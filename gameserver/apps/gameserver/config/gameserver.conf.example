@@ -1,0 +1,8 @@
+# GameServer config
+
+# TCP port to listen on (IPv4)
+listen_port=11000
+
+# Logging
+log_level=info
+log_file=logs/gameserver.log
