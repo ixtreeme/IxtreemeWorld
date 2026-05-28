@@ -8,10 +8,65 @@ Dependencies are managed through vcpkg manifest mode:
 
 - Boost.Asio
 - Boost.System
+- Cap'n Proto
+- MariaDB Connector/C++
+- libsodium
+- nlohmann-json
 - spdlog
 - fmt
 
 Set `VCPKG_ROOT` to your vcpkg checkout before configuring.
+
+For classic vcpkg installs on Windows:
+
+```sh
+vcpkg install capnproto:x64-windows
+vcpkg install mariadb-connector-cpp:x64-windows-static
+vcpkg install libsodium:x64-windows-static
+vcpkg install nlohmann-json:x64-windows-static
+```
+
+On FreeBSD:
+
+```sh
+pkg install capnproto
+```
+
+On Debian/Ubuntu:
+
+```sh
+apt install capnproto libcapnp-dev
+```
+
+## Database Setup
+
+Create the schema:
+
+```sh
+mysql -u root -p < libs/db/schema/schema.sql
+```
+
+Generate a test password hash:
+
+```sh
+build/windows-debug/apps/db_test/Debug/db_test.exe --make-hash test123
+```
+
+Copy the generated `$argon2id$...` hash into
+`libs/db/schema/seed_test_account.sql` in place of `REPLACE_ME`, then seed:
+
+```sh
+mysql -u root -p < libs/db/schema/seed_test_account.sql
+```
+
+Prepare the DB test config and run login checks:
+
+```sh
+copy build/windows-debug/database.json.example database.json
+# Edit database.json with real credentials
+build/windows-debug/apps/db_test/Debug/db_test.exe --login testuser test123
+build/windows-debug/apps/db_test/Debug/db_test.exe --login testuser wrongpass
+```
 
 ## Build on Windows
 
@@ -45,5 +100,20 @@ configuration directory, for example:
 Start the server, then run:
 
 ```sh
+pip install -r tools/requirements.txt
 python tools/test_client.py
 ```
+
+## Future AuthServer extraction
+
+The auth logic (`AuthHandler`) is intentionally separated from game logic (`GameHandler`)
+so a standalone AuthServer can be extracted later:
+
+1. Create `apps/authserver/` with its own `main.cpp`.
+2. Move `AuthHandler.h/.cpp` and the `AccountRepository` dependency to the new binary.
+3. Add a token system (Redis-backed) for cross-server session validation.
+4. Replace `AuthHandler` in gameserver with a `TokenValidator` that checks the token.
+5. The client connects to AuthServer first, gets a token, then connects to GameServer.
+6. TLS can be added to AuthServer only, where the password travels.
+
+The current code structure makes this extraction mechanical, not a refactor.

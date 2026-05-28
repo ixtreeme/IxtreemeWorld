@@ -9,15 +9,25 @@
 
 #include <boost/asio/io_context.hpp>
 #include <boost/asio/signal_set.hpp>
+#include <sodium.h>
 
 #include "common/Config.h"
 #include "common/Logging.h"
+#include "db/AccountRepository.h"
+#include "db/CharacterRepository.h"
+#include "db/DbConfig.h"
+#include "db/DbPool.h"
 #include "network/Server.h"
+
+#include "AuthHandler.h"
+#include "ConnectionHandler.h"
+#include "GameHandler.h"
 
 namespace {
 
 struct AppOptions {
     std::filesystem::path config_path = "gameserver.conf";
+    std::filesystem::path database_config_path = "database.json";
 };
 
 AppOptions ParseArgs(int argc, char* argv[])
@@ -27,8 +37,10 @@ AppOptions ParseArgs(int argc, char* argv[])
         const std::string arg = argv[i];
         if (arg == "--config" && i + 1 < argc) {
             options.config_path = argv[++i];
+        } else if (arg == "--database-config" && i + 1 < argc) {
+            options.database_config_path = argv[++i];
         } else {
-            std::cerr << "Usage: gameserver [--config path]\n";
+            std::cerr << "Usage: gameserver [--config path] [--database-config path]\n";
             std::exit(1);
         }
     }
@@ -64,10 +76,33 @@ int main(int argc, char* argv[])
             LOG_WARN("Config file '{}' not found, using defaults", options.config_path.string());
         }
 
+        if (sodium_init() < 0) {
+            LOG_ERROR("libsodium initialization failed");
+            return 1;
+        }
+
+        auto db_config = gs::db::LoadDbConfig(options.database_config_path);
+
         LOG_INFO("GameServer starting on port {}", port);
 
         boost::asio::io_context io;
-        gs::network::Server server(io, port);
+        gs::db::DbPool db_pool(io, std::move(db_config));
+        db_pool.Start();
+
+        gs::db::AccountRepository accounts(db_pool);
+        gs::db::CharacterRepository characters(db_pool);
+        gs::server::AuthHandler auth_handler(accounts);
+        gs::server::GameHandler game_handler(characters);
+        gs::server::ConnectionHandler handler(auth_handler, game_handler);
+        gs::network::Server server(
+            io,
+            port,
+            [&handler](auto session, auto payload) {
+                handler.OnPayload(session, std::move(payload));
+            },
+            [&handler](auto session) {
+                handler.OnDisconnect(session);
+            });
 
         boost::asio::signal_set signals(io, SIGINT, SIGTERM);
         signals.async_wait([&](const boost::system::error_code& error, int signal_number) {
@@ -81,6 +116,7 @@ int main(int argc, char* argv[])
         server.Start();
         io.run();
 
+        db_pool.Stop();
         LOG_INFO("GameServer shutting down cleanly");
         return 0;
     } catch (const std::exception& error) {

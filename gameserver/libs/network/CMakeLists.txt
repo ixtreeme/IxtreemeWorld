@@ -13,6 +13,7 @@ target_link_libraries(network
         common
         Boost::system
         Boost::headers
+        Boost::throw_exception
         $<$<PLATFORM_ID:Windows>:ws2_32>
 )
 

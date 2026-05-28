@@ -1,7 +1,6 @@
 #include "network/Server.h"
 
 #include <exception>
-#include <memory>
 #include <utility>
 
 #include <boost/asio/co_spawn.hpp>
@@ -9,15 +8,19 @@
 #include <boost/asio/use_awaitable.hpp>
 
 #include "common/Logging.h"
-#include "network/Session.h"
 
 namespace gs::network {
 namespace asio = boost::asio;
 using boost::asio::ip::tcp;
 
-Server::Server(asio::io_context& io, std::uint16_t port)
+Server::Server(asio::io_context& io,
+               std::uint16_t port,
+               Session::PayloadHandler on_payload,
+               Session::DisconnectHandler on_disconnect)
     : io_(io)
     , acceptor_(io, tcp::endpoint(tcp::v4(), port))
+    , on_payload_(std::move(on_payload))
+    , on_disconnect_(std::move(on_disconnect))
 {
 }
 
@@ -51,7 +54,7 @@ asio::awaitable<void> Server::AcceptLoop()
                      session_id);
 
             auto session = std::make_shared<Session>(std::move(socket), session_id);
-            session->Start();
+            session->Start(on_payload_, on_disconnect_);
         }
     } catch (const boost::system::system_error& error) {
         if (acceptor_.is_open()) {

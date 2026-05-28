@@ -31,8 +31,11 @@ Session::Session(tcp::socket socket, gs::common::SessionId id)
 {
 }
 
-void Session::Start()
+void Session::Start(PayloadHandler on_payload, DisconnectHandler on_disconnect)
 {
+    on_payload_ = std::move(on_payload);
+    on_disconnect_ = std::move(on_disconnect);
+
     auto self = shared_from_this();
     asio::co_spawn(
         socket_.get_executor(),
@@ -44,14 +47,51 @@ void Session::Start()
 
 void Session::Stop()
 {
-    if (stopped_) {
-        return;
-    }
-
+    const bool already_stopped = stopped_;
     stopped_ = true;
     boost::system::error_code ignored;
     socket_.shutdown(tcp::socket::shutdown_both, ignored);
     socket_.close(ignored);
+
+    if (!already_stopped && !disconnect_notified_) {
+        disconnect_notified_ = true;
+        if (on_disconnect_) {
+            on_disconnect_(shared_from_this());
+        }
+    }
+}
+
+void Session::SendPayload(std::vector<std::uint8_t> payload)
+{
+    SendPayloadInternal(std::move(payload), false);
+}
+
+void Session::SendPayloadAndClose(std::vector<std::uint8_t> payload)
+{
+    SendPayloadInternal(std::move(payload), true);
+}
+
+void Session::SendPayloadInternal(std::vector<std::uint8_t> payload, bool close_after_send)
+{
+    if (stopped_) {
+        return;
+    }
+
+    auto self = shared_from_this();
+    asio::co_spawn(
+        socket_.get_executor(),
+        [self, payload = std::move(payload), close_after_send]() mutable -> asio::awaitable<void> {
+            try {
+                co_await self->WriteFrame(std::move(payload));
+                if (close_after_send) {
+                    self->Stop();
+                }
+            } catch (const std::exception& error) {
+                LOG_ERROR("Session {} send error: {}", self->Id(), error.what());
+                self->Stop();
+            }
+        },
+        asio::detached);
 }
 
 asio::awaitable<void> Session::ReadLoop()
@@ -76,7 +116,9 @@ asio::awaitable<void> Session::ReadLoop()
             }
 
             LOG_DEBUG("Session {} received {} bytes", id_, length);
-            co_await WriteFrame(std::move(payload));
+            if (on_payload_) {
+                on_payload_(shared_from_this(), std::move(payload));
+            }
         }
     } catch (const boost::system::system_error& error) {
         if (!stopped_) {
