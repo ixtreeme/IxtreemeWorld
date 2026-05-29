@@ -12,7 +12,9 @@ import capnp
 HOST = "127.0.0.1"
 PORT = 11000
 
-SCHEMA_PATH = Path(__file__).resolve().parents[1] / "libs" / "protocol" / "schema" / "packet.capnp"
+SCHEMA_PATH = (
+    Path(__file__).resolve().parents[2] / "shared" / "protocol" / "schema" / "packet.capnp"
+)
 
 _vcpkg_root = Path(os.environ.get("VCPKG_ROOT", "C:/vcpkg"))
 _vcpkg_capnp_tools = _vcpkg_root / "installed" / "x64-windows-static" / "tools" / "capnproto"

@@ -1,0 +1,242 @@
+<Grid
+  xmlns="http://schemas.microsoft.com/winfx/2006/xaml/presentation"
+  xmlns:x="http://schemas.microsoft.com/winfx/2006/xaml"
+  TextElement.FontFamily="fonts/#Roboto">
+  <Grid.Background>
+    <LinearGradientBrush StartPoint="0,0" EndPoint="1,1">
+      <GradientStop Color="#FF08111F" Offset="0"/>
+      <GradientStop Color="#FF16213A" Offset="0.48"/>
+      <GradientStop Color="#FF252033" Offset="1"/>
+    </LinearGradientBrush>
+  </Grid.Background>
+
+  <Grid.Resources>
+    <Style x:Key="LobbyButton" TargetType="Button">
+      <Setter Property="Height" Value="46"/>
+      <Setter Property="FontFamily" Value="fonts/#Roboto"/>
+      <Setter Property="FontSize" Value="16"/>
+      <Setter Property="FontWeight" Value="Bold"/>
+      <Setter Property="Foreground" Value="#FFFFFFFF"/>
+      <Setter Property="Background" Value="#FF2F7DF6"/>
+      <Setter Property="BorderBrush" Value="#FF6EA7FF"/>
+      <Setter Property="BorderThickness" Value="1"/>
+      <Setter Property="Template">
+        <Setter.Value>
+          <ControlTemplate TargetType="Button">
+            <Border
+              x:Name="Chrome"
+              CornerRadius="6"
+              Background="{TemplateBinding Background}"
+              BorderBrush="{TemplateBinding BorderBrush}"
+              BorderThickness="{TemplateBinding BorderThickness}">
+              <ContentPresenter
+                HorizontalAlignment="Center"
+                VerticalAlignment="Center"/>
+            </Border>
+            <ControlTemplate.Triggers>
+              <Trigger Property="IsMouseOver" Value="True">
+                <Setter TargetName="Chrome" Property="Background" Value="#FF4690FF"/>
+              </Trigger>
+              <Trigger Property="IsPressed" Value="True">
+                <Setter TargetName="Chrome" Property="Background" Value="#FF1F5CC2"/>
+              </Trigger>
+              <Trigger Property="IsEnabled" Value="False">
+                <Setter TargetName="Chrome" Property="Opacity" Value="0.45"/>
+              </Trigger>
+            </ControlTemplate.Triggers>
+          </ControlTemplate>
+        </Setter.Value>
+      </Setter>
+    </Style>
+
+    <Style x:Key="LobbyListBox" TargetType="ListBox">
+      <Setter Property="FontFamily" Value="fonts/#Roboto"/>
+      <Setter Property="Foreground" Value="#FFFFFFFF"/>
+      <Setter Property="Background" Value="#FF121926"/>
+      <Setter Property="BorderBrush" Value="#55758AA8"/>
+      <Setter Property="BorderThickness" Value="1"/>
+      <Setter Property="Padding" Value="6"/>
+      <Setter Property="Template">
+        <Setter.Value>
+          <ControlTemplate TargetType="ListBox">
+            <Border
+              CornerRadius="6"
+              Background="{TemplateBinding Background}"
+              BorderBrush="{TemplateBinding BorderBrush}"
+              BorderThickness="{TemplateBinding BorderThickness}">
+              <ScrollViewer Padding="{TemplateBinding Padding}">
+                <ItemsPresenter/>
+              </ScrollViewer>
+            </Border>
+          </ControlTemplate>
+        </Setter.Value>
+      </Setter>
+    </Style>
+
+    <Style x:Key="LobbyListBoxItem" TargetType="ListBoxItem">
+      <Setter Property="FontFamily" Value="fonts/#Roboto"/>
+      <Setter Property="Foreground" Value="#FFFFFFFF"/>
+      <Setter Property="Margin" Value="0,0,0,6"/>
+      <Setter Property="Template">
+        <Setter.Value>
+          <ControlTemplate TargetType="ListBoxItem">
+            <Border
+              x:Name="Row"
+              MinHeight="64"
+              CornerRadius="5"
+              Padding="14"
+              Background="#FF202838"
+              BorderBrush="#26758AA8"
+              BorderThickness="1">
+              <ContentPresenter/>
+            </Border>
+            <ControlTemplate.Triggers>
+              <Trigger Property="IsMouseOver" Value="True">
+                <Setter TargetName="Row" Property="Background" Value="#FF29344A"/>
+                <Setter TargetName="Row" Property="BorderBrush" Value="#889AB4D6"/>
+              </Trigger>
+              <Trigger Property="IsSelected" Value="True">
+                <Setter TargetName="Row" Property="Background" Value="#FF253B62"/>
+                <Setter TargetName="Row" Property="BorderBrush" Value="#FF2F7DF6"/>
+              </Trigger>
+            </ControlTemplate.Triggers>
+          </ControlTemplate>
+        </Setter.Value>
+      </Setter>
+    </Style>
+
+    <Style x:Key="LobbyComboBox" TargetType="ComboBox">
+      <Setter Property="Height" Value="42"/>
+      <Setter Property="FontFamily" Value="fonts/#Roboto"/>
+      <Setter Property="FontSize" Value="15"/>
+      <Setter Property="Foreground" Value="#FFFFFFFF"/>
+      <Setter Property="Background" Value="#FF242B3A"/>
+      <Setter Property="BorderBrush" Value="#55758AA8"/>
+      <Setter Property="BorderThickness" Value="1"/>
+    </Style>
+
+  </Grid.Resources>
+
+  <Border
+    Width="940"
+    Padding="28"
+    CornerRadius="8"
+    Background="#CC1A1A22"
+    BorderBrush="#55FFFFFF"
+    BorderThickness="1"
+    HorizontalAlignment="Center"
+    VerticalAlignment="Center">
+    <Grid>
+      <Grid.RowDefinitions>
+        <RowDefinition Height="Auto"/>
+        <RowDefinition Height="20"/>
+        <RowDefinition Height="360"/>
+        <RowDefinition Height="18"/>
+        <RowDefinition Height="Auto"/>
+        <RowDefinition Height="14"/>
+        <RowDefinition Height="24"/>
+      </Grid.RowDefinitions>
+
+      <TextBlock
+        Text="AURIGA GLOBAL"
+        HorizontalAlignment="Center"
+        FontFamily="fonts/#Roboto"
+        FontSize="28"
+        FontWeight="Bold"
+        Foreground="#FFFFFFFF"/>
+
+      <Grid Grid.Row="2">
+        <Grid.ColumnDefinitions>
+          <ColumnDefinition Width="260"/>
+          <ColumnDefinition Width="22"/>
+          <ColumnDefinition Width="*"/>
+          <ColumnDefinition Width="22"/>
+          <ColumnDefinition Width="220"/>
+        </Grid.ColumnDefinitions>
+
+        <Border
+          CornerRadius="6"
+          Background="#FF121926"
+          BorderBrush="#55758AA8"
+          BorderThickness="1">
+          <Grid>
+            <Border
+              Margin="18"
+              CornerRadius="6"
+              Background="#FF202838"
+              BorderBrush="#26758AA8"
+              BorderThickness="1"/>
+          </Grid>
+        </Border>
+
+        <ListBox
+          Grid.Column="2"
+          ItemsSource="{Binding Characters}"
+          SelectedItem="{Binding SelectedCharacter, Mode=TwoWay}"
+          Style="{StaticResource LobbyListBox}"
+          ItemContainerStyle="{StaticResource LobbyListBoxItem}">
+          <ListBox.ItemTemplate>
+            <DataTemplate>
+              <Grid>
+                <Grid.ColumnDefinitions>
+                  <ColumnDefinition Width="42"/>
+                  <ColumnDefinition Width="*"/>
+                </Grid.ColumnDefinitions>
+                <TextBlock
+                  Text="{Binding Slot}"
+                  FontFamily="fonts/#Roboto"
+                  FontSize="18"
+                  FontWeight="Bold"
+                  Foreground="#FF79C8FF"
+                  VerticalAlignment="Center"/>
+                <StackPanel Grid.Column="1">
+                  <TextBlock
+                    Text="{Binding Name}"
+                    FontFamily="fonts/#Roboto"
+                    FontSize="17"
+                    FontWeight="Bold"
+                    Foreground="#FFFFFFFF"/>
+                  <TextBlock
+                    Text="{Binding Detail}"
+                    Margin="0,4,0,0"
+                    FontFamily="fonts/#Roboto"
+                    FontSize="13"
+                    Foreground="#FFB8C0CF"/>
+                </StackPanel>
+              </Grid>
+            </DataTemplate>
+          </ListBox.ItemTemplate>
+        </ListBox>
+
+        <StackPanel Grid.Column="4">
+          <TextBlock
+            Text="CHANNEL"
+            Margin="0,0,0,8"
+            FontFamily="fonts/#Roboto"
+            FontSize="13"
+            FontWeight="Bold"
+            Foreground="#FFB8C0CF"/>
+          <ComboBox
+            ItemsSource="{Binding Channels}"
+            SelectedItem="{Binding SelectedChannel, Mode=TwoWay}"
+            DisplayMemberPath="Label"
+            Style="{StaticResource LobbyComboBox}"
+            Margin="0,0,0,22"/>
+          <Button
+            Content="ENTER"
+            Command="{Binding EnterCommand}"
+            IsEnabled="{Binding CanEnter}"
+            Style="{StaticResource LobbyButton}"/>
+        </StackPanel>
+      </Grid>
+
+      <TextBlock
+        Grid.Row="6"
+        Text="{Binding Status}"
+        HorizontalAlignment="Center"
+        FontFamily="fonts/#Roboto"
+        FontSize="14"
+        Foreground="#FFFFD27A"/>
+    </Grid>
+  </Border>
+</Grid>

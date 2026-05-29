@@ -1,0 +1,231 @@
+<Grid
+  xmlns="http://schemas.microsoft.com/winfx/2006/xaml/presentation"
+  xmlns:x="http://schemas.microsoft.com/winfx/2006/xaml">
+  <Grid.Background>
+    <LinearGradientBrush StartPoint="0,0" EndPoint="1,1">
+      <GradientStop Color="#FF08111F" Offset="0"/>
+      <GradientStop Color="#FF16213A" Offset="0.48"/>
+      <GradientStop Color="#FF252033" Offset="1"/>
+    </LinearGradientBrush>
+  </Grid.Background>
+
+  <Border
+    Width="360"
+    HorizontalAlignment="Center"
+    VerticalAlignment="Center"
+    CornerRadius="8"
+    Background="#CC1A1A22"
+    BorderBrush="#55FFFFFF"
+    BorderThickness="1"
+    Padding="28">
+    <StackPanel>
+      <TextBlock
+        Text="AURIGA GLOBAL"
+        HorizontalAlignment="Center"
+        Margin="0,0,0,26"
+        FontFamily="fonts/#Roboto"
+        FontSize="28"
+        FontWeight="Bold"
+        Foreground="#FFFFFFFF"/>
+
+      <TextBlock
+        Text="Username"
+        Margin="0,0,0,6"
+        FontFamily="fonts/#Roboto"
+        FontSize="13"
+        Foreground="#FFB8C0CF"/>
+      <TextBox
+        x:Name="UsernameBox"
+        Height="42"
+        Margin="0,0,0,16"
+        Padding="12,8"
+        FontFamily="fonts/#Roboto"
+        FontSize="16"
+        Foreground="#FFFFFFFF"
+        CaretBrush="#FFFFFFFF"
+        Background="#FF242B3A"
+        BorderBrush="#55758AA8"
+        BorderThickness="1">
+        <TextBox.Template>
+          <ControlTemplate TargetType="TextBox">
+            <Border
+              x:Name="Chrome"
+              CornerRadius="5"
+              Background="{TemplateBinding Background}"
+              BorderBrush="{TemplateBinding BorderBrush}"
+              BorderThickness="{TemplateBinding BorderThickness}">
+              <ScrollViewer
+                x:Name="PART_ContentHost"
+                Focusable="False"
+                Padding="{TemplateBinding Padding}"
+                Foreground="{TemplateBinding Foreground}">
+                <ScrollViewer.Template>
+                  <ControlTemplate TargetType="ScrollViewer">
+                    <ScrollContentPresenter Margin="{TemplateBinding Padding}"/>
+                  </ControlTemplate>
+                </ScrollViewer.Template>
+              </ScrollViewer>
+            </Border>
+            <ControlTemplate.Triggers>
+              <Trigger Property="IsMouseOver" Value="True">
+                <Setter TargetName="Chrome" Property="BorderBrush" Value="#889AB4D6"/>
+              </Trigger>
+              <Trigger Property="IsKeyboardFocused" Value="True">
+                <Setter TargetName="Chrome" Property="BorderBrush" Value="#FF2F7DF6"/>
+                <Setter TargetName="Chrome" Property="Background" Value="#FF334255"/>
+              </Trigger>
+            </ControlTemplate.Triggers>
+          </ControlTemplate>
+        </TextBox.Template>
+      </TextBox>
+
+      <TextBlock
+        Text="Password"
+        Margin="0,0,0,6"
+        FontFamily="fonts/#Roboto"
+        FontSize="13"
+        Foreground="#FFB8C0CF"/>
+      <PasswordBox
+        x:Name="PasswordBox"
+        Height="42"
+        Margin="0,0,0,18"
+        Padding="12,8"
+        FontFamily="fonts/#Roboto"
+        FontSize="16"
+        Foreground="#FFFFFFFF"
+        CaretBrush="#FFFFFFFF"
+        Background="#FF242B3A"
+        BorderBrush="#55758AA8"
+        BorderThickness="1">
+        <PasswordBox.Template>
+          <ControlTemplate TargetType="PasswordBox">
+            <Border
+              x:Name="Chrome"
+              CornerRadius="5"
+              Background="{TemplateBinding Background}"
+              BorderBrush="{TemplateBinding BorderBrush}"
+              BorderThickness="{TemplateBinding BorderThickness}">
+              <ScrollViewer
+                x:Name="PART_ContentHost"
+                Focusable="False"
+                Padding="{TemplateBinding Padding}"
+                Foreground="{TemplateBinding Foreground}">
+                <ScrollViewer.Template>
+                  <ControlTemplate TargetType="ScrollViewer">
+                    <ScrollContentPresenter Margin="{TemplateBinding Padding}"/>
+                  </ControlTemplate>
+                </ScrollViewer.Template>
+              </ScrollViewer>
+            </Border>
+            <ControlTemplate.Triggers>
+              <Trigger Property="IsMouseOver" Value="True">
+                <Setter TargetName="Chrome" Property="BorderBrush" Value="#889AB4D6"/>
+              </Trigger>
+              <Trigger Property="IsKeyboardFocused" Value="True">
+                <Setter TargetName="Chrome" Property="BorderBrush" Value="#FF2F7DF6"/>
+                <Setter TargetName="Chrome" Property="Background" Value="#FF334255"/>
+              </Trigger>
+            </ControlTemplate.Triggers>
+          </ControlTemplate>
+        </PasswordBox.Template>
+      </PasswordBox>
+
+      <CheckBox
+        x:Name="RememberBox"
+        Content="Remember me"
+        Margin="0,0,0,22"
+        FontFamily="fonts/#Roboto"
+        FontSize="14"
+        Foreground="#FFE6EAF2">
+        <CheckBox.Template>
+          <ControlTemplate TargetType="CheckBox">
+            <Grid Background="Transparent">
+              <Grid.ColumnDefinitions>
+                <ColumnDefinition Width="Auto"/>
+                <ColumnDefinition Width="*"/>
+              </Grid.ColumnDefinitions>
+              <Border
+                x:Name="Box"
+                Width="18"
+                Height="18"
+                VerticalAlignment="Center"
+                CornerRadius="3"
+                Background="#FF242B3A"
+                BorderBrush="#66758AA8"
+                BorderThickness="1"/>
+              <TextBlock
+                x:Name="Mark"
+                Text="X"
+                Visibility="Collapsed"
+                HorizontalAlignment="Center"
+                VerticalAlignment="Center"
+                FontFamily="fonts/#Roboto"
+                FontSize="12"
+                FontWeight="Bold"
+                Foreground="#FFFFFFFF"/>
+              <ContentPresenter
+                Grid.Column="1"
+                Margin="10,0,0,0"
+                VerticalAlignment="Center"/>
+            </Grid>
+            <ControlTemplate.Triggers>
+              <Trigger Property="IsMouseOver" Value="True">
+                <Setter TargetName="Box" Property="BorderBrush" Value="#FF2F7DF6"/>
+              </Trigger>
+              <Trigger Property="IsChecked" Value="True">
+                <Setter TargetName="Box" Property="Background" Value="#FF2F7DF6"/>
+                <Setter TargetName="Mark" Property="Visibility" Value="Visible"/>
+              </Trigger>
+            </ControlTemplate.Triggers>
+          </ControlTemplate>
+        </CheckBox.Template>
+      </CheckBox>
+
+      <Button
+        x:Name="LoginButton"
+        Height="46"
+        HorizontalAlignment="Stretch"
+        Content="LOGIN"
+        FontFamily="fonts/#Roboto"
+        FontSize="16"
+        FontWeight="Bold"
+        Foreground="#FFFFFFFF"
+        Background="#FF2F7DF6"
+        BorderBrush="#FF6EA7FF"
+        BorderThickness="1">
+        <Button.Template>
+          <ControlTemplate TargetType="Button">
+            <Border
+              x:Name="Chrome"
+              CornerRadius="6"
+              Background="{TemplateBinding Background}"
+              BorderBrush="{TemplateBinding BorderBrush}"
+              BorderThickness="{TemplateBinding BorderThickness}">
+              <ContentPresenter
+                HorizontalAlignment="Center"
+                VerticalAlignment="Center"/>
+            </Border>
+            <ControlTemplate.Triggers>
+              <Trigger Property="IsMouseOver" Value="True">
+                <Setter TargetName="Chrome" Property="Background" Value="#FF4690FF"/>
+              </Trigger>
+              <Trigger Property="IsPressed" Value="True">
+                <Setter TargetName="Chrome" Property="Background" Value="#FF1F5CC2"/>
+              </Trigger>
+            </ControlTemplate.Triggers>
+          </ControlTemplate>
+        </Button.Template>
+      </Button>
+
+      <TextBlock
+        x:Name="StatusText"
+        Text=""
+        Height="22"
+        Margin="0,14,0,0"
+        FontFamily="fonts/#Roboto"
+        FontSize="13"
+        Foreground="#FFFF7A7A"
+        TextAlignment="Center"/>
+    </StackPanel>
+  </Border>
+</Grid>

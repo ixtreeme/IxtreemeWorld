@@ -20,7 +20,6 @@ target_include_directories(protocol
 
 target_link_libraries(protocol
     PUBLIC
-        common
         CapnProto::capnp
 )
 

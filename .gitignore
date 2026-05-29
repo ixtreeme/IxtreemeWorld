@@ -1,0 +1,14 @@
+build/
+.vs/
+.vscode/
+.idea/
+*.user
+*.obj
+*.o
+*.exe
+CMakeCache.txt
+CMakeFiles/
+install/
+logs/
+vcpkg_installed/
+*.log

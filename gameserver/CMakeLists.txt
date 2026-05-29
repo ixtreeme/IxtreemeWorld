@@ -59,7 +59,8 @@ vcpkg_require(
 find_package(Boost CONFIG REQUIRED COMPONENTS asio system throw_exception)
 
 add_subdirectory(libs/common)
-add_subdirectory(libs/protocol)
+# A protocol lib a kozos shared/ mappaban el, mindket oldal hasznalja.
+add_subdirectory(${CMAKE_CURRENT_SOURCE_DIR}/../shared/protocol shared_protocol_build)
 add_subdirectory(libs/network)
 add_subdirectory(libs/db)
 add_subdirectory(apps/gameserver)
