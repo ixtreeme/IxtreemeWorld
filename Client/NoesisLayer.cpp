@@ -42,6 +42,7 @@
 #include <cstring>
 #include <functional>
 #include <algorithm>
+#include <map>
 #include <memory>
 #include <mutex>
 #include <string>
@@ -427,35 +428,6 @@ private:
     }
 };
 
-class LobbyChannel final : public Noesis::BaseComponent
-{
-public:
-    LobbyChannel(uint32_t channel, uint32_t port)
-        : m_channel(channel)
-        , m_port(port)
-    {
-        char label[64];
-        std::snprintf(label, sizeof(label), "CH%u  (%u)", m_channel, m_port);
-        m_label = label;
-    }
-
-    uint32_t GetChannel() const { return m_channel; }
-    uint32_t GetPort() const { return m_port; }
-    const char* GetLabel() const { return m_label.Str(); }
-
-private:
-    uint32_t m_channel = 1;
-    uint32_t m_port = 30078; //ch99
-    Noesis::String m_label;
-
-    NS_IMPLEMENT_INLINE_REFLECTION(LobbyChannel, Noesis::BaseComponent, "Lobby.Channel")
-    {
-        NsProp("Channel", &LobbyChannel::GetChannel);
-        NsProp("Port", &LobbyChannel::GetPort);
-        NsProp("Label", &LobbyChannel::GetLabel);
-    }
-};
-
 class LobbyViewModel final : public NoesisApp::NotifyPropertyChangedBase
 {
 public:
@@ -463,20 +435,11 @@ public:
         : m_enterCallback(std::move(enterCallback))
     {
         m_characters = *new Noesis::ObservableCollection<LobbyCharacter>();
-        m_channels = *new Noesis::ObservableCollection<LobbyChannel>();
-        m_channels->Add(Noesis::MakePtr<LobbyChannel>(1, 30078)); //ch99
-        m_channels->Add(Noesis::MakePtr<LobbyChannel>(2, 30058));
-        m_channels->Add(Noesis::MakePtr<LobbyChannel>(3, 30062));
-        m_channels->Add(Noesis::MakePtr<LobbyChannel>(4, 30066));
-        m_channels->Add(Noesis::MakePtr<LobbyChannel>(5, 30070));
-        m_channels->Add(Noesis::MakePtr<LobbyChannel>(6, 30074));
-        m_selectedChannel = m_channels->Get(0);
         SetStatus("Fetching characters...");
         m_enterCommand.SetExecuteFunc(Noesis::MakeDelegate(this, &LobbyViewModel::Enter));
     }
 
     Noesis::ObservableCollection<LobbyCharacter>* GetCharacters() const { return m_characters; }
-    Noesis::ObservableCollection<LobbyChannel>* GetChannels() const { return m_channels; }
     LobbyCharacter* GetSelectedCharacter() const { return m_selectedCharacter; }
     void SetSelectedCharacter(LobbyCharacter* value)
     {
@@ -488,15 +451,6 @@ public:
 
             if (m_selectedCharacter && !m_selectedCharacter->GetCanEnter())
                 SetStatus("Character creation not available yet");
-        }
-    }
-    LobbyChannel* GetSelectedChannel() const { return m_selectedChannel; }
-    void SetSelectedChannel(LobbyChannel* value)
-    {
-        if (m_selectedChannel != value)
-        {
-            m_selectedChannel = value;
-            OnPropertyChanged("SelectedChannel");
         }
     }
     bool GetCanEnter() const
@@ -532,7 +486,7 @@ public:
             m_characters->Add(Noesis::MakePtr<LobbyCharacter>(slot));
         }
 
-        SetStatus("Select a character and channel");
+        SetStatus("Select a character");
         OnPropertyChanged("Characters");
         OnPropertyChanged("SelectedCharacter");
         OnPropertyChanged("CanEnter");
@@ -541,7 +495,7 @@ public:
 private:
     void Enter(Noesis::BaseComponent*)
     {
-        if (!m_selectedCharacter || !m_selectedChannel || !m_selectedCharacter->GetCanEnter())
+        if (!m_selectedCharacter || !m_selectedCharacter->GetCanEnter())
         {
             SetStatus("Select a character");
             return;
@@ -554,10 +508,8 @@ private:
 
 private:
     Noesis::Ptr<Noesis::ObservableCollection<LobbyCharacter>> m_characters;
-    Noesis::Ptr<Noesis::ObservableCollection<LobbyChannel>> m_channels;
     std::function<void(uint64_t)> m_enterCallback;
     LobbyCharacter* m_selectedCharacter = nullptr;
-    LobbyChannel* m_selectedChannel = nullptr;
     NoesisApp::DelegateCommand m_enterCommand;
     Noesis::String m_status;
     uint32_t m_characterCount = 0;
@@ -566,9 +518,7 @@ private:
     NS_IMPLEMENT_INLINE_REFLECTION(LobbyViewModel, NoesisApp::NotifyPropertyChangedBase, "Lobby.ViewModel")
     {
         NsProp("Characters", &LobbyViewModel::GetCharacters);
-        NsProp("Channels", &LobbyViewModel::GetChannels);
         NsProp("SelectedCharacter", &LobbyViewModel::GetSelectedCharacter, &LobbyViewModel::SetSelectedCharacter);
-        NsProp("SelectedChannel", &LobbyViewModel::GetSelectedChannel, &LobbyViewModel::SetSelectedChannel);
         NsProp("CanEnter", &LobbyViewModel::GetCanEnter);
         NsProp("EnterCommand", &LobbyViewModel::GetEnterCommand);
         NsProp("Status", &LobbyViewModel::GetStatus);
@@ -854,7 +804,13 @@ struct NoesisLayer::Impl
     std::string loginName;
     std::string loginPassword;
     std::vector<std::uint8_t> pendingEnterWorldToken;
+    std::string pendingGameHost;
+    std::uint16_t pendingGamePort = 0;
+    bool pendingGameConnect = false;
     bool pendingEnterWorldConnect = false;
+    bool inWorld = false;
+    std::uint32_t ownNetId = 0;
+    std::vector<WorldRenderEntity> worldEntities;
     client::net::ClientSession* clientSession = nullptr;
     uint32_t currentWidth = 0;
     uint32_t currentHeight = 0;
@@ -913,6 +869,15 @@ void NoesisLayer::Update(double timeSeconds)
 #if defined(__ANDROID__)
     DrainPendingTextInput();
 #endif
+    if (m_impl && m_impl->pendingGameConnect && m_impl->clientSession &&
+        !m_impl->clientSession->IsConnected())
+    {
+        m_impl->pendingGameConnect = false;
+        m_impl->pendingEnterWorldConnect = true;
+        LogFormat("[WORLD] deferred game connect to %s", m_impl->pendingGameHost.c_str());
+        m_impl->clientSession->Connect(m_impl->pendingGameHost, m_impl->pendingGamePort);
+    }
+
     if (m_impl && m_impl->view)
         m_impl->view->Update(timeSeconds);
     if (m_impl && m_impl->menuView && m_impl->inGameMenuOpen)
@@ -983,6 +948,21 @@ bool NoesisLayer::IsLobbyActive() const
     return m_impl && m_impl->lobbyActive;
 }
 
+bool NoesisLayer::IsInWorld() const
+{
+    return m_impl && m_impl->inWorld;
+}
+
+std::uint32_t NoesisLayer::GetOwnNetId() const
+{
+    return m_impl ? m_impl->ownNetId : 0;
+}
+
+std::vector<WorldRenderEntity> NoesisLayer::GetWorldEntities() const
+{
+    return m_impl ? m_impl->worldEntities : std::vector<WorldRenderEntity>{};
+}
+
 bool NoesisLayer::IsInGameMenuOpen() const
 {
     return m_impl && m_impl->inGameMenuOpen;
@@ -1049,12 +1029,18 @@ bool NoesisLayer::OnInput(const InputEvent& event)
 void NoesisLayer::OnConnectionFailed(const std::string& reason)
 {
     if (m_impl)
+    {
+        if (m_impl->pendingEnterWorldConnect || m_impl->pendingGameConnect)
+            LogFormat("[WORLD] game connect failed: %s", reason.c_str());
         m_impl->SetStatus(reason.empty() ? "Connection failed" : reason.c_str());
+        m_impl->pendingGameConnect = false;
+        m_impl->pendingEnterWorldConnect = false;
+    }
 }
 
 void NoesisLayer::OnDisconnected()
 {
-    if (m_impl)
+    if (m_impl && !m_impl->pendingGameConnect)
         m_impl->SetStatus("Disconnected");
 }
 
@@ -1066,6 +1052,7 @@ void NoesisLayer::OnHandshakeAccepted()
     if (m_impl->pendingEnterWorldConnect)
     {
         m_impl->pendingEnterWorldConnect = false;
+        Log("[WORLD] game connect succeeded; sending EnterWorld token");
         m_impl->SetStatus("Entering world...");
         if (m_impl->clientSession)
             m_impl->clientSession->SendEnterWorld(m_impl->pendingEnterWorldToken);
@@ -1116,18 +1103,30 @@ void NoesisLayer::OnEnterWorldToken(std::vector<std::uint8_t> token,
     if (!m_impl || !m_impl->clientSession)
         return;
 
-    LogFormat("[WORLD] received handoff token, connecting to %s", host.c_str());
+    LogFormat("[WORLD] received handoff token, deferring game connect to %s", host.c_str());
     m_impl->pendingEnterWorldToken = std::move(token);
-    m_impl->pendingEnterWorldConnect = true;
+    m_impl->pendingGameHost = host;
+    m_impl->pendingGamePort = port;
+    m_impl->pendingGameConnect = true;
+    m_impl->pendingEnterWorldConnect = false;
     m_impl->SetStatus("Connecting to world...");
     m_impl->clientSession->Disconnect();
-    m_impl->clientSession->Connect(host, port);
 }
 
 void NoesisLayer::OnEnterWorldAccepted(std::uint32_t net_id, client::net::Vec3 spawn_pos)
 {
     if (!m_impl)
         return;
+
+    m_impl->inWorld = true;
+    m_impl->lobbyActive = false;
+    m_impl->ownNetId = net_id;
+    m_impl->worldEntities.clear();
+    WorldRenderEntity self;
+    self.netId = net_id;
+    self.name = "You";
+    self.position = spawn_pos;
+    m_impl->worldEntities.push_back(std::move(self));
 
     LogFormat("[WORLD] enter accepted net_id=%u", net_id);
     char message[128];
@@ -1148,12 +1147,65 @@ void NoesisLayer::OnEnterWorldRejected(const std::string& reason)
 
 void NoesisLayer::OnEntitySpawn(const client::net::EntitySpawnInfo& entity)
 {
+    if (m_impl)
+    {
+        auto it = std::find_if(m_impl->worldEntities.begin(),
+            m_impl->worldEntities.end(),
+            [&entity](const WorldRenderEntity& existing) { return existing.netId == entity.netId; });
+        if (it == m_impl->worldEntities.end())
+        {
+            WorldRenderEntity render;
+            render.netId = entity.netId;
+            render.name = entity.name;
+            render.position = entity.spawnPos;
+            render.heading = entity.heading;
+            m_impl->worldEntities.push_back(std::move(render));
+        }
+    }
     LogFormat("[WORLD] entity spawn name=%s", entity.name.c_str());
 }
 
 void NoesisLayer::OnEntityDespawn(std::uint32_t net_id)
 {
+    if (m_impl)
+    {
+        m_impl->worldEntities.erase(
+            std::remove_if(m_impl->worldEntities.begin(),
+                m_impl->worldEntities.end(),
+                [net_id](const WorldRenderEntity& entity) { return entity.netId == net_id; }),
+            m_impl->worldEntities.end());
+    }
     LogFormat("[WORLD] entity despawn net_id=%u", net_id);
+}
+
+void NoesisLayer::OnEntityTransforms(std::uint32_t,
+                                     const std::vector<client::net::EntityTransform>& transforms)
+{
+    if (!m_impl)
+        return;
+
+    for (const auto& transform : transforms)
+    {
+        auto it = std::find_if(m_impl->worldEntities.begin(),
+            m_impl->worldEntities.end(),
+            [&transform](const WorldRenderEntity& entity) { return entity.netId == transform.netId; });
+        if (it == m_impl->worldEntities.end())
+        {
+            WorldRenderEntity entity;
+            entity.netId = transform.netId;
+            entity.name = "Player";
+            entity.position = transform.position;
+            entity.heading = transform.heading;
+            entity.moveState = transform.moveState;
+            m_impl->worldEntities.push_back(std::move(entity));
+        }
+        else
+        {
+            it->position = transform.position;
+            it->heading = transform.heading;
+            it->moveState = transform.moveState;
+        }
+    }
 }
 
 void NoesisLayer::Destroy()

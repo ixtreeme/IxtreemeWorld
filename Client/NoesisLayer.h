@@ -2,6 +2,7 @@
 
 #include "InputEvent.h"
 #include "network/IClientHandler.h"
+#include "WorldCamera.h"
 
 #include <cstdint>
 #include <functional>
@@ -19,6 +20,15 @@ class IAssetReader;
 
 class VulkanDevice;
 
+struct WorldRenderEntity
+{
+    std::uint32_t netId = 0;
+    std::string name;
+    client::net::Vec3 position;
+    std::uint16_t heading = 0;
+    client::net::MoveState moveState = client::net::MoveState::Idle;
+};
+
 class NoesisLayer : public client::net::IClientHandler
 {
 public:
@@ -33,6 +43,9 @@ public:
     void OnRenderPassChanged(VulkanDevice& device);
     void Resize(uint32_t width, uint32_t height);
     bool IsLobbyActive() const;
+    bool IsInWorld() const;
+    std::uint32_t GetOwnNetId() const;
+    std::vector<WorldRenderEntity> GetWorldEntities() const;
     bool IsInGameMenuOpen() const;
     void ToggleInGameMenu();
     void SetQuitCallback(std::function<void()> callback);
@@ -53,6 +66,8 @@ public:
     void OnEnterWorldRejected(const std::string& reason) override;
     void OnEntitySpawn(const client::net::EntitySpawnInfo& entity) override;
     void OnEntityDespawn(std::uint32_t net_id) override;
+    void OnEntityTransforms(std::uint32_t server_tick,
+                            const std::vector<client::net::EntityTransform>& transforms) override;
 
     void Destroy();
 

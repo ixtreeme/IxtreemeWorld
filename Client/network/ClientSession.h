@@ -28,6 +28,7 @@ public:
     void SendCharacterListRequest();
     void SendCharacterSelect(std::uint64_t character_id);
     void SendEnterWorld(const std::vector<std::uint8_t>& token);
+    void SendMoveInput(float dir_angle, MoveState state);
 
     void Update();
 

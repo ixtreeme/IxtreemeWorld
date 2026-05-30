@@ -51,7 +51,7 @@ AppOptions ParseArgs(int argc, char* argv[])
 
 std::uint16_t ResolvePort(const gs::common::Config& config)
 {
-    constexpr int kDefaultPort = 12000;
+    constexpr int kDefaultPort = 11020;
     const auto port = config.GetInt("listen_port").value_or(kDefaultPort);
     if (port <= 0 || port > std::numeric_limits<std::uint16_t>::max()) {
         return kDefaultPort;
@@ -113,6 +113,9 @@ int main(int argc, char* argv[])
             },
             [&handler](auto session) {
                 handler.OnDisconnect(session);
+            },
+            [](auto session) {
+                LOG_INFO("GameServer New connection: session id {}", session->Id());
             });
 
         boost::asio::signal_set signals(io, SIGINT, SIGTERM);

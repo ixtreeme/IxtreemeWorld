@@ -63,14 +63,16 @@ class Client:
         self.close()
 
     def send_packet(self, packet_msg):
-        payload = packet_msg.to_bytes()
+        payload = b"\x00" + packet_msg.to_bytes()
         self.sock.sendall(struct.pack(">I", len(payload)) + payload)
 
     def recv_packet(self):
         header = recv_exact(self.sock, 4)
         (length,) = struct.unpack(">I", header)
         payload = recv_exact(self.sock, length)
-        return packet_capnp.Packet.from_bytes(payload)
+        if not payload or payload[0] != 0:
+            raise ValueError(f"unexpected codec: {payload[0] if payload else 'empty'}")
+        return packet_capnp.Packet.from_bytes(payload[1:])
 
     def handshake(self, version=1):
         request = packet_capnp.Packet.new_message()

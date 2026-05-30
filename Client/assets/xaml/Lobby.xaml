@@ -105,16 +105,6 @@
       </Setter>
     </Style>
 
-    <Style x:Key="LobbyComboBox" TargetType="ComboBox">
-      <Setter Property="Height" Value="42"/>
-      <Setter Property="FontFamily" Value="assets/fonts/#Roboto"/>
-      <Setter Property="FontSize" Value="15"/>
-      <Setter Property="Foreground" Value="#FFFFFFFF"/>
-      <Setter Property="Background" Value="#FF242B3A"/>
-      <Setter Property="BorderBrush" Value="#55758AA8"/>
-      <Setter Property="BorderThickness" Value="1"/>
-    </Style>
-
   </Grid.Resources>
 
   <Border
@@ -151,7 +141,7 @@
           <ColumnDefinition Width="22"/>
           <ColumnDefinition Width="*"/>
           <ColumnDefinition Width="22"/>
-          <ColumnDefinition Width="220"/>
+          <ColumnDefinition Width="180"/>
         </Grid.ColumnDefinitions>
 
         <Border
@@ -209,19 +199,6 @@
         </ListBox>
 
         <StackPanel Grid.Column="4">
-          <TextBlock
-            Text="CHANNEL"
-            Margin="0,0,0,8"
-            FontFamily="assets/fonts/#Roboto"
-            FontSize="13"
-            FontWeight="Bold"
-            Foreground="#FFB8C0CF"/>
-          <ComboBox
-            ItemsSource="{Binding Channels}"
-            SelectedItem="{Binding SelectedChannel, Mode=TwoWay}"
-            DisplayMemberPath="Label"
-            Style="{StaticResource LobbyComboBox}"
-            Margin="0,0,0,22"/>
           <Button
             Content="ENTER"
             Command="{Binding EnterCommand}"

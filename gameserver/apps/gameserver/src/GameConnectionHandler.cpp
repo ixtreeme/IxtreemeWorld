@@ -1,6 +1,7 @@
 #include "GameConnectionHandler.h"
 
 #include <array>
+#include <cmath>
 #include <string>
 #include <utility>
 
@@ -15,6 +16,27 @@
 
 namespace gs::game {
 namespace {
+
+constexpr float kTwoPi = 6.28318530717958647692f;
+
+std::uint16_t ReadU16(const std::uint8_t* bytes)
+{
+    return static_cast<std::uint16_t>(bytes[0]) |
+           static_cast<std::uint16_t>(static_cast<std::uint16_t>(bytes[1]) << 8);
+}
+
+std::uint32_t ReadU32(const std::uint8_t* bytes)
+{
+    return static_cast<std::uint32_t>(bytes[0]) |
+           (static_cast<std::uint32_t>(bytes[1]) << 8) |
+           (static_cast<std::uint32_t>(bytes[2]) << 16) |
+           (static_cast<std::uint32_t>(bytes[3]) << 24);
+}
+
+float DequantizeHeading(std::uint16_t value)
+{
+    return (static_cast<float>(value) / 65535.0f) * kTwoPi;
+}
 
 std::string HexEncode(const unsigned char* bytes, std::size_t size)
 {
@@ -66,6 +88,27 @@ GameConnectionHandler::GameConnectionHandler(gs::db::HandoffTokenRepository& han
 void GameConnectionHandler::OnPayload(std::shared_ptr<gs::network::Session> session,
                                       std::vector<std::uint8_t> payload)
 {
+    if (!payload.empty() && payload[0] == gs::protocol::kCodecBinary) {
+        if (payload.size() != 9 || payload[1] != 0x01) {
+            Disconnect(session, "invalid binary packet");
+            return;
+        }
+
+        const auto sequence = ReadU32(payload.data() + 2);
+        const auto heading_q = ReadU16(payload.data() + 6);
+        const auto raw_state = payload[8];
+        if (raw_state > static_cast<std::uint8_t>(MoveState::Running)) {
+            Disconnect(session, "invalid move state");
+            return;
+        }
+
+        sim_.PostMoveInput(session->Id(),
+                           sequence,
+                           DequantizeHeading(heading_q),
+                           static_cast<MoveState>(raw_state));
+        return;
+    }
+
     std::lock_guard lock(contexts_mutex_);
     auto& ctx = contexts_[session->Id()];
 

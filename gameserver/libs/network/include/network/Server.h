@@ -1,6 +1,7 @@
 #pragma once
 
 #include <cstdint>
+#include <functional>
 
 #include <boost/asio/awaitable.hpp>
 #include <boost/asio/io_context.hpp>
@@ -16,7 +17,8 @@ public:
     Server(boost::asio::io_context& io,
            std::uint16_t port,
            Session::PayloadHandler on_payload,
-           Session::DisconnectHandler on_disconnect);
+           Session::DisconnectHandler on_disconnect,
+           std::function<void(std::shared_ptr<Session>)> on_connect = {});
 
     void Start();
     void Stop();
@@ -28,6 +30,7 @@ private:
     boost::asio::ip::tcp::acceptor acceptor_;
     Session::PayloadHandler on_payload_;
     Session::DisconnectHandler on_disconnect_;
+    std::function<void(std::shared_ptr<Session>)> on_connect_;
     gs::common::SessionId next_session_id_ = 1;
 };
 

@@ -29,9 +29,11 @@
 #endif
 
 #include <chrono>
+#include <cmath>
 #include <cstdio>
 #include <cstdint>
 #include <string>
+#include <vector>
 
 namespace
 {
@@ -72,6 +74,76 @@ void ShowFatal(const char* message)
     std::fprintf(stderr, "%s\n", message);
 #endif
 }
+
+float HeadingFromQuantized(std::uint16_t heading)
+{
+    constexpr float kTwoPi = 6.28318530717958647692f;
+    return (static_cast<float>(heading) / 65535.0f) * kTwoPi;
+}
+
+WorldVec3 ServerMetersToDisplay(client::net::Vec3 position)
+{
+    return {position.x, position.z, -position.y};
+}
+
+WarriorRenderer::MotionState ToWarriorMotion(client::net::MoveState state)
+{
+    switch (state)
+    {
+    case client::net::MoveState::Walking:
+        return WarriorRenderer::MotionState::Walk;
+    case client::net::MoveState::Running:
+        return WarriorRenderer::MotionState::Run;
+    default:
+        return WarriorRenderer::MotionState::Idle;
+    }
+}
+
+struct MovementInputState
+{
+    bool w = false;
+    bool a = false;
+    bool s = false;
+    bool d = false;
+    bool shift = false;
+
+    bool Apply(const InputEvent& event)
+    {
+        if (event.type != InputEvent::KeyDown && event.type != InputEvent::KeyUp)
+            return false;
+
+        const bool pressed = event.type == InputEvent::KeyDown;
+        switch (event.key)
+        {
+        case Key_W: w = pressed; return true;
+        case Key_A: a = pressed; return true;
+        case Key_S: s = pressed; return true;
+        case Key_D: d = pressed; return true;
+        case Key_Shift: shift = pressed; return true;
+        default: return false;
+        }
+    }
+
+    bool HasDirection() const { return w || a || s || d; }
+
+    float DirectionAngle() const
+    {
+        float x = 0.0f;
+        float y = 0.0f;
+        if (w) y += 1.0f;
+        if (s) y -= 1.0f;
+        if (d) x += 1.0f;
+        if (a) x -= 1.0f;
+        return std::atan2(x, y);
+    }
+
+    client::net::MoveState State() const
+    {
+        if (!HasDirection())
+            return client::net::MoveState::Idle;
+        return shift ? client::net::MoveState::Running : client::net::MoveState::Walking;
+    }
+};
 
 std::string ExecutableDirectory()
 {
@@ -145,8 +217,11 @@ int RunGame(NativeWindow& window, client::asset::IAssetReader& assets)
         window.RequestClose();
     });
 
-    window.SetInputCallback([&noesis](const InputEvent& event)
+    MovementInputState movement;
+
+    window.SetInputCallback([&noesis, &movement](const InputEvent& event)
     {
+        movement.Apply(event);
         if (!noesis.OnInput(event))
         {
             // TODO: forward unconsumed events to the game/3D scene input path.
@@ -187,18 +262,90 @@ int RunGame(NativeWindow& window, client::asset::IAssetReader& assets)
         const auto now = std::chrono::steady_clock::now();
         const double seconds = std::chrono::duration<double>(now - startTime).count();
         clientSession.Update();
+        clientSession.SendMoveInput(movement.DirectionAngle(), movement.State());
         noesis.Update(seconds);
 
         device.BeginFrame();
         if (device.IsFrameActive())
         {
-            if (warriorOk)
+            const bool isInWorld = noesis.IsInWorld();
+            std::vector<WorldRenderEntity> entities;
+            WorldCamera camera{};
+
+            if (isInWorld)
+            {
+                entities = noesis.GetWorldEntities();
+                WorldVec3 cameraTarget{};
+                bool hasOwn = false;
+                for (const auto& entity : entities)
+                {
+                    if (entity.netId == noesis.GetOwnNetId())
+                    {
+                        cameraTarget = ServerMetersToDisplay(entity.position);
+                        hasOwn = true;
+                        break;
+                    }
+                }
+                if (!hasOwn && !entities.empty())
+                    cameraTarget = ServerMetersToDisplay(entities.front().position);
+
+                camera = BuildFollowCamera(
+                    renderSize.width,
+                    renderSize.height,
+                    cameraTarget,
+                    movement.HasDirection() ? movement.DirectionAngle() : 0.0f);
+
+                if (warriorOk)
+                {
+                    uint32_t skinSlot = 0;
+                    for (const auto& entity : entities)
+                    {
+                        if (skinSlot >= WarriorRenderer::MaxSkinSlots())
+                            break;
+                        warrior.SkinInstance(device,
+                            skinSlot,
+                            ToWarriorMotion(entity.moveState),
+                            static_cast<float>(seconds));
+                        ++skinSlot;
+                    }
+                }
+            }
+            else if (noesis.IsLobbyActive() && warriorOk)
+            {
                 warrior.Skin(device, seconds);
+            }
+
             noesis.RenderOffscreen(device);
             device.BeginSwapchainRenderPass();
             noesis.RenderOnscreen(device);
 
-            if (noesis.IsLobbyActive() && warriorOk)
+            if (isInWorld)
+            {
+                if (terrainOk)
+                    terrain.Render(device, camera);
+
+                std::vector<NameplateRenderer::Nameplate> plates;
+                plates.reserve(entities.size());
+                uint32_t skinSlot = 0;
+                for (const auto& entity : entities)
+                {
+                    const auto position = ServerMetersToDisplay(entity.position);
+                    if (warriorOk && skinSlot < WarriorRenderer::MaxSkinSlots())
+                    {
+                        warrior.RenderInWorld(device,
+                            seconds,
+                            camera,
+                            position,
+                            HeadingFromQuantized(entity.heading),
+                            skinSlot);
+                    }
+                    plates.push_back(NameplateRenderer::Nameplate{WorldAdd(position, {0.0f, 2.2f, 0.0f}), entity.name, 1, 0});
+                    ++skinSlot;
+                }
+                if (nameplatesOk)
+                    nameplates.Render(device, camera, plates);
+            }
+            else if (noesis.IsLobbyActive() && warriorOk)
                 warrior.Render(device, seconds);
         }
         device.EndFrame();

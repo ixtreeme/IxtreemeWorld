@@ -16,11 +16,13 @@ using boost::asio::ip::tcp;
 Server::Server(asio::io_context& io,
                std::uint16_t port,
                Session::PayloadHandler on_payload,
-               Session::DisconnectHandler on_disconnect)
+               Session::DisconnectHandler on_disconnect,
+               std::function<void(std::shared_ptr<Session>)> on_connect)
     : io_(io)
     , acceptor_(io, tcp::endpoint(tcp::v4(), port))
     , on_payload_(std::move(on_payload))
     , on_disconnect_(std::move(on_disconnect))
+    , on_connect_(std::move(on_connect))
 {
 }
 
@@ -54,6 +56,9 @@ asio::awaitable<void> Server::AcceptLoop()
                      session_id);
 
             auto session = std::make_shared<Session>(std::move(socket), session_id);
+            if (on_connect_) {
+                on_connect_(session);
+            }
             session->Start(on_payload_, on_disconnect_);
         }
     } catch (const boost::system::system_error& error) {

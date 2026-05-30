@@ -22,6 +22,19 @@ struct EntitySpawnInfo {
     std::uint16_t heading = 0;
 };
 
+enum class MoveState : std::uint8_t {
+    Idle = 0,
+    Walking = 1,
+    Running = 2,
+};
+
+struct EntityTransform {
+    std::uint32_t netId = 0;
+    Vec3 position;
+    std::uint16_t heading = 0;
+    MoveState moveState = MoveState::Idle;
+};
+
 struct IClientHandler {
     virtual ~IClientHandler() = default;
 
@@ -43,6 +56,8 @@ struct IClientHandler {
     virtual void OnEnterWorldRejected(const std::string& reason) = 0;
     virtual void OnEntitySpawn(const EntitySpawnInfo& entity) = 0;
     virtual void OnEntityDespawn(std::uint32_t net_id) = 0;
+    virtual void OnEntityTransforms(std::uint32_t server_tick,
+                                    const std::vector<EntityTransform>& transforms) = 0;
 };
 
 } // namespace client::net

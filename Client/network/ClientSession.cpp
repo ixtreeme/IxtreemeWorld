@@ -4,7 +4,9 @@
 #include <capnp/message.h>
 
 #include <array>
+#include <cmath>
 #include <cstdio>
+#include <cstring>
 #include <deque>
 #include <optional>
 #include <utility>
@@ -23,6 +25,7 @@ namespace {
 
 constexpr std::size_t kHeaderSize = 4;
 constexpr std::size_t kMaxPayloadSize = 64 * 1024;
+constexpr float kTwoPi = 6.28318530717958647692f;
 
 void LogNet(const char* message)
 {
@@ -37,6 +40,13 @@ void LogNetFormat(const char* format, const std::string& value)
 {
     char buffer[512];
     std::snprintf(buffer, sizeof(buffer), format, value.c_str());
+    LogNet(buffer);
+}
+
+void LogNetFormat(const char* format, const std::string& first, const std::string& second)
+{
+    char buffer[512];
+    std::snprintf(buffer, sizeof(buffer), format, first.c_str(), second.c_str());
     LogNet(buffer);
 }
 
@@ -67,6 +77,53 @@ std::optional<std::size_t> ParseLengthPrefix(const std::uint8_t* bytes)
     return static_cast<std::size_t>(length);
 }
 
+void WriteU16(std::vector<std::uint8_t>& out, std::uint16_t value)
+{
+    out.push_back(static_cast<std::uint8_t>(value & 0xff));
+    out.push_back(static_cast<std::uint8_t>((value >> 8) & 0xff));
+}
+
+void WriteU32(std::vector<std::uint8_t>& out, std::uint32_t value)
+{
+    out.push_back(static_cast<std::uint8_t>(value & 0xff));
+    out.push_back(static_cast<std::uint8_t>((value >> 8) & 0xff));
+    out.push_back(static_cast<std::uint8_t>((value >> 16) & 0xff));
+    out.push_back(static_cast<std::uint8_t>((value >> 24) & 0xff));
+}
+
+std::uint16_t ReadU16(const std::uint8_t* bytes)
+{
+    return static_cast<std::uint16_t>(bytes[0]) |
+           static_cast<std::uint16_t>(static_cast<std::uint16_t>(bytes[1]) << 8);
+}
+
+std::uint32_t ReadU32(const std::uint8_t* bytes)
+{
+    return static_cast<std::uint32_t>(bytes[0]) |
+           (static_cast<std::uint32_t>(bytes[1]) << 8) |
+           (static_cast<std::uint32_t>(bytes[2]) << 16) |
+           (static_cast<std::uint32_t>(bytes[3]) << 24);
+}
+
+float ReadF32(const std::uint8_t* bytes)
+{
+    std::uint32_t bits = ReadU32(bytes);
+    float value = 0.0f;
+    std::memcpy(&value, &bits, sizeof(value));
+    return value;
+}
+
+std::uint16_t QuantizeHeading(float angle)
+{
+    while (angle < 0.0f) {
+        angle += kTwoPi;
+    }
+    while (angle >= kTwoPi) {
+        angle -= kTwoPi;
+    }
+    return static_cast<std::uint16_t>(std::lround((angle / kTwoPi) * 65535.0f));
+}
+
 } // namespace
 
 struct ClientSession::Impl {
@@ -93,13 +150,16 @@ struct ClientSession::Impl {
         Disconnect(false);
         io.restart();
         state = State::Connecting;
+        const std::string port_string = std::to_string(port);
+        LogNetFormat("[NET] connect begin %s:%s", host, port_string);
 
         resolver.async_resolve(
             host,
-            std::to_string(port),
-            [this](const boost::system::error_code& error,
+            port_string,
+            [this, host, port_string](const boost::system::error_code& error,
                    boost::asio::ip::tcp::resolver::results_type results) {
                 if (error) {
+                    LogNetFormat("[NET] resolve failed: %s", error.message());
                     state = State::Offline;
                     handler.OnConnectionFailed(error.message());
                     return;
@@ -108,14 +168,18 @@ struct ClientSession::Impl {
                 boost::asio::async_connect(
                     socket,
                     results,
-                    [this](const boost::system::error_code& connect_error,
-                           const boost::asio::ip::tcp::endpoint&) {
+                    [this, host, port_string](const boost::system::error_code& connect_error,
+                           const boost::asio::ip::tcp::endpoint& endpoint) {
                         if (connect_error) {
+                            LogNetFormat("[NET] connect failed: %s", connect_error.message());
                             state = State::Offline;
                             handler.OnConnectionFailed(connect_error.message());
                             return;
                         }
 
+                        LogNetFormat("[NET] connect OK %s:%s",
+                            endpoint.address().to_string(),
+                            std::to_string(endpoint.port()));
                         state = State::WaitingHandshake;
                         StartReadHeader();
                         SendHandshake();
@@ -222,6 +286,31 @@ struct ClientSession::Impl {
         EnqueueFrame(SerializeToFrame(msg));
     }
 
+    void SendMoveInput(float dir_angle, MoveState move_state)
+    {
+        if (state != State::InWorld) {
+            return;
+        }
+
+        std::vector<std::uint8_t> payload;
+        payload.reserve(9);
+        payload.push_back(gs::protocol::kCodecBinary);
+        payload.push_back(0x01);
+        WriteU32(payload, ++move_sequence);
+        WriteU16(payload, QuantizeHeading(dir_angle));
+        payload.push_back(static_cast<std::uint8_t>(move_state));
+
+        std::vector<std::uint8_t> frame;
+        frame.reserve(kHeaderSize + payload.size());
+        const auto length = static_cast<std::uint32_t>(payload.size());
+        frame.push_back(static_cast<std::uint8_t>((length >> 24) & 0xff));
+        frame.push_back(static_cast<std::uint8_t>((length >> 16) & 0xff));
+        frame.push_back(static_cast<std::uint8_t>((length >> 8) & 0xff));
+        frame.push_back(static_cast<std::uint8_t>(length & 0xff));
+        frame.insert(frame.end(), payload.begin(), payload.end());
+        EnqueueFrame(std::move(frame));
+    }
+
     void Update()
     {
         if (state == State::Offline) {
@@ -303,6 +392,11 @@ struct ClientSession::Impl {
 
     void HandlePayload(const std::vector<std::uint8_t>& payload)
     {
+        if (!payload.empty() && payload[0] == gs::protocol::kCodecBinary) {
+            HandleBinaryPayload(payload);
+            return;
+        }
+
         try {
             auto parsed = gs::protocol::ParsePacket(payload);
             if (!parsed) {
@@ -334,6 +428,44 @@ struct ClientSession::Impl {
             LogNetFormat("[NET] invalid packet: %s", exception.getDescription().cStr());
             Disconnect();
         }
+    }
+
+    void HandleBinaryPayload(const std::vector<std::uint8_t>& payload)
+    {
+        if (payload.size() < 2 || payload[1] != 0x10 || payload.size() < 8) {
+            LogNet("[NET] invalid binary payload");
+            return;
+        }
+
+        const auto server_tick = ReadU32(payload.data() + 2);
+        const auto count = ReadU16(payload.data() + 6);
+        constexpr std::size_t header_size = 8;
+        constexpr std::size_t record_size = 19;
+        if (payload.size() != header_size + static_cast<std::size_t>(count) * record_size) {
+            LogNet("[NET] invalid transform payload size");
+            return;
+        }
+
+        std::vector<EntityTransform> transforms;
+        transforms.reserve(count);
+        std::size_t offset = header_size;
+        for (std::uint16_t i = 0; i < count; ++i) {
+            EntityTransform transform;
+            transform.netId = ReadU32(payload.data() + offset);
+            offset += 4;
+            transform.position.x = ReadF32(payload.data() + offset);
+            offset += 4;
+            transform.position.y = ReadF32(payload.data() + offset);
+            offset += 4;
+            transform.position.z = ReadF32(payload.data() + offset);
+            offset += 4;
+            transform.heading = ReadU16(payload.data() + offset);
+            offset += 2;
+            transform.moveState = static_cast<MoveState>(payload[offset++]);
+            transforms.push_back(transform);
+        }
+
+        handler.OnEntityTransforms(server_tick, transforms);
     }
 
     void HandleHandshakeResponse(gs::protocol::HandshakeResponse::Reader response)
@@ -443,6 +575,7 @@ struct ClientSession::Impl {
     std::vector<std::uint8_t> read_payload;
     std::deque<std::vector<std::uint8_t>> send_queue;
     bool writing = false;
+    std::uint32_t move_sequence = 0;
 };
 
 ClientSession::ClientSession(IClientHandler& handler)
@@ -495,6 +628,11 @@ void ClientSession::SendCharacterSelect(std::uint64_t character_id)
 void ClientSession::SendEnterWorld(const std::vector<std::uint8_t>& token)
 {
     m_impl->SendEnterWorld(token);
+}
+
+void ClientSession::SendMoveInput(float dir_angle, MoveState state)
+{
+    m_impl->SendMoveInput(dir_angle, state);
 }
 
 void ClientSession::Update()
