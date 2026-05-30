@@ -9,7 +9,10 @@
 #include <optional>
 #include <utility>
 #include <vector>
+
+#if defined(_WIN32)
 #include <windows.h>
+#endif
 
 #include <protocol/Serialization.h>
 #include <kj/exception.h>
@@ -23,8 +26,10 @@ constexpr std::size_t kMaxPayloadSize = 64 * 1024;
 
 void LogNet(const char* message)
 {
+#if defined(_WIN32)
     OutputDebugStringA(message);
     OutputDebugStringA("\n");
+#endif
     std::fprintf(stderr, "%s\n", message);
 }
 

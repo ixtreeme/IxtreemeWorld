@@ -8,6 +8,10 @@
 #include <string>
 #include <vector>
 
+namespace client::asset {
+class IAssetReader;
+}
+
 class TerrainRenderer
 {
 public:
@@ -49,7 +53,7 @@ public:
         float maxZ = 0.0f;
     };
 
-    bool Create(VulkanDevice& device);
+    bool Create(VulkanDevice& device, client::asset::IAssetReader& assets);
     bool LoadMap(VulkanDevice& device, const std::string& mapDirectory, int32_t serverX, int32_t serverY);
     bool RecreatePipeline(VulkanDevice& device);
     void Render(VulkanDevice& device, const WorldCamera& camera);
@@ -92,6 +96,7 @@ private:
     void UpdateUniform(uint32_t frameIndex, const WorldCamera& camera);
 
     VkDevice m_device = VK_NULL_HANDLE;
+    client::asset::IAssetReader* m_assets = nullptr;
     Buffer m_vertexBuffer;
     Buffer m_indexBuffer;
     std::array<Buffer, kFramesInFlight> m_uniformBuffers{};

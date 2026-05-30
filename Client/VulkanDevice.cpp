@@ -11,14 +11,25 @@
 #include <set>
 #include <string>
 
+#if defined(_WIN32)
+#include <windows.h>
+#endif
+#if defined(__ANDROID__)
+#include <android/log.h>
+#endif
+
 namespace
 {
 const std::vector<const char*> kDeviceExtensions = {VK_KHR_SWAPCHAIN_EXTENSION_NAME};
 
 void Log(const char* text)
 {
+#if defined(_WIN32)
     OutputDebugStringA(text);
     OutputDebugStringA("\n");
+#elif defined(__ANDROID__)
+    __android_log_print(ANDROID_LOG_INFO, "IxtreemeClient", "%s", text);
+#endif
     std::fprintf(stderr, "%s\n", text);
 }
 
@@ -72,6 +83,31 @@ const char* VkFormatName(VkFormat format)
     }
 }
 
+const char* SurfaceTransformName(VkSurfaceTransformFlagBitsKHR transform)
+{
+    switch (transform)
+    {
+    case VK_SURFACE_TRANSFORM_IDENTITY_BIT_KHR: return "IDENTITY";
+    case VK_SURFACE_TRANSFORM_ROTATE_90_BIT_KHR: return "ROTATE_90";
+    case VK_SURFACE_TRANSFORM_ROTATE_180_BIT_KHR: return "ROTATE_180";
+    case VK_SURFACE_TRANSFORM_ROTATE_270_BIT_KHR: return "ROTATE_270";
+    case VK_SURFACE_TRANSFORM_HORIZONTAL_MIRROR_BIT_KHR: return "MIRROR";
+    case VK_SURFACE_TRANSFORM_HORIZONTAL_MIRROR_ROTATE_90_BIT_KHR: return "MIRROR_ROTATE_90";
+    case VK_SURFACE_TRANSFORM_HORIZONTAL_MIRROR_ROTATE_180_BIT_KHR: return "MIRROR_ROTATE_180";
+    case VK_SURFACE_TRANSFORM_HORIZONTAL_MIRROR_ROTATE_270_BIT_KHR: return "MIRROR_ROTATE_270";
+    case VK_SURFACE_TRANSFORM_INHERIT_BIT_KHR: return "INHERIT";
+    default: return "UNKNOWN";
+    }
+}
+
+bool IsQuarterTurn(VkSurfaceTransformFlagBitsKHR transform)
+{
+    return transform == VK_SURFACE_TRANSFORM_ROTATE_90_BIT_KHR ||
+        transform == VK_SURFACE_TRANSFORM_ROTATE_270_BIT_KHR ||
+        transform == VK_SURFACE_TRANSFORM_HORIZONTAL_MIRROR_ROTATE_90_BIT_KHR ||
+        transform == VK_SURFACE_TRANSFORM_HORIZONTAL_MIRROR_ROTATE_270_BIT_KHR;
+}
+
 void CheckVk(VkResult result, const char* call, const char* file, int line)
 {
     if (result == VK_SUCCESS)
@@ -117,12 +153,12 @@ bool HasExtension(const std::vector<VkExtensionProperties>& extensions, const ch
 }
 }
 
-bool VulkanDevice::Create(HWND hwnd, uint32_t width, uint32_t height)
+bool VulkanDevice::Create(NativeWindow& window, uint32_t width, uint32_t height)
 {
     m_width = width;
     m_height = height;
 
-    if (!CreateInstance() || !CreateDebugMessenger() || !CreateSurface(hwnd) ||
+    if (!CreateInstance(window) || !CreateDebugMessenger() || !CreateSurface(window) ||
         !PickPhysicalDevice() || !CreateLogicalDevice() ||
         !CreateSwapchainObjects(width, height) || !CreateCommandPool() ||
         !CreateCommandBuffers() || !CreateSyncObjects())
@@ -159,13 +195,21 @@ void VulkanDevice::BeginFrame()
 
     if (acquire == VK_ERROR_OUT_OF_DATE_KHR)
     {
+        Log("[VULKAN] acquireNextImage: VK_ERROR_OUT_OF_DATE_KHR - rebuilding swap-chain");
         m_swapchainDirty = true;
         return;
     }
+    if (acquire == VK_SUBOPTIMAL_KHR)
+    {
+        static bool warnedAcquireSuboptimal = false;
+        if (!warnedAcquireSuboptimal)
+        {
+            Log("[VULKAN] acquireNextImage: VK_SUBOPTIMAL_KHR (continuing) - this is expected on Android");
+            warnedAcquireSuboptimal = true;
+        }
+    }
     if (acquire != VK_SUCCESS && acquire != VK_SUBOPTIMAL_KHR)
         CheckVk(acquire, "vkAcquireNextImageKHR", __FILE__, __LINE__);
-
-    m_acquiredSuboptimal = acquire == VK_SUBOPTIMAL_KHR;
 
     if (m_imagesInFlight[m_imageIndex] != VK_NULL_HANDLE)
         VK_CHECK(vkWaitForFences(m_device, 1, &m_imagesInFlight[m_imageIndex], VK_TRUE, UINT64_MAX));
@@ -262,9 +306,19 @@ void VulkanDevice::EndFrame()
     present.pImageIndices = &m_imageIndex;
 
     const VkResult result = vkQueuePresentKHR(m_presentQueue, &present);
-    if (result == VK_ERROR_OUT_OF_DATE_KHR || result == VK_SUBOPTIMAL_KHR || m_acquiredSuboptimal)
+    if (result == VK_ERROR_OUT_OF_DATE_KHR)
     {
+        Log("[VULKAN] present: VK_ERROR_OUT_OF_DATE_KHR - rebuilding swap-chain");
         m_swapchainDirty = true;
+    }
+    else if (result == VK_SUBOPTIMAL_KHR)
+    {
+        static bool warnedPresentSuboptimal = false;
+        if (!warnedPresentSuboptimal)
+        {
+            Log("[VULKAN] present: VK_SUBOPTIMAL_KHR (continuing) - this is expected on Android");
+            warnedPresentSuboptimal = true;
+        }
     }
     else if (result != VK_SUCCESS)
     {
@@ -278,6 +332,20 @@ void VulkanDevice::EndFrame()
 
 bool VulkanDevice::Resize(uint32_t width, uint32_t height)
 {
+    if (!m_swapchainDirty && width == m_width && height == m_height)
+    {
+        LogFormat("[VULKAN] Resize ignored: %ux%u unchanged (current window size)", width, height);
+        return false;
+    }
+
+    LogFormat("[VULKAN] Resize requested: window %ux%u -> %ux%u, swapchain extent %ux%u",
+        m_width,
+        m_height,
+        width,
+        height,
+        m_swapchainExtent.width,
+        m_swapchainExtent.height);
+
     m_width = width;
     m_height = height;
 
@@ -337,7 +405,7 @@ void VulkanDevice::Destroy()
     m_instance = VK_NULL_HANDLE;
 }
 
-bool VulkanDevice::CreateInstance()
+bool VulkanDevice::CreateInstance(NativeWindow& window)
 {
 #ifdef _DEBUG
     m_validationEnabled = ValidationLayerAvailable();
@@ -345,16 +413,17 @@ bool VulkanDevice::CreateInstance()
         Log("VK_LAYER_KHRONOS_validation unavailable; continuing without validation.");
 #endif
 
-    std::vector<const char*> extensions = {VK_KHR_SURFACE_EXTENSION_NAME, VK_KHR_WIN32_SURFACE_EXTENSION_NAME};
+    const char* surfaceExtension = window.GetVulkanSurfaceExtensionName();
+    std::vector<const char*> extensions = {VK_KHR_SURFACE_EXTENSION_NAME, surfaceExtension};
     uint32_t extensionCount = 0;
     VK_CHECK(vkEnumerateInstanceExtensionProperties(nullptr, &extensionCount, nullptr));
     std::vector<VkExtensionProperties> availableExtensions(extensionCount);
     VK_CHECK(vkEnumerateInstanceExtensionProperties(nullptr, &extensionCount, availableExtensions.data()));
 
     if (!HasExtension(availableExtensions, VK_KHR_SURFACE_EXTENSION_NAME) ||
-        !HasExtension(availableExtensions, VK_KHR_WIN32_SURFACE_EXTENSION_NAME))
+        !HasExtension(availableExtensions, surfaceExtension))
     {
-        Log("Required Win32 Vulkan surface extensions are not available.");
+        Log("Required Vulkan surface extensions are not available.");
         return false;
     }
 
@@ -416,13 +485,9 @@ bool VulkanDevice::CreateDebugMessenger()
     return true;
 }
 
-bool VulkanDevice::CreateSurface(HWND hwnd)
+bool VulkanDevice::CreateSurface(NativeWindow& window)
 {
-    VkWin32SurfaceCreateInfoKHR create{};
-    create.sType = VK_STRUCTURE_TYPE_WIN32_SURFACE_CREATE_INFO_KHR;
-    create.hinstance = GetModuleHandleA(nullptr);
-    create.hwnd = hwnd;
-    VK_CHECK(vkCreateWin32SurfaceKHR(m_instance, &create, nullptr, &m_surface));
+    VK_CHECK(window.CreateVulkanSurface(m_instance, &m_surface));
     return true;
 }
 
@@ -504,14 +569,16 @@ bool VulkanDevice::CreateLogicalDevice()
 
     VkPhysicalDeviceFeatures supported{};
     vkGetPhysicalDeviceFeatures(m_physicalDevice, &supported);
-    if (!supported.fillModeNonSolid)
-    {
-        Log("Selected Vulkan device does not support fillModeNonSolid required by Noesis VKRenderDevice.");
-        return false;
-    }
 
     VkPhysicalDeviceFeatures enabled{};
-    enabled.fillModeNonSolid = VK_TRUE;
+    if (supported.fillModeNonSolid)
+    {
+        enabled.fillModeNonSolid = VK_TRUE;
+    }
+    else
+    {
+        Log("Vulkan device does not support fillModeNonSolid; wireframe/line polygon modes are disabled.");
+    }
     create.pEnabledFeatures = &enabled;
 
     VK_CHECK(vkCreateDevice(m_physicalDevice, &create, nullptr, &m_device));
@@ -534,6 +601,40 @@ bool VulkanDevice::CreateSwapchain(uint32_t width, uint32_t height)
     SwapchainSupport support = QuerySwapchainSupport(m_physicalDevice);
     VkSurfaceFormatKHR format = ChooseSurfaceFormat(support.formats);
     VkExtent2D extent = ChooseExtent(support.capabilities, width, height);
+    VkSurfaceTransformFlagBitsKHR preTransform = support.capabilities.currentTransform;
+
+    Log("[VULKAN] Surface capabilities:");
+    LogFormat("[VULKAN]   currentExtent = %u x %u",
+        support.capabilities.currentExtent.width,
+        support.capabilities.currentExtent.height);
+    LogFormat("[VULKAN]   currentTransform = %s (0x%x)",
+        SurfaceTransformName(support.capabilities.currentTransform),
+        static_cast<unsigned int>(support.capabilities.currentTransform));
+    LogFormat("[VULKAN]   supportedTransforms = 0x%x",
+        static_cast<unsigned int>(support.capabilities.supportedTransforms));
+    LogFormat("[VULKAN]   minImageCount = %u, maxImageCount = %u",
+        support.capabilities.minImageCount,
+        support.capabilities.maxImageCount);
+
+    if (IsQuarterTurn(support.capabilities.currentTransform))
+    {
+        if (support.capabilities.currentExtent.width == UINT32_MAX)
+        {
+            std::swap(extent.width, extent.height);
+            LogFormat("[VULKAN] Quarter-turn surface transform: swapped render extent to %u x %u",
+                extent.width,
+                extent.height);
+        }
+        else if (support.capabilities.supportedTransforms & VK_SURFACE_TRANSFORM_IDENTITY_BIT_KHR)
+        {
+            preTransform = VK_SURFACE_TRANSFORM_IDENTITY_BIT_KHR;
+            Log("[VULKAN] Quarter-turn fixed currentExtent: using IDENTITY preTransform so Android compositor handles rotation.");
+        }
+        else
+        {
+            Log("[VULKAN] Quarter-turn fixed currentExtent without IDENTITY support: shader pre-rotation will be needed if output is rotated.");
+        }
+    }
 
     // min+1 avoids stalling on the exact minimum while respecting platform maxImageCount.
     uint32_t imageCount = support.capabilities.minImageCount + 1;
@@ -562,10 +663,17 @@ bool VulkanDevice::CreateSwapchain(uint32_t width, uint32_t height)
         create.imageSharingMode = VK_SHARING_MODE_EXCLUSIVE;
     }
 
-    create.preTransform = support.capabilities.currentTransform;
+    create.preTransform = preTransform;
     create.compositeAlpha = VK_COMPOSITE_ALPHA_OPAQUE_BIT_KHR;
     create.presentMode = VK_PRESENT_MODE_FIFO_KHR; // FIFO is guaranteed and avoids tearing.
     create.clipped = VK_TRUE;
+
+    LogFormat("[VULKAN] Swap-chain create: preTransform=%s imageExtent=%u x %u requestedWindow=%u x %u",
+        SurfaceTransformName(create.preTransform),
+        create.imageExtent.width,
+        create.imageExtent.height,
+        width,
+        height);
 
     VK_CHECK(vkCreateSwapchainKHR(m_device, &create, nullptr, &m_swapchain));
     VK_CHECK(vkGetSwapchainImagesKHR(m_device, m_swapchain, &imageCount, nullptr));
@@ -574,7 +682,14 @@ bool VulkanDevice::CreateSwapchain(uint32_t width, uint32_t height)
 
     m_swapchainFormat = format.format;
     m_swapchainExtent = extent;
+    m_currentTransform = support.capabilities.currentTransform;
     m_imagesInFlight.assign(imageCount, VK_NULL_HANDLE);
+
+    LogFormat("[VULKAN] Swap-chain created with preTransform=%s imageExtent=%u x %u imageCount=%u",
+        SurfaceTransformName(preTransform),
+        m_swapchainExtent.width,
+        m_swapchainExtent.height,
+        imageCount);
 
     VkSemaphoreCreateInfo sem{};
     sem.sType = VK_STRUCTURE_TYPE_SEMAPHORE_CREATE_INFO;

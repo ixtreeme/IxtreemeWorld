@@ -1,6 +1,7 @@
 #include "TerrainRenderer.h"
 
 #include "Debug.h"
+#include "asset/IAssetReader.h"
 
 #include <algorithm>
 #include <array>
@@ -9,13 +10,11 @@
 #include <cstdio>
 #include <cstdlib>
 #include <cstring>
-#include <fstream>
 #include <limits>
 #include <sstream>
 #include <string>
 #include <unordered_map>
 #include <vector>
-#include <windows.h>
 
 namespace
 {
@@ -57,30 +56,17 @@ void CheckVk(VkResult result, const char* call, const char* file, int line)
 
 #define VK_CHECK(call) CheckVk((call), #call, __FILE__, __LINE__)
 
-std::string ExecutableDirectory()
+std::vector<char> ReadBinaryFile(client::asset::IAssetReader& assets, const std::string& path)
 {
-    char path[MAX_PATH]{};
-    GetModuleFileNameA(nullptr, path, MAX_PATH);
-    std::string result(path);
-    const size_t slash = result.find_last_of("\\/");
-    return slash == std::string::npos ? std::string(".") : result.substr(0, slash);
-}
-
-std::vector<char> ReadBinaryFile(const std::string& path)
-{
-    std::ifstream file(path, std::ios::ate | std::ios::binary);
-    if (!file)
+    auto bytes = assets.ReadAll(path);
+    if (!bytes)
     {
         const std::string message = "Failed to open shader: " + path;
         Tracen(message.c_str());
         std::abort();
     }
 
-    const size_t size = static_cast<size_t>(file.tellg());
-    std::vector<char> bytes(size);
-    file.seekg(0);
-    file.read(bytes.data(), bytes.size());
-    return bytes;
+    return std::vector<char>(bytes->begin(), bytes->end());
 }
 
 uint32_t MakeFourCC(char a, char b, char c, char d)
@@ -157,19 +143,16 @@ struct TextureSetEntry
     float scaleV = 1.0f;
 };
 
-bool LoadDdsImage(const std::string& path, DdsImage& out)
+bool LoadDdsImage(client::asset::IAssetReader& assets, const std::string& path, DdsImage& out)
 {
-    std::ifstream file(path, std::ios::binary | std::ios::ate);
-    if (!file)
+    auto maybeBytes = assets.ReadAll(path);
+    if (!maybeBytes)
     {
         Tracenf("[TERRAIN-TEX] failed to open DDS: %s", path.c_str());
         return false;
     }
 
-    const size_t fileSize = static_cast<size_t>(file.tellg());
-    file.seekg(0);
-    std::vector<uint8_t> bytes(fileSize);
-    file.read(reinterpret_cast<char*>(bytes.data()), static_cast<std::streamsize>(bytes.size()));
+    std::vector<uint8_t> bytes = std::move(*maybeBytes);
 
     if (bytes.size() < sizeof(uint32_t) + sizeof(DdsHeader))
         return false;
@@ -256,9 +239,10 @@ bool LoadDdsImage(const std::string& path, DdsImage& out)
     return true;
 }
 
-VkShaderModule CreateShaderModule(VkDevice device, const std::string& path)
+VkShaderModule CreateShaderModule(VkDevice device, client::asset::IAssetReader& assets,
+    const std::string& path)
 {
-    const std::vector<char> code = ReadBinaryFile(path);
+    const std::vector<char> code = ReadBinaryFile(assets, path);
     VkShaderModuleCreateInfo create{};
     create.sType = VK_STRUCTURE_TYPE_SHADER_MODULE_CREATE_INFO;
     create.codeSize = code.size();
@@ -415,12 +399,13 @@ std::string LowerCopy(std::string value)
     return value;
 }
 
-bool ReadMapSetting(const std::string& path, uint32_t& mapSizeX, uint32_t& mapSizeY,
+bool ReadMapSetting(client::asset::IAssetReader& assets, const std::string& path, uint32_t& mapSizeX, uint32_t& mapSizeY,
     uint32_t& baseX, uint32_t& baseY, uint32_t& cellScale, float& heightScale)
 {
-    std::ifstream file(path);
-    if (!file)
+    auto text = assets.ReadText(path);
+    if (!text)
         return false;
+    std::istringstream file(*text);
 
     std::string key;
     while (file >> key)
@@ -449,22 +434,18 @@ uint16_t ReadU16LE(const uint8_t* data)
     return static_cast<uint16_t>(data[0]) | (static_cast<uint16_t>(data[1]) << 8);
 }
 
-bool ReadHeightRaw(const std::string& path, std::vector<uint16_t>& heights)
+bool ReadHeightRaw(client::asset::IAssetReader& assets, const std::string& path, std::vector<uint16_t>& heights)
 {
-    std::ifstream file(path, std::ios::binary | std::ios::ate);
-    if (!file)
+    auto bytes = assets.ReadAll(path);
+    if (!bytes)
         return false;
 
-    const size_t size = static_cast<size_t>(file.tellg());
-    if (size != 131u * 131u * sizeof(uint16_t))
+    if (bytes->size() != 131u * 131u * sizeof(uint16_t))
         return false;
 
-    std::vector<uint8_t> bytes(size);
-    file.seekg(0);
-    file.read(reinterpret_cast<char*>(bytes.data()), static_cast<std::streamsize>(bytes.size()));
     heights.resize(131u * 131u);
     for (size_t i = 0; i < heights.size(); ++i)
-        heights[i] = ReadU16LE(bytes.data() + i * sizeof(uint16_t));
+        heights[i] = ReadU16LE(bytes->data() + i * sizeof(uint16_t));
     return true;
 }
 
@@ -519,8 +500,8 @@ std::string ResolveTerrainTexturePath(const std::string& textureSetPath)
     if (pos != std::string::npos)
     {
         std::string relative = textureSetPath.substr(pos + marker.size());
-        std::replace(relative.begin(), relative.end(), '/', '\\');
-        return ExecutableDirectory() + "\\ymi work\\terrainmaps\\" + relative;
+        std::replace(relative.begin(), relative.end(), '\\', '/');
+        return "assets/ymi work/terrainmaps/" + relative;
     }
 
     return textureSetPath;
@@ -535,11 +516,13 @@ float ParseFloatOrDefault(const std::string& value, float fallback)
     return end != begin ? parsed : fallback;
 }
 
-std::string ReadTextureSetPathFromSetting(const std::string& settingPath)
+std::string ReadTextureSetPathFromSetting(client::asset::IAssetReader& assets,
+    const std::string& settingPath)
 {
-    std::ifstream file(settingPath);
-    if (!file)
-        return ExecutableDirectory() + "\\textureset\\metin2_c1.txt";
+    auto text = assets.ReadText(settingPath);
+    if (!text)
+        return "assets/textureset/metin2_c1.txt";
+    std::istringstream file(*text);
 
     std::string key;
     while (file >> key)
@@ -550,25 +533,27 @@ std::string ReadTextureSetPathFromSetting(const std::string& settingPath)
             std::string value;
             file >> value;
             value = Trim(value);
-            std::replace(value.begin(), value.end(), '/', '\\');
+            std::replace(value.begin(), value.end(), '\\', '/');
             if (value.find(':') != std::string::npos || value.rfind("\\\\", 0) == 0)
                 return value;
-            return ExecutableDirectory() + "\\" + value;
+            return value.rfind("assets/", 0) == 0 ? value : "assets/" + value;
         }
 
         std::string rest;
         std::getline(file, rest);
     }
 
-    return ExecutableDirectory() + "\\textureset\\metin2_c1.txt";
+    return "assets/textureset/metin2_c1.txt";
 }
 
-std::vector<TextureSetEntry> LoadTextureSetEntries(const std::string& path)
+std::vector<TextureSetEntry> LoadTextureSetEntries(client::asset::IAssetReader& assets,
+    const std::string& path)
 {
-    std::ifstream file(path);
     std::vector<TextureSetEntry> entries(1);
-    if (!file)
+    auto text = assets.ReadText(path);
+    if (!text)
         return entries;
+    std::istringstream file(*text);
 
     std::string line;
     int currentIndex = 0;
@@ -601,39 +586,36 @@ std::vector<TextureSetEntry> LoadTextureSetEntries(const std::string& path)
     return entries;
 }
 
-std::vector<std::string> LoadTextureSetPaths(const std::string& path)
+std::vector<std::string> LoadTextureSetPaths(client::asset::IAssetReader& assets,
+    const std::string& path)
 {
-    const std::vector<TextureSetEntry> entries = LoadTextureSetEntries(path);
+    const std::vector<TextureSetEntry> entries = LoadTextureSetEntries(assets, path);
     std::vector<std::string> paths(entries.size());
     for (size_t i = 1; i < entries.size(); ++i)
         paths[i] = entries[i].path;
     return paths;
 }
 
-bool ReadTileRaw(const std::string& path, std::vector<uint8_t>& outInterior)
+bool ReadTileRaw(client::asset::IAssetReader& assets, const std::string& path, std::vector<uint8_t>& outInterior)
 {
-    std::ifstream file(path, std::ios::binary | std::ios::ate);
-    if (!file)
+    auto bytes = assets.ReadAll(path);
+    if (!bytes)
         return false;
 
-    const size_t size = static_cast<size_t>(file.tellg());
-    if (size != 258u * 258u)
+    if (bytes->size() != 258u * 258u)
         return false;
-
-    std::vector<uint8_t> bytes(size);
-    file.seekg(0);
-    file.read(reinterpret_cast<char*>(bytes.data()), static_cast<std::streamsize>(bytes.size()));
 
     outInterior.resize(256u * 256u);
     for (uint32_t y = 0; y < 256u; ++y)
     {
-        const uint8_t* src = bytes.data() + (static_cast<size_t>(y) + 1u) * 258u + 1u;
+        const uint8_t* src = bytes->data() + (static_cast<size_t>(y) + 1u) * 258u + 1u;
         std::memcpy(outInterior.data() + static_cast<size_t>(y) * 256u, src, 256u);
     }
     return true;
 }
 
-uint8_t DominantTileIndex(const std::string& mapDirectory, uint32_t mapSizeX, uint32_t mapSizeY)
+uint8_t DominantTileIndex(client::asset::IAssetReader& assets, const std::string& mapDirectory,
+    uint32_t mapSizeX, uint32_t mapSizeY)
 {
     std::array<uint32_t, 256> counts{};
     for (uint32_t cellX = 0; cellX < mapSizeX; ++cellX)
@@ -643,17 +625,14 @@ uint8_t DominantTileIndex(const std::string& mapDirectory, uint32_t mapSizeX, ui
             const uint32_t cellId = cellX * 1000u + cellY;
             char folder[16]{};
             std::snprintf(folder, sizeof(folder), "%06u", cellId);
-            std::ifstream file(mapDirectory + "\\" + folder + "\\tile.raw", std::ios::binary);
-            if (!file)
+            auto bytes = assets.ReadAll(mapDirectory + "/" + folder + "/tile.raw");
+            if (!bytes)
                 continue;
 
-            std::vector<uint8_t> bytes(258u * 258u);
-            file.read(reinterpret_cast<char*>(bytes.data()), static_cast<std::streamsize>(bytes.size()));
-            const std::streamsize read = file.gcount();
-            for (std::streamsize i = 0; i < read; ++i)
+            for (std::size_t i = 0; i < bytes->size(); ++i)
             {
-                if (bytes[static_cast<size_t>(i)] != 0)
-                    ++counts[bytes[static_cast<size_t>(i)]];
+                if ((*bytes)[i] != 0)
+                    ++counts[(*bytes)[i]];
             }
         }
     }
@@ -668,10 +647,11 @@ uint8_t DominantTileIndex(const std::string& mapDirectory, uint32_t mapSizeX, ui
 }
 }
 
-bool TerrainRenderer::Create(VulkanDevice& device)
+bool TerrainRenderer::Create(VulkanDevice& device, client::asset::IAssetReader& assets)
 {
     Destroy();
     m_device = device.GetDevice();
+    m_assets = &assets;
 
     const bool texture = CreateFallbackTexture(device);
     const bool mask = texture ? CreateFallbackMask(device) : false;
@@ -919,6 +899,7 @@ void TerrainRenderer::Destroy()
     m_mapLoaded = false;
     m_heightCmGrid.clear();
     m_device = VK_NULL_HANDLE;
+    m_assets = nullptr;
 }
 
 bool TerrainRenderer::CreateBuffers(VulkanDevice& device)
@@ -960,9 +941,10 @@ bool TerrainRenderer::CreateMapBuffers(VulkanDevice& device, const std::string& 
     uint32_t baseY = 0;
     uint32_t cellScaleCm = 200;
     float heightScale = 0.5f;
-    if (!ReadMapSetting(mapDirectory + "\\setting.txt", m_mapSizeX, m_mapSizeY, baseX, baseY, cellScaleCm, heightScale))
+    if (!m_assets || !ReadMapSetting(*m_assets, mapDirectory + "/setting.txt", m_mapSizeX, m_mapSizeY,
+                         baseX, baseY, cellScaleCm, heightScale))
     {
-        Tracenf("[TERRAIN-MAP] invalid setting.txt: %s", (mapDirectory + "\\setting.txt").c_str());
+        Tracenf("[TERRAIN-MAP] invalid setting.txt: %s", (mapDirectory + "/setting.txt").c_str());
         return false;
     }
 
@@ -986,10 +968,10 @@ bool TerrainRenderer::CreateMapBuffers(VulkanDevice& device, const std::string& 
             const uint32_t cellId = cellX * 1000u + cellY;
             char folder[16]{};
             std::snprintf(folder, sizeof(folder), "%06u", cellId);
-            const std::string heightPath = mapDirectory + "\\" + folder + "\\height.raw";
+            const std::string heightPath = mapDirectory + "/" + folder + "/height.raw";
 
             std::vector<uint16_t> raw;
-            if (!ReadHeightRaw(heightPath, raw))
+            if (!m_assets || !ReadHeightRaw(*m_assets, heightPath, raw))
             {
                 Tracenf("[TERRAIN-MAP] failed height.raw: %s", heightPath.c_str());
                 return false;
@@ -1227,15 +1209,16 @@ bool TerrainRenderer::CreateFallbackMask(VulkanDevice& device)
 bool TerrainRenderer::LoadDominantTerrainTexture(VulkanDevice& device, const std::string& mapDirectory)
 {
     const std::vector<std::string> texturePaths =
-        LoadTextureSetPaths(ReadTextureSetPathFromSetting(mapDirectory + "\\setting.txt"));
-    uint8_t index = DominantTileIndex(mapDirectory, m_mapSizeX, m_mapSizeY);
+        m_assets ? LoadTextureSetPaths(*m_assets, ReadTextureSetPathFromSetting(*m_assets, mapDirectory + "/setting.txt"))
+                 : std::vector<std::string>{};
+    uint8_t index = m_assets ? DominantTileIndex(*m_assets, mapDirectory, m_mapSizeX, m_mapSizeY) : 0;
     if (index == 0 || index >= texturePaths.size() || texturePaths[index].empty())
         index = texturePaths.size() > 5 && !texturePaths[5].empty() ? 5 : 1;
     if (index >= texturePaths.size() || texturePaths[index].empty())
         return false;
 
     DdsImage dds{};
-    if (!LoadDdsImage(texturePaths[index], dds))
+    if (!m_assets || !LoadDdsImage(*m_assets, texturePaths[index], dds))
         return false;
 
     VkFormatProperties props{};
@@ -1330,8 +1313,8 @@ bool TerrainRenderer::LoadTileIndices(const std::string& mapDirectory)
             std::snprintf(folder, sizeof(folder), "%06u", cellId);
 
             std::vector<uint8_t> interior;
-            const std::string tilePath = mapDirectory + "\\" + folder + "\\tile.raw";
-            if (!ReadTileRaw(tilePath, interior))
+            const std::string tilePath = mapDirectory + "/" + folder + "/tile.raw";
+            if (!m_assets || !ReadTileRaw(*m_assets, tilePath, interior))
             {
                 Tracenf("[TERRAIN-TILE] failed tile.raw: %s", tilePath.c_str());
                 m_tileIndices.clear();
@@ -1390,8 +1373,12 @@ bool TerrainRenderer::BuildTerrainLayers(VulkanDevice& device, const std::string
             return coverage[a] > coverage[b];
         });
 
-    const std::string textureSetPath = ReadTextureSetPathFromSetting(mapDirectory + "\\setting.txt");
-    const std::vector<TextureSetEntry> textureSet = LoadTextureSetEntries(textureSetPath);
+    const std::string textureSetPath = m_assets
+        ? ReadTextureSetPathFromSetting(*m_assets, mapDirectory + "/setting.txt")
+        : std::string();
+    const std::vector<TextureSetEntry> textureSet = m_assets
+        ? LoadTextureSetEntries(*m_assets, textureSetPath)
+        : std::vector<TextureSetEntry>{};
     if (textureSet.empty())
     {
         Tracenf("[TERRAIN-SPLAT] failed textureset: %s", textureSetPath.c_str());
@@ -1413,7 +1400,7 @@ bool TerrainRenderer::BuildTerrainLayers(VulkanDevice& device, const std::string
         }
 
         DdsImage dds{};
-        if (!LoadDdsImage(textureSet[textureIndex].path, dds))
+        if (!m_assets || !LoadDdsImage(*m_assets, textureSet[textureIndex].path, dds))
         {
             Tracenf("[TERRAIN-SPLAT] failed DDS index=%u path=%s",
                 textureIndex,
@@ -1731,9 +1718,11 @@ void TerrainRenderer::UpdateDescriptors()
 
 bool TerrainRenderer::CreatePipeline(VulkanDevice& device)
 {
-    const std::string shaderDir = ExecutableDirectory() + "\\shaders\\";
-    VkShaderModule vs = CreateShaderModule(m_device, shaderDir + "terrain_vs.spv");
-    VkShaderModule ps = CreateShaderModule(m_device, shaderDir + "terrain_ps.spv");
+    if (!m_assets)
+        return false;
+
+    VkShaderModule vs = CreateShaderModule(m_device, *m_assets, "assets/shaders/terrain_vs.spv");
+    VkShaderModule ps = CreateShaderModule(m_device, *m_assets, "assets/shaders/terrain_ps.spv");
 
     VkPipelineShaderStageCreateInfo stages[2]{};
     stages[0].sType = VK_STRUCTURE_TYPE_PIPELINE_SHADER_STAGE_CREATE_INFO;

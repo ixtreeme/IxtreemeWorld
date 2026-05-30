@@ -1,6 +1,7 @@
 #include "CubeRenderer.h"
 
-#include <windows.h>
+#include "Debug.h"
+#include "asset/IAssetReader.h"
 
 #include <algorithm>
 #include <array>
@@ -11,7 +12,6 @@
 #include <cstdio>
 #include <cstdlib>
 #include <cstring>
-#include <fstream>
 #include <limits>
 #include <string>
 #include <vector>
@@ -20,9 +20,7 @@ namespace
 {
 void Log(const char* text)
 {
-    OutputDebugStringA(text);
-    OutputDebugStringA("\n");
-    std::fprintf(stderr, "%s\n", text);
+    Tracen(text);
 }
 
 void LogFormat(const char* format, ...)
@@ -176,35 +174,23 @@ Mat4 Perspective(float fovYRadians, float aspect, float zNear, float zFar)
     return r;
 }
 
-std::string ExecutableDirectory()
+std::vector<char> ReadBinaryFile(client::asset::IAssetReader& assets, const std::string& path)
 {
-    char path[MAX_PATH]{};
-    GetModuleFileNameA(nullptr, path, MAX_PATH);
-    std::string result(path);
-    const size_t slash = result.find_last_of("\\/");
-    return slash == std::string::npos ? std::string(".") : result.substr(0, slash);
-}
-
-std::vector<char> ReadBinaryFile(const std::string& path)
-{
-    std::ifstream file(path, std::ios::ate | std::ios::binary);
-    if (!file)
+    auto bytes = assets.ReadAll(path);
+    if (!bytes)
     {
         std::string message = "Failed to open shader: " + path;
         Log(message.c_str());
         std::abort();
     }
 
-    const size_t size = static_cast<size_t>(file.tellg());
-    std::vector<char> bytes(size);
-    file.seekg(0);
-    file.read(bytes.data(), bytes.size());
-    return bytes;
+    return std::vector<char>(bytes->begin(), bytes->end());
 }
 
-VkShaderModule CreateShaderModule(VkDevice device, const std::string& path)
+VkShaderModule CreateShaderModule(VkDevice device, client::asset::IAssetReader& assets,
+    const std::string& path)
 {
-    const std::vector<char> code = ReadBinaryFile(path);
+    const std::vector<char> code = ReadBinaryFile(assets, path);
     VkShaderModuleCreateInfo create{};
     create.sType = VK_STRUCTURE_TYPE_SHADER_MODULE_CREATE_INFO;
     create.codeSize = code.size();
@@ -296,10 +282,11 @@ void LogNdcZRangeOnce(const Mat4& mvp)
 }
 }
 
-bool CubeRenderer::Create(VulkanDevice& device)
+bool CubeRenderer::Create(VulkanDevice& device, client::asset::IAssetReader& assets)
 {
     Destroy();
     m_device = device.GetDevice();
+    m_assets = &assets;
 
     const bool buffers = CreateBuffers(device);
     const bool descriptors = buffers ? CreateDescriptors(device) : false;
@@ -459,6 +446,7 @@ void CubeRenderer::Destroy()
         DestroyBuffer(buffer);
 
     m_device = VK_NULL_HANDLE;
+    m_assets = nullptr;
 }
 
 bool CubeRenderer::CreateBuffers(VulkanDevice& device)
@@ -533,9 +521,11 @@ bool CubeRenderer::CreateDescriptors(VulkanDevice&)
 
 bool CubeRenderer::CreatePipeline(VulkanDevice& device)
 {
-    const std::string shaderDir = ExecutableDirectory() + "\\shaders\\";
-    VkShaderModule vs = CreateShaderModule(m_device, shaderDir + "cube_vs.spv");
-    VkShaderModule ps = CreateShaderModule(m_device, shaderDir + "cube_ps.spv");
+    if (!m_assets)
+        return false;
+
+    VkShaderModule vs = CreateShaderModule(m_device, *m_assets, "assets/shaders/cube_vs.spv");
+    VkShaderModule ps = CreateShaderModule(m_device, *m_assets, "assets/shaders/cube_ps.spv");
 
     VkPipelineShaderStageCreateInfo stages[2]{};
     stages[0].sType = VK_STRUCTURE_TYPE_PIPELINE_SHADER_STAGE_CREATE_INFO;

@@ -1,6 +1,7 @@
 #include "WarriorRenderer.h"
 
-#include <windows.h>
+#include "Debug.h"
+#include "asset/IAssetReader.h"
 #include <granny.h>
 
 #include <algorithm>
@@ -12,9 +13,9 @@
 #include <cstdio>
 #include <cstdlib>
 #include <cstring>
-#include <fstream>
 #include <limits>
 #include <memory>
+#include <optional>
 #include <string>
 #include <vector>
 
@@ -22,9 +23,7 @@ namespace
 {
 void Log(const char* text)
 {
-    OutputDebugStringA(text);
-    OutputDebugStringA("\n");
-    std::fprintf(stderr, "%s\n", text);
+    Tracen(text);
 }
 
 void LogFormat(const char* format, ...)
@@ -247,30 +246,17 @@ const char* MotionStateName(WarriorRenderer::MotionState state)
     }
 }
 
-std::string ExecutableDirectory()
+std::vector<char> ReadBinaryFile(client::asset::IAssetReader& assets, const std::string& path)
 {
-    char path[MAX_PATH]{};
-    GetModuleFileNameA(nullptr, path, MAX_PATH);
-    std::string result(path);
-    const size_t slash = result.find_last_of("\\/");
-    return slash == std::string::npos ? std::string(".") : result.substr(0, slash);
-}
-
-std::vector<char> ReadBinaryFile(const std::string& path)
-{
-    std::ifstream file(path, std::ios::ate | std::ios::binary);
-    if (!file)
+    auto bytes = assets.ReadAll(path);
+    if (!bytes)
     {
         std::string message = "Failed to open shader: " + path;
         Log(message.c_str());
         std::abort();
     }
 
-    const size_t size = static_cast<size_t>(file.tellg());
-    std::vector<char> bytes(size);
-    file.seekg(0);
-    file.read(bytes.data(), bytes.size());
-    return bytes;
+    return std::vector<char>(bytes->begin(), bytes->end());
 }
 
 uint32_t MakeFourCC(char a, char b, char c, char d)
@@ -304,6 +290,7 @@ const char* VkFormatName(VkFormat format)
     case VK_FORMAT_BC2_SRGB_BLOCK: return "VK_FORMAT_BC2_SRGB_BLOCK";
     case VK_FORMAT_BC3_SRGB_BLOCK: return "VK_FORMAT_BC3_SRGB_BLOCK";
     case VK_FORMAT_BC7_SRGB_BLOCK: return "VK_FORMAT_BC7_SRGB_BLOCK";
+    case VK_FORMAT_R8G8B8A8_UNORM: return "VK_FORMAT_R8G8B8A8_UNORM";
     case VK_FORMAT_R8G8B8A8_SRGB: return "VK_FORMAT_R8G8B8A8_SRGB";
     case VK_FORMAT_B8G8R8A8_SRGB: return "VK_FORMAT_B8G8R8A8_SRGB";
     default: return "VK_FORMAT_UNDEFINED";
@@ -323,19 +310,16 @@ bool DxgiFormatToVk(uint32_t dxgiFormat, VkFormat& format, uint32_t& blockBytes,
     }
 }
 
-bool LoadDdsImage(const std::string& path, DdsImage& out)
+bool LoadDdsImage(client::asset::IAssetReader& assets, const std::string& path, DdsImage& out)
 {
-    std::ifstream file(path, std::ios::binary | std::ios::ate);
-    if (!file)
+    auto maybeBytes = assets.ReadAll(path);
+    if (!maybeBytes)
     {
         LogFormat("[DDS] failed to open %s", path.c_str());
         return false;
     }
 
-    const size_t fileSize = static_cast<size_t>(file.tellg());
-    file.seekg(0);
-    std::vector<uint8_t> bytes(fileSize);
-    file.read(reinterpret_cast<char*>(bytes.data()), bytes.size());
+    std::vector<uint8_t> bytes = std::move(*maybeBytes);
 
     if (bytes.size() < sizeof(uint32_t) + sizeof(DdsHeader))
     {
@@ -482,9 +466,37 @@ bool LoadDdsImage(const std::string& path, DdsImage& out)
     return true;
 }
 
-VkShaderModule CreateShaderModule(VkDevice device, const std::string& path)
+DdsImage CreateFallbackWhiteDdsImage(const std::string& sourcePath)
 {
-    const std::vector<char> code = ReadBinaryFile(path);
+    DdsImage out{};
+    const size_t slash = sourcePath.find_last_of("\\/");
+    const std::string filename = slash == std::string::npos ? sourcePath : sourcePath.substr(slash + 1);
+
+    out.filename = filename + " (fallback white)";
+    out.width = 4;
+    out.height = 4;
+    out.mipLevels = 1;
+    out.bytesPerPixel = 4;
+    out.compressed = false;
+    out.srgb = false;
+    out.format = VK_FORMAT_R8G8B8A8_UNORM;
+    out.pixels.assign(static_cast<size_t>(out.width) * out.height * out.bytesPerPixel, 0xff);
+
+    VkBufferImageCopy region{};
+    region.bufferOffset = 0;
+    region.imageSubresource.aspectMask = VK_IMAGE_ASPECT_COLOR_BIT;
+    region.imageSubresource.mipLevel = 0;
+    region.imageSubresource.baseArrayLayer = 0;
+    region.imageSubresource.layerCount = 1;
+    region.imageExtent = {out.width, out.height, 1};
+    out.regions.push_back(region);
+    return out;
+}
+
+VkShaderModule CreateShaderModule(VkDevice device, client::asset::IAssetReader& assets,
+    const std::string& path)
+{
+    const std::vector<char> code = ReadBinaryFile(assets, path);
     VkShaderModuleCreateInfo create{};
     create.sType = VK_STRUCTURE_TYPE_SHADER_MODULE_CREATE_INFO;
     create.codeSize = code.size();
@@ -824,10 +836,12 @@ bool MeshUsesFaceTexture(granny_mesh* mesh)
 }
 }
 
-bool WarriorRenderer::Create(VulkanDevice& device, const std::string& modelPath)
+bool WarriorRenderer::Create(VulkanDevice& device, client::asset::IAssetReader& assets,
+    const std::string& modelPath)
 {
     Destroy();
     m_device = device.GetDevice();
+    m_assets = &assets;
 
     const bool loaded = LoadGrannyMesh(modelPath);
     const bool buffers = loaded ? CreateBuffers(device) : false;
@@ -1148,15 +1162,20 @@ void WarriorRenderer::Destroy()
     m_rawMeshes.clear();
     m_indexCount = 0;
     m_device = VK_NULL_HANDLE;
+    m_assets = nullptr;
 }
 
 bool WarriorRenderer::LoadGrannyMesh(const std::string& modelPath)
 {
     DestroyAnimation();
-    m_grannyFile = GrannyReadEntireFile(modelPath.c_str());
+    auto modelBytes = m_assets ? m_assets->ReadAll(modelPath) : std::nullopt;
+    m_grannyFile = modelBytes
+        ? GrannyReadEntireFileFromMemory(static_cast<granny_int32x>(modelBytes->size()),
+              modelBytes->data())
+        : nullptr;
     if (!m_grannyFile)
     {
-        LogFormat("[MESH] GrannyReadEntireFile failed: %s", modelPath.c_str());
+        LogFormat("[MESH] GrannyReadEntireFileFromMemory failed: %s", modelPath.c_str());
         return false;
     }
 
@@ -1191,10 +1210,10 @@ bool WarriorRenderer::LoadGrannyMesh(const std::string& modelPath)
         return false;
     }
 
-    const std::string baseAnimDir = dir + "\\BaseAnim";
-    if (!LoadMotionAnimation(baseAnimDir + "\\wait.gr2", MotionState::Idle) ||
-        !LoadMotionAnimation(baseAnimDir + "\\walk.gr2", MotionState::Walk) ||
-        !LoadMotionAnimation(baseAnimDir + "\\run.gr2", MotionState::Run))
+    const std::string baseAnimDir = dir + "/BaseAnim";
+    if (!LoadMotionAnimation(baseAnimDir + "/wait.gr2", MotionState::Idle) ||
+        !LoadMotionAnimation(baseAnimDir + "/walk.gr2", MotionState::Walk) ||
+        !LoadMotionAnimation(baseAnimDir + "/run.gr2", MotionState::Run))
     {
         DestroyAnimation();
         return false;
@@ -1369,10 +1388,13 @@ bool WarriorRenderer::LoadMotionAnimation(const std::string& path, MotionState s
 {
     AnimationClip& clip = m_motionClips[MotionIndex(state)];
     clip.path = path;
-    clip.file = GrannyReadEntireFile(path.c_str());
+    auto bytes = m_assets ? m_assets->ReadAll(path) : std::nullopt;
+    clip.file = bytes
+        ? GrannyReadEntireFileFromMemory(static_cast<granny_int32x>(bytes->size()), bytes->data())
+        : nullptr;
     if (!clip.file)
     {
-        LogFormat("[ANIM] GrannyReadEntireFile failed: %s", path.c_str());
+        LogFormat("[ANIM] GrannyReadEntireFileFromMemory failed: %s", path.c_str());
         return false;
     }
 
@@ -1747,8 +1769,8 @@ bool WarriorRenderer::CreateTextures(VulkanDevice& device, const std::string& mo
     const size_t slash = modelPath.find_last_of("\\/");
     const std::string dir = slash == std::string::npos ? std::string(".") : modelPath.substr(0, slash);
     const std::array<std::string, kTextureCount> textureFiles = {
-        dir + "\\warrior_4-1.dds",
-        dir + "\\warrior_face.DDS"};
+        dir + "/warrior_4-1.dds",
+        dir + "/warrior_face.DDS"};
 
     VkQueue graphicsQueue = VK_NULL_HANDLE;
     vkGetDeviceQueue(m_device, device.GetGraphicsQueueFamily(), 0, &graphicsQueue);
@@ -1756,8 +1778,12 @@ bool WarriorRenderer::CreateTextures(VulkanDevice& device, const std::string& mo
     for (uint32_t textureIndex = 0; textureIndex < kTextureCount; ++textureIndex)
     {
         DdsImage dds{};
-        if (!LoadDdsImage(textureFiles[textureIndex], dds))
-            return false;
+        if (!m_assets || !LoadDdsImage(*m_assets, textureFiles[textureIndex], dds))
+        {
+            LogFormat("[DDS] Falling back to 4x4 white RGBA8888 texture for %s",
+                textureFiles[textureIndex].c_str());
+            dds = CreateFallbackWhiteDdsImage(textureFiles[textureIndex]);
+        }
 
         VkFormatProperties props{};
         vkGetPhysicalDeviceFormatProperties(device.GetPhysicalDevice(), dds.format, &props);
@@ -1769,7 +1795,18 @@ bool WarriorRenderer::CreateTextures(VulkanDevice& device, const std::string& mo
                 dds.filename.c_str(),
                 VkFormatName(dds.format),
                 props.optimalTilingFeatures);
-            return false;
+            LogFormat("[DDS] Falling back to 4x4 white RGBA8888 texture for %s",
+                dds.filename.c_str());
+            dds = CreateFallbackWhiteDdsImage(dds.filename);
+            vkGetPhysicalDeviceFormatProperties(device.GetPhysicalDevice(), dds.format, &props);
+            if ((props.optimalTilingFeatures & required) != required)
+            {
+                LogFormat("[DDS] fallback texture format unsupported for %s format=%s features=0x%08x",
+                    dds.filename.c_str(),
+                    VkFormatName(dds.format),
+                    props.optimalTilingFeatures);
+                return false;
+            }
         }
 
         Texture& texture = m_textures[textureIndex];
@@ -2025,8 +2062,10 @@ bool WarriorRenderer::CreateComputeDescriptors()
 
 bool WarriorRenderer::CreateComputePipeline()
 {
-    const std::string shaderDir = ExecutableDirectory() + "\\shaders\\";
-    VkShaderModule cs = CreateShaderModule(m_device, shaderDir + "warrior_cs.spv");
+    if (!m_assets)
+        return false;
+
+    VkShaderModule cs = CreateShaderModule(m_device, *m_assets, "assets/shaders/warrior_cs.spv");
 
     VkPushConstantRange push{};
     push.stageFlags = VK_SHADER_STAGE_COMPUTE_BIT;
@@ -2057,9 +2096,11 @@ bool WarriorRenderer::CreateComputePipeline()
 
 bool WarriorRenderer::CreatePipeline(VulkanDevice& device)
 {
-    const std::string shaderDir = ExecutableDirectory() + "\\shaders\\";
-    VkShaderModule vs = CreateShaderModule(m_device, shaderDir + "warrior_vs.spv");
-    VkShaderModule ps = CreateShaderModule(m_device, shaderDir + "warrior_ps.spv");
+    if (!m_assets)
+        return false;
+
+    VkShaderModule vs = CreateShaderModule(m_device, *m_assets, "assets/shaders/warrior_vs.spv");
+    VkShaderModule ps = CreateShaderModule(m_device, *m_assets, "assets/shaders/warrior_ps.spv");
 
     VkPipelineShaderStageCreateInfo stages[2]{};
     stages[0].sType = VK_STRUCTURE_TYPE_PIPELINE_SHADER_STAGE_CREATE_INFO;

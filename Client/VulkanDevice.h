@@ -1,9 +1,7 @@
 #pragma once
 
-#include <windows.h>
-#ifndef VK_USE_PLATFORM_WIN32_KHR
-#define VK_USE_PLATFORM_WIN32_KHR
-#endif
+#include "NativeWindow.h"
+
 #include <vulkan/vulkan.h>
 #include <cstdint>
 #include <vector>
@@ -11,7 +9,7 @@
 class VulkanDevice
 {
 public:
-    bool Create(HWND hwnd, uint32_t width, uint32_t height);
+    bool Create(NativeWindow& window, uint32_t width, uint32_t height);
     void BeginFrame();
     void BeginSwapchainRenderPass();
     void EndFrame();
@@ -28,6 +26,7 @@ public:
     VkCommandBuffer GetCommandBuffer() const { return m_commandBuffers[m_currentFrame]; }
     uint32_t GetFrameIndex() const { return m_currentFrame; }
     VkExtent2D GetSwapchainExtent() const { return m_swapchainExtent; }
+    VkSurfaceTransformFlagBitsKHR GetSurfaceTransform() const { return m_currentTransform; }
     uint64_t GetFrameNumber() const { return m_frameNumber; }
     uint64_t GetSafeFrameNumber() const { return m_safeFrameNumber; }
     uint32_t GetWidth() const { return m_width; }
@@ -52,9 +51,9 @@ private:
         std::vector<VkPresentModeKHR> presentModes;
     };
 
-    bool CreateInstance();
+    bool CreateInstance(NativeWindow& window);
     bool CreateDebugMessenger();
-    bool CreateSurface(HWND hwnd);
+    bool CreateSurface(NativeWindow& window);
     bool PickPhysicalDevice();
     bool CreateLogicalDevice();
     bool CreateSwapchainObjects(uint32_t width, uint32_t height);
@@ -90,6 +89,7 @@ private:
     VkSwapchainKHR m_swapchain = VK_NULL_HANDLE;
     VkFormat m_swapchainFormat = VK_FORMAT_UNDEFINED;
     VkExtent2D m_swapchainExtent{};
+    VkSurfaceTransformFlagBitsKHR m_currentTransform = VK_SURFACE_TRANSFORM_IDENTITY_BIT_KHR;
     std::vector<VkImage> m_swapchainImages;
     std::vector<VkImageView> m_swapchainImageViews;
     std::vector<VkFramebuffer> m_framebuffers;
@@ -117,6 +117,5 @@ private:
     bool m_skipFrame = false;
     bool m_renderPassStarted = false;
     bool m_swapchainDirty = false;
-    bool m_acquiredSuboptimal = false;
     bool m_validationEnabled = false;
 };

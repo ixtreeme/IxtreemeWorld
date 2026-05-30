@@ -2,7 +2,6 @@
 
 #include "InputEvent.h"
 #include "network/IClientHandler.h"
-#include "network/LegacyBridge.h"
 
 #include <cstdint>
 #include <functional>
@@ -14,6 +13,10 @@ namespace client::net {
 class ClientSession;
 }
 
+namespace client::asset {
+class IAssetReader;
+}
+
 class VulkanDevice;
 
 class NoesisLayer : public client::net::IClientHandler
@@ -22,24 +25,18 @@ public:
     NoesisLayer();
     ~NoesisLayer();
 
-    bool Create(VulkanDevice& device, uint32_t width, uint32_t height);
+    bool Create(VulkanDevice& device, client::asset::IAssetReader& assets, uint32_t width,
+        uint32_t height);
     void Update(double timeSeconds);
     void RenderOffscreen(VulkanDevice& device);
     void RenderOnscreen(VulkanDevice& device);
     void OnRenderPassChanged(VulkanDevice& device);
     void Resize(uint32_t width, uint32_t height);
     bool IsLobbyActive() const;
-    bool IsWorldActive() const;
     bool IsInGameMenuOpen() const;
-    bool IsQuestPanelOpen() const;
-    bool IsCharacterPanelOpen() const;
     void ToggleInGameMenu();
-    void ToggleQuestPanel();
-    void ToggleCharacterPanel();
     void SetQuitCallback(std::function<void()> callback);
     void SetClientSession(client::net::ClientSession* session);
-    const TWorldEnterInfo& GetWorldEnterInfo() const;
-    const std::vector<TWorldEntityInfo>& GetWorldEntities() const;
     bool OnInput(const InputEvent& event);
 
     void OnConnectionFailed(const std::string& reason) override;

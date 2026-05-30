@@ -1,6 +1,8 @@
 #include "GrannyModel.h"
 
-#include <windows.h>
+#include "Debug.h"
+#include "asset/IAssetReader.h"
+
 #include <granny.h>
 
 #include <cstdarg>
@@ -16,9 +18,7 @@ namespace
 {
 void Log(const char* text)
 {
-    OutputDebugStringA(text);
-    OutputDebugStringA("\n");
-    std::fprintf(stderr, "%s\n", text);
+    Tracen(text);
 }
 
 void LogFormat(const char* format, ...)
@@ -29,6 +29,21 @@ void LogFormat(const char* format, ...)
     std::vsnprintf(buffer, sizeof(buffer), format, args);
     va_end(args);
     Log(buffer);
+}
+
+granny_file* ReadGrannyAsset(client::asset::IAssetReader& assets, const std::string& path,
+    const char* logTag)
+{
+    auto bytes = assets.ReadAll(path);
+    if (!bytes)
+    {
+        LogFormat("[%s] failed to read asset: %s", logTag, path.c_str());
+        return nullptr;
+    }
+
+    // Granny copies the parsed file into its own allocation; the asset buffer only has to
+    // stay alive during this call.
+    return GrannyReadEntireFileFromMemory(static_cast<granny_int32x>(bytes->size()), bytes->data());
 }
 
 const char* Safe(const char* text)
@@ -355,6 +370,11 @@ struct GrannyModel::Impl
     granny_file* file = nullptr;
 };
 
+GrannyModel::GrannyModel(client::asset::IAssetReader& assets)
+    : m_assets(&assets)
+{
+}
+
 GrannyModel::~GrannyModel()
 {
     Destroy();
@@ -366,10 +386,10 @@ bool GrannyModel::LoadAndLog(const std::string& path)
     m_impl = new Impl();
 
     LogFormat("[GRANNY] loading: %s", path.c_str());
-    m_impl->file = GrannyReadEntireFile(path.c_str());
+    m_impl->file = m_assets ? ReadGrannyAsset(*m_assets, path, "GRANNY") : nullptr;
     if (!m_impl->file)
     {
-        Log("[GRANNY] GrannyReadEntireFile failed");
+        Log("[GRANNY] GrannyReadEntireFileFromMemory failed");
         Destroy();
         return false;
     }
@@ -492,10 +512,10 @@ bool GrannyModel::LoadAndLog(const std::string& path)
 bool GrannyModel::LoadAnimationAndCompare(const std::string& modelPath, const std::string& animationPath)
 {
     LogFormat("[ANIM] loading model for bone comparison: %s", modelPath.c_str());
-    granny_file* modelFile = GrannyReadEntireFile(modelPath.c_str());
+    granny_file* modelFile = m_assets ? ReadGrannyAsset(*m_assets, modelPath, "ANIM") : nullptr;
     if (!modelFile)
     {
-        Log("[ANIM] model GrannyReadEntireFile failed");
+        Log("[ANIM] model GrannyReadEntireFileFromMemory failed");
         return false;
     }
 
@@ -518,10 +538,10 @@ bool GrannyModel::LoadAnimationAndCompare(const std::string& modelPath, const st
         modelBoneSet.insert(bone);
 
     LogFormat("[ANIM] loading: %s", animationPath.c_str());
-    granny_file* animFile = GrannyReadEntireFile(animationPath.c_str());
+    granny_file* animFile = m_assets ? ReadGrannyAsset(*m_assets, animationPath, "ANIM") : nullptr;
     if (!animFile)
     {
-        Log("[ANIM] selected.gr2 GrannyReadEntireFile failed");
+        Log("[ANIM] selected.gr2 GrannyReadEntireFileFromMemory failed");
         GrannyFreeFile(modelFile);
         return false;
     }
@@ -641,10 +661,10 @@ bool GrannyModel::ComputeStaticPoseAndLog(const std::string& modelPath, const st
         animationPath.c_str(),
         timeSeconds);
 
-    granny_file* modelFile = GrannyReadEntireFile(modelPath.c_str());
+    granny_file* modelFile = m_assets ? ReadGrannyAsset(*m_assets, modelPath, "POSE") : nullptr;
     if (!modelFile)
     {
-        Log("[POSE] model GrannyReadEntireFile failed");
+        Log("[POSE] model GrannyReadEntireFileFromMemory failed");
         return false;
     }
 
@@ -687,10 +707,10 @@ bool GrannyModel::ComputeStaticPoseAndLog(const std::string& modelPath, const st
         return false;
     }
 
-    animFile = GrannyReadEntireFile(animationPath.c_str());
+    animFile = m_assets ? ReadGrannyAsset(*m_assets, animationPath, "POSE") : nullptr;
     if (!animFile)
     {
-        Log("[POSE] animation GrannyReadEntireFile failed");
+        Log("[POSE] animation GrannyReadEntireFileFromMemory failed");
         cleanup();
         return false;
     }

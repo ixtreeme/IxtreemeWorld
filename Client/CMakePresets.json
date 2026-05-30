@@ -1,0 +1,33 @@
+{
+  "version": 3,
+  "configurePresets": [
+    {
+      "name": "windows-debug",
+      "generator": "Visual Studio 18 2026",
+      "architecture": {
+        "value": "x64",
+        "strategy": "external"
+      },
+      "binaryDir": "${sourceDir}/build/windows-debug",
+      "cacheVariables": {
+        "CMAKE_BUILD_TYPE": "Debug",
+        "CMAKE_TOOLCHAIN_FILE": "$env{VCPKG_ROOT}/scripts/buildsystems/vcpkg.cmake",
+        "VCPKG_TARGET_TRIPLET": "x64-windows-static"
+      }
+    },
+    {
+      "name": "android-arm64-debug",
+      "generator": "Ninja",
+      "binaryDir": "${sourceDir}/build/android-arm64-debug",
+      "cacheVariables": {
+        "CMAKE_BUILD_TYPE": "Debug",
+        "CMAKE_TOOLCHAIN_FILE": "$env{VCPKG_ROOT}/scripts/buildsystems/vcpkg.cmake",
+        "VCPKG_CHAINLOAD_TOOLCHAIN_FILE": "$env{ANDROID_NDK_HOME}/build/cmake/android.toolchain.cmake",
+        "VCPKG_TARGET_TRIPLET": "arm64-android",
+        "ANDROID_PLATFORM": "android-26",
+        "ANDROID_ABI": "arm64-v8a",
+        "ANDROID_STL": "c++_static"
+      }
+    }
+  ]
+}

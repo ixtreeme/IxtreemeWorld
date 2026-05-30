@@ -2,15 +2,30 @@
 
 #include <cstdarg>
 #include <cstdio>
+
+#if defined(_WIN32)
 #include <windows.h>
+#elif defined(__ANDROID__)
+#include <android/log.h>
+#endif
 
 namespace {
 
+#if defined(__ANDROID__)
+constexpr const char* kAndroidLogTag = "IxtreemeClient";
+#endif
+
 void LogLine(const char* text)
 {
+#if defined(_WIN32)
     OutputDebugStringA(text);
     OutputDebugStringA("\n");
     std::fprintf(stderr, "%s\n", text);
+#elif defined(__ANDROID__)
+    __android_log_print(ANDROID_LOG_INFO, kAndroidLogTag, "%s", text);
+#else
+    std::fprintf(stderr, "%s\n", text);
+#endif
 }
 
 void LogFormatV(const char* format, va_list args)

@@ -8,6 +8,10 @@
 #include <string>
 #include <vector>
 
+namespace client::asset {
+class IAssetReader;
+}
+
 class NameplateRenderer
 {
 public:
@@ -35,7 +39,7 @@ public:
         int32_t alignment = 0;
     };
 
-    bool Create(VulkanDevice& device);
+    bool Create(VulkanDevice& device, client::asset::IAssetReader& assets);
     bool RecreatePipeline(VulkanDevice& device);
     void Render(VulkanDevice& device, const WorldCamera& camera, const std::vector<Nameplate>& nameplates);
     void Destroy();
@@ -79,6 +83,7 @@ private:
         const std::string& text, float pixelScale, const float color[4], float fade = 1.0f) const;
 
     VkDevice m_device = VK_NULL_HANDLE;
+    client::asset::IAssetReader* m_assets = nullptr;
     Buffer m_vertexBuffers[kFramesInFlight]{};
     std::array<Buffer, kFramesInFlight> m_uniformBuffers{};
     VkDescriptorSetLayout m_descriptorSetLayout = VK_NULL_HANDLE;

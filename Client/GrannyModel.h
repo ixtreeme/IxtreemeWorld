@@ -2,10 +2,14 @@
 
 #include <string>
 
+namespace client::asset {
+class IAssetReader;
+}
+
 class GrannyModel
 {
 public:
-    GrannyModel() = default;
+    explicit GrannyModel(client::asset::IAssetReader& assets);
     ~GrannyModel();
 
     bool LoadAndLog(const std::string& path);
@@ -16,4 +20,5 @@ public:
 private:
     struct Impl;
     Impl* m_impl = nullptr;
+    client::asset::IAssetReader* m_assets = nullptr;
 };

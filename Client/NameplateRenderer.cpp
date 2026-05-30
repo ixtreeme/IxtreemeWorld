@@ -1,8 +1,11 @@
 #include "NameplateRenderer.h"
 
 #include "Debug.h"
+#include "asset/IAssetReader.h"
 
+#if defined(_WIN32)
 #include <windows.h>
+#endif
 
 #include <algorithm>
 #include <array>
@@ -10,7 +13,6 @@
 #include <cstdio>
 #include <cstdlib>
 #include <cstring>
-#include <fstream>
 #include <string>
 #include <vector>
 
@@ -64,34 +66,22 @@ void CheckVk(VkResult result, const char* call, const char* file, int line)
 
 #define VK_CHECK(call) CheckVk((call), #call, __FILE__, __LINE__)
 
-std::string ExecutableDirectory()
+std::vector<char> ReadBinaryFile(client::asset::IAssetReader& assets, const std::string& path)
 {
-    char path[MAX_PATH]{};
-    GetModuleFileNameA(nullptr, path, MAX_PATH);
-    std::string result(path);
-    const size_t slash = result.find_last_of("\\/");
-    return slash == std::string::npos ? std::string(".") : result.substr(0, slash);
-}
-
-std::vector<char> ReadBinaryFile(const std::string& path)
-{
-    std::ifstream file(path, std::ios::ate | std::ios::binary);
-    if (!file)
+    auto bytes = assets.ReadAll(path);
+    if (!bytes)
     {
         Tracenf("[NAMEPLATE] failed to open shader: %s", path.c_str());
         std::abort();
     }
 
-    const size_t size = static_cast<size_t>(file.tellg());
-    std::vector<char> bytes(size);
-    file.seekg(0);
-    file.read(bytes.data(), bytes.size());
-    return bytes;
+    return std::vector<char>(bytes->begin(), bytes->end());
 }
 
-VkShaderModule CreateShaderModule(VkDevice device, const std::string& path)
+VkShaderModule CreateShaderModule(VkDevice device, client::asset::IAssetReader& assets,
+    const std::string& path)
 {
-    const std::vector<char> code = ReadBinaryFile(path);
+    const std::vector<char> code = ReadBinaryFile(assets, path);
     VkShaderModuleCreateInfo create{};
     create.sType = VK_STRUCTURE_TYPE_SHADER_MODULE_CREATE_INFO;
     create.codeSize = code.size();
@@ -278,10 +268,11 @@ WorldVec3 AddScaled(WorldVec3 origin, WorldVec3 right, float x, WorldVec3 up, fl
 }
 }
 
-bool NameplateRenderer::Create(VulkanDevice& device)
+bool NameplateRenderer::Create(VulkanDevice& device, client::asset::IAssetReader& assets)
 {
     Destroy();
     m_device = device.GetDevice();
+    m_assets = &assets;
 
     const bool atlas = CreateFontAtlas(device);
     const bool buffers = atlas ? CreateBuffers(device) : false;
@@ -388,6 +379,7 @@ void NameplateRenderer::Destroy()
         DestroyBuffer(buffer);
     DestroyTexture(m_fontAtlas);
     m_device = VK_NULL_HANDLE;
+    m_assets = nullptr;
 }
 
 bool NameplateRenderer::CreateBuffers(VulkanDevice& device)
@@ -411,6 +403,9 @@ bool NameplateRenderer::CreateFontAtlas(VulkanDevice& device)
     DestroyTexture(m_fontAtlas);
     m_glyphs = {};
 
+    std::vector<uint8_t> rgba(static_cast<size_t>(kAtlasWidth) * kAtlasHeight * 4u, 0);
+
+#if defined(_WIN32)
     BITMAPINFO info{};
     info.bmiHeader.biSize = sizeof(BITMAPINFOHEADER);
     info.bmiHeader.biWidth = static_cast<LONG>(kAtlasWidth);
@@ -471,7 +466,6 @@ bool NameplateRenderer::CreateFontAtlas(VulkanDevice& device)
     DeleteObject(font);
 
     const uint8_t* bgra = static_cast<const uint8_t*>(bits);
-    std::vector<uint8_t> rgba(static_cast<size_t>(kAtlasWidth) * kAtlasHeight * 4u, 0);
     for (uint32_t i = 0; i < kAtlasWidth * kAtlasHeight; ++i)
     {
         const uint8_t alpha = std::max(std::max(bgra[i * 4u + 0u], bgra[i * 4u + 1u]), bgra[i * 4u + 2u]);
@@ -485,6 +479,34 @@ bool NameplateRenderer::CreateFontAtlas(VulkanDevice& device)
     DeleteObject(bitmap);
     DeleteDC(memoryDc);
     ReleaseDC(nullptr, screenDc);
+#else
+    for (uint32_t glyphIndex = 0; glyphIndex < kGlyphCount; ++glyphIndex)
+    {
+        const char ch = static_cast<char>(kFirstGlyph + glyphIndex);
+        const uint32_t col = glyphIndex % kAtlasColumns;
+        const uint32_t row = glyphIndex / kAtlasColumns;
+        Glyph& glyph = m_glyphs[static_cast<size_t>(ch)];
+        glyph.u0 = static_cast<float>(col * kAtlasCell) / static_cast<float>(kAtlasWidth);
+        glyph.v0 = static_cast<float>(row * kAtlasCell) / static_cast<float>(kAtlasHeight);
+        glyph.u1 = static_cast<float>((col + 1u) * kAtlasCell) / static_cast<float>(kAtlasWidth);
+        glyph.v1 = static_cast<float>((row + 1u) * kAtlasCell) / static_cast<float>(kAtlasHeight);
+        glyph.width = static_cast<float>(kAtlasCell);
+        glyph.height = static_cast<float>(kAtlasCell);
+        glyph.advance = 16.0f;
+
+        for (uint32_t y = row * kAtlasCell + 6; y < row * kAtlasCell + kAtlasCell - 6; ++y)
+        {
+            for (uint32_t x = col * kAtlasCell + 6; x < col * kAtlasCell + kAtlasCell - 6; ++x)
+            {
+                const size_t index = (static_cast<size_t>(y) * kAtlasWidth + x) * 4u;
+                rgba[index + 0] = 255;
+                rgba[index + 1] = 255;
+                rgba[index + 2] = 255;
+                rgba[index + 3] = 180;
+            }
+        }
+    }
+#endif
 
     VkQueue graphicsQueue = VK_NULL_HANDLE;
     vkGetDeviceQueue(m_device, device.GetGraphicsQueueFamily(), 0, &graphicsQueue);
@@ -616,9 +638,11 @@ bool NameplateRenderer::CreateDescriptors()
 
 bool NameplateRenderer::CreatePipeline(VulkanDevice& device)
 {
-    const std::string shaderDir = ExecutableDirectory() + "\\shaders\\";
-    VkShaderModule vs = CreateShaderModule(m_device, shaderDir + "nameplate_vs.spv");
-    VkShaderModule ps = CreateShaderModule(m_device, shaderDir + "nameplate_ps.spv");
+    if (!m_assets)
+        return false;
+
+    VkShaderModule vs = CreateShaderModule(m_device, *m_assets, "assets/shaders/nameplate_vs.spv");
+    VkShaderModule ps = CreateShaderModule(m_device, *m_assets, "assets/shaders/nameplate_ps.spv");
 
     VkPipelineShaderStageCreateInfo stages[2]{};
     stages[0].sType = VK_STRUCTURE_TYPE_PIPELINE_SHADER_STAGE_CREATE_INFO;

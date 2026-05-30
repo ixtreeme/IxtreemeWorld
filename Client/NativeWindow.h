@@ -2,36 +2,25 @@
 
 #include "InputEvent.h"
 
-#include <windows.h>
+#include <vulkan/vulkan_core.h>
+
 #include <cstdint>
 #include <functional>
 
 class NativeWindow
 {
 public:
-    bool Create(HINSTANCE instance, const char* title, uint32_t width, uint32_t height);
-    void Destroy();
+    virtual ~NativeWindow() = default;
 
-    bool PumpMessages();
-    bool ConsumeResize(uint32_t& width, uint32_t& height);
-    void RequestClose();
+    virtual bool PumpMessages() = 0;
+    virtual bool ConsumeResize(uint32_t& width, uint32_t& height) = 0;
+    virtual void RequestClose() = 0;
+
     using InputCallback = std::function<void(const InputEvent&)>;
-    void SetInputCallback(InputCallback cb);
+    virtual void SetInputCallback(InputCallback cb) = 0;
 
-    HWND GetHwnd() const { return m_hwnd; }
-    uint32_t GetWidth() const { return m_width; }
-    uint32_t GetHeight() const { return m_height; }
-
-private:
-    static LRESULT CALLBACK StaticWndProc(HWND hwnd, UINT message, WPARAM wParam, LPARAM lParam);
-    LRESULT WndProc(HWND hwnd, UINT message, WPARAM wParam, LPARAM lParam);
-    void DispatchInput(const InputEvent& event);
-
-    HINSTANCE m_instance = nullptr;
-    HWND m_hwnd = nullptr;
-    uint32_t m_width = 0;
-    uint32_t m_height = 0;
-    bool m_resizePending = false;
-    uint16_t m_pendingHighSurrogate = 0;
-    InputCallback m_inputCallback;
+    virtual uint32_t GetWidth() const = 0;
+    virtual uint32_t GetHeight() const = 0;
+    virtual VkResult CreateVulkanSurface(VkInstance instance, VkSurfaceKHR* outSurface) = 0;
+    virtual const char* GetVulkanSurfaceExtensionName() const = 0;
 };

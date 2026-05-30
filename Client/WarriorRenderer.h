@@ -18,6 +18,10 @@ struct granny_model_instance;
 struct granny_skeleton;
 struct granny_world_pose;
 
+namespace client::asset {
+class IAssetReader;
+}
+
 class WarriorRenderer
 {
 public:
@@ -34,7 +38,8 @@ public:
         VkDeviceMemory memory = VK_NULL_HANDLE;
     };
 
-    bool Create(VulkanDevice& device, const std::string& modelPath);
+    bool Create(VulkanDevice& device, client::asset::IAssetReader& assets,
+        const std::string& modelPath);
     bool RecreatePipeline(VulkanDevice& device);
     void Skin(VulkanDevice& device, double timeSeconds);
     void SkinInstance(VulkanDevice& device, uint32_t skinSlot, MotionState state, float animTimeSeconds);
@@ -157,6 +162,7 @@ private:
     void UpdateWorldUniform(uint32_t frameIndex, uint32_t uniformSlot, const WorldCamera& camera, WorldVec3 position, float yawRadians);
 
     VkDevice m_device = VK_NULL_HANDLE;
+    client::asset::IAssetReader* m_assets = nullptr;
     Buffer m_indexBuffer;
     std::array<std::array<Buffer, kUniformSlots>, kFramesInFlight> m_uniformBuffers{};
     VkDescriptorSetLayout m_descriptorSetLayout = VK_NULL_HANDLE;

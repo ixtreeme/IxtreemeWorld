@@ -4,6 +4,10 @@
 
 #include <array>
 
+namespace client::asset {
+class IAssetReader;
+}
+
 class CubeRenderer
 {
 public:
@@ -13,7 +17,7 @@ public:
         VkDeviceMemory memory = VK_NULL_HANDLE;
     };
 
-    bool Create(VulkanDevice& device);
+    bool Create(VulkanDevice& device, client::asset::IAssetReader& assets);
     bool RecreatePipeline(VulkanDevice& device);
     void Render(VulkanDevice& device, double timeSeconds);
     void Destroy();
@@ -29,6 +33,7 @@ private:
     void UpdateUniform(uint32_t frameIndex, double timeSeconds, float aspect);
 
     VkDevice m_device = VK_NULL_HANDLE;
+    client::asset::IAssetReader* m_assets = nullptr;
     Buffer m_vertexBuffer;
     Buffer m_indexBuffer;
     std::array<Buffer, kFramesInFlight> m_uniformBuffers{};
