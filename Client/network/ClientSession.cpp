@@ -77,6 +77,8 @@ struct ClientSession::Impl {
         HandshakeAccepted,
         Authenticating,
         Authenticated,
+        EnteringWorld,
+        InWorld,
     };
 
     explicit Impl(IClientHandler& h)
@@ -147,7 +149,7 @@ struct ClientSession::Impl {
 
     bool IsAuthenticated() const
     {
-        return state == State::Authenticated;
+        return state == State::Authenticated || state == State::InWorld;
     }
 
     void SendHandshake(std::uint32_t protocol_version = 1,
@@ -189,6 +191,34 @@ struct ClientSession::Impl {
         capnp::MallocMessageBuilder msg;
         auto packet = msg.initRoot<gs::protocol::Packet>();
         packet.initCharacterListRequest();
+        EnqueueFrame(SerializeToFrame(msg));
+    }
+
+    void SendCharacterSelect(std::uint64_t character_id)
+    {
+        if (state != State::Authenticated) {
+            return;
+        }
+
+        capnp::MallocMessageBuilder msg;
+        auto packet = msg.initRoot<gs::protocol::Packet>();
+        auto request = packet.initCharacterSelect();
+        request.setCharacterId(character_id);
+        EnqueueFrame(SerializeToFrame(msg));
+    }
+
+    void SendEnterWorld(const std::vector<std::uint8_t>& token)
+    {
+        if (state != State::HandshakeAccepted) {
+            return;
+        }
+
+        state = State::EnteringWorld;
+        capnp::MallocMessageBuilder msg;
+        auto packet = msg.initRoot<gs::protocol::Packet>();
+        auto request = packet.initEnterWorld();
+        request.setToken(kj::ArrayPtr<const kj::byte>(
+            reinterpret_cast<const kj::byte*>(token.data()), token.size()));
         EnqueueFrame(SerializeToFrame(msg));
     }
 
@@ -287,6 +317,16 @@ struct ClientSession::Impl {
                 HandleLoginResponse(packet.getLoginResponse());
             } else if (packet.isCharacterListResponse()) {
                 HandleCharacterListResponse(packet.getCharacterListResponse());
+            } else if (packet.isEnterWorldToken()) {
+                HandleEnterWorldToken(packet.getEnterWorldToken());
+            } else if (packet.isEnterWorldAccept()) {
+                HandleEnterWorldAccept(packet.getEnterWorldAccept());
+            } else if (packet.isEnterWorldReject()) {
+                HandleEnterWorldReject(packet.getEnterWorldReject());
+            } else if (packet.isEntitySpawn()) {
+                HandleEntitySpawn(packet.getEntitySpawn());
+            } else if (packet.isEntityDespawn()) {
+                handler.OnEntityDespawn(packet.getEntityDespawn().getNetId());
             } else {
                 LogNet("[NET] unexpected packet type");
             }
@@ -348,6 +388,52 @@ struct ClientSession::Impl {
         handler.OnCharacterList(characters);
     }
 
+    void HandleEnterWorldToken(gs::protocol::S2cEnterWorldToken::Reader response)
+    {
+        std::vector<std::uint8_t> token;
+        auto data = response.getToken();
+        token.assign(data.begin(), data.end());
+        handler.OnEnterWorldToken(std::move(token), response.getGameHost().cStr(), response.getGamePort());
+    }
+
+    void HandleEnterWorldAccept(gs::protocol::S2cEnterWorldAccept::Reader response)
+    {
+        state = State::InWorld;
+        auto pos = response.getSpawnPos();
+        handler.OnEnterWorldAccepted(response.getYourNetId(), Vec3{pos.getX(), pos.getY(), pos.getZ()});
+    }
+
+    void HandleEnterWorldReject(gs::protocol::S2cEnterWorldReject::Reader response)
+    {
+        state = State::HandshakeAccepted;
+        switch (response.getReason()) {
+        case gs::protocol::S2cEnterWorldReject::RejectReason::INVALID_TOKEN:
+            handler.OnEnterWorldRejected("Invalid token");
+            break;
+        case gs::protocol::S2cEnterWorldReject::RejectReason::EXPIRED_TOKEN:
+            handler.OnEnterWorldRejected("Expired token");
+            break;
+        case gs::protocol::S2cEnterWorldReject::RejectReason::ALREADY_USED:
+            handler.OnEnterWorldRejected("Token already used");
+            break;
+        default:
+            handler.OnEnterWorldRejected("Enter world failed");
+            break;
+        }
+    }
+
+    void HandleEntitySpawn(gs::protocol::S2cEntitySpawn::Reader response)
+    {
+        auto pos = response.getSpawnPos();
+        EntitySpawnInfo spawn;
+        spawn.netId = response.getNetId();
+        spawn.name = response.getName().cStr();
+        spawn.classId = response.getClassId();
+        spawn.spawnPos = Vec3{pos.getX(), pos.getY(), pos.getZ()};
+        spawn.heading = response.getHeading();
+        handler.OnEntitySpawn(spawn);
+    }
+
     boost::asio::io_context io;
     boost::asio::ip::tcp::socket socket;
     boost::asio::ip::tcp::resolver resolver;
@@ -399,6 +485,16 @@ void ClientSession::SendLogin(const std::string& username, const std::string& pa
 void ClientSession::SendCharacterListRequest()
 {
     m_impl->SendCharacterListRequest();
+}
+
+void ClientSession::SendCharacterSelect(std::uint64_t character_id)
+{
+    m_impl->SendCharacterSelect(character_id);
+}
+
+void ClientSession::SendEnterWorld(const std::vector<std::uint8_t>& token)
+{
+    m_impl->SendEnterWorld(token);
 }
 
 void ClientSession::Update()

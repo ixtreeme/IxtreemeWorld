@@ -1,7 +1,13 @@
 # GameServer config
 
 # TCP port to listen on (IPv4)
-listen_port=11000
+listen_port=12000
+
+# Token game_server identifier. Must match loginserver.conf game_server.
+game_server=127.0.0.1:12000
+
+# Runtime
+io_threads=2
 
 # Logging
 log_level=info

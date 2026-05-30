@@ -35,6 +35,12 @@ public:
     void ListByAccount(AccountId account_id,
                        std::function<void(Result<std::vector<Character>>)> completion);
 
+    void FindById(CharacterId id, std::function<void(Result<Character>)> completion);
+
+    void FindByAccountAndId(AccountId account_id,
+                            CharacterId character_id,
+                            std::function<void(Result<Character>)> completion);
+
 private:
     DbPool& pool_;
 };

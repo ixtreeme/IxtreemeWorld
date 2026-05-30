@@ -1,0 +1,13 @@
+# LoginServer config
+
+# TCP port to listen on (IPv4)
+listen_port=11000
+
+# Game server endpoint handed to clients after character selection.
+game_host=127.0.0.1
+game_port=12000
+game_server=127.0.0.1:12000
+
+# Logging
+log_level=info
+log_file=logs/loginserver.log

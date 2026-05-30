@@ -1,4 +1,5 @@
 #include <csignal>
+#include <algorithm>
 #include <cstdlib>
 #include <cstdint>
 #include <exception>
@@ -6,6 +7,8 @@
 #include <iostream>
 #include <limits>
 #include <string>
+#include <thread>
+#include <vector>
 
 #include <boost/asio/io_context.hpp>
 #include <boost/asio/signal_set.hpp>
@@ -13,15 +16,14 @@
 
 #include "common/Config.h"
 #include "common/Logging.h"
-#include "db/AccountRepository.h"
 #include "db/CharacterRepository.h"
 #include "db/DbConfig.h"
 #include "db/DbPool.h"
+#include "db/HandoffTokenRepository.h"
 #include "network/Server.h"
 
-#include "AuthHandler.h"
-#include "ConnectionHandler.h"
-#include "GameHandler.h"
+#include "GameConnectionHandler.h"
+#include "SimWorld.h"
 
 namespace {
 
@@ -49,12 +51,18 @@ AppOptions ParseArgs(int argc, char* argv[])
 
 std::uint16_t ResolvePort(const gs::common::Config& config)
 {
-    constexpr int kDefaultPort = 11000;
+    constexpr int kDefaultPort = 12000;
     const auto port = config.GetInt("listen_port").value_or(kDefaultPort);
     if (port <= 0 || port > std::numeric_limits<std::uint16_t>::max()) {
         return kDefaultPort;
     }
     return static_cast<std::uint16_t>(port);
+}
+
+std::uint32_t ResolveIoThreads(const gs::common::Config& config)
+{
+    const auto value = config.GetInt("io_threads").value_or(2);
+    return static_cast<std::uint32_t>(std::clamp(value, 1, 4));
 }
 
 } // namespace
@@ -68,6 +76,9 @@ int main(int argc, char* argv[])
         const bool loaded = config.Load(options.config_path);
 
         const auto port = ResolvePort(config);
+        const auto io_threads = ResolveIoThreads(config);
+        const auto game_server =
+            config.GetString("game_server").value_or("127.0.0.1:" + std::to_string(port));
         const auto log_level = config.GetString("log_level").value_or("info");
         const auto log_file = config.GetString("log_file").value_or("logs/gameserver.log");
 
@@ -84,16 +95,16 @@ int main(int argc, char* argv[])
         auto db_config = gs::db::LoadDbConfig(options.database_config_path);
 
         LOG_INFO("GameServer starting on port {}", port);
-
         boost::asio::io_context io;
         gs::db::DbPool db_pool(io, std::move(db_config));
         db_pool.Start();
 
-        gs::db::AccountRepository accounts(db_pool);
         gs::db::CharacterRepository characters(db_pool);
-        gs::server::AuthHandler auth_handler(accounts);
-        gs::server::GameHandler game_handler(characters);
-        gs::server::ConnectionHandler handler(auth_handler, game_handler);
+        gs::db::HandoffTokenRepository handoff_tokens(db_pool);
+        gs::game::SimWorld sim(io);
+        sim.Start();
+
+        gs::game::GameConnectionHandler handler(handoff_tokens, characters, sim, game_server);
         gs::network::Server server(
             io,
             port,
@@ -107,15 +118,30 @@ int main(int argc, char* argv[])
         boost::asio::signal_set signals(io, SIGINT, SIGTERM);
         signals.async_wait([&](const boost::system::error_code& error, int signal_number) {
             if (!error) {
-                LOG_INFO("Received signal {}, stopping server", signal_number);
+                LOG_INFO("Received signal {}, stopping game server", signal_number);
                 server.Stop();
                 io.stop();
             }
         });
 
         server.Start();
+
+        std::vector<std::thread> io_workers;
+        io_workers.reserve(io_threads > 0 ? io_threads - 1 : 0);
+        for (std::uint32_t i = 1; i < io_threads; ++i) {
+            io_workers.emplace_back([&io] {
+                io.run();
+            });
+        }
         io.run();
 
+        for (auto& worker : io_workers) {
+            if (worker.joinable()) {
+                worker.join();
+            }
+        }
+
+        sim.Stop();
         db_pool.Stop();
         LOG_INFO("GameServer shutting down cleanly");
         return 0;

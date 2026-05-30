@@ -54,6 +54,7 @@ vcpkg_require(
 	mariadb-connector-cpp
 	libsodium
 	nlohmann-json
+	flecs
 )
 
 find_package(Boost CONFIG REQUIRED COMPONENTS asio system throw_exception)
@@ -63,5 +64,6 @@ add_subdirectory(libs/common)
 add_subdirectory(${CMAKE_CURRENT_SOURCE_DIR}/../shared/protocol shared_protocol_build)
 add_subdirectory(libs/network)
 add_subdirectory(libs/db)
+add_subdirectory(apps/loginserver)
 add_subdirectory(apps/gameserver)
 add_subdirectory(apps/db_test)

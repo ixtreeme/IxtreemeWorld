@@ -5,6 +5,7 @@
 #include <cstdint>
 #include <memory>
 #include <string>
+#include <vector>
 
 namespace client::net {
 
@@ -25,6 +26,8 @@ public:
                        const std::string& client_build = "vulkan-client-0.1");
     void SendLogin(const std::string& username, const std::string& password);
     void SendCharacterListRequest();
+    void SendCharacterSelect(std::uint64_t character_id);
+    void SendEnterWorld(const std::vector<std::uint8_t>& token);
 
     void Update();
 

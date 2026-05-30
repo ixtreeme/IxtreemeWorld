@@ -7,6 +7,7 @@ add_library(db STATIC
     src/DbPool.cpp
     src/AccountRepository.cpp
     src/CharacterRepository.cpp
+    src/HandoffTokenRepository.cpp
 )
 
 target_include_directories(db

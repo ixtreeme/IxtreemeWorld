@@ -8,6 +8,7 @@
 #include <boost/asio/buffer.hpp>
 #include <boost/asio/co_spawn.hpp>
 #include <boost/asio/detached.hpp>
+#include <boost/asio/post.hpp>
 #include <boost/asio/read.hpp>
 #include <boost/asio/use_awaitable.hpp>
 #include <boost/asio/write.hpp>
@@ -78,20 +79,53 @@ void Session::SendPayloadInternal(std::vector<std::uint8_t> payload, bool close_
     }
 
     auto self = shared_from_this();
-    asio::co_spawn(
+    asio::post(
         socket_.get_executor(),
-        [self, payload = std::move(payload), close_after_send]() mutable -> asio::awaitable<void> {
-            try {
-                co_await self->WriteFrame(std::move(payload));
-                if (close_after_send) {
-                    self->Stop();
-                }
-            } catch (const std::exception& error) {
-                LOG_ERROR("Session {} send error: {}", self->Id(), error.what());
-                self->Stop();
+        [self, payload = std::move(payload), close_after_send]() mutable {
+            if (self->stopped_) {
+                return;
             }
-        },
-        asio::detached);
+
+            self->write_queue_.push_back(
+                PendingWrite{Framing::Encode(payload), close_after_send});
+            if (!self->writing_) {
+                self->StartWriteQueue();
+            }
+        });
+}
+
+void Session::StartWriteQueue()
+{
+    if (stopped_) {
+        return;
+    }
+
+    if (write_queue_.empty()) {
+        writing_ = false;
+        return;
+    }
+
+    writing_ = true;
+    auto self = shared_from_this();
+    asio::async_write(
+        socket_,
+        asio::buffer(write_queue_.front().frame),
+        [self](const boost::system::error_code& error, std::size_t) {
+            if (error) {
+                LOG_ERROR("Session {} send error: {}", self->Id(), error.message());
+                self->Stop();
+                return;
+            }
+
+            const bool close_after_send = self->write_queue_.front().close_after_send;
+            self->write_queue_.pop_front();
+            if (close_after_send) {
+                self->Stop();
+                return;
+            }
+
+            self->StartWriteQueue();
+        });
 }
 
 asio::awaitable<void> Session::ReadLoop()
@@ -130,12 +164,6 @@ asio::awaitable<void> Session::ReadLoop()
 
     Stop();
     LOG_INFO("Session {} stopped", id_);
-}
-
-asio::awaitable<void> Session::WriteFrame(std::vector<std::uint8_t> payload)
-{
-    auto frame = Framing::Encode(payload);
-    co_await asio::async_write(socket_, asio::buffer(frame), asio::use_awaitable);
 }
 
 } // namespace gs::network

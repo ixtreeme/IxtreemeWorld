@@ -46,6 +46,13 @@ public:
     void OnLoginAccepted(uint64_t account_id) override;
     void OnLoginRejected(const std::string& reason) override;
     void OnCharacterList(const std::vector<client::net::CharacterListItem>& characters) override;
+    void OnEnterWorldToken(std::vector<std::uint8_t> token,
+                           const std::string& host,
+                           std::uint16_t port) override;
+    void OnEnterWorldAccepted(std::uint32_t net_id, client::net::Vec3 spawn_pos) override;
+    void OnEnterWorldRejected(const std::string& reason) override;
+    void OnEntitySpawn(const client::net::EntitySpawnInfo& entity) override;
+    void OnEntityDespawn(std::uint32_t net_id) override;
 
     void Destroy();
 

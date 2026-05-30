@@ -79,4 +79,56 @@ void CharacterRepository::ListByAccount(
         std::move(completion));
 }
 
+void CharacterRepository::FindById(CharacterId id, std::function<void(Result<Character>)> completion)
+{
+    pool_.Submit<Character>(
+        [id](sql::Connection& conn) {
+            Result<Character> result;
+            std::unique_ptr<sql::PreparedStatement> stmt(conn.prepareStatement(
+                "SELECT id, account_id, slot, name, level, experience, class_id, appearance, "
+                "pos_x, pos_y, map_id, created_at, last_played_at "
+                "FROM characters WHERE id = ?"));
+            stmt->setUInt64(1, static_cast<std::uint64_t>(id));
+
+            std::unique_ptr<sql::ResultSet> rows(stmt->executeQuery());
+            if (!rows->next()) {
+                result.error = DbError::NotFound;
+                result.message = "character not found";
+                return result;
+            }
+
+            result.value = ReadCharacter(*rows);
+            return result;
+        },
+        std::move(completion));
+}
+
+void CharacterRepository::FindByAccountAndId(
+    AccountId account_id,
+    CharacterId character_id,
+    std::function<void(Result<Character>)> completion)
+{
+    pool_.Submit<Character>(
+        [account_id, character_id](sql::Connection& conn) {
+            Result<Character> result;
+            std::unique_ptr<sql::PreparedStatement> stmt(conn.prepareStatement(
+                "SELECT id, account_id, slot, name, level, experience, class_id, appearance, "
+                "pos_x, pos_y, map_id, created_at, last_played_at "
+                "FROM characters WHERE account_id = ? AND id = ?"));
+            stmt->setUInt64(1, static_cast<std::uint64_t>(account_id));
+            stmt->setUInt64(2, static_cast<std::uint64_t>(character_id));
+
+            std::unique_ptr<sql::ResultSet> rows(stmt->executeQuery());
+            if (!rows->next()) {
+                result.error = DbError::NotFound;
+                result.message = "character does not belong to account";
+                return result;
+            }
+
+            result.value = ReadCharacter(*rows);
+            return result;
+        },
+        std::move(completion));
+}
+
 } // namespace gs::db

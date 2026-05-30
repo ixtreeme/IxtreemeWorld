@@ -75,6 +75,57 @@ struct CharacterListResponse {
   characters @2 :List(CharacterInfo);
 }
 
+# === ENTER WORLD / HANDOFF ===
+
+struct Vec3 {
+  x @0 :Float32;
+  y @1 :Float32;
+  z @2 :Float32;
+}
+
+struct C2sCharacterSelect {
+  characterId @0 :UInt64;
+}
+
+struct S2cEnterWorldToken {
+  token @0 :Data;
+  gameHost @1 :Text;
+  gamePort @2 :UInt16;
+}
+
+struct C2sEnterWorld {
+  token @0 :Data;
+}
+
+struct S2cEnterWorldAccept {
+  yourNetId @0 :UInt32;
+  spawnPos @1 :Vec3;
+  serverTick @2 :UInt32;
+}
+
+struct S2cEnterWorldReject {
+  reason @0 :RejectReason;
+
+  enum RejectReason {
+    invalidToken @0;
+    expiredToken @1;
+    alreadyUsed @2;
+    serverError @3;
+  }
+}
+
+struct S2cEntitySpawn {
+  netId @0 :UInt32;
+  name @1 :Text;
+  classId @2 :UInt16;
+  spawnPos @3 :Vec3;
+  heading @4 :UInt16;
+}
+
+struct S2cEntityDespawn {
+  netId @0 :UInt32;
+}
+
 # === ROOT PACKET (union) ===
 
 struct Packet {
@@ -85,5 +136,12 @@ struct Packet {
     loginResponse @3 :LoginResponse;
     characterListRequest @4 :CharacterListRequest;
     characterListResponse @5 :CharacterListResponse;
+    characterSelect @6 :C2sCharacterSelect;
+    enterWorldToken @7 :S2cEnterWorldToken;
+    enterWorld @8 :C2sEnterWorld;
+    enterWorldAccept @9 :S2cEnterWorldAccept;
+    enterWorldReject @10 :S2cEnterWorldReject;
+    entitySpawn @11 :S2cEntitySpawn;
+    entityDespawn @12 :S2cEntityDespawn;
   }
 }

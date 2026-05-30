@@ -47,3 +47,24 @@ CREATE TABLE IF NOT EXISTS characters (
         FOREIGN KEY (account_id) REFERENCES accounts(id)
         ON DELETE CASCADE
 ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_unicode_ci;
+
+-- =====================================================
+-- handoff_tokens
+-- =====================================================
+CREATE TABLE IF NOT EXISTS handoff_tokens (
+    token_hash    CHAR(64) NOT NULL,
+    account_id    BIGINT UNSIGNED NOT NULL,
+    character_id  BIGINT UNSIGNED NOT NULL,
+    game_server   VARCHAR(64) NOT NULL,
+    issued_at     DATETIME NOT NULL DEFAULT CURRENT_TIMESTAMP,
+    expires_at    DATETIME NOT NULL,
+    consumed      TINYINT(1) NOT NULL DEFAULT 0,
+    PRIMARY KEY (token_hash),
+    KEY idx_handoff_account (account_id),
+    CONSTRAINT fk_handoff_account
+        FOREIGN KEY (account_id) REFERENCES accounts(id)
+        ON DELETE CASCADE,
+    CONSTRAINT fk_handoff_character
+        FOREIGN KEY (character_id) REFERENCES characters(id)
+        ON DELETE CASCADE
+) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_unicode_ci;

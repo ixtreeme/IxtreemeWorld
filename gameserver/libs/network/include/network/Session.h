@@ -1,6 +1,7 @@
 #pragma once
 
 #include <cstdint>
+#include <deque>
 #include <functional>
 #include <memory>
 #include <vector>
@@ -29,8 +30,13 @@ public:
 
 private:
     boost::asio::awaitable<void> ReadLoop();
-    boost::asio::awaitable<void> WriteFrame(std::vector<std::uint8_t> payload);
     void SendPayloadInternal(std::vector<std::uint8_t> payload, bool close_after_send);
+    void StartWriteQueue();
+
+    struct PendingWrite {
+        std::vector<std::uint8_t> frame;
+        bool close_after_send = false;
+    };
 
     boost::asio::ip::tcp::socket socket_;
     gs::common::SessionId id_;
@@ -38,6 +44,8 @@ private:
     DisconnectHandler on_disconnect_;
     bool stopped_ = false;
     bool disconnect_notified_ = false;
+    bool writing_ = false;
+    std::deque<PendingWrite> write_queue_;
 };
 
 } // namespace gs::network
