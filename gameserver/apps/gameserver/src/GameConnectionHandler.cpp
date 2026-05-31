@@ -156,6 +156,7 @@ void GameConnectionHandler::OnDisconnect(std::shared_ptr<gs::network::Session> s
         std::lock_guard lock(contexts_mutex_);
         contexts_.erase(session->Id());
     }
+    LOG_INFO("Game session {} disconnected; posting sim despawn", session->Id());
     sim_.PostDespawn(session->Id());
     LOG_INFO("Game session {} cleaned up", session->Id());
 }

@@ -1,5 +1,6 @@
 #include "NoesisLayer.h"
 #include "VulkanDevice.h"
+#include "WorldComponents.h"
 #include "Debug.h"
 #include "asset/IAssetReader.h"
 #include "network/ClientSession.h"
@@ -37,6 +38,8 @@
 #include <NsRender/RenderDevice.h>
 #include <NsRender/VKFactory.h>
 
+#include <flecs.h>
+
 #include <cstdarg>
 #include <cstdio>
 #include <cstring>
@@ -46,6 +49,7 @@
 #include <memory>
 #include <mutex>
 #include <string>
+#include <unordered_map>
 #include <utility>
 #include <vector>
 
@@ -793,6 +797,102 @@ struct NoesisLayer::Impl
         SetStatus("Connecting...");
     }
 
+    void InitializeEntityWorld()
+    {
+        entitiesByNetId.clear();
+        entityWorld = std::make_unique<flecs::world>();
+        entityWorld->component<client::ecs::Position>();
+        entityWorld->component<client::ecs::Heading>();
+        entityWorld->component<client::ecs::NetId>();
+        entityWorld->component<client::ecs::MoveState>();
+        entityWorld->component<client::ecs::RenderableModel>();
+        entityWorld->component<client::ecs::Nameplate>();
+        entityWorld->component<client::ecs::LocalPlayerTag>();
+    }
+
+    void ClearWorldEntities()
+    {
+        InitializeEntityWorld();
+    }
+
+    flecs::entity UpsertWorldEntity(std::uint32_t netId,
+                                    const char* name,
+                                    client::net::Vec3 position,
+                                    std::uint16_t heading,
+                                    client::net::MoveState moveState,
+                                    bool localPlayer)
+    {
+        if (!entityWorld)
+            InitializeEntityWorld();
+
+        auto it = entitiesByNetId.find(netId);
+        flecs::entity entity;
+        if (it == entitiesByNetId.end())
+        {
+            entity = entityWorld->entity();
+            entitiesByNetId.emplace(netId, entity);
+        }
+        else
+        {
+            entity = it->second;
+        }
+
+        entity.set<client::ecs::NetId>({netId})
+            .set<client::ecs::Position>({position.x, position.y, position.z})
+            .set<client::ecs::Heading>({heading})
+            .set<client::ecs::MoveState>({moveState})
+            .set<client::ecs::RenderableModel>({})
+            .set<client::ecs::Nameplate>({name ? name : "Player", 1});
+
+        if (localPlayer)
+            entity.add<client::ecs::LocalPlayerTag>();
+
+        return entity;
+    }
+
+    void RemoveWorldEntity(std::uint32_t netId)
+    {
+        const auto it = entitiesByNetId.find(netId);
+        if (it == entitiesByNetId.end())
+            return;
+
+        if (it->second.is_valid())
+            it->second.destruct();
+        entitiesByNetId.erase(it);
+    }
+
+    std::vector<WorldRenderEntity> CollectWorldEntities() const
+    {
+        std::vector<WorldRenderEntity> result;
+        if (!entityWorld)
+            return result;
+
+        result.reserve(entitiesByNetId.size());
+        auto query = entityWorld->query_builder<const client::ecs::NetId,
+                                                const client::ecs::Position,
+                                                const client::ecs::Heading,
+                                                const client::ecs::MoveState,
+                                                const client::ecs::RenderableModel,
+                                                const client::ecs::Nameplate>()
+                         .build();
+        query.each([&](flecs::entity,
+                       const client::ecs::NetId& netId,
+                       const client::ecs::Position& position,
+                       const client::ecs::Heading& heading,
+                       const client::ecs::MoveState& moveState,
+                       const client::ecs::RenderableModel&,
+                       const client::ecs::Nameplate& nameplate) {
+            WorldRenderEntity entity;
+            entity.netId = netId.value;
+            entity.name = nameplate.name;
+            entity.position = {position.x, position.y, position.z};
+            entity.heading = heading.angle;
+            entity.moveState = moveState.value;
+            result.push_back(std::move(entity));
+        });
+        return result;
+    }
+
     Noesis::Ptr<Noesis::RenderDevice> renderDevice;
     Noesis::Ptr<Noesis::IView> view;
     Noesis::Ptr<Noesis::IView> menuView;
@@ -810,7 +910,8 @@ struct NoesisLayer::Impl
     bool pendingEnterWorldConnect = false;
     bool inWorld = false;
     std::uint32_t ownNetId = 0;
-    std::vector<WorldRenderEntity> worldEntities;
+    std::unique_ptr<flecs::world> entityWorld;
+    std::unordered_map<std::uint32_t, flecs::entity> entitiesByNetId;
     client::net::ClientSession* clientSession = nullptr;
     uint32_t currentWidth = 0;
     uint32_t currentHeight = 0;
@@ -828,6 +929,7 @@ bool NoesisLayer::Create(VulkanDevice& device, client::asset::IAssetReader& asse
 {
     Destroy();
     m_impl = std::make_unique<Impl>();
+    m_impl->InitializeEntityWorld();
 
     Noesis::GUI::SetLogHandler([](const char*, uint32_t, uint32_t level, const char*, const char* message)
     {
@@ -960,7 +1062,7 @@ std::uint32_t NoesisLayer::GetOwnNetId() const
 
 std::vector<WorldRenderEntity> NoesisLayer::GetWorldEntities() const
 {
-    return m_impl ? m_impl->worldEntities : std::vector<WorldRenderEntity>{};
+    return m_impl ? m_impl->CollectWorldEntities() : std::vector<WorldRenderEntity>{};
 }
 
 bool NoesisLayer::IsInGameMenuOpen() const
@@ -1121,12 +1223,8 @@ void NoesisLayer::OnEnterWorldAccepted(std::uint32_t net_id, client::net::Vec3 s
     m_impl->inWorld = true;
     m_impl->lobbyActive = false;
     m_impl->ownNetId = net_id;
-    m_impl->worldEntities.clear();
-    WorldRenderEntity self;
-    self.netId = net_id;
-    self.name = "You";
-    self.position = spawn_pos;
-    m_impl->worldEntities.push_back(std::move(self));
+    m_impl->ClearWorldEntities();
+    m_impl->UpsertWorldEntity(net_id, "You", spawn_pos, 0, client::net::MoveState::Idle, true);
 
     LogFormat("[WORLD] enter accepted net_id=%u", net_id);
     char message[128];
@@ -1148,33 +1246,21 @@ void NoesisLayer::OnEnterWorldRejected(const std::string& reason)
 void NoesisLayer::OnEntitySpawn(const client::net::EntitySpawnInfo& entity)
 {
     if (m_impl)
-    {
-        auto it = std::find_if(m_impl->worldEntities.begin(),
-            m_impl->worldEntities.end(),
-            [&entity](const WorldRenderEntity& existing) { return existing.netId == entity.netId; });
-        if (it == m_impl->worldEntities.end())
-        {
-            WorldRenderEntity render;
-            render.netId = entity.netId;
-            render.name = entity.name;
-            render.position = entity.spawnPos;
-            render.heading = entity.heading;
-            m_impl->worldEntities.push_back(std::move(render));
-        }
-    }
+        m_impl->UpsertWorldEntity(entity.netId,
+            entity.name.c_str(),
+            entity.spawnPos,
+            entity.heading,
+            client::net::MoveState::Idle,
+            entity.netId == m_impl->ownNetId);
+
     LogFormat("[WORLD] entity spawn name=%s", entity.name.c_str());
 }
 
 void NoesisLayer::OnEntityDespawn(std::uint32_t net_id)
 {
     if (m_impl)
-    {
-        m_impl->worldEntities.erase(
-            std::remove_if(m_impl->worldEntities.begin(),
-                m_impl->worldEntities.end(),
-                [net_id](const WorldRenderEntity& entity) { return entity.netId == net_id; }),
-            m_impl->worldEntities.end());
-    }
+        m_impl->RemoveWorldEntity(net_id);
+
     LogFormat("[WORLD] entity despawn net_id=%u", net_id);
 }
 
@@ -1186,25 +1272,23 @@ void NoesisLayer::OnEntityTransforms(std::uint32_t,
 
     for (const auto& transform : transforms)
     {
-        auto it = std::find_if(m_impl->worldEntities.begin(),
-            m_impl->worldEntities.end(),
-            [&transform](const WorldRenderEntity& entity) { return entity.netId == transform.netId; });
-        if (it == m_impl->worldEntities.end())
+        const auto it = m_impl->entitiesByNetId.find(transform.netId);
+        const char* name = it == m_impl->entitiesByNetId.end() ? "Player" : nullptr;
+        if (it == m_impl->entitiesByNetId.end())
         {
-            WorldRenderEntity entity;
-            entity.netId = transform.netId;
-            entity.name = "Player";
-            entity.position = transform.position;
-            entity.heading = transform.heading;
-            entity.moveState = transform.moveState;
-            m_impl->worldEntities.push_back(std::move(entity));
+            m_impl->UpsertWorldEntity(transform.netId,
+                name,
+                transform.position,
+                transform.heading,
+                transform.moveState,
+                transform.netId == m_impl->ownNetId);
+            continue;
         }
-        else
-        {
-            it->position = transform.position;
-            it->heading = transform.heading;
-            it->moveState = transform.moveState;
-        }
+
+        it->second.set<client::ecs::Position>(
+                      {transform.position.x, transform.position.y, transform.position.z})
+            .set<client::ecs::Heading>({transform.heading})
+            .set<client::ecs::MoveState>({transform.moveState});
     }
 }
 

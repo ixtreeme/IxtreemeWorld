@@ -211,6 +211,8 @@ void SimWorld::Run()
     LOG_INFO("Game sim thread started");
     const auto tick_dt = std::chrono::milliseconds(50);
     auto next_tick = std::chrono::steady_clock::now();
+    auto next_diagnostics = next_tick + std::chrono::seconds(1);
+    std::size_t transform_broadcasts_since_diagnostics = 0;
 
     while (!stopping_) {
         next_tick += tick_dt;
@@ -218,8 +220,20 @@ void SimWorld::Run()
         DrainMoveInputs();
         StepMovement(0.05f);
         world_->progress(0.05f);
-        BroadcastTransforms();
+        transform_broadcasts_since_diagnostics += BroadcastTransforms();
         ++world_tick_;
+
+        const auto now = std::chrono::steady_clock::now();
+        if (now >= next_diagnostics) {
+            LOG_INFO("Game sim diag: tick={} active_sessions={} transform_broadcasts_sent={}",
+                     world_tick_,
+                     players_.size(),
+                     transform_broadcasts_since_diagnostics);
+            transform_broadcasts_since_diagnostics = 0;
+            do {
+                next_diagnostics += std::chrono::seconds(1);
+            } while (now >= next_diagnostics);
+        }
 
         std::unique_lock lock(mutex_);
         cv_.wait_until(lock, next_tick, [this] {
@@ -282,11 +296,11 @@ void SimWorld::StepMovement(float dt)
     }
 }
 
-void SimWorld::BroadcastTransforms()
+std::size_t SimWorld::BroadcastTransforms()
 {
     AssertSimThread();
     if (players_.empty()) {
-        return;
+        return 0;
     }
 
     std::vector<std::uint8_t> payload;
@@ -308,6 +322,7 @@ void SimWorld::BroadcastTransforms()
     for (const auto& player : players_) {
         Send(io_, player.session, payload);
     }
+    return players_.size();
 }
 
 void SimWorld::DrainCommands()
@@ -373,6 +388,7 @@ void SimWorld::Despawn(gs::common::SessionId session_id)
         return player.session && player.session->Id() == session_id;
     });
     if (it == players_.end()) {
+        LOG_INFO("Sim despawn requested for session {}, but no in-world player was found", session_id);
         return;
     }
 

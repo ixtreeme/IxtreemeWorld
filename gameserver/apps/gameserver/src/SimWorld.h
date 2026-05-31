@@ -95,7 +95,7 @@ private:
     void DrainCommands();
     void DrainMoveInputs();
     void StepMovement(float dt);
-    void BroadcastTransforms();
+    std::size_t BroadcastTransforms();
     void Spawn(std::shared_ptr<gs::network::Session> session, gs::db::Character character);
     void Despawn(gs::common::SessionId session_id);
     void AssertSimThread() const;

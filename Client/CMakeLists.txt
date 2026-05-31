@@ -16,6 +16,15 @@ add_subdirectory(${CMAKE_CURRENT_SOURCE_DIR}/../shared/protocol shared_protocol_
 add_subdirectory(asset)
 add_subdirectory(network)
 
+find_package(flecs CONFIG REQUIRED)
+if(TARGET flecs::flecs_static)
+    set(CLIENT_FLECS_TARGET flecs::flecs_static)
+elseif(TARGET flecs::flecs)
+    set(CLIENT_FLECS_TARGET flecs::flecs)
+else()
+    message(FATAL_ERROR "flecs CMake target not found")
+endif()
+
 if(ANDROID)
     if(CMAKE_ANDROID_NDK)
         set(_ANDROID_NDK_ROOT "${CMAKE_ANDROID_NDK}")
@@ -131,6 +140,7 @@ if(ANDROID)
         NameplateRenderer.cpp
         NameplateRenderer.h
         WorldCamera.h
+        WorldComponents.h
         InputEvent.h
         NoesisLayer.cpp
         NoesisLayer.h
@@ -165,6 +175,7 @@ if(ANDROID)
         client_asset
         granny_android
         Noesis_imported
+        ${CLIENT_FLECS_TARGET}
         vulkan
         log
         android
@@ -316,6 +327,7 @@ add_executable(VulkanClear
     NameplateRenderer.cpp
     NameplateRenderer.h
     WorldCamera.h
+    WorldComponents.h
     NativeWindow.h
     NativeWindow_Win32.h
     NativeWindow_Win32.cpp
@@ -354,6 +366,7 @@ target_link_libraries(VulkanClear PRIVATE
     Vulkan::Vulkan
     client_asset
     client_network
+    ${CLIENT_FLECS_TARGET}
     "${GRANNY_STATIC_LIB}"
     "${NOESIS_SDK}/Lib/windows_x86_64/Noesis.lib"
     Ws2_32

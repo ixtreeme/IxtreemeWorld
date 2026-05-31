@@ -4,6 +4,7 @@
 #include <capnp/message.h>
 
 #include <array>
+#include <chrono>
 #include <cmath>
 #include <cstdio>
 #include <cstring>
@@ -47,6 +48,18 @@ void LogNetFormat(const char* format, const std::string& first, const std::strin
 {
     char buffer[512];
     std::snprintf(buffer, sizeof(buffer), format, first.c_str(), second.c_str());
+    LogNet(buffer);
+}
+
+void LogNetFormat(const char* format,
+                  std::uint32_t first,
+                  std::uint32_t second,
+                  std::uint32_t third,
+                  std::uint32_t fourth,
+                  std::uint32_t fifth)
+{
+    char buffer[512];
+    std::snprintf(buffer, sizeof(buffer), format, first, second, third, fourth, fifth);
     LogNet(buffer);
 }
 
@@ -136,6 +149,16 @@ struct ClientSession::Impl {
         Authenticated,
         EnteringWorld,
         InWorld,
+    };
+
+    struct RxDiagnostics {
+        std::uint32_t entity_spawns = 0;
+        std::uint32_t entity_despawns = 0;
+        std::uint32_t transform_packets = 0;
+        std::uint32_t transform_records = 0;
+        std::uint32_t packet_errors = 0;
+        std::chrono::steady_clock::time_point next_log =
+            std::chrono::steady_clock::now() + std::chrono::seconds(1);
     };
 
     explicit Impl(IClientHandler& h)
@@ -317,6 +340,30 @@ struct ClientSession::Impl {
             return;
         }
         io.poll();
+        MaybeLogRxDiagnostics();
+    }
+
+    void MaybeLogRxDiagnostics()
+    {
+        const auto now = std::chrono::steady_clock::now();
+        if (now < rx_diagnostics.next_log) {
+            return;
+        }
+
+        LogNetFormat("[NET] rx diag: spawns=%u despawns=%u transform_packets=%u transform_records=%u errors=%u",
+            rx_diagnostics.entity_spawns,
+            rx_diagnostics.entity_despawns,
+            rx_diagnostics.transform_packets,
+            rx_diagnostics.transform_records,
+            rx_diagnostics.packet_errors);
+        rx_diagnostics.entity_spawns = 0;
+        rx_diagnostics.entity_despawns = 0;
+        rx_diagnostics.transform_packets = 0;
+        rx_diagnostics.transform_records = 0;
+        rx_diagnostics.packet_errors = 0;
+        do {
+            rx_diagnostics.next_log += std::chrono::seconds(1);
+        } while (now >= rx_diagnostics.next_log);
     }
 
     void EnqueueFrame(std::vector<std::uint8_t> frame)
@@ -383,7 +430,15 @@ struct ClientSession::Impl {
                     return;
                 }
 
-                HandlePayload(read_payload);
+                try {
+                    HandlePayload(read_payload);
+                } catch (const std::exception& exception) {
+                    ++rx_diagnostics.packet_errors;
+                    LogNetFormat("[NET] packet handler exception: %s", std::string(exception.what()));
+                } catch (...) {
+                    ++rx_diagnostics.packet_errors;
+                    LogNet("[NET] packet handler exception: unknown");
+                }
                 if (state != State::Offline) {
                     StartReadHeader();
                 }
@@ -418,13 +473,16 @@ struct ClientSession::Impl {
             } else if (packet.isEnterWorldReject()) {
                 HandleEnterWorldReject(packet.getEnterWorldReject());
             } else if (packet.isEntitySpawn()) {
+                ++rx_diagnostics.entity_spawns;
                 HandleEntitySpawn(packet.getEntitySpawn());
             } else if (packet.isEntityDespawn()) {
+                ++rx_diagnostics.entity_despawns;
                 handler.OnEntityDespawn(packet.getEntityDespawn().getNetId());
             } else {
                 LogNet("[NET] unexpected packet type");
             }
         } catch (const kj::Exception& exception) {
+            ++rx_diagnostics.packet_errors;
             LogNetFormat("[NET] invalid packet: %s", exception.getDescription().cStr());
             Disconnect();
         }
@@ -433,6 +491,7 @@ struct ClientSession::Impl {
     void HandleBinaryPayload(const std::vector<std::uint8_t>& payload)
     {
         if (payload.size() < 2 || payload[1] != 0x10 || payload.size() < 8) {
+            ++rx_diagnostics.packet_errors;
             LogNet("[NET] invalid binary payload");
             return;
         }
@@ -442,6 +501,7 @@ struct ClientSession::Impl {
         constexpr std::size_t header_size = 8;
         constexpr std::size_t record_size = 19;
         if (payload.size() != header_size + static_cast<std::size_t>(count) * record_size) {
+            ++rx_diagnostics.packet_errors;
             LogNet("[NET] invalid transform payload size");
             return;
         }
@@ -466,6 +526,8 @@ struct ClientSession::Impl {
         }
 
         handler.OnEntityTransforms(server_tick, transforms);
+        ++rx_diagnostics.transform_packets;
+        rx_diagnostics.transform_records += count;
     }
 
     void HandleHandshakeResponse(gs::protocol::HandshakeResponse::Reader response)
@@ -576,6 +638,7 @@ struct ClientSession::Impl {
     std::deque<std::vector<std::uint8_t>> send_queue;
     bool writing = false;
     std::uint32_t move_sequence = 0;
+    RxDiagnostics rx_diagnostics;
 };
 
 ClientSession::ClientSession(IClientHandler& handler)
