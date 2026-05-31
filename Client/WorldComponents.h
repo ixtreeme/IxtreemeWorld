@@ -2,6 +2,7 @@
 
 #include "network/IClientHandler.h"
 
+#include <array>
 #include <cstdint>
 #include <string>
 
@@ -42,6 +43,22 @@ struct Nameplate
 
 struct LocalPlayerTag
 {
+};
+
+struct InterpolationSample
+{
+    Position position;
+    Heading heading;
+    double serverTimeSeconds = 0.0;
+};
+
+struct InterpolationBuffer
+{
+    static constexpr std::uint8_t Capacity = 4;
+
+    std::array<InterpolationSample, Capacity> samples{};
+    std::uint8_t count = 0;
+    std::uint8_t next = 0;
 };
 
 } // namespace client::ecs

@@ -6,17 +6,9 @@
 #include <array>
 #include <cstdint>
 #include <limits>
+#include <memory>
 #include <string>
 #include <vector>
-
-struct granny_animation;
-struct granny_control;
-struct granny_file;
-struct granny_local_pose;
-struct granny_model;
-struct granny_model_instance;
-struct granny_skeleton;
-struct granny_world_pose;
 
 namespace client::asset {
 class IAssetReader;
@@ -25,6 +17,9 @@ class IAssetReader;
 class WarriorRenderer
 {
 public:
+    WarriorRenderer();
+    ~WarriorRenderer();
+
     enum class MotionState : uint32_t
     {
         Idle = 0,
@@ -64,7 +59,7 @@ public:
         float normal[3];
         float uv[2];
     };
-    static_assert(sizeof(SourceVertex) == 40, "Granny warrior source vertex layout must stay 40 bytes");
+    static_assert(sizeof(SourceVertex) == 40, "Skinned source vertex layout must stay 40 bytes");
 
 private:
     static constexpr uint32_t kFramesInFlight = 2;
@@ -78,7 +73,6 @@ private:
         uint32_t baseVertex = 0;
         uint32_t vertexCount = 0;
         std::vector<SourceVertex> sourceVertices;
-        std::vector<int32_t> toBoneIndices;
     };
 
     struct RestVertexGpu
@@ -127,17 +121,10 @@ private:
         std::string name;
     };
 
-    struct AnimationClip
-    {
-        granny_file* file = nullptr;
-        granny_animation* animation = nullptr;
-        granny_control* control = nullptr;
-        float duration = 0.0f;
-        std::string path;
-    };
+    struct OzzRuntime;
 
-    bool LoadGrannyMesh(const std::string& modelPath);
-    bool LoadMotionAnimation(const std::string& path, MotionState state);
+    bool LoadGltfMesh(const std::string& modelPath);
+    bool LoadOzzPose(const std::string& dir);
     bool CreateBuffers(VulkanDevice& device);
     bool CreateTextures(VulkanDevice& device, const std::string& modelPath);
     bool CreateDescriptors();
@@ -146,8 +133,6 @@ private:
     bool CreateComputeDescriptors();
     bool CreateComputePipeline();
     bool VerifyComputeSkin(VulkanDevice& device);
-    bool ApplyMotionControls(MotionState state, float timeSeconds);
-    bool ApplyMotionControls(float timeSeconds);
     bool SkinPose(float animTimeSeconds, bool updateBounds, bool logSamples);
     bool UploadBonePalette(MotionState state, float animTimeSeconds, uint32_t frameIndex, uint32_t skinSlot);
     bool UploadBonePalette(float animTimeSeconds, uint32_t frameIndex);
@@ -186,13 +171,10 @@ private:
     std::array<std::array<Buffer, kSkinSlots>, kFramesInFlight> m_skinnedOutputBuffers{};
     uint32_t m_indexCount = 0;
     MeshBounds m_bounds{};
-    granny_file* m_grannyFile = nullptr;
-    granny_model* m_model = nullptr;
-    granny_skeleton* m_skeleton = nullptr;
-    granny_model_instance* m_modelInstance = nullptr;
-    granny_local_pose* m_localPose = nullptr;
-    granny_world_pose* m_worldPose = nullptr;
-    std::array<AnimationClip, 3> m_motionClips{};
+    std::unique_ptr<OzzRuntime> m_ozz;
+    std::vector<std::array<float, 16>> m_inverseBindMatrices;
+    std::vector<std::array<float, 16>> m_bonePaletteCpu;
+    uint32_t m_boneCount = 0;
     MotionState m_motionState = MotionState::Idle;
     uint32_t m_worldRenderFrameIndex = std::numeric_limits<uint32_t>::max();
     uint32_t m_worldUniformCursor = 0;

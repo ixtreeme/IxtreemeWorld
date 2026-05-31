@@ -16,6 +16,8 @@ add_subdirectory(${CMAKE_CURRENT_SOURCE_DIR}/../shared/protocol shared_protocol_
 add_subdirectory(asset)
 add_subdirectory(network)
 
+find_package(fastgltf CONFIG REQUIRED)
+find_package(Stb REQUIRED)
 find_package(flecs CONFIG REQUIRED)
 if(TARGET flecs::flecs_static)
     set(CLIENT_FLECS_TARGET flecs::flecs_static)
@@ -24,6 +26,21 @@ elseif(TARGET flecs::flecs)
 else()
     message(FATAL_ERROR "flecs CMake target not found")
 endif()
+
+set(OZZ_ROOT "D:/SDK/ozz-animation-master" CACHE PATH "ozz-animation source root")
+if(NOT EXISTS "${OZZ_ROOT}/CMakeLists.txt")
+    message(FATAL_ERROR "ozz-animation source not found at: ${OZZ_ROOT}")
+endif()
+set(ozz_build_tools OFF CACHE BOOL "" FORCE)
+set(ozz_build_fbx OFF CACHE BOOL "" FORCE)
+set(ozz_build_gltf OFF CACHE BOOL "" FORCE)
+set(ozz_build_data OFF CACHE BOOL "" FORCE)
+set(ozz_build_samples OFF CACHE BOOL "" FORCE)
+set(ozz_build_howtos OFF CACHE BOOL "" FORCE)
+set(ozz_build_tests OFF CACHE BOOL "" FORCE)
+set(ozz_build_postfix OFF CACHE BOOL "" FORCE)
+add_subdirectory(${OZZ_ROOT} ozz_build)
+set(CLIENT_OZZ_TARGETS ozz_animation ozz_base)
 
 if(ANDROID)
     if(CMAKE_ANDROID_NDK)
@@ -59,59 +76,6 @@ if(ANDROID)
         vulkan
     )
 
-    set(GRANNY_ANDROID_SOURCE "D:/SDK/Granny-3D-SDK-main/source/android" CACHE PATH "Granny Android port source root")
-    set(GRANNY_SOURCE_ROOT "D:/SDK/Granny-3D-SDK-main/source" CACHE PATH "Granny source root")
-    if(NOT EXISTS "${GRANNY_ANDROID_SOURCE}/granny.cpp")
-        message(FATAL_ERROR "Granny Android source not found at: ${GRANNY_ANDROID_SOURCE}")
-    endif()
-    if(NOT EXISTS "${GRANNY_SOURCE_ROOT}/granny_transform.cpp")
-        message(FATAL_ERROR "Granny core source not found at: ${GRANNY_SOURCE_ROOT}")
-    endif()
-
-    file(GLOB GRANNY_CORE_SOURCES CONFIGURE_DEPENDS
-        "${GRANNY_SOURCE_ROOT}/granny_*.cpp"
-        "${GRANNY_SOURCE_ROOT}/rrBase.cpp"
-        "${GRANNY_SOURCE_ROOT}/rrMath.cpp"
-    )
-    list(REMOVE_ITEM GRANNY_CORE_SOURCES
-        "${GRANNY_SOURCE_ROOT}/granny_assert.cpp"
-        "${GRANNY_SOURCE_ROOT}/granny_test_types.cpp"
-    )
-    add_library(granny_android STATIC
-        ${GRANNY_CORE_SOURCES}
-        "${GRANNY_ANDROID_SOURCE}/granny.cpp"
-        "${GRANNY_ANDROID_SOURCE}/android_granny_assert.cpp"
-        "${GRANNY_ANDROID_SOURCE}/android_granny_bone_operations.cpp"
-        "${GRANNY_ANDROID_SOURCE}/android_granny_accelerated_deformers.cpp"
-        "${GRANNY_ANDROID_SOURCE}/android_granny_file_operations.cpp"
-        "${GRANNY_ANDROID_SOURCE}/android_granny_file_reader.cpp"
-        "${GRANNY_ANDROID_SOURCE}/android_granny_file_writer.cpp"
-        "${GRANNY_ANDROID_SOURCE}/android_granny_matrix_operations.cpp"
-        "${GRANNY_ANDROID_SOURCE}/android_granny_memory.cpp"
-        "${GRANNY_ANDROID_SOURCE}/android_granny_posix.cpp"
-        "${GRANNY_ANDROID_SOURCE}/android_granny_system_clock.cpp"
-        "${GRANNY_ANDROID_SOURCE}/android_granny_threads.cpp"
-        "${GRANNY_ANDROID_SOURCE}/android_rrAtomics.cpp"
-        "${GRANNY_SOURCE_ROOT}/arithbit.c"
-        "${GRANNY_SOURCE_ROOT}/binktc.c"
-        "${GRANNY_SOURCE_ROOT}/encode.c"
-        "${GRANNY_SOURCE_ROOT}/radarith.c"
-        "${GRANNY_SOURCE_ROOT}/radlz.c"
-        "${GRANNY_SOURCE_ROOT}/varbits.c"
-        "${GRANNY_SOURCE_ROOT}/wavelet.c"
-    )
-
-    target_include_directories(granny_android PUBLIC
-        "${GRANNY_ANDROID_SOURCE}"
-        "${GRANNY_SOURCE_ROOT}"
-    )
-
-    target_compile_definitions(granny_android PUBLIC
-        BUILDING_GRANNY_STATIC=1
-    )
-
-    target_compile_features(granny_android PUBLIC cxx_std_20)
-
     set(NOESIS_SDK "D:/SDK/NoesisGUI-3.2.13" CACHE PATH "NoesisGUI SDK root")
     set(NOESIS_VKRENDERDEVICE "${NOESIS_SDK}/Src/Packages/Render/VKRenderDevice")
     set(NOESIS_PROVIDERS "${NOESIS_SDK}/Src/Packages/App/Providers")
@@ -131,8 +95,6 @@ if(ANDROID)
     add_library(client_render STATIC
         CubeRenderer.cpp
         CubeRenderer.h
-        GrannyModel.cpp
-        GrannyModel.h
         WarriorRenderer.cpp
         WarriorRenderer.h
         TerrainRenderer.cpp
@@ -153,19 +115,17 @@ if(ANDROID)
 
     target_include_directories(client_render PUBLIC
         ${CMAKE_CURRENT_SOURCE_DIR}
+        ${Stb_INCLUDE_DIR}
         "${NOESIS_SDK}/Include"
         "${NOESIS_PROVIDERS}/Include"
         "${NOESIS_VKRENDERDEVICE}/Include"
         "${NOESIS_SDK}/Src/Packages/App/ApplicationLauncher/Include"
-        "${GRANNY_ANDROID_SOURCE}"
-        "${GRANNY_SOURCE_ROOT}"
     )
 
     target_compile_definitions(client_render PUBLIC
         NS_APP_PROVIDERS_API=
         NS_APP_APPLICATIONLAUNCHER_API=
         NS_RENDER_VKRENDERDEVICE_API=
-        BUILDING_GRANNY_STATIC=1
     )
 
     target_compile_features(client_render PUBLIC cxx_std_20)
@@ -173,7 +133,8 @@ if(ANDROID)
     target_link_libraries(client_render PUBLIC
         client_platform
         client_asset
-        granny_android
+        fastgltf::fastgltf
+        ${CLIENT_OZZ_TARGETS}
         Noesis_imported
         ${CLIENT_FLECS_TARGET}
         vulkan
@@ -308,8 +269,6 @@ set(NOESIS_SDK "D:/SDK/NoesisGUI-3.2.13" CACHE PATH "NoesisGUI SDK root")
 set(NOESIS_VKRENDERDEVICE "${NOESIS_SDK}/Src/Packages/Render/VKRenderDevice")
 set(NOESIS_PROVIDERS "${NOESIS_SDK}/Src/Packages/App/Providers")
 set(NOESIS_APPLICATIONLAUNCHER "${NOESIS_SDK}/Src/Packages/App/ApplicationLauncher")
-set(GRANNY_SDK_SOURCE "D:/SDK/Granny-3D-SDK-main/source" CACHE PATH "Granny SDK source root")
-set(GRANNY_STATIC_LIB "${GRANNY_SDK_SOURCE}/build-mt/Debug/granny2_static.lib" CACHE FILEPATH "Granny static library")
 
 add_executable(VulkanClear
     main.cpp
@@ -318,8 +277,6 @@ add_executable(VulkanClear
     Debug.h
     CubeRenderer.cpp
     CubeRenderer.h
-    GrannyModel.cpp
-    GrannyModel.h
     WarriorRenderer.cpp
     WarriorRenderer.h
     TerrainRenderer.cpp
@@ -351,23 +308,21 @@ target_compile_definitions(VulkanClear PRIVATE
     NS_APP_PROVIDERS_API=
     NS_APP_APPLICATIONLAUNCHER_API=
     NS_RENDER_VKRENDERDEVICE_API=
-    BUILDING_GRANNY_STATIC=1
 )
 target_include_directories(VulkanClear PRIVATE
+    ${Stb_INCLUDE_DIR}
     "${NOESIS_SDK}/Include"
     "${NOESIS_PROVIDERS}/Include"
     "${NOESIS_VKRENDERDEVICE}/Include"
     "${NOESIS_SDK}/Src/Packages/App/ApplicationLauncher/Include"
-    "${GRANNY_SDK_SOURCE}/winxx/win64"
-    "${GRANNY_SDK_SOURCE}/winxx"
-    "${GRANNY_SDK_SOURCE}"
 )
 target_link_libraries(VulkanClear PRIVATE
     Vulkan::Vulkan
     client_asset
     client_network
     ${CLIENT_FLECS_TARGET}
-    "${GRANNY_STATIC_LIB}"
+    fastgltf::fastgltf
+    ${CLIENT_OZZ_TARGETS}
     "${NOESIS_SDK}/Lib/windows_x86_64/Noesis.lib"
     Ws2_32
     Gdi32

@@ -40,7 +40,9 @@
 
 #include <flecs.h>
 
+#include <array>
 #include <cstdarg>
+#include <cmath>
 #include <cstdio>
 #include <cstring>
 #include <functional>
@@ -80,6 +82,9 @@ Noesis::PasswordBox* g_focusedPasswordBox = nullptr;
 namespace
 {
 constexpr uint32_t kPlayerSlots = 4;
+constexpr double kServerTickSeconds = 0.05;
+constexpr double kInterpolationDelaySeconds = 0.10;
+constexpr float kTwoPi = 6.28318530717958647692f;
 
 #if defined(__ANDROID__)
 constexpr int kAndroidKeycodeDel = 67;
@@ -222,6 +227,51 @@ void LogFormat(const char* format, ...)
     std::vsnprintf(buffer, sizeof(buffer), format, args);
     va_end(args);
     Log(buffer);
+}
+
+float DequantizeHeading(std::uint16_t value)
+{
+    return (static_cast<float>(value) / 65535.0f) * kTwoPi;
+}
+
+std::uint16_t QuantizeHeading(float angle)
+{
+    while (angle < 0.0f)
+        angle += kTwoPi;
+    while (angle >= kTwoPi)
+        angle -= kTwoPi;
+    return static_cast<std::uint16_t>(std::lround((angle / kTwoPi) * 65535.0f));
+}
+
+float NormalizeAngleDelta(float delta)
+{
+    constexpr float kPi = 3.14159265358979323846f;
+    while (delta > kPi)
+        delta -= kTwoPi;
+    while (delta < -kPi)
+        delta += kTwoPi;
+    return delta;
+}
+
+float Lerp(float a, float b, double t)
+{
+    return static_cast<float>(static_cast<double>(a) + (static_cast<double>(b) - a) * t);
+}
+
+client::ecs::Position LerpPosition(const client::ecs::Position& a,
+                                   const client::ecs::Position& b,
+                                   double t)
+{
+    return {Lerp(a.x, b.x, t), Lerp(a.y, b.y, t), Lerp(a.z, b.z, t)};
+}
+
+client::ecs::Heading LerpHeadingShortest(client::ecs::Heading a,
+                                         client::ecs::Heading b,
+                                         double t)
+{
+    const float start = DequantizeHeading(a.angle);
+    const float delta = NormalizeAngleDelta(DequantizeHeading(b.angle) - start);
+    return {QuantizeHeading(start + delta * static_cast<float>(t))};
 }
 
 std::string AssetPath(std::string prefix, std::string path)
@@ -808,6 +858,7 @@ struct NoesisLayer::Impl
         entityWorld->component<client::ecs::RenderableModel>();
         entityWorld->component<client::ecs::Nameplate>();
         entityWorld->component<client::ecs::LocalPlayerTag>();
+        entityWorld->component<client::ecs::InterpolationBuffer>();
     }
 
     void ClearWorldEntities()
@@ -845,9 +896,134 @@ struct NoesisLayer::Impl
             .set<client::ecs::Nameplate>({name ? name : "Player", 1});
 
         if (localPlayer)
+        {
             entity.add<client::ecs::LocalPlayerTag>();
+            entity.remove<client::ecs::InterpolationBuffer>();
+        }
+        else if (!entity.has<client::ecs::InterpolationBuffer>())
+        {
+            client::ecs::InterpolationBuffer buffer;
+            AddInterpolationSample(buffer, position, heading, latestServerTimeSeconds);
+            entity.set<client::ecs::InterpolationBuffer>(buffer);
+        }
 
         return entity;
+    }
+
+    void AddInterpolationSample(client::ecs::InterpolationBuffer& buffer,
+                                client::net::Vec3 position,
+                                std::uint16_t heading,
+                                double serverTimeSeconds) const
+    {
+        if (buffer.count > 0)
+        {
+            for (std::uint8_t i = 0; i < buffer.count; ++i)
+            {
+                if (buffer.samples[i].serverTimeSeconds == serverTimeSeconds)
+                {
+                    buffer.samples[i].position = {position.x, position.y, position.z};
+                    buffer.samples[i].heading = {heading};
+                    return;
+                }
+            }
+        }
+
+        buffer.samples[buffer.next] =
+            client::ecs::InterpolationSample{{position.x, position.y, position.z},
+                                             {heading},
+                                             serverTimeSeconds};
+        buffer.next = static_cast<std::uint8_t>((buffer.next + 1) % client::ecs::InterpolationBuffer::Capacity);
+        if (buffer.count < client::ecs::InterpolationBuffer::Capacity)
+            ++buffer.count;
+    }
+
+    void ApplyLatestTransform(flecs::entity entity, const client::net::EntityTransform& transform) const
+    {
+        entity.set<client::ecs::Position>(
+                  {transform.position.x, transform.position.y, transform.position.z})
+            .set<client::ecs::Heading>({transform.heading})
+            .set<client::ecs::MoveState>({transform.moveState});
+    }
+
+    void BufferRemoteTransform(flecs::entity entity,
+                               const client::net::EntityTransform& transform,
+                               double serverTimeSeconds) const
+    {
+        if (!entity.has<client::ecs::InterpolationBuffer>())
+            entity.set<client::ecs::InterpolationBuffer>({});
+
+        auto& buffer = entity.get_mut<client::ecs::InterpolationBuffer>();
+        const bool firstSample = buffer.count == 0;
+        AddInterpolationSample(buffer, transform.position, transform.heading, serverTimeSeconds);
+        entity.modified<client::ecs::InterpolationBuffer>();
+        entity.set<client::ecs::MoveState>({transform.moveState});
+
+        if (firstSample)
+            ApplyLatestTransform(entity, transform);
+    }
+
+    void RunInterpolationSystem(double timeSeconds)
+    {
+        if (!entityWorld || latestServerTimeSeconds <= 0.0)
+            return;
+
+        const double estimatedServerTime =
+            latestServerTimeSeconds + (timeSeconds - latestTransformReceiveLocalTimeSeconds);
+        const double renderTime = estimatedServerTime - kInterpolationDelaySeconds;
+
+        auto query = entityWorld->query_builder<client::ecs::Position,
+                                                client::ecs::Heading,
+                                                const client::ecs::InterpolationBuffer>()
+                         .build();
+        query.each([&](flecs::entity entity,
+                       client::ecs::Position& position,
+                       client::ecs::Heading& heading,
+                       const client::ecs::InterpolationBuffer& buffer) {
+            if (entity.has<client::ecs::LocalPlayerTag>() || buffer.count == 0)
+                return;
+
+            std::array<client::ecs::InterpolationSample, client::ecs::InterpolationBuffer::Capacity> samples{};
+            for (std::uint8_t i = 0; i < buffer.count; ++i)
+                samples[i] = buffer.samples[i];
+
+            std::sort(samples.begin(),
+                samples.begin() + buffer.count,
+                [](const auto& a, const auto& b) {
+                    return a.serverTimeSeconds < b.serverTimeSeconds;
+                });
+
+            const auto& first = samples[0];
+            const auto& last = samples[buffer.count - 1];
+            if (buffer.count == 1 || renderTime <= first.serverTimeSeconds)
+            {
+                position = first.position;
+                heading = first.heading;
+                return;
+            }
+
+            if (renderTime >= last.serverTimeSeconds)
+            {
+                position = last.position;
+                heading = last.heading;
+                return;
+            }
+
+            for (std::uint8_t i = 1; i < buffer.count; ++i)
+            {
+                const auto& previous = samples[i - 1];
+                const auto& next = samples[i];
+                if (renderTime > next.serverTimeSeconds)
+                    continue;
+
+                const double duration = next.serverTimeSeconds - previous.serverTimeSeconds;
+                const double t = duration > 0.0
+                                     ? (renderTime - previous.serverTimeSeconds) / duration
+                                     : 1.0;
+                position = LerpPosition(previous.position, next.position, t);
+                heading = LerpHeadingShortest(previous.heading, next.heading, t);
+                return;
+            }
+        });
     }
 
     void RemoveWorldEntity(std::uint32_t netId)
@@ -910,6 +1086,9 @@ struct NoesisLayer::Impl
     bool pendingEnterWorldConnect = false;
     bool inWorld = false;
     std::uint32_t ownNetId = 0;
+    double currentTimeSeconds = 0.0;
+    double latestServerTimeSeconds = 0.0;
+    double latestTransformReceiveLocalTimeSeconds = 0.0;
     std::unique_ptr<flecs::world> entityWorld;
     std::unordered_map<std::uint32_t, flecs::entity> entitiesByNetId;
     client::net::ClientSession* clientSession = nullptr;
@@ -971,6 +1150,9 @@ void NoesisLayer::Update(double timeSeconds)
 #if defined(__ANDROID__)
     DrainPendingTextInput();
 #endif
+    if (m_impl)
+        m_impl->currentTimeSeconds = timeSeconds;
+
     if (m_impl && m_impl->pendingGameConnect && m_impl->clientSession &&
         !m_impl->clientSession->IsConnected())
     {
@@ -979,6 +1161,9 @@ void NoesisLayer::Update(double timeSeconds)
         LogFormat("[WORLD] deferred game connect to %s", m_impl->pendingGameHost.c_str());
         m_impl->clientSession->Connect(m_impl->pendingGameHost, m_impl->pendingGamePort);
     }
+
+    if (m_impl)
+        m_impl->RunInterpolationSystem(timeSeconds);
 
     if (m_impl && m_impl->view)
         m_impl->view->Update(timeSeconds);
@@ -1223,6 +1408,8 @@ void NoesisLayer::OnEnterWorldAccepted(std::uint32_t net_id, client::net::Vec3 s
     m_impl->inWorld = true;
     m_impl->lobbyActive = false;
     m_impl->ownNetId = net_id;
+    m_impl->latestServerTimeSeconds = 0.0;
+    m_impl->latestTransformReceiveLocalTimeSeconds = m_impl->currentTimeSeconds;
     m_impl->ClearWorldEntities();
     m_impl->UpsertWorldEntity(net_id, "You", spawn_pos, 0, client::net::MoveState::Idle, true);
 
@@ -1264,11 +1451,15 @@ void NoesisLayer::OnEntityDespawn(std::uint32_t net_id)
     LogFormat("[WORLD] entity despawn net_id=%u", net_id);
 }
 
-void NoesisLayer::OnEntityTransforms(std::uint32_t,
+void NoesisLayer::OnEntityTransforms(std::uint32_t server_tick,
                                      const std::vector<client::net::EntityTransform>& transforms)
 {
     if (!m_impl)
         return;
+
+    const double serverTimeSeconds = static_cast<double>(server_tick) * kServerTickSeconds;
+    m_impl->latestServerTimeSeconds = serverTimeSeconds;
+    m_impl->latestTransformReceiveLocalTimeSeconds = m_impl->currentTimeSeconds;
 
     for (const auto& transform : transforms)
     {
@@ -1285,10 +1476,10 @@ void NoesisLayer::OnEntityTransforms(std::uint32_t,
             continue;
         }
 
-        it->second.set<client::ecs::Position>(
-                      {transform.position.x, transform.position.y, transform.position.z})
-            .set<client::ecs::Heading>({transform.heading})
-            .set<client::ecs::MoveState>({transform.moveState});
+        if (it->second.has<client::ecs::LocalPlayerTag>())
+            m_impl->ApplyLatestTransform(it->second, transform);
+        else
+            m_impl->BufferRemoteTransform(it->second, transform, serverTimeSeconds);
     }
 }
 

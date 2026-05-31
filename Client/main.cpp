@@ -3,7 +3,6 @@
 #include <windows.h>
 #endif
 
-#include "GrannyModel.h"
 #include "NameplateRenderer.h"
 #include "NativeWindow.h"
 #if defined(_WIN32)
@@ -181,12 +180,7 @@ int RunGame(NativeWindow& window, client::asset::IAssetReader& assets)
     client::net::ClientSession clientSession(noesis);
     noesis.SetClientSession(&clientSession);
 
-    GrannyModel grannyModel(assets);
-    const std::string warriorModelPath = "assets/Character/warrior_4-1.gr2";
-    const std::string selectedAnimationPath = "assets/Character/selected.gr2";
-    grannyModel.LoadAndLog(warriorModelPath);
-    grannyModel.LoadAnimationAndCompare(warriorModelPath, selectedAnimationPath);
-    grannyModel.ComputeStaticPoseAndLog(warriorModelPath, selectedAnimationPath, 0.0f);
+    const std::string warriorModelPath = "assets/Character/KicsiK.glb";
 
     WarriorRenderer warrior;
     bool warriorOk = warrior.Create(device, assets, warriorModelPath);
@@ -353,7 +347,6 @@ int RunGame(NativeWindow& window, client::asset::IAssetReader& assets)
 
     device.WaitIdle();
     clientSession.Disconnect();
-    grannyModel.Destroy();
     if (nameplatesOk)
         nameplates.Destroy();
     if (terrainOk)

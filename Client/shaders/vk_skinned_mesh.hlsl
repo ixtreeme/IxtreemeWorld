@@ -1,6 +1,6 @@
 #include "vk_common.hlsli"
 
-// NOTE: bumped 64 -> 128 bones. The warrior model has 74 bones (Granny log),
+// NOTE: bumped 64 -> 128 bones for current humanoid skeletons,
 // so the original DX11 array of 64 would overflow / clamp. 128 * 64 bytes =
 // 8 KB, still well under the 16 KB guaranteed maxUniformBufferRange minimum.
 // If you ever exceed ~256 bones, switch this to a StructuredBuffer (SSBO).

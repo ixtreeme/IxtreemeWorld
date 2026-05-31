@@ -2,7 +2,23 @@
 
 #include "Debug.h"
 #include "asset/IAssetReader.h"
-#include <granny.h>
+
+#include <fastgltf/core.hpp>
+#include <fastgltf/math.hpp>
+#include <fastgltf/tools.hpp>
+#include <ozz/animation/runtime/animation.h>
+#include <ozz/animation/runtime/local_to_model_job.h>
+#include <ozz/animation/runtime/sampling_job.h>
+#include <ozz/animation/runtime/skeleton.h>
+#include <ozz/base/io/archive.h>
+#include <ozz/base/io/stream.h>
+#include <ozz/base/maths/simd_math.h>
+#include <ozz/base/maths/soa_transform.h>
+#include <ozz/base/span.h>
+
+#define STB_IMAGE_IMPLEMENTATION
+#define STBI_ONLY_PNG
+#include <stb_image.h>
 
 #include <algorithm>
 #include <array>
@@ -13,11 +29,26 @@
 #include <cstdio>
 #include <cstdlib>
 #include <cstring>
+#include <filesystem>
 #include <limits>
+#include <map>
 #include <memory>
 #include <optional>
 #include <string>
+#include <string_view>
+#include <unordered_map>
+#include <variant>
 #include <vector>
+
+struct WarriorRenderer::OzzRuntime
+{
+    ozz::animation::Skeleton skeleton;
+    ozz::animation::Animation idle;
+    ozz::animation::SamplingJob::Context context;
+    std::vector<ozz::math::SoaTransform> locals;
+    std::vector<ozz::math::Float4x4> models;
+    bool hasIdle = false;
+};
 
 namespace
 {
@@ -72,6 +103,8 @@ struct Mat4
 {
     float m[16];
 };
+
+Mat4 Translation(float x, float y, float z);
 
 struct UniformBlock
 {
@@ -137,16 +170,6 @@ struct DdsImage
     std::vector<VkBufferImageCopy> regions;
 };
 
-granny_data_type_definition g_sourceVertexType[] =
-{
-    {GrannyReal32Member, "Position", nullptr, 3, {0, 0, 0}, 0},
-    {GrannyNormalUInt8Member, "BoneWeights", nullptr, 4, {0, 0, 0}, 0},
-    {GrannyUInt8Member, "BoneIndices", nullptr, 4, {0, 0, 0}, 0},
-    {GrannyReal32Member, "Normal", nullptr, 3, {0, 0, 0}, 0},
-    {GrannyReal32Member, "TextureCoordinates0", nullptr, 2, {0, 0, 0}, 0},
-    {GrannyEndMember, nullptr, nullptr, 0, {0, 0, 0}, 0},
-};
-
 Mat4 Identity()
 {
     Mat4 r{};
@@ -174,18 +197,6 @@ Mat4 Scale(float value)
     r.m[0] = value;
     r.m[5] = value;
     r.m[10] = value;
-    return r;
-}
-
-Mat4 RawGrannyToDisplay()
-{
-    Mat4 r{};
-    // Row-vector matrix: raw Granny centimeters/Z-up -> renderer meters/Y-up.
-    // (x, y, z) -> (x * 0.01, z * 0.01, -y * 0.01)
-    r.m[0] = 0.01f;
-    r.m[6] = -0.01f;
-    r.m[9] = 0.01f;
-    r.m[15] = 1.0f;
     return r;
 }
 
@@ -228,11 +239,6 @@ Mat4 ToLocalMat4(const WorldMat4& matrix)
     Mat4 r{};
     std::memcpy(r.m, matrix.m, sizeof(r.m));
     return r;
-}
-
-size_t MotionIndex(WarriorRenderer::MotionState state)
-{
-    return static_cast<size_t>(state);
 }
 
 const char* MotionStateName(WarriorRenderer::MotionState state)
@@ -493,6 +499,159 @@ DdsImage CreateFallbackWhiteDdsImage(const std::string& sourcePath)
     return out;
 }
 
+bool CopyDataSourceBytes(const fastgltf::Asset& asset, const fastgltf::DataSource& source,
+    size_t byteOffset, size_t byteLength, std::vector<uint8_t>& out);
+
+bool CopyBufferViewBytes(const fastgltf::Asset& asset, size_t bufferViewIndex, std::vector<uint8_t>& out)
+{
+    if (bufferViewIndex >= asset.bufferViews.size())
+        return false;
+
+    const auto& view = asset.bufferViews[bufferViewIndex];
+    if (view.bufferIndex >= asset.buffers.size())
+        return false;
+
+    return CopyDataSourceBytes(asset, asset.buffers[view.bufferIndex].data,
+        view.byteOffset, view.byteLength, out);
+}
+
+bool CopyDataSourceBytes(const fastgltf::Asset& asset, const fastgltf::DataSource& source,
+    size_t byteOffset, size_t byteLength, std::vector<uint8_t>& out)
+{
+    const std::byte* data = nullptr;
+    size_t size = 0;
+
+    if (const auto* bufferView = std::get_if<fastgltf::sources::BufferView>(&source))
+        return CopyBufferViewBytes(asset, bufferView->bufferViewIndex, out);
+    if (const auto* array = std::get_if<fastgltf::sources::Array>(&source))
+    {
+        data = array->bytes.data();
+        size = array->bytes.size();
+    }
+    else if (const auto* vector = std::get_if<fastgltf::sources::Vector>(&source))
+    {
+        data = vector->bytes.data();
+        size = vector->bytes.size();
+    }
+    else if (const auto* byteView = std::get_if<fastgltf::sources::ByteView>(&source))
+    {
+        data = byteView->bytes.data();
+        size = byteView->bytes.size();
+    }
+    else
+    {
+        return false;
+    }
+
+    if (!data || byteOffset > size)
+        return false;
+    const size_t available = size - byteOffset;
+    const size_t length = byteLength == std::numeric_limits<size_t>::max()
+        ? available
+        : byteLength;
+    if (length > available)
+        return false;
+
+    const auto* begin = reinterpret_cast<const uint8_t*>(data + byteOffset);
+    out.assign(begin, begin + length);
+    return true;
+}
+
+DdsImage CreateRgbaImage(std::string name, uint32_t width, uint32_t height, std::vector<uint8_t> pixels)
+{
+    DdsImage out{};
+    out.filename = std::move(name);
+    out.width = width;
+    out.height = height;
+    out.mipLevels = 1;
+    out.bytesPerPixel = 4;
+    out.compressed = false;
+    out.srgb = true;
+    out.format = VK_FORMAT_R8G8B8A8_SRGB;
+    out.pixels = std::move(pixels);
+
+    VkBufferImageCopy region{};
+    region.bufferOffset = 0;
+    region.imageSubresource.aspectMask = VK_IMAGE_ASPECT_COLOR_BIT;
+    region.imageSubresource.mipLevel = 0;
+    region.imageSubresource.baseArrayLayer = 0;
+    region.imageSubresource.layerCount = 1;
+    region.imageExtent = {width, height, 1};
+    out.regions.push_back(region);
+    return out;
+}
+
+bool LoadGltfBaseColorTexture(client::asset::IAssetReader& assets,
+    const std::string& modelPath, DdsImage& out)
+{
+    const size_t slash = modelPath.find_last_of("\\/");
+    const std::string dir = slash == std::string::npos ? std::string(".") : modelPath.substr(0, slash);
+
+    auto modelBytes = assets.ReadAll(modelPath);
+    if (!modelBytes)
+        return false;
+
+    auto data = fastgltf::GltfDataBuffer::FromBytes(
+        reinterpret_cast<const std::byte*>(modelBytes->data()), modelBytes->size());
+    if (data.error() != fastgltf::Error::None)
+        return false;
+
+    fastgltf::Parser parser;
+    auto assetResult = parser.loadGltf(data.get(), std::filesystem::path(dir),
+        fastgltf::Options::DecomposeNodeMatrices);
+    if (assetResult.error() != fastgltf::Error::None)
+        return false;
+
+    fastgltf::Asset asset = std::move(assetResult.get());
+    for (const auto& material : asset.materials)
+    {
+        if (!material.pbrData.baseColorTexture.has_value())
+            continue;
+
+        const size_t textureIndex = material.pbrData.baseColorTexture->textureIndex;
+        if (textureIndex >= asset.textures.size())
+            continue;
+
+        const auto& texture = asset.textures[textureIndex];
+        if (!texture.imageIndex.has_value() || texture.imageIndex.value() >= asset.images.size())
+            continue;
+
+        const auto& image = asset.images[texture.imageIndex.value()];
+        std::vector<uint8_t> encoded;
+        if (!CopyDataSourceBytes(asset, image.data, 0, std::numeric_limits<size_t>::max(), encoded) ||
+            encoded.empty())
+            continue;
+
+        int width = 0;
+        int height = 0;
+        int channels = 0;
+        stbi_uc* decoded = stbi_load_from_memory(
+            encoded.data(), static_cast<int>(encoded.size()), &width, &height, &channels, 4);
+        if (!decoded || width <= 0 || height <= 0)
+        {
+            if (decoded)
+                stbi_image_free(decoded);
+            continue;
+        }
+
+        std::vector<uint8_t> pixels(
+            decoded, decoded + (static_cast<size_t>(width) * static_cast<size_t>(height) * 4u));
+        stbi_image_free(decoded);
+
+        out = CreateRgbaImage(std::string(image.name.empty() ? "glTF baseColorTexture" : image.name),
+            static_cast<uint32_t>(width), static_cast<uint32_t>(height), std::move(pixels));
+        LogFormat("[GLTF-TEX] decoded baseColorTexture material='%s' image='%s' (%ux%u, source channels=%d)",
+            material.name.c_str(),
+            out.filename.c_str(),
+            out.width,
+            out.height,
+            channels);
+        return true;
+    }
+
+    return false;
+}
+
 VkShaderModule CreateShaderModule(VkDevice device, client::asset::IAssetReader& assets,
     const std::string& path)
 {
@@ -726,23 +885,23 @@ void Normalize3(float v[3])
     v[2] /= len;
 }
 
-void TransformPointRowVector(const granny_real32* matrix, const float in[3], float out[3])
+void TransformPointRowVector(const float* matrix, const float in[3], float out[3])
 {
     out[0] = in[0] * matrix[0] + in[1] * matrix[4] + in[2] * matrix[8] + matrix[12];
     out[1] = in[0] * matrix[1] + in[1] * matrix[5] + in[2] * matrix[9] + matrix[13];
     out[2] = in[0] * matrix[2] + in[1] * matrix[6] + in[2] * matrix[10] + matrix[14];
 }
 
-void TransformVectorRowVector(const granny_real32* matrix, const float in[3], float out[3])
+void TransformVectorRowVector(const float* matrix, const float in[3], float out[3])
 {
     out[0] = in[0] * matrix[0] + in[1] * matrix[4] + in[2] * matrix[8];
     out[1] = in[0] * matrix[1] + in[1] * matrix[5] + in[2] * matrix[9];
     out[2] = in[0] * matrix[2] + in[1] * matrix[6] + in[2] * matrix[10];
 }
 
-void SkinVertex(const WarriorRenderer::SourceVertex& source, const granny_matrix_4x4* compositeMatrices,
-    const granny_int32x* toBoneIndices, int bindingBoneCount, float outPosition[3],
-    int skeletonBoneCount, float outNormal[3], float outUv[2], int modelBones[4])
+void SkinVertex(const WarriorRenderer::SourceVertex& source,
+    const std::vector<std::array<float, 16>>& bonePalette, float outPosition[3],
+    float outNormal[3], float outUv[2], int modelBones[4])
 {
     outPosition[0] = outPosition[1] = outPosition[2] = 0.0f;
     outNormal[0] = outNormal[1] = outNormal[2] = 0.0f;
@@ -753,7 +912,7 @@ void SkinVertex(const WarriorRenderer::SourceVertex& source, const granny_matrix
     for (int i = 0; i < 4; ++i)
         totalWeight += source.boneWeights[i];
 
-    if (totalWeight <= 0 || !compositeMatrices || !toBoneIndices)
+    if (totalWeight <= 0 || bonePalette.empty())
     {
         std::memcpy(outPosition, source.position, sizeof(float) * 3);
         std::memcpy(outNormal, source.normal, sizeof(float) * 3);
@@ -768,17 +927,13 @@ void SkinVertex(const WarriorRenderer::SourceVertex& source, const granny_matrix
         if (weightByte == 0)
             continue;
 
-        const int localBone = source.boneIndices[influence];
-        if (localBone < 0 || localBone >= bindingBoneCount)
-            continue;
-
-        const int modelBone = toBoneIndices[localBone];
+        const int modelBone = source.boneIndices[influence];
         modelBones[influence] = modelBone;
-        if (modelBone < 0 || modelBone >= skeletonBoneCount)
+        if (modelBone < 0 || modelBone >= static_cast<int>(bonePalette.size()))
             continue;
 
         const float weight = static_cast<float>(weightByte) / static_cast<float>(totalWeight);
-        const granny_real32* matrix = reinterpret_cast<const granny_real32*>(compositeMatrices[modelBone]);
+        const float* matrix = bonePalette[modelBone].data();
 
         float skinnedPosition[3]{};
         float skinnedNormal[3]{};
@@ -797,6 +952,94 @@ void SkinVertex(const WarriorRenderer::SourceVertex& source, const granny_matrix
     outUv[1] = source.uv[1];
 }
 
+template <typename T>
+bool ReadOzzObject(client::asset::IAssetReader& assets, const std::string& path, T& out)
+{
+    auto bytes = assets.ReadAll(path);
+    if (!bytes)
+    {
+        LogFormat("[OZZ] missing archive: %s", path.c_str());
+        return false;
+    }
+
+    ozz::io::MemoryStream stream;
+    if (stream.Write(bytes->data(), bytes->size()) != bytes->size())
+    {
+        LogFormat("[OZZ] failed to stage archive in memory: %s", path.c_str());
+        return false;
+    }
+    stream.Seek(0, ozz::io::Stream::kSet);
+    ozz::io::IArchive archive(&stream);
+    if (!archive.TestTag<T>())
+    {
+        LogFormat("[OZZ] archive type mismatch: %s", path.c_str());
+        return false;
+    }
+    archive >> out;
+    return true;
+}
+
+std::array<float, 16> IdentityPaletteMatrix()
+{
+    return {1.0f, 0.0f, 0.0f, 0.0f,
+        0.0f, 1.0f, 0.0f, 0.0f,
+        0.0f, 0.0f, 1.0f, 0.0f,
+        0.0f, 0.0f, 0.0f, 1.0f};
+}
+
+std::array<float, 16> ToRowMajorMatrix(const ozz::math::Float4x4& matrix)
+{
+    float columns[4][4]{};
+    for (int col = 0; col < 4; ++col)
+        ozz::math::StorePtrU(matrix.cols[col], columns[col]);
+
+    std::array<float, 16> out{};
+    for (int row = 0; row < 4; ++row)
+    {
+        for (int col = 0; col < 4; ++col)
+            out[row * 4 + col] = columns[col][row];
+    }
+    return out;
+}
+
+std::array<float, 16> ToRowVectorPaletteMatrix(const ozz::math::Float4x4& matrix)
+{
+    float columns[4][4]{};
+    for (int col = 0; col < 4; ++col)
+        ozz::math::StorePtrU(matrix.cols[col], columns[col]);
+
+    std::array<float, 16> out{};
+    for (int row = 0; row < 4; ++row)
+    {
+        for (int col = 0; col < 4; ++col)
+            out[row * 4 + col] = columns[row][col];
+    }
+    return out;
+}
+
+ozz::math::Float4x4 ToOzzMatrix(const fastgltf::math::fmat4x4& matrix)
+{
+    ozz::math::Float4x4 out{};
+    for (int col = 0; col < 4; ++col)
+    {
+        out.cols[col] = ozz::math::simd_float4::Load(
+            matrix[col][0], matrix[col][1], matrix[col][2], matrix[col][3]);
+    }
+    return out;
+}
+
+uint8_t ToWeightByte(float weight)
+{
+    const float clamped = std::clamp(weight, 0.0f, 1.0f);
+    return static_cast<uint8_t>(std::lround(clamped * 255.0f));
+}
+
+std::string DirectoryOf(const std::string& path)
+{
+    const size_t slash = path.find_last_of("\\/");
+    return slash == std::string::npos ? std::string(".") : path.substr(0, slash);
+}
+
 uint32_t PackBytes(uint32_t b0, uint32_t b1, uint32_t b2, uint32_t b3)
 {
     return (b0 & 0xffu) |
@@ -804,36 +1047,13 @@ uint32_t PackBytes(uint32_t b0, uint32_t b1, uint32_t b2, uint32_t b3)
         ((b2 & 0xffu) << 16u) |
         ((b3 & 0xffu) << 24u);
 }
-
-bool MeshUsesFaceTexture(granny_mesh* mesh)
-{
-    if (mesh && mesh->Name && std::strstr(mesh->Name, "face"))
-        return true;
-
-    if (!mesh)
-        return false;
-
-    for (int materialIndex = 0; materialIndex < mesh->MaterialBindingCount; ++materialIndex)
-    {
-        granny_material* material = mesh->MaterialBindings[materialIndex].Material;
-        if (!material)
-            continue;
-
-        if (material->Name && std::strstr(material->Name, "face"))
-            return true;
-
-        for (int mapIndex = 0; mapIndex < material->MapCount; ++mapIndex)
-        {
-            granny_material* mapped = material->Maps[mapIndex].Material;
-            if (mapped && mapped->Texture && mapped->Texture->FromFileName &&
-                std::strstr(mapped->Texture->FromFileName, "face"))
-            {
-                return true;
-            }
-        }
-    }
-    return false;
 }
+
+WarriorRenderer::WarriorRenderer() = default;
+
+WarriorRenderer::~WarriorRenderer()
+{
+    Destroy();
 }
 
 bool WarriorRenderer::Create(VulkanDevice& device, client::asset::IAssetReader& assets,
@@ -843,7 +1063,7 @@ bool WarriorRenderer::Create(VulkanDevice& device, client::asset::IAssetReader& 
     m_device = device.GetDevice();
     m_assets = &assets;
 
-    const bool loaded = LoadGrannyMesh(modelPath);
+    const bool loaded = LoadGltfMesh(modelPath);
     const bool buffers = loaded ? CreateBuffers(device) : false;
     const bool compute = buffers ? CreateComputeResources(device) : false;
     const bool textures = compute ? CreateTextures(device, modelPath) : false;
@@ -1035,7 +1255,7 @@ void WarriorRenderer::Render(VulkanDevice& device, double timeSeconds)
         {
             LogFormat("[MESH] drawing mesh[%zu] with texture %s",
                 i,
-                draw.textureIndex == 1 ? "warrior_face.DDS" : "warrior_4-1.dds");
+                draw.textureIndex < m_textures.size() ? m_textures[draw.textureIndex].name.c_str() : "<invalid>");
         }
     }
     loggedDraws = true;
@@ -1165,320 +1385,363 @@ void WarriorRenderer::Destroy()
     m_assets = nullptr;
 }
 
-bool WarriorRenderer::LoadGrannyMesh(const std::string& modelPath)
+bool WarriorRenderer::LoadGltfMesh(const std::string& modelPath)
 {
     DestroyAnimation();
-    auto modelBytes = m_assets ? m_assets->ReadAll(modelPath) : std::nullopt;
-    m_grannyFile = modelBytes
-        ? GrannyReadEntireFileFromMemory(static_cast<granny_int32x>(modelBytes->size()),
-              modelBytes->data())
-        : nullptr;
-    if (!m_grannyFile)
+    if (!m_assets)
+        return false;
+
+    const std::string dir = DirectoryOf(modelPath);
+    if (!LoadOzzPose(dir))
+        return false;
+
+    auto modelBytes = m_assets->ReadAll(modelPath);
+    if (!modelBytes)
     {
-        LogFormat("[MESH] GrannyReadEntireFileFromMemory failed: %s", modelPath.c_str());
+        LogFormat("[GLTF] failed to read model: %s", modelPath.c_str());
         return false;
     }
 
-    granny_file_info* info = GrannyGetFileInfo(m_grannyFile);
-    if (!info)
+    auto data = fastgltf::GltfDataBuffer::FromBytes(
+        reinterpret_cast<const std::byte*>(modelBytes->data()), modelBytes->size());
+    if (data.error() != fastgltf::Error::None)
     {
-        Log("[MESH] GrannyGetFileInfo failed");
-        DestroyAnimation();
+        LogFormat("[GLTF] data buffer error for %s: %s", modelPath.c_str(),
+            fastgltf::getErrorMessage(data.error()).data());
         return false;
     }
 
-    if (info->ModelCount <= 0 || !info->Models[0] || !info->Models[0]->Skeleton)
+    fastgltf::Parser parser;
+    auto assetResult = parser.loadGltf(data.get(), std::filesystem::path(dir),
+        fastgltf::Options::DecomposeNodeMatrices);
+    if (assetResult.error() != fastgltf::Error::None)
     {
-        Log("[SKIN] model has no usable skeleton");
-        DestroyAnimation();
+        LogFormat("[GLTF] parse error for %s: %s", modelPath.c_str(),
+            fastgltf::getErrorMessage(assetResult.error()).data());
         return false;
     }
+    fastgltf::Asset asset = std::move(assetResult.get());
 
-    m_model = info->Models[0];
-    m_skeleton = m_model->Skeleton;
-    const size_t slash = modelPath.find_last_of("\\/");
-    const std::string dir = slash == std::string::npos ? std::string(".") : modelPath.substr(0, slash);
+    std::unordered_map<std::string, uint32_t> ozzJointByName;
+    auto jointNames = m_ozz->skeleton.joint_names();
+    for (int i = 0; i < m_ozz->skeleton.num_joints(); ++i)
+        ozzJointByName.emplace(jointNames[i], static_cast<uint32_t>(i));
 
-    constexpr float kPoseTimeSeconds = 0.0f;
-    m_modelInstance = GrannyInstantiateModel(m_model);
-    m_localPose = GrannyNewLocalPose(m_skeleton->BoneCount);
-    m_worldPose = GrannyNewWorldPose(m_skeleton->BoneCount);
-    if (!m_modelInstance || !m_localPose || !m_worldPose)
+    std::vector<std::vector<uint32_t>> skinJointRemaps(asset.skins.size());
+    for (size_t skinIndex = 0; skinIndex < asset.skins.size(); ++skinIndex)
     {
-        Log("[SKIN] failed to allocate Granny pose objects");
-        DestroyAnimation();
-        return false;
-    }
+        const auto& skin = asset.skins[skinIndex];
+        auto& remaps = skinJointRemaps[skinIndex];
+        remaps.assign(skin.joints.size(), 255u);
+        for (size_t localJoint = 0; localJoint < skin.joints.size(); ++localJoint)
+        {
+            const auto& node = asset.nodes[skin.joints[localJoint]];
+            auto it = ozzJointByName.find(std::string(node.name));
+            if (it != ozzJointByName.end())
+                remaps[localJoint] = it->second;
+        }
 
-    const std::string baseAnimDir = dir + "/BaseAnim";
-    if (!LoadMotionAnimation(baseAnimDir + "/wait.gr2", MotionState::Idle) ||
-        !LoadMotionAnimation(baseAnimDir + "/walk.gr2", MotionState::Walk) ||
-        !LoadMotionAnimation(baseAnimDir + "/run.gr2", MotionState::Run))
-    {
-        DestroyAnimation();
-        return false;
+        if (skin.inverseBindMatrices.has_value())
+        {
+            const auto& accessor = asset.accessors[skin.inverseBindMatrices.value()];
+            size_t matrixIndex = 0;
+            fastgltf::iterateAccessor<fastgltf::math::fmat4x4>(
+                asset, accessor, [&](fastgltf::math::fmat4x4 matrix)
+                {
+                    if (matrixIndex < remaps.size() && remaps[matrixIndex] < m_inverseBindMatrices.size())
+                    {
+                        const auto ozzMatrix = ToOzzMatrix(matrix);
+                        m_inverseBindMatrices[remaps[matrixIndex]] = ToRowMajorMatrix(ozzMatrix);
+                    }
+                    ++matrixIndex;
+                });
+        }
     }
-    SetMotionState(MotionState::Idle);
 
     m_vertices.clear();
     m_indices.clear();
     m_rawMeshes.clear();
     m_restVerticesGpu.clear();
+    m_draws.clear();
 
-    int observedIndexBytes = 0;
     uint32_t invalidRemappedInfluences = 0;
+    uint32_t primitiveIndex = 0;
+    int observedIndexBytes = 0;
 
-    for (int meshIndex = 0; meshIndex < m_model->MeshBindingCount; ++meshIndex)
+    for (size_t nodeIndex = 0; nodeIndex < asset.nodes.size(); ++nodeIndex)
     {
-        granny_mesh* mesh = m_model->MeshBindings[meshIndex].Mesh;
-        if (!mesh)
+        const auto& node = asset.nodes[nodeIndex];
+        if (!node.meshIndex.has_value())
             continue;
+        LogFormat("[GLTF] loading skinned mesh '%s' from node '%s' in mesh-local coordinates",
+            modelPath.c_str(),
+            std::string(node.name).c_str());
+        const std::vector<uint32_t>* remaps = nullptr;
+        if (node.skinIndex.has_value() && node.skinIndex.value() < skinJointRemaps.size())
+            remaps = &skinJointRemaps[node.skinIndex.value()];
 
-        const int vertexCount = GrannyGetMeshVertexCount(mesh);
-        const int indexCount = GrannyGetMeshIndexCount(mesh);
-        const int bytesPerIndex = GrannyGetMeshBytesPerIndex(mesh);
-        observedIndexBytes = std::max(observedIndexBytes, bytesPerIndex);
-
-        std::vector<SourceVertex> sourceVertices(static_cast<size_t>(vertexCount));
-        GrannyCopyMeshVertices(mesh, g_sourceVertexType, sourceVertices.data());
-
-        granny_mesh_binding* meshBinding = GrannyNewMeshBinding(mesh, m_skeleton, m_skeleton);
-        if (!meshBinding)
+        const auto& mesh = asset.meshes[node.meshIndex.value()];
+        for (const auto& primitive : mesh.primitives)
         {
-            LogFormat("[SKIN] GrannyNewMeshBinding failed for mesh[%d]", meshIndex);
-            DestroyAnimation();
-            return false;
-        }
+            if (primitive.type != fastgltf::PrimitiveType::Triangles)
+                continue;
 
-        const int bindingBoneCount = GrannyGetMeshBindingBoneCount(meshBinding);
-        const granny_int32x* toBoneIndices = GrannyGetMeshBindingToBoneIndices(meshBinding);
-        if (!toBoneIndices)
-        {
-            LogFormat("[SKIN] GrannyGetMeshBindingToBoneIndices failed for mesh[%d]", meshIndex);
-            GrannyFreeMeshBinding(meshBinding);
-            DestroyAnimation();
-            return false;
-        }
+            auto posIt = primitive.findAttribute("POSITION");
+            auto normalIt = primitive.findAttribute("NORMAL");
+            auto uvIt = primitive.findAttribute("TEXCOORD_0");
+            auto jointsIt = primitive.findAttribute("JOINTS_0");
+            auto weightsIt = primitive.findAttribute("WEIGHTS_0");
+            if (posIt == primitive.attributes.end() || !primitive.indicesAccessor.has_value())
+                continue;
 
-        const uint32_t baseVertex = static_cast<uint32_t>(m_vertices.size());
-        m_vertices.resize(m_vertices.size() + sourceVertices.size());
-
-        RawMesh rawMesh{};
-        rawMesh.meshIndex = static_cast<uint32_t>(meshIndex);
-        rawMesh.baseVertex = baseVertex;
-        rawMesh.vertexCount = static_cast<uint32_t>(vertexCount);
-        rawMesh.sourceVertices = std::move(sourceVertices);
-        rawMesh.toBoneIndices.assign(toBoneIndices, toBoneIndices + bindingBoneCount);
-
-        m_restVerticesGpu.reserve(m_restVerticesGpu.size() + rawMesh.sourceVertices.size());
-        for (const SourceVertex& source : rawMesh.sourceVertices)
-        {
-            RestVertexGpu gpu{};
-            gpu.position[0] = source.position[0];
-            gpu.position[1] = source.position[1];
-            gpu.position[2] = source.position[2];
-            gpu.position[3] = 0.0f;
-            gpu.normal[0] = source.normal[0];
-            gpu.normal[1] = source.normal[1];
-            gpu.normal[2] = source.normal[2];
-            gpu.normal[3] = 0.0f;
-            gpu.uv[0] = source.uv[0];
-            gpu.uv[1] = source.uv[1];
-            gpu.uv[2] = 0.0f;
-            gpu.uv[3] = 0.0f;
-            gpu.packedWeights = PackBytes(
-                source.boneWeights[0], source.boneWeights[1],
-                source.boneWeights[2], source.boneWeights[3]);
-
-            uint32_t remappedBones[4]{255u, 255u, 255u, 255u};
-            for (uint32_t influence = 0; influence < 4; ++influence)
-            {
-                const uint32_t localBone = source.boneIndices[influence];
-                if (localBone < rawMesh.toBoneIndices.size())
+            const auto& positionAccessor = asset.accessors[posIt->accessorIndex];
+            const size_t vertexCount = positionAccessor.count;
+            std::vector<SourceVertex> sourceVertices(vertexCount);
+            fastgltf::iterateAccessorWithIndex<fastgltf::math::fvec3>(
+                asset, positionAccessor, [&](fastgltf::math::fvec3 value, size_t index)
                 {
-                    const int32_t modelBone = rawMesh.toBoneIndices[localBone];
-                    if (modelBone >= 0 && modelBone < m_skeleton->BoneCount)
+                    sourceVertices[index].position[0] = value.x();
+                    sourceVertices[index].position[1] = value.y();
+                    sourceVertices[index].position[2] = value.z();
+                });
+
+            if (normalIt != primitive.attributes.end())
+            {
+                const auto& accessor = asset.accessors[normalIt->accessorIndex];
+                fastgltf::iterateAccessorWithIndex<fastgltf::math::fvec3>(
+                    asset, accessor, [&](fastgltf::math::fvec3 value, size_t index)
                     {
-                        remappedBones[influence] = static_cast<uint32_t>(modelBone);
-                        continue;
-                    }
-                }
-                if (source.boneWeights[influence] != 0)
-                    ++invalidRemappedInfluences;
+                        sourceVertices[index].normal[0] = value.x();
+                        sourceVertices[index].normal[1] = value.y();
+                        sourceVertices[index].normal[2] = value.z();
+                    });
             }
-            gpu.packedBones = PackBytes(remappedBones[0], remappedBones[1], remappedBones[2], remappedBones[3]);
-            m_restVerticesGpu.push_back(gpu);
-        }
+            if (uvIt != primitive.attributes.end())
+            {
+                const auto& accessor = asset.accessors[uvIt->accessorIndex];
+                fastgltf::iterateAccessorWithIndex<fastgltf::math::fvec2>(
+                    asset, accessor, [&](fastgltf::math::fvec2 value, size_t index)
+                    {
+                        sourceVertices[index].uv[0] = value.x();
+                        sourceVertices[index].uv[1] = value.y();
+                    });
+            }
+            if (jointsIt != primitive.attributes.end() && remaps)
+            {
+                const auto& accessor = asset.accessors[jointsIt->accessorIndex];
+                if (accessor.componentType == fastgltf::ComponentType::UnsignedByte)
+                {
+                    fastgltf::iterateAccessorWithIndex<fastgltf::math::u8vec4>(
+                        asset, accessor, [&](fastgltf::math::u8vec4 value, size_t index)
+                        {
+                            for (int i = 0; i < 4; ++i)
+                            {
+                                const uint32_t local = value[i];
+                                sourceVertices[index].boneIndices[i] =
+                                    local < remaps->size() ? static_cast<uint8_t>((*remaps)[local]) : 255u;
+                            }
+                        });
+                }
+                else
+                {
+                    fastgltf::iterateAccessorWithIndex<fastgltf::math::u16vec4>(
+                        asset, accessor, [&](fastgltf::math::u16vec4 value, size_t index)
+                        {
+                            for (int i = 0; i < 4; ++i)
+                            {
+                                const uint32_t local = value[i];
+                                sourceVertices[index].boneIndices[i] =
+                                    local < remaps->size() ? static_cast<uint8_t>((*remaps)[local]) : 255u;
+                            }
+                        });
+                }
+            }
+            if (weightsIt != primitive.attributes.end())
+            {
+                const auto& accessor = asset.accessors[weightsIt->accessorIndex];
+                fastgltf::iterateAccessorWithIndex<fastgltf::math::fvec4>(
+                    asset, accessor, [&](fastgltf::math::fvec4 value, size_t index)
+                    {
+                        sourceVertices[index].boneWeights[0] = ToWeightByte(value.x());
+                        sourceVertices[index].boneWeights[1] = ToWeightByte(value.y());
+                        sourceVertices[index].boneWeights[2] = ToWeightByte(value.z());
+                        sourceVertices[index].boneWeights[3] = ToWeightByte(value.w());
+                    });
+            }
 
-        m_rawMeshes.push_back(std::move(rawMesh));
-        GrannyFreeMeshBinding(meshBinding);
+            const uint32_t baseVertex = static_cast<uint32_t>(m_vertices.size());
+            m_vertices.resize(m_vertices.size() + sourceVertices.size());
+            RawMesh rawMesh{};
+            rawMesh.meshIndex = primitiveIndex++;
+            rawMesh.baseVertex = baseVertex;
+            rawMesh.vertexCount = static_cast<uint32_t>(sourceVertices.size());
+            rawMesh.sourceVertices = std::move(sourceVertices);
 
-        const uint32_t firstIndex = static_cast<uint32_t>(m_indices.size());
-        void* indices = GrannyGetMeshIndices(mesh);
-        if (bytesPerIndex == 2)
-        {
-            const uint16_t* src = static_cast<const uint16_t*>(indices);
-            for (int i = 0; i < indexCount; ++i)
-                m_indices.push_back(baseVertex + src[i]);
-        }
-        else if (bytesPerIndex == 4)
-        {
-            const uint32_t* src = static_cast<const uint32_t*>(indices);
-            for (int i = 0; i < indexCount; ++i)
-                m_indices.push_back(baseVertex + src[i]);
-        }
-        else
-        {
-            LogFormat("[MESH] unsupported index size=%d in mesh[%d]", bytesPerIndex, meshIndex);
-            DestroyAnimation();
-            return false;
-        }
+            m_restVerticesGpu.reserve(m_restVerticesGpu.size() + rawMesh.sourceVertices.size());
+            for (const SourceVertex& source : rawMesh.sourceVertices)
+            {
+                RestVertexGpu gpu{};
+                gpu.position[0] = source.position[0];
+                gpu.position[1] = source.position[1];
+                gpu.position[2] = source.position[2];
+                gpu.normal[0] = source.normal[0];
+                gpu.normal[1] = source.normal[1];
+                gpu.normal[2] = source.normal[2];
+                gpu.uv[0] = source.uv[0];
+                gpu.uv[1] = source.uv[1];
+                gpu.packedWeights = PackBytes(
+                    source.boneWeights[0], source.boneWeights[1],
+                    source.boneWeights[2], source.boneWeights[3]);
+                gpu.packedBones = PackBytes(
+                    source.boneIndices[0], source.boneIndices[1],
+                    source.boneIndices[2], source.boneIndices[3]);
+                for (uint32_t i = 0; i < 4; ++i)
+                {
+                    if (source.boneWeights[i] != 0 && source.boneIndices[i] >= m_boneCount)
+                        ++invalidRemappedInfluences;
+                }
+                m_restVerticesGpu.push_back(gpu);
+            }
 
-        LogFormat("[MESH] extracted mesh[%d] '%s': verts=%d indices=%d indexSize=%d",
-            meshIndex,
-            mesh->Name ? mesh->Name : "<null>",
-            vertexCount,
-            indexCount,
-            bytesPerIndex * 8);
+            const uint32_t firstIndex = static_cast<uint32_t>(m_indices.size());
+            const auto& indexAccessor = asset.accessors[primitive.indicesAccessor.value()];
+            observedIndexBytes = std::max(observedIndexBytes,
+                static_cast<int>(fastgltf::getComponentByteSize(indexAccessor.componentType)));
+            fastgltf::iterateAccessor<std::uint32_t>(
+                asset, indexAccessor, [&](std::uint32_t index)
+                {
+                    m_indices.push_back(baseVertex + index);
+                });
 
-        MeshDraw draw{};
-        draw.firstIndex = firstIndex;
-        draw.indexCount = static_cast<uint32_t>(indexCount);
-        draw.textureIndex = MeshUsesFaceTexture(mesh) ? 1u : 0u;
-        m_draws.push_back(draw);
-        LogFormat("[COMPUTE] rest mesh[%d]: baseVertex=%u vertexCount=%d bindingBones=%d",
-            meshIndex,
-            baseVertex,
-            vertexCount,
-            bindingBoneCount);
+            MeshDraw draw{};
+            draw.firstIndex = firstIndex;
+            draw.indexCount = static_cast<uint32_t>(m_indices.size() - firstIndex);
+            draw.textureIndex = 0;
+            m_draws.push_back(draw);
+            LogFormat("[GLTF] extracted primitive[%u] mesh='%s': verts=%zu indices=%u skin=%s",
+                rawMesh.meshIndex,
+                mesh.name.c_str(),
+                rawMesh.sourceVertices.size(),
+                draw.indexCount,
+                remaps ? "yes" : "no");
+            m_rawMeshes.push_back(std::move(rawMesh));
+        }
     }
 
     if (m_vertices.empty() || m_indices.empty())
     {
-        Log("[MESH] no renderable Granny mesh data extracted");
+        Log("[GLTF] no renderable mesh data extracted");
         DestroyAnimation();
         return false;
     }
 
-    LogFormat("[SKIN] static pose sampled from BaseAnim/wait.gr2 at t=%.3f bones=%d duration=%.3f",
-        kPoseTimeSeconds,
-        m_skeleton->BoneCount,
-        m_motionClips[MotionIndex(MotionState::Idle)].duration);
-    if (!SkinPose(kPoseTimeSeconds, true, true))
+    if (!SkinPose(0.0f, true, true))
         return false;
 
     m_indexCount = static_cast<uint32_t>(m_indices.size());
-
     LogFormat("[MESH] total verts=%zu indices=%zu", m_vertices.size(), m_indices.size());
-    LogFormat("[MESH] skinned raw bbox cm min=(%.3f, %.3f, %.3f) max=(%.3f, %.3f, %.3f)",
+    LogFormat("[MESH] skinned bbox min=(%.3f, %.3f, %.3f) max=(%.3f, %.3f, %.3f)",
         m_bounds.min[0], m_bounds.min[1], m_bounds.min[2],
         m_bounds.max[0], m_bounds.max[1], m_bounds.max[2]);
-    LogFormat("[MESH] skinned raw bbox center=(%.3f, %.3f, %.3f) displayFitScale=%.3f",
+    LogFormat("[MESH] skinned bbox center=(%.3f, %.3f, %.3f) displayFitScale=%.3f",
         m_bounds.center[0], m_bounds.center[1], m_bounds.center[2], m_bounds.fitScale);
     LogFormat("[MESH] index size=%d bit, output index buffer=32 bit", observedIndexBytes * 8);
     LogFormat("[COMPUTE] rest-mesh SSBO vertices=%zu stride=%zu invalidRemapSentinels=%u",
         m_restVerticesGpu.size(),
         sizeof(RestVertexGpu),
         invalidRemappedInfluences);
-
     return true;
 }
 
-bool WarriorRenderer::LoadMotionAnimation(const std::string& path, MotionState state)
+bool WarriorRenderer::LoadOzzPose(const std::string& dir)
 {
-    AnimationClip& clip = m_motionClips[MotionIndex(state)];
-    clip.path = path;
-    auto bytes = m_assets ? m_assets->ReadAll(path) : std::nullopt;
-    clip.file = bytes
-        ? GrannyReadEntireFileFromMemory(static_cast<granny_int32x>(bytes->size()), bytes->data())
-        : nullptr;
-    if (!clip.file)
+    if (!m_assets)
+        return false;
+
+    m_ozz = std::make_unique<OzzRuntime>();
+    const std::string skeletonPath = dir + "/skeleton.ozz";
+    if (!ReadOzzObject(*m_assets, skeletonPath, m_ozz->skeleton))
     {
-        LogFormat("[ANIM] GrannyReadEntireFileFromMemory failed: %s", path.c_str());
+        DestroyAnimation();
         return false;
     }
 
-    granny_file_info* animInfo = GrannyGetFileInfo(clip.file);
-    if (!animInfo || animInfo->AnimationCount <= 0 || !animInfo->Animations[0])
-    {
-        LogFormat("[ANIM] no usable animation in %s", path.c_str());
-        return false;
-    }
+    m_boneCount = static_cast<uint32_t>(m_ozz->skeleton.num_joints());
+    m_inverseBindMatrices.assign(m_boneCount, IdentityPaletteMatrix());
+    m_bonePaletteCpu.assign(m_boneCount, IdentityPaletteMatrix());
+    m_ozz->locals.resize(static_cast<size_t>(m_ozz->skeleton.num_soa_joints()));
+    m_ozz->models.resize(static_cast<size_t>(m_ozz->skeleton.num_joints()));
+    m_ozz->context.Resize(m_ozz->skeleton.num_joints());
 
-    clip.animation = animInfo->Animations[0];
-    clip.duration = clip.animation->Duration > 0.0f ? clip.animation->Duration : 2.0f;
-    clip.control = m_modelInstance ? GrannyPlayControlledAnimation(0.0f, clip.animation, m_modelInstance) : nullptr;
-    if (!clip.control)
+    const std::string idlePath = dir + "/idle.ozz";
+    if (ReadOzzObject(*m_assets, idlePath, m_ozz->idle) &&
+        m_ozz->idle.num_tracks() == m_ozz->skeleton.num_joints())
     {
-        LogFormat("[ANIM] GrannyPlayControlledAnimation failed: %s", path.c_str());
-        return false;
+        m_ozz->hasIdle = true;
+        LogFormat("[OZZ] loaded skeleton=%s bones=%u idle=%s duration=%.3f",
+            skeletonPath.c_str(), m_boneCount, idlePath.c_str(), m_ozz->idle.duration());
     }
-
-    GrannySetControlWeight(clip.control, 0.0f);
-    GrannySetControlSpeed(clip.control, 1.0f);
-    GrannySetControlLoopCount(clip.control, 0);
-    GrannySetControlActive(clip.control, true);
-    LogFormat("[ANIM] loaded state=%s file=%s duration=%.3f",
-        MotionStateName(state),
-        path.c_str(),
-        clip.duration);
+    else
+    {
+        m_ozz->hasIdle = false;
+        LogFormat("[OZZ] loaded skeleton=%s bones=%u; idle.ozz missing or incompatible, using rest pose",
+            skeletonPath.c_str(), m_boneCount);
+    }
     return true;
 }
 
 void WarriorRenderer::SetMotionState(MotionState state)
 {
     const bool changed = m_motionState != state;
-
     m_motionState = state;
-    for (size_t i = 0; i < m_motionClips.size(); ++i)
-    {
-        if (m_motionClips[i].control)
-            GrannySetControlWeight(m_motionClips[i].control, i == MotionIndex(state) ? 1.0f : 0.0f);
-    }
-
     if (changed)
         LogFormat("[ANIM-PREVIEW] state=%s", MotionStateName(state));
 }
 
-bool WarriorRenderer::ApplyMotionControls(float timeSeconds)
-{
-    return ApplyMotionControls(m_motionState, timeSeconds);
-}
-
-bool WarriorRenderer::ApplyMotionControls(MotionState state, float timeSeconds)
-{
-    bool hasActiveControl = false;
-    for (size_t i = 0; i < m_motionClips.size(); ++i)
-    {
-        AnimationClip& clip = m_motionClips[i];
-        if (!clip.control)
-            continue;
-
-        GrannySetControlActive(clip.control, true);
-        GrannySetControlLoopCount(clip.control, 0);
-        GrannySetControlWeight(clip.control, i == MotionIndex(state) ? 1.0f : 0.0f);
-        hasActiveControl = true;
-    }
-
-    GrannySetModelClock(m_modelInstance, timeSeconds);
-    return hasActiveControl;
-}
-
 bool WarriorRenderer::SkinPose(float animTimeSeconds, bool updateBounds, bool logSamples)
 {
-    if (!m_modelInstance || !m_localPose || !m_worldPose || !m_skeleton)
+    if (!m_ozz || m_boneCount == 0)
         return false;
 
-    if (!ApplyMotionControls(animTimeSeconds))
-        return false;
-    GrannySampleModelAnimations(m_modelInstance, 0, m_skeleton->BoneCount, m_localPose);
-    GrannyBuildWorldPose(m_skeleton, 0, m_skeleton->BoneCount, m_localPose, nullptr, m_worldPose);
-
-    granny_matrix_4x4* compositeMatrices = GrannyGetWorldPoseComposite4x4Array(m_worldPose);
-    if (!compositeMatrices)
+    if (m_ozz->hasIdle)
     {
-        Log("[SKIN] GrannyGetWorldPoseComposite4x4Array returned null");
+        const float duration = m_ozz->idle.duration();
+        const float ratio = duration > 0.0f
+            ? std::fmod(std::max(animTimeSeconds, 0.0f), duration) / duration
+            : 0.0f;
+        ozz::animation::SamplingJob samplingJob;
+        samplingJob.animation = &m_ozz->idle;
+        samplingJob.context = &m_ozz->context;
+        samplingJob.ratio = ratio;
+        samplingJob.output = ozz::make_span(m_ozz->locals);
+        if (!samplingJob.Run())
+            return false;
+    }
+    else
+    {
+        const auto rest = m_ozz->skeleton.joint_rest_poses();
+        std::copy(rest.begin(), rest.end(), m_ozz->locals.begin());
+    }
+
+    ozz::animation::LocalToModelJob localToModel;
+    localToModel.skeleton = &m_ozz->skeleton;
+    localToModel.input = ozz::make_span(m_ozz->locals);
+    localToModel.output = ozz::make_span(m_ozz->models);
+    if (!localToModel.Run())
         return false;
+
+    for (uint32_t bone = 0; bone < m_boneCount; ++bone)
+    {
+        ozz::math::Float4x4 inverseBind = ozz::math::Float4x4::identity();
+        for (int col = 0; col < 4; ++col)
+        {
+            inverseBind.cols[col] = ozz::math::simd_float4::Load(
+                m_inverseBindMatrices[bone][0 * 4 + col],
+                m_inverseBindMatrices[bone][1 * 4 + col],
+                m_inverseBindMatrices[bone][2 * 4 + col],
+                m_inverseBindMatrices[bone][3 * 4 + col]);
+        }
+        m_bonePaletteCpu[bone] = ToRowVectorPaletteMatrix(m_ozz->models[bone] * inverseBind);
     }
 
     float minValue[3] = {
@@ -1493,14 +1756,12 @@ bool WarriorRenderer::SkinPose(float animTimeSeconds, bool updateBounds, bool lo
     int sampleLogs = 0;
     for (const RawMesh& rawMesh : m_rawMeshes)
     {
-        const int bindingBoneCount = static_cast<int>(rawMesh.toBoneIndices.size());
         for (uint32_t vertexIndex = 0; vertexIndex < rawMesh.vertexCount; ++vertexIndex)
         {
             const SourceVertex& source = rawMesh.sourceVertices[vertexIndex];
             Vertex out{};
             int modelBones[4]{};
-            SkinVertex(source, compositeMatrices, rawMesh.toBoneIndices.data(), bindingBoneCount,
-                out.position, m_skeleton->BoneCount, out.normal, out.uv, modelBones);
+            SkinVertex(source, m_bonePaletteCpu, out.position, out.normal, out.uv, modelBones);
 
             const uint32_t outputIndex = rawMesh.baseVertex + vertexIndex;
             if (outputIndex >= m_vertices.size())
@@ -1532,10 +1793,10 @@ bool WarriorRenderer::SkinPose(float animTimeSeconds, bool updateBounds, bool lo
 
         if (logSamples)
         {
-            LogFormat("[SKIN] mesh[%u]: skinned %u verts, %zu bones in binding",
+            LogFormat("[SKIN] mesh[%u]: skinned %u verts, bones=%u",
                 rawMesh.meshIndex,
                 rawMesh.vertexCount,
-                rawMesh.toBoneIndices.size());
+                m_boneCount);
         }
     }
 
@@ -1551,7 +1812,7 @@ bool WarriorRenderer::SkinPose(float animTimeSeconds, bool updateBounds, bool lo
         const float sizeX = m_bounds.max[0] - m_bounds.min[0];
         const float sizeY = m_bounds.max[1] - m_bounds.min[1];
         const float sizeZ = m_bounds.max[2] - m_bounds.min[2];
-        const float maxDimension = std::max(sizeX, std::max(sizeY, sizeZ)) * 0.01f;
+        const float maxDimension = std::max(sizeX, std::max(sizeY, sizeZ));
         m_bounds.fitScale = maxDimension > 0.0001f ? (2.35f / maxDimension) : 1.0f;
     }
 
@@ -1566,23 +1827,19 @@ bool WarriorRenderer::UploadBonePalette(float animTimeSeconds, uint32_t frameInd
 bool WarriorRenderer::UploadBonePalette(MotionState state, float animTimeSeconds, uint32_t frameIndex, uint32_t skinSlot)
 {
     if (frameIndex >= kFramesInFlight || skinSlot >= kSkinSlots || !m_bonePaletteBuffers[frameIndex][skinSlot].memory ||
-        !m_modelInstance || !m_localPose || !m_worldPose || !m_skeleton)
+        !m_ozz || m_bonePaletteCpu.empty())
     {
         return false;
     }
 
-    if (!ApplyMotionControls(state, animTimeSeconds))
-        return false;
-    GrannySampleModelAnimations(m_modelInstance, 0, m_skeleton->BoneCount, m_localPose);
-    GrannyBuildWorldPose(m_skeleton, 0, m_skeleton->BoneCount, m_localPose, nullptr, m_worldPose);
-    granny_matrix_4x4* compositeMatrices = GrannyGetWorldPoseComposite4x4Array(m_worldPose);
-    if (!compositeMatrices)
+    (void)state;
+    if (!SkinPose(animTimeSeconds, false, false))
         return false;
 
-    const VkDeviceSize size = sizeof(granny_matrix_4x4) * static_cast<size_t>(m_skeleton->BoneCount);
+    const VkDeviceSize size = sizeof(std::array<float, 16>) * m_bonePaletteCpu.size();
     void* mapped = nullptr;
     VK_CHECK(vkMapMemory(m_device, m_bonePaletteBuffers[frameIndex][skinSlot].memory, 0, size, 0, &mapped));
-    std::memcpy(mapped, compositeMatrices, static_cast<size_t>(size));
+    std::memcpy(mapped, m_bonePaletteCpu.data(), static_cast<size_t>(size));
     vkUnmapMemory(m_device, m_bonePaletteBuffers[frameIndex][skinSlot].memory);
     return true;
 }
@@ -1600,7 +1857,7 @@ void WarriorRenderer::DispatchSkin(VkCommandBuffer cmd, uint32_t frameIndex, uin
 
     SkinPushConstants push{};
     push.vertexCount = static_cast<uint32_t>(m_vertices.size());
-    push.boneCount = static_cast<uint32_t>(m_skeleton ? m_skeleton->BoneCount : 0);
+    push.boneCount = m_boneCount;
     vkCmdPushConstants(cmd, m_computePipelineLayout, VK_SHADER_STAGE_COMPUTE_BIT,
         0, sizeof(push), &push);
 
@@ -1724,7 +1981,7 @@ bool WarriorRenderer::CreateComputeResources(VulkanDevice& device)
 
     const VkDeviceSize restSize = sizeof(RestVertexGpu) * m_restVerticesGpu.size();
     const VkDeviceSize vertexSize = sizeof(Vertex) * m_vertices.size();
-    const VkDeviceSize paletteSize = sizeof(granny_matrix_4x4) * static_cast<size_t>(m_skeleton ? m_skeleton->BoneCount : 0);
+    const VkDeviceSize paletteSize = sizeof(std::array<float, 16>) * static_cast<size_t>(m_boneCount);
     if (restSize == 0 || vertexSize == 0 || paletteSize == 0)
     {
         LogFormat("[COMPUTE] invalid buffer sizes rest=%llu output=%llu palette=%llu",
@@ -1769,8 +2026,8 @@ bool WarriorRenderer::CreateTextures(VulkanDevice& device, const std::string& mo
     const size_t slash = modelPath.find_last_of("\\/");
     const std::string dir = slash == std::string::npos ? std::string(".") : modelPath.substr(0, slash);
     const std::array<std::string, kTextureCount> textureFiles = {
-        dir + "/warrior_4-1.dds",
-        dir + "/warrior_face.DDS"};
+        modelPath + "#baseColor",
+        modelPath + "#fallback"};
 
     VkQueue graphicsQueue = VK_NULL_HANDLE;
     vkGetDeviceQueue(m_device, device.GetGraphicsQueueFamily(), 0, &graphicsQueue);
@@ -1778,7 +2035,10 @@ bool WarriorRenderer::CreateTextures(VulkanDevice& device, const std::string& mo
     for (uint32_t textureIndex = 0; textureIndex < kTextureCount; ++textureIndex)
     {
         DdsImage dds{};
-        if (!m_assets || !LoadDdsImage(*m_assets, textureFiles[textureIndex], dds))
+        const bool loaded = textureIndex == 0 && m_assets
+            ? LoadGltfBaseColorTexture(*m_assets, modelPath, dds)
+            : false;
+        if (!loaded)
         {
             LogFormat("[DDS] Falling back to 4x4 white RGBA8888 texture for %s",
                 textureFiles[textureIndex].c_str());
@@ -2024,7 +2284,7 @@ bool WarriorRenderer::CreateComputeDescriptors()
 
             VkDescriptorBufferInfo bonesInfo{};
             bonesInfo.buffer = m_bonePaletteBuffers[frame][skinSlot].buffer;
-            bonesInfo.range = sizeof(granny_matrix_4x4) * static_cast<size_t>(m_skeleton->BoneCount);
+            bonesInfo.range = sizeof(std::array<float, 16>) * static_cast<size_t>(m_boneCount);
 
             VkDescriptorBufferInfo outputInfo{};
             outputInfo.buffer = m_skinnedOutputBuffers[frame][skinSlot].buffer;
@@ -2260,29 +2520,10 @@ void WarriorRenderer::DestroyComputeResources()
 
 void WarriorRenderer::DestroyAnimation()
 {
-    if (m_worldPose)
-        GrannyFreeWorldPose(m_worldPose);
-    if (m_localPose)
-        GrannyFreeLocalPose(m_localPose);
-    for (AnimationClip& clip : m_motionClips)
-    {
-        if (clip.control)
-            GrannyFreeControl(clip.control);
-        if (clip.file)
-            GrannyFreeFile(clip.file);
-        clip = {};
-    }
-    if (m_modelInstance)
-        GrannyFreeModelInstance(m_modelInstance);
-    if (m_grannyFile)
-        GrannyFreeFile(m_grannyFile);
-
-    m_worldPose = nullptr;
-    m_localPose = nullptr;
-    m_modelInstance = nullptr;
-    m_grannyFile = nullptr;
-    m_model = nullptr;
-    m_skeleton = nullptr;
+    m_ozz.reset();
+    m_inverseBindMatrices.clear();
+    m_bonePaletteCpu.clear();
+    m_boneCount = 0;
     m_motionState = MotionState::Idle;
     m_lastAnimationLogTime = -1000.0;
 }
@@ -2305,7 +2546,7 @@ void WarriorRenderer::UpdateUniform(uint32_t frameIndex, uint32_t uniformSlot, d
     static bool loggedMvp = false;
 
     const Mat4 center = Translation(-m_bounds.center[0], -m_bounds.center[1], -m_bounds.center[2]);
-    const Mat4 display = RawGrannyToDisplay();
+    const Mat4 display = Identity();
     const Mat4 fit = Scale(m_bounds.fitScale);
     const Mat4 spin = RotationY(static_cast<float>(timeSeconds) * 0.55f);
     const Mat4 place = Translation(0.0f, 0.0f, 4.0f);
@@ -2315,7 +2556,7 @@ void WarriorRenderer::UpdateUniform(uint32_t frameIndex, uint32_t uniformSlot, d
 
     if (!loggedMvp)
     {
-        LogFormat("[MESH] MVP: raw skinned cm/Z-up vertices, display transform in model matrix (cmScale=0.01, Z-up->Y-up), fitScale=%.3f, translateZ=4.0, fov=45, near=0.1 far=50, aspect=%.3f",
+        LogFormat("[MESH] MVP: ozz/glTF mesh-local render transform, fitScale=%.3f, translateZ=4.0, fov=45, near=0.1 far=50, aspect=%.3f",
             m_bounds.fitScale,
             aspect);
         loggedMvp = true;
@@ -2333,14 +2574,14 @@ void WarriorRenderer::UpdateWorldUniform(uint32_t frameIndex, uint32_t uniformSl
 {
     static bool loggedMvp = false;
 
-    const Mat4 model = Multiply(Multiply(RawGrannyToDisplay(), RotationY(-yawRadians)),
+    const Mat4 model = Multiply(RotationY(-yawRadians),
         Translation(position.x, position.y, position.z));
     const Mat4 viewProjection = ToLocalMat4(camera.viewProjection);
     const Mat4 mvp = Multiply(model, viewProjection);
 
     if (!loggedMvp)
     {
-        Log("[MESH] World MVP: raw skinned cm/Z-up vertices -> display meters/Y-up, spawn translated to local origin, shared full-screen camera");
+        Log("[MESH] World MVP: ozz/glTF mesh-local render transform, spawn translated to local origin, shared full-screen camera");
         loggedMvp = true;
     }
 
