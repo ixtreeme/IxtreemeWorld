@@ -4,10 +4,16 @@
 
 #include <cstdint>
 #include <memory>
+#include <optional>
 #include <string>
 #include <vector>
 
 namespace client::net {
+
+struct DebugSpawnOverride {
+    float x = 0.0f;
+    float y = 0.0f;
+};
 
 class ClientSession {
 public:
@@ -28,6 +34,7 @@ public:
     void SendCharacterListRequest();
     void SendCharacterSelect(std::uint64_t character_id);
     void SendEnterWorld(const std::vector<std::uint8_t>& token);
+    void SetDebugSpawnOverride(std::optional<DebugSpawnOverride> spawn);
     void SendMoveInput(float dir_angle, MoveState state);
 
     void Update();

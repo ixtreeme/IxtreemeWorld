@@ -2,6 +2,7 @@
 
 #include <array>
 #include <cmath>
+#include <optional>
 #include <string>
 #include <utility>
 
@@ -18,6 +19,10 @@ namespace gs::game {
 namespace {
 
 constexpr float kTwoPi = 6.28318530717958647692f;
+
+#ifndef MMO_DEBUG_SPAWN_OVERRIDE
+#define MMO_DEBUG_SPAWN_OVERRIDE 0
+#endif
 
 std::uint16_t ReadU16(const std::uint8_t* bytes)
 {
@@ -187,11 +192,22 @@ void GameConnectionHandler::HandleEnterWorld(std::shared_ptr<gs::network::Sessio
 {
     ctx.state = GameSessionState::EnteringWorld;
     const auto token_hash = Sha256Hex(request.getToken());
+    std::optional<DebugSpawnOverride> debug_spawn;
+#if MMO_DEBUG_SPAWN_OVERRIDE
+    if (request.hasDebugSpawnOverride()) {
+        auto requested = request.getDebugSpawnOverride();
+        debug_spawn = DebugSpawnOverride{requested.getX(), requested.getY()};
+        LOG_INFO("Session {} requested debug spawn override: ({}, {})",
+                 session->Id(),
+                 debug_spawn->x,
+                 debug_spawn->y);
+    }
+#endif
 
     handoff_tokens_.Consume(
         token_hash,
         game_server_,
-        [this, session](gs::db::HandoffTokenConsumeResult consume) {
+        [this, session, debug_spawn](gs::db::HandoffTokenConsumeResult consume) {
             if (!consume) {
                 LOG_WARN("Session {} enter world rejected: {}",
                          session->Id(),
@@ -202,7 +218,7 @@ void GameConnectionHandler::HandleEnterWorld(std::shared_ptr<gs::network::Sessio
 
             characters_.FindById(
                 consume.data.character_id,
-                [this, session](gs::db::Result<gs::db::Character> character_result) {
+                [this, session, debug_spawn](gs::db::Result<gs::db::Character> character_result) {
                     std::lock_guard lock(contexts_mutex_);
                     const auto it = contexts_.find(session->Id());
                     if (it == contexts_.end()) {
@@ -221,7 +237,7 @@ void GameConnectionHandler::HandleEnterWorld(std::shared_ptr<gs::network::Sessio
                     }
 
                     it->second.state = GameSessionState::InWorld;
-                    sim_.PostSpawn(session, std::move(*character_result.value));
+                    sim_.PostSpawn(session, std::move(*character_result.value), debug_spawn);
                 });
         });
 }

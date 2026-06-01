@@ -13,6 +13,7 @@ if(WIN32 AND DEFINED ENV{VCPKG_ROOT} AND EXISTS "$ENV{VCPKG_ROOT}/installed/x64-
 endif()
 
 add_subdirectory(${CMAKE_CURRENT_SOURCE_DIR}/../shared/protocol shared_protocol_build)
+add_subdirectory(${CMAKE_CURRENT_SOURCE_DIR}/../shared/map shared_map_build)
 add_subdirectory(asset)
 add_subdirectory(network)
 
@@ -99,6 +100,7 @@ if(ANDROID)
         WarriorRenderer.h
         TerrainRenderer.cpp
         TerrainRenderer.h
+        MapEditorTypes.h
         NameplateRenderer.cpp
         NameplateRenderer.h
         WorldCamera.h
@@ -133,6 +135,7 @@ if(ANDROID)
     target_link_libraries(client_render PUBLIC
         client_platform
         client_asset
+        mapdata
         fastgltf::fastgltf
         ${CLIENT_OZZ_TARGETS}
         Noesis_imported
@@ -281,6 +284,7 @@ add_executable(VulkanClear
     WarriorRenderer.h
     TerrainRenderer.cpp
     TerrainRenderer.h
+    MapEditorTypes.h
     NameplateRenderer.cpp
     NameplateRenderer.h
     WorldCamera.h
@@ -320,6 +324,7 @@ target_link_libraries(VulkanClear PRIVATE
     Vulkan::Vulkan
     client_asset
     client_network
+    mapdata
     ${CLIENT_FLECS_TARGET}
     fastgltf::fastgltf
     ${CLIENT_OZZ_TARGETS}

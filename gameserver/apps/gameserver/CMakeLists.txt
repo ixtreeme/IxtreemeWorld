@@ -19,8 +19,18 @@ target_link_libraries(gameserver
         common
         network
         protocol
+        mapdata
         db
         ${GS_FLECS_TARGET}
+)
+
+target_compile_definitions(gameserver
+    PRIVATE
+        IXTREEME_DEFAULT_MAP_ROOT="${CMAKE_CURRENT_SOURCE_DIR}/../../../Client/assets/Maps/test_zone"
+        $<$<CONFIG:Debug>:MMO_DEBUG_SPAWN_OVERRIDE=1>
+        $<$<CONFIG:RelWithDebInfo>:MMO_DEBUG_SPAWN_OVERRIDE=1>
+        $<$<CONFIG:Release>:MMO_DEBUG_SPAWN_OVERRIDE=0>
+        $<$<CONFIG:MinSizeRel>:MMO_DEBUG_SPAWN_OVERRIDE=0>
 )
 
 configure_file(

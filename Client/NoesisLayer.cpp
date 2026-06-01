@@ -26,7 +26,9 @@
 #include <NsGui/MemoryStream.h>
 #include <NsGui/ObservableCollection.h>
 #include <NsGui/PasswordBox.h>
+#include <NsGui/RadioButton.h>
 #include <NsGui/RoutedEvent.h>
+#include <NsGui/Slider.h>
 #include <NsGui/Stream.h>
 #include <NsGui/TextBlock.h>
 #include <NsGui/TextBox.h>
@@ -663,6 +665,27 @@ struct NoesisLayer::Impl
         return true;
     }
 
+    bool CreateEditorView(Noesis::FrameworkElement* root, uint32_t width, uint32_t height)
+    {
+        if (!root)
+        {
+            Log("[NOESIS] FATAL: cannot create editor view from null root element.");
+            return false;
+        }
+
+        if (editorView)
+        {
+            editorView->GetRenderer()->Shutdown();
+            editorView.Reset();
+        }
+
+        editorView = Noesis::GUI::CreateView(root);
+        editorView->SetSize(width, height);
+        editorView->SetFlags(Noesis::RenderFlags_PPAA | Noesis::RenderFlags_LCD);
+        editorView->GetRenderer()->Init(renderDevice);
+        return true;
+    }
+
     bool LoadLoginView(uint32_t width, uint32_t height)
     {
         lobbyActive = false;
@@ -745,6 +768,49 @@ struct NoesisLayer::Impl
         return CreateMenuView(root, width, height);
     }
 
+    bool LoadMapEditorView(uint32_t width, uint32_t height)
+    {
+        Noesis::Ptr<Noesis::FrameworkElement> root =
+            Noesis::GUI::LoadXaml<Noesis::FrameworkElement>("EditorPanel.xaml");
+        if (!root)
+        {
+            Log("[NOESIS] FATAL: EditorPanel.xaml could not be loaded.");
+            return false;
+        }
+
+        editorRaise = root->FindName<Noesis::RadioButton>("ToolRaise");
+        editorLower = root->FindName<Noesis::RadioButton>("ToolLower");
+        editorSmooth = root->FindName<Noesis::RadioButton>("ToolSmooth");
+        editorFlatten = root->FindName<Noesis::RadioButton>("ToolFlatten");
+        editorPaint = root->FindName<Noesis::RadioButton>("ToolPaint");
+        editorRadius = root->FindName<Noesis::Slider>("BrushRadiusSlider");
+        editorStrength = root->FindName<Noesis::Slider>("BrushStrengthSlider");
+        editorTextureText = root->FindName<Noesis::TextBlock>("TextureSlotText");
+
+        if (Noesis::Button* button = root->FindName<Noesis::Button>("SaveButton"))
+            button->Click() += Noesis::MakeDelegate(this, &Impl::OnEditorSaveClicked);
+        if (Noesis::Button* button = root->FindName<Noesis::Button>("ReloadButton"))
+            button->Click() += Noesis::MakeDelegate(this, &Impl::OnEditorReloadClicked);
+        if (Noesis::Button* button = root->FindName<Noesis::Button>("UndoButton"))
+            button->Click() += Noesis::MakeDelegate(this, &Impl::OnEditorUndoClicked);
+
+        for (uint32_t i = 0; i < 8; ++i)
+        {
+            char name[16];
+            std::snprintf(name, sizeof(name), "Tex%uButton", i);
+            if (Noesis::Button* button = root->FindName<Noesis::Button>(name))
+            {
+                editorTextureButtons[i] = button;
+                button->Click() += Noesis::MakeDelegate(this, &Impl::OnEditorTextureClicked);
+            }
+        }
+
+        if (editorRaise)
+            editorRaise->SetIsChecked(true);
+        UpdateEditorTextureText();
+        return CreateEditorView(root, width, height);
+    }
+
     bool LoadLobbyView(uint32_t width, uint32_t height)
     {
         inGameMenuOpen = false;
@@ -771,10 +837,95 @@ struct NoesisLayer::Impl
         return created;
     }
 
+    bool LoadWorldHudView(uint32_t width, uint32_t height)
+    {
+        lobbyActive = false;
+        Noesis::Ptr<Noesis::FrameworkElement> root =
+            Noesis::GUI::LoadXaml<Noesis::FrameworkElement>("WorldHud.xaml");
+        if (!root)
+        {
+            Log("[NOESIS] FATAL: WorldHud.xaml could not be loaded.");
+            return false;
+        }
+        return CreateView(root, width, height);
+    }
+
     void ToggleInGameMenu()
     {
         inGameMenuOpen = !inGameMenuOpen;
         LogFormat("[MENU] in-game menu %s", inGameMenuOpen ? "open" : "closed");
+    }
+
+    void ToggleMapEditor()
+    {
+        mapEditorOpen = !mapEditorOpen;
+        LogFormat("[MAP-EDITOR] panel %s", mapEditorOpen ? "open" : "closed");
+    }
+
+    MapEditorSettings GetMapEditorSettings() const
+    {
+        MapEditorSettings settings{};
+        if (editorLower && editorLower->GetIsChecked().GetValueOrDefault())
+            settings.tool = MapEditorTool::Lower;
+        else if (editorSmooth && editorSmooth->GetIsChecked().GetValueOrDefault())
+            settings.tool = MapEditorTool::Smooth;
+        else if (editorFlatten && editorFlatten->GetIsChecked().GetValueOrDefault())
+            settings.tool = MapEditorTool::Flatten;
+        else if (editorPaint && editorPaint->GetIsChecked().GetValueOrDefault())
+            settings.tool = MapEditorTool::Paint;
+        else
+            settings.tool = MapEditorTool::Raise;
+
+        settings.brushRadiusMeters =
+            editorRadius ? static_cast<float>(editorRadius->GetValue()) : settings.brushRadiusMeters;
+        settings.brushStrength =
+            editorStrength ? static_cast<float>(editorStrength->GetValue()) : settings.brushStrength;
+        settings.textureSlot = editorTextureSlot;
+        return settings;
+    }
+
+    MapEditorCommands ConsumeMapEditorCommands()
+    {
+        MapEditorCommands commands = editorCommands;
+        editorCommands = {};
+        return commands;
+    }
+
+    void UpdateEditorTextureText()
+    {
+        if (!editorTextureText)
+            return;
+        char text[32];
+        std::snprintf(text, sizeof(text), "Tex %u", editorTextureSlot);
+        editorTextureText->SetText(text);
+    }
+
+    void OnEditorSaveClicked(Noesis::BaseComponent*, const Noesis::RoutedEventArgs&)
+    {
+        editorCommands.save = true;
+    }
+
+    void OnEditorReloadClicked(Noesis::BaseComponent*, const Noesis::RoutedEventArgs&)
+    {
+        editorCommands.reload = true;
+    }
+
+    void OnEditorUndoClicked(Noesis::BaseComponent*, const Noesis::RoutedEventArgs&)
+    {
+        editorCommands.undo = true;
+    }
+
+    void OnEditorTextureClicked(Noesis::BaseComponent* sender, const Noesis::RoutedEventArgs&)
+    {
+        for (uint32_t i = 0; i < 8; ++i)
+        {
+            if (sender == editorTextureButtons[i])
+            {
+                editorTextureSlot = i;
+                break;
+            }
+        }
+        UpdateEditorTextureText();
     }
 
     void CloseInGameMenu()
@@ -1072,11 +1223,21 @@ struct NoesisLayer::Impl
     Noesis::Ptr<Noesis::RenderDevice> renderDevice;
     Noesis::Ptr<Noesis::IView> view;
     Noesis::Ptr<Noesis::IView> menuView;
+    Noesis::Ptr<Noesis::IView> editorView;
     Noesis::Ptr<LobbyViewModel> lobbyViewModel;
     Noesis::TextBox* usernameBox = nullptr;
     Noesis::PasswordBox* passwordBox = nullptr;
     Noesis::CheckBox* rememberBox = nullptr;
     Noesis::TextBlock* statusText = nullptr;
+    Noesis::RadioButton* editorRaise = nullptr;
+    Noesis::RadioButton* editorLower = nullptr;
+    Noesis::RadioButton* editorSmooth = nullptr;
+    Noesis::RadioButton* editorFlatten = nullptr;
+    Noesis::RadioButton* editorPaint = nullptr;
+    Noesis::Slider* editorRadius = nullptr;
+    Noesis::Slider* editorStrength = nullptr;
+    Noesis::TextBlock* editorTextureText = nullptr;
+    std::array<Noesis::Button*, 8> editorTextureButtons{};
     std::string loginName;
     std::string loginPassword;
     std::vector<std::uint8_t> pendingEnterWorldToken;
@@ -1097,6 +1258,9 @@ struct NoesisLayer::Impl
     bool guiInitialized = false;
     bool lobbyActive = false;
     bool inGameMenuOpen = false;
+    bool mapEditorOpen = false;
+    std::uint32_t editorTextureSlot = 4;
+    MapEditorCommands editorCommands;
     std::function<void()> quitCallback;
 };
 
@@ -1142,7 +1306,8 @@ bool NoesisLayer::Create(VulkanDevice& device, client::asset::IAssetReader& asse
 
     const bool login = m_impl->LoadLoginView(width, height);
     const bool menu = login ? m_impl->LoadInGameMenuView(width, height) : false;
-    return login && menu;
+    const bool editor = menu ? m_impl->LoadMapEditorView(width, height) : false;
+    return login && menu && editor;
 }
 
 void NoesisLayer::Update(double timeSeconds)
@@ -1169,6 +1334,8 @@ void NoesisLayer::Update(double timeSeconds)
         m_impl->view->Update(timeSeconds);
     if (m_impl && m_impl->menuView && m_impl->inGameMenuOpen)
         m_impl->menuView->Update(timeSeconds);
+    if (m_impl && m_impl->editorView && m_impl->mapEditorOpen)
+        m_impl->editorView->Update(timeSeconds);
 }
 
 void NoesisLayer::RenderOffscreen(VulkanDevice& device)
@@ -1189,6 +1356,11 @@ void NoesisLayer::RenderOffscreen(VulkanDevice& device)
         m_impl->menuView->GetRenderer()->UpdateRenderTree();
         m_impl->menuView->GetRenderer()->RenderOffscreen();
     }
+    if (m_impl->editorView && m_impl->mapEditorOpen)
+    {
+        m_impl->editorView->GetRenderer()->UpdateRenderTree();
+        m_impl->editorView->GetRenderer()->RenderOffscreen();
+    }
 }
 
 void NoesisLayer::RenderOnscreen(VulkanDevice& device)
@@ -1206,6 +1378,8 @@ void NoesisLayer::RenderOnscreen(VulkanDevice& device)
         m_impl->view->GetRenderer()->Render();
     if (m_impl->inGameMenuOpen && m_impl->menuView)
         m_impl->menuView->GetRenderer()->Render();
+    if (m_impl->mapEditorOpen && m_impl->editorView)
+        m_impl->editorView->GetRenderer()->Render();
 }
 
 void NoesisLayer::OnRenderPassChanged(VulkanDevice& device)
@@ -1223,6 +1397,8 @@ void NoesisLayer::Resize(uint32_t width, uint32_t height)
         m_impl->view->SetSize(width, height);
     if (m_impl && m_impl->menuView)
         m_impl->menuView->SetSize(width, height);
+    if (m_impl && m_impl->editorView)
+        m_impl->editorView->SetSize(width, height);
     if (m_impl)
     {
         m_impl->currentWidth = width;
@@ -1255,10 +1431,36 @@ bool NoesisLayer::IsInGameMenuOpen() const
     return m_impl && m_impl->inGameMenuOpen;
 }
 
+bool NoesisLayer::IsMapEditorOpen() const
+{
+    return m_impl && m_impl->mapEditorOpen;
+}
+
 void NoesisLayer::ToggleInGameMenu()
 {
     if (m_impl)
         m_impl->ToggleInGameMenu();
+}
+
+bool NoesisLayer::LoadMapEditorView(uint32_t width, uint32_t height)
+{
+    return m_impl && m_impl->LoadMapEditorView(width, height);
+}
+
+void NoesisLayer::ToggleMapEditor()
+{
+    if (m_impl)
+        m_impl->ToggleMapEditor();
+}
+
+MapEditorSettings NoesisLayer::GetMapEditorSettings() const
+{
+    return m_impl ? m_impl->GetMapEditorSettings() : MapEditorSettings{};
+}
+
+MapEditorCommands NoesisLayer::ConsumeMapEditorCommands()
+{
+    return m_impl ? m_impl->ConsumeMapEditorCommands() : MapEditorCommands{};
 }
 
 void NoesisLayer::SetQuitCallback(std::function<void()> callback)
@@ -1281,6 +1483,8 @@ bool NoesisLayer::OnInput(const InputEvent& event)
     Noesis::IView* targetView = m_impl->view.GetPtr();
     if (m_impl->inGameMenuOpen && m_impl->menuView)
         targetView = m_impl->menuView.GetPtr();
+    else if (m_impl->mapEditorOpen && m_impl->editorView)
+        targetView = m_impl->editorView.GetPtr();
 
     switch (event.type)
     {
@@ -1412,6 +1616,7 @@ void NoesisLayer::OnEnterWorldAccepted(std::uint32_t net_id, client::net::Vec3 s
     m_impl->latestTransformReceiveLocalTimeSeconds = m_impl->currentTimeSeconds;
     m_impl->ClearWorldEntities();
     m_impl->UpsertWorldEntity(net_id, "You", spawn_pos, 0, client::net::MoveState::Idle, true);
+    m_impl->LoadWorldHudView(m_impl->currentWidth, m_impl->currentHeight);
 
     LogFormat("[WORLD] enter accepted net_id=%u", net_id);
     char message[128];
@@ -1497,6 +1702,11 @@ void NoesisLayer::Destroy()
     {
         m_impl->menuView->GetRenderer()->Shutdown();
         m_impl->menuView.Reset();
+    }
+    if (m_impl->editorView)
+    {
+        m_impl->editorView->GetRenderer()->Shutdown();
+        m_impl->editorView.Reset();
     }
 
     m_impl->renderDevice.Reset();

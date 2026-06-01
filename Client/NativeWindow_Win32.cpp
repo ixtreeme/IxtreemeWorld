@@ -40,6 +40,13 @@ Key TranslateVirtualKey(WPARAM vk)
     case VK_DELETE: return Key_Delete;
     case VK_HOME: return Key_Home;
     case VK_END: return Key_End;
+    case VK_F1: return Key_F1;
+    case VK_F2: return Key_F2;
+    case VK_F4: return Key_F4;
+    case VK_F5: return Key_F5;
+    case VK_F6: return Key_F6;
+    case VK_F7: return Key_F7;
+    case VK_F8: return Key_F8;
     default: return Key_None;
     }
 }

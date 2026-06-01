@@ -6,14 +6,17 @@
 #include <functional>
 #include <memory>
 #include <mutex>
+#include <optional>
 #include <queue>
 #include <thread>
+#include <unordered_map>
 #include <vector>
 
 #include <boost/asio/io_context.hpp>
 #include <flecs.h>
 
 #include "db/CharacterRepository.h"
+#include "map/MapData.h"
 #include "network/Session.h"
 
 namespace gs::game {
@@ -62,6 +65,18 @@ struct SessionRef {
 struct PlayerTag {
 };
 
+struct GhostTag {
+};
+
+struct MigrateTo {
+    std::uint32_t target_zone = 0;
+};
+
+struct DebugSpawnOverride {
+    float x = 0.0f;
+    float y = 0.0f;
+};
+
 struct SimPlayer;
 
 class SimWorld {
@@ -75,7 +90,9 @@ public:
     void Start();
     void Stop();
 
-    void PostSpawn(std::shared_ptr<gs::network::Session> session, gs::db::Character character);
+    void PostSpawn(std::shared_ptr<gs::network::Session> session,
+                   gs::db::Character character,
+                   std::optional<DebugSpawnOverride> debug_spawn = std::nullopt);
     void PostDespawn(gs::common::SessionId session_id);
     void PostMoveInput(gs::common::SessionId session_id,
                        std::uint32_t sequence,
@@ -83,6 +100,11 @@ public:
                        MoveState state);
 
 private:
+    struct ZoneRuntime;
+    struct OwnerInfo;
+    struct ZoneTickScope;
+    struct AoiEntityRef;
+
     struct MoveInput {
         gs::common::SessionId session_id = 0;
         std::uint32_t sequence = 0;
@@ -92,16 +114,55 @@ private:
 
     void Enqueue(std::function<void()> command);
     void Run();
-    void DrainCommands();
+    void WorkerLoop();
+    void StopWorkers();
+    void DrainGlobalCommands();
+    void ProcessMigrations();
+    bool AnyZoneTickInProgress() const;
     void DrainMoveInputs();
-    void StepMovement(float dt);
-    std::size_t BroadcastTransforms();
-    void Spawn(std::shared_ptr<gs::network::Session> session, gs::db::Character character);
+    void ScheduleZones();
+    void TickZone(ZoneRuntime& zone, float dt);
+    void DrainZoneCommands(ZoneRuntime& zone);
+    void StepMovement(ZoneRuntime& zone, float dt);
+    float SampleGroundHeight(float world_x, float world_y) const;
+    bool IsWalkable(float world_x, float world_y) const;
+    Position ResolveSpawnPosition(const gs::db::Character& character,
+                                  std::optional<DebugSpawnOverride> debug_spawn,
+                                  gs::common::SessionId session_id) const;
+    bool IsValidDebugSpawnOverride(const DebugSpawnOverride& debug_spawn) const;
+    void TryApplyWarp(ZoneRuntime& zone, SimPlayer& player);
+    void UpdateMigrationMarker(ZoneRuntime& zone, SimPlayer& player);
+    std::size_t FindZoneIndexById(std::uint32_t zone_id) const;
+    void ExecuteMigration(std::size_t source_zone_index,
+                          std::size_t target_zone_index,
+                          std::uint32_t net_id);
+    void RemoveGhostByNetId(ZoneRuntime& zone, std::uint32_t net_id);
+    float WorldExtentMeters() const;
+    void BuildZones();
+    std::size_t FindZoneIndexForPosition(float world_x, float world_y) const;
+    void PublishBorderSnapshot(ZoneRuntime& zone);
+    void RebuildGhosts(ZoneRuntime& zone);
+    void ClearGhosts(ZoneRuntime& zone);
+    bool IsInBorderBand(const ZoneRuntime& zone, const Position& position) const;
+    bool IsResidentInZone(const ZoneRuntime& zone, std::uint32_t net_id) const;
+    void RebuildSpatialGrid(ZoneRuntime& zone);
+    std::vector<AoiEntityRef> QueryAoiCandidates(const ZoneRuntime& zone, const SimPlayer& viewer) const;
+    std::size_t BroadcastTransforms(ZoneRuntime& zone);
+    void Spawn(std::shared_ptr<gs::network::Session> session,
+               gs::db::Character character,
+               std::optional<DebugSpawnOverride> debug_spawn);
     void Despawn(gs::common::SessionId session_id);
-    void AssertSimThread() const;
+    void EnqueueZoneCommand(std::size_t zone_index, std::function<void(ZoneRuntime&)> command);
+    void EnqueueWorkerTask(std::size_t zone_index);
+    void AssertZoneOwner(const ZoneRuntime& zone, const char* operation) const;
+    [[noreturn]] void FailZoneOwnerCheck(const ZoneRuntime& zone,
+                                         const char* operation,
+                                         std::thread::id owner,
+                                         std::thread::id caller) const;
 
     boost::asio::io_context& io_;
     std::thread thread_;
+    std::vector<std::thread> workers_;
     std::atomic<bool> stopping_{false};
     std::thread::id sim_thread_id_{};
 
@@ -112,10 +173,16 @@ private:
     std::mutex input_mutex_;
     std::vector<MoveInput> pending_inputs_;
 
-    std::vector<SimPlayer> players_;
-    std::unique_ptr<flecs::world> world_;
+    std::mutex worker_mutex_;
+    std::condition_variable worker_cv_;
+    std::queue<std::size_t> worker_tasks_;
+
+    std::vector<std::unique_ptr<ZoneRuntime>> zones_;
+    std::unordered_map<gs::common::SessionId, OwnerInfo> owners_by_session_;
+    mx::map::HeightField terrain_;
+    mx::map::WorldLogic world_logic_;
     std::uint32_t next_net_id_ = 1;
-    std::uint32_t world_tick_ = 0;
+    std::atomic<std::uint32_t> world_tick_{0};
 };
 
 } // namespace gs::game

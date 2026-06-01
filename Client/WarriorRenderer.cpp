@@ -1698,6 +1698,11 @@ void WarriorRenderer::SetMotionState(MotionState state)
         LogFormat("[ANIM-PREVIEW] state=%s", MotionStateName(state));
 }
 
+float WarriorRenderer::GroundOffsetY() const
+{
+    return -m_bounds.min[1];
+}
+
 bool WarriorRenderer::SkinPose(float animTimeSeconds, bool updateBounds, bool logSamples)
 {
     if (!m_ozz || m_boneCount == 0)

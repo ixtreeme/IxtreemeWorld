@@ -1,6 +1,7 @@
 #pragma once
 
 #include "InputEvent.h"
+#include "MapEditorTypes.h"
 #include "network/IClientHandler.h"
 #include "WorldCamera.h"
 
@@ -47,7 +48,12 @@ public:
     std::uint32_t GetOwnNetId() const;
     std::vector<WorldRenderEntity> GetWorldEntities() const;
     bool IsInGameMenuOpen() const;
+    bool IsMapEditorOpen() const;
     void ToggleInGameMenu();
+    bool LoadMapEditorView(uint32_t width, uint32_t height);
+    void ToggleMapEditor();
+    MapEditorSettings GetMapEditorSettings() const;
+    MapEditorCommands ConsumeMapEditorCommands();
     void SetQuitCallback(std::function<void()> callback);
     void SetClientSession(client::net::ClientSession* session);
     bool OnInput(const InputEvent& event);

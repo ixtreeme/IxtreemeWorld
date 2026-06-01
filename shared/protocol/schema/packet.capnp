@@ -95,6 +95,12 @@ struct S2cEnterWorldToken {
 
 struct C2sEnterWorld {
   token @0 :Data;
+  debugSpawnOverride @1 :DebugSpawnOverride;
+
+  struct DebugSpawnOverride {
+    x @0 :Float32;
+    y @1 :Float32;
+  }
 }
 
 struct S2cEnterWorldAccept {

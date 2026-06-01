@@ -41,6 +41,7 @@ public:
     void Render(VulkanDevice& device, double timeSeconds);
     void RenderInWorld(VulkanDevice& device, double timeSeconds, const WorldCamera& camera, WorldVec3 position, float yawRadians, uint32_t skinSlot = 0);
     void SetMotionState(MotionState state);
+    float GroundOffsetY() const;
     static constexpr uint32_t MaxSkinSlots() { return kSkinSlots; }
     void Destroy();
 

@@ -306,7 +306,29 @@ struct ClientSession::Impl {
         auto request = packet.initEnterWorld();
         request.setToken(kj::ArrayPtr<const kj::byte>(
             reinterpret_cast<const kj::byte*>(token.data()), token.size()));
+        if (debug_spawn_override) {
+            auto spawn = request.initDebugSpawnOverride();
+            spawn.setX(debug_spawn_override->x);
+            spawn.setY(debug_spawn_override->y);
+            LogNet("[NET] sending debug spawn override");
+        }
         EnqueueFrame(SerializeToFrame(msg));
+    }
+
+    void SetDebugSpawnOverride(std::optional<DebugSpawnOverride> spawn)
+    {
+        debug_spawn_override = spawn;
+        if (debug_spawn_override) {
+            char buffer[160];
+            std::snprintf(buffer,
+                          sizeof(buffer),
+                          "[NET] debug spawn override configured: %.2f, %.2f",
+                          debug_spawn_override->x,
+                          debug_spawn_override->y);
+            LogNet(buffer);
+        } else {
+            LogNet("[NET] debug spawn override disabled");
+        }
     }
 
     void SendMoveInput(float dir_angle, MoveState move_state)
@@ -639,6 +661,7 @@ struct ClientSession::Impl {
     bool writing = false;
     std::uint32_t move_sequence = 0;
     RxDiagnostics rx_diagnostics;
+    std::optional<DebugSpawnOverride> debug_spawn_override;
 };
 
 ClientSession::ClientSession(IClientHandler& handler)
@@ -691,6 +714,11 @@ void ClientSession::SendCharacterSelect(std::uint64_t character_id)
 void ClientSession::SendEnterWorld(const std::vector<std::uint8_t>& token)
 {
     m_impl->SendEnterWorld(token);
+}
+
+void ClientSession::SetDebugSpawnOverride(std::optional<DebugSpawnOverride> spawn)
+{
+    m_impl->SetDebugSpawnOverride(spawn);
 }
 
 void ClientSession::SendMoveInput(float dir_angle, MoveState state)
