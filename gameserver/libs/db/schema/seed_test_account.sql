@@ -1,7 +1,6 @@
 USE ixtreemeworld;
 
--- Generate the hash with: db_test --make-hash "test123"
--- Then replace REPLACE_ME below with the output and run this script.
+-- Replace REPLACE_ME below with an Argon2id password hash and run this script.
 
 INSERT INTO accounts (username, password_hash, email, status)
 VALUES (

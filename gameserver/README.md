@@ -46,26 +46,11 @@ Create the schema:
 mysql -u root -p < libs/db/schema/schema.sql
 ```
 
-Generate a test password hash:
-
-```sh
-build/windows-debug/apps/db_test/Debug/db_test.exe --make-hash test123
-```
-
-Copy the generated `$argon2id$...` hash into
-`libs/db/schema/seed_test_account.sql` in place of `REPLACE_ME`, then seed:
+Copy an Argon2id password hash into `libs/db/schema/seed_test_account.sql`
+in place of `REPLACE_ME`, then seed:
 
 ```sh
 mysql -u root -p < libs/db/schema/seed_test_account.sql
-```
-
-Prepare the DB test config and run login checks:
-
-```sh
-copy build/windows-debug/database.json.example database.json
-# Edit database.json with real credentials
-build/windows-debug/apps/db_test/Debug/db_test.exe --login testuser test123
-build/windows-debug/apps/db_test/Debug/db_test.exe --login testuser wrongpass
 ```
 
 ## Build on Windows

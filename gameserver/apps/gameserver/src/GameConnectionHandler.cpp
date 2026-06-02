@@ -144,7 +144,11 @@ void GameConnectionHandler::OnPayload(std::shared_ptr<gs::network::Session> sess
             Disconnect(session, "packet during enter world");
             return;
         case GameSessionState::InWorld:
-            LOG_DEBUG("Session {} sent ignored in-world packet in M1/1", session->Id());
+            if (packet.isAttackTarget()) {
+                sim_.PostAttackTarget(session->Id(), packet.getAttackTarget().getTargetNetId());
+                return;
+            }
+            LOG_DEBUG("Session {} sent ignored in-world packet", session->Id());
             return;
         }
     } catch (const kj::Exception& error) {

@@ -4,6 +4,7 @@
 {
     float4x4 u_mvp;
     float4x4 u_model;
+    float4 u_tint;
 };
 
 [[vk::combinedImageSampler]] [[vk::binding(1, 0)]] Texture2D u_diffuse : register(t0);
@@ -39,6 +40,6 @@ float4 PSMain(VSOutput input) : SV_Target0
     float ndotl = saturate(dot(normal, lightDir));
     float3 baseColor = float3(0.62, 0.66, 0.70);
     float3 texColor = u_diffuse.Sample(u_sampler, input.uv).rgb;
-    float3 color = texColor * baseColor * (0.24 + ndotl * 0.76);
+    float3 color = texColor * baseColor * u_tint.rgb * (0.24 + ndotl * 0.76);
     return float4(color, 1.0);
 }

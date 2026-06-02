@@ -126,10 +126,29 @@ struct S2cEntitySpawn {
   classId @2 :UInt16;
   spawnPos @3 :Vec3;
   heading @4 :UInt16;
+  mobType @5 :UInt32;
+  level @6 :UInt32;
+  hpCurrent @7 :Float32;
+  hpMax @8 :Float32;
 }
 
 struct S2cEntityDespawn {
   netId @0 :UInt32;
+}
+
+struct C2sAttackTarget {
+  targetNetId @0 :UInt32;
+}
+
+struct S2cEntityHealthUpdate {
+  netId @0 :UInt32;
+  hpCurrent @1 :Float32;
+  hpMax @2 :Float32;
+}
+
+struct S2cEntityDeath {
+  netId @0 :UInt32;
+  killerNetId @1 :UInt32;
 }
 
 # === ROOT PACKET (union) ===
@@ -149,5 +168,8 @@ struct Packet {
     enterWorldReject @10 :S2cEnterWorldReject;
     entitySpawn @11 :S2cEntitySpawn;
     entityDespawn @12 :S2cEntityDespawn;
+    attackTarget @13 :C2sAttackTarget;
+    entityHealthUpdate @14 :S2cEntityHealthUpdate;
+    entityDeath @15 :S2cEntityDeath;
   }
 }

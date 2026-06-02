@@ -27,6 +27,7 @@ target_link_libraries(gameserver
 target_compile_definitions(gameserver
     PRIVATE
         IXTREEME_DEFAULT_MAP_ROOT="${CMAKE_CURRENT_SOURCE_DIR}/../../../Client/assets/Maps/test_zone"
+        IXTREEME_DEFAULT_MOB_TYPES_CONFIG="${CMAKE_CURRENT_SOURCE_DIR}/config/mob_types.conf"
         $<$<CONFIG:Debug>:MMO_DEBUG_SPAWN_OVERRIDE=1>
         $<$<CONFIG:RelWithDebInfo>:MMO_DEBUG_SPAWN_OVERRIDE=1>
         $<$<CONFIG:Release>:MMO_DEBUG_SPAWN_OVERRIDE=0>
@@ -36,6 +37,12 @@ target_compile_definitions(gameserver
 configure_file(
     ${CMAKE_CURRENT_SOURCE_DIR}/config/gameserver.conf.example
     ${CMAKE_BINARY_DIR}/gameserver.conf.example
+    COPYONLY
+)
+
+configure_file(
+    ${CMAKE_CURRENT_SOURCE_DIR}/config/mob_types.conf
+    ${CMAKE_BINARY_DIR}/mob_types.conf
     COPYONLY
 )
 

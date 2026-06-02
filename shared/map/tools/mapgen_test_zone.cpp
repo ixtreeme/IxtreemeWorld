@@ -105,14 +105,14 @@ void WriteManifest(const std::filesystem::path& path)
     manifest.setZoneSizeCells(kWorldSizeCells);
     auto palette = manifest.initTexturePalette(8);
     const char* paths[8] = {
-        "assets/ymi work/terrainmaps/n/desert/sand/sand01.dds",
-        "assets/ymi work/terrainmaps/b/beach/beach sand 01.dds",
-        "assets/ymi work/terrainmaps/b/grass/grass 01.dds",
-        "assets/ymi work/terrainmaps/b/field/field 03.dds",
-        "assets/ymi work/terrainmaps/b/stone/stone01.dds",
-        "assets/ymi work/terrainmaps/n/snow.m/stone01.dds",
-        "assets/ymi work/terrainmaps/b/grass/grass 03_03.dds",
-        "assets/ymi work/terrainmaps/n/snow.m/snow01.dds",
+        "assets/Textures/homokos/sand01.dds",
+        "assets/Textures/homokos/beach sand 01.dds",
+        "assets/Textures/fu/grass 01.dds",
+        "assets/Textures/foldes/field 03.dds",
+        "assets/Textures/szikla/stone01.dds",
+        "assets/Textures/szikla/n_snow_m_stone01.dds",
+        "assets/Textures/fu/grass 03_03.dds",
+        "assets/Textures/ho/snow01.dds",
     };
     for (std::uint16_t i = 0; i < 8; ++i) {
         palette[i].setId(i);

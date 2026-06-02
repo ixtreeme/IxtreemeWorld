@@ -1,3 +1,58 @@
+cmake_minimum_required(VERSION 3.21)
+
+if(CMAKE_SOURCE_DIR STREQUAL CMAKE_CURRENT_SOURCE_DIR)
+    if(NOT DEFINED VCPKG_ROOT)
+        if(DEFINED ENV{VCPKG_ROOT})
+            file(TO_CMAKE_PATH "$ENV{VCPKG_ROOT}" VCPKG_ROOT)
+        elseif(WIN32)
+            set(VCPKG_ROOT "C:/vcpkg")
+        else()
+            set(VCPKG_ROOT "${CMAKE_SOURCE_DIR}/vcpkg")
+        endif()
+    endif()
+
+    set(VCPKG_TRIPLET_TYPE "static" CACHE STRING "static or dynamic")
+    if(NOT DEFINED CMAKE_TOOLCHAIN_FILE)
+        set(CMAKE_TOOLCHAIN_FILE
+            "${VCPKG_ROOT}/scripts/buildsystems/vcpkg.cmake"
+            CACHE FILEPATH "Vcpkg toolchain file"
+        )
+    endif()
+    if(NOT DEFINED VCPKG_TARGET_TRIPLET)
+        set(VCPKG_TARGET_TRIPLET "x64-windows-static" CACHE STRING "vcpkg triplet")
+    endif()
+
+    project(ixtreeme_protocol LANGUAGES CXX)
+
+    include("${CMAKE_CURRENT_LIST_DIR}/../../gameserver/cmake/BootstrapVcpkg.cmake")
+    vcpkg_require(zlib capnproto)
+endif()
+
+if(DEFINED VCPKG_ROOT AND DEFINED VCPKG_TARGET_TRIPLET)
+    set(_protocol_vcpkg_prefix "${VCPKG_ROOT}/installed/${VCPKG_TARGET_TRIPLET}")
+    if(EXISTS "${_protocol_vcpkg_prefix}")
+        list(PREPEND CMAKE_PREFIX_PATH "${_protocol_vcpkg_prefix}")
+        set(ZLIB_ROOT "${_protocol_vcpkg_prefix}" CACHE PATH "ZLIB root from vcpkg")
+        set(ZLIB_INCLUDE_DIR "${_protocol_vcpkg_prefix}/include" CACHE PATH "ZLIB include dir from vcpkg" FORCE)
+
+        foreach(_zlib_release_name zs.lib zlib.lib libz.a)
+            if(EXISTS "${_protocol_vcpkg_prefix}/lib/${_zlib_release_name}")
+                set(ZLIB_LIBRARY_RELEASE "${_protocol_vcpkg_prefix}/lib/${_zlib_release_name}"
+                    CACHE FILEPATH "ZLIB release library from vcpkg" FORCE)
+                break()
+            endif()
+        endforeach()
+
+        foreach(_zlib_debug_name zsd.lib zlibd.lib zlib.lib libz.a)
+            if(EXISTS "${_protocol_vcpkg_prefix}/debug/lib/${_zlib_debug_name}")
+                set(ZLIB_LIBRARY_DEBUG "${_protocol_vcpkg_prefix}/debug/lib/${_zlib_debug_name}"
+                    CACHE FILEPATH "ZLIB debug library from vcpkg" FORCE)
+                break()
+            endif()
+        endforeach()
+    endif()
+endif()
+
 find_package(ZLIB REQUIRED)
 find_package(CapnProto CONFIG REQUIRED)
 
@@ -39,6 +94,7 @@ target_include_directories(protocol
 target_link_libraries(protocol
     PUBLIC
         CapnProto::capnp
+        ZLIB::ZLIB
 )
 
 target_compile_features(protocol PUBLIC cxx_std_20)

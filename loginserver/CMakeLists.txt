@@ -32,9 +32,9 @@ elseif(NOT DEFINED VCPKG_TARGET_TRIPLET AND CMAKE_HOST_WIN32)
     endif()
 endif()
 
-project(gameserver
+project(loginserver
     VERSION 0.1.0
-    DESCRIPTION "GameServer for the new MMORPG project"
+    DESCRIPTION "LoginServer for the IxtreemeWorld MMORPG project"
     LANGUAGES CXX)
 
 set(CMAKE_CXX_STANDARD 20)
@@ -45,7 +45,6 @@ option(ENABLE_ASAN "Enable AddressSanitizer" OFF)
 
 set(VCPKG_TRIPLET_TYPE "static" CACHE STRING "Choose vcpkg triplet type (static/dynamic)")
 set_property(CACHE VCPKG_TRIPLET_TYPE PROPERTY STRINGS static dynamic)
-
 
 if(ENABLE_ASAN)
     set(CMAKE_MSVC_RUNTIME_LIBRARY
@@ -77,25 +76,22 @@ endif()
 include(cmake/BootstrapVcpkg.cmake)
 
 vcpkg_require(
-	boost-asio
-	boost-system
-	boost-throw-exception
-	capnproto
-	spdlog
-	fmt
-	zlib
-	mariadb-connector-cpp
-	libsodium
-	nlohmann-json
-	flecs
+    boost-asio
+    boost-system
+    boost-throw-exception
+    capnproto
+    spdlog
+    fmt
+    zlib
+    mariadb-connector-cpp
+    libsodium
+    nlohmann-json
 )
 
 find_package(Boost CONFIG REQUIRED COMPONENTS asio system throw_exception)
 
-add_subdirectory(libs/common)
-# A protocol lib a kozos shared/ mappaban el, mindket oldal hasznalja.
+add_subdirectory(${CMAKE_CURRENT_SOURCE_DIR}/../gameserver/libs/common gameserver_common_build)
 add_subdirectory(${CMAKE_CURRENT_SOURCE_DIR}/../shared/protocol shared_protocol_build)
-add_subdirectory(${CMAKE_CURRENT_SOURCE_DIR}/../shared/map shared_map_build)
-add_subdirectory(libs/network)
-add_subdirectory(libs/db)
-add_subdirectory(apps/gameserver)
+add_subdirectory(${CMAKE_CURRENT_SOURCE_DIR}/../gameserver/libs/network gameserver_network_build)
+add_subdirectory(${CMAKE_CURRENT_SOURCE_DIR}/../gameserver/libs/db gameserver_db_build)
+add_subdirectory(apps/loginserver)

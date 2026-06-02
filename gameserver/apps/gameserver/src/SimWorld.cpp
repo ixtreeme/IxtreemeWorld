@@ -11,6 +11,7 @@
 #include <fstream>
 #include <limits>
 #include <optional>
+#include <random>
 #include <sstream>
 #include <string>
 #include <unordered_set>
@@ -24,6 +25,10 @@
 #include "protocol/Serialization.h"
 #include "schema/packet.capnp.h"
 
+#ifndef IXTREEME_DEFAULT_MOB_TYPES_CONFIG
+#define IXTREEME_DEFAULT_MOB_TYPES_CONFIG "mob_types.conf"
+#endif
+
 namespace gs::game {
 namespace {
 
@@ -35,6 +40,9 @@ constexpr std::size_t kAoiEntityCap = 100;
 constexpr float kMigrationHysteresisMeters = 5.0f;
 constexpr auto kTickDt = std::chrono::milliseconds(50);
 constexpr float kTickDtSeconds = 0.05f;
+constexpr std::uint32_t kFirstMobNetId = 1'000'000;
+constexpr float kTwoPi = 6.28318530717958647692f;
+constexpr float kWanderArrivalDistanceMeters = 0.5f;
 
 #ifndef MMO_ZONE_OWNER_CHECK
 #define MMO_ZONE_OWNER_CHECK 1
@@ -51,6 +59,10 @@ struct BorderEntitySnapshot {
     MoveState move_state = MoveState::Idle;
     std::string name;
     std::uint16_t class_id = 0;
+    std::uint32_t mob_type_id = 0;
+    std::uint32_t level = 1;
+    float hp_current = 1.0f;
+    float hp_max = 1.0f;
 };
 
 float DbToMeters(std::int32_t value)
@@ -96,7 +108,6 @@ float DistanceOutsideRect(const mx::map::Rect& rect, const Position& position)
 
 std::uint16_t QuantizeHeading(float angle)
 {
-    constexpr float kTwoPi = 6.28318530717958647692f;
     while (angle < 0.0f) {
         angle += kTwoPi;
     }
@@ -159,6 +170,27 @@ std::vector<std::uint8_t> MakeDespawn(std::uint32_t net_id)
     return gs::protocol::SerializeToBytes(msg);
 }
 
+std::vector<std::uint8_t> MakeHealthUpdate(std::uint32_t net_id, const Hp& hp)
+{
+    capnp::MallocMessageBuilder msg;
+    auto packet = msg.initRoot<gs::protocol::Packet>();
+    auto update = packet.initEntityHealthUpdate();
+    update.setNetId(net_id);
+    update.setHpCurrent(std::max(0.0f, hp.current));
+    update.setHpMax(std::max(1.0f, hp.max));
+    return gs::protocol::SerializeToBytes(msg);
+}
+
+std::vector<std::uint8_t> MakeDeath(std::uint32_t net_id, std::uint32_t killer_net_id)
+{
+    capnp::MallocMessageBuilder msg;
+    auto packet = msg.initRoot<gs::protocol::Packet>();
+    auto death = packet.initEntityDeath();
+    death.setNetId(net_id);
+    death.setKillerNetId(killer_net_id);
+    return gs::protocol::SerializeToBytes(msg);
+}
+
 void Send(boost::asio::io_context& io,
           const std::shared_ptr<gs::network::Session>& session,
           std::vector<std::uint8_t> payload)
@@ -179,8 +211,31 @@ struct SimPlayer {
     Velocity velocity;
     MoveIntent move_intent;
     MoveSpeed move_speed;
+    Hp hp;
+    CombatStats combat_stats;
+    AttackCooldown attack_cooldown;
     std::uint32_t net_id = 0;
     std::unordered_set<std::uint32_t> visible_net_ids;
+};
+
+struct SimMob {
+    flecs::entity entity;
+    Position position;
+    Heading heading;
+    Velocity velocity;
+    MoveIntent move_intent;
+    MoveSpeed move_speed;
+    WanderState wander;
+    Hp hp;
+    CombatStats combat_stats;
+    AttackCooldown attack_cooldown;
+    std::mt19937 wander_rng;
+    std::uint32_t net_id = 0;
+    std::uint32_t mob_type_id = 0;
+    std::uint32_t model_id = 0;
+    std::size_t spawn_point_index = 0;
+    std::uint32_t level = 1;
+    std::string name;
 };
 
 struct GhostEntity {
@@ -189,7 +244,13 @@ struct GhostEntity {
 };
 
 struct SimWorld::AoiEntityRef {
-    bool ghost = false;
+    enum class Source : std::uint8_t {
+        Player,
+        Mob,
+        Ghost,
+    };
+
+    Source source = Source::Player;
     std::size_t index = 0;
 };
 
@@ -204,6 +265,7 @@ struct SimWorld::ZoneRuntime {
     mx::map::Rect bounds;
     std::unique_ptr<flecs::world> world;
     std::vector<SimPlayer> players;
+    std::vector<SimMob> mobs;
     std::vector<GhostEntity> ghosts;
     std::unordered_map<std::int64_t, std::vector<AoiEntityRef>> spatial_grid;
     std::array<std::vector<BorderEntitySnapshot>, 2> publish_buffers;
@@ -218,6 +280,9 @@ struct SimWorld::ZoneRuntime {
     std::uint32_t zone_tick = 0;
 
     std::atomic<std::uint32_t> player_count{0};
+    std::atomic<std::uint32_t> mob_count{0};
+    std::atomic<std::uint32_t> wandering_mob_count{0};
+    std::atomic<std::uint32_t> idle_mob_count{0};
     std::atomic<std::uint32_t> ghost_count{0};
     std::atomic<std::uint64_t> ticks_since_diag{0};
     std::atomic<std::uint64_t> transform_records_since_diag{0};
@@ -267,7 +332,25 @@ BorderEntitySnapshot SnapshotFromPlayer(const SimPlayer& player)
                                 player.heading,
                                 player.move_intent.state,
                                 player.character.name,
-                                player.character.class_id};
+                                player.character.class_id,
+                                0,
+                                1,
+                                player.hp.current,
+                                player.hp.max};
+}
+
+BorderEntitySnapshot SnapshotFromMob(const SimMob& mob)
+{
+    return BorderEntitySnapshot{mob.net_id,
+                                mob.position,
+                                mob.heading,
+                                mob.move_intent.state,
+                                mob.name,
+                                static_cast<std::uint16_t>(mob.model_id),
+                                mob.mob_type_id,
+                                mob.level == 0 ? 1 : mob.level,
+                                mob.hp.current,
+                                mob.hp.max};
 }
 
 std::vector<std::uint8_t> MakeSpawn(const BorderEntitySnapshot& snapshot)
@@ -280,6 +363,10 @@ std::vector<std::uint8_t> MakeSpawn(const BorderEntitySnapshot& snapshot)
     spawn.setClassId(snapshot.class_id);
     FillVec3(spawn.initSpawnPos(), snapshot.position);
     spawn.setHeading(QuantizeHeading(snapshot.heading.angle));
+    spawn.setMobType(snapshot.mob_type_id);
+    spawn.setLevel(snapshot.level);
+    spawn.setHpCurrent(snapshot.hp_current);
+    spawn.setHpMax(snapshot.hp_max);
     return gs::protocol::SerializeToBytes(msg);
 }
 
@@ -303,15 +390,91 @@ void WriteTransformRecord(std::vector<std::uint8_t>& payload, const SimPlayer& p
     WriteTransformRecord(payload, SnapshotFromPlayer(player));
 }
 
+void WriteTransformRecord(std::vector<std::uint8_t>& payload, const SimMob& mob)
+{
+    WriteTransformRecord(payload, SnapshotFromMob(mob));
+}
+
 void RegisterFlecsComponents(flecs::world& world)
 {
     world.component<Position>();
     world.component<Heading>();
+    world.component<Velocity>();
+    world.component<MoveIntent>();
+    world.component<MoveSpeed>();
+    world.component<Hp>();
+    world.component<CombatStats>();
+    world.component<AttackCooldown>();
     world.component<NetId>();
     world.component<SessionRef>();
     world.component<PlayerTag>();
+    world.component<MobTag>();
+    world.component<MobTypeRef>();
+    world.component<WanderState>();
     world.component<GhostTag>();
     world.component<MigrateTo>();
+}
+
+std::string TrimCopy(std::string value)
+{
+    const auto first = value.find_first_not_of(" \t\r\n");
+    if (first == std::string::npos) {
+        return {};
+    }
+    const auto last = value.find_last_not_of(" \t\r\n");
+    return value.substr(first, last - first + 1);
+}
+
+std::string StripComment(std::string value)
+{
+    const auto comment = value.find('#');
+    if (comment != std::string::npos) {
+        value.erase(comment);
+    }
+    return TrimCopy(std::move(value));
+}
+
+bool ParseKeyValue(const std::string& token, std::string& key, std::string& value)
+{
+    const auto equals = token.find('=');
+    if (equals == std::string::npos) {
+        return false;
+    }
+    key = TrimCopy(token.substr(0, equals));
+    value = TrimCopy(token.substr(equals + 1));
+    if (value.size() >= 2 && value.front() == '"' && value.back() == '"') {
+        value = value.substr(1, value.size() - 2);
+    }
+    return !key.empty();
+}
+
+std::uint32_t MakeMobSeed(std::uint32_t net_id, std::uint32_t mob_type_id)
+{
+    std::uint32_t seed = 0x9e3779b9u;
+    seed ^= net_id + 0x85ebca6bu + (seed << 6) + (seed >> 2);
+    seed ^= mob_type_id + 0xc2b2ae35u + (seed << 6) + (seed >> 2);
+    return seed;
+}
+
+float RandomRange(std::mt19937& rng, float min_value, float max_value)
+{
+    if (!std::isfinite(min_value) || !std::isfinite(max_value)) {
+        return 0.0f;
+    }
+    if (max_value < min_value) {
+        std::swap(min_value, max_value);
+    }
+    std::uniform_real_distribution<float> dist(min_value, max_value);
+    return dist(rng);
+}
+
+Vec2 RandomPointInCircle(std::mt19937& rng, Vec2 center, float radius)
+{
+    std::uniform_real_distribution<float> unit(0.0f, 1.0f);
+    const float angle = unit(rng) * kTwoPi;
+    const float distance = std::max(0.0f, radius) * std::sqrt(unit(rng));
+    return Vec2{center.x + std::cos(angle) * distance,
+                center.y + std::sin(angle) * distance};
 }
 
 } // namespace
@@ -386,6 +549,9 @@ SimWorld::SimWorld(boost::asio::io_context& io)
     }
 
     BuildZones();
+    LoadMobTypes();
+    LoadMobSpawns();
+    SpawnConfiguredMobs();
 }
 
 SimWorld::~SimWorld()
@@ -443,6 +609,16 @@ void SimWorld::PostMoveInput(gs::common::SessionId session_id,
     {
         std::lock_guard lock(input_mutex_);
         pending_inputs_.push_back(MoveInput{session_id, sequence, dir_angle, state});
+    }
+    cv_.notify_one();
+}
+
+void SimWorld::PostAttackTarget(gs::common::SessionId session_id,
+                                std::uint32_t target_net_id)
+{
+    {
+        std::lock_guard lock(attack_mutex_);
+        pending_attacks_.push_back(AttackInput{session_id, target_net_id});
     }
     cv_.notify_one();
 }
@@ -507,6 +683,334 @@ void SimWorld::BuildZones()
     }
 }
 
+std::uint32_t SimWorld::AllocatePlayerNetId()
+{
+    assert(next_net_id_ > 0 && next_net_id_ < kFirstMobNetId);
+    const std::uint32_t value = next_net_id_++;
+    assert(value < kFirstMobNetId);
+    return value;
+}
+
+std::uint32_t SimWorld::AllocateMobNetId()
+{
+    assert(next_mob_net_id_ >= kFirstMobNetId);
+    return next_mob_net_id_++;
+}
+
+void SimWorld::LoadMobTypes()
+{
+    mob_types_.clear();
+
+    const std::filesystem::path path = IXTREEME_DEFAULT_MOB_TYPES_CONFIG;
+    std::ifstream file(path);
+    if (!file) {
+        LOG_WARN("Mob type config '{}' not found; no mobs will spawn", path.string());
+        return;
+    }
+
+    MobTypeDefinition current;
+    bool in_mob = false;
+    auto commit = [&]() {
+        if (!in_mob) {
+            return;
+        }
+        if (current.id == 0 || current.name.empty()) {
+            LOG_WARN("Skipping invalid mob type: id={} name='{}'", current.id, current.name);
+        } else if (mob_types_.contains(current.id)) {
+            LOG_WARN("Skipping duplicate mob type id={} name='{}'", current.id, current.name);
+        } else {
+            if (!std::isfinite(current.wander_speed) || current.wander_speed < 0.0f) {
+                current.wander_speed = 1.5f;
+            }
+            if (!std::isfinite(current.hp_max) || current.hp_max == 0) {
+                current.hp_max = 50;
+            }
+            if (!std::isfinite(current.defense) || current.defense < 0.0f) {
+                current.defense = 0.0f;
+            }
+            if (!std::isfinite(current.attack_range) || current.attack_range <= 0.0f) {
+                current.attack_range = 2.0f;
+            }
+            if (!std::isfinite(current.attack_cooldown) || current.attack_cooldown < 0.0f) {
+                current.attack_cooldown = 1.5f;
+            }
+            if (!std::isfinite(current.respawn_time_sec) || current.respawn_time_sec < 0.0f) {
+                current.respawn_time_sec = 30.0f;
+            }
+            if (!std::isfinite(current.wander_idle_min) || current.wander_idle_min < 0.0f) {
+                current.wander_idle_min = 3.0f;
+            }
+            if (!std::isfinite(current.wander_idle_max) || current.wander_idle_max < current.wander_idle_min) {
+                current.wander_idle_max = std::max(current.wander_idle_min, 8.0f);
+            }
+            mob_types_.emplace(current.id, current);
+            LOG_INFO("Mob type loaded: id={} name='{}' model_id={} hp_max={} damage={} defense={} attack_range={} cooldown={} respawn={} speed={} wander_speed={} idle=[{}, {}]",
+                     current.id,
+                     current.name,
+                     current.model_id,
+                     current.hp_max,
+                     current.damage,
+                     current.defense,
+                     current.attack_range,
+                     current.attack_cooldown,
+                     current.respawn_time_sec,
+                     current.speed,
+                     current.wander_speed,
+                     current.wander_idle_min,
+                     current.wander_idle_max);
+        }
+        current = {};
+        in_mob = false;
+    };
+
+    std::string line;
+    while (std::getline(file, line)) {
+        line = StripComment(std::move(line));
+        if (line.empty()) {
+            continue;
+        }
+        if (line == "[mob]") {
+            commit();
+            current = {};
+            in_mob = true;
+            continue;
+        }
+        if (!in_mob) {
+            LOG_WARN("Ignoring mob type config line outside [mob]: {}", line);
+            continue;
+        }
+
+        std::string key;
+        std::string value;
+        if (!ParseKeyValue(line, key, value)) {
+            LOG_WARN("Ignoring invalid mob type config line: {}", line);
+            continue;
+        }
+        try {
+            if (key == "id") {
+                current.id = static_cast<std::uint32_t>(std::stoul(value));
+            } else if (key == "name") {
+                current.name = value;
+            } else if (key == "model_id") {
+                current.model_id = static_cast<std::uint32_t>(std::stoul(value));
+            } else if (key == "hp_max") {
+                current.hp_max = static_cast<std::uint32_t>(std::stoul(value));
+            } else if (key == "damage") {
+                current.damage = static_cast<std::uint32_t>(std::stoul(value));
+            } else if (key == "defense") {
+                current.defense = std::stof(value);
+            } else if (key == "attack_range") {
+                current.attack_range = std::stof(value);
+            } else if (key == "attack_cooldown") {
+                current.attack_cooldown = std::stof(value);
+            } else if (key == "respawn_time_sec") {
+                current.respawn_time_sec = std::stof(value);
+            } else if (key == "speed") {
+                current.speed = std::stof(value);
+            } else if (key == "wander_speed") {
+                current.wander_speed = std::stof(value);
+            } else if (key == "wander_idle_min") {
+                current.wander_idle_min = std::stof(value);
+            } else if (key == "wander_idle_max") {
+                current.wander_idle_max = std::stof(value);
+            }
+        } catch (const std::exception& error) {
+            LOG_WARN("Invalid mob type value '{}={}' ({})", key, value, error.what());
+        }
+    }
+    commit();
+    LOG_INFO("Mob type registry ready: count={}", mob_types_.size());
+}
+
+void SimWorld::LoadMobSpawns()
+{
+    mob_spawn_points_.clear();
+
+    const std::filesystem::path map_root = IXTREEME_DEFAULT_MAP_ROOT;
+    const auto path = map_root / "mob_spawns.conf";
+    std::ifstream file(path);
+    if (!file) {
+        LOG_WARN("Mob spawn config '{}' not found; no mobs will spawn", path.string());
+        return;
+    }
+
+    std::string line;
+    std::uint32_t line_number = 0;
+    while (std::getline(file, line)) {
+        ++line_number;
+        line = StripComment(std::move(line));
+        if (line.empty()) {
+            continue;
+        }
+
+        MobSpawnPoint spawn;
+        std::istringstream tokens(line);
+        std::string token;
+        while (tokens >> token) {
+            std::string key;
+            std::string value;
+            if (!ParseKeyValue(token, key, value)) {
+                continue;
+            }
+            try {
+                if (key == "mob_type_id") {
+                    spawn.mob_type_id = static_cast<std::uint32_t>(std::stoul(value));
+                } else if (key == "x") {
+                    spawn.x = std::stof(value);
+                } else if (key == "y") {
+                    spawn.y = std::stof(value);
+                } else if (key == "count") {
+                    spawn.count = static_cast<std::uint32_t>(std::stoul(value));
+                } else if (key == "radius") {
+                    spawn.radius = std::max(0.0f, std::stof(value));
+                }
+            } catch (const std::exception& error) {
+                LOG_WARN("Invalid mob spawn value at {}:{} '{}={}' ({})",
+                         path.string(),
+                         line_number,
+                         key,
+                         value,
+                         error.what());
+            }
+        }
+
+        if (spawn.mob_type_id == 0 || spawn.count == 0 || !std::isfinite(spawn.x) ||
+            !std::isfinite(spawn.y) || !std::isfinite(spawn.radius)) {
+            LOG_WARN("Skipping invalid mob spawn at {}:{} '{}'", path.string(), line_number, line);
+            continue;
+        }
+        mob_spawn_points_.push_back(spawn);
+    }
+    LOG_INFO("Mob spawn config loaded: points={}", mob_spawn_points_.size());
+}
+
+void SimWorld::SpawnConfiguredMobs()
+{
+    if (mob_types_.empty() || mob_spawn_points_.empty() || zones_.empty()) {
+        LOG_INFO("Mob spawn skipped: types={} spawn_points={} zones={}",
+                 mob_types_.size(),
+                 mob_spawn_points_.size(),
+                 zones_.size());
+        return;
+    }
+
+    std::uint32_t total = 0;
+
+    for (std::size_t spawn_index = 0; spawn_index < mob_spawn_points_.size(); ++spawn_index) {
+        const auto& spawn = mob_spawn_points_[spawn_index];
+        for (std::uint32_t i = 0; i < spawn.count; ++i) {
+            if (SpawnMobFromSpawnPoint(spawn_index)) {
+                ++total;
+            }
+        }
+    }
+
+    LOG_INFO("spawn complete: total_mobs={}", total);
+}
+
+bool SimWorld::SpawnMobFromSpawnPoint(std::size_t spawn_point_index)
+{
+    if (spawn_point_index >= mob_spawn_points_.size()) {
+        return false;
+    }
+
+    const auto& spawn = mob_spawn_points_[spawn_point_index];
+    const auto type_it = mob_types_.find(spawn.mob_type_id);
+    if (type_it == mob_types_.end()) {
+        LOG_WARN("Skipping mob spawn: unknown mob_type_id={}", spawn.mob_type_id);
+        return false;
+    }
+
+    const auto net_id = AllocateMobNetId();
+    std::mt19937 position_rng(MakeMobSeed(net_id, spawn.mob_type_id) ^ 0x4d3561u);
+    Vec2 spawn_position = RandomPointInCircle(position_rng, Vec2{spawn.x, spawn.y}, spawn.radius);
+    Position position{spawn_position.x, spawn_position.y, 0.0f};
+    auto zone_index = FindZoneIndexForPosition(position.x, position.y);
+    for (int attempt = 0; (zone_index >= zones_.size() || !IsWalkable(position.x, position.y)) && attempt < 8; ++attempt) {
+        spawn_position = RandomPointInCircle(position_rng, Vec2{spawn.x, spawn.y}, spawn.radius);
+        position = Position{spawn_position.x, spawn_position.y, 0.0f};
+        zone_index = FindZoneIndexForPosition(position.x, position.y);
+    }
+    if (zone_index >= zones_.size()) {
+        LOG_WARN("Skipping mob spawn outside zones: type={} spawn_point={} pos=({}, {})",
+                 spawn.mob_type_id,
+                 spawn_point_index,
+                 position.x,
+                 position.y);
+        return false;
+    }
+
+    if (!IsWalkable(position.x, position.y)) {
+        LOG_WARN("Skipping mob spawn on blocked terrain: type={} spawn_point={} pos=({}, {})",
+                 spawn.mob_type_id,
+                 spawn_point_index,
+                 position.x,
+                 position.y);
+        return false;
+    }
+
+    position.z = SampleGroundHeight(position.x, position.y);
+    const auto& type = type_it->second;
+    auto& zone = *zones_[zone_index];
+    ZoneTickScope scope(*this, zone);
+
+    SimMob mob;
+    mob.position = position;
+    mob.heading = Heading{0.0f};
+    mob.velocity = {};
+    mob.move_intent = {};
+    mob.move_speed = MoveSpeed{type.wander_speed, type.wander_speed};
+    mob.hp = Hp{static_cast<float>(type.hp_max), static_cast<float>(type.hp_max)};
+    mob.combat_stats = CombatStats{static_cast<float>(type.damage),
+                                   type.defense,
+                                   type.attack_range,
+                                   type.attack_cooldown};
+    mob.attack_cooldown = {};
+    mob.net_id = net_id;
+    mob.mob_type_id = type.id;
+    mob.model_id = type.model_id;
+    mob.spawn_point_index = spawn_point_index;
+    mob.level = 1;
+    mob.name = type.name;
+    mob.wander_rng.seed(MakeMobSeed(mob.net_id, mob.mob_type_id));
+    mob.wander.mode = WanderState::Mode::Idle;
+    mob.wander.spawn_center = Vec2{spawn.x, spawn.y};
+    mob.wander.spawn_radius = spawn.radius;
+    mob.wander.target = Vec2{position.x, position.y};
+    mob.wander.timer = RandomRange(mob.wander_rng, type.wander_idle_min, type.wander_idle_max);
+    mob.entity = zone.world->entity()
+                     .set<Position>(mob.position)
+                     .set<Heading>(mob.heading)
+                     .set<Velocity>(mob.velocity)
+                     .set<MoveIntent>(mob.move_intent)
+                     .set<MoveSpeed>(mob.move_speed)
+                     .set<WanderState>(mob.wander)
+                     .set<Hp>(mob.hp)
+                     .set<CombatStats>(mob.combat_stats)
+                     .set<AttackCooldown>(mob.attack_cooldown)
+                     .set<NetId>({mob.net_id})
+                     .set<MobTypeRef>({mob.mob_type_id})
+                     .add<MobTag>()
+                     .set<MigrateTo>({0});
+    zone.mobs.push_back(std::move(mob));
+    zone.mob_count = static_cast<std::uint32_t>(zone.mobs.size());
+    zone.wandering_mob_count = static_cast<std::uint32_t>(
+        std::count_if(zone.mobs.begin(), zone.mobs.end(), [](const SimMob& zone_mob) {
+            return zone_mob.wander.mode == WanderState::Mode::Moving;
+        }));
+    zone.idle_mob_count = zone.mob_count.load() - zone.wandering_mob_count.load();
+
+    LOG_INFO("mob spawned: net_id={} type={} spawn_point={} zone={} pos=({}, {}, {})",
+             net_id,
+             type.id,
+             spawn_point_index,
+             zone.id,
+             position.x,
+             position.y,
+             position.z);
+    return true;
+}
+
 void SimWorld::Run()
 {
     sim_thread_id_ = std::this_thread::get_id();
@@ -532,7 +1036,9 @@ void SimWorld::Run()
     while (!stopping_) {
         DrainGlobalCommands();
         ProcessMigrations();
+        ProcessRespawns(kTickDtSeconds);
         DrainMoveInputs();
+        DrainAttackInputs();
         ScheduleZones();
 
         const auto now = std::chrono::steady_clock::now();
@@ -548,14 +1054,16 @@ void SimWorld::Run()
             std::uint64_t total_records = 0;
             std::uint64_t total_empty_skips = 0;
             std::uint64_t total_migrations = 0;
+            const auto attacks_per_sec = attacks_since_diag_.exchange(0);
             std::size_t active_zones = 0;
             std::size_t active_sessions = 0;
             std::size_t active_ghosts = 0;
             for (const auto& zone : zones_) {
                 const auto player_count = zone->player_count.load();
+                const auto mob_count = zone->mob_count.load();
                 active_sessions += player_count;
                 active_ghosts += zone->ghost_count.load();
-                if (player_count > 0) {
+                if (player_count > 0 || mob_count > 0) {
                     ++active_zones;
                 }
                 total_ticks += zone->ticks_since_diag.exchange(0);
@@ -563,15 +1071,35 @@ void SimWorld::Run()
                 total_empty_skips += zone->empty_skips_since_diag.exchange(0);
                 total_migrations += zone->migrations_since_diag.exchange(0);
             }
-            LOG_INFO("Game sim diag: world_tick={} zones={} active_zones={} active_sessions={} ghosts={} zone_ticks={} empty_zone_skips={} transform_records_sent={} migrations={} workers={}",
+            std::size_t active_mobs = 0;
+            std::size_t wandering_mobs = 0;
+            std::size_t idle_mobs = 0;
+            std::size_t respawns_pending = 0;
+            for (const auto& zone : zones_) {
+                active_mobs += zone->mob_count.load();
+                wandering_mobs += zone->wandering_mob_count.load();
+                idle_mobs += zone->idle_mob_count.load();
+            }
+            {
+                std::lock_guard lock(respawn_mutex_);
+                respawns_pending = respawns_pending_.size();
+            }
+            LOG_INFO("Game sim diag: world_tick={} zones={} active_zones={} active_sessions={} active_mobs={} wandering_mobs={} idle_mobs={} ghosts={} zone_ticks={} empty_zone_skips={} transform_records_sent={} attacks_per_sec={} deaths_total={} respawns_pending={} respawns_total={} migrations={} workers={}",
                      world_tick_.load(),
                      zones_.size(),
                      active_zones,
                      active_sessions,
+                     active_mobs,
+                     wandering_mobs,
+                     idle_mobs,
                      active_ghosts,
                      total_ticks,
                      total_empty_skips,
                      total_records,
+                     attacks_per_sec,
+                     deaths_total_.load(),
+                     respawns_pending,
+                     respawns_total_.load(),
                      total_migrations,
                      workers_.size());
             do {
@@ -591,15 +1119,23 @@ void SimWorld::Run()
             std::this_thread::sleep_for(std::chrono::milliseconds(1));
         }
         zone->players.clear();
+        zone->mobs.clear();
         zone->ghosts.clear();
         zone->spatial_grid.clear();
         for (auto& buffer : zone->publish_buffers) {
             buffer.clear();
         }
         zone->player_count = 0;
+        zone->mob_count = 0;
+        zone->wandering_mob_count = 0;
+        zone->idle_mob_count = 0;
         zone->ghost_count = 0;
     }
     owners_by_session_.clear();
+    {
+        std::lock_guard lock(respawn_mutex_);
+        respawns_pending_.clear();
+    }
     LOG_INFO("Game sim supervisor stopped");
 }
 
@@ -695,6 +1231,17 @@ void SimWorld::ProcessMigrations()
             }
             plans.push_back(MigrationPlan{player.net_id, zone_index, target_index});
         }
+        for (const auto& mob : zone.mobs) {
+            const auto migration = mob.entity.get<MigrateTo>();
+            if (migration.target_zone == 0) {
+                continue;
+            }
+            const std::size_t target_index = FindZoneIndexById(migration.target_zone);
+            if (target_index >= zones_.size() || target_index == zone_index) {
+                continue;
+            }
+            plans.push_back(MigrationPlan{mob.net_id, zone_index, target_index});
+        }
     }
 
     std::sort(plans.begin(), plans.end(), [](const MigrationPlan& lhs, const MigrationPlan& rhs) {
@@ -703,6 +1250,40 @@ void SimWorld::ProcessMigrations()
 
     for (const auto& plan : plans) {
         ExecuteMigration(plan.source_zone_index, plan.target_zone_index, plan.net_id);
+    }
+}
+
+void SimWorld::ProcessRespawns(float dt)
+{
+    if (AnyZoneTickInProgress()) {
+        return;
+    }
+
+    std::vector<std::size_t> ready;
+    {
+        std::lock_guard lock(respawn_mutex_);
+        for (auto& pending : respawns_pending_) {
+            pending.remaining_sec -= dt;
+        }
+
+        auto it = respawns_pending_.begin();
+        while (it != respawns_pending_.end()) {
+            if (it->remaining_sec <= 0.0f) {
+                ready.push_back(it->spawn_point_index);
+                it = respawns_pending_.erase(it);
+            } else {
+                ++it;
+            }
+        }
+    }
+
+    for (const auto spawn_point_index : ready) {
+        if (SpawnMobFromSpawnPoint(spawn_point_index)) {
+            respawns_total_.fetch_add(1, std::memory_order_relaxed);
+            LOG_INFO("respawn: spawn_point_id={} total_respawns={}",
+                     spawn_point_index,
+                     respawns_total_.load(std::memory_order_relaxed));
+        }
     }
 }
 
@@ -738,6 +1319,26 @@ void SimWorld::DrainMoveInputs()
     }
 }
 
+void SimWorld::DrainAttackInputs()
+{
+    std::vector<AttackInput> inputs;
+    {
+        std::lock_guard lock(attack_mutex_);
+        inputs.swap(pending_attacks_);
+    }
+
+    for (const auto& input : inputs) {
+        const auto owner_it = owners_by_session_.find(input.session_id);
+        if (owner_it == owners_by_session_.end()) {
+            continue;
+        }
+        const auto zone_index = owner_it->second.zone_index;
+        EnqueueZoneCommand(zone_index, [this, input](ZoneRuntime& zone) {
+            ProcessAttackCommand(zone, input.session_id, input.target_net_id);
+        });
+    }
+}
+
 void SimWorld::ScheduleZones()
 {
     const auto now = std::chrono::steady_clock::now();
@@ -749,7 +1350,7 @@ void SimWorld::ScheduleZones()
             has_commands = !zone.commands.empty();
         }
 
-        if (zone.player_count.load() == 0 && !has_commands) {
+        if (zone.player_count.load() == 0 && zone.mob_count.load() == 0 && !has_commands) {
             zone.next_tick = now + kTickDt;
             zone.empty_skips_since_diag.fetch_add(1, std::memory_order_relaxed);
             continue;
@@ -817,29 +1418,29 @@ void SimWorld::TickZone(ZoneRuntime& zone, float dt)
     {
         ZoneTickScope owner_scope(*this, zone);
         DrainZoneCommands(zone);
+        StepCooldowns(zone, dt);
+        StepWanderAi(zone, dt);
+        StepMovement(zone, dt);
+        AssertZoneOwner(zone, "flecs world progress");
+        zone.world->progress(dt);
+
+        // Phase 3 is the supervisor sync gap before the next worker tick: this
+        // worker only marks MigrateTo; the supervisor performs ownership transfer.
+        // Phase 4-5: publish this zone's border residents, then rebuild read-only ghosts
+        // from the previous tick buffers of neighboring zones.
+        PublishBorderSnapshot(zone);
         if (zone.players.empty()) {
             ClearGhosts(zone);
-            PublishBorderSnapshot(zone);
-            zone.ticks_since_diag.fetch_add(1, std::memory_order_relaxed);
-            ++zone.zone_tick;
         } else {
-            StepMovement(zone, dt);
-            AssertZoneOwner(zone, "flecs world progress");
-            zone.world->progress(dt);
-
-            // Phase 3 is the supervisor sync gap before the next worker tick: this
-            // worker only marks MigrateTo; the supervisor performs ownership transfer.
-            // Phase 4-5: publish this zone's border residents, then rebuild read-only ghosts
-            // from the previous tick buffers of neighboring zones.
-            PublishBorderSnapshot(zone);
             RebuildGhosts(zone);
 
             const auto records = BroadcastTransforms(zone);
             zone.transform_records_since_diag.fetch_add(records, std::memory_order_relaxed);
-            zone.ticks_since_diag.fetch_add(1, std::memory_order_relaxed);
-            ++zone.zone_tick;
         }
+        zone.ticks_since_diag.fetch_add(1, std::memory_order_relaxed);
+        ++zone.zone_tick;
         zone.player_count = static_cast<std::uint32_t>(zone.players.size());
+        zone.mob_count = static_cast<std::uint32_t>(zone.mobs.size());
     }
     zone.tick_in_progress = false;
 }
@@ -859,6 +1460,189 @@ void SimWorld::DrainZoneCommands(ZoneRuntime& zone)
         commands.pop();
         command(zone);
     }
+}
+
+void SimWorld::StepCooldowns(ZoneRuntime& zone, float dt)
+{
+    AssertZoneOwner(zone, "zone combat cooldowns");
+
+    for (auto& player : zone.players) {
+        player.attack_cooldown.remaining = std::max(0.0f, player.attack_cooldown.remaining - dt);
+        player.entity.set<AttackCooldown>(player.attack_cooldown);
+    }
+    for (auto& mob : zone.mobs) {
+        mob.attack_cooldown.remaining = std::max(0.0f, mob.attack_cooldown.remaining - dt);
+        mob.entity.set<AttackCooldown>(mob.attack_cooldown);
+    }
+}
+
+void SimWorld::ProcessAttackCommand(ZoneRuntime& zone,
+                                    gs::common::SessionId attacker_session_id,
+                                    std::uint32_t target_net_id)
+{
+    AssertZoneOwner(zone, "zone combat command");
+
+    auto attacker_it = std::find_if(zone.players.begin(),
+                                    zone.players.end(),
+                                    [attacker_session_id](const SimPlayer& player) {
+                                        return player.session && player.session->Id() == attacker_session_id;
+                                    });
+    if (attacker_it == zone.players.end()) {
+        return;
+    }
+
+    SimPlayer& attacker = *attacker_it;
+    if (target_net_id == 0 || target_net_id == attacker.net_id) {
+        return;
+    }
+
+    const auto player_target = std::find_if(zone.players.begin(),
+                                            zone.players.end(),
+                                            [target_net_id](const SimPlayer& player) {
+                                                return player.net_id == target_net_id;
+                                            });
+    if (player_target != zone.players.end()) {
+        LOG_INFO("combat: rejected - PvP not allowed attacker={} target={}", attacker.net_id, target_net_id);
+        return;
+    }
+
+    auto mob_it = std::find_if(zone.mobs.begin(), zone.mobs.end(), [target_net_id](const SimMob& mob) {
+        return mob.net_id == target_net_id;
+    });
+    if (mob_it == zone.mobs.end()) {
+        const auto ghost_it = std::find_if(zone.ghosts.begin(),
+                                           zone.ghosts.end(),
+                                           [target_net_id](const GhostEntity& ghost) {
+                                               return ghost.snapshot.net_id == target_net_id;
+                                           });
+        if (ghost_it != zone.ghosts.end()) {
+            LOG_INFO("combat: rejected - target is ghost attacker={} target={}", attacker.net_id, target_net_id);
+        }
+        return;
+    }
+
+    if (attacker.attack_cooldown.remaining > 0.0f) {
+        return;
+    }
+
+    SimMob& target = *mob_it;
+    const float dx = target.position.x - attacker.position.x;
+    const float dy = target.position.y - attacker.position.y;
+    const float dist_sq = dx * dx + dy * dy;
+    const float range = std::max(0.0f, attacker.combat_stats.attack_range);
+    if (dist_sq > range * range) {
+        LOG_INFO("combat: rejected - out of range attacker={} target={} dist={}",
+                 attacker.net_id,
+                 target_net_id,
+                 std::sqrt(dist_sq));
+        return;
+    }
+
+    const float damage_dealt = std::max(1.0f, attacker.combat_stats.damage - target.combat_stats.defense);
+    target.hp.current = std::max(0.0f, target.hp.current - damage_dealt);
+    target.entity.set<Hp>(target.hp);
+    attacker.attack_cooldown.remaining = std::max(0.0f, attacker.combat_stats.attack_cooldown);
+    attacker.entity.set<AttackCooldown>(attacker.attack_cooldown);
+    attacks_since_diag_.fetch_add(1, std::memory_order_relaxed);
+
+    const auto health_payload = MakeHealthUpdate(target.net_id, target.hp);
+    for (const auto& viewer : zone.players) {
+        if (viewer.session && (viewer.net_id == target.net_id || viewer.visible_net_ids.contains(target.net_id))) {
+            Send(io_, viewer.session, health_payload);
+        }
+    }
+
+    LOG_INFO("combat: net_id={} attacked net_id={} damage={} hp={}/{}",
+             attacker.net_id,
+             target.net_id,
+             damage_dealt,
+             target.hp.current,
+             target.hp.max);
+
+    if (target.hp.current > 0.0f) {
+        return;
+    }
+
+    const auto death_payload = MakeDeath(target.net_id, attacker.net_id);
+    const auto despawn_payload = MakeDespawn(target.net_id);
+    for (auto& viewer : zone.players) {
+        if (!viewer.session || !viewer.visible_net_ids.contains(target.net_id)) {
+            continue;
+        }
+        Send(io_, viewer.session, death_payload);
+        Send(io_, viewer.session, despawn_payload);
+        viewer.visible_net_ids.erase(target.net_id);
+    }
+
+    LOG_INFO("death: net_id={} killer_net_id={} damage_dealt={}", target.net_id, attacker.net_id, damage_dealt);
+    deaths_total_.fetch_add(1, std::memory_order_relaxed);
+
+    const auto type_it = mob_types_.find(target.mob_type_id);
+    const float respawn_time = type_it != mob_types_.end() ? type_it->second.respawn_time_sec : 30.0f;
+    {
+        std::lock_guard lock(respawn_mutex_);
+        respawns_pending_.push_back(RespawnPending{target.spawn_point_index, respawn_time});
+    }
+
+    RemoveGhostByNetId(zone, target.net_id);
+    if (target.entity.is_valid()) {
+        target.entity.destruct();
+    }
+    zone.mobs.erase(mob_it);
+    zone.mob_count = static_cast<std::uint32_t>(zone.mobs.size());
+    zone.wandering_mob_count = static_cast<std::uint32_t>(
+        std::count_if(zone.mobs.begin(), zone.mobs.end(), [](const SimMob& mob) {
+            return mob.wander.mode == WanderState::Mode::Moving;
+        }));
+    zone.idle_mob_count = zone.mob_count.load() - zone.wandering_mob_count.load();
+}
+
+void SimWorld::StepWanderAi(ZoneRuntime& zone, float dt)
+{
+    AssertZoneOwner(zone, "zone mob wander ai");
+
+    std::uint32_t moving_count = 0;
+    std::uint32_t idle_count = 0;
+    for (auto& mob : zone.mobs) {
+        auto type_it = mob_types_.find(mob.mob_type_id);
+        const float idle_min = type_it != mob_types_.end() ? type_it->second.wander_idle_min : 3.0f;
+        const float idle_max = type_it != mob_types_.end() ? type_it->second.wander_idle_max : 8.0f;
+
+        if (mob.wander.mode == WanderState::Mode::Idle) {
+            mob.wander.timer = std::max(0.0f, mob.wander.timer - dt);
+            mob.move_intent.state = MoveState::Idle;
+            if (mob.wander.timer <= 0.0f && mob.wander.spawn_radius > 0.0f) {
+                mob.wander.target =
+                    RandomPointInCircle(mob.wander_rng, mob.wander.spawn_center, mob.wander.spawn_radius);
+                mob.wander.mode = WanderState::Mode::Moving;
+                mob.wander.timer = 0.0f;
+            }
+        }
+
+        if (mob.wander.mode == WanderState::Mode::Moving) {
+            const float dx = mob.wander.target.x - mob.position.x;
+            const float dy = mob.wander.target.y - mob.position.y;
+            const float distance_sq = dx * dx + dy * dy;
+            if (distance_sq <= kWanderArrivalDistanceMeters * kWanderArrivalDistanceMeters) {
+                mob.wander.mode = WanderState::Mode::Idle;
+                mob.wander.timer = RandomRange(mob.wander_rng, idle_min, idle_max);
+                mob.move_intent.state = MoveState::Idle;
+            } else {
+                mob.move_intent.dir_angle = std::atan2(dx, dy);
+                mob.move_intent.state = MoveState::Walking;
+            }
+        }
+
+        if (mob.wander.mode == WanderState::Mode::Moving) {
+            ++moving_count;
+        } else {
+            ++idle_count;
+        }
+        mob.entity.set<WanderState>(mob.wander).set<MoveIntent>(mob.move_intent);
+    }
+
+    zone.wandering_mob_count = moving_count;
+    zone.idle_mob_count = idle_count;
 }
 
 void SimWorld::StepMovement(ZoneRuntime& zone, float dt)
@@ -895,6 +1679,39 @@ void SimWorld::StepMovement(ZoneRuntime& zone, float dt)
             .set<Heading>(player.heading)
             .set<Velocity>(player.velocity)
             .set<MoveIntent>(player.move_intent);
+    }
+
+    for (auto& mob : zone.mobs) {
+        const auto state = mob.move_intent.state;
+        const float speed = state == MoveState::Running
+                                ? mob.move_speed.run
+                                : (state == MoveState::Walking ? mob.move_speed.walk : 0.0f);
+        mob.heading.angle = mob.move_intent.dir_angle;
+        mob.velocity.x = std::sin(mob.move_intent.dir_angle) * speed;
+        mob.velocity.y = std::cos(mob.move_intent.dir_angle) * speed;
+        mob.velocity.z = 0.0f;
+
+        mob.position.x = std::clamp(mob.position.x + mob.velocity.x * dt, 0.0f, max_extent);
+        mob.position.y = std::clamp(mob.position.y + mob.velocity.y * dt, 0.0f, max_extent);
+
+        const float from_center_x = mob.position.x - mob.wander.spawn_center.x;
+        const float from_center_y = mob.position.y - mob.wander.spawn_center.y;
+        const float radius_sq = mob.wander.spawn_radius * mob.wander.spawn_radius;
+        const float distance_sq = from_center_x * from_center_x + from_center_y * from_center_y;
+        if (mob.wander.spawn_radius > 0.0f && distance_sq > radius_sq) {
+            const float distance = std::sqrt(distance_sq);
+            mob.position.x = mob.wander.spawn_center.x + (from_center_x / distance) * mob.wander.spawn_radius;
+            mob.position.y = mob.wander.spawn_center.y + (from_center_y / distance) * mob.wander.spawn_radius;
+        }
+
+        mob.position.z = SampleGroundHeight(mob.position.x, mob.position.y);
+        UpdateMigrationMarker(zone, mob);
+
+        mob.entity.set<Position>(mob.position)
+            .set<Heading>(mob.heading)
+            .set<Velocity>(mob.velocity)
+            .set<MoveIntent>(mob.move_intent)
+            .set<WanderState>(mob.wander);
     }
 }
 
@@ -1034,6 +1851,26 @@ void SimWorld::UpdateMigrationMarker(ZoneRuntime& zone, SimPlayer& player)
     player.entity.set<MigrateTo>({target_zone_id});
 }
 
+void SimWorld::UpdateMigrationMarker(ZoneRuntime& zone, SimMob& mob)
+{
+    AssertZoneOwner(zone, "zone mob migration marker update");
+
+    const std::size_t current_zone_index = FindZoneIndexById(zone.id);
+    const std::size_t target_zone_index = FindZoneIndexForPosition(mob.position.x, mob.position.y);
+    std::uint32_t target_zone_id = 0;
+
+    if (target_zone_index < zones_.size() && target_zone_index != current_zone_index &&
+        DistanceOutsideRect(zone.bounds, mob.position) > kMigrationHysteresisMeters) {
+        const auto neighbor_it =
+            std::find(zone.neighbor_indices.begin(), zone.neighbor_indices.end(), target_zone_index);
+        if (neighbor_it != zone.neighbor_indices.end()) {
+            target_zone_id = zones_[target_zone_index]->id;
+        }
+    }
+
+    mob.entity.set<MigrateTo>({target_zone_id});
+}
+
 std::size_t SimWorld::FindZoneIndexById(std::uint32_t zone_id) const
 {
     for (std::size_t i = 0; i < zones_.size(); ++i) {
@@ -1061,61 +1898,134 @@ void SimWorld::ExecuteMigration(std::size_t source_zone_index,
                                [net_id](const SimPlayer& player) {
                                    return player.net_id == net_id;
                                });
-        if (it == source_zone.players.end()) {
-            return;
-        }
-        if (!it->session) {
-            return;
-        }
-        const auto owner_it = owners_by_session_.find(it->session->Id());
-        if (owner_it == owners_by_session_.end() || owner_it->second.net_id != net_id ||
-            owner_it->second.zone_index != source_zone_index) {
+        if (it != source_zone.players.end()) {
+            if (!it->session) {
+                return;
+            }
+            const auto owner_it = owners_by_session_.find(it->session->Id());
+            if (owner_it == owners_by_session_.end() || owner_it->second.net_id != net_id ||
+                owner_it->second.zone_index != source_zone_index) {
+                return;
+            }
+
+            const auto migration = it->entity.get<MigrateTo>();
+            if (migration.target_zone != target_zone.id) {
+                return;
+            }
+
+            const std::size_t actual_target = FindZoneIndexForPosition(it->position.x, it->position.y);
+            if (actual_target != target_zone_index ||
+                DistanceOutsideRect(source_zone.bounds, it->position) <= kMigrationHysteresisMeters) {
+                it->entity.set<MigrateTo>({0});
+                return;
+            }
+
+            RemoveGhostByNetId(target_zone, net_id);
+
+            SimPlayer player = std::move(*it);
+            if (player.entity.is_valid()) {
+                player.entity.destruct();
+            }
+            source_zone.players.erase(it);
+            source_zone.player_count = static_cast<std::uint32_t>(source_zone.players.size());
+
+            player.position.z = SampleGroundHeight(player.position.x, player.position.y);
+            player.entity = target_zone.world->entity()
+                                .set<Position>(player.position)
+                                .set<Heading>(player.heading)
+                                .set<Velocity>(player.velocity)
+                                .set<MoveIntent>(player.move_intent)
+                                .set<MoveSpeed>(player.move_speed)
+                                .set<Hp>(player.hp)
+                                .set<CombatStats>(player.combat_stats)
+                                .set<AttackCooldown>(player.attack_cooldown)
+                                .set<NetId>({player.net_id})
+                                .set<SessionRef>({player.session ? player.session->Id() : 0})
+                                .set<MigrateTo>({0})
+                                .add<PlayerTag>();
+
+            const auto session_id = player.session ? player.session->Id() : 0;
+            target_zone.players.push_back(std::move(player));
+            target_zone.player_count = static_cast<std::uint32_t>(target_zone.players.size());
+            if (session_id != 0) {
+                owners_by_session_[session_id] = OwnerInfo{target_zone_index, net_id};
+            }
+
+            source_zone.migrations_since_diag.fetch_add(1, std::memory_order_relaxed);
+            LOG_INFO("migration: net_id={} (player) from_zone={} to_zone={} tick={}",
+                     net_id,
+                     source_zone.id,
+                     target_zone.id,
+                     world_tick_.load(std::memory_order_relaxed));
             return;
         }
 
-        const auto migration = it->entity.get<MigrateTo>();
+        auto mob_it = std::find_if(source_zone.mobs.begin(),
+                                   source_zone.mobs.end(),
+                                   [net_id](const SimMob& mob) {
+                                       return mob.net_id == net_id;
+                                   });
+        if (mob_it == source_zone.mobs.end()) {
+            return;
+        }
+
+        const auto migration = mob_it->entity.get<MigrateTo>();
         if (migration.target_zone != target_zone.id) {
             return;
         }
 
-        const std::size_t actual_target = FindZoneIndexForPosition(it->position.x, it->position.y);
+        const std::size_t actual_target = FindZoneIndexForPosition(mob_it->position.x, mob_it->position.y);
         if (actual_target != target_zone_index ||
-            DistanceOutsideRect(source_zone.bounds, it->position) <= kMigrationHysteresisMeters) {
-            it->entity.set<MigrateTo>({0});
+            DistanceOutsideRect(source_zone.bounds, mob_it->position) <= kMigrationHysteresisMeters) {
+            mob_it->entity.set<MigrateTo>({0});
             return;
         }
 
         RemoveGhostByNetId(target_zone, net_id);
 
-        SimPlayer player = std::move(*it);
-        if (player.entity.is_valid()) {
-            player.entity.destruct();
+        SimMob mob = std::move(*mob_it);
+        if (mob.entity.is_valid()) {
+            mob.entity.destruct();
         }
-        source_zone.players.erase(it);
-        source_zone.player_count = static_cast<std::uint32_t>(source_zone.players.size());
+        source_zone.mobs.erase(mob_it);
+        source_zone.mob_count = static_cast<std::uint32_t>(source_zone.mobs.size());
+        source_zone.wandering_mob_count = static_cast<std::uint32_t>(
+            std::count_if(source_zone.mobs.begin(), source_zone.mobs.end(), [](const SimMob& source_mob) {
+                return source_mob.wander.mode == WanderState::Mode::Moving;
+            }));
+        source_zone.idle_mob_count =
+            source_zone.mob_count.load() - source_zone.wandering_mob_count.load();
 
-        player.position.z = SampleGroundHeight(player.position.x, player.position.y);
-        player.entity = target_zone.world->entity()
-                            .set<Position>(player.position)
-                            .set<Heading>(player.heading)
-                            .set<Velocity>(player.velocity)
-                            .set<MoveIntent>(player.move_intent)
-                            .set<MoveSpeed>(player.move_speed)
-                            .set<NetId>({player.net_id})
-                            .set<SessionRef>({player.session ? player.session->Id() : 0})
-                            .set<MigrateTo>({0})
-                            .add<PlayerTag>();
+        mob.position.z = SampleGroundHeight(mob.position.x, mob.position.y);
+        mob.entity = target_zone.world->entity()
+                         .set<Position>(mob.position)
+                         .set<Heading>(mob.heading)
+                         .set<Velocity>(mob.velocity)
+                         .set<MoveIntent>(mob.move_intent)
+                         .set<MoveSpeed>(mob.move_speed)
+                         .set<WanderState>(mob.wander)
+                         .set<Hp>(mob.hp)
+                         .set<CombatStats>(mob.combat_stats)
+                         .set<AttackCooldown>(mob.attack_cooldown)
+                         .set<NetId>({mob.net_id})
+                         .set<MobTypeRef>({mob.mob_type_id})
+                         .set<MigrateTo>({0})
+                         .add<MobTag>();
 
-        const auto session_id = player.session ? player.session->Id() : 0;
-        target_zone.players.push_back(std::move(player));
-        target_zone.player_count = static_cast<std::uint32_t>(target_zone.players.size());
-        if (session_id != 0) {
-            owners_by_session_[session_id] = OwnerInfo{target_zone_index, net_id};
-        }
+        const auto mob_type_name = mob.name;
+        target_zone.mobs.push_back(std::move(mob));
+        target_zone.mob_count = static_cast<std::uint32_t>(target_zone.mobs.size());
+        target_zone.wandering_mob_count = static_cast<std::uint32_t>(
+            std::count_if(target_zone.mobs.begin(), target_zone.mobs.end(), [](const SimMob& target_mob) {
+                return target_mob.wander.mode == WanderState::Mode::Moving;
+            }));
+        target_zone.idle_mob_count =
+            target_zone.mob_count.load() - target_zone.wandering_mob_count.load();
 
         source_zone.migrations_since_diag.fetch_add(1, std::memory_order_relaxed);
-        LOG_INFO("migration: net_id={} from_zone={} to_zone={} tick={}",
+        LOG_INFO("migration: net_id={} (mob, type={}) from_zone={} to_zone={} tick={}",
                  net_id,
+                 mob_type_name,
                  source_zone.id,
                  target_zone.id,
                  world_tick_.load(std::memory_order_relaxed));
@@ -1174,11 +2084,16 @@ void SimWorld::PublishBorderSnapshot(ZoneRuntime& zone)
 
     auto& out = zone.publish_buffers[zone.zone_tick % zone.publish_buffers.size()];
     out.clear();
-    out.reserve(zone.players.size());
+    out.reserve(zone.players.size() + zone.mobs.size());
 
     for (const auto& player : zone.players) {
         if (IsInBorderBand(zone, player.position)) {
             out.push_back(SnapshotFromPlayer(player));
+        }
+    }
+    for (const auto& mob : zone.mobs) {
+        if (IsInBorderBand(zone, mob.position)) {
+            out.push_back(SnapshotFromMob(mob));
         }
     }
 }
@@ -1211,6 +2126,9 @@ void SimWorld::RebuildGhosts(ZoneRuntime& zone)
                               .set<Heading>(snapshot.heading)
                               .set<NetId>({snapshot.net_id})
                               .add<GhostTag>();
+            if (snapshot.mob_type_id != 0) {
+                entity.set<MobTypeRef>({snapshot.mob_type_id}).add<MobTag>();
+            }
             zone.ghosts.push_back(GhostEntity{entity, snapshot});
         }
     }
@@ -1241,8 +2159,11 @@ bool SimWorld::IsInBorderBand(const ZoneRuntime& zone, const Position& position)
 bool SimWorld::IsResidentInZone(const ZoneRuntime& zone, std::uint32_t net_id) const
 {
     return std::any_of(zone.players.begin(), zone.players.end(), [net_id](const SimPlayer& player) {
-        return player.net_id == net_id;
-    });
+               return player.net_id == net_id;
+           }) ||
+           std::any_of(zone.mobs.begin(), zone.mobs.end(), [net_id](const SimMob& mob) {
+               return mob.net_id == net_id;
+           });
 }
 
 void SimWorld::RebuildSpatialGrid(ZoneRuntime& zone)
@@ -1254,13 +2175,19 @@ void SimWorld::RebuildSpatialGrid(ZoneRuntime& zone)
         const auto& player = zone.players[i];
         const int cell_x = SpatialCellCoord(player.position.x);
         const int cell_y = SpatialCellCoord(player.position.y);
-        zone.spatial_grid[SpatialCellKey(cell_x, cell_y)].push_back(AoiEntityRef{false, i});
+        zone.spatial_grid[SpatialCellKey(cell_x, cell_y)].push_back(AoiEntityRef{AoiEntityRef::Source::Player, i});
+    }
+    for (std::size_t i = 0; i < zone.mobs.size(); ++i) {
+        const auto& mob = zone.mobs[i];
+        const int cell_x = SpatialCellCoord(mob.position.x);
+        const int cell_y = SpatialCellCoord(mob.position.y);
+        zone.spatial_grid[SpatialCellKey(cell_x, cell_y)].push_back(AoiEntityRef{AoiEntityRef::Source::Mob, i});
     }
     for (std::size_t i = 0; i < zone.ghosts.size(); ++i) {
         const auto& snapshot = zone.ghosts[i].snapshot;
         const int cell_x = SpatialCellCoord(snapshot.position.x);
         const int cell_y = SpatialCellCoord(snapshot.position.y);
-        zone.spatial_grid[SpatialCellKey(cell_x, cell_y)].push_back(AoiEntityRef{true, i});
+        zone.spatial_grid[SpatialCellKey(cell_x, cell_y)].push_back(AoiEntityRef{AoiEntityRef::Source::Ghost, i});
     }
 }
 
@@ -1290,20 +2217,27 @@ std::vector<SimWorld::AoiEntityRef> SimWorld::QueryAoiCandidates(const ZoneRunti
             for (const auto ref : cell_it->second) {
                 std::uint32_t candidate_net_id = 0;
                 Position candidate_position;
-                if (ref.ghost) {
+                if (ref.source == AoiEntityRef::Source::Ghost) {
                     if (ref.index >= zone.ghosts.size()) {
                         continue;
                     }
                     const auto& snapshot = zone.ghosts[ref.index].snapshot;
                     candidate_net_id = snapshot.net_id;
                     candidate_position = snapshot.position;
-                } else {
+                } else if (ref.source == AoiEntityRef::Source::Player) {
                     if (ref.index >= zone.players.size()) {
                         continue;
                     }
                     const auto& player = zone.players[ref.index];
                     candidate_net_id = player.net_id;
                     candidate_position = player.position;
+                } else {
+                    if (ref.index >= zone.mobs.size()) {
+                        continue;
+                    }
+                    const auto& mob = zone.mobs[ref.index];
+                    candidate_net_id = mob.net_id;
+                    candidate_position = mob.position;
                 }
 
                 if (candidate_net_id == 0 || candidate_net_id == viewer.net_id) {
@@ -1357,11 +2291,17 @@ std::size_t SimWorld::BroadcastTransforms(ZoneRuntime& zone)
         new_visible.reserve(visible_indices.size());
 
         auto snapshot_for_ref = [&zone](AoiEntityRef ref) -> std::optional<BorderEntitySnapshot> {
-            if (ref.ghost) {
+            if (ref.source == AoiEntityRef::Source::Ghost) {
                 if (ref.index >= zone.ghosts.size()) {
                     return std::nullopt;
                 }
                 return zone.ghosts[ref.index].snapshot;
+            }
+            if (ref.source == AoiEntityRef::Source::Mob) {
+                if (ref.index >= zone.mobs.size()) {
+                    return std::nullopt;
+                }
+                return SnapshotFromMob(zone.mobs[ref.index]);
             }
             if (ref.index >= zone.players.size()) {
                 return std::nullopt;
@@ -1446,7 +2386,10 @@ void SimWorld::Spawn(std::shared_ptr<gs::network::Session> session,
     player.position.z = SampleGroundHeight(player.position.x, player.position.y);
     player.heading = Heading{0.0f};
     player.move_speed = MoveSpeed{3.0f, 6.0f};
-    player.net_id = next_net_id_++;
+    player.hp = Hp{100.0f, 100.0f};
+    player.combat_stats = CombatStats{10.0f, 0.0f, 2.0f, 1.0f};
+    player.attack_cooldown = {};
+    player.net_id = AllocatePlayerNetId();
 
     owners_by_session_[session_id] = OwnerInfo{zone_index, player.net_id};
     const auto incoming_session = player.session;
@@ -1471,12 +2414,16 @@ void SimWorld::Spawn(std::shared_ptr<gs::network::Session> session,
                             .set<Velocity>(player.velocity)
                             .set<MoveIntent>(player.move_intent)
                             .set<MoveSpeed>(player.move_speed)
+                            .set<Hp>(player.hp)
+                            .set<CombatStats>(player.combat_stats)
+                            .set<AttackCooldown>(player.attack_cooldown)
                             .set<NetId>({player.net_id})
                             .set<SessionRef>({player.session->Id()})
                             .set<MigrateTo>({0})
                             .add<PlayerTag>();
         zone.players.push_back(std::move(player));
         zone.player_count = static_cast<std::uint32_t>(zone.players.size());
+        zone.mob_count = static_cast<std::uint32_t>(zone.mobs.size());
     });
 }
 
