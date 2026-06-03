@@ -12,6 +12,7 @@
 #include "NativeWindow_Android.h"
 #endif
 #include "NoesisLayer.h"
+#include "OffscreenSceneRenderer.h"
 #include "TerrainRenderer.h"
 #include "VulkanDevice.h"
 #include "WarriorRenderer.h"
@@ -37,6 +38,7 @@
 #include <cstdlib>
 #include <optional>
 #include <string>
+#include <type_traits>
 #include <vector>
 
 namespace
@@ -147,6 +149,127 @@ std::uint32_t PickMobTarget(const std::vector<WorldRenderEntity>& entities,
     return bestNetId;
 }
 
+enum class EditorGizmoMode
+{
+    Translate,
+    Rotate,
+    Scale
+};
+
+struct EditorTestMarker
+{
+    std::uint32_t id = 0;
+    WorldVec3 position;
+    WorldVec3 rotation;
+    WorldVec3 scale = {1.0f, 1.0f, 1.0f};
+};
+
+enum class SelectedEditorObjectType
+{
+    None,
+    Marker,
+    PointLight,
+    SpotLight
+};
+
+struct SelectedEditorObject
+{
+    SelectedEditorObjectType type = SelectedEditorObjectType::None;
+    std::uint32_t id = 0;
+};
+
+WorldVec3 CameraForward(const WorldCamera& camera)
+{
+    return WorldNormalize(WorldSub(camera.target, camera.eye));
+}
+
+WorldVec3 CameraRight(const WorldCamera& camera)
+{
+    return WorldNormalize(WorldCross({0.0f, 1.0f, 0.0f}, CameraForward(camera)));
+}
+
+WorldVec3 CameraUp(const WorldCamera& camera)
+{
+    return WorldNormalize(WorldCross(CameraForward(camera), CameraRight(camera)));
+}
+
+WorldVec3 ScreenRayDirection(const WorldCamera& camera, uint32_t width, uint32_t height, int mouseX, int mouseY)
+{
+    const float aspect = height != 0 ? static_cast<float>(width) / static_cast<float>(height) : 1.0f;
+    const float ndcX = width != 0 ? (2.0f * static_cast<float>(mouseX) / static_cast<float>(width)) - 1.0f : 0.0f;
+    const float ndcY = height != 0 ? 1.0f - (2.0f * static_cast<float>(mouseY) / static_cast<float>(height)) : 0.0f;
+    constexpr float kTanHalfFov = 0.41421356237f; // tan(45deg / 2)
+    return WorldNormalize(WorldAdd(
+        WorldAdd(CameraForward(camera), WorldScale(CameraRight(camera), ndcX * aspect * kTanHalfFov)),
+        WorldScale(CameraUp(camera), ndcY * kTanHalfFov)));
+}
+
+std::optional<std::uint32_t> PickEditorMarker(const std::vector<EditorTestMarker>& markers,
+                                              const WorldCamera& camera,
+                                              uint32_t width,
+                                              uint32_t height,
+                                              int mouseX,
+                                              int mouseY)
+{
+    const WorldVec3 rayDir = ScreenRayDirection(camera, width, height, mouseX, mouseY);
+    std::optional<std::uint32_t> bestId;
+    float bestT = 1000000.0f;
+    for (const EditorTestMarker& marker : markers)
+    {
+        const WorldVec3 toMarker = WorldSub(marker.position, camera.eye);
+        const float t = WorldDot(toMarker, rayDir);
+        if (t <= 0.0f || t >= bestT)
+            continue;
+        const WorldVec3 closest = WorldAdd(camera.eye, WorldScale(rayDir, t));
+        const WorldVec3 delta = WorldSub(marker.position, closest);
+        const float radius = std::max({marker.scale.x, marker.scale.y, marker.scale.z, 1.0f}) * 0.9f;
+        if (WorldDot(delta, delta) <= radius * radius)
+        {
+            bestT = t;
+            bestId = marker.id;
+        }
+    }
+    return bestId;
+}
+
+template <typename LightT>
+std::optional<std::uint32_t> PickDynamicLight(const std::vector<LightT>& lights,
+                                             const WorldCamera& camera,
+                                             uint32_t width,
+                                             uint32_t height,
+                                             int mouseX,
+                                             int mouseY)
+{
+    const WorldVec3 rayDir = ScreenRayDirection(camera, width, height, mouseX, mouseY);
+    std::optional<std::uint32_t> bestId;
+    float bestT = 1000000.0f;
+    for (const LightT& light : lights)
+    {
+        const WorldVec3 position{light.position[0], light.position[1], light.position[2]};
+        const WorldVec3 toLight = WorldSub(position, camera.eye);
+        const float t = WorldDot(toLight, rayDir);
+        if (t <= 0.0f || t >= bestT)
+            continue;
+        const WorldVec3 closest = WorldAdd(camera.eye, WorldScale(rayDir, t));
+        const WorldVec3 delta = WorldSub(position, closest);
+        constexpr float kPickRadius = 0.9f;
+        if (WorldDot(delta, delta) <= kPickRadius * kPickRadius)
+        {
+            bestT = t;
+            bestId = light.id;
+        }
+    }
+    return bestId;
+}
+
+WorldVec3 SpotLightDirection(const SpotLight& spot)
+{
+    const float pitch = spot.rotation[0];
+    const float yaw = spot.rotation[1];
+    const float cosPitch = std::cos(pitch);
+    return WorldNormalize({std::sin(yaw) * cosPitch, std::sin(pitch), std::cos(yaw) * cosPitch});
+}
+
 WarriorRenderer::MotionState ToWarriorMotion(client::net::MoveState state)
 {
     switch (state)
@@ -166,8 +289,8 @@ struct MovementInputState
     bool a = false;
     bool s = false;
     bool d = false;
-    bool q = false;
-    bool e = false;
+    bool space = false;
+    bool control = false;
     bool shift = false;
 
     bool Apply(const InputEvent& event)
@@ -182,15 +305,26 @@ struct MovementInputState
         case Key_A: a = pressed; return true;
         case Key_S: s = pressed; return true;
         case Key_D: d = pressed; return true;
-        case Key_Q: q = pressed; return true;
-        case Key_E: e = pressed; return true;
+        case Key_Space: space = pressed; return true;
+        case Key_Control: control = pressed; return true;
         case Key_Shift: shift = pressed; return true;
         default: return false;
         }
     }
 
+    void Clear()
+    {
+        w = false;
+        a = false;
+        s = false;
+        d = false;
+        space = false;
+        control = false;
+        shift = false;
+    }
+
     bool HasDirection() const { return w || a || s || d; }
-    bool HasFlyVertical() const { return q || e; }
+    bool HasFlyVertical() const { return space || control; }
 
     float DirectionAngle(float cameraYawRadians) const
     {
@@ -268,6 +402,28 @@ std::optional<client::net::DebugSpawnOverride> ParseDebugSpawnOverride(const std
 class CameraController
 {
 public:
+    void SetEditorFlyMode(bool enabled)
+    {
+        if (enabled == flyMode_)
+            return;
+
+        flyMode_ = enabled;
+        dragActive_ = false;
+        if (flyMode_)
+        {
+            flyEye_ = lastEye_;
+            flyYaw_ = yaw_;
+            flyPitch_ = pitch_;
+            Tracen("[CAMERA] mode=editor-fly");
+        }
+        else
+        {
+            yaw_ = flyYaw_;
+            pitch_ = std::clamp(flyPitch_, -kMaxPitch, kMaxPitch);
+            Tracen("[CAMERA] mode=tps");
+        }
+    }
+
     bool HandleInput(const InputEvent& event)
     {
         if (event.type == InputEvent::KeyUp && event.key == Key_F1)
@@ -281,20 +437,7 @@ public:
             if (f1Down_)
                 return true;
             f1Down_ = true;
-            flyMode_ = !flyMode_;
-            if (flyMode_)
-            {
-                flyEye_ = lastEye_;
-                flyYaw_ = yaw_;
-                flyPitch_ = pitch_;
-                Tracen("[CAMERA] mode=fly");
-            }
-            else
-            {
-                yaw_ = flyYaw_;
-                pitch_ = std::clamp(flyPitch_, -kMaxPitch, kMaxPitch);
-                Tracen("[CAMERA] mode=tps");
-            }
+            SetEditorFlyMode(!flyMode_);
             return true;
         }
 
@@ -369,7 +512,7 @@ private:
         if (flyMode_)
         {
             flyYaw_ += dx * kSensitivity;
-            flyPitch_ = std::clamp(flyPitch_ - dy * kSensitivity, -kMaxPitch, kMaxPitch);
+            flyPitch_ = std::clamp(flyPitch_ + dy * kSensitivity, -kMaxPitch, kMaxPitch);
             return;
         }
 
@@ -386,8 +529,8 @@ private:
         if (movement.s) localZ -= 1.0f;
         if (movement.d) localX += 1.0f;
         if (movement.a) localX -= 1.0f;
-        if (movement.e) localY += 1.0f;
-        if (movement.q) localY -= 1.0f;
+        if (movement.space) localY += 1.0f;
+        if (movement.control) localY -= 1.0f;
 
         const float cosPitch = std::cos(flyPitch_);
         const WorldVec3 forward = {std::sin(flyYaw_) * cosPitch, std::sin(flyPitch_), std::cos(flyYaw_) * cosPitch};
@@ -410,7 +553,9 @@ private:
         camera.eye = flyEye_;
         camera.target = WorldAdd(flyEye_, forward);
         const WorldMat4 view = WorldLookAt(camera.eye, camera.target, {0.0f, 1.0f, 0.0f});
-        const WorldMat4 projection = WorldPerspective(45.0f * 3.1415926535f / 180.0f, aspect, 0.1f, 1000.0f);
+        camera.nearPlane = 0.1f;
+        camera.farPlane = 1000.0f;
+        const WorldMat4 projection = WorldPerspective(45.0f * 3.1415926535f / 180.0f, aspect, camera.nearPlane, camera.farPlane);
         camera.viewProjection = WorldMultiply(view, projection);
         return camera;
     }
@@ -488,6 +633,12 @@ int RunGame(NativeWindow& window,
         Tracenf("[MAIN] TerrainRenderer failed to initialize - terrain will not be available");
         terrain.Destroy();
     }
+    else
+    {
+        noesis.InitializeAssetLibrary("assets/Maps/test_zone", terrain.GetPaletteSlots());
+        if (!terrain.ApplyPaletteSlots(device, noesis.GetPaletteSlots()))
+            Tracenf("[MAIN] world palette could not be applied; keeping initial terrain palette");
+    }
 
     NameplateRenderer nameplates;
     bool nameplatesOk = nameplates.Create(device, assets);
@@ -495,6 +646,26 @@ int RunGame(NativeWindow& window,
     {
         Tracenf("[MAIN] NameplateRenderer failed to initialize - nameplates will not be available");
         nameplates.Destroy();
+    }
+
+    OffscreenSceneRenderer offscreenScene;
+    bool offscreenSceneOk = offscreenScene.Create(device, assets);
+    if (offscreenSceneOk)
+    {
+        if (warriorOk)
+        {
+            warrior.SetMainRenderPass(offscreenScene.GetRenderPass());
+            warrior.RecreatePipeline(device);
+        }
+        if (terrainOk)
+        {
+            terrain.SetMainRenderPass(offscreenScene.GetRenderPass());
+            terrain.SetWaterRefractionInputs(offscreenScene.GetSceneColorSnapshotView(),
+                offscreenScene.GetSceneDepthSnapshotView(),
+                offscreenScene.GetLinearSampler(),
+                offscreenScene.GetExtent());
+            terrain.RecreatePipeline(device);
+        }
     }
 
     noesis.SetQuitCallback([&window]()
@@ -508,6 +679,17 @@ int RunGame(NativeWindow& window,
     WorldCamera lastPickCamera{};
     bool hasLastPickCamera = false;
     std::uint32_t selectedTargetNetId = 0;
+    std::vector<EditorTestMarker> editorMarkers;
+    std::vector<PointLight> editorPointLights;
+    std::vector<SpotLight> editorSpotLights;
+    std::uint32_t nextEditorMarkerId = 1;
+    std::uint32_t nextEditorLightId = 1;
+    std::uint32_t selectedEditorMarkerId = 0;
+    SelectedEditorObject selectedEditorObject;
+    EditorGizmoMode editorGizmoMode = EditorGizmoMode::Translate;
+    bool editorMarkerDragActive = false;
+    int editorMarkerDragLastX = 0;
+    int editorMarkerDragLastY = 0;
 
     window.SetInputCallback([&noesis,
                              &movement,
@@ -519,9 +701,23 @@ int RunGame(NativeWindow& window,
                              &lastPickCamera,
                              &hasLastPickCamera,
                              &selectedTargetNetId,
+                             &editorMarkers,
+                             &editorPointLights,
+                             &editorSpotLights,
+                             &selectedEditorMarkerId,
+                             &selectedEditorObject,
+                             &editorGizmoMode,
+                             &editorMarkerDragActive,
+                             &editorMarkerDragLastX,
+                             &editorMarkerDragLastY,
                              &renderSize](const InputEvent& event)
     {
-        movement.Apply(event);
+        const bool editorTextInputFocused = noesis.IsMapEditorOpen() && noesis.IsTextInputFocused();
+        if (editorTextInputFocused)
+            movement.Clear();
+        else
+            movement.Apply(event);
+
         if (noesis.IsInWorld() && event.type == InputEvent::MouseDown && event.button == MouseButton_Left &&
             hasLastPickCamera && !noesis.IsMapEditorOpen())
         {
@@ -534,11 +730,17 @@ int RunGame(NativeWindow& window,
             Tracenf("[COMBAT] selected target net_id=%u", selectedTargetNetId);
             return;
         }
-        if (noesis.IsInWorld() && event.type == InputEvent::KeyDown && event.key == Key_F)
+        if (noesis.IsInWorld() && !noesis.IsMapEditorOpen() &&
+            event.type == InputEvent::KeyDown && event.key == Key_F)
         {
             if (selectedTargetNetId != 0)
                 clientSession.SendAttackTarget(selectedTargetNetId);
             return;
+        }
+        if (event.type == InputEvent::KeyDown && event.key == Key_F2 && noesis.IsMapEditorOpen())
+        {
+            if (noesis.OnInput(event))
+                return;
         }
         if (event.type == InputEvent::KeyDown && event.key == Key_F2 && terrainOk)
         {
@@ -547,21 +749,64 @@ int RunGame(NativeWindow& window,
             {
                 noesis.ToggleMapEditor();
                 terrain.SetMapEditorOpen(false);
+                cameraController.SetEditorFlyMode(false);
             }
             return;
         }
         if (event.type == InputEvent::KeyDown && event.key == Key_F4 && terrainOk &&
-            noesis.IsInWorld() && terrain.IsWalkabilityDebugEnabled())
+            noesis.IsInWorld())
         {
             noesis.ToggleMapEditor();
+            noesis.ClearKeyboardFocus();
             terrain.SetMapEditorOpen(noesis.IsMapEditorOpen());
+            cameraController.SetEditorFlyMode(noesis.IsMapEditorOpen());
+            if (!noesis.IsMapEditorOpen())
+            {
+                selectedEditorMarkerId = 0;
+                selectedEditorObject = {};
+                editorMarkerDragActive = false;
+                noesis.SetEditorStatus("Editor closed");
+            }
+            else
+            {
+                noesis.SetEditorStatus("Editor fly camera active: RMB look, WASD move, Space/Ctrl up/down");
+            }
             return;
         }
 
         if (terrainOk && noesis.IsMapEditorOpen())
         {
+            if (editorTextInputFocused &&
+                (event.type == InputEvent::KeyDown ||
+                 event.type == InputEvent::KeyUp ||
+                 event.type == InputEvent::Char))
+            {
+                noesis.OnInput(event);
+                if (event.type == InputEvent::KeyDown && event.key == Key_Enter)
+                    noesis.ClearKeyboardFocus();
+                return;
+            }
+
             if (event.type == InputEvent::KeyDown || event.type == InputEvent::KeyUp)
             {
+                if (event.type == InputEvent::KeyDown)
+                {
+                    if (event.key == Key_W)
+                    {
+                        editorGizmoMode = EditorGizmoMode::Translate;
+                        noesis.SetEditorStatus("Gizmo: translate");
+                    }
+                    else if (event.key == Key_E)
+                    {
+                        editorGizmoMode = EditorGizmoMode::Rotate;
+                        noesis.SetEditorStatus("Gizmo: rotate");
+                    }
+                    else if (event.key == Key_R)
+                    {
+                        editorGizmoMode = EditorGizmoMode::Scale;
+                        noesis.SetEditorStatus("Gizmo: scale");
+                    }
+                }
                 if (terrain.HandleEditorInput(event))
                     return;
             }
@@ -574,9 +819,154 @@ int RunGame(NativeWindow& window,
             {
                 consumedByEditorUi = noesis.OnInput(event);
                 if (event.type == InputEvent::MouseUp)
+                {
+                    if (event.button == MouseButton_Left)
+                        editorMarkerDragActive = false;
                     terrain.HandleEditorInput(event);
+                }
                 else if (!consumedByEditorUi)
+                {
+                    if (event.type == InputEvent::MouseDown)
+                        noesis.ClearKeyboardFocus();
+
+                    if (event.type == InputEvent::MouseDown && event.button == MouseButton_Left && hasLastPickCamera)
+                    {
+                        if (auto pointId = PickDynamicLight(editorPointLights,
+                                lastPickCamera,
+                                renderSize.width,
+                                renderSize.height,
+                                event.x,
+                                event.y))
+                        {
+                            selectedEditorObject = {SelectedEditorObjectType::PointLight, *pointId};
+                            selectedEditorMarkerId = 0;
+                            editorMarkerDragActive = true;
+                            editorMarkerDragLastX = event.x;
+                            editorMarkerDragLastY = event.y;
+                            noesis.SetEditorStatus("Selected point light #" + std::to_string(*pointId));
+                            return;
+                        }
+                        if (auto spotId = PickDynamicLight(editorSpotLights,
+                                lastPickCamera,
+                                renderSize.width,
+                                renderSize.height,
+                                event.x,
+                                event.y))
+                        {
+                            selectedEditorObject = {SelectedEditorObjectType::SpotLight, *spotId};
+                            selectedEditorMarkerId = 0;
+                            editorMarkerDragActive = true;
+                            editorMarkerDragLastX = event.x;
+                            editorMarkerDragLastY = event.y;
+                            noesis.SetEditorStatus("Selected spot light #" + std::to_string(*spotId));
+                            return;
+                        }
+                        if (auto markerId = PickEditorMarker(editorMarkers,
+                                lastPickCamera,
+                                renderSize.width,
+                                renderSize.height,
+                                event.x,
+                                event.y))
+                        {
+                            selectedEditorMarkerId = *markerId;
+                            selectedEditorObject = {SelectedEditorObjectType::Marker, *markerId};
+                            editorMarkerDragActive = true;
+                            editorMarkerDragLastX = event.x;
+                            editorMarkerDragLastY = event.y;
+                            noesis.SetEditorStatus("Selected marker #" + std::to_string(selectedEditorMarkerId));
+                            return;
+                        }
+                    }
+                    if (event.type == InputEvent::MouseMove && editorMarkerDragActive && selectedEditorMarkerId != 0)
+                    {
+                        const int dx = event.x - editorMarkerDragLastX;
+                        const int dy = event.y - editorMarkerDragLastY;
+                        editorMarkerDragLastX = event.x;
+                        editorMarkerDragLastY = event.y;
+                        auto markerIt = std::find_if(editorMarkers.begin(), editorMarkers.end(),
+                            [selectedEditorMarkerId](const EditorTestMarker& marker) {
+                                return marker.id == selectedEditorMarkerId;
+                            });
+                        if (markerIt != editorMarkers.end())
+                        {
+                            const float scale = 0.025f * std::max(1.0f, std::sqrt(WorldDot(WorldSub(markerIt->position, lastPickCamera.eye),
+                                WorldSub(markerIt->position, lastPickCamera.eye))));
+                            if (editorGizmoMode == EditorGizmoMode::Translate)
+                            {
+                                markerIt->position = WorldAdd(markerIt->position,
+                                    WorldAdd(WorldScale(CameraRight(lastPickCamera), static_cast<float>(dx) * scale),
+                                             WorldScale(CameraUp(lastPickCamera), static_cast<float>(-dy) * scale)));
+                            }
+                            else if (editorGizmoMode == EditorGizmoMode::Rotate)
+                            {
+                                markerIt->rotation.y += static_cast<float>(dx) * 0.01f;
+                                markerIt->rotation.x += static_cast<float>(dy) * 0.01f;
+                            }
+                            else
+                            {
+                                const float delta = static_cast<float>(dx - dy) * 0.01f;
+                                markerIt->scale.x = std::max(0.1f, markerIt->scale.x + delta);
+                                markerIt->scale.y = std::max(0.1f, markerIt->scale.y + delta);
+                                markerIt->scale.z = std::max(0.1f, markerIt->scale.z + delta);
+                            }
+                            return;
+                        }
+                    }
+                    if (event.type == InputEvent::MouseMove && editorMarkerDragActive &&
+                        selectedEditorObject.type != SelectedEditorObjectType::None &&
+                        selectedEditorObject.type != SelectedEditorObjectType::Marker)
+                    {
+                        const int dx = event.x - editorMarkerDragLastX;
+                        const int dy = event.y - editorMarkerDragLastY;
+                        editorMarkerDragLastX = event.x;
+                        editorMarkerDragLastY = event.y;
+                        auto moveLight = [&](auto& light) {
+                            WorldVec3 position{light.position[0], light.position[1], light.position[2]};
+                            const float scale = 0.025f * std::max(1.0f, std::sqrt(WorldDot(WorldSub(position, lastPickCamera.eye),
+                                WorldSub(position, lastPickCamera.eye))));
+                            if (editorGizmoMode == EditorGizmoMode::Translate)
+                            {
+                                position = WorldAdd(position,
+                                    WorldAdd(WorldScale(CameraRight(lastPickCamera), static_cast<float>(dx) * scale),
+                                             WorldScale(CameraUp(lastPickCamera), static_cast<float>(-dy) * scale)));
+                                light.position[0] = position.x;
+                                light.position[1] = position.y;
+                                light.position[2] = position.z;
+                            }
+                            else if constexpr (std::is_same_v<std::decay_t<decltype(light)>, SpotLight>)
+                            {
+                                if (editorGizmoMode == EditorGizmoMode::Rotate)
+                                {
+                                    light.rotation[1] += static_cast<float>(dx) * 0.01f;
+                                    light.rotation[0] = std::clamp(light.rotation[0] + static_cast<float>(-dy) * 0.01f,
+                                        -1.5708f,
+                                        1.5708f);
+                                }
+                            }
+                        };
+                        if (selectedEditorObject.type == SelectedEditorObjectType::PointLight)
+                        {
+                            auto it = std::find_if(editorPointLights.begin(), editorPointLights.end(),
+                                [&](const PointLight& light) { return light.id == selectedEditorObject.id; });
+                            if (it != editorPointLights.end())
+                            {
+                                moveLight(*it);
+                                return;
+                            }
+                        }
+                        if (selectedEditorObject.type == SelectedEditorObjectType::SpotLight)
+                        {
+                            auto it = std::find_if(editorSpotLights.begin(), editorSpotLights.end(),
+                                [&](const SpotLight& light) { return light.id == selectedEditorObject.id; });
+                            if (it != editorSpotLights.end())
+                            {
+                                moveLight(*it);
+                                return;
+                            }
+                        }
+                    }
                     terrain.HandleEditorInput(event);
+                }
 
                 const bool cameraMouse =
                     event.type == InputEvent::MouseMove ||
@@ -600,6 +990,11 @@ int RunGame(NativeWindow& window,
         }
     });
 
+    window.SetFileDropCallback([&noesis](const std::vector<std::string>& paths)
+    {
+        noesis.ImportDroppedFiles(paths);
+    });
+
     const auto startTime = std::chrono::steady_clock::now();
     double previousSeconds = 0.0;
     bool running = true;
@@ -615,6 +1010,23 @@ int RunGame(NativeWindow& window,
             if (device.Resize(width, height))
             {
                 Tracen("[MAIN] device.Resize() returned true, recreating pipelines");
+                if (offscreenSceneOk)
+                {
+                    offscreenSceneOk = offscreenScene.Recreate(device);
+                    if (offscreenSceneOk)
+                    {
+                        if (warriorOk)
+                            warrior.SetMainRenderPass(offscreenScene.GetRenderPass());
+                        if (terrainOk)
+                        {
+                            terrain.SetMainRenderPass(offscreenScene.GetRenderPass());
+                            terrain.SetWaterRefractionInputs(offscreenScene.GetSceneColorSnapshotView(),
+                                offscreenScene.GetSceneDepthSnapshotView(),
+                                offscreenScene.GetLinearSampler(),
+                                offscreenScene.GetExtent());
+                        }
+                    }
+                }
                 if (warriorOk)
                     warrior.RecreatePipeline(device);
                 if (terrainOk)
@@ -679,6 +1091,159 @@ int RunGame(NativeWindow& window,
                 terrain.SetMapEditorOpen(noesis.IsMapEditorOpen());
                 terrain.SetMapEditorSettings(noesis.GetMapEditorSettings());
                 const MapEditorCommands commands = noesis.ConsumeMapEditorCommands();
+                if (commands.addTestMarker)
+                {
+                    EditorTestMarker marker{};
+                    marker.id = nextEditorMarkerId++;
+                    marker.position = WorldAdd(frameCamera.eye, WorldScale(CameraForward(frameCamera), 5.0f));
+                    marker.position.y = terrain.SampleHeight(marker.position) + 0.6f;
+                    editorMarkers.push_back(marker);
+                    selectedEditorMarkerId = marker.id;
+                    selectedEditorObject = {SelectedEditorObjectType::Marker, marker.id};
+                    editorGizmoMode = EditorGizmoMode::Translate;
+                    noesis.SetEditorStatus("Added and selected marker #" + std::to_string(marker.id));
+                }
+                if (commands.addPointLight)
+                {
+                    if (editorPointLights.size() >= kMaxDynamicPointLights)
+                    {
+                        noesis.SetEditorStatus("Maximum point lights reached (16)");
+                    }
+                    else
+                    {
+                        PointLight light{};
+                        light.id = nextEditorLightId++;
+                        const WorldVec3 spawn = WorldAdd(frameCamera.eye, WorldScale(CameraForward(frameCamera), 5.0f));
+                        light.position[0] = spawn.x;
+                        light.position[1] = terrain.SampleHeight(spawn) + 1.8f;
+                        light.position[2] = spawn.z;
+                        editorPointLights.push_back(light);
+                        selectedEditorObject = {SelectedEditorObjectType::PointLight, light.id};
+                        selectedEditorMarkerId = 0;
+                        editorGizmoMode = EditorGizmoMode::Translate;
+                        noesis.SetEditorStatus("Added point light #" + std::to_string(light.id));
+                    }
+                }
+                if (commands.addSpotLight)
+                {
+                    if (editorSpotLights.size() >= kMaxDynamicSpotLights)
+                    {
+                        noesis.SetEditorStatus("Maximum spot lights reached (16)");
+                    }
+                    else
+                    {
+                        SpotLight light{};
+                        light.id = nextEditorLightId++;
+                        const WorldVec3 spawn = WorldAdd(frameCamera.eye, WorldScale(CameraForward(frameCamera), 5.0f));
+                        light.position[0] = spawn.x;
+                        light.position[1] = terrain.SampleHeight(spawn) + 4.0f;
+                        light.position[2] = spawn.z;
+                        light.rotation[0] = -1.5708f;
+                        editorSpotLights.push_back(light);
+                        selectedEditorObject = {SelectedEditorObjectType::SpotLight, light.id};
+                        selectedEditorMarkerId = 0;
+                        editorGizmoMode = EditorGizmoMode::Translate;
+                        noesis.SetEditorStatus("Added spot light #" + std::to_string(light.id));
+                    }
+                }
+                if (commands.selectedLightChanged)
+                {
+                    if (commands.selectedLight.type == DynamicLightType::Point)
+                    {
+                        auto it = std::find_if(editorPointLights.begin(), editorPointLights.end(),
+                            [&](const PointLight& light) { return light.id == commands.selectedLight.point.id; });
+                        if (it != editorPointLights.end())
+                            *it = commands.selectedLight.point;
+                    }
+                    else if (commands.selectedLight.type == DynamicLightType::Spot)
+                    {
+                        auto it = std::find_if(editorSpotLights.begin(), editorSpotLights.end(),
+                            [&](const SpotLight& light) { return light.id == commands.selectedLight.spot.id; });
+                        if (it != editorSpotLights.end())
+                        {
+                            SpotLight spot = commands.selectedLight.spot;
+                            spot.outerConeDegrees = std::clamp(spot.outerConeDegrees, 1.0f, 90.0f);
+                            spot.innerConeDegrees = std::clamp(spot.innerConeDegrees, 1.0f, spot.outerConeDegrees);
+                            *it = spot;
+                        }
+                    }
+                }
+                if (commands.deleteSelectedLight)
+                {
+                    if (selectedEditorObject.type == SelectedEditorObjectType::PointLight)
+                    {
+                        editorPointLights.erase(std::remove_if(editorPointLights.begin(), editorPointLights.end(),
+                            [&](const PointLight& light) { return light.id == selectedEditorObject.id; }), editorPointLights.end());
+                        noesis.SetEditorStatus("Deleted point light #" + std::to_string(selectedEditorObject.id));
+                        selectedEditorObject = {};
+                    }
+                    else if (selectedEditorObject.type == SelectedEditorObjectType::SpotLight)
+                    {
+                        editorSpotLights.erase(std::remove_if(editorSpotLights.begin(), editorSpotLights.end(),
+                            [&](const SpotLight& light) { return light.id == selectedEditorObject.id; }), editorSpotLights.end());
+                        noesis.SetEditorStatus("Deleted spot light #" + std::to_string(selectedEditorObject.id));
+                        selectedEditorObject = {};
+                    }
+                }
+
+                DynamicLightEditorState dynamicLightState{};
+                dynamicLightState.pointCount = static_cast<std::uint32_t>(std::min<std::size_t>(editorPointLights.size(), kMaxDynamicPointLights));
+                dynamicLightState.spotCount = static_cast<std::uint32_t>(std::min<std::size_t>(editorSpotLights.size(), kMaxDynamicSpotLights));
+                if (selectedEditorObject.type == SelectedEditorObjectType::PointLight)
+                {
+                    auto it = std::find_if(editorPointLights.begin(), editorPointLights.end(),
+                        [&](const PointLight& light) { return light.id == selectedEditorObject.id; });
+                    if (it != editorPointLights.end())
+                    {
+                        dynamicLightState.type = DynamicLightType::Point;
+                        dynamicLightState.id = it->id;
+                        dynamicLightState.point = *it;
+                    }
+                }
+                else if (selectedEditorObject.type == SelectedEditorObjectType::SpotLight)
+                {
+                    auto it = std::find_if(editorSpotLights.begin(), editorSpotLights.end(),
+                        [&](const SpotLight& light) { return light.id == selectedEditorObject.id; });
+                    if (it != editorSpotLights.end())
+                    {
+                        dynamicLightState.type = DynamicLightType::Spot;
+                        dynamicLightState.id = it->id;
+                        dynamicLightState.spot = *it;
+                    }
+                }
+                noesis.SetDynamicLightEditorState(dynamicLightState);
+
+                LightingState lightingState = noesis.GetLightingState();
+                lightingState.numPointLights = 0;
+                for (const PointLight& light : editorPointLights)
+                {
+                    if (lightingState.numPointLights >= kMaxDynamicPointLights)
+                        break;
+                    lightingState.pointLights[lightingState.numPointLights++] = light;
+                }
+                lightingState.numSpotLights = 0;
+                for (const SpotLight& light : editorSpotLights)
+                {
+                    if (lightingState.numSpotLights >= kMaxDynamicSpotLights)
+                        break;
+                    lightingState.spotLights[lightingState.numSpotLights++] = light;
+                }
+                terrain.SetLightingState(lightingState);
+                terrain.SetWaterConfig(noesis.GetWaterConfig());
+                if (warriorOk)
+                {
+                    warrior.SetLightingState(lightingState);
+                    warrior.SetWaterConfig(noesis.GetWaterConfig());
+                }
+                if (commands.paletteSlotChanged)
+                {
+                    const auto slots = noesis.GetPaletteSlots();
+                    if (commands.paletteSlot < slots.size() &&
+                        !terrain.ApplyPaletteSlotChange(device, slots[commands.paletteSlot]))
+                    {
+                        Tracenf("[MAIN] failed to apply terrain palette slot %u", commands.paletteSlot);
+                    }
+                }
                 if (commands.save)
                     terrain.RequestEditorSave();
                 if (commands.reload)
@@ -714,6 +1279,21 @@ int RunGame(NativeWindow& window,
                             static_cast<float>(seconds));
                         ++skinSlot;
                     }
+                    if (noesis.IsMapEditorOpen())
+                    {
+                        const size_t editorMarkerRenderCount =
+                            editorMarkers.size() + editorPointLights.size() + editorSpotLights.size();
+                        for (size_t markerIndex = 0; markerIndex < editorMarkerRenderCount; ++markerIndex)
+                        {
+                            if (skinSlot >= WarriorRenderer::MaxSkinSlots())
+                                break;
+                            warrior.SkinInstance(device,
+                                skinSlot,
+                                WarriorRenderer::MotionState::Idle,
+                                static_cast<float>(seconds));
+                            ++skinSlot;
+                        }
+                    }
                 }
             }
             else if (noesis.IsLobbyActive() && warriorOk)
@@ -721,15 +1301,124 @@ int RunGame(NativeWindow& window,
                 warrior.Skin(device, seconds);
             }
 
-            noesis.RenderOffscreen(device);
-            device.BeginSwapchainRenderPass();
+            if (isInWorld && terrainOk && hasFrameCamera)
+                terrain.RenderSunShadowMap(device, frameCamera);
+            if (isInWorld && terrainOk && hasFrameCamera)
+            {
+                terrain.RenderWaterReflection(device,
+                    frameCamera,
+                    seconds,
+                    [&](const WorldCamera& mirrorCamera, VkExtent2D reflectionExtent, VkRenderPass reflectionRenderPass)
+                    {
+                        if (!warriorOk)
+                            return;
 
+                        const float waterLevelY = noesis.GetWaterConfig().waterLevelY;
+                        uint32_t skinSlot = 0;
+                        for (const auto& entity : entities)
+                        {
+                            if (skinSlot >= WarriorRenderer::MaxSkinSlots())
+                                break;
+                            auto position = ServerMetersToDisplay(entity.position);
+                            position.y += warrior.GroundOffsetY();
+                            const std::array<float, 4> tint = entity.mobTypeId == 0
+                                ? std::array<float, 4>{1.0f, 1.0f, 1.0f, 1.0f}
+                                : (entity.mobTypeId == 1
+                                      ? std::array<float, 4>{1.35f, 0.55f, 0.55f, 1.0f}
+                                      : std::array<float, 4>{0.65f, 0.95f, 1.35f, 1.0f});
+                            warrior.RenderInWorldReflection(device,
+                                mirrorCamera,
+                                reflectionExtent,
+                                reflectionRenderPass,
+                                waterLevelY,
+                                position,
+                                HeadingFromQuantized(entity.heading),
+                                skinSlot,
+                                tint);
+                            ++skinSlot;
+                        }
+
+                        if (noesis.IsMapEditorOpen())
+                        {
+                            for (const auto& marker : editorMarkers)
+                            {
+                                if (skinSlot >= WarriorRenderer::MaxSkinSlots())
+                                    break;
+                                WorldVec3 position = marker.position;
+                                position.y += warrior.GroundOffsetY();
+                                const bool selected = marker.id == selectedEditorMarkerId;
+                                warrior.RenderInWorldReflection(device,
+                                    mirrorCamera,
+                                    reflectionExtent,
+                                    reflectionRenderPass,
+                                    waterLevelY,
+                                    position,
+                                    marker.rotation.y,
+                                    skinSlot,
+                                    selected
+                                        ? std::array<float, 4>{1.8f, 1.55f, 0.25f, 1.0f}
+                                        : std::array<float, 4>{0.9f, 1.2f, 1.7f, 1.0f});
+                                ++skinSlot;
+                            }
+                            for (const auto& light : editorPointLights)
+                            {
+                                if (skinSlot >= WarriorRenderer::MaxSkinSlots())
+                                    break;
+                                WorldVec3 position{light.position[0], light.position[1] + warrior.GroundOffsetY(), light.position[2]};
+                                const bool selected =
+                                    selectedEditorObject.type == SelectedEditorObjectType::PointLight &&
+                                    selectedEditorObject.id == light.id;
+                                warrior.RenderInWorldReflection(device,
+                                    mirrorCamera,
+                                    reflectionExtent,
+                                    reflectionRenderPass,
+                                    waterLevelY,
+                                    position,
+                                    0.0f,
+                                    skinSlot,
+                                    selected
+                                        ? std::array<float, 4>{2.0f, 1.55f, 0.25f, 1.0f}
+                                        : std::array<float, 4>{1.6f, 1.05f, 0.35f, 1.0f});
+                                ++skinSlot;
+                            }
+                            for (const auto& light : editorSpotLights)
+                            {
+                                if (skinSlot >= WarriorRenderer::MaxSkinSlots())
+                                    break;
+                                WorldVec3 position{light.position[0], light.position[1] + warrior.GroundOffsetY(), light.position[2]};
+                                const bool selected =
+                                    selectedEditorObject.type == SelectedEditorObjectType::SpotLight &&
+                                    selectedEditorObject.id == light.id;
+                                warrior.RenderInWorldReflection(device,
+                                    mirrorCamera,
+                                    reflectionExtent,
+                                    reflectionRenderPass,
+                                    waterLevelY,
+                                    position,
+                                    light.rotation[1],
+                                    skinSlot,
+                                    selected
+                                        ? std::array<float, 4>{0.35f, 1.7f, 2.0f, 1.0f}
+                                        : std::array<float, 4>{0.35f, 1.25f, 1.65f, 1.0f});
+                                ++skinSlot;
+                            }
+                        }
+                    });
+            }
+
+            noesis.RenderOffscreen(device);
+            const bool useOffscreenScene = offscreenSceneOk && device.IsFrameActive();
+            if (useOffscreenScene)
+                offscreenScene.BeginMainPass(device);
+            else
+                device.BeginSwapchainRenderPass();
+
+            std::vector<NameplateRenderer::Nameplate> plates;
             if (isInWorld)
             {
                 if (terrainOk)
                     terrain.Render(device, camera);
 
-                std::vector<NameplateRenderer::Nameplate> plates;
                 plates.reserve(entities.size());
                 uint32_t skinSlot = 0;
                 static bool loggedTerrainAlignment = false;
@@ -778,12 +1467,119 @@ int RunGame(NativeWindow& window,
                         entity.netId == selectedTargetNetId});
                     ++skinSlot;
                 }
-                if (nameplatesOk)
+                if (warriorOk && noesis.IsMapEditorOpen())
+                {
+                    for (const auto& marker : editorMarkers)
+                    {
+                        if (skinSlot >= WarriorRenderer::MaxSkinSlots())
+                            break;
+                        WorldVec3 position = marker.position;
+                        position.y += warrior.GroundOffsetY();
+                        const bool selected = marker.id == selectedEditorMarkerId;
+                        warrior.RenderInWorld(device,
+                            seconds,
+                            camera,
+                            position,
+                            marker.rotation.y,
+                            skinSlot,
+                            selected
+                                ? std::array<float, 4>{1.8f, 1.55f, 0.25f, 1.0f}
+                                : std::array<float, 4>{0.9f, 1.2f, 1.7f, 1.0f});
+                        plates.push_back(NameplateRenderer::Nameplate{
+                            WorldAdd(marker.position, {0.0f, 2.0f, 0.0f}),
+                            "Marker " + std::to_string(marker.id),
+                            1,
+                            selected ? 2u : 0u,
+                            1.0f,
+                            1.0f,
+                            1.0f,
+                            selected});
+                        ++skinSlot;
+                    }
+                    for (const auto& light : editorPointLights)
+                    {
+                        if (skinSlot >= WarriorRenderer::MaxSkinSlots())
+                            break;
+                        WorldVec3 position{light.position[0], light.position[1] + warrior.GroundOffsetY(), light.position[2]};
+                        const bool selected =
+                            selectedEditorObject.type == SelectedEditorObjectType::PointLight &&
+                            selectedEditorObject.id == light.id;
+                        warrior.RenderInWorld(device,
+                            seconds,
+                            camera,
+                            position,
+                            0.0f,
+                            skinSlot,
+                            selected
+                                ? std::array<float, 4>{2.0f, 1.55f, 0.25f, 1.0f}
+                                : std::array<float, 4>{1.6f, 1.05f, 0.35f, 1.0f});
+                        plates.push_back(NameplateRenderer::Nameplate{
+                            WorldAdd({light.position[0], light.position[1], light.position[2]}, {0.0f, 1.4f, 0.0f}),
+                            "Point Light " + std::to_string(light.id),
+                            1,
+                            selected ? 2u : 0u,
+                            1.0f,
+                            1.0f,
+                            1.0f,
+                            selected});
+                        ++skinSlot;
+                    }
+                    for (const auto& light : editorSpotLights)
+                    {
+                        if (skinSlot >= WarriorRenderer::MaxSkinSlots())
+                            break;
+                        WorldVec3 position{light.position[0], light.position[1] + warrior.GroundOffsetY(), light.position[2]};
+                        const bool selected =
+                            selectedEditorObject.type == SelectedEditorObjectType::SpotLight &&
+                            selectedEditorObject.id == light.id;
+                        warrior.RenderInWorld(device,
+                            seconds,
+                            camera,
+                            position,
+                            light.rotation[1],
+                            skinSlot,
+                            selected
+                                ? std::array<float, 4>{0.35f, 1.7f, 2.0f, 1.0f}
+                                : std::array<float, 4>{0.35f, 1.25f, 1.65f, 1.0f});
+                        plates.push_back(NameplateRenderer::Nameplate{
+                            WorldAdd({light.position[0], light.position[1], light.position[2]}, {0.0f, 1.4f, 0.0f}),
+                            "Spot Light " + std::to_string(light.id),
+                            1,
+                            selected ? 2u : 0u,
+                            1.0f,
+                            1.0f,
+                            1.0f,
+                            selected});
+                        ++skinSlot;
+                    }
+                }
+                if (!useOffscreenScene && terrainOk)
+                    terrain.RenderWater(device, camera, seconds);
+                if (!useOffscreenScene && nameplatesOk)
                     nameplates.Render(device, camera, plates);
             }
             else if (noesis.IsLobbyActive() && warriorOk)
                 warrior.Render(device, seconds);
 
+            if (useOffscreenScene)
+            {
+                offscreenScene.EndMainPass(device);
+                if (isInWorld && terrainOk)
+                {
+                    offscreenScene.SnapshotScene(device);
+                    terrain.SetWaterRefractionInputs(offscreenScene.GetSceneColorSnapshotView(),
+                        offscreenScene.GetSceneDepthSnapshotView(),
+                        offscreenScene.GetLinearSampler(),
+                        offscreenScene.GetExtent());
+                    offscreenScene.BeginMainPass(device, false);
+                    terrain.RenderWater(device, camera, seconds);
+                    offscreenScene.EndMainPass(device);
+                }
+                device.BeginSwapchainRenderPass();
+                offscreenScene.RenderComposite(device);
+                if (isInWorld && nameplatesOk)
+                    nameplates.Render(device, camera, plates);
+            }
             noesis.RenderOnscreen(device);
         }
         device.EndFrame();
@@ -793,6 +1589,8 @@ int RunGame(NativeWindow& window,
     clientSession.Disconnect();
     if (nameplatesOk)
         nameplates.Destroy();
+    if (offscreenSceneOk)
+        offscreenScene.Destroy();
     if (terrainOk)
         terrain.Destroy();
     if (warriorOk)

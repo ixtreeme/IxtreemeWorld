@@ -18,6 +18,8 @@
 
 #define STB_IMAGE_IMPLEMENTATION
 #define STBI_ONLY_PNG
+#define STBI_ONLY_JPEG
+#define STBI_ONLY_TGA
 #include <stb_image.h>
 
 #include <algorithm>
@@ -108,12 +110,112 @@ Mat4 Translation(float x, float y, float z);
 
 struct UniformBlock
 {
+    struct PointLightUniform
+    {
+        float position[4];
+        float color[4];
+    };
+
+    struct SpotLightUniform
+    {
+        float position[4];
+        float direction[4];
+        float color[4];
+    };
+
     Mat4 mvp;
     Mat4 model;
     float tint[4];
+    float sunDir[4];
+    float sunColor[4];
+    float ambientColor[4];
+    float waterParams[4] = {0.0f, 0.0f, 0.0f, 0.0f};
+    float causticParams[4] = {0.0f, 0.0f, 0.0f, 0.0f};
+    std::int32_t numPointLights = 0;
+    std::int32_t numSpotLights = 0;
+    float lightPadding[2] = {0.0f, 0.0f};
+    PointLightUniform pointLights[kMaxDynamicPointLights]{};
+    SpotLightUniform spotLights[kMaxDynamicSpotLights]{};
 };
 
 static_assert(sizeof(WarriorRenderer::Vertex) == 32, "Graphics vertex layout must stay 32 bytes");
+
+void FillLightingUniform(const LightingState& lighting, UniformBlock& uniform)
+{
+    const DirectionalLight& directional = lighting.directional;
+    const AmbientLight& ambient = lighting.ambient;
+    const float azimuthRadians = std::clamp(directional.azimuthDegrees, 0.0f, 360.0f) * 3.1415926535f / 180.0f;
+    const float elevationRadians = std::clamp(directional.elevationDegrees, 0.0f, 90.0f) * 3.1415926535f / 180.0f;
+    const float cosElevation = std::cos(elevationRadians);
+    const float sunIntensity = std::max(0.0f, directional.intensity) * (directional.enabled ? 1.0f : 0.0f);
+    const float ambientIntensity = std::max(0.0f, ambient.intensity);
+    uniform.sunDir[0] = cosElevation * std::sin(azimuthRadians);
+    uniform.sunDir[1] = std::sin(elevationRadians);
+    uniform.sunDir[2] = cosElevation * std::cos(azimuthRadians);
+    uniform.sunDir[3] = 0.0f;
+    uniform.sunColor[0] = std::max(0.0f, directional.r) * sunIntensity;
+    uniform.sunColor[1] = std::max(0.0f, directional.g) * sunIntensity;
+    uniform.sunColor[2] = std::max(0.0f, directional.b) * sunIntensity;
+    uniform.sunColor[3] = 0.0f;
+    uniform.ambientColor[0] = std::max(0.0f, ambient.r) * ambientIntensity;
+    uniform.ambientColor[1] = std::max(0.0f, ambient.g) * ambientIntensity;
+    uniform.ambientColor[2] = std::max(0.0f, ambient.b) * ambientIntensity;
+    uniform.ambientColor[3] = 0.0f;
+    uniform.numPointLights = static_cast<std::int32_t>(
+        std::min<std::uint32_t>(lighting.numPointLights, kMaxDynamicPointLights));
+    uniform.numSpotLights = static_cast<std::int32_t>(
+        std::min<std::uint32_t>(lighting.numSpotLights, kMaxDynamicSpotLights));
+    for (std::uint32_t i = 0; i < static_cast<std::uint32_t>(uniform.numPointLights); ++i)
+    {
+        const PointLight& point = lighting.pointLights[i];
+        auto& out = uniform.pointLights[i];
+        out.position[0] = point.position[0];
+        out.position[1] = point.position[1];
+        out.position[2] = point.position[2];
+        out.position[3] = std::max(0.1f, point.radius);
+        const float intensity = point.enabled ? std::max(0.0f, point.intensity) : 0.0f;
+        out.color[0] = std::max(0.0f, point.r);
+        out.color[1] = std::max(0.0f, point.g);
+        out.color[2] = std::max(0.0f, point.b);
+        out.color[3] = intensity;
+    }
+    for (std::uint32_t i = 0; i < static_cast<std::uint32_t>(uniform.numSpotLights); ++i)
+    {
+        SpotLight spot = lighting.spotLights[i];
+        spot.outerConeDegrees = std::clamp(spot.outerConeDegrees, 1.0f, 90.0f);
+        spot.innerConeDegrees = std::clamp(spot.innerConeDegrees, 1.0f, spot.outerConeDegrees);
+        const float pitch = spot.rotation[0];
+        const float yaw = spot.rotation[1];
+        const float cosPitch = std::cos(pitch);
+        auto& out = uniform.spotLights[i];
+        out.position[0] = spot.position[0];
+        out.position[1] = spot.position[1];
+        out.position[2] = spot.position[2];
+        out.position[3] = std::max(0.1f, spot.radius);
+        out.direction[0] = std::sin(yaw) * cosPitch;
+        out.direction[1] = std::sin(pitch);
+        out.direction[2] = std::cos(yaw) * cosPitch;
+        out.direction[3] = std::cos(spot.innerConeDegrees * 3.1415926535f / 180.0f);
+        const float intensity = spot.enabled ? std::max(0.0f, spot.intensity) : 0.0f;
+        out.color[0] = std::max(0.0f, spot.r) * intensity;
+        out.color[1] = std::max(0.0f, spot.g) * intensity;
+        out.color[2] = std::max(0.0f, spot.b) * intensity;
+        out.color[3] = std::cos(spot.outerConeDegrees * 3.1415926535f / 180.0f);
+        out.direction[3] = std::max(out.direction[3], out.color[3]);
+    }
+}
+
+void FillWaterUniform(const WaterConfig& water, double timeSeconds, UniformBlock& uniform)
+{
+    uniform.waterParams[0] = water.enabled ? 1.0f : 0.0f;
+    uniform.waterParams[1] = water.waterLevelY;
+    uniform.waterParams[2] = static_cast<float>(static_cast<int>(water.causticMode));
+    uniform.waterParams[3] = std::clamp(water.causticIntensity, 0.0f, 3.0f);
+    uniform.causticParams[0] = std::clamp(water.causticScale, 0.05f, 2.0f);
+    uniform.causticParams[1] = static_cast<float>(timeSeconds) * std::clamp(water.causticSpeed, 0.0f, 2.0f);
+    uniform.causticParams[2] = std::clamp(water.causticMaxDepth, 1.0f, 30.0f);
+    uniform.causticParams[3] = 0.0f;
+}
 
 #pragma pack(push, 1)
 struct DdsPixelFormat
@@ -1094,10 +1196,15 @@ bool WarriorRenderer::RecreatePipeline(VulkanDevice& device)
         return true;
 
     DestroyPipeline();
-    if (device.GetRenderPass() == VK_NULL_HANDLE)
+    if ((m_mainRenderPass ? m_mainRenderPass : device.GetRenderPass()) == VK_NULL_HANDLE)
         return true;
 
     return CreatePipeline(device);
+}
+
+void WarriorRenderer::SetMainRenderPass(VkRenderPass renderPass)
+{
+    m_mainRenderPass = renderPass;
 }
 
 void WarriorRenderer::Skin(VulkanDevice& device, double timeSeconds)
@@ -1274,7 +1381,7 @@ void WarriorRenderer::Render(VulkanDevice& device, double timeSeconds)
 }
 
 void WarriorRenderer::RenderInWorld(VulkanDevice& device,
-    double,
+    double timeSeconds,
     const WorldCamera& camera,
     WorldVec3 position,
     float yawRadians,
@@ -1311,7 +1418,7 @@ void WarriorRenderer::RenderInWorld(VulkanDevice& device,
     }
 
     const uint32_t uniformSlot = std::min(m_worldUniformCursor++, kUniformSlots - 1);
-    UpdateWorldUniform(frameIndex, uniformSlot, camera, position, yawRadians, tint);
+    UpdateWorldUniform(frameIndex, uniformSlot, camera, position, yawRadians, timeSeconds, tint);
 
     VkCommandBuffer cmd = device.GetCommandBuffer();
 
@@ -1353,6 +1460,68 @@ void WarriorRenderer::RenderInWorld(VulkanDevice& device,
             camera.target.y,
             camera.target.z);
         loggedDraw = true;
+    }
+}
+
+void WarriorRenderer::RenderInWorldReflection(VulkanDevice& device,
+    const WorldCamera& camera,
+    VkExtent2D extent,
+    VkRenderPass renderPass,
+    float waterLevelY,
+    WorldVec3 position,
+    float yawRadians,
+    uint32_t skinSlot,
+    std::array<float, 4> tint)
+{
+    if (!m_pipelineLayout || !renderPass || m_indexCount == 0 || !device.IsFrameActive())
+        return;
+
+    if (!m_reflectionPipeline || m_reflectionRenderPass != renderPass)
+    {
+        DestroyReflectionPipeline();
+        if (!CreateReflectionPipeline(device, renderPass))
+            return;
+    }
+
+    if (extent.width == 0 || extent.height == 0)
+        return;
+
+    const uint32_t frameIndex = device.GetFrameIndex();
+    if (skinSlot >= kSkinSlots)
+        skinSlot = 0;
+    if (m_worldRenderFrameIndex != frameIndex)
+    {
+        m_worldRenderFrameIndex = frameIndex;
+        m_worldUniformCursor = 0;
+    }
+
+    const uint32_t uniformSlot = std::min(m_worldUniformCursor++, kUniformSlots - 1);
+    UpdateWorldUniform(frameIndex, uniformSlot, camera, position, yawRadians, 0.0, tint, true, waterLevelY);
+
+    VkCommandBuffer cmd = device.GetCommandBuffer();
+
+    VkViewport viewport{};
+    viewport.x = 0.0f;
+    viewport.y = 0.0f;
+    viewport.width = static_cast<float>(extent.width);
+    viewport.height = static_cast<float>(extent.height);
+    viewport.minDepth = 0.0f;
+    viewport.maxDepth = 1.0f;
+
+    VkRect2D scissor{{0, 0}, extent};
+    vkCmdSetViewport(cmd, 0, 1, &viewport);
+    vkCmdSetScissor(cmd, 0, 1, &scissor);
+    vkCmdBindPipeline(cmd, VK_PIPELINE_BIND_POINT_GRAPHICS, m_reflectionPipeline);
+
+    VkDeviceSize offset = 0;
+    vkCmdBindVertexBuffers(cmd, 0, 1, &m_skinnedOutputBuffers[frameIndex][skinSlot].buffer, &offset);
+    vkCmdBindIndexBuffer(cmd, m_indexBuffer.buffer, 0, VK_INDEX_TYPE_UINT32);
+
+    for (const MeshDraw& draw : m_draws)
+    {
+        vkCmdBindDescriptorSets(cmd, VK_PIPELINE_BIND_POINT_GRAPHICS, m_pipelineLayout,
+            0, 1, &m_descriptorSets[frameIndex][uniformSlot][draw.textureIndex], 0, nullptr);
+        vkCmdDrawIndexed(cmd, draw.indexCount, 1, draw.firstIndex, 0, 0);
     }
 }
 
@@ -2151,7 +2320,7 @@ bool WarriorRenderer::CreateDescriptors()
     ubo.binding = 0;
     ubo.descriptorType = VK_DESCRIPTOR_TYPE_UNIFORM_BUFFER;
     ubo.descriptorCount = 1;
-    ubo.stageFlags = VK_SHADER_STAGE_VERTEX_BIT;
+    ubo.stageFlags = VK_SHADER_STAGE_VERTEX_BIT | VK_SHADER_STAGE_FRAGMENT_BIT;
 
     VkDescriptorSetLayoutBinding diffuse{};
     diffuse.binding = 1;
@@ -2470,7 +2639,7 @@ bool WarriorRenderer::CreatePipeline(VulkanDevice& device)
     pipeline.pColorBlendState = &blend;
     pipeline.pDynamicState = &dynamic;
     pipeline.layout = m_pipelineLayout;
-    pipeline.renderPass = device.GetRenderPass();
+    pipeline.renderPass = m_mainRenderPass ? m_mainRenderPass : device.GetRenderPass();
     pipeline.subpass = 0;
     VK_CHECK(vkCreateGraphicsPipelines(m_device, VK_NULL_HANDLE, 1, &pipeline, nullptr, &m_pipeline));
 
@@ -2479,8 +2648,119 @@ bool WarriorRenderer::CreatePipeline(VulkanDevice& device)
     return true;
 }
 
+bool WarriorRenderer::CreateReflectionPipeline(VulkanDevice& device, VkRenderPass renderPass)
+{
+    if (!m_assets || !m_pipelineLayout || renderPass == VK_NULL_HANDLE)
+        return false;
+
+    VkShaderModule vs = CreateShaderModule(m_device, *m_assets, "assets/shaders/warrior_vs.spv");
+    VkShaderModule ps = CreateShaderModule(m_device, *m_assets, "assets/shaders/warrior_ps.spv");
+
+    VkPipelineShaderStageCreateInfo stages[2]{};
+    stages[0].sType = VK_STRUCTURE_TYPE_PIPELINE_SHADER_STAGE_CREATE_INFO;
+    stages[0].stage = VK_SHADER_STAGE_VERTEX_BIT;
+    stages[0].module = vs;
+    stages[0].pName = "VSMain";
+    stages[1].sType = VK_STRUCTURE_TYPE_PIPELINE_SHADER_STAGE_CREATE_INFO;
+    stages[1].stage = VK_SHADER_STAGE_FRAGMENT_BIT;
+    stages[1].module = ps;
+    stages[1].pName = "PSMain";
+
+    VkVertexInputBindingDescription binding{};
+    binding.binding = 0;
+    binding.stride = sizeof(Vertex);
+    binding.inputRate = VK_VERTEX_INPUT_RATE_VERTEX;
+
+    VkVertexInputAttributeDescription attributes[3]{};
+    attributes[0].location = 0;
+    attributes[0].binding = 0;
+    attributes[0].format = VK_FORMAT_R32G32B32_SFLOAT;
+    attributes[0].offset = offsetof(Vertex, position);
+    attributes[1].location = 1;
+    attributes[1].binding = 0;
+    attributes[1].format = VK_FORMAT_R32G32B32_SFLOAT;
+    attributes[1].offset = offsetof(Vertex, normal);
+    attributes[2].location = 2;
+    attributes[2].binding = 0;
+    attributes[2].format = VK_FORMAT_R32G32_SFLOAT;
+    attributes[2].offset = offsetof(Vertex, uv);
+
+    VkPipelineVertexInputStateCreateInfo vertexInput{};
+    vertexInput.sType = VK_STRUCTURE_TYPE_PIPELINE_VERTEX_INPUT_STATE_CREATE_INFO;
+    vertexInput.vertexBindingDescriptionCount = 1;
+    vertexInput.pVertexBindingDescriptions = &binding;
+    vertexInput.vertexAttributeDescriptionCount = static_cast<uint32_t>(std::size(attributes));
+    vertexInput.pVertexAttributeDescriptions = attributes;
+
+    VkPipelineInputAssemblyStateCreateInfo assembly{};
+    assembly.sType = VK_STRUCTURE_TYPE_PIPELINE_INPUT_ASSEMBLY_STATE_CREATE_INFO;
+    assembly.topology = VK_PRIMITIVE_TOPOLOGY_TRIANGLE_LIST;
+
+    VkPipelineViewportStateCreateInfo viewport{};
+    viewport.sType = VK_STRUCTURE_TYPE_PIPELINE_VIEWPORT_STATE_CREATE_INFO;
+    viewport.viewportCount = 1;
+    viewport.scissorCount = 1;
+
+    VkPipelineRasterizationStateCreateInfo raster{};
+    raster.sType = VK_STRUCTURE_TYPE_PIPELINE_RASTERIZATION_STATE_CREATE_INFO;
+    raster.polygonMode = VK_POLYGON_MODE_FILL;
+    raster.cullMode = VK_CULL_MODE_FRONT_BIT;
+    raster.frontFace = VK_FRONT_FACE_CLOCKWISE;
+    raster.lineWidth = 1.0f;
+
+    VkPipelineMultisampleStateCreateInfo multisample{};
+    multisample.sType = VK_STRUCTURE_TYPE_PIPELINE_MULTISAMPLE_STATE_CREATE_INFO;
+    multisample.rasterizationSamples = VK_SAMPLE_COUNT_1_BIT;
+
+    VkPipelineDepthStencilStateCreateInfo depth{};
+    depth.sType = VK_STRUCTURE_TYPE_PIPELINE_DEPTH_STENCIL_STATE_CREATE_INFO;
+    depth.depthTestEnable = VK_TRUE;
+    depth.depthWriteEnable = VK_TRUE;
+    depth.depthCompareOp = VK_COMPARE_OP_LESS;
+
+    VkPipelineColorBlendAttachmentState blendAttachment{};
+    blendAttachment.colorWriteMask = VK_COLOR_COMPONENT_R_BIT | VK_COLOR_COMPONENT_G_BIT |
+        VK_COLOR_COMPONENT_B_BIT | VK_COLOR_COMPONENT_A_BIT;
+
+    VkPipelineColorBlendStateCreateInfo blend{};
+    blend.sType = VK_STRUCTURE_TYPE_PIPELINE_COLOR_BLEND_STATE_CREATE_INFO;
+    blend.attachmentCount = 1;
+    blend.pAttachments = &blendAttachment;
+
+    VkDynamicState dynamicStates[] = {VK_DYNAMIC_STATE_VIEWPORT, VK_DYNAMIC_STATE_SCISSOR};
+    VkPipelineDynamicStateCreateInfo dynamic{};
+    dynamic.sType = VK_STRUCTURE_TYPE_PIPELINE_DYNAMIC_STATE_CREATE_INFO;
+    dynamic.dynamicStateCount = 2;
+    dynamic.pDynamicStates = dynamicStates;
+
+    VkGraphicsPipelineCreateInfo pipeline{};
+    pipeline.sType = VK_STRUCTURE_TYPE_GRAPHICS_PIPELINE_CREATE_INFO;
+    pipeline.stageCount = 2;
+    pipeline.pStages = stages;
+    pipeline.pVertexInputState = &vertexInput;
+    pipeline.pInputAssemblyState = &assembly;
+    pipeline.pViewportState = &viewport;
+    pipeline.pRasterizationState = &raster;
+    pipeline.pMultisampleState = &multisample;
+    pipeline.pDepthStencilState = &depth;
+    pipeline.pColorBlendState = &blend;
+    pipeline.pDynamicState = &dynamic;
+    pipeline.layout = m_pipelineLayout;
+    pipeline.renderPass = renderPass;
+    pipeline.subpass = 0;
+    VK_CHECK(vkCreateGraphicsPipelines(m_device, VK_NULL_HANDLE, 1, &pipeline, nullptr, &m_reflectionPipeline));
+    m_reflectionRenderPass = renderPass;
+
+    vkDestroyShaderModule(m_device, ps, nullptr);
+    vkDestroyShaderModule(m_device, vs, nullptr);
+    Log("[WATER-3] Warrior reflection pipeline created");
+    return true;
+}
+
 void WarriorRenderer::DestroyPipeline()
 {
+    DestroyReflectionPipeline();
+
     if (m_pipeline)
         vkDestroyPipeline(m_device, m_pipeline, nullptr);
     m_pipeline = VK_NULL_HANDLE;
@@ -2488,6 +2768,14 @@ void WarriorRenderer::DestroyPipeline()
     if (m_pipelineLayout)
         vkDestroyPipelineLayout(m_device, m_pipelineLayout, nullptr);
     m_pipelineLayout = VK_NULL_HANDLE;
+}
+
+void WarriorRenderer::DestroyReflectionPipeline()
+{
+    if (m_reflectionPipeline)
+        vkDestroyPipeline(m_device, m_reflectionPipeline, nullptr);
+    m_reflectionPipeline = VK_NULL_HANDLE;
+    m_reflectionRenderPass = VK_NULL_HANDLE;
 }
 
 void WarriorRenderer::DestroyBuffer(Buffer& buffer)
@@ -2574,7 +2862,9 @@ void WarriorRenderer::UpdateUniform(uint32_t frameIndex, uint32_t uniformSlot, d
         loggedMvp = true;
     }
 
-    const UniformBlock uniform{mvp, model, {1.0f, 1.0f, 1.0f, 1.0f}};
+    UniformBlock uniform{mvp, model, {1.0f, 1.0f, 1.0f, 1.0f}};
+    FillLightingUniform(m_lightingState, uniform);
+    FillWaterUniform(m_waterConfig, timeSeconds, uniform);
 
     void* mapped = nullptr;
     VK_CHECK(vkMapMemory(m_device, m_uniformBuffers[frameIndex][uniformSlot].memory, 0, sizeof(uniform), 0, &mapped));
@@ -2587,7 +2877,10 @@ void WarriorRenderer::UpdateWorldUniform(uint32_t frameIndex,
     const WorldCamera& camera,
     WorldVec3 position,
     float yawRadians,
-    std::array<float, 4> tint)
+    double timeSeconds,
+    std::array<float, 4> tint,
+    bool reflectionPass,
+    float waterLevelY)
 {
     static bool loggedMvp = false;
 
@@ -2602,7 +2895,22 @@ void WarriorRenderer::UpdateWorldUniform(uint32_t frameIndex,
         loggedMvp = true;
     }
 
-    const UniformBlock uniform{mvp, model, {tint[0], tint[1], tint[2], tint[3]}};
+    UniformBlock uniform{mvp, model, {tint[0], tint[1], tint[2], tint[3]}};
+    if (reflectionPass)
+    {
+        LightingState reflectionLighting = m_lightingState;
+        reflectionLighting.numPointLights = 0;
+        reflectionLighting.numSpotLights = 0;
+        FillLightingUniform(reflectionLighting, uniform);
+        FillWaterUniform(m_waterConfig, timeSeconds, uniform);
+        uniform.lightPadding[0] = 1.0f;
+        uniform.lightPadding[1] = waterLevelY;
+    }
+    else
+    {
+        FillLightingUniform(m_lightingState, uniform);
+        FillWaterUniform(m_waterConfig, timeSeconds, uniform);
+    }
 
     void* mapped = nullptr;
     VK_CHECK(vkMapMemory(m_device, m_uniformBuffers[frameIndex][uniformSlot].memory, 0, sizeof(uniform), 0, &mapped));

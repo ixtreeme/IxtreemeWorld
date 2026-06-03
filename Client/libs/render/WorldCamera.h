@@ -20,6 +20,8 @@ struct WorldCamera
     WorldVec3 eye;
     WorldVec3 target;
     WorldMat4 viewProjection;
+    float nearPlane = 0.1f;
+    float farPlane = 1000.0f;
 };
 
 inline WorldVec3 WorldAdd(WorldVec3 a, WorldVec3 b)
@@ -139,7 +141,9 @@ inline WorldCamera BuildSpawnCamera(uint32_t width, uint32_t height)
     camera.target = {0.0f, 1.1f, 0.0f};
     camera.eye = {0.0f, 10.0f, -20.0f};
     const WorldMat4 view = WorldLookAt(camera.eye, camera.target, {0.0f, 1.0f, 0.0f});
-    const WorldMat4 projection = WorldPerspective(45.0f * 3.1415926535f / 180.0f, aspect, 0.1f, 1000.0f);
+    camera.nearPlane = 0.1f;
+    camera.farPlane = 1000.0f;
+    const WorldMat4 projection = WorldPerspective(45.0f * 3.1415926535f / 180.0f, aspect, camera.nearPlane, camera.farPlane);
     camera.viewProjection = WorldMultiply(view, projection);
     return camera;
 }
@@ -155,7 +159,9 @@ inline WorldCamera BuildFollowCamera(uint32_t width, uint32_t height, WorldVec3 
     camera.eye = eye;
     camera.target = target;
     const WorldMat4 view = WorldLookAt(camera.eye, camera.target, {0.0f, 1.0f, 0.0f});
-    const WorldMat4 projection = WorldPerspective(45.0f * 3.1415926535f / 180.0f, aspect, 0.1f, 1000.0f);
+    camera.nearPlane = 0.1f;
+    camera.farPlane = 1000.0f;
+    const WorldMat4 projection = WorldPerspective(45.0f * 3.1415926535f / 180.0f, aspect, camera.nearPlane, camera.farPlane);
     camera.viewProjection = WorldMultiply(view, projection);
     return camera;
 }
@@ -177,7 +183,9 @@ inline WorldCamera BuildOrbitCamera(uint32_t width, uint32_t height, WorldVec3 p
     camera.eye = eye;
     camera.target = target;
     const WorldMat4 view = WorldLookAt(camera.eye, camera.target, {0.0f, 1.0f, 0.0f});
-    const WorldMat4 projection = WorldPerspective(45.0f * 3.1415926535f / 180.0f, aspect, 0.1f, 1000.0f);
+    camera.nearPlane = 0.1f;
+    camera.farPlane = 1000.0f;
+    const WorldMat4 projection = WorldPerspective(45.0f * 3.1415926535f / 180.0f, aspect, camera.nearPlane, camera.farPlane);
     camera.viewProjection = WorldMultiply(view, projection);
     return camera;
 }

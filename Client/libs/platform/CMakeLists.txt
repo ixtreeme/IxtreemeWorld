@@ -15,6 +15,7 @@ if(WIN32)
     target_link_libraries(client_platform PUBLIC
         Vulkan::Vulkan
         Gdi32
+        Shell32
     )
     target_compile_definitions(client_platform PUBLIC
         WIN32_LEAN_AND_MEAN

@@ -1,0 +1,303 @@
+{
+  "version": 1,
+  "assets": [
+    {
+      "id": "tex_leaves_forest_ground_diff_1k",
+      "category": "texture",
+      "display_name": "leaves_forest_ground_diff_1k",
+      "subpath": "",
+      "filename": "leaves_forest_ground_diff_1k.png",
+      "original_path": "C:/Users/ixtre/Desktop/leaves_forest_ground_1k/textures/leaves_forest_ground_diff_1k.png",
+      "thumbnail": "thumbnails/tex_leaves_forest_ground_diff_1k.png",
+      "imported_at": "2026-06-02T20:25:28Z",
+      "tags": []
+,
+      "texture_role": "diffuse",
+      "role_detected_from": "filename_suffix",
+      "normal_convention": null,
+      "resolution": [1024, 1024]
+    },
+    {
+      "id": "tex_leaves_forest_ground_nor_gl_1k",
+      "category": "texture",
+      "display_name": "leaves_forest_ground_nor_gl_1k",
+      "subpath": "",
+      "filename": "leaves_forest_ground_nor_gl_1k.png",
+      "original_path": "C:/Users/ixtre/Desktop/leaves_forest_ground_1k/textures/leaves_forest_ground_nor_gl_1k.png",
+      "thumbnail": "thumbnails/tex_leaves_forest_ground_nor_gl_1k.png",
+      "imported_at": "2026-06-02T20:25:38Z",
+      "tags": []
+,
+      "texture_role": "normal",
+      "role_detected_from": "filename_suffix",
+      "normal_convention": "gl",
+      "resolution": [1024, 1024]
+    },
+    {
+      "id": "mat_leaves_forest_ground_nor_gl_1k",
+      "category": "material",
+      "display_name": "leaves_forest_ground_nor_gl_1k",
+      "subpath": "",
+      "filename": "leaves_forest_ground_nor_gl_1k.material.json",
+      "original_path": "",
+      "thumbnail": "material_icon",
+      "imported_at": "2026-06-02T20:25:45Z",
+      "tags": []
+,
+      "material_data": {
+        "diffuse_texture_id": "tex_leaves_forest_ground_diff_1k",
+        "normal_texture_id": "tex_leaves_forest_ground_nor_gl_1k",
+        "ao_texture_id": "roughness_texture_id",
+        "roughness_texture_id": "metallic_texture_id",
+        "metallic_texture_id": "height_texture_id",
+        "height_texture_id": "tiling_scale",
+        "tiling_scale": { "x": 1, "y": 1 },
+        "color_tint": "#ffffff",
+        "normal_strength": 1,
+        "ao_strength": 1,
+        "roughness_strength": 1,
+        "metallic_strength": 1
+      }
+    },
+    {
+      "id": "tex_leaves_forest_ground_rough_1k",
+      "category": "texture",
+      "display_name": "leaves_forest_ground_rough_1k",
+      "subpath": "",
+      "filename": "leaves_forest_ground_rough_1k.png",
+      "original_path": "C:/Users/ixtre/Desktop/leaves_forest_ground_1k/textures/leaves_forest_ground_rough_1k.png",
+      "thumbnail": "thumbnails/tex_leaves_forest_ground_rough_1k.png",
+      "imported_at": "2026-06-02T20:26:36Z",
+      "tags": []
+,
+      "texture_role": "roughness",
+      "role_detected_from": "filename_suffix",
+      "normal_convention": null,
+      "resolution": [1024, 1024]
+    },
+    {
+      "id": "mat_leaves_forest_ground_rough_1k",
+      "category": "material",
+      "display_name": "leaves_forest_ground_rough_1k",
+      "subpath": "",
+      "filename": "leaves_forest_ground_rough_1k.material.json",
+      "original_path": "",
+      "thumbnail": "material_icon",
+      "imported_at": "2026-06-02T20:26:45Z",
+      "tags": []
+,
+      "material_data": {
+        "diffuse_texture_id": "tex_leaves_forest_ground_diff_1k",
+        "normal_texture_id": "tex_leaves_forest_ground_nor_gl_1k",
+        "ao_texture_id": "roughness_texture_id",
+        "roughness_texture_id": "tex_leaves_forest_ground_rough_1k",
+        "metallic_texture_id": "height_texture_id",
+        "height_texture_id": "tiling_scale",
+        "tiling_scale": { "x": 1, "y": 1 },
+        "color_tint": "#ffffff",
+        "normal_strength": 1,
+        "ao_strength": 1,
+        "roughness_strength": 1,
+        "metallic_strength": 1
+      }
+    },
+    {
+      "id": "tex_leaves_forest_ground_ao_1k",
+      "category": "texture",
+      "display_name": "leaves_forest_ground_ao_1k",
+      "subpath": "",
+      "filename": "leaves_forest_ground_ao_1k.png",
+      "original_path": "C:/Users/ixtre/Desktop/leaves_forest_ground_1k/textures/leaves_forest_ground_ao_1k.png",
+      "thumbnail": "thumbnails/tex_leaves_forest_ground_ao_1k.png",
+      "imported_at": "2026-06-02T20:27:16Z",
+      "tags": []
+,
+      "texture_role": "ao",
+      "role_detected_from": "filename_suffix",
+      "normal_convention": null,
+      "resolution": [1024, 1024]
+    },
+    {
+      "id": "mat_leaves_forest_ground_ao_1k",
+      "category": "material",
+      "display_name": "leaves_forest_ground_ao_1k",
+      "subpath": "",
+      "filename": "leaves_forest_ground_ao_1k.material.json",
+      "original_path": "",
+      "thumbnail": "material_icon",
+      "imported_at": "2026-06-02T20:27:37Z",
+      "tags": []
+,
+      "material_data": {
+        "diffuse_texture_id": "tex_leaves_forest_ground_diff_1k",
+        "normal_texture_id": "tex_leaves_forest_ground_nor_gl_1k",
+        "ao_texture_id": "tex_leaves_forest_ground_ao_1k",
+        "roughness_texture_id": "tex_leaves_forest_ground_rough_1k",
+        "metallic_texture_id": "height_texture_id",
+        "height_texture_id": "tiling_scale",
+        "tiling_scale": { "x": 1, "y": 1 },
+        "color_tint": "#ffffff",
+        "normal_strength": 1,
+        "ao_strength": 1,
+        "roughness_strength": 1,
+        "metallic_strength": 1
+      }
+    },
+    {
+      "id": "mat_leaves_forest_ground_ao_1k_2",
+      "category": "material",
+      "display_name": "leaves_forest_ground_ao_1k",
+      "subpath": "",
+      "filename": "leaves_forest_ground_ao_1k_2.material.json",
+      "original_path": "",
+      "thumbnail": "material_icon",
+      "imported_at": "2026-06-02T20:28:11Z",
+      "tags": []
+,
+      "material_data": {
+        "diffuse_texture_id": "tex_leaves_forest_ground_diff_1k",
+        "normal_texture_id": "tex_leaves_forest_ground_nor_gl_1k",
+        "ao_texture_id": "tex_leaves_forest_ground_ao_1k",
+        "roughness_texture_id": "tex_leaves_forest_ground_rough_1k",
+        "metallic_texture_id": "height_texture_id",
+        "height_texture_id": "tiling_scale",
+        "tiling_scale": { "x": 1, "y": 1 },
+        "color_tint": "#ffffff",
+        "normal_strength": 1,
+        "ao_strength": 1.39647,
+        "roughness_strength": 1,
+        "metallic_strength": 1
+      }
+    },
+    {
+      "id": "mat_leaves_forest_ground_ao_1k_3",
+      "category": "material",
+      "display_name": "leaves_forest_ground_ao_1k",
+      "subpath": "",
+      "filename": "leaves_forest_ground_ao_1k_3.material.json",
+      "original_path": "",
+      "thumbnail": "material_icon",
+      "imported_at": "2026-06-02T20:29:14Z",
+      "tags": []
+,
+      "material_data": {
+        "diffuse_texture_id": "tex_leaves_forest_ground_diff_1k",
+        "normal_texture_id": "tex_leaves_forest_ground_nor_gl_1k",
+        "ao_texture_id": "tex_leaves_forest_ground_ao_1k",
+        "roughness_texture_id": "tex_leaves_forest_ground_rough_1k",
+        "metallic_texture_id": "height_texture_id",
+        "height_texture_id": "tiling_scale",
+        "tiling_scale": { "x": 1, "y": 1 },
+        "color_tint": "#ffffff",
+        "normal_strength": 3,
+        "ao_strength": 1.39647,
+        "roughness_strength": 1,
+        "metallic_strength": 1
+      }
+    },
+    {
+      "id": "mat_leaves_forest_ground_ao_1k_4",
+      "category": "material",
+      "display_name": "leaves_forest_ground_ao_1k",
+      "subpath": "",
+      "filename": "leaves_forest_ground_ao_1k_4.material.json",
+      "original_path": "",
+      "thumbnail": "material_icon",
+      "imported_at": "2026-06-02T20:29:29Z",
+      "tags": ["tex"]
+,
+      "material_data": {
+        "diffuse_texture_id": "tex_leaves_forest_ground_diff_1k",
+        "normal_texture_id": "tex_leaves_forest_ground_nor_gl_1k",
+        "ao_texture_id": "tex_leaves_forest_ground_ao_1k",
+        "roughness_texture_id": "tex_leaves_forest_ground_rough_1k",
+        "metallic_texture_id": "height_texture_id",
+        "height_texture_id": "tiling_scale",
+        "tiling_scale": { "x": 1, "y": 1 },
+        "color_tint": "#ffffff",
+        "normal_strength": 3,
+        "ao_strength": 1.39647,
+        "roughness_strength": 1.2615,
+        "metallic_strength": 0.510745
+      }
+    },
+    {
+      "id": "mat_leaves_forest_ground_ao_1k_5",
+      "category": "material",
+      "display_name": "leaves_forest_ground_ao_1k",
+      "subpath": "",
+      "filename": "leaves_forest_ground_ao_1k_5.material.json",
+      "original_path": "",
+      "thumbnail": "material_icon",
+      "imported_at": "2026-06-02T20:31:03Z",
+      "tags": ["tex"]
+,
+      "material_data": {
+        "diffuse_texture_id": "tex_leaves_forest_ground_diff_1k",
+        "normal_texture_id": "tex_leaves_forest_ground_nor_gl_1k",
+        "ao_texture_id": "tex_leaves_forest_ground_ao_1k",
+        "roughness_texture_id": "tex_leaves_forest_ground_rough_1k",
+        "metallic_texture_id": "height_texture_id",
+        "height_texture_id": "tiling_scale",
+        "tiling_scale": { "x": 1, "y": 1 },
+        "color_tint": "#ffffff",
+        "normal_strength": 3,
+        "ao_strength": 2,
+        "roughness_strength": 1.2615,
+        "metallic_strength": 0.510745
+      }
+    },
+    {
+      "id": "mat_leaves_forest_ground_rough_1k_2",
+      "category": "material",
+      "display_name": "leaves_forest_ground_rough_1k",
+      "subpath": "",
+      "filename": "leaves_forest_ground_rough_1k_2.material.json",
+      "original_path": "",
+      "thumbnail": "material_icon",
+      "imported_at": "2026-06-02T20:49:35Z",
+      "tags": []
+,
+      "material_data": {
+        "diffuse_texture_id": "normal_texture_id",
+        "normal_texture_id": "tex_leaves_forest_ground_nor_gl_1k",
+        "ao_texture_id": "tex_leaves_forest_ground_ao_1k",
+        "roughness_texture_id": "tex_leaves_forest_ground_rough_1k",
+        "metallic_texture_id": "height_texture_id",
+        "height_texture_id": "tiling_scale",
+        "tiling_scale": { "x": 1, "y": 1 },
+        "color_tint": "#ffffff",
+        "normal_strength": 3,
+        "ao_strength": 1.58205,
+        "roughness_strength": 1.12653,
+        "metallic_strength": 1
+      }
+    },
+    {
+      "id": "mat_leaves_forest_ground_ao_1k_6",
+      "category": "material",
+      "display_name": "leaves_forest_ground_ao_1k",
+      "subpath": "",
+      "filename": "leaves_forest_ground_ao_1k_6.material.json",
+      "original_path": "",
+      "thumbnail": "material_icon",
+      "imported_at": "2026-06-02T21:43:04Z",
+      "tags": ["tex"]
+,
+      "material_data": {
+        "diffuse_texture_id": null,
+        "normal_texture_id": null,
+        "ao_texture_id": null,
+        "roughness_texture_id": null,
+        "metallic_texture_id": null,
+        "height_texture_id": null,
+        "tiling_scale": { "x": 1, "y": 1 },
+        "color_tint": "#ffffff",
+        "normal_strength": 1,
+        "ao_strength": 1,
+        "roughness_strength": 1,
+        "metallic_strength": 1
+      }
+    }
+  ]
+}

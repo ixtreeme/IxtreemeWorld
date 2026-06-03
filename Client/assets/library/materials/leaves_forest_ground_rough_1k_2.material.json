@@ -1,0 +1,15 @@
+{
+  "id": "mat_leaves_forest_ground_rough_1k_2",
+  "display_name": "leaves_forest_ground_rough_1k",
+  "diffuse_texture_id": "",
+  "normal_texture_id": "tex_leaves_forest_ground_nor_gl_1k",
+  "ao_texture_id": "tex_leaves_forest_ground_ao_1k",
+  "roughness_texture_id": "tex_leaves_forest_ground_rough_1k",
+  "metallic_texture_id": "",
+  "height_texture_id": "",
+  "tiling_scale": { "x": 1, "y": 1 },
+  "normal_strength": 3,
+  "ao_strength": 1.58205,
+  "roughness_strength": 1.12653,
+  "metallic_strength": 1
+}

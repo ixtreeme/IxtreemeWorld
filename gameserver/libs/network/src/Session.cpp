@@ -78,16 +78,18 @@ void Session::SendPayloadInternal(std::vector<std::uint8_t> payload, bool close_
         return;
     }
 
+    PendingWrite pending{Framing::Encode(std::span<const std::uint8_t>(payload.data(), payload.size())),
+                         close_after_send};
+
     auto self = shared_from_this();
     asio::post(
         socket_.get_executor(),
-        [self, payload = std::move(payload), close_after_send]() mutable {
+        [self, pending = std::move(pending)]() mutable {
             if (self->stopped_) {
                 return;
             }
 
-            self->write_queue_.push_back(
-                PendingWrite{Framing::Encode(payload), close_after_send});
+            self->write_queue_.push_back(std::move(pending));
             if (!self->writing_) {
                 self->StartWriteQueue();
             }

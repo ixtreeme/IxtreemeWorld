@@ -37,6 +37,8 @@ project(ixtreeme_client
     DESCRIPTION "IxtreemeWorld Vulkan client"
     LANGUAGES C CXX)
 
+include(CTest)
+
 set(CMAKE_CXX_STANDARD 20)
 set(CMAKE_CXX_STANDARD_REQUIRED ON)
 set(CMAKE_CXX_EXTENSIONS OFF)
@@ -161,6 +163,11 @@ if(WIN32)
     set(WARRIOR_CS_SPV "${GENERATED_SHADER_DIR}/warrior_cs.spv")
     set(TERRAIN_VS_SPV "${GENERATED_SHADER_DIR}/terrain_vs.spv")
     set(TERRAIN_PS_SPV "${GENERATED_SHADER_DIR}/terrain_ps.spv")
+    set(WATER_VS_SPV "${GENERATED_SHADER_DIR}/water_vs.spv")
+    set(WATER_PS_SPV "${GENERATED_SHADER_DIR}/water_ps.spv")
+    set(COMPOSITE_VS_SPV "${GENERATED_SHADER_DIR}/composite_vs.spv")
+    set(COMPOSITE_PS_SPV "${GENERATED_SHADER_DIR}/composite_ps.spv")
+    set(SHADOW_DEPTH_VS_SPV "${GENERATED_SHADER_DIR}/shadow_depth_vs.spv")
     set(NAMEPLATE_VS_SPV "${GENERATED_SHADER_DIR}/nameplate_vs.spv")
     set(NAMEPLATE_PS_SPV "${GENERATED_SHADER_DIR}/nameplate_ps.spv")
 
@@ -221,6 +228,46 @@ if(WIN32)
         VERBATIM
     )
     add_custom_command(
+        OUTPUT "${WATER_VS_SPV}"
+        COMMAND ${CMAKE_COMMAND} -E make_directory "${GENERATED_SHADER_DIR}"
+        COMMAND "${DXC_EXECUTABLE}" -spirv -fvk-use-dx-layout -T vs_6_0 -E VSMain
+            -Fo "${WATER_VS_SPV}" "${CLIENT_ROOT}/shaders/Water.hlsl"
+        DEPENDS "${CLIENT_ROOT}/shaders/Water.hlsl"
+        VERBATIM
+    )
+    add_custom_command(
+        OUTPUT "${WATER_PS_SPV}"
+        COMMAND ${CMAKE_COMMAND} -E make_directory "${GENERATED_SHADER_DIR}"
+        COMMAND "${DXC_EXECUTABLE}" -spirv -fvk-use-dx-layout -T ps_6_0 -E PSMain
+            -Fo "${WATER_PS_SPV}" "${CLIENT_ROOT}/shaders/Water.hlsl"
+        DEPENDS "${CLIENT_ROOT}/shaders/Water.hlsl"
+        VERBATIM
+    )
+    add_custom_command(
+        OUTPUT "${COMPOSITE_VS_SPV}"
+        COMMAND ${CMAKE_COMMAND} -E make_directory "${GENERATED_SHADER_DIR}"
+        COMMAND "${DXC_EXECUTABLE}" -spirv -T vs_6_0 -E VSMain
+            -Fo "${COMPOSITE_VS_SPV}" "${CLIENT_ROOT}/shaders/Composite.hlsl"
+        DEPENDS "${CLIENT_ROOT}/shaders/Composite.hlsl"
+        VERBATIM
+    )
+    add_custom_command(
+        OUTPUT "${COMPOSITE_PS_SPV}"
+        COMMAND ${CMAKE_COMMAND} -E make_directory "${GENERATED_SHADER_DIR}"
+        COMMAND "${DXC_EXECUTABLE}" -spirv -T ps_6_0 -E PSMain
+            -Fo "${COMPOSITE_PS_SPV}" "${CLIENT_ROOT}/shaders/Composite.hlsl"
+        DEPENDS "${CLIENT_ROOT}/shaders/Composite.hlsl"
+        VERBATIM
+    )
+    add_custom_command(
+        OUTPUT "${SHADOW_DEPTH_VS_SPV}"
+        COMMAND ${CMAKE_COMMAND} -E make_directory "${GENERATED_SHADER_DIR}"
+        COMMAND "${DXC_EXECUTABLE}" -spirv -fvk-use-dx-layout -T vs_6_0 -E VSMain
+            -Fo "${SHADOW_DEPTH_VS_SPV}" "${CLIENT_ROOT}/shaders/ShadowDepth.hlsl"
+        DEPENDS "${CLIENT_ROOT}/shaders/ShadowDepth.hlsl"
+        VERBATIM
+    )
+    add_custom_command(
         OUTPUT "${NAMEPLATE_VS_SPV}"
         COMMAND ${CMAKE_COMMAND} -E make_directory "${GENERATED_SHADER_DIR}"
         COMMAND "${DXC_EXECUTABLE}" -spirv -fvk-use-dx-layout -T vs_6_0 -E VSMain
@@ -244,6 +291,11 @@ if(WIN32)
         "${WARRIOR_CS_SPV}"
         "${TERRAIN_VS_SPV}"
         "${TERRAIN_PS_SPV}"
+        "${WATER_VS_SPV}"
+        "${WATER_PS_SPV}"
+        "${COMPOSITE_VS_SPV}"
+        "${COMPOSITE_PS_SPV}"
+        "${SHADOW_DEPTH_VS_SPV}"
         "${NAMEPLATE_VS_SPV}"
         "${NAMEPLATE_PS_SPV}"
     )
@@ -273,3 +325,4 @@ add_subdirectory(libs/asset)
 add_subdirectory(libs/network)
 add_subdirectory(libs/render)
 add_subdirectory(apps/client)
+add_subdirectory(apps/selftest)

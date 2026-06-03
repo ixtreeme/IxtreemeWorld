@@ -1,4 +1,6 @@
 add_library(client_render STATIC
+    AssetLibrary.cpp
+    AssetLibrary.h
     CubeRenderer.cpp
     CubeRenderer.h
     MapEditorTypes.h
@@ -6,6 +8,8 @@ add_library(client_render STATIC
     NameplateRenderer.h
     NoesisLayer.cpp
     NoesisLayer.h
+    OffscreenSceneRenderer.cpp
+    OffscreenSceneRenderer.h
     TerrainRenderer.cpp
     TerrainRenderer.h
     WarriorRenderer.cpp
@@ -57,6 +61,7 @@ if(WIN32)
             "${NOESIS_SDK}/Lib/windows_x86_64/Noesis.lib"
             Gdi32
             Advapi32
+            Comdlg32
     )
 elseif(ANDROID)
     target_link_libraries(client_render

@@ -6,6 +6,8 @@
 
 #include <cstdint>
 #include <functional>
+#include <string>
+#include <vector>
 
 class NativeWindow
 {
@@ -18,6 +20,8 @@ public:
 
     using InputCallback = std::function<void(const InputEvent&)>;
     virtual void SetInputCallback(InputCallback cb) = 0;
+    using FileDropCallback = std::function<void(const std::vector<std::string>&)>;
+    virtual void SetFileDropCallback(FileDropCallback cb) { (void)cb; }
 
     virtual uint32_t GetWidth() const = 0;
     virtual uint32_t GetHeight() const = 0;

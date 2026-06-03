@@ -1,0 +1,13 @@
+{
+  "version": 1,
+  "slots": [
+    { "slot": 0, "asset_id": "", "display_name": "Default 1", "texture_path": "assets/Textures/homokos/sand01.dds", "normal_texture_path": "", "tiling_scale_x": 1, "tiling_scale_y": 1, "normal_strength": 1 },
+    { "slot": 1, "asset_id": "", "display_name": "Default 2", "texture_path": "assets/Textures/homokos/beach sand 01.dds", "normal_texture_path": "", "tiling_scale_x": 1, "tiling_scale_y": 1, "normal_strength": 1 },
+    { "slot": 2, "asset_id": "", "display_name": "Default 3", "texture_path": "assets/Textures/fu/grass 01.dds", "normal_texture_path": "", "tiling_scale_x": 1, "tiling_scale_y": 1, "normal_strength": 1 },
+    { "slot": 3, "asset_id": "", "display_name": "Default 4", "texture_path": "assets/Textures/foldes/field 03.dds", "normal_texture_path": "", "tiling_scale_x": 1, "tiling_scale_y": 1, "normal_strength": 1 },
+    { "slot": 4, "asset_id": "mat_leaves_forest_ground_ao_1k_4", "display_name": "leaves_forest_ground_ao_1k", "texture_path": "assets/library/textures/leaves_forest_ground_diff_1k.png", "normal_texture_path": "assets/library/textures/leaves_forest_ground_nor_gl_1k.png", "tiling_scale_x": 1, "tiling_scale_y": 1, "normal_strength": 3 },
+    { "slot": 5, "asset_id": "", "display_name": "Default 6", "texture_path": "assets/Textures/szikla/n_snow_m_stone01.dds", "normal_texture_path": "", "tiling_scale_x": 1, "tiling_scale_y": 1, "normal_strength": 1 },
+    { "slot": 6, "asset_id": "", "display_name": "Default 7", "texture_path": "assets/Textures/fu/grass 03_03.dds", "normal_texture_path": "", "tiling_scale_x": 1, "tiling_scale_y": 1, "normal_strength": 1 },
+    { "slot": 7, "asset_id": "", "display_name": "Default 8", "texture_path": "assets/Textures/ho/snow01.dds", "normal_texture_path": "", "tiling_scale_x": 1, "tiling_scale_y": 1, "normal_strength": 1 }
+  ]
+}

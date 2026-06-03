@@ -2,6 +2,7 @@
 
 #include "VulkanDevice.h"
 #include "WorldCamera.h"
+#include "MapEditorTypes.h"
 
 #include <array>
 #include <cstdint>
@@ -36,6 +37,7 @@ public:
     bool Create(VulkanDevice& device, client::asset::IAssetReader& assets,
         const std::string& modelPath);
     bool RecreatePipeline(VulkanDevice& device);
+    void SetMainRenderPass(VkRenderPass renderPass);
     void Skin(VulkanDevice& device, double timeSeconds);
     void SkinInstance(VulkanDevice& device, uint32_t skinSlot, MotionState state, float animTimeSeconds);
     void Render(VulkanDevice& device, double timeSeconds);
@@ -46,6 +48,17 @@ public:
         float yawRadians,
         uint32_t skinSlot = 0,
         std::array<float, 4> tint = {1.0f, 1.0f, 1.0f, 1.0f});
+    void RenderInWorldReflection(VulkanDevice& device,
+        const WorldCamera& camera,
+        VkExtent2D extent,
+        VkRenderPass renderPass,
+        float waterLevelY,
+        WorldVec3 position,
+        float yawRadians,
+        uint32_t skinSlot = 0,
+        std::array<float, 4> tint = {1.0f, 1.0f, 1.0f, 1.0f});
+    void SetLightingState(const LightingState& lighting) { m_lightingState = lighting; }
+    void SetWaterConfig(const WaterConfig& water) { m_waterConfig = water; }
     void SetMotionState(MotionState state);
     float GroundOffsetY() const;
     static constexpr uint32_t MaxSkinSlots() { return kSkinSlots; }
@@ -136,6 +149,7 @@ private:
     bool CreateTextures(VulkanDevice& device, const std::string& modelPath);
     bool CreateDescriptors();
     bool CreatePipeline(VulkanDevice& device);
+    bool CreateReflectionPipeline(VulkanDevice& device, VkRenderPass renderPass);
     bool CreateComputeResources(VulkanDevice& device);
     bool CreateComputeDescriptors();
     bool CreateComputePipeline();
@@ -148,6 +162,7 @@ private:
     void DestroyComputeResources();
     void DestroyAnimation();
     void DestroyPipeline();
+    void DestroyReflectionPipeline();
     void DestroyBuffer(Buffer& buffer);
     void DestroyTexture(Texture& texture);
     void UpdateUniform(uint32_t frameIndex, uint32_t uniformSlot, double timeSeconds, float aspect);
@@ -156,7 +171,10 @@ private:
         const WorldCamera& camera,
         WorldVec3 position,
         float yawRadians,
-        std::array<float, 4> tint);
+        double timeSeconds,
+        std::array<float, 4> tint,
+        bool reflectionPass = false,
+        float waterLevelY = 0.0f);
 
     VkDevice m_device = VK_NULL_HANDLE;
     client::asset::IAssetReader* m_assets = nullptr;
@@ -170,6 +188,9 @@ private:
     std::array<std::array<VkDescriptorSet, kSkinSlots>, kFramesInFlight> m_computeDescriptorSets{};
     VkPipelineLayout m_pipelineLayout = VK_NULL_HANDLE;
     VkPipeline m_pipeline = VK_NULL_HANDLE;
+    VkRenderPass m_mainRenderPass = VK_NULL_HANDLE;
+    VkPipeline m_reflectionPipeline = VK_NULL_HANDLE;
+    VkRenderPass m_reflectionRenderPass = VK_NULL_HANDLE;
     VkPipelineLayout m_computePipelineLayout = VK_NULL_HANDLE;
     VkPipeline m_computePipeline = VK_NULL_HANDLE;
     std::vector<Vertex> m_vertices;
@@ -188,6 +209,8 @@ private:
     std::vector<std::array<float, 16>> m_bonePaletteCpu;
     uint32_t m_boneCount = 0;
     MotionState m_motionState = MotionState::Idle;
+    LightingState m_lightingState;
+    WaterConfig m_waterConfig;
     uint32_t m_worldRenderFrameIndex = std::numeric_limits<uint32_t>::max();
     uint32_t m_worldUniformCursor = 0;
     double m_lastAnimationLogTime = -1000.0;

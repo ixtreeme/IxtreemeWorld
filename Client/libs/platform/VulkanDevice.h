@@ -26,6 +26,8 @@ public:
     VkCommandBuffer GetCommandBuffer() const { return m_commandBuffers[m_currentFrame]; }
     uint32_t GetFrameIndex() const { return m_currentFrame; }
     VkExtent2D GetSwapchainExtent() const { return m_swapchainExtent; }
+    VkFormat GetSwapchainFormat() const { return m_swapchainFormat; }
+    VkFormat GetDepthStencilFormat() const { return m_depthStencilFormat; }
     VkSurfaceTransformFlagBitsKHR GetSurfaceTransform() const { return m_currentTransform; }
     uint64_t GetFrameNumber() const { return m_frameNumber; }
     uint64_t GetSafeFrameNumber() const { return m_safeFrameNumber; }

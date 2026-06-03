@@ -3,7 +3,10 @@
 
 #include "NativeWindow_Win32.h"
 
+#include <shellapi.h>
+#include <string>
 #include <utility>
+#include <vector>
 #include <windowsx.h>
 
 namespace
@@ -56,6 +59,18 @@ uint32_t DecodeSurrogatePair(uint16_t high, uint16_t low)
     return 0x10000u + ((static_cast<uint32_t>(high) - 0xD800u) << 10) +
         (static_cast<uint32_t>(low) - 0xDC00u);
 }
+
+std::string WideToUtf8(const wchar_t* text)
+{
+    if (!text)
+        return {};
+    const int needed = WideCharToMultiByte(CP_UTF8, 0, text, -1, nullptr, 0, nullptr, nullptr);
+    if (needed <= 1)
+        return {};
+    std::string out(static_cast<size_t>(needed - 1), '\0');
+    WideCharToMultiByte(CP_UTF8, 0, text, -1, out.data(), needed, nullptr, nullptr);
+    return out;
+}
 }
 
 bool NativeWindow_Win32::Create(HINSTANCE instance, const char* title, uint32_t width, uint32_t height)
@@ -97,6 +112,7 @@ bool NativeWindow_Win32::Create(HINSTANCE instance, const char* title, uint32_t 
 
     ShowWindow(m_hwnd, SW_SHOW);
     UpdateWindow(m_hwnd);
+    DragAcceptFiles(m_hwnd, TRUE);
 
     RECT client{};
     if (GetClientRect(m_hwnd, &client))
@@ -112,6 +128,7 @@ void NativeWindow_Win32::Destroy()
 {
     if (m_hwnd)
     {
+        DragAcceptFiles(m_hwnd, FALSE);
         DestroyWindow(m_hwnd);
         m_hwnd = nullptr;
     }
@@ -142,6 +159,11 @@ void NativeWindow_Win32::SetInputCallback(InputCallback cb)
     m_inputCallback = std::move(cb);
 }
 
+void NativeWindow_Win32::SetFileDropCallback(FileDropCallback cb)
+{
+    m_fileDropCallback = std::move(cb);
+}
+
 bool NativeWindow_Win32::ConsumeResize(uint32_t& width, uint32_t& height)
 {
     if (!m_resizePending)
@@ -166,6 +188,12 @@ void NativeWindow_Win32::DispatchInput(const InputEvent& event)
 {
     if (m_inputCallback)
         m_inputCallback(event);
+}
+
+void NativeWindow_Win32::DispatchFileDrop(const std::vector<std::string>& paths)
+{
+    if (m_fileDropCallback)
+        m_fileDropCallback(paths);
 }
 
 LRESULT CALLBACK NativeWindow_Win32::StaticWndProc(HWND hwnd, UINT message, WPARAM wParam, LPARAM lParam)
@@ -201,6 +229,24 @@ LRESULT NativeWindow_Win32::WndProc(HWND hwnd, UINT message, WPARAM wParam, LPAR
         PAINTSTRUCT paint{};
         BeginPaint(hwnd, &paint);
         EndPaint(hwnd, &paint);
+        return 0;
+    }
+
+    case WM_DROPFILES:
+    {
+        HDROP drop = reinterpret_cast<HDROP>(wParam);
+        const UINT count = DragQueryFileW(drop, 0xFFFFFFFF, nullptr, 0);
+        std::vector<std::string> paths;
+        paths.reserve(count);
+        for (UINT i = 0; i < count; ++i)
+        {
+            const UINT length = DragQueryFileW(drop, i, nullptr, 0);
+            std::wstring path(static_cast<size_t>(length) + 1u, L'\0');
+            DragQueryFileW(drop, i, path.data(), length + 1);
+            paths.push_back(WideToUtf8(path.c_str()));
+        }
+        DragFinish(drop);
+        DispatchFileDrop(paths);
         return 0;
     }
 

@@ -8,6 +8,7 @@
 #include <cstdint>
 #include <functional>
 #include <memory>
+#include <array>
 #include <string>
 #include <vector>
 
@@ -57,8 +58,18 @@ public:
     void ToggleInGameMenu();
     bool LoadMapEditorView(uint32_t width, uint32_t height);
     void ToggleMapEditor();
+    void ClearKeyboardFocus();
+    bool IsTextInputFocused() const;
     MapEditorSettings GetMapEditorSettings() const;
     MapEditorCommands ConsumeMapEditorCommands();
+    LightingState GetLightingState() const;
+    WaterConfig GetWaterConfig() const;
+    void SetDynamicLightEditorState(const DynamicLightEditorState& state);
+    void InitializeAssetLibrary(const std::string& mapDirectory,
+                                const std::array<MapEditorPaletteSlot, 8>& defaultSlots);
+    std::array<MapEditorPaletteSlot, 8> GetPaletteSlots() const;
+    void SetEditorStatus(const std::string& status);
+    void ImportDroppedFiles(const std::vector<std::string>& paths);
     void SetQuitCallback(std::function<void()> callback);
     void SetClientSession(client::net::ClientSession* session);
     bool OnInput(const InputEvent& event);

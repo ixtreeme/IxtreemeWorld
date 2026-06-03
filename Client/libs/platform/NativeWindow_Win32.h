@@ -14,6 +14,7 @@ public:
     bool ConsumeResize(uint32_t& width, uint32_t& height) override;
     void RequestClose() override;
     void SetInputCallback(InputCallback cb) override;
+    void SetFileDropCallback(FileDropCallback cb) override;
     uint32_t GetWidth() const override { return m_width; }
     uint32_t GetHeight() const override { return m_height; }
     VkResult CreateVulkanSurface(VkInstance instance, VkSurfaceKHR* outSurface) override;
@@ -25,6 +26,7 @@ private:
     static LRESULT CALLBACK StaticWndProc(HWND hwnd, UINT message, WPARAM wParam, LPARAM lParam);
     LRESULT WndProc(HWND hwnd, UINT message, WPARAM wParam, LPARAM lParam);
     void DispatchInput(const InputEvent& event);
+    void DispatchFileDrop(const std::vector<std::string>& paths);
 
     HINSTANCE m_instance = nullptr;
     HWND m_hwnd = nullptr;
@@ -33,4 +35,5 @@ private:
     bool m_resizePending = false;
     uint16_t m_pendingHighSurrogate = 0;
     InputCallback m_inputCallback;
+    FileDropCallback m_fileDropCallback;
 };
