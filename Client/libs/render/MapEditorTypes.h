@@ -3,6 +3,7 @@
 #include <cstdint>
 #include <array>
 #include <string>
+#include <vector>
 
 enum class MapEditorTool
 {
@@ -158,6 +159,19 @@ struct WaterConfig
     float causticScale = 0.3f;
     float causticSpeed = 0.5f;
     float causticMaxDepth = 8.0f;
+};
+
+struct WaterBody
+{
+    std::uint32_t id = 0;
+    std::string name;
+    float bboxMin[2] = {0.0f, 0.0f};
+    float bboxMax[2] = {0.0f, 0.0f};
+    float waterLevelY = 0.0f;
+    std::uint32_t maskWidth = 0;
+    std::uint32_t maskHeight = 0;
+    std::vector<std::uint8_t> shapeMask;
+    WaterConfig config;
 };
 
 enum class DynamicLightType

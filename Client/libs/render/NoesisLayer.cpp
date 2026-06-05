@@ -5419,7 +5419,7 @@ struct NoesisLayer::Impl
             return;
         }
 
-        clientSession->Connect("127.0.0.1", 11000);
+        clientSession->Connect("159.195.56.82", 11000);
         SetStatus("Connecting...");
     }
 

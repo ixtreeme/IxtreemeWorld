@@ -197,6 +197,16 @@ private:
         VkImageLayout colorLayout = VK_IMAGE_LAYOUT_UNDEFINED;
     };
 
+    struct WaterBodyGpu
+    {
+        WaterBody body;
+        Buffer vertexBuffer;
+        Buffer indexBuffer;
+        std::array<Buffer, kFramesInFlight> uniformBuffers{};
+        std::array<VkDescriptorSet, kFramesInFlight> descriptorSets{};
+        uint32_t indexCount = 0;
+    };
+
     struct DebugDrawRange
     {
         uint32_t indexOffset = 0;
@@ -246,11 +256,21 @@ private:
     void DestroyPipeline();
     bool CreateWaterResources(VulkanDevice& device);
     bool CreateWaterMesh(VulkanDevice& device);
+    bool LoadWaterBodies(VulkanDevice& device, const std::string& mapDirectory);
+    bool CreateWaterBodyMesh(VulkanDevice& device, WaterBodyGpu& waterBody);
+    bool CreateWaterBodyUniformBuffers(VulkanDevice& device, WaterBodyGpu& waterBody);
+    bool AllocateWaterDescriptorSets(const std::array<Buffer, kFramesInFlight>& uniformBuffers,
+                                     std::array<VkDescriptorSet, kFramesInFlight>& descriptorSets);
     bool CreateWaterNormalTextures(VulkanDevice& device);
     bool CreateWaterDescriptors();
     void UpdateWaterDescriptors();
+    void WriteWaterDescriptorSets(const std::array<Buffer, kFramesInFlight>& uniformBuffers,
+                                  const std::array<VkDescriptorSet, kFramesInFlight>& descriptorSets);
     bool CreateWaterPipeline(VulkanDevice& device);
     bool CreateOrRecreateWaterReflectionResources(VulkanDevice& device, bool force);
+    bool CreateOrRecreateWaterReflectionResources(VulkanDevice& device,
+                                                  bool force,
+                                                  WaterConfig::ReflectionQuality quality);
     bool CreateWaterReflectionPipeline(VulkanDevice& device);
     void DestroyWaterReflectionResources();
     void DestroyWaterReflectionPipeline();
@@ -261,9 +281,24 @@ private:
                             VkPipelineLayout pipelineLayout,
                             bool includeDebug);
     WorldCamera ComputeMirrorCamera(const WorldCamera& camera, VkExtent2D extent) const;
+    WorldCamera ComputeMirrorCamera(const WorldCamera& camera, VkExtent2D extent, float waterLevelY) const;
+    const WaterBodyGpu* FindClosestWaterBody(const WorldCamera& camera, float* outDistanceMeters = nullptr) const;
     void DestroyWaterResources();
+    void DestroyWaterBodyResources();
+    void DestroyWaterBodyResources(WaterBodyGpu& waterBody);
     void DestroyWaterPipeline();
     void UpdateWaterUniform(uint32_t frameIndex, const WorldCamera& camera, double timeSeconds);
+    void UpdateWaterBodyUniform(uint32_t frameIndex,
+                                const WorldCamera& camera,
+                                double timeSeconds,
+                                WaterBodyGpu& waterBody,
+                                bool reflectionTarget);
+    WaterUniformBlock BuildWaterUniform(const WorldCamera& camera,
+                                        double timeSeconds,
+                                        const WaterConfig& water,
+                                        float waterLevelY,
+                                        bool reflectionTarget) const;
+    void UploadWaterUniform(Buffer& buffer, const WaterUniformBlock& uniform);
     void DestroyBuffer(Buffer& buffer);
     void DestroyTexture(Texture& texture);
     void DestroyTerrainLayers();
@@ -357,6 +392,7 @@ private:
     uint32_t m_logicDebugIndexOffset = 0;
     uint32_t m_logicDebugIndexCount = 0;
     uint32_t m_waterIndexCount = 0;
+    std::vector<WaterBodyGpu> m_waterBodies;
     std::vector<DebugDrawRange> m_zoneFillDebugRanges;
     std::vector<DebugDrawRange> m_zoneBorderDebugRanges;
     std::vector<DebugDrawRange> m_zoneLabelDebugRanges;
@@ -400,7 +436,9 @@ private:
     LightingState m_lightingState;
     WaterConfig m_waterConfig;
     float m_waterMeshLevelY = std::numeric_limits<float>::quiet_NaN();
+    float m_reflectionClipWaterLevelY = std::numeric_limits<float>::quiet_NaN();
     double m_latestWaterTimeSeconds = 0.0;
+    double m_lastWaterDiagTimeSeconds = -1000.0;
     std::array<MapEditorPaletteSlot, 8> m_paletteSlots{};
     std::string m_loadedMapDirectory;
     int32_t m_loadedServerX = 0;

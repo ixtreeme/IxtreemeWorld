@@ -8,7 +8,7 @@ if(NOT DEFINED VCPKG_ROOT)
     elseif(WIN32)
         set(VCPKG_ROOT "C:/vcpkg")
     else()
-        set(VCPKG_ROOT "${CMAKE_SOURCE_DIR}/vcpkg")
+        set(VCPKG_ROOT "/IxtreemeWorld/vcpkg")
     endif()
 endif()
 

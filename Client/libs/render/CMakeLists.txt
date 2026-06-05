@@ -12,6 +12,8 @@ add_library(client_render STATIC
     OffscreenSceneRenderer.h
     TerrainRenderer.cpp
     TerrainRenderer.h
+    WaterBodyIO.cpp
+    WaterBodyIO.h
     WarriorRenderer.cpp
     WarriorRenderer.h
     WorldCamera.h

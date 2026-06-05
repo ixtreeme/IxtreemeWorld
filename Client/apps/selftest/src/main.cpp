@@ -1,6 +1,7 @@
 #include "ClientSession.h"
 #include "AssetLibrary.h"
 #include "MapEditorTypes.h"
+#include "WaterBodyIO.h"
 
 #include <algorithm>
 #include <chrono>
@@ -9,6 +10,7 @@
 #include <filesystem>
 #include <fstream>
 #include <iostream>
+#include <iterator>
 #include <optional>
 #include <sstream>
 #include <string>
@@ -515,6 +517,55 @@ bool RunRenderChecks(const Options& options, TestContext& ctx)
             water.causticMaxDepth > 0.0f,
         "water foam caustic defaults sane", "Water foam/caustic defaults are invalid");
 
+    const std::filesystem::path terrainRendererPath = options.clientRoot / "libs" / "render" / "TerrainRenderer.cpp";
+    std::ifstream terrainRenderer(terrainRendererPath);
+    std::stringstream terrainRendererText;
+    terrainRendererText << terrainRenderer.rdbuf();
+    const std::string terrainRendererSource = terrainRendererText.str();
+    const std::filesystem::path waterBodyIoPath = options.clientRoot / "libs" / "render" / "WaterBodyIO.h";
+    std::ifstream waterBodyIo(waterBodyIoPath);
+    std::stringstream waterBodyIoText;
+    waterBodyIoText << waterBodyIo.rdbuf();
+    const std::string waterBodyIoSource = waterBodyIoText.str();
+    ctx.Expect(terrainRendererSource.find("LoadWaterBodies") != std::string::npos &&
+            terrainRendererSource.find("m_waterBodies") != std::string::npos &&
+            terrainRendererSource.find("CreateWaterBodyMesh") != std::string::npos &&
+            terrainRendererSource.find("client::render::kWaterBodiesFilename") != std::string::npos &&
+            waterBodyIoSource.find("water_bodies.mxwater") != std::string::npos,
+        "water object renderer source", "TerrainRenderer is missing object-level water loading or mesh generation");
+    ctx.Expect(terrainRendererSource.find("UpdateWaterBodyUniform") != std::string::npos &&
+            terrainRendererSource.find("waterBody.descriptorSets") != std::string::npos,
+        "water object per-body UBO source", "Object water must use per-body uniform buffers/descriptors");
+    ctx.Expect(terrainRendererSource.find("FindClosestWaterBody") != std::string::npos &&
+            terrainRendererSource.find("reflectionTargetDistance") != std::string::npos &&
+            terrainRendererSource.find("reflection_target=id=") != std::string::npos,
+        "water object closest reflection target source", "WATER-OBJ-2 closest-body reflection selection is missing");
+    ctx.Expect(terrainRendererSource.find("ComputeMirrorCamera(camera, {m_waterReflection.width, m_waterReflection.height}, reflectionWaterLevelY)") != std::string::npos &&
+            terrainRendererSource.find("m_reflectionClipWaterLevelY = reflectionWaterLevelY") != std::string::npos,
+        "water object reflection uses body level", "Reflection pass must mirror and clip at the selected water body's level");
+    ctx.Expect(terrainRendererSource.find("BuildWaterUniform(camera, timeSeconds, waterBody.body.config, waterBody.body.waterLevelY, reflectionTarget)") != std::string::npos &&
+            terrainRendererSource.find("reflectionTarget && water.reflectionEnabled") != std::string::npos,
+        "water object reflection flag override", "Only the selected water body should sample the reflection texture");
+
+    const std::filesystem::path waterScratch = (options.scratchRoot.empty() ? MakeDefaultScratchRoot() : options.scratchRoot) / "water_obj";
+    const std::filesystem::path waterFile = waterScratch / client::render::kWaterBodiesFilename;
+    const auto waterBodies = client::render::CreateWaterBodyTestSet();
+    std::string waterError;
+    ctx.Expect(waterBodies.size() == 3 && waterBodies[0].maskWidth > 0 && !waterBodies[0].shapeMask.empty(),
+        "water object test fixtures", "CreateWaterBodyTestSet did not create valid fixtures");
+    if (ctx.Expect(client::render::SaveWaterBodiesBinary(waterFile, waterBodies, &waterError),
+            "water object sidecar write", waterError))
+    {
+        std::ifstream in(waterFile, std::ios::binary);
+        std::vector<std::uint8_t> bytes((std::istreambuf_iterator<char>(in)), std::istreambuf_iterator<char>());
+        std::vector<WaterBody> loadedBodies;
+        ctx.Expect(client::render::LoadWaterBodiesBinary(bytes, loadedBodies, &waterError) &&
+                loadedBodies.size() == waterBodies.size() &&
+                loadedBodies[1].waterLevelY == waterBodies[1].waterLevelY &&
+                loadedBodies[2].shapeMask == waterBodies[2].shapeMask,
+            "water object sidecar roundtrip", waterError.empty() ? "roundtrip mismatch" : waterError);
+    }
+
     return ctx.failed == 0;
 }
 
@@ -724,7 +775,7 @@ private:
     Phase phase = Phase::LoginConnect;
     std::string failure;
     std::vector<std::uint8_t> token;
-    std::string gameHost = "127.0.0.1";
+    std::string gameHost = "159.195.56.82";
     std::uint16_t gamePort = 11020;
     bool handoffDisconnectExpected = false;
     int spawns = 0;

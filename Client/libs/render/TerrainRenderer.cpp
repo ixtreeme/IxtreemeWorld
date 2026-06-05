@@ -1,6 +1,7 @@
 #include "TerrainRenderer.h"
 
 #include "Debug.h"
+#include "WaterBodyIO.h"
 #include "asset/IAssetReader.h"
 #include "map/MapData.h"
 
@@ -32,6 +33,8 @@
 
 namespace
 {
+constexpr uint32_t kMaxWaterBodyDraws = 64;
+
 const char* VkResultName(VkResult result)
 {
     switch (result)
@@ -1374,11 +1377,13 @@ bool TerrainRenderer::LoadMap(VulkanDevice& device, const std::string& mapDirect
         const bool flat = CreateFlatBuffers(device);
         if (flat)
             CreateWaterMesh(device);
+        LoadWaterBodies(device, mapDirectory);
         CreateDescriptors();
         return flat;
     }
 
     CreateWaterMesh(device);
+    LoadWaterBodies(device, mapDirectory);
     CreateDescriptors();
     return true;
 }
@@ -1570,7 +1575,12 @@ void TerrainRenderer::RenderSunShadowMap(VulkanDevice& device, const WorldCamera
 
 WorldCamera TerrainRenderer::ComputeMirrorCamera(const WorldCamera& camera, VkExtent2D extent) const
 {
-    const float waterY = m_waterConfig.waterLevelY;
+    return ComputeMirrorCamera(camera, extent, m_waterConfig.waterLevelY);
+}
+
+WorldCamera TerrainRenderer::ComputeMirrorCamera(const WorldCamera& camera, VkExtent2D extent, float waterLevelY) const
+{
+    const float waterY = waterLevelY;
     WorldCamera mirror{};
     mirror.eye = {camera.eye.x, 2.0f * waterY - camera.eye.y, camera.eye.z};
     mirror.target = {camera.target.x, 2.0f * waterY - camera.target.y, camera.target.z};
@@ -1583,12 +1593,70 @@ WorldCamera TerrainRenderer::ComputeMirrorCamera(const WorldCamera& camera, VkEx
     return mirror;
 }
 
+const TerrainRenderer::WaterBodyGpu* TerrainRenderer::FindClosestWaterBody(const WorldCamera& camera,
+                                                                           float* outDistanceMeters) const
+{
+    const WaterBodyGpu* closest = nullptr;
+    float closestDistanceSq = std::numeric_limits<float>::max();
+    for (const WaterBodyGpu& waterBody : m_waterBodies)
+    {
+        if (!waterBody.body.config.enabled || waterBody.indexCount == 0)
+            continue;
+
+        const float centerX = (waterBody.body.bboxMin[0] + waterBody.body.bboxMax[0]) * 0.5f;
+        const float centerZ = (waterBody.body.bboxMin[1] + waterBody.body.bboxMax[1]) * 0.5f;
+        const float dx = camera.eye.x - centerX;
+        const float dz = camera.eye.z - centerZ;
+        const float distanceSq = dx * dx + dz * dz;
+        if (distanceSq < closestDistanceSq)
+        {
+            closestDistanceSq = distanceSq;
+            closest = &waterBody;
+        }
+    }
+
+    if (outDistanceMeters)
+        *outDistanceMeters = closest ? std::sqrt(closestDistanceSq) : 0.0f;
+    return closest;
+}
+
 void TerrainRenderer::RenderWaterReflection(VulkanDevice& device,
     const WorldCamera& camera,
-    double,
+    double timeSeconds,
     const std::function<void(const WorldCamera&, VkExtent2D, VkRenderPass)>& renderEntities)
 {
-    if (!m_waterConfig.enabled || !m_waterConfig.reflectionEnabled || !m_waterReflectionPipeline ||
+    const WaterBodyGpu* reflectionBody = nullptr;
+    float reflectionDistanceMeters = 0.0f;
+    WaterConfig reflectionConfig = m_waterConfig;
+    float reflectionWaterLevelY = m_waterConfig.waterLevelY;
+    if (!m_waterBodies.empty())
+    {
+        reflectionBody = FindClosestWaterBody(camera, &reflectionDistanceMeters);
+        if (!reflectionBody || !reflectionBody->body.config.reflectionEnabled)
+        {
+            if (timeSeconds - m_lastWaterDiagTimeSeconds >= 1.0)
+            {
+                if (reflectionBody)
+                {
+                    Tracenf("[WATER-OBJ] diag: bodies=%zu reflection_target=id=%u name=\"%s\" distance=%.1fm reflection=disabled",
+                        m_waterBodies.size(),
+                        reflectionBody->body.id,
+                        reflectionBody->body.name.c_str(),
+                        reflectionDistanceMeters);
+                }
+                else
+                {
+                    Tracenf("[WATER-OBJ] diag: bodies=%zu reflection_target=<none>", m_waterBodies.size());
+                }
+                m_lastWaterDiagTimeSeconds = timeSeconds;
+            }
+            return;
+        }
+        reflectionConfig = reflectionBody->body.config;
+        reflectionWaterLevelY = reflectionBody->body.waterLevelY;
+    }
+
+    if (!reflectionConfig.enabled || !reflectionConfig.reflectionEnabled || !m_waterReflectionPipeline ||
         !m_waterReflection.framebuffer || !m_indexCount || !device.IsFrameActive())
         return;
 
@@ -1596,11 +1664,11 @@ void TerrainRenderer::RenderWaterReflection(VulkanDevice& device,
     if (swapExtent.width == 0 || swapExtent.height == 0)
         return;
 
-    if (m_waterReflection.quality != m_waterConfig.reflectionQuality ||
+    if (m_waterReflection.quality != reflectionConfig.reflectionQuality ||
         m_waterReflection.width == 0 || m_waterReflection.height == 0 ||
         m_waterReflection.width > swapExtent.width || m_waterReflection.height > swapExtent.height)
     {
-        CreateOrRecreateWaterReflectionResources(device, true);
+        CreateOrRecreateWaterReflectionResources(device, true, reflectionConfig.reflectionQuality);
         CreateWaterReflectionPipeline(device);
         UpdateWaterDescriptors();
     }
@@ -1609,7 +1677,8 @@ void TerrainRenderer::RenderWaterReflection(VulkanDevice& device,
         return;
 
     const uint32_t frameIndex = device.GetFrameIndex();
-    const WorldCamera mirror = ComputeMirrorCamera(camera, {m_waterReflection.width, m_waterReflection.height});
+    const WorldCamera mirror = ComputeMirrorCamera(camera, {m_waterReflection.width, m_waterReflection.height}, reflectionWaterLevelY);
+    m_reflectionClipWaterLevelY = reflectionWaterLevelY;
     UpdateUniform(frameIndex, mirror, true);
 
     VkCommandBuffer cmd = device.GetCommandBuffer();
@@ -1680,6 +1749,8 @@ void TerrainRenderer::RenderWaterReflection(VulkanDevice& device,
         renderEntities(mirror, {m_waterReflection.width, m_waterReflection.height}, m_waterReflection.renderPass);
 
     vkCmdEndRenderPass(cmd);
+
+    m_reflectionClipWaterLevelY = std::numeric_limits<float>::quiet_NaN();
 }
 
 void TerrainRenderer::Render(VulkanDevice& device, const WorldCamera& camera)
@@ -1805,7 +1876,9 @@ void TerrainRenderer::Render(VulkanDevice& device, const WorldCamera& camera)
 void TerrainRenderer::RenderWater(VulkanDevice& device, const WorldCamera& camera, double timeSeconds)
 {
     m_latestWaterTimeSeconds = timeSeconds;
-    if (!m_waterConfig.enabled || !m_waterPipeline || !m_waterIndexCount || !device.IsFrameActive())
+    const bool useWaterBodies = !m_waterBodies.empty();
+    if ((!useWaterBodies && (!m_waterConfig.enabled || !m_waterIndexCount)) ||
+        !m_waterPipeline || !device.IsFrameActive())
         return;
 
     const VkExtent2D extent = device.GetSwapchainExtent();
@@ -1813,12 +1886,31 @@ void TerrainRenderer::RenderWater(VulkanDevice& device, const WorldCamera& camer
         return;
 
     const uint32_t frameIndex = device.GetFrameIndex();
-    if (std::abs(m_waterMeshLevelY - m_waterConfig.waterLevelY) > 0.001f &&
+    if (!useWaterBodies &&
+        std::abs(m_waterMeshLevelY - m_waterConfig.waterLevelY) > 0.001f &&
         !CreateWaterMesh(device))
     {
         return;
     }
-    UpdateWaterUniform(frameIndex, camera, timeSeconds);
+    float reflectionTargetDistance = 0.0f;
+    const WaterBodyGpu* reflectionTarget = useWaterBodies ? FindClosestWaterBody(camera, &reflectionTargetDistance) : nullptr;
+    if (useWaterBodies && timeSeconds - m_lastWaterDiagTimeSeconds >= 1.0)
+    {
+        if (reflectionTarget)
+        {
+            Tracenf("[WATER-OBJ] diag: bodies=%zu reflection_target=id=%u name=\"%s\" distance=%.1fm reflection=%s",
+                m_waterBodies.size(),
+                reflectionTarget->body.id,
+                reflectionTarget->body.name.c_str(),
+                reflectionTargetDistance,
+                reflectionTarget->body.config.reflectionEnabled ? "enabled" : "disabled");
+        }
+        else
+        {
+            Tracenf("[WATER-OBJ] diag: bodies=%zu reflection_target=<none>", m_waterBodies.size());
+        }
+        m_lastWaterDiagTimeSeconds = timeSeconds;
+    }
 
     VkCommandBuffer cmd = device.GetCommandBuffer();
     VkViewport viewport{};
@@ -1835,11 +1927,34 @@ void TerrainRenderer::RenderWater(VulkanDevice& device, const WorldCamera& camer
     vkCmdBindPipeline(cmd, VK_PIPELINE_BIND_POINT_GRAPHICS, m_waterPipeline);
 
     VkDeviceSize offset = 0;
-    vkCmdBindVertexBuffers(cmd, 0, 1, &m_waterVertexBuffer.buffer, &offset);
-    vkCmdBindIndexBuffer(cmd, m_waterIndexBuffer.buffer, 0, VK_INDEX_TYPE_UINT32);
-    vkCmdBindDescriptorSets(cmd, VK_PIPELINE_BIND_POINT_GRAPHICS, m_waterPipelineLayout,
-        0, 1, &m_waterDescriptorSets[frameIndex], 0, nullptr);
-    vkCmdDrawIndexed(cmd, m_waterIndexCount, 1, 0, 0, 0);
+    if (useWaterBodies)
+    {
+        for (WaterBodyGpu& waterBody : m_waterBodies)
+        {
+            if (!waterBody.body.config.enabled || !waterBody.indexCount ||
+                !waterBody.vertexBuffer.buffer || !waterBody.indexBuffer.buffer ||
+                !waterBody.descriptorSets[frameIndex])
+            {
+                continue;
+            }
+            const bool isReflectionTarget = (&waterBody == reflectionTarget);
+            UpdateWaterBodyUniform(frameIndex, camera, timeSeconds, waterBody, isReflectionTarget);
+            vkCmdBindVertexBuffers(cmd, 0, 1, &waterBody.vertexBuffer.buffer, &offset);
+            vkCmdBindIndexBuffer(cmd, waterBody.indexBuffer.buffer, 0, VK_INDEX_TYPE_UINT32);
+            vkCmdBindDescriptorSets(cmd, VK_PIPELINE_BIND_POINT_GRAPHICS, m_waterPipelineLayout,
+                0, 1, &waterBody.descriptorSets[frameIndex], 0, nullptr);
+            vkCmdDrawIndexed(cmd, waterBody.indexCount, 1, 0, 0, 0);
+        }
+    }
+    else
+    {
+        UpdateWaterUniform(frameIndex, camera, timeSeconds);
+        vkCmdBindVertexBuffers(cmd, 0, 1, &m_waterVertexBuffer.buffer, &offset);
+        vkCmdBindIndexBuffer(cmd, m_waterIndexBuffer.buffer, 0, VK_INDEX_TYPE_UINT32);
+        vkCmdBindDescriptorSets(cmd, VK_PIPELINE_BIND_POINT_GRAPHICS, m_waterPipelineLayout,
+            0, 1, &m_waterDescriptorSets[frameIndex], 0, nullptr);
+        vkCmdDrawIndexed(cmd, m_waterIndexCount, 1, 0, 0, 0);
+    }
 }
 
 void TerrainRenderer::ToggleWalkabilityDebug()
@@ -4722,6 +4837,140 @@ bool TerrainRenderer::CreateWaterMesh(VulkanDevice& device)
     return created;
 }
 
+bool TerrainRenderer::LoadWaterBodies(VulkanDevice& device, const std::string& mapDirectory)
+{
+    DestroyWaterBodyResources();
+
+    if (!m_assets)
+        return false;
+
+    std::string normalizedRoot = mapDirectory;
+    std::replace(normalizedRoot.begin(), normalizedRoot.end(), '\\', '/');
+    while (!normalizedRoot.empty() && normalizedRoot.back() == '/')
+        normalizedRoot.pop_back();
+    const std::string waterPath = normalizedRoot + "/" + client::render::kWaterBodiesFilename;
+    const auto bytes = m_assets->ReadAll(waterPath);
+    if (!bytes)
+    {
+        Tracen("[WATER-OBJ] no object water file; using global water fallback");
+        if (m_waterDescriptorPool)
+            CreateWaterDescriptors();
+        return true;
+    }
+
+    std::vector<WaterBody> bodies;
+    std::string error;
+    if (!client::render::LoadWaterBodiesBinary(*bytes, bodies, &error))
+    {
+        Tracenf("[WATER-OBJ] failed to parse %s: %s", waterPath.c_str(), error.c_str());
+        if (m_waterDescriptorPool)
+            CreateWaterDescriptors();
+        return false;
+    }
+
+    if (bodies.size() > kMaxWaterBodyDraws)
+    {
+        Tracenf("[WATER-OBJ] water body count %zu exceeds renderer cap %u", bodies.size(), kMaxWaterBodyDraws);
+        bodies.resize(kMaxWaterBodyDraws);
+    }
+
+    m_waterBodies.reserve(bodies.size());
+    for (WaterBody& body : bodies)
+    {
+        WaterBodyGpu gpu;
+        gpu.body = std::move(body);
+        gpu.body.config.waterLevelY = gpu.body.waterLevelY;
+        if (!CreateWaterBodyUniformBuffers(device, gpu) || !CreateWaterBodyMesh(device, gpu))
+        {
+            DestroyWaterBodyResources(gpu);
+            Tracen("[WATER-OBJ] skipped invalid water body");
+            continue;
+        }
+        Tracenf("[WATER-OBJ] loaded body id=%u name=%s level=%.2f quads=%u",
+            gpu.body.id,
+            gpu.body.name.c_str(),
+            gpu.body.waterLevelY,
+            gpu.indexCount / 6u);
+        m_waterBodies.push_back(std::move(gpu));
+    }
+
+    if (m_waterDescriptorPool)
+        CreateWaterDescriptors();
+
+    Tracenf("[WATER-OBJ] active water bodies: %zu", m_waterBodies.size());
+    return true;
+}
+
+bool TerrainRenderer::CreateWaterBodyUniformBuffers(VulkanDevice& device, WaterBodyGpu& waterBody)
+{
+    for (Buffer& buffer : waterBody.uniformBuffers)
+    {
+        DestroyBuffer(buffer);
+        CreateHostVisibleBuffer(device, m_device, sizeof(WaterUniformBlock),
+            VK_BUFFER_USAGE_UNIFORM_BUFFER_BIT, nullptr, buffer);
+        if (!buffer.buffer || !buffer.memory)
+            return false;
+    }
+    return true;
+}
+
+bool TerrainRenderer::CreateWaterBodyMesh(VulkanDevice& device, WaterBodyGpu& waterBody)
+{
+    DestroyBuffer(waterBody.vertexBuffer);
+    DestroyBuffer(waterBody.indexBuffer);
+    waterBody.indexCount = 0;
+
+    const WaterBody& body = waterBody.body;
+    const std::size_t pixelCount = static_cast<std::size_t>(body.maskWidth) * body.maskHeight;
+    if (body.maskWidth == 0 || body.maskHeight == 0 || body.shapeMask.size() != pixelCount ||
+        body.bboxMax[0] <= body.bboxMin[0] || body.bboxMax[1] <= body.bboxMin[1])
+    {
+        return false;
+    }
+
+    std::vector<WaterVertex> vertices;
+    std::vector<uint32_t> indices;
+    vertices.reserve(pixelCount * 4u);
+    indices.reserve(pixelCount * 6u);
+
+    const float cellX = (body.bboxMax[0] - body.bboxMin[0]) / static_cast<float>(body.maskWidth);
+    const float cellZ = (body.bboxMax[1] - body.bboxMin[1]) / static_cast<float>(body.maskHeight);
+    for (std::uint32_t y = 0; y < body.maskHeight; ++y)
+    {
+        for (std::uint32_t x = 0; x < body.maskWidth; ++x)
+        {
+            const std::size_t maskIndex = static_cast<std::size_t>(y) * body.maskWidth + x;
+            if (body.shapeMask[maskIndex] == 0)
+                continue;
+
+            const float x0 = body.bboxMin[0] + static_cast<float>(x) * cellX;
+            const float x1 = x0 + cellX;
+            const float z0 = body.bboxMin[1] + static_cast<float>(y) * cellZ;
+            const float z1 = z0 + cellZ;
+            const float u0 = static_cast<float>(x) / static_cast<float>(body.maskWidth);
+            const float u1 = static_cast<float>(x + 1u) / static_cast<float>(body.maskWidth);
+            const float v0 = static_cast<float>(y) / static_cast<float>(body.maskHeight);
+            const float v1 = static_cast<float>(y + 1u) / static_cast<float>(body.maskHeight);
+            const uint32_t base = static_cast<uint32_t>(vertices.size());
+            vertices.push_back({{x0, body.waterLevelY, z0}, {u0, v0}});
+            vertices.push_back({{x1, body.waterLevelY, z0}, {u1, v0}});
+            vertices.push_back({{x1, body.waterLevelY, z1}, {u1, v1}});
+            vertices.push_back({{x0, body.waterLevelY, z1}, {u0, v1}});
+            indices.insert(indices.end(), {base, base + 1u, base + 2u, base, base + 2u, base + 3u});
+        }
+    }
+
+    if (indices.empty())
+        return false;
+
+    CreateHostVisibleBuffer(device, m_device, sizeof(WaterVertex) * vertices.size(),
+        VK_BUFFER_USAGE_VERTEX_BUFFER_BIT, vertices.data(), waterBody.vertexBuffer);
+    CreateHostVisibleBuffer(device, m_device, sizeof(uint32_t) * indices.size(),
+        VK_BUFFER_USAGE_INDEX_BUFFER_BIT, indices.data(), waterBody.indexBuffer);
+    waterBody.indexCount = static_cast<uint32_t>(indices.size());
+    return waterBody.vertexBuffer.buffer && waterBody.indexBuffer.buffer;
+}
+
 bool TerrainRenderer::CreateWaterNormalTextures(VulkanDevice& device)
 {
     constexpr uint32_t kSize = 128;
@@ -4773,19 +5022,39 @@ bool TerrainRenderer::CreateWaterDescriptors()
         vkDestroyDescriptorPool(m_device, m_waterDescriptorPool, nullptr);
     m_waterDescriptorPool = VK_NULL_HANDLE;
     m_waterDescriptorSets.fill(VK_NULL_HANDLE);
+    for (WaterBodyGpu& waterBody : m_waterBodies)
+        waterBody.descriptorSets.fill(VK_NULL_HANDLE);
 
     std::array<VkDescriptorPoolSize, 2> poolSizes{};
+    const uint32_t maxWaterSets = kFramesInFlight * (1u + kMaxWaterBodyDraws);
     poolSizes[0].type = VK_DESCRIPTOR_TYPE_UNIFORM_BUFFER;
-    poolSizes[0].descriptorCount = kFramesInFlight;
+    poolSizes[0].descriptorCount = maxWaterSets;
     poolSizes[1].type = VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER;
-    poolSizes[1].descriptorCount = kFramesInFlight * 5u;
+    poolSizes[1].descriptorCount = maxWaterSets * 5u;
 
     VkDescriptorPoolCreateInfo pool{};
     pool.sType = VK_STRUCTURE_TYPE_DESCRIPTOR_POOL_CREATE_INFO;
-    pool.maxSets = kFramesInFlight;
+    pool.maxSets = maxWaterSets;
     pool.poolSizeCount = static_cast<uint32_t>(poolSizes.size());
     pool.pPoolSizes = poolSizes.data();
     VK_CHECK(vkCreateDescriptorPool(m_device, &pool, nullptr, &m_waterDescriptorPool));
+
+    if (!AllocateWaterDescriptorSets(m_waterUniformBuffers, m_waterDescriptorSets))
+        return false;
+    for (WaterBodyGpu& waterBody : m_waterBodies)
+    {
+        if (!AllocateWaterDescriptorSets(waterBody.uniformBuffers, waterBody.descriptorSets))
+            return false;
+    }
+    UpdateWaterDescriptors();
+    return true;
+}
+
+bool TerrainRenderer::AllocateWaterDescriptorSets(const std::array<Buffer, kFramesInFlight>&,
+                                                  std::array<VkDescriptorSet, kFramesInFlight>& descriptorSets)
+{
+    if (!m_waterDescriptorPool || !m_waterDescriptorSetLayout)
+        return false;
 
     std::vector<VkDescriptorSetLayout> layouts(kFramesInFlight, m_waterDescriptorSetLayout);
     VkDescriptorSetAllocateInfo alloc{};
@@ -4793,23 +5062,18 @@ bool TerrainRenderer::CreateWaterDescriptors()
     alloc.descriptorPool = m_waterDescriptorPool;
     alloc.descriptorSetCount = kFramesInFlight;
     alloc.pSetLayouts = layouts.data();
-    VK_CHECK(vkAllocateDescriptorSets(m_device, &alloc, m_waterDescriptorSets.data()));
-    UpdateWaterDescriptors();
-    return true;
+    return vkAllocateDescriptorSets(m_device, &alloc, descriptorSets.data()) == VK_SUCCESS;
 }
 
-void TerrainRenderer::UpdateWaterDescriptors()
+void TerrainRenderer::WriteWaterDescriptorSets(const std::array<Buffer, kFramesInFlight>& uniformBuffers,
+                                               const std::array<VkDescriptorSet, kFramesInFlight>& descriptorSets)
 {
-    if (!m_waterDescriptorPool || !m_waterNormalSmall.view || !m_waterNormalLarge.view || !m_waterReflection.colorView)
-        return;
-
     for (uint32_t frame = 0; frame < kFramesInFlight; ++frame)
     {
-        if (!m_waterDescriptorSets[frame] || !m_waterUniformBuffers[frame].buffer)
+        if (!descriptorSets[frame] || !uniformBuffers[frame].buffer)
             continue;
-
         VkDescriptorBufferInfo bufferInfo{};
-        bufferInfo.buffer = m_waterUniformBuffers[frame].buffer;
+        bufferInfo.buffer = uniformBuffers[frame].buffer;
         bufferInfo.range = sizeof(WaterUniformBlock);
 
         VkDescriptorImageInfo smallInfo{};
@@ -4839,37 +5103,37 @@ void TerrainRenderer::UpdateWaterDescriptors()
 
         std::array<VkWriteDescriptorSet, 6> writes{};
         writes[0].sType = VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET;
-        writes[0].dstSet = m_waterDescriptorSets[frame];
+        writes[0].dstSet = descriptorSets[frame];
         writes[0].dstBinding = 0;
         writes[0].descriptorCount = 1;
         writes[0].descriptorType = VK_DESCRIPTOR_TYPE_UNIFORM_BUFFER;
         writes[0].pBufferInfo = &bufferInfo;
         writes[1].sType = VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET;
-        writes[1].dstSet = m_waterDescriptorSets[frame];
+        writes[1].dstSet = descriptorSets[frame];
         writes[1].dstBinding = 1;
         writes[1].descriptorCount = 1;
         writes[1].descriptorType = VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER;
         writes[1].pImageInfo = &smallInfo;
         writes[2].sType = VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET;
-        writes[2].dstSet = m_waterDescriptorSets[frame];
+        writes[2].dstSet = descriptorSets[frame];
         writes[2].dstBinding = 2;
         writes[2].descriptorCount = 1;
         writes[2].descriptorType = VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER;
         writes[2].pImageInfo = &largeInfo;
         writes[3].sType = VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET;
-        writes[3].dstSet = m_waterDescriptorSets[frame];
+        writes[3].dstSet = descriptorSets[frame];
         writes[3].dstBinding = 3;
         writes[3].descriptorCount = 1;
         writes[3].descriptorType = VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER;
         writes[3].pImageInfo = &reflectionInfo;
         writes[4].sType = VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET;
-        writes[4].dstSet = m_waterDescriptorSets[frame];
+        writes[4].dstSet = descriptorSets[frame];
         writes[4].dstBinding = 4;
         writes[4].descriptorCount = 1;
         writes[4].descriptorType = VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER;
         writes[4].pImageInfo = &sceneColorInfo;
         writes[5].sType = VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET;
-        writes[5].dstSet = m_waterDescriptorSets[frame];
+        writes[5].dstSet = descriptorSets[frame];
         writes[5].dstBinding = 5;
         writes[5].descriptorCount = 1;
         writes[5].descriptorType = VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER;
@@ -4878,14 +5142,31 @@ void TerrainRenderer::UpdateWaterDescriptors()
     }
 }
 
+void TerrainRenderer::UpdateWaterDescriptors()
+{
+    if (!m_waterDescriptorPool || !m_waterNormalSmall.view || !m_waterNormalLarge.view || !m_waterReflection.colorView)
+        return;
+
+    WriteWaterDescriptorSets(m_waterUniformBuffers, m_waterDescriptorSets);
+    for (WaterBodyGpu& waterBody : m_waterBodies)
+        WriteWaterDescriptorSets(waterBody.uniformBuffers, waterBody.descriptorSets);
+}
+
 bool TerrainRenderer::CreateOrRecreateWaterReflectionResources(VulkanDevice& device, bool force)
+{
+    return CreateOrRecreateWaterReflectionResources(device, force, m_waterConfig.reflectionQuality);
+}
+
+bool TerrainRenderer::CreateOrRecreateWaterReflectionResources(VulkanDevice& device,
+                                                               bool force,
+                                                               WaterConfig::ReflectionQuality quality)
 {
     const VkExtent2D swapExtent = device.GetSwapchainExtent();
     if (swapExtent.width == 0 || swapExtent.height == 0)
         return false;
 
     uint32_t divisor = 2;
-    switch (m_waterConfig.reflectionQuality)
+    switch (quality)
     {
     case WaterConfig::ReflectionQuality::Quarter: divisor = 4; break;
     case WaterConfig::ReflectionQuality::Half: divisor = 2; break;
@@ -4899,7 +5180,7 @@ bool TerrainRenderer::CreateOrRecreateWaterReflectionResources(VulkanDevice& dev
 
     if (!force && m_waterReflection.colorView && m_waterReflection.depthView &&
         m_waterReflection.width == width && m_waterReflection.height == height &&
-        m_waterReflection.quality == m_waterConfig.reflectionQuality &&
+        m_waterReflection.quality == quality &&
         m_waterReflection.colorFormat == colorFormat && m_waterReflection.depthFormat == depthFormat)
     {
         return true;
@@ -4918,7 +5199,7 @@ bool TerrainRenderer::CreateOrRecreateWaterReflectionResources(VulkanDevice& dev
 
     m_waterReflection.width = width;
     m_waterReflection.height = height;
-    m_waterReflection.quality = m_waterConfig.reflectionQuality;
+    m_waterReflection.quality = quality;
     m_waterReflection.colorFormat = colorFormat;
     m_waterReflection.depthFormat = depthFormat;
     m_waterReflection.colorLayout = VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL;
@@ -5579,6 +5860,7 @@ void TerrainRenderer::DestroyWaterResources()
         vkDestroyDescriptorSetLayout(m_device, m_waterDescriptorSetLayout, nullptr);
     m_waterDescriptorSetLayout = VK_NULL_HANDLE;
     m_waterDescriptorSets.fill(VK_NULL_HANDLE);
+    DestroyWaterBodyResources();
     DestroyBuffer(m_waterVertexBuffer);
     DestroyBuffer(m_waterIndexBuffer);
     for (Buffer& buffer : m_waterUniformBuffers)
@@ -5586,6 +5868,23 @@ void TerrainRenderer::DestroyWaterResources()
     DestroyTexture(m_waterNormalSmall);
     DestroyTexture(m_waterNormalLarge);
     m_waterIndexCount = 0;
+}
+
+void TerrainRenderer::DestroyWaterBodyResources()
+{
+    for (WaterBodyGpu& waterBody : m_waterBodies)
+        DestroyWaterBodyResources(waterBody);
+    m_waterBodies.clear();
+}
+
+void TerrainRenderer::DestroyWaterBodyResources(WaterBodyGpu& waterBody)
+{
+    DestroyBuffer(waterBody.vertexBuffer);
+    DestroyBuffer(waterBody.indexBuffer);
+    for (Buffer& buffer : waterBody.uniformBuffers)
+        DestroyBuffer(buffer);
+    waterBody.descriptorSets.fill(VK_NULL_HANDLE);
+    waterBody.indexCount = 0;
 }
 
 void TerrainRenderer::DestroyShadowPipeline()
@@ -5726,7 +6025,9 @@ void TerrainRenderer::UpdateUniform(uint32_t frameIndex, const WorldCamera& came
         uniform.numPointLights = 0;
         uniform.numSpotLights = 0;
         uniform.lightPadding[0] = 1.0f;
-        uniform.lightPadding[1] = m_waterConfig.waterLevelY;
+        uniform.lightPadding[1] = std::isfinite(m_reflectionClipWaterLevelY)
+            ? m_reflectionClipWaterLevelY
+            : m_waterConfig.waterLevelY;
     }
     else
     {
@@ -5856,4 +6157,120 @@ void TerrainRenderer::UpdateWaterUniform(uint32_t frameIndex, const WorldCamera&
     VK_CHECK(vkMapMemory(m_device, m_waterUniformBuffers[frameIndex].memory, 0, sizeof(uniform), 0, &mapped));
     std::memcpy(mapped, &uniform, sizeof(uniform));
     vkUnmapMemory(m_device, m_waterUniformBuffers[frameIndex].memory);
+}
+
+TerrainRenderer::WaterUniformBlock TerrainRenderer::BuildWaterUniform(const WorldCamera& camera,
+                                                                       double timeSeconds,
+                                                                       const WaterConfig& water,
+                                                                       float waterLevelY,
+                                                                       bool reflectionTarget) const
+{
+    WaterUniformBlock uniform{};
+    uniform.mvp = camera.viewProjection;
+    uniform.cameraPos[0] = camera.eye.x;
+    uniform.cameraPos[1] = camera.eye.y;
+    uniform.cameraPos[2] = camera.eye.z;
+    uniform.cameraPos[3] = 1.0f;
+
+    const DirectionalLight& directional = m_lightingState.directional;
+    const AmbientLight& ambient = m_lightingState.ambient;
+    const float azimuthRadians = std::clamp(directional.azimuthDegrees, 0.0f, 360.0f) * 3.1415926535f / 180.0f;
+    const float elevationRadians = std::clamp(directional.elevationDegrees, 0.0f, 90.0f) * 3.1415926535f / 180.0f;
+    const float cosElevation = std::cos(elevationRadians);
+    const float sunEnabled = directional.enabled ? 1.0f : 0.0f;
+    const float sunIntensity = std::max(0.0f, directional.intensity) * sunEnabled;
+    const float ambientIntensity = std::max(0.0f, ambient.intensity);
+    uniform.sunDir[0] = cosElevation * std::sin(azimuthRadians);
+    uniform.sunDir[1] = std::sin(elevationRadians);
+    uniform.sunDir[2] = cosElevation * std::cos(azimuthRadians);
+    uniform.sunDir[3] = 0.0f;
+    uniform.sunColor[0] = std::max(0.0f, directional.r) * sunIntensity;
+    uniform.sunColor[1] = std::max(0.0f, directional.g) * sunIntensity;
+    uniform.sunColor[2] = std::max(0.0f, directional.b) * sunIntensity;
+    uniform.sunColor[3] = 0.0f;
+    uniform.ambientColor[0] = std::max(0.0f, ambient.r) * ambientIntensity;
+    uniform.ambientColor[1] = std::max(0.0f, ambient.g) * ambientIntensity;
+    uniform.ambientColor[2] = std::max(0.0f, ambient.b) * ambientIntensity;
+    uniform.ambientColor[3] = 0.0f;
+
+    uniform.baseColor[0] = std::clamp(water.baseColor[0], 0.0f, 1.0f);
+    uniform.baseColor[1] = std::clamp(water.baseColor[1], 0.0f, 1.0f);
+    uniform.baseColor[2] = std::clamp(water.baseColor[2], 0.0f, 1.0f);
+    uniform.baseColor[3] = std::clamp(water.baseColor[3], 0.0f, 1.0f);
+    uniform.reflectionColor[0] = std::clamp(water.reflectionColor[0], 0.0f, 2.0f);
+    uniform.reflectionColor[1] = std::clamp(water.reflectionColor[1], 0.0f, 2.0f);
+    uniform.reflectionColor[2] = std::clamp(water.reflectionColor[2], 0.0f, 2.0f);
+    uniform.reflectionColor[3] = 1.0f;
+    uniform.waveParams1[0] = std::clamp(water.waveScaleSmall, 0.001f, 0.12f);
+    uniform.waveParams1[1] = std::clamp(water.waveScaleLarge, 0.001f, 0.08f);
+    uniform.waveParams1[2] = std::clamp(water.waveSpeedSmall, 0.0f, 0.5f);
+    uniform.waveParams1[3] = std::clamp(water.waveSpeedLarge, 0.0f, 0.5f);
+    uniform.waveParams2[0] = std::clamp(water.normalStrength, 0.0f, 2.0f);
+    uniform.waveParams2[1] = std::clamp(water.fresnelPower, 1.0f, 10.0f);
+    uniform.waveParams2[2] = std::clamp(water.fresnelMin, 0.0f, 0.5f);
+    uniform.waveParams2[3] = 0.0f;
+    uniform.levelTimeEnabled[0] = waterLevelY;
+    uniform.levelTimeEnabled[1] = static_cast<float>(timeSeconds);
+    uniform.levelTimeEnabled[2] = water.enabled ? 1.0f : 0.0f;
+    uniform.levelTimeEnabled[3] = 0.0f;
+    uniform.reflectionParams[0] = (reflectionTarget && water.reflectionEnabled && m_waterReflection.colorView) ? 1.0f : 0.0f;
+    uniform.reflectionParams[1] = std::clamp(water.reflectionDistortionStrength, 0.0f, 0.2f);
+    uniform.reflectionParams[2] = m_waterReflection.width > 0 ? static_cast<float>(m_waterReflection.width) : 1.0f;
+    uniform.reflectionParams[3] = m_waterReflection.height > 0 ? static_cast<float>(m_waterReflection.height) : 1.0f;
+    uniform.refractionParams[0] = (water.refractionEnabled && m_waterSceneColorView && m_waterSceneDepthView) ? 1.0f : 0.0f;
+    uniform.refractionParams[1] = std::clamp(water.refractionStrength, 0.0f, 0.1f);
+    uniform.refractionParams[2] = std::clamp(water.refractionDepthStrength, 0.0f, 2.0f);
+    uniform.refractionParams[3] = m_waterSceneExtent.width > 0 ? static_cast<float>(m_waterSceneExtent.width) : 1.0f;
+    uniform.shallowColor[0] = std::clamp(water.shallowColor[0], 0.0f, 2.0f);
+    uniform.shallowColor[1] = std::clamp(water.shallowColor[1], 0.0f, 2.0f);
+    uniform.shallowColor[2] = std::clamp(water.shallowColor[2], 0.0f, 2.0f);
+    uniform.shallowColor[3] = 1.0f;
+    uniform.deepColor[0] = std::clamp(water.deepColor[0], 0.0f, 2.0f);
+    uniform.deepColor[1] = std::clamp(water.deepColor[1], 0.0f, 2.0f);
+    uniform.deepColor[2] = std::clamp(water.deepColor[2], 0.0f, 2.0f);
+    uniform.deepColor[3] = 1.0f;
+    uniform.depthParams[0] = std::clamp(water.depthColorMin, 0.0f, 50.0f);
+    uniform.depthParams[1] = std::max(uniform.depthParams[0] + 0.001f, std::clamp(water.depthColorMax, 0.001f, 50.0f));
+    uniform.depthParams[2] = std::clamp(water.depthFadeDistance, 0.001f, 50.0f);
+    uniform.depthParams[3] = m_waterSceneExtent.height > 0 ? static_cast<float>(m_waterSceneExtent.height) : 1.0f;
+    uniform.foamParams[0] = water.foamEnabled ? 1.0f : 0.0f;
+    uniform.foamParams[1] = std::clamp(water.foamScale, 0.05f, 2.0f);
+    uniform.foamParams[2] = std::clamp(water.foamScrollSpeed, 0.0f, 0.1f);
+    uniform.foamParams[3] = std::clamp(water.foamIntensity, 0.0f, 2.0f);
+    uniform.foamDepthParams[0] = std::clamp(water.foamDistance, 0.02f, 1.5f);
+    uniform.foamDepthParams[1] = std::clamp(water.foamSoftness, 0.001f, 1.0f);
+    uniform.foamDepthParams[2] = std::clamp(water.foamTerrainThickness, 0.0f, 1.0f);
+    uniform.foamDepthParams[3] = 0.0f;
+    uniform.causticParams[0] = static_cast<float>(static_cast<int>(water.causticMode));
+    uniform.causticParams[1] = std::clamp(water.causticIntensity, 0.0f, 3.0f);
+    uniform.causticParams[2] = std::clamp(water.causticScale, 0.05f, 2.0f);
+    uniform.causticParams[3] = std::clamp(water.causticMaxDepth, 1.0f, 30.0f);
+    uniform.cameraNearFar[0] = std::max(camera.nearPlane, 0.0001f);
+    uniform.cameraNearFar[1] = std::max(camera.farPlane, uniform.cameraNearFar[0] + 0.001f);
+    uniform.cameraNearFar[2] = 0.0f;
+    uniform.cameraNearFar[3] = 0.0f;
+    return uniform;
+}
+
+void TerrainRenderer::UploadWaterUniform(Buffer& buffer, const WaterUniformBlock& uniform)
+{
+    if (!buffer.memory)
+        return;
+    void* mapped = nullptr;
+    VK_CHECK(vkMapMemory(m_device, buffer.memory, 0, sizeof(uniform), 0, &mapped));
+    std::memcpy(mapped, &uniform, sizeof(uniform));
+    vkUnmapMemory(m_device, buffer.memory);
+}
+
+void TerrainRenderer::UpdateWaterBodyUniform(uint32_t frameIndex,
+                                             const WorldCamera& camera,
+                                             double timeSeconds,
+                                             WaterBodyGpu& waterBody,
+                                             bool reflectionTarget)
+{
+    if (frameIndex >= kFramesInFlight)
+        return;
+    const WaterUniformBlock uniform =
+        BuildWaterUniform(camera, timeSeconds, waterBody.body.config, waterBody.body.waterLevelY, reflectionTarget);
+    UploadWaterUniform(waterBody.uniformBuffers[frameIndex], uniform);
 }

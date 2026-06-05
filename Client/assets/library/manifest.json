@@ -285,12 +285,12 @@
       "tags": ["tex"]
 ,
       "material_data": {
-        "diffuse_texture_id": null,
-        "normal_texture_id": null,
-        "ao_texture_id": null,
-        "roughness_texture_id": null,
-        "metallic_texture_id": null,
-        "height_texture_id": null,
+        "diffuse_texture_id": "normal_texture_id",
+        "normal_texture_id": "ao_texture_id",
+        "ao_texture_id": "roughness_texture_id",
+        "roughness_texture_id": "metallic_texture_id",
+        "metallic_texture_id": "height_texture_id",
+        "height_texture_id": "tiling_scale",
         "tiling_scale": { "x": 1, "y": 1 },
         "color_tint": "#ffffff",
         "normal_strength": 1,
@@ -298,6 +298,17 @@
         "roughness_strength": 1,
         "metallic_strength": 1
       }
+    },
+    {
+      "id": "model_jacaranda_tree_1k",
+      "category": "model",
+      "display_name": "jacaranda_tree_1k",
+      "subpath": "",
+      "filename": "jacaranda_tree_1k.gltf",
+      "original_path": "C:/Users/ixtre/Desktop/jacaranda_tree_1k.gltf/jacaranda_tree_1k.gltf",
+      "thumbnail": "model_icon",
+      "imported_at": "2026-06-03T21:11:33Z",
+      "tags": []
     }
   ]
 }
