@@ -12,6 +12,8 @@ add_library(client_render STATIC
     NoesisLayer.h
     OffscreenSceneRenderer.cpp
     OffscreenSceneRenderer.h
+    RmlUiLayer.cpp
+    RmlUiLayer.h
     TerrainRenderer.cpp
     TerrainRenderer.h
     WaterBodyIO.cpp
@@ -55,6 +57,7 @@ target_link_libraries(client_render
         client_asset
         mapdata
         fastgltf::fastgltf
+        RmlUi::RmlUi
         ${CLIENT_OZZ_TARGETS}
         ${CLIENT_FLECS_TARGET}
 )

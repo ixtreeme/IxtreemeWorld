@@ -146,6 +146,7 @@ if(NOT STB_INCLUDE_DIR)
     message(FATAL_ERROR "stb_image.h not found. Install stb with vcpkg or set STB_INCLUDE_DIR.")
 endif()
 find_package(flecs CONFIG REQUIRED)
+find_package(RmlUi 6.2 CONFIG REQUIRED)
 if(IXTREEME_WITH_EDITOR)
     find_package(imguizmo CONFIG REQUIRED)
 endif()
@@ -207,6 +208,8 @@ if(WIN32)
     set(SHADOW_DEPTH_VS_SPV "${GENERATED_SHADER_DIR}/shadow_depth_vs.spv")
     set(NAMEPLATE_VS_SPV "${GENERATED_SHADER_DIR}/nameplate_vs.spv")
     set(NAMEPLATE_PS_SPV "${GENERATED_SHADER_DIR}/nameplate_ps.spv")
+    set(RMLUI_VS_SPV "${GENERATED_SHADER_DIR}/rmlui_vs.spv")
+    set(RMLUI_PS_SPV "${GENERATED_SHADER_DIR}/rmlui_ps.spv")
 
     add_custom_command(
         OUTPUT "${CUBE_VS_SPV}"
@@ -320,6 +323,22 @@ if(WIN32)
         DEPENDS "${CLIENT_ROOT}/shaders/Nameplate.hlsl"
         VERBATIM
     )
+    add_custom_command(
+        OUTPUT "${RMLUI_VS_SPV}"
+        COMMAND ${CMAKE_COMMAND} -E make_directory "${GENERATED_SHADER_DIR}"
+        COMMAND "${DXC_EXECUTABLE}" -spirv -fvk-use-dx-layout -T vs_6_0 -E VSMain
+            -Fo "${RMLUI_VS_SPV}" "${CLIENT_ROOT}/shaders/RmlUi.hlsl"
+        DEPENDS "${CLIENT_ROOT}/shaders/RmlUi.hlsl"
+        VERBATIM
+    )
+    add_custom_command(
+        OUTPUT "${RMLUI_PS_SPV}"
+        COMMAND ${CMAKE_COMMAND} -E make_directory "${GENERATED_SHADER_DIR}"
+        COMMAND "${DXC_EXECUTABLE}" -spirv -fvk-use-dx-layout -T ps_6_0 -E PSMain
+            -Fo "${RMLUI_PS_SPV}" "${CLIENT_ROOT}/shaders/RmlUi.hlsl"
+        DEPENDS "${CLIENT_ROOT}/shaders/RmlUi.hlsl"
+        VERBATIM
+    )
     add_custom_target(ClientShaders DEPENDS
         "${CUBE_VS_SPV}"
         "${CUBE_PS_SPV}"
@@ -335,6 +354,8 @@ if(WIN32)
         "${SHADOW_DEPTH_VS_SPV}"
         "${NAMEPLATE_VS_SPV}"
         "${NAMEPLATE_PS_SPV}"
+        "${RMLUI_VS_SPV}"
+        "${RMLUI_PS_SPV}"
     )
 elseif(ANDROID)
     if(CMAKE_ANDROID_NDK)

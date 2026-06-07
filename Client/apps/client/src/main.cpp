@@ -14,6 +14,7 @@
 #endif
 #include "NoesisLayer.h"
 #include "OffscreenSceneRenderer.h"
+#include "RmlUiLayer.h"
 #include "TerrainRenderer.h"
 #include "VulkanDevice.h"
 #include "WarriorRenderer.h"
@@ -926,6 +927,15 @@ int RunGame(NativeWindow& window,
     clientSession.SetDebugSpawnOverride(debugSpawnOverride);
     noesis.SetClientSession(&clientSession);
 
+    RmlUiLayer rmlUi;
+    if (!rmlUi.Create(device, assets, renderSize.width, renderSize.height))
+    {
+        ShowFatal("Failed to create RmlUi layer. See debug output/stderr.");
+        noesis.Destroy();
+        device.Destroy();
+        return 1;
+    }
+
     EditorImGui editorImGui;
 #if defined(IXTREEME_WITH_EDITOR)
 #if defined(_WIN32)
@@ -1045,6 +1055,7 @@ int RunGame(NativeWindow& window,
     bool waterSculptMeshRegenPending = false;
 
     window.SetInputCallback([&noesis,
+                             &rmlUi,
                              &editorImGui,
                              &movement,
                              &cameraController,
@@ -1073,6 +1084,12 @@ int RunGame(NativeWindow& window,
                              &renderSize](const InputEvent& event)
     {
         if (editorImGui.WantsInputCapture(event))
+        {
+            movement.Clear();
+            return;
+        }
+
+        if (rmlUi.OnInput(event))
         {
             movement.Clear();
             return;
@@ -1536,11 +1553,13 @@ int RunGame(NativeWindow& window,
                 if (nameplatesOk)
                     nameplates.RecreatePipeline(device);
                 noesis.OnRenderPassChanged(device);
+                rmlUi.OnRenderPassChanged(device);
 #if defined(IXTREEME_WITH_EDITOR)
                 editorImGui.OnRenderPassChanged(device);
 #endif
                 renderSize = device.GetSwapchainExtent();
                 noesis.Resize(renderSize.width, renderSize.height);
+                rmlUi.Resize(renderSize.width, renderSize.height);
             }
             else
             {
@@ -1569,6 +1588,7 @@ int RunGame(NativeWindow& window,
             movement.DirectionAngle(cameraController.MovementYaw()),
             cameraController.IsFlyMode() ? client::net::MoveState::Idle : movement.State());
         noesis.Update(seconds);
+        rmlUi.Update();
 
         std::vector<WorldRenderEntity> frameEntities;
         WorldCamera frameCamera{};
@@ -2205,6 +2225,7 @@ int RunGame(NativeWindow& window,
                     nameplates.Render(device, camera, plates);
             }
             noesis.RenderOnscreen(device);
+            rmlUi.Render(device);
 #if defined(IXTREEME_WITH_EDITOR)
             editorImGui.Render(device);
 #endif
@@ -2229,6 +2250,7 @@ int RunGame(NativeWindow& window,
         cleanupWin32Window->SetMessageCallback({});
 #endif
 #endif
+    rmlUi.Destroy();
     noesis.Destroy();
     device.Destroy();
     return 0;

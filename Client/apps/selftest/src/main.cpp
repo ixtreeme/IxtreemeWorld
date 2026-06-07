@@ -713,6 +713,26 @@ bool RunRenderChecks(const Options& options, TestContext& ctx)
     std::stringstream editorImGuiText;
     editorImGuiText << editorImGui.rdbuf();
     const std::string editorImGuiSource = editorImGuiText.str();
+    const std::filesystem::path rmlUiLayerPath = options.clientRoot / "libs" / "render" / "RmlUiLayer.cpp";
+    std::ifstream rmlUiLayer(rmlUiLayerPath);
+    std::stringstream rmlUiLayerText;
+    rmlUiLayerText << rmlUiLayer.rdbuf();
+    const std::string rmlUiLayerSource = rmlUiLayerText.str();
+    const std::filesystem::path rmlUiShaderPath = options.clientRoot / "shaders" / "RmlUi.hlsl";
+    std::ifstream rmlUiShader(rmlUiShaderPath);
+    std::stringstream rmlUiShaderText;
+    rmlUiShaderText << rmlUiShader.rdbuf();
+    const std::string rmlUiShaderSource = rmlUiShaderText.str();
+    const std::filesystem::path helloRmlPath = options.clientRoot / "assets" / "ui" / "hello.rml";
+    std::ifstream helloRml(helloRmlPath);
+    std::stringstream helloRmlText;
+    helloRmlText << helloRml.rdbuf();
+    const std::string helloRmlSource = helloRmlText.str();
+    const std::filesystem::path helloRcssPath = options.clientRoot / "assets" / "ui" / "hello.rcss";
+    std::ifstream helloRcss(helloRcssPath);
+    std::stringstream helloRcssText;
+    helloRcssText << helloRcss.rdbuf();
+    const std::string helloRcssSource = helloRcssText.str();
     const std::filesystem::path editorPanelPath = options.clientRoot / "assets" / "xaml" / "EditorPanel.xaml";
     std::ifstream editorPanel(editorPanelPath);
     std::stringstream editorPanelText;
@@ -741,6 +761,31 @@ bool RunRenderChecks(const Options& options, TestContext& ctx)
             editorImGuiSource.find("#if defined(IXTREEME_WITH_EDITOR) && defined(_WIN32)") != std::string::npos &&
             clientMainSource.find("[BUILD] Editor: DISABLED") != std::string::npos,
         "editor build flag gates imgui pipeline", "IXTREEME_WITH_EDITOR must gate ImGui/ImGuizmo dependencies and runtime editor startup");
+    ctx.Expect(rootCmakeSource.find("find_package(RmlUi 6.2 CONFIG REQUIRED)") != std::string::npos &&
+            rootCmakeSource.find("RMLUI_VS_SPV") != std::string::npos &&
+            rootCmakeSource.find("RmlUi.hlsl") != std::string::npos &&
+            renderCmakeSource.find("RmlUiLayer.cpp") != std::string::npos &&
+            renderCmakeSource.find("RmlUi::RmlUi") != std::string::npos &&
+            clientMainSource.find("RmlUiLayer rmlUi") != std::string::npos &&
+            clientMainSource.find("noesis.RenderOnscreen(device);\n            rmlUi.Render(device);") != std::string::npos &&
+            clientMainSource.find("editorImGui.Render(device);") != std::string::npos,
+        "rmlui build and z-order pipeline", "RMLUI-1 must link RmlUi 6.2, compile shaders, and render between Noesis and ImGui");
+    ctx.Expect(rmlUiLayerSource.find("class RmlAssetFileInterface") != std::string::npos &&
+            rmlUiLayerSource.find("class RmlRenderInterface final : public Rml::RenderInterface") != std::string::npos &&
+            rmlUiLayerSource.find("CreateDescriptorPool") != std::string::npos &&
+            rmlUiLayerSource.find("ProcessMouseButtonDown") != std::string::npos &&
+            rmlUiLayerSource.find("Event: type=%s element=test-button") != std::string::npos &&
+            rmlUiLayerSource.find("assets/ui/hello.rml") != std::string::npos &&
+            rmlUiShaderSource.find("[[vk::push_constant]]") != std::string::npos &&
+            rmlUiShaderSource.find("[[vk::binding(0, 0)]] Texture2D") != std::string::npos,
+        "rmlui vulkan layer source", "RMLUI-1 must provide file, render, input, click-event, and Vulkan shader integration");
+    ctx.Expect(helloRmlSource.find("RmlUi v6.2 active") != std::string::npos &&
+            helloRmlSource.find("test-button") != std::string::npos &&
+            helloRcssSource.find("linear-gradient") != std::string::npos &&
+            helloRcssSource.find("box-shadow") != std::string::npos &&
+            helloRcssSource.find("border-radius") != std::string::npos &&
+            helloRcssSource.find("transition: background") != std::string::npos,
+        "rmlui hello document styling", "RMLUI-1 hello panel must prove RML/RCSS styling and button markup");
     ctx.Expect(editorPanelSource.find("AddWaterBodyButton") != std::string::npos &&
             editorPanelSource.find("SelectedWaterBodySection") != std::string::npos &&
             noesisLayerSource.find("OnAddWaterBodyClicked") != std::string::npos &&
