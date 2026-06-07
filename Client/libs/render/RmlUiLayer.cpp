@@ -180,7 +180,22 @@ struct Geometry
 {
     GpuBuffer vertices;
     GpuBuffer indices;
+    std::vector<Rml::Vertex> diagVertices;
+    std::vector<int> diagIndices;
     uint32_t indexCount = 0;
+};
+
+struct PendingGeometryDelete
+{
+    GpuBuffer vertices;
+    GpuBuffer indices;
+    uint64_t retireFrame = 0;
+};
+
+struct PendingTextureDelete
+{
+    GpuTexture texture;
+    uint64_t retireFrame = 0;
 };
 
 class RmlAssetFileInterface final : public Rml::FileInterface
@@ -328,6 +343,7 @@ public:
         m_queueFamily = device.GetGraphicsQueueFamily();
         m_width = width;
         m_height = height;
+        LogProjectionMatrix();
 
         CreateCommandPool();
         CreateDescriptorPool();
@@ -348,6 +364,15 @@ public:
             DestroyBuffer(item.second->indices);
         }
         m_geometries.clear();
+        for (PendingGeometryDelete& pending : m_pendingGeometryDeletes)
+        {
+            DestroyBuffer(pending.vertices);
+            DestroyBuffer(pending.indices);
+        }
+        m_pendingGeometryDeletes.clear();
+        for (PendingTextureDelete& pending : m_pendingTextureDeletes)
+            DestroyTexture(pending.texture);
+        m_pendingTextureDeletes.clear();
 
         for (auto& item : m_textures)
             DestroyTexture(*item.second);
@@ -377,6 +402,7 @@ public:
     {
         m_width = width;
         m_height = height;
+        LogProjectionMatrix();
     }
 
     void RecreatePipeline(VulkanDevice& device, client::asset::IAssetReader& assets)
@@ -390,9 +416,11 @@ public:
         CreatePipeline(device, assets);
     }
 
-    void BeginFrame(VkCommandBuffer commandBuffer)
+    void BeginFrame(VkCommandBuffer commandBuffer, uint64_t frameNumber, uint64_t safeFrameNumber)
     {
         m_commandBuffer = commandBuffer;
+        m_currentFrameNumber = frameNumber;
+        RetirePendingGeometry(safeFrameNumber);
         m_drawCallsThisFrame = 0;
         VkViewport viewport{};
         viewport.x = 0.0f;
@@ -401,11 +429,30 @@ public:
         viewport.height = static_cast<float>(m_height);
         viewport.minDepth = 0.0f;
         viewport.maxDepth = 1.0f;
+        if (m_diagViewportLogsRemaining > 0)
+        {
+            Tracenf("[RMLUI-DIAG] vkCmdSetViewport: (%.3f,%.3f) %.3fx%.3f depth=[%.3f,%.3f]",
+                viewport.x,
+                viewport.y,
+                viewport.width,
+                viewport.height,
+                viewport.minDepth,
+                viewport.maxDepth);
+        }
         vkCmdSetViewport(m_commandBuffer, 0, 1, &viewport);
 
         VkRect2D scissor{};
         scissor.offset = {0, 0};
         scissor.extent = {m_width, m_height};
+        if (m_diagViewportLogsRemaining > 0)
+        {
+            Tracenf("[RMLUI-DIAG] vkCmdSetScissor: offset=(%d,%d) extent=%ux%u",
+                scissor.offset.x,
+                scissor.offset.y,
+                scissor.extent.width,
+                scissor.extent.height);
+            --m_diagViewportLogsRemaining;
+        }
         vkCmdSetScissor(m_commandBuffer, 0, 1, &scissor);
     }
 
@@ -420,6 +467,8 @@ public:
     {
         auto geometry = std::make_unique<Geometry>();
         geometry->indexCount = static_cast<uint32_t>(indices.size());
+        geometry->diagVertices.assign(vertices.begin(), vertices.end());
+        geometry->diagIndices.assign(indices.begin(), indices.end());
         CreateBuffer(vertices.data(), sizeof(Rml::Vertex) * vertices.size(),
             VK_BUFFER_USAGE_VERTEX_BUFFER_BIT, geometry->vertices);
         CreateBuffer(indices.data(), sizeof(int) * indices.size(),
@@ -450,6 +499,7 @@ public:
             return;
 
         const Geometry& geometry = *geometryIt->second;
+        LogGeometryDiagnostics(geometry, translation, texture);
         struct PushConstants
         {
             float viewport[2];
@@ -473,8 +523,13 @@ public:
         auto it = m_geometries.find(geometry);
         if (it == m_geometries.end())
             return;
-        DestroyBuffer(it->second->vertices);
-        DestroyBuffer(it->second->indices);
+        PendingGeometryDelete pending{};
+        pending.vertices = it->second->vertices;
+        pending.indices = it->second->indices;
+        pending.retireFrame = m_currentFrameNumber + 3u;
+        it->second->vertices = {};
+        it->second->indices = {};
+        m_pendingGeometryDeletes.push_back(pending);
         m_geometries.erase(it);
     }
 
@@ -502,7 +557,11 @@ public:
             return;
         if (it->second.get() == m_whiteTexture)
             m_whiteTexture = nullptr;
-        DestroyTexture(*it->second);
+        PendingTextureDelete pending{};
+        pending.texture = *it->second;
+        pending.retireFrame = m_currentFrameNumber + 3u;
+        *it->second = {};
+        m_pendingTextureDeletes.push_back(pending);
         m_textures.erase(it);
     }
 
@@ -623,6 +682,11 @@ private:
         VkPipelineInputAssemblyStateCreateInfo assembly{};
         assembly.sType = VK_STRUCTURE_TYPE_PIPELINE_INPUT_ASSEMBLY_STATE_CREATE_INFO;
         assembly.topology = VK_PRIMITIVE_TOPOLOGY_TRIANGLE_LIST;
+        Tracen("[RMLUI-DIAG] Pipeline primitive topology: TRIANGLE_LIST");
+        Tracenf("[RMLUI-DIAG] Vertex stride: %zu", sizeof(Rml::Vertex));
+        Tracenf("[RMLUI-DIAG]   position offset: %zu", offsetof(Rml::Vertex, position));
+        Tracenf("[RMLUI-DIAG]   tex_coord offset: %zu", offsetof(Rml::Vertex, tex_coord));
+        Tracenf("[RMLUI-DIAG]   colour offset: %zu", offsetof(Rml::Vertex, colour));
 
         VkPipelineViewportStateCreateInfo viewport{};
         viewport.sType = VK_STRUCTURE_TYPE_PIPELINE_VIEWPORT_STATE_CREATE_INFO;
@@ -837,6 +901,34 @@ private:
         buffer = {};
     }
 
+    void RetirePendingGeometry(uint64_t safeFrameNumber)
+    {
+        auto it = m_pendingGeometryDeletes.begin();
+        while (it != m_pendingGeometryDeletes.end())
+        {
+            if (it->retireFrame > safeFrameNumber)
+            {
+                ++it;
+                continue;
+            }
+            DestroyBuffer(it->vertices);
+            DestroyBuffer(it->indices);
+            it = m_pendingGeometryDeletes.erase(it);
+        }
+
+        auto textureIt = m_pendingTextureDeletes.begin();
+        while (textureIt != m_pendingTextureDeletes.end())
+        {
+            if (textureIt->retireFrame > safeFrameNumber)
+            {
+                ++textureIt;
+                continue;
+            }
+            DestroyTexture(textureIt->texture);
+            textureIt = m_pendingTextureDeletes.erase(textureIt);
+        }
+    }
+
     void DestroyTexture(GpuTexture& texture)
     {
         if (texture.sampler)
@@ -948,7 +1040,71 @@ private:
             scissor.offset = {0, 0};
             scissor.extent = {m_width, m_height};
         }
+        if (m_diagScissorLogsRemaining > 0)
+        {
+            Tracenf("[RMLUI-DIAG] Rml scissor: enabled=%d region=(%d,%d)-(%d,%d) applied offset=(%d,%d) extent=%ux%u",
+                m_scissorEnabled ? 1 : 0,
+                m_scissor.Left(),
+                m_scissor.Top(),
+                m_scissor.Right(),
+                m_scissor.Bottom(),
+                scissor.offset.x,
+                scissor.offset.y,
+                scissor.extent.width,
+                scissor.extent.height);
+            --m_diagScissorLogsRemaining;
+        }
         vkCmdSetScissor(m_commandBuffer, 0, 1, &scissor);
+    }
+
+    void LogProjectionMatrix()
+    {
+        if (m_width == 0 || m_height == 0)
+            return;
+
+        const float matrix[16] = {
+            2.0f / static_cast<float>(m_width), 0.0f, 0.0f, -1.0f,
+            0.0f, 2.0f / static_cast<float>(m_height), 0.0f, -1.0f,
+            0.0f, 0.0f, -1.0f, 0.0f,
+            0.0f, 0.0f, 0.0f, 1.0f};
+        Tracen("[RMLUI-DIAG] Projection matrix:");
+        for (int row = 0; row < 4; ++row)
+        {
+            Tracenf("[RMLUI-DIAG]   [%.6f, %.6f, %.6f, %.6f]",
+                matrix[row * 4 + 0],
+                matrix[row * 4 + 1],
+                matrix[row * 4 + 2],
+                matrix[row * 4 + 3]);
+        }
+    }
+
+    void LogGeometryDiagnostics(const Geometry& geometry, Rml::Vector2f translation, Rml::TextureHandle texture)
+    {
+        if (m_diagGeometryLogsRemaining <= 0)
+            return;
+
+        Tracenf("[RMLUI-DIAG] RenderGeometry: vertices=%zu indices=%zu translation=(%.3f,%.3f) texture=%llu",
+            geometry.diagVertices.size(),
+            geometry.diagIndices.size(),
+            translation.x,
+            translation.y,
+            static_cast<unsigned long long>(texture));
+        const size_t vertexCount = std::min<size_t>(geometry.diagVertices.size(), 4);
+        for (size_t i = 0; i < vertexCount; ++i)
+        {
+            const Rml::Vertex& v = geometry.diagVertices[i];
+            Tracenf("[RMLUI-DIAG]   vertex[%zu]: pos=(%.3f,%.3f) uv=(%.3f,%.3f) color=(%u,%u,%u,%u)",
+                i,
+                v.position.x,
+                v.position.y,
+                v.tex_coord.x,
+                v.tex_coord.y,
+                static_cast<unsigned>(v.colour.red),
+                static_cast<unsigned>(v.colour.green),
+                static_cast<unsigned>(v.colour.blue),
+                static_cast<unsigned>(v.colour.alpha));
+        }
+        --m_diagGeometryLogsRemaining;
     }
 
     VkDevice m_device = VK_NULL_HANDLE;
@@ -967,10 +1123,16 @@ private:
     Rml::Rectanglei m_scissor;
     uint32_t m_drawCallsThisFrame = 0;
     uint32_t m_loggedFrameCounter = 0;
+    uint64_t m_currentFrameNumber = 0;
+    int m_diagViewportLogsRemaining = 3;
+    int m_diagScissorLogsRemaining = 8;
+    int m_diagGeometryLogsRemaining = 5;
     Rml::CompiledGeometryHandle m_nextGeometryHandle = 1;
     Rml::TextureHandle m_nextTextureHandle = 1;
     std::unordered_map<Rml::CompiledGeometryHandle, std::unique_ptr<Geometry>> m_geometries;
+    std::vector<PendingGeometryDelete> m_pendingGeometryDeletes;
     std::unordered_map<Rml::TextureHandle, std::unique_ptr<GpuTexture>> m_textures;
+    std::vector<PendingTextureDelete> m_pendingTextureDeletes;
     GpuTexture* m_whiteTexture = nullptr;
 };
 }
@@ -1009,12 +1171,17 @@ bool RmlUiLayer::Create(VulkanDevice& device, client::asset::IAssetReader& asset
     }
 
     Rml::LoadFontFace("assets/fonts/Roboto-Regular.ttf");
+    Tracenf("[RMLUI-DIAG] CreateContext: viewport=%ux%u", width, height);
     m_impl->context = Rml::CreateContext("main", Rml::Vector2i(static_cast<int>(width), static_cast<int>(height)));
     if (!m_impl->context)
     {
         Tracen("[RMLUI] CreateContext failed");
         return false;
     }
+    const Rml::Vector2i contextDimensions = m_impl->context->GetDimensions();
+    Tracenf("[RMLUI-DIAG] Context dimensions after create: %dx%d",
+        contextDimensions.x,
+        contextDimensions.y);
 
     m_impl->document = m_impl->context->LoadDocument("assets/ui/hello.rml");
     if (!m_impl->document)
@@ -1022,6 +1189,11 @@ bool RmlUiLayer::Create(VulkanDevice& device, client::asset::IAssetReader& asset
         Tracen("[RMLUI] Failed to load hello.rml");
         return false;
     }
+    m_impl->document->SetProperty("position", "absolute");
+    m_impl->document->SetProperty("left", "0px");
+    m_impl->document->SetProperty("top", "0px");
+    m_impl->document->SetProperty("width", std::to_string(width) + "px");
+    m_impl->document->SetProperty("height", std::to_string(height) + "px");
 
     if (Rml::Element* button = m_impl->document->GetElementById("test-button"))
         button->AddEventListener("click", &m_impl->helloButtonHandler);
@@ -1043,7 +1215,7 @@ void RmlUiLayer::Render(VulkanDevice& device)
     if (!m_impl || !m_impl->context || !device.IsFrameActive())
         return;
 
-    m_impl->renderer.BeginFrame(device.GetCommandBuffer());
+    m_impl->renderer.BeginFrame(device.GetCommandBuffer(), device.GetFrameNumber(), device.GetSafeFrameNumber());
     m_impl->context->Render();
     m_impl->renderer.EndFrame();
 }
@@ -1056,6 +1228,11 @@ void RmlUiLayer::Resize(uint32_t width, uint32_t height)
     m_impl->renderer.Resize(width, height);
     if (m_impl->context)
         m_impl->context->SetDimensions(Rml::Vector2i(static_cast<int>(width), static_cast<int>(height)));
+    if (m_impl->document)
+    {
+        m_impl->document->SetProperty("width", std::to_string(width) + "px");
+        m_impl->document->SetProperty("height", std::to_string(height) + "px");
+    }
 }
 
 void RmlUiLayer::OnRenderPassChanged(VulkanDevice& device)

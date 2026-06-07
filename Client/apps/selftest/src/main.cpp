@@ -776,11 +776,24 @@ bool RunRenderChecks(const Options& options, TestContext& ctx)
             rmlUiLayerSource.find("ProcessMouseButtonDown") != std::string::npos &&
             rmlUiLayerSource.find("Event: type=%s element=test-button") != std::string::npos &&
             rmlUiLayerSource.find("assets/ui/hello.rml") != std::string::npos &&
+            rmlUiLayerSource.find("[RMLUI-DIAG] CreateContext: viewport=") != std::string::npos &&
+            rmlUiLayerSource.find("[RMLUI-DIAG] RenderGeometry: vertices=") != std::string::npos &&
+            rmlUiLayerSource.find("[RMLUI-DIAG] vkCmdSetViewport") != std::string::npos &&
+            rmlUiLayerSource.find("[RMLUI-DIAG] Pipeline primitive topology: TRIANGLE_LIST") != std::string::npos &&
+            rmlUiLayerSource.find("PendingGeometryDelete") != std::string::npos &&
+            rmlUiLayerSource.find("m_pendingGeometryDeletes") != std::string::npos &&
             rmlUiShaderSource.find("[[vk::push_constant]]") != std::string::npos &&
-            rmlUiShaderSource.find("[[vk::binding(0, 0)]] Texture2D") != std::string::npos,
+            rmlUiShaderSource.find("[[vk::binding(0, 0)]] Texture2D") != std::string::npos &&
+            rmlUiShaderSource.find("(pixel.y / g_push.viewport.y) * 2.0f - 1.0f") != std::string::npos,
         "rmlui vulkan layer source", "RMLUI-1 must provide file, render, input, click-event, and Vulkan shader integration");
-    ctx.Expect(helloRmlSource.find("RmlUi v6.2 active") != std::string::npos &&
+    ctx.Expect(helloRmlSource.find("screen-root") != std::string::npos &&
+            helloRmlSource.find("RmlUi v6.2 active") != std::string::npos &&
             helloRmlSource.find("test-button") != std::string::npos &&
+            helloRcssSource.find(".screen-root") != std::string::npos &&
+            helloRcssSource.find("right: 0") != std::string::npos &&
+            helloRcssSource.find("bottom: 0") != std::string::npos &&
+            helloRcssSource.find("background-color: transparent") != std::string::npos &&
+            helloRcssSource.find("background-color: rgba(24, 28, 44, 0.96)") != std::string::npos &&
             helloRcssSource.find("linear-gradient") != std::string::npos &&
             helloRcssSource.find("box-shadow") != std::string::npos &&
             helloRcssSource.find("border-radius") != std::string::npos &&

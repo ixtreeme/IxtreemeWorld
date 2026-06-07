@@ -25,7 +25,7 @@ VSOutput VSMain(VSInput input)
     VSOutput output;
     const float2 pixel = input.position + g_push.translation;
     const float2 ndc = float2((pixel.x / g_push.viewport.x) * 2.0f - 1.0f,
-                             1.0f - (pixel.y / g_push.viewport.y) * 2.0f);
+                             (pixel.y / g_push.viewport.y) * 2.0f - 1.0f);
     output.position = float4(ndc, 0.0f, 1.0f);
     output.color = input.color;
     output.texcoord = input.texcoord;
