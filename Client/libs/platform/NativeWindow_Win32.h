@@ -2,11 +2,14 @@
 
 #include "NativeWindow.h"
 
+#include <functional>
 #include <windows.h>
 
 class NativeWindow_Win32 final : public NativeWindow
 {
 public:
+    using MessageCallback = std::function<bool(HWND, UINT, WPARAM, LPARAM, LRESULT&)>;
+
     bool Create(HINSTANCE instance, const char* title, uint32_t width, uint32_t height);
     void Destroy();
 
@@ -21,6 +24,7 @@ public:
     const char* GetVulkanSurfaceExtensionName() const override { return "VK_KHR_win32_surface"; }
 
     HWND GetHwnd() const { return m_hwnd; }
+    void SetMessageCallback(MessageCallback cb);
 
 private:
     static LRESULT CALLBACK StaticWndProc(HWND hwnd, UINT message, WPARAM wParam, LPARAM lParam);
@@ -36,4 +40,5 @@ private:
     uint16_t m_pendingHighSurrogate = 0;
     InputCallback m_inputCallback;
     FileDropCallback m_fileDropCallback;
+    MessageCallback m_messageCallback;
 };

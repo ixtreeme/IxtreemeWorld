@@ -3,6 +3,8 @@ add_library(client_render STATIC
     AssetLibrary.h
     CubeRenderer.cpp
     CubeRenderer.h
+    EditorImGui.cpp
+    EditorImGui.h
     MapEditorTypes.h
     NameplateRenderer.cpp
     NameplateRenderer.h
@@ -60,6 +62,7 @@ if(WIN32)
     target_link_libraries(client_render
         PUBLIC
             Vulkan::Vulkan
+            imgui::imgui
             "${NOESIS_SDK}/Lib/windows_x86_64/Noesis.lib"
             Gdi32
             Advapi32

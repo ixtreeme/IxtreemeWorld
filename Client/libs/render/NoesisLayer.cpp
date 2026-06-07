@@ -25,6 +25,7 @@
 #include <NsDrawing/Thickness.h>
 #include <NsGui/CachedFontProvider.h>
 #include <NsGui/Brush.h>
+#include <NsGui/Border.h>
 #include <NsGui/Button.h>
 #include <NsGui/CheckBox.h>
 #include <NsGui/ContentControl.h>
@@ -42,6 +43,7 @@
 #include <NsGui/MemoryStream.h>
 #include <NsGui/ObservableCollection.h>
 #include <NsGui/PasswordBox.h>
+#include <NsGui/Panel.h>
 #include <NsGui/RadioButton.h>
 #include <NsGui/RoutedEvent.h>
 #include <NsGui/ScrollViewer.h>
@@ -172,6 +174,7 @@ enum class DragPayloadType
     None,
     AssetTexture,
     AssetMaterial,
+    AssetWaterMaterial,
     AssetModel,
     AssetAnimation,
     OsFiles
@@ -266,6 +269,9 @@ std::optional<std::filesystem::path> PickAssetFile(AssetLibrary::Category catego
         break;
     case AssetLibrary::Category::Material:
         filter = L"Materials (*.json)\0*.json\0All files (*.*)\0*.*\0\0";
+        break;
+    case AssetLibrary::Category::WaterMaterial:
+        filter = L"Water Materials (*.watermat;*.json)\0*.watermat;*.json\0All files (*.*)\0*.*\0\0";
         break;
     }
 
@@ -1137,6 +1143,8 @@ struct NoesisLayer::Impl
         lightingMainSection = root->FindName<Noesis::FrameworkElement>("LightingMainSection");
         waterBaseSectionButton = root->FindName<Noesis::Button>("WaterBaseSectionButton");
         waterBaseSection = root->FindName<Noesis::FrameworkElement>("WaterBaseSection");
+        waterEdgeFadeSectionButton = root->FindName<Noesis::Button>("WaterEdgeFadeSectionButton");
+        waterEdgeFadeSection = root->FindName<Noesis::FrameworkElement>("WaterEdgeFadeSection");
         waterReflectionSectionButton = root->FindName<Noesis::Button>("WaterReflectionSectionButton");
         waterReflectionSection = root->FindName<Noesis::FrameworkElement>("WaterReflectionSection");
         waterRefractionSectionButton = root->FindName<Noesis::Button>("WaterRefractionSectionButton");
@@ -1149,6 +1157,8 @@ struct NoesisLayer::Impl
         dynamicLightsSection = root->FindName<Noesis::FrameworkElement>("DynamicLightsSection");
         selectedLightSectionButton = root->FindName<Noesis::Button>("SelectedLightSectionButton");
         selectedLightSection = root->FindName<Noesis::FrameworkElement>("SelectedLightSection");
+        selectedWaterBodySectionButton = root->FindName<Noesis::Button>("SelectedWaterBodySectionButton");
+        selectedWaterBodySection = root->FindName<Noesis::FrameworkElement>("SelectedWaterBodySection");
         lightingAzimuthText = root->FindName<Noesis::TextBlock>("LightingAzimuthText");
         lightingElevationText = root->FindName<Noesis::TextBlock>("LightingElevationText");
         lightingSunIntensityText = root->FindName<Noesis::TextBlock>("LightingSunIntensityText");
@@ -1206,6 +1216,7 @@ struct NoesisLayer::Impl
         waterCausticScaleText = root->FindName<Noesis::TextBlock>("WaterCausticScaleText");
         waterCausticSpeedText = root->FindName<Noesis::TextBlock>("WaterCausticSpeedText");
         waterCausticMaxDepthText = root->FindName<Noesis::TextBlock>("WaterCausticMaxDepthText");
+        waterEdgeFadeDistanceText = root->FindName<Noesis::TextBlock>("WaterEdgeFadeDistanceText");
         waterLevelSlider = root->FindName<Noesis::Slider>("WaterLevelSlider");
         waterBaseRSlider = root->FindName<Noesis::Slider>("WaterBaseRSlider");
         waterBaseGSlider = root->FindName<Noesis::Slider>("WaterBaseGSlider");
@@ -1222,6 +1233,10 @@ struct NoesisLayer::Impl
         waterReflectionGSlider = root->FindName<Noesis::Slider>("WaterReflectionGSlider");
         waterReflectionBSlider = root->FindName<Noesis::Slider>("WaterReflectionBSlider");
         waterReflectionDistortionSlider = root->FindName<Noesis::Slider>("WaterReflectionDistortionSlider");
+        waterEdgeFadeDistanceSlider = root->FindName<Noesis::Slider>("WaterEdgeFadeDistanceSlider");
+        waterEdgeFadeLinearButton = root->FindName<Noesis::Button>("WaterEdgeFadeLinearButton");
+        waterEdgeFadeSmoothButton = root->FindName<Noesis::Button>("WaterEdgeFadeSmoothButton");
+        waterEdgeFadeExponentialButton = root->FindName<Noesis::Button>("WaterEdgeFadeExponentialButton");
         waterReflectionEnabledButton = root->FindName<Noesis::Button>("WaterReflectionEnabledButton");
         waterRefractionEnabledButton = root->FindName<Noesis::Button>("WaterRefractionEnabledButton");
         waterReflectionQuarterButton = root->FindName<Noesis::Button>("WaterReflectionQuarterButton");
@@ -1266,6 +1281,24 @@ struct NoesisLayer::Impl
         selectedSpotYawText = root->FindName<Noesis::TextBlock>("SelectedSpotYawText");
         selectedSpotInnerText = root->FindName<Noesis::TextBlock>("SelectedSpotInnerText");
         selectedSpotOuterText = root->FindName<Noesis::TextBlock>("SelectedSpotOuterText");
+        selectedWaterBodyTitleText = root->FindName<Noesis::TextBlock>("SelectedWaterBodyTitleText");
+        selectedWaterBodyNameBox = root->FindName<Noesis::TextBox>("SelectedWaterBodyNameBox");
+        selectedWaterBodyMaterialText = root->FindName<Noesis::TextBlock>("SelectedWaterBodyMaterialText");
+        selectedWaterBodyMaterialButton = root->FindName<Noesis::Button>("SelectedWaterBodyMaterialButton");
+        editWaterMaterialButton = root->FindName<Noesis::Button>("EditWaterMaterialButton");
+        waterMaterialEditorSectionButton = root->FindName<Noesis::Button>("WaterMaterialEditorSectionButton");
+        waterMaterialEditorSection = root->FindName<Noesis::FrameworkElement>("WaterMaterialEditorSection");
+        waterMaterialEditorTitleText = root->FindName<Noesis::TextBlock>("WaterMaterialEditorTitleText");
+        selectedWaterBodyXText = root->FindName<Noesis::TextBlock>("SelectedWaterBodyXText");
+        selectedWaterBodyYText = root->FindName<Noesis::TextBlock>("SelectedWaterBodyYText");
+        selectedWaterBodyZText = root->FindName<Noesis::TextBlock>("SelectedWaterBodyZText");
+        selectedWaterBodyWidthText = root->FindName<Noesis::TextBlock>("SelectedWaterBodyWidthText");
+        selectedWaterBodyDepthText = root->FindName<Noesis::TextBlock>("SelectedWaterBodyDepthText");
+        selectedWaterSculptButton = root->FindName<Noesis::Button>("SelectedWaterSculptButton");
+        selectedWaterSculptControls = root->FindName<Noesis::FrameworkElement>("SelectedWaterSculptControls");
+        waterSculptAddButton = root->FindName<Noesis::Button>("WaterSculptAddButton");
+        waterSculptRemoveButton = root->FindName<Noesis::Button>("WaterSculptRemoveButton");
+        waterSculptRadiusText = root->FindName<Noesis::TextBlock>("WaterSculptRadiusText");
         selectedLightXSlider = root->FindName<Noesis::Slider>("SelectedLightXSlider");
         selectedLightYSlider = root->FindName<Noesis::Slider>("SelectedLightYSlider");
         selectedLightZSlider = root->FindName<Noesis::Slider>("SelectedLightZSlider");
@@ -1278,8 +1311,15 @@ struct NoesisLayer::Impl
         selectedSpotYawSlider = root->FindName<Noesis::Slider>("SelectedSpotYawSlider");
         selectedSpotInnerSlider = root->FindName<Noesis::Slider>("SelectedSpotInnerSlider");
         selectedSpotOuterSlider = root->FindName<Noesis::Slider>("SelectedSpotOuterSlider");
+        selectedWaterBodyXSlider = root->FindName<Noesis::Slider>("SelectedWaterBodyXSlider");
+        selectedWaterBodyYSlider = root->FindName<Noesis::Slider>("SelectedWaterBodyYSlider");
+        selectedWaterBodyZSlider = root->FindName<Noesis::Slider>("SelectedWaterBodyZSlider");
+        selectedWaterBodyWidthSlider = root->FindName<Noesis::Slider>("SelectedWaterBodyWidthSlider");
+        selectedWaterBodyDepthSlider = root->FindName<Noesis::Slider>("SelectedWaterBodyDepthSlider");
+        waterSculptRadiusSlider = root->FindName<Noesis::Slider>("WaterSculptRadiusSlider");
         assetStatusText = root->FindName<Noesis::TextBlock>("AssetStatusText");
         assetFolderTree = root->FindName<Noesis::TreeView>("AssetFolderTree");
+        assetFolderItemStyle = root->FindResource<Noesis::Style>("EditorTreeViewItem");
         assetBreadcrumbPanel = root->FindName<Noesis::StackPanel>("AssetBreadcrumbPanel");
         assetFolderCountText = root->FindName<Noesis::TextBlock>("AssetFolderCountText");
 
@@ -1333,42 +1373,44 @@ struct NoesisLayer::Impl
             &Impl::OnLightingAmbientGChanged);
         ConfigureLightingSlider(lightingAmbientBSlider, 0.0f, 1.0f, 0.1f, 0.01f, lightingState.ambient.b,
             &Impl::OnLightingAmbientBChanged);
-        ConfigureLightingSlider(waterLevelSlider, -50.0f, 50.0f, 5.0f, 0.1f, waterConfig.waterLevelY, &Impl::OnWaterLevelChanged);
-        ConfigureLightingSlider(waterBaseRSlider, 0.0f, 1.0f, 0.1f, 0.01f, waterConfig.baseColor[0], &Impl::OnWaterBaseRChanged);
-        ConfigureLightingSlider(waterBaseGSlider, 0.0f, 1.0f, 0.1f, 0.01f, waterConfig.baseColor[1], &Impl::OnWaterBaseGChanged);
-        ConfigureLightingSlider(waterBaseBSlider, 0.0f, 1.0f, 0.1f, 0.01f, waterConfig.baseColor[2], &Impl::OnWaterBaseBChanged);
-        ConfigureLightingSlider(waterAlphaSlider, 0.0f, 1.0f, 0.1f, 0.01f, waterConfig.baseColor[3], &Impl::OnWaterAlphaChanged);
-        ConfigureLightingSlider(waterWaveScaleSmallSlider, 0.001f, 0.12f, 0.01f, 0.001f, waterConfig.waveScaleSmall, &Impl::OnWaterWaveScaleSmallChanged);
-        ConfigureLightingSlider(waterWaveScaleLargeSlider, 0.001f, 0.08f, 0.01f, 0.001f, waterConfig.waveScaleLarge, &Impl::OnWaterWaveScaleLargeChanged);
-        ConfigureLightingSlider(waterWaveSpeedSmallSlider, 0.0f, 0.5f, 0.05f, 0.005f, waterConfig.waveSpeedSmall, &Impl::OnWaterWaveSpeedSmallChanged);
-        ConfigureLightingSlider(waterWaveSpeedLargeSlider, 0.0f, 0.5f, 0.05f, 0.005f, waterConfig.waveSpeedLarge, &Impl::OnWaterWaveSpeedLargeChanged);
-        ConfigureLightingSlider(waterNormalStrengthSlider, 0.0f, 2.0f, 0.2f, 0.01f, waterConfig.normalStrength, &Impl::OnWaterNormalStrengthChanged);
-        ConfigureLightingSlider(waterFresnelPowerSlider, 1.0f, 10.0f, 1.0f, 0.1f, waterConfig.fresnelPower, &Impl::OnWaterFresnelPowerChanged);
-        ConfigureLightingSlider(waterFresnelMinSlider, 0.0f, 0.5f, 0.05f, 0.005f, waterConfig.fresnelMin, &Impl::OnWaterFresnelMinChanged);
-        ConfigureLightingSlider(waterReflectionRSlider, 0.0f, 1.0f, 0.1f, 0.01f, waterConfig.reflectionColor[0], &Impl::OnWaterReflectionRChanged);
-        ConfigureLightingSlider(waterReflectionGSlider, 0.0f, 1.0f, 0.1f, 0.01f, waterConfig.reflectionColor[1], &Impl::OnWaterReflectionGChanged);
-        ConfigureLightingSlider(waterReflectionBSlider, 0.0f, 1.0f, 0.1f, 0.01f, waterConfig.reflectionColor[2], &Impl::OnWaterReflectionBChanged);
+        ConfigureLightingSlider(waterLevelSlider, -50.0f, 50.0f, 5.0f, 0.1f, EditedWaterConfig().waterLevelY, &Impl::OnWaterLevelChanged);
+        ConfigureLightingSlider(waterBaseRSlider, 0.0f, 1.0f, 0.1f, 0.01f, EditedWaterConfig().baseColor[0], &Impl::OnWaterBaseRChanged);
+        ConfigureLightingSlider(waterBaseGSlider, 0.0f, 1.0f, 0.1f, 0.01f, EditedWaterConfig().baseColor[1], &Impl::OnWaterBaseGChanged);
+        ConfigureLightingSlider(waterBaseBSlider, 0.0f, 1.0f, 0.1f, 0.01f, EditedWaterConfig().baseColor[2], &Impl::OnWaterBaseBChanged);
+        ConfigureLightingSlider(waterAlphaSlider, 0.0f, 1.0f, 0.1f, 0.01f, EditedWaterConfig().baseColor[3], &Impl::OnWaterAlphaChanged);
+        ConfigureLightingSlider(waterWaveScaleSmallSlider, 0.001f, 0.12f, 0.01f, 0.001f, EditedWaterConfig().waveScaleSmall, &Impl::OnWaterWaveScaleSmallChanged);
+        ConfigureLightingSlider(waterWaveScaleLargeSlider, 0.001f, 0.08f, 0.01f, 0.001f, EditedWaterConfig().waveScaleLarge, &Impl::OnWaterWaveScaleLargeChanged);
+        ConfigureLightingSlider(waterWaveSpeedSmallSlider, 0.0f, 0.5f, 0.05f, 0.005f, EditedWaterConfig().waveSpeedSmall, &Impl::OnWaterWaveSpeedSmallChanged);
+        ConfigureLightingSlider(waterWaveSpeedLargeSlider, 0.0f, 0.5f, 0.05f, 0.005f, EditedWaterConfig().waveSpeedLarge, &Impl::OnWaterWaveSpeedLargeChanged);
+        ConfigureLightingSlider(waterNormalStrengthSlider, 0.0f, 2.0f, 0.2f, 0.01f, EditedWaterConfig().normalStrength, &Impl::OnWaterNormalStrengthChanged);
+        ConfigureLightingSlider(waterFresnelPowerSlider, 1.0f, 10.0f, 1.0f, 0.1f, EditedWaterConfig().fresnelPower, &Impl::OnWaterFresnelPowerChanged);
+        ConfigureLightingSlider(waterFresnelMinSlider, 0.0f, 0.5f, 0.05f, 0.005f, EditedWaterConfig().fresnelMin, &Impl::OnWaterFresnelMinChanged);
+        ConfigureLightingSlider(waterReflectionRSlider, 0.0f, 1.0f, 0.1f, 0.01f, EditedWaterConfig().reflectionColor[0], &Impl::OnWaterReflectionRChanged);
+        ConfigureLightingSlider(waterReflectionGSlider, 0.0f, 1.0f, 0.1f, 0.01f, EditedWaterConfig().reflectionColor[1], &Impl::OnWaterReflectionGChanged);
+        ConfigureLightingSlider(waterReflectionBSlider, 0.0f, 1.0f, 0.1f, 0.01f, EditedWaterConfig().reflectionColor[2], &Impl::OnWaterReflectionBChanged);
         ConfigureLightingSlider(waterReflectionDistortionSlider, 0.0f, 0.2f, 0.02f, 0.005f,
-            waterConfig.reflectionDistortionStrength, &Impl::OnWaterReflectionDistortionChanged);
-        ConfigureLightingSlider(waterShallowRSlider, 0.0f, 1.0f, 0.1f, 0.01f, waterConfig.shallowColor[0], &Impl::OnWaterShallowRChanged);
-        ConfigureLightingSlider(waterShallowGSlider, 0.0f, 1.0f, 0.1f, 0.01f, waterConfig.shallowColor[1], &Impl::OnWaterShallowGChanged);
-        ConfigureLightingSlider(waterShallowBSlider, 0.0f, 1.0f, 0.1f, 0.01f, waterConfig.shallowColor[2], &Impl::OnWaterShallowBChanged);
-        ConfigureLightingSlider(waterDeepRSlider, 0.0f, 1.0f, 0.1f, 0.01f, waterConfig.deepColor[0], &Impl::OnWaterDeepRChanged);
-        ConfigureLightingSlider(waterDeepGSlider, 0.0f, 1.0f, 0.1f, 0.01f, waterConfig.deepColor[1], &Impl::OnWaterDeepGChanged);
-        ConfigureLightingSlider(waterDeepBSlider, 0.0f, 1.0f, 0.1f, 0.01f, waterConfig.deepColor[2], &Impl::OnWaterDeepBChanged);
-        ConfigureLightingSlider(waterDepthColorMinSlider, 0.0f, 50.0f, 5.0f, 0.1f, waterConfig.depthColorMin, &Impl::OnWaterDepthColorMinChanged);
-        ConfigureLightingSlider(waterDepthColorMaxSlider, 0.01f, 50.0f, 5.0f, 0.1f, waterConfig.depthColorMax, &Impl::OnWaterDepthColorMaxChanged);
-        ConfigureLightingSlider(waterDepthFadeSlider, 0.01f, 50.0f, 5.0f, 0.1f, waterConfig.depthFadeDistance, &Impl::OnWaterDepthFadeChanged);
-        ConfigureLightingSlider(waterRefractionStrengthSlider, 0.0f, 0.1f, 0.01f, 0.001f, waterConfig.refractionStrength, &Impl::OnWaterRefractionStrengthChanged);
-        ConfigureLightingSlider(waterRefractionDepthStrengthSlider, 0.0f, 2.0f, 0.2f, 0.01f, waterConfig.refractionDepthStrength, &Impl::OnWaterRefractionDepthStrengthChanged);
-        ConfigureLightingSlider(waterFoamDistanceSlider, 0.02f, 1.5f, 0.1f, 0.01f, waterConfig.foamDistance, &Impl::OnWaterFoamDistanceChanged);
-        ConfigureLightingSlider(waterFoamIntensitySlider, 0.0f, 2.0f, 0.2f, 0.01f, waterConfig.foamIntensity, &Impl::OnWaterFoamIntensityChanged);
-        ConfigureLightingSlider(waterFoamScaleSlider, 0.1f, 2.0f, 0.2f, 0.01f, waterConfig.foamScale, &Impl::OnWaterFoamScaleChanged);
-        ConfigureLightingSlider(waterFoamTerrainThicknessSlider, 0.0f, 1.0f, 0.1f, 0.01f, waterConfig.foamTerrainThickness, &Impl::OnWaterFoamTerrainThicknessChanged);
-        ConfigureLightingSlider(waterCausticIntensitySlider, 0.0f, 3.0f, 0.3f, 0.01f, waterConfig.causticIntensity, &Impl::OnWaterCausticIntensityChanged);
-        ConfigureLightingSlider(waterCausticScaleSlider, 0.1f, 2.0f, 0.2f, 0.01f, waterConfig.causticScale, &Impl::OnWaterCausticScaleChanged);
-        ConfigureLightingSlider(waterCausticSpeedSlider, 0.0f, 2.0f, 0.2f, 0.01f, waterConfig.causticSpeed, &Impl::OnWaterCausticSpeedChanged);
-        ConfigureLightingSlider(waterCausticMaxDepthSlider, 1.0f, 30.0f, 2.0f, 0.1f, waterConfig.causticMaxDepth, &Impl::OnWaterCausticMaxDepthChanged);
+            EditedWaterConfig().reflectionDistortionStrength, &Impl::OnWaterReflectionDistortionChanged);
+        ConfigureLightingSlider(waterEdgeFadeDistanceSlider, 0.0f, 3.0f, 0.3f, 0.01f,
+            EditedWaterConfig().edgeFadeDistance, &Impl::OnWaterEdgeFadeDistanceChanged);
+        ConfigureLightingSlider(waterShallowRSlider, 0.0f, 1.0f, 0.1f, 0.01f, EditedWaterConfig().shallowColor[0], &Impl::OnWaterShallowRChanged);
+        ConfigureLightingSlider(waterShallowGSlider, 0.0f, 1.0f, 0.1f, 0.01f, EditedWaterConfig().shallowColor[1], &Impl::OnWaterShallowGChanged);
+        ConfigureLightingSlider(waterShallowBSlider, 0.0f, 1.0f, 0.1f, 0.01f, EditedWaterConfig().shallowColor[2], &Impl::OnWaterShallowBChanged);
+        ConfigureLightingSlider(waterDeepRSlider, 0.0f, 1.0f, 0.1f, 0.01f, EditedWaterConfig().deepColor[0], &Impl::OnWaterDeepRChanged);
+        ConfigureLightingSlider(waterDeepGSlider, 0.0f, 1.0f, 0.1f, 0.01f, EditedWaterConfig().deepColor[1], &Impl::OnWaterDeepGChanged);
+        ConfigureLightingSlider(waterDeepBSlider, 0.0f, 1.0f, 0.1f, 0.01f, EditedWaterConfig().deepColor[2], &Impl::OnWaterDeepBChanged);
+        ConfigureLightingSlider(waterDepthColorMinSlider, 0.0f, 50.0f, 5.0f, 0.1f, EditedWaterConfig().depthColorMin, &Impl::OnWaterDepthColorMinChanged);
+        ConfigureLightingSlider(waterDepthColorMaxSlider, 0.01f, 50.0f, 5.0f, 0.1f, EditedWaterConfig().depthColorMax, &Impl::OnWaterDepthColorMaxChanged);
+        ConfigureLightingSlider(waterDepthFadeSlider, 0.01f, 50.0f, 5.0f, 0.1f, EditedWaterConfig().depthFadeDistance, &Impl::OnWaterDepthFadeChanged);
+        ConfigureLightingSlider(waterRefractionStrengthSlider, 0.0f, 0.1f, 0.01f, 0.001f, EditedWaterConfig().refractionStrength, &Impl::OnWaterRefractionStrengthChanged);
+        ConfigureLightingSlider(waterRefractionDepthStrengthSlider, 0.0f, 2.0f, 0.2f, 0.01f, EditedWaterConfig().refractionDepthStrength, &Impl::OnWaterRefractionDepthStrengthChanged);
+        ConfigureLightingSlider(waterFoamDistanceSlider, 0.02f, 1.5f, 0.1f, 0.01f, EditedWaterConfig().foamDistance, &Impl::OnWaterFoamDistanceChanged);
+        ConfigureLightingSlider(waterFoamIntensitySlider, 0.0f, 2.0f, 0.2f, 0.01f, EditedWaterConfig().foamIntensity, &Impl::OnWaterFoamIntensityChanged);
+        ConfigureLightingSlider(waterFoamScaleSlider, 0.1f, 2.0f, 0.2f, 0.01f, EditedWaterConfig().foamScale, &Impl::OnWaterFoamScaleChanged);
+        ConfigureLightingSlider(waterFoamTerrainThicknessSlider, 0.0f, 1.0f, 0.1f, 0.01f, EditedWaterConfig().foamTerrainThickness, &Impl::OnWaterFoamTerrainThicknessChanged);
+        ConfigureLightingSlider(waterCausticIntensitySlider, 0.0f, 3.0f, 0.3f, 0.01f, EditedWaterConfig().causticIntensity, &Impl::OnWaterCausticIntensityChanged);
+        ConfigureLightingSlider(waterCausticScaleSlider, 0.1f, 2.0f, 0.2f, 0.01f, EditedWaterConfig().causticScale, &Impl::OnWaterCausticScaleChanged);
+        ConfigureLightingSlider(waterCausticSpeedSlider, 0.0f, 2.0f, 0.2f, 0.01f, EditedWaterConfig().causticSpeed, &Impl::OnWaterCausticSpeedChanged);
+        ConfigureLightingSlider(waterCausticMaxDepthSlider, 1.0f, 30.0f, 2.0f, 0.1f, EditedWaterConfig().causticMaxDepth, &Impl::OnWaterCausticMaxDepthChanged);
         ConfigureLightingSlider(selectedLightXSlider, -200.0f, 200.0f, 10.0f, 0.1f, 0.0f, &Impl::OnSelectedLightXChanged);
         ConfigureLightingSlider(selectedLightYSlider, -50.0f, 100.0f, 5.0f, 0.1f, 0.0f, &Impl::OnSelectedLightYChanged);
         ConfigureLightingSlider(selectedLightZSlider, -200.0f, 200.0f, 10.0f, 0.1f, 0.0f, &Impl::OnSelectedLightZChanged);
@@ -1381,6 +1423,14 @@ struct NoesisLayer::Impl
         ConfigureLightingSlider(selectedSpotYawSlider, -180.0f, 180.0f, 10.0f, 0.5f, 0.0f, &Impl::OnSelectedSpotYawChanged);
         ConfigureLightingSlider(selectedSpotInnerSlider, 1.0f, 89.0f, 5.0f, 0.5f, 20.0f, &Impl::OnSelectedSpotInnerChanged);
         ConfigureLightingSlider(selectedSpotOuterSlider, 1.0f, 90.0f, 5.0f, 0.5f, 35.0f, &Impl::OnSelectedSpotOuterChanged);
+        ConfigureLightingSlider(selectedWaterBodyXSlider, -200.0f, 200.0f, 10.0f, 0.1f, 0.0f, &Impl::OnSelectedWaterBodyXChanged);
+        ConfigureLightingSlider(selectedWaterBodyYSlider, -50.0f, 100.0f, 5.0f, 0.1f, 0.0f, &Impl::OnSelectedWaterBodyYChanged);
+        ConfigureLightingSlider(selectedWaterBodyZSlider, -200.0f, 200.0f, 10.0f, 0.1f, 0.0f, &Impl::OnSelectedWaterBodyZChanged);
+        ConfigureLightingSlider(selectedWaterBodyWidthSlider, 1.0f, 200.0f, 10.0f, 0.1f, 10.0f, &Impl::OnSelectedWaterBodyWidthChanged);
+        ConfigureLightingSlider(selectedWaterBodyDepthSlider, 1.0f, 200.0f, 10.0f, 0.1f, 10.0f, &Impl::OnSelectedWaterBodyDepthChanged);
+        ConfigureLightingSlider(waterSculptRadiusSlider, 0.5f, 20.0f, 2.0f, 0.1f, waterSculptRadiusMeters, &Impl::OnWaterSculptRadiusChanged);
+        if (selectedWaterBodyNameBox)
+            selectedWaterBodyNameBox->TextChanged() += Noesis::MakeDelegate(this, &Impl::OnSelectedWaterBodyNameChanged);
 
         if (Noesis::Button* button = root->FindName<Noesis::Button>("SaveButton"))
             button->Click() += Noesis::MakeDelegate(this, &Impl::OnEditorSaveClicked);
@@ -1390,6 +1440,8 @@ struct NoesisLayer::Impl
             button->Click() += Noesis::MakeDelegate(this, &Impl::OnEditorUndoClicked);
         if (Noesis::Button* button = root->FindName<Noesis::Button>("AddMarkerButton"))
             button->Click() += Noesis::MakeDelegate(this, &Impl::OnAddMarkerClicked);
+        if (Noesis::Button* button = root->FindName<Noesis::Button>("AddWaterBodyButton"))
+            button->Click() += Noesis::MakeDelegate(this, &Impl::OnAddWaterBodyClicked);
         if (Noesis::Button* button = root->FindName<Noesis::Button>("LightingButton"))
             button->Click() += Noesis::MakeDelegate(this, &Impl::OnLightingButtonClicked);
         if (lightingMainSectionButton)
@@ -1408,6 +1460,18 @@ struct NoesisLayer::Impl
             dynamicLightsSectionButton->Click() += Noesis::MakeDelegate(this, &Impl::OnDynamicLightsSectionClicked);
         if (selectedLightSectionButton)
             selectedLightSectionButton->Click() += Noesis::MakeDelegate(this, &Impl::OnSelectedLightSectionClicked);
+        if (selectedWaterBodySectionButton)
+            selectedWaterBodySectionButton->Click() += Noesis::MakeDelegate(this, &Impl::OnSelectedWaterBodySectionClicked);
+        if (waterMaterialEditorSectionButton)
+            waterMaterialEditorSectionButton->Click() += Noesis::MakeDelegate(this, &Impl::OnWaterMaterialEditorSectionClicked);
+        if (editWaterMaterialButton)
+            editWaterMaterialButton->Click() += Noesis::MakeDelegate(this, &Impl::OnEditWaterMaterialClicked);
+        if (selectedWaterSculptButton)
+            selectedWaterSculptButton->Click() += Noesis::MakeDelegate(this, &Impl::OnSelectedWaterSculptClicked);
+        if (waterSculptAddButton)
+            waterSculptAddButton->Click() += Noesis::MakeDelegate(this, &Impl::OnWaterSculptAddClicked);
+        if (waterSculptRemoveButton)
+            waterSculptRemoveButton->Click() += Noesis::MakeDelegate(this, &Impl::OnWaterSculptRemoveClicked);
         if (Noesis::Button* button = root->FindName<Noesis::Button>("LightingSunEnabledButton"))
             button->Click() += Noesis::MakeDelegate(this, &Impl::OnLightingSunEnabledClicked);
         if (sunShadowsButton)
@@ -1432,6 +1496,14 @@ struct NoesisLayer::Impl
             waterReflectionHalfButton->Click() += Noesis::MakeDelegate(this, &Impl::OnWaterReflectionHalfClicked);
         if (waterReflectionFullButton)
             waterReflectionFullButton->Click() += Noesis::MakeDelegate(this, &Impl::OnWaterReflectionFullClicked);
+        if (waterEdgeFadeSectionButton)
+            waterEdgeFadeSectionButton->Click() += Noesis::MakeDelegate(this, &Impl::OnWaterEdgeFadeSectionClicked);
+        if (waterEdgeFadeLinearButton)
+            waterEdgeFadeLinearButton->Click() += Noesis::MakeDelegate(this, &Impl::OnWaterEdgeFadeLinearClicked);
+        if (waterEdgeFadeSmoothButton)
+            waterEdgeFadeSmoothButton->Click() += Noesis::MakeDelegate(this, &Impl::OnWaterEdgeFadeSmoothClicked);
+        if (waterEdgeFadeExponentialButton)
+            waterEdgeFadeExponentialButton->Click() += Noesis::MakeDelegate(this, &Impl::OnWaterEdgeFadeExponentialClicked);
         if (waterRefractionEnabledButton)
             waterRefractionEnabledButton->Click() += Noesis::MakeDelegate(this, &Impl::OnWaterRefractionEnabledClicked);
         if (waterFoamEnabledButton)
@@ -1450,6 +1522,10 @@ struct NoesisLayer::Impl
             button->Click() += Noesis::MakeDelegate(this, &Impl::OnSelectedLightEnabledClicked);
         if (Noesis::Button* button = root->FindName<Noesis::Button>("DeleteLightButton"))
             button->Click() += Noesis::MakeDelegate(this, &Impl::OnDeleteLightClicked);
+        if (Noesis::Button* button = root->FindName<Noesis::Button>("DeleteWaterBodyButton"))
+            button->Click() += Noesis::MakeDelegate(this, &Impl::OnDeleteWaterBodyClicked);
+        if (Noesis::Button* button = root->FindName<Noesis::Button>("SaveWaterMaterialButton"))
+            button->Click() += Noesis::MakeDelegate(this, &Impl::OnSaveWaterMaterialClicked);
 
         for (uint32_t i = 0; i < 8; ++i)
         {
@@ -1469,37 +1545,9 @@ struct NoesisLayer::Impl
 
             std::snprintf(name, sizeof(name), "Slot%uText", i);
             editorTextureSlotTexts[i] = root->FindName<Noesis::TextBlock>(name);
-
-            std::snprintf(name, sizeof(name), "Asset%uButton", i);
-            if (Noesis::Button* assetButton = root->FindName<Noesis::Button>(name))
-            {
-                assetButtons[i] = assetButton;
-                assetButton->Click() += Noesis::MakeDelegate(this, &Impl::OnAssetClicked);
-            }
-
-            std::snprintf(name, sizeof(name), "Asset%uText", i);
-            assetTexts[i] = root->FindName<Noesis::TextBlock>(name);
-
-            std::snprintf(name, sizeof(name), "Asset%uImage", i);
-            assetImages[i] = root->FindName<Noesis::Image>(name);
         }
 
-        for (uint32_t i = 8; i < assetButtons.size(); ++i)
-        {
-            char name[16];
-            std::snprintf(name, sizeof(name), "Asset%uButton", i);
-            if (Noesis::Button* assetButton = root->FindName<Noesis::Button>(name))
-            {
-                assetButtons[i] = assetButton;
-                assetButton->Click() += Noesis::MakeDelegate(this, &Impl::OnAssetClicked);
-            }
-
-            std::snprintf(name, sizeof(name), "Asset%uText", i);
-            assetTexts[i] = root->FindName<Noesis::TextBlock>(name);
-
-            std::snprintf(name, sizeof(name), "Asset%uImage", i);
-            assetImages[i] = root->FindName<Noesis::Image>(name);
-        }
+        assetTilePanel = root->FindName<Noesis::Panel>("AssetTilePanel");
 
         for (uint32_t i = 0; i < assetTagButtons.size(); ++i)
         {
@@ -1522,6 +1570,8 @@ struct NoesisLayer::Impl
             button->Click() += Noesis::MakeDelegate(this, &Impl::OnAssetAnimationsClicked);
         if (Noesis::Button* button = root->FindName<Noesis::Button>("AssetMaterialsButton"))
             button->Click() += Noesis::MakeDelegate(this, &Impl::OnAssetMaterialsClicked);
+        if (Noesis::Button* button = root->FindName<Noesis::Button>("AssetWaterMaterialsButton"))
+            button->Click() += Noesis::MakeDelegate(this, &Impl::OnAssetWaterMaterialsClicked);
         if (Noesis::Button* button = root->FindName<Noesis::Button>("ImportTextureButton"))
             button->Click() += Noesis::MakeDelegate(this, &Impl::OnImportTextureClicked);
         if (Noesis::Button* button = root->FindName<Noesis::Button>("ImportModelButton"))
@@ -1534,6 +1584,10 @@ struct NoesisLayer::Impl
             button->Click() += Noesis::MakeDelegate(this, &Impl::OnAssetFolderHomeClicked);
         if (Noesis::Button* button = root->FindName<Noesis::Button>("AssetFolderUpButton"))
             button->Click() += Noesis::MakeDelegate(this, &Impl::OnAssetFolderUpClicked);
+        if (Noesis::Button* button = root->FindName<Noesis::Button>("AssetCreateFolderButton"))
+            button->Click() += Noesis::MakeDelegate(this, &Impl::OnAssetCreateFolderClicked);
+        if (Noesis::Button* button = root->FindName<Noesis::Button>("AssetDeleteFolderButton"))
+            button->Click() += Noesis::MakeDelegate(this, &Impl::OnAssetDeleteFolderClicked);
         if (Noesis::Button* button = root->FindName<Noesis::Button>("AssetClearButton"))
             button->Click() += Noesis::MakeDelegate(this, &Impl::OnAssetClearClicked);
         if (Noesis::Button* button = root->FindName<Noesis::Button>("AssetRefreshButton"))
@@ -1572,6 +1626,7 @@ struct NoesisLayer::Impl
         ResetMaterialEditor();
         UpdateEditorTextureText();
         RefreshPaletteSlotText();
+        ApplyEditorDarkTheme(root.GetPtr());
         return CreateEditorView(root, width, height);
     }
 
@@ -1688,6 +1743,9 @@ struct NoesisLayer::Impl
             editorPaintMix && editorPaintMix->GetIsChecked().GetValueOrDefault()
                 ? MapEditorPaintMode::Mix
                 : MapEditorPaintMode::Replace;
+        settings.waterSculptActive = waterSculptActive && waterBodyEditorState.selected;
+        settings.waterSculptAdd = waterSculptAdd;
+        settings.waterSculptRadiusMeters = waterSculptRadiusMeters;
         return settings;
     }
 
@@ -1711,10 +1769,16 @@ struct NoesisLayer::Impl
         }
 
         if (EnsureAssetLibrary())
+        {
+            EnsureDefaultWaterMaterialAsset();
             editorPaletteSlots = assetLibrary->LoadWorldPalette(assetMapDirectory, editorPaletteSlots);
+        }
 
         RefreshPaletteSlotText();
         RefreshAssetBrowser();
+        assetLibrarySignature = BuildAssetLibrarySignature();
+        assetLibraryPollInitialized = true;
+        nextAssetLibraryPollSeconds = currentTimeSeconds + 1.0;
     }
 
     std::array<MapEditorPaletteSlot, 8> GetPaletteSlots() const
@@ -1727,7 +1791,8 @@ struct NoesisLayer::Impl
         if (assetLibrary)
             return true;
 
-        assetLibrary = std::make_unique<AssetLibrary>(FindClientRoot());
+        const std::filesystem::path clientRoot = assetReaderRoot.empty() ? FindClientRoot() : assetReaderRoot;
+        assetLibrary = std::make_unique<AssetLibrary>(clientRoot);
         if (!assetLibrary->Initialize())
         {
             assetLibrary.reset();
@@ -1735,7 +1800,105 @@ struct NoesisLayer::Impl
             Log("[ASSET-LIBRARY] failed to initialize");
             return false;
         }
+        LogFormat("[ASSET-LIBRARY] root=%s", assetLibrary->LibraryRoot().generic_string().c_str());
         return true;
+    }
+
+    std::string BuildAssetLibrarySignature() const
+    {
+        if (!assetLibrary)
+            return {};
+
+        std::filesystem::path root = assetLibrary->LibraryRoot();
+        if (!std::filesystem::exists(root))
+            return {};
+
+        std::vector<std::string> parts;
+        std::error_code ec;
+        for (std::filesystem::recursive_directory_iterator it(root, std::filesystem::directory_options::skip_permission_denied, ec), end;
+             it != end;
+             it.increment(ec))
+        {
+            if (ec)
+                continue;
+            const std::filesystem::directory_entry& entry = *it;
+            const std::filesystem::path relative = std::filesystem::relative(entry.path(), root, ec);
+            if (ec)
+                continue;
+
+            const auto writeTime = entry.last_write_time(ec);
+            const auto ticks = ec ? 0 : writeTime.time_since_epoch().count();
+            std::uintmax_t size = 0;
+            if (entry.is_regular_file(ec))
+                size = entry.file_size(ec);
+            parts.push_back(relative.generic_string() + "|" + std::to_string(ticks) + "|" + std::to_string(size));
+        }
+        std::sort(parts.begin(), parts.end());
+        std::string signature;
+        for (const std::string& part : parts)
+        {
+            signature += part;
+            signature.push_back('\n');
+        }
+        return signature;
+    }
+
+    void PollAssetLibraryChanges(double timeSeconds)
+    {
+        if (!mapEditorOpen || !assetLibrary || timeSeconds < nextAssetLibraryPollSeconds)
+            return;
+        nextAssetLibraryPollSeconds = timeSeconds + 1.0;
+
+        const std::string signature = BuildAssetLibrarySignature();
+        if (!assetLibraryPollInitialized)
+        {
+            assetLibrarySignature = signature;
+            assetLibraryPollInitialized = true;
+            return;
+        }
+        if (signature == assetLibrarySignature)
+            return;
+
+        assetLibrarySignature = signature;
+        std::string error;
+        if (!assetLibrary->Refresh(error))
+        {
+            SetAssetStatus("Asset auto-refresh failed: " + error);
+            return;
+        }
+        if (!selectedAssetId.empty() && !assetLibrary->FindById(selectedAssetId))
+            selectedAssetId.clear();
+        RefreshAssetBrowser();
+        SetAssetStatus("Assets refreshed from disk");
+    }
+
+    void EnsureDefaultWaterMaterialAsset()
+    {
+        if (!assetLibrary)
+            return;
+        if (auto existing = assetLibrary->FindById("watermat_Default_Water");
+            existing && existing->category == AssetLibrary::Category::WaterMaterial)
+        {
+            return;
+        }
+
+        WaterMaterialData defaultMaterial{};
+        defaultMaterial.config = WaterConfig{};
+        defaultMaterial.config.waterLevelY = 0.0f;
+        defaultMaterial.normalTiling = 1.0f;
+        defaultMaterial.formatVersion = 1;
+
+        AssetLibrary::ImportOptions options{};
+        options.displayName = "Default_Water";
+        options.tags = {"water", "default", "material"};
+        AssetLibrary::Entry entry{};
+        std::string error;
+        if (assetLibrary->CreateWaterMaterial(options, defaultMaterial, entry, error))
+        {
+            Tracenf("[ASSET-LIBRARY] default water material ready id=%s", entry.id.c_str());
+            return;
+        }
+        Tracenf("[ASSET-LIBRARY] default water material create failed: %s", error.c_str());
     }
 
     static void SetText(Noesis::TextBlock* textBlock, const std::string& text)
@@ -1762,6 +1925,72 @@ struct NoesisLayer::Impl
         char* end = nullptr;
         const float value = std::strtof(text.c_str(), &end);
         return end != text.c_str() ? value : fallback;
+    }
+
+    static Noesis::Ptr<Noesis::SolidColorBrush> EditorBrush(uint8_t r, uint8_t g, uint8_t b, uint8_t a = 255)
+    {
+        return Noesis::MakePtr<Noesis::SolidColorBrush>(Noesis::Color(r, g, b, a));
+    }
+
+    void ApplyEditorDarkTheme(Noesis::FrameworkElement* root)
+    {
+        Noesis::Ptr<Noesis::SolidColorBrush> panelBrush = EditorBrush(30, 30, 40);
+        Noesis::Ptr<Noesis::SolidColorBrush> panelBorderBrush = EditorBrush(255, 255, 255, 128);
+        Noesis::Ptr<Noesis::SolidColorBrush> inputBrush = EditorBrush(22, 34, 49);
+        Noesis::Ptr<Noesis::SolidColorBrush> inputBorderBrush = EditorBrush(117, 138, 168, 96);
+        Noesis::Ptr<Noesis::SolidColorBrush> buttonBrush = EditorBrush(38, 53, 74);
+        Noesis::Ptr<Noesis::SolidColorBrush> buttonBorderBrush = EditorBrush(117, 138, 168, 112);
+
+        auto applyBorder = [&](const char* name, Noesis::Brush* background) {
+            if (!root)
+                return;
+            if (Noesis::Border* border = root->FindName<Noesis::Border>(name))
+            {
+                border->SetBackground(background);
+                border->SetBorderBrush(panelBorderBrush.GetPtr());
+            }
+        };
+
+        applyBorder("ToolsPanelBorder", panelBrush.GetPtr());
+        applyBorder("InspectorPanelBorder", panelBrush.GetPtr());
+        applyBorder("AssetBrowserPanelBorder", panelBrush.GetPtr());
+        applyBorder("AssetFolderPanelBorder", inputBrush.GetPtr());
+
+        auto applyTextBox = [&](Noesis::TextBox* textBox) {
+            if (!textBox)
+                return;
+            textBox->SetBackground(inputBrush.GetPtr());
+            textBox->SetBorderBrush(inputBorderBrush.GetPtr());
+        };
+
+        applyTextBox(assetSearchBox);
+        applyTextBox(assetNameBox);
+        applyTextBox(assetSubpathBox);
+        applyTextBox(assetTagsBox);
+        applyTextBox(materialTilingXBox);
+        applyTextBox(materialTilingYBox);
+        applyTextBox(materialNormalStrengthBox);
+        applyTextBox(materialTintBox);
+        applyTextBox(selectedWaterBodyNameBox);
+
+        auto applyButton = [&](Noesis::Button* button) {
+            if (!button)
+                return;
+            button->SetBackground(buttonBrush.GetPtr());
+            button->SetBorderBrush(buttonBorderBrush.GetPtr());
+        };
+
+        for (Noesis::Button* button : editorTextureButtons)
+            applyButton(button);
+        for (Noesis::Button* button : assetButtons)
+            applyButton(button);
+        for (Noesis::Button* button : assetTagButtons)
+            applyButton(button);
+        for (Noesis::Button* button : materialSlotButtons)
+            applyButton(button);
+
+        if (assetFolderTree)
+            assetFolderTree->SetBackground(inputBrush.GetPtr());
     }
 
     void SetMaterialMetadataReadOnly(bool readOnly)
@@ -2044,102 +2273,135 @@ struct NoesisLayer::Impl
 
     void UpdateWaterText()
     {
+        if (!waterBodyControlsUpdating && !editingWaterMaterialId.empty() && assetLibrary)
+        {
+            AssetLibrary::Entry updated{};
+            std::string error;
+            if (assetLibrary->UpdateWaterMaterial(editingWaterMaterialId, editingWaterMaterial, updated, error))
+            {
+                editingWaterMaterial = updated.waterMaterial;
+                Tracenf("[WATER-OBJ-4] material edited: id=%s", editingWaterMaterialId.c_str());
+            }
+            else if (!error.empty())
+            {
+                SetAssetStatus("Water material save failed: " + error);
+            }
+        }
         char buffer[96];
         if (waterEnabledButton)
-            waterEnabledButton->SetContent(waterConfig.enabled ? "Water: ON" : "Water: OFF");
-        std::snprintf(buffer, sizeof(buffer), "Water Level Y: %.1f m", waterConfig.waterLevelY);
+            waterEnabledButton->SetContent(EditedWaterConfig().enabled ? "Water: ON" : "Water: OFF");
+        std::snprintf(buffer, sizeof(buffer), "Water Level Y: %.1f m", EditedWaterConfig().waterLevelY);
         SetText(waterLevelText, buffer);
-        std::snprintf(buffer, sizeof(buffer), "Base R: %.2f", waterConfig.baseColor[0]);
+        std::snprintf(buffer, sizeof(buffer), "Base R: %.2f", EditedWaterConfig().baseColor[0]);
         SetText(waterBaseRText, buffer);
-        std::snprintf(buffer, sizeof(buffer), "Base G: %.2f", waterConfig.baseColor[1]);
+        std::snprintf(buffer, sizeof(buffer), "Base G: %.2f", EditedWaterConfig().baseColor[1]);
         SetText(waterBaseGText, buffer);
-        std::snprintf(buffer, sizeof(buffer), "Base B: %.2f", waterConfig.baseColor[2]);
+        std::snprintf(buffer, sizeof(buffer), "Base B: %.2f", EditedWaterConfig().baseColor[2]);
         SetText(waterBaseBText, buffer);
-        std::snprintf(buffer, sizeof(buffer), "Base Alpha: %.2f", waterConfig.baseColor[3]);
+        std::snprintf(buffer, sizeof(buffer), "Base Alpha: %.2f", EditedWaterConfig().baseColor[3]);
         SetText(waterAlphaText, buffer);
-        std::snprintf(buffer, sizeof(buffer), "Normal Tiling Fine: %.3f", waterConfig.waveScaleSmall);
+        std::snprintf(buffer, sizeof(buffer), "Normal Tiling Fine: %.3f", EditedWaterConfig().waveScaleSmall);
         SetText(waterWaveScaleSmallText, buffer);
-        std::snprintf(buffer, sizeof(buffer), "Normal Tiling Broad: %.3f", waterConfig.waveScaleLarge);
+        std::snprintf(buffer, sizeof(buffer), "Normal Tiling Broad: %.3f", EditedWaterConfig().waveScaleLarge);
         SetText(waterWaveScaleLargeText, buffer);
-        std::snprintf(buffer, sizeof(buffer), "Wave Speed Small: %.3f", waterConfig.waveSpeedSmall);
+        std::snprintf(buffer, sizeof(buffer), "Wave Speed Small: %.3f", EditedWaterConfig().waveSpeedSmall);
         SetText(waterWaveSpeedSmallText, buffer);
-        std::snprintf(buffer, sizeof(buffer), "Wave Speed Large: %.3f", waterConfig.waveSpeedLarge);
+        std::snprintf(buffer, sizeof(buffer), "Wave Speed Large: %.3f", EditedWaterConfig().waveSpeedLarge);
         SetText(waterWaveSpeedLargeText, buffer);
-        std::snprintf(buffer, sizeof(buffer), "Normal Strength: %.2f", waterConfig.normalStrength);
+        std::snprintf(buffer, sizeof(buffer), "Normal Strength: %.2f", EditedWaterConfig().normalStrength);
         SetText(waterNormalStrengthText, buffer);
-        std::snprintf(buffer, sizeof(buffer), "Fresnel Power: %.1f", waterConfig.fresnelPower);
+        std::snprintf(buffer, sizeof(buffer), "Fresnel Power: %.1f", EditedWaterConfig().fresnelPower);
         SetText(waterFresnelPowerText, buffer);
-        std::snprintf(buffer, sizeof(buffer), "Fresnel Min: %.2f", waterConfig.fresnelMin);
+        std::snprintf(buffer, sizeof(buffer), "Fresnel Min: %.2f", EditedWaterConfig().fresnelMin);
         SetText(waterFresnelMinText, buffer);
-        std::snprintf(buffer, sizeof(buffer), "Reflection R: %.2f", waterConfig.reflectionColor[0]);
+        std::snprintf(buffer, sizeof(buffer), "Reflection R: %.2f", EditedWaterConfig().reflectionColor[0]);
         SetText(waterReflectionRText, buffer);
-        std::snprintf(buffer, sizeof(buffer), "Reflection G: %.2f", waterConfig.reflectionColor[1]);
+        std::snprintf(buffer, sizeof(buffer), "Reflection G: %.2f", EditedWaterConfig().reflectionColor[1]);
         SetText(waterReflectionGText, buffer);
-        std::snprintf(buffer, sizeof(buffer), "Reflection B: %.2f", waterConfig.reflectionColor[2]);
+        std::snprintf(buffer, sizeof(buffer), "Reflection B: %.2f", EditedWaterConfig().reflectionColor[2]);
         SetText(waterReflectionBText, buffer);
         if (waterReflectionEnabledButton)
-            waterReflectionEnabledButton->SetContent(waterConfig.reflectionEnabled ? "Reflection: ON" : "Reflection: OFF");
+            waterReflectionEnabledButton->SetContent(EditedWaterConfig().reflectionEnabled ? "Reflection: ON" : "Reflection: OFF");
         if (waterReflectionQuarterButton)
             waterReflectionQuarterButton->SetContent(
-                waterConfig.reflectionQuality == WaterConfig::ReflectionQuality::Quarter ? "[Quarter]" : "Quarter");
+                EditedWaterConfig().reflectionQuality == WaterConfig::ReflectionQuality::Quarter ? "[Quarter]" : "Quarter");
         if (waterReflectionHalfButton)
             waterReflectionHalfButton->SetContent(
-                waterConfig.reflectionQuality == WaterConfig::ReflectionQuality::Half ? "[Half]" : "Half");
+                EditedWaterConfig().reflectionQuality == WaterConfig::ReflectionQuality::Half ? "[Half]" : "Half");
         if (waterReflectionFullButton)
             waterReflectionFullButton->SetContent(
-                waterConfig.reflectionQuality == WaterConfig::ReflectionQuality::Full ? "[Full]" : "Full");
-        std::snprintf(buffer, sizeof(buffer), "Distortion Strength: %.3f", waterConfig.reflectionDistortionStrength);
+                EditedWaterConfig().reflectionQuality == WaterConfig::ReflectionQuality::Full ? "[Full]" : "Full");
+        std::snprintf(buffer, sizeof(buffer), "Distortion Strength: %.3f", EditedWaterConfig().reflectionDistortionStrength);
         SetText(waterReflectionDistortionText, buffer);
         if (waterRefractionEnabledButton)
-            waterRefractionEnabledButton->SetContent(waterConfig.refractionEnabled ? "Refraction: ON" : "Refraction: OFF");
-        std::snprintf(buffer, sizeof(buffer), "Shallow R: %.2f", waterConfig.shallowColor[0]);
+            waterRefractionEnabledButton->SetContent(EditedWaterConfig().refractionEnabled ? "Refraction: ON" : "Refraction: OFF");
+        std::snprintf(buffer, sizeof(buffer), "Shallow R: %.2f", EditedWaterConfig().shallowColor[0]);
         SetText(waterShallowRText, buffer);
-        std::snprintf(buffer, sizeof(buffer), "Shallow G: %.2f", waterConfig.shallowColor[1]);
+        std::snprintf(buffer, sizeof(buffer), "Shallow G: %.2f", EditedWaterConfig().shallowColor[1]);
         SetText(waterShallowGText, buffer);
-        std::snprintf(buffer, sizeof(buffer), "Shallow B: %.2f", waterConfig.shallowColor[2]);
+        std::snprintf(buffer, sizeof(buffer), "Shallow B: %.2f", EditedWaterConfig().shallowColor[2]);
         SetText(waterShallowBText, buffer);
-        std::snprintf(buffer, sizeof(buffer), "Deep R: %.2f", waterConfig.deepColor[0]);
+        std::snprintf(buffer, sizeof(buffer), "Deep R: %.2f", EditedWaterConfig().deepColor[0]);
         SetText(waterDeepRText, buffer);
-        std::snprintf(buffer, sizeof(buffer), "Deep G: %.2f", waterConfig.deepColor[1]);
+        std::snprintf(buffer, sizeof(buffer), "Deep G: %.2f", EditedWaterConfig().deepColor[1]);
         SetText(waterDeepGText, buffer);
-        std::snprintf(buffer, sizeof(buffer), "Deep B: %.2f", waterConfig.deepColor[2]);
+        std::snprintf(buffer, sizeof(buffer), "Deep B: %.2f", EditedWaterConfig().deepColor[2]);
         SetText(waterDeepBText, buffer);
-        std::snprintf(buffer, sizeof(buffer), "Color Depth Min: %.1f m", waterConfig.depthColorMin);
+        std::snprintf(buffer, sizeof(buffer), "Color Depth Min: %.1f m", EditedWaterConfig().depthColorMin);
         SetText(waterDepthColorMinText, buffer);
-        std::snprintf(buffer, sizeof(buffer), "Color Depth Max: %.1f m", waterConfig.depthColorMax);
+        std::snprintf(buffer, sizeof(buffer), "Color Depth Max: %.1f m", EditedWaterConfig().depthColorMax);
         SetText(waterDepthColorMaxText, buffer);
-        std::snprintf(buffer, sizeof(buffer), "Fade Distance: %.1f m", waterConfig.depthFadeDistance);
+        std::snprintf(buffer, sizeof(buffer), "Fade Distance: %.1f m", EditedWaterConfig().depthFadeDistance);
         SetText(waterDepthFadeText, buffer);
-        std::snprintf(buffer, sizeof(buffer), "Refraction Strength: %.3f", waterConfig.refractionStrength);
+        std::snprintf(buffer, sizeof(buffer), "Refraction Strength: %.3f", EditedWaterConfig().refractionStrength);
         SetText(waterRefractionStrengthText, buffer);
-        std::snprintf(buffer, sizeof(buffer), "Refraction Depth Mult: %.2f", waterConfig.refractionDepthStrength);
+        std::snprintf(buffer, sizeof(buffer), "Refraction Depth Mult: %.2f", EditedWaterConfig().refractionDepthStrength);
         SetText(waterRefractionDepthStrengthText, buffer);
         if (waterFoamEnabledButton)
-            waterFoamEnabledButton->SetContent(waterConfig.foamEnabled ? "Foam: ON" : "Foam: OFF");
-        std::snprintf(buffer, sizeof(buffer), "Foam Distance: %.2f m", waterConfig.foamDistance);
+            waterFoamEnabledButton->SetContent(EditedWaterConfig().foamEnabled ? "Foam: ON" : "Foam: OFF");
+        std::snprintf(buffer, sizeof(buffer), "Foam Distance: %.2f m", EditedWaterConfig().foamDistance);
         SetText(waterFoamDistanceText, buffer);
-        std::snprintf(buffer, sizeof(buffer), "Foam Intensity: %.2f", waterConfig.foamIntensity);
+        std::snprintf(buffer, sizeof(buffer), "Foam Intensity: %.2f", EditedWaterConfig().foamIntensity);
         SetText(waterFoamIntensityText, buffer);
-        std::snprintf(buffer, sizeof(buffer), "Foam Scale: %.2f m", waterConfig.foamScale);
+        std::snprintf(buffer, sizeof(buffer), "Foam Scale: %.2f m", EditedWaterConfig().foamScale);
         SetText(waterFoamScaleText, buffer);
-        std::snprintf(buffer, sizeof(buffer), "Terrain Foam Thickness: %.2f m", waterConfig.foamTerrainThickness);
+        std::snprintf(buffer, sizeof(buffer), "Terrain Foam Thickness: %.2f m", EditedWaterConfig().foamTerrainThickness);
         SetText(waterFoamTerrainThicknessText, buffer);
         if (waterCausticOffButton)
-            waterCausticOffButton->SetContent(waterConfig.causticMode == WaterConfig::CausticMode::Off ? "[Off]" : "Off");
+            waterCausticOffButton->SetContent(EditedWaterConfig().causticMode == WaterConfig::CausticMode::Off ? "[Off]" : "Off");
         if (waterCausticAnimatedButton)
             waterCausticAnimatedButton->SetContent(
-                waterConfig.causticMode == WaterConfig::CausticMode::AnimatedTexture ? "[Animated]" : "Animated");
+                EditedWaterConfig().causticMode == WaterConfig::CausticMode::AnimatedTexture ? "[Animated]" : "Animated");
         if (waterCausticProceduralButton)
             waterCausticProceduralButton->SetContent(
-                waterConfig.causticMode == WaterConfig::CausticMode::Procedural ? "[Procedural]" : "Procedural");
-        std::snprintf(buffer, sizeof(buffer), "Caustic Intensity: %.2f", waterConfig.causticIntensity);
+                EditedWaterConfig().causticMode == WaterConfig::CausticMode::Procedural ? "[Procedural]" : "Procedural");
+        std::snprintf(buffer, sizeof(buffer), "Caustic Intensity: %.2f", EditedWaterConfig().causticIntensity);
         SetText(waterCausticIntensityText, buffer);
-        std::snprintf(buffer, sizeof(buffer), "Caustic Scale: %.2f m", waterConfig.causticScale);
+        std::snprintf(buffer, sizeof(buffer), "Caustic Scale: %.2f m", EditedWaterConfig().causticScale);
         SetText(waterCausticScaleText, buffer);
-        std::snprintf(buffer, sizeof(buffer), "Caustic Speed: %.2f", waterConfig.causticSpeed);
+        std::snprintf(buffer, sizeof(buffer), "Caustic Speed: %.2f", EditedWaterConfig().causticSpeed);
         SetText(waterCausticSpeedText, buffer);
-        std::snprintf(buffer, sizeof(buffer), "Caustic Max Depth: %.1f m", waterConfig.causticMaxDepth);
+        std::snprintf(buffer, sizeof(buffer), "Caustic Max Depth: %.1f m", EditedWaterConfig().causticMaxDepth);
         SetText(waterCausticMaxDepthText, buffer);
+        std::snprintf(buffer, sizeof(buffer), "Edge Fade Distance: %.2f m", EditedWaterConfig().edgeFadeDistance);
+        SetText(waterEdgeFadeDistanceText, buffer);
+        if (waterEdgeFadeLinearButton)
+            waterEdgeFadeLinearButton->SetContent(
+                EditedWaterConfig().edgeFadeCurve == WaterConfig::EdgeFadeCurve::Linear ? "[Linear]" : "Linear");
+        if (waterEdgeFadeSmoothButton)
+            waterEdgeFadeSmoothButton->SetContent(
+                EditedWaterConfig().edgeFadeCurve == WaterConfig::EdgeFadeCurve::Smooth ? "[Smooth]" : "Smooth");
+        if (waterEdgeFadeExponentialButton)
+            waterEdgeFadeExponentialButton->SetContent(
+                EditedWaterConfig().edgeFadeCurve == WaterConfig::EdgeFadeCurve::Exponential ? "[Exp]" : "Exp");
+        if (waterMaterialEditorTitleText)
+        {
+            auto entry = assetLibrary && !editingWaterMaterialId.empty()
+                ? assetLibrary->FindById(editingWaterMaterialId)
+                : std::optional<AssetLibrary::Entry>{};
+            const std::string title = entry ? ("Material: " + entry->displayName) : "No water material open";
+            SetText(waterMaterialEditorTitleText, title);
+        }
     }
 
     void SetInspectorSection(Noesis::Button* button,
@@ -2170,13 +2432,16 @@ struct NoesisLayer::Impl
     void UpdateInspectorSections()
     {
         SetInspectorSection(lightingMainSectionButton, lightingMainSection, lightingMainExpanded, "Lighting");
+        SetInspectorSection(waterMaterialEditorSectionButton, waterMaterialEditorSection, waterMaterialEditorExpanded, "Water Material Editor");
         SetInspectorSection(waterBaseSectionButton, waterBaseSection, waterBaseExpanded, "Water");
+        SetInspectorSection(waterEdgeFadeSectionButton, waterEdgeFadeSection, waterEdgeFadeExpanded, "Edge Fade");
         SetInspectorSection(waterReflectionSectionButton, waterReflectionSection, waterReflectionExpanded, "Reflection");
         SetInspectorSection(waterRefractionSectionButton, waterRefractionSection, waterRefractionExpanded, "Refraction and Depth");
         SetInspectorSection(waterFoamSectionButton, waterFoamSection, waterFoamExpanded, "Foam");
         SetInspectorSection(waterCausticSectionButton, waterCausticSection, waterCausticExpanded, "Caustic");
         SetInspectorSection(dynamicLightsSectionButton, dynamicLightsSection, dynamicLightsExpanded, "Dynamic Lights");
         SetInspectorSection(selectedLightSectionButton, selectedLightSection, selectedLightExpanded, "Selected Light");
+        SetInspectorSection(selectedWaterBodySectionButton, selectedWaterBodySection, selectedWaterBodyExpanded, "Selected Water Body");
         ClampInspectorScrollOffset();
     }
 
@@ -2238,6 +2503,12 @@ struct NoesisLayer::Impl
         UpdateInspectorSections();
     }
 
+    void OnWaterEdgeFadeSectionClicked(Noesis::BaseComponent*, const Noesis::RoutedEventArgs&)
+    {
+        waterEdgeFadeExpanded = !waterEdgeFadeExpanded;
+        UpdateInspectorSections();
+    }
+
     void OnWaterReflectionSectionClicked(Noesis::BaseComponent*, const Noesis::RoutedEventArgs&)
     {
         waterReflectionExpanded = !waterReflectionExpanded;
@@ -2272,6 +2543,49 @@ struct NoesisLayer::Impl
     {
         selectedLightExpanded = !selectedLightExpanded;
         UpdateInspectorSections();
+    }
+
+    void OnSelectedWaterBodySectionClicked(Noesis::BaseComponent*, const Noesis::RoutedEventArgs&)
+    {
+        selectedWaterBodyExpanded = !selectedWaterBodyExpanded;
+        UpdateInspectorSections();
+    }
+
+    void OnWaterMaterialEditorSectionClicked(Noesis::BaseComponent*, const Noesis::RoutedEventArgs&)
+    {
+        waterMaterialEditorExpanded = !waterMaterialEditorExpanded;
+        if (waterMaterialEditorExpanded && editingWaterMaterialId.empty())
+            OpenWaterMaterialEditor(waterBodyEditorState.materialId);
+        UpdateInspectorSections();
+    }
+
+    void OnEditWaterMaterialClicked(Noesis::BaseComponent*, const Noesis::RoutedEventArgs&)
+    {
+        if (!waterBodyEditorState.selected)
+        {
+            SetAssetStatus("Select a water body first");
+            return;
+        }
+        OpenWaterMaterialEditor(waterBodyEditorState.materialId);
+    }
+
+    void OnSaveWaterMaterialClicked(Noesis::BaseComponent*, const Noesis::RoutedEventArgs&)
+    {
+        if (editingWaterMaterialId.empty() || !assetLibrary)
+        {
+            SetAssetStatus("No water material open");
+            return;
+        }
+        AssetLibrary::Entry updated{};
+        std::string error;
+        if (!assetLibrary->UpdateWaterMaterial(editingWaterMaterialId, editingWaterMaterial, updated, error))
+        {
+            SetAssetStatus("Water material save failed: " + error);
+            return;
+        }
+        editingWaterMaterial = updated.waterMaterial;
+        RefreshAssetBrowser();
+        SetAssetStatus("Water material saved: " + updated.displayName);
     }
 
     void OnLightingSunEnabledClicked(Noesis::BaseComponent*, const Noesis::RoutedEventArgs&)
@@ -2428,278 +2742,303 @@ struct NoesisLayer::Impl
 
     void OnWaterEnabledClicked(Noesis::BaseComponent*, const Noesis::RoutedEventArgs&)
     {
-        waterConfig.enabled = !waterConfig.enabled;
+        EditedWaterConfig().enabled = !EditedWaterConfig().enabled;
         UpdateWaterText();
-        SetAssetStatus(waterConfig.enabled ? "Water enabled" : "Water disabled");
+        SetAssetStatus(EditedWaterConfig().enabled ? "Water enabled" : "Water disabled");
     }
 
     void OnWaterLevelChanged(Noesis::BaseComponent*, const Noesis::RoutedPropertyChangedEventArgs<float>& args)
     {
-        waterConfig.waterLevelY = std::clamp(args.newValue, -50.0f, 50.0f);
+        EditedWaterConfig().waterLevelY = std::clamp(args.newValue, -50.0f, 50.0f);
         UpdateWaterText();
+        UpdateWaterBodyText();
     }
 
     void OnWaterBaseRChanged(Noesis::BaseComponent*, const Noesis::RoutedPropertyChangedEventArgs<float>& args)
     {
-        waterConfig.baseColor[0] = std::clamp(args.newValue, 0.0f, 1.0f);
+        EditedWaterConfig().baseColor[0] = std::clamp(args.newValue, 0.0f, 1.0f);
         UpdateWaterText();
     }
 
     void OnWaterBaseGChanged(Noesis::BaseComponent*, const Noesis::RoutedPropertyChangedEventArgs<float>& args)
     {
-        waterConfig.baseColor[1] = std::clamp(args.newValue, 0.0f, 1.0f);
+        EditedWaterConfig().baseColor[1] = std::clamp(args.newValue, 0.0f, 1.0f);
         UpdateWaterText();
     }
 
     void OnWaterBaseBChanged(Noesis::BaseComponent*, const Noesis::RoutedPropertyChangedEventArgs<float>& args)
     {
-        waterConfig.baseColor[2] = std::clamp(args.newValue, 0.0f, 1.0f);
+        EditedWaterConfig().baseColor[2] = std::clamp(args.newValue, 0.0f, 1.0f);
         UpdateWaterText();
     }
 
     void OnWaterAlphaChanged(Noesis::BaseComponent*, const Noesis::RoutedPropertyChangedEventArgs<float>& args)
     {
-        waterConfig.baseColor[3] = std::clamp(args.newValue, 0.0f, 1.0f);
+        EditedWaterConfig().baseColor[3] = std::clamp(args.newValue, 0.0f, 1.0f);
         UpdateWaterText();
     }
 
     void OnWaterWaveScaleSmallChanged(Noesis::BaseComponent*, const Noesis::RoutedPropertyChangedEventArgs<float>& args)
     {
-        waterConfig.waveScaleSmall = std::clamp(args.newValue, 0.001f, 0.12f);
+        EditedWaterConfig().waveScaleSmall = std::clamp(args.newValue, 0.001f, 0.12f);
         UpdateWaterText();
     }
 
     void OnWaterWaveScaleLargeChanged(Noesis::BaseComponent*, const Noesis::RoutedPropertyChangedEventArgs<float>& args)
     {
-        waterConfig.waveScaleLarge = std::clamp(args.newValue, 0.001f, 0.08f);
+        EditedWaterConfig().waveScaleLarge = std::clamp(args.newValue, 0.001f, 0.08f);
         UpdateWaterText();
     }
 
     void OnWaterWaveSpeedSmallChanged(Noesis::BaseComponent*, const Noesis::RoutedPropertyChangedEventArgs<float>& args)
     {
-        waterConfig.waveSpeedSmall = std::clamp(args.newValue, 0.0f, 0.5f);
+        EditedWaterConfig().waveSpeedSmall = std::clamp(args.newValue, 0.0f, 0.5f);
         UpdateWaterText();
     }
 
     void OnWaterWaveSpeedLargeChanged(Noesis::BaseComponent*, const Noesis::RoutedPropertyChangedEventArgs<float>& args)
     {
-        waterConfig.waveSpeedLarge = std::clamp(args.newValue, 0.0f, 0.5f);
+        EditedWaterConfig().waveSpeedLarge = std::clamp(args.newValue, 0.0f, 0.5f);
         UpdateWaterText();
     }
 
     void OnWaterNormalStrengthChanged(Noesis::BaseComponent*, const Noesis::RoutedPropertyChangedEventArgs<float>& args)
     {
-        waterConfig.normalStrength = std::clamp(args.newValue, 0.0f, 2.0f);
+        EditedWaterConfig().normalStrength = std::clamp(args.newValue, 0.0f, 2.0f);
         UpdateWaterText();
     }
 
     void OnWaterFresnelPowerChanged(Noesis::BaseComponent*, const Noesis::RoutedPropertyChangedEventArgs<float>& args)
     {
-        waterConfig.fresnelPower = std::clamp(args.newValue, 1.0f, 10.0f);
+        EditedWaterConfig().fresnelPower = std::clamp(args.newValue, 1.0f, 10.0f);
         UpdateWaterText();
     }
 
     void OnWaterFresnelMinChanged(Noesis::BaseComponent*, const Noesis::RoutedPropertyChangedEventArgs<float>& args)
     {
-        waterConfig.fresnelMin = std::clamp(args.newValue, 0.0f, 0.5f);
+        EditedWaterConfig().fresnelMin = std::clamp(args.newValue, 0.0f, 0.5f);
         UpdateWaterText();
     }
 
     void OnWaterReflectionRChanged(Noesis::BaseComponent*, const Noesis::RoutedPropertyChangedEventArgs<float>& args)
     {
-        waterConfig.reflectionColor[0] = std::clamp(args.newValue, 0.0f, 1.0f);
+        EditedWaterConfig().reflectionColor[0] = std::clamp(args.newValue, 0.0f, 1.0f);
         UpdateWaterText();
     }
 
     void OnWaterReflectionGChanged(Noesis::BaseComponent*, const Noesis::RoutedPropertyChangedEventArgs<float>& args)
     {
-        waterConfig.reflectionColor[1] = std::clamp(args.newValue, 0.0f, 1.0f);
+        EditedWaterConfig().reflectionColor[1] = std::clamp(args.newValue, 0.0f, 1.0f);
         UpdateWaterText();
     }
 
     void OnWaterReflectionBChanged(Noesis::BaseComponent*, const Noesis::RoutedPropertyChangedEventArgs<float>& args)
     {
-        waterConfig.reflectionColor[2] = std::clamp(args.newValue, 0.0f, 1.0f);
+        EditedWaterConfig().reflectionColor[2] = std::clamp(args.newValue, 0.0f, 1.0f);
         UpdateWaterText();
     }
 
     void OnWaterReflectionEnabledClicked(Noesis::BaseComponent*, const Noesis::RoutedEventArgs&)
     {
-        waterConfig.reflectionEnabled = !waterConfig.reflectionEnabled;
+        EditedWaterConfig().reflectionEnabled = !EditedWaterConfig().reflectionEnabled;
         UpdateWaterText();
-        SetAssetStatus(waterConfig.reflectionEnabled ? "Water reflection enabled" : "Water reflection disabled");
+        SetAssetStatus(EditedWaterConfig().reflectionEnabled ? "Water reflection enabled" : "Water reflection disabled");
     }
 
     void OnWaterReflectionQuarterClicked(Noesis::BaseComponent*, const Noesis::RoutedEventArgs&)
     {
-        waterConfig.reflectionQuality = WaterConfig::ReflectionQuality::Quarter;
+        EditedWaterConfig().reflectionQuality = WaterConfig::ReflectionQuality::Quarter;
         UpdateWaterText();
         SetAssetStatus("Water reflection quality: Quarter");
     }
 
     void OnWaterReflectionHalfClicked(Noesis::BaseComponent*, const Noesis::RoutedEventArgs&)
     {
-        waterConfig.reflectionQuality = WaterConfig::ReflectionQuality::Half;
+        EditedWaterConfig().reflectionQuality = WaterConfig::ReflectionQuality::Half;
         UpdateWaterText();
         SetAssetStatus("Water reflection quality: Half");
     }
 
     void OnWaterReflectionFullClicked(Noesis::BaseComponent*, const Noesis::RoutedEventArgs&)
     {
-        waterConfig.reflectionQuality = WaterConfig::ReflectionQuality::Full;
+        EditedWaterConfig().reflectionQuality = WaterConfig::ReflectionQuality::Full;
         UpdateWaterText();
         SetAssetStatus("Water reflection quality: Full");
     }
 
     void OnWaterReflectionDistortionChanged(Noesis::BaseComponent*, const Noesis::RoutedPropertyChangedEventArgs<float>& args)
     {
-        waterConfig.reflectionDistortionStrength = std::clamp(args.newValue, 0.0f, 0.2f);
+        EditedWaterConfig().reflectionDistortionStrength = std::clamp(args.newValue, 0.0f, 0.2f);
+        UpdateWaterText();
+    }
+
+    void OnWaterEdgeFadeDistanceChanged(Noesis::BaseComponent*, const Noesis::RoutedPropertyChangedEventArgs<float>& args)
+    {
+        EditedWaterConfig().edgeFadeDistance = std::clamp(args.newValue, 0.0f, 3.0f);
+        UpdateWaterText();
+    }
+
+    void OnWaterEdgeFadeLinearClicked(Noesis::BaseComponent*, const Noesis::RoutedEventArgs&)
+    {
+        EditedWaterConfig().edgeFadeCurve = WaterConfig::EdgeFadeCurve::Linear;
+        UpdateWaterText();
+    }
+
+    void OnWaterEdgeFadeSmoothClicked(Noesis::BaseComponent*, const Noesis::RoutedEventArgs&)
+    {
+        EditedWaterConfig().edgeFadeCurve = WaterConfig::EdgeFadeCurve::Smooth;
+        UpdateWaterText();
+    }
+
+    void OnWaterEdgeFadeExponentialClicked(Noesis::BaseComponent*, const Noesis::RoutedEventArgs&)
+    {
+        EditedWaterConfig().edgeFadeCurve = WaterConfig::EdgeFadeCurve::Exponential;
         UpdateWaterText();
     }
 
     void OnWaterRefractionEnabledClicked(Noesis::BaseComponent*, const Noesis::RoutedEventArgs&)
     {
-        waterConfig.refractionEnabled = !waterConfig.refractionEnabled;
+        EditedWaterConfig().refractionEnabled = !EditedWaterConfig().refractionEnabled;
         UpdateWaterText();
-        SetAssetStatus(waterConfig.refractionEnabled ? "Water refraction enabled" : "Water refraction disabled");
+        SetAssetStatus(EditedWaterConfig().refractionEnabled ? "Water refraction enabled" : "Water refraction disabled");
     }
 
     void OnWaterShallowRChanged(Noesis::BaseComponent*, const Noesis::RoutedPropertyChangedEventArgs<float>& args)
     {
-        waterConfig.shallowColor[0] = std::clamp(args.newValue, 0.0f, 1.0f);
+        EditedWaterConfig().shallowColor[0] = std::clamp(args.newValue, 0.0f, 1.0f);
         UpdateWaterText();
     }
 
     void OnWaterShallowGChanged(Noesis::BaseComponent*, const Noesis::RoutedPropertyChangedEventArgs<float>& args)
     {
-        waterConfig.shallowColor[1] = std::clamp(args.newValue, 0.0f, 1.0f);
+        EditedWaterConfig().shallowColor[1] = std::clamp(args.newValue, 0.0f, 1.0f);
         UpdateWaterText();
     }
 
     void OnWaterShallowBChanged(Noesis::BaseComponent*, const Noesis::RoutedPropertyChangedEventArgs<float>& args)
     {
-        waterConfig.shallowColor[2] = std::clamp(args.newValue, 0.0f, 1.0f);
+        EditedWaterConfig().shallowColor[2] = std::clamp(args.newValue, 0.0f, 1.0f);
         UpdateWaterText();
     }
 
     void OnWaterDeepRChanged(Noesis::BaseComponent*, const Noesis::RoutedPropertyChangedEventArgs<float>& args)
     {
-        waterConfig.deepColor[0] = std::clamp(args.newValue, 0.0f, 1.0f);
+        EditedWaterConfig().deepColor[0] = std::clamp(args.newValue, 0.0f, 1.0f);
         UpdateWaterText();
     }
 
     void OnWaterDeepGChanged(Noesis::BaseComponent*, const Noesis::RoutedPropertyChangedEventArgs<float>& args)
     {
-        waterConfig.deepColor[1] = std::clamp(args.newValue, 0.0f, 1.0f);
+        EditedWaterConfig().deepColor[1] = std::clamp(args.newValue, 0.0f, 1.0f);
         UpdateWaterText();
     }
 
     void OnWaterDeepBChanged(Noesis::BaseComponent*, const Noesis::RoutedPropertyChangedEventArgs<float>& args)
     {
-        waterConfig.deepColor[2] = std::clamp(args.newValue, 0.0f, 1.0f);
+        EditedWaterConfig().deepColor[2] = std::clamp(args.newValue, 0.0f, 1.0f);
         UpdateWaterText();
     }
 
     void OnWaterDepthColorMinChanged(Noesis::BaseComponent*, const Noesis::RoutedPropertyChangedEventArgs<float>& args)
     {
-        waterConfig.depthColorMin = std::clamp(args.newValue, 0.0f, 50.0f);
-        waterConfig.depthColorMax = std::max(waterConfig.depthColorMax, waterConfig.depthColorMin + 0.001f);
+        EditedWaterConfig().depthColorMin = std::clamp(args.newValue, 0.0f, 50.0f);
+        EditedWaterConfig().depthColorMax = std::max(EditedWaterConfig().depthColorMax, EditedWaterConfig().depthColorMin + 0.001f);
         UpdateWaterText();
     }
 
     void OnWaterDepthColorMaxChanged(Noesis::BaseComponent*, const Noesis::RoutedPropertyChangedEventArgs<float>& args)
     {
-        waterConfig.depthColorMax = std::max(waterConfig.depthColorMin + 0.001f, std::clamp(args.newValue, 0.01f, 50.0f));
+        EditedWaterConfig().depthColorMax = std::max(EditedWaterConfig().depthColorMin + 0.001f, std::clamp(args.newValue, 0.01f, 50.0f));
         UpdateWaterText();
     }
 
     void OnWaterDepthFadeChanged(Noesis::BaseComponent*, const Noesis::RoutedPropertyChangedEventArgs<float>& args)
     {
-        waterConfig.depthFadeDistance = std::clamp(args.newValue, 0.01f, 50.0f);
+        EditedWaterConfig().depthFadeDistance = std::clamp(args.newValue, 0.01f, 50.0f);
         UpdateWaterText();
     }
 
     void OnWaterRefractionStrengthChanged(Noesis::BaseComponent*, const Noesis::RoutedPropertyChangedEventArgs<float>& args)
     {
-        waterConfig.refractionStrength = std::clamp(args.newValue, 0.0f, 0.1f);
+        EditedWaterConfig().refractionStrength = std::clamp(args.newValue, 0.0f, 0.1f);
         UpdateWaterText();
     }
 
     void OnWaterRefractionDepthStrengthChanged(Noesis::BaseComponent*, const Noesis::RoutedPropertyChangedEventArgs<float>& args)
     {
-        waterConfig.refractionDepthStrength = std::clamp(args.newValue, 0.0f, 2.0f);
+        EditedWaterConfig().refractionDepthStrength = std::clamp(args.newValue, 0.0f, 2.0f);
         UpdateWaterText();
     }
 
     void OnWaterFoamEnabledClicked(Noesis::BaseComponent*, const Noesis::RoutedEventArgs&)
     {
-        waterConfig.foamEnabled = !waterConfig.foamEnabled;
+        EditedWaterConfig().foamEnabled = !EditedWaterConfig().foamEnabled;
         UpdateWaterText();
     }
 
     void OnWaterFoamDistanceChanged(Noesis::BaseComponent*, const Noesis::RoutedPropertyChangedEventArgs<float>& args)
     {
-        waterConfig.foamDistance = std::clamp(args.newValue, 0.02f, 1.5f);
+        EditedWaterConfig().foamDistance = std::clamp(args.newValue, 0.02f, 1.5f);
         UpdateWaterText();
     }
 
     void OnWaterFoamIntensityChanged(Noesis::BaseComponent*, const Noesis::RoutedPropertyChangedEventArgs<float>& args)
     {
-        waterConfig.foamIntensity = std::clamp(args.newValue, 0.0f, 2.0f);
+        EditedWaterConfig().foamIntensity = std::clamp(args.newValue, 0.0f, 2.0f);
         UpdateWaterText();
     }
 
     void OnWaterFoamScaleChanged(Noesis::BaseComponent*, const Noesis::RoutedPropertyChangedEventArgs<float>& args)
     {
-        waterConfig.foamScale = std::clamp(args.newValue, 0.1f, 2.0f);
+        EditedWaterConfig().foamScale = std::clamp(args.newValue, 0.1f, 2.0f);
         UpdateWaterText();
     }
 
     void OnWaterFoamTerrainThicknessChanged(Noesis::BaseComponent*, const Noesis::RoutedPropertyChangedEventArgs<float>& args)
     {
-        waterConfig.foamTerrainThickness = std::clamp(args.newValue, 0.0f, 1.0f);
+        EditedWaterConfig().foamTerrainThickness = std::clamp(args.newValue, 0.0f, 1.0f);
         UpdateWaterText();
     }
 
     void OnWaterCausticOffClicked(Noesis::BaseComponent*, const Noesis::RoutedEventArgs&)
     {
-        waterConfig.causticMode = WaterConfig::CausticMode::Off;
+        EditedWaterConfig().causticMode = WaterConfig::CausticMode::Off;
         UpdateWaterText();
     }
 
     void OnWaterCausticAnimatedClicked(Noesis::BaseComponent*, const Noesis::RoutedEventArgs&)
     {
-        waterConfig.causticMode = WaterConfig::CausticMode::AnimatedTexture;
+        EditedWaterConfig().causticMode = WaterConfig::CausticMode::AnimatedTexture;
         UpdateWaterText();
     }
 
     void OnWaterCausticProceduralClicked(Noesis::BaseComponent*, const Noesis::RoutedEventArgs&)
     {
-        waterConfig.causticMode = WaterConfig::CausticMode::Procedural;
+        EditedWaterConfig().causticMode = WaterConfig::CausticMode::Procedural;
         UpdateWaterText();
     }
 
     void OnWaterCausticIntensityChanged(Noesis::BaseComponent*, const Noesis::RoutedPropertyChangedEventArgs<float>& args)
     {
-        waterConfig.causticIntensity = std::clamp(args.newValue, 0.0f, 3.0f);
+        EditedWaterConfig().causticIntensity = std::clamp(args.newValue, 0.0f, 3.0f);
         UpdateWaterText();
     }
 
     void OnWaterCausticScaleChanged(Noesis::BaseComponent*, const Noesis::RoutedPropertyChangedEventArgs<float>& args)
     {
-        waterConfig.causticScale = std::clamp(args.newValue, 0.1f, 2.0f);
+        EditedWaterConfig().causticScale = std::clamp(args.newValue, 0.1f, 2.0f);
         UpdateWaterText();
     }
 
     void OnWaterCausticSpeedChanged(Noesis::BaseComponent*, const Noesis::RoutedPropertyChangedEventArgs<float>& args)
     {
-        waterConfig.causticSpeed = std::clamp(args.newValue, 0.0f, 2.0f);
+        EditedWaterConfig().causticSpeed = std::clamp(args.newValue, 0.0f, 2.0f);
         UpdateWaterText();
     }
 
     void OnWaterCausticMaxDepthChanged(Noesis::BaseComponent*, const Noesis::RoutedPropertyChangedEventArgs<float>& args)
     {
-        waterConfig.causticMaxDepth = std::clamp(args.newValue, 1.0f, 30.0f);
+        EditedWaterConfig().causticMaxDepth = std::clamp(args.newValue, 1.0f, 30.0f);
         UpdateWaterText();
     }
 
@@ -2719,6 +3058,217 @@ struct NoesisLayer::Impl
             return;
         editorCommands.selectedLightChanged = true;
         editorCommands.selectedLight = dynamicLightEditorState;
+    }
+
+    void MarkSelectedWaterBodyChanged()
+    {
+        if (waterBodyControlsUpdating || !waterBodyEditorState.selected)
+            return;
+        editorCommands.selectedWaterBodyChanged = true;
+        editorCommands.selectedWaterBody = waterBodyEditorState;
+    }
+
+    bool OpenWaterMaterialEditor(const std::string& materialId)
+    {
+        if (!EnsureAssetLibrary())
+            return false;
+
+        std::string id = materialId.empty() ? std::string("watermat_Default_Water") : materialId;
+        auto entry = assetLibrary->FindById(id);
+        if (!entry || entry->category != AssetLibrary::Category::WaterMaterial)
+        {
+            EnsureDefaultWaterMaterialAsset();
+            id = "watermat_Default_Water";
+            entry = assetLibrary->FindById(id);
+        }
+        if (!entry || entry->category != AssetLibrary::Category::WaterMaterial)
+        {
+            SetAssetStatus("Water material not found: " + materialId);
+            return false;
+        }
+
+        editingWaterMaterialId = entry->id;
+        editingWaterMaterial = entry->waterMaterial;
+        waterMaterialEditorExpanded = true;
+        ApplyWaterBodyEditorStateToControls();
+        UpdateInspectorSections();
+        SetAssetStatus("Editing water material: " + entry->displayName);
+        Tracenf("[WATER-OBJ-4] material loaded: id=%s name=%s",
+            entry->id.c_str(),
+            entry->displayName.c_str());
+        return true;
+    }
+
+    WaterConfig& EditedWaterConfig()
+    {
+        if (editingWaterMaterialId.empty())
+            OpenWaterMaterialEditor(waterBodyEditorState.materialId);
+        return editingWaterMaterial.config;
+    }
+
+    const WaterConfig& EditedWaterConfig() const
+    {
+        return editingWaterMaterial.config;
+    }
+
+    void SetWaterBodyEditorState(const WaterBodyEditorState& state)
+    {
+        waterBodyEditorState = state;
+        if (!waterBodyEditorState.selected)
+            waterSculptActive = false;
+        ApplyWaterBodyEditorStateToControls();
+    }
+
+    void ApplyWaterBodyEditorStateToControls()
+    {
+        waterBodyControlsUpdating = true;
+        const WaterConfig& water = EditedWaterConfig();
+        if (selectedWaterBodyNameBox)
+            selectedWaterBodyNameBox->SetText(waterBodyEditorState.name.c_str());
+        if (selectedWaterBodyXSlider)
+            selectedWaterBodyXSlider->SetValue(std::clamp(waterBodyEditorState.center[0], -200.0f, 200.0f));
+        if (selectedWaterBodyYSlider)
+            selectedWaterBodyYSlider->SetValue(std::clamp(waterBodyEditorState.center[1], -50.0f, 100.0f));
+        if (selectedWaterBodyZSlider)
+            selectedWaterBodyZSlider->SetValue(std::clamp(waterBodyEditorState.center[2], -200.0f, 200.0f));
+        if (selectedWaterBodyWidthSlider)
+            selectedWaterBodyWidthSlider->SetValue(std::clamp(waterBodyEditorState.width, 1.0f, 200.0f));
+        if (selectedWaterBodyDepthSlider)
+            selectedWaterBodyDepthSlider->SetValue(std::clamp(waterBodyEditorState.depth, 1.0f, 200.0f));
+        if (waterSculptRadiusSlider)
+            waterSculptRadiusSlider->SetValue(std::clamp(waterSculptRadiusMeters, 0.5f, 20.0f));
+        if (waterLevelSlider)
+            waterLevelSlider->SetValue(std::clamp(water.waterLevelY, -50.0f, 50.0f));
+        if (waterBaseRSlider)
+            waterBaseRSlider->SetValue(std::clamp(water.baseColor[0], 0.0f, 1.0f));
+        if (waterBaseGSlider)
+            waterBaseGSlider->SetValue(std::clamp(water.baseColor[1], 0.0f, 1.0f));
+        if (waterBaseBSlider)
+            waterBaseBSlider->SetValue(std::clamp(water.baseColor[2], 0.0f, 1.0f));
+        if (waterAlphaSlider)
+            waterAlphaSlider->SetValue(std::clamp(water.baseColor[3], 0.0f, 1.0f));
+        if (waterWaveScaleSmallSlider)
+            waterWaveScaleSmallSlider->SetValue(std::clamp(water.waveScaleSmall, 0.001f, 0.12f));
+        if (waterWaveScaleLargeSlider)
+            waterWaveScaleLargeSlider->SetValue(std::clamp(water.waveScaleLarge, 0.001f, 0.08f));
+        if (waterWaveSpeedSmallSlider)
+            waterWaveSpeedSmallSlider->SetValue(std::clamp(water.waveSpeedSmall, 0.0f, 0.5f));
+        if (waterWaveSpeedLargeSlider)
+            waterWaveSpeedLargeSlider->SetValue(std::clamp(water.waveSpeedLarge, 0.0f, 0.5f));
+        if (waterNormalStrengthSlider)
+            waterNormalStrengthSlider->SetValue(std::clamp(water.normalStrength, 0.0f, 2.0f));
+        if (waterFresnelPowerSlider)
+            waterFresnelPowerSlider->SetValue(std::clamp(water.fresnelPower, 1.0f, 10.0f));
+        if (waterFresnelMinSlider)
+            waterFresnelMinSlider->SetValue(std::clamp(water.fresnelMin, 0.0f, 0.5f));
+        if (waterReflectionRSlider)
+            waterReflectionRSlider->SetValue(std::clamp(water.reflectionColor[0], 0.0f, 1.0f));
+        if (waterReflectionGSlider)
+            waterReflectionGSlider->SetValue(std::clamp(water.reflectionColor[1], 0.0f, 1.0f));
+        if (waterReflectionBSlider)
+            waterReflectionBSlider->SetValue(std::clamp(water.reflectionColor[2], 0.0f, 1.0f));
+        if (waterReflectionDistortionSlider)
+            waterReflectionDistortionSlider->SetValue(std::clamp(water.reflectionDistortionStrength, 0.0f, 0.2f));
+        if (waterEdgeFadeDistanceSlider)
+            waterEdgeFadeDistanceSlider->SetValue(std::clamp(water.edgeFadeDistance, 0.0f, 3.0f));
+        if (waterShallowRSlider)
+            waterShallowRSlider->SetValue(std::clamp(water.shallowColor[0], 0.0f, 1.0f));
+        if (waterShallowGSlider)
+            waterShallowGSlider->SetValue(std::clamp(water.shallowColor[1], 0.0f, 1.0f));
+        if (waterShallowBSlider)
+            waterShallowBSlider->SetValue(std::clamp(water.shallowColor[2], 0.0f, 1.0f));
+        if (waterDeepRSlider)
+            waterDeepRSlider->SetValue(std::clamp(water.deepColor[0], 0.0f, 1.0f));
+        if (waterDeepGSlider)
+            waterDeepGSlider->SetValue(std::clamp(water.deepColor[1], 0.0f, 1.0f));
+        if (waterDeepBSlider)
+            waterDeepBSlider->SetValue(std::clamp(water.deepColor[2], 0.0f, 1.0f));
+        if (waterDepthColorMinSlider)
+            waterDepthColorMinSlider->SetValue(std::clamp(water.depthColorMin, 0.0f, 50.0f));
+        if (waterDepthColorMaxSlider)
+            waterDepthColorMaxSlider->SetValue(std::clamp(water.depthColorMax, 0.01f, 50.0f));
+        if (waterDepthFadeSlider)
+            waterDepthFadeSlider->SetValue(std::clamp(water.depthFadeDistance, 0.01f, 50.0f));
+        if (waterRefractionStrengthSlider)
+            waterRefractionStrengthSlider->SetValue(std::clamp(water.refractionStrength, 0.0f, 0.1f));
+        if (waterRefractionDepthStrengthSlider)
+            waterRefractionDepthStrengthSlider->SetValue(std::clamp(water.refractionDepthStrength, 0.0f, 2.0f));
+        if (waterFoamDistanceSlider)
+            waterFoamDistanceSlider->SetValue(std::clamp(water.foamDistance, 0.02f, 1.5f));
+        if (waterFoamIntensitySlider)
+            waterFoamIntensitySlider->SetValue(std::clamp(water.foamIntensity, 0.0f, 2.0f));
+        if (waterFoamScaleSlider)
+            waterFoamScaleSlider->SetValue(std::clamp(water.foamScale, 0.1f, 2.0f));
+        if (waterFoamTerrainThicknessSlider)
+            waterFoamTerrainThicknessSlider->SetValue(std::clamp(water.foamTerrainThickness, 0.0f, 1.0f));
+        if (waterCausticIntensitySlider)
+            waterCausticIntensitySlider->SetValue(std::clamp(water.causticIntensity, 0.0f, 3.0f));
+        if (waterCausticScaleSlider)
+            waterCausticScaleSlider->SetValue(std::clamp(water.causticScale, 0.1f, 2.0f));
+        if (waterCausticSpeedSlider)
+            waterCausticSpeedSlider->SetValue(std::clamp(water.causticSpeed, 0.0f, 2.0f));
+        if (waterCausticMaxDepthSlider)
+            waterCausticMaxDepthSlider->SetValue(std::clamp(water.causticMaxDepth, 1.0f, 30.0f));
+        UpdateWaterText();
+        waterBodyControlsUpdating = false;
+        UpdateWaterBodyText();
+        UpdateWaterSculptText();
+    }
+
+    void UpdateWaterSculptText()
+    {
+        char buffer[96];
+        if (selectedWaterSculptButton)
+            selectedWaterSculptButton->SetContent(waterSculptActive ? "Sculpt Mode: ON" : "Sculpt Mode: OFF");
+        if (selectedWaterSculptControls)
+            selectedWaterSculptControls->SetVisibility(waterSculptActive && waterBodyEditorState.selected
+                ? Noesis::Visibility_Visible
+                : Noesis::Visibility_Collapsed);
+        if (waterSculptAddButton)
+            waterSculptAddButton->SetContent(waterSculptAdd ? "[v] Add" : "Add");
+        if (waterSculptRemoveButton)
+            waterSculptRemoveButton->SetContent(!waterSculptAdd ? "[v] Remove" : "Remove");
+        std::snprintf(buffer, sizeof(buffer), "Sculpt Radius: %.1f m", waterSculptRadiusMeters);
+        SetText(waterSculptRadiusText, buffer);
+    }
+
+    void UpdateWaterBodyText()
+    {
+        char buffer[128];
+        if (!waterBodyEditorState.selected)
+        {
+            SetText(selectedWaterBodyTitleText, "No water body selected");
+            SetText(selectedWaterBodyMaterialText, "Material: -");
+            if (selectedWaterBodyMaterialButton)
+                selectedWaterBodyMaterialButton->SetContent("Drop Water Material Here");
+            SetText(selectedWaterBodyXText, "X: 0.0");
+            SetText(selectedWaterBodyYText, "Water Level Y: 0.0 m");
+            SetText(selectedWaterBodyZText, "Z: 0.0");
+            SetText(selectedWaterBodyWidthText, "Bbox Width: 0.0 m");
+            SetText(selectedWaterBodyDepthText, "Bbox Depth: 0.0 m");
+            UpdateWaterSculptText();
+            return;
+        }
+
+        std::snprintf(buffer, sizeof(buffer), "WATER BODY #%u (%u total)", waterBodyEditorState.id, waterBodyEditorState.count);
+        SetText(selectedWaterBodyTitleText, buffer);
+        const std::string materialLabel = waterBodyEditorState.materialName.empty()
+            ? (waterBodyEditorState.materialId.empty() ? "Inline Water" : waterBodyEditorState.materialId)
+            : waterBodyEditorState.materialName;
+        SetText(selectedWaterBodyMaterialText, ("Material: " + materialLabel).c_str());
+        if (selectedWaterBodyMaterialButton)
+            selectedWaterBodyMaterialButton->SetContent(("Material Slot: " + materialLabel).c_str());
+        std::snprintf(buffer, sizeof(buffer), "X: %.1f", waterBodyEditorState.center[0]);
+        SetText(selectedWaterBodyXText, buffer);
+        std::snprintf(buffer, sizeof(buffer), "Water Level Y: %.1f m", waterBodyEditorState.center[1]);
+        SetText(selectedWaterBodyYText, buffer);
+        std::snprintf(buffer, sizeof(buffer), "Z: %.1f", waterBodyEditorState.center[2]);
+        SetText(selectedWaterBodyZText, buffer);
+        std::snprintf(buffer, sizeof(buffer), "Bbox Width: %.1f m", waterBodyEditorState.width);
+        SetText(selectedWaterBodyWidthText, buffer);
+        std::snprintf(buffer, sizeof(buffer), "Bbox Depth: %.1f m", waterBodyEditorState.depth);
+        SetText(selectedWaterBodyDepthText, buffer);
+        UpdateWaterSculptText();
     }
 
     void UpdateDynamicLightText()
@@ -3030,6 +3580,64 @@ struct NoesisLayer::Impl
         ApplyDynamicLightEditorStateToControls();
     }
 
+    void OnSelectedWaterBodyNameChanged(Noesis::BaseComponent*, const Noesis::RoutedEventArgs&)
+    {
+        if (waterBodyControlsUpdating || !waterBodyEditorState.selected)
+            return;
+        waterBodyEditorState.name = GetText(selectedWaterBodyNameBox);
+        if (waterBodyEditorState.name.empty())
+            waterBodyEditorState.name = "Water_" + std::to_string(waterBodyEditorState.id);
+        MarkSelectedWaterBodyChanged();
+        UpdateWaterBodyText();
+    }
+
+    void OnSelectedWaterBodyXChanged(Noesis::BaseComponent*, const Noesis::RoutedPropertyChangedEventArgs<float>& args)
+    {
+        if (waterBodyControlsUpdating || !waterBodyEditorState.selected)
+            return;
+        waterBodyEditorState.center[0] = std::clamp(args.newValue, -200.0f, 200.0f);
+        MarkSelectedWaterBodyChanged();
+        UpdateWaterBodyText();
+    }
+
+    void OnSelectedWaterBodyYChanged(Noesis::BaseComponent*, const Noesis::RoutedPropertyChangedEventArgs<float>& args)
+    {
+        if (waterBodyControlsUpdating || !waterBodyEditorState.selected)
+            return;
+        waterBodyEditorState.center[1] = std::clamp(args.newValue, -50.0f, 100.0f);
+        EditedWaterConfig().waterLevelY = waterBodyEditorState.center[1];
+        MarkSelectedWaterBodyChanged();
+        UpdateWaterBodyText();
+        UpdateWaterText();
+    }
+
+    void OnSelectedWaterBodyZChanged(Noesis::BaseComponent*, const Noesis::RoutedPropertyChangedEventArgs<float>& args)
+    {
+        if (waterBodyControlsUpdating || !waterBodyEditorState.selected)
+            return;
+        waterBodyEditorState.center[2] = std::clamp(args.newValue, -200.0f, 200.0f);
+        MarkSelectedWaterBodyChanged();
+        UpdateWaterBodyText();
+    }
+
+    void OnSelectedWaterBodyWidthChanged(Noesis::BaseComponent*, const Noesis::RoutedPropertyChangedEventArgs<float>& args)
+    {
+        if (waterBodyControlsUpdating || !waterBodyEditorState.selected)
+            return;
+        waterBodyEditorState.width = std::clamp(args.newValue, 1.0f, 200.0f);
+        MarkSelectedWaterBodyChanged();
+        UpdateWaterBodyText();
+    }
+
+    void OnSelectedWaterBodyDepthChanged(Noesis::BaseComponent*, const Noesis::RoutedPropertyChangedEventArgs<float>& args)
+    {
+        if (waterBodyControlsUpdating || !waterBodyEditorState.selected)
+            return;
+        waterBodyEditorState.depth = std::clamp(args.newValue, 1.0f, 200.0f);
+        MarkSelectedWaterBodyChanged();
+        UpdateWaterBodyText();
+    }
+
     void UpdateBrushValueText()
     {
         char buffer[64];
@@ -3115,6 +3723,13 @@ struct NoesisLayer::Impl
         renameOriginalContent.Reset();
         renameAssetButton = nullptr;
         renameFolderItem = nullptr;
+        assetTilePanel = nullptr;
+        assetButtons.clear();
+        assetTexts.clear();
+        assetImages.clear();
+        assetButtonStorage.clear();
+        assetTextStorage.clear();
+        assetImageStorage.clear();
         assetFolderItems.clear();
         assetBreadcrumbButtons.clear();
         assetBreadcrumbSeparators.clear();
@@ -3173,6 +3788,7 @@ struct NoesisLayer::Impl
         {
         case AssetLibrary::Category::Texture: payload.type = DragPayloadType::AssetTexture; break;
         case AssetLibrary::Category::Material: payload.type = DragPayloadType::AssetMaterial; break;
+        case AssetLibrary::Category::WaterMaterial: payload.type = DragPayloadType::AssetWaterMaterial; break;
         case AssetLibrary::Category::Model: payload.type = DragPayloadType::AssetModel; break;
         case AssetLibrary::Category::Animation: payload.type = DragPayloadType::AssetAnimation; break;
         default: payload.type = DragPayloadType::None; break;
@@ -3218,6 +3834,40 @@ struct NoesisLayer::Impl
         return std::nullopt;
     }
 
+    bool HitWaterBodyMaterialSlot(int x, int y) const
+    {
+        return waterBodyEditorState.selected && HitElement(selectedWaterBodyMaterialButton, x, y, 4.0f);
+    }
+
+    bool AssignWaterMaterialToSelectedBody(const AssetLibrary::Entry& entry)
+    {
+        if (entry.category != AssetLibrary::Category::WaterMaterial &&
+            entry.category != AssetLibrary::Category::Material)
+        {
+            SetAssetStatus("Water bodies accept water materials or PBR materials");
+            return true;
+        }
+        if (!waterBodyEditorState.selected)
+        {
+            SetAssetStatus("Select a water body first");
+            return true;
+        }
+        waterBodyEditorState.materialId = entry.id;
+        waterBodyEditorState.materialName = entry.displayName;
+        MarkSelectedWaterBodyChanged();
+        UpdateWaterBodyText();
+        if (entry.category == AssetLibrary::Category::WaterMaterial)
+            OpenWaterMaterialEditor(entry.id);
+        else
+            editingWaterMaterialId.clear();
+        SetAssetStatus("Water body material <- " + entry.displayName);
+        Tracenf("[WATER-OBJ-4] water body material assigned: body_id=%u material=%s category=%s",
+            waterBodyEditorState.id,
+            entry.id.c_str(),
+            AssetLibrary::CategoryName(entry.category));
+        return true;
+    }
+
     std::optional<uint32_t> HitPaintSlot(int x, int y) const
     {
         for (uint32_t i = 0; i < editorTextureButtons.size(); ++i)
@@ -3237,6 +3887,16 @@ struct NoesisLayer::Impl
             auto it = assetFolderItemPaths.find(item.GetPtr());
             if (it != assetFolderItemPaths.end())
                 return it->second;
+        }
+        return std::nullopt;
+    }
+
+    std::optional<std::string> HitFolderTile(int x, int y) const
+    {
+        for (uint32_t i = 0; i < visibleAssetFolders.size() && i < assetButtons.size(); ++i)
+        {
+            if (HitElement(assetButtons[i], x, y, 4.0f))
+                return visibleAssetFolders[i];
         }
         return std::nullopt;
     }
@@ -3400,7 +4060,8 @@ struct NoesisLayer::Impl
 
     void BeginAssetRename(uint32_t index)
     {
-        if (index >= visibleAssetEntries.size() || index >= assetButtons.size() || !assetButtons[index])
+        const size_t slotIndex = static_cast<size_t>(index) + visibleAssetFolders.size();
+        if (index >= visibleAssetEntries.size() || slotIndex >= assetButtons.size() || !assetButtons[slotIndex])
             return;
 
         RestoreRenameUi();
@@ -3411,7 +4072,7 @@ struct NoesisLayer::Impl
         renameOriginalName = entry.displayName;
         renameEditText = entry.displayName;
         renameAssetIndex = index;
-        renameAssetButton = assetButtons[index];
+        renameAssetButton = assetButtons[slotIndex];
         renameOriginalContent.Reset(renameAssetButton->GetContent());
         renameTextBox = Noesis::MakePtr<Noesis::TextBox>();
         renameTextBox->SetText(renameEditText.c_str());
@@ -3530,8 +4191,11 @@ struct NoesisLayer::Impl
     {
         for (uint32_t i = 0; i < assetButtons.size(); ++i)
         {
-            if (i < visibleAssetEntries.size() && HitElement(assetButtons[i], x, y, 4.0f))
-                return i;
+            if (i < visibleAssetFolders.size())
+                continue;
+            const size_t assetIndex = static_cast<size_t>(i) - visibleAssetFolders.size();
+            if (assetIndex < visibleAssetEntries.size() && HitElement(assetButtons[i], x, y, 4.0f))
+                return static_cast<uint32_t>(assetIndex);
         }
         return std::nullopt;
     }
@@ -3540,7 +4204,10 @@ struct NoesisLayer::Impl
     {
         if (selectedAssetId.empty())
             return std::nullopt;
-        for (uint32_t i = 0; i < visibleAssetEntries.size() && i < assetButtons.size(); ++i)
+        const size_t availableAssetSlots = assetButtons.size() > visibleAssetFolders.size()
+            ? assetButtons.size() - visibleAssetFolders.size()
+            : 0;
+        for (uint32_t i = 0; i < visibleAssetEntries.size() && i < availableAssetSlots; ++i)
         {
             if (visibleAssetEntries[i].id == selectedAssetId)
                 return i;
@@ -3613,6 +4280,15 @@ struct NoesisLayer::Impl
             return true;
         }
 
+        if (event.type == InputEvent::KeyDown && event.key == Key_Delete &&
+            !selectedAssetFolderPath.empty() &&
+            !IsAllAssetFolderPath(selectedAssetFolderPath) &&
+            !IsRootAssetFolderPath(selectedAssetFolderPath))
+        {
+            DeleteSelectedAssetFolder();
+            return true;
+        }
+
         if (event.type == InputEvent::MouseDown && event.button == MouseButton_Right)
         {
             if (auto index = HitAssetTile(event.x, event.y))
@@ -3636,6 +4312,13 @@ struct NoesisLayer::Impl
         if (!activeAssetDrag)
             return;
 
+        if (HitWaterBodyMaterialSlot(x, y))
+        {
+            const bool valid = currentDragPayload.type == DragPayloadType::AssetWaterMaterial ||
+                currentDragPayload.type == DragPayloadType::AssetMaterial;
+            SetDragHighlight(selectedWaterBodyMaterialButton, valid);
+            return;
+        }
         if (auto slot = HitMaterialSlot(x, y))
         {
             const bool valid = currentDragPayload.type == DragPayloadType::AssetTexture &&
@@ -3661,6 +4344,16 @@ struct NoesisLayer::Impl
             SetDragHighlight(itemIt != assetFolderItems.end() ? itemIt->GetPtr() : nullptr, valid);
             return;
         }
+        if (auto folder = HitFolderTile(x, y))
+        {
+            const bool valid = currentDragPayload.type == DragPayloadType::AssetTexture ||
+                currentDragPayload.type == DragPayloadType::AssetMaterial ||
+                currentDragPayload.type == DragPayloadType::AssetWaterMaterial;
+            auto indexIt = std::find(visibleAssetFolders.begin(), visibleAssetFolders.end(), *folder);
+            const size_t index = static_cast<size_t>(std::distance(visibleAssetFolders.begin(), indexIt));
+            SetDragHighlight(index < assetButtons.size() ? assetButtons[index] : nullptr, valid);
+            return;
+        }
         ClearDragHighlight();
     }
 
@@ -3673,6 +4366,9 @@ struct NoesisLayer::Impl
         auto entry = assetLibrary->FindById(currentDragPayload.assetId);
         if (!entry)
             return false;
+
+        if (HitWaterBodyMaterialSlot(x, y))
+            return AssignWaterMaterialToSelectedBody(*entry);
 
         if (auto slot = HitMaterialSlot(x, y))
             return AssignTextureToMaterialSlot(*slot, *entry);
@@ -3697,7 +4393,8 @@ struct NoesisLayer::Impl
                 return true;
             }
             if (currentDragPayload.type != DragPayloadType::AssetTexture &&
-                currentDragPayload.type != DragPayloadType::AssetMaterial)
+                currentDragPayload.type != DragPayloadType::AssetMaterial &&
+                currentDragPayload.type != DragPayloadType::AssetWaterMaterial)
             {
                 SetAssetStatus("This asset type cannot be moved by folder drop yet");
                 return true;
@@ -3720,6 +4417,38 @@ struct NoesisLayer::Impl
             return true;
         }
 
+        if (auto folder = HitFolderTile(x, y))
+        {
+            if (currentDragPayload.type != DragPayloadType::AssetTexture &&
+                currentDragPayload.type != DragPayloadType::AssetMaterial &&
+                currentDragPayload.type != DragPayloadType::AssetWaterMaterial)
+            {
+                SetAssetStatus("This asset type cannot be moved by folder drop yet");
+                return true;
+            }
+
+            AssetLibrary::Entry moved{};
+            std::string error;
+            if (!assetLibrary->MoveAssetToSubpath(currentDragPayload.assetId, *folder, moved, error))
+            {
+                SetAssetStatus("Move failed: " + error);
+                return true;
+            }
+            selectedAssetId = moved.id;
+            activeAssetSubpath = moved.subpath.empty() ? std::string(kRootAssetFolderPath) : moved.subpath;
+            selectedAssetFolderPath = activeAssetSubpath;
+            RefreshPaletteSlotsReferencingAsset(moved);
+            RefreshAssetBrowser();
+            SetAssetStatus("Moved " + moved.displayName + " to " + moved.subpath);
+            return true;
+        }
+
+        if (currentDragPayload.type == DragPayloadType::AssetWaterMaterial ||
+            currentDragPayload.type == DragPayloadType::AssetMaterial)
+        {
+            return AssignWaterMaterialToSelectedBody(*entry);
+        }
+
         return false;
     }
 
@@ -3732,11 +4461,15 @@ struct NoesisLayer::Impl
         {
             for (uint32_t i = 0; i < assetButtons.size(); ++i)
             {
-                if (i >= visibleAssetEntries.size() || !HitElement(assetButtons[i], event.x, event.y, 4.0f))
+                if (i < visibleAssetFolders.size())
                     continue;
-                potentialDragPayload = PayloadForEntry(visibleAssetEntries[i]);
+                const size_t assetIndex = static_cast<size_t>(i) - visibleAssetFolders.size();
+                if (assetIndex >= visibleAssetEntries.size() || !HitElement(assetButtons[i], event.x, event.y, 4.0f))
+                    continue;
+                potentialDragPayload = PayloadForEntry(visibleAssetEntries[assetIndex]);
                 potentialAssetDrag = potentialDragPayload.type == DragPayloadType::AssetTexture ||
-                    potentialDragPayload.type == DragPayloadType::AssetMaterial ||
+                potentialDragPayload.type == DragPayloadType::AssetMaterial ||
+                    potentialDragPayload.type == DragPayloadType::AssetWaterMaterial ||
                     potentialDragPayload.type == DragPayloadType::AssetModel ||
                     potentialDragPayload.type == DragPayloadType::AssetAnimation;
                 dragStartX = event.x;
@@ -3936,41 +4669,59 @@ struct NoesisLayer::Impl
                 MarkSelectedLightChanged();
                 UpdateDynamicLightText();
                 return true;
-            case 25: waterConfig.waterLevelY = std::clamp(value, -50.0f, 50.0f); UpdateWaterText(); return true;
-            case 26: waterConfig.baseColor[0] = std::clamp(value, 0.0f, 1.0f); UpdateWaterText(); return true;
-            case 27: waterConfig.baseColor[1] = std::clamp(value, 0.0f, 1.0f); UpdateWaterText(); return true;
-            case 28: waterConfig.baseColor[2] = std::clamp(value, 0.0f, 1.0f); UpdateWaterText(); return true;
-            case 29: waterConfig.baseColor[3] = std::clamp(value, 0.0f, 1.0f); UpdateWaterText(); return true;
-            case 30: waterConfig.waveScaleSmall = std::clamp(value, 0.001f, 0.12f); UpdateWaterText(); return true;
-            case 31: waterConfig.waveScaleLarge = std::clamp(value, 0.001f, 0.08f); UpdateWaterText(); return true;
-            case 32: waterConfig.waveSpeedSmall = std::clamp(value, 0.0f, 0.5f); UpdateWaterText(); return true;
-            case 33: waterConfig.waveSpeedLarge = std::clamp(value, 0.0f, 0.5f); UpdateWaterText(); return true;
-            case 34: waterConfig.normalStrength = std::clamp(value, 0.0f, 2.0f); UpdateWaterText(); return true;
-            case 35: waterConfig.fresnelPower = std::clamp(value, 1.0f, 10.0f); UpdateWaterText(); return true;
-            case 36: waterConfig.fresnelMin = std::clamp(value, 0.0f, 0.5f); UpdateWaterText(); return true;
-            case 37: waterConfig.reflectionColor[0] = std::clamp(value, 0.0f, 1.0f); UpdateWaterText(); return true;
-            case 38: waterConfig.reflectionColor[1] = std::clamp(value, 0.0f, 1.0f); UpdateWaterText(); return true;
-            case 39: waterConfig.reflectionColor[2] = std::clamp(value, 0.0f, 1.0f); UpdateWaterText(); return true;
-            case 40: waterConfig.reflectionDistortionStrength = std::clamp(value, 0.0f, 0.2f); UpdateWaterText(); return true;
-            case 41: waterConfig.foamDistance = std::clamp(value, 0.02f, 1.5f); UpdateWaterText(); return true;
-            case 42: waterConfig.foamIntensity = std::clamp(value, 0.0f, 2.0f); UpdateWaterText(); return true;
-            case 43: waterConfig.foamScale = std::clamp(value, 0.1f, 2.0f); UpdateWaterText(); return true;
-            case 44: waterConfig.foamTerrainThickness = std::clamp(value, 0.0f, 1.0f); UpdateWaterText(); return true;
-            case 45: waterConfig.causticIntensity = std::clamp(value, 0.0f, 3.0f); UpdateWaterText(); return true;
-            case 46: waterConfig.causticScale = std::clamp(value, 0.1f, 2.0f); UpdateWaterText(); return true;
-            case 47: waterConfig.causticSpeed = std::clamp(value, 0.0f, 2.0f); UpdateWaterText(); return true;
-            case 48: waterConfig.causticMaxDepth = std::clamp(value, 1.0f, 30.0f); UpdateWaterText(); return true;
-            case 49: waterConfig.shallowColor[0] = std::clamp(value, 0.0f, 1.0f); UpdateWaterText(); return true;
-            case 50: waterConfig.shallowColor[1] = std::clamp(value, 0.0f, 1.0f); UpdateWaterText(); return true;
-            case 51: waterConfig.shallowColor[2] = std::clamp(value, 0.0f, 1.0f); UpdateWaterText(); return true;
-            case 52: waterConfig.deepColor[0] = std::clamp(value, 0.0f, 1.0f); UpdateWaterText(); return true;
-            case 53: waterConfig.deepColor[1] = std::clamp(value, 0.0f, 1.0f); UpdateWaterText(); return true;
-            case 54: waterConfig.deepColor[2] = std::clamp(value, 0.0f, 1.0f); UpdateWaterText(); return true;
-            case 55: waterConfig.depthColorMin = std::clamp(value, 0.0f, 50.0f); waterConfig.depthColorMax = std::max(waterConfig.depthColorMax, waterConfig.depthColorMin + 0.001f); UpdateWaterText(); return true;
-            case 56: waterConfig.depthColorMax = std::max(waterConfig.depthColorMin + 0.001f, std::clamp(value, 0.01f, 50.0f)); UpdateWaterText(); return true;
-            case 57: waterConfig.depthFadeDistance = std::clamp(value, 0.01f, 50.0f); UpdateWaterText(); return true;
-            case 58: waterConfig.refractionStrength = std::clamp(value, 0.0f, 0.1f); UpdateWaterText(); return true;
-            case 59: waterConfig.refractionDepthStrength = std::clamp(value, 0.0f, 2.0f); UpdateWaterText(); return true;
+            case 25:
+                EditedWaterConfig().waterLevelY = std::clamp(value, -50.0f, 50.0f);
+                waterBodyEditorState.center[1] = EditedWaterConfig().waterLevelY;
+                UpdateWaterText();
+                UpdateWaterBodyText();
+                return true;
+            case 26: EditedWaterConfig().baseColor[0] = std::clamp(value, 0.0f, 1.0f); UpdateWaterText(); return true;
+            case 27: EditedWaterConfig().baseColor[1] = std::clamp(value, 0.0f, 1.0f); UpdateWaterText(); return true;
+            case 28: EditedWaterConfig().baseColor[2] = std::clamp(value, 0.0f, 1.0f); UpdateWaterText(); return true;
+            case 29: EditedWaterConfig().baseColor[3] = std::clamp(value, 0.0f, 1.0f); UpdateWaterText(); return true;
+            case 30: EditedWaterConfig().waveScaleSmall = std::clamp(value, 0.001f, 0.12f); UpdateWaterText(); return true;
+            case 31: EditedWaterConfig().waveScaleLarge = std::clamp(value, 0.001f, 0.08f); UpdateWaterText(); return true;
+            case 32: EditedWaterConfig().waveSpeedSmall = std::clamp(value, 0.0f, 0.5f); UpdateWaterText(); return true;
+            case 33: EditedWaterConfig().waveSpeedLarge = std::clamp(value, 0.0f, 0.5f); UpdateWaterText(); return true;
+            case 34: EditedWaterConfig().normalStrength = std::clamp(value, 0.0f, 2.0f); UpdateWaterText(); return true;
+            case 35: EditedWaterConfig().fresnelPower = std::clamp(value, 1.0f, 10.0f); UpdateWaterText(); return true;
+            case 36: EditedWaterConfig().fresnelMin = std::clamp(value, 0.0f, 0.5f); UpdateWaterText(); return true;
+            case 37: EditedWaterConfig().reflectionColor[0] = std::clamp(value, 0.0f, 1.0f); UpdateWaterText(); return true;
+            case 38: EditedWaterConfig().reflectionColor[1] = std::clamp(value, 0.0f, 1.0f); UpdateWaterText(); return true;
+            case 39: EditedWaterConfig().reflectionColor[2] = std::clamp(value, 0.0f, 1.0f); UpdateWaterText(); return true;
+            case 40: EditedWaterConfig().reflectionDistortionStrength = std::clamp(value, 0.0f, 0.2f); UpdateWaterText(); return true;
+            case 41: EditedWaterConfig().foamDistance = std::clamp(value, 0.02f, 1.5f); UpdateWaterText(); return true;
+            case 42: EditedWaterConfig().foamIntensity = std::clamp(value, 0.0f, 2.0f); UpdateWaterText(); return true;
+            case 43: EditedWaterConfig().foamScale = std::clamp(value, 0.1f, 2.0f); UpdateWaterText(); return true;
+            case 44: EditedWaterConfig().foamTerrainThickness = std::clamp(value, 0.0f, 1.0f); UpdateWaterText(); return true;
+            case 45: EditedWaterConfig().causticIntensity = std::clamp(value, 0.0f, 3.0f); UpdateWaterText(); return true;
+            case 46: EditedWaterConfig().causticScale = std::clamp(value, 0.1f, 2.0f); UpdateWaterText(); return true;
+            case 47: EditedWaterConfig().causticSpeed = std::clamp(value, 0.0f, 2.0f); UpdateWaterText(); return true;
+            case 48: EditedWaterConfig().causticMaxDepth = std::clamp(value, 1.0f, 30.0f); UpdateWaterText(); return true;
+            case 49: EditedWaterConfig().shallowColor[0] = std::clamp(value, 0.0f, 1.0f); UpdateWaterText(); return true;
+            case 50: EditedWaterConfig().shallowColor[1] = std::clamp(value, 0.0f, 1.0f); UpdateWaterText(); return true;
+            case 51: EditedWaterConfig().shallowColor[2] = std::clamp(value, 0.0f, 1.0f); UpdateWaterText(); return true;
+            case 52: EditedWaterConfig().deepColor[0] = std::clamp(value, 0.0f, 1.0f); UpdateWaterText(); return true;
+            case 53: EditedWaterConfig().deepColor[1] = std::clamp(value, 0.0f, 1.0f); UpdateWaterText(); return true;
+            case 54: EditedWaterConfig().deepColor[2] = std::clamp(value, 0.0f, 1.0f); UpdateWaterText(); return true;
+            case 55: EditedWaterConfig().depthColorMin = std::clamp(value, 0.0f, 50.0f); EditedWaterConfig().depthColorMax = std::max(EditedWaterConfig().depthColorMax, EditedWaterConfig().depthColorMin + 0.001f); UpdateWaterText(); return true;
+            case 56: EditedWaterConfig().depthColorMax = std::max(EditedWaterConfig().depthColorMin + 0.001f, std::clamp(value, 0.01f, 50.0f)); UpdateWaterText(); return true;
+            case 57: EditedWaterConfig().depthFadeDistance = std::clamp(value, 0.01f, 50.0f); UpdateWaterText(); return true;
+            case 58: EditedWaterConfig().refractionStrength = std::clamp(value, 0.0f, 0.1f); UpdateWaterText(); return true;
+            case 59: EditedWaterConfig().refractionDepthStrength = std::clamp(value, 0.0f, 2.0f); UpdateWaterText(); return true;
+            case 60: waterBodyEditorState.center[0] = std::clamp(value, -200.0f, 200.0f); MarkSelectedWaterBodyChanged(); UpdateWaterBodyText(); return true;
+            case 61:
+                waterBodyEditorState.center[1] = std::clamp(value, -50.0f, 100.0f);
+                EditedWaterConfig().waterLevelY = waterBodyEditorState.center[1];
+                MarkSelectedWaterBodyChanged();
+                UpdateWaterBodyText();
+                UpdateWaterText();
+                return true;
+            case 62: waterBodyEditorState.center[2] = std::clamp(value, -200.0f, 200.0f); MarkSelectedWaterBodyChanged(); UpdateWaterBodyText(); return true;
+            case 63: waterBodyEditorState.width = std::clamp(value, 1.0f, 200.0f); MarkSelectedWaterBodyChanged(); UpdateWaterBodyText(); return true;
+            case 64: waterBodyEditorState.depth = std::clamp(value, 1.0f, 200.0f); MarkSelectedWaterBodyChanged(); UpdateWaterBodyText(); return true;
+            case 65: waterSculptRadiusMeters = std::clamp(value, 0.5f, 20.0f); UpdateWaterSculptText(); return true;
+            case 66: EditedWaterConfig().edgeFadeDistance = std::clamp(value, 0.0f, 3.0f); UpdateWaterText(); return true;
             default:
                 return false;
             }
@@ -4023,19 +4774,19 @@ struct NoesisLayer::Impl
             case 37:
             case 38:
             case 39:
-                return lightingModeActive && waterBaseExpanded;
+                return lightingModeActive && selectedWaterBodyExpanded && waterBodyEditorState.selected && waterBaseExpanded;
             case 40:
-                return lightingModeActive && waterReflectionExpanded;
+                return lightingModeActive && selectedWaterBodyExpanded && waterBodyEditorState.selected && waterReflectionExpanded;
             case 41:
             case 42:
             case 43:
             case 44:
-                return lightingModeActive && waterFoamExpanded;
+                return lightingModeActive && selectedWaterBodyExpanded && waterBodyEditorState.selected && waterFoamExpanded;
             case 45:
             case 46:
             case 47:
             case 48:
-                return lightingModeActive && waterCausticExpanded;
+                return lightingModeActive && selectedWaterBodyExpanded && waterBodyEditorState.selected && waterCausticExpanded;
             case 49:
             case 50:
             case 51:
@@ -4047,7 +4798,18 @@ struct NoesisLayer::Impl
             case 57:
             case 58:
             case 59:
-                return lightingModeActive && waterRefractionExpanded;
+                return lightingModeActive && selectedWaterBodyExpanded && waterBodyEditorState.selected && waterRefractionExpanded;
+            case 60:
+            case 61:
+            case 62:
+            case 63:
+            case 64:
+                return lightingModeActive && selectedWaterBodyExpanded && waterBodyEditorState.selected;
+            case 65:
+                return lightingModeActive && selectedWaterBodyExpanded && waterBodyEditorState.selected && waterSculptActive;
+            case 66:
+                return lightingModeActive && selectedWaterBodyExpanded && waterBodyEditorState.selected &&
+                    waterMaterialEditorExpanded && waterEdgeFadeExpanded;
             default:
                 return false;
             }
@@ -4118,6 +4880,13 @@ struct NoesisLayer::Impl
             case 57: slider = waterDepthFadeSlider; break;
             case 58: slider = waterRefractionStrengthSlider; break;
             case 59: slider = waterRefractionDepthStrengthSlider; break;
+            case 60: slider = selectedWaterBodyXSlider; break;
+            case 61: slider = selectedWaterBodyYSlider; break;
+            case 62: slider = selectedWaterBodyZSlider; break;
+            case 63: slider = selectedWaterBodyWidthSlider; break;
+            case 64: slider = selectedWaterBodyDepthSlider; break;
+            case 65: slider = waterSculptRadiusSlider; break;
+            case 66: slider = waterEdgeFadeDistanceSlider; break;
             default: break;
             }
             float value = 0.0f;
@@ -4196,7 +4965,14 @@ struct NoesisLayer::Impl
                 beginSlider(56, waterDepthColorMaxSlider) ||
                 beginSlider(57, waterDepthFadeSlider) ||
                 beginSlider(58, waterRefractionStrengthSlider) ||
-                beginSlider(59, waterRefractionDepthStrengthSlider))
+                beginSlider(59, waterRefractionDepthStrengthSlider) ||
+                beginSlider(60, selectedWaterBodyXSlider) ||
+                beginSlider(61, selectedWaterBodyYSlider) ||
+                beginSlider(62, selectedWaterBodyZSlider) ||
+                beginSlider(63, selectedWaterBodyWidthSlider) ||
+                beginSlider(64, selectedWaterBodyDepthSlider) ||
+                beginSlider(65, waterSculptRadiusSlider) ||
+                beginSlider(66, waterEdgeFadeDistanceSlider))
                 return true;
         }
 
@@ -4224,6 +5000,12 @@ struct NoesisLayer::Impl
     void OnEditorStrengthChanged(Noesis::BaseComponent*, const Noesis::RoutedPropertyChangedEventArgs<float>& args)
     {
         ApplyBrushSliderState(editorBrushRadiusMeters, args.newValue);
+    }
+
+    void OnWaterSculptRadiusChanged(Noesis::BaseComponent*, const Noesis::RoutedPropertyChangedEventArgs<float>& args)
+    {
+        waterSculptRadiusMeters = std::clamp(args.newValue, 0.5f, 20.0f);
+        UpdateWaterSculptText();
     }
 
     void SetAssetStatus(const std::string& text)
@@ -4259,6 +5041,17 @@ struct NoesisLayer::Impl
             {
                 const std::string child = parent.empty() ? segment : parent + "/" + segment;
                 data.childrenByParent[parent].insert(child);
+                parent = child;
+            }
+        }
+        for (const std::string& folderPath : assetLibrary->FolderSubpathsFor(assetCategory))
+        {
+            std::string parent;
+            for (const std::string& segment : SplitAssetFolderPath(folderPath))
+            {
+                const std::string child = parent.empty() ? segment : parent + "/" + segment;
+                data.childrenByParent[parent].insert(child);
+                data.directCounts.try_emplace(child, 0);
                 parent = child;
             }
         }
@@ -4320,6 +5113,8 @@ struct NoesisLayer::Impl
     Noesis::Ptr<Noesis::TreeViewItem> CreateAssetFolderItem(const std::string& path, const std::string& header)
     {
         Noesis::Ptr<Noesis::TreeViewItem> item = Noesis::MakePtr<Noesis::TreeViewItem>();
+        if (assetFolderItemStyle)
+            item->SetStyle(assetFolderItemStyle);
         item->SetHeader(header.c_str());
         item->SetFocusable(false);
         item->SetIsTabStop(false);
@@ -4408,6 +5203,54 @@ struct NoesisLayer::Impl
         return editorView->GetContent()->FindResource<Noesis::Style>("EditorButton");
     }
 
+    Noesis::Button* AddAssetBrowserTile(const std::string& title, const std::string& subtitle, bool folderTile)
+    {
+        if (!assetTilePanel)
+            return nullptr;
+
+        Noesis::Ptr<Noesis::Button> button = Noesis::MakePtr<Noesis::Button>();
+        button->SetWidth(132.0f);
+        button->SetHeight(124.0f);
+        button->SetMargin(Noesis::Thickness(0.0f, 0.0f, 8.0f, 8.0f));
+        button->SetFocusable(false);
+        button->SetIsTabStop(false);
+        if (Noesis::Style* style = EditorButtonStyle())
+            button->SetStyle(style);
+        button->Click() += Noesis::MakeDelegate(this, &Impl::OnAssetClicked);
+
+        Noesis::Ptr<Noesis::StackPanel> stack = Noesis::MakePtr<Noesis::StackPanel>();
+        stack->SetOrientation(Noesis::Orientation_Vertical);
+
+        Noesis::Ptr<Noesis::Border> preview = Noesis::MakePtr<Noesis::Border>();
+        preview->SetHeight(74.0f);
+        preview->SetMargin(Noesis::Thickness(6.0f, 6.0f, 6.0f, 4.0f));
+        preview->SetBackground(EditorBrush(folderTile ? 44 : 28, folderTile ? 61 : 40, folderTile ? 84 : 56, 235).GetPtr());
+        preview->SetBorderBrush(EditorBrush(117, 138, 168, 112).GetPtr());
+        preview->SetBorderThickness(Noesis::Thickness(1.0f));
+
+        Noesis::Ptr<Noesis::Image> image = Noesis::MakePtr<Noesis::Image>();
+        preview->SetChild(image.GetPtr());
+        stack->GetChildren()->Add(preview.GetPtr());
+
+        Noesis::Ptr<Noesis::TextBlock> text = Noesis::MakePtr<Noesis::TextBlock>();
+        text->SetText((title + (subtitle.empty() ? "" : "\n" + subtitle)).c_str());
+        text->SetFontSize(11.0f);
+        text->SetMargin(Noesis::Thickness(6.0f, 0.0f, 6.0f, 0.0f));
+        stack->GetChildren()->Add(text.GetPtr());
+
+        button->SetContent(stack.GetPtr());
+        assetTilePanel->GetChildren()->Add(button.GetPtr());
+
+        Noesis::Button* rawButton = button.GetPtr();
+        assetButtons.push_back(rawButton);
+        assetTexts.push_back(text.GetPtr());
+        assetImages.push_back(image.GetPtr());
+        assetButtonStorage.push_back(button);
+        assetTextStorage.push_back(text);
+        assetImageStorage.push_back(image);
+        return rawButton;
+    }
+
     void AddBreadcrumbButton(const std::string& text, const std::string& path)
     {
         if (!assetBreadcrumbPanel)
@@ -4470,12 +5313,14 @@ struct NoesisLayer::Impl
         }
 
         SetText(assetFolderCountText,
-            std::to_string(visibleAssetEntries.size()) + " assets | " + AssetFolderBreadcrumbLabel());
+            std::to_string(visibleAssetEntries.size()) + " assets, " +
+            std::to_string(visibleAssetFolders.size()) + " folders | " + AssetFolderBreadcrumbLabel());
     }
 
     void RefreshAssetBrowser()
     {
         visibleAssetEntries.clear();
+        visibleAssetFolders.clear();
         visibleAssetTags.clear();
         AssetFolderTreeData folderTree;
         if (EnsureAssetLibrary())
@@ -4490,6 +5335,15 @@ struct NoesisLayer::Impl
                 search);
             visibleAssetTags = assetLibrary->TagsFor(assetCategory);
             folderTree = BuildAssetFolderTreeData();
+            if (search.empty() && activeAssetTags.empty())
+            {
+                const std::string folderParent = IsAllAssetFolderPath(activeAssetSubpath) || IsRootAssetFolderPath(activeAssetSubpath)
+                    ? std::string{}
+                    : activeAssetSubpath;
+                auto folderIt = folderTree.childrenByParent.find(folderParent);
+                if (folderIt != folderTree.childrenByParent.end())
+                    visibleAssetFolders.assign(folderIt->second.begin(), folderIt->second.end());
+            }
         }
 
         RebuildAssetFolderTree(folderTree);
@@ -4503,75 +5357,82 @@ struct NoesisLayer::Impl
                 const bool active = std::find(activeAssetTags.begin(), activeAssetTags.end(), tag.first) != activeAssetTags.end();
                 const std::string label = (active ? "> " : "") + CompactAssetName(tag.first, 13) +
                     " (" + std::to_string(tag.second) + ")";
+                if (assetTagButtons[i])
+                    assetTagButtons[i]->SetVisibility(Noesis::Visibility_Visible);
                 SetText(assetTagTexts[i], label);
             }
             else
             {
-                SetText(assetTagTexts[i], "-");
+                if (assetTagButtons[i])
+                    assetTagButtons[i]->SetVisibility(Noesis::Visibility_Collapsed);
+                SetText(assetTagTexts[i], "");
             }
         }
 
-        for (uint32_t i = 0; i < assetTexts.size(); ++i)
+        if (assetTilePanel)
         {
-            if (i < visibleAssetEntries.size())
-            {
-                const AssetLibrary::Entry& entry = visibleAssetEntries[i];
-                const bool wrongTextureRole = assetCategory == AssetLibrary::Category::Texture &&
-                    !TextureRoleMatchesMaterialSlot(entry.textureRole, activeMaterialTextureSlot);
-                if (assetButtons[i])
-                    assetButtons[i]->SetOpacity(wrongTextureRole ? 0.45f : 1.0f);
-                if (assetImages[i])
-                {
-                    if (entry.category == AssetLibrary::Category::Texture && !entry.thumbnail.empty())
-                    {
-                        const std::string thumbnailSource = "assets/library/" + entry.thumbnail;
-                        Tracenf("[NOESIS-THUMB] requesting image source=%s asset_id=%s",
-                            thumbnailSource.c_str(),
-                            entry.id.c_str());
-                        Noesis::Ptr<Noesis::BitmapImage> image = Noesis::MakePtr<Noesis::BitmapImage>(thumbnailSource.c_str());
-                        assetImages[i]->SetSource(image.GetPtr());
-                    }
-                    else
-                    {
-                        assetImages[i]->SetSource(nullptr);
-                    }
-                }
+            assetTilePanel->GetChildren()->Clear();
+            assetButtons.clear();
+            assetTexts.clear();
+            assetImages.clear();
+            assetButtonStorage.clear();
+            assetTextStorage.clear();
+            assetImageStorage.clear();
+        }
 
-                std::string line;
-                if (entry.category == AssetLibrary::Category::Texture)
-                {
-                    line += std::string(wrongTextureRole ? "x " : "") +
-                        "[" + AssetLibrary::TextureRoleBadge(entry.textureRole) + "] " +
-                        TextureResolutionLabel(entry);
-                    if (!entry.normalConvention.empty())
-                        line += " " + entry.normalConvention;
-                    line += "\n";
-                }
-                line += CompactAssetName(entry.displayName, 28);
-                if (!entry.subpath.empty())
-                    line += "\n" + CompactAssetName(entry.subpath, 28);
-                if (!entry.tags.empty())
-                {
-                    line += "\n";
-                    const size_t shownTags = std::min<size_t>(entry.tags.size(), 3);
-                    for (size_t tagIndex = 0; tagIndex < shownTags; ++tagIndex)
-                    {
-                        if (tagIndex > 0)
-                            line += " ";
-                        line += "#" + entry.tags[tagIndex];
-                    }
-                    if (entry.tags.size() > shownTags)
-                        line += " +" + std::to_string(entry.tags.size() - shownTags);
-                }
-                SetText(assetTexts[i], line);
+        for (const std::string& folderPath : visibleAssetFolders)
+        {
+            const auto countIt = folderTree.directCounts.find(folderPath);
+            const std::uint32_t count = countIt != folderTree.directCounts.end() ? countIt->second : 0;
+            Noesis::Button* button = AddAssetBrowserTile(
+                "[Folder] " + CompactAssetName(AssetFolderDisplayName(folderPath), 24),
+                std::to_string(count) + " assets",
+                true);
+            if (button)
+                button->SetOpacity(1.0f);
+        }
+
+        for (const AssetLibrary::Entry& entry : visibleAssetEntries)
+        {
+            const bool wrongTextureRole = assetCategory == AssetLibrary::Category::Texture &&
+                !TextureRoleMatchesMaterialSlot(entry.textureRole, activeMaterialTextureSlot);
+
+            std::string title = CompactAssetName(entry.displayName, 24);
+            std::string subtitle;
+            if (entry.category == AssetLibrary::Category::Texture)
+            {
+                subtitle = std::string(wrongTextureRole ? "x " : "") +
+                    "[" + AssetLibrary::TextureRoleBadge(entry.textureRole) + "] " +
+                    TextureResolutionLabel(entry);
+                if (!entry.normalConvention.empty())
+                    subtitle += " " + entry.normalConvention;
             }
             else
             {
-                if (assetButtons[i])
-                    assetButtons[i]->SetOpacity(0.25f);
-                if (assetImages[i])
-                    assetImages[i]->SetSource(nullptr);
-                SetText(assetTexts[i], "-");
+                subtitle = AssetLibrary::CategoryName(entry.category);
+            }
+            if (!entry.tags.empty())
+            {
+                const size_t shownTags = std::min<size_t>(entry.tags.size(), 2);
+                for (size_t tagIndex = 0; tagIndex < shownTags; ++tagIndex)
+                    subtitle += (subtitle.empty() ? "" : " ") + std::string("#") + entry.tags[tagIndex];
+                if (entry.tags.size() > shownTags)
+                    subtitle += " +" + std::to_string(entry.tags.size() - shownTags);
+            }
+
+            Noesis::Button* button = AddAssetBrowserTile(title, subtitle, false);
+            const size_t tileIndex = assetButtons.empty() ? 0 : assetButtons.size() - 1;
+            if (button)
+                button->SetOpacity(wrongTextureRole ? 0.45f : 1.0f);
+            if (tileIndex < assetImages.size() && assetImages[tileIndex] &&
+                entry.category == AssetLibrary::Category::Texture && !entry.thumbnail.empty())
+            {
+                const std::string thumbnailSource = "assets/library/" + entry.thumbnail;
+                Tracenf("[NOESIS-THUMB] requesting image source=%s asset_id=%s",
+                    thumbnailSource.c_str(),
+                    entry.id.c_str());
+                Noesis::Ptr<Noesis::BitmapImage> image = Noesis::MakePtr<Noesis::BitmapImage>(thumbnailSource.c_str());
+                assetImages[tileIndex]->SetSource(image.GetPtr());
             }
         }
     }
@@ -4660,6 +5521,8 @@ struct NoesisLayer::Impl
             return AssetLibrary::Category::Animation;
         if (ext == ".json")
             return AssetLibrary::Category::Material;
+        if (ext == ".watermat")
+            return AssetLibrary::Category::WaterMaterial;
         return std::nullopt;
     }
 
@@ -4905,6 +5768,53 @@ struct NoesisLayer::Impl
         SetAssetStatus("Adding test marker in front of the editor camera");
     }
 
+    void OnAddWaterBodyClicked(Noesis::BaseComponent*, const Noesis::RoutedEventArgs&)
+    {
+        SetLightingModeActive(true);
+        selectedWaterBodyExpanded = true;
+        editorCommands.addWaterBody = true;
+        UpdateInspectorSections();
+        SetAssetStatus("Adding water body in front of the editor camera");
+    }
+
+    void OnDeleteWaterBodyClicked(Noesis::BaseComponent*, const Noesis::RoutedEventArgs&)
+    {
+        editorCommands.deleteSelectedWaterBody = true;
+        SetAssetStatus("Deleting selected water body");
+    }
+
+    void OnSelectedWaterSculptClicked(Noesis::BaseComponent*, const Noesis::RoutedEventArgs&)
+    {
+        if (!waterBodyEditorState.selected)
+        {
+            waterSculptActive = false;
+            SetAssetStatus("Select a water body before sculpting");
+        }
+        else
+        {
+            waterSculptActive = !waterSculptActive;
+            SetAssetStatus(waterSculptActive ? "Water sculpt mode enabled" : "Water sculpt mode disabled");
+            Tracenf("[WATER-OBJ-5] Sculpt mode toggled: body_id=%u active=%s",
+                waterBodyEditorState.id,
+                waterSculptActive ? "true" : "false");
+        }
+        UpdateWaterSculptText();
+    }
+
+    void OnWaterSculptAddClicked(Noesis::BaseComponent*, const Noesis::RoutedEventArgs&)
+    {
+        waterSculptAdd = true;
+        SetAssetStatus("Water sculpt brush: add");
+        UpdateWaterSculptText();
+    }
+
+    void OnWaterSculptRemoveClicked(Noesis::BaseComponent*, const Noesis::RoutedEventArgs&)
+    {
+        waterSculptAdd = false;
+        SetAssetStatus("Water sculpt brush: remove");
+        UpdateWaterSculptText();
+    }
+
     void OnEditorTextureClicked(Noesis::BaseComponent* sender, const Noesis::RoutedEventArgs&)
     {
         for (uint32_t i = 0; i < 8; ++i)
@@ -4939,6 +5849,11 @@ struct NoesisLayer::Impl
         SetAssetCategory(AssetLibrary::Category::Material);
     }
 
+    void OnAssetWaterMaterialsClicked(Noesis::BaseComponent*, const Noesis::RoutedEventArgs&)
+    {
+        SetAssetCategory(AssetLibrary::Category::WaterMaterial);
+    }
+
     void OnImportTextureClicked(Noesis::BaseComponent*, const Noesis::RoutedEventArgs&)
     {
         ImportAsset(AssetLibrary::Category::Texture);
@@ -4958,10 +5873,34 @@ struct NoesisLayer::Impl
     {
         for (uint32_t i = 0; i < assetButtons.size(); ++i)
         {
-            if (sender != assetButtons[i] || i >= visibleAssetEntries.size())
+            if (sender != assetButtons[i])
                 continue;
 
-            const AssetLibrary::Entry& entry = visibleAssetEntries[i];
+            if (i < visibleAssetFolders.size())
+            {
+                const std::string& path = visibleAssetFolders[i];
+                const bool doubleClick = path == lastClickedAssetFolderPath &&
+                    lastAssetFolderClickSeconds >= 0.0 &&
+                    currentTimeSeconds - lastAssetFolderClickSeconds <= kFolderDoubleClickSeconds;
+                lastClickedAssetFolderPath = path;
+                lastAssetFolderClickSeconds = currentTimeSeconds;
+                selectedAssetFolderPath = path;
+                selectedAssetId.clear();
+                SetAssetStatus("Selected folder: " + AssetFolderDisplayName(path) +
+                    (doubleClick ? " (opening)" : " (double-click to open)"));
+                if (doubleClick)
+                {
+                    expandedAssetFolders.insert(path);
+                    SetCurrentAssetFolder(path);
+                }
+                return;
+            }
+
+            const size_t assetIndex = static_cast<size_t>(i) - visibleAssetFolders.size();
+            if (assetIndex >= visibleAssetEntries.size())
+                continue;
+
+            const AssetLibrary::Entry& entry = visibleAssetEntries[assetIndex];
             selectedAssetId = entry.id;
             if (!(assetCategory == AssetLibrary::Category::Texture && editingMaterialId))
             {
@@ -5027,6 +5966,12 @@ struct NoesisLayer::Impl
                     SetAssetStatus("Editing material " + entry.displayName +
                         "; assigned to Slot " + std::to_string(targetSlot));
                 }
+                return;
+            }
+
+            if (assetCategory == AssetLibrary::Category::WaterMaterial)
+            {
+                OpenWaterMaterialEditor(entry.id);
                 return;
             }
 
@@ -5260,6 +6205,121 @@ struct NoesisLayer::Impl
         SetCurrentAssetFolder(ParentAssetFolderPath(activeAssetSubpath));
     }
 
+    Noesis::TreeViewItem* AssetFolderItemByPath(const std::string& path) const
+    {
+        for (const Noesis::Ptr<Noesis::TreeViewItem>& item : assetFolderItems)
+        {
+            auto it = item ? assetFolderItemPaths.find(item.GetPtr()) : assetFolderItemPaths.end();
+            if (it != assetFolderItemPaths.end() && it->second == path)
+                return item.GetPtr();
+        }
+        return nullptr;
+    }
+
+    std::uint32_t CountAssetsUnderFolder(const std::string& folderPath) const
+    {
+        if (!assetLibrary)
+            return 0;
+        const std::string queryPath = AssetFolderQuerySubpath(folderPath);
+        return static_cast<std::uint32_t>(std::count_if(assetLibrary->Entries().begin(), assetLibrary->Entries().end(),
+            [&](const AssetLibrary::Entry& entry) {
+                return entry.category == assetCategory && AssetFolderContains(AssetLibrary::NormalizeSubpath(entry.subpath), queryPath);
+            }));
+    }
+
+    std::string UniqueFolderName(const std::string& parentSubpath) const
+    {
+        std::set<std::string> folders;
+        if (assetLibrary)
+        {
+            for (const std::string& folder : assetLibrary->FolderSubpathsFor(assetCategory))
+                folders.insert(folder);
+        }
+
+        const std::string parent = AssetLibrary::NormalizeSubpath(parentSubpath);
+        for (uint32_t i = 0; i < 1000; ++i)
+        {
+            const std::string name = i == 0 ? "NewFolder" : "NewFolder_" + std::to_string(i);
+            const std::string normalizedName = AssetLibrary::NormalizeSubpath(name);
+            const std::string candidate = parent.empty() ? normalizedName : parent + "/" + normalizedName;
+            if (!folders.contains(candidate))
+                return name;
+        }
+        return "NewFolder";
+    }
+
+    void OnAssetCreateFolderClicked(Noesis::BaseComponent*, const Noesis::RoutedEventArgs&)
+    {
+        if (!EnsureAssetLibrary())
+            return;
+
+        const std::string parent = IsAllAssetFolderPath(activeAssetSubpath) || IsRootAssetFolderPath(activeAssetSubpath)
+            ? std::string{}
+            : activeAssetSubpath;
+        const std::string name = UniqueFolderName(parent);
+        std::string newPath;
+        std::string error;
+        if (!assetLibrary->CreateFolder(assetCategory, parent, name, newPath, error))
+        {
+            SetAssetStatus("Create folder failed: " + error);
+            return;
+        }
+
+        if (!parent.empty())
+            expandedAssetFolders.insert(parent);
+        selectedAssetFolderPath = newPath;
+        pendingDeleteFolderPath.clear();
+        RefreshAssetBrowser();
+        if (Noesis::TreeViewItem* item = AssetFolderItemByPath(newPath))
+            BeginFolderRename(newPath, item);
+        SetAssetStatus("Created folder: " + newPath);
+    }
+
+    void DeleteSelectedAssetFolder()
+    {
+        if (!EnsureAssetLibrary())
+            return;
+
+        std::string target = selectedAssetFolderPath;
+        if (target.empty() || IsAllAssetFolderPath(target))
+            target = activeAssetSubpath;
+        if (IsAllAssetFolderPath(target) || IsRootAssetFolderPath(target))
+        {
+            SetAssetStatus("Select a real folder to delete");
+            return;
+        }
+
+        const std::uint32_t containedAssets = CountAssetsUnderFolder(target);
+        if (containedAssets > 0 && pendingDeleteFolderPath != target)
+        {
+            pendingDeleteFolderPath = target;
+            SetAssetStatus("Delete folder '" + AssetFolderDisplayName(target) + "' contains " +
+                std::to_string(containedAssets) + " assets. Click Delete Folder again to confirm.");
+            return;
+        }
+
+        const std::string parent = ParentAssetFolderPath(target);
+        std::uint32_t removedAssets = 0;
+        std::string error;
+        if (!assetLibrary->DeleteFolder(assetCategory, AssetFolderQuerySubpath(target), removedAssets, error))
+        {
+            SetAssetStatus("Delete folder failed: " + error);
+            return;
+        }
+
+        pendingDeleteFolderPath.clear();
+        if (AssetFolderContains(activeAssetSubpath, target))
+            activeAssetSubpath = parent.empty() ? std::string(kRootAssetFolderPath) : parent;
+        selectedAssetFolderPath = activeAssetSubpath;
+        RefreshAssetBrowser();
+        SetAssetStatus("Deleted folder: " + target + " (" + std::to_string(removedAssets) + " assets)");
+    }
+
+    void OnAssetDeleteFolderClicked(Noesis::BaseComponent*, const Noesis::RoutedEventArgs&)
+    {
+        DeleteSelectedAssetFolder();
+    }
+
     void OnAssetBreadcrumbClicked(Noesis::BaseComponent* sender, const Noesis::RoutedEventArgs&)
     {
         auto it = assetBreadcrumbButtonPaths.find(sender);
@@ -5311,6 +6371,9 @@ struct NoesisLayer::Impl
             return;
         }
         RefreshAssetBrowser();
+        assetLibrarySignature = BuildAssetLibrarySignature();
+        assetLibraryPollInitialized = true;
+        nextAssetLibraryPollSeconds = currentTimeSeconds + 1.0;
         SetAssetStatus("Library refreshed");
     }
 
@@ -5748,6 +6811,8 @@ struct NoesisLayer::Impl
     Noesis::FrameworkElement* lightingMainSection = nullptr;
     Noesis::Button* waterBaseSectionButton = nullptr;
     Noesis::FrameworkElement* waterBaseSection = nullptr;
+    Noesis::Button* waterEdgeFadeSectionButton = nullptr;
+    Noesis::FrameworkElement* waterEdgeFadeSection = nullptr;
     Noesis::Button* waterReflectionSectionButton = nullptr;
     Noesis::FrameworkElement* waterReflectionSection = nullptr;
     Noesis::Button* waterRefractionSectionButton = nullptr;
@@ -5760,6 +6825,8 @@ struct NoesisLayer::Impl
     Noesis::FrameworkElement* dynamicLightsSection = nullptr;
     Noesis::Button* selectedLightSectionButton = nullptr;
     Noesis::FrameworkElement* selectedLightSection = nullptr;
+    Noesis::Button* selectedWaterBodySectionButton = nullptr;
+    Noesis::FrameworkElement* selectedWaterBodySection = nullptr;
     Noesis::TextBlock* lightingAzimuthText = nullptr;
     Noesis::TextBlock* lightingElevationText = nullptr;
     Noesis::TextBlock* lightingSunIntensityText = nullptr;
@@ -5821,6 +6888,7 @@ struct NoesisLayer::Impl
     Noesis::TextBlock* waterCausticScaleText = nullptr;
     Noesis::TextBlock* waterCausticSpeedText = nullptr;
     Noesis::TextBlock* waterCausticMaxDepthText = nullptr;
+    Noesis::TextBlock* waterEdgeFadeDistanceText = nullptr;
     Noesis::Slider* waterLevelSlider = nullptr;
     Noesis::Slider* waterBaseRSlider = nullptr;
     Noesis::Slider* waterBaseGSlider = nullptr;
@@ -5837,6 +6905,10 @@ struct NoesisLayer::Impl
     Noesis::Slider* waterReflectionGSlider = nullptr;
     Noesis::Slider* waterReflectionBSlider = nullptr;
     Noesis::Slider* waterReflectionDistortionSlider = nullptr;
+    Noesis::Slider* waterEdgeFadeDistanceSlider = nullptr;
+    Noesis::Button* waterEdgeFadeLinearButton = nullptr;
+    Noesis::Button* waterEdgeFadeSmoothButton = nullptr;
+    Noesis::Button* waterEdgeFadeExponentialButton = nullptr;
     Noesis::Button* waterRefractionEnabledButton = nullptr;
     Noesis::Slider* waterShallowRSlider = nullptr;
     Noesis::Slider* waterShallowGSlider = nullptr;
@@ -5877,6 +6949,24 @@ struct NoesisLayer::Impl
     Noesis::TextBlock* selectedSpotYawText = nullptr;
     Noesis::TextBlock* selectedSpotInnerText = nullptr;
     Noesis::TextBlock* selectedSpotOuterText = nullptr;
+    Noesis::TextBlock* selectedWaterBodyTitleText = nullptr;
+    Noesis::TextBlock* selectedWaterBodyMaterialText = nullptr;
+    Noesis::Button* selectedWaterBodyMaterialButton = nullptr;
+    Noesis::Button* editWaterMaterialButton = nullptr;
+    Noesis::Button* waterMaterialEditorSectionButton = nullptr;
+    Noesis::FrameworkElement* waterMaterialEditorSection = nullptr;
+    Noesis::TextBlock* waterMaterialEditorTitleText = nullptr;
+    Noesis::TextBox* selectedWaterBodyNameBox = nullptr;
+    Noesis::TextBlock* selectedWaterBodyXText = nullptr;
+    Noesis::TextBlock* selectedWaterBodyYText = nullptr;
+    Noesis::TextBlock* selectedWaterBodyZText = nullptr;
+    Noesis::TextBlock* selectedWaterBodyWidthText = nullptr;
+    Noesis::TextBlock* selectedWaterBodyDepthText = nullptr;
+    Noesis::Button* selectedWaterSculptButton = nullptr;
+    Noesis::FrameworkElement* selectedWaterSculptControls = nullptr;
+    Noesis::Button* waterSculptAddButton = nullptr;
+    Noesis::Button* waterSculptRemoveButton = nullptr;
+    Noesis::TextBlock* waterSculptRadiusText = nullptr;
     Noesis::Slider* selectedLightXSlider = nullptr;
     Noesis::Slider* selectedLightYSlider = nullptr;
     Noesis::Slider* selectedLightZSlider = nullptr;
@@ -5889,26 +6979,43 @@ struct NoesisLayer::Impl
     Noesis::Slider* selectedSpotYawSlider = nullptr;
     Noesis::Slider* selectedSpotInnerSlider = nullptr;
     Noesis::Slider* selectedSpotOuterSlider = nullptr;
+    Noesis::Slider* selectedWaterBodyXSlider = nullptr;
+    Noesis::Slider* selectedWaterBodyYSlider = nullptr;
+    Noesis::Slider* selectedWaterBodyZSlider = nullptr;
+    Noesis::Slider* selectedWaterBodyWidthSlider = nullptr;
+    Noesis::Slider* selectedWaterBodyDepthSlider = nullptr;
+    Noesis::Slider* waterSculptRadiusSlider = nullptr;
     std::array<Noesis::Button*, 8> editorTextureButtons{};
     std::array<Noesis::TextBlock*, 8> editorTextureSlotTexts{};
-    std::array<Noesis::Button*, 12> assetButtons{};
-    std::array<Noesis::TextBlock*, 12> assetTexts{};
-    std::array<Noesis::Image*, 12> assetImages{};
+    Noesis::Panel* assetTilePanel = nullptr;
+    std::vector<Noesis::Ptr<Noesis::Button>> assetButtonStorage;
+    std::vector<Noesis::Ptr<Noesis::TextBlock>> assetTextStorage;
+    std::vector<Noesis::Ptr<Noesis::Image>> assetImageStorage;
+    std::vector<Noesis::Button*> assetButtons;
+    std::vector<Noesis::TextBlock*> assetTexts;
+    std::vector<Noesis::Image*> assetImages;
     Noesis::TreeView* assetFolderTree = nullptr;
+    Noesis::Style* assetFolderItemStyle = nullptr;
     Noesis::StackPanel* assetBreadcrumbPanel = nullptr;
     Noesis::TextBlock* assetFolderCountText = nullptr;
     std::array<Noesis::Button*, 6> assetTagButtons{};
     std::array<Noesis::TextBlock*, 6> assetTagTexts{};
     Noesis::TextBlock* assetStatusText = nullptr;
+    std::filesystem::path assetReaderRoot;
     std::unique_ptr<AssetLibrary> assetLibrary;
+    std::string assetLibrarySignature;
+    double nextAssetLibraryPollSeconds = 0.0;
+    bool assetLibraryPollInitialized = false;
     AssetLibrary::Category assetCategory = AssetLibrary::Category::Texture;
     std::vector<AssetLibrary::Entry> visibleAssetEntries;
+    std::vector<std::string> visibleAssetFolders;
     std::vector<std::pair<std::string, std::uint32_t>> visibleAssetTags;
     std::vector<std::string> activeAssetTags;
     std::string activeAssetSubpath;
     std::string selectedAssetFolderPath;
     std::string lastClickedAssetFolderPath;
     double lastAssetFolderClickSeconds = -1.0;
+    std::string pendingDeleteFolderPath;
     std::set<std::string> expandedAssetFolders;
     std::unordered_map<Noesis::BaseComponent*, std::string> assetFolderItemPaths;
     std::unordered_map<Noesis::BaseComponent*, std::string> assetBreadcrumbButtonPaths;
@@ -5970,19 +7077,28 @@ struct NoesisLayer::Impl
     float editorBrushRadiusMeters = 5.0f;
     float editorBrushStrength = 1.0f;
     LightingState lightingState;
-    WaterConfig waterConfig;
     DynamicLightEditorState dynamicLightEditorState;
+    WaterBodyEditorState waterBodyEditorState;
+    bool waterSculptActive = false;
+    bool waterSculptAdd = true;
+    float waterSculptRadiusMeters = 3.0f;
+    std::string editingWaterMaterialId;
+    WaterMaterialData editingWaterMaterial;
     bool lightingControlsUpdating = false;
     bool dynamicLightControlsUpdating = false;
+    bool waterBodyControlsUpdating = false;
     bool lightingModeActive = false;
     bool lightingMainExpanded = true;
     bool waterBaseExpanded = true;
+    bool waterEdgeFadeExpanded = false;
     bool waterReflectionExpanded = false;
     bool waterRefractionExpanded = false;
     bool waterFoamExpanded = false;
     bool waterCausticExpanded = false;
     bool dynamicLightsExpanded = false;
     bool selectedLightExpanded = false;
+    bool selectedWaterBodyExpanded = false;
+    bool waterMaterialEditorExpanded = false;
     float inspectorManualScrollOffset = 0.0f;
     MapEditorCommands editorCommands;
     std::function<void()> quitCallback;
@@ -5996,6 +7112,11 @@ bool NoesisLayer::Create(VulkanDevice& device, client::asset::IAssetReader& asse
 {
     Destroy();
     m_impl = std::make_unique<Impl>();
+    if (auto root = assets.RootPath())
+    {
+        m_impl->assetReaderRoot = *root;
+        LogFormat("[NOESIS] asset reader root=%s", m_impl->assetReaderRoot.generic_string().c_str());
+    }
     m_impl->InitializeEntityWorld();
 
     Noesis::GUI::SetLogHandler([](const char*, uint32_t, uint32_t level, const char*, const char* message)
@@ -6068,7 +7189,10 @@ void NoesisLayer::Update(double timeSeconds)
     if (m_impl && m_impl->menuView && m_impl->inGameMenuOpen)
         m_impl->menuView->Update(timeSeconds);
     if (m_impl && m_impl->editorView && m_impl->mapEditorOpen)
+    {
         m_impl->editorView->Update(timeSeconds);
+        m_impl->PollAssetLibraryChanges(timeSeconds);
+    }
     if (m_impl && m_impl->mapEditorOpen && !m_impl->IsTextInputFocused())
         m_impl->ClearKeyboardFocus();
 }
@@ -6214,15 +7338,16 @@ LightingState NoesisLayer::GetLightingState() const
     return m_impl ? m_impl->lightingState : LightingState{};
 }
 
-WaterConfig NoesisLayer::GetWaterConfig() const
-{
-    return m_impl ? m_impl->waterConfig : WaterConfig{};
-}
-
 void NoesisLayer::SetDynamicLightEditorState(const DynamicLightEditorState& state)
 {
     if (m_impl)
         m_impl->SetDynamicLightEditorState(state);
+}
+
+void NoesisLayer::SetWaterBodyEditorState(const WaterBodyEditorState& state)
+{
+    if (m_impl)
+        m_impl->SetWaterBodyEditorState(state);
 }
 
 void NoesisLayer::InitializeAssetLibrary(const std::string& mapDirectory,
@@ -6230,6 +7355,43 @@ void NoesisLayer::InitializeAssetLibrary(const std::string& mapDirectory,
 {
     if (m_impl)
         m_impl->InitializeAssetLibrary(mapDirectory, defaultSlots);
+}
+
+std::vector<std::pair<std::string, WaterMaterialData>> NoesisLayer::GetWaterMaterialsSnapshot() const
+{
+    std::vector<std::pair<std::string, WaterMaterialData>> materials;
+    if (!m_impl || !m_impl->assetLibrary)
+        return materials;
+
+    auto texturePathForId = [&](const std::string& textureId) -> std::string {
+        if (textureId.empty())
+            return {};
+        auto texture = m_impl->assetLibrary->FindById(textureId);
+        if (!texture || texture->category != AssetLibrary::Category::Texture)
+            return {};
+        return m_impl->assetLibrary->AssetRelativePath(*texture);
+    };
+
+    for (const AssetLibrary::Entry& entry : m_impl->assetLibrary->Entries())
+    {
+        if (entry.category == AssetLibrary::Category::WaterMaterial && !entry.id.empty())
+            materials.push_back({entry.id, entry.waterMaterial});
+        else if (entry.category == AssetLibrary::Category::Material && !entry.id.empty())
+        {
+            WaterMaterialData converted{};
+            converted.diffuseMap = texturePathForId(entry.material.diffuseTextureId);
+            converted.normalMapA = texturePathForId(entry.material.normalTextureId);
+            converted.normalMapB = converted.normalMapA;
+            converted.normalTiling = std::clamp((entry.material.tilingScaleX + entry.material.tilingScaleY) * 0.5f, 0.001f, 100.0f);
+            converted.scrollSpeedA[0] = 0.03f;
+            converted.scrollSpeedA[1] = 0.014f;
+            converted.scrollSpeedB[0] = -0.015f;
+            converted.scrollSpeedB[1] = 0.02f;
+            converted.config.normalStrength = std::clamp(entry.material.normalStrength, 0.0f, 2.0f);
+            materials.push_back({entry.id, converted});
+        }
+    }
+    return materials;
 }
 
 std::array<MapEditorPaletteSlot, 8> NoesisLayer::GetPaletteSlots() const

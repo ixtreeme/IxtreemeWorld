@@ -114,6 +114,25 @@ float JsonFloatValue(const std::string& object, const std::string& key, float fa
     return end != begin ? value : fallback;
 }
 
+bool JsonBoolValue(const std::string& object, const std::string& key, bool fallback)
+{
+    const std::string needle = "\"" + key + "\"";
+    const size_t keyPos = object.find(needle);
+    if (keyPos == std::string::npos)
+        return fallback;
+    const size_t colon = object.find(':', keyPos + needle.size());
+    if (colon == std::string::npos)
+        return fallback;
+    size_t pos = colon + 1;
+    while (pos < object.size() && std::isspace(static_cast<unsigned char>(object[pos])))
+        ++pos;
+    if (object.compare(pos, 4, "true") == 0)
+        return true;
+    if (object.compare(pos, 5, "false") == 0)
+        return false;
+    return fallback;
+}
+
 std::string JsonObjectValue(const std::string& object, const std::string& key)
 {
     const std::string needle = "\"" + key + "\"";
@@ -378,6 +397,200 @@ AssetLibrary::MaterialData ClampMaterialData(AssetLibrary::MaterialData material
     return material;
 }
 
+WaterConfig ClampWaterConfig(WaterConfig config)
+{
+    config.waterLevelY = std::clamp(config.waterLevelY, -1000.0f, 1000.0f);
+    for (float& value : config.baseColor) value = std::clamp(value, 0.0f, 1.0f);
+    config.waveScaleSmall = std::clamp(config.waveScaleSmall, 0.001f, 2.0f);
+    config.waveScaleLarge = std::clamp(config.waveScaleLarge, 0.001f, 2.0f);
+    config.waveSpeedSmall = std::clamp(config.waveSpeedSmall, 0.0f, 5.0f);
+    config.waveSpeedLarge = std::clamp(config.waveSpeedLarge, 0.0f, 5.0f);
+    config.normalStrength = std::clamp(config.normalStrength, 0.0f, 4.0f);
+    config.fresnelPower = std::clamp(config.fresnelPower, 0.1f, 20.0f);
+    config.fresnelMin = std::clamp(config.fresnelMin, 0.0f, 1.0f);
+    for (float& value : config.reflectionColor) value = std::clamp(value, 0.0f, 1.0f);
+    config.reflectionDistortionStrength = std::clamp(config.reflectionDistortionStrength, 0.0f, 1.0f);
+    for (float& value : config.shallowColor) value = std::clamp(value, 0.0f, 1.0f);
+    for (float& value : config.deepColor) value = std::clamp(value, 0.0f, 1.0f);
+    config.depthColorMin = std::clamp(config.depthColorMin, 0.0f, 100.0f);
+    config.depthColorMax = std::max(config.depthColorMin + 0.001f, std::clamp(config.depthColorMax, 0.001f, 200.0f));
+    config.depthFadeDistance = std::clamp(config.depthFadeDistance, 0.001f, 200.0f);
+    config.refractionStrength = std::clamp(config.refractionStrength, 0.0f, 1.0f);
+    config.refractionDepthStrength = std::clamp(config.refractionDepthStrength, 0.0f, 8.0f);
+    config.foamDistance = std::clamp(config.foamDistance, 0.0f, 20.0f);
+    config.foamSoftness = std::clamp(config.foamSoftness, 0.001f, 20.0f);
+    config.foamIntensity = std::clamp(config.foamIntensity, 0.0f, 8.0f);
+    config.foamScrollSpeed = std::clamp(config.foamScrollSpeed, 0.0f, 10.0f);
+    config.foamScale = std::clamp(config.foamScale, 0.001f, 20.0f);
+    config.foamTerrainThickness = std::clamp(config.foamTerrainThickness, 0.0f, 20.0f);
+    config.causticIntensity = std::clamp(config.causticIntensity, 0.0f, 8.0f);
+    config.causticScale = std::clamp(config.causticScale, 0.001f, 20.0f);
+    config.causticSpeed = std::clamp(config.causticSpeed, 0.0f, 10.0f);
+    config.causticMaxDepth = std::clamp(config.causticMaxDepth, 0.001f, 200.0f);
+    config.edgeFadeDistance = std::clamp(config.edgeFadeDistance, 0.0f, 3.0f);
+    config.edgeFadeCurve = static_cast<WaterConfig::EdgeFadeCurve>(
+        std::clamp(static_cast<int>(config.edgeFadeCurve), 0, 2));
+    return config;
+}
+
+WaterMaterialData ClampWaterMaterialData(WaterMaterialData material)
+{
+    material.config = ClampWaterConfig(material.config);
+    material.scrollSpeedA[0] = std::clamp(material.scrollSpeedA[0], -10.0f, 10.0f);
+    material.scrollSpeedA[1] = std::clamp(material.scrollSpeedA[1], -10.0f, 10.0f);
+    material.scrollSpeedB[0] = std::clamp(material.scrollSpeedB[0], -10.0f, 10.0f);
+    material.scrollSpeedB[1] = std::clamp(material.scrollSpeedB[1], -10.0f, 10.0f);
+    material.normalTiling = std::clamp(material.normalTiling, 0.001f, 100.0f);
+    material.formatVersion = std::max(1u, material.formatVersion);
+    return material;
+}
+
+void WriteWaterConfigJson(std::ostringstream& json, const WaterConfig& config, const char* indent)
+{
+    json << indent << "\"enabled\": " << (config.enabled ? "true" : "false") << ",\n"
+         << indent << "\"water_level_y\": " << config.waterLevelY << ",\n"
+         << indent << "\"base_color\": [" << config.baseColor[0] << ", " << config.baseColor[1] << ", "
+         << config.baseColor[2] << ", " << config.baseColor[3] << "],\n"
+         << indent << "\"wave_scale_small\": " << config.waveScaleSmall << ",\n"
+         << indent << "\"wave_scale_large\": " << config.waveScaleLarge << ",\n"
+         << indent << "\"wave_speed_small\": " << config.waveSpeedSmall << ",\n"
+         << indent << "\"wave_speed_large\": " << config.waveSpeedLarge << ",\n"
+         << indent << "\"normal_strength\": " << config.normalStrength << ",\n"
+         << indent << "\"fresnel_power\": " << config.fresnelPower << ",\n"
+         << indent << "\"fresnel_min\": " << config.fresnelMin << ",\n"
+         << indent << "\"reflection_color\": [" << config.reflectionColor[0] << ", " << config.reflectionColor[1]
+         << ", " << config.reflectionColor[2] << "],\n"
+         << indent << "\"reflection_enabled\": " << (config.reflectionEnabled ? "true" : "false") << ",\n"
+         << indent << "\"reflection_quality\": " << static_cast<std::int32_t>(config.reflectionQuality) << ",\n"
+         << indent << "\"reflection_distortion_strength\": " << config.reflectionDistortionStrength << ",\n"
+         << indent << "\"refraction_enabled\": " << (config.refractionEnabled ? "true" : "false") << ",\n"
+         << indent << "\"shallow_color\": [" << config.shallowColor[0] << ", " << config.shallowColor[1]
+         << ", " << config.shallowColor[2] << "],\n"
+         << indent << "\"deep_color\": [" << config.deepColor[0] << ", " << config.deepColor[1]
+         << ", " << config.deepColor[2] << "],\n"
+         << indent << "\"depth_color_min\": " << config.depthColorMin << ",\n"
+         << indent << "\"depth_color_max\": " << config.depthColorMax << ",\n"
+         << indent << "\"depth_fade_distance\": " << config.depthFadeDistance << ",\n"
+         << indent << "\"refraction_strength\": " << config.refractionStrength << ",\n"
+         << indent << "\"refraction_depth_strength\": " << config.refractionDepthStrength << ",\n"
+         << indent << "\"foam_enabled\": " << (config.foamEnabled ? "true" : "false") << ",\n"
+         << indent << "\"foam_distance\": " << config.foamDistance << ",\n"
+         << indent << "\"foam_softness\": " << config.foamSoftness << ",\n"
+         << indent << "\"foam_intensity\": " << config.foamIntensity << ",\n"
+         << indent << "\"foam_scroll_speed\": " << config.foamScrollSpeed << ",\n"
+         << indent << "\"foam_scale\": " << config.foamScale << ",\n"
+         << indent << "\"foam_terrain_thickness\": " << config.foamTerrainThickness << ",\n"
+         << indent << "\"caustic_mode\": " << static_cast<std::int32_t>(config.causticMode) << ",\n"
+         << indent << "\"caustic_intensity\": " << config.causticIntensity << ",\n"
+         << indent << "\"caustic_scale\": " << config.causticScale << ",\n"
+         << indent << "\"caustic_speed\": " << config.causticSpeed << ",\n"
+         << indent << "\"caustic_max_depth\": " << config.causticMaxDepth << ",\n"
+         << indent << "\"edge_fade_distance\": " << config.edgeFadeDistance << ",\n"
+         << indent << "\"edge_fade_curve\": " << static_cast<std::int32_t>(config.edgeFadeCurve);
+}
+
+void ReadFloatArray(const std::string& object, const std::string& key, float* values, std::size_t count)
+{
+    std::string body;
+    if (!JsonArrayBody(object, key, body))
+        return;
+    const char* cursor = body.c_str();
+    for (std::size_t i = 0; i < count && *cursor != '\0';)
+    {
+        char* end = nullptr;
+        const float value = std::strtof(cursor, &end);
+        if (end != cursor)
+        {
+            values[i++] = value;
+            cursor = end;
+            continue;
+        }
+        ++cursor;
+    }
+}
+
+WaterConfig ReadWaterConfigJson(const std::string& object, WaterConfig fallback = {})
+{
+    WaterConfig config = fallback;
+    config.enabled = JsonBoolValue(object, "enabled", config.enabled);
+    config.waterLevelY = JsonFloatValue(object, "water_level_y", config.waterLevelY);
+    ReadFloatArray(object, "base_color", config.baseColor, 4);
+    config.waveScaleSmall = JsonFloatValue(object, "wave_scale_small", config.waveScaleSmall);
+    config.waveScaleLarge = JsonFloatValue(object, "wave_scale_large", config.waveScaleLarge);
+    config.waveSpeedSmall = JsonFloatValue(object, "wave_speed_small", config.waveSpeedSmall);
+    config.waveSpeedLarge = JsonFloatValue(object, "wave_speed_large", config.waveSpeedLarge);
+    config.normalStrength = JsonFloatValue(object, "normal_strength", config.normalStrength);
+    config.fresnelPower = JsonFloatValue(object, "fresnel_power", config.fresnelPower);
+    config.fresnelMin = JsonFloatValue(object, "fresnel_min", config.fresnelMin);
+    ReadFloatArray(object, "reflection_color", config.reflectionColor, 3);
+    config.reflectionEnabled = JsonBoolValue(object, "reflection_enabled", config.reflectionEnabled);
+    config.reflectionQuality = static_cast<WaterConfig::ReflectionQuality>(
+        std::clamp(static_cast<int>(JsonFloatValue(object, "reflection_quality", static_cast<float>(config.reflectionQuality))), 0, 2));
+    config.reflectionDistortionStrength = JsonFloatValue(object, "reflection_distortion_strength", config.reflectionDistortionStrength);
+    config.refractionEnabled = JsonBoolValue(object, "refraction_enabled", config.refractionEnabled);
+    ReadFloatArray(object, "shallow_color", config.shallowColor, 3);
+    ReadFloatArray(object, "deep_color", config.deepColor, 3);
+    config.depthColorMin = JsonFloatValue(object, "depth_color_min", config.depthColorMin);
+    config.depthColorMax = JsonFloatValue(object, "depth_color_max", config.depthColorMax);
+    config.depthFadeDistance = JsonFloatValue(object, "depth_fade_distance", config.depthFadeDistance);
+    config.refractionStrength = JsonFloatValue(object, "refraction_strength", config.refractionStrength);
+    config.refractionDepthStrength = JsonFloatValue(object, "refraction_depth_strength", config.refractionDepthStrength);
+    config.foamEnabled = JsonBoolValue(object, "foam_enabled", config.foamEnabled);
+    config.foamDistance = JsonFloatValue(object, "foam_distance", config.foamDistance);
+    config.foamSoftness = JsonFloatValue(object, "foam_softness", config.foamSoftness);
+    config.foamIntensity = JsonFloatValue(object, "foam_intensity", config.foamIntensity);
+    config.foamScrollSpeed = JsonFloatValue(object, "foam_scroll_speed", config.foamScrollSpeed);
+    config.foamScale = JsonFloatValue(object, "foam_scale", config.foamScale);
+    config.foamTerrainThickness = JsonFloatValue(object, "foam_terrain_thickness", config.foamTerrainThickness);
+    config.causticMode = static_cast<WaterConfig::CausticMode>(
+        std::clamp(static_cast<int>(JsonFloatValue(object, "caustic_mode", static_cast<float>(config.causticMode))), 0, 2));
+    config.causticIntensity = JsonFloatValue(object, "caustic_intensity", config.causticIntensity);
+    config.causticScale = JsonFloatValue(object, "caustic_scale", config.causticScale);
+    config.causticSpeed = JsonFloatValue(object, "caustic_speed", config.causticSpeed);
+    config.causticMaxDepth = JsonFloatValue(object, "caustic_max_depth", config.causticMaxDepth);
+    config.edgeFadeDistance = JsonFloatValue(object, "edge_fade_distance", config.edgeFadeDistance);
+    config.edgeFadeCurve = static_cast<WaterConfig::EdgeFadeCurve>(
+        std::clamp(static_cast<int>(JsonFloatValue(object, "edge_fade_curve", static_cast<float>(config.edgeFadeCurve))), 0, 2));
+    return ClampWaterConfig(config);
+}
+
+WaterMaterialData ReadWaterMaterialJson(const std::string& object, WaterMaterialData fallback = {})
+{
+    WaterMaterialData material = fallback;
+    material.formatVersion = static_cast<std::uint32_t>(
+        std::max(1.0f, JsonFloatValue(object, "format_version", static_cast<float>(material.formatVersion))));
+    material.normalMapA = JsonNullableStringValue(object, "normal_map_a");
+    material.normalMapB = JsonNullableStringValue(object, "normal_map_b");
+    material.diffuseMap = JsonNullableStringValue(object, "diffuse_map");
+    ReadFloatArray(object, "scroll_speed_a", material.scrollSpeedA, 2);
+    ReadFloatArray(object, "scroll_speed_b", material.scrollSpeedB, 2);
+    material.normalTiling = JsonFloatValue(object, "normal_tiling", material.normalTiling);
+    const std::string configObject = JsonObjectValue(object, "water_config");
+    material.config = ReadWaterConfigJson(configObject.empty() ? object : configObject, material.config);
+    return ClampWaterMaterialData(material);
+}
+
+std::string WaterMaterialFileJson(const AssetLibrary::Entry& entry)
+{
+    std::ostringstream fileJson;
+    fileJson << "{\n"
+             << "  \"format_version\": " << entry.waterMaterial.formatVersion << ",\n"
+             << "  \"id\": \"" << EscapeJson(entry.id) << "\",\n"
+             << "  \"display_name\": \"" << EscapeJson(entry.displayName) << "\",\n"
+             << "  \"normal_map_a\": \"" << EscapeJson(entry.waterMaterial.normalMapA) << "\",\n"
+             << "  \"normal_map_b\": \"" << EscapeJson(entry.waterMaterial.normalMapB) << "\",\n"
+             << "  \"diffuse_map\": \"" << EscapeJson(entry.waterMaterial.diffuseMap) << "\",\n"
+             << "  \"scroll_speed_a\": [" << entry.waterMaterial.scrollSpeedA[0] << ", "
+             << entry.waterMaterial.scrollSpeedA[1] << "],\n"
+             << "  \"scroll_speed_b\": [" << entry.waterMaterial.scrollSpeedB[0] << ", "
+             << entry.waterMaterial.scrollSpeedB[1] << "],\n"
+             << "  \"normal_tiling\": " << entry.waterMaterial.normalTiling << ",\n"
+             << "  \"water_config\": {\n";
+    WriteWaterConfigJson(fileJson, entry.waterMaterial.config, "    ");
+    fileJson << "\n  }\n}\n";
+    return fileJson.str();
+}
+
 std::string MaterialFileJson(const AssetLibrary::Entry& entry)
 {
     auto tintByte = [](float value) {
@@ -579,6 +792,7 @@ bool AssetLibrary::EnsureDirectories() const
     std::filesystem::create_directories(m_libraryRoot / "models", ec);
     std::filesystem::create_directories(m_libraryRoot / "animations", ec);
     std::filesystem::create_directories(m_libraryRoot / "materials", ec);
+    std::filesystem::create_directories(m_libraryRoot / "materials" / "water", ec);
     std::filesystem::create_directories(m_libraryRoot / "thumbnails", ec);
     return !ec;
 }
@@ -591,6 +805,7 @@ const char* AssetLibrary::CategoryName(Category category)
     case Category::Model: return "Models";
     case Category::Animation: return "Animations";
     case Category::Material: return "Materials";
+    case Category::WaterMaterial: return "Water Materials";
     default: return "Assets";
     }
 }
@@ -850,6 +1065,7 @@ std::string AssetLibrary::CategoryString(Category category)
     case Category::Model: return "model";
     case Category::Animation: return "animation";
     case Category::Material: return "material";
+    case Category::WaterMaterial: return "water_material";
     default: return "texture";
     }
 }
@@ -860,6 +1076,7 @@ std::optional<AssetLibrary::Category> AssetLibrary::ParseCategory(const std::str
     if (value == "model") return Category::Model;
     if (value == "animation") return Category::Animation;
     if (value == "material") return Category::Material;
+    if (value == "water_material" || value == "watermaterial") return Category::WaterMaterial;
     return std::nullopt;
 }
 
@@ -884,6 +1101,7 @@ std::filesystem::path AssetLibrary::CategoryDirectory(Category category) const
     case Category::Model: return m_libraryRoot / "models";
     case Category::Animation: return m_libraryRoot / "animations";
     case Category::Material: return m_libraryRoot / "materials";
+    case Category::WaterMaterial: return m_libraryRoot / "materials" / "water";
     default: return m_libraryRoot / "textures";
     }
 }
@@ -1114,6 +1332,12 @@ bool AssetLibrary::LoadManifest()
         }
         if (entry.category == Category::Texture)
             metadataChanged = PopulateTextureMetadata(entry, false) || metadataChanged;
+        if (entry.category == Category::WaterMaterial)
+        {
+            const std::string waterObject = JsonObjectValue(object, "water_material_data");
+            if (!waterObject.empty())
+                entry.waterMaterial = ReadWaterMaterialJson(waterObject, entry.waterMaterial);
+        }
         m_entries.push_back(std::move(entry));
     }
 
@@ -1195,6 +1419,24 @@ bool AssetLibrary::SaveManifest(std::string& error) const
                  << "        \"ao_strength\": " << entry.material.aoStrength << ",\n"
                  << "        \"roughness_strength\": " << entry.material.roughnessStrength << ",\n"
                  << "        \"metallic_strength\": " << entry.material.metallicStrength << "\n"
+                 << "      }\n";
+        }
+        if (entry.category == Category::WaterMaterial)
+        {
+            json << ",\n"
+                 << "      \"water_material_data\": {\n"
+                 << "        \"format_version\": " << entry.waterMaterial.formatVersion << ",\n"
+                 << "        \"normal_map_a\": \"" << EscapeJson(entry.waterMaterial.normalMapA) << "\",\n"
+                 << "        \"normal_map_b\": \"" << EscapeJson(entry.waterMaterial.normalMapB) << "\",\n"
+                 << "        \"diffuse_map\": \"" << EscapeJson(entry.waterMaterial.diffuseMap) << "\",\n"
+                 << "        \"scroll_speed_a\": [" << entry.waterMaterial.scrollSpeedA[0] << ", "
+                 << entry.waterMaterial.scrollSpeedA[1] << "],\n"
+                 << "        \"scroll_speed_b\": [" << entry.waterMaterial.scrollSpeedB[0] << ", "
+                 << entry.waterMaterial.scrollSpeedB[1] << "],\n"
+                 << "        \"normal_tiling\": " << entry.waterMaterial.normalTiling << ",\n"
+                 << "        \"water_config\": {\n";
+            WriteWaterConfigJson(json, entry.waterMaterial.config, "          ");
+            json << "\n        }\n"
                  << "      }\n";
         }
         json << "    }" << (i + 1 < m_entries.size() ? "," : "") << "\n";
@@ -1335,6 +1577,43 @@ std::vector<std::string> AssetLibrary::SubpathsFor(Category category) const
     return {paths.begin(), paths.end()};
 }
 
+std::vector<std::string> AssetLibrary::FolderSubpathsFor(Category category) const
+{
+    std::set<std::string> paths;
+    paths.insert("");
+
+    const std::filesystem::path root = CategoryDirectory(category);
+    std::error_code ec;
+    if (std::filesystem::exists(root, ec))
+    {
+        for (std::filesystem::recursive_directory_iterator it(root, ec), end; !ec && it != end; it.increment(ec))
+        {
+            if (!it->is_directory(ec))
+                continue;
+            const std::filesystem::path relative = std::filesystem::relative(it->path(), root, ec);
+            if (ec)
+                continue;
+            const std::string normalized = NormalizeSubpath(relative.generic_string());
+            if (!normalized.empty())
+                paths.insert(normalized);
+        }
+    }
+
+    for (const Entry& entry : m_entries)
+    {
+        if (entry.category != category)
+            continue;
+        std::string path = NormalizeSubpath(entry.subpath);
+        while (!path.empty())
+        {
+            paths.insert(path);
+            path = ParentSubpath(path);
+        }
+    }
+
+    return {paths.begin(), paths.end()};
+}
+
 std::vector<std::pair<std::string, std::uint32_t>> AssetLibrary::TagsFor(Category category) const
 {
     std::map<std::string, std::uint32_t> counts;
@@ -1411,6 +1690,13 @@ bool AssetLibrary::ValidateFile(Category category, const std::filesystem::path& 
             return false;
         }
         break;
+    case Category::WaterMaterial:
+        if (!HasAnyExtension(path, {".watermat", ".json"}))
+        {
+            error = "water materials must be WATERMAT or JSON";
+            return false;
+        }
+        break;
     }
     return true;
 }
@@ -1418,7 +1704,9 @@ bool AssetLibrary::ValidateFile(Category category, const std::filesystem::path& 
 std::string AssetLibrary::MakeUniqueId(Category category, const std::filesystem::path& sourcePath) const
 {
     const std::string prefix = category == Category::Texture ? "tex_" :
-        (category == Category::Model ? "model_" : (category == Category::Animation ? "anim_" : "mat_"));
+        (category == Category::Model ? "model_" :
+            (category == Category::Animation ? "anim_" :
+                (category == Category::WaterMaterial ? "watermat_" : "mat_")));
     const std::string base = prefix + SanitizeStem(sourcePath.stem().string());
     std::unordered_set<std::string> existing;
     for (const Entry& entry : m_entries)
@@ -1487,7 +1775,10 @@ bool AssetLibrary::Import(Category category,
     entry.filename = destination.filename().generic_string();
     entry.originalPath = GenericPath(sourcePath);
     entry.importedAt = TimestampUtc();
-    entry.thumbnail = category == Category::Texture ? "" : (category == Category::Model ? "model_icon" : "animation_icon");
+    entry.thumbnail = category == Category::Texture ? "" :
+        (category == Category::Model ? "model_icon" :
+            (category == Category::Animation ? "animation_icon" :
+                (category == Category::WaterMaterial ? "water_material_icon" : "material_icon")));
     entry.tags = NormalizeTags(options.tags);
     if (category == Category::Texture)
     {
@@ -1499,6 +1790,12 @@ bool AssetLibrary::Import(Category category,
             error = thumbnailError.empty() ? "failed to generate thumbnail" : thumbnailError;
             return false;
         }
+    }
+    else if (category == Category::WaterMaterial)
+    {
+        std::ifstream importedFile(destination, std::ios::binary);
+        std::string importedText((std::istreambuf_iterator<char>(importedFile)), std::istreambuf_iterator<char>());
+        entry.waterMaterial = ReadWaterMaterialJson(importedText);
     }
     m_entries.push_back(entry);
 
@@ -1629,6 +1926,118 @@ bool AssetLibrary::UpdateMaterial(const std::string& id,
     return true;
 }
 
+bool AssetLibrary::CreateWaterMaterial(const ImportOptions& options,
+                                       const WaterMaterialData& material,
+                                       Entry& outEntry,
+                                       std::string& error)
+{
+    const std::string displayName = options.displayName.empty() ? "Default_Water" : options.displayName;
+    const std::string subpath = NormalizeSubpath(options.subpath);
+    Entry entry;
+    entry.id = MakeUniqueId(Category::WaterMaterial, displayName);
+    entry.category = Category::WaterMaterial;
+    entry.displayName = displayName;
+    entry.subpath = subpath;
+    entry.filename = SanitizeStem(displayName) + ".watermat";
+    entry.originalPath.clear();
+    entry.importedAt = TimestampUtc();
+    entry.tags = NormalizeTags(options.tags.empty() ? std::vector<std::string>{"water", "material"} : options.tags);
+    entry.thumbnail = "water_material_icon";
+    entry.waterMaterial = ClampWaterMaterialData(material);
+
+    std::filesystem::path destination = AbsolutePath(entry);
+    for (uint32_t i = 2; std::filesystem::exists(destination); ++i)
+    {
+        entry.filename = SanitizeStem(displayName) + "_" + std::to_string(i) + ".watermat";
+        destination = AbsolutePath(entry);
+    }
+
+    if (!AtomicWriteText(destination, WaterMaterialFileJson(entry), error))
+        return false;
+
+    m_entries.push_back(entry);
+    if (!SaveManifest(error))
+    {
+        std::error_code ec;
+        std::filesystem::remove(destination, ec);
+        m_entries.pop_back();
+        return false;
+    }
+
+    Tracenf("[ASSET-LIBRARY] water material saved id=%s base=(%.2f %.2f %.2f)",
+        entry.id.c_str(),
+        entry.waterMaterial.config.baseColor[0],
+        entry.waterMaterial.config.baseColor[1],
+        entry.waterMaterial.config.baseColor[2]);
+    outEntry = entry;
+    return true;
+}
+
+bool AssetLibrary::UpdateWaterMaterial(const std::string& id,
+                                       const WaterMaterialData& material,
+                                       Entry& outEntry,
+                                       std::string& error)
+{
+    const auto it = std::find_if(m_entries.begin(), m_entries.end(), [&id](const Entry& entry) {
+        return entry.id == id;
+    });
+    if (it == m_entries.end())
+    {
+        error = "asset not found";
+        return false;
+    }
+    if (it->category != Category::WaterMaterial)
+    {
+        error = "asset is not a water material";
+        return false;
+    }
+
+    const Entry oldEntry = *it;
+    Entry updated = oldEntry;
+    updated.waterMaterial = ClampWaterMaterialData(material);
+    const std::filesystem::path destination = AbsolutePath(updated);
+
+    std::string oldFileText;
+    const bool hadOldFile = std::filesystem::exists(destination);
+    if (hadOldFile)
+    {
+        std::ifstream oldFile(destination, std::ios::binary);
+        oldFileText.assign(std::istreambuf_iterator<char>(oldFile), std::istreambuf_iterator<char>());
+    }
+
+    if (!AtomicWriteText(destination, WaterMaterialFileJson(updated), error))
+        return false;
+
+    *it = updated;
+    if (!SaveManifest(error))
+    {
+        const std::string manifestError = error;
+        *it = oldEntry;
+
+        std::string rollbackError;
+        bool rolledBack = false;
+        if (hadOldFile)
+            rolledBack = AtomicWriteText(destination, oldFileText, rollbackError);
+        else
+        {
+            std::error_code ec;
+            std::filesystem::remove(destination, ec);
+            rolledBack = !ec;
+            if (ec)
+                rollbackError = ec.message();
+        }
+
+        error = "manifest save failed: " + manifestError;
+        if (!rolledBack)
+            error += "; rollback failed: " + rollbackError;
+        return false;
+    }
+
+    Tracenf("[ASSET-LIBRARY] water material updated id=%s", updated.id.c_str());
+    outEntry = updated;
+    return true;
+}
+
 bool AssetLibrary::Remove(const std::string& id, std::string& error)
 {
     const auto it = std::find_if(m_entries.begin(), m_entries.end(), [&id](const Entry& entry) {
@@ -1755,10 +2164,11 @@ bool AssetLibrary::RenameAsset(const std::string& id,
 
     std::string baseName = newBaseName;
     const std::string filenameLower = ToLower(it->filename);
-    const std::string oldExtension =
-        it->category == Category::Material && filenameLower.ends_with(".material.json")
-            ? ".material.json"
-            : ToLower(std::filesystem::path(it->filename).extension().string());
+    const std::string oldExtension = it->category == Category::Material && filenameLower.ends_with(".material.json")
+        ? ".material.json"
+        : (it->category == Category::WaterMaterial && filenameLower.ends_with(".watermat")
+            ? ".watermat"
+            : ToLower(std::filesystem::path(it->filename).extension().string()));
     std::filesystem::path typedName(baseName);
     const std::string typedNameLower = ToLower(baseName);
     if (oldExtension == ".material.json" && typedNameLower.ends_with(oldExtension))
@@ -1831,11 +2241,11 @@ bool AssetLibrary::RenameAsset(const std::string& id,
         return false;
     }
 
-    std::string oldMaterialText;
-    if (oldEntry.category == Category::Material)
+    std::string oldStructuredText;
+    if (oldEntry.category == Category::Material || oldEntry.category == Category::WaterMaterial)
     {
         std::ifstream oldFile(source, std::ios::binary);
-        oldMaterialText.assign(std::istreambuf_iterator<char>(oldFile), std::istreambuf_iterator<char>());
+        oldStructuredText.assign(std::istreambuf_iterator<char>(oldFile), std::istreambuf_iterator<char>());
     }
 
     std::error_code ec;
@@ -1852,10 +2262,26 @@ bool AssetLibrary::RenameAsset(const std::string& id,
         {
             std::error_code rollbackEc;
             std::filesystem::rename(destination, source, rollbackEc);
-            if (!oldMaterialText.empty())
+            if (!oldStructuredText.empty())
             {
                 std::string ignored;
-                AtomicWriteText(source, oldMaterialText, ignored);
+                AtomicWriteText(source, oldStructuredText, ignored);
+            }
+            if (rollbackEc)
+                error += "; rollback failed: " + rollbackEc.message();
+            return false;
+        }
+    }
+    else if (renamed.category == Category::WaterMaterial)
+    {
+        if (!AtomicWriteText(destination, WaterMaterialFileJson(renamed), error))
+        {
+            std::error_code rollbackEc;
+            std::filesystem::rename(destination, source, rollbackEc);
+            if (!oldStructuredText.empty())
+            {
+                std::string ignored;
+                AtomicWriteText(source, oldStructuredText, ignored);
             }
             if (rollbackEc)
                 error += "; rollback failed: " + rollbackEc.message();
@@ -1869,10 +2295,11 @@ bool AssetLibrary::RenameAsset(const std::string& id,
         const std::string manifestError = error;
         std::error_code rollbackEc;
         std::filesystem::rename(destination, source, rollbackEc);
-        if (oldEntry.category == Category::Material && !oldMaterialText.empty())
+        if ((oldEntry.category == Category::Material || oldEntry.category == Category::WaterMaterial) &&
+            !oldStructuredText.empty())
         {
             std::string ignored;
-            AtomicWriteText(source, oldMaterialText, ignored);
+            AtomicWriteText(source, oldStructuredText, ignored);
         }
         *it = oldEntry;
         error = "manifest save failed: " + manifestError;
@@ -1935,13 +2362,6 @@ bool AssetLibrary::RenameFolder(Category category,
         entry.subpath = ReplaceSubpathPrefix(subpath, oldPath, targetPath);
         ++affected;
     }
-    if (affected == 0)
-    {
-        m_entries = backup;
-        error = "folder has no assets";
-        return false;
-    }
-
     const std::filesystem::path source = CategoryDirectory(category) / oldPath;
     const std::filesystem::path destination = CategoryDirectory(category) / targetPath;
     if (!std::filesystem::exists(source))
@@ -1989,6 +2409,126 @@ bool AssetLibrary::RenameFolder(Category category,
     }
 
     newSubpath = targetPath;
+    return true;
+}
+
+bool AssetLibrary::CreateFolder(Category category,
+                                const std::string& parentSubpath,
+                                const std::string& name,
+                                std::string& outSubpath,
+                                std::string& error)
+{
+    if (!IsValidRenameName(name, &error))
+        return false;
+
+    const std::string parent = NormalizeSubpath(parentSubpath);
+    const std::string normalizedName = NormalizeSubpath(name);
+    if (normalizedName.empty() || normalizedName.find('/') != std::string::npos)
+    {
+        error = "invalid folder name";
+        return false;
+    }
+
+    const std::string target = parent.empty() ? normalizedName : parent + "/" + normalizedName;
+    const std::filesystem::path directory = CategoryDirectory(category) / target;
+    if (std::filesystem::exists(directory))
+    {
+        error = "folder already exists";
+        return false;
+    }
+
+    std::error_code ec;
+    std::filesystem::create_directories(directory, ec);
+    if (ec)
+    {
+        error = ec.message();
+        return false;
+    }
+
+    outSubpath = target;
+    return true;
+}
+
+bool AssetLibrary::DeleteFolder(Category category,
+                                const std::string& subpath,
+                                std::uint32_t& removedAssets,
+                                std::string& error)
+{
+    removedAssets = 0;
+    const std::string target = NormalizeSubpath(subpath);
+    if (target.empty())
+    {
+        error = "root folder cannot be deleted";
+        return false;
+    }
+
+    const std::filesystem::path source = CategoryDirectory(category) / target;
+    if (!std::filesystem::exists(source))
+    {
+        error = "folder does not exist";
+        return false;
+    }
+
+    std::filesystem::path trash = source;
+    trash += ".delete_tmp";
+    for (int i = 0; std::filesystem::exists(trash) && i < 100; ++i)
+    {
+        trash = source;
+        trash += ".delete_tmp_" + std::to_string(i);
+    }
+    if (std::filesystem::exists(trash))
+    {
+        error = "could not reserve temporary delete path";
+        return false;
+    }
+
+    const std::vector<Entry> backup = m_entries;
+    std::vector<Entry> removedEntries;
+    auto writeIt = m_entries.begin();
+    for (auto readIt = m_entries.begin(); readIt != m_entries.end(); ++readIt)
+    {
+        if (readIt->category == category && IsSubpathInside(NormalizeSubpath(readIt->subpath), target))
+        {
+            removedEntries.push_back(*readIt);
+            continue;
+        }
+        if (writeIt != readIt)
+            *writeIt = *readIt;
+        ++writeIt;
+    }
+    m_entries.erase(writeIt, m_entries.end());
+    removedAssets = static_cast<std::uint32_t>(removedEntries.size());
+
+    std::error_code ec;
+    std::filesystem::rename(source, trash, ec);
+    if (ec)
+    {
+        m_entries = backup;
+        error = ec.message();
+        return false;
+    }
+
+    if (!SaveManifest(error))
+    {
+        const std::string manifestError = error;
+        std::error_code rollbackEc;
+        std::filesystem::rename(trash, source, rollbackEc);
+        m_entries = backup;
+        error = "manifest save failed: " + manifestError;
+        if (rollbackEc)
+            error += "; rollback failed: " + rollbackEc.message();
+        return false;
+    }
+
+    std::filesystem::remove_all(trash, ec);
+    for (const Entry& entry : removedEntries)
+    {
+        if (!entry.thumbnail.empty())
+        {
+            std::error_code thumbEc;
+            std::filesystem::remove(m_libraryRoot / entry.thumbnail, thumbEc);
+        }
+    }
     return true;
 }
 

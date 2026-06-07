@@ -21,6 +21,7 @@ public:
     VkInstance GetInstance() const { return m_instance; }
     VkPhysicalDevice GetPhysicalDevice() const { return m_physicalDevice; }
     VkDevice GetDevice() const { return m_device; }
+    VkQueue GetGraphicsQueue() const { return m_graphicsQueue; }
     uint32_t GetGraphicsQueueFamily() const { return m_queueFamilies.graphics; }
     VkRenderPass GetRenderPass() const { return m_renderPass; }
     VkCommandBuffer GetCommandBuffer() const { return m_commandBuffers[m_currentFrame]; }
@@ -29,8 +30,11 @@ public:
     VkFormat GetSwapchainFormat() const { return m_swapchainFormat; }
     VkFormat GetDepthStencilFormat() const { return m_depthStencilFormat; }
     VkSurfaceTransformFlagBitsKHR GetSurfaceTransform() const { return m_currentTransform; }
+    uint32_t GetSwapchainImageCount() const { return static_cast<uint32_t>(m_swapchainImages.size()); }
     uint64_t GetFrameNumber() const { return m_frameNumber; }
     uint64_t GetSafeFrameNumber() const { return m_safeFrameNumber; }
+    bool SupportsSamplerAnisotropy() const { return m_samplerAnisotropySupported; }
+    float GetMaxSamplerAnisotropy() const { return m_maxSamplerAnisotropy; }
     uint32_t GetWidth() const { return m_width; }
     uint32_t GetHeight() const { return m_height; }
     bool IsSwapchainFormatSrgb() const;
@@ -120,4 +124,6 @@ private:
     bool m_renderPassStarted = false;
     bool m_swapchainDirty = false;
     bool m_validationEnabled = false;
+    bool m_samplerAnisotropySupported = false;
+    float m_maxSamplerAnisotropy = 1.0f;
 };

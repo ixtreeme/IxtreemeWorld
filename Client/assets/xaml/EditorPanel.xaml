@@ -5,7 +5,7 @@
   Background="#00000000">
 
   <Grid.Resources>
-    <SolidColorBrush x:Key="EditorPanelBackground" Color="#CC1E1E28"/>
+    <SolidColorBrush x:Key="EditorPanelBackground" Color="#FF1E1E28"/>
     <SolidColorBrush x:Key="EditorPanelBorder" Color="#80FFFFFF"/>
 
     <Style TargetType="Button">
@@ -41,12 +41,41 @@
       <Setter Property="BorderThickness" Value="0"/>
     </Style>
 
-    <Style TargetType="TreeViewItem">
+    <Style x:Key="EditorTreeViewItem" TargetType="TreeViewItem">
       <Setter Property="Focusable" Value="False"/>
       <Setter Property="IsTabStop" Value="False"/>
       <Setter Property="Foreground" Value="#FFFFFFFF"/>
+      <Setter Property="Background" Value="#001E1E28"/>
       <Setter Property="Margin" Value="0,1,0,1"/>
       <Setter Property="FontSize" Value="12"/>
+      <Setter Property="Template">
+        <Setter.Value>
+          <ControlTemplate TargetType="TreeViewItem">
+            <StackPanel>
+              <Border
+                x:Name="TreeItemChrome"
+                CornerRadius="3"
+                Padding="4,2"
+                Background="{TemplateBinding Background}">
+                <ContentPresenter
+                  Content="{TemplateBinding Header}"
+                  ContentTemplate="{TemplateBinding HeaderTemplate}"
+                  HorizontalAlignment="Left"
+                  VerticalAlignment="Center"/>
+              </Border>
+              <ItemsPresenter Margin="14,1,0,0"/>
+            </StackPanel>
+            <ControlTemplate.Triggers>
+              <Trigger Property="IsMouseOver" Value="True">
+                <Setter TargetName="TreeItemChrome" Property="Background" Value="#334762"/>
+              </Trigger>
+              <Trigger Property="IsSelected" Value="True">
+                <Setter TargetName="TreeItemChrome" Property="Background" Value="#FF26354A"/>
+              </Trigger>
+            </ControlTemplate.Triggers>
+          </ControlTemplate>
+        </Setter.Value>
+      </Setter>
     </Style>
 
     <Style x:Key="EditorButton" TargetType="Button">
@@ -130,6 +159,33 @@
       <Setter Property="BorderBrush" Value="#55758AA8"/>
       <Setter Property="BorderThickness" Value="1"/>
       <Setter Property="Padding" Value="6,3"/>
+      <Setter Property="CaretBrush" Value="#FFFFFFFF"/>
+      <Setter Property="Template">
+        <Setter.Value>
+          <ControlTemplate TargetType="TextBox">
+            <Border
+              x:Name="Chrome"
+              CornerRadius="3"
+              Background="{TemplateBinding Background}"
+              BorderBrush="{TemplateBinding BorderBrush}"
+              BorderThickness="{TemplateBinding BorderThickness}">
+              <ScrollViewer
+                x:Name="PART_ContentHost"
+                Margin="{TemplateBinding Padding}"
+                Background="#00000000"/>
+            </Border>
+            <ControlTemplate.Triggers>
+              <Trigger Property="IsMouseOver" Value="True">
+                <Setter TargetName="Chrome" Property="BorderBrush" Value="#889AB4D6"/>
+              </Trigger>
+              <Trigger Property="IsKeyboardFocused" Value="True">
+                <Setter TargetName="Chrome" Property="BorderBrush" Value="#FF2F7DF6"/>
+                <Setter TargetName="Chrome" Property="Background" Value="#FF192638"/>
+              </Trigger>
+            </ControlTemplate.Triggers>
+          </ControlTemplate>
+        </Setter.Value>
+      </Setter>
     </Style>
 
     <Style x:Key="EditorSliderRepeatButton" TargetType="RepeatButton">
@@ -224,6 +280,7 @@
     </Grid.RowDefinitions>
 
     <Border
+      x:Name="ToolsPanelBorder"
       Grid.Row="0"
       Grid.Column="0"
       Margin="0,16,12,12"
@@ -245,6 +302,7 @@
           </UniformGrid>
 
           <Button x:Name="AddMarkerButton" Content="+ Marker" Style="{StaticResource EditorButton}"/>
+          <Button x:Name="AddWaterBodyButton" Content="+ Water" Style="{StaticResource EditorButton}"/>
           <TextBlock Text="Lighting" FontSize="13" FontWeight="Bold" Foreground="#FFFFFFFF" Margin="0,10,0,4"/>
           <Button x:Name="LightingButton" Content="Lighting" Style="{StaticResource EditorButton}"/>
 
@@ -302,6 +360,7 @@
     <Border Grid.Row="0" Grid.Column="1" Background="#00000000"/>
 
     <Border
+      x:Name="InspectorPanelBorder"
       Grid.Row="0"
       Grid.Column="2"
       Margin="12,16,0,12"
@@ -436,11 +495,111 @@
 
           </StackPanel>
 
+          <Button x:Name="DynamicLightsSectionButton" Content="[>] Dynamic Lights" Style="{StaticResource EditorButton}" HorizontalContentAlignment="Left" Margin="0,8,6,6"/>
+          <StackPanel x:Name="DynamicLightsSection" Visibility="Collapsed">
+          <TextBlock x:Name="DynamicLightCountText" Text="Active: 0 / 16" FontSize="12" Foreground="#FFB8C0CF" Margin="0,0,0,4"/>
+          <Grid>
+            <Grid.ColumnDefinitions>
+              <ColumnDefinition Width="*"/>
+              <ColumnDefinition Width="*"/>
+            </Grid.ColumnDefinitions>
+            <Button x:Name="AddPointLightButton" Grid.Column="0" Content="+ Point Light" Style="{StaticResource EditorButton}"/>
+            <Button x:Name="AddSpotLightButton" Grid.Column="1" Content="+ Spot Light" Style="{StaticResource EditorButton}"/>
+          </Grid>
+
+          </StackPanel>
+
+          <Button x:Name="SelectedLightSectionButton" Content="[>] Selected Light" Style="{StaticResource EditorButton}" HorizontalContentAlignment="Left" Margin="0,8,6,6"/>
+          <StackPanel x:Name="SelectedLightSection" Visibility="Collapsed">
+          <TextBlock x:Name="SelectedLightTitleText" Text="No light selected" FontSize="13" FontWeight="Bold" Foreground="#FFFFFFFF" Margin="0,10,0,4"/>
+          <Grid>
+            <Grid.ColumnDefinitions>
+              <ColumnDefinition Width="*"/>
+              <ColumnDefinition Width="*"/>
+            </Grid.ColumnDefinitions>
+            <Button x:Name="SelectedLightEnabledButton" Grid.Column="0" Content="Light: ON" Style="{StaticResource EditorButton}"/>
+            <Button x:Name="DeleteLightButton" Grid.Column="1" Content="Delete Light" Style="{StaticResource EditorButton}"/>
+          </Grid>
+          <TextBlock x:Name="SelectedLightXText" Text="X: 0.0" FontSize="12" Foreground="#FFB8C0CF" Margin="0,4,0,2"/>
+          <Slider x:Name="SelectedLightXSlider" Minimum="-200" Maximum="200" Value="0" Style="{StaticResource EditorSlider}"/>
+          <TextBlock x:Name="SelectedLightYText" Text="Y: 0.0" FontSize="12" Foreground="#FFB8C0CF" Margin="0,4,0,2"/>
+          <Slider x:Name="SelectedLightYSlider" Minimum="-50" Maximum="100" Value="0" Style="{StaticResource EditorSlider}"/>
+          <TextBlock x:Name="SelectedLightZText" Text="Z: 0.0" FontSize="12" Foreground="#FFB8C0CF" Margin="0,4,0,2"/>
+          <Slider x:Name="SelectedLightZSlider" Minimum="-200" Maximum="200" Value="0" Style="{StaticResource EditorSlider}"/>
+          <TextBlock x:Name="SelectedLightIntensityText" Text="Intensity: 1.0" FontSize="12" Foreground="#FFB8C0CF" Margin="0,4,0,2"/>
+          <Slider x:Name="SelectedLightIntensitySlider" Minimum="0" Maximum="10" Value="1" Style="{StaticResource EditorSlider}"/>
+          <TextBlock x:Name="SelectedLightRadiusText" Text="Radius: 10.0 m" FontSize="12" Foreground="#FFB8C0CF" Margin="0,4,0,2"/>
+          <Slider x:Name="SelectedLightRadiusSlider" Minimum="0.1" Maximum="100" Value="10" Style="{StaticResource EditorSlider}"/>
+          <TextBlock x:Name="SelectedLightRText" Text="R: 1.00" FontSize="12" Foreground="#FFB8C0CF" Margin="0,4,0,2"/>
+          <Slider x:Name="SelectedLightRSlider" Minimum="0" Maximum="1" Value="1" Style="{StaticResource EditorSlider}"/>
+          <TextBlock x:Name="SelectedLightGText" Text="G: 0.95" FontSize="12" Foreground="#FFB8C0CF" Margin="0,4,0,2"/>
+          <Slider x:Name="SelectedLightGSlider" Minimum="0" Maximum="1" Value="0.95" Style="{StaticResource EditorSlider}"/>
+          <TextBlock x:Name="SelectedLightBText" Text="B: 0.75" FontSize="12" Foreground="#FFB8C0CF" Margin="0,4,0,2"/>
+          <Slider x:Name="SelectedLightBSlider" Minimum="0" Maximum="1" Value="0.75" Style="{StaticResource EditorSlider}"/>
+          <TextBlock x:Name="SelectedSpotPitchText" Text="Pitch: -90 deg" FontSize="12" Foreground="#FFB8C0CF" Margin="0,6,0,2"/>
+          <Slider x:Name="SelectedSpotPitchSlider" Minimum="-90" Maximum="90" Value="-90" Style="{StaticResource EditorSlider}"/>
+          <TextBlock x:Name="SelectedSpotYawText" Text="Yaw: 0 deg" FontSize="12" Foreground="#FFB8C0CF" Margin="0,4,0,2"/>
+          <Slider x:Name="SelectedSpotYawSlider" Minimum="-180" Maximum="180" Value="0" Style="{StaticResource EditorSlider}"/>
+          <TextBlock x:Name="SelectedSpotInnerText" Text="Inner Cone: 20 deg" FontSize="12" Foreground="#FFB8C0CF" Margin="0,4,0,2"/>
+          <Slider x:Name="SelectedSpotInnerSlider" Minimum="1" Maximum="89" Value="20" Style="{StaticResource EditorSlider}"/>
+          <TextBlock x:Name="SelectedSpotOuterText" Text="Outer Cone: 35 deg" FontSize="12" Foreground="#FFB8C0CF" Margin="0,4,0,2"/>
+          <Slider x:Name="SelectedSpotOuterSlider" Minimum="1" Maximum="90" Value="35" Style="{StaticResource EditorSlider}"/>
+          </StackPanel>
+
+          <Button x:Name="SelectedWaterBodySectionButton" Content="[>] Selected Water Body" Style="{StaticResource EditorButton}" HorizontalContentAlignment="Left" Margin="0,8,6,6"/>
+          <StackPanel x:Name="SelectedWaterBodySection" Visibility="Collapsed">
+          <TextBlock x:Name="SelectedWaterBodyTitleText" Text="No water body selected" FontSize="13" FontWeight="Bold" Foreground="#FFFFFFFF" Margin="0,10,0,4"/>
+          <TextBlock Text="Name" FontSize="12" Foreground="#FFB8C0CF" Margin="0,4,0,2"/>
+          <TextBox x:Name="SelectedWaterBodyNameBox" Style="{StaticResource EditorTextBox}"/>
+          <TextBlock x:Name="SelectedWaterBodyMaterialText" Text="Material: Inline Water" FontSize="12" Foreground="#FFB8C0CF" Margin="0,6,0,2" TextTrimming="CharacterEllipsis"/>
+          <Button x:Name="SelectedWaterBodyMaterialButton" Content="Drop Water Material Here" Style="{StaticResource EditorButton}" HorizontalContentAlignment="Left"/>
+          <Grid>
+            <Grid.ColumnDefinitions>
+              <ColumnDefinition Width="*"/>
+              <ColumnDefinition Width="*"/>
+            </Grid.ColumnDefinitions>
+            <Button x:Name="EditWaterMaterialButton" Grid.Column="0" Content="Edit Material" Style="{StaticResource EditorButton}"/>
+            <Button x:Name="DeleteWaterBodyButton" Grid.Column="1" Content="Delete Water Body" Style="{StaticResource EditorButton}"/>
+          </Grid>
+          <TextBlock x:Name="SelectedWaterBodyXText" Text="X: 0.0" FontSize="12" Foreground="#FFB8C0CF" Margin="0,4,0,2"/>
+          <Slider x:Name="SelectedWaterBodyXSlider" Minimum="-200" Maximum="200" Value="0" Style="{StaticResource EditorSlider}"/>
+          <TextBlock x:Name="SelectedWaterBodyYText" Text="Water Level Y: 0.0 m" FontSize="12" Foreground="#FFB8C0CF" Margin="0,4,0,2"/>
+          <Slider x:Name="SelectedWaterBodyYSlider" Minimum="-50" Maximum="100" Value="0" Style="{StaticResource EditorSlider}"/>
+          <TextBlock x:Name="SelectedWaterBodyZText" Text="Z: 0.0" FontSize="12" Foreground="#FFB8C0CF" Margin="0,4,0,2"/>
+          <Slider x:Name="SelectedWaterBodyZSlider" Minimum="-200" Maximum="200" Value="0" Style="{StaticResource EditorSlider}"/>
+          <TextBlock x:Name="SelectedWaterBodyWidthText" Text="Bbox Width: 10.0 m" FontSize="12" Foreground="#FFB8C0CF" Margin="0,4,0,2"/>
+          <Slider x:Name="SelectedWaterBodyWidthSlider" Minimum="1" Maximum="200" Value="10" Style="{StaticResource EditorSlider}"/>
+          <TextBlock x:Name="SelectedWaterBodyDepthText" Text="Bbox Depth: 10.0 m" FontSize="12" Foreground="#FFB8C0CF" Margin="0,4,0,2"/>
+          <Slider x:Name="SelectedWaterBodyDepthSlider" Minimum="1" Maximum="200" Value="10" Style="{StaticResource EditorSlider}"/>
+          <Button x:Name="SelectedWaterSculptButton" Content="Sculpt Mode: OFF" Style="{StaticResource EditorButton}" Margin="0,8,0,2"/>
+          <Grid x:Name="SelectedWaterSculptControls" Visibility="Collapsed">
+            <Grid.RowDefinitions>
+              <RowDefinition Height="Auto"/>
+              <RowDefinition Height="Auto"/>
+              <RowDefinition Height="Auto"/>
+            </Grid.RowDefinitions>
+            <Grid Grid.Row="0">
+              <Grid.ColumnDefinitions>
+                <ColumnDefinition Width="*"/>
+                <ColumnDefinition Width="*"/>
+              </Grid.ColumnDefinitions>
+              <Button x:Name="WaterSculptAddButton" Grid.Column="0" Content="Add" Style="{StaticResource EditorButton}"/>
+              <Button x:Name="WaterSculptRemoveButton" Grid.Column="1" Content="Remove" Style="{StaticResource EditorButton}"/>
+            </Grid>
+            <TextBlock x:Name="WaterSculptRadiusText" Grid.Row="1" Text="Sculpt Radius: 3.0 m" FontSize="12" Foreground="#FFB8C0CF" Margin="0,4,0,2"/>
+            <Slider x:Name="WaterSculptRadiusSlider" Grid.Row="2" Minimum="0.5" Maximum="20" Value="3" Style="{StaticResource EditorSlider}"/>
+          </Grid>
+          </StackPanel>
+
+          <Button x:Name="WaterMaterialEditorSectionButton" Content="[>] Water Material Editor" Style="{StaticResource EditorButton}" HorizontalContentAlignment="Left" Margin="0,8,6,6"/>
+          <StackPanel x:Name="WaterMaterialEditorSection" Visibility="Collapsed">
+          <TextBlock x:Name="WaterMaterialEditorTitleText" Text="No water material open" FontSize="13" FontWeight="Bold" Foreground="#FFFFFFFF" Margin="0,4,0,4"/>
+          <Button x:Name="SaveWaterMaterialButton" Content="Save Water Material" Style="{StaticResource EditorButton}"/>
           <Button x:Name="WaterBaseSectionButton" Content="[v] Water" Style="{StaticResource EditorButton}" HorizontalContentAlignment="Left" Margin="0,8,6,6"/>
           <StackPanel x:Name="WaterBaseSection">
           <Button x:Name="WaterEnabledButton" Content="Water: ON" Style="{StaticResource EditorButton}"/>
-          <TextBlock x:Name="WaterLevelText" Text="Water Level Y: 0.0 m" FontSize="12" Foreground="#FFB8C0CF" Margin="0,4,0,2"/>
-          <Slider x:Name="WaterLevelSlider" Minimum="-50" Maximum="50" Value="0" Style="{StaticResource EditorSlider}"/>
+          <TextBlock x:Name="WaterLevelText" Text="Water Level Y: material fallback" FontSize="12" Foreground="#FFB8C0CF" Margin="0,4,0,2" Visibility="Collapsed"/>
+          <Slider x:Name="WaterLevelSlider" Minimum="-50" Maximum="50" Value="0" Style="{StaticResource EditorSlider}" Visibility="Collapsed"/>
           <TextBlock x:Name="WaterBaseRText" Text="Base R: 0.10" FontSize="12" Foreground="#FFB8C0CF" Margin="0,4,0,2"/>
           <Slider x:Name="WaterBaseRSlider" Minimum="0" Maximum="1" Value="0.10" Style="{StaticResource EditorSlider}"/>
           <TextBlock x:Name="WaterBaseGText" Text="Base G: 0.35" FontSize="12" Foreground="#FFB8C0CF" Margin="0,4,0,2"/>
@@ -469,6 +628,19 @@
           <Slider x:Name="WaterReflectionGSlider" Minimum="0" Maximum="1" Value="0.70" Style="{StaticResource EditorSlider}"/>
           <TextBlock x:Name="WaterReflectionBText" Text="Reflection B: 0.85" FontSize="12" Foreground="#FFB8C0CF" Margin="0,4,0,2"/>
           <Slider x:Name="WaterReflectionBSlider" Minimum="0" Maximum="1" Value="0.85" Style="{StaticResource EditorSlider}"/>
+          </StackPanel>
+
+          <Button x:Name="WaterEdgeFadeSectionButton" Content="[>] Edge Fade" Style="{StaticResource EditorButton}" HorizontalContentAlignment="Left" Margin="0,8,6,6"/>
+          <StackPanel x:Name="WaterEdgeFadeSection" Visibility="Collapsed">
+          <TextBlock x:Name="WaterEdgeFadeDistanceText" Text="Edge Fade Distance: 1.0 m" FontSize="12" Foreground="#FFB8C0CF" Margin="0,4,0,2"/>
+          <Slider x:Name="WaterEdgeFadeDistanceSlider" Minimum="0" Maximum="3" Value="1" Style="{StaticResource EditorSlider}"/>
+          <TextBlock Text="Edge Fade Curve" FontSize="12" Foreground="#FFB8C0CF" Margin="0,6,0,2"/>
+          <UniformGrid Columns="3" Margin="0,0,0,0">
+            <Button x:Name="WaterEdgeFadeLinearButton" Content="Linear" Style="{StaticResource EditorButton}"/>
+            <Button x:Name="WaterEdgeFadeSmoothButton" Content="[Smooth]" Style="{StaticResource EditorButton}"/>
+            <Button x:Name="WaterEdgeFadeExponentialButton" Content="Exp" Style="{StaticResource EditorButton}"/>
+          </UniformGrid>
+          <TextBlock Text="Soft shoreline transition over the specified distance" FontSize="11" Foreground="#FF8F98A8" TextWrapping="Wrap" Margin="0,4,0,0"/>
           </StackPanel>
 
           <Button x:Name="WaterReflectionSectionButton" Content="[>] Reflection" Style="{StaticResource EditorButton}" HorizontalContentAlignment="Left" Margin="0,8,6,6"/>
@@ -544,55 +716,7 @@
 
           </StackPanel>
 
-          <Button x:Name="DynamicLightsSectionButton" Content="[>] Dynamic Lights" Style="{StaticResource EditorButton}" HorizontalContentAlignment="Left" Margin="0,8,6,6"/>
-          <StackPanel x:Name="DynamicLightsSection" Visibility="Collapsed">
-          <TextBlock x:Name="DynamicLightCountText" Text="Active: 0 / 16" FontSize="12" Foreground="#FFB8C0CF" Margin="0,0,0,4"/>
-          <Grid>
-            <Grid.ColumnDefinitions>
-              <ColumnDefinition Width="*"/>
-              <ColumnDefinition Width="*"/>
-            </Grid.ColumnDefinitions>
-            <Button x:Name="AddPointLightButton" Grid.Column="0" Content="+ Point Light" Style="{StaticResource EditorButton}"/>
-            <Button x:Name="AddSpotLightButton" Grid.Column="1" Content="+ Spot Light" Style="{StaticResource EditorButton}"/>
-          </Grid>
 
-          </StackPanel>
-
-          <Button x:Name="SelectedLightSectionButton" Content="[>] Selected Light" Style="{StaticResource EditorButton}" HorizontalContentAlignment="Left" Margin="0,8,6,6"/>
-          <StackPanel x:Name="SelectedLightSection" Visibility="Collapsed">
-          <TextBlock x:Name="SelectedLightTitleText" Text="No light selected" FontSize="13" FontWeight="Bold" Foreground="#FFFFFFFF" Margin="0,10,0,4"/>
-          <Grid>
-            <Grid.ColumnDefinitions>
-              <ColumnDefinition Width="*"/>
-              <ColumnDefinition Width="*"/>
-            </Grid.ColumnDefinitions>
-            <Button x:Name="SelectedLightEnabledButton" Grid.Column="0" Content="Light: ON" Style="{StaticResource EditorButton}"/>
-            <Button x:Name="DeleteLightButton" Grid.Column="1" Content="Delete Light" Style="{StaticResource EditorButton}"/>
-          </Grid>
-          <TextBlock x:Name="SelectedLightXText" Text="X: 0.0" FontSize="12" Foreground="#FFB8C0CF" Margin="0,4,0,2"/>
-          <Slider x:Name="SelectedLightXSlider" Minimum="-200" Maximum="200" Value="0" Style="{StaticResource EditorSlider}"/>
-          <TextBlock x:Name="SelectedLightYText" Text="Y: 0.0" FontSize="12" Foreground="#FFB8C0CF" Margin="0,4,0,2"/>
-          <Slider x:Name="SelectedLightYSlider" Minimum="-50" Maximum="100" Value="0" Style="{StaticResource EditorSlider}"/>
-          <TextBlock x:Name="SelectedLightZText" Text="Z: 0.0" FontSize="12" Foreground="#FFB8C0CF" Margin="0,4,0,2"/>
-          <Slider x:Name="SelectedLightZSlider" Minimum="-200" Maximum="200" Value="0" Style="{StaticResource EditorSlider}"/>
-          <TextBlock x:Name="SelectedLightIntensityText" Text="Intensity: 1.0" FontSize="12" Foreground="#FFB8C0CF" Margin="0,4,0,2"/>
-          <Slider x:Name="SelectedLightIntensitySlider" Minimum="0" Maximum="10" Value="1" Style="{StaticResource EditorSlider}"/>
-          <TextBlock x:Name="SelectedLightRadiusText" Text="Radius: 10.0 m" FontSize="12" Foreground="#FFB8C0CF" Margin="0,4,0,2"/>
-          <Slider x:Name="SelectedLightRadiusSlider" Minimum="0.1" Maximum="100" Value="10" Style="{StaticResource EditorSlider}"/>
-          <TextBlock x:Name="SelectedLightRText" Text="R: 1.00" FontSize="12" Foreground="#FFB8C0CF" Margin="0,4,0,2"/>
-          <Slider x:Name="SelectedLightRSlider" Minimum="0" Maximum="1" Value="1" Style="{StaticResource EditorSlider}"/>
-          <TextBlock x:Name="SelectedLightGText" Text="G: 0.95" FontSize="12" Foreground="#FFB8C0CF" Margin="0,4,0,2"/>
-          <Slider x:Name="SelectedLightGSlider" Minimum="0" Maximum="1" Value="0.95" Style="{StaticResource EditorSlider}"/>
-          <TextBlock x:Name="SelectedLightBText" Text="B: 0.75" FontSize="12" Foreground="#FFB8C0CF" Margin="0,4,0,2"/>
-          <Slider x:Name="SelectedLightBSlider" Minimum="0" Maximum="1" Value="0.75" Style="{StaticResource EditorSlider}"/>
-          <TextBlock x:Name="SelectedSpotPitchText" Text="Pitch: -90 deg" FontSize="12" Foreground="#FFB8C0CF" Margin="0,6,0,2"/>
-          <Slider x:Name="SelectedSpotPitchSlider" Minimum="-90" Maximum="90" Value="-90" Style="{StaticResource EditorSlider}"/>
-          <TextBlock x:Name="SelectedSpotYawText" Text="Yaw: 0 deg" FontSize="12" Foreground="#FFB8C0CF" Margin="0,4,0,2"/>
-          <Slider x:Name="SelectedSpotYawSlider" Minimum="-180" Maximum="180" Value="0" Style="{StaticResource EditorSlider}"/>
-          <TextBlock x:Name="SelectedSpotInnerText" Text="Inner Cone: 20 deg" FontSize="12" Foreground="#FFB8C0CF" Margin="0,4,0,2"/>
-          <Slider x:Name="SelectedSpotInnerSlider" Minimum="1" Maximum="89" Value="20" Style="{StaticResource EditorSlider}"/>
-          <TextBlock x:Name="SelectedSpotOuterText" Text="Outer Cone: 35 deg" FontSize="12" Foreground="#FFB8C0CF" Margin="0,4,0,2"/>
-          <Slider x:Name="SelectedSpotOuterSlider" Minimum="1" Maximum="90" Value="35" Style="{StaticResource EditorSlider}"/>
           </StackPanel>
           </StackPanel>
 
@@ -609,6 +733,7 @@
     </Border>
 
     <Border
+      x:Name="AssetBrowserPanelBorder"
       Grid.Row="1"
       Grid.Column="0"
       Grid.ColumnSpan="3"
@@ -634,6 +759,7 @@
             <ColumnDefinition Width="Auto"/>
             <ColumnDefinition Width="Auto"/>
             <ColumnDefinition Width="Auto"/>
+            <ColumnDefinition Width="Auto"/>
             <ColumnDefinition Width="*"/>
             <ColumnDefinition Width="Auto"/>
             <ColumnDefinition Width="Auto"/>
@@ -642,14 +768,15 @@
           <Button x:Name="AssetModelsButton" Grid.Column="1" Content="Models" Style="{StaticResource EditorButton}"/>
           <Button x:Name="AssetAnimationsButton" Grid.Column="2" Content="Anims" Style="{StaticResource EditorButton}"/>
           <Button x:Name="AssetMaterialsButton" Grid.Column="3" Content="Materials" Style="{StaticResource EditorButton}"/>
-          <TextBox x:Name="AssetSearchBox" Grid.Column="4" Style="{StaticResource EditorTextBox}"/>
-          <Button x:Name="AssetClearButton" Grid.Column="5" Content="Clear" Style="{StaticResource EditorButton}"/>
-          <Button x:Name="AssetRefreshButton" Grid.Column="6" Content="Refresh" Style="{StaticResource EditorButton}"/>
+          <Button x:Name="AssetWaterMaterialsButton" Grid.Column="4" Content="Water Mats" Style="{StaticResource EditorButton}"/>
+          <TextBox x:Name="AssetSearchBox" Grid.Column="5" Style="{StaticResource EditorTextBox}"/>
+          <Button x:Name="AssetClearButton" Grid.Column="6" Content="Clear" Style="{StaticResource EditorButton}"/>
+          <Button x:Name="AssetRefreshButton" Grid.Column="7" Content="Refresh" Style="{StaticResource EditorButton}"/>
         </Grid>
 
         <StackPanel Grid.Row="1" Grid.Column="0" Margin="0,8,10,0">
           <TextBlock Text="Folders" FontSize="12" Foreground="#FFB8C0CF" Margin="0,0,0,4"/>
-          <Border Background="#44111820" BorderBrush="#33758AA8" BorderThickness="1" CornerRadius="4" Padding="6">
+          <Border x:Name="AssetFolderPanelBorder" Background="#FF111820" BorderBrush="#33758AA8" BorderThickness="1" CornerRadius="4" Padding="6">
             <TreeView x:Name="AssetFolderTree"/>
           </Border>
         </StackPanel>
@@ -663,6 +790,8 @@
             <Grid.ColumnDefinitions>
               <ColumnDefinition Width="Auto"/>
               <ColumnDefinition Width="Auto"/>
+              <ColumnDefinition Width="Auto"/>
+              <ColumnDefinition Width="Auto"/>
               <ColumnDefinition Width="*"/>
               <ColumnDefinition Width="Auto"/>
               <ColumnDefinition Width="Auto"/>
@@ -670,42 +799,31 @@
             </Grid.ColumnDefinitions>
             <Button x:Name="AssetFolderHomeButton" Grid.Column="0" Content="Home" Style="{StaticResource EditorButton}"/>
             <Button x:Name="AssetFolderUpButton" Grid.Column="1" Content="Up" Style="{StaticResource EditorButton}"/>
-            <StackPanel Grid.Column="2" Orientation="Vertical" Margin="2,0,8,0">
+            <Button x:Name="AssetCreateFolderButton" Grid.Column="2" Content="+ Folder" Style="{StaticResource EditorButton}"/>
+            <Button x:Name="AssetDeleteFolderButton" Grid.Column="3" Content="Delete Folder" Style="{StaticResource EditorButton}"/>
+            <StackPanel Grid.Column="4" Orientation="Vertical" Margin="2,0,8,0">
               <StackPanel x:Name="AssetBreadcrumbPanel" Orientation="Horizontal"/>
               <TextBlock x:Name="AssetFolderCountText" Text="0 assets" FontSize="11" Foreground="#FF8EA0B8" TextTrimming="CharacterEllipsis"/>
             </StackPanel>
-            <Button x:Name="ImportTextureButton" Grid.Column="3" Content="+ Texture" Style="{StaticResource EditorButton}"/>
-            <Button x:Name="ImportModelButton" Grid.Column="4" Content="+ Model" Style="{StaticResource EditorButton}"/>
-            <Button x:Name="ImportAnimationButton" Grid.Column="5" Content="+ Anim" Style="{StaticResource EditorButton}"/>
+            <Button x:Name="ImportTextureButton" Grid.Column="5" Content="+ Texture" Style="{StaticResource EditorButton}"/>
+            <Button x:Name="ImportModelButton" Grid.Column="6" Content="+ Model" Style="{StaticResource EditorButton}"/>
+            <Button x:Name="ImportAnimationButton" Grid.Column="7" Content="+ Anim" Style="{StaticResource EditorButton}"/>
           </Grid>
 
           <ScrollViewer Grid.Row="1" VerticalScrollBarVisibility="Auto">
-            <UniformGrid Columns="4">
-              <Button x:Name="Asset0Button" Height="126" Style="{StaticResource EditorButton}"><StackPanel><Border Height="64" Margin="6,6,6,4" Background="#FF0F141D"><Image x:Name="Asset0Image" Stretch="UniformToFill"/></Border><TextBlock x:Name="Asset0Text" Text="-" FontSize="11" TextWrapping="Wrap" TextAlignment="Center"/></StackPanel></Button>
-              <Button x:Name="Asset1Button" Height="126" Style="{StaticResource EditorButton}"><StackPanel><Border Height="64" Margin="6,6,6,4" Background="#FF0F141D"><Image x:Name="Asset1Image" Stretch="UniformToFill"/></Border><TextBlock x:Name="Asset1Text" Text="-" FontSize="11" TextWrapping="Wrap" TextAlignment="Center"/></StackPanel></Button>
-              <Button x:Name="Asset2Button" Height="126" Style="{StaticResource EditorButton}"><StackPanel><Border Height="64" Margin="6,6,6,4" Background="#FF0F141D"><Image x:Name="Asset2Image" Stretch="UniformToFill"/></Border><TextBlock x:Name="Asset2Text" Text="-" FontSize="11" TextWrapping="Wrap" TextAlignment="Center"/></StackPanel></Button>
-              <Button x:Name="Asset3Button" Height="126" Style="{StaticResource EditorButton}"><StackPanel><Border Height="64" Margin="6,6,6,4" Background="#FF0F141D"><Image x:Name="Asset3Image" Stretch="UniformToFill"/></Border><TextBlock x:Name="Asset3Text" Text="-" FontSize="11" TextWrapping="Wrap" TextAlignment="Center"/></StackPanel></Button>
-              <Button x:Name="Asset4Button" Height="126" Style="{StaticResource EditorButton}"><StackPanel><Border Height="64" Margin="6,6,6,4" Background="#FF0F141D"><Image x:Name="Asset4Image" Stretch="UniformToFill"/></Border><TextBlock x:Name="Asset4Text" Text="-" FontSize="11" TextWrapping="Wrap" TextAlignment="Center"/></StackPanel></Button>
-              <Button x:Name="Asset5Button" Height="126" Style="{StaticResource EditorButton}"><StackPanel><Border Height="64" Margin="6,6,6,4" Background="#FF0F141D"><Image x:Name="Asset5Image" Stretch="UniformToFill"/></Border><TextBlock x:Name="Asset5Text" Text="-" FontSize="11" TextWrapping="Wrap" TextAlignment="Center"/></StackPanel></Button>
-              <Button x:Name="Asset6Button" Height="126" Style="{StaticResource EditorButton}"><StackPanel><Border Height="64" Margin="6,6,6,4" Background="#FF0F141D"><Image x:Name="Asset6Image" Stretch="UniformToFill"/></Border><TextBlock x:Name="Asset6Text" Text="-" FontSize="11" TextWrapping="Wrap" TextAlignment="Center"/></StackPanel></Button>
-              <Button x:Name="Asset7Button" Height="126" Style="{StaticResource EditorButton}"><StackPanel><Border Height="64" Margin="6,6,6,4" Background="#FF0F141D"><Image x:Name="Asset7Image" Stretch="UniformToFill"/></Border><TextBlock x:Name="Asset7Text" Text="-" FontSize="11" TextWrapping="Wrap" TextAlignment="Center"/></StackPanel></Button>
-              <Button x:Name="Asset8Button" Height="126" Style="{StaticResource EditorButton}"><StackPanel><Border Height="64" Margin="6,6,6,4" Background="#FF0F141D"><Image x:Name="Asset8Image" Stretch="UniformToFill"/></Border><TextBlock x:Name="Asset8Text" Text="-" FontSize="11" TextWrapping="Wrap" TextAlignment="Center"/></StackPanel></Button>
-              <Button x:Name="Asset9Button" Height="126" Style="{StaticResource EditorButton}"><StackPanel><Border Height="64" Margin="6,6,6,4" Background="#FF0F141D"><Image x:Name="Asset9Image" Stretch="UniformToFill"/></Border><TextBlock x:Name="Asset9Text" Text="-" FontSize="11" TextWrapping="Wrap" TextAlignment="Center"/></StackPanel></Button>
-              <Button x:Name="Asset10Button" Height="126" Style="{StaticResource EditorButton}"><StackPanel><Border Height="64" Margin="6,6,6,4" Background="#FF0F141D"><Image x:Name="Asset10Image" Stretch="UniformToFill"/></Border><TextBlock x:Name="Asset10Text" Text="-" FontSize="11" TextWrapping="Wrap" TextAlignment="Center"/></StackPanel></Button>
-              <Button x:Name="Asset11Button" Height="126" Style="{StaticResource EditorButton}"><StackPanel><Border Height="64" Margin="6,6,6,4" Background="#FF0F141D"><Image x:Name="Asset11Image" Stretch="UniformToFill"/></Border><TextBlock x:Name="Asset11Text" Text="-" FontSize="11" TextWrapping="Wrap" TextAlignment="Center"/></StackPanel></Button>
-            </UniformGrid>
+            <WrapPanel x:Name="AssetTilePanel" Orientation="Horizontal"/>
           </ScrollViewer>
         </Grid>
 
         <StackPanel Grid.Row="1" Grid.Column="2" Margin="0,8,0,0">
           <TextBlock Text="Tags" FontSize="12" Foreground="#FFB8C0CF" Margin="0,0,0,4"/>
           <UniformGrid Columns="2">
-            <Button x:Name="AssetTag0Button" Style="{StaticResource EditorButton}"><TextBlock x:Name="AssetTag0Text" Text="-" TextAlignment="Center"/></Button>
-            <Button x:Name="AssetTag1Button" Style="{StaticResource EditorButton}"><TextBlock x:Name="AssetTag1Text" Text="-" TextAlignment="Center"/></Button>
-            <Button x:Name="AssetTag2Button" Style="{StaticResource EditorButton}"><TextBlock x:Name="AssetTag2Text" Text="-" TextAlignment="Center"/></Button>
-            <Button x:Name="AssetTag3Button" Style="{StaticResource EditorButton}"><TextBlock x:Name="AssetTag3Text" Text="-" TextAlignment="Center"/></Button>
-            <Button x:Name="AssetTag4Button" Style="{StaticResource EditorButton}"><TextBlock x:Name="AssetTag4Text" Text="-" TextAlignment="Center"/></Button>
-            <Button x:Name="AssetTag5Button" Style="{StaticResource EditorButton}"><TextBlock x:Name="AssetTag5Text" Text="-" TextAlignment="Center"/></Button>
+            <Button x:Name="AssetTag0Button" Style="{StaticResource EditorButton}"><TextBlock x:Name="AssetTag0Text" Text="" TextAlignment="Center"/></Button>
+            <Button x:Name="AssetTag1Button" Style="{StaticResource EditorButton}"><TextBlock x:Name="AssetTag1Text" Text="" TextAlignment="Center"/></Button>
+            <Button x:Name="AssetTag2Button" Style="{StaticResource EditorButton}"><TextBlock x:Name="AssetTag2Text" Text="" TextAlignment="Center"/></Button>
+            <Button x:Name="AssetTag3Button" Style="{StaticResource EditorButton}"><TextBlock x:Name="AssetTag3Text" Text="" TextAlignment="Center"/></Button>
+            <Button x:Name="AssetTag4Button" Style="{StaticResource EditorButton}"><TextBlock x:Name="AssetTag4Text" Text="" TextAlignment="Center"/></Button>
+            <Button x:Name="AssetTag5Button" Style="{StaticResource EditorButton}"><TextBlock x:Name="AssetTag5Text" Text="" TextAlignment="Center"/></Button>
           </UniformGrid>
         </StackPanel>
       </Grid>

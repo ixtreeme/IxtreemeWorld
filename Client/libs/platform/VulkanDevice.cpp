@@ -569,6 +569,8 @@ bool VulkanDevice::CreateLogicalDevice()
 
     VkPhysicalDeviceFeatures supported{};
     vkGetPhysicalDeviceFeatures(m_physicalDevice, &supported);
+    VkPhysicalDeviceProperties properties{};
+    vkGetPhysicalDeviceProperties(m_physicalDevice, &properties);
 
     VkPhysicalDeviceFeatures enabled{};
     if (supported.fillModeNonSolid)
@@ -578,6 +580,19 @@ bool VulkanDevice::CreateLogicalDevice()
     else
     {
         Log("Vulkan device does not support fillModeNonSolid; wireframe/line polygon modes are disabled.");
+    }
+    if (supported.samplerAnisotropy)
+    {
+        enabled.samplerAnisotropy = VK_TRUE;
+        m_samplerAnisotropySupported = true;
+        m_maxSamplerAnisotropy = std::max(1.0f, properties.limits.maxSamplerAnisotropy);
+        LogFormat("[VULKAN] samplerAnisotropy enabled max=%.1f", m_maxSamplerAnisotropy);
+    }
+    else
+    {
+        m_samplerAnisotropySupported = false;
+        m_maxSamplerAnisotropy = 1.0f;
+        Log("[VULKAN] samplerAnisotropy unsupported; using linear filtering fallback.");
     }
     create.pEnabledFeatures = &enabled;
 

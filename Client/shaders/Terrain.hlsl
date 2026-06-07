@@ -13,6 +13,15 @@ struct SpotLightUbo
     float4 color;
 };
 
+struct TerrainWaterBodyUbo
+{
+    float4 bboxMinMax;       // minX, minZ, maxX, maxZ
+    float4 levelModeEnabled; // levelY, causticMode, enabled, foamEnabled
+    float4 foamParams;       // distance, softness, intensity, scale
+    float4 causticParams;    // intensity, scale, speed, maxDepth
+    float4 edgeParams;       // fadeDistance, curve, reserved, reserved
+};
+
 [[vk::binding(0, 0)]] cbuffer TerrainConstants : register(b0)
 {
     float4x4 u_mvp;
@@ -29,10 +38,8 @@ struct SpotLightUbo
     int u_numPointLights;
     int u_numSpotLights;
     float2 u_lightPadding;
-    float4 u_waterParams1;
-    float4 u_waterParams2;
-    float4 u_waterParams3;
-    float4 u_waterParams4;
+    float4 u_waterGlobalParams; // time, activeCount, truncatedCount, reserved
+    TerrainWaterBodyUbo u_terrainWaterBodies[8];
     PointLightUbo u_pointLights[16];
     SpotLightUbo u_spotLights[16];
 };
@@ -253,10 +260,56 @@ float CausticPattern(float2 uv, float time, float mode)
     return saturate(max(rings, veins) * 0.85);
 }
 
+bool IsInsideWaterBodyBbox(float3 worldPos, TerrainWaterBodyUbo body)
+{
+    return body.levelModeEnabled.z > 0.5 &&
+        worldPos.x >= body.bboxMinMax.x &&
+        worldPos.x <= body.bboxMinMax.z &&
+        worldPos.z >= body.bboxMinMax.y &&
+        worldPos.z <= body.bboxMinMax.w;
+}
+
+float ApplyWaterEdgeCurve(float t, float curve)
+{
+    t = saturate(t);
+    if (curve < 0.5)
+        return t;
+    if (curve < 1.5)
+        return t * t * (3.0 - 2.0 * t);
+    return t * t;
+}
+
+float WaterBodyBboxEdgeAlpha(float3 worldPos, TerrainWaterBodyUbo body)
+{
+    const float fadeDistance = max(body.edgeParams.x, 0.0);
+    if (fadeDistance <= 0.0001)
+        return 1.0;
+
+    const float distToEdge = min(
+        min(worldPos.x - body.bboxMinMax.x, body.bboxMinMax.z - worldPos.x),
+        min(worldPos.z - body.bboxMinMax.y, body.bboxMinMax.w - worldPos.z));
+    return ApplyWaterEdgeCurve(saturate(distToEdge / fadeDistance), body.edgeParams.y);
+}
+
 float4 PSMain(VSOutput input) : SV_Target0
 {
     if (u_layerConstants.u_layerParams.z > 5.5)
     {
+        if (u_layerConstants.u_layerParams.z > 7.5)
+        {
+            const float2 center = u_layerConstants.u_layerParams.xy;
+            const float radius = max(u_layerConstants.u_layerParams.w, 0.001);
+            const float dist = distance(input.localXZ, center);
+            const float ring = 1.0 - smoothstep(radius * 0.92, radius, dist);
+            const float hole = smoothstep(radius * 0.68, radius * 0.78, dist);
+            const float alpha = saturate(ring * hole) * 0.78;
+            const bool addMode = u_layerConstants.u_layerParams.z < 8.5;
+            const float3 color = addMode ? float3(0.34, 0.82, 1.0) : float3(1.0, 0.18, 0.12);
+            return float4(color, alpha);
+        }
+        if (u_layerConstants.u_layerParams.z > 6.5)
+            return float4(1.0, 0.86, 0.05, 1.0);
+
         const float2 center = u_layerConstants.u_layerParams.xy;
         const float radius = max(u_layerConstants.u_layerParams.w, 0.001);
         const float dist = distance(input.localXZ, center);
@@ -375,38 +428,55 @@ float4 PSMain(VSOutput input) : SV_Target0
         }
     }
 
-    const bool waterEnabled = u_waterParams1.x > 0.5;
-    const float waterLevel = u_waterParams1.y;
-    const float waterDepth = waterLevel - input.worldPos.y;
+    const float waterTime = u_waterGlobalParams.x;
+    const int terrainWaterBodyCount = min((int)u_waterGlobalParams.y, 8);
 
-    if (waterEnabled && u_waterParams1.z > 0.5)
+    [loop]
+    for (int w = 0; w < terrainWaterBodyCount; ++w)
     {
-        const float terrainFoamDepth = waterDepth;
-        const float foamThickness = max(u_waterParams2.w, 0.001);
-        if (terrainFoamDepth > 0.0 && terrainFoamDepth < foamThickness)
+        TerrainWaterBodyUbo body = u_terrainWaterBodies[w];
+        if (!IsInsideWaterBodyBbox(input.worldPos, body))
+            continue;
+
+        const float bodyWaterDepth = body.levelModeEnabled.x - input.worldPos.y;
+        if (bodyWaterDepth <= 0.0)
+            continue;
+
+        const float waterEdgeAlpha = WaterBodyBboxEdgeAlpha(input.worldPos, body);
+        const float waterFoamEdgeMask = smoothstep(0.5, 0.9, waterEdgeAlpha);
+
+        if (body.levelModeEnabled.w > 0.5)
         {
-            const float time = u_waterParams1.w * max(u_waterParams2.y, 0.001);
-            const float foamScale = max(u_waterParams4.x, 0.05);
-            float2 foamUv0 = input.worldPos.xz / max(foamScale * 5.0, 0.5) + float2(time * 0.21, time * 0.13);
-            float2 foamUv1 = input.worldPos.xz / max(foamScale * 11.0, 1.0) - float2(time * 0.17, time * 0.25);
-            float terrainFoam = FoamNoise(foamUv0) * 0.6 + FoamNoise(foamUv1) * 0.4;
-            terrainFoam = smoothstep(0.55, 0.82, terrainFoam);
-            const float shoreMask = 1.0 - smoothstep(0.0, foamThickness, terrainFoamDepth);
-            terrainFoam *= shoreMask * saturate(u_waterParams2.z) * 0.12;
-            finalColor = lerp(finalColor, float3(0.88, 0.94, 0.92), terrainFoam);
+            const float foamThickness = max(body.foamParams.x, 0.001);
+            if (bodyWaterDepth < foamThickness)
+            {
+                const float time = waterTime * 0.02;
+                const float foamScale = max(body.foamParams.w, 0.05);
+                float2 foamUv0 = input.worldPos.xz / max(foamScale * 5.0, 0.5) + float2(time * 0.21, time * 0.13);
+                float2 foamUv1 = input.worldPos.xz / max(foamScale * 11.0, 1.0) - float2(time * 0.17, time * 0.25);
+                float terrainFoam = FoamNoise(foamUv0) * 0.6 + FoamNoise(foamUv1) * 0.4;
+                terrainFoam = smoothstep(0.55, 0.82, terrainFoam);
+                const float foamSoftness = max(body.foamParams.y, 0.001);
+                const float shoreMask = 1.0 - smoothstep(0.0, foamThickness + foamSoftness, bodyWaterDepth);
+                terrainFoam *= shoreMask * waterFoamEdgeMask * saturate(body.foamParams.z) * 0.12;
+                finalColor = lerp(finalColor, float3(0.88, 0.94, 0.92), terrainFoam);
+            }
         }
-    }
 
-    const float causticMode = u_waterParams2.x;
-    if (waterEnabled && causticMode > 0.5 && waterDepth > 0.0 && waterDepth < u_waterParams3.w)
-    {
-        const float time = u_waterParams1.w * u_waterParams3.z;
-        const float causticScale = max(u_waterParams3.y, 0.05);
-        float2 causticUv = input.worldPos.xz / causticScale + float2(time * 0.15, -time * 0.09);
-        const float caustic = CausticPattern(causticUv, time, causticMode);
-        const float depthFade = 1.0 - smoothstep(0.0, max(u_waterParams3.w, 0.01), waterDepth);
-        const float sunFactor = saturate(dot(n, SafeNormalize(u_sunDir.xyz, float3(0.0, 1.0, 0.0))));
-        finalColor += u_sunColor.rgb * caustic * u_waterParams3.x * depthFade * sunFactor;
+        const float causticMode = body.levelModeEnabled.y;
+        const float causticMaxDepth = max(body.causticParams.w, 0.01);
+        if (causticMode > 0.5 && bodyWaterDepth < causticMaxDepth)
+        {
+            const float time = waterTime * body.causticParams.z;
+            const float causticScale = max(body.causticParams.y, 0.05);
+            float2 causticUv = input.worldPos.xz / causticScale + float2(time * 0.15, -time * 0.09);
+            const float caustic = CausticPattern(causticUv, time, causticMode);
+            const float depthFade = 1.0 - smoothstep(0.0, causticMaxDepth, bodyWaterDepth);
+            const float sunFactor = saturate(dot(n, SafeNormalize(u_sunDir.xyz, float3(0.0, 1.0, 0.0))));
+            finalColor += u_sunColor.rgb * caustic * body.causticParams.x * depthFade * sunFactor * waterEdgeAlpha;
+        }
+
+        break;
     }
 
     return float4(max(finalColor, 0.0.xxx), 1.0);

@@ -200,7 +200,8 @@ void OffscreenSceneRenderer::SnapshotScene(VulkanDevice& device)
     }
 
     VkCommandBuffer cmd = device.GetCommandBuffer();
-    const VkImageAspectFlags depthAspect = VK_IMAGE_ASPECT_DEPTH_BIT;
+    const VkImageAspectFlags depthAspect = VK_IMAGE_ASPECT_DEPTH_BIT |
+        (HasStencil(m_depthFormat) ? VK_IMAGE_ASPECT_STENCIL_BIT : 0);
 
     TransitionImage(cmd,
         m_colorImage,
@@ -562,8 +563,10 @@ bool OffscreenSceneRenderer::CreateImages(VulkanDevice& device)
     VK_CHECK(vkAllocateMemory(m_device, &alloc, nullptr, &m_sceneDepthSnapshotMemory));
     VK_CHECK(vkBindImageMemory(m_device, m_sceneDepthSnapshot, m_sceneDepthSnapshotMemory, 0));
 
-    depthView.image = m_sceneDepthSnapshot;
-    VK_CHECK(vkCreateImageView(m_device, &depthView, nullptr, &m_sceneDepthSnapshotView));
+    VkImageViewCreateInfo depthSnapshotView = depthView;
+    depthSnapshotView.image = m_sceneDepthSnapshot;
+    depthSnapshotView.subresourceRange.aspectMask = VK_IMAGE_ASPECT_DEPTH_BIT;
+    VK_CHECK(vkCreateImageView(m_device, &depthSnapshotView, nullptr, &m_sceneDepthSnapshotView));
     return true;
 }
 

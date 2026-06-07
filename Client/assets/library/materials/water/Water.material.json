@@ -1,6 +1,6 @@
 {
-  "id": "mat_leaves_forest_ground_ao_1k_6",
-  "display_name": "leaves_forest_ground_ao_1k",
+  "id": "mat_Water",
+  "display_name": "Water",
   "diffuse_texture_id": "",
   "normal_texture_id": "",
   "ao_texture_id": "",
@@ -8,6 +8,7 @@
   "metallic_texture_id": "",
   "height_texture_id": "",
   "tiling_scale": { "x": 1, "y": 1 },
+  "color_tint": "#ffffff",
   "normal_strength": 1,
   "ao_strength": 1,
   "roughness_strength": 1,

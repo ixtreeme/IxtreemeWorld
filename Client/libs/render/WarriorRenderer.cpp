@@ -2300,6 +2300,12 @@ bool WarriorRenderer::CreateTextures(VulkanDevice& device, const std::string& mo
         sampler.addressModeW = VK_SAMPLER_ADDRESS_MODE_REPEAT;
         sampler.minLod = 0.0f;
         sampler.maxLod = static_cast<float>(texture.mipLevels);
+        sampler.mipLodBias = -0.25f;
+        if (device.SupportsSamplerAnisotropy())
+        {
+            sampler.anisotropyEnable = VK_TRUE;
+            sampler.maxAnisotropy = device.GetMaxSamplerAnisotropy();
+        }
         sampler.borderColor = VK_BORDER_COLOR_FLOAT_OPAQUE_BLACK;
         VK_CHECK(vkCreateSampler(m_device, &sampler, nullptr, &texture.sampler));
 
@@ -2864,7 +2870,11 @@ void WarriorRenderer::UpdateUniform(uint32_t frameIndex, uint32_t uniformSlot, d
 
     UniformBlock uniform{mvp, model, {1.0f, 1.0f, 1.0f, 1.0f}};
     FillLightingUniform(m_lightingState, uniform);
-    FillWaterUniform(m_waterConfig, timeSeconds, uniform);
+    WaterConfig noWater{};
+    noWater.enabled = false;
+    noWater.foamEnabled = false;
+    noWater.causticMode = WaterConfig::CausticMode::Off;
+    FillWaterUniform(noWater, timeSeconds, uniform);
 
     void* mapped = nullptr;
     VK_CHECK(vkMapMemory(m_device, m_uniformBuffers[frameIndex][uniformSlot].memory, 0, sizeof(uniform), 0, &mapped));
@@ -2902,14 +2912,22 @@ void WarriorRenderer::UpdateWorldUniform(uint32_t frameIndex,
         reflectionLighting.numPointLights = 0;
         reflectionLighting.numSpotLights = 0;
         FillLightingUniform(reflectionLighting, uniform);
-        FillWaterUniform(m_waterConfig, timeSeconds, uniform);
+        WaterConfig noWater{};
+        noWater.enabled = false;
+        noWater.foamEnabled = false;
+        noWater.causticMode = WaterConfig::CausticMode::Off;
+        FillWaterUniform(noWater, timeSeconds, uniform);
         uniform.lightPadding[0] = 1.0f;
         uniform.lightPadding[1] = waterLevelY;
     }
     else
     {
         FillLightingUniform(m_lightingState, uniform);
-        FillWaterUniform(m_waterConfig, timeSeconds, uniform);
+        WaterConfig noWater{};
+        noWater.enabled = false;
+        noWater.foamEnabled = false;
+        noWater.causticMode = WaterConfig::CausticMode::Off;
+        FillWaterUniform(noWater, timeSeconds, uniform);
     }
 
     void* mapped = nullptr;

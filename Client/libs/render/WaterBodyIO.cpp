@@ -8,6 +8,7 @@ namespace client::render {
 namespace {
 
 constexpr std::uint32_t kMagic = 0x4257584d; // "MXWB", little-endian.
+constexpr std::uint32_t kMinWaterBodiesFormatVersion = 1;
 constexpr std::uint32_t kMaxWaterBodies = 64;
 constexpr std::uint32_t kMaxMaskPixels = 1024u * 1024u;
 
@@ -225,7 +226,7 @@ bool LoadWaterBodiesBinary(const std::vector<std::uint8_t>& bytes,
         SetError(error, "water body file has invalid magic");
         return false;
     }
-    if (version != kWaterBodiesFormatVersion)
+    if (version < kMinWaterBodiesFormatVersion || version > kWaterBodiesFormatVersion)
     {
         SetError(error, "unsupported water body file version");
         return false;
@@ -241,7 +242,17 @@ bool LoadWaterBodiesBinary(const std::vector<std::uint8_t>& bytes,
     {
         WaterBody body;
         if (!ReadU32(bytes, offset, body.id) ||
-            !ReadString(bytes, offset, body.name) ||
+            !ReadString(bytes, offset, body.name))
+        {
+            SetError(error, "water body entry is truncated");
+            return false;
+        }
+        if (version >= 2 && !ReadString(bytes, offset, body.materialId))
+        {
+            SetError(error, "water body material reference is truncated");
+            return false;
+        }
+        if (
             !ReadF32(bytes, offset, body.bboxMin[0]) ||
             !ReadF32(bytes, offset, body.bboxMin[1]) ||
             !ReadF32(bytes, offset, body.bboxMax[0]) ||
@@ -304,6 +315,7 @@ bool SaveWaterBodiesBinary(const std::filesystem::path& path,
         config.waterLevelY = body.waterLevelY;
         WriteU32(bytes, body.id);
         WriteString(bytes, body.name);
+        WriteString(bytes, body.materialId);
         WriteF32(bytes, body.bboxMin[0]);
         WriteF32(bytes, body.bboxMin[1]);
         WriteF32(bytes, body.bboxMax[0]);

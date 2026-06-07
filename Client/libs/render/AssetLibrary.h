@@ -17,7 +17,8 @@ public:
         Texture,
         Model,
         Animation,
-        Material
+        Material,
+        WaterMaterial
     };
 
     enum class TextureRole
@@ -66,6 +67,7 @@ public:
         std::uint32_t resolutionWidth = 0;
         std::uint32_t resolutionHeight = 0;
         MaterialData material;
+        WaterMaterialData waterMaterial;
     };
 
     struct ImportOptions
@@ -87,6 +89,7 @@ public:
                                     const std::string& search) const;
     std::optional<Entry> FindById(const std::string& id) const;
     std::vector<std::string> SubpathsFor(Category category) const;
+    std::vector<std::string> FolderSubpathsFor(Category category) const;
     std::vector<std::pair<std::string, std::uint32_t>> TagsFor(Category category) const;
     std::uint32_t CountAssetsIn(Category category, const std::string& subpath) const;
 
@@ -104,6 +107,14 @@ public:
                         const MaterialData& material,
                         Entry& outEntry,
                         std::string& error);
+    bool CreateWaterMaterial(const ImportOptions& options,
+                             const WaterMaterialData& material,
+                             Entry& outEntry,
+                             std::string& error);
+    bool UpdateWaterMaterial(const std::string& id,
+                             const WaterMaterialData& material,
+                             Entry& outEntry,
+                             std::string& error);
     bool Remove(const std::string& id, std::string& error);
     bool UpdateAssetMetadata(const std::string& id,
                              const std::string& displayName,
@@ -120,10 +131,20 @@ public:
                       const std::string& newName,
                       std::string& newSubpath,
                       std::string& error);
+    bool CreateFolder(Category category,
+                      const std::string& parentSubpath,
+                      const std::string& name,
+                      std::string& outSubpath,
+                      std::string& error);
+    bool DeleteFolder(Category category,
+                      const std::string& subpath,
+                      std::uint32_t& removedAssets,
+                      std::string& error);
     bool Refresh(std::string& error);
 
     std::filesystem::path AbsolutePath(const Entry& entry) const;
     std::string AssetRelativePath(const Entry& entry) const;
+    const std::filesystem::path& LibraryRoot() const { return m_libraryRoot; }
 
     std::array<MapEditorPaletteSlot, 8> LoadWorldPalette(const std::string& mapDirectory,
                                                          const std::array<MapEditorPaletteSlot, 8>& defaults) const;

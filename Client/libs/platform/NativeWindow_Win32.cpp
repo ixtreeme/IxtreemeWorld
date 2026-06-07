@@ -164,6 +164,11 @@ void NativeWindow_Win32::SetFileDropCallback(FileDropCallback cb)
     m_fileDropCallback = std::move(cb);
 }
 
+void NativeWindow_Win32::SetMessageCallback(MessageCallback cb)
+{
+    m_messageCallback = std::move(cb);
+}
+
 bool NativeWindow_Win32::ConsumeResize(uint32_t& width, uint32_t& height)
 {
     if (!m_resizePending)
@@ -219,6 +224,13 @@ LRESULT CALLBACK NativeWindow_Win32::StaticWndProc(HWND hwnd, UINT message, WPAR
 
 LRESULT NativeWindow_Win32::WndProc(HWND hwnd, UINT message, WPARAM wParam, LPARAM lParam)
 {
+    if (m_messageCallback)
+    {
+        LRESULT result = 0;
+        if (m_messageCallback(hwnd, message, wParam, lParam, result))
+            return result;
+    }
+
     switch (message)
     {
     case WM_ERASEBKGND:

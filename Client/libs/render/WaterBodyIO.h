@@ -10,7 +10,7 @@
 namespace client::render {
 
 constexpr const char* kWaterBodiesFilename = "water_bodies.mxwater";
-constexpr std::uint32_t kWaterBodiesFormatVersion = 1;
+constexpr std::uint32_t kWaterBodiesFormatVersion = 2;
 
 bool LoadWaterBodiesBinary(const std::vector<std::uint8_t>& bytes,
                            std::vector<WaterBody>& outBodies,

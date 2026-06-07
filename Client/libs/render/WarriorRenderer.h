@@ -58,7 +58,6 @@ public:
         uint32_t skinSlot = 0,
         std::array<float, 4> tint = {1.0f, 1.0f, 1.0f, 1.0f});
     void SetLightingState(const LightingState& lighting) { m_lightingState = lighting; }
-    void SetWaterConfig(const WaterConfig& water) { m_waterConfig = water; }
     void SetMotionState(MotionState state);
     float GroundOffsetY() const;
     static constexpr uint32_t MaxSkinSlots() { return kSkinSlots; }
@@ -210,7 +209,6 @@ private:
     uint32_t m_boneCount = 0;
     MotionState m_motionState = MotionState::Idle;
     LightingState m_lightingState;
-    WaterConfig m_waterConfig;
     uint32_t m_worldRenderFrameIndex = std::numeric_limits<uint32_t>::max();
     uint32_t m_worldUniformCursor = 0;
     double m_lastAnimationLogTime = -1000.0;

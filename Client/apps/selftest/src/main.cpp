@@ -5,6 +5,7 @@
 
 #include <algorithm>
 #include <chrono>
+#include <cmath>
 #include <cstdint>
 #include <cstdlib>
 #include <filesystem>
@@ -324,6 +325,43 @@ bool RunAssetTests(const Options& options, TestContext& ctx)
             std::filesystem::exists(library.AbsolutePath(renamedMaterial)),
         "material rename filesystem", "renamed material JSON missing");
 
+    WaterMaterialData waterMaterial{};
+    waterMaterial.config.baseColor[0] = 0.12f;
+    waterMaterial.config.baseColor[1] = 0.42f;
+    waterMaterial.config.baseColor[2] = 0.68f;
+    waterMaterial.config.foamIntensity = 0.75f;
+    waterMaterial.config.edgeFadeDistance = 2.25f;
+    waterMaterial.config.edgeFadeCurve = WaterConfig::EdgeFadeCurve::Exponential;
+    waterMaterial.normalTiling = 3.5f;
+    AssetLibrary::ImportOptions waterMaterialOptions;
+    waterMaterialOptions.displayName = "LakeShared";
+    AssetLibrary::Entry waterMaterialEntry;
+    if (!ctx.Expect(library.CreateWaterMaterial(waterMaterialOptions, waterMaterial, waterMaterialEntry, error),
+            "water material create", error))
+        return false;
+    ctx.Expect(waterMaterialEntry.category == AssetLibrary::Category::WaterMaterial &&
+            waterMaterialEntry.filename == "LakeShared.watermat" &&
+            std::filesystem::exists(library.AbsolutePath(waterMaterialEntry)) &&
+            std::abs(waterMaterialEntry.waterMaterial.config.edgeFadeDistance - 2.25f) < 0.001f &&
+            waterMaterialEntry.waterMaterial.config.edgeFadeCurve == WaterConfig::EdgeFadeCurve::Exponential,
+        "water material filesystem", "water material file was not written or edge fade was not preserved");
+    waterMaterial.config.foamIntensity = 1.25f;
+    AssetLibrary::Entry updatedWaterMaterial;
+    if (!ctx.Expect(library.UpdateWaterMaterial(waterMaterialEntry.id, waterMaterial, updatedWaterMaterial, error),
+            "water material update", error))
+        return false;
+    const auto waterMaterialEntries = library.QueryEntries(AssetLibrary::Category::WaterMaterial, "", true, {}, "LakeShared");
+    ctx.Expect(waterMaterialEntries.size() == 1 &&
+            std::abs(waterMaterialEntries[0].waterMaterial.config.foamIntensity - 1.25f) < 0.001f &&
+            std::abs(waterMaterialEntries[0].waterMaterial.config.edgeFadeDistance - 2.25f) < 0.001f &&
+            waterMaterialEntries[0].waterMaterial.config.edgeFadeCurve == WaterConfig::EdgeFadeCurve::Exponential,
+        "water material update no duplicate", "water material update created a duplicate or missed new edge fade values");
+    AssetLibrary::Entry renamedWaterMaterial;
+    ctx.Expect(library.RenameAsset(waterMaterialEntry.id, "LakeShared_Renamed", true, renamedWaterMaterial, error) &&
+            renamedWaterMaterial.filename == "LakeShared_Renamed.watermat" &&
+            std::filesystem::exists(library.AbsolutePath(renamedWaterMaterial)),
+        "water material rename", error);
+
     std::string newSubpath;
     if (!ctx.Expect(library.RenameFolder(AssetLibrary::Category::Texture,
             "terrain/rock", "pebbles", newSubpath, error),
@@ -332,6 +370,24 @@ bool RunAssetTests(const Options& options, TestContext& ctx)
     const auto renamedTexture = library.FindById(renamedDiffuse.id);
     ctx.Expect(renamedTexture && renamedTexture->subpath == "terrain/pebbles",
         "folder rename updates subpath", "texture subpath was not updated");
+
+    std::string createdFolder;
+    ctx.Expect(library.CreateFolder(AssetLibrary::Category::Texture, "terrain", "empty_folder", createdFolder, error) &&
+            createdFolder == "terrain/empty_folder",
+        "folder create empty", error);
+    const auto foldersAfterCreate = library.FolderSubpathsFor(AssetLibrary::Category::Texture);
+    ctx.Expect(std::find(foldersAfterCreate.begin(), foldersAfterCreate.end(), "terrain/empty_folder") != foldersAfterCreate.end(),
+        "folder create visible", "empty created folder was not listed");
+    std::string renamedEmptyFolder;
+    ctx.Expect(library.RenameFolder(AssetLibrary::Category::Texture,
+            "terrain/empty_folder", "empty_renamed", renamedEmptyFolder, error) &&
+            renamedEmptyFolder == "terrain/empty_renamed",
+        "empty folder rename", error);
+    std::uint32_t removedFolderAssets = 0;
+    ctx.Expect(library.DeleteFolder(AssetLibrary::Category::Texture,
+            "terrain/empty_renamed", removedFolderAssets, error) &&
+            removedFolderAssets == 0,
+        "empty folder delete", error);
 
     ctx.Expect(!AssetLibrary::IsValidRenameName("bad name"),
         "rename validation rejects spaces", "space-containing name was accepted");
@@ -347,6 +403,14 @@ bool RunAssetTests(const Options& options, TestContext& ctx)
     const auto grassFiltered = library.QueryEntries(AssetLibrary::Category::Texture, "terrain/pebbles", false, {}, "mygrass");
     ctx.Expect(allTextures.size() >= 3 && grassFiltered.size() == 1,
         "asset query folder plus search", "query did not combine folder/search as expected");
+
+    AssetLibrary::Entry movedStone;
+    ctx.Expect(library.MoveAssetToSubpath(stone.id, "terrain/delete_me", movedStone, error),
+        "folder delete fixture move", error);
+    std::uint32_t removedAssets = 0;
+    ctx.Expect(library.DeleteFolder(AssetLibrary::Category::Texture, "terrain/delete_me", removedAssets, error) &&
+            removedAssets == 1 && !library.FindById(stone.id),
+        "non-empty folder delete removes manifest entries", error);
 
     std::cout << "[INFO] asset scratch kept at: " << scratch.generic_string() << "\n";
     return ctx.failed == 0;
@@ -387,9 +451,22 @@ bool RunRenderChecks(const Options& options, TestContext& ctx)
             waterSource.find("u_deepColor") != std::string::npos &&
             waterSource.find("waterDepth") != std::string::npos,
         "water depth color shader", "Water shader is missing WATER-3 depth color/fade logic");
+    ctx.Expect(waterSource.find("u_textureParams") != std::string::npos &&
+            waterSource.find("u_textureScroll") != std::string::npos &&
+            waterSource.find("u_diffuseMap") != std::string::npos &&
+            waterSource.find("useNormalA") != std::string::npos &&
+            waterSource.find("useNormalB") != std::string::npos &&
+            waterSource.find("depthWaterColor = lerp(depthWaterColor, depthWaterColor * diffuseTint") != std::string::npos,
+        "water object material texture shader", "Water shader must sample assigned water material normals/diffuse with per-body tiling/scroll");
     ctx.Expect(waterSource.find("u_foamParams") != std::string::npos &&
             waterSource.find("FoamNoise") != std::string::npos,
         "water foam shader controls", "Water shader is missing WATER-4 foam controls");
+    ctx.Expect(waterSource.find("edgeAlpha") != std::string::npos &&
+            waterSource.find("outputAlpha") != std::string::npos &&
+            waterSource.find("* saturate(input.edgeAlpha)") != std::string::npos,
+        "water edge fade shader alpha", "Water shader must multiply final alpha by per-vertex edge alpha");
+    ctx.Expect(waterSource.find("foamMask = smoothstep(0.5, 0.9, input.edgeAlpha)") != std::string::npos,
+        "water edge fade foam mask", "Water foam must be suppressed in the fully faded shoreline zone");
     ctx.Expect(waterSource.find("worldPos.y = u_levelTimeEnabled.x") == std::string::npos,
         "water mesh Y comes from vertices", "Water vertex shader still overwrites mesh Y from the uniform level");
     ctx.Expect(waterSource.find("screenUv.y = 1.0 - screenUv.y") == std::string::npos,
@@ -408,6 +485,8 @@ bool RunRenderChecks(const Options& options, TestContext& ctx)
             waterSource.find("fwidth(waterViewDepth)") != std::string::npos &&
             waterSource.find("smoothstep(0.02, foamDistance + foamSoftness, waterViewDepth)") != std::string::npos,
         "water foam shore mask constrained", "Water foam must use a narrow linear-depth shoreline band and reject flat shallow open water");
+    ctx.Expect(waterSource.find("min(finalColor, float3(10.0, 10.0, 10.0))") != std::string::npos,
+        "water HDR specular clamp", "Water shader is missing the HDR clamp that suppresses reflection/specular fireflies");
     ctx.Expect(waterSource.find("finalColor = finalColor / (finalColor + 1.0.xxx)") == std::string::npos,
         "water local tone-map removed", "Water shader still performs local Reinhard tone-mapping");
 
@@ -416,20 +495,43 @@ bool RunRenderChecks(const Options& options, TestContext& ctx)
     std::stringstream terrainShaderText;
     terrainShaderText << terrainShader.rdbuf();
     const std::string terrainSource = terrainShaderText.str();
-    ctx.Expect(terrainSource.find("u_waterParams1") != std::string::npos &&
-            terrainSource.find("CausticPattern") != std::string::npos,
-        "terrain water caustic shader controls", "Terrain shader is missing WATER-4 water/caustic controls");
+    ctx.Expect(terrainSource.find("TerrainWaterBodyUbo") != std::string::npos &&
+            terrainSource.find("u_terrainWaterBodies[8]") != std::string::npos &&
+            terrainSource.find("IsInsideWaterBodyBbox") != std::string::npos &&
+            terrainSource.find("body.levelModeEnabled.x - input.worldPos.y") != std::string::npos &&
+            terrainSource.find("u_waterParams1") == std::string::npos,
+        "terrain per-water-body caustic controls", "Terrain shader must use per-body bbox/water-level data instead of a global water uniform");
     ctx.Expect(terrainSource.find("terrainFoam") != std::string::npos &&
-            terrainSource.find("terrainFoamDepth > 0.0") != std::string::npos,
-        "terrain shore foam constrained", "Terrain foam must exist only in a water-under-surface shoreline band");
+            terrainSource.find("bodyWaterDepth <= 0.0") != std::string::npos &&
+            terrainSource.find("bodyWaterDepth < foamThickness") != std::string::npos &&
+            terrainSource.find("body.foamParams") != std::string::npos,
+        "terrain per-water-body shore foam", "Terrain foam must be scoped to the current water body and its depth band");
+    ctx.Expect(terrainSource.find("float4 edgeParams") != std::string::npos &&
+            terrainSource.find("WaterBodyBboxEdgeAlpha") != std::string::npos &&
+            terrainSource.find("waterFoamEdgeMask") != std::string::npos &&
+            terrainSource.find("* waterEdgeAlpha") != std::string::npos,
+        "terrain water edge fade effects", "Terrain water foam/caustics must fade near soft water body edges");
     ctx.Expect(terrainSource.find("float4(1.0, 0.92, 0.15") != std::string::npos,
         "terrain editor brush ring present", "Terrain shader is missing the yellow editor brush ring");
+    ctx.Expect(terrainSource.find("u_layerConstants.u_layerParams.z > 7.5") != std::string::npos &&
+            terrainSource.find("float3(0.34, 0.82, 1.0)") != std::string::npos &&
+            terrainSource.find("float3(1.0, 0.18, 0.12)") != std::string::npos,
+        "water sculpt brush ring shader", "Terrain shader must draw add/remove water sculpt brush rings");
     ctx.Expect(terrainSource.find("float4(0.1, 0.55, 1.0") == std::string::npos &&
             terrainSource.find("float4(0.0, 1.0, 0.25") == std::string::npos &&
             terrainSource.find("float4(1.0, 0.08, 0.04") == std::string::npos,
         "terrain debug color layers removed", "Terrain shader still contains old blue/green/red debug layers");
     ctx.Expect(terrainSource.find("finalColor = finalColor / (finalColor + 1.0.xxx)") == std::string::npos,
         "terrain local tone-map removed", "Terrain shader still performs local Reinhard tone-mapping");
+
+    const std::filesystem::path vulkanDevicePath = options.clientRoot / "libs" / "platform" / "VulkanDevice.cpp";
+    std::ifstream vulkanDevice(vulkanDevicePath);
+    std::stringstream vulkanDeviceText;
+    vulkanDeviceText << vulkanDevice.rdbuf();
+    const std::string vulkanDeviceSource = vulkanDeviceText.str();
+    ctx.Expect(vulkanDeviceSource.find("supported.samplerAnisotropy") != std::string::npos &&
+            vulkanDeviceSource.find("enabled.samplerAnisotropy = VK_TRUE") != std::string::npos,
+        "vulkan sampler anisotropy feature", "VulkanDevice must enable samplerAnisotropy with graceful fallback");
 
     const std::filesystem::path warriorShaderPath = options.clientRoot / "shaders" / "Warrior.hlsl";
     std::ifstream warriorShader(warriorShaderPath);
@@ -516,6 +618,9 @@ bool RunRenderChecks(const Options& options, TestContext& ctx)
             water.causticIntensity > 0.0f &&
             water.causticMaxDepth > 0.0f,
         "water foam caustic defaults sane", "Water foam/caustic defaults are invalid");
+    ctx.Expect(water.edgeFadeDistance == 1.0f &&
+            water.edgeFadeCurve == WaterConfig::EdgeFadeCurve::Smooth,
+        "water edge fade defaults sane", "Water edge fade should default to a 1m Smooth shoreline transition");
 
     const std::filesystem::path terrainRendererPath = options.clientRoot / "libs" / "render" / "TerrainRenderer.cpp";
     std::ifstream terrainRenderer(terrainRendererPath);
@@ -533,6 +638,12 @@ bool RunRenderChecks(const Options& options, TestContext& ctx)
             terrainRendererSource.find("client::render::kWaterBodiesFilename") != std::string::npos &&
             waterBodyIoSource.find("water_bodies.mxwater") != std::string::npos,
         "water object renderer source", "TerrainRenderer is missing object-level water loading or mesh generation");
+    ctx.Expect(terrainRendererSource.find("CreateWaterMesh") == std::string::npos &&
+            terrainRendererSource.find("m_waterConfig") == std::string::npos &&
+            terrainRendererSource.find("m_waterVertexBuffer") == std::string::npos &&
+            terrainRendererSource.find("m_waterIndexBuffer") == std::string::npos &&
+            terrainRendererSource.find("global water fallback") == std::string::npos,
+        "legacy global water renderer removed", "TerrainRenderer still contains legacy global water mesh/config/fallback code");
     ctx.Expect(terrainRendererSource.find("UpdateWaterBodyUniform") != std::string::npos &&
             terrainRendererSource.find("waterBody.descriptorSets") != std::string::npos,
         "water object per-body UBO source", "Object water must use per-body uniform buffers/descriptors");
@@ -543,13 +654,148 @@ bool RunRenderChecks(const Options& options, TestContext& ctx)
     ctx.Expect(terrainRendererSource.find("ComputeMirrorCamera(camera, {m_waterReflection.width, m_waterReflection.height}, reflectionWaterLevelY)") != std::string::npos &&
             terrainRendererSource.find("m_reflectionClipWaterLevelY = reflectionWaterLevelY") != std::string::npos,
         "water object reflection uses body level", "Reflection pass must mirror and clip at the selected water body's level");
-    ctx.Expect(terrainRendererSource.find("BuildWaterUniform(camera, timeSeconds, waterBody.body.config, waterBody.body.waterLevelY, reflectionTarget)") != std::string::npos &&
+    ctx.Expect(terrainRendererSource.find("BuildWaterUniform(camera, timeSeconds, ResolveWaterConfig(waterBody.body), waterBody.body.waterLevelY, reflectionTarget)") != std::string::npos &&
             terrainRendererSource.find("reflectionTarget && water.reflectionEnabled") != std::string::npos,
         "water object reflection flag override", "Only the selected water body should sample the reflection texture");
+    ctx.Expect(terrainRendererSource.find("SetWaterMaterials") != std::string::npos &&
+            terrainRendererSource.find("m_waterMaterials") != std::string::npos &&
+            terrainRendererSource.find("ResolveWaterConfig") != std::string::npos,
+        "water object live material references", "Water bodies must resolve live WaterMaterialData by material id");
+    ctx.Expect(terrainRendererSource.find("WaterMaterialTextureSet") != std::string::npos &&
+            terrainRendererSource.find("LoadWaterMaterialTextureSet") != std::string::npos &&
+            terrainRendererSource.find("ResolveWaterMaterialTextures(waterBody.body)") != std::string::npos &&
+            terrainRendererSource.find("materialTextures && materialTextures->normalA.view") != std::string::npos,
+        "water object material normal textures", "Water body descriptor sets must bind the assigned material's normal maps");
+    ctx.Expect(terrainRendererSource.find("VK_FORMAT_R8G8B8A8_SRGB") != std::string::npos &&
+            terrainRendererSource.find("textureParams[0] = textures->normalA.view") != std::string::npos &&
+            terrainRendererSource.find("textureParams[2] = textures->diffuse.view") != std::string::npos &&
+            terrainRendererSource.find("textureScroll[0] = material->scrollSpeedA[0]") != std::string::npos &&
+            terrainRendererSource.find("diffusePath") != std::string::npos &&
+            terrainRendererSource.find("dstBinding = 6") != std::string::npos,
+        "water object material texture sampling source", "Water body materials must drive normal/diffuse texture sampling and tiling flags");
+    ctx.Expect(terrainRendererSource.find("ComputeWaterBodyDistanceField") != std::string::npos &&
+            terrainRendererSource.find("BilinearSampleWaterDistance") != std::string::npos &&
+            terrainRendererSource.find("edgeAlphaAt") != std::string::npos &&
+            terrainRendererSource.find("edgeFadeDistance") != std::string::npos &&
+            terrainRendererSource.find("out.edgeParams[0]") != std::string::npos &&
+            terrainRendererSource.find("Vertex alpha computed") != std::string::npos,
+        "water object edge fade mesh source", "WATER-OBJ-6 must compute distance-field driven per-vertex shoreline alpha");
+    ctx.Expect(terrainRendererSource.find("m_waterMaterialEdgeSignature") != std::string::npos &&
+            terrainRendererSource.find("Material edge fade updated") != std::string::npos,
+        "water object edge fade live rebuild", "Changing edge fade material settings must rebuild water body meshes");
+    ctx.Expect(terrainRendererSource.find("SetWaterBodies") != std::string::npos &&
+            terrainRendererSource.find("SaveWaterBodies") != std::string::npos &&
+            terrainRendererSource.find("SaveWaterBodiesBinary(tmp, bodies") != std::string::npos,
+        "water object editor renderer API", "WATER-OBJ-3 needs runtime water body replacement and sidecar save support");
+    ctx.Expect(terrainRendererSource.find("SetSelectedWaterBodyHighlight") != std::string::npos &&
+            terrainRendererSource.find("RenderSelectedWaterBodyHighlight") != std::string::npos &&
+            terrainRendererSource.find("m_selectedWaterBodyIndexCount") != std::string::npos,
+        "water object selected bbox highlight legacy renderer source", "Selected water body highlight cleanup should leave renderer cleanup entry points available");
+    ctx.Expect(terrainRendererSource.find("SetWaterSculptBrush") != std::string::npos &&
+            terrainRendererSource.find("m_waterSculptBrushVisible") != std::string::npos &&
+            terrainRendererSource.find("m_waterSculptBrushAddMode ? 8.0f : 9.0f") != std::string::npos,
+        "water sculpt brush renderer source", "WATER-OBJ-5 needs add/remove brush cursor rendering");
+    ctx.Expect(terrainRendererSource.find("device.WaitIdle();\n    DestroyWaterBodyResources();") != std::string::npos,
+        "water object SetWaterBodies wait-idle", "SetWaterBodies must wait before destroying in-flight GPU resources");
+
+    const std::filesystem::path noesisLayerPath = options.clientRoot / "libs" / "render" / "NoesisLayer.cpp";
+    std::ifstream noesisLayer(noesisLayerPath);
+    std::stringstream noesisLayerText;
+    noesisLayerText << noesisLayer.rdbuf();
+    const std::string noesisLayerSource = noesisLayerText.str();
+    const std::filesystem::path noesisLayerHeaderPath = options.clientRoot / "libs" / "render" / "NoesisLayer.h";
+    std::ifstream noesisLayerHeader(noesisLayerHeaderPath);
+    std::stringstream noesisLayerHeaderText;
+    noesisLayerHeaderText << noesisLayerHeader.rdbuf();
+    const std::string noesisLayerHeaderSource = noesisLayerHeaderText.str();
+    const std::filesystem::path editorPanelPath = options.clientRoot / "assets" / "xaml" / "EditorPanel.xaml";
+    std::ifstream editorPanel(editorPanelPath);
+    std::stringstream editorPanelText;
+    editorPanelText << editorPanel.rdbuf();
+    const std::string editorPanelSource = editorPanelText.str();
+    const std::filesystem::path clientMainPath = options.clientRoot / "apps" / "client" / "src" / "main.cpp";
+    std::ifstream clientMain(clientMainPath);
+    std::stringstream clientMainText;
+    clientMainText << clientMain.rdbuf();
+    const std::string clientMainSource = clientMainText.str();
+    ctx.Expect(editorPanelSource.find("AddWaterBodyButton") != std::string::npos &&
+            editorPanelSource.find("SelectedWaterBodySection") != std::string::npos &&
+            noesisLayerSource.find("OnAddWaterBodyClicked") != std::string::npos &&
+            noesisLayerSource.find("SetWaterBodyEditorState") != std::string::npos,
+        "water object editor UI source", "WATER-OBJ-3 editor button/inspector binding is missing");
+    ctx.Expect(editorPanelSource.find("SelectedWaterSculptButton") != std::string::npos &&
+            editorPanelSource.find("WaterSculptAddButton") != std::string::npos &&
+            editorPanelSource.find("WaterSculptRemoveButton") != std::string::npos &&
+            editorPanelSource.find("WaterSculptRadiusSlider") != std::string::npos &&
+            noesisLayerSource.find("waterSculptActive") != std::string::npos &&
+            noesisLayerSource.find("settings.waterSculptActive") != std::string::npos,
+        "water sculpt inspector UI source", "WATER-OBJ-5 Sculpt Mode UI/binding is missing");
+    ctx.Expect(editorPanelSource.find("WaterEdgeFadeSectionButton") != std::string::npos &&
+            editorPanelSource.find("WaterEdgeFadeDistanceSlider") != std::string::npos &&
+            editorPanelSource.find("WaterEdgeFadeLinearButton") != std::string::npos &&
+            editorPanelSource.find("WaterEdgeFadeSmoothButton") != std::string::npos &&
+            editorPanelSource.find("WaterEdgeFadeExponentialButton") != std::string::npos &&
+            noesisLayerSource.find("OnWaterEdgeFadeDistanceChanged") != std::string::npos &&
+            noesisLayerSource.find("edgeFadeCurve = WaterConfig::EdgeFadeCurve::Smooth") != std::string::npos,
+        "water edge fade inspector UI source", "WATER-OBJ-6 Edge Fade material controls are missing");
+    const auto selectedWaterSectionPos = editorPanelSource.find("SelectedWaterBodySection");
+    const auto waterMaterialEditorPos = editorPanelSource.find("WaterMaterialEditorSection");
+    const auto waterBaseSectionPos = editorPanelSource.find("WaterBaseSectionButton");
+    const auto dynamicLightsSectionPos = editorPanelSource.find("DynamicLightsSectionButton");
+    ctx.Expect(waterBaseSectionPos != std::string::npos &&
+            selectedWaterSectionPos != std::string::npos &&
+            dynamicLightsSectionPos != std::string::npos &&
+            waterMaterialEditorPos != std::string::npos &&
+            dynamicLightsSectionPos < selectedWaterSectionPos &&
+            selectedWaterSectionPos < waterMaterialEditorPos &&
+            waterMaterialEditorPos < waterBaseSectionPos,
+        "water controls live under material editor", "Water controls must be scoped to the Water Material Editor, not the Selected Water Body inspector");
+    ctx.Expect(noesisLayerSource.find("WaterConfig waterConfig;") == std::string::npos &&
+            noesisLayerSource.find("EditedWaterConfig()") != std::string::npos &&
+            noesisLayerHeaderSource.find("GetWaterConfig") == std::string::npos,
+        "legacy global water UI state removed", "NoesisLayer still exposes or stores global WaterConfig state");
+    ctx.Expect(noesisLayerSource.find("BuildAssetLibrarySignature") != std::string::npos &&
+            noesisLayerSource.find("PollAssetLibraryChanges") != std::string::npos &&
+            noesisLayerSource.find("assets.RootPath()") != std::string::npos &&
+            noesisLayerSource.find("assetReaderRoot.empty() ? FindClientRoot() : assetReaderRoot") != std::string::npos &&
+            noesisLayerSource.find("assetLibrary->Refresh(error)") != std::string::npos &&
+            noesisLayerSource.find("RefreshAssetBrowser()") != std::string::npos,
+        "asset browser realtime filesystem refresh", "Asset browser must poll assets/library and refresh when files or folders change");
+    ctx.Expect(noesisLayerSource.find("entry.category != AssetLibrary::Category::WaterMaterial &&") != std::string::npos &&
+            noesisLayerSource.find("entry.category != AssetLibrary::Category::Material") != std::string::npos &&
+            noesisLayerSource.find("converted.normalMapA = texturePathForId(entry.material.normalTextureId)") != std::string::npos &&
+            noesisLayerSource.find("materials.push_back({entry.id, converted})") != std::string::npos,
+        "water body accepts material assets", "Water bodies must accept PBR material assets and convert their textures for water rendering");
+    ctx.Expect(clientMainSource.find("PickWaterBody") != std::string::npos &&
+            clientMainSource.find("RegenerateCircularWaterMask") != std::string::npos &&
+            clientMainSource.find("SelectedEditorObjectType::WaterBody") != std::string::npos &&
+            clientMainSource.find("commands.addWaterBody") != std::string::npos,
+        "water object editor workflow source", "WATER-OBJ-3 spawn/select/transform/delete workflow is missing");
+    ctx.Expect(clientMainSource.find("ApplyWaterSculptBrush") != std::string::npos &&
+            clientMainSource.find("ExpandWaterBodyForSculpt") != std::string::npos &&
+            clientMainSource.find("RaycastTerrainPoint") != std::string::npos &&
+            clientMainSource.find("IsNearWaterBodyBbox") == std::string::npos &&
+            clientMainSource.find("body.bboxMin[0] = nextMinX") != std::string::npos &&
+            clientMainSource.find("waterSculptStrokeActive") != std::string::npos &&
+            clientMainSource.find("waterSculptMeshRegenPending") != std::string::npos &&
+            clientMainSource.find("RegenerateCircularWaterMask(body);") != std::string::npos,
+        "water sculpt expandable bitmask source", "WATER-OBJ-5 sculpting must expand the water body instead of being limited by the initial bbox");
+    ctx.Expect(clientMainSource.find("GetWaterConfig") == std::string::npos &&
+            clientMainSource.find("SetWaterConfig") == std::string::npos &&
+            clientMainSource.find("body.config = state.config") == std::string::npos &&
+            clientMainSource.find("SetWaterMaterials(noesis.GetWaterMaterialsSnapshot())") != std::string::npos,
+        "water body uses material reference", "Client main must not copy material config into WaterBody");
+    ctx.Expect(clientMainSource.find("terrain.SetSelectedWaterBodyHighlight(device, 0u)") != std::string::npos &&
+            clientMainSource.find("RenderSelectedWaterBodyHighlight(device, camera)") == std::string::npos &&
+            clientMainSource.find("Water \" + std::to_string(body.id)") == std::string::npos &&
+            clientMainSource.find("for (const WaterBody& body : editorWaterBodies)\n                    {\n                        if (skinSlot") == std::string::npos,
+        "water object selection visuals removed", "Water-body selection must not render the legacy bbox or warrior/nameplate proxies");
 
     const std::filesystem::path waterScratch = (options.scratchRoot.empty() ? MakeDefaultScratchRoot() : options.scratchRoot) / "water_obj";
     const std::filesystem::path waterFile = waterScratch / client::render::kWaterBodiesFilename;
-    const auto waterBodies = client::render::CreateWaterBodyTestSet();
+    auto waterBodies = client::render::CreateWaterBodyTestSet();
+    if (!waterBodies.empty())
+        waterBodies[0].materialId = "watermat_LakeShared_Renamed";
     std::string waterError;
     ctx.Expect(waterBodies.size() == 3 && waterBodies[0].maskWidth > 0 && !waterBodies[0].shapeMask.empty(),
         "water object test fixtures", "CreateWaterBodyTestSet did not create valid fixtures");
@@ -561,9 +807,10 @@ bool RunRenderChecks(const Options& options, TestContext& ctx)
         std::vector<WaterBody> loadedBodies;
         ctx.Expect(client::render::LoadWaterBodiesBinary(bytes, loadedBodies, &waterError) &&
                 loadedBodies.size() == waterBodies.size() &&
+                loadedBodies[0].materialId == waterBodies[0].materialId &&
                 loadedBodies[1].waterLevelY == waterBodies[1].waterLevelY &&
                 loadedBodies[2].shapeMask == waterBodies[2].shapeMask,
-            "water object sidecar roundtrip", waterError.empty() ? "roundtrip mismatch" : waterError);
+            "water object sidecar roundtrip", waterError.empty() ? "roundtrip mismatch/material id lost" : waterError);
     }
 
     return ctx.failed == 0;

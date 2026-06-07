@@ -63,10 +63,11 @@ public:
     MapEditorSettings GetMapEditorSettings() const;
     MapEditorCommands ConsumeMapEditorCommands();
     LightingState GetLightingState() const;
-    WaterConfig GetWaterConfig() const;
     void SetDynamicLightEditorState(const DynamicLightEditorState& state);
+    void SetWaterBodyEditorState(const WaterBodyEditorState& state);
     void InitializeAssetLibrary(const std::string& mapDirectory,
                                 const std::array<MapEditorPaletteSlot, 8>& defaultSlots);
+    std::vector<std::pair<std::string, WaterMaterialData>> GetWaterMaterialsSnapshot() const;
     std::array<MapEditorPaletteSlot, 8> GetPaletteSlots() const;
     void SetEditorStatus(const std::string& status);
     void ImportDroppedFiles(const std::vector<std::string>& paths);

@@ -21,6 +21,8 @@
     float4 u_foamDepthParams;
     float4 u_causticParams;
     float4 u_cameraNearFar;
+    float4 u_textureParams;
+    float4 u_textureScroll;
 };
 
 [[vk::combinedImageSampler]] [[vk::binding(1, 0)]] Texture2D u_waveNormalSmall : register(t0);
@@ -33,11 +35,14 @@
 [[vk::combinedImageSampler]] [[vk::binding(4, 0)]] SamplerState u_sceneColorSampler : register(s3);
 [[vk::combinedImageSampler]] [[vk::binding(5, 0)]] Texture2D u_sceneDepthTexture : register(t4);
 [[vk::combinedImageSampler]] [[vk::binding(5, 0)]] SamplerState u_sceneDepthSampler : register(s4);
+[[vk::combinedImageSampler]] [[vk::binding(6, 0)]] Texture2D u_diffuseMap : register(t5);
+[[vk::combinedImageSampler]] [[vk::binding(6, 0)]] SamplerState u_diffuseMapSampler : register(s5);
 
 struct VSInput
 {
     float3 position : POSITION;
     float2 uv : TEXCOORD0;
+    float edgeAlpha : TEXCOORD1;
 };
 
 struct VSOutput
@@ -46,6 +51,7 @@ struct VSOutput
     float3 worldPos : TEXCOORD0;
     float2 uv : TEXCOORD1;
     float4 clipPos : TEXCOORD2;
+    float edgeAlpha : TEXCOORD3;
 };
 
 VSOutput VSMain(VSInput input)
@@ -56,6 +62,7 @@ VSOutput VSMain(VSInput input)
     output.uv = input.uv;
     output.position = mul(float4(worldPos, 1.0), u_mvp);
     output.clipPos = output.position;
+    output.edgeAlpha = saturate(input.edgeAlpha);
     return output;
 }
 
@@ -75,10 +82,33 @@ float3 SampleWaveNormal(float2 worldXZ)
     float2 uvSmall = fineBasis * fineTiling + float2(time * u_waveParams1.z, time * u_waveParams1.z * 0.47);
     float2 uvLarge = broadBasis * broadTiling - float2(time * u_waveParams1.w * 0.63, time * u_waveParams1.w);
 
-    float3 nSmall = u_waveNormalSmall.Sample(u_waveNormalSmallSampler, uvSmall).rgb * 2.0 - 1.0;
-    float3 nLarge = u_waveNormalLarge.Sample(u_waveNormalLargeSampler, uvLarge).rgb * 2.0 - 1.0;
-    float3 tangentNormal = (nSmall + nLarge) * 0.5;
-    return SafeNormalize(float3(tangentNormal.x, 1.0, tangentNormal.z) * float3(u_waveParams2.x, 1.0, u_waveParams2.x),
+    float3 proceduralSmall = u_waveNormalSmall.Sample(u_waveNormalSmallSampler, uvSmall).rgb * 2.0 - 1.0;
+    float3 proceduralLarge = u_waveNormalLarge.Sample(u_waveNormalLargeSampler, uvLarge).rgb * 2.0 - 1.0;
+    float3 proceduralNormal = (proceduralSmall + proceduralLarge) * 0.5;
+
+    const bool useNormalA = u_textureParams.x > 0.5;
+    const bool useNormalB = u_textureParams.y > 0.5;
+    if (useNormalA || useNormalB)
+    {
+        const float materialTiling = max(u_textureParams.w, 0.001);
+        const float2 uvA = worldXZ * materialTiling + u_textureScroll.xy * time;
+        const float2 uvB = worldXZ * materialTiling + u_textureScroll.zw * time;
+        float3 texturedNormal = float3(0.0, 0.0, 0.0);
+        float layerCount = 0.0;
+        if (useNormalA)
+        {
+            texturedNormal += u_waveNormalSmall.Sample(u_waveNormalSmallSampler, uvA).rgb * 2.0 - 1.0;
+            layerCount += 1.0;
+        }
+        if (useNormalB)
+        {
+            texturedNormal += u_waveNormalLarge.Sample(u_waveNormalLargeSampler, uvB).rgb * 2.0 - 1.0;
+            layerCount += 1.0;
+        }
+        proceduralNormal = texturedNormal / max(layerCount, 1.0);
+    }
+
+    return SafeNormalize(float3(proceduralNormal.x, 1.0, proceduralNormal.z) * float3(u_waveParams2.x, 1.0, u_waveParams2.x),
         float3(0.0, 1.0, 0.0));
 }
 
@@ -143,6 +173,13 @@ float4 PSMain(VSOutput input) : SV_Target0
     float depthT = smoothstep(u_depthParams.x, max(u_depthParams.y, u_depthParams.x + 0.001), waterViewDepth);
     float fadeT = saturate(waterViewDepth / max(u_depthParams.z, 0.001));
     float3 depthWaterColor = lerp(u_shallowColor.rgb, u_deepColor.rgb, depthT);
+    if (u_textureParams.z > 0.5)
+    {
+        const float materialTiling = max(u_textureParams.w, 0.001) * 0.5;
+        float2 diffuseUv = input.worldPos.xz * materialTiling + u_textureScroll.xy * u_levelTimeEnabled.y * 0.3;
+        float3 diffuseTint = u_diffuseMap.Sample(u_diffuseMapSampler, diffuseUv).rgb;
+        depthWaterColor = lerp(depthWaterColor, depthWaterColor * diffuseTint, 0.5);
+    }
 
     float2 refractionUv = screenUv;
     if (u_refractionParams.x > 0.5)
@@ -171,8 +208,11 @@ float4 PSMain(VSOutput input) : SV_Target0
         float depthGradient = fwidth(waterViewDepth);
         float shorelineEdge = smoothstep(0.002, 0.08, depthGradient);
         float shoreFoam = (1.0 - smoothstep(0.02, foamDistance + foamSoftness, waterViewDepth)) * shorelineEdge;
-        float foam = foamPattern * shoreFoam * saturate(u_foamParams.w) * 0.65;
+        float foamMask = smoothstep(0.5, 0.9, input.edgeAlpha);
+        float foam = foamPattern * shoreFoam * foamMask * saturate(u_foamParams.w) * 0.65;
         finalColor = lerp(finalColor, float3(0.95, 0.98, 1.0), foam);
     }
-    return float4(max(finalColor, 0.0.xxx), u_refractionParams.x > 0.5 ? 1.0 : u_baseColor.a);
+    finalColor = min(finalColor, float3(10.0, 10.0, 10.0));
+    float outputAlpha = (u_refractionParams.x > 0.5 ? 1.0 : u_baseColor.a) * saturate(input.edgeAlpha);
+    return float4(max(finalColor, 0.0.xxx), outputAlpha);
 }

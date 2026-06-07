@@ -27,6 +27,9 @@ struct MapEditorSettings
     float brushStrength = 1.0f;
     std::uint32_t textureSlot = 4;
     MapEditorPaintMode paintMode = MapEditorPaintMode::Replace;
+    bool waterSculptActive = false;
+    bool waterSculptAdd = true;
+    float waterSculptRadiusMeters = 3.0f;
 };
 
 struct MapEditorPaletteSlot
@@ -125,6 +128,13 @@ struct WaterConfig
         Procedural = 2
     };
 
+    enum class EdgeFadeCurve : std::int32_t
+    {
+        Linear = 0,
+        Smooth = 1,
+        Exponential = 2
+    };
+
     bool enabled = true;
     float waterLevelY = 0.0f;
     float baseColor[4] = {0.10f, 0.35f, 0.55f, 0.85f};
@@ -134,7 +144,7 @@ struct WaterConfig
     float waveSpeedLarge = 0.015f;
     float normalStrength = 0.6f;
     float fresnelPower = 5.0f;
-    float fresnelMin = 0.02f;
+    float fresnelMin = 0.05f;
     float reflectionColor[3] = {0.55f, 0.70f, 0.85f};
     bool reflectionEnabled = true;
     ReflectionQuality reflectionQuality = ReflectionQuality::Half;
@@ -159,6 +169,20 @@ struct WaterConfig
     float causticScale = 0.3f;
     float causticSpeed = 0.5f;
     float causticMaxDepth = 8.0f;
+    float edgeFadeDistance = 1.0f;
+    EdgeFadeCurve edgeFadeCurve = EdgeFadeCurve::Smooth;
+};
+
+struct WaterMaterialData
+{
+    WaterConfig config;
+    std::string normalMapA;
+    std::string normalMapB;
+    std::string diffuseMap;
+    float scrollSpeedA[2] = {0.0f, 0.0f};
+    float scrollSpeedB[2] = {0.0f, 0.0f};
+    float normalTiling = 1.0f;
+    std::uint32_t formatVersion = 1;
 };
 
 struct WaterBody
@@ -171,6 +195,21 @@ struct WaterBody
     std::uint32_t maskWidth = 0;
     std::uint32_t maskHeight = 0;
     std::vector<std::uint8_t> shapeMask;
+    std::string materialId;
+    WaterConfig config;
+};
+
+struct WaterBodyEditorState
+{
+    bool selected = false;
+    std::uint32_t id = 0;
+    std::uint32_t count = 0;
+    std::string name;
+    float center[3] = {0.0f, 0.0f, 0.0f};
+    float width = 10.0f;
+    float depth = 10.0f;
+    std::string materialId;
+    std::string materialName;
     WaterConfig config;
 };
 
@@ -197,6 +236,10 @@ struct MapEditorCommands
     bool reload = false;
     bool undo = false;
     bool addTestMarker = false;
+    bool addWaterBody = false;
+    bool deleteSelectedWaterBody = false;
+    bool selectedWaterBodyChanged = false;
+    WaterBodyEditorState selectedWaterBody;
     bool addPointLight = false;
     bool addSpotLight = false;
     bool deleteSelectedLight = false;

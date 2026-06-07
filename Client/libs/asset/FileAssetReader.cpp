@@ -51,6 +51,11 @@ std::optional<std::vector<std::uint8_t>> FileAssetReader::ReadAll(std::string_vi
     return bytes;
 }
 
+std::optional<std::filesystem::path> FileAssetReader::RootPath() const
+{
+    return m_root;
+}
+
 std::filesystem::path FileAssetReader::Resolve(std::string_view path) const
 {
     return m_root / std::filesystem::path(NormalizeAssetPath(path));

@@ -82,9 +82,32 @@ vcpkg_require(
     capnproto
     fastgltf
     flecs
+	rmlui
 	zlib
     stb
 )
+
+if(WIN32)
+    find_package(imgui CONFIG QUIET)
+    if(NOT imgui_FOUND)
+        execute_process(
+            COMMAND "${_vcpkg_exe}" install "imgui[docking-experimental,vulkan-binding,win32-binding]:${VCPKG_TARGET_TRIPLET}"
+            RESULT_VARIABLE result
+        )
+        if(result)
+            message(FATAL_ERROR "vcpkg: Nem sikerult telepiteni: imgui[docking-experimental,vulkan-binding,win32-binding]")
+        endif()
+        if(EXISTS "${_vcpkg_installed_prefix}")
+            list(PREPEND CMAKE_PREFIX_PATH "${_vcpkg_installed_prefix}")
+            list(PREPEND CMAKE_LIBRARY_PATH
+                "${_vcpkg_installed_prefix}/lib"
+                "${_vcpkg_installed_prefix}/debug/lib"
+            )
+            list(PREPEND CMAKE_INCLUDE_PATH "${_vcpkg_installed_prefix}/include")
+        endif()
+        find_package(imgui CONFIG REQUIRED)
+    endif()
+endif()
 
 set(CLIENT_ROOT "${CMAKE_CURRENT_SOURCE_DIR}")
 set(CLIENT_LIBS_DIR "${CLIENT_ROOT}/libs")

@@ -1,6 +1,7 @@
 #pragma once
 
 #include <cstdint>
+#include <filesystem>
 #include <optional>
 #include <string>
 #include <string_view>
@@ -13,6 +14,7 @@ public:
     virtual ~IAssetReader() = default;
 
     virtual std::optional<std::vector<std::uint8_t>> ReadAll(std::string_view path) const = 0;
+    virtual std::optional<std::filesystem::path> RootPath() const { return std::nullopt; }
 
     std::optional<std::string> ReadText(std::string_view path) const
     {

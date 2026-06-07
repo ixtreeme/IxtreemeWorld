@@ -11,6 +11,7 @@
 #include <functional>
 #include <limits>
 #include <string>
+#include <unordered_map>
 #include <vector>
 
 namespace client::asset {
@@ -78,7 +79,7 @@ public:
     void RenderWaterReflection(VulkanDevice& device,
                                const WorldCamera& camera,
                                double timeSeconds,
-                               const std::function<void(const WorldCamera&, VkExtent2D, VkRenderPass)>& renderEntities = {});
+                               const std::function<void(const WorldCamera&, VkExtent2D, VkRenderPass, float)>& renderEntities = {});
     void Render(VulkanDevice& device, const WorldCamera& camera);
     void RenderWater(VulkanDevice& device, const WorldCamera& camera, double timeSeconds);
     void RenderSunShadowMap(VulkanDevice& device, const WorldCamera& camera);
@@ -87,7 +88,12 @@ public:
     void SetMapEditorOpen(bool open);
     void SetMapEditorSettings(const MapEditorSettings& settings);
     void SetLightingState(const LightingState& lighting) { m_lightingState = lighting; }
-    void SetWaterConfig(const WaterConfig& water);
+    void SetWaterMaterials(const std::vector<std::pair<std::string, WaterMaterialData>>& materials);
+    std::vector<WaterBody> GetWaterBodies() const;
+    bool SetWaterBodies(VulkanDevice& device, const std::vector<WaterBody>& bodies);
+    bool SetSelectedWaterBodyHighlight(VulkanDevice& device, std::uint32_t selectedWaterBodyId);
+    void RenderSelectedWaterBodyHighlight(VulkanDevice& device, const WorldCamera& camera);
+    void SetWaterSculptBrush(bool visible, float worldX, float worldZ, float radiusMeters, bool addMode);
     void SetPaletteSlots(const std::array<MapEditorPaletteSlot, 8>& slots);
     const std::array<MapEditorPaletteSlot, 8>& GetPaletteSlots() const { return m_paletteSlots; }
     bool ApplyPaletteSlots(VulkanDevice& device, const std::array<MapEditorPaletteSlot, 8>& slots);
@@ -104,6 +110,7 @@ private:
     static constexpr uint32_t kFramesInFlight = 2;
     static constexpr uint32_t kShadowCascadeCount = 4;
     static constexpr uint32_t kShadowResolution = 2048;
+    static constexpr uint32_t kMaxTerrainWaterBodies = 8;
 
     struct Vertex
     {
@@ -116,6 +123,7 @@ private:
     {
         float position[3];
         float uv[2];
+        float edgeAlpha;
     };
 
     struct UniformBlock
@@ -133,6 +141,15 @@ private:
             float color[4];
         };
 
+        struct TerrainWaterBodyUniform
+        {
+            float bboxMinMax[4] = {0.0f, 0.0f, 0.0f, 0.0f};      // minX, minZ, maxX, maxZ
+            float levelModeEnabled[4] = {0.0f, 0.0f, 0.0f, 0.0f}; // levelY, causticMode, enabled, foamEnabled
+            float foamParams[4] = {0.0f, 0.0f, 0.0f, 0.0f};      // distance, softness, intensity, scale
+            float causticParams[4] = {0.0f, 0.0f, 0.0f, 0.0f};   // intensity, scale, speed, maxDepth
+            float edgeParams[4] = {0.0f, 0.0f, 0.0f, 0.0f};      // fade distance, curve, reserved, reserved
+        };
+
         WorldMat4 mvp;
         float materialTiling[8][4];
         float materialTintNormal[8][4];
@@ -147,10 +164,8 @@ private:
         std::int32_t numPointLights = 0;
         std::int32_t numSpotLights = 0;
         float lightPadding[2] = {0.0f, 0.0f};
-        float waterParams1[4] = {0.0f, 0.0f, 0.0f, 0.0f};
-        float waterParams2[4] = {0.0f, 0.0f, 0.0f, 0.0f};
-        float waterParams3[4] = {0.0f, 0.0f, 0.0f, 0.0f};
-        float waterParams4[4] = {0.0f, 0.0f, 0.0f, 0.0f};
+        float waterGlobalParams[4] = {0.0f, 0.0f, 0.0f, 0.0f}; // time, activeCount, truncatedCount, reserved
+        TerrainWaterBodyUniform terrainWaterBodies[kMaxTerrainWaterBodies]{};
         PointLightUniform pointLights[kMaxDynamicPointLights]{};
         SpotLightUniform spotLights[kMaxDynamicSpotLights]{};
     };
@@ -176,6 +191,8 @@ private:
         float foamDepthParams[4];
         float causticParams[4];
         float cameraNearFar[4];
+        float textureParams[4]; // use normal A, use normal B, use diffuse, normal tiling
+        float textureScroll[4]; // scroll A xy, scroll B xy
     };
 
     struct WaterReflectionResources
@@ -207,6 +224,16 @@ private:
         uint32_t indexCount = 0;
     };
 
+    struct WaterMaterialTextureSet
+    {
+        Texture normalA;
+        Texture normalB;
+        Texture diffuse;
+        std::string normalAPath;
+        std::string normalBPath;
+        std::string diffusePath;
+    };
+
     struct DebugDrawRange
     {
         uint32_t indexOffset = 0;
@@ -229,7 +256,8 @@ private:
                              uint32_t height,
                              const std::vector<std::uint8_t>& pixels,
                              VkSamplerAddressMode addressMode,
-                             Texture& out);
+                             Texture& out,
+                             VkFormat format = VK_FORMAT_R8G8B8A8_UNORM);
     bool UpdateRgbaTexture2D(VulkanDevice& device, Texture& texture, const std::vector<std::uint8_t>& pixels);
     bool UploadRgbaTextureArray(VulkanDevice& device,
                                 const std::string& name,
@@ -255,17 +283,18 @@ private:
     bool CreatePipeline(VulkanDevice& device);
     void DestroyPipeline();
     bool CreateWaterResources(VulkanDevice& device);
-    bool CreateWaterMesh(VulkanDevice& device);
     bool LoadWaterBodies(VulkanDevice& device, const std::string& mapDirectory);
     bool CreateWaterBodyMesh(VulkanDevice& device, WaterBodyGpu& waterBody);
     bool CreateWaterBodyUniformBuffers(VulkanDevice& device, WaterBodyGpu& waterBody);
+    bool RebuildSelectedWaterBodyHighlight(VulkanDevice& device, const WaterBody* body);
     bool AllocateWaterDescriptorSets(const std::array<Buffer, kFramesInFlight>& uniformBuffers,
                                      std::array<VkDescriptorSet, kFramesInFlight>& descriptorSets);
     bool CreateWaterNormalTextures(VulkanDevice& device);
     bool CreateWaterDescriptors();
     void UpdateWaterDescriptors();
     void WriteWaterDescriptorSets(const std::array<Buffer, kFramesInFlight>& uniformBuffers,
-                                  const std::array<VkDescriptorSet, kFramesInFlight>& descriptorSets);
+                                  const std::array<VkDescriptorSet, kFramesInFlight>& descriptorSets,
+                                  const WaterMaterialTextureSet* materialTextures = nullptr);
     bool CreateWaterPipeline(VulkanDevice& device);
     bool CreateOrRecreateWaterReflectionResources(VulkanDevice& device, bool force);
     bool CreateOrRecreateWaterReflectionResources(VulkanDevice& device,
@@ -280,14 +309,19 @@ private:
                             VkPipeline pipeline,
                             VkPipelineLayout pipelineLayout,
                             bool includeDebug);
-    WorldCamera ComputeMirrorCamera(const WorldCamera& camera, VkExtent2D extent) const;
     WorldCamera ComputeMirrorCamera(const WorldCamera& camera, VkExtent2D extent, float waterLevelY) const;
     const WaterBodyGpu* FindClosestWaterBody(const WorldCamera& camera, float* outDistanceMeters = nullptr) const;
+    const WaterConfig& ResolveWaterConfig(const WaterBody& body) const;
     void DestroyWaterResources();
     void DestroyWaterBodyResources();
     void DestroyWaterBodyResources(WaterBodyGpu& waterBody);
+    void DestroyWaterMaterialTextureCache();
+    bool LoadWaterMaterialTextureSet(VulkanDevice& device,
+                                     const std::string& id,
+                                     const WaterMaterialData& material,
+                                     WaterMaterialTextureSet& out);
+    const WaterMaterialTextureSet* ResolveWaterMaterialTextures(const WaterBody& body) const;
     void DestroyWaterPipeline();
-    void UpdateWaterUniform(uint32_t frameIndex, const WorldCamera& camera, double timeSeconds);
     void UpdateWaterBodyUniform(uint32_t frameIndex,
                                 const WorldCamera& camera,
                                 double timeSeconds,
@@ -322,20 +356,27 @@ private:
     bool RefreshSplatTextures(VulkanDevice& device);
     bool SaveDirtyChunks();
     bool SaveWorldPalette() const;
+    bool SaveWaterBodies() const;
     bool SaveChunkHeights(uint32_t chunkX, uint32_t chunkY, uint32_t dirtyTexels);
     bool ReloadCurrentMap(VulkanDevice& device);
     std::string ResolveWritableMapPath(const std::string& relativePath) const;
 
     VkDevice m_device = VK_NULL_HANDLE;
+    VulkanDevice* m_deviceOwner = nullptr;
     client::asset::IAssetReader* m_assets = nullptr;
+    std::unordered_map<std::string, WaterMaterialData> m_waterMaterials;
+    std::unordered_map<std::string, WaterMaterialTextureSet> m_waterMaterialTextures;
+    std::string m_waterMaterialTextureSignature;
+    std::string m_waterMaterialEdgeSignature;
+    WaterMaterialData m_defaultWaterMaterial;
     Buffer m_vertexBuffer;
     Buffer m_indexBuffer;
     Buffer m_debugVertexBuffer;
     Buffer m_debugIndexBuffer;
     Buffer m_logicVertexBuffer;
     Buffer m_logicIndexBuffer;
-    Buffer m_waterVertexBuffer;
-    Buffer m_waterIndexBuffer;
+    Buffer m_selectedWaterBodyVertexBuffer;
+    Buffer m_selectedWaterBodyIndexBuffer;
     std::array<Buffer, kFramesInFlight> m_uniformBuffers{};
     std::array<Buffer, kFramesInFlight> m_waterUniformBuffers{};
     VkDescriptorSetLayout m_descriptorSetLayout = VK_NULL_HANDLE;
@@ -391,7 +432,9 @@ private:
     uint32_t m_spawnDebugIndexCount = 0;
     uint32_t m_logicDebugIndexOffset = 0;
     uint32_t m_logicDebugIndexCount = 0;
-    uint32_t m_waterIndexCount = 0;
+    uint32_t m_selectedWaterBodyIndexCount = 0;
+    std::uint32_t m_selectedWaterBodyId = 0;
+    float m_selectedWaterBodySignature[5] = {};
     std::vector<WaterBodyGpu> m_waterBodies;
     std::vector<DebugDrawRange> m_zoneFillDebugRanges;
     std::vector<DebugDrawRange> m_zoneBorderDebugRanges;
@@ -418,6 +461,8 @@ private:
     bool m_editorStrokeActive = false;
     bool m_editorCtrlHeld = false;
     bool m_editorBrushVisible = false;
+    bool m_waterSculptBrushVisible = false;
+    bool m_waterSculptBrushAddMode = true;
     bool m_editorSplatGpuDirty = false;
     bool m_editorSaveRequested = false;
     bool m_editorReloadRequested = false;
@@ -428,14 +473,15 @@ private:
     float m_editorBrushStrength = 1.0f;
     float m_editorBrushLocalX = 0.0f;
     float m_editorBrushLocalZ = 0.0f;
+    float m_waterSculptBrushWorldX = 0.0f;
+    float m_waterSculptBrushWorldZ = 0.0f;
+    float m_waterSculptBrushRadiusMeters = 3.0f;
     float m_editorFlattenTargetCm = 0.0f;
     bool m_editorHasFlattenTarget = false;
     MapEditorTool m_editorTool = MapEditorTool::Raise;
     MapEditorPaintMode m_editorPaintMode = MapEditorPaintMode::Replace;
     std::uint32_t m_editorTextureSlot = 4;
     LightingState m_lightingState;
-    WaterConfig m_waterConfig;
-    float m_waterMeshLevelY = std::numeric_limits<float>::quiet_NaN();
     float m_reflectionClipWaterLevelY = std::numeric_limits<float>::quiet_NaN();
     double m_latestWaterTimeSeconds = 0.0;
     double m_lastWaterDiagTimeSeconds = -1000.0;

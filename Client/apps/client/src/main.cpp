@@ -5,6 +5,7 @@
 
 #include "NameplateRenderer.h"
 #include "NativeWindow.h"
+#include "EditorImGui.h"
 #if defined(_WIN32)
 #include "NativeWindow_Win32.h"
 #endif
@@ -39,6 +40,7 @@
 #include <optional>
 #include <string>
 #include <type_traits>
+#include <utility>
 #include <vector>
 
 namespace
@@ -169,7 +171,8 @@ enum class SelectedEditorObjectType
     None,
     Marker,
     PointLight,
-    SpotLight
+    SpotLight,
+    WaterBody
 };
 
 struct SelectedEditorObject
@@ -260,6 +263,290 @@ std::optional<std::uint32_t> PickDynamicLight(const std::vector<LightT>& lights,
         }
     }
     return bestId;
+}
+
+void RegenerateCircularWaterMask(WaterBody& body)
+{
+    body.maskWidth = 32;
+    body.maskHeight = 32;
+    body.shapeMask.assign(static_cast<std::size_t>(body.maskWidth) * body.maskHeight, 0);
+
+    const float cx = static_cast<float>(body.maskWidth) * 0.5f;
+    const float cy = static_cast<float>(body.maskHeight) * 0.5f;
+    const float radius = std::min(cx, cy) * 0.95f;
+    for (std::uint32_t y = 0; y < body.maskHeight; ++y)
+    {
+        for (std::uint32_t x = 0; x < body.maskWidth; ++x)
+        {
+            const float dx = static_cast<float>(x) + 0.5f - cx;
+            const float dy = static_cast<float>(y) + 0.5f - cy;
+            const bool inside = dx * dx + dy * dy <= radius * radius;
+            body.shapeMask[static_cast<std::size_t>(y) * body.maskWidth + x] = inside ? 1u : 0u;
+        }
+    }
+}
+
+WorldVec3 WaterBodyCenter(const WaterBody& body)
+{
+    return {
+        (body.bboxMin[0] + body.bboxMax[0]) * 0.5f,
+        body.waterLevelY,
+        (body.bboxMin[1] + body.bboxMax[1]) * 0.5f
+    };
+}
+
+float WaterBodyWidth(const WaterBody& body)
+{
+    return std::max(0.0f, body.bboxMax[0] - body.bboxMin[0]);
+}
+
+float WaterBodyDepth(const WaterBody& body)
+{
+    return std::max(0.0f, body.bboxMax[1] - body.bboxMin[1]);
+}
+
+void ApplyWaterBodyEditorStateToBody(WaterBody& body, const WaterBodyEditorState& state)
+{
+    const float width = std::clamp(state.width, 1.0f, 200.0f);
+    const float depth = std::clamp(state.depth, 1.0f, 200.0f);
+    const bool hasValidMask = body.maskWidth > 0 && body.maskHeight > 0 &&
+        body.shapeMask.size() == static_cast<std::size_t>(body.maskWidth) * body.maskHeight;
+    body.name = state.name.empty() ? ("Water_" + std::to_string(body.id)) : state.name;
+    body.materialId = state.materialId;
+    body.waterLevelY = state.center[1];
+    body.bboxMin[0] = state.center[0] - width * 0.5f;
+    body.bboxMax[0] = state.center[0] + width * 0.5f;
+    body.bboxMin[1] = state.center[2] - depth * 0.5f;
+    body.bboxMax[1] = state.center[2] + depth * 0.5f;
+    if (!hasValidMask)
+        RegenerateCircularWaterMask(body);
+}
+
+WaterBodyEditorState BuildWaterBodyEditorState(const std::vector<WaterBody>& bodies, std::uint32_t selectedId)
+{
+    WaterBodyEditorState state{};
+    state.count = static_cast<std::uint32_t>(bodies.size());
+    auto it = std::find_if(bodies.begin(), bodies.end(),
+        [selectedId](const WaterBody& body) { return selectedId != 0 && body.id == selectedId; });
+    if (it == bodies.end())
+        return state;
+
+    state.selected = true;
+    state.id = it->id;
+    state.name = it->name;
+    const WorldVec3 center = WaterBodyCenter(*it);
+    state.center[0] = center.x;
+    state.center[1] = center.y;
+    state.center[2] = center.z;
+    state.width = WaterBodyWidth(*it);
+    state.depth = WaterBodyDepth(*it);
+    state.materialId = it->materialId;
+    state.materialName = it->materialId.empty() ? "Inline Water" : it->materialId;
+    state.config = it->config;
+    state.config.waterLevelY = it->waterLevelY;
+    return state;
+}
+
+std::optional<std::uint32_t> PickWaterBody(const std::vector<WaterBody>& bodies,
+                                           const WorldCamera& camera,
+                                           uint32_t width,
+                                           uint32_t height,
+                                           int mouseX,
+                                           int mouseY)
+{
+    const WorldVec3 rayDir = ScreenRayDirection(camera, width, height, mouseX, mouseY);
+    std::optional<std::uint32_t> bestId;
+    float bestT = 1000000.0f;
+    for (const WaterBody& body : bodies)
+    {
+        if (!body.config.enabled || body.maskWidth == 0 || body.maskHeight == 0 ||
+            body.shapeMask.size() != static_cast<std::size_t>(body.maskWidth) * body.maskHeight)
+        {
+            continue;
+        }
+
+        const float denom = rayDir.y;
+        if (std::abs(denom) < 0.0001f)
+            continue;
+        const float t = (body.waterLevelY - camera.eye.y) / denom;
+        if (t <= 0.0f || t >= bestT)
+            continue;
+
+        const WorldVec3 hit = WorldAdd(camera.eye, WorldScale(rayDir, t));
+        if (hit.x < body.bboxMin[0] || hit.x > body.bboxMax[0] ||
+            hit.z < body.bboxMin[1] || hit.z > body.bboxMax[1])
+        {
+            continue;
+        }
+
+        const float u = (hit.x - body.bboxMin[0]) / std::max(0.001f, body.bboxMax[0] - body.bboxMin[0]);
+        const float v = (hit.z - body.bboxMin[1]) / std::max(0.001f, body.bboxMax[1] - body.bboxMin[1]);
+        const std::uint32_t mx = std::min(body.maskWidth - 1u, static_cast<std::uint32_t>(u * body.maskWidth));
+        const std::uint32_t my = std::min(body.maskHeight - 1u, static_cast<std::uint32_t>(v * body.maskHeight));
+        if (body.shapeMask[static_cast<std::size_t>(my) * body.maskWidth + mx] == 0)
+            continue;
+
+        bestT = t;
+        bestId = body.id;
+    }
+    return bestId;
+}
+
+std::optional<WorldVec3> RaycastTerrainPoint(const TerrainRenderer& terrain,
+                                             const WorldCamera& camera,
+                                             uint32_t width,
+                                             uint32_t height,
+                                             int mouseX,
+                                             int mouseY)
+{
+    if (width == 0 || height == 0)
+        return std::nullopt;
+
+    const WorldVec3 rayDir = ScreenRayDirection(camera, width, height, mouseX, mouseY);
+    constexpr float kStepMeters = 0.5f;
+    constexpr float kMaxDistanceMeters = 700.0f;
+    float previousT = 0.0f;
+    float previousDelta = camera.eye.y - terrain.SampleHeight(camera.eye);
+    for (float t = kStepMeters; t <= kMaxDistanceMeters; t += kStepMeters)
+    {
+        const WorldVec3 p = WorldAdd(camera.eye, WorldScale(rayDir, t));
+        const float terrainY = terrain.SampleHeight(p);
+        const float delta = p.y - terrainY;
+        if (delta <= 0.0f && previousDelta > 0.0f)
+        {
+            const float denom = previousDelta - delta;
+            const float lerp = denom > 0.0001f ? previousDelta / denom : 0.0f;
+            const float hitT = previousT + (t - previousT) * std::clamp(lerp, 0.0f, 1.0f);
+            WorldVec3 hit = WorldAdd(camera.eye, WorldScale(rayDir, hitT));
+            hit.y = terrain.SampleHeight(hit);
+            return hit;
+        }
+        previousT = t;
+        previousDelta = delta;
+    }
+    return std::nullopt;
+}
+
+bool ExpandWaterBodyForSculpt(WaterBody& body, const WorldVec3& point, float radiusMeters)
+{
+    if (body.maskWidth == 0 || body.maskHeight == 0 ||
+        body.shapeMask.size() != static_cast<std::size_t>(body.maskWidth) * body.maskHeight)
+    {
+        return false;
+    }
+
+    const float minX = std::min(body.bboxMin[0], body.bboxMax[0]);
+    const float maxX = std::max(body.bboxMin[0], body.bboxMax[0]);
+    const float minZ = std::min(body.bboxMin[1], body.bboxMax[1]);
+    const float maxZ = std::max(body.bboxMin[1], body.bboxMax[1]);
+    const float brushRadius = std::max(radiusMeters, 0.001f);
+    const float nextMinX = std::min(minX, point.x - brushRadius);
+    const float nextMaxX = std::max(maxX, point.x + brushRadius);
+    const float nextMinZ = std::min(minZ, point.z - brushRadius);
+    const float nextMaxZ = std::max(maxZ, point.z + brushRadius);
+    if (std::abs(nextMinX - minX) < 0.001f && std::abs(nextMaxX - maxX) < 0.001f &&
+        std::abs(nextMinZ - minZ) < 0.001f && std::abs(nextMaxZ - maxZ) < 0.001f)
+    {
+        return true;
+    }
+
+    const float oldSizeX = std::max(maxX - minX, 0.001f);
+    const float oldSizeZ = std::max(maxZ - minZ, 0.001f);
+    const float cellX = oldSizeX / static_cast<float>(body.maskWidth);
+    const float cellZ = oldSizeZ / static_cast<float>(body.maskHeight);
+    const float targetCell = std::max(0.1f, std::min(cellX, cellZ));
+    const float newSizeX = std::max(nextMaxX - nextMinX, targetCell);
+    const float newSizeZ = std::max(nextMaxZ - nextMinZ, targetCell);
+    const std::uint32_t newWidth = std::clamp(
+        static_cast<std::uint32_t>(std::ceil(newSizeX / targetCell)), 8u, 256u);
+    const std::uint32_t newHeight = std::clamp(
+        static_cast<std::uint32_t>(std::ceil(newSizeZ / targetCell)), 8u, 256u);
+    std::vector<std::uint8_t> nextMask(static_cast<std::size_t>(newWidth) * newHeight, 0u);
+    const std::vector<std::uint8_t> oldMask = body.shapeMask;
+
+    for (std::uint32_t y = 0; y < newHeight; ++y)
+    {
+        const float worldZ = nextMinZ + (static_cast<float>(y) + 0.5f) / static_cast<float>(newHeight) * newSizeZ;
+        if (worldZ < minZ || worldZ > maxZ)
+            continue;
+        const float oldV = (worldZ - minZ) / oldSizeZ;
+        const std::uint32_t oldY = std::min(body.maskHeight - 1u,
+            static_cast<std::uint32_t>(std::clamp(oldV, 0.0f, 0.9999f) * static_cast<float>(body.maskHeight)));
+        for (std::uint32_t x = 0; x < newWidth; ++x)
+        {
+            const float worldX = nextMinX + (static_cast<float>(x) + 0.5f) / static_cast<float>(newWidth) * newSizeX;
+            if (worldX < minX || worldX > maxX)
+                continue;
+            const float oldU = (worldX - minX) / oldSizeX;
+            const std::uint32_t oldX = std::min(body.maskWidth - 1u,
+                static_cast<std::uint32_t>(std::clamp(oldU, 0.0f, 0.9999f) * static_cast<float>(body.maskWidth)));
+            nextMask[static_cast<std::size_t>(y) * newWidth + x] =
+                oldMask[static_cast<std::size_t>(oldY) * body.maskWidth + oldX];
+        }
+    }
+
+    body.bboxMin[0] = nextMinX;
+    body.bboxMax[0] = nextMaxX;
+    body.bboxMin[1] = nextMinZ;
+    body.bboxMax[1] = nextMaxZ;
+    body.maskWidth = newWidth;
+    body.maskHeight = newHeight;
+    body.shapeMask = std::move(nextMask);
+    return true;
+}
+
+std::uint32_t ApplyWaterSculptBrush(WaterBody& body, const WorldVec3& point, float radiusMeters, bool addMode)
+{
+    if (body.maskWidth == 0 || body.maskHeight == 0 ||
+        body.shapeMask.size() != static_cast<std::size_t>(body.maskWidth) * body.maskHeight)
+    {
+        return 0;
+    }
+
+    if (addMode && !ExpandWaterBodyForSculpt(body, point, radiusMeters))
+        return 0;
+
+    const float minX = std::min(body.bboxMin[0], body.bboxMax[0]);
+    const float maxX = std::max(body.bboxMin[0], body.bboxMax[0]);
+    const float minZ = std::min(body.bboxMin[1], body.bboxMax[1]);
+    const float maxZ = std::max(body.bboxMin[1], body.bboxMax[1]);
+    const float sizeX = std::max(maxX - minX, 0.001f);
+    const float sizeZ = std::max(maxZ - minZ, 0.001f);
+    if (point.x < minX || point.x > maxX || point.z < minZ || point.z > maxZ)
+        return 0;
+
+    const float u = (point.x - minX) / sizeX;
+    const float v = (point.z - minZ) / sizeZ;
+    const int centerX = static_cast<int>(std::clamp(u, 0.0f, 0.9999f) * static_cast<float>(body.maskWidth));
+    const int centerY = static_cast<int>(std::clamp(v, 0.0f, 0.9999f) * static_cast<float>(body.maskHeight));
+    const float radiusPxX = (std::max(radiusMeters, 0.001f) / sizeX) * static_cast<float>(body.maskWidth);
+    const float radiusPxY = (std::max(radiusMeters, 0.001f) / sizeZ) * static_cast<float>(body.maskHeight);
+    const float radiusPx = std::max(1.0f, (radiusPxX + radiusPxY) * 0.5f);
+    const int radiusCeil = static_cast<int>(std::ceil(radiusPx));
+    const int xMin = std::max(0, centerX - radiusCeil);
+    const int xMax = std::min(static_cast<int>(body.maskWidth) - 1, centerX + radiusCeil);
+    const int yMin = std::max(0, centerY - radiusCeil);
+    const int yMax = std::min(static_cast<int>(body.maskHeight) - 1, centerY + radiusCeil);
+    const std::uint8_t value = addMode ? 1u : 0u;
+
+    std::uint32_t modified = 0;
+    const float radiusSq = radiusPx * radiusPx;
+    for (int y = yMin; y <= yMax; ++y)
+    {
+        for (int x = xMin; x <= xMax; ++x)
+        {
+            const float dx = static_cast<float>(x) + 0.5f - static_cast<float>(centerX);
+            const float dy = static_cast<float>(y) + 0.5f - static_cast<float>(centerY);
+            if (dx * dx + dy * dy > radiusSq)
+                continue;
+            const std::size_t index = static_cast<std::size_t>(y) * body.maskWidth + static_cast<std::size_t>(x);
+            if (body.shapeMask[index] == value)
+                continue;
+            body.shapeMask[index] = value;
+            ++modified;
+        }
+    }
+    return modified;
 }
 
 WorldVec3 SpotLightDirection(const SpotLight& spot)
@@ -616,6 +903,30 @@ int RunGame(NativeWindow& window,
     clientSession.SetDebugSpawnOverride(debugSpawnOverride);
     noesis.SetClientSession(&clientSession);
 
+    EditorImGui editorImGui;
+#if defined(_WIN32)
+    NativeWindow_Win32* win32Window = dynamic_cast<NativeWindow_Win32*>(&window);
+    if (!win32Window || !editorImGui.Create(device, win32Window->GetHwnd()))
+    {
+        ShowFatal("Failed to create ImGui editor layer. See debug output/stderr.");
+        noesis.Destroy();
+        device.Destroy();
+        return 1;
+    }
+    win32Window->SetMessageCallback([&editorImGui](HWND hwnd, UINT message, WPARAM wParam, LPARAM lParam, LRESULT& result)
+    {
+        return editorImGui.HandleWin32Message(hwnd, message, wParam, lParam, result);
+    });
+#else
+    if (!editorImGui.Create(device, nullptr))
+    {
+        ShowFatal("Failed to create ImGui editor layer. See debug output/stderr.");
+        noesis.Destroy();
+        device.Destroy();
+        return 1;
+    }
+#endif
+
     const std::string warriorModelPath = "assets/Character/KicsiK.glb";
 
     WarriorRenderer warrior;
@@ -682,16 +993,26 @@ int RunGame(NativeWindow& window,
     std::vector<EditorTestMarker> editorMarkers;
     std::vector<PointLight> editorPointLights;
     std::vector<SpotLight> editorSpotLights;
+    std::vector<WaterBody> editorWaterBodies = terrainOk ? terrain.GetWaterBodies() : std::vector<WaterBody>{};
+    bool editorWaterBodiesDirty = false;
     std::uint32_t nextEditorMarkerId = 1;
     std::uint32_t nextEditorLightId = 1;
+    std::uint32_t nextEditorWaterBodyId = 1;
+    for (const WaterBody& body : editorWaterBodies)
+        nextEditorWaterBodyId = std::max(nextEditorWaterBodyId, body.id + 1u);
     std::uint32_t selectedEditorMarkerId = 0;
     SelectedEditorObject selectedEditorObject;
     EditorGizmoMode editorGizmoMode = EditorGizmoMode::Translate;
     bool editorMarkerDragActive = false;
     int editorMarkerDragLastX = 0;
     int editorMarkerDragLastY = 0;
+    bool waterSculptStrokeActive = false;
+    std::uint32_t waterSculptStrokeBodyId = 0;
+    std::uint32_t waterSculptStrokeModifiedCells = 0;
+    bool waterSculptMeshRegenPending = false;
 
     window.SetInputCallback([&noesis,
+                             &editorImGui,
                              &movement,
                              &cameraController,
                              &terrain,
@@ -704,14 +1025,26 @@ int RunGame(NativeWindow& window,
                              &editorMarkers,
                              &editorPointLights,
                              &editorSpotLights,
+                             &editorWaterBodies,
+                             &editorWaterBodiesDirty,
                              &selectedEditorMarkerId,
                              &selectedEditorObject,
                              &editorGizmoMode,
                              &editorMarkerDragActive,
                              &editorMarkerDragLastX,
                              &editorMarkerDragLastY,
+                             &waterSculptStrokeActive,
+                             &waterSculptStrokeBodyId,
+                             &waterSculptStrokeModifiedCells,
+                             &waterSculptMeshRegenPending,
                              &renderSize](const InputEvent& event)
     {
+        if (editorImGui.WantsInputCapture(event))
+        {
+            movement.Clear();
+            return;
+        }
+
         const bool editorTextInputFocused = noesis.IsMapEditorOpen() && noesis.IsTextInputFocused();
         if (editorTextInputFocused)
             movement.Clear();
@@ -806,6 +1139,15 @@ int RunGame(NativeWindow& window,
                         editorGizmoMode = EditorGizmoMode::Scale;
                         noesis.SetEditorStatus("Gizmo: scale");
                     }
+                    else if (event.key == Key_Delete && selectedEditorObject.type == SelectedEditorObjectType::WaterBody)
+                    {
+                        editorWaterBodies.erase(std::remove_if(editorWaterBodies.begin(), editorWaterBodies.end(),
+                            [&](const WaterBody& body) { return body.id == selectedEditorObject.id; }), editorWaterBodies.end());
+                        noesis.SetEditorStatus("Deleted water body #" + std::to_string(selectedEditorObject.id));
+                        selectedEditorObject = {};
+                        editorWaterBodiesDirty = true;
+                        return;
+                    }
                 }
                 if (terrain.HandleEditorInput(event))
                     return;
@@ -818,6 +1160,103 @@ int RunGame(NativeWindow& window,
                 event.type == InputEvent::MouseWheel)
             {
                 consumedByEditorUi = noesis.OnInput(event);
+                const MapEditorSettings editorSettings = noesis.GetMapEditorSettings();
+                auto selectedWaterBodyIt = [&]() {
+                    return std::find_if(editorWaterBodies.begin(), editorWaterBodies.end(),
+                        [&](const WaterBody& body) {
+                            return selectedEditorObject.type == SelectedEditorObjectType::WaterBody &&
+                                body.id == selectedEditorObject.id;
+                        });
+                };
+                auto updateWaterSculptCursor = [&]() -> std::optional<WorldVec3> {
+                    if (!editorSettings.waterSculptActive || !hasLastPickCamera ||
+                        selectedEditorObject.type != SelectedEditorObjectType::WaterBody)
+                    {
+                        terrain.SetWaterSculptBrush(false, 0.0f, 0.0f, editorSettings.waterSculptRadiusMeters,
+                            editorSettings.waterSculptAdd);
+                        return std::nullopt;
+                    }
+                    auto bodyIt = selectedWaterBodyIt();
+                    if (bodyIt == editorWaterBodies.end())
+                    {
+                        terrain.SetWaterSculptBrush(false, 0.0f, 0.0f, editorSettings.waterSculptRadiusMeters,
+                            editorSettings.waterSculptAdd);
+                        return std::nullopt;
+                    }
+                    std::optional<WorldVec3> hit = RaycastTerrainPoint(terrain,
+                        lastPickCamera,
+                        renderSize.width,
+                        renderSize.height,
+                        event.x,
+                        event.y);
+                    if (!hit)
+                    {
+                        terrain.SetWaterSculptBrush(false, 0.0f, 0.0f, editorSettings.waterSculptRadiusMeters,
+                            editorSettings.waterSculptAdd);
+                        return std::nullopt;
+                    }
+                    terrain.SetWaterSculptBrush(true, hit->x, hit->z, editorSettings.waterSculptRadiusMeters,
+                        editorSettings.waterSculptAdd);
+                    return hit;
+                };
+                auto applyWaterSculptAtCursor = [&](const WorldVec3& hit) -> std::uint32_t {
+                    auto bodyIt = selectedWaterBodyIt();
+                    if (bodyIt == editorWaterBodies.end() || bodyIt->id != waterSculptStrokeBodyId)
+                        return 0;
+                    return ApplyWaterSculptBrush(*bodyIt, hit, editorSettings.waterSculptRadiusMeters,
+                        editorSettings.waterSculptAdd);
+                };
+
+                if (waterSculptStrokeActive)
+                {
+                    if (event.type == InputEvent::MouseMove)
+                    {
+                        if (std::optional<WorldVec3> hit = updateWaterSculptCursor())
+                            waterSculptStrokeModifiedCells += applyWaterSculptAtCursor(*hit);
+                        return;
+                    }
+                    if (event.type == InputEvent::MouseUp && event.button == MouseButton_Left)
+                    {
+                        if (std::optional<WorldVec3> hit = updateWaterSculptCursor())
+                            waterSculptStrokeModifiedCells += applyWaterSculptAtCursor(*hit);
+                        waterSculptStrokeActive = false;
+                        if (waterSculptStrokeModifiedCells > 0)
+                        {
+                            editorWaterBodiesDirty = true;
+                            waterSculptMeshRegenPending = true;
+                            noesis.SetEditorStatus("Water sculpt stroke: " +
+                                std::to_string(waterSculptStrokeModifiedCells) + " cells modified");
+                        }
+                        Tracenf("[WATER-OBJ-5] Brush stroke ended: body_id=%u mode=%s cells_modified=%u",
+                            waterSculptStrokeBodyId,
+                            editorSettings.waterSculptAdd ? "add" : "remove",
+                            waterSculptStrokeModifiedCells);
+                        waterSculptStrokeBodyId = 0;
+                        waterSculptStrokeModifiedCells = 0;
+                        return;
+                    }
+                }
+
+                if (!consumedByEditorUi && editorSettings.waterSculptActive &&
+                    selectedEditorObject.type == SelectedEditorObjectType::WaterBody &&
+                    (event.type == InputEvent::MouseMove ||
+                     (event.type == InputEvent::MouseDown && event.button == MouseButton_Left)))
+                {
+                    std::optional<WorldVec3> hit = updateWaterSculptCursor();
+                    if (event.type == InputEvent::MouseDown && event.button == MouseButton_Left)
+                    {
+                        waterSculptStrokeActive = true;
+                        waterSculptStrokeBodyId = selectedEditorObject.id;
+                        waterSculptStrokeModifiedCells = 0;
+                        editorMarkerDragActive = false;
+                        if (hit)
+                            waterSculptStrokeModifiedCells += applyWaterSculptAtCursor(*hit);
+                    }
+                    return;
+                }
+                if (!editorSettings.waterSculptActive && !waterSculptStrokeActive)
+                    terrain.SetWaterSculptBrush(false, 0.0f, 0.0f, editorSettings.waterSculptRadiusMeters,
+                        editorSettings.waterSculptAdd);
                 if (event.type == InputEvent::MouseUp)
                 {
                     if (event.button == MouseButton_Left)
@@ -876,6 +1315,21 @@ int RunGame(NativeWindow& window,
                             noesis.SetEditorStatus("Selected marker #" + std::to_string(selectedEditorMarkerId));
                             return;
                         }
+                        if (auto waterId = PickWaterBody(editorWaterBodies,
+                                lastPickCamera,
+                                renderSize.width,
+                                renderSize.height,
+                                event.x,
+                                event.y))
+                        {
+                            selectedEditorObject = {SelectedEditorObjectType::WaterBody, *waterId};
+                            selectedEditorMarkerId = 0;
+                            editorMarkerDragActive = true;
+                            editorMarkerDragLastX = event.x;
+                            editorMarkerDragLastY = event.y;
+                            noesis.SetEditorStatus("Selected water body #" + std::to_string(*waterId));
+                            return;
+                        }
                     }
                     if (event.type == InputEvent::MouseMove && editorMarkerDragActive && selectedEditorMarkerId != 0)
                     {
@@ -914,7 +1368,8 @@ int RunGame(NativeWindow& window,
                     }
                     if (event.type == InputEvent::MouseMove && editorMarkerDragActive &&
                         selectedEditorObject.type != SelectedEditorObjectType::None &&
-                        selectedEditorObject.type != SelectedEditorObjectType::Marker)
+                        selectedEditorObject.type != SelectedEditorObjectType::Marker &&
+                        selectedEditorObject.type != SelectedEditorObjectType::WaterBody)
                     {
                         const int dx = event.x - editorMarkerDragLastX;
                         const int dy = event.y - editorMarkerDragLastY;
@@ -963,6 +1418,41 @@ int RunGame(NativeWindow& window,
                                 moveLight(*it);
                                 return;
                             }
+                        }
+                    }
+                    if (event.type == InputEvent::MouseMove && editorMarkerDragActive &&
+                        selectedEditorObject.type == SelectedEditorObjectType::WaterBody)
+                    {
+                        const int dx = event.x - editorMarkerDragLastX;
+                        const int dy = event.y - editorMarkerDragLastY;
+                        editorMarkerDragLastX = event.x;
+                        editorMarkerDragLastY = event.y;
+                        auto it = std::find_if(editorWaterBodies.begin(), editorWaterBodies.end(),
+                            [&](const WaterBody& body) { return body.id == selectedEditorObject.id; });
+                        if (it != editorWaterBodies.end())
+                        {
+                            WaterBodyEditorState state = BuildWaterBodyEditorState(editorWaterBodies, it->id);
+                            const WorldVec3 center{state.center[0], state.center[1], state.center[2]};
+                            const float scale = 0.025f * std::max(1.0f, std::sqrt(WorldDot(WorldSub(center, lastPickCamera.eye),
+                                WorldSub(center, lastPickCamera.eye))));
+                            if (editorGizmoMode == EditorGizmoMode::Translate)
+                            {
+                                const WorldVec3 moved = WorldAdd(center,
+                                    WorldAdd(WorldScale(CameraRight(lastPickCamera), static_cast<float>(dx) * scale),
+                                             WorldScale(CameraUp(lastPickCamera), static_cast<float>(-dy) * scale)));
+                                state.center[0] = moved.x;
+                                state.center[1] = moved.y;
+                                state.center[2] = moved.z;
+                            }
+                            else if (editorGizmoMode == EditorGizmoMode::Scale)
+                            {
+                                const float delta = static_cast<float>(dx - dy) * 0.05f * std::max(1.0f, scale);
+                                state.width = std::clamp(state.width + delta, 1.0f, 200.0f);
+                                state.depth = std::clamp(state.depth + delta, 1.0f, 200.0f);
+                            }
+                            ApplyWaterBodyEditorStateToBody(*it, state);
+                            editorWaterBodiesDirty = true;
+                            return;
                         }
                     }
                     terrain.HandleEditorInput(event);
@@ -1034,6 +1524,7 @@ int RunGame(NativeWindow& window,
                 if (nameplatesOk)
                     nameplates.RecreatePipeline(device);
                 noesis.OnRenderPassChanged(device);
+                editorImGui.OnRenderPassChanged(device);
                 renderSize = device.GetSwapchainExtent();
                 noesis.Resize(renderSize.width, renderSize.height);
             }
@@ -1102,6 +1593,28 @@ int RunGame(NativeWindow& window,
                     selectedEditorObject = {SelectedEditorObjectType::Marker, marker.id};
                     editorGizmoMode = EditorGizmoMode::Translate;
                     noesis.SetEditorStatus("Added and selected marker #" + std::to_string(marker.id));
+                }
+                if (commands.addWaterBody)
+                {
+                    const WorldVec3 spawnXZ = WorldAdd(frameCamera.eye, WorldScale(CameraForward(frameCamera), 8.0f));
+                    const float terrainY = terrain.SampleHeight(spawnXZ);
+                    WaterBody body{};
+                    body.id = nextEditorWaterBodyId++;
+                    body.name = "Water_" + std::to_string(body.id);
+                    body.materialId = "watermat_Default_Water";
+                    body.waterLevelY = terrainY - 0.5f;
+                    body.bboxMin[0] = spawnXZ.x - 5.0f;
+                    body.bboxMax[0] = spawnXZ.x + 5.0f;
+                    body.bboxMin[1] = spawnXZ.z - 5.0f;
+                    body.bboxMax[1] = spawnXZ.z + 5.0f;
+                    RegenerateCircularWaterMask(body);
+                    editorWaterBodies.push_back(body);
+                    selectedEditorObject = {SelectedEditorObjectType::WaterBody, body.id};
+                    selectedEditorMarkerId = 0;
+                    editorGizmoMode = EditorGizmoMode::Translate;
+                    editorWaterBodiesDirty = true;
+                    noesis.SetEditorStatus("Water body spawned: id=" + std::to_string(body.id) +
+                        " name=" + body.name);
                 }
                 if (commands.addPointLight)
                 {
@@ -1185,6 +1698,27 @@ int RunGame(NativeWindow& window,
                         selectedEditorObject = {};
                     }
                 }
+                if (commands.selectedWaterBodyChanged)
+                {
+                    auto it = std::find_if(editorWaterBodies.begin(), editorWaterBodies.end(),
+                        [&](const WaterBody& body) { return body.id == commands.selectedWaterBody.id; });
+                    if (it != editorWaterBodies.end())
+                    {
+                        ApplyWaterBodyEditorStateToBody(*it, commands.selectedWaterBody);
+                        selectedEditorObject = {SelectedEditorObjectType::WaterBody, it->id};
+                        selectedEditorMarkerId = 0;
+                        editorWaterBodiesDirty = true;
+                    }
+                }
+                if (commands.deleteSelectedWaterBody &&
+                    selectedEditorObject.type == SelectedEditorObjectType::WaterBody)
+                {
+                    editorWaterBodies.erase(std::remove_if(editorWaterBodies.begin(), editorWaterBodies.end(),
+                        [&](const WaterBody& body) { return body.id == selectedEditorObject.id; }), editorWaterBodies.end());
+                    noesis.SetEditorStatus("Water body deleted: id=" + std::to_string(selectedEditorObject.id));
+                    selectedEditorObject = {};
+                    editorWaterBodiesDirty = true;
+                }
 
                 DynamicLightEditorState dynamicLightState{};
                 dynamicLightState.pointCount = static_cast<std::uint32_t>(std::min<std::size_t>(editorPointLights.size(), kMaxDynamicPointLights));
@@ -1212,6 +1746,8 @@ int RunGame(NativeWindow& window,
                     }
                 }
                 noesis.SetDynamicLightEditorState(dynamicLightState);
+                noesis.SetWaterBodyEditorState(BuildWaterBodyEditorState(editorWaterBodies,
+                    selectedEditorObject.type == SelectedEditorObjectType::WaterBody ? selectedEditorObject.id : 0u));
 
                 LightingState lightingState = noesis.GetLightingState();
                 lightingState.numPointLights = 0;
@@ -1229,11 +1765,35 @@ int RunGame(NativeWindow& window,
                     lightingState.spotLights[lightingState.numSpotLights++] = light;
                 }
                 terrain.SetLightingState(lightingState);
-                terrain.SetWaterConfig(noesis.GetWaterConfig());
+                terrain.SetWaterMaterials(noesis.GetWaterMaterialsSnapshot());
+                if (editorWaterBodiesDirty)
+                {
+                    terrain.SetWaterBodies(device, editorWaterBodies);
+                    editorWaterBodies = terrain.GetWaterBodies();
+                    if (waterSculptMeshRegenPending &&
+                        selectedEditorObject.type == SelectedEditorObjectType::WaterBody)
+                    {
+                        auto bodyIt = std::find_if(editorWaterBodies.begin(), editorWaterBodies.end(),
+                            [&](const WaterBody& body) { return body.id == selectedEditorObject.id; });
+                        if (bodyIt != editorWaterBodies.end())
+                        {
+                            const std::uint32_t activeCells = static_cast<std::uint32_t>(
+                                std::count_if(bodyIt->shapeMask.begin(), bodyIt->shapeMask.end(),
+                                    [](std::uint8_t value) { return value != 0; }));
+                            Tracenf("[WATER-OBJ-5] Mesh regenerated: body_id=%u cells_active=%u mask=%ux%u",
+                                bodyIt->id,
+                                activeCells,
+                                bodyIt->maskWidth,
+                                bodyIt->maskHeight);
+                        }
+                    }
+                    waterSculptMeshRegenPending = false;
+                    editorWaterBodiesDirty = false;
+                }
+                terrain.SetSelectedWaterBodyHighlight(device, 0u);
                 if (warriorOk)
                 {
                     warrior.SetLightingState(lightingState);
-                    warrior.SetWaterConfig(noesis.GetWaterConfig());
                 }
                 if (commands.paletteSlotChanged)
                 {
@@ -1247,16 +1807,28 @@ int RunGame(NativeWindow& window,
                 if (commands.save)
                     terrain.RequestEditorSave();
                 if (commands.reload)
+                {
                     terrain.RequestEditorReload();
+                    selectedEditorObject = {};
+                    selectedEditorMarkerId = 0;
+                }
                 if (commands.undo)
                     terrain.RequestEditorUndo();
                 terrain.UpdateEditor(device, deltaSeconds, frameCamera, renderSize.width, renderSize.height);
+                if (commands.reload)
+                {
+                    editorWaterBodies = terrain.GetWaterBodies();
+                    editorWaterBodiesDirty = false;
+                    for (const WaterBody& body : editorWaterBodies)
+                        nextEditorWaterBodyId = std::max(nextEditorWaterBodyId, body.id + 1u);
+                }
             }
         }
 
         device.BeginFrame();
         if (device.IsFrameActive())
         {
+            editorImGui.BeginFrame(noesis.IsMapEditorOpen());
             const bool isInWorld = noesis.IsInWorld();
             std::vector<WorldRenderEntity> entities;
             WorldCamera camera{};
@@ -1308,12 +1880,14 @@ int RunGame(NativeWindow& window,
                 terrain.RenderWaterReflection(device,
                     frameCamera,
                     seconds,
-                    [&](const WorldCamera& mirrorCamera, VkExtent2D reflectionExtent, VkRenderPass reflectionRenderPass)
+                    [&](const WorldCamera& mirrorCamera,
+                        VkExtent2D reflectionExtent,
+                        VkRenderPass reflectionRenderPass,
+                        float waterLevelY)
                     {
                         if (!warriorOk)
                             return;
 
-                        const float waterLevelY = noesis.GetWaterConfig().waterLevelY;
                         uint32_t skinSlot = 0;
                         for (const auto& entity : entities)
                         {
@@ -1554,7 +2128,9 @@ int RunGame(NativeWindow& window,
                     }
                 }
                 if (!useOffscreenScene && terrainOk)
+                {
                     terrain.RenderWater(device, camera, seconds);
+                }
                 if (!useOffscreenScene && nameplatesOk)
                     nameplates.Render(device, camera, plates);
             }
@@ -1581,6 +2157,7 @@ int RunGame(NativeWindow& window,
                     nameplates.Render(device, camera, plates);
             }
             noesis.RenderOnscreen(device);
+            editorImGui.Render(device);
         }
         device.EndFrame();
     }
@@ -1595,6 +2172,11 @@ int RunGame(NativeWindow& window,
         terrain.Destroy();
     if (warriorOk)
         warrior.Destroy();
+    editorImGui.Destroy();
+#if defined(_WIN32)
+    if (NativeWindow_Win32* cleanupWin32Window = dynamic_cast<NativeWindow_Win32*>(&window))
+        cleanupWin32Window->SetMessageCallback({});
+#endif
     noesis.Destroy();
     device.Destroy();
     return 0;
