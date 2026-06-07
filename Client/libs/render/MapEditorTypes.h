@@ -20,11 +20,22 @@ enum class MapEditorPaintMode
     Mix
 };
 
+enum class MapEditorToolMode
+{
+    None,
+    WaterSculpt,
+    Heightmap,
+    SplatPaint
+};
+
 struct MapEditorSettings
 {
+    MapEditorToolMode toolMode = MapEditorToolMode::None;
     MapEditorTool tool = MapEditorTool::Raise;
     float brushRadiusMeters = 5.0f;
     float brushStrength = 1.0f;
+    float brushFalloff = 1.0f;
+    float flattenTargetY = 0.0f;
     std::uint32_t textureSlot = 4;
     MapEditorPaintMode paintMode = MapEditorPaintMode::Replace;
     bool waterSculptActive = false;
@@ -220,6 +231,13 @@ enum class DynamicLightType
     Spot
 };
 
+enum class MapEditorGizmoOperation
+{
+    Translate,
+    Rotate,
+    Scale
+};
+
 struct DynamicLightEditorState
 {
     DynamicLightType type = DynamicLightType::None;
@@ -235,10 +253,12 @@ struct MapEditorCommands
     bool save = false;
     bool reload = false;
     bool undo = false;
-    bool addTestMarker = false;
     bool addWaterBody = false;
     bool deleteSelectedWaterBody = false;
     bool selectedWaterBodyChanged = false;
+    bool openSelectedWaterMaterialEditor = false;
+    bool waterMaterialDeleted = false;
+    std::string deletedWaterMaterialId;
     WaterBodyEditorState selectedWaterBody;
     bool addPointLight = false;
     bool addSpotLight = false;
@@ -249,4 +269,9 @@ struct MapEditorCommands
     std::uint32_t paletteSlot = 0;
     std::string paletteAssetId;
     std::string paletteTexturePath;
+    MapEditorPaletteSlot paletteSlotData;
+    bool gizmoSettingsChanged = false;
+    MapEditorGizmoOperation gizmoOperation = MapEditorGizmoOperation::Translate;
+    bool gizmoSnapEnabled = false;
+    float gizmoSnapValue = 1.0f;
 };

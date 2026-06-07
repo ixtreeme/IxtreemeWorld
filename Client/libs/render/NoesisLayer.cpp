@@ -1438,8 +1438,6 @@ struct NoesisLayer::Impl
             button->Click() += Noesis::MakeDelegate(this, &Impl::OnEditorReloadClicked);
         if (Noesis::Button* button = root->FindName<Noesis::Button>("UndoButton"))
             button->Click() += Noesis::MakeDelegate(this, &Impl::OnEditorUndoClicked);
-        if (Noesis::Button* button = root->FindName<Noesis::Button>("AddMarkerButton"))
-            button->Click() += Noesis::MakeDelegate(this, &Impl::OnAddMarkerClicked);
         if (Noesis::Button* button = root->FindName<Noesis::Button>("AddWaterBodyButton"))
             button->Click() += Noesis::MakeDelegate(this, &Impl::OnAddWaterBodyClicked);
         if (Noesis::Button* button = root->FindName<Noesis::Button>("LightingButton"))
@@ -1953,8 +1951,6 @@ struct NoesisLayer::Impl
 
         applyBorder("ToolsPanelBorder", panelBrush.GetPtr());
         applyBorder("InspectorPanelBorder", panelBrush.GetPtr());
-        applyBorder("AssetBrowserPanelBorder", panelBrush.GetPtr());
-        applyBorder("AssetFolderPanelBorder", inputBrush.GetPtr());
 
         auto applyTextBox = [&](Noesis::TextBox* textBox) {
             if (!textBox)
@@ -2554,8 +2550,12 @@ struct NoesisLayer::Impl
     void OnWaterMaterialEditorSectionClicked(Noesis::BaseComponent*, const Noesis::RoutedEventArgs&)
     {
         waterMaterialEditorExpanded = !waterMaterialEditorExpanded;
-        if (waterMaterialEditorExpanded && editingWaterMaterialId.empty())
-            OpenWaterMaterialEditor(waterBodyEditorState.materialId);
+        if (waterMaterialEditorExpanded && waterBodyEditorState.selected)
+        {
+            editorCommands.selectedWaterBodyChanged = true;
+            editorCommands.selectedWaterBody = waterBodyEditorState;
+            editorCommands.openSelectedWaterMaterialEditor = true;
+        }
         UpdateInspectorSections();
     }
 
@@ -2566,7 +2566,10 @@ struct NoesisLayer::Impl
             SetAssetStatus("Select a water body first");
             return;
         }
-        OpenWaterMaterialEditor(waterBodyEditorState.materialId);
+        editorCommands.selectedWaterBodyChanged = true;
+        editorCommands.selectedWaterBody = waterBodyEditorState;
+        editorCommands.openSelectedWaterMaterialEditor = true;
+        SetAssetStatus("Opening ImGui water material editor");
     }
 
     void OnSaveWaterMaterialClicked(Noesis::BaseComponent*, const Noesis::RoutedEventArgs&)
@@ -3101,14 +3104,12 @@ struct NoesisLayer::Impl
 
     WaterConfig& EditedWaterConfig()
     {
-        if (editingWaterMaterialId.empty())
-            OpenWaterMaterialEditor(waterBodyEditorState.materialId);
-        return editingWaterMaterial.config;
+        return editingWaterMaterialId.empty() ? waterBodyEditorState.config : editingWaterMaterial.config;
     }
 
     const WaterConfig& EditedWaterConfig() const
     {
-        return editingWaterMaterial.config;
+        return editingWaterMaterialId.empty() ? waterBodyEditorState.config : editingWaterMaterial.config;
     }
 
     void SetWaterBodyEditorState(const WaterBodyEditorState& state)
@@ -3857,7 +3858,11 @@ struct NoesisLayer::Impl
         MarkSelectedWaterBodyChanged();
         UpdateWaterBodyText();
         if (entry.category == AssetLibrary::Category::WaterMaterial)
-            OpenWaterMaterialEditor(entry.id);
+        {
+            editorCommands.selectedWaterBodyChanged = true;
+            editorCommands.selectedWaterBody = waterBodyEditorState;
+            editorCommands.openSelectedWaterMaterialEditor = true;
+        }
         else
             editingWaterMaterialId.clear();
         SetAssetStatus("Water body material <- " + entry.displayName);
@@ -5761,13 +5766,6 @@ struct NoesisLayer::Impl
         editorCommands.undo = true;
     }
 
-    void OnAddMarkerClicked(Noesis::BaseComponent*, const Noesis::RoutedEventArgs&)
-    {
-        SetLightingModeActive(false);
-        editorCommands.addTestMarker = true;
-        SetAssetStatus("Adding test marker in front of the editor camera");
-    }
-
     void OnAddWaterBodyClicked(Noesis::BaseComponent*, const Noesis::RoutedEventArgs&)
     {
         SetLightingModeActive(true);
@@ -5971,7 +5969,7 @@ struct NoesisLayer::Impl
 
             if (assetCategory == AssetLibrary::Category::WaterMaterial)
             {
-                OpenWaterMaterialEditor(entry.id);
+                SetAssetStatus("Open water materials from the ImGui Asset Browser");
                 return;
             }
 
@@ -7392,6 +7390,12 @@ std::vector<std::pair<std::string, WaterMaterialData>> NoesisLayer::GetWaterMate
         }
     }
     return materials;
+}
+
+void NoesisLayer::ImportAsset(AssetLibrary::Category category)
+{
+    if (m_impl)
+        m_impl->ImportAsset(category);
 }
 
 std::array<MapEditorPaletteSlot, 8> NoesisLayer::GetPaletteSlots() const

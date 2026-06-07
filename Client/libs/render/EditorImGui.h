@@ -1,6 +1,8 @@
 #pragma once
 
+#include "AssetLibrary.h"
 #include "InputEvent.h"
+#include "MapEditorTypes.h"
 
 #if defined(_WIN32) && !defined(VK_USE_PLATFORM_WIN32_KHR)
 #define VK_USE_PLATFORM_WIN32_KHR
@@ -9,6 +11,14 @@
 #include <vulkan/vulkan.h>
 
 #include <cstdint>
+#include <array>
+#include <filesystem>
+#include <functional>
+#include <unordered_map>
+#include <memory>
+#include <string>
+#include <utility>
+#include <vector>
 
 #if defined(_WIN32)
 #include <windows.h>
@@ -33,12 +43,118 @@ public:
     void Render(VulkanDevice& device);
     void OnRenderPassChanged(VulkanDevice& device);
     bool WantsInputCapture(const InputEvent& event) const;
+    void SetMapEditorSettings(const MapEditorSettings& settings);
+    MapEditorSettings GetMapEditorSettings() const { return m_editorSettings; }
+    void SetLightingState(const LightingState& state);
+    LightingState GetLightingState() const { return m_lightingState; }
+    void SetDynamicLightEditorState(const DynamicLightEditorState& state);
+    void SetWaterBodyEditorState(const WaterBodyEditorState& state);
+    void SetWaterMaterials(std::vector<std::pair<std::string, WaterMaterialData>> materials);
+    void SetWaterMaterialUsageCounts(std::vector<std::pair<std::string, std::uint32_t>> usageCounts);
+    std::vector<std::pair<std::string, WaterMaterialData>> GetWaterMaterialsSnapshot() const;
+    void SetPaletteSlots(const std::array<MapEditorPaletteSlot, 8>& slots);
+    void InitializeAssetLibrary(const std::filesystem::path& clientRoot);
+    void RefreshAssetLibrary();
+    bool OpenWaterMaterialEditor(const std::string& materialId);
+    bool OpenPbrMaterialEditor(const std::string& materialId);
+    MapEditorCommands ConsumeCommands();
     void Destroy();
 
 private:
+    enum class AssetBrowserFilter
+    {
+        All,
+        Texture,
+        Model,
+        Animation,
+        Material,
+        WaterMaterial
+    };
+
     bool CreateDescriptorPool(VulkanDevice& device);
     bool InitVulkanBackend(VulkanDevice& device);
+    void RenderEditorPanels();
     void RenderDemoPanels();
+    void RenderDockSpace();
+    void RenderToolsPanel();
+    void RenderInspector();
+    void RenderSelectedWaterBodyInspector();
+    void RenderSelectedLightInspector();
+    void RenderLightingPanel();
+    void RenderDynamicLightsPanel();
+    void RenderGizmoControls();
+    void RenderWaterSculptToolPanel();
+    void RenderHeightmapToolPanel();
+    void RenderSplatPaintToolPanel();
+    void RenderSplatLayerSlot(std::uint32_t slotIndex);
+    void RenderWaterMaterialEditor();
+    void RenderWaterMaterialHeader();
+    void RenderWaterMaterialColorsSection(WaterMaterialData& material);
+    void RenderWaterMaterialWaveSection(WaterMaterialData& material);
+    void RenderWaterMaterialFoamSection(WaterMaterialData& material);
+    void RenderWaterMaterialCausticSection(WaterMaterialData& material);
+    void RenderWaterMaterialReflectionSection(WaterMaterialData& material);
+    void RenderWaterMaterialRefractionSection(WaterMaterialData& material);
+    void RenderWaterMaterialEdgeFadeSection(WaterMaterialData& material);
+    void RenderWaterMaterialTexturesSection(WaterMaterialData& material);
+    void RenderWaterTextureSlot(const char* label, std::string& texturePath, bool& changed);
+    void RenderPbrMaterialEditor();
+    void RenderPbrMaterialHeader();
+    void RenderPbrTextureSlot(const char* label, std::string& textureId, bool& changed);
+    void RenderAssetBrowser();
+    void RenderAssetBrowserToolbar();
+    void RenderAssetTypeTabs();
+    void RenderAssetFolderPanel();
+    void RenderAssetFolderNode(const std::string& path, const std::vector<std::string>& folders);
+    void RenderAssetGrid();
+    void RenderAssetTile(const AssetLibrary::Entry& entry, float tileSize);
+    void RenderAssetTagFilters();
+    void CreateAssetFolder();
+    void DeleteAssetFolder();
+    void DeleteAsset(const AssetLibrary::Entry& entry);
+    void ImportAssetWithDialog(AssetLibrary::Category category);
+    void CreatePbrMaterialAsset();
+    void CreateWaterMaterialAsset();
+    bool CreateWaterMaterialAsset(const std::string& displayName, AssetLibrary::Entry& outEntry);
+    void AssignAssetToSelectedWaterBody(const std::string& assetId);
+    void MarkWaterMaterialChanged(const char* field);
+    void MarkPbrMaterialChanged(const char* field);
+    bool SaveWaterMaterialEditor();
+    bool SavePbrMaterialEditor();
+    bool DeleteWaterMaterialEditor();
+    void SyncWaterMaterialSnapshot();
+    std::vector<AssetLibrary::Entry> QueryVisibleAssets() const;
+    std::vector<std::string> QueryVisibleFolders() const;
+    std::vector<std::pair<std::string, std::uint32_t>> QueryVisibleTags() const;
+    bool AssetPassesCurrentFilters(const AssetLibrary::Entry& entry) const;
+    bool ActiveAssetCategory(AssetLibrary::Category category) const;
+    AssetLibrary::Category FolderCategory() const;
+    const char* AssetFilterName() const;
+    void ApplyTimeOfDayPreset(float hour);
+    void MarkSelectedWaterBodyChanged();
+    void MarkSelectedLightChanged();
+    void SetToolMode(MapEditorToolMode mode);
+    MapEditorPaletteSlot BuildPaletteSlotFromAsset(std::uint32_t slotIndex, const AssetLibrary::Entry& entry) const;
+
+    struct WaterMaterialEditorState
+    {
+        bool windowOpen = false;
+        bool dirty = false;
+        std::string materialId;
+        WaterMaterialData draft;
+        char name[96]{};
+        char newName[96] = "Water_Material";
+    };
+
+    struct PbrMaterialEditorState
+    {
+        bool windowOpen = false;
+        bool dirty = false;
+        std::string materialId;
+        AssetLibrary::MaterialData draft;
+        char name[96]{};
+        char newName[96] = "material";
+    };
 
     VkDevice m_device = VK_NULL_HANDLE;
     VkDescriptorPool m_descriptorPool = VK_NULL_HANDLE;
@@ -46,6 +162,37 @@ private:
     bool m_vulkanBackendReady = false;
     bool m_frameActive = false;
     bool m_editorModeActive = false;
-    bool m_showDemoWindow = true;
+    bool m_showDemoWindow = false;
+    bool m_applyDefaultDockLayout = false;
+    bool m_defaultDockLayoutBuilt = false;
+    bool m_logToolsRendered = false;
+    bool m_logInspectorRendered = false;
+    MapEditorGizmoOperation m_gizmoOperation = MapEditorGizmoOperation::Translate;
+    bool m_gizmoSnapEnabled = false;
+    int m_gizmoSnapIndex = 2;
+    float m_gizmoSnapValue = 1.0f;
+    MapEditorSettings m_editorSettings;
+    LightingState m_lightingState;
+    DynamicLightEditorState m_dynamicLightState;
+    WaterBodyEditorState m_waterBodyState;
+    MapEditorCommands m_commands;
+    std::array<MapEditorPaletteSlot, 8> m_paletteSlots{};
+    std::vector<std::pair<std::string, WaterMaterialData>> m_waterMaterials;
+    std::unordered_map<std::string, std::uint32_t> m_waterMaterialUsageCounts;
+    WaterMaterialEditorState m_waterMaterialEditor;
+    PbrMaterialEditorState m_pbrMaterialEditor;
+    std::unique_ptr<AssetLibrary> m_assetLibrary;
+    bool m_waterSculptToolOpen = false;
+    bool m_heightmapToolOpen = false;
+    bool m_splatPaintToolOpen = false;
+    AssetBrowserFilter m_assetFilter = AssetBrowserFilter::All;
+    std::string m_assetSubpath;
+    std::string m_selectedAssetId;
+    std::vector<std::string> m_activeAssetTags;
+    std::string m_assetStatus;
+    char m_assetSearchBuffer[128]{};
+    char m_newAssetFolderName[64]{};
+    bool m_assetBrowserLogged = false;
+    float m_timeOfDayHours = 12.0f;
     uint64_t m_lastLoggedFrame = UINT64_MAX;
 };

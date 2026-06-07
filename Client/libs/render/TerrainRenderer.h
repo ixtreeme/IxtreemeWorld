@@ -461,6 +461,7 @@ private:
     bool m_editorStrokeActive = false;
     bool m_editorCtrlHeld = false;
     bool m_editorBrushVisible = false;
+    bool m_editorTerrainToolActive = false;
     bool m_waterSculptBrushVisible = false;
     bool m_waterSculptBrushAddMode = true;
     bool m_editorSplatGpuDirty = false;
@@ -479,6 +480,7 @@ private:
     float m_editorFlattenTargetCm = 0.0f;
     bool m_editorHasFlattenTarget = false;
     MapEditorTool m_editorTool = MapEditorTool::Raise;
+    MapEditorToolMode m_editorToolMode = MapEditorToolMode::None;
     MapEditorPaintMode m_editorPaintMode = MapEditorPaintMode::Replace;
     std::uint32_t m_editorTextureSlot = 4;
     LightingState m_lightingState;

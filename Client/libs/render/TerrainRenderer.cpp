@@ -2131,6 +2131,10 @@ void TerrainRenderer::SetMapEditorOpen(bool open)
 
 void TerrainRenderer::SetMapEditorSettings(const MapEditorSettings& settings)
 {
+    m_editorToolMode = settings.toolMode;
+    m_editorTerrainToolActive =
+        settings.toolMode == MapEditorToolMode::Heightmap ||
+        settings.toolMode == MapEditorToolMode::SplatPaint;
     m_editorTool = settings.tool;
     m_editorBrushRadiusMeters = std::clamp(settings.brushRadiusMeters, 0.5f, 50.0f);
     m_editorBrushStrength = std::clamp(settings.brushStrength, 0.1f, 5.0f);
@@ -2568,7 +2572,8 @@ void TerrainRenderer::UpdateEditor(VulkanDevice& device,
                                    uint32_t viewportWidth,
                                    uint32_t viewportHeight)
 {
-    if (m_mapEditorOpen && m_walkabilityDebug && m_mapLoaded)
+    const bool editorBrushActive = m_walkabilityDebug || m_editorTerrainToolActive;
+    if (m_mapEditorOpen && editorBrushActive && m_mapLoaded)
         RaycastEditorBrush(camera, viewportWidth, viewportHeight);
     else
     {
@@ -2598,7 +2603,7 @@ void TerrainRenderer::UpdateEditor(VulkanDevice& device,
         UndoLastEditorStroke(device);
     }
 
-    if (!m_walkabilityDebug || !m_mapLoaded)
+    if (!editorBrushActive || !m_mapLoaded)
         return;
 
     if (m_mapEditorOpen)

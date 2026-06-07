@@ -43,6 +43,7 @@ target_compile_definitions(client_render
         NS_APP_PROVIDERS_API=
         NS_APP_APPLICATIONLAUNCHER_API=
         NS_RENDER_VKRENDERDEVICE_API=
+        $<$<BOOL:${IXTREEME_WITH_EDITOR}>:IXTREEME_WITH_EDITOR=1>
         $<$<PLATFORM_ID:Windows>:WIN32_LEAN_AND_MEAN>
         $<$<PLATFORM_ID:Windows>:NOMINMAX>
         $<$<PLATFORM_ID:Windows>:_WIN32_WINNT=0x0601>
@@ -62,12 +63,18 @@ if(WIN32)
     target_link_libraries(client_render
         PUBLIC
             Vulkan::Vulkan
-            imgui::imgui
             "${NOESIS_SDK}/Lib/windows_x86_64/Noesis.lib"
             Gdi32
             Advapi32
-            Comdlg32
     )
+    if(IXTREEME_WITH_EDITOR)
+        target_link_libraries(client_render
+            PUBLIC
+                imgui::imgui
+                imguizmo::imguizmo
+                Comdlg32
+        )
+    endif()
 elseif(ANDROID)
     target_link_libraries(client_render
         PUBLIC

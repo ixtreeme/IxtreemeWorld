@@ -708,6 +708,11 @@ bool RunRenderChecks(const Options& options, TestContext& ctx)
     std::stringstream noesisLayerHeaderText;
     noesisLayerHeaderText << noesisLayerHeader.rdbuf();
     const std::string noesisLayerHeaderSource = noesisLayerHeaderText.str();
+    const std::filesystem::path editorImGuiPath = options.clientRoot / "libs" / "render" / "EditorImGui.cpp";
+    std::ifstream editorImGui(editorImGuiPath);
+    std::stringstream editorImGuiText;
+    editorImGuiText << editorImGui.rdbuf();
+    const std::string editorImGuiSource = editorImGuiText.str();
     const std::filesystem::path editorPanelPath = options.clientRoot / "assets" / "xaml" / "EditorPanel.xaml";
     std::ifstream editorPanel(editorPanelPath);
     std::stringstream editorPanelText;
@@ -718,38 +723,60 @@ bool RunRenderChecks(const Options& options, TestContext& ctx)
     std::stringstream clientMainText;
     clientMainText << clientMain.rdbuf();
     const std::string clientMainSource = clientMainText.str();
+    const std::filesystem::path rootCmakePath = options.clientRoot / "CMakeLists.txt";
+    std::ifstream rootCmake(rootCmakePath);
+    std::stringstream rootCmakeText;
+    rootCmakeText << rootCmake.rdbuf();
+    const std::string rootCmakeSource = rootCmakeText.str();
+    const std::filesystem::path renderCmakePath = options.clientRoot / "libs" / "render" / "CMakeLists.txt";
+    std::ifstream renderCmake(renderCmakePath);
+    std::stringstream renderCmakeText;
+    renderCmakeText << renderCmake.rdbuf();
+    const std::string renderCmakeSource = renderCmakeText.str();
+    ctx.Expect(rootCmakeSource.find("option(IXTREEME_WITH_EDITOR") != std::string::npos &&
+            rootCmakeSource.find("if(IXTREEME_WITH_EDITOR)\n    vcpkg_require(imguizmo)") != std::string::npos &&
+            rootCmakeSource.find("if(WIN32 AND IXTREEME_WITH_EDITOR)") != std::string::npos &&
+            renderCmakeSource.find("$<$<BOOL:${IXTREEME_WITH_EDITOR}>:IXTREEME_WITH_EDITOR=1>") != std::string::npos &&
+            renderCmakeSource.find("if(IXTREEME_WITH_EDITOR)") != std::string::npos &&
+            editorImGuiSource.find("#if defined(IXTREEME_WITH_EDITOR) && defined(_WIN32)") != std::string::npos &&
+            clientMainSource.find("[BUILD] Editor: DISABLED") != std::string::npos,
+        "editor build flag gates imgui pipeline", "IXTREEME_WITH_EDITOR must gate ImGui/ImGuizmo dependencies and runtime editor startup");
     ctx.Expect(editorPanelSource.find("AddWaterBodyButton") != std::string::npos &&
             editorPanelSource.find("SelectedWaterBodySection") != std::string::npos &&
             noesisLayerSource.find("OnAddWaterBodyClicked") != std::string::npos &&
             noesisLayerSource.find("SetWaterBodyEditorState") != std::string::npos,
         "water object editor UI source", "WATER-OBJ-3 editor button/inspector binding is missing");
-    ctx.Expect(editorPanelSource.find("SelectedWaterSculptButton") != std::string::npos &&
-            editorPanelSource.find("WaterSculptAddButton") != std::string::npos &&
-            editorPanelSource.find("WaterSculptRemoveButton") != std::string::npos &&
-            editorPanelSource.find("WaterSculptRadiusSlider") != std::string::npos &&
-            noesisLayerSource.find("waterSculptActive") != std::string::npos &&
-            noesisLayerSource.find("settings.waterSculptActive") != std::string::npos,
-        "water sculpt inspector UI source", "WATER-OBJ-5 Sculpt Mode UI/binding is missing");
-    ctx.Expect(editorPanelSource.find("WaterEdgeFadeSectionButton") != std::string::npos &&
-            editorPanelSource.find("WaterEdgeFadeDistanceSlider") != std::string::npos &&
-            editorPanelSource.find("WaterEdgeFadeLinearButton") != std::string::npos &&
-            editorPanelSource.find("WaterEdgeFadeSmoothButton") != std::string::npos &&
-            editorPanelSource.find("WaterEdgeFadeExponentialButton") != std::string::npos &&
-            noesisLayerSource.find("OnWaterEdgeFadeDistanceChanged") != std::string::npos &&
-            noesisLayerSource.find("edgeFadeCurve = WaterConfig::EdgeFadeCurve::Smooth") != std::string::npos,
-        "water edge fade inspector UI source", "WATER-OBJ-6 Edge Fade material controls are missing");
+    ctx.Expect(editorPanelSource.find("SelectedWaterSculptButton") == std::string::npos &&
+            editorPanelSource.find("BrushRadiusSlider") == std::string::npos &&
+            editorPanelSource.find("ToolPaint") == std::string::npos &&
+            editorPanelSource.find("Slot0Button") == std::string::npos &&
+            editorImGuiSource.find("RenderWaterSculptToolPanel") != std::string::npos &&
+            editorImGuiSource.find("RenderHeightmapToolPanel") != std::string::npos &&
+            editorImGuiSource.find("RenderSplatPaintToolPanel") != std::string::npos &&
+            editorImGuiSource.find("ImportAssetWithDialog") != std::string::npos &&
+            editorImGuiSource.find("PickAssetFileForImport") != std::string::npos &&
+            clientMainSource.find("editorSettings.toolMode == MapEditorToolMode::Heightmap") != std::string::npos &&
+            clientMainSource.find("editorSettings.toolMode == MapEditorToolMode::SplatPaint") != std::string::npos,
+        "editor tool ui moved to imgui", "EDITOR-IMGUI-5 tool panels/import routing are missing or Noesis tool XAML remains");
+    ctx.Expect(editorImGuiSource.find("RenderWaterMaterialEdgeFadeSection") != std::string::npos &&
+            editorImGuiSource.find("SliderFloat(\"Edge Fade Distance\"") != std::string::npos &&
+            editorImGuiSource.find("Combo(\"Edge Fade Curve\"") != std::string::npos &&
+            editorImGuiSource.find("WaterConfig::EdgeFadeCurve") != std::string::npos,
+        "water edge fade imgui material editor source", "WATER-OBJ-6 Edge Fade material controls are missing from ImGui");
     const auto selectedWaterSectionPos = editorPanelSource.find("SelectedWaterBodySection");
-    const auto waterMaterialEditorPos = editorPanelSource.find("WaterMaterialEditorSection");
-    const auto waterBaseSectionPos = editorPanelSource.find("WaterBaseSectionButton");
     const auto dynamicLightsSectionPos = editorPanelSource.find("DynamicLightsSectionButton");
-    ctx.Expect(waterBaseSectionPos != std::string::npos &&
-            selectedWaterSectionPos != std::string::npos &&
+    ctx.Expect(selectedWaterSectionPos != std::string::npos &&
             dynamicLightsSectionPos != std::string::npos &&
-            waterMaterialEditorPos != std::string::npos &&
+            editorPanelSource.find("WaterMaterialEditorSection") == std::string::npos &&
+            editorPanelSource.find("WaterBaseSectionButton") == std::string::npos &&
+            editorPanelSource.find("MaterialDiffuseButton") == std::string::npos &&
+            editorImGuiSource.find("RenderWaterMaterialEditor") != std::string::npos &&
+            editorImGuiSource.find("RenderPbrMaterialEditor") != std::string::npos &&
+            editorImGuiSource.find("RenderWaterTextureSlot") != std::string::npos &&
+            editorImGuiSource.find("AcceptDragDropPayload(kAssetPayloadType)") != std::string::npos &&
             dynamicLightsSectionPos < selectedWaterSectionPos &&
-            selectedWaterSectionPos < waterMaterialEditorPos &&
-            waterMaterialEditorPos < waterBaseSectionPos,
-        "water controls live under material editor", "Water controls must be scoped to the Water Material Editor, not the Selected Water Body inspector");
+            clientMainSource.find("editorImGui.OpenWaterMaterialEditor(materialId)") != std::string::npos,
+        "material editors moved to imgui", "Noesis material editor UI must be removed and ImGui material editors must handle water/PBR editing");
     ctx.Expect(noesisLayerSource.find("WaterConfig waterConfig;") == std::string::npos &&
             noesisLayerSource.find("EditedWaterConfig()") != std::string::npos &&
             noesisLayerHeaderSource.find("GetWaterConfig") == std::string::npos,
@@ -783,7 +810,7 @@ bool RunRenderChecks(const Options& options, TestContext& ctx)
     ctx.Expect(clientMainSource.find("GetWaterConfig") == std::string::npos &&
             clientMainSource.find("SetWaterConfig") == std::string::npos &&
             clientMainSource.find("body.config = state.config") == std::string::npos &&
-            clientMainSource.find("SetWaterMaterials(noesis.GetWaterMaterialsSnapshot())") != std::string::npos,
+            clientMainSource.find("SetWaterMaterials(editorImGui.GetWaterMaterialsSnapshot())") != std::string::npos,
         "water body uses material reference", "Client main must not copy material config into WaterBody");
     ctx.Expect(clientMainSource.find("terrain.SetSelectedWaterBodyHighlight(device, 0u)") != std::string::npos &&
             clientMainSource.find("RenderSelectedWaterBodyHighlight(device, camera)") == std::string::npos &&

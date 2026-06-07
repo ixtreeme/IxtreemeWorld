@@ -1,5 +1,6 @@
 #pragma once
 
+#include "AssetLibrary.h"
 #include "InputEvent.h"
 #include "MapEditorTypes.h"
 #include "network/IClientHandler.h"
@@ -68,6 +69,7 @@ public:
     void InitializeAssetLibrary(const std::string& mapDirectory,
                                 const std::array<MapEditorPaletteSlot, 8>& defaultSlots);
     std::vector<std::pair<std::string, WaterMaterialData>> GetWaterMaterialsSnapshot() const;
+    void ImportAsset(AssetLibrary::Category category);
     std::array<MapEditorPaletteSlot, 8> GetPaletteSlots() const;
     void SetEditorStatus(const std::string& status);
     void ImportDroppedFiles(const std::vector<std::string>& paths);

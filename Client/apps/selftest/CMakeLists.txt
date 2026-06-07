@@ -13,6 +13,7 @@ target_compile_features(IwSelfTest PRIVATE cxx_std_20)
 target_compile_definitions(IwSelfTest
     PRIVATE
         IW_CLIENT_SOURCE_ROOT="${CLIENT_ROOT}"
+        $<$<BOOL:${IXTREEME_WITH_EDITOR}>:IXTREEME_WITH_EDITOR=1>
 )
 
 if(WIN32)

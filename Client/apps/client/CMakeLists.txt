@@ -24,6 +24,11 @@ target_link_libraries(VulkanClear
 
 target_compile_features(VulkanClear PRIVATE cxx_std_20)
 
+target_compile_definitions(VulkanClear
+    PRIVATE
+        $<$<BOOL:${IXTREEME_WITH_EDITOR}>:IXTREEME_WITH_EDITOR=1>
+)
+
 if(WIN32)
     if(TARGET ClientShaders)
         add_dependencies(VulkanClear ClientShaders)

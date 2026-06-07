@@ -614,6 +614,13 @@ bool VulkanDevice::CreateSwapchainObjects(uint32_t width, uint32_t height)
 bool VulkanDevice::CreateSwapchain(uint32_t width, uint32_t height)
 {
     SwapchainSupport support = QuerySwapchainSupport(m_physicalDevice);
+    if (support.formats.empty() || support.presentModes.empty())
+    {
+        Log("[VULKAN] Swap-chain create skipped: surface has no formats or present modes available.");
+        m_swapchainDirty = true;
+        return false;
+    }
+
     VkSurfaceFormatKHR format = ChooseSurfaceFormat(support.formats);
     VkExtent2D extent = ChooseExtent(support.capabilities, width, height);
     VkSurfaceTransformFlagBitsKHR preTransform = support.capabilities.currentTransform;
@@ -690,7 +697,18 @@ bool VulkanDevice::CreateSwapchain(uint32_t width, uint32_t height)
         width,
         height);
 
-    VK_CHECK(vkCreateSwapchainKHR(m_device, &create, nullptr, &m_swapchain));
+    const VkResult createResult = vkCreateSwapchainKHR(m_device, &create, nullptr, &m_swapchain);
+    if (createResult == VK_ERROR_SURFACE_LOST_KHR ||
+        createResult == VK_ERROR_OUT_OF_DATE_KHR ||
+        createResult == VK_ERROR_INITIALIZATION_FAILED)
+    {
+        LogFormat("[VULKAN] Swap-chain create deferred: %s", VkResultName(createResult));
+        m_swapchainDirty = true;
+        m_swapchain = VK_NULL_HANDLE;
+        return false;
+    }
+    CheckVk(createResult, "vkCreateSwapchainKHR", __FILE__, __LINE__);
+
     VK_CHECK(vkGetSwapchainImagesKHR(m_device, m_swapchain, &imageCount, nullptr));
     m_swapchainImages.resize(imageCount);
     VK_CHECK(vkGetSwapchainImagesKHR(m_device, m_swapchain, &imageCount, m_swapchainImages.data()));
@@ -978,16 +996,50 @@ VulkanDevice::QueueFamilies VulkanDevice::FindQueueFamilies(VkPhysicalDevice dev
 VulkanDevice::SwapchainSupport VulkanDevice::QuerySwapchainSupport(VkPhysicalDevice device) const
 {
     SwapchainSupport support{};
-    VK_CHECK(vkGetPhysicalDeviceSurfaceCapabilitiesKHR(device, m_surface, &support.capabilities));
+    VkResult result = vkGetPhysicalDeviceSurfaceCapabilitiesKHR(device, m_surface, &support.capabilities);
+    if (result != VK_SUCCESS)
+    {
+        LogFormat("[VULKAN] Surface capabilities unavailable: %s", VkResultName(result));
+        return support;
+    }
 
     uint32_t count = 0;
-    VK_CHECK(vkGetPhysicalDeviceSurfaceFormatsKHR(device, m_surface, &count, nullptr));
+    result = vkGetPhysicalDeviceSurfaceFormatsKHR(device, m_surface, &count, nullptr);
+    if (result != VK_SUCCESS)
+    {
+        LogFormat("[VULKAN] Surface formats unavailable: %s", VkResultName(result));
+        return support;
+    }
     support.formats.resize(count);
-    if (count) VK_CHECK(vkGetPhysicalDeviceSurfaceFormatsKHR(device, m_surface, &count, support.formats.data()));
+    if (count)
+    {
+        result = vkGetPhysicalDeviceSurfaceFormatsKHR(device, m_surface, &count, support.formats.data());
+        if (result != VK_SUCCESS)
+        {
+            LogFormat("[VULKAN] Surface formats fetch failed: %s", VkResultName(result));
+            support.formats.clear();
+            return support;
+        }
+    }
 
-    VK_CHECK(vkGetPhysicalDeviceSurfacePresentModesKHR(device, m_surface, &count, nullptr));
+    result = vkGetPhysicalDeviceSurfacePresentModesKHR(device, m_surface, &count, nullptr);
+    if (result != VK_SUCCESS)
+    {
+        LogFormat("[VULKAN] Surface present modes unavailable: %s", VkResultName(result));
+        support.formats.clear();
+        return support;
+    }
     support.presentModes.resize(count);
-    if (count) VK_CHECK(vkGetPhysicalDeviceSurfacePresentModesKHR(device, m_surface, &count, support.presentModes.data()));
+    if (count)
+    {
+        result = vkGetPhysicalDeviceSurfacePresentModesKHR(device, m_surface, &count, support.presentModes.data());
+        if (result != VK_SUCCESS)
+        {
+            LogFormat("[VULKAN] Surface present modes fetch failed: %s", VkResultName(result));
+            support.presentModes.clear();
+            return support;
+        }
+    }
     return support;
 }
 

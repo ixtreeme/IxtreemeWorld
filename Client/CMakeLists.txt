@@ -44,6 +44,13 @@ set(CMAKE_CXX_STANDARD_REQUIRED ON)
 set(CMAKE_CXX_EXTENSIONS OFF)
 
 option(ENABLE_ASAN "Enable AddressSanitizer" OFF)
+option(IXTREEME_WITH_EDITOR "Build ImGui-based editor functionality" ON)
+
+if(IXTREEME_WITH_EDITOR)
+    message(STATUS "IxtreemeWorld editor build: ENABLED")
+else()
+    message(STATUS "IxtreemeWorld editor build: DISABLED")
+endif()
 
 set(VCPKG_TRIPLET_TYPE "static" CACHE STRING "Choose vcpkg triplet type (static/dynamic)")
 set_property(CACHE VCPKG_TRIPLET_TYPE PROPERTY STRINGS static dynamic)
@@ -87,7 +94,11 @@ vcpkg_require(
     stb
 )
 
-if(WIN32)
+if(IXTREEME_WITH_EDITOR)
+    vcpkg_require(imguizmo)
+endif()
+
+if(WIN32 AND IXTREEME_WITH_EDITOR)
     find_package(imgui CONFIG QUIET)
     if(NOT imgui_FOUND)
         execute_process(
@@ -135,6 +146,9 @@ if(NOT STB_INCLUDE_DIR)
     message(FATAL_ERROR "stb_image.h not found. Install stb with vcpkg or set STB_INCLUDE_DIR.")
 endif()
 find_package(flecs CONFIG REQUIRED)
+if(IXTREEME_WITH_EDITOR)
+    find_package(imguizmo CONFIG REQUIRED)
+endif()
 find_package(Boost CONFIG REQUIRED COMPONENTS system)
 
 if(TARGET flecs::flecs_static)

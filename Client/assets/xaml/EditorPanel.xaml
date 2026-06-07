@@ -283,6 +283,7 @@
       x:Name="ToolsPanelBorder"
       Grid.Row="0"
       Grid.Column="0"
+      Visibility="Collapsed"
       Margin="0,16,12,12"
       CornerRadius="6"
       Padding="14"
@@ -293,55 +294,9 @@
         <StackPanel>
           <TextBlock Text="Tools" FontSize="19" FontWeight="Bold" Foreground="#FFFFFFFF" Margin="0,0,0,12"/>
 
-          <UniformGrid Columns="2">
-            <RadioButton x:Name="ToolRaise" Content="Raise" GroupName="EditorTool" Style="{StaticResource EditorRadio}"/>
-            <RadioButton x:Name="ToolLower" Content="Lower" GroupName="EditorTool" Style="{StaticResource EditorRadio}"/>
-            <RadioButton x:Name="ToolSmooth" Content="Smooth" GroupName="EditorTool" Style="{StaticResource EditorRadio}"/>
-            <RadioButton x:Name="ToolFlatten" Content="Flatten" GroupName="EditorTool" Style="{StaticResource EditorRadio}"/>
-            <RadioButton x:Name="ToolPaint" Content="Paint" GroupName="EditorTool" Style="{StaticResource EditorRadio}"/>
-          </UniformGrid>
-
-          <Button x:Name="AddMarkerButton" Content="+ Marker" Style="{StaticResource EditorButton}"/>
           <Button x:Name="AddWaterBodyButton" Content="+ Water" Style="{StaticResource EditorButton}"/>
           <TextBlock Text="Lighting" FontSize="13" FontWeight="Bold" Foreground="#FFFFFFFF" Margin="0,10,0,4"/>
           <Button x:Name="LightingButton" Content="Lighting" Style="{StaticResource EditorButton}"/>
-
-          <TextBlock x:Name="BrushRadiusText" Text="Radius: 5.0 m" FontSize="12" Foreground="#FFB8C0CF" Margin="0,8,0,2"/>
-          <Slider x:Name="BrushRadiusSlider" Minimum="0.5" Maximum="50" Value="5" Style="{StaticResource EditorSlider}"/>
-
-          <TextBlock x:Name="BrushStrengthText" Text="Strength: 1.0" FontSize="12" Foreground="#FFB8C0CF" Margin="0,10,0,2"/>
-          <Slider x:Name="BrushStrengthSlider" Minimum="0.1" Maximum="5" Value="1" Style="{StaticResource EditorSlider}"/>
-
-          <Grid Margin="0,14,0,6">
-            <Grid.ColumnDefinitions>
-              <ColumnDefinition Width="*"/>
-              <ColumnDefinition Width="Auto"/>
-            </Grid.ColumnDefinitions>
-            <TextBlock Text="Active Slot" FontSize="13" Foreground="#FFFFFFFF"/>
-            <TextBlock x:Name="TextureSlotText" Grid.Column="1" FontSize="13" Foreground="#FF79C8FF"/>
-          </Grid>
-
-          <Grid Margin="0,2,0,8">
-            <Grid.ColumnDefinitions>
-              <ColumnDefinition Width="Auto"/>
-              <ColumnDefinition Width="*"/>
-              <ColumnDefinition Width="*"/>
-            </Grid.ColumnDefinitions>
-            <TextBlock Text="Paint Mode:" FontSize="12" Foreground="#FFB8C0CF" VerticalAlignment="Center" Margin="0,0,8,6"/>
-            <RadioButton x:Name="PaintModeReplace" Grid.Column="1" Content="Replace" GroupName="PaintMode" Style="{StaticResource EditorRadio}" IsChecked="True"/>
-            <RadioButton x:Name="PaintModeMix" Grid.Column="2" Content="Mix" GroupName="PaintMode" Style="{StaticResource EditorRadio}"/>
-          </Grid>
-
-          <UniformGrid Columns="2">
-            <Button x:Name="Slot0Button" Style="{StaticResource EditorButton}"><TextBlock x:Name="Slot0Text" Text="0" TextAlignment="Center"/></Button>
-            <Button x:Name="Slot1Button" Style="{StaticResource EditorButton}"><TextBlock x:Name="Slot1Text" Text="1" TextAlignment="Center"/></Button>
-            <Button x:Name="Slot2Button" Style="{StaticResource EditorButton}"><TextBlock x:Name="Slot2Text" Text="2" TextAlignment="Center"/></Button>
-            <Button x:Name="Slot3Button" Style="{StaticResource EditorButton}"><TextBlock x:Name="Slot3Text" Text="3" TextAlignment="Center"/></Button>
-            <Button x:Name="Slot4Button" Style="{StaticResource EditorButton}"><TextBlock x:Name="Slot4Text" Text="4" TextAlignment="Center"/></Button>
-            <Button x:Name="Slot5Button" Style="{StaticResource EditorButton}"><TextBlock x:Name="Slot5Text" Text="5" TextAlignment="Center"/></Button>
-            <Button x:Name="Slot6Button" Style="{StaticResource EditorButton}"><TextBlock x:Name="Slot6Text" Text="6" TextAlignment="Center"/></Button>
-            <Button x:Name="Slot7Button" Style="{StaticResource EditorButton}"><TextBlock x:Name="Slot7Text" Text="7" TextAlignment="Center"/></Button>
-          </UniformGrid>
 
           <Grid Margin="0,14,0,0">
             <Grid.ColumnDefinitions>
@@ -374,7 +329,7 @@
           <RowDefinition Height="Auto"/>
           <RowDefinition Height="*"/>
         </Grid.RowDefinitions>
-        <TextBlock Text="Inspector" FontSize="19" FontWeight="Bold" Foreground="#FFFFFFFF" Margin="0,0,0,12"/>
+        <TextBlock Text="Asset / Material" FontSize="19" FontWeight="Bold" Foreground="#FFFFFFFF" Margin="0,0,0,12"/>
         <Border
           x:Name="InspectorScrollViewport"
           Grid.Row="1"
@@ -395,55 +350,6 @@
               <Button x:Name="ApplyAssetMetaButton" Grid.Column="1" Content="Apply" Style="{StaticResource EditorButton}"/>
             </Grid>
 
-            <TextBlock Text="Material Editor" FontSize="13" FontWeight="Bold" Foreground="#FFFFFFFF" Margin="0,10,0,6"/>
-            <Grid>
-              <Grid.ColumnDefinitions>
-                <ColumnDefinition Width="*"/>
-                <ColumnDefinition Width="*"/>
-                <ColumnDefinition Width="*"/>
-                <ColumnDefinition Width="*"/>
-              </Grid.ColumnDefinitions>
-              <Button x:Name="NewMaterialButton" Grid.Column="0" Content="New" Style="{StaticResource EditorButton}"/>
-              <Button x:Name="SaveMaterialButton" Grid.Column="1" Content="Save" Style="{StaticResource EditorButton}"/>
-              <Button x:Name="SaveAsMaterialButton" Grid.Column="2" Content="Save As" Style="{StaticResource EditorButton}"/>
-              <Button x:Name="LoadMaterialButton" Grid.Column="3" Content="Load" Style="{StaticResource EditorButton}"/>
-            </Grid>
-
-            <UniformGrid Columns="2">
-              <Button x:Name="MaterialDiffuseButton" Height="42" Style="{StaticResource EditorButton}"><TextBlock x:Name="MaterialDiffuseText" Text="Diffuse: empty" TextAlignment="Center" TextWrapping="Wrap"/></Button>
-              <Button x:Name="MaterialNormalButton" Height="42" Style="{StaticResource EditorButton}"><TextBlock x:Name="MaterialNormalText" Text="Normal: flat" TextAlignment="Center" TextWrapping="Wrap"/></Button>
-              <Button x:Name="MaterialAoButton" Height="42" Style="{StaticResource EditorButton}"><TextBlock x:Name="MaterialAoText" Text="AO: default" TextAlignment="Center" TextWrapping="Wrap"/></Button>
-              <Button x:Name="MaterialRoughnessButton" Height="42" Style="{StaticResource EditorButton}"><TextBlock x:Name="MaterialRoughnessText" Text="Rough: 0.5" TextAlignment="Center" TextWrapping="Wrap"/></Button>
-              <Button x:Name="MaterialMetallicButton" Height="42" Style="{StaticResource EditorButton}"><TextBlock x:Name="MaterialMetallicText" Text="Metal: 0.0" TextAlignment="Center" TextWrapping="Wrap"/></Button>
-              <Button x:Name="MaterialHeightButton" Height="42" Style="{StaticResource EditorButton}"><TextBlock x:Name="MaterialHeightText" Text="Height: empty" TextAlignment="Center" TextWrapping="Wrap"/></Button>
-            </UniformGrid>
-
-            <TextBlock Text="Tiling X / Tiling Y" FontSize="12" Foreground="#FFB8C0CF" Margin="0,8,0,2"/>
-            <Grid>
-              <Grid.ColumnDefinitions>
-                <ColumnDefinition Width="*"/>
-                <ColumnDefinition Width="*"/>
-              </Grid.ColumnDefinitions>
-              <TextBox x:Name="MaterialTilingXBox" Grid.Column="0" Style="{StaticResource EditorTextBox}"/>
-              <TextBox x:Name="MaterialTilingYBox" Grid.Column="1" Style="{StaticResource EditorTextBox}"/>
-            </Grid>
-
-            <TextBlock Text="Normal Strength / Tint" FontSize="12" Foreground="#FFB8C0CF" Margin="0,4,0,2"/>
-            <Grid>
-              <Grid.ColumnDefinitions>
-                <ColumnDefinition Width="*"/>
-                <ColumnDefinition Width="*"/>
-              </Grid.ColumnDefinitions>
-              <TextBox x:Name="MaterialNormalStrengthBox" Grid.Column="0" Style="{StaticResource EditorTextBox}"/>
-              <TextBox x:Name="MaterialTintBox" Grid.Column="1" Style="{StaticResource EditorTextBox}"/>
-            </Grid>
-
-            <TextBlock x:Name="MaterialAoStrengthText" Text="AO Strength: 1.0" FontSize="12" Foreground="#FFB8C0CF" Margin="0,4,0,2"/>
-            <Slider x:Name="MaterialAoStrengthSlider" Minimum="0" Maximum="2" Value="1" Style="{StaticResource EditorSlider}"/>
-            <TextBlock x:Name="MaterialRoughnessStrengthText" Text="Roughness Strength: 1.0" FontSize="12" Foreground="#FFB8C0CF" Margin="0,4,0,2"/>
-            <Slider x:Name="MaterialRoughnessStrengthSlider" Minimum="0" Maximum="2" Value="1" Style="{StaticResource EditorSlider}"/>
-            <TextBlock x:Name="MaterialMetallicStrengthText" Text="Metallic Strength: 1.0" FontSize="12" Foreground="#FFB8C0CF" Margin="0,4,0,2"/>
-            <Slider x:Name="MaterialMetallicStrengthSlider" Minimum="0" Maximum="2" Value="1" Style="{StaticResource EditorSlider}"/>
           </StackPanel>
 
           <StackPanel x:Name="LightingPanel" Visibility="Collapsed">
@@ -495,7 +401,7 @@
 
           </StackPanel>
 
-          <Button x:Name="DynamicLightsSectionButton" Content="[>] Dynamic Lights" Style="{StaticResource EditorButton}" HorizontalContentAlignment="Left" Margin="0,8,6,6"/>
+          <Button x:Name="DynamicLightsSectionButton" Content="[>] Dynamic Lights" Style="{StaticResource EditorButton}" HorizontalContentAlignment="Left" Margin="0,8,6,6" Visibility="Collapsed"/>
           <StackPanel x:Name="DynamicLightsSection" Visibility="Collapsed">
           <TextBlock x:Name="DynamicLightCountText" Text="Active: 0 / 16" FontSize="12" Foreground="#FFB8C0CF" Margin="0,0,0,4"/>
           <Grid>
@@ -509,7 +415,7 @@
 
           </StackPanel>
 
-          <Button x:Name="SelectedLightSectionButton" Content="[>] Selected Light" Style="{StaticResource EditorButton}" HorizontalContentAlignment="Left" Margin="0,8,6,6"/>
+          <Button x:Name="SelectedLightSectionButton" Content="[>] Selected Light" Style="{StaticResource EditorButton}" HorizontalContentAlignment="Left" Margin="0,8,6,6" Visibility="Collapsed"/>
           <StackPanel x:Name="SelectedLightSection" Visibility="Collapsed">
           <TextBlock x:Name="SelectedLightTitleText" Text="No light selected" FontSize="13" FontWeight="Bold" Foreground="#FFFFFFFF" Margin="0,10,0,4"/>
           <Grid>
@@ -546,7 +452,7 @@
           <Slider x:Name="SelectedSpotOuterSlider" Minimum="1" Maximum="90" Value="35" Style="{StaticResource EditorSlider}"/>
           </StackPanel>
 
-          <Button x:Name="SelectedWaterBodySectionButton" Content="[>] Selected Water Body" Style="{StaticResource EditorButton}" HorizontalContentAlignment="Left" Margin="0,8,6,6"/>
+          <Button x:Name="SelectedWaterBodySectionButton" Content="[>] Selected Water Body" Style="{StaticResource EditorButton}" HorizontalContentAlignment="Left" Margin="0,8,6,6" Visibility="Collapsed"/>
           <StackPanel x:Name="SelectedWaterBodySection" Visibility="Collapsed">
           <TextBlock x:Name="SelectedWaterBodyTitleText" Text="No water body selected" FontSize="13" FontWeight="Bold" Foreground="#FFFFFFFF" Margin="0,10,0,4"/>
           <TextBlock Text="Name" FontSize="12" Foreground="#FFB8C0CF" Margin="0,4,0,2"/>
@@ -571,153 +477,6 @@
           <Slider x:Name="SelectedWaterBodyWidthSlider" Minimum="1" Maximum="200" Value="10" Style="{StaticResource EditorSlider}"/>
           <TextBlock x:Name="SelectedWaterBodyDepthText" Text="Bbox Depth: 10.0 m" FontSize="12" Foreground="#FFB8C0CF" Margin="0,4,0,2"/>
           <Slider x:Name="SelectedWaterBodyDepthSlider" Minimum="1" Maximum="200" Value="10" Style="{StaticResource EditorSlider}"/>
-          <Button x:Name="SelectedWaterSculptButton" Content="Sculpt Mode: OFF" Style="{StaticResource EditorButton}" Margin="0,8,0,2"/>
-          <Grid x:Name="SelectedWaterSculptControls" Visibility="Collapsed">
-            <Grid.RowDefinitions>
-              <RowDefinition Height="Auto"/>
-              <RowDefinition Height="Auto"/>
-              <RowDefinition Height="Auto"/>
-            </Grid.RowDefinitions>
-            <Grid Grid.Row="0">
-              <Grid.ColumnDefinitions>
-                <ColumnDefinition Width="*"/>
-                <ColumnDefinition Width="*"/>
-              </Grid.ColumnDefinitions>
-              <Button x:Name="WaterSculptAddButton" Grid.Column="0" Content="Add" Style="{StaticResource EditorButton}"/>
-              <Button x:Name="WaterSculptRemoveButton" Grid.Column="1" Content="Remove" Style="{StaticResource EditorButton}"/>
-            </Grid>
-            <TextBlock x:Name="WaterSculptRadiusText" Grid.Row="1" Text="Sculpt Radius: 3.0 m" FontSize="12" Foreground="#FFB8C0CF" Margin="0,4,0,2"/>
-            <Slider x:Name="WaterSculptRadiusSlider" Grid.Row="2" Minimum="0.5" Maximum="20" Value="3" Style="{StaticResource EditorSlider}"/>
-          </Grid>
-          </StackPanel>
-
-          <Button x:Name="WaterMaterialEditorSectionButton" Content="[>] Water Material Editor" Style="{StaticResource EditorButton}" HorizontalContentAlignment="Left" Margin="0,8,6,6"/>
-          <StackPanel x:Name="WaterMaterialEditorSection" Visibility="Collapsed">
-          <TextBlock x:Name="WaterMaterialEditorTitleText" Text="No water material open" FontSize="13" FontWeight="Bold" Foreground="#FFFFFFFF" Margin="0,4,0,4"/>
-          <Button x:Name="SaveWaterMaterialButton" Content="Save Water Material" Style="{StaticResource EditorButton}"/>
-          <Button x:Name="WaterBaseSectionButton" Content="[v] Water" Style="{StaticResource EditorButton}" HorizontalContentAlignment="Left" Margin="0,8,6,6"/>
-          <StackPanel x:Name="WaterBaseSection">
-          <Button x:Name="WaterEnabledButton" Content="Water: ON" Style="{StaticResource EditorButton}"/>
-          <TextBlock x:Name="WaterLevelText" Text="Water Level Y: material fallback" FontSize="12" Foreground="#FFB8C0CF" Margin="0,4,0,2" Visibility="Collapsed"/>
-          <Slider x:Name="WaterLevelSlider" Minimum="-50" Maximum="50" Value="0" Style="{StaticResource EditorSlider}" Visibility="Collapsed"/>
-          <TextBlock x:Name="WaterBaseRText" Text="Base R: 0.10" FontSize="12" Foreground="#FFB8C0CF" Margin="0,4,0,2"/>
-          <Slider x:Name="WaterBaseRSlider" Minimum="0" Maximum="1" Value="0.10" Style="{StaticResource EditorSlider}"/>
-          <TextBlock x:Name="WaterBaseGText" Text="Base G: 0.35" FontSize="12" Foreground="#FFB8C0CF" Margin="0,4,0,2"/>
-          <Slider x:Name="WaterBaseGSlider" Minimum="0" Maximum="1" Value="0.35" Style="{StaticResource EditorSlider}"/>
-          <TextBlock x:Name="WaterBaseBText" Text="Base B: 0.55" FontSize="12" Foreground="#FFB8C0CF" Margin="0,4,0,2"/>
-          <Slider x:Name="WaterBaseBSlider" Minimum="0" Maximum="1" Value="0.55" Style="{StaticResource EditorSlider}"/>
-          <TextBlock x:Name="WaterAlphaText" Text="Base Alpha: 0.85" FontSize="12" Foreground="#FFB8C0CF" Margin="0,4,0,2"/>
-          <Slider x:Name="WaterAlphaSlider" Minimum="0" Maximum="1" Value="0.85" Style="{StaticResource EditorSlider}"/>
-          <TextBlock x:Name="WaterWaveScaleSmallText" Text="Normal Tiling Fine: 0.080" FontSize="12" Foreground="#FFB8C0CF" Margin="0,4,0,2"/>
-          <Slider x:Name="WaterWaveScaleSmallSlider" Minimum="0.001" Maximum="0.12" Value="0.08" Style="{StaticResource EditorSlider}"/>
-          <TextBlock x:Name="WaterWaveScaleLargeText" Text="Normal Tiling Broad: 0.030" FontSize="12" Foreground="#FFB8C0CF" Margin="0,4,0,2"/>
-          <Slider x:Name="WaterWaveScaleLargeSlider" Minimum="0.001" Maximum="0.08" Value="0.03" Style="{StaticResource EditorSlider}"/>
-          <TextBlock x:Name="WaterWaveSpeedSmallText" Text="Wave Speed Small: 0.03" FontSize="12" Foreground="#FFB8C0CF" Margin="0,4,0,2"/>
-          <Slider x:Name="WaterWaveSpeedSmallSlider" Minimum="0" Maximum="0.5" Value="0.03" Style="{StaticResource EditorSlider}"/>
-          <TextBlock x:Name="WaterWaveSpeedLargeText" Text="Wave Speed Large: 0.015" FontSize="12" Foreground="#FFB8C0CF" Margin="0,4,0,2"/>
-          <Slider x:Name="WaterWaveSpeedLargeSlider" Minimum="0" Maximum="0.5" Value="0.015" Style="{StaticResource EditorSlider}"/>
-          <TextBlock x:Name="WaterNormalStrengthText" Text="Normal Strength: 0.60" FontSize="12" Foreground="#FFB8C0CF" Margin="0,4,0,2"/>
-          <Slider x:Name="WaterNormalStrengthSlider" Minimum="0" Maximum="2" Value="0.60" Style="{StaticResource EditorSlider}"/>
-          <TextBlock x:Name="WaterFresnelPowerText" Text="Fresnel Power: 5.0" FontSize="12" Foreground="#FFB8C0CF" Margin="0,4,0,2"/>
-          <Slider x:Name="WaterFresnelPowerSlider" Minimum="1" Maximum="10" Value="5" Style="{StaticResource EditorSlider}"/>
-          <TextBlock x:Name="WaterFresnelMinText" Text="Fresnel Min: 0.02" FontSize="12" Foreground="#FFB8C0CF" Margin="0,4,0,2"/>
-          <Slider x:Name="WaterFresnelMinSlider" Minimum="0" Maximum="0.5" Value="0.02" Style="{StaticResource EditorSlider}"/>
-          <TextBlock x:Name="WaterReflectionRText" Text="Reflection R: 0.55" FontSize="12" Foreground="#FFB8C0CF" Margin="0,4,0,2"/>
-          <Slider x:Name="WaterReflectionRSlider" Minimum="0" Maximum="1" Value="0.55" Style="{StaticResource EditorSlider}"/>
-          <TextBlock x:Name="WaterReflectionGText" Text="Reflection G: 0.70" FontSize="12" Foreground="#FFB8C0CF" Margin="0,4,0,2"/>
-          <Slider x:Name="WaterReflectionGSlider" Minimum="0" Maximum="1" Value="0.70" Style="{StaticResource EditorSlider}"/>
-          <TextBlock x:Name="WaterReflectionBText" Text="Reflection B: 0.85" FontSize="12" Foreground="#FFB8C0CF" Margin="0,4,0,2"/>
-          <Slider x:Name="WaterReflectionBSlider" Minimum="0" Maximum="1" Value="0.85" Style="{StaticResource EditorSlider}"/>
-          </StackPanel>
-
-          <Button x:Name="WaterEdgeFadeSectionButton" Content="[>] Edge Fade" Style="{StaticResource EditorButton}" HorizontalContentAlignment="Left" Margin="0,8,6,6"/>
-          <StackPanel x:Name="WaterEdgeFadeSection" Visibility="Collapsed">
-          <TextBlock x:Name="WaterEdgeFadeDistanceText" Text="Edge Fade Distance: 1.0 m" FontSize="12" Foreground="#FFB8C0CF" Margin="0,4,0,2"/>
-          <Slider x:Name="WaterEdgeFadeDistanceSlider" Minimum="0" Maximum="3" Value="1" Style="{StaticResource EditorSlider}"/>
-          <TextBlock Text="Edge Fade Curve" FontSize="12" Foreground="#FFB8C0CF" Margin="0,6,0,2"/>
-          <UniformGrid Columns="3" Margin="0,0,0,0">
-            <Button x:Name="WaterEdgeFadeLinearButton" Content="Linear" Style="{StaticResource EditorButton}"/>
-            <Button x:Name="WaterEdgeFadeSmoothButton" Content="[Smooth]" Style="{StaticResource EditorButton}"/>
-            <Button x:Name="WaterEdgeFadeExponentialButton" Content="Exp" Style="{StaticResource EditorButton}"/>
-          </UniformGrid>
-          <TextBlock Text="Soft shoreline transition over the specified distance" FontSize="11" Foreground="#FF8F98A8" TextWrapping="Wrap" Margin="0,4,0,0"/>
-          </StackPanel>
-
-          <Button x:Name="WaterReflectionSectionButton" Content="[>] Reflection" Style="{StaticResource EditorButton}" HorizontalContentAlignment="Left" Margin="0,8,6,6"/>
-          <StackPanel x:Name="WaterReflectionSection" Visibility="Collapsed">
-          <Button x:Name="WaterReflectionEnabledButton" Content="Reflection: ON" Style="{StaticResource EditorButton}"/>
-          <UniformGrid Columns="3" Margin="0,4,0,0">
-            <Button x:Name="WaterReflectionQuarterButton" Content="Quarter" Style="{StaticResource EditorButton}"/>
-            <Button x:Name="WaterReflectionHalfButton" Content="Half" Style="{StaticResource EditorButton}"/>
-            <Button x:Name="WaterReflectionFullButton" Content="Full" Style="{StaticResource EditorButton}"/>
-          </UniformGrid>
-          <TextBlock x:Name="WaterReflectionDistortionText" Text="Distortion Strength: 0.04" FontSize="12" Foreground="#FFB8C0CF" Margin="0,4,0,2"/>
-          <Slider x:Name="WaterReflectionDistortionSlider" Minimum="0" Maximum="0.2" Value="0.04" Style="{StaticResource EditorSlider}"/>
-
-          </StackPanel>
-
-          <Button x:Name="WaterRefractionSectionButton" Content="[>] Refraction and Depth" Style="{StaticResource EditorButton}" HorizontalContentAlignment="Left" Margin="0,8,6,6"/>
-          <StackPanel x:Name="WaterRefractionSection" Visibility="Collapsed">
-          <Button x:Name="WaterRefractionEnabledButton" Content="Refraction: ON" Style="{StaticResource EditorButton}"/>
-          <TextBlock x:Name="WaterShallowRText" Text="Shallow R: 0.36" FontSize="12" Foreground="#FFB8C0CF" Margin="0,4,0,2"/>
-          <Slider x:Name="WaterShallowRSlider" Minimum="0" Maximum="1" Value="0.36" Style="{StaticResource EditorSlider}"/>
-          <TextBlock x:Name="WaterShallowGText" Text="Shallow G: 0.88" FontSize="12" Foreground="#FFB8C0CF" Margin="0,4,0,2"/>
-          <Slider x:Name="WaterShallowGSlider" Minimum="0" Maximum="1" Value="0.88" Style="{StaticResource EditorSlider}"/>
-          <TextBlock x:Name="WaterShallowBText" Text="Shallow B: 0.78" FontSize="12" Foreground="#FFB8C0CF" Margin="0,4,0,2"/>
-          <Slider x:Name="WaterShallowBSlider" Minimum="0" Maximum="1" Value="0.78" Style="{StaticResource EditorSlider}"/>
-          <TextBlock x:Name="WaterDeepRText" Text="Deep R: 0.04" FontSize="12" Foreground="#FFB8C0CF" Margin="0,4,0,2"/>
-          <Slider x:Name="WaterDeepRSlider" Minimum="0" Maximum="1" Value="0.04" Style="{StaticResource EditorSlider}"/>
-          <TextBlock x:Name="WaterDeepGText" Text="Deep G: 0.17" FontSize="12" Foreground="#FFB8C0CF" Margin="0,4,0,2"/>
-          <Slider x:Name="WaterDeepGSlider" Minimum="0" Maximum="1" Value="0.17" Style="{StaticResource EditorSlider}"/>
-          <TextBlock x:Name="WaterDeepBText" Text="Deep B: 0.35" FontSize="12" Foreground="#FFB8C0CF" Margin="0,4,0,2"/>
-          <Slider x:Name="WaterDeepBSlider" Minimum="0" Maximum="1" Value="0.35" Style="{StaticResource EditorSlider}"/>
-          <TextBlock x:Name="WaterDepthColorMinText" Text="Color Depth Min: 0.5 m" FontSize="12" Foreground="#FFB8C0CF" Margin="0,4,0,2"/>
-          <Slider x:Name="WaterDepthColorMinSlider" Minimum="0" Maximum="50" Value="0.5" Style="{StaticResource EditorSlider}"/>
-          <TextBlock x:Name="WaterDepthColorMaxText" Text="Color Depth Max: 8.0 m" FontSize="12" Foreground="#FFB8C0CF" Margin="0,4,0,2"/>
-          <Slider x:Name="WaterDepthColorMaxSlider" Minimum="0.01" Maximum="50" Value="8" Style="{StaticResource EditorSlider}"/>
-          <TextBlock x:Name="WaterDepthFadeText" Text="Fade Distance: 12.0 m" FontSize="12" Foreground="#FFB8C0CF" Margin="0,4,0,2"/>
-          <Slider x:Name="WaterDepthFadeSlider" Minimum="0.01" Maximum="50" Value="12" Style="{StaticResource EditorSlider}"/>
-          <TextBlock x:Name="WaterRefractionStrengthText" Text="Refraction Strength: 0.018" FontSize="12" Foreground="#FFB8C0CF" Margin="0,4,0,2"/>
-          <Slider x:Name="WaterRefractionStrengthSlider" Minimum="0" Maximum="0.1" Value="0.018" Style="{StaticResource EditorSlider}"/>
-          <TextBlock x:Name="WaterRefractionDepthStrengthText" Text="Refraction Depth Mult: 1.00" FontSize="12" Foreground="#FFB8C0CF" Margin="0,4,0,2"/>
-          <Slider x:Name="WaterRefractionDepthStrengthSlider" Minimum="0" Maximum="2" Value="1" Style="{StaticResource EditorSlider}"/>
-
-          </StackPanel>
-
-          <Button x:Name="WaterFoamSectionButton" Content="[>] Foam" Style="{StaticResource EditorButton}" HorizontalContentAlignment="Left" Margin="0,8,6,6"/>
-          <StackPanel x:Name="WaterFoamSection" Visibility="Collapsed">
-          <Button x:Name="WaterFoamEnabledButton" Content="Foam: ON" Style="{StaticResource EditorButton}"/>
-          <TextBlock x:Name="WaterFoamDistanceText" Text="Foam Distance: 0.08 m" FontSize="12" Foreground="#FFB8C0CF" Margin="0,4,0,2"/>
-          <Slider x:Name="WaterFoamDistanceSlider" Minimum="0.02" Maximum="1.5" Value="0.08" Style="{StaticResource EditorSlider}"/>
-          <TextBlock x:Name="WaterFoamIntensityText" Text="Foam Intensity: 0.65" FontSize="12" Foreground="#FFB8C0CF" Margin="0,4,0,2"/>
-          <Slider x:Name="WaterFoamIntensitySlider" Minimum="0" Maximum="2" Value="0.65" Style="{StaticResource EditorSlider}"/>
-          <TextBlock x:Name="WaterFoamScaleText" Text="Foam Scale: 2.00 m" FontSize="12" Foreground="#FFB8C0CF" Margin="0,4,0,2"/>
-          <Slider x:Name="WaterFoamScaleSlider" Minimum="0.1" Maximum="2" Value="2.0" Style="{StaticResource EditorSlider}"/>
-          <TextBlock x:Name="WaterFoamTerrainThicknessText" Text="Terrain Foam Thickness: 0.08 m" FontSize="12" Foreground="#FFB8C0CF" Margin="0,4,0,2"/>
-          <Slider x:Name="WaterFoamTerrainThicknessSlider" Minimum="0" Maximum="1" Value="0.08" Style="{StaticResource EditorSlider}"/>
-
-          </StackPanel>
-
-          <Button x:Name="WaterCausticSectionButton" Content="[>] Caustic" Style="{StaticResource EditorButton}" HorizontalContentAlignment="Left" Margin="0,8,6,6"/>
-          <StackPanel x:Name="WaterCausticSection" Visibility="Collapsed">
-          <UniformGrid Columns="3" Margin="0,4,0,0">
-            <Button x:Name="WaterCausticOffButton" Content="Off" Style="{StaticResource EditorButton}"/>
-            <Button x:Name="WaterCausticAnimatedButton" Content="Animated" Style="{StaticResource EditorButton}"/>
-            <Button x:Name="WaterCausticProceduralButton" Content="Procedural" Style="{StaticResource EditorButton}"/>
-          </UniformGrid>
-          <TextBlock x:Name="WaterCausticIntensityText" Text="Caustic Intensity: 0.70" FontSize="12" Foreground="#FFB8C0CF" Margin="0,4,0,2"/>
-          <Slider x:Name="WaterCausticIntensitySlider" Minimum="0" Maximum="3" Value="0.7" Style="{StaticResource EditorSlider}"/>
-          <TextBlock x:Name="WaterCausticScaleText" Text="Caustic Scale: 0.30 m" FontSize="12" Foreground="#FFB8C0CF" Margin="0,4,0,2"/>
-          <Slider x:Name="WaterCausticScaleSlider" Minimum="0.1" Maximum="2" Value="0.3" Style="{StaticResource EditorSlider}"/>
-          <TextBlock x:Name="WaterCausticSpeedText" Text="Caustic Speed: 0.50" FontSize="12" Foreground="#FFB8C0CF" Margin="0,4,0,2"/>
-          <Slider x:Name="WaterCausticSpeedSlider" Minimum="0" Maximum="2" Value="0.5" Style="{StaticResource EditorSlider}"/>
-          <TextBlock x:Name="WaterCausticMaxDepthText" Text="Caustic Max Depth: 8.0 m" FontSize="12" Foreground="#FFB8C0CF" Margin="0,4,0,2"/>
-          <Slider x:Name="WaterCausticMaxDepthSlider" Minimum="1" Maximum="30" Value="8" Style="{StaticResource EditorSlider}"/>
-
-          </StackPanel>
-
-
-          </StackPanel>
           </StackPanel>
 
           <TextBlock
@@ -732,101 +491,5 @@
       </Grid>
     </Border>
 
-    <Border
-      x:Name="AssetBrowserPanelBorder"
-      Grid.Row="1"
-      Grid.Column="0"
-      Grid.ColumnSpan="3"
-      CornerRadius="6"
-      Padding="12"
-      Background="{StaticResource EditorPanelBackground}"
-      BorderBrush="{StaticResource EditorPanelBorder}"
-      BorderThickness="1">
-      <Grid>
-        <Grid.ColumnDefinitions>
-          <ColumnDefinition Width="230"/>
-          <ColumnDefinition Width="*"/>
-          <ColumnDefinition Width="260"/>
-        </Grid.ColumnDefinitions>
-        <Grid.RowDefinitions>
-          <RowDefinition Height="Auto"/>
-          <RowDefinition Height="*"/>
-        </Grid.RowDefinitions>
-
-        <Grid Grid.Row="0" Grid.ColumnSpan="3">
-          <Grid.ColumnDefinitions>
-            <ColumnDefinition Width="Auto"/>
-            <ColumnDefinition Width="Auto"/>
-            <ColumnDefinition Width="Auto"/>
-            <ColumnDefinition Width="Auto"/>
-            <ColumnDefinition Width="Auto"/>
-            <ColumnDefinition Width="*"/>
-            <ColumnDefinition Width="Auto"/>
-            <ColumnDefinition Width="Auto"/>
-          </Grid.ColumnDefinitions>
-          <Button x:Name="AssetTexturesButton" Grid.Column="0" Content="Textures" Style="{StaticResource EditorButton}"/>
-          <Button x:Name="AssetModelsButton" Grid.Column="1" Content="Models" Style="{StaticResource EditorButton}"/>
-          <Button x:Name="AssetAnimationsButton" Grid.Column="2" Content="Anims" Style="{StaticResource EditorButton}"/>
-          <Button x:Name="AssetMaterialsButton" Grid.Column="3" Content="Materials" Style="{StaticResource EditorButton}"/>
-          <Button x:Name="AssetWaterMaterialsButton" Grid.Column="4" Content="Water Mats" Style="{StaticResource EditorButton}"/>
-          <TextBox x:Name="AssetSearchBox" Grid.Column="5" Style="{StaticResource EditorTextBox}"/>
-          <Button x:Name="AssetClearButton" Grid.Column="6" Content="Clear" Style="{StaticResource EditorButton}"/>
-          <Button x:Name="AssetRefreshButton" Grid.Column="7" Content="Refresh" Style="{StaticResource EditorButton}"/>
-        </Grid>
-
-        <StackPanel Grid.Row="1" Grid.Column="0" Margin="0,8,10,0">
-          <TextBlock Text="Folders" FontSize="12" Foreground="#FFB8C0CF" Margin="0,0,0,4"/>
-          <Border x:Name="AssetFolderPanelBorder" Background="#FF111820" BorderBrush="#33758AA8" BorderThickness="1" CornerRadius="4" Padding="6">
-            <TreeView x:Name="AssetFolderTree"/>
-          </Border>
-        </StackPanel>
-
-        <Grid Grid.Row="1" Grid.Column="1" Margin="0,8,10,0">
-          <Grid.RowDefinitions>
-            <RowDefinition Height="Auto"/>
-            <RowDefinition Height="*"/>
-          </Grid.RowDefinitions>
-          <Grid Grid.Row="0">
-            <Grid.ColumnDefinitions>
-              <ColumnDefinition Width="Auto"/>
-              <ColumnDefinition Width="Auto"/>
-              <ColumnDefinition Width="Auto"/>
-              <ColumnDefinition Width="Auto"/>
-              <ColumnDefinition Width="*"/>
-              <ColumnDefinition Width="Auto"/>
-              <ColumnDefinition Width="Auto"/>
-              <ColumnDefinition Width="Auto"/>
-            </Grid.ColumnDefinitions>
-            <Button x:Name="AssetFolderHomeButton" Grid.Column="0" Content="Home" Style="{StaticResource EditorButton}"/>
-            <Button x:Name="AssetFolderUpButton" Grid.Column="1" Content="Up" Style="{StaticResource EditorButton}"/>
-            <Button x:Name="AssetCreateFolderButton" Grid.Column="2" Content="+ Folder" Style="{StaticResource EditorButton}"/>
-            <Button x:Name="AssetDeleteFolderButton" Grid.Column="3" Content="Delete Folder" Style="{StaticResource EditorButton}"/>
-            <StackPanel Grid.Column="4" Orientation="Vertical" Margin="2,0,8,0">
-              <StackPanel x:Name="AssetBreadcrumbPanel" Orientation="Horizontal"/>
-              <TextBlock x:Name="AssetFolderCountText" Text="0 assets" FontSize="11" Foreground="#FF8EA0B8" TextTrimming="CharacterEllipsis"/>
-            </StackPanel>
-            <Button x:Name="ImportTextureButton" Grid.Column="5" Content="+ Texture" Style="{StaticResource EditorButton}"/>
-            <Button x:Name="ImportModelButton" Grid.Column="6" Content="+ Model" Style="{StaticResource EditorButton}"/>
-            <Button x:Name="ImportAnimationButton" Grid.Column="7" Content="+ Anim" Style="{StaticResource EditorButton}"/>
-          </Grid>
-
-          <ScrollViewer Grid.Row="1" VerticalScrollBarVisibility="Auto">
-            <WrapPanel x:Name="AssetTilePanel" Orientation="Horizontal"/>
-          </ScrollViewer>
-        </Grid>
-
-        <StackPanel Grid.Row="1" Grid.Column="2" Margin="0,8,0,0">
-          <TextBlock Text="Tags" FontSize="12" Foreground="#FFB8C0CF" Margin="0,0,0,4"/>
-          <UniformGrid Columns="2">
-            <Button x:Name="AssetTag0Button" Style="{StaticResource EditorButton}"><TextBlock x:Name="AssetTag0Text" Text="" TextAlignment="Center"/></Button>
-            <Button x:Name="AssetTag1Button" Style="{StaticResource EditorButton}"><TextBlock x:Name="AssetTag1Text" Text="" TextAlignment="Center"/></Button>
-            <Button x:Name="AssetTag2Button" Style="{StaticResource EditorButton}"><TextBlock x:Name="AssetTag2Text" Text="" TextAlignment="Center"/></Button>
-            <Button x:Name="AssetTag3Button" Style="{StaticResource EditorButton}"><TextBlock x:Name="AssetTag3Text" Text="" TextAlignment="Center"/></Button>
-            <Button x:Name="AssetTag4Button" Style="{StaticResource EditorButton}"><TextBlock x:Name="AssetTag4Text" Text="" TextAlignment="Center"/></Button>
-            <Button x:Name="AssetTag5Button" Style="{StaticResource EditorButton}"><TextBlock x:Name="AssetTag5Text" Text="" TextAlignment="Center"/></Button>
-          </UniformGrid>
-        </StackPanel>
-      </Grid>
-    </Border>
   </Grid>
 </Grid>
