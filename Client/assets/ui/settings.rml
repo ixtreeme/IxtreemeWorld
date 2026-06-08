@@ -1,0 +1,70 @@
+<rml>
+<head>
+    <title>Settings</title>
+    <link type="text/rcss" href="settings.rcss" />
+</head>
+<body>
+    <div class="settings-screen">
+        <div class="settings-panel">
+            <div class="title-row">
+                <h2>Settings</h2>
+                <button id="settings-back-btn" class="close-button">Back</button>
+            </div>
+
+            <div class="tab-row">
+                <button id="settings-tab-video" class="tab-button active">Video</button>
+                <button id="settings-tab-audio" class="tab-button">Audio</button>
+                <button id="settings-tab-controls" class="tab-button">Controls</button>
+            </div>
+
+            <div id="settings-video" class="settings-page">
+                <div class="setting-row">
+                    <span class="setting-label">Resolution</span>
+                    <span class="setting-value">Window size</span>
+                </div>
+                <div class="setting-row">
+                    <span class="setting-label">Fullscreen</span>
+                    <span class="setting-value">Off</span>
+                </div>
+                <div class="setting-row">
+                    <span class="setting-label">VSync</span>
+                    <span class="setting-value">Swapchain default</span>
+                </div>
+            </div>
+
+            <div id="settings-audio" class="settings-page hidden">
+                <div class="setting-row">
+                    <span class="setting-label">Master Volume</span>
+                    <span class="setting-value">100%</span>
+                </div>
+                <div class="setting-row">
+                    <span class="setting-label">Music</span>
+                    <span class="setting-value">70%</span>
+                </div>
+                <div class="setting-row">
+                    <span class="setting-label">Effects</span>
+                    <span class="setting-value">85%</span>
+                </div>
+            </div>
+
+            <div id="settings-controls" class="settings-page hidden">
+                <div class="setting-row">
+                    <span class="setting-label">Inventory</span>
+                    <span class="setting-value">I</span>
+                </div>
+                <div class="setting-row">
+                    <span class="setting-label">Menu</span>
+                    <span class="setting-value">Esc</span>
+                </div>
+                <div class="setting-row">
+                    <span class="setting-label">Move</span>
+                    <span class="setting-value">WASD</span>
+                </div>
+            </div>
+
+            <button id="settings-apply-btn" class="apply-button">Apply</button>
+            <p id="settings-status" class="status-text"></p>
+        </div>
+    </div>
+</body>
+</rml>

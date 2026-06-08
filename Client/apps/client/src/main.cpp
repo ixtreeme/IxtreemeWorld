@@ -12,7 +12,7 @@
 #if defined(__ANDROID__)
 #include "NativeWindow_Android.h"
 #endif
-#include "NoesisLayer.h"
+#include "GameClientLayer.h"
 #include "OffscreenSceneRenderer.h"
 #include "RmlUiLayer.h"
 #include "TerrainRenderer.h"
@@ -68,7 +68,7 @@ const char* InputEventTypeName(InputEvent::Type type)
 void LogUnhandledInput(const InputEvent& event)
 {
     char buffer[128];
-    std::snprintf(buffer, sizeof(buffer), "Input not consumed by Noesis: %s\n",
+    std::snprintf(buffer, sizeof(buffer), "Input not consumed by gameClient: %s\n",
         InputEventTypeName(event.type));
 #if defined(_WIN32)
     OutputDebugStringA(buffer);
@@ -915,26 +915,83 @@ int RunGame(NativeWindow& window,
     Tracen("[BUILD] Editor: DISABLED");
 #endif
 
-    NoesisLayer noesis;
+    GameClientLayer gameClient;
     VkExtent2D renderSize = device.GetSwapchainExtent();
-    if (!noesis.Create(device, assets, renderSize.width, renderSize.height))
+    if (!gameClient.Create(device, assets, renderSize.width, renderSize.height))
     {
-        ShowFatal("Failed to create Noesis layer. See debug output/stderr.");
+        ShowFatal("Failed to create gameClient layer. See debug output/stderr.");
         device.Destroy();
         return 1;
     }
-    client::net::ClientSession clientSession(noesis);
+    client::net::ClientSession clientSession(gameClient);
     clientSession.SetDebugSpawnOverride(debugSpawnOverride);
-    noesis.SetClientSession(&clientSession);
+    gameClient.SetClientSession(&clientSession);
 
     RmlUiLayer rmlUi;
     if (!rmlUi.Create(device, assets, renderSize.width, renderSize.height))
     {
         ShowFatal("Failed to create RmlUi layer. See debug output/stderr.");
-        noesis.Destroy();
+        gameClient.Destroy();
         device.Destroy();
         return 1;
     }
+    rmlUi.SetLoginSubmitCallback([&gameClient](const std::string& username,
+                                            const std::string& password,
+                                            bool remember) {
+        gameClient.SubmitLogin(username, password, remember);
+    });
+    gameClient.SetLoginCallbacks(
+        [&rmlUi]() {
+            rmlUi.SetLoginError("");
+            rmlUi.HideLogin();
+        },
+        [&gameClient, &rmlUi](const std::string& message) {
+            if (!gameClient.IsLobbyActive() && !gameClient.IsInWorld())
+                rmlUi.ShowLogin();
+            rmlUi.SetLoginError(message);
+        });
+    rmlUi.SetLobbyCallbacks(
+        [&gameClient](std::uint64_t characterId) {
+            gameClient.EnterWorldWithCharacter(characterId);
+        },
+        [&rmlUi]() {
+            rmlUi.ShowCharacterCreation();
+        },
+        [&rmlUi](std::uint64_t) {
+            rmlUi.SetLobbyStatus("Character delete is not available yet");
+        },
+        [&gameClient, &rmlUi]() {
+            gameClient.LogoutToLogin();
+            rmlUi.HideLobby();
+            rmlUi.ShowLogin();
+        });
+    gameClient.SetLobbyCallbacks(
+        [&rmlUi]() {
+            rmlUi.ShowLobby();
+        },
+        [&rmlUi](const std::vector<client::net::CharacterListItem>& characters) {
+            rmlUi.SetLobbyCharacters(characters);
+        },
+        [&rmlUi](const std::string& message) {
+            rmlUi.SetLobbyStatus(message);
+        },
+        [&rmlUi]() {
+            rmlUi.HideLobby();
+            rmlUi.ShowHud();
+        });
+    rmlUi.SetInGameMenuCallbacks(
+        []() {},
+        [&gameClient, &rmlUi]() {
+            gameClient.LogoutToLogin();
+            rmlUi.HideHud();
+            rmlUi.HideInventory();
+            rmlUi.HideSettings();
+            rmlUi.HideInGameMenu();
+            rmlUi.ShowLogin();
+        },
+        [&window]() {
+            window.RequestClose();
+        });
 
     EditorImGui editorImGui;
 #if defined(IXTREEME_WITH_EDITOR)
@@ -943,7 +1000,7 @@ int RunGame(NativeWindow& window,
     if (!win32Window || !editorImGui.Create(device, win32Window->GetHwnd()))
     {
         ShowFatal("Failed to create ImGui editor layer. See debug output/stderr.");
-        noesis.Destroy();
+        gameClient.Destroy();
         device.Destroy();
         return 1;
     }
@@ -955,13 +1012,13 @@ int RunGame(NativeWindow& window,
     if (!editorImGui.Create(device, nullptr))
     {
         ShowFatal("Failed to create ImGui editor layer. See debug output/stderr.");
-        noesis.Destroy();
+        gameClient.Destroy();
         device.Destroy();
         return 1;
     }
 #endif
-    editorImGui.SetMapEditorSettings(noesis.GetMapEditorSettings());
-    editorImGui.SetLightingState(noesis.GetLightingState());
+    editorImGui.SetMapEditorSettings(gameClient.GetMapEditorSettings());
+    editorImGui.SetLightingState(gameClient.GetLightingState());
     if (auto assetRoot = assets.RootPath())
         editorImGui.InitializeAssetLibrary(*assetRoot);
 #endif
@@ -984,12 +1041,12 @@ int RunGame(NativeWindow& window,
     }
     else
     {
-        noesis.InitializeAssetLibrary("assets/Maps/test_zone", terrain.GetPaletteSlots());
+        gameClient.InitializeAssetLibrary("assets/Maps/test_zone", terrain.GetPaletteSlots());
 #if defined(IXTREEME_WITH_EDITOR)
-        editorImGui.SetPaletteSlots(noesis.GetPaletteSlots());
+        editorImGui.SetPaletteSlots(gameClient.GetPaletteSlots());
         editorImGui.SetWaterMaterials(editorImGui.GetWaterMaterialsSnapshot());
 #endif
-        if (!terrain.ApplyPaletteSlots(device, noesis.GetPaletteSlots()))
+        if (!terrain.ApplyPaletteSlots(device, gameClient.GetPaletteSlots()))
             Tracenf("[MAIN] world palette could not be applied; keeping initial terrain palette");
     }
 
@@ -1021,7 +1078,7 @@ int RunGame(NativeWindow& window,
         }
     }
 
-    noesis.SetQuitCallback([&window]()
+    gameClient.SetQuitCallback([&window]()
     {
         window.RequestClose();
     });
@@ -1054,7 +1111,7 @@ int RunGame(NativeWindow& window,
     std::uint32_t waterSculptStrokeModifiedCells = 0;
     bool waterSculptMeshRegenPending = false;
 
-    window.SetInputCallback([&noesis,
+    window.SetInputCallback([&gameClient,
                              &rmlUi,
                              &editorImGui,
                              &movement,
@@ -1089,20 +1146,36 @@ int RunGame(NativeWindow& window,
             return;
         }
 
+        if (gameClient.IsInWorld() && event.type == InputEvent::KeyDown && event.key == Key_Escape)
+        {
+            if (rmlUi.IsSettingsVisible())
+                rmlUi.HideSettings();
+            else
+                rmlUi.ToggleInGameMenu();
+            movement.Clear();
+            return;
+        }
+        if (gameClient.IsInWorld() && event.type == InputEvent::KeyDown && event.key == Key_I)
+        {
+            rmlUi.ToggleInventory();
+            movement.Clear();
+            return;
+        }
+
         if (rmlUi.OnInput(event))
         {
             movement.Clear();
             return;
         }
 
-        const bool editorTextInputFocused = noesis.IsMapEditorOpen() && noesis.IsTextInputFocused();
+        const bool editorTextInputFocused = gameClient.IsMapEditorOpen() && gameClient.IsTextInputFocused();
         if (editorTextInputFocused)
             movement.Clear();
         else
             movement.Apply(event);
 
-        if (noesis.IsInWorld() && event.type == InputEvent::MouseDown && event.button == MouseButton_Left &&
-            hasLastPickCamera && !noesis.IsMapEditorOpen())
+        if (gameClient.IsInWorld() && event.type == InputEvent::MouseDown && event.button == MouseButton_Left &&
+            hasLastPickCamera && !gameClient.IsMapEditorOpen())
         {
             selectedTargetNetId = PickMobTarget(lastPickEntities,
                                                lastPickCamera,
@@ -1113,7 +1186,7 @@ int RunGame(NativeWindow& window,
             Tracenf("[COMBAT] selected target net_id=%u", selectedTargetNetId);
             return;
         }
-        if (noesis.IsInWorld() && !noesis.IsMapEditorOpen() &&
+        if (gameClient.IsInWorld() && !gameClient.IsMapEditorOpen() &&
             event.type == InputEvent::KeyDown && event.key == Key_F)
         {
             if (selectedTargetNetId != 0)
@@ -1121,52 +1194,52 @@ int RunGame(NativeWindow& window,
             return;
         }
 #if defined(IXTREEME_WITH_EDITOR)
-        if (event.type == InputEvent::KeyDown && event.key == Key_F2 && noesis.IsMapEditorOpen())
+        if (event.type == InputEvent::KeyDown && event.key == Key_F2 && gameClient.IsMapEditorOpen())
         {
-            if (noesis.OnInput(event))
+            if (gameClient.OnInput(event))
                 return;
         }
         if (event.type == InputEvent::KeyDown && event.key == Key_F2 && terrainOk)
         {
             terrain.ToggleWalkabilityDebug();
-            if (!terrain.IsWalkabilityDebugEnabled() && noesis.IsMapEditorOpen())
+            if (!terrain.IsWalkabilityDebugEnabled() && gameClient.IsMapEditorOpen())
             {
-                noesis.ToggleMapEditor();
+                gameClient.ToggleMapEditor();
                 terrain.SetMapEditorOpen(false);
                 cameraController.SetEditorFlyMode(false);
             }
             return;
         }
         if (event.type == InputEvent::KeyDown && event.key == Key_F4 && terrainOk &&
-            noesis.IsInWorld())
+            gameClient.IsInWorld())
         {
-            noesis.ToggleMapEditor();
-            noesis.ClearKeyboardFocus();
-            terrain.SetMapEditorOpen(noesis.IsMapEditorOpen());
-            cameraController.SetEditorFlyMode(noesis.IsMapEditorOpen());
-            if (!noesis.IsMapEditorOpen())
+            gameClient.ToggleMapEditor();
+            gameClient.ClearKeyboardFocus();
+            terrain.SetMapEditorOpen(gameClient.IsMapEditorOpen());
+            cameraController.SetEditorFlyMode(gameClient.IsMapEditorOpen());
+            if (!gameClient.IsMapEditorOpen())
             {
                 selectedEditorObject = {};
                 editorObjectDragActive = false;
-                noesis.SetEditorStatus("Editor closed");
+                gameClient.SetEditorStatus("Editor closed");
             }
             else
             {
-                noesis.SetEditorStatus("Editor fly camera active: RMB look, WASD move, Space/Ctrl up/down");
+                gameClient.SetEditorStatus("Editor fly camera active: RMB look, WASD move, Space/Ctrl up/down");
             }
             return;
         }
 
-        if (terrainOk && noesis.IsMapEditorOpen())
+        if (terrainOk && gameClient.IsMapEditorOpen())
         {
             if (editorTextInputFocused &&
                 (event.type == InputEvent::KeyDown ||
                  event.type == InputEvent::KeyUp ||
                  event.type == InputEvent::Char))
             {
-                noesis.OnInput(event);
+                gameClient.OnInput(event);
                 if (event.type == InputEvent::KeyDown && event.key == Key_Enter)
-                    noesis.ClearKeyboardFocus();
+                    gameClient.ClearKeyboardFocus();
                 return;
             }
 
@@ -1177,23 +1250,23 @@ int RunGame(NativeWindow& window,
                     if (event.key == Key_W)
                     {
                         editorGizmoMode = EditorGizmoMode::Translate;
-                        noesis.SetEditorStatus("Gizmo: translate");
+                        gameClient.SetEditorStatus("Gizmo: translate");
                     }
                     else if (event.key == Key_E)
                     {
                         editorGizmoMode = EditorGizmoMode::Rotate;
-                        noesis.SetEditorStatus("Gizmo: rotate");
+                        gameClient.SetEditorStatus("Gizmo: rotate");
                     }
                     else if (event.key == Key_R)
                     {
                         editorGizmoMode = EditorGizmoMode::Scale;
-                        noesis.SetEditorStatus("Gizmo: scale");
+                        gameClient.SetEditorStatus("Gizmo: scale");
                     }
                     else if (event.key == Key_Delete && selectedEditorObject.type == SelectedEditorObjectType::WaterBody)
                     {
                         editorWaterBodies.erase(std::remove_if(editorWaterBodies.begin(), editorWaterBodies.end(),
                             [&](const WaterBody& body) { return body.id == selectedEditorObject.id; }), editorWaterBodies.end());
-                        noesis.SetEditorStatus("Deleted water body #" + std::to_string(selectedEditorObject.id));
+                        gameClient.SetEditorStatus("Deleted water body #" + std::to_string(selectedEditorObject.id));
                         selectedEditorObject = {};
                         editorWaterBodiesDirty = true;
                         return;
@@ -1209,7 +1282,7 @@ int RunGame(NativeWindow& window,
                 event.type == InputEvent::MouseUp ||
                 event.type == InputEvent::MouseWheel)
             {
-                consumedByEditorUi = noesis.OnInput(event);
+                consumedByEditorUi = gameClient.OnInput(event);
                 const MapEditorSettings editorSettings = editorImGui.GetMapEditorSettings();
                 auto selectedWaterBodyIt = [&]() {
                     return std::find_if(editorWaterBodies.begin(), editorWaterBodies.end(),
@@ -1274,7 +1347,7 @@ int RunGame(NativeWindow& window,
                         {
                             editorWaterBodiesDirty = true;
                             waterSculptMeshRegenPending = true;
-                            noesis.SetEditorStatus("Water sculpt stroke: " +
+                            gameClient.SetEditorStatus("Water sculpt stroke: " +
                                 std::to_string(waterSculptStrokeModifiedCells) + " cells modified");
                         }
                         Tracenf("[WATER-OBJ-5] Brush stroke ended: body_id=%u mode=%s cells_modified=%u",
@@ -1330,7 +1403,7 @@ int RunGame(NativeWindow& window,
                 else if (!consumedByEditorUi)
                 {
                     if (event.type == InputEvent::MouseDown)
-                        noesis.ClearKeyboardFocus();
+                        gameClient.ClearKeyboardFocus();
 
                     if (event.type == InputEvent::MouseDown && event.button == MouseButton_Left && hasLastPickCamera)
                     {
@@ -1345,7 +1418,7 @@ int RunGame(NativeWindow& window,
                             editorObjectDragActive = true;
                             editorObjectDragLastX = event.x;
                             editorObjectDragLastY = event.y;
-                            noesis.SetEditorStatus("Selected point light #" + std::to_string(*pointId));
+                            gameClient.SetEditorStatus("Selected point light #" + std::to_string(*pointId));
                             return;
                         }
                         if (auto spotId = PickDynamicLight(editorSpotLights,
@@ -1359,7 +1432,7 @@ int RunGame(NativeWindow& window,
                             editorObjectDragActive = true;
                             editorObjectDragLastX = event.x;
                             editorObjectDragLastY = event.y;
-                            noesis.SetEditorStatus("Selected spot light #" + std::to_string(*spotId));
+                            gameClient.SetEditorStatus("Selected spot light #" + std::to_string(*spotId));
                             return;
                         }
                         if (auto waterId = PickWaterBody(editorWaterBodies,
@@ -1373,7 +1446,7 @@ int RunGame(NativeWindow& window,
                             editorObjectDragActive = true;
                             editorObjectDragLastX = event.x;
                             editorObjectDragLastY = event.y;
-                            noesis.SetEditorStatus("Selected water body #" + std::to_string(*waterId));
+                            gameClient.SetEditorStatus("Selected water body #" + std::to_string(*waterId));
                             return;
                         }
                     }
@@ -1487,7 +1560,7 @@ int RunGame(NativeWindow& window,
                     event.type == InputEvent::MouseMove ||
                     ((event.type == InputEvent::MouseDown || event.type == InputEvent::MouseUp) &&
                      event.button == MouseButton_Right);
-                if (!consumedByEditorUi && noesis.IsInWorld() && cameraMouse)
+                if (!consumedByEditorUi && gameClient.IsInWorld() && cameraMouse)
                     cameraController.HandleInput(event);
                 return;
             }
@@ -1496,10 +1569,10 @@ int RunGame(NativeWindow& window,
         if (terrainOk && terrain.HandleEditorInput(event))
             return;
 #endif
-        if (noesis.IsInWorld() && cameraController.HandleInput(event))
+        if (gameClient.IsInWorld() && cameraController.HandleInput(event))
             return;
 
-        if (!noesis.OnInput(event))
+        if (!gameClient.OnInput(event))
         {
             // TODO: forward unconsumed events to the game/3D scene input path.
             //LogUnhandledInput(event);
@@ -1552,13 +1625,13 @@ int RunGame(NativeWindow& window,
                     terrain.RecreatePipeline(device);
                 if (nameplatesOk)
                     nameplates.RecreatePipeline(device);
-                noesis.OnRenderPassChanged(device);
+                gameClient.OnRenderPassChanged(device);
                 rmlUi.OnRenderPassChanged(device);
 #if defined(IXTREEME_WITH_EDITOR)
                 editorImGui.OnRenderPassChanged(device);
 #endif
                 renderSize = device.GetSwapchainExtent();
-                noesis.Resize(renderSize.width, renderSize.height);
+                gameClient.Resize(renderSize.width, renderSize.height);
                 rmlUi.Resize(renderSize.width, renderSize.height);
             }
             else
@@ -1573,7 +1646,7 @@ int RunGame(NativeWindow& window,
             std::vector<std::string> dropped;
             dropped.swap(pendingDroppedFiles);
             Tracenf("[ASSET-DROP] queued file drop import: %zu path(s)", dropped.size());
-            noesis.ImportDroppedFiles(dropped);
+            gameClient.ImportDroppedFiles(dropped);
             editorImGui.RefreshAssetLibrary();
         }
 #endif
@@ -1587,20 +1660,20 @@ int RunGame(NativeWindow& window,
         clientSession.SendMoveInput(
             movement.DirectionAngle(cameraController.MovementYaw()),
             cameraController.IsFlyMode() ? client::net::MoveState::Idle : movement.State());
-        noesis.Update(seconds);
+        gameClient.Update(seconds);
         rmlUi.Update();
 
         std::vector<WorldRenderEntity> frameEntities;
         WorldCamera frameCamera{};
         bool hasFrameCamera = false;
-        if (noesis.IsInWorld())
+        if (gameClient.IsInWorld())
         {
-            frameEntities = noesis.GetWorldEntities();
+            frameEntities = gameClient.GetWorldEntities();
             WorldVec3 cameraTarget{};
             bool hasOwn = false;
             for (const auto& entity : frameEntities)
             {
-                if (entity.netId == noesis.GetOwnNetId())
+                if (entity.netId == gameClient.GetOwnNetId())
                 {
                     cameraTarget = ServerMetersToDisplay(entity.position);
                     hasOwn = true;
@@ -1622,13 +1695,45 @@ int RunGame(NativeWindow& window,
             if (selectedTargetNetId != 0 && !selectedStillVisible)
                 selectedTargetNetId = 0;
 
+            RmlHudData hudData{};
+            const WorldRenderEntity* ownEntity = nullptr;
+            const WorldRenderEntity* targetEntity = nullptr;
+            for (const WorldRenderEntity& entity : frameEntities)
+            {
+                if (entity.netId == gameClient.GetOwnNetId())
+                    ownEntity = &entity;
+                if (selectedTargetNetId != 0 && entity.netId == selectedTargetNetId)
+                    targetEntity = &entity;
+            }
+            if (!ownEntity && !frameEntities.empty())
+                ownEntity = &frameEntities.front();
+            if (ownEntity)
+            {
+                hudData.playerName = ownEntity->name.empty() ? "Player" : ownEntity->name;
+                hudData.playerLevel = static_cast<int>(std::max(1u, ownEntity->level));
+                hudData.currentHp = ownEntity->hpCurrent;
+                hudData.maxHp = ownEntity->hpMax <= 0.0f ? 1.0f : ownEntity->hpMax;
+                const WorldVec3 displayPos = ServerMetersToDisplay(ownEntity->position);
+                hudData.playerX = displayPos.x;
+                hudData.playerZ = displayPos.z;
+            }
+            hudData.hasTarget = targetEntity != nullptr && targetEntity != ownEntity;
+            if (hudData.hasTarget)
+            {
+                hudData.targetName = targetEntity->name.empty() ? "Target" : targetEntity->name;
+                hudData.targetLevel = static_cast<int>(std::max(1u, targetEntity->level));
+                hudData.targetCurrentHp = targetEntity->hpCurrent;
+                hudData.targetMaxHp = targetEntity->hpMax <= 0.0f ? 1.0f : targetEntity->hpMax;
+            }
+            rmlUi.UpdateHud(hudData);
+
 #if defined(IXTREEME_WITH_EDITOR)
             if (terrainOk)
             {
-                terrain.SetMapEditorOpen(noesis.IsMapEditorOpen());
+                terrain.SetMapEditorOpen(gameClient.IsMapEditorOpen());
                 const MapEditorSettings editorSettings = editorImGui.GetMapEditorSettings();
                 terrain.SetMapEditorSettings(editorSettings);
-                MapEditorCommands commands = noesis.ConsumeMapEditorCommands();
+                MapEditorCommands commands = gameClient.ConsumeMapEditorCommands();
                 MergeMapEditorCommands(commands, editorImGui.ConsumeCommands());
                 if (commands.gizmoSettingsChanged)
                 {
@@ -1671,7 +1776,7 @@ int RunGame(NativeWindow& window,
                     selectedEditorObject = {SelectedEditorObjectType::WaterBody, body.id};
                     editorGizmoMode = EditorGizmoMode::Translate;
                     editorWaterBodiesDirty = true;
-                    noesis.SetEditorStatus("Water body spawned: id=" + std::to_string(body.id) +
+                    gameClient.SetEditorStatus("Water body spawned: id=" + std::to_string(body.id) +
                         " name=" + body.name);
                     Tracenf("[EDITOR-3D-SPAWN] Spawn at cursor: type=water position=(%.2f,%.2f,%.2f)",
                         spawn.x, spawn.y, spawn.z);
@@ -1680,7 +1785,7 @@ int RunGame(NativeWindow& window,
                 {
                     if (editorPointLights.size() >= kMaxDynamicPointLights)
                     {
-                        noesis.SetEditorStatus("Maximum point lights reached (16)");
+                        gameClient.SetEditorStatus("Maximum point lights reached (16)");
                     }
                     else
                     {
@@ -1693,7 +1798,7 @@ int RunGame(NativeWindow& window,
                         editorPointLights.push_back(light);
                         selectedEditorObject = {SelectedEditorObjectType::PointLight, light.id};
                         editorGizmoMode = EditorGizmoMode::Translate;
-                        noesis.SetEditorStatus("Added point light #" + std::to_string(light.id));
+                        gameClient.SetEditorStatus("Added point light #" + std::to_string(light.id));
                         Tracenf("[EDITOR-3D-SPAWN] Spawn at cursor: type=point_light position=(%.2f,%.2f,%.2f)",
                             spawn.x, spawn.y, spawn.z);
                     }
@@ -1702,7 +1807,7 @@ int RunGame(NativeWindow& window,
                 {
                     if (editorSpotLights.size() >= kMaxDynamicSpotLights)
                     {
-                        noesis.SetEditorStatus("Maximum spot lights reached (16)");
+                        gameClient.SetEditorStatus("Maximum spot lights reached (16)");
                     }
                     else
                     {
@@ -1716,7 +1821,7 @@ int RunGame(NativeWindow& window,
                         editorSpotLights.push_back(light);
                         selectedEditorObject = {SelectedEditorObjectType::SpotLight, light.id};
                         editorGizmoMode = EditorGizmoMode::Translate;
-                        noesis.SetEditorStatus("Added spot light #" + std::to_string(light.id));
+                        gameClient.SetEditorStatus("Added spot light #" + std::to_string(light.id));
                         Tracenf("[EDITOR-3D-SPAWN] Spawn at cursor: type=spot_light position=(%.2f,%.2f,%.2f)",
                             spawn.x, spawn.y, spawn.z);
                     }
@@ -1753,14 +1858,14 @@ int RunGame(NativeWindow& window,
                     {
                         editorPointLights.erase(std::remove_if(editorPointLights.begin(), editorPointLights.end(),
                             [&](const PointLight& light) { return light.id == selectedEditorObject.id; }), editorPointLights.end());
-                        noesis.SetEditorStatus("Deleted point light #" + std::to_string(selectedEditorObject.id));
+                        gameClient.SetEditorStatus("Deleted point light #" + std::to_string(selectedEditorObject.id));
                         selectedEditorObject = {};
                     }
                     else if (selectedEditorObject.type == SelectedEditorObjectType::SpotLight)
                     {
                         editorSpotLights.erase(std::remove_if(editorSpotLights.begin(), editorSpotLights.end(),
                             [&](const SpotLight& light) { return light.id == selectedEditorObject.id; }), editorSpotLights.end());
-                        noesis.SetEditorStatus("Deleted spot light #" + std::to_string(selectedEditorObject.id));
+                        gameClient.SetEditorStatus("Deleted spot light #" + std::to_string(selectedEditorObject.id));
                         selectedEditorObject = {};
                     }
                 }
@@ -1781,7 +1886,7 @@ int RunGame(NativeWindow& window,
                         ? std::string("watermat_Default_Water")
                         : commands.selectedWaterBody.materialId;
                     if (editorImGui.OpenWaterMaterialEditor(materialId))
-                        noesis.SetEditorStatus("Editing water material: " + materialId);
+                        gameClient.SetEditorStatus("Editing water material: " + materialId);
                 }
                 if (commands.waterMaterialDeleted)
                 {
@@ -1800,7 +1905,7 @@ int RunGame(NativeWindow& window,
                         if (selectedIt != editorWaterBodies.end() &&
                             selectedIt->materialId == "watermat_Default_Water")
                         {
-                            noesis.SetEditorStatus("Deleted material replaced with default on selected water body");
+                            gameClient.SetEditorStatus("Deleted material replaced with default on selected water body");
                         }
                     }
                 }
@@ -1809,7 +1914,7 @@ int RunGame(NativeWindow& window,
                 {
                     editorWaterBodies.erase(std::remove_if(editorWaterBodies.begin(), editorWaterBodies.end(),
                         [&](const WaterBody& body) { return body.id == selectedEditorObject.id; }), editorWaterBodies.end());
-                    noesis.SetEditorStatus("Water body deleted: id=" + std::to_string(selectedEditorObject.id));
+                    gameClient.SetEditorStatus("Water body deleted: id=" + std::to_string(selectedEditorObject.id));
                     selectedEditorObject = {};
                     editorWaterBodiesDirty = true;
                 }
@@ -1842,7 +1947,7 @@ int RunGame(NativeWindow& window,
                 editorImGui.SetDynamicLightEditorState(dynamicLightState);
                 WaterBodyEditorState waterBodyState = BuildWaterBodyEditorState(editorWaterBodies,
                     selectedEditorObject.type == SelectedEditorObjectType::WaterBody ? selectedEditorObject.id : 0u);
-                noesis.SetWaterBodyEditorState(waterBodyState);
+                gameClient.SetWaterBodyEditorState(waterBodyState);
                 editorImGui.SetWaterBodyEditorState(waterBodyState);
 
                 LightingState lightingState = editorImGui.GetLightingState();
@@ -1942,9 +2047,9 @@ int RunGame(NativeWindow& window,
         if (device.IsFrameActive())
         {
 #if defined(IXTREEME_WITH_EDITOR)
-            editorImGui.BeginFrame(noesis.IsMapEditorOpen());
+            editorImGui.BeginFrame(gameClient.IsMapEditorOpen());
 #endif
-            const bool isInWorld = noesis.IsInWorld();
+            const bool isInWorld = gameClient.IsInWorld();
             std::vector<WorldRenderEntity> entities;
             WorldCamera camera{};
 
@@ -1966,7 +2071,7 @@ int RunGame(NativeWindow& window,
                             static_cast<float>(seconds));
                         ++skinSlot;
                     }
-                    if (noesis.IsMapEditorOpen())
+                    if (gameClient.IsMapEditorOpen())
                     {
                         const size_t editorVisualRenderCount =
                             editorPointLights.size() + editorSpotLights.size();
@@ -1983,7 +2088,7 @@ int RunGame(NativeWindow& window,
                     }
                 }
             }
-            else if (noesis.IsLobbyActive() && warriorOk)
+            else if (gameClient.IsLobbyActive() && warriorOk)
             {
                 warrior.Skin(device, seconds);
             }
@@ -2027,7 +2132,7 @@ int RunGame(NativeWindow& window,
                             ++skinSlot;
                         }
 
-                        if (noesis.IsMapEditorOpen())
+                        if (gameClient.IsMapEditorOpen())
                         {
                             for (const auto& light : editorPointLights)
                             {
@@ -2075,7 +2180,6 @@ int RunGame(NativeWindow& window,
                     });
             }
 
-            noesis.RenderOffscreen(device);
             const bool useOffscreenScene = offscreenSceneOk && device.IsFrameActive();
             if (useOffscreenScene)
                 offscreenScene.BeginMainPass(device);
@@ -2136,7 +2240,7 @@ int RunGame(NativeWindow& window,
                         entity.netId == selectedTargetNetId});
                     ++skinSlot;
                 }
-                if (warriorOk && noesis.IsMapEditorOpen())
+                if (warriorOk && gameClient.IsMapEditorOpen())
                 {
                     for (const auto& light : editorPointLights)
                     {
@@ -2202,7 +2306,7 @@ int RunGame(NativeWindow& window,
                 if (!useOffscreenScene && nameplatesOk)
                     nameplates.Render(device, camera, plates);
             }
-            else if (noesis.IsLobbyActive() && warriorOk)
+            else if (gameClient.IsLobbyActive() && warriorOk)
                 warrior.Render(device, seconds);
 
             if (useOffscreenScene)
@@ -2224,7 +2328,6 @@ int RunGame(NativeWindow& window,
                 if (isInWorld && nameplatesOk)
                     nameplates.Render(device, camera, plates);
             }
-            noesis.RenderOnscreen(device);
             rmlUi.Render(device);
 #if defined(IXTREEME_WITH_EDITOR)
             editorImGui.Render(device);
@@ -2251,7 +2354,7 @@ int RunGame(NativeWindow& window,
 #endif
 #endif
     rmlUi.Destroy();
-    noesis.Destroy();
+    gameClient.Destroy();
     device.Destroy();
     return 0;
 }
@@ -2271,7 +2374,7 @@ int WINAPI WinMain(HINSTANCE instance, HINSTANCE, LPSTR, int showCommand)
     }
 
     NativeWindow_Win32 window;
-    if (!window.Create(instance, "Standalone Vulkan Clear - Noesis Overlay", 1280, 720))
+    if (!window.Create(instance, "Standalone Vulkan Clear - gameClient Overlay", 1280, 720))
     {
         ShowFatal("Failed to create Win32 window.");
         WSACleanup();
@@ -2309,3 +2412,4 @@ extern "C" void android_main(android_app* state)
     g_androidApp = nullptr;
 }
 #endif
+

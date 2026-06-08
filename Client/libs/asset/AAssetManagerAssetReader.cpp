@@ -40,7 +40,7 @@ AAssetManagerAssetReader::AAssetManagerAssetReader(AAssetManager* manager)
     DumpAssetDirectory("");
     DumpAssetDirectory("xaml");
     DumpAssetDirectory("assets");
-    DumpAssetDirectory("assets/xaml");
+    DumpAssetDirectory("assets/ui");
 }
 
 void AAssetManagerAssetReader::DumpAssetDirectory(const std::string& directory) const

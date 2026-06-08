@@ -5,11 +5,11 @@ add_library(client_render STATIC
     CubeRenderer.h
     EditorImGui.cpp
     EditorImGui.h
+    GameClientLayer.cpp
+    GameClientLayer.h
     MapEditorTypes.h
     NameplateRenderer.cpp
     NameplateRenderer.h
-    NoesisLayer.cpp
-    NoesisLayer.h
     OffscreenSceneRenderer.cpp
     OffscreenSceneRenderer.h
     RmlUiLayer.cpp
@@ -22,11 +22,6 @@ add_library(client_render STATIC
     WarriorRenderer.h
     WorldCamera.h
     WorldComponents.h
-    "${NOESIS_APPLICATIONLAUNCHER}/Src/DelegateCommand.cpp"
-    "${NOESIS_APPLICATIONLAUNCHER}/Src/NotifyPropertyChangedBase.cpp"
-    "${NOESIS_PROVIDERS}/Src/FastLZ.cpp"
-    "${NOESIS_VKRENDERDEVICE}/Src/Render.VKRenderDevice.cpp"
-    "${NOESIS_VKRENDERDEVICE}/Src/VKRenderDevice.cpp"
 )
 
 target_include_directories(client_render
@@ -34,17 +29,10 @@ target_include_directories(client_render
         ${CMAKE_CURRENT_SOURCE_DIR}
         ${CLIENT_LIBS_DIR}
         ${STB_INCLUDE_DIR}
-        "${NOESIS_SDK}/Include"
-        "${NOESIS_PROVIDERS}/Include"
-        "${NOESIS_VKRENDERDEVICE}/Include"
-        "${NOESIS_SDK}/Src/Packages/App/ApplicationLauncher/Include"
 )
 
 target_compile_definitions(client_render
     PUBLIC
-        NS_APP_PROVIDERS_API=
-        NS_APP_APPLICATIONLAUNCHER_API=
-        NS_RENDER_VKRENDERDEVICE_API=
         $<$<BOOL:${IXTREEME_WITH_EDITOR}>:IXTREEME_WITH_EDITOR=1>
         $<$<PLATFORM_ID:Windows>:WIN32_LEAN_AND_MEAN>
         $<$<PLATFORM_ID:Windows>:NOMINMAX>
@@ -66,7 +54,6 @@ if(WIN32)
     target_link_libraries(client_render
         PUBLIC
             Vulkan::Vulkan
-            "${NOESIS_SDK}/Lib/windows_x86_64/Noesis.lib"
             Gdi32
             Advapi32
     )
@@ -81,7 +68,6 @@ if(WIN32)
 elseif(ANDROID)
     target_link_libraries(client_render
         PUBLIC
-            Noesis_imported
             vulkan
             log
             android

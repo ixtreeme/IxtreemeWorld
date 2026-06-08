@@ -235,7 +235,7 @@ bool CreateHostVisibleBuffer(VulkanDevice& device, VkDevice vkDevice, VkDeviceSi
 
 VkRect2D PreviewRect(VkExtent2D extent)
 {
-    // TODO: derive this from the actual Lobby.xaml preview-frame bounds instead of mirroring the current fixed layout.
+    // TODO: derive this from the RmlUi lobby preview-frame bounds instead of mirroring the current fixed layout.
     const int32_t cardWidth = 940;
     const int32_t cardHeight = 492;
     const int32_t cardX = std::max<int32_t>(0, (static_cast<int32_t>(extent.width) - cardWidth) / 2);

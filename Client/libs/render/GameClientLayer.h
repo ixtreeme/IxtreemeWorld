@@ -6,10 +6,10 @@
 #include "network/IClientHandler.h"
 #include "WorldCamera.h"
 
+#include <array>
 #include <cstdint>
 #include <functional>
 #include <memory>
-#include <array>
 #include <string>
 #include <vector>
 
@@ -37,17 +37,14 @@ struct WorldRenderEntity
     float hpDisplayed = 1.0f;
 };
 
-class NoesisLayer : public client::net::IClientHandler
+class GameClientLayer : public client::net::IClientHandler
 {
 public:
-    NoesisLayer();
-    ~NoesisLayer();
+    GameClientLayer();
+    ~GameClientLayer();
 
-    bool Create(VulkanDevice& device, client::asset::IAssetReader& assets, uint32_t width,
-        uint32_t height);
+    bool Create(VulkanDevice& device, client::asset::IAssetReader& assets, uint32_t width, uint32_t height);
     void Update(double timeSeconds);
-    void RenderOffscreen(VulkanDevice& device);
-    void RenderOnscreen(VulkanDevice& device);
     void OnRenderPassChanged(VulkanDevice& device);
     void Resize(uint32_t width, uint32_t height);
     bool IsLobbyActive() const;
@@ -75,6 +72,15 @@ public:
     void ImportDroppedFiles(const std::vector<std::string>& paths);
     void SetQuitCallback(std::function<void()> callback);
     void SetClientSession(client::net::ClientSession* session);
+    void SetLoginCallbacks(std::function<void()> acceptedCallback,
+                           std::function<void(const std::string&)> statusCallback);
+    void SubmitLogin(const std::string& username, const std::string& password, bool remember);
+    void SetLobbyCallbacks(std::function<void()> shownCallback,
+                           std::function<void(const std::vector<client::net::CharacterListItem>&)> charactersCallback,
+                           std::function<void(const std::string&)> statusCallback,
+                           std::function<void()> enteredWorldCallback);
+    void EnterWorldWithCharacter(std::uint64_t characterId);
+    void LogoutToLogin();
     bool OnInput(const InputEvent& event);
 
     void OnConnectionFailed(const std::string& reason) override;

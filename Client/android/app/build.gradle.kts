@@ -56,12 +56,6 @@ val copyVulkanClearSo by tasks.registering(Copy::class) {
     into("src/main/jniLibs/arm64-v8a")
 }
 
-val copyNoesisSo by tasks.registering(Copy::class) {
-    val noesisLib = file("D:/SDK/NoesisGUI-3.2.13/Bin/android_arm64/libNoesis.so")
-    from(noesisLib)
-    into("src/main/jniLibs/arm64-v8a")
-}
-
 val copyAssets by tasks.registering(Copy::class) {
     val clientAssets = file("${rootDir}/../assets")
     from(clientAssets)
@@ -69,5 +63,5 @@ val copyAssets by tasks.registering(Copy::class) {
 }
 
 tasks.named("preBuild") {
-    dependsOn(copyVulkanClearSo, copyNoesisSo, copyAssets)
+    dependsOn(copyVulkanClearSo, copyAssets)
 }

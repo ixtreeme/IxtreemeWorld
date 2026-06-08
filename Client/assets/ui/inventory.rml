@@ -1,0 +1,16 @@
+<rml>
+<head>
+    <title>Inventory</title>
+    <link type="text/rcss" href="inventory.rcss" />
+</head>
+<body>
+    <div class="inventory-window">
+        <div class="title-row">
+            <h2>Inventory</h2>
+            <button id="inventory-close-btn" class="close-button">Close</button>
+        </div>
+        <div id="inventory-grid" class="inventory-grid"></div>
+        <p class="status-text">Inventory backend placeholder</p>
+    </div>
+</body>
+</rml>

@@ -39,9 +39,6 @@ if(WIN32)
     )
 
     add_custom_command(TARGET VulkanClear POST_BUILD
-        COMMAND ${CMAKE_COMMAND} -E copy_if_different
-            "${NOESIS_SDK}/Bin/windows_x86_64/Noesis.dll"
-            "$<TARGET_FILE_DIR:VulkanClear>/Noesis.dll"
         COMMAND ${CMAKE_COMMAND} -E copy_directory
             "${CLIENT_ROOT}/assets"
             "$<TARGET_FILE_DIR:VulkanClear>/assets"

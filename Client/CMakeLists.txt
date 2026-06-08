@@ -175,11 +175,6 @@ set(ozz_build_postfix OFF CACHE BOOL "" FORCE)
 add_subdirectory(${OZZ_ROOT} ozz_build)
 set(CLIENT_OZZ_TARGETS ozz_animation ozz_base)
 
-set(NOESIS_SDK "D:/SDK/NoesisGUI-3.2.13" CACHE PATH "NoesisGUI SDK root")
-set(NOESIS_VKRENDERDEVICE "${NOESIS_SDK}/Src/Packages/Render/VKRenderDevice")
-set(NOESIS_PROVIDERS "${NOESIS_SDK}/Src/Packages/App/Providers")
-set(NOESIS_APPLICATIONLAUNCHER "${NOESIS_SDK}/Src/Packages/App/ApplicationLauncher")
-
 if(WIN32)
     find_package(Vulkan REQUIRED)
     find_program(DXC_EXECUTABLE
@@ -366,16 +361,6 @@ elseif(ANDROID)
         message(FATAL_ERROR "Android NDK path is not available. Set ANDROID_NDK_HOME.")
     endif()
 
-    set(NOESIS_ANDROID_LIB "${NOESIS_SDK}/Bin/android_arm64/libNoesis.so")
-    if(NOT EXISTS "${NOESIS_ANDROID_LIB}")
-        message(FATAL_ERROR "NoesisGUI Android library not found at: ${NOESIS_ANDROID_LIB}")
-    endif()
-
-    add_library(Noesis_imported SHARED IMPORTED)
-    set_target_properties(Noesis_imported PROPERTIES
-        IMPORTED_LOCATION "${NOESIS_ANDROID_LIB}"
-        INTERFACE_INCLUDE_DIRECTORIES "${NOESIS_SDK}/Include"
-    )
 endif()
 
 add_subdirectory(libs/platform)

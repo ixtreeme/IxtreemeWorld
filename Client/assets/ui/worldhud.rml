@@ -1,0 +1,71 @@
+<rml>
+<head>
+    <title>HUD - AURIGA GLOBAL</title>
+    <link type="text/rcss" href="worldhud.rcss" />
+</head>
+<body>
+    <div class="hud-screen">
+        <div class="player-frame">
+            <div class="player-header">
+                <span id="player-name" class="player-name">Player</span>
+                <span id="player-level" class="player-level">Lv. 1</span>
+            </div>
+
+            <div class="bar-container">
+                <div class="bar-label">
+                    <span class="bar-name">HP</span>
+                    <span id="hp-text" class="bar-value">100 / 100</span>
+                </div>
+                <div class="bar-track health-track">
+                    <div id="hp-fill" class="bar-fill health-fill"></div>
+                </div>
+            </div>
+
+            <div class="bar-container">
+                <div class="bar-label">
+                    <span class="bar-name">MP</span>
+                    <span id="mp-text" class="bar-value">50 / 50</span>
+                </div>
+                <div class="bar-track mana-track">
+                    <div id="mp-fill" class="bar-fill mana-fill"></div>
+                </div>
+            </div>
+
+            <div class="bar-container exp-container">
+                <div class="bar-label">
+                    <span class="bar-name">XP</span>
+                    <span id="xp-text" class="bar-value">0 / 1000</span>
+                </div>
+                <div class="bar-track exp-track">
+                    <div id="xp-fill" class="bar-fill exp-fill"></div>
+                </div>
+            </div>
+        </div>
+
+        <div id="target-frame" class="target-frame">
+            <div class="target-header">
+                <span id="target-name" class="target-name">Target</span>
+                <span id="target-level" class="target-level">Lv. 1</span>
+            </div>
+            <div class="bar-track health-track">
+                <div id="target-hp-fill" class="bar-fill health-fill"></div>
+            </div>
+            <span id="target-hp-text" class="target-hp-text">100 / 100</span>
+        </div>
+
+        <div class="minimap-frame">
+            <div class="minimap-header">
+                <span id="zone-name" class="zone-name">Starting Zone</span>
+            </div>
+            <div id="minimap-canvas" class="minimap-canvas">
+                <div class="minimap-crosshair horizontal"></div>
+                <div class="minimap-crosshair vertical"></div>
+                <div class="minimap-player-dot"></div>
+            </div>
+            <div class="minimap-coords">
+                <span id="player-coords">X: 0, Z: 0</span>
+            </div>
+        </div>
+    </div>
+</body>
+</rml>

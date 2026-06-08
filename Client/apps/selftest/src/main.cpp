@@ -698,16 +698,18 @@ bool RunRenderChecks(const Options& options, TestContext& ctx)
     ctx.Expect(terrainRendererSource.find("device.WaitIdle();\n    DestroyWaterBodyResources();") != std::string::npos,
         "water object SetWaterBodies wait-idle", "SetWaterBodies must wait before destroying in-flight GPU resources");
 
-    const std::filesystem::path noesisLayerPath = options.clientRoot / "libs" / "render" / "NoesisLayer.cpp";
-    std::ifstream noesisLayer(noesisLayerPath);
-    std::stringstream noesisLayerText;
-    noesisLayerText << noesisLayer.rdbuf();
-    const std::string noesisLayerSource = noesisLayerText.str();
-    const std::filesystem::path noesisLayerHeaderPath = options.clientRoot / "libs" / "render" / "NoesisLayer.h";
-    std::ifstream noesisLayerHeader(noesisLayerHeaderPath);
-    std::stringstream noesisLayerHeaderText;
-    noesisLayerHeaderText << noesisLayerHeader.rdbuf();
-    const std::string noesisLayerHeaderSource = noesisLayerHeaderText.str();
+    const std::string legacyUiName = "Noe" "sis";
+    const std::string legacyMarkupExt = ".xa" "ml";
+    const std::filesystem::path gameClientLayerPath = options.clientRoot / "libs" / "render" / "GameClientLayer.cpp";
+    std::ifstream gameClientLayer(gameClientLayerPath);
+    std::stringstream gameClientLayerText;
+    gameClientLayerText << gameClientLayer.rdbuf();
+    const std::string gameClientLayerSource = gameClientLayerText.str();
+    const std::filesystem::path gameClientLayerHeaderPath = options.clientRoot / "libs" / "render" / "GameClientLayer.h";
+    std::ifstream gameClientLayerHeader(gameClientLayerHeaderPath);
+    std::stringstream gameClientLayerHeaderText;
+    gameClientLayerHeaderText << gameClientLayerHeader.rdbuf();
+    const std::string gameClientLayerHeaderSource = gameClientLayerHeaderText.str();
     const std::filesystem::path editorImGuiPath = options.clientRoot / "libs" / "render" / "EditorImGui.cpp";
     std::ifstream editorImGui(editorImGuiPath);
     std::stringstream editorImGuiText;
@@ -723,21 +725,56 @@ bool RunRenderChecks(const Options& options, TestContext& ctx)
     std::stringstream rmlUiShaderText;
     rmlUiShaderText << rmlUiShader.rdbuf();
     const std::string rmlUiShaderSource = rmlUiShaderText.str();
-    const std::filesystem::path helloRmlPath = options.clientRoot / "assets" / "ui" / "hello.rml";
-    std::ifstream helloRml(helloRmlPath);
-    std::stringstream helloRmlText;
-    helloRmlText << helloRml.rdbuf();
-    const std::string helloRmlSource = helloRmlText.str();
-    const std::filesystem::path helloRcssPath = options.clientRoot / "assets" / "ui" / "hello.rcss";
-    std::ifstream helloRcss(helloRcssPath);
-    std::stringstream helloRcssText;
-    helloRcssText << helloRcss.rdbuf();
-    const std::string helloRcssSource = helloRcssText.str();
-    const std::filesystem::path editorPanelPath = options.clientRoot / "assets" / "xaml" / "EditorPanel.xaml";
-    std::ifstream editorPanel(editorPanelPath);
-    std::stringstream editorPanelText;
-    editorPanelText << editorPanel.rdbuf();
-    const std::string editorPanelSource = editorPanelText.str();
+    const std::filesystem::path loginRmlPath = options.clientRoot / "assets" / "ui" / "login.rml";
+    std::ifstream loginRml(loginRmlPath);
+    std::stringstream loginRmlText;
+    loginRmlText << loginRml.rdbuf();
+    const std::string loginRmlSource = loginRmlText.str();
+    const std::filesystem::path loginRcssPath = options.clientRoot / "assets" / "ui" / "login.rcss";
+    std::ifstream loginRcss(loginRcssPath);
+    std::stringstream loginRcssText;
+    loginRcssText << loginRcss.rdbuf();
+    const std::string loginRcssSource = loginRcssText.str();
+    const std::filesystem::path lobbyRmlPath = options.clientRoot / "assets" / "ui" / "lobby.rml";
+    std::ifstream lobbyRml(lobbyRmlPath);
+    std::stringstream lobbyRmlText;
+    lobbyRmlText << lobbyRml.rdbuf();
+    const std::string lobbyRmlSource = lobbyRmlText.str();
+    const std::filesystem::path lobbyRcssPath = options.clientRoot / "assets" / "ui" / "lobby.rcss";
+    std::ifstream lobbyRcss(lobbyRcssPath);
+    std::stringstream lobbyRcssText;
+    lobbyRcssText << lobbyRcss.rdbuf();
+    const std::string lobbyRcssSource = lobbyRcssText.str();
+    const std::filesystem::path worldHudRmlPath = options.clientRoot / "assets" / "ui" / "worldhud.rml";
+    std::ifstream worldHudRml(worldHudRmlPath);
+    std::stringstream worldHudRmlText;
+    worldHudRmlText << worldHudRml.rdbuf();
+    const std::string worldHudRmlSource = worldHudRmlText.str();
+    const std::filesystem::path worldHudRcssPath = options.clientRoot / "assets" / "ui" / "worldhud.rcss";
+    std::ifstream worldHudRcss(worldHudRcssPath);
+    std::stringstream worldHudRcssText;
+    worldHudRcssText << worldHudRcss.rdbuf();
+    const std::string worldHudRcssSource = worldHudRcssText.str();
+    const std::filesystem::path menuRmlPath = options.clientRoot / "assets" / "ui" / "ingame_menu.rml";
+    std::ifstream menuRml(menuRmlPath);
+    std::stringstream menuRmlText;
+    menuRmlText << menuRml.rdbuf();
+    const std::string menuRmlSource = menuRmlText.str();
+    const std::filesystem::path settingsRmlPath = options.clientRoot / "assets" / "ui" / "settings.rml";
+    std::ifstream settingsRml(settingsRmlPath);
+    std::stringstream settingsRmlText;
+    settingsRmlText << settingsRml.rdbuf();
+    const std::string settingsRmlSource = settingsRmlText.str();
+    const std::filesystem::path inventoryRmlPath = options.clientRoot / "assets" / "ui" / "inventory.rml";
+    std::ifstream inventoryRml(inventoryRmlPath);
+    std::stringstream inventoryRmlText;
+    inventoryRmlText << inventoryRml.rdbuf();
+    const std::string inventoryRmlSource = inventoryRmlText.str();
+    const std::filesystem::path creationRmlPath = options.clientRoot / "assets" / "ui" / "character_creation.rml";
+    std::ifstream creationRml(creationRmlPath);
+    std::stringstream creationRmlText;
+    creationRmlText << creationRml.rdbuf();
+    const std::string creationRmlSource = creationRmlText.str();
     const std::filesystem::path clientMainPath = options.clientRoot / "apps" / "client" / "src" / "main.cpp";
     std::ifstream clientMain(clientMainPath);
     std::stringstream clientMainText;
@@ -753,6 +790,16 @@ bool RunRenderChecks(const Options& options, TestContext& ctx)
     std::stringstream renderCmakeText;
     renderCmakeText << renderCmake.rdbuf();
     const std::string renderCmakeSource = renderCmakeText.str();
+    const std::filesystem::path clientCmakePath = options.clientRoot / "apps" / "client" / "CMakeLists.txt";
+    std::ifstream clientCmake(clientCmakePath);
+    std::stringstream clientCmakeText;
+    clientCmakeText << clientCmake.rdbuf();
+    const std::string clientCmakeSource = clientCmakeText.str();
+    const std::filesystem::path androidGradlePath = options.clientRoot / "android" / "app" / "build.gradle.kts";
+    std::ifstream androidGradle(androidGradlePath);
+    std::stringstream androidGradleText;
+    androidGradleText << androidGradle.rdbuf();
+    const std::string androidGradleSource = androidGradleText.str();
     ctx.Expect(rootCmakeSource.find("option(IXTREEME_WITH_EDITOR") != std::string::npos &&
             rootCmakeSource.find("if(IXTREEME_WITH_EDITOR)\n    vcpkg_require(imguizmo)") != std::string::npos &&
             rootCmakeSource.find("if(WIN32 AND IXTREEME_WITH_EDITOR)") != std::string::npos &&
@@ -766,16 +813,20 @@ bool RunRenderChecks(const Options& options, TestContext& ctx)
             rootCmakeSource.find("RmlUi.hlsl") != std::string::npos &&
             renderCmakeSource.find("RmlUiLayer.cpp") != std::string::npos &&
             renderCmakeSource.find("RmlUi::RmlUi") != std::string::npos &&
+            renderCmakeSource.find("GameClientLayer.cpp") != std::string::npos &&
             clientMainSource.find("RmlUiLayer rmlUi") != std::string::npos &&
-            clientMainSource.find("noesis.RenderOnscreen(device);\n            rmlUi.Render(device);") != std::string::npos &&
+            clientMainSource.find("GameClientLayer gameClient") != std::string::npos &&
+            clientMainSource.find("rmlUi.Render(device);") != std::string::npos &&
             clientMainSource.find("editorImGui.Render(device);") != std::string::npos,
-        "rmlui build and z-order pipeline", "RMLUI-1 must link RmlUi 6.2, compile shaders, and render between Noesis and ImGui");
+        "rmlui build and z-order pipeline", "RMLUI-1 must link RmlUi 6.2, compile shaders, and render before ImGui");
     ctx.Expect(rmlUiLayerSource.find("class RmlAssetFileInterface") != std::string::npos &&
             rmlUiLayerSource.find("class RmlRenderInterface final : public Rml::RenderInterface") != std::string::npos &&
             rmlUiLayerSource.find("CreateDescriptorPool") != std::string::npos &&
             rmlUiLayerSource.find("ProcessMouseButtonDown") != std::string::npos &&
-            rmlUiLayerSource.find("Event: type=%s element=test-button") != std::string::npos &&
-            rmlUiLayerSource.find("assets/ui/hello.rml") != std::string::npos &&
+            rmlUiLayerSource.find("Event: type=%s element=login-button") != std::string::npos &&
+            rmlUiLayerSource.find("assets/ui/login.rml") != std::string::npos &&
+            rmlUiLayerSource.find("SetLoginSubmitCallback") != std::string::npos &&
+            rmlUiLayerSource.find("Username and password required") != std::string::npos &&
             rmlUiLayerSource.find("[RMLUI-DIAG] CreateContext: viewport=") != std::string::npos &&
             rmlUiLayerSource.find("[RMLUI-DIAG] RenderGeometry: vertices=") != std::string::npos &&
             rmlUiLayerSource.find("[RMLUI-DIAG] vkCmdSetViewport") != std::string::npos &&
@@ -785,72 +836,99 @@ bool RunRenderChecks(const Options& options, TestContext& ctx)
             rmlUiShaderSource.find("[[vk::push_constant]]") != std::string::npos &&
             rmlUiShaderSource.find("[[vk::binding(0, 0)]] Texture2D") != std::string::npos &&
             rmlUiShaderSource.find("(pixel.y / g_push.viewport.y) * 2.0f - 1.0f") != std::string::npos,
-        "rmlui vulkan layer source", "RMLUI-1 must provide file, render, input, click-event, and Vulkan shader integration");
-    ctx.Expect(helloRmlSource.find("screen-root") != std::string::npos &&
-            helloRmlSource.find("RmlUi v6.2 active") != std::string::npos &&
-            helloRmlSource.find("test-button") != std::string::npos &&
-            helloRcssSource.find(".screen-root") != std::string::npos &&
-            helloRcssSource.find("right: 0") != std::string::npos &&
-            helloRcssSource.find("bottom: 0") != std::string::npos &&
-            helloRcssSource.find("background-color: transparent") != std::string::npos &&
-            helloRcssSource.find("background-color: rgba(24, 28, 44, 0.96)") != std::string::npos &&
-            helloRcssSource.find("linear-gradient") != std::string::npos &&
-            helloRcssSource.find("box-shadow") != std::string::npos &&
-            helloRcssSource.find("border-radius") != std::string::npos &&
-            helloRcssSource.find("transition: background") != std::string::npos,
-        "rmlui hello document styling", "RMLUI-1 hello panel must prove RML/RCSS styling and button markup");
-    ctx.Expect(editorPanelSource.find("AddWaterBodyButton") != std::string::npos &&
-            editorPanelSource.find("SelectedWaterBodySection") != std::string::npos &&
-            noesisLayerSource.find("OnAddWaterBodyClicked") != std::string::npos &&
-            noesisLayerSource.find("SetWaterBodyEditorState") != std::string::npos,
-        "water object editor UI source", "WATER-OBJ-3 editor button/inspector binding is missing");
-    ctx.Expect(editorPanelSource.find("SelectedWaterSculptButton") == std::string::npos &&
-            editorPanelSource.find("BrushRadiusSlider") == std::string::npos &&
-            editorPanelSource.find("ToolPaint") == std::string::npos &&
-            editorPanelSource.find("Slot0Button") == std::string::npos &&
-            editorImGuiSource.find("RenderWaterSculptToolPanel") != std::string::npos &&
+        "rmlui vulkan layer source", "RMLUI-2 must provide file, render, input, login event, and Vulkan shader integration");
+    ctx.Expect(loginRmlSource.find("AURIGA GLOBAL") != std::string::npos &&
+            loginRmlSource.find("login-username") != std::string::npos &&
+            loginRmlSource.find("login-password") != std::string::npos &&
+            loginRmlSource.find("login-remember") != std::string::npos &&
+            loginRmlSource.find("login-button") != std::string::npos &&
+            loginRmlSource.find("login-error") != std::string::npos &&
+            loginRcssSource.find(".login-screen") != std::string::npos &&
+            loginRcssSource.find(".login-panel") != std::string::npos &&
+            loginRcssSource.find(".login-button") != std::string::npos &&
+            loginRcssSource.find(".login-error") != std::string::npos &&
+            clientMainSource.find("rmlUi.SetLoginSubmitCallback") != std::string::npos &&
+            clientMainSource.find("gameClient.SetLoginCallbacks") != std::string::npos,
+        "rmlui login document and game handoff", "RMLUI-2 login must be RML/RCSS and call the existing backend login path");
+    ctx.Expect(lobbyRmlSource.find("Lobby - AURIGA GLOBAL") != std::string::npos &&
+            lobbyRmlSource.find("character-list") != std::string::npos &&
+            lobbyRmlSource.find("enter-world-btn") != std::string::npos &&
+            lobbyRmlSource.find("delete-char-btn") != std::string::npos &&
+            lobbyRmlSource.find("logout-btn") != std::string::npos &&
+            lobbyRmlSource.find("delete-confirm") != std::string::npos &&
+            lobbyRcssSource.find(".lobby-screen") != std::string::npos &&
+            lobbyRcssSource.find(".character-panel") != std::string::npos &&
+            lobbyRcssSource.find(".action-panel") != std::string::npos &&
+            lobbyRcssSource.find(".character-item.selected") != std::string::npos &&
+            rmlUiLayerSource.find("assets/ui/lobby.rml") != std::string::npos &&
+            rmlUiLayerSource.find("SetLobbyCharacters") != std::string::npos &&
+            rmlUiLayerSource.find("[RMLUI-LOBBY] Character list populated") != std::string::npos &&
+            clientMainSource.find("rmlUi.SetLobbyCallbacks") != std::string::npos &&
+            clientMainSource.find("gameClient.SetLobbyCallbacks") != std::string::npos,
+        "rmlui lobby document and game handoff", "RMLUI-3 lobby must be RML/RCSS and populate character data from callbacks");
+    ctx.Expect(worldHudRmlSource.find("HUD - AURIGA GLOBAL") != std::string::npos &&
+            worldHudRmlSource.find("player-name") != std::string::npos &&
+            worldHudRmlSource.find("hp-fill") != std::string::npos &&
+            worldHudRmlSource.find("mp-fill") != std::string::npos &&
+            worldHudRmlSource.find("xp-fill") != std::string::npos &&
+            worldHudRmlSource.find("target-frame") != std::string::npos &&
+            worldHudRmlSource.find("minimap-canvas") != std::string::npos &&
+            worldHudRcssSource.find(".player-frame") != std::string::npos &&
+            worldHudRcssSource.find(".target-frame") != std::string::npos &&
+            worldHudRcssSource.find(".minimap-frame") != std::string::npos &&
+            rmlUiLayerSource.find("assets/ui/worldhud.rml") != std::string::npos &&
+            rmlUiLayerSource.find("CacheHudElements") != std::string::npos &&
+            rmlUiLayerSource.find("void RmlUiLayer::UpdateHud") != std::string::npos &&
+            rmlUiLayerSource.find("SetProperty(\"width\"") != std::string::npos &&
+            clientMainSource.find("rmlUi.ShowHud()") != std::string::npos &&
+            clientMainSource.find("rmlUi.UpdateHud(hudData)") != std::string::npos,
+        "rmlui hud document and per-frame update", "RMLUI-4 HUD must be RML/RCSS and update bar widths by CSS property");
+    ctx.Expect(menuRmlSource.find("menu-resume-btn") != std::string::npos &&
+            menuRmlSource.find("menu-settings-btn") != std::string::npos &&
+            menuRmlSource.find("menu-logout-btn") != std::string::npos &&
+            settingsRmlSource.find("settings-tab-video") != std::string::npos &&
+            settingsRmlSource.find("settings-tab-audio") != std::string::npos &&
+            inventoryRmlSource.find("inventory-grid") != std::string::npos &&
+            creationRmlSource.find("character-name") != std::string::npos &&
+            rmlUiLayerSource.find("assets/ui/ingame_menu.rml") != std::string::npos &&
+            rmlUiLayerSource.find("SetInGameMenuCallbacks") != std::string::npos &&
+            rmlUiLayerSource.find("ToggleInventory") != std::string::npos &&
+            rmlUiLayerSource.find("ShowCharacterCreation") != std::string::npos &&
+            clientMainSource.find("event.key == Key_Escape") != std::string::npos &&
+            clientMainSource.find("event.key == Key_I") != std::string::npos,
+        "rmlui gameplay panels", "RMLUI-5 must provide menu, settings, inventory, character creation, and keyboard toggles");
+    ctx.Expect(!std::filesystem::exists(options.clientRoot / "libs" / "render" / ("Noe" "sisLayer.cpp")) &&
+            !std::filesystem::exists(options.clientRoot / "libs" / "render" / ("Noe" "sisLayer.h")) &&
+            renderCmakeSource.find(legacyUiName) == std::string::npos &&
+            rootCmakeSource.find(legacyUiName) == std::string::npos &&
+            clientCmakeSource.find(legacyUiName) == std::string::npos &&
+            androidGradleSource.find(legacyUiName) == std::string::npos &&
+            gameClientLayerSource.find(legacyUiName) == std::string::npos &&
+            rmlUiLayerSource.find(legacyUiName) == std::string::npos &&
+            clientMainSource.find(legacyUiName) == std::string::npos &&
+            renderCmakeSource.find(legacyMarkupExt) == std::string::npos &&
+            rootCmakeSource.find(legacyMarkupExt) == std::string::npos &&
+            clientCmakeSource.find(legacyMarkupExt) == std::string::npos,
+        "legacy ui removed", "RMLUI-5 must remove legacy UI source, CMake links, Android packaging, and markup assets");
+    ctx.Expect(editorImGuiSource.find("RenderWaterSculptToolPanel") != std::string::npos &&
             editorImGuiSource.find("RenderHeightmapToolPanel") != std::string::npos &&
             editorImGuiSource.find("RenderSplatPaintToolPanel") != std::string::npos &&
             editorImGuiSource.find("ImportAssetWithDialog") != std::string::npos &&
             editorImGuiSource.find("PickAssetFileForImport") != std::string::npos &&
             clientMainSource.find("editorSettings.toolMode == MapEditorToolMode::Heightmap") != std::string::npos &&
             clientMainSource.find("editorSettings.toolMode == MapEditorToolMode::SplatPaint") != std::string::npos,
-        "editor tool ui moved to imgui", "EDITOR-IMGUI-5 tool panels/import routing are missing or Noesis tool XAML remains");
+        "editor tool ui moved to imgui", "EDITOR-IMGUI-5 tool panels/import routing are missing or legacy tool markup remains");
     ctx.Expect(editorImGuiSource.find("RenderWaterMaterialEdgeFadeSection") != std::string::npos &&
             editorImGuiSource.find("SliderFloat(\"Edge Fade Distance\"") != std::string::npos &&
             editorImGuiSource.find("Combo(\"Edge Fade Curve\"") != std::string::npos &&
             editorImGuiSource.find("WaterConfig::EdgeFadeCurve") != std::string::npos,
         "water edge fade imgui material editor source", "WATER-OBJ-6 Edge Fade material controls are missing from ImGui");
-    const auto selectedWaterSectionPos = editorPanelSource.find("SelectedWaterBodySection");
-    const auto dynamicLightsSectionPos = editorPanelSource.find("DynamicLightsSectionButton");
-    ctx.Expect(selectedWaterSectionPos != std::string::npos &&
-            dynamicLightsSectionPos != std::string::npos &&
-            editorPanelSource.find("WaterMaterialEditorSection") == std::string::npos &&
-            editorPanelSource.find("WaterBaseSectionButton") == std::string::npos &&
-            editorPanelSource.find("MaterialDiffuseButton") == std::string::npos &&
-            editorImGuiSource.find("RenderWaterMaterialEditor") != std::string::npos &&
+    ctx.Expect(editorImGuiSource.find("RenderWaterMaterialEditor") != std::string::npos &&
             editorImGuiSource.find("RenderPbrMaterialEditor") != std::string::npos &&
             editorImGuiSource.find("RenderWaterTextureSlot") != std::string::npos &&
             editorImGuiSource.find("AcceptDragDropPayload(kAssetPayloadType)") != std::string::npos &&
-            dynamicLightsSectionPos < selectedWaterSectionPos &&
             clientMainSource.find("editorImGui.OpenWaterMaterialEditor(materialId)") != std::string::npos,
-        "material editors moved to imgui", "Noesis material editor UI must be removed and ImGui material editors must handle water/PBR editing");
-    ctx.Expect(noesisLayerSource.find("WaterConfig waterConfig;") == std::string::npos &&
-            noesisLayerSource.find("EditedWaterConfig()") != std::string::npos &&
-            noesisLayerHeaderSource.find("GetWaterConfig") == std::string::npos,
-        "legacy global water UI state removed", "NoesisLayer still exposes or stores global WaterConfig state");
-    ctx.Expect(noesisLayerSource.find("BuildAssetLibrarySignature") != std::string::npos &&
-            noesisLayerSource.find("PollAssetLibraryChanges") != std::string::npos &&
-            noesisLayerSource.find("assets.RootPath()") != std::string::npos &&
-            noesisLayerSource.find("assetReaderRoot.empty() ? FindClientRoot() : assetReaderRoot") != std::string::npos &&
-            noesisLayerSource.find("assetLibrary->Refresh(error)") != std::string::npos &&
-            noesisLayerSource.find("RefreshAssetBrowser()") != std::string::npos,
-        "asset browser realtime filesystem refresh", "Asset browser must poll assets/library and refresh when files or folders change");
-    ctx.Expect(noesisLayerSource.find("entry.category != AssetLibrary::Category::WaterMaterial &&") != std::string::npos &&
-            noesisLayerSource.find("entry.category != AssetLibrary::Category::Material") != std::string::npos &&
-            noesisLayerSource.find("converted.normalMapA = texturePathForId(entry.material.normalTextureId)") != std::string::npos &&
-            noesisLayerSource.find("materials.push_back({entry.id, converted})") != std::string::npos,
-        "water body accepts material assets", "Water bodies must accept PBR material assets and convert their textures for water rendering");
+        "material editors moved to imgui", "ImGui material editors must handle water/PBR editing");
     ctx.Expect(clientMainSource.find("PickWaterBody") != std::string::npos &&
             clientMainSource.find("RegenerateCircularWaterMask") != std::string::npos &&
             clientMainSource.find("SelectedEditorObjectType::WaterBody") != std::string::npos &&

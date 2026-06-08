@@ -3,10 +3,12 @@
 #include "Debug.h"
 #include "VulkanDevice.h"
 #include "asset/IAssetReader.h"
+#include "network/CharacterListItem.h"
 
 #include <RmlUi/Core.h>
 #include <RmlUi/Core/Event.h>
 #include <RmlUi/Core/EventListener.h>
+#include <RmlUi/Core/Elements/ElementFormControlInput.h>
 #include <RmlUi/Core/FileInterface.h>
 #include <RmlUi/Core/Input.h>
 #include <RmlUi/Core/SystemInterface.h>
@@ -15,6 +17,7 @@
 #include <chrono>
 #include <cstddef>
 #include <cstring>
+#include <charconv>
 #include <memory>
 #include <optional>
 #include <string>
@@ -157,6 +160,8 @@ int ToRmlMouseButton(MouseButton button)
     default: return 0;
     }
 }
+
+constexpr uint32_t kLobbyPlayerSlots = 4;
 
 struct GpuBuffer
 {
@@ -323,12 +328,28 @@ private:
     std::chrono::steady_clock::time_point m_start = std::chrono::steady_clock::now();
 };
 
-class HelloButtonHandler final : public Rml::EventListener
+class LoginButtonHandler final : public Rml::EventListener
 {
 public:
+    std::function<void()> submit;
+
     void ProcessEvent(Rml::Event& event) override
     {
-        Tracenf("[RMLUI] Event: type=%s element=test-button", event.GetType().c_str());
+        Tracenf("[RMLUI] Event: type=%s element=login-button", event.GetType().c_str());
+        if (submit)
+            submit();
+    }
+};
+
+class ClickHandler final : public Rml::EventListener
+{
+public:
+    std::function<void(Rml::Event&)> callback;
+
+    void ProcessEvent(Rml::Event& event) override
+    {
+        if (callback)
+            callback(event);
     }
 };
 
@@ -1139,18 +1160,338 @@ private:
 
 struct RmlUiLayer::Impl
 {
+    struct HudElements
+    {
+        Rml::Element* playerName = nullptr;
+        Rml::Element* playerLevel = nullptr;
+        Rml::Element* hpText = nullptr;
+        Rml::Element* hpFill = nullptr;
+        Rml::Element* mpText = nullptr;
+        Rml::Element* mpFill = nullptr;
+        Rml::Element* xpText = nullptr;
+        Rml::Element* xpFill = nullptr;
+        Rml::Element* targetFrame = nullptr;
+        Rml::Element* targetName = nullptr;
+        Rml::Element* targetLevel = nullptr;
+        Rml::Element* targetHpFill = nullptr;
+        Rml::Element* targetHpText = nullptr;
+        Rml::Element* zoneName = nullptr;
+        Rml::Element* playerCoords = nullptr;
+    };
+
     client::asset::IAssetReader* assets = nullptr;
     RmlRenderInterface renderer;
     RmlSystemInterface system;
     std::unique_ptr<RmlAssetFileInterface> fileInterface;
     Rml::Context* context = nullptr;
-    Rml::ElementDocument* document = nullptr;
-    HelloButtonHandler helloButtonHandler;
+    Rml::ElementDocument* loginDocument = nullptr;
+    Rml::ElementDocument* lobbyDocument = nullptr;
+    Rml::ElementDocument* hudDocument = nullptr;
+    Rml::ElementDocument* menuDocument = nullptr;
+    Rml::ElementDocument* settingsDocument = nullptr;
+    Rml::ElementDocument* inventoryDocument = nullptr;
+    Rml::ElementDocument* characterCreationDocument = nullptr;
+    HudElements hud;
+    LoginButtonHandler loginButtonHandler;
+    ClickHandler lobbyEnterHandler;
+    ClickHandler lobbyNewCharacterHandler;
+    ClickHandler lobbyDeleteHandler;
+    ClickHandler lobbyLogoutHandler;
+    ClickHandler lobbyConfirmDeleteYesHandler;
+    ClickHandler lobbyConfirmDeleteNoHandler;
+    ClickHandler menuResumeHandler;
+    ClickHandler menuSettingsHandler;
+    ClickHandler menuLogoutHandler;
+    ClickHandler menuQuitHandler;
+    ClickHandler settingsBackHandler;
+    ClickHandler settingsApplyHandler;
+    ClickHandler settingsVideoTabHandler;
+    ClickHandler settingsAudioTabHandler;
+    ClickHandler settingsControlsTabHandler;
+    ClickHandler inventoryCloseHandler;
+    ClickHandler creationCreateHandler;
+    ClickHandler creationCancelHandler;
+    std::unordered_map<std::uint64_t, std::unique_ptr<ClickHandler>> lobbyCharacterHandlers;
+    std::function<void(const std::string&, const std::string&, bool)> loginSubmitCallback;
+    std::function<void(std::uint64_t)> lobbyEnterWorldCallback;
+    std::function<void()> lobbyNewCharacterCallback;
+    std::function<void(std::uint64_t)> lobbyDeleteCharacterCallback;
+    std::function<void()> lobbyLogoutCallback;
+    std::function<void()> menuResumeCallback;
+    std::function<void()> menuLogoutCallback;
+    std::function<void()> menuQuitCallback;
+    std::vector<client::net::CharacterListItem> lobbyCharacters;
+    std::uint64_t selectedCharacterId = 0;
+    bool loginVisible = true;
+    bool lobbyVisible = false;
+    bool hudVisible = false;
+    bool menuVisible = false;
+    bool settingsVisible = false;
+    bool inventoryVisible = false;
+    bool characterCreationVisible = false;
     bool initialized = false;
 };
 
 RmlUiLayer::RmlUiLayer() = default;
 RmlUiLayer::~RmlUiLayer() { Destroy(); }
+
+namespace
+{
+Rml::ElementFormControlInput* FindLoginInput(Rml::ElementDocument* document, const char* id)
+{
+    if (!document)
+        return nullptr;
+
+    return dynamic_cast<Rml::ElementFormControlInput*>(document->GetElementById(id));
+}
+
+std::string GetLoginInputValue(Rml::ElementDocument* document, const char* id)
+{
+    Rml::ElementFormControlInput* input = FindLoginInput(document, id);
+    return input ? input->GetValue() : std::string{};
+}
+
+std::string EscapeRmlText(const std::string& text)
+{
+    std::string escaped;
+    escaped.reserve(text.size());
+    for (char c : text)
+    {
+        switch (c)
+        {
+        case '&': escaped += "&amp;"; break;
+        case '<': escaped += "&lt;"; break;
+        case '>': escaped += "&gt;"; break;
+        default: escaped.push_back(c); break;
+        }
+    }
+    return escaped;
+}
+
+bool GetLoginCheckboxValue(Rml::ElementDocument* document, const char* id)
+{
+    if (Rml::Element* element = document ? document->GetElementById(id) : nullptr)
+        return element->GetAttribute<bool>("checked", false);
+    return false;
+}
+
+void SetLoginStatusText(Rml::ElementDocument* document, const std::string& message)
+{
+    if (!document)
+        return;
+
+    Rml::Element* status = document->GetElementById("login-error");
+    if (!status)
+        return;
+
+    status->SetInnerRML(EscapeRmlText(message));
+    status->SetProperty("display", message.empty() ? "none" : "block");
+}
+
+std::string ClassLabel(std::uint16_t classId)
+{
+    return "Class " + std::to_string(classId);
+}
+
+std::string CharacterDetail(const client::net::CharacterListItem& character)
+{
+    if (character.id == 0)
+        return "Character creation not available yet";
+    return "Level " + std::to_string(character.level) + "  " + ClassLabel(character.classId);
+}
+
+template <typename ImplT>
+const client::net::CharacterListItem* FindLobbyCharacter(const ImplT* impl, std::uint64_t id)
+{
+    if (!impl || id == 0)
+        return nullptr;
+
+    for (const client::net::CharacterListItem& character : impl->lobbyCharacters)
+    {
+        if (character.id == id)
+            return &character;
+    }
+    return nullptr;
+}
+
+void SetElementText(Rml::ElementDocument* document, const char* id, const std::string& text)
+{
+    if (Rml::Element* element = document ? document->GetElementById(id) : nullptr)
+        element->SetInnerRML(EscapeRmlText(text));
+}
+
+void SetElementRml(Rml::ElementDocument* document, const char* id, const std::string& rml)
+{
+    if (Rml::Element* element = document ? document->GetElementById(id) : nullptr)
+        element->SetInnerRML(rml);
+}
+
+void SetButtonDisabled(Rml::ElementDocument* document, const char* id, bool disabled)
+{
+    Rml::Element* button = document ? document->GetElementById(id) : nullptr;
+    if (!button)
+        return;
+
+    if (disabled)
+        button->SetAttribute("disabled", "disabled");
+    else
+        button->RemoveAttribute("disabled");
+}
+
+void SetElementDisplay(Rml::ElementDocument* document, const char* id, bool visible)
+{
+    if (Rml::Element* element = document ? document->GetElementById(id) : nullptr)
+        element->SetProperty("display", visible ? "block" : "none");
+}
+
+template <typename ImplT>
+void UpdateLobbySelectionPanel(ImplT* impl)
+{
+    if (!impl || !impl->lobbyDocument)
+        return;
+
+    const client::net::CharacterListItem* selected = FindLobbyCharacter(impl, impl->selectedCharacterId);
+    if (!selected)
+    {
+        SetElementText(impl->lobbyDocument, "selected-char-name", "No character selected");
+        SetElementText(impl->lobbyDocument, "selected-char-meta", "");
+        SetButtonDisabled(impl->lobbyDocument, "enter-world-btn", true);
+        SetButtonDisabled(impl->lobbyDocument, "delete-char-btn", true);
+        return;
+    }
+
+    SetElementText(impl->lobbyDocument, "selected-char-name", selected->name);
+    SetElementRml(impl->lobbyDocument,
+        "selected-char-meta",
+        EscapeRmlText(CharacterDetail(*selected)) + "<br/>Slot " + std::to_string(selected->slot + 1));
+    SetButtonDisabled(impl->lobbyDocument, "enter-world-btn", false);
+    SetButtonDisabled(impl->lobbyDocument, "delete-char-btn", false);
+}
+
+template <typename ImplT>
+void UpdateLobbySelectionClasses(ImplT* impl)
+{
+    if (!impl || !impl->lobbyDocument)
+        return;
+
+    Rml::ElementList items;
+    impl->lobbyDocument->GetElementsByClassName(items, "character-item");
+    for (Rml::Element* item : items)
+    {
+        const Rml::String idText = item->GetAttribute<Rml::String>("data-char-id", "");
+        std::uint64_t id = 0;
+        std::from_chars(idText.data(), idText.data() + idText.size(), id);
+        item->SetClass("selected", id != 0 && id == impl->selectedCharacterId);
+    }
+}
+
+template <typename ImplT>
+void SetLobbyStatusText(ImplT* impl, const std::string& message)
+{
+    if (!impl || !impl->lobbyDocument)
+        return;
+
+    SetElementText(impl->lobbyDocument, "error-message", message);
+    SetElementDisplay(impl->lobbyDocument, "error-message", !message.empty());
+    if (!message.empty())
+        Tracenf("[RMLUI-LOBBY] Error: %s", message.c_str());
+}
+
+float Percent(float current, float max)
+{
+    if (max <= 0.0f)
+        return 0.0f;
+    return std::clamp((current / max) * 100.0f, 0.0f, 100.0f);
+}
+
+std::string PercentWidth(float current, float max)
+{
+    return std::to_string(static_cast<int>(Percent(current, max))) + "%";
+}
+
+void SetText(Rml::Element* element, const std::string& text)
+{
+    if (element)
+        element->SetInnerRML(EscapeRmlText(text));
+}
+
+void SetWidthPercent(Rml::Element* element, float current, float max)
+{
+    if (element)
+        element->SetProperty("width", PercentWidth(current, max));
+}
+
+template <typename ImplT>
+void CacheHudElements(ImplT& impl)
+{
+    Rml::ElementDocument* document = impl.hudDocument;
+    if (!document)
+        return;
+
+    impl.hud.playerName = document->GetElementById("player-name");
+    impl.hud.playerLevel = document->GetElementById("player-level");
+    impl.hud.hpText = document->GetElementById("hp-text");
+    impl.hud.hpFill = document->GetElementById("hp-fill");
+    impl.hud.mpText = document->GetElementById("mp-text");
+    impl.hud.mpFill = document->GetElementById("mp-fill");
+    impl.hud.xpText = document->GetElementById("xp-text");
+    impl.hud.xpFill = document->GetElementById("xp-fill");
+    impl.hud.targetFrame = document->GetElementById("target-frame");
+    impl.hud.targetName = document->GetElementById("target-name");
+    impl.hud.targetLevel = document->GetElementById("target-level");
+    impl.hud.targetHpFill = document->GetElementById("target-hp-fill");
+    impl.hud.targetHpText = document->GetElementById("target-hp-text");
+    impl.hud.zoneName = document->GetElementById("zone-name");
+    impl.hud.playerCoords = document->GetElementById("player-coords");
+}
+
+void SetFullscreenDocumentSize(Rml::ElementDocument* document, uint32_t width, uint32_t height)
+{
+    if (!document)
+        return;
+
+    document->SetProperty("position", "absolute");
+    document->SetProperty("left", "0px");
+    document->SetProperty("top", "0px");
+    document->SetProperty("width", std::to_string(width) + "px");
+    document->SetProperty("height", std::to_string(height) + "px");
+}
+
+void SetSettingsTab(Rml::ElementDocument* document, const char* tab)
+{
+    if (!document)
+        return;
+
+    const bool video = std::strcmp(tab, "video") == 0;
+    const bool audio = std::strcmp(tab, "audio") == 0;
+    const bool controls = std::strcmp(tab, "controls") == 0;
+    SetElementDisplay(document, "settings-video", video);
+    SetElementDisplay(document, "settings-audio", audio);
+    SetElementDisplay(document, "settings-controls", controls);
+
+    if (Rml::Element* button = document->GetElementById("settings-tab-video"))
+        button->SetClass("active", video);
+    if (Rml::Element* button = document->GetElementById("settings-tab-audio"))
+        button->SetClass("active", audio);
+    if (Rml::Element* button = document->GetElementById("settings-tab-controls"))
+        button->SetClass("active", controls);
+}
+
+void PopulateInventoryGrid(Rml::ElementDocument* document)
+{
+    if (!document)
+        return;
+
+    Rml::Element* grid = document->GetElementById("inventory-grid");
+    if (!grid)
+        return;
+
+    std::string rml;
+    for (int slot = 0; slot < 30; ++slot)
+        rml += "<div class='slot'></div>";
+    grid->SetInnerRML(rml);
+}
+}
 
 bool RmlUiLayer::Create(VulkanDevice& device, client::asset::IAssetReader& assets, uint32_t width, uint32_t height)
 {
@@ -1183,24 +1524,265 @@ bool RmlUiLayer::Create(VulkanDevice& device, client::asset::IAssetReader& asset
         contextDimensions.x,
         contextDimensions.y);
 
-    m_impl->document = m_impl->context->LoadDocument("assets/ui/hello.rml");
-    if (!m_impl->document)
+    m_impl->loginButtonHandler.submit = [this]() {
+        if (!m_impl || !m_impl->loginVisible)
+            return;
+
+        const std::string username = GetLoginInputValue(m_impl->loginDocument, "login-username");
+        const std::string password = GetLoginInputValue(m_impl->loginDocument, "login-password");
+        const bool remember = GetLoginCheckboxValue(m_impl->loginDocument, "login-remember");
+        Tracenf("[RMLUI-LOGIN] attempt user='%s' remember=%s", username.c_str(), remember ? "true" : "false");
+
+        if (username.empty() || password.empty())
+        {
+            SetLoginStatusText(m_impl->loginDocument, "Username and password required");
+            return;
+        }
+
+        SetLoginStatusText(m_impl->loginDocument, "Connecting...");
+        if (m_impl->loginSubmitCallback)
+            m_impl->loginSubmitCallback(username, password, remember);
+        else
+            SetLoginStatusText(m_impl->loginDocument, "Network session is not ready");
+    };
+
+    m_impl->loginDocument = m_impl->context->LoadDocument("assets/ui/login.rml");
+    if (!m_impl->loginDocument)
     {
-        Tracen("[RMLUI] Failed to load hello.rml");
+        Tracen("[RMLUI] Failed to load login.rml");
         return false;
     }
-    m_impl->document->SetProperty("position", "absolute");
-    m_impl->document->SetProperty("left", "0px");
-    m_impl->document->SetProperty("top", "0px");
-    m_impl->document->SetProperty("width", std::to_string(width) + "px");
-    m_impl->document->SetProperty("height", std::to_string(height) + "px");
+    m_impl->loginDocument->SetProperty("position", "absolute");
+    m_impl->loginDocument->SetProperty("left", "0px");
+    m_impl->loginDocument->SetProperty("top", "0px");
+    m_impl->loginDocument->SetProperty("width", std::to_string(width) + "px");
+    m_impl->loginDocument->SetProperty("height", std::to_string(height) + "px");
 
-    if (Rml::Element* button = m_impl->document->GetElementById("test-button"))
-        button->AddEventListener("click", &m_impl->helloButtonHandler);
-    m_impl->document->Show();
+    if (Rml::Element* button = m_impl->loginDocument->GetElementById("login-button"))
+        button->AddEventListener("click", &m_impl->loginButtonHandler);
+    SetLoginStatusText(m_impl->loginDocument, "");
+    m_impl->loginDocument->Show();
+    if (Rml::Element* username = m_impl->loginDocument->GetElementById("login-username"))
+        username->Focus(true);
+
+    m_impl->lobbyEnterHandler.callback = [this](Rml::Event&) {
+        if (!m_impl || !m_impl->lobbyVisible)
+            return;
+        if (m_impl->selectedCharacterId == 0)
+        {
+            SetLobbyStatusText(m_impl.get(), "Please select a character first");
+            return;
+        }
+        Tracenf("[RMLUI-LOBBY] Enter world: char_id=%llu",
+            static_cast<unsigned long long>(m_impl->selectedCharacterId));
+        SetLobbyStatusText(m_impl.get(), "Entering world...");
+        if (m_impl->lobbyEnterWorldCallback)
+            m_impl->lobbyEnterWorldCallback(m_impl->selectedCharacterId);
+    };
+    m_impl->lobbyNewCharacterHandler.callback = [this](Rml::Event&) {
+        if (!m_impl || !m_impl->lobbyVisible)
+            return;
+        Tracen("[RMLUI-LOBBY] New character");
+        if (m_impl->lobbyNewCharacterCallback)
+            m_impl->lobbyNewCharacterCallback();
+        else
+            SetLobbyStatusText(m_impl.get(), "Character creation not available yet");
+    };
+    m_impl->lobbyDeleteHandler.callback = [this](Rml::Event&) {
+        if (!m_impl || !m_impl->lobbyVisible || m_impl->selectedCharacterId == 0)
+            return;
+        SetElementDisplay(m_impl->lobbyDocument, "delete-confirm", true);
+    };
+    m_impl->lobbyLogoutHandler.callback = [this](Rml::Event&) {
+        if (!m_impl || !m_impl->lobbyVisible)
+            return;
+        Tracen("[RMLUI-LOBBY] Logout");
+        if (m_impl->lobbyLogoutCallback)
+            m_impl->lobbyLogoutCallback();
+    };
+    m_impl->lobbyConfirmDeleteYesHandler.callback = [this](Rml::Event&) {
+        if (!m_impl || !m_impl->lobbyVisible || m_impl->selectedCharacterId == 0)
+            return;
+        const std::uint64_t id = m_impl->selectedCharacterId;
+        Tracenf("[RMLUI-LOBBY] Delete character: char_id=%llu", static_cast<unsigned long long>(id));
+        SetElementDisplay(m_impl->lobbyDocument, "delete-confirm", false);
+        if (m_impl->lobbyDeleteCharacterCallback)
+            m_impl->lobbyDeleteCharacterCallback(id);
+        else
+            SetLobbyStatusText(m_impl.get(), "Character delete is not available yet");
+    };
+    m_impl->lobbyConfirmDeleteNoHandler.callback = [this](Rml::Event&) {
+        if (m_impl)
+            SetElementDisplay(m_impl->lobbyDocument, "delete-confirm", false);
+    };
+    m_impl->menuResumeHandler.callback = [this](Rml::Event&) {
+        HideInGameMenu();
+        if (m_impl && m_impl->menuResumeCallback)
+            m_impl->menuResumeCallback();
+    };
+    m_impl->menuSettingsHandler.callback = [this](Rml::Event&) {
+        ShowSettings();
+    };
+    m_impl->menuLogoutHandler.callback = [this](Rml::Event&) {
+        if (!m_impl)
+            return;
+        HideSettings();
+        HideInventory();
+        HideInGameMenu();
+        if (m_impl->menuLogoutCallback)
+            m_impl->menuLogoutCallback();
+    };
+    m_impl->menuQuitHandler.callback = [this](Rml::Event&) {
+        if (m_impl && m_impl->menuQuitCallback)
+            m_impl->menuQuitCallback();
+    };
+    m_impl->settingsBackHandler.callback = [this](Rml::Event&) {
+        HideSettings();
+    };
+    m_impl->settingsApplyHandler.callback = [this](Rml::Event&) {
+        if (!m_impl || !m_impl->settingsDocument)
+            return;
+        if (Rml::Element* status = m_impl->settingsDocument->GetElementById("settings-status"))
+            status->SetInnerRML("Settings placeholder applied");
+    };
+    m_impl->settingsVideoTabHandler.callback = [this](Rml::Event&) {
+        if (m_impl)
+            SetSettingsTab(m_impl->settingsDocument, "video");
+    };
+    m_impl->settingsAudioTabHandler.callback = [this](Rml::Event&) {
+        if (m_impl)
+            SetSettingsTab(m_impl->settingsDocument, "audio");
+    };
+    m_impl->settingsControlsTabHandler.callback = [this](Rml::Event&) {
+        if (m_impl)
+            SetSettingsTab(m_impl->settingsDocument, "controls");
+    };
+    m_impl->inventoryCloseHandler.callback = [this](Rml::Event&) {
+        HideInventory();
+    };
+    m_impl->creationCreateHandler.callback = [this](Rml::Event&) {
+        if (!m_impl || !m_impl->characterCreationDocument)
+            return;
+        if (Rml::Element* status = m_impl->characterCreationDocument->GetElementById("creation-status"))
+            status->SetInnerRML("Character creation backend is not wired yet");
+    };
+    m_impl->creationCancelHandler.callback = [this](Rml::Event&) {
+        HideCharacterCreation();
+        ShowLobby();
+    };
+
+    m_impl->lobbyDocument = m_impl->context->LoadDocument("assets/ui/lobby.rml");
+    if (!m_impl->lobbyDocument)
+    {
+        Tracen("[RMLUI] Failed to load lobby.rml");
+        return false;
+    }
+    m_impl->lobbyDocument->SetProperty("position", "absolute");
+    m_impl->lobbyDocument->SetProperty("left", "0px");
+    m_impl->lobbyDocument->SetProperty("top", "0px");
+    m_impl->lobbyDocument->SetProperty("width", std::to_string(width) + "px");
+    m_impl->lobbyDocument->SetProperty("height", std::to_string(height) + "px");
+    if (Rml::Element* button = m_impl->lobbyDocument->GetElementById("enter-world-btn"))
+        button->AddEventListener("click", &m_impl->lobbyEnterHandler);
+    if (Rml::Element* button = m_impl->lobbyDocument->GetElementById("new-character-btn"))
+        button->AddEventListener("click", &m_impl->lobbyNewCharacterHandler);
+    if (Rml::Element* button = m_impl->lobbyDocument->GetElementById("delete-char-btn"))
+        button->AddEventListener("click", &m_impl->lobbyDeleteHandler);
+    if (Rml::Element* button = m_impl->lobbyDocument->GetElementById("logout-btn"))
+        button->AddEventListener("click", &m_impl->lobbyLogoutHandler);
+    if (Rml::Element* button = m_impl->lobbyDocument->GetElementById("confirm-delete-yes"))
+        button->AddEventListener("click", &m_impl->lobbyConfirmDeleteYesHandler);
+    if (Rml::Element* button = m_impl->lobbyDocument->GetElementById("confirm-delete-no"))
+        button->AddEventListener("click", &m_impl->lobbyConfirmDeleteNoHandler);
+    SetElementDisplay(m_impl->lobbyDocument, "delete-confirm", false);
+    SetLobbyStatusText(m_impl.get(), "");
+    m_impl->lobbyDocument->Hide();
+
+    m_impl->hudDocument = m_impl->context->LoadDocument("assets/ui/worldhud.rml");
+    if (!m_impl->hudDocument)
+    {
+        Tracen("[RMLUI] Failed to load worldhud.rml");
+        return false;
+    }
+    m_impl->hudDocument->SetProperty("position", "absolute");
+    m_impl->hudDocument->SetProperty("left", "0px");
+    m_impl->hudDocument->SetProperty("top", "0px");
+    m_impl->hudDocument->SetProperty("width", std::to_string(width) + "px");
+    m_impl->hudDocument->SetProperty("height", std::to_string(height) + "px");
+    CacheHudElements(*m_impl);
+    m_impl->hudDocument->Hide();
+
+    m_impl->menuDocument = m_impl->context->LoadDocument("assets/ui/ingame_menu.rml");
+    if (!m_impl->menuDocument)
+    {
+        Tracen("[RMLUI] Failed to load ingame_menu.rml");
+        return false;
+    }
+    SetFullscreenDocumentSize(m_impl->menuDocument, width, height);
+    if (Rml::Element* button = m_impl->menuDocument->GetElementById("menu-resume-btn"))
+        button->AddEventListener("click", &m_impl->menuResumeHandler);
+    if (Rml::Element* button = m_impl->menuDocument->GetElementById("menu-settings-btn"))
+        button->AddEventListener("click", &m_impl->menuSettingsHandler);
+    if (Rml::Element* button = m_impl->menuDocument->GetElementById("menu-logout-btn"))
+        button->AddEventListener("click", &m_impl->menuLogoutHandler);
+    if (Rml::Element* button = m_impl->menuDocument->GetElementById("menu-quit-btn"))
+        button->AddEventListener("click", &m_impl->menuQuitHandler);
+    m_impl->menuDocument->Hide();
+
+    m_impl->settingsDocument = m_impl->context->LoadDocument("assets/ui/settings.rml");
+    if (!m_impl->settingsDocument)
+    {
+        Tracen("[RMLUI] Failed to load settings.rml");
+        return false;
+    }
+    SetFullscreenDocumentSize(m_impl->settingsDocument, width, height);
+    if (Rml::Element* button = m_impl->settingsDocument->GetElementById("settings-back-btn"))
+        button->AddEventListener("click", &m_impl->settingsBackHandler);
+    if (Rml::Element* button = m_impl->settingsDocument->GetElementById("settings-apply-btn"))
+        button->AddEventListener("click", &m_impl->settingsApplyHandler);
+    if (Rml::Element* button = m_impl->settingsDocument->GetElementById("settings-tab-video"))
+        button->AddEventListener("click", &m_impl->settingsVideoTabHandler);
+    if (Rml::Element* button = m_impl->settingsDocument->GetElementById("settings-tab-audio"))
+        button->AddEventListener("click", &m_impl->settingsAudioTabHandler);
+    if (Rml::Element* button = m_impl->settingsDocument->GetElementById("settings-tab-controls"))
+        button->AddEventListener("click", &m_impl->settingsControlsTabHandler);
+    SetSettingsTab(m_impl->settingsDocument, "video");
+    m_impl->settingsDocument->Hide();
+
+    m_impl->inventoryDocument = m_impl->context->LoadDocument("assets/ui/inventory.rml");
+    if (!m_impl->inventoryDocument)
+    {
+        Tracen("[RMLUI] Failed to load inventory.rml");
+        return false;
+    }
+    SetFullscreenDocumentSize(m_impl->inventoryDocument, width, height);
+    if (Rml::Element* button = m_impl->inventoryDocument->GetElementById("inventory-close-btn"))
+        button->AddEventListener("click", &m_impl->inventoryCloseHandler);
+    PopulateInventoryGrid(m_impl->inventoryDocument);
+    m_impl->inventoryDocument->Hide();
+
+    m_impl->characterCreationDocument = m_impl->context->LoadDocument("assets/ui/character_creation.rml");
+    if (!m_impl->characterCreationDocument)
+    {
+        Tracen("[RMLUI] Failed to load character_creation.rml");
+        return false;
+    }
+    SetFullscreenDocumentSize(m_impl->characterCreationDocument, width, height);
+    if (Rml::Element* button = m_impl->characterCreationDocument->GetElementById("creation-create-btn"))
+        button->AddEventListener("click", &m_impl->creationCreateHandler);
+    if (Rml::Element* button = m_impl->characterCreationDocument->GetElementById("creation-cancel-btn"))
+        button->AddEventListener("click", &m_impl->creationCancelHandler);
+    m_impl->characterCreationDocument->Hide();
+
     m_impl->initialized = true;
     Tracenf("[RMLUI] Initialized: version 6.2, viewport=%ux%u", width, height);
-    Tracen("[RMLUI] Loaded document: assets/ui/hello.rml");
+    Tracen("[RMLUI] Loaded document: assets/ui/login.rml");
+    Tracen("[RMLUI] Loaded document: assets/ui/lobby.rml");
+    Tracen("[RMLUI] Loaded document: assets/ui/worldhud.rml");
+    Tracen("[RMLUI] Loaded document: assets/ui/ingame_menu.rml");
+    Tracen("[RMLUI] Loaded document: assets/ui/settings.rml");
+    Tracen("[RMLUI] Loaded document: assets/ui/inventory.rml");
+    Tracen("[RMLUI] Loaded document: assets/ui/character_creation.rml");
     return true;
 }
 
@@ -1228,11 +1810,25 @@ void RmlUiLayer::Resize(uint32_t width, uint32_t height)
     m_impl->renderer.Resize(width, height);
     if (m_impl->context)
         m_impl->context->SetDimensions(Rml::Vector2i(static_cast<int>(width), static_cast<int>(height)));
-    if (m_impl->document)
+    if (m_impl->loginDocument)
     {
-        m_impl->document->SetProperty("width", std::to_string(width) + "px");
-        m_impl->document->SetProperty("height", std::to_string(height) + "px");
+        m_impl->loginDocument->SetProperty("width", std::to_string(width) + "px");
+        m_impl->loginDocument->SetProperty("height", std::to_string(height) + "px");
     }
+    if (m_impl->lobbyDocument)
+    {
+        m_impl->lobbyDocument->SetProperty("width", std::to_string(width) + "px");
+        m_impl->lobbyDocument->SetProperty("height", std::to_string(height) + "px");
+    }
+    if (m_impl->hudDocument)
+    {
+        m_impl->hudDocument->SetProperty("width", std::to_string(width) + "px");
+        m_impl->hudDocument->SetProperty("height", std::to_string(height) + "px");
+    }
+    SetFullscreenDocumentSize(m_impl->menuDocument, width, height);
+    SetFullscreenDocumentSize(m_impl->settingsDocument, width, height);
+    SetFullscreenDocumentSize(m_impl->inventoryDocument, width, height);
+    SetFullscreenDocumentSize(m_impl->characterCreationDocument, width, height);
 }
 
 void RmlUiLayer::OnRenderPassChanged(VulkanDevice& device)
@@ -1246,37 +1842,467 @@ bool RmlUiLayer::OnInput(const InputEvent& event)
     if (!m_impl || !m_impl->context)
         return false;
 
-    const Rml::Vector2i dimensions = m_impl->context->GetDimensions();
-    const bool overHelloPanel =
-        event.x >= dimensions.x - 400 && event.x <= dimensions.x - 12 &&
-        event.y >= 12 && event.y <= 260;
-    bool rmlAccepted = false;
+    const bool loginVisible = m_impl->loginVisible && m_impl->loginDocument;
+    const bool lobbyVisible = m_impl->lobbyVisible && m_impl->lobbyDocument;
+    const bool menuVisible = m_impl->menuVisible && m_impl->menuDocument;
+    const bool settingsVisible = m_impl->settingsVisible && m_impl->settingsDocument;
+    const bool inventoryVisible = m_impl->inventoryVisible && m_impl->inventoryDocument;
+    const bool creationVisible = m_impl->characterCreationVisible && m_impl->characterCreationDocument;
+    const bool capturesInput = loginVisible || lobbyVisible || menuVisible || settingsVisible ||
+        inventoryVisible || creationVisible;
     switch (event.type)
     {
     case InputEvent::MouseMove:
         m_impl->context->ProcessMouseMove(event.x, event.y, 0);
-        return false;
+        return capturesInput;
     case InputEvent::MouseDown:
-        rmlAccepted = m_impl->context->ProcessMouseButtonDown(ToRmlMouseButton(event.button), 0);
-        return overHelloPanel && rmlAccepted;
+        m_impl->context->ProcessMouseButtonDown(ToRmlMouseButton(event.button), 0);
+        return capturesInput;
     case InputEvent::MouseUp:
-        rmlAccepted = m_impl->context->ProcessMouseButtonUp(ToRmlMouseButton(event.button), 0);
-        return overHelloPanel && rmlAccepted;
+        m_impl->context->ProcessMouseButtonUp(ToRmlMouseButton(event.button), 0);
+        return capturesInput;
     case InputEvent::MouseWheel:
-        rmlAccepted = m_impl->context->ProcessMouseWheel(static_cast<float>(event.wheelDelta) / 120.0f, 0);
-        return overHelloPanel && rmlAccepted;
+        m_impl->context->ProcessMouseWheel(static_cast<float>(event.wheelDelta) / 120.0f, 0);
+        return capturesInput;
     case InputEvent::KeyDown:
+        if (loginVisible && event.key == Key_Enter)
+        {
+            if (m_impl->loginButtonHandler.submit)
+                m_impl->loginButtonHandler.submit();
+            return true;
+        }
         m_impl->context->ProcessKeyDown(ToRmlKey(event.key), 0);
-        return false;
+        return capturesInput;
     case InputEvent::KeyUp:
         m_impl->context->ProcessKeyUp(ToRmlKey(event.key), 0);
-        return false;
+        return capturesInput;
     case InputEvent::Char:
         m_impl->context->ProcessTextInput(CodepointToUtf8(event.codepoint));
-        return false;
+        return capturesInput;
     default:
         return false;
     }
+}
+
+void RmlUiLayer::SetLoginSubmitCallback(std::function<void(const std::string&, const std::string&, bool)> callback)
+{
+    if (m_impl)
+        m_impl->loginSubmitCallback = std::move(callback);
+}
+
+void RmlUiLayer::ShowLogin()
+{
+    if (!m_impl || !m_impl->loginDocument)
+        return;
+
+    m_impl->loginVisible = true;
+    m_impl->lobbyVisible = false;
+    m_impl->hudVisible = false;
+    m_impl->menuVisible = false;
+    m_impl->settingsVisible = false;
+    m_impl->inventoryVisible = false;
+    m_impl->characterCreationVisible = false;
+    if (m_impl->lobbyDocument)
+        m_impl->lobbyDocument->Hide();
+    if (m_impl->hudDocument)
+        m_impl->hudDocument->Hide();
+    if (m_impl->menuDocument)
+        m_impl->menuDocument->Hide();
+    if (m_impl->settingsDocument)
+        m_impl->settingsDocument->Hide();
+    if (m_impl->inventoryDocument)
+        m_impl->inventoryDocument->Hide();
+    if (m_impl->characterCreationDocument)
+        m_impl->characterCreationDocument->Hide();
+    m_impl->loginDocument->Show();
+    if (Rml::Element* username = m_impl->loginDocument->GetElementById("login-username"))
+        username->Focus(true);
+}
+
+void RmlUiLayer::HideLogin()
+{
+    if (!m_impl || !m_impl->loginDocument)
+        return;
+
+    m_impl->loginVisible = false;
+    m_impl->loginDocument->Hide();
+}
+
+void RmlUiLayer::SetLoginError(const std::string& message)
+{
+    if (!m_impl || !m_impl->loginDocument)
+        return;
+
+    SetLoginStatusText(m_impl->loginDocument, message);
+}
+
+bool RmlUiLayer::IsLoginVisible() const
+{
+    return m_impl && m_impl->loginVisible;
+}
+
+void RmlUiLayer::SetLobbyCallbacks(std::function<void(std::uint64_t)> enterWorldCallback,
+                                   std::function<void()> newCharacterCallback,
+                                   std::function<void(std::uint64_t)> deleteCharacterCallback,
+                                   std::function<void()> logoutCallback)
+{
+    if (!m_impl)
+        return;
+
+    m_impl->lobbyEnterWorldCallback = std::move(enterWorldCallback);
+    m_impl->lobbyNewCharacterCallback = std::move(newCharacterCallback);
+    m_impl->lobbyDeleteCharacterCallback = std::move(deleteCharacterCallback);
+    m_impl->lobbyLogoutCallback = std::move(logoutCallback);
+}
+
+void RmlUiLayer::ShowLobby()
+{
+    if (!m_impl || !m_impl->lobbyDocument)
+        return;
+
+    m_impl->loginVisible = false;
+    m_impl->hudVisible = false;
+    m_impl->menuVisible = false;
+    m_impl->settingsVisible = false;
+    m_impl->inventoryVisible = false;
+    m_impl->characterCreationVisible = false;
+    if (m_impl->loginDocument)
+        m_impl->loginDocument->Hide();
+    if (m_impl->hudDocument)
+        m_impl->hudDocument->Hide();
+    if (m_impl->menuDocument)
+        m_impl->menuDocument->Hide();
+    if (m_impl->settingsDocument)
+        m_impl->settingsDocument->Hide();
+    if (m_impl->inventoryDocument)
+        m_impl->inventoryDocument->Hide();
+    if (m_impl->characterCreationDocument)
+        m_impl->characterCreationDocument->Hide();
+    m_impl->lobbyVisible = true;
+    m_impl->lobbyDocument->Show();
+    SetLobbyStatusText(m_impl.get(), "Fetching characters...");
+    Tracen("[RMLUI-LOBBY] Lobby shown");
+}
+
+void RmlUiLayer::HideLobby()
+{
+    if (!m_impl || !m_impl->lobbyDocument)
+        return;
+
+    m_impl->lobbyVisible = false;
+    m_impl->lobbyDocument->Hide();
+    SetElementDisplay(m_impl->lobbyDocument, "delete-confirm", false);
+}
+
+void RmlUiLayer::SetLobbyCharacters(const std::vector<client::net::CharacterListItem>& characters)
+{
+    if (!m_impl || !m_impl->lobbyDocument)
+        return;
+
+    m_impl->lobbyCharacters = characters;
+    m_impl->selectedCharacterId = 0;
+    m_impl->lobbyCharacterHandlers.clear();
+
+    Rml::Element* list = m_impl->lobbyDocument->GetElementById("character-list");
+    if (!list)
+        return;
+
+    std::string rml;
+    if (characters.empty())
+        rml += "<div class='character-item-empty'>No characters yet. Create one to start!</div>";
+
+    for (const client::net::CharacterListItem& character : characters)
+    {
+        if (character.id == 0)
+        {
+            rml += "<div class='character-item character-item-disabled'>";
+            rml += "<div class='char-name'>Empty slot</div>";
+            rml += "<div class='char-meta'>Character creation not available yet</div>";
+        }
+        else
+        {
+            rml += "<div class='character-item' data-char-id='" + std::to_string(character.id) + "'>";
+            rml += "<div class='char-name'>" + EscapeRmlText(character.name) + "</div>";
+            rml += "<div class='char-meta'>" + EscapeRmlText(CharacterDetail(character)) + "</div>";
+        }
+        rml += "</div>";
+    }
+
+    for (uint32_t slot = static_cast<uint32_t>(characters.size()); slot < kLobbyPlayerSlots; ++slot)
+    {
+        rml += "<div class='character-item character-item-disabled'>";
+        rml += "<div class='char-name'>Empty slot</div>";
+        rml += "<div class='char-meta'>Character creation not available yet</div>";
+        rml += "</div>";
+    }
+
+    list->SetInnerRML(rml);
+
+    for (const client::net::CharacterListItem& character : m_impl->lobbyCharacters)
+    {
+        if (character.id == 0)
+            continue;
+
+        Rml::ElementList items;
+        m_impl->lobbyDocument->GetElementsByClassName(items, "character-item");
+        for (Rml::Element* item : items)
+        {
+            const Rml::String idText = item->GetAttribute<Rml::String>("data-char-id", "");
+            if (idText != std::to_string(character.id))
+                continue;
+
+            auto handler = std::make_unique<ClickHandler>();
+            handler->callback = [this, id = character.id](Rml::Event&) {
+                if (!m_impl || !m_impl->lobbyVisible)
+                    return;
+
+                m_impl->selectedCharacterId = id;
+                UpdateLobbySelectionClasses(m_impl.get());
+                UpdateLobbySelectionPanel(m_impl.get());
+                SetLobbyStatusText(m_impl.get(), "");
+                Tracenf("[RMLUI-LOBBY] Selected character: id=%llu",
+                    static_cast<unsigned long long>(id));
+            };
+            item->AddEventListener("click", handler.get());
+            m_impl->lobbyCharacterHandlers[character.id] = std::move(handler);
+            break;
+        }
+    }
+
+    UpdateLobbySelectionPanel(m_impl.get());
+    SetLobbyStatusText(m_impl.get(), characters.empty() ? "No characters yet" : "Select a character");
+    Tracenf("[RMLUI-LOBBY] Character list populated: %zu characters", characters.size());
+}
+
+void RmlUiLayer::SetLobbyStatus(const std::string& message)
+{
+    if (m_impl)
+        SetLobbyStatusText(m_impl.get(), message);
+}
+
+bool RmlUiLayer::IsLobbyVisible() const
+{
+    return m_impl && m_impl->lobbyVisible;
+}
+
+void RmlUiLayer::ShowHud()
+{
+    if (!m_impl || !m_impl->hudDocument)
+        return;
+
+    m_impl->loginVisible = false;
+    m_impl->lobbyVisible = false;
+    m_impl->menuVisible = false;
+    m_impl->settingsVisible = false;
+    m_impl->characterCreationVisible = false;
+    m_impl->hudVisible = true;
+    if (m_impl->loginDocument)
+        m_impl->loginDocument->Hide();
+    if (m_impl->lobbyDocument)
+        m_impl->lobbyDocument->Hide();
+    if (m_impl->menuDocument)
+        m_impl->menuDocument->Hide();
+    if (m_impl->settingsDocument)
+        m_impl->settingsDocument->Hide();
+    if (m_impl->characterCreationDocument)
+        m_impl->characterCreationDocument->Hide();
+    m_impl->hudDocument->Show();
+    Tracen("[RMLUI-HUD] HUD shown");
+}
+
+void RmlUiLayer::HideHud()
+{
+    if (!m_impl || !m_impl->hudDocument)
+        return;
+
+    m_impl->hudVisible = false;
+    m_impl->hudDocument->Hide();
+    Tracen("[RMLUI-HUD] HUD hidden");
+}
+
+void RmlUiLayer::UpdateHud(const RmlHudData& data)
+{
+    if (!m_impl || !m_impl->hudVisible || !m_impl->hudDocument)
+        return;
+
+    SetText(m_impl->hud.playerName, data.playerName);
+    SetText(m_impl->hud.playerLevel, "Lv. " + std::to_string(data.playerLevel));
+
+    SetWidthPercent(m_impl->hud.hpFill, data.currentHp, data.maxHp);
+    SetText(m_impl->hud.hpText,
+        std::to_string(static_cast<int>(data.currentHp)) + " / " + std::to_string(static_cast<int>(data.maxHp)));
+
+    SetWidthPercent(m_impl->hud.mpFill, data.currentMp, data.maxMp);
+    SetText(m_impl->hud.mpText,
+        std::to_string(static_cast<int>(data.currentMp)) + " / " + std::to_string(static_cast<int>(data.maxMp)));
+
+    SetWidthPercent(m_impl->hud.xpFill,
+        static_cast<float>(data.currentXp),
+        static_cast<float>(data.xpForNextLevel));
+    SetText(m_impl->hud.xpText, std::to_string(data.currentXp) + " / " + std::to_string(data.xpForNextLevel));
+
+    if (m_impl->hud.targetFrame)
+        m_impl->hud.targetFrame->SetProperty("display", data.hasTarget ? "block" : "none");
+    if (data.hasTarget)
+    {
+        SetText(m_impl->hud.targetName, data.targetName);
+        SetText(m_impl->hud.targetLevel, "Lv. " + std::to_string(data.targetLevel));
+        SetWidthPercent(m_impl->hud.targetHpFill, data.targetCurrentHp, data.targetMaxHp);
+        SetText(m_impl->hud.targetHpText,
+            std::to_string(static_cast<int>(data.targetCurrentHp)) + " / " +
+            std::to_string(static_cast<int>(data.targetMaxHp)));
+    }
+
+    SetText(m_impl->hud.zoneName, data.zoneName);
+    SetText(m_impl->hud.playerCoords,
+        "X: " + std::to_string(static_cast<int>(data.playerX)) +
+        ", Z: " + std::to_string(static_cast<int>(data.playerZ)));
+}
+
+bool RmlUiLayer::IsHudVisible() const
+{
+    return m_impl && m_impl->hudVisible;
+}
+
+void RmlUiLayer::SetInGameMenuCallbacks(std::function<void()> resumeCallback,
+                                        std::function<void()> logoutCallback,
+                                        std::function<void()> quitCallback)
+{
+    if (!m_impl)
+        return;
+
+    m_impl->menuResumeCallback = std::move(resumeCallback);
+    m_impl->menuLogoutCallback = std::move(logoutCallback);
+    m_impl->menuQuitCallback = std::move(quitCallback);
+}
+
+void RmlUiLayer::ShowInGameMenu()
+{
+    if (!m_impl || !m_impl->menuDocument)
+        return;
+
+    m_impl->menuVisible = true;
+    m_impl->menuDocument->Show();
+}
+
+void RmlUiLayer::HideInGameMenu()
+{
+    if (!m_impl || !m_impl->menuDocument)
+        return;
+
+    m_impl->menuVisible = false;
+    m_impl->menuDocument->Hide();
+}
+
+void RmlUiLayer::ToggleInGameMenu()
+{
+    if (IsInGameMenuVisible())
+        HideInGameMenu();
+    else
+        ShowInGameMenu();
+}
+
+bool RmlUiLayer::IsInGameMenuVisible() const
+{
+    return m_impl && m_impl->menuVisible;
+}
+
+void RmlUiLayer::ShowSettings()
+{
+    if (!m_impl || !m_impl->settingsDocument)
+        return;
+
+    m_impl->settingsVisible = true;
+    m_impl->settingsDocument->Show();
+}
+
+void RmlUiLayer::HideSettings()
+{
+    if (!m_impl || !m_impl->settingsDocument)
+        return;
+
+    m_impl->settingsVisible = false;
+    m_impl->settingsDocument->Hide();
+}
+
+bool RmlUiLayer::IsSettingsVisible() const
+{
+    return m_impl && m_impl->settingsVisible;
+}
+
+void RmlUiLayer::ShowInventory()
+{
+    if (!m_impl || !m_impl->inventoryDocument)
+        return;
+
+    m_impl->inventoryVisible = true;
+    m_impl->inventoryDocument->Show();
+}
+
+void RmlUiLayer::HideInventory()
+{
+    if (!m_impl || !m_impl->inventoryDocument)
+        return;
+
+    m_impl->inventoryVisible = false;
+    m_impl->inventoryDocument->Hide();
+}
+
+void RmlUiLayer::ToggleInventory()
+{
+    if (IsInventoryVisible())
+        HideInventory();
+    else
+        ShowInventory();
+}
+
+bool RmlUiLayer::IsInventoryVisible() const
+{
+    return m_impl && m_impl->inventoryVisible;
+}
+
+void RmlUiLayer::ShowCharacterCreation()
+{
+    if (!m_impl || !m_impl->characterCreationDocument)
+        return;
+
+    m_impl->loginVisible = false;
+    m_impl->lobbyVisible = false;
+    m_impl->hudVisible = false;
+    m_impl->menuVisible = false;
+    m_impl->settingsVisible = false;
+    m_impl->inventoryVisible = false;
+    if (m_impl->loginDocument)
+        m_impl->loginDocument->Hide();
+    if (m_impl->lobbyDocument)
+        m_impl->lobbyDocument->Hide();
+    if (m_impl->hudDocument)
+        m_impl->hudDocument->Hide();
+    if (m_impl->menuDocument)
+        m_impl->menuDocument->Hide();
+    if (m_impl->settingsDocument)
+        m_impl->settingsDocument->Hide();
+    if (m_impl->inventoryDocument)
+        m_impl->inventoryDocument->Hide();
+
+    m_impl->characterCreationVisible = true;
+    m_impl->characterCreationDocument->Show();
+    if (Rml::Element* input = m_impl->characterCreationDocument->GetElementById("character-name"))
+        input->Focus(true);
+}
+
+void RmlUiLayer::HideCharacterCreation()
+{
+    if (!m_impl || !m_impl->characterCreationDocument)
+        return;
+
+    m_impl->characterCreationVisible = false;
+    m_impl->characterCreationDocument->Hide();
+}
+
+bool RmlUiLayer::IsCharacterCreationVisible() const
+{
+    return m_impl && m_impl->characterCreationVisible;
 }
 
 void RmlUiLayer::Destroy()

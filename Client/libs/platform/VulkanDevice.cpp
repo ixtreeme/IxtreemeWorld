@@ -247,7 +247,7 @@ void VulkanDevice::BeginSwapchainRenderPass()
     pass.clearValueCount = 2;
     pass.pClearValues = clearValues;
 
-    // The pass loadOps clear color plus combined depth/stencil; Noesis draws into this same onscreen pass.
+    // The pass loadOps clear color plus combined depth/stencil; UI draws into this same onscreen pass.
     vkCmdBeginRenderPass(m_commandBuffers[m_currentFrame], &pass, VK_SUBPASS_CONTENTS_INLINE);
 
     VkViewport viewport{};

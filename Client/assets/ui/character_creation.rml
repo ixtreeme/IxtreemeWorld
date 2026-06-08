@@ -1,0 +1,30 @@
+<rml>
+<head>
+    <title>Character Creation</title>
+    <link type="text/rcss" href="character_creation.rcss" />
+</head>
+<body>
+    <div class="creation-screen">
+        <div class="creation-panel">
+            <h2>Create Character</h2>
+            <div class="field">
+                <label for="character-name">Name</label>
+                <input id="character-name" type="text" />
+            </div>
+            <div class="field">
+                <label>Class</label>
+                <div class="class-row">
+                    <button class="class-button selected">Warrior</button>
+                    <button class="class-button">Mage</button>
+                    <button class="class-button">Ranger</button>
+                </div>
+            </div>
+            <p id="creation-status" class="status-text"></p>
+            <div class="button-row">
+                <button id="creation-create-btn" class="primary-button">Create</button>
+                <button id="creation-cancel-btn" class="secondary-button">Cancel</button>
+            </div>
+        </div>
+    </div>
+</body>
+</rml>

@@ -39,5 +39,5 @@ Or through Gradle:
 
 ## Logcat
 ```powershell
-adb logcat -s IxtreemeClient:V Noesis:V NativeActivity:V
+adb logcat -s IxtreemeClient:V RMLUI:V NativeActivity:V
 ```
