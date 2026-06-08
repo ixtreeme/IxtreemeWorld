@@ -1,5 +1,4 @@
 #if defined(_WIN32)
-#include <winsock2.h>
 #include <windows.h>
 #endif
 
@@ -631,49 +630,6 @@ struct MovementInputState
     }
 };
 
-std::optional<client::net::DebugSpawnOverride> ParseDebugSpawnOverride(const std::string& commandLine)
-{
-    const std::string flag = "--debug-spawn=";
-    const std::size_t begin = commandLine.find(flag);
-    if (begin == std::string::npos)
-        return std::nullopt;
-
-    std::size_t valueBegin = begin + flag.size();
-    while (valueBegin < commandLine.size() &&
-           (commandLine[valueBegin] == '"' || commandLine[valueBegin] == '\'')) {
-        ++valueBegin;
-    }
-    std::size_t valueEnd = valueBegin;
-    while (valueEnd < commandLine.size() &&
-           !std::isspace(static_cast<unsigned char>(commandLine[valueEnd])) &&
-           commandLine[valueEnd] != '"' &&
-           commandLine[valueEnd] != '\'') {
-        ++valueEnd;
-    }
-
-    const std::string value = commandLine.substr(valueBegin, valueEnd - valueBegin);
-    const std::size_t comma = value.find(',');
-    if (comma == std::string::npos) {
-        Tracenf("[ARGS] invalid --debug-spawn value: %s", value.c_str());
-        return std::nullopt;
-    }
-
-    char* endX = nullptr;
-    char* endY = nullptr;
-    const std::string xText = value.substr(0, comma);
-    const std::string yText = value.substr(comma + 1);
-    const float x = std::strtof(xText.c_str(), &endX);
-    const float y = std::strtof(yText.c_str(), &endY);
-    if (endX == xText.c_str() || *endX != '\0' || endY == yText.c_str() || *endY != '\0' ||
-        !std::isfinite(x) || !std::isfinite(y)) {
-        Tracenf("[ARGS] invalid --debug-spawn value: %s", value.c_str());
-        return std::nullopt;
-    }
-
-    Tracenf("[ARGS] debug spawn override requested: %.2f, %.2f", x, y);
-    return client::net::DebugSpawnOverride{x, y};
-}
-
 class CameraController
 {
 public:
@@ -1120,53 +1076,24 @@ struct EditorPlayRuntime
     SceneData playStartSceneSnapshot;
     bool playStartSceneWasOpen = false;
     bool playStartSceneDirty = false;
-    bool directGameplayDevCharacter = false;
     client::net::Vec3 playerPosition{};
     std::uint16_t playerHeading = 0;
 };
 
-enum class RuntimeImplementation
+std::unique_ptr<RuntimeSession> CreateRuntimeSession()
 {
-    Empty,
-    Auriga
-};
-
-constexpr RuntimeImplementation kActiveRuntimeImplementation = RuntimeImplementation::Auriga;
-
-std::unique_ptr<RuntimeSession> CreateRuntimeSession(RuntimeImplementation implementation)
-{
-    switch (implementation)
-    {
-    case RuntimeImplementation::Empty:
-        Tracen("[RUNTIME] active session = EmptyRuntimeSession");
-        return CreateEmptyRuntimeSession();
-    case RuntimeImplementation::Auriga:
-    default:
-        Tracen("[RUNTIME] active session = AurigaRuntimeSession");
-        return CreateAurigaRuntimeSession();
-    }
+    Tracen("[RUNTIME] active session = EmptyRuntimeSession");
+    return CreateEmptyRuntimeSession();
 }
 
-std::unique_ptr<RuntimeUiAdapter> CreateRuntimeUiAdapter(RuntimeImplementation implementation,
-                                                        RmlUiLayer& rmlUi,
-                                                        client::asset::IAssetReader& assets,
-                                                        std::function<bool()> isRuntimeFlowActive)
+std::unique_ptr<RuntimeUiAdapter> CreateRuntimeUiAdapter(RmlUiLayer& rmlUi)
 {
-    switch (implementation)
-    {
-    case RuntimeImplementation::Empty:
-        Tracen("[RUNTIME] active UI adapter = NullRuntimeUiAdapter");
-        return CreateNullRuntimeUiAdapter(rmlUi);
-    case RuntimeImplementation::Auriga:
-    default:
-        Tracen("[RUNTIME] active UI adapter = AurigaRuntimeUiAdapter");
-        return CreateAurigaRuntimeUiAdapter(rmlUi, assets, std::move(isRuntimeFlowActive));
-    }
+    Tracen("[RUNTIME] active UI adapter = NullRuntimeUiAdapter");
+    return CreateNullRuntimeUiAdapter(rmlUi);
 }
 
 int RunGame(NativeWindow& window,
-            client::asset::IAssetReader& assets,
-            std::optional<client::net::DebugSpawnOverride> debugSpawnOverride = std::nullopt)
+            client::asset::IAssetReader& assets)
 {
     VulkanDevice device;
     if (!device.Create(window, window.GetWidth(), window.GetHeight()))
@@ -1181,14 +1108,13 @@ int RunGame(NativeWindow& window,
 #else
     Tracen("[BUILD] Editor: DISABLED");
     Tracen("[BOOT] build = RELEASE");
-    Tracen("[BOOT] entry state = release boot, loading startup_scene from app_config");
+    Tracen("[BOOT] entry state = release boot, default runtime, no built-in AURIGA startup scene");
 #endif
     Tracenf("[BOOT] window size = %ux%u", window.GetWidth(), window.GetHeight());
 
     VkExtent2D renderSize = device.GetSwapchainExtent();
     Tracenf("[BOOT] swapchain size = %ux%u", renderSize.width, renderSize.height);
-    std::unique_ptr<RuntimeSession> runtimeSession = CreateRuntimeSession(kActiveRuntimeImplementation);
-    runtimeSession->SetDebugSpawnOverride(debugSpawnOverride);
+    std::unique_ptr<RuntimeSession> runtimeSession = CreateRuntimeSession();
     if (!runtimeSession->Create(device, assets, renderSize.width, renderSize.height))
     {
         ShowFatal("Failed to create runtime session. See debug output/stderr.");
@@ -1204,18 +1130,7 @@ int RunGame(NativeWindow& window,
         device.Destroy();
         return 1;
     }
-#if defined(IXTREEME_WITH_EDITOR)
-    bool editorRuntimeFlowActive = false;
-#endif
-    auto isRuntimeFlowActive = [&]() {
-#if defined(IXTREEME_WITH_EDITOR)
-        return editorRuntimeFlowActive;
-#else
-        return true;
-#endif
-    };
-    std::unique_ptr<RuntimeUiAdapter> runtimeUi =
-        CreateRuntimeUiAdapter(kActiveRuntimeImplementation, rmlUi, assets, isRuntimeFlowActive);
+    std::unique_ptr<RuntimeUiAdapter> runtimeUi = CreateRuntimeUiAdapter(rmlUi);
     runtimeUi->SetQuitCallback([&window]() {
         window.RequestClose();
     });
@@ -1261,7 +1176,7 @@ int RunGame(NativeWindow& window,
     if (auto assetRoot = assets.RootPath())
         editorImGui.SetEngineRoot(*assetRoot);
 #else
-    LoadRuntimeScene(assets, StartupSceneFromConfig(assets));
+    Tracen("[SCENE] no scene loaded (default runtime release state)");
 #endif
     const std::string warriorModelPath = "assets/Character/KicsiK.glb";
 
@@ -2174,40 +2089,6 @@ int RunGame(NativeWindow& window,
                     fallback.y = terrain.SampleHeight(fallback);
                     return fallback;
                 };
-                auto hasOwnRuntimeCharacter = [&]() {
-                    if (!runtimeSession->IsInWorld())
-                        return false;
-                    const std::uint32_t ownNetId = runtimeSession->GetOwnNetId();
-                    if (ownNetId == 0)
-                        return false;
-                    const std::vector<WorldRenderEntity> worldEntities = runtimeSession->GetWorldEntities();
-                    return std::any_of(worldEntities.begin(), worldEntities.end(), [ownNetId](const WorldRenderEntity& entity) {
-                        return entity.netId == ownNetId;
-                    });
-                };
-                auto injectDirectGameplayDevCharacter = [&]() {
-                    WorldVec3 spawn = spawnAtCameraCenter();
-                    if (terrainOk)
-                        spawn.y = terrain.SampleHeight(spawn);
-                    editorPlay.playerPosition = DisplayToServerMeters(spawn);
-                    editorPlay.playerHeading = 0;
-
-                    WorldRenderEntity player{};
-                    player.netId = 1;
-                    player.name = "DevPlayer";
-                    player.position = editorPlay.playerPosition;
-                    player.heading = editorPlay.playerHeading;
-                    player.moveState = client::net::MoveState::Idle;
-                    player.mobTypeId = 0;
-                    player.level = 50;
-                    player.hpCurrent = 1000.0f;
-                    player.hpMax = 1000.0f;
-                    player.hpDisplayed = 1000.0f;
-                    runtimeSession->EnterLocalPlayMode(player);
-                    selectedTargetNetId = 0;
-                    editorPlay.directGameplayDevCharacter = true;
-                    Tracen("[EDIT-PLAY-2] Direct gameplay scene Play: dev character injected");
-                };
                 auto selectHierarchyEntity = [&](HierarchyEntityType type, std::uint32_t id) {
                     switch (type)
                     {
@@ -2435,7 +2316,6 @@ int RunGame(NativeWindow& window,
                         editorPlay.playStartScenePath.empty() ? "<unsaved>" : editorPlay.playStartScenePath.c_str(),
                         playSceneType.c_str());
                     editorPlay.editorCameraSnapshot = cameraController.SaveSnapshot();
-                    editorPlay.directGameplayDevCharacter = false;
                     selectedEditorObject = {};
                     editorObjectDragActive = false;
                     waterSculptStrokeActive = false;
@@ -2443,14 +2323,11 @@ int RunGame(NativeWindow& window,
                     terrain.SetWaterSculptBrush(false, 0.0f, 0.0f, 0.0f, true);
                     cameraController.SetEditorFlyMode(false);
                     runtimeSession->Start(SceneManager::Instance().GetCurrentScene());
-                    editorRuntimeFlowActive = true;
                     SceneManager::Instance().ActivateCurrentSceneType();
-                    if ((playSceneType == "world" || playSceneType == "gameplay") && !hasOwnRuntimeCharacter())
-                        injectDirectGameplayDevCharacter();
                     editorPlay.state.frameCount = 0;
                     editorPlay.state.elapsedSeconds = 0.0;
                     editorPlay.appliedMode = editorPlay.state.mode;
-                    Tracen("[EDIT-PLAY-2] Runtime UI/scene flow enabled for Play mode");
+                    Tracen("[EDIT-PLAY] Default runtime Play mode enabled (no player UI, network, or character)");
                     Tracen("[EDIT-PLAY] Play Mode active");
                 }
                 else if (editorPlay.appliedMode != EditorPlayMode::Edit &&
@@ -2459,7 +2336,6 @@ int RunGame(NativeWindow& window,
                     Tracenf("[EDIT-PLAY] Exiting Play Mode (after %.1fs, %d frames)",
                         editorPlay.state.elapsedSeconds,
                         editorPlay.state.frameCount);
-                    editorRuntimeFlowActive = false;
                     runtimeUi->HideAll();
                     runtimeSession->Stop();
                     editorWaterBodiesDirty = true;
@@ -2475,7 +2351,6 @@ int RunGame(NativeWindow& window,
                     editorPlay.playStartScenePath.clear();
                     editorPlay.playStartSceneWasOpen = false;
                     editorPlay.playStartSceneDirty = false;
-                    editorPlay.directGameplayDevCharacter = false;
                     if (editorPlay.editorCameraSnapshot)
                     {
                         cameraController.RestoreSnapshot(*editorPlay.editorCameraSnapshot);
@@ -3221,27 +3096,17 @@ int RunGame(NativeWindow& window,
 int WINAPI WinMain(HINSTANCE instance, HINSTANCE, LPSTR, int showCommand)
 {
     (void)showCommand;
-    const auto debugSpawnOverride = ParseDebugSpawnOverride(GetCommandLineA());
-
-    WSADATA wsaData{};
-    if (WSAStartup(MAKEWORD(2, 2), &wsaData) != 0)
-    {
-        ShowFatal("Failed to initialize WinSock.");
-        return 1;
-    }
 
     NativeWindow_Win32 window;
     if (!window.Create(instance, "AURIGA GLOBAL — Editor", 1280, 720))
     {
         ShowFatal("Failed to create Win32 window.");
-        WSACleanup();
         return 1;
     }
 
     client::asset::FileAssetReader assets(ExecutableDirectory());
-    const int result = RunGame(window, assets, debugSpawnOverride);
+    const int result = RunGame(window, assets);
     window.Destroy();
-    WSACleanup();
     return result;
 }
 

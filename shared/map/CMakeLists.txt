@@ -44,16 +44,3 @@ if(MSVC)
         MSVC_RUNTIME_LIBRARY "MultiThreaded$<$<CONFIG:Debug>:Debug>"
     )
 endif()
-
-if(NOT CMAKE_SYSTEM_NAME STREQUAL "Android")
-    add_executable(mapgen_test_zone
-        tools/mapgen_test_zone.cpp
-    )
-    target_link_libraries(mapgen_test_zone PRIVATE mapdata CapnProto::capnp)
-    target_compile_features(mapgen_test_zone PRIVATE cxx_std_20)
-    if(MSVC)
-        set_target_properties(mapgen_test_zone PROPERTIES
-            MSVC_RUNTIME_LIBRARY "MultiThreaded$<$<CONFIG:Debug>:Debug>"
-        )
-    endif()
-endif()

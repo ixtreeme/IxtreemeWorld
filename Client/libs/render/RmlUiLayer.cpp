@@ -1567,21 +1567,21 @@ bool RmlUiLayer::Create(VulkanDevice& device, client::asset::IAssetReader& asset
     m_impl->loginDocument = m_impl->context->LoadDocument("assets/ui/login.rml");
     if (!m_impl->loginDocument)
     {
-        Tracen("[RMLUI] Failed to load login.rml");
-        return false;
+        Tracen("[RMLUI] Optional runtime document missing: assets/ui/login.rml");
     }
-    m_impl->loginDocument->SetProperty("position", "absolute");
-    m_impl->loginDocument->SetProperty("left", "0px");
-    m_impl->loginDocument->SetProperty("top", "0px");
-    m_impl->loginDocument->SetProperty("width", std::to_string(width) + "px");
-    m_impl->loginDocument->SetProperty("height", std::to_string(height) + "px");
+    else
+    {
+        m_impl->loginDocument->SetProperty("position", "absolute");
+        m_impl->loginDocument->SetProperty("left", "0px");
+        m_impl->loginDocument->SetProperty("top", "0px");
+        m_impl->loginDocument->SetProperty("width", std::to_string(width) + "px");
+        m_impl->loginDocument->SetProperty("height", std::to_string(height) + "px");
 
-    if (Rml::Element* button = m_impl->loginDocument->GetElementById("login-button"))
-        button->AddEventListener("click", &m_impl->loginButtonHandler);
-    SetLoginStatusText(m_impl->loginDocument, "");
-    m_impl->loginDocument->Show();
-    if (Rml::Element* username = m_impl->loginDocument->GetElementById("login-username"))
-        username->Focus(true);
+        if (Rml::Element* button = m_impl->loginDocument->GetElementById("login-button"))
+            button->AddEventListener("click", &m_impl->loginButtonHandler);
+        SetLoginStatusText(m_impl->loginDocument, "");
+        m_impl->loginDocument->Hide();
+    }
 
     m_impl->lobbyEnterHandler.callback = [this](Rml::Event&) {
         if (!m_impl || !m_impl->lobbyVisible)
@@ -1692,115 +1692,128 @@ bool RmlUiLayer::Create(VulkanDevice& device, client::asset::IAssetReader& asset
     m_impl->lobbyDocument = m_impl->context->LoadDocument("assets/ui/lobby.rml");
     if (!m_impl->lobbyDocument)
     {
-        Tracen("[RMLUI] Failed to load lobby.rml");
-        return false;
+        Tracen("[RMLUI] Optional runtime document missing: assets/ui/lobby.rml");
     }
-    m_impl->lobbyDocument->SetProperty("position", "absolute");
-    m_impl->lobbyDocument->SetProperty("left", "0px");
-    m_impl->lobbyDocument->SetProperty("top", "0px");
-    m_impl->lobbyDocument->SetProperty("width", std::to_string(width) + "px");
-    m_impl->lobbyDocument->SetProperty("height", std::to_string(height) + "px");
-    if (Rml::Element* button = m_impl->lobbyDocument->GetElementById("enter-world-btn"))
-        button->AddEventListener("click", &m_impl->lobbyEnterHandler);
-    if (Rml::Element* button = m_impl->lobbyDocument->GetElementById("new-character-btn"))
-        button->AddEventListener("click", &m_impl->lobbyNewCharacterHandler);
-    if (Rml::Element* button = m_impl->lobbyDocument->GetElementById("delete-char-btn"))
-        button->AddEventListener("click", &m_impl->lobbyDeleteHandler);
-    if (Rml::Element* button = m_impl->lobbyDocument->GetElementById("logout-btn"))
-        button->AddEventListener("click", &m_impl->lobbyLogoutHandler);
-    if (Rml::Element* button = m_impl->lobbyDocument->GetElementById("confirm-delete-yes"))
-        button->AddEventListener("click", &m_impl->lobbyConfirmDeleteYesHandler);
-    if (Rml::Element* button = m_impl->lobbyDocument->GetElementById("confirm-delete-no"))
-        button->AddEventListener("click", &m_impl->lobbyConfirmDeleteNoHandler);
-    SetElementDisplay(m_impl->lobbyDocument, "delete-confirm", false);
-    SetLobbyStatusText(m_impl.get(), "");
-    m_impl->lobbyDocument->Hide();
+    else
+    {
+        m_impl->lobbyDocument->SetProperty("position", "absolute");
+        m_impl->lobbyDocument->SetProperty("left", "0px");
+        m_impl->lobbyDocument->SetProperty("top", "0px");
+        m_impl->lobbyDocument->SetProperty("width", std::to_string(width) + "px");
+        m_impl->lobbyDocument->SetProperty("height", std::to_string(height) + "px");
+        if (Rml::Element* button = m_impl->lobbyDocument->GetElementById("enter-world-btn"))
+            button->AddEventListener("click", &m_impl->lobbyEnterHandler);
+        if (Rml::Element* button = m_impl->lobbyDocument->GetElementById("new-character-btn"))
+            button->AddEventListener("click", &m_impl->lobbyNewCharacterHandler);
+        if (Rml::Element* button = m_impl->lobbyDocument->GetElementById("delete-char-btn"))
+            button->AddEventListener("click", &m_impl->lobbyDeleteHandler);
+        if (Rml::Element* button = m_impl->lobbyDocument->GetElementById("logout-btn"))
+            button->AddEventListener("click", &m_impl->lobbyLogoutHandler);
+        if (Rml::Element* button = m_impl->lobbyDocument->GetElementById("confirm-delete-yes"))
+            button->AddEventListener("click", &m_impl->lobbyConfirmDeleteYesHandler);
+        if (Rml::Element* button = m_impl->lobbyDocument->GetElementById("confirm-delete-no"))
+            button->AddEventListener("click", &m_impl->lobbyConfirmDeleteNoHandler);
+        SetElementDisplay(m_impl->lobbyDocument, "delete-confirm", false);
+        SetLobbyStatusText(m_impl.get(), "");
+        m_impl->lobbyDocument->Hide();
+    }
 
     m_impl->hudDocument = m_impl->context->LoadDocument("assets/ui/worldhud.rml");
     if (!m_impl->hudDocument)
     {
-        Tracen("[RMLUI] Failed to load worldhud.rml");
-        return false;
+        Tracen("[RMLUI] Optional runtime document missing: assets/ui/worldhud.rml");
     }
-    m_impl->hudDocument->SetProperty("position", "absolute");
-    m_impl->hudDocument->SetProperty("left", "0px");
-    m_impl->hudDocument->SetProperty("top", "0px");
-    m_impl->hudDocument->SetProperty("width", std::to_string(width) + "px");
-    m_impl->hudDocument->SetProperty("height", std::to_string(height) + "px");
-    CacheHudElements(*m_impl);
-    m_impl->hudDocument->Hide();
+    else
+    {
+        m_impl->hudDocument->SetProperty("position", "absolute");
+        m_impl->hudDocument->SetProperty("left", "0px");
+        m_impl->hudDocument->SetProperty("top", "0px");
+        m_impl->hudDocument->SetProperty("width", std::to_string(width) + "px");
+        m_impl->hudDocument->SetProperty("height", std::to_string(height) + "px");
+        CacheHudElements(*m_impl);
+        m_impl->hudDocument->Hide();
+    }
 
     m_impl->menuDocument = m_impl->context->LoadDocument("assets/ui/ingame_menu.rml");
     if (!m_impl->menuDocument)
     {
-        Tracen("[RMLUI] Failed to load ingame_menu.rml");
-        return false;
+        Tracen("[RMLUI] Optional runtime document missing: assets/ui/ingame_menu.rml");
     }
-    SetFullscreenDocumentSize(m_impl->menuDocument, width, height);
-    if (Rml::Element* button = m_impl->menuDocument->GetElementById("menu-resume-btn"))
-        button->AddEventListener("click", &m_impl->menuResumeHandler);
-    if (Rml::Element* button = m_impl->menuDocument->GetElementById("menu-settings-btn"))
-        button->AddEventListener("click", &m_impl->menuSettingsHandler);
-    if (Rml::Element* button = m_impl->menuDocument->GetElementById("menu-logout-btn"))
-        button->AddEventListener("click", &m_impl->menuLogoutHandler);
-    if (Rml::Element* button = m_impl->menuDocument->GetElementById("menu-quit-btn"))
-        button->AddEventListener("click", &m_impl->menuQuitHandler);
-    m_impl->menuDocument->Hide();
+    else
+    {
+        SetFullscreenDocumentSize(m_impl->menuDocument, width, height);
+        if (Rml::Element* button = m_impl->menuDocument->GetElementById("menu-resume-btn"))
+            button->AddEventListener("click", &m_impl->menuResumeHandler);
+        if (Rml::Element* button = m_impl->menuDocument->GetElementById("menu-settings-btn"))
+            button->AddEventListener("click", &m_impl->menuSettingsHandler);
+        if (Rml::Element* button = m_impl->menuDocument->GetElementById("menu-logout-btn"))
+            button->AddEventListener("click", &m_impl->menuLogoutHandler);
+        if (Rml::Element* button = m_impl->menuDocument->GetElementById("menu-quit-btn"))
+            button->AddEventListener("click", &m_impl->menuQuitHandler);
+        m_impl->menuDocument->Hide();
+    }
 
     m_impl->settingsDocument = m_impl->context->LoadDocument("assets/ui/settings.rml");
     if (!m_impl->settingsDocument)
     {
-        Tracen("[RMLUI] Failed to load settings.rml");
-        return false;
+        Tracen("[RMLUI] Optional runtime document missing: assets/ui/settings.rml");
     }
-    SetFullscreenDocumentSize(m_impl->settingsDocument, width, height);
-    if (Rml::Element* button = m_impl->settingsDocument->GetElementById("settings-back-btn"))
-        button->AddEventListener("click", &m_impl->settingsBackHandler);
-    if (Rml::Element* button = m_impl->settingsDocument->GetElementById("settings-apply-btn"))
-        button->AddEventListener("click", &m_impl->settingsApplyHandler);
-    if (Rml::Element* button = m_impl->settingsDocument->GetElementById("settings-tab-video"))
-        button->AddEventListener("click", &m_impl->settingsVideoTabHandler);
-    if (Rml::Element* button = m_impl->settingsDocument->GetElementById("settings-tab-audio"))
-        button->AddEventListener("click", &m_impl->settingsAudioTabHandler);
-    if (Rml::Element* button = m_impl->settingsDocument->GetElementById("settings-tab-controls"))
-        button->AddEventListener("click", &m_impl->settingsControlsTabHandler);
-    SetSettingsTab(m_impl->settingsDocument, "video");
-    m_impl->settingsDocument->Hide();
+    else
+    {
+        SetFullscreenDocumentSize(m_impl->settingsDocument, width, height);
+        if (Rml::Element* button = m_impl->settingsDocument->GetElementById("settings-back-btn"))
+            button->AddEventListener("click", &m_impl->settingsBackHandler);
+        if (Rml::Element* button = m_impl->settingsDocument->GetElementById("settings-apply-btn"))
+            button->AddEventListener("click", &m_impl->settingsApplyHandler);
+        if (Rml::Element* button = m_impl->settingsDocument->GetElementById("settings-tab-video"))
+            button->AddEventListener("click", &m_impl->settingsVideoTabHandler);
+        if (Rml::Element* button = m_impl->settingsDocument->GetElementById("settings-tab-audio"))
+            button->AddEventListener("click", &m_impl->settingsAudioTabHandler);
+        if (Rml::Element* button = m_impl->settingsDocument->GetElementById("settings-tab-controls"))
+            button->AddEventListener("click", &m_impl->settingsControlsTabHandler);
+        SetSettingsTab(m_impl->settingsDocument, "video");
+        m_impl->settingsDocument->Hide();
+    }
 
     m_impl->inventoryDocument = m_impl->context->LoadDocument("assets/ui/inventory.rml");
     if (!m_impl->inventoryDocument)
     {
-        Tracen("[RMLUI] Failed to load inventory.rml");
-        return false;
+        Tracen("[RMLUI] Optional runtime document missing: assets/ui/inventory.rml");
     }
-    SetFullscreenDocumentSize(m_impl->inventoryDocument, width, height);
-    if (Rml::Element* button = m_impl->inventoryDocument->GetElementById("inventory-close-btn"))
-        button->AddEventListener("click", &m_impl->inventoryCloseHandler);
-    PopulateInventoryGrid(m_impl->inventoryDocument);
-    m_impl->inventoryDocument->Hide();
+    else
+    {
+        SetFullscreenDocumentSize(m_impl->inventoryDocument, width, height);
+        if (Rml::Element* button = m_impl->inventoryDocument->GetElementById("inventory-close-btn"))
+            button->AddEventListener("click", &m_impl->inventoryCloseHandler);
+        PopulateInventoryGrid(m_impl->inventoryDocument);
+        m_impl->inventoryDocument->Hide();
+    }
 
     m_impl->characterCreationDocument = m_impl->context->LoadDocument("assets/ui/character_creation.rml");
     if (!m_impl->characterCreationDocument)
     {
-        Tracen("[RMLUI] Failed to load character_creation.rml");
-        return false;
+        Tracen("[RMLUI] Optional runtime document missing: assets/ui/character_creation.rml");
     }
-    SetFullscreenDocumentSize(m_impl->characterCreationDocument, width, height);
-    if (Rml::Element* button = m_impl->characterCreationDocument->GetElementById("creation-create-btn"))
-        button->AddEventListener("click", &m_impl->creationCreateHandler);
-    if (Rml::Element* button = m_impl->characterCreationDocument->GetElementById("creation-cancel-btn"))
-        button->AddEventListener("click", &m_impl->creationCancelHandler);
-    m_impl->characterCreationDocument->Hide();
+    else
+    {
+        SetFullscreenDocumentSize(m_impl->characterCreationDocument, width, height);
+        if (Rml::Element* button = m_impl->characterCreationDocument->GetElementById("creation-create-btn"))
+            button->AddEventListener("click", &m_impl->creationCreateHandler);
+        if (Rml::Element* button = m_impl->characterCreationDocument->GetElementById("creation-cancel-btn"))
+            button->AddEventListener("click", &m_impl->creationCancelHandler);
+        m_impl->characterCreationDocument->Hide();
+    }
 
     m_impl->initialized = true;
     Tracenf("[RMLUI] Initialized: version 6.2, viewport=%ux%u", width, height);
-    Tracen("[RMLUI] Loaded document: assets/ui/login.rml");
-    Tracen("[RMLUI] Loaded document: assets/ui/lobby.rml");
-    Tracen("[RMLUI] Loaded document: assets/ui/worldhud.rml");
-    Tracen("[RMLUI] Loaded document: assets/ui/ingame_menu.rml");
-    Tracen("[RMLUI] Loaded document: assets/ui/settings.rml");
-    Tracen("[RMLUI] Loaded document: assets/ui/inventory.rml");
-    Tracen("[RMLUI] Loaded document: assets/ui/character_creation.rml");
+    Tracenf("[RMLUI] Runtime documents loaded: login=%d lobby=%d hud=%d menu=%d settings=%d inventory=%d character=%d",
+        m_impl->loginDocument ? 1 : 0,
+        m_impl->lobbyDocument ? 1 : 0,
+        m_impl->hudDocument ? 1 : 0,
+        m_impl->menuDocument ? 1 : 0,
+        m_impl->settingsDocument ? 1 : 0,
+        m_impl->inventoryDocument ? 1 : 0,
+        m_impl->characterCreationDocument ? 1 : 0);
     return true;
 }
 

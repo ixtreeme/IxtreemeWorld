@@ -5,8 +5,6 @@ add_library(client_render STATIC
     CubeRenderer.h
     EditorImGui.cpp
     EditorImGui.h
-    GameClientLayer.cpp
-    GameClientLayer.h
     MapEditorTypes.h
     NameplateRenderer.cpp
     NameplateRenderer.h

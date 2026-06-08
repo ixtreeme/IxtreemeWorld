@@ -1,11 +1,39 @@
 #pragma once
 
-#include "GameClientLayer.h"
+#include "InputEvent.h"
+#include "MapEditorTypes.h"
 #include "SceneManager.h"
-#include "network/ClientSession.h"
+#include "network/IClientHandler.h"
 
+#include <array>
+#include <cstdint>
+#include <functional>
 #include <memory>
 #include <optional>
+#include <string>
+#include <utility>
+#include <vector>
+
+class VulkanDevice;
+
+namespace client::asset
+{
+class IAssetReader;
+}
+
+struct WorldRenderEntity
+{
+    std::uint32_t netId = 0;
+    std::string name;
+    client::net::Vec3 position;
+    std::uint16_t heading = 0;
+    client::net::MoveState moveState = client::net::MoveState::Idle;
+    std::uint32_t mobTypeId = 0;
+    std::uint32_t level = 1;
+    float hpCurrent = 1.0f;
+    float hpMax = 1.0f;
+    float hpDisplayed = 1.0f;
+};
 
 class RuntimeSession
 {
@@ -14,7 +42,6 @@ public:
 
     virtual bool Create(VulkanDevice& device, client::asset::IAssetReader& assets, uint32_t width, uint32_t height) = 0;
     virtual void Destroy() = 0;
-    virtual void SetDebugSpawnOverride(std::optional<client::net::DebugSpawnOverride> override) = 0;
     virtual void SetQuitCallback(std::function<void()> callback) = 0;
     virtual void Update(double timeSeconds) = 0;
     virtual void UpdateNetwork() = 0;
@@ -69,4 +96,3 @@ public:
 };
 
 std::unique_ptr<RuntimeSession> CreateEmptyRuntimeSession();
-std::unique_ptr<RuntimeSession> CreateAurigaRuntimeSession();

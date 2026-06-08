@@ -19,7 +19,6 @@ endif()
 target_link_libraries(VulkanClear
     PRIVATE
         client_render
-        client_network
 )
 
 target_compile_features(VulkanClear PRIVATE cxx_std_20)

@@ -54,6 +54,12 @@ struct TestContext
         std::cerr << "[FAIL] " << name << ": " << message << "\n";
     }
 
+    void Skip(const std::string& name, const std::string& reason)
+    {
+        ++passed;
+        std::cout << "[SKIP] " << name << ": " << reason << "\n";
+    }
+
     bool Expect(bool condition, const std::string& name, const std::string& message)
     {
         if (condition)
@@ -865,6 +871,23 @@ bool RunRenderChecks(const Options& options, TestContext& ctx)
     std::stringstream androidGradleText;
     androidGradleText << androidGradle.rdbuf();
     const std::string androidGradleSource = androidGradleText.str();
+    const bool hasAurigaUiContent =
+        std::filesystem::exists(loginRmlPath) &&
+        std::filesystem::exists(loginRcssPath) &&
+        std::filesystem::exists(lobbyRmlPath) &&
+        std::filesystem::exists(lobbyRcssPath) &&
+        std::filesystem::exists(worldHudRmlPath) &&
+        std::filesystem::exists(worldHudRcssPath) &&
+        std::filesystem::exists(menuRmlPath) &&
+        std::filesystem::exists(settingsRmlPath) &&
+        std::filesystem::exists(inventoryRmlPath) &&
+        std::filesystem::exists(creationRmlPath);
+    const bool cleanup2DefaultRuntime =
+        !hasAurigaUiContent &&
+        runtimeSessionSource.find("class AurigaRuntimeSession") == std::string::npos &&
+        runtimeUiAdapterSource.find("class AurigaRuntimeUiAdapter") == std::string::npos &&
+        clientMainSource.find("CreateRuntimeSession()") != std::string::npos &&
+        clientMainSource.find("CreateRuntimeUiAdapter(rmlUi)") != std::string::npos;
     ctx.Expect(rootCmakeSource.find("option(IXTREEME_WITH_EDITOR") != std::string::npos &&
             rootCmakeSource.find("if(IXTREEME_WITH_EDITOR)\n    vcpkg_require(imguizmo)") != std::string::npos &&
             rootCmakeSource.find("if(WIN32 AND IXTREEME_WITH_EDITOR)") != std::string::npos &&
@@ -880,9 +903,13 @@ bool RunRenderChecks(const Options& options, TestContext& ctx)
             renderCmakeSource.find("RuntimeSession.cpp") != std::string::npos &&
             renderCmakeSource.find("RuntimeUiAdapter.cpp") != std::string::npos &&
             renderCmakeSource.find("RmlUi::RmlUi") != std::string::npos &&
-            renderCmakeSource.find("GameClientLayer.cpp") != std::string::npos &&
+            (cleanup2DefaultRuntime
+                ? renderCmakeSource.find("GameClientLayer.cpp") == std::string::npos
+                : renderCmakeSource.find("GameClientLayer.cpp") != std::string::npos) &&
             clientMainSource.find("RmlUiLayer rmlUi") != std::string::npos &&
-            clientMainSource.find("CreateRuntimeSession(kActiveRuntimeImplementation)") != std::string::npos &&
+            (cleanup2DefaultRuntime
+                ? clientMainSource.find("CreateRuntimeSession()") != std::string::npos
+                : clientMainSource.find("CreateRuntimeSession(kActiveRuntimeImplementation)") != std::string::npos) &&
             clientMainSource.find("rmlUi.Render(device);") != std::string::npos &&
             clientMainSource.find("editorImGui.Render(device);") != std::string::npos,
         "rmlui build and z-order pipeline", "RMLUI-1 must link RmlUi 6.2, compile shaders, and render before ImGui");
@@ -904,7 +931,10 @@ bool RunRenderChecks(const Options& options, TestContext& ctx)
             rmlUiShaderSource.find("[[vk::binding(0, 0)]] Texture2D") != std::string::npos &&
             rmlUiShaderSource.find("(pixel.y / g_push.viewport.y) * 2.0f - 1.0f") != std::string::npos,
         "rmlui vulkan layer source", "RMLUI-2 must provide file, render, input, login event, and Vulkan shader integration");
-    ctx.Expect(loginRmlSource.find("AURIGA GLOBAL") != std::string::npos &&
+    if (cleanup2DefaultRuntime)
+        ctx.Skip("rmlui login document and game handoff", "CLEANUP-2 archived AURIGA login UI and game handoff");
+    else
+        ctx.Expect(loginRmlSource.find("AURIGA GLOBAL") != std::string::npos &&
             loginRmlSource.find("login-username") != std::string::npos &&
             loginRmlSource.find("login-password") != std::string::npos &&
             loginRmlSource.find("login-remember") != std::string::npos &&
@@ -917,7 +947,10 @@ bool RunRenderChecks(const Options& options, TestContext& ctx)
             runtimeUiAdapterSource.find("m_rmlUi.SetLoginSubmitCallback") != std::string::npos &&
             runtimeUiAdapterSource.find("runtime.SetLoginCallbacks") != std::string::npos,
         "rmlui login document and game handoff", "RMLUI-2 login must be RML/RCSS and call the existing backend login path");
-    ctx.Expect(lobbyRmlSource.find("Lobby - AURIGA GLOBAL") != std::string::npos &&
+    if (cleanup2DefaultRuntime)
+        ctx.Skip("rmlui lobby document and game handoff", "CLEANUP-2 archived AURIGA lobby UI and callbacks");
+    else
+        ctx.Expect(lobbyRmlSource.find("Lobby - AURIGA GLOBAL") != std::string::npos &&
             lobbyRmlSource.find("character-list") != std::string::npos &&
             lobbyRmlSource.find("enter-world-btn") != std::string::npos &&
             lobbyRmlSource.find("delete-char-btn") != std::string::npos &&
@@ -933,7 +966,10 @@ bool RunRenderChecks(const Options& options, TestContext& ctx)
             runtimeUiAdapterSource.find("m_rmlUi.SetLobbyCallbacks") != std::string::npos &&
             runtimeUiAdapterSource.find("runtime.SetLobbyCallbacks") != std::string::npos,
         "rmlui lobby document and game handoff", "RMLUI-3 lobby must be RML/RCSS and populate character data from callbacks");
-    ctx.Expect(worldHudRmlSource.find("HUD - AURIGA GLOBAL") != std::string::npos &&
+    if (cleanup2DefaultRuntime)
+        ctx.Skip("rmlui hud document and per-frame update", "CLEANUP-2 archived AURIGA HUD UI and runtime HUD update");
+    else
+        ctx.Expect(worldHudRmlSource.find("HUD - AURIGA GLOBAL") != std::string::npos &&
             worldHudRmlSource.find("player-name") != std::string::npos &&
             worldHudRmlSource.find("hp-fill") != std::string::npos &&
             worldHudRmlSource.find("mp-fill") != std::string::npos &&
@@ -950,7 +986,10 @@ bool RunRenderChecks(const Options& options, TestContext& ctx)
             runtimeUiAdapterSource.find("m_rmlUi.ShowHud()") != std::string::npos &&
             clientMainSource.find("runtimeUi->UpdateHud(hudData)") != std::string::npos,
         "rmlui hud document and per-frame update", "RMLUI-4 HUD must be RML/RCSS and update bar widths by CSS property");
-    ctx.Expect(menuRmlSource.find("menu-resume-btn") != std::string::npos &&
+    if (cleanup2DefaultRuntime)
+        ctx.Skip("rmlui gameplay panels", "CLEANUP-2 archived AURIGA menu/settings/inventory/character panels");
+    else
+        ctx.Expect(menuRmlSource.find("menu-resume-btn") != std::string::npos &&
             menuRmlSource.find("menu-settings-btn") != std::string::npos &&
             menuRmlSource.find("menu-logout-btn") != std::string::npos &&
             settingsRmlSource.find("settings-tab-video") != std::string::npos &&
@@ -1123,33 +1162,52 @@ bool RunRenderChecks(const Options& options, TestContext& ctx)
             sceneManagerSource.find("type == \"world\"") != std::string::npos &&
             sceneManagerSource.find("type == \"empty\"") != std::string::npos,
         "scene runtime ui binding", "SCENE-2 must activate RmlUi views from scene_type values");
-    ctx.Expect(runtimeSessionHeaderSource.find("class RuntimeSession") != std::string::npos &&
-            runtimeSessionHeaderSource.find("Start(const SceneData& openScene)") != std::string::npos &&
-            runtimeSessionHeaderSource.find("Stop()") != std::string::npos &&
-            runtimeSessionSource.find("class EmptyRuntimeSession final") != std::string::npos &&
-            runtimeSessionSource.find("class AurigaRuntimeSession final") != std::string::npos &&
-            runtimeSessionSource.find("GameClientLayer m_gameClient") != std::string::npos &&
-            runtimeSessionSource.find("std::unique_ptr<client::net::ClientSession>") != std::string::npos &&
-            runtimeUiAdapterHeaderSource.find("class RuntimeUiAdapter") != std::string::npos &&
-            runtimeUiAdapterSource.find("class NullRuntimeUiAdapter final") != std::string::npos &&
-            runtimeUiAdapterSource.find("class AurigaRuntimeUiAdapter final") != std::string::npos &&
-            clientMainSource.find("kActiveRuntimeImplementation = RuntimeImplementation::Auriga") != std::string::npos,
-        "cleanup runtime adapters", "CLEANUP-1 must put runtime session and player UI routing behind default and AURIGA adapters");
-    ctx.Expect(clientMainSource.find("StartupSceneFromConfig") != std::string::npos &&
-            clientMainSource.find("startup_scene") != std::string::npos &&
-            clientMainSource.find("scenes/Login.scene") != std::string::npos &&
-            clientMainSource.find("#else\n    LoadRuntimeScene(assets, StartupSceneFromConfig(assets));") != std::string::npos,
-        "scene release startup flow", "SCENE-2 release builds must load app_config.json startup_scene with Login.scene fallback");
+    if (cleanup2DefaultRuntime)
+        ctx.Expect(runtimeSessionHeaderSource.find("class RuntimeSession") != std::string::npos &&
+                runtimeSessionHeaderSource.find("Start(const SceneData& openScene)") != std::string::npos &&
+                runtimeSessionHeaderSource.find("Stop()") != std::string::npos &&
+                runtimeSessionSource.find("class EmptyRuntimeSession final") != std::string::npos &&
+                runtimeSessionSource.find("class AurigaRuntimeSession final") == std::string::npos &&
+                runtimeUiAdapterHeaderSource.find("class RuntimeUiAdapter") != std::string::npos &&
+                runtimeUiAdapterSource.find("class NullRuntimeUiAdapter final") != std::string::npos &&
+                runtimeUiAdapterSource.find("class AurigaRuntimeUiAdapter final") == std::string::npos &&
+                clientMainSource.find("CreateRuntimeSession()") != std::string::npos &&
+                clientMainSource.find("CreateRuntimeUiAdapter(rmlUi)") != std::string::npos,
+            "cleanup runtime adapters", "CLEANUP-2 must leave only the default runtime session and null UI adapter active");
+    else
+        ctx.Expect(runtimeSessionHeaderSource.find("class RuntimeSession") != std::string::npos &&
+                runtimeSessionHeaderSource.find("Start(const SceneData& openScene)") != std::string::npos &&
+                runtimeSessionHeaderSource.find("Stop()") != std::string::npos &&
+                runtimeSessionSource.find("class EmptyRuntimeSession final") != std::string::npos &&
+                runtimeSessionSource.find("class AurigaRuntimeSession final") != std::string::npos &&
+                runtimeSessionSource.find("GameClientLayer m_gameClient") != std::string::npos &&
+                runtimeSessionSource.find("std::unique_ptr<client::net::ClientSession>") != std::string::npos &&
+                runtimeUiAdapterHeaderSource.find("class RuntimeUiAdapter") != std::string::npos &&
+                runtimeUiAdapterSource.find("class NullRuntimeUiAdapter final") != std::string::npos &&
+                runtimeUiAdapterSource.find("class AurigaRuntimeUiAdapter final") != std::string::npos &&
+                clientMainSource.find("kActiveRuntimeImplementation = RuntimeImplementation::Auriga") != std::string::npos,
+            "cleanup runtime adapters", "CLEANUP-1 must put runtime session and player UI routing behind default and AURIGA adapters");
+    if (cleanup2DefaultRuntime)
+        ctx.Skip("scene release startup flow", "CLEANUP-2 switches release boot to default runtime with no AURIGA Login.scene fallback");
+    else
+        ctx.Expect(clientMainSource.find("StartupSceneFromConfig") != std::string::npos &&
+                clientMainSource.find("startup_scene") != std::string::npos &&
+                clientMainSource.find("scenes/Login.scene") != std::string::npos &&
+                clientMainSource.find("#else\n    LoadRuntimeScene(assets, StartupSceneFromConfig(assets));") != std::string::npos,
+            "scene release startup flow", "SCENE-2 release builds must load app_config.json startup_scene with Login.scene fallback");
     ctx.Expect(gameClientLayerHeaderSource.find("SetMapEditorOpen") != std::string::npos &&
             gameClientLayerSource.find("void GameClientLayer::SetMapEditorOpen(bool open)") != std::string::npos &&
             clientMainSource.find("runtimeSession->SetMapEditorOpen(true)") != std::string::npos &&
             clientMainSource.find("[BOOT] editor_open forced = 1") != std::string::npos &&
             clientMainSource.find("editorImGui.BeginFrame(runtimeSession->IsMapEditorOpen())") != std::string::npos,
         "editor boot opens imgui", "ENGINE-BOOT-FIX must keep the ImGui editor open on editor-build boot independent of scene_type/RmlUi routing");
-    ctx.Expect(runtimeUiAdapterSource.find("scenes/Lobby.scene") != std::string::npos &&
-            runtimeUiAdapterSource.find("scenes/World.scene") != std::string::npos &&
-            runtimeUiAdapterSource.find("LoadRuntimeSceneOrFallback") != std::string::npos,
-        "scene navigation callbacks", "SCENE-2 login/lobby/world transitions must route through scene loads");
+    if (cleanup2DefaultRuntime)
+        ctx.Skip("scene navigation callbacks", "CLEANUP-2 removes active AURIGA login/lobby/world scene-flow routing");
+    else
+        ctx.Expect(runtimeUiAdapterSource.find("scenes/Lobby.scene") != std::string::npos &&
+                runtimeUiAdapterSource.find("scenes/World.scene") != std::string::npos &&
+                runtimeUiAdapterSource.find("LoadRuntimeSceneOrFallback") != std::string::npos,
+            "scene navigation callbacks", "SCENE-2 login/lobby/world transitions must route through scene loads");
     ctx.Expect(rmlUiLayerSource.find("void RmlUiLayer::HideAll") != std::string::npos &&
             rmlUiLayerSource.find("WarnSceneTypeMismatch") != std::string::npos &&
             rmlUiLayerSource.find("ShowLogin\", \"login") != std::string::npos &&
@@ -1166,17 +1224,23 @@ bool RunRenderChecks(const Options& options, TestContext& ctx)
             editorImGuiSource.find("Open a scene to Play") != std::string::npos &&
             editorImGuiSource.find("HasOpenScene()") != std::string::npos,
         "play scene restore", "SCENE-2 Play mode must store/restore the starting scene and disable Play with no open scene");
-    ctx.Expect(clientMainSource.find("editorRuntimeFlowActive") != std::string::npos &&
-            runtimeUiAdapterSource.find("suppressed (Edit mode)") != std::string::npos &&
-            runtimeUiAdapterSource.find("[SCENE-FLOW] suppressed in Edit mode") != std::string::npos &&
-            clientMainSource.find("SceneManager::Instance().ActivateCurrentSceneType()") != std::string::npos &&
-            clientMainSource.find("Runtime UI/scene flow enabled for Play mode") != std::string::npos,
-        "runtime ui play gate", "EDIT-PLAY-2 must keep scene_type RmlUi routing and login/lobby/world flow inactive in Edit mode and enable them only in Play");
-    ctx.Expect(clientMainSource.find("injectDirectGameplayDevCharacter") != std::string::npos &&
-            clientMainSource.find("playSceneType == \"world\" || playSceneType == \"gameplay\"") != std::string::npos &&
-            clientMainSource.find("!hasOwnRuntimeCharacter()") != std::string::npos &&
-            clientMainSource.find("Direct gameplay scene Play: dev character injected") != std::string::npos,
-        "direct gameplay dev character", "EDIT-PLAY-2 must inject a dev character only when directly playing a gameplay scene without an existing character");
+    if (cleanup2DefaultRuntime)
+        ctx.Skip("runtime ui play gate", "CLEANUP-2 default runtime has no active player-UI scene-flow routing");
+    else
+        ctx.Expect(clientMainSource.find("editorRuntimeFlowActive") != std::string::npos &&
+                runtimeUiAdapterSource.find("suppressed (Edit mode)") != std::string::npos &&
+                runtimeUiAdapterSource.find("[SCENE-FLOW] suppressed in Edit mode") != std::string::npos &&
+                clientMainSource.find("SceneManager::Instance().ActivateCurrentSceneType()") != std::string::npos &&
+                clientMainSource.find("Runtime UI/scene flow enabled for Play mode") != std::string::npos,
+            "runtime ui play gate", "EDIT-PLAY-2 must keep scene_type RmlUi routing and login/lobby/world flow inactive in Edit mode and enable them only in Play");
+    if (cleanup2DefaultRuntime)
+        ctx.Skip("direct gameplay dev character", "CLEANUP-2 default runtime intentionally has no dev character injection");
+    else
+        ctx.Expect(clientMainSource.find("injectDirectGameplayDevCharacter") != std::string::npos &&
+                clientMainSource.find("playSceneType == \"world\" || playSceneType == \"gameplay\"") != std::string::npos &&
+                clientMainSource.find("!hasOwnRuntimeCharacter()") != std::string::npos &&
+                clientMainSource.find("Direct gameplay scene Play: dev character injected") != std::string::npos,
+            "direct gameplay dev character", "EDIT-PLAY-2 must inject a dev character only when directly playing a gameplay scene without an existing character");
     ctx.Expect(sceneManagerHeaderSource.find("RestoreSceneSnapshot") != std::string::npos &&
             sceneManagerSource.find("void SceneManager::RestoreSceneSnapshot") != std::string::npos &&
             clientMainSource.find("playStartSceneSnapshot") != std::string::npos &&
@@ -1236,7 +1300,10 @@ bool RunRenderChecks(const Options& options, TestContext& ctx)
             editorImGuiSource.find("Tools disabled in Play Mode") != std::string::npos &&
             editorImGuiSource.find("Read-only during Play Mode") != std::string::npos,
         "editor play toolbar and hotkeys", "EDIT-PLAY-1 needs Play/Stop/Pause toolbar controls, F5/F6 hotkeys, and disabled edit tools in Play Mode");
-    ctx.Expect(gameClientLayerHeaderSource.find("EnterLocalPlayMode") != std::string::npos &&
+    if (cleanup2DefaultRuntime)
+        ctx.Skip("editor local play mode runtime", "CLEANUP-2 default runtime removes AURIGA local dev-character/HUD runtime path");
+    else
+        ctx.Expect(gameClientLayerHeaderSource.find("EnterLocalPlayMode") != std::string::npos &&
             gameClientLayerHeaderSource.find("ExitLocalPlayMode") != std::string::npos &&
             gameClientLayerHeaderSource.find("UpdateLocalPlayPlayer") != std::string::npos &&
             gameClientLayerSource.find("localSavedStateValid") != std::string::npos &&

@@ -24,6 +24,3 @@ public:
 };
 
 std::unique_ptr<RuntimeUiAdapter> CreateNullRuntimeUiAdapter(RmlUiLayer& rmlUi);
-std::unique_ptr<RuntimeUiAdapter> CreateAurigaRuntimeUiAdapter(RmlUiLayer& rmlUi,
-                                                               client::asset::IAssetReader& assets,
-                                                               std::function<bool()> isRuntimeFlowActive);
