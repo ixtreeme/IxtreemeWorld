@@ -45,6 +45,7 @@ public:
     bool WantsInputCapture(const InputEvent& event) const;
     void SetMapEditorSettings(const MapEditorSettings& settings);
     MapEditorSettings GetMapEditorSettings() const { return m_editorSettings; }
+    void SetEditorPlayModeState(const EditorPlayModeState& state);
     void SetLightingState(const LightingState& state);
     LightingState GetLightingState() const { return m_lightingState; }
     void SetDynamicLightEditorState(const DynamicLightEditorState& state);
@@ -71,11 +72,24 @@ private:
         WaterMaterial
     };
 
+    struct AssetPreviewTexture
+    {
+        VkImage image = VK_NULL_HANDLE;
+        VkDeviceMemory memory = VK_NULL_HANDLE;
+        VkImageView view = VK_NULL_HANDLE;
+        VkSampler sampler = VK_NULL_HANDLE;
+        VkDescriptorSet descriptor = VK_NULL_HANDLE;
+        uint32_t width = 0;
+        uint32_t height = 0;
+        bool failed = false;
+    };
+
     bool CreateDescriptorPool(VulkanDevice& device);
     bool InitVulkanBackend(VulkanDevice& device);
     void RenderEditorPanels();
     void RenderDemoPanels();
     void RenderDockSpace();
+    void RenderEditorToolbar();
     void RenderToolsPanel();
     void RenderInspector();
     void RenderSelectedWaterBodyInspector();
@@ -109,6 +123,11 @@ private:
     void RenderAssetGrid();
     void RenderAssetTile(const AssetLibrary::Entry& entry, float tileSize);
     void RenderAssetTagFilters();
+    void DestroyAssetPreviewTextures();
+    void DestroyAssetPreviewTexture(AssetPreviewTexture& texture);
+    std::optional<std::filesystem::path> AssetPreviewPathFor(const AssetLibrary::Entry& entry) const;
+    AssetPreviewTexture* GetAssetPreviewTexture(const AssetLibrary::Entry& entry);
+    bool LoadAssetPreviewTexture(const std::filesystem::path& path, AssetPreviewTexture& outTexture);
     void CreateAssetFolder();
     void DeleteAssetFolder();
     void DeleteAsset(const AssetLibrary::Entry& entry);
@@ -133,6 +152,8 @@ private:
     void ApplyTimeOfDayPreset(float hour);
     void MarkSelectedWaterBodyChanged();
     void MarkSelectedLightChanged();
+    void HandleEditorHotkeys();
+    bool CanUseEditorTools() const;
     void SetToolMode(MapEditorToolMode mode);
     MapEditorPaletteSlot BuildPaletteSlotFromAsset(std::uint32_t slotIndex, const AssetLibrary::Entry& entry) const;
 
@@ -157,6 +178,9 @@ private:
     };
 
     VkDevice m_device = VK_NULL_HANDLE;
+    VkPhysicalDevice m_physicalDevice = VK_NULL_HANDLE;
+    VkQueue m_graphicsQueue = VK_NULL_HANDLE;
+    uint32_t m_graphicsQueueFamily = UINT32_MAX;
     VkDescriptorPool m_descriptorPool = VK_NULL_HANDLE;
     bool m_initialized = false;
     bool m_vulkanBackendReady = false;
@@ -172,6 +196,7 @@ private:
     int m_gizmoSnapIndex = 2;
     float m_gizmoSnapValue = 1.0f;
     MapEditorSettings m_editorSettings;
+    EditorPlayModeState m_playModeState;
     LightingState m_lightingState;
     DynamicLightEditorState m_dynamicLightState;
     WaterBodyEditorState m_waterBodyState;
@@ -192,6 +217,7 @@ private:
     std::string m_assetStatus;
     char m_assetSearchBuffer[128]{};
     char m_newAssetFolderName[64]{};
+    std::unordered_map<std::string, AssetPreviewTexture> m_assetPreviewTextures;
     bool m_assetBrowserLogged = false;
     float m_timeOfDayHours = 12.0f;
     uint64_t m_lastLoggedFrame = UINT64_MAX;

@@ -30,6 +30,12 @@ struct GameClientLayer::Impl
     std::uint32_t currentHeight = 0;
     bool lobbyActive = false;
     bool inWorld = false;
+    bool localPlayMode = false;
+    bool localSavedStateValid = false;
+    bool savedLobbyActive = false;
+    bool savedInWorld = false;
+    std::uint32_t savedOwnNetId = 0;
+    std::vector<WorldRenderEntity> savedEntities;
     bool inGameMenuOpen = false;
     bool mapEditorOpen = false;
     std::uint32_t ownNetId = 0;
@@ -132,8 +138,67 @@ void GameClientLayer::Resize(uint32_t width, uint32_t height)
 
 bool GameClientLayer::IsLobbyActive() const { return m_impl && m_impl->lobbyActive; }
 bool GameClientLayer::IsInWorld() const { return m_impl && m_impl->inWorld; }
+bool GameClientLayer::IsLocalPlayMode() const { return m_impl && m_impl->localPlayMode; }
 std::uint32_t GameClientLayer::GetOwnNetId() const { return m_impl ? m_impl->ownNetId : 0; }
 std::vector<WorldRenderEntity> GameClientLayer::GetWorldEntities() const { return m_impl ? m_impl->entities : std::vector<WorldRenderEntity>{}; }
+void GameClientLayer::EnterLocalPlayMode(const WorldRenderEntity& player)
+{
+    if (!m_impl)
+        return;
+
+    m_impl->localPlayMode = true;
+    m_impl->localSavedStateValid = true;
+    m_impl->savedLobbyActive = m_impl->lobbyActive;
+    m_impl->savedInWorld = m_impl->inWorld;
+    m_impl->savedOwnNetId = m_impl->ownNetId;
+    m_impl->savedEntities = m_impl->entities;
+    m_impl->inWorld = true;
+    m_impl->lobbyActive = false;
+    m_impl->inGameMenuOpen = false;
+    m_impl->ownNetId = player.netId;
+    m_impl->entities.clear();
+    m_impl->entities.push_back(player);
+    Tracenf("[EDIT-PLAY] Test character spawned: id=%u pos=(%.1f,%.1f,%.1f)",
+        player.netId,
+        player.position.x,
+        player.position.y,
+        player.position.z);
+}
+void GameClientLayer::UpdateLocalPlayPlayer(client::net::Vec3 position,
+                                            std::uint16_t heading,
+                                            client::net::MoveState moveState)
+{
+    if (!m_impl || !m_impl->localPlayMode)
+        return;
+
+    WorldRenderEntity& player = m_impl->UpsertEntity(m_impl->ownNetId);
+    player.position = position;
+    player.heading = heading;
+    player.moveState = moveState;
+}
+void GameClientLayer::ExitLocalPlayMode()
+{
+    if (!m_impl || !m_impl->localPlayMode)
+        return;
+
+    m_impl->localPlayMode = false;
+    if (m_impl->localSavedStateValid)
+    {
+        m_impl->lobbyActive = m_impl->savedLobbyActive;
+        m_impl->inWorld = m_impl->savedInWorld;
+        m_impl->ownNetId = m_impl->savedOwnNetId;
+        m_impl->entities = std::move(m_impl->savedEntities);
+        m_impl->localSavedStateValid = false;
+    }
+    else
+    {
+        m_impl->inWorld = false;
+        m_impl->ownNetId = 0;
+        m_impl->entities.clear();
+    }
+    m_impl->inGameMenuOpen = false;
+    Tracen("[EDIT-PLAY] Runtime state cleared");
+}
 bool GameClientLayer::IsInGameMenuOpen() const { return m_impl && m_impl->inGameMenuOpen; }
 bool GameClientLayer::IsMapEditorOpen() const { return m_impl && m_impl->mapEditorOpen; }
 void GameClientLayer::ToggleInGameMenu() { if (m_impl) m_impl->inGameMenuOpen = !m_impl->inGameMenuOpen; }

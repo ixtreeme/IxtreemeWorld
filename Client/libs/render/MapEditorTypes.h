@@ -28,6 +28,20 @@ enum class MapEditorToolMode
     SplatPaint
 };
 
+enum class EditorPlayMode
+{
+    Edit,
+    Play,
+    PlayPaused
+};
+
+struct EditorPlayModeState
+{
+    EditorPlayMode mode = EditorPlayMode::Edit;
+    int frameCount = 0;
+    double elapsedSeconds = 0.0;
+};
+
 struct MapEditorSettings
 {
     MapEditorToolMode toolMode = MapEditorToolMode::None;
@@ -253,6 +267,10 @@ struct MapEditorCommands
     bool save = false;
     bool reload = false;
     bool undo = false;
+    bool enterPlayMode = false;
+    bool exitPlayMode = false;
+    bool pausePlayMode = false;
+    bool resumePlayMode = false;
     bool addWaterBody = false;
     bool deleteSelectedWaterBody = false;
     bool selectedWaterBodyChanged = false;

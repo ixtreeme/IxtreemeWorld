@@ -715,11 +715,26 @@ bool RunRenderChecks(const Options& options, TestContext& ctx)
     std::stringstream editorImGuiText;
     editorImGuiText << editorImGui.rdbuf();
     const std::string editorImGuiSource = editorImGuiText.str();
+    const std::filesystem::path editorImGuiHeaderPath = options.clientRoot / "libs" / "render" / "EditorImGui.h";
+    std::ifstream editorImGuiHeader(editorImGuiHeaderPath);
+    std::stringstream editorImGuiHeaderText;
+    editorImGuiHeaderText << editorImGuiHeader.rdbuf();
+    const std::string editorImGuiHeaderSource = editorImGuiHeaderText.str();
     const std::filesystem::path rmlUiLayerPath = options.clientRoot / "libs" / "render" / "RmlUiLayer.cpp";
     std::ifstream rmlUiLayer(rmlUiLayerPath);
     std::stringstream rmlUiLayerText;
     rmlUiLayerText << rmlUiLayer.rdbuf();
     const std::string rmlUiLayerSource = rmlUiLayerText.str();
+    const std::filesystem::path uiHelpersPath = options.clientRoot / "libs" / "render" / "UIHelpers.cpp";
+    std::ifstream uiHelpers(uiHelpersPath);
+    std::stringstream uiHelpersText;
+    uiHelpersText << uiHelpers.rdbuf();
+    const std::string uiHelpersSource = uiHelpersText.str();
+    const std::filesystem::path iconsHeaderPath = options.clientRoot / "libs" / "render" / "IconsFontAwesome6.h";
+    std::ifstream iconsHeader(iconsHeaderPath);
+    std::stringstream iconsHeaderText;
+    iconsHeaderText << iconsHeader.rdbuf();
+    const std::string iconsHeaderSource = iconsHeaderText.str();
     const std::filesystem::path rmlUiShaderPath = options.clientRoot / "shaders" / "RmlUi.hlsl";
     std::ifstream rmlUiShader(rmlUiShaderPath);
     std::stringstream rmlUiShaderText;
@@ -897,6 +912,99 @@ bool RunRenderChecks(const Options& options, TestContext& ctx)
             clientMainSource.find("event.key == Key_Escape") != std::string::npos &&
             clientMainSource.find("event.key == Key_I") != std::string::npos,
         "rmlui gameplay panels", "RMLUI-5 must provide menu, settings, inventory, character creation, and keyboard toggles");
+    ctx.Expect(std::filesystem::exists(options.clientRoot / "assets" / "fonts" / "Inter-Regular.ttf") &&
+            std::filesystem::exists(options.clientRoot / "assets" / "fonts" / "Inter-SemiBold.ttf") &&
+            std::filesystem::exists(options.clientRoot / "assets" / "fonts" / "Inter-Bold.ttf") &&
+            std::filesystem::exists(options.clientRoot / "assets" / "fonts" / "fa-solid-900.ttf") &&
+            editorImGuiSource.find("LoadEditorFonts") != std::string::npos &&
+            editorImGuiSource.find("AddFontFromFileTTF") != std::string::npos &&
+            editorImGuiSource.find("Inter-Regular.ttf") != std::string::npos &&
+            editorImGuiSource.find("fa-solid-900.ttf") != std::string::npos &&
+            iconsHeaderSource.find("ICON_FA_PLAY") != std::string::npos &&
+            iconsHeaderSource.find("ICON_FA_TRASH") != std::string::npos,
+        "editor visual fonts and icons", "EDITOR-VISUAL-POLISH must bundle Inter, FontAwesome, and icon constants");
+    ctx.Expect(editorImGuiSource.find("ApplyAaaImGuiStyle") != std::string::npos &&
+            editorImGuiSource.find("WindowRounding = 6.0f") != std::string::npos &&
+            editorImGuiSource.find("FramePadding = ImVec2(8.0f, 6.0f)") != std::string::npos &&
+            editorImGuiSource.find("ImGuiCol_ButtonHovered") != std::string::npos &&
+            editorImGuiSource.find("0.28f, 0.48f, 0.75f") != std::string::npos &&
+            editorImGuiSource.find("[EDITOR-VISUAL] AAA-style ImGui colors applied") != std::string::npos,
+        "editor aaa imgui style", "EDITOR-VISUAL-POLISH must apply deep backgrounds, rounded corners, padding, and blue hover accents");
+    ctx.Expect(uiHelpersSource.find("namespace UI") != std::string::npos &&
+            uiHelpersSource.find("PropertyRow") != std::string::npos &&
+            uiHelpersSource.find("IconButton") != std::string::npos &&
+            uiHelpersSource.find("SectionHeader") != std::string::npos &&
+            uiHelpersSource.find("StatusOk") != std::string::npos &&
+            uiHelpersSource.find("HelpMarker") != std::string::npos &&
+            renderCmakeSource.find("UIHelpers.cpp") != std::string::npos,
+        "editor ui helper layer", "EDITOR-VISUAL-POLISH must provide reusable UI helpers for consistent panels");
+    ctx.Expect(editorImGuiSource.find("DockBuilderDockWindow(\"Editor Toolbar\"") != std::string::npos &&
+            editorImGuiSource.find("DockBuilderDockWindow(\"Tools\"") != std::string::npos &&
+            editorImGuiSource.find("DockBuilderDockWindow(\"Inspector\"") != std::string::npos &&
+            editorImGuiSource.find("DockBuilderDockWindow(\"Asset Browser\"") != std::string::npos &&
+            editorImGuiSource.find("DockBuilderDockWindow(\"Scene View\"") != std::string::npos &&
+            editorImGuiSource.find("[EDITOR-LAYOUT] Default Unity-style dock layout applied") != std::string::npos &&
+            editorImGuiSource.find("[EDITOR-LAYOUT] Loaded layout from editor_layout.ini") != std::string::npos,
+        "editor unity dock layout", "EDITOR-VISUAL-POLISH must default to a Unity-style dock layout without overwriting saved layouts");
+    ctx.Expect(editorImGuiSource.find("UI::IconButton(ICON_FA_PLAY") != std::string::npos &&
+            editorImGuiSource.find("UI::IconButton(ICON_FA_DROPLET") != std::string::npos &&
+            editorImGuiSource.find("UI::IconButton(ICON_FA_FOLDER_PLUS") != std::string::npos &&
+            editorImGuiSource.find("UI::IconButton(ICON_FA_TRASH") != std::string::npos &&
+            editorImGuiSource.find("UI::SectionHeader") != std::string::npos &&
+            clientMainSource.find("AURIGA GLOBAL") != std::string::npos &&
+            clientMainSource.find("Standalone Vulkan Clear - gameClient Overlay") == std::string::npos,
+        "editor icon buttons and title", "EDITOR-VISUAL-POLISH must iconize editor controls and rename the window title");
+    ctx.Expect(editorImGuiSource.find("ImGui::Button(label)") != std::string::npos &&
+            editorImGuiSource.find("m_assetFilter = filter") != std::string::npos &&
+            editorImGuiSource.find("m_assetSubpath.clear()") != std::string::npos &&
+            editorImGuiSource.find("ImGuiTabItemFlags_SetSelected") == std::string::npos,
+        "asset browser category tabs", "asset browser category buttons must drive the editor filter directly instead of forcing ImGui tab selection");
+    ctx.Expect(editorImGuiSource.find("BeginTable(\"AssetGridTiles\"") != std::string::npos &&
+            editorImGuiSource.find("TableSetupColumn(nullptr, ImGuiTableColumnFlags_WidthFixed, cellWidth)") != std::string::npos &&
+            editorImGuiSource.find("ImGui::TableNextColumn()") != std::string::npos &&
+            editorImGuiSource.find("ShortAssetFilename") != std::string::npos &&
+            editorImGuiSource.find("constexpr size_t kVisibleCharacters = 10") != std::string::npos,
+        "asset browser grid wrapping", "asset browser tiles must wrap inside fixed grid cells instead of extending horizontally past the Tags panel");
+    ctx.Expect(editorImGuiSource.find("BeginChild(\"AssetFoldersScroll\"") != std::string::npos &&
+            editorImGuiSource.find("BeginChild(\"AssetGridScroll\"") != std::string::npos &&
+            editorImGuiSource.find("BeginChild(\"AssetTagsScroll\"") != std::string::npos &&
+            editorImGuiSource.find("browserPanelHeight") != std::string::npos,
+        "asset browser independent scroll zones", "asset browser folders, grid, and tags columns must scroll independently when content overflows");
+    ctx.Expect(editorImGuiHeaderSource.find("AssetPreviewTexture") != std::string::npos &&
+            editorImGuiSource.find("LoadAssetPreviewTexture") != std::string::npos &&
+            editorImGuiSource.find("ImGui_ImplVulkan_AddTexture") != std::string::npos &&
+            editorImGuiSource.find("ImGui_ImplVulkan_RemoveTexture") != std::string::npos &&
+            editorImGuiSource.find("drawList->AddImage") != std::string::npos &&
+            iconsHeaderSource.find("ICON_FA_IMAGE") != std::string::npos,
+        "asset browser previews", "asset browser must show texture/material thumbnails and fall back to category icons");
+    ctx.Expect(editorImGuiSource.find("ImGui::BeginTooltip()") != std::string::npos &&
+            editorImGuiSource.find("Type: %s") != std::string::npos &&
+            editorImGuiSource.find("Preview: %s") != std::string::npos &&
+            editorImGuiSource.find("Tags: %s") != std::string::npos &&
+            editorImGuiSource.find("Source: %s") != std::string::npos,
+        "asset browser compact tile metadata", "asset browser tiles should show only a short filename and move metadata into the hover tooltip");
+    ctx.Expect(editorImGuiSource.find("RenderEditorToolbar") != std::string::npos &&
+            editorImGuiSource.find("HandleEditorHotkeys") != std::string::npos &&
+            editorImGuiSource.find("ImGuiKey_F5") != std::string::npos &&
+            editorImGuiSource.find("ImGuiKey_F6") != std::string::npos &&
+            editorImGuiSource.find("enterPlayMode") != std::string::npos &&
+            editorImGuiSource.find("pausePlayMode") != std::string::npos &&
+            editorImGuiSource.find("Tools disabled in Play Mode") != std::string::npos &&
+            editorImGuiSource.find("Read-only during Play Mode") != std::string::npos,
+        "editor play toolbar and hotkeys", "EDIT-PLAY-1 needs Play/Stop/Pause toolbar controls, F5/F6 hotkeys, and disabled edit tools in Play Mode");
+    ctx.Expect(gameClientLayerHeaderSource.find("EnterLocalPlayMode") != std::string::npos &&
+            gameClientLayerHeaderSource.find("ExitLocalPlayMode") != std::string::npos &&
+            gameClientLayerHeaderSource.find("UpdateLocalPlayPlayer") != std::string::npos &&
+            gameClientLayerSource.find("localSavedStateValid") != std::string::npos &&
+            gameClientLayerSource.find("[EDIT-PLAY] Runtime state cleared") != std::string::npos &&
+            clientMainSource.find("EditorPlayRuntime") != std::string::npos &&
+            clientMainSource.find("TestPlayer") != std::string::npos &&
+            clientMainSource.find("player.level = 50") != std::string::npos &&
+            clientMainSource.find("player.hpMax = 1000.0f") != std::string::npos &&
+            clientMainSource.find("rmlUi.ShowHud()") != std::string::npos &&
+            clientMainSource.find("editorPlay.state.mode == EditorPlayMode::PlayPaused") != std::string::npos &&
+            clientMainSource.find("[EDIT-PLAY] Snapshot restored") != std::string::npos,
+        "editor local play mode runtime", "EDIT-PLAY-1 needs local play runtime state, test character spawn, HUD activation, pause, and Stop restore");
     ctx.Expect(!std::filesystem::exists(options.clientRoot / "libs" / "render" / ("Noe" "sisLayer.cpp")) &&
             !std::filesystem::exists(options.clientRoot / "libs" / "render" / ("Noe" "sisLayer.h")) &&
             renderCmakeSource.find(legacyUiName) == std::string::npos &&

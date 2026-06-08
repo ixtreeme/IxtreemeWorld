@@ -96,6 +96,11 @@ WorldVec3 ServerMetersToDisplay(client::net::Vec3 position)
     return {position.x, position.z, -position.y};
 }
 
+client::net::Vec3 DisplayToServerMeters(WorldVec3 position)
+{
+    return {position.x, -position.z, position.y};
+}
+
 bool ProjectWorldToScreen(const WorldCamera& camera,
                           WorldVec3 world,
                           uint32_t width,
@@ -664,6 +669,18 @@ std::optional<client::net::DebugSpawnOverride> ParseDebugSpawnOverride(const std
 class CameraController
 {
 public:
+    struct Snapshot
+    {
+        bool flyMode = false;
+        float yaw = 0.0f;
+        float pitch = 0.0f;
+        float distance = 0.0f;
+        WorldVec3 lastEye{};
+        WorldVec3 flyEye{};
+        float flyYaw = 0.0f;
+        float flyPitch = 0.0f;
+    };
+
     void SetEditorFlyMode(bool enabled)
     {
         if (enabled == flyMode_)
@@ -762,6 +779,25 @@ public:
 
     bool IsFlyMode() const { return flyMode_; }
     float MovementYaw() const { return flyMode_ ? flyYaw_ : yaw_; }
+    Snapshot SaveSnapshot() const
+    {
+        return Snapshot{flyMode_, yaw_, pitch_, distance_, lastEye_, flyEye_, flyYaw_, flyPitch_};
+    }
+    void RestoreSnapshot(const Snapshot& snapshot)
+    {
+        flyMode_ = snapshot.flyMode;
+        yaw_ = snapshot.yaw;
+        pitch_ = snapshot.pitch;
+        distance_ = snapshot.distance;
+        lastEye_ = snapshot.lastEye;
+        flyEye_ = snapshot.flyEye;
+        flyYaw_ = snapshot.flyYaw;
+        flyPitch_ = snapshot.flyPitch;
+        yawVelocity_ = 0.0f;
+        pitchVelocity_ = 0.0f;
+        zoomVelocity_ = 0.0f;
+        dragActive_ = false;
+    }
 
 private:
     static constexpr float kMaxPitch = 80.0f * 3.1415926535f / 180.0f;
@@ -860,6 +896,10 @@ void MergeMapEditorCommands(MapEditorCommands& target, const MapEditorCommands& 
     target.save = target.save || source.save;
     target.reload = target.reload || source.reload;
     target.undo = target.undo || source.undo;
+    target.enterPlayMode = target.enterPlayMode || source.enterPlayMode;
+    target.exitPlayMode = target.exitPlayMode || source.exitPlayMode;
+    target.pausePlayMode = target.pausePlayMode || source.pausePlayMode;
+    target.resumePlayMode = target.resumePlayMode || source.resumePlayMode;
     target.addWaterBody = target.addWaterBody || source.addWaterBody;
     target.deleteSelectedWaterBody = target.deleteSelectedWaterBody || source.deleteSelectedWaterBody;
     target.openSelectedWaterMaterialEditor =
@@ -898,6 +938,15 @@ void MergeMapEditorCommands(MapEditorCommands& target, const MapEditorCommands& 
         target.gizmoSnapValue = source.gizmoSnapValue;
     }
 }
+
+struct EditorPlayRuntime
+{
+    EditorPlayModeState state;
+    EditorPlayMode appliedMode = EditorPlayMode::Edit;
+    std::optional<CameraController::Snapshot> editorCameraSnapshot;
+    client::net::Vec3 playerPosition{};
+    std::uint16_t playerHeading = 0;
+};
 
 int RunGame(NativeWindow& window,
             client::asset::IAssetReader& assets,
@@ -1085,6 +1134,9 @@ int RunGame(NativeWindow& window,
 
     MovementInputState movement;
     CameraController cameraController;
+#if defined(IXTREEME_WITH_EDITOR)
+    EditorPlayRuntime editorPlay;
+#endif
     std::vector<WorldRenderEntity> lastPickEntities;
     WorldCamera lastPickCamera{};
     bool hasLastPickCamera = false;
@@ -1110,6 +1162,9 @@ int RunGame(NativeWindow& window,
     std::uint32_t waterSculptStrokeBodyId = 0;
     std::uint32_t waterSculptStrokeModifiedCells = 0;
     bool waterSculptMeshRegenPending = false;
+#if defined(IXTREEME_WITH_EDITOR)
+    bool editorShiftDown = false;
+#endif
 
     window.SetInputCallback([&gameClient,
                              &rmlUi,
@@ -1138,8 +1193,46 @@ int RunGame(NativeWindow& window,
                              &waterSculptStrokeBodyId,
                              &waterSculptStrokeModifiedCells,
                              &waterSculptMeshRegenPending,
+#if defined(IXTREEME_WITH_EDITOR)
+                             &editorPlay,
+                             &editorShiftDown,
+#endif
                              &renderSize](const InputEvent& event)
     {
+#if defined(IXTREEME_WITH_EDITOR)
+        if (event.type == InputEvent::KeyDown && event.key == Key_Shift)
+            editorShiftDown = true;
+        else if (event.type == InputEvent::KeyUp && event.key == Key_Shift)
+            editorShiftDown = false;
+
+        if (gameClient.IsMapEditorOpen() && event.type == InputEvent::KeyDown && event.key == Key_F5)
+        {
+            if (editorShiftDown)
+            {
+                if (editorPlay.state.mode != EditorPlayMode::Edit)
+                    editorPlay.state.mode = EditorPlayMode::Edit;
+            }
+            else if (editorPlay.state.mode == EditorPlayMode::Edit)
+            {
+                editorPlay.state.mode = EditorPlayMode::Play;
+            }
+            else
+            {
+                editorPlay.state.mode = EditorPlayMode::Edit;
+            }
+            movement.Clear();
+            return;
+        }
+        if (gameClient.IsMapEditorOpen() && event.type == InputEvent::KeyDown && event.key == Key_F6)
+        {
+            if (editorPlay.state.mode == EditorPlayMode::Play)
+                editorPlay.state.mode = EditorPlayMode::PlayPaused;
+            else if (editorPlay.state.mode == EditorPlayMode::PlayPaused)
+                editorPlay.state.mode = EditorPlayMode::Play;
+            movement.Clear();
+            return;
+        }
+#endif
         if (editorImGui.WantsInputCapture(event))
         {
             movement.Clear();
@@ -1230,7 +1323,11 @@ int RunGame(NativeWindow& window,
             return;
         }
 
-        if (terrainOk && gameClient.IsMapEditorOpen())
+        if (terrainOk && gameClient.IsMapEditorOpen()
+#if defined(IXTREEME_WITH_EDITOR)
+            && editorPlay.state.mode == EditorPlayMode::Edit
+#endif
+            )
         {
             if (editorTextInputFocused &&
                 (event.type == InputEvent::KeyDown ||
@@ -1566,7 +1663,11 @@ int RunGame(NativeWindow& window,
             }
         }
 
-        if (terrainOk && terrain.HandleEditorInput(event))
+        if (terrainOk
+#if defined(IXTREEME_WITH_EDITOR)
+            && editorPlay.state.mode == EditorPlayMode::Edit
+#endif
+            && terrain.HandleEditorInput(event))
             return;
 #endif
         if (gameClient.IsInWorld() && cameraController.HandleInput(event))
@@ -1656,10 +1757,64 @@ int RunGame(NativeWindow& window,
         const double deltaSeconds = seconds - previousSeconds;
         previousSeconds = seconds;
         cameraController.Update(deltaSeconds, movement);
-        clientSession.Update();
-        clientSession.SendMoveInput(
-            movement.DirectionAngle(cameraController.MovementYaw()),
-            cameraController.IsFlyMode() ? client::net::MoveState::Idle : movement.State());
+#if defined(IXTREEME_WITH_EDITOR)
+        if (gameClient.IsLocalPlayMode())
+        {
+            if (editorPlay.state.mode == EditorPlayMode::Play)
+            {
+                const float frameDt = static_cast<float>(std::clamp(deltaSeconds, 0.0, 0.05));
+                const float yaw = cameraController.MovementYaw();
+                WorldVec3 localMove{};
+                if (movement.w)
+                {
+                    localMove.x += std::sin(yaw);
+                    localMove.z += std::cos(yaw);
+                }
+                if (movement.s)
+                {
+                    localMove.x -= std::sin(yaw);
+                    localMove.z -= std::cos(yaw);
+                }
+                if (movement.d)
+                {
+                    localMove.x += std::cos(yaw);
+                    localMove.z -= std::sin(yaw);
+                }
+                if (movement.a)
+                {
+                    localMove.x -= std::cos(yaw);
+                    localMove.z += std::sin(yaw);
+                }
+                if (WorldDot(localMove, localMove) > 0.0001f)
+                {
+                    localMove = WorldNormalize(localMove);
+                    WorldVec3 displayPos = ServerMetersToDisplay(editorPlay.playerPosition);
+                    const float speed = movement.shift ? 9.0f : 4.5f;
+                    displayPos = WorldAdd(displayPos, WorldScale(localMove, speed * frameDt));
+                    if (terrainOk)
+                        displayPos.y = terrain.SampleHeight(displayPos);
+                    editorPlay.playerPosition = DisplayToServerMeters(displayPos);
+                    constexpr float kTwoPi = 6.28318530717958647692f;
+                    float heading = std::atan2(localMove.x, localMove.z);
+                    if (heading < 0.0f)
+                        heading += kTwoPi;
+                    editorPlay.playerHeading = static_cast<std::uint16_t>((heading / kTwoPi) * 65535.0f);
+                }
+                gameClient.UpdateLocalPlayPlayer(editorPlay.playerPosition,
+                    editorPlay.playerHeading,
+                    movement.State());
+                editorPlay.state.elapsedSeconds += deltaSeconds;
+                ++editorPlay.state.frameCount;
+            }
+        }
+        else
+#endif
+        {
+            clientSession.Update();
+            clientSession.SendMoveInput(
+                movement.DirectionAngle(cameraController.MovementYaw()),
+                cameraController.IsFlyMode() ? client::net::MoveState::Idle : movement.State());
+        }
         gameClient.Update(seconds);
         rmlUi.Update();
 
@@ -1713,6 +1868,15 @@ int RunGame(NativeWindow& window,
                 hudData.playerLevel = static_cast<int>(std::max(1u, ownEntity->level));
                 hudData.currentHp = ownEntity->hpCurrent;
                 hudData.maxHp = ownEntity->hpMax <= 0.0f ? 1.0f : ownEntity->hpMax;
+#if defined(IXTREEME_WITH_EDITOR)
+                if (gameClient.IsLocalPlayMode())
+                {
+                    hudData.currentMp = 500.0f;
+                    hudData.maxMp = 500.0f;
+                    hudData.currentXp = 0;
+                    hudData.xpForNextLevel = 1000;
+                }
+#endif
                 const WorldVec3 displayPos = ServerMetersToDisplay(ownEntity->position);
                 hudData.playerX = displayPos.x;
                 hudData.playerZ = displayPos.z;
@@ -1759,6 +1923,100 @@ int RunGame(NativeWindow& window,
                     fallback.y = terrain.SampleHeight(fallback);
                     return fallback;
                 };
+#if defined(IXTREEME_WITH_EDITOR)
+                if (commands.enterPlayMode)
+                    editorPlay.state.mode = EditorPlayMode::Play;
+                if (commands.exitPlayMode)
+                    editorPlay.state.mode = EditorPlayMode::Edit;
+                if (commands.pausePlayMode && editorPlay.state.mode == EditorPlayMode::Play)
+                    editorPlay.state.mode = EditorPlayMode::PlayPaused;
+                if (commands.resumePlayMode && editorPlay.state.mode == EditorPlayMode::PlayPaused)
+                    editorPlay.state.mode = EditorPlayMode::Play;
+
+                if (editorPlay.appliedMode == EditorPlayMode::Edit &&
+                    editorPlay.state.mode != EditorPlayMode::Edit)
+                {
+                    Tracen("[EDIT-PLAY] Entering Play Mode");
+                    editorPlay.editorCameraSnapshot = cameraController.SaveSnapshot();
+                    selectedEditorObject = {};
+                    editorObjectDragActive = false;
+                    waterSculptStrokeActive = false;
+                    terrain.SetWaterSculptBrush(false, 0.0f, 0.0f, 0.0f, true);
+                    cameraController.SetEditorFlyMode(false);
+
+                    WorldVec3 spawn = spawnAtCameraCenter();
+                    if (terrainOk)
+                        spawn.y = terrain.SampleHeight(spawn);
+                    editorPlay.playerPosition = DisplayToServerMeters(spawn);
+                    editorPlay.playerHeading = 0;
+
+                    WorldRenderEntity player{};
+                    player.netId = 1;
+                    player.name = "TestPlayer";
+                    player.position = editorPlay.playerPosition;
+                    player.heading = editorPlay.playerHeading;
+                    player.moveState = client::net::MoveState::Idle;
+                    player.mobTypeId = 0;
+                    player.level = 50;
+                    player.hpCurrent = 1000.0f;
+                    player.hpMax = 1000.0f;
+                    player.hpDisplayed = 1000.0f;
+                    gameClient.EnterLocalPlayMode(player);
+                    rmlUi.HideLobby();
+                    rmlUi.ShowHud();
+                    selectedTargetNetId = 0;
+                    editorPlay.state.frameCount = 0;
+                    editorPlay.state.elapsedSeconds = 0.0;
+                    editorPlay.appliedMode = editorPlay.state.mode;
+                    Tracen("[EDIT-PLAY] Embedded server started: local in-process play session");
+                    Tracen("[EDIT-PLAY] Play Mode active");
+                }
+                else if (editorPlay.appliedMode != EditorPlayMode::Edit &&
+                    editorPlay.state.mode == EditorPlayMode::Edit)
+                {
+                    Tracenf("[EDIT-PLAY] Exiting Play Mode (after %.1fs, %d frames)",
+                        editorPlay.state.elapsedSeconds,
+                        editorPlay.state.frameCount);
+                    rmlUi.HideHud();
+                    rmlUi.HideInventory();
+                    rmlUi.HideSettings();
+                    rmlUi.HideInGameMenu();
+                    gameClient.ExitLocalPlayMode();
+                    if (editorPlay.editorCameraSnapshot)
+                    {
+                        cameraController.RestoreSnapshot(*editorPlay.editorCameraSnapshot);
+                        editorPlay.editorCameraSnapshot.reset();
+                    }
+                    movement.Clear();
+                    editorPlay.state.frameCount = 0;
+                    editorPlay.state.elapsedSeconds = 0.0;
+                    editorPlay.appliedMode = EditorPlayMode::Edit;
+                    Tracen("[EDIT-PLAY] Embedded server stopped");
+                    Tracen("[EDIT-PLAY] Snapshot restored");
+                    Tracen("[EDIT-PLAY] Edit Mode active");
+                }
+                else if (editorPlay.appliedMode != editorPlay.state.mode)
+                {
+                    editorPlay.appliedMode = editorPlay.state.mode;
+                    Tracen(editorPlay.state.mode == EditorPlayMode::PlayPaused
+                        ? "[EDIT-PLAY] Play paused"
+                        : "[EDIT-PLAY] Play resumed");
+                }
+                if (editorPlay.state.mode != EditorPlayMode::Edit)
+                {
+                    commands.addWaterBody = false;
+                    commands.addPointLight = false;
+                    commands.addSpotLight = false;
+                    commands.deleteSelectedLight = false;
+                    commands.deleteSelectedWaterBody = false;
+                    commands.selectedLightChanged = false;
+                    commands.selectedWaterBodyChanged = false;
+                    commands.paletteSlotChanged = false;
+                    commands.save = false;
+                    commands.reload = false;
+                    commands.undo = false;
+                }
+#endif
                 if (commands.addWaterBody)
                 {
                     const WorldVec3 spawn = spawnAtCameraCenter();
@@ -2047,6 +2305,7 @@ int RunGame(NativeWindow& window,
         if (device.IsFrameActive())
         {
 #if defined(IXTREEME_WITH_EDITOR)
+            editorImGui.SetEditorPlayModeState(editorPlay.state);
             editorImGui.BeginFrame(gameClient.IsMapEditorOpen());
 #endif
             const bool isInWorld = gameClient.IsInWorld();
@@ -2374,7 +2633,7 @@ int WINAPI WinMain(HINSTANCE instance, HINSTANCE, LPSTR, int showCommand)
     }
 
     NativeWindow_Win32 window;
-    if (!window.Create(instance, "Standalone Vulkan Clear - gameClient Overlay", 1280, 720))
+    if (!window.Create(instance, "AURIGA GLOBAL — Editor", 1280, 720))
     {
         ShowFatal("Failed to create Win32 window.");
         WSACleanup();

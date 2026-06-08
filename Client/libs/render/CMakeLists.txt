@@ -16,6 +16,8 @@ add_library(client_render STATIC
     RmlUiLayer.h
     TerrainRenderer.cpp
     TerrainRenderer.h
+    IconsFontAwesome6.h
+    UIHelpers.h
     WaterBodyIO.cpp
     WaterBodyIO.h
     WarriorRenderer.cpp
@@ -23,6 +25,10 @@ add_library(client_render STATIC
     WorldCamera.h
     WorldComponents.h
 )
+
+if(IXTREEME_WITH_EDITOR)
+    target_sources(client_render PRIVATE UIHelpers.cpp)
+endif()
 
 target_include_directories(client_render
     PUBLIC

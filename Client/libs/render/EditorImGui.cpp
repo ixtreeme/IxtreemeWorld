@@ -4,11 +4,14 @@
 #include "VulkanDevice.h"
 
 #if defined(IXTREEME_WITH_EDITOR) && defined(_WIN32)
+#include "IconsFontAwesome6.h"
+#include "UIHelpers.h"
 #define VK_USE_PLATFORM_WIN32_KHR
 #include <imgui.h>
 #include <imgui_internal.h>
 #include <imgui_impl_vulkan.h>
 #include <imgui_impl_win32.h>
+#include <stb_image.h>
 #include <vulkan/vulkan.h>
 
 #include <algorithm>
@@ -109,6 +112,44 @@ bool IsDirectChildFolder(const std::string& parent, const std::string& child)
     return normalizedChild.find('/', normalizedParent.size() + 1) == std::string::npos;
 }
 
+bool CheckEditorVk(VkResult result, const char* call)
+{
+    if (result == VK_SUCCESS)
+        return true;
+    TraceError("[EDITOR-IMGUI] Vulkan thumbnail call failed: %s result=%d", call, static_cast<int>(result));
+    return false;
+}
+
+void TransitionPreviewImage(VkCommandBuffer cmd, VkImage image, VkImageLayout oldLayout, VkImageLayout newLayout)
+{
+    VkImageMemoryBarrier barrier{};
+    barrier.sType = VK_STRUCTURE_TYPE_IMAGE_MEMORY_BARRIER;
+    barrier.oldLayout = oldLayout;
+    barrier.newLayout = newLayout;
+    barrier.srcQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;
+    barrier.dstQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;
+    barrier.image = image;
+    barrier.subresourceRange.aspectMask = VK_IMAGE_ASPECT_COLOR_BIT;
+    barrier.subresourceRange.levelCount = 1;
+    barrier.subresourceRange.layerCount = 1;
+
+    VkPipelineStageFlags srcStage = VK_PIPELINE_STAGE_TOP_OF_PIPE_BIT;
+    VkPipelineStageFlags dstStage = VK_PIPELINE_STAGE_TRANSFER_BIT;
+    if (newLayout == VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL)
+    {
+        barrier.srcAccessMask = VK_ACCESS_TRANSFER_WRITE_BIT;
+        barrier.dstAccessMask = VK_ACCESS_SHADER_READ_BIT;
+        srcStage = VK_PIPELINE_STAGE_TRANSFER_BIT;
+        dstStage = VK_PIPELINE_STAGE_FRAGMENT_SHADER_BIT;
+    }
+    else
+    {
+        barrier.dstAccessMask = VK_ACCESS_TRANSFER_WRITE_BIT;
+    }
+
+    vkCmdPipelineBarrier(cmd, srcStage, dstStage, 0, 0, nullptr, 0, nullptr, 1, &barrier);
+}
+
 ImVec4 AssetCategoryColor(AssetLibrary::Category category)
 {
     switch (category)
@@ -120,6 +161,28 @@ ImVec4 AssetCategoryColor(AssetLibrary::Category category)
     case AssetLibrary::Category::WaterMaterial: return ImVec4(0.16f, 0.58f, 0.64f, 1.0f);
     default: return ImVec4(0.35f, 0.35f, 0.35f, 1.0f);
     }
+}
+
+const char* AssetCategoryIcon(AssetLibrary::Category category)
+{
+    switch (category)
+    {
+    case AssetLibrary::Category::Texture: return ICON_FA_IMAGE;
+    case AssetLibrary::Category::Model: return ICON_FA_CUBE;
+    case AssetLibrary::Category::Animation: return ICON_FA_PERSON_RUNNING;
+    case AssetLibrary::Category::Material: return ICON_FA_PALETTE;
+    case AssetLibrary::Category::WaterMaterial: return ICON_FA_DROPLET;
+    default: return ICON_FA_FILE;
+    }
+}
+
+std::string ShortAssetFilename(const AssetLibrary::Entry& entry)
+{
+    const std::string name = !entry.filename.empty() ? entry.filename : entry.displayName;
+    constexpr size_t kVisibleCharacters = 10;
+    if (name.size() <= kVisibleCharacters)
+        return name;
+    return name.substr(0, kVisibleCharacters) + "...";
 }
 
 std::optional<std::filesystem::path> PickAssetFileForImport(AssetLibrary::Category category)
@@ -163,6 +226,140 @@ std::optional<std::filesystem::path> PickAssetFileForImport(AssetLibrary::Catego
         return std::nullopt;
     return std::filesystem::path(file.data());
 }
+
+std::optional<std::filesystem::path> FindEditorFont(const char* filename)
+{
+    const std::filesystem::path candidates[] = {
+        std::filesystem::path("assets") / "fonts" / filename,
+        std::filesystem::path("Client") / "assets" / "fonts" / filename,
+        std::filesystem::path("..") / ".." / ".." / "assets" / "fonts" / filename,
+    };
+    for (const std::filesystem::path& path : candidates)
+    {
+        if (std::filesystem::exists(path))
+            return path;
+    }
+    return std::nullopt;
+}
+
+void LoadEditorFonts()
+{
+    ImGuiIO& io = ImGui::GetIO();
+    io.Fonts->Clear();
+
+    ImFont* regular = nullptr;
+    ImFont* bold = nullptr;
+    if (auto path = FindEditorFont("Inter-Regular.ttf"))
+    {
+        regular = io.Fonts->AddFontFromFileTTF(path->generic_string().c_str(), 16.0f);
+        Tracen("[EDITOR-VISUAL] Loaded font: Inter-Regular.ttf (16px)");
+    }
+    if (!regular)
+    {
+        regular = io.Fonts->AddFontDefault();
+        TraceError("[EDITOR-VISUAL] Inter-Regular.ttf missing; using ImGui default font");
+    }
+
+    static const ImWchar iconRanges[] = {ICON_MIN_FA, ICON_MAX_16_FA, 0};
+    if (auto path = FindEditorFont("fa-solid-900.ttf"))
+    {
+        ImFontConfig iconsConfig;
+        iconsConfig.MergeMode = true;
+        iconsConfig.PixelSnapH = true;
+        iconsConfig.GlyphMinAdvanceX = 16.0f;
+        io.Fonts->AddFontFromFileTTF(path->generic_string().c_str(), 14.0f, &iconsConfig, iconRanges);
+        Tracen("[EDITOR-VISUAL] Loaded font: fa-solid-900.ttf (14px, merged)");
+    }
+    else
+    {
+        TraceError("[EDITOR-VISUAL] fa-solid-900.ttf missing; editor icons will fall back to text");
+    }
+
+    if (auto path = FindEditorFont("Inter-Bold.ttf"))
+    {
+        bold = io.Fonts->AddFontFromFileTTF(path->generic_string().c_str(), 18.0f);
+        Tracen("[EDITOR-VISUAL] Loaded font: Inter-Bold.ttf (18px)");
+    }
+    if (!bold)
+        bold = regular;
+    if (bold)
+    {
+        if (auto path = FindEditorFont("fa-solid-900.ttf"))
+        {
+            ImFontConfig iconsConfig;
+            iconsConfig.MergeMode = true;
+            iconsConfig.PixelSnapH = true;
+            iconsConfig.GlyphMinAdvanceX = 16.0f;
+            io.Fonts->AddFontFromFileTTF(path->generic_string().c_str(), 16.0f, &iconsConfig, iconRanges);
+        }
+    }
+
+    io.FontDefault = regular;
+    UI::SetEditorFonts({regular, bold});
+}
+
+void ApplyAaaImGuiStyle()
+{
+    ImGuiStyle& style = ImGui::GetStyle();
+
+    style.WindowRounding = 6.0f;
+    style.ChildRounding = 6.0f;
+    style.FrameRounding = 4.0f;
+    style.PopupRounding = 6.0f;
+    style.ScrollbarRounding = 8.0f;
+    style.GrabRounding = 4.0f;
+    style.TabRounding = 4.0f;
+
+    style.WindowPadding = ImVec2(12.0f, 12.0f);
+    style.FramePadding = ImVec2(8.0f, 6.0f);
+    style.ItemSpacing = ImVec2(10.0f, 8.0f);
+    style.ItemInnerSpacing = ImVec2(8.0f, 6.0f);
+    style.IndentSpacing = 22.0f;
+
+    style.WindowBorderSize = 1.0f;
+    style.FrameBorderSize = 0.0f;
+    style.PopupBorderSize = 1.0f;
+    style.TabBorderSize = 0.0f;
+
+    ImVec4* colors = style.Colors;
+    colors[ImGuiCol_WindowBg] = ImVec4(0.12f, 0.12f, 0.14f, 1.00f);
+    colors[ImGuiCol_ChildBg] = ImVec4(0.10f, 0.10f, 0.12f, 1.00f);
+    colors[ImGuiCol_PopupBg] = ImVec4(0.14f, 0.14f, 0.16f, 0.97f);
+    colors[ImGuiCol_TitleBg] = ImVec4(0.08f, 0.08f, 0.10f, 1.00f);
+    colors[ImGuiCol_TitleBgActive] = ImVec4(0.10f, 0.10f, 0.13f, 1.00f);
+    colors[ImGuiCol_TitleBgCollapsed] = ImVec4(0.06f, 0.06f, 0.08f, 1.00f);
+    colors[ImGuiCol_FrameBg] = ImVec4(0.18f, 0.18f, 0.21f, 1.00f);
+    colors[ImGuiCol_FrameBgHovered] = ImVec4(0.24f, 0.24f, 0.28f, 1.00f);
+    colors[ImGuiCol_FrameBgActive] = ImVec4(0.28f, 0.30f, 0.36f, 1.00f);
+    colors[ImGuiCol_Button] = ImVec4(0.22f, 0.22f, 0.26f, 1.00f);
+    colors[ImGuiCol_ButtonHovered] = ImVec4(0.28f, 0.48f, 0.75f, 1.00f);
+    colors[ImGuiCol_ButtonActive] = ImVec4(0.20f, 0.42f, 0.70f, 1.00f);
+    colors[ImGuiCol_Header] = ImVec4(0.18f, 0.30f, 0.50f, 0.50f);
+    colors[ImGuiCol_HeaderHovered] = ImVec4(0.28f, 0.48f, 0.75f, 0.70f);
+    colors[ImGuiCol_HeaderActive] = ImVec4(0.28f, 0.48f, 0.75f, 1.00f);
+    colors[ImGuiCol_Tab] = ImVec4(0.14f, 0.14f, 0.17f, 1.00f);
+    colors[ImGuiCol_TabHovered] = ImVec4(0.28f, 0.48f, 0.75f, 0.80f);
+    colors[ImGuiCol_TabActive] = ImVec4(0.22f, 0.40f, 0.65f, 1.00f);
+    colors[ImGuiCol_TabUnfocused] = ImVec4(0.10f, 0.10f, 0.12f, 1.00f);
+    colors[ImGuiCol_TabUnfocusedActive] = ImVec4(0.18f, 0.30f, 0.50f, 1.00f);
+    colors[ImGuiCol_CheckMark] = ImVec4(0.40f, 0.70f, 1.00f, 1.00f);
+    colors[ImGuiCol_SliderGrab] = ImVec4(0.40f, 0.70f, 1.00f, 1.00f);
+    colors[ImGuiCol_SliderGrabActive] = ImVec4(0.55f, 0.80f, 1.00f, 1.00f);
+    colors[ImGuiCol_Separator] = ImVec4(0.25f, 0.25f, 0.28f, 1.00f);
+    colors[ImGuiCol_SeparatorHovered] = ImVec4(0.40f, 0.70f, 1.00f, 0.80f);
+    colors[ImGuiCol_SeparatorActive] = ImVec4(0.55f, 0.80f, 1.00f, 1.00f);
+    colors[ImGuiCol_Border] = ImVec4(0.20f, 0.20f, 0.24f, 1.00f);
+    colors[ImGuiCol_BorderShadow] = ImVec4(0.00f, 0.00f, 0.00f, 0.00f);
+    colors[ImGuiCol_Text] = ImVec4(0.94f, 0.94f, 0.94f, 1.00f);
+    colors[ImGuiCol_TextDisabled] = ImVec4(0.50f, 0.50f, 0.55f, 1.00f);
+    colors[ImGuiCol_DragDropTarget] = ImVec4(0.40f, 0.70f, 1.00f, 0.80f);
+    colors[ImGuiCol_ScrollbarBg] = ImVec4(0.08f, 0.08f, 0.10f, 1.00f);
+    colors[ImGuiCol_ScrollbarGrab] = ImVec4(0.30f, 0.30f, 0.34f, 1.00f);
+    colors[ImGuiCol_ScrollbarGrabHovered] = ImVec4(0.40f, 0.40f, 0.46f, 1.00f);
+    colors[ImGuiCol_ScrollbarGrabActive] = ImVec4(0.50f, 0.50f, 0.56f, 1.00f);
+
+    Tracen("[EDITOR-VISUAL] AAA-style ImGui colors applied");
+}
 }
 
 EditorImGui::~EditorImGui()
@@ -176,6 +373,9 @@ bool EditorImGui::Create(VulkanDevice& device, HWND hwnd)
         return true;
 
     m_device = device.GetDevice();
+    m_physicalDevice = device.GetPhysicalDevice();
+    m_graphicsQueue = device.GetGraphicsQueue();
+    m_graphicsQueueFamily = device.GetGraphicsQueueFamily();
 
     IMGUI_CHECKVERSION();
     ImGui::CreateContext();
@@ -187,12 +387,8 @@ bool EditorImGui::Create(VulkanDevice& device, HWND hwnd)
     io.IniFilename = kLayoutFile;
     m_applyDefaultDockLayout = !std::filesystem::exists(kLayoutFile);
 
-    ImGui::StyleColorsDark();
-    ImGuiStyle& style = ImGui::GetStyle();
-    style.FrameRounding = 4.0f;
-    style.WindowPadding = ImVec2(12.0f, 12.0f);
-    style.WindowRounding = 0.0f;
-    style.Colors[ImGuiCol_WindowBg].w = 1.0f;
+    LoadEditorFonts();
+    ApplyAaaImGuiStyle();
 
     if (!CreateDescriptorPool(device))
     {
@@ -219,6 +415,8 @@ bool EditorImGui::Create(VulkanDevice& device, HWND hwnd)
     Tracenf("[EDITOR-IMGUI] Initialized with imgui version %s, vulkan backend ready", IMGUI_VERSION);
     Tracen("[EDITOR-IMGUI] Docking enabled, multi-viewport enabled");
     Tracenf("[EDITOR-IMGUI] Layout file: %s", kLayoutFile);
+    if (!m_applyDefaultDockLayout)
+        Tracen("[EDITOR-LAYOUT] Loaded layout from editor_layout.ini");
     return true;
 }
 
@@ -278,6 +476,16 @@ bool EditorImGui::InitVulkanBackend(VulkanDevice& device)
 void EditorImGui::SetMapEditorSettings(const MapEditorSettings& settings)
 {
     m_editorSettings = settings;
+}
+
+void EditorImGui::SetEditorPlayModeState(const EditorPlayModeState& state)
+{
+    m_playModeState = state;
+    if (!CanUseEditorTools())
+    {
+        m_editorSettings.toolMode = MapEditorToolMode::None;
+        m_editorSettings.waterSculptActive = false;
+    }
 }
 
 void EditorImGui::SetLightingState(const LightingState& state)
@@ -388,6 +596,18 @@ MapEditorCommands EditorImGui::ConsumeCommands()
 {
     MapEditorCommands commands = m_commands;
     m_commands = {};
+    if (!CanUseEditorTools())
+    {
+        const bool enterPlayMode = commands.enterPlayMode;
+        const bool exitPlayMode = commands.exitPlayMode;
+        const bool pausePlayMode = commands.pausePlayMode;
+        const bool resumePlayMode = commands.resumePlayMode;
+        commands = {};
+        commands.enterPlayMode = enterPlayMode;
+        commands.exitPlayMode = exitPlayMode;
+        commands.pausePlayMode = pausePlayMode;
+        commands.resumePlayMode = resumePlayMode;
+    }
     return commands;
 }
 
@@ -544,6 +764,323 @@ std::vector<std::pair<std::string, std::uint32_t>> EditorImGui::QueryVisibleTags
     return result;
 }
 
+void EditorImGui::DestroyAssetPreviewTexture(AssetPreviewTexture& texture)
+{
+    if (texture.descriptor)
+        ImGui_ImplVulkan_RemoveTexture(texture.descriptor);
+    if (texture.sampler)
+        vkDestroySampler(m_device, texture.sampler, nullptr);
+    if (texture.view)
+        vkDestroyImageView(m_device, texture.view, nullptr);
+    if (texture.image)
+        vkDestroyImage(m_device, texture.image, nullptr);
+    if (texture.memory)
+        vkFreeMemory(m_device, texture.memory, nullptr);
+    texture = {};
+}
+
+void EditorImGui::DestroyAssetPreviewTextures()
+{
+    if (m_device)
+        vkDeviceWaitIdle(m_device);
+    for (auto& preview : m_assetPreviewTextures)
+        DestroyAssetPreviewTexture(preview.second);
+    m_assetPreviewTextures.clear();
+}
+
+std::optional<std::filesystem::path> EditorImGui::AssetPreviewPathFor(const AssetLibrary::Entry& entry) const
+{
+    if (!m_assetLibrary)
+        return std::nullopt;
+
+    const auto thumbnailPath = [this](const AssetLibrary::Entry& textureEntry) -> std::optional<std::filesystem::path> {
+        if (textureEntry.thumbnail.empty() ||
+            textureEntry.thumbnail == "model_icon" ||
+            textureEntry.thumbnail == "animation_icon" ||
+            textureEntry.thumbnail == "material_icon" ||
+            textureEntry.thumbnail == "water_material_icon")
+        {
+            return std::nullopt;
+        }
+
+        const std::filesystem::path path = m_assetLibrary->LibraryRoot() / textureEntry.thumbnail;
+        if (!std::filesystem::exists(path))
+            return std::nullopt;
+        return path;
+    };
+
+    if (entry.category == AssetLibrary::Category::Texture)
+        return thumbnailPath(entry);
+
+    if (entry.category == AssetLibrary::Category::Material)
+    {
+        const std::string ids[] = {
+            entry.material.diffuseTextureId,
+            entry.material.normalTextureId,
+            entry.material.aoTextureId,
+            entry.material.roughnessTextureId,
+            entry.material.metallicTextureId,
+            entry.material.heightTextureId,
+        };
+        for (const std::string& textureId : ids)
+        {
+            if (textureId.empty())
+                continue;
+            auto textureEntry = m_assetLibrary->FindById(textureId);
+            if (textureEntry)
+            {
+                if (auto path = thumbnailPath(*textureEntry))
+                    return path;
+            }
+        }
+    }
+
+    return std::nullopt;
+}
+
+bool EditorImGui::LoadAssetPreviewTexture(const std::filesystem::path& path, AssetPreviewTexture& outTexture)
+{
+    if (!m_device || !m_physicalDevice || !m_graphicsQueue || m_graphicsQueueFamily == UINT32_MAX)
+        return false;
+
+    int width = 0;
+    int height = 0;
+    int channels = 0;
+    stbi_uc* decoded = stbi_load(path.string().c_str(), &width, &height, &channels, 4);
+    if (!decoded || width <= 0 || height <= 0)
+    {
+        if (decoded)
+            stbi_image_free(decoded);
+        TraceError("[EDITOR-IMGUI] Failed to decode asset thumbnail: %s", path.string().c_str());
+        return false;
+    }
+
+    const VkDeviceSize byteSize = static_cast<VkDeviceSize>(width) * static_cast<VkDeviceSize>(height) * 4u;
+    VkBuffer stagingBuffer = VK_NULL_HANDLE;
+    VkDeviceMemory stagingMemory = VK_NULL_HANDLE;
+    VkCommandPool uploadPool = VK_NULL_HANDLE;
+    VkCommandBuffer cmd = VK_NULL_HANDLE;
+
+    auto findMemoryType = [this](uint32_t typeFilter, VkMemoryPropertyFlags properties) -> std::optional<uint32_t> {
+        VkPhysicalDeviceMemoryProperties memory{};
+        vkGetPhysicalDeviceMemoryProperties(m_physicalDevice, &memory);
+        for (uint32_t i = 0; i < memory.memoryTypeCount; ++i)
+        {
+            if ((typeFilter & (1u << i)) && (memory.memoryTypes[i].propertyFlags & properties) == properties)
+                return i;
+        }
+        return std::nullopt;
+    };
+
+    auto cleanupUpload = [&]() {
+        if (uploadPool)
+            vkDestroyCommandPool(m_device, uploadPool, nullptr);
+        if (stagingBuffer)
+            vkDestroyBuffer(m_device, stagingBuffer, nullptr);
+        if (stagingMemory)
+            vkFreeMemory(m_device, stagingMemory, nullptr);
+        stbi_image_free(decoded);
+    };
+
+    VkBufferCreateInfo buffer{};
+    buffer.sType = VK_STRUCTURE_TYPE_BUFFER_CREATE_INFO;
+    buffer.size = byteSize;
+    buffer.usage = VK_BUFFER_USAGE_TRANSFER_SRC_BIT;
+    buffer.sharingMode = VK_SHARING_MODE_EXCLUSIVE;
+    if (!CheckEditorVk(vkCreateBuffer(m_device, &buffer, nullptr, &stagingBuffer), "vkCreateBuffer"))
+    {
+        cleanupUpload();
+        return false;
+    }
+
+    VkMemoryRequirements stagingReq{};
+    vkGetBufferMemoryRequirements(m_device, stagingBuffer, &stagingReq);
+    const auto stagingMemoryType = findMemoryType(stagingReq.memoryTypeBits,
+        VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT | VK_MEMORY_PROPERTY_HOST_COHERENT_BIT);
+    if (!stagingMemoryType)
+    {
+        cleanupUpload();
+        return false;
+    }
+
+    VkMemoryAllocateInfo stagingAlloc{};
+    stagingAlloc.sType = VK_STRUCTURE_TYPE_MEMORY_ALLOCATE_INFO;
+    stagingAlloc.allocationSize = stagingReq.size;
+    stagingAlloc.memoryTypeIndex = *stagingMemoryType;
+    if (!CheckEditorVk(vkAllocateMemory(m_device, &stagingAlloc, nullptr, &stagingMemory), "vkAllocateMemory(staging)") ||
+        !CheckEditorVk(vkBindBufferMemory(m_device, stagingBuffer, stagingMemory, 0), "vkBindBufferMemory"))
+    {
+        cleanupUpload();
+        return false;
+    }
+
+    void* mapped = nullptr;
+    if (!CheckEditorVk(vkMapMemory(m_device, stagingMemory, 0, byteSize, 0, &mapped), "vkMapMemory"))
+    {
+        cleanupUpload();
+        return false;
+    }
+    std::memcpy(mapped, decoded, static_cast<size_t>(byteSize));
+    vkUnmapMemory(m_device, stagingMemory);
+
+    VkImageCreateInfo image{};
+    image.sType = VK_STRUCTURE_TYPE_IMAGE_CREATE_INFO;
+    image.imageType = VK_IMAGE_TYPE_2D;
+    image.extent = {static_cast<uint32_t>(width), static_cast<uint32_t>(height), 1};
+    image.mipLevels = 1;
+    image.arrayLayers = 1;
+    image.format = VK_FORMAT_R8G8B8A8_UNORM;
+    image.tiling = VK_IMAGE_TILING_OPTIMAL;
+    image.initialLayout = VK_IMAGE_LAYOUT_UNDEFINED;
+    image.usage = VK_IMAGE_USAGE_TRANSFER_DST_BIT | VK_IMAGE_USAGE_SAMPLED_BIT;
+    image.samples = VK_SAMPLE_COUNT_1_BIT;
+    image.sharingMode = VK_SHARING_MODE_EXCLUSIVE;
+    if (!CheckEditorVk(vkCreateImage(m_device, &image, nullptr, &outTexture.image), "vkCreateImage"))
+    {
+        cleanupUpload();
+        DestroyAssetPreviewTexture(outTexture);
+        return false;
+    }
+
+    VkMemoryRequirements imageReq{};
+    vkGetImageMemoryRequirements(m_device, outTexture.image, &imageReq);
+    const auto imageMemoryType = findMemoryType(imageReq.memoryTypeBits, VK_MEMORY_PROPERTY_DEVICE_LOCAL_BIT);
+    if (!imageMemoryType)
+    {
+        cleanupUpload();
+        DestroyAssetPreviewTexture(outTexture);
+        return false;
+    }
+
+    VkMemoryAllocateInfo imageAlloc{};
+    imageAlloc.sType = VK_STRUCTURE_TYPE_MEMORY_ALLOCATE_INFO;
+    imageAlloc.allocationSize = imageReq.size;
+    imageAlloc.memoryTypeIndex = *imageMemoryType;
+    if (!CheckEditorVk(vkAllocateMemory(m_device, &imageAlloc, nullptr, &outTexture.memory), "vkAllocateMemory(image)") ||
+        !CheckEditorVk(vkBindImageMemory(m_device, outTexture.image, outTexture.memory, 0), "vkBindImageMemory"))
+    {
+        cleanupUpload();
+        DestroyAssetPreviewTexture(outTexture);
+        return false;
+    }
+
+    VkCommandPoolCreateInfo poolInfo{};
+    poolInfo.sType = VK_STRUCTURE_TYPE_COMMAND_POOL_CREATE_INFO;
+    poolInfo.flags = VK_COMMAND_POOL_CREATE_TRANSIENT_BIT;
+    poolInfo.queueFamilyIndex = m_graphicsQueueFamily;
+    if (!CheckEditorVk(vkCreateCommandPool(m_device, &poolInfo, nullptr, &uploadPool), "vkCreateCommandPool"))
+    {
+        cleanupUpload();
+        DestroyAssetPreviewTexture(outTexture);
+        return false;
+    }
+
+    VkCommandBufferAllocateInfo cmdAlloc{};
+    cmdAlloc.sType = VK_STRUCTURE_TYPE_COMMAND_BUFFER_ALLOCATE_INFO;
+    cmdAlloc.commandPool = uploadPool;
+    cmdAlloc.level = VK_COMMAND_BUFFER_LEVEL_PRIMARY;
+    cmdAlloc.commandBufferCount = 1;
+    if (!CheckEditorVk(vkAllocateCommandBuffers(m_device, &cmdAlloc, &cmd), "vkAllocateCommandBuffers"))
+    {
+        cleanupUpload();
+        DestroyAssetPreviewTexture(outTexture);
+        return false;
+    }
+
+    VkCommandBufferBeginInfo begin{};
+    begin.sType = VK_STRUCTURE_TYPE_COMMAND_BUFFER_BEGIN_INFO;
+    begin.flags = VK_COMMAND_BUFFER_USAGE_ONE_TIME_SUBMIT_BIT;
+    if (!CheckEditorVk(vkBeginCommandBuffer(cmd, &begin), "vkBeginCommandBuffer"))
+    {
+        cleanupUpload();
+        DestroyAssetPreviewTexture(outTexture);
+        return false;
+    }
+
+    TransitionPreviewImage(cmd, outTexture.image, VK_IMAGE_LAYOUT_UNDEFINED, VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL);
+    VkBufferImageCopy copy{};
+    copy.imageSubresource.aspectMask = VK_IMAGE_ASPECT_COLOR_BIT;
+    copy.imageSubresource.mipLevel = 0;
+    copy.imageSubresource.baseArrayLayer = 0;
+    copy.imageSubresource.layerCount = 1;
+    copy.imageExtent = {static_cast<uint32_t>(width), static_cast<uint32_t>(height), 1};
+    vkCmdCopyBufferToImage(cmd, stagingBuffer, outTexture.image, VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL, 1, &copy);
+    TransitionPreviewImage(cmd, outTexture.image, VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL, VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL);
+
+    if (!CheckEditorVk(vkEndCommandBuffer(cmd), "vkEndCommandBuffer"))
+    {
+        cleanupUpload();
+        DestroyAssetPreviewTexture(outTexture);
+        return false;
+    }
+
+    VkSubmitInfo submit{};
+    submit.sType = VK_STRUCTURE_TYPE_SUBMIT_INFO;
+    submit.commandBufferCount = 1;
+    submit.pCommandBuffers = &cmd;
+    if (!CheckEditorVk(vkQueueSubmit(m_graphicsQueue, 1, &submit, VK_NULL_HANDLE), "vkQueueSubmit") ||
+        !CheckEditorVk(vkQueueWaitIdle(m_graphicsQueue), "vkQueueWaitIdle"))
+    {
+        cleanupUpload();
+        DestroyAssetPreviewTexture(outTexture);
+        return false;
+    }
+
+    VkImageViewCreateInfo view{};
+    view.sType = VK_STRUCTURE_TYPE_IMAGE_VIEW_CREATE_INFO;
+    view.image = outTexture.image;
+    view.viewType = VK_IMAGE_VIEW_TYPE_2D;
+    view.format = VK_FORMAT_R8G8B8A8_UNORM;
+    view.subresourceRange.aspectMask = VK_IMAGE_ASPECT_COLOR_BIT;
+    view.subresourceRange.levelCount = 1;
+    view.subresourceRange.layerCount = 1;
+    if (!CheckEditorVk(vkCreateImageView(m_device, &view, nullptr, &outTexture.view), "vkCreateImageView"))
+    {
+        cleanupUpload();
+        DestroyAssetPreviewTexture(outTexture);
+        return false;
+    }
+
+    VkSamplerCreateInfo sampler{};
+    sampler.sType = VK_STRUCTURE_TYPE_SAMPLER_CREATE_INFO;
+    sampler.magFilter = VK_FILTER_LINEAR;
+    sampler.minFilter = VK_FILTER_LINEAR;
+    sampler.mipmapMode = VK_SAMPLER_MIPMAP_MODE_LINEAR;
+    sampler.addressModeU = VK_SAMPLER_ADDRESS_MODE_CLAMP_TO_EDGE;
+    sampler.addressModeV = VK_SAMPLER_ADDRESS_MODE_CLAMP_TO_EDGE;
+    sampler.addressModeW = VK_SAMPLER_ADDRESS_MODE_CLAMP_TO_EDGE;
+    sampler.maxLod = 1.0f;
+    if (!CheckEditorVk(vkCreateSampler(m_device, &sampler, nullptr, &outTexture.sampler), "vkCreateSampler"))
+    {
+        cleanupUpload();
+        DestroyAssetPreviewTexture(outTexture);
+        return false;
+    }
+
+    outTexture.descriptor = ImGui_ImplVulkan_AddTexture(outTexture.sampler, outTexture.view, VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL);
+    outTexture.width = static_cast<uint32_t>(width);
+    outTexture.height = static_cast<uint32_t>(height);
+    cleanupUpload();
+    Tracenf("[EDITOR-ASSET-PREVIEW] Loaded thumbnail: %s %dx%d", path.string().c_str(), width, height);
+    return outTexture.descriptor != VK_NULL_HANDLE;
+}
+
+EditorImGui::AssetPreviewTexture* EditorImGui::GetAssetPreviewTexture(const AssetLibrary::Entry& entry)
+{
+    auto path = AssetPreviewPathFor(entry);
+    if (!path)
+        return nullptr;
+
+    const std::string key = path->generic_string();
+    auto [it, inserted] = m_assetPreviewTextures.try_emplace(key);
+    if (inserted)
+    {
+        if (!LoadAssetPreviewTexture(*path, it->second))
+            it->second.failed = true;
+    }
+    return it->second.failed || !it->second.descriptor ? nullptr : &it->second;
+}
+
 void EditorImGui::CreateAssetFolder()
 {
     if (!m_assetLibrary)
@@ -608,6 +1145,12 @@ void EditorImGui::DeleteAsset(const AssetLibrary::Entry& entry)
 
 void EditorImGui::SetToolMode(MapEditorToolMode mode)
 {
+    if (!CanUseEditorTools())
+    {
+        m_editorSettings.toolMode = MapEditorToolMode::None;
+        m_editorSettings.waterSculptActive = false;
+        return;
+    }
     if (m_editorSettings.toolMode == mode)
         return;
     const MapEditorToolMode previous = m_editorSettings.toolMode;
@@ -620,6 +1163,11 @@ void EditorImGui::SetToolMode(MapEditorToolMode mode)
     Tracenf("[EDITOR-IMGUI-5] Tool mode changed: %d -> %d",
         static_cast<int>(previous),
         static_cast<int>(mode));
+}
+
+bool EditorImGui::CanUseEditorTools() const
+{
+    return m_playModeState.mode == EditorPlayMode::Edit;
 }
 
 MapEditorPaletteSlot EditorImGui::BuildPaletteSlotFromAsset(std::uint32_t slotIndex, const AssetLibrary::Entry& entry) const
@@ -1073,13 +1621,110 @@ void EditorImGui::RenderDockSpace()
         ImGuiID leftId = 0;
         ImGuiID rightId = 0;
         ImGuiID bottomId = 0;
-        ImGui::DockBuilderSplitNode(mainId, ImGuiDir_Left, 0.18f, &leftId, &mainId);
-        ImGui::DockBuilderSplitNode(mainId, ImGuiDir_Right, 0.24f, &rightId, &mainId);
-        ImGui::DockBuilderSplitNode(mainId, ImGuiDir_Down, 0.32f, &bottomId, &mainId);
+        ImGuiID topId = 0;
+        ImGui::DockBuilderSplitNode(mainId, ImGuiDir_Up, 0.06f, &topId, &mainId);
+        ImGui::DockBuilderSplitNode(mainId, ImGuiDir_Left, 0.20f, &leftId, &mainId);
+        ImGui::DockBuilderSplitNode(mainId, ImGuiDir_Right, 0.25f, &rightId, &mainId);
+        ImGui::DockBuilderSplitNode(mainId, ImGuiDir_Down, 0.30f, &bottomId, &mainId);
+        ImGui::DockBuilderDockWindow("Editor Toolbar", topId);
         ImGui::DockBuilderDockWindow("Tools", leftId);
         ImGui::DockBuilderDockWindow("Inspector", rightId);
         ImGui::DockBuilderDockWindow("Asset Browser", bottomId);
+        ImGui::DockBuilderDockWindow("Scene View", mainId);
         ImGui::DockBuilderFinish(dockspaceId);
+        Tracen("[EDITOR-LAYOUT] Default Unity-style dock layout applied");
+    }
+    ImGui::End();
+}
+
+void EditorImGui::HandleEditorHotkeys()
+{
+    if (!m_editorModeActive)
+        return;
+
+    ImGuiIO& io = ImGui::GetIO();
+    if (io.WantCaptureKeyboard)
+        return;
+
+    if (ImGui::IsKeyPressed(ImGuiKey_F5, false))
+    {
+        if (io.KeyShift)
+        {
+            if (m_playModeState.mode != EditorPlayMode::Edit)
+                m_commands.exitPlayMode = true;
+        }
+        else if (m_playModeState.mode == EditorPlayMode::Edit)
+        {
+            m_commands.enterPlayMode = true;
+        }
+        else
+        {
+            m_commands.exitPlayMode = true;
+        }
+    }
+
+    if (ImGui::IsKeyPressed(ImGuiKey_F6, false))
+    {
+        if (m_playModeState.mode == EditorPlayMode::Play)
+            m_commands.pausePlayMode = true;
+        else if (m_playModeState.mode == EditorPlayMode::PlayPaused)
+            m_commands.resumePlayMode = true;
+    }
+}
+
+void EditorImGui::RenderEditorToolbar()
+{
+    if (!m_editorModeActive)
+        return;
+
+    const ImGuiViewport* viewport = ImGui::GetMainViewport();
+    ImGui::SetNextWindowPos(ImVec2(viewport->WorkPos.x + 12.0f, viewport->WorkPos.y + 12.0f), ImGuiCond_FirstUseEver);
+    ImGui::SetNextWindowSize(ImVec2(520.0f, 58.0f), ImGuiCond_FirstUseEver);
+    if (ImGui::Begin("Editor Toolbar", nullptr,
+        ImGuiWindowFlags_NoCollapse | ImGuiWindowFlags_NoScrollbar))
+    {
+        const bool isEdit = m_playModeState.mode == EditorPlayMode::Edit;
+        const bool isPlay = m_playModeState.mode == EditorPlayMode::Play;
+        const bool isPaused = m_playModeState.mode == EditorPlayMode::PlayPaused;
+
+        if (isEdit)
+        {
+            if (UI::IconButton(ICON_FA_PLAY, "Play", ImVec2(96.0f, 32.0f)))
+                m_commands.enterPlayMode = true;
+        }
+        else
+        {
+            ImGui::PushStyleColor(ImGuiCol_Button, ImVec4(0.70f, 0.20f, 0.20f, 1.0f));
+            if (UI::IconButton(ICON_FA_STOP, "Stop", ImVec2(96.0f, 32.0f)))
+                m_commands.exitPlayMode = true;
+            ImGui::PopStyleColor();
+            ImGui::SameLine();
+            if (isPlay)
+            {
+                if (UI::IconButton(ICON_FA_PAUSE, "Pause", ImVec2(104.0f, 32.0f)))
+                    m_commands.pausePlayMode = true;
+            }
+            else if (isPaused)
+            {
+                if (UI::IconButton(ICON_FA_PLAY, "Resume", ImVec2(112.0f, 32.0f)))
+                    m_commands.resumePlayMode = true;
+            }
+        }
+
+        ImGui::SameLine();
+        ImGui::Dummy(ImVec2(16.0f, 0.0f));
+        ImGui::SameLine();
+
+        const char* modeText = isEdit ? "EDIT MODE" : isPlay ? "PLAY MODE" : "PAUSED";
+        const ImVec4 modeColor = isEdit
+            ? ImVec4(0.72f, 0.72f, 0.72f, 1.0f)
+            : isPlay ? ImVec4(0.35f, 0.90f, 0.35f, 1.0f) : ImVec4(0.95f, 0.74f, 0.30f, 1.0f);
+        ImGui::TextColored(modeColor, "%s", modeText);
+        if (!isEdit)
+        {
+            ImGui::SameLine();
+            ImGui::TextDisabled("(%.1fs, frame %d)", m_playModeState.elapsedSeconds, m_playModeState.frameCount);
+        }
     }
     ImGui::End();
 }
@@ -1088,29 +1733,38 @@ void EditorImGui::RenderToolsPanel()
 {
     if (ImGui::Begin("Tools"))
     {
-        if (ImGui::Button("+ Water", ImVec2(-1.0f, 0.0f)))
+        UI::SectionHeader(ICON_FA_WRENCH " Tools");
+        const bool toolsEnabled = CanUseEditorTools();
+        if (!toolsEnabled)
+        {
+            ImGui::TextColored(ImVec4(0.95f, 0.74f, 0.30f, 1.0f), "Tools disabled in Play Mode");
+            ImGui::BeginDisabled();
+        }
+        if (UI::IconButton(ICON_FA_DROPLET, "Water", ImVec2(-1.0f, 0.0f)))
         {
             m_commands.addWaterBody = true;
             Tracen("[EDITOR-3D-SPAWN] Add water requested");
         }
 
         ImGui::Separator();
-        ImGui::TextUnformatted("Editing Tools");
-        if (ImGui::Button("Water Sculpt Tool", ImVec2(-1.0f, 0.0f)))
+        UI::SectionHeader(ICON_FA_HAMMER " Editing");
+        if (UI::IconButton(ICON_FA_WATER, "Water Sculpt", ImVec2(-1.0f, 0.0f)))
             m_waterSculptToolOpen = !m_waterSculptToolOpen;
-        if (ImGui::Button("Heightmap Tool", ImVec2(-1.0f, 0.0f)))
+        if (UI::IconButton(ICON_FA_MOUNTAIN, "Heightmap", ImVec2(-1.0f, 0.0f)))
             m_heightmapToolOpen = !m_heightmapToolOpen;
-        if (ImGui::Button("Splat Paint Tool", ImVec2(-1.0f, 0.0f)))
+        if (UI::IconButton(ICON_FA_PAINTBRUSH, "Splat Paint", ImVec2(-1.0f, 0.0f)))
             m_splatPaintToolOpen = !m_splatPaintToolOpen;
 
         ImGui::Separator();
-        if (ImGui::Button("Undo", ImVec2(-1.0f, 0.0f)))
+        if (UI::IconButton(ICON_FA_UNDO, "Undo", ImVec2(-1.0f, 0.0f)))
             m_commands.undo = true;
-        if (ImGui::Button("Save", ImVec2(-1.0f, 0.0f)))
+        if (UI::IconButton(ICON_FA_FLOPPY_DISK, "Save", ImVec2(-1.0f, 0.0f)))
             m_commands.save = true;
-        if (ImGui::Button("Reload", ImVec2(-1.0f, 0.0f)))
+        if (UI::IconButton(ICON_FA_ROTATE, "Reload", ImVec2(-1.0f, 0.0f)))
             m_commands.reload = true;
 
+        if (!toolsEnabled)
+            ImGui::EndDisabled();
     }
     ImGui::End();
 
@@ -1146,8 +1800,8 @@ void EditorImGui::RenderSelectedWaterBodyInspector()
     if (!m_waterBodyState.selected)
         return;
 
-    ImGui::Text("WATER BODY #%u", m_waterBodyState.id);
-    ImGui::Separator();
+    UI::SectionHeader(ICON_FA_WATER " Water Body");
+    ImGui::TextDisabled("#%u", m_waterBodyState.id);
 
     char nameBuffer[96]{};
     std::snprintf(nameBuffer, sizeof(nameBuffer), "%s", m_waterBodyState.name.c_str());
@@ -1184,7 +1838,7 @@ void EditorImGui::RenderSelectedWaterBodyInspector()
         ImGui::EndDragDropTarget();
     }
 
-    if (ImGui::Button("Edit Material"))
+    if (UI::IconButton(ICON_FA_PALETTE, "Edit Material"))
     {
         m_commands.selectedWaterBodyChanged = true;
         m_commands.selectedWaterBody = m_waterBodyState;
@@ -1192,7 +1846,7 @@ void EditorImGui::RenderSelectedWaterBodyInspector()
         OpenWaterMaterialEditor(m_waterBodyState.materialId);
     }
     ImGui::SameLine();
-    if (ImGui::Button("Change Material"))
+    if (UI::IconButton(ICON_FA_FOLDER_OPEN, "Change Material"))
         ImGui::OpenPopup("ChangeWaterMaterial");
 
     if (ImGui::BeginPopup("ChangeWaterMaterial"))
@@ -1218,7 +1872,7 @@ void EditorImGui::RenderSelectedWaterBodyInspector()
     }
 
     ImGui::Separator();
-    if (ImGui::Button("Delete Water Body", ImVec2(-1.0f, 0.0f)))
+    if (UI::IconButton(ICON_FA_TRASH, "Delete Water Body", ImVec2(-1.0f, 0.0f)))
         m_commands.deleteSelectedWaterBody = true;
 }
 
@@ -1229,8 +1883,8 @@ void EditorImGui::RenderSelectedLightInspector()
 
     const bool isPoint = m_dynamicLightState.type == DynamicLightType::Point;
     const bool isSpot = m_dynamicLightState.type == DynamicLightType::Spot;
-    ImGui::Text("%s LIGHT #%u", isPoint ? "POINT" : "SPOT", m_dynamicLightState.id);
-    ImGui::Separator();
+    UI::SectionHeader(ICON_FA_LIGHTBULB " Light");
+    ImGui::TextDisabled("%s #%u", isPoint ? "Point" : "Spot", m_dynamicLightState.id);
 
     if (isPoint)
     {
@@ -1277,7 +1931,7 @@ void EditorImGui::RenderSelectedLightInspector()
     }
 
     ImGui::Separator();
-    if (ImGui::Button("Delete Light", ImVec2(-1.0f, 0.0f)))
+    if (UI::IconButton(ICON_FA_TRASH, "Delete Light", ImVec2(-1.0f, 0.0f)))
         m_commands.deleteSelectedLight = true;
 }
 
@@ -1315,7 +1969,7 @@ void EditorImGui::ApplyTimeOfDayPreset(float hour)
 
 void EditorImGui::RenderLightingPanel()
 {
-    ImGui::TextUnformatted("Directional Light");
+    UI::SectionHeader(ICON_FA_LIGHTBULB " Directional Light");
     ImGui::Checkbox("Sun Enabled", &m_lightingState.directional.enabled);
     ImGui::Checkbox("Sun Shadows", &m_lightingState.sunShadowsEnabled);
     ImGui::ColorEdit3("Sun Color", &m_lightingState.directional.r);
@@ -1324,14 +1978,14 @@ void EditorImGui::RenderLightingPanel()
     ImGui::SliderFloat("Sun Angle Y", &m_lightingState.directional.azimuthDegrees, 0.0f, 360.0f, "%.1f deg");
 
     ImGui::Spacing();
-    ImGui::TextUnformatted("Ambient Light");
+    UI::SectionHeader(ICON_FA_GEAR " Ambient Light");
     ImGui::ColorEdit3("Ambient Color", &m_lightingState.ambient.r);
     ImGui::SliderFloat("Ambient Intensity", &m_lightingState.ambient.intensity, 0.0f, 3.0f, "%.2f");
 
     ImGui::Spacing();
-    ImGui::TextUnformatted("Time of Day");
+    UI::SectionHeader(ICON_FA_GEAR " Time of Day");
     ImGui::SliderFloat("Hour", &m_timeOfDayHours, 0.0f, 24.0f, "%.1f h");
-    if (ImGui::Button("Apply Preset"))
+    if (UI::IconButton(ICON_FA_CHECK, "Apply Preset"))
         ApplyTimeOfDayPreset(m_timeOfDayHours);
 }
 
@@ -1340,13 +1994,13 @@ void EditorImGui::RenderDynamicLightsPanel()
     const uint32_t total = m_lightingState.numPointLights + m_lightingState.numSpotLights;
     ImGui::Text("Total: %u / %u", total, kMaxDynamicPointLights + kMaxDynamicSpotLights);
 
-    if (ImGui::Button("+ Point Light"))
+    if (UI::IconButton(ICON_FA_LIGHTBULB, "Point Light"))
     {
         m_commands.addPointLight = true;
         Tracen("[EDITOR-IMGUI-2] Light spawn: type=point id=pending");
     }
     ImGui::SameLine();
-    if (ImGui::Button("+ Spot Light"))
+    if (UI::IconButton(ICON_FA_LIGHTBULB, "Spot Light"))
     {
         m_commands.addSpotLight = true;
         Tracen("[EDITOR-IMGUI-2] Light spawn: type=spot id=pending");
@@ -1551,42 +2205,53 @@ void EditorImGui::RenderSplatPaintToolPanel()
 
 void EditorImGui::RenderAssetBrowserToolbar()
 {
-    if (ImGui::Button("+ Texture"))
+    if (UI::IconButton(ICON_FA_PLUS, "Texture"))
         ImportAssetWithDialog(AssetLibrary::Category::Texture);
     ImGui::SameLine();
-    if (ImGui::Button("+ Model"))
+    if (UI::IconButton(ICON_FA_CUBE, "Model"))
         ImportAssetWithDialog(AssetLibrary::Category::Model);
     ImGui::SameLine();
-    if (ImGui::Button("+ Anim"))
+    if (UI::IconButton(ICON_FA_PERSON_RUNNING, "Anim"))
         ImportAssetWithDialog(AssetLibrary::Category::Animation);
     ImGui::SameLine();
-    if (ImGui::Button("+ Material"))
+    if (UI::IconButton(ICON_FA_PALETTE, "Material"))
         CreatePbrMaterialAsset();
     ImGui::SameLine();
-    if (ImGui::Button("+ Water Mat"))
+    if (UI::IconButton(ICON_FA_DROPLET, "Water Mat"))
         CreateWaterMaterialAsset();
 
     ImGui::SameLine();
     ImGui::SetNextItemWidth(220.0f);
     ImGui::InputTextWithHint("##asset_search", "Search assets...", m_assetSearchBuffer, sizeof(m_assetSearchBuffer));
     ImGui::SameLine();
-    if (ImGui::Button("Clear"))
+    if (UI::IconButton(ICON_FA_XMARK, "Clear"))
     {
         m_assetSearchBuffer[0] = '\0';
         m_activeAssetTags.clear();
     }
     ImGui::SameLine();
-    if (ImGui::Button("Refresh"))
+    if (UI::IconButton(ICON_FA_ROTATE, "Refresh"))
         RefreshAssetLibrary();
 }
 
 void EditorImGui::RenderAssetTypeTabs()
 {
-    if (!ImGui::BeginTabBar("AssetTypes"))
-        return;
-
     const auto tab = [this](const char* label, AssetBrowserFilter filter) {
-        if (ImGui::BeginTabItem(label, nullptr, m_assetFilter == filter ? ImGuiTabItemFlags_SetSelected : 0))
+        const bool active = m_assetFilter == filter;
+        if (active)
+        {
+            ImGui::PushStyleColor(ImGuiCol_Button, ImGui::GetStyleColorVec4(ImGuiCol_TabActive));
+            ImGui::PushStyleColor(ImGuiCol_ButtonHovered, ImGui::GetStyleColorVec4(ImGuiCol_TabActive));
+            ImGui::PushStyleColor(ImGuiCol_ButtonActive, ImGui::GetStyleColorVec4(ImGuiCol_TabActive));
+        }
+        else
+        {
+            ImGui::PushStyleColor(ImGuiCol_Button, ImGui::GetStyleColorVec4(ImGuiCol_Tab));
+            ImGui::PushStyleColor(ImGuiCol_ButtonHovered, ImGui::GetStyleColorVec4(ImGuiCol_TabHovered));
+            ImGui::PushStyleColor(ImGuiCol_ButtonActive, ImGui::GetStyleColorVec4(ImGuiCol_TabActive));
+        }
+
+        if (ImGui::Button(label))
         {
             if (m_assetFilter != filter)
             {
@@ -1595,17 +2260,21 @@ void EditorImGui::RenderAssetTypeTabs()
                 m_activeAssetTags.clear();
                 m_selectedAssetId.clear();
             }
-            ImGui::EndTabItem();
         }
+        ImGui::PopStyleColor(3);
     };
 
     tab("All", AssetBrowserFilter::All);
+    ImGui::SameLine();
     tab("Textures", AssetBrowserFilter::Texture);
+    ImGui::SameLine();
     tab("Models", AssetBrowserFilter::Model);
+    ImGui::SameLine();
     tab("Anims", AssetBrowserFilter::Animation);
+    ImGui::SameLine();
     tab("Materials", AssetBrowserFilter::Material);
+    ImGui::SameLine();
     tab("Water Mats", AssetBrowserFilter::WaterMaterial);
-    ImGui::EndTabBar();
 }
 
 void EditorImGui::RenderAssetFolderNode(const std::string& path, const std::vector<std::string>& folders)
@@ -1675,22 +2344,22 @@ void EditorImGui::RenderAssetFolderNode(const std::string& path, const std::vect
 
 void EditorImGui::RenderAssetFolderPanel()
 {
-    if (ImGui::Button("Home"))
+    if (UI::IconButton(ICON_FA_HOUSE, "Home"))
     {
         m_assetSubpath.clear();
         m_selectedAssetId.clear();
     }
     ImGui::SameLine();
-    if (ImGui::Button("Up"))
+    if (UI::IconButton(ICON_FA_FOLDER_OPEN, "Up"))
     {
         m_assetSubpath = ParentSubpath(m_assetSubpath);
         m_selectedAssetId.clear();
     }
 
-    if (ImGui::Button("+ Folder"))
+    if (UI::IconButton(ICON_FA_FOLDER_PLUS, "Folder"))
         ImGui::OpenPopup("NewAssetFolder");
     ImGui::SameLine();
-    if (ImGui::Button("Delete") && !m_assetSubpath.empty())
+    if (UI::IconButton(ICON_FA_TRASH, "Delete") && !m_assetSubpath.empty())
         DeleteAssetFolder();
 
     if (ImGui::BeginPopup("NewAssetFolder"))
@@ -1717,25 +2386,70 @@ void EditorImGui::RenderAssetTile(const AssetLibrary::Entry& entry, float tileSi
     ImGui::PushID(entry.id.c_str());
     const bool selected = entry.id == m_selectedAssetId;
     const ImVec4 categoryColor = AssetCategoryColor(entry.category);
-    ImGui::PushStyleColor(ImGuiCol_Button, selected ? ImVec4(0.80f, 0.68f, 0.22f, 1.0f) : categoryColor);
-    ImGui::PushStyleColor(ImGuiCol_ButtonHovered, ImVec4(categoryColor.x + 0.08f, categoryColor.y + 0.08f, categoryColor.z + 0.08f, 1.0f));
-    ImGui::PushStyleColor(ImGuiCol_ButtonActive, ImVec4(categoryColor.x * 0.8f, categoryColor.y * 0.8f, categoryColor.z * 0.8f, 1.0f));
-    if (ImGui::Button("##asset_tile", ImVec2(tileSize, tileSize)))
+    AssetPreviewTexture* preview = GetAssetPreviewTexture(entry);
+
+    const ImVec2 previewMin = ImGui::GetCursorScreenPos();
+    const ImVec2 previewMax(previewMin.x + tileSize, previewMin.y + tileSize);
+    ImGui::InvisibleButton("##asset_tile", ImVec2(tileSize, tileSize));
+    const bool clicked = ImGui::IsItemClicked(ImGuiMouseButton_Left);
+    const bool doubleClicked = ImGui::IsItemHovered() && ImGui::IsMouseDoubleClicked(ImGuiMouseButton_Left);
+    const bool hovered = ImGui::IsItemHovered();
+
+    ImDrawList* drawList = ImGui::GetWindowDrawList();
+    const ImU32 baseColor = ImGui::ColorConvertFloat4ToU32(hovered
+        ? ImVec4(categoryColor.x + 0.08f, categoryColor.y + 0.08f, categoryColor.z + 0.08f, 1.0f)
+        : categoryColor);
+    drawList->AddRectFilled(previewMin, previewMax, baseColor, 5.0f);
+    if (preview && preview->descriptor)
+    {
+        drawList->AddImage(
+            reinterpret_cast<ImTextureID>(preview->descriptor),
+            previewMin,
+            previewMax,
+            ImVec2(0.0f, 0.0f),
+            ImVec2(1.0f, 1.0f),
+            IM_COL32_WHITE);
+        drawList->AddRectFilled(
+            ImVec2(previewMin.x, previewMax.y - 18.0f),
+            previewMax,
+            IM_COL32(10, 12, 16, 145),
+            0.0f);
+        drawList->AddText(ImVec2(previewMin.x + 6.0f, previewMax.y - 16.0f),
+            IM_COL32(235, 238, 244, 235),
+            AssetLibrary::TextureRoleBadge(entry.textureRole));
+    }
+    else
+    {
+        const char* icon = AssetCategoryIcon(entry.category);
+        if (UI::GetEditorFonts().bold)
+            ImGui::PushFont(UI::GetEditorFonts().bold);
+        const ImVec2 iconSize = ImGui::CalcTextSize(icon);
+        drawList->AddText(
+            ImVec2(previewMin.x + (tileSize - iconSize.x) * 0.5f, previewMin.y + (tileSize - iconSize.y) * 0.5f),
+            IM_COL32(245, 248, 255, 235),
+            icon);
+        if (UI::GetEditorFonts().bold)
+            ImGui::PopFont();
+    }
+    drawList->AddRect(previewMin, previewMax,
+        selected ? IM_COL32(255, 210, 92, 255) : IM_COL32(55, 60, 70, 255),
+        5.0f,
+        0,
+        selected ? 3.0f : 1.0f);
+
+    if (clicked)
     {
         m_selectedAssetId = entry.id;
         m_assetStatus = "Selected: " + entry.displayName;
-        if (ImGui::IsMouseDoubleClicked(ImGuiMouseButton_Left) &&
-            entry.category == AssetLibrary::Category::WaterMaterial)
+        if (doubleClicked && entry.category == AssetLibrary::Category::WaterMaterial)
         {
             OpenWaterMaterialEditor(entry.id);
         }
-        else if (ImGui::IsMouseDoubleClicked(ImGuiMouseButton_Left) &&
-            entry.category == AssetLibrary::Category::Material)
+        else if (doubleClicked && entry.category == AssetLibrary::Category::Material)
         {
             OpenPbrMaterialEditor(entry.id);
         }
     }
-    ImGui::PopStyleColor(3);
 
     if (ImGui::BeginDragDropSource())
     {
@@ -1761,15 +2475,34 @@ void EditorImGui::RenderAssetTile(const AssetLibrary::Entry& entry, float tileSi
         ImGui::EndPopup();
     }
 
-    const char* badge = entry.category == AssetLibrary::Category::Texture
-        ? AssetLibrary::TextureRoleBadge(entry.textureRole)
-        : AssetLibrary::CategoryName(entry.category);
-    ImGui::TextWrapped("%s", entry.displayName.c_str());
-    ImGui::TextDisabled("%s", badge);
-    if (!entry.thumbnail.empty())
-        ImGui::TextDisabled("%s", entry.thumbnail.c_str());
-    if (!entry.tags.empty())
-        ImGui::TextDisabled("#%s", AssetLibrary::TagsToCsv(entry.tags).c_str());
+    const std::string shortName = ShortAssetFilename(entry);
+    ImGui::TextUnformatted(shortName.c_str());
+    const bool labelHovered = ImGui::IsItemHovered();
+    if (hovered || labelHovered)
+    {
+        ImGui::BeginTooltip();
+        ImGui::PushTextWrapPos(ImGui::GetFontSize() * 34.0f);
+        ImGui::TextUnformatted(entry.filename.empty() ? entry.displayName.c_str() : entry.filename.c_str());
+        if (!entry.displayName.empty() && entry.displayName != entry.filename)
+            ImGui::TextDisabled("Name: %s", entry.displayName.c_str());
+        ImGui::TextDisabled("Type: %s", AssetLibrary::CategoryName(entry.category));
+        if (!entry.subpath.empty())
+            ImGui::TextDisabled("Folder: %s", entry.subpath.c_str());
+        if (entry.category == AssetLibrary::Category::Texture)
+        {
+            ImGui::TextDisabled("Role: %s", AssetLibrary::TextureRoleName(entry.textureRole));
+            if (entry.resolutionWidth > 0 && entry.resolutionHeight > 0)
+                ImGui::TextDisabled("Size: %ux%u", entry.resolutionWidth, entry.resolutionHeight);
+        }
+        if (!entry.thumbnail.empty())
+            ImGui::TextDisabled("Preview: %s", entry.thumbnail.c_str());
+        if (!entry.tags.empty())
+            ImGui::TextDisabled("Tags: %s", AssetLibrary::TagsToCsv(entry.tags).c_str());
+        if (!entry.originalPath.empty())
+            ImGui::TextDisabled("Source: %s", entry.originalPath.c_str());
+        ImGui::PopTextWrapPos();
+        ImGui::EndTooltip();
+    }
     ImGui::PopID();
 }
 
@@ -1792,21 +2525,23 @@ void EditorImGui::RenderAssetGrid()
     ImGui::Separator();
 
     const float tileSize = 86.0f;
-    const float cellWidth = 128.0f;
-    const float panelWidth = ImGui::GetContentRegionAvail().x;
-    const int columns = std::max(1, static_cast<int>(panelWidth / cellWidth));
-    int column = 0;
-    for (const AssetLibrary::Entry& entry : visibleAssets)
+    const float cellWidth = 142.0f;
+    const float panelWidth = std::max(1.0f, ImGui::GetContentRegionAvail().x);
+    const float columnStride = cellWidth + ImGui::GetStyle().ItemSpacing.x;
+    const int columns = std::max(1, static_cast<int>((panelWidth + ImGui::GetStyle().ItemSpacing.x) / columnStride));
+    if (ImGui::BeginTable("AssetGridTiles", columns, ImGuiTableFlags_SizingFixedSame | ImGuiTableFlags_NoSavedSettings))
     {
-        ImGui::BeginGroup();
-        RenderAssetTile(entry, tileSize);
-        ImGui::EndGroup();
+        for (int i = 0; i < columns; ++i)
+            ImGui::TableSetupColumn(nullptr, ImGuiTableColumnFlags_WidthFixed, cellWidth);
 
-        ++column;
-        if (column < columns)
-            ImGui::SameLine();
-        else
-            column = 0;
+        for (const AssetLibrary::Entry& entry : visibleAssets)
+        {
+            ImGui::TableNextColumn();
+            ImGui::BeginGroup();
+            RenderAssetTile(entry, tileSize);
+            ImGui::EndGroup();
+        }
+        ImGui::EndTable();
     }
 
     if (visibleAssets.empty())
@@ -1871,6 +2606,13 @@ void EditorImGui::RenderAssetBrowser()
         RenderAssetTypeTabs();
         ImGui::Separator();
 
+        if (!m_assetStatus.empty())
+        {
+            ImGui::TextDisabled("%s", m_assetStatus.c_str());
+            ImGui::Separator();
+        }
+
+        const float browserPanelHeight = std::max(140.0f, ImGui::GetContentRegionAvail().y);
         if (ImGui::BeginTable("AssetBrowserLayout", 3, ImGuiTableFlags_Resizable | ImGuiTableFlags_BordersInnerV))
         {
             ImGui::TableSetupColumn("Folders", ImGuiTableColumnFlags_WidthFixed, 190.0f);
@@ -1879,21 +2621,30 @@ void EditorImGui::RenderAssetBrowser()
             ImGui::TableNextRow();
 
             ImGui::TableSetColumnIndex(0);
-            RenderAssetFolderPanel();
+            if (ImGui::BeginChild("AssetFoldersScroll", ImVec2(0.0f, browserPanelHeight), false,
+                    ImGuiWindowFlags_HorizontalScrollbar))
+            {
+                RenderAssetFolderPanel();
+            }
+            ImGui::EndChild();
 
             ImGui::TableSetColumnIndex(1);
-            RenderAssetGrid();
+            if (ImGui::BeginChild("AssetGridScroll", ImVec2(0.0f, browserPanelHeight), false,
+                    ImGuiWindowFlags_HorizontalScrollbar))
+            {
+                RenderAssetGrid();
+            }
+            ImGui::EndChild();
 
             ImGui::TableSetColumnIndex(2);
-            RenderAssetTagFilters();
+            if (ImGui::BeginChild("AssetTagsScroll", ImVec2(0.0f, browserPanelHeight), false,
+                    ImGuiWindowFlags_HorizontalScrollbar))
+            {
+                RenderAssetTagFilters();
+            }
+            ImGui::EndChild();
 
             ImGui::EndTable();
-        }
-
-        if (!m_assetStatus.empty())
-        {
-            ImGui::Separator();
-            ImGui::TextDisabled("%s", m_assetStatus.c_str());
         }
     }
     ImGui::End();
@@ -1955,22 +2706,23 @@ void EditorImGui::RenderWaterMaterialHeader()
 
     auto entry = m_assetLibrary->FindById(m_waterMaterialEditor.materialId);
     const std::string title = entry ? entry->displayName : m_waterMaterialEditor.materialId;
+    UI::SectionHeader(ICON_FA_PALETTE " Water Material");
     ImGui::Text("Editing: %s%s", title.c_str(), m_waterMaterialEditor.dirty ? " *" : "");
     ImGui::InputText("Name", m_waterMaterialEditor.name, sizeof(m_waterMaterialEditor.name));
 
-    if (ImGui::Button("Save"))
+    if (UI::IconButton(ICON_FA_FLOPPY_DISK, "Save"))
         SaveWaterMaterialEditor();
     ImGui::SameLine();
-    if (ImGui::Button("New Material"))
+    if (UI::IconButton(ICON_FA_PLUS, "New Material"))
         ImGui::OpenPopup("NewWaterMaterialPopup");
     ImGui::SameLine();
-    if (ImGui::Button("Delete"))
+    if (UI::IconButton(ICON_FA_TRASH, "Delete"))
         ImGui::OpenPopup("DeleteWaterMaterialConfirm");
 
     if (ImGui::BeginPopup("NewWaterMaterialPopup"))
     {
         ImGui::InputText("Name", m_waterMaterialEditor.newName, sizeof(m_waterMaterialEditor.newName));
-        if (ImGui::Button("Create"))
+        if (UI::IconButton(ICON_FA_CHECK, "Create"))
         {
             AssetLibrary::Entry created{};
             if (CreateWaterMaterialAsset(m_waterMaterialEditor.newName, created))
@@ -1978,7 +2730,7 @@ void EditorImGui::RenderWaterMaterialHeader()
             ImGui::CloseCurrentPopup();
         }
         ImGui::SameLine();
-        if (ImGui::Button("Cancel"))
+        if (UI::IconButton(ICON_FA_XMARK, "Cancel"))
             ImGui::CloseCurrentPopup();
         ImGui::EndPopup();
     }
@@ -1990,13 +2742,13 @@ void EditorImGui::RenderWaterMaterialHeader()
         ImGui::Text("Delete '%s'?", title.c_str());
         if (users > 0)
             ImGui::TextColored(ImVec4(1.0f, 0.55f, 0.45f, 1.0f), "%u water bodies will use the default material.", users);
-        if (ImGui::Button("Yes, delete"))
+        if (UI::IconButton(ICON_FA_TRASH, "Yes, delete"))
         {
             DeleteWaterMaterialEditor();
             ImGui::CloseCurrentPopup();
         }
         ImGui::SameLine();
-        if (ImGui::Button("Cancel"))
+        if (UI::IconButton(ICON_FA_XMARK, "Cancel"))
             ImGui::CloseCurrentPopup();
         ImGui::EndPopup();
     }
@@ -2212,9 +2964,17 @@ void EditorImGui::RenderWaterMaterialEditor()
 
     if (ImGui::Begin("Water Material Editor", &m_waterMaterialEditor.windowOpen))
     {
+        const bool toolsEnabled = CanUseEditorTools();
+        if (!toolsEnabled)
+        {
+            ImGui::TextColored(ImVec4(0.95f, 0.74f, 0.30f, 1.0f), "Read-only during Play Mode");
+            ImGui::BeginDisabled();
+        }
         if (m_waterMaterialEditor.materialId.empty())
         {
             ImGui::TextDisabled("No water material loaded.");
+            if (!toolsEnabled)
+                ImGui::EndDisabled();
             ImGui::End();
             return;
         }
@@ -2230,18 +2990,21 @@ void EditorImGui::RenderWaterMaterialEditor()
         RenderWaterMaterialRefractionSection(material);
         RenderWaterMaterialEdgeFadeSection(material);
         RenderWaterMaterialTexturesSection(material);
+        if (!toolsEnabled)
+            ImGui::EndDisabled();
     }
     ImGui::End();
 }
 
 void EditorImGui::RenderPbrMaterialHeader()
 {
+    UI::SectionHeader(ICON_FA_PALETTE " PBR Material");
     ImGui::Text("Editing: %s%s", m_pbrMaterialEditor.name, m_pbrMaterialEditor.dirty ? " *" : "");
     ImGui::InputText("Name", m_pbrMaterialEditor.name, sizeof(m_pbrMaterialEditor.name));
-    if (ImGui::Button("Save"))
+    if (UI::IconButton(ICON_FA_FLOPPY_DISK, "Save"))
         SavePbrMaterialEditor();
     ImGui::SameLine();
-    if (ImGui::Button("New Material"))
+    if (UI::IconButton(ICON_FA_PLUS, "New Material"))
         CreatePbrMaterialAsset();
 }
 
@@ -2299,6 +3062,12 @@ void EditorImGui::RenderPbrMaterialEditor()
 
     if (ImGui::Begin("PBR Material Editor", &m_pbrMaterialEditor.windowOpen))
     {
+        const bool toolsEnabled = CanUseEditorTools();
+        if (!toolsEnabled)
+        {
+            ImGui::TextColored(ImVec4(0.95f, 0.74f, 0.30f, 1.0f), "Read-only during Play Mode");
+            ImGui::BeginDisabled();
+        }
         RenderPbrMaterialHeader();
         ImGui::Separator();
         AssetLibrary::MaterialData& material = m_pbrMaterialEditor.draft;
@@ -2324,6 +3093,8 @@ void EditorImGui::RenderPbrMaterialEditor()
             if (ImGui::SliderFloat("Roughness Strength", &material.roughnessStrength, 0.0f, 2.0f, "%.2f")) MarkPbrMaterialChanged("roughness_strength");
             if (ImGui::SliderFloat("Metallic Strength", &material.metallicStrength, 0.0f, 2.0f, "%.2f")) MarkPbrMaterialChanged("metallic_strength");
         }
+        if (!toolsEnabled)
+            ImGui::EndDisabled();
     }
     ImGui::End();
 }
@@ -2366,6 +3137,8 @@ void EditorImGui::RenderEditorPanels()
         return;
 
     RenderDockSpace();
+    HandleEditorHotkeys();
+    RenderEditorToolbar();
     RenderToolsPanel();
     RenderAssetBrowser();
     RenderInspector();
@@ -2458,6 +3231,8 @@ bool EditorImGui::WantsInputCapture(const InputEvent& event) const
 
 void EditorImGui::Destroy()
 {
+    DestroyAssetPreviewTextures();
+
     if (m_vulkanBackendReady)
     {
         ImGui_ImplVulkan_Shutdown();
@@ -2478,6 +3253,9 @@ void EditorImGui::Destroy()
     }
 
     m_device = VK_NULL_HANDLE;
+    m_physicalDevice = VK_NULL_HANDLE;
+    m_graphicsQueue = VK_NULL_HANDLE;
+    m_graphicsQueueFamily = UINT32_MAX;
     m_frameActive = false;
 }
 #else

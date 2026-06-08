@@ -49,8 +49,14 @@ public:
     void Resize(uint32_t width, uint32_t height);
     bool IsLobbyActive() const;
     bool IsInWorld() const;
+    bool IsLocalPlayMode() const;
     std::uint32_t GetOwnNetId() const;
     std::vector<WorldRenderEntity> GetWorldEntities() const;
+    void EnterLocalPlayMode(const WorldRenderEntity& player);
+    void UpdateLocalPlayPlayer(client::net::Vec3 position,
+                               std::uint16_t heading,
+                               client::net::MoveState moveState);
+    void ExitLocalPlayMode();
     bool IsInGameMenuOpen() const;
     bool IsMapEditorOpen() const;
     void ToggleInGameMenu();
