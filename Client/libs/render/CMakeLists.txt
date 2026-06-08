@@ -16,6 +16,10 @@ add_library(client_render STATIC
     ProjectManager.h
     RmlUiLayer.cpp
     RmlUiLayer.h
+    RuntimeSession.cpp
+    RuntimeSession.h
+    RuntimeUiAdapter.cpp
+    RuntimeUiAdapter.h
     SceneManager.cpp
     SceneManager.h
     TerrainRenderer.cpp

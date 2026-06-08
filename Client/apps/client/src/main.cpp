@@ -12,16 +12,16 @@
 #if defined(__ANDROID__)
 #include "NativeWindow_Android.h"
 #endif
-#include "GameClientLayer.h"
 #include "OffscreenSceneRenderer.h"
 #include "RmlUiLayer.h"
+#include "RuntimeSession.h"
+#include "RuntimeUiAdapter.h"
 #include "SceneManager.h"
 #include "TerrainRenderer.h"
 #include "VulkanDevice.h"
 #include "WarriorRenderer.h"
 #include "Debug.h"
 #include "asset/IAssetReader.h"
-#include "network/ClientSession.h"
 
 #if defined(_WIN32)
 #include "asset/FileAssetReader.h"
@@ -41,6 +41,7 @@
 #include <cstdlib>
 #include <filesystem>
 #include <functional>
+#include <memory>
 #include <optional>
 #include <string>
 #include <type_traits>
@@ -1124,6 +1125,45 @@ struct EditorPlayRuntime
     std::uint16_t playerHeading = 0;
 };
 
+enum class RuntimeImplementation
+{
+    Empty,
+    Auriga
+};
+
+constexpr RuntimeImplementation kActiveRuntimeImplementation = RuntimeImplementation::Auriga;
+
+std::unique_ptr<RuntimeSession> CreateRuntimeSession(RuntimeImplementation implementation)
+{
+    switch (implementation)
+    {
+    case RuntimeImplementation::Empty:
+        Tracen("[RUNTIME] active session = EmptyRuntimeSession");
+        return CreateEmptyRuntimeSession();
+    case RuntimeImplementation::Auriga:
+    default:
+        Tracen("[RUNTIME] active session = AurigaRuntimeSession");
+        return CreateAurigaRuntimeSession();
+    }
+}
+
+std::unique_ptr<RuntimeUiAdapter> CreateRuntimeUiAdapter(RuntimeImplementation implementation,
+                                                        RmlUiLayer& rmlUi,
+                                                        client::asset::IAssetReader& assets,
+                                                        std::function<bool()> isRuntimeFlowActive)
+{
+    switch (implementation)
+    {
+    case RuntimeImplementation::Empty:
+        Tracen("[RUNTIME] active UI adapter = NullRuntimeUiAdapter");
+        return CreateNullRuntimeUiAdapter(rmlUi);
+    case RuntimeImplementation::Auriga:
+    default:
+        Tracen("[RUNTIME] active UI adapter = AurigaRuntimeUiAdapter");
+        return CreateAurigaRuntimeUiAdapter(rmlUi, assets, std::move(isRuntimeFlowActive));
+    }
+}
+
 int RunGame(NativeWindow& window,
             client::asset::IAssetReader& assets,
             std::optional<client::net::DebugSpawnOverride> debugSpawnOverride = std::nullopt)
@@ -1145,24 +1185,22 @@ int RunGame(NativeWindow& window,
 #endif
     Tracenf("[BOOT] window size = %ux%u", window.GetWidth(), window.GetHeight());
 
-    GameClientLayer gameClient;
     VkExtent2D renderSize = device.GetSwapchainExtent();
     Tracenf("[BOOT] swapchain size = %ux%u", renderSize.width, renderSize.height);
-    if (!gameClient.Create(device, assets, renderSize.width, renderSize.height))
+    std::unique_ptr<RuntimeSession> runtimeSession = CreateRuntimeSession(kActiveRuntimeImplementation);
+    runtimeSession->SetDebugSpawnOverride(debugSpawnOverride);
+    if (!runtimeSession->Create(device, assets, renderSize.width, renderSize.height))
     {
-        ShowFatal("Failed to create gameClient layer. See debug output/stderr.");
+        ShowFatal("Failed to create runtime session. See debug output/stderr.");
         device.Destroy();
         return 1;
     }
-    client::net::ClientSession clientSession(gameClient);
-    clientSession.SetDebugSpawnOverride(debugSpawnOverride);
-    gameClient.SetClientSession(&clientSession);
 
     RmlUiLayer rmlUi;
     if (!rmlUi.Create(device, assets, renderSize.width, renderSize.height))
     {
         ShowFatal("Failed to create RmlUi layer. See debug output/stderr.");
-        gameClient.Destroy();
+        runtimeSession->Destroy();
         device.Destroy();
         return 1;
     }
@@ -1176,145 +1214,17 @@ int RunGame(NativeWindow& window,
         return true;
 #endif
     };
-    SceneManager::Instance().SetRuntimeUiCallbacks(
-        [&rmlUi]() {
-            Tracen("[UI-ROUTE] RmlUi HideAll() called");
-            rmlUi.HideAll();
-        },
-        [&rmlUi, &isRuntimeFlowActive]() {
-            if (!isRuntimeFlowActive())
-            {
-                Tracen("[UI-ROUTE] callback -> ShowLogin() suppressed (Edit mode)");
-                rmlUi.HideAll();
-                return;
-            }
-            Tracen("[UI-ROUTE] callback -> ShowLogin()");
-            rmlUi.ShowLogin();
-        },
-        [&rmlUi, &isRuntimeFlowActive]() {
-            if (!isRuntimeFlowActive())
-            {
-                Tracen("[UI-ROUTE] callback -> ShowLobby() suppressed (Edit mode)");
-                rmlUi.HideAll();
-                return;
-            }
-            Tracen("[UI-ROUTE] callback -> ShowLobby()");
-            rmlUi.ShowLobby();
-        },
-        [&rmlUi, &isRuntimeFlowActive]() {
-            if (!isRuntimeFlowActive())
-            {
-                Tracen("[UI-ROUTE] callback -> ShowHud() suppressed (Edit mode)");
-                rmlUi.HideAll();
-                return;
-            }
-            Tracen("[UI-ROUTE] callback -> ShowHud()");
-            rmlUi.ShowHud();
-        });
+    std::unique_ptr<RuntimeUiAdapter> runtimeUi =
+        CreateRuntimeUiAdapter(kActiveRuntimeImplementation, rmlUi, assets, isRuntimeFlowActive);
+    runtimeUi->SetQuitCallback([&window]() {
+        window.RequestClose();
+    });
+    runtimeUi->InstallSceneRouting(SceneManager::Instance());
+    runtimeUi->BindRuntime(*runtimeSession);
 #if defined(IXTREEME_WITH_EDITOR)
-    rmlUi.HideAll();
+    runtimeUi->HideAll();
     Tracen("[STARTUP] Editor build starts in editor-only empty scene state");
 #endif
-    auto loadRuntimeSceneOrFallback = [&assets, &isRuntimeFlowActive](const char* sceneAssetPath, std::function<void()> fallback) {
-        if (!isRuntimeFlowActive())
-        {
-            Tracenf("[SCENE-FLOW] suppressed in Edit mode: %s", sceneAssetPath);
-            return;
-        }
-        if (!LoadRuntimeScene(assets, sceneAssetPath) && fallback)
-            fallback();
-    };
-    rmlUi.SetLoginSubmitCallback([&gameClient](const std::string& username,
-                                            const std::string& password,
-                                            bool remember) {
-        gameClient.SubmitLogin(username, password, remember);
-    });
-    gameClient.SetLoginCallbacks(
-        [&rmlUi, &loadRuntimeSceneOrFallback, &isRuntimeFlowActive]() {
-            if (!isRuntimeFlowActive())
-            {
-                rmlUi.HideAll();
-                return;
-            }
-            rmlUi.SetLoginError("");
-            loadRuntimeSceneOrFallback("scenes/Lobby.scene", [&rmlUi]() {
-                rmlUi.HideLogin();
-                rmlUi.ShowLobby();
-            });
-        },
-        [&gameClient, &rmlUi, &isRuntimeFlowActive](const std::string& message) {
-            if (!isRuntimeFlowActive())
-            {
-                rmlUi.HideAll();
-                return;
-            }
-            if (!gameClient.IsLobbyActive() && !gameClient.IsInWorld())
-                rmlUi.ShowLogin();
-            rmlUi.SetLoginError(message);
-        });
-    rmlUi.SetLobbyCallbacks(
-        [&gameClient](std::uint64_t characterId) {
-            gameClient.EnterWorldWithCharacter(characterId);
-        },
-        [&rmlUi]() {
-            rmlUi.ShowCharacterCreation();
-        },
-        [&rmlUi](std::uint64_t) {
-            rmlUi.SetLobbyStatus("Character delete is not available yet");
-        },
-        [&gameClient, &rmlUi, &loadRuntimeSceneOrFallback]() {
-            gameClient.LogoutToLogin();
-            loadRuntimeSceneOrFallback("scenes/Login.scene", [&rmlUi]() {
-                rmlUi.HideLobby();
-                rmlUi.ShowLogin();
-            });
-        });
-    gameClient.SetLobbyCallbacks(
-        [&rmlUi, &isRuntimeFlowActive]() {
-            if (!isRuntimeFlowActive())
-            {
-                rmlUi.HideAll();
-                return;
-            }
-            rmlUi.ShowLobby();
-        },
-        [&rmlUi](const std::vector<client::net::CharacterListItem>& characters) {
-            rmlUi.SetLobbyCharacters(characters);
-        },
-        [&rmlUi](const std::string& message) {
-            rmlUi.SetLobbyStatus(message);
-        },
-        [&rmlUi, &loadRuntimeSceneOrFallback, &isRuntimeFlowActive]() {
-            if (!isRuntimeFlowActive())
-            {
-                rmlUi.HideAll();
-                return;
-            }
-            loadRuntimeSceneOrFallback("scenes/World.scene", [&rmlUi]() {
-                rmlUi.HideLobby();
-                rmlUi.ShowHud();
-            });
-        });
-    rmlUi.SetInGameMenuCallbacks(
-        []() {},
-        [&gameClient, &rmlUi, &loadRuntimeSceneOrFallback, &isRuntimeFlowActive]() {
-            gameClient.LogoutToLogin();
-            if (!isRuntimeFlowActive())
-            {
-                rmlUi.HideAll();
-                return;
-            }
-            loadRuntimeSceneOrFallback("scenes/Login.scene", [&rmlUi]() {
-                rmlUi.HideHud();
-                rmlUi.HideInventory();
-                rmlUi.HideSettings();
-                rmlUi.HideInGameMenu();
-                rmlUi.ShowLogin();
-            });
-        },
-        [&window]() {
-            window.RequestClose();
-        });
 
     EditorImGui editorImGui;
 #if defined(IXTREEME_WITH_EDITOR)
@@ -1323,7 +1233,7 @@ int RunGame(NativeWindow& window,
     if (!win32Window || !editorImGui.Create(device, win32Window->GetHwnd()))
     {
         ShowFatal("Failed to create ImGui editor layer. See debug output/stderr.");
-        gameClient.Destroy();
+        runtimeSession->Destroy();
         device.Destroy();
         return 1;
     }
@@ -1338,7 +1248,7 @@ int RunGame(NativeWindow& window,
     if (!editorImGui.Create(device, nullptr))
     {
         ShowFatal("Failed to create ImGui editor layer. See debug output/stderr.");
-        gameClient.Destroy();
+        runtimeSession->Destroy();
         device.Destroy();
         return 1;
     }
@@ -1346,8 +1256,8 @@ int RunGame(NativeWindow& window,
         window.SetTitle(title);
     });
 #endif
-    editorImGui.SetMapEditorSettings(gameClient.GetMapEditorSettings());
-    editorImGui.SetLightingState(gameClient.GetLightingState());
+    editorImGui.SetMapEditorSettings(runtimeSession->GetMapEditorSettings());
+    editorImGui.SetLightingState(runtimeSession->GetLightingState());
     if (auto assetRoot = assets.RootPath())
         editorImGui.SetEngineRoot(*assetRoot);
 #else
@@ -1372,12 +1282,12 @@ int RunGame(NativeWindow& window,
     }
     else
     {
-        gameClient.InitializeAssetLibrary("assets/Maps/test_zone", terrain.GetPaletteSlots());
+        runtimeSession->InitializeAssetLibrary("assets/Maps/test_zone", terrain.GetPaletteSlots());
 #if defined(IXTREEME_WITH_EDITOR)
-        editorImGui.SetPaletteSlots(gameClient.GetPaletteSlots());
+        editorImGui.SetPaletteSlots(runtimeSession->GetPaletteSlots());
         editorImGui.SetWaterMaterials(editorImGui.GetWaterMaterialsSnapshot());
 #endif
-        if (!terrain.ApplyPaletteSlots(device, gameClient.GetPaletteSlots()))
+        if (!terrain.ApplyPaletteSlots(device, runtimeSession->GetPaletteSlots()))
             Tracenf("[MAIN] world palette could not be applied; keeping initial terrain palette");
     }
 
@@ -1409,7 +1319,7 @@ int RunGame(NativeWindow& window,
         }
     }
 
-    gameClient.SetQuitCallback([&window]()
+    runtimeSession->SetQuitCallback([&window]()
     {
         window.RequestClose();
     });
@@ -1418,11 +1328,11 @@ int RunGame(NativeWindow& window,
     CameraController cameraController;
 #if defined(IXTREEME_WITH_EDITOR)
     EditorPlayRuntime editorPlay;
-    gameClient.SetMapEditorOpen(true);
+    runtimeSession->SetMapEditorOpen(true);
     if (terrainOk)
         terrain.SetMapEditorOpen(true);
     cameraController.SetEditorFlyMode(true);
-    gameClient.SetEditorStatus("Editor opened at boot");
+    runtimeSession->SetEditorStatus("Editor opened at boot");
     Tracen("[BOOT] editor_open forced = 1 (editor build boot)");
 #endif
     std::vector<WorldRenderEntity> lastPickEntities;
@@ -1453,7 +1363,7 @@ int RunGame(NativeWindow& window,
         scene.waterBodies = editorWaterBodies;
         scene.pointLights = editorPointLights;
         scene.spotLights = editorSpotLights;
-        scene.paletteSlots = terrainOk ? terrain.GetPaletteSlots() : gameClient.GetPaletteSlots();
+        scene.paletteSlots = terrainOk ? terrain.GetPaletteSlots() : runtimeSession->GetPaletteSlots();
         return scene;
     };
     auto applySceneData = [&](const SceneData& scene) {
@@ -1471,8 +1381,8 @@ int RunGame(NativeWindow& window,
             nextEditorLightId = std::max(nextEditorLightId, light.id + 1u);
 
         editorImGui.SetLightingState(scene.lighting);
-        gameClient.SetDynamicLightEditorState({});
-        gameClient.SetWaterBodyEditorState({});
+        runtimeSession->SetDynamicLightEditorState({});
+        runtimeSession->SetWaterBodyEditorState({});
         if (terrainOk)
         {
             terrain.SetLightingState(scene.lighting);
@@ -1502,14 +1412,13 @@ int RunGame(NativeWindow& window,
     bool editorShiftDown = false;
 #endif
 
-    window.SetInputCallback([&gameClient,
-                             &rmlUi,
+    window.SetInputCallback([&runtimeSession,
+                             &runtimeUi,
                              &editorImGui,
                              &movement,
                              &cameraController,
                              &terrain,
                              &terrainOk,
-                             &clientSession,
                              &lastPickEntities,
                              &lastPickCamera,
                              &hasLastPickCamera,
@@ -1541,7 +1450,7 @@ int RunGame(NativeWindow& window,
         else if (event.type == InputEvent::KeyUp && event.key == Key_Shift)
             editorShiftDown = false;
 
-        if (gameClient.IsMapEditorOpen() && event.type == InputEvent::KeyDown && event.key == Key_F5)
+        if (runtimeSession->IsMapEditorOpen() && event.type == InputEvent::KeyDown && event.key == Key_F5)
         {
             if (editorShiftDown)
             {
@@ -1562,7 +1471,7 @@ int RunGame(NativeWindow& window,
             movement.Clear();
             return;
         }
-        if (gameClient.IsMapEditorOpen() && event.type == InputEvent::KeyDown && event.key == Key_F6)
+        if (runtimeSession->IsMapEditorOpen() && event.type == InputEvent::KeyDown && event.key == Key_F6)
         {
             if (editorPlay.state.mode == EditorPlayMode::Play)
                 editorPlay.state.mode = EditorPlayMode::PlayPaused;
@@ -1578,36 +1487,36 @@ int RunGame(NativeWindow& window,
             return;
         }
 
-        if (gameClient.IsInWorld() && event.type == InputEvent::KeyDown && event.key == Key_Escape)
+        if (runtimeSession->IsInWorld() && event.type == InputEvent::KeyDown && event.key == Key_Escape)
         {
-            if (rmlUi.IsSettingsVisible())
-                rmlUi.HideSettings();
+            if (runtimeUi->IsSettingsVisible())
+                runtimeUi->HideSettings();
             else
-                rmlUi.ToggleInGameMenu();
+                runtimeUi->ToggleInGameMenu();
             movement.Clear();
             return;
         }
-        if (gameClient.IsInWorld() && event.type == InputEvent::KeyDown && event.key == Key_I)
+        if (runtimeSession->IsInWorld() && event.type == InputEvent::KeyDown && event.key == Key_I)
         {
-            rmlUi.ToggleInventory();
+            runtimeUi->ToggleInventory();
             movement.Clear();
             return;
         }
 
-        if (rmlUi.OnInput(event))
+        if (runtimeUi->OnInput(event))
         {
             movement.Clear();
             return;
         }
 
-        const bool editorTextInputFocused = gameClient.IsMapEditorOpen() && gameClient.IsTextInputFocused();
+        const bool editorTextInputFocused = runtimeSession->IsMapEditorOpen() && runtimeSession->IsTextInputFocused();
         if (editorTextInputFocused)
             movement.Clear();
         else
             movement.Apply(event);
 
-        if (gameClient.IsInWorld() && event.type == InputEvent::MouseDown && event.button == MouseButton_Left &&
-            hasLastPickCamera && !gameClient.IsMapEditorOpen())
+        if (runtimeSession->IsInWorld() && event.type == InputEvent::MouseDown && event.button == MouseButton_Left &&
+            hasLastPickCamera && !runtimeSession->IsMapEditorOpen())
         {
             selectedTargetNetId = PickMobTarget(lastPickEntities,
                                                lastPickCamera,
@@ -1618,51 +1527,51 @@ int RunGame(NativeWindow& window,
             Tracenf("[COMBAT] selected target net_id=%u", selectedTargetNetId);
             return;
         }
-        if (gameClient.IsInWorld() && !gameClient.IsMapEditorOpen() &&
+        if (runtimeSession->IsInWorld() && !runtimeSession->IsMapEditorOpen() &&
             event.type == InputEvent::KeyDown && event.key == Key_F)
         {
             if (selectedTargetNetId != 0)
-                clientSession.SendAttackTarget(selectedTargetNetId);
+                runtimeSession->SendAttackTarget(selectedTargetNetId);
             return;
         }
 #if defined(IXTREEME_WITH_EDITOR)
-        if (event.type == InputEvent::KeyDown && event.key == Key_F2 && gameClient.IsMapEditorOpen())
+        if (event.type == InputEvent::KeyDown && event.key == Key_F2 && runtimeSession->IsMapEditorOpen())
         {
-            if (gameClient.OnInput(event))
+            if (runtimeSession->OnInput(event))
                 return;
         }
         if (event.type == InputEvent::KeyDown && event.key == Key_F2 && terrainOk)
         {
             terrain.ToggleWalkabilityDebug();
-            if (!terrain.IsWalkabilityDebugEnabled() && gameClient.IsMapEditorOpen())
+            if (!terrain.IsWalkabilityDebugEnabled() && runtimeSession->IsMapEditorOpen())
             {
-                gameClient.ToggleMapEditor();
+                runtimeSession->ToggleMapEditor();
                 terrain.SetMapEditorOpen(false);
                 cameraController.SetEditorFlyMode(false);
             }
             return;
         }
         if (event.type == InputEvent::KeyDown && event.key == Key_F4 && terrainOk &&
-            gameClient.IsInWorld())
+            runtimeSession->IsInWorld())
         {
-            gameClient.ToggleMapEditor();
-            gameClient.ClearKeyboardFocus();
-            terrain.SetMapEditorOpen(gameClient.IsMapEditorOpen());
-            cameraController.SetEditorFlyMode(gameClient.IsMapEditorOpen());
-            if (!gameClient.IsMapEditorOpen())
+            runtimeSession->ToggleMapEditor();
+            runtimeSession->ClearKeyboardFocus();
+            terrain.SetMapEditorOpen(runtimeSession->IsMapEditorOpen());
+            cameraController.SetEditorFlyMode(runtimeSession->IsMapEditorOpen());
+            if (!runtimeSession->IsMapEditorOpen())
             {
                 selectedEditorObject = {};
                 editorObjectDragActive = false;
-                gameClient.SetEditorStatus("Editor closed");
+                runtimeSession->SetEditorStatus("Editor closed");
             }
             else
             {
-                gameClient.SetEditorStatus("Editor fly camera active: RMB look, WASD move, Space/Ctrl up/down");
+                runtimeSession->SetEditorStatus("Editor fly camera active: RMB look, WASD move, Space/Ctrl up/down");
             }
             return;
         }
 
-        if (terrainOk && gameClient.IsMapEditorOpen()
+        if (terrainOk && runtimeSession->IsMapEditorOpen()
 #if defined(IXTREEME_WITH_EDITOR)
             && editorPlay.state.mode == EditorPlayMode::Edit
 #endif
@@ -1673,9 +1582,9 @@ int RunGame(NativeWindow& window,
                  event.type == InputEvent::KeyUp ||
                  event.type == InputEvent::Char))
             {
-                gameClient.OnInput(event);
+                runtimeSession->OnInput(event);
                 if (event.type == InputEvent::KeyDown && event.key == Key_Enter)
-                    gameClient.ClearKeyboardFocus();
+                    runtimeSession->ClearKeyboardFocus();
                 return;
             }
 
@@ -1686,23 +1595,23 @@ int RunGame(NativeWindow& window,
                     if (event.key == Key_W)
                     {
                         editorGizmoMode = EditorGizmoMode::Translate;
-                        gameClient.SetEditorStatus("Gizmo: translate");
+                        runtimeSession->SetEditorStatus("Gizmo: translate");
                     }
                     else if (event.key == Key_E)
                     {
                         editorGizmoMode = EditorGizmoMode::Rotate;
-                        gameClient.SetEditorStatus("Gizmo: rotate");
+                        runtimeSession->SetEditorStatus("Gizmo: rotate");
                     }
                     else if (event.key == Key_R)
                     {
                         editorGizmoMode = EditorGizmoMode::Scale;
-                        gameClient.SetEditorStatus("Gizmo: scale");
+                        runtimeSession->SetEditorStatus("Gizmo: scale");
                     }
                     else if (event.key == Key_Delete && selectedEditorObject.type == SelectedEditorObjectType::WaterBody)
                     {
                         editorWaterBodies.erase(std::remove_if(editorWaterBodies.begin(), editorWaterBodies.end(),
                             [&](const WaterBody& body) { return body.id == selectedEditorObject.id; }), editorWaterBodies.end());
-                        gameClient.SetEditorStatus("Deleted water body #" + std::to_string(selectedEditorObject.id));
+                        runtimeSession->SetEditorStatus("Deleted water body #" + std::to_string(selectedEditorObject.id));
                         selectedEditorObject = {};
                         editorWaterBodiesDirty = true;
                         return;
@@ -1718,7 +1627,7 @@ int RunGame(NativeWindow& window,
                 event.type == InputEvent::MouseUp ||
                 event.type == InputEvent::MouseWheel)
             {
-                consumedByEditorUi = gameClient.OnInput(event);
+                consumedByEditorUi = runtimeSession->OnInput(event);
                 const MapEditorSettings editorSettings = editorImGui.GetMapEditorSettings();
                 auto selectedWaterBodyIt = [&]() {
                     return std::find_if(editorWaterBodies.begin(), editorWaterBodies.end(),
@@ -1783,7 +1692,7 @@ int RunGame(NativeWindow& window,
                         {
                             editorWaterBodiesDirty = true;
                             waterSculptMeshRegenPending = true;
-                            gameClient.SetEditorStatus("Water sculpt stroke: " +
+                            runtimeSession->SetEditorStatus("Water sculpt stroke: " +
                                 std::to_string(waterSculptStrokeModifiedCells) + " cells modified");
                         }
                         Tracenf("[WATER-OBJ-5] Brush stroke ended: body_id=%u mode=%s cells_modified=%u",
@@ -1839,7 +1748,7 @@ int RunGame(NativeWindow& window,
                 else if (!consumedByEditorUi)
                 {
                     if (event.type == InputEvent::MouseDown)
-                        gameClient.ClearKeyboardFocus();
+                        runtimeSession->ClearKeyboardFocus();
 
                     if (event.type == InputEvent::MouseDown && event.button == MouseButton_Left && hasLastPickCamera)
                     {
@@ -1854,7 +1763,7 @@ int RunGame(NativeWindow& window,
                             editorObjectDragActive = true;
                             editorObjectDragLastX = event.x;
                             editorObjectDragLastY = event.y;
-                            gameClient.SetEditorStatus("Selected point light #" + std::to_string(*pointId));
+                            runtimeSession->SetEditorStatus("Selected point light #" + std::to_string(*pointId));
                             return;
                         }
                         if (auto spotId = PickDynamicLight(editorSpotLights,
@@ -1868,7 +1777,7 @@ int RunGame(NativeWindow& window,
                             editorObjectDragActive = true;
                             editorObjectDragLastX = event.x;
                             editorObjectDragLastY = event.y;
-                            gameClient.SetEditorStatus("Selected spot light #" + std::to_string(*spotId));
+                            runtimeSession->SetEditorStatus("Selected spot light #" + std::to_string(*spotId));
                             return;
                         }
                         if (auto waterId = PickWaterBody(editorWaterBodies,
@@ -1882,7 +1791,7 @@ int RunGame(NativeWindow& window,
                             editorObjectDragActive = true;
                             editorObjectDragLastX = event.x;
                             editorObjectDragLastY = event.y;
-                            gameClient.SetEditorStatus("Selected water body #" + std::to_string(*waterId));
+                            runtimeSession->SetEditorStatus("Selected water body #" + std::to_string(*waterId));
                             return;
                         }
                     }
@@ -1996,7 +1905,7 @@ int RunGame(NativeWindow& window,
                     event.type == InputEvent::MouseMove ||
                     ((event.type == InputEvent::MouseDown || event.type == InputEvent::MouseUp) &&
                      event.button == MouseButton_Right);
-                if (!consumedByEditorUi && gameClient.IsInWorld() && cameraMouse)
+                if (!consumedByEditorUi && runtimeSession->IsInWorld() && cameraMouse)
                     cameraController.HandleInput(event);
                 return;
             }
@@ -2009,10 +1918,10 @@ int RunGame(NativeWindow& window,
             && terrain.HandleEditorInput(event))
             return;
 #endif
-        if (gameClient.IsInWorld() && cameraController.HandleInput(event))
+        if (runtimeSession->IsInWorld() && cameraController.HandleInput(event))
             return;
 
-        if (!gameClient.OnInput(event))
+        if (!runtimeSession->OnInput(event))
         {
             // TODO: forward unconsumed events to the game/3D scene input path.
             //LogUnhandledInput(event);
@@ -2065,13 +1974,13 @@ int RunGame(NativeWindow& window,
                     terrain.RecreatePipeline(device);
                 if (nameplatesOk)
                     nameplates.RecreatePipeline(device);
-                gameClient.OnRenderPassChanged(device);
+                runtimeSession->OnRenderPassChanged(device);
                 rmlUi.OnRenderPassChanged(device);
 #if defined(IXTREEME_WITH_EDITOR)
                 editorImGui.OnRenderPassChanged(device);
 #endif
                 renderSize = device.GetSwapchainExtent();
-                gameClient.Resize(renderSize.width, renderSize.height);
+                runtimeSession->Resize(renderSize.width, renderSize.height);
                 rmlUi.Resize(renderSize.width, renderSize.height);
             }
             else
@@ -2086,7 +1995,7 @@ int RunGame(NativeWindow& window,
             std::vector<std::string> dropped;
             dropped.swap(pendingDroppedFiles);
             Tracenf("[ASSET-DROP] queued file drop import: %zu path(s)", dropped.size());
-            gameClient.ImportDroppedFiles(dropped);
+            runtimeSession->ImportDroppedFiles(dropped);
             editorImGui.RefreshAssetLibrary();
         }
 #endif
@@ -2097,7 +2006,7 @@ int RunGame(NativeWindow& window,
         previousSeconds = seconds;
         cameraController.Update(deltaSeconds, movement);
 #if defined(IXTREEME_WITH_EDITOR)
-        if (gameClient.IsLocalPlayMode())
+        if (runtimeSession->IsLocalPlayMode())
         {
             if (editorPlay.state.mode == EditorPlayMode::Play)
             {
@@ -2139,7 +2048,7 @@ int RunGame(NativeWindow& window,
                         heading += kTwoPi;
                     editorPlay.playerHeading = static_cast<std::uint16_t>((heading / kTwoPi) * 65535.0f);
                 }
-                gameClient.UpdateLocalPlayPlayer(editorPlay.playerPosition,
+                runtimeSession->UpdateLocalPlayPlayer(editorPlay.playerPosition,
                     editorPlay.playerHeading,
                     movement.State());
                 editorPlay.state.elapsedSeconds += deltaSeconds;
@@ -2149,25 +2058,25 @@ int RunGame(NativeWindow& window,
         else
 #endif
         {
-            clientSession.Update();
-            clientSession.SendMoveInput(
+            runtimeSession->UpdateNetwork();
+            runtimeSession->SendMoveInput(
                 movement.DirectionAngle(cameraController.MovementYaw()),
                 cameraController.IsFlyMode() ? client::net::MoveState::Idle : movement.State());
         }
-        gameClient.Update(seconds);
+        runtimeSession->Update(seconds);
         rmlUi.Update();
 
         std::vector<WorldRenderEntity> frameEntities;
         WorldCamera frameCamera{};
         bool hasFrameCamera = false;
-        if (gameClient.IsInWorld())
+        if (runtimeSession->IsInWorld())
         {
-            frameEntities = gameClient.GetWorldEntities();
+            frameEntities = runtimeSession->GetWorldEntities();
             WorldVec3 cameraTarget{};
             bool hasOwn = false;
             for (const auto& entity : frameEntities)
             {
-                if (entity.netId == gameClient.GetOwnNetId())
+                if (entity.netId == runtimeSession->GetOwnNetId())
                 {
                     cameraTarget = ServerMetersToDisplay(entity.position);
                     hasOwn = true;
@@ -2194,7 +2103,7 @@ int RunGame(NativeWindow& window,
             const WorldRenderEntity* targetEntity = nullptr;
             for (const WorldRenderEntity& entity : frameEntities)
             {
-                if (entity.netId == gameClient.GetOwnNetId())
+                if (entity.netId == runtimeSession->GetOwnNetId())
                     ownEntity = &entity;
                 if (selectedTargetNetId != 0 && entity.netId == selectedTargetNetId)
                     targetEntity = &entity;
@@ -2208,7 +2117,7 @@ int RunGame(NativeWindow& window,
                 hudData.currentHp = ownEntity->hpCurrent;
                 hudData.maxHp = ownEntity->hpMax <= 0.0f ? 1.0f : ownEntity->hpMax;
 #if defined(IXTREEME_WITH_EDITOR)
-                if (gameClient.IsLocalPlayMode())
+                if (runtimeSession->IsLocalPlayMode())
                 {
                     hudData.currentMp = 500.0f;
                     hudData.maxMp = 500.0f;
@@ -2228,18 +2137,18 @@ int RunGame(NativeWindow& window,
                 hudData.targetCurrentHp = targetEntity->hpCurrent;
                 hudData.targetMaxHp = targetEntity->hpMax <= 0.0f ? 1.0f : targetEntity->hpMax;
             }
-            rmlUi.UpdateHud(hudData);
+            runtimeUi->UpdateHud(hudData);
 
 #if defined(IXTREEME_WITH_EDITOR)
             if (terrainOk)
             {
-                terrain.SetMapEditorOpen(gameClient.IsMapEditorOpen());
+                terrain.SetMapEditorOpen(runtimeSession->IsMapEditorOpen());
                 const MapEditorSettings editorSettings = editorImGui.GetMapEditorSettings();
                 terrain.SetMapEditorSettings(editorSettings);
                 SceneData pendingScene;
                 if (SceneManager::Instance().ConsumePendingScene(pendingScene))
                     applySceneData(pendingScene);
-                MapEditorCommands commands = gameClient.ConsumeMapEditorCommands();
+                MapEditorCommands commands = runtimeSession->ConsumeMapEditorCommands();
                 MergeMapEditorCommands(commands, editorImGui.ConsumeCommands());
                 if (commands.gizmoSettingsChanged)
                 {
@@ -2266,12 +2175,12 @@ int RunGame(NativeWindow& window,
                     return fallback;
                 };
                 auto hasOwnRuntimeCharacter = [&]() {
-                    if (!gameClient.IsInWorld())
+                    if (!runtimeSession->IsInWorld())
                         return false;
-                    const std::uint32_t ownNetId = gameClient.GetOwnNetId();
+                    const std::uint32_t ownNetId = runtimeSession->GetOwnNetId();
                     if (ownNetId == 0)
                         return false;
-                    const std::vector<WorldRenderEntity> worldEntities = gameClient.GetWorldEntities();
+                    const std::vector<WorldRenderEntity> worldEntities = runtimeSession->GetWorldEntities();
                     return std::any_of(worldEntities.begin(), worldEntities.end(), [ownNetId](const WorldRenderEntity& entity) {
                         return entity.netId == ownNetId;
                     });
@@ -2294,7 +2203,7 @@ int RunGame(NativeWindow& window,
                     player.hpCurrent = 1000.0f;
                     player.hpMax = 1000.0f;
                     player.hpDisplayed = 1000.0f;
-                    gameClient.EnterLocalPlayMode(player);
+                    runtimeSession->EnterLocalPlayMode(player);
                     selectedTargetNetId = 0;
                     editorPlay.directGameplayDevCharacter = true;
                     Tracen("[EDIT-PLAY-2] Direct gameplay scene Play: dev character injected");
@@ -2304,15 +2213,15 @@ int RunGame(NativeWindow& window,
                     {
                     case HierarchyEntityType::WaterBody:
                         selectedEditorObject = {SelectedEditorObjectType::WaterBody, id};
-                        gameClient.SetEditorStatus("Selected water body #" + std::to_string(id));
+                        runtimeSession->SetEditorStatus("Selected water body #" + std::to_string(id));
                         break;
                     case HierarchyEntityType::PointLight:
                         selectedEditorObject = {SelectedEditorObjectType::PointLight, id};
-                        gameClient.SetEditorStatus("Selected point light #" + std::to_string(id));
+                        runtimeSession->SetEditorStatus("Selected point light #" + std::to_string(id));
                         break;
                     case HierarchyEntityType::SpotLight:
                         selectedEditorObject = {SelectedEditorObjectType::SpotLight, id};
-                        gameClient.SetEditorStatus("Selected spot light #" + std::to_string(id));
+                        runtimeSession->SetEditorStatus("Selected spot light #" + std::to_string(id));
                         break;
                     default:
                         break;
@@ -2345,7 +2254,7 @@ int RunGame(NativeWindow& window,
                     if (!target)
                         return;
                     cameraController.FocusOn(*target);
-                    gameClient.SetEditorStatus("Focused camera on entity #" + std::to_string(id));
+                    runtimeSession->SetEditorStatus("Focused camera on entity #" + std::to_string(id));
                     Tracenf("[HIERARCHY] Focused camera on entity: id=%u type=%d", id, static_cast<int>(type));
                 };
                 auto deleteHierarchyEntity = [&](HierarchyEntityType type, std::uint32_t id) {
@@ -2372,7 +2281,7 @@ int RunGame(NativeWindow& window,
                         selectedEditorObject = {};
                     }
                     SceneManager::Instance().MarkDirty();
-                    gameClient.SetEditorStatus("Deleted hierarchy entity #" + std::to_string(id));
+                    runtimeSession->SetEditorStatus("Deleted hierarchy entity #" + std::to_string(id));
                     Tracenf("[HIERARCHY] Deleted entity: id=%u type=%d", id, static_cast<int>(type));
                 };
                 auto duplicateHierarchyEntity = [&](HierarchyEntityType type, std::uint32_t id) {
@@ -2430,7 +2339,7 @@ int RunGame(NativeWindow& window,
                         SceneManager::Instance().MarkDirty();
                         Tracenf("[HIERARCHY] Duplicated entity: original=%u new=%u", id, copy.id);
                     }
-                    gameClient.SetEditorStatus("Duplicated hierarchy entity #" + std::to_string(id));
+                    runtimeSession->SetEditorStatus("Duplicated hierarchy entity #" + std::to_string(id));
                 };
                 auto renameHierarchyEntity = [&](HierarchyEntityType type, std::uint32_t id, const std::string& name) {
                     if (name.empty())
@@ -2457,7 +2366,7 @@ int RunGame(NativeWindow& window,
                             it->name = name;
                     }
                     SceneManager::Instance().MarkDirty();
-                    gameClient.SetEditorStatus("Renamed hierarchy entity #" + std::to_string(id));
+                    runtimeSession->SetEditorStatus("Renamed hierarchy entity #" + std::to_string(id));
                     Tracenf("[HIERARCHY] Renamed entity: id=%u new_name=%s", id, name.c_str());
                 };
                 auto toggleHierarchyHidden = [&](HierarchyEntityType type, std::uint32_t id) {
@@ -2494,7 +2403,7 @@ int RunGame(NativeWindow& window,
                         }
                     }
                     SceneManager::Instance().MarkDirty();
-                    gameClient.SetEditorStatus(std::string(hidden ? "Hidden" : "Shown") + " hierarchy entity #" + std::to_string(id));
+                    runtimeSession->SetEditorStatus(std::string(hidden ? "Hidden" : "Shown") + " hierarchy entity #" + std::to_string(id));
                     Tracenf("[HIERARCHY] Toggled editor-visibility: id=%u hidden=%d", id, hidden ? 1 : 0);
                 };
 #if defined(IXTREEME_WITH_EDITOR)
@@ -2533,6 +2442,7 @@ int RunGame(NativeWindow& window,
                     editorWaterBodiesDirty = true;
                     terrain.SetWaterSculptBrush(false, 0.0f, 0.0f, 0.0f, true);
                     cameraController.SetEditorFlyMode(false);
+                    runtimeSession->Start(SceneManager::Instance().GetCurrentScene());
                     editorRuntimeFlowActive = true;
                     SceneManager::Instance().ActivateCurrentSceneType();
                     if ((playSceneType == "world" || playSceneType == "gameplay") && !hasOwnRuntimeCharacter())
@@ -2550,11 +2460,8 @@ int RunGame(NativeWindow& window,
                         editorPlay.state.elapsedSeconds,
                         editorPlay.state.frameCount);
                     editorRuntimeFlowActive = false;
-                    rmlUi.HideAll();
-                    if (gameClient.IsLocalPlayMode())
-                        gameClient.ExitLocalPlayMode();
-                    else if (gameClient.IsInWorld() || gameClient.IsLobbyActive())
-                        gameClient.LogoutToLogin();
+                    runtimeUi->HideAll();
+                    runtimeSession->Stop();
                     editorWaterBodiesDirty = true;
                     if (editorPlay.playStartSceneWasOpen)
                     {
@@ -2591,6 +2498,8 @@ int RunGame(NativeWindow& window,
                 }
                 if (editorPlay.state.mode != EditorPlayMode::Edit)
                 {
+                    if (editorPlay.state.mode == EditorPlayMode::Play)
+                        runtimeSession->Tick(deltaSeconds);
                     commands.addWaterBody = false;
                     commands.addPointLight = false;
                     commands.addSpotLight = false;
@@ -2638,7 +2547,7 @@ int RunGame(NativeWindow& window,
                     editorGizmoMode = EditorGizmoMode::Translate;
                     editorWaterBodiesDirty = true;
                     SceneManager::Instance().MarkDirty();
-                    gameClient.SetEditorStatus("Water body spawned: id=" + std::to_string(body.id) +
+                    runtimeSession->SetEditorStatus("Water body spawned: id=" + std::to_string(body.id) +
                         " name=" + body.name);
                     Tracenf("[EDITOR-3D-SPAWN] Spawn at cursor: type=water position=(%.2f,%.2f,%.2f)",
                         spawn.x, spawn.y, spawn.z);
@@ -2647,7 +2556,7 @@ int RunGame(NativeWindow& window,
                 {
                     if (editorPointLights.size() >= kMaxDynamicPointLights)
                     {
-                        gameClient.SetEditorStatus("Maximum point lights reached (16)");
+                        runtimeSession->SetEditorStatus("Maximum point lights reached (16)");
                     }
                     else
                     {
@@ -2662,7 +2571,7 @@ int RunGame(NativeWindow& window,
                         selectedEditorObject = {SelectedEditorObjectType::PointLight, light.id};
                         editorGizmoMode = EditorGizmoMode::Translate;
                         SceneManager::Instance().MarkDirty();
-                        gameClient.SetEditorStatus("Added point light #" + std::to_string(light.id));
+                        runtimeSession->SetEditorStatus("Added point light #" + std::to_string(light.id));
                         Tracenf("[EDITOR-3D-SPAWN] Spawn at cursor: type=point_light position=(%.2f,%.2f,%.2f)",
                             spawn.x, spawn.y, spawn.z);
                     }
@@ -2671,7 +2580,7 @@ int RunGame(NativeWindow& window,
                 {
                     if (editorSpotLights.size() >= kMaxDynamicSpotLights)
                     {
-                        gameClient.SetEditorStatus("Maximum spot lights reached (16)");
+                        runtimeSession->SetEditorStatus("Maximum spot lights reached (16)");
                     }
                     else
                     {
@@ -2687,7 +2596,7 @@ int RunGame(NativeWindow& window,
                         selectedEditorObject = {SelectedEditorObjectType::SpotLight, light.id};
                         editorGizmoMode = EditorGizmoMode::Translate;
                         SceneManager::Instance().MarkDirty();
-                        gameClient.SetEditorStatus("Added spot light #" + std::to_string(light.id));
+                        runtimeSession->SetEditorStatus("Added spot light #" + std::to_string(light.id));
                         Tracenf("[EDITOR-3D-SPAWN] Spawn at cursor: type=spot_light position=(%.2f,%.2f,%.2f)",
                             spawn.x, spawn.y, spawn.z);
                     }
@@ -2726,7 +2635,7 @@ int RunGame(NativeWindow& window,
                     {
                         editorPointLights.erase(std::remove_if(editorPointLights.begin(), editorPointLights.end(),
                             [&](const PointLight& light) { return light.id == selectedEditorObject.id; }), editorPointLights.end());
-                        gameClient.SetEditorStatus("Deleted point light #" + std::to_string(selectedEditorObject.id));
+                        runtimeSession->SetEditorStatus("Deleted point light #" + std::to_string(selectedEditorObject.id));
                         selectedEditorObject = {};
                         SceneManager::Instance().MarkDirty();
                     }
@@ -2734,7 +2643,7 @@ int RunGame(NativeWindow& window,
                     {
                         editorSpotLights.erase(std::remove_if(editorSpotLights.begin(), editorSpotLights.end(),
                             [&](const SpotLight& light) { return light.id == selectedEditorObject.id; }), editorSpotLights.end());
-                        gameClient.SetEditorStatus("Deleted spot light #" + std::to_string(selectedEditorObject.id));
+                        runtimeSession->SetEditorStatus("Deleted spot light #" + std::to_string(selectedEditorObject.id));
                         selectedEditorObject = {};
                         SceneManager::Instance().MarkDirty();
                     }
@@ -2757,7 +2666,7 @@ int RunGame(NativeWindow& window,
                         ? std::string("watermat_Default_Water")
                         : commands.selectedWaterBody.materialId;
                     if (editorImGui.OpenWaterMaterialEditor(materialId))
-                        gameClient.SetEditorStatus("Editing water material: " + materialId);
+                        runtimeSession->SetEditorStatus("Editing water material: " + materialId);
                 }
                 if (commands.waterMaterialDeleted)
                 {
@@ -2777,7 +2686,7 @@ int RunGame(NativeWindow& window,
                         if (selectedIt != editorWaterBodies.end() &&
                             selectedIt->materialId == "watermat_Default_Water")
                         {
-                            gameClient.SetEditorStatus("Deleted material replaced with default on selected water body");
+                            runtimeSession->SetEditorStatus("Deleted material replaced with default on selected water body");
                         }
                     }
                 }
@@ -2786,7 +2695,7 @@ int RunGame(NativeWindow& window,
                 {
                     editorWaterBodies.erase(std::remove_if(editorWaterBodies.begin(), editorWaterBodies.end(),
                         [&](const WaterBody& body) { return body.id == selectedEditorObject.id; }), editorWaterBodies.end());
-                    gameClient.SetEditorStatus("Water body deleted: id=" + std::to_string(selectedEditorObject.id));
+                    runtimeSession->SetEditorStatus("Water body deleted: id=" + std::to_string(selectedEditorObject.id));
                     selectedEditorObject = {};
                     editorWaterBodiesDirty = true;
                     SceneManager::Instance().MarkDirty();
@@ -2820,7 +2729,7 @@ int RunGame(NativeWindow& window,
                 editorImGui.SetDynamicLightEditorState(dynamicLightState);
                 WaterBodyEditorState waterBodyState = BuildWaterBodyEditorState(editorWaterBodies,
                     selectedEditorObject.type == SelectedEditorObjectType::WaterBody ? selectedEditorObject.id : 0u);
-                gameClient.SetWaterBodyEditorState(waterBodyState);
+                runtimeSession->SetWaterBodyEditorState(waterBodyState);
                 editorImGui.SetWaterBodyEditorState(waterBodyState);
                 editorImGui.SetHierarchySceneState(editorWaterBodies, editorPointLights, editorSpotLights);
 
@@ -2950,9 +2859,9 @@ int RunGame(NativeWindow& window,
             size_t frameSceneEntityCount = 0;
 #if defined(IXTREEME_WITH_EDITOR)
             editorImGui.SetEditorPlayModeState(editorPlay.state);
-            editorImGui.BeginFrame(gameClient.IsMapEditorOpen());
+            editorImGui.BeginFrame(runtimeSession->IsMapEditorOpen());
 #endif
-            const bool isInWorld = gameClient.IsInWorld();
+            const bool isInWorld = runtimeSession->IsInWorld();
             std::vector<WorldRenderEntity> entities;
             WorldCamera camera{};
 
@@ -2975,7 +2884,7 @@ int RunGame(NativeWindow& window,
                             static_cast<float>(seconds));
                         ++skinSlot;
                     }
-                    if (gameClient.IsMapEditorOpen())
+                    if (runtimeSession->IsMapEditorOpen())
                     {
                         const size_t editorVisualRenderCount =
                             editorPointLights.size() + editorSpotLights.size();
@@ -2992,7 +2901,7 @@ int RunGame(NativeWindow& window,
                     }
                 }
             }
-            else if (gameClient.IsLobbyActive() && warriorOk)
+            else if (runtimeSession->IsLobbyActive() && warriorOk)
             {
                 warrior.Skin(device, seconds);
             }
@@ -3036,7 +2945,7 @@ int RunGame(NativeWindow& window,
                             ++skinSlot;
                         }
 
-                        if (gameClient.IsMapEditorOpen())
+                        if (runtimeSession->IsMapEditorOpen())
                         {
                             for (const auto& light : editorPointLights)
                             {
@@ -3151,7 +3060,7 @@ int RunGame(NativeWindow& window,
                         entity.netId == selectedTargetNetId});
                     ++skinSlot;
                 }
-                if (warriorOk && gameClient.IsMapEditorOpen())
+                if (warriorOk && runtimeSession->IsMapEditorOpen())
                 {
                     for (const auto& light : editorPointLights)
                     {
@@ -3221,7 +3130,7 @@ int RunGame(NativeWindow& window,
                 if (!useOffscreenScene && nameplatesOk)
                     nameplates.Render(device, camera, plates);
             }
-            else if (gameClient.IsLobbyActive() && warriorOk)
+            else if (runtimeSession->IsLobbyActive() && warriorOk)
             {
                 frameSceneRenderCalled = true;
                 frameSceneEntityCount = 1;
@@ -3265,8 +3174,8 @@ int RunGame(NativeWindow& window,
                     frameSceneRenderCalled ? "yes" : "no",
                     frameSceneEntityCount,
                     isInWorld ? 1 : 0,
-                    gameClient.IsLobbyActive() ? 1 : 0,
-                    gameClient.IsMapEditorOpen() ? 1 : 0,
+                    runtimeSession->IsLobbyActive() ? 1 : 0,
+                    runtimeSession->IsMapEditorOpen() ? 1 : 0,
                     renderSize.width,
                     renderSize.height);
             }
@@ -3286,7 +3195,6 @@ int RunGame(NativeWindow& window,
     }
 
     device.WaitIdle();
-    clientSession.Disconnect();
     if (nameplatesOk)
         nameplates.Destroy();
     if (offscreenSceneOk)
@@ -3303,7 +3211,7 @@ int RunGame(NativeWindow& window,
 #endif
 #endif
     rmlUi.Destroy();
-    gameClient.Destroy();
+    runtimeSession->Destroy();
     device.Destroy();
     return 0;
 }
