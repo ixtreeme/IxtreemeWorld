@@ -154,6 +154,12 @@ void NativeWindow_Win32::RequestClose()
     PostQuitMessage(0);
 }
 
+void NativeWindow_Win32::SetTitle(const std::string& title)
+{
+    if (m_hwnd)
+        SetWindowTextA(m_hwnd, title.c_str());
+}
+
 void NativeWindow_Win32::SetInputCallback(InputCallback cb)
 {
     m_inputCallback = std::move(cb);

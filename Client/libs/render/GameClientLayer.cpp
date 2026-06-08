@@ -203,6 +203,7 @@ bool GameClientLayer::IsInGameMenuOpen() const { return m_impl && m_impl->inGame
 bool GameClientLayer::IsMapEditorOpen() const { return m_impl && m_impl->mapEditorOpen; }
 void GameClientLayer::ToggleInGameMenu() { if (m_impl) m_impl->inGameMenuOpen = !m_impl->inGameMenuOpen; }
 bool GameClientLayer::LoadMapEditorView(uint32_t, uint32_t) { return true; }
+void GameClientLayer::SetMapEditorOpen(bool open) { if (m_impl) m_impl->mapEditorOpen = open; }
 void GameClientLayer::ToggleMapEditor() { if (m_impl) m_impl->mapEditorOpen = !m_impl->mapEditorOpen; }
 void GameClientLayer::ClearKeyboardFocus() {}
 bool GameClientLayer::IsTextInputFocused() const { return false; }

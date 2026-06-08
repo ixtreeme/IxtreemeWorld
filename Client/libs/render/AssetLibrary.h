@@ -78,6 +78,7 @@ public:
     };
 
     explicit AssetLibrary(std::filesystem::path clientRoot);
+    AssetLibrary(std::filesystem::path clientRoot, std::filesystem::path libraryRoot);
 
     bool Initialize();
     const std::vector<Entry>& Entries() const { return m_entries; }

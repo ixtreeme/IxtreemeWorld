@@ -778,6 +778,12 @@ AssetLibrary::AssetLibrary(std::filesystem::path clientRoot)
 {
 }
 
+AssetLibrary::AssetLibrary(std::filesystem::path clientRoot, std::filesystem::path libraryRoot)
+    : m_clientRoot(std::move(clientRoot))
+    , m_libraryRoot(std::move(libraryRoot))
+{
+}
+
 bool AssetLibrary::Initialize()
 {
     if (!EnsureDirectories())

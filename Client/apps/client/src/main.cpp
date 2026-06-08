@@ -15,6 +15,7 @@
 #include "GameClientLayer.h"
 #include "OffscreenSceneRenderer.h"
 #include "RmlUiLayer.h"
+#include "SceneManager.h"
 #include "TerrainRenderer.h"
 #include "VulkanDevice.h"
 #include "WarriorRenderer.h"
@@ -38,6 +39,8 @@
 #include <cstdio>
 #include <cstdint>
 #include <cstdlib>
+#include <filesystem>
+#include <functional>
 #include <optional>
 #include <string>
 #include <type_traits>
@@ -213,6 +216,8 @@ std::optional<std::uint32_t> PickDynamicLight(const std::vector<LightT>& lights,
     float bestT = 1000000.0f;
     for (const LightT& light : lights)
     {
+        if (light.editorHidden)
+            continue;
         const WorldVec3 position{light.position[0], light.position[1], light.position[2]};
         const WorldVec3 toLight = WorldSub(position, camera.eye);
         const float t = WorldDot(toLight, rayDir);
@@ -324,6 +329,8 @@ std::optional<std::uint32_t> PickWaterBody(const std::vector<WaterBody>& bodies,
     float bestT = 1000000.0f;
     for (const WaterBody& body : bodies)
     {
+        if (body.editorHidden)
+            continue;
         if (!body.config.enabled || body.maskWidth == 0 || body.maskHeight == 0 ||
             body.shapeMask.size() != static_cast<std::size_t>(body.maskWidth) * body.maskHeight)
         {
@@ -799,6 +806,25 @@ public:
         dragActive_ = false;
     }
 
+    void FocusOn(WorldVec3 target, float distance = 15.0f)
+    {
+        flyMode_ = true;
+        const WorldVec3 eye = {target.x, target.y + 5.0f, target.z - distance};
+        const WorldVec3 forward = WorldNormalize(WorldSub(target, eye));
+        flyEye_ = eye;
+        lastEye_ = eye;
+        flyYaw_ = std::atan2(forward.x, forward.z);
+        flyPitch_ = std::clamp(std::asin(std::clamp(forward.y, -1.0f, 1.0f)), -kMaxPitch, kMaxPitch);
+        yaw_ = flyYaw_;
+        pitch_ = flyPitch_;
+        distance_ = std::clamp(distance, kMinDistance, kMaxDistance);
+        yawVelocity_ = 0.0f;
+        pitchVelocity_ = 0.0f;
+        zoomVelocity_ = 0.0f;
+        dragActive_ = false;
+        Tracenf("[HIERARCHY] Focused camera on target: %.2f, %.2f, %.2f", target.x, target.y, target.z);
+    }
+
 private:
     static constexpr float kMaxPitch = 80.0f * 3.1415926535f / 180.0f;
     static constexpr float kMinDistance = 4.0f;
@@ -891,6 +917,114 @@ std::string ExecutableDirectory()
 #endif
 }
 
+std::optional<std::string> ExtractJsonStringField(const std::string& text, const char* key)
+{
+    const std::string quotedKey = "\"" + std::string(key) + "\"";
+    size_t keyPos = text.find(quotedKey);
+    if (keyPos == std::string::npos)
+        return std::nullopt;
+    size_t colon = text.find(':', keyPos + quotedKey.size());
+    if (colon == std::string::npos)
+        return std::nullopt;
+    size_t valueStart = text.find('"', colon + 1);
+    if (valueStart == std::string::npos)
+        return std::nullopt;
+    ++valueStart;
+
+    std::string value;
+    bool escaped = false;
+    for (size_t i = valueStart; i < text.size(); ++i)
+    {
+        const char ch = text[i];
+        if (escaped)
+        {
+            value.push_back(ch);
+            escaped = false;
+            continue;
+        }
+        if (ch == '\\')
+        {
+            escaped = true;
+            continue;
+        }
+        if (ch == '"')
+            return value;
+        value.push_back(ch);
+    }
+    return std::nullopt;
+}
+
+std::string StartupSceneFromConfig(const client::asset::IAssetReader& assets)
+{
+    constexpr const char* kFallbackStartupScene = "scenes/Login.scene";
+    if (auto root = assets.RootPath())
+    {
+        Tracenf("[BOOT] config probe: %s",
+            (*root / "assets" / "app_config.json").string().c_str());
+        Tracenf("[BOOT] config probe: %s",
+            (*root / "app_config.json").string().c_str());
+    }
+    std::optional<std::string> configText = assets.ReadText("assets/app_config.json");
+    const char* configSource = "assets/app_config.json";
+    if (!configText)
+    {
+        configText = assets.ReadText("app_config.json");
+        configSource = "app_config.json";
+    }
+    if (!configText)
+    {
+        Tracenf("[BOOT] config missing/empty -> fallback = %s", kFallbackStartupScene);
+        return kFallbackStartupScene;
+    }
+
+    if (auto root = assets.RootPath())
+        Tracenf("[BOOT] config loaded: %s", (*root / configSource).string().c_str());
+    else
+        Tracenf("[BOOT] config loaded: %s", configSource);
+
+    if (std::optional<std::string> startupScene = ExtractJsonStringField(*configText, "startup_scene");
+        startupScene && !startupScene->empty())
+    {
+        Tracenf("[BOOT] startup_scene = %s", startupScene->c_str());
+        return *startupScene;
+    }
+
+    Tracenf("[BOOT] config missing/empty -> fallback = %s", kFallbackStartupScene);
+    return kFallbackStartupScene;
+}
+
+std::filesystem::path ResolveRuntimeScenePath(const client::asset::IAssetReader& assets, const std::string& sceneAssetPath)
+{
+    std::filesystem::path requested(sceneAssetPath);
+    if (requested.is_absolute() && std::filesystem::exists(requested))
+        return requested;
+
+    if (auto root = assets.RootPath())
+    {
+        const std::filesystem::path assetRelative = *root / "assets" / requested;
+        if (std::filesystem::exists(assetRelative))
+            return assetRelative;
+        const std::filesystem::path rootRelative = *root / requested;
+        if (std::filesystem::exists(rootRelative))
+            return rootRelative;
+        return assetRelative;
+    }
+
+    return requested;
+}
+
+bool LoadRuntimeScene(client::asset::IAssetReader& assets, const std::string& sceneAssetPath)
+{
+    const std::filesystem::path scenePath = ResolveRuntimeScenePath(assets, sceneAssetPath);
+    Tracenf("[BOOT] runtime scene request: %s", sceneAssetPath.c_str());
+    Tracenf("[SCENE] load attempt: %s",
+        scenePath.string().c_str());
+    Tracenf("[SCENE-RUNTIME] Request load: %s -> %s",
+        sceneAssetPath.c_str(),
+        scenePath.string().c_str());
+    return SceneManager::Instance().LoadScene(scenePath.string());
+}
+
 void MergeMapEditorCommands(MapEditorCommands& target, const MapEditorCommands& source)
 {
     target.save = target.save || source.save;
@@ -922,6 +1056,43 @@ void MergeMapEditorCommands(MapEditorCommands& target, const MapEditorCommands& 
         target.selectedLightChanged = true;
         target.selectedLight = source.selectedLight;
     }
+    if (source.hierarchySelectEntity)
+    {
+        target.hierarchySelectEntity = true;
+        target.hierarchyEntityType = source.hierarchyEntityType;
+        target.hierarchyEntityId = source.hierarchyEntityId;
+    }
+    if (source.hierarchyFocusEntity)
+    {
+        target.hierarchyFocusEntity = true;
+        target.hierarchyEntityType = source.hierarchyEntityType;
+        target.hierarchyEntityId = source.hierarchyEntityId;
+    }
+    if (source.hierarchyDeleteEntity)
+    {
+        target.hierarchyDeleteEntity = true;
+        target.hierarchyEntityType = source.hierarchyEntityType;
+        target.hierarchyEntityId = source.hierarchyEntityId;
+    }
+    if (source.hierarchyDuplicateEntity)
+    {
+        target.hierarchyDuplicateEntity = true;
+        target.hierarchyEntityType = source.hierarchyEntityType;
+        target.hierarchyEntityId = source.hierarchyEntityId;
+    }
+    if (source.hierarchyRenameEntity)
+    {
+        target.hierarchyRenameEntity = true;
+        target.hierarchyEntityType = source.hierarchyEntityType;
+        target.hierarchyEntityId = source.hierarchyEntityId;
+        target.hierarchyRenameValue = source.hierarchyRenameValue;
+    }
+    if (source.hierarchyToggleHidden)
+    {
+        target.hierarchyToggleHidden = true;
+        target.hierarchyEntityType = source.hierarchyEntityType;
+        target.hierarchyEntityId = source.hierarchyEntityId;
+    }
     if (source.paletteSlotChanged)
     {
         target.paletteSlotChanged = true;
@@ -944,6 +1115,11 @@ struct EditorPlayRuntime
     EditorPlayModeState state;
     EditorPlayMode appliedMode = EditorPlayMode::Edit;
     std::optional<CameraController::Snapshot> editorCameraSnapshot;
+    std::string playStartScenePath;
+    SceneData playStartSceneSnapshot;
+    bool playStartSceneWasOpen = false;
+    bool playStartSceneDirty = false;
+    bool directGameplayDevCharacter = false;
     client::net::Vec3 playerPosition{};
     std::uint16_t playerHeading = 0;
 };
@@ -960,12 +1136,18 @@ int RunGame(NativeWindow& window,
     }
 #if defined(IXTREEME_WITH_EDITOR)
     Tracen("[BUILD] Editor: ENABLED");
+    Tracen("[BOOT] build = EDITOR");
+    Tracen("[BOOT] entry state = editor boot, editor UI available, no startup scene auto-load");
 #else
     Tracen("[BUILD] Editor: DISABLED");
+    Tracen("[BOOT] build = RELEASE");
+    Tracen("[BOOT] entry state = release boot, loading startup_scene from app_config");
 #endif
+    Tracenf("[BOOT] window size = %ux%u", window.GetWidth(), window.GetHeight());
 
     GameClientLayer gameClient;
     VkExtent2D renderSize = device.GetSwapchainExtent();
+    Tracenf("[BOOT] swapchain size = %ux%u", renderSize.width, renderSize.height);
     if (!gameClient.Create(device, assets, renderSize.width, renderSize.height))
     {
         ShowFatal("Failed to create gameClient layer. See debug output/stderr.");
@@ -984,17 +1166,88 @@ int RunGame(NativeWindow& window,
         device.Destroy();
         return 1;
     }
+#if defined(IXTREEME_WITH_EDITOR)
+    bool editorRuntimeFlowActive = false;
+#endif
+    auto isRuntimeFlowActive = [&]() {
+#if defined(IXTREEME_WITH_EDITOR)
+        return editorRuntimeFlowActive;
+#else
+        return true;
+#endif
+    };
+    SceneManager::Instance().SetRuntimeUiCallbacks(
+        [&rmlUi]() {
+            Tracen("[UI-ROUTE] RmlUi HideAll() called");
+            rmlUi.HideAll();
+        },
+        [&rmlUi, &isRuntimeFlowActive]() {
+            if (!isRuntimeFlowActive())
+            {
+                Tracen("[UI-ROUTE] callback -> ShowLogin() suppressed (Edit mode)");
+                rmlUi.HideAll();
+                return;
+            }
+            Tracen("[UI-ROUTE] callback -> ShowLogin()");
+            rmlUi.ShowLogin();
+        },
+        [&rmlUi, &isRuntimeFlowActive]() {
+            if (!isRuntimeFlowActive())
+            {
+                Tracen("[UI-ROUTE] callback -> ShowLobby() suppressed (Edit mode)");
+                rmlUi.HideAll();
+                return;
+            }
+            Tracen("[UI-ROUTE] callback -> ShowLobby()");
+            rmlUi.ShowLobby();
+        },
+        [&rmlUi, &isRuntimeFlowActive]() {
+            if (!isRuntimeFlowActive())
+            {
+                Tracen("[UI-ROUTE] callback -> ShowHud() suppressed (Edit mode)");
+                rmlUi.HideAll();
+                return;
+            }
+            Tracen("[UI-ROUTE] callback -> ShowHud()");
+            rmlUi.ShowHud();
+        });
+#if defined(IXTREEME_WITH_EDITOR)
+    rmlUi.HideAll();
+    Tracen("[STARTUP] Editor build starts in editor-only empty scene state");
+#endif
+    auto loadRuntimeSceneOrFallback = [&assets, &isRuntimeFlowActive](const char* sceneAssetPath, std::function<void()> fallback) {
+        if (!isRuntimeFlowActive())
+        {
+            Tracenf("[SCENE-FLOW] suppressed in Edit mode: %s", sceneAssetPath);
+            return;
+        }
+        if (!LoadRuntimeScene(assets, sceneAssetPath) && fallback)
+            fallback();
+    };
     rmlUi.SetLoginSubmitCallback([&gameClient](const std::string& username,
                                             const std::string& password,
                                             bool remember) {
         gameClient.SubmitLogin(username, password, remember);
     });
     gameClient.SetLoginCallbacks(
-        [&rmlUi]() {
+        [&rmlUi, &loadRuntimeSceneOrFallback, &isRuntimeFlowActive]() {
+            if (!isRuntimeFlowActive())
+            {
+                rmlUi.HideAll();
+                return;
+            }
             rmlUi.SetLoginError("");
-            rmlUi.HideLogin();
+            loadRuntimeSceneOrFallback("scenes/Lobby.scene", [&rmlUi]() {
+                rmlUi.HideLogin();
+                rmlUi.ShowLobby();
+            });
         },
-        [&gameClient, &rmlUi](const std::string& message) {
+        [&gameClient, &rmlUi, &isRuntimeFlowActive](const std::string& message) {
+            if (!isRuntimeFlowActive())
+            {
+                rmlUi.HideAll();
+                return;
+            }
             if (!gameClient.IsLobbyActive() && !gameClient.IsInWorld())
                 rmlUi.ShowLogin();
             rmlUi.SetLoginError(message);
@@ -1009,13 +1262,20 @@ int RunGame(NativeWindow& window,
         [&rmlUi](std::uint64_t) {
             rmlUi.SetLobbyStatus("Character delete is not available yet");
         },
-        [&gameClient, &rmlUi]() {
+        [&gameClient, &rmlUi, &loadRuntimeSceneOrFallback]() {
             gameClient.LogoutToLogin();
-            rmlUi.HideLobby();
-            rmlUi.ShowLogin();
+            loadRuntimeSceneOrFallback("scenes/Login.scene", [&rmlUi]() {
+                rmlUi.HideLobby();
+                rmlUi.ShowLogin();
+            });
         });
     gameClient.SetLobbyCallbacks(
-        [&rmlUi]() {
+        [&rmlUi, &isRuntimeFlowActive]() {
+            if (!isRuntimeFlowActive())
+            {
+                rmlUi.HideAll();
+                return;
+            }
             rmlUi.ShowLobby();
         },
         [&rmlUi](const std::vector<client::net::CharacterListItem>& characters) {
@@ -1024,19 +1284,33 @@ int RunGame(NativeWindow& window,
         [&rmlUi](const std::string& message) {
             rmlUi.SetLobbyStatus(message);
         },
-        [&rmlUi]() {
-            rmlUi.HideLobby();
-            rmlUi.ShowHud();
+        [&rmlUi, &loadRuntimeSceneOrFallback, &isRuntimeFlowActive]() {
+            if (!isRuntimeFlowActive())
+            {
+                rmlUi.HideAll();
+                return;
+            }
+            loadRuntimeSceneOrFallback("scenes/World.scene", [&rmlUi]() {
+                rmlUi.HideLobby();
+                rmlUi.ShowHud();
+            });
         });
     rmlUi.SetInGameMenuCallbacks(
         []() {},
-        [&gameClient, &rmlUi]() {
+        [&gameClient, &rmlUi, &loadRuntimeSceneOrFallback, &isRuntimeFlowActive]() {
             gameClient.LogoutToLogin();
-            rmlUi.HideHud();
-            rmlUi.HideInventory();
-            rmlUi.HideSettings();
-            rmlUi.HideInGameMenu();
-            rmlUi.ShowLogin();
+            if (!isRuntimeFlowActive())
+            {
+                rmlUi.HideAll();
+                return;
+            }
+            loadRuntimeSceneOrFallback("scenes/Login.scene", [&rmlUi]() {
+                rmlUi.HideHud();
+                rmlUi.HideInventory();
+                rmlUi.HideSettings();
+                rmlUi.HideInGameMenu();
+                rmlUi.ShowLogin();
+            });
         },
         [&window]() {
             window.RequestClose();
@@ -1053,6 +1327,9 @@ int RunGame(NativeWindow& window,
         device.Destroy();
         return 1;
     }
+    SceneManager::Instance().SetWindowTitleCallback([&window](const std::string& title) {
+        window.SetTitle(title);
+    });
     win32Window->SetMessageCallback([&editorImGui](HWND hwnd, UINT message, WPARAM wParam, LPARAM lParam, LRESULT& result)
     {
         return editorImGui.HandleWin32Message(hwnd, message, wParam, lParam, result);
@@ -1065,11 +1342,16 @@ int RunGame(NativeWindow& window,
         device.Destroy();
         return 1;
     }
+    SceneManager::Instance().SetWindowTitleCallback([&window](const std::string& title) {
+        window.SetTitle(title);
+    });
 #endif
     editorImGui.SetMapEditorSettings(gameClient.GetMapEditorSettings());
     editorImGui.SetLightingState(gameClient.GetLightingState());
     if (auto assetRoot = assets.RootPath())
-        editorImGui.InitializeAssetLibrary(*assetRoot);
+        editorImGui.SetEngineRoot(*assetRoot);
+#else
+    LoadRuntimeScene(assets, StartupSceneFromConfig(assets));
 #endif
     const std::string warriorModelPath = "assets/Character/KicsiK.glb";
 
@@ -1136,6 +1418,12 @@ int RunGame(NativeWindow& window,
     CameraController cameraController;
 #if defined(IXTREEME_WITH_EDITOR)
     EditorPlayRuntime editorPlay;
+    gameClient.SetMapEditorOpen(true);
+    if (terrainOk)
+        terrain.SetMapEditorOpen(true);
+    cameraController.SetEditorFlyMode(true);
+    gameClient.SetEditorStatus("Editor opened at boot");
+    Tracen("[BOOT] editor_open forced = 1 (editor build boot)");
 #endif
     std::vector<WorldRenderEntity> lastPickEntities;
     WorldCamera lastPickCamera{};
@@ -1158,6 +1446,54 @@ int RunGame(NativeWindow& window,
     bool editorObjectDragActive = false;
     int editorObjectDragLastX = 0;
     int editorObjectDragLastY = 0;
+#if defined(IXTREEME_WITH_EDITOR)
+    auto buildSceneSnapshot = [&]() {
+        SceneData scene;
+        scene.lighting = editorImGui.GetLightingState();
+        scene.waterBodies = editorWaterBodies;
+        scene.pointLights = editorPointLights;
+        scene.spotLights = editorSpotLights;
+        scene.paletteSlots = terrainOk ? terrain.GetPaletteSlots() : gameClient.GetPaletteSlots();
+        return scene;
+    };
+    auto applySceneData = [&](const SceneData& scene) {
+        editorWaterBodies = scene.waterBodies;
+        editorPointLights = scene.pointLights;
+        editorSpotLights = scene.spotLights;
+        selectedEditorObject = {};
+        nextEditorWaterBodyId = 1;
+        for (const WaterBody& body : editorWaterBodies)
+            nextEditorWaterBodyId = std::max(nextEditorWaterBodyId, body.id + 1u);
+        nextEditorLightId = 1;
+        for (const PointLight& light : editorPointLights)
+            nextEditorLightId = std::max(nextEditorLightId, light.id + 1u);
+        for (const SpotLight& light : editorSpotLights)
+            nextEditorLightId = std::max(nextEditorLightId, light.id + 1u);
+
+        editorImGui.SetLightingState(scene.lighting);
+        gameClient.SetDynamicLightEditorState({});
+        gameClient.SetWaterBodyEditorState({});
+        if (terrainOk)
+        {
+            terrain.SetLightingState(scene.lighting);
+            terrain.SetWaterBodies(device, editorWaterBodies);
+            editorWaterBodies = terrain.GetWaterBodies();
+            if (terrain.ApplyPaletteSlots(device, scene.paletteSlots))
+                editorImGui.SetPaletteSlots(terrain.GetPaletteSlots());
+        }
+        editorWaterBodiesDirty = false;
+        Tracenf("[SCENE] Applied editor scene state: water=%zu point=%zu spot=%zu",
+            editorWaterBodies.size(),
+            editorPointLights.size(),
+            editorSpotLights.size());
+    };
+    {
+        SceneManager& scenes = SceneManager::Instance();
+        scenes.CloseScene();
+        Tracen("[SCENE] no scene loaded (editor empty state)");
+        Tracen("[STARTUP] Editor build: no automatic default.scene load");
+    }
+#endif
     bool waterSculptStrokeActive = false;
     std::uint32_t waterSculptStrokeBodyId = 0;
     std::uint32_t waterSculptStrokeModifiedCells = 0;
@@ -1214,7 +1550,10 @@ int RunGame(NativeWindow& window,
             }
             else if (editorPlay.state.mode == EditorPlayMode::Edit)
             {
-                editorPlay.state.mode = EditorPlayMode::Play;
+                if (SceneManager::Instance().HasOpenScene())
+                    editorPlay.state.mode = EditorPlayMode::Play;
+                else
+                    Tracen("[EDIT-PLAY] Play ignored: no open scene");
             }
             else
             {
@@ -1897,6 +2236,9 @@ int RunGame(NativeWindow& window,
                 terrain.SetMapEditorOpen(gameClient.IsMapEditorOpen());
                 const MapEditorSettings editorSettings = editorImGui.GetMapEditorSettings();
                 terrain.SetMapEditorSettings(editorSettings);
+                SceneData pendingScene;
+                if (SceneManager::Instance().ConsumePendingScene(pendingScene))
+                    applySceneData(pendingScene);
                 MapEditorCommands commands = gameClient.ConsumeMapEditorCommands();
                 MergeMapEditorCommands(commands, editorImGui.ConsumeCommands());
                 if (commands.gizmoSettingsChanged)
@@ -1923,9 +2265,246 @@ int RunGame(NativeWindow& window,
                     fallback.y = terrain.SampleHeight(fallback);
                     return fallback;
                 };
+                auto hasOwnRuntimeCharacter = [&]() {
+                    if (!gameClient.IsInWorld())
+                        return false;
+                    const std::uint32_t ownNetId = gameClient.GetOwnNetId();
+                    if (ownNetId == 0)
+                        return false;
+                    const std::vector<WorldRenderEntity> worldEntities = gameClient.GetWorldEntities();
+                    return std::any_of(worldEntities.begin(), worldEntities.end(), [ownNetId](const WorldRenderEntity& entity) {
+                        return entity.netId == ownNetId;
+                    });
+                };
+                auto injectDirectGameplayDevCharacter = [&]() {
+                    WorldVec3 spawn = spawnAtCameraCenter();
+                    if (terrainOk)
+                        spawn.y = terrain.SampleHeight(spawn);
+                    editorPlay.playerPosition = DisplayToServerMeters(spawn);
+                    editorPlay.playerHeading = 0;
+
+                    WorldRenderEntity player{};
+                    player.netId = 1;
+                    player.name = "DevPlayer";
+                    player.position = editorPlay.playerPosition;
+                    player.heading = editorPlay.playerHeading;
+                    player.moveState = client::net::MoveState::Idle;
+                    player.mobTypeId = 0;
+                    player.level = 50;
+                    player.hpCurrent = 1000.0f;
+                    player.hpMax = 1000.0f;
+                    player.hpDisplayed = 1000.0f;
+                    gameClient.EnterLocalPlayMode(player);
+                    selectedTargetNetId = 0;
+                    editorPlay.directGameplayDevCharacter = true;
+                    Tracen("[EDIT-PLAY-2] Direct gameplay scene Play: dev character injected");
+                };
+                auto selectHierarchyEntity = [&](HierarchyEntityType type, std::uint32_t id) {
+                    switch (type)
+                    {
+                    case HierarchyEntityType::WaterBody:
+                        selectedEditorObject = {SelectedEditorObjectType::WaterBody, id};
+                        gameClient.SetEditorStatus("Selected water body #" + std::to_string(id));
+                        break;
+                    case HierarchyEntityType::PointLight:
+                        selectedEditorObject = {SelectedEditorObjectType::PointLight, id};
+                        gameClient.SetEditorStatus("Selected point light #" + std::to_string(id));
+                        break;
+                    case HierarchyEntityType::SpotLight:
+                        selectedEditorObject = {SelectedEditorObjectType::SpotLight, id};
+                        gameClient.SetEditorStatus("Selected spot light #" + std::to_string(id));
+                        break;
+                    default:
+                        break;
+                    }
+                    Tracenf("[HIERARCHY] Selected entity: id=%u type=%d", id, static_cast<int>(type));
+                };
+                auto focusHierarchyEntity = [&](HierarchyEntityType type, std::uint32_t id) {
+                    std::optional<WorldVec3> target;
+                    if (type == HierarchyEntityType::WaterBody)
+                    {
+                        auto it = std::find_if(editorWaterBodies.begin(), editorWaterBodies.end(),
+                            [&](const WaterBody& body) { return body.id == id; });
+                        if (it != editorWaterBodies.end())
+                            target = WaterBodyCenter(*it);
+                    }
+                    else if (type == HierarchyEntityType::PointLight)
+                    {
+                        auto it = std::find_if(editorPointLights.begin(), editorPointLights.end(),
+                            [&](const PointLight& light) { return light.id == id; });
+                        if (it != editorPointLights.end())
+                            target = WorldVec3{it->position[0], it->position[1], it->position[2]};
+                    }
+                    else if (type == HierarchyEntityType::SpotLight)
+                    {
+                        auto it = std::find_if(editorSpotLights.begin(), editorSpotLights.end(),
+                            [&](const SpotLight& light) { return light.id == id; });
+                        if (it != editorSpotLights.end())
+                            target = WorldVec3{it->position[0], it->position[1], it->position[2]};
+                    }
+                    if (!target)
+                        return;
+                    cameraController.FocusOn(*target);
+                    gameClient.SetEditorStatus("Focused camera on entity #" + std::to_string(id));
+                    Tracenf("[HIERARCHY] Focused camera on entity: id=%u type=%d", id, static_cast<int>(type));
+                };
+                auto deleteHierarchyEntity = [&](HierarchyEntityType type, std::uint32_t id) {
+                    if (type == HierarchyEntityType::WaterBody)
+                    {
+                        editorWaterBodies.erase(std::remove_if(editorWaterBodies.begin(), editorWaterBodies.end(),
+                            [&](const WaterBody& body) { return body.id == id; }), editorWaterBodies.end());
+                        editorWaterBodiesDirty = true;
+                    }
+                    else if (type == HierarchyEntityType::PointLight)
+                    {
+                        editorPointLights.erase(std::remove_if(editorPointLights.begin(), editorPointLights.end(),
+                            [&](const PointLight& light) { return light.id == id; }), editorPointLights.end());
+                    }
+                    else if (type == HierarchyEntityType::SpotLight)
+                    {
+                        editorSpotLights.erase(std::remove_if(editorSpotLights.begin(), editorSpotLights.end(),
+                            [&](const SpotLight& light) { return light.id == id; }), editorSpotLights.end());
+                    }
+                    if ((type == HierarchyEntityType::WaterBody && selectedEditorObject.type == SelectedEditorObjectType::WaterBody && selectedEditorObject.id == id) ||
+                        (type == HierarchyEntityType::PointLight && selectedEditorObject.type == SelectedEditorObjectType::PointLight && selectedEditorObject.id == id) ||
+                        (type == HierarchyEntityType::SpotLight && selectedEditorObject.type == SelectedEditorObjectType::SpotLight && selectedEditorObject.id == id))
+                    {
+                        selectedEditorObject = {};
+                    }
+                    SceneManager::Instance().MarkDirty();
+                    gameClient.SetEditorStatus("Deleted hierarchy entity #" + std::to_string(id));
+                    Tracenf("[HIERARCHY] Deleted entity: id=%u type=%d", id, static_cast<int>(type));
+                };
+                auto duplicateHierarchyEntity = [&](HierarchyEntityType type, std::uint32_t id) {
+                    if (type == HierarchyEntityType::WaterBody)
+                    {
+                        auto it = std::find_if(editorWaterBodies.begin(), editorWaterBodies.end(),
+                            [&](const WaterBody& body) { return body.id == id; });
+                        if (it == editorWaterBodies.end())
+                            return;
+                        WaterBody copy = *it;
+                        copy.id = nextEditorWaterBodyId++;
+                        copy.name = (copy.name.empty() ? "Water Body" : copy.name) + " (Copy)";
+                        copy.bboxMin[0] += 5.0f;
+                        copy.bboxMax[0] += 5.0f;
+                        copy.editorHidden = false;
+                        editorWaterBodies.push_back(copy);
+                        selectedEditorObject = {SelectedEditorObjectType::WaterBody, copy.id};
+                        editorWaterBodiesDirty = true;
+                        SceneManager::Instance().MarkDirty();
+                        Tracenf("[HIERARCHY] Duplicated entity: original=%u new=%u", id, copy.id);
+                    }
+                    else if (type == HierarchyEntityType::PointLight)
+                    {
+                        if (editorPointLights.size() >= kMaxDynamicPointLights)
+                            return;
+                        auto it = std::find_if(editorPointLights.begin(), editorPointLights.end(),
+                            [&](const PointLight& light) { return light.id == id; });
+                        if (it == editorPointLights.end())
+                            return;
+                        PointLight copy = *it;
+                        copy.id = nextEditorLightId++;
+                        copy.name = (copy.name.empty() ? "Point Light" : copy.name) + " (Copy)";
+                        copy.position[0] += 5.0f;
+                        copy.editorHidden = false;
+                        editorPointLights.push_back(copy);
+                        selectedEditorObject = {SelectedEditorObjectType::PointLight, copy.id};
+                        SceneManager::Instance().MarkDirty();
+                        Tracenf("[HIERARCHY] Duplicated entity: original=%u new=%u", id, copy.id);
+                    }
+                    else if (type == HierarchyEntityType::SpotLight)
+                    {
+                        if (editorSpotLights.size() >= kMaxDynamicSpotLights)
+                            return;
+                        auto it = std::find_if(editorSpotLights.begin(), editorSpotLights.end(),
+                            [&](const SpotLight& light) { return light.id == id; });
+                        if (it == editorSpotLights.end())
+                            return;
+                        SpotLight copy = *it;
+                        copy.id = nextEditorLightId++;
+                        copy.name = (copy.name.empty() ? "Spot Light" : copy.name) + " (Copy)";
+                        copy.position[0] += 5.0f;
+                        copy.editorHidden = false;
+                        editorSpotLights.push_back(copy);
+                        selectedEditorObject = {SelectedEditorObjectType::SpotLight, copy.id};
+                        SceneManager::Instance().MarkDirty();
+                        Tracenf("[HIERARCHY] Duplicated entity: original=%u new=%u", id, copy.id);
+                    }
+                    gameClient.SetEditorStatus("Duplicated hierarchy entity #" + std::to_string(id));
+                };
+                auto renameHierarchyEntity = [&](HierarchyEntityType type, std::uint32_t id, const std::string& name) {
+                    if (name.empty())
+                        return;
+                    if (type == HierarchyEntityType::WaterBody)
+                    {
+                        auto it = std::find_if(editorWaterBodies.begin(), editorWaterBodies.end(),
+                            [&](const WaterBody& body) { return body.id == id; });
+                        if (it != editorWaterBodies.end())
+                            it->name = name;
+                    }
+                    else if (type == HierarchyEntityType::PointLight)
+                    {
+                        auto it = std::find_if(editorPointLights.begin(), editorPointLights.end(),
+                            [&](const PointLight& light) { return light.id == id; });
+                        if (it != editorPointLights.end())
+                            it->name = name;
+                    }
+                    else if (type == HierarchyEntityType::SpotLight)
+                    {
+                        auto it = std::find_if(editorSpotLights.begin(), editorSpotLights.end(),
+                            [&](const SpotLight& light) { return light.id == id; });
+                        if (it != editorSpotLights.end())
+                            it->name = name;
+                    }
+                    SceneManager::Instance().MarkDirty();
+                    gameClient.SetEditorStatus("Renamed hierarchy entity #" + std::to_string(id));
+                    Tracenf("[HIERARCHY] Renamed entity: id=%u new_name=%s", id, name.c_str());
+                };
+                auto toggleHierarchyHidden = [&](HierarchyEntityType type, std::uint32_t id) {
+                    bool hidden = false;
+                    if (type == HierarchyEntityType::WaterBody)
+                    {
+                        auto it = std::find_if(editorWaterBodies.begin(), editorWaterBodies.end(),
+                            [&](const WaterBody& body) { return body.id == id; });
+                        if (it != editorWaterBodies.end())
+                        {
+                            it->editorHidden = !it->editorHidden;
+                            hidden = it->editorHidden;
+                            editorWaterBodiesDirty = true;
+                        }
+                    }
+                    else if (type == HierarchyEntityType::PointLight)
+                    {
+                        auto it = std::find_if(editorPointLights.begin(), editorPointLights.end(),
+                            [&](const PointLight& light) { return light.id == id; });
+                        if (it != editorPointLights.end())
+                        {
+                            it->editorHidden = !it->editorHidden;
+                            hidden = it->editorHidden;
+                        }
+                    }
+                    else if (type == HierarchyEntityType::SpotLight)
+                    {
+                        auto it = std::find_if(editorSpotLights.begin(), editorSpotLights.end(),
+                            [&](const SpotLight& light) { return light.id == id; });
+                        if (it != editorSpotLights.end())
+                        {
+                            it->editorHidden = !it->editorHidden;
+                            hidden = it->editorHidden;
+                        }
+                    }
+                    SceneManager::Instance().MarkDirty();
+                    gameClient.SetEditorStatus(std::string(hidden ? "Hidden" : "Shown") + " hierarchy entity #" + std::to_string(id));
+                    Tracenf("[HIERARCHY] Toggled editor-visibility: id=%u hidden=%d", id, hidden ? 1 : 0);
+                };
 #if defined(IXTREEME_WITH_EDITOR)
                 if (commands.enterPlayMode)
-                    editorPlay.state.mode = EditorPlayMode::Play;
+                {
+                    if (SceneManager::Instance().HasOpenScene())
+                        editorPlay.state.mode = EditorPlayMode::Play;
+                    else
+                        Tracen("[EDIT-PLAY] Play ignored: no open scene");
+                }
                 if (commands.exitPlayMode)
                     editorPlay.state.mode = EditorPlayMode::Edit;
                 if (commands.pausePlayMode && editorPlay.state.mode == EditorPlayMode::Play)
@@ -1937,38 +2516,31 @@ int RunGame(NativeWindow& window,
                     editorPlay.state.mode != EditorPlayMode::Edit)
                 {
                     Tracen("[EDIT-PLAY] Entering Play Mode");
+                    SceneManager::Instance().SetCurrentSceneSnapshot(buildSceneSnapshot());
+                    editorPlay.playStartSceneWasOpen = SceneManager::Instance().HasOpenScene();
+                    editorPlay.playStartSceneDirty = SceneManager::Instance().IsDirty();
+                    editorPlay.playStartSceneSnapshot = SceneManager::Instance().GetCurrentScene();
+                    editorPlay.playStartScenePath = SceneManager::Instance().GetCurrentScenePath();
+                    const std::string playSceneType = SceneManager::Instance().GetCurrentSceneType();
+                    Tracenf("[EDIT-PLAY] Play Mode: starting scene = %s scene_type=%s",
+                        editorPlay.playStartScenePath.empty() ? "<unsaved>" : editorPlay.playStartScenePath.c_str(),
+                        playSceneType.c_str());
                     editorPlay.editorCameraSnapshot = cameraController.SaveSnapshot();
+                    editorPlay.directGameplayDevCharacter = false;
                     selectedEditorObject = {};
                     editorObjectDragActive = false;
                     waterSculptStrokeActive = false;
+                    editorWaterBodiesDirty = true;
                     terrain.SetWaterSculptBrush(false, 0.0f, 0.0f, 0.0f, true);
                     cameraController.SetEditorFlyMode(false);
-
-                    WorldVec3 spawn = spawnAtCameraCenter();
-                    if (terrainOk)
-                        spawn.y = terrain.SampleHeight(spawn);
-                    editorPlay.playerPosition = DisplayToServerMeters(spawn);
-                    editorPlay.playerHeading = 0;
-
-                    WorldRenderEntity player{};
-                    player.netId = 1;
-                    player.name = "TestPlayer";
-                    player.position = editorPlay.playerPosition;
-                    player.heading = editorPlay.playerHeading;
-                    player.moveState = client::net::MoveState::Idle;
-                    player.mobTypeId = 0;
-                    player.level = 50;
-                    player.hpCurrent = 1000.0f;
-                    player.hpMax = 1000.0f;
-                    player.hpDisplayed = 1000.0f;
-                    gameClient.EnterLocalPlayMode(player);
-                    rmlUi.HideLobby();
-                    rmlUi.ShowHud();
-                    selectedTargetNetId = 0;
+                    editorRuntimeFlowActive = true;
+                    SceneManager::Instance().ActivateCurrentSceneType();
+                    if ((playSceneType == "world" || playSceneType == "gameplay") && !hasOwnRuntimeCharacter())
+                        injectDirectGameplayDevCharacter();
                     editorPlay.state.frameCount = 0;
                     editorPlay.state.elapsedSeconds = 0.0;
                     editorPlay.appliedMode = editorPlay.state.mode;
-                    Tracen("[EDIT-PLAY] Embedded server started: local in-process play session");
+                    Tracen("[EDIT-PLAY-2] Runtime UI/scene flow enabled for Play mode");
                     Tracen("[EDIT-PLAY] Play Mode active");
                 }
                 else if (editorPlay.appliedMode != EditorPlayMode::Edit &&
@@ -1977,11 +2549,26 @@ int RunGame(NativeWindow& window,
                     Tracenf("[EDIT-PLAY] Exiting Play Mode (after %.1fs, %d frames)",
                         editorPlay.state.elapsedSeconds,
                         editorPlay.state.frameCount);
-                    rmlUi.HideHud();
-                    rmlUi.HideInventory();
-                    rmlUi.HideSettings();
-                    rmlUi.HideInGameMenu();
-                    gameClient.ExitLocalPlayMode();
+                    editorRuntimeFlowActive = false;
+                    rmlUi.HideAll();
+                    if (gameClient.IsLocalPlayMode())
+                        gameClient.ExitLocalPlayMode();
+                    else if (gameClient.IsInWorld() || gameClient.IsLobbyActive())
+                        gameClient.LogoutToLogin();
+                    editorWaterBodiesDirty = true;
+                    if (editorPlay.playStartSceneWasOpen)
+                    {
+                        SceneManager::Instance().RestoreSceneSnapshot(
+                            editorPlay.playStartSceneSnapshot,
+                            editorPlay.playStartScenePath,
+                            editorPlay.playStartSceneDirty);
+                        Tracenf("[EDIT-PLAY] Restored starting scene: %s",
+                            editorPlay.playStartScenePath.empty() ? "<unsaved>" : editorPlay.playStartScenePath.c_str());
+                    }
+                    editorPlay.playStartScenePath.clear();
+                    editorPlay.playStartSceneWasOpen = false;
+                    editorPlay.playStartSceneDirty = false;
+                    editorPlay.directGameplayDevCharacter = false;
                     if (editorPlay.editorCameraSnapshot)
                     {
                         cameraController.RestoreSnapshot(*editorPlay.editorCameraSnapshot);
@@ -2011,12 +2598,28 @@ int RunGame(NativeWindow& window,
                     commands.deleteSelectedWaterBody = false;
                     commands.selectedLightChanged = false;
                     commands.selectedWaterBodyChanged = false;
+                    commands.hierarchyDeleteEntity = false;
+                    commands.hierarchyDuplicateEntity = false;
+                    commands.hierarchyRenameEntity = false;
+                    commands.hierarchyToggleHidden = false;
                     commands.paletteSlotChanged = false;
                     commands.save = false;
                     commands.reload = false;
                     commands.undo = false;
                 }
 #endif
+                if (commands.hierarchySelectEntity)
+                    selectHierarchyEntity(commands.hierarchyEntityType, commands.hierarchyEntityId);
+                if (commands.hierarchyFocusEntity)
+                    focusHierarchyEntity(commands.hierarchyEntityType, commands.hierarchyEntityId);
+                if (commands.hierarchyDeleteEntity)
+                    deleteHierarchyEntity(commands.hierarchyEntityType, commands.hierarchyEntityId);
+                if (commands.hierarchyDuplicateEntity)
+                    duplicateHierarchyEntity(commands.hierarchyEntityType, commands.hierarchyEntityId);
+                if (commands.hierarchyRenameEntity)
+                    renameHierarchyEntity(commands.hierarchyEntityType, commands.hierarchyEntityId, commands.hierarchyRenameValue);
+                if (commands.hierarchyToggleHidden)
+                    toggleHierarchyHidden(commands.hierarchyEntityType, commands.hierarchyEntityId);
                 if (commands.addWaterBody)
                 {
                     const WorldVec3 spawn = spawnAtCameraCenter();
@@ -2034,6 +2637,7 @@ int RunGame(NativeWindow& window,
                     selectedEditorObject = {SelectedEditorObjectType::WaterBody, body.id};
                     editorGizmoMode = EditorGizmoMode::Translate;
                     editorWaterBodiesDirty = true;
+                    SceneManager::Instance().MarkDirty();
                     gameClient.SetEditorStatus("Water body spawned: id=" + std::to_string(body.id) +
                         " name=" + body.name);
                     Tracenf("[EDITOR-3D-SPAWN] Spawn at cursor: type=water position=(%.2f,%.2f,%.2f)",
@@ -2049,6 +2653,7 @@ int RunGame(NativeWindow& window,
                     {
                         PointLight light{};
                         light.id = nextEditorLightId++;
+                        light.name = "Point Light " + std::to_string(light.id);
                         const WorldVec3 spawn = spawnAtCameraCenter();
                         light.position[0] = spawn.x;
                         light.position[1] = spawn.y + 1.8f;
@@ -2056,6 +2661,7 @@ int RunGame(NativeWindow& window,
                         editorPointLights.push_back(light);
                         selectedEditorObject = {SelectedEditorObjectType::PointLight, light.id};
                         editorGizmoMode = EditorGizmoMode::Translate;
+                        SceneManager::Instance().MarkDirty();
                         gameClient.SetEditorStatus("Added point light #" + std::to_string(light.id));
                         Tracenf("[EDITOR-3D-SPAWN] Spawn at cursor: type=point_light position=(%.2f,%.2f,%.2f)",
                             spawn.x, spawn.y, spawn.z);
@@ -2071,6 +2677,7 @@ int RunGame(NativeWindow& window,
                     {
                         SpotLight light{};
                         light.id = nextEditorLightId++;
+                        light.name = "Spot Light " + std::to_string(light.id);
                         const WorldVec3 spawn = spawnAtCameraCenter();
                         light.position[0] = spawn.x;
                         light.position[1] = spawn.y + 4.0f;
@@ -2079,6 +2686,7 @@ int RunGame(NativeWindow& window,
                         editorSpotLights.push_back(light);
                         selectedEditorObject = {SelectedEditorObjectType::SpotLight, light.id};
                         editorGizmoMode = EditorGizmoMode::Translate;
+                        SceneManager::Instance().MarkDirty();
                         gameClient.SetEditorStatus("Added spot light #" + std::to_string(light.id));
                         Tracenf("[EDITOR-3D-SPAWN] Spawn at cursor: type=spot_light position=(%.2f,%.2f,%.2f)",
                             spawn.x, spawn.y, spawn.z);
@@ -2094,6 +2702,7 @@ int RunGame(NativeWindow& window,
                         {
                             *it = commands.selectedLight.point;
                             selectedEditorObject = {SelectedEditorObjectType::PointLight, it->id};
+                            SceneManager::Instance().MarkDirty();
                         }
                     }
                     else if (commands.selectedLight.type == DynamicLightType::Spot)
@@ -2107,6 +2716,7 @@ int RunGame(NativeWindow& window,
                             spot.innerConeDegrees = std::clamp(spot.innerConeDegrees, 1.0f, spot.outerConeDegrees);
                             *it = spot;
                             selectedEditorObject = {SelectedEditorObjectType::SpotLight, it->id};
+                            SceneManager::Instance().MarkDirty();
                         }
                     }
                 }
@@ -2118,6 +2728,7 @@ int RunGame(NativeWindow& window,
                             [&](const PointLight& light) { return light.id == selectedEditorObject.id; }), editorPointLights.end());
                         gameClient.SetEditorStatus("Deleted point light #" + std::to_string(selectedEditorObject.id));
                         selectedEditorObject = {};
+                        SceneManager::Instance().MarkDirty();
                     }
                     else if (selectedEditorObject.type == SelectedEditorObjectType::SpotLight)
                     {
@@ -2125,6 +2736,7 @@ int RunGame(NativeWindow& window,
                             [&](const SpotLight& light) { return light.id == selectedEditorObject.id; }), editorSpotLights.end());
                         gameClient.SetEditorStatus("Deleted spot light #" + std::to_string(selectedEditorObject.id));
                         selectedEditorObject = {};
+                        SceneManager::Instance().MarkDirty();
                     }
                 }
                 if (commands.selectedWaterBodyChanged)
@@ -2136,6 +2748,7 @@ int RunGame(NativeWindow& window,
                         ApplyWaterBodyEditorStateToBody(*it, commands.selectedWaterBody);
                         selectedEditorObject = {SelectedEditorObjectType::WaterBody, it->id};
                         editorWaterBodiesDirty = true;
+                        SceneManager::Instance().MarkDirty();
                     }
                 }
                 if (commands.openSelectedWaterMaterialEditor)
@@ -2154,6 +2767,7 @@ int RunGame(NativeWindow& window,
                         {
                             body.materialId = "watermat_Default_Water";
                             editorWaterBodiesDirty = true;
+                            SceneManager::Instance().MarkDirty();
                         }
                     }
                     if (selectedEditorObject.type == SelectedEditorObjectType::WaterBody)
@@ -2175,6 +2789,7 @@ int RunGame(NativeWindow& window,
                     gameClient.SetEditorStatus("Water body deleted: id=" + std::to_string(selectedEditorObject.id));
                     selectedEditorObject = {};
                     editorWaterBodiesDirty = true;
+                    SceneManager::Instance().MarkDirty();
                 }
 
                 DynamicLightEditorState dynamicLightState{};
@@ -2207,11 +2822,15 @@ int RunGame(NativeWindow& window,
                     selectedEditorObject.type == SelectedEditorObjectType::WaterBody ? selectedEditorObject.id : 0u);
                 gameClient.SetWaterBodyEditorState(waterBodyState);
                 editorImGui.SetWaterBodyEditorState(waterBodyState);
+                editorImGui.SetHierarchySceneState(editorWaterBodies, editorPointLights, editorSpotLights);
 
                 LightingState lightingState = editorImGui.GetLightingState();
+                const bool editorHideEntities = editorPlay.state.mode == EditorPlayMode::Edit;
                 lightingState.numPointLights = 0;
                 for (const PointLight& light : editorPointLights)
                 {
+                    if (editorHideEntities && light.editorHidden)
+                        continue;
                     if (lightingState.numPointLights >= kMaxDynamicPointLights)
                         break;
                     lightingState.pointLights[lightingState.numPointLights++] = light;
@@ -2219,6 +2838,8 @@ int RunGame(NativeWindow& window,
                 lightingState.numSpotLights = 0;
                 for (const SpotLight& light : editorSpotLights)
                 {
+                    if (editorHideEntities && light.editorHidden)
+                        continue;
                     if (lightingState.numSpotLights >= kMaxDynamicSpotLights)
                         break;
                     lightingState.spotLights[lightingState.numSpotLights++] = light;
@@ -2242,8 +2863,22 @@ int RunGame(NativeWindow& window,
                 terrain.SetWaterMaterials(waterMaterials);
                 if (editorWaterBodiesDirty)
                 {
-                    terrain.SetWaterBodies(device, editorWaterBodies);
-                    editorWaterBodies = terrain.GetWaterBodies();
+                    std::vector<WaterBody> terrainWaterBodies = editorWaterBodies;
+                    const bool hasHiddenWaterBody = editorHideEntities && std::any_of(terrainWaterBodies.begin(),
+                        terrainWaterBodies.end(),
+                        [](const WaterBody& body) { return body.editorHidden; });
+                    if (hasHiddenWaterBody)
+                    {
+                        terrainWaterBodies.erase(std::remove_if(terrainWaterBodies.begin(),
+                            terrainWaterBodies.end(),
+                            [](const WaterBody& body) { return body.editorHidden; }), terrainWaterBodies.end());
+                        terrain.SetWaterBodies(device, terrainWaterBodies);
+                    }
+                    else
+                    {
+                        terrain.SetWaterBodies(device, terrainWaterBodies);
+                        editorWaterBodies = terrain.GetWaterBodies();
+                    }
                     if (waterSculptMeshRegenPending &&
                         selectedEditorObject.type == SelectedEditorObjectType::WaterBody)
                     {
@@ -2278,10 +2913,14 @@ int RunGame(NativeWindow& window,
                     else
                     {
                         editorImGui.SetPaletteSlots(terrain.GetPaletteSlots());
+                        SceneManager::Instance().MarkDirty();
                     }
                 }
                 if (commands.save)
+                {
                     terrain.RequestEditorSave();
+                    SceneManager::Instance().MarkDirty();
+                }
                 if (commands.reload)
                 {
                     terrain.RequestEditorReload();
@@ -2297,6 +2936,7 @@ int RunGame(NativeWindow& window,
                     for (const WaterBody& body : editorWaterBodies)
                         nextEditorWaterBodyId = std::max(nextEditorWaterBodyId, body.id + 1u);
                 }
+                SceneManager::Instance().SetCurrentSceneSnapshot(buildSceneSnapshot());
             }
 #endif
         }
@@ -2304,6 +2944,10 @@ int RunGame(NativeWindow& window,
         device.BeginFrame();
         if (device.IsFrameActive())
         {
+            bool frameRmlUiRenderCalled = false;
+            bool frameImGuiRenderCalled = false;
+            bool frameSceneRenderCalled = false;
+            size_t frameSceneEntityCount = 0;
 #if defined(IXTREEME_WITH_EDITOR)
             editorImGui.SetEditorPlayModeState(editorPlay.state);
             editorImGui.BeginFrame(gameClient.IsMapEditorOpen());
@@ -2315,6 +2959,7 @@ int RunGame(NativeWindow& window,
             if (isInWorld)
             {
                 entities = frameEntities;
+                frameSceneEntityCount = entities.size();
                 camera = hasFrameCamera ? frameCamera : cameraController.BuildCamera(renderSize.width, renderSize.height, {});
 
                 if (warriorOk)
@@ -2395,6 +3040,8 @@ int RunGame(NativeWindow& window,
                         {
                             for (const auto& light : editorPointLights)
                             {
+                                if (editorPlay.state.mode == EditorPlayMode::Edit && light.editorHidden)
+                                    continue;
                                 if (skinSlot >= WarriorRenderer::MaxSkinSlots())
                                     break;
                                 WorldVec3 position{light.position[0], light.position[1] + warrior.GroundOffsetY(), light.position[2]};
@@ -2416,6 +3063,8 @@ int RunGame(NativeWindow& window,
                             }
                             for (const auto& light : editorSpotLights)
                             {
+                                if (editorPlay.state.mode == EditorPlayMode::Edit && light.editorHidden)
+                                    continue;
                                 if (skinSlot >= WarriorRenderer::MaxSkinSlots())
                                     break;
                                 WorldVec3 position{light.position[0], light.position[1] + warrior.GroundOffsetY(), light.position[2]};
@@ -2449,7 +3098,10 @@ int RunGame(NativeWindow& window,
             if (isInWorld)
             {
                 if (terrainOk)
+                {
+                    frameSceneRenderCalled = true;
                     terrain.Render(device, camera);
+                }
 
                 plates.reserve(entities.size());
                 uint32_t skinSlot = 0;
@@ -2503,6 +3155,8 @@ int RunGame(NativeWindow& window,
                 {
                     for (const auto& light : editorPointLights)
                     {
+                        if (editorPlay.state.mode == EditorPlayMode::Edit && light.editorHidden)
+                            continue;
                         if (skinSlot >= WarriorRenderer::MaxSkinSlots())
                             break;
                         WorldVec3 position{light.position[0], light.position[1] + warrior.GroundOffsetY(), light.position[2]};
@@ -2520,7 +3174,7 @@ int RunGame(NativeWindow& window,
                                 : std::array<float, 4>{1.6f, 1.05f, 0.35f, 1.0f});
                         plates.push_back(NameplateRenderer::Nameplate{
                             WorldAdd({light.position[0], light.position[1], light.position[2]}, {0.0f, 1.4f, 0.0f}),
-                            "Point Light " + std::to_string(light.id),
+                            light.name.empty() ? "Point Light " + std::to_string(light.id) : light.name,
                             1,
                             selected ? 2u : 0u,
                             1.0f,
@@ -2531,6 +3185,8 @@ int RunGame(NativeWindow& window,
                     }
                     for (const auto& light : editorSpotLights)
                     {
+                        if (editorPlay.state.mode == EditorPlayMode::Edit && light.editorHidden)
+                            continue;
                         if (skinSlot >= WarriorRenderer::MaxSkinSlots())
                             break;
                         WorldVec3 position{light.position[0], light.position[1] + warrior.GroundOffsetY(), light.position[2]};
@@ -2548,7 +3204,7 @@ int RunGame(NativeWindow& window,
                                 : std::array<float, 4>{0.35f, 1.25f, 1.65f, 1.0f});
                         plates.push_back(NameplateRenderer::Nameplate{
                             WorldAdd({light.position[0], light.position[1], light.position[2]}, {0.0f, 1.4f, 0.0f}),
-                            "Spot Light " + std::to_string(light.id),
+                            light.name.empty() ? "Spot Light " + std::to_string(light.id) : light.name,
                             1,
                             selected ? 2u : 0u,
                             1.0f,
@@ -2566,7 +3222,11 @@ int RunGame(NativeWindow& window,
                     nameplates.Render(device, camera, plates);
             }
             else if (gameClient.IsLobbyActive() && warriorOk)
+            {
+                frameSceneRenderCalled = true;
+                frameSceneEntityCount = 1;
                 warrior.Render(device, seconds);
+            }
 
             if (useOffscreenScene)
             {
@@ -2587,10 +3247,40 @@ int RunGame(NativeWindow& window,
                 if (isInWorld && nameplatesOk)
                     nameplates.Render(device, camera, plates);
             }
+            frameRmlUiRenderCalled = true;
             rmlUi.Render(device);
 #if defined(IXTREEME_WITH_EDITOR)
+            frameImGuiRenderCalled = true;
             editorImGui.Render(device);
+#else
+            frameImGuiRenderCalled = false;
 #endif
+            const uint64_t frameNumber = device.GetFrameNumber();
+            if (frameNumber < 3 || (frameNumber % 60u) == 0u)
+            {
+                Tracenf("[FRAME] summary frame=%llu imgui_render called=%s rmlui_render called=%s scene_render called=%s entity_count=%zu clear_color=(0.04,0.05,0.09,1.00) in_world=%d lobby=%d editor_open=%d swapchain=%ux%u",
+                    static_cast<unsigned long long>(frameNumber),
+                    frameImGuiRenderCalled ? "yes" : "no",
+                    frameRmlUiRenderCalled ? "yes" : "no",
+                    frameSceneRenderCalled ? "yes" : "no",
+                    frameSceneEntityCount,
+                    isInWorld ? 1 : 0,
+                    gameClient.IsLobbyActive() ? 1 : 0,
+                    gameClient.IsMapEditorOpen() ? 1 : 0,
+                    renderSize.width,
+                    renderSize.height);
+            }
+        }
+        else
+        {
+            static uint32_t inactiveFrameLogs = 0;
+            if (inactiveFrameLogs < 3)
+            {
+                ++inactiveFrameLogs;
+                Tracenf("[FRAME] inactive: imgui_render called=no rmlui_render called=no scene_render called=no clear_color=(0.04,0.05,0.09,1.00) swapchain=%ux%u",
+                    renderSize.width,
+                    renderSize.height);
+            }
         }
         device.EndFrame();
     }

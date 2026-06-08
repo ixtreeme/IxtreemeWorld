@@ -17,6 +17,7 @@ public:
     virtual bool PumpMessages() = 0;
     virtual bool ConsumeResize(uint32_t& width, uint32_t& height) = 0;
     virtual void RequestClose() = 0;
+    virtual void SetTitle(const std::string& title) { (void)title; }
 
     using InputCallback = std::function<void(const InputEvent&)>;
     virtual void SetInputCallback(InputCallback cb) = 0;

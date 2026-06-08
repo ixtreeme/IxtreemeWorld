@@ -61,6 +61,7 @@ public:
     bool IsMapEditorOpen() const;
     void ToggleInGameMenu();
     bool LoadMapEditorView(uint32_t width, uint32_t height);
+    void SetMapEditorOpen(bool open);
     void ToggleMapEditor();
     void ClearKeyboardFocus();
     bool IsTextInputFocused() const;

@@ -50,11 +50,16 @@ public:
     LightingState GetLightingState() const { return m_lightingState; }
     void SetDynamicLightEditorState(const DynamicLightEditorState& state);
     void SetWaterBodyEditorState(const WaterBodyEditorState& state);
+    void SetHierarchySceneState(std::vector<WaterBody> waterBodies,
+                                std::vector<PointLight> pointLights,
+                                std::vector<SpotLight> spotLights);
     void SetWaterMaterials(std::vector<std::pair<std::string, WaterMaterialData>> materials);
     void SetWaterMaterialUsageCounts(std::vector<std::pair<std::string, std::uint32_t>> usageCounts);
     std::vector<std::pair<std::string, WaterMaterialData>> GetWaterMaterialsSnapshot() const;
     void SetPaletteSlots(const std::array<MapEditorPaletteSlot, 8>& slots);
+    void SetEngineRoot(const std::filesystem::path& clientRoot);
     void InitializeAssetLibrary(const std::filesystem::path& clientRoot);
+    void InitializeProjectAssetLibrary(const std::filesystem::path& projectRoot, const std::filesystem::path& assetRoot);
     void RefreshAssetLibrary();
     bool OpenWaterMaterialEditor(const std::string& materialId);
     bool OpenPbrMaterialEditor(const std::string& materialId);
@@ -70,6 +75,14 @@ private:
         Animation,
         Material,
         WaterMaterial
+    };
+
+    enum class ProjectDialogMode
+    {
+        None,
+        NoProject,
+        Create,
+        Open
     };
 
     struct AssetPreviewTexture
@@ -89,7 +102,35 @@ private:
     void RenderEditorPanels();
     void RenderDemoPanels();
     void RenderDockSpace();
+    void RenderMenuBar();
+    void RenderProjectModal();
+    void RenderProjectBrowser(bool pickProjectFile);
+    void OpenProjectDialog(ProjectDialogMode mode);
+    bool NavigateProjectBrowser(const std::filesystem::path& path, bool createMissing = false);
+    void ActivateCurrentProject();
+    void CreateProjectFromDialog();
+    void OpenProjectFromDialog(const std::filesystem::path& manifestPath);
     void RenderEditorToolbar();
+    void RenderSceneSettingsPanel();
+    void RenderHierarchyPanel();
+    void RenderHierarchyToolbar();
+    void RenderHierarchyWaterBodies();
+    void RenderHierarchyPointLights();
+    void RenderHierarchySpotLights();
+    void RenderHierarchyWaterBodyItem(const WaterBody& body);
+    void RenderHierarchyPointLightItem(const PointLight& light);
+    void RenderHierarchySpotLightItem(const SpotLight& light);
+    void RenderHierarchyEntityRow(HierarchyEntityType type,
+                                  std::uint32_t id,
+                                  const char* icon,
+                                  const std::string& name,
+                                  bool selected,
+                                  bool hidden);
+    void RenderHierarchyContextMenu(HierarchyEntityType type, std::uint32_t id, const std::string& name);
+    bool HierarchyPassesSearch(const std::string& name) const;
+    void QueueHierarchySelection(HierarchyEntityType type, std::uint32_t id);
+    void QueueHierarchyFocus(HierarchyEntityType type, std::uint32_t id);
+    void StartHierarchyRename(HierarchyEntityType type, std::uint32_t id, const std::string& name);
     void RenderToolsPanel();
     void RenderInspector();
     void RenderSelectedWaterBodyInspector();
@@ -201,12 +242,26 @@ private:
     DynamicLightEditorState m_dynamicLightState;
     WaterBodyEditorState m_waterBodyState;
     MapEditorCommands m_commands;
+    std::vector<WaterBody> m_hierarchyWaterBodies;
+    std::vector<PointLight> m_hierarchyPointLights;
+    std::vector<SpotLight> m_hierarchySpotLights;
     std::array<MapEditorPaletteSlot, 8> m_paletteSlots{};
     std::vector<std::pair<std::string, WaterMaterialData>> m_waterMaterials;
     std::unordered_map<std::string, std::uint32_t> m_waterMaterialUsageCounts;
     WaterMaterialEditorState m_waterMaterialEditor;
     PbrMaterialEditorState m_pbrMaterialEditor;
+    std::filesystem::path m_engineRoot;
     std::unique_ptr<AssetLibrary> m_assetLibrary;
+    ProjectDialogMode m_projectDialogMode = ProjectDialogMode::NoProject;
+    bool m_projectPopupNeedsOpen = true;
+    bool m_projectCreateBrowserVisible = false;
+    std::filesystem::path m_projectBrowserPath;
+    std::string m_projectStatus;
+    char m_projectParentBuffer[512]{};
+    char m_projectNameBuffer[128] = "NewProject";
+    char m_projectOpenPathBuffer[512]{};
+    char m_projectBrowsePathBuffer[512]{};
+    char m_projectBrowseFilterBuffer[128]{};
     bool m_waterSculptToolOpen = false;
     bool m_heightmapToolOpen = false;
     bool m_splatPaintToolOpen = false;
@@ -217,6 +272,11 @@ private:
     std::string m_assetStatus;
     char m_assetSearchBuffer[128]{};
     char m_newAssetFolderName[64]{};
+    char m_hierarchySearchBuffer[128]{};
+    HierarchyEntityType m_hierarchyRenamingType = HierarchyEntityType::None;
+    std::uint32_t m_hierarchyRenamingId = 0;
+    char m_hierarchyRenameBuffer[128]{};
+    bool m_logHierarchyRendered = false;
     std::unordered_map<std::string, AssetPreviewTexture> m_assetPreviewTextures;
     bool m_assetBrowserLogged = false;
     float m_timeOfDayHours = 12.0f;

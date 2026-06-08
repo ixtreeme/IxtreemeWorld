@@ -12,8 +12,12 @@ add_library(client_render STATIC
     NameplateRenderer.h
     OffscreenSceneRenderer.cpp
     OffscreenSceneRenderer.h
+    ProjectManager.cpp
+    ProjectManager.h
     RmlUiLayer.cpp
     RmlUiLayer.h
+    SceneManager.cpp
+    SceneManager.h
     TerrainRenderer.cpp
     TerrainRenderer.h
     IconsFontAwesome6.h

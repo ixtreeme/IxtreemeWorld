@@ -16,6 +16,7 @@ public:
     bool PumpMessages() override;
     bool ConsumeResize(uint32_t& width, uint32_t& height) override;
     void RequestClose() override;
+    void SetTitle(const std::string& title) override;
     void SetInputCallback(InputCallback cb) override;
     void SetFileDropCallback(FileDropCallback cb) override;
     uint32_t GetWidth() const override { return m_width; }

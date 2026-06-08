@@ -720,6 +720,36 @@ bool RunRenderChecks(const Options& options, TestContext& ctx)
     std::stringstream editorImGuiHeaderText;
     editorImGuiHeaderText << editorImGuiHeader.rdbuf();
     const std::string editorImGuiHeaderSource = editorImGuiHeaderText.str();
+    const std::filesystem::path mapEditorTypesPath = options.clientRoot / "libs" / "render" / "MapEditorTypes.h";
+    std::ifstream mapEditorTypes(mapEditorTypesPath);
+    std::stringstream mapEditorTypesText;
+    mapEditorTypesText << mapEditorTypes.rdbuf();
+    const std::string mapEditorTypesSource = mapEditorTypesText.str();
+    const std::filesystem::path sceneManagerPath = options.clientRoot / "libs" / "render" / "SceneManager.cpp";
+    std::ifstream sceneManager(sceneManagerPath);
+    std::stringstream sceneManagerText;
+    sceneManagerText << sceneManager.rdbuf();
+    const std::string sceneManagerSource = sceneManagerText.str();
+    const std::filesystem::path sceneManagerHeaderPath = options.clientRoot / "libs" / "render" / "SceneManager.h";
+    std::ifstream sceneManagerHeader(sceneManagerHeaderPath);
+    std::stringstream sceneManagerHeaderText;
+    sceneManagerHeaderText << sceneManagerHeader.rdbuf();
+    const std::string sceneManagerHeaderSource = sceneManagerHeaderText.str();
+    const std::filesystem::path projectManagerPath = options.clientRoot / "libs" / "render" / "ProjectManager.cpp";
+    std::ifstream projectManager(projectManagerPath);
+    std::stringstream projectManagerText;
+    projectManagerText << projectManager.rdbuf();
+    const std::string projectManagerSource = projectManagerText.str();
+    const std::filesystem::path projectManagerHeaderPath = options.clientRoot / "libs" / "render" / "ProjectManager.h";
+    std::ifstream projectManagerHeader(projectManagerHeaderPath);
+    std::stringstream projectManagerHeaderText;
+    projectManagerHeaderText << projectManagerHeader.rdbuf();
+    const std::string projectManagerHeaderSource = projectManagerHeaderText.str();
+    const std::filesystem::path nativeWindowHeaderPath = options.clientRoot / "libs" / "platform" / "NativeWindow.h";
+    std::ifstream nativeWindowHeader(nativeWindowHeaderPath);
+    std::stringstream nativeWindowHeaderText;
+    nativeWindowHeaderText << nativeWindowHeader.rdbuf();
+    const std::string nativeWindowHeaderSource = nativeWindowHeaderText.str();
     const std::filesystem::path rmlUiLayerPath = options.clientRoot / "libs" / "render" / "RmlUiLayer.cpp";
     std::ifstream rmlUiLayer(rmlUiLayerPath);
     std::stringstream rmlUiLayerText;
@@ -983,6 +1013,186 @@ bool RunRenderChecks(const Options& options, TestContext& ctx)
             editorImGuiSource.find("Tags: %s") != std::string::npos &&
             editorImGuiSource.find("Source: %s") != std::string::npos,
         "asset browser compact tile metadata", "asset browser tiles should show only a short filename and move metadata into the hover tooltip");
+    ctx.Expect(sceneManagerHeaderSource.find("class SceneManager") != std::string::npos &&
+            sceneManagerHeaderSource.find("struct SceneData") != std::string::npos &&
+            sceneManagerHeaderSource.find("LoadScene") != std::string::npos &&
+            sceneManagerHeaderSource.find("SaveScene") != std::string::npos &&
+            sceneManagerHeaderSource.find("SaveSceneAs") != std::string::npos &&
+            renderCmakeSource.find("SceneManager.cpp") != std::string::npos,
+        "scene manager class", "SCENE-1 must add a SceneManager class and build it into the editor client");
+    ctx.Expect(sceneManagerHeaderSource.find("m_sceneOpen") != std::string::npos &&
+            sceneManagerHeaderSource.find("bool HasOpenScene() const { return m_sceneOpen; }") != std::string::npos &&
+            sceneManagerSource.find("m_sceneOpen = true;") != std::string::npos &&
+            sceneManagerSource.find("m_sceneOpen = false;") != std::string::npos,
+        "unsaved new scene open state", "New Scene must be treated as an open editor scene even before it has a saved file path");
+    ctx.Expect(sceneManagerSource.find("\\\"version\\\": 1") != std::string::npos &&
+            sceneManagerSource.find("\\\"terrain_ref\\\"") != std::string::npos &&
+            sceneManagerSource.find("\\\"splat_ref\\\"") != std::string::npos &&
+            sceneManagerSource.find("\\\"shape_mask_ref\\\"") != std::string::npos &&
+            sceneManagerSource.find(".heightmap") != std::string::npos &&
+            sceneManagerSource.find(".splat") != std::string::npos &&
+            sceneManagerSource.find(".mask") != std::string::npos,
+        "scene json sidecar format", "SCENE-1 must save readable .scene JSON and separate heightmap/splat/water-mask sidecar files");
+    ctx.Expect(editorImGuiSource.find("RenderMenuBar") != std::string::npos &&
+            editorImGuiSource.find("BeginMainMenuBar") != std::string::npos &&
+            editorImGuiSource.find("New Scene") != std::string::npos &&
+            editorImGuiSource.find("Open Scene") != std::string::npos &&
+            editorImGuiSource.find("Save Scene") != std::string::npos &&
+            editorImGuiSource.find("Recent Scenes") != std::string::npos &&
+            editorImGuiSource.find("Ctrl+Shift+S") != std::string::npos,
+        "scene editor file menu", "SCENE-1 must expose New/Open/Save/SaveAs/Recent through an editor File menu");
+    ctx.Expect(editorImGuiSource.find("ImGuiKey_N") != std::string::npos &&
+            editorImGuiSource.find("ImGuiKey_O") != std::string::npos &&
+            editorImGuiSource.find("ImGuiKey_S") != std::string::npos &&
+            editorImGuiSource.find("io.KeyShift") != std::string::npos,
+        "scene editor hotkeys", "SCENE-1 must wire Ctrl+N, Ctrl+O, Ctrl+S, and Ctrl+Shift+S");
+    ctx.Expect(sceneManagerSource.find("MarkDirty") != std::string::npos &&
+            sceneManagerSource.find("PromptSaveBeforeAction") != std::string::npos &&
+            sceneManagerHeaderSource.find("GetRecentScenes") != std::string::npos &&
+            sceneManagerSource.find("AURIGA GLOBAL \\xE2\\x80\\x94 Editor") != std::string::npos &&
+            sceneManagerSource.find("title += \"*\"") != std::string::npos &&
+            nativeWindowHeaderSource.find("SetTitle") != std::string::npos &&
+            clientMainSource.find("SetWindowTitleCallback") != std::string::npos,
+        "scene dirty title recent", "SCENE-1 must track dirty state, prompt before destructive scene actions, update title, and maintain recent scenes");
+    ctx.Expect(clientMainSource.find("SetCurrentSceneSnapshot(buildSceneSnapshot())") != std::string::npos &&
+            clientMainSource.find("ConsumePendingScene") != std::string::npos &&
+            clientMainSource.find("applySceneData") != std::string::npos &&
+            clientMainSource.find("[STARTUP] Editor build: no automatic default.scene load") != std::string::npos,
+        "scene main editor bridge", "SCENE-1/2 must bridge SceneManager data into editor water/light/palette state and start editor builds without automatic default.scene loading");
+    ctx.Expect(projectManagerHeaderSource.find("class ProjectManager") != std::string::npos &&
+            projectManagerHeaderSource.find("CreateProject") != std::string::npos &&
+            projectManagerHeaderSource.find("OpenProject") != std::string::npos &&
+            projectManagerHeaderSource.find("SaveProject") != std::string::npos &&
+            projectManagerSource.find("\"project.ixproj\"") != std::string::npos &&
+            projectManagerSource.find("\"Assets\"") != std::string::npos &&
+            projectManagerSource.find("\"Scenes\"") != std::string::npos &&
+            renderCmakeSource.find("ProjectManager.cpp") != std::string::npos,
+        "project manager manifest", "PROJECT-1 must create/open/save project.ixproj manifests and project Assets/Scenes roots");
+    ctx.Expect(editorImGuiHeaderSource.find("ProjectDialogMode") != std::string::npos &&
+            editorImGuiSource.find("RenderProjectModal") != std::string::npos &&
+            editorImGuiSource.find("No Project") != std::string::npos &&
+            editorImGuiSource.find("Create New Project") != std::string::npos &&
+            editorImGuiSource.find("Open Project") != std::string::npos &&
+            editorImGuiSource.find("Browse...") != std::string::npos &&
+            editorImGuiSource.find("Browse Path") != std::string::npos &&
+            editorImGuiSource.find("Filter folders/projects...") != std::string::npos &&
+            editorImGuiSource.find("NavigateProjectBrowser") != std::string::npos &&
+            editorImGuiSource.find("createMissing") != std::string::npos &&
+            editorImGuiSource.find("create_directories(target") != std::string::npos &&
+            editorImGuiSource.find("Folder created:") != std::string::npos &&
+            editorImGuiSource.find("Drives") != std::string::npos &&
+            editorImGuiSource.find("Go") != std::string::npos &&
+            editorImGuiSource.find("Use This Folder") != std::string::npos &&
+            editorImGuiSource.find("Recent Projects") != std::string::npos &&
+            editorImGuiSource.find("InitializeProjectAssetLibrary") != std::string::npos &&
+            clientMainSource.find("editorImGui.SetEngineRoot(*assetRoot)") != std::string::npos &&
+            clientMainSource.find("editorImGui.InitializeAssetLibrary(*assetRoot)") == std::string::npos,
+        "editor project workflow", "PROJECT-1 editor boot must show a no-project modal and bind the Asset Browser only after a project is active");
+    ctx.Expect(sceneManagerSource.find("DefaultProjectScenePath") != std::string::npos &&
+            sceneManagerSource.find("ResolveProjectScenePath") != std::string::npos &&
+            sceneManagerSource.find("ProjectSceneRecentPath") != std::string::npos &&
+            sceneManagerSource.find("ProjectManager::Instance().SetRecentScenes") != std::string::npos,
+        "project scene paths", "PROJECT-1 scene save/open/recent handling must be project-relative when a project is active");
+    ctx.Expect(sceneManagerHeaderSource.find("SetRuntimeUiCallbacks") != std::string::npos &&
+            sceneManagerSource.find("ActivateSceneType") != std::string::npos &&
+            sceneManagerSource.find("scene_type") != std::string::npos &&
+            sceneManagerSource.find("type == \"login\"") != std::string::npos &&
+            sceneManagerSource.find("type == \"lobby\"") != std::string::npos &&
+            sceneManagerSource.find("type == \"world\"") != std::string::npos &&
+            sceneManagerSource.find("type == \"empty\"") != std::string::npos,
+        "scene runtime ui binding", "SCENE-2 must activate RmlUi views from scene_type values");
+    ctx.Expect(clientMainSource.find("StartupSceneFromConfig") != std::string::npos &&
+            clientMainSource.find("startup_scene") != std::string::npos &&
+            clientMainSource.find("scenes/Login.scene") != std::string::npos &&
+            clientMainSource.find("#else\n    LoadRuntimeScene(assets, StartupSceneFromConfig(assets));") != std::string::npos,
+        "scene release startup flow", "SCENE-2 release builds must load app_config.json startup_scene with Login.scene fallback");
+    ctx.Expect(gameClientLayerHeaderSource.find("SetMapEditorOpen") != std::string::npos &&
+            gameClientLayerSource.find("void GameClientLayer::SetMapEditorOpen(bool open)") != std::string::npos &&
+            clientMainSource.find("gameClient.SetMapEditorOpen(true)") != std::string::npos &&
+            clientMainSource.find("[BOOT] editor_open forced = 1") != std::string::npos &&
+            clientMainSource.find("editorImGui.BeginFrame(gameClient.IsMapEditorOpen())") != std::string::npos,
+        "editor boot opens imgui", "ENGINE-BOOT-FIX must keep the ImGui editor open on editor-build boot independent of scene_type/RmlUi routing");
+    ctx.Expect(clientMainSource.find("scenes/Lobby.scene") != std::string::npos &&
+            clientMainSource.find("scenes/World.scene") != std::string::npos &&
+            clientMainSource.find("loadRuntimeSceneOrFallback") != std::string::npos,
+        "scene navigation callbacks", "SCENE-2 login/lobby/world transitions must route through scene loads");
+    ctx.Expect(rmlUiLayerSource.find("void RmlUiLayer::HideAll") != std::string::npos &&
+            rmlUiLayerSource.find("WarnSceneTypeMismatch") != std::string::npos &&
+            rmlUiLayerSource.find("ShowLogin\", \"login") != std::string::npos &&
+            rmlUiLayerSource.find("ShowLobby\", \"lobby") != std::string::npos &&
+            rmlUiLayerSource.find("ShowHud\", \"world") != std::string::npos,
+        "rmlui scene type warnings", "SCENE-2 must warn when runtime UI is shown outside its matching scene_type while remaining backwards compatible");
+    ctx.Expect(editorImGuiSource.find("RenderSceneSettingsPanel") != std::string::npos &&
+            editorImGuiSource.find("Scene Settings") != std::string::npos &&
+            editorImGuiSource.find("Scene Type") != std::string::npos &&
+            editorImGuiSource.find("\"login\", \"lobby\", \"loading\", \"world\"") != std::string::npos,
+        "scene settings panel", "SCENE-2 must expose scene metadata and editable scene type in the editor");
+    ctx.Expect(clientMainSource.find("playStartScenePath") != std::string::npos &&
+            clientMainSource.find("Restored starting scene") != std::string::npos &&
+            editorImGuiSource.find("Open a scene to Play") != std::string::npos &&
+            editorImGuiSource.find("HasOpenScene()") != std::string::npos,
+        "play scene restore", "SCENE-2 Play mode must store/restore the starting scene and disable Play with no open scene");
+    ctx.Expect(clientMainSource.find("editorRuntimeFlowActive") != std::string::npos &&
+            clientMainSource.find("suppressed (Edit mode)") != std::string::npos &&
+            clientMainSource.find("[SCENE-FLOW] suppressed in Edit mode") != std::string::npos &&
+            clientMainSource.find("SceneManager::Instance().ActivateCurrentSceneType()") != std::string::npos &&
+            clientMainSource.find("Runtime UI/scene flow enabled for Play mode") != std::string::npos,
+        "runtime ui play gate", "EDIT-PLAY-2 must keep scene_type RmlUi routing and login/lobby/world flow inactive in Edit mode and enable them only in Play");
+    ctx.Expect(clientMainSource.find("injectDirectGameplayDevCharacter") != std::string::npos &&
+            clientMainSource.find("playSceneType == \"world\" || playSceneType == \"gameplay\"") != std::string::npos &&
+            clientMainSource.find("!hasOwnRuntimeCharacter()") != std::string::npos &&
+            clientMainSource.find("Direct gameplay scene Play: dev character injected") != std::string::npos,
+        "direct gameplay dev character", "EDIT-PLAY-2 must inject a dev character only when directly playing a gameplay scene without an existing character");
+    ctx.Expect(sceneManagerHeaderSource.find("RestoreSceneSnapshot") != std::string::npos &&
+            sceneManagerSource.find("void SceneManager::RestoreSceneSnapshot") != std::string::npos &&
+            clientMainSource.find("playStartSceneSnapshot") != std::string::npos &&
+            clientMainSource.find("playStartSceneDirty") != std::string::npos,
+        "play snapshot restore", "EDIT-PLAY-2 Stop must restore the editor scene snapshot, including unsaved scenes, after Play");
+    ctx.Expect(editorImGuiSource.find("RenderHierarchyPanel") != std::string::npos &&
+            editorImGuiSource.find("Hierarchy") != std::string::npos &&
+            editorImGuiSource.find("RenderHierarchyWaterBodies") != std::string::npos &&
+            editorImGuiSource.find("RenderHierarchyPointLights") != std::string::npos &&
+            editorImGuiSource.find("RenderHierarchySpotLights") != std::string::npos &&
+            editorImGuiSource.find("DockBuilderDockWindow(ICON_FA_LIST_TREE \" Hierarchy\"") != std::string::npos,
+        "hierarchy panel and dock", "HIERARCHY-1 must add a docked Scene Hierarchy panel grouped by entity type");
+    ctx.Expect(editorImGuiSource.find("RenderHierarchyToolbar") != std::string::npos &&
+            editorImGuiSource.find("Search entities") != std::string::npos &&
+            editorImGuiSource.find("HierarchyPassesSearch") != std::string::npos &&
+            editorImGuiSource.find("ContainsCaseInsensitive") != std::string::npos &&
+            editorImGuiSource.find("Search filter") != std::string::npos,
+        "hierarchy search", "HIERARCHY-1 must provide case-insensitive entity search with a clearable toolbar");
+    ctx.Expect(editorImGuiSource.find("QueueHierarchySelection") != std::string::npos &&
+            editorImGuiSource.find("QueueHierarchyFocus") != std::string::npos &&
+            editorImGuiSource.find("SetScrollHereY") != std::string::npos &&
+            clientMainSource.find("selectHierarchyEntity") != std::string::npos &&
+            clientMainSource.find("editorImGui.SetHierarchySceneState") != std::string::npos,
+        "hierarchy selection sync", "HIERARCHY-1 must sync hierarchy clicks with Inspector/gizmo selection and reverse-highlight selected items");
+    ctx.Expect(editorImGuiSource.find("RenderHierarchyContextMenu") != std::string::npos &&
+            editorImGuiSource.find("Focus Camera") != std::string::npos &&
+            editorImGuiSource.find("Duplicate") != std::string::npos &&
+            editorImGuiSource.find("Rename") != std::string::npos &&
+            editorImGuiSource.find("Delete") != std::string::npos &&
+            editorImGuiSource.find("InputTextFlags_EnterReturnsTrue") != std::string::npos,
+        "hierarchy context menu", "HIERARCHY-1 must expose Focus/Duplicate/Rename/Delete and in-place rename");
+    ctx.Expect(mapEditorTypesSource.find("HierarchyEntityType") != std::string::npos &&
+            mapEditorTypesSource.find("hierarchyDuplicateEntity") != std::string::npos &&
+            mapEditorTypesSource.find("hierarchyRenameEntity") != std::string::npos &&
+            clientMainSource.find("duplicateHierarchyEntity") != std::string::npos &&
+            clientMainSource.find("renameHierarchyEntity") != std::string::npos &&
+            clientMainSource.find("deleteHierarchyEntity") != std::string::npos,
+        "hierarchy commands", "HIERARCHY-1 hierarchy commands must be routed from ImGui to the editor runtime");
+    ctx.Expect(mapEditorTypesSource.find("editorHidden") != std::string::npos &&
+            editorImGuiSource.find("ICON_FA_EYE_SLASH") != std::string::npos &&
+            clientMainSource.find("toggleHierarchyHidden") != std::string::npos &&
+            clientMainSource.find("light.editorHidden") != std::string::npos &&
+            clientMainSource.find("body.editorHidden") != std::string::npos &&
+            sceneManagerSource.find("\\\"editor_hidden\\\"") == std::string::npos,
+        "hierarchy editor visibility", "HIERARCHY-1 must add editor-only hide/show with eye icons and avoid saving editor_hidden into scene JSON");
+    ctx.Expect(clientMainSource.find("void FocusOn(WorldVec3 target") != std::string::npos &&
+            clientMainSource.find("focusHierarchyEntity") != std::string::npos &&
+            editorImGuiSource.find("ImGuiKey_F") != std::string::npos &&
+            clientMainSource.find("[HIERARCHY] Focused camera on entity") != std::string::npos,
+        "hierarchy focus camera", "HIERARCHY-1 must focus the editor camera on selected hierarchy entities with F/double-click/context menu");
     ctx.Expect(editorImGuiSource.find("RenderEditorToolbar") != std::string::npos &&
             editorImGuiSource.find("HandleEditorHotkeys") != std::string::npos &&
             editorImGuiSource.find("ImGuiKey_F5") != std::string::npos &&
@@ -998,13 +1208,14 @@ bool RunRenderChecks(const Options& options, TestContext& ctx)
             gameClientLayerSource.find("localSavedStateValid") != std::string::npos &&
             gameClientLayerSource.find("[EDIT-PLAY] Runtime state cleared") != std::string::npos &&
             clientMainSource.find("EditorPlayRuntime") != std::string::npos &&
-            clientMainSource.find("TestPlayer") != std::string::npos &&
+            clientMainSource.find("DevPlayer") != std::string::npos &&
+            clientMainSource.find("injectDirectGameplayDevCharacter") != std::string::npos &&
             clientMainSource.find("player.level = 50") != std::string::npos &&
             clientMainSource.find("player.hpMax = 1000.0f") != std::string::npos &&
-            clientMainSource.find("rmlUi.ShowHud()") != std::string::npos &&
+            clientMainSource.find("SceneManager::Instance().ActivateCurrentSceneType()") != std::string::npos &&
             clientMainSource.find("editorPlay.state.mode == EditorPlayMode::PlayPaused") != std::string::npos &&
             clientMainSource.find("[EDIT-PLAY] Snapshot restored") != std::string::npos,
-        "editor local play mode runtime", "EDIT-PLAY-1 needs local play runtime state, test character spawn, HUD activation, pause, and Stop restore");
+        "editor local play mode runtime", "EDIT-PLAY-1/2 needs local play runtime state, controlled dev character spawn, HUD routing, pause, and Stop restore");
     ctx.Expect(!std::filesystem::exists(options.clientRoot / "libs" / "render" / ("Noe" "sisLayer.cpp")) &&
             !std::filesystem::exists(options.clientRoot / "libs" / "render" / ("Noe" "sisLayer.h")) &&
             renderCmakeSource.find(legacyUiName) == std::string::npos &&

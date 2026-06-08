@@ -54,6 +54,7 @@ public:
     void Resize(uint32_t width, uint32_t height);
     void OnRenderPassChanged(VulkanDevice& device);
     bool OnInput(const InputEvent& event);
+    void HideAll();
     void SetLoginSubmitCallback(std::function<void(const std::string&, const std::string&, bool)> callback);
     void ShowLogin();
     void HideLogin();

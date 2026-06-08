@@ -102,6 +102,7 @@ constexpr std::uint32_t kMaxDynamicSpotLights = 16;
 struct PointLight
 {
     std::uint32_t id = 0;
+    std::string name;
     float position[3] = {0.0f, 0.0f, 0.0f};
     float r = 1.0f;
     float g = 0.95f;
@@ -109,11 +110,13 @@ struct PointLight
     float intensity = 3.0f;
     float radius = 10.0f;
     bool enabled = true;
+    bool editorHidden = false;
 };
 
 struct SpotLight
 {
     std::uint32_t id = 0;
+    std::string name;
     float position[3] = {0.0f, 0.0f, 0.0f};
     float rotation[3] = {-1.5708f, 0.0f, 0.0f};
     float r = 1.0f;
@@ -124,6 +127,7 @@ struct SpotLight
     float innerConeDegrees = 20.0f;
     float outerConeDegrees = 35.0f;
     bool enabled = true;
+    bool editorHidden = false;
 };
 
 struct LightingState
@@ -222,6 +226,15 @@ struct WaterBody
     std::vector<std::uint8_t> shapeMask;
     std::string materialId;
     WaterConfig config;
+    bool editorHidden = false;
+};
+
+enum class HierarchyEntityType
+{
+    None,
+    WaterBody,
+    PointLight,
+    SpotLight
 };
 
 struct WaterBodyEditorState
@@ -283,6 +296,15 @@ struct MapEditorCommands
     bool deleteSelectedLight = false;
     bool selectedLightChanged = false;
     DynamicLightEditorState selectedLight;
+    bool hierarchySelectEntity = false;
+    bool hierarchyFocusEntity = false;
+    bool hierarchyDeleteEntity = false;
+    bool hierarchyDuplicateEntity = false;
+    bool hierarchyRenameEntity = false;
+    bool hierarchyToggleHidden = false;
+    HierarchyEntityType hierarchyEntityType = HierarchyEntityType::None;
+    std::uint32_t hierarchyEntityId = 0;
+    std::string hierarchyRenameValue;
     bool paletteSlotChanged = false;
     std::uint32_t paletteSlot = 0;
     std::string paletteAssetId;

@@ -1,0 +1,1086 @@
+#include "SceneManager.h"
+
+#include "Debug.h"
+#include "ProjectManager.h"
+
+#include <algorithm>
+#include <chrono>
+#include <cctype>
+#include <cstdlib>
+#include <cstring>
+#include <fstream>
+#include <iomanip>
+#include <map>
+#include <optional>
+#include <sstream>
+#include <utility>
+
+#if defined(_WIN32)
+#include <windows.h>
+#include <commdlg.h>
+#endif
+
+namespace
+{
+struct JsonValue
+{
+    enum class Type { Null, Bool, Number, String, Array, Object };
+
+    Type type = Type::Null;
+    bool boolean = false;
+    double number = 0.0;
+    std::string string;
+    std::vector<JsonValue> array;
+    std::map<std::string, JsonValue> object;
+
+    const JsonValue* Find(const std::string& key) const
+    {
+        auto it = object.find(key);
+        return it == object.end() ? nullptr : &it->second;
+    }
+
+    std::string StringOr(const std::string& fallback = {}) const
+    {
+        return type == Type::String ? string : fallback;
+    }
+
+    double NumberOr(double fallback = 0.0) const
+    {
+        return type == Type::Number ? number : fallback;
+    }
+
+    bool BoolOr(bool fallback = false) const
+    {
+        return type == Type::Bool ? boolean : fallback;
+    }
+};
+
+class JsonParser
+{
+public:
+    explicit JsonParser(std::string text) : m_text(std::move(text)) {}
+
+    bool Parse(JsonValue& out)
+    {
+        SkipWs();
+        if (!ParseValue(out))
+            return false;
+        SkipWs();
+        return m_pos == m_text.size();
+    }
+
+private:
+    void SkipWs()
+    {
+        while (m_pos < m_text.size() && std::isspace(static_cast<unsigned char>(m_text[m_pos])))
+            ++m_pos;
+    }
+
+    bool Match(char ch)
+    {
+        SkipWs();
+        if (m_pos >= m_text.size() || m_text[m_pos] != ch)
+            return false;
+        ++m_pos;
+        return true;
+    }
+
+    bool ParseValue(JsonValue& out)
+    {
+        SkipWs();
+        if (m_pos >= m_text.size())
+            return false;
+
+        const char ch = m_text[m_pos];
+        if (ch == '{')
+            return ParseObject(out);
+        if (ch == '[')
+            return ParseArray(out);
+        if (ch == '"')
+        {
+            out.type = JsonValue::Type::String;
+            return ParseString(out.string);
+        }
+        if (ch == 't' && m_text.substr(m_pos, 4) == "true")
+        {
+            m_pos += 4;
+            out.type = JsonValue::Type::Bool;
+            out.boolean = true;
+            return true;
+        }
+        if (ch == 'f' && m_text.substr(m_pos, 5) == "false")
+        {
+            m_pos += 5;
+            out.type = JsonValue::Type::Bool;
+            out.boolean = false;
+            return true;
+        }
+        if (ch == 'n' && m_text.substr(m_pos, 4) == "null")
+        {
+            m_pos += 4;
+            out.type = JsonValue::Type::Null;
+            return true;
+        }
+        return ParseNumber(out);
+    }
+
+    bool ParseObject(JsonValue& out)
+    {
+        if (!Match('{'))
+            return false;
+        out.type = JsonValue::Type::Object;
+        SkipWs();
+        if (Match('}'))
+            return true;
+        while (true)
+        {
+            std::string key;
+            if (!ParseString(key) || !Match(':'))
+                return false;
+            JsonValue value;
+            if (!ParseValue(value))
+                return false;
+            out.object[std::move(key)] = std::move(value);
+            if (Match('}'))
+                return true;
+            if (!Match(','))
+                return false;
+        }
+    }
+
+    bool ParseArray(JsonValue& out)
+    {
+        if (!Match('['))
+            return false;
+        out.type = JsonValue::Type::Array;
+        SkipWs();
+        if (Match(']'))
+            return true;
+        while (true)
+        {
+            JsonValue value;
+            if (!ParseValue(value))
+                return false;
+            out.array.push_back(std::move(value));
+            if (Match(']'))
+                return true;
+            if (!Match(','))
+                return false;
+        }
+    }
+
+    bool ParseString(std::string& out)
+    {
+        SkipWs();
+        if (m_pos >= m_text.size() || m_text[m_pos] != '"')
+            return false;
+        ++m_pos;
+        out.clear();
+        while (m_pos < m_text.size())
+        {
+            const char ch = m_text[m_pos++];
+            if (ch == '"')
+                return true;
+            if (ch != '\\')
+            {
+                out.push_back(ch);
+                continue;
+            }
+            if (m_pos >= m_text.size())
+                return false;
+            const char escaped = m_text[m_pos++];
+            switch (escaped)
+            {
+            case '"': out.push_back('"'); break;
+            case '\\': out.push_back('\\'); break;
+            case '/': out.push_back('/'); break;
+            case 'b': out.push_back('\b'); break;
+            case 'f': out.push_back('\f'); break;
+            case 'n': out.push_back('\n'); break;
+            case 'r': out.push_back('\r'); break;
+            case 't': out.push_back('\t'); break;
+            default: out.push_back(escaped); break;
+            }
+        }
+        return false;
+    }
+
+    bool ParseNumber(JsonValue& out)
+    {
+        SkipWs();
+        const size_t start = m_pos;
+        if (m_pos < m_text.size() && (m_text[m_pos] == '-' || m_text[m_pos] == '+'))
+            ++m_pos;
+        while (m_pos < m_text.size() && std::isdigit(static_cast<unsigned char>(m_text[m_pos])))
+            ++m_pos;
+        if (m_pos < m_text.size() && m_text[m_pos] == '.')
+        {
+            ++m_pos;
+            while (m_pos < m_text.size() && std::isdigit(static_cast<unsigned char>(m_text[m_pos])))
+                ++m_pos;
+        }
+        if (m_pos < m_text.size() && (m_text[m_pos] == 'e' || m_text[m_pos] == 'E'))
+        {
+            ++m_pos;
+            if (m_pos < m_text.size() && (m_text[m_pos] == '-' || m_text[m_pos] == '+'))
+                ++m_pos;
+            while (m_pos < m_text.size() && std::isdigit(static_cast<unsigned char>(m_text[m_pos])))
+                ++m_pos;
+        }
+        if (start == m_pos)
+            return false;
+        out.type = JsonValue::Type::Number;
+        out.number = std::strtod(m_text.c_str() + start, nullptr);
+        return true;
+    }
+
+    std::string m_text;
+    size_t m_pos = 0;
+};
+
+std::string EscapeJson(const std::string& value)
+{
+    std::string out;
+    out.reserve(value.size() + 8);
+    for (char ch : value)
+    {
+        switch (ch)
+        {
+        case '"': out += "\\\""; break;
+        case '\\': out += "\\\\"; break;
+        case '\n': out += "\\n"; break;
+        case '\r': out += "\\r"; break;
+        case '\t': out += "\\t"; break;
+        default: out.push_back(ch); break;
+        }
+    }
+    return out;
+}
+
+std::string GenericPath(const std::filesystem::path& path)
+{
+    return path.generic_string();
+}
+
+std::string TimestampUtc()
+{
+    const auto now = std::chrono::system_clock::now();
+    const std::time_t time = std::chrono::system_clock::to_time_t(now);
+    std::tm tm{};
+#if defined(_WIN32)
+    gmtime_s(&tm, &time);
+#else
+    gmtime_r(&time, &tm);
+#endif
+    std::ostringstream out;
+    out << std::put_time(&tm, "%Y-%m-%dT%H:%M:%SZ");
+    return out.str();
+}
+
+std::string SceneNameFromPath(const std::string& path)
+{
+    if (path.empty())
+        return "Untitled";
+    return std::filesystem::path(path).stem().string();
+}
+
+std::filesystem::path SceneSidecarPath(const std::filesystem::path& scenePath, const char* extension)
+{
+    std::filesystem::path sidecar = scenePath;
+    sidecar.replace_extension(extension);
+    return sidecar;
+}
+
+std::string ResolveProjectScenePath(const std::string& path)
+{
+    const std::filesystem::path input(path);
+    if (!ProjectManager::Instance().HasProject() || input.is_absolute())
+        return path;
+    return (ProjectManager::Instance().ProjectRoot() / input).string();
+}
+
+std::string ProjectSceneRecentPath(const std::string& path)
+{
+    ProjectManager& projects = ProjectManager::Instance();
+    if (!projects.HasProject())
+        return path;
+
+    std::error_code ec;
+    const std::filesystem::path absolutePath = std::filesystem::absolute(path, ec);
+    if (ec)
+        return path;
+    const std::filesystem::path relative = std::filesystem::relative(absolutePath, projects.ProjectRoot(), ec);
+    if (!ec && !relative.empty() && relative.string().rfind("..", 0) != 0)
+        return relative.generic_string();
+    return path;
+}
+
+std::string DefaultProjectScenePath(const SceneData& scene)
+{
+    ProjectManager& projects = ProjectManager::Instance();
+    if (!projects.HasProject())
+        return {};
+
+    std::string name = scene.name.empty() ? "Untitled" : scene.name;
+    for (char& ch : name)
+    {
+        if (!std::isalnum(static_cast<unsigned char>(ch)) && ch != '_' && ch != '-')
+            ch = '_';
+    }
+    if (name.empty())
+        name = "Untitled";
+    return (projects.ScenesPath() / (name + ".scene")).string();
+}
+
+void WritePlaceholderBinary(const std::filesystem::path& path, const char* magic)
+{
+    if (!path.parent_path().empty())
+        std::filesystem::create_directories(path.parent_path());
+    std::ofstream file(path, std::ios::binary);
+    if (!file)
+        return;
+    file.write(magic, static_cast<std::streamsize>(std::strlen(magic)));
+    const std::uint32_t version = 1;
+    file.write(reinterpret_cast<const char*>(&version), sizeof(version));
+}
+
+bool WriteBytes(const std::filesystem::path& path, const std::vector<std::uint8_t>& bytes)
+{
+    if (!path.parent_path().empty())
+        std::filesystem::create_directories(path.parent_path());
+    std::ofstream file(path, std::ios::binary);
+    if (!file)
+        return false;
+    if (!bytes.empty())
+        file.write(reinterpret_cast<const char*>(bytes.data()), static_cast<std::streamsize>(bytes.size()));
+    return true;
+}
+
+std::vector<std::uint8_t> ReadBytes(const std::filesystem::path& path)
+{
+    std::ifstream file(path, std::ios::binary);
+    if (!file)
+        return {};
+    return {std::istreambuf_iterator<char>(file), std::istreambuf_iterator<char>()};
+}
+
+const JsonValue* Find(const JsonValue& object, const char* key)
+{
+    return object.type == JsonValue::Type::Object ? object.Find(key) : nullptr;
+}
+
+float ReadFloat(const JsonValue& object, const char* key, float fallback)
+{
+    if (const JsonValue* value = Find(object, key))
+        return static_cast<float>(value->NumberOr(fallback));
+    return fallback;
+}
+
+std::uint32_t ReadU32(const JsonValue& object, const char* key, std::uint32_t fallback)
+{
+    if (const JsonValue* value = Find(object, key))
+        return static_cast<std::uint32_t>(std::max(0.0, value->NumberOr(fallback)));
+    return fallback;
+}
+
+bool ReadBool(const JsonValue& object, const char* key, bool fallback)
+{
+    if (const JsonValue* value = Find(object, key))
+        return value->BoolOr(fallback);
+    return fallback;
+}
+
+std::string ReadString(const JsonValue& object, const char* key, const std::string& fallback = {})
+{
+    if (const JsonValue* value = Find(object, key))
+        return value->StringOr(fallback);
+    return fallback;
+}
+
+void ReadFloatArray(const JsonValue& object, const char* key, float* values, size_t count)
+{
+    const JsonValue* array = Find(object, key);
+    if (!array || array->type != JsonValue::Type::Array)
+        return;
+    for (size_t i = 0; i < count && i < array->array.size(); ++i)
+        values[i] = static_cast<float>(array->array[i].NumberOr(values[i]));
+}
+
+std::string FloatArray(const float* values, size_t count)
+{
+    std::ostringstream out;
+    out << '[';
+    for (size_t i = 0; i < count; ++i)
+    {
+        if (i > 0)
+            out << ", ";
+        out << values[i];
+    }
+    out << ']';
+    return out.str();
+}
+
+void WriteWaterConfig(std::ostream& out, const WaterConfig& config, int indent)
+{
+    const std::string pad(static_cast<size_t>(indent), ' ');
+    out << pad << "\"water_config\": {\n";
+    out << pad << "  \"enabled\": " << (config.enabled ? "true" : "false") << ",\n";
+    out << pad << "  \"water_level_y\": " << config.waterLevelY << ",\n";
+    out << pad << "  \"base_color\": " << FloatArray(config.baseColor, 4) << ",\n";
+    out << pad << "  \"deep_color\": " << FloatArray(config.deepColor, 3) << ",\n";
+    out << pad << "  \"shallow_color\": " << FloatArray(config.shallowColor, 3) << ",\n";
+    out << pad << "  \"foam_intensity\": " << config.foamIntensity << ",\n";
+    out << pad << "  \"edge_fade_distance\": " << config.edgeFadeDistance << ",\n";
+    out << pad << "  \"edge_fade_curve\": " << static_cast<int>(config.edgeFadeCurve) << "\n";
+    out << pad << '}';
+}
+
+void ReadWaterConfig(const JsonValue& object, WaterConfig& config)
+{
+    const JsonValue* water = Find(object, "water_config");
+    if (!water || water->type != JsonValue::Type::Object)
+        return;
+    config.enabled = ReadBool(*water, "enabled", config.enabled);
+    config.waterLevelY = ReadFloat(*water, "water_level_y", config.waterLevelY);
+    ReadFloatArray(*water, "base_color", config.baseColor, 4);
+    ReadFloatArray(*water, "deep_color", config.deepColor, 3);
+    ReadFloatArray(*water, "shallow_color", config.shallowColor, 3);
+    config.foamIntensity = ReadFloat(*water, "foam_intensity", config.foamIntensity);
+    config.edgeFadeDistance = ReadFloat(*water, "edge_fade_distance", config.edgeFadeDistance);
+    config.edgeFadeCurve = static_cast<WaterConfig::EdgeFadeCurve>(
+        std::clamp<int>(static_cast<int>(ReadFloat(*water, "edge_fade_curve", static_cast<float>(config.edgeFadeCurve))), 0, 2));
+}
+
+void WritePaletteSlot(std::ostream& out, const MapEditorPaletteSlot& slot, bool comma)
+{
+    out << "    {\n";
+    out << "      \"slot\": " << slot.slot << ",\n";
+    out << "      \"asset_id\": \"" << EscapeJson(slot.assetId) << "\",\n";
+    out << "      \"display_name\": \"" << EscapeJson(slot.displayName) << "\",\n";
+    out << "      \"texture_path\": \"" << EscapeJson(slot.texturePath) << "\",\n";
+    out << "      \"normal_texture_path\": \"" << EscapeJson(slot.normalTexturePath) << "\",\n";
+    out << "      \"tiling\": [" << slot.tilingScaleX << ", " << slot.tilingScaleY << "]\n";
+    out << "    }" << (comma ? "," : "") << "\n";
+}
+
+MapEditorPaletteSlot ReadPaletteSlot(const JsonValue& object)
+{
+    MapEditorPaletteSlot slot;
+    slot.slot = ReadU32(object, "slot", slot.slot);
+    slot.assetId = ReadString(object, "asset_id");
+    slot.displayName = ReadString(object, "display_name");
+    slot.texturePath = ReadString(object, "texture_path");
+    slot.normalTexturePath = ReadString(object, "normal_texture_path");
+    ReadFloatArray(object, "tiling", &slot.tilingScaleX, 2);
+    return slot;
+}
+
+void WriteSceneEntity(std::ostream& out,
+                      const WaterBody& body,
+                      const std::string& maskRef,
+                      bool comma)
+{
+    out << "    {\n";
+    out << "      \"type\": \"water_body\",\n";
+    out << "      \"id\": " << body.id << ",\n";
+    out << "      \"name\": \"" << EscapeJson(body.name) << "\",\n";
+    out << "      \"bbox_min\": " << FloatArray(body.bboxMin, 2) << ",\n";
+    out << "      \"bbox_max\": " << FloatArray(body.bboxMax, 2) << ",\n";
+    out << "      \"water_level_y\": " << body.waterLevelY << ",\n";
+    out << "      \"material_id\": \"" << EscapeJson(body.materialId) << "\",\n";
+    out << "      \"mask_width\": " << body.maskWidth << ",\n";
+    out << "      \"mask_height\": " << body.maskHeight << ",\n";
+    out << "      \"shape_mask_ref\": \"" << EscapeJson(maskRef) << "\",\n";
+    WriteWaterConfig(out, body.config, 6);
+    out << "\n    }" << (comma ? "," : "") << "\n";
+}
+
+void WriteSceneEntity(std::ostream& out, const PointLight& light, bool comma)
+{
+    out << "    {\n";
+    out << "      \"type\": \"dynamic_light\",\n";
+    out << "      \"id\": " << light.id << ",\n";
+    out << "      \"name\": \"" << EscapeJson(light.name) << "\",\n";
+    out << "      \"light_type\": \"point\",\n";
+    out << "      \"position\": " << FloatArray(light.position, 3) << ",\n";
+    const float color[3] = {light.r, light.g, light.b};
+    out << "      \"color\": " << FloatArray(color, 3) << ",\n";
+    out << "      \"intensity\": " << light.intensity << ",\n";
+    out << "      \"radius\": " << light.radius << ",\n";
+    out << "      \"enabled\": " << (light.enabled ? "true" : "false") << "\n";
+    out << "    }" << (comma ? "," : "") << "\n";
+}
+
+void WriteSceneEntity(std::ostream& out, const SpotLight& light, bool comma)
+{
+    out << "    {\n";
+    out << "      \"type\": \"dynamic_light\",\n";
+    out << "      \"id\": " << light.id << ",\n";
+    out << "      \"name\": \"" << EscapeJson(light.name) << "\",\n";
+    out << "      \"light_type\": \"spot\",\n";
+    out << "      \"position\": " << FloatArray(light.position, 3) << ",\n";
+    out << "      \"rotation\": " << FloatArray(light.rotation, 3) << ",\n";
+    const float color[3] = {light.r, light.g, light.b};
+    out << "      \"color\": " << FloatArray(color, 3) << ",\n";
+    out << "      \"intensity\": " << light.intensity << ",\n";
+    out << "      \"radius\": " << light.radius << ",\n";
+    out << "      \"inner_cone_deg\": " << light.innerConeDegrees << ",\n";
+    out << "      \"outer_cone_deg\": " << light.outerConeDegrees << ",\n";
+    out << "      \"enabled\": " << (light.enabled ? "true" : "false") << "\n";
+    out << "    }" << (comma ? "," : "") << "\n";
+}
+
+PointLight ReadPointLight(const JsonValue& entity)
+{
+    PointLight light;
+    light.id = ReadU32(entity, "id", light.id);
+    light.name = ReadString(entity, "name", light.name);
+    ReadFloatArray(entity, "position", light.position, 3);
+    float color[3] = {light.r, light.g, light.b};
+    ReadFloatArray(entity, "color", color, 3);
+    light.r = color[0];
+    light.g = color[1];
+    light.b = color[2];
+    light.intensity = ReadFloat(entity, "intensity", light.intensity);
+    light.radius = ReadFloat(entity, "radius", light.radius);
+    light.enabled = ReadBool(entity, "enabled", light.enabled);
+    return light;
+}
+
+SpotLight ReadSpotLight(const JsonValue& entity)
+{
+    SpotLight light;
+    light.id = ReadU32(entity, "id", light.id);
+    light.name = ReadString(entity, "name", light.name);
+    ReadFloatArray(entity, "position", light.position, 3);
+    ReadFloatArray(entity, "rotation", light.rotation, 3);
+    float color[3] = {light.r, light.g, light.b};
+    ReadFloatArray(entity, "color", color, 3);
+    light.r = color[0];
+    light.g = color[1];
+    light.b = color[2];
+    light.intensity = ReadFloat(entity, "intensity", light.intensity);
+    light.radius = ReadFloat(entity, "radius", light.radius);
+    light.innerConeDegrees = ReadFloat(entity, "inner_cone_deg", light.innerConeDegrees);
+    light.outerConeDegrees = ReadFloat(entity, "outer_cone_deg", light.outerConeDegrees);
+    light.enabled = ReadBool(entity, "enabled", light.enabled);
+    return light;
+}
+}
+
+SceneManager& SceneManager::Instance()
+{
+    static SceneManager manager;
+    return manager;
+}
+
+void SceneManager::SetWindowTitleCallback(std::function<void(const std::string&)> callback)
+{
+    m_windowTitleCallback = std::move(callback);
+    UpdateWindowTitle();
+}
+
+void SceneManager::SetRuntimeUiCallbacks(std::function<void()> hideAllCallback,
+                                         std::function<void()> showLoginCallback,
+                                         std::function<void()> showLobbyCallback,
+                                         std::function<void()> showHudCallback,
+                                         std::function<void()> showLoadingCallback)
+{
+    m_hideAllRuntimeUiCallback = std::move(hideAllCallback);
+    m_showLoginCallback = std::move(showLoginCallback);
+    m_showLobbyCallback = std::move(showLobbyCallback);
+    m_showHudCallback = std::move(showHudCallback);
+    m_showLoadingCallback = std::move(showLoadingCallback);
+}
+
+void SceneManager::SetCurrentSceneSnapshot(const SceneData& scene)
+{
+    SceneData snapshot = scene;
+    snapshot.name = m_currentScene.name.empty() ? scene.name : m_currentScene.name;
+    snapshot.sceneType = m_currentScene.sceneType;
+    m_currentScene = std::move(snapshot);
+}
+
+void SceneManager::RestoreSceneSnapshot(const SceneData& scene, const std::string& path, bool dirty)
+{
+    m_currentScene = scene;
+    m_pendingScene = scene;
+    m_hasPendingScene = true;
+    m_currentScenePath = path;
+    m_sceneOpen = true;
+    m_isDirty = dirty;
+    UpdateWindowTitle();
+    ActivateSceneType(m_currentScene.sceneType);
+    Tracenf("[SCENE] Restored snapshot: name=%s scene_type=%s path=%s dirty=%d",
+        m_currentScene.name.c_str(),
+        m_currentScene.sceneType.c_str(),
+        m_currentScenePath.c_str(),
+        m_isDirty ? 1 : 0);
+}
+
+bool SceneManager::ConsumePendingScene(SceneData& outScene)
+{
+    if (!m_hasPendingScene)
+        return false;
+    outScene = m_pendingScene;
+    m_hasPendingScene = false;
+    return true;
+}
+
+void SceneManager::NewScene()
+{
+    if (m_isDirty && !PromptSaveBeforeAction("New Scene"))
+        return;
+
+    m_currentScene = SceneData{};
+    m_currentScenePath.clear();
+    m_sceneOpen = true;
+    m_isDirty = false;
+    m_pendingScene = m_currentScene;
+    m_hasPendingScene = true;
+    UpdateWindowTitle();
+    Tracen("[SCENE] New empty scene created");
+    ActivateSceneType(m_currentScene.sceneType);
+}
+
+bool SceneManager::LoadScene(const std::string& path)
+{
+    if (m_isDirty && !PromptSaveBeforeAction("Open Scene"))
+        return false;
+    return LoadSceneInternal(ResolveProjectScenePath(path));
+}
+
+bool SceneManager::SaveScene()
+{
+    if (m_currentScenePath.empty())
+        return SaveSceneAs({});
+    return SaveSceneInternal(m_currentScenePath);
+}
+
+bool SceneManager::SaveSceneAs(const std::string& path)
+{
+    std::string target = path.empty() ? DefaultProjectScenePath(m_currentScene) : path;
+    if (target.empty())
+        target = SaveSceneDialog();
+    if (target.empty())
+        return false;
+    target = ResolveProjectScenePath(target);
+    if (std::filesystem::path(target).extension().empty())
+        target += ".scene";
+    return SaveSceneInternal(target);
+}
+
+void SceneManager::CloseScene()
+{
+    m_currentScene = SceneData{};
+    m_currentScenePath.clear();
+    m_sceneOpen = false;
+    m_isDirty = false;
+    m_pendingScene = m_currentScene;
+    m_hasPendingScene = true;
+    UpdateWindowTitle();
+    ActivateSceneType(m_currentScene.sceneType);
+}
+
+void SceneManager::SetSceneName(const std::string& name)
+{
+    m_currentScene.name = name.empty() ? "Untitled" : name;
+    MarkDirty();
+}
+
+void SceneManager::SetSceneType(const std::string& sceneType)
+{
+    const std::string normalized = sceneType.empty() ? "empty" : sceneType;
+    if (m_currentScene.sceneType == normalized)
+        return;
+    m_currentScene.sceneType = normalized;
+    MarkDirty();
+    ActivateSceneType(m_currentScene.sceneType);
+}
+
+void SceneManager::ActivateCurrentSceneType()
+{
+    ActivateSceneType(m_currentScene.sceneType);
+}
+
+void SceneManager::MarkDirty()
+{
+    if (!m_isDirty)
+        Tracen("[SCENE] Dirty mark");
+    m_isDirty = true;
+    UpdateWindowTitle();
+}
+
+bool SceneManager::LoadSceneInternal(const std::string& path)
+{
+    Tracenf("[SCENE] Loading: %s", path.c_str());
+    Tracenf("[SCENE] load attempt: %s", path.c_str());
+    std::ifstream file(path);
+    if (!file)
+    {
+        TraceError("[SCENE] Failed to open: %s", path.c_str());
+        TraceError("[SCENE] load FAILED: file not found/unreadable path=%s", path.c_str());
+        return false;
+    }
+
+    std::string text((std::istreambuf_iterator<char>(file)), std::istreambuf_iterator<char>());
+    JsonValue root;
+    if (!JsonParser(std::move(text)).Parse(root) || root.type != JsonValue::Type::Object)
+    {
+        TraceError("[SCENE] JSON parse error: %s", path.c_str());
+        TraceError("[SCENE] load FAILED: parse error path=%s", path.c_str());
+        return false;
+    }
+
+    if (static_cast<int>(ReadFloat(root, "version", 1.0f)) != 1)
+    {
+        TraceError("[SCENE] Unsupported scene version");
+        TraceError("[SCENE] load FAILED: unsupported version path=%s", path.c_str());
+        return false;
+    }
+
+    SceneData scene;
+    const JsonValue* metadata = Find(root, "metadata");
+    if (metadata)
+    {
+        scene.name = ReadString(*metadata, "name", SceneNameFromPath(path));
+        scene.sceneType = ReadString(*metadata, "scene_type", "world");
+    }
+    if (const JsonValue* camera = Find(root, "camera"))
+    {
+        ReadFloatArray(*camera, "position", scene.cameraPosition, 3);
+        ReadFloatArray(*camera, "rotation", scene.cameraRotation, 4);
+        scene.cameraFov = ReadFloat(*camera, "fov", scene.cameraFov);
+        scene.cameraNear = ReadFloat(*camera, "near", scene.cameraNear);
+        scene.cameraFar = ReadFloat(*camera, "far", scene.cameraFar);
+    }
+    if (const JsonValue* env = Find(root, "environment"))
+    {
+        scene.lighting.directional.elevationDegrees = ReadFloat(*env, "directional_light_angle_x", scene.lighting.directional.elevationDegrees);
+        scene.lighting.directional.azimuthDegrees = ReadFloat(*env, "directional_light_angle_y", scene.lighting.directional.azimuthDegrees);
+        scene.lighting.directional.intensity = ReadFloat(*env, "directional_light_intensity", scene.lighting.directional.intensity);
+        float dirColor[3] = {scene.lighting.directional.r, scene.lighting.directional.g, scene.lighting.directional.b};
+        ReadFloatArray(*env, "directional_light_color", dirColor, 3);
+        scene.lighting.directional.r = dirColor[0];
+        scene.lighting.directional.g = dirColor[1];
+        scene.lighting.directional.b = dirColor[2];
+        scene.lighting.ambient.intensity = ReadFloat(*env, "ambient_intensity", scene.lighting.ambient.intensity);
+        float ambientColor[3] = {scene.lighting.ambient.r, scene.lighting.ambient.g, scene.lighting.ambient.b};
+        ReadFloatArray(*env, "ambient_color", ambientColor, 3);
+        scene.lighting.ambient.r = ambientColor[0];
+        scene.lighting.ambient.g = ambientColor[1];
+        scene.lighting.ambient.b = ambientColor[2];
+    }
+    scene.terrainRef = ReadString(root, "terrain_ref");
+    scene.splatRef = ReadString(root, "splat_ref");
+
+    const std::filesystem::path sceneDir = std::filesystem::path(path).parent_path();
+    if (const JsonValue* entities = Find(root, "entities"); entities && entities->type == JsonValue::Type::Array)
+    {
+        for (const JsonValue& entity : entities->array)
+        {
+            const std::string type = ReadString(entity, "type");
+            if (type == "water_body")
+            {
+                WaterBody body;
+                body.id = ReadU32(entity, "id", body.id);
+                body.name = ReadString(entity, "name");
+                ReadFloatArray(entity, "bbox_min", body.bboxMin, 2);
+                ReadFloatArray(entity, "bbox_max", body.bboxMax, 2);
+                body.waterLevelY = ReadFloat(entity, "water_level_y", body.waterLevelY);
+                body.materialId = ReadString(entity, "material_id");
+                body.maskWidth = ReadU32(entity, "mask_width", body.maskWidth);
+                body.maskHeight = ReadU32(entity, "mask_height", body.maskHeight);
+                ReadWaterConfig(entity, body.config);
+                body.config.waterLevelY = body.waterLevelY;
+                const std::string maskRef = ReadString(entity, "shape_mask_ref");
+                if (!maskRef.empty())
+                    body.shapeMask = ReadBytes(sceneDir / maskRef);
+                scene.waterBodies.push_back(std::move(body));
+            }
+            else if (type == "dynamic_light")
+            {
+                const std::string lightType = ReadString(entity, "light_type");
+                if (lightType == "point")
+                    scene.pointLights.push_back(ReadPointLight(entity));
+                else if (lightType == "spot")
+                    scene.spotLights.push_back(ReadSpotLight(entity));
+                else
+                    Tracenf("[SCENE] Unknown dynamic light type: %s", lightType.c_str());
+            }
+            else
+            {
+                Tracenf("[SCENE] Unknown entity type: %s", type.c_str());
+            }
+        }
+    }
+    if (const JsonValue* palette = Find(root, "terrain_palette"); palette && palette->type == JsonValue::Type::Array)
+    {
+        for (const JsonValue& slotJson : palette->array)
+        {
+            MapEditorPaletteSlot slot = ReadPaletteSlot(slotJson);
+            if (slot.slot < scene.paletteSlots.size())
+                scene.paletteSlots[slot.slot] = slot;
+        }
+    }
+    if (const JsonValue* preload = Find(root, "preload_assets"); preload && preload->type == JsonValue::Type::Array)
+    {
+        for (const JsonValue& value : preload->array)
+            scene.preloadAssets.push_back(value.StringOr());
+    }
+
+    scene.lighting.numPointLights = static_cast<std::uint32_t>(std::min<std::size_t>(scene.pointLights.size(), kMaxDynamicPointLights));
+    for (std::uint32_t i = 0; i < scene.lighting.numPointLights; ++i)
+        scene.lighting.pointLights[i] = scene.pointLights[i];
+    scene.lighting.numSpotLights = static_cast<std::uint32_t>(std::min<std::size_t>(scene.spotLights.size(), kMaxDynamicSpotLights));
+    for (std::uint32_t i = 0; i < scene.lighting.numSpotLights; ++i)
+        scene.lighting.spotLights[i] = scene.spotLights[i];
+
+    m_currentScene = scene;
+    m_pendingScene = scene;
+    m_hasPendingScene = true;
+    m_currentScenePath = path;
+    m_sceneOpen = true;
+    m_isDirty = false;
+    UpdateRecentList(path);
+    UpdateWindowTitle();
+    ActivateSceneType(m_currentScene.sceneType);
+    Tracenf("[SCENE] load OK: name=%s scene_type=%s water=%zu point_lights=%zu spot_lights=%zu",
+        m_currentScene.name.c_str(),
+        m_currentScene.sceneType.c_str(),
+        m_currentScene.waterBodies.size(),
+        m_currentScene.pointLights.size(),
+        m_currentScene.spotLights.size());
+    Tracenf("[SCENE] Loaded successfully: %s (%zu entities)",
+        path.c_str(),
+        scene.waterBodies.size() + scene.pointLights.size() + scene.spotLights.size());
+    return true;
+}
+
+bool SceneManager::SaveSceneInternal(const std::string& path)
+{
+    Tracenf("[SCENE] Saving: %s", path.c_str());
+    const std::filesystem::path scenePath(path);
+    if (!scenePath.parent_path().empty())
+        std::filesystem::create_directories(scenePath.parent_path());
+
+    SceneData scene = m_currentScene;
+    if (scene.name.empty())
+        scene.name = SceneNameFromPath(path);
+    const std::filesystem::path heightmapPath = SceneSidecarPath(scenePath, ".heightmap");
+    const std::filesystem::path splatPath = SceneSidecarPath(scenePath, ".splat");
+    WritePlaceholderBinary(heightmapPath, "IWHEIGHTMAP");
+    WritePlaceholderBinary(splatPath, "IWSPLAT");
+    scene.terrainRef = GenericPath(heightmapPath.filename());
+    scene.splatRef = GenericPath(splatPath.filename());
+
+    std::ofstream out(path);
+    if (!out)
+    {
+        TraceError("[SCENE] Failed to write: %s", path.c_str());
+        return false;
+    }
+
+    out << "{\n";
+    out << "  \"version\": 1,\n";
+    out << "  \"metadata\": {\n";
+    out << "    \"name\": \"" << EscapeJson(scene.name) << "\",\n";
+    out << "    \"scene_type\": \"" << EscapeJson(scene.sceneType) << "\",\n";
+    out << "    \"author\": \"editor\",\n";
+    out << "    \"modified_at\": \"" << TimestampUtc() << "\"\n";
+    out << "  },\n";
+    out << "  \"camera\": {\n";
+    out << "    \"position\": " << FloatArray(scene.cameraPosition, 3) << ",\n";
+    out << "    \"rotation\": " << FloatArray(scene.cameraRotation, 4) << ",\n";
+    out << "    \"fov\": " << scene.cameraFov << ",\n";
+    out << "    \"near\": " << scene.cameraNear << ",\n";
+    out << "    \"far\": " << scene.cameraFar << "\n";
+    out << "  },\n";
+    out << "  \"environment\": {\n";
+    out << "    \"time_of_day\": 12.0,\n";
+    const float dirColor[3] = {scene.lighting.directional.r, scene.lighting.directional.g, scene.lighting.directional.b};
+    out << "    \"directional_light_color\": " << FloatArray(dirColor, 3) << ",\n";
+    out << "    \"directional_light_intensity\": " << scene.lighting.directional.intensity << ",\n";
+    out << "    \"directional_light_angle_x\": " << scene.lighting.directional.elevationDegrees << ",\n";
+    out << "    \"directional_light_angle_y\": " << scene.lighting.directional.azimuthDegrees << ",\n";
+    const float ambientColor[3] = {scene.lighting.ambient.r, scene.lighting.ambient.g, scene.lighting.ambient.b};
+    out << "    \"ambient_color\": " << FloatArray(ambientColor, 3) << ",\n";
+    out << "    \"ambient_intensity\": " << scene.lighting.ambient.intensity << "\n";
+    out << "  },\n";
+    out << "  \"terrain_ref\": \"" << EscapeJson(scene.terrainRef) << "\",\n";
+    out << "  \"splat_ref\": \"" << EscapeJson(scene.splatRef) << "\",\n";
+    out << "  \"entities\": [\n";
+
+    const size_t entityCount = scene.waterBodies.size() + scene.pointLights.size() + scene.spotLights.size();
+    size_t entityIndex = 0;
+    for (const WaterBody& body : scene.waterBodies)
+    {
+        const std::filesystem::path maskPath = scenePath.parent_path() /
+            (scenePath.stem().string() + "_water_" + std::to_string(body.id) + ".mask");
+        WriteBytes(maskPath, body.shapeMask);
+        WriteSceneEntity(out, body, GenericPath(maskPath.filename()), ++entityIndex < entityCount);
+    }
+    for (const PointLight& light : scene.pointLights)
+        WriteSceneEntity(out, light, ++entityIndex < entityCount);
+    for (const SpotLight& light : scene.spotLights)
+        WriteSceneEntity(out, light, ++entityIndex < entityCount);
+
+    out << "  ],\n";
+    out << "  \"terrain_palette\": [\n";
+    for (size_t i = 0; i < scene.paletteSlots.size(); ++i)
+        WritePaletteSlot(out, scene.paletteSlots[i], i + 1 < scene.paletteSlots.size());
+    out << "  ],\n";
+    out << "  \"preload_assets\": [";
+    for (size_t i = 0; i < scene.preloadAssets.size(); ++i)
+    {
+        if (i > 0)
+            out << ", ";
+        out << "\"" << EscapeJson(scene.preloadAssets[i]) << "\"";
+    }
+    out << "]\n";
+    out << "}\n";
+
+    m_currentScene = scene;
+    m_currentScenePath = path;
+    m_sceneOpen = true;
+    m_isDirty = false;
+    UpdateRecentList(path);
+    UpdateWindowTitle();
+    Tracenf("[SCENE] Saved successfully: %s (%zu entities)", path.c_str(), entityCount);
+    return true;
+}
+
+bool SceneManager::PromptSaveBeforeAction(const std::string& actionName)
+{
+#if defined(_WIN32)
+    const std::string text = "The current scene has unsaved changes. Save before '" + actionName + "'?";
+    const int result = MessageBoxA(nullptr, text.c_str(), "Unsaved Changes", MB_YESNOCANCEL | MB_ICONWARNING | MB_DEFBUTTON1);
+    if (result == IDYES)
+        return SaveScene();
+    if (result == IDNO)
+        return true;
+    return false;
+#else
+    (void)actionName;
+    return true;
+#endif
+}
+
+void SceneManager::UpdateRecentList(const std::string& path)
+{
+    if (path.empty())
+        return;
+    const std::string recentPath = ProjectSceneRecentPath(path);
+    m_recentScenes.erase(std::remove(m_recentScenes.begin(), m_recentScenes.end(), recentPath), m_recentScenes.end());
+    m_recentScenes.insert(m_recentScenes.begin(), recentPath);
+    if (m_recentScenes.size() > 8)
+        m_recentScenes.resize(8);
+    ProjectManager::Instance().SetRecentScenes(m_recentScenes);
+    Tracenf("[SCENE] Recent: %s", recentPath.c_str());
+}
+
+void SceneManager::ActivateSceneType(const std::string& sceneType)
+{
+    const std::string type = sceneType.empty() ? "empty" : sceneType;
+    if (m_hideAllRuntimeUiCallback)
+    {
+        Tracen("[UI-ROUTE] HideAll callback present -> calling");
+        m_hideAllRuntimeUiCallback();
+    }
+    else
+    {
+        Tracen("[UI-ROUTE] HideAll callback missing");
+    }
+
+    if (type == "login")
+    {
+        Tracen("[UI-ROUTE] scene_type=login -> Login");
+        if (m_showLoginCallback)
+            m_showLoginCallback();
+    }
+    else if (type == "lobby")
+    {
+        Tracen("[UI-ROUTE] scene_type=lobby -> Lobby");
+        if (m_showLobbyCallback)
+            m_showLobbyCallback();
+    }
+    else if (type == "world")
+    {
+        Tracen("[UI-ROUTE] scene_type=world -> HUD");
+        if (m_showHudCallback)
+            m_showHudCallback();
+    }
+    else if (type == "loading")
+    {
+        Tracen("[UI-ROUTE] scene_type=loading -> loading");
+        if (m_showLoadingCallback)
+            m_showLoadingCallback();
+    }
+    else if (type == "empty")
+    {
+        Tracen("[UI-ROUTE] scene_type=empty -> none");
+    }
+    else
+    {
+        Tracenf("[UI-ROUTE] scene_type=%s -> none (unknown)", type.c_str());
+        TraceError("[SCENE] Unknown scene_type: %s", type.c_str());
+    }
+
+    Tracenf("[SCENE] Scene type activated: %s", type.c_str());
+}
+
+std::string SceneManager::OpenSceneDialog() const
+{
+#if defined(_WIN32)
+    char file[MAX_PATH]{};
+    OPENFILENAMEA ofn{};
+    ofn.lStructSize = sizeof(ofn);
+    ofn.lpstrTitle = "Open Scene";
+    ofn.lpstrFilter = "Scene Files (*.scene)\0*.scene\0All files (*.*)\0*.*\0\0";
+    ofn.lpstrFile = file;
+    ofn.nMaxFile = MAX_PATH;
+    ofn.Flags = OFN_FILEMUSTEXIST | OFN_PATHMUSTEXIST | OFN_NOCHANGEDIR;
+    if (GetOpenFileNameA(&ofn))
+        return file;
+#endif
+    return {};
+}
+
+std::string SceneManager::SaveSceneDialog() const
+{
+#if defined(_WIN32)
+    char file[MAX_PATH] = "untitled.scene";
+    OPENFILENAMEA ofn{};
+    ofn.lStructSize = sizeof(ofn);
+    ofn.lpstrTitle = "Save Scene As";
+    ofn.lpstrFilter = "Scene Files (*.scene)\0*.scene\0All files (*.*)\0*.*\0\0";
+    ofn.lpstrFile = file;
+    ofn.nMaxFile = MAX_PATH;
+    ofn.Flags = OFN_OVERWRITEPROMPT | OFN_PATHMUSTEXIST | OFN_NOCHANGEDIR;
+    ofn.lpstrDefExt = "scene";
+    if (GetSaveFileNameA(&ofn))
+        return file;
+#endif
+    return {};
+}
+
+void SceneManager::UpdateWindowTitle()
+{
+    std::string title = "AURIGA GLOBAL \xE2\x80\x94 Editor";
+    if (HasOpenScene())
+    {
+        std::string sceneLabel = std::filesystem::path(m_currentScenePath).filename().string();
+        if (sceneLabel.empty())
+            sceneLabel = m_currentScene.name.empty() ? "Untitled.scene" : m_currentScene.name;
+        title += " [" + sceneLabel + "]";
+        if (m_isDirty)
+            title += "*";
+    }
+    else
+    {
+        title += " [No Scene]";
+    }
+
+    if (m_windowTitleCallback)
+        m_windowTitleCallback(title);
+}

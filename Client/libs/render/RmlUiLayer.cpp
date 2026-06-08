@@ -1,6 +1,7 @@
 #include "RmlUiLayer.h"
 
 #include "Debug.h"
+#include "SceneManager.h"
 #include "VulkanDevice.h"
 #include "asset/IAssetReader.h"
 #include "network/CharacterListItem.h"
@@ -26,6 +27,18 @@
 
 namespace
 {
+void WarnSceneTypeMismatch(const char* call, const char* expected)
+{
+    const std::string& sceneType = SceneManager::Instance().GetCurrentSceneType();
+    if (sceneType != expected)
+    {
+        TraceError("[RMLUI] scene_type mismatch: %s called while active scene_type is '%s' (expected '%s')",
+            call,
+            sceneType.c_str(),
+            expected);
+    }
+}
+
 const char* VkResultName(VkResult result)
 {
     switch (result)
@@ -1230,6 +1243,9 @@ struct RmlUiLayer::Impl
     bool inventoryVisible = false;
     bool characterCreationVisible = false;
     bool initialized = false;
+    uint32_t viewportWidth = 0;
+    uint32_t viewportHeight = 0;
+    uint64_t lastFrameDiagSecond = UINT64_MAX;
 };
 
 RmlUiLayer::RmlUiLayer() = default;
@@ -1497,6 +1513,8 @@ bool RmlUiLayer::Create(VulkanDevice& device, client::asset::IAssetReader& asset
 {
     m_impl = std::make_unique<Impl>();
     m_impl->assets = &assets;
+    m_impl->viewportWidth = width;
+    m_impl->viewportHeight = height;
     if (!m_impl->renderer.Create(device, assets, width, height))
         return false;
 
@@ -1795,7 +1813,40 @@ void RmlUiLayer::Update()
 void RmlUiLayer::Render(VulkanDevice& device)
 {
     if (!m_impl || !m_impl->context || !device.IsFrameActive())
+    {
+        static uint32_t skippedLogs = 0;
+        if (skippedLogs < 3)
+        {
+            ++skippedLogs;
+            Tracenf("[FRAME] rmlui_render called = no, reason=%s",
+                !m_impl ? "no_impl" : !m_impl->context ? "no_context" : "inactive_frame");
+        }
         return;
+    }
+
+    const uint32_t visibleDocs =
+        (m_impl->loginVisible && m_impl->loginDocument ? 1u : 0u) +
+        (m_impl->lobbyVisible && m_impl->lobbyDocument ? 1u : 0u) +
+        (m_impl->hudVisible && m_impl->hudDocument ? 1u : 0u) +
+        (m_impl->menuVisible && m_impl->menuDocument ? 1u : 0u) +
+        (m_impl->settingsVisible && m_impl->settingsDocument ? 1u : 0u) +
+        (m_impl->inventoryVisible && m_impl->inventoryDocument ? 1u : 0u) +
+        (m_impl->characterCreationVisible && m_impl->characterCreationDocument ? 1u : 0u);
+    const uint64_t frameNumber = device.GetFrameNumber();
+    if (frameNumber < 3 || (frameNumber % 60u) == 0u)
+    {
+        Tracenf("[FRAME] rmlui_render called = yes, visible_docs = %u, login=%d lobby=%d hud=%d menu=%d settings=%d inventory=%d character=%d viewport=%ux%u",
+            visibleDocs,
+            m_impl->loginVisible ? 1 : 0,
+            m_impl->lobbyVisible ? 1 : 0,
+            m_impl->hudVisible ? 1 : 0,
+            m_impl->menuVisible ? 1 : 0,
+            m_impl->settingsVisible ? 1 : 0,
+            m_impl->inventoryVisible ? 1 : 0,
+            m_impl->characterCreationVisible ? 1 : 0,
+            m_impl->viewportWidth,
+            m_impl->viewportHeight);
+    }
 
     m_impl->renderer.BeginFrame(device.GetCommandBuffer(), device.GetFrameNumber(), device.GetSafeFrameNumber());
     m_impl->context->Render();
@@ -1807,6 +1858,8 @@ void RmlUiLayer::Resize(uint32_t width, uint32_t height)
     if (!m_impl)
         return;
 
+    m_impl->viewportWidth = width;
+    m_impl->viewportHeight = height;
     m_impl->renderer.Resize(width, height);
     if (m_impl->context)
         m_impl->context->SetDimensions(Rml::Vector2i(static_cast<int>(width), static_cast<int>(height)));
@@ -1884,6 +1937,27 @@ bool RmlUiLayer::OnInput(const InputEvent& event)
     }
 }
 
+void RmlUiLayer::HideAll()
+{
+    Tracenf("[RMLUI] HideAll called: docs login=%d lobby=%d hud=%d menu=%d settings=%d inventory=%d character=%d viewport=%ux%u",
+        m_impl && m_impl->loginDocument ? 1 : 0,
+        m_impl && m_impl->lobbyDocument ? 1 : 0,
+        m_impl && m_impl->hudDocument ? 1 : 0,
+        m_impl && m_impl->menuDocument ? 1 : 0,
+        m_impl && m_impl->settingsDocument ? 1 : 0,
+        m_impl && m_impl->inventoryDocument ? 1 : 0,
+        m_impl && m_impl->characterCreationDocument ? 1 : 0,
+        m_impl ? m_impl->viewportWidth : 0u,
+        m_impl ? m_impl->viewportHeight : 0u);
+    HideLogin();
+    HideLobby();
+    HideHud();
+    HideInventory();
+    HideSettings();
+    HideInGameMenu();
+    HideCharacterCreation();
+}
+
 void RmlUiLayer::SetLoginSubmitCallback(std::function<void(const std::string&, const std::string&, bool)> callback)
 {
     if (m_impl)
@@ -1893,8 +1967,15 @@ void RmlUiLayer::SetLoginSubmitCallback(std::function<void(const std::string&, c
 void RmlUiLayer::ShowLogin()
 {
     if (!m_impl || !m_impl->loginDocument)
+    {
+        Tracenf("[RMLUI] ShowLogin called: document_loaded=%d visible=0 viewport=%ux%u",
+            m_impl && m_impl->loginDocument ? 1 : 0,
+            m_impl ? m_impl->viewportWidth : 0u,
+            m_impl ? m_impl->viewportHeight : 0u);
         return;
+    }
 
+    WarnSceneTypeMismatch("ShowLogin", "login");
     m_impl->loginVisible = true;
     m_impl->lobbyVisible = false;
     m_impl->hudVisible = false;
@@ -1915,6 +1996,10 @@ void RmlUiLayer::ShowLogin()
     if (m_impl->characterCreationDocument)
         m_impl->characterCreationDocument->Hide();
     m_impl->loginDocument->Show();
+    Tracenf("[RMLUI] ShowLogin called: document_loaded=1 visible=%d viewport=%ux%u",
+        m_impl->loginVisible ? 1 : 0,
+        m_impl->viewportWidth,
+        m_impl->viewportHeight);
     if (Rml::Element* username = m_impl->loginDocument->GetElementById("login-username"))
         username->Focus(true);
 }
@@ -1958,8 +2043,15 @@ void RmlUiLayer::SetLobbyCallbacks(std::function<void(std::uint64_t)> enterWorld
 void RmlUiLayer::ShowLobby()
 {
     if (!m_impl || !m_impl->lobbyDocument)
+    {
+        Tracenf("[RMLUI] ShowLobby called: document_loaded=%d visible=0 viewport=%ux%u",
+            m_impl && m_impl->lobbyDocument ? 1 : 0,
+            m_impl ? m_impl->viewportWidth : 0u,
+            m_impl ? m_impl->viewportHeight : 0u);
         return;
+    }
 
+    WarnSceneTypeMismatch("ShowLobby", "lobby");
     m_impl->loginVisible = false;
     m_impl->hudVisible = false;
     m_impl->menuVisible = false;
@@ -1981,6 +2073,10 @@ void RmlUiLayer::ShowLobby()
     m_impl->lobbyVisible = true;
     m_impl->lobbyDocument->Show();
     SetLobbyStatusText(m_impl.get(), "Fetching characters...");
+    Tracenf("[RMLUI] ShowLobby called: document_loaded=1 visible=%d viewport=%ux%u",
+        m_impl->lobbyVisible ? 1 : 0,
+        m_impl->viewportWidth,
+        m_impl->viewportHeight);
     Tracen("[RMLUI-LOBBY] Lobby shown");
 }
 
@@ -2088,8 +2184,15 @@ bool RmlUiLayer::IsLobbyVisible() const
 void RmlUiLayer::ShowHud()
 {
     if (!m_impl || !m_impl->hudDocument)
+    {
+        Tracenf("[RMLUI] ShowHud called: document_loaded=%d visible=0 viewport=%ux%u",
+            m_impl && m_impl->hudDocument ? 1 : 0,
+            m_impl ? m_impl->viewportWidth : 0u,
+            m_impl ? m_impl->viewportHeight : 0u);
         return;
+    }
 
+    WarnSceneTypeMismatch("ShowHud", "world");
     m_impl->loginVisible = false;
     m_impl->lobbyVisible = false;
     m_impl->menuVisible = false;
@@ -2107,6 +2210,10 @@ void RmlUiLayer::ShowHud()
     if (m_impl->characterCreationDocument)
         m_impl->characterCreationDocument->Hide();
     m_impl->hudDocument->Show();
+    Tracenf("[RMLUI] ShowHud called: document_loaded=1 visible=%d viewport=%ux%u",
+        m_impl->hudVisible ? 1 : 0,
+        m_impl->viewportWidth,
+        m_impl->viewportHeight);
     Tracen("[RMLUI-HUD] HUD shown");
 }
 
