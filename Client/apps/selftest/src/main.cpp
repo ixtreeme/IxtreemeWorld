@@ -753,6 +753,11 @@ bool RunRenderChecks(const Options& options, TestContext& ctx)
     std::stringstream skinnedMeshRendererText;
     skinnedMeshRendererText << skinnedMeshRenderer.rdbuf();
     const std::string skinnedMeshRendererSource = skinnedMeshRendererText.str();
+    const std::filesystem::path staticMeshRendererPath = options.clientRoot / "libs" / "render" / "StaticMeshRenderer.cpp";
+    std::ifstream staticMeshRenderer(staticMeshRendererPath);
+    std::stringstream staticMeshRendererText;
+    staticMeshRendererText << staticMeshRenderer.rdbuf();
+    const std::string staticMeshRendererSource = staticMeshRendererText.str();
     ctx.Expect(skinnedMeshRendererSource.find("CreateReflectionPipeline") != std::string::npos &&
             skinnedMeshRendererSource.find("VK_CULL_MODE_FRONT_BIT") != std::string::npos &&
             skinnedMeshRendererSource.find("RenderInWorldReflection") != std::string::npos,
@@ -1314,10 +1319,25 @@ bool RunRenderChecks(const Options& options, TestContext& ctx)
     ctx.Expect(clientMainSource.find("std::vector<MeshSceneEntity> editorMeshEntities") != std::string::npos &&
             clientMainSource.find("createMeshEntityAt") != std::string::npos &&
             clientMainSource.find("resolveMeshRuntimePath") != std::string::npos &&
-            clientMainSource.find("ensureSkinnedMeshLoaded") != std::string::npos &&
-            clientMainSource.find("SkinnedMeshRenderer loaded") != std::string::npos &&
+            clientMainSource.find("getStaticMeshRenderer") != std::string::npos &&
+            clientMainSource.find("StaticMeshRenderer loaded") != std::string::npos &&
             clientMainSource.find("SelectedEditorObjectType::MeshEntity") != std::string::npos,
-        "mesh entity runtime source", "MESH-ENTITY-1 must route mesh entities through hierarchy selection, gizmo state, and SkinnedMeshRenderer rendering");
+        "mesh entity runtime source", "MESH-ENTITY-1/2 must route mesh entities through hierarchy selection, gizmo state, and static mesh rendering");
+    ctx.Expect(renderCmakeSource.find("StaticMeshRenderer.cpp") != std::string::npos &&
+            staticMeshRendererSource.find("bool StaticMeshRenderer::DetectSkinnedGltf") != std::string::npos &&
+            staticMeshRendererSource.find("!asset.skins.empty()") != std::string::npos &&
+            staticMeshRendererSource.find("node.skinIndex.has_value()") != std::string::npos &&
+            staticMeshRendererSource.find("JOINTS_0") != std::string::npos &&
+            staticMeshRendererSource.find("WEIGHTS_0") != std::string::npos &&
+            staticMeshRendererSource.find("LoadStatus::UnsupportedSkinned") != std::string::npos &&
+            staticMeshRendererSource.find("bool StaticMeshRenderer::LoadStaticGltfMesh") != std::string::npos &&
+            staticMeshRendererSource.find("skeleton.ozz") == std::string::npos,
+        "static mesh renderer source", "MESH-ENTITY-2 must add an ozz-free static glTF renderer with skinned detection");
+    ctx.Expect(clientMainSource.find("staticMeshCache") != std::string::npos &&
+            clientMainSource.find("UnsupportedSkinned") != std::string::npos &&
+            clientMainSource.find("StaticMeshRenderer::Instance") != std::string::npos &&
+            clientMainSource.find("ensureSkinnedMeshLoaded(activeMeshModelPath)") == std::string::npos,
+        "mesh entity static cache source", "MESH-ENTITY-2 must cache static/skinned/failed model states and avoid per-frame skinned retries for mesh entities");
     ctx.Expect(editorImGuiSource.find("void EditorImGui::RenderWorldPanel") != std::string::npos &&
             editorImGuiSource.find("ImGui::Begin(ICON_FA_GLOBE \" World\"") != std::string::npos &&
             editorImGuiSource.find("RenderWorldPanel();") != std::string::npos &&

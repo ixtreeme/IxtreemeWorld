@@ -26,6 +26,8 @@ add_library(client_render STATIC
     UIHelpers.h
     WaterBodyIO.cpp
     WaterBodyIO.h
+    StaticMeshRenderer.cpp
+    StaticMeshRenderer.h
     SkinnedMeshRenderer.cpp
     SkinnedMeshRenderer.h
     WorldCamera.h

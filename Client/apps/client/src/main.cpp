@@ -17,6 +17,7 @@
 #include "RuntimeSession.h"
 #include "RuntimeUiAdapter.h"
 #include "SceneManager.h"
+#include "StaticMeshRenderer.h"
 #include "TerrainRenderer.h"
 #include "VulkanDevice.h"
 #include "SkinnedMeshRenderer.h"
@@ -1250,6 +1251,20 @@ int RunGame(NativeWindow& window,
             terrain.RecreatePipeline(device);
         }
     }
+    struct StaticMeshCacheEntry
+    {
+        enum class State
+        {
+            Unknown,
+            LoadedStatic,
+            UnsupportedSkinned,
+            Failed
+        };
+
+        std::unique_ptr<StaticMeshRenderer> renderer;
+        State state = State::Unknown;
+    };
+    std::unordered_map<std::string, StaticMeshCacheEntry> staticMeshCache;
     auto ensureSkinnedMeshLoaded = [&](const std::string& modelPath) {
         if (modelPath.empty())
             return false;
@@ -1293,6 +1308,45 @@ int RunGame(NativeWindow& window,
                 return stored.generic_string();
         }
         return mesh.meshAssetPath;
+    };
+    auto getStaticMeshRenderer = [&](const std::string& modelPath) -> StaticMeshRenderer* {
+        if (modelPath.empty())
+            return nullptr;
+        auto& entry = staticMeshCache[modelPath];
+        if (entry.state == StaticMeshCacheEntry::State::LoadedStatic)
+            return entry.renderer.get();
+        if (entry.state == StaticMeshCacheEntry::State::UnsupportedSkinned ||
+            entry.state == StaticMeshCacheEntry::State::Failed)
+            return nullptr;
+
+        bool isSkinned = false;
+        std::string inspectError;
+        if (!StaticMeshRenderer::DetectSkinnedGltf(assets, modelPath, isSkinned, &inspectError))
+        {
+            entry.state = StaticMeshCacheEntry::State::Failed;
+            TraceError("[MESH-ENTITY] Static mesh inspect failed: %s (%s)", modelPath.c_str(), inspectError.c_str());
+            return nullptr;
+        }
+        if (isSkinned)
+        {
+            entry.state = StaticMeshCacheEntry::State::UnsupportedSkinned;
+            Tracenf("[MESH-ENTITY] Skinned glTF detected and skipped for mesh entity static path: %s", modelPath.c_str());
+            return nullptr;
+        }
+
+        entry.renderer = std::make_unique<StaticMeshRenderer>();
+        if (offscreenSceneOk)
+            entry.renderer->SetMainRenderPass(offscreenScene.GetRenderPass());
+        if (!entry.renderer->Create(device, assets, modelPath))
+        {
+            entry.renderer.reset();
+            entry.state = StaticMeshCacheEntry::State::Failed;
+            TraceError("[MESH-ENTITY] Static mesh load failed: %s", modelPath.c_str());
+            return nullptr;
+        }
+        entry.state = StaticMeshCacheEntry::State::LoadedStatic;
+        Tracenf("[MESH-ENTITY] StaticMeshRenderer loaded: %s", modelPath.c_str());
+        return entry.renderer.get();
     };
 
     runtimeSession->SetQuitCallback([&window]()
@@ -2105,6 +2159,12 @@ int RunGame(NativeWindow& window,
                     {
                         if (skinnedMeshOk)
                             skinnedMesh.SetMainRenderPass(offscreenScene.GetRenderPass());
+                        for (auto& [path, entry] : staticMeshCache)
+                        {
+                            (void)path;
+                            if (entry.renderer)
+                                entry.renderer->SetMainRenderPass(offscreenScene.GetRenderPass());
+                        }
                         if (terrainOk)
                         {
                             terrain.SetMainRenderPass(offscreenScene.GetRenderPass());
@@ -2117,6 +2177,12 @@ int RunGame(NativeWindow& window,
                 }
                 if (skinnedMeshOk)
                     skinnedMesh.RecreatePipeline(device);
+                for (auto& [path, entry] : staticMeshCache)
+                {
+                    (void)path;
+                    if (entry.renderer)
+                        entry.renderer->RecreatePipeline(device);
+                }
                 if (terrainOk)
                     terrain.RecreatePipeline(device);
                 if (worldLabelsOk)
@@ -2699,7 +2765,7 @@ int RunGame(NativeWindow& window,
                     mesh.position[0] = spawn.x;
                     mesh.position[1] = spawn.y;
                     mesh.position[2] = spawn.z;
-                    mesh.skinned = true;
+                    mesh.skinned = false;
                     editorMeshEntities.push_back(mesh);
                     selectedEditorObject = {SelectedEditorObjectType::MeshEntity, mesh.id};
                     editorGizmoMode = EditorGizmoMode::Translate;
@@ -3156,30 +3222,6 @@ int RunGame(NativeWindow& window,
             const bool isInWorld = runtimeSession->IsInWorld();
             std::vector<WorldRenderEntity> entities;
             WorldCamera camera{};
-            const bool editorHideEntitiesForMeshes =
-#if defined(IXTREEME_WITH_EDITOR)
-                editorPlay.state.mode == EditorPlayMode::Edit;
-#else
-                false;
-#endif
-            std::string activeMeshModelPath;
-            if (runtimeSession->IsMapEditorOpen())
-            {
-                for (const MeshSceneEntity& mesh : editorMeshEntities)
-                {
-                    if (editorHideEntitiesForMeshes && mesh.editorHidden)
-                        continue;
-                    const std::string runtimePath = resolveMeshRuntimePath(mesh);
-                    if (!runtimePath.empty())
-                    {
-                        activeMeshModelPath = runtimePath;
-                        break;
-                    }
-                }
-                if (!activeMeshModelPath.empty())
-                    ensureSkinnedMeshLoaded(activeMeshModelPath);
-            }
-
             if (isInWorld)
             {
                 entities = frameEntities;
@@ -3310,31 +3352,6 @@ int RunGame(NativeWindow& window,
                                         : std::array<float, 4>{0.35f, 1.25f, 1.65f, 1.0f});
                                 ++skinSlot;
                             }
-                            for (const MeshSceneEntity& mesh : editorMeshEntities)
-                            {
-                                if (editorPlay.state.mode == EditorPlayMode::Edit && mesh.editorHidden)
-                                    continue;
-                                if (resolveMeshRuntimePath(mesh) != loadedSkinnedMeshPath)
-                                    continue;
-                                if (skinSlot >= SkinnedMeshRenderer::MaxSkinSlots())
-                                    break;
-                                WorldVec3 position{mesh.position[0], mesh.position[1] + skinnedMesh.GroundOffsetY(), mesh.position[2]};
-                                const bool selected =
-                                    selectedEditorObject.type == SelectedEditorObjectType::MeshEntity &&
-                                    selectedEditorObject.id == mesh.id;
-                                skinnedMesh.RenderInWorldReflection(device,
-                                    mirrorCamera,
-                                    reflectionExtent,
-                                    reflectionRenderPass,
-                                    waterLevelY,
-                                    position,
-                                    mesh.rotation[1],
-                                    skinSlot,
-                                    selected
-                                        ? std::array<float, 4>{1.25f, 1.05f, 0.45f, 1.0f}
-                                        : std::array<float, 4>{1.0f, 1.0f, 1.0f, 1.0f});
-                                ++skinSlot;
-                            }
                         }
                     });
             }
@@ -3458,27 +3475,33 @@ int RunGame(NativeWindow& window,
                             selected});
                         ++skinSlot;
                     }
+                }
+                if (runtimeSession->IsMapEditorOpen())
+                {
                     for (const MeshSceneEntity& mesh : editorMeshEntities)
                     {
                         if (editorPlay.state.mode == EditorPlayMode::Edit && mesh.editorHidden)
                             continue;
-                        if (resolveMeshRuntimePath(mesh) != loadedSkinnedMeshPath)
-                            continue;
-                        if (skinSlot >= SkinnedMeshRenderer::MaxSkinSlots())
-                            break;
-                        WorldVec3 position{mesh.position[0], mesh.position[1] + skinnedMesh.GroundOffsetY(), mesh.position[2]};
                         const bool selected =
                             selectedEditorObject.type == SelectedEditorObjectType::MeshEntity &&
                             selectedEditorObject.id == mesh.id;
-                        skinnedMesh.RenderInWorld(device,
-                            seconds,
-                            camera,
-                            position,
-                            mesh.rotation[1],
-                            skinSlot,
-                            selected
+                        const std::string runtimePath = resolveMeshRuntimePath(mesh);
+                        if (StaticMeshRenderer* renderer = getStaticMeshRenderer(runtimePath))
+                        {
+                            renderer->SetLightingState(runtimeSession->GetLightingState());
+                            StaticMeshRenderer::Instance instance{};
+                            instance.position = {mesh.position[0], mesh.position[1], mesh.position[2]};
+                            instance.rotation[0] = mesh.rotation[0];
+                            instance.rotation[1] = mesh.rotation[1];
+                            instance.rotation[2] = mesh.rotation[2];
+                            instance.scale[0] = mesh.scale[0];
+                            instance.scale[1] = mesh.scale[1];
+                            instance.scale[2] = mesh.scale[2];
+                            instance.tint = selected
                                 ? std::array<float, 4>{1.25f, 1.05f, 0.45f, 1.0f}
-                                : std::array<float, 4>{1.0f, 1.0f, 1.0f, 1.0f});
+                                : std::array<float, 4>{1.0f, 1.0f, 1.0f, 1.0f};
+                            renderer->RenderInWorld(device, seconds, camera, instance);
+                        }
                         plates.push_back(WorldLabelRenderer::Label{
                             WorldAdd({mesh.position[0], mesh.position[1], mesh.position[2]}, {0.0f, 1.8f, 0.0f}),
                             mesh.name.empty() ? "Mesh Entity " + std::to_string(mesh.id) : mesh.name,
@@ -3486,7 +3509,6 @@ int RunGame(NativeWindow& window,
                                 ? std::array<float, 4>{1.0f, 0.86f, 0.32f, 1.0f}
                                 : std::array<float, 4>{0.92f, 0.92f, 1.0f, 1.0f},
                             selected});
-                        ++skinSlot;
                     }
                 }
                 if (!useOffscreenScene && terrainOk)
@@ -3563,6 +3585,12 @@ int RunGame(NativeWindow& window,
     device.WaitIdle();
     if (worldLabelsOk)
         worldLabels.Destroy();
+    for (auto& [path, entry] : staticMeshCache)
+    {
+        (void)path;
+        if (entry.renderer)
+            entry.renderer->Destroy();
+    }
     if (offscreenSceneOk)
         offscreenScene.Destroy();
     if (terrainOk)
