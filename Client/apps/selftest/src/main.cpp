@@ -540,6 +540,19 @@ bool RunAssetTests(const Options& options, TestContext& ctx)
     keyLight.position[1] = 2.0f;
     keyLight.position[2] = 3.0f;
     baselineScene.pointLights.push_back(keyLight);
+    MeshSceneEntity meshEntity{};
+    meshEntity.id = 303;
+    meshEntity.name = "KicsiK";
+    meshEntity.meshAssetId = "model_KicsiK";
+    meshEntity.meshAssetPath = "Assets/Models/KicsiK.glb";
+    meshEntity.position[0] = 4.0f;
+    meshEntity.position[1] = 5.0f;
+    meshEntity.position[2] = 6.0f;
+    meshEntity.rotation[1] = 0.75f;
+    meshEntity.scale[0] = 1.5f;
+    meshEntity.scale[1] = 1.5f;
+    meshEntity.scale[2] = 1.5f;
+    baselineScene.meshEntities.push_back(meshEntity);
     scenes.SetCurrentSceneSnapshot(baselineScene);
     const std::filesystem::path scenePath = projects.ScenesPath() / "Baseline.scene";
     if (!ctx.Expect(scenes.SaveSceneAs(scenePath.string()),
@@ -557,8 +570,12 @@ bool RunAssetTests(const Options& options, TestContext& ctx)
     ctx.Expect(scenes.GetCurrentScene().waterBodies.size() == 1 &&
             scenes.GetCurrentScene().waterBodies[0].name == "Renamed Water" &&
             scenes.GetCurrentScene().pointLights.size() == 1 &&
-            scenes.GetCurrentScene().pointLights[0].name == "Key Light",
-        "scene entity round-trip", "renamed water/light scene entities did not survive save/load");
+            scenes.GetCurrentScene().pointLights[0].name == "Key Light" &&
+            scenes.GetCurrentScene().meshEntities.size() == 1 &&
+            scenes.GetCurrentScene().meshEntities[0].name == "KicsiK" &&
+            scenes.GetCurrentScene().meshEntities[0].meshAssetPath == "Assets/Models/KicsiK.glb" &&
+            scenes.GetCurrentScene().meshEntities[0].position[2] == 6.0f,
+        "scene entity round-trip", "water/light/mesh scene entities did not survive save/load");
 
     RunMapDataBaselineTest(ctx);
 
@@ -1281,6 +1298,26 @@ bool RunRenderChecks(const Options& options, TestContext& ctx)
             clientMainSource.find("commands.addComponentToSelectedEntity") != std::string::npos &&
             clientMainSource.find("selectedEntityPosition") != std::string::npos,
         "component add command", "INSPECTOR-2 must expose an Add Component menu and route known component commands through the editor runtime");
+    ctx.Expect(mapEditorTypesSource.find("struct MeshSceneEntity") != std::string::npos &&
+            sceneManagerHeaderSource.find("meshEntities") != std::string::npos &&
+            sceneManagerSource.find("mesh_entity") != std::string::npos &&
+            sceneManagerSource.find("\"mesh_asset_path\"") != std::string::npos &&
+            sceneManagerSource.find("ReadMeshSceneEntity") != std::string::npos,
+        "mesh entity scene roundtrip source", "MESH-ENTITY-1 must persist mesh entities with Transform and MeshRenderer asset references");
+    ctx.Expect(editorImGuiSource.find("RenderSelectedMeshRendererInspector") != std::string::npos &&
+            editorImGuiSource.find("SetMeshRendererEditorState") != std::string::npos &&
+            editorImGuiSource.find("MeshRenderer") != std::string::npos &&
+            editorImGuiSource.find("AssignAssetToSelectedMeshRenderer") != std::string::npos &&
+            editorImGuiSource.find("m_commands.addMeshEntity = true") != std::string::npos &&
+            editorImGuiSource.find("Hierarchy drop queued") != std::string::npos,
+        "mesh renderer inspector and spawn source", "MESH-ENTITY-1 must expose MeshRenderer in Inspector and allow model assets to spawn mesh entities from Asset Browser/Hierarchy");
+    ctx.Expect(clientMainSource.find("std::vector<MeshSceneEntity> editorMeshEntities") != std::string::npos &&
+            clientMainSource.find("createMeshEntityAt") != std::string::npos &&
+            clientMainSource.find("resolveMeshRuntimePath") != std::string::npos &&
+            clientMainSource.find("ensureSkinnedMeshLoaded") != std::string::npos &&
+            clientMainSource.find("SkinnedMeshRenderer loaded") != std::string::npos &&
+            clientMainSource.find("SelectedEditorObjectType::MeshEntity") != std::string::npos,
+        "mesh entity runtime source", "MESH-ENTITY-1 must route mesh entities through hierarchy selection, gizmo state, and SkinnedMeshRenderer rendering");
     ctx.Expect(editorImGuiSource.find("void EditorImGui::RenderWorldPanel") != std::string::npos &&
             editorImGuiSource.find("ImGui::Begin(ICON_FA_GLOBE \" World\"") != std::string::npos &&
             editorImGuiSource.find("RenderWorldPanel();") != std::string::npos &&

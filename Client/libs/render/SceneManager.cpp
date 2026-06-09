@@ -530,6 +530,21 @@ void WriteSceneEntity(std::ostream& out, const SpotLight& light, bool comma)
     out << "    }" << (comma ? "," : "") << "\n";
 }
 
+void WriteSceneEntity(std::ostream& out, const MeshSceneEntity& mesh, bool comma)
+{
+    out << "    {\n";
+    out << "      \"type\": \"mesh_entity\",\n";
+    out << "      \"id\": " << mesh.id << ",\n";
+    out << "      \"name\": \"" << EscapeJson(mesh.name) << "\",\n";
+    out << "      \"position\": " << FloatArray(mesh.position, 3) << ",\n";
+    out << "      \"rotation\": " << FloatArray(mesh.rotation, 3) << ",\n";
+    out << "      \"scale\": " << FloatArray(mesh.scale, 3) << ",\n";
+    out << "      \"mesh_asset_id\": \"" << EscapeJson(mesh.meshAssetId) << "\",\n";
+    out << "      \"mesh_asset_path\": \"" << EscapeJson(mesh.meshAssetPath) << "\",\n";
+    out << "      \"skinned\": " << (mesh.skinned ? "true" : "false") << "\n";
+    out << "    }" << (comma ? "," : "") << "\n";
+}
+
 PointLight ReadPointLight(const JsonValue& entity)
 {
     PointLight light;
@@ -565,6 +580,20 @@ SpotLight ReadSpotLight(const JsonValue& entity)
     light.outerConeDegrees = ReadFloat(entity, "outer_cone_deg", light.outerConeDegrees);
     light.enabled = ReadBool(entity, "enabled", light.enabled);
     return light;
+}
+
+MeshSceneEntity ReadMeshSceneEntity(const JsonValue& entity)
+{
+    MeshSceneEntity mesh;
+    mesh.id = ReadU32(entity, "id", mesh.id);
+    mesh.name = ReadString(entity, "name", mesh.name);
+    ReadFloatArray(entity, "position", mesh.position, 3);
+    ReadFloatArray(entity, "rotation", mesh.rotation, 3);
+    ReadFloatArray(entity, "scale", mesh.scale, 3);
+    mesh.meshAssetId = ReadString(entity, "mesh_asset_id");
+    mesh.meshAssetPath = ReadString(entity, "mesh_asset_path");
+    mesh.skinned = ReadBool(entity, "skinned", mesh.skinned);
+    return mesh;
 }
 }
 
@@ -808,6 +837,10 @@ bool SceneManager::LoadSceneInternal(const std::string& path)
                 else
                     Tracenf("[SCENE] Unknown dynamic light type: %s", lightType.c_str());
             }
+            else if (type == "mesh_entity")
+            {
+                scene.meshEntities.push_back(ReadMeshSceneEntity(entity));
+            }
             else
             {
                 Tracenf("[SCENE] Unknown entity type: %s", type.c_str());
@@ -845,15 +878,16 @@ bool SceneManager::LoadSceneInternal(const std::string& path)
     UpdateRecentList(path);
     UpdateWindowTitle();
     ActivateSceneType(m_currentScene.sceneType);
-    Tracenf("[SCENE] load OK: name=%s scene_type=%s water=%zu point_lights=%zu spot_lights=%zu",
+    Tracenf("[SCENE] load OK: name=%s scene_type=%s water=%zu point_lights=%zu spot_lights=%zu mesh=%zu",
         m_currentScene.name.c_str(),
         m_currentScene.sceneType.c_str(),
         m_currentScene.waterBodies.size(),
         m_currentScene.pointLights.size(),
-        m_currentScene.spotLights.size());
+        m_currentScene.spotLights.size(),
+        m_currentScene.meshEntities.size());
     Tracenf("[SCENE] Loaded successfully: %s (%zu entities)",
         path.c_str(),
-        scene.waterBodies.size() + scene.pointLights.size() + scene.spotLights.size());
+        scene.waterBodies.size() + scene.pointLights.size() + scene.spotLights.size() + scene.meshEntities.size());
     return true;
 }
 
@@ -911,7 +945,8 @@ bool SceneManager::SaveSceneInternal(const std::string& path)
     out << "  \"splat_ref\": \"" << EscapeJson(scene.splatRef) << "\",\n";
     out << "  \"entities\": [\n";
 
-    const size_t entityCount = scene.waterBodies.size() + scene.pointLights.size() + scene.spotLights.size();
+    const size_t entityCount =
+        scene.waterBodies.size() + scene.pointLights.size() + scene.spotLights.size() + scene.meshEntities.size();
     size_t entityIndex = 0;
     for (const WaterBody& body : scene.waterBodies)
     {
@@ -924,6 +959,8 @@ bool SceneManager::SaveSceneInternal(const std::string& path)
         WriteSceneEntity(out, light, ++entityIndex < entityCount);
     for (const SpotLight& light : scene.spotLights)
         WriteSceneEntity(out, light, ++entityIndex < entityCount);
+    for (const MeshSceneEntity& mesh : scene.meshEntities)
+        WriteSceneEntity(out, mesh, ++entityIndex < entityCount);
 
     out << "  ],\n";
     out << "  \"terrain_palette\": [\n";

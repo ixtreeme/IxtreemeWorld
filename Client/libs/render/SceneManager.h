@@ -24,6 +24,7 @@ struct SceneData
     std::vector<WaterBody> waterBodies;
     std::vector<PointLight> pointLights;
     std::vector<SpotLight> spotLights;
+    std::vector<MeshSceneEntity> meshEntities;
     std::array<MapEditorPaletteSlot, 8> paletteSlots{};
     std::vector<std::string> preloadAssets;
 };

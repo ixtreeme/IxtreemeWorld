@@ -538,6 +538,11 @@ void EditorImGui::SetWaterBodyEditorState(const WaterBodyEditorState& state)
     m_waterBodyState = state;
 }
 
+void EditorImGui::SetMeshRendererEditorState(const MeshRendererEditorState& state)
+{
+    m_meshRendererState = state;
+}
+
 void EditorImGui::SetHierarchySceneState(std::uint64_t sceneRootEntity,
                                          std::string sceneRootName,
                                          std::vector<HierarchySceneEntity> entities)
@@ -1621,6 +1626,34 @@ void EditorImGui::AssignAssetToSelectedWaterBody(const std::string& assetId)
         m_waterBodyState.id);
 }
 
+void EditorImGui::AssignAssetToSelectedMeshRenderer(const std::string& assetId)
+{
+    if (!m_assetLibrary || !m_meshRendererState.selected)
+        return;
+
+    const auto entry = m_assetLibrary->FindById(assetId);
+    if (!entry)
+    {
+        m_assetStatus = "Drop failed: asset not found";
+        return;
+    }
+    if (entry->category != AssetLibrary::Category::Model)
+    {
+        m_assetStatus = "MeshRenderer accepts model assets";
+        return;
+    }
+
+    m_meshRendererState.meshAssetId = entry->id;
+    m_meshRendererState.meshAssetPath = m_assetLibrary->AssetRelativePath(*entry);
+    m_meshRendererState.meshDisplayName = entry->displayName;
+    MarkSelectedMeshRendererChanged();
+    m_assetStatus = "MeshRenderer mesh <- " + entry->displayName;
+    Tracenf("[MESH-ENTITY] Mesh assigned: entity=%u asset_id=%s path=%s",
+        m_meshRendererState.id,
+        entry->id.c_str(),
+        m_meshRendererState.meshAssetPath.c_str());
+}
+
 bool EditorImGui::HandleWin32Message(HWND hwnd, UINT message, WPARAM wParam, LPARAM lParam, LRESULT& result)
 {
     if (!m_initialized)
@@ -2547,6 +2580,8 @@ void EditorImGui::RenderHierarchyEntityNode(std::uint64_t entityHandle)
         icon = ICON_FA_LIGHTBULB;
     else if (entity->type == HierarchyEntityType::SpotLight)
         icon = ICON_FA_BULLSEYE;
+    else if (entity->type == HierarchyEntityType::MeshEntity)
+        icon = ICON_FA_CUBE;
 
     bool open = false;
     if (m_hierarchyRenamingEntity == entity->entity)
@@ -2645,6 +2680,22 @@ void EditorImGui::RenderHierarchyPanel()
             const std::string rootLabel = std::string(ICON_FA_GLOBE) + " " + m_sceneRootName;
             const bool rootOpen = ImGui::TreeNodeEx(rootLabel.c_str(),
                 ImGuiTreeNodeFlags_DefaultOpen | ImGuiTreeNodeFlags_OpenOnArrow | ImGuiTreeNodeFlags_SpanFullWidth);
+            if (ImGui::BeginDragDropTarget())
+            {
+                if (const ImGuiPayload* payload = ImGui::AcceptDragDropPayload(kAssetPayloadType))
+                {
+                    const std::string assetId(static_cast<const char*>(payload->Data), payload->DataSize);
+                    const auto entry = m_assetLibrary ? m_assetLibrary->FindById(assetId) : std::optional<AssetLibrary::Entry>{};
+                    if (entry && entry->category == AssetLibrary::Category::Model)
+                    {
+                        m_commands.addMeshEntity = true;
+                        m_commands.meshAssetId = entry->id;
+                        m_assetStatus = "Mesh entity queued: " + entry->displayName;
+                        Tracenf("[MESH-ENTITY] Hierarchy drop queued: asset_id=%s", entry->id.c_str());
+                    }
+                }
+                ImGui::EndDragDropTarget();
+            }
             ImGui::TableSetColumnIndex(1);
             ImGui::TextDisabled("-");
             if (rootOpen)
@@ -2737,6 +2788,15 @@ void EditorImGui::MarkSelectedLightChanged()
     m_commands.selectedLight = m_dynamicLightState;
 }
 
+void EditorImGui::MarkSelectedMeshRendererChanged()
+{
+    if (!m_meshRendererState.selected)
+        return;
+    SceneManager::Instance().MarkDirty();
+    m_commands.selectedMeshEntityChanged = true;
+    m_commands.selectedMeshEntity = m_meshRendererState;
+}
+
 bool EditorImGui::RenderAxisFloat(const char* axis,
                                   float& value,
                                   float r,
@@ -2791,7 +2851,8 @@ void EditorImGui::RenderAddComponentMenu()
     const bool hasWater = m_waterBodyState.selected;
     const bool hasPoint = m_dynamicLightState.type == DynamicLightType::Point;
     const bool hasSpot = m_dynamicLightState.type == DynamicLightType::Spot;
-    const bool hasSelection = hasWater || hasPoint || hasSpot;
+    const bool hasMesh = m_meshRendererState.selected;
+    const bool hasSelection = hasWater || hasPoint || hasSpot || hasMesh;
 
     if (!hasSelection)
     {
@@ -2834,6 +2895,16 @@ void EditorImGui::RenderAddComponentMenu()
             m_commands.addComponentType = EditorComponentType::SpotLight;
         }
         if (hasSpot)
+            ImGui::EndDisabled();
+
+        if (hasMesh)
+            ImGui::BeginDisabled();
+        if (ImGui::MenuItem(ICON_FA_CUBE " MeshRenderer"))
+        {
+            m_commands.addComponentToSelectedEntity = true;
+            m_commands.addComponentType = EditorComponentType::MeshRenderer;
+        }
+        if (hasMesh)
             ImGui::EndDisabled();
 
         ImGui::EndPopup();
@@ -3031,6 +3102,74 @@ void EditorImGui::RenderSelectedLightInspector()
     ImGui::Separator();
     if (UI::IconButton(ICON_FA_TRASH, "Delete Light", ImVec2(-1.0f, 0.0f)))
         m_commands.deleteSelectedLight = true;
+}
+
+void EditorImGui::RenderSelectedMeshRendererInspector()
+{
+    if (!m_meshRendererState.selected)
+        return;
+
+    UI::SectionHeader(ICON_FA_CUBE " Entity");
+    ImGui::TextDisabled("flecs=%llu  object=%u",
+        static_cast<unsigned long long>(m_selectedHierarchyEntity),
+        m_meshRendererState.id);
+
+    char nameBuffer[96]{};
+    std::snprintf(nameBuffer, sizeof(nameBuffer), "%s", m_meshRendererState.name.c_str());
+    if (ImGui::InputText("Name", nameBuffer, sizeof(nameBuffer)))
+    {
+        m_meshRendererState.name = nameBuffer[0] != '\0' ? nameBuffer : ("Mesh Entity " + std::to_string(m_meshRendererState.id));
+        MarkSelectedMeshRendererChanged();
+    }
+
+    RenderAddComponentMenu();
+
+    float position[3] = {m_meshRendererState.position[0], m_meshRendererState.position[1], m_meshRendererState.position[2]};
+    float rotation[3] = {
+        m_meshRendererState.rotation[0] * 57.2957795f,
+        m_meshRendererState.rotation[1] * 57.2957795f,
+        m_meshRendererState.rotation[2] * 57.2957795f};
+    float scale[3] = {m_meshRendererState.scale[0], m_meshRendererState.scale[1], m_meshRendererState.scale[2]};
+    if (RenderTransformComponent(position, rotation, scale))
+    {
+        m_meshRendererState.position[0] = position[0];
+        m_meshRendererState.position[1] = position[1];
+        m_meshRendererState.position[2] = position[2];
+        m_meshRendererState.rotation[0] = rotation[0] / 57.2957795f;
+        m_meshRendererState.rotation[1] = rotation[1] / 57.2957795f;
+        m_meshRendererState.rotation[2] = rotation[2] / 57.2957795f;
+        m_meshRendererState.scale[0] = std::max(scale[0], 0.001f);
+        m_meshRendererState.scale[1] = std::max(scale[1], 0.001f);
+        m_meshRendererState.scale[2] = std::max(scale[2], 0.001f);
+        MarkSelectedMeshRendererChanged();
+    }
+
+    if (ImGui::CollapsingHeader(ICON_FA_CUBE " MeshRenderer", ImGuiTreeNodeFlags_DefaultOpen))
+    {
+        const std::string meshLabel = m_meshRendererState.meshDisplayName.empty()
+            ? (m_meshRendererState.meshAssetId.empty() ? std::string("No model assigned") : m_meshRendererState.meshAssetId)
+            : m_meshRendererState.meshDisplayName;
+        ImGui::TextUnformatted("Mesh");
+        ImGui::PushStyleColor(ImGuiCol_Button, ImVec4(0.42f, 0.34f, 0.64f, 1.0f));
+        ImGui::Button(meshLabel.c_str(), ImVec2(-1.0f, 42.0f));
+        ImGui::PopStyleColor();
+        if (ImGui::BeginDragDropTarget())
+        {
+            if (const ImGuiPayload* payload = ImGui::AcceptDragDropPayload(kAssetPayloadType))
+            {
+                const std::string assetId(static_cast<const char*>(payload->Data), payload->DataSize);
+                AssignAssetToSelectedMeshRenderer(assetId);
+            }
+            ImGui::EndDragDropTarget();
+        }
+        ImGui::TextDisabled("Asset ID: %s", m_meshRendererState.meshAssetId.empty() ? "<none>" : m_meshRendererState.meshAssetId.c_str());
+        ImGui::TextDisabled("Path: %s", m_meshRendererState.meshAssetPath.empty() ? "<none>" : m_meshRendererState.meshAssetPath.c_str());
+        ImGui::TextDisabled("Render path: %s", m_meshRendererState.skinned ? "SkinnedMeshRenderer" : "static mesh pending");
+    }
+
+    ImGui::Separator();
+    if (UI::IconButton(ICON_FA_TRASH, "Delete Mesh Entity", ImVec2(-1.0f, 0.0f)))
+        m_commands.deleteSelectedMeshEntity = true;
 }
 
 void EditorImGui::ApplyTimeOfDayPreset(float hour)
@@ -3524,6 +3663,13 @@ void EditorImGui::RenderAssetTile(const AssetLibrary::Entry& entry, float tileSi
         else if (doubleClicked && entry.category == AssetLibrary::Category::Material)
         {
             OpenPbrMaterialEditor(entry.id);
+        }
+        else if (doubleClicked && entry.category == AssetLibrary::Category::Model)
+        {
+            m_commands.addMeshEntity = true;
+            m_commands.meshAssetId = entry.id;
+            m_assetStatus = "Mesh entity queued: " + entry.displayName;
+            Tracenf("[MESH-ENTITY] Asset browser model spawn queued: asset_id=%s", entry.id.c_str());
         }
     }
 
@@ -4187,6 +4333,8 @@ void EditorImGui::RenderInspector()
             RenderSelectedWaterBodyInspector();
         else if (m_dynamicLightState.type != DynamicLightType::None)
             RenderSelectedLightInspector();
+        else if (m_meshRendererState.selected)
+            RenderSelectedMeshRendererInspector();
         else
         {
             ImGui::TextUnformatted("Nothing selected");
@@ -4406,6 +4554,10 @@ void EditorImGui::SetDynamicLightEditorState(const DynamicLightEditorState&)
 }
 
 void EditorImGui::SetWaterBodyEditorState(const WaterBodyEditorState&)
+{
+}
+
+void EditorImGui::SetMeshRendererEditorState(const MeshRendererEditorState&)
 {
 }
 

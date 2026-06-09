@@ -229,12 +229,26 @@ struct WaterBody
     bool editorHidden = false;
 };
 
+struct MeshSceneEntity
+{
+    std::uint32_t id = 0;
+    std::string name;
+    std::string meshAssetId;
+    std::string meshAssetPath;
+    float position[3] = {0.0f, 0.0f, 0.0f};
+    float rotation[3] = {0.0f, 0.0f, 0.0f};
+    float scale[3] = {1.0f, 1.0f, 1.0f};
+    bool skinned = true;
+    bool editorHidden = false;
+};
+
 enum class HierarchyEntityType
 {
     None,
     WaterBody,
     PointLight,
-    SpotLight
+    SpotLight,
+    MeshEntity
 };
 
 enum class EditorComponentType
@@ -242,7 +256,8 @@ enum class EditorComponentType
     None,
     WaterBody,
     PointLight,
-    SpotLight
+    SpotLight,
+    MeshRenderer
 };
 
 struct HierarchySceneEntity
@@ -268,6 +283,21 @@ struct WaterBodyEditorState
     std::string materialId;
     std::string materialName;
     WaterConfig config;
+};
+
+struct MeshRendererEditorState
+{
+    bool selected = false;
+    std::uint32_t id = 0;
+    std::uint32_t count = 0;
+    std::string name;
+    std::string meshAssetId;
+    std::string meshAssetPath;
+    std::string meshDisplayName;
+    float position[3] = {0.0f, 0.0f, 0.0f};
+    float rotation[3] = {0.0f, 0.0f, 0.0f};
+    float scale[3] = {1.0f, 1.0f, 1.0f};
+    bool skinned = true;
 };
 
 enum class DynamicLightType
@@ -304,8 +334,12 @@ struct MapEditorCommands
     bool pausePlayMode = false;
     bool resumePlayMode = false;
     bool addWaterBody = false;
+    bool addMeshEntity = false;
+    std::string meshAssetId;
     bool addComponentToSelectedEntity = false;
     EditorComponentType addComponentType = EditorComponentType::None;
+    bool assignMeshAssetToSelectedEntity = false;
+    std::string assignMeshAssetId;
     bool deleteSelectedWaterBody = false;
     bool selectedWaterBodyChanged = false;
     bool openSelectedWaterMaterialEditor = false;
@@ -317,6 +351,9 @@ struct MapEditorCommands
     bool deleteSelectedLight = false;
     bool selectedLightChanged = false;
     DynamicLightEditorState selectedLight;
+    bool deleteSelectedMeshEntity = false;
+    bool selectedMeshEntityChanged = false;
+    MeshRendererEditorState selectedMeshEntity;
     bool hierarchySelectEntity = false;
     bool hierarchyFocusEntity = false;
     bool hierarchyDeleteEntity = false;

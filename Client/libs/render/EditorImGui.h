@@ -50,6 +50,7 @@ public:
     LightingState GetLightingState() const { return m_lightingState; }
     void SetDynamicLightEditorState(const DynamicLightEditorState& state);
     void SetWaterBodyEditorState(const WaterBodyEditorState& state);
+    void SetMeshRendererEditorState(const MeshRendererEditorState& state);
     void SetHierarchySceneState(std::uint64_t sceneRootEntity,
                                 std::string sceneRootName,
                                 std::vector<HierarchySceneEntity> entities);
@@ -128,6 +129,7 @@ private:
     void RenderInspector();
     void RenderSelectedWaterBodyInspector();
     void RenderSelectedLightInspector();
+    void RenderSelectedMeshRendererInspector();
     void RenderAddComponentMenu();
     bool RenderTransformComponent(float* position, float* rotation, float* scale);
     bool RenderAxisFloat(const char* axis, float& value, float r, float g, float b, float speed, float minValue, float maxValue);
@@ -174,6 +176,7 @@ private:
     void CreateWaterMaterialAsset();
     bool CreateWaterMaterialAsset(const std::string& displayName, AssetLibrary::Entry& outEntry);
     void AssignAssetToSelectedWaterBody(const std::string& assetId);
+    void AssignAssetToSelectedMeshRenderer(const std::string& assetId);
     void MarkWaterMaterialChanged(const char* field);
     void MarkPbrMaterialChanged(const char* field);
     bool SaveWaterMaterialEditor();
@@ -190,6 +193,7 @@ private:
     void ApplyTimeOfDayPreset(float hour);
     void MarkSelectedWaterBodyChanged();
     void MarkSelectedLightChanged();
+    void MarkSelectedMeshRendererChanged();
     void HandleEditorHotkeys();
     bool CanUseEditorTools() const;
     void SetToolMode(MapEditorToolMode mode);
@@ -238,6 +242,7 @@ private:
     LightingState m_lightingState;
     DynamicLightEditorState m_dynamicLightState;
     WaterBodyEditorState m_waterBodyState;
+    MeshRendererEditorState m_meshRendererState;
     MapEditorCommands m_commands;
     std::array<MapEditorPaletteSlot, 8> m_paletteSlots{};
     std::vector<std::pair<std::string, WaterMaterialData>> m_waterMaterials;

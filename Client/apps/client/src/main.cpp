@@ -12,6 +12,7 @@
 #include "NativeWindow_Android.h"
 #endif
 #include "OffscreenSceneRenderer.h"
+#include "ProjectManager.h"
 #include "RmlUiLayer.h"
 #include "RuntimeSession.h"
 #include "RuntimeUiAdapter.h"
@@ -170,7 +171,8 @@ enum class SelectedEditorObjectType
     None,
     PointLight,
     SpotLight,
-    WaterBody
+    WaterBody,
+    MeshEntity
 };
 
 struct SelectedEditorObject
@@ -192,6 +194,7 @@ SelectedEditorObjectType ToSelectedObjectType(HierarchyEntityType type)
     case HierarchyEntityType::WaterBody: return SelectedEditorObjectType::WaterBody;
     case HierarchyEntityType::PointLight: return SelectedEditorObjectType::PointLight;
     case HierarchyEntityType::SpotLight: return SelectedEditorObjectType::SpotLight;
+    case HierarchyEntityType::MeshEntity: return SelectedEditorObjectType::MeshEntity;
     default: return SelectedEditorObjectType::None;
     }
 }
@@ -209,6 +212,11 @@ std::string EditorDisplayName(const PointLight& light)
 std::string EditorDisplayName(const SpotLight& light)
 {
     return light.name.empty() ? "Spot Light " + std::to_string(light.id) : light.name;
+}
+
+std::string EditorDisplayName(const MeshSceneEntity& mesh)
+{
+    return mesh.name.empty() ? "Mesh Entity " + std::to_string(mesh.id) : mesh.name;
 }
 
 WorldVec3 CameraForward(const WorldCamera& camera)
@@ -349,6 +357,40 @@ WaterBodyEditorState BuildWaterBodyEditorState(const std::vector<WaterBody>& bod
     state.config = it->config;
     state.config.waterLevelY = it->waterLevelY;
     return state;
+}
+
+MeshRendererEditorState BuildMeshRendererEditorState(const std::vector<MeshSceneEntity>& meshes,
+                                                     std::uint32_t selectedId)
+{
+    MeshRendererEditorState state{};
+    state.count = static_cast<std::uint32_t>(meshes.size());
+    auto it = std::find_if(meshes.begin(), meshes.end(),
+        [selectedId](const MeshSceneEntity& mesh) { return selectedId != 0 && mesh.id == selectedId; });
+    if (it == meshes.end())
+        return state;
+
+    state.selected = true;
+    state.id = it->id;
+    state.name = EditorDisplayName(*it);
+    state.meshAssetId = it->meshAssetId;
+    state.meshAssetPath = it->meshAssetPath;
+    state.meshDisplayName = it->meshAssetId.empty() ? it->meshAssetPath : it->meshAssetId;
+    std::copy(std::begin(it->position), std::end(it->position), std::begin(state.position));
+    std::copy(std::begin(it->rotation), std::end(it->rotation), std::begin(state.rotation));
+    std::copy(std::begin(it->scale), std::end(it->scale), std::begin(state.scale));
+    state.skinned = it->skinned;
+    return state;
+}
+
+void ApplyMeshRendererEditorState(MeshSceneEntity& mesh, const MeshRendererEditorState& state)
+{
+    mesh.name = state.name;
+    mesh.meshAssetId = state.meshAssetId;
+    mesh.meshAssetPath = state.meshAssetPath;
+    std::copy(std::begin(state.position), std::end(state.position), std::begin(mesh.position));
+    std::copy(std::begin(state.rotation), std::end(state.rotation), std::begin(mesh.rotation));
+    std::copy(std::begin(state.scale), std::end(state.scale), std::begin(mesh.scale));
+    mesh.skinned = state.skinned;
 }
 
 std::optional<std::uint32_t> PickWaterBody(const std::vector<WaterBody>& bodies,
@@ -953,10 +995,20 @@ void MergeMapEditorCommands(MapEditorCommands& target, const MapEditorCommands& 
     target.pausePlayMode = target.pausePlayMode || source.pausePlayMode;
     target.resumePlayMode = target.resumePlayMode || source.resumePlayMode;
     target.addWaterBody = target.addWaterBody || source.addWaterBody;
+    if (source.addMeshEntity)
+    {
+        target.addMeshEntity = true;
+        target.meshAssetId = source.meshAssetId;
+    }
     if (source.addComponentToSelectedEntity)
     {
         target.addComponentToSelectedEntity = true;
         target.addComponentType = source.addComponentType;
+    }
+    if (source.assignMeshAssetToSelectedEntity)
+    {
+        target.assignMeshAssetToSelectedEntity = true;
+        target.assignMeshAssetId = source.assignMeshAssetId;
     }
     target.deleteSelectedWaterBody = target.deleteSelectedWaterBody || source.deleteSelectedWaterBody;
     target.openSelectedWaterMaterialEditor =
@@ -978,6 +1030,12 @@ void MergeMapEditorCommands(MapEditorCommands& target, const MapEditorCommands& 
     {
         target.selectedLightChanged = true;
         target.selectedLight = source.selectedLight;
+    }
+    target.deleteSelectedMeshEntity = target.deleteSelectedMeshEntity || source.deleteSelectedMeshEntity;
+    if (source.selectedMeshEntityChanged)
+    {
+        target.selectedMeshEntityChanged = true;
+        target.selectedMeshEntity = source.selectedMeshEntity;
     }
     if (source.hierarchySelectEntity)
     {
@@ -1144,6 +1202,7 @@ int RunGame(NativeWindow& window,
 #endif
     SkinnedMeshRenderer skinnedMesh;
     bool skinnedMeshOk = false;
+    std::string loadedSkinnedMeshPath;
     Tracen("[MAIN] SkinnedMeshRenderer available; no default skinned mesh asset loaded");
 
     TerrainRenderer terrain;
@@ -1191,6 +1250,50 @@ int RunGame(NativeWindow& window,
             terrain.RecreatePipeline(device);
         }
     }
+    auto ensureSkinnedMeshLoaded = [&](const std::string& modelPath) {
+        if (modelPath.empty())
+            return false;
+        if (skinnedMeshOk && loadedSkinnedMeshPath == modelPath)
+            return true;
+        skinnedMesh.Destroy();
+        skinnedMeshOk = skinnedMesh.Create(device, assets, modelPath);
+        if (skinnedMeshOk)
+        {
+            loadedSkinnedMeshPath = modelPath;
+            if (offscreenSceneOk)
+            {
+                skinnedMesh.SetMainRenderPass(offscreenScene.GetRenderPass());
+                skinnedMesh.RecreatePipeline(device);
+            }
+            Tracenf("[MESH-ENTITY] SkinnedMeshRenderer loaded: %s", modelPath.c_str());
+        }
+        else
+        {
+            loadedSkinnedMeshPath.clear();
+            TraceError("[MESH-ENTITY] Failed to load model: %s", modelPath.c_str());
+        }
+        return skinnedMeshOk;
+    };
+    auto resolveMeshRuntimePath = [&](const MeshSceneEntity& mesh) {
+        if (mesh.meshAssetPath.empty())
+            return std::string{};
+        const std::filesystem::path stored(mesh.meshAssetPath);
+        if (stored.is_absolute())
+            return stored.string();
+        if (ProjectManager::Instance().HasProject())
+        {
+            const std::filesystem::path projectPath = ProjectManager::Instance().ProjectRoot() / stored;
+            if (std::filesystem::exists(projectPath))
+                return projectPath.string();
+        }
+        if (auto root = assets.RootPath())
+        {
+            const std::filesystem::path enginePath = *root / stored;
+            if (std::filesystem::exists(enginePath))
+                return stored.generic_string();
+        }
+        return mesh.meshAssetPath;
+    };
 
     runtimeSession->SetQuitCallback([&window]()
     {
@@ -1214,6 +1317,7 @@ int RunGame(NativeWindow& window,
     std::uint32_t selectedTargetNetId = 0;
     std::vector<PointLight> editorPointLights;
     std::vector<SpotLight> editorSpotLights;
+    std::vector<MeshSceneEntity> editorMeshEntities;
     std::vector<WaterBody> editorWaterBodies = terrainOk ? terrain.GetWaterBodies() : std::vector<WaterBody>{};
     bool editorWaterBodiesDirty = false;
 #if defined(IXTREEME_WITH_EDITOR)
@@ -1222,6 +1326,7 @@ int RunGame(NativeWindow& window,
     std::uint32_t nextEditorWaterBodyId = 1;
     for (const WaterBody& body : editorWaterBodies)
         nextEditorWaterBodyId = std::max(nextEditorWaterBodyId, body.id + 1u);
+    std::uint32_t nextEditorMeshEntityId = 1;
     SelectedEditorObject selectedEditorObject;
     std::unique_ptr<ecs_world_t, void(*)(ecs_world_t*)> editorHierarchyWorld(ecs_init(), [](ecs_world_t* world) {
         if (world)
@@ -1242,7 +1347,8 @@ int RunGame(NativeWindow& window,
         };
         return std::any_of(editorWaterBodies.begin(), editorWaterBodies.end(), matches) ||
             std::any_of(editorPointLights.begin(), editorPointLights.end(), matches) ||
-            std::any_of(editorSpotLights.begin(), editorSpotLights.end(), matches);
+            std::any_of(editorSpotLights.begin(), editorSpotLights.end(), matches) ||
+            std::any_of(editorMeshEntities.begin(), editorMeshEntities.end(), matches);
     };
     auto makeUniqueSceneEntityName = [&](const std::string& base) {
         if (!sceneEntityNameExists(base))
@@ -1253,7 +1359,7 @@ int RunGame(NativeWindow& window,
             if (!sceneEntityNameExists(candidate))
                 return candidate;
         }
-        return base + " " + std::to_string(nextEditorLightId + nextEditorWaterBodyId);
+        return base + " " + std::to_string(nextEditorLightId + nextEditorWaterBodyId + nextEditorMeshEntityId);
     };
     EditorGizmoMode editorGizmoMode = EditorGizmoMode::Translate;
     bool editorGizmoSnapEnabled = false;
@@ -1268,6 +1374,7 @@ int RunGame(NativeWindow& window,
         scene.waterBodies = editorWaterBodies;
         scene.pointLights = editorPointLights;
         scene.spotLights = editorSpotLights;
+        scene.meshEntities = editorMeshEntities;
         scene.paletteSlots = terrainOk ? terrain.GetPaletteSlots() : runtimeSession->GetPaletteSlots();
         return scene;
     };
@@ -1275,6 +1382,7 @@ int RunGame(NativeWindow& window,
         editorWaterBodies = scene.waterBodies;
         editorPointLights = scene.pointLights;
         editorSpotLights = scene.spotLights;
+        editorMeshEntities = scene.meshEntities;
         selectedEditorObject = {};
         resetEditorHierarchyEntities();
         nextEditorWaterBodyId = 1;
@@ -1285,6 +1393,9 @@ int RunGame(NativeWindow& window,
             nextEditorLightId = std::max(nextEditorLightId, light.id + 1u);
         for (const SpotLight& light : editorSpotLights)
             nextEditorLightId = std::max(nextEditorLightId, light.id + 1u);
+        nextEditorMeshEntityId = 1;
+        for (const MeshSceneEntity& mesh : editorMeshEntities)
+            nextEditorMeshEntityId = std::max(nextEditorMeshEntityId, mesh.id + 1u);
 
         editorImGui.SetLightingState(scene.lighting);
         runtimeSession->SetDynamicLightEditorState({});
@@ -1363,6 +1474,8 @@ int RunGame(NativeWindow& window,
             ensureEntity(HierarchyEntityType::PointLight, light.id, EditorDisplayName(light), light.editorHidden);
         for (const SpotLight& light : editorSpotLights)
             ensureEntity(HierarchyEntityType::SpotLight, light.id, EditorDisplayName(light), light.editorHidden);
+        for (const MeshSceneEntity& mesh : editorMeshEntities)
+            ensureEntity(HierarchyEntityType::MeshEntity, mesh.id, EditorDisplayName(mesh), mesh.editorHidden);
 
         for (auto it = editorHierarchyEntities.begin(); it != editorHierarchyEntities.end();)
         {
@@ -1407,6 +1520,7 @@ int RunGame(NativeWindow& window,
                              &selectedTargetNetId,
                              &editorPointLights,
                              &editorSpotLights,
+                             &editorMeshEntities,
                              &editorWaterBodies,
                              &editorWaterBodiesDirty,
                              &selectedEditorObject,
@@ -1596,6 +1710,15 @@ int RunGame(NativeWindow& window,
                         runtimeSession->SetEditorStatus("Deleted water body #" + std::to_string(selectedEditorObject.id));
                         selectedEditorObject = {};
                         editorWaterBodiesDirty = true;
+                        return;
+                    }
+                    else if (event.key == Key_Delete && selectedEditorObject.type == SelectedEditorObjectType::MeshEntity)
+                    {
+                        editorMeshEntities.erase(std::remove_if(editorMeshEntities.begin(), editorMeshEntities.end(),
+                            [&](const MeshSceneEntity& mesh) { return mesh.id == selectedEditorObject.id; }), editorMeshEntities.end());
+                        runtimeSession->SetEditorStatus("Deleted mesh entity #" + std::to_string(selectedEditorObject.id));
+                        selectedEditorObject = {};
+                        SceneManager::Instance().MarkDirty();
                         return;
                     }
                 }
@@ -1835,6 +1958,48 @@ int RunGame(NativeWindow& window,
                             if (it != editorSpotLights.end())
                             {
                                 moveLight(*it);
+                                return;
+                            }
+                        }
+                        if (selectedEditorObject.type == SelectedEditorObjectType::MeshEntity)
+                        {
+                            auto it = std::find_if(editorMeshEntities.begin(), editorMeshEntities.end(),
+                                [&](const MeshSceneEntity& mesh) { return mesh.id == selectedEditorObject.id; });
+                            if (it != editorMeshEntities.end())
+                            {
+                                WorldVec3 position{it->position[0], it->position[1], it->position[2]};
+                                const float scale = 0.025f * std::max(1.0f, std::sqrt(WorldDot(WorldSub(position, lastPickCamera.eye),
+                                    WorldSub(position, lastPickCamera.eye))));
+                                if (editorGizmoMode == EditorGizmoMode::Translate)
+                                {
+                                    position = WorldAdd(position,
+                                        WorldAdd(WorldScale(CameraRight(lastPickCamera), static_cast<float>(dx) * scale),
+                                                 WorldScale(CameraUp(lastPickCamera), static_cast<float>(-dy) * scale)));
+                                    if (editorGizmoSnapEnabled)
+                                        position = SnapPoint(position, editorGizmoSnapValue);
+                                    it->position[0] = position.x;
+                                    it->position[1] = position.y;
+                                    it->position[2] = position.z;
+                                }
+                                else if (editorGizmoMode == EditorGizmoMode::Scale)
+                                {
+                                    const float delta = static_cast<float>(dx - dy) * 0.01f * std::max(1.0f, scale);
+                                    it->scale[0] = std::max(0.001f, it->scale[0] + delta);
+                                    it->scale[1] = std::max(0.001f, it->scale[1] + delta);
+                                    it->scale[2] = std::max(0.001f, it->scale[2] + delta);
+                                    if (editorGizmoSnapEnabled)
+                                    {
+                                        it->scale[0] = std::max(0.001f, SnapValue(it->scale[0], editorGizmoSnapValue));
+                                        it->scale[1] = std::max(0.001f, SnapValue(it->scale[1], editorGizmoSnapValue));
+                                        it->scale[2] = std::max(0.001f, SnapValue(it->scale[2], editorGizmoSnapValue));
+                                    }
+                                }
+                                else if (editorGizmoMode == EditorGizmoMode::Rotate)
+                                {
+                                    it->rotation[1] += static_cast<float>(dx) * 0.01f;
+                                    it->rotation[0] += static_cast<float>(-dy) * 0.01f;
+                                }
+                                SceneManager::Instance().MarkDirty();
                                 return;
                             }
                         }
@@ -2100,6 +2265,10 @@ int RunGame(NativeWindow& window,
                         selectedEditorObject = {SelectedEditorObjectType::SpotLight, id, flecsEntity};
                         runtimeSession->SetEditorStatus("Selected spot light #" + std::to_string(id));
                         break;
+                    case HierarchyEntityType::MeshEntity:
+                        selectedEditorObject = {SelectedEditorObjectType::MeshEntity, id, flecsEntity};
+                        runtimeSession->SetEditorStatus("Selected mesh entity #" + std::to_string(id));
+                        break;
                     default:
                         break;
                     }
@@ -2129,6 +2298,13 @@ int RunGame(NativeWindow& window,
                         if (it != editorSpotLights.end())
                             target = WorldVec3{it->position[0], it->position[1], it->position[2]};
                     }
+                    else if (type == HierarchyEntityType::MeshEntity)
+                    {
+                        auto it = std::find_if(editorMeshEntities.begin(), editorMeshEntities.end(),
+                            [&](const MeshSceneEntity& mesh) { return mesh.id == id; });
+                        if (it != editorMeshEntities.end())
+                            target = WorldVec3{it->position[0], it->position[1], it->position[2]};
+                    }
                     if (!target)
                         return;
                     cameraController.FocusOn(*target);
@@ -2152,9 +2328,15 @@ int RunGame(NativeWindow& window,
                         editorSpotLights.erase(std::remove_if(editorSpotLights.begin(), editorSpotLights.end(),
                             [&](const SpotLight& light) { return light.id == id; }), editorSpotLights.end());
                     }
+                    else if (type == HierarchyEntityType::MeshEntity)
+                    {
+                        editorMeshEntities.erase(std::remove_if(editorMeshEntities.begin(), editorMeshEntities.end(),
+                            [&](const MeshSceneEntity& mesh) { return mesh.id == id; }), editorMeshEntities.end());
+                    }
                     if ((type == HierarchyEntityType::WaterBody && selectedEditorObject.type == SelectedEditorObjectType::WaterBody && selectedEditorObject.id == id) ||
                         (type == HierarchyEntityType::PointLight && selectedEditorObject.type == SelectedEditorObjectType::PointLight && selectedEditorObject.id == id) ||
-                        (type == HierarchyEntityType::SpotLight && selectedEditorObject.type == SelectedEditorObjectType::SpotLight && selectedEditorObject.id == id))
+                        (type == HierarchyEntityType::SpotLight && selectedEditorObject.type == SelectedEditorObjectType::SpotLight && selectedEditorObject.id == id) ||
+                        (type == HierarchyEntityType::MeshEntity && selectedEditorObject.type == SelectedEditorObjectType::MeshEntity && selectedEditorObject.id == id))
                     {
                         selectedEditorObject = {};
                     }
@@ -2217,6 +2399,22 @@ int RunGame(NativeWindow& window,
                         SceneManager::Instance().MarkDirty();
                         Tracenf("[HIERARCHY] Duplicated entity: original=%u new=%u", id, copy.id);
                     }
+                    else if (type == HierarchyEntityType::MeshEntity)
+                    {
+                        auto it = std::find_if(editorMeshEntities.begin(), editorMeshEntities.end(),
+                            [&](const MeshSceneEntity& mesh) { return mesh.id == id; });
+                        if (it == editorMeshEntities.end())
+                            return;
+                        MeshSceneEntity copy = *it;
+                        copy.id = nextEditorMeshEntityId++;
+                        copy.name = makeUniqueSceneEntityName((copy.name.empty() ? "Mesh Entity" : copy.name) + " Copy");
+                        copy.position[0] += 5.0f;
+                        copy.editorHidden = false;
+                        editorMeshEntities.push_back(copy);
+                        selectedEditorObject = {SelectedEditorObjectType::MeshEntity, copy.id};
+                        SceneManager::Instance().MarkDirty();
+                        Tracenf("[HIERARCHY] Duplicated entity: original=%u new=%u", id, copy.id);
+                    }
                     runtimeSession->SetEditorStatus("Duplicated hierarchy entity #" + std::to_string(id));
                 };
                 auto renameHierarchyEntity = [&](HierarchyEntityType type, std::uint32_t id, const std::string& name) {
@@ -2241,6 +2439,13 @@ int RunGame(NativeWindow& window,
                         auto it = std::find_if(editorSpotLights.begin(), editorSpotLights.end(),
                             [&](const SpotLight& light) { return light.id == id; });
                         if (it != editorSpotLights.end())
+                            it->name = name;
+                    }
+                    else if (type == HierarchyEntityType::MeshEntity)
+                    {
+                        auto it = std::find_if(editorMeshEntities.begin(), editorMeshEntities.end(),
+                            [&](const MeshSceneEntity& mesh) { return mesh.id == id; });
+                        if (it != editorMeshEntities.end())
                             it->name = name;
                     }
                     SceneManager::Instance().MarkDirty();
@@ -2275,6 +2480,16 @@ int RunGame(NativeWindow& window,
                         auto it = std::find_if(editorSpotLights.begin(), editorSpotLights.end(),
                             [&](const SpotLight& light) { return light.id == id; });
                         if (it != editorSpotLights.end())
+                        {
+                            it->editorHidden = !it->editorHidden;
+                            hidden = it->editorHidden;
+                        }
+                    }
+                    else if (type == HierarchyEntityType::MeshEntity)
+                    {
+                        auto it = std::find_if(editorMeshEntities.begin(), editorMeshEntities.end(),
+                            [&](const MeshSceneEntity& mesh) { return mesh.id == id; });
+                        if (it != editorMeshEntities.end())
                         {
                             it->editorHidden = !it->editorHidden;
                             hidden = it->editorHidden;
@@ -2373,14 +2588,18 @@ int RunGame(NativeWindow& window,
                     if (editorPlay.state.mode == EditorPlayMode::Play)
                         runtimeSession->Tick(deltaSeconds);
                     commands.addWaterBody = false;
+                    commands.addMeshEntity = false;
                     commands.addComponentToSelectedEntity = false;
                     commands.addComponentType = EditorComponentType::None;
+                    commands.assignMeshAssetToSelectedEntity = false;
                     commands.addPointLight = false;
                     commands.addSpotLight = false;
                     commands.deleteSelectedLight = false;
                     commands.deleteSelectedWaterBody = false;
+                    commands.deleteSelectedMeshEntity = false;
                     commands.selectedLightChanged = false;
                     commands.selectedWaterBodyChanged = false;
+                    commands.selectedMeshEntityChanged = false;
                     commands.hierarchyDeleteEntity = false;
                     commands.hierarchyDuplicateEntity = false;
                     commands.hierarchyRenameEntity = false;
@@ -2425,7 +2644,74 @@ int RunGame(NativeWindow& window,
                         if (it != editorSpotLights.end())
                             return WorldVec3{it->position[0], it->position[1], it->position[2]};
                     }
+                    else if (selectedEditorObject.type == SelectedEditorObjectType::MeshEntity)
+                    {
+                        auto it = std::find_if(editorMeshEntities.begin(), editorMeshEntities.end(),
+                            [&](const MeshSceneEntity& mesh) { return mesh.id == selectedEditorObject.id; });
+                        if (it != editorMeshEntities.end())
+                            return WorldVec3{it->position[0], it->position[1], it->position[2]};
+                    }
                     return spawnAtCameraCenter();
+                };
+                auto resolveModelAsset = [&](const std::string& assetId) -> std::optional<AssetLibrary::Entry> {
+                    if (assetId.empty())
+                        return std::nullopt;
+                    std::string error;
+                    if (ProjectManager::Instance().HasProject())
+                    {
+                        AssetLibrary projectAssets(ProjectManager::Instance().ProjectRoot(),
+                            ProjectManager::Instance().AssetRootPath());
+                        if (projectAssets.Initialize())
+                        {
+                            auto entry = projectAssets.FindById(assetId);
+                            if (entry && entry->category == AssetLibrary::Category::Model)
+                            {
+                                entry->originalPath = projectAssets.AssetRelativePath(*entry);
+                                return entry;
+                            }
+                        }
+                    }
+                    if (auto root = assets.RootPath())
+                    {
+                        AssetLibrary engineAssets(*root);
+                        if (engineAssets.Initialize())
+                        {
+                            auto entry = engineAssets.FindById(assetId);
+                            if (entry && entry->category == AssetLibrary::Category::Model)
+                            {
+                                entry->originalPath = engineAssets.AssetRelativePath(*entry);
+                                return entry;
+                            }
+                        }
+                    }
+                    return std::nullopt;
+                };
+                auto createMeshEntityAt = [&](const std::string& assetId, WorldVec3 spawn) {
+                    auto entry = resolveModelAsset(assetId);
+                    MeshSceneEntity mesh{};
+                    mesh.id = nextEditorMeshEntityId++;
+                    mesh.meshAssetId = assetId;
+                    mesh.meshAssetPath = entry ? entry->originalPath : assetId;
+                    const std::string baseName = entry
+                        ? (entry->displayName.empty() ? std::filesystem::path(entry->filename).stem().string() : entry->displayName)
+                        : (assetId.empty() ? std::string("Mesh Entity") : assetId);
+                    mesh.name = makeUniqueSceneEntityName(baseName);
+                    mesh.position[0] = spawn.x;
+                    mesh.position[1] = spawn.y;
+                    mesh.position[2] = spawn.z;
+                    mesh.skinned = true;
+                    editorMeshEntities.push_back(mesh);
+                    selectedEditorObject = {SelectedEditorObjectType::MeshEntity, mesh.id};
+                    editorGizmoMode = EditorGizmoMode::Translate;
+                    SceneManager::Instance().MarkDirty();
+                    runtimeSession->SetEditorStatus("Mesh entity spawned: " + mesh.name);
+                    Tracenf("[MESH-ENTITY] Spawned: id=%u asset_id=%s path=%s position=(%.2f,%.2f,%.2f)",
+                        mesh.id,
+                        mesh.meshAssetId.c_str(),
+                        mesh.meshAssetPath.c_str(),
+                        spawn.x,
+                        spawn.y,
+                        spawn.z);
                 };
                 if (commands.addComponentToSelectedEntity)
                 {
@@ -2495,7 +2781,14 @@ int RunGame(NativeWindow& window,
                             runtimeSession->SetEditorStatus("Added Spot Light component");
                         }
                     }
+                    else if (commands.addComponentType == EditorComponentType::MeshRenderer &&
+                        selectedEditorObject.type != SelectedEditorObjectType::MeshEntity)
+                    {
+                        createMeshEntityAt(commands.assignMeshAssetId.empty() ? commands.meshAssetId : commands.assignMeshAssetId, spawn);
+                    }
                 }
+                if (commands.addMeshEntity)
+                    createMeshEntityAt(commands.meshAssetId, spawnAtCameraCenter());
                 if (commands.addWaterBody)
                 {
                     const WorldVec3 spawn = spawnAtCameraCenter();
@@ -2596,6 +2889,17 @@ int RunGame(NativeWindow& window,
                         }
                     }
                 }
+                if (commands.selectedMeshEntityChanged)
+                {
+                    auto it = std::find_if(editorMeshEntities.begin(), editorMeshEntities.end(),
+                        [&](const MeshSceneEntity& mesh) { return mesh.id == commands.selectedMeshEntity.id; });
+                    if (it != editorMeshEntities.end())
+                    {
+                        ApplyMeshRendererEditorState(*it, commands.selectedMeshEntity);
+                        selectedEditorObject = {SelectedEditorObjectType::MeshEntity, it->id};
+                        SceneManager::Instance().MarkDirty();
+                    }
+                }
                 if (commands.deleteSelectedLight)
                 {
                     if (selectedEditorObject.type == SelectedEditorObjectType::PointLight)
@@ -2614,6 +2918,15 @@ int RunGame(NativeWindow& window,
                         selectedEditorObject = {};
                         SceneManager::Instance().MarkDirty();
                     }
+                }
+                if (commands.deleteSelectedMeshEntity &&
+                    selectedEditorObject.type == SelectedEditorObjectType::MeshEntity)
+                {
+                    editorMeshEntities.erase(std::remove_if(editorMeshEntities.begin(), editorMeshEntities.end(),
+                        [&](const MeshSceneEntity& mesh) { return mesh.id == selectedEditorObject.id; }), editorMeshEntities.end());
+                    runtimeSession->SetEditorStatus("Mesh entity deleted: id=" + std::to_string(selectedEditorObject.id));
+                    selectedEditorObject = {};
+                    SceneManager::Instance().MarkDirty();
                 }
                 if (commands.selectedWaterBodyChanged)
                 {
@@ -2698,6 +3011,14 @@ int RunGame(NativeWindow& window,
                     selectedEditorObject.type == SelectedEditorObjectType::WaterBody ? selectedEditorObject.id : 0u);
                 runtimeSession->SetWaterBodyEditorState(waterBodyState);
                 editorImGui.SetWaterBodyEditorState(waterBodyState);
+                MeshRendererEditorState meshRendererState = BuildMeshRendererEditorState(editorMeshEntities,
+                    selectedEditorObject.type == SelectedEditorObjectType::MeshEntity ? selectedEditorObject.id : 0u);
+                if (meshRendererState.selected)
+                {
+                    if (auto entry = resolveModelAsset(meshRendererState.meshAssetId))
+                        meshRendererState.meshDisplayName = entry->displayName.empty() ? entry->filename : entry->displayName;
+                }
+                editorImGui.SetMeshRendererEditorState(meshRendererState);
                 auto hierarchyState = buildHierarchyEntities();
                 editorImGui.SetHierarchySceneState(
                     static_cast<std::uint64_t>(editorSceneRootEntity),
@@ -2835,11 +3156,36 @@ int RunGame(NativeWindow& window,
             const bool isInWorld = runtimeSession->IsInWorld();
             std::vector<WorldRenderEntity> entities;
             WorldCamera camera{};
+            const bool editorHideEntitiesForMeshes =
+#if defined(IXTREEME_WITH_EDITOR)
+                editorPlay.state.mode == EditorPlayMode::Edit;
+#else
+                false;
+#endif
+            std::string activeMeshModelPath;
+            if (runtimeSession->IsMapEditorOpen())
+            {
+                for (const MeshSceneEntity& mesh : editorMeshEntities)
+                {
+                    if (editorHideEntitiesForMeshes && mesh.editorHidden)
+                        continue;
+                    const std::string runtimePath = resolveMeshRuntimePath(mesh);
+                    if (!runtimePath.empty())
+                    {
+                        activeMeshModelPath = runtimePath;
+                        break;
+                    }
+                }
+                if (!activeMeshModelPath.empty())
+                    ensureSkinnedMeshLoaded(activeMeshModelPath);
+            }
 
             if (isInWorld)
             {
                 entities = frameEntities;
                 frameSceneEntityCount = entities.size();
+                if (runtimeSession->IsMapEditorOpen())
+                    frameSceneEntityCount += editorMeshEntities.size();
                 camera = hasFrameCamera ? frameCamera : cameraController.BuildCamera(renderSize.width, renderSize.height);
 
                 if (skinnedMeshOk)
@@ -2858,7 +3204,7 @@ int RunGame(NativeWindow& window,
                     if (runtimeSession->IsMapEditorOpen())
                     {
                         const size_t editorVisualRenderCount =
-                            editorPointLights.size() + editorSpotLights.size();
+                            editorPointLights.size() + editorSpotLights.size() + editorMeshEntities.size();
                         for (size_t visualIndex = 0; visualIndex < editorVisualRenderCount; ++visualIndex)
                         {
                             if (skinSlot >= SkinnedMeshRenderer::MaxSkinSlots())
@@ -2962,6 +3308,31 @@ int RunGame(NativeWindow& window,
                                     selected
                                         ? std::array<float, 4>{0.35f, 1.7f, 2.0f, 1.0f}
                                         : std::array<float, 4>{0.35f, 1.25f, 1.65f, 1.0f});
+                                ++skinSlot;
+                            }
+                            for (const MeshSceneEntity& mesh : editorMeshEntities)
+                            {
+                                if (editorPlay.state.mode == EditorPlayMode::Edit && mesh.editorHidden)
+                                    continue;
+                                if (resolveMeshRuntimePath(mesh) != loadedSkinnedMeshPath)
+                                    continue;
+                                if (skinSlot >= SkinnedMeshRenderer::MaxSkinSlots())
+                                    break;
+                                WorldVec3 position{mesh.position[0], mesh.position[1] + skinnedMesh.GroundOffsetY(), mesh.position[2]};
+                                const bool selected =
+                                    selectedEditorObject.type == SelectedEditorObjectType::MeshEntity &&
+                                    selectedEditorObject.id == mesh.id;
+                                skinnedMesh.RenderInWorldReflection(device,
+                                    mirrorCamera,
+                                    reflectionExtent,
+                                    reflectionRenderPass,
+                                    waterLevelY,
+                                    position,
+                                    mesh.rotation[1],
+                                    skinSlot,
+                                    selected
+                                        ? std::array<float, 4>{1.25f, 1.05f, 0.45f, 1.0f}
+                                        : std::array<float, 4>{1.0f, 1.0f, 1.0f, 1.0f});
                                 ++skinSlot;
                             }
                         }
@@ -3084,6 +3455,36 @@ int RunGame(NativeWindow& window,
                             selected
                                 ? std::array<float, 4>{1.0f, 0.86f, 0.32f, 1.0f}
                                 : std::array<float, 4>{0.35f, 0.86f, 1.0f, 1.0f},
+                            selected});
+                        ++skinSlot;
+                    }
+                    for (const MeshSceneEntity& mesh : editorMeshEntities)
+                    {
+                        if (editorPlay.state.mode == EditorPlayMode::Edit && mesh.editorHidden)
+                            continue;
+                        if (resolveMeshRuntimePath(mesh) != loadedSkinnedMeshPath)
+                            continue;
+                        if (skinSlot >= SkinnedMeshRenderer::MaxSkinSlots())
+                            break;
+                        WorldVec3 position{mesh.position[0], mesh.position[1] + skinnedMesh.GroundOffsetY(), mesh.position[2]};
+                        const bool selected =
+                            selectedEditorObject.type == SelectedEditorObjectType::MeshEntity &&
+                            selectedEditorObject.id == mesh.id;
+                        skinnedMesh.RenderInWorld(device,
+                            seconds,
+                            camera,
+                            position,
+                            mesh.rotation[1],
+                            skinSlot,
+                            selected
+                                ? std::array<float, 4>{1.25f, 1.05f, 0.45f, 1.0f}
+                                : std::array<float, 4>{1.0f, 1.0f, 1.0f, 1.0f});
+                        plates.push_back(WorldLabelRenderer::Label{
+                            WorldAdd({mesh.position[0], mesh.position[1], mesh.position[2]}, {0.0f, 1.8f, 0.0f}),
+                            mesh.name.empty() ? "Mesh Entity " + std::to_string(mesh.id) : mesh.name,
+                            selected
+                                ? std::array<float, 4>{1.0f, 0.86f, 0.32f, 1.0f}
+                                : std::array<float, 4>{0.92f, 0.92f, 1.0f, 1.0f},
                             selected});
                         ++skinSlot;
                     }
