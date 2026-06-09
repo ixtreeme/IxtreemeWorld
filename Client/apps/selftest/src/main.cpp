@@ -538,15 +538,15 @@ bool RunRenderChecks(const Options& options, TestContext& ctx)
             vulkanDeviceSource.find("enabled.samplerAnisotropy = VK_TRUE") != std::string::npos,
         "vulkan sampler anisotropy feature", "VulkanDevice must enable samplerAnisotropy with graceful fallback");
 
-    const std::filesystem::path warriorShaderPath = options.clientRoot / "shaders" / "Warrior.hlsl";
-    std::ifstream warriorShader(warriorShaderPath);
-    std::stringstream warriorShaderText;
-    warriorShaderText << warriorShader.rdbuf();
-    const std::string warriorSource = warriorShaderText.str();
-    ctx.Expect(warriorSource.find("u_waterParams") != std::string::npos &&
-            warriorSource.find("CausticPattern") != std::string::npos &&
-            warriorSource.find("waterDepth > 0.0") != std::string::npos,
-        "warrior water caustic shader controls", "Warrior shader is missing WATER-4 underwater caustic controls");
+    const std::filesystem::path skinnedMeshShaderPath = options.clientRoot / "shaders" / "SkinnedMesh.hlsl";
+    std::ifstream skinnedMeshShader(skinnedMeshShaderPath);
+    std::stringstream skinnedMeshShaderText;
+    skinnedMeshShaderText << skinnedMeshShader.rdbuf();
+    const std::string skinnedMeshSource = skinnedMeshShaderText.str();
+    ctx.Expect(skinnedMeshSource.find("u_waterParams") != std::string::npos &&
+            skinnedMeshSource.find("CausticPattern") != std::string::npos &&
+            skinnedMeshSource.find("waterDepth > 0.0") != std::string::npos,
+        "skinnedMesh water caustic shader controls", "Skinned mesh shader is missing WATER-4 underwater caustic controls");
 
     const std::filesystem::path compositeShaderPath = options.clientRoot / "shaders" / "Composite.hlsl";
     std::ifstream compositeShader(compositeShaderPath);
@@ -582,19 +582,19 @@ bool RunRenderChecks(const Options& options, TestContext& ctx)
             mainSource.find("offscreenScene.BeginMainPass(device, false)") != std::string::npos,
         "main render loop uses water refraction snapshots", "Main render loop does not snapshot scene before water pass");
 
-    ctx.Expect(warriorSource.find("u_lightPadding.x > 0.5") != std::string::npos &&
-            warriorSource.find("input.worldPos.y < u_lightPadding.y") != std::string::npos,
-        "warrior reflection clip shader", "Warrior shader is missing water-level reflection clipping");
+    ctx.Expect(skinnedMeshSource.find("u_lightPadding.x > 0.5") != std::string::npos &&
+            skinnedMeshSource.find("input.worldPos.y < u_lightPadding.y") != std::string::npos,
+        "skinnedMesh reflection clip shader", "Skinned mesh shader is missing water-level reflection clipping");
 
-    const std::filesystem::path warriorRendererPath = options.clientRoot / "libs" / "render" / "WarriorRenderer.cpp";
-    std::ifstream warriorRenderer(warriorRendererPath);
-    std::stringstream warriorRendererText;
-    warriorRendererText << warriorRenderer.rdbuf();
-    const std::string warriorRendererSource = warriorRendererText.str();
-    ctx.Expect(warriorRendererSource.find("CreateReflectionPipeline") != std::string::npos &&
-            warriorRendererSource.find("VK_CULL_MODE_FRONT_BIT") != std::string::npos &&
-            warriorRendererSource.find("RenderInWorldReflection") != std::string::npos,
-        "warrior reflection pipeline source", "WarriorRenderer reflection pipeline entry points are missing");
+    const std::filesystem::path skinnedMeshRendererPath = options.clientRoot / "libs" / "render" / "SkinnedMeshRenderer.cpp";
+    std::ifstream skinnedMeshRenderer(skinnedMeshRendererPath);
+    std::stringstream skinnedMeshRendererText;
+    skinnedMeshRendererText << skinnedMeshRenderer.rdbuf();
+    const std::string skinnedMeshRendererSource = skinnedMeshRendererText.str();
+    ctx.Expect(skinnedMeshRendererSource.find("CreateReflectionPipeline") != std::string::npos &&
+            skinnedMeshRendererSource.find("VK_CULL_MODE_FRONT_BIT") != std::string::npos &&
+            skinnedMeshRendererSource.find("RenderInWorldReflection") != std::string::npos,
+        "skinnedMesh reflection pipeline source", "SkinnedMeshRenderer reflection pipeline entry points are missing");
 
     WaterConfig water;
     ctx.Expect(water.enabled &&
@@ -1377,7 +1377,7 @@ bool RunRenderChecks(const Options& options, TestContext& ctx)
             clientMainSource.find("RenderSelectedWaterBodyHighlight(device, camera)") == std::string::npos &&
             clientMainSource.find("Water \" + std::to_string(body.id)") == std::string::npos &&
             clientMainSource.find("for (const WaterBody& body : editorWaterBodies)\n                    {\n                        if (skinSlot") == std::string::npos,
-        "water object selection visuals removed", "Water-body selection must not render the legacy bbox or warrior/nameplate proxies");
+        "water object selection visuals removed", "Water-body selection must not render the legacy bbox or skinnedMesh/label proxies");
 
     const std::filesystem::path waterScratch = (options.scratchRoot.empty() ? MakeDefaultScratchRoot() : options.scratchRoot) / "water_obj";
     const std::filesystem::path waterFile = waterScratch / client::render::kWaterBodiesFilename;

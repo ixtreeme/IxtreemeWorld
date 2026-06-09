@@ -1,4 +1,4 @@
-#include "WarriorRenderer.h"
+#include "SkinnedMeshRenderer.h"
 
 #include "Debug.h"
 #include "asset/IAssetReader.h"
@@ -42,7 +42,7 @@
 #include <variant>
 #include <vector>
 
-struct WarriorRenderer::OzzRuntime
+struct SkinnedMeshRenderer::OzzRuntime
 {
     ozz::animation::Skeleton skeleton;
     ozz::animation::Animation idle;
@@ -138,7 +138,7 @@ struct UniformBlock
     SpotLightUniform spotLights[kMaxDynamicSpotLights]{};
 };
 
-static_assert(sizeof(WarriorRenderer::Vertex) == 32, "Graphics vertex layout must stay 32 bytes");
+static_assert(sizeof(SkinnedMeshRenderer::Vertex) == 32, "Graphics vertex layout must stay 32 bytes");
 
 void FillLightingUniform(const LightingState& lighting, UniformBlock& uniform)
 {
@@ -344,13 +344,13 @@ Mat4 ToLocalMat4(const WorldMat4& matrix)
     return r;
 }
 
-const char* MotionStateName(WarriorRenderer::MotionState state)
+const char* MotionStateName(SkinnedMeshRenderer::MotionState state)
 {
     switch (state)
     {
-    case WarriorRenderer::MotionState::Idle: return "wait";
-    case WarriorRenderer::MotionState::Walk: return "walk";
-    case WarriorRenderer::MotionState::Run: return "run";
+    case SkinnedMeshRenderer::MotionState::Idle: return "wait";
+    case SkinnedMeshRenderer::MotionState::Walk: return "walk";
+    case SkinnedMeshRenderer::MotionState::Run: return "run";
     default: return "unknown";
     }
 }
@@ -773,7 +773,7 @@ VkCommandBuffer BeginOneTimeCommands(VkDevice vkDevice, uint32_t queueFamily, Vk
 void EndOneTimeCommands(VkDevice vkDevice, VkQueue queue, VkCommandPool pool, VkCommandBuffer cmd);
 
 bool CreateHostVisibleBuffer(VulkanDevice& device, VkDevice vkDevice, VkDeviceSize size,
-    VkBufferUsageFlags usage, const void* initialData, WarriorRenderer::Buffer& out)
+    VkBufferUsageFlags usage, const void* initialData, SkinnedMeshRenderer::Buffer& out)
 {
     VkBufferCreateInfo buffer{};
     buffer.sType = VK_STRUCTURE_TYPE_BUFFER_CREATE_INFO;
@@ -812,7 +812,7 @@ void CopyBuffer(VkCommandBuffer cmd, VkBuffer src, VkBuffer dst, VkDeviceSize si
 }
 
 bool CreateDeviceLocalBuffer(VulkanDevice& device, VkDevice vkDevice, VkQueue queue, VkDeviceSize size,
-    VkBufferUsageFlags usage, const void* initialData, WarriorRenderer::Buffer& out)
+    VkBufferUsageFlags usage, const void* initialData, SkinnedMeshRenderer::Buffer& out)
 {
     VkBufferCreateInfo buffer{};
     buffer.sType = VK_STRUCTURE_TYPE_BUFFER_CREATE_INFO;
@@ -833,7 +833,7 @@ bool CreateDeviceLocalBuffer(VulkanDevice& device, VkDevice vkDevice, VkQueue qu
 
     if (initialData && size > 0)
     {
-        WarriorRenderer::Buffer staging{};
+        SkinnedMeshRenderer::Buffer staging{};
         CreateHostVisibleBuffer(device, vkDevice, size, VK_BUFFER_USAGE_TRANSFER_SRC_BIT, initialData, staging);
 
         VkCommandPool uploadPool = VK_NULL_HANDLE;
@@ -1002,7 +1002,7 @@ void TransformVectorRowVector(const float* matrix, const float in[3], float out[
     out[2] = in[0] * matrix[2] + in[1] * matrix[6] + in[2] * matrix[10];
 }
 
-void SkinVertex(const WarriorRenderer::SourceVertex& source,
+void SkinVertex(const SkinnedMeshRenderer::SourceVertex& source,
     const std::vector<std::array<float, 16>>& bonePalette, float outPosition[3],
     float outNormal[3], float outUv[2], int modelBones[4])
 {
@@ -1152,14 +1152,14 @@ uint32_t PackBytes(uint32_t b0, uint32_t b1, uint32_t b2, uint32_t b3)
 }
 }
 
-WarriorRenderer::WarriorRenderer() = default;
+SkinnedMeshRenderer::SkinnedMeshRenderer() = default;
 
-WarriorRenderer::~WarriorRenderer()
+SkinnedMeshRenderer::~SkinnedMeshRenderer()
 {
     Destroy();
 }
 
-bool WarriorRenderer::Create(VulkanDevice& device, client::asset::IAssetReader& assets,
+bool SkinnedMeshRenderer::Create(VulkanDevice& device, client::asset::IAssetReader& assets,
     const std::string& modelPath)
 {
     Destroy();
@@ -1190,7 +1190,7 @@ bool WarriorRenderer::Create(VulkanDevice& device, client::asset::IAssetReader& 
     return false;
 }
 
-bool WarriorRenderer::RecreatePipeline(VulkanDevice& device)
+bool SkinnedMeshRenderer::RecreatePipeline(VulkanDevice& device)
 {
     if (!m_device)
         return true;
@@ -1202,17 +1202,17 @@ bool WarriorRenderer::RecreatePipeline(VulkanDevice& device)
     return CreatePipeline(device);
 }
 
-void WarriorRenderer::SetMainRenderPass(VkRenderPass renderPass)
+void SkinnedMeshRenderer::SetMainRenderPass(VkRenderPass renderPass)
 {
     m_mainRenderPass = renderPass;
 }
 
-void WarriorRenderer::Skin(VulkanDevice& device, double timeSeconds)
+void SkinnedMeshRenderer::Skin(VulkanDevice& device, double timeSeconds)
 {
     SkinInstance(device, 0, m_motionState, static_cast<float>(timeSeconds));
 }
 
-void WarriorRenderer::SkinInstance(VulkanDevice& device, uint32_t skinSlot, MotionState state, float animTimeSeconds)
+void SkinnedMeshRenderer::SkinInstance(VulkanDevice& device, uint32_t skinSlot, MotionState state, float animTimeSeconds)
 {
     if (!m_computePipeline || !device.IsFrameActive())
         return;
@@ -1257,7 +1257,7 @@ void WarriorRenderer::SkinInstance(VulkanDevice& device, uint32_t skinSlot, Moti
    //}
 }
 
-void WarriorRenderer::Render(VulkanDevice& device, double timeSeconds)
+void SkinnedMeshRenderer::Render(VulkanDevice& device, double timeSeconds)
 {
     static bool loggedNoPipeline = false;
     static bool loggedFrameInactive = false;
@@ -1309,7 +1309,7 @@ void WarriorRenderer::Render(VulkanDevice& device, double timeSeconds)
 
     if (!loggedDraw)
     {
-        LogFormat("[MESH] Render: drawing warrior in rect x=%d y=%d w=%u h=%u (swapchain %ux%u)",
+        LogFormat("[MESH] Render: drawing skinnedMesh in rect x=%d y=%d w=%u h=%u (swapchain %ux%u)",
             rect.offset.x,
             rect.offset.y,
             rect.extent.width,
@@ -1380,7 +1380,7 @@ void WarriorRenderer::Render(VulkanDevice& device, double timeSeconds)
     vkCmdSetScissor(cmd, 0, 1, &fullScissor);
 }
 
-void WarriorRenderer::RenderInWorld(VulkanDevice& device,
+void SkinnedMeshRenderer::RenderInWorld(VulkanDevice& device,
     double timeSeconds,
     const WorldCamera& camera,
     WorldVec3 position,
@@ -1448,7 +1448,7 @@ void WarriorRenderer::RenderInWorld(VulkanDevice& device,
 
     if (!loggedDraw)
     {
-        LogFormat("[MESH] World render: warrior pos=(%.2f,%.2f,%.2f) yaw=%.2f camera eye=(%.2f,%.2f,%.2f) target=(%.2f,%.2f,%.2f)",
+        LogFormat("[MESH] World render: skinnedMesh pos=(%.2f,%.2f,%.2f) yaw=%.2f camera eye=(%.2f,%.2f,%.2f) target=(%.2f,%.2f,%.2f)",
             position.x,
             position.y,
             position.z,
@@ -1463,7 +1463,7 @@ void WarriorRenderer::RenderInWorld(VulkanDevice& device,
     }
 }
 
-void WarriorRenderer::RenderInWorldReflection(VulkanDevice& device,
+void SkinnedMeshRenderer::RenderInWorldReflection(VulkanDevice& device,
     const WorldCamera& camera,
     VkExtent2D extent,
     VkRenderPass renderPass,
@@ -1525,7 +1525,7 @@ void WarriorRenderer::RenderInWorldReflection(VulkanDevice& device,
     }
 }
 
-void WarriorRenderer::Destroy()
+void SkinnedMeshRenderer::Destroy()
 {
     DestroyAnimation();
 
@@ -1561,7 +1561,7 @@ void WarriorRenderer::Destroy()
     m_assets = nullptr;
 }
 
-bool WarriorRenderer::LoadGltfMesh(const std::string& modelPath)
+bool SkinnedMeshRenderer::LoadGltfMesh(const std::string& modelPath)
 {
     DestroyAnimation();
     if (!m_assets)
@@ -1829,7 +1829,7 @@ bool WarriorRenderer::LoadGltfMesh(const std::string& modelPath)
     return true;
 }
 
-bool WarriorRenderer::LoadOzzPose(const std::string& dir)
+bool SkinnedMeshRenderer::LoadOzzPose(const std::string& dir)
 {
     if (!m_assets)
         return false;
@@ -1866,7 +1866,7 @@ bool WarriorRenderer::LoadOzzPose(const std::string& dir)
     return true;
 }
 
-void WarriorRenderer::SetMotionState(MotionState state)
+void SkinnedMeshRenderer::SetMotionState(MotionState state)
 {
     const bool changed = m_motionState != state;
     m_motionState = state;
@@ -1874,12 +1874,12 @@ void WarriorRenderer::SetMotionState(MotionState state)
         LogFormat("[ANIM-PREVIEW] state=%s", MotionStateName(state));
 }
 
-float WarriorRenderer::GroundOffsetY() const
+float SkinnedMeshRenderer::GroundOffsetY() const
 {
     return -m_bounds.min[1];
 }
 
-bool WarriorRenderer::SkinPose(float animTimeSeconds, bool updateBounds, bool logSamples)
+bool SkinnedMeshRenderer::SkinPose(float animTimeSeconds, bool updateBounds, bool logSamples)
 {
     if (!m_ozz || m_boneCount == 0)
         return false;
@@ -2000,12 +2000,12 @@ bool WarriorRenderer::SkinPose(float animTimeSeconds, bool updateBounds, bool lo
     return true;
 }
 
-bool WarriorRenderer::UploadBonePalette(float animTimeSeconds, uint32_t frameIndex)
+bool SkinnedMeshRenderer::UploadBonePalette(float animTimeSeconds, uint32_t frameIndex)
 {
     return UploadBonePalette(m_motionState, animTimeSeconds, frameIndex, 0);
 }
 
-bool WarriorRenderer::UploadBonePalette(MotionState state, float animTimeSeconds, uint32_t frameIndex, uint32_t skinSlot)
+bool SkinnedMeshRenderer::UploadBonePalette(MotionState state, float animTimeSeconds, uint32_t frameIndex, uint32_t skinSlot)
 {
     if (frameIndex >= kFramesInFlight || skinSlot >= kSkinSlots || !m_bonePaletteBuffers[frameIndex][skinSlot].memory ||
         !m_ozz || m_bonePaletteCpu.empty())
@@ -2025,12 +2025,12 @@ bool WarriorRenderer::UploadBonePalette(MotionState state, float animTimeSeconds
     return true;
 }
 
-void WarriorRenderer::DispatchSkin(VkCommandBuffer cmd, uint32_t frameIndex)
+void SkinnedMeshRenderer::DispatchSkin(VkCommandBuffer cmd, uint32_t frameIndex)
 {
     DispatchSkin(cmd, frameIndex, 0);
 }
 
-void WarriorRenderer::DispatchSkin(VkCommandBuffer cmd, uint32_t frameIndex, uint32_t skinSlot)
+void SkinnedMeshRenderer::DispatchSkin(VkCommandBuffer cmd, uint32_t frameIndex, uint32_t skinSlot)
 {
     vkCmdBindPipeline(cmd, VK_PIPELINE_BIND_POINT_COMPUTE, m_computePipeline);
     vkCmdBindDescriptorSets(cmd, VK_PIPELINE_BIND_POINT_COMPUTE, m_computePipelineLayout,
@@ -2046,7 +2046,7 @@ void WarriorRenderer::DispatchSkin(VkCommandBuffer cmd, uint32_t frameIndex, uin
     vkCmdDispatch(cmd, groupCount, 1, 1);
 }
 
-bool WarriorRenderer::VerifyComputeSkin(VulkanDevice& device)
+bool SkinnedMeshRenderer::VerifyComputeSkin(VulkanDevice& device)
 {
     constexpr float verifyTime = 0.5f;
     if (!SkinPose(verifyTime, false, false))
@@ -2139,7 +2139,7 @@ bool WarriorRenderer::VerifyComputeSkin(VulkanDevice& device)
     return true;
 }
 
-bool WarriorRenderer::CreateBuffers(VulkanDevice& device)
+bool SkinnedMeshRenderer::CreateBuffers(VulkanDevice& device)
 {
     CreateHostVisibleBuffer(device, m_device, sizeof(uint32_t) * m_indices.size(),
         VK_BUFFER_USAGE_INDEX_BUFFER_BIT, m_indices.data(), m_indexBuffer);
@@ -2155,7 +2155,7 @@ bool WarriorRenderer::CreateBuffers(VulkanDevice& device)
     return true;
 }
 
-bool WarriorRenderer::CreateComputeResources(VulkanDevice& device)
+bool SkinnedMeshRenderer::CreateComputeResources(VulkanDevice& device)
 {
     VkQueue graphicsQueue = VK_NULL_HANDLE;
     vkGetDeviceQueue(m_device, device.GetGraphicsQueueFamily(), 0, &graphicsQueue);
@@ -2202,7 +2202,7 @@ bool WarriorRenderer::CreateComputeResources(VulkanDevice& device)
     return true;
 }
 
-bool WarriorRenderer::CreateTextures(VulkanDevice& device, const std::string& modelPath)
+bool SkinnedMeshRenderer::CreateTextures(VulkanDevice& device, const std::string& modelPath)
 {
     const size_t slash = modelPath.find_last_of("\\/");
     const std::string dir = slash == std::string::npos ? std::string(".") : modelPath.substr(0, slash);
@@ -2320,7 +2320,7 @@ bool WarriorRenderer::CreateTextures(VulkanDevice& device, const std::string& mo
     return true;
 }
 
-bool WarriorRenderer::CreateDescriptors()
+bool SkinnedMeshRenderer::CreateDescriptors()
 {
     VkDescriptorSetLayoutBinding ubo{};
     ubo.binding = 0;
@@ -2408,7 +2408,7 @@ bool WarriorRenderer::CreateDescriptors()
     return true;
 }
 
-bool WarriorRenderer::CreateComputeDescriptors()
+bool SkinnedMeshRenderer::CreateComputeDescriptors()
 {
     VkDescriptorSetLayoutBinding rest{};
     rest.binding = 0;
@@ -2507,12 +2507,12 @@ bool WarriorRenderer::CreateComputeDescriptors()
     return true;
 }
 
-bool WarriorRenderer::CreateComputePipeline()
+bool SkinnedMeshRenderer::CreateComputePipeline()
 {
     if (!m_assets)
         return false;
 
-    VkShaderModule cs = CreateShaderModule(m_device, *m_assets, "assets/shaders/warrior_cs.spv");
+    VkShaderModule cs = CreateShaderModule(m_device, *m_assets, "assets/shaders/skinned_mesh_cs.spv");
 
     VkPushConstantRange push{};
     push.stageFlags = VK_SHADER_STAGE_COMPUTE_BIT;
@@ -2541,13 +2541,13 @@ bool WarriorRenderer::CreateComputePipeline()
     return true;
 }
 
-bool WarriorRenderer::CreatePipeline(VulkanDevice& device)
+bool SkinnedMeshRenderer::CreatePipeline(VulkanDevice& device)
 {
     if (!m_assets)
         return false;
 
-    VkShaderModule vs = CreateShaderModule(m_device, *m_assets, "assets/shaders/warrior_vs.spv");
-    VkShaderModule ps = CreateShaderModule(m_device, *m_assets, "assets/shaders/warrior_ps.spv");
+    VkShaderModule vs = CreateShaderModule(m_device, *m_assets, "assets/shaders/skinned_mesh_vs.spv");
+    VkShaderModule ps = CreateShaderModule(m_device, *m_assets, "assets/shaders/skinned_mesh_ps.spv");
 
     VkPipelineShaderStageCreateInfo stages[2]{};
     stages[0].sType = VK_STRUCTURE_TYPE_PIPELINE_SHADER_STAGE_CREATE_INFO;
@@ -2654,13 +2654,13 @@ bool WarriorRenderer::CreatePipeline(VulkanDevice& device)
     return true;
 }
 
-bool WarriorRenderer::CreateReflectionPipeline(VulkanDevice& device, VkRenderPass renderPass)
+bool SkinnedMeshRenderer::CreateReflectionPipeline(VulkanDevice& device, VkRenderPass renderPass)
 {
     if (!m_assets || !m_pipelineLayout || renderPass == VK_NULL_HANDLE)
         return false;
 
-    VkShaderModule vs = CreateShaderModule(m_device, *m_assets, "assets/shaders/warrior_vs.spv");
-    VkShaderModule ps = CreateShaderModule(m_device, *m_assets, "assets/shaders/warrior_ps.spv");
+    VkShaderModule vs = CreateShaderModule(m_device, *m_assets, "assets/shaders/skinned_mesh_vs.spv");
+    VkShaderModule ps = CreateShaderModule(m_device, *m_assets, "assets/shaders/skinned_mesh_ps.spv");
 
     VkPipelineShaderStageCreateInfo stages[2]{};
     stages[0].sType = VK_STRUCTURE_TYPE_PIPELINE_SHADER_STAGE_CREATE_INFO;
@@ -2759,11 +2759,11 @@ bool WarriorRenderer::CreateReflectionPipeline(VulkanDevice& device, VkRenderPas
 
     vkDestroyShaderModule(m_device, ps, nullptr);
     vkDestroyShaderModule(m_device, vs, nullptr);
-    Log("[WATER-3] Warrior reflection pipeline created");
+    Log("[WATER-3] Skinned mesh reflection pipeline created");
     return true;
 }
 
-void WarriorRenderer::DestroyPipeline()
+void SkinnedMeshRenderer::DestroyPipeline()
 {
     DestroyReflectionPipeline();
 
@@ -2776,7 +2776,7 @@ void WarriorRenderer::DestroyPipeline()
     m_pipelineLayout = VK_NULL_HANDLE;
 }
 
-void WarriorRenderer::DestroyReflectionPipeline()
+void SkinnedMeshRenderer::DestroyReflectionPipeline()
 {
     if (m_reflectionPipeline)
         vkDestroyPipeline(m_device, m_reflectionPipeline, nullptr);
@@ -2784,7 +2784,7 @@ void WarriorRenderer::DestroyReflectionPipeline()
     m_reflectionRenderPass = VK_NULL_HANDLE;
 }
 
-void WarriorRenderer::DestroyBuffer(Buffer& buffer)
+void SkinnedMeshRenderer::DestroyBuffer(Buffer& buffer)
 {
     if (buffer.buffer)
         vkDestroyBuffer(m_device, buffer.buffer, nullptr);
@@ -2793,7 +2793,7 @@ void WarriorRenderer::DestroyBuffer(Buffer& buffer)
     buffer = {};
 }
 
-void WarriorRenderer::DestroyComputeResources()
+void SkinnedMeshRenderer::DestroyComputeResources()
 {
     if (m_computePipeline)
         vkDestroyPipeline(m_device, m_computePipeline, nullptr);
@@ -2824,7 +2824,7 @@ void WarriorRenderer::DestroyComputeResources()
     }
 }
 
-void WarriorRenderer::DestroyAnimation()
+void SkinnedMeshRenderer::DestroyAnimation()
 {
     m_ozz.reset();
     m_inverseBindMatrices.clear();
@@ -2834,7 +2834,7 @@ void WarriorRenderer::DestroyAnimation()
     m_lastAnimationLogTime = -1000.0;
 }
 
-void WarriorRenderer::DestroyTexture(Texture& texture)
+void SkinnedMeshRenderer::DestroyTexture(Texture& texture)
 {
     if (texture.sampler)
         vkDestroySampler(m_device, texture.sampler, nullptr);
@@ -2847,7 +2847,7 @@ void WarriorRenderer::DestroyTexture(Texture& texture)
     texture = {};
 }
 
-void WarriorRenderer::UpdateUniform(uint32_t frameIndex, uint32_t uniformSlot, double timeSeconds, float aspect)
+void SkinnedMeshRenderer::UpdateUniform(uint32_t frameIndex, uint32_t uniformSlot, double timeSeconds, float aspect)
 {
     static bool loggedMvp = false;
 
@@ -2882,7 +2882,7 @@ void WarriorRenderer::UpdateUniform(uint32_t frameIndex, uint32_t uniformSlot, d
     vkUnmapMemory(m_device, m_uniformBuffers[frameIndex][uniformSlot].memory);
 }
 
-void WarriorRenderer::UpdateWorldUniform(uint32_t frameIndex,
+void SkinnedMeshRenderer::UpdateWorldUniform(uint32_t frameIndex,
     uint32_t uniformSlot,
     const WorldCamera& camera,
     WorldVec3 position,

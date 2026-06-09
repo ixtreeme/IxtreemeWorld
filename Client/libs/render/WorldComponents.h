@@ -38,20 +38,12 @@ struct MoveState
 struct RenderableModel
 {
     std::uint32_t modelId = 0;
-    std::uint32_t mobTypeId = 0;
+    std::uint32_t visualClassId = 0;
 };
 
-struct Nameplate
+struct WorldLabel
 {
-    std::string name;
-    std::uint32_t level = 1;
-};
-
-struct Health
-{
-    float current = 1.0f;
-    float max = 1.0f;
-    float displayed = 1.0f;
+    std::string text;
 };
 
 struct LocalPlayerTag

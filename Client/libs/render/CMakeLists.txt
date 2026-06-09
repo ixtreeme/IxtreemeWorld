@@ -6,8 +6,8 @@ add_library(client_render STATIC
     EditorImGui.cpp
     EditorImGui.h
     MapEditorTypes.h
-    NameplateRenderer.cpp
-    NameplateRenderer.h
+    WorldLabelRenderer.cpp
+    WorldLabelRenderer.h
     OffscreenSceneRenderer.cpp
     OffscreenSceneRenderer.h
     ProjectManager.cpp
@@ -26,8 +26,8 @@ add_library(client_render STATIC
     UIHelpers.h
     WaterBodyIO.cpp
     WaterBodyIO.h
-    WarriorRenderer.cpp
-    WarriorRenderer.h
+    SkinnedMeshRenderer.cpp
+    SkinnedMeshRenderer.h
     WorldCamera.h
     WorldComponents.h
 )

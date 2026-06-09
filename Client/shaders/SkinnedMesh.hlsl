@@ -13,7 +13,7 @@ struct SpotLightUbo
     float4 color;
 };
 
-[[vk::binding(0, 0)]] cbuffer WarriorConstants : register(b0)
+[[vk::binding(0, 0)]] cbuffer SkinnedMeshConstants : register(b0)
 {
     float4x4 u_mvp;
     float4x4 u_model;

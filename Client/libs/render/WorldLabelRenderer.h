@@ -12,7 +12,7 @@ namespace client::asset {
 class IAssetReader;
 }
 
-class NameplateRenderer
+class WorldLabelRenderer
 {
 public:
     struct Buffer
@@ -31,21 +31,17 @@ public:
         uint32_t height = 0;
     };
 
-    struct Nameplate
+    struct Label
     {
         WorldVec3 position{};
-        std::string name;
-        uint32_t level = 0;
-        int32_t alignment = 0;
-        float hpCurrent = 1.0f;
-        float hpMax = 1.0f;
-        float hpDisplayed = 1.0f;
+        std::string text;
+        std::array<float, 4> color = {0.92f, 0.96f, 1.0f, 1.0f};
         bool selected = false;
     };
 
     bool Create(VulkanDevice& device, client::asset::IAssetReader& assets);
     bool RecreatePipeline(VulkanDevice& device);
-    void Render(VulkanDevice& device, const WorldCamera& camera, const std::vector<Nameplate>& nameplates);
+    void Render(VulkanDevice& device, const WorldCamera& camera, const std::vector<Label>& worldLabels);
     void Destroy();
 
 private:
@@ -82,7 +78,7 @@ private:
     void DestroyBuffer(Buffer& buffer);
     void DestroyTexture(Texture& texture);
     void UpdateUniform(uint32_t frameIndex, const WorldCamera& camera);
-    void BuildVertices(const WorldCamera& camera, const std::vector<Nameplate>& nameplates, std::vector<Vertex>& vertices) const;
+    void BuildVertices(const WorldCamera& camera, const std::vector<Label>& worldLabels, std::vector<Vertex>& vertices) const;
     void AppendLine(std::vector<Vertex>& vertices, WorldVec3 origin, WorldVec3 right, WorldVec3 up,
         const std::string& text, float pixelScale, const float color[4], float fade = 1.0f) const;
     void AppendQuad(std::vector<Vertex>& vertices, WorldVec3 origin, WorldVec3 right, WorldVec3 up,

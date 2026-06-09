@@ -2,7 +2,7 @@
 #include <windows.h>
 #endif
 
-#include "NameplateRenderer.h"
+#include "WorldLabelRenderer.h"
 #include "NativeWindow.h"
 #include "EditorImGui.h"
 #if defined(_WIN32)
@@ -18,7 +18,7 @@
 #include "SceneManager.h"
 #include "TerrainRenderer.h"
 #include "VulkanDevice.h"
-#include "WarriorRenderer.h"
+#include "SkinnedMeshRenderer.h"
 #include "Debug.h"
 #include "asset/IAssetReader.h"
 
@@ -128,7 +128,7 @@ bool ProjectWorldToScreen(const WorldCamera& camera,
     return true;
 }
 
-std::uint32_t PickMobTarget(const std::vector<WorldRenderEntity>& entities,
+std::uint32_t PickRenderEntityTarget(const std::vector<WorldRenderEntity>& entities,
                             const WorldCamera& camera,
                             uint32_t width,
                             uint32_t height,
@@ -140,7 +140,7 @@ std::uint32_t PickMobTarget(const std::vector<WorldRenderEntity>& entities,
     std::uint32_t bestNetId = 0;
     for (const auto& entity : entities)
     {
-        if (entity.mobTypeId == 0)
+        if (entity.visualClassId == 0)
             continue;
 
         WorldVec3 screenAnchor = WorldAdd(ServerMetersToDisplay(entity.position), {0.0f, 1.4f, 0.0f});
@@ -544,16 +544,16 @@ WorldVec3 SpotLightDirection(const SpotLight& spot)
     return WorldNormalize({std::sin(yaw) * cosPitch, std::sin(pitch), std::cos(yaw) * cosPitch});
 }
 
-WarriorRenderer::MotionState ToWarriorMotion(RuntimeMoveState state)
+SkinnedMeshRenderer::MotionState ToSkinnedMeshMotion(RuntimeMoveState state)
 {
     switch (state)
     {
     case RuntimeMoveState::Walking:
-        return WarriorRenderer::MotionState::Walk;
+        return SkinnedMeshRenderer::MotionState::Walk;
     case RuntimeMoveState::Running:
-        return WarriorRenderer::MotionState::Run;
+        return SkinnedMeshRenderer::MotionState::Run;
     default:
-        return WarriorRenderer::MotionState::Idle;
+        return SkinnedMeshRenderer::MotionState::Idle;
     }
 }
 
@@ -630,59 +630,30 @@ struct MovementInputState
     }
 };
 
-class CameraController
+class FlyCameraController
 {
 public:
     struct Snapshot
     {
-        bool flyMode = false;
+        WorldVec3 eye{};
         float yaw = 0.0f;
         float pitch = 0.0f;
-        float distance = 0.0f;
-        WorldVec3 lastEye{};
-        WorldVec3 flyEye{};
-        float flyYaw = 0.0f;
-        float flyPitch = 0.0f;
     };
 
-    void SetEditorFlyMode(bool enabled)
+    void SetFreeCameraEnabled(bool enabled)
     {
-        if (enabled == flyMode_)
+        if (enabled == inputEnabled_)
             return;
 
-        flyMode_ = enabled;
+        inputEnabled_ = enabled;
         dragActive_ = false;
-        if (flyMode_)
-        {
-            flyEye_ = lastEye_;
-            flyYaw_ = yaw_;
-            flyPitch_ = pitch_;
-            Tracen("[CAMERA] mode=editor-fly");
-        }
-        else
-        {
-            yaw_ = flyYaw_;
-            pitch_ = std::clamp(flyPitch_, -kMaxPitch, kMaxPitch);
-            Tracen("[CAMERA] mode=tps");
-        }
+        Tracenf("[CAMERA] mode=free enabled=%d", inputEnabled_ ? 1 : 0);
     }
 
     bool HandleInput(const InputEvent& event)
     {
-        if (event.type == InputEvent::KeyUp && event.key == Key_F1)
-        {
-            f1Down_ = false;
-            return true;
-        }
-
-        if (event.type == InputEvent::KeyDown && event.key == Key_F1)
-        {
-            if (f1Down_)
-                return true;
-            f1Down_ = true;
-            SetEditorFlyMode(!flyMode_);
-            return true;
-        }
+        if (!inputEnabled_)
+            return false;
 
         switch (event.type)
         {
@@ -703,7 +674,7 @@ public:
             lastMouseY_ = event.y;
             return true;
         case InputEvent::MouseWheel:
-            zoomVelocity_ -= static_cast<float>(event.wheelDelta) / 120.0f * 1.2f;
+            speedScale_ = std::clamp(speedScale_ + static_cast<float>(event.wheelDelta) / 120.0f * 0.15f, 0.25f, 4.0f);
             return true;
         default:
             return false;
@@ -712,93 +683,51 @@ public:
 
     void Update(double dt, const MovementInputState& movement)
     {
+        if (!inputEnabled_)
+            return;
         const float frameDt = static_cast<float>(std::clamp(dt, 0.0, 0.05));
-        yaw_ += yawVelocity_;
-        pitch_ = std::clamp(pitch_ + pitchVelocity_, -kMaxPitch, kMaxPitch);
-        distance_ = std::clamp(distance_ + zoomVelocity_, kMinDistance, kMaxDistance);
-
-        yawVelocity_ *= 0.85f;
-        pitchVelocity_ *= 0.85f;
-        zoomVelocity_ *= 0.85f;
-        if (std::fabs(yawVelocity_) < 0.00001f)
-            yawVelocity_ = 0.0f;
-        if (std::fabs(pitchVelocity_) < 0.00001f)
-            pitchVelocity_ = 0.0f;
-        if (std::fabs(zoomVelocity_) < 0.001f)
-            zoomVelocity_ = 0.0f;
-
-        if (flyMode_)
-            UpdateFly(frameDt, movement);
+        UpdateFly(frameDt, movement);
     }
 
-    WorldCamera BuildCamera(uint32_t width, uint32_t height, WorldVec3 target)
+    WorldCamera BuildCamera(uint32_t width, uint32_t height) const
     {
-        if (flyMode_)
-            return BuildFlyCamera(width, height);
-
-        WorldCamera camera = BuildOrbitCamera(width, height, target, yaw_, pitch_, distance_);
-        lastEye_ = camera.eye;
-        return camera;
+        return BuildFlyCamera(width, height);
     }
 
-    bool IsFlyMode() const { return flyMode_; }
-    float MovementYaw() const { return flyMode_ ? flyYaw_ : yaw_; }
+    bool IsFreeCameraEnabled() const { return inputEnabled_; }
+    float MovementYaw() const { return yaw_; }
     Snapshot SaveSnapshot() const
     {
-        return Snapshot{flyMode_, yaw_, pitch_, distance_, lastEye_, flyEye_, flyYaw_, flyPitch_};
+        return Snapshot{eye_, yaw_, pitch_};
     }
     void RestoreSnapshot(const Snapshot& snapshot)
     {
-        flyMode_ = snapshot.flyMode;
+        eye_ = snapshot.eye;
         yaw_ = snapshot.yaw;
         pitch_ = snapshot.pitch;
-        distance_ = snapshot.distance;
-        lastEye_ = snapshot.lastEye;
-        flyEye_ = snapshot.flyEye;
-        flyYaw_ = snapshot.flyYaw;
-        flyPitch_ = snapshot.flyPitch;
-        yawVelocity_ = 0.0f;
-        pitchVelocity_ = 0.0f;
-        zoomVelocity_ = 0.0f;
         dragActive_ = false;
     }
 
     void FocusOn(WorldVec3 target, float distance = 15.0f)
     {
-        flyMode_ = true;
+        inputEnabled_ = true;
         const WorldVec3 eye = {target.x, target.y + 5.0f, target.z - distance};
         const WorldVec3 forward = WorldNormalize(WorldSub(target, eye));
-        flyEye_ = eye;
-        lastEye_ = eye;
-        flyYaw_ = std::atan2(forward.x, forward.z);
-        flyPitch_ = std::clamp(std::asin(std::clamp(forward.y, -1.0f, 1.0f)), -kMaxPitch, kMaxPitch);
-        yaw_ = flyYaw_;
-        pitch_ = flyPitch_;
-        distance_ = std::clamp(distance, kMinDistance, kMaxDistance);
-        yawVelocity_ = 0.0f;
-        pitchVelocity_ = 0.0f;
-        zoomVelocity_ = 0.0f;
+        eye_ = eye;
+        yaw_ = std::atan2(forward.x, forward.z);
+        pitch_ = std::clamp(std::asin(std::clamp(forward.y, -1.0f, 1.0f)), -kMaxPitch, kMaxPitch);
         dragActive_ = false;
         Tracenf("[HIERARCHY] Focused camera on target: %.2f, %.2f, %.2f", target.x, target.y, target.z);
     }
 
 private:
     static constexpr float kMaxPitch = 80.0f * 3.1415926535f / 180.0f;
-    static constexpr float kMinDistance = 4.0f;
-    static constexpr float kMaxDistance = 32.0f;
 
     void ApplyMouseDelta(float dx, float dy)
     {
         constexpr float kSensitivity = 0.0045f;
-        if (flyMode_)
-        {
-            flyYaw_ += dx * kSensitivity;
-            flyPitch_ = std::clamp(flyPitch_ + dy * kSensitivity, -kMaxPitch, kMaxPitch);
-            return;
-        }
-
-        yawVelocity_ = dx * kSensitivity;
-        pitchVelocity_ = -dy * kSensitivity;
+        yaw_ += dx * kSensitivity;
+        pitch_ = std::clamp(pitch_ + dy * kSensitivity, -kMaxPitch, kMaxPitch);
     }
 
     void UpdateFly(float dt, const MovementInputState& movement)
@@ -813,26 +742,26 @@ private:
         if (movement.space) localY += 1.0f;
         if (movement.control) localY -= 1.0f;
 
-        const float cosPitch = std::cos(flyPitch_);
-        const WorldVec3 forward = {std::sin(flyYaw_) * cosPitch, std::sin(flyPitch_), std::cos(flyYaw_) * cosPitch};
-        const WorldVec3 right = {std::cos(flyYaw_), 0.0f, -std::sin(flyYaw_)};
+        const float cosPitch = std::cos(pitch_);
+        const WorldVec3 forward = {std::sin(yaw_) * cosPitch, std::sin(pitch_), std::cos(yaw_) * cosPitch};
+        const WorldVec3 right = {std::cos(yaw_), 0.0f, -std::sin(yaw_)};
         WorldVec3 delta = WorldAdd(WorldAdd(WorldScale(forward, localZ), WorldScale(right, localX)),
             {0.0f, localY, 0.0f});
         if (WorldDot(delta, delta) > 0.0001f)
             delta = WorldNormalize(delta);
 
-        const float speed = movement.shift ? 22.0f : 9.0f;
-        flyEye_ = WorldAdd(flyEye_, WorldScale(delta, speed * dt));
+        const float speed = (movement.shift ? 22.0f : 9.0f) * speedScale_;
+        eye_ = WorldAdd(eye_, WorldScale(delta, speed * dt));
     }
 
     WorldCamera BuildFlyCamera(uint32_t width, uint32_t height) const
     {
         const float aspect = height != 0 ? static_cast<float>(width) / static_cast<float>(height) : 1.0f;
-        const float cosPitch = std::cos(flyPitch_);
-        const WorldVec3 forward = {std::sin(flyYaw_) * cosPitch, std::sin(flyPitch_), std::cos(flyYaw_) * cosPitch};
+        const float cosPitch = std::cos(pitch_);
+        const WorldVec3 forward = {std::sin(yaw_) * cosPitch, std::sin(pitch_), std::cos(yaw_) * cosPitch};
         WorldCamera camera{};
-        camera.eye = flyEye_;
-        camera.target = WorldAdd(flyEye_, forward);
+        camera.eye = eye_;
+        camera.target = WorldAdd(eye_, forward);
         const WorldMat4 view = WorldLookAt(camera.eye, camera.target, {0.0f, 1.0f, 0.0f});
         camera.nearPlane = 0.1f;
         camera.farPlane = 1000.0f;
@@ -841,21 +770,14 @@ private:
         return camera;
     }
 
-    bool flyMode_ = false;
-    bool f1Down_ = false;
+    bool inputEnabled_ = true;
     bool dragActive_ = false;
     int lastMouseX_ = 0;
     int lastMouseY_ = 0;
     float yaw_ = 3.1415926535f;
     float pitch_ = 25.0f * 3.1415926535f / 180.0f;
-    float distance_ = 18.0f;
-    float yawVelocity_ = 0.0f;
-    float pitchVelocity_ = 0.0f;
-    float zoomVelocity_ = 0.0f;
-    WorldVec3 lastEye_ = {0.0f, 8.0f, -18.0f};
-    WorldVec3 flyEye_ = {0.0f, 8.0f, -18.0f};
-    float flyYaw_ = 3.1415926535f;
-    float flyPitch_ = 25.0f * 3.1415926535f / 180.0f;
+    float speedScale_ = 1.0f;
+    WorldVec3 eye_ = {0.0f, 8.0f, -18.0f};
 };
 
 std::string ExecutableDirectory()
@@ -1071,13 +993,11 @@ struct EditorPlayRuntime
 {
     EditorPlayModeState state;
     EditorPlayMode appliedMode = EditorPlayMode::Edit;
-    std::optional<CameraController::Snapshot> editorCameraSnapshot;
+    std::optional<FlyCameraController::Snapshot> editorCameraSnapshot;
     std::string playStartScenePath;
     SceneData playStartSceneSnapshot;
     bool playStartSceneWasOpen = false;
     bool playStartSceneDirty = false;
-    RuntimeVec3 playerPosition{};
-    std::uint16_t playerHeading = 0;
 };
 
 std::unique_ptr<RuntimeSession> CreateRuntimeSession()
@@ -1178,15 +1098,9 @@ int RunGame(NativeWindow& window,
 #else
     Tracen("[SCENE] no scene loaded (default runtime release state)");
 #endif
-    const std::string warriorModelPath = "assets/Character/KicsiK.glb";
-
-    WarriorRenderer warrior;
-    bool warriorOk = warrior.Create(device, assets, warriorModelPath);
-    if (!warriorOk)
-    {
-        Tracenf("[MAIN] WarriorRenderer failed to initialize - 3D warrior preview will not be available");
-        warrior.Destroy();
-    }
+    SkinnedMeshRenderer skinnedMesh;
+    bool skinnedMeshOk = false;
+    Tracen("[MAIN] SkinnedMeshRenderer available; no default skinned mesh asset loaded");
 
     TerrainRenderer terrain;
     bool terrainOk = terrain.Create(device, assets);
@@ -1206,22 +1120,22 @@ int RunGame(NativeWindow& window,
             Tracenf("[MAIN] world palette could not be applied; keeping initial terrain palette");
     }
 
-    NameplateRenderer nameplates;
-    bool nameplatesOk = nameplates.Create(device, assets);
-    if (!nameplatesOk)
+    WorldLabelRenderer worldLabels;
+    bool worldLabelsOk = worldLabels.Create(device, assets);
+    if (!worldLabelsOk)
     {
-        Tracenf("[MAIN] NameplateRenderer failed to initialize - nameplates will not be available");
-        nameplates.Destroy();
+        Tracenf("[MAIN] WorldLabelRenderer failed to initialize - worldLabels will not be available");
+        worldLabels.Destroy();
     }
 
     OffscreenSceneRenderer offscreenScene;
     bool offscreenSceneOk = offscreenScene.Create(device, assets);
     if (offscreenSceneOk)
     {
-        if (warriorOk)
+        if (skinnedMeshOk)
         {
-            warrior.SetMainRenderPass(offscreenScene.GetRenderPass());
-            warrior.RecreatePipeline(device);
+            skinnedMesh.SetMainRenderPass(offscreenScene.GetRenderPass());
+            skinnedMesh.RecreatePipeline(device);
         }
         if (terrainOk)
         {
@@ -1240,13 +1154,13 @@ int RunGame(NativeWindow& window,
     });
 
     MovementInputState movement;
-    CameraController cameraController;
+    FlyCameraController cameraController;
 #if defined(IXTREEME_WITH_EDITOR)
     EditorPlayRuntime editorPlay;
     runtimeSession->SetMapEditorOpen(true);
     if (terrainOk)
         terrain.SetMapEditorOpen(true);
-    cameraController.SetEditorFlyMode(true);
+    cameraController.SetFreeCameraEnabled(true);
     runtimeSession->SetEditorStatus("Editor opened at boot");
     Tracen("[BOOT] editor_open forced = 1 (editor build boot)");
 #endif
@@ -1433,13 +1347,13 @@ int RunGame(NativeWindow& window,
         if (runtimeSession->IsInWorld() && event.type == InputEvent::MouseDown && event.button == MouseButton_Left &&
             hasLastPickCamera && !runtimeSession->IsMapEditorOpen())
         {
-            selectedTargetNetId = PickMobTarget(lastPickEntities,
+            selectedTargetNetId = PickRenderEntityTarget(lastPickEntities,
                                                lastPickCamera,
                                                renderSize.width,
                                                renderSize.height,
                                                event.x,
                                                event.y);
-            Tracenf("[COMBAT] selected target net_id=%u", selectedTargetNetId);
+            Tracenf("[PICK] selected render entity net_id=%u", selectedTargetNetId);
             return;
         }
         if (runtimeSession->IsInWorld() && !runtimeSession->IsMapEditorOpen() &&
@@ -1462,7 +1376,7 @@ int RunGame(NativeWindow& window,
             {
                 runtimeSession->ToggleMapEditor();
                 terrain.SetMapEditorOpen(false);
-                cameraController.SetEditorFlyMode(false);
+                cameraController.SetFreeCameraEnabled(false);
             }
             return;
         }
@@ -1472,7 +1386,7 @@ int RunGame(NativeWindow& window,
             runtimeSession->ToggleMapEditor();
             runtimeSession->ClearKeyboardFocus();
             terrain.SetMapEditorOpen(runtimeSession->IsMapEditorOpen());
-            cameraController.SetEditorFlyMode(runtimeSession->IsMapEditorOpen());
+            cameraController.SetFreeCameraEnabled(runtimeSession->IsMapEditorOpen());
             if (!runtimeSession->IsMapEditorOpen())
             {
                 selectedEditorObject = {};
@@ -1871,8 +1785,8 @@ int RunGame(NativeWindow& window,
                     offscreenSceneOk = offscreenScene.Recreate(device);
                     if (offscreenSceneOk)
                     {
-                        if (warriorOk)
-                            warrior.SetMainRenderPass(offscreenScene.GetRenderPass());
+                        if (skinnedMeshOk)
+                            skinnedMesh.SetMainRenderPass(offscreenScene.GetRenderPass());
                         if (terrainOk)
                         {
                             terrain.SetMainRenderPass(offscreenScene.GetRenderPass());
@@ -1883,12 +1797,12 @@ int RunGame(NativeWindow& window,
                         }
                     }
                 }
-                if (warriorOk)
-                    warrior.RecreatePipeline(device);
+                if (skinnedMeshOk)
+                    skinnedMesh.RecreatePipeline(device);
                 if (terrainOk)
                     terrain.RecreatePipeline(device);
-                if (nameplatesOk)
-                    nameplates.RecreatePipeline(device);
+                if (worldLabelsOk)
+                    worldLabels.RecreatePipeline(device);
                 runtimeSession->OnRenderPassChanged(device);
                 rmlUi.OnRenderPassChanged(device);
 #if defined(IXTREEME_WITH_EDITOR)
@@ -1921,62 +1835,15 @@ int RunGame(NativeWindow& window,
         previousSeconds = seconds;
         cameraController.Update(deltaSeconds, movement);
 #if defined(IXTREEME_WITH_EDITOR)
-        if (runtimeSession->IsLocalPlayMode())
+        if (editorPlay.state.mode == EditorPlayMode::Play)
         {
-            if (editorPlay.state.mode == EditorPlayMode::Play)
-            {
-                const float frameDt = static_cast<float>(std::clamp(deltaSeconds, 0.0, 0.05));
-                const float yaw = cameraController.MovementYaw();
-                WorldVec3 localMove{};
-                if (movement.w)
-                {
-                    localMove.x += std::sin(yaw);
-                    localMove.z += std::cos(yaw);
-                }
-                if (movement.s)
-                {
-                    localMove.x -= std::sin(yaw);
-                    localMove.z -= std::cos(yaw);
-                }
-                if (movement.d)
-                {
-                    localMove.x += std::cos(yaw);
-                    localMove.z -= std::sin(yaw);
-                }
-                if (movement.a)
-                {
-                    localMove.x -= std::cos(yaw);
-                    localMove.z += std::sin(yaw);
-                }
-                if (WorldDot(localMove, localMove) > 0.0001f)
-                {
-                    localMove = WorldNormalize(localMove);
-                    WorldVec3 displayPos = ServerMetersToDisplay(editorPlay.playerPosition);
-                    const float speed = movement.shift ? 9.0f : 4.5f;
-                    displayPos = WorldAdd(displayPos, WorldScale(localMove, speed * frameDt));
-                    if (terrainOk)
-                        displayPos.y = terrain.SampleHeight(displayPos);
-                    editorPlay.playerPosition = DisplayToServerMeters(displayPos);
-                    constexpr float kTwoPi = 6.28318530717958647692f;
-                    float heading = std::atan2(localMove.x, localMove.z);
-                    if (heading < 0.0f)
-                        heading += kTwoPi;
-                    editorPlay.playerHeading = static_cast<std::uint16_t>((heading / kTwoPi) * 65535.0f);
-                }
-                runtimeSession->UpdateLocalPlayPlayer(editorPlay.playerPosition,
-                    editorPlay.playerHeading,
-                    movement.State());
-                editorPlay.state.elapsedSeconds += deltaSeconds;
-                ++editorPlay.state.frameCount;
-            }
+            editorPlay.state.elapsedSeconds += deltaSeconds;
+            ++editorPlay.state.frameCount;
         }
-        else
 #endif
         {
             runtimeSession->UpdateNetwork();
-            runtimeSession->SendMoveInput(
-                movement.DirectionAngle(cameraController.MovementYaw()),
-                cameraController.IsFlyMode() ? RuntimeMoveState::Idle : movement.State());
+            runtimeSession->SendMoveInput(movement.DirectionAngle(cameraController.MovementYaw()), RuntimeMoveState::Idle);
         }
         runtimeSession->Update(seconds);
         rmlUi.Update();
@@ -1987,20 +1854,7 @@ int RunGame(NativeWindow& window,
         if (runtimeSession->IsInWorld())
         {
             frameEntities = runtimeSession->GetWorldEntities();
-            WorldVec3 cameraTarget{};
-            bool hasOwn = false;
-            for (const auto& entity : frameEntities)
-            {
-                if (entity.netId == runtimeSession->GetOwnNetId())
-                {
-                    cameraTarget = ServerMetersToDisplay(entity.position);
-                    hasOwn = true;
-                    break;
-                }
-            }
-            if (!hasOwn && !frameEntities.empty())
-                cameraTarget = ServerMetersToDisplay(frameEntities.front().position);
-            frameCamera = cameraController.BuildCamera(renderSize.width, renderSize.height, cameraTarget);
+            frameCamera = cameraController.BuildCamera(renderSize.width, renderSize.height);
             hasFrameCamera = true;
             lastPickEntities = frameEntities;
             lastPickCamera = frameCamera;
@@ -2018,8 +1872,6 @@ int RunGame(NativeWindow& window,
             const WorldRenderEntity* targetEntity = nullptr;
             for (const WorldRenderEntity& entity : frameEntities)
             {
-                if (entity.netId == runtimeSession->GetOwnNetId())
-                    ownEntity = &entity;
                 if (selectedTargetNetId != 0 && entity.netId == selectedTargetNetId)
                     targetEntity = &entity;
             }
@@ -2031,15 +1883,6 @@ int RunGame(NativeWindow& window,
                 hudData.playerLevel = static_cast<int>(std::max(1u, ownEntity->level));
                 hudData.currentHp = ownEntity->hpCurrent;
                 hudData.maxHp = ownEntity->hpMax <= 0.0f ? 1.0f : ownEntity->hpMax;
-#if defined(IXTREEME_WITH_EDITOR)
-                if (runtimeSession->IsLocalPlayMode())
-                {
-                    hudData.currentMp = 500.0f;
-                    hudData.maxMp = 500.0f;
-                    hudData.currentXp = 0;
-                    hudData.xpForNextLevel = 1000;
-                }
-#endif
                 const WorldVec3 displayPos = ServerMetersToDisplay(ownEntity->position);
                 hudData.playerX = displayPos.x;
                 hudData.playerZ = displayPos.z;
@@ -2321,7 +2164,7 @@ int RunGame(NativeWindow& window,
                     waterSculptStrokeActive = false;
                     editorWaterBodiesDirty = true;
                     terrain.SetWaterSculptBrush(false, 0.0f, 0.0f, 0.0f, true);
-                    cameraController.SetEditorFlyMode(false);
+                    cameraController.SetFreeCameraEnabled(true);
                     runtimeSession->Start(SceneManager::Instance().GetCurrentScene());
                     SceneManager::Instance().ActivateCurrentSceneType();
                     editorPlay.state.frameCount = 0;
@@ -2684,9 +2527,9 @@ int RunGame(NativeWindow& window,
                     editorWaterBodiesDirty = false;
                 }
                 terrain.SetSelectedWaterBodyHighlight(device, 0u);
-                if (warriorOk)
+                if (skinnedMeshOk)
                 {
-                    warrior.SetLightingState(lightingState);
+                    skinnedMesh.SetLightingState(lightingState);
                 }
                 if (commands.paletteSlotChanged)
                 {
@@ -2744,18 +2587,18 @@ int RunGame(NativeWindow& window,
             {
                 entities = frameEntities;
                 frameSceneEntityCount = entities.size();
-                camera = hasFrameCamera ? frameCamera : cameraController.BuildCamera(renderSize.width, renderSize.height, {});
+                camera = hasFrameCamera ? frameCamera : cameraController.BuildCamera(renderSize.width, renderSize.height);
 
-                if (warriorOk)
+                if (skinnedMeshOk)
                 {
                     uint32_t skinSlot = 0;
                     for (const auto& entity : entities)
                     {
-                        if (skinSlot >= WarriorRenderer::MaxSkinSlots())
+                        if (skinSlot >= SkinnedMeshRenderer::MaxSkinSlots())
                             break;
-                        warrior.SkinInstance(device,
+                        skinnedMesh.SkinInstance(device,
                             skinSlot,
-                            ToWarriorMotion(entity.moveState),
+                            ToSkinnedMeshMotion(entity.moveState),
                             static_cast<float>(seconds));
                         ++skinSlot;
                     }
@@ -2765,20 +2608,20 @@ int RunGame(NativeWindow& window,
                             editorPointLights.size() + editorSpotLights.size();
                         for (size_t visualIndex = 0; visualIndex < editorVisualRenderCount; ++visualIndex)
                         {
-                            if (skinSlot >= WarriorRenderer::MaxSkinSlots())
+                            if (skinSlot >= SkinnedMeshRenderer::MaxSkinSlots())
                                 break;
-                            warrior.SkinInstance(device,
+                            skinnedMesh.SkinInstance(device,
                                 skinSlot,
-                                WarriorRenderer::MotionState::Idle,
+                                SkinnedMeshRenderer::MotionState::Idle,
                                 static_cast<float>(seconds));
                             ++skinSlot;
                         }
                     }
                 }
             }
-            else if (runtimeSession->IsLobbyActive() && warriorOk)
+            else if (runtimeSession->IsLobbyActive() && skinnedMeshOk)
             {
-                warrior.Skin(device, seconds);
+                skinnedMesh.Skin(device, seconds);
             }
 
             if (isInWorld && terrainOk && hasFrameCamera)
@@ -2793,22 +2636,22 @@ int RunGame(NativeWindow& window,
                         VkRenderPass reflectionRenderPass,
                         float waterLevelY)
                     {
-                        if (!warriorOk)
+                        if (!skinnedMeshOk)
                             return;
 
                         uint32_t skinSlot = 0;
                         for (const auto& entity : entities)
                         {
-                            if (skinSlot >= WarriorRenderer::MaxSkinSlots())
+                            if (skinSlot >= SkinnedMeshRenderer::MaxSkinSlots())
                                 break;
                             auto position = ServerMetersToDisplay(entity.position);
-                            position.y += warrior.GroundOffsetY();
-                            const std::array<float, 4> tint = entity.mobTypeId == 0
+                            position.y += skinnedMesh.GroundOffsetY();
+                            const std::array<float, 4> tint = entity.visualClassId == 0
                                 ? std::array<float, 4>{1.0f, 1.0f, 1.0f, 1.0f}
-                                : (entity.mobTypeId == 1
+                                : (entity.visualClassId == 1
                                       ? std::array<float, 4>{1.35f, 0.55f, 0.55f, 1.0f}
                                       : std::array<float, 4>{0.65f, 0.95f, 1.35f, 1.0f});
-                            warrior.RenderInWorldReflection(device,
+                            skinnedMesh.RenderInWorldReflection(device,
                                 mirrorCamera,
                                 reflectionExtent,
                                 reflectionRenderPass,
@@ -2826,13 +2669,13 @@ int RunGame(NativeWindow& window,
                             {
                                 if (editorPlay.state.mode == EditorPlayMode::Edit && light.editorHidden)
                                     continue;
-                                if (skinSlot >= WarriorRenderer::MaxSkinSlots())
+                                if (skinSlot >= SkinnedMeshRenderer::MaxSkinSlots())
                                     break;
-                                WorldVec3 position{light.position[0], light.position[1] + warrior.GroundOffsetY(), light.position[2]};
+                                WorldVec3 position{light.position[0], light.position[1] + skinnedMesh.GroundOffsetY(), light.position[2]};
                                 const bool selected =
                                     selectedEditorObject.type == SelectedEditorObjectType::PointLight &&
                                     selectedEditorObject.id == light.id;
-                                warrior.RenderInWorldReflection(device,
+                                skinnedMesh.RenderInWorldReflection(device,
                                     mirrorCamera,
                                     reflectionExtent,
                                     reflectionRenderPass,
@@ -2849,13 +2692,13 @@ int RunGame(NativeWindow& window,
                             {
                                 if (editorPlay.state.mode == EditorPlayMode::Edit && light.editorHidden)
                                     continue;
-                                if (skinSlot >= WarriorRenderer::MaxSkinSlots())
+                                if (skinSlot >= SkinnedMeshRenderer::MaxSkinSlots())
                                     break;
-                                WorldVec3 position{light.position[0], light.position[1] + warrior.GroundOffsetY(), light.position[2]};
+                                WorldVec3 position{light.position[0], light.position[1] + skinnedMesh.GroundOffsetY(), light.position[2]};
                                 const bool selected =
                                     selectedEditorObject.type == SelectedEditorObjectType::SpotLight &&
                                     selectedEditorObject.id == light.id;
-                                warrior.RenderInWorldReflection(device,
+                                skinnedMesh.RenderInWorldReflection(device,
                                     mirrorCamera,
                                     reflectionExtent,
                                     reflectionRenderPass,
@@ -2878,7 +2721,7 @@ int RunGame(NativeWindow& window,
             else
                 device.BeginSwapchainRenderPass();
 
-            std::vector<NameplateRenderer::Nameplate> plates;
+            std::vector<WorldLabelRenderer::Label> plates;
             if (isInWorld)
             {
                 if (terrainOk)
@@ -2894,7 +2737,7 @@ int RunGame(NativeWindow& window,
                 {
                     auto position = ServerMetersToDisplay(entity.position);
                     const float terrainY = terrainOk ? terrain.SampleHeight(position) : position.y;
-                    const float groundOffsetY = warriorOk ? warrior.GroundOffsetY() : 0.0f;
+                    const float groundOffsetY = skinnedMeshOk ? skinnedMesh.GroundOffsetY() : 0.0f;
                     if (!loggedTerrainAlignment && terrainOk)
                     {
                         Tracenf("[WORLD] terrain align: net_id=%u server=(%.3f,%.3f,%.3f) displayY=%.3f terrainY=%.3f delta=%.3f modelGroundOffset=%.3f",
@@ -2908,15 +2751,15 @@ int RunGame(NativeWindow& window,
                             groundOffsetY);
                         loggedTerrainAlignment = true;
                     }
-                    if (warriorOk && skinSlot < WarriorRenderer::MaxSkinSlots())
+                    if (skinnedMeshOk && skinSlot < SkinnedMeshRenderer::MaxSkinSlots())
                     {
                         position.y += groundOffsetY;
-                        const std::array<float, 4> tint = entity.mobTypeId == 0
+                        const std::array<float, 4> tint = entity.visualClassId == 0
                             ? std::array<float, 4>{1.0f, 1.0f, 1.0f, 1.0f}
-                            : (entity.mobTypeId == 1
+                            : (entity.visualClassId == 1
                                   ? std::array<float, 4>{1.35f, 0.55f, 0.55f, 1.0f}
                                   : std::array<float, 4>{0.65f, 0.95f, 1.35f, 1.0f});
-                        warrior.RenderInWorld(device,
+                        skinnedMesh.RenderInWorld(device,
                             seconds,
                             camera,
                             position,
@@ -2924,30 +2767,28 @@ int RunGame(NativeWindow& window,
                             skinSlot,
                             tint);
                     }
-                    plates.push_back(NameplateRenderer::Nameplate{
+                    plates.push_back(WorldLabelRenderer::Label{
                         WorldAdd(position, {0.0f, 2.2f, 0.0f}),
                         entity.name,
-                        entity.level,
-                        entity.mobTypeId == 0 ? 0 : 1,
-                        entity.hpCurrent,
-                        entity.hpMax,
-                        entity.hpDisplayed,
+                        entity.netId == selectedTargetNetId
+                            ? std::array<float, 4>{1.0f, 0.86f, 0.32f, 1.0f}
+                            : std::array<float, 4>{0.92f, 0.96f, 1.0f, 1.0f},
                         entity.netId == selectedTargetNetId});
                     ++skinSlot;
                 }
-                if (warriorOk && runtimeSession->IsMapEditorOpen())
+                if (skinnedMeshOk && runtimeSession->IsMapEditorOpen())
                 {
                     for (const auto& light : editorPointLights)
                     {
                         if (editorPlay.state.mode == EditorPlayMode::Edit && light.editorHidden)
                             continue;
-                        if (skinSlot >= WarriorRenderer::MaxSkinSlots())
+                        if (skinSlot >= SkinnedMeshRenderer::MaxSkinSlots())
                             break;
-                        WorldVec3 position{light.position[0], light.position[1] + warrior.GroundOffsetY(), light.position[2]};
+                        WorldVec3 position{light.position[0], light.position[1] + skinnedMesh.GroundOffsetY(), light.position[2]};
                         const bool selected =
                             selectedEditorObject.type == SelectedEditorObjectType::PointLight &&
                             selectedEditorObject.id == light.id;
-                        warrior.RenderInWorld(device,
+                        skinnedMesh.RenderInWorld(device,
                             seconds,
                             camera,
                             position,
@@ -2956,14 +2797,12 @@ int RunGame(NativeWindow& window,
                             selected
                                 ? std::array<float, 4>{2.0f, 1.55f, 0.25f, 1.0f}
                                 : std::array<float, 4>{1.6f, 1.05f, 0.35f, 1.0f});
-                        plates.push_back(NameplateRenderer::Nameplate{
+                        plates.push_back(WorldLabelRenderer::Label{
                             WorldAdd({light.position[0], light.position[1], light.position[2]}, {0.0f, 1.4f, 0.0f}),
                             light.name.empty() ? "Point Light " + std::to_string(light.id) : light.name,
-                            1,
-                            selected ? 2u : 0u,
-                            1.0f,
-                            1.0f,
-                            1.0f,
+                            selected
+                                ? std::array<float, 4>{1.0f, 0.86f, 0.32f, 1.0f}
+                                : std::array<float, 4>{1.0f, 0.78f, 0.30f, 1.0f},
                             selected});
                         ++skinSlot;
                     }
@@ -2971,13 +2810,13 @@ int RunGame(NativeWindow& window,
                     {
                         if (editorPlay.state.mode == EditorPlayMode::Edit && light.editorHidden)
                             continue;
-                        if (skinSlot >= WarriorRenderer::MaxSkinSlots())
+                        if (skinSlot >= SkinnedMeshRenderer::MaxSkinSlots())
                             break;
-                        WorldVec3 position{light.position[0], light.position[1] + warrior.GroundOffsetY(), light.position[2]};
+                        WorldVec3 position{light.position[0], light.position[1] + skinnedMesh.GroundOffsetY(), light.position[2]};
                         const bool selected =
                             selectedEditorObject.type == SelectedEditorObjectType::SpotLight &&
                             selectedEditorObject.id == light.id;
-                        warrior.RenderInWorld(device,
+                        skinnedMesh.RenderInWorld(device,
                             seconds,
                             camera,
                             position,
@@ -2986,14 +2825,12 @@ int RunGame(NativeWindow& window,
                             selected
                                 ? std::array<float, 4>{0.35f, 1.7f, 2.0f, 1.0f}
                                 : std::array<float, 4>{0.35f, 1.25f, 1.65f, 1.0f});
-                        plates.push_back(NameplateRenderer::Nameplate{
+                        plates.push_back(WorldLabelRenderer::Label{
                             WorldAdd({light.position[0], light.position[1], light.position[2]}, {0.0f, 1.4f, 0.0f}),
                             light.name.empty() ? "Spot Light " + std::to_string(light.id) : light.name,
-                            1,
-                            selected ? 2u : 0u,
-                            1.0f,
-                            1.0f,
-                            1.0f,
+                            selected
+                                ? std::array<float, 4>{1.0f, 0.86f, 0.32f, 1.0f}
+                                : std::array<float, 4>{0.35f, 0.86f, 1.0f, 1.0f},
                             selected});
                         ++skinSlot;
                     }
@@ -3002,14 +2839,14 @@ int RunGame(NativeWindow& window,
                 {
                     terrain.RenderWater(device, camera, seconds);
                 }
-                if (!useOffscreenScene && nameplatesOk)
-                    nameplates.Render(device, camera, plates);
+                if (!useOffscreenScene && worldLabelsOk)
+                    worldLabels.Render(device, camera, plates);
             }
-            else if (runtimeSession->IsLobbyActive() && warriorOk)
+            else if (runtimeSession->IsLobbyActive() && skinnedMeshOk)
             {
                 frameSceneRenderCalled = true;
                 frameSceneEntityCount = 1;
-                warrior.Render(device, seconds);
+                skinnedMesh.Render(device, seconds);
             }
 
             if (useOffscreenScene)
@@ -3028,8 +2865,8 @@ int RunGame(NativeWindow& window,
                 }
                 device.BeginSwapchainRenderPass();
                 offscreenScene.RenderComposite(device);
-                if (isInWorld && nameplatesOk)
-                    nameplates.Render(device, camera, plates);
+                if (isInWorld && worldLabelsOk)
+                    worldLabels.Render(device, camera, plates);
             }
             frameRmlUiRenderCalled = true;
             rmlUi.Render(device);
@@ -3070,14 +2907,14 @@ int RunGame(NativeWindow& window,
     }
 
     device.WaitIdle();
-    if (nameplatesOk)
-        nameplates.Destroy();
+    if (worldLabelsOk)
+        worldLabels.Destroy();
     if (offscreenSceneOk)
         offscreenScene.Destroy();
     if (terrainOk)
         terrain.Destroy();
-    if (warriorOk)
-        warrior.Destroy();
+    if (skinnedMeshOk)
+        skinnedMesh.Destroy();
 #if defined(IXTREEME_WITH_EDITOR)
     editorImGui.Destroy();
 #if defined(_WIN32)

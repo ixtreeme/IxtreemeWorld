@@ -41,7 +41,7 @@ struct WorldRenderEntity
     RuntimeVec3 position;
     std::uint16_t heading = 0;
     RuntimeMoveState moveState = RuntimeMoveState::Idle;
-    std::uint32_t mobTypeId = 0;
+    std::uint32_t visualClassId = 0;
     std::uint32_t level = 1;
     float hpCurrent = 1.0f;
     float hpMax = 1.0f;
@@ -70,14 +70,7 @@ public:
 
     virtual bool IsLobbyActive() const = 0;
     virtual bool IsInWorld() const = 0;
-    virtual bool IsLocalPlayMode() const = 0;
-    virtual std::uint32_t GetOwnNetId() const = 0;
     virtual std::vector<WorldRenderEntity> GetWorldEntities() const = 0;
-    virtual void EnterLocalPlayMode(const WorldRenderEntity& player) = 0;
-    virtual void UpdateLocalPlayPlayer(RuntimeVec3 position,
-                                       std::uint16_t heading,
-                                       RuntimeMoveState moveState) = 0;
-    virtual void ExitLocalPlayMode() = 0;
 
     virtual bool IsMapEditorOpen() const = 0;
     virtual void SetMapEditorOpen(bool open) = 0;

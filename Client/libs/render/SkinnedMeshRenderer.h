@@ -15,11 +15,11 @@ namespace client::asset {
 class IAssetReader;
 }
 
-class WarriorRenderer
+class SkinnedMeshRenderer
 {
 public:
-    WarriorRenderer();
-    ~WarriorRenderer();
+    SkinnedMeshRenderer();
+    ~SkinnedMeshRenderer();
 
     enum class MotionState : uint32_t
     {

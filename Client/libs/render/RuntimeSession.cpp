@@ -20,39 +20,13 @@ public:
     void Stop() override
     {
         m_playing = false;
-        m_localPlayMode = false;
         m_entities.clear();
-        m_ownNetId = 0;
     }
     void OnSceneLoaded(const SceneData&) override {}
 
     bool IsLobbyActive() const override { return false; }
-    bool IsInWorld() const override { return m_playing && m_localPlayMode; }
-    bool IsLocalPlayMode() const override { return m_localPlayMode; }
-    std::uint32_t GetOwnNetId() const override { return m_ownNetId; }
+    bool IsInWorld() const override { return m_playing || m_mapEditorOpen; }
     std::vector<WorldRenderEntity> GetWorldEntities() const override { return m_entities; }
-    void EnterLocalPlayMode(const WorldRenderEntity& player) override
-    {
-        m_localPlayMode = true;
-        m_ownNetId = player.netId;
-        m_entities = {player};
-    }
-    void UpdateLocalPlayPlayer(RuntimeVec3 position,
-                               std::uint16_t heading,
-                               RuntimeMoveState moveState) override
-    {
-        if (m_entities.empty())
-            return;
-        m_entities.front().position = position;
-        m_entities.front().heading = heading;
-        m_entities.front().moveState = moveState;
-    }
-    void ExitLocalPlayMode() override
-    {
-        m_localPlayMode = false;
-        m_entities.clear();
-        m_ownNetId = 0;
-    }
 
     bool IsMapEditorOpen() const override { return m_mapEditorOpen; }
     void SetMapEditorOpen(bool open) override { m_mapEditorOpen = open; }
@@ -79,9 +53,7 @@ private:
     std::array<MapEditorPaletteSlot, 8> m_paletteSlots{};
     std::vector<WorldRenderEntity> m_entities;
     std::string m_editorStatus;
-    std::uint32_t m_ownNetId = 0;
     bool m_playing = false;
-    bool m_localPlayMode = false;
     bool m_mapEditorOpen = false;
 };
 }

@@ -187,9 +187,9 @@ if(WIN32)
     set(GENERATED_SHADER_DIR "${CLIENT_ROOT}/assets/shaders")
     set(CUBE_VS_SPV "${GENERATED_SHADER_DIR}/cube_vs.spv")
     set(CUBE_PS_SPV "${GENERATED_SHADER_DIR}/cube_ps.spv")
-    set(WARRIOR_VS_SPV "${GENERATED_SHADER_DIR}/warrior_vs.spv")
-    set(WARRIOR_PS_SPV "${GENERATED_SHADER_DIR}/warrior_ps.spv")
-    set(WARRIOR_CS_SPV "${GENERATED_SHADER_DIR}/warrior_cs.spv")
+    set(SKINNED_MESH_VS_SPV "${GENERATED_SHADER_DIR}/skinned_mesh_vs.spv")
+    set(SKINNED_MESH_PS_SPV "${GENERATED_SHADER_DIR}/skinned_mesh_ps.spv")
+    set(SKINNED_MESH_CS_SPV "${GENERATED_SHADER_DIR}/skinned_mesh_cs.spv")
     set(TERRAIN_VS_SPV "${GENERATED_SHADER_DIR}/terrain_vs.spv")
     set(TERRAIN_PS_SPV "${GENERATED_SHADER_DIR}/terrain_ps.spv")
     set(WATER_VS_SPV "${GENERATED_SHADER_DIR}/water_vs.spv")
@@ -197,8 +197,8 @@ if(WIN32)
     set(COMPOSITE_VS_SPV "${GENERATED_SHADER_DIR}/composite_vs.spv")
     set(COMPOSITE_PS_SPV "${GENERATED_SHADER_DIR}/composite_ps.spv")
     set(SHADOW_DEPTH_VS_SPV "${GENERATED_SHADER_DIR}/shadow_depth_vs.spv")
-    set(NAMEPLATE_VS_SPV "${GENERATED_SHADER_DIR}/nameplate_vs.spv")
-    set(NAMEPLATE_PS_SPV "${GENERATED_SHADER_DIR}/nameplate_ps.spv")
+    set(WORLD_LABEL_VS_SPV "${GENERATED_SHADER_DIR}/world_label_vs.spv")
+    set(WORLD_LABEL_PS_SPV "${GENERATED_SHADER_DIR}/world_label_ps.spv")
     set(RMLUI_VS_SPV "${GENERATED_SHADER_DIR}/rmlui_vs.spv")
     set(RMLUI_PS_SPV "${GENERATED_SHADER_DIR}/rmlui_ps.spv")
 
@@ -219,27 +219,27 @@ if(WIN32)
         VERBATIM
     )
     add_custom_command(
-        OUTPUT "${WARRIOR_VS_SPV}"
+        OUTPUT "${SKINNED_MESH_VS_SPV}"
         COMMAND ${CMAKE_COMMAND} -E make_directory "${GENERATED_SHADER_DIR}"
         COMMAND "${DXC_EXECUTABLE}" -spirv -T vs_6_0 -E VSMain
-            -Fo "${WARRIOR_VS_SPV}" "${CLIENT_ROOT}/shaders/Warrior.hlsl"
-        DEPENDS "${CLIENT_ROOT}/shaders/Warrior.hlsl"
+            -Fo "${SKINNED_MESH_VS_SPV}" "${CLIENT_ROOT}/shaders/SkinnedMesh.hlsl"
+        DEPENDS "${CLIENT_ROOT}/shaders/SkinnedMesh.hlsl"
         VERBATIM
     )
     add_custom_command(
-        OUTPUT "${WARRIOR_PS_SPV}"
+        OUTPUT "${SKINNED_MESH_PS_SPV}"
         COMMAND ${CMAKE_COMMAND} -E make_directory "${GENERATED_SHADER_DIR}"
         COMMAND "${DXC_EXECUTABLE}" -spirv -T ps_6_0 -E PSMain
-            -Fo "${WARRIOR_PS_SPV}" "${CLIENT_ROOT}/shaders/Warrior.hlsl"
-        DEPENDS "${CLIENT_ROOT}/shaders/Warrior.hlsl"
+            -Fo "${SKINNED_MESH_PS_SPV}" "${CLIENT_ROOT}/shaders/SkinnedMesh.hlsl"
+        DEPENDS "${CLIENT_ROOT}/shaders/SkinnedMesh.hlsl"
         VERBATIM
     )
     add_custom_command(
-        OUTPUT "${WARRIOR_CS_SPV}"
+        OUTPUT "${SKINNED_MESH_CS_SPV}"
         COMMAND ${CMAKE_COMMAND} -E make_directory "${GENERATED_SHADER_DIR}"
         COMMAND "${DXC_EXECUTABLE}" -spirv -T cs_6_0 -E CSMain
-            -Fo "${WARRIOR_CS_SPV}" "${CLIENT_ROOT}/shaders/WarriorSkin.hlsl"
-        DEPENDS "${CLIENT_ROOT}/shaders/WarriorSkin.hlsl"
+            -Fo "${SKINNED_MESH_CS_SPV}" "${CLIENT_ROOT}/shaders/SkinnedMeshSkin.hlsl"
+        DEPENDS "${CLIENT_ROOT}/shaders/SkinnedMeshSkin.hlsl"
         VERBATIM
     )
     add_custom_command(
@@ -299,19 +299,19 @@ if(WIN32)
         VERBATIM
     )
     add_custom_command(
-        OUTPUT "${NAMEPLATE_VS_SPV}"
+        OUTPUT "${WORLD_LABEL_VS_SPV}"
         COMMAND ${CMAKE_COMMAND} -E make_directory "${GENERATED_SHADER_DIR}"
         COMMAND "${DXC_EXECUTABLE}" -spirv -fvk-use-dx-layout -T vs_6_0 -E VSMain
-            -Fo "${NAMEPLATE_VS_SPV}" "${CLIENT_ROOT}/shaders/Nameplate.hlsl"
-        DEPENDS "${CLIENT_ROOT}/shaders/Nameplate.hlsl"
+            -Fo "${WORLD_LABEL_VS_SPV}" "${CLIENT_ROOT}/shaders/WorldLabel.hlsl"
+        DEPENDS "${CLIENT_ROOT}/shaders/WorldLabel.hlsl"
         VERBATIM
     )
     add_custom_command(
-        OUTPUT "${NAMEPLATE_PS_SPV}"
+        OUTPUT "${WORLD_LABEL_PS_SPV}"
         COMMAND ${CMAKE_COMMAND} -E make_directory "${GENERATED_SHADER_DIR}"
         COMMAND "${DXC_EXECUTABLE}" -spirv -fvk-use-dx-layout -T ps_6_0 -E PSMain
-            -Fo "${NAMEPLATE_PS_SPV}" "${CLIENT_ROOT}/shaders/Nameplate.hlsl"
-        DEPENDS "${CLIENT_ROOT}/shaders/Nameplate.hlsl"
+            -Fo "${WORLD_LABEL_PS_SPV}" "${CLIENT_ROOT}/shaders/WorldLabel.hlsl"
+        DEPENDS "${CLIENT_ROOT}/shaders/WorldLabel.hlsl"
         VERBATIM
     )
     add_custom_command(
@@ -333,9 +333,9 @@ if(WIN32)
     add_custom_target(ClientShaders DEPENDS
         "${CUBE_VS_SPV}"
         "${CUBE_PS_SPV}"
-        "${WARRIOR_VS_SPV}"
-        "${WARRIOR_PS_SPV}"
-        "${WARRIOR_CS_SPV}"
+        "${SKINNED_MESH_VS_SPV}"
+        "${SKINNED_MESH_PS_SPV}"
+        "${SKINNED_MESH_CS_SPV}"
         "${TERRAIN_VS_SPV}"
         "${TERRAIN_PS_SPV}"
         "${WATER_VS_SPV}"
@@ -343,8 +343,8 @@ if(WIN32)
         "${COMPOSITE_VS_SPV}"
         "${COMPOSITE_PS_SPV}"
         "${SHADOW_DEPTH_VS_SPV}"
-        "${NAMEPLATE_VS_SPV}"
-        "${NAMEPLATE_PS_SPV}"
+        "${WORLD_LABEL_VS_SPV}"
+        "${WORLD_LABEL_PS_SPV}"
         "${RMLUI_VS_SPV}"
         "${RMLUI_PS_SPV}"
     )

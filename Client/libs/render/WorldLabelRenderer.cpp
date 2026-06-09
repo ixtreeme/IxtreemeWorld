@@ -1,4 +1,4 @@
-#include "NameplateRenderer.h"
+#include "WorldLabelRenderer.h"
 
 #include "Debug.h"
 #include "asset/IAssetReader.h"
@@ -29,15 +29,11 @@ constexpr uint32_t kAtlasWidth = kAtlasColumns * kAtlasCell;
 constexpr uint32_t kAtlasHeight = kAtlasRows * kAtlasCell;
 constexpr float kHeadOffsetMeters = 2.0f;
 constexpr float kNamePixelScale = 0.013f;
-constexpr float kInfoPixelScale = 0.009f;
-constexpr float kLineGapMeters = 0.03f;
-constexpr float kHealthBarWidthMeters = 0.95f;
-constexpr float kHealthBarHeightMeters = 0.075f;
 constexpr float kOutlinePixels = 1.6f;
 constexpr float kOutlineAlpha = 0.85f;
 constexpr float kFadeStartMeters = 25.0f;
 constexpr float kFadeEndMeters = 45.0f;
-constexpr bool kDepthTestNameplates = true;
+constexpr bool kDepthTestLabels = true;
 
 const char* VkResultName(VkResult result)
 {
@@ -73,7 +69,7 @@ std::vector<char> ReadBinaryFile(client::asset::IAssetReader& assets, const std:
     auto bytes = assets.ReadAll(path);
     if (!bytes)
     {
-        Tracenf("[NAMEPLATE] failed to open shader: %s", path.c_str());
+        Tracenf("[WORLD-LABEL] failed to open shader: %s", path.c_str());
         std::abort();
     }
 
@@ -95,7 +91,7 @@ VkShaderModule CreateShaderModule(VkDevice device, client::asset::IAssetReader& 
 }
 
 bool CreateHostVisibleBuffer(VulkanDevice& device, VkDevice vkDevice, VkDeviceSize size,
-    VkBufferUsageFlags usage, const void* initialData, NameplateRenderer::Buffer& out)
+    VkBufferUsageFlags usage, const void* initialData, WorldLabelRenderer::Buffer& out)
 {
     VkBufferCreateInfo buffer{};
     buffer.sType = VK_STRUCTURE_TYPE_BUFFER_CREATE_INFO;
@@ -223,35 +219,6 @@ void TransitionImageLayout(VkCommandBuffer cmd, VkImage image, VkImageLayout old
     vkCmdPipelineBarrier(cmd, srcStage, dstStage, 0, 0, nullptr, 0, nullptr, 1, &barrier);
 }
 
-const char* AlignmentTitle(int32_t alignment)
-{
-    if (alignment >= 12000) return "Holy";
-    if (alignment >= 8000) return "Honored";
-    if (alignment >= 4000) return "Respected";
-    if (alignment >= 1000) return "Good";
-    if (alignment > -1000) return "Neutral";
-    if (alignment > -4000) return "Mischievous";
-    if (alignment > -8000) return "Wicked";
-    if (alignment > -12000) return "Evil";
-    return "Demonic";
-}
-
-void AlignmentColor(int32_t alignment, float color[4])
-{
-    if (alignment >= 1000)
-    {
-        color[0] = 0.70f; color[1] = 1.0f; color[2] = 0.70f; color[3] = 1.0f;
-    }
-    else if (alignment <= -1000)
-    {
-        color[0] = 1.0f; color[1] = 0.38f; color[2] = 0.32f; color[3] = 1.0f;
-    }
-    else
-    {
-        color[0] = 1.0f; color[1] = 0.96f; color[2] = 0.75f; color[3] = 1.0f;
-    }
-}
-
 std::string ToPrintableAscii(const std::string& text)
 {
     std::string result;
@@ -270,7 +237,7 @@ WorldVec3 AddScaled(WorldVec3 origin, WorldVec3 right, float x, WorldVec3 up, fl
 }
 }
 
-bool NameplateRenderer::Create(VulkanDevice& device, client::asset::IAssetReader& assets)
+bool WorldLabelRenderer::Create(VulkanDevice& device, client::asset::IAssetReader& assets)
 {
     Destroy();
     m_device = device.GetDevice();
@@ -280,7 +247,7 @@ bool NameplateRenderer::Create(VulkanDevice& device, client::asset::IAssetReader
     const bool buffers = atlas ? CreateBuffers(device) : false;
     const bool descriptors = buffers ? CreateDescriptors() : false;
     const bool pipeline = descriptors ? CreatePipeline(device) : false;
-    Tracenf("[NAMEPLATE] Create: atlas=%d buffers=%d descriptors=%d pipeline=%d glyphs=%u",
+    Tracenf("[WORLD-LABEL] Create: atlas=%d buffers=%d descriptors=%d pipeline=%d glyphs=%u",
         atlas ? 1 : 0,
         buffers ? 1 : 0,
         descriptors ? 1 : 0,
@@ -294,7 +261,7 @@ bool NameplateRenderer::Create(VulkanDevice& device, client::asset::IAssetReader
     return false;
 }
 
-bool NameplateRenderer::RecreatePipeline(VulkanDevice& device)
+bool WorldLabelRenderer::RecreatePipeline(VulkanDevice& device)
 {
     if (!m_device)
         return true;
@@ -306,9 +273,9 @@ bool NameplateRenderer::RecreatePipeline(VulkanDevice& device)
     return CreatePipeline(device);
 }
 
-void NameplateRenderer::Render(VulkanDevice& device, const WorldCamera& camera, const std::vector<Nameplate>& nameplates)
+void WorldLabelRenderer::Render(VulkanDevice& device, const WorldCamera& camera, const std::vector<Label>& worldLabels)
 {
-    if (!m_pipeline || !device.IsFrameActive() || nameplates.empty())
+    if (!m_pipeline || !device.IsFrameActive() || worldLabels.empty())
         return;
 
     const VkExtent2D extent = device.GetSwapchainExtent();
@@ -317,7 +284,7 @@ void NameplateRenderer::Render(VulkanDevice& device, const WorldCamera& camera, 
 
     const uint32_t frameIndex = device.GetFrameIndex();
     std::vector<Vertex> vertices;
-    BuildVertices(camera, nameplates, vertices);
+    BuildVertices(camera, worldLabels, vertices);
     if (vertices.empty())
         return;
     if (vertices.size() > kMaxVertices)
@@ -354,15 +321,15 @@ void NameplateRenderer::Render(VulkanDevice& device, const WorldCamera& camera, 
     static bool loggedRender = false;
     if (!loggedRender)
     {
-        Tracenf("[NAMEPLATE] Render: nameplates=%zu vertices=%zu depthTest=%d",
-            nameplates.size(),
+        Tracenf("[WORLD-LABEL] Render: worldLabels=%zu vertices=%zu depthTest=%d",
+            worldLabels.size(),
             vertices.size(),
-            kDepthTestNameplates ? 1 : 0);
+            kDepthTestLabels ? 1 : 0);
         loggedRender = true;
     }
 }
 
-void NameplateRenderer::Destroy()
+void WorldLabelRenderer::Destroy()
 {
     if (!m_device)
         return;
@@ -384,7 +351,7 @@ void NameplateRenderer::Destroy()
     m_assets = nullptr;
 }
 
-bool NameplateRenderer::CreateBuffers(VulkanDevice& device)
+bool WorldLabelRenderer::CreateBuffers(VulkanDevice& device)
 {
     for (Buffer& buffer : m_vertexBuffers)
     {
@@ -400,7 +367,7 @@ bool NameplateRenderer::CreateBuffers(VulkanDevice& device)
     return true;
 }
 
-bool NameplateRenderer::CreateFontAtlas(VulkanDevice& device)
+bool WorldLabelRenderer::CreateFontAtlas(VulkanDevice& device)
 {
     DestroyTexture(m_fontAtlas);
     m_glyphs = {};
@@ -566,7 +533,7 @@ bool NameplateRenderer::CreateFontAtlas(VulkanDevice& device)
     return true;
 }
 
-bool NameplateRenderer::CreateDescriptors()
+bool WorldLabelRenderer::CreateDescriptors()
 {
     VkDescriptorSetLayoutBinding ubo{};
     ubo.binding = 0;
@@ -642,13 +609,13 @@ bool NameplateRenderer::CreateDescriptors()
     return true;
 }
 
-bool NameplateRenderer::CreatePipeline(VulkanDevice& device)
+bool WorldLabelRenderer::CreatePipeline(VulkanDevice& device)
 {
     if (!m_assets)
         return false;
 
-    VkShaderModule vs = CreateShaderModule(m_device, *m_assets, "assets/shaders/nameplate_vs.spv");
-    VkShaderModule ps = CreateShaderModule(m_device, *m_assets, "assets/shaders/nameplate_ps.spv");
+    VkShaderModule vs = CreateShaderModule(m_device, *m_assets, "assets/shaders/world_label_vs.spv");
+    VkShaderModule ps = CreateShaderModule(m_device, *m_assets, "assets/shaders/world_label_ps.spv");
 
     VkPipelineShaderStageCreateInfo stages[2]{};
     stages[0].sType = VK_STRUCTURE_TYPE_PIPELINE_SHADER_STAGE_CREATE_INFO;
@@ -708,7 +675,7 @@ bool NameplateRenderer::CreatePipeline(VulkanDevice& device)
 
     VkPipelineDepthStencilStateCreateInfo depth{};
     depth.sType = VK_STRUCTURE_TYPE_PIPELINE_DEPTH_STENCIL_STATE_CREATE_INFO;
-    depth.depthTestEnable = kDepthTestNameplates ? VK_TRUE : VK_FALSE;
+    depth.depthTestEnable = kDepthTestLabels ? VK_TRUE : VK_FALSE;
     depth.depthWriteEnable = VK_FALSE;
     depth.depthCompareOp = VK_COMPARE_OP_LESS_OR_EQUAL;
 
@@ -762,7 +729,7 @@ bool NameplateRenderer::CreatePipeline(VulkanDevice& device)
     return true;
 }
 
-void NameplateRenderer::DestroyPipeline()
+void WorldLabelRenderer::DestroyPipeline()
 {
     if (m_pipeline)
         vkDestroyPipeline(m_device, m_pipeline, nullptr);
@@ -773,7 +740,7 @@ void NameplateRenderer::DestroyPipeline()
     m_pipelineLayout = VK_NULL_HANDLE;
 }
 
-void NameplateRenderer::DestroyBuffer(Buffer& buffer)
+void WorldLabelRenderer::DestroyBuffer(Buffer& buffer)
 {
     if (buffer.buffer)
         vkDestroyBuffer(m_device, buffer.buffer, nullptr);
@@ -782,7 +749,7 @@ void NameplateRenderer::DestroyBuffer(Buffer& buffer)
     buffer = {};
 }
 
-void NameplateRenderer::DestroyTexture(Texture& texture)
+void WorldLabelRenderer::DestroyTexture(Texture& texture)
 {
     if (texture.sampler)
         vkDestroySampler(m_device, texture.sampler, nullptr);
@@ -795,7 +762,7 @@ void NameplateRenderer::DestroyTexture(Texture& texture)
     texture = {};
 }
 
-void NameplateRenderer::UpdateUniform(uint32_t frameIndex, const WorldCamera& camera)
+void WorldLabelRenderer::UpdateUniform(uint32_t frameIndex, const WorldCamera& camera)
 {
     const UniformBlock uniform{camera.viewProjection};
     void* mapped = nullptr;
@@ -804,7 +771,7 @@ void NameplateRenderer::UpdateUniform(uint32_t frameIndex, const WorldCamera& ca
     vkUnmapMemory(m_device, m_uniformBuffers[frameIndex].memory);
 }
 
-void NameplateRenderer::BuildVertices(const WorldCamera& camera, const std::vector<Nameplate>& nameplates, std::vector<Vertex>& vertices) const
+void WorldLabelRenderer::BuildVertices(const WorldCamera& camera, const std::vector<Label>& worldLabels, std::vector<Vertex>& vertices) const
 {
     const WorldVec3 forward = WorldNormalize(WorldSub(camera.target, camera.eye));
     WorldVec3 right = WorldNormalize(WorldCross({0.0f, 1.0f, 0.0f}, forward));
@@ -812,10 +779,10 @@ void NameplateRenderer::BuildVertices(const WorldCamera& camera, const std::vect
         right = {1.0f, 0.0f, 0.0f};
     const WorldVec3 up = WorldNormalize(WorldCross(forward, right));
 
-    vertices.reserve(std::min<size_t>(kMaxVertices, nameplates.size() * 96u * 6u * 9u));
-    for (const Nameplate& nameplate : nameplates)
+    vertices.reserve(std::min<size_t>(kMaxVertices, worldLabels.size() * 96u * 6u * 2u));
+    for (const Label& label : worldLabels)
     {
-        const WorldVec3 toCamera = WorldSub(nameplate.position, camera.eye);
+        const WorldVec3 toCamera = WorldSub(label.position, camera.eye);
         const float distance = std::sqrt(WorldDot(toCamera, toCamera));
         const float fade = std::clamp(
             (kFadeEndMeters - distance) / (kFadeEndMeters - kFadeStartMeters),
@@ -824,69 +791,27 @@ void NameplateRenderer::BuildVertices(const WorldCamera& camera, const std::vect
         if (fade <= 0.0f)
             continue;
 
-        const std::string name = ToPrintableAscii(nameplate.name.empty() ? std::string("Player") : nameplate.name);
-        const bool hasInfo = nameplate.level > 0;
-        const std::string level = hasInfo ? "Lv " + std::to_string(nameplate.level) : std::string();
-        const std::string alignment = hasInfo ? AlignmentTitle(nameplate.alignment) : std::string();
+        const std::string text = ToPrintableAscii(label.text.empty() ? std::string("Label") : label.text);
 
-        WorldVec3 origin = WorldAdd(nameplate.position, {0.0f, kHeadOffsetMeters, 0.0f});
+        WorldVec3 origin = WorldAdd(label.position, {0.0f, kHeadOffsetMeters, 0.0f});
         const float nameLineHeight = kAtlasCell * kNamePixelScale;
-        const float infoLineHeight = kAtlasCell * kInfoPixelScale;
-        const float totalHeight = hasInfo
-            ? nameLineHeight + infoLineHeight * 2.0f + kLineGapMeters * 2.0f
-            : nameLineHeight;
-        origin = WorldAdd(origin, WorldScale(up, totalHeight * 0.5f));
+        origin = WorldAdd(origin, WorldScale(up, nameLineHeight * 0.5f));
 
-        float nameColor[4]{};
-        AlignmentColor(nameplate.alignment, nameColor);
-        if (nameplate.selected)
+        float textColor[4] = {label.color[0], label.color[1], label.color[2], label.color[3]};
+        if (label.selected)
         {
-            nameColor[0] = 1.0f;
-            nameColor[1] = 0.86f;
-            nameColor[2] = 0.32f;
-            nameColor[3] = 1.0f;
+            const float selectColor[4] = {1.0f, 0.80f, 0.22f, 0.30f};
+            AppendQuad(vertices, origin, right, up, 2.2f, 0.42f, selectColor, fade);
+            textColor[0] = 1.0f;
+            textColor[1] = 0.86f;
+            textColor[2] = 0.32f;
+            textColor[3] = 1.0f;
         }
-        const float levelColor[4] = {0.80f, 0.86f, 0.92f, 0.85f};
-        float alignmentColor[4]{};
-        AlignmentColor(nameplate.alignment, alignmentColor);
-
-        AppendLine(vertices, origin, right, up, name, kNamePixelScale, nameColor, fade);
-        origin = WorldAdd(origin, WorldScale(up, -(nameLineHeight + kLineGapMeters)));
-        if (hasInfo)
-        {
-            AppendLine(vertices, origin, right, up, level, kInfoPixelScale, levelColor, fade);
-            origin = WorldAdd(origin, WorldScale(up, -(infoLineHeight + kLineGapMeters)));
-            AppendLine(vertices, origin, right, up, alignment, kInfoPixelScale, alignmentColor, fade);
-            if (nameplate.alignment != 0 && nameplate.hpMax > 0.0f)
-            {
-                origin = WorldAdd(origin, WorldScale(up, -(infoLineHeight + kLineGapMeters * 1.5f)));
-                const float backColor[4] = {0.02f, 0.025f, 0.03f, 0.86f};
-                if (nameplate.selected)
-                {
-                    const float selectColor[4] = {1.0f, 0.80f, 0.22f, 0.92f};
-                    AppendQuad(vertices, origin, right, up, kHealthBarWidthMeters + 0.08f, kHealthBarHeightMeters + 0.05f, selectColor, fade);
-                }
-                AppendQuad(vertices, origin, right, up, kHealthBarWidthMeters, kHealthBarHeightMeters, backColor, fade);
-
-                const float ratio = std::clamp(nameplate.hpDisplayed / nameplate.hpMax, 0.0f, 1.0f);
-                const float fillWidth = std::max(0.0f, kHealthBarWidthMeters * ratio - 0.018f);
-                float hpColor[4] = {0.28f, 0.92f, 0.34f, 0.95f};
-                if (ratio <= 0.2f)
-                {
-                    hpColor[0] = 1.0f; hpColor[1] = 0.20f; hpColor[2] = 0.16f;
-                }
-                else if (ratio <= 0.5f)
-                {
-                    hpColor[0] = 1.0f; hpColor[1] = 0.80f; hpColor[2] = 0.18f;
-                }
-                const WorldVec3 fillOrigin = WorldAdd(origin, WorldScale(right, -(kHealthBarWidthMeters - fillWidth) * 0.5f));
-                AppendQuad(vertices, fillOrigin, right, up, fillWidth, kHealthBarHeightMeters * 0.58f, hpColor, fade);
-            }
-        }
+        AppendLine(vertices, origin, right, up, text, kNamePixelScale, textColor, fade);
     }
 }
 
-void NameplateRenderer::AppendQuad(std::vector<Vertex>& vertices, WorldVec3 origin, WorldVec3 right, WorldVec3 up,
+void WorldLabelRenderer::AppendQuad(std::vector<Vertex>& vertices, WorldVec3 origin, WorldVec3 right, WorldVec3 up,
     float width, float height, const float color[4], float fade) const
 {
     if (width <= 0.0f || height <= 0.0f || vertices.size() + 6u >= kMaxVertices)
@@ -924,7 +849,7 @@ void NameplateRenderer::AppendQuad(std::vector<Vertex>& vertices, WorldVec3 orig
     vertices.push_back(makeVertex(p3));
 }
 
-void NameplateRenderer::AppendLine(std::vector<Vertex>& vertices, WorldVec3 origin, WorldVec3 right, WorldVec3 up,
+void WorldLabelRenderer::AppendLine(std::vector<Vertex>& vertices, WorldVec3 origin, WorldVec3 right, WorldVec3 up,
     const std::string& text, float pixelScale, const float color[4], float fade) const
 {
     if (text.empty() || vertices.size() + 6u >= kMaxVertices)

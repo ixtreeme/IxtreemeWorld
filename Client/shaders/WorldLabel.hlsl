@@ -1,6 +1,6 @@
 #pragma pack_matrix(row_major)
 
-[[vk::binding(0, 0)]] cbuffer NameplateConstants : register(b0)
+[[vk::binding(0, 0)]] cbuffer WorldLabelConstants : register(b0)
 {
     float4x4 u_mvp;
 };
