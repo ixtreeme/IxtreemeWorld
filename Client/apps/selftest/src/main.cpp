@@ -1329,6 +1329,9 @@ bool RunRenderChecks(const Options& options, TestContext& ctx)
             staticMeshRendererSource.find("node.skinIndex.has_value()") != std::string::npos &&
             staticMeshRendererSource.find("JOINTS_0") != std::string::npos &&
             staticMeshRendererSource.find("WEIGHTS_0") != std::string::npos &&
+            staticMeshRendererSource.find("fastgltf::Options::LoadExternalBuffers") != std::string::npos &&
+            staticMeshRendererSource.find("fastgltf::Options::LoadExternalImages") != std::string::npos &&
+            staticMeshRendererSource.find("fastgltf::Options::GenerateMeshIndices") != std::string::npos &&
             staticMeshRendererSource.find("LoadStatus::UnsupportedSkinned") != std::string::npos &&
             staticMeshRendererSource.find("bool StaticMeshRenderer::LoadStaticGltfMesh") != std::string::npos &&
             staticMeshRendererSource.find("skeleton.ozz") == std::string::npos,

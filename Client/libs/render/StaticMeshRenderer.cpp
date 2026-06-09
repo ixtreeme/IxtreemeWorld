@@ -335,9 +335,15 @@ std::optional<fastgltf::Asset> ParseGltf(client::asset::IAssetReader& assets,
             *error = std::string("data buffer error: ") + std::string(fastgltf::getErrorMessage(data.error()));
         return std::nullopt;
     }
+    constexpr fastgltf::Options options =
+        fastgltf::Options::DecomposeNodeMatrices |
+        fastgltf::Options::LoadExternalBuffers |
+        fastgltf::Options::LoadExternalImages |
+        fastgltf::Options::GenerateMeshIndices;
+
     fastgltf::Parser parser;
     auto assetResult = parser.loadGltf(data.get(), std::filesystem::path(dir),
-        fastgltf::Options::DecomposeNodeMatrices);
+        options);
     if (assetResult.error() != fastgltf::Error::None)
     {
         if (error)
