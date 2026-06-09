@@ -311,6 +311,192 @@ bool JsonArrayBody(const std::string& text, const std::string& key, std::string&
     return false;
 }
 
+bool IsDataUri(const std::string& uri)
+{
+    const std::string lower = ToLower(uri);
+    return lower.rfind("data:", 0) == 0;
+}
+
+int HexValue(char c)
+{
+    if (c >= '0' && c <= '9')
+        return c - '0';
+    if (c >= 'a' && c <= 'f')
+        return 10 + c - 'a';
+    if (c >= 'A' && c <= 'F')
+        return 10 + c - 'A';
+    return -1;
+}
+
+std::string PercentDecodeUriPath(std::string uri)
+{
+    const size_t fragment = uri.find('#');
+    if (fragment != std::string::npos)
+        uri.resize(fragment);
+    const size_t query = uri.find('?');
+    if (query != std::string::npos)
+        uri.resize(query);
+
+    std::string out;
+    out.reserve(uri.size());
+    for (size_t i = 0; i < uri.size(); ++i)
+    {
+        if (uri[i] == '%' && i + 2 < uri.size())
+        {
+            const int hi = HexValue(uri[i + 1]);
+            const int lo = HexValue(uri[i + 2]);
+            if (hi >= 0 && lo >= 0)
+            {
+                out.push_back(static_cast<char>((hi << 4) | lo));
+                i += 2;
+                continue;
+            }
+        }
+        out.push_back(uri[i]);
+    }
+    return out;
+}
+
+bool NormalizeGltfDependencyUri(const std::string& uri, std::filesystem::path& outRelative, std::string& error)
+{
+    if (uri.empty() || IsDataUri(uri))
+        return false;
+
+    const std::string decoded = PercentDecodeUriPath(uri);
+    if (decoded.find("://") != std::string::npos)
+    {
+        error = "remote glTF URI is not supported: " + uri;
+        return false;
+    }
+
+    std::string slashPath = decoded;
+    std::replace(slashPath.begin(), slashPath.end(), '\\', '/');
+    std::filesystem::path candidate(slashPath);
+    if (candidate.is_absolute() || !candidate.root_name().empty())
+    {
+        error = "absolute glTF URI is not supported: " + uri;
+        return false;
+    }
+
+    std::filesystem::path normalized;
+    for (const auto& part : candidate)
+    {
+        const std::string text = part.generic_string();
+        if (text.empty() || text == ".")
+            continue;
+        if (text == "..")
+        {
+            error = "parent-relative glTF URI is not supported: " + uri;
+            return false;
+        }
+        normalized /= part;
+    }
+
+    if (normalized.empty())
+        return false;
+    outRelative = normalized;
+    return true;
+}
+
+void CollectGltfDependencyArray(const std::string& json,
+                                const std::string& key,
+                                std::vector<std::filesystem::path>& dependencies,
+                                std::string& error)
+{
+    std::string body;
+    if (!JsonArrayBody(json, key, body))
+        return;
+
+    size_t pos = 0;
+    while ((pos = body.find('{', pos)) != std::string::npos)
+    {
+        std::string object;
+        size_t end = 0;
+        if (!JsonObjectAt(body, pos, object, end))
+            break;
+        pos = end;
+
+        const std::string uri = JsonStringValue(object, "uri");
+        std::filesystem::path relative;
+        if (NormalizeGltfDependencyUri(uri, relative, error))
+            dependencies.push_back(relative);
+        if (!error.empty())
+            return;
+    }
+}
+
+bool CopyGltfExternalDependencies(const std::filesystem::path& sourceGltf,
+                                  const std::filesystem::path& destinationGltf,
+                                  std::vector<std::filesystem::path>& copiedFiles,
+                                  std::string& error)
+{
+    copiedFiles.clear();
+    if (ToLower(sourceGltf.extension().string()) != ".gltf")
+        return true;
+
+    std::ifstream file(sourceGltf, std::ios::binary);
+    if (!file)
+    {
+        error = "failed to open glTF source";
+        return false;
+    }
+    const std::string json((std::istreambuf_iterator<char>(file)), std::istreambuf_iterator<char>());
+
+    std::vector<std::filesystem::path> dependencies;
+    CollectGltfDependencyArray(json, "buffers", dependencies, error);
+    if (error.empty())
+        CollectGltfDependencyArray(json, "images", dependencies, error);
+    if (!error.empty())
+        return false;
+
+    std::set<std::string> unique;
+    std::vector<std::filesystem::path> uniqueDependencies;
+    for (const auto& dependency : dependencies)
+    {
+        const std::string key = dependency.generic_string();
+        if (unique.insert(key).second)
+            uniqueDependencies.push_back(dependency);
+    }
+
+    const std::filesystem::path sourceDir = sourceGltf.parent_path();
+    const std::filesystem::path destinationDir = destinationGltf.parent_path();
+    for (const auto& dependency : uniqueDependencies)
+    {
+        const std::filesystem::path source = sourceDir / dependency;
+        if (!std::filesystem::is_regular_file(source))
+        {
+            Tracenf("[ASSET-LIBRARY] glTF missing external dependency: %s", source.string().c_str());
+            error = "missing glTF external dependency: " + dependency.generic_string();
+            return false;
+        }
+    }
+
+    std::error_code ec;
+    for (const auto& dependency : uniqueDependencies)
+    {
+        const std::filesystem::path source = sourceDir / dependency;
+        const std::filesystem::path destination = destinationDir / dependency;
+        std::filesystem::create_directories(destination.parent_path(), ec);
+        if (ec)
+        {
+            error = ec.message();
+            return false;
+        }
+        std::filesystem::copy_file(source, destination, std::filesystem::copy_options::overwrite_existing, ec);
+        if (ec)
+        {
+            error = ec.message();
+            return false;
+        }
+        copiedFiles.push_back(destination);
+        Tracenf("[ASSET-LIBRARY] glTF dependency imported: %s -> %s",
+            dependency.generic_string().c_str(),
+            destination.string().c_str());
+    }
+
+    return true;
+}
+
 std::string TimestampUtc()
 {
     const auto now = std::chrono::system_clock::now();
@@ -1771,6 +1957,17 @@ bool AssetLibrary::Import(Category category,
         return false;
     }
 
+    std::vector<std::filesystem::path> copiedDependencyFiles;
+    if ((category == Category::Model || category == Category::Animation) &&
+        ToLower(sourcePath.extension().string()) == ".gltf" &&
+        !CopyGltfExternalDependencies(sourcePath, destination, copiedDependencyFiles, error))
+    {
+        std::filesystem::remove(destination, ec);
+        for (const auto& dependency : copiedDependencyFiles)
+            std::filesystem::remove(dependency, ec);
+        return false;
+    }
+
     Entry entry;
     entry.id = MakeUniqueId(category, sourcePath);
     entry.category = category;
@@ -1808,6 +2005,8 @@ bool AssetLibrary::Import(Category category,
     if (!SaveManifest(error))
     {
         std::filesystem::remove(destination, ec);
+        for (const auto& dependency : copiedDependencyFiles)
+            std::filesystem::remove(dependency, ec);
         if (category == Category::Texture && !entry.thumbnail.empty())
             std::filesystem::remove(m_libraryRoot / entry.thumbnail, ec);
         m_entries.pop_back();

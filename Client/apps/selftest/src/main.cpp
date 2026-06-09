@@ -348,6 +348,53 @@ bool RunAssetTests(const Options& options, TestContext& ctx)
     ctx.Expect(!diffuse.thumbnail.empty() && std::filesystem::exists(fakeClientRoot / "assets" / "library" / diffuse.thumbnail),
         "texture thumbnail generated", "thumbnail missing");
 
+    const auto gltfRoot = inputRoot / "BoulderSource";
+    std::filesystem::create_directories(gltfRoot / "buffers", ec);
+    std::filesystem::create_directories(gltfRoot / "textures", ec);
+    {
+        std::ofstream bin(gltfRoot / "buffers" / "boulder.bin", std::ios::binary);
+        const std::uint8_t bytes[48] = {};
+        bin.write(reinterpret_cast<const char*>(bytes), sizeof(bytes));
+    }
+    {
+        std::ofstream texture(gltfRoot / "textures" / "boulder_albedo.png", std::ios::binary);
+        texture << "fixture texture bytes";
+    }
+    const auto gltfPath = gltfRoot / "namaqualand_boulder_02_1k.gltf";
+    {
+        std::ofstream gltf(gltfPath, std::ios::binary);
+        gltf << "{\n"
+             << "  \"asset\": {\"version\": \"2.0\"},\n"
+             << "  \"buffers\": [{\"uri\": \"buffers/boulder.bin\", \"byteLength\": 48}],\n"
+             << "  \"images\": [{\"uri\": \"textures/boulder_albedo.png\"}],\n"
+             << "  \"bufferViews\": [],\n"
+             << "  \"meshes\": []\n"
+             << "}\n";
+    }
+    AssetLibrary::ImportOptions modelOptions;
+    modelOptions.subpath = "props/boulders";
+    AssetLibrary::Entry boulderModel;
+    if (!ctx.Expect(library.Import(AssetLibrary::Category::Model, gltfPath, modelOptions, boulderModel, error),
+            "gltf model import dependencies", error))
+        return false;
+    const std::filesystem::path importedGltf = library.AbsolutePath(boulderModel);
+    ctx.Expect(std::filesystem::exists(importedGltf.parent_path() / "buffers" / "boulder.bin") &&
+            std::filesystem::exists(importedGltf.parent_path() / "textures" / "boulder_albedo.png"),
+        "gltf dependencies copied", "gltf external .bin or texture was not copied beside the imported model");
+    const auto missingGltfPath = gltfRoot / "missing_dependency.gltf";
+    {
+        std::ofstream gltf(missingGltfPath, std::ios::binary);
+        gltf << "{\n"
+             << "  \"asset\": {\"version\": \"2.0\"},\n"
+             << "  \"buffers\": [{\"uri\": \"buffers/does_not_exist.bin\", \"byteLength\": 48}],\n"
+             << "  \"images\": []\n"
+             << "}\n";
+    }
+    AssetLibrary::Entry missingModel;
+    ctx.Expect(!library.Import(AssetLibrary::Category::Model, missingGltfPath, modelOptions, missingModel, error) &&
+            error.find("missing glTF external dependency") != std::string::npos,
+        "gltf missing dependency rejected", "missing glTF dependency should fail import with a clear warning/error");
+
     AssetLibrary::Entry normal;
     if (!ctx.Expect(library.Import(AssetLibrary::Category::Texture, normalPath, grassOptions, normal, error),
             "texture import normal TGA", error))
