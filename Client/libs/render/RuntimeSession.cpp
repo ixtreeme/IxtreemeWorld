@@ -10,7 +10,7 @@ public:
     void SetQuitCallback(std::function<void()> callback) override { m_quitCallback = std::move(callback); }
     void Update(double) override {}
     void UpdateNetwork() override {}
-    void SendMoveInput(float, client::net::MoveState) override {}
+    void SendMoveInput(float, RuntimeMoveState) override {}
     void SendAttackTarget(std::uint32_t) override {}
     void OnRenderPassChanged(VulkanDevice&) override {}
     void Resize(uint32_t, uint32_t) override {}
@@ -37,9 +37,9 @@ public:
         m_ownNetId = player.netId;
         m_entities = {player};
     }
-    void UpdateLocalPlayPlayer(client::net::Vec3 position,
+    void UpdateLocalPlayPlayer(RuntimeVec3 position,
                                std::uint16_t heading,
-                               client::net::MoveState moveState) override
+                               RuntimeMoveState moveState) override
     {
         if (m_entities.empty())
             return;
@@ -73,15 +73,6 @@ public:
     std::array<MapEditorPaletteSlot, 8> GetPaletteSlots() const override { return m_paletteSlots; }
     void SetEditorStatus(const std::string& status) override { m_editorStatus = status; }
     void ImportDroppedFiles(const std::vector<std::string>&) override {}
-
-    void SetLoginCallbacks(std::function<void()>, std::function<void(const std::string&)>) override {}
-    void SubmitLogin(const std::string&, const std::string&, bool) override {}
-    void SetLobbyCallbacks(std::function<void()>,
-                           std::function<void(const std::vector<client::net::CharacterListItem>&)>,
-                           std::function<void(const std::string&)>,
-                           std::function<void()>) override {}
-    void EnterWorldWithCharacter(std::uint64_t) override {}
-    void LogoutToLogin() override { Stop(); }
 
 private:
     std::function<void()> m_quitCallback;

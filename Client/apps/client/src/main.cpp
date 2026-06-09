@@ -94,12 +94,12 @@ float HeadingFromQuantized(std::uint16_t heading)
     return (static_cast<float>(heading) / 65535.0f) * kTwoPi;
 }
 
-WorldVec3 ServerMetersToDisplay(client::net::Vec3 position)
+WorldVec3 ServerMetersToDisplay(RuntimeVec3 position)
 {
     return {position.x, position.z, -position.y};
 }
 
-client::net::Vec3 DisplayToServerMeters(WorldVec3 position)
+RuntimeVec3 DisplayToServerMeters(WorldVec3 position)
 {
     return {position.x, -position.z, position.y};
 }
@@ -544,13 +544,13 @@ WorldVec3 SpotLightDirection(const SpotLight& spot)
     return WorldNormalize({std::sin(yaw) * cosPitch, std::sin(pitch), std::cos(yaw) * cosPitch});
 }
 
-WarriorRenderer::MotionState ToWarriorMotion(client::net::MoveState state)
+WarriorRenderer::MotionState ToWarriorMotion(RuntimeMoveState state)
 {
     switch (state)
     {
-    case client::net::MoveState::Walking:
+    case RuntimeMoveState::Walking:
         return WarriorRenderer::MotionState::Walk;
-    case client::net::MoveState::Running:
+    case RuntimeMoveState::Running:
         return WarriorRenderer::MotionState::Run;
     default:
         return WarriorRenderer::MotionState::Idle;
@@ -622,11 +622,11 @@ struct MovementInputState
         return std::atan2(displayDir.x, -displayDir.z);
     }
 
-    client::net::MoveState State() const
+    RuntimeMoveState State() const
     {
         if (!HasDirection())
-            return client::net::MoveState::Idle;
-        return shift ? client::net::MoveState::Running : client::net::MoveState::Walking;
+            return RuntimeMoveState::Idle;
+        return shift ? RuntimeMoveState::Running : RuntimeMoveState::Walking;
     }
 };
 
@@ -1076,7 +1076,7 @@ struct EditorPlayRuntime
     SceneData playStartSceneSnapshot;
     bool playStartSceneWasOpen = false;
     bool playStartSceneDirty = false;
-    client::net::Vec3 playerPosition{};
+    RuntimeVec3 playerPosition{};
     std::uint16_t playerHeading = 0;
 };
 
@@ -1976,7 +1976,7 @@ int RunGame(NativeWindow& window,
             runtimeSession->UpdateNetwork();
             runtimeSession->SendMoveInput(
                 movement.DirectionAngle(cameraController.MovementYaw()),
-                cameraController.IsFlyMode() ? client::net::MoveState::Idle : movement.State());
+                cameraController.IsFlyMode() ? RuntimeMoveState::Idle : movement.State());
         }
         runtimeSession->Update(seconds);
         rmlUi.Update();

@@ -3,7 +3,6 @@
 #include "InputEvent.h"
 #include "MapEditorTypes.h"
 #include "SceneManager.h"
-#include "network/IClientHandler.h"
 
 #include <array>
 #include <cstdint>
@@ -21,13 +20,27 @@ namespace client::asset
 class IAssetReader;
 }
 
+struct RuntimeVec3
+{
+    float x = 0.0f;
+    float y = 0.0f;
+    float z = 0.0f;
+};
+
+enum class RuntimeMoveState : std::uint8_t
+{
+    Idle,
+    Walking,
+    Running,
+};
+
 struct WorldRenderEntity
 {
     std::uint32_t netId = 0;
     std::string name;
-    client::net::Vec3 position;
+    RuntimeVec3 position;
     std::uint16_t heading = 0;
-    client::net::MoveState moveState = client::net::MoveState::Idle;
+    RuntimeMoveState moveState = RuntimeMoveState::Idle;
     std::uint32_t mobTypeId = 0;
     std::uint32_t level = 1;
     float hpCurrent = 1.0f;
@@ -45,7 +58,7 @@ public:
     virtual void SetQuitCallback(std::function<void()> callback) = 0;
     virtual void Update(double timeSeconds) = 0;
     virtual void UpdateNetwork() = 0;
-    virtual void SendMoveInput(float directionAngle, client::net::MoveState moveState) = 0;
+    virtual void SendMoveInput(float directionAngle, RuntimeMoveState moveState) = 0;
     virtual void SendAttackTarget(std::uint32_t netId) = 0;
     virtual void OnRenderPassChanged(VulkanDevice& device) = 0;
     virtual void Resize(uint32_t width, uint32_t height) = 0;
@@ -61,9 +74,9 @@ public:
     virtual std::uint32_t GetOwnNetId() const = 0;
     virtual std::vector<WorldRenderEntity> GetWorldEntities() const = 0;
     virtual void EnterLocalPlayMode(const WorldRenderEntity& player) = 0;
-    virtual void UpdateLocalPlayPlayer(client::net::Vec3 position,
+    virtual void UpdateLocalPlayPlayer(RuntimeVec3 position,
                                        std::uint16_t heading,
-                                       client::net::MoveState moveState) = 0;
+                                       RuntimeMoveState moveState) = 0;
     virtual void ExitLocalPlayMode() = 0;
 
     virtual bool IsMapEditorOpen() const = 0;
@@ -84,15 +97,6 @@ public:
     virtual void SetEditorStatus(const std::string& status) = 0;
     virtual void ImportDroppedFiles(const std::vector<std::string>& paths) = 0;
 
-    virtual void SetLoginCallbacks(std::function<void()> acceptedCallback,
-                                   std::function<void(const std::string&)> statusCallback) = 0;
-    virtual void SubmitLogin(const std::string& username, const std::string& password, bool remember) = 0;
-    virtual void SetLobbyCallbacks(std::function<void()> shownCallback,
-                                   std::function<void(const std::vector<client::net::CharacterListItem>&)> charactersCallback,
-                                   std::function<void(const std::string&)> statusCallback,
-                                   std::function<void()> enteredWorldCallback) = 0;
-    virtual void EnterWorldWithCharacter(std::uint64_t characterId) = 0;
-    virtual void LogoutToLogin() = 0;
 };
 
 std::unique_ptr<RuntimeSession> CreateEmptyRuntimeSession();

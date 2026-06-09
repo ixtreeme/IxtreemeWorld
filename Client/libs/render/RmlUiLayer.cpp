@@ -4,8 +4,6 @@
 #include "SceneManager.h"
 #include "VulkanDevice.h"
 #include "asset/IAssetReader.h"
-#include "network/CharacterListItem.h"
-
 #include <RmlUi/Core.h>
 #include <RmlUi/Core/Event.h>
 #include <RmlUi/Core/EventListener.h>
@@ -1233,7 +1231,7 @@ struct RmlUiLayer::Impl
     std::function<void()> menuResumeCallback;
     std::function<void()> menuLogoutCallback;
     std::function<void()> menuQuitCallback;
-    std::vector<client::net::CharacterListItem> lobbyCharacters;
+    std::vector<RmlCharacterListItem> lobbyCharacters;
     std::uint64_t selectedCharacterId = 0;
     bool loginVisible = true;
     bool lobbyVisible = false;
@@ -1309,7 +1307,7 @@ std::string ClassLabel(std::uint16_t classId)
     return "Class " + std::to_string(classId);
 }
 
-std::string CharacterDetail(const client::net::CharacterListItem& character)
+std::string CharacterDetail(const RmlCharacterListItem& character)
 {
     if (character.id == 0)
         return "Character creation not available yet";
@@ -1317,12 +1315,12 @@ std::string CharacterDetail(const client::net::CharacterListItem& character)
 }
 
 template <typename ImplT>
-const client::net::CharacterListItem* FindLobbyCharacter(const ImplT* impl, std::uint64_t id)
+const RmlCharacterListItem* FindLobbyCharacter(const ImplT* impl, std::uint64_t id)
 {
     if (!impl || id == 0)
         return nullptr;
 
-    for (const client::net::CharacterListItem& character : impl->lobbyCharacters)
+    for (const RmlCharacterListItem& character : impl->lobbyCharacters)
     {
         if (character.id == id)
             return &character;
@@ -1366,7 +1364,7 @@ void UpdateLobbySelectionPanel(ImplT* impl)
     if (!impl || !impl->lobbyDocument)
         return;
 
-    const client::net::CharacterListItem* selected = FindLobbyCharacter(impl, impl->selectedCharacterId);
+    const RmlCharacterListItem* selected = FindLobbyCharacter(impl, impl->selectedCharacterId);
     if (!selected)
     {
         SetElementText(impl->lobbyDocument, "selected-char-name", "No character selected");
@@ -2103,7 +2101,7 @@ void RmlUiLayer::HideLobby()
     SetElementDisplay(m_impl->lobbyDocument, "delete-confirm", false);
 }
 
-void RmlUiLayer::SetLobbyCharacters(const std::vector<client::net::CharacterListItem>& characters)
+void RmlUiLayer::SetLobbyCharacters(const std::vector<RmlCharacterListItem>& characters)
 {
     if (!m_impl || !m_impl->lobbyDocument)
         return;
@@ -2120,7 +2118,7 @@ void RmlUiLayer::SetLobbyCharacters(const std::vector<client::net::CharacterList
     if (characters.empty())
         rml += "<div class='character-item-empty'>No characters yet. Create one to start!</div>";
 
-    for (const client::net::CharacterListItem& character : characters)
+    for (const RmlCharacterListItem& character : characters)
     {
         if (character.id == 0)
         {
@@ -2147,7 +2145,7 @@ void RmlUiLayer::SetLobbyCharacters(const std::vector<client::net::CharacterList
 
     list->SetInnerRML(rml);
 
-    for (const client::net::CharacterListItem& character : m_impl->lobbyCharacters)
+    for (const RmlCharacterListItem& character : m_impl->lobbyCharacters)
     {
         if (character.id == 0)
             continue;

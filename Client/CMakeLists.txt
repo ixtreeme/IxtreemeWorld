@@ -85,7 +85,6 @@ endif()
 include(cmake/BootstrapVcpkg.cmake)
 
 vcpkg_require(
-    boost-system
     capnproto
     fastgltf
     flecs
@@ -123,7 +122,6 @@ endif()
 set(CLIENT_ROOT "${CMAKE_CURRENT_SOURCE_DIR}")
 set(CLIENT_LIBS_DIR "${CLIENT_ROOT}/libs")
 
-add_subdirectory(${CMAKE_CURRENT_SOURCE_DIR}/../shared/protocol shared_protocol_build)
 add_subdirectory(${CMAKE_CURRENT_SOURCE_DIR}/../shared/map shared_map_build)
 
 find_package(fastgltf CONFIG REQUIRED)
@@ -150,8 +148,6 @@ find_package(RmlUi 6.2 CONFIG REQUIRED)
 if(IXTREEME_WITH_EDITOR)
     find_package(imguizmo CONFIG REQUIRED)
 endif()
-find_package(Boost CONFIG REQUIRED COMPONENTS system)
-
 if(TARGET flecs::flecs_static)
     set(CLIENT_FLECS_TARGET flecs::flecs_static)
 elseif(TARGET flecs::flecs)
@@ -365,7 +361,6 @@ endif()
 
 add_subdirectory(libs/platform)
 add_subdirectory(libs/asset)
-add_subdirectory(libs/network)
 add_subdirectory(libs/render)
 add_subdirectory(apps/client)
 add_subdirectory(apps/selftest)

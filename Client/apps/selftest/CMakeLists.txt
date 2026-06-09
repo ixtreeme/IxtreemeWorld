@@ -4,7 +4,6 @@ add_executable(IwSelfTest
 
 target_link_libraries(IwSelfTest
     PRIVATE
-        client_network
         client_render
 )
 

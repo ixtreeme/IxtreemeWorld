@@ -17,11 +17,6 @@ namespace client::asset
 class IAssetReader;
 }
 
-namespace client::net
-{
-struct CharacterListItem;
-}
-
 struct RmlHudData
 {
     std::string playerName = "Player";
@@ -40,6 +35,19 @@ struct RmlHudData
     std::string zoneName = "Starting Zone";
     float playerX = 0.0f;
     float playerZ = 0.0f;
+};
+
+struct RmlCharacterListItem
+{
+    std::uint64_t id = 0;
+    std::uint8_t slot = 0;
+    std::string name;
+    std::uint32_t level = 0;
+    std::uint16_t classId = 0;
+    std::uint16_t appearance = 0;
+    std::int32_t posX = 0;
+    std::int32_t posY = 0;
+    std::uint16_t mapId = 0;
 };
 
 class RmlUiLayer
@@ -66,7 +74,7 @@ public:
                            std::function<void()> logoutCallback);
     void ShowLobby();
     void HideLobby();
-    void SetLobbyCharacters(const std::vector<client::net::CharacterListItem>& characters);
+    void SetLobbyCharacters(const std::vector<RmlCharacterListItem>& characters);
     void SetLobbyStatus(const std::string& message);
     bool IsLobbyVisible() const;
     void ShowHud();

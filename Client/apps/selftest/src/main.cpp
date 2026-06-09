@@ -1,4 +1,3 @@
-#include "ClientSession.h"
 #include "AssetLibrary.h"
 #include "MapEditorTypes.h"
 #include "WaterBodyIO.h"
@@ -101,7 +100,7 @@ void PrintUsage()
         << "  --all                         Run asset/render/network tests\n"
         << "  --asset                       Run isolated AssetLibrary tests\n"
         << "  --render                      Run render asset/shader/config checks\n"
-        << "  --network                     Connect to loginserver and enter world\n"
+        << "  --network                     Skip archived AURIGA network/protocol test\n"
         << "  --login-host HOST             Default: 127.0.0.1\n"
         << "  --login-port PORT             Default: 11000\n"
         << "  --username USER               Default: IW_TEST_USER or testuser\n"
@@ -1195,12 +1194,18 @@ bool RunRenderChecks(const Options& options, TestContext& ctx)
                 clientMainSource.find("scenes/Login.scene") != std::string::npos &&
                 clientMainSource.find("#else\n    LoadRuntimeScene(assets, StartupSceneFromConfig(assets));") != std::string::npos,
             "scene release startup flow", "SCENE-2 release builds must load app_config.json startup_scene with Login.scene fallback");
-    ctx.Expect(gameClientLayerHeaderSource.find("SetMapEditorOpen") != std::string::npos &&
-            gameClientLayerSource.find("void GameClientLayer::SetMapEditorOpen(bool open)") != std::string::npos &&
-            clientMainSource.find("runtimeSession->SetMapEditorOpen(true)") != std::string::npos &&
-            clientMainSource.find("[BOOT] editor_open forced = 1") != std::string::npos &&
-            clientMainSource.find("editorImGui.BeginFrame(runtimeSession->IsMapEditorOpen())") != std::string::npos,
-        "editor boot opens imgui", "ENGINE-BOOT-FIX must keep the ImGui editor open on editor-build boot independent of scene_type/RmlUi routing");
+    if (cleanup2DefaultRuntime)
+        ctx.Expect(clientMainSource.find("runtimeSession->SetMapEditorOpen(true)") != std::string::npos &&
+                clientMainSource.find("[BOOT] editor_open forced = 1") != std::string::npos &&
+                clientMainSource.find("editorImGui.BeginFrame(runtimeSession->IsMapEditorOpen())") != std::string::npos,
+            "editor boot opens imgui", "ENGINE-BOOT-FIX must keep the ImGui editor open on editor-build boot independent of scene_type/RmlUi routing");
+    else
+        ctx.Expect(gameClientLayerHeaderSource.find("SetMapEditorOpen") != std::string::npos &&
+                gameClientLayerSource.find("void GameClientLayer::SetMapEditorOpen(bool open)") != std::string::npos &&
+                clientMainSource.find("runtimeSession->SetMapEditorOpen(true)") != std::string::npos &&
+                clientMainSource.find("[BOOT] editor_open forced = 1") != std::string::npos &&
+                clientMainSource.find("editorImGui.BeginFrame(runtimeSession->IsMapEditorOpen())") != std::string::npos,
+            "editor boot opens imgui", "ENGINE-BOOT-FIX must keep the ImGui editor open on editor-build boot independent of scene_type/RmlUi routing");
     if (cleanup2DefaultRuntime)
         ctx.Skip("scene navigation callbacks", "CLEANUP-2 removes active AURIGA login/lobby/world scene-flow routing");
     else
@@ -1399,6 +1404,7 @@ bool RunRenderChecks(const Options& options, TestContext& ctx)
     return ctx.failed == 0;
 }
 
+#if 0
 class NetworkProbe final : public client::net::IClientHandler
 {
 public:
@@ -1641,6 +1647,13 @@ bool RunNetworkTest(const Options& options, TestContext& ctx)
               << " transform_packets=" << probe.TransformPackets()
               << " transform_records=" << probe.TransformRecords()
               << " last_tick=" << probe.LastTransformTick() << "\n";
+    return true;
+}
+#endif
+
+bool RunNetworkTest(const Options&, TestContext& ctx)
+{
+    ctx.Skip("network login enter-world", "CLEANUP-3 archived AURIGA network/server/protocol");
     return true;
 }
 

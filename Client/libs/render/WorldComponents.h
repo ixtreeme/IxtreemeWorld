@@ -1,7 +1,5 @@
 #pragma once
 
-#include "network/IClientHandler.h"
-
 #include <array>
 #include <cstdint>
 #include <string>
@@ -25,9 +23,16 @@ struct NetId
     std::uint32_t value = 0;
 };
 
+enum class MoveStateValue : std::uint8_t
+{
+    Idle,
+    Walking,
+    Running,
+};
+
 struct MoveState
 {
-    client::net::MoveState value = client::net::MoveState::Idle;
+    MoveStateValue value = MoveStateValue::Idle;
 };
 
 struct RenderableModel
