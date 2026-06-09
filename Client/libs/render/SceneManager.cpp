@@ -1066,7 +1066,7 @@ std::string SceneManager::SaveSceneDialog() const
 
 void SceneManager::UpdateWindowTitle()
 {
-    std::string title = "AURIGA GLOBAL \xE2\x80\x94 Editor";
+    std::string title = "IxtreemeWorld Engine - Editor";
     if (HasOpenScene())
     {
         std::string sceneLabel = std::filesystem::path(m_currentScenePath).filename().string();

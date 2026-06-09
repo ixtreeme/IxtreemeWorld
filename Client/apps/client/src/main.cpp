@@ -835,7 +835,6 @@ std::optional<std::string> ExtractJsonStringField(const std::string& text, const
 
 std::string StartupSceneFromConfig(const client::asset::IAssetReader& assets)
 {
-    constexpr const char* kFallbackStartupScene = "scenes/Login.scene";
     if (auto root = assets.RootPath())
     {
         Tracenf("[BOOT] config probe: %s",
@@ -852,8 +851,8 @@ std::string StartupSceneFromConfig(const client::asset::IAssetReader& assets)
     }
     if (!configText)
     {
-        Tracenf("[BOOT] config missing/empty -> fallback = %s", kFallbackStartupScene);
-        return kFallbackStartupScene;
+        Tracen("[BOOT] config missing/empty -> fallback = empty runtime");
+        return {};
     }
 
     if (auto root = assets.RootPath())
@@ -868,8 +867,8 @@ std::string StartupSceneFromConfig(const client::asset::IAssetReader& assets)
         return *startupScene;
     }
 
-    Tracenf("[BOOT] config missing/empty -> fallback = %s", kFallbackStartupScene);
-    return kFallbackStartupScene;
+    Tracen("[BOOT] config missing/empty -> fallback = empty runtime");
+    return {};
 }
 
 std::filesystem::path ResolveRuntimeScenePath(const client::asset::IAssetReader& assets, const std::string& sceneAssetPath)
@@ -894,6 +893,12 @@ std::filesystem::path ResolveRuntimeScenePath(const client::asset::IAssetReader&
 
 bool LoadRuntimeScene(client::asset::IAssetReader& assets, const std::string& sceneAssetPath)
 {
+    if (sceneAssetPath.empty())
+    {
+        Tracen("[BOOT] runtime scene request: <empty>");
+        Tracen("[SCENE] no scene loaded (empty runtime startup)");
+        return false;
+    }
     const std::filesystem::path scenePath = ResolveRuntimeScenePath(assets, sceneAssetPath);
     Tracenf("[BOOT] runtime scene request: %s", sceneAssetPath.c_str());
     Tracenf("[SCENE] load attempt: %s",
@@ -1028,7 +1033,7 @@ int RunGame(NativeWindow& window,
 #else
     Tracen("[BUILD] Editor: DISABLED");
     Tracen("[BOOT] build = RELEASE");
-    Tracen("[BOOT] entry state = release boot, default runtime, no built-in AURIGA startup scene");
+    Tracen("[BOOT] entry state = release boot, default runtime, no startup scene");
 #endif
     Tracenf("[BOOT] window size = %ux%u", window.GetWidth(), window.GetHeight());
 
@@ -2935,7 +2940,7 @@ int WINAPI WinMain(HINSTANCE instance, HINSTANCE, LPSTR, int showCommand)
     (void)showCommand;
 
     NativeWindow_Win32 window;
-    if (!window.Create(instance, "AURIGA GLOBAL — Editor", 1280, 720))
+    if (!window.Create(instance, "IxtreemeWorld Engine - Editor", 1280, 720))
     {
         ShowFatal("Failed to create Win32 window.");
         return 1;

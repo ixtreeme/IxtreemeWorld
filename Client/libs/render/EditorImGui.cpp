@@ -2107,7 +2107,7 @@ void EditorImGui::RenderMenuBar()
     }
     if (ImGui::BeginMenu("Help"))
     {
-        ImGui::MenuItem("About AURIGA GLOBAL", nullptr, false, false);
+        ImGui::MenuItem("About IxtreemeWorld Engine", nullptr, false, false);
         ImGui::EndMenu();
     }
 

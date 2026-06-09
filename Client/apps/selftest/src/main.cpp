@@ -1,6 +1,10 @@
 #include "AssetLibrary.h"
 #include "MapEditorTypes.h"
+#include "ProjectManager.h"
+#include "SceneManager.h"
 #include "WaterBodyIO.h"
+#include "map/MapData.h"
+#include "schema/map_manifest.capnp.h"
 
 #include <algorithm>
 #include <chrono>
@@ -14,8 +18,10 @@
 #include <optional>
 #include <sstream>
 #include <string>
-#include <thread>
 #include <vector>
+
+#include <capnp/message.h>
+#include <capnp/serialize.h>
 
 namespace
 {
@@ -23,15 +29,8 @@ using Clock = std::chrono::steady_clock;
 
 struct Options
 {
-    bool runNetwork = false;
     bool runAsset = false;
     bool runRender = false;
-    std::string loginHost = "127.0.0.1";
-    std::uint16_t loginPort = 11000;
-    std::string username = "testuser";
-    std::string password = "testpass";
-    std::uint64_t characterId = 0;
-    int timeoutSeconds = 15;
     std::filesystem::path clientRoot = IW_CLIENT_SOURCE_ROOT;
     std::filesystem::path scratchRoot;
 };
@@ -53,12 +52,6 @@ struct TestContext
         std::cerr << "[FAIL] " << name << ": " << message << "\n";
     }
 
-    void Skip(const std::string& name, const std::string& reason)
-    {
-        ++passed;
-        std::cout << "[SKIP] " << name << ": " << reason << "\n";
-    }
-
     bool Expect(bool condition, const std::string& name, const std::string& message)
     {
         if (condition)
@@ -71,42 +64,13 @@ struct TestContext
     }
 };
 
-std::string GetEnvString(const char* name, const std::string& fallback)
-{
-    char* value = nullptr;
-    size_t size = 0;
-    if (_dupenv_s(&value, &size, name) == 0 && value)
-    {
-        std::string out(value);
-        std::free(value);
-        if (!out.empty())
-            return out;
-    }
-    return fallback;
-}
-
-std::uint16_t ParsePort(const std::string& value)
-{
-    const int parsed = std::stoi(value);
-    if (parsed <= 0 || parsed > 65535)
-        throw std::runtime_error("invalid port: " + value);
-    return static_cast<std::uint16_t>(parsed);
-}
-
 void PrintUsage()
 {
     std::cout
         << "IwSelfTest options:\n"
-        << "  --all                         Run asset/render/network tests\n"
+        << "  --all                         Run asset/render engine baseline tests\n"
         << "  --asset                       Run isolated AssetLibrary tests\n"
         << "  --render                      Run render asset/shader/config checks\n"
-        << "  --network                     Skip archived AURIGA network/protocol test\n"
-        << "  --login-host HOST             Default: 127.0.0.1\n"
-        << "  --login-port PORT             Default: 11000\n"
-        << "  --username USER               Default: IW_TEST_USER or testuser\n"
-        << "  --password PASS               Default: IW_TEST_PASSWORD or testpass\n"
-        << "  --character-id ID             Default: first character in list\n"
-        << "  --timeout SECONDS             Default: 15\n"
         << "  --client-root PATH            Default: compiled Client source root\n"
         << "  --scratch-root PATH           Default: temp/IwSelfTest_<time>\n";
 }
@@ -114,8 +78,6 @@ void PrintUsage()
 Options ParseOptions(int argc, char** argv)
 {
     Options options;
-    options.username = GetEnvString("IW_TEST_USER", options.username);
-    options.password = GetEnvString("IW_TEST_PASSWORD", options.password);
 
     for (int i = 1; i < argc; ++i)
     {
@@ -133,7 +95,6 @@ Options ParseOptions(int argc, char** argv)
         }
         else if (arg == "--all")
         {
-            options.runNetwork = true;
             options.runAsset = true;
             options.runRender = true;
         }
@@ -141,20 +102,6 @@ Options ParseOptions(int argc, char** argv)
             options.runAsset = true;
         else if (arg == "--render")
             options.runRender = true;
-        else if (arg == "--network")
-            options.runNetwork = true;
-        else if (arg == "--login-host")
-            options.loginHost = needValue("--login-host");
-        else if (arg == "--login-port")
-            options.loginPort = ParsePort(needValue("--login-port"));
-        else if (arg == "--username")
-            options.username = needValue("--username");
-        else if (arg == "--password")
-            options.password = needValue("--password");
-        else if (arg == "--character-id")
-            options.characterId = std::stoull(needValue("--character-id"));
-        else if (arg == "--timeout")
-            options.timeoutSeconds = std::stoi(needValue("--timeout"));
         else if (arg == "--client-root")
             options.clientRoot = needValue("--client-root");
         else if (arg == "--scratch-root")
@@ -163,7 +110,7 @@ Options ParseOptions(int argc, char** argv)
             throw std::runtime_error("unknown option: " + arg);
     }
 
-    if (!options.runNetwork && !options.runAsset && !options.runRender)
+    if (!options.runAsset && !options.runRender)
     {
         options.runAsset = true;
         options.runRender = true;
@@ -223,6 +170,137 @@ std::size_t CountCategory(const AssetLibrary& library, AssetLibrary::Category ca
         [category](const AssetLibrary::Entry& entry) {
             return entry.category == category;
         }));
+}
+
+void PushU16(std::vector<std::uint8_t>& bytes, std::uint16_t value)
+{
+    bytes.push_back(static_cast<std::uint8_t>(value & 0xffu));
+    bytes.push_back(static_cast<std::uint8_t>((value >> 8) & 0xffu));
+}
+
+void PushU32(std::vector<std::uint8_t>& bytes, std::uint32_t value)
+{
+    bytes.push_back(static_cast<std::uint8_t>(value & 0xffu));
+    bytes.push_back(static_cast<std::uint8_t>((value >> 8) & 0xffu));
+    bytes.push_back(static_cast<std::uint8_t>((value >> 16) & 0xffu));
+    bytes.push_back(static_cast<std::uint8_t>((value >> 24) & 0xffu));
+}
+
+void PushI16(std::vector<std::uint8_t>& bytes, std::int16_t value)
+{
+    PushU16(bytes, static_cast<std::uint16_t>(value));
+}
+
+std::vector<std::uint8_t> BuildOneCellMxChunk()
+{
+    struct Section
+    {
+        std::uint16_t type = 0;
+        std::vector<std::uint8_t> bytes;
+    };
+
+    std::vector<Section> sections;
+    Section height;
+    height.type = 1;
+    PushI16(height.bytes, 0);
+    PushI16(height.bytes, 100);
+    PushI16(height.bytes, 200);
+    PushI16(height.bytes, 300);
+    sections.push_back(height);
+
+    Section splatA;
+    splatA.type = 2;
+    PushU16(splatA.bytes, 1);
+    PushU16(splatA.bytes, 1);
+    splatA.bytes.insert(splatA.bytes.end(), {255, 0, 0, 255});
+    sections.push_back(splatA);
+
+    Section attributes;
+    attributes.type = 3;
+    PushU16(attributes.bytes, 0);
+    sections.push_back(attributes);
+
+    Section splatB;
+    splatB.type = 4;
+    PushU16(splatB.bytes, 1);
+    PushU16(splatB.bytes, 1);
+    splatB.bytes.insert(splatB.bytes.end(), {0, 255, 0, 255});
+    sections.push_back(splatB);
+
+    constexpr std::size_t kHeaderSize = 14;
+    constexpr std::size_t kTocEntrySize = 12;
+    std::vector<std::uint8_t> bytes;
+    PushU32(bytes, 0x3143584d); // MXC1
+    PushU16(bytes, 2);
+    PushU16(bytes, 0);
+    PushU16(bytes, 0);
+    PushU16(bytes, 1);
+    PushU16(bytes, static_cast<std::uint16_t>(sections.size()));
+
+    std::uint32_t offset = static_cast<std::uint32_t>(kHeaderSize + sections.size() * kTocEntrySize);
+    for (const Section& section : sections)
+    {
+        PushU16(bytes, section.type);
+        PushU16(bytes, 0);
+        PushU32(bytes, offset);
+        PushU32(bytes, static_cast<std::uint32_t>(section.bytes.size()));
+        offset += static_cast<std::uint32_t>(section.bytes.size());
+    }
+
+    for (const Section& section : sections)
+        bytes.insert(bytes.end(), section.bytes.begin(), section.bytes.end());
+    return bytes;
+}
+
+std::vector<std::uint8_t> BuildMapManifest()
+{
+    capnp::MallocMessageBuilder builder;
+    auto manifest = builder.initRoot<mx::map::schema::MapManifest>();
+    manifest.setFormatVersion(2);
+    manifest.setWorldId("baseline");
+    manifest.setWorldName("Engine Baseline");
+    manifest.setWorldSizeCells(1);
+    manifest.setCellSizeMeters(1.0f);
+    manifest.setHeightUnit(mx::map::schema::HeightUnit::CENTIMETERS);
+    manifest.setChunkSizeCells(1);
+    auto grid = manifest.initZoneGridDims();
+    grid.setX(1);
+    grid.setY(1);
+    manifest.setZoneSizeCells(1);
+    auto palette = manifest.initTexturePalette(1);
+    palette[0].setId(0);
+    palette[0].setPath("textures/default");
+
+    kj::Array<capnp::word> words = capnp::messageToFlatArray(builder);
+    const auto bytes = words.asBytes();
+    return {bytes.begin(), bytes.end()};
+}
+
+bool RunMapDataBaselineTest(TestContext& ctx)
+{
+    const std::vector<std::uint8_t> manifest = BuildMapManifest();
+    const std::vector<std::uint8_t> chunk = BuildOneCellMxChunk();
+    const auto read = [&](std::string_view path) -> std::optional<std::vector<std::uint8_t>> {
+        const std::string key(path);
+        if (key == "maps/baseline/map.manifest")
+            return manifest;
+        if (key == "maps/baseline/chunks/chunk_0_0.mxchunk")
+            return chunk;
+        return std::nullopt;
+    };
+
+    const auto loadedManifest = mx::map::LoadManifest(read, "maps/baseline");
+    ctx.Expect(loadedManifest && loadedManifest->world_name == "Engine Baseline" &&
+            loadedManifest->chunk_size_cells == 1,
+        "mapdata manifest capnp load", "MapData failed to load the capnp manifest fixture");
+
+    const auto heightField = mx::map::LoadHeightField(read, "maps/baseline");
+    return ctx.Expect(heightField && heightField->IsValid() &&
+            heightField->width_vertices == 2 &&
+            heightField->height_vertices == 2 &&
+            heightField->splat_a_rgba8.size() == 4 &&
+            std::abs(heightField->SampleHeightMeters(1.0f, 1.0f) - 3.0f) < 0.001f,
+        "mapdata mxchunk heightfield load", "MapData failed to load and sample the .mxchunk fixture");
 }
 
 bool RunAssetTests(const Options& options, TestContext& ctx)
@@ -416,6 +494,48 @@ bool RunAssetTests(const Options& options, TestContext& ctx)
     ctx.Expect(library.DeleteFolder(AssetLibrary::Category::Texture, "terrain/delete_me", removedAssets, error) &&
             removedAssets == 1 && !library.FindById(stone.id),
         "non-empty folder delete removes manifest entries", error);
+
+    const std::filesystem::path projectParent = scratch / "projects";
+    std::filesystem::create_directories(projectParent, ec);
+    if (!ctx.Expect(!ec, "project scratch setup", ec.message()))
+        return false;
+
+    std::string projectError;
+    ProjectManager& projects = ProjectManager::Instance();
+    if (!ctx.Expect(projects.CreateProject(projectParent, "EngineBaseline", projectError),
+            "project create round-trip", projectError))
+        return false;
+    ctx.Expect(std::filesystem::exists(projects.ManifestPath()) &&
+            std::filesystem::exists(projects.AssetRootPath()) &&
+            std::filesystem::exists(projects.ScenesPath()),
+        "project folders created", "project.ixproj, Assets, or Scenes missing after CreateProject");
+
+    projects.SetRecentScenes({"Scenes/Baseline.scene"});
+    ctx.Expect(projects.SaveProject(projectError), "project save manifest", projectError);
+    ctx.Expect(projects.OpenProject(projects.ManifestPath(), projectError) &&
+            projects.CurrentProject().name == "EngineBaseline" &&
+            projects.CurrentProject().recentScenes.size() == 1,
+        "project open round-trip", projectError);
+
+    SceneManager& scenes = SceneManager::Instance();
+    scenes.NewScene();
+    scenes.SetSceneName("Baseline");
+    scenes.SetSceneType("empty");
+    const std::filesystem::path scenePath = projects.ScenesPath() / "Baseline.scene";
+    if (!ctx.Expect(scenes.SaveSceneAs(scenePath.string()),
+            "scene save project-relative", "SaveSceneAs failed"))
+        return false;
+    scenes.CloseScene();
+    if (!ctx.Expect(scenes.LoadScene(scenePath.string()),
+            "scene load round-trip", "LoadScene failed"))
+        return false;
+    ctx.Expect(scenes.HasOpenScene() &&
+            scenes.GetCurrentScene().name == "Baseline" &&
+            scenes.GetCurrentSceneType() == "empty" &&
+            !scenes.IsDirty(),
+        "scene data round-trip", "scene name/type/open/dirty state did not round-trip");
+
+    RunMapDataBaselineTest(ctx);
 
     std::cout << "[INFO] asset scratch kept at: " << scratch.generic_string() << "\n";
     return ctx.failed == 0;
@@ -705,16 +825,6 @@ bool RunRenderChecks(const Options& options, TestContext& ctx)
 
     const std::string legacyUiName = "Noe" "sis";
     const std::string legacyMarkupExt = ".xa" "ml";
-    const std::filesystem::path gameClientLayerPath = options.clientRoot / "libs" / "render" / "GameClientLayer.cpp";
-    std::ifstream gameClientLayer(gameClientLayerPath);
-    std::stringstream gameClientLayerText;
-    gameClientLayerText << gameClientLayer.rdbuf();
-    const std::string gameClientLayerSource = gameClientLayerText.str();
-    const std::filesystem::path gameClientLayerHeaderPath = options.clientRoot / "libs" / "render" / "GameClientLayer.h";
-    std::ifstream gameClientLayerHeader(gameClientLayerHeaderPath);
-    std::stringstream gameClientLayerHeaderText;
-    gameClientLayerHeaderText << gameClientLayerHeader.rdbuf();
-    const std::string gameClientLayerHeaderSource = gameClientLayerHeaderText.str();
     const std::filesystem::path editorImGuiPath = options.clientRoot / "libs" / "render" / "EditorImGui.cpp";
     std::ifstream editorImGui(editorImGuiPath);
     std::stringstream editorImGuiText;
@@ -795,56 +905,6 @@ bool RunRenderChecks(const Options& options, TestContext& ctx)
     std::stringstream rmlUiShaderText;
     rmlUiShaderText << rmlUiShader.rdbuf();
     const std::string rmlUiShaderSource = rmlUiShaderText.str();
-    const std::filesystem::path loginRmlPath = options.clientRoot / "assets" / "ui" / "login.rml";
-    std::ifstream loginRml(loginRmlPath);
-    std::stringstream loginRmlText;
-    loginRmlText << loginRml.rdbuf();
-    const std::string loginRmlSource = loginRmlText.str();
-    const std::filesystem::path loginRcssPath = options.clientRoot / "assets" / "ui" / "login.rcss";
-    std::ifstream loginRcss(loginRcssPath);
-    std::stringstream loginRcssText;
-    loginRcssText << loginRcss.rdbuf();
-    const std::string loginRcssSource = loginRcssText.str();
-    const std::filesystem::path lobbyRmlPath = options.clientRoot / "assets" / "ui" / "lobby.rml";
-    std::ifstream lobbyRml(lobbyRmlPath);
-    std::stringstream lobbyRmlText;
-    lobbyRmlText << lobbyRml.rdbuf();
-    const std::string lobbyRmlSource = lobbyRmlText.str();
-    const std::filesystem::path lobbyRcssPath = options.clientRoot / "assets" / "ui" / "lobby.rcss";
-    std::ifstream lobbyRcss(lobbyRcssPath);
-    std::stringstream lobbyRcssText;
-    lobbyRcssText << lobbyRcss.rdbuf();
-    const std::string lobbyRcssSource = lobbyRcssText.str();
-    const std::filesystem::path worldHudRmlPath = options.clientRoot / "assets" / "ui" / "worldhud.rml";
-    std::ifstream worldHudRml(worldHudRmlPath);
-    std::stringstream worldHudRmlText;
-    worldHudRmlText << worldHudRml.rdbuf();
-    const std::string worldHudRmlSource = worldHudRmlText.str();
-    const std::filesystem::path worldHudRcssPath = options.clientRoot / "assets" / "ui" / "worldhud.rcss";
-    std::ifstream worldHudRcss(worldHudRcssPath);
-    std::stringstream worldHudRcssText;
-    worldHudRcssText << worldHudRcss.rdbuf();
-    const std::string worldHudRcssSource = worldHudRcssText.str();
-    const std::filesystem::path menuRmlPath = options.clientRoot / "assets" / "ui" / "ingame_menu.rml";
-    std::ifstream menuRml(menuRmlPath);
-    std::stringstream menuRmlText;
-    menuRmlText << menuRml.rdbuf();
-    const std::string menuRmlSource = menuRmlText.str();
-    const std::filesystem::path settingsRmlPath = options.clientRoot / "assets" / "ui" / "settings.rml";
-    std::ifstream settingsRml(settingsRmlPath);
-    std::stringstream settingsRmlText;
-    settingsRmlText << settingsRml.rdbuf();
-    const std::string settingsRmlSource = settingsRmlText.str();
-    const std::filesystem::path inventoryRmlPath = options.clientRoot / "assets" / "ui" / "inventory.rml";
-    std::ifstream inventoryRml(inventoryRmlPath);
-    std::stringstream inventoryRmlText;
-    inventoryRmlText << inventoryRml.rdbuf();
-    const std::string inventoryRmlSource = inventoryRmlText.str();
-    const std::filesystem::path creationRmlPath = options.clientRoot / "assets" / "ui" / "character_creation.rml";
-    std::ifstream creationRml(creationRmlPath);
-    std::stringstream creationRmlText;
-    creationRmlText << creationRml.rdbuf();
-    const std::string creationRmlSource = creationRmlText.str();
     const std::filesystem::path clientMainPath = options.clientRoot / "apps" / "client" / "src" / "main.cpp";
     std::ifstream clientMain(clientMainPath);
     std::stringstream clientMainText;
@@ -870,23 +930,6 @@ bool RunRenderChecks(const Options& options, TestContext& ctx)
     std::stringstream androidGradleText;
     androidGradleText << androidGradle.rdbuf();
     const std::string androidGradleSource = androidGradleText.str();
-    const bool hasAurigaUiContent =
-        std::filesystem::exists(loginRmlPath) &&
-        std::filesystem::exists(loginRcssPath) &&
-        std::filesystem::exists(lobbyRmlPath) &&
-        std::filesystem::exists(lobbyRcssPath) &&
-        std::filesystem::exists(worldHudRmlPath) &&
-        std::filesystem::exists(worldHudRcssPath) &&
-        std::filesystem::exists(menuRmlPath) &&
-        std::filesystem::exists(settingsRmlPath) &&
-        std::filesystem::exists(inventoryRmlPath) &&
-        std::filesystem::exists(creationRmlPath);
-    const bool cleanup2DefaultRuntime =
-        !hasAurigaUiContent &&
-        runtimeSessionSource.find("class AurigaRuntimeSession") == std::string::npos &&
-        runtimeUiAdapterSource.find("class AurigaRuntimeUiAdapter") == std::string::npos &&
-        clientMainSource.find("CreateRuntimeSession()") != std::string::npos &&
-        clientMainSource.find("CreateRuntimeUiAdapter(rmlUi)") != std::string::npos;
     ctx.Expect(rootCmakeSource.find("option(IXTREEME_WITH_EDITOR") != std::string::npos &&
             rootCmakeSource.find("if(IXTREEME_WITH_EDITOR)\n    vcpkg_require(imguizmo)") != std::string::npos &&
             rootCmakeSource.find("if(WIN32 AND IXTREEME_WITH_EDITOR)") != std::string::npos &&
@@ -902,13 +945,9 @@ bool RunRenderChecks(const Options& options, TestContext& ctx)
             renderCmakeSource.find("RuntimeSession.cpp") != std::string::npos &&
             renderCmakeSource.find("RuntimeUiAdapter.cpp") != std::string::npos &&
             renderCmakeSource.find("RmlUi::RmlUi") != std::string::npos &&
-            (cleanup2DefaultRuntime
-                ? renderCmakeSource.find("GameClientLayer.cpp") == std::string::npos
-                : renderCmakeSource.find("GameClientLayer.cpp") != std::string::npos) &&
+            renderCmakeSource.find("Game" "ClientLayer.cpp") == std::string::npos &&
             clientMainSource.find("RmlUiLayer rmlUi") != std::string::npos &&
-            (cleanup2DefaultRuntime
-                ? clientMainSource.find("CreateRuntimeSession()") != std::string::npos
-                : clientMainSource.find("CreateRuntimeSession(kActiveRuntimeImplementation)") != std::string::npos) &&
+            clientMainSource.find("CreateRuntimeSession()") != std::string::npos &&
             clientMainSource.find("rmlUi.Render(device);") != std::string::npos &&
             clientMainSource.find("editorImGui.Render(device);") != std::string::npos,
         "rmlui build and z-order pipeline", "RMLUI-1 must link RmlUi 6.2, compile shaders, and render before ImGui");
@@ -916,10 +955,6 @@ bool RunRenderChecks(const Options& options, TestContext& ctx)
             rmlUiLayerSource.find("class RmlRenderInterface final : public Rml::RenderInterface") != std::string::npos &&
             rmlUiLayerSource.find("CreateDescriptorPool") != std::string::npos &&
             rmlUiLayerSource.find("ProcessMouseButtonDown") != std::string::npos &&
-            rmlUiLayerSource.find("Event: type=%s element=login-button") != std::string::npos &&
-            rmlUiLayerSource.find("assets/ui/login.rml") != std::string::npos &&
-            rmlUiLayerSource.find("SetLoginSubmitCallback") != std::string::npos &&
-            rmlUiLayerSource.find("Username and password required") != std::string::npos &&
             rmlUiLayerSource.find("[RMLUI-DIAG] CreateContext: viewport=") != std::string::npos &&
             rmlUiLayerSource.find("[RMLUI-DIAG] RenderGeometry: vertices=") != std::string::npos &&
             rmlUiLayerSource.find("[RMLUI-DIAG] vkCmdSetViewport") != std::string::npos &&
@@ -929,79 +964,13 @@ bool RunRenderChecks(const Options& options, TestContext& ctx)
             rmlUiShaderSource.find("[[vk::push_constant]]") != std::string::npos &&
             rmlUiShaderSource.find("[[vk::binding(0, 0)]] Texture2D") != std::string::npos &&
             rmlUiShaderSource.find("(pixel.y / g_push.viewport.y) * 2.0f - 1.0f") != std::string::npos,
-        "rmlui vulkan layer source", "RMLUI-2 must provide file, render, input, login event, and Vulkan shader integration");
-    if (cleanup2DefaultRuntime)
-        ctx.Skip("rmlui login document and game handoff", "CLEANUP-2 archived AURIGA login UI and game handoff");
-    else
-        ctx.Expect(loginRmlSource.find("AURIGA GLOBAL") != std::string::npos &&
-            loginRmlSource.find("login-username") != std::string::npos &&
-            loginRmlSource.find("login-password") != std::string::npos &&
-            loginRmlSource.find("login-remember") != std::string::npos &&
-            loginRmlSource.find("login-button") != std::string::npos &&
-            loginRmlSource.find("login-error") != std::string::npos &&
-            loginRcssSource.find(".login-screen") != std::string::npos &&
-            loginRcssSource.find(".login-panel") != std::string::npos &&
-            loginRcssSource.find(".login-button") != std::string::npos &&
-            loginRcssSource.find(".login-error") != std::string::npos &&
-            runtimeUiAdapterSource.find("m_rmlUi.SetLoginSubmitCallback") != std::string::npos &&
-            runtimeUiAdapterSource.find("runtime.SetLoginCallbacks") != std::string::npos,
-        "rmlui login document and game handoff", "RMLUI-2 login must be RML/RCSS and call the existing backend login path");
-    if (cleanup2DefaultRuntime)
-        ctx.Skip("rmlui lobby document and game handoff", "CLEANUP-2 archived AURIGA lobby UI and callbacks");
-    else
-        ctx.Expect(lobbyRmlSource.find("Lobby - AURIGA GLOBAL") != std::string::npos &&
-            lobbyRmlSource.find("character-list") != std::string::npos &&
-            lobbyRmlSource.find("enter-world-btn") != std::string::npos &&
-            lobbyRmlSource.find("delete-char-btn") != std::string::npos &&
-            lobbyRmlSource.find("logout-btn") != std::string::npos &&
-            lobbyRmlSource.find("delete-confirm") != std::string::npos &&
-            lobbyRcssSource.find(".lobby-screen") != std::string::npos &&
-            lobbyRcssSource.find(".character-panel") != std::string::npos &&
-            lobbyRcssSource.find(".action-panel") != std::string::npos &&
-            lobbyRcssSource.find(".character-item.selected") != std::string::npos &&
-            rmlUiLayerSource.find("assets/ui/lobby.rml") != std::string::npos &&
-            rmlUiLayerSource.find("SetLobbyCharacters") != std::string::npos &&
-            rmlUiLayerSource.find("[RMLUI-LOBBY] Character list populated") != std::string::npos &&
-            runtimeUiAdapterSource.find("m_rmlUi.SetLobbyCallbacks") != std::string::npos &&
-            runtimeUiAdapterSource.find("runtime.SetLobbyCallbacks") != std::string::npos,
-        "rmlui lobby document and game handoff", "RMLUI-3 lobby must be RML/RCSS and populate character data from callbacks");
-    if (cleanup2DefaultRuntime)
-        ctx.Skip("rmlui hud document and per-frame update", "CLEANUP-2 archived AURIGA HUD UI and runtime HUD update");
-    else
-        ctx.Expect(worldHudRmlSource.find("HUD - AURIGA GLOBAL") != std::string::npos &&
-            worldHudRmlSource.find("player-name") != std::string::npos &&
-            worldHudRmlSource.find("hp-fill") != std::string::npos &&
-            worldHudRmlSource.find("mp-fill") != std::string::npos &&
-            worldHudRmlSource.find("xp-fill") != std::string::npos &&
-            worldHudRmlSource.find("target-frame") != std::string::npos &&
-            worldHudRmlSource.find("minimap-canvas") != std::string::npos &&
-            worldHudRcssSource.find(".player-frame") != std::string::npos &&
-            worldHudRcssSource.find(".target-frame") != std::string::npos &&
-            worldHudRcssSource.find(".minimap-frame") != std::string::npos &&
-            rmlUiLayerSource.find("assets/ui/worldhud.rml") != std::string::npos &&
-            rmlUiLayerSource.find("CacheHudElements") != std::string::npos &&
-            rmlUiLayerSource.find("void RmlUiLayer::UpdateHud") != std::string::npos &&
-            rmlUiLayerSource.find("SetProperty(\"width\"") != std::string::npos &&
-            runtimeUiAdapterSource.find("m_rmlUi.ShowHud()") != std::string::npos &&
-            clientMainSource.find("runtimeUi->UpdateHud(hudData)") != std::string::npos,
-        "rmlui hud document and per-frame update", "RMLUI-4 HUD must be RML/RCSS and update bar widths by CSS property");
-    if (cleanup2DefaultRuntime)
-        ctx.Skip("rmlui gameplay panels", "CLEANUP-2 archived AURIGA menu/settings/inventory/character panels");
-    else
-        ctx.Expect(menuRmlSource.find("menu-resume-btn") != std::string::npos &&
-            menuRmlSource.find("menu-settings-btn") != std::string::npos &&
-            menuRmlSource.find("menu-logout-btn") != std::string::npos &&
-            settingsRmlSource.find("settings-tab-video") != std::string::npos &&
-            settingsRmlSource.find("settings-tab-audio") != std::string::npos &&
-            inventoryRmlSource.find("inventory-grid") != std::string::npos &&
-            creationRmlSource.find("character-name") != std::string::npos &&
-            rmlUiLayerSource.find("assets/ui/ingame_menu.rml") != std::string::npos &&
-            rmlUiLayerSource.find("SetInGameMenuCallbacks") != std::string::npos &&
-            rmlUiLayerSource.find("ToggleInventory") != std::string::npos &&
-            rmlUiLayerSource.find("ShowCharacterCreation") != std::string::npos &&
-            clientMainSource.find("event.key == Key_Escape") != std::string::npos &&
-            clientMainSource.find("event.key == Key_I") != std::string::npos,
-        "rmlui gameplay panels", "RMLUI-5 must provide menu, settings, inventory, character creation, and keyboard toggles");
+        "rmlui vulkan backend source", "RmlUi backend must provide file IO, render, input, deferred GPU cleanup, and Vulkan shader integration");
+    ctx.Expect(runtimeUiAdapterHeaderSource.find("class RuntimeUiAdapter") != std::string::npos &&
+            runtimeUiAdapterSource.find("class NullRuntimeUiAdapter final") != std::string::npos &&
+            runtimeUiAdapterSource.find("HideAll") != std::string::npos &&
+            runtimeSessionSource.find("class EmptyRuntimeSession final") != std::string::npos &&
+            clientMainSource.find("CreateRuntimeUiAdapter(rmlUi)") != std::string::npos,
+        "runtime ui null baseline", "Clean engine runtime UI must use the Null adapter by default while keeping the RmlUi backend available");
     ctx.Expect(std::filesystem::exists(options.clientRoot / "assets" / "fonts" / "Inter-Regular.ttf") &&
             std::filesystem::exists(options.clientRoot / "assets" / "fonts" / "Inter-SemiBold.ttf") &&
             std::filesystem::exists(options.clientRoot / "assets" / "fonts" / "Inter-Bold.ttf") &&
@@ -1041,7 +1010,7 @@ bool RunRenderChecks(const Options& options, TestContext& ctx)
             editorImGuiSource.find("UI::IconButton(ICON_FA_FOLDER_PLUS") != std::string::npos &&
             editorImGuiSource.find("UI::IconButton(ICON_FA_TRASH") != std::string::npos &&
             editorImGuiSource.find("UI::SectionHeader") != std::string::npos &&
-            clientMainSource.find("AURIGA GLOBAL") != std::string::npos &&
+            clientMainSource.find("IxtreemeWorld Engine - Editor") != std::string::npos &&
             clientMainSource.find("Standalone Vulkan Clear - gameClient Overlay") == std::string::npos,
         "editor icon buttons and title", "EDITOR-VISUAL-POLISH must iconize editor controls and rename the window title");
     ctx.Expect(editorImGuiSource.find("ImGui::Button(label)") != std::string::npos &&
@@ -1109,7 +1078,7 @@ bool RunRenderChecks(const Options& options, TestContext& ctx)
     ctx.Expect(sceneManagerSource.find("MarkDirty") != std::string::npos &&
             sceneManagerSource.find("PromptSaveBeforeAction") != std::string::npos &&
             sceneManagerHeaderSource.find("GetRecentScenes") != std::string::npos &&
-            sceneManagerSource.find("AURIGA GLOBAL \\xE2\\x80\\x94 Editor") != std::string::npos &&
+            sceneManagerSource.find("IxtreemeWorld Engine - Editor") != std::string::npos &&
             sceneManagerSource.find("title += \"*\"") != std::string::npos &&
             nativeWindowHeaderSource.find("SetTitle") != std::string::npos &&
             clientMainSource.find("SetWindowTitleCallback") != std::string::npos,
@@ -1161,58 +1130,29 @@ bool RunRenderChecks(const Options& options, TestContext& ctx)
             sceneManagerSource.find("type == \"world\"") != std::string::npos &&
             sceneManagerSource.find("type == \"empty\"") != std::string::npos,
         "scene runtime ui binding", "SCENE-2 must activate RmlUi views from scene_type values");
-    if (cleanup2DefaultRuntime)
-        ctx.Expect(runtimeSessionHeaderSource.find("class RuntimeSession") != std::string::npos &&
-                runtimeSessionHeaderSource.find("Start(const SceneData& openScene)") != std::string::npos &&
-                runtimeSessionHeaderSource.find("Stop()") != std::string::npos &&
-                runtimeSessionSource.find("class EmptyRuntimeSession final") != std::string::npos &&
-                runtimeSessionSource.find("class AurigaRuntimeSession final") == std::string::npos &&
-                runtimeUiAdapterHeaderSource.find("class RuntimeUiAdapter") != std::string::npos &&
-                runtimeUiAdapterSource.find("class NullRuntimeUiAdapter final") != std::string::npos &&
-                runtimeUiAdapterSource.find("class AurigaRuntimeUiAdapter final") == std::string::npos &&
-                clientMainSource.find("CreateRuntimeSession()") != std::string::npos &&
-                clientMainSource.find("CreateRuntimeUiAdapter(rmlUi)") != std::string::npos,
-            "cleanup runtime adapters", "CLEANUP-2 must leave only the default runtime session and null UI adapter active");
-    else
-        ctx.Expect(runtimeSessionHeaderSource.find("class RuntimeSession") != std::string::npos &&
-                runtimeSessionHeaderSource.find("Start(const SceneData& openScene)") != std::string::npos &&
-                runtimeSessionHeaderSource.find("Stop()") != std::string::npos &&
-                runtimeSessionSource.find("class EmptyRuntimeSession final") != std::string::npos &&
-                runtimeSessionSource.find("class AurigaRuntimeSession final") != std::string::npos &&
-                runtimeSessionSource.find("GameClientLayer m_gameClient") != std::string::npos &&
-                runtimeSessionSource.find("std::unique_ptr<client::net::ClientSession>") != std::string::npos &&
-                runtimeUiAdapterHeaderSource.find("class RuntimeUiAdapter") != std::string::npos &&
-                runtimeUiAdapterSource.find("class NullRuntimeUiAdapter final") != std::string::npos &&
-                runtimeUiAdapterSource.find("class AurigaRuntimeUiAdapter final") != std::string::npos &&
-                clientMainSource.find("kActiveRuntimeImplementation = RuntimeImplementation::Auriga") != std::string::npos,
-            "cleanup runtime adapters", "CLEANUP-1 must put runtime session and player UI routing behind default and AURIGA adapters");
-    if (cleanup2DefaultRuntime)
-        ctx.Skip("scene release startup flow", "CLEANUP-2 switches release boot to default runtime with no AURIGA Login.scene fallback");
-    else
-        ctx.Expect(clientMainSource.find("StartupSceneFromConfig") != std::string::npos &&
-                clientMainSource.find("startup_scene") != std::string::npos &&
-                clientMainSource.find("scenes/Login.scene") != std::string::npos &&
-                clientMainSource.find("#else\n    LoadRuntimeScene(assets, StartupSceneFromConfig(assets));") != std::string::npos,
-            "scene release startup flow", "SCENE-2 release builds must load app_config.json startup_scene with Login.scene fallback");
-    if (cleanup2DefaultRuntime)
-        ctx.Expect(clientMainSource.find("runtimeSession->SetMapEditorOpen(true)") != std::string::npos &&
-                clientMainSource.find("[BOOT] editor_open forced = 1") != std::string::npos &&
-                clientMainSource.find("editorImGui.BeginFrame(runtimeSession->IsMapEditorOpen())") != std::string::npos,
-            "editor boot opens imgui", "ENGINE-BOOT-FIX must keep the ImGui editor open on editor-build boot independent of scene_type/RmlUi routing");
-    else
-        ctx.Expect(gameClientLayerHeaderSource.find("SetMapEditorOpen") != std::string::npos &&
-                gameClientLayerSource.find("void GameClientLayer::SetMapEditorOpen(bool open)") != std::string::npos &&
-                clientMainSource.find("runtimeSession->SetMapEditorOpen(true)") != std::string::npos &&
-                clientMainSource.find("[BOOT] editor_open forced = 1") != std::string::npos &&
-                clientMainSource.find("editorImGui.BeginFrame(runtimeSession->IsMapEditorOpen())") != std::string::npos,
-            "editor boot opens imgui", "ENGINE-BOOT-FIX must keep the ImGui editor open on editor-build boot independent of scene_type/RmlUi routing");
-    if (cleanup2DefaultRuntime)
-        ctx.Skip("scene navigation callbacks", "CLEANUP-2 removes active AURIGA login/lobby/world scene-flow routing");
-    else
-        ctx.Expect(runtimeUiAdapterSource.find("scenes/Lobby.scene") != std::string::npos &&
-                runtimeUiAdapterSource.find("scenes/World.scene") != std::string::npos &&
-                runtimeUiAdapterSource.find("LoadRuntimeSceneOrFallback") != std::string::npos,
-            "scene navigation callbacks", "SCENE-2 login/lobby/world transitions must route through scene loads");
+    ctx.Expect(runtimeSessionHeaderSource.find("class RuntimeSession") != std::string::npos &&
+            runtimeSessionHeaderSource.find("Start(const SceneData& openScene)") != std::string::npos &&
+            runtimeSessionHeaderSource.find("Stop()") != std::string::npos &&
+            runtimeSessionSource.find("class EmptyRuntimeSession final") != std::string::npos &&
+            runtimeUiAdapterHeaderSource.find("class RuntimeUiAdapter") != std::string::npos &&
+            runtimeUiAdapterSource.find("class NullRuntimeUiAdapter final") != std::string::npos &&
+            clientMainSource.find("CreateRuntimeSession()") != std::string::npos &&
+            clientMainSource.find("CreateRuntimeUiAdapter(rmlUi)") != std::string::npos,
+        "default runtime adapters", "Clean engine must boot through the default runtime session and null UI adapter");
+    ctx.Expect(clientMainSource.find("StartupSceneFromConfig") != std::string::npos &&
+            clientMainSource.find("startup_scene") != std::string::npos &&
+            clientMainSource.find("scenes/" "Login" ".scene") == std::string::npos &&
+            clientMainSource.find("[BOOT] config missing/empty -> fallback = empty runtime") != std::string::npos &&
+            clientMainSource.find("[SCENE] no scene loaded (empty runtime startup)") != std::string::npos,
+        "release empty startup fallback", "Release/default runtime must no longer fall back to archived game scenes");
+    ctx.Expect(clientMainSource.find("runtimeSession->SetMapEditorOpen(true)") != std::string::npos &&
+            clientMainSource.find("[BOOT] editor_open forced = 1") != std::string::npos &&
+            clientMainSource.find("editorImGui.BeginFrame(runtimeSession->IsMapEditorOpen())") != std::string::npos,
+        "editor boot opens imgui", "Editor boot must keep the ImGui editor open independent of scene type");
+    ctx.Expect(runtimeUiAdapterSource.find("LoadRuntimeSceneOrFallback") == std::string::npos &&
+            runtimeUiAdapterSource.find("Scenes/Lobby.scene") == std::string::npos &&
+            runtimeUiAdapterSource.find("Scenes/World.scene") == std::string::npos,
+        "no built-in scene flow", "Clean engine runtime UI adapter must not hard-code game scene transitions");
     ctx.Expect(rmlUiLayerSource.find("void RmlUiLayer::HideAll") != std::string::npos &&
             rmlUiLayerSource.find("WarnSceneTypeMismatch") != std::string::npos &&
             rmlUiLayerSource.find("ShowLogin\", \"login") != std::string::npos &&
@@ -1229,23 +1169,13 @@ bool RunRenderChecks(const Options& options, TestContext& ctx)
             editorImGuiSource.find("Open a scene to Play") != std::string::npos &&
             editorImGuiSource.find("HasOpenScene()") != std::string::npos,
         "play scene restore", "SCENE-2 Play mode must store/restore the starting scene and disable Play with no open scene");
-    if (cleanup2DefaultRuntime)
-        ctx.Skip("runtime ui play gate", "CLEANUP-2 default runtime has no active player-UI scene-flow routing");
-    else
-        ctx.Expect(clientMainSource.find("editorRuntimeFlowActive") != std::string::npos &&
-                runtimeUiAdapterSource.find("suppressed (Edit mode)") != std::string::npos &&
-                runtimeUiAdapterSource.find("[SCENE-FLOW] suppressed in Edit mode") != std::string::npos &&
-                clientMainSource.find("SceneManager::Instance().ActivateCurrentSceneType()") != std::string::npos &&
-                clientMainSource.find("Runtime UI/scene flow enabled for Play mode") != std::string::npos,
-            "runtime ui play gate", "EDIT-PLAY-2 must keep scene_type RmlUi routing and login/lobby/world flow inactive in Edit mode and enable them only in Play");
-    if (cleanup2DefaultRuntime)
-        ctx.Skip("direct gameplay dev character", "CLEANUP-2 default runtime intentionally has no dev character injection");
-    else
-        ctx.Expect(clientMainSource.find("injectDirectGameplayDevCharacter") != std::string::npos &&
-                clientMainSource.find("playSceneType == \"world\" || playSceneType == \"gameplay\"") != std::string::npos &&
-                clientMainSource.find("!hasOwnRuntimeCharacter()") != std::string::npos &&
-                clientMainSource.find("Direct gameplay scene Play: dev character injected") != std::string::npos,
-            "direct gameplay dev character", "EDIT-PLAY-2 must inject a dev character only when directly playing a gameplay scene without an existing character");
+    ctx.Expect(clientMainSource.find("editorRuntimeFlowActive") == std::string::npos &&
+            clientMainSource.find("Runtime UI/scene flow enabled for Play mode") == std::string::npos,
+        "runtime flow absent in clean engine", "Clean engine default runtime must not enable game-specific UI/scene flow");
+    ctx.Expect(clientMainSource.find("injectDirectGameplayDevCharacter") == std::string::npos &&
+            clientMainSource.find("Dev" "Player") == std::string::npos &&
+            clientMainSource.find("player.level = 50") == std::string::npos,
+        "no dev character injection", "Clean engine Play mode must not inject game-specific dev characters");
     ctx.Expect(sceneManagerHeaderSource.find("RestoreSceneSnapshot") != std::string::npos &&
             sceneManagerSource.find("void SceneManager::RestoreSceneSnapshot") != std::string::npos &&
             clientMainSource.find("playStartSceneSnapshot") != std::string::npos &&
@@ -1305,30 +1235,17 @@ bool RunRenderChecks(const Options& options, TestContext& ctx)
             editorImGuiSource.find("Tools disabled in Play Mode") != std::string::npos &&
             editorImGuiSource.find("Read-only during Play Mode") != std::string::npos,
         "editor play toolbar and hotkeys", "EDIT-PLAY-1 needs Play/Stop/Pause toolbar controls, F5/F6 hotkeys, and disabled edit tools in Play Mode");
-    if (cleanup2DefaultRuntime)
-        ctx.Skip("editor local play mode runtime", "CLEANUP-2 default runtime removes AURIGA local dev-character/HUD runtime path");
-    else
-        ctx.Expect(gameClientLayerHeaderSource.find("EnterLocalPlayMode") != std::string::npos &&
-            gameClientLayerHeaderSource.find("ExitLocalPlayMode") != std::string::npos &&
-            gameClientLayerHeaderSource.find("UpdateLocalPlayPlayer") != std::string::npos &&
-            gameClientLayerSource.find("localSavedStateValid") != std::string::npos &&
-            gameClientLayerSource.find("[EDIT-PLAY] Runtime state cleared") != std::string::npos &&
-            clientMainSource.find("EditorPlayRuntime") != std::string::npos &&
-            clientMainSource.find("DevPlayer") != std::string::npos &&
-            clientMainSource.find("injectDirectGameplayDevCharacter") != std::string::npos &&
-            clientMainSource.find("player.level = 50") != std::string::npos &&
-            clientMainSource.find("player.hpMax = 1000.0f") != std::string::npos &&
-            clientMainSource.find("SceneManager::Instance().ActivateCurrentSceneType()") != std::string::npos &&
+    ctx.Expect(clientMainSource.find("SetFreeCameraEnabled(true)") != std::string::npos &&
+            clientMainSource.find("SetFreeCameraEnabled(false)") != std::string::npos &&
             clientMainSource.find("editorPlay.state.mode == EditorPlayMode::PlayPaused") != std::string::npos &&
             clientMainSource.find("[EDIT-PLAY] Snapshot restored") != std::string::npos,
-        "editor local play mode runtime", "EDIT-PLAY-1/2 needs local play runtime state, controlled dev character spawn, HUD routing, pause, and Stop restore");
+        "editor play baseline runtime", "Clean engine Play mode must keep snapshot restore, pause state, and free-camera control without character runtime");
     ctx.Expect(!std::filesystem::exists(options.clientRoot / "libs" / "render" / ("Noe" "sisLayer.cpp")) &&
             !std::filesystem::exists(options.clientRoot / "libs" / "render" / ("Noe" "sisLayer.h")) &&
             renderCmakeSource.find(legacyUiName) == std::string::npos &&
             rootCmakeSource.find(legacyUiName) == std::string::npos &&
             clientCmakeSource.find(legacyUiName) == std::string::npos &&
             androidGradleSource.find(legacyUiName) == std::string::npos &&
-            gameClientLayerSource.find(legacyUiName) == std::string::npos &&
             rmlUiLayerSource.find(legacyUiName) == std::string::npos &&
             clientMainSource.find(legacyUiName) == std::string::npos &&
             renderCmakeSource.find(legacyMarkupExt) == std::string::npos &&
@@ -1404,259 +1321,6 @@ bool RunRenderChecks(const Options& options, TestContext& ctx)
     return ctx.failed == 0;
 }
 
-#if 0
-class NetworkProbe final : public client::net::IClientHandler
-{
-public:
-    enum class Phase
-    {
-        LoginConnect,
-        LoginAuthenticated,
-        WaitingCharacterList,
-        WaitingToken,
-        GameConnect,
-        EnteringWorld,
-        InWorld,
-        Failed
-    };
-
-    explicit NetworkProbe(const Options& opts)
-        : options(opts)
-    {
-    }
-
-    void Attach(client::net::ClientSession* value)
-    {
-        session = value;
-    }
-
-    bool Done() const
-    {
-        return phase == Phase::InWorld || phase == Phase::Failed;
-    }
-
-    bool Success() const
-    {
-        return phase == Phase::InWorld;
-    }
-
-    std::string FailureReason() const
-    {
-        return failure;
-    }
-
-    void Start()
-    {
-        Log("connect login " + options.loginHost + ":" + std::to_string(options.loginPort));
-        phase = Phase::LoginConnect;
-        session->Connect(options.loginHost, options.loginPort);
-    }
-
-    void OnConnectionFailed(const std::string& reason) override
-    {
-        Fail("connection failed: " + reason);
-    }
-
-    void OnDisconnected() override
-    {
-        if (handoffDisconnectExpected)
-        {
-            handoffDisconnectExpected = false;
-            phase = Phase::GameConnect;
-            Log("connect game " + gameHost + ":" + std::to_string(gamePort));
-            session->Connect(gameHost, gamePort);
-            return;
-        }
-        if (phase == Phase::GameConnect)
-        {
-            Log("ignoring late login disconnect during game handoff");
-            return;
-        }
-        if (phase != Phase::InWorld && phase != Phase::Failed)
-            Fail("unexpected disconnect");
-    }
-
-    void OnHandshakeAccepted() override
-    {
-        if (phase == Phase::LoginConnect)
-        {
-            Log("login handshake accepted");
-            session->SendLogin(options.username, options.password);
-            return;
-        }
-        if (phase == Phase::GameConnect)
-        {
-            Log("game handshake accepted; sending enter-world token");
-            phase = Phase::EnteringWorld;
-            session->SendEnterWorld(token);
-            return;
-        }
-        Fail("handshake accepted in unexpected phase");
-    }
-
-    void OnHandshakeRejected(const std::string& reason) override
-    {
-        Fail("handshake rejected: " + reason);
-    }
-
-    void OnLoginAccepted(std::uint64_t accountId) override
-    {
-        Log("login accepted account_id=" + std::to_string(accountId));
-        phase = Phase::WaitingCharacterList;
-        session->SendCharacterListRequest();
-    }
-
-    void OnLoginRejected(const std::string& reason) override
-    {
-        Fail("login rejected: " + reason);
-    }
-
-    void OnCharacterList(const std::vector<client::net::CharacterListItem>& characters) override
-    {
-        Log("character list count=" + std::to_string(characters.size()));
-        if (characters.empty())
-        {
-            Fail("character list is empty");
-            return;
-        }
-
-        std::uint64_t selected = options.characterId;
-        if (selected == 0)
-            selected = characters.front().id;
-
-        const auto it = std::find_if(characters.begin(), characters.end(),
-            [selected](const client::net::CharacterListItem& item) {
-                return item.id == selected;
-            });
-        if (it == characters.end())
-        {
-            Fail("requested character id not found: " + std::to_string(selected));
-            return;
-        }
-
-        Log("select character id=" + std::to_string(selected) + " name=" + it->name);
-        phase = Phase::WaitingToken;
-        session->SendCharacterSelect(selected);
-    }
-
-    void OnEnterWorldToken(std::vector<std::uint8_t> newToken,
-                           const std::string& host,
-                           std::uint16_t port) override
-    {
-        token = std::move(newToken);
-        gameHost = host.empty() ? "127.0.0.1" : host;
-        gamePort = port;
-        if (token.empty())
-        {
-            Fail("empty handoff token");
-            return;
-        }
-        handoffDisconnectExpected = true;
-        Log("received handoff token bytes=" + std::to_string(token.size()));
-        session->Disconnect();
-    }
-
-    void OnEnterWorldAccepted(std::uint32_t netId, client::net::Vec3 spawnPos) override
-    {
-        phase = Phase::InWorld;
-        Log("enter world accepted net_id=" + std::to_string(netId) +
-            " spawn=(" + std::to_string(spawnPos.x) + ", " +
-            std::to_string(spawnPos.y) + ", " + std::to_string(spawnPos.z) + ")");
-        session->SendMoveInput(0.0f, client::net::MoveState::Walking);
-    }
-
-    void OnEnterWorldRejected(const std::string& reason) override
-    {
-        Fail("enter world rejected: " + reason);
-    }
-
-    void OnEntitySpawn(const client::net::EntitySpawnInfo& entity) override
-    {
-        ++spawns;
-        Log("entity spawn net_id=" + std::to_string(entity.netId) + " name=" + entity.name);
-    }
-
-    void OnEntityDespawn(std::uint32_t) override {}
-    void OnEntityHealthUpdate(const client::net::EntityHealthInfo&) override {}
-    void OnEntityDeath(std::uint32_t, std::uint32_t) override {}
-
-    void OnEntityTransforms(std::uint32_t serverTick,
-                            const std::vector<client::net::EntityTransform>& transforms) override
-    {
-        lastTransformTick = serverTick;
-        transformPackets += 1;
-        transformRecords += static_cast<int>(transforms.size());
-    }
-
-    int SpawnCount() const { return spawns; }
-    int TransformPackets() const { return transformPackets; }
-    int TransformRecords() const { return transformRecords; }
-    std::uint32_t LastTransformTick() const { return lastTransformTick; }
-
-private:
-    void Log(const std::string& message)
-    {
-        std::cout << "[NETTEST] " << message << "\n";
-    }
-
-    void Fail(const std::string& message)
-    {
-        failure = message;
-        phase = Phase::Failed;
-        std::cerr << "[NETTEST] " << message << "\n";
-    }
-
-    const Options& options;
-    client::net::ClientSession* session = nullptr;
-    Phase phase = Phase::LoginConnect;
-    std::string failure;
-    std::vector<std::uint8_t> token;
-    std::string gameHost = "159.195.56.82";
-    std::uint16_t gamePort = 11020;
-    bool handoffDisconnectExpected = false;
-    int spawns = 0;
-    int transformPackets = 0;
-    int transformRecords = 0;
-    std::uint32_t lastTransformTick = 0;
-};
-
-bool RunNetworkTest(const Options& options, TestContext& ctx)
-{
-    NetworkProbe probe(options);
-    client::net::ClientSession session(probe);
-    probe.Attach(&session);
-    probe.Start();
-
-    const auto deadline = Clock::now() + std::chrono::seconds(options.timeoutSeconds);
-    while (!probe.Done() && Clock::now() < deadline)
-    {
-        session.Update();
-        std::this_thread::sleep_for(std::chrono::milliseconds(10));
-    }
-    session.Update();
-
-    if (!probe.Success())
-    {
-        const std::string reason = probe.FailureReason().empty() ? "timed out" : probe.FailureReason();
-        ctx.Fail("network login enter-world", reason);
-        return false;
-    }
-
-    ctx.Pass("network login enter-world");
-    std::cout << "[NETTEST] post-enter stats: spawns=" << probe.SpawnCount()
-              << " transform_packets=" << probe.TransformPackets()
-              << " transform_records=" << probe.TransformRecords()
-              << " last_tick=" << probe.LastTransformTick() << "\n";
-    return true;
-}
-#endif
-
-bool RunNetworkTest(const Options&, TestContext& ctx)
-{
-    ctx.Skip("network login enter-world", "CLEANUP-3 archived AURIGA network/server/protocol");
-    return true;
-}
-
 } // namespace
 
 int main(int argc, char** argv)
@@ -1670,8 +1334,6 @@ int main(int argc, char** argv)
             RunAssetTests(options, ctx);
         if (options.runRender)
             RunRenderChecks(options, ctx);
-        if (options.runNetwork)
-            RunNetworkTest(options, ctx);
 
         std::cout << "[SUMMARY] passed=" << ctx.passed << " failed=" << ctx.failed << "\n";
         return ctx.failed == 0 ? 0 : 1;
