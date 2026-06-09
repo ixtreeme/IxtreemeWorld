@@ -50,9 +50,10 @@ public:
     LightingState GetLightingState() const { return m_lightingState; }
     void SetDynamicLightEditorState(const DynamicLightEditorState& state);
     void SetWaterBodyEditorState(const WaterBodyEditorState& state);
-    void SetHierarchySceneState(std::vector<WaterBody> waterBodies,
-                                std::vector<PointLight> pointLights,
-                                std::vector<SpotLight> spotLights);
+    void SetHierarchySceneState(std::uint64_t sceneRootEntity,
+                                std::string sceneRootName,
+                                std::vector<HierarchySceneEntity> entities);
+    std::uint64_t GetSelectedHierarchyEntity() const { return m_selectedHierarchyEntity; }
     void SetWaterMaterials(std::vector<std::pair<std::string, WaterMaterialData>> materials);
     void SetWaterMaterialUsageCounts(std::vector<std::pair<std::string, std::uint32_t>> usageCounts);
     std::vector<std::pair<std::string, WaterMaterialData>> GetWaterMaterialsSnapshot() const;
@@ -114,27 +115,23 @@ private:
     void RenderSceneSettingsPanel();
     void RenderHierarchyPanel();
     void RenderHierarchyToolbar();
-    void RenderHierarchyWaterBodies();
-    void RenderHierarchyPointLights();
-    void RenderHierarchySpotLights();
-    void RenderHierarchyWaterBodyItem(const WaterBody& body);
-    void RenderHierarchyPointLightItem(const PointLight& light);
-    void RenderHierarchySpotLightItem(const SpotLight& light);
-    void RenderHierarchyEntityRow(HierarchyEntityType type,
-                                  std::uint32_t id,
-                                  const char* icon,
-                                  const std::string& name,
-                                  bool selected,
-                                  bool hidden);
-    void RenderHierarchyContextMenu(HierarchyEntityType type, std::uint32_t id, const std::string& name);
+    void RenderHierarchyEntityNode(std::uint64_t entity);
+    void RenderHierarchyContextMenu(const HierarchySceneEntity& entity);
+    bool HierarchySubtreePassesSearch(std::uint64_t entity) const;
+    const HierarchySceneEntity* FindHierarchyEntity(std::uint64_t entity) const;
+    const HierarchySceneEntity* FindHierarchyEntity(HierarchyEntityType type, std::uint32_t objectId) const;
     bool HierarchyPassesSearch(const std::string& name) const;
-    void QueueHierarchySelection(HierarchyEntityType type, std::uint32_t id);
-    void QueueHierarchyFocus(HierarchyEntityType type, std::uint32_t id);
-    void StartHierarchyRename(HierarchyEntityType type, std::uint32_t id, const std::string& name);
+    void QueueHierarchySelection(const HierarchySceneEntity& entity);
+    void QueueHierarchyFocus(const HierarchySceneEntity& entity);
+    void StartHierarchyRename(const HierarchySceneEntity& entity);
     void RenderToolsPanel();
     void RenderInspector();
     void RenderSelectedWaterBodyInspector();
     void RenderSelectedLightInspector();
+    void RenderAddComponentMenu();
+    bool RenderTransformComponent(float* position, float* rotation, float* scale);
+    bool RenderAxisFloat(const char* axis, float& value, float r, float g, float b, float speed, float minValue, float maxValue);
+    void RenderWorldPanel();
     void RenderLightingPanel();
     void RenderDynamicLightsPanel();
     void RenderGizmoControls();
@@ -242,9 +239,6 @@ private:
     DynamicLightEditorState m_dynamicLightState;
     WaterBodyEditorState m_waterBodyState;
     MapEditorCommands m_commands;
-    std::vector<WaterBody> m_hierarchyWaterBodies;
-    std::vector<PointLight> m_hierarchyPointLights;
-    std::vector<SpotLight> m_hierarchySpotLights;
     std::array<MapEditorPaletteSlot, 8> m_paletteSlots{};
     std::vector<std::pair<std::string, WaterMaterialData>> m_waterMaterials;
     std::unordered_map<std::string, std::uint32_t> m_waterMaterialUsageCounts;
@@ -273,8 +267,11 @@ private:
     char m_assetSearchBuffer[128]{};
     char m_newAssetFolderName[64]{};
     char m_hierarchySearchBuffer[128]{};
-    HierarchyEntityType m_hierarchyRenamingType = HierarchyEntityType::None;
-    std::uint32_t m_hierarchyRenamingId = 0;
+    std::uint64_t m_sceneRootEntity = 0;
+    std::string m_sceneRootName = "Untitled";
+    std::vector<HierarchySceneEntity> m_hierarchyEntities;
+    std::uint64_t m_selectedHierarchyEntity = 0;
+    std::uint64_t m_hierarchyRenamingEntity = 0;
     char m_hierarchyRenameBuffer[128]{};
     bool m_logHierarchyRendered = false;
     std::unordered_map<std::string, AssetPreviewTexture> m_assetPreviewTextures;

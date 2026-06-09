@@ -22,6 +22,8 @@
 #include "Debug.h"
 #include "asset/IAssetReader.h"
 
+#include <flecs.h>
+
 #if defined(_WIN32)
 #include "asset/FileAssetReader.h"
 #endif
@@ -175,7 +177,39 @@ struct SelectedEditorObject
 {
     SelectedEditorObjectType type = SelectedEditorObjectType::None;
     std::uint32_t id = 0;
+    std::uint64_t flecsEntity = 0;
 };
+
+std::uint64_t HierarchyObjectKey(HierarchyEntityType type, std::uint32_t id)
+{
+    return (static_cast<std::uint64_t>(static_cast<std::uint32_t>(type)) << 32u) | id;
+}
+
+SelectedEditorObjectType ToSelectedObjectType(HierarchyEntityType type)
+{
+    switch (type)
+    {
+    case HierarchyEntityType::WaterBody: return SelectedEditorObjectType::WaterBody;
+    case HierarchyEntityType::PointLight: return SelectedEditorObjectType::PointLight;
+    case HierarchyEntityType::SpotLight: return SelectedEditorObjectType::SpotLight;
+    default: return SelectedEditorObjectType::None;
+    }
+}
+
+std::string EditorDisplayName(const WaterBody& body)
+{
+    return body.name.empty() ? "Water Body " + std::to_string(body.id) : body.name;
+}
+
+std::string EditorDisplayName(const PointLight& light)
+{
+    return light.name.empty() ? "Point Light " + std::to_string(light.id) : light.name;
+}
+
+std::string EditorDisplayName(const SpotLight& light)
+{
+    return light.name.empty() ? "Spot Light " + std::to_string(light.id) : light.name;
+}
 
 WorldVec3 CameraForward(const WorldCamera& camera)
 {
@@ -919,6 +953,11 @@ void MergeMapEditorCommands(MapEditorCommands& target, const MapEditorCommands& 
     target.pausePlayMode = target.pausePlayMode || source.pausePlayMode;
     target.resumePlayMode = target.resumePlayMode || source.resumePlayMode;
     target.addWaterBody = target.addWaterBody || source.addWaterBody;
+    if (source.addComponentToSelectedEntity)
+    {
+        target.addComponentToSelectedEntity = true;
+        target.addComponentType = source.addComponentType;
+    }
     target.deleteSelectedWaterBody = target.deleteSelectedWaterBody || source.deleteSelectedWaterBody;
     target.openSelectedWaterMaterialEditor =
         target.openSelectedWaterMaterialEditor || source.openSelectedWaterMaterialEditor;
@@ -1184,6 +1223,38 @@ int RunGame(NativeWindow& window,
     for (const WaterBody& body : editorWaterBodies)
         nextEditorWaterBodyId = std::max(nextEditorWaterBodyId, body.id + 1u);
     SelectedEditorObject selectedEditorObject;
+    std::unique_ptr<ecs_world_t, void(*)(ecs_world_t*)> editorHierarchyWorld(ecs_init(), [](ecs_world_t* world) {
+        if (world)
+            ecs_fini(world);
+    });
+    ecs_entity_t editorSceneRootEntity = ecs_new(editorHierarchyWorld.get());
+    ecs_set_name(editorHierarchyWorld.get(), editorSceneRootEntity, "Untitled");
+    std::unordered_map<std::uint64_t, ecs_entity_t> editorHierarchyEntities;
+    auto resetEditorHierarchyEntities = [&]() {
+        for (const auto& [_, entity] : editorHierarchyEntities)
+            ecs_delete(editorHierarchyWorld.get(), entity);
+        editorHierarchyEntities.clear();
+        selectedEditorObject.flecsEntity = 0;
+    };
+    auto sceneEntityNameExists = [&](const std::string& name) {
+        auto matches = [&](const auto& entity) {
+            return entity.name == name;
+        };
+        return std::any_of(editorWaterBodies.begin(), editorWaterBodies.end(), matches) ||
+            std::any_of(editorPointLights.begin(), editorPointLights.end(), matches) ||
+            std::any_of(editorSpotLights.begin(), editorSpotLights.end(), matches);
+    };
+    auto makeUniqueSceneEntityName = [&](const std::string& base) {
+        if (!sceneEntityNameExists(base))
+            return base;
+        for (std::uint32_t suffix = 2; suffix < 10000; ++suffix)
+        {
+            const std::string candidate = base + " " + std::to_string(suffix);
+            if (!sceneEntityNameExists(candidate))
+                return candidate;
+        }
+        return base + " " + std::to_string(nextEditorLightId + nextEditorWaterBodyId);
+    };
     EditorGizmoMode editorGizmoMode = EditorGizmoMode::Translate;
     bool editorGizmoSnapEnabled = false;
     float editorGizmoSnapValue = 1.0f;
@@ -1205,6 +1276,7 @@ int RunGame(NativeWindow& window,
         editorPointLights = scene.pointLights;
         editorSpotLights = scene.spotLights;
         selectedEditorObject = {};
+        resetEditorHierarchyEntities();
         nextEditorWaterBodyId = 1;
         for (const WaterBody& body : editorWaterBodies)
             nextEditorWaterBodyId = std::max(nextEditorWaterBodyId, body.id + 1u);
@@ -1230,6 +1302,82 @@ int RunGame(NativeWindow& window,
             editorWaterBodies.size(),
             editorPointLights.size(),
             editorSpotLights.size());
+    };
+    auto buildHierarchyEntities = [&]() {
+        std::vector<HierarchySceneEntity> entities;
+        std::vector<std::uint64_t> liveKeys;
+        selectedEditorObject.flecsEntity = 0;
+
+        const SceneData& scene = SceneManager::Instance().GetCurrentScene();
+        const std::filesystem::path scenePath(SceneManager::Instance().GetCurrentScenePath());
+        std::string sceneName = scenePath.stem().empty() ? scene.name : scenePath.stem().string();
+        if (sceneName.empty())
+            sceneName = "Untitled";
+        ecs_set_name(editorHierarchyWorld.get(), editorSceneRootEntity, sceneName.c_str());
+
+        auto ensureEntity = [&](HierarchyEntityType type,
+                                std::uint32_t objectId,
+                                const std::string& displayName,
+                                bool editorHidden) {
+            const std::uint64_t key = HierarchyObjectKey(type, objectId);
+            liveKeys.push_back(key);
+            ecs_entity_t entity = 0;
+            auto it = editorHierarchyEntities.find(key);
+            if (it == editorHierarchyEntities.end())
+            {
+                entity = ecs_new(editorHierarchyWorld.get());
+                ecs_add_pair(editorHierarchyWorld.get(), entity, EcsChildOf, editorSceneRootEntity);
+                editorHierarchyEntities[key] = entity;
+                Tracenf("[HIERARCHY] Created flecs scene entity: flecs=%llu object=%u type=%d",
+                    static_cast<unsigned long long>(entity),
+                    objectId,
+                    static_cast<int>(type));
+            }
+            else
+            {
+                entity = it->second;
+            }
+
+            ecs_set_name(editorHierarchyWorld.get(), entity, displayName.c_str());
+            ecs_add_pair(editorHierarchyWorld.get(), entity, EcsChildOf, editorSceneRootEntity);
+
+            const bool selected =
+                selectedEditorObject.type == ToSelectedObjectType(type) &&
+                selectedEditorObject.id == objectId;
+            if (selected)
+                selectedEditorObject.flecsEntity = static_cast<std::uint64_t>(entity);
+
+            entities.push_back(HierarchySceneEntity{
+                static_cast<std::uint64_t>(entity),
+                static_cast<std::uint64_t>(editorSceneRootEntity),
+                type,
+                objectId,
+                displayName,
+                editorHidden,
+                selected});
+        };
+
+        for (const WaterBody& body : editorWaterBodies)
+            ensureEntity(HierarchyEntityType::WaterBody, body.id, EditorDisplayName(body), body.editorHidden);
+        for (const PointLight& light : editorPointLights)
+            ensureEntity(HierarchyEntityType::PointLight, light.id, EditorDisplayName(light), light.editorHidden);
+        for (const SpotLight& light : editorSpotLights)
+            ensureEntity(HierarchyEntityType::SpotLight, light.id, EditorDisplayName(light), light.editorHidden);
+
+        for (auto it = editorHierarchyEntities.begin(); it != editorHierarchyEntities.end();)
+        {
+            if (std::find(liveKeys.begin(), liveKeys.end(), it->first) == liveKeys.end())
+            {
+                ecs_delete(editorHierarchyWorld.get(), it->second);
+                it = editorHierarchyEntities.erase(it);
+            }
+            else
+            {
+                ++it;
+            }
+        }
+
+        return std::pair<std::string, std::vector<HierarchySceneEntity>>(sceneName, std::move(entities));
     };
     {
         SceneManager& scenes = SceneManager::Instance();
@@ -1937,25 +2085,26 @@ int RunGame(NativeWindow& window,
                     fallback.y = terrain.SampleHeight(fallback);
                     return fallback;
                 };
-                auto selectHierarchyEntity = [&](HierarchyEntityType type, std::uint32_t id) {
+                auto selectHierarchyEntity = [&](HierarchyEntityType type, std::uint32_t id, std::uint64_t flecsEntity = 0) {
                     switch (type)
                     {
                     case HierarchyEntityType::WaterBody:
-                        selectedEditorObject = {SelectedEditorObjectType::WaterBody, id};
+                        selectedEditorObject = {SelectedEditorObjectType::WaterBody, id, flecsEntity};
                         runtimeSession->SetEditorStatus("Selected water body #" + std::to_string(id));
                         break;
                     case HierarchyEntityType::PointLight:
-                        selectedEditorObject = {SelectedEditorObjectType::PointLight, id};
+                        selectedEditorObject = {SelectedEditorObjectType::PointLight, id, flecsEntity};
                         runtimeSession->SetEditorStatus("Selected point light #" + std::to_string(id));
                         break;
                     case HierarchyEntityType::SpotLight:
-                        selectedEditorObject = {SelectedEditorObjectType::SpotLight, id};
+                        selectedEditorObject = {SelectedEditorObjectType::SpotLight, id, flecsEntity};
                         runtimeSession->SetEditorStatus("Selected spot light #" + std::to_string(id));
                         break;
                     default:
                         break;
                     }
-                    Tracenf("[HIERARCHY] Selected entity: id=%u type=%d", id, static_cast<int>(type));
+                    Tracenf("[HIERARCHY] Selected entity: flecs=%llu id=%u type=%d",
+                        static_cast<unsigned long long>(flecsEntity), id, static_cast<int>(type));
                 };
                 auto focusHierarchyEntity = [&](HierarchyEntityType type, std::uint32_t id) {
                     std::optional<WorldVec3> target;
@@ -2022,7 +2171,7 @@ int RunGame(NativeWindow& window,
                             return;
                         WaterBody copy = *it;
                         copy.id = nextEditorWaterBodyId++;
-                        copy.name = (copy.name.empty() ? "Water Body" : copy.name) + " (Copy)";
+                        copy.name = makeUniqueSceneEntityName((copy.name.empty() ? "Water Body" : copy.name) + " Copy");
                         copy.bboxMin[0] += 5.0f;
                         copy.bboxMax[0] += 5.0f;
                         copy.editorHidden = false;
@@ -2042,7 +2191,7 @@ int RunGame(NativeWindow& window,
                             return;
                         PointLight copy = *it;
                         copy.id = nextEditorLightId++;
-                        copy.name = (copy.name.empty() ? "Point Light" : copy.name) + " (Copy)";
+                        copy.name = makeUniqueSceneEntityName((copy.name.empty() ? "Point Light" : copy.name) + " Copy");
                         copy.position[0] += 5.0f;
                         copy.editorHidden = false;
                         editorPointLights.push_back(copy);
@@ -2060,7 +2209,7 @@ int RunGame(NativeWindow& window,
                             return;
                         SpotLight copy = *it;
                         copy.id = nextEditorLightId++;
-                        copy.name = (copy.name.empty() ? "Spot Light" : copy.name) + " (Copy)";
+                        copy.name = makeUniqueSceneEntityName((copy.name.empty() ? "Spot Light" : copy.name) + " Copy");
                         copy.position[0] += 5.0f;
                         copy.editorHidden = false;
                         editorSpotLights.push_back(copy);
@@ -2224,6 +2373,8 @@ int RunGame(NativeWindow& window,
                     if (editorPlay.state.mode == EditorPlayMode::Play)
                         runtimeSession->Tick(deltaSeconds);
                     commands.addWaterBody = false;
+                    commands.addComponentToSelectedEntity = false;
+                    commands.addComponentType = EditorComponentType::None;
                     commands.addPointLight = false;
                     commands.addSpotLight = false;
                     commands.deleteSelectedLight = false;
@@ -2241,7 +2392,7 @@ int RunGame(NativeWindow& window,
                 }
 #endif
                 if (commands.hierarchySelectEntity)
-                    selectHierarchyEntity(commands.hierarchyEntityType, commands.hierarchyEntityId);
+                    selectHierarchyEntity(commands.hierarchyEntityType, commands.hierarchyEntityId, commands.hierarchyEntityHandle);
                 if (commands.hierarchyFocusEntity)
                     focusHierarchyEntity(commands.hierarchyEntityType, commands.hierarchyEntityId);
                 if (commands.hierarchyDeleteEntity)
@@ -2252,12 +2403,105 @@ int RunGame(NativeWindow& window,
                     renameHierarchyEntity(commands.hierarchyEntityType, commands.hierarchyEntityId, commands.hierarchyRenameValue);
                 if (commands.hierarchyToggleHidden)
                     toggleHierarchyHidden(commands.hierarchyEntityType, commands.hierarchyEntityId);
+                auto selectedEntityPosition = [&]() {
+                    if (selectedEditorObject.type == SelectedEditorObjectType::WaterBody)
+                    {
+                        auto it = std::find_if(editorWaterBodies.begin(), editorWaterBodies.end(),
+                            [&](const WaterBody& body) { return body.id == selectedEditorObject.id; });
+                        if (it != editorWaterBodies.end())
+                            return WaterBodyCenter(*it);
+                    }
+                    else if (selectedEditorObject.type == SelectedEditorObjectType::PointLight)
+                    {
+                        auto it = std::find_if(editorPointLights.begin(), editorPointLights.end(),
+                            [&](const PointLight& light) { return light.id == selectedEditorObject.id; });
+                        if (it != editorPointLights.end())
+                            return WorldVec3{it->position[0], it->position[1], it->position[2]};
+                    }
+                    else if (selectedEditorObject.type == SelectedEditorObjectType::SpotLight)
+                    {
+                        auto it = std::find_if(editorSpotLights.begin(), editorSpotLights.end(),
+                            [&](const SpotLight& light) { return light.id == selectedEditorObject.id; });
+                        if (it != editorSpotLights.end())
+                            return WorldVec3{it->position[0], it->position[1], it->position[2]};
+                    }
+                    return spawnAtCameraCenter();
+                };
+                if (commands.addComponentToSelectedEntity)
+                {
+                    const WorldVec3 spawn = selectedEntityPosition();
+                    if (commands.addComponentType == EditorComponentType::WaterBody &&
+                        selectedEditorObject.type != SelectedEditorObjectType::WaterBody)
+                    {
+                        WaterBody body{};
+                        body.id = nextEditorWaterBodyId++;
+                        body.name = makeUniqueSceneEntityName("Water Body");
+                        body.materialId = "watermat_Default_Water";
+                        body.waterLevelY = spawn.y;
+                        body.bboxMin[0] = spawn.x - 5.0f;
+                        body.bboxMax[0] = spawn.x + 5.0f;
+                        body.bboxMin[1] = spawn.z - 5.0f;
+                        body.bboxMax[1] = spawn.z + 5.0f;
+                        RegenerateCircularWaterMask(body);
+                        editorWaterBodies.push_back(body);
+                        selectedEditorObject = {SelectedEditorObjectType::WaterBody, body.id};
+                        editorGizmoMode = EditorGizmoMode::Translate;
+                        editorWaterBodiesDirty = true;
+                        SceneManager::Instance().MarkDirty();
+                        runtimeSession->SetEditorStatus("Added Water Body component");
+                    }
+                    else if (commands.addComponentType == EditorComponentType::PointLight &&
+                        selectedEditorObject.type != SelectedEditorObjectType::PointLight)
+                    {
+                        if (editorPointLights.size() >= kMaxDynamicPointLights)
+                        {
+                            runtimeSession->SetEditorStatus("Maximum point lights reached (16)");
+                        }
+                        else
+                        {
+                            PointLight light{};
+                            light.id = nextEditorLightId++;
+                            light.name = makeUniqueSceneEntityName("Point Light");
+                            light.position[0] = spawn.x;
+                            light.position[1] = spawn.y + 1.8f;
+                            light.position[2] = spawn.z;
+                            editorPointLights.push_back(light);
+                            selectedEditorObject = {SelectedEditorObjectType::PointLight, light.id};
+                            editorGizmoMode = EditorGizmoMode::Translate;
+                            SceneManager::Instance().MarkDirty();
+                            runtimeSession->SetEditorStatus("Added Point Light component");
+                        }
+                    }
+                    else if (commands.addComponentType == EditorComponentType::SpotLight &&
+                        selectedEditorObject.type != SelectedEditorObjectType::SpotLight)
+                    {
+                        if (editorSpotLights.size() >= kMaxDynamicSpotLights)
+                        {
+                            runtimeSession->SetEditorStatus("Maximum spot lights reached (16)");
+                        }
+                        else
+                        {
+                            SpotLight light{};
+                            light.id = nextEditorLightId++;
+                            light.name = makeUniqueSceneEntityName("Spot Light");
+                            light.position[0] = spawn.x;
+                            light.position[1] = spawn.y + 4.0f;
+                            light.position[2] = spawn.z;
+                            light.rotation[0] = -1.5708f;
+                            editorSpotLights.push_back(light);
+                            selectedEditorObject = {SelectedEditorObjectType::SpotLight, light.id};
+                            editorGizmoMode = EditorGizmoMode::Translate;
+                            SceneManager::Instance().MarkDirty();
+                            runtimeSession->SetEditorStatus("Added Spot Light component");
+                        }
+                    }
+                }
                 if (commands.addWaterBody)
                 {
                     const WorldVec3 spawn = spawnAtCameraCenter();
                     WaterBody body{};
                     body.id = nextEditorWaterBodyId++;
-                    body.name = "Water_" + std::to_string(body.id);
+                    body.name = makeUniqueSceneEntityName("Water Body");
                     body.materialId = "watermat_Default_Water";
                     body.waterLevelY = spawn.y;
                     body.bboxMin[0] = spawn.x - 5.0f;
@@ -2285,7 +2529,7 @@ int RunGame(NativeWindow& window,
                     {
                         PointLight light{};
                         light.id = nextEditorLightId++;
-                        light.name = "Point Light " + std::to_string(light.id);
+                        light.name = makeUniqueSceneEntityName("Point Light");
                         const WorldVec3 spawn = spawnAtCameraCenter();
                         light.position[0] = spawn.x;
                         light.position[1] = spawn.y + 1.8f;
@@ -2309,7 +2553,7 @@ int RunGame(NativeWindow& window,
                     {
                         SpotLight light{};
                         light.id = nextEditorLightId++;
-                        light.name = "Spot Light " + std::to_string(light.id);
+                        light.name = makeUniqueSceneEntityName("Spot Light");
                         const WorldVec3 spawn = spawnAtCameraCenter();
                         light.position[0] = spawn.x;
                         light.position[1] = spawn.y + 4.0f;
@@ -2454,7 +2698,11 @@ int RunGame(NativeWindow& window,
                     selectedEditorObject.type == SelectedEditorObjectType::WaterBody ? selectedEditorObject.id : 0u);
                 runtimeSession->SetWaterBodyEditorState(waterBodyState);
                 editorImGui.SetWaterBodyEditorState(waterBodyState);
-                editorImGui.SetHierarchySceneState(editorWaterBodies, editorPointLights, editorSpotLights);
+                auto hierarchyState = buildHierarchyEntities();
+                editorImGui.SetHierarchySceneState(
+                    static_cast<std::uint64_t>(editorSceneRootEntity),
+                    std::move(hierarchyState.first),
+                    std::move(hierarchyState.second));
 
                 LightingState lightingState = editorImGui.GetLightingState();
                 const bool editorHideEntities = editorPlay.state.mode == EditorPlayMode::Edit;

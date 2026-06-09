@@ -538,13 +538,22 @@ void EditorImGui::SetWaterBodyEditorState(const WaterBodyEditorState& state)
     m_waterBodyState = state;
 }
 
-void EditorImGui::SetHierarchySceneState(std::vector<WaterBody> waterBodies,
-                                         std::vector<PointLight> pointLights,
-                                         std::vector<SpotLight> spotLights)
+void EditorImGui::SetHierarchySceneState(std::uint64_t sceneRootEntity,
+                                         std::string sceneRootName,
+                                         std::vector<HierarchySceneEntity> entities)
 {
-    m_hierarchyWaterBodies = std::move(waterBodies);
-    m_hierarchyPointLights = std::move(pointLights);
-    m_hierarchySpotLights = std::move(spotLights);
+    m_sceneRootEntity = sceneRootEntity;
+    m_sceneRootName = sceneRootName.empty() ? "Untitled" : std::move(sceneRootName);
+    m_hierarchyEntities = std::move(entities);
+    m_selectedHierarchyEntity = 0;
+    for (const HierarchySceneEntity& entity : m_hierarchyEntities)
+    {
+        if (entity.selected)
+        {
+            m_selectedHierarchyEntity = entity.entity;
+            break;
+        }
+    }
 }
 
 void EditorImGui::SetWaterMaterials(std::vector<std::pair<std::string, WaterMaterialData>> materials)
@@ -1728,6 +1737,7 @@ void EditorImGui::RenderDockSpace()
         ImGui::DockBuilderDockWindow("Tools", leftId);
         ImGui::DockBuilderDockWindow("Inspector", rightId);
         ImGui::DockBuilderDockWindow("Scene Settings", rightId);
+        ImGui::DockBuilderDockWindow(ICON_FA_GLOBE " World", rightId);
         ImGui::DockBuilderDockWindow("Asset Browser", bottomId);
         ImGui::DockBuilderDockWindow("Scene View", mainId);
         ImGui::DockBuilderFinish(dockspaceId);
@@ -2154,21 +2164,39 @@ void EditorImGui::HandleEditorHotkeys()
     if (!io.KeyCtrl && !io.KeyShift && ImGui::IsKeyPressed(ImGuiKey_F, false))
     {
         if (m_waterBodyState.selected)
-            QueueHierarchyFocus(HierarchyEntityType::WaterBody, m_waterBodyState.id);
+        {
+            if (const HierarchySceneEntity* entity = FindHierarchyEntity(HierarchyEntityType::WaterBody, m_waterBodyState.id))
+                QueueHierarchyFocus(*entity);
+        }
         else if (m_dynamicLightState.type == DynamicLightType::Point)
-            QueueHierarchyFocus(HierarchyEntityType::PointLight, m_dynamicLightState.id);
+        {
+            if (const HierarchySceneEntity* entity = FindHierarchyEntity(HierarchyEntityType::PointLight, m_dynamicLightState.id))
+                QueueHierarchyFocus(*entity);
+        }
         else if (m_dynamicLightState.type == DynamicLightType::Spot)
-            QueueHierarchyFocus(HierarchyEntityType::SpotLight, m_dynamicLightState.id);
+        {
+            if (const HierarchySceneEntity* entity = FindHierarchyEntity(HierarchyEntityType::SpotLight, m_dynamicLightState.id))
+                QueueHierarchyFocus(*entity);
+        }
     }
 
     if (!io.KeyCtrl && !io.KeyShift && ImGui::IsKeyPressed(ImGuiKey_F2, false))
     {
         if (m_waterBodyState.selected)
-            StartHierarchyRename(HierarchyEntityType::WaterBody, m_waterBodyState.id, m_waterBodyState.name);
+        {
+            if (const HierarchySceneEntity* entity = FindHierarchyEntity(HierarchyEntityType::WaterBody, m_waterBodyState.id))
+                StartHierarchyRename(*entity);
+        }
         else if (m_dynamicLightState.type == DynamicLightType::Point)
-            StartHierarchyRename(HierarchyEntityType::PointLight, m_dynamicLightState.id, PointLightDisplayName(m_dynamicLightState.point));
+        {
+            if (const HierarchySceneEntity* entity = FindHierarchyEntity(HierarchyEntityType::PointLight, m_dynamicLightState.id))
+                StartHierarchyRename(*entity);
+        }
         else if (m_dynamicLightState.type == DynamicLightType::Spot)
-            StartHierarchyRename(HierarchyEntityType::SpotLight, m_dynamicLightState.id, SpotLightDisplayName(m_dynamicLightState.spot));
+        {
+            if (const HierarchySceneEntity* entity = FindHierarchyEntity(HierarchyEntityType::SpotLight, m_dynamicLightState.id))
+                StartHierarchyRename(*entity);
+        }
     }
 
     if (!io.KeyCtrl && !io.KeyShift && ImGui::IsKeyPressed(ImGuiKey_Delete, false))
@@ -2178,18 +2206,24 @@ void EditorImGui::HandleEditorHotkeys()
             m_commands.hierarchyDeleteEntity = true;
             m_commands.hierarchyEntityType = HierarchyEntityType::WaterBody;
             m_commands.hierarchyEntityId = m_waterBodyState.id;
+            if (const HierarchySceneEntity* entity = FindHierarchyEntity(HierarchyEntityType::WaterBody, m_waterBodyState.id))
+                m_commands.hierarchyEntityHandle = entity->entity;
         }
         else if (m_dynamicLightState.type == DynamicLightType::Point)
         {
             m_commands.hierarchyDeleteEntity = true;
             m_commands.hierarchyEntityType = HierarchyEntityType::PointLight;
             m_commands.hierarchyEntityId = m_dynamicLightState.id;
+            if (const HierarchySceneEntity* entity = FindHierarchyEntity(HierarchyEntityType::PointLight, m_dynamicLightState.id))
+                m_commands.hierarchyEntityHandle = entity->entity;
         }
         else if (m_dynamicLightState.type == DynamicLightType::Spot)
         {
             m_commands.hierarchyDeleteEntity = true;
             m_commands.hierarchyEntityType = HierarchyEntityType::SpotLight;
             m_commands.hierarchyEntityId = m_dynamicLightState.id;
+            if (const HierarchySceneEntity* entity = FindHierarchyEntity(HierarchyEntityType::SpotLight, m_dynamicLightState.id))
+                m_commands.hierarchyEntityHandle = entity->entity;
         }
     }
 
@@ -2285,6 +2319,11 @@ void EditorImGui::RenderEditorToolbar()
             ImGui::SameLine();
             ImGui::TextDisabled("(%.1fs, frame %d)", m_playModeState.elapsedSeconds, m_playModeState.frameCount);
         }
+
+        ImGui::SameLine();
+        ImGui::Dummy(ImVec2(24.0f, 0.0f));
+        ImGui::SameLine();
+        RenderGizmoControls();
     }
     ImGui::End();
 }
@@ -2349,27 +2388,68 @@ bool EditorImGui::HierarchyPassesSearch(const std::string& name) const
     return ContainsCaseInsensitive(name, m_hierarchySearchBuffer);
 }
 
-void EditorImGui::QueueHierarchySelection(HierarchyEntityType type, std::uint32_t id)
+const HierarchySceneEntity* EditorImGui::FindHierarchyEntity(std::uint64_t entity) const
+{
+    auto it = std::find_if(m_hierarchyEntities.begin(), m_hierarchyEntities.end(),
+        [entity](const HierarchySceneEntity& candidate) {
+            return candidate.entity == entity;
+        });
+    return it == m_hierarchyEntities.end() ? nullptr : &*it;
+}
+
+const HierarchySceneEntity* EditorImGui::FindHierarchyEntity(HierarchyEntityType type, std::uint32_t objectId) const
+{
+    auto it = std::find_if(m_hierarchyEntities.begin(), m_hierarchyEntities.end(),
+        [type, objectId](const HierarchySceneEntity& candidate) {
+            return candidate.type == type && candidate.objectId == objectId;
+        });
+    return it == m_hierarchyEntities.end() ? nullptr : &*it;
+}
+
+bool EditorImGui::HierarchySubtreePassesSearch(std::uint64_t entity) const
+{
+    const HierarchySceneEntity* node = FindHierarchyEntity(entity);
+    if (!node)
+        return false;
+    if (HierarchyPassesSearch(node->name))
+        return true;
+    for (const HierarchySceneEntity& child : m_hierarchyEntities)
+    {
+        if (child.parent == entity && HierarchySubtreePassesSearch(child.entity))
+            return true;
+    }
+    return false;
+}
+
+void EditorImGui::QueueHierarchySelection(const HierarchySceneEntity& entity)
 {
     m_commands.hierarchySelectEntity = true;
-    m_commands.hierarchyEntityType = type;
-    m_commands.hierarchyEntityId = id;
-    Tracenf("[HIERARCHY] Selected entity: id=%u type=%d", id, static_cast<int>(type));
+    m_commands.hierarchyEntityType = entity.type;
+    m_commands.hierarchyEntityId = entity.objectId;
+    m_commands.hierarchyEntityHandle = entity.entity;
+    m_selectedHierarchyEntity = entity.entity;
+    Tracenf("[HIERARCHY] Selected entity: flecs=%llu object=%u type=%d",
+        static_cast<unsigned long long>(entity.entity),
+        entity.objectId,
+        static_cast<int>(entity.type));
 }
 
-void EditorImGui::QueueHierarchyFocus(HierarchyEntityType type, std::uint32_t id)
+void EditorImGui::QueueHierarchyFocus(const HierarchySceneEntity& entity)
 {
     m_commands.hierarchyFocusEntity = true;
-    m_commands.hierarchyEntityType = type;
-    m_commands.hierarchyEntityId = id;
-    Tracenf("[HIERARCHY] Focus requested: id=%u type=%d", id, static_cast<int>(type));
+    m_commands.hierarchyEntityType = entity.type;
+    m_commands.hierarchyEntityId = entity.objectId;
+    m_commands.hierarchyEntityHandle = entity.entity;
+    Tracenf("[HIERARCHY] Focus requested: flecs=%llu object=%u type=%d",
+        static_cast<unsigned long long>(entity.entity),
+        entity.objectId,
+        static_cast<int>(entity.type));
 }
 
-void EditorImGui::StartHierarchyRename(HierarchyEntityType type, std::uint32_t id, const std::string& name)
+void EditorImGui::StartHierarchyRename(const HierarchySceneEntity& entity)
 {
-    m_hierarchyRenamingType = type;
-    m_hierarchyRenamingId = id;
-    std::snprintf(m_hierarchyRenameBuffer, sizeof(m_hierarchyRenameBuffer), "%s", name.c_str());
+    m_hierarchyRenamingEntity = entity.entity;
+    std::snprintf(m_hierarchyRenameBuffer, sizeof(m_hierarchyRenameBuffer), "%s", entity.name.c_str());
 }
 
 void EditorImGui::RenderHierarchyToolbar()
@@ -2394,59 +2474,84 @@ void EditorImGui::RenderHierarchyToolbar()
     }
 }
 
-void EditorImGui::RenderHierarchyContextMenu(HierarchyEntityType type, std::uint32_t id, const std::string& name)
+void EditorImGui::RenderHierarchyContextMenu(const HierarchySceneEntity& entity)
 {
-    ImGui::TextUnformatted(name.c_str());
+    ImGui::TextUnformatted(entity.name.c_str());
     ImGui::Separator();
 
     if (ImGui::MenuItem(ICON_FA_BULLSEYE " Focus Camera", "F"))
-        QueueHierarchyFocus(type, id);
+        QueueHierarchyFocus(entity);
     if (ImGui::MenuItem(ICON_FA_COPY " Duplicate"))
     {
         m_commands.hierarchyDuplicateEntity = true;
-        m_commands.hierarchyEntityType = type;
-        m_commands.hierarchyEntityId = id;
-        Tracenf("[HIERARCHY] Duplicate requested: id=%u type=%d", id, static_cast<int>(type));
+        m_commands.hierarchyEntityType = entity.type;
+        m_commands.hierarchyEntityId = entity.objectId;
+        m_commands.hierarchyEntityHandle = entity.entity;
+        Tracenf("[HIERARCHY] Duplicate requested: flecs=%llu object=%u type=%d",
+            static_cast<unsigned long long>(entity.entity),
+            entity.objectId,
+            static_cast<int>(entity.type));
     }
     if (ImGui::MenuItem(ICON_FA_PEN " Rename", "F2"))
-        StartHierarchyRename(type, id, name);
+        StartHierarchyRename(entity);
 
     ImGui::Separator();
     ImGui::PushStyleColor(ImGuiCol_Text, ImVec4(0.95f, 0.30f, 0.30f, 1.0f));
     if (ImGui::MenuItem(ICON_FA_TRASH " Delete", "Del"))
     {
         m_commands.hierarchyDeleteEntity = true;
-        m_commands.hierarchyEntityType = type;
-        m_commands.hierarchyEntityId = id;
-        Tracenf("[HIERARCHY] Delete requested: id=%u type=%d", id, static_cast<int>(type));
+        m_commands.hierarchyEntityType = entity.type;
+        m_commands.hierarchyEntityId = entity.objectId;
+        m_commands.hierarchyEntityHandle = entity.entity;
+        Tracenf("[HIERARCHY] Delete requested: flecs=%llu object=%u type=%d",
+            static_cast<unsigned long long>(entity.entity),
+            entity.objectId,
+            static_cast<int>(entity.type));
     }
     ImGui::PopStyleColor();
 }
 
-void EditorImGui::RenderHierarchyEntityRow(HierarchyEntityType type,
-                                           std::uint32_t id,
-                                           const char* icon,
-                                           const std::string& name,
-                                           bool selected,
-                                           bool hidden)
+void EditorImGui::RenderHierarchyEntityNode(std::uint64_t entityHandle)
 {
-    ImGui::PushID(static_cast<int>(id));
+    const HierarchySceneEntity* entity = FindHierarchyEntity(entityHandle);
+    if (!entity)
+        return;
+    if (m_hierarchySearchBuffer[0] != '\0' && !HierarchySubtreePassesSearch(entityHandle))
+        return;
 
-    const ImVec4 eyeColor = hidden ? ImVec4(0.48f, 0.48f, 0.48f, 1.0f) : ImVec4(0.88f, 0.88f, 0.88f, 1.0f);
-    ImGui::PushStyleColor(ImGuiCol_Text, eyeColor);
-    if (ImGui::SmallButton(hidden ? ICON_FA_EYE_SLASH : ICON_FA_EYE))
+    std::vector<std::uint64_t> children;
+    for (const HierarchySceneEntity& candidate : m_hierarchyEntities)
     {
-        m_commands.hierarchyToggleHidden = true;
-        m_commands.hierarchyEntityType = type;
-        m_commands.hierarchyEntityId = id;
-        Tracenf("[HIERARCHY] Toggle visibility requested: id=%u type=%d", id, static_cast<int>(type));
+        if (candidate.parent == entityHandle)
+            children.push_back(candidate.entity);
     }
-    ImGui::PopStyleColor();
 
-    ImGui::SameLine();
+    ImGui::TableNextRow();
+    ImGui::TableSetColumnIndex(0);
+    ImGui::PushID(static_cast<int>(entity->entity & 0xffffffffu));
 
-    if (m_hierarchyRenamingType == type && m_hierarchyRenamingId == id)
+    if (entity->editorHidden)
+        ImGui::PushStyleColor(ImGuiCol_Text, ImVec4(0.60f, 0.60f, 0.60f, 1.0f));
+
+    const bool selected = entity->selected || m_selectedHierarchyEntity == entity->entity;
+    ImGuiTreeNodeFlags flags = ImGuiTreeNodeFlags_OpenOnArrow | ImGuiTreeNodeFlags_SpanFullWidth;
+    if (children.empty())
+        flags |= ImGuiTreeNodeFlags_Leaf | ImGuiTreeNodeFlags_NoTreePushOnOpen;
+    if (selected)
+        flags |= ImGuiTreeNodeFlags_Selected;
+
+    const char* icon = ICON_FA_CUBE;
+    if (entity->type == HierarchyEntityType::WaterBody)
+        icon = ICON_FA_DROPLET;
+    else if (entity->type == HierarchyEntityType::PointLight)
+        icon = ICON_FA_LIGHTBULB;
+    else if (entity->type == HierarchyEntityType::SpotLight)
+        icon = ICON_FA_BULLSEYE;
+
+    bool open = false;
+    if (m_hierarchyRenamingEntity == entity->entity)
     {
+        ImGui::Indent(ImGui::GetTreeNodeToLabelSpacing());
         ImGui::SetNextItemWidth(-1.0f);
         ImGui::SetKeyboardFocusHere();
         if (ImGui::InputText("##rename",
@@ -2455,135 +2560,65 @@ void EditorImGui::RenderHierarchyEntityRow(HierarchyEntityType type,
                 ImGuiInputTextFlags_EnterReturnsTrue | ImGuiInputTextFlags_AutoSelectAll))
         {
             m_commands.hierarchyRenameEntity = true;
-            m_commands.hierarchyEntityType = type;
-            m_commands.hierarchyEntityId = id;
+            m_commands.hierarchyEntityType = entity->type;
+            m_commands.hierarchyEntityId = entity->objectId;
+            m_commands.hierarchyEntityHandle = entity->entity;
             m_commands.hierarchyRenameValue = m_hierarchyRenameBuffer;
-            m_hierarchyRenamingType = HierarchyEntityType::None;
-            m_hierarchyRenamingId = 0;
-            Tracenf("[HIERARCHY] Rename requested: id=%u new_name=%s", id, m_hierarchyRenameBuffer);
+            m_hierarchyRenamingEntity = 0;
+            Tracenf("[HIERARCHY] Rename requested: flecs=%llu new_name=%s",
+                static_cast<unsigned long long>(entity->entity),
+                m_hierarchyRenameBuffer);
         }
         if (ImGui::IsKeyPressed(ImGuiKey_Escape))
-        {
-            m_hierarchyRenamingType = HierarchyEntityType::None;
-            m_hierarchyRenamingId = 0;
-        }
+            m_hierarchyRenamingEntity = 0;
+        ImGui::Unindent(ImGui::GetTreeNodeToLabelSpacing());
     }
     else
     {
-        if (hidden)
-            ImGui::PushStyleColor(ImGuiCol_Text, ImVec4(0.60f, 0.60f, 0.60f, 1.0f));
-
-        const std::string label = std::string(icon) + " " + name;
-        if (ImGui::Selectable(label.c_str(), selected, ImGuiSelectableFlags_AllowDoubleClick))
+        const std::string label = std::string(icon) + " " + entity->name + "##" + std::to_string(entity->entity);
+        open = ImGui::TreeNodeEx(label.c_str(), flags);
+        if (ImGui::IsItemClicked() && !ImGui::IsItemToggledOpen())
         {
-            QueueHierarchySelection(type, id);
+            QueueHierarchySelection(*entity);
             if (ImGui::IsMouseDoubleClicked(ImGuiMouseButton_Left))
-                QueueHierarchyFocus(type, id);
+                QueueHierarchyFocus(*entity);
         }
         if (selected)
             ImGui::SetScrollHereY(0.5f);
-
-        if (hidden)
-            ImGui::PopStyleColor();
     }
+
+    if (entity->editorHidden)
+        ImGui::PopStyleColor();
 
     if (ImGui::BeginPopupContextItem("##hierarchy_context"))
     {
-        RenderHierarchyContextMenu(type, id, name);
+        RenderHierarchyContextMenu(*entity);
         ImGui::EndPopup();
     }
 
+    ImGui::TableSetColumnIndex(1);
+    const ImVec4 eyeColor = entity->editorHidden ? ImVec4(0.48f, 0.48f, 0.48f, 1.0f) : ImVec4(0.88f, 0.88f, 0.88f, 1.0f);
+    ImGui::PushStyleColor(ImGuiCol_Text, eyeColor);
+    if (ImGui::SmallButton(entity->editorHidden ? ICON_FA_EYE_SLASH : ICON_FA_EYE))
+    {
+        m_commands.hierarchyToggleHidden = true;
+        m_commands.hierarchyEntityType = entity->type;
+        m_commands.hierarchyEntityId = entity->objectId;
+        m_commands.hierarchyEntityHandle = entity->entity;
+        Tracenf("[HIERARCHY] Toggle visibility requested: flecs=%llu object=%u type=%d",
+            static_cast<unsigned long long>(entity->entity),
+            entity->objectId,
+            static_cast<int>(entity->type));
+    }
+    ImGui::PopStyleColor();
+
+    if (!children.empty() && open)
+    {
+        for (std::uint64_t child : children)
+            RenderHierarchyEntityNode(child);
+        ImGui::TreePop();
+    }
     ImGui::PopID();
-}
-
-void EditorImGui::RenderHierarchyWaterBodyItem(const WaterBody& body)
-{
-    RenderHierarchyEntityRow(HierarchyEntityType::WaterBody,
-        body.id,
-        ICON_FA_DROPLET,
-        WaterBodyDisplayName(body),
-        m_waterBodyState.selected && m_waterBodyState.id == body.id,
-        body.editorHidden);
-}
-
-void EditorImGui::RenderHierarchyPointLightItem(const PointLight& light)
-{
-    RenderHierarchyEntityRow(HierarchyEntityType::PointLight,
-        light.id,
-        ICON_FA_LIGHTBULB,
-        PointLightDisplayName(light),
-        m_dynamicLightState.type == DynamicLightType::Point && m_dynamicLightState.id == light.id,
-        light.editorHidden);
-}
-
-void EditorImGui::RenderHierarchySpotLightItem(const SpotLight& light)
-{
-    RenderHierarchyEntityRow(HierarchyEntityType::SpotLight,
-        light.id,
-        ICON_FA_BULLSEYE,
-        SpotLightDisplayName(light),
-        m_dynamicLightState.type == DynamicLightType::Spot && m_dynamicLightState.id == light.id,
-        light.editorHidden);
-}
-
-void EditorImGui::RenderHierarchyWaterBodies()
-{
-    std::vector<const WaterBody*> visible;
-    for (const WaterBody& body : m_hierarchyWaterBodies)
-    {
-        if (HierarchyPassesSearch(WaterBodyDisplayName(body)))
-            visible.push_back(&body);
-    }
-    if (visible.empty() && m_hierarchySearchBuffer[0] != '\0')
-        return;
-
-    const std::string label = std::string(ICON_FA_DROPLET) + " Water Bodies (" + std::to_string(visible.size()) + ")";
-    if (ImGui::TreeNodeEx(label.c_str(), ImGuiTreeNodeFlags_DefaultOpen | ImGuiTreeNodeFlags_OpenOnArrow))
-    {
-        for (const WaterBody* body : visible)
-            RenderHierarchyWaterBodyItem(*body);
-        ImGui::TreePop();
-    }
-}
-
-void EditorImGui::RenderHierarchyPointLights()
-{
-    std::vector<const PointLight*> visible;
-    for (const PointLight& light : m_hierarchyPointLights)
-    {
-        if (HierarchyPassesSearch(PointLightDisplayName(light)))
-            visible.push_back(&light);
-    }
-    if (visible.empty() && m_hierarchySearchBuffer[0] != '\0')
-        return;
-
-    const std::string label = std::string(ICON_FA_LIGHTBULB) + " Point Lights (" + std::to_string(visible.size()) + ")";
-    if (ImGui::TreeNodeEx(label.c_str(), ImGuiTreeNodeFlags_DefaultOpen | ImGuiTreeNodeFlags_OpenOnArrow))
-    {
-        for (const PointLight* light : visible)
-            RenderHierarchyPointLightItem(*light);
-        ImGui::TreePop();
-    }
-}
-
-void EditorImGui::RenderHierarchySpotLights()
-{
-    std::vector<const SpotLight*> visible;
-    for (const SpotLight& light : m_hierarchySpotLights)
-    {
-        if (HierarchyPassesSearch(SpotLightDisplayName(light)))
-            visible.push_back(&light);
-    }
-    if (visible.empty() && m_hierarchySearchBuffer[0] != '\0')
-        return;
-
-    const std::string label = std::string(ICON_FA_BULLSEYE) + " Spot Lights (" + std::to_string(visible.size()) + ")";
-    if (ImGui::TreeNodeEx(label.c_str(), ImGuiTreeNodeFlags_DefaultOpen | ImGuiTreeNodeFlags_OpenOnArrow))
-    {
-        for (const SpotLight* light : visible)
-            RenderHierarchySpotLightItem(*light);
-        ImGui::TreePop();
-    }
 }
 
 void EditorImGui::RenderHierarchyPanel()
@@ -2598,30 +2633,42 @@ void EditorImGui::RenderHierarchyPanel()
             ImGui::TextDisabled("No scene open");
             ImGui::TextWrapped("Open a scene or create a new one from File.");
         }
-        else
+        else if (ImGui::BeginTable("HierarchyEntityTree", 2,
+            ImGuiTableFlags_Resizable | ImGuiTableFlags_RowBg | ImGuiTableFlags_BordersInnerV | ImGuiTableFlags_SizingStretchProp))
         {
-            const std::filesystem::path scenePath(SceneManager::Instance().GetCurrentScenePath());
-            const std::string sceneName = scenePath.stem().empty() ? SceneManager::Instance().GetCurrentScene().name : scenePath.stem().string();
-            const std::string rootLabel = std::string(ICON_FA_GLOBE) + " " + sceneName;
-            if (ImGui::TreeNodeEx(rootLabel.c_str(), ImGuiTreeNodeFlags_DefaultOpen | ImGuiTreeNodeFlags_Framed))
+            ImGui::TableSetupColumn("Label", ImGuiTableColumnFlags_WidthStretch);
+            ImGui::TableSetupColumn("Visibility", ImGuiTableColumnFlags_WidthFixed, 84.0f);
+            ImGui::TableHeadersRow();
+
+            ImGui::TableNextRow();
+            ImGui::TableSetColumnIndex(0);
+            const std::string rootLabel = std::string(ICON_FA_GLOBE) + " " + m_sceneRootName;
+            const bool rootOpen = ImGui::TreeNodeEx(rootLabel.c_str(),
+                ImGuiTreeNodeFlags_DefaultOpen | ImGuiTreeNodeFlags_OpenOnArrow | ImGuiTreeNodeFlags_SpanFullWidth);
+            ImGui::TableSetColumnIndex(1);
+            ImGui::TextDisabled("-");
+            if (rootOpen)
             {
-                RenderHierarchyWaterBodies();
-                RenderHierarchyPointLights();
-                RenderHierarchySpotLights();
+                for (const HierarchySceneEntity& entity : m_hierarchyEntities)
+                {
+                    if (entity.parent == m_sceneRootEntity || entity.parent == 0)
+                        RenderHierarchyEntityNode(entity.entity);
+                }
                 ImGui::TreePop();
             }
+            ImGui::EndTable();
 
             if (!m_logHierarchyRendered)
             {
                 m_logHierarchyRendered = true;
-                Tracenf("[HIERARCHY] Panel rendered, %zu entities visible",
-                    m_hierarchyWaterBodies.size() + m_hierarchyPointLights.size() + m_hierarchySpotLights.size());
+                Tracenf("[HIERARCHY] Entity tree rendered, root=%llu entities=%zu",
+                    static_cast<unsigned long long>(m_sceneRootEntity),
+                    m_hierarchyEntities.size());
             }
         }
     }
     ImGui::End();
 }
-
 void EditorImGui::RenderToolsPanel()
 {
     if (ImGui::Begin("Tools"))
@@ -2690,13 +2737,118 @@ void EditorImGui::MarkSelectedLightChanged()
     m_commands.selectedLight = m_dynamicLightState;
 }
 
+bool EditorImGui::RenderAxisFloat(const char* axis,
+                                  float& value,
+                                  float r,
+                                  float g,
+                                  float b,
+                                  float speed,
+                                  float minValue,
+                                  float maxValue)
+{
+    ImGui::PushID(axis);
+    ImGui::TextColored(ImVec4(r, g, b, 1.0f), "%s", axis);
+    ImGui::SameLine();
+    ImGui::SetNextItemWidth(-1.0f);
+    const bool changed = ImGui::DragFloat("##value", &value, speed, minValue, maxValue, "%.2f");
+    ImGui::PopID();
+    return changed;
+}
+
+bool EditorImGui::RenderTransformComponent(float* position, float* rotation, float* scale)
+{
+    bool changed = false;
+    if (ImGui::CollapsingHeader(ICON_FA_CUBE " Transform", ImGuiTreeNodeFlags_DefaultOpen))
+    {
+        ImGui::TextDisabled("Position");
+        changed |= RenderAxisFloat("X", position[0], 0.86f, 0.25f, 0.25f, 0.1f, -500.0f, 500.0f);
+        changed |= RenderAxisFloat("Y", position[1], 0.30f, 0.78f, 0.34f, 0.1f, -100.0f, 200.0f);
+        changed |= RenderAxisFloat("Z", position[2], 0.28f, 0.45f, 0.92f, 0.1f, -500.0f, 500.0f);
+
+        if (rotation)
+        {
+            ImGui::Spacing();
+            ImGui::TextDisabled("Rotation");
+            changed |= RenderAxisFloat("Pitch", rotation[0], 0.86f, 0.25f, 0.25f, 0.5f, -90.0f, 90.0f);
+            changed |= RenderAxisFloat("Yaw", rotation[1], 0.30f, 0.78f, 0.34f, 0.5f, -180.0f, 180.0f);
+            changed |= RenderAxisFloat("Roll", rotation[2], 0.28f, 0.45f, 0.92f, 0.5f, -180.0f, 180.0f);
+        }
+
+        if (scale)
+        {
+            ImGui::Spacing();
+            ImGui::TextDisabled("Scale");
+            changed |= RenderAxisFloat("W", scale[0], 0.86f, 0.25f, 0.25f, 0.1f, 0.1f, 200.0f);
+            changed |= RenderAxisFloat("H", scale[1], 0.30f, 0.78f, 0.34f, 0.1f, 0.1f, 200.0f);
+            changed |= RenderAxisFloat("D", scale[2], 0.28f, 0.45f, 0.92f, 0.1f, 0.1f, 200.0f);
+        }
+    }
+    return changed;
+}
+
+void EditorImGui::RenderAddComponentMenu()
+{
+    const bool hasWater = m_waterBodyState.selected;
+    const bool hasPoint = m_dynamicLightState.type == DynamicLightType::Point;
+    const bool hasSpot = m_dynamicLightState.type == DynamicLightType::Spot;
+    const bool hasSelection = hasWater || hasPoint || hasSpot;
+
+    if (!hasSelection)
+    {
+        ImGui::BeginDisabled();
+        UI::IconButton(ICON_FA_PLUS, "Add Component", ImVec2(-1.0f, 0.0f));
+        ImGui::EndDisabled();
+        return;
+    }
+
+    if (UI::IconButton(ICON_FA_PLUS, "Add Component", ImVec2(-1.0f, 0.0f)))
+        ImGui::OpenPopup("AddComponentPopup");
+
+    if (ImGui::BeginPopup("AddComponentPopup"))
+    {
+        if (hasWater)
+            ImGui::BeginDisabled();
+        if (ImGui::MenuItem(ICON_FA_DROPLET " Water Body"))
+        {
+            m_commands.addComponentToSelectedEntity = true;
+            m_commands.addComponentType = EditorComponentType::WaterBody;
+        }
+        if (hasWater)
+            ImGui::EndDisabled();
+
+        if (hasPoint)
+            ImGui::BeginDisabled();
+        if (ImGui::MenuItem(ICON_FA_LIGHTBULB " Point Light"))
+        {
+            m_commands.addComponentToSelectedEntity = true;
+            m_commands.addComponentType = EditorComponentType::PointLight;
+        }
+        if (hasPoint)
+            ImGui::EndDisabled();
+
+        if (hasSpot)
+            ImGui::BeginDisabled();
+        if (ImGui::MenuItem(ICON_FA_BULLSEYE " Spot Light"))
+        {
+            m_commands.addComponentToSelectedEntity = true;
+            m_commands.addComponentType = EditorComponentType::SpotLight;
+        }
+        if (hasSpot)
+            ImGui::EndDisabled();
+
+        ImGui::EndPopup();
+    }
+}
+
 void EditorImGui::RenderSelectedWaterBodyInspector()
 {
     if (!m_waterBodyState.selected)
         return;
 
-    UI::SectionHeader(ICON_FA_WATER " Water Body");
-    ImGui::TextDisabled("#%u", m_waterBodyState.id);
+    UI::SectionHeader(ICON_FA_CUBE " Entity");
+    ImGui::TextDisabled("flecs=%llu  object=%u",
+        static_cast<unsigned long long>(m_selectedHierarchyEntity),
+        m_waterBodyState.id);
 
     char nameBuffer[96]{};
     std::snprintf(nameBuffer, sizeof(nameBuffer), "%s", m_waterBodyState.name.c_str());
@@ -2706,16 +2858,23 @@ void EditorImGui::RenderSelectedWaterBodyInspector()
         MarkSelectedWaterBodyChanged();
     }
 
-    bool changed = false;
-    changed |= ImGui::SliderFloat("X", &m_waterBodyState.center[0], -500.0f, 500.0f, "%.1f");
-    changed |= ImGui::SliderFloat("Water Level Y", &m_waterBodyState.config.waterLevelY, -50.0f, 100.0f, "%.2f m");
-    changed |= ImGui::SliderFloat("Z", &m_waterBodyState.center[2], -500.0f, 500.0f, "%.1f");
-    changed |= ImGui::SliderFloat("Bbox Width", &m_waterBodyState.width, 1.0f, 200.0f, "%.1f m");
-    changed |= ImGui::SliderFloat("Bbox Depth", &m_waterBodyState.depth, 1.0f, 200.0f, "%.1f m");
-    if (changed)
-        MarkSelectedWaterBodyChanged();
+    RenderAddComponentMenu();
 
-    ImGui::Separator();
+    float position[3] = {m_waterBodyState.center[0], m_waterBodyState.config.waterLevelY, m_waterBodyState.center[2]};
+    float scale[3] = {m_waterBodyState.width, 1.0f, m_waterBodyState.depth};
+    if (RenderTransformComponent(position, nullptr, scale))
+    {
+        m_waterBodyState.center[0] = position[0];
+        m_waterBodyState.config.waterLevelY = position[1];
+        m_waterBodyState.center[1] = position[1];
+        m_waterBodyState.center[2] = position[2];
+        m_waterBodyState.width = scale[0];
+        m_waterBodyState.depth = scale[2];
+        MarkSelectedWaterBodyChanged();
+    }
+
+    if (!ImGui::CollapsingHeader(ICON_FA_WATER " Water Body", ImGuiTreeNodeFlags_DefaultOpen))
+        return;
     const std::string materialLabel = m_waterBodyState.materialName.empty()
         ? (m_waterBodyState.materialId.empty() ? std::string("Inline Water") : m_waterBodyState.materialId)
         : m_waterBodyState.materialName;
@@ -2778,17 +2937,38 @@ void EditorImGui::RenderSelectedLightInspector()
 
     const bool isPoint = m_dynamicLightState.type == DynamicLightType::Point;
     const bool isSpot = m_dynamicLightState.type == DynamicLightType::Spot;
-    UI::SectionHeader(ICON_FA_LIGHTBULB " Light");
-    ImGui::TextDisabled("%s #%u", isPoint ? "Point" : "Spot", m_dynamicLightState.id);
+    UI::SectionHeader(ICON_FA_CUBE " Entity");
+    ImGui::TextDisabled("flecs=%llu  object=%u",
+        static_cast<unsigned long long>(m_selectedHierarchyEntity),
+        m_dynamicLightState.id);
 
     if (isPoint)
     {
         PointLight& point = m_dynamicLightState.point;
+        char nameBuffer[96]{};
+        std::snprintf(nameBuffer, sizeof(nameBuffer), "%s", PointLightDisplayName(point).c_str());
+        if (ImGui::InputText("Name", nameBuffer, sizeof(nameBuffer)))
+        {
+            point.name = nameBuffer;
+            MarkSelectedLightChanged();
+        }
+        RenderAddComponentMenu();
+
+        float position[3] = {point.position[0], point.position[1], point.position[2]};
+        float scale[3] = {point.radius, point.radius, point.radius};
+        if (RenderTransformComponent(position, nullptr, scale))
+        {
+            point.position[0] = position[0];
+            point.position[1] = position[1];
+            point.position[2] = position[2];
+            point.radius = std::clamp(scale[0], 0.5f, 100.0f);
+            MarkSelectedLightChanged();
+        }
+
+        if (!ImGui::CollapsingHeader(ICON_FA_LIGHTBULB " Point Light", ImGuiTreeNodeFlags_DefaultOpen))
+            return;
         bool changed = false;
         changed |= ImGui::Checkbox("Enabled", &point.enabled);
-        changed |= ImGui::SliderFloat("X", &point.position[0], -500.0f, 500.0f, "%.1f");
-        changed |= ImGui::SliderFloat("Y", &point.position[1], -50.0f, 100.0f, "%.1f");
-        changed |= ImGui::SliderFloat("Z", &point.position[2], -500.0f, 500.0f, "%.1f");
         changed |= ImGui::ColorEdit3("Color", &point.r);
         changed |= ImGui::SliderFloat("Intensity", &point.intensity, 0.0f, 10.0f, "%.2f");
         changed |= ImGui::SliderFloat("Radius", &point.radius, 0.5f, 100.0f, "%.1f m");
@@ -2798,11 +2978,34 @@ void EditorImGui::RenderSelectedLightInspector()
     else if (isSpot)
     {
         SpotLight& spot = m_dynamicLightState.spot;
+        char nameBuffer[96]{};
+        std::snprintf(nameBuffer, sizeof(nameBuffer), "%s", SpotLightDisplayName(spot).c_str());
+        if (ImGui::InputText("Name", nameBuffer, sizeof(nameBuffer)))
+        {
+            spot.name = nameBuffer;
+            MarkSelectedLightChanged();
+        }
+        RenderAddComponentMenu();
+
+        float position[3] = {spot.position[0], spot.position[1], spot.position[2]};
+        float rotation[3] = {spot.rotation[0] * 57.2957795f, spot.rotation[1] * 57.2957795f, spot.rotation[2] * 57.2957795f};
+        float scale[3] = {spot.radius, spot.radius, spot.radius};
+        if (RenderTransformComponent(position, rotation, scale))
+        {
+            spot.position[0] = position[0];
+            spot.position[1] = position[1];
+            spot.position[2] = position[2];
+            spot.rotation[0] = rotation[0] / 57.2957795f;
+            spot.rotation[1] = rotation[1] / 57.2957795f;
+            spot.rotation[2] = rotation[2] / 57.2957795f;
+            spot.radius = std::clamp(scale[0], 0.5f, 100.0f);
+            MarkSelectedLightChanged();
+        }
+
+        if (!ImGui::CollapsingHeader(ICON_FA_BULLSEYE " Spot Light", ImGuiTreeNodeFlags_DefaultOpen))
+            return;
         bool changed = false;
         changed |= ImGui::Checkbox("Enabled", &spot.enabled);
-        changed |= ImGui::SliderFloat("X", &spot.position[0], -500.0f, 500.0f, "%.1f");
-        changed |= ImGui::SliderFloat("Y", &spot.position[1], -50.0f, 100.0f, "%.1f");
-        changed |= ImGui::SliderFloat("Z", &spot.position[2], -500.0f, 500.0f, "%.1f");
         changed |= ImGui::ColorEdit3("Color", &spot.r);
         changed |= ImGui::SliderFloat("Intensity", &spot.intensity, 0.0f, 10.0f, "%.2f");
         changed |= ImGui::SliderFloat("Radius", &spot.radius, 0.5f, 100.0f, "%.1f m");
@@ -2900,40 +3103,18 @@ void EditorImGui::RenderDynamicLightsPanel()
         m_commands.addSpotLight = true;
         Tracen("[EDITOR-IMGUI-2] Light spawn: type=spot id=pending");
     }
+}
 
-    ImGui::Separator();
-    for (uint32_t i = 0; i < m_lightingState.numPointLights; ++i)
+void EditorImGui::RenderWorldPanel()
+{
+    if (ImGui::Begin(ICON_FA_GLOBE " World"))
     {
-        PointLight point = m_lightingState.pointLights[i];
-        ImGui::PushID(static_cast<int>(point.id));
-        char label[64];
-        std::snprintf(label, sizeof(label), "Light #%u (Point)", point.id);
-        const bool selected = m_dynamicLightState.type == DynamicLightType::Point && m_dynamicLightState.id == point.id;
-        if (ImGui::Selectable(label, selected))
-        {
-            m_dynamicLightState.type = DynamicLightType::Point;
-            m_dynamicLightState.id = point.id;
-            m_dynamicLightState.point = point;
-            MarkSelectedLightChanged();
-        }
-        ImGui::PopID();
+        if (ImGui::CollapsingHeader("Environment", ImGuiTreeNodeFlags_DefaultOpen))
+            RenderLightingPanel();
+        if (ImGui::CollapsingHeader("Dynamic Lights", ImGuiTreeNodeFlags_DefaultOpen))
+            RenderDynamicLightsPanel();
     }
-    for (uint32_t i = 0; i < m_lightingState.numSpotLights; ++i)
-    {
-        SpotLight spot = m_lightingState.spotLights[i];
-        ImGui::PushID(static_cast<int>(spot.id));
-        char label[64];
-        std::snprintf(label, sizeof(label), "Light #%u (Spot)", spot.id);
-        const bool selected = m_dynamicLightState.type == DynamicLightType::Spot && m_dynamicLightState.id == spot.id;
-        if (ImGui::Selectable(label, selected))
-        {
-            m_dynamicLightState.type = DynamicLightType::Spot;
-            m_dynamicLightState.id = spot.id;
-            m_dynamicLightState.spot = spot;
-            MarkSelectedLightChanged();
-        }
-        ImGui::PopID();
-    }
+    ImGui::End();
 }
 
 void EditorImGui::RenderWaterSculptToolPanel()
@@ -3547,9 +3728,6 @@ void EditorImGui::RenderAssetBrowser()
 
 void EditorImGui::RenderGizmoControls()
 {
-    ImGui::Separator();
-    ImGui::TextUnformatted("Gizmo");
-
     auto publish = [this]() {
         m_commands.gizmoSettingsChanged = true;
         m_commands.gizmoOperation = m_gizmoOperation;
@@ -3557,30 +3735,37 @@ void EditorImGui::RenderGizmoControls()
         m_commands.gizmoSnapValue = m_gizmoSnapValue;
     };
 
-    if (ImGui::RadioButton("Translate (W)", m_gizmoOperation == MapEditorGizmoOperation::Translate))
-    {
-        m_gizmoOperation = MapEditorGizmoOperation::Translate;
-        publish();
-        Tracen("[EDITOR-GIZMO] Gizmo operation changed: translate");
-    }
-    if (ImGui::RadioButton("Rotate (E)", m_gizmoOperation == MapEditorGizmoOperation::Rotate))
-    {
-        m_gizmoOperation = MapEditorGizmoOperation::Rotate;
-        publish();
-        Tracen("[EDITOR-GIZMO] Gizmo operation changed: rotate");
-    }
-    if (ImGui::RadioButton("Scale (R)", m_gizmoOperation == MapEditorGizmoOperation::Scale))
-    {
-        m_gizmoOperation = MapEditorGizmoOperation::Scale;
-        publish();
-        Tracen("[EDITOR-GIZMO] Gizmo operation changed: scale");
-    }
+    ImGui::TextUnformatted("Gizmo");
+    ImGui::SameLine();
 
-    bool snapChanged = ImGui::Checkbox("Snapping", &m_gizmoSnapEnabled);
+    auto operationButton = [&](const char* label, const char* tooltip, MapEditorGizmoOperation operation, const char* trace) {
+        const bool active = m_gizmoOperation == operation;
+        if (active)
+            ImGui::PushStyleColor(ImGuiCol_Button, ImVec4(0.22f, 0.48f, 0.86f, 1.0f));
+        if (ImGui::SmallButton(label))
+        {
+            m_gizmoOperation = operation;
+            publish();
+            Tracen(trace);
+        }
+        if (active)
+            ImGui::PopStyleColor();
+        if (ImGui::IsItemHovered())
+            ImGui::SetTooltip("%s", tooltip);
+        ImGui::SameLine();
+    };
+
+    operationButton("W", "Translate", MapEditorGizmoOperation::Translate, "[EDITOR-GIZMO] Gizmo operation changed: translate");
+    operationButton("E", "Rotate", MapEditorGizmoOperation::Rotate, "[EDITOR-GIZMO] Gizmo operation changed: rotate");
+    operationButton("R", "Scale", MapEditorGizmoOperation::Scale, "[EDITOR-GIZMO] Gizmo operation changed: scale");
+
+    bool snapChanged = ImGui::Checkbox("Snap", &m_gizmoSnapEnabled);
     if (m_gizmoSnapEnabled)
     {
+        ImGui::SameLine();
         const char* labels[] = {"0.1", "0.5", "1.0", "5.0"};
-        snapChanged = ImGui::Combo("Snap", &m_gizmoSnapIndex, labels, IM_ARRAYSIZE(labels)) || snapChanged;
+        ImGui::SetNextItemWidth(72.0f);
+        snapChanged = ImGui::Combo("##GizmoSnap", &m_gizmoSnapIndex, labels, IM_ARRAYSIZE(labels)) || snapChanged;
         constexpr float values[] = {0.1f, 0.5f, 1.0f, 5.0f};
         m_gizmoSnapIndex = std::clamp(m_gizmoSnapIndex, 0, 3);
         m_gizmoSnapValue = values[m_gizmoSnapIndex];
@@ -4005,15 +4190,8 @@ void EditorImGui::RenderInspector()
         else
         {
             ImGui::TextUnformatted("Nothing selected");
-            ImGui::TextWrapped("Click a water body or light in the 3D viewport, or select a light from Dynamic Lights.");
+            ImGui::TextWrapped("Select an entity in the Hierarchy or 3D viewport to edit its components.");
         }
-
-        ImGui::Separator();
-        if (ImGui::CollapsingHeader("Lighting", ImGuiTreeNodeFlags_DefaultOpen))
-            RenderLightingPanel();
-        if (ImGui::CollapsingHeader("Dynamic Lights", ImGuiTreeNodeFlags_DefaultOpen))
-            RenderDynamicLightsPanel();
-        RenderGizmoControls();
     }
     ImGui::End();
 
@@ -4038,6 +4216,7 @@ void EditorImGui::RenderEditorPanels()
     RenderEditorToolbar();
     RenderHierarchyPanel();
     RenderSceneSettingsPanel();
+    RenderWorldPanel();
     RenderToolsPanel();
     RenderAssetBrowser();
     RenderInspector();
@@ -4230,7 +4409,7 @@ void EditorImGui::SetWaterBodyEditorState(const WaterBodyEditorState&)
 {
 }
 
-void EditorImGui::SetHierarchySceneState(std::vector<WaterBody>, std::vector<PointLight>, std::vector<SpotLight>)
+void EditorImGui::SetHierarchySceneState(std::uint64_t, std::string, std::vector<HierarchySceneEntity>)
 {
 }
 

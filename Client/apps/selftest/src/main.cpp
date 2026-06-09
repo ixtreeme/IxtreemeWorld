@@ -521,6 +521,26 @@ bool RunAssetTests(const Options& options, TestContext& ctx)
     scenes.NewScene();
     scenes.SetSceneName("Baseline");
     scenes.SetSceneType("empty");
+    SceneData baselineScene = scenes.GetCurrentScene();
+    WaterBody renamedWater{};
+    renamedWater.id = 101;
+    renamedWater.name = "Renamed Water";
+    renamedWater.bboxMin[0] = -2.0f;
+    renamedWater.bboxMin[1] = -2.0f;
+    renamedWater.bboxMax[0] = 2.0f;
+    renamedWater.bboxMax[1] = 2.0f;
+    renamedWater.maskWidth = 1;
+    renamedWater.maskHeight = 1;
+    renamedWater.shapeMask = {255};
+    baselineScene.waterBodies.push_back(renamedWater);
+    PointLight keyLight{};
+    keyLight.id = 202;
+    keyLight.name = "Key Light";
+    keyLight.position[0] = 1.0f;
+    keyLight.position[1] = 2.0f;
+    keyLight.position[2] = 3.0f;
+    baselineScene.pointLights.push_back(keyLight);
+    scenes.SetCurrentSceneSnapshot(baselineScene);
     const std::filesystem::path scenePath = projects.ScenesPath() / "Baseline.scene";
     if (!ctx.Expect(scenes.SaveSceneAs(scenePath.string()),
             "scene save project-relative", "SaveSceneAs failed"))
@@ -534,6 +554,11 @@ bool RunAssetTests(const Options& options, TestContext& ctx)
             scenes.GetCurrentSceneType() == "empty" &&
             !scenes.IsDirty(),
         "scene data round-trip", "scene name/type/open/dirty state did not round-trip");
+    ctx.Expect(scenes.GetCurrentScene().waterBodies.size() == 1 &&
+            scenes.GetCurrentScene().waterBodies[0].name == "Renamed Water" &&
+            scenes.GetCurrentScene().pointLights.size() == 1 &&
+            scenes.GetCurrentScene().pointLights[0].name == "Key Light",
+        "scene entity round-trip", "renamed water/light scene entities did not survive save/load");
 
     RunMapDataBaselineTest(ctx);
 
@@ -1182,50 +1207,94 @@ bool RunRenderChecks(const Options& options, TestContext& ctx)
             clientMainSource.find("playStartSceneDirty") != std::string::npos,
         "play snapshot restore", "EDIT-PLAY-2 Stop must restore the editor scene snapshot, including unsaved scenes, after Play");
     ctx.Expect(editorImGuiSource.find("RenderHierarchyPanel") != std::string::npos &&
-            editorImGuiSource.find("Hierarchy") != std::string::npos &&
-            editorImGuiSource.find("RenderHierarchyWaterBodies") != std::string::npos &&
-            editorImGuiSource.find("RenderHierarchyPointLights") != std::string::npos &&
-            editorImGuiSource.find("RenderHierarchySpotLights") != std::string::npos &&
+            editorImGuiSource.find("BeginTable(\"HierarchyEntityTree\"") != std::string::npos &&
+            editorImGuiSource.find("TableSetupColumn(\"Label\"") != std::string::npos &&
+            editorImGuiSource.find("TableSetupColumn(\"Visibility\"") != std::string::npos &&
+            editorImGuiSource.find("RenderHierarchyEntityNode") != std::string::npos &&
+            editorImGuiSource.find("RenderHierarchyWaterBodies") == std::string::npos &&
+            editorImGuiSource.find("RenderHierarchyPointLights") == std::string::npos &&
+            editorImGuiSource.find("RenderHierarchySpotLights") == std::string::npos &&
             editorImGuiSource.find("DockBuilderDockWindow(ICON_FA_LIST_TREE \" Hierarchy\"") != std::string::npos,
-        "hierarchy panel and dock", "HIERARCHY-1 must add a docked Scene Hierarchy panel grouped by entity type");
+        "hierarchy entity tree panel", "HIERARCHY-2 must render a real scene-root entity tree instead of fixed type buckets");
     ctx.Expect(editorImGuiSource.find("RenderHierarchyToolbar") != std::string::npos &&
             editorImGuiSource.find("Search entities") != std::string::npos &&
             editorImGuiSource.find("HierarchyPassesSearch") != std::string::npos &&
             editorImGuiSource.find("ContainsCaseInsensitive") != std::string::npos &&
             editorImGuiSource.find("Search filter") != std::string::npos,
-        "hierarchy search", "HIERARCHY-1 must provide case-insensitive entity search with a clearable toolbar");
+        "hierarchy search", "HIERARCHY-2 must provide case-insensitive entity-name search with a clearable toolbar");
     ctx.Expect(editorImGuiSource.find("QueueHierarchySelection") != std::string::npos &&
             editorImGuiSource.find("QueueHierarchyFocus") != std::string::npos &&
             editorImGuiSource.find("SetScrollHereY") != std::string::npos &&
             clientMainSource.find("selectHierarchyEntity") != std::string::npos &&
-            clientMainSource.find("editorImGui.SetHierarchySceneState") != std::string::npos,
-        "hierarchy selection sync", "HIERARCHY-1 must sync hierarchy clicks with Inspector/gizmo selection and reverse-highlight selected items");
+            clientMainSource.find("editorImGui.SetHierarchySceneState") != std::string::npos &&
+            mapEditorTypesSource.find("hierarchyEntityHandle") != std::string::npos &&
+            editorImGuiHeaderSource.find("GetSelectedHierarchyEntity") != std::string::npos,
+        "hierarchy selected entity bridge", "HIERARCHY-2 must expose the selected flecs entity handle for the next Inspector pass");
     ctx.Expect(editorImGuiSource.find("RenderHierarchyContextMenu") != std::string::npos &&
             editorImGuiSource.find("Focus Camera") != std::string::npos &&
             editorImGuiSource.find("Duplicate") != std::string::npos &&
             editorImGuiSource.find("Rename") != std::string::npos &&
             editorImGuiSource.find("Delete") != std::string::npos &&
             editorImGuiSource.find("InputTextFlags_EnterReturnsTrue") != std::string::npos,
-        "hierarchy context menu", "HIERARCHY-1 must expose Focus/Duplicate/Rename/Delete and in-place rename");
-    ctx.Expect(mapEditorTypesSource.find("HierarchyEntityType") != std::string::npos &&
+        "hierarchy context menu", "HIERARCHY-2 must expose Focus/Duplicate/Rename/Delete and in-place rename per entity");
+    ctx.Expect(mapEditorTypesSource.find("struct HierarchySceneEntity") != std::string::npos &&
+            mapEditorTypesSource.find("std::uint64_t entity") != std::string::npos &&
+            mapEditorTypesSource.find("std::uint64_t parent") != std::string::npos &&
+            mapEditorTypesSource.find("HierarchyEntityType") != std::string::npos &&
             mapEditorTypesSource.find("hierarchyDuplicateEntity") != std::string::npos &&
             mapEditorTypesSource.find("hierarchyRenameEntity") != std::string::npos &&
             clientMainSource.find("duplicateHierarchyEntity") != std::string::npos &&
             clientMainSource.find("renameHierarchyEntity") != std::string::npos &&
             clientMainSource.find("deleteHierarchyEntity") != std::string::npos,
-        "hierarchy commands", "HIERARCHY-1 hierarchy commands must be routed from ImGui to the editor runtime");
+        "hierarchy commands", "HIERARCHY-2 hierarchy commands must be routed from generic entity nodes to the editor runtime");
+    ctx.Expect(clientMainSource.find("#include <flecs.h>") != std::string::npos &&
+            clientMainSource.find("ecs_new(editorHierarchyWorld.get())") != std::string::npos &&
+            clientMainSource.find("ecs_add_pair(editorHierarchyWorld.get(), entity, EcsChildOf, editorSceneRootEntity)") != std::string::npos &&
+            clientMainSource.find("HierarchyObjectKey") != std::string::npos &&
+            clientMainSource.find("buildHierarchyEntities") != std::string::npos,
+        "hierarchy flecs scene root", "HIERARCHY-2 must back visible scene objects with flecs entities parented to the scene root");
     ctx.Expect(mapEditorTypesSource.find("editorHidden") != std::string::npos &&
             editorImGuiSource.find("ICON_FA_EYE_SLASH") != std::string::npos &&
             clientMainSource.find("toggleHierarchyHidden") != std::string::npos &&
             clientMainSource.find("light.editorHidden") != std::string::npos &&
             clientMainSource.find("body.editorHidden") != std::string::npos &&
             sceneManagerSource.find("\\\"editor_hidden\\\"") == std::string::npos,
-        "hierarchy editor visibility", "HIERARCHY-1 must add editor-only hide/show with eye icons and avoid saving editor_hidden into scene JSON");
+        "hierarchy editor visibility", "HIERARCHY-2 must keep per-entity editor visibility with eye icons and avoid saving editor_hidden into scene JSON");
     ctx.Expect(clientMainSource.find("void FocusOn(WorldVec3 target") != std::string::npos &&
             clientMainSource.find("focusHierarchyEntity") != std::string::npos &&
             editorImGuiSource.find("ImGuiKey_F") != std::string::npos &&
             clientMainSource.find("[HIERARCHY] Focused camera on entity") != std::string::npos,
-        "hierarchy focus camera", "HIERARCHY-1 must focus the editor camera on selected hierarchy entities with F/double-click/context menu");
+        "hierarchy focus camera", "HIERARCHY-2 must focus the editor camera on selected hierarchy entities with F/double-click/context menu");
+    ctx.Expect(editorImGuiSource.find("RenderSelectedWaterBodyInspector") != std::string::npos &&
+            editorImGuiSource.find("RenderSelectedLightInspector") != std::string::npos &&
+            editorImGuiSource.find("RenderTransformComponent") != std::string::npos &&
+            editorImGuiSource.find("RenderAxisFloat") != std::string::npos &&
+            editorImGuiSource.find("CollapsingHeader(ICON_FA_CUBE \" Transform\"") != std::string::npos &&
+            editorImGuiSource.find("CollapsingHeader(ICON_FA_WATER \" Water Body\"") != std::string::npos &&
+            editorImGuiSource.find("CollapsingHeader(ICON_FA_LIGHTBULB \" Point Light\"") != std::string::npos &&
+            editorImGuiSource.find("CollapsingHeader(ICON_FA_BULLSEYE \" Spot Light\"") != std::string::npos,
+        "component inspector sections", "INSPECTOR-2 must render selected entities as component sections with a colored transform editor");
+    ctx.Expect(editorImGuiSource.find("RenderAddComponentMenu") != std::string::npos &&
+            editorImGuiSource.find("Add Component") != std::string::npos &&
+            mapEditorTypesSource.find("enum class EditorComponentType") != std::string::npos &&
+            mapEditorTypesSource.find("addComponentToSelectedEntity") != std::string::npos &&
+            clientMainSource.find("commands.addComponentToSelectedEntity") != std::string::npos &&
+            clientMainSource.find("selectedEntityPosition") != std::string::npos,
+        "component add command", "INSPECTOR-2 must expose an Add Component menu and route known component commands through the editor runtime");
+    ctx.Expect(editorImGuiSource.find("void EditorImGui::RenderWorldPanel") != std::string::npos &&
+            editorImGuiSource.find("ImGui::Begin(ICON_FA_GLOBE \" World\"") != std::string::npos &&
+            editorImGuiSource.find("RenderWorldPanel();") != std::string::npos &&
+            editorImGuiSource.find("DockBuilderDockWindow(ICON_FA_GLOBE \" World\"") != std::string::npos &&
+            editorImGuiSource.find("Click a water body or light in the 3D viewport, or select a light from Dynamic Lights.") == std::string::npos &&
+            editorImGuiSource.find("RenderWorldPanel();\n    RenderToolsPanel();") != std::string::npos,
+        "world panel split", "INSPECTOR-2 must move environment/dynamic-light creation out of Inspector and keep gizmo controls out of the Inspector body");
+    ctx.Expect(editorImGuiSource.find("void EditorImGui::RenderEditorToolbar") != std::string::npos &&
+            editorImGuiSource.find("RenderGizmoControls();") != std::string::npos &&
+            editorImGuiSource.find("operationButton(\"W\", \"Translate\"") != std::string::npos &&
+            editorImGuiSource.find("operationButton(\"E\", \"Rotate\"") != std::string::npos &&
+            editorImGuiSource.find("operationButton(\"R\", \"Scale\"") != std::string::npos &&
+            editorImGuiSource.find("##GizmoSnap") != std::string::npos,
+        "toolbar gizmo controls", "INSPECTOR-2 must move gizmo mode/snap controls to the top editor toolbar");
     ctx.Expect(editorImGuiSource.find("RenderEditorToolbar") != std::string::npos &&
             editorImGuiSource.find("HandleEditorHotkeys") != std::string::npos &&
             editorImGuiSource.find("ImGuiKey_F5") != std::string::npos &&

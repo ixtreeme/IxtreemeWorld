@@ -237,6 +237,25 @@ enum class HierarchyEntityType
     SpotLight
 };
 
+enum class EditorComponentType
+{
+    None,
+    WaterBody,
+    PointLight,
+    SpotLight
+};
+
+struct HierarchySceneEntity
+{
+    std::uint64_t entity = 0;
+    std::uint64_t parent = 0;
+    HierarchyEntityType type = HierarchyEntityType::None;
+    std::uint32_t objectId = 0;
+    std::string name;
+    bool editorHidden = false;
+    bool selected = false;
+};
+
 struct WaterBodyEditorState
 {
     bool selected = false;
@@ -285,6 +304,8 @@ struct MapEditorCommands
     bool pausePlayMode = false;
     bool resumePlayMode = false;
     bool addWaterBody = false;
+    bool addComponentToSelectedEntity = false;
+    EditorComponentType addComponentType = EditorComponentType::None;
     bool deleteSelectedWaterBody = false;
     bool selectedWaterBodyChanged = false;
     bool openSelectedWaterMaterialEditor = false;
@@ -304,6 +325,7 @@ struct MapEditorCommands
     bool hierarchyToggleHidden = false;
     HierarchyEntityType hierarchyEntityType = HierarchyEntityType::None;
     std::uint32_t hierarchyEntityId = 0;
+    std::uint64_t hierarchyEntityHandle = 0;
     std::string hierarchyRenameValue;
     bool paletteSlotChanged = false;
     std::uint32_t paletteSlot = 0;
