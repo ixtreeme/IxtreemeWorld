@@ -1187,6 +1187,8 @@ void MergeMapEditorCommands(MapEditorCommands& target, const MapEditorCommands& 
         target.terrainTriplanarChanged = true;
         target.terrainTriplanarEnabled = source.terrainTriplanarEnabled;
         target.terrainTriplanarSharpness = source.terrainTriplanarSharpness;
+        target.terrainTriplanarSlopeThreshold = source.terrainTriplanarSlopeThreshold;
+        target.terrainTriplanarSlopeTransition = source.terrainTriplanarSlopeTransition;
     }
     if (source.gizmoSettingsChanged)
     {
@@ -2564,6 +2566,7 @@ int RunGame(NativeWindow& window,
             statsFrameCount = 0;
         }
 #endif
+        terrain.SetPerformanceFps(engineStats.fps);
 #if defined(IXTREEME_WITH_EDITOR)
         if (runtimeSession->IsMapEditorOpen() && cameraController.IsFreeCameraEnabled())
             cameraController.Update(deltaSeconds, editorFlyMovement);
@@ -3563,6 +3566,8 @@ int RunGame(NativeWindow& window,
                     terrainState.cellsZ = terrainData.cellsZ;
                     terrainState.triplanarEnabled = terrainData.triplanarEnabled;
                     terrainState.triplanarSharpness = terrainData.triplanarSharpness;
+                    terrainState.triplanarSlopeThreshold = terrainData.triplanarSlopeThreshold;
+                    terrainState.triplanarSlopeTransition = terrainData.triplanarSlopeTransition;
                 }
                 editorImGui.SetTerrainEditorState(terrainState);
                 auto hierarchyState = buildHierarchyEntities();
@@ -3679,7 +3684,9 @@ int RunGame(NativeWindow& window,
                 if (commands.terrainTriplanarChanged)
                 {
                     if (!terrain.SetTriplanarSettings(commands.terrainTriplanarEnabled,
-                            commands.terrainTriplanarSharpness))
+                            commands.terrainTriplanarSharpness,
+                            commands.terrainTriplanarSlopeThreshold,
+                            commands.terrainTriplanarSlopeTransition))
                     {
                         Tracen("[MAIN] failed to apply terrain triplanar settings");
                     }

@@ -21,6 +21,8 @@ struct Manifest {
     std::uint32_t zone_grid_x = 0;
     std::uint32_t zone_grid_y = 0;
     std::uint32_t zone_size_cells = 0;
+    float triplanar_slope_threshold = 0.18f;
+    float triplanar_slope_transition = 0.20f;
     std::vector<std::string> texture_palette_paths;
     std::vector<float> texture_palette_tiling_x;
     std::vector<float> texture_palette_tiling_y;

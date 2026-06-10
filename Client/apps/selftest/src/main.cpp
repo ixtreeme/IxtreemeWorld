@@ -636,6 +636,8 @@ bool RunAssetTests(const Options& options, TestContext& ctx)
     terrainScene.terrain.chunkSizeCells = 32;
     terrainScene.terrain.triplanarEnabled = true;
     terrainScene.terrain.triplanarSharpness = 5.5f;
+    terrainScene.terrain.triplanarSlopeThreshold = 0.22f;
+    terrainScene.terrain.triplanarSlopeTransition = 0.18f;
     terrainScene.terrain.heightCmGrid.resize(static_cast<std::size_t>(terrainScene.terrain.cellsX + 1u) *
         (terrainScene.terrain.cellsZ + 1u), 0.0f);
     terrainScene.terrain.heightCmGrid[static_cast<std::size_t>(16) * (terrainScene.terrain.cellsX + 1u) + 32u] = 123.0f;
@@ -693,7 +695,9 @@ bool RunAssetTests(const Options& options, TestContext& ctx)
             std::abs(savedManifest->texture_palette_ao_strength[2] - 0.35f) < 0.01f &&
             std::abs(savedManifest->texture_palette_uv_offset_x[2] - 0.125f) < 0.01f &&
             std::abs(savedManifest->texture_palette_uv_offset_y[2] + 0.25f) < 0.01f &&
-            std::abs(savedManifest->texture_palette_uv_rotation_degrees[2] - 37.0f) < 0.01f,
+            std::abs(savedManifest->texture_palette_uv_rotation_degrees[2] - 37.0f) < 0.01f &&
+            std::abs(savedManifest->triplanar_slope_threshold - 0.22f) < 0.01f &&
+            std::abs(savedManifest->triplanar_slope_transition - 0.18f) < 0.01f,
         "terrain material params manifest save", "map.manifest did not persist per-layer terrain material params");
     scenes.CloseScene();
     if (!ctx.Expect(scenes.LoadScene(terrainScenePath.string()),
@@ -707,6 +711,8 @@ bool RunAssetTests(const Options& options, TestContext& ctx)
             loadedTerrain.chunkSizeCells == 32 &&
             loadedTerrain.triplanarEnabled &&
             std::abs(loadedTerrain.triplanarSharpness - 5.5f) < 0.01f &&
+            std::abs(loadedTerrain.triplanarSlopeThreshold - 0.22f) < 0.01f &&
+            std::abs(loadedTerrain.triplanarSlopeTransition - 0.18f) < 0.01f &&
             loadedTerrain.chunkManifestRef == "ChunkedTerrain_terrain_map/map.manifest" &&
             loadedHeightIndex < loadedTerrain.heightCmGrid.size() &&
             std::abs(loadedTerrain.heightCmGrid[loadedHeightIndex] - 123.0f) < 0.5f &&
@@ -838,6 +844,8 @@ bool RunRenderChecks(const Options& options, TestContext& ctx)
         "terrain local tone-map removed", "Terrain shader still performs local Reinhard tone-mapping");
     ctx.Expect(terrainSource.find("u_terrainMaterialParams") != std::string::npos &&
             terrainSource.find("TriplanarWeights") != std::string::npos &&
+            terrainSource.find("TriplanarSlopeBlend") != std::string::npos &&
+            terrainSource.find("smoothstep(threshold, threshold + transition, slope)") != std::string::npos &&
             terrainSource.find("TriplanarNormalToWorld") != std::string::npos &&
             terrainSource.find("TriplanarPlaneUv") != std::string::npos,
         "terrain triplanar shader path", "Terrain shader is missing triplanar UV/normal sampling support");
@@ -998,6 +1006,7 @@ bool RunRenderChecks(const Options& options, TestContext& ctx)
             terrainRendererSource.find("[TRI-PERF] avgActiveLayers=%.2f samples/fragment planar=%.1f triplanar=%.1f") != std::string::npos &&
             terrainRendererSource.find("[TRI-PERF] triplanar LOD mode=textureGrad-explicit mipUsed=%s forced-0=%s") != std::string::npos &&
             terrainRendererSource.find("[TRI-PERF] layer sampling=weight-gated threshold=1/255") != std::string::npos &&
+            terrainRendererSource.find("[TRIPLANAR-OPT] mode=selective slopeThreshold=%.3f transition=%.3f avgAxesPerLayer=%.2f samples/fragment=%.1f fps=%.1f") != std::string::npos &&
             terrainRendererSource.find("[TRI-PERF] palette size=") != std::string::npos,
         "terrain triplanar perf diagnostics", "Terrain renderer must log pass inventory, sample count, LOD mode, layer gating, and palette texture details");
     ctx.Expect(terrainRendererSource.find("BuildRgbaArrayMipUpload") != std::string::npos &&
@@ -1010,7 +1019,8 @@ bool RunRenderChecks(const Options& options, TestContext& ctx)
             terrainSource.find("if (weights[layer] < layerWeightEpsilon)") != std::string::npos &&
             terrainSource.find("continue;") != std::string::npos &&
             terrainSource.find("SampleGrad") != std::string::npos &&
-            terrainSource.find("TriplanarPlaneUvGrad") != std::string::npos,
+            terrainSource.find("TriplanarPlaneUvGrad") != std::string::npos &&
+            terrainSource.find("if (triplanarSlopeBlend > 0.001)") != std::string::npos,
         "terrain layer weight gating", "Terrain shader must skip zero-weight layers while using explicit gradients for mip-safe sampling");
     const std::filesystem::path waterBodyIoPath = options.clientRoot / "libs" / "render" / "WaterBodyIO.h";
     std::ifstream waterBodyIo(waterBodyIoPath);

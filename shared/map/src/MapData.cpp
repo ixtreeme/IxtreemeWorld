@@ -350,6 +350,8 @@ std::optional<Manifest> LoadManifest(const AssetReadFn& read, std::string_view m
     manifest.zone_grid_x = root.getZoneGridDims().getX();
     manifest.zone_grid_y = root.getZoneGridDims().getY();
     manifest.zone_size_cells = root.getZoneSizeCells();
+    manifest.triplanar_slope_threshold = root.getTriplanarSlopeThreshold();
+    manifest.triplanar_slope_transition = root.getTriplanarSlopeTransition();
     const auto palette = root.getTexturePalette();
     manifest.texture_palette_paths.reserve(palette.size());
     manifest.texture_palette_tiling_x.reserve(palette.size());

@@ -1179,6 +1179,56 @@ double EstimateAverageActiveSplatLayers(const std::vector<uint8_t>& splatA,
     return static_cast<double>(activeTotal) / static_cast<double>(texelCount);
 }
 
+float Smoothstep(float edge0, float edge1, float x)
+{
+    const float denom = std::max(edge1 - edge0, 0.0001f);
+    const float t = std::clamp((x - edge0) / denom, 0.0f, 1.0f);
+    return t * t * (3.0f - 2.0f * t);
+}
+
+double EstimateAverageSlopeAxes(const std::vector<float>& heightCmGrid,
+                                uint32_t widthVertices,
+                                uint32_t heightVertices,
+                                float cellScaleMeters,
+                                float slopeThreshold,
+                                float slopeTransition)
+{
+    if (widthVertices < 2 || heightVertices < 2 ||
+        heightCmGrid.size() < static_cast<size_t>(widthVertices) * heightVertices ||
+        cellScaleMeters <= 0.0f)
+    {
+        return 1.0;
+    }
+
+    const auto heightMeters = [&](uint32_t x, uint32_t z) -> float {
+        return heightCmGrid[static_cast<size_t>(z) * widthVertices + x] * 0.01f;
+    };
+
+    double axesTotal = 0.0;
+    size_t samples = 0;
+    for (uint32_t z = 0; z < heightVertices; ++z)
+    {
+        const uint32_t z0 = z == 0 ? z : z - 1u;
+        const uint32_t z1 = std::min(heightVertices - 1u, z + 1u);
+        const float dzDenom = static_cast<float>(std::max(1u, z1 - z0)) * cellScaleMeters;
+        for (uint32_t x = 0; x < widthVertices; ++x)
+        {
+            const uint32_t x0 = x == 0 ? x : x - 1u;
+            const uint32_t x1 = std::min(widthVertices - 1u, x + 1u);
+            const float dxDenom = static_cast<float>(std::max(1u, x1 - x0)) * cellScaleMeters;
+            const float dhdx = (heightMeters(x1, z) - heightMeters(x0, z)) / std::max(dxDenom, 0.0001f);
+            const float dhdz = (heightMeters(x, z1) - heightMeters(x, z0)) / std::max(dzDenom, 0.0001f);
+            const float normalY = 1.0f / std::sqrt(1.0f + dhdx * dhdx + dhdz * dhdz);
+            const float slope = 1.0f - std::clamp(normalY, 0.0f, 1.0f);
+            const float blend = Smoothstep(slopeThreshold, slopeThreshold + slopeTransition, slope);
+            axesTotal += 1.0 + 2.0 * static_cast<double>(blend);
+            ++samples;
+        }
+    }
+
+    return samples == 0 ? 1.0 : axesTotal / static_cast<double>(samples);
+}
+
 bool CreateDepthImageArray(VulkanDevice& device, VkDevice vkDevice, uint32_t width, uint32_t height,
     uint32_t arrayLayers, VkFormat format, VkImage& image, VkDeviceMemory& memory)
 {
@@ -1864,6 +1914,8 @@ bool TerrainRenderer::CreateFlatTerrain(VulkanDevice& device, const TerrainScene
     if (next.depthMeters <= 0.0f)
         next.depthMeters = static_cast<float>(next.cellsZ) * next.cellSizeMeters;
     next.triplanarSharpness = std::clamp(next.triplanarSharpness, 1.0f, 16.0f);
+    next.triplanarSlopeThreshold = std::clamp(next.triplanarSlopeThreshold, 0.0f, 1.0f);
+    next.triplanarSlopeTransition = std::clamp(next.triplanarSlopeTransition, 0.001f, 1.0f);
 
     device.WaitIdle();
     DestroyBuffer(m_vertexBuffer);
@@ -2039,6 +2091,8 @@ void TerrainRenderer::SetTerrainSceneData(const TerrainSceneData& terrain)
     m_sceneTerrain = terrain;
     m_sceneTerrain.exists = true;
     m_sceneTerrain.triplanarSharpness = std::clamp(m_sceneTerrain.triplanarSharpness, 1.0f, 16.0f);
+    m_sceneTerrain.triplanarSlopeThreshold = std::clamp(m_sceneTerrain.triplanarSlopeThreshold, 0.0f, 1.0f);
+    m_sceneTerrain.triplanarSlopeTransition = std::clamp(m_sceneTerrain.triplanarSlopeTransition, 0.001f, 1.0f);
     m_triplanarParamsDirty = true;
 }
 
@@ -3091,23 +3145,32 @@ bool TerrainRenderer::ApplyPaletteSlotParams(const MapEditorPaletteSlot& slot)
     return true;
 }
 
-bool TerrainRenderer::SetTriplanarSettings(bool enabled, float sharpness)
+bool TerrainRenderer::SetTriplanarSettings(bool enabled, float sharpness, float slopeThreshold, float slopeTransition)
 {
     if (!m_sceneTerrainActive)
         return false;
 
     const float clampedSharpness = std::clamp(sharpness, 1.0f, 16.0f);
+    const float clampedSlopeThreshold = std::clamp(slopeThreshold, 0.0f, 1.0f);
+    const float clampedSlopeTransition = std::clamp(slopeTransition, 0.001f, 1.0f);
     const bool changed = m_sceneTerrain.triplanarEnabled != enabled ||
-        std::abs(m_sceneTerrain.triplanarSharpness - clampedSharpness) > 0.0001f;
+        std::abs(m_sceneTerrain.triplanarSharpness - clampedSharpness) > 0.0001f ||
+        std::abs(m_sceneTerrain.triplanarSlopeThreshold - clampedSlopeThreshold) > 0.0001f ||
+        std::abs(m_sceneTerrain.triplanarSlopeTransition - clampedSlopeTransition) > 0.0001f;
     m_sceneTerrain.triplanarEnabled = enabled;
     m_sceneTerrain.triplanarSharpness = clampedSharpness;
+    m_sceneTerrain.triplanarSlopeThreshold = clampedSlopeThreshold;
+    m_sceneTerrain.triplanarSlopeTransition = clampedSlopeTransition;
     if (changed)
     {
         m_materialParamsDirty = true;
         m_triplanarParamsDirty = true;
-        Tracenf("[TRIPLANAR] enabled=%s scope=terrain sharpness=%.2f",
+        m_triPerfStaticLogged = false;
+        Tracenf("[TRIPLANAR] enabled=%s scope=terrain sharpness=%.2f slopeThreshold=%.3f transition=%.3f",
             enabled ? "yes" : "no",
-            clampedSharpness);
+            clampedSharpness,
+            clampedSlopeThreshold,
+            clampedSlopeTransition);
         if (enabled)
             Tracen("[TRIPLANAR] sample mode active, layers=8");
     }
@@ -7410,6 +7473,8 @@ void TerrainRenderer::UpdateUniform(uint32_t frameIndex, const WorldCamera& came
     }
     uniform.terrainMaterialParams[0] = m_sceneTerrain.triplanarEnabled ? 1.0f : 0.0f;
     uniform.terrainMaterialParams[1] = std::clamp(m_sceneTerrain.triplanarSharpness, 1.0f, 16.0f);
+    uniform.terrainMaterialParams[2] = std::clamp(m_sceneTerrain.triplanarSlopeThreshold, 0.0f, 1.0f);
+    uniform.terrainMaterialParams[3] = std::clamp(m_sceneTerrain.triplanarSlopeTransition, 0.001f, 1.0f);
     uniform.cameraPos[0] = camera.eye.x;
     uniform.cameraPos[1] = camera.eye.y;
     uniform.cameraPos[2] = camera.eye.z;
@@ -7523,9 +7588,11 @@ void TerrainRenderer::UpdateUniform(uint32_t frameIndex, const WorldCamera& came
     }
     if (m_triplanarParamsDirty)
     {
-        Tracenf("[TRIPLANAR] enabled=%s scope=terrain sharpness=%.2f",
+        Tracenf("[TRIPLANAR] enabled=%s scope=terrain sharpness=%.2f slopeThreshold=%.3f transition=%.3f",
             m_sceneTerrain.triplanarEnabled ? "yes" : "no",
-            std::clamp(m_sceneTerrain.triplanarSharpness, 1.0f, 16.0f));
+            std::clamp(m_sceneTerrain.triplanarSharpness, 1.0f, 16.0f),
+            std::clamp(m_sceneTerrain.triplanarSlopeThreshold, 0.0f, 1.0f),
+            std::clamp(m_sceneTerrain.triplanarSlopeTransition, 0.001f, 1.0f));
         if (m_sceneTerrain.triplanarEnabled)
             Tracen("[TRIPLANAR] sample mode active, layers=8");
         m_triplanarParamsDirty = false;
@@ -7539,12 +7606,25 @@ void TerrainRenderer::UpdateUniform(uint32_t frameIndex, const WorldCamera& came
             m_roughnessTexture.mipLevels > 1 &&
             m_metallicTexture.mipLevels > 1;
         const double avgActiveLayers = EstimateAverageActiveSplatLayers(m_splatABytes, m_splatBBytes, m_splatWidth, m_splatHeight);
+        const double avgAxesPerLayer = EstimateAverageSlopeAxes(m_heightCmGrid,
+            m_heightGridWidth,
+            m_heightGridHeight,
+            m_cellScaleMeters,
+            std::clamp(m_sceneTerrain.triplanarSlopeThreshold, 0.0f, 1.0f),
+            std::clamp(m_sceneTerrain.triplanarSlopeTransition, 0.001f, 1.0f));
         const double gatedPlanarSamples = 2.0 + avgActiveLayers * 5.0;
         const double gatedTriplanarSamples = 2.0 + avgActiveLayers * 15.0;
+        const double selectiveSamples = 2.0 + avgActiveLayers * 5.0 * avgAxesPerLayer;
         Tracenf("[TRI-PERF] avgActiveLayers=%.2f samples/fragment planar=%.1f triplanar=%.1f unconditionalPlanar=42 unconditionalTriplanar=122 layers=8 maps=diff,nor,ao,roughness,metallic axes=1|3 splat=2 shadow_pcf=25-50-independent",
             avgActiveLayers,
             gatedPlanarSamples,
             gatedTriplanarSamples);
+        Tracenf("[TRIPLANAR-OPT] mode=selective slopeThreshold=%.3f transition=%.3f avgAxesPerLayer=%.2f samples/fragment=%.1f fps=%.1f",
+            std::clamp(m_sceneTerrain.triplanarSlopeThreshold, 0.0f, 1.0f),
+            std::clamp(m_sceneTerrain.triplanarSlopeTransition, 0.001f, 1.0f),
+            avgAxesPerLayer,
+            selectiveSamples,
+            m_latestFps);
         Tracenf("[TRI-PERF] triplanar LOD mode=textureGrad-explicit mipUsed=%s forced-0=%s reason=%s",
             terrainMipsUsable ? "yes" : "no",
             terrainMipsUsable ? "no" : "yes",

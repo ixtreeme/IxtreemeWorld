@@ -4208,16 +4208,24 @@ void EditorImGui::RenderSplatPaintToolPanel()
         {
             bool triplanarEnabled = m_terrainState.triplanarEnabled;
             float triplanarSharpness = std::clamp(m_terrainState.triplanarSharpness, 1.0f, 16.0f);
+            float triplanarSlopeThreshold = std::clamp(m_terrainState.triplanarSlopeThreshold, 0.0f, 1.0f);
+            float triplanarSlopeTransition = std::clamp(m_terrainState.triplanarSlopeTransition, 0.001f, 1.0f);
             bool triplanarChanged = false;
             triplanarChanged |= ImGui::Checkbox("Triplanar Mapping", &triplanarEnabled);
             triplanarChanged |= ImGui::SliderFloat("Triplanar Sharpness", &triplanarSharpness, 1.0f, 16.0f, "%.2f");
+            triplanarChanged |= ImGui::SliderFloat("Slope Threshold", &triplanarSlopeThreshold, 0.0f, 1.0f, "%.3f");
+            triplanarChanged |= ImGui::SliderFloat("Slope Transition", &triplanarSlopeTransition, 0.001f, 1.0f, "%.3f");
             if (triplanarChanged)
             {
                 m_terrainState.triplanarEnabled = triplanarEnabled;
                 m_terrainState.triplanarSharpness = triplanarSharpness;
+                m_terrainState.triplanarSlopeThreshold = triplanarSlopeThreshold;
+                m_terrainState.triplanarSlopeTransition = triplanarSlopeTransition;
                 m_commands.terrainTriplanarChanged = true;
                 m_commands.terrainTriplanarEnabled = triplanarEnabled;
                 m_commands.terrainTriplanarSharpness = triplanarSharpness;
+                m_commands.terrainTriplanarSlopeThreshold = triplanarSlopeThreshold;
+                m_commands.terrainTriplanarSlopeTransition = triplanarSlopeTransition;
                 SceneManager::Instance().MarkDirty();
             }
         }

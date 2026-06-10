@@ -264,6 +264,8 @@ struct TerrainSceneData
     std::vector<std::uint8_t> splatBBytes;
     bool triplanarEnabled = false;
     float triplanarSharpness = 4.0f;
+    float triplanarSlopeThreshold = 0.18f;
+    float triplanarSlopeTransition = 0.20f;
     bool editorHidden = false;
 };
 
@@ -338,6 +340,8 @@ struct TerrainEditorState
     std::uint32_t cellsZ = 0;
     bool triplanarEnabled = false;
     float triplanarSharpness = 4.0f;
+    float triplanarSlopeThreshold = 0.18f;
+    float triplanarSlopeTransition = 0.20f;
 };
 
 enum class DynamicLightType
@@ -434,6 +438,8 @@ struct MapEditorCommands
     bool terrainTriplanarChanged = false;
     bool terrainTriplanarEnabled = false;
     float terrainTriplanarSharpness = 4.0f;
+    float terrainTriplanarSlopeThreshold = 0.18f;
+    float terrainTriplanarSlopeTransition = 0.20f;
     bool gizmoSettingsChanged = false;
     MapEditorGizmoOperation gizmoOperation = MapEditorGizmoOperation::Translate;
     bool gizmoSnapEnabled = false;

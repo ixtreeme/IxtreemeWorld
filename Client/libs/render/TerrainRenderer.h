@@ -96,6 +96,7 @@ public:
     void SetMapEditorOpen(bool open);
     void SetMapEditorSettings(const MapEditorSettings& settings);
     void SetLightingState(const LightingState& lighting) { m_lightingState = lighting; }
+    void SetPerformanceFps(double fps) { m_latestFps = fps; }
     void SetWaterMaterials(const std::vector<std::pair<std::string, WaterMaterialData>>& materials);
     std::vector<WaterBody> GetWaterBodies() const;
     bool SetWaterBodies(VulkanDevice& device, const std::vector<WaterBody>& bodies);
@@ -107,7 +108,7 @@ public:
     bool ApplyPaletteSlots(VulkanDevice& device, const std::array<MapEditorPaletteSlot, 8>& slots);
     bool ApplyPaletteSlotParams(const MapEditorPaletteSlot& slot);
     bool ApplyPaletteSlotChange(VulkanDevice& device, const MapEditorPaletteSlot& slot);
-    bool SetTriplanarSettings(bool enabled, float sharpness);
+    bool SetTriplanarSettings(bool enabled, float sharpness, float slopeThreshold, float slopeTransition);
     void RequestEditorSave();
     void RequestEditorReload();
     void RequestEditorUndo();
@@ -164,7 +165,7 @@ private:
         float materialTiling[8][4];
         float materialTintNormal[8][4];
         float materialPbr[8][4];
-        float terrainMaterialParams[4] = {0.0f, 4.0f, 0.0f, 0.0f}; // triplanar enabled, sharpness, reserved, reserved
+        float terrainMaterialParams[4] = {0.0f, 4.0f, 0.18f, 0.20f}; // triplanar enabled, sharpness, slope threshold, slope transition
         float cameraPos[4];
         float sunDir[4];
         float sunColor[4];
@@ -503,6 +504,7 @@ private:
     LightingState m_lightingState;
     float m_reflectionClipWaterLevelY = std::numeric_limits<float>::quiet_NaN();
     double m_latestWaterTimeSeconds = 0.0;
+    double m_latestFps = 0.0;
     double m_lastWaterDiagTimeSeconds = -1000.0;
     std::array<MapEditorPaletteSlot, 8> m_paletteSlots{};
     bool m_materialParamsDirty = false;

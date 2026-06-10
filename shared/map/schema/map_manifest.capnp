@@ -42,4 +42,6 @@ struct MapManifest {
   texturePalette @9 :List(TexturePaletteEntry);
   worldLogicFile @10 :Text;
   environmentFile @11 :Text;
+  triplanarSlopeThreshold @12 :Float32 = 0.18;
+  triplanarSlopeTransition @13 :Float32 = 0.20;
 }
