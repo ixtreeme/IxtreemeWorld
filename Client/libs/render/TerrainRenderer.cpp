@@ -939,6 +939,246 @@ bool CreateDeviceLocalImageArray(VulkanDevice& device, VkDevice vkDevice, uint32
     return true;
 }
 
+uint32_t FullMipCount(uint32_t width, uint32_t height)
+{
+    uint32_t levels = 1;
+    uint32_t size = std::max(width, height);
+    while (size > 1)
+    {
+        size >>= 1u;
+        ++levels;
+    }
+    return levels;
+}
+
+float SrgbToLinear(float value)
+{
+    value = std::clamp(value, 0.0f, 1.0f);
+    return value <= 0.04045f ? value / 12.92f : std::pow((value + 0.055f) / 1.055f, 2.4f);
+}
+
+float LinearToSrgb(float value)
+{
+    value = std::clamp(value, 0.0f, 1.0f);
+    return value <= 0.0031308f ? value * 12.92f : 1.055f * std::pow(value, 1.0f / 2.4f) - 0.055f;
+}
+
+uint8_t QuantizeByte(float value)
+{
+    return static_cast<uint8_t>(std::clamp(std::lround(value * 255.0f), 0l, 255l));
+}
+
+struct ArrayMipUpload
+{
+    std::vector<uint8_t> pixels;
+    std::vector<VkBufferImageCopy> regions;
+    uint32_t mipLevels = 1;
+};
+
+ArrayMipUpload BuildRgbaArrayMipUpload(uint32_t width,
+                                       uint32_t height,
+                                       uint32_t layers,
+                                       const std::vector<uint8_t>& basePixels,
+                                       bool srgbColor,
+                                       bool normalMap)
+{
+    ArrayMipUpload upload{};
+    upload.mipLevels = FullMipCount(width, height);
+    upload.regions.reserve(static_cast<size_t>(layers) * upload.mipLevels);
+
+    const size_t baseLayerBytes = static_cast<size_t>(width) * height * 4u;
+    for (uint32_t layer = 0; layer < layers; ++layer)
+    {
+        std::vector<uint8_t> current(baseLayerBytes);
+        std::memcpy(current.data(), basePixels.data() + static_cast<size_t>(layer) * baseLayerBytes, baseLayerBytes);
+        uint32_t mipWidth = width;
+        uint32_t mipHeight = height;
+
+        for (uint32_t mip = 0; mip < upload.mipLevels; ++mip)
+        {
+            VkBufferImageCopy region{};
+            region.bufferOffset = static_cast<VkDeviceSize>(upload.pixels.size());
+            region.imageSubresource.aspectMask = VK_IMAGE_ASPECT_COLOR_BIT;
+            region.imageSubresource.mipLevel = mip;
+            region.imageSubresource.baseArrayLayer = layer;
+            region.imageSubresource.layerCount = 1;
+            region.imageExtent = {mipWidth, mipHeight, 1};
+            upload.regions.push_back(region);
+            upload.pixels.insert(upload.pixels.end(), current.begin(), current.end());
+
+            if (mip + 1u >= upload.mipLevels)
+                break;
+
+            const uint32_t nextWidth = std::max(1u, mipWidth >> 1u);
+            const uint32_t nextHeight = std::max(1u, mipHeight >> 1u);
+            std::vector<uint8_t> next(static_cast<size_t>(nextWidth) * nextHeight * 4u, 255);
+            for (uint32_t y = 0; y < nextHeight; ++y)
+            {
+                for (uint32_t x = 0; x < nextWidth; ++x)
+                {
+                    float accum[4] = {};
+                    float normal[3] = {};
+                    float samples = 0.0f;
+                    for (uint32_t oy = 0; oy < 2; ++oy)
+                    {
+                        for (uint32_t ox = 0; ox < 2; ++ox)
+                        {
+                            const uint32_t sx = std::min(mipWidth - 1u, x * 2u + ox);
+                            const uint32_t sy = std::min(mipHeight - 1u, y * 2u + oy);
+                            const size_t src = (static_cast<size_t>(sy) * mipWidth + sx) * 4u;
+                            if (normalMap)
+                            {
+                                normal[0] += static_cast<float>(current[src + 0]) / 255.0f * 2.0f - 1.0f;
+                                normal[1] += static_cast<float>(current[src + 1]) / 255.0f * 2.0f - 1.0f;
+                                normal[2] += static_cast<float>(current[src + 2]) / 255.0f * 2.0f - 1.0f;
+                                accum[3] += static_cast<float>(current[src + 3]) / 255.0f;
+                            }
+                            else if (srgbColor)
+                            {
+                                accum[0] += SrgbToLinear(static_cast<float>(current[src + 0]) / 255.0f);
+                                accum[1] += SrgbToLinear(static_cast<float>(current[src + 1]) / 255.0f);
+                                accum[2] += SrgbToLinear(static_cast<float>(current[src + 2]) / 255.0f);
+                                accum[3] += static_cast<float>(current[src + 3]) / 255.0f;
+                            }
+                            else
+                            {
+                                accum[0] += static_cast<float>(current[src + 0]) / 255.0f;
+                                accum[1] += static_cast<float>(current[src + 1]) / 255.0f;
+                                accum[2] += static_cast<float>(current[src + 2]) / 255.0f;
+                                accum[3] += static_cast<float>(current[src + 3]) / 255.0f;
+                            }
+                            samples += 1.0f;
+                        }
+                    }
+
+                    const size_t dst = (static_cast<size_t>(y) * nextWidth + x) * 4u;
+                    if (normalMap)
+                    {
+                        const float len2 = normal[0] * normal[0] + normal[1] * normal[1] + normal[2] * normal[2];
+                        const float invLen = len2 > 0.000001f ? 1.0f / std::sqrt(len2) : 1.0f;
+                        next[dst + 0] = QuantizeByte(normal[0] * invLen * 0.5f + 0.5f);
+                        next[dst + 1] = QuantizeByte(normal[1] * invLen * 0.5f + 0.5f);
+                        next[dst + 2] = QuantizeByte(normal[2] * invLen * 0.5f + 0.5f);
+                        next[dst + 3] = QuantizeByte(accum[3] / samples);
+                    }
+                    else if (srgbColor)
+                    {
+                        next[dst + 0] = QuantizeByte(LinearToSrgb(accum[0] / samples));
+                        next[dst + 1] = QuantizeByte(LinearToSrgb(accum[1] / samples));
+                        next[dst + 2] = QuantizeByte(LinearToSrgb(accum[2] / samples));
+                        next[dst + 3] = QuantizeByte(accum[3] / samples);
+                    }
+                    else
+                    {
+                        next[dst + 0] = QuantizeByte(accum[0] / samples);
+                        next[dst + 1] = QuantizeByte(accum[1] / samples);
+                        next[dst + 2] = QuantizeByte(accum[2] / samples);
+                        next[dst + 3] = QuantizeByte(accum[3] / samples);
+                    }
+                }
+            }
+            current = std::move(next);
+            mipWidth = nextWidth;
+            mipHeight = nextHeight;
+        }
+    }
+
+    return upload;
+}
+
+ArrayMipUpload BuildR8ArrayMipUpload(uint32_t width,
+                                     uint32_t height,
+                                     uint32_t layers,
+                                     const std::vector<uint8_t>& basePixels)
+{
+    ArrayMipUpload upload{};
+    upload.mipLevels = FullMipCount(width, height);
+    upload.regions.reserve(static_cast<size_t>(layers) * upload.mipLevels);
+
+    const size_t baseLayerBytes = static_cast<size_t>(width) * height;
+    for (uint32_t layer = 0; layer < layers; ++layer)
+    {
+        std::vector<uint8_t> current(baseLayerBytes);
+        std::memcpy(current.data(), basePixels.data() + static_cast<size_t>(layer) * baseLayerBytes, baseLayerBytes);
+        uint32_t mipWidth = width;
+        uint32_t mipHeight = height;
+
+        for (uint32_t mip = 0; mip < upload.mipLevels; ++mip)
+        {
+            VkBufferImageCopy region{};
+            region.bufferOffset = static_cast<VkDeviceSize>(upload.pixels.size());
+            region.imageSubresource.aspectMask = VK_IMAGE_ASPECT_COLOR_BIT;
+            region.imageSubresource.mipLevel = mip;
+            region.imageSubresource.baseArrayLayer = layer;
+            region.imageSubresource.layerCount = 1;
+            region.imageExtent = {mipWidth, mipHeight, 1};
+            upload.regions.push_back(region);
+            upload.pixels.insert(upload.pixels.end(), current.begin(), current.end());
+
+            if (mip + 1u >= upload.mipLevels)
+                break;
+
+            const uint32_t nextWidth = std::max(1u, mipWidth >> 1u);
+            const uint32_t nextHeight = std::max(1u, mipHeight >> 1u);
+            std::vector<uint8_t> next(static_cast<size_t>(nextWidth) * nextHeight, 0);
+            for (uint32_t y = 0; y < nextHeight; ++y)
+            {
+                for (uint32_t x = 0; x < nextWidth; ++x)
+                {
+                    uint32_t sum = 0;
+                    uint32_t samples = 0;
+                    for (uint32_t oy = 0; oy < 2; ++oy)
+                    {
+                        for (uint32_t ox = 0; ox < 2; ++ox)
+                        {
+                            const uint32_t sx = std::min(mipWidth - 1u, x * 2u + ox);
+                            const uint32_t sy = std::min(mipHeight - 1u, y * 2u + oy);
+                            sum += current[static_cast<size_t>(sy) * mipWidth + sx];
+                            ++samples;
+                        }
+                    }
+                    next[static_cast<size_t>(y) * nextWidth + x] =
+                        static_cast<uint8_t>((sum + samples / 2u) / samples);
+                }
+            }
+            current = std::move(next);
+            mipWidth = nextWidth;
+            mipHeight = nextHeight;
+        }
+    }
+
+    return upload;
+}
+
+double EstimateAverageActiveSplatLayers(const std::vector<uint8_t>& splatA,
+                                        const std::vector<uint8_t>& splatB,
+                                        uint32_t width,
+                                        uint32_t height)
+{
+    const size_t texelCount = static_cast<size_t>(width) * height;
+    if (texelCount == 0 ||
+        splatA.size() < texelCount * 4u ||
+        splatB.size() < texelCount * 4u)
+    {
+        return 1.0;
+    }
+
+    uint64_t activeTotal = 0;
+    for (size_t texel = 0; texel < texelCount; ++texel)
+    {
+        const size_t byte = texel * 4u;
+        uint32_t active = 0;
+        for (uint32_t i = 0; i < 4; ++i)
+        {
+            active += splatA[byte + i] > 0 ? 1u : 0u;
+            active += splatB[byte + i] > 0 ? 1u : 0u;
+        }
+        activeTotal += std::max(active, 1u);
+    }
+
+    return static_cast<double>(activeTotal) / static_cast<double>(texelCount);
+}
+
 bool CreateDepthImageArray(VulkanDevice& device, VkDevice vkDevice, uint32_t width, uint32_t height,
     uint32_t arrayLayers, VkFormat format, VkImage& image, VkDeviceMemory& memory)
 {
@@ -1959,6 +2199,15 @@ void TerrainRenderer::RenderSunShadowMap(VulkanDevice& device, const WorldCamera
     clear.depthStencil = {1.0f, 0};
     VkDeviceSize offset = 0;
 
+    if (m_sceneTerrain.triplanarEnabled && !m_triPerfShadowPassLogged)
+    {
+        Tracenf("[TRI-PERF] terrain pipeline bound in pass=shadow-cascade0..%u triplanar=no shader=depth-only extent=%ux%u",
+            kShadowCascadeCount - 1u,
+            kShadowResolution,
+            kShadowResolution);
+        m_triPerfShadowPassLogged = true;
+    }
+
     for (uint32_t cascade = 0; cascade < kShadowCascadeCount; ++cascade)
     {
         VkRenderPassBeginInfo pass{};
@@ -2115,6 +2364,13 @@ void TerrainRenderer::RenderWaterReflection(VulkanDevice& device,
     vkCmdSetViewport(cmd, 0, 1, &viewport);
     vkCmdSetScissor(cmd, 0, 1, &scissor);
     vkCmdBindPipeline(cmd, VK_PIPELINE_BIND_POINT_GRAPHICS, m_waterReflectionPipeline);
+    if (m_sceneTerrain.triplanarEnabled && !m_triPerfReflectionPassLogged)
+    {
+        Tracenf("[TRI-PERF] terrain pipeline bound in pass=water-reflection triplanar=yes extent=%ux%u shader=terrain_ps",
+            m_waterReflection.width,
+            m_waterReflection.height);
+        m_triPerfReflectionPassLogged = true;
+    }
 
     VkDeviceSize offset = 0;
     vkCmdBindVertexBuffers(cmd, 0, 1, &m_vertexBuffer.buffer, &offset);
@@ -2206,6 +2462,16 @@ void TerrainRenderer::Render(VulkanDevice& device, const WorldCamera& camera)
     vkCmdSetViewport(cmd, 0, 1, &viewport);
     vkCmdSetScissor(cmd, 0, 1, &scissor);
     vkCmdBindPipeline(cmd, VK_PIPELINE_BIND_POINT_GRAPHICS, m_pipeline);
+    if (m_sceneTerrain.triplanarEnabled && !m_triPerfMainPassLogged)
+    {
+        Tracenf("[TRI-PERF] terrain pipeline bound in pass=main triplanar=yes extent=%ux%u shader=terrain_ps",
+            extent.width,
+            extent.height);
+        Tracenf("[TRI-PERF] offscreen target extent=%ux%u fragment-bound-cost-scales-with-pixels",
+            extent.width,
+            extent.height);
+        m_triPerfMainPassLogged = true;
+    }
 
     VkDeviceSize offset = 0;
     vkCmdBindVertexBuffers(cmd, 0, 1, &m_vertexBuffer.buffer, &offset);
@@ -3370,32 +3636,22 @@ bool TerrainRenderer::UploadRgbaTextureArray(VulkanDevice& device,
     VkQueue graphicsQueue = VK_NULL_HANDLE;
     vkGetDeviceQueue(m_device, device.GetGraphicsQueueFamily(), 0, &graphicsQueue);
 
-    CreateDeviceLocalImageArray(device, m_device, width, height, 1, layers,
+    const bool srgbColor = format == VK_FORMAT_R8G8B8A8_SRGB;
+    const bool normalMap = name.find("normal") != std::string::npos;
+    const ArrayMipUpload mipUpload = BuildRgbaArrayMipUpload(width, height, layers, pixels, srgbColor, normalMap);
+    CreateDeviceLocalImageArray(device, m_device, width, height, mipUpload.mipLevels, layers,
         format, out.image, out.memory);
     Buffer staging{};
-    CreateHostVisibleBuffer(device, m_device, pixels.size(), VK_BUFFER_USAGE_TRANSFER_SRC_BIT, pixels.data(), staging);
-
-    std::vector<VkBufferImageCopy> regions;
-    regions.reserve(layers);
-    const VkDeviceSize layerSize = static_cast<VkDeviceSize>(width) * height * 4u;
-    for (uint32_t layer = 0; layer < layers; ++layer)
-    {
-        VkBufferImageCopy region{};
-        region.bufferOffset = layerSize * layer;
-        region.imageSubresource.aspectMask = VK_IMAGE_ASPECT_COLOR_BIT;
-        region.imageSubresource.baseArrayLayer = layer;
-        region.imageSubresource.layerCount = 1;
-        region.imageExtent = {width, height, 1};
-        regions.push_back(region);
-    }
+    CreateHostVisibleBuffer(device, m_device, mipUpload.pixels.size(),
+        VK_BUFFER_USAGE_TRANSFER_SRC_BIT, mipUpload.pixels.data(), staging);
 
     VkCommandPool uploadPool = VK_NULL_HANDLE;
     VkCommandBuffer cmd = BeginOneTimeCommands(m_device, device.GetGraphicsQueueFamily(), uploadPool);
-    TransitionImageLayoutArray(cmd, out.image, 1, layers, VK_IMAGE_LAYOUT_UNDEFINED,
+    TransitionImageLayoutArray(cmd, out.image, mipUpload.mipLevels, layers, VK_IMAGE_LAYOUT_UNDEFINED,
         VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL);
     vkCmdCopyBufferToImage(cmd, staging.buffer, out.image, VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL,
-        static_cast<uint32_t>(regions.size()), regions.data());
-    TransitionImageLayoutArray(cmd, out.image, 1, layers, VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL,
+        static_cast<uint32_t>(mipUpload.regions.size()), mipUpload.regions.data());
+    TransitionImageLayoutArray(cmd, out.image, mipUpload.mipLevels, layers, VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL,
         VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL);
     EndOneTimeCommands(m_device, graphicsQueue, uploadPool, cmd);
     DestroyBuffer(staging);
@@ -3403,7 +3659,7 @@ bool TerrainRenderer::UploadRgbaTextureArray(VulkanDevice& device,
     out.format = format;
     out.width = width;
     out.height = height;
-    out.mipLevels = 1;
+    out.mipLevels = mipUpload.mipLevels;
     out.name = name;
 
     VkImageViewCreateInfo view{};
@@ -3412,7 +3668,7 @@ bool TerrainRenderer::UploadRgbaTextureArray(VulkanDevice& device,
     view.viewType = VK_IMAGE_VIEW_TYPE_2D_ARRAY;
     view.format = out.format;
     view.subresourceRange.aspectMask = VK_IMAGE_ASPECT_COLOR_BIT;
-    view.subresourceRange.levelCount = 1;
+    view.subresourceRange.levelCount = out.mipLevels;
     view.subresourceRange.layerCount = layers;
     VK_CHECK(vkCreateImageView(m_device, &view, nullptr, &out.view));
 
@@ -3420,7 +3676,7 @@ bool TerrainRenderer::UploadRgbaTextureArray(VulkanDevice& device,
     sampler.sType = VK_STRUCTURE_TYPE_SAMPLER_CREATE_INFO;
     sampler.magFilter = VK_FILTER_LINEAR;
     sampler.minFilter = VK_FILTER_LINEAR;
-    sampler.mipmapMode = VK_SAMPLER_MIPMAP_MODE_NEAREST;
+    sampler.mipmapMode = out.mipLevels > 1 ? VK_SAMPLER_MIPMAP_MODE_LINEAR : VK_SAMPLER_MIPMAP_MODE_NEAREST;
     sampler.addressModeU = VK_SAMPLER_ADDRESS_MODE_REPEAT;
     sampler.addressModeV = VK_SAMPLER_ADDRESS_MODE_REPEAT;
     sampler.addressModeW = VK_SAMPLER_ADDRESS_MODE_REPEAT;
@@ -3429,10 +3685,18 @@ bool TerrainRenderer::UploadRgbaTextureArray(VulkanDevice& device,
         sampler.anisotropyEnable = VK_TRUE;
         sampler.maxAnisotropy = device.GetMaxSamplerAnisotropy();
     }
-    if (name.find("palette") != std::string::npos)
-        sampler.mipLodBias = -0.5f;
-    sampler.maxLod = 1.0f;
+    sampler.mipLodBias = 0.0f;
+    sampler.maxLod = static_cast<float>(out.mipLevels > 0 ? out.mipLevels - 1u : 0u);
     VK_CHECK(vkCreateSampler(m_device, &sampler, nullptr, &out.sampler));
+    Tracenf("[TERRAIN-MIPS] generated array=%s size=%ux%u layers=%u mips=%u format=%s normalRenorm=%s sampler=trilinear aniso=%s",
+        name.c_str(),
+        width,
+        height,
+        layers,
+        out.mipLevels,
+        VkFormatName(format),
+        normalMap ? "yes" : "no",
+        sampler.anisotropyEnable ? "yes" : "no");
     return true;
 }
 
@@ -3452,32 +3716,20 @@ bool TerrainRenderer::UploadR8TextureArray(VulkanDevice& device,
     VkQueue graphicsQueue = VK_NULL_HANDLE;
     vkGetDeviceQueue(m_device, device.GetGraphicsQueueFamily(), 0, &graphicsQueue);
 
-    CreateDeviceLocalImageArray(device, m_device, width, height, 1, layers,
+    const ArrayMipUpload mipUpload = BuildR8ArrayMipUpload(width, height, layers, pixels);
+    CreateDeviceLocalImageArray(device, m_device, width, height, mipUpload.mipLevels, layers,
         VK_FORMAT_R8_UNORM, out.image, out.memory);
     Buffer staging{};
-    CreateHostVisibleBuffer(device, m_device, pixels.size(), VK_BUFFER_USAGE_TRANSFER_SRC_BIT, pixels.data(), staging);
-
-    std::vector<VkBufferImageCopy> regions;
-    regions.reserve(layers);
-    const VkDeviceSize layerSize = static_cast<VkDeviceSize>(width) * height;
-    for (uint32_t layer = 0; layer < layers; ++layer)
-    {
-        VkBufferImageCopy region{};
-        region.bufferOffset = layerSize * layer;
-        region.imageSubresource.aspectMask = VK_IMAGE_ASPECT_COLOR_BIT;
-        region.imageSubresource.baseArrayLayer = layer;
-        region.imageSubresource.layerCount = 1;
-        region.imageExtent = {width, height, 1};
-        regions.push_back(region);
-    }
+    CreateHostVisibleBuffer(device, m_device, mipUpload.pixels.size(),
+        VK_BUFFER_USAGE_TRANSFER_SRC_BIT, mipUpload.pixels.data(), staging);
 
     VkCommandPool uploadPool = VK_NULL_HANDLE;
     VkCommandBuffer cmd = BeginOneTimeCommands(m_device, device.GetGraphicsQueueFamily(), uploadPool);
-    TransitionImageLayoutArray(cmd, out.image, 1, layers, VK_IMAGE_LAYOUT_UNDEFINED,
+    TransitionImageLayoutArray(cmd, out.image, mipUpload.mipLevels, layers, VK_IMAGE_LAYOUT_UNDEFINED,
         VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL);
     vkCmdCopyBufferToImage(cmd, staging.buffer, out.image, VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL,
-        static_cast<uint32_t>(regions.size()), regions.data());
-    TransitionImageLayoutArray(cmd, out.image, 1, layers, VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL,
+        static_cast<uint32_t>(mipUpload.regions.size()), mipUpload.regions.data());
+    TransitionImageLayoutArray(cmd, out.image, mipUpload.mipLevels, layers, VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL,
         VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL);
     EndOneTimeCommands(m_device, graphicsQueue, uploadPool, cmd);
     DestroyBuffer(staging);
@@ -3485,7 +3737,7 @@ bool TerrainRenderer::UploadR8TextureArray(VulkanDevice& device,
     out.format = VK_FORMAT_R8_UNORM;
     out.width = width;
     out.height = height;
-    out.mipLevels = 1;
+    out.mipLevels = mipUpload.mipLevels;
     out.name = name;
 
     VkImageViewCreateInfo view{};
@@ -3494,7 +3746,7 @@ bool TerrainRenderer::UploadR8TextureArray(VulkanDevice& device,
     view.viewType = VK_IMAGE_VIEW_TYPE_2D_ARRAY;
     view.format = out.format;
     view.subresourceRange.aspectMask = VK_IMAGE_ASPECT_COLOR_BIT;
-    view.subresourceRange.levelCount = 1;
+    view.subresourceRange.levelCount = out.mipLevels;
     view.subresourceRange.layerCount = layers;
     VK_CHECK(vkCreateImageView(m_device, &view, nullptr, &out.view));
 
@@ -3502,7 +3754,7 @@ bool TerrainRenderer::UploadR8TextureArray(VulkanDevice& device,
     sampler.sType = VK_STRUCTURE_TYPE_SAMPLER_CREATE_INFO;
     sampler.magFilter = VK_FILTER_LINEAR;
     sampler.minFilter = VK_FILTER_LINEAR;
-    sampler.mipmapMode = VK_SAMPLER_MIPMAP_MODE_NEAREST;
+    sampler.mipmapMode = out.mipLevels > 1 ? VK_SAMPLER_MIPMAP_MODE_LINEAR : VK_SAMPLER_MIPMAP_MODE_NEAREST;
     sampler.addressModeU = VK_SAMPLER_ADDRESS_MODE_REPEAT;
     sampler.addressModeV = VK_SAMPLER_ADDRESS_MODE_REPEAT;
     sampler.addressModeW = VK_SAMPLER_ADDRESS_MODE_REPEAT;
@@ -3511,8 +3763,17 @@ bool TerrainRenderer::UploadR8TextureArray(VulkanDevice& device,
         sampler.anisotropyEnable = VK_TRUE;
         sampler.maxAnisotropy = device.GetMaxSamplerAnisotropy();
     }
-    sampler.maxLod = 1.0f;
+    sampler.mipLodBias = 0.0f;
+    sampler.maxLod = static_cast<float>(out.mipLevels > 0 ? out.mipLevels - 1u : 0u);
     VK_CHECK(vkCreateSampler(m_device, &sampler, nullptr, &out.sampler));
+    Tracenf("[TERRAIN-MIPS] generated array=%s size=%ux%u layers=%u mips=%u format=%s data=linear sampler=trilinear aniso=%s",
+        name.c_str(),
+        width,
+        height,
+        layers,
+        out.mipLevels,
+        VkFormatName(out.format),
+        sampler.anisotropyEnable ? "yes" : "no");
     return true;
 }
 
@@ -5180,6 +5441,26 @@ bool TerrainRenderer::LoadTerrainPaletteFromPaths(VulkanDevice& device, const st
         m_baseTexture.height,
         VkFormatName(m_baseTexture.format),
         VkFormatName(m_normalTexture.format));
+    if (!m_triPerfPaletteLogged)
+    {
+        Tracenf("[TRI-PERF] palette size=%ux%u layers=%zu format(diffuse=%s normal=%s ao=%s roughness=%s metallic=%s height=%s) mips(diffuse=%u normal=%u ao=%u roughness=%u metallic=%u height=%u)",
+            m_baseTexture.width,
+            m_baseTexture.height,
+            images.size(),
+            VkFormatName(m_baseTexture.format),
+            VkFormatName(m_normalTexture.format),
+            VkFormatName(m_aoTexture.format),
+            VkFormatName(m_roughnessTexture.format),
+            VkFormatName(m_metallicTexture.format),
+            VkFormatName(m_heightTexture.format),
+            m_baseTexture.mipLevels,
+            m_normalTexture.mipLevels,
+            m_aoTexture.mipLevels,
+            m_roughnessTexture.mipLevels,
+            m_metallicTexture.mipLevels,
+            m_heightTexture.mipLevels);
+        m_triPerfPaletteLogged = true;
+    }
     return true;
 }
 
@@ -7248,6 +7529,30 @@ void TerrainRenderer::UpdateUniform(uint32_t frameIndex, const WorldCamera& came
         if (m_sceneTerrain.triplanarEnabled)
             Tracen("[TRIPLANAR] sample mode active, layers=8");
         m_triplanarParamsDirty = false;
+    }
+    if (m_sceneTerrain.triplanarEnabled && !m_triPerfStaticLogged)
+    {
+        const bool terrainMipsUsable =
+            m_baseTexture.mipLevels > 1 &&
+            m_normalTexture.mipLevels > 1 &&
+            m_aoTexture.mipLevels > 1 &&
+            m_roughnessTexture.mipLevels > 1 &&
+            m_metallicTexture.mipLevels > 1;
+        const double avgActiveLayers = EstimateAverageActiveSplatLayers(m_splatABytes, m_splatBBytes, m_splatWidth, m_splatHeight);
+        const double gatedPlanarSamples = 2.0 + avgActiveLayers * 5.0;
+        const double gatedTriplanarSamples = 2.0 + avgActiveLayers * 15.0;
+        Tracenf("[TRI-PERF] avgActiveLayers=%.2f samples/fragment planar=%.1f triplanar=%.1f unconditionalPlanar=42 unconditionalTriplanar=122 layers=8 maps=diff,nor,ao,roughness,metallic axes=1|3 splat=2 shadow_pcf=25-50-independent",
+            avgActiveLayers,
+            gatedPlanarSamples,
+            gatedTriplanarSamples);
+        Tracenf("[TRI-PERF] triplanar LOD mode=textureGrad-explicit mipUsed=%s forced-0=%s reason=%s",
+            terrainMipsUsable ? "yes" : "no",
+            terrainMipsUsable ? "no" : "yes",
+            terrainMipsUsable ? "terrain-array-textures-have-full-mip-chain-and-branch-safe-gradients" : "one-or-more-terrain-array-textures-have-1-mip");
+        Tracen("[TRI-PERF] layer sampling=weight-gated threshold=1/255 derivativeSafe=textureGrad-gradients-before-branch");
+        Tracenf("[TRI-PERF] likely bottleneck class=%s",
+            terrainMipsUsable ? "active-layer-count-and-remaining-triplanar-sample-count" : "fragment-texture-bandwidth-plus-mip0-cache-pressure");
+        m_triPerfStaticLogged = true;
     }
 }
 

@@ -224,12 +224,6 @@ void VulkanDevice::BeginFrame()
         VK_NULL_HANDLE,
         &m_imageIndex);
 
-    LogFormat("[SWP-DIAG] acquire frame=%llu swapchain=0x%llx -> imageIndex=%u result=%s",
-        static_cast<unsigned long long>(m_frameNumber),
-        VkHandleBits(m_swapchain),
-        m_imageIndex,
-        VkResultName(acquire));
-
     if (acquire == VK_ERROR_OUT_OF_DATE_KHR)
     {
         Log("[VULKAN] acquireNextImage: VK_ERROR_OUT_OF_DATE_KHR - rebuilding swap-chain");
@@ -355,14 +349,6 @@ void VulkanDevice::EndFrame()
     submit.pSignalSemaphores = &m_renderFinished[m_imageIndex];
 
     // The fence protects CPU reuse of this frame's command buffer and sync objects.
-    if (m_swapchainTransitionThisFrame)
-    {
-        LogFormat("[SWP-DIAG] submit frame=%llu targetImageIndex=%u lastAcquiredImageIndex=%d match=%s",
-            static_cast<unsigned long long>(m_frameNumber),
-            m_imageIndex,
-            m_lastAcquiredImageIndex,
-            m_lastAcquiredImageIndex == static_cast<int>(m_imageIndex) ? "yes" : "no");
-    }
     VK_CHECK(vkQueueSubmit(m_graphicsQueue, 1, &submit, m_inFlightFences[m_currentFrame]));
 
     VkPresentInfoKHR present{};
@@ -374,10 +360,6 @@ void VulkanDevice::EndFrame()
     present.pImageIndices = &m_imageIndex;
 
     const VkResult result = vkQueuePresentKHR(m_presentQueue, &present);
-    LogFormat("[SWP-DIAG] present frame=%llu imageIndex=%u result=%s",
-        static_cast<unsigned long long>(m_frameNumber),
-        m_imageIndex,
-        VkResultName(result));
     if (result == VK_ERROR_OUT_OF_DATE_KHR)
     {
         Log("[VULKAN] present: VK_ERROR_OUT_OF_DATE_KHR - rebuilding swap-chain");
@@ -1102,20 +1084,12 @@ int VulkanDevice::FindSwapchainImageIndex(VkImage image) const
 
 void VulkanDevice::LogSwapchainImageTransition(VkImage image, VkImageLayout oldLayout, VkImageLayout newLayout, const char* passName) const
 {
+    (void)oldLayout;
+    (void)newLayout;
+    (void)passName;
     const int swapchainIndex = FindSwapchainImageIndex(image);
     if (swapchainIndex < 0)
         return;
-
-    const bool acquiredMatch = m_acquiredThisFrame && m_lastAcquiredImageIndex == swapchainIndex;
-    LogFormat("[SWP-DIAG] transition frame=%llu image=0x%llx swpIndex=%d old=%s new=%s pass=%s acquiredThisFrame=%s acquiredImageIndex=%d",
-        static_cast<unsigned long long>(m_frameNumber),
-        VkHandleBits(image),
-        swapchainIndex,
-        VkImageLayoutName(oldLayout),
-        VkImageLayoutName(newLayout),
-        passName ? passName : "other",
-        acquiredMatch ? "yes" : "no",
-        m_acquiredThisFrame ? m_lastAcquiredImageIndex : -1);
 }
 
 VulkanDevice::QueueFamilies VulkanDevice::FindQueueFamilies(VkPhysicalDevice device) const

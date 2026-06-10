@@ -992,6 +992,26 @@ bool RunRenderChecks(const Options& options, TestContext& ctx)
     ctx.Expect(terrainRendererSource.find("const float pz = halfDepth - static_cast<float>(z) * cellSize") != std::string::npos &&
             terrainRendererSource.find("const float centerYcm = m_spawnLocalYcm - m_editorBrushLocalZ * 100.0f") != std::string::npos,
         "created terrain edit z convention", "Created terrain vertices must use the same Z orientation as sculpt/splat world-to-grid mapping");
+    ctx.Expect(terrainRendererSource.find("[TRI-PERF] terrain pipeline bound in pass=main") != std::string::npos &&
+            terrainRendererSource.find("[TRI-PERF] terrain pipeline bound in pass=water-reflection") != std::string::npos &&
+            terrainRendererSource.find("[TRI-PERF] terrain pipeline bound in pass=shadow-cascade0") != std::string::npos &&
+            terrainRendererSource.find("[TRI-PERF] avgActiveLayers=%.2f samples/fragment planar=%.1f triplanar=%.1f") != std::string::npos &&
+            terrainRendererSource.find("[TRI-PERF] triplanar LOD mode=textureGrad-explicit mipUsed=%s forced-0=%s") != std::string::npos &&
+            terrainRendererSource.find("[TRI-PERF] layer sampling=weight-gated threshold=1/255") != std::string::npos &&
+            terrainRendererSource.find("[TRI-PERF] palette size=") != std::string::npos,
+        "terrain triplanar perf diagnostics", "Terrain renderer must log pass inventory, sample count, LOD mode, layer gating, and palette texture details");
+    ctx.Expect(terrainRendererSource.find("BuildRgbaArrayMipUpload") != std::string::npos &&
+            terrainRendererSource.find("BuildR8ArrayMipUpload") != std::string::npos &&
+            terrainRendererSource.find("normalRenorm=%s") != std::string::npos &&
+            terrainRendererSource.find("sampler=trilinear aniso=%s") != std::string::npos &&
+            terrainRendererSource.find("sampler.mipmapMode = out.mipLevels > 1 ? VK_SAMPLER_MIPMAP_MODE_LINEAR") != std::string::npos,
+        "terrain array texture mip chains", "Terrain array textures must upload full mip chains and use trilinear/aniso sampling");
+    ctx.Expect(terrainSource.find("const float layerWeightEpsilon = 1.0 / 255.0") != std::string::npos &&
+            terrainSource.find("if (weights[layer] < layerWeightEpsilon)") != std::string::npos &&
+            terrainSource.find("continue;") != std::string::npos &&
+            terrainSource.find("SampleGrad") != std::string::npos &&
+            terrainSource.find("TriplanarPlaneUvGrad") != std::string::npos,
+        "terrain layer weight gating", "Terrain shader must skip zero-weight layers while using explicit gradients for mip-safe sampling");
     const std::filesystem::path waterBodyIoPath = options.clientRoot / "libs" / "render" / "WaterBodyIO.h";
     std::ifstream waterBodyIo(waterBodyIoPath);
     std::stringstream waterBodyIoText;

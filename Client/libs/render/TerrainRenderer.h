@@ -507,6 +507,11 @@ private:
     std::array<MapEditorPaletteSlot, 8> m_paletteSlots{};
     bool m_materialParamsDirty = false;
     bool m_triplanarParamsDirty = false;
+    bool m_triPerfStaticLogged = false;
+    bool m_triPerfPaletteLogged = false;
+    bool m_triPerfMainPassLogged = false;
+    bool m_triPerfReflectionPassLogged = false;
+    bool m_triPerfShadowPassLogged = false;
     std::string m_loadedMapDirectory;
     int32_t m_loadedServerX = 0;
     int32_t m_loadedServerY = 0;
