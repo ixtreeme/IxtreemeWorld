@@ -634,6 +634,8 @@ bool RunAssetTests(const Options& options, TestContext& ctx)
     terrainScene.terrain.cellsX = 33;
     terrainScene.terrain.cellsZ = 17;
     terrainScene.terrain.chunkSizeCells = 32;
+    terrainScene.terrain.triplanarEnabled = true;
+    terrainScene.terrain.triplanarSharpness = 5.5f;
     terrainScene.terrain.heightCmGrid.resize(static_cast<std::size_t>(terrainScene.terrain.cellsX + 1u) *
         (terrainScene.terrain.cellsZ + 1u), 0.0f);
     terrainScene.terrain.heightCmGrid[static_cast<std::size_t>(16) * (terrainScene.terrain.cellsX + 1u) + 32u] = 123.0f;
@@ -703,6 +705,8 @@ bool RunAssetTests(const Options& options, TestContext& ctx)
             loadedTerrain.cellsX == 33 &&
             loadedTerrain.cellsZ == 17 &&
             loadedTerrain.chunkSizeCells == 32 &&
+            loadedTerrain.triplanarEnabled &&
+            std::abs(loadedTerrain.triplanarSharpness - 5.5f) < 0.01f &&
             loadedTerrain.chunkManifestRef == "ChunkedTerrain_terrain_map/map.manifest" &&
             loadedHeightIndex < loadedTerrain.heightCmGrid.size() &&
             std::abs(loadedTerrain.heightCmGrid[loadedHeightIndex] - 123.0f) < 0.5f &&
@@ -717,7 +721,7 @@ bool RunAssetTests(const Options& options, TestContext& ctx)
             std::abs(scenes.GetCurrentScene().paletteSlots[2].uvOffset[0] - 0.125f) < 0.01f &&
             std::abs(scenes.GetCurrentScene().paletteSlots[2].uvOffset[1] + 0.25f) < 0.01f &&
             std::abs(scenes.GetCurrentScene().paletteSlots[2].uvRotationDegrees - 37.0f) < 0.01f,
-        "terrain chunk round-trip", "chunked terrain dimensions, manifest, height, or splat data did not round-trip");
+        "terrain chunk round-trip", "chunked terrain dimensions, manifest, triplanar state, height, or splat data did not round-trip");
 
     RunMapDataBaselineTest(ctx);
 
@@ -832,6 +836,11 @@ bool RunRenderChecks(const Options& options, TestContext& ctx)
         "terrain debug color layers removed", "Terrain shader still contains old blue/green/red debug layers");
     ctx.Expect(terrainSource.find("finalColor = finalColor / (finalColor + 1.0.xxx)") == std::string::npos,
         "terrain local tone-map removed", "Terrain shader still performs local Reinhard tone-mapping");
+    ctx.Expect(terrainSource.find("u_terrainMaterialParams") != std::string::npos &&
+            terrainSource.find("TriplanarWeights") != std::string::npos &&
+            terrainSource.find("TriplanarNormalToWorld") != std::string::npos &&
+            terrainSource.find("TriplanarPlaneUv") != std::string::npos,
+        "terrain triplanar shader path", "Terrain shader is missing triplanar UV/normal sampling support");
 
     const std::filesystem::path vulkanDevicePath = options.clientRoot / "libs" / "platform" / "VulkanDevice.cpp";
     std::ifstream vulkanDevice(vulkanDevicePath);
@@ -873,6 +882,23 @@ bool RunRenderChecks(const Options& options, TestContext& ctx)
             offscreenSource.find("m_sceneDepthSnapshot") != std::string::npos,
         "offscreen scene snapshot source", "Offscreen scene renderer is missing WATER-3 scene color/depth snapshots");
 
+    const std::filesystem::path offscreenRendererHeaderPath = options.clientRoot / "libs" / "render" / "OffscreenSceneRenderer.h";
+    std::ifstream offscreenRendererHeader(offscreenRendererHeaderPath);
+    std::stringstream offscreenRendererHeaderText;
+    offscreenRendererHeaderText << offscreenRendererHeader.rdbuf();
+    const std::string offscreenHeaderSource = offscreenRendererHeaderText.str();
+    const std::filesystem::path sceneViewEditorImGuiPath = options.clientRoot / "libs" / "render" / "EditorImGui.cpp";
+    std::ifstream editorImGuiForSceneView(sceneViewEditorImGuiPath);
+    std::stringstream editorImGuiForSceneViewText;
+    editorImGuiForSceneViewText << editorImGuiForSceneView.rdbuf();
+    const std::string editorImGuiSceneViewSource = editorImGuiForSceneViewText.str();
+    ctx.Expect(offscreenHeaderSource.find("GetSceneColorView") != std::string::npos &&
+            editorImGuiSceneViewSource.find("SetSceneViewTexture") != std::string::npos &&
+            editorImGuiSceneViewSource.find("ImGui_ImplVulkan_AddTexture") != std::string::npos &&
+            editorImGuiSceneViewSource.find("ImGui::Image(reinterpret_cast<ImTextureID>(m_sceneViewDescriptor), imageSize)") != std::string::npos &&
+            editorImGuiSceneViewSource.find("sceneViewSize[0] = imageSize.x") != std::string::npos,
+        "scene view draws offscreen target", "Scene View must present the offscreen scene color target inside the docked ImGui panel");
+
     const std::filesystem::path mainPath = options.clientRoot / "apps" / "client" / "src" / "main.cpp";
     std::ifstream mainFile(mainPath);
     std::stringstream mainText;
@@ -881,6 +907,28 @@ bool RunRenderChecks(const Options& options, TestContext& ctx)
     ctx.Expect(mainSource.find("offscreenScene.BeginMainPass") != std::string::npos &&
             mainSource.find("offscreenScene.RenderComposite") != std::string::npos,
         "main render loop uses offscreen composite", "Main render loop does not route 3D through offscreen composite");
+    ctx.Expect(editorImGuiSceneViewSource.find("IsSceneViewInputTarget") != std::string::npos &&
+            editorImGuiSceneViewSource.find("MapInputToSceneView") != std::string::npos &&
+            editorImGuiSceneViewSource.find("SetSceneViewKeyboardFocus") != std::string::npos &&
+            editorImGuiSceneViewSource.find("diag.sceneViewHovered") != std::string::npos &&
+            mainSource.find("!sceneViewInputTarget") != std::string::npos &&
+            mainSource.find("editorFlyCameraKey") != std::string::npos &&
+            mainSource.find("editorFlyMovement") != std::string::npos &&
+            mainSource.find("editorRightMouseHeld") != std::string::npos &&
+            mainSource.find("cameraRmbInput") != std::string::npos &&
+            mainSource.find("cameraController.IsFreeCameraEnabled()") != std::string::npos &&
+            mainSource.find("editorImGui.SetSceneViewKeyboardFocus(sceneViewInputTarget)") != std::string::npos &&
+            mainSource.find("viewportEvent = editorImGui.MapInputToSceneView(event)") != std::string::npos,
+        "scene view routes viewport input", "Scene View must bypass generic ImGui capture and map mouse input into render-target coordinates");
+    const std::filesystem::path nativeWindowWin32Path = options.clientRoot / "libs" / "platform" / "NativeWindow_Win32.cpp";
+    std::ifstream nativeWindowWin32(nativeWindowWin32Path);
+    std::stringstream nativeWindowWin32Text;
+    nativeWindowWin32Text << nativeWindowWin32.rdbuf();
+    const std::string nativeWindowWin32Source = nativeWindowWin32Text.str();
+    ctx.Expect(nativeWindowWin32Source.find("IsEngineKeyboardInputMessage") != std::string::npos &&
+            nativeWindowWin32Source.find("WM_KEYDOWN") != std::string::npos &&
+            nativeWindowWin32Source.find("WantCapture gate before viewport tools") != std::string::npos,
+        "win32 dispatches viewport keyboard input", "Win32 input must dispatch key events to the engine even when ImGui consumes the native message");
     ctx.Expect(mainSource.find("offscreenScene.SnapshotScene") != std::string::npos &&
             mainSource.find("terrain.SetWaterRefractionInputs") != std::string::npos &&
             mainSource.find("offscreenScene.BeginMainPass(device, false)") != std::string::npos,
@@ -941,6 +989,9 @@ bool RunRenderChecks(const Options& options, TestContext& ctx)
     std::stringstream terrainRendererText;
     terrainRendererText << terrainRenderer.rdbuf();
     const std::string terrainRendererSource = terrainRendererText.str();
+    ctx.Expect(terrainRendererSource.find("const float pz = halfDepth - static_cast<float>(z) * cellSize") != std::string::npos &&
+            terrainRendererSource.find("const float centerYcm = m_spawnLocalYcm - m_editorBrushLocalZ * 100.0f") != std::string::npos,
+        "created terrain edit z convention", "Created terrain vertices must use the same Z orientation as sculpt/splat world-to-grid mapping");
     const std::filesystem::path waterBodyIoPath = options.clientRoot / "libs" / "render" / "WaterBodyIO.h";
     std::ifstream waterBodyIo(waterBodyIoPath);
     std::stringstream waterBodyIoText;
@@ -1427,6 +1478,10 @@ bool RunRenderChecks(const Options& options, TestContext& ctx)
             editorImGuiSource.find("ImGuiKey_F") != std::string::npos &&
             clientMainSource.find("[HIERARCHY] Focused camera on entity") != std::string::npos,
         "hierarchy focus camera", "HIERARCHY-2 must focus the editor camera on selected hierarchy entities with F/double-click/context menu");
+    ctx.Expect(clientMainSource.find("float yaw_ = 0.0f") != std::string::npos &&
+            clientMainSource.find("float pitch_ = -25.0f") != std::string::npos &&
+            clientMainSource.find("WorldVec3 eye_ = {0.0f, 8.0f, -18.0f}") != std::string::npos,
+        "editor default camera sees origin", "Editor fly camera must boot looking toward the scene origin instead of the sky/background");
     ctx.Expect(editorImGuiSource.find("RenderSelectedWaterBodyInspector") != std::string::npos &&
             editorImGuiSource.find("RenderSelectedLightInspector") != std::string::npos &&
             editorImGuiSource.find("RenderTransformComponent") != std::string::npos &&

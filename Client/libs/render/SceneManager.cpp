@@ -1224,6 +1224,8 @@ bool SceneManager::LoadSceneInternal(const std::string& path)
         scene.terrain.heightmapRef = ReadString(*terrain, "heightmap_ref");
         scene.terrain.splatRef = ReadString(*terrain, "splat_ref");
         scene.terrain.maskRef = ReadString(*terrain, "mask_ref");
+        scene.terrain.triplanarEnabled = ReadBool(*terrain, "triplanar_enabled", scene.terrain.triplanarEnabled);
+        scene.terrain.triplanarSharpness = ReadFloat(*terrain, "triplanar_sharpness", scene.terrain.triplanarSharpness);
     }
     else
     {
@@ -1255,11 +1257,12 @@ bool SceneManager::LoadSceneInternal(const std::string& path)
         scene.terrain.cellsX = std::max(1u, scene.terrain.cellsX);
         scene.terrain.cellsZ = std::max(1u, scene.terrain.cellsZ);
         scene.terrain.chunkSizeCells = std::clamp(scene.terrain.chunkSizeCells == 0 ? 64u : scene.terrain.chunkSizeCells, 32u, 256u);
+        scene.terrain.triplanarSharpness = std::clamp(scene.terrain.triplanarSharpness, 1.0f, 16.0f);
         if (scene.terrain.widthMeters <= 0.0f)
             scene.terrain.widthMeters = static_cast<float>(scene.terrain.cellsX) * scene.terrain.cellSizeMeters;
         if (scene.terrain.depthMeters <= 0.0f)
             scene.terrain.depthMeters = static_cast<float>(scene.terrain.cellsZ) * scene.terrain.cellSizeMeters;
-        Tracenf("[SCENE] terrain loaded: dims=%.2fx%.2f m cellSize=%.2f cells=%ux%u chunkSize=%u manifest=%s files=%s/%s/%s",
+        Tracenf("[SCENE] terrain loaded: dims=%.2fx%.2f m cellSize=%.2f cells=%ux%u chunkSize=%u manifest=%s files=%s/%s/%s triplanar=%s sharpness=%.2f",
             scene.terrain.widthMeters,
             scene.terrain.depthMeters,
             scene.terrain.cellSizeMeters,
@@ -1269,7 +1272,9 @@ bool SceneManager::LoadSceneInternal(const std::string& path)
             scene.terrain.chunkManifestRef.c_str(),
             scene.terrain.heightmapRef.c_str(),
             scene.terrain.splatRef.c_str(),
-            scene.terrain.maskRef.c_str());
+            scene.terrain.maskRef.c_str(),
+            scene.terrain.triplanarEnabled ? "yes" : "no",
+            scene.terrain.triplanarSharpness);
     }
     else
     {
@@ -1378,14 +1383,16 @@ bool SceneManager::SaveSceneInternal(const std::string& path)
             TraceError("[SCENE] terrain chunk save failed: %s", path.c_str());
             return false;
         }
-        Tracenf("[SCENE] terrain saved: dims=%.2fx%.2f m cellSize=%.2f cells=%ux%u chunkSize=%u manifest=%s",
+        Tracenf("[SCENE] terrain saved: dims=%.2fx%.2f m cellSize=%.2f cells=%ux%u chunkSize=%u manifest=%s triplanar=%s sharpness=%.2f",
             scene.terrain.widthMeters,
             scene.terrain.depthMeters,
             scene.terrain.cellSizeMeters,
             scene.terrain.cellsX,
             scene.terrain.cellsZ,
             scene.terrain.chunkSizeCells,
-            scene.terrain.chunkManifestRef.c_str());
+            scene.terrain.chunkManifestRef.c_str(),
+            scene.terrain.triplanarEnabled ? "yes" : "no",
+            scene.terrain.triplanarSharpness);
     }
     else
     {
@@ -1438,7 +1445,9 @@ bool SceneManager::SaveSceneInternal(const std::string& path)
         out << "    \"chunk_manifest_ref\": \"" << EscapeJson(scene.terrain.chunkManifestRef) << "\",\n";
         out << "    \"heightmap_ref\": \"" << EscapeJson(scene.terrain.heightmapRef) << "\",\n";
         out << "    \"splat_ref\": \"" << EscapeJson(scene.terrain.splatRef) << "\",\n";
-        out << "    \"mask_ref\": \"" << EscapeJson(scene.terrain.maskRef) << "\"\n";
+        out << "    \"mask_ref\": \"" << EscapeJson(scene.terrain.maskRef) << "\",\n";
+        out << "    \"triplanar_enabled\": " << (scene.terrain.triplanarEnabled ? "true" : "false") << ",\n";
+        out << "    \"triplanar_sharpness\": " << std::clamp(scene.terrain.triplanarSharpness, 1.0f, 16.0f) << "\n";
         out << "  },\n";
     }
     else

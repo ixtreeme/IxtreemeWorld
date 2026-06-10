@@ -42,11 +42,14 @@
 #include <cstdio>
 #include <cstdint>
 #include <cstdlib>
+#include <ctime>
 #include <filesystem>
 #include <functional>
+#include <limits>
 #include <memory>
 #include <optional>
 #include <string>
+#include <thread>
 #include <type_traits>
 #include <unordered_map>
 #include <utility>
@@ -870,8 +873,8 @@ private:
     bool dragActive_ = false;
     int lastMouseX_ = 0;
     int lastMouseY_ = 0;
-    float yaw_ = 3.1415926535f;
-    float pitch_ = 25.0f * 3.1415926535f / 180.0f;
+    float yaw_ = 0.0f;
+    float pitch_ = -25.0f * 3.1415926535f / 180.0f;
     float speedScale_ = 1.0f;
     WorldVec3 eye_ = {0.0f, 8.0f, -18.0f};
 };
@@ -890,6 +893,69 @@ std::string ExecutableDirectory()
 #else
     return ".";
 #endif
+}
+
+bool EngineAssetRootLooksValid(const std::filesystem::path& root)
+{
+    std::error_code ec;
+    return std::filesystem::exists(root / "assets" / "shaders" / "composite_ps.spv", ec) &&
+        std::filesystem::exists(root / "assets" / "shaders" / "terrain_ps.spv", ec) &&
+        std::filesystem::exists(root / "assets" / "shaders" / "rmlui_ps.spv", ec);
+}
+
+std::optional<std::filesystem::path> FindClientRootNear(std::filesystem::path start)
+{
+    std::error_code ec;
+    start = std::filesystem::absolute(start, ec);
+    if (ec)
+        return std::nullopt;
+    if (std::filesystem::is_regular_file(start, ec))
+        start = start.parent_path();
+
+    for (std::filesystem::path current = start; !current.empty(); current = current.parent_path())
+    {
+        if (EngineAssetRootLooksValid(current))
+            return current;
+
+        const std::filesystem::path clientChild = current / "Client";
+        if (EngineAssetRootLooksValid(clientChild))
+            return clientChild;
+
+        if (current == current.root_path())
+            break;
+    }
+    return std::nullopt;
+}
+
+std::filesystem::path ResolveEngineAssetRoot()
+{
+    const std::filesystem::path exeDir(ExecutableDirectory());
+    std::vector<std::filesystem::path> candidates;
+
+    if (auto clientRoot = FindClientRootNear(exeDir))
+        candidates.push_back(*clientRoot);
+
+    std::error_code ec;
+    const std::filesystem::path cwd = std::filesystem::current_path(ec);
+    if (!ec)
+    {
+        if (auto clientRoot = FindClientRootNear(cwd))
+            candidates.push_back(*clientRoot);
+    }
+
+    candidates.push_back(exeDir);
+
+    for (const std::filesystem::path& candidate : candidates)
+    {
+        if (EngineAssetRootLooksValid(candidate))
+        {
+            Tracenf("[BOOT] engine asset root = %s", candidate.string().c_str());
+            return candidate;
+        }
+    }
+
+    Tracenf("[BOOT] engine asset root fallback = %s (required shaders not found)", exeDir.string().c_str());
+    return exeDir;
 }
 
 std::optional<std::string> ExtractJsonStringField(const std::string& text, const char* key)
@@ -1116,6 +1182,12 @@ void MergeMapEditorCommands(MapEditorCommands& target, const MapEditorCommands& 
         target.paletteSlot = source.paletteSlot;
         target.paletteSlotData = source.paletteSlotData;
     }
+    if (source.terrainTriplanarChanged)
+    {
+        target.terrainTriplanarChanged = true;
+        target.terrainTriplanarEnabled = source.terrainTriplanarEnabled;
+        target.terrainTriplanarSharpness = source.terrainTriplanarSharpness;
+    }
     if (source.gizmoSettingsChanged)
     {
         target.gizmoSettingsChanged = true;
@@ -1289,6 +1361,12 @@ int RunGame(NativeWindow& window,
                 offscreenScene.GetExtent());
             terrain.RecreatePipeline(device);
         }
+#if defined(IXTREEME_WITH_EDITOR)
+        editorImGui.SetSceneViewTexture(offscreenScene.GetLinearSampler(),
+            offscreenScene.GetSceneColorView(),
+            VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL,
+            offscreenScene.GetExtent());
+#endif
     }
     struct StaticMeshCacheEntry
     {
@@ -1514,10 +1592,12 @@ int RunGame(NativeWindow& window,
                 editorImGui.SetPaletteSlots(terrain.GetPaletteSlots());
         }
         editorWaterBodiesDirty = false;
-        Tracenf("[SCENE] Applied editor scene state: water=%zu point=%zu spot=%zu",
+        Tracenf("[SCENE] Applied editor scene state: terrain=%s water=%zu point=%zu spot=%zu mesh=%zu",
+            (terrainOk && terrain.HasTerrain()) ? "yes" : "no",
             editorWaterBodies.size(),
             editorPointLights.size(),
-            editorSpotLights.size());
+            editorSpotLights.size(),
+            editorMeshEntities.size());
     };
     auto buildHierarchyEntities = [&]() {
         std::vector<HierarchySceneEntity> entities;
@@ -1616,6 +1696,8 @@ int RunGame(NativeWindow& window,
 #if defined(IXTREEME_WITH_EDITOR)
     bool editorShiftDown = false;
     bool editorLeftMouseHeld = false;
+    bool editorRightMouseHeld = false;
+    MovementInputState editorFlyMovement;
 #endif
 
     window.SetInputCallback([&runtimeSession,
@@ -1649,6 +1731,8 @@ int RunGame(NativeWindow& window,
                              &editorPlay,
                              &editorShiftDown,
                              &editorLeftMouseHeld,
+                             &editorRightMouseHeld,
+                             &editorFlyMovement,
 #endif
                              &renderSize](const InputEvent& event)
     {
@@ -1657,6 +1741,10 @@ int RunGame(NativeWindow& window,
             editorLeftMouseHeld = true;
         else if (event.type == InputEvent::MouseUp && event.button == MouseButton_Left)
             editorLeftMouseHeld = false;
+        else if (event.type == InputEvent::MouseDown && event.button == MouseButton_Right)
+            editorRightMouseHeld = true;
+        else if (event.type == InputEvent::MouseUp && event.button == MouseButton_Right)
+            editorRightMouseHeld = false;
 
         if (event.type == InputEvent::KeyDown && event.key == Key_Shift)
             editorShiftDown = true;
@@ -1682,6 +1770,9 @@ int RunGame(NativeWindow& window,
                 editorPlay.state.mode = EditorPlayMode::Edit;
             }
             movement.Clear();
+#if defined(IXTREEME_WITH_EDITOR)
+            editorFlyMovement.Clear();
+#endif
             return;
         }
         if (runtimeSession->IsMapEditorOpen() && event.type == InputEvent::KeyDown && event.key == Key_F6)
@@ -1691,10 +1782,59 @@ int RunGame(NativeWindow& window,
             else if (editorPlay.state.mode == EditorPlayMode::PlayPaused)
                 editorPlay.state.mode = EditorPlayMode::Play;
             movement.Clear();
+#if defined(IXTREEME_WITH_EDITOR)
+            editorFlyMovement.Clear();
+#endif
             return;
         }
 #endif
-        if (editorImGui.WantsInputCapture(event))
+        bool sceneViewInputTarget = false;
+        InputEvent viewportEvent = event;
+        const auto isEditorFlyCameraKey = [](const InputEvent& input) {
+            if (input.type != InputEvent::KeyDown && input.type != InputEvent::KeyUp)
+                return false;
+            switch (input.key)
+            {
+            case Key_W:
+            case Key_A:
+            case Key_S:
+            case Key_D:
+            case Key_Space:
+            case Key_Control:
+            case Key_Shift:
+                return true;
+            default:
+                return false;
+            }
+        };
+#if defined(IXTREEME_WITH_EDITOR)
+        sceneViewInputTarget = runtimeSession->IsMapEditorOpen() && editorImGui.IsSceneViewInputTarget(event);
+        if (runtimeSession->IsMapEditorOpen() && event.type == InputEvent::MouseDown)
+            editorImGui.SetSceneViewKeyboardFocus(sceneViewInputTarget);
+        if (sceneViewInputTarget)
+            viewportEvent = editorImGui.MapInputToSceneView(event);
+#endif
+        const bool editorFlyCameraKey =
+            runtimeSession->IsMapEditorOpen() &&
+            cameraController.IsFreeCameraEnabled() &&
+            isEditorFlyCameraKey(event);
+        if (editorFlyCameraKey)
+        {
+            editorFlyMovement.Apply(event);
+            movement.Apply(event);
+            Tracenf("[EDITOR-CAMERA-INPUT] key=%d type=%s state w=%d a=%d s=%d d=%d space=%d ctrl=%d shift=%d",
+                static_cast<int>(event.key),
+                InputEventTypeName(event.type),
+                editorFlyMovement.w ? 1 : 0,
+                editorFlyMovement.a ? 1 : 0,
+                editorFlyMovement.s ? 1 : 0,
+                editorFlyMovement.d ? 1 : 0,
+                editorFlyMovement.space ? 1 : 0,
+                editorFlyMovement.control ? 1 : 0,
+                editorFlyMovement.shift ? 1 : 0);
+            return;
+        }
+        if (editorImGui.WantsInputCapture(event) && !sceneViewInputTarget && !editorFlyCameraKey)
         {
             movement.Clear();
             return;
@@ -1839,7 +1979,7 @@ int RunGame(NativeWindow& window,
                         return;
                     }
                 }
-                if (terrain.HandleEditorInput(event))
+                if (terrain.HandleEditorInput(viewportEvent))
                     return;
             }
 
@@ -1939,8 +2079,8 @@ int RunGame(NativeWindow& window,
                         lastPickCamera,
                         renderSize.width,
                         renderSize.height,
-                        event.x,
-                        event.y);
+                        viewportEvent.x,
+                        viewportEvent.y);
                     if (!hit)
                     {
                         terrain.SetWaterSculptBrush(false, 0.0f, 0.0f, editorSettings.waterSculptRadiusMeters,
@@ -2013,14 +2153,21 @@ int RunGame(NativeWindow& window,
                 const bool terrainToolActive =
                     editorSettings.toolMode == MapEditorToolMode::Heightmap ||
                     editorSettings.toolMode == MapEditorToolMode::SplatPaint;
-                if (!consumedByEditorUi && terrainToolActive &&
-                    (event.type == InputEvent::MouseMove ||
-                     event.type == InputEvent::MouseDown ||
-                     event.type == InputEvent::MouseUp))
+                const bool rightMouseButtonEvent =
+                    (event.type == InputEvent::MouseDown || event.type == InputEvent::MouseUp) &&
+                    event.button == MouseButton_Right;
+                const bool cameraRmbInput =
+                    rightMouseButtonEvent ||
+                    (event.type == InputEvent::MouseMove && editorRightMouseHeld);
+                const bool terrainBrushInput =
+                    event.type == InputEvent::MouseMove ||
+                    ((event.type == InputEvent::MouseDown || event.type == InputEvent::MouseUp) &&
+                     event.button == MouseButton_Left);
+                if (!consumedByEditorUi && terrainToolActive && !cameraRmbInput && terrainBrushInput)
                 {
                     editorObjectDragActive = false;
                     logSculptGateState("before-brush-handler", true, "terrain-tool-route");
-                    terrain.HandleEditorInput(event);
+                    terrain.HandleEditorInput(viewportEvent);
                     return;
                 }
                 if (shouldLogSculptDiag &&
@@ -2037,7 +2184,7 @@ int RunGame(NativeWindow& window,
                 {
                     if (event.button == MouseButton_Left)
                         editorObjectDragActive = false;
-                    terrain.HandleEditorInput(event);
+                    terrain.HandleEditorInput(viewportEvent);
                 }
                 else if (!consumedByEditorUi)
                 {
@@ -2050,8 +2197,8 @@ int RunGame(NativeWindow& window,
                                 lastPickCamera,
                                 renderSize.width,
                                 renderSize.height,
-                                event.x,
-                                event.y))
+                                viewportEvent.x,
+                                viewportEvent.y))
                         {
                             selectedEditorObject = {SelectedEditorObjectType::PointLight, *pointId};
                             editorObjectDragActive = true;
@@ -2064,8 +2211,8 @@ int RunGame(NativeWindow& window,
                                 lastPickCamera,
                                 renderSize.width,
                                 renderSize.height,
-                                event.x,
-                                event.y))
+                                viewportEvent.x,
+                                viewportEvent.y))
                         {
                             selectedEditorObject = {SelectedEditorObjectType::SpotLight, *spotId};
                             editorObjectDragActive = true;
@@ -2078,8 +2225,8 @@ int RunGame(NativeWindow& window,
                                 lastPickCamera,
                                 renderSize.width,
                                 renderSize.height,
-                                event.x,
-                                event.y))
+                                viewportEvent.x,
+                                viewportEvent.y))
                         {
                             selectedEditorObject = {SelectedEditorObjectType::WaterBody, *waterId};
                             editorObjectDragActive = true;
@@ -2234,7 +2381,7 @@ int RunGame(NativeWindow& window,
                             return;
                         }
                     }
-                    terrain.HandleEditorInput(event);
+                    terrain.HandleEditorInput(viewportEvent);
                 }
 
                 const bool cameraMouse =
@@ -2251,7 +2398,7 @@ int RunGame(NativeWindow& window,
 #if defined(IXTREEME_WITH_EDITOR)
             && editorPlay.state.mode == EditorPlayMode::Edit
 #endif
-            && terrain.HandleEditorInput(event))
+            && terrain.HandleEditorInput(viewportEvent))
             return;
 #endif
         if (runtimeSession->IsInWorld() && cameraController.HandleInput(event))
@@ -2274,6 +2421,17 @@ int RunGame(NativeWindow& window,
 
     const auto startTime = std::chrono::steady_clock::now();
     double previousSeconds = 0.0;
+#if defined(IXTREEME_WITH_EDITOR)
+    EngineStats engineStats{};
+    double statsAccumSeconds = 0.0;
+    double statsFrameMsAccum = 0.0;
+    double statsMinFrameMs = std::numeric_limits<double>::max();
+    double statsMaxFrameMs = 0.0;
+    std::uint32_t statsFrameCount = 0;
+    std::clock_t statsPreviousCpuClock = std::clock();
+    double statsPreviousCpuSampleSeconds = 0.0;
+    const unsigned int statsHardwareThreads = std::max(1u, std::thread::hardware_concurrency());
+#endif
     bool running = true;
     while (running)
     {
@@ -2308,7 +2466,22 @@ int RunGame(NativeWindow& window,
                                 offscreenScene.GetLinearSampler(),
                                 offscreenScene.GetExtent());
                         }
+#if defined(IXTREEME_WITH_EDITOR)
+                        editorImGui.SetSceneViewTexture(offscreenScene.GetLinearSampler(),
+                            offscreenScene.GetSceneColorView(),
+                            VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL,
+                            offscreenScene.GetExtent());
+#endif
                     }
+#if defined(IXTREEME_WITH_EDITOR)
+                    else
+                    {
+                        editorImGui.SetSceneViewTexture(VK_NULL_HANDLE,
+                            VK_NULL_HANDLE,
+                            VK_IMAGE_LAYOUT_UNDEFINED,
+                            {});
+                    }
+#endif
                 }
                 if (skinnedMeshOk)
                     skinnedMesh.RecreatePipeline(device);
@@ -2352,7 +2525,53 @@ int RunGame(NativeWindow& window,
         const double seconds = std::chrono::duration<double>(now - startTime).count();
         const double deltaSeconds = seconds - previousSeconds;
         previousSeconds = seconds;
+#if defined(IXTREEME_WITH_EDITOR)
+        const double frameMs = std::max(0.0, deltaSeconds * 1000.0);
+        statsAccumSeconds += std::max(0.0, deltaSeconds);
+        statsFrameMsAccum += frameMs;
+        statsMinFrameMs = std::min(statsMinFrameMs, frameMs);
+        statsMaxFrameMs = std::max(statsMaxFrameMs, frameMs);
+        ++statsFrameCount;
+        engineStats.frameMs = frameMs;
+        if (statsAccumSeconds >= 0.25 && statsFrameCount > 0)
+        {
+            engineStats.fps = static_cast<double>(statsFrameCount) / statsAccumSeconds;
+            engineStats.averageFrameMs = statsFrameMsAccum / static_cast<double>(statsFrameCount);
+            engineStats.minFrameMs = statsMinFrameMs == std::numeric_limits<double>::max() ? 0.0 : statsMinFrameMs;
+            engineStats.maxFrameMs = statsMaxFrameMs;
+            engineStats.frameBudgetPercent = (engineStats.averageFrameMs / (1000.0 / 60.0)) * 100.0;
+
+            const std::clock_t cpuClock = std::clock();
+            const double cpuSeconds = static_cast<double>(cpuClock - statsPreviousCpuClock) / CLOCKS_PER_SEC;
+            const double sampleSeconds = std::max(0.0001, seconds - statsPreviousCpuSampleSeconds);
+            engineStats.processCpuPercent =
+                std::clamp((cpuSeconds / sampleSeconds) * 100.0 / static_cast<double>(statsHardwareThreads), 0.0, 100.0);
+            statsPreviousCpuClock = cpuClock;
+            statsPreviousCpuSampleSeconds = seconds;
+
+            Tracenf("[PERF] fps=%.1f frame_ms=%.2f budget60=%.0f%% cpu=%.1f%% swapchain=%ux%u",
+                engineStats.fps,
+                engineStats.averageFrameMs,
+                engineStats.frameBudgetPercent,
+                engineStats.processCpuPercent,
+                renderSize.width,
+                renderSize.height);
+
+            statsAccumSeconds = 0.0;
+            statsFrameMsAccum = 0.0;
+            statsMinFrameMs = std::numeric_limits<double>::max();
+            statsMaxFrameMs = 0.0;
+            statsFrameCount = 0;
+        }
+#endif
+#if defined(IXTREEME_WITH_EDITOR)
+        if (runtimeSession->IsMapEditorOpen() && cameraController.IsFreeCameraEnabled())
+            cameraController.Update(deltaSeconds, editorFlyMovement);
+        else
+            cameraController.Update(deltaSeconds, movement);
+#else
         cameraController.Update(deltaSeconds, movement);
+#endif
 #if defined(IXTREEME_WITH_EDITOR)
         if (editorPlay.state.mode == EditorPlayMode::Play)
         {
@@ -3342,6 +3561,8 @@ int RunGame(NativeWindow& window,
                     terrainState.cellSizeMeters = terrainData.cellSizeMeters;
                     terrainState.cellsX = terrainData.cellsX;
                     terrainState.cellsZ = terrainData.cellsZ;
+                    terrainState.triplanarEnabled = terrainData.triplanarEnabled;
+                    terrainState.triplanarSharpness = terrainData.triplanarSharpness;
                 }
                 editorImGui.SetTerrainEditorState(terrainState);
                 auto hierarchyState = buildHierarchyEntities();
@@ -3452,6 +3673,18 @@ int RunGame(NativeWindow& window,
                     else
                     {
                         editorImGui.SetPaletteSlots(terrain.GetPaletteSlots());
+                        SceneManager::Instance().MarkDirty();
+                    }
+                }
+                if (commands.terrainTriplanarChanged)
+                {
+                    if (!terrain.SetTriplanarSettings(commands.terrainTriplanarEnabled,
+                            commands.terrainTriplanarSharpness))
+                    {
+                        Tracen("[MAIN] failed to apply terrain triplanar settings");
+                    }
+                    else
+                    {
                         SceneManager::Instance().MarkDirty();
                     }
                 }
@@ -3828,6 +4061,13 @@ int RunGame(NativeWindow& window,
             rmlUi.Render(device);
 #if defined(IXTREEME_WITH_EDITOR)
             frameImGuiRenderCalled = true;
+            engineStats.swapchainWidth = renderSize.width;
+            engineStats.swapchainHeight = renderSize.height;
+            engineStats.frameNumber = frameNumber;
+            engineStats.sceneEntityCount = frameSceneEntityCount;
+            engineStats.staticMeshSubmitted = frameStaticMeshSubmitted;
+            engineStats.staticMeshDrawCalls = frameStaticMeshDrawCalls;
+            editorImGui.SetEngineStats(engineStats);
             editorImGui.Render(device);
 #else
             frameImGuiRenderCalled = false;
@@ -3917,7 +4157,7 @@ int WINAPI WinMain(HINSTANCE instance, HINSTANCE, LPSTR, int showCommand)
         return 1;
     }
 
-    client::asset::FileAssetReader assets(ExecutableDirectory());
+    client::asset::FileAssetReader assets(ResolveEngineAssetRoot());
     const int result = RunGame(window, assets);
     window.Destroy();
     return result;

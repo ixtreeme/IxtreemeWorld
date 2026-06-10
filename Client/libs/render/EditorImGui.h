@@ -37,6 +37,12 @@ public:
         bool dropTargetActive = false;
         bool overlayDropTargetHovered = false;
         bool overlayDropTargetActive = false;
+        bool sceneViewRectValid = false;
+        bool sceneViewHovered = false;
+        bool sceneViewFocused = false;
+        float sceneViewMin[2] = {0.0f, 0.0f};
+        float sceneViewSize[2] = {0.0f, 0.0f};
+        uint32_t sceneViewExtent[2] = {0u, 0u};
         std::uint32_t hoveredItemId = 0;
         std::uint32_t activeItemId = 0;
     };
@@ -54,7 +60,11 @@ public:
     void BeginFrame(bool editorModeActive);
     void Render(VulkanDevice& device);
     void OnRenderPassChanged(VulkanDevice& device);
+    void SetSceneViewTexture(VkSampler sampler, VkImageView imageView, VkImageLayout layout, VkExtent2D extent);
     bool WantsInputCapture(const InputEvent& event) const;
+    bool IsSceneViewInputTarget(const InputEvent& event) const;
+    InputEvent MapInputToSceneView(const InputEvent& event) const;
+    void SetSceneViewKeyboardFocus(bool focused);
     void SetMapEditorSettings(const MapEditorSettings& settings);
     MapEditorSettings GetMapEditorSettings() const { return m_editorSettings; }
     void SetEditorPlayModeState(const EditorPlayModeState& state);
@@ -64,6 +74,7 @@ public:
     void SetWaterBodyEditorState(const WaterBodyEditorState& state);
     void SetMeshRendererEditorState(const MeshRendererEditorState& state);
     void SetTerrainEditorState(const TerrainEditorState& state);
+    void SetEngineStats(const EngineStats& stats);
     void SetHierarchySceneState(std::uint64_t sceneRootEntity,
                                 std::string sceneRootName,
                                 std::vector<HierarchySceneEntity> entities);
@@ -120,6 +131,7 @@ private:
     void RenderDemoPanels();
     void RenderDockSpace();
     void RenderSceneViewDropTarget();
+    void ReleaseSceneViewTextureDescriptor();
     void RenderMenuBar();
     void RenderProjectModal();
     void RenderProjectBrowser(bool pickProjectFile);
@@ -166,6 +178,7 @@ private:
     bool RenderTransformComponent(float* position, float* rotation, float* scale);
     bool RenderAxisFloat(const char* axis, float& value, float r, float g, float b, float speed, float minValue, float maxValue);
     void RenderWorldPanel();
+    void RenderPerformancePanel();
     void RenderCreateTerrainModal();
     void RenderLightingPanel();
     void RenderDynamicLightsPanel();
@@ -277,6 +290,7 @@ private:
     WaterBodyEditorState m_waterBodyState;
     MeshRendererEditorState m_meshRendererState;
     TerrainEditorState m_terrainState;
+    EngineStats m_engineStats;
     MapEditorCommands m_commands;
     std::array<MapEditorPaletteSlot, 8> m_paletteSlots{};
     std::vector<std::pair<std::string, WaterMaterialData>> m_waterMaterials;
@@ -323,6 +337,15 @@ private:
     std::unordered_map<std::string, AssetPreviewTexture> m_assetPreviewTextures;
     bool m_assetBrowserLogged = false;
     std::string m_loggedDragAssetId;
+    VkSampler m_sceneViewSampler = VK_NULL_HANDLE;
+    VkImageView m_sceneViewImageView = VK_NULL_HANDLE;
+    VkImageLayout m_sceneViewImageLayout = VK_IMAGE_LAYOUT_UNDEFINED;
+    VkExtent2D m_sceneViewExtent{};
+    VkDescriptorSet m_sceneViewDescriptor = VK_NULL_HANDLE;
+    VkSampler m_sceneViewDescriptorSampler = VK_NULL_HANDLE;
+    VkImageView m_sceneViewDescriptorImageView = VK_NULL_HANDLE;
+    VkImageLayout m_sceneViewDescriptorImageLayout = VK_IMAGE_LAYOUT_UNDEFINED;
+    bool m_sceneViewKeyboardFocus = false;
     bool m_viewportDropTargetLogged = false;
     ViewportInputDiagnostics m_viewportInputDiagnostics;
     float m_timeOfDayHours = 12.0f;

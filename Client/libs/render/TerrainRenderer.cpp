@@ -1623,6 +1623,7 @@ bool TerrainRenderer::CreateFlatTerrain(VulkanDevice& device, const TerrainScene
         next.widthMeters = static_cast<float>(next.cellsX) * next.cellSizeMeters;
     if (next.depthMeters <= 0.0f)
         next.depthMeters = static_cast<float>(next.cellsZ) * next.cellSizeMeters;
+    next.triplanarSharpness = std::clamp(next.triplanarSharpness, 1.0f, 16.0f);
 
     device.WaitIdle();
     DestroyBuffer(m_vertexBuffer);
@@ -1696,6 +1697,7 @@ bool TerrainRenderer::CreateFlatTerrain(VulkanDevice& device, const TerrainScene
     m_mapLoaded = true;
     m_sceneTerrainActive = true;
     m_sceneTerrain = next;
+    m_triplanarParamsDirty = true;
     Tracenf("[TERRAIN-CREATE] dims=%.2fx%.2f m, cellSize=%.2f m, cells=%ux%u, verts=%zu, pos=(0.00,0.00,0.00)",
         next.widthMeters,
         next.depthMeters,
@@ -1796,6 +1798,8 @@ void TerrainRenderer::SetTerrainSceneData(const TerrainSceneData& terrain)
         return;
     m_sceneTerrain = terrain;
     m_sceneTerrain.exists = true;
+    m_sceneTerrain.triplanarSharpness = std::clamp(m_sceneTerrain.triplanarSharpness, 1.0f, 16.0f);
+    m_triplanarParamsDirty = true;
 }
 
 bool TerrainRenderer::RecreatePipeline(VulkanDevice& device)
@@ -2821,6 +2825,29 @@ bool TerrainRenderer::ApplyPaletteSlotParams(const MapEditorPaletteSlot& slot)
     return true;
 }
 
+bool TerrainRenderer::SetTriplanarSettings(bool enabled, float sharpness)
+{
+    if (!m_sceneTerrainActive)
+        return false;
+
+    const float clampedSharpness = std::clamp(sharpness, 1.0f, 16.0f);
+    const bool changed = m_sceneTerrain.triplanarEnabled != enabled ||
+        std::abs(m_sceneTerrain.triplanarSharpness - clampedSharpness) > 0.0001f;
+    m_sceneTerrain.triplanarEnabled = enabled;
+    m_sceneTerrain.triplanarSharpness = clampedSharpness;
+    if (changed)
+    {
+        m_materialParamsDirty = true;
+        m_triplanarParamsDirty = true;
+        Tracenf("[TRIPLANAR] enabled=%s scope=terrain sharpness=%.2f",
+            enabled ? "yes" : "no",
+            clampedSharpness);
+        if (enabled)
+            Tracen("[TRIPLANAR] sample mode active, layers=8");
+    }
+    return true;
+}
+
 void TerrainRenderer::RequestEditorSave()
 {
     m_editorSaveRequested = true;
@@ -3192,7 +3219,7 @@ bool TerrainRenderer::CreateFlatBuffers(VulkanDevice& device)
             const size_t index = static_cast<size_t>(z) * m_heightGridWidth + x;
             const float heightMeters = index < m_heightCmGrid.size() ? m_heightCmGrid[index] * 0.01f : 0.0f;
             const float px = static_cast<float>(x) * cellSize - halfWidth;
-            const float pz = static_cast<float>(z) * cellSize - halfDepth;
+            const float pz = halfDepth - static_cast<float>(z) * cellSize;
             vertices.push_back({{px, heightMeters, pz},
                 {static_cast<float>(x) / 10.0f, static_cast<float>(z) / 10.0f},
                 {static_cast<float>(x) / static_cast<float>(cellsX), static_cast<float>(z) / static_cast<float>(cellsZ)}});
@@ -7100,6 +7127,8 @@ void TerrainRenderer::UpdateUniform(uint32_t frameIndex, const WorldCamera& came
         uniform.materialPbr[i][2] = std::clamp(m_paletteSlots[i].metallicStrength, 0.0f, 1.0f);
         uniform.materialPbr[i][3] = m_paletteSlots[i].uvRotationDegrees * 3.1415926535f / 180.0f;
     }
+    uniform.terrainMaterialParams[0] = m_sceneTerrain.triplanarEnabled ? 1.0f : 0.0f;
+    uniform.terrainMaterialParams[1] = std::clamp(m_sceneTerrain.triplanarSharpness, 1.0f, 16.0f);
     uniform.cameraPos[0] = camera.eye.x;
     uniform.cameraPos[1] = camera.eye.y;
     uniform.cameraPos[2] = camera.eye.z;
@@ -7210,6 +7239,15 @@ void TerrainRenderer::UpdateUniform(uint32_t frameIndex, const WorldCamera& came
     {
         Tracen("[TMAT] params buffer updated (live, no reload, no remesh)");
         m_materialParamsDirty = false;
+    }
+    if (m_triplanarParamsDirty)
+    {
+        Tracenf("[TRIPLANAR] enabled=%s scope=terrain sharpness=%.2f",
+            m_sceneTerrain.triplanarEnabled ? "yes" : "no",
+            std::clamp(m_sceneTerrain.triplanarSharpness, 1.0f, 16.0f));
+        if (m_sceneTerrain.triplanarEnabled)
+            Tracen("[TRIPLANAR] sample mode active, layers=8");
+        m_triplanarParamsDirty = false;
     }
 }
 

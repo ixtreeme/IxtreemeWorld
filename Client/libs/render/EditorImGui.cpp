@@ -572,6 +572,11 @@ void EditorImGui::SetTerrainEditorState(const TerrainEditorState& state)
     m_terrainState = state;
 }
 
+void EditorImGui::SetEngineStats(const EngineStats& stats)
+{
+    m_engineStats = stats;
+}
+
 void EditorImGui::SetHierarchySceneState(std::uint64_t sceneRootEntity,
                                          std::string sceneRootName,
                                          std::vector<HierarchySceneEntity> entities)
@@ -710,6 +715,50 @@ void EditorImGui::InitializeProjectAssetLibrary(const std::filesystem::path& pro
     m_assetStatus = "Project assets ready";
     SyncWaterMaterialSnapshot();
     Tracenf("[PROJECT] asset browser root=%s", m_assetLibrary->LibraryRoot().generic_string().c_str());
+}
+
+void EditorImGui::ReleaseSceneViewTextureDescriptor()
+{
+    if (m_sceneViewDescriptor && m_vulkanBackendReady)
+        ImGui_ImplVulkan_RemoveTexture(m_sceneViewDescriptor);
+    m_sceneViewDescriptor = VK_NULL_HANDLE;
+    m_sceneViewDescriptorSampler = VK_NULL_HANDLE;
+    m_sceneViewDescriptorImageView = VK_NULL_HANDLE;
+    m_sceneViewDescriptorImageLayout = VK_IMAGE_LAYOUT_UNDEFINED;
+}
+
+void EditorImGui::SetSceneViewTexture(VkSampler sampler,
+                                      VkImageView imageView,
+                                      VkImageLayout layout,
+                                      VkExtent2D extent)
+{
+    m_sceneViewSampler = sampler;
+    m_sceneViewImageView = imageView;
+    m_sceneViewImageLayout = layout;
+    m_sceneViewExtent = extent;
+
+    const bool descriptorMatches =
+        m_sceneViewDescriptor &&
+        m_sceneViewDescriptorSampler == sampler &&
+        m_sceneViewDescriptorImageView == imageView &&
+        m_sceneViewDescriptorImageLayout == layout;
+    if (descriptorMatches)
+        return;
+
+    ReleaseSceneViewTextureDescriptor();
+    if (!m_vulkanBackendReady || !sampler || !imageView || layout == VK_IMAGE_LAYOUT_UNDEFINED)
+        return;
+
+    m_sceneViewDescriptor = ImGui_ImplVulkan_AddTexture(sampler, imageView, layout);
+    if (m_sceneViewDescriptor)
+    {
+        m_sceneViewDescriptorSampler = sampler;
+        m_sceneViewDescriptorImageView = imageView;
+        m_sceneViewDescriptorImageLayout = layout;
+        Tracenf("[EDITOR-SCENE-VIEW] bound offscreen texture extent=%ux%u",
+            extent.width,
+            extent.height);
+    }
 }
 
 MapEditorCommands EditorImGui::ConsumeCommands()
@@ -1837,8 +1886,6 @@ void EditorImGui::RenderSceneViewDropTarget()
         ImGuiWindowFlags_NoScrollbar |
         ImGuiWindowFlags_NoScrollWithMouse |
         ImGuiWindowFlags_NoCollapse;
-    if (!assetDragActive)
-        flags |= ImGuiWindowFlags_NoInputs;
 
     auto acceptModelDrop = [&]() {
         if (ImGui::BeginDragDropTarget())
@@ -1854,11 +1901,16 @@ void EditorImGui::RenderSceneViewDropTarget()
                         const ImVec2 mouse = ImGui::GetMousePos();
                         const ImGuiViewport* viewport = ImGui::GetMainViewport();
                         const ImVec2 viewportPos = viewport ? viewport->Pos : ImVec2(0.0f, 0.0f);
+                        InputEvent dropEvent{};
+                        dropEvent.type = InputEvent::MouseUp;
+                        dropEvent.x = static_cast<int>(std::round(mouse.x - viewportPos.x));
+                        dropEvent.y = static_cast<int>(std::round(mouse.y - viewportPos.y));
+                        const InputEvent mappedDropEvent = MapInputToSceneView(dropEvent);
                         m_commands.addMeshEntity = true;
                         m_commands.meshAssetId = entry->id;
                         m_commands.meshDropScreenPositionValid = true;
-                        m_commands.meshDropScreenPosition[0] = mouse.x - viewportPos.x;
-                        m_commands.meshDropScreenPosition[1] = mouse.y - viewportPos.y;
+                        m_commands.meshDropScreenPosition[0] = static_cast<float>(mappedDropEvent.x);
+                        m_commands.meshDropScreenPosition[1] = static_cast<float>(mappedDropEvent.y);
                         m_assetStatus = "Mesh entity dropped: " + entry->displayName;
                         Tracenf("[DND] payload accepted: %s", entry->id.c_str());
                     }
@@ -1874,7 +1926,59 @@ void EditorImGui::RenderSceneViewDropTarget()
         return;
     }
 
+    const ImVec2 sceneMin = ImGui::GetCursorScreenPos();
     const ImVec2 avail = ImGui::GetContentRegionAvail();
+    const ImGuiViewport* mainViewport = ImGui::GetMainViewport();
+    const ImVec2 viewportPos = mainViewport ? mainViewport->Pos : ImVec2(0.0f, 0.0f);
+    ImVec2 imageMin = sceneMin;
+    ImVec2 imageSize = avail;
+    if (avail.x > 1.0f && avail.y > 1.0f &&
+        m_sceneViewExtent.width > 0 && m_sceneViewExtent.height > 0)
+    {
+        const float targetAspect = static_cast<float>(m_sceneViewExtent.width) /
+            static_cast<float>(m_sceneViewExtent.height);
+        const float availableAspect = avail.x / avail.y;
+        if (availableAspect > targetAspect)
+        {
+            imageSize.x = avail.y * targetAspect;
+            imageMin.x += (avail.x - imageSize.x) * 0.5f;
+        }
+        else
+        {
+            imageSize.y = avail.x / targetAspect;
+            imageMin.y += (avail.y - imageSize.y) * 0.5f;
+        }
+    }
+    if (avail.x > 1.0f && avail.y > 1.0f)
+    {
+        m_viewportInputDiagnostics.sceneViewRectValid = true;
+        m_viewportInputDiagnostics.sceneViewMin[0] = imageMin.x - viewportPos.x;
+        m_viewportInputDiagnostics.sceneViewMin[1] = imageMin.y - viewportPos.y;
+        m_viewportInputDiagnostics.sceneViewSize[0] = imageSize.x;
+        m_viewportInputDiagnostics.sceneViewSize[1] = imageSize.y;
+        m_viewportInputDiagnostics.sceneViewExtent[0] = m_sceneViewExtent.width;
+        m_viewportInputDiagnostics.sceneViewExtent[1] = m_sceneViewExtent.height;
+    }
+    const bool canDrawSceneView = m_sceneViewDescriptor && avail.x > 1.0f && avail.y > 1.0f;
+    bool sceneViewItemDrawn = false;
+    if (canDrawSceneView)
+    {
+        ImGui::SetCursorScreenPos(imageMin);
+        ImGui::Image(reinterpret_cast<ImTextureID>(m_sceneViewDescriptor), imageSize);
+        sceneViewItemDrawn = true;
+    }
+    else if (avail.x > 1.0f && avail.y > 1.0f)
+    {
+        ImGui::BeginDisabled();
+        ImGui::TextUnformatted("Scene render target unavailable");
+        ImGui::EndDisabled();
+    }
+    m_viewportInputDiagnostics.sceneViewHovered =
+        ImGui::IsWindowHovered(ImGuiHoveredFlags_AllowWhenBlockedByActiveItem) ||
+        (sceneViewItemDrawn && ImGui::IsItemHovered(ImGuiHoveredFlags_AllowWhenBlockedByActiveItem));
+    m_viewportInputDiagnostics.sceneViewFocused =
+        ImGui::IsWindowFocused(ImGuiFocusedFlags_RootAndChildWindows);
+
     if (assetDragActive && avail.x > 1.0f && avail.y > 1.0f)
     {
         if (!m_viewportDropTargetLogged)
@@ -1883,8 +1987,17 @@ void EditorImGui::RenderSceneViewDropTarget()
             Tracen("[DND] viewport drop target active");
         }
 
-        const ImGuiID dropItemId = ImGui::GetID("##SceneViewDropTarget");
-        ImGui::InvisibleButton("##SceneViewDropTarget", avail);
+        ImGuiID dropItemId = 0;
+        if (sceneViewItemDrawn)
+        {
+            dropItemId = ImGui::GetItemID();
+        }
+        else
+        {
+            dropItemId = ImGui::GetID("##SceneViewDropTarget");
+            ImGui::SetCursorScreenPos(imageMin);
+            ImGui::InvisibleButton("##SceneViewDropTarget", imageSize);
+        }
         m_viewportInputDiagnostics.dropTargetVisible = true;
         m_viewportInputDiagnostics.dropTargetHovered = ImGui::IsItemHovered();
         m_viewportInputDiagnostics.dropTargetActive = ImGui::IsItemActive();
@@ -2557,7 +2670,7 @@ void EditorImGui::RenderEditorToolbar()
 
     const ImGuiViewport* viewport = ImGui::GetMainViewport();
     ImGui::SetNextWindowPos(ImVec2(viewport->WorkPos.x + 12.0f, viewport->WorkPos.y + 12.0f), ImGuiCond_FirstUseEver);
-    ImGui::SetNextWindowSize(ImVec2(520.0f, 58.0f), ImGuiCond_FirstUseEver);
+    ImGui::SetNextWindowSize(ImVec2(760.0f, 58.0f), ImGuiCond_FirstUseEver);
     if (ImGui::Begin("Editor Toolbar", nullptr,
         ImGuiWindowFlags_NoCollapse | ImGuiWindowFlags_NoScrollbar))
     {
@@ -2617,6 +2730,14 @@ void EditorImGui::RenderEditorToolbar()
         ImGui::Dummy(ImVec2(24.0f, 0.0f));
         ImGui::SameLine();
         RenderGizmoControls();
+
+        ImGui::SameLine();
+        ImGui::Dummy(ImVec2(18.0f, 0.0f));
+        ImGui::SameLine();
+        ImGui::TextDisabled("FPS %.0f | %.2f ms | CPU %.0f%%",
+            m_engineStats.fps,
+            m_engineStats.averageFrameMs > 0.0 ? m_engineStats.averageFrameMs : m_engineStats.frameMs,
+            m_engineStats.processCpuPercent);
     }
     ImGui::End();
 }
@@ -3782,6 +3903,8 @@ void EditorImGui::RenderWorldPanel()
 {
     if (ImGui::Begin(ICON_FA_GLOBE " World"))
     {
+        if (ImGui::CollapsingHeader("Performance", ImGuiTreeNodeFlags_DefaultOpen))
+            RenderPerformancePanel();
         if (ImGui::CollapsingHeader("Terrain", ImGuiTreeNodeFlags_DefaultOpen))
         {
             if (UI::IconButton(ICON_FA_MOUNTAIN, "Create Terrain"))
@@ -3807,6 +3930,37 @@ void EditorImGui::RenderWorldPanel()
     }
     ImGui::End();
     RenderCreateTerrainModal();
+}
+
+void EditorImGui::RenderPerformancePanel()
+{
+    const double frameMs = m_engineStats.averageFrameMs > 0.0 ? m_engineStats.averageFrameMs : m_engineStats.frameMs;
+    ImGui::Text("FPS: %.1f", m_engineStats.fps);
+    ImGui::Text("Frame: %.2f ms  (min %.2f / max %.2f)",
+        frameMs,
+        m_engineStats.minFrameMs,
+        m_engineStats.maxFrameMs);
+    ImGui::Text("Swapchain: %u x %u",
+        m_engineStats.swapchainWidth,
+        m_engineStats.swapchainHeight);
+
+    const float budgetFraction = static_cast<float>(std::clamp(m_engineStats.frameBudgetPercent / 100.0, 0.0, 1.0));
+    const std::string budgetLabel =
+        std::to_string(static_cast<int>(std::round(m_engineStats.frameBudgetPercent))) + "%";
+    ImGui::TextUnformatted("Frame Budget @60 FPS");
+    ImGui::ProgressBar(budgetFraction, ImVec2(-1.0f, 0.0f), budgetLabel.c_str());
+
+    const float cpuFraction = static_cast<float>(std::clamp(m_engineStats.processCpuPercent / 100.0, 0.0, 1.0));
+    const std::string cpuLabel =
+        std::to_string(static_cast<int>(std::round(m_engineStats.processCpuPercent))) + "%";
+    ImGui::TextUnformatted("Process CPU");
+    ImGui::ProgressBar(cpuFraction, ImVec2(-1.0f, 0.0f), cpuLabel.c_str());
+
+    ImGui::TextDisabled("Frame #%llu | scene entities=%zu | static submitted=%zu drawcalls=%zu",
+        static_cast<unsigned long long>(m_engineStats.frameNumber),
+        m_engineStats.sceneEntityCount,
+        m_engineStats.staticMeshSubmitted,
+        m_engineStats.staticMeshDrawCalls);
 }
 
 void EditorImGui::RenderCreateTerrainModal()
@@ -4050,6 +4204,28 @@ void EditorImGui::RenderSplatPaintToolPanel()
 
         ImGui::Separator();
         UI::SectionHeader(ICON_FA_PALETTE " Terrain Material");
+        if (m_terrainState.exists)
+        {
+            bool triplanarEnabled = m_terrainState.triplanarEnabled;
+            float triplanarSharpness = std::clamp(m_terrainState.triplanarSharpness, 1.0f, 16.0f);
+            bool triplanarChanged = false;
+            triplanarChanged |= ImGui::Checkbox("Triplanar Mapping", &triplanarEnabled);
+            triplanarChanged |= ImGui::SliderFloat("Triplanar Sharpness", &triplanarSharpness, 1.0f, 16.0f, "%.2f");
+            if (triplanarChanged)
+            {
+                m_terrainState.triplanarEnabled = triplanarEnabled;
+                m_terrainState.triplanarSharpness = triplanarSharpness;
+                m_commands.terrainTriplanarChanged = true;
+                m_commands.terrainTriplanarEnabled = triplanarEnabled;
+                m_commands.terrainTriplanarSharpness = triplanarSharpness;
+                SceneManager::Instance().MarkDirty();
+            }
+        }
+        else
+        {
+            ImGui::TextDisabled("Create a terrain to edit triplanar sampling.");
+        }
+        ImGui::Separator();
         const std::uint32_t selectedSlot = std::min<std::uint32_t>(m_editorSettings.textureSlot, 7u);
         MapEditorPaletteSlot& materialSlot = m_paletteSlots[selectedSlot];
         ImGui::Text("Layer %u: %s",
@@ -5199,9 +5375,79 @@ bool EditorImGui::WantsInputCapture(const InputEvent& event) const
     }
 }
 
+bool EditorImGui::IsSceneViewInputTarget(const InputEvent& event) const
+{
+    const auto& diag = m_viewportInputDiagnostics;
+    switch (event.type)
+    {
+    case InputEvent::MouseMove:
+    case InputEvent::MouseDown:
+    case InputEvent::MouseUp:
+    case InputEvent::MouseWheel:
+    {
+        if (!diag.sceneViewRectValid)
+            return false;
+        const float minX = diag.sceneViewMin[0];
+        const float minY = diag.sceneViewMin[1];
+        const float maxX = minX + diag.sceneViewSize[0];
+        const float maxY = minY + diag.sceneViewSize[1];
+        return static_cast<float>(event.x) >= minX &&
+            static_cast<float>(event.x) < maxX &&
+            static_cast<float>(event.y) >= minY &&
+            static_cast<float>(event.y) < maxY;
+    }
+    case InputEvent::KeyDown:
+    case InputEvent::KeyUp:
+        return m_sceneViewKeyboardFocus || diag.sceneViewFocused || diag.sceneViewHovered;
+    default:
+        return false;
+    }
+}
+
+InputEvent EditorImGui::MapInputToSceneView(const InputEvent& event) const
+{
+    InputEvent mapped = event;
+    const auto& diag = m_viewportInputDiagnostics;
+    if (!diag.sceneViewRectValid ||
+        diag.sceneViewSize[0] <= 1.0f ||
+        diag.sceneViewSize[1] <= 1.0f ||
+        diag.sceneViewExtent[0] == 0u ||
+        diag.sceneViewExtent[1] == 0u)
+    {
+        return mapped;
+    }
+
+    switch (event.type)
+    {
+    case InputEvent::MouseMove:
+    case InputEvent::MouseDown:
+    case InputEvent::MouseUp:
+    case InputEvent::MouseWheel:
+    {
+        const float u = std::clamp((static_cast<float>(event.x) - diag.sceneViewMin[0]) / diag.sceneViewSize[0], 0.0f, 1.0f);
+        const float v = std::clamp((static_cast<float>(event.y) - diag.sceneViewMin[1]) / diag.sceneViewSize[1], 0.0f, 1.0f);
+        mapped.x = static_cast<int>(std::round(u * static_cast<float>(diag.sceneViewExtent[0] - 1u)));
+        mapped.y = static_cast<int>(std::round(v * static_cast<float>(diag.sceneViewExtent[1] - 1u)));
+        break;
+    }
+    default:
+        break;
+    }
+    return mapped;
+}
+
+void EditorImGui::SetSceneViewKeyboardFocus(bool focused)
+{
+    if (m_sceneViewKeyboardFocus == focused)
+        return;
+    m_sceneViewKeyboardFocus = focused;
+    Tracenf("[EDITOR-SCENE-VIEW] keyboard focus=%d", focused ? 1 : 0);
+}
+
 void EditorImGui::Destroy()
 {
     DestroyAssetPreviewTextures();
+    ReleaseSceneViewTextureDescriptor();
 
     if (m_vulkanBackendReady)
     {
@@ -5260,9 +5506,27 @@ void EditorImGui::OnRenderPassChanged(VulkanDevice&)
 {
 }
 
+void EditorImGui::SetSceneViewTexture(VkSampler, VkImageView, VkImageLayout, VkExtent2D)
+{
+}
+
 bool EditorImGui::WantsInputCapture(const InputEvent&) const
 {
     return false;
+}
+
+bool EditorImGui::IsSceneViewInputTarget(const InputEvent&) const
+{
+    return false;
+}
+
+InputEvent EditorImGui::MapInputToSceneView(const InputEvent& event) const
+{
+    return event;
+}
+
+void EditorImGui::SetSceneViewKeyboardFocus(bool)
+{
 }
 
 void EditorImGui::SetMapEditorSettings(const MapEditorSettings&)
@@ -5286,6 +5550,10 @@ void EditorImGui::SetMeshRendererEditorState(const MeshRendererEditorState&)
 }
 
 void EditorImGui::SetTerrainEditorState(const TerrainEditorState&)
+{
+}
+
+void EditorImGui::SetEngineStats(const EngineStats&)
 {
 }
 

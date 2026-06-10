@@ -1,6 +1,7 @@
 #pragma once
 
 #include <cstdint>
+#include <cstddef>
 #include <array>
 #include <string>
 #include <vector>
@@ -261,6 +262,8 @@ struct TerrainSceneData
     std::vector<float> heightCmGrid;
     std::vector<std::uint8_t> splatABytes;
     std::vector<std::uint8_t> splatBBytes;
+    bool triplanarEnabled = false;
+    float triplanarSharpness = 4.0f;
     bool editorHidden = false;
 };
 
@@ -333,6 +336,8 @@ struct TerrainEditorState
     float cellSizeMeters = 1.0f;
     std::uint32_t cellsX = 0;
     std::uint32_t cellsZ = 0;
+    bool triplanarEnabled = false;
+    float triplanarSharpness = 4.0f;
 };
 
 enum class DynamicLightType
@@ -357,6 +362,23 @@ struct DynamicLightEditorState
     std::uint32_t spotCount = 0;
     PointLight point;
     SpotLight spot;
+};
+
+struct EngineStats
+{
+    double fps = 0.0;
+    double frameMs = 0.0;
+    double averageFrameMs = 0.0;
+    double minFrameMs = 0.0;
+    double maxFrameMs = 0.0;
+    double frameBudgetPercent = 0.0;
+    double processCpuPercent = 0.0;
+    std::uint32_t swapchainWidth = 0;
+    std::uint32_t swapchainHeight = 0;
+    std::uint64_t frameNumber = 0;
+    std::size_t sceneEntityCount = 0;
+    std::size_t staticMeshSubmitted = 0;
+    std::size_t staticMeshDrawCalls = 0;
 };
 
 struct MapEditorCommands
@@ -409,6 +431,9 @@ struct MapEditorCommands
     std::string paletteAssetId;
     std::string paletteTexturePath;
     MapEditorPaletteSlot paletteSlotData;
+    bool terrainTriplanarChanged = false;
+    bool terrainTriplanarEnabled = false;
+    float terrainTriplanarSharpness = 4.0f;
     bool gizmoSettingsChanged = false;
     MapEditorGizmoOperation gizmoOperation = MapEditorGizmoOperation::Translate;
     bool gizmoSnapEnabled = false;

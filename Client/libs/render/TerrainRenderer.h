@@ -107,6 +107,7 @@ public:
     bool ApplyPaletteSlots(VulkanDevice& device, const std::array<MapEditorPaletteSlot, 8>& slots);
     bool ApplyPaletteSlotParams(const MapEditorPaletteSlot& slot);
     bool ApplyPaletteSlotChange(VulkanDevice& device, const MapEditorPaletteSlot& slot);
+    bool SetTriplanarSettings(bool enabled, float sharpness);
     void RequestEditorSave();
     void RequestEditorReload();
     void RequestEditorUndo();
@@ -163,6 +164,7 @@ private:
         float materialTiling[8][4];
         float materialTintNormal[8][4];
         float materialPbr[8][4];
+        float terrainMaterialParams[4] = {0.0f, 4.0f, 0.0f, 0.0f}; // triplanar enabled, sharpness, reserved, reserved
         float cameraPos[4];
         float sunDir[4];
         float sunColor[4];
@@ -504,6 +506,7 @@ private:
     double m_lastWaterDiagTimeSeconds = -1000.0;
     std::array<MapEditorPaletteSlot, 8> m_paletteSlots{};
     bool m_materialParamsDirty = false;
+    bool m_triplanarParamsDirty = false;
     std::string m_loadedMapDirectory;
     int32_t m_loadedServerX = 0;
     int32_t m_loadedServerY = 0;

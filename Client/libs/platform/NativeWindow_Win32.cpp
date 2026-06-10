@@ -31,6 +31,20 @@ bool IsEngineMouseInputMessage(UINT message)
     }
 }
 
+bool IsEngineKeyboardInputMessage(UINT message)
+{
+    switch (message)
+    {
+    case WM_KEYDOWN:
+    case WM_SYSKEYDOWN:
+    case WM_KEYUP:
+    case WM_SYSKEYUP:
+        return true;
+    default:
+        return false;
+    }
+}
+
 Key TranslateVirtualKey(WPARAM vk)
 {
     if (vk >= 'A' && vk <= 'Z')
@@ -296,11 +310,11 @@ LRESULT NativeWindow_Win32::WndProc(HWND hwnd, UINT message, WPARAM wParam, LPAR
         LRESULT result = 0;
         if (m_messageCallback(hwnd, message, wParam, lParam, result))
         {
-            if (IsEngineMouseInputMessage(message))
+            if (IsEngineMouseInputMessage(message) || IsEngineKeyboardInputMessage(message))
             {
-                // ImGui may consume the native mouse message while the engine still needs
+                // ImGui may consume native input while the engine still needs
                 // the platform-level event. The editor input router applies its own
-                // WantCaptureMouse gate before viewport tools see the event.
+                // WantCapture gate before viewport tools see the event.
             }
             else
             {

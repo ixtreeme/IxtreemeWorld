@@ -28,6 +28,7 @@ struct TerrainWaterBodyUbo
     float4 u_materialTiling[8];
     float4 u_materialTintNormal[8];
     float4 u_materialPbr[8];
+    float4 u_terrainMaterialParams; // x: triplanar enabled, y: blend sharpness, zw: reserved
     float4 u_cameraPos;
     float4 u_sunDir;
     float4 u_sunColor;
@@ -232,6 +233,46 @@ float2 TransformLayerUv(float2 uv, int layer)
     return rotated * u_materialTiling[layer].xy + u_materialTiling[layer].zw;
 }
 
+float AxisSign(float value)
+{
+    return value < 0.0 ? -1.0 : 1.0;
+}
+
+float3 TriplanarWeights(float3 normalWs, float sharpness)
+{
+    const float p = max(sharpness, 0.001);
+    float3 weights = pow(abs(normalWs), float3(p, p, p));
+    return weights / max(weights.x + weights.y + weights.z, 0.0001);
+}
+
+float2 TriplanarPlaneUv(float3 worldPos, int axis, int layer)
+{
+    if (axis == 0)
+        return TransformLayerUv(worldPos.zy, layer); // YZ -> X
+    if (axis == 1)
+        return TransformLayerUv(worldPos.xz, layer); // XZ -> Y
+    return TransformLayerUv(worldPos.xy, layer);     // XY -> Z
+}
+
+float3 DecodeLayerNormal(float2 uv, int layer)
+{
+    float3 sampledNormal = u_normalTex.Sample(u_normalSampler, float3(uv, (float)layer)).rgb * 2.0 - 1.0;
+    sampledNormal.xy *= u_materialTintNormal[layer].w;
+    return SafeNormalize(sampledNormal, float3(0.0, 0.0, 1.0));
+}
+
+float3 TriplanarNormalToWorld(float3 normalTs, int axis, float3 surfaceNormal)
+{
+    if (axis == 0)
+        return SafeNormalize(float3(normalTs.z * AxisSign(surfaceNormal.x), normalTs.y, normalTs.x),
+            float3(AxisSign(surfaceNormal.x), 0.0, 0.0));
+    if (axis == 1)
+        return SafeNormalize(float3(normalTs.x, normalTs.z * AxisSign(surfaceNormal.y), normalTs.y),
+            float3(0.0, AxisSign(surfaceNormal.y), 0.0));
+    return SafeNormalize(float3(normalTs.x, normalTs.y, normalTs.z * AxisSign(surfaceNormal.z)),
+        float3(0.0, 0.0, AxisSign(surfaceNormal.z)));
+}
+
 float FoamHash(float2 p)
 {
     p = frac(p * float2(123.34, 456.21));
@@ -355,35 +396,88 @@ float4 PSMain(VSOutput input) : SV_Target0
         weights[0] = 1.0;
     }
 
+    float3 surfaceNormal = SafeNormalize(cross(ddx(input.worldPos), ddy(input.worldPos)), float3(0.0, 1.0, 0.0));
+    if (surfaceNormal.y < 0.0)
+        surfaceNormal = -surfaceNormal;
+
+    const bool triplanarEnabled = u_terrainMaterialParams.x > 0.5;
+    const float3 triplanarWeights = TriplanarWeights(surfaceNormal, u_terrainMaterialParams.y);
     float3 albedo = 0.0.xxx;
     float3 normalTs = 0.0.xxx;
+    float3 normalWs = 0.0.xxx;
     float ao = 0.0;
     float roughness = 0.0;
     float metallic = 0.0;
     [unroll]
     for (int layer = 0; layer < 8; ++layer)
     {
-        const float2 materialUv = TransformLayerUv(input.texUv, layer);
-        const float3 diffuse = u_paletteTex.Sample(u_paletteSampler, float3(materialUv, (float)layer)).rgb;
-        float3 sampledNormal = u_normalTex.Sample(u_normalSampler, float3(materialUv, (float)layer)).rgb * 2.0 - 1.0;
-        sampledNormal.xy *= u_materialTintNormal[layer].w;
-        sampledNormal = SafeNormalize(sampledNormal, float3(0.0, 0.0, 1.0));
-        const float sampledAo = u_aoTex.Sample(u_aoSampler, float3(materialUv, (float)layer)).r;
-        const float sampledRoughness = u_roughnessTex.Sample(u_roughnessSampler, float3(materialUv, (float)layer)).r;
-        const float sampledMetallic = u_metallicTex.Sample(u_metallicSampler, float3(materialUv, (float)layer)).r;
+        float3 diffuse = 0.0.xxx;
+        float3 sampledNormal = float3(0.0, 0.0, 1.0);
+        float3 sampledNormalWs = surfaceNormal;
+        float sampledAo = 1.0;
+        float sampledRoughness = 1.0;
+        float sampledMetallic = 0.0;
+        if (triplanarEnabled)
+        {
+            const float2 uvX = TriplanarPlaneUv(input.worldPos, 0, layer);
+            const float2 uvY = TriplanarPlaneUv(input.worldPos, 1, layer);
+            const float2 uvZ = TriplanarPlaneUv(input.worldPos, 2, layer);
+            diffuse =
+                u_paletteTex.Sample(u_paletteSampler, float3(uvX, (float)layer)).rgb * triplanarWeights.x +
+                u_paletteTex.Sample(u_paletteSampler, float3(uvY, (float)layer)).rgb * triplanarWeights.y +
+                u_paletteTex.Sample(u_paletteSampler, float3(uvZ, (float)layer)).rgb * triplanarWeights.z;
+            sampledAo =
+                u_aoTex.Sample(u_aoSampler, float3(uvX, (float)layer)).r * triplanarWeights.x +
+                u_aoTex.Sample(u_aoSampler, float3(uvY, (float)layer)).r * triplanarWeights.y +
+                u_aoTex.Sample(u_aoSampler, float3(uvZ, (float)layer)).r * triplanarWeights.z;
+            sampledRoughness =
+                u_roughnessTex.Sample(u_roughnessSampler, float3(uvX, (float)layer)).r * triplanarWeights.x +
+                u_roughnessTex.Sample(u_roughnessSampler, float3(uvY, (float)layer)).r * triplanarWeights.y +
+                u_roughnessTex.Sample(u_roughnessSampler, float3(uvZ, (float)layer)).r * triplanarWeights.z;
+            sampledMetallic =
+                u_metallicTex.Sample(u_metallicSampler, float3(uvX, (float)layer)).r * triplanarWeights.x +
+                u_metallicTex.Sample(u_metallicSampler, float3(uvY, (float)layer)).r * triplanarWeights.y +
+                u_metallicTex.Sample(u_metallicSampler, float3(uvZ, (float)layer)).r * triplanarWeights.z;
+
+            const float3 normalX = TriplanarNormalToWorld(DecodeLayerNormal(uvX, layer), 0, surfaceNormal);
+            const float3 normalY = TriplanarNormalToWorld(DecodeLayerNormal(uvY, layer), 1, surfaceNormal);
+            const float3 normalZ = TriplanarNormalToWorld(DecodeLayerNormal(uvZ, layer), 2, surfaceNormal);
+            sampledNormalWs = SafeNormalize(
+                normalX * triplanarWeights.x +
+                normalY * triplanarWeights.y +
+                normalZ * triplanarWeights.z,
+                surfaceNormal);
+        }
+        else
+        {
+            const float2 materialUv = TransformLayerUv(input.texUv, layer);
+            diffuse = u_paletteTex.Sample(u_paletteSampler, float3(materialUv, (float)layer)).rgb;
+            sampledNormal = DecodeLayerNormal(materialUv, layer);
+            sampledAo = u_aoTex.Sample(u_aoSampler, float3(materialUv, (float)layer)).r;
+            sampledRoughness = u_roughnessTex.Sample(u_roughnessSampler, float3(materialUv, (float)layer)).r;
+            sampledMetallic = u_metallicTex.Sample(u_metallicSampler, float3(materialUv, (float)layer)).r;
+        }
         albedo += weights[layer] * diffuse * u_materialTintNormal[layer].rgb;
-        normalTs += weights[layer] * sampledNormal;
+        if (triplanarEnabled)
+            normalWs += weights[layer] * sampledNormalWs;
+        else
+            normalTs += weights[layer] * sampledNormal;
         ao += weights[layer] * lerp(1.0, sampledAo, saturate(u_materialPbr[layer].x));
         roughness += weights[layer] * clamp(sampledRoughness * u_materialPbr[layer].y, 0.04, 1.0);
         metallic += weights[layer] * clamp(sampledMetallic * u_materialPbr[layer].z, 0.0, 1.0);
     }
 
-    normalTs = SafeNormalize(normalTs, float3(0.0, 0.0, 1.0));
-    float3 surfaceNormal = SafeNormalize(cross(ddx(input.worldPos), ddy(input.worldPos)), float3(0.0, 1.0, 0.0));
-    if (surfaceNormal.y < 0.0)
-        surfaceNormal = -surfaceNormal;
-    const float3x3 tbn = ComputeTbn(input.worldPos, input.texUv, surfaceNormal);
-    const float3 n = SafeNormalize(mul(normalTs, tbn), surfaceNormal);
+    float3 n = surfaceNormal;
+    if (triplanarEnabled)
+    {
+        n = SafeNormalize(normalWs, surfaceNormal);
+    }
+    else
+    {
+        normalTs = SafeNormalize(normalTs, float3(0.0, 0.0, 1.0));
+        const float3x3 tbn = ComputeTbn(input.worldPos, input.texUv, surfaceNormal);
+        n = SafeNormalize(mul(normalTs, tbn), surfaceNormal);
+    }
     const float3 v = SafeNormalize(u_cameraPos.xyz - input.worldPos, float3(0.0, 1.0, 0.0));
     const float3 l = SafeNormalize(u_sunDir.xyz, float3(0.0, 1.0, 0.0));
     const float nDotV = max(dot(n, v), 0.001);

@@ -21,6 +21,7 @@ public:
 
     bool IsReady() const { return m_ready; }
     VkRenderPass GetRenderPass() const { return m_renderPass; }
+    VkImageView GetSceneColorView() const { return m_colorView; }
     VkImageView GetSceneColorSnapshotView() const { return m_sceneColorSnapshotView; }
     VkImageView GetSceneDepthSnapshotView() const { return m_sceneDepthSnapshotView; }
     VkSampler GetLinearSampler() const { return m_sampler; }
