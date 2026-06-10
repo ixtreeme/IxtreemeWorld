@@ -72,6 +72,18 @@ const char* InputEventTypeName(InputEvent::Type type)
     }
 }
 
+const char* SculptDiagToolModeName(MapEditorToolMode mode)
+{
+    switch (mode)
+    {
+    case MapEditorToolMode::Heightmap: return "sculpt";
+    case MapEditorToolMode::SplatPaint: return "splat";
+    case MapEditorToolMode::WaterSculpt: return "water";
+    case MapEditorToolMode::None:
+    default: return "none";
+    }
+}
+
 void LogUnhandledInput(const InputEvent& event)
 {
     char buffer[128];
@@ -170,6 +182,7 @@ using EditorGizmoMode = MapEditorGizmoOperation;
 enum class SelectedEditorObjectType
 {
     None,
+    Terrain,
     PointLight,
     SpotLight,
     WaterBody,
@@ -192,6 +205,7 @@ SelectedEditorObjectType ToSelectedObjectType(HierarchyEntityType type)
 {
     switch (type)
     {
+    case HierarchyEntityType::Terrain: return SelectedEditorObjectType::Terrain;
     case HierarchyEntityType::WaterBody: return SelectedEditorObjectType::WaterBody;
     case HierarchyEntityType::PointLight: return SelectedEditorObjectType::PointLight;
     case HierarchyEntityType::SpotLight: return SelectedEditorObjectType::SpotLight;
@@ -218,6 +232,11 @@ std::string EditorDisplayName(const SpotLight& light)
 std::string EditorDisplayName(const MeshSceneEntity& mesh)
 {
     return mesh.name.empty() ? "Mesh Entity " + std::to_string(mesh.id) : mesh.name;
+}
+
+std::string EditorDisplayName(const TerrainSceneData& terrain)
+{
+    return terrain.name.empty() ? "Terrain" : terrain.name;
 }
 
 WorldVec3 CameraForward(const WorldCamera& camera)
@@ -996,10 +1015,18 @@ void MergeMapEditorCommands(MapEditorCommands& target, const MapEditorCommands& 
     target.pausePlayMode = target.pausePlayMode || source.pausePlayMode;
     target.resumePlayMode = target.resumePlayMode || source.resumePlayMode;
     target.addWaterBody = target.addWaterBody || source.addWaterBody;
+    if (source.createTerrain)
+    {
+        target.createTerrain = true;
+        target.terrainCreate = source.terrainCreate;
+    }
     if (source.addMeshEntity)
     {
         target.addMeshEntity = true;
         target.meshAssetId = source.meshAssetId;
+        target.meshDropScreenPositionValid = source.meshDropScreenPositionValid;
+        target.meshDropScreenPosition[0] = source.meshDropScreenPosition[0];
+        target.meshDropScreenPosition[1] = source.meshDropScreenPosition[1];
     }
     if (source.addComponentToSelectedEntity)
     {
@@ -1157,7 +1184,6 @@ int RunGame(NativeWindow& window,
     runtimeUi->SetQuitCallback([&window]() {
         window.RequestClose();
     });
-    runtimeUi->InstallSceneRouting(SceneManager::Instance());
     runtimeUi->BindRuntime(*runtimeSession);
 #if defined(IXTREEME_WITH_EDITOR)
     runtimeUi->HideAll();
@@ -1208,6 +1234,13 @@ int RunGame(NativeWindow& window,
 
     TerrainRenderer terrain;
     bool terrainOk = terrain.Create(device, assets);
+    auto syncTerrainAssetRoots = [&]() {
+        std::vector<std::filesystem::path> roots;
+        if (ProjectManager::Instance().HasProject())
+            roots.push_back(ProjectManager::Instance().ProjectRoot());
+        terrain.SetAdditionalAssetRoots(std::move(roots));
+    };
+    syncTerrainAssetRoots();
     if (!terrainOk)
     {
         Tracenf("[MAIN] TerrainRenderer failed to initialize - terrain will not be available");
@@ -1215,7 +1248,7 @@ int RunGame(NativeWindow& window,
     }
     else
     {
-        runtimeSession->InitializeAssetLibrary("assets/Maps/test_zone", terrain.GetPaletteSlots());
+        runtimeSession->InitializeAssetLibrary("", terrain.GetPaletteSlots());
 #if defined(IXTREEME_WITH_EDITOR)
         editorImGui.SetPaletteSlots(runtimeSession->GetPaletteSlots());
         editorImGui.SetWaterMaterials(editorImGui.GetWaterMaterialsSnapshot());
@@ -1429,6 +1462,7 @@ int RunGame(NativeWindow& window,
         scene.pointLights = editorPointLights;
         scene.spotLights = editorSpotLights;
         scene.meshEntities = editorMeshEntities;
+        scene.terrain = terrainOk ? terrain.GetTerrainSceneData() : TerrainSceneData{};
         scene.paletteSlots = terrainOk ? terrain.GetPaletteSlots() : runtimeSession->GetPaletteSlots();
         return scene;
     };
@@ -1456,9 +1490,20 @@ int RunGame(NativeWindow& window,
         runtimeSession->SetWaterBodyEditorState({});
         if (terrainOk)
         {
+            syncTerrainAssetRoots();
             terrain.SetLightingState(scene.lighting);
-            terrain.SetWaterBodies(device, editorWaterBodies);
-            editorWaterBodies = terrain.GetWaterBodies();
+            if (scene.terrain.exists)
+            {
+                terrain.CreateFlatTerrain(device, scene.terrain);
+                terrain.SetWaterBodies(device, editorWaterBodies);
+                editorWaterBodies = terrain.GetWaterBodies();
+            }
+            else
+            {
+                terrain.ClearTerrain(device);
+                editorWaterBodies.clear();
+                Tracen("[SCENE] no terrain in scene");
+            }
             if (terrain.ApplyPaletteSlots(device, scene.paletteSlots))
                 editorImGui.SetPaletteSlots(terrain.GetPaletteSlots());
         }
@@ -1524,6 +1569,11 @@ int RunGame(NativeWindow& window,
 
         for (const WaterBody& body : editorWaterBodies)
             ensureEntity(HierarchyEntityType::WaterBody, body.id, EditorDisplayName(body), body.editorHidden);
+        if (terrainOk && terrain.HasTerrain())
+        {
+            const TerrainSceneData terrainData = terrain.GetTerrainSceneData();
+            ensureEntity(HierarchyEntityType::Terrain, 1u, EditorDisplayName(terrainData), terrainData.editorHidden);
+        }
         for (const PointLight& light : editorPointLights)
             ensureEntity(HierarchyEntityType::PointLight, light.id, EditorDisplayName(light), light.editorHidden);
         for (const SpotLight& light : editorSpotLights)
@@ -1559,6 +1609,7 @@ int RunGame(NativeWindow& window,
     bool waterSculptMeshRegenPending = false;
 #if defined(IXTREEME_WITH_EDITOR)
     bool editorShiftDown = false;
+    bool editorLeftMouseHeld = false;
 #endif
 
     window.SetInputCallback([&runtimeSession,
@@ -1591,10 +1642,16 @@ int RunGame(NativeWindow& window,
 #if defined(IXTREEME_WITH_EDITOR)
                              &editorPlay,
                              &editorShiftDown,
+                             &editorLeftMouseHeld,
 #endif
                              &renderSize](const InputEvent& event)
     {
 #if defined(IXTREEME_WITH_EDITOR)
+        if (event.type == InputEvent::MouseDown && event.button == MouseButton_Left)
+            editorLeftMouseHeld = true;
+        else if (event.type == InputEvent::MouseUp && event.button == MouseButton_Left)
+            editorLeftMouseHeld = false;
+
         if (event.type == InputEvent::KeyDown && event.key == Key_Shift)
             editorShiftDown = true;
         else if (event.type == InputEvent::KeyUp && event.key == Key_Shift)
@@ -1786,8 +1843,70 @@ int RunGame(NativeWindow& window,
                 event.type == InputEvent::MouseUp ||
                 event.type == InputEvent::MouseWheel)
             {
-                consumedByEditorUi = runtimeSession->OnInput(event);
                 const MapEditorSettings editorSettings = editorImGui.GetMapEditorSettings();
+                const bool terrainToolActiveForDiag =
+                    editorSettings.toolMode == MapEditorToolMode::Heightmap ||
+                    editorSettings.toolMode == MapEditorToolMode::SplatPaint;
+                const bool shouldLogSculptDiag =
+                    terrainToolActiveForDiag ||
+                    event.type == InputEvent::MouseDown ||
+                    event.type == InputEvent::MouseUp;
+                const auto viewportDiag = editorImGui.GetViewportInputDiagnostics();
+                auto logSculptGateState = [&](const char* stage, bool brushReached, const char* reason) {
+                    if (!shouldLogSculptDiag)
+                        return;
+                    const bool wantCaptureMouse = editorImGui.WantsInputCapture(event);
+                    const bool isLeftMouseDown = event.type == InputEvent::MouseDown && event.button == MouseButton_Left;
+                    const bool dropTargetCapturing =
+                        viewportDiag.dropTargetActive ||
+                        viewportDiag.overlayDropTargetActive;
+                    Tracenf("[SCULPT-DIAG] viewport mouseDown=%s drag=%s pos=(%d,%d) sculptModeActive=%s activeTool=%s event=%s stage=%s",
+                        isLeftMouseDown ? "yes" : "no",
+                        (editorLeftMouseHeld || editorObjectDragActive || viewportDiag.assetDragActive) ? "yes" : "no",
+                        event.x,
+                        event.y,
+                        terrainToolActiveForDiag ? "yes" : "no",
+                        SculptDiagToolModeName(editorSettings.toolMode),
+                        InputEventTypeName(event.type),
+                        stage ? stage : "unknown");
+                    Tracenf("[SCULPT-DIAG] gate imgui WantCaptureMouse=%s",
+                        wantCaptureMouse ? "yes" : "no");
+                    if (viewportDiag.hoveredItemId != 0)
+                    {
+                        Tracenf("[SCULPT-DIAG] gate hoveredItem=0x%08x dropTargetCapturing=%s dropVisible=%s assetDrag=%s dropHovered=%s overlayHovered=%s activeItem=0x%08x",
+                            viewportDiag.hoveredItemId,
+                            dropTargetCapturing ? "yes" : "no",
+                            viewportDiag.dropTargetVisible ? "yes" : "no",
+                            viewportDiag.assetDragActive ? "yes" : "no",
+                            viewportDiag.dropTargetHovered ? "yes" : "no",
+                            viewportDiag.overlayDropTargetHovered ? "yes" : "no",
+                            viewportDiag.activeItemId);
+                    }
+                    else
+                    {
+                        Tracenf("[SCULPT-DIAG] gate hoveredItem=none dropTargetCapturing=%s dropVisible=%s assetDrag=%s dropHovered=%s overlayHovered=%s activeItem=0x%08x",
+                            dropTargetCapturing ? "yes" : "no",
+                            viewportDiag.dropTargetVisible ? "yes" : "no",
+                            viewportDiag.assetDragActive ? "yes" : "no",
+                            viewportDiag.dropTargetHovered ? "yes" : "no",
+                            viewportDiag.overlayDropTargetHovered ? "yes" : "no",
+                            viewportDiag.activeItemId);
+                    }
+                    Tracenf("[SCULPT-DIAG] gate sculptToolSelected=%s",
+                        terrainToolActiveForDiag ? "yes" : "no");
+                    Tracenf("[SCULPT-DIAG] gate mapLoadedFlag=%s",
+                        terrain.IsMapLoadedForDiagnostics() ? "yes" : "no");
+                    Tracenf("[SCULPT-DIAG] gate terrainTarget=%p",
+                        terrain.HasTerrain() ? static_cast<void*>(&terrain) : nullptr);
+                    Tracenf("[SCULPT-DIAG] brush handler reached=%s reason=%s consumedByEditorUi=%s",
+                        brushReached ? "yes" : "no",
+                        reason ? reason : "n/a",
+                        consumedByEditorUi ? "yes" : "no");
+                };
+
+                logSculptGateState("before-runtime-ui", false, "pre-runtime-ui");
+                consumedByEditorUi = runtimeSession->OnInput(event);
+                logSculptGateState("after-runtime-ui", false, consumedByEditorUi ? "runtime-ui-consumed" : "runtime-ui-pass");
                 auto selectedWaterBodyIt = [&]() {
                     return std::find_if(editorWaterBodies.begin(), editorWaterBodies.end(),
                         [&](const WaterBody& body) {
@@ -1894,8 +2013,18 @@ int RunGame(NativeWindow& window,
                      event.type == InputEvent::MouseUp))
                 {
                     editorObjectDragActive = false;
+                    logSculptGateState("before-brush-handler", true, "terrain-tool-route");
                     terrain.HandleEditorInput(event);
                     return;
+                }
+                if (shouldLogSculptDiag &&
+                    (event.type == InputEvent::MouseMove ||
+                     event.type == InputEvent::MouseDown ||
+                     event.type == InputEvent::MouseUp))
+                {
+                    logSculptGateState("terrain-tool-route-skipped", false,
+                        consumedByEditorUi ? "consumed-by-editor-ui" :
+                        (!terrainToolActive ? "terrain-tool-inactive" : "event-not-routed"));
                 }
 
                 if (event.type == InputEvent::MouseUp)
@@ -2316,9 +2445,32 @@ int RunGame(NativeWindow& window,
                     fallback.y = terrain.SampleHeight(fallback);
                     return fallback;
                 };
+                auto spawnAtScreenPosition = [&](float screenX, float screenY) {
+                    const int maxX = renderSize.width > 0 ? static_cast<int>(renderSize.width - 1u) : 0;
+                    const int maxY = renderSize.height > 0 ? static_cast<int>(renderSize.height - 1u) : 0;
+                    const int mouseX = std::clamp(static_cast<int>(std::round(screenX)), 0, maxX);
+                    const int mouseY = std::clamp(static_cast<int>(std::round(screenY)), 0, maxY);
+                    std::optional<WorldVec3> hit = RaycastTerrainPoint(terrain,
+                        frameCamera,
+                        renderSize.width,
+                        renderSize.height,
+                        mouseX,
+                        mouseY);
+                    if (hit)
+                        return *hit;
+
+                    WorldVec3 fallback = WorldAdd(frameCamera.eye,
+                        WorldScale(ScreenRayDirection(frameCamera, renderSize.width, renderSize.height, mouseX, mouseY), 30.0f));
+                    fallback.y = terrain.SampleHeight(fallback);
+                    return fallback;
+                };
                 auto selectHierarchyEntity = [&](HierarchyEntityType type, std::uint32_t id, std::uint64_t flecsEntity = 0) {
                     switch (type)
                     {
+                    case HierarchyEntityType::Terrain:
+                        selectedEditorObject = {SelectedEditorObjectType::Terrain, id, flecsEntity};
+                        runtimeSession->SetEditorStatus("Selected terrain");
+                        break;
                     case HierarchyEntityType::WaterBody:
                         selectedEditorObject = {SelectedEditorObjectType::WaterBody, id, flecsEntity};
                         runtimeSession->SetEditorStatus("Selected water body #" + std::to_string(id));
@@ -2343,7 +2495,11 @@ int RunGame(NativeWindow& window,
                 };
                 auto focusHierarchyEntity = [&](HierarchyEntityType type, std::uint32_t id) {
                     std::optional<WorldVec3> target;
-                    if (type == HierarchyEntityType::WaterBody)
+                    if (type == HierarchyEntityType::Terrain)
+                    {
+                        target = WorldVec3{0.0f, 0.0f, 0.0f};
+                    }
+                    else if (type == HierarchyEntityType::WaterBody)
                     {
                         auto it = std::find_if(editorWaterBodies.begin(), editorWaterBodies.end(),
                             [&](const WaterBody& body) { return body.id == id; });
@@ -2384,6 +2540,11 @@ int RunGame(NativeWindow& window,
                             [&](const WaterBody& body) { return body.id == id; }), editorWaterBodies.end());
                         editorWaterBodiesDirty = true;
                     }
+                    else if (type == HierarchyEntityType::Terrain)
+                    {
+                        if (terrainOk)
+                            terrain.ClearTerrain(device);
+                    }
                     else if (type == HierarchyEntityType::PointLight)
                     {
                         editorPointLights.erase(std::remove_if(editorPointLights.begin(), editorPointLights.end(),
@@ -2399,7 +2560,8 @@ int RunGame(NativeWindow& window,
                         editorMeshEntities.erase(std::remove_if(editorMeshEntities.begin(), editorMeshEntities.end(),
                             [&](const MeshSceneEntity& mesh) { return mesh.id == id; }), editorMeshEntities.end());
                     }
-                    if ((type == HierarchyEntityType::WaterBody && selectedEditorObject.type == SelectedEditorObjectType::WaterBody && selectedEditorObject.id == id) ||
+                    if ((type == HierarchyEntityType::Terrain && selectedEditorObject.type == SelectedEditorObjectType::Terrain) ||
+                        (type == HierarchyEntityType::WaterBody && selectedEditorObject.type == SelectedEditorObjectType::WaterBody && selectedEditorObject.id == id) ||
                         (type == HierarchyEntityType::PointLight && selectedEditorObject.type == SelectedEditorObjectType::PointLight && selectedEditorObject.id == id) ||
                         (type == HierarchyEntityType::SpotLight && selectedEditorObject.type == SelectedEditorObjectType::SpotLight && selectedEditorObject.id == id) ||
                         (type == HierarchyEntityType::MeshEntity && selectedEditorObject.type == SelectedEditorObjectType::MeshEntity && selectedEditorObject.id == id))
@@ -2428,6 +2590,11 @@ int RunGame(NativeWindow& window,
                         editorWaterBodiesDirty = true;
                         SceneManager::Instance().MarkDirty();
                         Tracenf("[HIERARCHY] Duplicated entity: original=%u new=%u", id, copy.id);
+                    }
+                    else if (type == HierarchyEntityType::Terrain)
+                    {
+                        runtimeSession->SetEditorStatus("Only one terrain is supported per scene");
+                        Tracen("[HIERARCHY] Duplicate ignored for Terrain: one terrain per scene");
                     }
                     else if (type == HierarchyEntityType::PointLight)
                     {
@@ -2493,6 +2660,15 @@ int RunGame(NativeWindow& window,
                         if (it != editorWaterBodies.end())
                             it->name = name;
                     }
+                    else if (type == HierarchyEntityType::Terrain)
+                    {
+                        if (terrainOk && terrain.HasTerrain())
+                        {
+                            TerrainSceneData data = terrain.GetTerrainSceneData();
+                            data.name = name;
+                            terrain.SetTerrainSceneData(data);
+                        }
+                    }
                     else if (type == HierarchyEntityType::PointLight)
                     {
                         auto it = std::find_if(editorPointLights.begin(), editorPointLights.end(),
@@ -2529,6 +2705,16 @@ int RunGame(NativeWindow& window,
                             it->editorHidden = !it->editorHidden;
                             hidden = it->editorHidden;
                             editorWaterBodiesDirty = true;
+                        }
+                    }
+                    else if (type == HierarchyEntityType::Terrain)
+                    {
+                        if (terrainOk && terrain.HasTerrain())
+                        {
+                            TerrainSceneData data = terrain.GetTerrainSceneData();
+                            data.editorHidden = !data.editorHidden;
+                            hidden = data.editorHidden;
+                            terrain.SetTerrainSceneData(data);
                         }
                     }
                     else if (type == HierarchyEntityType::PointLight)
@@ -2589,10 +2775,8 @@ int RunGame(NativeWindow& window,
                     editorPlay.playStartSceneDirty = SceneManager::Instance().IsDirty();
                     editorPlay.playStartSceneSnapshot = SceneManager::Instance().GetCurrentScene();
                     editorPlay.playStartScenePath = SceneManager::Instance().GetCurrentScenePath();
-                    const std::string playSceneType = SceneManager::Instance().GetCurrentSceneType();
-                    Tracenf("[EDIT-PLAY] Play Mode: starting scene = %s scene_type=%s",
-                        editorPlay.playStartScenePath.empty() ? "<unsaved>" : editorPlay.playStartScenePath.c_str(),
-                        playSceneType.c_str());
+                    Tracenf("[EDIT-PLAY] Play Mode: starting scene = %s",
+                        editorPlay.playStartScenePath.empty() ? "<unsaved>" : editorPlay.playStartScenePath.c_str());
                     editorPlay.editorCameraSnapshot = cameraController.SaveSnapshot();
                     selectedEditorObject = {};
                     editorObjectDragActive = false;
@@ -2601,7 +2785,6 @@ int RunGame(NativeWindow& window,
                     terrain.SetWaterSculptBrush(false, 0.0f, 0.0f, 0.0f, true);
                     cameraController.SetFreeCameraEnabled(true);
                     runtimeSession->Start(SceneManager::Instance().GetCurrentScene());
-                    SceneManager::Instance().ActivateCurrentSceneType();
                     editorPlay.state.frameCount = 0;
                     editorPlay.state.elapsedSeconds = 0.0;
                     editorPlay.appliedMode = editorPlay.state.mode;
@@ -2654,6 +2837,7 @@ int RunGame(NativeWindow& window,
                     if (editorPlay.state.mode == EditorPlayMode::Play)
                         runtimeSession->Tick(deltaSeconds);
                     commands.addWaterBody = false;
+                    commands.createTerrain = false;
                     commands.addMeshEntity = false;
                     commands.addComponentToSelectedEntity = false;
                     commands.addComponentType = EditorComponentType::None;
@@ -2689,6 +2873,10 @@ int RunGame(NativeWindow& window,
                 if (commands.hierarchyToggleHidden)
                     toggleHierarchyHidden(commands.hierarchyEntityType, commands.hierarchyEntityId);
                 auto selectedEntityPosition = [&]() {
+                    if (selectedEditorObject.type == SelectedEditorObjectType::Terrain)
+                    {
+                        return WorldVec3{0.0f, 0.0f, 0.0f};
+                    }
                     if (selectedEditorObject.type == SelectedEditorObjectType::WaterBody)
                     {
                         auto it = std::find_if(editorWaterBodies.begin(), editorWaterBodies.end(),
@@ -2785,6 +2973,12 @@ int RunGame(NativeWindow& window,
                     if (commands.addComponentType == EditorComponentType::WaterBody &&
                         selectedEditorObject.type != SelectedEditorObjectType::WaterBody)
                     {
+                        if (!terrainOk || !terrain.HasTerrain())
+                        {
+                            runtimeSession->SetEditorStatus("Create a terrain before adding water");
+                        }
+                        else
+                        {
                         WaterBody body{};
                         body.id = nextEditorWaterBodyId++;
                         body.name = makeUniqueSceneEntityName("Water Body");
@@ -2801,6 +2995,7 @@ int RunGame(NativeWindow& window,
                         editorWaterBodiesDirty = true;
                         SceneManager::Instance().MarkDirty();
                         runtimeSession->SetEditorStatus("Added Water Body component");
+                        }
                     }
                     else if (commands.addComponentType == EditorComponentType::PointLight &&
                         selectedEditorObject.type != SelectedEditorObjectType::PointLight)
@@ -2854,9 +3049,52 @@ int RunGame(NativeWindow& window,
                     }
                 }
                 if (commands.addMeshEntity)
-                    createMeshEntityAt(commands.meshAssetId, spawnAtCameraCenter());
+                {
+                    const WorldVec3 spawn = commands.meshDropScreenPositionValid
+                        ? spawnAtScreenPosition(commands.meshDropScreenPosition[0], commands.meshDropScreenPosition[1])
+                        : spawnAtCameraCenter();
+                    if (commands.meshDropScreenPositionValid)
+                    {
+                        Tracenf("[DND] drop -> spawn at raycast pos=(%.2f,%.2f,%.2f)",
+                            spawn.x,
+                            spawn.y,
+                            spawn.z);
+                    }
+                    createMeshEntityAt(commands.meshAssetId, spawn);
+                }
+                if (commands.createTerrain && terrainOk)
+                {
+                    TerrainSceneData next = commands.terrainCreate;
+                    next.exists = true;
+                    if (next.name.empty())
+                        next.name = makeUniqueSceneEntityName("Terrain");
+                    next.cellSizeMeters = std::max(0.01f, next.cellSizeMeters);
+                    next.cellsX = std::max(1u, next.cellsX);
+                    next.cellsZ = std::max(1u, next.cellsZ);
+                    next.widthMeters = static_cast<float>(next.cellsX) * next.cellSizeMeters;
+                    next.depthMeters = static_cast<float>(next.cellsZ) * next.cellSizeMeters;
+                    if (terrain.CreateFlatTerrain(device, next))
+                    {
+                        editorWaterBodies.clear();
+                        editorWaterBodiesDirty = true;
+                        selectedEditorObject = {SelectedEditorObjectType::Terrain, 1u};
+                        editorGizmoMode = EditorGizmoMode::Translate;
+                        SceneManager::Instance().MarkDirty();
+                        runtimeSession->SetEditorStatus("Terrain created");
+                    }
+                    else
+                    {
+                        runtimeSession->SetEditorStatus("Terrain creation failed");
+                    }
+                }
                 if (commands.addWaterBody)
                 {
+                    if (!terrainOk || !terrain.HasTerrain())
+                    {
+                        runtimeSession->SetEditorStatus("Create a terrain before adding water");
+                    }
+                    else
+                    {
                     const WorldVec3 spawn = spawnAtCameraCenter();
                     WaterBody body{};
                     body.id = nextEditorWaterBodyId++;
@@ -2877,6 +3115,7 @@ int RunGame(NativeWindow& window,
                         " name=" + body.name);
                     Tracenf("[EDITOR-3D-SPAWN] Spawn at cursor: type=water position=(%.2f,%.2f,%.2f)",
                         spawn.x, spawn.y, spawn.z);
+                    }
                 }
                 if (commands.addPointLight)
                 {
@@ -3085,6 +3324,20 @@ int RunGame(NativeWindow& window,
                         meshRendererState.meshDisplayName = entry->displayName.empty() ? entry->filename : entry->displayName;
                 }
                 editorImGui.SetMeshRendererEditorState(meshRendererState);
+                TerrainEditorState terrainState{};
+                if (terrainOk && terrain.HasTerrain())
+                {
+                    const TerrainSceneData terrainData = terrain.GetTerrainSceneData();
+                    terrainState.exists = true;
+                    terrainState.selected = selectedEditorObject.type == SelectedEditorObjectType::Terrain;
+                    terrainState.name = EditorDisplayName(terrainData);
+                    terrainState.widthMeters = terrainData.widthMeters;
+                    terrainState.depthMeters = terrainData.depthMeters;
+                    terrainState.cellSizeMeters = terrainData.cellSizeMeters;
+                    terrainState.cellsX = terrainData.cellsX;
+                    terrainState.cellsZ = terrainData.cellsZ;
+                }
+                editorImGui.SetTerrainEditorState(terrainState);
                 auto hierarchyState = buildHierarchyEntities();
                 editorImGui.SetHierarchySceneState(
                     static_cast<std::uint64_t>(editorSceneRootEntity),
@@ -3173,6 +3426,7 @@ int RunGame(NativeWindow& window,
                 }
                 if (commands.paletteSlotChanged)
                 {
+                    syncTerrainAssetRoots();
                     if (!terrain.ApplyPaletteSlotChange(device, commands.paletteSlotData))
                     {
                         Tracenf("[MAIN] failed to apply terrain palette slot %u", commands.paletteSlot);
@@ -3211,15 +3465,20 @@ int RunGame(NativeWindow& window,
         device.BeginFrame();
         if (device.IsFrameActive())
         {
+            const uint64_t frameNumber = device.GetFrameNumber();
             bool frameRmlUiRenderCalled = false;
             bool frameImGuiRenderCalled = false;
             bool frameSceneRenderCalled = false;
             size_t frameSceneEntityCount = 0;
+            size_t frameStaticMeshEntityCount = 0;
+            size_t frameStaticMeshSubmitted = 0;
+            size_t frameStaticMeshDrawCalls = 0;
 #if defined(IXTREEME_WITH_EDITOR)
             editorImGui.SetEditorPlayModeState(editorPlay.state);
             editorImGui.BeginFrame(runtimeSession->IsMapEditorOpen());
 #endif
             const bool isInWorld = runtimeSession->IsInWorld();
+            const bool hasSceneTerrain = terrainOk && terrain.HasTerrain();
             std::vector<WorldRenderEntity> entities;
             WorldCamera camera{};
             if (isInWorld)
@@ -3265,9 +3524,9 @@ int RunGame(NativeWindow& window,
                 skinnedMesh.Skin(device, seconds);
             }
 
-            if (isInWorld && terrainOk && hasFrameCamera)
+            if (isInWorld && hasSceneTerrain && hasFrameCamera)
                 terrain.RenderSunShadowMap(device, frameCamera);
-            if (isInWorld && terrainOk && hasFrameCamera)
+            if (isInWorld && hasSceneTerrain && hasFrameCamera)
             {
                 terrain.RenderWaterReflection(device,
                     frameCamera,
@@ -3360,12 +3619,12 @@ int RunGame(NativeWindow& window,
             if (useOffscreenScene)
                 offscreenScene.BeginMainPass(device);
             else
-                device.BeginSwapchainRenderPass();
+                device.BeginSwapchainRenderPass("direct");
 
             std::vector<WorldLabelRenderer::Label> plates;
             if (isInWorld)
             {
-                if (terrainOk)
+                if (hasSceneTerrain)
                 {
                     frameSceneRenderCalled = true;
                     terrain.Render(device, camera);
@@ -3377,9 +3636,9 @@ int RunGame(NativeWindow& window,
                 for (const auto& entity : entities)
                 {
                     auto position = ServerMetersToDisplay(entity.position);
-                    const float terrainY = terrainOk ? terrain.SampleHeight(position) : position.y;
+                    const float terrainY = hasSceneTerrain ? terrain.SampleHeight(position) : position.y;
                     const float groundOffsetY = skinnedMeshOk ? skinnedMesh.GroundOffsetY() : 0.0f;
-                    if (!loggedTerrainAlignment && terrainOk)
+                    if (!loggedTerrainAlignment && hasSceneTerrain)
                     {
                         Tracenf("[WORLD] terrain align: net_id=%u server=(%.3f,%.3f,%.3f) displayY=%.3f terrainY=%.3f delta=%.3f modelGroundOffset=%.3f",
                             entity.netId,
@@ -3438,13 +3697,6 @@ int RunGame(NativeWindow& window,
                             selected
                                 ? std::array<float, 4>{2.0f, 1.55f, 0.25f, 1.0f}
                                 : std::array<float, 4>{1.6f, 1.05f, 0.35f, 1.0f});
-                        plates.push_back(WorldLabelRenderer::Label{
-                            WorldAdd({light.position[0], light.position[1], light.position[2]}, {0.0f, 1.4f, 0.0f}),
-                            light.name.empty() ? "Point Light " + std::to_string(light.id) : light.name,
-                            selected
-                                ? std::array<float, 4>{1.0f, 0.86f, 0.32f, 1.0f}
-                                : std::array<float, 4>{1.0f, 0.78f, 0.30f, 1.0f},
-                            selected});
                         ++skinSlot;
                     }
                     for (const auto& light : editorSpotLights)
@@ -3466,13 +3718,6 @@ int RunGame(NativeWindow& window,
                             selected
                                 ? std::array<float, 4>{0.35f, 1.7f, 2.0f, 1.0f}
                                 : std::array<float, 4>{0.35f, 1.25f, 1.65f, 1.0f});
-                        plates.push_back(WorldLabelRenderer::Label{
-                            WorldAdd({light.position[0], light.position[1], light.position[2]}, {0.0f, 1.4f, 0.0f}),
-                            light.name.empty() ? "Spot Light " + std::to_string(light.id) : light.name,
-                            selected
-                                ? std::array<float, 4>{1.0f, 0.86f, 0.32f, 1.0f}
-                                : std::array<float, 4>{0.35f, 0.86f, 1.0f, 1.0f},
-                            selected});
                         ++skinSlot;
                     }
                 }
@@ -3482,6 +3727,7 @@ int RunGame(NativeWindow& window,
                     {
                         if (editorPlay.state.mode == EditorPlayMode::Edit && mesh.editorHidden)
                             continue;
+                        ++frameStaticMeshEntityCount;
                         const bool selected =
                             selectedEditorObject.type == SelectedEditorObjectType::MeshEntity &&
                             selectedEditorObject.id == mesh.id;
@@ -3501,17 +3747,33 @@ int RunGame(NativeWindow& window,
                                 ? std::array<float, 4>{1.25f, 1.05f, 0.45f, 1.0f}
                                 : std::array<float, 4>{1.0f, 1.0f, 1.0f, 1.0f};
                             renderer->RenderInWorld(device, seconds, camera, instance);
+                            const std::uint32_t submittedDrawCalls = renderer->LastSubmittedDrawCalls();
+                            if (submittedDrawCalls > 0)
+                            {
+                                ++frameStaticMeshSubmitted;
+                                frameStaticMeshDrawCalls += submittedDrawCalls;
+                                if (frameNumber < 3 || (frameNumber % 60u) == 0u)
+                                {
+                                    const auto& bmin = renderer->BoundsMin();
+                                    const auto& bmax = renderer->BoundsMax();
+                                    Tracenf("[MESH] Static submit detail: id=%u name=%s path=%s drawcalls=%u verts=%zu indices=%zu bbox_min=(%.3f,%.3f,%.3f) bbox_max=(%.3f,%.3f,%.3f) pos=(%.3f,%.3f,%.3f) scale=(%.3f,%.3f,%.3f) rot=(%.3f,%.3f,%.3f)",
+                                        mesh.id,
+                                        mesh.name.c_str(),
+                                        runtimePath.c_str(),
+                                        submittedDrawCalls,
+                                        renderer->VertexCount(),
+                                        renderer->IndexCount(),
+                                        bmin[0], bmin[1], bmin[2],
+                                        bmax[0], bmax[1], bmax[2],
+                                        mesh.position[0], mesh.position[1], mesh.position[2],
+                                        mesh.scale[0], mesh.scale[1], mesh.scale[2],
+                                        mesh.rotation[0], mesh.rotation[1], mesh.rotation[2]);
+                                }
+                            }
                         }
-                        plates.push_back(WorldLabelRenderer::Label{
-                            WorldAdd({mesh.position[0], mesh.position[1], mesh.position[2]}, {0.0f, 1.8f, 0.0f}),
-                            mesh.name.empty() ? "Mesh Entity " + std::to_string(mesh.id) : mesh.name,
-                            selected
-                                ? std::array<float, 4>{1.0f, 0.86f, 0.32f, 1.0f}
-                                : std::array<float, 4>{0.92f, 0.92f, 1.0f, 1.0f},
-                            selected});
                     }
                 }
-                if (!useOffscreenScene && terrainOk)
+                if (!useOffscreenScene && hasSceneTerrain)
                 {
                     terrain.RenderWater(device, camera, seconds);
                 }
@@ -3528,7 +3790,7 @@ int RunGame(NativeWindow& window,
             if (useOffscreenScene)
             {
                 offscreenScene.EndMainPass(device);
-                if (isInWorld && terrainOk)
+                if (isInWorld && hasSceneTerrain)
                 {
                     offscreenScene.SnapshotScene(device);
                     terrain.SetWaterRefractionInputs(offscreenScene.GetSceneColorSnapshotView(),
@@ -3539,7 +3801,7 @@ int RunGame(NativeWindow& window,
                     terrain.RenderWater(device, camera, seconds);
                     offscreenScene.EndMainPass(device);
                 }
-                device.BeginSwapchainRenderPass();
+                device.BeginSwapchainRenderPass("composite");
                 offscreenScene.RenderComposite(device);
                 if (isInWorld && worldLabelsOk)
                     worldLabels.Render(device, camera, plates);
@@ -3552,9 +3814,12 @@ int RunGame(NativeWindow& window,
 #else
             frameImGuiRenderCalled = false;
 #endif
-            const uint64_t frameNumber = device.GetFrameNumber();
             if (frameNumber < 3 || (frameNumber % 60u) == 0u)
             {
+                Tracenf("[FRAME] static_mesh entities=%zu submitted=%zu drawcalls=%zu",
+                    frameStaticMeshEntityCount,
+                    frameStaticMeshSubmitted,
+                    frameStaticMeshDrawCalls);
                 Tracenf("[FRAME] summary frame=%llu imgui_render called=%s rmlui_render called=%s scene_render called=%s entity_count=%zu clear_color=(0.04,0.05,0.09,1.00) in_world=%d lobby=%d editor_open=%d swapchain=%ux%u",
                     static_cast<unsigned long long>(frameNumber),
                     frameImGuiRenderCalled ? "yes" : "no",
@@ -3616,8 +3881,19 @@ int WINAPI WinMain(HINSTANCE instance, HINSTANCE, LPSTR, int showCommand)
 {
     (void)showCommand;
 
+    uint32_t windowWidth = 1280;
+    uint32_t windowHeight = 720;
+    if (NativeWindow_Win32::GetPrimaryMonitorResolution(windowWidth, windowHeight))
+    {
+        Tracenf("[BOOT] native monitor resolution = %ux%u", windowWidth, windowHeight);
+    }
+    else
+    {
+        Tracenf("[BOOT] native monitor resolution unavailable -> fallback = %ux%u", windowWidth, windowHeight);
+    }
+
     NativeWindow_Win32 window;
-    if (!window.Create(instance, "IxtreemeWorld Engine - Editor", 1280, 720))
+    if (!window.Create(instance, "IxtreemeWorld Engine - Editor", windowWidth, windowHeight))
     {
         ShowFatal("Failed to create Win32 window.");
         return 1;

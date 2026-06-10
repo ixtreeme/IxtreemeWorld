@@ -1,7 +1,6 @@
 #include "RmlUiLayer.h"
 
 #include "Debug.h"
-#include "SceneManager.h"
 #include "VulkanDevice.h"
 #include "asset/IAssetReader.h"
 #include <RmlUi/Core.h>
@@ -25,18 +24,6 @@
 
 namespace
 {
-void WarnSceneTypeMismatch(const char* call, const char* expected)
-{
-    const std::string& sceneType = SceneManager::Instance().GetCurrentSceneType();
-    if (sceneType != expected)
-    {
-        TraceError("[RMLUI] scene_type mismatch: %s called while active scene_type is '%s' (expected '%s')",
-            call,
-            sceneType.c_str(),
-            expected);
-    }
-}
-
 const char* VkResultName(VkResult result)
 {
     switch (result)
@@ -1986,7 +1973,6 @@ void RmlUiLayer::ShowLogin()
         return;
     }
 
-    WarnSceneTypeMismatch("ShowLogin", "login");
     m_impl->loginVisible = true;
     m_impl->lobbyVisible = false;
     m_impl->hudVisible = false;
@@ -2062,7 +2048,6 @@ void RmlUiLayer::ShowLobby()
         return;
     }
 
-    WarnSceneTypeMismatch("ShowLobby", "lobby");
     m_impl->loginVisible = false;
     m_impl->hudVisible = false;
     m_impl->menuVisible = false;
@@ -2203,7 +2188,6 @@ void RmlUiLayer::ShowHud()
         return;
     }
 
-    WarnSceneTypeMismatch("ShowHud", "world");
     m_impl->loginVisible = false;
     m_impl->lobbyVisible = false;
     m_impl->menuVisible = false;

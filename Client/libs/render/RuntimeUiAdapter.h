@@ -11,7 +11,6 @@ class RuntimeUiAdapter
 public:
     virtual ~RuntimeUiAdapter() = default;
 
-    virtual void InstallSceneRouting(SceneManager& scenes) = 0;
     virtual void BindRuntime(RuntimeSession& runtime) = 0;
     virtual void SetQuitCallback(std::function<void()> callback) = 0;
     virtual void HideAll() = 0;

@@ -17,6 +17,7 @@
 #include <filesystem>
 #include <fstream>
 #include <limits>
+#include <optional>
 #include <utility>
 #include <sstream>
 #include <string>
@@ -248,6 +249,56 @@ std::vector<char> ReadBinaryFile(client::asset::IAssetReader& assets, const std:
     return std::vector<char>(bytes->begin(), bytes->end());
 }
 
+std::string NormalizeTerrainAssetPath(std::string_view path)
+{
+    std::string normalized(path);
+    for (char& c : normalized)
+    {
+        if (c == '\\')
+            c = '/';
+    }
+    while (!normalized.empty() && normalized.front() == '/')
+        normalized.erase(normalized.begin());
+    return normalized;
+}
+
+std::optional<std::vector<std::uint8_t>> ReadTerrainAssetBytes(
+    client::asset::IAssetReader& assets,
+    const std::string& path,
+    const std::vector<std::filesystem::path>* additionalRoots = nullptr)
+{
+    if (auto bytes = assets.ReadAll(path))
+        return bytes;
+
+    if (!additionalRoots)
+        return std::nullopt;
+
+    const std::filesystem::path relative = std::filesystem::path(NormalizeTerrainAssetPath(path));
+    for (const std::filesystem::path& root : *additionalRoots)
+    {
+        if (root.empty())
+            continue;
+        const std::filesystem::path resolved = relative.is_absolute() ? relative : (root / relative);
+        std::ifstream file(resolved, std::ios::binary | std::ios::ate);
+        if (!file)
+            continue;
+        const auto end = file.tellg();
+        if (end < 0)
+            continue;
+        std::vector<std::uint8_t> bytes(static_cast<std::size_t>(end));
+        file.seekg(0);
+        if (!bytes.empty())
+        {
+            file.read(reinterpret_cast<char*>(bytes.data()), static_cast<std::streamsize>(bytes.size()));
+            if (!file)
+                continue;
+        }
+        Tracenf("[TERRAIN-PALETTE] loaded project asset: %s", resolved.generic_string().c_str());
+        return bytes;
+    }
+    return std::nullopt;
+}
+
 uint32_t MakeFourCC(char a, char b, char c, char d)
 {
     return static_cast<uint32_t>(a) |
@@ -331,9 +382,12 @@ struct RgbaImage
     std::vector<uint8_t> pixels;
 };
 
-bool LoadDdsImage(client::asset::IAssetReader& assets, const std::string& path, DdsImage& out)
+bool LoadDdsImage(client::asset::IAssetReader& assets,
+    const std::string& path,
+    DdsImage& out,
+    const std::vector<std::filesystem::path>* additionalRoots = nullptr)
 {
-    auto maybeBytes = assets.ReadAll(path);
+    auto maybeBytes = ReadTerrainAssetBytes(assets, path, additionalRoots);
     if (!maybeBytes)
     {
         Tracenf("[TERRAIN-TEX] failed to open DDS: %s", path.c_str());
@@ -559,9 +613,12 @@ bool DdsToRgba(const DdsImage& dds, RgbaImage& out)
     return true;
 }
 
-bool LoadStbImage(client::asset::IAssetReader& assets, const std::string& path, RgbaImage& out)
+bool LoadStbImage(client::asset::IAssetReader& assets,
+    const std::string& path,
+    RgbaImage& out,
+    const std::vector<std::filesystem::path>* additionalRoots = nullptr)
 {
-    auto bytes = assets.ReadAll(path);
+    auto bytes = ReadTerrainAssetBytes(assets, path, additionalRoots);
     if (!bytes)
         return false;
     int width = 0;
@@ -583,12 +640,15 @@ bool LoadStbImage(client::asset::IAssetReader& assets, const std::string& path, 
     return true;
 }
 
-bool LoadAnyTerrainImage(client::asset::IAssetReader& assets, const std::string& path, RgbaImage& out)
+bool LoadAnyTerrainImage(client::asset::IAssetReader& assets,
+    const std::string& path,
+    RgbaImage& out,
+    const std::vector<std::filesystem::path>* additionalRoots = nullptr)
 {
     DdsImage dds{};
-    if (LoadDdsImage(assets, path, dds))
+    if (LoadDdsImage(assets, path, dds, additionalRoots))
         return DdsToRgba(dds, out);
-    return LoadStbImage(assets, path, out);
+    return LoadStbImage(assets, path, out, additionalRoots);
 }
 
 RgbaImage ResizeNearest(const RgbaImage& src, uint32_t width, uint32_t height)
@@ -1410,6 +1470,31 @@ uint8_t DominantTileIndex(client::asset::IAssetReader& assets, const std::string
     }
     return best;
 }
+
+const char* TeditToolModeName(MapEditorToolMode mode)
+{
+    switch (mode)
+    {
+    case MapEditorToolMode::WaterSculpt: return "water";
+    case MapEditorToolMode::Heightmap: return "sculpt";
+    case MapEditorToolMode::SplatPaint: return "splat";
+    case MapEditorToolMode::None:
+    default: return "none";
+    }
+}
+
+const char* TeditToolName(MapEditorTool tool)
+{
+    switch (tool)
+    {
+    case MapEditorTool::Raise: return "raise";
+    case MapEditorTool::Lower: return "lower";
+    case MapEditorTool::Smooth: return "smooth";
+    case MapEditorTool::Flatten: return "flatten";
+    case MapEditorTool::Paint: return "splat";
+    default: return "unknown";
+    }
+}
 }
 
 bool TerrainRenderer::Create(VulkanDevice& device, client::asset::IAssetReader& assets)
@@ -1427,6 +1512,8 @@ bool TerrainRenderer::Create(VulkanDevice& device, client::asset::IAssetReader& 
     const bool descriptors = shadows ? CreateDescriptors() : false;
     const bool pipeline = descriptors ? CreatePipeline(device) : false;
     const bool water = pipeline ? CreateWaterResources(device) : false;
+    m_sceneTerrainActive = false;
+    m_sceneTerrain = {};
     Tracenf("[TERRAIN] Create: texture=%d mask=%d buffers=%d shadows=%d descriptors=%d pipeline=%d",
         texture ? 1 : 0,
         mask ? 1 : 0,
@@ -1440,6 +1527,16 @@ bool TerrainRenderer::Create(VulkanDevice& device, client::asset::IAssetReader& 
 
     Destroy();
     return false;
+}
+
+void TerrainRenderer::SetAdditionalAssetRoots(std::vector<std::filesystem::path> roots)
+{
+    m_additionalAssetRoots.clear();
+    for (std::filesystem::path& root : roots)
+    {
+        if (!root.empty())
+            m_additionalAssetRoots.push_back(std::move(root));
+    }
 }
 
 bool TerrainRenderer::LoadMap(VulkanDevice& device, const std::string& mapDirectory, int32_t serverX, int32_t serverY)
@@ -1498,7 +1595,194 @@ bool TerrainRenderer::LoadMap(VulkanDevice& device, const std::string& mapDirect
 
     LoadWaterBodies(device, mapDirectory);
     CreateDescriptors();
+    m_sceneTerrainActive = true;
+    m_sceneTerrain.exists = true;
+    m_sceneTerrain.name = "Terrain";
+    m_sceneTerrain.widthMeters = static_cast<float>(m_mapSizeX) * m_cellScaleMeters;
+    m_sceneTerrain.depthMeters = static_cast<float>(m_mapSizeY) * m_cellScaleMeters;
+    m_sceneTerrain.cellSizeMeters = m_cellScaleMeters;
+    m_sceneTerrain.cellsX = m_mapSizeX;
+    m_sceneTerrain.cellsZ = m_mapSizeY;
     return true;
+}
+
+bool TerrainRenderer::CreateFlatTerrain(VulkanDevice& device, const TerrainSceneData& terrain)
+{
+    if (!m_device)
+        return false;
+
+    TerrainSceneData next = terrain;
+    next.exists = true;
+    if (next.name.empty())
+        next.name = "Terrain";
+    next.cellSizeMeters = std::max(0.01f, next.cellSizeMeters);
+    next.cellsX = std::max(1u, next.cellsX);
+    next.cellsZ = std::max(1u, next.cellsZ);
+    if (next.widthMeters <= 0.0f)
+        next.widthMeters = static_cast<float>(next.cellsX) * next.cellSizeMeters;
+    if (next.depthMeters <= 0.0f)
+        next.depthMeters = static_cast<float>(next.cellsZ) * next.cellSizeMeters;
+
+    device.WaitIdle();
+    DestroyBuffer(m_vertexBuffer);
+    DestroyBuffer(m_indexBuffer);
+    DestroyBuffer(m_debugVertexBuffer);
+    DestroyBuffer(m_debugIndexBuffer);
+    DestroyBuffer(m_logicVertexBuffer);
+    DestroyBuffer(m_logicIndexBuffer);
+    DestroyBuffer(m_selectedWaterBodyVertexBuffer);
+    DestroyBuffer(m_selectedWaterBodyIndexBuffer);
+    DestroyTerrainLayers();
+    DestroyWaterBodyResources();
+    DestroyTexture(m_splatA);
+    DestroyTexture(m_splatB);
+    m_tileIndices.clear();
+    m_tileGridWidth = 0;
+    m_tileGridHeight = 0;
+    m_indexCount = 0;
+    m_debugIndexCount = 0;
+    m_selectedWaterBodyIndexCount = 0;
+    m_selectedWaterBodyId = 0;
+    m_waterBodies.clear();
+    m_heightCmGrid.clear();
+    m_attributes.clear();
+    m_splatABytes.clear();
+    m_splatBBytes.clear();
+    m_dirtyChunkTexels.clear();
+    m_undoStack.clear();
+
+    m_flatTerrainWidthMeters = next.widthMeters;
+    m_flatTerrainDepthMeters = next.depthMeters;
+    m_cellScaleMeters = next.cellSizeMeters;
+    m_mapSizeX = next.cellsX;
+    m_mapSizeY = next.cellsZ;
+    m_chunkSizeCells = std::max(1u, std::min<std::uint32_t>(64u, std::max(next.cellsX, next.cellsZ)));
+    m_heightGridWidth = next.cellsX + 1u;
+    m_heightGridHeight = next.cellsZ + 1u;
+    m_spawnLocalXcm = next.widthMeters * 50.0f;
+    m_spawnLocalYcm = next.depthMeters * 50.0f;
+    m_spawnHeightCm = 0.0f;
+    const size_t expectedHeightCount = static_cast<size_t>(m_heightGridWidth) * m_heightGridHeight;
+    if (next.heightCmGrid.size() == expectedHeightCount)
+        m_heightCmGrid = next.heightCmGrid;
+    else
+        m_heightCmGrid.assign(expectedHeightCount, 0.0f);
+    m_heightUndoRecorded.assign(m_heightCmGrid.size(), 0);
+    m_splatWidth = std::max(1u, next.cellsX);
+    m_splatHeight = std::max(1u, next.cellsZ);
+    m_chunkSplatWidth = m_splatWidth;
+    m_chunkSplatHeight = m_splatHeight;
+    const size_t expectedSplatBytes = static_cast<size_t>(m_splatWidth) * m_splatHeight * 4u;
+    if (next.splatABytes.size() == expectedSplatBytes)
+        m_splatABytes = next.splatABytes;
+    else
+        m_splatABytes.assign(expectedSplatBytes, 0);
+    if (next.splatBBytes.size() == expectedSplatBytes)
+        m_splatBBytes = next.splatBBytes;
+    else
+        m_splatBBytes.assign(expectedSplatBytes, 0);
+    m_splatUndoRecorded.assign(m_splatABytes.size() + m_splatBBytes.size(), 0);
+    const uint32_t chunksX = (m_mapSizeX + m_chunkSizeCells - 1u) / m_chunkSizeCells;
+    const uint32_t chunksY = (m_mapSizeY + m_chunkSizeCells - 1u) / m_chunkSizeCells;
+    m_dirtyChunkTexels.assign(static_cast<size_t>(chunksX) * chunksY, 0);
+
+    if (!CreateFlatBuffers(device))
+        return false;
+    if (!CreateSceneSplatTextures(device))
+        return false;
+    CreateDescriptors();
+
+    m_mapLoaded = true;
+    m_sceneTerrainActive = true;
+    m_sceneTerrain = next;
+    Tracenf("[TERRAIN-CREATE] dims=%.2fx%.2f m, cellSize=%.2f m, cells=%ux%u, verts=%zu, pos=(0.00,0.00,0.00)",
+        next.widthMeters,
+        next.depthMeters,
+        next.cellSizeMeters,
+        next.cellsX,
+        next.cellsZ,
+        m_heightCmGrid.size());
+    Tracenf("[TEDIT-DIAG] terrain created id=%p registeredAsEditTarget=%s activeTerrain=%p dims=%ux%u cells heightBuffer=%p splatTarget=%p/%p",
+        static_cast<void*>(this),
+        (m_sceneTerrainActive && m_mapLoaded && m_heightGridWidth > 1 && m_heightGridHeight > 1) ? "yes" : "no",
+        m_sceneTerrainActive ? static_cast<void*>(this) : nullptr,
+        m_mapSizeX,
+        m_mapSizeY,
+        m_heightCmGrid.empty() ? nullptr : static_cast<void*>(m_heightCmGrid.data()),
+        m_splatABytes.empty() ? nullptr : static_cast<void*>(m_splatABytes.data()),
+        m_splatBBytes.empty() ? nullptr : static_cast<void*>(m_splatBBytes.data()));
+    Tracenf("[TEDIT-DIAG] tool terrain==created terrain ? %s",
+        m_sceneTerrainActive ? "yes" : "no");
+    return true;
+}
+
+void TerrainRenderer::ClearTerrain(VulkanDevice& device)
+{
+    if (!m_device)
+        return;
+    device.WaitIdle();
+    DestroyBuffer(m_vertexBuffer);
+    DestroyBuffer(m_indexBuffer);
+    DestroyBuffer(m_debugVertexBuffer);
+    DestroyBuffer(m_debugIndexBuffer);
+    DestroyBuffer(m_logicVertexBuffer);
+    DestroyBuffer(m_logicIndexBuffer);
+    DestroyBuffer(m_selectedWaterBodyVertexBuffer);
+    DestroyBuffer(m_selectedWaterBodyIndexBuffer);
+    DestroyTerrainLayers();
+    DestroyWaterBodyResources();
+    DestroyTexture(m_splatA);
+    DestroyTexture(m_splatB);
+    m_waterBodies.clear();
+    m_tileIndices.clear();
+    m_heightCmGrid.clear();
+    m_attributes.clear();
+    m_splatABytes.clear();
+    m_splatBBytes.clear();
+    m_dirtyChunkTexels.clear();
+    m_heightUndoRecorded.clear();
+    m_splatUndoRecorded.clear();
+    m_indexCount = 0;
+    m_debugIndexCount = 0;
+    m_heightGridWidth = 0;
+    m_heightGridHeight = 0;
+    m_mapSizeX = 0;
+    m_mapSizeY = 0;
+    m_mapLoaded = false;
+    m_sceneTerrainActive = false;
+    m_sceneTerrain = {};
+    CreateDescriptors();
+    Tracenf("[TEDIT-DIAG] active terrain cleared id=%p activeTerrain=NULL", static_cast<void*>(this));
+}
+
+TerrainSceneData TerrainRenderer::GetTerrainSceneData() const
+{
+    TerrainSceneData data = m_sceneTerrain;
+    data.exists = m_sceneTerrainActive;
+    if (data.exists)
+    {
+        data.cellSizeMeters = m_cellScaleMeters;
+        data.cellsX = m_mapSizeX;
+        data.cellsZ = m_mapSizeY;
+        data.widthMeters = m_flatTerrainWidthMeters > 0.0f
+            ? m_flatTerrainWidthMeters
+            : static_cast<float>(m_mapSizeX) * m_cellScaleMeters;
+        data.depthMeters = m_flatTerrainDepthMeters > 0.0f
+            ? m_flatTerrainDepthMeters
+            : static_cast<float>(m_mapSizeY) * m_cellScaleMeters;
+        data.heightCmGrid = m_heightCmGrid;
+        data.splatABytes = m_splatABytes;
+        data.splatBBytes = m_splatBBytes;
+    }
+    return data;
+}
+
+void TerrainRenderer::SetTerrainSceneData(const TerrainSceneData& terrain)
+{
+    if (!m_sceneTerrainActive)
+        return;
+    m_sceneTerrain = terrain;
+    m_sceneTerrain.exists = true;
 }
 
 bool TerrainRenderer::RecreatePipeline(VulkanDevice& device)
@@ -1635,7 +1919,7 @@ void TerrainRenderer::UpdateShadowCascades(const WorldCamera& camera)
 
 void TerrainRenderer::RenderSunShadowMap(VulkanDevice& device, const WorldCamera& camera)
 {
-    if (!m_lightingState.sunShadowsEnabled || !m_shadowPipeline || !m_shadowImage ||
+    if (!m_sceneTerrainActive || m_sceneTerrain.editorHidden || !m_lightingState.sunShadowsEnabled || !m_shadowPipeline || !m_shadowImage ||
         !m_vertexBuffer.buffer || !m_indexBuffer.buffer || m_indexCount == 0 || !device.IsFrameActive())
         return;
 
@@ -1735,7 +2019,7 @@ void TerrainRenderer::RenderWaterReflection(VulkanDevice& device,
 {
     const WaterBodyGpu* reflectionBody = nullptr;
     float reflectionDistanceMeters = 0.0f;
-    if (m_waterBodies.empty())
+    if (!m_sceneTerrainActive || m_sceneTerrain.editorHidden || m_waterBodies.empty())
         return;
 
     reflectionBody = FindClosestWaterBody(camera, &reflectionDistanceMeters);
@@ -1864,7 +2148,7 @@ void TerrainRenderer::Render(VulkanDevice& device, const WorldCamera& camera)
     static bool loggedDraw = false;
     static bool loggedSkip = false;
 
-    if (!m_pipeline || m_indexCount == 0 || !device.IsFrameActive())
+    if (!m_sceneTerrainActive || m_sceneTerrain.editorHidden || !m_pipeline || m_indexCount == 0 || !device.IsFrameActive())
     {
         if (!loggedSkip)
         {
@@ -1997,7 +2281,7 @@ void TerrainRenderer::Render(VulkanDevice& device, const WorldCamera& camera)
 
 void TerrainRenderer::RenderSelectedWaterBodyHighlight(VulkanDevice& device, const WorldCamera& camera)
 {
-    if (!m_mapEditorOpen || !m_pipeline || !m_selectedWaterBodyIndexCount ||
+    if (!m_sceneTerrainActive || m_sceneTerrain.editorHidden || !m_mapEditorOpen || !m_pipeline || !m_selectedWaterBodyIndexCount ||
         !m_selectedWaterBodyVertexBuffer.buffer || !m_selectedWaterBodyIndexBuffer.buffer ||
         !device.IsFrameActive())
     {
@@ -2045,7 +2329,7 @@ void TerrainRenderer::RenderSelectedWaterBodyHighlight(VulkanDevice& device, con
 void TerrainRenderer::RenderWater(VulkanDevice& device, const WorldCamera& camera, double timeSeconds)
 {
     m_latestWaterTimeSeconds = timeSeconds;
-    if (m_waterBodies.empty() || !m_waterPipeline || !device.IsFrameActive())
+    if (!m_sceneTerrainActive || m_sceneTerrain.editorHidden || m_waterBodies.empty() || !m_waterPipeline || !device.IsFrameActive())
         return;
 
     const VkExtent2D extent = device.GetSwapchainExtent();
@@ -2131,6 +2415,8 @@ void TerrainRenderer::SetMapEditorOpen(bool open)
 
 void TerrainRenderer::SetMapEditorSettings(const MapEditorSettings& settings)
 {
+    const MapEditorToolMode previousMode = m_editorToolMode;
+    const MapEditorTool previousTool = m_editorTool;
     m_editorToolMode = settings.toolMode;
     m_editorTerrainToolActive =
         settings.toolMode == MapEditorToolMode::Heightmap ||
@@ -2140,6 +2426,22 @@ void TerrainRenderer::SetMapEditorSettings(const MapEditorSettings& settings)
     m_editorBrushStrength = std::clamp(settings.brushStrength, 0.1f, 5.0f);
     m_editorTextureSlot = std::min<std::uint32_t>(settings.textureSlot, 7u);
     m_editorPaintMode = settings.paintMode;
+    if ((previousMode != m_editorToolMode || previousTool != m_editorTool) &&
+        (m_editorToolMode == MapEditorToolMode::Heightmap ||
+         m_editorToolMode == MapEditorToolMode::SplatPaint))
+    {
+        Tracenf("[TEDIT-DIAG] tool=%s activeTerrain=%p dims=%ux%u cells mapLoaded=%d heightBuffer=%p splatTarget=%p/%p",
+            TeditToolModeName(m_editorToolMode),
+            m_sceneTerrainActive ? static_cast<void*>(this) : nullptr,
+            m_mapSizeX,
+            m_mapSizeY,
+            m_mapLoaded ? 1 : 0,
+            m_heightCmGrid.empty() ? nullptr : static_cast<void*>(m_heightCmGrid.data()),
+            m_splatABytes.empty() ? nullptr : static_cast<void*>(m_splatABytes.data()),
+            m_splatBBytes.empty() ? nullptr : static_cast<void*>(m_splatBBytes.data()));
+        Tracenf("[TEDIT-DIAG] tool terrain==created terrain ? %s",
+            m_sceneTerrainActive ? "yes" : "no");
+    }
 }
 
 void TerrainRenderer::SetWaterSculptBrush(bool visible,
@@ -2158,6 +2460,8 @@ void TerrainRenderer::SetWaterSculptBrush(bool visible,
 std::vector<WaterBody> TerrainRenderer::GetWaterBodies() const
 {
     std::vector<WaterBody> bodies;
+    if (!m_sceneTerrainActive)
+        return bodies;
     bodies.reserve(m_waterBodies.size());
     for (const WaterBodyGpu& waterBody : m_waterBodies)
         bodies.push_back(waterBody.body);
@@ -2168,6 +2472,8 @@ bool TerrainRenderer::SetWaterBodies(VulkanDevice& device, const std::vector<Wat
 {
     device.WaitIdle();
     DestroyWaterBodyResources();
+    if (!m_sceneTerrainActive)
+        return bodies.empty();
 
     std::vector<WaterBody> limited = bodies;
     if (limited.size() > kMaxWaterBodyDraws)
@@ -2477,6 +2783,14 @@ bool TerrainRenderer::HandleEditorInput(const InputEvent& event)
     {
         m_editorCursorX = event.x;
         m_editorCursorY = event.y;
+        if (m_mapEditorOpen && m_editorTerrainToolActive && m_editorLmbHeld)
+        {
+            Tracenf("[TEDIT-DIAG] brush input tool=%s mouse=(%d,%d) activeTerrain=%p",
+                TeditToolModeName(m_editorToolMode),
+                event.x,
+                event.y,
+                m_sceneTerrainActive ? static_cast<void*>(this) : nullptr);
+        }
         return m_mapEditorOpen;
     }
 
@@ -2489,7 +2803,17 @@ bool TerrainRenderer::HandleEditorInput(const InputEvent& event)
             m_editorCursorX = event.x;
             m_editorCursorY = event.y;
             if (event.type == InputEvent::MouseDown)
+            {
                 m_editorLmbHeld = true;
+                if (m_editorTerrainToolActive)
+                {
+                    Tracenf("[TEDIT-DIAG] brush input tool=%s mouse=(%d,%d) activeTerrain=%p",
+                        TeditToolModeName(m_editorToolMode),
+                        event.x,
+                        event.y,
+                        m_sceneTerrainActive ? static_cast<void*>(this) : nullptr);
+                }
+            }
             else
             {
                 m_editorLmbHeld = false;
@@ -2727,6 +3051,8 @@ void TerrainRenderer::Destroy()
     m_spawnLocalYcm = 0.0f;
     m_spawnHeightCm = 0.0f;
     m_mapLoaded = false;
+    m_sceneTerrainActive = false;
+    m_sceneTerrain = {};
     m_editorRaiseHeld = false;
     m_editorLowerHeld = false;
     m_editorSaveRequested = false;
@@ -2756,11 +3082,10 @@ void TerrainRenderer::Destroy()
 
 bool TerrainRenderer::CreateBuffers(VulkanDevice& device)
 {
-    if (CreateMapBuffers(device, "assets/Maps/test_zone", 0, 0)) {
-        return true;
-    }
-
-    Tracen("[TERRAIN-MAP] clean-room test zone missing; using flat fallback terrain");
+    m_mapSizeX = 100;
+    m_mapSizeY = 100;
+    m_cellScaleMeters = 1.0f;
+    m_heightCmGrid.assign(static_cast<size_t>(m_mapSizeX + 1u) * (m_mapSizeY + 1u), 0.0f);
     return CreateFlatBuffers(device);
 }
 
@@ -2789,16 +3114,50 @@ bool TerrainRenderer::EnsureUniformBuffers(VulkanDevice& device)
 
 bool TerrainRenderer::CreateFlatBuffers(VulkanDevice& device)
 {
-    constexpr float halfSize = 50.0f;
-    const std::array<Vertex, 4> vertices =
-    {{
-        {{-halfSize, 0.0f, -halfSize}, {0.0f, 0.0f}, {0.0f, 0.0f}},
-        {{ halfSize, 0.0f, -halfSize}, {10.0f, 0.0f}, {1.0f, 0.0f}},
-        {{ halfSize, 0.0f,  halfSize}, {10.0f, 10.0f}, {1.0f, 1.0f}},
-        {{-halfSize, 0.0f,  halfSize}, {0.0f, 10.0f}, {0.0f, 1.0f}},
-    }};
+    const uint32_t cellsX = std::max(1u, m_mapSizeX == 0 ? 100u : m_mapSizeX);
+    const uint32_t cellsZ = std::max(1u, m_mapSizeY == 0 ? 100u : m_mapSizeY);
+    const float cellSize = std::max(0.01f, m_cellScaleMeters);
+    m_flatTerrainWidthMeters = static_cast<float>(cellsX) * cellSize;
+    m_flatTerrainDepthMeters = static_cast<float>(cellsZ) * cellSize;
+    m_heightGridWidth = cellsX + 1u;
+    m_heightGridHeight = cellsZ + 1u;
+    const float halfWidth = m_flatTerrainWidthMeters * 0.5f;
+    const float halfDepth = m_flatTerrainDepthMeters * 0.5f;
 
-    const std::array<uint32_t, 6> indices = {0, 1, 2, 0, 2, 3};
+    std::vector<Vertex> vertices;
+    vertices.reserve(static_cast<size_t>(m_heightGridWidth) * m_heightGridHeight);
+    for (uint32_t z = 0; z < m_heightGridHeight; ++z)
+    {
+        for (uint32_t x = 0; x < m_heightGridWidth; ++x)
+        {
+            const size_t index = static_cast<size_t>(z) * m_heightGridWidth + x;
+            const float heightMeters = index < m_heightCmGrid.size() ? m_heightCmGrid[index] * 0.01f : 0.0f;
+            const float px = static_cast<float>(x) * cellSize - halfWidth;
+            const float pz = static_cast<float>(z) * cellSize - halfDepth;
+            vertices.push_back({{px, heightMeters, pz},
+                {static_cast<float>(x) / 10.0f, static_cast<float>(z) / 10.0f},
+                {static_cast<float>(x) / static_cast<float>(cellsX), static_cast<float>(z) / static_cast<float>(cellsZ)}});
+        }
+    }
+
+    std::vector<uint32_t> indices;
+    indices.reserve(static_cast<size_t>(cellsX) * cellsZ * 6u);
+    for (uint32_t z = 0; z < cellsZ; ++z)
+    {
+        for (uint32_t x = 0; x < cellsX; ++x)
+        {
+            const uint32_t i0 = z * m_heightGridWidth + x;
+            const uint32_t i1 = i0 + 1u;
+            const uint32_t i2 = i0 + m_heightGridWidth + 1u;
+            const uint32_t i3 = i0 + m_heightGridWidth;
+            indices.push_back(i0);
+            indices.push_back(i1);
+            indices.push_back(i2);
+            indices.push_back(i0);
+            indices.push_back(i2);
+            indices.push_back(i3);
+        }
+    }
     m_indexCount = static_cast<uint32_t>(indices.size());
 
     CreateHostVisibleBuffer(device, m_device, sizeof(Vertex) * vertices.size(),
@@ -3578,6 +3937,15 @@ bool TerrainRenderer::RaycastEditorBrush(const WorldCamera& camera,
     if (!bounds.valid)
     {
         m_editorBrushVisible = false;
+        if (m_editorLmbHeld && m_editorTerrainToolActive)
+        {
+            Tracenf("[TEDIT-DIAG] brush raycast hit=no terrain=%p reason=invalid-bounds dims=%ux%u heightGrid=%ux%u",
+                m_sceneTerrainActive ? static_cast<void*>(this) : nullptr,
+                m_mapSizeX,
+                m_mapSizeY,
+                m_heightGridWidth,
+                m_heightGridHeight);
+        }
         return false;
     }
 
@@ -3606,6 +3974,20 @@ bool TerrainRenderer::RaycastEditorBrush(const WorldCamera& camera,
             m_editorBrushLocalX = std::clamp(hit.x, bounds.minX, bounds.maxX);
             m_editorBrushLocalZ = std::clamp(hit.z, bounds.minZ, bounds.maxZ);
             m_editorBrushVisible = true;
+            if (m_editorLmbHeld && m_editorTerrainToolActive)
+            {
+                const float cellXf = (m_spawnLocalXcm + m_editorBrushLocalX * 100.0f) /
+                    std::max(m_cellScaleMeters * 100.0f, 0.001f);
+                const float cellYf = (m_spawnLocalYcm - m_editorBrushLocalZ * 100.0f) /
+                    std::max(m_cellScaleMeters * 100.0f, 0.001f);
+                Tracenf("[TEDIT-DIAG] brush raycast hit=yes terrain=%p worldPos=(%.2f,%.2f,%.2f) cell=(%u,%u)",
+                    m_sceneTerrainActive ? static_cast<void*>(this) : nullptr,
+                    m_editorBrushLocalX,
+                    SampleHeightAt(m_editorBrushLocalX, m_editorBrushLocalZ),
+                    m_editorBrushLocalZ,
+                    static_cast<unsigned>(std::clamp(cellXf, 0.0f, static_cast<float>(m_heightGridWidth > 0 ? m_heightGridWidth - 1u : 0u))),
+                    static_cast<unsigned>(std::clamp(cellYf, 0.0f, static_cast<float>(m_heightGridHeight > 0 ? m_heightGridHeight - 1u : 0u))));
+            }
             return true;
         }
 
@@ -3614,6 +3996,15 @@ bool TerrainRenderer::RaycastEditorBrush(const WorldCamera& camera,
     }
 
     m_editorBrushVisible = false;
+    if (m_editorLmbHeld && m_editorTerrainToolActive)
+    {
+        Tracenf("[TEDIT-DIAG] brush raycast hit=no terrain=%p bounds=(%.2f,%.2f)-(%.2f,%.2f)",
+            m_sceneTerrainActive ? static_cast<void*>(this) : nullptr,
+            bounds.minX,
+            bounds.minZ,
+            bounds.maxX,
+            bounds.maxZ);
+    }
     return false;
 }
 
@@ -3711,7 +4102,21 @@ void TerrainRenderer::ApplyEditorBrush(VulkanDevice& device, double deltaSeconds
     (void)device;
     if (!m_editorBrushVisible || m_heightCmGrid.empty() || !m_vertexBuffer.memory ||
         m_heightGridWidth < 2 || m_heightGridHeight < 2 || m_chunkSizeCells == 0)
+    {
+        if (m_editorLmbHeld && m_editorTerrainToolActive)
+        {
+            Tracenf("[TEDIT-DIAG] %s apply skipped terrainId=%p brushVisible=%d heightBuffer=%p vertexBuffer=%p heightGrid=%ux%u chunkCells=%u",
+                m_editorTool == MapEditorTool::Paint ? "splat" : "sculpt",
+                m_sceneTerrainActive ? static_cast<void*>(this) : nullptr,
+                m_editorBrushVisible ? 1 : 0,
+                m_heightCmGrid.empty() ? nullptr : static_cast<void*>(m_heightCmGrid.data()),
+                m_vertexBuffer.memory,
+                m_heightGridWidth,
+                m_heightGridHeight,
+                m_chunkSizeCells);
+        }
         return;
+    }
 
     BeginEditorStroke();
 
@@ -3738,22 +4143,36 @@ void TerrainRenderer::ApplyEditorBrush(VulkanDevice& device, double deltaSeconds
     if (m_editorTool == MapEditorTool::Paint)
     {
         if (m_splatABytes.empty() || m_splatBBytes.empty() || m_splatWidth == 0 || m_splatHeight == 0)
+        {
+            Tracenf("[TEDIT-DIAG] splat apply skipped terrainId=%p splatTarget=%p/%p splatSize=%ux%u layer=%u",
+                m_sceneTerrainActive ? static_cast<void*>(this) : nullptr,
+                m_splatABytes.empty() ? nullptr : static_cast<void*>(m_splatABytes.data()),
+                m_splatBBytes.empty() ? nullptr : static_cast<void*>(m_splatBBytes.data()),
+                m_splatWidth,
+                m_splatHeight,
+                m_editorTextureSlot);
             return;
-        const uint32_t splatChunkMinX = chunkX * m_chunkSplatWidth;
-        const uint32_t splatChunkMinY = chunkY * m_chunkSplatHeight;
-        const uint32_t splatChunkMaxX = std::min(splatChunkMinX + m_chunkSplatWidth - 1u, m_splatWidth - 1u);
-        const uint32_t splatChunkMaxY = std::min(splatChunkMinY + m_chunkSplatHeight - 1u, m_splatHeight - 1u);
-        const uint32_t minX = std::max(splatChunkMinX, static_cast<uint32_t>(std::max(0.0f, std::floor(centerGridX - radiusCells))));
-        const uint32_t minY = std::max(splatChunkMinY, static_cast<uint32_t>(std::max(0.0f, std::floor(centerGridY - radiusCells))));
-        const uint32_t maxX = std::min(splatChunkMaxX, static_cast<uint32_t>(std::ceil(centerGridX + radiusCells)));
-        const uint32_t maxY = std::min(splatChunkMaxY, static_cast<uint32_t>(std::ceil(centerGridY + radiusCells)));
+        }
+        const float mapCellsX = std::max(static_cast<float>(m_mapSizeX), 1.0f);
+        const float mapCellsY = std::max(static_cast<float>(m_mapSizeY), 1.0f);
+        const float splatScaleX = static_cast<float>(m_splatWidth) / mapCellsX;
+        const float splatScaleY = static_cast<float>(m_splatHeight) / mapCellsY;
+        const float centerSplatX = std::clamp(centerGridX * splatScaleX, 0.0f, static_cast<float>(m_splatWidth - 1u));
+        const float centerSplatY = std::clamp(centerGridY * splatScaleY, 0.0f, static_cast<float>(m_splatHeight - 1u));
+        const float radiusSplatX = std::max(radiusCells * splatScaleX, 1.0f);
+        const float radiusSplatY = std::max(radiusCells * splatScaleY, 1.0f);
+        const uint32_t minX = static_cast<uint32_t>(std::max(0.0f, std::floor(centerSplatX - radiusSplatX)));
+        const uint32_t minY = static_cast<uint32_t>(std::max(0.0f, std::floor(centerSplatY - radiusSplatY)));
+        const uint32_t maxX = std::min(m_splatWidth - 1u, static_cast<uint32_t>(std::ceil(centerSplatX + radiusSplatX)));
+        const uint32_t maxY = std::min(m_splatHeight - 1u, static_cast<uint32_t>(std::ceil(centerSplatY + radiusSplatY)));
         bool changed = false;
+        std::uint32_t changedCells = 0;
         for (uint32_t sy = minY; sy <= maxY; ++sy)
         {
             for (uint32_t sx = minX; sx <= maxX; ++sx)
             {
-                const float dx = (static_cast<float>(sx) - centerGridX) * m_cellScaleMeters;
-                const float dy = (static_cast<float>(sy) - centerGridY) * m_cellScaleMeters;
+                const float dx = (static_cast<float>(sx) - centerSplatX) / std::max(splatScaleX, 0.001f) * m_cellScaleMeters;
+                const float dy = (static_cast<float>(sy) - centerSplatY) / std::max(splatScaleY, 0.001f) * m_cellScaleMeters;
                 const float dist = std::sqrt(dx * dx + dy * dy);
                 if (dist > m_editorBrushRadiusMeters)
                     continue;
@@ -3824,9 +4243,22 @@ void TerrainRenderer::ApplyEditorBrush(VulkanDevice& device, double deltaSeconds
                     m_splatBBytes[byte + i] = quantized[4 + i];
                 MarkSplatDirty(index);
                 changed = true;
+                ++changedCells;
             }
         }
         m_editorSplatGpuDirty = m_editorSplatGpuDirty || changed;
+        Tracenf("[TEDIT-DIAG] splat apply terrainId=%p splatTarget=%p/%p layer=%u cellRange=(%u,%u)-(%u,%u) maskUpdated=%s changedCells=%u gpuUpload=%s",
+            m_sceneTerrainActive ? static_cast<void*>(this) : nullptr,
+            m_splatABytes.empty() ? nullptr : static_cast<void*>(m_splatABytes.data()),
+            m_splatBBytes.empty() ? nullptr : static_cast<void*>(m_splatBBytes.data()),
+            m_editorTextureSlot,
+            minX,
+            minY,
+            maxX,
+            maxY,
+            changed ? "yes" : "no",
+            changedCells,
+            m_editorSplatGpuDirty ? "pending" : "no");
         return;
     }
 
@@ -3845,6 +4277,8 @@ void TerrainRenderer::ApplyEditorBrush(VulkanDevice& device, double deltaSeconds
     const uint32_t minY = std::max(chunkMinY, static_cast<uint32_t>(std::max(0.0f, std::floor(centerGridY - radiusCells))));
     const uint32_t maxX = std::min(chunkMaxX, static_cast<uint32_t>(std::ceil(centerGridX + radiusCells)));
     const uint32_t maxY = std::min(chunkMaxY, static_cast<uint32_t>(std::ceil(centerGridY + radiusCells)));
+    std::uint32_t changedHeights = 0;
+    float maxHeightDeltaCm = 0.0f;
 
     void* mapped = nullptr;
     const VkDeviceSize vertexBytes = static_cast<VkDeviceSize>(m_heightGridWidth) * m_heightGridHeight * sizeof(Vertex);
@@ -3899,15 +4333,52 @@ void TerrainRenderer::ApplyEditorBrush(VulkanDevice& device, double deltaSeconds
             }
 
             newHeight = std::clamp(newHeight, -32768.0f, 32767.0f);
-            if (std::abs(newHeight - m_heightCmGrid[index]) <= 0.001f)
+            const float heightDeltaCm = newHeight - m_heightCmGrid[index];
+            if (std::abs(heightDeltaCm) <= 0.001f)
                 continue;
+            if (std::abs(heightDeltaCm) > std::abs(maxHeightDeltaCm))
+                maxHeightDeltaCm = heightDeltaCm;
             RecordHeightUndo(index);
             m_heightCmGrid[index] = newHeight;
             vertices[index].position[1] = newHeight * 0.01f;
             MarkHeightDirty(index);
+            ++changedHeights;
         }
     }
     vkUnmapMemory(m_device, m_vertexBuffer.memory);
+    Tracenf("[TEDIT-DIAG] sculpt apply terrainId=%p tool=%s heightBuffer=%p vertexBuffer=%p cellRange=(%u,%u)-(%u,%u) changedCells=%u gpuUpload=%s remesh=no",
+        m_sceneTerrainActive ? static_cast<void*>(this) : nullptr,
+        TeditToolName(m_editorTool),
+        m_heightCmGrid.empty() ? nullptr : static_cast<void*>(m_heightCmGrid.data()),
+        m_vertexBuffer.memory,
+        minX,
+        minY,
+        maxX,
+        maxY,
+        changedHeights,
+        changedHeights > 0 ? "mapped-buffer-write" : "no");
+    const uint32_t brushCellX = static_cast<uint32_t>(std::clamp(
+        centerGridX,
+        0.0f,
+        static_cast<float>(m_heightGridWidth > 0 ? m_heightGridWidth - 1u : 0u)));
+    const uint32_t brushCellY = static_cast<uint32_t>(std::clamp(
+        centerGridY,
+        0.0f,
+        static_cast<float>(m_heightGridHeight > 0 ? m_heightGridHeight - 1u : 0u)));
+    Tracenf("[SCULPT-DIAG] sculpt APPLY terrainId=%p worldPos=(%.2f,%.2f,%.2f) cell=(%u,%u) radius=%.2f strength=%.2f dir=%s cellsModified=%u heightDelta=%.4f gpuUpload=%s remesh=%s",
+        m_sceneTerrainActive ? static_cast<void*>(this) : nullptr,
+        m_editorBrushLocalX,
+        SampleHeightAt(m_editorBrushLocalX, m_editorBrushLocalZ),
+        m_editorBrushLocalZ,
+        brushCellX,
+        brushCellY,
+        m_editorBrushRadiusMeters,
+        m_editorBrushStrength,
+        TeditToolName(m_editorTool),
+        changedHeights,
+        maxHeightDeltaCm * 0.01f,
+        changedHeights > 0 ? "yes" : "no",
+        changedHeights > 0 ? "yes" : "no");
 }
 
 bool TerrainRenderer::RefreshSplatTextures(VulkanDevice& device)
@@ -3917,6 +4388,17 @@ bool TerrainRenderer::RefreshSplatTextures(VulkanDevice& device)
     const bool okA = UpdateRgbaTexture2D(device, m_splatA, m_splatABytes);
     const bool okB = UpdateRgbaTexture2D(device, m_splatB, m_splatBBytes);
     m_editorSplatGpuDirty = !(okA && okB);
+    Tracenf("[TEDIT-DIAG] splat gpu upload terrainId=%p targetImages=%p/%p textureSize=%ux%u cpuSize=%ux%u okA=%d okB=%d gpuUpload=%s",
+        m_sceneTerrainActive ? static_cast<void*>(this) : nullptr,
+        m_splatA.image,
+        m_splatB.image,
+        m_splatA.width,
+        m_splatA.height,
+        m_splatWidth,
+        m_splatHeight,
+        okA ? 1 : 0,
+        okB ? 1 : 0,
+        (okA && okB) ? "yes" : "no");
     return okA && okB;
 }
 
@@ -4343,6 +4825,27 @@ bool TerrainRenderer::CreateFallbackSplatTextures(VulkanDevice& device)
                VK_SAMPLER_ADDRESS_MODE_CLAMP_TO_EDGE, m_splatB);
 }
 
+bool TerrainRenderer::CreateSceneSplatTextures(VulkanDevice& device)
+{
+    if (m_splatWidth == 0 || m_splatHeight == 0 ||
+        m_splatABytes.size() != static_cast<size_t>(m_splatWidth) * m_splatHeight * 4u ||
+        m_splatBBytes.size() != static_cast<size_t>(m_splatWidth) * m_splatHeight * 4u)
+    {
+        return false;
+    }
+
+    const bool okA = UploadRgbaTexture2D(device, "splat_a_scene", m_splatWidth, m_splatHeight, m_splatABytes,
+        VK_SAMPLER_ADDRESS_MODE_CLAMP_TO_EDGE, m_splatA);
+    const bool okB = UploadRgbaTexture2D(device, "splat_b_scene", m_splatWidth, m_splatHeight, m_splatBBytes,
+        VK_SAMPLER_ADDRESS_MODE_CLAMP_TO_EDGE, m_splatB);
+    Tracenf("[TERRAIN-SPLAT] scene splat textures created size=%ux%u okA=%d okB=%d",
+        m_splatWidth,
+        m_splatHeight,
+        okA ? 1 : 0,
+        okB ? 1 : 0);
+    return okA && okB;
+}
+
 bool TerrainRenderer::LoadTerrainPalette(VulkanDevice& device,
     const mx::map::Manifest& manifest,
     const std::string& mapDirectory)
@@ -4377,7 +4880,7 @@ bool TerrainRenderer::LoadTerrainPaletteFromPaths(VulkanDevice& device, const st
     uint32_t height = 0;
     for (uint32_t i = 0; i < images.size(); ++i)
     {
-        if (slots[i].texturePath.empty() || !LoadAnyTerrainImage(*m_assets, slots[i].texturePath, images[i]))
+        if (slots[i].texturePath.empty() || !LoadAnyTerrainImage(*m_assets, slots[i].texturePath, images[i], &m_additionalAssetRoots))
         {
             Tracenf("[TERRAIN-PALETTE] using default diffuse for layer %u path=%s", i, slots[i].texturePath.c_str());
         }
@@ -4425,7 +4928,7 @@ bool TerrainRenderer::LoadTerrainPaletteFromPaths(VulkanDevice& device, const st
     for (uint32_t i = 0; i < normalImages.size(); ++i)
     {
         if (!slots[i].normalTexturePath.empty() &&
-            LoadAnyTerrainImage(*m_assets, slots[i].normalTexturePath, normalImages[i]))
+            LoadAnyTerrainImage(*m_assets, slots[i].normalTexturePath, normalImages[i], &m_additionalAssetRoots))
         {
             normalImages[i] = ResizeNearest(normalImages[i], width, height);
             continue;
@@ -4442,7 +4945,7 @@ bool TerrainRenderer::LoadTerrainPaletteFromPaths(VulkanDevice& device, const st
         }
     }
     auto loadSingleChannelOrDefault = [&](const std::string& path, RgbaImage& image, uint8_t defaultValue) {
-        if (!path.empty() && LoadAnyTerrainImage(*m_assets, path, image))
+        if (!path.empty() && LoadAnyTerrainImage(*m_assets, path, image, &m_additionalAssetRoots))
         {
             image = ResizeNearest(image, width, height);
             return;

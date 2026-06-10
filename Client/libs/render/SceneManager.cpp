@@ -329,7 +329,7 @@ std::string DefaultProjectScenePath(const SceneData& scene)
     }
     if (name.empty())
         name = "Untitled";
-    return (projects.ScenesPath() / (name + ".scene")).string();
+    return (projects.ScenesPath() / name / (name + ".scene")).string();
 }
 
 void WritePlaceholderBinary(const std::filesystem::path& path, const char* magic)
@@ -362,6 +362,121 @@ std::vector<std::uint8_t> ReadBytes(const std::filesystem::path& path)
     if (!file)
         return {};
     return {std::istreambuf_iterator<char>(file), std::istreambuf_iterator<char>()};
+}
+
+bool WriteTerrainHeightmap(const std::filesystem::path& path, const TerrainSceneData& terrain)
+{
+    if (!path.parent_path().empty())
+        std::filesystem::create_directories(path.parent_path());
+    std::ofstream file(path, std::ios::binary);
+    if (!file)
+        return false;
+    const char magic[12] = {'I','W','T','E','R','R','H','G','R','I','D','1'};
+    const std::uint32_t version = 1;
+    file.write(magic, sizeof(magic));
+    file.write(reinterpret_cast<const char*>(&version), sizeof(version));
+    file.write(reinterpret_cast<const char*>(&terrain.cellsX), sizeof(terrain.cellsX));
+    file.write(reinterpret_cast<const char*>(&terrain.cellsZ), sizeof(terrain.cellsZ));
+    file.write(reinterpret_cast<const char*>(&terrain.cellSizeMeters), sizeof(terrain.cellSizeMeters));
+    const std::uint64_t count = static_cast<std::uint64_t>(terrain.heightCmGrid.size());
+    file.write(reinterpret_cast<const char*>(&count), sizeof(count));
+    if (!terrain.heightCmGrid.empty())
+        file.write(reinterpret_cast<const char*>(terrain.heightCmGrid.data()),
+            static_cast<std::streamsize>(terrain.heightCmGrid.size() * sizeof(float)));
+    return true;
+}
+
+bool ReadTerrainHeightmap(const std::filesystem::path& path, TerrainSceneData& terrain)
+{
+    std::ifstream file(path, std::ios::binary);
+    if (!file)
+        return false;
+    char magic[12]{};
+    std::uint32_t version = 0;
+    file.read(magic, sizeof(magic));
+    file.read(reinterpret_cast<char*>(&version), sizeof(version));
+    if (!file || std::memcmp(magic, "IWTERRHGRID1", sizeof(magic)) != 0 || version != 1)
+        return false;
+    std::uint32_t cellsX = 0;
+    std::uint32_t cellsZ = 0;
+    float cellSize = 1.0f;
+    std::uint64_t count = 0;
+    file.read(reinterpret_cast<char*>(&cellsX), sizeof(cellsX));
+    file.read(reinterpret_cast<char*>(&cellsZ), sizeof(cellsZ));
+    file.read(reinterpret_cast<char*>(&cellSize), sizeof(cellSize));
+    file.read(reinterpret_cast<char*>(&count), sizeof(count));
+    if (!file || count > 100000000ull)
+        return false;
+    std::vector<float> heights(static_cast<size_t>(count));
+    if (!heights.empty())
+        file.read(reinterpret_cast<char*>(heights.data()), static_cast<std::streamsize>(heights.size() * sizeof(float)));
+    if (!file)
+        return false;
+    terrain.cellsX = cellsX;
+    terrain.cellsZ = cellsZ;
+    terrain.cellSizeMeters = cellSize;
+    terrain.widthMeters = static_cast<float>(cellsX) * cellSize;
+    terrain.depthMeters = static_cast<float>(cellsZ) * cellSize;
+    terrain.heightCmGrid = std::move(heights);
+    return true;
+}
+
+bool WriteTerrainSplat(const std::filesystem::path& path, const TerrainSceneData& terrain)
+{
+    if (!path.parent_path().empty())
+        std::filesystem::create_directories(path.parent_path());
+    std::ofstream file(path, std::ios::binary);
+    if (!file)
+        return false;
+    const char magic[12] = {'I','W','T','E','R','R','S','P','L','A','T','1'};
+    const std::uint32_t version = 1;
+    const std::uint64_t aSize = static_cast<std::uint64_t>(terrain.splatABytes.size());
+    const std::uint64_t bSize = static_cast<std::uint64_t>(terrain.splatBBytes.size());
+    file.write(magic, sizeof(magic));
+    file.write(reinterpret_cast<const char*>(&version), sizeof(version));
+    file.write(reinterpret_cast<const char*>(&terrain.cellsX), sizeof(terrain.cellsX));
+    file.write(reinterpret_cast<const char*>(&terrain.cellsZ), sizeof(terrain.cellsZ));
+    file.write(reinterpret_cast<const char*>(&aSize), sizeof(aSize));
+    if (!terrain.splatABytes.empty())
+        file.write(reinterpret_cast<const char*>(terrain.splatABytes.data()), static_cast<std::streamsize>(terrain.splatABytes.size()));
+    file.write(reinterpret_cast<const char*>(&bSize), sizeof(bSize));
+    if (!terrain.splatBBytes.empty())
+        file.write(reinterpret_cast<const char*>(terrain.splatBBytes.data()), static_cast<std::streamsize>(terrain.splatBBytes.size()));
+    return true;
+}
+
+bool ReadTerrainSplat(const std::filesystem::path& path, TerrainSceneData& terrain)
+{
+    std::ifstream file(path, std::ios::binary);
+    if (!file)
+        return false;
+    char magic[12]{};
+    std::uint32_t version = 0;
+    std::uint32_t cellsX = 0;
+    std::uint32_t cellsZ = 0;
+    std::uint64_t aSize = 0;
+    std::uint64_t bSize = 0;
+    file.read(magic, sizeof(magic));
+    file.read(reinterpret_cast<char*>(&version), sizeof(version));
+    if (!file || std::memcmp(magic, "IWTERRSPLAT1", sizeof(magic)) != 0 || version != 1)
+        return false;
+    file.read(reinterpret_cast<char*>(&cellsX), sizeof(cellsX));
+    file.read(reinterpret_cast<char*>(&cellsZ), sizeof(cellsZ));
+    file.read(reinterpret_cast<char*>(&aSize), sizeof(aSize));
+    if (!file || aSize > 512000000ull)
+        return false;
+    terrain.splatABytes.resize(static_cast<size_t>(aSize));
+    if (!terrain.splatABytes.empty())
+        file.read(reinterpret_cast<char*>(terrain.splatABytes.data()), static_cast<std::streamsize>(terrain.splatABytes.size()));
+    file.read(reinterpret_cast<char*>(&bSize), sizeof(bSize));
+    if (!file || bSize > 512000000ull)
+        return false;
+    terrain.splatBBytes.resize(static_cast<size_t>(bSize));
+    if (!terrain.splatBBytes.empty())
+        file.read(reinterpret_cast<char*>(terrain.splatBBytes.data()), static_cast<std::streamsize>(terrain.splatBBytes.size()));
+    terrain.cellsX = terrain.cellsX == 0 ? cellsX : terrain.cellsX;
+    terrain.cellsZ = terrain.cellsZ == 0 ? cellsZ : terrain.cellsZ;
+    return static_cast<bool>(file);
 }
 
 const JsonValue* Find(const JsonValue& object, const char* key)
@@ -609,24 +724,10 @@ void SceneManager::SetWindowTitleCallback(std::function<void(const std::string&)
     UpdateWindowTitle();
 }
 
-void SceneManager::SetRuntimeUiCallbacks(std::function<void()> hideAllCallback,
-                                         std::function<void()> showLoginCallback,
-                                         std::function<void()> showLobbyCallback,
-                                         std::function<void()> showHudCallback,
-                                         std::function<void()> showLoadingCallback)
-{
-    m_hideAllRuntimeUiCallback = std::move(hideAllCallback);
-    m_showLoginCallback = std::move(showLoginCallback);
-    m_showLobbyCallback = std::move(showLobbyCallback);
-    m_showHudCallback = std::move(showHudCallback);
-    m_showLoadingCallback = std::move(showLoadingCallback);
-}
-
 void SceneManager::SetCurrentSceneSnapshot(const SceneData& scene)
 {
     SceneData snapshot = scene;
     snapshot.name = m_currentScene.name.empty() ? scene.name : m_currentScene.name;
-    snapshot.sceneType = m_currentScene.sceneType;
     m_currentScene = std::move(snapshot);
 }
 
@@ -639,10 +740,8 @@ void SceneManager::RestoreSceneSnapshot(const SceneData& scene, const std::strin
     m_sceneOpen = true;
     m_isDirty = dirty;
     UpdateWindowTitle();
-    ActivateSceneType(m_currentScene.sceneType);
-    Tracenf("[SCENE] Restored snapshot: name=%s scene_type=%s path=%s dirty=%d",
+    Tracenf("[SCENE] Restored snapshot: name=%s path=%s dirty=%d",
         m_currentScene.name.c_str(),
-        m_currentScene.sceneType.c_str(),
         m_currentScenePath.c_str(),
         m_isDirty ? 1 : 0);
 }
@@ -669,7 +768,6 @@ void SceneManager::NewScene()
     m_hasPendingScene = true;
     UpdateWindowTitle();
     Tracen("[SCENE] New empty scene created");
-    ActivateSceneType(m_currentScene.sceneType);
 }
 
 bool SceneManager::LoadScene(const std::string& path)
@@ -708,28 +806,12 @@ void SceneManager::CloseScene()
     m_pendingScene = m_currentScene;
     m_hasPendingScene = true;
     UpdateWindowTitle();
-    ActivateSceneType(m_currentScene.sceneType);
 }
 
 void SceneManager::SetSceneName(const std::string& name)
 {
     m_currentScene.name = name.empty() ? "Untitled" : name;
     MarkDirty();
-}
-
-void SceneManager::SetSceneType(const std::string& sceneType)
-{
-    const std::string normalized = sceneType.empty() ? "empty" : sceneType;
-    if (m_currentScene.sceneType == normalized)
-        return;
-    m_currentScene.sceneType = normalized;
-    MarkDirty();
-    ActivateSceneType(m_currentScene.sceneType);
-}
-
-void SceneManager::ActivateCurrentSceneType()
-{
-    ActivateSceneType(m_currentScene.sceneType);
 }
 
 void SceneManager::MarkDirty()
@@ -773,7 +855,6 @@ bool SceneManager::LoadSceneInternal(const std::string& path)
     if (metadata)
     {
         scene.name = ReadString(*metadata, "name", SceneNameFromPath(path));
-        scene.sceneType = ReadString(*metadata, "scene_type", "world");
     }
     if (const JsonValue* camera = Find(root, "camera"))
     {
@@ -800,10 +881,60 @@ bool SceneManager::LoadSceneInternal(const std::string& path)
         scene.lighting.ambient.g = ambientColor[1];
         scene.lighting.ambient.b = ambientColor[2];
     }
-    scene.terrainRef = ReadString(root, "terrain_ref");
-    scene.splatRef = ReadString(root, "splat_ref");
-
     const std::filesystem::path sceneDir = std::filesystem::path(path).parent_path();
+    if (const JsonValue* terrain = Find(root, "terrain"); terrain && terrain->type == JsonValue::Type::Object)
+    {
+        scene.terrain.exists = ReadBool(*terrain, "exists", true);
+        scene.terrain.name = ReadString(*terrain, "name", scene.terrain.name);
+        scene.terrain.widthMeters = ReadFloat(*terrain, "width_m", scene.terrain.widthMeters);
+        scene.terrain.depthMeters = ReadFloat(*terrain, "depth_m", scene.terrain.depthMeters);
+        scene.terrain.cellSizeMeters = ReadFloat(*terrain, "cell_size_m", scene.terrain.cellSizeMeters);
+        scene.terrain.cellsX = ReadU32(*terrain, "cells_x", scene.terrain.cellsX);
+        scene.terrain.cellsZ = ReadU32(*terrain, "cells_z", scene.terrain.cellsZ);
+        scene.terrain.heightmapRef = ReadString(*terrain, "heightmap_ref");
+        scene.terrain.splatRef = ReadString(*terrain, "splat_ref");
+        scene.terrain.maskRef = ReadString(*terrain, "mask_ref");
+    }
+    else
+    {
+        const std::string legacyTerrainRef = ReadString(root, "terrain_ref");
+        const std::string legacySplatRef = ReadString(root, "splat_ref");
+        if (!legacyTerrainRef.empty() || !legacySplatRef.empty())
+        {
+            scene.terrain.exists = true;
+            scene.terrain.heightmapRef = legacyTerrainRef;
+            scene.terrain.splatRef = legacySplatRef;
+            scene.terrain.name = "Terrain";
+        }
+    }
+    if (scene.terrain.exists)
+    {
+        if (!scene.terrain.heightmapRef.empty())
+            ReadTerrainHeightmap(sceneDir / scene.terrain.heightmapRef, scene.terrain);
+        if (!scene.terrain.splatRef.empty())
+            ReadTerrainSplat(sceneDir / scene.terrain.splatRef, scene.terrain);
+        scene.terrain.cellSizeMeters = std::max(0.01f, scene.terrain.cellSizeMeters);
+        scene.terrain.cellsX = std::max(1u, scene.terrain.cellsX);
+        scene.terrain.cellsZ = std::max(1u, scene.terrain.cellsZ);
+        if (scene.terrain.widthMeters <= 0.0f)
+            scene.terrain.widthMeters = static_cast<float>(scene.terrain.cellsX) * scene.terrain.cellSizeMeters;
+        if (scene.terrain.depthMeters <= 0.0f)
+            scene.terrain.depthMeters = static_cast<float>(scene.terrain.cellsZ) * scene.terrain.cellSizeMeters;
+        Tracenf("[SCENE] terrain loaded: dims=%.2fx%.2f m cellSize=%.2f cells=%ux%u files=%s/%s/%s",
+            scene.terrain.widthMeters,
+            scene.terrain.depthMeters,
+            scene.terrain.cellSizeMeters,
+            scene.terrain.cellsX,
+            scene.terrain.cellsZ,
+            scene.terrain.heightmapRef.c_str(),
+            scene.terrain.splatRef.c_str(),
+            scene.terrain.maskRef.c_str());
+    }
+    else
+    {
+        Tracen("[SCENE] no terrain in scene");
+    }
+
     if (const JsonValue* entities = Find(root, "entities"); entities && entities->type == JsonValue::Type::Array)
     {
         for (const JsonValue& entity : entities->array)
@@ -877,10 +1008,8 @@ bool SceneManager::LoadSceneInternal(const std::string& path)
     m_isDirty = false;
     UpdateRecentList(path);
     UpdateWindowTitle();
-    ActivateSceneType(m_currentScene.sceneType);
-    Tracenf("[SCENE] load OK: name=%s scene_type=%s water=%zu point_lights=%zu spot_lights=%zu mesh=%zu",
+    Tracenf("[SCENE] load OK: name=%s water=%zu point_lights=%zu spot_lights=%zu mesh=%zu",
         m_currentScene.name.c_str(),
-        m_currentScene.sceneType.c_str(),
         m_currentScene.waterBodies.size(),
         m_currentScene.pointLights.size(),
         m_currentScene.spotLights.size(),
@@ -901,12 +1030,34 @@ bool SceneManager::SaveSceneInternal(const std::string& path)
     SceneData scene = m_currentScene;
     if (scene.name.empty())
         scene.name = SceneNameFromPath(path);
-    const std::filesystem::path heightmapPath = SceneSidecarPath(scenePath, ".heightmap");
-    const std::filesystem::path splatPath = SceneSidecarPath(scenePath, ".splat");
-    WritePlaceholderBinary(heightmapPath, "IWHEIGHTMAP");
-    WritePlaceholderBinary(splatPath, "IWSPLAT");
-    scene.terrainRef = GenericPath(heightmapPath.filename());
-    scene.splatRef = GenericPath(splatPath.filename());
+    if (scene.terrain.exists)
+    {
+        const std::filesystem::path heightmapPath = SceneSidecarPath(scenePath, ".heightmap");
+        const std::filesystem::path splatPath = SceneSidecarPath(scenePath, ".splat");
+        const std::filesystem::path maskPath = SceneSidecarPath(scenePath, ".mask");
+        if (scene.terrain.heightmapRef.empty())
+            scene.terrain.heightmapRef = GenericPath(heightmapPath.filename());
+        if (scene.terrain.splatRef.empty())
+            scene.terrain.splatRef = GenericPath(splatPath.filename());
+        if (scene.terrain.maskRef.empty())
+            scene.terrain.maskRef = GenericPath(maskPath.filename());
+        WriteTerrainHeightmap(scenePath.parent_path() / scene.terrain.heightmapRef, scene.terrain);
+        WriteTerrainSplat(scenePath.parent_path() / scene.terrain.splatRef, scene.terrain);
+        WritePlaceholderBinary(scenePath.parent_path() / scene.terrain.maskRef, "IWMASK");
+        Tracenf("[SCENE] terrain saved: dims=%.2fx%.2f m cellSize=%.2f cells=%ux%u files=%s/%s/%s",
+            scene.terrain.widthMeters,
+            scene.terrain.depthMeters,
+            scene.terrain.cellSizeMeters,
+            scene.terrain.cellsX,
+            scene.terrain.cellsZ,
+            scene.terrain.heightmapRef.c_str(),
+            scene.terrain.splatRef.c_str(),
+            scene.terrain.maskRef.c_str());
+    }
+    else
+    {
+        Tracen("[SCENE] no terrain in scene");
+    }
 
     std::ofstream out(path);
     if (!out)
@@ -919,7 +1070,6 @@ bool SceneManager::SaveSceneInternal(const std::string& path)
     out << "  \"version\": 1,\n";
     out << "  \"metadata\": {\n";
     out << "    \"name\": \"" << EscapeJson(scene.name) << "\",\n";
-    out << "    \"scene_type\": \"" << EscapeJson(scene.sceneType) << "\",\n";
     out << "    \"author\": \"editor\",\n";
     out << "    \"modified_at\": \"" << TimestampUtc() << "\"\n";
     out << "  },\n";
@@ -941,8 +1091,25 @@ bool SceneManager::SaveSceneInternal(const std::string& path)
     out << "    \"ambient_color\": " << FloatArray(ambientColor, 3) << ",\n";
     out << "    \"ambient_intensity\": " << scene.lighting.ambient.intensity << "\n";
     out << "  },\n";
-    out << "  \"terrain_ref\": \"" << EscapeJson(scene.terrainRef) << "\",\n";
-    out << "  \"splat_ref\": \"" << EscapeJson(scene.splatRef) << "\",\n";
+    if (scene.terrain.exists)
+    {
+        out << "  \"terrain\": {\n";
+        out << "    \"exists\": true,\n";
+        out << "    \"name\": \"" << EscapeJson(scene.terrain.name) << "\",\n";
+        out << "    \"width_m\": " << scene.terrain.widthMeters << ",\n";
+        out << "    \"depth_m\": " << scene.terrain.depthMeters << ",\n";
+        out << "    \"cell_size_m\": " << scene.terrain.cellSizeMeters << ",\n";
+        out << "    \"cells_x\": " << scene.terrain.cellsX << ",\n";
+        out << "    \"cells_z\": " << scene.terrain.cellsZ << ",\n";
+        out << "    \"heightmap_ref\": \"" << EscapeJson(scene.terrain.heightmapRef) << "\",\n";
+        out << "    \"splat_ref\": \"" << EscapeJson(scene.terrain.splatRef) << "\",\n";
+        out << "    \"mask_ref\": \"" << EscapeJson(scene.terrain.maskRef) << "\"\n";
+        out << "  },\n";
+    }
+    else
+    {
+        out << "  \"terrain\": null,\n";
+    }
     out << "  \"entities\": [\n";
 
     const size_t entityCount =
@@ -1014,56 +1181,6 @@ void SceneManager::UpdateRecentList(const std::string& path)
         m_recentScenes.resize(8);
     ProjectManager::Instance().SetRecentScenes(m_recentScenes);
     Tracenf("[SCENE] Recent: %s", recentPath.c_str());
-}
-
-void SceneManager::ActivateSceneType(const std::string& sceneType)
-{
-    const std::string type = sceneType.empty() ? "empty" : sceneType;
-    if (m_hideAllRuntimeUiCallback)
-    {
-        Tracen("[UI-ROUTE] HideAll callback present -> calling");
-        m_hideAllRuntimeUiCallback();
-    }
-    else
-    {
-        Tracen("[UI-ROUTE] HideAll callback missing");
-    }
-
-    if (type == "login")
-    {
-        Tracen("[UI-ROUTE] scene_type=login -> Login");
-        if (m_showLoginCallback)
-            m_showLoginCallback();
-    }
-    else if (type == "lobby")
-    {
-        Tracen("[UI-ROUTE] scene_type=lobby -> Lobby");
-        if (m_showLobbyCallback)
-            m_showLobbyCallback();
-    }
-    else if (type == "world")
-    {
-        Tracen("[UI-ROUTE] scene_type=world -> HUD");
-        if (m_showHudCallback)
-            m_showHudCallback();
-    }
-    else if (type == "loading")
-    {
-        Tracen("[UI-ROUTE] scene_type=loading -> loading");
-        if (m_showLoadingCallback)
-            m_showLoadingCallback();
-    }
-    else if (type == "empty")
-    {
-        Tracen("[UI-ROUTE] scene_type=empty -> none");
-    }
-    else
-    {
-        Tracenf("[UI-ROUTE] scene_type=%s -> none (unknown)", type.c_str());
-        TraceError("[SCENE] Unknown scene_type: %s", type.c_str());
-    }
-
-    Tracenf("[SCENE] Scene type activated: %s", type.c_str());
 }
 
 std::string SceneManager::OpenSceneDialog() const

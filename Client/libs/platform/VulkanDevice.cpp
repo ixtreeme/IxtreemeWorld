@@ -6,6 +6,7 @@
 #include <chrono>
 #include <cmath>
 #include <cstdio>
+#include <cstdint>
 #include <cstdlib>
 #include <cstring>
 #include <set>
@@ -100,6 +101,33 @@ const char* SurfaceTransformName(VkSurfaceTransformFlagBitsKHR transform)
     }
 }
 
+const char* VkImageLayoutName(VkImageLayout layout)
+{
+    switch (layout)
+    {
+    case VK_IMAGE_LAYOUT_UNDEFINED: return "UNDEFINED";
+    case VK_IMAGE_LAYOUT_GENERAL: return "GENERAL";
+    case VK_IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL: return "COLOR_ATTACHMENT_OPTIMAL";
+    case VK_IMAGE_LAYOUT_DEPTH_STENCIL_ATTACHMENT_OPTIMAL: return "DEPTH_STENCIL_ATTACHMENT_OPTIMAL";
+    case VK_IMAGE_LAYOUT_DEPTH_STENCIL_READ_ONLY_OPTIMAL: return "DEPTH_STENCIL_READ_ONLY_OPTIMAL";
+    case VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL: return "SHADER_READ_ONLY_OPTIMAL";
+    case VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL: return "TRANSFER_SRC_OPTIMAL";
+    case VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL: return "TRANSFER_DST_OPTIMAL";
+    case VK_IMAGE_LAYOUT_PRESENT_SRC_KHR: return "PRESENT_SRC_KHR";
+    default: return "UNKNOWN_LAYOUT";
+    }
+}
+
+template <typename HandleT>
+unsigned long long VkHandleBits(HandleT handle)
+{
+#if defined(VK_USE_64_BIT_PTR_DEFINES)
+    return static_cast<unsigned long long>(reinterpret_cast<std::uintptr_t>(handle));
+#else
+    return static_cast<unsigned long long>(handle);
+#endif
+}
+
 bool IsQuarterTurn(VkSurfaceTransformFlagBitsKHR transform)
 {
     return transform == VK_SURFACE_TRANSFORM_ROTATE_90_BIT_KHR ||
@@ -175,6 +203,9 @@ void VulkanDevice::BeginFrame()
     m_skipFrame = true;
     m_frameStarted = false;
     m_renderPassStarted = false;
+    m_acquiredThisFrame = false;
+    m_swapchainTransitionThisFrame = false;
+    m_activeSwapchainPass = "none";
 
     if (!m_device || m_width == 0 || m_height == 0 || m_swapchain == VK_NULL_HANDLE)
         return;
@@ -193,9 +224,19 @@ void VulkanDevice::BeginFrame()
         VK_NULL_HANDLE,
         &m_imageIndex);
 
+    LogFormat("[SWP-DIAG] acquire frame=%llu swapchain=0x%llx -> imageIndex=%u result=%s",
+        static_cast<unsigned long long>(m_frameNumber),
+        VkHandleBits(m_swapchain),
+        m_imageIndex,
+        VkResultName(acquire));
+
     if (acquire == VK_ERROR_OUT_OF_DATE_KHR)
     {
         Log("[VULKAN] acquireNextImage: VK_ERROR_OUT_OF_DATE_KHR - rebuilding swap-chain");
+        LogFormat("[SWP-DIAG] resize/out-of-date branch: acquire result=%s frame=%llu swapchain=0x%llx",
+            VkResultName(acquire),
+            static_cast<unsigned long long>(m_frameNumber),
+            VkHandleBits(m_swapchain));
         m_swapchainDirty = true;
         return;
     }
@@ -210,6 +251,8 @@ void VulkanDevice::BeginFrame()
     }
     if (acquire != VK_SUCCESS && acquire != VK_SUBOPTIMAL_KHR)
         CheckVk(acquire, "vkAcquireNextImageKHR", __FILE__, __LINE__);
+    m_lastAcquiredImageIndex = static_cast<int>(m_imageIndex);
+    m_acquiredThisFrame = true;
 
     if (m_imagesInFlight[m_imageIndex] != VK_NULL_HANDLE)
         VK_CHECK(vkWaitForFences(m_device, 1, &m_imagesInFlight[m_imageIndex], VK_TRUE, UINT64_MAX));
@@ -226,7 +269,7 @@ void VulkanDevice::BeginFrame()
     m_frameStarted = true;
 }
 
-void VulkanDevice::BeginSwapchainRenderPass()
+void VulkanDevice::BeginSwapchainRenderPass(const char* passName)
 {
     if (m_skipFrame || !m_frameStarted || m_renderPassStarted)
         return;
@@ -246,6 +289,16 @@ void VulkanDevice::BeginSwapchainRenderPass()
     pass.renderArea.extent = m_swapchainExtent;
     pass.clearValueCount = 2;
     pass.pClearValues = clearValues;
+
+    if (m_imageIndex < m_swapchainImages.size())
+    {
+        m_swapchainTransitionThisFrame = true;
+        m_activeSwapchainPass = passName ? passName : "other";
+        LogSwapchainImageTransition(m_swapchainImages[m_imageIndex],
+            VK_IMAGE_LAYOUT_UNDEFINED,
+            VK_IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL,
+            m_activeSwapchainPass);
+    }
 
     // The pass loadOps clear color plus combined depth/stencil; UI draws into this same onscreen pass.
     vkCmdBeginRenderPass(m_commandBuffers[m_currentFrame], &pass, VK_SUBPASS_CONTENTS_INLINE);
@@ -273,10 +326,17 @@ void VulkanDevice::EndFrame()
         return;
 
     if (!m_renderPassStarted)
-        BeginSwapchainRenderPass();
+        BeginSwapchainRenderPass("auto-empty");
 
     if (m_renderPassStarted)
     {
+        if (m_imageIndex < m_swapchainImages.size())
+        {
+            LogSwapchainImageTransition(m_swapchainImages[m_imageIndex],
+                VK_IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL,
+                VK_IMAGE_LAYOUT_PRESENT_SRC_KHR,
+                m_activeSwapchainPass);
+        }
         vkCmdEndRenderPass(m_commandBuffers[m_currentFrame]);
         m_renderPassStarted = false;
     }
@@ -295,6 +355,14 @@ void VulkanDevice::EndFrame()
     submit.pSignalSemaphores = &m_renderFinished[m_imageIndex];
 
     // The fence protects CPU reuse of this frame's command buffer and sync objects.
+    if (m_swapchainTransitionThisFrame)
+    {
+        LogFormat("[SWP-DIAG] submit frame=%llu targetImageIndex=%u lastAcquiredImageIndex=%d match=%s",
+            static_cast<unsigned long long>(m_frameNumber),
+            m_imageIndex,
+            m_lastAcquiredImageIndex,
+            m_lastAcquiredImageIndex == static_cast<int>(m_imageIndex) ? "yes" : "no");
+    }
     VK_CHECK(vkQueueSubmit(m_graphicsQueue, 1, &submit, m_inFlightFences[m_currentFrame]));
 
     VkPresentInfoKHR present{};
@@ -306,9 +374,18 @@ void VulkanDevice::EndFrame()
     present.pImageIndices = &m_imageIndex;
 
     const VkResult result = vkQueuePresentKHR(m_presentQueue, &present);
+    LogFormat("[SWP-DIAG] present frame=%llu imageIndex=%u result=%s",
+        static_cast<unsigned long long>(m_frameNumber),
+        m_imageIndex,
+        VkResultName(result));
     if (result == VK_ERROR_OUT_OF_DATE_KHR)
     {
         Log("[VULKAN] present: VK_ERROR_OUT_OF_DATE_KHR - rebuilding swap-chain");
+        LogFormat("[SWP-DIAG] resize/out-of-date branch: present result=%s frame=%llu swapchain=0x%llx imageIndex=%u",
+            VkResultName(result),
+            static_cast<unsigned long long>(m_frameNumber),
+            VkHandleBits(m_swapchain),
+            m_imageIndex);
         m_swapchainDirty = true;
     }
     else if (result == VK_SUBOPTIMAL_KHR)
@@ -328,6 +405,9 @@ void VulkanDevice::EndFrame()
     m_currentFrame = (m_currentFrame + 1) % MAX_FRAMES_IN_FLIGHT;
     ++m_frameNumber;
     m_frameStarted = false;
+    m_acquiredThisFrame = false;
+    m_swapchainTransitionThisFrame = false;
+    m_activeSwapchainPass = "none";
 }
 
 bool VulkanDevice::Resize(uint32_t width, uint32_t height)
@@ -345,6 +425,15 @@ bool VulkanDevice::Resize(uint32_t width, uint32_t height)
         height,
         m_swapchainExtent.width,
         m_swapchainExtent.height);
+    LogFormat("[SWP-DIAG] resize request frame=%llu oldSwapchain=0x%llx oldExtent=%ux%u newWindow=%ux%u frameStarted=%d acquiredThisFrame=%s",
+        static_cast<unsigned long long>(m_frameNumber),
+        VkHandleBits(m_swapchain),
+        m_swapchainExtent.width,
+        m_swapchainExtent.height,
+        width,
+        height,
+        m_frameStarted ? 1 : 0,
+        m_acquiredThisFrame ? "yes" : "no");
 
     m_width = width;
     m_height = height;
@@ -723,6 +812,21 @@ bool VulkanDevice::CreateSwapchain(uint32_t width, uint32_t height)
         m_swapchainExtent.width,
         m_swapchainExtent.height,
         imageCount);
+    std::string imageList;
+    for (uint32_t i = 0; i < imageCount; ++i)
+    {
+        char item[96]{};
+        std::snprintf(item, sizeof(item), "%sidx%u=0x%llx", i == 0 ? "" : ", ", i, VkHandleBits(m_swapchainImages[i]));
+        imageList += item;
+    }
+    LogFormat("[SWP-DIAG] swapchain created handle=0x%llx imageCount=%u extent=%ux%u images=[%s]",
+        VkHandleBits(m_swapchain),
+        imageCount,
+        m_swapchainExtent.width,
+        m_swapchainExtent.height,
+        imageList.c_str());
+    LogFormat("[SWP-DIAG] INIT transition loop over swapchain images count=0 beforeAnyAcquire=yes swapchain=0x%llx",
+        VkHandleBits(m_swapchain));
 
     VkSemaphoreCreateInfo sem{};
     sem.sType = VK_STRUCTURE_TYPE_SEMAPHORE_CREATE_INFO;
@@ -922,6 +1026,14 @@ bool VulkanDevice::CreateSyncObjects()
 
 void VulkanDevice::DestroySwapchainObjects()
 {
+    if (m_swapchain)
+    {
+        LogFormat("[SWP-DIAG] destroy swapchain handle=0x%llx imageCount=%zu frame=%llu",
+            VkHandleBits(m_swapchain),
+            m_swapchainImages.size(),
+            static_cast<unsigned long long>(m_frameNumber));
+    }
+
     for (VkSemaphore semaphore : m_renderFinished)
         vkDestroySemaphore(m_device, semaphore, nullptr);
     m_renderFinished.clear();
@@ -963,10 +1075,47 @@ bool VulkanDevice::RecreateSwapchain(uint32_t width, uint32_t height)
     if (width == 0 || height == 0)
         return true;
 
+    LogFormat("[SWP-DIAG] recreate begin frame=%llu oldSwapchain=0x%llx extent=%ux%u requested=%ux%u frameStarted=%d acquiredThisFrame=%s",
+        static_cast<unsigned long long>(m_frameNumber),
+        VkHandleBits(m_swapchain),
+        m_swapchainExtent.width,
+        m_swapchainExtent.height,
+        width,
+        height,
+        m_frameStarted ? 1 : 0,
+        m_acquiredThisFrame ? "yes" : "no");
     VK_CHECK(vkDeviceWaitIdle(m_device));
     DestroySwapchainObjects();
     m_swapchainDirty = false;
     return CreateSwapchainObjects(width, height);
+}
+
+int VulkanDevice::FindSwapchainImageIndex(VkImage image) const
+{
+    for (size_t i = 0; i < m_swapchainImages.size(); ++i)
+    {
+        if (m_swapchainImages[i] == image)
+            return static_cast<int>(i);
+    }
+    return -1;
+}
+
+void VulkanDevice::LogSwapchainImageTransition(VkImage image, VkImageLayout oldLayout, VkImageLayout newLayout, const char* passName) const
+{
+    const int swapchainIndex = FindSwapchainImageIndex(image);
+    if (swapchainIndex < 0)
+        return;
+
+    const bool acquiredMatch = m_acquiredThisFrame && m_lastAcquiredImageIndex == swapchainIndex;
+    LogFormat("[SWP-DIAG] transition frame=%llu image=0x%llx swpIndex=%d old=%s new=%s pass=%s acquiredThisFrame=%s acquiredImageIndex=%d",
+        static_cast<unsigned long long>(m_frameNumber),
+        VkHandleBits(image),
+        swapchainIndex,
+        VkImageLayoutName(oldLayout),
+        VkImageLayoutName(newLayout),
+        passName ? passName : "other",
+        acquiredMatch ? "yes" : "no",
+        m_acquiredThisFrame ? m_lastAcquiredImageIndex : -1);
 }
 
 VulkanDevice::QueueFamilies VulkanDevice::FindQueueFamilies(VkPhysicalDevice device) const

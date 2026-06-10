@@ -10,6 +10,8 @@ class NativeWindow_Win32 final : public NativeWindow
 public:
     using MessageCallback = std::function<bool(HWND, UINT, WPARAM, LPARAM, LRESULT&)>;
 
+    static bool GetPrimaryMonitorResolution(uint32_t& width, uint32_t& height);
+
     bool Create(HINSTANCE instance, const char* title, uint32_t width, uint32_t height);
     void Destroy();
 

@@ -985,6 +985,7 @@ bool AssetLibrary::EnsureDirectories() const
     std::filesystem::create_directories(m_libraryRoot / "animations", ec);
     std::filesystem::create_directories(m_libraryRoot / "materials", ec);
     std::filesystem::create_directories(m_libraryRoot / "materials" / "water", ec);
+    std::filesystem::create_directories(m_libraryRoot / "scenes", ec);
     std::filesystem::create_directories(m_libraryRoot / "thumbnails", ec);
     return !ec;
 }
@@ -998,6 +999,7 @@ const char* AssetLibrary::CategoryName(Category category)
     case Category::Animation: return "Animations";
     case Category::Material: return "Materials";
     case Category::WaterMaterial: return "Water Materials";
+    case Category::Scene: return "Scenes";
     default: return "Assets";
     }
 }
@@ -1258,6 +1260,7 @@ std::string AssetLibrary::CategoryString(Category category)
     case Category::Animation: return "animation";
     case Category::Material: return "material";
     case Category::WaterMaterial: return "water_material";
+    case Category::Scene: return "scene";
     default: return "texture";
     }
 }
@@ -1269,6 +1272,7 @@ std::optional<AssetLibrary::Category> AssetLibrary::ParseCategory(const std::str
     if (value == "animation") return Category::Animation;
     if (value == "material") return Category::Material;
     if (value == "water_material" || value == "watermaterial") return Category::WaterMaterial;
+    if (value == "scene") return Category::Scene;
     return std::nullopt;
 }
 
@@ -1294,6 +1298,7 @@ std::filesystem::path AssetLibrary::CategoryDirectory(Category category) const
     case Category::Animation: return m_libraryRoot / "animations";
     case Category::Material: return m_libraryRoot / "materials";
     case Category::WaterMaterial: return m_libraryRoot / "materials" / "water";
+    case Category::Scene: return m_libraryRoot / "scenes";
     default: return m_libraryRoot / "textures";
     }
 }
@@ -1889,6 +1894,13 @@ bool AssetLibrary::ValidateFile(Category category, const std::filesystem::path& 
             return false;
         }
         break;
+    case Category::Scene:
+        if (!HasAnyExtension(path, {".scene"}))
+        {
+            error = "scenes must be SCENE files";
+            return false;
+        }
+        break;
     }
     return true;
 }
@@ -1898,7 +1910,8 @@ std::string AssetLibrary::MakeUniqueId(Category category, const std::filesystem:
     const std::string prefix = category == Category::Texture ? "tex_" :
         (category == Category::Model ? "model_" :
             (category == Category::Animation ? "anim_" :
-                (category == Category::WaterMaterial ? "watermat_" : "mat_")));
+                (category == Category::WaterMaterial ? "watermat_" :
+                    (category == Category::Scene ? "scene_" : "mat_"))));
     const std::string base = prefix + SanitizeStem(sourcePath.stem().string());
     std::unordered_set<std::string> existing;
     for (const Entry& entry : m_entries)

@@ -287,6 +287,8 @@ void ProjectManager::SetRecentScenes(const std::vector<std::string>& recentScene
     if (!m_hasProject)
         return;
     m_project.recentScenes = recentScenes;
+    if (!m_project.recentScenes.empty())
+        m_project.startupScene = m_project.recentScenes.front();
     std::string ignored;
     SaveProject(ignored);
 }

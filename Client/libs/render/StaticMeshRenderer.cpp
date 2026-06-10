@@ -640,33 +640,75 @@ bool StaticMeshRenderer::Create(VulkanDevice& device, client::asset::IAssetReade
     m_device = device.GetDevice();
     m_assets = &assets;
     m_status = LoadStatus::Failed;
+    bool loaded = false;
+    bool buffers = false;
+    bool textures = false;
+    bool descriptors = false;
+    bool pipeline = false;
+    auto logCreateState = [&]() {
+        LogFormat("[MESH] Create: loaded=%d buffers=%d textures=%d descriptors=%d pipeline=%d verts=%zu indices=%zu drawcalls=%zu texture=%s bbox_min=(%.3f,%.3f,%.3f) bbox_max=(%.3f,%.3f,%.3f)",
+            loaded ? 1 : 0,
+            buffers ? 1 : 0,
+            textures ? 1 : 0,
+            descriptors ? 1 : 0,
+            pipeline ? 1 : 0,
+            m_vertices.size(),
+            m_indices.size(),
+            m_draws.size(),
+            m_texture.name.empty() ? "<none>" : m_texture.name.c_str(),
+            m_boundsMin[0], m_boundsMin[1], m_boundsMin[2],
+            m_boundsMax[0], m_boundsMax[1], m_boundsMax[2]);
+    };
 
     bool isSkinned = false;
     std::string error;
     if (!DetectSkinnedGltf(assets, modelPath, isSkinned, &error))
     {
         LogFormat("[STATIC-MESH] inspect failed: %s reason=%s", modelPath.c_str(), error.c_str());
+        logCreateState();
         return false;
     }
     if (isSkinned)
     {
         m_status = LoadStatus::UnsupportedSkinned;
         LogFormat("[STATIC-MESH] skinned glTF detected, static renderer will not load it: %s", modelPath.c_str());
+        logCreateState();
         return false;
     }
 
     if (!LoadStaticGltfMesh(modelPath))
+    {
+        logCreateState();
         return false;
+    }
+    loaded = true;
     if (!CreateBuffers(device))
+    {
+        logCreateState();
         return false;
+    }
+    buffers = HasVertexBuffer() && HasIndexBuffer();
     if (!CreateTexture(device, modelPath))
+    {
+        logCreateState();
         return false;
+    }
+    textures = HasTexture();
     if (!CreateDescriptors())
+    {
+        logCreateState();
         return false;
+    }
+    descriptors = HasDescriptors();
     if (!CreatePipeline(device))
+    {
+        logCreateState();
         return false;
+    }
+    pipeline = HasPipeline();
 
     m_status = LoadStatus::LoadedStatic;
+    logCreateState();
     LogFormat("[STATIC-MESH] loaded: %s verts=%zu indices=%zu draws=%zu",
         modelPath.c_str(), m_vertices.size(), m_indices.size(), m_draws.size());
     return true;
@@ -706,6 +748,8 @@ bool StaticMeshRenderer::LoadStaticGltfMesh(const std::string& modelPath)
     m_vertices.clear();
     m_indices.clear();
     m_draws.clear();
+    m_boundsMin = {std::numeric_limits<float>::max(), std::numeric_limits<float>::max(), std::numeric_limits<float>::max()};
+    m_boundsMax = {std::numeric_limits<float>::lowest(), std::numeric_limits<float>::lowest(), std::numeric_limits<float>::lowest()};
 
     uint32_t primitiveIndex = 0;
     for (const auto& mesh : asset.meshes)
@@ -732,6 +776,12 @@ bool StaticMeshRenderer::LoadStaticGltfMesh(const std::string& modelPath)
                     vertices[index].position[1] = value.y();
                     vertices[index].position[2] = value.z();
                     vertices[index].normal[1] = 1.0f;
+                    m_boundsMin[0] = std::min(m_boundsMin[0], vertices[index].position[0]);
+                    m_boundsMin[1] = std::min(m_boundsMin[1], vertices[index].position[1]);
+                    m_boundsMin[2] = std::min(m_boundsMin[2], vertices[index].position[2]);
+                    m_boundsMax[0] = std::max(m_boundsMax[0], vertices[index].position[0]);
+                    m_boundsMax[1] = std::max(m_boundsMax[1], vertices[index].position[1]);
+                    m_boundsMax[2] = std::max(m_boundsMax[2], vertices[index].position[2]);
                 });
             if (normalIt != primitive.attributes.end())
             {
@@ -776,6 +826,8 @@ bool StaticMeshRenderer::LoadStaticGltfMesh(const std::string& modelPath)
     if (m_vertices.empty() || m_indices.empty())
     {
         LogFormat("[STATIC-MESH] no renderable static mesh data extracted: %s", modelPath.c_str());
+        m_boundsMin = {0.0f, 0.0f, 0.0f};
+        m_boundsMax = {0.0f, 0.0f, 0.0f};
         return false;
     }
     return true;
@@ -1084,6 +1136,7 @@ void StaticMeshRenderer::RenderInWorld(VulkanDevice& device,
     const WorldCamera& camera,
     const Instance& instance)
 {
+    m_lastSubmittedDrawCalls = 0;
     if (!m_pipeline || m_indices.empty() || !device.IsFrameActive())
         return;
     const VkExtent2D extent = device.GetSwapchainExtent();
@@ -1117,7 +1170,10 @@ void StaticMeshRenderer::RenderInWorld(VulkanDevice& device,
     vkCmdBindDescriptorSets(cmd, VK_PIPELINE_BIND_POINT_GRAPHICS, m_pipelineLayout,
         0, 1, &m_descriptorSets[frameIndex][uniformSlot], 0, nullptr);
     for (const MeshDraw& draw : m_draws)
+    {
         vkCmdDrawIndexed(cmd, draw.indexCount, 1, draw.firstIndex, 0, 0);
+        ++m_lastSubmittedDrawCalls;
+    }
 }
 
 void StaticMeshRenderer::DestroyPipeline()
@@ -1174,6 +1230,9 @@ void StaticMeshRenderer::Destroy()
     m_vertices.clear();
     m_indices.clear();
     m_draws.clear();
+    m_boundsMin = {0.0f, 0.0f, 0.0f};
+    m_boundsMax = {0.0f, 0.0f, 0.0f};
+    m_lastSubmittedDrawCalls = 0;
     m_assets = nullptr;
     m_status = LoadStatus::NotLoaded;
     m_device = VK_NULL_HANDLE;

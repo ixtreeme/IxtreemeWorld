@@ -52,6 +52,18 @@ public:
     bool IsLoaded() const { return m_status == LoadStatus::LoadedStatic; }
     LoadStatus Status() const { return m_status; }
     bool IsSkinnedModel() const { return m_status == LoadStatus::UnsupportedSkinned; }
+    bool HasPipeline() const { return m_pipeline != VK_NULL_HANDLE; }
+    bool HasVertexBuffer() const { return m_vertexBuffer.buffer != VK_NULL_HANDLE; }
+    bool HasIndexBuffer() const { return m_indexBuffer.buffer != VK_NULL_HANDLE; }
+    bool HasTexture() const { return m_texture.image != VK_NULL_HANDLE && m_texture.view != VK_NULL_HANDLE; }
+    bool HasDescriptors() const { return m_descriptorPool != VK_NULL_HANDLE && m_descriptorSetLayout != VK_NULL_HANDLE; }
+    std::size_t VertexCount() const { return m_vertices.size(); }
+    std::size_t IndexCount() const { return m_indices.size(); }
+    std::size_t DrawCount() const { return m_draws.size(); }
+    std::uint32_t LastSubmittedDrawCalls() const { return m_lastSubmittedDrawCalls; }
+    const std::array<float, 3>& BoundsMin() const { return m_boundsMin; }
+    const std::array<float, 3>& BoundsMax() const { return m_boundsMax; }
+    const std::string& TextureName() const { return m_texture.name; }
 
     static bool DetectSkinnedGltf(client::asset::IAssetReader& assets,
         const std::string& modelPath,
@@ -117,8 +129,11 @@ private:
     std::vector<Vertex> m_vertices;
     std::vector<uint32_t> m_indices;
     std::vector<MeshDraw> m_draws;
+    std::array<float, 3> m_boundsMin = {0.0f, 0.0f, 0.0f};
+    std::array<float, 3> m_boundsMax = {0.0f, 0.0f, 0.0f};
     LightingState m_lightingState;
     LoadStatus m_status = LoadStatus::NotLoaded;
     uint32_t m_worldRenderFrameIndex = std::numeric_limits<uint32_t>::max();
     uint32_t m_worldUniformCursor = 0;
+    std::uint32_t m_lastSubmittedDrawCalls = 0;
 };

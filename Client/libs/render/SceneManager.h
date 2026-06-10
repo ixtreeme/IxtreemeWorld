@@ -12,15 +12,13 @@
 struct SceneData
 {
     std::string name = "Untitled";
-    std::string sceneType = "empty";
     float cameraPosition[3] = {0.0f, 50.0f, 0.0f};
     float cameraRotation[4] = {0.0f, 0.0f, 0.0f, 1.0f};
     float cameraFov = 60.0f;
     float cameraNear = 0.1f;
     float cameraFar = 1000.0f;
     LightingState lighting;
-    std::string terrainRef;
-    std::string splatRef;
+    TerrainSceneData terrain;
     std::vector<WaterBody> waterBodies;
     std::vector<PointLight> pointLights;
     std::vector<SpotLight> spotLights;
@@ -44,21 +42,13 @@ public:
     void SetCurrentSceneSnapshot(const SceneData& scene);
     bool ConsumePendingScene(SceneData& outScene);
     void SetWindowTitleCallback(std::function<void(const std::string&)> callback);
-    void SetRuntimeUiCallbacks(std::function<void()> hideAllCallback,
-                               std::function<void()> showLoginCallback,
-                               std::function<void()> showLobbyCallback,
-                               std::function<void()> showHudCallback,
-                               std::function<void()> showLoadingCallback = {});
     void SetSceneName(const std::string& name);
-    void SetSceneType(const std::string& sceneType);
-    void ActivateCurrentSceneType();
 
     const std::string& GetCurrentScenePath() const { return m_currentScenePath; }
     bool IsDirty() const { return m_isDirty; }
     bool HasOpenScene() const { return m_sceneOpen; }
     const std::vector<std::string>& GetRecentScenes() const { return m_recentScenes; }
     const SceneData& GetCurrentScene() const { return m_currentScene; }
-    const std::string& GetCurrentSceneType() const { return m_currentScene.sceneType; }
 
     void MarkDirty();
     void UpdateWindowTitle();
@@ -70,7 +60,6 @@ private:
     bool SaveSceneInternal(const std::string& path);
     bool PromptSaveBeforeAction(const std::string& actionName);
     void UpdateRecentList(const std::string& path);
-    void ActivateSceneType(const std::string& sceneType);
     std::string OpenSceneDialog() const;
     std::string SaveSceneDialog() const;
 
@@ -82,9 +71,4 @@ private:
     bool m_isDirty = false;
     std::vector<std::string> m_recentScenes;
     std::function<void(const std::string&)> m_windowTitleCallback;
-    std::function<void()> m_hideAllRuntimeUiCallback;
-    std::function<void()> m_showLoginCallback;
-    std::function<void()> m_showLobbyCallback;
-    std::function<void()> m_showHudCallback;
-    std::function<void()> m_showLoadingCallback;
 };

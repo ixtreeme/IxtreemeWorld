@@ -13,6 +13,24 @@ namespace
 {
 constexpr const char* kWindowClassName = "StandaloneVulkanClearWindow";
 
+bool IsEngineMouseInputMessage(UINT message)
+{
+    switch (message)
+    {
+    case WM_MOUSEMOVE:
+    case WM_LBUTTONDOWN:
+    case WM_RBUTTONDOWN:
+    case WM_MBUTTONDOWN:
+    case WM_LBUTTONUP:
+    case WM_RBUTTONUP:
+    case WM_MBUTTONUP:
+    case WM_MOUSEWHEEL:
+        return true;
+    default:
+        return false;
+    }
+}
+
 Key TranslateVirtualKey(WPARAM vk)
 {
     if (vk >= 'A' && vk <= 'Z')
@@ -73,6 +91,18 @@ std::string WideToUtf8(const wchar_t* text)
 }
 }
 
+bool NativeWindow_Win32::GetPrimaryMonitorResolution(uint32_t& width, uint32_t& height)
+{
+    const int nativeWidth = GetSystemMetrics(SM_CXSCREEN);
+    const int nativeHeight = GetSystemMetrics(SM_CYSCREEN);
+    if (nativeWidth <= 0 || nativeHeight <= 0)
+        return false;
+
+    width = static_cast<uint32_t>(nativeWidth);
+    height = static_cast<uint32_t>(nativeHeight);
+    return true;
+}
+
 bool NativeWindow_Win32::Create(HINSTANCE instance, const char* title, uint32_t width, uint32_t height)
 {
     m_instance = instance;
@@ -90,18 +120,49 @@ bool NativeWindow_Win32::Create(HINSTANCE instance, const char* title, uint32_t 
     if (!RegisterClassEx(&wc) && GetLastError() != ERROR_CLASS_ALREADY_EXISTS)
         return false;
 
-    RECT rect{0, 0, static_cast<LONG>(width), static_cast<LONG>(height)};
-    AdjustWindowRect(&rect, WS_OVERLAPPEDWINDOW, FALSE);
+    const DWORD style = WS_OVERLAPPEDWINDOW;
+    int x = CW_USEDEFAULT;
+    int y = CW_USEDEFAULT;
+    int windowWidth = 0;
+    int windowHeight = 0;
+
+    uint32_t nativeWidth = 0;
+    uint32_t nativeHeight = 0;
+    const bool nativeResolutionWindow =
+        GetPrimaryMonitorResolution(nativeWidth, nativeHeight) &&
+        width == nativeWidth &&
+        height == nativeHeight;
+
+    if (nativeResolutionWindow)
+    {
+        MONITORINFO monitor{};
+        monitor.cbSize = sizeof(monitor);
+        const HMONITOR primaryMonitor = MonitorFromPoint(POINT{0, 0}, MONITOR_DEFAULTTOPRIMARY);
+        if (GetMonitorInfo(primaryMonitor, &monitor))
+        {
+            x = monitor.rcMonitor.left;
+            y = monitor.rcMonitor.top;
+            windowWidth = monitor.rcMonitor.right - monitor.rcMonitor.left;
+            windowHeight = monitor.rcMonitor.bottom - monitor.rcMonitor.top;
+        }
+    }
+    if (windowWidth <= 0 || windowHeight <= 0)
+    {
+        RECT rect{0, 0, static_cast<LONG>(width), static_cast<LONG>(height)};
+        AdjustWindowRect(&rect, style, FALSE);
+        windowWidth = rect.right - rect.left;
+        windowHeight = rect.bottom - rect.top;
+    }
 
     m_hwnd = CreateWindowEx(
         0,
         kWindowClassName,
         title,
-        WS_OVERLAPPEDWINDOW,
-        CW_USEDEFAULT,
-        CW_USEDEFAULT,
-        rect.right - rect.left,
-        rect.bottom - rect.top,
+        style,
+        x,
+        y,
+        windowWidth,
+        windowHeight,
         nullptr,
         nullptr,
         instance,
@@ -234,7 +295,18 @@ LRESULT NativeWindow_Win32::WndProc(HWND hwnd, UINT message, WPARAM wParam, LPAR
     {
         LRESULT result = 0;
         if (m_messageCallback(hwnd, message, wParam, lParam, result))
-            return result;
+        {
+            if (IsEngineMouseInputMessage(message))
+            {
+                // ImGui may consume the native mouse message while the engine still needs
+                // the platform-level event. The editor input router applies its own
+                // WantCaptureMouse gate before viewport tools see the event.
+            }
+            else
+            {
+                return result;
+            }
+        }
     }
 
     switch (message)

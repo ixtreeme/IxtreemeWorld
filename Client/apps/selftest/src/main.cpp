@@ -557,17 +557,17 @@ bool RunAssetTests(const Options& options, TestContext& ctx)
             std::filesystem::exists(projects.ScenesPath()),
         "project folders created", "project.ixproj, Assets, or Scenes missing after CreateProject");
 
-    projects.SetRecentScenes({"Scenes/Baseline.scene"});
+    projects.SetRecentScenes({"Scenes/Baseline/Baseline.scene"});
     ctx.Expect(projects.SaveProject(projectError), "project save manifest", projectError);
     ctx.Expect(projects.OpenProject(projects.ManifestPath(), projectError) &&
             projects.CurrentProject().name == "EngineBaseline" &&
-            projects.CurrentProject().recentScenes.size() == 1,
+            projects.CurrentProject().recentScenes.size() == 1 &&
+            projects.CurrentProject().startupScene == "Scenes/Baseline/Baseline.scene",
         "project open round-trip", projectError);
 
     SceneManager& scenes = SceneManager::Instance();
     scenes.NewScene();
     scenes.SetSceneName("Baseline");
-    scenes.SetSceneType("empty");
     SceneData baselineScene = scenes.GetCurrentScene();
     WaterBody renamedWater{};
     renamedWater.id = 101;
@@ -601,7 +601,7 @@ bool RunAssetTests(const Options& options, TestContext& ctx)
     meshEntity.scale[2] = 1.5f;
     baselineScene.meshEntities.push_back(meshEntity);
     scenes.SetCurrentSceneSnapshot(baselineScene);
-    const std::filesystem::path scenePath = projects.ScenesPath() / "Baseline.scene";
+    const std::filesystem::path scenePath = projects.ScenesPath() / "Baseline" / "Baseline.scene";
     if (!ctx.Expect(scenes.SaveSceneAs(scenePath.string()),
             "scene save project-relative", "SaveSceneAs failed"))
         return false;
@@ -611,9 +611,8 @@ bool RunAssetTests(const Options& options, TestContext& ctx)
         return false;
     ctx.Expect(scenes.HasOpenScene() &&
             scenes.GetCurrentScene().name == "Baseline" &&
-            scenes.GetCurrentSceneType() == "empty" &&
             !scenes.IsDirty(),
-        "scene data round-trip", "scene name/type/open/dirty state did not round-trip");
+        "scene data round-trip", "scene name/open/dirty state did not round-trip");
     ctx.Expect(scenes.GetCurrentScene().waterBodies.size() == 1 &&
             scenes.GetCurrentScene().waterBodies[0].name == "Renamed Water" &&
             scenes.GetCurrentScene().pointLights.size() == 1 &&
@@ -1149,13 +1148,14 @@ bool RunRenderChecks(const Options& options, TestContext& ctx)
             sceneManagerSource.find("m_sceneOpen = false;") != std::string::npos,
         "unsaved new scene open state", "New Scene must be treated as an open editor scene even before it has a saved file path");
     ctx.Expect(sceneManagerSource.find("\\\"version\\\": 1") != std::string::npos &&
-            sceneManagerSource.find("\\\"terrain_ref\\\"") != std::string::npos &&
-            sceneManagerSource.find("\\\"splat_ref\\\"") != std::string::npos &&
+            sceneManagerSource.find("\\\"terrain\\\"") != std::string::npos &&
+            sceneManagerSource.find("\\\"width_m\\\"") != std::string::npos &&
+            sceneManagerSource.find("\\\"cell_size_m\\\"") != std::string::npos &&
             sceneManagerSource.find("\\\"shape_mask_ref\\\"") != std::string::npos &&
             sceneManagerSource.find(".heightmap") != std::string::npos &&
             sceneManagerSource.find(".splat") != std::string::npos &&
             sceneManagerSource.find(".mask") != std::string::npos,
-        "scene json sidecar format", "SCENE-1 must save readable .scene JSON and separate heightmap/splat/water-mask sidecar files");
+        "scene json sidecar format", "SCENE-1/TERRAIN-CREATE-1 must save readable .scene JSON and optional terrain/water sidecar files");
     ctx.Expect(editorImGuiSource.find("RenderMenuBar") != std::string::npos &&
             editorImGuiSource.find("BeginMainMenuBar") != std::string::npos &&
             editorImGuiSource.find("New Scene") != std::string::npos &&
@@ -1216,14 +1216,12 @@ bool RunRenderChecks(const Options& options, TestContext& ctx)
             sceneManagerSource.find("ProjectSceneRecentPath") != std::string::npos &&
             sceneManagerSource.find("ProjectManager::Instance().SetRecentScenes") != std::string::npos,
         "project scene paths", "PROJECT-1 scene save/open/recent handling must be project-relative when a project is active");
-    ctx.Expect(sceneManagerHeaderSource.find("SetRuntimeUiCallbacks") != std::string::npos &&
-            sceneManagerSource.find("ActivateSceneType") != std::string::npos &&
-            sceneManagerSource.find("scene_type") != std::string::npos &&
-            sceneManagerSource.find("type == \"login\"") != std::string::npos &&
-            sceneManagerSource.find("type == \"lobby\"") != std::string::npos &&
-            sceneManagerSource.find("type == \"world\"") != std::string::npos &&
-            sceneManagerSource.find("type == \"empty\"") != std::string::npos,
-        "scene runtime ui binding", "SCENE-2 must activate RmlUi views from scene_type values");
+    ctx.Expect(sceneManagerHeaderSource.find("SetRuntimeUiCallbacks") == std::string::npos &&
+            sceneManagerHeaderSource.find("SetSceneType") == std::string::npos &&
+            sceneManagerSource.find("ActivateSceneType") == std::string::npos &&
+            sceneManagerSource.find("\"scene_type\"") == std::string::npos &&
+            editorImGuiSource.find("Scene Type") == std::string::npos,
+        "scene type removed", "Clean engine scenes must not expose scene_type metadata or runtime UI routing");
     ctx.Expect(runtimeSessionHeaderSource.find("class RuntimeSession") != std::string::npos &&
             runtimeSessionHeaderSource.find("Start(const SceneData& openScene)") != std::string::npos &&
             runtimeSessionHeaderSource.find("Stop()") != std::string::npos &&
@@ -1248,16 +1246,14 @@ bool RunRenderChecks(const Options& options, TestContext& ctx)
             runtimeUiAdapterSource.find("Scenes/World.scene") == std::string::npos,
         "no built-in scene flow", "Clean engine runtime UI adapter must not hard-code game scene transitions");
     ctx.Expect(rmlUiLayerSource.find("void RmlUiLayer::HideAll") != std::string::npos &&
-            rmlUiLayerSource.find("WarnSceneTypeMismatch") != std::string::npos &&
-            rmlUiLayerSource.find("ShowLogin\", \"login") != std::string::npos &&
-            rmlUiLayerSource.find("ShowLobby\", \"lobby") != std::string::npos &&
-            rmlUiLayerSource.find("ShowHud\", \"world") != std::string::npos,
-        "rmlui scene type warnings", "SCENE-2 must warn when runtime UI is shown outside its matching scene_type while remaining backwards compatible");
+            rmlUiLayerSource.find("WarnSceneTypeMismatch") == std::string::npos &&
+            rmlUiLayerSource.find("scene_type mismatch") == std::string::npos,
+        "rmlui scene type warnings removed", "Clean engine RmlUi must not depend on scene_type metadata");
     ctx.Expect(editorImGuiSource.find("RenderSceneSettingsPanel") != std::string::npos &&
             editorImGuiSource.find("Scene Settings") != std::string::npos &&
-            editorImGuiSource.find("Scene Type") != std::string::npos &&
-            editorImGuiSource.find("\"login\", \"lobby\", \"loading\", \"world\"") != std::string::npos,
-        "scene settings panel", "SCENE-2 must expose scene metadata and editable scene type in the editor");
+            editorImGuiSource.find("Scene Name") != std::string::npos &&
+            editorImGuiSource.find("Scene Type") == std::string::npos,
+        "scene settings panel", "Scene Settings must expose scene metadata without obsolete scene_type controls");
     ctx.Expect(clientMainSource.find("playStartScenePath") != std::string::npos &&
             clientMainSource.find("Restored starting scene") != std::string::npos &&
             editorImGuiSource.find("Open a scene to Play") != std::string::npos &&

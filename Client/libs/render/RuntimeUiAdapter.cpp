@@ -7,16 +7,6 @@ class NullRuntimeUiAdapter final : public RuntimeUiAdapter
 public:
     explicit NullRuntimeUiAdapter(RmlUiLayer& rmlUi) : m_rmlUi(rmlUi) {}
 
-    void InstallSceneRouting(SceneManager& scenes) override
-    {
-        scenes.SetRuntimeUiCallbacks(
-            [this]() { HideAll(); },
-            [this]() { HideAll(); },
-            [this]() { HideAll(); },
-            [this]() { HideAll(); },
-            [this]() { HideAll(); });
-    }
-
     void BindRuntime(RuntimeSession&) override {}
     void SetQuitCallback(std::function<void()>) override {}
     void HideAll() override { m_rmlUi.HideAll(); }

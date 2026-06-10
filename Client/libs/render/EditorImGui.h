@@ -29,6 +29,18 @@ class VulkanDevice;
 class EditorImGui
 {
 public:
+    struct ViewportInputDiagnostics
+    {
+        bool assetDragActive = false;
+        bool dropTargetVisible = false;
+        bool dropTargetHovered = false;
+        bool dropTargetActive = false;
+        bool overlayDropTargetHovered = false;
+        bool overlayDropTargetActive = false;
+        std::uint32_t hoveredItemId = 0;
+        std::uint32_t activeItemId = 0;
+    };
+
     EditorImGui() = default;
     ~EditorImGui();
 
@@ -51,6 +63,7 @@ public:
     void SetDynamicLightEditorState(const DynamicLightEditorState& state);
     void SetWaterBodyEditorState(const WaterBodyEditorState& state);
     void SetMeshRendererEditorState(const MeshRendererEditorState& state);
+    void SetTerrainEditorState(const TerrainEditorState& state);
     void SetHierarchySceneState(std::uint64_t sceneRootEntity,
                                 std::string sceneRootName,
                                 std::vector<HierarchySceneEntity> entities);
@@ -66,6 +79,7 @@ public:
     bool OpenWaterMaterialEditor(const std::string& materialId);
     bool OpenPbrMaterialEditor(const std::string& materialId);
     MapEditorCommands ConsumeCommands();
+    ViewportInputDiagnostics GetViewportInputDiagnostics() const { return m_viewportInputDiagnostics; }
     void Destroy();
 
 private:
@@ -76,7 +90,8 @@ private:
         Model,
         Animation,
         Material,
-        WaterMaterial
+        WaterMaterial,
+        Scene
     };
 
     enum class ProjectDialogMode
@@ -104,18 +119,34 @@ private:
     void RenderEditorPanels();
     void RenderDemoPanels();
     void RenderDockSpace();
+    void RenderSceneViewDropTarget();
     void RenderMenuBar();
     void RenderProjectModal();
     void RenderProjectBrowser(bool pickProjectFile);
     void OpenProjectDialog(ProjectDialogMode mode);
     bool NavigateProjectBrowser(const std::filesystem::path& path, bool createMissing = false);
     void ActivateCurrentProject();
+    bool LoadProjectStartupScene();
+    bool CreateDefaultProjectScene();
     void CreateProjectFromDialog();
     void OpenProjectFromDialog(const std::filesystem::path& manifestPath);
     void RenderEditorToolbar();
     void RenderSceneSettingsPanel();
+    struct ProjectSceneEntry
+    {
+        std::string name;
+        std::filesystem::path path;
+        std::string relativePath;
+        bool active = false;
+    };
+
     void RenderHierarchyPanel();
     void RenderHierarchyToolbar();
+    std::vector<ProjectSceneEntry> QueryProjectScenes() const;
+    std::vector<AssetLibrary::Entry> QuerySceneAssets() const;
+    bool AttachSceneToHierarchy(const AssetLibrary::Entry& entry);
+    bool DetachSceneFromHierarchy(const ProjectSceneEntry& scene);
+    void RenderProjectSceneNode(const ProjectSceneEntry& scene);
     void RenderHierarchyEntityNode(std::uint64_t entity);
     void RenderHierarchyContextMenu(const HierarchySceneEntity& entity);
     bool HierarchySubtreePassesSearch(std::uint64_t entity) const;
@@ -128,12 +159,14 @@ private:
     void RenderToolsPanel();
     void RenderInspector();
     void RenderSelectedWaterBodyInspector();
+    void RenderSelectedTerrainInspector();
     void RenderSelectedLightInspector();
     void RenderSelectedMeshRendererInspector();
     void RenderAddComponentMenu();
     bool RenderTransformComponent(float* position, float* rotation, float* scale);
     bool RenderAxisFloat(const char* axis, float& value, float r, float g, float b, float speed, float minValue, float maxValue);
     void RenderWorldPanel();
+    void RenderCreateTerrainModal();
     void RenderLightingPanel();
     void RenderDynamicLightsPanel();
     void RenderGizmoControls();
@@ -243,6 +276,7 @@ private:
     DynamicLightEditorState m_dynamicLightState;
     WaterBodyEditorState m_waterBodyState;
     MeshRendererEditorState m_meshRendererState;
+    TerrainEditorState m_terrainState;
     MapEditorCommands m_commands;
     std::array<MapEditorPaletteSlot, 8> m_paletteSlots{};
     std::vector<std::pair<std::string, WaterMaterialData>> m_waterMaterials;
@@ -251,8 +285,8 @@ private:
     PbrMaterialEditorState m_pbrMaterialEditor;
     std::filesystem::path m_engineRoot;
     std::unique_ptr<AssetLibrary> m_assetLibrary;
-    ProjectDialogMode m_projectDialogMode = ProjectDialogMode::NoProject;
-    bool m_projectPopupNeedsOpen = true;
+    ProjectDialogMode m_projectDialogMode = ProjectDialogMode::None;
+    bool m_projectPopupNeedsOpen = false;
     bool m_projectCreateBrowserVisible = false;
     std::filesystem::path m_projectBrowserPath;
     std::string m_projectStatus;
@@ -264,6 +298,11 @@ private:
     bool m_waterSculptToolOpen = false;
     bool m_heightmapToolOpen = false;
     bool m_splatPaintToolOpen = false;
+    bool m_createTerrainModalOpen = false;
+    bool m_replaceTerrainConfirmOpen = false;
+    float m_createTerrainWidthMeters = 200.0f;
+    float m_createTerrainDepthMeters = 200.0f;
+    float m_createTerrainCellSizeMeters = 1.0f;
     AssetBrowserFilter m_assetFilter = AssetBrowserFilter::All;
     std::string m_assetSubpath;
     std::string m_selectedAssetId;
@@ -275,12 +314,16 @@ private:
     std::uint64_t m_sceneRootEntity = 0;
     std::string m_sceneRootName = "Untitled";
     std::vector<HierarchySceneEntity> m_hierarchyEntities;
+    std::vector<std::string> m_attachedScenePaths;
     std::uint64_t m_selectedHierarchyEntity = 0;
     std::uint64_t m_hierarchyRenamingEntity = 0;
     char m_hierarchyRenameBuffer[128]{};
     bool m_logHierarchyRendered = false;
     std::unordered_map<std::string, AssetPreviewTexture> m_assetPreviewTextures;
     bool m_assetBrowserLogged = false;
+    std::string m_loggedDragAssetId;
+    bool m_viewportDropTargetLogged = false;
+    ViewportInputDiagnostics m_viewportInputDiagnostics;
     float m_timeOfDayHours = 12.0f;
     uint64_t m_lastLoggedFrame = UINT64_MAX;
 };

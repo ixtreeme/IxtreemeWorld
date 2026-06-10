@@ -77,6 +77,24 @@ std::string ToLowerAscii(std::string value)
     return value;
 }
 
+std::string ComparablePath(const std::filesystem::path& path)
+{
+    if (path.empty())
+        return {};
+
+    std::error_code ec;
+    std::filesystem::path normalized = std::filesystem::absolute(path, ec);
+    if (ec)
+        normalized = path;
+
+    ec.clear();
+    const std::filesystem::path canonical = std::filesystem::weakly_canonical(normalized, ec);
+    if (!ec)
+        normalized = canonical;
+
+    return ToLowerAscii(normalized.lexically_normal().generic_string());
+}
+
 bool ContainsCaseInsensitive(const std::string& value, const std::string& needle)
 {
     if (needle.empty())
@@ -194,6 +212,7 @@ ImVec4 AssetCategoryColor(AssetLibrary::Category category)
     case AssetLibrary::Category::Animation: return ImVec4(0.72f, 0.50f, 0.20f, 1.0f);
     case AssetLibrary::Category::Material: return ImVec4(0.38f, 0.58f, 0.36f, 1.0f);
     case AssetLibrary::Category::WaterMaterial: return ImVec4(0.16f, 0.58f, 0.64f, 1.0f);
+    case AssetLibrary::Category::Scene: return ImVec4(0.42f, 0.50f, 0.66f, 1.0f);
     default: return ImVec4(0.35f, 0.35f, 0.35f, 1.0f);
     }
 }
@@ -207,6 +226,7 @@ const char* AssetCategoryIcon(AssetLibrary::Category category)
     case AssetLibrary::Category::Animation: return ICON_FA_PERSON_RUNNING;
     case AssetLibrary::Category::Material: return ICON_FA_PALETTE;
     case AssetLibrary::Category::WaterMaterial: return ICON_FA_DROPLET;
+    case AssetLibrary::Category::Scene: return ICON_FA_GLOBE;
     default: return ICON_FA_FILE;
     }
 }
@@ -245,6 +265,10 @@ std::optional<std::filesystem::path> PickAssetFileForImport(AssetLibrary::Catego
     case AssetLibrary::Category::WaterMaterial:
         filter = L"Water Materials (*.watermat;*.json)\0*.watermat;*.json\0All files (*.*)\0*.*\0\0";
         title = L"Import Water Material";
+        break;
+    case AssetLibrary::Category::Scene:
+        filter = L"Scene Files (*.scene)\0*.scene\0All files (*.*)\0*.*\0\0";
+        title = L"Import Scene";
         break;
     }
 
@@ -543,6 +567,11 @@ void EditorImGui::SetMeshRendererEditorState(const MeshRendererEditorState& stat
     m_meshRendererState = state;
 }
 
+void EditorImGui::SetTerrainEditorState(const TerrainEditorState& state)
+{
+    m_terrainState = state;
+}
+
 void EditorImGui::SetHierarchySceneState(std::uint64_t sceneRootEntity,
                                          std::string sceneRootName,
                                          std::vector<HierarchySceneEntity> entities)
@@ -728,6 +757,7 @@ bool EditorImGui::ActiveAssetCategory(AssetLibrary::Category category) const
     case AssetBrowserFilter::Animation: return category == AssetLibrary::Category::Animation;
     case AssetBrowserFilter::Material: return category == AssetLibrary::Category::Material;
     case AssetBrowserFilter::WaterMaterial: return category == AssetLibrary::Category::WaterMaterial;
+    case AssetBrowserFilter::Scene: return category == AssetLibrary::Category::Scene;
     default: return true;
     }
 }
@@ -740,6 +770,7 @@ AssetLibrary::Category EditorImGui::FolderCategory() const
     case AssetBrowserFilter::Animation: return AssetLibrary::Category::Animation;
     case AssetBrowserFilter::Material: return AssetLibrary::Category::Material;
     case AssetBrowserFilter::WaterMaterial: return AssetLibrary::Category::WaterMaterial;
+    case AssetBrowserFilter::Scene: return AssetLibrary::Category::Scene;
     case AssetBrowserFilter::All:
     case AssetBrowserFilter::Texture:
     default:
@@ -757,6 +788,7 @@ const char* EditorImGui::AssetFilterName() const
     case AssetBrowserFilter::Animation: return "Anims";
     case AssetBrowserFilter::Material: return "Materials";
     case AssetBrowserFilter::WaterMaterial: return "Water Mats";
+    case AssetBrowserFilter::Scene: return "Scenes";
     default: return "Assets";
     }
 }
@@ -790,10 +822,15 @@ bool EditorImGui::AssetPassesCurrentFilters(const AssetLibrary::Entry& entry) co
 std::vector<AssetLibrary::Entry> EditorImGui::QueryVisibleAssets() const
 {
     std::vector<AssetLibrary::Entry> result;
-    if (!m_assetLibrary)
-        return result;
-
-    for (const AssetLibrary::Entry& entry : m_assetLibrary->Entries())
+    if (m_assetLibrary)
+    {
+        for (const AssetLibrary::Entry& entry : m_assetLibrary->Entries())
+        {
+            if (AssetPassesCurrentFilters(entry))
+                result.push_back(entry);
+        }
+    }
+    for (const AssetLibrary::Entry& entry : QuerySceneAssets())
     {
         if (AssetPassesCurrentFilters(entry))
             result.push_back(entry);
@@ -819,13 +856,25 @@ std::vector<std::string> EditorImGui::QueryVisibleFolders() const
         AssetLibrary::Category::Animation,
         AssetLibrary::Category::Material,
         AssetLibrary::Category::WaterMaterial,
+        AssetLibrary::Category::Scene,
     };
     for (AssetLibrary::Category category : categories)
     {
         if (!ActiveAssetCategory(category))
             continue;
-        for (const std::string& folder : m_assetLibrary->FolderSubpathsFor(category))
-            folders.insert(AssetLibrary::NormalizeSubpath(folder));
+        if (category == AssetLibrary::Category::Scene)
+        {
+            for (const AssetLibrary::Entry& entry : QuerySceneAssets())
+            {
+                if (!entry.subpath.empty())
+                    folders.insert(AssetLibrary::NormalizeSubpath(entry.subpath));
+            }
+        }
+        else
+        {
+            for (const std::string& folder : m_assetLibrary->FolderSubpathsFor(category))
+                folders.insert(AssetLibrary::NormalizeSubpath(folder));
+        }
     }
     return {folders.begin(), folders.end()};
 }
@@ -837,6 +886,15 @@ std::vector<std::pair<std::string, std::uint32_t>> EditorImGui::QueryVisibleTags
         return {};
 
     for (const AssetLibrary::Entry& entry : m_assetLibrary->Entries())
+    {
+        if (!ActiveAssetCategory(entry.category))
+            continue;
+        if (AssetLibrary::NormalizeSubpath(entry.subpath) != AssetLibrary::NormalizeSubpath(m_assetSubpath))
+            continue;
+        for (const std::string& tag : entry.tags)
+            ++counts[tag];
+    }
+    for (const AssetLibrary::Entry& entry : QuerySceneAssets())
     {
         if (!ActiveAssetCategory(entry.category))
             continue;
@@ -1698,23 +1756,6 @@ void EditorImGui::RenderDemoPanels()
     if (!m_editorModeActive)
         return;
 
-    if (ImGui::Begin("Editor Test Panel"))
-    {
-        ImGui::Text("ImGui-Vulkan-binding active");
-        ImGui::Text("ImGui version: %s", IMGUI_VERSION);
-        ImGui::Separator();
-
-        if (ImGui::Button("Click Me"))
-            Tracen("[EDITOR-IMGUI] Test button clicked");
-
-        ImGui::SameLine();
-        ImGui::Text("Press the button to verify event-handling");
-        ImGui::Separator();
-        ImGui::Text("Docking: drag the panel header to test docking");
-        ImGui::Text("Multi-viewport: drag the panel out of the main window");
-    }
-    ImGui::End();
-
     if (m_showDemoWindow)
         ImGui::ShowDemoWindow(&m_showDemoWindow);
 }
@@ -1779,6 +1820,129 @@ void EditorImGui::RenderDockSpace()
     ImGui::End();
 }
 
+void EditorImGui::RenderSceneViewDropTarget()
+{
+    const ImGuiPayload* activePayload = ImGui::GetDragDropPayload();
+    const bool assetDragActive = activePayload && std::strcmp(activePayload->DataType, kAssetPayloadType) == 0;
+    m_viewportInputDiagnostics = {};
+    m_viewportInputDiagnostics.assetDragActive = assetDragActive;
+    if (!assetDragActive)
+    {
+        m_viewportDropTargetLogged = false;
+        m_loggedDragAssetId.clear();
+    }
+
+    ImGuiWindowFlags flags =
+        ImGuiWindowFlags_NoBackground |
+        ImGuiWindowFlags_NoScrollbar |
+        ImGuiWindowFlags_NoScrollWithMouse |
+        ImGuiWindowFlags_NoCollapse;
+    if (!assetDragActive)
+        flags |= ImGuiWindowFlags_NoInputs;
+
+    auto acceptModelDrop = [&]() {
+        if (ImGui::BeginDragDropTarget())
+        {
+            if (const ImGuiPayload* payload = ImGui::AcceptDragDropPayload(kAssetPayloadType))
+            {
+                if (payload->IsDelivery())
+                {
+                    const std::string assetId(static_cast<const char*>(payload->Data), payload->DataSize);
+                    const auto entry = m_assetLibrary ? m_assetLibrary->FindById(assetId) : std::optional<AssetLibrary::Entry>{};
+                    if (entry && entry->category == AssetLibrary::Category::Model)
+                    {
+                        const ImVec2 mouse = ImGui::GetMousePos();
+                        const ImGuiViewport* viewport = ImGui::GetMainViewport();
+                        const ImVec2 viewportPos = viewport ? viewport->Pos : ImVec2(0.0f, 0.0f);
+                        m_commands.addMeshEntity = true;
+                        m_commands.meshAssetId = entry->id;
+                        m_commands.meshDropScreenPositionValid = true;
+                        m_commands.meshDropScreenPosition[0] = mouse.x - viewportPos.x;
+                        m_commands.meshDropScreenPosition[1] = mouse.y - viewportPos.y;
+                        m_assetStatus = "Mesh entity dropped: " + entry->displayName;
+                        Tracenf("[DND] payload accepted: %s", entry->id.c_str());
+                    }
+                }
+            }
+            ImGui::EndDragDropTarget();
+        }
+    };
+
+    if (!ImGui::Begin("Scene View", nullptr, flags))
+    {
+        ImGui::End();
+        return;
+    }
+
+    const ImVec2 avail = ImGui::GetContentRegionAvail();
+    if (assetDragActive && avail.x > 1.0f && avail.y > 1.0f)
+    {
+        if (!m_viewportDropTargetLogged)
+        {
+            m_viewportDropTargetLogged = true;
+            Tracen("[DND] viewport drop target active");
+        }
+
+        const ImGuiID dropItemId = ImGui::GetID("##SceneViewDropTarget");
+        ImGui::InvisibleButton("##SceneViewDropTarget", avail);
+        m_viewportInputDiagnostics.dropTargetVisible = true;
+        m_viewportInputDiagnostics.dropTargetHovered = ImGui::IsItemHovered();
+        m_viewportInputDiagnostics.dropTargetActive = ImGui::IsItemActive();
+        if (m_viewportInputDiagnostics.dropTargetHovered)
+            m_viewportInputDiagnostics.hoveredItemId = static_cast<std::uint32_t>(dropItemId);
+        m_viewportInputDiagnostics.activeItemId = m_viewportInputDiagnostics.dropTargetActive
+            ? static_cast<std::uint32_t>(dropItemId)
+            : 0u;
+        acceptModelDrop();
+    }
+
+    ImGui::End();
+
+    if (!assetDragActive || m_commands.addMeshEntity)
+        return;
+
+    const ImGuiViewport* viewport = ImGui::GetMainViewport();
+    if (!viewport)
+        return;
+
+    const ImVec2 workPos = viewport->WorkPos;
+    const ImVec2 workSize = viewport->WorkSize;
+    const ImVec2 overlayPos(workPos.x + workSize.x * 0.20f, workPos.y + workSize.y * 0.06f);
+    const ImVec2 overlaySize(workSize.x * 0.55f, workSize.y * 0.64f);
+    if (overlaySize.x <= 1.0f || overlaySize.y <= 1.0f)
+        return;
+
+    ImGui::SetNextWindowPos(overlayPos, ImGuiCond_Always);
+    ImGui::SetNextWindowSize(overlaySize, ImGuiCond_Always);
+    ImGui::SetNextWindowViewport(viewport->ID);
+    ImGui::PushStyleVar(ImGuiStyleVar_WindowPadding, ImVec2(0.0f, 0.0f));
+    ImGui::SetNextWindowBgAlpha(0.0f);
+    const ImGuiWindowFlags overlayFlags =
+        ImGuiWindowFlags_NoDocking |
+        ImGuiWindowFlags_NoTitleBar |
+        ImGuiWindowFlags_NoResize |
+        ImGuiWindowFlags_NoMove |
+        ImGuiWindowFlags_NoScrollbar |
+        ImGuiWindowFlags_NoSavedSettings |
+        ImGuiWindowFlags_NoBackground |
+        ImGuiWindowFlags_NoNavFocus;
+    if (ImGui::Begin("##ViewportDropOverlay", nullptr, overlayFlags))
+    {
+        const ImGuiID overlayItemId = ImGui::GetID("##ViewportDropOverlayTarget");
+        ImGui::InvisibleButton("##ViewportDropOverlayTarget", ImGui::GetContentRegionAvail());
+        m_viewportInputDiagnostics.dropTargetVisible = true;
+        m_viewportInputDiagnostics.overlayDropTargetHovered = ImGui::IsItemHovered();
+        m_viewportInputDiagnostics.overlayDropTargetActive = ImGui::IsItemActive();
+        if (m_viewportInputDiagnostics.overlayDropTargetHovered)
+            m_viewportInputDiagnostics.hoveredItemId = static_cast<std::uint32_t>(overlayItemId);
+        if (m_viewportInputDiagnostics.overlayDropTargetActive)
+            m_viewportInputDiagnostics.activeItemId = static_cast<std::uint32_t>(overlayItemId);
+        acceptModelDrop();
+    }
+    ImGui::End();
+    ImGui::PopStyleVar();
+}
+
 void EditorImGui::OpenProjectDialog(ProjectDialogMode mode)
 {
     m_projectDialogMode = mode;
@@ -1839,9 +2003,107 @@ void EditorImGui::ActivateCurrentProject()
 
     InitializeProjectAssetLibrary(projects.ProjectRoot(), projects.AssetRootPath());
     SceneManager::Instance().CloseScene();
+    const bool openedScene = LoadProjectStartupScene();
+    const bool createdScene = openedScene ? false : CreateDefaultProjectScene();
     m_projectDialogMode = ProjectDialogMode::None;
     m_projectPopupNeedsOpen = false;
     m_projectStatus = "Project active: " + projects.CurrentProject().name;
+    if (openedScene)
+        m_projectStatus += " | scene loaded";
+    else if (createdScene)
+        m_projectStatus += " | default scene created";
+    else
+        m_projectStatus += " | no scene";
+
+    m_attachedScenePaths.clear();
+    const std::string activePath = SceneManager::Instance().GetCurrentScenePath();
+    if (!activePath.empty())
+    {
+        std::error_code ec;
+        const std::filesystem::path relative = std::filesystem::relative(activePath, projects.ProjectRoot(), ec);
+        m_attachedScenePaths.push_back(ec ? std::filesystem::path(activePath).generic_string() : relative.generic_string());
+    }
+}
+
+bool EditorImGui::LoadProjectStartupScene()
+{
+    ProjectManager& projects = ProjectManager::Instance();
+    if (!projects.HasProject())
+        return false;
+
+    std::vector<std::string> candidates;
+    const ProjectData& project = projects.CurrentProject();
+    if (!project.startupScene.empty())
+        candidates.push_back(project.startupScene);
+    for (const std::string& recentScene : project.recentScenes)
+    {
+        if (!recentScene.empty() &&
+            std::find(candidates.begin(), candidates.end(), recentScene) == candidates.end())
+        {
+            candidates.push_back(recentScene);
+        }
+    }
+
+    for (const std::string& candidate : candidates)
+    {
+        std::filesystem::path scenePath(candidate);
+        if (!scenePath.is_absolute())
+            scenePath = projects.ProjectRoot() / scenePath;
+        if (!std::filesystem::exists(scenePath))
+        {
+            Tracenf("[PROJECT] startup scene missing: %s", scenePath.string().c_str());
+            continue;
+        }
+        if (SceneManager::Instance().LoadScene(scenePath.string()))
+        {
+            Tracenf("[PROJECT] startup scene loaded: %s", scenePath.string().c_str());
+            return true;
+        }
+        Tracenf("[PROJECT] startup scene load failed: %s", scenePath.string().c_str());
+    }
+
+    return false;
+}
+
+bool EditorImGui::CreateDefaultProjectScene()
+{
+    ProjectManager& projects = ProjectManager::Instance();
+    if (!projects.HasProject())
+        return false;
+
+    std::filesystem::path scenePath = projects.ScenesPath() / "Main" / "Main.scene";
+    if (std::filesystem::exists(scenePath))
+    {
+        if (SceneManager::Instance().LoadScene(scenePath.string()))
+        {
+            Tracenf("[PROJECT] existing default scene loaded: %s", scenePath.string().c_str());
+            return true;
+        }
+
+        for (int index = 2; index < 1000; ++index)
+        {
+            const std::string name = "Main_" + std::to_string(index);
+            std::filesystem::path candidate = projects.ScenesPath() / name / (name + ".scene");
+            if (!std::filesystem::exists(candidate))
+            {
+                scenePath = std::move(candidate);
+                break;
+            }
+        }
+    }
+
+    SceneManager& scenes = SceneManager::Instance();
+    scenes.NewScene();
+    scenes.SetSceneName("Main");
+
+    if (!scenes.SaveSceneAs(scenePath.string()))
+    {
+        TraceError("[PROJECT] default scene create failed: %s", scenePath.string().c_str());
+        return false;
+    }
+
+    Tracenf("[PROJECT] default scene created: %s", scenePath.string().c_str());
+    return true;
 }
 
 void EditorImGui::CreateProjectFromDialog()
@@ -1974,8 +2236,6 @@ void EditorImGui::RenderProjectBrowser(bool pickProjectFile)
 void EditorImGui::RenderProjectModal()
 {
     ProjectManager& projects = ProjectManager::Instance();
-    if (!projects.HasProject() && m_projectDialogMode == ProjectDialogMode::None)
-        OpenProjectDialog(ProjectDialogMode::NoProject);
     if (m_projectDialogMode == ProjectDialogMode::None)
         return;
 
@@ -2380,19 +2640,6 @@ void EditorImGui::RenderSceneSettingsPanel()
             if (ImGui::InputText("Scene Name", nameBuffer, sizeof(nameBuffer)))
                 scenes.SetSceneName(nameBuffer);
 
-            constexpr const char* kSceneTypes[] = {"empty", "login", "lobby", "loading", "world"};
-            int selectedType = 0;
-            for (int i = 0; i < IM_ARRAYSIZE(kSceneTypes); ++i)
-            {
-                if (scene.sceneType == kSceneTypes[i])
-                {
-                    selectedType = i;
-                    break;
-                }
-            }
-            if (ImGui::Combo("Scene Type", &selectedType, kSceneTypes, IM_ARRAYSIZE(kSceneTypes)))
-                scenes.SetSceneType(kSceneTypes[selectedType]);
-
             ImGui::Separator();
             ImGui::TextUnformatted("Camera");
             ImGui::Text("Position: %.1f, %.1f, %.1f",
@@ -2489,7 +2736,7 @@ void EditorImGui::RenderHierarchyToolbar()
 {
     ImGui::PushItemWidth(-1.0f);
     const bool changed = ImGui::InputTextWithHint("##hierarchy_search",
-        ICON_FA_MAGNIFYING_GLASS " Search entities...",
+        ICON_FA_MAGNIFYING_GLASS " Search entities/scenes...",
         m_hierarchySearchBuffer,
         sizeof(m_hierarchySearchBuffer));
     ImGui::PopItemWidth();
@@ -2505,6 +2752,283 @@ void EditorImGui::RenderHierarchyToolbar()
             Tracen("[HIERARCHY] Search filter cleared");
         }
     }
+}
+
+std::vector<EditorImGui::ProjectSceneEntry> EditorImGui::QueryProjectScenes() const
+{
+    std::vector<ProjectSceneEntry> scenes;
+    const SceneManager& sceneManager = SceneManager::Instance();
+    const std::string activePathKey = ComparablePath(sceneManager.GetCurrentScenePath());
+
+    auto appendScene = [&](const std::filesystem::path& path, const std::string& relativePath, bool active) {
+        ProjectSceneEntry entry;
+        entry.path = path;
+        entry.relativePath = relativePath;
+        entry.name = path.empty() ? m_sceneRootName : path.stem().string();
+        if (entry.name.empty())
+            entry.name = "Untitled";
+        entry.active = active;
+        scenes.push_back(std::move(entry));
+    };
+
+    ProjectManager& projects = ProjectManager::Instance();
+    if (projects.HasProject())
+    {
+        for (const std::string& attachedPath : m_attachedScenePaths)
+        {
+            if (attachedPath.empty())
+                continue;
+            std::filesystem::path scenePath(attachedPath);
+            if (!scenePath.is_absolute())
+                scenePath = projects.ProjectRoot() / scenePath;
+            const bool active = !activePathKey.empty() && ComparablePath(scenePath) == activePathKey;
+            appendScene(scenePath, attachedPath, active);
+        }
+
+        if (sceneManager.HasOpenScene())
+        {
+            const bool activeListed = std::any_of(scenes.begin(), scenes.end(), [](const ProjectSceneEntry& scene) {
+                return scene.active;
+            });
+            if (!activeListed)
+            {
+                const std::filesystem::path activePath(sceneManager.GetCurrentScenePath());
+                appendScene(activePath, activePath.empty() ? std::string{} : activePath.generic_string(), true);
+            }
+        }
+    }
+    else if (sceneManager.HasOpenScene())
+    {
+        const std::filesystem::path activePath(sceneManager.GetCurrentScenePath());
+        appendScene(activePath, activePath.empty() ? std::string{} : activePath.generic_string(), true);
+    }
+
+    std::sort(scenes.begin(), scenes.end(), [](const ProjectSceneEntry& a, const ProjectSceneEntry& b) {
+        return ToLowerAscii(a.relativePath.empty() ? a.name : a.relativePath) <
+            ToLowerAscii(b.relativePath.empty() ? b.name : b.relativePath);
+    });
+    return scenes;
+}
+
+std::vector<AssetLibrary::Entry> EditorImGui::QuerySceneAssets() const
+{
+    std::vector<AssetLibrary::Entry> scenes;
+    ProjectManager& projects = ProjectManager::Instance();
+    if (!projects.HasProject())
+        return scenes;
+
+    const std::filesystem::path scenesRoot = projects.ScenesPath();
+    std::error_code ec;
+    if (!std::filesystem::exists(scenesRoot, ec))
+        return scenes;
+
+    for (const auto& entry : std::filesystem::recursive_directory_iterator(
+             scenesRoot,
+             std::filesystem::directory_options::skip_permission_denied,
+             ec))
+    {
+        if (ec)
+            break;
+        std::error_code entryEc;
+        if (!entry.is_regular_file(entryEc) || entry.path().extension() != ".scene")
+            continue;
+
+        std::filesystem::path absolutePath = std::filesystem::absolute(entry.path(), entryEc);
+        if (entryEc)
+            absolutePath = entry.path();
+        const std::filesystem::path relativePath = std::filesystem::relative(absolutePath, projects.ProjectRoot(), entryEc);
+        const std::string relative = entryEc ? entry.path().generic_string() : relativePath.generic_string();
+
+        AssetLibrary::Entry scene;
+        scene.category = AssetLibrary::Category::Scene;
+        scene.displayName = absolutePath.stem().string();
+        scene.filename = absolutePath.filename().string();
+        scene.originalPath = absolutePath.string();
+        const std::filesystem::path sceneRelativePath = std::filesystem::relative(absolutePath, scenesRoot, entryEc);
+        scene.subpath = AssetLibrary::NormalizeSubpath(
+            (entryEc ? std::filesystem::path(relative) : sceneRelativePath).parent_path().generic_string());
+        scene.tags = {"scene"};
+        scene.id = "scene_";
+        for (char ch : relative)
+        {
+            const unsigned char uch = static_cast<unsigned char>(ch);
+            scene.id += std::isalnum(uch) ? static_cast<char>(std::tolower(uch)) : '_';
+        }
+        scenes.push_back(std::move(scene));
+    }
+
+    std::sort(scenes.begin(), scenes.end(), [](const AssetLibrary::Entry& a, const AssetLibrary::Entry& b) {
+        return ToLowerAscii(a.originalPath) < ToLowerAscii(b.originalPath);
+    });
+    return scenes;
+}
+
+bool EditorImGui::AttachSceneToHierarchy(const AssetLibrary::Entry& entry)
+{
+    if (entry.category != AssetLibrary::Category::Scene || entry.originalPath.empty())
+        return false;
+
+    ProjectManager& projects = ProjectManager::Instance();
+    std::filesystem::path scenePath(entry.originalPath);
+    std::string relativePath = entry.originalPath;
+    if (projects.HasProject())
+    {
+        std::error_code ec;
+        const std::filesystem::path relative = std::filesystem::relative(scenePath, projects.ProjectRoot(), ec);
+        if (!ec)
+            relativePath = relative.generic_string();
+    }
+
+    auto samePath = [&](const std::string& existing) {
+        std::filesystem::path existingPath(existing);
+        if (projects.HasProject() && !existingPath.is_absolute())
+            existingPath = projects.ProjectRoot() / existingPath;
+        return ComparablePath(existingPath) == ComparablePath(scenePath);
+    };
+    if (std::none_of(m_attachedScenePaths.begin(), m_attachedScenePaths.end(), samePath))
+        m_attachedScenePaths.push_back(relativePath);
+
+    if (SceneManager::Instance().LoadScene(scenePath.string()))
+    {
+        m_projectStatus = "Scene added to Hierarchy: " + relativePath;
+        Tracenf("[HIERARCHY] Scene attached: %s", relativePath.c_str());
+        return true;
+    }
+
+    m_attachedScenePaths.erase(
+        std::remove_if(m_attachedScenePaths.begin(), m_attachedScenePaths.end(), samePath),
+        m_attachedScenePaths.end());
+    m_projectStatus = "Scene attach failed: " + relativePath;
+    return false;
+}
+
+bool EditorImGui::DetachSceneFromHierarchy(const ProjectSceneEntry& scene)
+{
+    if (scene.relativePath.empty())
+        return false;
+
+    auto matchesScene = [&](const std::string& existing) {
+        std::filesystem::path existingPath(existing);
+        if (ProjectManager::Instance().HasProject() && !existingPath.is_absolute())
+            existingPath = ProjectManager::Instance().ProjectRoot() / existingPath;
+        return ComparablePath(existingPath) == ComparablePath(scene.path);
+    };
+    m_attachedScenePaths.erase(
+        std::remove_if(m_attachedScenePaths.begin(), m_attachedScenePaths.end(), matchesScene),
+        m_attachedScenePaths.end());
+
+    if (scene.active)
+    {
+        if (SceneManager::Instance().IsDirty())
+        {
+            m_attachedScenePaths.push_back(scene.relativePath);
+            m_projectStatus = "Save the scene before removing it from Hierarchy.";
+            Tracenf("[HIERARCHY] Scene detach blocked by dirty scene: %s", scene.relativePath.c_str());
+            return false;
+        }
+        SceneManager::Instance().CloseScene();
+    }
+
+    m_projectStatus = "Scene removed from Hierarchy: " + scene.name;
+    Tracenf("[HIERARCHY] Scene detached: %s", scene.relativePath.c_str());
+    return true;
+}
+
+void EditorImGui::RenderProjectSceneNode(const ProjectSceneEntry& scene)
+{
+    const bool activeHasMatchingEntity =
+        scene.active && m_hierarchySearchBuffer[0] != '\0' && HierarchySubtreePassesSearch(m_sceneRootEntity);
+    if (m_hierarchySearchBuffer[0] != '\0' && !HierarchyPassesSearch(scene.name) && !activeHasMatchingEntity)
+        return;
+
+    ImGui::TableNextRow();
+    ImGui::TableSetColumnIndex(0);
+    ImGui::PushID(scene.relativePath.empty() ? scene.name.c_str() : scene.relativePath.c_str());
+
+    if (!scene.active)
+        ImGui::PushStyleColor(ImGuiCol_Text, ImVec4(0.62f, 0.62f, 0.62f, 1.0f));
+
+    bool hasChildren = scene.active && !m_hierarchyEntities.empty();
+    ImGuiTreeNodeFlags flags =
+        ImGuiTreeNodeFlags_OpenOnArrow |
+        ImGuiTreeNodeFlags_SpanFullWidth |
+        (scene.active ? ImGuiTreeNodeFlags_DefaultOpen : 0);
+    if (!hasChildren)
+        flags |= ImGuiTreeNodeFlags_Leaf | ImGuiTreeNodeFlags_NoTreePushOnOpen;
+
+    const std::string label = std::string(ICON_FA_GLOBE) + " " + scene.name + "##" + scene.relativePath;
+    const bool open = ImGui::TreeNodeEx(label.c_str(), flags);
+    if (ImGui::IsItemHovered() && !scene.relativePath.empty())
+        ImGui::SetTooltip("%s", scene.relativePath.c_str());
+    if (ImGui::IsItemClicked() && !ImGui::IsItemToggledOpen() && !scene.active && !scene.path.empty())
+    {
+        if (SceneManager::Instance().LoadScene(scene.path.string()))
+            m_projectStatus = "Scene loaded: " + scene.relativePath;
+    }
+    if (scene.active && ImGui::BeginPopupContextItem("##scene_context"))
+    {
+        if (ImGui::MenuItem(ICON_FA_MOUNTAIN " Create Terrain"))
+        {
+            if (m_terrainState.exists)
+                m_replaceTerrainConfirmOpen = true;
+            else
+                m_createTerrainModalOpen = true;
+        }
+        ImGui::EndPopup();
+    }
+
+    if (scene.active && ImGui::BeginDragDropTarget())
+    {
+        if (const ImGuiPayload* payload = ImGui::AcceptDragDropPayload(kAssetPayloadType))
+        {
+            const std::string assetId(static_cast<const char*>(payload->Data), payload->DataSize);
+            const auto entry = m_assetLibrary ? m_assetLibrary->FindById(assetId) : std::optional<AssetLibrary::Entry>{};
+            if (entry && entry->category == AssetLibrary::Category::Model)
+            {
+                m_commands.addMeshEntity = true;
+                m_commands.meshAssetId = entry->id;
+                m_assetStatus = "Mesh entity queued: " + entry->displayName;
+                Tracenf("[MESH-ENTITY] Hierarchy drop queued: asset_id=%s", entry->id.c_str());
+            }
+        }
+        ImGui::EndDragDropTarget();
+    }
+
+    if (!scene.active)
+        ImGui::PopStyleColor();
+
+    ImGui::TableSetColumnIndex(1);
+    const ImVec4 eyeColor = scene.active ? ImVec4(0.88f, 0.88f, 0.88f, 1.0f) : ImVec4(0.48f, 0.48f, 0.48f, 1.0f);
+    ImGui::PushStyleColor(ImGuiCol_Text, eyeColor);
+    if (ImGui::SmallButton(scene.active ? ICON_FA_EYE : ICON_FA_EYE_SLASH))
+    {
+        if (!scene.active && !scene.path.empty())
+        {
+            if (SceneManager::Instance().LoadScene(scene.path.string()))
+            {
+                m_projectStatus = "Scene enabled: " + scene.relativePath;
+                Tracenf("[HIERARCHY] Scene enabled: %s", scene.relativePath.c_str());
+            }
+        }
+    }
+    ImGui::PopStyleColor();
+    ImGui::SameLine();
+    ImGui::PushStyleColor(ImGuiCol_Text, ImVec4(0.95f, 0.36f, 0.36f, 1.0f));
+    if (ImGui::SmallButton(ICON_FA_TRASH))
+        DetachSceneFromHierarchy(scene);
+    ImGui::PopStyleColor();
+
+    if (hasChildren && open)
+    {
+        for (const HierarchySceneEntity& entity : m_hierarchyEntities)
+        {
+            if (entity.parent == m_sceneRootEntity || entity.parent == 0)
+                RenderHierarchyEntityNode(entity.entity);
+        }
+        ImGui::TreePop();
+    }
+
+    ImGui::PopID();
 }
 
 void EditorImGui::RenderHierarchyContextMenu(const HierarchySceneEntity& entity)
@@ -2574,7 +3098,9 @@ void EditorImGui::RenderHierarchyEntityNode(std::uint64_t entityHandle)
         flags |= ImGuiTreeNodeFlags_Selected;
 
     const char* icon = ICON_FA_CUBE;
-    if (entity->type == HierarchyEntityType::WaterBody)
+    if (entity->type == HierarchyEntityType::Terrain)
+        icon = ICON_FA_MOUNTAIN;
+    else if (entity->type == HierarchyEntityType::WaterBody)
         icon = ICON_FA_DROPLET;
     else if (entity->type == HierarchyEntityType::PointLight)
         icon = ICON_FA_LIGHTBULB;
@@ -2663,10 +3189,13 @@ void EditorImGui::RenderHierarchyPanel()
         RenderHierarchyToolbar();
         ImGui::Separator();
 
-        if (!SceneManager::Instance().HasOpenScene())
+        const std::vector<ProjectSceneEntry> projectScenes = QueryProjectScenes();
+        if (projectScenes.empty())
         {
             ImGui::TextDisabled("No scene open");
-            ImGui::TextWrapped("Open a scene or create a new one from File.");
+            ImGui::TextWrapped(ProjectManager::Instance().HasProject()
+                    ? "Create a scene from File to add it to this project."
+                    : "Open a project or create a scene from File.");
         }
         else if (ImGui::BeginTable("HierarchyEntityTree", 2,
             ImGuiTableFlags_Resizable | ImGuiTableFlags_RowBg | ImGuiTableFlags_BordersInnerV | ImGuiTableFlags_SizingStretchProp))
@@ -2675,45 +3204,50 @@ void EditorImGui::RenderHierarchyPanel()
             ImGui::TableSetupColumn("Visibility", ImGuiTableColumnFlags_WidthFixed, 84.0f);
             ImGui::TableHeadersRow();
 
-            ImGui::TableNextRow();
-            ImGui::TableSetColumnIndex(0);
-            const std::string rootLabel = std::string(ICON_FA_GLOBE) + " " + m_sceneRootName;
-            const bool rootOpen = ImGui::TreeNodeEx(rootLabel.c_str(),
-                ImGuiTreeNodeFlags_DefaultOpen | ImGuiTreeNodeFlags_OpenOnArrow | ImGuiTreeNodeFlags_SpanFullWidth);
-            if (ImGui::BeginDragDropTarget())
+            if (ProjectManager::Instance().HasProject())
             {
-                if (const ImGuiPayload* payload = ImGui::AcceptDragDropPayload(kAssetPayloadType))
+                ImGui::TableNextRow();
+                ImGui::TableSetColumnIndex(0);
+                const ProjectData& project = ProjectManager::Instance().CurrentProject();
+                const std::string rootLabel = std::string(ICON_FA_FOLDER_OPEN) + " " + project.name;
+                const bool projectOpen = ImGui::TreeNodeEx(rootLabel.c_str(),
+                    ImGuiTreeNodeFlags_DefaultOpen | ImGuiTreeNodeFlags_OpenOnArrow | ImGuiTreeNodeFlags_SpanFullWidth);
+                if (ImGui::BeginDragDropTarget())
                 {
-                    const std::string assetId(static_cast<const char*>(payload->Data), payload->DataSize);
-                    const auto entry = m_assetLibrary ? m_assetLibrary->FindById(assetId) : std::optional<AssetLibrary::Entry>{};
-                    if (entry && entry->category == AssetLibrary::Category::Model)
+                    if (const ImGuiPayload* payload = ImGui::AcceptDragDropPayload(kAssetPayloadType))
                     {
-                        m_commands.addMeshEntity = true;
-                        m_commands.meshAssetId = entry->id;
-                        m_assetStatus = "Mesh entity queued: " + entry->displayName;
-                        Tracenf("[MESH-ENTITY] Hierarchy drop queued: asset_id=%s", entry->id.c_str());
+                        const std::string assetId(static_cast<const char*>(payload->Data), payload->DataSize);
+                        const std::vector<AssetLibrary::Entry> sceneAssets = QuerySceneAssets();
+                        const auto sceneIt = std::find_if(sceneAssets.begin(), sceneAssets.end(), [&assetId](const AssetLibrary::Entry& entry) {
+                            return entry.id == assetId;
+                        });
+                        if (sceneIt != sceneAssets.end())
+                            AttachSceneToHierarchy(*sceneIt);
                     }
+                    ImGui::EndDragDropTarget();
                 }
-                ImGui::EndDragDropTarget();
-            }
-            ImGui::TableSetColumnIndex(1);
-            ImGui::TextDisabled("-");
-            if (rootOpen)
-            {
-                for (const HierarchySceneEntity& entity : m_hierarchyEntities)
+                ImGui::TableSetColumnIndex(1);
+                ImGui::TextDisabled("-");
+                if (projectOpen)
                 {
-                    if (entity.parent == m_sceneRootEntity || entity.parent == 0)
-                        RenderHierarchyEntityNode(entity.entity);
+                    for (const ProjectSceneEntry& scene : projectScenes)
+                        RenderProjectSceneNode(scene);
+                    ImGui::TreePop();
                 }
-                ImGui::TreePop();
+            }
+            else
+            {
+                for (const ProjectSceneEntry& scene : projectScenes)
+                    RenderProjectSceneNode(scene);
             }
             ImGui::EndTable();
 
             if (!m_logHierarchyRendered)
             {
                 m_logHierarchyRendered = true;
-                Tracenf("[HIERARCHY] Entity tree rendered, root=%llu entities=%zu",
+                Tracenf("[HIERARCHY] Project scene tree rendered, root=%llu scenes=%zu entities=%zu",
                     static_cast<unsigned long long>(m_sceneRootEntity),
+                    projectScenes.size(),
                     m_hierarchyEntities.size());
             }
         }
@@ -3248,12 +3782,103 @@ void EditorImGui::RenderWorldPanel()
 {
     if (ImGui::Begin(ICON_FA_GLOBE " World"))
     {
+        if (ImGui::CollapsingHeader("Terrain", ImGuiTreeNodeFlags_DefaultOpen))
+        {
+            if (UI::IconButton(ICON_FA_MOUNTAIN, "Create Terrain"))
+            {
+                if (m_terrainState.exists)
+                    m_replaceTerrainConfirmOpen = true;
+                else
+                    m_createTerrainModalOpen = true;
+            }
+            if (m_terrainState.exists)
+            {
+                ImGui::SameLine();
+                ImGui::TextDisabled("%.0fm x %.0fm, %.2fm/cell",
+                    m_terrainState.widthMeters,
+                    m_terrainState.depthMeters,
+                    m_terrainState.cellSizeMeters);
+            }
+        }
         if (ImGui::CollapsingHeader("Environment", ImGuiTreeNodeFlags_DefaultOpen))
             RenderLightingPanel();
         if (ImGui::CollapsingHeader("Dynamic Lights", ImGuiTreeNodeFlags_DefaultOpen))
             RenderDynamicLightsPanel();
     }
     ImGui::End();
+    RenderCreateTerrainModal();
+}
+
+void EditorImGui::RenderCreateTerrainModal()
+{
+    if (m_replaceTerrainConfirmOpen)
+    {
+        ImGui::OpenPopup("Replace Terrain?");
+        m_replaceTerrainConfirmOpen = false;
+    }
+    if (ImGui::BeginPopupModal("Replace Terrain?", nullptr, ImGuiWindowFlags_AlwaysAutoResize))
+    {
+        ImGui::TextWrapped("The current scene already has a terrain. Creating a new terrain will replace it.");
+        ImGui::Separator();
+        if (ImGui::Button("Replace", ImVec2(120.0f, 0.0f)))
+        {
+            m_createTerrainModalOpen = true;
+            ImGui::CloseCurrentPopup();
+        }
+        ImGui::SameLine();
+        if (ImGui::Button("Cancel", ImVec2(120.0f, 0.0f)))
+            ImGui::CloseCurrentPopup();
+        ImGui::EndPopup();
+    }
+
+    if (m_createTerrainModalOpen)
+    {
+        ImGui::OpenPopup("Create Terrain");
+        m_createTerrainModalOpen = false;
+    }
+    if (ImGui::BeginPopupModal("Create Terrain", nullptr, ImGuiWindowFlags_AlwaysAutoResize))
+    {
+        ImGui::SetNextItemWidth(180.0f);
+        ImGui::InputFloat("Width (m)", &m_createTerrainWidthMeters, 10.0f, 100.0f, "%.1f");
+        ImGui::SetNextItemWidth(180.0f);
+        ImGui::InputFloat("Depth (m)", &m_createTerrainDepthMeters, 10.0f, 100.0f, "%.1f");
+        ImGui::SetNextItemWidth(180.0f);
+        ImGui::InputFloat("Cell size (m/cell)", &m_createTerrainCellSizeMeters, 0.25f, 1.0f, "%.2f");
+
+        m_createTerrainWidthMeters = std::max(1.0f, m_createTerrainWidthMeters);
+        m_createTerrainDepthMeters = std::max(1.0f, m_createTerrainDepthMeters);
+        m_createTerrainCellSizeMeters = std::max(0.01f, m_createTerrainCellSizeMeters);
+        const std::uint32_t cellsX = std::max(1u,
+            static_cast<std::uint32_t>(std::lround(m_createTerrainWidthMeters / m_createTerrainCellSizeMeters)));
+        const std::uint32_t cellsZ = std::max(1u,
+            static_cast<std::uint32_t>(std::lround(m_createTerrainDepthMeters / m_createTerrainCellSizeMeters)));
+        const std::uint64_t vertexCount =
+            static_cast<std::uint64_t>(cellsX + 1u) * static_cast<std::uint64_t>(cellsZ + 1u);
+        ImGui::Text("Cells: %u x %u", cellsX, cellsZ);
+        ImGui::Text("Vertices: %llu", static_cast<unsigned long long>(vertexCount));
+        if (vertexCount > 4000000ull)
+            ImGui::TextColored(ImVec4(0.95f, 0.58f, 0.22f, 1.0f), "Large terrain: this may be heavy to edit/render.");
+
+        ImGui::Separator();
+        if (ImGui::Button("Create", ImVec2(120.0f, 0.0f)))
+        {
+            TerrainSceneData terrain{};
+            terrain.exists = true;
+            terrain.name = "Terrain";
+            terrain.cellSizeMeters = m_createTerrainCellSizeMeters;
+            terrain.cellsX = cellsX;
+            terrain.cellsZ = cellsZ;
+            terrain.widthMeters = static_cast<float>(cellsX) * terrain.cellSizeMeters;
+            terrain.depthMeters = static_cast<float>(cellsZ) * terrain.cellSizeMeters;
+            m_commands.createTerrain = true;
+            m_commands.terrainCreate = terrain;
+            ImGui::CloseCurrentPopup();
+        }
+        ImGui::SameLine();
+        if (ImGui::Button("Cancel", ImVec2(120.0f, 0.0f)))
+            ImGui::CloseCurrentPopup();
+        ImGui::EndPopup();
+    }
 }
 
 void EditorImGui::RenderWaterSculptToolPanel()
@@ -3345,7 +3970,7 @@ void EditorImGui::RenderSplatLayerSlot(std::uint32_t slotIndex)
     }
     ImGui::PopStyleColor();
 
-    if (ImGui::BeginDragDropTarget())
+    if (m_assetFilter != AssetBrowserFilter::Scene && ImGui::BeginDragDropTarget())
     {
         if (const ImGuiPayload* payload = ImGui::AcceptDragDropPayload(kAssetPayloadType))
         {
@@ -3490,6 +4115,8 @@ void EditorImGui::RenderAssetTypeTabs()
     tab("Materials", AssetBrowserFilter::Material);
     ImGui::SameLine();
     tab("Water Mats", AssetBrowserFilter::WaterMaterial);
+    ImGui::SameLine();
+    tab("Scenes", AssetBrowserFilter::Scene);
 }
 
 void EditorImGui::RenderAssetFolderNode(const std::string& path, const std::vector<std::string>& folders)
@@ -3559,6 +4186,7 @@ void EditorImGui::RenderAssetFolderNode(const std::string& path, const std::vect
 
 void EditorImGui::RenderAssetFolderPanel()
 {
+    const bool sceneCategory = m_assetFilter == AssetBrowserFilter::Scene;
     if (UI::IconButton(ICON_FA_HOUSE, "Home"))
     {
         m_assetSubpath.clear();
@@ -3571,11 +4199,15 @@ void EditorImGui::RenderAssetFolderPanel()
         m_selectedAssetId.clear();
     }
 
+    if (sceneCategory)
+        ImGui::BeginDisabled();
     if (UI::IconButton(ICON_FA_FOLDER_PLUS, "Folder"))
         ImGui::OpenPopup("NewAssetFolder");
     ImGui::SameLine();
     if (UI::IconButton(ICON_FA_TRASH, "Delete") && !m_assetSubpath.empty())
         DeleteAssetFolder();
+    if (sceneCategory)
+        ImGui::EndDisabled();
 
     if (ImGui::BeginPopup("NewAssetFolder"))
     {
@@ -3671,6 +4303,11 @@ void EditorImGui::RenderAssetTile(const AssetLibrary::Entry& entry, float tileSi
             m_assetStatus = "Mesh entity queued: " + entry.displayName;
             Tracenf("[MESH-ENTITY] Asset browser model spawn queued: asset_id=%s", entry.id.c_str());
         }
+        else if (doubleClicked && entry.category == AssetLibrary::Category::Scene)
+        {
+            if (AttachSceneToHierarchy(entry))
+                m_assetStatus = "Scene added to Hierarchy: " + entry.displayName;
+        }
     }
 
     if (ImGui::BeginDragDropSource())
@@ -3678,22 +4315,35 @@ void EditorImGui::RenderAssetTile(const AssetLibrary::Entry& entry, float tileSi
         ImGui::SetDragDropPayload(kAssetPayloadType, entry.id.data(), entry.id.size());
         ImGui::Text("%s", entry.displayName.c_str());
         ImGui::TextDisabled("%s", AssetLibrary::CategoryName(entry.category));
+        if (m_loggedDragAssetId != entry.id)
+        {
+            m_loggedDragAssetId = entry.id;
+            Tracenf("[EDITOR-IMGUI-3] Drag started: asset_id=%s type=%s",
+                entry.id.c_str(),
+                AssetLibrary::CategoryName(entry.category));
+        }
         ImGui::EndDragDropSource();
-        Tracenf("[EDITOR-IMGUI-3] Drag started: asset_id=%s type=%s",
-            entry.id.c_str(),
-            AssetLibrary::CategoryName(entry.category));
     }
 
     if (ImGui::BeginPopupContextItem("AssetTileContext"))
     {
-        if (ImGui::MenuItem("New Material"))
-            CreatePbrMaterialAsset();
-        if (ImGui::MenuItem("New Water Material"))
-            CreateWaterMaterialAsset();
-        ImGui::Separator();
         ImGui::TextDisabled("%s", entry.displayName.c_str());
-        if (ImGui::MenuItem("Delete Asset"))
-            DeleteAsset(entry);
+        if (entry.category == AssetLibrary::Category::Scene)
+        {
+            if (ImGui::MenuItem("Add to Hierarchy"))
+                AttachSceneToHierarchy(entry);
+        }
+        else
+        {
+            ImGui::Separator();
+            if (ImGui::MenuItem("New Material"))
+                CreatePbrMaterialAsset();
+            if (ImGui::MenuItem("New Water Material"))
+                CreateWaterMaterialAsset();
+            ImGui::Separator();
+            if (ImGui::MenuItem("Delete Asset"))
+                DeleteAsset(entry);
+        }
         ImGui::EndPopup();
     }
 
@@ -4325,11 +4975,34 @@ void EditorImGui::RenderPbrMaterialEditor()
     ImGui::End();
 }
 
+void EditorImGui::RenderSelectedTerrainInspector()
+{
+    if (!m_terrainState.selected)
+        return;
+
+    UI::SectionHeader(ICON_FA_MOUNTAIN " Terrain");
+    ImGui::TextDisabled("flecs=%llu  object=1",
+        static_cast<unsigned long long>(m_selectedHierarchyEntity));
+    ImGui::Text("Name: %s", m_terrainState.name.c_str());
+    ImGui::Separator();
+    ImGui::Text("Size: %.2f m x %.2f m",
+        m_terrainState.widthMeters,
+        m_terrainState.depthMeters);
+    ImGui::Text("Cell size: %.2f m/cell", m_terrainState.cellSizeMeters);
+    ImGui::Text("Cells: %u x %u", m_terrainState.cellsX, m_terrainState.cellsZ);
+    const std::uint64_t verts =
+        static_cast<std::uint64_t>(m_terrainState.cellsX + 1u) *
+        static_cast<std::uint64_t>(m_terrainState.cellsZ + 1u);
+    ImGui::Text("Vertices: %llu", static_cast<unsigned long long>(verts));
+}
+
 void EditorImGui::RenderInspector()
 {
     if (ImGui::Begin("Inspector"))
     {
-        if (m_waterBodyState.selected)
+        if (m_terrainState.selected)
+            RenderSelectedTerrainInspector();
+        else if (m_waterBodyState.selected)
             RenderSelectedWaterBodyInspector();
         else if (m_dynamicLightState.type != DynamicLightType::None)
             RenderSelectedLightInspector();
@@ -4368,6 +5041,7 @@ void EditorImGui::RenderEditorPanels()
     RenderToolsPanel();
     RenderAssetBrowser();
     RenderInspector();
+    RenderSceneViewDropTarget();
     RenderWaterSculptToolPanel();
     RenderHeightmapToolPanel();
     RenderSplatPaintToolPanel();
@@ -4558,6 +5232,10 @@ void EditorImGui::SetWaterBodyEditorState(const WaterBodyEditorState&)
 }
 
 void EditorImGui::SetMeshRendererEditorState(const MeshRendererEditorState&)
+{
+}
+
+void EditorImGui::SetTerrainEditorState(const TerrainEditorState&)
 {
 }
 

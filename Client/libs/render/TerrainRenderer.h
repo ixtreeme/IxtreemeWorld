@@ -8,6 +8,7 @@
 #include <array>
 #include <cstdint>
 #include <deque>
+#include <filesystem>
 #include <functional>
 #include <limits>
 #include <string>
@@ -63,7 +64,14 @@ public:
     };
 
     bool Create(VulkanDevice& device, client::asset::IAssetReader& assets);
+    void SetAdditionalAssetRoots(std::vector<std::filesystem::path> roots);
     bool LoadMap(VulkanDevice& device, const std::string& mapDirectory, int32_t serverX, int32_t serverY);
+    bool CreateFlatTerrain(VulkanDevice& device, const TerrainSceneData& terrain);
+    void ClearTerrain(VulkanDevice& device);
+    bool HasTerrain() const { return m_sceneTerrainActive; }
+    bool IsMapLoadedForDiagnostics() const { return m_mapLoaded; }
+    TerrainSceneData GetTerrainSceneData() const;
+    void SetTerrainSceneData(const TerrainSceneData& terrain);
     bool RecreatePipeline(VulkanDevice& device);
     void SetMainRenderPass(VkRenderPass renderPass);
     void SetWaterRefractionInputs(VkImageView colorView,
@@ -248,6 +256,7 @@ private:
     bool CreateFallbackTexture(VulkanDevice& device);
     bool CreateFallbackMask(VulkanDevice& device);
     bool CreateFallbackSplatTextures(VulkanDevice& device);
+    bool CreateSceneSplatTextures(VulkanDevice& device);
     bool LoadTerrainPalette(VulkanDevice& device, const mx::map::Manifest& manifest, const std::string& mapDirectory);
     bool LoadTerrainPaletteFromPaths(VulkanDevice& device, const std::array<MapEditorPaletteSlot, 8>& slots);
     bool UploadRgbaTexture2D(VulkanDevice& device,
@@ -368,6 +377,7 @@ private:
     std::unordered_map<std::string, WaterMaterialTextureSet> m_waterMaterialTextures;
     std::string m_waterMaterialTextureSignature;
     std::string m_waterMaterialEdgeSignature;
+    std::vector<std::filesystem::path> m_additionalAssetRoots;
     WaterMaterialData m_defaultWaterMaterial;
     Buffer m_vertexBuffer;
     Buffer m_indexBuffer;
@@ -452,6 +462,10 @@ private:
     float m_spawnLocalXcm = 0.0f;
     float m_spawnLocalYcm = 0.0f;
     float m_spawnHeightCm = 0.0f;
+    float m_flatTerrainWidthMeters = 100.0f;
+    float m_flatTerrainDepthMeters = 100.0f;
+    bool m_sceneTerrainActive = false;
+    TerrainSceneData m_sceneTerrain;
     bool m_mapLoaded = false;
     bool m_walkabilityDebug = false;
     bool m_editorRaiseHeld = false;

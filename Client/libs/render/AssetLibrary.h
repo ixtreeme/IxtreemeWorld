@@ -18,7 +18,8 @@ public:
         Model,
         Animation,
         Material,
-        WaterMaterial
+        WaterMaterial,
+        Scene
     };
 
     enum class TextureRole

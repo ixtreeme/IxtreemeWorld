@@ -242,9 +242,28 @@ struct MeshSceneEntity
     bool editorHidden = false;
 };
 
+struct TerrainSceneData
+{
+    bool exists = false;
+    std::string name = "Terrain";
+    float widthMeters = 100.0f;
+    float depthMeters = 100.0f;
+    float cellSizeMeters = 1.0f;
+    std::uint32_t cellsX = 100;
+    std::uint32_t cellsZ = 100;
+    std::string heightmapRef;
+    std::string splatRef;
+    std::string maskRef;
+    std::vector<float> heightCmGrid;
+    std::vector<std::uint8_t> splatABytes;
+    std::vector<std::uint8_t> splatBBytes;
+    bool editorHidden = false;
+};
+
 enum class HierarchyEntityType
 {
     None,
+    Terrain,
     WaterBody,
     PointLight,
     SpotLight,
@@ -300,6 +319,18 @@ struct MeshRendererEditorState
     bool skinned = false;
 };
 
+struct TerrainEditorState
+{
+    bool selected = false;
+    bool exists = false;
+    std::string name;
+    float widthMeters = 0.0f;
+    float depthMeters = 0.0f;
+    float cellSizeMeters = 1.0f;
+    std::uint32_t cellsX = 0;
+    std::uint32_t cellsZ = 0;
+};
+
 enum class DynamicLightType
 {
     None,
@@ -334,8 +365,12 @@ struct MapEditorCommands
     bool pausePlayMode = false;
     bool resumePlayMode = false;
     bool addWaterBody = false;
+    bool createTerrain = false;
+    TerrainSceneData terrainCreate;
     bool addMeshEntity = false;
     std::string meshAssetId;
+    bool meshDropScreenPositionValid = false;
+    float meshDropScreenPosition[2] = {0.0f, 0.0f};
     bool addComponentToSelectedEntity = false;
     EditorComponentType addComponentType = EditorComponentType::None;
     bool assignMeshAssetToSelectedEntity = false;

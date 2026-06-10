@@ -11,7 +11,7 @@ class VulkanDevice
 public:
     bool Create(NativeWindow& window, uint32_t width, uint32_t height);
     void BeginFrame();
-    void BeginSwapchainRenderPass();
+    void BeginSwapchainRenderPass(const char* passName = "other");
     void EndFrame();
     bool Resize(uint32_t width, uint32_t height);
     void WaitIdle();
@@ -74,6 +74,8 @@ private:
 
     void DestroySwapchainObjects();
     bool RecreateSwapchain(uint32_t width, uint32_t height);
+    int FindSwapchainImageIndex(VkImage image) const;
+    void LogSwapchainImageTransition(VkImage image, VkImageLayout oldLayout, VkImageLayout newLayout, const char* passName) const;
 
     QueueFamilies FindQueueFamilies(VkPhysicalDevice device) const;
     SwapchainSupport QuerySwapchainSupport(VkPhysicalDevice device) const;
@@ -115,6 +117,7 @@ private:
 
     uint32_t m_currentFrame = 0;
     uint32_t m_imageIndex = 0;
+    int m_lastAcquiredImageIndex = -1;
     uint32_t m_width = 0;
     uint32_t m_height = 0;
     uint64_t m_frameNumber = 0;
@@ -123,6 +126,9 @@ private:
     bool m_skipFrame = false;
     bool m_renderPassStarted = false;
     bool m_swapchainDirty = false;
+    bool m_acquiredThisFrame = false;
+    bool m_swapchainTransitionThisFrame = false;
+    const char* m_activeSwapchainPass = "none";
     bool m_validationEnabled = false;
     bool m_samplerAnisotropySupported = false;
     float m_maxSamplerAnisotropy = 1.0f;
