@@ -223,6 +223,15 @@ float3x3 ComputeTbn(float3 worldPos, float2 uv, float3 surfaceNormal)
     return float3x3(tangent, bitangent, surfaceNormal);
 }
 
+float2 TransformLayerUv(float2 uv, int layer)
+{
+    const float angle = u_materialPbr[layer].w;
+    const float s = sin(angle);
+    const float c = cos(angle);
+    const float2 rotated = float2(uv.x * c - uv.y * s, uv.x * s + uv.y * c);
+    return rotated * u_materialTiling[layer].xy + u_materialTiling[layer].zw;
+}
+
 float FoamHash(float2 p)
 {
     p = frac(p * float2(123.34, 456.21));
@@ -354,7 +363,7 @@ float4 PSMain(VSOutput input) : SV_Target0
     [unroll]
     for (int layer = 0; layer < 8; ++layer)
     {
-        const float2 materialUv = input.texUv * u_materialTiling[layer].xy;
+        const float2 materialUv = TransformLayerUv(input.texUv, layer);
         const float3 diffuse = u_paletteTex.Sample(u_paletteSampler, float3(materialUv, (float)layer)).rgb;
         float3 sampledNormal = u_normalTex.Sample(u_normalSampler, float3(materialUv, (float)layer)).rgb * 2.0 - 1.0;
         sampledNormal.xy *= u_materialTintNormal[layer].w;

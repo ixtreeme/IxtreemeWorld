@@ -2849,7 +2849,10 @@ std::array<MapEditorPaletteSlot, 8> AssetLibrary::LoadWorldPalette(
                     slot.normalStrength = 0.0f;
                     slot.aoStrength = 1.0f;
                     slot.roughnessStrength = 1.0f;
-                    slot.metallicStrength = 1.0f;
+                    slot.metallicStrength = 0.0f;
+                    slot.uvOffset[0] = 0.0f;
+                    slot.uvOffset[1] = 0.0f;
+                    slot.uvRotationDegrees = 0.0f;
                 }
             }
         }
@@ -2872,10 +2875,16 @@ std::array<MapEditorPaletteSlot, 8> AssetLibrary::LoadWorldPalette(
             slot.heightTexturePath = heightPath;
         slot.tilingScaleX = JsonFloatValue(object, "tiling_scale_x", slot.tilingScaleX);
         slot.tilingScaleY = JsonFloatValue(object, "tiling_scale_y", slot.tilingScaleY);
+        slot.colorTint[0] = JsonFloatValue(object, "tint_r", slot.colorTint[0]);
+        slot.colorTint[1] = JsonFloatValue(object, "tint_g", slot.colorTint[1]);
+        slot.colorTint[2] = JsonFloatValue(object, "tint_b", slot.colorTint[2]);
         slot.normalStrength = JsonFloatValue(object, "normal_strength", slot.normalStrength);
         slot.aoStrength = JsonFloatValue(object, "ao_strength", slot.aoStrength);
         slot.roughnessStrength = JsonFloatValue(object, "roughness_strength", slot.roughnessStrength);
-        slot.metallicStrength = JsonFloatValue(object, "metallic_strength", slot.metallicStrength);
+        slot.metallicStrength = JsonFloatValue(object, "metallic_strength", 0.0f);
+        slot.uvOffset[0] = JsonFloatValue(object, "uv_offset_x", slot.uvOffset[0]);
+        slot.uvOffset[1] = JsonFloatValue(object, "uv_offset_y", slot.uvOffset[1]);
+        slot.uvRotationDegrees = JsonFloatValue(object, "uv_rotation_degrees", slot.uvRotationDegrees);
         const std::string display = JsonStringValue(object, "display_name");
         if (!display.empty())
             slot.displayName = display;
@@ -2905,10 +2914,16 @@ bool AssetLibrary::SaveWorldPalette(const std::string& mapDirectory,
              << ", \"height_texture_path\": \"" << EscapeJson(slot.heightTexturePath) << "\""
              << ", \"tiling_scale_x\": " << slot.tilingScaleX
              << ", \"tiling_scale_y\": " << slot.tilingScaleY
+             << ", \"tint_r\": " << slot.colorTint[0]
+             << ", \"tint_g\": " << slot.colorTint[1]
+             << ", \"tint_b\": " << slot.colorTint[2]
              << ", \"normal_strength\": " << slot.normalStrength
              << ", \"ao_strength\": " << slot.aoStrength
              << ", \"roughness_strength\": " << slot.roughnessStrength
-             << ", \"metallic_strength\": " << slot.metallicStrength << " }"
+             << ", \"metallic_strength\": " << slot.metallicStrength
+             << ", \"uv_offset_x\": " << slot.uvOffset[0]
+             << ", \"uv_offset_y\": " << slot.uvOffset[1]
+             << ", \"uv_rotation_degrees\": " << slot.uvRotationDegrees << " }"
              << (i + 1 < slots.size() ? "," : "") << "\n";
     }
     json << "  ]\n}\n";

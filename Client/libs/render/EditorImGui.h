@@ -303,6 +303,7 @@ private:
     float m_createTerrainWidthMeters = 200.0f;
     float m_createTerrainDepthMeters = 200.0f;
     float m_createTerrainCellSizeMeters = 1.0f;
+    int m_createTerrainChunkSizeCells = 64;
     AssetBrowserFilter m_assetFilter = AssetBrowserFilter::All;
     std::string m_assetSubpath;
     std::string m_selectedAssetId;

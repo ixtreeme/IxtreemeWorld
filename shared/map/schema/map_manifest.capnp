@@ -10,6 +10,18 @@ enum HeightUnit {
 struct TexturePaletteEntry {
   id @0 :UInt16;
   path @1 :Text;
+  tilingX @2 :Float32 = 1.0;
+  tilingY @3 :Float32 = 1.0;
+  normalStrength @4 :Float32 = 1.0;
+  roughnessStrength @5 :Float32 = 1.0;
+  tintR @6 :Float32 = 1.0;
+  tintG @7 :Float32 = 1.0;
+  tintB @8 :Float32 = 1.0;
+  metallicStrength @9 :Float32 = 0.0;
+  aoStrength @10 :Float32 = 1.0;
+  uvOffsetX @11 :Float32 = 0.0;
+  uvOffsetY @12 :Float32 = 0.0;
+  uvRotationDegrees @13 :Float32 = 0.0;
 }
 
 struct ZoneGridDims {

@@ -74,7 +74,9 @@ struct MapEditorPaletteSlot
     float normalStrength = 1.0f;
     float aoStrength = 1.0f;
     float roughnessStrength = 1.0f;
-    float metallicStrength = 1.0f;
+    float metallicStrength = 0.0f;
+    float uvOffset[2] = {0.0f, 0.0f};
+    float uvRotationDegrees = 0.0f;
 };
 
 struct DirectionalLight
@@ -251,6 +253,8 @@ struct TerrainSceneData
     float cellSizeMeters = 1.0f;
     std::uint32_t cellsX = 100;
     std::uint32_t cellsZ = 100;
+    std::uint32_t chunkSizeCells = 64;
+    std::string chunkManifestRef;
     std::string heightmapRef;
     std::string splatRef;
     std::string maskRef;
@@ -400,6 +404,7 @@ struct MapEditorCommands
     std::uint64_t hierarchyEntityHandle = 0;
     std::string hierarchyRenameValue;
     bool paletteSlotChanged = false;
+    bool paletteSlotParamsChanged = false;
     std::uint32_t paletteSlot = 0;
     std::string paletteAssetId;
     std::string paletteTexturePath;

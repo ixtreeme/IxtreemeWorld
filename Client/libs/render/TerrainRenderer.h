@@ -105,6 +105,7 @@ public:
     void SetPaletteSlots(const std::array<MapEditorPaletteSlot, 8>& slots);
     const std::array<MapEditorPaletteSlot, 8>& GetPaletteSlots() const { return m_paletteSlots; }
     bool ApplyPaletteSlots(VulkanDevice& device, const std::array<MapEditorPaletteSlot, 8>& slots);
+    bool ApplyPaletteSlotParams(const MapEditorPaletteSlot& slot);
     bool ApplyPaletteSlotChange(VulkanDevice& device, const MapEditorPaletteSlot& slot);
     void RequestEditorSave();
     void RequestEditorReload();
@@ -502,6 +503,7 @@ private:
     double m_latestWaterTimeSeconds = 0.0;
     double m_lastWaterDiagTimeSeconds = -1000.0;
     std::array<MapEditorPaletteSlot, 8> m_paletteSlots{};
+    bool m_materialParamsDirty = false;
     std::string m_loadedMapDirectory;
     int32_t m_loadedServerX = 0;
     int32_t m_loadedServerY = 0;

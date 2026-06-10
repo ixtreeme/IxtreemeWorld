@@ -1618,6 +1618,7 @@ bool TerrainRenderer::CreateFlatTerrain(VulkanDevice& device, const TerrainScene
     next.cellSizeMeters = std::max(0.01f, next.cellSizeMeters);
     next.cellsX = std::max(1u, next.cellsX);
     next.cellsZ = std::max(1u, next.cellsZ);
+    next.chunkSizeCells = std::clamp(next.chunkSizeCells == 0 ? 64u : next.chunkSizeCells, 32u, 256u);
     if (next.widthMeters <= 0.0f)
         next.widthMeters = static_cast<float>(next.cellsX) * next.cellSizeMeters;
     if (next.depthMeters <= 0.0f)
@@ -1656,7 +1657,7 @@ bool TerrainRenderer::CreateFlatTerrain(VulkanDevice& device, const TerrainScene
     m_cellScaleMeters = next.cellSizeMeters;
     m_mapSizeX = next.cellsX;
     m_mapSizeY = next.cellsZ;
-    m_chunkSizeCells = std::max(1u, std::min<std::uint32_t>(64u, std::max(next.cellsX, next.cellsZ)));
+    m_chunkSizeCells = next.chunkSizeCells;
     m_heightGridWidth = next.cellsX + 1u;
     m_heightGridHeight = next.cellsZ + 1u;
     m_spawnLocalXcm = next.widthMeters * 50.0f;
@@ -1670,8 +1671,8 @@ bool TerrainRenderer::CreateFlatTerrain(VulkanDevice& device, const TerrainScene
     m_heightUndoRecorded.assign(m_heightCmGrid.size(), 0);
     m_splatWidth = std::max(1u, next.cellsX);
     m_splatHeight = std::max(1u, next.cellsZ);
-    m_chunkSplatWidth = m_splatWidth;
-    m_chunkSplatHeight = m_splatHeight;
+    m_chunkSplatWidth = m_chunkSizeCells;
+    m_chunkSplatHeight = m_chunkSizeCells;
     const size_t expectedSplatBytes = static_cast<size_t>(m_splatWidth) * m_splatHeight * 4u;
     if (next.splatABytes.size() == expectedSplatBytes)
         m_splatABytes = next.splatABytes;
@@ -1702,6 +1703,17 @@ bool TerrainRenderer::CreateFlatTerrain(VulkanDevice& device, const TerrainScene
         next.cellsX,
         next.cellsZ,
         m_heightCmGrid.size());
+    const uint32_t chunkGridX = (m_mapSizeX + m_chunkSizeCells - 1u) / m_chunkSizeCells;
+    const uint32_t chunkGridY = (m_mapSizeY + m_chunkSizeCells - 1u) / m_chunkSizeCells;
+    Tracenf("[TCHUNK] create dims=%.2fx%.2f m cellSize=%.2f chunkSize=%u cells=%ux%u chunkGrid=%ux%u",
+        next.widthMeters,
+        next.depthMeters,
+        next.cellSizeMeters,
+        m_chunkSizeCells,
+        m_mapSizeX,
+        m_mapSizeY,
+        chunkGridX,
+        chunkGridY);
     Tracenf("[TEDIT-DIAG] terrain created id=%p registeredAsEditTarget=%s activeTerrain=%p dims=%ux%u cells heightBuffer=%p splatTarget=%p/%p",
         static_cast<void*>(this),
         (m_sceneTerrainActive && m_mapLoaded && m_heightGridWidth > 1 && m_heightGridHeight > 1) ? "yes" : "no",
@@ -1764,6 +1776,7 @@ TerrainSceneData TerrainRenderer::GetTerrainSceneData() const
         data.cellSizeMeters = m_cellScaleMeters;
         data.cellsX = m_mapSizeX;
         data.cellsZ = m_mapSizeY;
+        data.chunkSizeCells = m_chunkSizeCells == 0 ? data.chunkSizeCells : m_chunkSizeCells;
         data.widthMeters = m_flatTerrainWidthMeters > 0.0f
             ? m_flatTerrainWidthMeters
             : static_cast<float>(m_mapSizeX) * m_cellScaleMeters;
@@ -2275,6 +2288,13 @@ void TerrainRenderer::Render(VulkanDevice& device, const WorldCamera& camera)
             camera.target.x,
             camera.target.y,
             camera.target.z);
+        const uint32_t chunkSize = m_chunkSizeCells == 0 ? 64u : m_chunkSizeCells;
+        const uint32_t chunksX = m_mapSizeX == 0 ? 0u : (m_mapSizeX + chunkSize - 1u) / chunkSize;
+        const uint32_t chunksY = m_mapSizeY == 0 ? 0u : (m_mapSizeY + chunkSize - 1u) / chunkSize;
+        Tracenf("[TCHUNK] render chunksDrawn=%u culled=0 chunkGrid=%ux%u policy=resident-all",
+            chunksX * chunksY,
+            chunksX,
+            chunksY);
         loggedDraw = true;
     }
 }
@@ -2742,6 +2762,7 @@ bool TerrainRenderer::RebuildSelectedWaterBodyHighlight(VulkanDevice& device, co
 void TerrainRenderer::SetPaletteSlots(const std::array<MapEditorPaletteSlot, 8>& slots)
 {
     m_paletteSlots = slots;
+    m_materialParamsDirty = true;
 }
 
 bool TerrainRenderer::ApplyPaletteSlotChange(VulkanDevice& device, const MapEditorPaletteSlot& slot)
@@ -2760,6 +2781,44 @@ bool TerrainRenderer::ApplyPaletteSlotChange(VulkanDevice& device, const MapEdit
 bool TerrainRenderer::ApplyPaletteSlots(VulkanDevice& device, const std::array<MapEditorPaletteSlot, 8>& slots)
 {
     return LoadTerrainPaletteFromPaths(device, slots);
+}
+
+bool TerrainRenderer::ApplyPaletteSlotParams(const MapEditorPaletteSlot& slot)
+{
+    if (slot.slot >= m_paletteSlots.size())
+        return false;
+
+    MapEditorPaletteSlot& dst = m_paletteSlots[slot.slot];
+    dst.tilingScaleX = std::clamp(slot.tilingScaleX, 0.01f, 64.0f);
+    dst.tilingScaleY = std::clamp(slot.tilingScaleY, 0.01f, 64.0f);
+    dst.colorTint[0] = std::clamp(slot.colorTint[0], 0.0f, 8.0f);
+    dst.colorTint[1] = std::clamp(slot.colorTint[1], 0.0f, 8.0f);
+    dst.colorTint[2] = std::clamp(slot.colorTint[2], 0.0f, 8.0f);
+    dst.normalStrength = std::clamp(slot.normalStrength, 0.0f, 4.0f);
+    dst.roughnessStrength = std::clamp(slot.roughnessStrength, 0.0f, 4.0f);
+    dst.metallicStrength = std::clamp(slot.metallicStrength, 0.0f, 1.0f);
+    dst.aoStrength = std::clamp(slot.aoStrength, 0.0f, 1.0f);
+    dst.uvOffset[0] = slot.uvOffset[0];
+    dst.uvOffset[1] = slot.uvOffset[1];
+    dst.uvRotationDegrees = slot.uvRotationDegrees;
+    m_materialParamsDirty = true;
+    Tracenf("[TMAT] layer=%u tiling=%.3f,%.3f normalStrength=%.3f roughness=%.3f (changed)",
+        slot.slot,
+        dst.tilingScaleX,
+        dst.tilingScaleY,
+        dst.normalStrength,
+        dst.roughnessStrength);
+    Tracenf("[TMAT] layer=%u tint=(%.3f,%.3f,%.3f) metallic=%.3f ao=%.3f uvOffset=(%.3f,%.3f) uvRot=%.3f (changed)",
+        slot.slot,
+        dst.colorTint[0],
+        dst.colorTint[1],
+        dst.colorTint[2],
+        dst.metallicStrength,
+        dst.aoStrength,
+        dst.uvOffset[0],
+        dst.uvOffset[1],
+        dst.uvRotationDegrees);
+    return true;
 }
 
 void TerrainRenderer::RequestEditorSave()
@@ -4086,12 +4145,12 @@ void TerrainRenderer::MarkSplatDirty(size_t splatIndex)
         return;
     const uint32_t sx = static_cast<uint32_t>(splatIndex % m_splatWidth);
     const uint32_t sy = static_cast<uint32_t>(splatIndex / m_splatWidth);
-    const uint32_t chunksX = m_chunkSplatWidth > 0 ? m_splatWidth / m_chunkSplatWidth : 0;
+    const uint32_t chunksX = m_chunkSplatWidth > 0 ? (m_splatWidth + m_chunkSplatWidth - 1u) / m_chunkSplatWidth : 0;
     if (chunksX == 0)
         return;
     const uint32_t chunkX = std::min(sx / m_chunkSplatWidth, chunksX - 1u);
-    const uint32_t chunkY = std::min(sy / m_chunkSplatHeight,
-        static_cast<uint32_t>(m_dirtyChunkTexels.size() / chunksX) - 1u);
+    const uint32_t chunksY = static_cast<uint32_t>((m_dirtyChunkTexels.size() + chunksX - 1u) / chunksX);
+    const uint32_t chunkY = std::min(sy / m_chunkSplatHeight, chunksY - 1u);
     const size_t dirtyIndex = static_cast<size_t>(chunkY) * chunksX + chunkX;
     if (dirtyIndex < m_dirtyChunkTexels.size())
         ++m_dirtyChunkTexels[dirtyIndex];
@@ -4131,12 +4190,6 @@ void TerrainRenderer::ApplyEditorBrush(VulkanDevice& device, double deltaSeconds
 
     const uint32_t chunksX = (m_mapSizeX + m_chunkSizeCells - 1u) / m_chunkSizeCells;
     const uint32_t chunksY = (m_mapSizeY + m_chunkSizeCells - 1u) / m_chunkSizeCells;
-    const uint32_t chunkX = std::min(static_cast<uint32_t>(centerGridX) / m_chunkSizeCells, chunksX - 1u);
-    const uint32_t chunkY = std::min(static_cast<uint32_t>(centerGridY) / m_chunkSizeCells, chunksY - 1u);
-    const uint32_t chunkMinX = chunkX * m_chunkSizeCells;
-    const uint32_t chunkMinY = chunkY * m_chunkSizeCells;
-    const uint32_t chunkMaxX = std::min(chunkMinX + m_chunkSizeCells, m_heightGridWidth - 1u);
-    const uint32_t chunkMaxY = std::min(chunkMinY + m_chunkSizeCells, m_heightGridHeight - 1u);
     const float radiusCells = m_editorBrushRadiusMeters / std::max(m_cellScaleMeters, 0.001f);
     const float alphaCenter = std::clamp(m_editorBrushStrength * static_cast<float>(deltaSeconds), 0.0f, 1.0f);
 
@@ -4167,6 +4220,7 @@ void TerrainRenderer::ApplyEditorBrush(VulkanDevice& device, double deltaSeconds
         const uint32_t maxY = std::min(m_splatHeight - 1u, static_cast<uint32_t>(std::ceil(centerSplatY + radiusSplatY)));
         bool changed = false;
         std::uint32_t changedCells = 0;
+        std::unordered_set<std::uint32_t> touchedChunks;
         for (uint32_t sy = minY; sy <= maxY; ++sy)
         {
             for (uint32_t sx = minX; sx <= maxX; ++sx)
@@ -4242,6 +4296,9 @@ void TerrainRenderer::ApplyEditorBrush(VulkanDevice& device, double deltaSeconds
                 for (int i = 0; i < 4; ++i)
                     m_splatBBytes[byte + i] = quantized[4 + i];
                 MarkSplatDirty(index);
+                const std::uint32_t cx = m_chunkSplatWidth > 0 ? sx / m_chunkSplatWidth : 0;
+                const std::uint32_t cy = m_chunkSplatHeight > 0 ? sy / m_chunkSplatHeight : 0;
+                touchedChunks.insert((cy << 16u) | (cx & 0xffffu));
                 changed = true;
                 ++changedCells;
             }
@@ -4259,6 +4316,20 @@ void TerrainRenderer::ApplyEditorBrush(VulkanDevice& device, double deltaSeconds
             changed ? "yes" : "no",
             changedCells,
             m_editorSplatGpuDirty ? "pending" : "no");
+        std::ostringstream chunksText;
+        bool firstChunk = true;
+        for (std::uint32_t packed : touchedChunks)
+        {
+            if (!firstChunk)
+                chunksText << ";";
+            firstChunk = false;
+            chunksText << (packed & 0xffffu) << "," << (packed >> 16u);
+        }
+        Tracenf("[TCHUNK] splat stroke chunksTouched=[%s] dirty=%zu gpuUpload=%s remesh=%s",
+            chunksText.str().c_str(),
+            touchedChunks.size(),
+            changed ? "yes" : "no",
+            changed ? "yes" : "no");
         return;
     }
 
@@ -4273,12 +4344,13 @@ void TerrainRenderer::ApplyEditorBrush(VulkanDevice& device, double deltaSeconds
     if (m_editorTool == MapEditorTool::Smooth)
         smoothSource = m_heightCmGrid;
 
-    const uint32_t minX = std::max(chunkMinX, static_cast<uint32_t>(std::max(0.0f, std::floor(centerGridX - radiusCells))));
-    const uint32_t minY = std::max(chunkMinY, static_cast<uint32_t>(std::max(0.0f, std::floor(centerGridY - radiusCells))));
-    const uint32_t maxX = std::min(chunkMaxX, static_cast<uint32_t>(std::ceil(centerGridX + radiusCells)));
-    const uint32_t maxY = std::min(chunkMaxY, static_cast<uint32_t>(std::ceil(centerGridY + radiusCells)));
+    const uint32_t minX = static_cast<uint32_t>(std::max(0.0f, std::floor(centerGridX - radiusCells)));
+    const uint32_t minY = static_cast<uint32_t>(std::max(0.0f, std::floor(centerGridY - radiusCells)));
+    const uint32_t maxX = std::min(m_heightGridWidth - 1u, static_cast<uint32_t>(std::ceil(centerGridX + radiusCells)));
+    const uint32_t maxY = std::min(m_heightGridHeight - 1u, static_cast<uint32_t>(std::ceil(centerGridY + radiusCells)));
     std::uint32_t changedHeights = 0;
     float maxHeightDeltaCm = 0.0f;
+    std::unordered_set<std::uint32_t> touchedChunks;
 
     void* mapped = nullptr;
     const VkDeviceSize vertexBytes = static_cast<VkDeviceSize>(m_heightGridWidth) * m_heightGridHeight * sizeof(Vertex);
@@ -4342,6 +4414,9 @@ void TerrainRenderer::ApplyEditorBrush(VulkanDevice& device, double deltaSeconds
             m_heightCmGrid[index] = newHeight;
             vertices[index].position[1] = newHeight * 0.01f;
             MarkHeightDirty(index);
+            const std::uint32_t cx = m_chunkSizeCells > 0 ? std::min(gx / m_chunkSizeCells, chunksX - 1u) : 0;
+            const std::uint32_t cy = m_chunkSizeCells > 0 ? std::min(gy / m_chunkSizeCells, chunksY - 1u) : 0;
+            touchedChunks.insert((cy << 16u) | (cx & 0xffffu));
             ++changedHeights;
         }
     }
@@ -4377,6 +4452,20 @@ void TerrainRenderer::ApplyEditorBrush(VulkanDevice& device, double deltaSeconds
         TeditToolName(m_editorTool),
         changedHeights,
         maxHeightDeltaCm * 0.01f,
+        changedHeights > 0 ? "yes" : "no",
+        changedHeights > 0 ? "yes" : "no");
+    std::ostringstream chunksText;
+    bool firstChunk = true;
+    for (std::uint32_t packed : touchedChunks)
+    {
+        if (!firstChunk)
+            chunksText << ";";
+        firstChunk = false;
+        chunksText << (packed & 0xffffu) << "," << (packed >> 16u);
+    }
+    Tracenf("[TCHUNK] sculpt stroke chunksTouched=[%s] dirty=%zu gpuUpload=%s remesh=%s",
+        chunksText.str().c_str(),
+        touchedChunks.size(),
         changedHeights > 0 ? "yes" : "no",
         changedHeights > 0 ? "yes" : "no");
 }
@@ -4534,7 +4623,16 @@ bool TerrainRenderer::SaveWorldPalette() const
                 << ", \"normal_texture_path\": \"" << escape(slot.normalTexturePath) << "\""
                 << ", \"tiling_scale_x\": " << slot.tilingScaleX
                 << ", \"tiling_scale_y\": " << slot.tilingScaleY
-                << ", \"normal_strength\": " << slot.normalStrength << " }"
+                << ", \"tint_r\": " << slot.colorTint[0]
+                << ", \"tint_g\": " << slot.colorTint[1]
+                << ", \"tint_b\": " << slot.colorTint[2]
+                << ", \"normal_strength\": " << slot.normalStrength
+                << ", \"ao_strength\": " << slot.aoStrength
+                << ", \"roughness_strength\": " << slot.roughnessStrength
+                << ", \"metallic_strength\": " << slot.metallicStrength
+                << ", \"uv_offset_x\": " << slot.uvOffset[0]
+                << ", \"uv_offset_y\": " << slot.uvOffset[1]
+                << ", \"uv_rotation_degrees\": " << slot.uvRotationDegrees << " }"
                 << (i + 1 < m_paletteSlots.size() ? "," : "") << "\n";
         }
         out << "  ]\n}\n";
@@ -4860,6 +4958,30 @@ bool TerrainRenderer::LoadTerrainPalette(VulkanDevice& device,
         if (!path.empty() && path.rfind("assets/", 0) != 0 && path.find(':') == std::string::npos)
             path = mapDirectory + "/" + path;
         slots[i] = MapEditorPaletteSlot{i, {}, "Default " + std::to_string(i + 1u), path};
+        if (i < manifest.texture_palette_tiling_x.size())
+            slots[i].tilingScaleX = manifest.texture_palette_tiling_x[i];
+        if (i < manifest.texture_palette_tiling_y.size())
+            slots[i].tilingScaleY = manifest.texture_palette_tiling_y[i];
+        if (i < manifest.texture_palette_normal_strength.size())
+            slots[i].normalStrength = manifest.texture_palette_normal_strength[i];
+        if (i < manifest.texture_palette_roughness_strength.size())
+            slots[i].roughnessStrength = manifest.texture_palette_roughness_strength[i];
+        if (i < manifest.texture_palette_tint_r.size())
+            slots[i].colorTint[0] = manifest.texture_palette_tint_r[i];
+        if (i < manifest.texture_palette_tint_g.size())
+            slots[i].colorTint[1] = manifest.texture_palette_tint_g[i];
+        if (i < manifest.texture_palette_tint_b.size())
+            slots[i].colorTint[2] = manifest.texture_palette_tint_b[i];
+        if (i < manifest.texture_palette_metallic_strength.size())
+            slots[i].metallicStrength = manifest.texture_palette_metallic_strength[i];
+        if (i < manifest.texture_palette_ao_strength.size())
+            slots[i].aoStrength = manifest.texture_palette_ao_strength[i];
+        if (i < manifest.texture_palette_uv_offset_x.size())
+            slots[i].uvOffset[0] = manifest.texture_palette_uv_offset_x[i];
+        if (i < manifest.texture_palette_uv_offset_y.size())
+            slots[i].uvOffset[1] = manifest.texture_palette_uv_offset_y[i];
+        if (i < manifest.texture_palette_uv_rotation_degrees.size())
+            slots[i].uvRotationDegrees = manifest.texture_palette_uv_rotation_degrees[i];
     }
 
     return LoadTerrainPaletteFromPaths(device, slots);
@@ -5024,6 +5146,7 @@ bool TerrainRenderer::LoadTerrainPaletteFromPaths(VulkanDevice& device, const st
     m_metallicTexture = metallic;
     m_heightTexture = heightTex;
     m_paletteSlots = slots;
+    m_materialParamsDirty = true;
     UpdateDescriptors();
     Tracenf("[TERRAIN-PALETTE] loaded 8-layer PBR palette size=%ux%u diffuse=%s normal=%s orm_height=R8",
         m_baseTexture.width,
@@ -6964,16 +7087,18 @@ void TerrainRenderer::UpdateUniform(uint32_t frameIndex, const WorldCamera& came
     uniform.mvp = camera.viewProjection;
     for (uint32_t i = 0; i < m_paletteSlots.size(); ++i)
     {
-        uniform.materialTiling[i][0] = std::clamp(m_paletteSlots[i].tilingScaleX, 0.1f, 10.0f);
-        uniform.materialTiling[i][1] = std::clamp(m_paletteSlots[i].tilingScaleY, 0.1f, 10.0f);
+        uniform.materialTiling[i][0] = std::clamp(m_paletteSlots[i].tilingScaleX, 0.01f, 64.0f);
+        uniform.materialTiling[i][1] = std::clamp(m_paletteSlots[i].tilingScaleY, 0.01f, 64.0f);
+        uniform.materialTiling[i][2] = m_paletteSlots[i].uvOffset[0];
+        uniform.materialTiling[i][3] = m_paletteSlots[i].uvOffset[1];
         uniform.materialTintNormal[i][0] = m_paletteSlots[i].colorTint[0];
         uniform.materialTintNormal[i][1] = m_paletteSlots[i].colorTint[1];
         uniform.materialTintNormal[i][2] = m_paletteSlots[i].colorTint[2];
         uniform.materialTintNormal[i][3] = std::clamp(m_paletteSlots[i].normalStrength, 0.0f, 3.0f);
-        uniform.materialPbr[i][0] = std::clamp(m_paletteSlots[i].aoStrength, 0.0f, 2.0f);
+        uniform.materialPbr[i][0] = std::clamp(m_paletteSlots[i].aoStrength, 0.0f, 1.0f);
         uniform.materialPbr[i][1] = std::clamp(m_paletteSlots[i].roughnessStrength, 0.0f, 2.0f);
-        uniform.materialPbr[i][2] = std::clamp(m_paletteSlots[i].metallicStrength, 0.0f, 2.0f);
-        uniform.materialPbr[i][3] = 0.0f;
+        uniform.materialPbr[i][2] = std::clamp(m_paletteSlots[i].metallicStrength, 0.0f, 1.0f);
+        uniform.materialPbr[i][3] = m_paletteSlots[i].uvRotationDegrees * 3.1415926535f / 180.0f;
     }
     uniform.cameraPos[0] = camera.eye.x;
     uniform.cameraPos[1] = camera.eye.y;
@@ -7081,6 +7206,11 @@ void TerrainRenderer::UpdateUniform(uint32_t frameIndex, const WorldCamera& came
     VK_CHECK(vkMapMemory(m_device, m_uniformBuffers[frameIndex].memory, 0, sizeof(uniform), 0, &mapped));
     std::memcpy(mapped, &uniform, sizeof(uniform));
     vkUnmapMemory(m_device, m_uniformBuffers[frameIndex].memory);
+    if (m_materialParamsDirty)
+    {
+        Tracen("[TMAT] params buffer updated (live, no reload, no remesh)");
+        m_materialParamsDirty = false;
+    }
 }
 
 TerrainRenderer::WaterUniformBlock TerrainRenderer::BuildWaterUniform(const WorldCamera& camera,

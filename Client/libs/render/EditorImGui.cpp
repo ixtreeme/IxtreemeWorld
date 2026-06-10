@@ -3844,17 +3844,24 @@ void EditorImGui::RenderCreateTerrainModal()
         ImGui::InputFloat("Depth (m)", &m_createTerrainDepthMeters, 10.0f, 100.0f, "%.1f");
         ImGui::SetNextItemWidth(180.0f);
         ImGui::InputFloat("Cell size (m/cell)", &m_createTerrainCellSizeMeters, 0.25f, 1.0f, "%.2f");
+        ImGui::SetNextItemWidth(180.0f);
+        ImGui::InputInt("Chunk size (cells/chunk)", &m_createTerrainChunkSizeCells, 16, 32);
 
         m_createTerrainWidthMeters = std::max(1.0f, m_createTerrainWidthMeters);
         m_createTerrainDepthMeters = std::max(1.0f, m_createTerrainDepthMeters);
         m_createTerrainCellSizeMeters = std::max(0.01f, m_createTerrainCellSizeMeters);
+        m_createTerrainChunkSizeCells = std::clamp(m_createTerrainChunkSizeCells, 32, 256);
         const std::uint32_t cellsX = std::max(1u,
             static_cast<std::uint32_t>(std::lround(m_createTerrainWidthMeters / m_createTerrainCellSizeMeters)));
         const std::uint32_t cellsZ = std::max(1u,
             static_cast<std::uint32_t>(std::lround(m_createTerrainDepthMeters / m_createTerrainCellSizeMeters)));
+        const std::uint32_t chunkSize = static_cast<std::uint32_t>(m_createTerrainChunkSizeCells);
+        const std::uint32_t chunksX = (cellsX + chunkSize - 1u) / chunkSize;
+        const std::uint32_t chunksZ = (cellsZ + chunkSize - 1u) / chunkSize;
         const std::uint64_t vertexCount =
             static_cast<std::uint64_t>(cellsX + 1u) * static_cast<std::uint64_t>(cellsZ + 1u);
         ImGui::Text("Cells: %u x %u", cellsX, cellsZ);
+        ImGui::Text("Chunk grid: %u x %u", chunksX, chunksZ);
         ImGui::Text("Vertices: %llu", static_cast<unsigned long long>(vertexCount));
         if (vertexCount > 4000000ull)
             ImGui::TextColored(ImVec4(0.95f, 0.58f, 0.22f, 1.0f), "Large terrain: this may be heavy to edit/render.");
@@ -3868,6 +3875,7 @@ void EditorImGui::RenderCreateTerrainModal()
             terrain.cellSizeMeters = m_createTerrainCellSizeMeters;
             terrain.cellsX = cellsX;
             terrain.cellsZ = cellsZ;
+            terrain.chunkSizeCells = chunkSize;
             terrain.widthMeters = static_cast<float>(cellsX) * terrain.cellSizeMeters;
             terrain.depthMeters = static_cast<float>(cellsZ) * terrain.cellSizeMeters;
             m_commands.createTerrain = true;
@@ -4039,6 +4047,48 @@ void EditorImGui::RenderSplatPaintToolPanel()
         ImGui::SliderFloat("Radius", &m_editorSettings.brushRadiusMeters, 1.0f, 100.0f, "%.1f m");
         ImGui::SliderFloat("Strength", &m_editorSettings.brushStrength, 0.1f, 1.0f, "%.2f");
         ImGui::SliderFloat("Falloff", &m_editorSettings.brushFalloff, 0.0f, 1.0f, "%.2f");
+
+        ImGui::Separator();
+        UI::SectionHeader(ICON_FA_PALETTE " Terrain Material");
+        const std::uint32_t selectedSlot = std::min<std::uint32_t>(m_editorSettings.textureSlot, 7u);
+        MapEditorPaletteSlot& materialSlot = m_paletteSlots[selectedSlot];
+        ImGui::Text("Layer %u: %s",
+            selectedSlot,
+            materialSlot.displayName.empty() ? "empty" : materialSlot.displayName.c_str());
+
+        auto commitMaterialParams = [&]() {
+            materialSlot.slot = selectedSlot;
+            materialSlot.tilingScaleX = std::clamp(materialSlot.tilingScaleX, 0.01f, 64.0f);
+            materialSlot.tilingScaleY = std::clamp(materialSlot.tilingScaleY, 0.01f, 64.0f);
+            materialSlot.normalStrength = std::clamp(materialSlot.normalStrength, 0.0f, 4.0f);
+            materialSlot.roughnessStrength = std::clamp(materialSlot.roughnessStrength, 0.0f, 4.0f);
+            m_commands.paletteSlotParamsChanged = true;
+            m_commands.paletteSlot = selectedSlot;
+            m_commands.paletteSlotData = materialSlot;
+            SceneManager::Instance().MarkDirty();
+        };
+
+        float tiling = (materialSlot.tilingScaleX + materialSlot.tilingScaleY) * 0.5f;
+        if (ImGui::SliderFloat("Tiling", &tiling, 0.05f, 32.0f, "%.2f"))
+        {
+            materialSlot.tilingScaleX = tiling;
+            materialSlot.tilingScaleY = tiling;
+            commitMaterialParams();
+        }
+        if (ImGui::ColorEdit3("Tint", materialSlot.colorTint))
+            commitMaterialParams();
+        if (ImGui::SliderFloat("Normal Strength", &materialSlot.normalStrength, 0.0f, 3.0f, "%.2f"))
+            commitMaterialParams();
+        if (ImGui::SliderFloat("Roughness", &materialSlot.roughnessStrength, 0.0f, 2.0f, "%.2f"))
+            commitMaterialParams();
+        if (ImGui::SliderFloat("Metallic", &materialSlot.metallicStrength, 0.0f, 1.0f, "%.2f"))
+            commitMaterialParams();
+        if (ImGui::SliderFloat("AO Strength", &materialSlot.aoStrength, 0.0f, 1.0f, "%.2f"))
+            commitMaterialParams();
+        if (ImGui::SliderFloat2("UV Offset", materialSlot.uvOffset, -10.0f, 10.0f, "%.3f"))
+            commitMaterialParams();
+        if (ImGui::SliderFloat("UV Rotation", &materialSlot.uvRotationDegrees, -180.0f, 180.0f, "%.1f deg"))
+            commitMaterialParams();
     }
     ImGui::End();
 }

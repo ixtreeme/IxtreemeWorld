@@ -22,6 +22,18 @@ struct Manifest {
     std::uint32_t zone_grid_y = 0;
     std::uint32_t zone_size_cells = 0;
     std::vector<std::string> texture_palette_paths;
+    std::vector<float> texture_palette_tiling_x;
+    std::vector<float> texture_palette_tiling_y;
+    std::vector<float> texture_palette_normal_strength;
+    std::vector<float> texture_palette_roughness_strength;
+    std::vector<float> texture_palette_tint_r;
+    std::vector<float> texture_palette_tint_g;
+    std::vector<float> texture_palette_tint_b;
+    std::vector<float> texture_palette_metallic_strength;
+    std::vector<float> texture_palette_ao_strength;
+    std::vector<float> texture_palette_uv_offset_x;
+    std::vector<float> texture_palette_uv_offset_y;
+    std::vector<float> texture_palette_uv_rotation_degrees;
 };
 
 struct HeightField {

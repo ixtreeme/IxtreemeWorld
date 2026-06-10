@@ -623,6 +623,102 @@ bool RunAssetTests(const Options& options, TestContext& ctx)
             scenes.GetCurrentScene().meshEntities[0].position[2] == 6.0f,
         "scene entity round-trip", "water/light/mesh scene entities did not survive save/load");
 
+    scenes.NewScene();
+    scenes.SetSceneName("ChunkedTerrain");
+    SceneData terrainScene = scenes.GetCurrentScene();
+    terrainScene.terrain.exists = true;
+    terrainScene.terrain.name = "Terrain";
+    terrainScene.terrain.widthMeters = 33.0f;
+    terrainScene.terrain.depthMeters = 17.0f;
+    terrainScene.terrain.cellSizeMeters = 1.0f;
+    terrainScene.terrain.cellsX = 33;
+    terrainScene.terrain.cellsZ = 17;
+    terrainScene.terrain.chunkSizeCells = 32;
+    terrainScene.terrain.heightCmGrid.resize(static_cast<std::size_t>(terrainScene.terrain.cellsX + 1u) *
+        (terrainScene.terrain.cellsZ + 1u), 0.0f);
+    terrainScene.terrain.heightCmGrid[static_cast<std::size_t>(16) * (terrainScene.terrain.cellsX + 1u) + 32u] = 123.0f;
+    terrainScene.terrain.splatABytes.assign(static_cast<std::size_t>(terrainScene.terrain.cellsX) *
+        terrainScene.terrain.cellsZ * 4u, 0);
+    terrainScene.terrain.splatBBytes.assign(terrainScene.terrain.splatABytes.size(), 0);
+    for (std::size_t i = 0; i < terrainScene.terrain.splatABytes.size(); i += 4u)
+        terrainScene.terrain.splatABytes[i] = 255;
+    terrainScene.terrain.splatABytes[0] = 0;
+    terrainScene.terrain.splatABytes[1] = 255;
+    terrainScene.paletteSlots[2].slot = 2;
+    terrainScene.paletteSlots[2].displayName = "Live Grass";
+    terrainScene.paletteSlots[2].texturePath = "Assets/Textures/live_grass.png";
+    terrainScene.paletteSlots[2].tilingScaleX = 3.5f;
+    terrainScene.paletteSlots[2].tilingScaleY = 3.5f;
+    terrainScene.paletteSlots[2].colorTint[0] = 0.25f;
+    terrainScene.paletteSlots[2].colorTint[1] = 0.75f;
+    terrainScene.paletteSlots[2].colorTint[2] = 0.50f;
+    terrainScene.paletteSlots[2].normalStrength = 1.7f;
+    terrainScene.paletteSlots[2].roughnessStrength = 0.42f;
+    terrainScene.paletteSlots[2].metallicStrength = 0.65f;
+    terrainScene.paletteSlots[2].aoStrength = 0.35f;
+    terrainScene.paletteSlots[2].uvOffset[0] = 0.125f;
+    terrainScene.paletteSlots[2].uvOffset[1] = -0.25f;
+    terrainScene.paletteSlots[2].uvRotationDegrees = 37.0f;
+    scenes.SetCurrentSceneSnapshot(terrainScene);
+    const std::filesystem::path terrainScenePath = projects.ScenesPath() / "ChunkedTerrain" / "ChunkedTerrain.scene";
+    if (!ctx.Expect(scenes.SaveSceneAs(terrainScenePath.string()),
+            "terrain chunk scene save", "SaveSceneAs failed for chunked terrain"))
+        return false;
+    const std::filesystem::path terrainMapDir = terrainScenePath.parent_path() / "ChunkedTerrain_terrain_map";
+    ctx.Expect(std::filesystem::exists(terrainMapDir / "map.manifest") &&
+            std::filesystem::exists(terrainMapDir / "chunks" / "chunk_0_0.mxchunk") &&
+            std::filesystem::exists(terrainMapDir / "chunks" / "chunk_1_1.mxchunk"),
+        "terrain chunk sidecars written", "terrain save did not write map.manifest and expected .mxchunk files");
+    const auto readManifestBytes = [&](std::string_view assetPath) -> std::optional<std::vector<std::uint8_t>> {
+        const std::filesystem::path diskPath = terrainMapDir / std::filesystem::path(assetPath);
+        std::ifstream file(diskPath, std::ios::binary);
+        if (!file)
+            return std::nullopt;
+        return std::vector<std::uint8_t>{std::istreambuf_iterator<char>(file), std::istreambuf_iterator<char>()};
+    };
+    const auto savedManifest = mx::map::LoadManifest(readManifestBytes, ".");
+    ctx.Expect(savedManifest &&
+            savedManifest->texture_palette_paths.size() > 2 &&
+            savedManifest->texture_palette_paths[2] == "Assets/Textures/live_grass.png" &&
+            savedManifest->texture_palette_tiling_x.size() > 2 &&
+            std::abs(savedManifest->texture_palette_tiling_x[2] - 3.5f) < 0.01f &&
+            std::abs(savedManifest->texture_palette_normal_strength[2] - 1.7f) < 0.01f &&
+            std::abs(savedManifest->texture_palette_roughness_strength[2] - 0.42f) < 0.01f &&
+            std::abs(savedManifest->texture_palette_tint_r[2] - 0.25f) < 0.01f &&
+            std::abs(savedManifest->texture_palette_tint_g[2] - 0.75f) < 0.01f &&
+            std::abs(savedManifest->texture_palette_tint_b[2] - 0.50f) < 0.01f &&
+            std::abs(savedManifest->texture_palette_metallic_strength[2] - 0.65f) < 0.01f &&
+            std::abs(savedManifest->texture_palette_ao_strength[2] - 0.35f) < 0.01f &&
+            std::abs(savedManifest->texture_palette_uv_offset_x[2] - 0.125f) < 0.01f &&
+            std::abs(savedManifest->texture_palette_uv_offset_y[2] + 0.25f) < 0.01f &&
+            std::abs(savedManifest->texture_palette_uv_rotation_degrees[2] - 37.0f) < 0.01f,
+        "terrain material params manifest save", "map.manifest did not persist per-layer terrain material params");
+    scenes.CloseScene();
+    if (!ctx.Expect(scenes.LoadScene(terrainScenePath.string()),
+            "terrain chunk scene load", "LoadScene failed for chunked terrain"))
+        return false;
+    const TerrainSceneData& loadedTerrain = scenes.GetCurrentScene().terrain;
+    const std::size_t loadedHeightIndex = static_cast<std::size_t>(16) * (loadedTerrain.cellsX + 1u) + 32u;
+    ctx.Expect(loadedTerrain.exists &&
+            loadedTerrain.cellsX == 33 &&
+            loadedTerrain.cellsZ == 17 &&
+            loadedTerrain.chunkSizeCells == 32 &&
+            loadedTerrain.chunkManifestRef == "ChunkedTerrain_terrain_map/map.manifest" &&
+            loadedHeightIndex < loadedTerrain.heightCmGrid.size() &&
+            std::abs(loadedTerrain.heightCmGrid[loadedHeightIndex] - 123.0f) < 0.5f &&
+            loadedTerrain.splatABytes.size() == static_cast<std::size_t>(33) * 17u * 4u &&
+            loadedTerrain.splatABytes[1] == 255 &&
+            std::abs(scenes.GetCurrentScene().paletteSlots[2].tilingScaleX - 3.5f) < 0.01f &&
+            std::abs(scenes.GetCurrentScene().paletteSlots[2].normalStrength - 1.7f) < 0.01f &&
+            std::abs(scenes.GetCurrentScene().paletteSlots[2].roughnessStrength - 0.42f) < 0.01f &&
+            std::abs(scenes.GetCurrentScene().paletteSlots[2].colorTint[1] - 0.75f) < 0.01f &&
+            std::abs(scenes.GetCurrentScene().paletteSlots[2].metallicStrength - 0.65f) < 0.01f &&
+            std::abs(scenes.GetCurrentScene().paletteSlots[2].aoStrength - 0.35f) < 0.01f &&
+            std::abs(scenes.GetCurrentScene().paletteSlots[2].uvOffset[0] - 0.125f) < 0.01f &&
+            std::abs(scenes.GetCurrentScene().paletteSlots[2].uvOffset[1] + 0.25f) < 0.01f &&
+            std::abs(scenes.GetCurrentScene().paletteSlots[2].uvRotationDegrees - 37.0f) < 0.01f,
+        "terrain chunk round-trip", "chunked terrain dimensions, manifest, height, or splat data did not round-trip");
+
     RunMapDataBaselineTest(ctx);
 
     std::cout << "[INFO] asset scratch kept at: " << scratch.generic_string() << "\n";
@@ -1151,11 +1247,12 @@ bool RunRenderChecks(const Options& options, TestContext& ctx)
             sceneManagerSource.find("\\\"terrain\\\"") != std::string::npos &&
             sceneManagerSource.find("\\\"width_m\\\"") != std::string::npos &&
             sceneManagerSource.find("\\\"cell_size_m\\\"") != std::string::npos &&
+            sceneManagerSource.find("\\\"chunk_size_cells\\\"") != std::string::npos &&
+            sceneManagerSource.find("\\\"chunk_manifest_ref\\\"") != std::string::npos &&
             sceneManagerSource.find("\\\"shape_mask_ref\\\"") != std::string::npos &&
-            sceneManagerSource.find(".heightmap") != std::string::npos &&
-            sceneManagerSource.find(".splat") != std::string::npos &&
-            sceneManagerSource.find(".mask") != std::string::npos,
-        "scene json sidecar format", "SCENE-1/TERRAIN-CREATE-1 must save readable .scene JSON and optional terrain/water sidecar files");
+            sceneManagerSource.find("map.manifest") != std::string::npos &&
+            sceneManagerSource.find(".mxchunk") != std::string::npos,
+        "scene json chunk terrain format", "TERRAIN-CHUNK-1 must save readable .scene JSON and terrain through map.manifest/.mxchunk sidecar files");
     ctx.Expect(editorImGuiSource.find("RenderMenuBar") != std::string::npos &&
             editorImGuiSource.find("BeginMainMenuBar") != std::string::npos &&
             editorImGuiSource.find("New Scene") != std::string::npos &&

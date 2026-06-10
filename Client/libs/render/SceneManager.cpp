@@ -2,12 +2,18 @@
 
 #include "Debug.h"
 #include "ProjectManager.h"
+#include "map/MapData.h"
+#include "schema/map_manifest.capnp.h"
+
+#include <capnp/message.h>
+#include <capnp/serialize.h>
 
 #include <algorithm>
 #include <chrono>
 #include <cctype>
 #include <cstdlib>
 #include <cstring>
+#include <cmath>
 #include <fstream>
 #include <iomanip>
 #include <map>
@@ -364,6 +370,306 @@ std::vector<std::uint8_t> ReadBytes(const std::filesystem::path& path)
     return {std::istreambuf_iterator<char>(file), std::istreambuf_iterator<char>()};
 }
 
+void PushU16(std::vector<std::uint8_t>& bytes, std::uint16_t value)
+{
+    bytes.push_back(static_cast<std::uint8_t>(value & 0xffu));
+    bytes.push_back(static_cast<std::uint8_t>((value >> 8) & 0xffu));
+}
+
+void PushU32(std::vector<std::uint8_t>& bytes, std::uint32_t value)
+{
+    bytes.push_back(static_cast<std::uint8_t>(value & 0xffu));
+    bytes.push_back(static_cast<std::uint8_t>((value >> 8) & 0xffu));
+    bytes.push_back(static_cast<std::uint8_t>((value >> 16) & 0xffu));
+    bytes.push_back(static_cast<std::uint8_t>((value >> 24) & 0xffu));
+}
+
+void PushI16(std::vector<std::uint8_t>& bytes, std::int16_t value)
+{
+    PushU16(bytes, static_cast<std::uint16_t>(value));
+}
+
+std::vector<std::uint8_t> BuildMxChunkBytes(const TerrainSceneData& terrain,
+                                            std::uint32_t chunkX,
+                                            std::uint32_t chunkY,
+                                            std::uint32_t worldCells,
+                                            std::uint32_t chunkSize)
+{
+    struct Section
+    {
+        std::uint16_t type = 0;
+        std::vector<std::uint8_t> bytes;
+    };
+
+    const std::uint32_t chunkVertices = chunkSize + 1u;
+    std::vector<Section> sections;
+    Section height;
+    height.type = 1;
+    height.bytes.reserve(static_cast<size_t>(chunkVertices) * chunkVertices * sizeof(std::int16_t));
+    for (std::uint32_t y = 0; y < chunkVertices; ++y)
+    {
+        for (std::uint32_t x = 0; x < chunkVertices; ++x)
+        {
+            const std::uint32_t gx = chunkX * chunkSize + x;
+            const std::uint32_t gy = chunkY * chunkSize + y;
+            float h = 0.0f;
+            if (gx <= terrain.cellsX && gy <= terrain.cellsZ &&
+                !terrain.heightCmGrid.empty())
+            {
+                const size_t src = static_cast<size_t>(gy) * (terrain.cellsX + 1u) + gx;
+                if (src < terrain.heightCmGrid.size())
+                    h = terrain.heightCmGrid[src];
+            }
+            PushI16(height.bytes, static_cast<std::int16_t>(std::lround(std::clamp(h, -32768.0f, 32767.0f))));
+        }
+    }
+    sections.push_back(std::move(height));
+
+    auto buildSplatSection = [&](std::uint16_t type, const std::vector<std::uint8_t>& source) {
+        Section splat;
+        splat.type = type;
+        PushU16(splat.bytes, static_cast<std::uint16_t>(chunkSize));
+        PushU16(splat.bytes, static_cast<std::uint16_t>(chunkSize));
+        splat.bytes.resize(4u + static_cast<size_t>(chunkSize) * chunkSize * 4u, 0);
+        for (std::uint32_t y = 0; y < chunkSize; ++y)
+        {
+            for (std::uint32_t x = 0; x < chunkSize; ++x)
+            {
+                const std::uint32_t sx = chunkX * chunkSize + x;
+                const std::uint32_t sy = chunkY * chunkSize + y;
+                const size_t dst = 4u + (static_cast<size_t>(y) * chunkSize + x) * 4u;
+                if (sx < terrain.cellsX && sy < terrain.cellsZ && !source.empty())
+                {
+                    const size_t src = (static_cast<size_t>(sy) * terrain.cellsX + sx) * 4u;
+                    if (src + 4u <= source.size())
+                    {
+                        std::memcpy(splat.bytes.data() + dst, source.data() + src, 4u);
+                        continue;
+                    }
+                }
+                if (type == 2)
+                    splat.bytes[dst + 0] = 255;
+            }
+        }
+        sections.push_back(std::move(splat));
+    };
+    buildSplatSection(2, terrain.splatABytes);
+
+    Section attributes;
+    attributes.type = 3;
+    attributes.bytes.assign(static_cast<size_t>(chunkSize) * chunkSize * sizeof(std::uint16_t), 0);
+    sections.push_back(std::move(attributes));
+    buildSplatSection(4, terrain.splatBBytes);
+
+    constexpr std::size_t kHeaderSize = 14;
+    constexpr std::size_t kTocEntrySize = 12;
+    std::vector<std::uint8_t> bytes;
+    PushU32(bytes, 0x3143584d); // MXC1
+    PushU16(bytes, 2);
+    PushU16(bytes, static_cast<std::uint16_t>(chunkX));
+    PushU16(bytes, static_cast<std::uint16_t>(chunkY));
+    PushU16(bytes, static_cast<std::uint16_t>(chunkSize));
+    PushU16(bytes, static_cast<std::uint16_t>(sections.size()));
+
+    std::uint32_t offset = static_cast<std::uint32_t>(kHeaderSize + sections.size() * kTocEntrySize);
+    for (const Section& section : sections)
+    {
+        PushU16(bytes, section.type);
+        PushU16(bytes, 0);
+        PushU32(bytes, offset);
+        PushU32(bytes, static_cast<std::uint32_t>(section.bytes.size()));
+        offset += static_cast<std::uint32_t>(section.bytes.size());
+    }
+    for (const Section& section : sections)
+        bytes.insert(bytes.end(), section.bytes.begin(), section.bytes.end());
+    (void)worldCells;
+    return bytes;
+}
+
+std::vector<std::uint8_t> BuildTerrainManifestBytes(const TerrainSceneData& terrain,
+                                                    const std::array<MapEditorPaletteSlot, 8>& paletteSlots,
+                                                    std::uint32_t worldCells,
+                                                    std::uint32_t chunkSize,
+                                                    std::uint32_t chunksX,
+                                                    std::uint32_t chunksY)
+{
+    capnp::MallocMessageBuilder builder;
+    auto manifest = builder.initRoot<mx::map::schema::MapManifest>();
+    manifest.setFormatVersion(2);
+    manifest.setWorldId("scene-terrain");
+    manifest.setWorldName(terrain.name.empty() ? "Terrain" : terrain.name);
+    manifest.setWorldSizeCells(worldCells);
+    manifest.setCellSizeMeters(terrain.cellSizeMeters);
+    manifest.setHeightUnit(mx::map::schema::HeightUnit::CENTIMETERS);
+    manifest.setChunkSizeCells(chunkSize);
+    auto grid = manifest.initZoneGridDims();
+    grid.setX(chunksX);
+    grid.setY(chunksY);
+    manifest.setZoneSizeCells(chunkSize);
+    auto palette = manifest.initTexturePalette(8);
+    for (std::uint16_t i = 0; i < 8; ++i)
+    {
+        palette[i].setId(i);
+        const MapEditorPaletteSlot& slot = paletteSlots[i];
+        palette[i].setPath(slot.texturePath);
+        palette[i].setTilingX(std::clamp(slot.tilingScaleX, 0.01f, 64.0f));
+        palette[i].setTilingY(std::clamp(slot.tilingScaleY, 0.01f, 64.0f));
+        palette[i].setNormalStrength(std::clamp(slot.normalStrength, 0.0f, 4.0f));
+        palette[i].setRoughnessStrength(std::clamp(slot.roughnessStrength, 0.0f, 4.0f));
+        palette[i].setTintR(std::clamp(slot.colorTint[0], 0.0f, 8.0f));
+        palette[i].setTintG(std::clamp(slot.colorTint[1], 0.0f, 8.0f));
+        palette[i].setTintB(std::clamp(slot.colorTint[2], 0.0f, 8.0f));
+        palette[i].setMetallicStrength(std::clamp(slot.metallicStrength, 0.0f, 1.0f));
+        palette[i].setAoStrength(std::clamp(slot.aoStrength, 0.0f, 1.0f));
+        palette[i].setUvOffsetX(slot.uvOffset[0]);
+        palette[i].setUvOffsetY(slot.uvOffset[1]);
+        palette[i].setUvRotationDegrees(slot.uvRotationDegrees);
+    }
+    kj::Array<capnp::word> words = capnp::messageToFlatArray(builder);
+    const auto bytes = words.asBytes();
+    return {bytes.begin(), bytes.end()};
+}
+
+bool WriteTerrainChunkSet(const std::filesystem::path& scenePath,
+                          TerrainSceneData& terrain,
+                          const std::array<MapEditorPaletteSlot, 8>& paletteSlots)
+{
+    terrain.chunkSizeCells = std::clamp(terrain.chunkSizeCells == 0 ? 64u : terrain.chunkSizeCells, 32u, 256u);
+    const std::uint32_t worldCells = std::max(terrain.cellsX, terrain.cellsZ);
+    const std::uint32_t chunkSize = terrain.chunkSizeCells;
+    const std::uint32_t chunksX = (worldCells + chunkSize - 1u) / chunkSize;
+    const std::uint32_t chunksY = chunksX;
+    const std::filesystem::path mapDir = scenePath.stem().string() + "_terrain_map";
+    const std::filesystem::path absoluteMapDir = scenePath.parent_path() / mapDir;
+    std::filesystem::create_directories(absoluteMapDir / "chunks");
+
+    const std::vector<std::uint8_t> manifest = BuildTerrainManifestBytes(terrain, paletteSlots, worldCells, chunkSize, chunksX, chunksY);
+    if (!WriteBytes(absoluteMapDir / "map.manifest", manifest))
+        return false;
+
+    std::uint32_t written = 0;
+    for (std::uint32_t cy = 0; cy < chunksY; ++cy)
+    {
+        for (std::uint32_t cx = 0; cx < chunksX; ++cx)
+        {
+            const std::filesystem::path chunkPath = absoluteMapDir / "chunks" /
+                ("chunk_" + std::to_string(cx) + "_" + std::to_string(cy) + ".mxchunk");
+            if (!WriteBytes(chunkPath, BuildMxChunkBytes(terrain, cx, cy, worldCells, chunkSize)))
+                return false;
+            ++written;
+        }
+    }
+
+    terrain.chunkManifestRef = GenericPath(mapDir / "map.manifest");
+    terrain.heightmapRef.clear();
+    terrain.splatRef.clear();
+    terrain.maskRef.clear();
+    Tracenf("[TCHUNK] save chunks=%u manifest=%s",
+        written,
+        terrain.chunkManifestRef.c_str());
+    Tracen("[TMAT] saved per-layer params: layers=8");
+    return true;
+}
+
+bool ReadTerrainChunkSet(const std::filesystem::path& sceneDir,
+                         TerrainSceneData& terrain,
+                         std::array<MapEditorPaletteSlot, 8>* outPaletteSlots)
+{
+    if (terrain.chunkManifestRef.empty())
+        return false;
+    const std::uint32_t sceneCellsX = terrain.cellsX;
+    const std::uint32_t sceneCellsZ = terrain.cellsZ;
+    const std::filesystem::path manifestPath = sceneDir / terrain.chunkManifestRef;
+    const std::filesystem::path mapRoot = manifestPath.parent_path();
+    const auto read = [&](std::string_view path) -> std::optional<std::vector<std::uint8_t>> {
+        std::filesystem::path p(path);
+        if (!p.is_absolute())
+            p = sceneDir / p;
+        std::vector<std::uint8_t> bytes = ReadBytes(p);
+        if (bytes.empty())
+            return std::nullopt;
+        return bytes;
+    };
+    const std::filesystem::path relativeRoot = std::filesystem::relative(mapRoot, sceneDir);
+    const std::string mapRootString = relativeRoot.generic_string();
+    auto field = mx::map::LoadHeightField(read, mapRootString);
+    if (!field)
+        return false;
+    terrain.exists = true;
+    terrain.cellsX = sceneCellsX == 0 ? field->manifest.world_size_cells : std::min(sceneCellsX, field->manifest.world_size_cells);
+    terrain.cellsZ = sceneCellsZ == 0 ? field->manifest.world_size_cells : std::min(sceneCellsZ, field->manifest.world_size_cells);
+    terrain.cellSizeMeters = field->manifest.cell_size_meters;
+    terrain.widthMeters = static_cast<float>(terrain.cellsX) * terrain.cellSizeMeters;
+    terrain.depthMeters = static_cast<float>(terrain.cellsZ) * terrain.cellSizeMeters;
+    terrain.chunkSizeCells = field->manifest.chunk_size_cells;
+    terrain.heightCmGrid.clear();
+    terrain.heightCmGrid.reserve(static_cast<size_t>(terrain.cellsX + 1u) * (terrain.cellsZ + 1u));
+    for (std::uint32_t y = 0; y <= terrain.cellsZ; ++y)
+    {
+        for (std::uint32_t x = 0; x <= terrain.cellsX; ++x)
+        {
+            const size_t src = static_cast<size_t>(y) * field->width_vertices + x;
+            terrain.heightCmGrid.push_back(src < field->heights_cm.size() ? static_cast<float>(field->heights_cm[src]) : 0.0f);
+        }
+    }
+    const size_t splatBytes = static_cast<size_t>(terrain.cellsX) * terrain.cellsZ * 4u;
+    terrain.splatABytes.assign(splatBytes, 0);
+    terrain.splatBBytes.assign(splatBytes, 0);
+    for (std::uint32_t y = 0; y < terrain.cellsZ; ++y)
+    {
+        for (std::uint32_t x = 0; x < terrain.cellsX; ++x)
+        {
+            const size_t dst = (static_cast<size_t>(y) * terrain.cellsX + x) * 4u;
+            const size_t src = (static_cast<size_t>(y) * field->splat_width + x) * 4u;
+            if (src + 4u <= field->splat_a_rgba8.size())
+                std::memcpy(terrain.splatABytes.data() + dst, field->splat_a_rgba8.data() + src, 4u);
+            else
+                terrain.splatABytes[dst] = 255;
+            if (src + 4u <= field->splat_b_rgba8.size())
+                std::memcpy(terrain.splatBBytes.data() + dst, field->splat_b_rgba8.data() + src, 4u);
+        }
+    }
+    Tracenf("[TCHUNK] load chunks=%u from manifest=%s",
+        field->manifest.zone_grid_x * field->manifest.zone_grid_y,
+        terrain.chunkManifestRef.c_str());
+    if (outPaletteSlots)
+    {
+        for (std::uint32_t i = 0; i < outPaletteSlots->size(); ++i)
+        {
+            MapEditorPaletteSlot& slot = (*outPaletteSlots)[i];
+            slot.slot = i;
+            if (i < field->manifest.texture_palette_paths.size())
+                slot.texturePath = field->manifest.texture_palette_paths[i];
+            if (i < field->manifest.texture_palette_tiling_x.size())
+                slot.tilingScaleX = field->manifest.texture_palette_tiling_x[i];
+            if (i < field->manifest.texture_palette_tiling_y.size())
+                slot.tilingScaleY = field->manifest.texture_palette_tiling_y[i];
+            if (i < field->manifest.texture_palette_normal_strength.size())
+                slot.normalStrength = field->manifest.texture_palette_normal_strength[i];
+            if (i < field->manifest.texture_palette_roughness_strength.size())
+                slot.roughnessStrength = field->manifest.texture_palette_roughness_strength[i];
+            if (i < field->manifest.texture_palette_tint_r.size())
+                slot.colorTint[0] = field->manifest.texture_palette_tint_r[i];
+            if (i < field->manifest.texture_palette_tint_g.size())
+                slot.colorTint[1] = field->manifest.texture_palette_tint_g[i];
+            if (i < field->manifest.texture_palette_tint_b.size())
+                slot.colorTint[2] = field->manifest.texture_palette_tint_b[i];
+            if (i < field->manifest.texture_palette_metallic_strength.size())
+                slot.metallicStrength = field->manifest.texture_palette_metallic_strength[i];
+            if (i < field->manifest.texture_palette_ao_strength.size())
+                slot.aoStrength = field->manifest.texture_palette_ao_strength[i];
+            if (i < field->manifest.texture_palette_uv_offset_x.size())
+                slot.uvOffset[0] = field->manifest.texture_palette_uv_offset_x[i];
+            if (i < field->manifest.texture_palette_uv_offset_y.size())
+                slot.uvOffset[1] = field->manifest.texture_palette_uv_offset_y[i];
+            if (i < field->manifest.texture_palette_uv_rotation_degrees.size())
+                slot.uvRotationDegrees = field->manifest.texture_palette_uv_rotation_degrees[i];
+        }
+        Tracen("[TMAT] loaded per-layer params");
+    }
+    return true;
+}
+
 bool WriteTerrainHeightmap(const std::filesystem::path& path, const TerrainSceneData& terrain)
 {
     if (!path.parent_path().empty())
@@ -574,7 +880,18 @@ void WritePaletteSlot(std::ostream& out, const MapEditorPaletteSlot& slot, bool 
     out << "      \"display_name\": \"" << EscapeJson(slot.displayName) << "\",\n";
     out << "      \"texture_path\": \"" << EscapeJson(slot.texturePath) << "\",\n";
     out << "      \"normal_texture_path\": \"" << EscapeJson(slot.normalTexturePath) << "\",\n";
-    out << "      \"tiling\": [" << slot.tilingScaleX << ", " << slot.tilingScaleY << "]\n";
+    out << "      \"ao_texture_path\": \"" << EscapeJson(slot.aoTexturePath) << "\",\n";
+    out << "      \"roughness_texture_path\": \"" << EscapeJson(slot.roughnessTexturePath) << "\",\n";
+    out << "      \"metallic_texture_path\": \"" << EscapeJson(slot.metallicTexturePath) << "\",\n";
+    out << "      \"height_texture_path\": \"" << EscapeJson(slot.heightTexturePath) << "\",\n";
+    out << "      \"tiling\": [" << slot.tilingScaleX << ", " << slot.tilingScaleY << "],\n";
+    out << "      \"tint\": [" << slot.colorTint[0] << ", " << slot.colorTint[1] << ", " << slot.colorTint[2] << "],\n";
+    out << "      \"normal_strength\": " << slot.normalStrength << ",\n";
+    out << "      \"roughness_strength\": " << slot.roughnessStrength << ",\n";
+    out << "      \"ao_strength\": " << slot.aoStrength << ",\n";
+    out << "      \"metallic_strength\": " << slot.metallicStrength << ",\n";
+    out << "      \"uv_offset\": [" << slot.uvOffset[0] << ", " << slot.uvOffset[1] << "],\n";
+    out << "      \"uv_rotation_degrees\": " << slot.uvRotationDegrees << "\n";
     out << "    }" << (comma ? "," : "") << "\n";
 }
 
@@ -586,7 +903,18 @@ MapEditorPaletteSlot ReadPaletteSlot(const JsonValue& object)
     slot.displayName = ReadString(object, "display_name");
     slot.texturePath = ReadString(object, "texture_path");
     slot.normalTexturePath = ReadString(object, "normal_texture_path");
+    slot.aoTexturePath = ReadString(object, "ao_texture_path");
+    slot.roughnessTexturePath = ReadString(object, "roughness_texture_path");
+    slot.metallicTexturePath = ReadString(object, "metallic_texture_path");
+    slot.heightTexturePath = ReadString(object, "height_texture_path");
     ReadFloatArray(object, "tiling", &slot.tilingScaleX, 2);
+    ReadFloatArray(object, "tint", slot.colorTint, 3);
+    slot.normalStrength = ReadFloat(object, "normal_strength", slot.normalStrength);
+    slot.roughnessStrength = ReadFloat(object, "roughness_strength", slot.roughnessStrength);
+    slot.aoStrength = ReadFloat(object, "ao_strength", slot.aoStrength);
+    slot.metallicStrength = ReadFloat(object, "metallic_strength", 0.0f);
+    ReadFloatArray(object, "uv_offset", slot.uvOffset, 2);
+    slot.uvRotationDegrees = ReadFloat(object, "uv_rotation_degrees", slot.uvRotationDegrees);
     return slot;
 }
 
@@ -891,6 +1219,8 @@ bool SceneManager::LoadSceneInternal(const std::string& path)
         scene.terrain.cellSizeMeters = ReadFloat(*terrain, "cell_size_m", scene.terrain.cellSizeMeters);
         scene.terrain.cellsX = ReadU32(*terrain, "cells_x", scene.terrain.cellsX);
         scene.terrain.cellsZ = ReadU32(*terrain, "cells_z", scene.terrain.cellsZ);
+        scene.terrain.chunkSizeCells = ReadU32(*terrain, "chunk_size_cells", scene.terrain.chunkSizeCells);
+        scene.terrain.chunkManifestRef = ReadString(*terrain, "chunk_manifest_ref");
         scene.terrain.heightmapRef = ReadString(*terrain, "heightmap_ref");
         scene.terrain.splatRef = ReadString(*terrain, "splat_ref");
         scene.terrain.maskRef = ReadString(*terrain, "mask_ref");
@@ -909,23 +1239,34 @@ bool SceneManager::LoadSceneInternal(const std::string& path)
     }
     if (scene.terrain.exists)
     {
-        if (!scene.terrain.heightmapRef.empty())
+        const bool loadedChunkSet = ReadTerrainChunkSet(sceneDir, scene.terrain, &scene.paletteSlots);
+        if (!loadedChunkSet && !scene.terrain.heightmapRef.empty())
             ReadTerrainHeightmap(sceneDir / scene.terrain.heightmapRef, scene.terrain);
-        if (!scene.terrain.splatRef.empty())
+        if (!loadedChunkSet && !scene.terrain.splatRef.empty())
             ReadTerrainSplat(sceneDir / scene.terrain.splatRef, scene.terrain);
+        if (!loadedChunkSet && (!scene.terrain.heightmapRef.empty() || !scene.terrain.splatRef.empty()))
+        {
+            const std::uint32_t chunkSize = std::clamp(scene.terrain.chunkSizeCells == 0 ? 64u : scene.terrain.chunkSizeCells, 32u, 256u);
+            const std::uint32_t worldCells = std::max(scene.terrain.cellsX, scene.terrain.cellsZ);
+            const std::uint32_t chunks = ((worldCells + chunkSize - 1u) / chunkSize);
+            Tracenf("[TCHUNK] legacy import -> converted chunks=%u", chunks * chunks);
+        }
         scene.terrain.cellSizeMeters = std::max(0.01f, scene.terrain.cellSizeMeters);
         scene.terrain.cellsX = std::max(1u, scene.terrain.cellsX);
         scene.terrain.cellsZ = std::max(1u, scene.terrain.cellsZ);
+        scene.terrain.chunkSizeCells = std::clamp(scene.terrain.chunkSizeCells == 0 ? 64u : scene.terrain.chunkSizeCells, 32u, 256u);
         if (scene.terrain.widthMeters <= 0.0f)
             scene.terrain.widthMeters = static_cast<float>(scene.terrain.cellsX) * scene.terrain.cellSizeMeters;
         if (scene.terrain.depthMeters <= 0.0f)
             scene.terrain.depthMeters = static_cast<float>(scene.terrain.cellsZ) * scene.terrain.cellSizeMeters;
-        Tracenf("[SCENE] terrain loaded: dims=%.2fx%.2f m cellSize=%.2f cells=%ux%u files=%s/%s/%s",
+        Tracenf("[SCENE] terrain loaded: dims=%.2fx%.2f m cellSize=%.2f cells=%ux%u chunkSize=%u manifest=%s files=%s/%s/%s",
             scene.terrain.widthMeters,
             scene.terrain.depthMeters,
             scene.terrain.cellSizeMeters,
             scene.terrain.cellsX,
             scene.terrain.cellsZ,
+            scene.terrain.chunkSizeCells,
+            scene.terrain.chunkManifestRef.c_str(),
             scene.terrain.heightmapRef.c_str(),
             scene.terrain.splatRef.c_str(),
             scene.terrain.maskRef.c_str());
@@ -1032,27 +1373,19 @@ bool SceneManager::SaveSceneInternal(const std::string& path)
         scene.name = SceneNameFromPath(path);
     if (scene.terrain.exists)
     {
-        const std::filesystem::path heightmapPath = SceneSidecarPath(scenePath, ".heightmap");
-        const std::filesystem::path splatPath = SceneSidecarPath(scenePath, ".splat");
-        const std::filesystem::path maskPath = SceneSidecarPath(scenePath, ".mask");
-        if (scene.terrain.heightmapRef.empty())
-            scene.terrain.heightmapRef = GenericPath(heightmapPath.filename());
-        if (scene.terrain.splatRef.empty())
-            scene.terrain.splatRef = GenericPath(splatPath.filename());
-        if (scene.terrain.maskRef.empty())
-            scene.terrain.maskRef = GenericPath(maskPath.filename());
-        WriteTerrainHeightmap(scenePath.parent_path() / scene.terrain.heightmapRef, scene.terrain);
-        WriteTerrainSplat(scenePath.parent_path() / scene.terrain.splatRef, scene.terrain);
-        WritePlaceholderBinary(scenePath.parent_path() / scene.terrain.maskRef, "IWMASK");
-        Tracenf("[SCENE] terrain saved: dims=%.2fx%.2f m cellSize=%.2f cells=%ux%u files=%s/%s/%s",
+        if (!WriteTerrainChunkSet(scenePath, scene.terrain, scene.paletteSlots))
+        {
+            TraceError("[SCENE] terrain chunk save failed: %s", path.c_str());
+            return false;
+        }
+        Tracenf("[SCENE] terrain saved: dims=%.2fx%.2f m cellSize=%.2f cells=%ux%u chunkSize=%u manifest=%s",
             scene.terrain.widthMeters,
             scene.terrain.depthMeters,
             scene.terrain.cellSizeMeters,
             scene.terrain.cellsX,
             scene.terrain.cellsZ,
-            scene.terrain.heightmapRef.c_str(),
-            scene.terrain.splatRef.c_str(),
-            scene.terrain.maskRef.c_str());
+            scene.terrain.chunkSizeCells,
+            scene.terrain.chunkManifestRef.c_str());
     }
     else
     {
@@ -1101,6 +1434,8 @@ bool SceneManager::SaveSceneInternal(const std::string& path)
         out << "    \"cell_size_m\": " << scene.terrain.cellSizeMeters << ",\n";
         out << "    \"cells_x\": " << scene.terrain.cellsX << ",\n";
         out << "    \"cells_z\": " << scene.terrain.cellsZ << ",\n";
+        out << "    \"chunk_size_cells\": " << scene.terrain.chunkSizeCells << ",\n";
+        out << "    \"chunk_manifest_ref\": \"" << EscapeJson(scene.terrain.chunkManifestRef) << "\",\n";
         out << "    \"heightmap_ref\": \"" << EscapeJson(scene.terrain.heightmapRef) << "\",\n";
         out << "    \"splat_ref\": \"" << EscapeJson(scene.terrain.splatRef) << "\",\n";
         out << "    \"mask_ref\": \"" << EscapeJson(scene.terrain.maskRef) << "\"\n";

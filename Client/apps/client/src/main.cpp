@@ -1110,6 +1110,12 @@ void MergeMapEditorCommands(MapEditorCommands& target, const MapEditorCommands& 
         target.paletteTexturePath = source.paletteTexturePath;
         target.paletteSlotData = source.paletteSlotData;
     }
+    if (source.paletteSlotParamsChanged)
+    {
+        target.paletteSlotParamsChanged = true;
+        target.paletteSlot = source.paletteSlot;
+        target.paletteSlotData = source.paletteSlotData;
+    }
     if (source.gizmoSettingsChanged)
     {
         target.gizmoSettingsChanged = true;
@@ -3430,6 +3436,18 @@ int RunGame(NativeWindow& window,
                     if (!terrain.ApplyPaletteSlotChange(device, commands.paletteSlotData))
                     {
                         Tracenf("[MAIN] failed to apply terrain palette slot %u", commands.paletteSlot);
+                    }
+                    else
+                    {
+                        editorImGui.SetPaletteSlots(terrain.GetPaletteSlots());
+                        SceneManager::Instance().MarkDirty();
+                    }
+                }
+                if (commands.paletteSlotParamsChanged)
+                {
+                    if (!terrain.ApplyPaletteSlotParams(commands.paletteSlotData))
+                    {
+                        Tracenf("[MAIN] failed to apply terrain material params for layer %u", commands.paletteSlot);
                     }
                     else
                     {

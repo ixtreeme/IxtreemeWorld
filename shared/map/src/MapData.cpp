@@ -352,8 +352,32 @@ std::optional<Manifest> LoadManifest(const AssetReadFn& read, std::string_view m
     manifest.zone_size_cells = root.getZoneSizeCells();
     const auto palette = root.getTexturePalette();
     manifest.texture_palette_paths.reserve(palette.size());
+    manifest.texture_palette_tiling_x.reserve(palette.size());
+    manifest.texture_palette_tiling_y.reserve(palette.size());
+    manifest.texture_palette_normal_strength.reserve(palette.size());
+    manifest.texture_palette_roughness_strength.reserve(palette.size());
+    manifest.texture_palette_tint_r.reserve(palette.size());
+    manifest.texture_palette_tint_g.reserve(palette.size());
+    manifest.texture_palette_tint_b.reserve(palette.size());
+    manifest.texture_palette_metallic_strength.reserve(palette.size());
+    manifest.texture_palette_ao_strength.reserve(palette.size());
+    manifest.texture_palette_uv_offset_x.reserve(palette.size());
+    manifest.texture_palette_uv_offset_y.reserve(palette.size());
+    manifest.texture_palette_uv_rotation_degrees.reserve(palette.size());
     for (auto entry : palette) {
         manifest.texture_palette_paths.emplace_back(entry.getPath().cStr());
+        manifest.texture_palette_tiling_x.emplace_back(entry.getTilingX());
+        manifest.texture_palette_tiling_y.emplace_back(entry.getTilingY());
+        manifest.texture_palette_normal_strength.emplace_back(entry.getNormalStrength());
+        manifest.texture_palette_roughness_strength.emplace_back(entry.getRoughnessStrength());
+        manifest.texture_palette_tint_r.emplace_back(entry.getTintR());
+        manifest.texture_palette_tint_g.emplace_back(entry.getTintG());
+        manifest.texture_palette_tint_b.emplace_back(entry.getTintB());
+        manifest.texture_palette_metallic_strength.emplace_back(entry.getMetallicStrength());
+        manifest.texture_palette_ao_strength.emplace_back(entry.getAoStrength());
+        manifest.texture_palette_uv_offset_x.emplace_back(entry.getUvOffsetX());
+        manifest.texture_palette_uv_offset_y.emplace_back(entry.getUvOffsetY());
+        manifest.texture_palette_uv_rotation_degrees.emplace_back(entry.getUvRotationDegrees());
     }
     return manifest;
 }
