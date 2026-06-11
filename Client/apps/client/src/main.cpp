@@ -17,6 +17,7 @@
 #include "RuntimeSession.h"
 #include "RuntimeUiAdapter.h"
 #include "SceneManager.h"
+#include "SpatialIndex.h"
 #include "StaticMeshRenderer.h"
 #include "TerrainRenderer.h"
 #include "VulkanDevice.h"
@@ -52,6 +53,7 @@
 #include <thread>
 #include <type_traits>
 #include <unordered_map>
+#include <unordered_set>
 #include <utility>
 #include <vector>
 
@@ -211,6 +213,45 @@ std::array<WorldVec3, 8> BuildStaticMeshWorldAabbCorners(const MeshSceneEntity& 
         }
     }
     return corners;
+}
+
+SpatialIndex::Aabb StaticMeshWorldAabb(const MeshSceneEntity& mesh, const StaticMeshRenderer& renderer)
+{
+    const auto corners = BuildStaticMeshWorldAabbCorners(mesh, renderer);
+    SpatialIndex::Aabb bounds{};
+    bounds.min = {std::numeric_limits<float>::max(), std::numeric_limits<float>::max(), std::numeric_limits<float>::max()};
+    bounds.max = {std::numeric_limits<float>::lowest(), std::numeric_limits<float>::lowest(), std::numeric_limits<float>::lowest()};
+    for (const WorldVec3& corner : corners)
+    {
+        bounds.min.x = std::min(bounds.min.x, corner.x);
+        bounds.min.y = std::min(bounds.min.y, corner.y);
+        bounds.min.z = std::min(bounds.min.z, corner.z);
+        bounds.max.x = std::max(bounds.max.x, corner.x);
+        bounds.max.y = std::max(bounds.max.y, corner.y);
+        bounds.max.z = std::max(bounds.max.z, corner.z);
+    }
+    return bounds;
+}
+
+std::array<WorldVec3, 8> SpatialAabbCorners(const SpatialIndex::Aabb& bounds)
+{
+    return {{
+        {bounds.min.x, bounds.min.y, bounds.min.z},
+        {bounds.max.x, bounds.min.y, bounds.min.z},
+        {bounds.min.x, bounds.max.y, bounds.min.z},
+        {bounds.max.x, bounds.max.y, bounds.min.z},
+        {bounds.min.x, bounds.min.y, bounds.max.z},
+        {bounds.max.x, bounds.min.y, bounds.max.z},
+        {bounds.min.x, bounds.max.y, bounds.max.z},
+        {bounds.max.x, bounds.max.y, bounds.max.z},
+    }};
+}
+
+SpatialIndex::Frustum SpatialFrustumFromCamera(const WorldCamera& camera)
+{
+    SpatialIndex::Frustum frustum{};
+    std::copy(std::begin(camera.viewProjection.m), std::end(camera.viewProjection.m), std::begin(frustum.viewProjection));
+    return frustum;
 }
 
 bool WorldAabbOutsideCameraFrustum(const WorldCamera& camera, const std::array<WorldVec3, 8>& corners)
@@ -1586,6 +1627,9 @@ int RunGame(NativeWindow& window,
     std::vector<PointLight> editorPointLights;
     std::vector<SpotLight> editorSpotLights;
     std::vector<MeshSceneEntity> editorMeshEntities;
+    std::unordered_map<std::uint32_t, std::size_t> editorMeshEntityLookup;
+    SpatialIndex staticMeshSpatialIndex;
+    std::unordered_set<std::uint32_t> staticMeshSpatialIndexed;
     std::vector<WaterBody> editorWaterBodies = terrainOk ? terrain.GetWaterBodies() : std::vector<WaterBody>{};
     bool editorWaterBodiesDirty = false;
 #if defined(IXTREEME_WITH_EDITOR)
@@ -1636,6 +1680,70 @@ int RunGame(NativeWindow& window,
     int editorObjectDragLastX = 0;
     int editorObjectDragLastY = 0;
 #if defined(IXTREEME_WITH_EDITOR)
+    auto rebuildMeshEntityLookup = [&]() {
+        editorMeshEntityLookup.clear();
+        for (std::size_t i = 0; i < editorMeshEntities.size(); ++i)
+            editorMeshEntityLookup[editorMeshEntities[i].id] = i;
+    };
+    auto findMeshEntityById = [&](std::uint32_t id) -> MeshSceneEntity* {
+        auto lookupIt = editorMeshEntityLookup.find(id);
+        if (lookupIt == editorMeshEntityLookup.end() || lookupIt->second >= editorMeshEntities.size())
+            return nullptr;
+        MeshSceneEntity& mesh = editorMeshEntities[lookupIt->second];
+        return mesh.id == id ? &mesh : nullptr;
+    };
+    auto syncStaticMeshSpatialEntity = [&](const MeshSceneEntity& mesh) {
+        const std::string runtimePath = resolveMeshRuntimePath(mesh);
+        StaticMeshRenderer* renderer = getStaticMeshRenderer(runtimePath);
+        if (!renderer || !renderer->IsLoaded())
+        {
+            if (staticMeshSpatialIndexed.erase(mesh.id) > 0)
+                staticMeshSpatialIndex.Remove(mesh.id);
+            return false;
+        }
+
+        const SpatialIndex::Aabb bounds = StaticMeshWorldAabb(mesh, *renderer);
+        if (staticMeshSpatialIndexed.find(mesh.id) == staticMeshSpatialIndexed.end())
+        {
+            staticMeshSpatialIndex.Insert(mesh.id, bounds);
+            staticMeshSpatialIndexed.insert(mesh.id);
+        }
+        else
+        {
+            staticMeshSpatialIndex.Update(mesh.id, bounds);
+        }
+        return true;
+    };
+    auto removeStaticMeshSpatialEntity = [&](std::uint32_t id) {
+        if (staticMeshSpatialIndexed.erase(id) > 0)
+            staticMeshSpatialIndex.Remove(id);
+    };
+    auto logStaticMeshSpatialBuild = [&]() {
+        const SpatialIndex::Aabb& b = staticMeshSpatialIndex.WorldBounds();
+        Tracenf("[SPATIAL] built nodes=%u maxDepth=%u objects=%u worldBounds=(%.1f,%.1f,%.1f)-(%.1f,%.1f,%.1f)",
+            staticMeshSpatialIndex.NodeCount(),
+            staticMeshSpatialIndex.MaxDepth(),
+            staticMeshSpatialIndex.ObjectCount(),
+            b.min.x, b.min.y, b.min.z,
+            b.max.x, b.max.y, b.max.z);
+    };
+    auto rebuildStaticMeshSpatialIndex = [&]() {
+        staticMeshSpatialIndex.Clear();
+        staticMeshSpatialIndexed.clear();
+        rebuildMeshEntityLookup();
+        for (const MeshSceneEntity& mesh : editorMeshEntities)
+            syncStaticMeshSpatialEntity(mesh);
+        logStaticMeshSpatialBuild();
+    };
+    auto logStaticMeshSpatialMutations = [&]() {
+        const SpatialIndex::MutationStats mutations = staticMeshSpatialIndex.ConsumeMutationStats();
+        if (mutations.inserts == 0 && mutations.removes == 0 && mutations.updates == 0)
+            return;
+        Tracenf("[SPATIAL] mutate insert=%u remove=%u update=%u (this load/edit)",
+            mutations.inserts,
+            mutations.removes,
+            mutations.updates);
+    };
     auto buildSceneSnapshot = [&]() {
         SceneData scene;
         scene.lighting = editorImGui.GetLightingState();
@@ -1665,6 +1773,7 @@ int RunGame(NativeWindow& window,
         nextEditorMeshEntityId = 1;
         for (const MeshSceneEntity& mesh : editorMeshEntities)
             nextEditorMeshEntityId = std::max(nextEditorMeshEntityId, mesh.id + 1u);
+        rebuildStaticMeshSpatialIndex();
 
         editorImGui.SetLightingState(scene.lighting);
         runtimeSession->SetDynamicLightEditorState({});
@@ -1830,6 +1939,9 @@ int RunGame(NativeWindow& window,
                              &editorLeftMouseHeld,
                              &editorRightMouseHeld,
                              &editorFlyMovement,
+                             &rebuildMeshEntityLookup,
+                             &syncStaticMeshSpatialEntity,
+                             &removeStaticMeshSpatialEntity,
 #endif
                              &renderSize](const InputEvent& event)
     {
@@ -2068,8 +2180,10 @@ int RunGame(NativeWindow& window,
                     }
                     else if (event.key == Key_Delete && selectedEditorObject.type == SelectedEditorObjectType::MeshEntity)
                     {
+                        removeStaticMeshSpatialEntity(selectedEditorObject.id);
                         editorMeshEntities.erase(std::remove_if(editorMeshEntities.begin(), editorMeshEntities.end(),
                             [&](const MeshSceneEntity& mesh) { return mesh.id == selectedEditorObject.id; }), editorMeshEntities.end());
+                        rebuildMeshEntityLookup();
                         runtimeSession->SetEditorStatus("Deleted mesh entity #" + std::to_string(selectedEditorObject.id));
                         selectedEditorObject = {};
                         SceneManager::Instance().MarkDirty();
@@ -2432,6 +2546,7 @@ int RunGame(NativeWindow& window,
                                     it->rotation[1] += static_cast<float>(dx) * 0.01f;
                                     it->rotation[0] += static_cast<float>(-dy) * 0.01f;
                                 }
+                                syncStaticMeshSpatialEntity(*it);
                                 SceneManager::Instance().MarkDirty();
                                 return;
                             }
@@ -2880,8 +2995,10 @@ int RunGame(NativeWindow& window,
                     }
                     else if (type == HierarchyEntityType::MeshEntity)
                     {
+                        removeStaticMeshSpatialEntity(id);
                         editorMeshEntities.erase(std::remove_if(editorMeshEntities.begin(), editorMeshEntities.end(),
                             [&](const MeshSceneEntity& mesh) { return mesh.id == id; }), editorMeshEntities.end());
+                        rebuildMeshEntityLookup();
                     }
                     if ((type == HierarchyEntityType::Terrain && selectedEditorObject.type == SelectedEditorObjectType::Terrain) ||
                         (type == HierarchyEntityType::WaterBody && selectedEditorObject.type == SelectedEditorObjectType::WaterBody && selectedEditorObject.id == id) ||
@@ -2967,6 +3084,8 @@ int RunGame(NativeWindow& window,
                         copy.position[0] += 5.0f;
                         copy.editorHidden = false;
                         editorMeshEntities.push_back(copy);
+                        editorMeshEntityLookup[copy.id] = editorMeshEntities.size() - 1u;
+                        syncStaticMeshSpatialEntity(editorMeshEntities.back());
                         selectedEditorObject = {SelectedEditorObjectType::MeshEntity, copy.id};
                         SceneManager::Instance().MarkDirty();
                         Tracenf("[HIERARCHY] Duplicated entity: original=%u new=%u", id, copy.id);
@@ -3278,6 +3397,8 @@ int RunGame(NativeWindow& window,
                     mesh.position[2] = spawn.z;
                     mesh.skinned = false;
                     editorMeshEntities.push_back(mesh);
+                    editorMeshEntityLookup[mesh.id] = editorMeshEntities.size() - 1u;
+                    syncStaticMeshSpatialEntity(editorMeshEntities.back());
                     selectedEditorObject = {SelectedEditorObjectType::MeshEntity, mesh.id};
                     editorGizmoMode = EditorGizmoMode::Translate;
                     SceneManager::Instance().MarkDirty();
@@ -3524,6 +3645,7 @@ int RunGame(NativeWindow& window,
                     if (it != editorMeshEntities.end())
                     {
                         ApplyMeshRendererEditorState(*it, commands.selectedMeshEntity);
+                        syncStaticMeshSpatialEntity(*it);
                         selectedEditorObject = {SelectedEditorObjectType::MeshEntity, it->id};
                         SceneManager::Instance().MarkDirty();
                     }
@@ -3550,8 +3672,10 @@ int RunGame(NativeWindow& window,
                 if (commands.deleteSelectedMeshEntity &&
                     selectedEditorObject.type == SelectedEditorObjectType::MeshEntity)
                 {
+                    removeStaticMeshSpatialEntity(selectedEditorObject.id);
                     editorMeshEntities.erase(std::remove_if(editorMeshEntities.begin(), editorMeshEntities.end(),
                         [&](const MeshSceneEntity& mesh) { return mesh.id == selectedEditorObject.id; }), editorMeshEntities.end());
+                    rebuildMeshEntityLookup();
                     runtimeSession->SetEditorStatus("Mesh entity deleted: id=" + std::to_string(selectedEditorObject.id));
                     selectedEditorObject = {};
                     SceneManager::Instance().MarkDirty();
@@ -3608,6 +3732,8 @@ int RunGame(NativeWindow& window,
                     editorWaterBodiesDirty = true;
                     SceneManager::Instance().MarkDirty();
                 }
+
+                logStaticMeshSpatialMutations();
 
                 DynamicLightEditorState dynamicLightState{};
                 dynamicLightState.pointCount = static_cast<std::uint32_t>(std::min<std::size_t>(editorPointLights.size(), kMaxDynamicPointLights));
@@ -3840,6 +3966,7 @@ int RunGame(NativeWindow& window,
             size_t frameStaticMeshUniformUpdates = 0;
             size_t frameStaticMeshOverrideActiveDraws = 0;
             size_t frameStaticMeshFrustumCulled = 0;
+            SpatialIndex::QueryStats frameStaticMeshSpatialStats{};
 #if defined(IXTREEME_WITH_EDITOR)
             editorImGui.SetEditorPlayModeState(editorPlay.state);
             editorImGui.BeginFrame(runtimeSession->IsMapEditorOpen());
@@ -4090,11 +4217,21 @@ int RunGame(NativeWindow& window,
                 }
                 if (runtimeSession->IsMapEditorOpen())
                 {
-                    for (const MeshSceneEntity& mesh : editorMeshEntities)
+                    const std::vector<std::uint32_t> spatialCandidates =
+                        staticMeshSpatialIndex.QueryFrustum(SpatialFrustumFromCamera(camera), &frameStaticMeshSpatialStats);
+                    frameStaticMeshEntityCount = editorMeshEntities.size();
+                    frameStaticMeshFrustumCulled =
+                        frameStaticMeshSpatialStats.totalObjects > frameStaticMeshSpatialStats.candidates
+                            ? static_cast<std::size_t>(frameStaticMeshSpatialStats.totalObjects - frameStaticMeshSpatialStats.candidates)
+                            : 0u;
+                    for (std::uint32_t meshId : spatialCandidates)
                     {
+                        MeshSceneEntity* meshPtr = findMeshEntityById(meshId);
+                        if (!meshPtr)
+                            continue;
+                        const MeshSceneEntity& mesh = *meshPtr;
                         if (editorPlay.state.mode == EditorPlayMode::Edit && mesh.editorHidden)
                             continue;
-                        ++frameStaticMeshEntityCount;
                         const bool selected =
                             selectedEditorObject.type == SelectedEditorObjectType::MeshEntity &&
                             selectedEditorObject.id == mesh.id;
@@ -4102,7 +4239,7 @@ int RunGame(NativeWindow& window,
                         if (StaticMeshRenderer* renderer = getStaticMeshRenderer(runtimePath))
                         {
                             if (renderer->IsLoaded() &&
-                                WorldAabbOutsideCameraFrustum(camera, BuildStaticMeshWorldAabbCorners(mesh, *renderer)))
+                                WorldAabbOutsideCameraFrustum(camera, SpatialAabbCorners(StaticMeshWorldAabb(mesh, *renderer))))
                             {
                                 ++frameStaticMeshFrustumCulled;
                                 if (frameNumber < 3 || (frameNumber % 60u) == 0u)
@@ -4224,6 +4361,10 @@ int RunGame(NativeWindow& window,
                     frameStaticMeshEntityCount,
                     frameStaticMeshFrustumCulled,
                     frameStaticMeshSubmitted);
+                Tracenf("[SPATIAL] frustumQuery nodesVisited=%u candidates=%u total=%u",
+                    frameStaticMeshSpatialStats.nodesVisited,
+                    frameStaticMeshSpatialStats.candidates,
+                    frameStaticMeshSpatialStats.totalObjects);
                 const VkExtent2D mperfExtent = useOffscreenScene ? offscreenScene.GetExtent() : renderSize;
                 Tracenf("[MPERF] offscreen=%ux%u halfResTestFps=n/a boundHint=unknown",
                     mperfExtent.width,

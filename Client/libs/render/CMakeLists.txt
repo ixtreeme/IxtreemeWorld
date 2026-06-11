@@ -20,6 +20,8 @@ add_library(client_render STATIC
     RuntimeUiAdapter.h
     SceneManager.cpp
     SceneManager.h
+    SpatialIndex.cpp
+    SpatialIndex.h
     TerrainRenderer.cpp
     TerrainRenderer.h
     IconsFontAwesome6.h
