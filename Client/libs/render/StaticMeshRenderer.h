@@ -4,6 +4,7 @@
 #include "VulkanDevice.h"
 #include "WorldCamera.h"
 
+#include <algorithm>
 #include <array>
 #include <cstdint>
 #include <limits>
@@ -31,12 +32,23 @@ public:
         VkDeviceMemory memory = VK_NULL_HANDLE;
     };
 
+    struct MaterialDefaults
+    {
+        float baseColor[4] = {1.0f, 1.0f, 1.0f, 1.0f};
+        float metallic = 1.0f;
+        float roughness = 1.0f;
+        float normalStrength = 1.0f;
+        float aoStrength = 1.0f;
+        float emissive[3] = {0.0f, 0.0f, 0.0f};
+    };
+
     struct Instance
     {
         WorldVec3 position{};
         float rotation[3] = {0.0f, 0.0f, 0.0f};
         float scale[3] = {1.0f, 1.0f, 1.0f};
         std::array<float, 4> tint = {1.0f, 1.0f, 1.0f, 1.0f};
+        std::vector<MeshSceneEntity::MaterialOverride> materialOverrides;
     };
 
     StaticMeshRenderer() = default;
@@ -59,8 +71,13 @@ public:
     bool HasDescriptors() const { return m_descriptorPool != VK_NULL_HANDLE && m_descriptorSetLayout != VK_NULL_HANDLE; }
     std::size_t VertexCount() const { return m_vertices.size(); }
     std::size_t IndexCount() const { return m_indices.size(); }
+    std::size_t TriangleCount() const { return m_indices.size() / 3u; }
     std::size_t DrawCount() const { return m_draws.size(); }
+    std::uint32_t MaterialSlotCount() const { return std::max<std::uint32_t>(1u, m_materialSlotCount); }
     std::uint32_t LastSubmittedDrawCalls() const { return m_lastSubmittedDrawCalls; }
+    std::uint32_t LastMaterialUniformUpdates() const { return m_lastMaterialUniformUpdates; }
+    std::uint32_t LastOverrideActiveDraws() const { return m_lastOverrideActiveDraws; }
+    const char* AlphaModeName() const { return m_alphaModeName.c_str(); }
     const std::array<float, 3>& BoundsMin() const { return m_boundsMin; }
     const std::array<float, 3>& BoundsMax() const { return m_boundsMax; }
     const std::string& TextureName() const { return m_texture.name; }
@@ -85,6 +102,7 @@ private:
     {
         uint32_t firstIndex = 0;
         uint32_t indexCount = 0;
+        uint32_t materialSlot = 0;
     };
 
     struct Texture
@@ -102,7 +120,7 @@ private:
 
     bool LoadStaticGltfMesh(const std::string& modelPath);
     bool CreateBuffers(VulkanDevice& device);
-    bool CreateTexture(VulkanDevice& device, const std::string& modelPath);
+    bool CreateTextures(VulkanDevice& device, const std::string& modelPath);
     bool CreateDescriptors();
     bool CreatePipeline(VulkanDevice& device);
     void DestroyPipeline();
@@ -112,7 +130,8 @@ private:
         uint32_t uniformSlot,
         const WorldCamera& camera,
         const Instance& instance,
-        double timeSeconds);
+        double timeSeconds,
+        uint32_t materialSlot);
 
     VkDevice m_device = VK_NULL_HANDLE;
     client::asset::IAssetReader* m_assets = nullptr;
@@ -121,6 +140,8 @@ private:
     Buffer m_indexBuffer;
     std::array<std::array<Buffer, kUniformSlots>, kFramesInFlight> m_uniformBuffers{};
     Texture m_texture;
+    Texture m_normalTexture;
+    Texture m_ormTexture;
     VkDescriptorSetLayout m_descriptorSetLayout = VK_NULL_HANDLE;
     VkDescriptorPool m_descriptorPool = VK_NULL_HANDLE;
     std::array<std::array<VkDescriptorSet, kUniformSlots>, kFramesInFlight> m_descriptorSets{};
@@ -129,6 +150,9 @@ private:
     std::vector<Vertex> m_vertices;
     std::vector<uint32_t> m_indices;
     std::vector<MeshDraw> m_draws;
+    std::vector<MaterialDefaults> m_materialDefaults;
+    std::uint32_t m_materialSlotCount = 1;
+    std::string m_alphaModeName = "opaque";
     std::array<float, 3> m_boundsMin = {0.0f, 0.0f, 0.0f};
     std::array<float, 3> m_boundsMax = {0.0f, 0.0f, 0.0f};
     LightingState m_lightingState;
@@ -136,4 +160,6 @@ private:
     uint32_t m_worldRenderFrameIndex = std::numeric_limits<uint32_t>::max();
     uint32_t m_worldUniformCursor = 0;
     std::uint32_t m_lastSubmittedDrawCalls = 0;
+    std::uint32_t m_lastMaterialUniformUpdates = 0;
+    std::uint32_t m_lastOverrideActiveDraws = 0;
 };

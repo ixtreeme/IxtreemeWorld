@@ -243,6 +243,22 @@ struct MeshSceneEntity
     float scale[3] = {1.0f, 1.0f, 1.0f};
     bool skinned = false;
     bool editorHidden = false;
+
+    struct MaterialOverride
+    {
+        std::uint32_t slot = 0;
+        bool enabled = false;
+        float baseColor[4] = {1.0f, 1.0f, 1.0f, 1.0f};
+        float metallic = 1.0f;
+        float roughness = 1.0f;
+        float normalStrength = 1.0f;
+        float aoStrength = 1.0f;
+        float emissive[3] = {0.0f, 0.0f, 0.0f};
+        float emissiveIntensity = 0.0f;
+        float uvTiling[2] = {1.0f, 1.0f};
+        float uvOffset[2] = {0.0f, 0.0f};
+    };
+    std::vector<MaterialOverride> materialOverrides;
 };
 
 struct TerrainSceneData
@@ -326,6 +342,9 @@ struct MeshRendererEditorState
     float rotation[3] = {0.0f, 0.0f, 0.0f};
     float scale[3] = {1.0f, 1.0f, 1.0f};
     bool skinned = false;
+    std::uint32_t materialSlotCount = 1;
+    std::uint32_t selectedMaterialSlot = 0;
+    std::vector<MeshSceneEntity::MaterialOverride> materialOverrides;
 };
 
 struct TerrainEditorState

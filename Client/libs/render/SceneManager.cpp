@@ -977,6 +977,23 @@ void WriteSceneEntity(std::ostream& out, const SpotLight& light, bool comma)
     out << "    }" << (comma ? "," : "") << "\n";
 }
 
+void WriteMaterialOverride(std::ostream& out, const MeshSceneEntity::MaterialOverride& material, bool comma)
+{
+    out << "        {\n";
+    out << "          \"slot\": " << material.slot << ",\n";
+    out << "          \"enabled\": " << (material.enabled ? "true" : "false") << ",\n";
+    out << "          \"base_color\": " << FloatArray(material.baseColor, 4) << ",\n";
+    out << "          \"metallic\": " << material.metallic << ",\n";
+    out << "          \"roughness\": " << material.roughness << ",\n";
+    out << "          \"normal_strength\": " << material.normalStrength << ",\n";
+    out << "          \"ao_strength\": " << material.aoStrength << ",\n";
+    out << "          \"emissive\": " << FloatArray(material.emissive, 3) << ",\n";
+    out << "          \"emissive_intensity\": " << material.emissiveIntensity << ",\n";
+    out << "          \"uv_tiling\": " << FloatArray(material.uvTiling, 2) << ",\n";
+    out << "          \"uv_offset\": " << FloatArray(material.uvOffset, 2) << "\n";
+    out << "        }" << (comma ? "," : "") << "\n";
+}
+
 void WriteSceneEntity(std::ostream& out, const MeshSceneEntity& mesh, bool comma)
 {
     out << "    {\n";
@@ -988,7 +1005,20 @@ void WriteSceneEntity(std::ostream& out, const MeshSceneEntity& mesh, bool comma
     out << "      \"scale\": " << FloatArray(mesh.scale, 3) << ",\n";
     out << "      \"mesh_asset_id\": \"" << EscapeJson(mesh.meshAssetId) << "\",\n";
     out << "      \"mesh_asset_path\": \"" << EscapeJson(mesh.meshAssetPath) << "\",\n";
-    out << "      \"skinned\": " << (mesh.skinned ? "true" : "false") << "\n";
+    out << "      \"skinned\": " << (mesh.skinned ? "true" : "false");
+    if (!mesh.materialOverrides.empty())
+    {
+        out << ",\n";
+        out << "      \"material_overrides\": [\n";
+        for (size_t i = 0; i < mesh.materialOverrides.size(); ++i)
+            WriteMaterialOverride(out, mesh.materialOverrides[i], i + 1 < mesh.materialOverrides.size());
+        out << "      ]\n";
+        Tracenf("[MMAT] saved override entity=%u slots=%zu", mesh.id, mesh.materialOverrides.size());
+    }
+    else
+    {
+        out << "\n";
+    }
     out << "    }" << (comma ? "," : "") << "\n";
 }
 
@@ -1029,6 +1059,23 @@ SpotLight ReadSpotLight(const JsonValue& entity)
     return light;
 }
 
+MeshSceneEntity::MaterialOverride ReadMaterialOverride(const JsonValue& object)
+{
+    MeshSceneEntity::MaterialOverride material;
+    material.slot = ReadU32(object, "slot", material.slot);
+    material.enabled = ReadBool(object, "enabled", material.enabled);
+    ReadFloatArray(object, "base_color", material.baseColor, 4);
+    material.metallic = ReadFloat(object, "metallic", material.metallic);
+    material.roughness = ReadFloat(object, "roughness", material.roughness);
+    material.normalStrength = ReadFloat(object, "normal_strength", material.normalStrength);
+    material.aoStrength = ReadFloat(object, "ao_strength", material.aoStrength);
+    ReadFloatArray(object, "emissive", material.emissive, 3);
+    material.emissiveIntensity = ReadFloat(object, "emissive_intensity", material.emissiveIntensity);
+    ReadFloatArray(object, "uv_tiling", material.uvTiling, 2);
+    ReadFloatArray(object, "uv_offset", material.uvOffset, 2);
+    return material;
+}
+
 MeshSceneEntity ReadMeshSceneEntity(const JsonValue& entity)
 {
     MeshSceneEntity mesh;
@@ -1040,6 +1087,15 @@ MeshSceneEntity ReadMeshSceneEntity(const JsonValue& entity)
     mesh.meshAssetId = ReadString(entity, "mesh_asset_id");
     mesh.meshAssetPath = ReadString(entity, "mesh_asset_path");
     mesh.skinned = ReadBool(entity, "skinned", mesh.skinned);
+    if (const JsonValue* materials = Find(entity, "material_overrides"); materials && materials->type == JsonValue::Type::Array)
+    {
+        for (const JsonValue& value : materials->array)
+        {
+            if (value.type == JsonValue::Type::Object)
+                mesh.materialOverrides.push_back(ReadMaterialOverride(value));
+        }
+        Tracenf("[MMAT] loaded override entity=%u slots=%zu", mesh.id, mesh.materialOverrides.size());
+    }
     return mesh;
 }
 }

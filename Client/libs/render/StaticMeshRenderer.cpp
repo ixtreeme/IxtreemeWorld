@@ -83,6 +83,11 @@ struct UniformBlock
     Mat4 mvp;
     Mat4 model;
     float tint[4];
+    float materialBaseColor[4] = {1.0f, 1.0f, 1.0f, 1.0f};
+    float materialParams[4] = {1.0f, 1.0f, 1.0f, 1.0f}; // metallic, roughness, normal strength, AO strength
+    float materialEmissive[4] = {0.0f, 0.0f, 0.0f, 0.0f};
+    float materialUv[4] = {1.0f, 1.0f, 0.0f, 0.0f}; // tiling.xy, offset.xy
+    float cameraPosition[4] = {0.0f, 0.0f, 0.0f, 0.0f};
     float sunDir[4];
     float sunColor[4];
     float ambientColor[4];
@@ -374,6 +379,25 @@ bool AssetLooksSkinned(const fastgltf::Asset& asset)
     return false;
 }
 
+StaticMeshRenderer::MaterialDefaults ReadMaterialDefaults(const fastgltf::Material& material)
+{
+    StaticMeshRenderer::MaterialDefaults defaults{};
+    defaults.baseColor[0] = material.pbrData.baseColorFactor.x();
+    defaults.baseColor[1] = material.pbrData.baseColorFactor.y();
+    defaults.baseColor[2] = material.pbrData.baseColorFactor.z();
+    defaults.baseColor[3] = material.pbrData.baseColorFactor.w();
+    defaults.metallic = material.pbrData.metallicFactor;
+    defaults.roughness = material.pbrData.roughnessFactor;
+    if (material.normalTexture.has_value())
+        defaults.normalStrength = material.normalTexture->scale;
+    if (material.occlusionTexture.has_value())
+        defaults.aoStrength = material.occlusionTexture->strength;
+    defaults.emissive[0] = material.emissiveFactor.x();
+    defaults.emissive[1] = material.emissiveFactor.y();
+    defaults.emissive[2] = material.emissiveFactor.z();
+    return defaults;
+}
+
 RgbaImage CreateFallbackWhiteImage(const std::string& modelPath)
 {
     RgbaImage image{};
@@ -385,54 +409,114 @@ RgbaImage CreateFallbackWhiteImage(const std::string& modelPath)
     return image;
 }
 
-bool LoadGltfBaseColorTexture(client::asset::IAssetReader& assets,
-    const std::string& modelPath,
+RgbaImage CreateFallbackNormalImage(const std::string& modelPath)
+{
+    RgbaImage image{};
+    image.name = modelPath + "#fallback-normal";
+    image.width = 4;
+    image.height = 4;
+    image.format = VK_FORMAT_R8G8B8A8_UNORM;
+    image.pixels.resize(static_cast<size_t>(image.width) * image.height * 4u);
+    for (size_t i = 0; i < image.pixels.size(); i += 4)
+    {
+        image.pixels[i + 0] = 128;
+        image.pixels[i + 1] = 128;
+        image.pixels[i + 2] = 255;
+        image.pixels[i + 3] = 255;
+    }
+    return image;
+}
+
+RgbaImage CreateFallbackOrmImage(const std::string& modelPath)
+{
+    RgbaImage image{};
+    image.name = modelPath + "#fallback-orm";
+    image.width = 4;
+    image.height = 4;
+    image.format = VK_FORMAT_R8G8B8A8_UNORM;
+    image.pixels.resize(static_cast<size_t>(image.width) * image.height * 4u);
+    for (size_t i = 0; i < image.pixels.size(); i += 4)
+    {
+        image.pixels[i + 0] = 255; // AO
+        image.pixels[i + 1] = 255; // Roughness
+        image.pixels[i + 2] = 255; // Metallic factor texture
+        image.pixels[i + 3] = 255;
+    }
+    return image;
+}
+
+bool DecodeGltfTexture(const fastgltf::Asset& asset,
+    size_t textureIndex,
+    VkFormat format,
+    const char* label,
     RgbaImage& out)
+{
+    if (textureIndex >= asset.textures.size())
+        return false;
+    const auto& texture = asset.textures[textureIndex];
+    if (!texture.imageIndex.has_value() || texture.imageIndex.value() >= asset.images.size())
+        return false;
+    const auto& image = asset.images[texture.imageIndex.value()];
+    std::vector<uint8_t> encoded;
+    if (!CopyDataSourceBytes(asset, image.data, 0, std::numeric_limits<size_t>::max(), encoded) ||
+        encoded.empty())
+    {
+        return false;
+    }
+
+    int width = 0;
+    int height = 0;
+    int channels = 0;
+    stbi_uc* decoded = stbi_load_from_memory(
+        encoded.data(), static_cast<int>(encoded.size()), &width, &height, &channels, 4);
+    if (!decoded || width <= 0 || height <= 0)
+    {
+        if (decoded)
+            stbi_image_free(decoded);
+        return false;
+    }
+
+    out.name = std::string(image.name.empty() ? label : image.name);
+    out.width = static_cast<uint32_t>(width);
+    out.height = static_cast<uint32_t>(height);
+    out.format = format;
+    out.pixels.assign(decoded, decoded + static_cast<size_t>(width) * static_cast<size_t>(height) * 4u);
+    stbi_image_free(decoded);
+    LogFormat("[STATIC-MESH] decoded %s image='%s' (%ux%u, source channels=%d)",
+        label, out.name.c_str(), out.width, out.height, channels);
+    return true;
+}
+
+bool LoadGltfMaterialTextures(client::asset::IAssetReader& assets,
+    const std::string& modelPath,
+    RgbaImage& diffuse,
+    RgbaImage& normal,
+    RgbaImage& orm)
 {
     std::string error;
     auto parsed = ParseGltf(assets, modelPath, &error);
     if (!parsed)
         return false;
     const fastgltf::Asset& asset = *parsed;
+    bool loadedAny = false;
     for (const auto& material : asset.materials)
     {
-        if (!material.pbrData.baseColorTexture.has_value())
-            continue;
-        const size_t textureIndex = material.pbrData.baseColorTexture->textureIndex;
-        if (textureIndex >= asset.textures.size())
-            continue;
-        const auto& texture = asset.textures[textureIndex];
-        if (!texture.imageIndex.has_value() || texture.imageIndex.value() >= asset.images.size())
-            continue;
-        const auto& image = asset.images[texture.imageIndex.value()];
-        std::vector<uint8_t> encoded;
-        if (!CopyDataSourceBytes(asset, image.data, 0, std::numeric_limits<size_t>::max(), encoded) ||
-            encoded.empty())
-            continue;
-
-        int width = 0;
-        int height = 0;
-        int channels = 0;
-        stbi_uc* decoded = stbi_load_from_memory(
-            encoded.data(), static_cast<int>(encoded.size()), &width, &height, &channels, 4);
-        if (!decoded || width <= 0 || height <= 0)
-        {
-            if (decoded)
-                stbi_image_free(decoded);
-            continue;
-        }
-
-        out.name = std::string(image.name.empty() ? "glTF baseColorTexture" : image.name);
-        out.width = static_cast<uint32_t>(width);
-        out.height = static_cast<uint32_t>(height);
-        out.format = VK_FORMAT_R8G8B8A8_SRGB;
-        out.pixels.assign(decoded, decoded + static_cast<size_t>(width) * static_cast<size_t>(height) * 4u);
-        stbi_image_free(decoded);
-        LogFormat("[STATIC-MESH] decoded baseColorTexture material='%s' image='%s' (%ux%u, source channels=%d)",
-            material.name.c_str(), out.name.c_str(), out.width, out.height, channels);
-        return true;
+        if (material.pbrData.baseColorTexture.has_value())
+            loadedAny |= DecodeGltfTexture(asset, material.pbrData.baseColorTexture->textureIndex,
+                VK_FORMAT_R8G8B8A8_SRGB, "baseColorTexture", diffuse);
+        if (material.normalTexture.has_value())
+            loadedAny |= DecodeGltfTexture(asset, material.normalTexture->textureIndex,
+                VK_FORMAT_R8G8B8A8_UNORM, "normalTexture", normal);
+        if (material.pbrData.metallicRoughnessTexture.has_value())
+            loadedAny |= DecodeGltfTexture(asset, material.pbrData.metallicRoughnessTexture->textureIndex,
+                VK_FORMAT_R8G8B8A8_UNORM, "metallicRoughnessTexture", orm);
+        else if (material.occlusionTexture.has_value())
+            loadedAny |= DecodeGltfTexture(asset, material.occlusionTexture->textureIndex,
+                VK_FORMAT_R8G8B8A8_UNORM, "occlusionTexture", orm);
+        if (loadedAny)
+            break;
     }
-    return false;
+    return loadedAny;
 }
 
 VkShaderModule CreateShaderModule(VkDevice device, client::asset::IAssetReader& assets, const std::string& path)
@@ -688,7 +772,7 @@ bool StaticMeshRenderer::Create(VulkanDevice& device, client::asset::IAssetReade
         return false;
     }
     buffers = HasVertexBuffer() && HasIndexBuffer();
-    if (!CreateTexture(device, modelPath))
+    if (!CreateTextures(device, modelPath))
     {
         logCreateState();
         return false;
@@ -748,6 +832,25 @@ bool StaticMeshRenderer::LoadStaticGltfMesh(const std::string& modelPath)
     m_vertices.clear();
     m_indices.clear();
     m_draws.clear();
+    m_materialDefaults.clear();
+    m_alphaModeName = "opaque";
+    m_materialDefaults.reserve(std::max<std::size_t>(asset.materials.size(), 1u));
+    if (asset.materials.empty())
+    {
+        m_materialDefaults.push_back(MaterialDefaults{});
+    }
+    else
+    {
+        for (const auto& material : asset.materials)
+        {
+            m_materialDefaults.push_back(ReadMaterialDefaults(material));
+            if (material.alphaMode == fastgltf::AlphaMode::Blend)
+                m_alphaModeName = "blend";
+            else if (material.alphaMode == fastgltf::AlphaMode::Mask && m_alphaModeName != "blend")
+                m_alphaModeName = "mask";
+        }
+    }
+    m_materialSlotCount = static_cast<std::uint32_t>(std::max<std::size_t>(m_materialDefaults.size(), 1u));
     m_boundsMin = {std::numeric_limits<float>::max(), std::numeric_limits<float>::max(), std::numeric_limits<float>::max()};
     m_boundsMax = {std::numeric_limits<float>::lowest(), std::numeric_limits<float>::lowest(), std::numeric_limits<float>::lowest()};
 
@@ -817,9 +920,13 @@ bool StaticMeshRenderer::LoadStaticGltfMesh(const std::string& modelPath)
             MeshDraw draw{};
             draw.firstIndex = firstIndex;
             draw.indexCount = static_cast<uint32_t>(m_indices.size() - firstIndex);
+            draw.materialSlot = static_cast<uint32_t>(
+                primitive.materialIndex.has_value() ? primitive.materialIndex.value() : 0u);
+            if (draw.materialSlot >= m_materialSlotCount)
+                draw.materialSlot = 0;
             m_draws.push_back(draw);
-            LogFormat("[STATIC-MESH] extracted primitive[%u] mesh='%s': verts=%zu indices=%u",
-                primitiveIndex++, mesh.name.c_str(), vertices.size(), draw.indexCount);
+            LogFormat("[STATIC-MESH] extracted primitive[%u] mesh='%s': verts=%zu indices=%u materialSlot=%u",
+                primitiveIndex++, mesh.name.c_str(), vertices.size(), draw.indexCount, draw.materialSlot);
         }
     }
 
@@ -830,6 +937,12 @@ bool StaticMeshRenderer::LoadStaticGltfMesh(const std::string& modelPath)
         m_boundsMax = {0.0f, 0.0f, 0.0f};
         return false;
     }
+    LogFormat("[MPERF] mesh=%s verts=%zu submeshes=%zu materials=%u alpha=%s",
+        modelPath.c_str(),
+        m_vertices.size(),
+        m_draws.size(),
+        m_materialSlotCount,
+        m_alphaModeName.c_str());
     return true;
 }
 
@@ -852,89 +965,102 @@ bool StaticMeshRenderer::CreateBuffers(VulkanDevice& device)
     return true;
 }
 
-bool StaticMeshRenderer::CreateTexture(VulkanDevice& device, const std::string& modelPath)
+bool StaticMeshRenderer::CreateTextures(VulkanDevice& device, const std::string& modelPath)
 {
-    RgbaImage image{};
-    if (!m_assets || !LoadGltfBaseColorTexture(*m_assets, modelPath, image))
+    RgbaImage diffuse{};
+    RgbaImage normal{};
+    RgbaImage orm{};
+    if (!m_assets || !LoadGltfMaterialTextures(*m_assets, modelPath, diffuse, normal, orm))
     {
-        image = CreateFallbackWhiteImage(modelPath);
-        LogFormat("[STATIC-MESH] using fallback white texture for %s", modelPath.c_str());
+        LogFormat("[STATIC-MESH] using fallback PBR textures for %s", modelPath.c_str());
     }
+    if (diffuse.pixels.empty())
+        diffuse = CreateFallbackWhiteImage(modelPath);
+    if (normal.pixels.empty())
+        normal = CreateFallbackNormalImage(modelPath);
+    if (orm.pixels.empty())
+        orm = CreateFallbackOrmImage(modelPath);
 
-    VkFormatProperties props{};
-    vkGetPhysicalDeviceFormatProperties(device.GetPhysicalDevice(), image.format, &props);
-    const VkFormatFeatureFlags required =
-        VK_FORMAT_FEATURE_SAMPLED_IMAGE_BIT | VK_FORMAT_FEATURE_TRANSFER_DST_BIT;
-    if ((props.optimalTilingFeatures & required) != required)
-    {
-        image = CreateFallbackWhiteImage(modelPath);
-        image.format = VK_FORMAT_R8G8B8A8_UNORM;
+    auto uploadTexture = [&](const RgbaImage& source, Texture& texture) -> bool {
+        RgbaImage image = source;
+        VkFormatProperties props{};
         vkGetPhysicalDeviceFormatProperties(device.GetPhysicalDevice(), image.format, &props);
+        const VkFormatFeatureFlags required =
+            VK_FORMAT_FEATURE_SAMPLED_IMAGE_BIT | VK_FORMAT_FEATURE_TRANSFER_DST_BIT;
         if ((props.optimalTilingFeatures & required) != required)
-            return false;
-    }
+        {
+            image.format = VK_FORMAT_R8G8B8A8_UNORM;
+            vkGetPhysicalDeviceFormatProperties(device.GetPhysicalDevice(), image.format, &props);
+            if ((props.optimalTilingFeatures & required) != required)
+                return false;
+        }
 
-    VkQueue graphicsQueue = VK_NULL_HANDLE;
-    vkGetDeviceQueue(m_device, device.GetGraphicsQueueFamily(), 0, &graphicsQueue);
+        VkQueue graphicsQueue = VK_NULL_HANDLE;
+        vkGetDeviceQueue(m_device, device.GetGraphicsQueueFamily(), 0, &graphicsQueue);
 
-    m_texture.name = image.name;
-    m_texture.width = image.width;
-    m_texture.height = image.height;
-    m_texture.mipLevels = 1;
-    m_texture.format = image.format;
-    CreateDeviceLocalImage(device, m_device, image.width, image.height, image.format, m_texture.image, m_texture.memory);
+        texture.name = image.name;
+        texture.width = image.width;
+        texture.height = image.height;
+        texture.mipLevels = 1;
+        texture.format = image.format;
+        CreateDeviceLocalImage(device, m_device, image.width, image.height, image.format, texture.image, texture.memory);
 
-    Buffer staging{};
-    CreateHostVisibleBuffer(device, m_device, image.pixels.size(),
-        VK_BUFFER_USAGE_TRANSFER_SRC_BIT, image.pixels.data(), staging);
+        Buffer staging{};
+        CreateHostVisibleBuffer(device, m_device, image.pixels.size(),
+            VK_BUFFER_USAGE_TRANSFER_SRC_BIT, image.pixels.data(), staging);
 
-    VkCommandPool uploadPool = VK_NULL_HANDLE;
-    VkCommandBuffer cmd = BeginOneTimeCommands(m_device, device.GetGraphicsQueueFamily(), uploadPool);
-    TransitionImageLayout(cmd, m_texture.image, VK_IMAGE_LAYOUT_UNDEFINED, VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL);
-    VkBufferImageCopy region{};
-    region.bufferOffset = 0;
-    region.imageSubresource.aspectMask = VK_IMAGE_ASPECT_COLOR_BIT;
-    region.imageSubresource.mipLevel = 0;
-    region.imageSubresource.baseArrayLayer = 0;
-    region.imageSubresource.layerCount = 1;
-    region.imageExtent = {image.width, image.height, 1};
-    vkCmdCopyBufferToImage(cmd, staging.buffer, m_texture.image,
-        VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL, 1, &region);
-    TransitionImageLayout(cmd, m_texture.image,
-        VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL, VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL);
-    EndOneTimeCommands(m_device, graphicsQueue, uploadPool, cmd);
-    DestroyBuffer(staging);
+        VkCommandPool uploadPool = VK_NULL_HANDLE;
+        VkCommandBuffer cmd = BeginOneTimeCommands(m_device, device.GetGraphicsQueueFamily(), uploadPool);
+        TransitionImageLayout(cmd, texture.image, VK_IMAGE_LAYOUT_UNDEFINED, VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL);
+        VkBufferImageCopy region{};
+        region.bufferOffset = 0;
+        region.imageSubresource.aspectMask = VK_IMAGE_ASPECT_COLOR_BIT;
+        region.imageSubresource.mipLevel = 0;
+        region.imageSubresource.baseArrayLayer = 0;
+        region.imageSubresource.layerCount = 1;
+        region.imageExtent = {image.width, image.height, 1};
+        vkCmdCopyBufferToImage(cmd, staging.buffer, texture.image,
+            VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL, 1, &region);
+        TransitionImageLayout(cmd, texture.image,
+            VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL, VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL);
+        EndOneTimeCommands(m_device, graphicsQueue, uploadPool, cmd);
+        DestroyBuffer(staging);
 
-    VkImageViewCreateInfo view{};
-    view.sType = VK_STRUCTURE_TYPE_IMAGE_VIEW_CREATE_INFO;
-    view.image = m_texture.image;
-    view.viewType = VK_IMAGE_VIEW_TYPE_2D;
-    view.format = m_texture.format;
-    view.subresourceRange.aspectMask = VK_IMAGE_ASPECT_COLOR_BIT;
-    view.subresourceRange.baseMipLevel = 0;
-    view.subresourceRange.levelCount = 1;
-    view.subresourceRange.baseArrayLayer = 0;
-    view.subresourceRange.layerCount = 1;
-    VK_CHECK(vkCreateImageView(m_device, &view, nullptr, &m_texture.view));
+        VkImageViewCreateInfo view{};
+        view.sType = VK_STRUCTURE_TYPE_IMAGE_VIEW_CREATE_INFO;
+        view.image = texture.image;
+        view.viewType = VK_IMAGE_VIEW_TYPE_2D;
+        view.format = texture.format;
+        view.subresourceRange.aspectMask = VK_IMAGE_ASPECT_COLOR_BIT;
+        view.subresourceRange.baseMipLevel = 0;
+        view.subresourceRange.levelCount = 1;
+        view.subresourceRange.baseArrayLayer = 0;
+        view.subresourceRange.layerCount = 1;
+        VK_CHECK(vkCreateImageView(m_device, &view, nullptr, &texture.view));
 
-    VkSamplerCreateInfo sampler{};
-    sampler.sType = VK_STRUCTURE_TYPE_SAMPLER_CREATE_INFO;
-    sampler.magFilter = VK_FILTER_LINEAR;
-    sampler.minFilter = VK_FILTER_LINEAR;
-    sampler.mipmapMode = VK_SAMPLER_MIPMAP_MODE_NEAREST;
-    sampler.addressModeU = VK_SAMPLER_ADDRESS_MODE_REPEAT;
-    sampler.addressModeV = VK_SAMPLER_ADDRESS_MODE_REPEAT;
-    sampler.addressModeW = VK_SAMPLER_ADDRESS_MODE_REPEAT;
-    sampler.minLod = 0.0f;
-    sampler.maxLod = 1.0f;
-    if (device.SupportsSamplerAnisotropy())
-    {
-        sampler.anisotropyEnable = VK_TRUE;
-        sampler.maxAnisotropy = device.GetMaxSamplerAnisotropy();
-    }
-    sampler.borderColor = VK_BORDER_COLOR_FLOAT_OPAQUE_BLACK;
-    VK_CHECK(vkCreateSampler(m_device, &sampler, nullptr, &m_texture.sampler));
-    return true;
+        VkSamplerCreateInfo sampler{};
+        sampler.sType = VK_STRUCTURE_TYPE_SAMPLER_CREATE_INFO;
+        sampler.magFilter = VK_FILTER_LINEAR;
+        sampler.minFilter = VK_FILTER_LINEAR;
+        sampler.mipmapMode = VK_SAMPLER_MIPMAP_MODE_NEAREST;
+        sampler.addressModeU = VK_SAMPLER_ADDRESS_MODE_REPEAT;
+        sampler.addressModeV = VK_SAMPLER_ADDRESS_MODE_REPEAT;
+        sampler.addressModeW = VK_SAMPLER_ADDRESS_MODE_REPEAT;
+        sampler.minLod = 0.0f;
+        sampler.maxLod = 1.0f;
+        if (device.SupportsSamplerAnisotropy())
+        {
+            sampler.anisotropyEnable = VK_TRUE;
+            sampler.maxAnisotropy = device.GetMaxSamplerAnisotropy();
+        }
+        sampler.borderColor = VK_BORDER_COLOR_FLOAT_OPAQUE_BLACK;
+        VK_CHECK(vkCreateSampler(m_device, &sampler, nullptr, &texture.sampler));
+        return true;
+    };
+
+    return uploadTexture(diffuse, m_texture) &&
+        uploadTexture(normal, m_normalTexture) &&
+        uploadTexture(orm, m_ormTexture);
 }
 
 bool StaticMeshRenderer::CreateDescriptors()
@@ -951,7 +1077,12 @@ bool StaticMeshRenderer::CreateDescriptors()
     diffuse.descriptorCount = 1;
     diffuse.stageFlags = VK_SHADER_STAGE_FRAGMENT_BIT;
 
-    std::array<VkDescriptorSetLayoutBinding, 2> bindings = {ubo, diffuse};
+    VkDescriptorSetLayoutBinding normal = diffuse;
+    normal.binding = 2;
+    VkDescriptorSetLayoutBinding orm = diffuse;
+    orm.binding = 3;
+
+    std::array<VkDescriptorSetLayoutBinding, 4> bindings = {ubo, diffuse, normal, orm};
     VkDescriptorSetLayoutCreateInfo layout{};
     layout.sType = VK_STRUCTURE_TYPE_DESCRIPTOR_SET_LAYOUT_CREATE_INFO;
     layout.bindingCount = static_cast<uint32_t>(bindings.size());
@@ -962,7 +1093,7 @@ bool StaticMeshRenderer::CreateDescriptors()
     poolSizes[0].type = VK_DESCRIPTOR_TYPE_UNIFORM_BUFFER;
     poolSizes[0].descriptorCount = kFramesInFlight * kUniformSlots;
     poolSizes[1].type = VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER;
-    poolSizes[1].descriptorCount = kFramesInFlight * kUniformSlots;
+    poolSizes[1].descriptorCount = kFramesInFlight * kUniformSlots * 3u;
 
     VkDescriptorPoolCreateInfo pool{};
     pool.sType = VK_STRUCTURE_TYPE_DESCRIPTOR_POOL_CREATE_INFO;
@@ -999,8 +1130,16 @@ bool StaticMeshRenderer::CreateDescriptors()
             imageInfo.sampler = m_texture.sampler;
             imageInfo.imageView = m_texture.view;
             imageInfo.imageLayout = VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL;
+            VkDescriptorImageInfo normalInfo{};
+            normalInfo.sampler = m_normalTexture.sampler;
+            normalInfo.imageView = m_normalTexture.view;
+            normalInfo.imageLayout = VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL;
+            VkDescriptorImageInfo ormInfo{};
+            ormInfo.sampler = m_ormTexture.sampler;
+            ormInfo.imageView = m_ormTexture.view;
+            ormInfo.imageLayout = VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL;
 
-            std::array<VkWriteDescriptorSet, 2> writes{};
+            std::array<VkWriteDescriptorSet, 4> writes{};
             writes[0].sType = VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET;
             writes[0].dstSet = descriptorSet;
             writes[0].dstBinding = 0;
@@ -1013,6 +1152,18 @@ bool StaticMeshRenderer::CreateDescriptors()
             writes[1].descriptorCount = 1;
             writes[1].descriptorType = VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER;
             writes[1].pImageInfo = &imageInfo;
+            writes[2].sType = VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET;
+            writes[2].dstSet = descriptorSet;
+            writes[2].dstBinding = 2;
+            writes[2].descriptorCount = 1;
+            writes[2].descriptorType = VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER;
+            writes[2].pImageInfo = &normalInfo;
+            writes[3].sType = VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET;
+            writes[3].dstSet = descriptorSet;
+            writes[3].dstBinding = 3;
+            writes[3].descriptorCount = 1;
+            writes[3].descriptorType = VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER;
+            writes[3].pImageInfo = &ormInfo;
             vkUpdateDescriptorSets(m_device, static_cast<uint32_t>(writes.size()), writes.data(), 0, nullptr);
         }
     }
@@ -1024,8 +1175,8 @@ bool StaticMeshRenderer::CreatePipeline(VulkanDevice& device)
     if (!m_assets)
         return false;
 
-    VkShaderModule vs = CreateShaderModule(m_device, *m_assets, "assets/shaders/skinned_mesh_vs.spv");
-    VkShaderModule ps = CreateShaderModule(m_device, *m_assets, "assets/shaders/skinned_mesh_ps.spv");
+    VkShaderModule vs = CreateShaderModule(m_device, *m_assets, "assets/shaders/static_mesh_vs.spv");
+    VkShaderModule ps = CreateShaderModule(m_device, *m_assets, "assets/shaders/static_mesh_ps.spv");
 
     VkPipelineShaderStageCreateInfo stages[2]{};
     stages[0].sType = VK_STRUCTURE_TYPE_PIPELINE_SHADER_STAGE_CREATE_INFO;
@@ -1137,6 +1288,8 @@ void StaticMeshRenderer::RenderInWorld(VulkanDevice& device,
     const Instance& instance)
 {
     m_lastSubmittedDrawCalls = 0;
+    m_lastMaterialUniformUpdates = 0;
+    m_lastOverrideActiveDraws = 0;
     if (!m_pipeline || m_indices.empty() || !device.IsFrameActive())
         return;
     const VkExtent2D extent = device.GetSwapchainExtent();
@@ -1149,9 +1302,6 @@ void StaticMeshRenderer::RenderInWorld(VulkanDevice& device,
         m_worldRenderFrameIndex = frameIndex;
         m_worldUniformCursor = 0;
     }
-    const uint32_t uniformSlot = std::min(m_worldUniformCursor++, kUniformSlots - 1);
-    UpdateWorldUniform(frameIndex, uniformSlot, camera, instance, timeSeconds);
-
     VkCommandBuffer cmd = device.GetCommandBuffer();
     VkViewport viewport{};
     viewport.x = 0.0f;
@@ -1167,10 +1317,20 @@ void StaticMeshRenderer::RenderInWorld(VulkanDevice& device,
     VkDeviceSize offset = 0;
     vkCmdBindVertexBuffers(cmd, 0, 1, &m_vertexBuffer.buffer, &offset);
     vkCmdBindIndexBuffer(cmd, m_indexBuffer.buffer, 0, VK_INDEX_TYPE_UINT32);
-    vkCmdBindDescriptorSets(cmd, VK_PIPELINE_BIND_POINT_GRAPHICS, m_pipelineLayout,
-        0, 1, &m_descriptorSets[frameIndex][uniformSlot], 0, nullptr);
     for (const MeshDraw& draw : m_draws)
     {
+        const uint32_t uniformSlot = std::min(m_worldUniformCursor++, kUniformSlots - 1);
+        const bool overrideActive = std::any_of(instance.materialOverrides.begin(),
+            instance.materialOverrides.end(),
+            [&](const MeshSceneEntity::MaterialOverride& material) {
+                return material.enabled && material.slot == draw.materialSlot;
+            });
+        UpdateWorldUniform(frameIndex, uniformSlot, camera, instance, timeSeconds, draw.materialSlot);
+        ++m_lastMaterialUniformUpdates;
+        if (overrideActive)
+            ++m_lastOverrideActiveDraws;
+        vkCmdBindDescriptorSets(cmd, VK_PIPELINE_BIND_POINT_GRAPHICS, m_pipelineLayout,
+            0, 1, &m_descriptorSets[frameIndex][uniformSlot], 0, nullptr);
         vkCmdDrawIndexed(cmd, draw.indexCount, 1, draw.firstIndex, 0, 0);
         ++m_lastSubmittedDrawCalls;
     }
@@ -1227,12 +1387,16 @@ void StaticMeshRenderer::Destroy()
             DestroyBuffer(buffer);
     }
     DestroyTexture(m_texture);
+    DestroyTexture(m_normalTexture);
+    DestroyTexture(m_ormTexture);
     m_vertices.clear();
     m_indices.clear();
     m_draws.clear();
     m_boundsMin = {0.0f, 0.0f, 0.0f};
     m_boundsMax = {0.0f, 0.0f, 0.0f};
     m_lastSubmittedDrawCalls = 0;
+    m_lastMaterialUniformUpdates = 0;
+    m_lastOverrideActiveDraws = 0;
     m_assets = nullptr;
     m_status = LoadStatus::NotLoaded;
     m_device = VK_NULL_HANDLE;
@@ -1242,7 +1406,8 @@ void StaticMeshRenderer::UpdateWorldUniform(uint32_t frameIndex,
     uint32_t uniformSlot,
     const WorldCamera& camera,
     const Instance& instance,
-    double)
+    double,
+    uint32_t materialSlot)
 {
     const Mat4 model = Multiply(
         Multiply(
@@ -1257,6 +1422,42 @@ void StaticMeshRenderer::UpdateWorldUniform(uint32_t frameIndex,
 
     UniformBlock uniform{mvp, model,
         {instance.tint[0], instance.tint[1], instance.tint[2], instance.tint[3]}};
+    const MaterialDefaults fallbackDefaults{};
+    const MaterialDefaults& defaults = m_materialDefaults.empty()
+        ? fallbackDefaults
+        : (materialSlot < m_materialDefaults.size() ? m_materialDefaults[materialSlot] : m_materialDefaults.front());
+    std::memcpy(uniform.materialBaseColor, defaults.baseColor, sizeof(uniform.materialBaseColor));
+    uniform.materialParams[0] = defaults.metallic;
+    uniform.materialParams[1] = defaults.roughness;
+    uniform.materialParams[2] = defaults.normalStrength;
+    uniform.materialParams[3] = defaults.aoStrength;
+    uniform.materialEmissive[0] = defaults.emissive[0];
+    uniform.materialEmissive[1] = defaults.emissive[1];
+    uniform.materialEmissive[2] = defaults.emissive[2];
+    uniform.materialEmissive[3] = 1.0f;
+    for (const MeshSceneEntity::MaterialOverride& overrideSlot : instance.materialOverrides)
+    {
+        if (overrideSlot.slot != materialSlot || !overrideSlot.enabled)
+            continue;
+        std::memcpy(uniform.materialBaseColor, overrideSlot.baseColor, sizeof(uniform.materialBaseColor));
+        uniform.materialParams[0] = overrideSlot.metallic;
+        uniform.materialParams[1] = overrideSlot.roughness;
+        uniform.materialParams[2] = overrideSlot.normalStrength;
+        uniform.materialParams[3] = overrideSlot.aoStrength;
+        uniform.materialEmissive[0] = overrideSlot.emissive[0];
+        uniform.materialEmissive[1] = overrideSlot.emissive[1];
+        uniform.materialEmissive[2] = overrideSlot.emissive[2];
+        uniform.materialEmissive[3] = overrideSlot.emissiveIntensity;
+        uniform.materialUv[0] = overrideSlot.uvTiling[0];
+        uniform.materialUv[1] = overrideSlot.uvTiling[1];
+        uniform.materialUv[2] = overrideSlot.uvOffset[0];
+        uniform.materialUv[3] = overrideSlot.uvOffset[1];
+        break;
+    }
+    uniform.cameraPosition[0] = static_cast<float>(camera.eye.x);
+    uniform.cameraPosition[1] = static_cast<float>(camera.eye.y);
+    uniform.cameraPosition[2] = static_cast<float>(camera.eye.z);
+    uniform.cameraPosition[3] = 1.0f;
     FillLightingUniform(m_lightingState, uniform);
     uniform.waterParams[0] = 0.0f;
     uniform.causticParams[0] = 0.0f;

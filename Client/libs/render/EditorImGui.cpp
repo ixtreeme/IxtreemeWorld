@@ -593,7 +593,13 @@ void EditorImGui::SetWaterBodyEditorState(const WaterBodyEditorState& state)
 
 void EditorImGui::SetMeshRendererEditorState(const MeshRendererEditorState& state)
 {
+    const std::uint32_t previousSlot =
+        (m_meshRendererState.selected && state.selected && m_meshRendererState.id == state.id)
+            ? m_meshRendererState.selectedMaterialSlot
+            : 0u;
     m_meshRendererState = state;
+    m_meshRendererState.selectedMaterialSlot = std::min(previousSlot,
+        m_meshRendererState.materialSlotCount > 0 ? m_meshRendererState.materialSlotCount - 1u : 0u);
 }
 
 void EditorImGui::SetTerrainEditorState(const TerrainEditorState& state)
@@ -3848,7 +3854,92 @@ void EditorImGui::RenderSelectedMeshRendererInspector()
         }
         ImGui::TextDisabled("Asset ID: %s", m_meshRendererState.meshAssetId.empty() ? "<none>" : m_meshRendererState.meshAssetId.c_str());
         ImGui::TextDisabled("Path: %s", m_meshRendererState.meshAssetPath.empty() ? "<none>" : m_meshRendererState.meshAssetPath.c_str());
-        ImGui::TextDisabled("Render path: %s", m_meshRendererState.skinned ? "SkinnedMeshRenderer" : "static mesh pending");
+        ImGui::TextDisabled("Render path: %s", m_meshRendererState.skinned ? "SkinnedMeshRenderer" : "StaticMeshRenderer");
+    }
+
+    if (!m_meshRendererState.skinned &&
+        ImGui::CollapsingHeader(ICON_FA_PALETTE " Material", ImGuiTreeNodeFlags_DefaultOpen))
+    {
+        m_meshRendererState.materialSlotCount = std::max<std::uint32_t>(1u, m_meshRendererState.materialSlotCount);
+        m_meshRendererState.selectedMaterialSlot = std::min(m_meshRendererState.selectedMaterialSlot,
+            m_meshRendererState.materialSlotCount - 1u);
+        if (m_meshRendererState.materialSlotCount > 1)
+        {
+            ImGui::TextDisabled("Material Slot");
+            ImGui::SameLine();
+            for (std::uint32_t slot = 0; slot < m_meshRendererState.materialSlotCount; ++slot)
+            {
+                ImGui::PushID(static_cast<int>(slot));
+                if (slot > 0)
+                    ImGui::SameLine();
+                const bool selected = slot == m_meshRendererState.selectedMaterialSlot;
+                if (selected)
+                    ImGui::PushStyleColor(ImGuiCol_Button, ImGui::GetStyleColorVec4(ImGuiCol_ButtonActive));
+                if (ImGui::SmallButton(std::to_string(slot).c_str()))
+                    m_meshRendererState.selectedMaterialSlot = slot;
+                if (selected)
+                    ImGui::PopStyleColor();
+                ImGui::PopID();
+            }
+        }
+
+        auto findOverride = [&]() -> MeshSceneEntity::MaterialOverride& {
+            const std::uint32_t slot = m_meshRendererState.selectedMaterialSlot;
+            auto it = std::find_if(m_meshRendererState.materialOverrides.begin(),
+                m_meshRendererState.materialOverrides.end(),
+                [slot](const MeshSceneEntity::MaterialOverride& material) { return material.slot == slot; });
+            if (it == m_meshRendererState.materialOverrides.end())
+            {
+                MeshSceneEntity::MaterialOverride material{};
+                material.slot = slot;
+                m_meshRendererState.materialOverrides.push_back(material);
+                return m_meshRendererState.materialOverrides.back();
+            }
+            return *it;
+        };
+
+        MeshSceneEntity::MaterialOverride& material = findOverride();
+        bool changed = false;
+        changed |= ImGui::Checkbox("Override Active", &material.enabled);
+        changed |= ImGui::ColorEdit4("BaseColor Tint", material.baseColor, ImGuiColorEditFlags_Float);
+        changed |= ImGui::SliderFloat("Metallic", &material.metallic, 0.0f, 1.0f, "%.2f");
+        changed |= ImGui::SliderFloat("Roughness", &material.roughness, 0.0f, 1.0f, "%.2f");
+        changed |= ImGui::SliderFloat("Normal Strength", &material.normalStrength, 0.0f, 4.0f, "%.2f");
+        changed |= ImGui::SliderFloat("AO Strength", &material.aoStrength, 0.0f, 2.0f, "%.2f");
+        changed |= ImGui::ColorEdit3("Emissive", material.emissive, ImGuiColorEditFlags_Float);
+        changed |= ImGui::SliderFloat("Emissive Intensity", &material.emissiveIntensity, 0.0f, 20.0f, "%.2f");
+        changed |= ImGui::DragFloat2("UV Tiling", material.uvTiling, 0.01f, 0.01f, 64.0f, "%.2f");
+        changed |= ImGui::DragFloat2("UV Offset", material.uvOffset, 0.01f, -1000.0f, 1000.0f, "%.2f");
+
+        material.baseColor[0] = std::clamp(material.baseColor[0], 0.0f, 8.0f);
+        material.baseColor[1] = std::clamp(material.baseColor[1], 0.0f, 8.0f);
+        material.baseColor[2] = std::clamp(material.baseColor[2], 0.0f, 8.0f);
+        material.baseColor[3] = std::clamp(material.baseColor[3], 0.0f, 1.0f);
+        material.metallic = std::clamp(material.metallic, 0.0f, 1.0f);
+        material.roughness = std::clamp(material.roughness, 0.0f, 1.0f);
+        material.normalStrength = std::clamp(material.normalStrength, 0.0f, 4.0f);
+        material.aoStrength = std::clamp(material.aoStrength, 0.0f, 2.0f);
+        material.emissiveIntensity = std::clamp(material.emissiveIntensity, 0.0f, 20.0f);
+        material.uvTiling[0] = std::clamp(material.uvTiling[0], 0.01f, 64.0f);
+        material.uvTiling[1] = std::clamp(material.uvTiling[1], 0.01f, 64.0f);
+
+        if (changed)
+        {
+            material.enabled = true;
+            Tracenf("[MMAT] entity=%u slot=%u baseColor=(%.3f,%.3f,%.3f,%.3f) metallic=%.3f roughness=%.3f normal=%.3f ao=%.3f emissive=(%.3f,%.3f,%.3f,%.3f) uvTiling=(%.3f,%.3f) uvOffset=(%.3f,%.3f) (changed)",
+                m_meshRendererState.id,
+                material.slot,
+                material.baseColor[0], material.baseColor[1], material.baseColor[2], material.baseColor[3],
+                material.metallic,
+                material.roughness,
+                material.normalStrength,
+                material.aoStrength,
+                material.emissive[0], material.emissive[1], material.emissive[2], material.emissiveIntensity,
+                material.uvTiling[0], material.uvTiling[1],
+                material.uvOffset[0], material.uvOffset[1]);
+            Tracen("[MMAT] override buffer updated (live, no reload, no remesh)");
+            MarkSelectedMeshRendererChanged();
+        }
     }
 
     ImGui::Separator();

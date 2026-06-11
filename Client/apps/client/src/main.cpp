@@ -147,6 +147,97 @@ bool ProjectWorldToScreen(const WorldCamera& camera,
     return true;
 }
 
+WorldVec3 TransformMeshLocalPoint(const MeshSceneEntity& mesh, WorldVec3 local)
+{
+    local.x *= mesh.scale[0];
+    local.y *= mesh.scale[1];
+    local.z *= mesh.scale[2];
+
+    const float cx = std::cos(mesh.rotation[0]);
+    const float sx = std::sin(mesh.rotation[0]);
+    const float yx = local.y * cx - local.z * sx;
+    const float zx = local.y * sx + local.z * cx;
+    local.y = yx;
+    local.z = zx;
+
+    const float cy = std::cos(mesh.rotation[1]);
+    const float sy = std::sin(mesh.rotation[1]);
+    const float xy = local.x * cy - local.z * sy;
+    const float zy = local.x * sy + local.z * cy;
+    local.x = xy;
+    local.z = zy;
+
+    const float cz = std::cos(mesh.rotation[2]);
+    const float sz = std::sin(mesh.rotation[2]);
+    const float xz = local.x * cz - local.y * sz;
+    const float yz = local.x * sz + local.y * cz;
+    local.x = xz + mesh.position[0];
+    local.y = yz + mesh.position[1];
+    local.z += mesh.position[2];
+    return local;
+}
+
+std::array<WorldVec3, 8> BuildStaticMeshWorldAabbCorners(const MeshSceneEntity& mesh,
+                                                         const StaticMeshRenderer& renderer)
+{
+    const auto& bmin = renderer.BoundsMin();
+    const auto& bmax = renderer.BoundsMax();
+    const WorldVec3 center{
+        (bmin[0] + bmax[0]) * 0.5f,
+        (bmin[1] + bmax[1]) * 0.5f,
+        (bmin[2] + bmax[2]) * 0.5f};
+    WorldVec3 extent{
+        std::max(0.001f, (bmax[0] - bmin[0]) * 0.5f),
+        std::max(0.001f, (bmax[1] - bmin[1]) * 0.5f),
+        std::max(0.001f, (bmax[2] - bmin[2]) * 0.5f)};
+    const float inflate = std::max({extent.x, extent.y, extent.z}) * 0.02f + 0.10f;
+    extent.x += inflate;
+    extent.y += inflate;
+    extent.z += inflate;
+
+    std::array<WorldVec3, 8> corners{};
+    std::size_t index = 0;
+    for (int z = -1; z <= 1; z += 2)
+    {
+        for (int y = -1; y <= 1; y += 2)
+        {
+            for (int x = -1; x <= 1; x += 2)
+            {
+                corners[index++] = TransformMeshLocalPoint(mesh, {
+                    center.x + extent.x * static_cast<float>(x),
+                    center.y + extent.y * static_cast<float>(y),
+                    center.z + extent.z * static_cast<float>(z)});
+            }
+        }
+    }
+    return corners;
+}
+
+bool WorldAabbOutsideCameraFrustum(const WorldCamera& camera, const std::array<WorldVec3, 8>& corners)
+{
+    bool outsideLeft = true;
+    bool outsideRight = true;
+    bool outsideBottom = true;
+    bool outsideTop = true;
+    bool outsideNear = true;
+    bool outsideFar = true;
+    const auto& m = camera.viewProjection.m;
+    for (const WorldVec3& p : corners)
+    {
+        const float clipX = p.x * m[0] + p.y * m[4] + p.z * m[8] + m[12];
+        const float clipY = p.x * m[1] + p.y * m[5] + p.z * m[9] + m[13];
+        const float clipZ = p.x * m[2] + p.y * m[6] + p.z * m[10] + m[14];
+        const float clipW = p.x * m[3] + p.y * m[7] + p.z * m[11] + m[15];
+        outsideLeft = outsideLeft && (clipX < -clipW);
+        outsideRight = outsideRight && (clipX > clipW);
+        outsideBottom = outsideBottom && (clipY < -clipW);
+        outsideTop = outsideTop && (clipY > clipW);
+        outsideNear = outsideNear && (clipZ < 0.0f);
+        outsideFar = outsideFar && (clipZ > clipW);
+    }
+    return outsideLeft || outsideRight || outsideBottom || outsideTop || outsideNear || outsideFar;
+}
+
 std::uint32_t PickRenderEntityTarget(const std::vector<WorldRenderEntity>& entities,
                             const WorldCamera& camera,
                             uint32_t width,
@@ -402,6 +493,9 @@ MeshRendererEditorState BuildMeshRendererEditorState(const std::vector<MeshScene
     std::copy(std::begin(it->rotation), std::end(it->rotation), std::begin(state.rotation));
     std::copy(std::begin(it->scale), std::end(it->scale), std::begin(state.scale));
     state.skinned = it->skinned;
+    state.materialOverrides = it->materialOverrides;
+    state.materialSlotCount = std::max<std::uint32_t>(1u, static_cast<std::uint32_t>(state.materialOverrides.size()));
+    state.selectedMaterialSlot = std::min(state.selectedMaterialSlot, state.materialSlotCount - 1u);
     return state;
 }
 
@@ -414,6 +508,7 @@ void ApplyMeshRendererEditorState(MeshSceneEntity& mesh, const MeshRendererEdito
     std::copy(std::begin(state.rotation), std::end(state.rotation), std::begin(mesh.rotation));
     std::copy(std::begin(state.scale), std::end(state.scale), std::begin(mesh.scale));
     mesh.skinned = state.skinned;
+    mesh.materialOverrides = state.materialOverrides;
 }
 
 std::optional<std::uint32_t> PickWaterBody(const std::vector<WaterBody>& bodies,
@@ -3550,6 +3645,16 @@ int RunGame(NativeWindow& window,
                 {
                     if (auto entry = resolveModelAsset(meshRendererState.meshAssetId))
                         meshRendererState.meshDisplayName = entry->displayName.empty() ? entry->filename : entry->displayName;
+                    auto meshIt = std::find_if(editorMeshEntities.begin(), editorMeshEntities.end(),
+                        [&](const MeshSceneEntity& mesh) { return mesh.id == meshRendererState.id; });
+                    if (meshIt != editorMeshEntities.end())
+                    {
+                        const std::string runtimePath = resolveMeshRuntimePath(*meshIt);
+                        if (StaticMeshRenderer* renderer = getStaticMeshRenderer(runtimePath))
+                            meshRendererState.materialSlotCount = std::max<std::uint32_t>(1u, renderer->MaterialSlotCount());
+                    }
+                    meshRendererState.selectedMaterialSlot = std::min(meshRendererState.selectedMaterialSlot,
+                        meshRendererState.materialSlotCount > 0 ? meshRendererState.materialSlotCount - 1u : 0u);
                 }
                 editorImGui.SetMeshRendererEditorState(meshRendererState);
                 TerrainEditorState terrainState{};
@@ -3731,6 +3836,10 @@ int RunGame(NativeWindow& window,
             size_t frameStaticMeshEntityCount = 0;
             size_t frameStaticMeshSubmitted = 0;
             size_t frameStaticMeshDrawCalls = 0;
+            size_t frameStaticMeshTriangles = 0;
+            size_t frameStaticMeshUniformUpdates = 0;
+            size_t frameStaticMeshOverrideActiveDraws = 0;
+            size_t frameStaticMeshFrustumCulled = 0;
 #if defined(IXTREEME_WITH_EDITOR)
             editorImGui.SetEditorPlayModeState(editorPlay.state);
             editorImGui.BeginFrame(runtimeSession->IsMapEditorOpen());
@@ -3992,6 +4101,19 @@ int RunGame(NativeWindow& window,
                         const std::string runtimePath = resolveMeshRuntimePath(mesh);
                         if (StaticMeshRenderer* renderer = getStaticMeshRenderer(runtimePath))
                         {
+                            if (renderer->IsLoaded() &&
+                                WorldAabbOutsideCameraFrustum(camera, BuildStaticMeshWorldAabbCorners(mesh, *renderer)))
+                            {
+                                ++frameStaticMeshFrustumCulled;
+                                if (frameNumber < 3 || (frameNumber % 60u) == 0u)
+                                {
+                                    Tracenf("[MESH-CULL] culled id=%u name=%s path=%s",
+                                        mesh.id,
+                                        mesh.name.c_str(),
+                                        runtimePath.c_str());
+                                }
+                                continue;
+                            }
                             renderer->SetLightingState(runtimeSession->GetLightingState());
                             StaticMeshRenderer::Instance instance{};
                             instance.position = {mesh.position[0], mesh.position[1], mesh.position[2]};
@@ -4004,12 +4126,16 @@ int RunGame(NativeWindow& window,
                             instance.tint = selected
                                 ? std::array<float, 4>{1.25f, 1.05f, 0.45f, 1.0f}
                                 : std::array<float, 4>{1.0f, 1.0f, 1.0f, 1.0f};
+                            instance.materialOverrides = mesh.materialOverrides;
                             renderer->RenderInWorld(device, seconds, camera, instance);
                             const std::uint32_t submittedDrawCalls = renderer->LastSubmittedDrawCalls();
                             if (submittedDrawCalls > 0)
                             {
                                 ++frameStaticMeshSubmitted;
                                 frameStaticMeshDrawCalls += submittedDrawCalls;
+                                frameStaticMeshTriangles += renderer->TriangleCount();
+                                frameStaticMeshUniformUpdates += renderer->LastMaterialUniformUpdates();
+                                frameStaticMeshOverrideActiveDraws += renderer->LastOverrideActiveDraws();
                                 if (frameNumber < 3 || (frameNumber % 60u) == 0u)
                                 {
                                     const auto& bmin = renderer->BoundsMin();
@@ -4085,6 +4211,23 @@ int RunGame(NativeWindow& window,
                     frameStaticMeshEntityCount,
                     frameStaticMeshSubmitted,
                     frameStaticMeshDrawCalls);
+                Tracenf("[MPERF] pass=main drawcalls=%zu tris=%zu",
+                    frameStaticMeshDrawCalls,
+                    frameStaticMeshTriangles);
+                for (int cascade = 0; cascade < 4; ++cascade)
+                    Tracenf("[MPERF] pass=shadow-cascade%d drawcalls=0 tris=0", cascade);
+                Tracen("[MPERF] pass=water-reflection drawcalls=0 tris=0");
+                Tracenf("[MPERF] mmat overrideUpdatesThisFrame=%zu activeOverrideDraws=%zu mode=every-frame descriptorAllocPerDraw=no bufferMapPerDraw=yes queueWaitPerDraw=no",
+                    frameStaticMeshUniformUpdates,
+                    frameStaticMeshOverrideActiveDraws);
+                Tracenf("[MPERF] meshes total=%zu frustumCulled=%zu drawn=%zu cullEnabled=yes",
+                    frameStaticMeshEntityCount,
+                    frameStaticMeshFrustumCulled,
+                    frameStaticMeshSubmitted);
+                const VkExtent2D mperfExtent = useOffscreenScene ? offscreenScene.GetExtent() : renderSize;
+                Tracenf("[MPERF] offscreen=%ux%u halfResTestFps=n/a boundHint=unknown",
+                    mperfExtent.width,
+                    mperfExtent.height);
                 Tracenf("[FRAME] summary frame=%llu imgui_render called=%s rmlui_render called=%s scene_render called=%s entity_count=%zu clear_color=(0.04,0.05,0.09,1.00) in_world=%d lobby=%d editor_open=%d swapchain=%ux%u",
                     static_cast<unsigned long long>(frameNumber),
                     frameImGuiRenderCalled ? "yes" : "no",

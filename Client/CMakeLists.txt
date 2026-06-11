@@ -190,6 +190,8 @@ if(WIN32)
     set(SKINNED_MESH_VS_SPV "${GENERATED_SHADER_DIR}/skinned_mesh_vs.spv")
     set(SKINNED_MESH_PS_SPV "${GENERATED_SHADER_DIR}/skinned_mesh_ps.spv")
     set(SKINNED_MESH_CS_SPV "${GENERATED_SHADER_DIR}/skinned_mesh_cs.spv")
+    set(STATIC_MESH_VS_SPV "${GENERATED_SHADER_DIR}/static_mesh_vs.spv")
+    set(STATIC_MESH_PS_SPV "${GENERATED_SHADER_DIR}/static_mesh_ps.spv")
     set(TERRAIN_VS_SPV "${GENERATED_SHADER_DIR}/terrain_vs.spv")
     set(TERRAIN_PS_SPV "${GENERATED_SHADER_DIR}/terrain_ps.spv")
     set(WATER_VS_SPV "${GENERATED_SHADER_DIR}/water_vs.spv")
@@ -240,6 +242,22 @@ if(WIN32)
         COMMAND "${DXC_EXECUTABLE}" -spirv -T cs_6_0 -E CSMain
             -Fo "${SKINNED_MESH_CS_SPV}" "${CLIENT_ROOT}/shaders/SkinnedMeshSkin.hlsl"
         DEPENDS "${CLIENT_ROOT}/shaders/SkinnedMeshSkin.hlsl"
+        VERBATIM
+    )
+    add_custom_command(
+        OUTPUT "${STATIC_MESH_VS_SPV}"
+        COMMAND ${CMAKE_COMMAND} -E make_directory "${GENERATED_SHADER_DIR}"
+        COMMAND "${DXC_EXECUTABLE}" -spirv -T vs_6_0 -E VSMain
+            -Fo "${STATIC_MESH_VS_SPV}" "${CLIENT_ROOT}/shaders/StaticMesh.hlsl"
+        DEPENDS "${CLIENT_ROOT}/shaders/StaticMesh.hlsl"
+        VERBATIM
+    )
+    add_custom_command(
+        OUTPUT "${STATIC_MESH_PS_SPV}"
+        COMMAND ${CMAKE_COMMAND} -E make_directory "${GENERATED_SHADER_DIR}"
+        COMMAND "${DXC_EXECUTABLE}" -spirv -T ps_6_0 -E PSMain
+            -Fo "${STATIC_MESH_PS_SPV}" "${CLIENT_ROOT}/shaders/StaticMesh.hlsl"
+        DEPENDS "${CLIENT_ROOT}/shaders/StaticMesh.hlsl"
         VERBATIM
     )
     add_custom_command(
@@ -336,6 +354,8 @@ if(WIN32)
         "${SKINNED_MESH_VS_SPV}"
         "${SKINNED_MESH_PS_SPV}"
         "${SKINNED_MESH_CS_SPV}"
+        "${STATIC_MESH_VS_SPV}"
+        "${STATIC_MESH_PS_SPV}"
         "${TERRAIN_VS_SPV}"
         "${TERRAIN_PS_SPV}"
         "${WATER_VS_SPV}"
