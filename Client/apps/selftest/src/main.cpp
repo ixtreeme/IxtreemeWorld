@@ -1252,13 +1252,14 @@ bool RunRenderChecks(const Options& options, TestContext& ctx)
             iconsHeaderSource.find("ICON_FA_PLAY") != std::string::npos &&
             iconsHeaderSource.find("ICON_FA_TRASH") != std::string::npos,
         "editor visual fonts and icons", "EDITOR-VISUAL-POLISH must bundle Inter, FontAwesome, and icon constants");
-    ctx.Expect(editorImGuiSource.find("ApplyAaaImGuiStyle") != std::string::npos &&
-            editorImGuiSource.find("WindowRounding = 6.0f") != std::string::npos &&
-            editorImGuiSource.find("FramePadding = ImVec2(8.0f, 6.0f)") != std::string::npos &&
+    ctx.Expect(editorImGuiSource.find("ApplyEditorStyle") != std::string::npos &&
+            editorImGuiSource.find("WindowRounding = 4.0f") != std::string::npos &&
+            editorImGuiSource.find("FramePadding = ImVec2(8.0f, 3.0f)") != std::string::npos &&
+            editorImGuiSource.find("FrameBorderSize = 1.0f") != std::string::npos &&
             editorImGuiSource.find("ImGuiCol_ButtonHovered") != std::string::npos &&
-            editorImGuiSource.find("0.28f, 0.48f, 0.75f") != std::string::npos &&
-            editorImGuiSource.find("[EDITOR-VISUAL] AAA-style ImGui colors applied") != std::string::npos,
-        "editor aaa imgui style", "EDITOR-VISUAL-POLISH must apply deep backgrounds, rounded corners, padding, and blue hover accents");
+            editorImGuiSource.find("ColorU8(61, 126, 219") != std::string::npos &&
+            editorImGuiSource.find("[EDITOR-VISUAL] Dark compact editor style applied") != std::string::npos,
+        "editor dark compact imgui style", "EDITOR-VISUAL-POLISH must apply neutral dark backgrounds, compact controls, subtle borders, and blue accents");
     ctx.Expect(uiHelpersSource.find("namespace UI") != std::string::npos &&
             uiHelpersSource.find("PropertyRow") != std::string::npos &&
             uiHelpersSource.find("IconButton") != std::string::npos &&

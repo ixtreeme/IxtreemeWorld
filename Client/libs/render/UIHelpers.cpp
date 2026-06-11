@@ -78,14 +78,14 @@ bool IconOnlyButton(const char* icon, float size)
 
 void SectionHeader(const char* text)
 {
-    ImGui::Spacing();
+    ImGui::Dummy(ImVec2(0.0f, 2.0f));
     if (g_fonts.bold)
         ImGui::PushFont(g_fonts.bold);
-    ImGui::TextColored(ImVec4(0.94f, 0.96f, 1.0f, 1.0f), "%s", text);
+    ImGui::TextColored(ImVec4(0.78f, 0.81f, 0.86f, 1.0f), "%s", text);
     if (g_fonts.bold)
         ImGui::PopFont();
     ImGui::Separator();
-    ImGui::Spacing();
+    ImGui::Dummy(ImVec2(0.0f, 1.0f));
 }
 
 void ColoredText(const ImVec4& color, const char* fmt, ...)

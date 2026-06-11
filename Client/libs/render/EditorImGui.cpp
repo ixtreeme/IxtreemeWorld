@@ -357,67 +357,96 @@ void LoadEditorFonts()
     UI::SetEditorFonts({regular, bold});
 }
 
-void ApplyAaaImGuiStyle()
+ImVec4 ColorU8(int r, int g, int b, int a = 255)
+{
+    const auto toLinear = [](int value) {
+        const float srgb = static_cast<float>(value) / 255.0f;
+        return srgb <= 0.04045f ? srgb / 12.92f : std::pow((srgb + 0.055f) / 1.055f, 2.4f);
+    };
+    return ImVec4(
+        toLinear(r),
+        toLinear(g),
+        toLinear(b),
+        static_cast<float>(a) / 255.0f);
+}
+
+void ApplyEditorStyle()
 {
     ImGuiStyle& style = ImGui::GetStyle();
 
-    style.WindowRounding = 6.0f;
-    style.ChildRounding = 6.0f;
-    style.FrameRounding = 4.0f;
-    style.PopupRounding = 6.0f;
-    style.ScrollbarRounding = 8.0f;
-    style.GrabRounding = 4.0f;
-    style.TabRounding = 4.0f;
+    style.WindowRounding = 4.0f;
+    style.ChildRounding = 4.0f;
+    style.FrameRounding = 3.0f;
+    style.PopupRounding = 4.0f;
+    style.ScrollbarRounding = 3.0f;
+    style.GrabRounding = 3.0f;
+    style.TabRounding = 3.0f;
 
-    style.WindowPadding = ImVec2(12.0f, 12.0f);
-    style.FramePadding = ImVec2(8.0f, 6.0f);
-    style.ItemSpacing = ImVec2(10.0f, 8.0f);
-    style.ItemInnerSpacing = ImVec2(8.0f, 6.0f);
-    style.IndentSpacing = 22.0f;
+    style.WindowPadding = ImVec2(10.0f, 8.0f);
+    style.FramePadding = ImVec2(8.0f, 3.0f);
+    style.ItemSpacing = ImVec2(8.0f, 4.0f);
+    style.ItemInnerSpacing = ImVec2(6.0f, 4.0f);
+    style.IndentSpacing = 18.0f;
+    style.CellPadding = ImVec2(5.0f, 3.0f);
+    style.GrabMinSize = 11.0f;
+    style.ScrollbarSize = 12.0f;
 
     style.WindowBorderSize = 1.0f;
-    style.FrameBorderSize = 0.0f;
+    style.ChildBorderSize = 1.0f;
+    style.FrameBorderSize = 1.0f;
     style.PopupBorderSize = 1.0f;
     style.TabBorderSize = 0.0f;
 
     ImVec4* colors = style.Colors;
-    colors[ImGuiCol_WindowBg] = ImVec4(0.12f, 0.12f, 0.14f, 1.00f);
-    colors[ImGuiCol_ChildBg] = ImVec4(0.10f, 0.10f, 0.12f, 1.00f);
-    colors[ImGuiCol_PopupBg] = ImVec4(0.14f, 0.14f, 0.16f, 0.97f);
-    colors[ImGuiCol_TitleBg] = ImVec4(0.08f, 0.08f, 0.10f, 1.00f);
-    colors[ImGuiCol_TitleBgActive] = ImVec4(0.10f, 0.10f, 0.13f, 1.00f);
-    colors[ImGuiCol_TitleBgCollapsed] = ImVec4(0.06f, 0.06f, 0.08f, 1.00f);
-    colors[ImGuiCol_FrameBg] = ImVec4(0.18f, 0.18f, 0.21f, 1.00f);
-    colors[ImGuiCol_FrameBgHovered] = ImVec4(0.24f, 0.24f, 0.28f, 1.00f);
-    colors[ImGuiCol_FrameBgActive] = ImVec4(0.28f, 0.30f, 0.36f, 1.00f);
-    colors[ImGuiCol_Button] = ImVec4(0.22f, 0.22f, 0.26f, 1.00f);
-    colors[ImGuiCol_ButtonHovered] = ImVec4(0.28f, 0.48f, 0.75f, 1.00f);
-    colors[ImGuiCol_ButtonActive] = ImVec4(0.20f, 0.42f, 0.70f, 1.00f);
-    colors[ImGuiCol_Header] = ImVec4(0.18f, 0.30f, 0.50f, 0.50f);
-    colors[ImGuiCol_HeaderHovered] = ImVec4(0.28f, 0.48f, 0.75f, 0.70f);
-    colors[ImGuiCol_HeaderActive] = ImVec4(0.28f, 0.48f, 0.75f, 1.00f);
-    colors[ImGuiCol_Tab] = ImVec4(0.14f, 0.14f, 0.17f, 1.00f);
-    colors[ImGuiCol_TabHovered] = ImVec4(0.28f, 0.48f, 0.75f, 0.80f);
-    colors[ImGuiCol_TabActive] = ImVec4(0.22f, 0.40f, 0.65f, 1.00f);
-    colors[ImGuiCol_TabUnfocused] = ImVec4(0.10f, 0.10f, 0.12f, 1.00f);
-    colors[ImGuiCol_TabUnfocusedActive] = ImVec4(0.18f, 0.30f, 0.50f, 1.00f);
-    colors[ImGuiCol_CheckMark] = ImVec4(0.40f, 0.70f, 1.00f, 1.00f);
-    colors[ImGuiCol_SliderGrab] = ImVec4(0.40f, 0.70f, 1.00f, 1.00f);
-    colors[ImGuiCol_SliderGrabActive] = ImVec4(0.55f, 0.80f, 1.00f, 1.00f);
-    colors[ImGuiCol_Separator] = ImVec4(0.25f, 0.25f, 0.28f, 1.00f);
-    colors[ImGuiCol_SeparatorHovered] = ImVec4(0.40f, 0.70f, 1.00f, 0.80f);
-    colors[ImGuiCol_SeparatorActive] = ImVec4(0.55f, 0.80f, 1.00f, 1.00f);
-    colors[ImGuiCol_Border] = ImVec4(0.20f, 0.20f, 0.24f, 1.00f);
+    colors[ImGuiCol_WindowBg] = ColorU8(27, 29, 33);
+    colors[ImGuiCol_ChildBg] = ColorU8(33, 36, 41);
+    colors[ImGuiCol_PopupBg] = ColorU8(30, 33, 37, 248);
+    colors[ImGuiCol_MenuBarBg] = ColorU8(30, 32, 36);
+    colors[ImGuiCol_TitleBg] = ColorU8(24, 26, 30);
+    colors[ImGuiCol_TitleBgActive] = ColorU8(32, 35, 40);
+    colors[ImGuiCol_TitleBgCollapsed] = ColorU8(22, 24, 28);
+    colors[ImGuiCol_FrameBg] = ColorU8(42, 46, 52);
+    colors[ImGuiCol_FrameBgHovered] = ColorU8(51, 56, 64);
+    colors[ImGuiCol_FrameBgActive] = ColorU8(58, 65, 75);
+    colors[ImGuiCol_Button] = ColorU8(46, 51, 58);
+    colors[ImGuiCol_ButtonHovered] = ColorU8(58, 65, 75);
+    colors[ImGuiCol_ButtonActive] = ColorU8(69, 77, 88);
+    colors[ImGuiCol_Header] = ColorU8(38, 42, 48);
+    colors[ImGuiCol_HeaderHovered] = ColorU8(49, 55, 64);
+    colors[ImGuiCol_HeaderActive] = ColorU8(58, 65, 75);
+    colors[ImGuiCol_Tab] = ColorU8(36, 40, 46);
+    colors[ImGuiCol_TabHovered] = ColorU8(52, 58, 66);
+    colors[ImGuiCol_TabActive] = ColorU8(46, 51, 58);
+    colors[ImGuiCol_TabUnfocused] = ColorU8(30, 33, 38);
+    colors[ImGuiCol_TabUnfocusedActive] = ColorU8(39, 43, 49);
+    colors[ImGuiCol_CheckMark] = ColorU8(61, 126, 219);
+    colors[ImGuiCol_SliderGrab] = ColorU8(61, 126, 219);
+    colors[ImGuiCol_SliderGrabActive] = ColorU8(91, 155, 232);
+    colors[ImGuiCol_Separator] = ColorU8(46, 50, 58);
+    colors[ImGuiCol_SeparatorHovered] = ColorU8(61, 126, 219, 204);
+    colors[ImGuiCol_SeparatorActive] = ColorU8(91, 155, 232);
+    colors[ImGuiCol_Border] = ColorU8(52, 56, 63);
     colors[ImGuiCol_BorderShadow] = ImVec4(0.00f, 0.00f, 0.00f, 0.00f);
-    colors[ImGuiCol_Text] = ImVec4(0.94f, 0.94f, 0.94f, 1.00f);
-    colors[ImGuiCol_TextDisabled] = ImVec4(0.50f, 0.50f, 0.55f, 1.00f);
-    colors[ImGuiCol_DragDropTarget] = ImVec4(0.40f, 0.70f, 1.00f, 0.80f);
-    colors[ImGuiCol_ScrollbarBg] = ImVec4(0.08f, 0.08f, 0.10f, 1.00f);
-    colors[ImGuiCol_ScrollbarGrab] = ImVec4(0.30f, 0.30f, 0.34f, 1.00f);
-    colors[ImGuiCol_ScrollbarGrabHovered] = ImVec4(0.40f, 0.40f, 0.46f, 1.00f);
-    colors[ImGuiCol_ScrollbarGrabActive] = ImVec4(0.50f, 0.50f, 0.56f, 1.00f);
+    colors[ImGuiCol_Text] = ColorU8(213, 216, 221);
+    colors[ImGuiCol_TextDisabled] = ColorU8(107, 112, 121);
+    colors[ImGuiCol_DragDropTarget] = ColorU8(61, 126, 219, 204);
+    colors[ImGuiCol_ScrollbarBg] = ColorU8(27, 29, 33);
+    colors[ImGuiCol_ScrollbarGrab] = ColorU8(58, 62, 70);
+    colors[ImGuiCol_ScrollbarGrabHovered] = ColorU8(73, 79, 88);
+    colors[ImGuiCol_ScrollbarGrabActive] = ColorU8(91, 99, 110);
+    colors[ImGuiCol_ResizeGrip] = ColorU8(61, 126, 219, 64);
+    colors[ImGuiCol_ResizeGripHovered] = ColorU8(61, 126, 219, 128);
+    colors[ImGuiCol_ResizeGripActive] = ColorU8(91, 155, 232, 190);
+    colors[ImGuiCol_TableHeaderBg] = ColorU8(38, 42, 48);
+    colors[ImGuiCol_TableBorderStrong] = ColorU8(52, 56, 63);
+    colors[ImGuiCol_TableBorderLight] = ColorU8(46, 50, 58);
+    colors[ImGuiCol_TableRowBg] = ImVec4(0.0f, 0.0f, 0.0f, 0.0f);
+    colors[ImGuiCol_TableRowBgAlt] = ColorU8(255, 255, 255, 10);
+    colors[ImGuiCol_NavHighlight] = ColorU8(61, 126, 219, 190);
+    colors[ImGuiCol_DockingPreview] = ColorU8(61, 126, 219, 102);
+    colors[ImGuiCol_DockingEmptyBg] = ColorU8(27, 29, 33);
 
-    Tracen("[EDITOR-VISUAL] AAA-style ImGui colors applied");
+    Tracen("[EDITOR-VISUAL] Dark compact editor style applied");
 }
 }
 
@@ -447,7 +476,7 @@ bool EditorImGui::Create(VulkanDevice& device, HWND hwnd)
     m_applyDefaultDockLayout = !std::filesystem::exists(kLayoutFile);
 
     LoadEditorFonts();
-    ApplyAaaImGuiStyle();
+    ApplyEditorStyle();
 
     if (!CreateDescriptorPool(device))
     {
@@ -4120,17 +4149,21 @@ void EditorImGui::RenderSplatLayerSlot(std::uint32_t slotIndex)
     MapEditorPaletteSlot& slot = m_paletteSlots[slotIndex];
     ImGui::PushID(static_cast<int>(slotIndex));
     const bool selected = m_editorSettings.textureSlot == slotIndex;
-    ImVec4 color = selected ? ImVec4(0.82f, 0.68f, 0.18f, 1.0f) : ImVec4(0.28f, 0.34f, 0.40f, 1.0f);
-    ImGui::PushStyleColor(ImGuiCol_Button, color);
+    const ImVec4 selectedColor = ImVec4(0.20f, 0.34f, 0.56f, 1.0f);
+    const ImVec4 selectedHover = ImVec4(0.24f, 0.42f, 0.68f, 1.0f);
+    const ImVec4 idleColor = ImGui::GetStyleColorVec4(ImGuiCol_Button);
+    ImGui::PushStyleColor(ImGuiCol_Button, selected ? selectedColor : idleColor);
+    ImGui::PushStyleColor(ImGuiCol_ButtonHovered, selected ? selectedHover : ImGui::GetStyleColorVec4(ImGuiCol_ButtonHovered));
+    ImGui::PushStyleColor(ImGuiCol_ButtonActive, selected ? selectedHover : ImGui::GetStyleColorVec4(ImGuiCol_ButtonActive));
     const std::string label = std::to_string(slotIndex) + "##splat_slot";
-    if (ImGui::Button(label.c_str(), ImVec2(58.0f, 52.0f)))
+    if (ImGui::Button(label.c_str(), ImVec2(48.0f, 38.0f)))
     {
         m_editorSettings.textureSlot = slotIndex;
         m_editorSettings.tool = MapEditorTool::Paint;
         if (m_editorSettings.toolMode != MapEditorToolMode::SplatPaint)
             SetToolMode(MapEditorToolMode::SplatPaint);
     }
-    ImGui::PopStyleColor();
+    ImGui::PopStyleColor(3);
 
     if (m_assetFilter != AssetBrowserFilter::Scene && ImGui::BeginDragDropTarget())
     {
