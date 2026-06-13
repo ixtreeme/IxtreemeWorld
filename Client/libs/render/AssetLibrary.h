@@ -69,6 +69,8 @@ public:
         std::uint32_t resolutionHeight = 0;
         MaterialData material;
         WaterMaterialData waterMaterial;
+        bool hasLodDefault = false;
+        LodConfig lodDefault;
     };
 
     struct ImportOptions
@@ -122,6 +124,10 @@ public:
                              const std::string& displayName,
                              const std::vector<std::string>& tags,
                              std::string& error);
+    bool UpdateModelLodDefault(const std::string& id,
+                               const LodConfig& config,
+                               Entry& outEntry,
+                               std::string& error);
     bool MoveAssetToSubpath(const std::string& id, const std::string& subpath, Entry& outEntry, std::string& error);
     bool RenameAsset(const std::string& id,
                      const std::string& newBaseName,

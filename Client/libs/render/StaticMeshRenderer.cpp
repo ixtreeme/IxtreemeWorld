@@ -7,20 +7,25 @@
 #include <fastgltf/math.hpp>
 #include <fastgltf/tools.hpp>
 
+#include <meshoptimizer.h>
 #include <stb_image.h>
 
 #include <algorithm>
 #include <array>
+#include <chrono>
 #include <cmath>
+#include <cstddef>
 #include <cstdarg>
 #include <cstdint>
 #include <cstdio>
 #include <cstdlib>
 #include <cstring>
 #include <filesystem>
+#include <fstream>
 #include <limits>
 #include <optional>
 #include <string>
+#include <type_traits>
 #include <utility>
 #include <variant>
 #include <vector>
@@ -34,6 +39,8 @@ void LogFormat(const char* format, ...)
     va_start(args, format);
     std::vsnprintf(buffer, sizeof(buffer), format, args);
     va_end(args);
+    if (!LodLogsEnabled() && std::strncmp(buffer, "[LOD", 4) == 0)
+        return;
     Tracen(buffer);
 }
 
@@ -99,6 +106,69 @@ struct UniformBlock
     PointLightUniform pointLights[kMaxDynamicPointLights]{};
     SpotLightUniform spotLights[kMaxDynamicSpotLights]{};
 };
+
+struct StaticMeshInstanceBlock
+{
+    Mat4 mvp;
+    Mat4 model;
+    float tint[4] = {1.0f, 1.0f, 1.0f, 1.0f};
+    float materialBaseColor[4] = {1.0f, 1.0f, 1.0f, 1.0f};
+    float materialParams[4] = {1.0f, 1.0f, 1.0f, 1.0f};
+    float materialEmissive[4] = {0.0f, 0.0f, 0.0f, 0.0f};
+    float materialUv[4] = {1.0f, 1.0f, 0.0f, 0.0f};
+};
+
+struct InstancedDrawCommand
+{
+    uint32_t firstIndex = 0;
+    uint32_t indexCount = 0;
+    uint32_t firstInstance = 0;
+    uint32_t instanceCount = 0;
+    uint32_t materialSlot = 0;
+    uint32_t sourceSubmesh = 0;
+};
+
+template <typename Handle>
+unsigned long long VkHandleValue(Handle handle)
+{
+    if constexpr (std::is_pointer_v<Handle>)
+        return static_cast<unsigned long long>(reinterpret_cast<std::uintptr_t>(handle));
+    else
+        return static_cast<unsigned long long>(handle);
+}
+
+const char* AlphaModeForLog(const std::string& alphaMode)
+{
+    if (alphaMode == "mask")
+        return "mask";
+    if (alphaMode == "blend")
+        return "blend";
+    return "opaque";
+}
+
+template <typename T>
+bool ReadBinary(std::istream& in, T& value)
+{
+    in.read(reinterpret_cast<char*>(&value), sizeof(T));
+    return static_cast<bool>(in);
+}
+
+template <typename T>
+void WriteBinary(std::ostream& out, const T& value)
+{
+    out.write(reinterpret_cast<const char*>(&value), sizeof(T));
+}
+
+const char* LodSourceName(StaticMeshRenderer::LodBufferSource source)
+{
+    switch (source)
+    {
+    case StaticMeshRenderer::LodBufferSource::Preview: return "preview";
+    case StaticMeshRenderer::LodBufferSource::Cache: return "cache";
+    case StaticMeshRenderer::LodBufferSource::Commit: return "commit";
+    default: return "unknown";
+    }
+}
 
 struct RgbaImage
 {
@@ -253,6 +323,71 @@ void FillLightingUniform(const LightingState& lighting, UniformBlock& uniform)
         out.color[2] = std::max(0.0f, spot.b) * intensity;
         out.color[3] = std::cos(spot.outerConeDegrees * 3.1415926535f / 180.0f);
         out.direction[3] = std::max(out.direction[3], out.color[3]);
+    }
+}
+
+Mat4 BuildStaticMeshModelMatrix(const StaticMeshRenderer::Instance& instance)
+{
+    return Multiply(
+        Multiply(
+            Multiply(
+                Multiply(Scale(instance.scale[0], instance.scale[1], instance.scale[2]),
+                    RotationX(instance.rotation[0])),
+                RotationY(instance.rotation[1])),
+            RotationZ(instance.rotation[2])),
+        Translation(instance.position.x, instance.position.y, instance.position.z));
+}
+
+void FillStaticMeshInstanceBlock(const WorldCamera& camera,
+    const StaticMeshRenderer::Instance& instance,
+    uint32_t materialSlot,
+    const std::vector<StaticMeshRenderer::MaterialDefaults>& materialDefaults,
+    StaticMeshInstanceBlock& out)
+{
+    out = {};
+    out.model = BuildStaticMeshModelMatrix(instance);
+    out.mvp = Multiply(out.model, ToLocalMat4(camera.viewProjection));
+    out.tint[0] = instance.tint[0];
+    out.tint[1] = instance.tint[1];
+    out.tint[2] = instance.tint[2];
+    out.tint[3] = instance.tint[3];
+
+    const StaticMeshRenderer::MaterialDefaults fallbackDefaults{};
+    const StaticMeshRenderer::MaterialDefaults& defaults = materialDefaults.empty()
+        ? fallbackDefaults
+        : (materialSlot < materialDefaults.size() ? materialDefaults[materialSlot] : materialDefaults.front());
+    std::memcpy(out.materialBaseColor, defaults.baseColor, sizeof(out.materialBaseColor));
+    out.materialParams[0] = defaults.metallic;
+    out.materialParams[1] = defaults.roughness;
+    out.materialParams[2] = defaults.normalStrength;
+    out.materialParams[3] = defaults.aoStrength;
+    out.materialEmissive[0] = defaults.emissive[0];
+    out.materialEmissive[1] = defaults.emissive[1];
+    out.materialEmissive[2] = defaults.emissive[2];
+    out.materialEmissive[3] = 1.0f;
+    out.materialUv[0] = 1.0f;
+    out.materialUv[1] = 1.0f;
+    out.materialUv[2] = 0.0f;
+    out.materialUv[3] = 0.0f;
+
+    for (const MeshSceneEntity::MaterialOverride& overrideSlot : instance.materialOverrides)
+    {
+        if (overrideSlot.slot != materialSlot || !overrideSlot.enabled)
+            continue;
+        std::memcpy(out.materialBaseColor, overrideSlot.baseColor, sizeof(out.materialBaseColor));
+        out.materialParams[0] = overrideSlot.metallic;
+        out.materialParams[1] = overrideSlot.roughness;
+        out.materialParams[2] = overrideSlot.normalStrength;
+        out.materialParams[3] = overrideSlot.aoStrength;
+        out.materialEmissive[0] = overrideSlot.emissive[0];
+        out.materialEmissive[1] = overrideSlot.emissive[1];
+        out.materialEmissive[2] = overrideSlot.emissive[2];
+        out.materialEmissive[3] = overrideSlot.emissiveIntensity;
+        out.materialUv[0] = overrideSlot.uvTiling[0];
+        out.materialUv[1] = overrideSlot.uvTiling[1];
+        out.materialUv[2] = overrideSlot.uvOffset[0];
+        out.materialUv[3] = overrideSlot.uvOffset[1];
+        break;
     }
 }
 
@@ -566,6 +701,22 @@ void EndOneTimeCommands(VkDevice vkDevice, VkQueue queue, VkCommandPool pool, Vk
     vkDestroyCommandPool(vkDevice, pool, nullptr);
 }
 
+VkFence SubmitOneTimeCommandsNoWait(VkDevice vkDevice, VkQueue queue, VkCommandBuffer cmd)
+{
+    VK_CHECK(vkEndCommandBuffer(cmd));
+    VkFenceCreateInfo fenceCreate{};
+    fenceCreate.sType = VK_STRUCTURE_TYPE_FENCE_CREATE_INFO;
+    VkFence fence = VK_NULL_HANDLE;
+    VK_CHECK(vkCreateFence(vkDevice, &fenceCreate, nullptr, &fence));
+
+    VkSubmitInfo submit{};
+    submit.sType = VK_STRUCTURE_TYPE_SUBMIT_INFO;
+    submit.commandBufferCount = 1;
+    submit.pCommandBuffers = &cmd;
+    VK_CHECK(vkQueueSubmit(queue, 1, &submit, fence));
+    return fence;
+}
+
 bool CreateHostVisibleBuffer(VulkanDevice& device, VkDevice vkDevice, VkDeviceSize size,
     VkBufferUsageFlags usage, const void* initialData, StaticMeshRenderer::Buffer& out)
 {
@@ -723,6 +874,7 @@ bool StaticMeshRenderer::Create(VulkanDevice& device, client::asset::IAssetReade
     Destroy();
     m_device = device.GetDevice();
     m_assets = &assets;
+    m_modelPath = modelPath;
     m_status = LoadStatus::Failed;
     bool loaded = false;
     bool buffers = false;
@@ -806,6 +958,75 @@ bool StaticMeshRenderer::RecreatePipeline(VulkanDevice& device)
     return CreatePipeline(device);
 }
 
+std::size_t StaticMeshRenderer::TriangleCountForLod(std::uint64_t configHash, std::uint32_t lodLevel) const
+{
+    if (configHash == 0 || lodLevel == 0)
+        return TriangleCount();
+    const auto it = m_lodBuffers.find(configHash);
+    if (it == m_lodBuffers.end() || it->second.levels == 0)
+        return TriangleCount();
+    const std::uint32_t level = std::min<std::uint32_t>(lodLevel, it->second.levels - 1u);
+    return it->second.triangles[level] > 0 ? it->second.triangles[level] : TriangleCount();
+}
+
+StaticMeshRenderer::LodDiagnostics StaticMeshRenderer::GetLodDiagnostics(std::uint64_t configHash) const
+{
+    LodDiagnostics diag{};
+    diag.vertexCount = m_vertices.size();
+    if (configHash == 0)
+    {
+        diag.bufferKnown = true;
+        diag.bufferValid = m_indexBuffer.buffer != VK_NULL_HANDLE;
+        diag.levelCount = 1;
+        diag.levelTris[0] = TriangleCount();
+        diag.levelIndices[0] = m_indices.size();
+        diag.source = "fullres";
+        return diag;
+    }
+
+    const auto existing = m_lodBuffers.find(configHash);
+    if (existing != m_lodBuffers.end())
+    {
+        diag.bufferKnown = true;
+        diag.bufferValid = existing->second.buffer.buffer != VK_NULL_HANDLE;
+        diag.levelCount = existing->second.levels;
+        diag.levelTris = existing->second.triangles;
+        const std::size_t drawsPerLevel = m_draws.size();
+        for (std::uint32_t level = 0; level < existing->second.levels && level < LodConfig::MaxLevels; ++level)
+        {
+            const std::size_t begin = static_cast<std::size_t>(level) * drawsPerLevel;
+            const std::size_t end = std::min(begin + drawsPerLevel, existing->second.draws.size());
+            for (std::size_t i = begin; i < end; ++i)
+                diag.levelIndices[level] += existing->second.draws[i].indexCount;
+        }
+        diag.source = LodSourceName(existing->second.source);
+        return diag;
+    }
+
+    const auto pending = std::find_if(m_pendingLodUploads.begin(), m_pendingLodUploads.end(),
+        [&](const PendingLodUpload& upload) { return upload.configHash == configHash; });
+    if (pending != m_pendingLodUploads.end())
+    {
+        diag.bufferKnown = true;
+        diag.pendingUpload = true;
+        diag.bufferValid = false;
+        diag.levelCount = pending->lodSet.levels;
+        diag.levelTris = pending->lodSet.triangles;
+        const std::size_t drawsPerLevel = m_draws.size();
+        for (std::uint32_t level = 0; level < pending->lodSet.levels && level < LodConfig::MaxLevels; ++level)
+        {
+            const std::size_t begin = static_cast<std::size_t>(level) * drawsPerLevel;
+            const std::size_t end = std::min(begin + drawsPerLevel, pending->lodSet.draws.size());
+            for (std::size_t i = begin; i < end; ++i)
+                diag.levelIndices[level] += pending->lodSet.draws[i].indexCount;
+        }
+        diag.source = LodSourceName(pending->lodSet.source);
+        return diag;
+    }
+
+    return diag;
+}
+
 void StaticMeshRenderer::SetMainRenderPass(VkRenderPass renderPass)
 {
     m_mainRenderPass = renderPass;
@@ -832,6 +1053,9 @@ bool StaticMeshRenderer::LoadStaticGltfMesh(const std::string& modelPath)
     m_vertices.clear();
     m_indices.clear();
     m_draws.clear();
+    m_lodProxyBuilt = false;
+    m_lodProxyIndices.clear();
+    m_lodProxyDraws.clear();
     m_materialDefaults.clear();
     m_alphaModeName = "opaque";
     m_materialDefaults.reserve(std::max<std::size_t>(asset.materials.size(), 1u));
@@ -962,7 +1186,602 @@ bool StaticMeshRenderer::CreateBuffers(VulkanDevice& device)
                 VK_BUFFER_USAGE_UNIFORM_BUFFER_BIT, nullptr, buffer);
         }
     }
+    for (uint32_t frame = 0; frame < kFramesInFlight; ++frame)
+    {
+        m_instanceBufferCapacity[frame] = kInitialInstanceCapacity;
+        CreateHostVisibleBuffer(device,
+            m_device,
+            sizeof(StaticMeshInstanceBlock) * m_instanceBufferCapacity[frame],
+            VK_BUFFER_USAGE_STORAGE_BUFFER_BIT,
+            nullptr,
+            m_instanceBuffers[frame]);
+    }
     return true;
+}
+
+std::filesystem::path StaticMeshRenderer::LodCachePath(const std::string& modelPath, std::uint64_t configHash) const
+{
+    std::filesystem::path assetPath(modelPath);
+    if (assetPath.is_relative() && m_assets)
+    {
+        if (auto root = m_assets->RootPath())
+            assetPath = *root / assetPath;
+    }
+    if (assetPath.empty())
+        return {};
+    const std::filesystem::path cacheDir = assetPath.parent_path() / ".lod_cache";
+    const std::string filename = assetPath.stem().string() + "_" + std::to_string(configHash) + ".lodbin";
+    return cacheDir / filename;
+}
+
+bool StaticMeshRenderer::EnsureLodBuffers(VulkanDevice& device, const LodConfig& config, std::uint64_t configHash, std::uint32_t entityId)
+{
+    if (configHash == 0 || m_vertices.empty() || m_indices.empty() || m_draws.empty())
+        return false;
+    ApplyPendingLodResult(device, configHash);
+    auto cached = m_lodBuffers.find(configHash);
+    if (cached != m_lodBuffers.end())
+        return cached->second.buffer.buffer != VK_NULL_HANDLE;
+    if (HasPendingLodUpload(configHash))
+        return false;
+
+    const std::filesystem::path cachePath = LodCachePath(m_modelPath, configHash);
+    if (!cachePath.empty())
+    {
+        LodCpuSet cachedCpu;
+        if (LoadLodCpuCache(configHash, cachedCpu))
+        {
+            cachedCpu.diagnosticEntityId = entityId;
+            std::lock_guard<std::mutex> lock(m_lodMutex);
+            m_lodPendingResults[configHash] = std::move(cachedCpu);
+        }
+        if (ApplyPendingLodResult(device, configHash))
+            return true;
+    }
+
+    RequestLodBuild(config, configHash, false, entityId);
+    return false;
+}
+
+bool StaticMeshRenderer::EnsureLodPreviewProxy()
+{
+    if (m_lodProxyBuilt)
+        return !m_lodProxyIndices.empty() && !m_lodProxyDraws.empty();
+    const auto begin = std::chrono::steady_clock::now();
+    constexpr std::size_t kTargetPreviewTriangles = 150000;
+    const std::size_t sourceTriangles = m_indices.size() / 3u;
+    if (sourceTriangles == 0 || m_draws.empty())
+        return false;
+
+    const float proxyRatio = sourceTriangles <= kTargetPreviewTriangles
+        ? 1.0f
+        : static_cast<float>(kTargetPreviewTriangles) / static_cast<float>(sourceTriangles);
+    m_lodProxyIndices.clear();
+    m_lodProxyDraws.clear();
+    m_lodProxyIndices.reserve(std::min<std::size_t>(m_indices.size(), kTargetPreviewTriangles * 3u));
+    m_lodProxyDraws.reserve(m_draws.size());
+
+    for (std::uint32_t drawIndex = 0; drawIndex < static_cast<std::uint32_t>(m_draws.size()); ++drawIndex)
+    {
+        const MeshDraw& draw = m_draws[drawIndex];
+        std::vector<std::uint32_t> proxy;
+        if (proxyRatio >= 0.999f)
+        {
+            proxy.assign(m_indices.begin() + draw.firstIndex, m_indices.begin() + draw.firstIndex + draw.indexCount);
+        }
+        else
+        {
+            std::size_t targetIndexCount = static_cast<std::size_t>(static_cast<float>(draw.indexCount) * proxyRatio);
+            targetIndexCount = std::max<std::size_t>(3u, (targetIndexCount / 3u) * 3u);
+            targetIndexCount = std::min<std::size_t>(draw.indexCount, targetIndexCount);
+            proxy.resize(draw.indexCount);
+            const std::size_t written = meshopt_simplifySloppy(proxy.data(),
+                m_indices.data() + draw.firstIndex,
+                draw.indexCount,
+                &m_vertices.front().position[0],
+                m_vertices.size(),
+                sizeof(Vertex),
+                targetIndexCount,
+                1e-2f);
+            proxy.resize(std::max<std::size_t>(3u, (written / 3u) * 3u));
+        }
+        if (proxy.empty())
+            continue;
+
+        MeshDraw proxyDraw{};
+        proxyDraw.firstIndex = static_cast<std::uint32_t>(m_lodProxyIndices.size());
+        proxyDraw.indexCount = static_cast<std::uint32_t>(proxy.size());
+        proxyDraw.materialSlot = draw.materialSlot;
+        m_lodProxyIndices.insert(m_lodProxyIndices.end(), proxy.begin(), proxy.end());
+        m_lodProxyDraws.push_back(proxyDraw);
+    }
+
+    m_lodProxyBuilt = true;
+    const auto end = std::chrono::steady_clock::now();
+    const double ms = std::chrono::duration<double, std::milli>(end - begin).count();
+    LogFormat("[LOD-ASYNC] proxy built tris=%zu ms=%.3f",
+        m_lodProxyIndices.size() / 3u,
+        ms);
+    return !m_lodProxyIndices.empty() && !m_lodProxyDraws.empty();
+}
+
+StaticMeshRenderer::LodCpuSet StaticMeshRenderer::BuildLodCpuSet(const LodConfig& config,
+    std::uint64_t configHash,
+    bool quality,
+    std::uint32_t entityId)
+{
+    static std::atomic_bool meshoptBuildLogged = false;
+    if (!meshoptBuildLogged.exchange(true))
+    {
+#if defined(_DEBUG)
+        constexpr const char* kBuildConfig = "Debug";
+#else
+        constexpr const char* kBuildConfig = "Release";
+#endif
+#if defined(IXTREEME_MESHOPT_FETCHCONTENT) && defined(IXTREEME_MESHOPT_OPTIMIZED_DEBUG)
+        LogFormat("[LOD-BUILD] meshopt source=fetchcontent optimized=yes config=%s", kBuildConfig);
+#else
+        LogFormat("[LOD-BUILD] meshopt source=unknown optimized=no config=%s", kBuildConfig);
+#endif
+    }
+
+    const auto begin = std::chrono::steady_clock::now();
+    LodCpuSet lodSet{};
+    lodSet.config = config;
+    lodSet.configHash = configHash;
+    lodSet.quality = quality;
+    lodSet.writeCache = quality;
+    lodSet.source = quality ? LodBufferSource::Commit : LodBufferSource::Preview;
+    lodSet.diagnosticEntityId = entityId;
+    lodSet.levels = std::clamp(config.levelCount, 1u, LodConfig::MaxLevels);
+    const bool useProxy = !quality && EnsureLodPreviewProxy();
+    const std::vector<std::uint32_t>& sourceIndices = useProxy ? m_lodProxyIndices : m_indices;
+    const std::vector<MeshDraw>& sourceDraws = useProxy ? m_lodProxyDraws : m_draws;
+    lodSet.indices.reserve(sourceIndices.size() * lodSet.levels);
+    lodSet.draws.reserve(sourceDraws.size() * lodSet.levels);
+    std::array<std::vector<std::uint32_t>, LodConfig::MaxLevels> levelIndices{};
+    std::array<std::vector<LodMeshDraw>, LodConfig::MaxLevels> levelDraws{};
+
+    for (std::uint32_t level = 0; level < lodSet.levels; ++level)
+    {
+        const std::size_t levelInTris = sourceIndices.size() / 3u;
+        for (std::uint32_t drawIndex = 0; drawIndex < static_cast<std::uint32_t>(sourceDraws.size()); ++drawIndex)
+        {
+            const MeshDraw& draw = sourceDraws[drawIndex];
+            const std::size_t submeshInTris = draw.indexCount / 3u;
+            std::vector<std::uint32_t> simplified;
+            if (level == 0)
+            {
+                simplified.assign(sourceIndices.begin() + draw.firstIndex,
+                    sourceIndices.begin() + draw.firstIndex + draw.indexCount);
+            }
+            else
+            {
+                const float ratio = std::clamp(config.targetRatios[level], 0.001f, 1.0f);
+                std::size_t targetIndexCount = static_cast<std::size_t>(static_cast<float>(draw.indexCount) * ratio);
+                targetIndexCount = std::max<std::size_t>(3u, (targetIndexCount / 3u) * 3u);
+                targetIndexCount = std::min<std::size_t>(draw.indexCount, targetIndexCount);
+                simplified.resize(draw.indexCount);
+                const std::size_t written = quality
+                    ? meshopt_simplify(simplified.data(),
+                        sourceIndices.data() + draw.firstIndex,
+                        draw.indexCount,
+                        &m_vertices.front().position[0],
+                        m_vertices.size(),
+                        sizeof(Vertex),
+                        targetIndexCount,
+                        1e-2f,
+                        0)
+                    : meshopt_simplifySloppy(simplified.data(),
+                        sourceIndices.data() + draw.firstIndex,
+                        draw.indexCount,
+                        &m_vertices.front().position[0],
+                        m_vertices.size(),
+                        sizeof(Vertex),
+                        targetIndexCount,
+                        1e-2f);
+                simplified.resize(std::max<std::size_t>(3u, (written / 3u) * 3u));
+                if (simplified.empty())
+                {
+                    simplified.assign(sourceIndices.begin() + draw.firstIndex,
+                        sourceIndices.begin() + draw.firstIndex + draw.indexCount);
+                }
+            }
+
+            LodMeshDraw lodDraw{};
+            lodDraw.firstIndex = static_cast<std::uint32_t>(levelIndices[level].size());
+            lodDraw.indexCount = static_cast<std::uint32_t>(simplified.size());
+            lodDraw.materialSlot = draw.materialSlot;
+            lodDraw.sourceDraw = drawIndex;
+            levelIndices[level].insert(levelIndices[level].end(), simplified.begin(), simplified.end());
+            levelDraws[level].push_back(lodDraw);
+            const std::size_t submeshOutTris = simplified.size() / 3u;
+            lodSet.triangles[level] += submeshOutTris;
+            LogFormat("[LOD-GEN] entity=%u path=%s level=%u submesh=%u targetRatio=%.5f inTris=%zu outTris=%zu material=%s%s",
+                entityId,
+                quality ? "quality" : "sloppy",
+                level,
+                drawIndex,
+                level == 0 ? 1.0f : std::clamp(config.targetRatios[level], 0.001f, 1.0f),
+                submeshInTris,
+                submeshOutTris,
+                m_alphaModeName.c_str(),
+                submeshOutTris < 12u ? " DEGENERATE" : "");
+        }
+        LogFormat("[LOD-GEN] entity=%u path=%s level=%u targetRatio=%.5f inTris=%zu outTris=%zu%s",
+            entityId,
+            quality ? "quality" : "sloppy",
+            level,
+            level == 0 ? 1.0f : std::clamp(config.targetRatios[level], 0.001f, 1.0f),
+            levelInTris,
+            lodSet.triangles[level],
+            lodSet.triangles[level] < 12u ? " DEGENERATE" : "");
+        LogFormat("[LOD-GEN] entity=%u level=%u ratio=%.5f requestedTris=%zu resultVerts=%zu resultIndices=%zu result=%s",
+            entityId,
+            level,
+            level == 0 ? 1.0f : std::clamp(config.targetRatios[level], 0.001f, 1.0f),
+            level == 0 ? levelInTris : static_cast<std::size_t>(static_cast<float>(levelInTris) * std::clamp(config.targetRatios[level], 0.001f, 1.0f)),
+            m_vertices.size(),
+            levelIndices[level].size(),
+            levelIndices[level].empty() ? "EMPTY" : "OK");
+    }
+
+    for (std::uint32_t level = 0; level < lodSet.levels; ++level)
+    {
+        const std::uint32_t baseIndex = static_cast<std::uint32_t>(lodSet.indices.size());
+        for (LodMeshDraw draw : levelDraws[level])
+        {
+            draw.firstIndex += baseIndex;
+            lodSet.draws.push_back(draw);
+        }
+        lodSet.indices.insert(lodSet.indices.end(), levelIndices[level].begin(), levelIndices[level].end());
+    }
+
+    const auto end = std::chrono::steady_clock::now();
+    lodSet.decimateMs = std::chrono::duration<double, std::milli>(end - begin).count();
+    return lodSet;
+}
+
+bool StaticMeshRenderer::ApplyPendingLodResult(VulkanDevice& device, std::uint64_t configHash)
+{
+    if (PollPendingLodUploads(configHash))
+        return true;
+
+    LodCpuSet cpuSet;
+    {
+        std::lock_guard<std::mutex> lock(m_lodMutex);
+        auto pending = m_lodPendingResults.find(configHash);
+        if (pending == m_lodPendingResults.end())
+            return false;
+        cpuSet = std::move(pending->second);
+        m_lodPendingResults.erase(pending);
+    }
+
+    if (cpuSet.indices.empty())
+        return false;
+
+    return QueueLodUpload(device, configHash, std::move(cpuSet));
+}
+
+bool StaticMeshRenderer::QueueLodUpload(VulkanDevice& device, std::uint64_t configHash, LodCpuSet&& cpuSet)
+{
+    if (cpuSet.indices.empty() || HasPendingLodUpload(configHash))
+        return false;
+
+    const auto begin = std::chrono::steady_clock::now();
+    const VkDeviceSize indexBytes = sizeof(std::uint32_t) * cpuSet.indices.size();
+    VkQueue graphicsQueue = VK_NULL_HANDLE;
+    vkGetDeviceQueue(m_device, device.GetGraphicsQueueFamily(), 0, &graphicsQueue);
+
+    LodIndexBuffer lodSet{};
+    lodSet.indices = std::move(cpuSet.indices);
+    lodSet.draws = std::move(cpuSet.draws);
+    lodSet.triangles = cpuSet.triangles;
+    lodSet.levels = cpuSet.levels;
+    lodSet.quality = cpuSet.quality;
+    lodSet.source = cpuSet.source;
+    if (!CreateDeviceLocalBuffer(device,
+            m_device,
+            graphicsQueue,
+            indexBytes,
+            VK_BUFFER_USAGE_INDEX_BUFFER_BIT,
+            nullptr,
+            lodSet.buffer))
+    {
+        return false;
+    }
+    lodSet.generated = true;
+
+    PendingLodUpload upload{};
+    upload.configHash = configHash;
+    upload.diagnosticEntityId = cpuSet.diagnosticEntityId;
+    upload.lodSet = std::move(lodSet);
+    if (!CreateHostVisibleBuffer(device,
+            m_device,
+            indexBytes,
+            VK_BUFFER_USAGE_TRANSFER_SRC_BIT,
+            upload.lodSet.indices.data(),
+            upload.staging))
+    {
+        DestroyBuffer(upload.lodSet.buffer);
+        return false;
+    }
+
+    VkCommandBuffer cmd = BeginOneTimeCommands(m_device, device.GetGraphicsQueueFamily(), upload.commandPool);
+    CopyBuffer(cmd, upload.staging.buffer, upload.lodSet.buffer.buffer, indexBytes);
+    upload.fence = SubmitOneTimeCommandsNoWait(m_device, graphicsQueue, cmd);
+    const auto end = std::chrono::steady_clock::now();
+    upload.uploadMs = std::chrono::duration<double, std::milli>(end - begin).count();
+    LogFormat("[LOD-ASYNC] swap uploadMs=%.3f blocking=no", upload.uploadMs);
+    m_pendingLodUploads.push_back(std::move(upload));
+    return false;
+}
+
+bool StaticMeshRenderer::PollPendingLodUploads(std::uint64_t configHash)
+{
+    bool appliedRequested = false;
+    for (auto it = m_pendingLodUploads.begin(); it != m_pendingLodUploads.end();)
+    {
+        const VkResult fenceStatus = vkGetFenceStatus(m_device, it->fence);
+        if (fenceStatus == VK_NOT_READY)
+        {
+            ++it;
+            continue;
+        }
+        VK_CHECK(fenceStatus);
+
+        if (it->staging.buffer)
+            vkDestroyBuffer(m_device, it->staging.buffer, nullptr);
+        if (it->staging.memory)
+            vkFreeMemory(m_device, it->staging.memory, nullptr);
+        if (it->commandPool)
+            vkDestroyCommandPool(m_device, it->commandPool, nullptr);
+        if (it->fence)
+            vkDestroyFence(m_device, it->fence, nullptr);
+
+        const std::uint32_t populatedEntityId = it->diagnosticEntityId;
+        const std::uint32_t populatedLevelCount = it->lodSet.levels;
+        auto existing = m_lodBuffers.find(it->configHash);
+        if (existing != m_lodBuffers.end())
+        {
+            m_retiredLodBuffers.push_back(existing->second.buffer);
+            existing->second.buffer = {};
+            existing->second = std::move(it->lodSet);
+        }
+        else
+        {
+            m_lodBuffers.emplace(it->configHash, std::move(it->lodSet));
+        }
+        LogFormat("[LOD-ASYNC] swap applied frame=%u", m_worldRenderFrameIndex);
+        LogFormat("[LOD-LEVELS] populated entity=%u levelCount=%u",
+            populatedEntityId,
+            populatedLevelCount);
+        if (it->configHash == configHash)
+            appliedRequested = true;
+        it = m_pendingLodUploads.erase(it);
+    }
+    return appliedRequested || m_lodBuffers.find(configHash) != m_lodBuffers.end();
+}
+
+bool StaticMeshRenderer::HasPendingLodUpload(std::uint64_t configHash) const
+{
+    return std::any_of(m_pendingLodUploads.begin(), m_pendingLodUploads.end(),
+        [&](const PendingLodUpload& upload) { return upload.configHash == configHash; });
+}
+
+bool StaticMeshRenderer::LoadLodCpuCache(std::uint64_t configHash, LodCpuSet& out) const
+{
+    const std::filesystem::path cachePath = LodCachePath(m_modelPath, configHash);
+    if (cachePath.empty())
+        return false;
+    std::ifstream in(cachePath, std::ios::binary);
+    if (!in)
+        return false;
+
+    char magic[8]{};
+    in.read(magic, sizeof(magic));
+    std::uint32_t drawCount = 0;
+    std::uint32_t indexCount = 0;
+    if (std::strncmp(magic, "IWLOD2", 6) != 0 ||
+        !ReadBinary(in, out.levels) ||
+        !ReadBinary(in, drawCount) ||
+        !ReadBinary(in, indexCount))
+    {
+        return false;
+    }
+    out.configHash = configHash;
+    out.quality = true;
+    out.source = LodBufferSource::Cache;
+    out.levels = std::clamp(out.levels, 1u, LodConfig::MaxLevels);
+    for (std::size_t& tris : out.triangles)
+        ReadBinary(in, tris);
+    out.draws.resize(drawCount);
+    out.indices.resize(indexCount);
+    if (!out.draws.empty())
+        in.read(reinterpret_cast<char*>(out.draws.data()), sizeof(LodMeshDraw) * out.draws.size());
+    if (!out.indices.empty())
+        in.read(reinterpret_cast<char*>(out.indices.data()), sizeof(std::uint32_t) * out.indices.size());
+    if (!in || out.indices.empty())
+        return false;
+    LogFormat("[LOD] generated asset=%s configHash=%llu submesh=all levels=%u tris=[%zu,%zu,%zu,%zu] source=cache",
+        m_modelPath.c_str(),
+        static_cast<unsigned long long>(configHash),
+        out.levels,
+        out.triangles[0],
+        out.triangles[1],
+        out.triangles[2],
+        out.triangles[3]);
+    return true;
+}
+
+void StaticMeshRenderer::WriteLodCpuCache(const LodCpuSet& set) const
+{
+    const std::filesystem::path cachePath = LodCachePath(m_modelPath, set.configHash);
+    if (cachePath.empty() || set.indices.empty())
+        return;
+    const auto begin = std::chrono::steady_clock::now();
+    std::error_code ec;
+    std::filesystem::create_directories(cachePath.parent_path(), ec);
+    std::ofstream out(cachePath, std::ios::binary);
+    if (out)
+    {
+        char magic[8] = {'I', 'W', 'L', 'O', 'D', '2', '\0', '\0'};
+        out.write(magic, sizeof(magic));
+        const std::uint32_t drawCount = static_cast<std::uint32_t>(set.draws.size());
+        const std::uint32_t indexCount = static_cast<std::uint32_t>(set.indices.size());
+        WriteBinary(out, set.levels);
+        WriteBinary(out, drawCount);
+        WriteBinary(out, indexCount);
+        for (const std::size_t tris : set.triangles)
+            WriteBinary(out, tris);
+        if (!set.draws.empty())
+            out.write(reinterpret_cast<const char*>(set.draws.data()), sizeof(LodMeshDraw) * set.draws.size());
+        if (!set.indices.empty())
+            out.write(reinterpret_cast<const char*>(set.indices.data()), sizeof(std::uint32_t) * set.indices.size());
+    }
+    const auto end = std::chrono::steady_clock::now();
+    const double cacheWriteMs = std::chrono::duration<double, std::milli>(end - begin).count();
+    LogFormat("[LOD-REGEN] trigger=commit path=quality decimateMs=%.3f cacheWriteMs=%.3f",
+        set.decimateMs,
+        cacheWriteMs);
+}
+
+void StaticMeshRenderer::StartLodWorker()
+{
+    if (m_lodWorker.joinable())
+        return;
+    m_lodWorkerStop = false;
+    m_lodWorker = std::thread([this]() { LodWorkerMain(); });
+}
+
+void StaticMeshRenderer::StopLodWorker()
+{
+    {
+        std::lock_guard<std::mutex> lock(m_lodMutex);
+        m_lodWorkerStop = true;
+        m_lodRequestPending = false;
+    }
+    m_lodCv.notify_all();
+    if (m_lodWorker.joinable())
+        m_lodWorker.join();
+    {
+        std::lock_guard<std::mutex> lock(m_lodMutex);
+        m_lodPendingResults.clear();
+        m_lodRunningHash = 0;
+        m_lodRunningQuality = false;
+        m_lodCoalescedDropped = 0;
+    }
+}
+
+void StaticMeshRenderer::RequestLodBuild(const LodConfig& config,
+    std::uint64_t configHash,
+    bool quality,
+    std::uint32_t entityId)
+{
+    if (configHash == 0)
+        return;
+    auto existing = m_lodBuffers.find(configHash);
+    if (existing != m_lodBuffers.end() && (!quality || existing->second.quality))
+        return;
+    {
+        std::lock_guard<std::mutex> lock(m_lodMutex);
+        if (!quality)
+        {
+            if (m_lodRunningHash == configHash && m_lodRunningQuality)
+                return;
+            if (m_lodRequestPending && m_lodRequest.configHash == configHash && m_lodRequest.quality)
+                return;
+            const auto pendingResult = m_lodPendingResults.find(configHash);
+            if (pendingResult != m_lodPendingResults.end() && pendingResult->second.quality)
+                return;
+        }
+        if (m_lodRunningHash == configHash && m_lodRunningQuality == quality)
+            return;
+        if (m_lodRequestPending &&
+            (m_lodRequest.configHash != configHash || m_lodRequest.quality != quality))
+        {
+            ++m_lodCoalescedDropped;
+        }
+        if (quality)
+        {
+            LogFormat("[LOD-LEVELS] commit start entity=%u configHash=%llu",
+                entityId,
+                static_cast<unsigned long long>(configHash));
+        }
+        m_lodRequest = {config, configHash, quality, entityId};
+        m_lodRequestPending = true;
+        LogFormat("[LOD-ASYNC] request configHash=%llu coalescedDropped=%u",
+            static_cast<unsigned long long>(configHash),
+            m_lodCoalescedDropped);
+    }
+    StartLodWorker();
+    m_lodCv.notify_one();
+}
+
+void StaticMeshRenderer::RequestLodQualityBuild(const LodConfig& lodConfig,
+    std::uint64_t configHash,
+    std::uint32_t entityId)
+{
+    RequestLodBuild(lodConfig, configHash, true, entityId);
+}
+
+void StaticMeshRenderer::LodWorkerMain()
+{
+    for (;;)
+    {
+        LodBuildRequest request;
+        {
+            std::unique_lock<std::mutex> lock(m_lodMutex);
+            m_lodCv.wait(lock, [&]() { return m_lodWorkerStop || m_lodRequestPending; });
+            if (m_lodWorkerStop)
+                return;
+            request = m_lodRequest;
+            m_lodRequestPending = false;
+            m_lodRunningHash = request.configHash;
+            m_lodRunningQuality = request.quality;
+        }
+
+        LodCpuSet result;
+        bool fromCache = false;
+        if (request.quality)
+            fromCache = LoadLodCpuCache(request.configHash, result);
+        if (!fromCache)
+            result = BuildLodCpuSet(request.config, request.configHash, request.quality, request.diagnosticEntityId);
+        else
+            result.diagnosticEntityId = request.diagnosticEntityId;
+        if (request.quality && !fromCache)
+            WriteLodCpuCache(result);
+
+        bool publish = !result.indices.empty();
+        const double decimateMs = fromCache ? 0.0 : result.decimateMs;
+        {
+            std::lock_guard<std::mutex> lock(m_lodMutex);
+            if (!request.quality && m_lodRequestPending && m_lodRequest.configHash != request.configHash)
+                publish = false;
+            if (publish)
+                m_lodPendingResults[request.configHash] = std::move(result);
+            m_lodRunningHash = 0;
+            m_lodRunningQuality = false;
+        }
+        LogFormat("[LOD-LEVELS] result entity=%u configHash=%llu applied=%s reason=%s",
+            request.diagnosticEntityId,
+            static_cast<unsigned long long>(request.configHash),
+            publish ? "y" : "n",
+            publish ? "applied" : "stale-config-moved-on");
+        if (request.quality)
+        {
+            LogFormat("[LOD-ASYNC] worker path=quality decimateMs=%.3f published=%s",
+                decimateMs,
+                publish ? "yes" : "no");
+        }
+        else
+        {
+            LogFormat("[LOD-ASYNC] worker path=sloppy previewIterMs=%.3f decimateMs=%.3f published=%s",
+                decimateMs,
+                decimateMs,
+                publish ? "yes" : "no");
+        }
+    }
 }
 
 bool StaticMeshRenderer::CreateTextures(VulkanDevice& device, const std::string& modelPath)
@@ -1082,18 +1901,26 @@ bool StaticMeshRenderer::CreateDescriptors()
     VkDescriptorSetLayoutBinding orm = diffuse;
     orm.binding = 3;
 
-    std::array<VkDescriptorSetLayoutBinding, 4> bindings = {ubo, diffuse, normal, orm};
+    VkDescriptorSetLayoutBinding instances{};
+    instances.binding = 4;
+    instances.descriptorType = VK_DESCRIPTOR_TYPE_STORAGE_BUFFER;
+    instances.descriptorCount = 1;
+    instances.stageFlags = VK_SHADER_STAGE_VERTEX_BIT | VK_SHADER_STAGE_FRAGMENT_BIT;
+
+    std::array<VkDescriptorSetLayoutBinding, 5> bindings = {ubo, diffuse, normal, orm, instances};
     VkDescriptorSetLayoutCreateInfo layout{};
     layout.sType = VK_STRUCTURE_TYPE_DESCRIPTOR_SET_LAYOUT_CREATE_INFO;
     layout.bindingCount = static_cast<uint32_t>(bindings.size());
     layout.pBindings = bindings.data();
     VK_CHECK(vkCreateDescriptorSetLayout(m_device, &layout, nullptr, &m_descriptorSetLayout));
 
-    std::array<VkDescriptorPoolSize, 2> poolSizes{};
+    std::array<VkDescriptorPoolSize, 3> poolSizes{};
     poolSizes[0].type = VK_DESCRIPTOR_TYPE_UNIFORM_BUFFER;
     poolSizes[0].descriptorCount = kFramesInFlight * kUniformSlots;
     poolSizes[1].type = VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER;
     poolSizes[1].descriptorCount = kFramesInFlight * kUniformSlots * 3u;
+    poolSizes[2].type = VK_DESCRIPTOR_TYPE_STORAGE_BUFFER;
+    poolSizes[2].descriptorCount = kFramesInFlight * kUniformSlots;
 
     VkDescriptorPoolCreateInfo pool{};
     pool.sType = VK_STRUCTURE_TYPE_DESCRIPTOR_POOL_CREATE_INFO;
@@ -1138,8 +1965,12 @@ bool StaticMeshRenderer::CreateDescriptors()
             ormInfo.sampler = m_ormTexture.sampler;
             ormInfo.imageView = m_ormTexture.view;
             ormInfo.imageLayout = VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL;
+            VkDescriptorBufferInfo instanceInfo{};
+            instanceInfo.buffer = m_instanceBuffers[frame].buffer;
+            instanceInfo.offset = 0;
+            instanceInfo.range = VK_WHOLE_SIZE;
 
-            std::array<VkWriteDescriptorSet, 4> writes{};
+            std::array<VkWriteDescriptorSet, 5> writes{};
             writes[0].sType = VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET;
             writes[0].dstSet = descriptorSet;
             writes[0].dstBinding = 0;
@@ -1164,9 +1995,63 @@ bool StaticMeshRenderer::CreateDescriptors()
             writes[3].descriptorCount = 1;
             writes[3].descriptorType = VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER;
             writes[3].pImageInfo = &ormInfo;
+            writes[4].sType = VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET;
+            writes[4].dstSet = descriptorSet;
+            writes[4].dstBinding = 4;
+            writes[4].descriptorCount = 1;
+            writes[4].descriptorType = VK_DESCRIPTOR_TYPE_STORAGE_BUFFER;
+            writes[4].pBufferInfo = &instanceInfo;
             vkUpdateDescriptorSets(m_device, static_cast<uint32_t>(writes.size()), writes.data(), 0, nullptr);
         }
     }
+    return true;
+}
+
+void StaticMeshRenderer::UpdateInstanceDescriptorSets(uint32_t frameIndex)
+{
+    if (frameIndex >= kFramesInFlight || !m_descriptorPool || !m_instanceBuffers[frameIndex].buffer)
+        return;
+
+    VkDescriptorBufferInfo instanceInfo{};
+    instanceInfo.buffer = m_instanceBuffers[frameIndex].buffer;
+    instanceInfo.offset = 0;
+    instanceInfo.range = VK_WHOLE_SIZE;
+
+    std::array<VkWriteDescriptorSet, kUniformSlots> writes{};
+    for (uint32_t uniformSlot = 0; uniformSlot < kUniformSlots; ++uniformSlot)
+    {
+        writes[uniformSlot].sType = VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET;
+        writes[uniformSlot].dstSet = m_descriptorSets[frameIndex][uniformSlot];
+        writes[uniformSlot].dstBinding = 4;
+        writes[uniformSlot].descriptorCount = 1;
+        writes[uniformSlot].descriptorType = VK_DESCRIPTOR_TYPE_STORAGE_BUFFER;
+        writes[uniformSlot].pBufferInfo = &instanceInfo;
+    }
+    vkUpdateDescriptorSets(m_device, static_cast<uint32_t>(writes.size()), writes.data(), 0, nullptr);
+}
+
+bool StaticMeshRenderer::EnsureInstanceCapacity(VulkanDevice& device, uint32_t frameIndex, std::uint32_t requiredRecords)
+{
+    if (frameIndex >= kFramesInFlight)
+        return false;
+    requiredRecords = std::max<std::uint32_t>(1u, requiredRecords);
+    if (m_instanceBufferCapacity[frameIndex] >= requiredRecords && m_instanceBuffers[frameIndex].buffer)
+        return true;
+
+    std::uint32_t nextCapacity = std::max<std::uint32_t>(kInitialInstanceCapacity, m_instanceBufferCapacity[frameIndex]);
+    while (nextCapacity < requiredRecords)
+        nextCapacity *= 2u;
+
+    DestroyBuffer(m_instanceBuffers[frameIndex]);
+    CreateHostVisibleBuffer(device,
+        m_device,
+        sizeof(StaticMeshInstanceBlock) * nextCapacity,
+        VK_BUFFER_USAGE_STORAGE_BUFFER_BIT,
+        nullptr,
+        m_instanceBuffers[frameIndex]);
+    m_instanceBufferCapacity[frameIndex] = nextCapacity;
+    UpdateInstanceDescriptorSets(frameIndex);
+    m_lastInstanceBufferRebuilt = true;
     return true;
 }
 
@@ -1287,14 +2172,88 @@ void StaticMeshRenderer::RenderInWorld(VulkanDevice& device,
     const WorldCamera& camera,
     const Instance& instance)
 {
+    std::vector<Instance> instances;
+    instances.push_back(instance);
+    RenderBatchInWorld(device, timeSeconds, camera, instances);
+}
+
+void StaticMeshRenderer::RenderBatchInWorld(VulkanDevice& device,
+    double timeSeconds,
+    const WorldCamera& camera,
+    const std::vector<Instance>& instances)
+{
+    LodConfig defaultLod{};
+    RenderLodBatchInWorld(device, timeSeconds, camera, instances, defaultLod, 0, 0);
+}
+
+void StaticMeshRenderer::RenderLodBatchInWorld(VulkanDevice& device,
+    double timeSeconds,
+    const WorldCamera& camera,
+    const std::vector<Instance>& instances,
+    const LodConfig& lodConfig,
+    std::uint64_t configHash,
+    std::uint32_t lodLevel)
+{
     m_lastSubmittedDrawCalls = 0;
+    m_lastSubmittedInstances = 0;
+    m_lastSubmittedIndexCount = 0;
+    m_lastUsedFullResFallback = false;
     m_lastMaterialUniformUpdates = 0;
     m_lastOverrideActiveDraws = 0;
-    if (!m_pipeline || m_indices.empty() || !device.IsFrameActive())
+    m_lastInstanceBufferBytes = 0;
+    m_lastInstanceBufferRebuilt = false;
+    if (!m_pipeline || m_indices.empty() || instances.empty() || !device.IsFrameActive())
         return;
     const VkExtent2D extent = device.GetSwapchainExtent();
     if (extent.width == 0 || extent.height == 0)
         return;
+
+    const std::uint32_t diagnosticEntityId = instances.empty() ? 0u : instances.front().entityId;
+    const bool useLodBuffer = configHash != 0 && lodLevel > 0 && EnsureLodBuffers(device, lodConfig, configHash, diagnosticEntityId);
+    const LodIndexBuffer* lodSet = nullptr;
+    if (useLodBuffer)
+    {
+        const auto lodIt = m_lodBuffers.find(configHash);
+        if (lodIt != m_lodBuffers.end())
+            lodSet = &lodIt->second;
+    }
+    if (lodSet)
+    {
+        const std::uint32_t requestedLevel = lodLevel;
+        const char* fallbackReason = nullptr;
+        if (lodSet->levels == 0)
+            fallbackReason = "no-levels";
+        else if (lodSet->buffer.buffer == VK_NULL_HANDLE)
+            fallbackReason = "buffer-not-ready";
+        else if (requestedLevel >= lodSet->levels)
+            fallbackReason = "no-levels";
+        else if (lodSet->triangles[requestedLevel] == 0)
+            fallbackReason = "zero-tris";
+
+        if (fallbackReason)
+        {
+            LogFormat("[LOD-PICK] FALLBACK entity=%u reason=%s drawing=full-res",
+                diagnosticEntityId,
+                fallbackReason);
+            lodSet = nullptr;
+            lodLevel = 0;
+            m_lastUsedFullResFallback = true;
+        }
+        else
+        {
+            lodLevel = requestedLevel;
+        }
+    }
+    else
+    {
+        if (configHash != 0 && lodLevel > 0)
+        {
+            LogFormat("[LOD-PICK] FALLBACK entity=%u reason=buffer-not-ready drawing=full-res",
+                diagnosticEntityId);
+            m_lastUsedFullResFallback = true;
+        }
+        lodLevel = 0;
+    }
 
     const uint32_t frameIndex = device.GetFrameIndex();
     if (m_worldRenderFrameIndex != frameIndex)
@@ -1302,6 +2261,76 @@ void StaticMeshRenderer::RenderInWorld(VulkanDevice& device,
         m_worldRenderFrameIndex = frameIndex;
         m_worldUniformCursor = 0;
     }
+
+    std::vector<StaticMeshInstanceBlock> instanceBlocks;
+    std::vector<InstancedDrawCommand> drawCommands;
+    const std::size_t drawCountForLevel = lodSet
+        ? std::count_if(lodSet->draws.begin(), lodSet->draws.end(), [&](const LodMeshDraw& draw) {
+            return draw.firstIndex < lodSet->indices.size();
+        })
+        : m_draws.size();
+    instanceBlocks.reserve(instances.size() * std::max<std::size_t>(1u, drawCountForLevel));
+    drawCommands.reserve(drawCountForLevel);
+    auto appendDraw = [&](std::uint32_t firstIndex, std::uint32_t indexCount, std::uint32_t materialSlot, std::uint32_t sourceSubmesh) {
+        if (indexCount == 0)
+            return;
+        {
+            InstancedDrawCommand command{};
+            command.firstIndex = firstIndex;
+            command.indexCount = indexCount;
+            command.firstInstance = static_cast<uint32_t>(instanceBlocks.size());
+            command.instanceCount = static_cast<uint32_t>(instances.size());
+            command.materialSlot = materialSlot;
+            command.sourceSubmesh = sourceSubmesh;
+            for (const Instance& instance : instances)
+            {
+                StaticMeshInstanceBlock block{};
+                FillStaticMeshInstanceBlock(camera, instance, materialSlot, m_materialDefaults, block);
+                instanceBlocks.push_back(block);
+                const bool overrideActive = std::any_of(instance.materialOverrides.begin(),
+                    instance.materialOverrides.end(),
+                    [&](const MeshSceneEntity::MaterialOverride& material) {
+                        return material.enabled && material.slot == materialSlot;
+                    });
+                if (overrideActive)
+                    ++m_lastOverrideActiveDraws;
+            }
+            drawCommands.push_back(command);
+        }
+    };
+    if (lodSet)
+    {
+        const std::size_t drawsPerLevel = m_draws.size();
+        const std::size_t begin = static_cast<std::size_t>(lodLevel) * drawsPerLevel;
+        const std::size_t end = std::min(begin + drawsPerLevel, lodSet->draws.size());
+        for (std::size_t i = begin; i < end; ++i)
+        {
+            const LodMeshDraw& draw = lodSet->draws[i];
+            appendDraw(draw.firstIndex, draw.indexCount, draw.materialSlot, draw.sourceDraw);
+        }
+    }
+    else
+    {
+        for (std::size_t i = 0; i < m_draws.size(); ++i)
+        {
+            const MeshDraw& draw = m_draws[i];
+            appendDraw(draw.firstIndex, draw.indexCount, draw.materialSlot, static_cast<std::uint32_t>(i));
+        }
+    }
+
+    if (instanceBlocks.empty() || !EnsureInstanceCapacity(device, frameIndex, static_cast<std::uint32_t>(instanceBlocks.size())))
+        return;
+    m_lastInstanceBufferBytes = instanceBlocks.size() * sizeof(StaticMeshInstanceBlock);
+    void* mapped = nullptr;
+    VK_CHECK(vkMapMemory(m_device,
+        m_instanceBuffers[frameIndex].memory,
+        0,
+        static_cast<VkDeviceSize>(m_lastInstanceBufferBytes),
+        0,
+        &mapped));
+    std::memcpy(mapped, instanceBlocks.data(), m_lastInstanceBufferBytes);
+    vkUnmapMemory(m_device, m_instanceBuffers[frameIndex].memory);
+
     VkCommandBuffer cmd = device.GetCommandBuffer();
     VkViewport viewport{};
     viewport.x = 0.0f;
@@ -1316,24 +2345,179 @@ void StaticMeshRenderer::RenderInWorld(VulkanDevice& device,
     vkCmdBindPipeline(cmd, VK_PIPELINE_BIND_POINT_GRAPHICS, m_pipeline);
     VkDeviceSize offset = 0;
     vkCmdBindVertexBuffers(cmd, 0, 1, &m_vertexBuffer.buffer, &offset);
-    vkCmdBindIndexBuffer(cmd, m_indexBuffer.buffer, 0, VK_INDEX_TYPE_UINT32);
-    for (const MeshDraw& draw : m_draws)
+    vkCmdBindIndexBuffer(cmd, lodSet ? lodSet->buffer.buffer : m_indexBuffer.buffer, 0, VK_INDEX_TYPE_UINT32);
+    const auto findInstanceIndex = [&](std::uint32_t entityId) -> std::optional<std::size_t> {
+        for (std::size_t i = 0; i < instances.size(); ++i)
+        {
+            if (instances[i].entityId == entityId)
+                return i;
+        }
+        return std::nullopt;
+    };
+    const std::optional<std::size_t> diagnosticInstanceIndex =
+        configHash != 0 && diagnosticEntityId != 0 ? findInstanceIndex(diagnosticEntityId) : std::nullopt;
+    std::optional<std::size_t> refInstanceIndex;
+    if (configHash == 0)
+    {
+        for (std::size_t i = 0; i < instances.size(); ++i)
+        {
+            if (instances[i].entityId != 3u)
+            {
+                refInstanceIndex = i;
+                break;
+            }
+        }
+    }
+    bool loggedMaterialE3 = false;
+    bool loggedMaterialRef = false;
+    const std::uint64_t frameNumber = device.GetFrameNumber();
+    const VkBuffer boundIndexBuffer = lodSet ? lodSet->buffer.buffer : m_indexBuffer.buffer;
+    const auto logDrawDiag = [&](const char* tag,
+                                 std::uint32_t entityId,
+                                 const InstancedDrawCommand& draw,
+                                 std::size_t instanceIndex,
+                                 uint32_t uniformSlot) {
+        const std::size_t absoluteInstance = static_cast<std::size_t>(draw.firstInstance) + instanceIndex;
+        const std::size_t instanceOffset = absoluteInstance * sizeof(StaticMeshInstanceBlock);
+        LogFormat("%s entity=%u submesh=%u frame=%llu pipeline=0x%llx vbuf=0x%llx vbufOffset=0 vbufRange=%zu ibuf=0x%llx ibufOffset=0 indexCount=%u indexType=UINT32 ibuf_first=%u ibuf_vertexOffset=0 instbuf=0x%llx instbufOffset=%zu instCount=%u firstInstance=%u descSets=[set0=0x%llx] pushConst_bytes=<none> pushConst_size=0",
+            tag,
+            entityId,
+            draw.sourceSubmesh,
+            static_cast<unsigned long long>(frameNumber),
+            VkHandleValue(m_pipeline),
+            VkHandleValue(m_vertexBuffer.buffer),
+            sizeof(Vertex) * m_vertices.size(),
+            VkHandleValue(boundIndexBuffer),
+            draw.indexCount,
+            draw.firstIndex,
+            VkHandleValue(m_instanceBuffers[frameIndex].buffer),
+            instanceOffset,
+            draw.instanceCount,
+            draw.firstInstance,
+            VkHandleValue(m_descriptorSets[frameIndex][uniformSlot]));
+    };
+    const auto logMaterialDiag = [&](const char* tag,
+                                     const Instance& instance,
+                                     const StaticMeshInstanceBlock& block,
+                                     uint32_t materialSlot,
+                                     std::size_t absoluteInstance,
+                                     bool isLodActive) {
+        const std::size_t instanceOffset = absoluteInstance * sizeof(StaticMeshInstanceBlock);
+        const std::size_t materialOffset = instanceOffset + offsetof(StaticMeshInstanceBlock, materialBaseColor);
+        const std::size_t materialSize =
+            sizeof(block.materialBaseColor) +
+            sizeof(block.materialParams) +
+            sizeof(block.materialEmissive) +
+            sizeof(block.materialUv);
+        const std::size_t transformOffset = instanceOffset + offsetof(StaticMeshInstanceBlock, model);
+        const float alphaCutoff = m_alphaModeName == "mask" ? 0.5f : 0.0f;
+        LogFormat("%s entity=%u frame=%llu alphaMode=%s materialIndex=%u materialBuffer=0x%llx matOffset=%zu matSize=%zu baseColorView=0x%llx normalView=0x%llx metallicRoughnessView=0x%llx baseColorFactor=(%.3f,%.3f,%.3f,%.3f) alphaCutoff=%.3f transformBuffer=0x%llx tfOffset=%zu worldMatrix.row0=(%.3f,%.3f,%.3f,%.3f) worldMatrix.row1=(%.3f,%.3f,%.3f,%.3f) worldMatrix.row2=(%.3f,%.3f,%.3f,%.3f) worldMatrix.row3=(%.3f,%.3f,%.3f,%.3f) isLodActive=%s",
+            tag,
+            instance.entityId,
+            static_cast<unsigned long long>(frameNumber),
+            AlphaModeForLog(m_alphaModeName),
+            materialSlot,
+            VkHandleValue(m_instanceBuffers[frameIndex].buffer),
+            materialOffset,
+            materialSize,
+            VkHandleValue(m_texture.view),
+            VkHandleValue(m_normalTexture.view),
+            VkHandleValue(m_ormTexture.view),
+            block.materialBaseColor[0],
+            block.materialBaseColor[1],
+            block.materialBaseColor[2],
+            block.materialBaseColor[3],
+            alphaCutoff,
+            VkHandleValue(m_instanceBuffers[frameIndex].buffer),
+            transformOffset,
+            block.model.m[0], block.model.m[1], block.model.m[2], block.model.m[3],
+            block.model.m[4], block.model.m[5], block.model.m[6], block.model.m[7],
+            block.model.m[8], block.model.m[9], block.model.m[10], block.model.m[11],
+            block.model.m[12], block.model.m[13], block.model.m[14], block.model.m[15],
+            isLodActive ? "yes" : "no");
+    };
+    const auto materialSlotForAbsoluteInstance = [&](std::size_t absoluteInstance) -> std::uint32_t {
+        for (const InstancedDrawCommand& command : drawCommands)
+        {
+            const std::size_t begin = static_cast<std::size_t>(command.firstInstance);
+            const std::size_t end = begin + static_cast<std::size_t>(command.instanceCount);
+            if (absoluteInstance >= begin && absoluteInstance < end)
+                return command.materialSlot;
+        }
+        return 0u;
+    };
+    if (configHash != 0 && diagnosticInstanceIndex && drawCommands.size() >= 3)
+    {
+        std::array<std::size_t, 3> slots{};
+        std::array<std::uint32_t, 3> materialSlots{};
+        for (std::size_t i = 0; i < slots.size(); ++i)
+        {
+            slots[i] = static_cast<std::size_t>(drawCommands[i].firstInstance) + *diagnosticInstanceIndex;
+            materialSlots[i] = materialSlotForAbsoluteInstance(slots[i]);
+        }
+        auto row3 = [&](std::size_t slot, int column) -> float {
+            if (slot >= instanceBlocks.size())
+                return 0.0f;
+            return instanceBlocks[slot].model.m[12 + column];
+        };
+        LogFormat("[LOD-INSTBUF-DUMP] entity=%u frame=%llu source=cpu-source-array slot0_worldMatrix_row3=(%.3f,%.3f,%.3f,%.3f) slot1_worldMatrix_row3=(%.3f,%.3f,%.3f,%.3f) slot2_worldMatrix_row3=(%.3f,%.3f,%.3f,%.3f) slot0_materialIndex=%u slot1_materialIndex=%u slot2_materialIndex=%u",
+            diagnosticEntityId,
+            static_cast<unsigned long long>(frameNumber),
+            row3(slots[0], 0), row3(slots[0], 1), row3(slots[0], 2), row3(slots[0], 3),
+            row3(slots[1], 0), row3(slots[1], 1), row3(slots[1], 2), row3(slots[1], 3),
+            row3(slots[2], 0), row3(slots[2], 1), row3(slots[2], 2), row3(slots[2], 3),
+            materialSlots[0],
+            materialSlots[1],
+            materialSlots[2]);
+    }
+    for (const InstancedDrawCommand& draw : drawCommands)
     {
         const uint32_t uniformSlot = std::min(m_worldUniformCursor++, kUniformSlots - 1);
-        const bool overrideActive = std::any_of(instance.materialOverrides.begin(),
-            instance.materialOverrides.end(),
-            [&](const MeshSceneEntity::MaterialOverride& material) {
-                return material.enabled && material.slot == draw.materialSlot;
-            });
-        UpdateWorldUniform(frameIndex, uniformSlot, camera, instance, timeSeconds, draw.materialSlot);
+        UpdateWorldUniform(frameIndex, uniformSlot, camera, instances.front(), timeSeconds, 0u);
         ++m_lastMaterialUniformUpdates;
-        if (overrideActive)
-            ++m_lastOverrideActiveDraws;
         vkCmdBindDescriptorSets(cmd, VK_PIPELINE_BIND_POINT_GRAPHICS, m_pipelineLayout,
             0, 1, &m_descriptorSets[frameIndex][uniformSlot], 0, nullptr);
-        vkCmdDrawIndexed(cmd, draw.indexCount, 1, draw.firstIndex, 0, 0);
+        if (configHash != 0 && diagnosticInstanceIndex)
+        {
+            const std::size_t absoluteInstance = static_cast<std::size_t>(draw.firstInstance) + *diagnosticInstanceIndex;
+            if (absoluteInstance < instanceBlocks.size())
+            {
+                if (!loggedMaterialE3)
+                {
+                    logMaterialDiag("[LOD-MAT-E3]",
+                        instances[*diagnosticInstanceIndex],
+                        instanceBlocks[absoluteInstance],
+                        draw.materialSlot,
+                        absoluteInstance,
+                        true);
+                    loggedMaterialE3 = true;
+                }
+                logDrawDiag("[LOD-DRAW-E3]", diagnosticEntityId, draw, *diagnosticInstanceIndex, uniformSlot);
+            }
+        }
+        if (refInstanceIndex)
+        {
+            const std::size_t absoluteInstance = static_cast<std::size_t>(draw.firstInstance) + *refInstanceIndex;
+            if (absoluteInstance < instanceBlocks.size())
+            {
+                if (!loggedMaterialRef)
+                {
+                    logMaterialDiag("[LOD-MAT-REF]",
+                        instances[*refInstanceIndex],
+                        instanceBlocks[absoluteInstance],
+                        draw.materialSlot,
+                        absoluteInstance,
+                        false);
+                    loggedMaterialRef = true;
+                }
+                logDrawDiag("[LOD-DRAW-REF]", instances[*refInstanceIndex].entityId, draw, *refInstanceIndex, uniformSlot);
+            }
+        }
+        vkCmdDrawIndexed(cmd, draw.indexCount, draw.instanceCount, draw.firstIndex, 0, draw.firstInstance);
         ++m_lastSubmittedDrawCalls;
+        m_lastSubmittedIndexCount += draw.indexCount;
     }
+    m_lastSubmittedInstances = static_cast<std::uint32_t>(instances.size());
 }
 
 void StaticMeshRenderer::DestroyPipeline()
@@ -1370,6 +2554,7 @@ void StaticMeshRenderer::DestroyTexture(Texture& texture)
 
 void StaticMeshRenderer::Destroy()
 {
+    StopLodWorker();
     if (!m_device)
         return;
     DestroyPipeline();
@@ -1381,11 +2566,33 @@ void StaticMeshRenderer::Destroy()
     m_descriptorSetLayout = VK_NULL_HANDLE;
     DestroyBuffer(m_vertexBuffer);
     DestroyBuffer(m_indexBuffer);
+    for (auto& [_, lodSet] : m_lodBuffers)
+        DestroyBuffer(lodSet.buffer);
+    m_lodBuffers.clear();
+    for (PendingLodUpload& upload : m_pendingLodUploads)
+    {
+        if (upload.fence)
+        {
+            vkWaitForFences(m_device, 1, &upload.fence, VK_TRUE, UINT64_MAX);
+            vkDestroyFence(m_device, upload.fence, nullptr);
+        }
+        if (upload.commandPool)
+            vkDestroyCommandPool(m_device, upload.commandPool, nullptr);
+        DestroyBuffer(upload.staging);
+        DestroyBuffer(upload.lodSet.buffer);
+    }
+    m_pendingLodUploads.clear();
+    for (Buffer& buffer : m_retiredLodBuffers)
+        DestroyBuffer(buffer);
+    m_retiredLodBuffers.clear();
     for (auto& frameBuffers : m_uniformBuffers)
     {
         for (Buffer& buffer : frameBuffers)
             DestroyBuffer(buffer);
     }
+    for (Buffer& buffer : m_instanceBuffers)
+        DestroyBuffer(buffer);
+    m_instanceBufferCapacity = {};
     DestroyTexture(m_texture);
     DestroyTexture(m_normalTexture);
     DestroyTexture(m_ormTexture);
@@ -1395,9 +2602,15 @@ void StaticMeshRenderer::Destroy()
     m_boundsMin = {0.0f, 0.0f, 0.0f};
     m_boundsMax = {0.0f, 0.0f, 0.0f};
     m_lastSubmittedDrawCalls = 0;
+    m_lastSubmittedInstances = 0;
+    m_lastSubmittedIndexCount = 0;
+    m_lastUsedFullResFallback = false;
     m_lastMaterialUniformUpdates = 0;
     m_lastOverrideActiveDraws = 0;
+    m_lastInstanceBufferBytes = 0;
+    m_lastInstanceBufferRebuilt = false;
     m_assets = nullptr;
+    m_modelPath.clear();
     m_status = LoadStatus::NotLoaded;
     m_device = VK_NULL_HANDLE;
 }

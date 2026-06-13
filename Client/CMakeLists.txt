@@ -77,12 +77,17 @@ else()
 endif()
 
 if(MSVC)
+    foreach(_lang C CXX)
+        string(REPLACE " /RTC1" "" CMAKE_${_lang}_FLAGS_DEBUG "${CMAKE_${_lang}_FLAGS_DEBUG}")
+        string(REPLACE "/RTC1" "" CMAKE_${_lang}_FLAGS_DEBUG "${CMAKE_${_lang}_FLAGS_DEBUG}")
+    endforeach()
     add_compile_options(/W4 /permissive- /Zc:__cplusplus /utf-8 /MP /EHsc)
 else()
     add_compile_options(-Wall -Wextra -Wpedantic)
 endif()
 
 include(cmake/BootstrapVcpkg.cmake)
+include(FetchContent)
 
 vcpkg_require(
     capnproto
@@ -125,6 +130,27 @@ set(CLIENT_LIBS_DIR "${CLIENT_ROOT}/libs")
 add_subdirectory(${CMAKE_CURRENT_SOURCE_DIR}/../shared/map shared_map_build)
 
 find_package(fastgltf CONFIG REQUIRED)
+FetchContent_Declare(
+    meshoptimizer
+    GIT_REPOSITORY https://github.com/zeux/meshoptimizer.git
+    GIT_TAG v0.23
+    GIT_SHALLOW TRUE
+)
+FetchContent_MakeAvailable(meshoptimizer)
+if(TARGET meshoptimizer AND NOT TARGET meshoptimizer::meshoptimizer)
+    add_library(meshoptimizer::meshoptimizer ALIAS meshoptimizer)
+endif()
+if(TARGET meshoptimizer)
+    if(MSVC)
+        set_property(TARGET meshoptimizer PROPERTY MSVC_RUNTIME_CHECKS "")
+        set_target_properties(meshoptimizer PROPERTIES VS_GLOBAL_BasicRuntimeChecks "Default")
+        target_compile_options(meshoptimizer PRIVATE $<$<CONFIG:Debug>:/O2;/Ob2>)
+    else()
+        target_compile_options(meshoptimizer PRIVATE $<$<CONFIG:Debug>:-O2>)
+    endif()
+else()
+    message(FATAL_ERROR "FetchContent meshoptimizer target was not created")
+endif()
 set(STB_INCLUDE_DIR "" CACHE PATH "stb include directory")
 if(DEFINED VCPKG_ROOT AND DEFINED VCPKG_TARGET_TRIPLET)
     set(_client_vcpkg_prefix "${VCPKG_ROOT}/installed/${VCPKG_TARGET_TRIPLET}")

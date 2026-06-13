@@ -232,6 +232,31 @@ struct WaterBody
     bool editorHidden = false;
 };
 
+struct EditorAttachedComponent
+{
+    std::string type;
+    std::string displayName;
+    std::string category;
+    std::string note;
+};
+
+struct LodConfig
+{
+    static constexpr std::uint32_t MaxLevels = 4;
+
+    std::uint32_t levelCount = 4;
+    float targetRatios[MaxLevels] = {1.0f, 0.5f, 0.2f, 0.06f};
+    float distances[MaxLevels] = {0.0f, 30.0f, 80.0f, 200.0f};
+    float hysteresisMeters = 5.0f;
+};
+
+struct LodComponent
+{
+    bool enabled = false;
+    bool overrideAssetDefault = false;
+    LodConfig config;
+};
+
 struct MeshSceneEntity
 {
     std::uint32_t id = 0;
@@ -259,6 +284,8 @@ struct MeshSceneEntity
         float uvOffset[2] = {0.0f, 0.0f};
     };
     std::vector<MaterialOverride> materialOverrides;
+    std::vector<EditorAttachedComponent> editorComponents;
+    LodComponent lod;
 };
 
 struct TerrainSceneData
@@ -345,6 +372,8 @@ struct MeshRendererEditorState
     std::uint32_t materialSlotCount = 1;
     std::uint32_t selectedMaterialSlot = 0;
     std::vector<MeshSceneEntity::MaterialOverride> materialOverrides;
+    std::vector<EditorAttachedComponent> editorComponents;
+    LodComponent lod;
 };
 
 struct TerrainEditorState
@@ -422,6 +451,12 @@ struct MapEditorCommands
     float meshDropScreenPosition[2] = {0.0f, 0.0f};
     bool addComponentToSelectedEntity = false;
     EditorComponentType addComponentType = EditorComponentType::None;
+    std::string addComponentTypeId;
+    bool removeComponentFromSelectedEntity = false;
+    std::string removeComponentTypeId;
+    bool lodQualityCommitRequested = false;
+    std::uint32_t lodQualityCommitEntityId = 0;
+    LodConfig lodQualityCommitConfig;
     bool assignMeshAssetToSelectedEntity = false;
     std::string assignMeshAssetId;
     bool deleteSelectedWaterBody = false;

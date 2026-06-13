@@ -43,6 +43,7 @@
 #include <cstdio>
 #include <cstdint>
 #include <cstdlib>
+#include <cstring>
 #include <ctime>
 #include <filesystem>
 #include <functional>
@@ -278,6 +279,170 @@ bool WorldAabbOutsideCameraFrustum(const WorldCamera& camera, const std::array<W
     }
     return outsideLeft || outsideRight || outsideBottom || outsideTop || outsideNear || outsideFar;
 }
+
+std::uint64_t HashLodConfig(const LodConfig& config)
+{
+    std::uint64_t hash = 1469598103934665603ull;
+    auto mix = [&](std::uint64_t value) {
+        hash ^= value;
+        hash *= 1099511628211ull;
+    };
+    mix(std::clamp(config.levelCount, 1u, LodConfig::MaxLevels));
+    mix(static_cast<std::uint32_t>(std::max(0.0f, config.hysteresisMeters) * 100.0f));
+    for (std::uint32_t i = 0; i < LodConfig::MaxLevels; ++i)
+    {
+        mix(static_cast<std::uint32_t>(std::clamp(config.targetRatios[i], 0.001f, 1.0f) * 100000.0f));
+        mix(static_cast<std::uint32_t>(std::max(0.0f, config.distances[i]) * 100.0f));
+    }
+    return hash == 0 ? 1 : hash;
+}
+
+float DistanceToAabb(const WorldVec3& point, const SpatialIndex::Aabb& bounds)
+{
+    const float dx = std::max({bounds.min.x - point.x, 0.0f, point.x - bounds.max.x});
+    const float dy = std::max({bounds.min.y - point.y, 0.0f, point.y - bounds.max.y});
+    const float dz = std::max({bounds.min.z - point.z, 0.0f, point.z - bounds.max.z});
+    return std::sqrt(dx * dx + dy * dy + dz * dz);
+}
+
+std::uint32_t SelectLodLevel(const LodConfig& config, float distanceMeters, std::uint32_t previousLevel)
+{
+    const std::uint32_t levelCount = std::clamp(config.levelCount, 1u, LodConfig::MaxLevels);
+    std::uint32_t selected = 0;
+    for (std::uint32_t level = 1; level < levelCount; ++level)
+    {
+        if (distanceMeters >= config.distances[level])
+            selected = level;
+    }
+
+    const float hysteresis = std::max(0.0f, config.hysteresisMeters);
+    if (previousLevel < levelCount && previousLevel != selected && hysteresis > 0.0f)
+    {
+        if (previousLevel < selected && distanceMeters < config.distances[selected] + hysteresis)
+            return previousLevel;
+        if (previousLevel > selected && distanceMeters > config.distances[previousLevel] - hysteresis)
+            return previousLevel;
+    }
+    return selected;
+}
+
+struct StaticMeshLodBatchKey
+{
+    StaticMeshRenderer* renderer = nullptr;
+    std::uint64_t configHash = 0;
+    std::uint32_t lodLevel = 0;
+
+    bool operator==(const StaticMeshLodBatchKey& rhs) const
+    {
+        return renderer == rhs.renderer && configHash == rhs.configHash && lodLevel == rhs.lodLevel;
+    }
+};
+
+struct StaticMeshLodBatchKeyHash
+{
+    std::size_t operator()(const StaticMeshLodBatchKey& key) const
+    {
+        std::size_t hash = std::hash<StaticMeshRenderer*>{}(key.renderer);
+        hash ^= std::hash<std::uint64_t>{}(key.configHash) + 0x9e3779b97f4a7c15ull + (hash << 6u) + (hash >> 2u);
+        hash ^= std::hash<std::uint32_t>{}(key.lodLevel) + 0x9e3779b97f4a7c15ull + (hash << 6u) + (hash >> 2u);
+        return hash;
+    }
+};
+
+struct StaticMeshLodBatch
+{
+    LodConfig config;
+    std::vector<StaticMeshRenderer::Instance> instances;
+    struct LodDispositionRecord
+    {
+        std::uint32_t entityId = 0;
+        float distance = 0.0f;
+        std::uint32_t previousLevel = 0;
+        std::uint32_t selectedLevel = 0;
+        std::uint32_t levelCount = 0;
+        LodConfig configSnapshot;
+        bool overrideEnabled = false;
+        bool bufferValid = false;
+        const char* bufferSource = "none";
+        std::size_t selectedVertices = 0;
+        std::size_t selectedIndices = 0;
+        SpatialIndex::Aabb bounds{};
+        const char* bboxSource = "entity";
+        bool culled = false;
+        const char* cullReason = "none";
+        bool submitted = false;
+        bool fullResFallback = false;
+        std::uint32_t drawIndexCount = 0;
+    };
+    std::vector<LodDispositionRecord> lodDispositionRecords;
+};
+
+struct LodDispositionState
+{
+    std::uint32_t selectedLevel = std::numeric_limits<std::uint32_t>::max();
+    bool bufferValid = false;
+    bool culled = false;
+    bool submitted = false;
+    bool fullResFallback = false;
+    std::string disposition;
+};
+
+struct LodCfgLogState
+{
+    std::uint32_t levelCount = 0;
+    std::array<float, LodConfig::MaxLevels> ratios{};
+    std::array<float, LodConfig::MaxLevels> distances{};
+    bool overrideEnabled = false;
+    bool initialized = false;
+};
+
+struct LodPickLogState
+{
+    std::uint32_t selectedLevel = 0;
+    std::uint32_t levelCount = 0;
+    std::array<std::size_t, LodConfig::MaxLevels> levelTris{};
+    std::size_t selectedTris = 0;
+    bool selectedBufferValid = false;
+    std::string source;
+    bool initialized = false;
+};
+
+struct MPerfMainState
+{
+    std::size_t drawcalls = 0;
+    std::size_t tris = 0;
+    bool initialized = false;
+};
+
+struct MPerfOverrideState
+{
+    std::size_t uniformUpdates = 0;
+    std::size_t activeOverrideDraws = 0;
+    bool initialized = false;
+};
+
+struct MPerfMeshesState
+{
+    std::size_t total = 0;
+    std::size_t culled = 0;
+    std::size_t drawn = 0;
+    bool initialized = false;
+};
+
+struct InstSummaryState
+{
+    std::size_t batches = 0;
+    std::size_t draws = 0;
+    std::size_t instances = 0;
+    std::size_t maxBatch = 0;
+    bool initialized = false;
+};
+
+struct InstBufferState
+{
+    std::size_t bytes = 0;
+    bool initialized = false;
+};
 
 std::uint32_t PickRenderEntityTarget(const std::vector<WorldRenderEntity>& entities,
                             const WorldCamera& camera,
@@ -535,6 +700,8 @@ MeshRendererEditorState BuildMeshRendererEditorState(const std::vector<MeshScene
     std::copy(std::begin(it->scale), std::end(it->scale), std::begin(state.scale));
     state.skinned = it->skinned;
     state.materialOverrides = it->materialOverrides;
+    state.editorComponents = it->editorComponents;
+    state.lod = it->lod;
     state.materialSlotCount = std::max<std::uint32_t>(1u, static_cast<std::uint32_t>(state.materialOverrides.size()));
     state.selectedMaterialSlot = std::min(state.selectedMaterialSlot, state.materialSlotCount - 1u);
     return state;
@@ -550,6 +717,8 @@ void ApplyMeshRendererEditorState(MeshSceneEntity& mesh, const MeshRendererEdito
     std::copy(std::begin(state.scale), std::end(state.scale), std::begin(mesh.scale));
     mesh.skinned = state.skinned;
     mesh.materialOverrides = state.materialOverrides;
+    mesh.editorComponents = state.editorComponents;
+    mesh.lod = state.lod;
 }
 
 std::optional<std::uint32_t> PickWaterBody(const std::vector<WaterBody>& bodies,
@@ -1234,6 +1403,18 @@ void MergeMapEditorCommands(MapEditorCommands& target, const MapEditorCommands& 
     {
         target.addComponentToSelectedEntity = true;
         target.addComponentType = source.addComponentType;
+        target.addComponentTypeId = source.addComponentTypeId;
+    }
+    if (source.removeComponentFromSelectedEntity)
+    {
+        target.removeComponentFromSelectedEntity = true;
+        target.removeComponentTypeId = source.removeComponentTypeId;
+    }
+    if (source.lodQualityCommitRequested)
+    {
+        target.lodQualityCommitRequested = true;
+        target.lodQualityCommitEntityId = source.lodQualityCommitEntityId;
+        target.lodQualityCommitConfig = source.lodQualityCommitConfig;
     }
     if (source.assignMeshAssetToSelectedEntity)
     {
@@ -1377,6 +1558,7 @@ int RunGame(NativeWindow& window,
     Tracen("[BOOT] entry state = release boot, default runtime, no startup scene");
 #endif
     Tracenf("[BOOT] window size = %ux%u", window.GetWidth(), window.GetHeight());
+    Tracenf("[LOG-CONFIG] quiet_logs_for_lod_diag = %s", QuietLogsForLodDiag() ? "true" : "false");
 
     VkExtent2D renderSize = device.GetSwapchainExtent();
     Tracenf("[BOOT] swapchain size = %ux%u", renderSize.width, renderSize.height);
@@ -1630,6 +1812,23 @@ int RunGame(NativeWindow& window,
     std::unordered_map<std::uint32_t, std::size_t> editorMeshEntityLookup;
     SpatialIndex staticMeshSpatialIndex;
     std::unordered_set<std::uint32_t> staticMeshSpatialIndexed;
+    std::unordered_map<std::uint32_t, std::uint32_t> staticMeshSelectedLods;
+    std::unordered_map<std::uint32_t, LodDispositionState> staticMeshLodDispositionStates;
+    std::unordered_map<std::uint32_t, LodCfgLogState> lodCfgLogStates;
+    std::unordered_map<std::uint32_t, LodPickLogState> lodPickLogStates;
+    std::unordered_set<std::uint32_t> previousCulledMeshLogSet;
+    std::array<std::uint32_t, LodConfig::MaxLevels> previousFrameLodSelection{};
+    bool previousFrameLodSelectionInitialized = false;
+    std::uint32_t previousFrameNonLodEntities = 0;
+    bool previousFrameNonLodInitialized = false;
+    MPerfMainState previousMperfMain;
+    MPerfOverrideState previousMperfOverride;
+    MPerfMeshesState previousMperfMeshes;
+    InstSummaryState previousInstSummary;
+    InstBufferState previousInstBuffer;
+    std::size_t previousMeshSubmitDetailInstances = 0;
+    std::size_t previousMeshSubmitDetailDrawCalls = 0;
+    bool previousMeshSubmitDetailInitialized = false;
     std::vector<WaterBody> editorWaterBodies = terrainOk ? terrain.GetWaterBodies() : std::vector<WaterBody>{};
     bool editorWaterBodiesDirty = false;
 #if defined(IXTREEME_WITH_EDITOR)
@@ -1646,6 +1845,8 @@ int RunGame(NativeWindow& window,
     });
     ecs_entity_t editorSceneRootEntity = ecs_new(editorHierarchyWorld.get());
     ecs_set_name(editorHierarchyWorld.get(), editorSceneRootEntity, "Untitled");
+    ecs_entity_t editorNoteComponentEntity = ecs_new(editorHierarchyWorld.get());
+    ecs_set_name(editorHierarchyWorld.get(), editorNoteComponentEntity, "EditorNoteComponent");
     std::unordered_map<std::uint64_t, ecs_entity_t> editorHierarchyEntities;
     auto resetEditorHierarchyEntities = [&]() {
         for (const auto& [_, entity] : editorHierarchyEntities)
@@ -1715,6 +1916,8 @@ int RunGame(NativeWindow& window,
         return true;
     };
     auto removeStaticMeshSpatialEntity = [&](std::uint32_t id) {
+        staticMeshSelectedLods.erase(id);
+        staticMeshLodDispositionStates.erase(id);
         if (staticMeshSpatialIndexed.erase(id) > 0)
             staticMeshSpatialIndex.Remove(id);
     };
@@ -1738,6 +1941,8 @@ int RunGame(NativeWindow& window,
     auto logStaticMeshSpatialMutations = [&]() {
         const SpatialIndex::MutationStats mutations = staticMeshSpatialIndex.ConsumeMutationStats();
         if (mutations.inserts == 0 && mutations.removes == 0 && mutations.updates == 0)
+            return;
+        if (QuietLogsForLodDiag() && mutations.inserts == 0 && mutations.removes == 0 && mutations.updates == 1)
             return;
         Tracenf("[SPATIAL] mutate insert=%u remove=%u update=%u (this load/edit)",
             mutations.inserts,
@@ -1816,6 +2021,14 @@ int RunGame(NativeWindow& window,
         if (sceneName.empty())
             sceneName = "Untitled";
         ecs_set_name(editorHierarchyWorld.get(), editorSceneRootEntity, sceneName.c_str());
+        auto syncEditorComponentTags = [&](ecs_entity_t entity, const std::vector<EditorAttachedComponent>& components) {
+            const bool hasNote = std::any_of(components.begin(), components.end(),
+                [](const EditorAttachedComponent& component) { return component.type == "editor.note"; });
+            if (hasNote)
+                ecs_add_id(editorHierarchyWorld.get(), entity, editorNoteComponentEntity);
+            else
+                ecs_remove_id(editorHierarchyWorld.get(), entity, editorNoteComponentEntity);
+        };
 
         auto ensureEntity = [&](HierarchyEntityType type,
                                 std::uint32_t objectId,
@@ -1884,6 +2097,13 @@ int RunGame(NativeWindow& window,
             {
                 ++it;
             }
+        }
+
+        for (const MeshSceneEntity& mesh : editorMeshEntities)
+        {
+            auto meshIt = editorHierarchyEntities.find(HierarchyObjectKey(HierarchyEntityType::MeshEntity, mesh.id));
+            if (meshIt != editorHierarchyEntities.end())
+                syncEditorComponentTags(meshIt->second, mesh.editorComponents);
         }
 
         return std::pair<std::string, std::vector<HierarchySceneEntity>>(sceneName, std::move(entities));
@@ -2031,16 +2251,19 @@ int RunGame(NativeWindow& window,
         {
             editorFlyMovement.Apply(event);
             movement.Apply(event);
-            Tracenf("[EDITOR-CAMERA-INPUT] key=%d type=%s state w=%d a=%d s=%d d=%d space=%d ctrl=%d shift=%d",
-                static_cast<int>(event.key),
-                InputEventTypeName(event.type),
-                editorFlyMovement.w ? 1 : 0,
-                editorFlyMovement.a ? 1 : 0,
-                editorFlyMovement.s ? 1 : 0,
-                editorFlyMovement.d ? 1 : 0,
-                editorFlyMovement.space ? 1 : 0,
-                editorFlyMovement.control ? 1 : 0,
-                editorFlyMovement.shift ? 1 : 0);
+            if (!QuietLogsForLodDiag())
+            {
+                Tracenf("[EDITOR-CAMERA-INPUT] key=%d type=%s state w=%d a=%d s=%d d=%d space=%d ctrl=%d shift=%d",
+                    static_cast<int>(event.key),
+                    InputEventTypeName(event.type),
+                    editorFlyMovement.w ? 1 : 0,
+                    editorFlyMovement.a ? 1 : 0,
+                    editorFlyMovement.s ? 1 : 0,
+                    editorFlyMovement.d ? 1 : 0,
+                    editorFlyMovement.space ? 1 : 0,
+                    editorFlyMovement.control ? 1 : 0,
+                    editorFlyMovement.shift ? 1 : 0);
+            }
             return;
         }
         if (editorImGui.WantsInputCapture(event) && !sceneViewInputTarget && !editorFlyCameraKey)
@@ -2205,9 +2428,11 @@ int RunGame(NativeWindow& window,
                     editorSettings.toolMode == MapEditorToolMode::Heightmap ||
                     editorSettings.toolMode == MapEditorToolMode::SplatPaint;
                 const bool shouldLogSculptDiag =
-                    terrainToolActiveForDiag ||
-                    event.type == InputEvent::MouseDown ||
-                    event.type == InputEvent::MouseUp;
+                    QuietLogsForLodDiag()
+                        ? terrainToolActiveForDiag
+                        : (terrainToolActiveForDiag ||
+                            event.type == InputEvent::MouseDown ||
+                            event.type == InputEvent::MouseUp);
                 const auto viewportDiag = editorImGui.GetViewportInputDiagnostics();
                 auto logSculptGateState = [&](const char* stage, bool brushReached, const char* reason) {
                     if (!shouldLogSculptDiag)
@@ -2643,6 +2868,7 @@ int RunGame(NativeWindow& window,
     std::clock_t statsPreviousCpuClock = std::clock();
     double statsPreviousCpuSampleSeconds = 0.0;
     const unsigned int statsHardwareThreads = std::max(1u, std::thread::hardware_concurrency());
+    double lastPerfLogSeconds = -1000.0;
 #endif
     bool running = true;
     while (running)
@@ -2761,13 +2987,17 @@ int RunGame(NativeWindow& window,
             statsPreviousCpuClock = cpuClock;
             statsPreviousCpuSampleSeconds = seconds;
 
-            Tracenf("[PERF] fps=%.1f frame_ms=%.2f budget60=%.0f%% cpu=%.1f%% swapchain=%ux%u",
-                engineStats.fps,
-                engineStats.averageFrameMs,
-                engineStats.frameBudgetPercent,
-                engineStats.processCpuPercent,
-                renderSize.width,
-                renderSize.height);
+            if (!QuietLogsForLodDiag() || seconds - lastPerfLogSeconds >= 5.0)
+            {
+                Tracenf("[PERF] fps=%.1f frame_ms=%.2f budget60=%.0f%% cpu=%.1f%% swapchain=%ux%u",
+                    engineStats.fps,
+                    engineStats.averageFrameMs,
+                    engineStats.frameBudgetPercent,
+                    engineStats.processCpuPercent,
+                    renderSize.width,
+                    renderSize.height);
+                lastPerfLogSeconds = seconds;
+            }
 
             statsAccumSeconds = 0.0;
             statsFrameMsAccum = 0.0;
@@ -3283,6 +3513,11 @@ int RunGame(NativeWindow& window,
                     commands.addMeshEntity = false;
                     commands.addComponentToSelectedEntity = false;
                     commands.addComponentType = EditorComponentType::None;
+                    commands.addComponentTypeId.clear();
+                    commands.removeComponentFromSelectedEntity = false;
+                    commands.removeComponentTypeId.clear();
+                    commands.lodQualityCommitRequested = false;
+                    commands.lodQualityCommitEntityId = 0;
                     commands.assignMeshAssetToSelectedEntity = false;
                     commands.addPointLight = false;
                     commands.addSpotLight = false;
@@ -3411,8 +3646,92 @@ int RunGame(NativeWindow& window,
                         spawn.y,
                         spawn.z);
                 };
+                auto addEditorNoteComponentToSelectedMesh = [&]() {
+                    if (selectedEditorObject.type != SelectedEditorObjectType::MeshEntity)
+                        return false;
+                    auto it = std::find_if(editorMeshEntities.begin(), editorMeshEntities.end(),
+                        [&](const MeshSceneEntity& mesh) { return mesh.id == selectedEditorObject.id; });
+                    if (it == editorMeshEntities.end())
+                        return false;
+                    const auto existing = std::find_if(it->editorComponents.begin(), it->editorComponents.end(),
+                        [](const EditorAttachedComponent& component) { return component.type == "editor.note"; });
+                    if (existing != it->editorComponents.end())
+                        return false;
+                    EditorAttachedComponent component{};
+                    component.type = "editor.note";
+                    component.displayName = "Note";
+                    component.category = "Editor";
+                    component.note = "New note";
+                    it->editorComponents.push_back(component);
+                    if (selectedEditorObject.flecsEntity != 0)
+                        ecs_add_id(editorHierarchyWorld.get(), static_cast<ecs_entity_t>(selectedEditorObject.flecsEntity), editorNoteComponentEntity);
+                    SceneManager::Instance().MarkDirty();
+                    Tracenf("[INSPECTOR-COMP] add entity=%u component=Note", it->id);
+                    return true;
+                };
+                auto addLodComponentToSelectedMesh = [&]() {
+                    if (selectedEditorObject.type != SelectedEditorObjectType::MeshEntity)
+                        return false;
+                    auto it = std::find_if(editorMeshEntities.begin(), editorMeshEntities.end(),
+                        [&](const MeshSceneEntity& mesh) { return mesh.id == selectedEditorObject.id; });
+                    if (it == editorMeshEntities.end())
+                        return false;
+                    const auto existing = std::find_if(it->editorComponents.begin(), it->editorComponents.end(),
+                        [](const EditorAttachedComponent& component) { return component.type == "rendering.lod"; });
+                    if (existing == it->editorComponents.end())
+                        it->editorComponents.push_back({"rendering.lod", "LOD Group", "Rendering", {}});
+                    const std::optional<LodConfig> assetDefault = editorImGui.FindModelLodDefault(it->meshAssetId);
+                    it->lod.enabled = true;
+                    it->lod.overrideAssetDefault = false;
+                    it->lod.config = assetDefault.value_or(LodConfig{});
+                    SceneManager::Instance().MarkDirty();
+                    Tracenf("[INSPECTOR-COMP] add entity=%u component=LOD Group", it->id);
+                    if (LodLogsEnabled())
+                    {
+                        Tracenf("[LOD] component added entity=%u asset=%s source=%s",
+                            it->id,
+                            it->meshAssetId.empty() ? it->meshAssetPath.c_str() : it->meshAssetId.c_str(),
+                            assetDefault ? "assetDefault" : "engineDefault");
+                    }
+                    return true;
+                };
+                auto removeEditorComponentFromSelectedMesh = [&](const std::string& componentType) {
+                    if (selectedEditorObject.type != SelectedEditorObjectType::MeshEntity)
+                        return false;
+                    auto it = std::find_if(editorMeshEntities.begin(), editorMeshEntities.end(),
+                        [&](const MeshSceneEntity& mesh) { return mesh.id == selectedEditorObject.id; });
+                    if (it == editorMeshEntities.end())
+                        return false;
+                    const std::size_t oldSize = it->editorComponents.size();
+                    it->editorComponents.erase(std::remove_if(it->editorComponents.begin(), it->editorComponents.end(),
+                        [&](const EditorAttachedComponent& component) { return component.type == componentType; }),
+                        it->editorComponents.end());
+                    if (it->editorComponents.size() == oldSize)
+                        return false;
+                    if (componentType == "editor.note" && selectedEditorObject.flecsEntity != 0)
+                        ecs_remove_id(editorHierarchyWorld.get(), static_cast<ecs_entity_t>(selectedEditorObject.flecsEntity), editorNoteComponentEntity);
+                    if (componentType == "rendering.lod")
+                        it->lod = {};
+                    SceneManager::Instance().MarkDirty();
+                    Tracenf("[INSPECTOR-COMP] remove entity=%u component=%s",
+                        it->id,
+                        componentType == "editor.note" ? "Note" : (componentType == "rendering.lod" ? "LOD Group" : componentType.c_str()));
+                    return true;
+                };
                 if (commands.addComponentToSelectedEntity)
                 {
+                    if (commands.addComponentTypeId == "editor.note")
+                    {
+                        if (addEditorNoteComponentToSelectedMesh())
+                            runtimeSession->SetEditorStatus("Added Note component");
+                    }
+                    else if (commands.addComponentTypeId == "rendering.lod")
+                    {
+                        if (addLodComponentToSelectedMesh())
+                            runtimeSession->SetEditorStatus("Added LOD Group component");
+                    }
+                    else
+                    {
                     const WorldVec3 spawn = selectedEntityPosition();
                     if (commands.addComponentType == EditorComponentType::WaterBody &&
                         selectedEditorObject.type != SelectedEditorObjectType::WaterBody)
@@ -3490,6 +3809,18 @@ int RunGame(NativeWindow& window,
                         selectedEditorObject.type != SelectedEditorObjectType::MeshEntity)
                     {
                         createMeshEntityAt(commands.assignMeshAssetId.empty() ? commands.meshAssetId : commands.assignMeshAssetId, spawn);
+                    }
+                    }
+                }
+                if (commands.removeComponentFromSelectedEntity)
+                {
+                    if (commands.removeComponentTypeId == "builtin.transform")
+                    {
+                        Tracen("[INSPECTOR-COMP] remove ignored component=Transform reason=not-removable");
+                    }
+                    else if (removeEditorComponentFromSelectedMesh(commands.removeComponentTypeId))
+                    {
+                        runtimeSession->SetEditorStatus("Removed component");
                     }
                 }
                 if (commands.addMeshEntity)
@@ -3644,10 +3975,33 @@ int RunGame(NativeWindow& window,
                         [&](const MeshSceneEntity& mesh) { return mesh.id == commands.selectedMeshEntity.id; });
                     if (it != editorMeshEntities.end())
                     {
+                        const bool transformChanged =
+                            !std::equal(std::begin(it->position), std::end(it->position), std::begin(commands.selectedMeshEntity.position)) ||
+                            !std::equal(std::begin(it->rotation), std::end(it->rotation), std::begin(commands.selectedMeshEntity.rotation)) ||
+                            !std::equal(std::begin(it->scale), std::end(it->scale), std::begin(commands.selectedMeshEntity.scale));
+                        const bool meshAssetChanged =
+                            it->meshAssetId != commands.selectedMeshEntity.meshAssetId ||
+                            it->meshAssetPath != commands.selectedMeshEntity.meshAssetPath ||
+                            it->skinned != commands.selectedMeshEntity.skinned;
                         ApplyMeshRendererEditorState(*it, commands.selectedMeshEntity);
-                        syncStaticMeshSpatialEntity(*it);
+                        if (transformChanged || meshAssetChanged)
+                            syncStaticMeshSpatialEntity(*it);
                         selectedEditorObject = {SelectedEditorObjectType::MeshEntity, it->id};
                         SceneManager::Instance().MarkDirty();
+                    }
+                }
+                if (commands.lodQualityCommitRequested)
+                {
+                    MeshSceneEntity* mesh = findMeshEntityById(commands.lodQualityCommitEntityId);
+                    if (mesh && mesh->lod.enabled)
+                    {
+                        LodConfig qualityConfig = commands.lodQualityCommitConfig;
+                        qualityConfig.levelCount = std::clamp(qualityConfig.levelCount, 1u, LodConfig::MaxLevels);
+                        qualityConfig.targetRatios[0] = 1.0f;
+                        qualityConfig.distances[0] = 0.0f;
+                        const std::uint64_t qualityHash = HashLodConfig(qualityConfig);
+                        if (StaticMeshRenderer* renderer = getStaticMeshRenderer(resolveMeshRuntimePath(*mesh)))
+                            renderer->RequestLodQualityBuild(qualityConfig, qualityHash, mesh->id);
                     }
                 }
                 if (commands.deleteSelectedLight)
@@ -3967,6 +4321,10 @@ int RunGame(NativeWindow& window,
             size_t frameStaticMeshOverrideActiveDraws = 0;
             size_t frameStaticMeshFrustumCulled = 0;
             SpatialIndex::QueryStats frameStaticMeshSpatialStats{};
+            size_t frameStaticMeshBatches = 0;
+            size_t frameStaticMeshMaxBatchSize = 0;
+            size_t frameStaticMeshInstanceBufferBytes = 0;
+            bool frameStaticMeshInstanceBufferRebuilt = false;
 #if defined(IXTREEME_WITH_EDITOR)
             editorImGui.SetEditorPlayModeState(editorPlay.state);
             editorImGui.BeginFrame(runtimeSession->IsMapEditorOpen());
@@ -4217,6 +4575,10 @@ int RunGame(NativeWindow& window,
                 }
                 if (runtimeSession->IsMapEditorOpen())
                 {
+                    std::unordered_map<StaticMeshLodBatchKey, StaticMeshLodBatch, StaticMeshLodBatchKeyHash> staticMeshBatches;
+                    std::array<std::uint32_t, LodConfig::MaxLevels> frameLodSelection{};
+                    std::uint32_t frameLodActiveInstances = 0;
+                    std::uint32_t frameNonLodEntities = 0;
                     const std::vector<std::uint32_t> spatialCandidates =
                         staticMeshSpatialIndex.QueryFrustum(SpatialFrustumFromCamera(camera), &frameStaticMeshSpatialStats);
                     frameStaticMeshEntityCount = editorMeshEntities.size();
@@ -4224,6 +4586,85 @@ int RunGame(NativeWindow& window,
                         frameStaticMeshSpatialStats.totalObjects > frameStaticMeshSpatialStats.candidates
                             ? static_cast<std::size_t>(frameStaticMeshSpatialStats.totalObjects - frameStaticMeshSpatialStats.candidates)
                             : 0u;
+                    auto logLodDisposition = [&](const StaticMeshLodBatch::LodDispositionRecord& record) {
+                        const char* disposition = "DRAWN";
+                        if (record.fullResFallback && record.submitted)
+                            disposition = "DRAWN";
+                        else if (record.selectedLevel >= record.levelCount)
+                            disposition = "LEVEL_OUT_OF_RANGE";
+                        else if (!record.bufferValid)
+                            disposition = "INVALID_BUFFER";
+                        else if (record.selectedIndices == 0)
+                            disposition = "EMPTY_BUFFER";
+                        else if (record.culled)
+                            disposition = "CULLED";
+                        else if (!record.submitted)
+                            disposition = "NOT_SUBMITTED";
+
+                        LodDispositionState& state = staticMeshLodDispositionStates[record.entityId];
+                        const bool changed =
+                            state.selectedLevel != record.selectedLevel ||
+                            state.bufferValid != record.bufferValid ||
+                            state.culled != record.culled ||
+                            state.submitted != record.submitted ||
+                            state.fullResFallback != record.fullResFallback ||
+                            state.disposition != disposition;
+                        const bool heartbeat = (frameNumber % 60u) == 0u;
+                        if (!changed && !heartbeat)
+                            return;
+
+                        if (LodLogsEnabled())
+                        {
+                            Tracenf("[LOD-DISP] entity=%u dist=%.3f prevLevel=%u -> level=%u levelCount=%u cfg.distances=[%.2f,%.2f,%.2f,%.2f] cfg.ratios=[%.5f,%.5f,%.5f,%.5f] override=%u bufferValid=%s bufferSource=%s selVerts=%zu selIndices=%zu bbox.min=(%.3f,%.3f,%.3f) bbox.max=(%.3f,%.3f,%.3f) bboxSource=%s culled=%s cullReason=%s submitted=%s drawIndexCount=%u disposition=%s",
+                                record.entityId,
+                                record.distance,
+                                record.previousLevel,
+                                record.selectedLevel,
+                                record.levelCount,
+                                record.configSnapshot.distances[0],
+                                record.configSnapshot.distances[1],
+                                record.configSnapshot.distances[2],
+                                record.configSnapshot.distances[3],
+                                record.configSnapshot.targetRatios[0],
+                                record.configSnapshot.targetRatios[1],
+                                record.configSnapshot.targetRatios[2],
+                                record.configSnapshot.targetRatios[3],
+                                record.overrideEnabled ? 1u : 0u,
+                                record.bufferValid ? "y" : "n",
+                                record.bufferSource,
+                                record.selectedVertices,
+                                record.selectedIndices,
+                                record.bounds.min.x, record.bounds.min.y, record.bounds.min.z,
+                                record.bounds.max.x, record.bounds.max.y, record.bounds.max.z,
+                                record.bboxSource,
+                                record.culled ? "y" : "n",
+                                record.cullReason,
+                                record.submitted ? "y" : "n",
+                                record.drawIndexCount,
+                                disposition);
+                        }
+
+                        state.selectedLevel = record.selectedLevel;
+                        state.bufferValid = record.bufferValid;
+                        state.culled = record.culled;
+                        state.submitted = record.submitted;
+                        state.fullResFallback = record.fullResFallback;
+                        state.disposition = disposition;
+                    };
+                    auto lodBufferSourceForDiag = [](const StaticMeshRenderer::LodDiagnostics& diag) -> const char* {
+                        if (diag.pendingUpload)
+                            return "pending";
+                        if (std::strcmp(diag.source, "cache") == 0)
+                            return "cache";
+                        if (std::strcmp(diag.source, "preview") == 0 ||
+                            std::strcmp(diag.source, "commit") == 0 ||
+                            std::strcmp(diag.source, "fullres") == 0)
+                        {
+                            return "generated";
+                        }
+                        return "none";
+                    };
+                    std::unordered_set<std::uint32_t> currentCulledMeshLogSet;
                     for (std::uint32_t meshId : spatialCandidates)
                     {
                         MeshSceneEntity* meshPtr = findMeshEntityById(meshId);
@@ -4238,11 +4679,58 @@ int RunGame(NativeWindow& window,
                         const std::string runtimePath = resolveMeshRuntimePath(mesh);
                         if (StaticMeshRenderer* renderer = getStaticMeshRenderer(runtimePath))
                         {
+                            const SpatialIndex::Aabb worldBounds = StaticMeshWorldAabb(mesh, *renderer);
                             if (renderer->IsLoaded() &&
-                                WorldAabbOutsideCameraFrustum(camera, SpatialAabbCorners(StaticMeshWorldAabb(mesh, *renderer))))
+                                WorldAabbOutsideCameraFrustum(camera, SpatialAabbCorners(worldBounds)))
                             {
                                 ++frameStaticMeshFrustumCulled;
-                                if (frameNumber < 3 || (frameNumber % 60u) == 0u)
+                                currentCulledMeshLogSet.insert(mesh.id);
+                                if (mesh.lod.enabled)
+                                {
+                                    LodConfig cullLodConfig{};
+                                    const std::optional<LodConfig> assetDefault = editorImGui.FindModelLodDefault(mesh.meshAssetId);
+                                    cullLodConfig = (!mesh.lod.overrideAssetDefault && assetDefault)
+                                        ? *assetDefault
+                                        : mesh.lod.config;
+                                    cullLodConfig.levelCount = std::clamp(cullLodConfig.levelCount, 1u, LodConfig::MaxLevels);
+                                    cullLodConfig.targetRatios[0] = 1.0f;
+                                    cullLodConfig.distances[0] = 0.0f;
+                                    const std::uint64_t cullConfigHash = HashLodConfig(cullLodConfig);
+                                    const float cullDistance = DistanceToAabb(camera.eye, worldBounds);
+                                    const std::uint32_t previousLevel = staticMeshSelectedLods.count(mesh.id) > 0
+                                        ? staticMeshSelectedLods[mesh.id]
+                                        : 0u;
+                                    const std::uint32_t cullLevel = SelectLodLevel(cullLodConfig, cullDistance, previousLevel);
+                                    const StaticMeshRenderer::LodDiagnostics lodDiag =
+                                        renderer->GetLodDiagnostics(cullLevel == 0 ? 0 : cullConfigHash);
+                                    StaticMeshLodBatch::LodDispositionRecord record{};
+                                    record.entityId = mesh.id;
+                                    record.distance = cullDistance;
+                                    record.previousLevel = previousLevel;
+                                    record.selectedLevel = cullLevel;
+                                    record.levelCount = lodDiag.levelCount;
+                                    record.configSnapshot = cullLodConfig;
+                                    record.overrideEnabled = mesh.lod.overrideAssetDefault;
+                                    record.bufferValid = cullLevel < lodDiag.levelCount && lodDiag.bufferValid;
+                                    record.bufferSource = lodBufferSourceForDiag(lodDiag);
+                                    record.selectedVertices = lodDiag.vertexCount;
+                                    record.selectedIndices = cullLevel < lodDiag.levelIndices.size() ? lodDiag.levelIndices[cullLevel] : 0u;
+                                    record.bounds = worldBounds;
+                                    record.bboxSource =
+                                        (worldBounds.min.x == worldBounds.max.x ||
+                                            worldBounds.min.y == worldBounds.max.y ||
+                                            worldBounds.min.z == worldBounds.max.z)
+                                        ? "degenerate"
+                                        : "entity";
+                                    record.culled = true;
+                                    record.cullReason = "frustum";
+                                    record.submitted = false;
+                                    record.drawIndexCount = 0;
+                                    logLodDisposition(record);
+                                }
+                                const bool cullLogChanged = previousCulledMeshLogSet.find(mesh.id) == previousCulledMeshLogSet.end();
+                                if ((!QuietLogsForLodDiag() && (frameNumber < 3 || (frameNumber % 60u) == 0u)) ||
+                                    (QuietLogsForLodDiag() && cullLogChanged))
                                 {
                                     Tracenf("[MESH-CULL] culled id=%u name=%s path=%s",
                                         mesh.id,
@@ -4253,6 +4741,7 @@ int RunGame(NativeWindow& window,
                             }
                             renderer->SetLightingState(runtimeSession->GetLightingState());
                             StaticMeshRenderer::Instance instance{};
+                            instance.entityId = mesh.id;
                             instance.position = {mesh.position[0], mesh.position[1], mesh.position[2]};
                             instance.rotation[0] = mesh.rotation[0];
                             instance.rotation[1] = mesh.rotation[1];
@@ -4264,35 +4753,247 @@ int RunGame(NativeWindow& window,
                                 ? std::array<float, 4>{1.25f, 1.05f, 0.45f, 1.0f}
                                 : std::array<float, 4>{1.0f, 1.0f, 1.0f, 1.0f};
                             instance.materialOverrides = mesh.materialOverrides;
-                            renderer->RenderInWorld(device, seconds, camera, instance);
-                            const std::uint32_t submittedDrawCalls = renderer->LastSubmittedDrawCalls();
-                            if (submittedDrawCalls > 0)
+                            LodConfig effectiveLodConfig{};
+                            std::uint64_t lodConfigHash = 0;
+                            std::uint32_t lodLevel = 0;
+                            bool lodDispositionActive = false;
+                            StaticMeshLodBatch::LodDispositionRecord lodDispositionRecord{};
+                            if (mesh.lod.enabled)
                             {
-                                ++frameStaticMeshSubmitted;
-                                frameStaticMeshDrawCalls += submittedDrawCalls;
-                                frameStaticMeshTriangles += renderer->TriangleCount();
-                                frameStaticMeshUniformUpdates += renderer->LastMaterialUniformUpdates();
-                                frameStaticMeshOverrideActiveDraws += renderer->LastOverrideActiveDraws();
-                                if (frameNumber < 3 || (frameNumber % 60u) == 0u)
+                                ++frameLodActiveInstances;
+                                const std::optional<LodConfig> assetDefault = editorImGui.FindModelLodDefault(mesh.meshAssetId);
+                                effectiveLodConfig = (!mesh.lod.overrideAssetDefault && assetDefault)
+                                    ? *assetDefault
+                                    : mesh.lod.config;
+                                effectiveLodConfig.levelCount = std::clamp(effectiveLodConfig.levelCount, 1u, LodConfig::MaxLevels);
+                                effectiveLodConfig.targetRatios[0] = 1.0f;
+                                effectiveLodConfig.distances[0] = 0.0f;
+                                lodConfigHash = HashLodConfig(effectiveLodConfig);
+                                const float distance = DistanceToAabb(camera.eye, worldBounds);
+                                const std::uint32_t previousLevel = staticMeshSelectedLods.count(mesh.id) > 0
+                                    ? staticMeshSelectedLods[mesh.id]
+                                    : 0u;
+                                lodLevel = SelectLodLevel(effectiveLodConfig, distance, previousLevel);
+                                staticMeshSelectedLods[mesh.id] = lodLevel;
+                                if (lodLevel < frameLodSelection.size())
+                                    ++frameLodSelection[lodLevel];
+                                const StaticMeshRenderer::LodDiagnostics lodDiag =
+                                    renderer->GetLodDiagnostics(lodLevel == 0 ? 0 : lodConfigHash);
+                                const std::size_t selectedTris =
+                                    lodLevel < lodDiag.levelTris.size() ? lodDiag.levelTris[lodLevel] : 0u;
+                                const bool selectedBufferValid =
+                                    lodLevel < lodDiag.levelCount && lodDiag.bufferValid;
+                                lodDispositionActive = true;
+                                lodDispositionRecord.entityId = mesh.id;
+                                lodDispositionRecord.distance = distance;
+                                lodDispositionRecord.previousLevel = previousLevel;
+                                lodDispositionRecord.selectedLevel = lodLevel;
+                                lodDispositionRecord.levelCount = lodDiag.levelCount;
+                                lodDispositionRecord.configSnapshot = effectiveLodConfig;
+                                lodDispositionRecord.overrideEnabled = mesh.lod.overrideAssetDefault;
+                                lodDispositionRecord.bufferValid = selectedBufferValid;
+                                lodDispositionRecord.bufferSource = lodBufferSourceForDiag(lodDiag);
+                                lodDispositionRecord.selectedVertices = lodDiag.vertexCount;
+                                lodDispositionRecord.selectedIndices = lodLevel < lodDiag.levelIndices.size() ? lodDiag.levelIndices[lodLevel] : 0u;
+                                lodDispositionRecord.bounds = worldBounds;
+                                lodDispositionRecord.bboxSource =
+                                    (worldBounds.min.x == worldBounds.max.x ||
+                                        worldBounds.min.y == worldBounds.max.y ||
+                                        worldBounds.min.z == worldBounds.max.z)
+                                    ? "degenerate"
+                                    : "entity";
+                                lodDispositionRecord.culled = false;
+                                lodDispositionRecord.cullReason = "none";
+                                std::array<float, LodConfig::MaxLevels> cfgRatios{};
+                                std::array<float, LodConfig::MaxLevels> cfgDistances{};
+                                for (std::size_t i = 0; i < LodConfig::MaxLevels; ++i)
                                 {
-                                    const auto& bmin = renderer->BoundsMin();
-                                    const auto& bmax = renderer->BoundsMax();
-                                    Tracenf("[MESH] Static submit detail: id=%u name=%s path=%s drawcalls=%u verts=%zu indices=%zu bbox_min=(%.3f,%.3f,%.3f) bbox_max=(%.3f,%.3f,%.3f) pos=(%.3f,%.3f,%.3f) scale=(%.3f,%.3f,%.3f) rot=(%.3f,%.3f,%.3f)",
+                                    cfgRatios[i] = effectiveLodConfig.targetRatios[i];
+                                    cfgDistances[i] = effectiveLodConfig.distances[i];
+                                }
+                                LodCfgLogState& cfgLogState = lodCfgLogStates[mesh.id];
+                                const bool cfgChanged =
+                                    !cfgLogState.initialized ||
+                                    cfgLogState.levelCount != effectiveLodConfig.levelCount ||
+                                    cfgLogState.ratios != cfgRatios ||
+                                    cfgLogState.distances != cfgDistances ||
+                                    cfgLogState.overrideEnabled != mesh.lod.overrideAssetDefault;
+                                if (LodLogsEnabled() && (!QuietLogsForLodDiag() || cfgChanged))
+                                {
+                                    Tracenf("[LOD-CFG] entity=%u levelCount=%u ratios=[%.5f,%.5f,%.5f,%.5f] distances=[%.2f,%.2f,%.2f,%.2f] override=%u",
                                         mesh.id,
-                                        mesh.name.c_str(),
-                                        runtimePath.c_str(),
-                                        submittedDrawCalls,
-                                        renderer->VertexCount(),
-                                        renderer->IndexCount(),
-                                        bmin[0], bmin[1], bmin[2],
-                                        bmax[0], bmax[1], bmax[2],
-                                        mesh.position[0], mesh.position[1], mesh.position[2],
-                                        mesh.scale[0], mesh.scale[1], mesh.scale[2],
-                                        mesh.rotation[0], mesh.rotation[1], mesh.rotation[2]);
+                                        effectiveLodConfig.levelCount,
+                                        effectiveLodConfig.targetRatios[0],
+                                        effectiveLodConfig.targetRatios[1],
+                                        effectiveLodConfig.targetRatios[2],
+                                        effectiveLodConfig.targetRatios[3],
+                                        effectiveLodConfig.distances[0],
+                                        effectiveLodConfig.distances[1],
+                                        effectiveLodConfig.distances[2],
+                                        effectiveLodConfig.distances[3],
+                                        mesh.lod.overrideAssetDefault ? 1u : 0u);
+                                }
+                                cfgLogState.levelCount = effectiveLodConfig.levelCount;
+                                cfgLogState.ratios = cfgRatios;
+                                cfgLogState.distances = cfgDistances;
+                                cfgLogState.overrideEnabled = mesh.lod.overrideAssetDefault;
+                                cfgLogState.initialized = true;
+
+                                std::array<std::size_t, LodConfig::MaxLevels> pickLevelTris{};
+                                for (std::size_t i = 0; i < LodConfig::MaxLevels; ++i)
+                                    pickLevelTris[i] = lodDiag.levelTris[i];
+                                LodPickLogState& pickLogState = lodPickLogStates[mesh.id];
+                                const bool pickCritical =
+                                    lodLevel > 0 &&
+                                    (lodLevel >= lodDiag.levelCount ||
+                                        !selectedBufferValid ||
+                                        selectedTris == 0);
+                                const bool pickChanged =
+                                    !pickLogState.initialized ||
+                                    pickLogState.selectedLevel != lodLevel ||
+                                    pickLogState.levelCount != lodDiag.levelCount ||
+                                    pickLogState.levelTris != pickLevelTris ||
+                                    pickLogState.selectedTris != selectedTris ||
+                                    pickLogState.selectedBufferValid != selectedBufferValid ||
+                                    pickLogState.source != lodDiag.source;
+                                if (LodLogsEnabled() && (!QuietLogsForLodDiag() || pickChanged || pickCritical))
+                                {
+                                    Tracenf("[LOD-PICK] entity=%u dist=%.3f selectedLevel=%u levelCount=%u levelTris=[%zu,%zu,%zu,%zu] selectedTris=%zu selectedBufferValid=%s source=%s",
+                                        mesh.id,
+                                        distance,
+                                        lodLevel,
+                                        lodDiag.levelCount,
+                                        lodDiag.levelTris[0],
+                                        lodDiag.levelTris[1],
+                                        lodDiag.levelTris[2],
+                                        lodDiag.levelTris[3],
+                                        selectedTris,
+                                        selectedBufferValid ? "y" : "n",
+                                        lodDiag.source);
+                                }
+                                pickLogState.selectedLevel = lodLevel;
+                                pickLogState.levelCount = lodDiag.levelCount;
+                                pickLogState.levelTris = pickLevelTris;
+                                pickLogState.selectedTris = selectedTris;
+                                pickLogState.selectedBufferValid = selectedBufferValid;
+                                pickLogState.source = lodDiag.source;
+                                pickLogState.initialized = true;
+                                if (lodLevel > 0)
+                                {
+                                    const char* emptyReason = nullptr;
+                                    if (!lodDiag.bufferKnown || !lodDiag.bufferValid)
+                                        emptyReason = "buffer-null";
+                                    else if (lodLevel >= lodDiag.levelCount)
+                                        emptyReason = "level-out-of-range";
+                                    else if (selectedTris == 0)
+                                        emptyReason = std::strcmp(lodDiag.source, "preview") == 0 ? "preview-empty" : "zero-tris";
+                                    if (emptyReason)
+                                    {
+                                        const char* fallbackReason = "buffer-not-ready";
+                                        if (std::strcmp(emptyReason, "level-out-of-range") == 0)
+                                            fallbackReason = "no-levels";
+                                        else if (std::strcmp(emptyReason, "zero-tris") == 0 ||
+                                            std::strcmp(emptyReason, "preview-empty") == 0)
+                                            fallbackReason = "zero-tris";
+                                        if (LodLogsEnabled())
+                                        {
+                                            Tracenf("[LOD-PICK] EMPTY entity=%u reason=%s", mesh.id, emptyReason);
+                                            Tracenf("[LOD-PICK] FALLBACK entity=%u reason=%s drawing=full-res",
+                                                mesh.id,
+                                                fallbackReason);
+                                        }
+                                    }
                                 }
                             }
+                            else
+                            {
+                                ++frameNonLodEntities;
+                                staticMeshSelectedLods.erase(mesh.id);
+                            }
+                            StaticMeshLodBatchKey key{renderer, lodConfigHash, lodLevel};
+                            StaticMeshLodBatch& batch = staticMeshBatches[key];
+                            batch.config = effectiveLodConfig;
+                            batch.instances.push_back(std::move(instance));
+                            if (lodDispositionActive)
+                                batch.lodDispositionRecords.push_back(lodDispositionRecord);
                         }
                     }
+                    for (auto& [key, batch] : staticMeshBatches)
+                    {
+                        StaticMeshRenderer* renderer = key.renderer;
+                        std::vector<StaticMeshRenderer::Instance>& instances = batch.instances;
+                        if (!renderer || instances.empty())
+                            continue;
+                        if (key.configHash != 0)
+                            renderer->RenderLodBatchInWorld(device, seconds, camera, instances, batch.config, key.configHash, key.lodLevel);
+                        else
+                            renderer->RenderBatchInWorld(device, seconds, camera, instances);
+                        const std::uint32_t submittedDrawCalls = renderer->LastSubmittedDrawCalls();
+                        const std::uint32_t submittedInstances = renderer->LastSubmittedInstances();
+                        const std::uint32_t submittedIndexCount = renderer->LastSubmittedIndexCount();
+                        for (StaticMeshLodBatch::LodDispositionRecord& record : batch.lodDispositionRecords)
+                        {
+                            record.submitted = submittedDrawCalls > 0 && submittedInstances > 0;
+                            record.fullResFallback = renderer->LastUsedFullResFallback();
+                            record.drawIndexCount = record.submitted ? submittedIndexCount : 0u;
+                            logLodDisposition(record);
+                        }
+                        if (submittedDrawCalls == 0 || submittedInstances == 0)
+                            continue;
+                        frameStaticMeshBatches += submittedDrawCalls;
+                        frameStaticMeshMaxBatchSize = std::max(frameStaticMeshMaxBatchSize, instances.size());
+                        frameStaticMeshSubmitted += submittedInstances;
+                        frameStaticMeshDrawCalls += submittedDrawCalls;
+                        frameStaticMeshTriangles += (renderer->LastUsedFullResFallback()
+                            ? renderer->TriangleCount()
+                            : renderer->TriangleCountForLod(key.configHash, key.lodLevel)) * submittedInstances;
+                        frameStaticMeshUniformUpdates += renderer->LastMaterialUniformUpdates();
+                        frameStaticMeshOverrideActiveDraws += renderer->LastOverrideActiveDraws();
+                        frameStaticMeshInstanceBufferBytes += renderer->LastInstanceBufferBytes();
+                        frameStaticMeshInstanceBufferRebuilt = frameStaticMeshInstanceBufferRebuilt || renderer->LastInstanceBufferRebuilt();
+                        const bool meshSubmitDetailChanged =
+                            !previousMeshSubmitDetailInitialized ||
+                            previousMeshSubmitDetailInstances != submittedInstances ||
+                            previousMeshSubmitDetailDrawCalls != submittedDrawCalls;
+                        if ((!QuietLogsForLodDiag() && (frameNumber < 3 || (frameNumber % 60u) == 0u)) ||
+                            (QuietLogsForLodDiag() && meshSubmitDetailChanged))
+                        {
+                            const auto& bmin = renderer->BoundsMin();
+                            const auto& bmax = renderer->BoundsMax();
+                            Tracenf("[MESH] Static instanced submit detail: instances=%u drawcalls=%u verts=%zu indices=%zu bbox_min=(%.3f,%.3f,%.3f) bbox_max=(%.3f,%.3f,%.3f)",
+                                submittedInstances,
+                                submittedDrawCalls,
+                                renderer->VertexCount(),
+                                renderer->IndexCount(),
+                                bmin[0], bmin[1], bmin[2],
+                                bmax[0], bmax[1], bmax[2]);
+                        }
+                        previousMeshSubmitDetailInstances = submittedInstances;
+                        previousMeshSubmitDetailDrawCalls = submittedDrawCalls;
+                        previousMeshSubmitDetailInitialized = true;
+                    }
+                    const bool lodSelectionChanged =
+                        !previousFrameLodSelectionInitialized ||
+                        previousFrameLodSelection != frameLodSelection;
+                    const bool nonLodChanged =
+                        !previousFrameNonLodInitialized ||
+                        previousFrameNonLodEntities != frameNonLodEntities;
+                    if (LodLogsEnabled() &&
+                        ((!QuietLogsForLodDiag() && (frameNumber < 3 || (frameNumber % 60u) == 0u)) ||
+                        (QuietLogsForLodDiag() && (lodSelectionChanged || nonLodChanged))))
+                    {
+                        Tracenf("[LOD] selection lod0=%u lod1=%u lod2=%u lod3=%u (LOD-active instances)",
+                            frameLodSelection[0],
+                            frameLodSelection[1],
+                            frameLodSelection[2],
+                            frameLodSelection[3]);
+                        Tracenf("[LOD] non-lod entities=%u (always full-res)", frameNonLodEntities);
+                    }
+                    previousFrameLodSelection = frameLodSelection;
+                    previousFrameLodSelectionInitialized = true;
+                    previousFrameNonLodEntities = frameNonLodEntities;
+                    previousFrameNonLodInitialized = true;
+                    previousCulledMeshLogSet = std::move(currentCulledMeshLogSet);
                 }
                 if (!useOffscreenScene && hasSceneTerrain)
                 {
@@ -4342,33 +5043,114 @@ int RunGame(NativeWindow& window,
 #else
             frameImGuiRenderCalled = false;
 #endif
-            if (frameNumber < 3 || (frameNumber % 60u) == 0u)
+            const bool frameHeartbeatLog = QuietLogsForLodDiag()
+                ? ((frameNumber % 60u) == 0u)
+                : (frameNumber < 3 || (frameNumber % 60u) == 0u);
+            if (frameHeartbeatLog)
             {
-                Tracenf("[FRAME] static_mesh entities=%zu submitted=%zu drawcalls=%zu",
-                    frameStaticMeshEntityCount,
-                    frameStaticMeshSubmitted,
-                    frameStaticMeshDrawCalls);
-                Tracenf("[MPERF] pass=main drawcalls=%zu tris=%zu",
-                    frameStaticMeshDrawCalls,
-                    frameStaticMeshTriangles);
-                for (int cascade = 0; cascade < 4; ++cascade)
-                    Tracenf("[MPERF] pass=shadow-cascade%d drawcalls=0 tris=0", cascade);
-                Tracen("[MPERF] pass=water-reflection drawcalls=0 tris=0");
-                Tracenf("[MPERF] mmat overrideUpdatesThisFrame=%zu activeOverrideDraws=%zu mode=every-frame descriptorAllocPerDraw=no bufferMapPerDraw=yes queueWaitPerDraw=no",
-                    frameStaticMeshUniformUpdates,
-                    frameStaticMeshOverrideActiveDraws);
-                Tracenf("[MPERF] meshes total=%zu frustumCulled=%zu drawn=%zu cullEnabled=yes",
-                    frameStaticMeshEntityCount,
-                    frameStaticMeshFrustumCulled,
-                    frameStaticMeshSubmitted);
-                Tracenf("[SPATIAL] frustumQuery nodesVisited=%u candidates=%u total=%u",
-                    frameStaticMeshSpatialStats.nodesVisited,
-                    frameStaticMeshSpatialStats.candidates,
-                    frameStaticMeshSpatialStats.totalObjects);
-                const VkExtent2D mperfExtent = useOffscreenScene ? offscreenScene.GetExtent() : renderSize;
-                Tracenf("[MPERF] offscreen=%ux%u halfResTestFps=n/a boundHint=unknown",
-                    mperfExtent.width,
-                    mperfExtent.height);
+                if (!QuietLogsForLodDiag())
+                {
+                    Tracenf("[FRAME] static_mesh entities=%zu submitted=%zu drawcalls=%zu",
+                        frameStaticMeshEntityCount,
+                        frameStaticMeshSubmitted,
+                        frameStaticMeshDrawCalls);
+                }
+                const bool mperfMainChanged =
+                    !previousMperfMain.initialized ||
+                    previousMperfMain.drawcalls != frameStaticMeshDrawCalls ||
+                    previousMperfMain.tris != frameStaticMeshTriangles;
+                if (!QuietLogsForLodDiag() || mperfMainChanged)
+                {
+                    Tracenf("[MPERF] pass=main drawcalls=%zu tris=%zu",
+                        frameStaticMeshDrawCalls,
+                        frameStaticMeshTriangles);
+                }
+                previousMperfMain.drawcalls = frameStaticMeshDrawCalls;
+                previousMperfMain.tris = frameStaticMeshTriangles;
+                previousMperfMain.initialized = true;
+
+                if (!QuietLogsForLodDiag())
+                {
+                    for (int cascade = 0; cascade < 4; ++cascade)
+                        Tracenf("[MPERF] pass=shadow-cascade%d drawcalls=0 tris=0", cascade);
+                    Tracen("[MPERF] pass=water-reflection drawcalls=0 tris=0");
+                }
+
+                const bool mperfOverrideChanged =
+                    !previousMperfOverride.initialized ||
+                    previousMperfOverride.uniformUpdates != frameStaticMeshUniformUpdates ||
+                    previousMperfOverride.activeOverrideDraws != frameStaticMeshOverrideActiveDraws;
+                if (!QuietLogsForLodDiag() || mperfOverrideChanged)
+                {
+                    Tracenf("[MPERF] mmat overrideUpdatesThisFrame=%zu activeOverrideDraws=%zu mode=every-frame descriptorAllocPerDraw=no bufferMapPerDraw=yes queueWaitPerDraw=no",
+                        frameStaticMeshUniformUpdates,
+                        frameStaticMeshOverrideActiveDraws);
+                }
+                previousMperfOverride.uniformUpdates = frameStaticMeshUniformUpdates;
+                previousMperfOverride.activeOverrideDraws = frameStaticMeshOverrideActiveDraws;
+                previousMperfOverride.initialized = true;
+
+                const bool mperfMeshesChanged =
+                    !previousMperfMeshes.initialized ||
+                    previousMperfMeshes.total != frameStaticMeshEntityCount ||
+                    previousMperfMeshes.culled != frameStaticMeshFrustumCulled ||
+                    previousMperfMeshes.drawn != frameStaticMeshSubmitted;
+                if (!QuietLogsForLodDiag() || mperfMeshesChanged)
+                {
+                    Tracenf("[MPERF] meshes total=%zu frustumCulled=%zu drawn=%zu cullEnabled=yes",
+                        frameStaticMeshEntityCount,
+                        frameStaticMeshFrustumCulled,
+                        frameStaticMeshSubmitted);
+                }
+                previousMperfMeshes.total = frameStaticMeshEntityCount;
+                previousMperfMeshes.culled = frameStaticMeshFrustumCulled;
+                previousMperfMeshes.drawn = frameStaticMeshSubmitted;
+                previousMperfMeshes.initialized = true;
+
+                const bool instSummaryChanged =
+                    !previousInstSummary.initialized ||
+                    previousInstSummary.batches != frameStaticMeshBatches ||
+                    previousInstSummary.draws != frameStaticMeshDrawCalls ||
+                    previousInstSummary.instances != frameStaticMeshSubmitted ||
+                    previousInstSummary.maxBatch != frameStaticMeshMaxBatchSize;
+                if (!QuietLogsForLodDiag() || instSummaryChanged)
+                {
+                    Tracenf("[INST] batches=%zu instancedDraws=%zu instancesTotal=%zu maxBatchSize=%zu",
+                        frameStaticMeshBatches,
+                        frameStaticMeshDrawCalls,
+                        frameStaticMeshSubmitted,
+                        frameStaticMeshMaxBatchSize);
+                }
+                previousInstSummary.batches = frameStaticMeshBatches;
+                previousInstSummary.draws = frameStaticMeshDrawCalls;
+                previousInstSummary.instances = frameStaticMeshSubmitted;
+                previousInstSummary.maxBatch = frameStaticMeshMaxBatchSize;
+                previousInstSummary.initialized = true;
+
+                const bool instBufferChanged =
+                    !previousInstBuffer.initialized ||
+                    previousInstBuffer.bytes != frameStaticMeshInstanceBufferBytes ||
+                    frameStaticMeshInstanceBufferRebuilt;
+                if (!QuietLogsForLodDiag() || instBufferChanged)
+                {
+                    Tracenf("[INST] instanceBufferBytes=%zu rebuiltThisFrame=%s",
+                        frameStaticMeshInstanceBufferBytes,
+                        frameStaticMeshInstanceBufferRebuilt ? "yes" : "no");
+                }
+                previousInstBuffer.bytes = frameStaticMeshInstanceBufferBytes;
+                previousInstBuffer.initialized = true;
+
+                if (!QuietLogsForLodDiag())
+                {
+                    Tracenf("[SPATIAL] frustumQuery nodesVisited=%u candidates=%u total=%u",
+                        frameStaticMeshSpatialStats.nodesVisited,
+                        frameStaticMeshSpatialStats.candidates,
+                        frameStaticMeshSpatialStats.totalObjects);
+                    const VkExtent2D mperfExtent = useOffscreenScene ? offscreenScene.GetExtent() : renderSize;
+                    Tracenf("[MPERF] offscreen=%ux%u halfResTestFps=n/a boundHint=unknown",
+                        mperfExtent.width,
+                        mperfExtent.height);
+                }
                 Tracenf("[FRAME] summary frame=%llu imgui_render called=%s rmlui_render called=%s scene_render called=%s entity_count=%zu clear_color=(0.04,0.05,0.09,1.00) in_world=%d lobby=%d editor_open=%d swapchain=%ux%u",
                     static_cast<unsigned long long>(frameNumber),
                     frameImGuiRenderCalled ? "yes" : "no",

@@ -24,6 +24,7 @@
 #include <cstring>
 #include <cstdio>
 #include <filesystem>
+#include <limits>
 #include <map>
 #include <optional>
 #include <set>
@@ -38,6 +39,31 @@ namespace
 constexpr uint32_t kMinImageCount = 2;
 constexpr const char* kLayoutFile = "editor_layout.ini";
 constexpr const char* kAssetPayloadType = "ASSET_ID";
+constexpr const char* kEditorNoteComponentId = "editor.note";
+constexpr const char* kLodComponentId = "rendering.lod";
+
+struct InspectorComponentDefinition
+{
+    const char* id;
+    const char* displayName;
+    const char* category;
+    EditorComponentType legacyType;
+    bool addableToMesh;
+};
+
+const std::array<InspectorComponentDefinition, 7>& InspectorComponentRegistry()
+{
+    static const std::array<InspectorComponentDefinition, 7> registry{{
+        {"builtin.transform", "Transform", "Core", EditorComponentType::None, false},
+        {"builtin.mesh_renderer", "MeshRenderer", "Rendering", EditorComponentType::MeshRenderer, false},
+        {kLodComponentId, "LOD Group", "Rendering", EditorComponentType::None, true},
+        {"builtin.water_body", "Water Body", "Rendering", EditorComponentType::WaterBody, false},
+        {"builtin.point_light", "Point Light", "Lighting", EditorComponentType::PointLight, false},
+        {"builtin.spot_light", "Spot Light", "Lighting", EditorComponentType::SpotLight, false},
+        {kEditorNoteComponentId, "Note", "Editor", EditorComponentType::None, true},
+    }};
+    return registry;
+}
 
 void CheckVkResult(VkResult result)
 {
@@ -829,6 +855,32 @@ void EditorImGui::RefreshAssetLibrary()
     m_assetStatus = "Assets refreshed";
     SyncWaterMaterialSnapshot();
     Tracen("[EDITOR-IMGUI-3] Asset Browser refreshed");
+}
+
+std::optional<LodConfig> EditorImGui::FindModelLodDefault(const std::string& assetId) const
+{
+    if (!m_assetLibrary || assetId.empty())
+        return std::nullopt;
+    const auto entry = m_assetLibrary->FindById(assetId);
+    if (!entry || entry->category != AssetLibrary::Category::Model || !entry->hasLodDefault)
+        return std::nullopt;
+    return entry->lodDefault;
+}
+
+bool EditorImGui::SaveModelLodDefault(const std::string& assetId, const LodConfig& config)
+{
+    if (!m_assetLibrary || assetId.empty())
+        return false;
+    AssetLibrary::Entry updated;
+    std::string error;
+    if (!m_assetLibrary->UpdateModelLodDefault(assetId, config, updated, error))
+    {
+        m_assetStatus = "LOD asset default failed: " + error;
+        return false;
+    }
+    m_assetStatus = "LOD asset default saved: " + updated.displayName;
+    RefreshAssetLibrary();
+    return true;
 }
 
 bool EditorImGui::ActiveAssetCategory(AssetLibrary::Category category) const
@@ -1810,7 +1862,7 @@ void EditorImGui::BeginFrame(bool editorModeActive)
     if (!m_initialized || !m_vulkanBackendReady || m_frameActive)
     {
         static uint32_t beginSkippedLogs = 0;
-        if (beginSkippedLogs < 3)
+        if (!QuietLogsForLodDiag() && beginSkippedLogs < 3)
         {
             ++beginSkippedLogs;
             Tracenf("[FRAME] imgui_begin called = no, initialized=%d backend_ready=%d frame_active=%d editor_mode=%d",
@@ -1828,7 +1880,7 @@ void EditorImGui::BeginFrame(bool editorModeActive)
     ImGui::NewFrame();
     m_frameActive = true;
     static uint32_t beginLogs = 0;
-    if (beginLogs < 3)
+    if (!QuietLogsForLodDiag() && beginLogs < 3)
     {
         ++beginLogs;
         Tracenf("[FRAME] imgui_begin called = yes, editor_mode=%d", editorModeActive ? 1 : 0);
@@ -3543,6 +3595,31 @@ void EditorImGui::RenderAddComponentMenu()
     const bool hasSpot = m_dynamicLightState.type == DynamicLightType::Spot;
     const bool hasMesh = m_meshRendererState.selected;
     const bool hasSelection = hasWater || hasPoint || hasSpot || hasMesh;
+    if (!m_componentRegistryLogged)
+    {
+        m_componentRegistryLogged = true;
+        Tracen("[INSPECTOR-COMP] registered=7 categories=[Core, Rendering, Lighting, Editor]");
+    }
+
+    auto hasAttachedComponent = [&](const char* id) {
+        return std::any_of(m_meshRendererState.editorComponents.begin(),
+            m_meshRendererState.editorComponents.end(),
+            [id](const EditorAttachedComponent& component) { return component.type == id; });
+    };
+    auto selectionHasComponent = [&](const InspectorComponentDefinition& definition) {
+        const std::string id = definition.id;
+        if (id == "builtin.transform")
+            return hasSelection;
+        if (id == "builtin.mesh_renderer")
+            return hasMesh;
+        if (id == "builtin.water_body")
+            return hasWater;
+        if (id == "builtin.point_light")
+            return hasPoint;
+        if (id == "builtin.spot_light")
+            return hasSpot;
+        return hasMesh && hasAttachedComponent(definition.id);
+    };
 
     if (!hasSelection)
     {
@@ -3553,52 +3630,197 @@ void EditorImGui::RenderAddComponentMenu()
     }
 
     if (UI::IconButton(ICON_FA_PLUS, "Add Component", ImVec2(-1.0f, 0.0f)))
+    {
+        m_componentSearchBuffer[0] = '\0';
         ImGui::OpenPopup("AddComponentPopup");
+    }
 
     if (ImGui::BeginPopup("AddComponentPopup"))
     {
-        if (hasWater)
-            ImGui::BeginDisabled();
-        if (ImGui::MenuItem(ICON_FA_DROPLET " Water Body"))
-        {
-            m_commands.addComponentToSelectedEntity = true;
-            m_commands.addComponentType = EditorComponentType::WaterBody;
-        }
-        if (hasWater)
-            ImGui::EndDisabled();
+        ImGui::SetNextItemWidth(260.0f);
+        ImGui::InputTextWithHint("##componentSearch", "Search components...", m_componentSearchBuffer, sizeof(m_componentSearchBuffer));
+        ImGui::Separator();
 
-        if (hasPoint)
-            ImGui::BeginDisabled();
-        if (ImGui::MenuItem(ICON_FA_LIGHTBULB " Point Light"))
+        const std::string filter = ToLowerAscii(m_componentSearchBuffer);
+        std::string currentCategory;
+        for (const InspectorComponentDefinition& definition : InspectorComponentRegistry())
         {
-            m_commands.addComponentToSelectedEntity = true;
-            m_commands.addComponentType = EditorComponentType::PointLight;
-        }
-        if (hasPoint)
-            ImGui::EndDisabled();
+            if (!filter.empty() &&
+                ToLowerAscii(definition.displayName).find(filter) == std::string::npos &&
+                ToLowerAscii(definition.category).find(filter) == std::string::npos)
+            {
+                continue;
+            }
 
-        if (hasSpot)
-            ImGui::BeginDisabled();
-        if (ImGui::MenuItem(ICON_FA_BULLSEYE " Spot Light"))
-        {
-            m_commands.addComponentToSelectedEntity = true;
-            m_commands.addComponentType = EditorComponentType::SpotLight;
-        }
-        if (hasSpot)
-            ImGui::EndDisabled();
+            if (currentCategory != definition.category)
+            {
+                currentCategory = definition.category;
+                ImGui::TextDisabled("%s", currentCategory.c_str());
+            }
 
-        if (hasMesh)
-            ImGui::BeginDisabled();
-        if (ImGui::MenuItem(ICON_FA_CUBE " MeshRenderer"))
-        {
-            m_commands.addComponentToSelectedEntity = true;
-            m_commands.addComponentType = EditorComponentType::MeshRenderer;
+            const bool alreadyPresent = selectionHasComponent(definition);
+            const bool canAddToSelection =
+                definition.legacyType != EditorComponentType::None ||
+                (definition.addableToMesh && hasMesh);
+            const bool disabled = alreadyPresent || !canAddToSelection;
+            if (disabled)
+                ImGui::BeginDisabled();
+            if (ImGui::MenuItem(definition.displayName, nullptr, false, !disabled))
+            {
+                m_commands.addComponentToSelectedEntity = true;
+                m_commands.addComponentType = definition.legacyType;
+                m_commands.addComponentTypeId = definition.id;
+                Tracenf("[INSPECTOR-COMP] add requested component=%s", definition.displayName);
+                ImGui::CloseCurrentPopup();
+            }
+            if (disabled)
+                ImGui::EndDisabled();
         }
-        if (hasMesh)
-            ImGui::EndDisabled();
 
         ImGui::EndPopup();
     }
+}
+
+bool EditorImGui::RenderAttachedEditorComponents(std::vector<EditorAttachedComponent>& components)
+{
+    bool changed = false;
+    for (EditorAttachedComponent& component : components)
+    {
+        if (component.type != kEditorNoteComponentId && component.type != kLodComponentId)
+            continue;
+
+        ImGui::PushID(component.type.c_str());
+        const bool isLod = component.type == kLodComponentId;
+        const bool open = ImGui::CollapsingHeader(isLod ? "LOD Group" : "Note", ImGuiTreeNodeFlags_DefaultOpen);
+        ImGui::SameLine();
+        if (ImGui::SmallButton("..."))
+            ImGui::OpenPopup("ComponentMenu");
+        if (ImGui::BeginPopup("ComponentMenu"))
+        {
+            if (ImGui::MenuItem("Remove Component"))
+            {
+                m_commands.removeComponentFromSelectedEntity = true;
+                m_commands.removeComponentTypeId = component.type;
+            }
+            ImGui::EndPopup();
+        }
+        if (open)
+        {
+            if (isLod)
+            {
+                LodComponent& lod = m_meshRendererState.lod;
+                lod.enabled = true;
+                bool lodConfigChanged = false;
+                bool lodCommitRequested = false;
+                const std::optional<LodConfig> assetDefault = FindModelLodDefault(m_meshRendererState.meshAssetId);
+                const char* source = lod.overrideAssetDefault
+                    ? "Entity override"
+                    : (assetDefault ? "Asset default" : "Engine default");
+                ImGui::TextDisabled("Source: %s", source);
+                bool overrideEnabled = lod.overrideAssetDefault;
+                if (ImGui::Checkbox("Override on this entity", &overrideEnabled))
+                {
+                    lod.overrideAssetDefault = overrideEnabled;
+                    if (overrideEnabled && assetDefault)
+                        lod.config = *assetDefault;
+                    lodConfigChanged = true;
+                    changed = true;
+                }
+
+                LodConfig displayConfig = lod.overrideAssetDefault
+                    ? lod.config
+                    : (assetDefault ? *assetDefault : LodConfig{});
+                const bool editEnabled = lod.overrideAssetDefault || !assetDefault;
+                if (!editEnabled)
+                    ImGui::BeginDisabled();
+
+                int levelCount = static_cast<int>(std::clamp(displayConfig.levelCount, 1u, LodConfig::MaxLevels));
+                if (ImGui::SliderInt("Levels", &levelCount, 1, static_cast<int>(LodConfig::MaxLevels)))
+                {
+                    displayConfig.levelCount = static_cast<std::uint32_t>(levelCount);
+                    lodConfigChanged = true;
+                    changed = true;
+                }
+                lodCommitRequested = lodCommitRequested || ImGui::IsItemDeactivatedAfterEdit();
+                float hysteresis = displayConfig.hysteresisMeters;
+                if (ImGui::DragFloat("Hysteresis (m)", &hysteresis, 0.25f, 0.0f, 100.0f, "%.2f"))
+                {
+                    displayConfig.hysteresisMeters = std::max(0.0f, hysteresis);
+                    lodConfigChanged = true;
+                    changed = true;
+                }
+                lodCommitRequested = lodCommitRequested || ImGui::IsItemDeactivatedAfterEdit();
+                for (std::uint32_t level = 1; level < static_cast<std::uint32_t>(levelCount); ++level)
+                {
+                    ImGui::Separator();
+                    ImGui::Text("LOD%u", level);
+                    float ratioPercent = std::clamp(displayConfig.targetRatios[level], 0.001f, 1.0f) * 100.0f;
+                    std::string ratioLabel = "Target %##ratio" + std::to_string(level);
+                    if (ImGui::SliderFloat(ratioLabel.c_str(), &ratioPercent, 1.0f, 100.0f, "%.1f"))
+                    {
+                        displayConfig.targetRatios[level] = std::clamp(ratioPercent / 100.0f, 0.001f, 1.0f);
+                        lodConfigChanged = true;
+                        changed = true;
+                    }
+                    lodCommitRequested = lodCommitRequested || ImGui::IsItemDeactivatedAfterEdit();
+                    float distance = displayConfig.distances[level];
+                    std::string distanceLabel = "Distance (m)##distance" + std::to_string(level);
+                    if (ImGui::DragFloat(distanceLabel.c_str(), &distance, 1.0f, 0.0f, 100000.0f, "%.1f"))
+                    {
+                        displayConfig.distances[level] = std::max(0.0f, distance);
+                        lodConfigChanged = true;
+                        changed = true;
+                    }
+                    lodCommitRequested = lodCommitRequested || ImGui::IsItemDeactivatedAfterEdit();
+                }
+                if (!editEnabled)
+                    ImGui::EndDisabled();
+
+                if (lodConfigChanged && editEnabled)
+                {
+                    displayConfig.levelCount = std::clamp(displayConfig.levelCount, 1u, LodConfig::MaxLevels);
+                    displayConfig.targetRatios[0] = 1.0f;
+                    displayConfig.distances[0] = 0.0f;
+                    lod.config = displayConfig;
+                    if (LodLogsEnabled())
+                    {
+                        Tracenf("[LOD] ui edit entity=%u levels=%u override=%d",
+                            m_meshRendererState.id,
+                            lod.config.levelCount,
+                            lod.overrideAssetDefault ? 1 : 0);
+                    }
+                }
+                if (lodCommitRequested && editEnabled)
+                {
+                    m_commands.lodQualityCommitRequested = true;
+                    m_commands.lodQualityCommitEntityId = m_meshRendererState.id;
+                    m_commands.lodQualityCommitConfig = lod.config;
+                }
+                if (UI::IconButton(ICON_FA_FLOPPY_DISK, "Set as asset default", ImVec2(-1.0f, 0.0f)))
+                {
+                    const LodConfig defaultConfig = lod.overrideAssetDefault ? lod.config : displayConfig;
+                    if (SaveModelLodDefault(m_meshRendererState.meshAssetId, defaultConfig))
+                    {
+                        lod.overrideAssetDefault = false;
+                        lod.config = defaultConfig;
+                        changed = true;
+                    }
+                }
+            }
+            else
+            {
+                char noteBuffer[512]{};
+                CopyToBuffer(noteBuffer, sizeof(noteBuffer), component.note);
+                if (ImGui::InputTextMultiline("##note", noteBuffer, sizeof(noteBuffer), ImVec2(-1.0f, 96.0f)))
+                {
+                    component.note = noteBuffer;
+                    changed = true;
+                }
+            }
+        }
+        ImGui::PopID();
+    }
+    return changed;
 }
 
 void EditorImGui::RenderSelectedWaterBodyInspector()
@@ -3618,8 +3840,6 @@ void EditorImGui::RenderSelectedWaterBodyInspector()
         m_waterBodyState.name = nameBuffer[0] != '\0' ? nameBuffer : ("Water_" + std::to_string(m_waterBodyState.id));
         MarkSelectedWaterBodyChanged();
     }
-
-    RenderAddComponentMenu();
 
     float position[3] = {m_waterBodyState.center[0], m_waterBodyState.config.waterLevelY, m_waterBodyState.center[2]};
     float scale[3] = {m_waterBodyState.width, 1.0f, m_waterBodyState.depth};
@@ -3687,6 +3907,8 @@ void EditorImGui::RenderSelectedWaterBodyInspector()
     }
 
     ImGui::Separator();
+    RenderAddComponentMenu();
+    ImGui::Separator();
     if (UI::IconButton(ICON_FA_TRASH, "Delete Water Body", ImVec2(-1.0f, 0.0f)))
         m_commands.deleteSelectedWaterBody = true;
 }
@@ -3713,8 +3935,6 @@ void EditorImGui::RenderSelectedLightInspector()
             point.name = nameBuffer;
             MarkSelectedLightChanged();
         }
-        RenderAddComponentMenu();
-
         float position[3] = {point.position[0], point.position[1], point.position[2]};
         float scale[3] = {point.radius, point.radius, point.radius};
         if (RenderTransformComponent(position, nullptr, scale))
@@ -3746,8 +3966,6 @@ void EditorImGui::RenderSelectedLightInspector()
             spot.name = nameBuffer;
             MarkSelectedLightChanged();
         }
-        RenderAddComponentMenu();
-
         float position[3] = {spot.position[0], spot.position[1], spot.position[2]};
         float rotation[3] = {spot.rotation[0] * 57.2957795f, spot.rotation[1] * 57.2957795f, spot.rotation[2] * 57.2957795f};
         float scale[3] = {spot.radius, spot.radius, spot.radius};
@@ -3790,6 +4008,8 @@ void EditorImGui::RenderSelectedLightInspector()
     }
 
     ImGui::Separator();
+    RenderAddComponentMenu();
+    ImGui::Separator();
     if (UI::IconButton(ICON_FA_TRASH, "Delete Light", ImVec2(-1.0f, 0.0f)))
         m_commands.deleteSelectedLight = true;
 }
@@ -3811,8 +4031,6 @@ void EditorImGui::RenderSelectedMeshRendererInspector()
         m_meshRendererState.name = nameBuffer[0] != '\0' ? nameBuffer : ("Mesh Entity " + std::to_string(m_meshRendererState.id));
         MarkSelectedMeshRendererChanged();
     }
-
-    RenderAddComponentMenu();
 
     float position[3] = {m_meshRendererState.position[0], m_meshRendererState.position[1], m_meshRendererState.position[2]};
     float rotation[3] = {
@@ -3942,6 +4160,10 @@ void EditorImGui::RenderSelectedMeshRendererInspector()
         }
     }
 
+    ImGui::Separator();
+    if (RenderAttachedEditorComponents(m_meshRendererState.editorComponents))
+        MarkSelectedMeshRendererChanged();
+    RenderAddComponentMenu();
     ImGui::Separator();
     if (UI::IconButton(ICON_FA_TRASH, "Delete Mesh Entity", ImVec2(-1.0f, 0.0f)))
         m_commands.deleteSelectedMeshEntity = true;
@@ -5412,7 +5634,7 @@ void EditorImGui::Render(VulkanDevice& device)
     if (!m_initialized || !m_vulkanBackendReady || !m_frameActive)
     {
         static uint32_t renderSkippedLogs = 0;
-        if (renderSkippedLogs < 3)
+        if (!QuietLogsForLodDiag() && renderSkippedLogs < 3)
         {
             ++renderSkippedLogs;
             Tracenf("[FRAME] imgui_render called = no, initialized=%d backend_ready=%d frame_active=%d editor_mode=%d",
@@ -5430,7 +5652,7 @@ void EditorImGui::Render(VulkanDevice& device)
 
     ImDrawData* drawData = ImGui::GetDrawData();
     const uint64_t frameNumber = device.GetFrameNumber();
-    if (frameNumber < 3 || (frameNumber % 60u) == 0u)
+    if (!QuietLogsForLodDiag() && (frameNumber < 3 || (frameNumber % 60u) == 0u))
     {
         Tracenf("[FRAME] imgui_render called = yes, editor_mode=%d draw_lists=%d draw_cmds=%u",
             m_editorModeActive ? 1 : 0,
@@ -5439,12 +5661,18 @@ void EditorImGui::Render(VulkanDevice& device)
     }
     ImGui_ImplVulkan_RenderDrawData(drawData, device.GetCommandBuffer());
 
-    if (device.GetFrameNumber() != m_lastLoggedFrame && device.GetFrameNumber() % 300 == 0)
+    static uint32_t lastLoggedDrawCommands = std::numeric_limits<uint32_t>::max();
+    const uint32_t drawCommands = CountDrawCommands(drawData);
+    const bool drawCommandsChanged = lastLoggedDrawCommands != drawCommands;
+    if (device.GetFrameNumber() != m_lastLoggedFrame &&
+        device.GetFrameNumber() % 300 == 0 &&
+        (!QuietLogsForLodDiag() || drawCommandsChanged))
     {
         m_lastLoggedFrame = device.GetFrameNumber();
         Tracenf("[EDITOR-IMGUI] Frame %llu rendered with %u draw calls",
             static_cast<unsigned long long>(device.GetFrameNumber()),
-            CountDrawCommands(drawData));
+            drawCommands);
+        lastLoggedDrawCommands = drawCommands;
     }
 
     ImGuiIO& io = ImGui::GetIO();

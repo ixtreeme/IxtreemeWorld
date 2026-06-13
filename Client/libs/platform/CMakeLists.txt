@@ -1,6 +1,7 @@
 add_library(client_platform STATIC
     Debug.cpp
     Debug.h
+    LogConfig.h
     InputEvent.h
     NativeWindow.h
     VulkanDevice.cpp

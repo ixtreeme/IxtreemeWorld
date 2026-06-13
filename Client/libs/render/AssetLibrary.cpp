@@ -133,6 +133,21 @@ bool JsonBoolValue(const std::string& object, const std::string& key, bool fallb
     return fallback;
 }
 
+std::uint32_t JsonU32Value(const std::string& object, const std::string& key, std::uint32_t fallback)
+{
+    const std::string needle = "\"" + key + "\"";
+    const size_t keyPos = object.find(needle);
+    if (keyPos == std::string::npos)
+        return fallback;
+    const size_t colon = object.find(':', keyPos + needle.size());
+    if (colon == std::string::npos)
+        return fallback;
+    const char* begin = object.c_str() + colon + 1;
+    char* end = nullptr;
+    const unsigned long value = std::strtoul(begin, &end, 10);
+    return end != begin ? static_cast<std::uint32_t>(value) : fallback;
+}
+
 std::string JsonObjectValue(const std::string& object, const std::string& key)
 {
     const std::string needle = "\"" + key + "\"";
@@ -173,6 +188,39 @@ std::string JsonObjectValue(const std::string& object, const std::string& key)
         }
     }
     return {};
+}
+
+LodConfig ReadLodConfigJson(const std::string& object)
+{
+    LodConfig config;
+    config.levelCount = std::clamp(JsonU32Value(object, "level_count", config.levelCount),
+        1u,
+        LodConfig::MaxLevels);
+    config.hysteresisMeters = std::max(0.0f, JsonFloatValue(object, "hysteresis_m", config.hysteresisMeters));
+    for (std::uint32_t i = 0; i < LodConfig::MaxLevels; ++i)
+    {
+        const std::string ratioKey = "target_ratio_" + std::to_string(i);
+        const std::string distanceKey = "distance_m_" + std::to_string(i);
+        config.targetRatios[i] = std::clamp(JsonFloatValue(object, ratioKey, config.targetRatios[i]), 0.001f, 1.0f);
+        config.distances[i] = std::max(0.0f, JsonFloatValue(object, distanceKey, config.distances[i]));
+    }
+    config.targetRatios[0] = 1.0f;
+    config.distances[0] = 0.0f;
+    return config;
+}
+
+void WriteLodConfigJson(std::ostringstream& json, const LodConfig& config, const char* indent)
+{
+    const std::uint32_t levelCount = std::clamp(config.levelCount, 1u, LodConfig::MaxLevels);
+    json << indent << "\"level_count\": " << levelCount << ",\n"
+         << indent << "\"hysteresis_m\": " << std::max(0.0f, config.hysteresisMeters);
+    for (std::uint32_t i = 0; i < LodConfig::MaxLevels; ++i)
+    {
+        json << ",\n" << indent << "\"target_ratio_" << i << "\": "
+             << (i == 0 ? 1.0f : std::clamp(config.targetRatios[i], 0.001f, 1.0f))
+             << ",\n" << indent << "\"distance_m_" << i << "\": "
+             << (i == 0 ? 0.0f : std::max(0.0f, config.distances[i]));
+    }
 }
 
 bool JsonObjectAt(const std::string& text, size_t begin, std::string& out, size_t& endOut)
@@ -1535,6 +1583,15 @@ bool AssetLibrary::LoadManifest()
             if (!waterObject.empty())
                 entry.waterMaterial = ReadWaterMaterialJson(waterObject, entry.waterMaterial);
         }
+        if (entry.category == Category::Model)
+        {
+            const std::string lodObject = JsonObjectValue(object, "lod_default");
+            if (!lodObject.empty())
+            {
+                entry.hasLodDefault = true;
+                entry.lodDefault = ReadLodConfigJson(lodObject);
+            }
+        }
         m_entries.push_back(std::move(entry));
     }
 
@@ -1634,6 +1691,14 @@ bool AssetLibrary::SaveManifest(std::string& error) const
                  << "        \"water_config\": {\n";
             WriteWaterConfigJson(json, entry.waterMaterial.config, "          ");
             json << "\n        }\n"
+                 << "      }\n";
+        }
+        if (entry.category == Category::Model && entry.hasLodDefault)
+        {
+            json << ",\n"
+                 << "      \"lod_default\": {\n";
+            WriteLodConfigJson(json, entry.lodDefault, "        ");
+            json << "\n"
                  << "      }\n";
         }
         json << "    }" << (i + 1 < m_entries.size() ? "," : "") << "\n";
@@ -2291,6 +2356,39 @@ bool AssetLibrary::UpdateAssetMetadata(const std::string& id,
         it->displayName = displayName;
     it->tags = NormalizeTags(tags);
     return SaveManifest(error);
+}
+
+bool AssetLibrary::UpdateModelLodDefault(const std::string& id,
+                                         const LodConfig& config,
+                                         Entry& outEntry,
+                                         std::string& error)
+{
+    const auto it = std::find_if(m_entries.begin(), m_entries.end(), [&id](const Entry& entry) {
+        return entry.id == id;
+    });
+    if (it == m_entries.end())
+    {
+        error = "asset not found";
+        return false;
+    }
+    if (it->category != Category::Model)
+    {
+        error = "LOD defaults can only be stored on model assets";
+        return false;
+    }
+
+    it->hasLodDefault = true;
+    it->lodDefault = config;
+    it->lodDefault.levelCount = std::clamp(it->lodDefault.levelCount, 1u, LodConfig::MaxLevels);
+    it->lodDefault.targetRatios[0] = 1.0f;
+    it->lodDefault.distances[0] = 0.0f;
+    if (!SaveManifest(error))
+        return false;
+    outEntry = *it;
+    Tracenf("[LOD] asset default saved asset=%s levels=%u",
+        it->displayName.empty() ? it->id.c_str() : it->displayName.c_str(),
+        it->lodDefault.levelCount);
+    return true;
 }
 
 bool AssetLibrary::MoveAssetToSubpath(const std::string& id,

@@ -994,6 +994,52 @@ void WriteMaterialOverride(std::ostream& out, const MeshSceneEntity::MaterialOve
     out << "        }" << (comma ? "," : "") << "\n";
 }
 
+void WriteEditorComponent(std::ostream& out, const EditorAttachedComponent& component, bool comma)
+{
+    out << "        {\n";
+    out << "          \"type\": \"" << EscapeJson(component.type) << "\",\n";
+    out << "          \"display_name\": \"" << EscapeJson(component.displayName) << "\",\n";
+    out << "          \"category\": \"" << EscapeJson(component.category) << "\",\n";
+    out << "          \"note\": \"" << EscapeJson(component.note) << "\"\n";
+    out << "        }" << (comma ? "," : "") << "\n";
+}
+
+void WriteEditorComponents(std::ostream& out, const std::vector<EditorAttachedComponent>& components, bool comma)
+{
+    if (components.empty())
+        return;
+    out << "      \"editor_components\": [\n";
+    for (size_t i = 0; i < components.size(); ++i)
+        WriteEditorComponent(out, components[i], i + 1 < components.size());
+    out << "      ]" << (comma ? "," : "") << "\n";
+}
+
+void WriteLodConfig(std::ostream& out, const LodConfig& config, const std::string& indent)
+{
+    const std::uint32_t levelCount = std::clamp(config.levelCount, 1u, LodConfig::MaxLevels);
+    out << indent << "\"level_count\": " << levelCount << ",\n";
+    out << indent << "\"hysteresis_m\": " << std::max(0.0f, config.hysteresisMeters);
+    for (std::uint32_t i = 0; i < LodConfig::MaxLevels; ++i)
+    {
+        out << ",\n" << indent << "\"target_ratio_" << i << "\": "
+            << (i == 0 ? 1.0f : std::clamp(config.targetRatios[i], 0.001f, 1.0f));
+        out << ",\n" << indent << "\"distance_m_" << i << "\": "
+            << (i == 0 ? 0.0f : std::max(0.0f, config.distances[i]));
+    }
+}
+
+void WriteLodComponent(std::ostream& out, const LodComponent& lod, bool comma)
+{
+    out << "      \"lod_component\": {\n";
+    out << "        \"enabled\": " << (lod.enabled ? "true" : "false") << ",\n";
+    out << "        \"override_asset_default\": " << (lod.overrideAssetDefault ? "true" : "false") << ",\n";
+    out << "        \"config\": {\n";
+    WriteLodConfig(out, lod.config, "          ");
+    out << "\n";
+    out << "        }\n";
+    out << "      }" << (comma ? "," : "") << "\n";
+}
+
 void WriteSceneEntity(std::ostream& out, const MeshSceneEntity& mesh, bool comma)
 {
     out << "    {\n";
@@ -1012,13 +1058,26 @@ void WriteSceneEntity(std::ostream& out, const MeshSceneEntity& mesh, bool comma
         out << "      \"material_overrides\": [\n";
         for (size_t i = 0; i < mesh.materialOverrides.size(); ++i)
             WriteMaterialOverride(out, mesh.materialOverrides[i], i + 1 < mesh.materialOverrides.size());
-        out << "      ]\n";
+        out << "      ]";
         Tracenf("[MMAT] saved override entity=%u slots=%zu", mesh.id, mesh.materialOverrides.size());
     }
-    else
+    if (!mesh.editorComponents.empty())
     {
-        out << "\n";
+        out << ",\n";
+        WriteEditorComponents(out, mesh.editorComponents, mesh.lod.enabled);
+        Tracenf("[INSPECTOR-COMP] saved entity=%u components=%zu", mesh.id, mesh.editorComponents.size());
     }
+    if (mesh.lod.enabled)
+    {
+        out << (!mesh.editorComponents.empty() ? "" : ",\n");
+        WriteLodComponent(out, mesh.lod, false);
+        Tracenf("[LOD] saved component entity=%u levels=%u override=%d",
+            mesh.id,
+            mesh.lod.config.levelCount,
+            mesh.lod.overrideAssetDefault ? 1 : 0);
+    }
+    else
+        out << "\n";
     out << "    }" << (comma ? "," : "") << "\n";
 }
 
@@ -1076,6 +1135,63 @@ MeshSceneEntity::MaterialOverride ReadMaterialOverride(const JsonValue& object)
     return material;
 }
 
+EditorAttachedComponent ReadEditorComponent(const JsonValue& object)
+{
+    EditorAttachedComponent component;
+    component.type = ReadString(object, "type");
+    component.displayName = ReadString(object, "display_name", component.type);
+    component.category = ReadString(object, "category", "Editor");
+    component.note = ReadString(object, "note");
+    return component;
+}
+
+std::vector<EditorAttachedComponent> ReadEditorComponents(const JsonValue& entity)
+{
+    std::vector<EditorAttachedComponent> components;
+    if (const JsonValue* values = Find(entity, "editor_components"); values && values->type == JsonValue::Type::Array)
+    {
+        for (const JsonValue& value : values->array)
+        {
+            if (value.type != JsonValue::Type::Object)
+                continue;
+            EditorAttachedComponent component = ReadEditorComponent(value);
+            if (!component.type.empty())
+                components.push_back(std::move(component));
+        }
+    }
+    return components;
+}
+
+LodConfig ReadLodConfig(const JsonValue& object)
+{
+    LodConfig config;
+    config.levelCount = std::clamp(ReadU32(object, "level_count", config.levelCount), 1u, LodConfig::MaxLevels);
+    config.hysteresisMeters = std::max(0.0f, ReadFloat(object, "hysteresis_m", config.hysteresisMeters));
+    for (std::uint32_t i = 0; i < LodConfig::MaxLevels; ++i)
+    {
+        const std::string ratioKey = "target_ratio_" + std::to_string(i);
+        const std::string distanceKey = "distance_m_" + std::to_string(i);
+        config.targetRatios[i] = std::clamp(ReadFloat(object, ratioKey.c_str(), config.targetRatios[i]), 0.001f, 1.0f);
+        config.distances[i] = std::max(0.0f, ReadFloat(object, distanceKey.c_str(), config.distances[i]));
+    }
+    config.targetRatios[0] = 1.0f;
+    config.distances[0] = 0.0f;
+    return config;
+}
+
+LodComponent ReadLodComponent(const JsonValue& entity)
+{
+    LodComponent lod;
+    if (const JsonValue* object = Find(entity, "lod_component"); object && object->type == JsonValue::Type::Object)
+    {
+        lod.enabled = ReadBool(*object, "enabled", true);
+        lod.overrideAssetDefault = ReadBool(*object, "override_asset_default", lod.overrideAssetDefault);
+        if (const JsonValue* config = Find(*object, "config"); config && config->type == JsonValue::Type::Object)
+            lod.config = ReadLodConfig(*config);
+    }
+    return lod;
+}
+
 MeshSceneEntity ReadMeshSceneEntity(const JsonValue& entity)
 {
     MeshSceneEntity mesh;
@@ -1096,6 +1212,31 @@ MeshSceneEntity ReadMeshSceneEntity(const JsonValue& entity)
         }
         Tracenf("[MMAT] loaded override entity=%u slots=%zu", mesh.id, mesh.materialOverrides.size());
     }
+    mesh.editorComponents = ReadEditorComponents(entity);
+    mesh.lod = ReadLodComponent(entity);
+    if (mesh.lod.enabled &&
+        std::none_of(mesh.editorComponents.begin(), mesh.editorComponents.end(), [](const EditorAttachedComponent& component) {
+            return component.type == "rendering.lod";
+        }))
+    {
+        mesh.editorComponents.push_back({"rendering.lod", "LOD Group", "Rendering", {}});
+    }
+    if (!mesh.editorComponents.empty())
+    {
+        std::string restored;
+        for (size_t i = 0; i < mesh.editorComponents.size(); ++i)
+        {
+            if (i > 0)
+                restored += ",";
+            restored += mesh.editorComponents[i].displayName.empty() ? mesh.editorComponents[i].type : mesh.editorComponents[i].displayName;
+        }
+        Tracenf("[INSPECTOR-COMP] restored entity=%u components=[%s]", mesh.id, restored.c_str());
+    }
+    if (mesh.lod.enabled)
+        Tracenf("[LOD] restored component entity=%u levels=%u override=%d",
+            mesh.id,
+            mesh.lod.config.levelCount,
+            mesh.lod.overrideAssetDefault ? 1 : 0);
     return mesh;
 }
 }

@@ -448,7 +448,7 @@ public:
         viewport.height = static_cast<float>(m_height);
         viewport.minDepth = 0.0f;
         viewport.maxDepth = 1.0f;
-        if (m_diagViewportLogsRemaining > 0)
+        if (!QuietLogsForLodDiag() && m_diagViewportLogsRemaining > 0)
         {
             Tracenf("[RMLUI-DIAG] vkCmdSetViewport: (%.3f,%.3f) %.3fx%.3f depth=[%.3f,%.3f]",
                 viewport.x,
@@ -463,7 +463,7 @@ public:
         VkRect2D scissor{};
         scissor.offset = {0, 0};
         scissor.extent = {m_width, m_height};
-        if (m_diagViewportLogsRemaining > 0)
+        if (!QuietLogsForLodDiag() && m_diagViewportLogsRemaining > 0)
         {
             Tracenf("[RMLUI-DIAG] vkCmdSetScissor: offset=(%d,%d) extent=%ux%u",
                 scissor.offset.x,
@@ -1059,7 +1059,7 @@ private:
             scissor.offset = {0, 0};
             scissor.extent = {m_width, m_height};
         }
-        if (m_diagScissorLogsRemaining > 0)
+        if (!QuietLogsForLodDiag() && m_diagScissorLogsRemaining > 0)
         {
             Tracenf("[RMLUI-DIAG] Rml scissor: enabled=%d region=(%d,%d)-(%d,%d) applied offset=(%d,%d) extent=%ux%u",
                 m_scissorEnabled ? 1 : 0,
@@ -1099,7 +1099,7 @@ private:
 
     void LogGeometryDiagnostics(const Geometry& geometry, Rml::Vector2f translation, Rml::TextureHandle texture)
     {
-        if (m_diagGeometryLogsRemaining <= 0)
+        if (QuietLogsForLodDiag() || m_diagGeometryLogsRemaining <= 0)
             return;
 
         Tracenf("[RMLUI-DIAG] RenderGeometry: vertices=%zu indices=%zu translation=(%.3f,%.3f) texture=%llu",
@@ -1813,7 +1813,7 @@ void RmlUiLayer::Render(VulkanDevice& device)
     if (!m_impl || !m_impl->context || !device.IsFrameActive())
     {
         static uint32_t skippedLogs = 0;
-        if (skippedLogs < 3)
+        if (!QuietLogsForLodDiag() && skippedLogs < 3)
         {
             ++skippedLogs;
             Tracenf("[FRAME] rmlui_render called = no, reason=%s",
@@ -1831,7 +1831,7 @@ void RmlUiLayer::Render(VulkanDevice& device)
         (m_impl->inventoryVisible && m_impl->inventoryDocument ? 1u : 0u) +
         (m_impl->characterCreationVisible && m_impl->characterCreationDocument ? 1u : 0u);
     const uint64_t frameNumber = device.GetFrameNumber();
-    if (frameNumber < 3 || (frameNumber % 60u) == 0u)
+    if (!QuietLogsForLodDiag() && (frameNumber < 3 || (frameNumber % 60u) == 0u))
     {
         Tracenf("[FRAME] rmlui_render called = yes, visible_docs = %u, login=%d lobby=%d hud=%d menu=%d settings=%d inventory=%d character=%d viewport=%ux%u",
             visibleDocs,

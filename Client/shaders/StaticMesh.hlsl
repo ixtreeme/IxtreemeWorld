@@ -42,6 +42,19 @@ struct SpotLightUbo
 [[vk::combinedImageSampler]] [[vk::binding(3, 0)]] Texture2D u_ormMap : register(t2);
 [[vk::combinedImageSampler]] [[vk::binding(3, 0)]] SamplerState u_ormSampler : register(s2);
 
+struct StaticMeshInstanceData
+{
+    float4x4 mvp;
+    float4x4 model;
+    float4 tint;
+    float4 materialBaseColor;
+    float4 materialParams;
+    float4 materialEmissive;
+    float4 materialUv;
+};
+
+[[vk::binding(4, 0)]] StructuredBuffer<StaticMeshInstanceData> u_instances : register(t3);
+
 struct VSInput
 {
     float3 position : POSITION;
@@ -55,16 +68,25 @@ struct VSOutput
     float3 normal : NORMAL;
     float2 uv : TEXCOORD0;
     float3 worldPos : TEXCOORD1;
+    nointerpolation float4 tint : TEXCOORD2;
+    nointerpolation float4 materialBaseColor : TEXCOORD3;
+    nointerpolation float4 materialParams : TEXCOORD4;
+    nointerpolation float4 materialEmissive : TEXCOORD5;
 };
 
-VSOutput VSMain(VSInput input)
+VSOutput VSMain(VSInput input, uint instanceId : SV_InstanceID)
 {
+    StaticMeshInstanceData instance = u_instances[instanceId];
     VSOutput output;
-    output.position = mul(float4(input.position, 1.0), u_mvp);
-    const float4 worldPos = mul(float4(input.position, 1.0), u_model);
-    output.normal = normalize(mul(float4(input.normal, 0.0), u_model).xyz);
-    output.uv = input.uv * max(u_materialUv.xy, float2(0.001, 0.001)) + u_materialUv.zw;
+    output.position = mul(float4(input.position, 1.0), instance.mvp);
+    const float4 worldPos = mul(float4(input.position, 1.0), instance.model);
+    output.normal = normalize(mul(float4(input.normal, 0.0), instance.model).xyz);
+    output.uv = input.uv * max(instance.materialUv.xy, float2(0.001, 0.001)) + instance.materialUv.zw;
     output.worldPos = worldPos.xyz;
+    output.tint = instance.tint;
+    output.materialBaseColor = instance.materialBaseColor;
+    output.materialParams = instance.materialParams;
+    output.materialEmissive = instance.materialEmissive;
     return output;
 }
 
@@ -101,17 +123,17 @@ float4 PSMain(VSOutput input) : SV_Target0
     if (u_lightPadding.x > 0.5 && input.worldPos.y < u_lightPadding.y)
         discard;
 
-    float3 normal = ApplyNormalMap(normalize(input.normal), input.worldPos, input.uv, u_materialParams.z);
+    float3 normal = ApplyNormalMap(normalize(input.normal), input.worldPos, input.uv, input.materialParams.z);
     float3 viewDir = normalize(u_cameraPosition.xyz - input.worldPos);
     float3 lightDir = normalize(u_sunDir.xyz);
     float ndotl = saturate(dot(normal, lightDir));
 
     float3 orm = u_ormMap.Sample(u_ormSampler, input.uv).rgb;
-    const float metallic = saturate(u_materialParams.x * orm.b);
-    const float roughness = saturate(u_materialParams.y * max(orm.g, 0.04));
-    const float ao = saturate(u_materialParams.w * orm.r);
+    const float metallic = saturate(input.materialParams.x * orm.b);
+    const float roughness = saturate(input.materialParams.y * max(orm.g, 0.04));
+    const float ao = saturate(input.materialParams.w * orm.r);
     float3 texColor = u_diffuse.Sample(u_sampler, input.uv).rgb;
-    float3 albedo = texColor * u_materialBaseColor.rgb * u_tint.rgb;
+    float3 albedo = texColor * input.materialBaseColor.rgb * input.tint.rgb;
     float3 lighting = u_ambientColor.rgb * ao + u_sunColor.rgb * ndotl;
     float3 specular = u_sunColor.rgb * SpecularTerm(normal, lightDir, viewDir, roughness, metallic);
 
@@ -157,6 +179,6 @@ float4 PSMain(VSOutput input) : SV_Target0
         }
     }
 
-    float3 color = albedo * lighting + specular + u_materialEmissive.rgb * u_materialEmissive.a;
-    return float4(color, u_materialBaseColor.a * u_tint.a);
+    float3 color = albedo * lighting + specular + input.materialEmissive.rgb * input.materialEmissive.a;
+    return float4(color, input.materialBaseColor.a * input.tint.a);
 }

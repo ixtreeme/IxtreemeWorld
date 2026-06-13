@@ -53,6 +53,9 @@ target_compile_definitions(client_render
         $<$<PLATFORM_ID:Windows>:WIN32_LEAN_AND_MEAN>
         $<$<PLATFORM_ID:Windows>:NOMINMAX>
         $<$<PLATFORM_ID:Windows>:_WIN32_WINNT=0x0601>
+    PRIVATE
+        IXTREEME_MESHOPT_FETCHCONTENT=1
+        IXTREEME_MESHOPT_OPTIMIZED_DEBUG=1
 )
 
 target_link_libraries(client_render
@@ -61,6 +64,7 @@ target_link_libraries(client_render
         client_asset
         mapdata
         fastgltf::fastgltf
+        meshoptimizer::meshoptimizer
         RmlUi::RmlUi
         ${CLIENT_OZZ_TARGETS}
         ${CLIENT_FLECS_TARGET}

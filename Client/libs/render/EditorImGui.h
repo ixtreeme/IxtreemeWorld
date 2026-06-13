@@ -16,6 +16,7 @@
 #include <functional>
 #include <unordered_map>
 #include <memory>
+#include <optional>
 #include <string>
 #include <utility>
 #include <vector>
@@ -87,6 +88,8 @@ public:
     void InitializeAssetLibrary(const std::filesystem::path& clientRoot);
     void InitializeProjectAssetLibrary(const std::filesystem::path& projectRoot, const std::filesystem::path& assetRoot);
     void RefreshAssetLibrary();
+    std::optional<LodConfig> FindModelLodDefault(const std::string& assetId) const;
+    bool SaveModelLodDefault(const std::string& assetId, const LodConfig& config);
     bool OpenWaterMaterialEditor(const std::string& materialId);
     bool OpenPbrMaterialEditor(const std::string& materialId);
     MapEditorCommands ConsumeCommands();
@@ -175,6 +178,7 @@ private:
     void RenderSelectedLightInspector();
     void RenderSelectedMeshRendererInspector();
     void RenderAddComponentMenu();
+    bool RenderAttachedEditorComponents(std::vector<EditorAttachedComponent>& components);
     bool RenderTransformComponent(float* position, float* rotation, float* scale);
     bool RenderAxisFloat(const char* axis, float& value, float r, float g, float b, float speed, float minValue, float maxValue);
     void RenderWorldPanel();
@@ -333,6 +337,8 @@ private:
     std::uint64_t m_selectedHierarchyEntity = 0;
     std::uint64_t m_hierarchyRenamingEntity = 0;
     char m_hierarchyRenameBuffer[128]{};
+    char m_componentSearchBuffer[128]{};
+    bool m_componentRegistryLogged = false;
     bool m_logHierarchyRendered = false;
     std::unordered_map<std::string, AssetPreviewTexture> m_assetPreviewTextures;
     bool m_assetBrowserLogged = false;
