@@ -7,6 +7,7 @@
 #include "SceneManager.h"
 #include "VulkanDevice.h"
 #include "platform/trash.h"
+#include "tools/tree/TreeTexturePalette.h"
 
 #if defined(IXTREEME_WITH_EDITOR) && defined(_WIN32)
 #include "IconsFontAwesome6.h"
@@ -45,6 +46,20 @@ constexpr const char* kAssetPayloadType = "ASSET_ID";
 constexpr const char* kAssetFolderPayloadType = "ASSET_FOLDER_PATH";
 constexpr const char* kEditorNoteComponentId = "editor.note";
 constexpr const char* kLodComponentId = "rendering.lod";
+
+std::filesystem::path InternalAssetRootFor(const std::filesystem::path& engineRoot)
+{
+    if (engineRoot.empty())
+        return std::filesystem::path{};
+    std::error_code ec;
+    const std::filesystem::path direct = engineRoot / "internal";
+    if (std::filesystem::exists(direct, ec))
+        return direct;
+    const std::filesystem::path underAssets = engineRoot / "assets" / "internal";
+    if (std::filesystem::exists(underAssets, ec))
+        return underAssets;
+    return direct;
+}
 
 struct InspectorComponentDefinition
 {
@@ -791,6 +806,7 @@ void EditorImGui::InitializeAssetLibrary(const std::filesystem::path& clientRoot
     }
 
     m_assetStatus = "Asset library ready";
+    tree_tool::TreeTexturePalette::Instance().EnsureLoaded(InternalAssetRootFor(m_engineRoot));
     SyncWaterMaterialSnapshot();
     Tracenf("[EDITOR-IMGUI-3] Asset library root=%s", m_assetLibrary->LibraryRoot().generic_string().c_str());
 }
@@ -813,6 +829,7 @@ void EditorImGui::InitializeProjectAssetLibrary(const std::filesystem::path& pro
     m_selectedAssetId.clear();
     m_activeAssetTags.clear();
     m_assetStatus = "Project assets ready";
+    tree_tool::TreeTexturePalette::Instance().EnsureLoaded(InternalAssetRootFor(m_engineRoot));
     SyncWaterMaterialSnapshot();
     Tracenf("[PROJECT] asset browser root=%s", m_assetLibrary->LibraryRoot().generic_string().c_str());
 }
@@ -2977,6 +2994,22 @@ void EditorImGui::RenderMenuBar()
     if (ImGui::BeginMenu("View"))
     {
         ImGui::MenuItem("Demo Window", nullptr, &m_showDemoWindow);
+        ImGui::EndMenu();
+    }
+    if (ImGui::BeginMenu("Tools"))
+    {
+        if (ImGui::MenuItem("Tree Generator..."))
+        {
+            if (!m_treeGeneratorPanel)
+            {
+                const std::filesystem::path presetDir = m_engineRoot.empty()
+                    ? std::filesystem::path{}
+                    : (InternalAssetRootFor(m_engineRoot) / "tree_presets");
+                m_treeGeneratorPanel = std::make_unique<tree_tool::TreeGeneratorPanel>(presetDir);
+            }
+            m_treeGeneratorPanel->SetAssetLibrary(m_assetLibrary.get());
+            m_treeGeneratorPanel->Show();
+        }
         ImGui::EndMenu();
     }
     if (ImGui::BeginMenu("Help"))
@@ -6306,8 +6339,22 @@ void EditorImGui::RenderEditorPanels()
     RenderWaterSculptToolPanel();
     RenderHeightmapToolPanel();
     RenderSplatPaintToolPanel();
+    RenderTreeGeneratorPanel();
     RenderWaterMaterialEditor();
     RenderPbrMaterialEditor();
+}
+
+void EditorImGui::RenderTreeGeneratorPanel()
+{
+    if (!m_treeGeneratorPanel)
+        return;
+    m_treeGeneratorPanel->SetAssetLibrary(m_assetLibrary.get());
+    if (m_treeGeneratorPanel->Render())
+    {
+        RefreshAssetLibrary();
+        m_assetFilter = AssetBrowserFilter::Model;
+        m_assetStatus = m_treeGeneratorPanel->Status();
+    }
 }
 
 void EditorImGui::Render(VulkanDevice& device)

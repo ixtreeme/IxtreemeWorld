@@ -128,6 +128,7 @@ endif()
 set(CLIENT_ROOT "${CMAKE_CURRENT_SOURCE_DIR}")
 set(CLIENT_LIBS_DIR "${CLIENT_ROOT}/libs")
 
+add_subdirectory(${CLIENT_LIBS_DIR}/ixtreemetree)
 add_subdirectory(${CMAKE_CURRENT_SOURCE_DIR}/../shared/map shared_map_build)
 
 find_package(fastgltf CONFIG REQUIRED)

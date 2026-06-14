@@ -38,6 +38,14 @@ add_library(client_render STATIC
     StaticMeshRenderer.h
     SkinnedMeshRenderer.cpp
     SkinnedMeshRenderer.h
+    tools/tree/TreeGeneratorPanel.cpp
+    tools/tree/TreeGeneratorPanel.h
+    tools/tree/TreeGlbExporter.cpp
+    tools/tree/TreeGlbExporter.h
+    tools/tree/TreePreviewRenderer.cpp
+    tools/tree/TreePreviewRenderer.h
+    tools/tree/TreeTexturePalette.cpp
+    tools/tree/TreeTexturePalette.h
     WorldCamera.h
     WorldComponents.h
 )
@@ -59,6 +67,7 @@ target_compile_definitions(client_render
         $<$<PLATFORM_ID:Windows>:WIN32_LEAN_AND_MEAN>
         $<$<PLATFORM_ID:Windows>:NOMINMAX>
         $<$<PLATFORM_ID:Windows>:_WIN32_WINNT=0x0601>
+        IXTREEME_TREE_PRESET_DIR="${CLIENT_ROOT}/assets/internal/tree_presets"
     PRIVATE
         IXTREEME_MESHOPT_FETCHCONTENT=1
         IXTREEME_MESHOPT_OPTIMIZED_DEBUG=1
@@ -71,6 +80,7 @@ target_link_libraries(client_render
         mapdata
         efsw::efsw
         fastgltf::fastgltf
+        ixtreemetree::ixtreemetree
         meshoptimizer::meshoptimizer
         RmlUi::RmlUi
         ${CLIENT_OZZ_TARGETS}

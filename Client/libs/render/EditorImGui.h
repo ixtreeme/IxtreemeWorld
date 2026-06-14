@@ -3,6 +3,7 @@
 #include "AssetLibrary.h"
 #include "InputEvent.h"
 #include "MapEditorTypes.h"
+#include "tools/tree/TreeGeneratorPanel.h"
 
 #if defined(_WIN32) && !defined(VK_USE_PLATFORM_WIN32_KHR)
 #define VK_USE_PLATFORM_WIN32_KHR
@@ -193,6 +194,7 @@ private:
     void RenderSplatPaintToolPanel();
     void RenderSplatLayerSlot(std::uint32_t slotIndex);
     void RenderWaterMaterialEditor();
+    void RenderTreeGeneratorPanel();
     void RenderWaterMaterialHeader();
     void RenderWaterMaterialColorsSection(WaterMaterialData& material);
     void RenderWaterMaterialWaveSection(WaterMaterialData& material);
@@ -321,6 +323,7 @@ private:
     std::unordered_map<std::string, std::uint32_t> m_waterMaterialUsageCounts;
     WaterMaterialEditorState m_waterMaterialEditor;
     PbrMaterialEditorState m_pbrMaterialEditor;
+    std::unique_ptr<tree_tool::TreeGeneratorPanel> m_treeGeneratorPanel;
     std::filesystem::path m_engineRoot;
     std::unique_ptr<AssetLibrary> m_assetLibrary;
     ProjectDialogMode m_projectDialogMode = ProjectDialogMode::None;

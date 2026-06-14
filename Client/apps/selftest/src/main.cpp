@@ -3,6 +3,7 @@
 #include "ProjectManager.h"
 #include "SceneManager.h"
 #include "WaterBodyIO.h"
+#include "ixtreemetree/ixtreemetree.h"
 #include "map/MapData.h"
 #include "schema/map_manifest.capnp.h"
 
@@ -1199,6 +1200,51 @@ bool RunRenderChecks(const Options& options, TestContext& ctx)
     std::stringstream renderCmakeText;
     renderCmakeText << renderCmake.rdbuf();
     const std::string renderCmakeSource = renderCmakeText.str();
+    const std::filesystem::path treeLibCmakePath = options.clientRoot / "libs" / "ixtreemetree" / "CMakeLists.txt";
+    std::ifstream treeLibCmake(treeLibCmakePath);
+    std::stringstream treeLibCmakeText;
+    treeLibCmakeText << treeLibCmake.rdbuf();
+    const std::string treeLibCmakeSource = treeLibCmakeText.str();
+    const std::filesystem::path treeLibHeaderPath = options.clientRoot / "libs" / "ixtreemetree" / "include" / "ixtreemetree" / "tree_options.h";
+    std::ifstream treeLibHeader(treeLibHeaderPath);
+    std::stringstream treeLibHeaderText;
+    treeLibHeaderText << treeLibHeader.rdbuf();
+    const std::string treeLibHeaderSource = treeLibHeaderText.str();
+    const std::filesystem::path treeLibSourcePath = options.clientRoot / "libs" / "ixtreemetree" / "src" / "tree.cpp";
+    std::ifstream treeLibSourceFile(treeLibSourcePath);
+    std::stringstream treeLibSourceText;
+    treeLibSourceText << treeLibSourceFile.rdbuf();
+    const std::string treeLibSource = treeLibSourceText.str();
+    const std::filesystem::path treePresetHeaderPath = options.clientRoot / "libs" / "ixtreemetree" / "include" / "ixtreemetree" / "preset.h";
+    std::ifstream treePresetHeader(treePresetHeaderPath);
+    std::stringstream treePresetHeaderText;
+    treePresetHeaderText << treePresetHeader.rdbuf();
+    const std::string treePresetHeaderSource = treePresetHeaderText.str();
+    const std::filesystem::path treePresetSourcePath = options.clientRoot / "libs" / "ixtreemetree" / "src" / "preset_loader.cpp";
+    std::ifstream treePresetSourceFile(treePresetSourcePath);
+    std::stringstream treePresetSourceText;
+    treePresetSourceText << treePresetSourceFile.rdbuf();
+    const std::string treePresetSource = treePresetSourceText.str();
+    const std::filesystem::path treePanelPath = options.clientRoot / "libs" / "render" / "tools" / "tree" / "TreeGeneratorPanel.cpp";
+    std::ifstream treePanelFile(treePanelPath);
+    std::stringstream treePanelText;
+    treePanelText << treePanelFile.rdbuf();
+    const std::string treePanelSource = treePanelText.str();
+    const std::filesystem::path treeExporterPath = options.clientRoot / "libs" / "render" / "tools" / "tree" / "TreeGlbExporter.cpp";
+    std::ifstream treeExporterFile(treeExporterPath);
+    std::stringstream treeExporterText;
+    treeExporterText << treeExporterFile.rdbuf();
+    const std::string treeExporterSource = treeExporterText.str();
+    const std::filesystem::path treePreviewPath = options.clientRoot / "libs" / "render" / "tools" / "tree" / "TreePreviewRenderer.cpp";
+    std::ifstream treePreviewFile(treePreviewPath);
+    std::stringstream treePreviewText;
+    treePreviewText << treePreviewFile.rdbuf();
+    const std::string treePreviewSource = treePreviewText.str();
+    const std::filesystem::path treePalettePath = options.clientRoot / "libs" / "render" / "tools" / "tree" / "TreeTexturePalette.cpp";
+    std::ifstream treePaletteFile(treePalettePath);
+    std::stringstream treePaletteText;
+    treePaletteText << treePaletteFile.rdbuf();
+    const std::string treePaletteSource = treePaletteText.str();
     const std::filesystem::path clientCmakePath = options.clientRoot / "apps" / "client" / "CMakeLists.txt";
     std::ifstream clientCmake(clientCmakePath);
     std::stringstream clientCmakeText;
@@ -1290,7 +1336,7 @@ bool RunRenderChecks(const Options& options, TestContext& ctx)
             editorImGuiSource.find("UI::IconButton(ICON_FA_FOLDER_PLUS") != std::string::npos &&
             editorImGuiSource.find("UI::IconButton(ICON_FA_TRASH") != std::string::npos &&
             editorImGuiSource.find("UI::SectionHeader") != std::string::npos &&
-            clientMainSource.find("Ixtreeme Engine - Editor") != std::string::npos &&
+            sceneManagerSource.find("IxtreemeEngine - Editor") != std::string::npos &&
             clientMainSource.find("Standalone Vulkan Clear - gameClient Overlay") == std::string::npos,
         "editor icon buttons and title", "EDITOR-VISUAL-POLISH must iconize editor controls and rename the window title");
     ctx.Expect(editorImGuiSource.find("RenderAssetBrowserFolderTree") != std::string::npos &&
@@ -1327,6 +1373,126 @@ bool RunRenderChecks(const Options& options, TestContext& ctx)
             editorImGuiSource.find("Tags: %s") != std::string::npos &&
             editorImGuiSource.find("Source: %s") != std::string::npos,
         "asset browser compact tile metadata", "asset browser tiles should show only a short filename and move metadata into the hover tooltip");
+    ctx.Expect(treeLibCmakeSource.find("add_library(ixtreemetree STATIC") != std::string::npos &&
+            treeLibCmakeSource.find("add_library(ixtreemetree::ixtreemetree ALIAS ixtreemetree)") != std::string::npos &&
+            rootCmakeSource.find("add_subdirectory(${CLIENT_LIBS_DIR}/ixtreemetree)") != std::string::npos &&
+            renderCmakeSource.find("ixtreemetree::ixtreemetree") != std::string::npos,
+        "ixtreemetree library target", "TREE-1 must add a standalone ixtreemetree static library target and link it into the editor render module");
+    ctx.Expect(treeLibHeaderSource.find("struct TreeOptions") != std::string::npos &&
+            treeLibHeaderSource.find("enum class TreeType") != std::string::npos &&
+            treeLibHeaderSource.find("enum class BarkType") != std::string::npos &&
+            treeLibHeaderSource.find("enum class LeafBillboard") != std::string::npos &&
+            treeLibSource.find("Rng rng(options.seed)") != std::string::npos &&
+            treeLibSource.find("GenerateBranch") != std::string::npos &&
+            treeLibSource.find("GenerateLeaves") != std::string::npos &&
+            treeLibSource.find("Vulkan") == std::string::npos &&
+            treeLibSource.find("ImGui") == std::string::npos,
+        "ixtreemetree pure generator api", "TREE-1 library must expose TreeOptions/TreeMesh/Tree and stay independent from Vulkan/ImGui");
+    {
+        ixtreemetree::Tree tree;
+        tree.options = ixtreemetree::defaultTreeOptions();
+        tree.options.seed = 54321;
+        const ixtreemetree::TreeMesh a = tree.generate();
+        const ixtreemetree::TreeMesh b = tree.generate();
+        const bool deterministic = a.bark.vertices.size() == b.bark.vertices.size() &&
+            a.bark.indices.size() == b.bark.indices.size() &&
+            a.leaves.vertices.size() == b.leaves.vertices.size() &&
+            a.leaves.indices.size() == b.leaves.indices.size() &&
+            !a.bark.vertices.empty() &&
+            a.stats.barkTriangles > 0 &&
+            a.stats.leafTriangles > 0;
+        ctx.Expect(deterministic,
+            "ixtreemetree deterministic generate", "TREE-1 must generate deterministic non-empty bark and leaf meshes from the same seed/options");
+    }
+    ctx.Expect(treePresetHeaderSource.find("loadPresetFile") != std::string::npos &&
+            treePresetHeaderSource.find("loadAllPresets") != std::string::npos &&
+            treePresetSource.find("JsonParser") != std::string::npos &&
+            treePresetSource.find("defaultTreeOptions") != std::string::npos &&
+            treePresetSource.find("IXTREEME") == std::string::npos &&
+            treePresetSource.find("ImGui") == std::string::npos,
+        "ixtreemetree preset loader api", "TREE-2 preset loader must expose file/folder load APIs, tolerate missing fields with defaults, and stay engine/UI independent");
+    {
+        const std::filesystem::path presetDir = options.clientRoot / "assets" / "internal" / "tree_presets";
+        std::vector<std::string> errors;
+        const std::vector<ixtreemetree::Preset> presets = ixtreemetree::loadAllPresets(presetDir, &errors);
+        std::string presetFailure = "TREE-2 must ship the EZ-Tree base presets as parseable JSON files";
+        if (!errors.empty())
+        {
+            presetFailure += "; first error: " + errors.front();
+        }
+        presetFailure += "; count=" + std::to_string(presets.size());
+        const auto hasPreset = [&](const char* name) {
+            return std::any_of(presets.begin(), presets.end(), [name](const ixtreemetree::Preset& preset) {
+                return preset.name == name;
+            });
+        };
+        ctx.Expect(errors.empty() && presets.size() == 16 &&
+                hasPreset("Oak Medium") &&
+                hasPreset("Pine Medium") &&
+                hasPreset("Bush 1") &&
+                hasPreset("Trellis"),
+            "tree preset json set parses", presetFailure);
+        if (!presets.empty())
+        {
+            ixtreemetree::Tree tree;
+            tree.options = presets.front().options;
+            const ixtreemetree::TreeMesh mesh = tree.generate();
+            ctx.Expect(mesh.stats.barkTriangles > 0 && mesh.stats.leafTriangles > 0,
+                "tree preset generates mesh", "TREE-2 presets must produce usable ixtreemetree meshes");
+        }
+    }
+    ctx.Expect(treePanelSource.find("Tree Generator") != std::string::npos &&
+            treePanelSource.find("BeginTable(\"TreeBranchLevels\"") != std::string::npos &&
+            treePanelSource.find("Regenerate") != std::string::npos &&
+            treePanelSource.find("Save as Asset") != std::string::npos &&
+            treePreviewSource.find("TreePreviewCanvas") != std::string::npos &&
+            treeExporterSource.find("[TREE-1] saved asset") != std::string::npos &&
+            editorImGuiSource.find("Tree Generator...") != std::string::npos &&
+            editorImGuiHeaderSource.find("TreeGeneratorPanel") != std::string::npos,
+        "tree generator editor integration", "TREE-1 must add a Tools > Tree Generator panel, preview wrapper, and GLB asset exporter");
+    ctx.Expect(treePanelSource.find("RenderPresetSelector") != std::string::npos &&
+            treePanelSource.find("loadAllPresets") != std::string::npos &&
+            treePanelSource.find("Custom") != std::string::npos &&
+            treePanelSource.find("[TREE-2] loaded") != std::string::npos &&
+            renderCmakeSource.find("IXTREEME_TREE_PRESET_DIR") != std::string::npos &&
+            clientCmakeSource.find("${CLIENT_ROOT}/assets") != std::string::npos,
+        "tree generator preset dropdown", "TREE-2 must load internal tree presets, expose a Custom+preset dropdown, and rely on the existing asset copy path for runtime availability");
+    {
+        const std::filesystem::path treeTextureRoot = options.clientRoot / "assets" / "internal" / "textures";
+        int textureCount = 0;
+        for (const std::filesystem::path path : {
+                 treeTextureRoot / "bark" / "oak_bark.png",
+                 treeTextureRoot / "bark" / "birch_bark.png",
+                 treeTextureRoot / "bark" / "pine_bark.png",
+                 treeTextureRoot / "bark" / "willow_bark.png",
+                 treeTextureRoot / "bark" / "ash_bark.png",
+                 treeTextureRoot / "leaves" / "oak_leaf.png",
+                 treeTextureRoot / "leaves" / "ash_leaf.png",
+                 treeTextureRoot / "leaves" / "pine_leaf.png",
+                 treeTextureRoot / "leaves" / "willow_leaf.png",
+                 treeTextureRoot / "leaves" / "birch_leaf.png",
+             })
+        {
+            if (std::filesystem::exists(path))
+                ++textureCount;
+        }
+        ctx.Expect(textureCount == 10 &&
+                renderCmakeSource.find("TreeTexturePalette.cpp") != std::string::npos &&
+                treePaletteSource.find("[TREE-3] palette_loaded bark=") != std::string::npos &&
+                treePaletteSource.find("[TREE-3] generated procedural fallback") != std::string::npos &&
+                treePanelSource.find("RenderTextureOverrideSlot") != std::string::npos &&
+                treePanelSource.find("AcceptDragDropPayload(\"ASSET_ID\")") != std::string::npos &&
+                treePanelSource.find("AssetLibrary::Category::Texture") != std::string::npos &&
+                treePanelSource.find("barkTextureOverridePath_") != std::string::npos &&
+                treeExporterSource.find("TreeMaterialBinding") != std::string::npos &&
+                treeExporterSource.find("CopyTextureDependency") != std::string::npos &&
+                treeExporterSource.find("baseColorTexturePath = barkTexturePath") != std::string::npos &&
+                treeExporterSource.find("\\\"baseColorTexture\\\"") != std::string::npos &&
+                treePreviewSource.find("TreePreviewStyle") != std::string::npos &&
+                treeLibHeaderSource.find("Guid") == std::string::npos &&
+                treeLibSource.find("TreeTexturePalette") == std::string::npos,
+            "tree texture palette and overrides", "TREE-3 must keep ixtreemetree texture-agnostic while engine-side palette textures, drag-drop overrides, preview styling, and material GUID binding are wired");
+    }
     ctx.Expect(sceneManagerHeaderSource.find("class SceneManager") != std::string::npos &&
             sceneManagerHeaderSource.find("struct SceneData") != std::string::npos &&
             sceneManagerHeaderSource.find("LoadScene") != std::string::npos &&
@@ -1365,7 +1531,7 @@ bool RunRenderChecks(const Options& options, TestContext& ctx)
     ctx.Expect(sceneManagerSource.find("MarkDirty") != std::string::npos &&
             sceneManagerSource.find("PromptSaveBeforeAction") != std::string::npos &&
             sceneManagerHeaderSource.find("GetRecentScenes") != std::string::npos &&
-            sceneManagerSource.find("Ixtreeme Engine - Editor") != std::string::npos &&
+            sceneManagerSource.find("IxtreemeEngine - Editor") != std::string::npos &&
             sceneManagerSource.find("title += \"*\"") != std::string::npos &&
             nativeWindowHeaderSource.find("SetTitle") != std::string::npos &&
             clientMainSource.find("SetWindowTitleCallback") != std::string::npos,
