@@ -273,9 +273,29 @@ MaterialAssetManager& MaterialAssetManager::Instance()
     return manager;
 }
 
+Guid MaterialAssetManager::PinkMissingMaterialGuid()
+{
+    static const Guid guid = [] {
+        Guid value{};
+        value.bytes[15] = 1;
+        return value;
+    }();
+    return guid;
+}
+
 MaterialAssetManager::MaterialAssetManager(AssetDatabase& db)
     : db_(db)
 {
+    MaterialAsset material{};
+    material.guid = PinkMissingMaterialGuid();
+    material.name = "Pink Missing Material";
+    material.baseColor = {1.0f, 0.0f, 1.0f, 1.0f};
+    material.metallic = 0.0f;
+    material.roughness = 1.0f;
+    auto builtin = std::make_unique<MaterialAsset>(material);
+    cache_[builtin->guid] = std::move(builtin);
+    Tracenf("[MATERIAL-SLOTS] registered pink_missing_material guid=%s",
+        PinkMissingMaterialGuid().toString().c_str());
 }
 
 MaterialAsset* MaterialAssetManager::getOrLoad(const Guid& guid)

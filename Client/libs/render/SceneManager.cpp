@@ -1052,6 +1052,19 @@ void WriteSceneEntity(std::ostream& out, const MeshSceneEntity& mesh, bool comma
     out << "      \"mesh_asset_id\": \"" << EscapeJson(mesh.meshAssetId) << "\",\n";
     out << "      \"mesh_asset_path\": \"" << EscapeJson(mesh.meshAssetPath) << "\",\n";
     out << "      \"skinned\": " << (mesh.skinned ? "true" : "false");
+    if (!mesh.materialSlots.empty())
+    {
+        out << ",\n";
+        out << "      \"materials\": [";
+        for (size_t i = 0; i < mesh.materialSlots.size(); ++i)
+        {
+            if (i)
+                out << ", ";
+            out << "\"" << EscapeJson(mesh.materialSlots[i]) << "\"";
+        }
+        out << "]";
+        Tracenf("[MATERIAL-SLOTS] saved entity=%u slots=%zu", mesh.id, mesh.materialSlots.size());
+    }
     if (!mesh.materialOverrides.empty())
     {
         out << ",\n";
@@ -1203,6 +1216,15 @@ MeshSceneEntity ReadMeshSceneEntity(const JsonValue& entity)
     mesh.meshAssetId = ReadString(entity, "mesh_asset_id");
     mesh.meshAssetPath = ReadString(entity, "mesh_asset_path");
     mesh.skinned = ReadBool(entity, "skinned", mesh.skinned);
+    if (const JsonValue* materials = Find(entity, "materials"); materials && materials->type == JsonValue::Type::Array)
+    {
+        for (const JsonValue& value : materials->array)
+        {
+            if (value.type == JsonValue::Type::String)
+                mesh.materialSlots.push_back(value.string);
+        }
+        Tracenf("[MATERIAL-SLOTS] loaded entity=%u slots=%zu", mesh.id, mesh.materialSlots.size());
+    }
     if (const JsonValue* materials = Find(entity, "material_overrides"); materials && materials->type == JsonValue::Type::Array)
     {
         for (const JsonValue& value : materials->array)

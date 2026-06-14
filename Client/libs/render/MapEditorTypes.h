@@ -283,6 +283,7 @@ struct MeshSceneEntity
         float uvTiling[2] = {1.0f, 1.0f};
         float uvOffset[2] = {0.0f, 0.0f};
     };
+    std::vector<std::string> materialSlots;
     std::vector<MaterialOverride> materialOverrides;
     std::vector<EditorAttachedComponent> editorComponents;
     LodComponent lod;
@@ -371,6 +372,7 @@ struct MeshRendererEditorState
     bool skinned = false;
     std::uint32_t materialSlotCount = 1;
     std::uint32_t selectedMaterialSlot = 0;
+    std::vector<std::string> materialSlots;
     std::vector<MeshSceneEntity::MaterialOverride> materialOverrides;
     std::vector<EditorAttachedComponent> editorComponents;
     LodComponent lod;
@@ -438,6 +440,7 @@ struct MapEditorCommands
     bool save = false;
     bool reload = false;
     bool undo = false;
+    bool dumpMaterialState = false;
     bool enterPlayMode = false;
     bool exitPlayMode = false;
     bool pausePlayMode = false;

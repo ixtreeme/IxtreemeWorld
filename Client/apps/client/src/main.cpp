@@ -3,6 +3,7 @@
 #endif
 
 #include "AssetLibrary.h"
+#include "AssetDatabase.h"
 #include "WorldLabelRenderer.h"
 #include "AssetWatcher.h"
 #include "NativeWindow.h"
@@ -701,10 +702,14 @@ MeshRendererEditorState BuildMeshRendererEditorState(const std::vector<MeshScene
     std::copy(std::begin(it->rotation), std::end(it->rotation), std::begin(state.rotation));
     std::copy(std::begin(it->scale), std::end(it->scale), std::begin(state.scale));
     state.skinned = it->skinned;
+    state.materialSlots = it->materialSlots;
     state.materialOverrides = it->materialOverrides;
     state.editorComponents = it->editorComponents;
     state.lod = it->lod;
-    state.materialSlotCount = std::max<std::uint32_t>(1u, static_cast<std::uint32_t>(state.materialOverrides.size()));
+    state.materialSlotCount = std::max<std::uint32_t>(
+        1u,
+        std::max(static_cast<std::uint32_t>(state.materialSlots.size()),
+            static_cast<std::uint32_t>(state.materialOverrides.size())));
     state.selectedMaterialSlot = std::min(state.selectedMaterialSlot, state.materialSlotCount - 1u);
     return state;
 }
@@ -718,9 +723,100 @@ void ApplyMeshRendererEditorState(MeshSceneEntity& mesh, const MeshRendererEdito
     std::copy(std::begin(state.rotation), std::end(state.rotation), std::begin(mesh.rotation));
     std::copy(std::begin(state.scale), std::end(state.scale), std::begin(mesh.scale));
     mesh.skinned = state.skinned;
+    mesh.materialSlots = state.materialSlots;
     mesh.materialOverrides = state.materialOverrides;
     mesh.editorComponents = state.editorComponents;
     mesh.lod = state.lod;
+}
+
+std::filesystem::path ResolveModelAssetPathForMeta(const std::string& meshAssetPath)
+{
+    if (meshAssetPath.empty())
+        return {};
+    std::filesystem::path path(meshAssetPath);
+    if (path.is_absolute())
+        return path;
+    ProjectManager& projects = ProjectManager::Instance();
+    if (projects.HasProject())
+    {
+        const std::string generic = path.generic_string();
+        if (generic == "Assets" || generic.rfind("Assets/", 0) == 0)
+            path = projects.ProjectRoot() / path;
+        else
+            path = projects.AssetRootPath() / path;
+    }
+    else
+    {
+        path = std::filesystem::current_path() / path;
+    }
+    std::error_code ec;
+    const std::filesystem::path canonical = std::filesystem::weakly_canonical(path, ec);
+    return ec ? std::filesystem::absolute(path) : canonical;
+}
+
+std::vector<std::string> LoadDefaultMaterialSlotGuids(const std::string& meshAssetPath)
+{
+    std::vector<std::string> slots;
+    const std::filesystem::path modelPath = ResolveModelAssetPathForMeta(meshAssetPath);
+    if (modelPath.empty())
+        return slots;
+
+    std::vector<Guid> defaults = AssetDatabase::Instance().loadDefaultMaterials(modelPath);
+    if (defaults.empty())
+    {
+        static std::unordered_set<std::string> warnedLegacyMeta;
+        const std::string key = modelPath.generic_string();
+        if (warnedLegacyMeta.insert(key).second)
+        {
+            Tracenf("[MATERIAL-SLOTS] legacy_meta_no_defaultMaterials assetPath=%s",
+                key.c_str());
+        }
+
+        if (ProjectManager::Instance().HasProject())
+        {
+            const std::filesystem::path materialFolder =
+                ProjectManager::Instance().AssetRootPath() / "materials" / modelPath.stem();
+            std::error_code ec;
+            std::vector<std::filesystem::path> materialFiles;
+            if (std::filesystem::exists(materialFolder, ec))
+            {
+                for (const std::filesystem::directory_entry& entry : std::filesystem::directory_iterator(materialFolder, ec))
+                {
+                    if (!entry.is_regular_file(ec) || entry.path().extension() != ".material")
+                        continue;
+                    materialFiles.push_back(entry.path());
+                }
+            }
+            std::sort(materialFiles.begin(), materialFiles.end());
+            for (const std::filesystem::path& materialPath : materialFiles)
+                defaults.push_back(AssetDatabase::Instance().getOrCreateGuid(materialPath));
+            if (!defaults.empty())
+            {
+                AssetDatabase::Instance().writeDefaultMaterials(modelPath, defaults);
+                Tracenf("[MATERIAL-SLOTS] defaultMaterials_recorded model=%s count=%zu",
+                    modelPath.filename().generic_string().c_str(),
+                    defaults.size());
+            }
+        }
+    }
+
+    slots.reserve(defaults.size());
+    for (const Guid& guid : defaults)
+        slots.push_back(guid.toString());
+    return slots;
+}
+
+void EnsureMeshEntityMaterialSlots(MeshSceneEntity& mesh)
+{
+    if (!mesh.materialSlots.empty())
+        return;
+    mesh.materialSlots = LoadDefaultMaterialSlotGuids(mesh.meshAssetPath);
+    if (!mesh.materialSlots.empty())
+    {
+        Tracenf("[MATERIAL-SLOTS] legacy_scene_auto_populated entity=%u from=meta count=%zu",
+            mesh.id,
+            mesh.materialSlots.size());
+    }
 }
 
 std::optional<std::uint32_t> PickWaterBody(const std::vector<WaterBody>& bodies,
@@ -2014,6 +2110,8 @@ int RunGame(NativeWindow& window,
         editorPointLights = scene.pointLights;
         editorSpotLights = scene.spotLights;
         editorMeshEntities = scene.meshEntities;
+        for (MeshSceneEntity& mesh : editorMeshEntities)
+            EnsureMeshEntityMaterialSlots(mesh);
         selectedEditorObject = {};
         resetEditorHierarchyEntities();
         nextEditorWaterBodyId = 1;
@@ -3700,6 +3798,7 @@ int RunGame(NativeWindow& window,
                     mesh.position[1] = spawn.y;
                     mesh.position[2] = spawn.z;
                     mesh.skinned = false;
+                    mesh.materialSlots = LoadDefaultMaterialSlotGuids(mesh.meshAssetPath);
                     editorMeshEntities.push_back(mesh);
                     editorMeshEntityLookup[mesh.id] = editorMeshEntities.size() - 1u;
                     syncStaticMeshSpatialEntity(editorMeshEntities.back());
@@ -4057,6 +4156,35 @@ int RunGame(NativeWindow& window,
                             syncStaticMeshSpatialEntity(*it);
                         selectedEditorObject = {SelectedEditorObjectType::MeshEntity, it->id};
                         SceneManager::Instance().MarkDirty();
+                    }
+                }
+                if (commands.dumpMaterialState)
+                {
+                    Tracenf("[MATSLOT-DIAG] dump requested meshEntities=%zu", editorMeshEntities.size());
+                    for (const MeshSceneEntity& mesh : editorMeshEntities)
+                    {
+                        const std::string runtimePath = resolveMeshRuntimePath(mesh);
+                        StaticMeshRenderer* renderer = getStaticMeshRenderer(runtimePath);
+                        if (!renderer)
+                        {
+                            Tracenf("[MATSLOT-DIAG] === entity name=%s entityId=%u renderer=NULL path=%s ===",
+                                mesh.name.c_str(),
+                                mesh.id,
+                                runtimePath.c_str());
+                            continue;
+                        }
+                        StaticMeshRenderer::Instance instance{};
+                        instance.entityId = mesh.id;
+                        instance.position = {mesh.position[0], mesh.position[1], mesh.position[2]};
+                        instance.rotation[0] = mesh.rotation[0];
+                        instance.rotation[1] = mesh.rotation[1];
+                        instance.rotation[2] = mesh.rotation[2];
+                        instance.scale[0] = mesh.scale[0];
+                        instance.scale[1] = mesh.scale[1];
+                        instance.scale[2] = mesh.scale[2];
+                        instance.materialSlots = mesh.materialSlots;
+                        instance.materialOverrides = mesh.materialOverrides;
+                        renderer->DumpMaterialState(mesh.name.c_str(), instance);
                     }
                 }
                 if (commands.lodQualityCommitRequested)
@@ -4748,6 +4876,12 @@ int RunGame(NativeWindow& window,
                         const std::string runtimePath = resolveMeshRuntimePath(mesh);
                         if (StaticMeshRenderer* renderer = getStaticMeshRenderer(runtimePath))
                         {
+                            if (meshPtr->materialSlots.empty())
+                            {
+                                EnsureMeshEntityMaterialSlots(*meshPtr);
+                                if (!meshPtr->materialSlots.empty())
+                                    SceneManager::Instance().MarkDirty();
+                            }
                             const SpatialIndex::Aabb worldBounds = StaticMeshWorldAabb(mesh, *renderer);
                             if (renderer->IsLoaded() &&
                                 WorldAabbOutsideCameraFrustum(camera, SpatialAabbCorners(worldBounds)))
@@ -4821,6 +4955,7 @@ int RunGame(NativeWindow& window,
                             instance.tint = selected
                                 ? std::array<float, 4>{1.25f, 1.05f, 0.45f, 1.0f}
                                 : std::array<float, 4>{1.0f, 1.0f, 1.0f, 1.0f};
+                            instance.materialSlots = mesh.materialSlots;
                             instance.materialOverrides = mesh.materialOverrides;
                             LodConfig effectiveLodConfig{};
                             std::uint64_t lodConfigHash = 0;

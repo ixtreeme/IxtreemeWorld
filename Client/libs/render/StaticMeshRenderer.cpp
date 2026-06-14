@@ -28,6 +28,7 @@
 #include <optional>
 #include <string>
 #include <type_traits>
+#include <unordered_set>
 #include <utility>
 #include <variant>
 #include <vector>
@@ -340,6 +341,80 @@ Mat4 BuildStaticMeshModelMatrix(const StaticMeshRenderer::Instance& instance)
         Translation(instance.position.x, instance.position.y, instance.position.z));
 }
 
+StaticMeshRenderer::MaterialDefaults MaterialDefaultsFromAsset(const MaterialAsset& material)
+{
+    StaticMeshRenderer::MaterialDefaults defaults{};
+    defaults.baseColor[0] = material.baseColor[0];
+    defaults.baseColor[1] = material.baseColor[1];
+    defaults.baseColor[2] = material.baseColor[2];
+    defaults.baseColor[3] = material.baseColor[3];
+    defaults.metallic = material.metallic;
+    defaults.roughness = material.roughness;
+    defaults.normalStrength = material.normalStrength;
+    defaults.aoStrength = material.aoStrength;
+    defaults.emissive[0] = material.emissive[0] * material.emissive[3];
+    defaults.emissive[1] = material.emissive[1] * material.emissive[3];
+    defaults.emissive[2] = material.emissive[2] * material.emissive[3];
+    defaults.alphaMode = material.alphaMode == MaterialAsset::AlphaMode::Mask ? "mask" :
+        (material.alphaMode == MaterialAsset::AlphaMode::Blend ? "blend" : "opaque");
+    defaults.alphaCutoff = material.alphaCutoff;
+    return defaults;
+}
+
+void LogPinkFallbackOnce(std::uint32_t entityId,
+                         std::uint32_t materialSlot,
+                         const char* reason,
+                         const std::string& requestedGuid)
+{
+    static std::unordered_set<std::string> logged;
+    const std::string key = std::to_string(entityId) + ":" + std::to_string(materialSlot) + ":" +
+        reason + ":" + requestedGuid;
+    if (!logged.insert(key).second)
+        return;
+    Tracenf("[MATERIAL-SLOTS] resolved_to_pink entity=%u slot=%u reason=%s requestedGuid=%s",
+        entityId,
+        materialSlot,
+        reason,
+        requestedGuid.empty() ? "<empty>" : requestedGuid.c_str());
+}
+
+StaticMeshRenderer::MaterialDefaults ResolveMaterialSlotDefaults(
+    const StaticMeshRenderer::Instance& instance,
+    uint32_t materialSlot,
+    const std::vector<StaticMeshRenderer::MaterialDefaults>& bakedDefaults)
+{
+    const StaticMeshRenderer::MaterialDefaults bakedFallback{};
+    StaticMeshRenderer::MaterialDefaults defaults = bakedDefaults.empty()
+        ? bakedFallback
+        : (materialSlot < bakedDefaults.size() ? bakedDefaults[materialSlot] : bakedDefaults.front());
+
+    if (materialSlot >= instance.materialSlots.size() || instance.materialSlots[materialSlot].empty())
+    {
+        LogPinkFallbackOnce(instance.entityId, materialSlot, "empty_guid", {});
+        if (MaterialAsset* pink = MaterialAssetManager::Instance().getOrLoad(MaterialAssetManager::PinkMissingMaterialGuid()))
+            return MaterialDefaultsFromAsset(*pink);
+        return defaults;
+    }
+
+    const std::string& guidText = instance.materialSlots[materialSlot];
+    const std::optional<Guid> guid = Guid::fromString(guidText);
+    if (!guid)
+    {
+        LogPinkFallbackOnce(instance.entityId, materialSlot, "invalid_guid", guidText);
+        if (MaterialAsset* pink = MaterialAssetManager::Instance().getOrLoad(MaterialAssetManager::PinkMissingMaterialGuid()))
+            return MaterialDefaultsFromAsset(*pink);
+        return defaults;
+    }
+
+    if (MaterialAsset* material = MaterialAssetManager::Instance().getOrLoad(*guid))
+        return MaterialDefaultsFromAsset(*material);
+
+    LogPinkFallbackOnce(instance.entityId, materialSlot, "guid_not_found", guidText);
+    if (MaterialAsset* pink = MaterialAssetManager::Instance().getOrLoad(MaterialAssetManager::PinkMissingMaterialGuid()))
+        return MaterialDefaultsFromAsset(*pink);
+    return defaults;
+}
+
 void FillStaticMeshInstanceBlock(const WorldCamera& camera,
     const StaticMeshRenderer::Instance& instance,
     uint32_t materialSlot,
@@ -354,10 +429,8 @@ void FillStaticMeshInstanceBlock(const WorldCamera& camera,
     out.tint[2] = instance.tint[2];
     out.tint[3] = instance.tint[3];
 
-    const StaticMeshRenderer::MaterialDefaults fallbackDefaults{};
-    const StaticMeshRenderer::MaterialDefaults& defaults = materialDefaults.empty()
-        ? fallbackDefaults
-        : (materialSlot < materialDefaults.size() ? materialDefaults[materialSlot] : materialDefaults.front());
+    const StaticMeshRenderer::MaterialDefaults defaults =
+        ResolveMaterialSlotDefaults(instance, materialSlot, materialDefaults);
     std::memcpy(out.materialBaseColor, defaults.baseColor, sizeof(out.materialBaseColor));
     out.materialParams[0] = defaults.metallic;
     out.materialParams[1] = defaults.roughness;
@@ -534,6 +607,9 @@ StaticMeshRenderer::MaterialDefaults ReadMaterialDefaults(const fastgltf::Materi
     defaults.emissive[0] = material.emissiveFactor.x();
     defaults.emissive[1] = material.emissiveFactor.y();
     defaults.emissive[2] = material.emissiveFactor.z();
+    defaults.alphaMode = material.alphaMode == fastgltf::AlphaMode::Mask ? "mask" :
+        (material.alphaMode == fastgltf::AlphaMode::Blend ? "blend" : "opaque");
+    defaults.alphaCutoff = material.alphaCutoff;
     return defaults;
 }
 
@@ -572,6 +648,16 @@ std::string AlphaModeString(fastgltf::AlphaMode mode)
     case fastgltf::AlphaMode::Mask: return "mask";
     case fastgltf::AlphaMode::Blend: return "blend";
     default: return "opaque";
+    }
+}
+
+const char* MaterialAlphaModeName(MaterialAsset::AlphaMode mode)
+{
+    switch (mode)
+    {
+    case MaterialAsset::AlphaMode::Mask: return "MASK";
+    case MaterialAsset::AlphaMode::Blend: return "BLEND";
+    default: return "OPAQUE";
     }
 }
 
@@ -641,13 +727,23 @@ GltfMaterialSource BuildMaterialSource(const fastgltf::Asset& asset,
     return source;
 }
 
-void GenerateMaterialAssetsForGltf(const fastgltf::Asset& asset, const std::string& modelPath)
+std::vector<Guid> GenerateMaterialAssetsForGltf(const fastgltf::Asset& asset, const std::string& modelPath)
 {
+    std::vector<Guid> defaultMaterials;
     ProjectManager& projects = ProjectManager::Instance();
     if (!projects.HasProject())
-        return;
+        return defaultMaterials;
 
-    const std::filesystem::path modelFsPath(modelPath);
+    std::filesystem::path modelFsPath(modelPath);
+    if (modelFsPath.is_relative())
+    {
+        const std::string generic = modelFsPath.generic_string();
+        modelFsPath = (generic == "Assets" || generic.rfind("Assets/", 0) == 0)
+            ? (projects.ProjectRoot() / modelFsPath)
+            : (projects.AssetRootPath() / modelFsPath);
+    }
+    std::error_code modelPathEc;
+    modelFsPath = std::filesystem::weakly_canonical(modelFsPath, modelPathEc);
     const std::filesystem::path modelDir = modelFsPath.has_parent_path()
         ? modelFsPath.parent_path()
         : std::filesystem::current_path();
@@ -658,11 +754,20 @@ void GenerateMaterialAssetsForGltf(const fastgltf::Asset& asset, const std::stri
     MaterialAssetManager::ImportSummary summary{};
     const std::size_t materialCount = asset.materials.empty() ? 1u : asset.materials.size();
     summary.materials = static_cast<std::uint32_t>(materialCount);
+    defaultMaterials.reserve(materialCount);
     for (std::size_t i = 0; i < materialCount; ++i)
     {
         const fastgltf::Material* material = asset.materials.empty() ? nullptr : &asset.materials[i];
         GltfMaterialSource source = BuildMaterialSource(asset, material, i, modelDir);
-        manager.createFromGltfMaterial(source, materialFolder, source.name, &summary);
+        defaultMaterials.push_back(manager.createFromGltfMaterial(source, materialFolder, source.name, &summary));
+    }
+
+    if (!defaultMaterials.empty())
+    {
+        AssetDatabase::Instance().writeDefaultMaterials(modelFsPath, defaultMaterials);
+        Tracenf("[MATERIAL-SLOTS] defaultMaterials_recorded model=%s count=%zu",
+            modelFsPath.filename().generic_string().c_str(),
+            defaultMaterials.size());
     }
 
     Tracenf("[MATERIAL-ASSET] gltf_import_summary mesh=%s materials=%u generated=%u reused=%u conflicts=%u",
@@ -671,6 +776,7 @@ void GenerateMaterialAssetsForGltf(const fastgltf::Asset& asset, const std::stri
         summary.generated,
         summary.reused,
         summary.conflicts);
+    return defaultMaterials;
 }
 
 RgbaImage CreateFallbackWhiteImage(const std::string& modelPath)
@@ -1167,6 +1273,140 @@ StaticMeshRenderer::LodDiagnostics StaticMeshRenderer::GetLodDiagnostics(std::ui
     return diag;
 }
 
+void StaticMeshRenderer::DumpMaterialState(const char* entityName, const Instance& instance) const
+{
+    LogFormat("[MATSLOT-DIAG] === entity name=%s entityId=%u submeshCount=%zu ===",
+        entityName && entityName[0] ? entityName : "<unnamed>",
+        instance.entityId,
+        m_draws.size());
+
+    auto guidText = [](const std::optional<Guid>& guid) {
+        return guid ? guid->toString() : std::string("EMPTY");
+    };
+
+    for (std::size_t i = 0; i < m_draws.size(); ++i)
+    {
+        const MeshDraw& draw = m_draws[i];
+        const std::uint32_t materialSlot = draw.materialSlot;
+        const std::string slotGuid =
+            materialSlot < instance.materialSlots.size() ? instance.materialSlots[materialSlot] : std::string{};
+        const MaterialDefaults bakedFallback{};
+        const MaterialDefaults& baked = m_materialDefaults.empty()
+            ? bakedFallback
+            : (materialSlot < m_materialDefaults.size() ? m_materialDefaults[materialSlot] : m_materialDefaults.front());
+
+        const char* source = "gltf_baked";
+        std::string resolvedName = "NULL";
+        const char* alphaMode = AlphaModeForLog(baked.alphaMode);
+        float alphaCutoff = baked.alphaCutoff;
+        float baseColor[4] = {baked.baseColor[0], baked.baseColor[1], baked.baseColor[2], baked.baseColor[3]};
+        float metallic = baked.metallic;
+        float roughness = baked.roughness;
+        std::string baseColorTextureGuid = "EMPTY";
+        std::string baseColorTextureHandle = m_texture.view != VK_NULL_HANDLE
+            ? [&] {
+                char handle[32]{};
+                std::snprintf(handle, sizeof(handle), "0x%llx", VkHandleValue(m_texture.view));
+                return std::string(handle);
+            }()
+            : "NULL";
+
+        if (slotGuid.empty())
+        {
+            source = "pink_fallback";
+            if (MaterialAsset* pink = MaterialAssetManager::Instance().getOrLoad(MaterialAssetManager::PinkMissingMaterialGuid()))
+            {
+                resolvedName = pink->name;
+                baseColor[0] = pink->baseColor[0];
+                baseColor[1] = pink->baseColor[1];
+                baseColor[2] = pink->baseColor[2];
+                baseColor[3] = pink->baseColor[3];
+                metallic = pink->metallic;
+                roughness = pink->roughness;
+                alphaMode = MaterialAlphaModeName(pink->alphaMode);
+                alphaCutoff = pink->alphaCutoff;
+            }
+            baseColorTextureHandle = "NULL";
+        }
+        else if (const std::optional<Guid> guid = Guid::fromString(slotGuid))
+        {
+            if (MaterialAsset* material = MaterialAssetManager::Instance().getOrLoad(*guid))
+            {
+                source = "slot";
+                resolvedName = material->name.empty() ? material->path.filename().generic_string() : material->name;
+                baseColor[0] = material->baseColor[0];
+                baseColor[1] = material->baseColor[1];
+                baseColor[2] = material->baseColor[2];
+                baseColor[3] = material->baseColor[3];
+                metallic = material->metallic;
+                roughness = material->roughness;
+                alphaMode = MaterialAlphaModeName(material->alphaMode);
+                alphaCutoff = material->alphaCutoff;
+                baseColorTextureGuid = guidText(material->baseColorTexture);
+                baseColorTextureHandle = "NULL";
+            }
+            else
+            {
+                source = "pink_fallback";
+                if (MaterialAsset* pink = MaterialAssetManager::Instance().getOrLoad(MaterialAssetManager::PinkMissingMaterialGuid()))
+                {
+                    resolvedName = pink->name;
+                    baseColor[0] = pink->baseColor[0];
+                    baseColor[1] = pink->baseColor[1];
+                    baseColor[2] = pink->baseColor[2];
+                    baseColor[3] = pink->baseColor[3];
+                    metallic = pink->metallic;
+                    roughness = pink->roughness;
+                    alphaMode = MaterialAlphaModeName(pink->alphaMode);
+                    alphaCutoff = pink->alphaCutoff;
+                }
+                baseColorTextureGuid = slotGuid;
+                baseColorTextureHandle = "NULL";
+            }
+        }
+        else
+        {
+            source = "pink_fallback";
+            if (MaterialAsset* pink = MaterialAssetManager::Instance().getOrLoad(MaterialAssetManager::PinkMissingMaterialGuid()))
+            {
+                resolvedName = pink->name;
+                baseColor[0] = pink->baseColor[0];
+                baseColor[1] = pink->baseColor[1];
+                baseColor[2] = pink->baseColor[2];
+                baseColor[3] = pink->baseColor[3];
+                metallic = pink->metallic;
+                roughness = pink->roughness;
+                alphaMode = MaterialAlphaModeName(pink->alphaMode);
+                alphaCutoff = pink->alphaCutoff;
+            }
+            baseColorTextureGuid = slotGuid;
+            baseColorTextureHandle = "NULL";
+        }
+
+        LogFormat("[MATSLOT-DIAG]   submesh=%zu", i);
+        LogFormat("[MATSLOT-DIAG]     renderer.materials[%u] = %s",
+            materialSlot,
+            slotGuid.empty() ? "EMPTY" : slotGuid.c_str());
+        LogFormat("[MATSLOT-DIAG]     resolvedMaterialAsset = %s", resolvedName.c_str());
+        LogFormat("[MATSLOT-DIAG]     materialSource = \"%s\"", source);
+        LogFormat("[MATSLOT-DIAG]     baseColor = (%.3f,%.3f,%.3f,%.3f)",
+            baseColor[0], baseColor[1], baseColor[2], baseColor[3]);
+        LogFormat("[MATSLOT-DIAG]     baseColorTexture.guid = %s", baseColorTextureGuid.c_str());
+        LogFormat("[MATSLOT-DIAG]     baseColorTexture.resolvedHandle = %s", baseColorTextureHandle.c_str());
+        LogFormat("[MATSLOT-DIAG]     boundRendererBaseColorView = 0x%llx source=gltf_baked_renderer_texture",
+            VkHandleValue(m_texture.view));
+        LogFormat("[MATSLOT-DIAG]     boundRendererNormalView = 0x%llx", VkHandleValue(m_normalTexture.view));
+        LogFormat("[MATSLOT-DIAG]     boundRendererMetallicRoughnessView = 0x%llx", VkHandleValue(m_ormTexture.view));
+        LogFormat("[MATSLOT-DIAG]     alphaMode = %s", alphaMode);
+        LogFormat("[MATSLOT-DIAG]     alphaCutoff = %.3f", alphaCutoff);
+        LogFormat("[MATSLOT-DIAG]     metallic = %.3f", metallic);
+        LogFormat("[MATSLOT-DIAG]     roughness = %.3f", roughness);
+        LogFormat("[MATSLOT-DIAG]     vertexCount = %u", draw.vertexCount);
+        LogFormat("[MATSLOT-DIAG]     indexCount = %u", draw.indexCount);
+        LogFormat("[MATSLOT-DIAG]     drawCallIssued = %s", draw.indexCount > 0 ? "yes" : "no");
+    }
+}
+
 void StaticMeshRenderer::SetMainRenderPass(VkRenderPass renderPass)
 {
     m_mainRenderPass = renderPass;
@@ -1288,6 +1528,7 @@ bool StaticMeshRenderer::LoadStaticGltfMesh(const std::string& modelPath)
                 primitive.materialIndex.has_value() ? primitive.materialIndex.value() : 0u);
             if (draw.materialSlot >= m_materialSlotCount)
                 draw.materialSlot = 0;
+            draw.vertexCount = static_cast<uint32_t>(vertices.size());
             m_draws.push_back(draw);
             LogFormat("[STATIC-MESH] extracted primitive[%u] mesh='%s': verts=%zu indices=%u materialSlot=%u",
                 primitiveIndex++, mesh.name.c_str(), vertices.size(), draw.indexCount, draw.materialSlot);
@@ -2776,10 +3017,7 @@ void StaticMeshRenderer::UpdateWorldUniform(uint32_t frameIndex,
 
     UniformBlock uniform{mvp, model,
         {instance.tint[0], instance.tint[1], instance.tint[2], instance.tint[3]}};
-    const MaterialDefaults fallbackDefaults{};
-    const MaterialDefaults& defaults = m_materialDefaults.empty()
-        ? fallbackDefaults
-        : (materialSlot < m_materialDefaults.size() ? m_materialDefaults[materialSlot] : m_materialDefaults.front());
+    const MaterialDefaults defaults = ResolveMaterialSlotDefaults(instance, materialSlot, m_materialDefaults);
     std::memcpy(uniform.materialBaseColor, defaults.baseColor, sizeof(uniform.materialBaseColor));
     uniform.materialParams[0] = defaults.metallic;
     uniform.materialParams[1] = defaults.roughness;

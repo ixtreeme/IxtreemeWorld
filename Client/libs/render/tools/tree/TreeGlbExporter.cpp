@@ -7,11 +7,13 @@
 #include <algorithm>
 #include <chrono>
 #include <cctype>
+#include <cstdint>
 #include <cstring>
 #include <fstream>
 #include <iomanip>
 #include <sstream>
 #include <system_error>
+#include <vector>
 
 namespace tree_tool
 {
@@ -48,6 +50,38 @@ std::string SanitizeAssetName(std::string value)
     while (!value.empty() && (value.back() == '_' || value.back() == '-'))
         value.pop_back();
     return value.empty() ? "tree" : value;
+}
+
+bool PathFilenameEquals(const std::filesystem::path& path, const char* name)
+{
+    std::string filename = path.filename().string();
+    std::string expected(name);
+    std::transform(filename.begin(), filename.end(), filename.begin(), [](unsigned char c) {
+        return static_cast<char>(std::tolower(c));
+    });
+    std::transform(expected.begin(), expected.end(), expected.begin(), [](unsigned char c) {
+        return static_cast<char>(std::tolower(c));
+    });
+    return filename == expected;
+}
+
+std::filesystem::path ResolvePathBestEffort(const std::filesystem::path& path)
+{
+    std::error_code ec;
+    std::filesystem::path resolved = std::filesystem::weakly_canonical(path, ec);
+    if (!ec && !resolved.empty())
+        return resolved;
+    ec.clear();
+    resolved = std::filesystem::absolute(path, ec);
+    return ec ? path : resolved;
+}
+
+std::filesystem::path NormalizeProjectRoot(const std::filesystem::path& projectRoot)
+{
+    std::filesystem::path resolved = ResolvePathBestEffort(projectRoot);
+    if (PathFilenameEquals(resolved, "Assets") && resolved.has_parent_path())
+        resolved = resolved.parent_path();
+    return resolved;
 }
 
 void Align4(std::vector<std::uint8_t>& bytes)
@@ -124,7 +158,8 @@ bool WriteGlb(const ixtreemetree::TreeMesh& mesh,
               const std::string& name,
               const std::string& barkTextureUri,
               const std::string& leafTextureUri,
-              float leafAlphaCutoff)
+              float leafAlphaCutoff,
+              std::uint64_t* outBinarySizeBytes)
 {
     std::vector<BufferView> views;
     std::vector<std::uint8_t> bin;
@@ -227,7 +262,50 @@ bool WriteGlb(const ixtreemetree::TreeMesh& mesh,
     file.write(reinterpret_cast<const char*>(&binLength), sizeof(binLength));
     file.write(reinterpret_cast<const char*>(&binType), sizeof(binType));
     file.write(reinterpret_cast<const char*>(bin.data()), static_cast<std::streamsize>(bin.size()));
+    if (outBinarySizeBytes)
+        *outBinarySizeBytes = totalLength;
     return file.good();
+}
+
+bool VerifyBinaryGlb(const std::filesystem::path& path, std::uint64_t expectedSize, std::string& error)
+{
+    std::error_code ec;
+    const std::uint64_t fileSize = static_cast<std::uint64_t>(std::filesystem::file_size(path, ec));
+    if (ec || fileSize < 20u)
+    {
+        error = "written GLB is missing or too small";
+        return false;
+    }
+
+    std::ifstream file(path, std::ios::binary);
+    if (!file)
+    {
+        error = "failed to reopen written GLB";
+        return false;
+    }
+
+    std::uint32_t magic = 0;
+    std::uint32_t version = 0;
+    std::uint32_t totalLength = 0;
+    std::uint32_t jsonLength = 0;
+    std::uint32_t jsonType = 0;
+    file.read(reinterpret_cast<char*>(&magic), sizeof(magic));
+    file.read(reinterpret_cast<char*>(&version), sizeof(version));
+    file.read(reinterpret_cast<char*>(&totalLength), sizeof(totalLength));
+    file.read(reinterpret_cast<char*>(&jsonLength), sizeof(jsonLength));
+    file.read(reinterpret_cast<char*>(&jsonType), sizeof(jsonType));
+
+    if (magic != 0x46546C67u || version != 2u || jsonType != 0x4E4F534Au)
+    {
+        error = "written file is not a binary GLB v2";
+        return false;
+    }
+    if (static_cast<std::uint64_t>(totalLength) != fileSize || (expectedSize != 0u && expectedSize != fileSize))
+    {
+        error = "written GLB size does not match header";
+        return false;
+    }
+    return true;
 }
 
 std::filesystem::path CopyTextureDependency(const std::filesystem::path& source,
@@ -304,7 +382,8 @@ TreeExportResult TreeGlbExporter::SaveAsAsset(const ixtreemetree::TreeMesh& mesh
         return result;
     }
     const std::string safeName = SanitizeAssetName(assetName);
-    const std::filesystem::path assetRoot = projectRoot / "Assets";
+    const std::filesystem::path normalizedProjectRoot = NormalizeProjectRoot(projectRoot);
+    const std::filesystem::path assetRoot = normalizedProjectRoot / "Assets";
     const std::filesystem::path modelDir = assetRoot / "models";
     const std::filesystem::path textureDir = assetRoot / "textures" / safeName;
     const std::filesystem::path materialDir = assetRoot / "materials" / safeName;
@@ -338,14 +417,31 @@ TreeExportResult TreeGlbExporter::SaveAsAsset(const ixtreemetree::TreeMesh& mesh
         result.error = dependencyError;
         return result;
     }
+    std::uint64_t binarySizeBytes = 0;
     if (!WriteGlb(mesh,
             modelPath,
             safeName,
             RelativeUri(barkTexturePath, modelDir),
             RelativeUri(leafTexturePath, modelDir),
-            materialBinding.leafAlphaCutoff))
+            materialBinding.leafAlphaCutoff,
+            &binarySizeBytes))
     {
         result.error = "failed to write glb";
+        return result;
+    }
+    const std::filesystem::path resolvedModelPath = ResolvePathBestEffort(modelPath);
+    std::error_code fileSizeError;
+    const std::uint64_t actualFileSize = static_cast<std::uint64_t>(std::filesystem::file_size(modelPath, fileSizeError));
+    if (!fileSizeError)
+        binarySizeBytes = actualFileSize;
+    Tracenf("[TREE-1-DEBUG] save_attempt name=%s resolvedPath=%s fastgltf_method=manual_glb_writer buffer_uri_mode=embedded binary_size_bytes=%llu",
+        safeName.c_str(),
+        resolvedModelPath.string().c_str(),
+        static_cast<unsigned long long>(binarySizeBytes));
+    std::string glbVerifyError;
+    if (!VerifyBinaryGlb(modelPath, binarySizeBytes, glbVerifyError))
+    {
+        result.error = glbVerifyError;
         return result;
     }
     if (!barkTexturePath.empty())
@@ -353,13 +449,15 @@ TreeExportResult TreeGlbExporter::SaveAsAsset(const ixtreemetree::TreeMesh& mesh
     if (!leafTexturePath.empty())
         AssetDatabase::Instance().getOrCreateGuid(leafTexturePath);
 
+    std::vector<Guid> defaultMaterials;
+    defaultMaterials.reserve(2);
     MaterialAssetManager::ImportSummary summary{};
     GltfMaterialSource bark{};
     bark.name = "bark";
     bark.baseColor = {0.42f, 0.26f, 0.12f, 1.0f};
     bark.roughness = 0.82f;
     bark.baseColorTexturePath = barkTexturePath;
-    MaterialAssetManager::Instance().createFromGltfMaterial(bark, materialDir, "bark", &summary);
+    defaultMaterials.push_back(MaterialAssetManager::Instance().createFromGltfMaterial(bark, materialDir, "bark", &summary));
     GltfMaterialSource leaves{};
     leaves.name = "leaves";
     leaves.baseColor = {0.22f, 0.56f, 0.22f, 1.0f};
@@ -367,9 +465,10 @@ TreeExportResult TreeGlbExporter::SaveAsAsset(const ixtreemetree::TreeMesh& mesh
     leaves.alphaMode = "mask";
     leaves.alphaCutoff = materialBinding.leafAlphaCutoff;
     leaves.baseColorTexturePath = leafTexturePath;
-    MaterialAssetManager::Instance().createFromGltfMaterial(leaves, materialDir, "leaves", &summary);
+    defaultMaterials.push_back(MaterialAssetManager::Instance().createFromGltfMaterial(leaves, materialDir, "leaves", &summary));
 
-    AssetDatabase::Instance().scan(projectRoot);
+    AssetDatabase::Instance().scan(normalizedProjectRoot);
+    AssetDatabase::Instance().writeDefaultMaterials(modelPath, defaultMaterials);
     if (!barkTexturePath.empty())
         AssetDatabase::Instance().getOrCreateGuid(barkTexturePath);
     if (!leafTexturePath.empty())

@@ -2225,6 +2225,17 @@ void EditorImGui::AssignAssetToSelectedMeshRenderer(const std::string& assetId)
     m_meshRendererState.meshAssetId = entry->id;
     m_meshRendererState.meshAssetPath = m_assetLibrary->AssetRelativePath(*entry);
     m_meshRendererState.meshDisplayName = entry->displayName;
+    m_meshRendererState.materialSlots.clear();
+    std::filesystem::path modelPath =
+        entry->originalPath.empty() ? m_assetLibrary->AbsolutePath(*entry) : std::filesystem::path(entry->originalPath);
+    if (modelPath.is_relative())
+        modelPath = m_assetLibrary->AbsolutePath(*entry);
+    const std::vector<Guid> defaults = AssetDatabase::Instance().loadDefaultMaterials(modelPath);
+    m_meshRendererState.materialSlots.reserve(defaults.size());
+    for (const Guid& guid : defaults)
+        m_meshRendererState.materialSlots.push_back(guid.toString());
+    m_meshRendererState.materialSlotCount = std::max<std::uint32_t>(1u,
+        static_cast<std::uint32_t>(m_meshRendererState.materialSlots.size()));
     MarkSelectedMeshRendererChanged();
     m_assetStatus = "MeshRenderer mesh <- " + entry->displayName;
     Tracenf("[MESH-ENTITY] Mesh assigned: entity=%u asset_id=%s path=%s",
@@ -3009,6 +3020,12 @@ void EditorImGui::RenderMenuBar()
             }
             m_treeGeneratorPanel->SetAssetLibrary(m_assetLibrary.get());
             m_treeGeneratorPanel->Show();
+        }
+        if (ImGui::BeginMenu("Debug"))
+        {
+            if (ImGui::MenuItem("Dump Material State"))
+                m_commands.dumpMaterialState = true;
+            ImGui::EndMenu();
         }
         ImGui::EndMenu();
     }
@@ -4477,6 +4494,83 @@ void EditorImGui::RenderSelectedMeshRendererInspector()
         ImGui::TextDisabled("Asset ID: %s", m_meshRendererState.meshAssetId.empty() ? "<none>" : m_meshRendererState.meshAssetId.c_str());
         ImGui::TextDisabled("Path: %s", m_meshRendererState.meshAssetPath.empty() ? "<none>" : m_meshRendererState.meshAssetPath.c_str());
         ImGui::TextDisabled("Render path: %s", m_meshRendererState.skinned ? "SkinnedMeshRenderer" : "StaticMeshRenderer");
+    }
+
+    if (!m_meshRendererState.skinned &&
+        ImGui::CollapsingHeader(ICON_FA_LAYER_GROUP " Material Slots", ImGuiTreeNodeFlags_DefaultOpen))
+    {
+        m_meshRendererState.materialSlotCount = std::max<std::uint32_t>(
+            1u,
+            std::max(m_meshRendererState.materialSlotCount,
+                static_cast<std::uint32_t>(m_meshRendererState.materialSlots.size())));
+        if (m_meshRendererState.materialSlots.size() < m_meshRendererState.materialSlotCount)
+            m_meshRendererState.materialSlots.resize(m_meshRendererState.materialSlotCount);
+
+        auto materialLabelForGuid = [](const std::string& guidText) {
+            if (guidText.empty())
+                return std::string("(Drop Material here)");
+            const std::optional<Guid> guid = Guid::fromString(guidText);
+            if (!guid)
+                return std::string("Invalid material GUID");
+            const std::optional<std::filesystem::path> path = AssetDatabase::Instance().resolveGuid(*guid);
+            if (!path)
+                return std::string("Missing Material");
+            return path->filename().generic_string();
+        };
+
+        for (std::uint32_t slot = 0; slot < m_meshRendererState.materialSlotCount; ++slot)
+        {
+            ImGui::PushID(static_cast<int>(slot));
+            ImGui::Text("[%u] Submesh %u", slot, slot);
+            ImGui::SameLine();
+            if (UI::IconButton(ICON_FA_XMARK, "Clear Material Slot", ImVec2(28.0f, 0.0f)))
+            {
+                m_meshRendererState.materialSlots[slot].clear();
+                MarkSelectedMeshRendererChanged();
+                Tracenf("[MATERIAL-SLOTS] clear entity=%u slot=%u",
+                    m_meshRendererState.id,
+                    slot);
+            }
+            const std::string label = materialLabelForGuid(m_meshRendererState.materialSlots[slot]);
+            const bool emptySlot = m_meshRendererState.materialSlots[slot].empty();
+            ImGui::PushStyleColor(ImGuiCol_Button,
+                emptySlot ? ImVec4(0.22f, 0.22f, 0.25f, 1.0f) : ImVec4(0.34f, 0.42f, 0.34f, 1.0f));
+            ImGui::Button(label.c_str(), ImVec2(-1.0f, 42.0f));
+            ImGui::PopStyleColor();
+            if (ImGui::BeginDragDropTarget())
+            {
+                if (const ImGuiPayload* payload = ImGui::AcceptDragDropPayload(kAssetPayloadType))
+                {
+                    const std::string assetId(static_cast<const char*>(payload->Data), payload->DataSize);
+                    const auto entry = m_assetLibrary ? m_assetLibrary->FindById(assetId) : std::optional<AssetLibrary::Entry>{};
+                    if (entry && entry->category == AssetLibrary::Category::Material)
+                    {
+                        std::filesystem::path materialPath =
+                            entry->originalPath.empty() ? m_assetLibrary->AbsolutePath(*entry) : std::filesystem::path(entry->originalPath);
+                        if (materialPath.is_relative())
+                            materialPath = m_assetLibrary->AbsolutePath(*entry);
+                        const Guid guid = AssetDatabase::Instance().getOrCreateGuid(materialPath);
+                        m_meshRendererState.materialSlots[slot] = guid.toString();
+                        m_assetStatus = "Material slot <- " + entry->displayName;
+                        MarkSelectedMeshRendererChanged();
+                        Tracenf("[MATERIAL-SLOTS] assign entity=%u slot=%u material=%s guid=%s",
+                            m_meshRendererState.id,
+                            slot,
+                            entry->displayName.c_str(),
+                            guid.toString().c_str());
+                    }
+                    else
+                    {
+                        m_assetStatus = "Material Slots accept Material assets";
+                    }
+                }
+                ImGui::EndDragDropTarget();
+            }
+            if (!m_meshRendererState.materialSlots[slot].empty())
+                ImGui::TextDisabled("guid: %s", m_meshRendererState.materialSlots[slot].c_str());
+            ImGui::Spacing();
+            ImGui::PopID();
+        }
     }
 
     if (!m_meshRendererState.skinned &&

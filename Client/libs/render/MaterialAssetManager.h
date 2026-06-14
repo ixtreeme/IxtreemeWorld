@@ -71,6 +71,7 @@ public:
     };
 
     static MaterialAssetManager& Instance();
+    static Guid PinkMissingMaterialGuid();
 
     explicit MaterialAssetManager(AssetDatabase& db);
 

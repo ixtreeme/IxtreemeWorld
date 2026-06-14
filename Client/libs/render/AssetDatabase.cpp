@@ -121,6 +121,54 @@ std::optional<int> JsonIntValue(const std::string& object, const std::string& ke
     return static_cast<int>(value);
 }
 
+std::vector<std::string> JsonStringArrayValue(const std::string& object, const std::string& key)
+{
+    std::vector<std::string> values;
+    const std::string needle = "\"" + key + "\"";
+    const size_t keyPos = object.find(needle);
+    if (keyPos == std::string::npos)
+        return values;
+    const size_t begin = object.find('[', keyPos + needle.size());
+    if (begin == std::string::npos)
+        return values;
+
+    bool inString = false;
+    bool escaping = false;
+    std::string current;
+    for (size_t i = begin + 1; i < object.size(); ++i)
+    {
+        const char c = object[i];
+        if (inString)
+        {
+            if (escaping)
+            {
+                current += c;
+                escaping = false;
+            }
+            else if (c == '\\')
+            {
+                escaping = true;
+            }
+            else if (c == '"')
+            {
+                values.push_back(current);
+                current.clear();
+                inString = false;
+            }
+            else
+            {
+                current += c;
+            }
+            continue;
+        }
+        if (c == '"')
+            inString = true;
+        else if (c == ']')
+            return values;
+    }
+    return values;
+}
+
 bool HasJsonObjectShape(const std::string& text)
 {
     const size_t first = text.find_first_not_of(" \t\r\n");
@@ -157,6 +205,80 @@ bool IsIgnoredDirectoryName(const std::filesystem::path& path)
         ".cache",
     };
     return ignored.contains(name);
+}
+
+std::string WithDefaultMaterialsField(std::string text, const std::vector<Guid>& materials)
+{
+    const std::string fieldName = "\"defaultMaterials\"";
+    const size_t fieldPos = text.find(fieldName);
+    if (fieldPos != std::string::npos)
+    {
+        const size_t arrayBegin = text.find('[', fieldPos + fieldName.size());
+        if (arrayBegin != std::string::npos)
+        {
+            int depth = 0;
+            bool inString = false;
+            bool escaping = false;
+            for (size_t i = arrayBegin; i < text.size(); ++i)
+            {
+                const char c = text[i];
+                if (inString)
+                {
+                    if (escaping) escaping = false;
+                    else if (c == '\\') escaping = true;
+                    else if (c == '"') inString = false;
+                    continue;
+                }
+                if (c == '"')
+                    inString = true;
+                else if (c == '[')
+                    ++depth;
+                else if (c == ']' && --depth == 0)
+                {
+                    size_t lineEnd = text.find('\n', i);
+                    if (lineEnd == std::string::npos)
+                        lineEnd = i + 1;
+                    text.erase(fieldPos, lineEnd - fieldPos + (lineEnd < text.size() ? 1 : 0));
+                    break;
+                }
+            }
+        }
+    }
+
+    std::ostringstream field;
+    field << "  \"defaultMaterials\": [";
+    for (size_t i = 0; i < materials.size(); ++i)
+    {
+        if (i)
+            field << ", ";
+        field << "\"" << materials[i].toString() << "\"";
+    }
+    field << "]";
+
+    const size_t importedAt = text.find("\"importedAt\"");
+    if (importedAt != std::string::npos)
+    {
+        const size_t lineBegin = text.rfind('\n', importedAt);
+        const size_t insertPos = lineBegin == std::string::npos ? importedAt : lineBegin + 1;
+        text.insert(insertPos, field.str() + ",\n");
+        return text;
+    }
+
+    const size_t closing = text.find_last_of('}');
+    if (closing != std::string::npos)
+    {
+        size_t insertPos = closing;
+        while (insertPos > 0 && (text[insertPos - 1] == '\n' || text[insertPos - 1] == '\r' ||
+                                text[insertPos - 1] == ' ' || text[insertPos - 1] == '\t'))
+        {
+            --insertPos;
+        }
+        if (insertPos > 0 && text[insertPos - 1] != '{')
+            text.insert(insertPos, ",\n" + field.str());
+        else
+            text.insert(insertPos, "\n" + field.str() + "\n");
+    }
+    return text;
 }
 }
 
@@ -602,6 +724,66 @@ Guid AssetDatabase::getOrCreateGuid(const std::filesystem::path& absPath)
         guid.toString().c_str(),
         AssetTypeName(assetType));
     return guid;
+}
+
+std::vector<Guid> AssetDatabase::loadDefaultMaterials(const std::filesystem::path& modelPath) const
+{
+    std::vector<Guid> materials;
+    const std::filesystem::path assetPath = canonicalPath(modelPath);
+    const std::filesystem::path metaPath = metaPathFor(assetPath);
+    std::ifstream file(metaPath, std::ios::binary);
+    if (!file)
+        return materials;
+    const std::string text((std::istreambuf_iterator<char>(file)), std::istreambuf_iterator<char>());
+    for (const std::string& value : JsonStringArrayValue(text, "defaultMaterials"))
+    {
+        if (const std::optional<Guid> guid = Guid::fromString(value))
+            materials.push_back(*guid);
+    }
+    return materials;
+}
+
+bool AssetDatabase::writeDefaultMaterials(const std::filesystem::path& modelPath, const std::vector<Guid>& materials) const
+{
+    const std::filesystem::path assetPath = canonicalPath(modelPath);
+    if (detectAssetType(assetPath) != AssetType::Model)
+        return false;
+
+    Guid modelGuid{};
+    if (const std::optional<Guid> existing = resolvePath(assetPath))
+        modelGuid = *existing;
+    else
+        modelGuid = const_cast<AssetDatabase*>(this)->getOrCreateGuid(assetPath);
+
+    const std::filesystem::path metaPath = metaPathFor(assetPath);
+    std::string text;
+    {
+        std::ifstream file(metaPath, std::ios::binary);
+        if (file)
+            text.assign(std::istreambuf_iterator<char>(file), std::istreambuf_iterator<char>());
+    }
+    if (text.empty())
+    {
+        std::ostringstream json;
+        json << "{\n"
+             << "  \"guid\": \"" << modelGuid.toString() << "\",\n"
+             << "  \"version\": 1,\n"
+             << "  \"assetType\": \"" << AssetTypeName(AssetType::Model) << "\",\n"
+             << "  \"importedAt\": \"" << EscapeJson(TimestampUtc()) << "\"\n"
+             << "}\n";
+        text = json.str();
+    }
+    text = WithDefaultMaterialsField(text, materials);
+
+    std::ofstream file(metaPath, std::ios::binary | std::ios::trunc);
+    if (!file)
+    {
+        TraceError("[ASSET-DB] error path=%s reason=meta_write_open_failed regenerating=no",
+            displayPath(metaPath).c_str());
+        return false;
+    }
+    file << text;
+    return true;
 }
 
 std::filesystem::path AssetDatabase::canonicalPath(const std::filesystem::path& path) const

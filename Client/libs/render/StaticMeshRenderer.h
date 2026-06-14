@@ -46,6 +46,8 @@ public:
         float normalStrength = 1.0f;
         float aoStrength = 1.0f;
         float emissive[3] = {0.0f, 0.0f, 0.0f};
+        std::string alphaMode = "opaque";
+        float alphaCutoff = 0.5f;
     };
 
     struct Instance
@@ -55,6 +57,7 @@ public:
         float rotation[3] = {0.0f, 0.0f, 0.0f};
         float scale[3] = {1.0f, 1.0f, 1.0f};
         std::array<float, 4> tint = {1.0f, 1.0f, 1.0f, 1.0f};
+        std::vector<std::string> materialSlots;
         std::vector<MeshSceneEntity::MaterialOverride> materialOverrides;
     };
 
@@ -114,6 +117,7 @@ public:
     LodDiagnostics GetLodDiagnostics(std::uint64_t configHash) const;
     std::size_t DrawCount() const { return m_draws.size(); }
     std::uint32_t MaterialSlotCount() const { return std::max<std::uint32_t>(1u, m_materialSlotCount); }
+    void DumpMaterialState(const char* entityName, const Instance& instance) const;
     std::uint32_t LastSubmittedDrawCalls() const { return m_lastSubmittedDrawCalls; }
     std::uint32_t LastSubmittedInstances() const { return m_lastSubmittedInstances; }
     std::uint32_t LastSubmittedIndexCount() const { return m_lastSubmittedIndexCount; }
@@ -149,6 +153,7 @@ private:
         uint32_t firstIndex = 0;
         uint32_t indexCount = 0;
         uint32_t materialSlot = 0;
+        uint32_t vertexCount = 0;
     };
 
     struct LodMeshDraw
