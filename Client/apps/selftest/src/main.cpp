@@ -928,6 +928,13 @@ bool RunRenderChecks(const Options& options, TestContext& ctx)
             mainSource.find("editorImGui.SetSceneViewKeyboardFocus(sceneViewInputTarget)") != std::string::npos &&
             mainSource.find("viewportEvent = editorImGui.MapInputToSceneView(event)") != std::string::npos,
         "scene view routes viewport input", "Scene View must bypass generic ImGui capture and map mouse input into render-target coordinates");
+    ctx.Expect(mainSource.find("ApplyGatedEdge") != std::string::npos &&
+            mainSource.find("editorLastMouseX") != std::string::npos &&
+            mainSource.find("viewportDiag.sceneViewRectValid") != std::string::npos &&
+            mainSource.find("editorImGui.IsTextInputActive()") != std::string::npos &&
+            mainSource.find("viewportHovered && !wantCaptureKeyboard") != std::string::npos &&
+            mainSource.find("[EDITOR-CAMERA] viewport_input_gate enabled") != std::string::npos,
+        "editor camera movement is viewport gated", "Editor fly-camera movement keys must activate only on viewport-hovered key-down edges outside ImGui keyboard capture");
     const std::filesystem::path nativeWindowWin32Path = options.clientRoot / "libs" / "platform" / "NativeWindow_Win32.cpp";
     std::ifstream nativeWindowWin32(nativeWindowWin32Path);
     std::stringstream nativeWindowWin32Text;
@@ -937,6 +944,8 @@ bool RunRenderChecks(const Options& options, TestContext& ctx)
             nativeWindowWin32Source.find("WM_KEYDOWN") != std::string::npos &&
             nativeWindowWin32Source.find("WantCapture gate before viewport tools") != std::string::npos,
         "win32 dispatches viewport keyboard input", "Win32 input must dispatch key events to the engine even when ImGui consumes the native message");
+    ctx.Expect(nativeWindowWin32Source.find("ShowWindow(m_hwnd, SW_MAXIMIZE)") != std::string::npos,
+        "win32 starts maximized", "The desktop editor window must open maximized while keeping the normal overlapped window border");
     ctx.Expect(mainSource.find("offscreenScene.SnapshotScene") != std::string::npos &&
             mainSource.find("terrain.SetWaterRefractionInputs") != std::string::npos &&
             mainSource.find("offscreenScene.BeginMainPass(device, false)") != std::string::npos,
@@ -1281,25 +1290,30 @@ bool RunRenderChecks(const Options& options, TestContext& ctx)
             editorImGuiSource.find("UI::IconButton(ICON_FA_FOLDER_PLUS") != std::string::npos &&
             editorImGuiSource.find("UI::IconButton(ICON_FA_TRASH") != std::string::npos &&
             editorImGuiSource.find("UI::SectionHeader") != std::string::npos &&
-            clientMainSource.find("IxtreemeWorld Engine - Editor") != std::string::npos &&
+            clientMainSource.find("Ixtreeme Engine - Editor") != std::string::npos &&
             clientMainSource.find("Standalone Vulkan Clear - gameClient Overlay") == std::string::npos,
         "editor icon buttons and title", "EDITOR-VISUAL-POLISH must iconize editor controls and rename the window title");
-    ctx.Expect(editorImGuiSource.find("ImGui::Button(label)") != std::string::npos &&
-            editorImGuiSource.find("m_assetFilter = filter") != std::string::npos &&
-            editorImGuiSource.find("m_assetSubpath.clear()") != std::string::npos &&
-            editorImGuiSource.find("ImGuiTabItemFlags_SetSelected") == std::string::npos,
-        "asset browser category tabs", "asset browser category buttons must drive the editor filter directly instead of forcing ImGui tab selection");
-    ctx.Expect(editorImGuiSource.find("BeginTable(\"AssetGridTiles\"") != std::string::npos &&
+    ctx.Expect(editorImGuiSource.find("RenderAssetBrowserFolderTree") != std::string::npos &&
+            editorImGuiSource.find("RenderAssetBrowserContent") != std::string::npos &&
+            editorImGuiSource.find("RenderAssetBrowserBreadcrumb") != std::string::npos &&
+            editorImGuiSource.find("BeginTable(\"AssetBrowserLayout\", 2") != std::string::npos &&
+            editorImGuiSource.find("RenderAssetTypeTabs();") == std::string::npos,
+        "asset browser unity layout", "ASSET-BROWSER-UNITY-1 must replace category tabs with a folder tree, content view, and breadcrumb");
+    ctx.Expect(editorImGuiSource.find("BeginTable(\"AssetBrowserUnityGrid\"") != std::string::npos &&
             editorImGuiSource.find("TableSetupColumn(nullptr, ImGuiTableColumnFlags_WidthFixed, cellWidth)") != std::string::npos &&
             editorImGuiSource.find("ImGui::TableNextColumn()") != std::string::npos &&
             editorImGuiSource.find("ShortAssetFilename") != std::string::npos &&
             editorImGuiSource.find("constexpr size_t kVisibleCharacters = 10") != std::string::npos,
         "asset browser grid wrapping", "asset browser tiles must wrap inside fixed grid cells instead of extending horizontally past the Tags panel");
-    ctx.Expect(editorImGuiSource.find("BeginChild(\"AssetFoldersScroll\"") != std::string::npos &&
-            editorImGuiSource.find("BeginChild(\"AssetGridScroll\"") != std::string::npos &&
-            editorImGuiSource.find("BeginChild(\"AssetTagsScroll\"") != std::string::npos &&
+    ctx.Expect(editorImGuiSource.find("BeginChild(\"AssetFolderTreeScroll\"") != std::string::npos &&
+            editorImGuiSource.find("BeginChild(\"AssetContentScroll\"") != std::string::npos &&
+            editorImGuiSource.find("BeginChild(\"AssetTagsScroll\"") == std::string::npos &&
             editorImGuiSource.find("browserPanelHeight") != std::string::npos,
-        "asset browser independent scroll zones", "asset browser folders, grid, and tags columns must scroll independently when content overflows");
+        "asset browser independent scroll zones", "asset browser folder tree and content view must scroll independently when content overflows");
+    ctx.Expect(editorImGuiSource.find("platform::move_to_trash") != std::string::npos &&
+            editorImGuiSource.find("MetaSidecarPath") != std::string::npos &&
+            editorImGuiSource.find("kAssetFolderPayloadType") != std::string::npos,
+        "asset browser file ops", "ASSET-BROWSER-UNITY-1 must route delete through platform trash, move .meta sidecars, and support folder drag payloads");
     ctx.Expect(editorImGuiHeaderSource.find("AssetPreviewTexture") != std::string::npos &&
             editorImGuiSource.find("LoadAssetPreviewTexture") != std::string::npos &&
             editorImGuiSource.find("ImGui_ImplVulkan_AddTexture") != std::string::npos &&
@@ -1351,7 +1365,7 @@ bool RunRenderChecks(const Options& options, TestContext& ctx)
     ctx.Expect(sceneManagerSource.find("MarkDirty") != std::string::npos &&
             sceneManagerSource.find("PromptSaveBeforeAction") != std::string::npos &&
             sceneManagerHeaderSource.find("GetRecentScenes") != std::string::npos &&
-            sceneManagerSource.find("IxtreemeWorld Engine - Editor") != std::string::npos &&
+            sceneManagerSource.find("Ixtreeme Engine - Editor") != std::string::npos &&
             sceneManagerSource.find("title += \"*\"") != std::string::npos &&
             nativeWindowHeaderSource.find("SetTitle") != std::string::npos &&
             clientMainSource.find("SetWindowTitleCallback") != std::string::npos,

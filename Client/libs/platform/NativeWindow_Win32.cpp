@@ -185,7 +185,7 @@ bool NativeWindow_Win32::Create(HINSTANCE instance, const char* title, uint32_t 
     if (!m_hwnd)
         return false;
 
-    ShowWindow(m_hwnd, SW_SHOW);
+    ShowWindow(m_hwnd, SW_MAXIMIZE);
     UpdateWindow(m_hwnd);
     DragAcceptFiles(m_hwnd, TRUE);
 

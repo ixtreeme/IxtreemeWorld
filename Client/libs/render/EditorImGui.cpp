@@ -1,9 +1,12 @@
 #include "EditorImGui.h"
 
+#include "AssetDatabase.h"
+#include "AssetWatcher.h"
 #include "Debug.h"
 #include "ProjectManager.h"
 #include "SceneManager.h"
 #include "VulkanDevice.h"
+#include "platform/trash.h"
 
 #if defined(IXTREEME_WITH_EDITOR) && defined(_WIN32)
 #include "IconsFontAwesome6.h"
@@ -39,6 +42,7 @@ namespace
 constexpr uint32_t kMinImageCount = 2;
 constexpr const char* kLayoutFile = "editor_layout.ini";
 constexpr const char* kAssetPayloadType = "ASSET_ID";
+constexpr const char* kAssetFolderPayloadType = "ASSET_FOLDER_PATH";
 constexpr const char* kEditorNoteComponentId = "editor.note";
 constexpr const char* kLodComponentId = "rendering.lod";
 
@@ -189,6 +193,41 @@ bool IsDirectChildFolder(const std::string& parent, const std::string& child)
     if (normalizedChild.rfind(normalizedParent + "/", 0) != 0)
         return false;
     return normalizedChild.find('/', normalizedParent.size() + 1) == std::string::npos;
+}
+
+std::filesystem::path MetaSidecarPath(const std::filesystem::path& path)
+{
+    return std::filesystem::path(path.string() + ".meta");
+}
+
+bool IsMetaFile(const std::filesystem::path& path)
+{
+    return path.extension() == ".meta";
+}
+
+std::string UniqueFolderName(const std::filesystem::path& parent)
+{
+    std::error_code ec;
+    const std::string base = "New Folder";
+    if (!std::filesystem::exists(parent / base, ec))
+        return base;
+    for (int i = 2; i < 1000; ++i)
+    {
+        const std::string candidate = base + " " + std::to_string(i);
+        ec.clear();
+        if (!std::filesystem::exists(parent / candidate, ec))
+            return candidate;
+    }
+    return base + " 1000";
+}
+
+bool IsSubpathOrSelf(const std::string& maybeChild, const std::string& maybeParent)
+{
+    const std::string child = AssetLibrary::NormalizeSubpath(maybeChild);
+    const std::string parent = AssetLibrary::NormalizeSubpath(maybeParent);
+    if (parent.empty())
+        return true;
+    return child == parent || child.rfind(parent + "/", 0) == 0;
 }
 
 bool CheckEditorVk(VkResult result, const char* call)
@@ -1049,6 +1088,93 @@ std::vector<std::pair<std::string, std::uint32_t>> EditorImGui::QueryVisibleTags
     return result;
 }
 
+std::filesystem::path EditorImGui::AssetBrowserRoot() const
+{
+    return m_assetLibrary ? m_assetLibrary->LibraryRoot() : std::filesystem::path{};
+}
+
+std::filesystem::path EditorImGui::AssetBrowserPath(const std::string& subpath) const
+{
+    return AssetBrowserRoot() / AssetLibrary::NormalizeSubpath(subpath);
+}
+
+std::string EditorImGui::AssetBrowserSubpath(const std::filesystem::path& path) const
+{
+    const std::filesystem::path root = AssetBrowserRoot();
+    if (root.empty())
+        return {};
+    std::error_code ec;
+    const std::filesystem::path relative = std::filesystem::relative(path, root, ec);
+    if (ec)
+        return {};
+    return AssetLibrary::NormalizeSubpath(relative.generic_string());
+}
+
+void EditorImGui::SelectAssetBrowserFolder(const std::string& subpath)
+{
+    m_assetSubpath = AssetLibrary::NormalizeSubpath(subpath);
+    m_selectedAssetId.clear();
+    m_activeAssetTags.clear();
+}
+
+std::vector<std::string> EditorImGui::QueryFilesystemChildFolders(const std::string& subpath) const
+{
+    std::vector<std::string> folders;
+    const std::filesystem::path directory = AssetBrowserPath(subpath);
+    std::error_code ec;
+    if (!std::filesystem::exists(directory, ec) || !std::filesystem::is_directory(directory, ec))
+        return folders;
+
+    for (const auto& entry : std::filesystem::directory_iterator(directory, std::filesystem::directory_options::skip_permission_denied, ec))
+    {
+        if (ec)
+            break;
+        std::error_code itemEc;
+        if (!entry.is_directory(itemEc))
+            continue;
+        folders.push_back(AssetBrowserSubpath(entry.path()));
+    }
+    std::sort(folders.begin(), folders.end(), [](const std::string& a, const std::string& b) {
+        return ToLowerAscii(FolderDisplayName(a)) < ToLowerAscii(FolderDisplayName(b));
+    });
+    return folders;
+}
+
+std::vector<AssetLibrary::Entry> EditorImGui::QueryFilesystemAssetsInFolder(const std::string& subpath) const
+{
+    std::vector<AssetLibrary::Entry> result;
+    if (!m_assetLibrary)
+        return result;
+
+    const std::string target = ComparablePath(AssetBrowserPath(subpath));
+    auto addIfInFolder = [&](const AssetLibrary::Entry& entry, const std::filesystem::path& absolutePath) {
+        if (absolutePath.empty() || IsMetaFile(absolutePath))
+            return;
+        if (ComparablePath(absolutePath.parent_path()) == target)
+            result.push_back(entry);
+    };
+
+    for (const AssetLibrary::Entry& entry : m_assetLibrary->Entries())
+        addIfInFolder(entry, m_assetLibrary->AbsolutePath(entry));
+
+    for (const AssetLibrary::Entry& entry : QuerySceneAssets())
+    {
+        if (entry.originalPath.empty())
+            continue;
+        const std::filesystem::path scenePath(entry.originalPath);
+        const std::string sceneComparable = ComparablePath(scenePath);
+        const std::string rootComparable = ComparablePath(AssetBrowserRoot());
+        if (sceneComparable.rfind(rootComparable + "/", 0) == 0)
+            addIfInFolder(entry, scenePath);
+    }
+
+    std::sort(result.begin(), result.end(), [](const AssetLibrary::Entry& a, const AssetLibrary::Entry& b) {
+        return ToLowerAscii(a.filename.empty() ? a.displayName : a.filename) <
+            ToLowerAscii(b.filename.empty() ? b.displayName : b.filename);
+    });
+    return result;
+}
+
 void EditorImGui::DestroyAssetPreviewTexture(AssetPreviewTexture& texture)
 {
     if (texture.descriptor)
@@ -1426,6 +1552,248 @@ void EditorImGui::DeleteAsset(const AssetLibrary::Entry& entry)
     Tracenf("[EDITOR-IMGUI-3] Asset deleted: asset_id=%s type=%s",
         deletedId.c_str(),
         AssetLibrary::CategoryName(entry.category));
+}
+
+void EditorImGui::CreateFilesystemFolder(const std::string& parentSubpath, const std::string& requestedName)
+{
+    const std::filesystem::path parent = AssetBrowserPath(parentSubpath);
+    const std::string name = requestedName.empty() ? UniqueFolderName(parent) : requestedName;
+    if (!AssetLibrary::IsValidRenameName(name))
+    {
+        m_assetStatus = "Folder create failed: invalid name";
+        return;
+    }
+
+    std::error_code ec;
+    const std::filesystem::path created = parent / name;
+    std::filesystem::create_directories(created, ec);
+    if (ec)
+    {
+        m_assetStatus = "Folder create failed: " + ec.message();
+        return;
+    }
+    RefreshAssetLibrary();
+    SelectAssetBrowserFolder(AssetBrowserSubpath(created));
+    m_assetStatus = "Folder created: " + name;
+    Tracenf("[EDITOR-ASSET-BROWSER] folder_created path=Assets/%s",
+        AssetBrowserSubpath(created).c_str());
+}
+
+void EditorImGui::BeginAssetRename(const AssetLibrary::Entry& entry)
+{
+    if (!m_assetLibrary)
+        return;
+    const std::filesystem::path path = entry.originalPath.empty() ? m_assetLibrary->AbsolutePath(entry) : std::filesystem::path(entry.originalPath);
+    m_assetRenamePath = path.generic_string();
+    m_assetRenameIsFolder = false;
+    CopyToBuffer(m_assetRenameBuffer, sizeof(m_assetRenameBuffer), path.filename().string());
+    m_assetOpenRenamePopup = true;
+}
+
+void EditorImGui::BeginFolderRename(const std::string& subpath)
+{
+    if (subpath.empty())
+        return;
+    const std::filesystem::path path = AssetBrowserPath(subpath);
+    m_assetRenamePath = path.generic_string();
+    m_assetRenameIsFolder = true;
+    CopyToBuffer(m_assetRenameBuffer, sizeof(m_assetRenameBuffer), path.filename().string());
+    m_assetOpenRenamePopup = true;
+}
+
+void EditorImGui::RenameFilesystemSelection()
+{
+    if (m_assetRenamePath.empty())
+        return;
+    const std::filesystem::path source(m_assetRenamePath);
+    const std::string requested = m_assetRenameBuffer;
+    if (!AssetLibrary::IsValidRenameName(std::filesystem::path(requested).stem().string()))
+    {
+        m_assetStatus = "Rename failed: invalid name";
+        return;
+    }
+
+    std::filesystem::path targetName(requested);
+    if (!m_assetRenameIsFolder && targetName.extension().empty())
+        targetName += source.extension();
+    const std::filesystem::path destination = source.parent_path() / targetName.filename();
+    std::error_code ec;
+    if (std::filesystem::exists(destination, ec))
+    {
+        m_assetStatus = "Rename failed: target already exists";
+        return;
+    }
+
+    bool metaMoved = false;
+    const std::filesystem::path sourceMeta = MetaSidecarPath(source);
+    const std::filesystem::path destinationMeta = MetaSidecarPath(destination);
+    if (!m_assetRenameIsFolder && std::filesystem::exists(sourceMeta, ec))
+    {
+        std::filesystem::rename(sourceMeta, destinationMeta, ec);
+        if (ec)
+        {
+            m_assetStatus = "Rename failed moving .meta: " + ec.message();
+            return;
+        }
+        metaMoved = true;
+    }
+
+    std::filesystem::rename(source, destination, ec);
+    if (ec)
+    {
+        if (metaMoved)
+        {
+            std::error_code rollbackEc;
+            std::filesystem::rename(destinationMeta, sourceMeta, rollbackEc);
+        }
+        m_assetStatus = "Rename failed: " + ec.message();
+        return;
+    }
+
+    RefreshAssetLibrary();
+    if (m_assetRenameIsFolder && AssetLibrary::NormalizeSubpath(m_assetSubpath).rfind(AssetBrowserSubpath(source), 0) == 0)
+        SelectAssetBrowserFolder(AssetBrowserSubpath(destination));
+    m_assetStatus = "Renamed: " + destination.filename().string();
+    Tracenf("[EDITOR-ASSET-BROWSER] renamed src=%s dst=%s metaMoved=%s",
+        source.generic_string().c_str(),
+        destination.generic_string().c_str(),
+        metaMoved ? "yes" : "no");
+}
+
+void EditorImGui::DeleteFilesystemSelection()
+{
+    if (m_assetDeletePath.empty())
+        return;
+    const std::filesystem::path path(m_assetDeletePath);
+    std::string error;
+    bool metaDeleted = false;
+    if (!m_assetDeleteIsFolder)
+    {
+        const std::filesystem::path meta = MetaSidecarPath(path);
+        std::error_code ec;
+        if (std::filesystem::exists(meta, ec))
+        {
+            if (!platform::move_to_trash(meta, &error))
+            {
+                m_assetStatus = "Delete .meta failed: " + error;
+                return;
+            }
+            metaDeleted = true;
+        }
+    }
+
+    if (!platform::move_to_trash(path, &error))
+    {
+        m_assetStatus = "Delete failed: " + error;
+        return;
+    }
+
+    if (m_assetDeleteIsFolder && IsSubpathOrSelf(m_assetSubpath, AssetBrowserSubpath(path)))
+        SelectAssetBrowserFolder(ParentSubpath(AssetBrowserSubpath(path)));
+    if (!m_assetDeleteIsFolder)
+        m_selectedAssetId.clear();
+    RefreshAssetLibrary();
+    m_assetStatus = "Deleted: " + path.filename().string();
+    Tracenf("[EDITOR-ASSET-BROWSER] deleted path=Assets/%s metaDeleted=%s targetTrash=ok",
+        AssetBrowserSubpath(path).c_str(),
+        metaDeleted ? "yes" : "no");
+}
+
+bool EditorImGui::MoveAssetEntryToFolder(const std::string& assetId, const std::string& targetFolderSubpath)
+{
+    if (!m_assetLibrary)
+        return false;
+    auto entry = m_assetLibrary->FindById(assetId);
+    if (!entry)
+        return false;
+    const std::filesystem::path source = entry->originalPath.empty() ? m_assetLibrary->AbsolutePath(*entry) : std::filesystem::path(entry->originalPath);
+    const std::filesystem::path targetFolder = AssetBrowserPath(targetFolderSubpath);
+    const std::filesystem::path destination = targetFolder / source.filename();
+    std::error_code ec;
+    if (ComparablePath(source.parent_path()) == ComparablePath(targetFolder))
+        return true;
+    if (std::filesystem::exists(destination, ec))
+    {
+        m_assetStatus = "Move failed: target already exists";
+        Tracenf("[EDITOR-ASSET-BROWSER] move_failed reason=target_exists src=%s dst=%s",
+            source.generic_string().c_str(),
+            destination.generic_string().c_str());
+        return false;
+    }
+    std::filesystem::create_directories(targetFolder, ec);
+    if (ec)
+    {
+        m_assetStatus = "Move failed: " + ec.message();
+        return false;
+    }
+
+    bool metaMoved = false;
+    const std::filesystem::path sourceMeta = MetaSidecarPath(source);
+    const std::filesystem::path destinationMeta = MetaSidecarPath(destination);
+    if (std::filesystem::exists(sourceMeta, ec))
+    {
+        std::filesystem::rename(sourceMeta, destinationMeta, ec);
+        if (ec)
+        {
+            m_assetStatus = "Move failed moving .meta: " + ec.message();
+            return false;
+        }
+        metaMoved = true;
+    }
+
+    std::filesystem::rename(source, destination, ec);
+    if (ec)
+    {
+        if (metaMoved)
+        {
+            std::error_code rollbackEc;
+            std::filesystem::rename(destinationMeta, sourceMeta, rollbackEc);
+        }
+        m_assetStatus = "Move failed: " + ec.message();
+        return false;
+    }
+    RefreshAssetLibrary();
+    m_assetStatus = "Moved: " + source.filename().string();
+    Tracenf("[EDITOR-ASSET-BROWSER] moved src=%s dst=%s metaMoved=%s",
+        source.generic_string().c_str(),
+        destination.generic_string().c_str(),
+        metaMoved ? "yes" : "no");
+    return true;
+}
+
+bool EditorImGui::MoveFolderToFolder(const std::string& sourceSubpath, const std::string& targetFolderSubpath)
+{
+    const std::string sourceNorm = AssetLibrary::NormalizeSubpath(sourceSubpath);
+    const std::string targetNorm = AssetLibrary::NormalizeSubpath(targetFolderSubpath);
+    if (sourceNorm.empty() || IsSubpathOrSelf(targetNorm, sourceNorm))
+        return false;
+
+    const std::filesystem::path source = AssetBrowserPath(sourceNorm);
+    if (ComparablePath(source.parent_path()) == ComparablePath(AssetBrowserPath(targetNorm)))
+        return true;
+    const std::filesystem::path destination = AssetBrowserPath(targetNorm) / source.filename();
+    std::error_code ec;
+    if (std::filesystem::exists(destination, ec))
+    {
+        m_assetStatus = "Move failed: target already exists";
+        Tracenf("[EDITOR-ASSET-BROWSER] move_failed reason=target_exists src=%s dst=%s",
+            source.generic_string().c_str(),
+            destination.generic_string().c_str());
+        return false;
+    }
+    std::filesystem::rename(source, destination, ec);
+    if (ec)
+    {
+        m_assetStatus = "Move failed: " + ec.message();
+        return false;
+    }
+    RefreshAssetLibrary();
+    if (IsSubpathOrSelf(m_assetSubpath, sourceNorm))
+        SelectAssetBrowserFolder(AssetBrowserSubpath(destination));
+    Tracenf("[EDITOR-ASSET-BROWSER] moved src=%s dst=%s metaMoved=folder_subtree",
+        source.generic_string().c_str(),
+        destination.generic_string().c_str());
+    return true;
 }
 
 void EditorImGui::SetToolMode(MapEditorToolMode mode)
@@ -2201,6 +2569,8 @@ void EditorImGui::ActivateCurrentProject()
     if (!projects.HasProject())
         return;
 
+    AssetDatabase::Instance().scan(projects.ProjectRoot());
+    AssetWatcher::Instance().start(projects.ProjectRoot());
     InitializeProjectAssetLibrary(projects.ProjectRoot(), projects.AssetRootPath());
     SceneManager::Instance().CloseScene();
     const bool openedScene = LoadProjectStartupScene();
@@ -2302,6 +2672,7 @@ bool EditorImGui::CreateDefaultProjectScene()
         return false;
     }
 
+    AssetDatabase::Instance().getOrCreateGuid(scenePath);
     Tracenf("[PROJECT] default scene created: %s", scenePath.string().c_str());
     return true;
 }
@@ -2610,7 +2981,7 @@ void EditorImGui::RenderMenuBar()
     }
     if (ImGui::BeginMenu("Help"))
     {
-        ImGui::MenuItem("About IxtreemeWorld Engine", nullptr, false, false);
+        ImGui::MenuItem("About IxtreemeEngine", nullptr, false, false);
         ImGui::EndMenu();
     }
 
@@ -4641,15 +5012,6 @@ void EditorImGui::RenderAssetBrowserToolbar()
         CreateWaterMaterialAsset();
 
     ImGui::SameLine();
-    ImGui::SetNextItemWidth(220.0f);
-    ImGui::InputTextWithHint("##asset_search", "Search assets...", m_assetSearchBuffer, sizeof(m_assetSearchBuffer));
-    ImGui::SameLine();
-    if (UI::IconButton(ICON_FA_XMARK, "Clear"))
-    {
-        m_assetSearchBuffer[0] = '\0';
-        m_activeAssetTags.clear();
-    }
-    ImGui::SameLine();
     if (UI::IconButton(ICON_FA_ROTATE, "Refresh"))
         RefreshAssetLibrary();
 }
@@ -4908,8 +5270,20 @@ void EditorImGui::RenderAssetTile(const AssetLibrary::Entry& entry, float tileSi
     if (ImGui::BeginPopupContextItem("AssetTileContext"))
     {
         ImGui::TextDisabled("%s", entry.displayName.c_str());
+        if (ImGui::MenuItem("Rename"))
+            BeginAssetRename(entry);
+        if (ImGui::MenuItem("Delete"))
+        {
+            const std::filesystem::path path = entry.originalPath.empty() && m_assetLibrary
+                ? m_assetLibrary->AbsolutePath(entry)
+                : std::filesystem::path(entry.originalPath);
+            m_assetDeletePath = path.generic_string();
+            m_assetDeleteIsFolder = false;
+            m_assetOpenDeletePopup = true;
+        }
         if (entry.category == AssetLibrary::Category::Scene)
         {
+            ImGui::Separator();
             if (ImGui::MenuItem("Add to Hierarchy"))
                 AttachSceneToHierarchy(entry);
         }
@@ -4920,9 +5294,6 @@ void EditorImGui::RenderAssetTile(const AssetLibrary::Entry& entry, float tileSi
                 CreatePbrMaterialAsset();
             if (ImGui::MenuItem("New Water Material"))
                 CreateWaterMaterialAsset();
-            ImGui::Separator();
-            if (ImGui::MenuItem("Delete Asset"))
-                DeleteAsset(entry);
         }
         ImGui::EndPopup();
     }
@@ -5018,6 +5389,289 @@ void EditorImGui::RenderAssetGrid()
     }
 }
 
+void EditorImGui::RenderAssetBrowserFolderTreeNode(const std::string& subpath)
+{
+    const std::string normalized = AssetLibrary::NormalizeSubpath(subpath);
+    ImGui::PushID(normalized.empty() ? "__assets_root__" : normalized.c_str());
+    const std::vector<std::string> children = QueryFilesystemChildFolders(normalized);
+    ImGuiTreeNodeFlags flags = ImGuiTreeNodeFlags_OpenOnArrow | ImGuiTreeNodeFlags_SpanAvailWidth;
+    if (children.empty())
+        flags |= ImGuiTreeNodeFlags_Leaf;
+    if (AssetLibrary::NormalizeSubpath(m_assetSubpath) == normalized)
+        flags |= ImGuiTreeNodeFlags_Selected;
+    const std::string label = normalized.empty() ? (std::string(ICON_FA_FOLDER_OPEN) + " Assets")
+        : (std::string(ICON_FA_FOLDER) + " " + FolderDisplayName(normalized));
+    const bool open = ImGui::TreeNodeEx(label.c_str(), flags);
+    if (ImGui::IsItemClicked() && !ImGui::IsItemToggledOpen())
+        SelectAssetBrowserFolder(normalized);
+
+    if (!normalized.empty() && ImGui::BeginDragDropSource())
+    {
+        ImGui::SetDragDropPayload(kAssetFolderPayloadType, normalized.data(), normalized.size());
+        ImGui::Text("%s", FolderDisplayName(normalized).c_str());
+        ImGui::EndDragDropSource();
+    }
+
+    if (ImGui::BeginDragDropTarget())
+    {
+        if (const ImGuiPayload* payload = ImGui::AcceptDragDropPayload(kAssetPayloadType))
+        {
+            const std::string assetId(static_cast<const char*>(payload->Data), payload->DataSize);
+            MoveAssetEntryToFolder(assetId, normalized);
+        }
+        if (const ImGuiPayload* payload = ImGui::AcceptDragDropPayload(kAssetFolderPayloadType))
+        {
+            const std::string source(static_cast<const char*>(payload->Data), payload->DataSize);
+            MoveFolderToFolder(source, normalized);
+        }
+        ImGui::EndDragDropTarget();
+    }
+
+    if (ImGui::BeginPopupContextItem("FolderTreeContext"))
+    {
+        if (ImGui::MenuItem("New Folder"))
+        {
+            m_assetNewFolderParent = normalized;
+            CopyToBuffer(m_newAssetFolderName, sizeof(m_newAssetFolderName), UniqueFolderName(AssetBrowserPath(normalized)));
+            m_assetOpenNewFolderPopup = true;
+        }
+        if (!normalized.empty() && ImGui::MenuItem("Rename"))
+            BeginFolderRename(normalized);
+        if (!normalized.empty() && ImGui::MenuItem("Delete"))
+        {
+            m_assetDeletePath = AssetBrowserPath(normalized).generic_string();
+            m_assetDeleteIsFolder = true;
+            m_assetOpenDeletePopup = true;
+        }
+        ImGui::EndPopup();
+    }
+
+    if (open)
+    {
+        for (const std::string& child : children)
+            RenderAssetBrowserFolderTreeNode(child);
+        ImGui::TreePop();
+    }
+    ImGui::PopID();
+}
+
+void EditorImGui::RenderAssetBrowserFolderTree()
+{
+    RenderAssetBrowserFolderTreeNode("");
+}
+
+void EditorImGui::RenderAssetBrowserBreadcrumb()
+{
+    if (ImGui::SmallButton("Assets"))
+        SelectAssetBrowserFolder("");
+    std::filesystem::path current(m_assetSubpath);
+    std::string acc;
+    for (const auto& part : current)
+    {
+        const std::string segment = part.generic_string();
+        if (segment.empty() || segment == ".")
+            continue;
+        acc = acc.empty() ? segment : acc + "/" + segment;
+        ImGui::SameLine();
+        ImGui::TextDisabled(">");
+        ImGui::SameLine();
+        if (AssetLibrary::NormalizeSubpath(acc) == AssetLibrary::NormalizeSubpath(m_assetSubpath))
+            ImGui::TextUnformatted(segment.c_str());
+        else if (ImGui::SmallButton(segment.c_str()))
+            SelectAssetBrowserFolder(acc);
+    }
+}
+
+void EditorImGui::RenderAssetBrowserFolderTile(const std::string& subpath, float tileSize)
+{
+    ImGui::PushID(subpath.c_str());
+    const bool selected = m_selectedAssetId == ("folder:" + subpath);
+    const ImVec2 previewMin = ImGui::GetCursorScreenPos();
+    const ImVec2 previewMax(previewMin.x + tileSize, previewMin.y + tileSize);
+    ImGui::InvisibleButton("##folder_tile", ImVec2(tileSize, tileSize));
+    const bool clicked = ImGui::IsItemClicked(ImGuiMouseButton_Left);
+    const bool doubleClicked = ImGui::IsItemHovered() && ImGui::IsMouseDoubleClicked(ImGuiMouseButton_Left);
+    const bool hovered = ImGui::IsItemHovered();
+    ImDrawList* drawList = ImGui::GetWindowDrawList();
+    drawList->AddRectFilled(previewMin, previewMax, hovered ? IM_COL32(88, 96, 112, 255) : IM_COL32(72, 78, 92, 255), 5.0f);
+    const char* icon = ICON_FA_FOLDER;
+    if (UI::GetEditorFonts().bold)
+        ImGui::PushFont(UI::GetEditorFonts().bold);
+    const ImVec2 iconSize = ImGui::CalcTextSize(icon);
+    drawList->AddText(ImVec2(previewMin.x + (tileSize - iconSize.x) * 0.5f, previewMin.y + (tileSize - iconSize.y) * 0.5f),
+        IM_COL32(245, 248, 255, 235),
+        icon);
+    if (UI::GetEditorFonts().bold)
+        ImGui::PopFont();
+    drawList->AddRect(previewMin, previewMax,
+        selected ? IM_COL32(255, 210, 92, 255) : IM_COL32(55, 60, 70, 255),
+        5.0f,
+        0,
+        selected ? 3.0f : 1.0f);
+    if (clicked)
+    {
+        m_selectedAssetId = "folder:" + subpath;
+        if (doubleClicked)
+            SelectAssetBrowserFolder(subpath);
+    }
+    if (ImGui::BeginDragDropSource())
+    {
+        ImGui::SetDragDropPayload(kAssetFolderPayloadType, subpath.data(), subpath.size());
+        ImGui::Text("%s", FolderDisplayName(subpath).c_str());
+        ImGui::EndDragDropSource();
+    }
+    if (ImGui::BeginDragDropTarget())
+    {
+        if (const ImGuiPayload* payload = ImGui::AcceptDragDropPayload(kAssetPayloadType))
+        {
+            const std::string assetId(static_cast<const char*>(payload->Data), payload->DataSize);
+            MoveAssetEntryToFolder(assetId, subpath);
+        }
+        if (const ImGuiPayload* payload = ImGui::AcceptDragDropPayload(kAssetFolderPayloadType))
+        {
+            const std::string source(static_cast<const char*>(payload->Data), payload->DataSize);
+            MoveFolderToFolder(source, subpath);
+        }
+        ImGui::EndDragDropTarget();
+    }
+    if (ImGui::BeginPopupContextItem("FolderTileContext"))
+    {
+        if (ImGui::MenuItem("New Folder"))
+        {
+            m_assetNewFolderParent = subpath;
+            CopyToBuffer(m_newAssetFolderName, sizeof(m_newAssetFolderName), UniqueFolderName(AssetBrowserPath(subpath)));
+            m_assetOpenNewFolderPopup = true;
+        }
+        if (ImGui::MenuItem("Rename"))
+            BeginFolderRename(subpath);
+        if (ImGui::MenuItem("Delete"))
+        {
+            m_assetDeletePath = AssetBrowserPath(subpath).generic_string();
+            m_assetDeleteIsFolder = true;
+            m_assetOpenDeletePopup = true;
+        }
+        ImGui::EndPopup();
+    }
+    ImGui::TextUnformatted(FolderDisplayName(subpath).c_str());
+    ImGui::PopID();
+}
+
+void EditorImGui::RenderAssetBrowserContent()
+{
+    RenderAssetBrowserBreadcrumb();
+    ImGui::Separator();
+    const std::vector<std::string> folders = QueryFilesystemChildFolders(m_assetSubpath);
+    const std::vector<AssetLibrary::Entry> assets = QueryFilesystemAssetsInFolder(m_assetSubpath);
+    ImGui::Text("%zu assets, %zu folders | Assets%s%s",
+        assets.size(),
+        folders.size(),
+        m_assetSubpath.empty() ? "" : "/",
+        m_assetSubpath.c_str());
+    ImGui::Separator();
+
+    const float tileSize = 76.0f;
+    const float cellWidth = 128.0f;
+    const float panelWidth = std::max(1.0f, ImGui::GetContentRegionAvail().x);
+    const int columns = std::max(1, static_cast<int>(panelWidth / (cellWidth + ImGui::GetStyle().ItemSpacing.x)));
+    if (ImGui::BeginTable("AssetBrowserUnityGrid", columns, ImGuiTableFlags_SizingFixedSame | ImGuiTableFlags_NoSavedSettings))
+    {
+        for (int i = 0; i < columns; ++i)
+            ImGui::TableSetupColumn(nullptr, ImGuiTableColumnFlags_WidthFixed, cellWidth);
+        for (const std::string& folder : folders)
+        {
+            ImGui::TableNextColumn();
+            ImGui::BeginGroup();
+            RenderAssetBrowserFolderTile(folder, tileSize);
+            ImGui::EndGroup();
+        }
+        for (const AssetLibrary::Entry& entry : assets)
+        {
+            ImGui::TableNextColumn();
+            ImGui::BeginGroup();
+            RenderAssetTile(entry, tileSize);
+            ImGui::EndGroup();
+        }
+        ImGui::EndTable();
+    }
+    if (folders.empty() && assets.empty())
+        ImGui::TextDisabled("Empty folder.");
+
+    if (ImGui::BeginPopupContextWindow("AssetBrowserContentContext", ImGuiPopupFlags_MouseButtonRight | ImGuiPopupFlags_NoOpenOverItems))
+    {
+        if (ImGui::MenuItem("New Folder"))
+        {
+            m_assetNewFolderParent = m_assetSubpath;
+            CopyToBuffer(m_newAssetFolderName, sizeof(m_newAssetFolderName), UniqueFolderName(AssetBrowserPath(m_assetSubpath)));
+            m_assetOpenNewFolderPopup = true;
+        }
+        if (ImGui::MenuItem("New Material"))
+            CreatePbrMaterialAsset();
+        if (ImGui::MenuItem("New Water Material"))
+            CreateWaterMaterialAsset();
+        ImGui::EndPopup();
+    }
+}
+
+void EditorImGui::RenderAssetBrowserOperationPopups()
+{
+    if (m_assetOpenNewFolderPopup)
+    {
+        ImGui::OpenPopup("NewAssetFolderUnity");
+        m_assetOpenNewFolderPopup = false;
+    }
+    if (m_assetOpenRenamePopup)
+    {
+        ImGui::OpenPopup("RenameAssetBrowserItem");
+        m_assetOpenRenamePopup = false;
+    }
+    if (m_assetOpenDeletePopup)
+    {
+        ImGui::OpenPopup("DeleteAssetBrowserItem");
+        m_assetOpenDeletePopup = false;
+    }
+
+    if (ImGui::BeginPopupModal("NewAssetFolderUnity", nullptr, ImGuiWindowFlags_AlwaysAutoResize))
+    {
+        ImGui::InputText("Name", m_newAssetFolderName, sizeof(m_newAssetFolderName));
+        if (ImGui::Button("Create") || ImGui::IsKeyPressed(ImGuiKey_Enter))
+        {
+            CreateFilesystemFolder(m_assetNewFolderParent, m_newAssetFolderName);
+            ImGui::CloseCurrentPopup();
+        }
+        ImGui::SameLine();
+        if (ImGui::Button("Cancel") || ImGui::IsKeyPressed(ImGuiKey_Escape))
+            ImGui::CloseCurrentPopup();
+        ImGui::EndPopup();
+    }
+    if (ImGui::BeginPopupModal("RenameAssetBrowserItem", nullptr, ImGuiWindowFlags_AlwaysAutoResize))
+    {
+        ImGui::InputText("Name", m_assetRenameBuffer, sizeof(m_assetRenameBuffer));
+        if (ImGui::Button("Rename") || ImGui::IsKeyPressed(ImGuiKey_Enter))
+        {
+            RenameFilesystemSelection();
+            ImGui::CloseCurrentPopup();
+        }
+        ImGui::SameLine();
+        if (ImGui::Button("Cancel") || ImGui::IsKeyPressed(ImGuiKey_Escape))
+            ImGui::CloseCurrentPopup();
+        ImGui::EndPopup();
+    }
+    if (ImGui::BeginPopupModal("DeleteAssetBrowserItem", nullptr, ImGuiWindowFlags_AlwaysAutoResize))
+    {
+        const std::filesystem::path path(m_assetDeletePath);
+        ImGui::Text("Move '%s' to recycle bin?", path.filename().string().c_str());
+        if (ImGui::Button("Yes"))
+        {
+            DeleteFilesystemSelection();
+            ImGui::CloseCurrentPopup();
+        }
+        ImGui::SameLine();
+        if (ImGui::Button("No") || ImGui::IsKeyPressed(ImGuiKey_Escape))
+            ImGui::CloseCurrentPopup();
+        ImGui::EndPopup();
+    }
+}
+
 void EditorImGui::RenderAssetTagFilters()
 {
     const std::vector<std::pair<std::string, std::uint32_t>> tags = QueryVisibleTags();
@@ -5055,8 +5709,6 @@ void EditorImGui::RenderAssetBrowser()
 
         RenderAssetBrowserToolbar();
         ImGui::Separator();
-        RenderAssetTypeTabs();
-        ImGui::Separator();
 
         if (!m_assetStatus.empty())
         {
@@ -5065,38 +5717,67 @@ void EditorImGui::RenderAssetBrowser()
         }
 
         const float browserPanelHeight = std::max(140.0f, ImGui::GetContentRegionAvail().y);
-        if (ImGui::BeginTable("AssetBrowserLayout", 3, ImGuiTableFlags_Resizable | ImGuiTableFlags_BordersInnerV))
+        if (ImGui::BeginTable("AssetBrowserLayout", 2, ImGuiTableFlags_Resizable | ImGuiTableFlags_BordersInnerV))
         {
-            ImGui::TableSetupColumn("Folders", ImGuiTableColumnFlags_WidthFixed, 190.0f);
-            ImGui::TableSetupColumn("Assets", ImGuiTableColumnFlags_WidthStretch);
-            ImGui::TableSetupColumn("Tags", ImGuiTableColumnFlags_WidthFixed, 170.0f);
+            ImGui::TableSetupColumn("Folder Tree", ImGuiTableColumnFlags_WidthFixed, 230.0f);
+            ImGui::TableSetupColumn("Content", ImGuiTableColumnFlags_WidthStretch);
             ImGui::TableNextRow();
 
             ImGui::TableSetColumnIndex(0);
-            if (ImGui::BeginChild("AssetFoldersScroll", ImVec2(0.0f, browserPanelHeight), false,
+            if (ImGui::BeginChild("AssetFolderTreeScroll", ImVec2(0.0f, browserPanelHeight), false,
                     ImGuiWindowFlags_HorizontalScrollbar))
             {
-                RenderAssetFolderPanel();
+                RenderAssetBrowserFolderTree();
             }
             ImGui::EndChild();
 
             ImGui::TableSetColumnIndex(1);
-            if (ImGui::BeginChild("AssetGridScroll", ImVec2(0.0f, browserPanelHeight), false,
+            if (ImGui::BeginChild("AssetContentScroll", ImVec2(0.0f, browserPanelHeight), false,
                     ImGuiWindowFlags_HorizontalScrollbar))
             {
-                RenderAssetGrid();
-            }
-            ImGui::EndChild();
-
-            ImGui::TableSetColumnIndex(2);
-            if (ImGui::BeginChild("AssetTagsScroll", ImVec2(0.0f, browserPanelHeight), false,
-                    ImGuiWindowFlags_HorizontalScrollbar))
-            {
-                RenderAssetTagFilters();
+                RenderAssetBrowserContent();
             }
             ImGui::EndChild();
 
             ImGui::EndTable();
+        }
+        if (ImGui::IsWindowFocused(ImGuiFocusedFlags_RootAndChildWindows))
+        {
+            if (ImGui::IsKeyPressed(ImGuiKey_F2) && !m_selectedAssetId.empty())
+            {
+                if (m_selectedAssetId.rfind("folder:", 0) == 0)
+                    BeginFolderRename(m_selectedAssetId.substr(7));
+                else if (auto entry = m_assetLibrary->FindById(m_selectedAssetId))
+                    BeginAssetRename(*entry);
+            }
+            if (ImGui::IsKeyPressed(ImGuiKey_Delete) && !m_selectedAssetId.empty())
+            {
+                if (m_selectedAssetId.rfind("folder:", 0) == 0)
+                {
+                    const std::string folder = m_selectedAssetId.substr(7);
+                    m_assetDeletePath = AssetBrowserPath(folder).generic_string();
+                    m_assetDeleteIsFolder = true;
+                    m_assetOpenDeletePopup = true;
+                }
+                else if (auto entry = m_assetLibrary->FindById(m_selectedAssetId))
+                {
+                    const std::filesystem::path path = entry->originalPath.empty() ? m_assetLibrary->AbsolutePath(*entry) : std::filesystem::path(entry->originalPath);
+                    m_assetDeletePath = path.generic_string();
+                    m_assetDeleteIsFolder = false;
+                    m_assetOpenDeletePopup = true;
+                }
+            }
+        }
+        RenderAssetBrowserOperationPopups();
+        if (!m_assetBrowserLogged)
+        {
+            m_assetBrowserLogged = true;
+            const auto folders = QueryFilesystemChildFolders(m_assetSubpath);
+            const auto assets = QueryFilesystemAssetsInFolder(m_assetSubpath);
+            Tracenf("[EDITOR-IMGUI-3] Asset Browser rendered, current_folder=Assets/%s subfolders=%zu files=%zu",
+                m_assetSubpath.c_str(),
+                folders.size(),
+                assets.size());
         }
     }
     ImGui::End();
@@ -5733,6 +6414,17 @@ bool EditorImGui::WantsInputCapture(const InputEvent& event) const
     default:
         return false;
     }
+}
+
+bool EditorImGui::IsTextInputActive() const
+{
+    if (!m_initialized)
+        return false;
+
+    ImGuiContext* context = ImGui::GetCurrentContext();
+    if (!context)
+        return false;
+    return context->ActiveId != 0 && context->InputTextState.ID == context->ActiveId;
 }
 
 bool EditorImGui::IsSceneViewInputTarget(const InputEvent& event) const

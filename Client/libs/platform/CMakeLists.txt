@@ -4,6 +4,8 @@ add_library(client_platform STATIC
     LogConfig.h
     InputEvent.h
     NativeWindow.h
+    platform/trash.h
+    Trash_Stub.cpp
     VulkanDevice.cpp
     VulkanDevice.h
 )
@@ -12,6 +14,7 @@ if(WIN32)
     target_sources(client_platform PRIVATE
         NativeWindow_Win32.cpp
         NativeWindow_Win32.h
+        Trash_Win32.cpp
     )
     target_link_libraries(client_platform PUBLIC
         Vulkan::Vulkan

@@ -1,4 +1,8 @@
 add_library(client_render STATIC
+    AssetDatabase.cpp
+    AssetDatabase.h
+    AssetWatcher.cpp
+    AssetWatcher.h
     AssetLibrary.cpp
     AssetLibrary.h
     CubeRenderer.cpp
@@ -6,6 +10,8 @@ add_library(client_render STATIC
     EditorImGui.cpp
     EditorImGui.h
     MapEditorTypes.h
+    MaterialAssetManager.cpp
+    MaterialAssetManager.h
     WorldLabelRenderer.cpp
     WorldLabelRenderer.h
     OffscreenSceneRenderer.cpp
@@ -63,6 +69,7 @@ target_link_libraries(client_render
         client_platform
         client_asset
         mapdata
+        efsw::efsw
         fastgltf::fastgltf
         meshoptimizer::meshoptimizer
         RmlUi::RmlUi

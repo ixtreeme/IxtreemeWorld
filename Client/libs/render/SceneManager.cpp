@@ -1775,7 +1775,7 @@ std::string SceneManager::SaveSceneDialog() const
 
 void SceneManager::UpdateWindowTitle()
 {
-    std::string title = "IxtreemeWorld Engine - Editor";
+    std::string title = "IxtreemeEngine - Editor";
     if (HasOpenScene())
     {
         std::string sceneLabel = std::filesystem::path(m_currentScenePath).filename().string();

@@ -2,7 +2,9 @@
 #include <windows.h>
 #endif
 
+#include "AssetLibrary.h"
 #include "WorldLabelRenderer.h"
+#include "AssetWatcher.h"
 #include "NativeWindow.h"
 #include "EditorImGui.h"
 #if defined(_WIN32)
@@ -970,6 +972,13 @@ struct MovementInputState
     bool space = false;
     bool control = false;
     bool shift = false;
+    bool wPhysicalDown = false;
+    bool aPhysicalDown = false;
+    bool sPhysicalDown = false;
+    bool dPhysicalDown = false;
+    bool spacePhysicalDown = false;
+    bool controlPhysicalDown = false;
+    bool shiftPhysicalDown = false;
 
     bool Apply(const InputEvent& event)
     {
@@ -990,6 +999,38 @@ struct MovementInputState
         }
     }
 
+    bool ApplyGatedEdge(const InputEvent& event, bool gateOpen)
+    {
+        if (event.type != InputEvent::KeyDown && event.type != InputEvent::KeyUp)
+            return false;
+
+        const auto updateKey = [&](bool& active, bool& physicalDown) {
+            if (event.type == InputEvent::KeyDown)
+            {
+                if (!physicalDown && gateOpen)
+                    active = true;
+                physicalDown = true;
+            }
+            else
+            {
+                physicalDown = false;
+                active = false;
+            }
+        };
+
+        switch (event.key)
+        {
+        case Key_W: updateKey(w, wPhysicalDown); return true;
+        case Key_A: updateKey(a, aPhysicalDown); return true;
+        case Key_S: updateKey(s, sPhysicalDown); return true;
+        case Key_D: updateKey(d, dPhysicalDown); return true;
+        case Key_Space: updateKey(space, spacePhysicalDown); return true;
+        case Key_Control: updateKey(control, controlPhysicalDown); return true;
+        case Key_Shift: updateKey(shift, shiftPhysicalDown); return true;
+        default: return false;
+        }
+    }
+
     void Clear()
     {
         w = false;
@@ -999,6 +1040,13 @@ struct MovementInputState
         space = false;
         control = false;
         shift = false;
+        wPhysicalDown = false;
+        aPhysicalDown = false;
+        sPhysicalDown = false;
+        dPhysicalDown = false;
+        spacePhysicalDown = false;
+        controlPhysicalDown = false;
+        shiftPhysicalDown = false;
     }
 
     bool HasDirection() const { return w || a || s || d; }
@@ -1801,6 +1849,7 @@ int RunGame(NativeWindow& window,
     cameraController.SetFreeCameraEnabled(true);
     runtimeSession->SetEditorStatus("Editor opened at boot");
     Tracen("[BOOT] editor_open forced = 1 (editor build boot)");
+    Tracen("[EDITOR-CAMERA] viewport_input_gate enabled");
 #endif
     std::vector<WorldRenderEntity> lastPickEntities;
     WorldCamera lastPickCamera{};
@@ -2123,6 +2172,9 @@ int RunGame(NativeWindow& window,
     bool editorShiftDown = false;
     bool editorLeftMouseHeld = false;
     bool editorRightMouseHeld = false;
+    bool editorHasMousePosition = false;
+    int editorLastMouseX = 0;
+    int editorLastMouseY = 0;
     MovementInputState editorFlyMovement;
 #endif
 
@@ -2158,6 +2210,9 @@ int RunGame(NativeWindow& window,
                              &editorShiftDown,
                              &editorLeftMouseHeld,
                              &editorRightMouseHeld,
+                             &editorHasMousePosition,
+                             &editorLastMouseX,
+                             &editorLastMouseY,
                              &editorFlyMovement,
                              &rebuildMeshEntityLookup,
                              &syncStaticMeshSpatialEntity,
@@ -2166,6 +2221,16 @@ int RunGame(NativeWindow& window,
                              &renderSize](const InputEvent& event)
     {
 #if defined(IXTREEME_WITH_EDITOR)
+        if (event.type == InputEvent::MouseMove ||
+            event.type == InputEvent::MouseDown ||
+            event.type == InputEvent::MouseUp ||
+            event.type == InputEvent::MouseWheel)
+        {
+            editorHasMousePosition = true;
+            editorLastMouseX = event.x;
+            editorLastMouseY = event.y;
+        }
+
         if (event.type == InputEvent::MouseDown && event.button == MouseButton_Left)
             editorLeftMouseHeld = true;
         else if (event.type == InputEvent::MouseUp && event.button == MouseButton_Left)
@@ -2249,21 +2314,18 @@ int RunGame(NativeWindow& window,
             isEditorFlyCameraKey(event);
         if (editorFlyCameraKey)
         {
-            editorFlyMovement.Apply(event);
-            movement.Apply(event);
-            if (!QuietLogsForLodDiag())
-            {
-                Tracenf("[EDITOR-CAMERA-INPUT] key=%d type=%s state w=%d a=%d s=%d d=%d space=%d ctrl=%d shift=%d",
-                    static_cast<int>(event.key),
-                    InputEventTypeName(event.type),
-                    editorFlyMovement.w ? 1 : 0,
-                    editorFlyMovement.a ? 1 : 0,
-                    editorFlyMovement.s ? 1 : 0,
-                    editorFlyMovement.d ? 1 : 0,
-                    editorFlyMovement.space ? 1 : 0,
-                    editorFlyMovement.control ? 1 : 0,
-                    editorFlyMovement.shift ? 1 : 0);
-            }
+            const auto viewportDiag = editorImGui.GetViewportInputDiagnostics();
+            const bool lastMouseInsideViewport =
+                editorHasMousePosition &&
+                viewportDiag.sceneViewRectValid &&
+                static_cast<float>(editorLastMouseX) >= viewportDiag.sceneViewMin[0] &&
+                static_cast<float>(editorLastMouseX) < viewportDiag.sceneViewMin[0] + viewportDiag.sceneViewSize[0] &&
+                static_cast<float>(editorLastMouseY) >= viewportDiag.sceneViewMin[1] &&
+                static_cast<float>(editorLastMouseY) < viewportDiag.sceneViewMin[1] + viewportDiag.sceneViewSize[1];
+            const bool viewportHovered = lastMouseInsideViewport || viewportDiag.sceneViewHovered;
+            const bool wantCaptureKeyboard = editorImGui.IsTextInputActive();
+            const bool gateOpen = viewportHovered && !wantCaptureKeyboard;
+            editorFlyMovement.ApplyGatedEdge(event, gateOpen);
             return;
         }
         if (editorImGui.WantsInputCapture(event) && !sceneViewInputTarget && !editorFlyCameraKey)
@@ -2874,6 +2936,13 @@ int RunGame(NativeWindow& window,
     while (running)
     {
         running = window.PumpMessages();
+
+#if defined(IXTREEME_WITH_EDITOR)
+        const std::uint64_t assetLibraryDiagFrame = device.GetFrameNumber() + 1u;
+        AssetLibrary::BeginMaterialDiscoveryFrame(assetLibraryDiagFrame);
+        if (AssetWatcher::Instance().processPendingEvents())
+            editorImGui.RefreshAssetLibrary();
+#endif
 
         uint32_t width = 0;
         uint32_t height = 0;
@@ -4955,8 +5024,11 @@ int RunGame(NativeWindow& window,
                             !previousMeshSubmitDetailInitialized ||
                             previousMeshSubmitDetailInstances != submittedInstances ||
                             previousMeshSubmitDetailDrawCalls != submittedDrawCalls;
-                        if ((!QuietLogsForLodDiag() && (frameNumber < 3 || (frameNumber % 60u) == 0u)) ||
-                            (QuietLogsForLodDiag() && meshSubmitDetailChanged))
+                        const bool shouldLogMeshSubmitDetail =
+                            LodLogsEnabled() &&
+                            ((!QuietLogsForLodDiag() && (frameNumber < 3 || (frameNumber % 60u) == 0u)) ||
+                                (QuietLogsForLodDiag() && meshSubmitDetailChanged));
+                        if (shouldLogMeshSubmitDetail)
                         {
                             const auto& bmin = renderer->BoundsMin();
                             const auto& bmax = renderer->BoundsMax();
@@ -5175,6 +5247,9 @@ int RunGame(NativeWindow& window,
                     renderSize.height);
             }
         }
+#if defined(IXTREEME_WITH_EDITOR)
+        AssetLibrary::EndMaterialDiscoveryFrame(assetLibraryDiagFrame);
+#endif
         device.EndFrame();
     }
 
@@ -5224,7 +5299,7 @@ int WINAPI WinMain(HINSTANCE instance, HINSTANCE, LPSTR, int showCommand)
     }
 
     NativeWindow_Win32 window;
-    if (!window.Create(instance, "IxtreemeWorld Engine - Editor", windowWidth, windowHeight))
+    if (!window.Create(instance, "Ixtreeme Engine", windowWidth, windowHeight))
     {
         ShowFatal("Failed to create Win32 window.");
         return 1;

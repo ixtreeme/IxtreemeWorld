@@ -34,7 +34,7 @@ endif()
 
 project(ixtreeme_client
     VERSION 0.1.0
-    DESCRIPTION "IxtreemeWorld Vulkan client"
+    DESCRIPTION "IxtreemeEngeni - Vulkan"
     LANGUAGES C CXX)
 
 include(CTest)
@@ -47,9 +47,9 @@ option(ENABLE_ASAN "Enable AddressSanitizer" OFF)
 option(IXTREEME_WITH_EDITOR "Build ImGui-based editor functionality" ON)
 
 if(IXTREEME_WITH_EDITOR)
-    message(STATUS "IxtreemeWorld editor build: ENABLED")
+    message(STATUS "IxtreemeEngeni editor build: ENABLED")
 else()
-    message(STATUS "IxtreemeWorld editor build: DISABLED")
+    message(STATUS "IxtreemeEngeni editor build: DISABLED")
 endif()
 
 set(VCPKG_TRIPLET_TYPE "static" CACHE STRING "Choose vcpkg triplet type (static/dynamic)")
@@ -91,6 +91,7 @@ include(FetchContent)
 
 vcpkg_require(
     capnproto
+    efsw
     fastgltf
     flecs
 	rmlui
@@ -130,6 +131,7 @@ set(CLIENT_LIBS_DIR "${CLIENT_ROOT}/libs")
 add_subdirectory(${CMAKE_CURRENT_SOURCE_DIR}/../shared/map shared_map_build)
 
 find_package(fastgltf CONFIG REQUIRED)
+find_package(efsw CONFIG REQUIRED)
 FetchContent_Declare(
     meshoptimizer
     GIT_REPOSITORY https://github.com/zeux/meshoptimizer.git

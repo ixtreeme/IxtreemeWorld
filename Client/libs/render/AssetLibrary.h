@@ -3,9 +3,11 @@
 #include "MapEditorTypes.h"
 
 #include <array>
+#include <cstdint>
 #include <filesystem>
 #include <optional>
 #include <string>
+#include <unordered_set>
 #include <utility>
 #include <vector>
 
@@ -169,6 +171,8 @@ public:
     static std::vector<std::string> NormalizeTags(const std::vector<std::string>& tags);
     static std::vector<std::string> TagsFromCsv(const std::string& csv);
     static std::string TagsToCsv(const std::vector<std::string>& tags);
+    static void BeginMaterialDiscoveryFrame(std::uint64_t frameNumber);
+    static void EndMaterialDiscoveryFrame(std::uint64_t frameNumber);
 
 private:
     std::filesystem::path CategoryDirectory(Category category) const;
@@ -191,4 +195,9 @@ private:
     std::filesystem::path m_clientRoot;
     std::filesystem::path m_libraryRoot;
     std::vector<Entry> m_entries;
+    std::unordered_set<std::string> m_failedMaterialDiscoveryAttempts;
+    bool m_loggedMaterialFailureHint = false;
+    mutable std::optional<size_t> m_lastSavedManifestHash;
+    mutable std::optional<size_t> m_lastFailedManifestHash;
+    mutable bool m_loggedPersistentManifestFailure = false;
 };

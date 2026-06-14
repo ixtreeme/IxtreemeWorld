@@ -1,12 +1,24 @@
 #include "AssetLibrary.h"
 
+#include "AssetDatabase.h"
 #include "Debug.h"
+
+#if defined(_WIN32)
+#ifndef WIN32_LEAN_AND_MEAN
+#define WIN32_LEAN_AND_MEAN
+#endif
+#ifndef NOMINMAX
+#define NOMINMAX
+#endif
+#include <windows.h>
+#endif
 
 #include <stb_image.h>
 #define STB_IMAGE_WRITE_IMPLEMENTATION
 #include <stb_image_write.h>
 
 #include <algorithm>
+#include <cerrno>
 #include <chrono>
 #include <cmath>
 #include <cctype>
@@ -14,12 +26,15 @@
 #include <cstdlib>
 #include <cstring>
 #include <fstream>
+#include <functional>
 #include <iomanip>
 #include <map>
 #include <numeric>
 #include <set>
 #include <sstream>
+#include <thread>
 #include <ctime>
+#include <unordered_map>
 #include <unordered_set>
 
 namespace
@@ -63,6 +78,8 @@ std::string EscapeJson(const std::string& value)
 }
 
 bool JsonArrayBody(const std::string& text, const std::string& key, std::string& out);
+std::optional<int> JsonIntValue(const std::string& object, const std::string& key);
+bool HasJsonObjectShape(const std::string& text);
 
 std::string JsonStringValue(const std::string& object, const std::string& key)
 {
@@ -146,6 +163,30 @@ std::uint32_t JsonU32Value(const std::string& object, const std::string& key, st
     char* end = nullptr;
     const unsigned long value = std::strtoul(begin, &end, 10);
     return end != begin ? static_cast<std::uint32_t>(value) : fallback;
+}
+
+std::optional<int> JsonIntValue(const std::string& object, const std::string& key)
+{
+    const std::string needle = "\"" + key + "\"";
+    const size_t keyPos = object.find(needle);
+    if (keyPos == std::string::npos)
+        return std::nullopt;
+    const size_t colon = object.find(':', keyPos + needle.size());
+    if (colon == std::string::npos)
+        return std::nullopt;
+    const char* begin = object.c_str() + colon + 1;
+    char* end = nullptr;
+    const long value = std::strtol(begin, &end, 10);
+    if (end == begin)
+        return std::nullopt;
+    return static_cast<int>(value);
+}
+
+bool HasJsonObjectShape(const std::string& text)
+{
+    const size_t first = text.find_first_not_of(" \t\r\n");
+    const size_t last = text.find_last_not_of(" \t\r\n");
+    return first != std::string::npos && last != std::string::npos && text[first] == '{' && text[last] == '}';
 }
 
 std::string JsonObjectValue(const std::string& object, const std::string& key)
@@ -560,35 +601,66 @@ std::string TimestampUtc()
     return out.str();
 }
 
+const char* NativeErrorName(int code);
+void ClearAtomicWriteFailure();
+void SetAtomicWriteFailure(const std::filesystem::path& path,
+                           std::string operation,
+                           int nativeErrorCode,
+                           bool ofstreamGood = false,
+                           bool ofstreamFailBit = false,
+                           int retriesAttempted = 0);
+
+bool AtomicReplaceWithRetry(const std::filesystem::path& tmp,
+                            const std::filesystem::path& path,
+                            int& finalNativeErrorCode,
+                            int& attemptsMade);
+
 bool AtomicWriteText(const std::filesystem::path& path, const std::string& text, std::string& error)
 {
+    ClearAtomicWriteFailure();
     std::error_code ec;
     std::filesystem::create_directories(path.parent_path(), ec);
+    if (ec)
+    {
+        SetAtomicWriteFailure(path.parent_path(), "create_directories", ec.value());
+        error = ec.message();
+        return false;
+    }
     const auto tmp = path.string() + ".tmp";
     {
         std::ofstream file(tmp, std::ios::binary | std::ios::trunc);
         if (!file)
         {
+            const int nativeCode =
+#if defined(_WIN32)
+                static_cast<int>(GetLastError() != ERROR_SUCCESS ? GetLastError() : errno);
+#else
+                errno;
+#endif
+            SetAtomicWriteFailure(tmp, "ofstream_open_temp", nativeCode, file.good(), file.fail());
             error = "failed to open temp file";
             return false;
         }
         file << text;
         if (!file)
         {
+            const int nativeCode =
+#if defined(_WIN32)
+                static_cast<int>(GetLastError() != ERROR_SUCCESS ? GetLastError() : errno);
+#else
+                errno;
+#endif
+            SetAtomicWriteFailure(tmp, "ofstream_write_temp", nativeCode, file.good(), file.fail());
             error = "failed to write temp file";
             return false;
         }
     }
-    std::filesystem::rename(tmp, path, ec);
-    if (ec)
+    int finalNativeErrorCode = 0;
+    int attemptsMade = 0;
+    if (!AtomicReplaceWithRetry(tmp, path, finalNativeErrorCode, attemptsMade))
     {
-        std::filesystem::remove(path, ec);
-        ec.clear();
-        std::filesystem::rename(tmp, path, ec);
-    }
-    if (ec)
-    {
-        error = ec.message();
+        SetAtomicWriteFailure(path, "rename_temp_to_target", finalNativeErrorCode, false, false, attemptsMade);
+        error = NativeErrorName(finalNativeErrorCode);
         return false;
     }
     return true;
@@ -866,6 +938,403 @@ bool HasAnyExtension(const std::filesystem::path& path, std::initializer_list<co
             return true;
     }
     return false;
+}
+
+std::string CanonicalPathString(const std::filesystem::path& path)
+{
+    std::error_code ec;
+    std::filesystem::path normalized = std::filesystem::weakly_canonical(path, ec);
+    if (ec)
+    {
+        ec.clear();
+        normalized = std::filesystem::absolute(path, ec);
+    }
+    return (ec ? path : normalized).generic_string();
+}
+
+bool HasJsonKey(const std::string& object, const std::string& key)
+{
+    return object.find("\"" + key + "\"") != std::string::npos;
+}
+
+bool ValidateMaterialAssetSchema(const std::filesystem::path& path,
+                                 std::string& step,
+                                 std::string& errorMessage)
+{
+    std::ifstream file(path, std::ios::binary);
+    if (!file)
+    {
+        step = "fileOpen";
+        errorMessage = "failed to open material file";
+        return false;
+    }
+
+    const std::string text((std::istreambuf_iterator<char>(file)), std::istreambuf_iterator<char>());
+    if (!HasJsonObjectShape(text))
+    {
+        step = "jsonParse";
+        errorMessage = "file is not a JSON object";
+        return false;
+    }
+
+    const auto version = JsonIntValue(text, "version");
+    if (!version || *version != 1)
+    {
+        step = "schemaValidate";
+        errorMessage = "missing or unsupported field 'version'";
+        return false;
+    }
+
+    static const char* requiredKeys[] = {
+        "shader",
+        "name",
+        "baseColor",
+        "metallic",
+        "roughness",
+        "normalStrength",
+        "aoStrength",
+        "emissive",
+        "uvTiling",
+        "uvOffset",
+        "alphaMode",
+        "alphaCutoff",
+        "textures",
+    };
+    for (const char* key : requiredKeys)
+    {
+        if (!HasJsonKey(text, key))
+        {
+            step = "schemaValidate";
+            errorMessage = std::string("missing required field '") + key + "'";
+            return false;
+        }
+    }
+
+    const std::string textures = JsonObjectValue(text, "textures");
+    if (textures.empty())
+    {
+        step = "schemaValidate";
+        errorMessage = "missing or invalid object field 'textures'";
+        return false;
+    }
+    static const char* requiredTextureKeys[] = {
+        "baseColor",
+        "normal",
+        "metallicRoughness",
+        "ao",
+        "emissive",
+    };
+    for (const char* key : requiredTextureKeys)
+    {
+        if (!HasJsonKey(textures, key))
+        {
+            step = "schemaValidate";
+            errorMessage = std::string("missing required texture slot '") + key + "'";
+            return false;
+        }
+    }
+
+    return true;
+}
+
+bool IsEmptyGuid(const Guid& guid)
+{
+    return std::all_of(guid.bytes.begin(), guid.bytes.end(), [](std::uint8_t byte) {
+        return byte == 0;
+    });
+}
+
+Guid RegisterMaterialAssetFile(const std::filesystem::path& path,
+                               std::string& step,
+                               std::string& errorMessage)
+{
+    if (!ValidateMaterialAssetSchema(path, step, errorMessage))
+        return {};
+
+    step = "dbRegister";
+    Guid guid = AssetDatabase::Instance().getOrCreateGuid(path);
+    if (IsEmptyGuid(guid))
+    {
+        errorMessage = "AssetDatabase returned empty GUID";
+        return {};
+    }
+    errorMessage.clear();
+    return guid;
+}
+
+std::string FailedPathList(const std::vector<std::string>& paths)
+{
+    std::ostringstream out;
+    out << "[";
+    for (size_t i = 0; i < paths.size(); ++i)
+    {
+        if (i)
+            out << ", ";
+        out << paths[i];
+    }
+    out << "]";
+    return out.str();
+}
+
+const char* NativeErrorName(int code)
+{
+#if defined(_WIN32)
+    switch (code)
+    {
+    case ERROR_SUCCESS: return "ERROR_SUCCESS";
+    case ERROR_FILE_NOT_FOUND: return "ERROR_FILE_NOT_FOUND";
+    case ERROR_PATH_NOT_FOUND: return "ERROR_PATH_NOT_FOUND";
+    case ERROR_ACCESS_DENIED: return "ERROR_ACCESS_DENIED";
+    case ERROR_SHARING_VIOLATION: return "ERROR_SHARING_VIOLATION";
+    case ERROR_LOCK_VIOLATION: return "ERROR_LOCK_VIOLATION";
+    case ERROR_ALREADY_EXISTS: return "ERROR_ALREADY_EXISTS";
+    case ERROR_INVALID_NAME: return "ERROR_INVALID_NAME";
+    default: return "UNKNOWN_WINDOWS_ERROR";
+    }
+#else
+    switch (code)
+    {
+    case 0: return "NO_ERROR";
+    case EACCES: return "EACCES";
+    case ENOENT: return "ENOENT";
+    case EEXIST: return "EEXIST";
+    case EBUSY: return "EBUSY";
+    default: return "UNKNOWN_ERRNO";
+    }
+#endif
+}
+
+bool AtomicReplaceOnce(const std::filesystem::path& tmp,
+                       const std::filesystem::path& path,
+                       int& nativeErrorCode)
+{
+#if defined(_WIN32)
+    const std::wstring tmpW = tmp.wstring();
+    const std::wstring pathW = path.wstring();
+    const DWORD replaceFlags = REPLACEFILE_IGNORE_MERGE_ERRORS | REPLACEFILE_IGNORE_ACL_ERRORS;
+    std::error_code existsEc;
+    if (std::filesystem::exists(path, existsEc))
+    {
+        if (ReplaceFileW(pathW.c_str(), tmpW.c_str(), nullptr, replaceFlags, nullptr, nullptr))
+        {
+            nativeErrorCode = 0;
+            return true;
+        }
+        nativeErrorCode = static_cast<int>(GetLastError());
+    }
+
+    if (MoveFileExW(tmpW.c_str(), pathW.c_str(), MOVEFILE_REPLACE_EXISTING | MOVEFILE_WRITE_THROUGH))
+    {
+        nativeErrorCode = 0;
+        return true;
+    }
+    nativeErrorCode = static_cast<int>(GetLastError());
+    return false;
+#else
+    std::error_code ec;
+    std::filesystem::rename(tmp, path, ec);
+    if (!ec)
+    {
+        nativeErrorCode = 0;
+        return true;
+    }
+    nativeErrorCode = ec.value();
+    return false;
+#endif
+}
+
+bool AtomicReplaceWithRetry(const std::filesystem::path& tmp,
+                            const std::filesystem::path& path,
+                            int& finalNativeErrorCode,
+                            int& attemptsMade)
+{
+    static constexpr int kMaxAttempts = 3;
+    static constexpr int kRetryDelaysMs[kMaxAttempts - 1] = {25, 50};
+    finalNativeErrorCode = 0;
+    attemptsMade = 0;
+    for (int attempt = 0; attempt < kMaxAttempts; ++attempt)
+    {
+        if (attempt > 0)
+            std::this_thread::sleep_for(std::chrono::milliseconds(kRetryDelaysMs[attempt - 1]));
+
+        ++attemptsMade;
+        int nativeCode = 0;
+        if (AtomicReplaceOnce(tmp, path, nativeCode))
+        {
+            if (attempt > 0)
+            {
+                Tracenf("[MATERIAL-ASSET] manifestSave_rename_succeeded_after_retry attempt=%d delayMs=%d",
+                    attempt + 1,
+                    kRetryDelaysMs[attempt - 1]);
+            }
+            return true;
+        }
+        finalNativeErrorCode = nativeCode;
+    }
+    return false;
+}
+
+bool PathIsReadOnly(const std::filesystem::path& path, bool& known)
+{
+    known = false;
+#if defined(_WIN32)
+    const DWORD attrs = GetFileAttributesW(path.wstring().c_str());
+    if (attrs == INVALID_FILE_ATTRIBUTES)
+        return false;
+    known = true;
+    return (attrs & FILE_ATTRIBUTE_READONLY) != 0;
+#else
+    std::error_code ec;
+    const auto status = std::filesystem::status(path, ec);
+    if (ec)
+        return false;
+    known = true;
+    const auto perms = status.permissions();
+    return (perms & std::filesystem::perms::owner_write) == std::filesystem::perms::none;
+#endif
+}
+
+struct AtomicWriteFailureDiag
+{
+    std::filesystem::path path;
+    std::string operation;
+    int nativeErrorCode = 0;
+    bool ofstreamGood = false;
+    bool ofstreamFailBit = false;
+    int retriesAttempted = 0;
+};
+
+thread_local AtomicWriteFailureDiag g_lastAtomicWriteFailure;
+
+void ClearAtomicWriteFailure()
+{
+    g_lastAtomicWriteFailure = {};
+}
+
+void SetAtomicWriteFailure(const std::filesystem::path& path,
+                           std::string operation,
+                           int nativeErrorCode,
+                           bool ofstreamGood,
+                           bool ofstreamFailBit,
+                           int retriesAttempted)
+{
+    g_lastAtomicWriteFailure.path = path;
+    g_lastAtomicWriteFailure.operation = std::move(operation);
+    g_lastAtomicWriteFailure.nativeErrorCode = nativeErrorCode;
+    g_lastAtomicWriteFailure.ofstreamGood = ofstreamGood;
+    g_lastAtomicWriteFailure.ofstreamFailBit = ofstreamFailBit;
+    g_lastAtomicWriteFailure.retriesAttempted = retriesAttempted;
+}
+
+void LogManifestSaveAttempt(const std::filesystem::path& manifestPath)
+{
+    std::error_code ec;
+    const bool exists = std::filesystem::exists(manifestPath, ec);
+    ec.clear();
+    const bool directoryExists = std::filesystem::exists(manifestPath.parent_path(), ec);
+    bool readOnlyKnown = false;
+    const bool readOnly = exists ? PathIsReadOnly(manifestPath, readOnlyKnown) : false;
+    Tracenf("[MATERIAL-ASSET-DIAG] manifestSave_attempt path=%s mode=atomic-temp-truncate+replace currentlyExists=%s readOnly=%s directoryExists=%s",
+        manifestPath.generic_string().c_str(),
+        exists ? "yes" : "no",
+        exists ? (readOnlyKnown ? (readOnly ? "yes" : "no") : "unknown") : "unknown",
+        directoryExists ? "yes" : "no");
+}
+
+void LogManifestSaveFailed(const std::filesystem::path& manifestPath)
+{
+    const AtomicWriteFailureDiag& failure = g_lastAtomicWriteFailure;
+    int nativeCode = failure.nativeErrorCode;
+#if defined(_WIN32)
+    if (nativeCode == 0)
+        nativeCode = static_cast<int>(GetLastError());
+#else
+    if (nativeCode == 0)
+        nativeCode = errno;
+#endif
+    Tracenf("[MATERIAL-ASSET-DIAG] manifestSave_failed path=%s nativeErrorCode=%d nativeErrorName=%s operation=%s failurePath=%s ofstreamGood=%s ofstreamFailBit=%s attemptingShareMode=n/a retriesAttempted=%d finalNativeErrorCode=%d",
+        manifestPath.generic_string().c_str(),
+        nativeCode,
+        NativeErrorName(nativeCode),
+        failure.operation.empty() ? "unknown" : failure.operation.c_str(),
+        failure.path.empty() ? "" : failure.path.generic_string().c_str(),
+        failure.ofstreamGood ? "true" : "false",
+        failure.ofstreamFailBit ? "true" : "false",
+        failure.retriesAttempted,
+        nativeCode);
+#if defined(_WIN32)
+    HANDLE probe = CreateFileW(manifestPath.wstring().c_str(),
+                               GENERIC_WRITE,
+                               0,
+                               nullptr,
+                               OPEN_EXISTING,
+                               FILE_ATTRIBUTE_NORMAL,
+                               nullptr);
+    if (probe == INVALID_HANDLE_VALUE)
+    {
+        const int probeCode = static_cast<int>(GetLastError());
+        Tracenf("[MATERIAL-ASSET-DIAG] manifestSave_probe nativeErrorCode=%d errorName=%s",
+            probeCode,
+            NativeErrorName(probeCode));
+    }
+    else
+    {
+        CloseHandle(probe);
+        Tracen("[MATERIAL-ASSET-DIAG] manifestSave_probe write_access_OK - rename failure was transient");
+    }
+#endif
+}
+
+struct MaterialDiscoveryDiagState
+{
+    std::uint64_t frame = 0;
+    std::uint32_t calls = 0;
+    std::unordered_set<std::string> uniquePaths;
+    std::unordered_map<std::string, std::uint32_t> callerCounts;
+    std::unordered_map<std::string, std::uint64_t> originalLogLastFrame;
+};
+
+MaterialDiscoveryDiagState& MaterialDiscoveryDiag()
+{
+    static MaterialDiscoveryDiagState state;
+    return state;
+}
+
+bool ShouldLogOriginalMaterialDiscovery(const std::string& path, std::uint64_t frame)
+{
+    auto& state = MaterialDiscoveryDiag();
+    auto it = state.originalLogLastFrame.find(path);
+    if (it == state.originalLogLastFrame.end() || frame - it->second >= 600u)
+    {
+        state.originalLogLastFrame[path] = frame;
+        return true;
+    }
+    return false;
+}
+
+void RecordMaterialDiscoveryDiag(const std::filesystem::path& path,
+                                 const char* caller,
+                                 const char* cacheHit,
+                                 const char* diskIOExpected,
+                                 const char* action,
+                                 const void* returnPtr)
+{
+    auto& state = MaterialDiscoveryDiag();
+    const std::string pathText = path.generic_string();
+    ++state.calls;
+    state.uniquePaths.insert(pathText);
+    ++state.callerCounts[caller ? caller : "unknown"];
+
+    Tracenf("[ASSET-LIBRARY-DIAG] discovered material asset path=%s caller=%s callIndexThisFrame=%u",
+        pathText.c_str(),
+        caller ? caller : "unknown",
+        state.calls);
+    Tracenf("[ASSET-LIBRARY-DIAG] discovery_state path=%s cacheHit=%s diskIOExpected=%s action=%s returnPtr=%p",
+        pathText.c_str(),
+        cacheHit,
+        diskIOExpected,
+        action,
+        returnPtr);
 }
 
 std::string GenericPath(const std::filesystem::path& path)
@@ -1299,6 +1768,36 @@ std::string AssetLibrary::TagsToCsv(const std::vector<std::string>& tags)
     return csv;
 }
 
+void AssetLibrary::BeginMaterialDiscoveryFrame(std::uint64_t frameNumber)
+{
+    auto& state = MaterialDiscoveryDiag();
+    state.frame = frameNumber;
+    state.calls = 0;
+    state.uniquePaths.clear();
+    state.callerCounts.clear();
+}
+
+void AssetLibrary::EndMaterialDiscoveryFrame(std::uint64_t frameNumber)
+{
+    auto& state = MaterialDiscoveryDiag();
+    std::string topCaller = "none";
+    std::uint32_t topCount = 0;
+    for (const auto& [caller, count] : state.callerCounts)
+    {
+        if (count > topCount)
+        {
+            topCaller = caller;
+            topCount = count;
+        }
+    }
+
+    Tracenf("[ASSET-LIBRARY-DIAG] frame_summary frame=%llu material_discovery_calls=%u unique_paths=%zu top_caller=%s",
+        static_cast<unsigned long long>(frameNumber),
+        state.calls,
+        state.uniquePaths.size(),
+        topCaller.c_str());
+}
+
 std::string AssetLibrary::CategoryString(Category category)
 {
     switch (category)
@@ -1505,14 +2004,18 @@ bool AssetLibrary::LoadManifest()
 {
     m_entries.clear();
     const auto path = m_libraryRoot / "manifest.json";
-    std::ifstream file(path, std::ios::binary);
-    if (!file)
+    std::string text;
     {
-        std::string error;
-        return SaveManifest(error);
+        std::ifstream scopedFile(path, std::ios::binary);
+        if (!scopedFile)
+        {
+            std::string error;
+            return SaveManifest(error);
+        }
+        text.assign(std::istreambuf_iterator<char>(scopedFile), std::istreambuf_iterator<char>());
     }
-
-    std::string text((std::istreambuf_iterator<char>(file)), std::istreambuf_iterator<char>());
+    m_lastSavedManifestHash = std::hash<std::string>{}(text);
+    m_lastFailedManifestHash.reset();
     std::string assetsText;
     if (!JsonArrayBody(text, "assets", assetsText))
         return true;
@@ -1604,6 +2107,7 @@ bool AssetLibrary::LoadManifest()
 
 bool AssetLibrary::SaveManifest(std::string& error) const
 {
+    const auto saveBegin = std::chrono::steady_clock::now();
     std::ostringstream json;
     json << "{\n  \"version\": 1,\n  \"assets\": [\n";
     for (size_t i = 0; i < m_entries.size(); ++i)
@@ -1704,14 +2208,64 @@ bool AssetLibrary::SaveManifest(std::string& error) const
         json << "    }" << (i + 1 < m_entries.size() ? "," : "") << "\n";
     }
     json << "  ]\n}\n";
-    return AtomicWriteText(m_libraryRoot / "manifest.json", json.str(), error);
+    const std::string serialized = json.str();
+    const size_t currentHash = std::hash<std::string>{}(serialized);
+    if (m_lastSavedManifestHash && *m_lastSavedManifestHash == currentHash)
+        return true;
+    if (m_lastFailedManifestHash && *m_lastFailedManifestHash == currentHash)
+        return true;
+
+    const std::filesystem::path manifestPath = m_libraryRoot / "manifest.json";
+    LogManifestSaveAttempt(manifestPath);
+    if (!AtomicWriteText(manifestPath, serialized, error))
+    {
+        LogManifestSaveFailed(manifestPath);
+        m_lastFailedManifestHash = currentHash;
+        if (!m_loggedPersistentManifestFailure)
+        {
+            Tracenf("[MATERIAL-ASSET] manifestSave_persistent_failure path=%s reason=\"Windows ERROR_ACCESS_DENIED on rename - target file likely held by another process (efsw watcher, antivirus, or our own read handle). Manifest will not be persisted this session. Restart editor or check Process Explorer for open handles.\"",
+                manifestPath.generic_string().c_str());
+            m_loggedPersistentManifestFailure = true;
+        }
+        return false;
+    }
+    m_lastSavedManifestHash = currentHash;
+    m_lastFailedManifestHash.reset();
+    const auto saveEnd = std::chrono::steady_clock::now();
+    const double durationMs =
+        std::chrono::duration<double, std::milli>(saveEnd - saveBegin).count();
+    Tracenf("[MATERIAL-ASSET] manifest_saved durationMs=%.3f", durationMs);
+    return true;
 }
 
 bool AssetLibrary::ReconcileFilesystem(std::string& error)
 {
+    const auto reconcileBegin = std::chrono::steady_clock::now();
     bool changed = false;
     std::vector<Entry> reconciled;
     reconciled.reserve(m_entries.size());
+    std::unordered_set<std::string> knownMaterialPaths;
+    std::vector<std::string> newlyRegisteredMaterialPaths;
+    std::vector<std::string> failedMaterialPaths;
+    std::uint32_t discoveredMaterials = 0;
+    std::uint32_t registeredMaterials = 0;
+    std::uint32_t failedMaterials = 0;
+    const std::vector<Entry> entriesBeforeReconcile = m_entries;
+    auto logFailureHintIfNeeded = [&]() {
+        if (!failedMaterialPaths.empty() && !m_loggedMaterialFailureHint)
+        {
+            Tracen("[MATERIAL-ASSET] hint failedPaths_present recoveryNote=\"A reconcile path-okat ujraprobalni: editor restart, vagy modositsa az erintett fajlokat (mentes/watcher esemeny utan a failedAttempts session-cache ujraepul).\"");
+            m_loggedMaterialFailureHint = true;
+        }
+    };
+
+    for (auto it = m_failedMaterialDiscoveryAttempts.begin(); it != m_failedMaterialDiscoveryAttempts.end();)
+    {
+        if (!std::filesystem::exists(std::filesystem::path(*it)))
+            it = m_failedMaterialDiscoveryAttempts.erase(it);
+        else
+            ++it;
+    }
 
     for (Entry entry : m_entries)
     {
@@ -1719,6 +2273,10 @@ bool AssetLibrary::ReconcileFilesystem(std::string& error)
         {
             if (entry.category == Category::Texture)
                 changed = PopulateTextureMetadata(entry, false, &error) || changed;
+            if (entry.category == Category::Material)
+            {
+                knownMaterialPaths.insert(CanonicalPathString(AbsolutePath(entry)));
+            }
             reconciled.push_back(std::move(entry));
             continue;
         }
@@ -1742,6 +2300,10 @@ bool AssetLibrary::ReconcileFilesystem(std::string& error)
                 entry.subpath = NormalizeSubpath(parentRel.generic_string());
             if (entry.category == Category::Texture)
                 PopulateTextureMetadata(entry, false, &error);
+            if (entry.category == Category::Material)
+            {
+                knownMaterialPaths.insert(CanonicalPathString(matches.front()));
+            }
             reconciled.push_back(std::move(entry));
             changed = true;
             continue;
@@ -1753,10 +2315,139 @@ bool AssetLibrary::ReconcileFilesystem(std::string& error)
         changed = true;
     }
 
+    std::error_code ec;
+    const auto materialDir = CategoryDirectory(Category::Material);
+    if (std::filesystem::exists(materialDir, ec))
+    {
+        for (std::filesystem::recursive_directory_iterator it(materialDir, ec), end; it != end && !ec; it.increment(ec))
+        {
+            if (!it->is_regular_file(ec) || !HasAnyExtension(it->path(), {".material"}))
+                continue;
+            const std::string canonical = CanonicalPathString(it->path());
+            if (knownMaterialPaths.find(canonical) != knownMaterialPaths.end())
+                continue;
+            if (m_failedMaterialDiscoveryAttempts.find(canonical) != m_failedMaterialDiscoveryAttempts.end())
+                continue;
+
+            ++discoveredMaterials;
+            const auto registerBegin = std::chrono::steady_clock::now();
+            std::string failedStep;
+            std::string failedMessage;
+            Guid materialGuid{};
+            try
+            {
+                materialGuid = RegisterMaterialAssetFile(it->path(), failedStep, failedMessage);
+            }
+            catch (const std::exception& ex)
+            {
+                failedStep = failedStep.empty() ? "cacheInsert" : failedStep;
+                failedMessage = ex.what();
+            }
+            catch (...)
+            {
+                failedStep = failedStep.empty() ? "cacheInsert" : failedStep;
+                failedMessage = "unknown exception";
+            }
+
+            if (IsEmptyGuid(materialGuid))
+            {
+                if (failedStep.empty())
+                    failedStep = "dbRegister";
+                if (failedMessage.empty())
+                    failedMessage = "registration failed";
+                m_failedMaterialDiscoveryAttempts.insert(canonical);
+                failedMaterialPaths.push_back(it->path().generic_string());
+                ++failedMaterials;
+                RecordMaterialDiscoveryDiag(it->path(),
+                    "AssetLibrary::ReconcileFilesystem::scanMaterialFolder",
+                    "no",
+                    "yes",
+                    "register_failed",
+                    nullptr);
+                Tracenf("[MATERIAL-ASSET] register_failed path=%s step=%s errorMessage=\"%s\" exceptionType=%s attemptCount=1 willRetry=no",
+                    it->path().generic_string().c_str(),
+                    failedStep.c_str(),
+                    failedMessage.c_str(),
+                    failedMessage == "unknown exception" ? "unknown" : "none");
+                continue;
+            }
+
+            Entry entry;
+            entry.id = MakeUniqueId(Category::Material, it->path());
+            entry.category = Category::Material;
+            entry.displayName = it->path().stem().string();
+            ec.clear();
+            std::filesystem::path parentRel = std::filesystem::relative(it->path().parent_path(), materialDir, ec);
+            entry.subpath = ec ? "" : NormalizeSubpath(parentRel.generic_string());
+            entry.filename = it->path().filename().generic_string();
+            entry.originalPath = GenericPath(it->path());
+            entry.importedAt = TimestampUtc();
+            entry.thumbnail = "material_icon";
+            entry.tags = {"material"};
+            knownMaterialPaths.insert(canonical);
+            reconciled.push_back(std::move(entry));
+            changed = true;
+            ++registeredMaterials;
+            newlyRegisteredMaterialPaths.push_back(canonical);
+            const auto registerEnd = std::chrono::steady_clock::now();
+            const double registerMs =
+                std::chrono::duration<double, std::milli>(registerEnd - registerBegin).count();
+            RecordMaterialDiscoveryDiag(it->path(),
+                "AssetLibrary::ReconcileFilesystem::scanMaterialFolder",
+                "no",
+                "yes",
+                "register_OK",
+                &reconciled.back());
+            Tracenf("[MATERIAL-ASSET] register_OK path=%s guid=%s durationMs=%.3f",
+                it->path().generic_string().c_str(),
+                materialGuid.toString().c_str(),
+                registerMs);
+            if (ShouldLogOriginalMaterialDiscovery(it->path().generic_string(), MaterialDiscoveryDiag().frame))
+            {
+                Tracenf("[ASSET-LIBRARY] discovered material asset path=%s",
+                    it->path().generic_string().c_str());
+            }
+        }
+    }
+
     if (changed)
     {
         m_entries = std::move(reconciled);
-        return SaveManifest(error);
+        if (!SaveManifest(error))
+        {
+            m_entries = entriesBeforeReconcile;
+            for (const std::string& path : newlyRegisteredMaterialPaths)
+            {
+                m_failedMaterialDiscoveryAttempts.insert(path);
+                failedMaterialPaths.push_back(path);
+                Tracenf("[MATERIAL-ASSET] register_failed path=%s step=manifestSave errorMessage=\"%s\" exceptionType=none attemptCount=1 willRetry=no",
+                    path.c_str(),
+                    error.c_str());
+            }
+            const auto reconcileEnd = std::chrono::steady_clock::now();
+            const double durationMs =
+                std::chrono::duration<double, std::milli>(reconcileEnd - reconcileBegin).count();
+            Tracenf("[MATERIAL-ASSET] reconcile_summary durationMs=%.3f discovered=%u registered=0 failed=%zu failedPaths=%s",
+                durationMs,
+                discoveredMaterials,
+                failedMaterialPaths.size(),
+                FailedPathList(failedMaterialPaths).c_str());
+            logFailureHintIfNeeded();
+            return false;
+        }
+    }
+    if (discoveredMaterials > 0 || registeredMaterials > 0 || failedMaterials > 0)
+    {
+        const auto reconcileEnd = std::chrono::steady_clock::now();
+        const double durationMs =
+            std::chrono::duration<double, std::milli>(reconcileEnd - reconcileBegin).count();
+        Tracenf("[MATERIAL-ASSET] reconcile_summary durationMs=%.3f discovered=%u registered=%u failed=%u failedPaths=%s",
+            durationMs,
+            discoveredMaterials,
+            registeredMaterials,
+            failedMaterials,
+            FailedPathList(failedMaterialPaths).c_str());
+        logFailureHintIfNeeded();
     }
     return true;
 }
@@ -1932,9 +2623,9 @@ bool AssetLibrary::ValidateFile(Category category, const std::filesystem::path& 
         }
         break;
     case Category::Model:
-        if (!HasAnyExtension(path, {".gltf", ".glb"}))
+        if (!HasAnyExtension(path, {".gltf", ".glb", ".fbx"}))
         {
-            error = "models must be GLTF or GLB";
+            error = "models must be GLTF, GLB or FBX";
             return false;
         }
         break;
@@ -1946,9 +2637,9 @@ bool AssetLibrary::ValidateFile(Category category, const std::filesystem::path& 
         }
         break;
     case Category::Material:
-        if (!HasAnyExtension(path, {".material.json", ".json"}))
+        if (!HasAnyExtension(path, {".material", ".material.json", ".json"}))
         {
-            error = "materials must be JSON";
+            error = "materials must be MATERIAL or JSON";
             return false;
         }
         break;
@@ -2333,7 +3024,9 @@ bool AssetLibrary::Remove(const std::string& id, std::string& error)
     }
 
     std::error_code ec;
-    std::filesystem::remove(AbsolutePath(*it), ec);
+    const std::filesystem::path assetPath = AbsolutePath(*it);
+    m_failedMaterialDiscoveryAttempts.erase(CanonicalPathString(assetPath));
+    std::filesystem::remove(assetPath, ec);
     m_entries.erase(it);
     return SaveManifest(error);
 }

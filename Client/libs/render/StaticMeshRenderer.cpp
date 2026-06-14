@@ -1,6 +1,8 @@
 #include "StaticMeshRenderer.h"
 
 #include "Debug.h"
+#include "MaterialAssetManager.h"
+#include "ProjectManager.h"
 #include "asset/IAssetReader.h"
 
 #include <fastgltf/core.hpp>
@@ -456,7 +458,8 @@ bool CopyDataSourceBytes(const fastgltf::Asset& asset, const fastgltf::DataSourc
 
 std::optional<fastgltf::Asset> ParseGltf(client::asset::IAssetReader& assets,
     const std::string& modelPath,
-    std::string* error)
+    std::string* error,
+    bool loadExternalImages = true)
 {
     const size_t slash = modelPath.find_last_of("\\/");
     const std::string dir = slash == std::string::npos ? std::string(".") : modelPath.substr(0, slash);
@@ -475,11 +478,12 @@ std::optional<fastgltf::Asset> ParseGltf(client::asset::IAssetReader& assets,
             *error = std::string("data buffer error: ") + std::string(fastgltf::getErrorMessage(data.error()));
         return std::nullopt;
     }
-    constexpr fastgltf::Options options =
+    fastgltf::Options options =
         fastgltf::Options::DecomposeNodeMatrices |
         fastgltf::Options::LoadExternalBuffers |
-        fastgltf::Options::LoadExternalImages |
         fastgltf::Options::GenerateMeshIndices;
+    if (loadExternalImages)
+        options |= fastgltf::Options::LoadExternalImages;
 
     fastgltf::Parser parser;
     auto assetResult = parser.loadGltf(data.get(), std::filesystem::path(dir),
@@ -531,6 +535,142 @@ StaticMeshRenderer::MaterialDefaults ReadMaterialDefaults(const fastgltf::Materi
     defaults.emissive[1] = material.emissiveFactor.y();
     defaults.emissive[2] = material.emissiveFactor.z();
     return defaults;
+}
+
+std::optional<std::filesystem::path> TexturePathFromInfo(const fastgltf::Asset& asset,
+                                                         const fastgltf::TextureInfo& info,
+                                                         const std::filesystem::path& modelDir)
+{
+    if (info.textureIndex >= asset.textures.size())
+        return std::nullopt;
+    const fastgltf::Texture& texture = asset.textures[info.textureIndex];
+    std::optional<std::size_t> imageIndex = texture.imageIndex;
+    if (!imageIndex)
+        imageIndex = texture.ddsImageIndex;
+    if (!imageIndex)
+        imageIndex = texture.basisuImageIndex;
+    if (!imageIndex || *imageIndex >= asset.images.size())
+        return std::nullopt;
+
+    const auto& image = asset.images[*imageIndex];
+    const auto* uri = std::get_if<fastgltf::sources::URI>(&image.data);
+    if (!uri || !uri->uri.isLocalPath() || uri->uri.isDataUri())
+        return std::nullopt;
+
+    std::filesystem::path path = uri->uri.fspath();
+    if (path.is_relative())
+        path = modelDir / path;
+    std::error_code ec;
+    std::filesystem::path normalized = std::filesystem::weakly_canonical(path, ec);
+    return ec ? std::filesystem::absolute(path) : normalized;
+}
+
+std::string AlphaModeString(fastgltf::AlphaMode mode)
+{
+    switch (mode)
+    {
+    case fastgltf::AlphaMode::Mask: return "mask";
+    case fastgltf::AlphaMode::Blend: return "blend";
+    default: return "opaque";
+    }
+}
+
+std::string SanitizedStem(std::string value)
+{
+    for (char& c : value)
+    {
+        if (!std::isalnum(static_cast<unsigned char>(c)))
+            c = '_';
+    }
+    while (!value.empty() && value.back() == '_')
+        value.pop_back();
+    return value.empty() ? "asset" : value;
+}
+
+GltfMaterialSource BuildMaterialSource(const fastgltf::Asset& asset,
+                                       const fastgltf::Material* material,
+                                       std::size_t index,
+                                       const std::filesystem::path& modelDir)
+{
+    GltfMaterialSource source{};
+    source.name = material && !material->name.empty()
+        ? std::string(material->name)
+        : ("material_" + std::to_string(index));
+    if (!material)
+        return source;
+
+    source.baseColor[0] = material->pbrData.baseColorFactor.x();
+    source.baseColor[1] = material->pbrData.baseColorFactor.y();
+    source.baseColor[2] = material->pbrData.baseColorFactor.z();
+    source.baseColor[3] = material->pbrData.baseColorFactor.w();
+    source.metallic = material->pbrData.metallicFactor;
+    source.roughness = material->pbrData.roughnessFactor;
+    source.emissive[0] = material->emissiveFactor.x();
+    source.emissive[1] = material->emissiveFactor.y();
+    source.emissive[2] = material->emissiveFactor.z();
+    source.emissive[3] = material->emissiveStrength;
+    source.alphaMode = AlphaModeString(material->alphaMode);
+    source.alphaCutoff = material->alphaCutoff;
+    if (material->normalTexture.has_value())
+    {
+        source.normalStrength = material->normalTexture->scale;
+        if (const auto path = TexturePathFromInfo(asset, *material->normalTexture, modelDir))
+            source.normalTexturePath = *path;
+    }
+    if (material->occlusionTexture.has_value())
+    {
+        source.aoStrength = material->occlusionTexture->strength;
+        if (const auto path = TexturePathFromInfo(asset, *material->occlusionTexture, modelDir))
+            source.aoTexturePath = *path;
+    }
+    if (material->pbrData.baseColorTexture.has_value())
+    {
+        if (const auto path = TexturePathFromInfo(asset, *material->pbrData.baseColorTexture, modelDir))
+            source.baseColorTexturePath = *path;
+    }
+    if (material->pbrData.metallicRoughnessTexture.has_value())
+    {
+        if (const auto path = TexturePathFromInfo(asset, *material->pbrData.metallicRoughnessTexture, modelDir))
+            source.metallicRoughnessTexturePath = *path;
+    }
+    if (material->emissiveTexture.has_value())
+    {
+        if (const auto path = TexturePathFromInfo(asset, *material->emissiveTexture, modelDir))
+            source.emissiveTexturePath = *path;
+    }
+    return source;
+}
+
+void GenerateMaterialAssetsForGltf(const fastgltf::Asset& asset, const std::string& modelPath)
+{
+    ProjectManager& projects = ProjectManager::Instance();
+    if (!projects.HasProject())
+        return;
+
+    const std::filesystem::path modelFsPath(modelPath);
+    const std::filesystem::path modelDir = modelFsPath.has_parent_path()
+        ? modelFsPath.parent_path()
+        : std::filesystem::current_path();
+    const std::string meshName = SanitizedStem(modelFsPath.stem().string());
+    const std::filesystem::path materialFolder = projects.AssetRootPath() / "materials" / meshName;
+
+    auto& manager = MaterialAssetManager::Instance();
+    MaterialAssetManager::ImportSummary summary{};
+    const std::size_t materialCount = asset.materials.empty() ? 1u : asset.materials.size();
+    summary.materials = static_cast<std::uint32_t>(materialCount);
+    for (std::size_t i = 0; i < materialCount; ++i)
+    {
+        const fastgltf::Material* material = asset.materials.empty() ? nullptr : &asset.materials[i];
+        GltfMaterialSource source = BuildMaterialSource(asset, material, i, modelDir);
+        manager.createFromGltfMaterial(source, materialFolder, source.name, &summary);
+    }
+
+    Tracenf("[MATERIAL-ASSET] gltf_import_summary mesh=%s materials=%u generated=%u reused=%u conflicts=%u",
+        modelFsPath.filename().generic_string().c_str(),
+        summary.materials,
+        summary.generated,
+        summary.reused,
+        summary.conflicts);
 }
 
 RgbaImage CreateFallbackWhiteImage(const std::string& modelPath)
@@ -1037,7 +1177,7 @@ bool StaticMeshRenderer::LoadStaticGltfMesh(const std::string& modelPath)
     if (!m_assets)
         return false;
     std::string error;
-    auto parsed = ParseGltf(*m_assets, modelPath, &error);
+    auto parsed = ParseGltf(*m_assets, modelPath, &error, false);
     if (!parsed)
     {
         LogFormat("[STATIC-MESH] parse failed: %s reason=%s", modelPath.c_str(), error.c_str());
@@ -1161,6 +1301,7 @@ bool StaticMeshRenderer::LoadStaticGltfMesh(const std::string& modelPath)
         m_boundsMax = {0.0f, 0.0f, 0.0f};
         return false;
     }
+    GenerateMaterialAssetsForGltf(asset, modelPath);
     LogFormat("[MPERF] mesh=%s verts=%zu submeshes=%zu materials=%u alpha=%s",
         modelPath.c_str(),
         m_vertices.size(),
