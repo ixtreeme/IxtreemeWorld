@@ -4,8 +4,10 @@
 #include "WorldCamera.h"
 #include "MapEditorTypes.h"
 
+#include <algorithm>
 #include <array>
 #include <cstdint>
+#include <filesystem>
 #include <limits>
 #include <memory>
 #include <string>
@@ -47,7 +49,8 @@ public:
         WorldVec3 position,
         float yawRadians,
         uint32_t skinSlot = 0,
-        std::array<float, 4> tint = {1.0f, 1.0f, 1.0f, 1.0f});
+        std::array<float, 4> tint = {1.0f, 1.0f, 1.0f, 1.0f},
+        VkExtent2D targetExtent = {});
     void RenderInWorldReflection(VulkanDevice& device,
         const WorldCamera& camera,
         VkExtent2D extent,
@@ -60,6 +63,7 @@ public:
     void SetLightingState(const LightingState& lighting) { m_lightingState = lighting; }
     void SetMotionState(MotionState state);
     float GroundOffsetY() const;
+    std::uint32_t MaterialSlotCount() const { return std::max<std::uint32_t>(1u, static_cast<std::uint32_t>(m_draws.size())); }
     static constexpr uint32_t MaxSkinSlots() { return kSkinSlots; }
     void Destroy();
 
@@ -143,7 +147,8 @@ private:
     struct OzzRuntime;
 
     bool LoadGltfMesh(const std::string& modelPath);
-    bool LoadOzzPose(const std::string& dir);
+    bool LoadFbxMesh(const std::string& modelPath);
+    bool LoadOzzPose(const std::string& modelPath);
     bool CreateBuffers(VulkanDevice& device);
     bool CreateTextures(VulkanDevice& device, const std::string& modelPath);
     bool CreateDescriptors();
@@ -195,6 +200,7 @@ private:
     std::vector<Vertex> m_vertices;
     std::vector<uint32_t> m_indices;
     std::vector<MeshDraw> m_draws;
+    std::filesystem::path m_importedDiffuseTexturePath;
     std::vector<RawMesh> m_rawMeshes;
     std::vector<RestVertexGpu> m_restVerticesGpu;
     std::array<Texture, kTextureCount> m_textures{};

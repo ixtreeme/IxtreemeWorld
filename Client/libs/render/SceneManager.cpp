@@ -1,5 +1,6 @@
 #include "SceneManager.h"
 
+#include "Common.h"
 #include "Debug.h"
 #include "ProjectManager.h"
 #include "map/MapData.h"
@@ -28,6 +29,10 @@
 
 namespace
 {
+using ixtreeme::common::EscapeJson;
+using ixtreeme::common::GenericPath;
+using ixtreeme::common::TimestampUtc;
+
 struct JsonValue
 {
     enum class Type { Null, Bool, Number, String, Array, Object };
@@ -243,45 +248,6 @@ private:
     std::string m_text;
     size_t m_pos = 0;
 };
-
-std::string EscapeJson(const std::string& value)
-{
-    std::string out;
-    out.reserve(value.size() + 8);
-    for (char ch : value)
-    {
-        switch (ch)
-        {
-        case '"': out += "\\\""; break;
-        case '\\': out += "\\\\"; break;
-        case '\n': out += "\\n"; break;
-        case '\r': out += "\\r"; break;
-        case '\t': out += "\\t"; break;
-        default: out.push_back(ch); break;
-        }
-    }
-    return out;
-}
-
-std::string GenericPath(const std::filesystem::path& path)
-{
-    return path.generic_string();
-}
-
-std::string TimestampUtc()
-{
-    const auto now = std::chrono::system_clock::now();
-    const std::time_t time = std::chrono::system_clock::to_time_t(now);
-    std::tm tm{};
-#if defined(_WIN32)
-    gmtime_s(&tm, &time);
-#else
-    gmtime_r(&time, &tm);
-#endif
-    std::ostringstream out;
-    out << std::put_time(&tm, "%Y-%m-%dT%H:%M:%SZ");
-    return out.str();
-}
 
 std::string SceneNameFromPath(const std::string& path)
 {
@@ -1275,6 +1241,14 @@ void SceneManager::SetWindowTitleCallback(std::function<void(const std::string&)
     UpdateWindowTitle();
 }
 
+void SceneManager::SetWindowTitleSuffix(std::string suffix)
+{
+    if (m_windowTitleSuffix == suffix)
+        return;
+    m_windowTitleSuffix = std::move(suffix);
+    UpdateWindowTitle();
+}
+
 void SceneManager::SetCurrentSceneSnapshot(const SceneData& scene)
 {
     SceneData snapshot = scene;
@@ -1811,6 +1785,8 @@ void SceneManager::UpdateWindowTitle()
     {
         title += " [No Scene]";
     }
+    if (!m_windowTitleSuffix.empty())
+        title += " | " + m_windowTitleSuffix;
 
     if (m_windowTitleCallback)
         m_windowTitleCallback(title);

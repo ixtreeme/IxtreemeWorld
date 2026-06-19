@@ -1,3 +1,5 @@
+#include "AssimpExporter.h"
+#include "AssimpImporter.h"
 #include "AssetLibrary.h"
 #include "MapEditorTypes.h"
 #include "ProjectManager.h"
@@ -6,6 +8,7 @@
 #include "ixtreemetree/ixtreemetree.h"
 #include "map/MapData.h"
 #include "schema/map_manifest.capnp.h"
+#include "tools/tree/TreeGlbExporter.h"
 
 #include <algorithm>
 #include <chrono>
@@ -382,6 +385,20 @@ bool RunAssetTests(const Options& options, TestContext& ctx)
     ctx.Expect(std::filesystem::exists(importedGltf.parent_path() / "buffers" / "boulder.bin") &&
             std::filesystem::exists(importedGltf.parent_path() / "textures" / "boulder_albedo.png"),
         "gltf dependencies copied", "gltf external .bin or texture was not copied beside the imported model");
+
+    AssetLibrary::Entry directImport;
+    std::filesystem::path directFinalPath;
+    const std::filesystem::path directTargetFolder = fakeClientRoot / "assets" / "library" / "custom" / "drop";
+    if (!ctx.Expect(library.ImportFileToFolder(stonePath, directTargetFolder, directImport, directFinalPath, error),
+            "direct folder import", error))
+        return false;
+    ctx.Expect(directImport.category == AssetLibrary::Category::Texture &&
+            directImport.subpath == "custom/drop" &&
+            directFinalPath == directTargetFolder / stonePath.filename() &&
+            library.AbsolutePath(directImport) == directFinalPath &&
+            std::filesystem::exists(directFinalPath),
+        "direct import no auto categorize", "direct import should copy exactly into the requested folder, not a category subfolder");
+
     const auto missingGltfPath = gltfRoot / "missing_dependency.gltf";
     {
         std::ofstream gltf(missingGltfPath, std::ios::binary);
@@ -742,15 +759,15 @@ bool RunRenderChecks(const Options& options, TestContext& ctx)
     ctx.Expect(std::filesystem::exists(options.clientRoot / "shaders" / "Water.hlsl"),
         "water shader source exists", "Client/shaders/Water.hlsl missing");
     ctx.Expect(std::filesystem::exists(shaderDir / "water_vs.spv"),
-        "water vertex shader compiled", "assets/shaders/water_vs.spv missing; build ClientShaders");
+        "water vertex shader compiled", "assets/shaders/water_vs.spv missing; build IXEngineShaders");
     ctx.Expect(std::filesystem::exists(shaderDir / "water_ps.spv"),
-        "water pixel shader compiled", "assets/shaders/water_ps.spv missing; build ClientShaders");
+        "water pixel shader compiled", "assets/shaders/water_ps.spv missing; build IXEngineShaders");
     ctx.Expect(std::filesystem::exists(options.clientRoot / "shaders" / "Composite.hlsl"),
         "composite shader source exists", "Client/shaders/Composite.hlsl missing");
     ctx.Expect(std::filesystem::exists(shaderDir / "composite_vs.spv"),
-        "composite vertex shader compiled", "assets/shaders/composite_vs.spv missing; build ClientShaders");
+        "composite vertex shader compiled", "assets/shaders/composite_vs.spv missing; build IXEngineShaders");
     ctx.Expect(std::filesystem::exists(shaderDir / "composite_ps.spv"),
-        "composite pixel shader compiled", "assets/shaders/composite_ps.spv missing; build ClientShaders");
+        "composite pixel shader compiled", "assets/shaders/composite_ps.spv missing; build IXEngineShaders");
 
     const std::filesystem::path waterShaderPath = options.clientRoot / "shaders" / "Water.hlsl";
     std::ifstream waterShader(waterShaderPath);
@@ -1381,7 +1398,9 @@ bool RunRenderChecks(const Options& options, TestContext& ctx)
     ctx.Expect(treeLibHeaderSource.find("struct TreeOptions") != std::string::npos &&
             treeLibHeaderSource.find("enum class TreeType") != std::string::npos &&
             treeLibHeaderSource.find("enum class BarkType") != std::string::npos &&
-            treeLibHeaderSource.find("enum class LeafBillboard") != std::string::npos &&
+            treeLibHeaderSource.find("cardsPerCluster") != std::string::npos &&
+            treeLibHeaderSource.find("atlasGridX") != std::string::npos &&
+            treeLibHeaderSource.find("atlasGridY") != std::string::npos &&
             treeLibSource.find("Rng rng(options.seed)") != std::string::npos &&
             treeLibSource.find("GenerateBranch") != std::string::npos &&
             treeLibSource.find("GenerateLeaves") != std::string::npos &&
@@ -1403,6 +1422,36 @@ bool RunRenderChecks(const Options& options, TestContext& ctx)
             a.stats.leafTriangles > 0;
         ctx.Expect(deterministic,
             "ixtreemetree deterministic generate", "TREE-1 must generate deterministic non-empty bark and leaf meshes from the same seed/options");
+    }
+    {
+        const std::filesystem::path scratch = (options.scratchRoot.empty() ? MakeDefaultScratchRoot() : options.scratchRoot) / "tree_fbx_export";
+        std::error_code ec;
+        std::filesystem::create_directories(scratch, ec);
+
+        ixtreemetree::Tree tree;
+        tree.options = ixtreemetree::defaultTreeOptions();
+        tree.options.seed = 91917;
+        const ixtreemetree::TreeMesh mesh = tree.generate();
+
+        tree_tool::TreeMaterialBinding binding{};
+        binding.barkBaseColorTexturePath = options.clientRoot / "assets" / "internal" / "textures" / "bark" / "oak_bark.png";
+        binding.leafBaseColorTexturePath = options.clientRoot / "assets" / "internal" / "textures" / "leaves" / "oak_leaf.png";
+        const tree_tool::TreeExportResult glb = tree_tool::TreeGlbExporter::SaveAsAsset(mesh, scratch, "fbx_export_tree", binding);
+
+        AssimpExporter::ExportOptions exportOptions{};
+        exportOptions.outputPath = scratch / "fbx_export_tree.fbx";
+        exportOptions.embedTextures = true;
+        std::string exportError;
+        const bool exported = glb.ok && AssimpExporter::ExportAssetToFbx(glb.modelPath, exportOptions, exportError);
+        ctx.Expect(exported && std::filesystem::exists(exportOptions.outputPath),
+            "tree glb exports to fbx", "Tree Generator GLB with external bark/leaf textures must export to FBX without Assimp iterator crash; error=" + (glb.ok ? exportError : glb.error));
+        if (exported)
+        {
+            AssimpImporter importer;
+            const AssimpImporter::ImportResult importResult = importer.importFile(exportOptions.outputPath);
+            ctx.Expect(importResult.success && !importResult.meshes.empty() && !importResult.materials.empty(),
+                "tree fbx imports as static mesh", "FBX static import must parse exported Tree Generator FBX into renderable meshes/materials");
+        }
     }
     ctx.Expect(treePresetHeaderSource.find("loadPresetFile") != std::string::npos &&
             treePresetHeaderSource.find("loadAllPresets") != std::string::npos &&
@@ -1479,7 +1528,8 @@ bool RunRenderChecks(const Options& options, TestContext& ctx)
         ctx.Expect(textureCount == 10 &&
                 renderCmakeSource.find("TreeTexturePalette.cpp") != std::string::npos &&
                 treePaletteSource.find("[TREE-3] palette_loaded bark=") != std::string::npos &&
-                treePaletteSource.find("[TREE-3] generated procedural fallback") != std::string::npos &&
+                treePaletteSource.find("[TREE-3] generated procedural") != std::string::npos &&
+                treePaletteSource.find("[TREE-LEAF-FORM-1] atlas_grid=2x2 cardsPerCluster_default=3") != std::string::npos &&
                 treePanelSource.find("RenderTextureOverrideSlot") != std::string::npos &&
                 treePanelSource.find("AcceptDragDropPayload(\"ASSET_ID\")") != std::string::npos &&
                 treePanelSource.find("AssetLibrary::Category::Texture") != std::string::npos &&
@@ -1790,8 +1840,11 @@ bool RunRenderChecks(const Options& options, TestContext& ctx)
     ctx.Expect(editorImGuiSource.find("RenderWaterSculptToolPanel") != std::string::npos &&
             editorImGuiSource.find("RenderHeightmapToolPanel") != std::string::npos &&
             editorImGuiSource.find("RenderSplatPaintToolPanel") != std::string::npos &&
-            editorImGuiSource.find("ImportAssetWithDialog") != std::string::npos &&
-            editorImGuiSource.find("PickAssetFileForImport") != std::string::npos &&
+            editorImGuiSource.find("OpenImportAssetDialog") != std::string::npos &&
+            editorImGuiSource.find("ImportAssetFromPath") != std::string::npos &&
+            editorImGuiSource.find("ImportAssetIntoFolder") != std::string::npos &&
+            editorImGuiSource.find("[IMPORT-DIAG]") != std::string::npos &&
+            clientMainSource.find("editorImGui.ImportExternalFiles") != std::string::npos &&
             clientMainSource.find("editorSettings.toolMode == MapEditorToolMode::Heightmap") != std::string::npos &&
             clientMainSource.find("editorSettings.toolMode == MapEditorToolMode::SplatPaint") != std::string::npos,
         "editor tool ui moved to imgui", "EDITOR-IMGUI-5 tool panels/import routing are missing or legacy tool markup remains");

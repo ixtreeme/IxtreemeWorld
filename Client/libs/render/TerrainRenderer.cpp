@@ -645,10 +645,58 @@ bool LoadAnyTerrainImage(client::asset::IAssetReader& assets,
     RgbaImage& out,
     const std::vector<std::filesystem::path>* additionalRoots = nullptr)
 {
+    std::string ext = std::filesystem::path(path).extension().string();
+    std::transform(ext.begin(), ext.end(), ext.begin(), [](unsigned char c) {
+        return static_cast<char>(std::tolower(c));
+    });
+    if (ext == ".dds")
+    {
+        DdsImage dds{};
+        return LoadDdsImage(assets, path, dds, additionalRoots) && DdsToRgba(dds, out);
+    }
+    if (ext == ".png" || ext == ".jpg" || ext == ".jpeg" || ext == ".tga" || ext == ".bmp")
+        return LoadStbImage(assets, path, out, additionalRoots);
+
     DdsImage dds{};
     if (LoadDdsImage(assets, path, dds, additionalRoots))
         return DdsToRgba(dds, out);
     return LoadStbImage(assets, path, out, additionalRoots);
+}
+
+bool TerrainAabbOutsideCameraFrustum(const WorldCamera& camera, WorldVec3 min, WorldVec3 max)
+{
+    const std::array<WorldVec3, 8> corners = {{
+        {min.x, min.y, min.z},
+        {max.x, min.y, min.z},
+        {min.x, max.y, min.z},
+        {max.x, max.y, min.z},
+        {min.x, min.y, max.z},
+        {max.x, min.y, max.z},
+        {min.x, max.y, max.z},
+        {max.x, max.y, max.z},
+    }};
+
+    bool outsideLeft = true;
+    bool outsideRight = true;
+    bool outsideBottom = true;
+    bool outsideTop = true;
+    bool outsideNear = true;
+    bool outsideFar = true;
+    const float* m = camera.viewProjection.m;
+    for (const WorldVec3& p : corners)
+    {
+        const float clipX = p.x * m[0] + p.y * m[4] + p.z * m[8] + m[12];
+        const float clipY = p.x * m[1] + p.y * m[5] + p.z * m[9] + m[13];
+        const float clipZ = p.x * m[2] + p.y * m[6] + p.z * m[10] + m[14];
+        const float clipW = p.x * m[3] + p.y * m[7] + p.z * m[11] + m[15];
+        outsideLeft = outsideLeft && (clipX < -clipW);
+        outsideRight = outsideRight && (clipX > clipW);
+        outsideBottom = outsideBottom && (clipY < -clipW);
+        outsideTop = outsideTop && (clipY > clipW);
+        outsideNear = outsideNear && (clipZ < 0.0f);
+        outsideFar = outsideFar && (clipZ > clipW);
+    }
+    return outsideLeft || outsideRight || outsideBottom || outsideTop || outsideNear || outsideFar;
 }
 
 RgbaImage ResizeNearest(const RgbaImage& src, uint32_t width, uint32_t height)
@@ -1853,6 +1901,8 @@ bool TerrainRenderer::LoadMap(VulkanDevice& device, const std::string& mapDirect
     m_spawnDebugIndexCount = 0;
     m_logicDebugIndexOffset = 0;
     m_logicDebugIndexCount = 0;
+    m_terrainChunks.clear();
+    m_visibleTerrainChunksScratch.clear();
     m_selectedWaterBodyIndexCount = 0;
     m_selectedWaterBodyId = 0;
     m_zoneFillDebugRanges.clear();
@@ -1876,6 +1926,8 @@ bool TerrainRenderer::LoadMap(VulkanDevice& device, const std::string& mapDirect
         m_splatHeight = 0;
         m_chunkSplatWidth = 0;
         m_chunkSplatHeight = 0;
+        m_terrainChunks.clear();
+        m_visibleTerrainChunksScratch.clear();
         m_undoStack.clear();
         const bool flat = CreateFlatBuffers(device);
         LoadWaterBodies(device, mapDirectory);
@@ -1937,6 +1989,8 @@ bool TerrainRenderer::CreateFlatTerrain(VulkanDevice& device, const TerrainScene
     m_debugIndexCount = 0;
     m_selectedWaterBodyIndexCount = 0;
     m_selectedWaterBodyId = 0;
+    m_terrainChunks.clear();
+    m_visibleTerrainChunksScratch.clear();
     m_waterBodies.clear();
     m_heightCmGrid.clear();
     m_attributes.clear();
@@ -2232,7 +2286,11 @@ void TerrainRenderer::RenderSunShadowMap(VulkanDevice& device, const WorldCamera
 {
     if (!m_sceneTerrainActive || m_sceneTerrain.editorHidden || !m_lightingState.sunShadowsEnabled || !m_shadowPipeline || !m_shadowImage ||
         !m_vertexBuffer.buffer || !m_indexBuffer.buffer || m_indexCount == 0 || !device.IsFrameActive())
+    {
+        for (PassDrawStats& cascadeStats : m_frameDrawStats.shadowCascades)
+            cascadeStats.skipped = true;
         return;
+    }
 
     UpdateShadowCascades(camera);
 
@@ -2255,7 +2313,7 @@ void TerrainRenderer::RenderSunShadowMap(VulkanDevice& device, const WorldCamera
 
     if (m_sceneTerrain.triplanarEnabled && !m_triPerfShadowPassLogged)
     {
-        Tracenf("[TRI-PERF] terrain pipeline bound in pass=shadow-cascade0..%u triplanar=no shader=depth-only extent=%ux%u",
+        TraceDiagf("[TRI-PERF] terrain pipeline bound in pass=shadow-cascade0..%u triplanar=no shader=depth-only extent=%ux%u",
             kShadowCascadeCount - 1u,
             kShadowResolution,
             kShadowResolution);
@@ -2264,6 +2322,17 @@ void TerrainRenderer::RenderSunShadowMap(VulkanDevice& device, const WorldCamera
 
     for (uint32_t cascade = 0; cascade < kShadowCascadeCount; ++cascade)
     {
+        const VulkanDevice::GpuTimestampPoint cascadeBegin =
+            cascade == 0 ? VulkanDevice::GpuTimestampPoint::ShadowCascade0Begin :
+            cascade == 1 ? VulkanDevice::GpuTimestampPoint::ShadowCascade1Begin :
+            cascade == 2 ? VulkanDevice::GpuTimestampPoint::ShadowCascade2Begin :
+                           VulkanDevice::GpuTimestampPoint::ShadowCascade3Begin;
+        const VulkanDevice::GpuTimestampPoint cascadeEnd =
+            cascade == 0 ? VulkanDevice::GpuTimestampPoint::ShadowCascade0End :
+            cascade == 1 ? VulkanDevice::GpuTimestampPoint::ShadowCascade1End :
+            cascade == 2 ? VulkanDevice::GpuTimestampPoint::ShadowCascade2End :
+                           VulkanDevice::GpuTimestampPoint::ShadowCascade3End;
+        device.WriteGpuTimestamp(cascadeBegin);
         VkRenderPassBeginInfo pass{};
         pass.sType = VK_STRUCTURE_TYPE_RENDER_PASS_BEGIN_INFO;
         pass.renderPass = m_shadowRenderPass;
@@ -2281,7 +2350,15 @@ void TerrainRenderer::RenderSunShadowMap(VulkanDevice& device, const WorldCamera
         vkCmdBindVertexBuffers(cmd, 0, 1, &m_vertexBuffer.buffer, &offset);
         vkCmdBindIndexBuffer(cmd, m_indexBuffer.buffer, 0, VK_INDEX_TYPE_UINT32);
         vkCmdDrawIndexed(cmd, m_indexCount, 1, 0, 0, 0);
+        PassDrawStats& cascadeStats = m_frameDrawStats.shadowCascades[cascade];
+        cascadeStats.executed = true;
+        cascadeStats.drawCalls = 1;
+        cascadeStats.chunksDrawn = m_terrainChunks.empty()
+            ? (m_indexCount > 0 ? 1u : 0u)
+            : static_cast<uint32_t>(m_terrainChunks.size());
+        cascadeStats.chunksCulled = 0;
         vkCmdEndRenderPass(cmd);
+        device.WriteGpuTimestamp(cascadeEnd);
     }
 
     TransitionDepthArrayLayout(cmd, m_shadowImage, kShadowCascadeCount,
@@ -2337,10 +2414,17 @@ void TerrainRenderer::RenderWaterReflection(VulkanDevice& device,
     double timeSeconds,
     const std::function<void(const WorldCamera&, VkExtent2D, VkRenderPass, float)>& renderEntities)
 {
+    PassDrawStats& reflectionStats = m_frameDrawStats.waterReflection;
+    auto skipReflection = [&]() {
+        reflectionStats.skipped = true;
+    };
     const WaterBodyGpu* reflectionBody = nullptr;
     float reflectionDistanceMeters = 0.0f;
     if (!m_sceneTerrainActive || m_sceneTerrain.editorHidden || m_waterBodies.empty())
+    {
+        skipReflection();
         return;
+    }
 
     reflectionBody = FindClosestWaterBody(camera, &reflectionDistanceMeters);
     if (!reflectionBody || !ResolveWaterConfig(reflectionBody->body).reflectionEnabled)
@@ -2361,6 +2445,7 @@ void TerrainRenderer::RenderWaterReflection(VulkanDevice& device,
             }
             m_lastWaterDiagTimeSeconds = timeSeconds;
         }
+        skipReflection();
         return;
     }
 
@@ -2368,11 +2453,17 @@ void TerrainRenderer::RenderWaterReflection(VulkanDevice& device,
     const float reflectionWaterLevelY = reflectionBody->body.waterLevelY;
     if (!reflectionConfig.enabled || !reflectionConfig.reflectionEnabled || !m_waterReflectionPipeline ||
         !m_waterReflection.framebuffer || !m_indexCount || !device.IsFrameActive())
+    {
+        skipReflection();
         return;
+    }
 
     const VkExtent2D swapExtent = device.GetSwapchainExtent();
     if (swapExtent.width == 0 || swapExtent.height == 0)
+    {
+        skipReflection();
         return;
+    }
 
     if (m_waterReflection.quality != reflectionConfig.reflectionQuality ||
         m_waterReflection.width == 0 || m_waterReflection.height == 0 ||
@@ -2384,7 +2475,10 @@ void TerrainRenderer::RenderWaterReflection(VulkanDevice& device,
     }
 
     if (!m_waterReflection.framebuffer || !m_waterReflectionPipeline)
+    {
+        skipReflection();
         return;
+    }
 
     const uint32_t frameIndex = device.GetFrameIndex();
     const WorldCamera mirror = ComputeMirrorCamera(camera, {m_waterReflection.width, m_waterReflection.height}, reflectionWaterLevelY);
@@ -2420,7 +2514,7 @@ void TerrainRenderer::RenderWaterReflection(VulkanDevice& device,
     vkCmdBindPipeline(cmd, VK_PIPELINE_BIND_POINT_GRAPHICS, m_waterReflectionPipeline);
     if (m_sceneTerrain.triplanarEnabled && !m_triPerfReflectionPassLogged)
     {
-        Tracenf("[TRI-PERF] terrain pipeline bound in pass=water-reflection triplanar=yes extent=%ux%u shader=terrain_ps",
+        TraceDiagf("[TRI-PERF] terrain pipeline bound in pass=water-reflection triplanar=yes extent=%ux%u shader=terrain_ps",
             m_waterReflection.width,
             m_waterReflection.height);
         m_triPerfReflectionPassLogged = true;
@@ -2449,6 +2543,7 @@ void TerrainRenderer::RenderWaterReflection(VulkanDevice& device,
             vkCmdBindDescriptorSets(cmd, VK_PIPELINE_BIND_POINT_GRAPHICS, m_waterReflectionPipelineLayout,
                 0, 1, &descriptorSet, 0, nullptr);
             vkCmdDrawIndexed(cmd, m_indexCount, 1, 0, 0, 0);
+            ++reflectionStats.drawCalls;
         }
     }
     else
@@ -2460,7 +2555,14 @@ void TerrainRenderer::RenderWaterReflection(VulkanDevice& device,
         vkCmdBindDescriptorSets(cmd, VK_PIPELINE_BIND_POINT_GRAPHICS, m_waterReflectionPipelineLayout,
             0, 1, &m_descriptorSets[frameIndex], 0, nullptr);
         vkCmdDrawIndexed(cmd, m_indexCount, 1, 0, 0, 0);
+        ++reflectionStats.drawCalls;
     }
+
+    reflectionStats.executed = reflectionStats.drawCalls > 0;
+    reflectionStats.chunksDrawn = m_terrainChunks.empty()
+        ? (m_indexCount > 0 ? 1u : 0u)
+        : static_cast<uint32_t>(m_terrainChunks.size());
+    reflectionStats.chunksCulled = 0;
 
     if (renderEntities)
         renderEntities(mirror, {m_waterReflection.width, m_waterReflection.height}, m_waterReflection.renderPass, reflectionWaterLevelY);
@@ -2470,13 +2572,15 @@ void TerrainRenderer::RenderWaterReflection(VulkanDevice& device,
     m_reflectionClipWaterLevelY = std::numeric_limits<float>::quiet_NaN();
 }
 
-void TerrainRenderer::Render(VulkanDevice& device, const WorldCamera& camera)
+void TerrainRenderer::Render(VulkanDevice& device, const WorldCamera& camera, VkExtent2D targetExtent)
 {
     static bool loggedDraw = false;
     static bool loggedSkip = false;
+    PassDrawStats& terrainStats = m_frameDrawStats.terrainMain;
 
     if (!m_sceneTerrainActive || m_sceneTerrain.editorHidden || !m_pipeline || m_indexCount == 0 || !device.IsFrameActive())
     {
+        terrainStats.skipped = true;
         if (!loggedSkip)
         {
             Tracen("[TERRAIN] Render skip: inactive pipeline/frame");
@@ -2485,9 +2589,14 @@ void TerrainRenderer::Render(VulkanDevice& device, const WorldCamera& camera)
         return;
     }
 
-    const VkExtent2D extent = device.GetSwapchainExtent();
+    const VkExtent2D extent = (targetExtent.width > 0 && targetExtent.height > 0)
+        ? targetExtent
+        : device.GetSwapchainExtent();
     if (extent.width == 0 || extent.height == 0)
+    {
+        terrainStats.skipped = true;
         return;
+    }
 
     const uint32_t frameIndex = device.GetFrameIndex();
     UpdateUniform(frameIndex, camera);
@@ -2518,10 +2627,10 @@ void TerrainRenderer::Render(VulkanDevice& device, const WorldCamera& camera)
     vkCmdBindPipeline(cmd, VK_PIPELINE_BIND_POINT_GRAPHICS, m_pipeline);
     if (m_sceneTerrain.triplanarEnabled && !m_triPerfMainPassLogged)
     {
-        Tracenf("[TRI-PERF] terrain pipeline bound in pass=main triplanar=yes extent=%ux%u shader=terrain_ps",
+        TraceDiagf("[TRI-PERF] terrain pipeline bound in pass=main triplanar=yes extent=%ux%u shader=terrain_ps",
             extent.width,
             extent.height);
-        Tracenf("[TRI-PERF] offscreen target extent=%ux%u fragment-bound-cost-scales-with-pixels",
+        TraceDiagf("[TRI-PERF] offscreen target extent=%ux%u fragment-bound-cost-scales-with-pixels",
             extent.width,
             extent.height);
         m_triPerfMainPassLogged = true;
@@ -2534,6 +2643,44 @@ void TerrainRenderer::Render(VulkanDevice& device, const WorldCamera& camera)
     {
         float layerParams[4];
     };
+
+    m_visibleTerrainChunksScratch.clear();
+    uint32_t culledChunks = 0;
+    if (!m_terrainChunks.empty())
+    {
+        m_visibleTerrainChunksScratch.reserve(m_terrainChunks.size());
+        for (uint32_t chunkIndex = 0; chunkIndex < static_cast<uint32_t>(m_terrainChunks.size()); ++chunkIndex)
+        {
+            const TerrainChunkDraw& chunk = m_terrainChunks[chunkIndex];
+            if (TerrainAabbOutsideCameraFrustum(camera, chunk.worldMin, chunk.worldMax))
+            {
+                ++culledChunks;
+            }
+            else
+            {
+                m_visibleTerrainChunksScratch.push_back(chunkIndex);
+            }
+        }
+    }
+    auto drawVisibleTerrainChunks = [&]() {
+        if (m_terrainChunks.empty())
+        {
+            vkCmdDrawIndexed(cmd, m_indexCount, 1, 0, 0, 0);
+            ++terrainStats.drawCalls;
+            return;
+        }
+        for (uint32_t chunkIndex : m_visibleTerrainChunksScratch)
+        {
+            const TerrainChunkDraw& chunk = m_terrainChunks[chunkIndex];
+            vkCmdDrawIndexed(cmd, chunk.indexCount, 1, chunk.indexOffset, 0, 0);
+            ++terrainStats.drawCalls;
+        }
+    };
+    terrainStats.executed = true;
+    terrainStats.chunksDrawn = m_terrainChunks.empty()
+        ? (m_indexCount > 0 ? 1u : 0u)
+        : static_cast<uint32_t>(m_visibleTerrainChunksScratch.size());
+    terrainStats.chunksCulled = m_terrainChunks.empty() ? 0u : culledChunks;
 
     if (!m_layers.empty() && m_layerDescriptorSets.size() == m_layers.size() * kFramesInFlight)
     {
@@ -2549,7 +2696,7 @@ void TerrainRenderer::Render(VulkanDevice& device, const WorldCamera& camera)
                 m_layerDescriptorSets[layerIndex * kFramesInFlight + frameIndex];
             vkCmdBindDescriptorSets(cmd, VK_PIPELINE_BIND_POINT_GRAPHICS, m_pipelineLayout,
                 0, 1, &descriptorSet, 0, nullptr);
-            vkCmdDrawIndexed(cmd, m_indexCount, 1, 0, 0, 0);
+            drawVisibleTerrainChunks();
         }
     }
     else
@@ -2560,7 +2707,7 @@ void TerrainRenderer::Render(VulkanDevice& device, const WorldCamera& camera)
             0, sizeof(push), &push);
         vkCmdBindDescriptorSets(cmd, VK_PIPELINE_BIND_POINT_GRAPHICS, m_pipelineLayout,
             0, 1, &m_descriptorSets[frameIndex], 0, nullptr);
-        vkCmdDrawIndexed(cmd, m_indexCount, 1, 0, 0, 0);
+        drawVisibleTerrainChunks();
     }
 
     if (m_mapLoaded && m_mapEditorOpen && m_editorBrushVisible)
@@ -2576,7 +2723,7 @@ void TerrainRenderer::Render(VulkanDevice& device, const WorldCamera& camera)
         vkCmdBindIndexBuffer(cmd, m_indexBuffer.buffer, 0, VK_INDEX_TYPE_UINT32);
         vkCmdBindDescriptorSets(cmd, VK_PIPELINE_BIND_POINT_GRAPHICS, m_pipelineLayout,
             0, 1, &m_descriptorSets[frameIndex], 0, nullptr);
-        vkCmdDrawIndexed(cmd, m_indexCount, 1, 0, 0, 0);
+        drawVisibleTerrainChunks();
     }
 
     if (m_mapLoaded && m_mapEditorOpen && m_waterSculptBrushVisible)
@@ -2592,8 +2739,32 @@ void TerrainRenderer::Render(VulkanDevice& device, const WorldCamera& camera)
         vkCmdBindIndexBuffer(cmd, m_indexBuffer.buffer, 0, VK_INDEX_TYPE_UINT32);
         vkCmdBindDescriptorSets(cmd, VK_PIPELINE_BIND_POINT_GRAPHICS, m_pipelineLayout,
             0, 1, &m_descriptorSets[frameIndex], 0, nullptr);
-        vkCmdDrawIndexed(cmd, m_indexCount, 1, 0, 0, 0);
+        drawVisibleTerrainChunks();
     }
+
+#if defined(IXTREEME_DEBUG_LOGS)
+    {
+        static uint64_t terrainChunkLogFrame = 0;
+        ++terrainChunkLogFrame;
+        if (terrainChunkLogFrame <= 3 || (terrainChunkLogFrame % 60u) == 0u)
+        {
+            const uint32_t drawnChunks = m_terrainChunks.empty()
+                ? (m_indexCount > 0 ? 1u : 0u)
+                : static_cast<uint32_t>(m_visibleTerrainChunksScratch.size());
+            const uint32_t gridX = m_chunkSizeCells > 0 && m_mapSizeX > 0
+                ? (m_mapSizeX + m_chunkSizeCells - 1u) / m_chunkSizeCells
+                : 0u;
+            const uint32_t gridY = m_chunkSizeCells > 0 && m_mapSizeY > 0
+                ? (m_mapSizeY + m_chunkSizeCells - 1u) / m_chunkSizeCells
+                : 0u;
+            TraceDiagf("[TCHUNK] render chunksDrawn=%u culled=%u chunkGrid=%ux%u policy=frustum-culled",
+                drawnChunks,
+                m_terrainChunks.empty() ? 0u : culledChunks,
+                gridX,
+                gridY);
+        }
+    }
+#endif
 
     if (!loggedDraw)
     {
@@ -2612,18 +2783,11 @@ void TerrainRenderer::Render(VulkanDevice& device, const WorldCamera& camera)
             camera.target.x,
             camera.target.y,
             camera.target.z);
-        const uint32_t chunkSize = m_chunkSizeCells == 0 ? 64u : m_chunkSizeCells;
-        const uint32_t chunksX = m_mapSizeX == 0 ? 0u : (m_mapSizeX + chunkSize - 1u) / chunkSize;
-        const uint32_t chunksY = m_mapSizeY == 0 ? 0u : (m_mapSizeY + chunkSize - 1u) / chunkSize;
-        Tracenf("[TCHUNK] render chunksDrawn=%u culled=0 chunkGrid=%ux%u policy=resident-all",
-            chunksX * chunksY,
-            chunksX,
-            chunksY);
         loggedDraw = true;
     }
 }
 
-void TerrainRenderer::RenderSelectedWaterBodyHighlight(VulkanDevice& device, const WorldCamera& camera)
+void TerrainRenderer::RenderSelectedWaterBodyHighlight(VulkanDevice& device, const WorldCamera& camera, VkExtent2D targetExtent)
 {
     if (!m_sceneTerrainActive || m_sceneTerrain.editorHidden || !m_mapEditorOpen || !m_pipeline || !m_selectedWaterBodyIndexCount ||
         !m_selectedWaterBodyVertexBuffer.buffer || !m_selectedWaterBodyIndexBuffer.buffer ||
@@ -2632,7 +2796,9 @@ void TerrainRenderer::RenderSelectedWaterBodyHighlight(VulkanDevice& device, con
         return;
     }
 
-    const VkExtent2D extent = device.GetSwapchainExtent();
+    const VkExtent2D extent = (targetExtent.width > 0 && targetExtent.height > 0)
+        ? targetExtent
+        : device.GetSwapchainExtent();
     if (extent.width == 0 || extent.height == 0)
         return;
 
@@ -2670,13 +2836,15 @@ void TerrainRenderer::RenderSelectedWaterBodyHighlight(VulkanDevice& device, con
     vkCmdDrawIndexed(cmd, m_selectedWaterBodyIndexCount, 1, 0, 0, 0);
 }
 
-void TerrainRenderer::RenderWater(VulkanDevice& device, const WorldCamera& camera, double timeSeconds)
+void TerrainRenderer::RenderWater(VulkanDevice& device, const WorldCamera& camera, double timeSeconds, VkExtent2D targetExtent)
 {
     m_latestWaterTimeSeconds = timeSeconds;
     if (!m_sceneTerrainActive || m_sceneTerrain.editorHidden || m_waterBodies.empty() || !m_waterPipeline || !device.IsFrameActive())
         return;
 
-    const VkExtent2D extent = device.GetSwapchainExtent();
+    const VkExtent2D extent = (targetExtent.width > 0 && targetExtent.height > 0)
+        ? targetExtent
+        : device.GetSwapchainExtent();
     if (extent.width == 0 || extent.height == 0)
         return;
 
@@ -2938,7 +3106,7 @@ bool TerrainRenderer::LoadWaterMaterialTextureSet(VulkanDevice& device,
         if (path.empty())
             return false;
         RgbaImage image{};
-        if (!LoadAnyTerrainImage(*m_assets, path, image))
+        if (!LoadAnyTerrainImage(*m_assets, path, image, &m_additionalAssetRoots))
         {
             Tracenf("[WATER-MAT] failed to load %s texture for %s: %s",
                 label.c_str(),
@@ -3448,6 +3616,8 @@ void TerrainRenderer::Destroy()
     m_spawnDebugIndexCount = 0;
     m_logicDebugIndexOffset = 0;
     m_logicDebugIndexCount = 0;
+    m_terrainChunks.clear();
+    m_visibleTerrainChunksScratch.clear();
     m_selectedWaterBodyIndexCount = 0;
     m_selectedWaterBodyId = 0;
     m_zoneFillDebugRanges.clear();
@@ -3486,6 +3656,8 @@ void TerrainRenderer::Destroy()
     m_splatABytes.clear();
     m_splatBBytes.clear();
     m_dirtyChunkTexels.clear();
+    m_terrainChunks.clear();
+    m_visibleTerrainChunksScratch.clear();
     m_heightUndoRecorded.clear();
     m_splatUndoRecorded.clear();
     m_currentUndo = {};
@@ -3527,11 +3699,98 @@ bool TerrainRenderer::EnsureUniformBuffers(VulkanDevice& device)
     return true;
 }
 
+void TerrainRenderer::BuildTerrainChunkDraws(const std::vector<Vertex>& vertices, std::vector<uint32_t>& indices)
+{
+    m_terrainChunks.clear();
+    indices.clear();
+    if (m_mapSizeX == 0 || m_mapSizeY == 0 || m_heightGridWidth < 2 || m_heightGridHeight < 2 ||
+        m_chunkSizeCells == 0 || vertices.empty())
+    {
+        return;
+    }
+
+    const uint32_t chunksX = (m_mapSizeX + m_chunkSizeCells - 1u) / m_chunkSizeCells;
+    const uint32_t chunksY = (m_mapSizeY + m_chunkSizeCells - 1u) / m_chunkSizeCells;
+    indices.reserve(static_cast<size_t>(m_mapSizeX) * m_mapSizeY * 6u);
+    m_terrainChunks.reserve(static_cast<size_t>(chunksX) * chunksY);
+
+    const float horizontalPad = std::max(0.05f, static_cast<float>(m_chunkSizeCells) * m_cellScaleMeters * 0.05f);
+    constexpr float kVerticalPad = 2.0f;
+
+    for (uint32_t chunkY = 0; chunkY < chunksY; ++chunkY)
+    {
+        const uint32_t cellMinY = chunkY * m_chunkSizeCells;
+        const uint32_t cellMaxY = std::min(cellMinY + m_chunkSizeCells, m_mapSizeY);
+        for (uint32_t chunkX = 0; chunkX < chunksX; ++chunkX)
+        {
+            const uint32_t cellMinX = chunkX * m_chunkSizeCells;
+            const uint32_t cellMaxX = std::min(cellMinX + m_chunkSizeCells, m_mapSizeX);
+            TerrainChunkDraw chunk{};
+            chunk.indexOffset = static_cast<uint32_t>(indices.size());
+            chunk.worldMin = {
+                std::numeric_limits<float>::max(),
+                std::numeric_limits<float>::max(),
+                std::numeric_limits<float>::max()};
+            chunk.worldMax = {
+                -std::numeric_limits<float>::max(),
+                -std::numeric_limits<float>::max(),
+                -std::numeric_limits<float>::max()};
+
+            for (uint32_t z = cellMinY; z <= cellMaxY; ++z)
+            {
+                for (uint32_t x = cellMinX; x <= cellMaxX; ++x)
+                {
+                    const size_t vertexIndex = static_cast<size_t>(z) * m_heightGridWidth + x;
+                    if (vertexIndex >= vertices.size())
+                        continue;
+                    const Vertex& vertex = vertices[vertexIndex];
+                    chunk.worldMin.x = std::min(chunk.worldMin.x, vertex.position[0]);
+                    chunk.worldMin.y = std::min(chunk.worldMin.y, vertex.position[1]);
+                    chunk.worldMin.z = std::min(chunk.worldMin.z, vertex.position[2]);
+                    chunk.worldMax.x = std::max(chunk.worldMax.x, vertex.position[0]);
+                    chunk.worldMax.y = std::max(chunk.worldMax.y, vertex.position[1]);
+                    chunk.worldMax.z = std::max(chunk.worldMax.z, vertex.position[2]);
+                }
+            }
+
+            for (uint32_t z = cellMinY; z < cellMaxY; ++z)
+            {
+                for (uint32_t x = cellMinX; x < cellMaxX; ++x)
+                {
+                    const uint32_t i0 = z * m_heightGridWidth + x;
+                    const uint32_t i1 = i0 + 1u;
+                    const uint32_t i2 = i0 + m_heightGridWidth + 1u;
+                    const uint32_t i3 = i0 + m_heightGridWidth;
+                    indices.push_back(i0);
+                    indices.push_back(i1);
+                    indices.push_back(i2);
+                    indices.push_back(i0);
+                    indices.push_back(i2);
+                    indices.push_back(i3);
+                }
+            }
+
+            chunk.indexCount = static_cast<uint32_t>(indices.size()) - chunk.indexOffset;
+            if (chunk.indexCount == 0)
+                continue;
+            chunk.worldMin.x -= horizontalPad;
+            chunk.worldMin.y -= kVerticalPad;
+            chunk.worldMin.z -= horizontalPad;
+            chunk.worldMax.x += horizontalPad;
+            chunk.worldMax.y += kVerticalPad;
+            chunk.worldMax.z += horizontalPad;
+            m_terrainChunks.push_back(chunk);
+        }
+    }
+}
+
 bool TerrainRenderer::CreateFlatBuffers(VulkanDevice& device)
 {
     const uint32_t cellsX = std::max(1u, m_mapSizeX == 0 ? 100u : m_mapSizeX);
     const uint32_t cellsZ = std::max(1u, m_mapSizeY == 0 ? 100u : m_mapSizeY);
     const float cellSize = std::max(0.01f, m_cellScaleMeters);
+    if (m_chunkSizeCells == 0)
+        m_chunkSizeCells = 64;
     m_flatTerrainWidthMeters = static_cast<float>(cellsX) * cellSize;
     m_flatTerrainDepthMeters = static_cast<float>(cellsZ) * cellSize;
     m_heightGridWidth = cellsX + 1u;
@@ -3557,22 +3816,7 @@ bool TerrainRenderer::CreateFlatBuffers(VulkanDevice& device)
 
     std::vector<uint32_t> indices;
     indices.reserve(static_cast<size_t>(cellsX) * cellsZ * 6u);
-    for (uint32_t z = 0; z < cellsZ; ++z)
-    {
-        for (uint32_t x = 0; x < cellsX; ++x)
-        {
-            const uint32_t i0 = z * m_heightGridWidth + x;
-            const uint32_t i1 = i0 + 1u;
-            const uint32_t i2 = i0 + m_heightGridWidth + 1u;
-            const uint32_t i3 = i0 + m_heightGridWidth;
-            indices.push_back(i0);
-            indices.push_back(i1);
-            indices.push_back(i2);
-            indices.push_back(i0);
-            indices.push_back(i2);
-            indices.push_back(i3);
-        }
-    }
+    BuildTerrainChunkDraws(vertices, indices);
     m_indexCount = static_cast<uint32_t>(indices.size());
 
     CreateHostVisibleBuffer(device, m_device, sizeof(Vertex) * vertices.size(),
@@ -3937,22 +4181,7 @@ bool TerrainRenderer::CreateMapBuffers(VulkanDevice& device, const std::string& 
 
     std::vector<uint32_t> indices;
     indices.reserve(static_cast<size_t>(m_heightGridWidth - 1) * (m_heightGridHeight - 1) * 6u);
-    for (uint32_t y = 0; y < m_heightGridHeight - 1; ++y)
-    {
-        for (uint32_t x = 0; x < m_heightGridWidth - 1; ++x)
-        {
-            const uint32_t i0 = y * m_heightGridWidth + x;
-            const uint32_t i1 = i0 + 1;
-            const uint32_t i2 = i0 + m_heightGridWidth;
-            const uint32_t i3 = i2 + 1;
-            indices.push_back(i0);
-            indices.push_back(i1);
-            indices.push_back(i3);
-            indices.push_back(i0);
-            indices.push_back(i3);
-            indices.push_back(i2);
-        }
-    }
+    BuildTerrainChunkDraws(vertices, indices);
 
     std::vector<Vertex> debugVertices;
     std::vector<uint32_t> debugIndices;
@@ -5506,7 +5735,7 @@ bool TerrainRenderer::LoadTerrainPaletteFromPaths(VulkanDevice& device, const st
         VkFormatName(m_normalTexture.format));
     if (!m_triPerfPaletteLogged)
     {
-        Tracenf("[TRI-PERF] palette size=%ux%u layers=%zu format(diffuse=%s normal=%s ao=%s roughness=%s metallic=%s height=%s) mips(diffuse=%u normal=%u ao=%u roughness=%u metallic=%u height=%u)",
+        TraceDiagf("[TRI-PERF] palette size=%ux%u layers=%zu format(diffuse=%s normal=%s ao=%s roughness=%s metallic=%s height=%s) mips(diffuse=%u normal=%u ao=%u roughness=%u metallic=%u height=%u)",
             m_baseTexture.width,
             m_baseTexture.height,
             images.size(),
@@ -5537,6 +5766,36 @@ bool TerrainRenderer::LoadDominantTerrainTexture(VulkanDevice& device, const std
         index = texturePaths.size() > 5 && !texturePaths[5].empty() ? 5 : 1;
     if (index >= texturePaths.size() || texturePaths[index].empty())
         return false;
+
+    std::string ext = std::filesystem::path(texturePaths[index]).extension().string();
+    std::transform(ext.begin(), ext.end(), ext.begin(), [](unsigned char c) {
+        return static_cast<char>(std::tolower(c));
+    });
+    if (ext != ".dds")
+    {
+        RgbaImage image{};
+        if (!m_assets || !LoadAnyTerrainImage(*m_assets, texturePaths[index], image, &m_additionalAssetRoots))
+            return false;
+
+        Texture newTexture{};
+        if (!UploadRgbaTexture2D(device, texturePaths[index], image.width, image.height, image.pixels,
+                VK_SAMPLER_ADDRESS_MODE_REPEAT, newTexture, VK_FORMAT_R8G8B8A8_SRGB))
+        {
+            return false;
+        }
+
+        DestroyTexture(m_baseTexture);
+        m_baseTexture = newTexture;
+        UpdateDescriptors();
+        Tracenf("[TERRAIN-TEX] loaded textureset index=%u file=%s size=%ux%u mips=%u format=%s",
+            index,
+            texturePaths[index].c_str(),
+            m_baseTexture.width,
+            m_baseTexture.height,
+            m_baseTexture.mipLevels,
+            VkFormatName(m_baseTexture.format));
+        return true;
+    }
 
     DdsImage dds{};
     if (!m_assets || !LoadDdsImage(*m_assets, texturePaths[index], dds))
@@ -7597,6 +7856,7 @@ void TerrainRenderer::UpdateUniform(uint32_t frameIndex, const WorldCamera& came
             Tracen("[TRIPLANAR] sample mode active, layers=8");
         m_triplanarParamsDirty = false;
     }
+#if defined(IXTREEME_DEBUG_LOGS)
     if (m_sceneTerrain.triplanarEnabled && !m_triPerfStaticLogged)
     {
         const bool terrainMipsUsable =
@@ -7615,25 +7875,26 @@ void TerrainRenderer::UpdateUniform(uint32_t frameIndex, const WorldCamera& came
         const double gatedPlanarSamples = 2.0 + avgActiveLayers * 5.0;
         const double gatedTriplanarSamples = 2.0 + avgActiveLayers * 15.0;
         const double selectiveSamples = 2.0 + avgActiveLayers * 5.0 * avgAxesPerLayer;
-        Tracenf("[TRI-PERF] avgActiveLayers=%.2f samples/fragment planar=%.1f triplanar=%.1f unconditionalPlanar=42 unconditionalTriplanar=122 layers=8 maps=diff,nor,ao,roughness,metallic axes=1|3 splat=2 shadow_pcf=25-50-independent",
+        TraceDiagf("[TRI-PERF] avgActiveLayers=%.2f samples/fragment planar=%.1f triplanar=%.1f unconditionalPlanar=42 unconditionalTriplanar=122 layers=8 maps=diff,nor,ao,roughness,metallic axes=1|3 splat=2 shadow_pcf=25-50-independent",
             avgActiveLayers,
             gatedPlanarSamples,
             gatedTriplanarSamples);
-        Tracenf("[TRIPLANAR-OPT] mode=selective slopeThreshold=%.3f transition=%.3f avgAxesPerLayer=%.2f samples/fragment=%.1f fps=%.1f",
+        TraceDiagf("[TRIPLANAR-OPT] mode=selective slopeThreshold=%.3f transition=%.3f avgAxesPerLayer=%.2f samples/fragment=%.1f fps=%.1f",
             std::clamp(m_sceneTerrain.triplanarSlopeThreshold, 0.0f, 1.0f),
             std::clamp(m_sceneTerrain.triplanarSlopeTransition, 0.001f, 1.0f),
             avgAxesPerLayer,
             selectiveSamples,
             m_latestFps);
-        Tracenf("[TRI-PERF] triplanar LOD mode=textureGrad-explicit mipUsed=%s forced-0=%s reason=%s",
+        TraceDiagf("[TRI-PERF] triplanar LOD mode=textureGrad-explicit mipUsed=%s forced-0=%s reason=%s",
             terrainMipsUsable ? "yes" : "no",
             terrainMipsUsable ? "no" : "yes",
             terrainMipsUsable ? "terrain-array-textures-have-full-mip-chain-and-branch-safe-gradients" : "one-or-more-terrain-array-textures-have-1-mip");
-        Tracen("[TRI-PERF] layer sampling=weight-gated threshold=1/255 derivativeSafe=textureGrad-gradients-before-branch");
-        Tracenf("[TRI-PERF] likely bottleneck class=%s",
+        TraceDiag("[TRI-PERF] layer sampling=weight-gated threshold=1/255 derivativeSafe=textureGrad-gradients-before-branch");
+        TraceDiagf("[TRI-PERF] likely bottleneck class=%s",
             terrainMipsUsable ? "active-layer-count-and-remaining-triplanar-sample-count" : "fragment-texture-bandwidth-plus-mip0-cache-pressure");
         m_triPerfStaticLogged = true;
     }
+#endif
 }
 
 TerrainRenderer::WaterUniformBlock TerrainRenderer::BuildWaterUniform(const WorldCamera& camera,

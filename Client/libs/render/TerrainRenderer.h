@@ -25,6 +25,22 @@ struct Manifest;
 class TerrainRenderer
 {
 public:
+    struct PassDrawStats
+    {
+        bool executed = false;
+        bool skipped = false;
+        uint32_t drawCalls = 0;
+        uint32_t chunksDrawn = 0;
+        uint32_t chunksCulled = 0;
+    };
+
+    struct FrameDrawStats
+    {
+        std::array<PassDrawStats, 4> shadowCascades{};
+        PassDrawStats waterReflection;
+        PassDrawStats terrainMain;
+    };
+
     struct Buffer
     {
         VkBuffer buffer = VK_NULL_HANDLE;
@@ -88,9 +104,11 @@ public:
                                const WorldCamera& camera,
                                double timeSeconds,
                                const std::function<void(const WorldCamera&, VkExtent2D, VkRenderPass, float)>& renderEntities = {});
-    void Render(VulkanDevice& device, const WorldCamera& camera);
-    void RenderWater(VulkanDevice& device, const WorldCamera& camera, double timeSeconds);
+    void Render(VulkanDevice& device, const WorldCamera& camera, VkExtent2D targetExtent = {});
+    void RenderWater(VulkanDevice& device, const WorldCamera& camera, double timeSeconds, VkExtent2D targetExtent = {});
     void RenderSunShadowMap(VulkanDevice& device, const WorldCamera& camera);
+    void ResetFrameDrawStats() { m_frameDrawStats = {}; }
+    FrameDrawStats GetFrameDrawStats() const { return m_frameDrawStats; }
     void ToggleWalkabilityDebug();
     bool IsWalkabilityDebugEnabled() const { return m_walkabilityDebug; }
     void SetMapEditorOpen(bool open);
@@ -101,7 +119,7 @@ public:
     std::vector<WaterBody> GetWaterBodies() const;
     bool SetWaterBodies(VulkanDevice& device, const std::vector<WaterBody>& bodies);
     bool SetSelectedWaterBodyHighlight(VulkanDevice& device, std::uint32_t selectedWaterBodyId);
-    void RenderSelectedWaterBodyHighlight(VulkanDevice& device, const WorldCamera& camera);
+    void RenderSelectedWaterBodyHighlight(VulkanDevice& device, const WorldCamera& camera, VkExtent2D targetExtent = {});
     void SetWaterSculptBrush(bool visible, float worldX, float worldZ, float radiusMeters, bool addMode);
     void SetPaletteSlots(const std::array<MapEditorPaletteSlot, 8>& slots);
     const std::array<MapEditorPaletteSlot, 8>& GetPaletteSlots() const { return m_paletteSlots; }
@@ -128,6 +146,14 @@ private:
         float position[3];
         float texUv[2];
         float maskUv[2];
+    };
+
+    struct TerrainChunkDraw
+    {
+        uint32_t indexOffset = 0;
+        uint32_t indexCount = 0;
+        WorldVec3 worldMin;
+        WorldVec3 worldMax;
     };
 
     struct WaterVertex
@@ -257,6 +283,7 @@ private:
     bool EnsureUniformBuffers(VulkanDevice& device);
     bool CreateFlatBuffers(VulkanDevice& device);
     bool CreateMapBuffers(VulkanDevice& device, const std::string& mapDirectory, int32_t serverX, int32_t serverY);
+    void BuildTerrainChunkDraws(const std::vector<Vertex>& vertices, std::vector<uint32_t>& indices);
     bool CreateFallbackTexture(VulkanDevice& device);
     bool CreateFallbackMask(VulkanDevice& device);
     bool CreateFallbackSplatTextures(VulkanDevice& device);
@@ -522,6 +549,9 @@ private:
     std::vector<std::uint8_t> m_splatABytes;
     std::vector<std::uint8_t> m_splatBBytes;
     std::vector<uint32_t> m_dirtyChunkTexels;
+    std::vector<TerrainChunkDraw> m_terrainChunks;
+    std::vector<uint32_t> m_visibleTerrainChunksScratch;
+    FrameDrawStats m_frameDrawStats{};
 
     struct HeightUndo
     {

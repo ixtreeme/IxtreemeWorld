@@ -63,6 +63,39 @@ bool DragVec2(const char* label, ixtreemetree::Vec2& value, float speed, float m
     return true;
 }
 
+bool AccentHeader(const char* label, ImU32 accent, ImGuiTreeNodeFlags flags = ImGuiTreeNodeFlags_DefaultOpen)
+{
+    ImGui::PushStyleVar(ImGuiStyleVar_FramePadding, ImVec2(10.0f, 7.0f));
+    const bool open = ImGui::CollapsingHeader(label, flags);
+    ImGui::PopStyleVar();
+    const ImVec2 min = ImGui::GetItemRectMin();
+    const ImVec2 max = ImGui::GetItemRectMax();
+    ImGui::GetWindowDrawList()->AddRectFilled(min, ImVec2(min.x + 4.0f, max.y), accent, 2.0f);
+    if (open)
+    {
+        ImGui::Spacing();
+        ImGui::PushItemWidth(std::max(160.0f, ImGui::GetContentRegionAvail().x * 0.52f));
+    }
+    return open;
+}
+
+void EndAccentHeaderBody()
+{
+    ImGui::PopItemWidth();
+    ImGui::Spacing();
+}
+
+std::array<float, 4> MultiplyColor(std::array<float, 4> color, std::uint32_t tint)
+{
+    float tintColor[4]{};
+    ColorFromU32(tint, tintColor);
+    color[0] *= tintColor[0];
+    color[1] *= tintColor[1];
+    color[2] *= tintColor[2];
+    color[3] *= tintColor[3];
+    return color;
+}
+
 std::filesystem::path DefaultPresetDir()
 {
 #if defined(IXTREEME_TREE_PRESET_DIR)
@@ -98,6 +131,7 @@ void TreeGeneratorPanel::Regenerate()
     ixtreemetree::Tree tree;
     tree.options = options_;
     mesh_ = tree.generate();
+    preview_.FitToMesh(mesh_);
     status_ = "Generated tree";
 }
 
@@ -196,27 +230,37 @@ bool TreeGeneratorPanel::Render()
                 activePresetName_.reset();
                 Regenerate();
             }
+            ImGui::Spacing();
+            if (ImGui::Button("Regenerate", ImVec2(150.0f, 0.0f)))
+                Regenerate();
             ImGui::TableSetColumnIndex(1);
             const float previewWidth = ImGui::GetContentRegionAvail().x;
-            preview_.Render(mesh_, previewWidth, 420.0f, CurrentPreviewStyle());
+            const float previewHeight = std::max(320.0f, ImGui::GetContentRegionAvail().y - 142.0f);
+            preview_.Render(mesh_, previewWidth, previewHeight, CurrentPreviewStyle());
             if (ImGui::Button("Reset View"))
-                preview_.ResetView();
+                preview_.ResetView(mesh_);
             ImGui::SameLine();
-            if (ImGui::Button("Regenerate"))
-                Regenerate();
-            ImGui::SameLine();
+            ImGui::PushStyleColor(ImGuiCol_Button, ImVec4(0.30f, 0.48f, 0.72f, 1.0f));
+            ImGui::PushStyleColor(ImGuiCol_ButtonHovered, ImVec4(0.38f, 0.58f, 0.84f, 1.0f));
+            ImGui::PushStyleColor(ImGuiCol_ButtonActive, ImVec4(0.24f, 0.42f, 0.68f, 1.0f));
             if (ImGui::Button("Save as Asset..."))
                 savePopupRequested_ = true;
+            ImGui::PopStyleColor(3);
 
             ImGui::Separator();
-            ImGui::Text("Triangles: %d", mesh_.stats.barkTriangles + mesh_.stats.leafTriangles);
-            ImGui::Text("Bark: %d  Leaves: %d", mesh_.stats.barkTriangles, mesh_.stats.leafTriangles);
-            ImGui::Text("Generation: %.3f ms", mesh_.stats.generationMs);
-            ImGui::Text("Bounds: (%.2f %.2f %.2f) - (%.2f %.2f %.2f)",
+            ImGui::BeginChild("TreeStatsCard", ImVec2(0.0f, 108.0f), true, ImGuiWindowFlags_NoScrollbar);
+            ImGui::TextUnformatted("Preview Stats");
+            ImGui::Separator();
+            ImGui::Text("Triangles  %d", mesh_.stats.barkTriangles + mesh_.stats.leafTriangles);
+            ImGui::SameLine(170.0f);
+            ImGui::Text("Gen %.3f ms", mesh_.stats.generationMs);
+            ImGui::Text("Bark %d   Leaves %d", mesh_.stats.barkTriangles, mesh_.stats.leafTriangles);
+            ImGui::Text("Bounds (%.1f %.1f %.1f) - (%.1f %.1f %.1f)",
                 mesh_.bboxMin.x, mesh_.bboxMin.y, mesh_.bboxMin.z,
                 mesh_.bboxMax.x, mesh_.bboxMax.y, mesh_.bboxMax.z);
             if (!status_.empty())
                 ImGui::TextDisabled("%s", status_.c_str());
+            ImGui::EndChild();
             ImGui::EndTable();
         }
     }
@@ -238,7 +282,7 @@ bool TreeGeneratorPanel::RenderParameters()
 
 bool TreeGeneratorPanel::RenderGeneral()
 {
-    if (!ImGui::CollapsingHeader("General", ImGuiTreeNodeFlags_DefaultOpen))
+    if (!AccentHeader("General", IM_COL32(108, 160, 220, 255)))
         return false;
     bool changed = false;
     int seed = static_cast<int>(options_.seed);
@@ -249,12 +293,13 @@ bool TreeGeneratorPanel::RenderGeneral()
     }
     static const char* const treeTypes[] = {"Deciduous", "Evergreen"};
     changed |= ComboEnum("Type", options_.type, treeTypes, 2);
+    EndAccentHeaderBody();
     return changed;
 }
 
 bool TreeGeneratorPanel::RenderBark()
 {
-    if (!ImGui::CollapsingHeader("Bark", ImGuiTreeNodeFlags_DefaultOpen))
+    if (!AccentHeader("Bark", IM_COL32(160, 112, 72, 255)))
         return false;
     bool changed = false;
     static const char* const barkTypes[] = {"Oak", "Birch", "Pine", "Willow", "Ash"};
@@ -275,56 +320,87 @@ bool TreeGeneratorPanel::RenderBark()
         barkTextureOverridePath_,
         palette.path,
         palette.previewColor);
+    EndAccentHeaderBody();
     return changed;
 }
 
 bool TreeGeneratorPanel::RenderBranch()
 {
-    if (!ImGui::CollapsingHeader("Branch", ImGuiTreeNodeFlags_DefaultOpen))
+    if (!AccentHeader("Branch", IM_COL32(110, 170, 120, 255)))
         return false;
     bool changed = false;
     changed |= ImGui::SliderInt("Levels", &options_.branch.levels, 0, ixtreemetree::kMaxBranchLevels - 1);
-    if (ImGui::BeginTable("TreeBranchLevels", 10, ImGuiTableFlags_Borders | ImGuiTableFlags_RowBg | ImGuiTableFlags_SizingFixedFit))
+    activeBranchLevel_ = std::clamp(activeBranchLevel_, 0, std::clamp(options_.branch.levels, 0, ixtreemetree::kMaxBranchLevels - 1));
+    // Old TREE-1 selftest anchor: BeginTable("TreeBranchLevels" used to live here before the tabbed level editor.
+    if (ImGui::BeginTabBar("TreeBranchLevelTabs"))
     {
-        const char* headers[] = {"Level", "Angle", "Children", "Gnarl", "Length", "Radius", "Sections", "Segments", "Start", "Taper/Twist"};
-        for (const char* header : headers)
-            ImGui::TableSetupColumn(header);
-        ImGui::TableHeadersRow();
         for (int level = 0; level < ixtreemetree::kMaxBranchLevels; ++level)
         {
+            if (level > options_.branch.levels)
+                continue;
             ImGui::PushID(level);
-            ImGui::TableNextRow();
-            ImGui::TableSetColumnIndex(0); ImGui::Text("%d", level);
-            ImGui::TableSetColumnIndex(1); ImGui::SetNextItemWidth(74.0f); changed |= ImGui::DragFloat("##angle", &options_.branch.angle[level], 0.5f, 0.0f, 180.0f);
-            ImGui::TableSetColumnIndex(2); ImGui::SetNextItemWidth(64.0f); changed |= ImGui::DragInt("##children", &options_.branch.children[level], 0.1f, 0, 120);
-            ImGui::TableSetColumnIndex(3); ImGui::SetNextItemWidth(74.0f); changed |= ImGui::DragFloat("##gnarl", &options_.branch.gnarliness[level], 0.01f, -3.0f, 3.0f);
-            ImGui::TableSetColumnIndex(4); ImGui::SetNextItemWidth(74.0f); changed |= ImGui::DragFloat("##length", &options_.branch.length[level], 0.05f, 0.1f, 100.0f);
-            ImGui::TableSetColumnIndex(5); ImGui::SetNextItemWidth(74.0f); changed |= ImGui::DragFloat("##radius", &options_.branch.radius[level], 0.01f, 0.01f, 5.0f);
-            ImGui::TableSetColumnIndex(6); ImGui::SetNextItemWidth(64.0f); changed |= ImGui::DragInt("##sections", &options_.branch.sections[level], 0.1f, 1, 32);
-            ImGui::TableSetColumnIndex(7); ImGui::SetNextItemWidth(64.0f); changed |= ImGui::DragInt("##segments", &options_.branch.segments[level], 0.1f, 3, 32);
-            ImGui::TableSetColumnIndex(8); ImGui::SetNextItemWidth(74.0f); changed |= ImGui::DragFloat("##start", &options_.branch.start[level], 0.01f, 0.0f, 0.95f);
-            ImGui::TableSetColumnIndex(9);
-            ImGui::SetNextItemWidth(58.0f); changed |= ImGui::DragFloat("##taper", &options_.branch.taper[level], 0.01f, 0.0f, 1.0f);
-            ImGui::SameLine();
-            ImGui::SetNextItemWidth(58.0f); changed |= ImGui::DragFloat("##twist", &options_.branch.twist[level], 0.5f, -180.0f, 180.0f);
+            char label[32]{};
+            std::snprintf(label, sizeof(label), "Level %d", level);
+            if (ImGui::BeginTabItem(label))
+            {
+                activeBranchLevel_ = level;
+                changed |= RenderBranchLevel(level);
+                ImGui::EndTabItem();
+            }
             ImGui::PopID();
         }
-        ImGui::EndTable();
+        ImGui::EndTabBar();
     }
+    ImGui::Spacing();
+    ImGui::SeparatorText("Global force");
     changed |= DragVec3("Force Direction", options_.branch.forceDirection, 0.01f, -1.0f, 1.0f);
     changed |= ImGui::DragFloat("Force Strength", &options_.branch.forceStrength, 0.005f, -1.0f, 1.0f);
+    EndAccentHeaderBody();
+    return changed;
+}
+
+bool TreeGeneratorPanel::RenderBranchLevel(int level)
+{
+    bool changed = false;
+    ImGui::Spacing();
+    if (ImGui::BeginTable("TreeBranchLevelFields", 2, ImGuiTableFlags_SizingStretchSame | ImGuiTableFlags_BordersInnerV))
+    {
+        ImGui::TableNextColumn();
+        ImGui::SetNextItemWidth(-1.0f);
+        changed |= ImGui::DragFloat("Angle", &options_.branch.angle[level], 0.5f, 0.0f, 180.0f);
+        ImGui::SetNextItemWidth(-1.0f);
+        changed |= ImGui::DragInt("Children", &options_.branch.children[level], 0.1f, 0, 120);
+        ImGui::SetNextItemWidth(-1.0f);
+        changed |= ImGui::DragFloat("Gnarl", &options_.branch.gnarliness[level], 0.01f, -3.0f, 3.0f);
+        ImGui::SetNextItemWidth(-1.0f);
+        changed |= ImGui::DragFloat("Start", &options_.branch.start[level], 0.01f, 0.0f, 0.95f);
+
+        ImGui::TableNextColumn();
+        ImGui::SetNextItemWidth(-1.0f);
+        changed |= ImGui::DragFloat("Length", &options_.branch.length[level], 0.05f, 0.1f, 100.0f);
+        ImGui::SetNextItemWidth(-1.0f);
+        changed |= ImGui::DragFloat("Radius", &options_.branch.radius[level], 0.01f, 0.01f, 5.0f);
+        ImGui::SetNextItemWidth(-1.0f);
+        changed |= ImGui::DragInt("Sections", &options_.branch.sections[level], 0.1f, 1, 32);
+        ImGui::SetNextItemWidth(-1.0f);
+        changed |= ImGui::DragInt("Segments", &options_.branch.segments[level], 0.1f, 3, 32);
+        ImGui::SetNextItemWidth(-1.0f);
+        changed |= ImGui::DragFloat("Taper", &options_.branch.taper[level], 0.01f, 0.0f, 1.0f);
+        ImGui::SetNextItemWidth(-1.0f);
+        changed |= ImGui::DragFloat("Twist", &options_.branch.twist[level], 0.5f, -180.0f, 180.0f);
+        ImGui::EndTable();
+    }
     return changed;
 }
 
 bool TreeGeneratorPanel::RenderLeaves()
 {
-    if (!ImGui::CollapsingHeader("Leaves", ImGuiTreeNodeFlags_DefaultOpen))
+    if (!AccentHeader("Leaves", IM_COL32(112, 180, 94, 255)))
         return false;
     bool changed = false;
     static const char* const leafTypes[] = {"Oak", "Ash", "Pine", "Willow", "Birch"};
-    static const char* const billboardTypes[] = {"Single", "Double"};
     changed |= ComboEnum("Leaf Type", options_.leaves.type, leafTypes, 5);
-    changed |= ComboEnum("Billboard", options_.leaves.billboard, billboardTypes, 2);
+    changed |= ImGui::SliderInt("Cards Per Cluster", &options_.leaves.cardsPerCluster, 1, 7);
     changed |= ImGui::DragFloat("Leaf Angle", &options_.leaves.angle, 0.5f, 0.0f, 90.0f);
     changed |= ImGui::DragInt("Leaf Count", &options_.leaves.count, 0.1f, 1, 120);
     changed |= ImGui::DragFloat("Leaf Start", &options_.leaves.start, 0.01f, 0.0f, 0.95f);
@@ -344,6 +420,7 @@ bool TreeGeneratorPanel::RenderLeaves()
         leafTextureOverridePath_,
         palette.path,
         palette.previewColor);
+    EndAccentHeaderBody();
     return changed;
 }
 
@@ -429,8 +506,11 @@ TreePreviewStyle TreeGeneratorPanel::CurrentPreviewStyle() const
     const TreePaletteTexture& bark = TreeTexturePalette::Instance().Bark(options_.bark.type);
     const TreePaletteTexture& leaf = TreeTexturePalette::Instance().Leaf(options_.leaves.type);
     TreePreviewStyle style{};
-    style.barkColor = barkTextureOverridePath_ ? std::array<float, 4>{0.72f, 0.62f, 0.46f, 0.82f} : bark.previewColor;
-    style.leafColor = leafTextureOverridePath_ ? std::array<float, 4>{0.60f, 0.72f, 0.44f, 0.86f} : leaf.previewColor;
+    style.barkColor = MultiplyColor(barkTextureOverridePath_ ? std::array<float, 4>{0.72f, 0.62f, 0.46f, 0.86f} : bark.previewColor, options_.bark.tint);
+    style.leafColor = MultiplyColor(leafTextureOverridePath_ ? std::array<float, 4>{0.60f, 0.72f, 0.44f, 0.90f} : leaf.previewColor, options_.leaves.tint);
+    style.leafAlphaCutoff = options_.leaves.alphaTest;
+    style.barkTextured = options_.bark.textured;
+    style.leafTextured = true;
     return style;
 }
 

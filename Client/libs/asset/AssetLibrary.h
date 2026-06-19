@@ -14,6 +14,10 @@
 class AssetLibrary
 {
 public:
+    using FbxSidecarProcessor = bool (*)(const std::filesystem::path& destination,
+                                         const std::filesystem::path& libraryRoot,
+                                         std::string& error);
+
     enum class Category
     {
         Texture,
@@ -51,6 +55,9 @@ public:
         float aoStrength = 1.0f;
         float roughnessStrength = 1.0f;
         float metallicStrength = 1.0f;
+        std::string shadingMode = "lit";
+        std::string alphaMode = "opaque";
+        float alphaCutoff = 0.5f;
     };
 
     struct Entry
@@ -85,6 +92,8 @@ public:
     explicit AssetLibrary(std::filesystem::path clientRoot);
     AssetLibrary(std::filesystem::path clientRoot, std::filesystem::path libraryRoot);
 
+    static void SetFbxSidecarProcessor(FbxSidecarProcessor processor);
+
     bool Initialize();
     const std::vector<Entry>& Entries() const { return m_entries; }
     std::vector<Entry> EntriesFor(Category category, const std::string& filter = {}) const;
@@ -105,6 +114,11 @@ public:
                 const ImportOptions& options,
                 Entry& outEntry,
                 std::string& error);
+    bool ImportFileToFolder(const std::filesystem::path& sourcePath,
+                            const std::filesystem::path& targetFolder,
+                            Entry& outEntry,
+                            std::filesystem::path& outFinalPath,
+                            std::string& error);
     bool CreateMaterial(const ImportOptions& options,
                         const MaterialData& material,
                         Entry& outEntry,

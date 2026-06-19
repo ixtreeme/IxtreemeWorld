@@ -32,7 +32,7 @@ elseif(NOT DEFINED VCPKG_TARGET_TRIPLET AND CMAKE_HOST_WIN32)
     endif()
 endif()
 
-project(ixtreeme_client
+project(IxtreemeEngine
     VERSION 0.1.0
     DESCRIPTION "IxtreemeEngeni - Vulkan"
     LANGUAGES C CXX)
@@ -45,6 +45,7 @@ set(CMAKE_CXX_EXTENSIONS OFF)
 
 option(ENABLE_ASAN "Enable AddressSanitizer" OFF)
 option(IXTREEME_WITH_EDITOR "Build ImGui-based editor functionality" ON)
+option(IXTREEME_VERBOSE_DIAGNOSTICS "Enable verbose per-frame engine diagnostics" OFF)
 
 if(IXTREEME_WITH_EDITOR)
     message(STATUS "IxtreemeEngeni editor build: ENABLED")
@@ -92,6 +93,7 @@ include(FetchContent)
 vcpkg_require(
     capnproto
     efsw
+    assimp
     fastgltf
     flecs
 	rmlui
@@ -129,9 +131,12 @@ set(CLIENT_ROOT "${CMAKE_CURRENT_SOURCE_DIR}")
 set(CLIENT_LIBS_DIR "${CLIENT_ROOT}/libs")
 
 add_subdirectory(${CLIENT_LIBS_DIR}/ixtreemetree)
+add_subdirectory(libs/common)
+add_subdirectory(libs/debug)
 add_subdirectory(${CMAKE_CURRENT_SOURCE_DIR}/../shared/map shared_map_build)
 
 find_package(fastgltf CONFIG REQUIRED)
+find_package(assimp CONFIG REQUIRED)
 find_package(efsw CONFIG REQUIRED)
 FetchContent_Declare(
     meshoptimizer
@@ -198,7 +203,7 @@ set(ozz_build_howtos OFF CACHE BOOL "" FORCE)
 set(ozz_build_tests OFF CACHE BOOL "" FORCE)
 set(ozz_build_postfix OFF CACHE BOOL "" FORCE)
 add_subdirectory(${OZZ_ROOT} ozz_build)
-set(CLIENT_OZZ_TARGETS ozz_animation ozz_base)
+set(CLIENT_OZZ_TARGETS ozz_animation ozz_animation_offline ozz_base)
 
 if(WIN32)
     find_package(Vulkan REQUIRED)
@@ -221,6 +226,9 @@ if(WIN32)
     set(SKINNED_MESH_CS_SPV "${GENERATED_SHADER_DIR}/skinned_mesh_cs.spv")
     set(STATIC_MESH_VS_SPV "${GENERATED_SHADER_DIR}/static_mesh_vs.spv")
     set(STATIC_MESH_PS_SPV "${GENERATED_SHADER_DIR}/static_mesh_ps.spv")
+    set(STATIC_MESH_UNLIT_PS_SPV "${GENERATED_SHADER_DIR}/static_mesh_unlit_ps.spv")
+    set(STATIC_MESH_OUTLINE_VS_SPV "${GENERATED_SHADER_DIR}/static_mesh_outline_vs.spv")
+    set(STATIC_MESH_OUTLINE_PS_SPV "${GENERATED_SHADER_DIR}/static_mesh_outline_ps.spv")
     set(TERRAIN_VS_SPV "${GENERATED_SHADER_DIR}/terrain_vs.spv")
     set(TERRAIN_PS_SPV "${GENERATED_SHADER_DIR}/terrain_ps.spv")
     set(WATER_VS_SPV "${GENERATED_SHADER_DIR}/water_vs.spv")
@@ -228,6 +236,8 @@ if(WIN32)
     set(COMPOSITE_VS_SPV "${GENERATED_SHADER_DIR}/composite_vs.spv")
     set(COMPOSITE_PS_SPV "${GENERATED_SHADER_DIR}/composite_ps.spv")
     set(SHADOW_DEPTH_VS_SPV "${GENERATED_SHADER_DIR}/shadow_depth_vs.spv")
+    set(SELECTION_OUTLINE_VS_SPV "${GENERATED_SHADER_DIR}/selection_outline_vs.spv")
+    set(SELECTION_OUTLINE_PS_SPV "${GENERATED_SHADER_DIR}/selection_outline_ps.spv")
     set(WORLD_LABEL_VS_SPV "${GENERATED_SHADER_DIR}/world_label_vs.spv")
     set(WORLD_LABEL_PS_SPV "${GENERATED_SHADER_DIR}/world_label_ps.spv")
     set(RMLUI_VS_SPV "${GENERATED_SHADER_DIR}/rmlui_vs.spv")
@@ -290,6 +300,30 @@ if(WIN32)
         VERBATIM
     )
     add_custom_command(
+        OUTPUT "${STATIC_MESH_UNLIT_PS_SPV}"
+        COMMAND ${CMAKE_COMMAND} -E make_directory "${GENERATED_SHADER_DIR}"
+        COMMAND "${DXC_EXECUTABLE}" -spirv -T ps_6_0 -E PSMain -D SHADING_MODE_UNLIT=1
+            -Fo "${STATIC_MESH_UNLIT_PS_SPV}" "${CLIENT_ROOT}/shaders/StaticMesh.hlsl"
+        DEPENDS "${CLIENT_ROOT}/shaders/StaticMesh.hlsl"
+        VERBATIM
+    )
+    add_custom_command(
+        OUTPUT "${STATIC_MESH_OUTLINE_VS_SPV}"
+        COMMAND ${CMAKE_COMMAND} -E make_directory "${GENERATED_SHADER_DIR}"
+        COMMAND "${DXC_EXECUTABLE}" -spirv -T vs_6_0 -E VSMain -D STATIC_MESH_OUTLINE=1
+            -Fo "${STATIC_MESH_OUTLINE_VS_SPV}" "${CLIENT_ROOT}/shaders/StaticMesh.hlsl"
+        DEPENDS "${CLIENT_ROOT}/shaders/StaticMesh.hlsl"
+        VERBATIM
+    )
+    add_custom_command(
+        OUTPUT "${STATIC_MESH_OUTLINE_PS_SPV}"
+        COMMAND ${CMAKE_COMMAND} -E make_directory "${GENERATED_SHADER_DIR}"
+        COMMAND "${DXC_EXECUTABLE}" -spirv -T ps_6_0 -E PSMain -D STATIC_MESH_OUTLINE=1
+            -Fo "${STATIC_MESH_OUTLINE_PS_SPV}" "${CLIENT_ROOT}/shaders/StaticMesh.hlsl"
+        DEPENDS "${CLIENT_ROOT}/shaders/StaticMesh.hlsl"
+        VERBATIM
+    )
+    add_custom_command(
         OUTPUT "${TERRAIN_VS_SPV}"
         COMMAND ${CMAKE_COMMAND} -E make_directory "${GENERATED_SHADER_DIR}"
         COMMAND "${DXC_EXECUTABLE}" -spirv -fvk-use-dx-layout -T vs_6_0 -E VSMain
@@ -346,6 +380,22 @@ if(WIN32)
         VERBATIM
     )
     add_custom_command(
+        OUTPUT "${SELECTION_OUTLINE_VS_SPV}"
+        COMMAND ${CMAKE_COMMAND} -E make_directory "${GENERATED_SHADER_DIR}"
+        COMMAND "${DXC_EXECUTABLE}" -spirv -fvk-use-dx-layout -T vs_6_0 -E VSMain
+            -Fo "${SELECTION_OUTLINE_VS_SPV}" "${CLIENT_ROOT}/shaders/SelectionOutline.hlsl"
+        DEPENDS "${CLIENT_ROOT}/shaders/SelectionOutline.hlsl"
+        VERBATIM
+    )
+    add_custom_command(
+        OUTPUT "${SELECTION_OUTLINE_PS_SPV}"
+        COMMAND ${CMAKE_COMMAND} -E make_directory "${GENERATED_SHADER_DIR}"
+        COMMAND "${DXC_EXECUTABLE}" -spirv -fvk-use-dx-layout -T ps_6_0 -E PSMain
+            -Fo "${SELECTION_OUTLINE_PS_SPV}" "${CLIENT_ROOT}/shaders/SelectionOutline.hlsl"
+        DEPENDS "${CLIENT_ROOT}/shaders/SelectionOutline.hlsl"
+        VERBATIM
+    )
+    add_custom_command(
         OUTPUT "${WORLD_LABEL_VS_SPV}"
         COMMAND ${CMAKE_COMMAND} -E make_directory "${GENERATED_SHADER_DIR}"
         COMMAND "${DXC_EXECUTABLE}" -spirv -fvk-use-dx-layout -T vs_6_0 -E VSMain
@@ -377,7 +427,7 @@ if(WIN32)
         DEPENDS "${CLIENT_ROOT}/shaders/RmlUi.hlsl"
         VERBATIM
     )
-    add_custom_target(ClientShaders DEPENDS
+    add_custom_target(IXEngineShaders DEPENDS
         "${CUBE_VS_SPV}"
         "${CUBE_PS_SPV}"
         "${SKINNED_MESH_VS_SPV}"
@@ -385,6 +435,9 @@ if(WIN32)
         "${SKINNED_MESH_CS_SPV}"
         "${STATIC_MESH_VS_SPV}"
         "${STATIC_MESH_PS_SPV}"
+        "${STATIC_MESH_UNLIT_PS_SPV}"
+        "${STATIC_MESH_OUTLINE_VS_SPV}"
+        "${STATIC_MESH_OUTLINE_PS_SPV}"
         "${TERRAIN_VS_SPV}"
         "${TERRAIN_PS_SPV}"
         "${WATER_VS_SPV}"
@@ -392,6 +445,8 @@ if(WIN32)
         "${COMPOSITE_VS_SPV}"
         "${COMPOSITE_PS_SPV}"
         "${SHADOW_DEPTH_VS_SPV}"
+        "${SELECTION_OUTLINE_VS_SPV}"
+        "${SELECTION_OUTLINE_PS_SPV}"
         "${WORLD_LABEL_VS_SPV}"
         "${WORLD_LABEL_PS_SPV}"
         "${RMLUI_VS_SPV}"
@@ -410,7 +465,9 @@ endif()
 
 add_subdirectory(libs/platform)
 add_subdirectory(libs/asset)
+add_subdirectory(libs/import_export)
 add_subdirectory(libs/render)
+add_subdirectory(libs/mesh_system)
+add_subdirectory(libs/terrain_editor_system)
+add_subdirectory(libs/selection_system)
 add_subdirectory(apps/client)
-add_subdirectory(apps/selftest)
-add_subdirectory(apps/water_body_test_gen)

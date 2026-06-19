@@ -7,7 +7,7 @@
    cmake --preset android-arm64-debug
    cmake --build build/android-arm64-debug
    ```
-2. Confirm `Client/build/android-arm64-debug/libVulkanClear.so` exists.
+2. Confirm `Client/build/android-arm64-debug/libIxtreemeEngine.so` exists.
 3. Enable USB debugging on the phone and connect it by USB.
 4. If Java or the Android SDK are not on your global PATH, set them for the shell:
    ```powershell

@@ -1,5 +1,6 @@
 #include "StaticMeshRenderer.h"
 
+#include "AssimpImporter.h"
 #include "Debug.h"
 #include "MaterialAssetManager.h"
 #include "ProjectManager.h"
@@ -35,6 +36,8 @@
 
 namespace
 {
+using RgbaImage = StaticMeshRenderer::RgbaImage;
+
 void LogFormat(const char* format, ...)
 {
     char buffer[1024];
@@ -97,6 +100,7 @@ struct UniformBlock
     float materialParams[4] = {1.0f, 1.0f, 1.0f, 1.0f}; // metallic, roughness, normal strength, AO strength
     float materialEmissive[4] = {0.0f, 0.0f, 0.0f, 0.0f};
     float materialUv[4] = {1.0f, 1.0f, 0.0f, 0.0f}; // tiling.xy, offset.xy
+    float materialAlpha[4] = {0.0f, 0.5f, 0.0f, 0.0f}; // mode: 0 opaque, 1 mask, 2 blend; cutoff
     float cameraPosition[4] = {0.0f, 0.0f, 0.0f, 0.0f};
     float sunDir[4];
     float sunColor[4];
@@ -119,6 +123,7 @@ struct StaticMeshInstanceBlock
     float materialParams[4] = {1.0f, 1.0f, 1.0f, 1.0f};
     float materialEmissive[4] = {0.0f, 0.0f, 0.0f, 0.0f};
     float materialUv[4] = {1.0f, 1.0f, 0.0f, 0.0f};
+    float materialAlpha[4] = {0.0f, 0.5f, 0.0f, 0.0f};
 };
 
 struct InstancedDrawCommand
@@ -172,15 +177,6 @@ const char* LodSourceName(StaticMeshRenderer::LodBufferSource source)
     default: return "unknown";
     }
 }
-
-struct RgbaImage
-{
-    std::string name;
-    uint32_t width = 0;
-    uint32_t height = 0;
-    VkFormat format = VK_FORMAT_R8G8B8A8_UNORM;
-    std::vector<uint8_t> pixels;
-};
 
 Mat4 Identity()
 {
@@ -341,6 +337,9 @@ Mat4 BuildStaticMeshModelMatrix(const StaticMeshRenderer::Instance& instance)
         Translation(instance.position.x, instance.position.y, instance.position.z));
 }
 
+float AlphaModeCode(const std::string& alphaMode);
+const char* AlphaFragmentPath(const std::string& alphaMode);
+
 StaticMeshRenderer::MaterialDefaults MaterialDefaultsFromAsset(const MaterialAsset& material)
 {
     StaticMeshRenderer::MaterialDefaults defaults{};
@@ -358,6 +357,7 @@ StaticMeshRenderer::MaterialDefaults MaterialDefaultsFromAsset(const MaterialAss
     defaults.alphaMode = material.alphaMode == MaterialAsset::AlphaMode::Mask ? "mask" :
         (material.alphaMode == MaterialAsset::AlphaMode::Blend ? "blend" : "opaque");
     defaults.alphaCutoff = material.alphaCutoff;
+    defaults.unlit = material.shadingMode == MaterialAsset::ShadingMode::Unlit;
     return defaults;
 }
 
@@ -444,6 +444,10 @@ void FillStaticMeshInstanceBlock(const WorldCamera& camera,
     out.materialUv[1] = 1.0f;
     out.materialUv[2] = 0.0f;
     out.materialUv[3] = 0.0f;
+    out.materialAlpha[0] = AlphaModeCode(defaults.alphaMode);
+    out.materialAlpha[1] = std::clamp(defaults.alphaCutoff, 0.0f, 1.0f);
+    out.materialAlpha[2] = defaults.unlit ? 1.0f : 0.0f;
+    out.materialAlpha[3] = 0.0f;
 
     for (const MeshSceneEntity::MaterialOverride& overrideSlot : instance.materialOverrides)
     {
@@ -613,6 +617,25 @@ StaticMeshRenderer::MaterialDefaults ReadMaterialDefaults(const fastgltf::Materi
     return defaults;
 }
 
+StaticMeshRenderer::MaterialDefaults MaterialDefaultsFromSource(const GltfMaterialSource& source)
+{
+    StaticMeshRenderer::MaterialDefaults defaults{};
+    defaults.baseColor[0] = source.baseColor[0];
+    defaults.baseColor[1] = source.baseColor[1];
+    defaults.baseColor[2] = source.baseColor[2];
+    defaults.baseColor[3] = source.baseColor[3];
+    defaults.metallic = source.metallic;
+    defaults.roughness = source.roughness;
+    defaults.normalStrength = source.normalStrength;
+    defaults.aoStrength = source.aoStrength;
+    defaults.emissive[0] = source.emissive[0] * source.emissive[3];
+    defaults.emissive[1] = source.emissive[1] * source.emissive[3];
+    defaults.emissive[2] = source.emissive[2] * source.emissive[3];
+    defaults.alphaMode = source.alphaMode.empty() ? "opaque" : source.alphaMode;
+    defaults.alphaCutoff = source.alphaCutoff;
+    return defaults;
+}
+
 std::optional<std::filesystem::path> TexturePathFromInfo(const fastgltf::Asset& asset,
                                                          const fastgltf::TextureInfo& info,
                                                          const std::filesystem::path& modelDir)
@@ -661,6 +684,24 @@ const char* MaterialAlphaModeName(MaterialAsset::AlphaMode mode)
     }
 }
 
+float AlphaModeCode(const std::string& alphaMode)
+{
+    if (alphaMode == "mask" || alphaMode == "MASK")
+        return 1.0f;
+    if (alphaMode == "blend" || alphaMode == "BLEND")
+        return 2.0f;
+    return 0.0f;
+}
+
+const char* AlphaFragmentPath(const std::string& alphaMode)
+{
+    if (alphaMode == "mask" || alphaMode == "MASK")
+        return "discard";
+    if (alphaMode == "blend" || alphaMode == "BLEND")
+        return "blend-fallback-opaque";
+    return "none";
+}
+
 std::string SanitizedStem(std::string value)
 {
     for (char& c : value)
@@ -671,6 +712,15 @@ std::string SanitizedStem(std::string value)
     while (!value.empty() && value.back() == '_')
         value.pop_back();
     return value.empty() ? "asset" : value;
+}
+
+std::string LowercaseExtension(const std::string& modelPath)
+{
+    std::string ext = std::filesystem::path(modelPath).extension().string();
+    std::transform(ext.begin(), ext.end(), ext.begin(), [](unsigned char c) {
+        return static_cast<char>(std::tolower(c));
+    });
+    return ext;
 }
 
 GltfMaterialSource BuildMaterialSource(const fastgltf::Asset& asset,
@@ -864,6 +914,39 @@ bool DecodeGltfTexture(const fastgltf::Asset& asset,
     out.pixels.assign(decoded, decoded + static_cast<size_t>(width) * static_cast<size_t>(height) * 4u);
     stbi_image_free(decoded);
     LogFormat("[STATIC-MESH] decoded %s image='%s' (%ux%u, source channels=%d)",
+        label, out.name.c_str(), out.width, out.height, channels);
+    return true;
+}
+
+bool DecodeTextureFile(const std::filesystem::path& path, VkFormat format, const char* label, RgbaImage& out)
+{
+    std::ifstream file(path, std::ios::binary);
+    if (!file)
+        return false;
+
+    std::vector<uint8_t> encoded((std::istreambuf_iterator<char>(file)), std::istreambuf_iterator<char>());
+    if (encoded.empty())
+        return false;
+
+    int width = 0;
+    int height = 0;
+    int channels = 0;
+    stbi_uc* decoded = stbi_load_from_memory(
+        encoded.data(), static_cast<int>(encoded.size()), &width, &height, &channels, 4);
+    if (!decoded || width <= 0 || height <= 0)
+    {
+        if (decoded)
+            stbi_image_free(decoded);
+        return false;
+    }
+
+    out.name = path.filename().generic_string();
+    out.width = static_cast<uint32_t>(width);
+    out.height = static_cast<uint32_t>(height);
+    out.format = format;
+    out.pixels.assign(decoded, decoded + static_cast<size_t>(width) * static_cast<size_t>(height) * 4u);
+    stbi_image_free(decoded);
+    LogFormat("[STATIC-MESH] decoded material %s image='%s' (%ux%u, source channels=%d)",
         label, out.name.c_str(), out.width, out.height, channels);
     return true;
 }
@@ -1142,26 +1225,47 @@ bool StaticMeshRenderer::Create(VulkanDevice& device, client::asset::IAssetReade
             m_boundsMax[0], m_boundsMax[1], m_boundsMax[2]);
     };
 
-    bool isSkinned = false;
-    std::string error;
-    if (!DetectSkinnedGltf(assets, modelPath, isSkinned, &error))
+    const bool builtinPrimitive = modelPath.rfind("builtin://primitive/", 0) == 0;
+    const std::string ext = LowercaseExtension(modelPath);
+    if (builtinPrimitive)
     {
-        LogFormat("[STATIC-MESH] inspect failed: %s reason=%s", modelPath.c_str(), error.c_str());
-        logCreateState();
-        return false;
+        if (!LoadBuiltinPrimitiveMesh(modelPath))
+        {
+            logCreateState();
+            return false;
+        }
     }
-    if (isSkinned)
+    else if (ext == ".fbx")
     {
-        m_status = LoadStatus::UnsupportedSkinned;
-        LogFormat("[STATIC-MESH] skinned glTF detected, static renderer will not load it: %s", modelPath.c_str());
-        logCreateState();
-        return false;
+        if (!LoadStaticFbxMesh(modelPath))
+        {
+            logCreateState();
+            return false;
+        }
     }
+    else
+    {
+        bool isSkinned = false;
+        std::string error;
+        if (!DetectSkinnedGltf(assets, modelPath, isSkinned, &error))
+        {
+            LogFormat("[STATIC-MESH] inspect failed: %s reason=%s", modelPath.c_str(), error.c_str());
+            logCreateState();
+            return false;
+        }
+        if (isSkinned)
+        {
+            m_status = LoadStatus::UnsupportedSkinned;
+            LogFormat("[STATIC-MESH] skinned glTF detected, static renderer will not load it: %s", modelPath.c_str());
+            logCreateState();
+            return false;
+        }
 
-    if (!LoadStaticGltfMesh(modelPath))
-    {
-        logCreateState();
-        return false;
+        if (!LoadStaticGltfMesh(modelPath))
+        {
+            logCreateState();
+            return false;
+        }
     }
     loaded = true;
     if (!CreateBuffers(device))
@@ -1275,13 +1379,26 @@ StaticMeshRenderer::LodDiagnostics StaticMeshRenderer::GetLodDiagnostics(std::ui
 
 void StaticMeshRenderer::DumpMaterialState(const char* entityName, const Instance& instance) const
 {
-    LogFormat("[MATSLOT-DIAG] === entity name=%s entityId=%u submeshCount=%zu ===",
+    LogFormat("[MATBIND-DIAG] === entity name=%s entityId=%u submeshCount=%zu ===",
         entityName && entityName[0] ? entityName : "<unnamed>",
         instance.entityId,
         m_draws.size());
 
     auto guidText = [](const std::optional<Guid>& guid) {
         return guid ? guid->toString() : std::string("EMPTY");
+    };
+    auto handleText = [](auto handle) {
+        char value[32]{};
+        std::snprintf(value, sizeof(value), "0x%llx", VkHandleValue(handle));
+        return std::string(value);
+    };
+    auto lastBindingFor = [&](std::uint32_t sourceSubmesh, std::uint32_t materialSlot) -> const LastMaterialBinding* {
+        for (const LastMaterialBinding& binding : m_lastMaterialBindings)
+        {
+            if (binding.sourceSubmesh == sourceSubmesh && binding.materialSlot == materialSlot)
+                return &binding;
+        }
+        return nullptr;
     };
 
     for (std::size_t i = 0; i < m_draws.size(); ++i)
@@ -1303,13 +1420,9 @@ void StaticMeshRenderer::DumpMaterialState(const char* entityName, const Instanc
         float metallic = baked.metallic;
         float roughness = baked.roughness;
         std::string baseColorTextureGuid = "EMPTY";
-        std::string baseColorTextureHandle = m_texture.view != VK_NULL_HANDLE
-            ? [&] {
-                char handle[32]{};
-                std::snprintf(handle, sizeof(handle), "0x%llx", VkHandleValue(m_texture.view));
-                return std::string(handle);
-            }()
-            : "NULL";
+        std::string resolvedBaseColorView = handleText(m_texture.view);
+        std::string descriptorSet = "NULL";
+        std::string boundBeforeDraw = "no";
 
         if (slotGuid.empty())
         {
@@ -1326,7 +1439,6 @@ void StaticMeshRenderer::DumpMaterialState(const char* entityName, const Instanc
                 alphaMode = MaterialAlphaModeName(pink->alphaMode);
                 alphaCutoff = pink->alphaCutoff;
             }
-            baseColorTextureHandle = "NULL";
         }
         else if (const std::optional<Guid> guid = Guid::fromString(slotGuid))
         {
@@ -1343,7 +1455,6 @@ void StaticMeshRenderer::DumpMaterialState(const char* entityName, const Instanc
                 alphaMode = MaterialAlphaModeName(material->alphaMode);
                 alphaCutoff = material->alphaCutoff;
                 baseColorTextureGuid = guidText(material->baseColorTexture);
-                baseColorTextureHandle = "NULL";
             }
             else
             {
@@ -1361,7 +1472,6 @@ void StaticMeshRenderer::DumpMaterialState(const char* entityName, const Instanc
                     alphaCutoff = pink->alphaCutoff;
                 }
                 baseColorTextureGuid = slotGuid;
-                baseColorTextureHandle = "NULL";
             }
         }
         else
@@ -1380,30 +1490,49 @@ void StaticMeshRenderer::DumpMaterialState(const char* entityName, const Instanc
                 alphaCutoff = pink->alphaCutoff;
             }
             baseColorTextureGuid = slotGuid;
-            baseColorTextureHandle = "NULL";
         }
 
-        LogFormat("[MATSLOT-DIAG]   submesh=%zu", i);
-        LogFormat("[MATSLOT-DIAG]     renderer.materials[%u] = %s",
-            materialSlot,
-            slotGuid.empty() ? "EMPTY" : slotGuid.c_str());
-        LogFormat("[MATSLOT-DIAG]     resolvedMaterialAsset = %s", resolvedName.c_str());
-        LogFormat("[MATSLOT-DIAG]     materialSource = \"%s\"", source);
-        LogFormat("[MATSLOT-DIAG]     baseColor = (%.3f,%.3f,%.3f,%.3f)",
-            baseColor[0], baseColor[1], baseColor[2], baseColor[3]);
-        LogFormat("[MATSLOT-DIAG]     baseColorTexture.guid = %s", baseColorTextureGuid.c_str());
-        LogFormat("[MATSLOT-DIAG]     baseColorTexture.resolvedHandle = %s", baseColorTextureHandle.c_str());
-        LogFormat("[MATSLOT-DIAG]     boundRendererBaseColorView = 0x%llx source=gltf_baked_renderer_texture",
-            VkHandleValue(m_texture.view));
-        LogFormat("[MATSLOT-DIAG]     boundRendererNormalView = 0x%llx", VkHandleValue(m_normalTexture.view));
-        LogFormat("[MATSLOT-DIAG]     boundRendererMetallicRoughnessView = 0x%llx", VkHandleValue(m_ormTexture.view));
-        LogFormat("[MATSLOT-DIAG]     alphaMode = %s", alphaMode);
-        LogFormat("[MATSLOT-DIAG]     alphaCutoff = %.3f", alphaCutoff);
-        LogFormat("[MATSLOT-DIAG]     metallic = %.3f", metallic);
-        LogFormat("[MATSLOT-DIAG]     roughness = %.3f", roughness);
-        LogFormat("[MATSLOT-DIAG]     vertexCount = %u", draw.vertexCount);
-        LogFormat("[MATSLOT-DIAG]     indexCount = %u", draw.indexCount);
-        LogFormat("[MATSLOT-DIAG]     drawCallIssued = %s", draw.indexCount > 0 ? "yes" : "no");
+        if (const LastMaterialBinding* binding = lastBindingFor(static_cast<std::uint32_t>(i), materialSlot))
+        {
+            resolvedBaseColorView = handleText(binding->baseColorView);
+            descriptorSet = handleText(binding->descriptorSet);
+            boundBeforeDraw = binding->boundBeforeDraw ? "yes" : "no";
+            alphaMode = binding->alphaMode.c_str();
+            alphaCutoff = binding->alphaCutoff;
+            if (binding->resolvedMaterial != "gltf_baked")
+                resolvedName = binding->resolvedMaterial;
+            if (binding->baseColorTextureGuid != "EMPTY")
+                baseColorTextureGuid = binding->baseColorTextureGuid;
+        }
+
+        LogFormat("[MATBIND-DIAG]   submesh=%zu materialSlot=%u", i, materialSlot);
+        LogFormat("[MATBIND-DIAG]     slotGuid=%s", slotGuid.empty() ? "EMPTY" : slotGuid.c_str());
+        LogFormat("[MATBIND-DIAG]     resolvedMaterial=%s source=%s", resolvedName.c_str(), source);
+        LogFormat("[MATBIND-DIAG]     baseColorTextureGuid=%s", baseColorTextureGuid.c_str());
+        LogFormat("[MATBIND-DIAG]     resolvedVkImageView=%s", resolvedBaseColorView.c_str());
+        LogFormat("[MATBIND-DIAG]     alphaMode=%s", alphaMode);
+        LogFormat("[MATBIND-DIAG]     alphaCutoff=%.3f", alphaCutoff);
+        LogFormat("[MATBIND-DIAG]     vkPipeline=%s",
+            lastBindingFor(static_cast<std::uint32_t>(i), materialSlot)
+                ? handleText(lastBindingFor(static_cast<std::uint32_t>(i), materialSlot)->pipeline).c_str()
+                : "NULL");
+        LogFormat("[MATBIND-DIAG]     fragmentShaderAlphaPath=%s",
+            lastBindingFor(static_cast<std::uint32_t>(i), materialSlot)
+                ? lastBindingFor(static_cast<std::uint32_t>(i), materialSlot)->fragmentShaderAlphaPath
+                : AlphaFragmentPath(alphaMode));
+        LogFormat("[MATBIND-DIAG]     descriptorSet=%s boundBeforeDraw=%s",
+            descriptorSet.c_str(),
+            boundBeforeDraw.c_str());
+        LogFormat("[MATBIND-DIAG]     baseColor=(%.3f,%.3f,%.3f,%.3f) alphaMode=%s alphaCutoff=%.3f metallic=%.3f roughness=%.3f",
+            baseColor[0], baseColor[1], baseColor[2], baseColor[3],
+            alphaMode,
+            alphaCutoff,
+            metallic,
+            roughness);
+        LogFormat("[MATBIND-DIAG]     vertexCount=%u indexCount=%u drawCallIssued=%s",
+            draw.vertexCount,
+            draw.indexCount,
+            draw.indexCount > 0 ? "yes" : "no");
     }
 }
 
@@ -1543,6 +1672,318 @@ bool StaticMeshRenderer::LoadStaticGltfMesh(const std::string& modelPath)
         return false;
     }
     GenerateMaterialAssetsForGltf(asset, modelPath);
+    LogFormat("[MPERF] mesh=%s verts=%zu submeshes=%zu materials=%u alpha=%s",
+        modelPath.c_str(),
+        m_vertices.size(),
+        m_draws.size(),
+        m_materialSlotCount,
+        m_alphaModeName.c_str());
+    return true;
+}
+
+bool StaticMeshRenderer::LoadBuiltinPrimitiveMesh(const std::string& modelPath)
+{
+    const std::string prefix = "builtin://primitive/";
+    if (modelPath.rfind(prefix, 0) != 0)
+        return false;
+    const std::string type = modelPath.substr(prefix.size());
+
+    m_vertices.clear();
+    m_indices.clear();
+    m_draws.clear();
+    m_lodProxyBuilt = false;
+    m_lodProxyIndices.clear();
+    m_lodProxyDraws.clear();
+    m_materialDefaults.clear();
+    m_materialDefaults.push_back(MaterialDefaults{});
+    m_materialSlotCount = 1;
+    m_alphaModeName = "opaque";
+    m_boundsMin = {std::numeric_limits<float>::max(), std::numeric_limits<float>::max(), std::numeric_limits<float>::max()};
+    m_boundsMax = {std::numeric_limits<float>::lowest(), std::numeric_limits<float>::lowest(), std::numeric_limits<float>::lowest()};
+
+    auto addVertex = [&](float x, float y, float z, float nx, float ny, float nz, float u, float v) {
+        Vertex vertex{};
+        vertex.position[0] = x;
+        vertex.position[1] = y;
+        vertex.position[2] = z;
+        vertex.normal[0] = nx;
+        vertex.normal[1] = ny;
+        vertex.normal[2] = nz;
+        vertex.uv[0] = u;
+        vertex.uv[1] = v;
+        m_boundsMin[0] = std::min(m_boundsMin[0], x);
+        m_boundsMin[1] = std::min(m_boundsMin[1], y);
+        m_boundsMin[2] = std::min(m_boundsMin[2], z);
+        m_boundsMax[0] = std::max(m_boundsMax[0], x);
+        m_boundsMax[1] = std::max(m_boundsMax[1], y);
+        m_boundsMax[2] = std::max(m_boundsMax[2], z);
+        m_vertices.push_back(vertex);
+        return static_cast<std::uint32_t>(m_vertices.size() - 1u);
+    };
+    auto addTri = [&](std::uint32_t a, std::uint32_t b, std::uint32_t c) {
+        m_indices.push_back(a);
+        m_indices.push_back(b);
+        m_indices.push_back(c);
+    };
+    auto addQuad = [&](std::uint32_t a, std::uint32_t b, std::uint32_t c, std::uint32_t d) {
+        addTri(a, b, c);
+        addTri(a, c, d);
+    };
+
+    if (type == "cube")
+    {
+        struct Face
+        {
+            float normal[3];
+            float corners[4][3];
+        };
+        constexpr float s = 0.5f;
+        const std::array<Face, 6> faces{{
+            {{0.0f, 0.0f, 1.0f}, {{-s, -s, s}, {s, -s, s}, {s, s, s}, {-s, s, s}}},
+            {{0.0f, 0.0f, -1.0f}, {{s, -s, -s}, {-s, -s, -s}, {-s, s, -s}, {s, s, -s}}},
+            {{1.0f, 0.0f, 0.0f}, {{s, -s, s}, {s, -s, -s}, {s, s, -s}, {s, s, s}}},
+            {{-1.0f, 0.0f, 0.0f}, {{-s, -s, -s}, {-s, -s, s}, {-s, s, s}, {-s, s, -s}}},
+            {{0.0f, 1.0f, 0.0f}, {{-s, s, s}, {s, s, s}, {s, s, -s}, {-s, s, -s}}},
+            {{0.0f, -1.0f, 0.0f}, {{-s, -s, -s}, {s, -s, -s}, {s, -s, s}, {-s, -s, s}}},
+        }};
+        for (const Face& face : faces)
+        {
+            const std::uint32_t base = static_cast<std::uint32_t>(m_vertices.size());
+            addVertex(face.corners[0][0], face.corners[0][1], face.corners[0][2], face.normal[0], face.normal[1], face.normal[2], 0.0f, 1.0f);
+            addVertex(face.corners[1][0], face.corners[1][1], face.corners[1][2], face.normal[0], face.normal[1], face.normal[2], 1.0f, 1.0f);
+            addVertex(face.corners[2][0], face.corners[2][1], face.corners[2][2], face.normal[0], face.normal[1], face.normal[2], 1.0f, 0.0f);
+            addVertex(face.corners[3][0], face.corners[3][1], face.corners[3][2], face.normal[0], face.normal[1], face.normal[2], 0.0f, 0.0f);
+            addQuad(base + 0u, base + 1u, base + 2u, base + 3u);
+        }
+    }
+    else if (type == "sphere")
+    {
+        constexpr std::uint32_t rings = 24;
+        constexpr std::uint32_t segments = 32;
+        constexpr float radius = 0.5f;
+        for (std::uint32_t y = 0; y <= rings; ++y)
+        {
+            const float v = static_cast<float>(y) / static_cast<float>(rings);
+            const float theta = v * 3.14159265358979323846f;
+            const float sinTheta = std::sin(theta);
+            const float cosTheta = std::cos(theta);
+            for (std::uint32_t x = 0; x <= segments; ++x)
+            {
+                const float u = static_cast<float>(x) / static_cast<float>(segments);
+                const float phi = u * 6.28318530717958647692f;
+                const float nx = std::cos(phi) * sinTheta;
+                const float ny = cosTheta;
+                const float nz = std::sin(phi) * sinTheta;
+                addVertex(nx * radius, ny * radius, nz * radius, nx, ny, nz, u, v);
+            }
+        }
+        const std::uint32_t stride = segments + 1u;
+        for (std::uint32_t y = 0; y < rings; ++y)
+        {
+            for (std::uint32_t x = 0; x < segments; ++x)
+            {
+                const std::uint32_t a = y * stride + x;
+                const std::uint32_t b = a + 1u;
+                const std::uint32_t c = (y + 1u) * stride + x + 1u;
+                const std::uint32_t d = (y + 1u) * stride + x;
+                addQuad(a, b, c, d);
+            }
+        }
+    }
+    else if (type == "capsule")
+    {
+        constexpr std::uint32_t hemiRings = 8;
+        constexpr std::uint32_t segments = 32;
+        constexpr float radius = 0.5f;
+        constexpr float halfCylinder = 0.5f;
+        std::vector<std::uint32_t> ringStarts;
+        auto addRing = [&](float y, float ringRadius, float normalCenterY, float v) {
+            ringStarts.push_back(static_cast<std::uint32_t>(m_vertices.size()));
+            for (std::uint32_t x = 0; x <= segments; ++x)
+            {
+                const float u = static_cast<float>(x) / static_cast<float>(segments);
+                const float phi = u * 6.28318530717958647692f;
+                const float px = std::cos(phi) * ringRadius;
+                const float pz = std::sin(phi) * ringRadius;
+                float nx = px;
+                float ny = y - normalCenterY;
+                float nz = pz;
+                const float len = std::max(0.0001f, std::sqrt(nx * nx + ny * ny + nz * nz));
+                nx /= len;
+                ny /= len;
+                nz /= len;
+                addVertex(px, y, pz, nx, ny, nz, u, v);
+            }
+        };
+        for (std::uint32_t ring = 0; ring <= hemiRings; ++ring)
+        {
+            const float t = static_cast<float>(ring) / static_cast<float>(hemiRings);
+            const float angle = t * 1.57079632679489661923f;
+            addRing(halfCylinder + std::cos(angle) * radius, std::sin(angle) * radius, halfCylinder, t * 0.25f);
+        }
+        addRing(-halfCylinder, radius, -halfCylinder, 0.75f);
+        for (std::uint32_t ring = 1; ring <= hemiRings; ++ring)
+        {
+            const float t = static_cast<float>(ring) / static_cast<float>(hemiRings);
+            const float angle = 1.57079632679489661923f + t * 1.57079632679489661923f;
+            addRing(-halfCylinder + std::cos(angle) * radius, std::sin(angle) * radius, -halfCylinder, 0.75f + t * 0.25f);
+        }
+        const std::uint32_t stride = segments + 1u;
+        for (std::size_t ring = 0; ring + 1u < ringStarts.size(); ++ring)
+        {
+            const std::uint32_t rowA = ringStarts[ring];
+            const std::uint32_t rowB = ringStarts[ring + 1u];
+            for (std::uint32_t x = 0; x < segments; ++x)
+                addQuad(rowA + x, rowA + x + 1u, rowB + x + 1u, rowB + x);
+        }
+        (void)stride;
+    }
+    else
+    {
+        LogFormat("[PRIMITIVE] unknown builtin primitive: %s", modelPath.c_str());
+        return false;
+    }
+
+    if (m_vertices.empty() || m_indices.empty())
+        return false;
+
+    MeshDraw draw{};
+    draw.firstIndex = 0;
+    draw.indexCount = static_cast<std::uint32_t>(m_indices.size());
+    draw.materialSlot = 0;
+    draw.vertexCount = static_cast<std::uint32_t>(m_vertices.size());
+    m_draws.push_back(draw);
+    LogFormat("[PRIMITIVE] generated type=%s verts=%zu indices=%zu tris=%zu",
+        type.c_str(),
+        m_vertices.size(),
+        m_indices.size(),
+        m_indices.size() / 3u);
+    return true;
+}
+
+bool StaticMeshRenderer::LoadStaticFbxMesh(const std::string& modelPath)
+{
+    std::filesystem::path fbxPath(modelPath);
+    if (fbxPath.is_relative())
+    {
+        if (m_assets)
+        {
+            if (auto root = m_assets->RootPath())
+                fbxPath = *root / fbxPath;
+            else
+                fbxPath = std::filesystem::absolute(fbxPath);
+        }
+        else
+        {
+            fbxPath = std::filesystem::absolute(fbxPath);
+        }
+    }
+    std::error_code ec;
+    const std::filesystem::path canonicalPath = std::filesystem::weakly_canonical(fbxPath, ec);
+    if (!ec)
+        fbxPath = canonicalPath;
+
+    AssimpImporter importer;
+    AssimpImporter::ImportResult result = importer.importFile(fbxPath);
+    if (!result.success)
+    {
+        LogFormat("[STATIC-MESH] FBX parse failed: %s reason=%s",
+            modelPath.c_str(),
+            result.errorMessage.empty() ? "unknown" : result.errorMessage.c_str());
+        return false;
+    }
+
+    if (result.skeletalIgnored)
+    {
+        LogFormat("[FBX-IMPORT] skeletal data ignored for static renderer path=%s",
+            fbxPath.generic_string().c_str());
+    }
+
+    m_vertices.clear();
+    m_indices.clear();
+    m_draws.clear();
+    m_lodProxyBuilt = false;
+    m_lodProxyIndices.clear();
+    m_lodProxyDraws.clear();
+    m_materialDefaults.clear();
+    m_alphaModeName = "opaque";
+    m_materialDefaults.reserve(std::max<std::size_t>(result.materials.size(), 1u));
+    if (result.materials.empty())
+    {
+        m_materialDefaults.push_back(MaterialDefaults{});
+    }
+    else
+    {
+        for (const GltfMaterialSource& source : result.materials)
+        {
+            MaterialDefaults defaults = MaterialDefaultsFromSource(source);
+            m_materialDefaults.push_back(defaults);
+            if (defaults.alphaMode == "blend" || defaults.alphaMode == "BLEND")
+                m_alphaModeName = "blend";
+            else if ((defaults.alphaMode == "mask" || defaults.alphaMode == "MASK") && m_alphaModeName != "blend")
+                m_alphaModeName = "mask";
+        }
+    }
+    m_materialSlotCount = static_cast<std::uint32_t>(std::max<std::size_t>(m_materialDefaults.size(), 1u));
+    m_boundsMin = {std::numeric_limits<float>::max(), std::numeric_limits<float>::max(), std::numeric_limits<float>::max()};
+    m_boundsMax = {std::numeric_limits<float>::lowest(), std::numeric_limits<float>::lowest(), std::numeric_limits<float>::lowest()};
+
+    std::uint32_t meshIndex = 0;
+    for (const AssimpImporter::StaticMeshData& mesh : result.meshes)
+    {
+        if (mesh.vertices.empty() || mesh.indices.empty())
+            continue;
+
+        const std::uint32_t baseVertex = static_cast<std::uint32_t>(m_vertices.size());
+        const std::uint32_t firstIndex = static_cast<std::uint32_t>(m_indices.size());
+        for (const AssimpImporter::Vertex& src : mesh.vertices)
+        {
+            Vertex vertex{};
+            vertex.position[0] = src.position[0];
+            vertex.position[1] = src.position[1];
+            vertex.position[2] = src.position[2];
+            vertex.normal[0] = src.normal[0];
+            vertex.normal[1] = src.normal[1];
+            vertex.normal[2] = src.normal[2];
+            vertex.uv[0] = src.uv[0];
+            vertex.uv[1] = src.uv[1];
+            m_boundsMin[0] = std::min(m_boundsMin[0], vertex.position[0]);
+            m_boundsMin[1] = std::min(m_boundsMin[1], vertex.position[1]);
+            m_boundsMin[2] = std::min(m_boundsMin[2], vertex.position[2]);
+            m_boundsMax[0] = std::max(m_boundsMax[0], vertex.position[0]);
+            m_boundsMax[1] = std::max(m_boundsMax[1], vertex.position[1]);
+            m_boundsMax[2] = std::max(m_boundsMax[2], vertex.position[2]);
+            m_vertices.push_back(vertex);
+        }
+        for (std::uint32_t index : mesh.indices)
+            m_indices.push_back(baseVertex + index);
+
+        MeshDraw draw{};
+        draw.firstIndex = firstIndex;
+        draw.indexCount = static_cast<std::uint32_t>(m_indices.size() - firstIndex);
+        draw.materialSlot = mesh.materialIndex < m_materialSlotCount ? mesh.materialIndex : 0u;
+        draw.vertexCount = static_cast<std::uint32_t>(mesh.vertices.size());
+        m_draws.push_back(draw);
+        LogFormat("[STATIC-MESH] extracted FBX mesh[%u] mesh='%s': verts=%zu indices=%u materialSlot=%u",
+            meshIndex++,
+            mesh.name.c_str(),
+            mesh.vertices.size(),
+            draw.indexCount,
+            draw.materialSlot);
+    }
+
+    if (m_vertices.empty() || m_indices.empty())
+    {
+        LogFormat("[STATIC-MESH] no renderable static FBX mesh data extracted: %s", modelPath.c_str());
+        m_boundsMin = {0.0f, 0.0f, 0.0f};
+        m_boundsMax = {0.0f, 0.0f, 0.0f};
+        return false;
+    }
+
+    LogFormat("[FBX-IMPORT] runtime loaded path=%s meshes=%zu materials=%zu",
+        fbxPath.generic_string().c_str(),
+        result.meshes.size(),
+        result.materials.size());
     LogFormat("[MPERF] mesh=%s verts=%zu submeshes=%zu materials=%u alpha=%s",
         modelPath.c_str(),
         m_vertices.size(),
@@ -2166,6 +2607,84 @@ void StaticMeshRenderer::LodWorkerMain()
     }
 }
 
+bool StaticMeshRenderer::UploadTexture(VulkanDevice& device, const RgbaImage& source, Texture& texture)
+{
+    RgbaImage image = source;
+    VkFormatProperties props{};
+    vkGetPhysicalDeviceFormatProperties(device.GetPhysicalDevice(), image.format, &props);
+    const VkFormatFeatureFlags required =
+        VK_FORMAT_FEATURE_SAMPLED_IMAGE_BIT | VK_FORMAT_FEATURE_TRANSFER_DST_BIT;
+    if ((props.optimalTilingFeatures & required) != required)
+    {
+        image.format = VK_FORMAT_R8G8B8A8_UNORM;
+        vkGetPhysicalDeviceFormatProperties(device.GetPhysicalDevice(), image.format, &props);
+        if ((props.optimalTilingFeatures & required) != required)
+            return false;
+    }
+
+    VkQueue graphicsQueue = VK_NULL_HANDLE;
+    vkGetDeviceQueue(m_device, device.GetGraphicsQueueFamily(), 0, &graphicsQueue);
+
+    texture.name = image.name;
+    texture.width = image.width;
+    texture.height = image.height;
+    texture.mipLevels = 1;
+    texture.format = image.format;
+    CreateDeviceLocalImage(device, m_device, image.width, image.height, image.format, texture.image, texture.memory);
+
+    Buffer staging{};
+    CreateHostVisibleBuffer(device, m_device, image.pixels.size(),
+        VK_BUFFER_USAGE_TRANSFER_SRC_BIT, image.pixels.data(), staging);
+
+    VkCommandPool uploadPool = VK_NULL_HANDLE;
+    VkCommandBuffer cmd = BeginOneTimeCommands(m_device, device.GetGraphicsQueueFamily(), uploadPool);
+    TransitionImageLayout(cmd, texture.image, VK_IMAGE_LAYOUT_UNDEFINED, VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL);
+    VkBufferImageCopy region{};
+    region.bufferOffset = 0;
+    region.imageSubresource.aspectMask = VK_IMAGE_ASPECT_COLOR_BIT;
+    region.imageSubresource.mipLevel = 0;
+    region.imageSubresource.baseArrayLayer = 0;
+    region.imageSubresource.layerCount = 1;
+    region.imageExtent = {image.width, image.height, 1};
+    vkCmdCopyBufferToImage(cmd, staging.buffer, texture.image,
+        VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL, 1, &region);
+    TransitionImageLayout(cmd, texture.image,
+        VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL, VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL);
+    EndOneTimeCommands(m_device, graphicsQueue, uploadPool, cmd);
+    DestroyBuffer(staging);
+
+    VkImageViewCreateInfo view{};
+    view.sType = VK_STRUCTURE_TYPE_IMAGE_VIEW_CREATE_INFO;
+    view.image = texture.image;
+    view.viewType = VK_IMAGE_VIEW_TYPE_2D;
+    view.format = texture.format;
+    view.subresourceRange.aspectMask = VK_IMAGE_ASPECT_COLOR_BIT;
+    view.subresourceRange.baseMipLevel = 0;
+    view.subresourceRange.levelCount = 1;
+    view.subresourceRange.baseArrayLayer = 0;
+    view.subresourceRange.layerCount = 1;
+    VK_CHECK(vkCreateImageView(m_device, &view, nullptr, &texture.view));
+
+    VkSamplerCreateInfo sampler{};
+    sampler.sType = VK_STRUCTURE_TYPE_SAMPLER_CREATE_INFO;
+    sampler.magFilter = VK_FILTER_LINEAR;
+    sampler.minFilter = VK_FILTER_LINEAR;
+    sampler.mipmapMode = VK_SAMPLER_MIPMAP_MODE_NEAREST;
+    sampler.addressModeU = VK_SAMPLER_ADDRESS_MODE_REPEAT;
+    sampler.addressModeV = VK_SAMPLER_ADDRESS_MODE_REPEAT;
+    sampler.addressModeW = VK_SAMPLER_ADDRESS_MODE_REPEAT;
+    sampler.minLod = 0.0f;
+    sampler.maxLod = 1.0f;
+    if (device.SupportsSamplerAnisotropy())
+    {
+        sampler.anisotropyEnable = VK_TRUE;
+        sampler.maxAnisotropy = device.GetMaxSamplerAnisotropy();
+    }
+    sampler.borderColor = VK_BORDER_COLOR_FLOAT_OPAQUE_BLACK;
+    VK_CHECK(vkCreateSampler(m_device, &sampler, nullptr, &texture.sampler));
+    return true;
+}
+
 bool StaticMeshRenderer::CreateTextures(VulkanDevice& device, const std::string& modelPath)
 {
     RgbaImage diffuse{};
@@ -2182,86 +2701,154 @@ bool StaticMeshRenderer::CreateTextures(VulkanDevice& device, const std::string&
     if (orm.pixels.empty())
         orm = CreateFallbackOrmImage(modelPath);
 
-    auto uploadTexture = [&](const RgbaImage& source, Texture& texture) -> bool {
-        RgbaImage image = source;
-        VkFormatProperties props{};
-        vkGetPhysicalDeviceFormatProperties(device.GetPhysicalDevice(), image.format, &props);
-        const VkFormatFeatureFlags required =
-            VK_FORMAT_FEATURE_SAMPLED_IMAGE_BIT | VK_FORMAT_FEATURE_TRANSFER_DST_BIT;
-        if ((props.optimalTilingFeatures & required) != required)
-        {
-            image.format = VK_FORMAT_R8G8B8A8_UNORM;
-            vkGetPhysicalDeviceFormatProperties(device.GetPhysicalDevice(), image.format, &props);
-            if ((props.optimalTilingFeatures & required) != required)
-                return false;
-        }
+    return UploadTexture(device, diffuse, m_texture) &&
+        UploadTexture(device, normal, m_normalTexture) &&
+        UploadTexture(device, orm, m_ormTexture);
+}
 
-        VkQueue graphicsQueue = VK_NULL_HANDLE;
-        vkGetDeviceQueue(m_device, device.GetGraphicsQueueFamily(), 0, &graphicsQueue);
+const StaticMeshRenderer::Texture* StaticMeshRenderer::EnsureMaterialTexture(VulkanDevice& device,
+    const std::optional<Guid>& guid,
+    VkFormat format,
+    const char* role)
+{
+    if (!guid)
+        return nullptr;
 
-        texture.name = image.name;
-        texture.width = image.width;
-        texture.height = image.height;
-        texture.mipLevels = 1;
-        texture.format = image.format;
-        CreateDeviceLocalImage(device, m_device, image.width, image.height, image.format, texture.image, texture.memory);
+    const std::string guidText = guid->toString();
+    const std::string key = std::string(role ? role : "texture") + ":" + guidText;
+    if (const auto it = m_materialTextureCache.find(key); it != m_materialTextureCache.end())
+        return it->second.view != VK_NULL_HANDLE ? &it->second : nullptr;
+    if (m_failedMaterialTextureKeys.find(key) != m_failedMaterialTextureKeys.end())
+        return nullptr;
 
-        Buffer staging{};
-        CreateHostVisibleBuffer(device, m_device, image.pixels.size(),
-            VK_BUFFER_USAGE_TRANSFER_SRC_BIT, image.pixels.data(), staging);
+    const std::optional<std::filesystem::path> path = AssetDatabase::Instance().resolveGuid(*guid);
+    if (!path)
+    {
+        m_failedMaterialTextureKeys.insert(key);
+        LogFormat("[MATBIND-DIAG] texture resolve failed role=%s guid=%s reason=guid_not_found",
+            role ? role : "texture",
+            guidText.c_str());
+        return nullptr;
+    }
 
-        VkCommandPool uploadPool = VK_NULL_HANDLE;
-        VkCommandBuffer cmd = BeginOneTimeCommands(m_device, device.GetGraphicsQueueFamily(), uploadPool);
-        TransitionImageLayout(cmd, texture.image, VK_IMAGE_LAYOUT_UNDEFINED, VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL);
-        VkBufferImageCopy region{};
-        region.bufferOffset = 0;
-        region.imageSubresource.aspectMask = VK_IMAGE_ASPECT_COLOR_BIT;
-        region.imageSubresource.mipLevel = 0;
-        region.imageSubresource.baseArrayLayer = 0;
-        region.imageSubresource.layerCount = 1;
-        region.imageExtent = {image.width, image.height, 1};
-        vkCmdCopyBufferToImage(cmd, staging.buffer, texture.image,
-            VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL, 1, &region);
-        TransitionImageLayout(cmd, texture.image,
-            VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL, VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL);
-        EndOneTimeCommands(m_device, graphicsQueue, uploadPool, cmd);
-        DestroyBuffer(staging);
+    RgbaImage image{};
+    if (!DecodeTextureFile(*path, format, role ? role : "texture", image))
+    {
+        m_failedMaterialTextureKeys.insert(key);
+        LogFormat("[MATBIND-DIAG] texture decode failed role=%s guid=%s path=%s",
+            role ? role : "texture",
+            guidText.c_str(),
+            path->generic_string().c_str());
+        return nullptr;
+    }
 
-        VkImageViewCreateInfo view{};
-        view.sType = VK_STRUCTURE_TYPE_IMAGE_VIEW_CREATE_INFO;
-        view.image = texture.image;
-        view.viewType = VK_IMAGE_VIEW_TYPE_2D;
-        view.format = texture.format;
-        view.subresourceRange.aspectMask = VK_IMAGE_ASPECT_COLOR_BIT;
-        view.subresourceRange.baseMipLevel = 0;
-        view.subresourceRange.levelCount = 1;
-        view.subresourceRange.baseArrayLayer = 0;
-        view.subresourceRange.layerCount = 1;
-        VK_CHECK(vkCreateImageView(m_device, &view, nullptr, &texture.view));
+    Texture texture{};
+    if (!UploadTexture(device, image, texture))
+    {
+        m_failedMaterialTextureKeys.insert(key);
+        LogFormat("[MATBIND-DIAG] texture upload failed role=%s guid=%s path=%s",
+            role ? role : "texture",
+            guidText.c_str(),
+            path->generic_string().c_str());
+        return nullptr;
+    }
 
-        VkSamplerCreateInfo sampler{};
-        sampler.sType = VK_STRUCTURE_TYPE_SAMPLER_CREATE_INFO;
-        sampler.magFilter = VK_FILTER_LINEAR;
-        sampler.minFilter = VK_FILTER_LINEAR;
-        sampler.mipmapMode = VK_SAMPLER_MIPMAP_MODE_NEAREST;
-        sampler.addressModeU = VK_SAMPLER_ADDRESS_MODE_REPEAT;
-        sampler.addressModeV = VK_SAMPLER_ADDRESS_MODE_REPEAT;
-        sampler.addressModeW = VK_SAMPLER_ADDRESS_MODE_REPEAT;
-        sampler.minLod = 0.0f;
-        sampler.maxLod = 1.0f;
-        if (device.SupportsSamplerAnisotropy())
-        {
-            sampler.anisotropyEnable = VK_TRUE;
-            sampler.maxAnisotropy = device.GetMaxSamplerAnisotropy();
-        }
-        sampler.borderColor = VK_BORDER_COLOR_FLOAT_OPAQUE_BLACK;
-        VK_CHECK(vkCreateSampler(m_device, &sampler, nullptr, &texture.sampler));
-        return true;
+    auto [it, _] = m_materialTextureCache.emplace(key, std::move(texture));
+    LogFormat("[MATBIND-DIAG] texture loaded role=%s guid=%s view=0x%llx path=%s",
+        role ? role : "texture",
+        guidText.c_str(),
+        VkHandleValue(it->second.view),
+        path->generic_string().c_str());
+    return &it->second;
+}
+
+StaticMeshRenderer::MaterialTextureViews StaticMeshRenderer::ResolveMaterialTextureViews(VulkanDevice& device,
+    const Instance& instance,
+    std::uint32_t materialSlot)
+{
+    auto imageInfo = [](const Texture& texture) {
+        VkDescriptorImageInfo info{};
+        info.sampler = texture.sampler;
+        info.imageView = texture.view;
+        info.imageLayout = VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL;
+        return info;
     };
 
-    return uploadTexture(diffuse, m_texture) &&
-        uploadTexture(normal, m_normalTexture) &&
-        uploadTexture(orm, m_ormTexture);
+    MaterialTextureViews views{};
+    views.baseColor = imageInfo(m_texture);
+    views.normal = imageInfo(m_normalTexture);
+    views.orm = imageInfo(m_ormTexture);
+
+    if (materialSlot >= instance.materialSlots.size())
+        return views;
+
+    const std::string& slotGuid = instance.materialSlots[materialSlot];
+    const std::optional<Guid> materialGuid = Guid::fromString(slotGuid);
+    if (!materialGuid)
+        return views;
+
+    MaterialAsset* material = MaterialAssetManager::Instance().getOrLoad(*materialGuid);
+    if (!material)
+    {
+        views.resolvedMaterial = "pink_missing";
+        return views;
+    }
+
+    views.resolvedMaterial = material->name.empty()
+        ? material->path.filename().generic_string()
+        : material->name;
+    views.baseColorTextureGuid = material->baseColorTexture
+        ? material->baseColorTexture->toString()
+        : std::string("EMPTY");
+    views.alphaMode = MaterialAlphaModeName(material->alphaMode);
+    views.alphaCutoff = material->alphaCutoff;
+    views.fragmentShaderAlphaPath = AlphaFragmentPath(views.alphaMode);
+    views.unlit = material->shadingMode == MaterialAsset::ShadingMode::Unlit;
+
+    if (const Texture* texture =
+            EnsureMaterialTexture(device, material->baseColorTexture, VK_FORMAT_R8G8B8A8_SRGB, "baseColor"))
+        views.baseColor = imageInfo(*texture);
+    if (!views.unlit)
+    {
+        if (const Texture* texture =
+                EnsureMaterialTexture(device, material->normalTexture, VK_FORMAT_R8G8B8A8_UNORM, "normal"))
+            views.normal = imageInfo(*texture);
+        if (const Texture* texture =
+                EnsureMaterialTexture(device, material->metallicRoughnessTexture, VK_FORMAT_R8G8B8A8_UNORM, "metallicRoughness"))
+            views.orm = imageInfo(*texture);
+    }
+
+    return views;
+}
+
+void StaticMeshRenderer::UpdateMaterialTextureDescriptors(uint32_t frameIndex,
+    uint32_t uniformSlot,
+    const MaterialTextureViews& textures)
+{
+    if (frameIndex >= kFramesInFlight || uniformSlot >= kUniformSlots)
+        return;
+
+    VkDescriptorSet descriptorSet = m_descriptorSets[frameIndex][uniformSlot];
+    std::array<VkWriteDescriptorSet, 3> writes{};
+    writes[0].sType = VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET;
+    writes[0].dstSet = descriptorSet;
+    writes[0].dstBinding = 1;
+    writes[0].descriptorCount = 1;
+    writes[0].descriptorType = VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER;
+    writes[0].pImageInfo = &textures.baseColor;
+    writes[1].sType = VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET;
+    writes[1].dstSet = descriptorSet;
+    writes[1].dstBinding = 2;
+    writes[1].descriptorCount = 1;
+    writes[1].descriptorType = VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER;
+    writes[1].pImageInfo = &textures.normal;
+    writes[2].sType = VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET;
+    writes[2].dstSet = descriptorSet;
+    writes[2].dstBinding = 3;
+    writes[2].descriptorCount = 1;
+    writes[2].descriptorType = VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER;
+    writes[2].pImageInfo = &textures.orm;
+    vkUpdateDescriptorSets(m_device, static_cast<uint32_t>(writes.size()), writes.data(), 0, nullptr);
 }
 
 bool StaticMeshRenderer::CreateDescriptors()
@@ -2444,6 +3031,9 @@ bool StaticMeshRenderer::CreatePipeline(VulkanDevice& device)
 
     VkShaderModule vs = CreateShaderModule(m_device, *m_assets, "assets/shaders/static_mesh_vs.spv");
     VkShaderModule ps = CreateShaderModule(m_device, *m_assets, "assets/shaders/static_mesh_ps.spv");
+    VkShaderModule unlitPs = CreateShaderModule(m_device, *m_assets, "assets/shaders/static_mesh_unlit_ps.spv");
+    VkShaderModule outlineVs = CreateShaderModule(m_device, *m_assets, "assets/shaders/static_mesh_outline_vs.spv");
+    VkShaderModule outlinePs = CreateShaderModule(m_device, *m_assets, "assets/shaders/static_mesh_outline_ps.spv");
 
     VkPipelineShaderStageCreateInfo stages[2]{};
     stages[0].sType = VK_STRUCTURE_TYPE_PIPELINE_SHADER_STAGE_CREATE_INFO;
@@ -2542,30 +3132,52 @@ bool StaticMeshRenderer::CreatePipeline(VulkanDevice& device)
     pipeline.layout = m_pipelineLayout;
     pipeline.renderPass = m_mainRenderPass ? m_mainRenderPass : device.GetRenderPass();
     pipeline.subpass = 0;
-    VK_CHECK(vkCreateGraphicsPipelines(m_device, VK_NULL_HANDLE, 1, &pipeline, nullptr, &m_pipeline));
+    auto createPipelineVariant = [&](VkShaderModule fragmentShader, VkPipeline& target) {
+        stages[1].module = fragmentShader;
+        VK_CHECK(vkCreateGraphicsPipelines(m_device, VK_NULL_HANDLE, 1, &pipeline, nullptr, &target));
+    };
+    createPipelineVariant(ps, m_pipeline);
+    createPipelineVariant(ps, m_maskPipeline);
+    createPipelineVariant(unlitPs, m_unlitPipeline);
+    createPipelineVariant(unlitPs, m_unlitMaskPipeline);
 
+    stages[0].module = outlineVs;
+    stages[1].module = outlinePs;
+    raster.cullMode = VK_CULL_MODE_FRONT_BIT;
+    depth.depthWriteEnable = VK_FALSE;
+    depth.depthCompareOp = VK_COMPARE_OP_LESS_OR_EQUAL;
+    VK_CHECK(vkCreateGraphicsPipelines(m_device, VK_NULL_HANDLE, 1, &pipeline, nullptr, &m_outlinePipeline));
+
+    vkDestroyShaderModule(m_device, outlinePs, nullptr);
+    vkDestroyShaderModule(m_device, outlineVs, nullptr);
+    vkDestroyShaderModule(m_device, unlitPs, nullptr);
     vkDestroyShaderModule(m_device, ps, nullptr);
     vkDestroyShaderModule(m_device, vs, nullptr);
+    LogFormat("[MATERIAL] static mesh shading pipelines ready lit=0x%llx unlit=0x%llx",
+        VkHandleValue(m_pipeline),
+        VkHandleValue(m_unlitPipeline));
     return true;
 }
 
 void StaticMeshRenderer::RenderInWorld(VulkanDevice& device,
     double timeSeconds,
     const WorldCamera& camera,
-    const Instance& instance)
+    const Instance& instance,
+    VkExtent2D targetExtent)
 {
     std::vector<Instance> instances;
     instances.push_back(instance);
-    RenderBatchInWorld(device, timeSeconds, camera, instances);
+    RenderBatchInWorld(device, timeSeconds, camera, instances, targetExtent);
 }
 
 void StaticMeshRenderer::RenderBatchInWorld(VulkanDevice& device,
     double timeSeconds,
     const WorldCamera& camera,
-    const std::vector<Instance>& instances)
+    const std::vector<Instance>& instances,
+    VkExtent2D targetExtent)
 {
     LodConfig defaultLod{};
-    RenderLodBatchInWorld(device, timeSeconds, camera, instances, defaultLod, 0, 0);
+    RenderLodBatchInWorld(device, timeSeconds, camera, instances, defaultLod, 0, 0, targetExtent);
 }
 
 void StaticMeshRenderer::RenderLodBatchInWorld(VulkanDevice& device,
@@ -2574,7 +3186,8 @@ void StaticMeshRenderer::RenderLodBatchInWorld(VulkanDevice& device,
     const std::vector<Instance>& instances,
     const LodConfig& lodConfig,
     std::uint64_t configHash,
-    std::uint32_t lodLevel)
+    std::uint32_t lodLevel,
+    VkExtent2D targetExtent)
 {
     m_lastSubmittedDrawCalls = 0;
     m_lastSubmittedInstances = 0;
@@ -2584,9 +3197,11 @@ void StaticMeshRenderer::RenderLodBatchInWorld(VulkanDevice& device,
     m_lastOverrideActiveDraws = 0;
     m_lastInstanceBufferBytes = 0;
     m_lastInstanceBufferRebuilt = false;
-    if (!m_pipeline || m_indices.empty() || instances.empty() || !device.IsFrameActive())
+    if (!m_pipeline || !m_unlitPipeline || m_indices.empty() || instances.empty() || !device.IsFrameActive())
         return;
-    const VkExtent2D extent = device.GetSwapchainExtent();
+    const VkExtent2D extent = (targetExtent.width > 0 && targetExtent.height > 0)
+        ? targetExtent
+        : device.GetSwapchainExtent();
     if (extent.width == 0 || extent.height == 0)
         return;
 
@@ -2724,7 +3339,6 @@ void StaticMeshRenderer::RenderLodBatchInWorld(VulkanDevice& device,
     VkRect2D scissor{{0, 0}, extent};
     vkCmdSetViewport(cmd, 0, 1, &viewport);
     vkCmdSetScissor(cmd, 0, 1, &scissor);
-    vkCmdBindPipeline(cmd, VK_PIPELINE_BIND_POINT_GRAPHICS, m_pipeline);
     VkDeviceSize offset = 0;
     vkCmdBindVertexBuffers(cmd, 0, 1, &m_vertexBuffer.buffer, &offset);
     vkCmdBindIndexBuffer(cmd, lodSet ? lodSet->buffer.buffer : m_indexBuffer.buffer, 0, VK_INDEX_TYPE_UINT32);
@@ -2758,7 +3372,8 @@ void StaticMeshRenderer::RenderLodBatchInWorld(VulkanDevice& device,
                                  std::uint32_t entityId,
                                  const InstancedDrawCommand& draw,
                                  std::size_t instanceIndex,
-                                 uint32_t uniformSlot) {
+                                 uint32_t uniformSlot,
+                                 VkPipeline pipelineForDraw) {
         const std::size_t absoluteInstance = static_cast<std::size_t>(draw.firstInstance) + instanceIndex;
         const std::size_t instanceOffset = absoluteInstance * sizeof(StaticMeshInstanceBlock);
         LogFormat("%s entity=%u submesh=%u frame=%llu pipeline=0x%llx vbuf=0x%llx vbufOffset=0 vbufRange=%zu ibuf=0x%llx ibufOffset=0 indexCount=%u indexType=UINT32 ibuf_first=%u ibuf_vertexOffset=0 instbuf=0x%llx instbufOffset=%zu instCount=%u firstInstance=%u descSets=[set0=0x%llx] pushConst_bytes=<none> pushConst_size=0",
@@ -2766,7 +3381,7 @@ void StaticMeshRenderer::RenderLodBatchInWorld(VulkanDevice& device,
             entityId,
             draw.sourceSubmesh,
             static_cast<unsigned long long>(frameNumber),
-            VkHandleValue(m_pipeline),
+            VkHandleValue(pipelineForDraw),
             VkHandleValue(m_vertexBuffer.buffer),
             sizeof(Vertex) * m_vertices.size(),
             VkHandleValue(boundIndexBuffer),
@@ -2852,52 +3467,139 @@ void StaticMeshRenderer::RenderLodBatchInWorld(VulkanDevice& device,
             materialSlots[1],
             materialSlots[2]);
     }
-    for (const InstancedDrawCommand& draw : drawCommands)
+    m_lastMaterialBindings.clear();
+    m_lastMaterialBindings.reserve(drawCommands.size());
+    VkPipeline boundPipeline = VK_NULL_HANDLE;
+    auto drawPass = [&](bool maskPass) {
+        for (const InstancedDrawCommand& draw : drawCommands)
+        {
+            const MaterialTextureViews materialTextures =
+                ResolveMaterialTextureViews(device, instances.front(), draw.materialSlot);
+            const bool isMask = std::strcmp(materialTextures.fragmentShaderAlphaPath, "discard") == 0;
+            if (isMask != maskPass)
+                continue;
+
+            VkPipeline pipelineForDraw = materialTextures.unlit
+                ? (isMask ? m_unlitMaskPipeline : m_unlitPipeline)
+                : (isMask ? m_maskPipeline : m_pipeline);
+            if (std::strcmp(materialTextures.fragmentShaderAlphaPath, "blend-fallback-opaque") == 0)
+            {
+                static std::unordered_set<std::string> loggedBlendFallbacks;
+                const std::string key = m_modelPath + ":" + std::to_string(draw.materialSlot);
+                if (loggedBlendFallbacks.insert(key).second)
+                    LogFormat("[MATERIAL] BLEND mode not yet supported, falling back to OPAQUE material=%s slot=%u",
+                        materialTextures.resolvedMaterial.c_str(),
+                        draw.materialSlot);
+                pipelineForDraw = materialTextures.unlit ? m_unlitPipeline : m_pipeline;
+            }
+
+            if (boundPipeline != pipelineForDraw)
+            {
+                vkCmdBindPipeline(cmd, VK_PIPELINE_BIND_POINT_GRAPHICS, pipelineForDraw);
+                boundPipeline = pipelineForDraw;
+            }
+
+            const uint32_t uniformSlot = std::min(m_worldUniformCursor++, kUniformSlots - 1);
+            UpdateWorldUniform(frameIndex, uniformSlot, camera, instances.front(), timeSeconds, draw.materialSlot);
+            UpdateMaterialTextureDescriptors(frameIndex, uniformSlot, materialTextures);
+            VkDescriptorSet descriptorSet = m_descriptorSets[frameIndex][uniformSlot];
+            LastMaterialBinding binding{};
+            binding.sourceSubmesh = draw.sourceSubmesh;
+            binding.materialSlot = draw.materialSlot;
+            binding.descriptorSet = descriptorSet;
+            binding.baseColorView = materialTextures.baseColor.imageView;
+            binding.normalView = materialTextures.normal.imageView;
+            binding.ormView = materialTextures.orm.imageView;
+            binding.resolvedMaterial = materialTextures.resolvedMaterial;
+            binding.baseColorTextureGuid = materialTextures.baseColorTextureGuid;
+            binding.alphaMode = materialTextures.alphaMode;
+            binding.alphaCutoff = materialTextures.alphaCutoff;
+            binding.fragmentShaderAlphaPath = materialTextures.fragmentShaderAlphaPath;
+            binding.unlit = materialTextures.unlit;
+            binding.pipeline = pipelineForDraw;
+            binding.boundBeforeDraw = true;
+            m_lastMaterialBindings.push_back(std::move(binding));
+            ++m_lastMaterialUniformUpdates;
+            vkCmdBindDescriptorSets(cmd, VK_PIPELINE_BIND_POINT_GRAPHICS, m_pipelineLayout,
+                0, 1, &descriptorSet, 0, nullptr);
+            if (configHash != 0 && diagnosticInstanceIndex)
+            {
+                const std::size_t absoluteInstance = static_cast<std::size_t>(draw.firstInstance) + *diagnosticInstanceIndex;
+                if (absoluteInstance < instanceBlocks.size())
+                {
+                    if (!loggedMaterialE3)
+                    {
+                        logMaterialDiag("[LOD-MAT-E3]",
+                            instances[*diagnosticInstanceIndex],
+                            instanceBlocks[absoluteInstance],
+                            draw.materialSlot,
+                            absoluteInstance,
+                            true);
+                        loggedMaterialE3 = true;
+                    }
+                    logDrawDiag("[LOD-DRAW-E3]", diagnosticEntityId, draw, *diagnosticInstanceIndex, uniformSlot, pipelineForDraw);
+                }
+            }
+            if (refInstanceIndex)
+            {
+                const std::size_t absoluteInstance = static_cast<std::size_t>(draw.firstInstance) + *refInstanceIndex;
+                if (absoluteInstance < instanceBlocks.size())
+                {
+                    if (!loggedMaterialRef)
+                    {
+                        logMaterialDiag("[LOD-MAT-REF]",
+                            instances[*refInstanceIndex],
+                            instanceBlocks[absoluteInstance],
+                            draw.materialSlot,
+                            absoluteInstance,
+                            false);
+                        loggedMaterialRef = true;
+                    }
+                    logDrawDiag("[LOD-DRAW-REF]", instances[*refInstanceIndex].entityId, draw, *refInstanceIndex, uniformSlot, pipelineForDraw);
+                }
+            }
+            vkCmdDrawIndexed(cmd, draw.indexCount, draw.instanceCount, draw.firstIndex, 0, draw.firstInstance);
+            ++m_lastSubmittedDrawCalls;
+            m_lastSubmittedIndexCount += draw.indexCount;
+        }
+    };
+    drawPass(false);
+    drawPass(true);
+    if (m_outlinePipeline)
     {
-        const uint32_t uniformSlot = std::min(m_worldUniformCursor++, kUniformSlots - 1);
-        UpdateWorldUniform(frameIndex, uniformSlot, camera, instances.front(), timeSeconds, 0u);
-        ++m_lastMaterialUniformUpdates;
-        vkCmdBindDescriptorSets(cmd, VK_PIPELINE_BIND_POINT_GRAPHICS, m_pipelineLayout,
-            0, 1, &m_descriptorSets[frameIndex][uniformSlot], 0, nullptr);
-        if (configHash != 0 && diagnosticInstanceIndex)
+        std::vector<std::uint32_t> outlinedInstances;
+        outlinedInstances.reserve(instances.size());
+        for (std::uint32_t i = 0; i < instances.size(); ++i)
         {
-            const std::size_t absoluteInstance = static_cast<std::size_t>(draw.firstInstance) + *diagnosticInstanceIndex;
-            if (absoluteInstance < instanceBlocks.size())
+            if (instances[i].selectedForOutline)
+                outlinedInstances.push_back(i);
+        }
+        if (!outlinedInstances.empty())
+        {
+            vkCmdBindPipeline(cmd, VK_PIPELINE_BIND_POINT_GRAPHICS, m_outlinePipeline);
+            const MaterialTextureViews materialTextures = ResolveMaterialTextureViews(device, instances.front(), 0);
+            const uint32_t uniformSlot = std::min(m_worldUniformCursor++, kUniformSlots - 1);
+            UpdateWorldUniform(frameIndex, uniformSlot, camera, instances.front(), timeSeconds, 0);
+            UpdateMaterialTextureDescriptors(frameIndex, uniformSlot, materialTextures);
+            VkDescriptorSet descriptorSet = m_descriptorSets[frameIndex][uniformSlot];
+            vkCmdBindDescriptorSets(cmd, VK_PIPELINE_BIND_POINT_GRAPHICS, m_pipelineLayout,
+                0, 1, &descriptorSet, 0, nullptr);
+
+            for (const InstancedDrawCommand& draw : drawCommands)
             {
-                if (!loggedMaterialE3)
+                for (std::uint32_t instanceIndex : outlinedInstances)
                 {
-                    logMaterialDiag("[LOD-MAT-E3]",
-                        instances[*diagnosticInstanceIndex],
-                        instanceBlocks[absoluteInstance],
-                        draw.materialSlot,
-                        absoluteInstance,
-                        true);
-                    loggedMaterialE3 = true;
+                    if (instanceIndex >= draw.instanceCount)
+                        continue;
+                    vkCmdDrawIndexed(cmd,
+                        draw.indexCount,
+                        1,
+                        draw.firstIndex,
+                        0,
+                        draw.firstInstance + instanceIndex);
                 }
-                logDrawDiag("[LOD-DRAW-E3]", diagnosticEntityId, draw, *diagnosticInstanceIndex, uniformSlot);
             }
         }
-        if (refInstanceIndex)
-        {
-            const std::size_t absoluteInstance = static_cast<std::size_t>(draw.firstInstance) + *refInstanceIndex;
-            if (absoluteInstance < instanceBlocks.size())
-            {
-                if (!loggedMaterialRef)
-                {
-                    logMaterialDiag("[LOD-MAT-REF]",
-                        instances[*refInstanceIndex],
-                        instanceBlocks[absoluteInstance],
-                        draw.materialSlot,
-                        absoluteInstance,
-                        false);
-                    loggedMaterialRef = true;
-                }
-                logDrawDiag("[LOD-DRAW-REF]", instances[*refInstanceIndex].entityId, draw, *refInstanceIndex, uniformSlot);
-            }
-        }
-        vkCmdDrawIndexed(cmd, draw.indexCount, draw.instanceCount, draw.firstIndex, 0, draw.firstInstance);
-        ++m_lastSubmittedDrawCalls;
-        m_lastSubmittedIndexCount += draw.indexCount;
     }
     m_lastSubmittedInstances = static_cast<std::uint32_t>(instances.size());
 }
@@ -2907,6 +3609,18 @@ void StaticMeshRenderer::DestroyPipeline()
     if (m_pipeline)
         vkDestroyPipeline(m_device, m_pipeline, nullptr);
     m_pipeline = VK_NULL_HANDLE;
+    if (m_maskPipeline)
+        vkDestroyPipeline(m_device, m_maskPipeline, nullptr);
+    m_maskPipeline = VK_NULL_HANDLE;
+    if (m_unlitPipeline)
+        vkDestroyPipeline(m_device, m_unlitPipeline, nullptr);
+    m_unlitPipeline = VK_NULL_HANDLE;
+    if (m_unlitMaskPipeline)
+        vkDestroyPipeline(m_device, m_unlitMaskPipeline, nullptr);
+    m_unlitMaskPipeline = VK_NULL_HANDLE;
+    if (m_outlinePipeline)
+        vkDestroyPipeline(m_device, m_outlinePipeline, nullptr);
+    m_outlinePipeline = VK_NULL_HANDLE;
     if (m_pipelineLayout)
         vkDestroyPipelineLayout(m_device, m_pipelineLayout, nullptr);
     m_pipelineLayout = VK_NULL_HANDLE;
@@ -2978,6 +3692,10 @@ void StaticMeshRenderer::Destroy()
     DestroyTexture(m_texture);
     DestroyTexture(m_normalTexture);
     DestroyTexture(m_ormTexture);
+    for (auto& [_, texture] : m_materialTextureCache)
+        DestroyTexture(texture);
+    m_materialTextureCache.clear();
+    m_failedMaterialTextureKeys.clear();
     m_vertices.clear();
     m_indices.clear();
     m_draws.clear();
@@ -3027,6 +3745,10 @@ void StaticMeshRenderer::UpdateWorldUniform(uint32_t frameIndex,
     uniform.materialEmissive[1] = defaults.emissive[1];
     uniform.materialEmissive[2] = defaults.emissive[2];
     uniform.materialEmissive[3] = 1.0f;
+    uniform.materialAlpha[0] = AlphaModeCode(defaults.alphaMode);
+    uniform.materialAlpha[1] = std::clamp(defaults.alphaCutoff, 0.0f, 1.0f);
+    uniform.materialAlpha[2] = defaults.unlit ? 1.0f : 0.0f;
+    uniform.materialAlpha[3] = 0.0f;
     for (const MeshSceneEntity::MaterialOverride& overrideSlot : instance.materialOverrides)
     {
         if (overrideSlot.slot != materialSlot || !overrideSlot.enabled)

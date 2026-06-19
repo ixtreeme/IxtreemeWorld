@@ -3,6 +3,7 @@
 #include "AssetLibrary.h"
 #include "InputEvent.h"
 #include "MapEditorTypes.h"
+#include "WorldCamera.h"
 #include "tools/tree/TreeGeneratorPanel.h"
 
 #if defined(_WIN32) && !defined(VK_USE_PLATFORM_WIN32_KHR)
@@ -27,6 +28,7 @@
 #endif
 
 class VulkanDevice;
+struct ImVec2;
 
 class EditorImGui
 {
@@ -63,6 +65,18 @@ public:
     void Render(VulkanDevice& device);
     void OnRenderPassChanged(VulkanDevice& device);
     void SetSceneViewTexture(VkSampler sampler, VkImageView imageView, VkImageLayout layout, VkExtent2D extent);
+    void SetSceneViewSelectionOutline(std::vector<std::array<float, 4>> segments);
+    void SetSceneViewGizmo(HierarchyEntityType type,
+                           std::uint32_t id,
+                           const WorldCamera& camera,
+                           const float* position,
+                           const float* rotation,
+                           const float* scale,
+                           MapEditorGizmoOperation operation,
+                           bool snapEnabled,
+                           float snapValue);
+    void ClearSceneViewGizmo();
+    bool IsSceneGizmoInputActive() const { return m_sceneGizmoInputActive; }
     bool WantsInputCapture(const InputEvent& event) const;
     bool IsTextInputActive() const;
     bool IsSceneViewInputTarget(const InputEvent& event) const;
@@ -90,6 +104,7 @@ public:
     void InitializeAssetLibrary(const std::filesystem::path& clientRoot);
     void InitializeProjectAssetLibrary(const std::filesystem::path& projectRoot, const std::filesystem::path& assetRoot);
     void RefreshAssetLibrary();
+    void ImportExternalFiles(const std::vector<std::string>& paths, const char* trigger = "dragdrop");
     std::optional<LodConfig> FindModelLodDefault(const std::string& assetId) const;
     bool SaveModelLodDefault(const std::string& assetId, const LodConfig& config);
     bool OpenWaterMaterialEditor(const std::string& materialId);
@@ -136,8 +151,12 @@ private:
     void RenderDemoPanels();
     void RenderDockSpace();
     void RenderSceneViewDropTarget();
+    void RenderSceneViewGizmo(const ImVec2& imageMin, const ImVec2& imageSize);
     void ReleaseSceneViewTextureDescriptor();
     void RenderMenuBar();
+    bool SaveProjectAndCurrentScene(bool automatic = false);
+    void RunProjectAutoSave();
+    void UpdateAutoSaveWindowTitle(double now);
     void RenderProjectModal();
     void RenderProjectBrowser(bool pickProjectFile);
     void OpenProjectDialog(ProjectDialogMode mode);
@@ -229,7 +248,10 @@ private:
     void CreateAssetFolder();
     void DeleteAssetFolder();
     void DeleteAsset(const AssetLibrary::Entry& entry);
-    void ImportAssetWithDialog(AssetLibrary::Category category);
+    void OpenImportAssetDialog(const std::string& targetSubpath);
+    void ImportAssetFromPath(const std::filesystem::path& sourcePath,
+                             const std::string& targetSubpath,
+                             const char* trigger);
     void CreatePbrMaterialAsset();
     void CreateWaterMaterialAsset();
     bool CreateWaterMaterialAsset(const std::string& displayName, AssetLibrary::Entry& outEntry);
@@ -253,6 +275,11 @@ private:
     void BeginAssetRename(const AssetLibrary::Entry& entry);
     void BeginFolderRename(const std::string& subpath);
     void RenderAssetBrowserOperationPopups();
+    void RenderCreatePbrMaterialPopup();
+    void OpenFbxExportDialogForAsset(const AssetLibrary::Entry& entry);
+    void OpenFbxExportDialogForMeshEntity(const HierarchySceneEntity& entity);
+    void RenderFbxExportPopup();
+    void ExecuteFbxAssetExport();
     void CreateFilesystemFolder(const std::string& parentSubpath, const std::string& requestedName);
     void RenameFilesystemSelection();
     void DeleteFilesystemSelection();
@@ -305,6 +332,14 @@ private:
     bool m_defaultDockLayoutBuilt = false;
     bool m_logToolsRendered = false;
     bool m_logInspectorRendered = false;
+    bool m_debugDisableShadowPass = false;
+    bool m_debugDisableWaterReflectionPass = false;
+    bool m_debugDisableAssetLibraryDiscovery = false;
+    bool m_debugDisableAssetWatcherPoll = false;
+    bool m_debugDisableHierarchyIteration = false;
+    int m_renderResolutionMode = 0;
+    int m_customRenderResolutionWidth = 1920;
+    int m_customRenderResolutionHeight = 1080;
     MapEditorGizmoOperation m_gizmoOperation = MapEditorGizmoOperation::Translate;
     bool m_gizmoSnapEnabled = false;
     int m_gizmoSnapIndex = 2;
@@ -331,6 +366,8 @@ private:
     bool m_projectCreateBrowserVisible = false;
     std::filesystem::path m_projectBrowserPath;
     std::string m_projectStatus;
+    double m_lastAutoSaveSeconds = 0.0;
+    int m_lastAutoSaveTitleRemainingSeconds = -1;
     char m_projectParentBuffer[512]{};
     char m_projectNameBuffer[128] = "NewProject";
     char m_projectOpenPathBuffer[512]{};
@@ -361,6 +398,29 @@ private:
     bool m_assetOpenNewFolderPopup = false;
     bool m_assetOpenRenamePopup = false;
     bool m_assetOpenDeletePopup = false;
+    bool m_assetOpenImportPopup = false;
+    bool m_assetOpenCreateMaterialPopup = false;
+    char m_createMaterialName[96] = "material";
+    int m_createMaterialShadingMode = -1;
+    enum class FbxExportSource
+    {
+        None,
+        Asset,
+        MeshEntity
+    };
+    bool m_fbxExportPopupOpen = false;
+    FbxExportSource m_fbxExportSource = FbxExportSource::None;
+    std::string m_fbxExportAssetId;
+    std::uint32_t m_fbxExportMeshEntityId = 0;
+    char m_fbxExportPathBuffer[512]{};
+    bool m_fbxExportEmbedTextures = true;
+    bool m_fbxExportMaterials = true;
+    bool m_fbxExportAnimations = true;
+    std::string m_assetImportTargetSubpath;
+    std::filesystem::path m_assetImportBrowserPath;
+    char m_assetImportPathBuffer[512]{};
+    char m_assetImportBrowserPathBuffer[512]{};
+    char m_assetImportFilterBuffer[128]{};
     char m_hierarchySearchBuffer[128]{};
     std::uint64_t m_sceneRootEntity = 0;
     std::string m_sceneRootName = "Untitled";
@@ -384,8 +444,20 @@ private:
     VkImageView m_sceneViewDescriptorImageView = VK_NULL_HANDLE;
     VkImageLayout m_sceneViewDescriptorImageLayout = VK_IMAGE_LAYOUT_UNDEFINED;
     bool m_sceneViewKeyboardFocus = false;
+    std::vector<std::array<float, 4>> m_sceneViewSelectionOutline;
     bool m_viewportDropTargetLogged = false;
     ViewportInputDiagnostics m_viewportInputDiagnostics;
+    bool m_sceneGizmoVisible = false;
+    bool m_sceneGizmoInputActive = false;
+    HierarchyEntityType m_sceneGizmoEntityType = HierarchyEntityType::None;
+    std::uint32_t m_sceneGizmoEntityId = 0;
+    WorldCamera m_sceneGizmoCamera{};
+    float m_sceneGizmoPosition[3] = {0.0f, 0.0f, 0.0f};
+    float m_sceneGizmoRotation[3] = {0.0f, 0.0f, 0.0f};
+    float m_sceneGizmoScale[3] = {1.0f, 1.0f, 1.0f};
+    MapEditorGizmoOperation m_sceneGizmoOperation = MapEditorGizmoOperation::Translate;
+    bool m_sceneGizmoSnapEnabled = false;
+    float m_sceneGizmoSnapValue = 1.0f;
     float m_timeOfDayHours = 12.0f;
     uint64_t m_lastLoggedFrame = UINT64_MAX;
 };

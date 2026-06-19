@@ -1,5 +1,6 @@
 #pragma once
 
+#include "AssetDatabase.h"
 #include "MapEditorTypes.h"
 #include "VulkanDevice.h"
 #include "WorldCamera.h"
@@ -12,9 +13,11 @@
 #include <filesystem>
 #include <limits>
 #include <mutex>
+#include <optional>
 #include <string>
 #include <thread>
 #include <unordered_map>
+#include <unordered_set>
 #include <vector>
 
 namespace client::asset {
@@ -38,6 +41,15 @@ public:
         VkDeviceMemory memory = VK_NULL_HANDLE;
     };
 
+    struct RgbaImage
+    {
+        std::string name;
+        uint32_t width = 0;
+        uint32_t height = 0;
+        VkFormat format = VK_FORMAT_R8G8B8A8_UNORM;
+        std::vector<uint8_t> pixels;
+    };
+
     struct MaterialDefaults
     {
         float baseColor[4] = {1.0f, 1.0f, 1.0f, 1.0f};
@@ -48,6 +60,7 @@ public:
         float emissive[3] = {0.0f, 0.0f, 0.0f};
         std::string alphaMode = "opaque";
         float alphaCutoff = 0.5f;
+        bool unlit = false;
     };
 
     struct Instance
@@ -57,6 +70,7 @@ public:
         float rotation[3] = {0.0f, 0.0f, 0.0f};
         float scale[3] = {1.0f, 1.0f, 1.0f};
         std::array<float, 4> tint = {1.0f, 1.0f, 1.0f, 1.0f};
+        bool selectedForOutline = false;
         std::vector<std::string> materialSlots;
         std::vector<MeshSceneEntity::MaterialOverride> materialOverrides;
     };
@@ -87,18 +101,24 @@ public:
     bool RecreatePipeline(VulkanDevice& device);
     void SetMainRenderPass(VkRenderPass renderPass);
     void SetLightingState(const LightingState& lighting) { m_lightingState = lighting; }
-    void RenderInWorld(VulkanDevice& device, double timeSeconds, const WorldCamera& camera, const Instance& instance);
+    void RenderInWorld(VulkanDevice& device,
+        double timeSeconds,
+        const WorldCamera& camera,
+        const Instance& instance,
+        VkExtent2D targetExtent = {});
     void RenderBatchInWorld(VulkanDevice& device,
         double timeSeconds,
         const WorldCamera& camera,
-        const std::vector<Instance>& instances);
+        const std::vector<Instance>& instances,
+        VkExtent2D targetExtent = {});
     void RenderLodBatchInWorld(VulkanDevice& device,
         double timeSeconds,
         const WorldCamera& camera,
         const std::vector<Instance>& instances,
         const LodConfig& lodConfig,
         std::uint64_t configHash,
-        std::uint32_t lodLevel);
+        std::uint32_t lodLevel,
+        VkExtent2D targetExtent = {});
     void RequestLodQualityBuild(const LodConfig& lodConfig, std::uint64_t configHash, std::uint32_t entityId);
     void Destroy();
 
@@ -224,7 +244,41 @@ private:
         std::string name;
     };
 
+    struct MaterialTextureViews
+    {
+        VkDescriptorImageInfo baseColor{};
+        VkDescriptorImageInfo normal{};
+        VkDescriptorImageInfo orm{};
+        std::string resolvedMaterial = "gltf_baked";
+        std::string baseColorTextureGuid = "EMPTY";
+        std::string alphaMode = "OPAQUE";
+        float alphaCutoff = 0.5f;
+        const char* fragmentShaderAlphaPath = "none";
+        bool unlit = false;
+        VkPipeline pipeline = VK_NULL_HANDLE;
+    };
+
+    struct LastMaterialBinding
+    {
+        std::uint32_t sourceSubmesh = 0;
+        std::uint32_t materialSlot = 0;
+        VkDescriptorSet descriptorSet = VK_NULL_HANDLE;
+        VkImageView baseColorView = VK_NULL_HANDLE;
+        VkImageView normalView = VK_NULL_HANDLE;
+        VkImageView ormView = VK_NULL_HANDLE;
+        std::string resolvedMaterial = "gltf_baked";
+        std::string baseColorTextureGuid = "EMPTY";
+        std::string alphaMode = "OPAQUE";
+        float alphaCutoff = 0.5f;
+        const char* fragmentShaderAlphaPath = "none";
+        bool unlit = false;
+        VkPipeline pipeline = VK_NULL_HANDLE;
+        bool boundBeforeDraw = false;
+    };
+
     bool LoadStaticGltfMesh(const std::string& modelPath);
+    bool LoadStaticFbxMesh(const std::string& modelPath);
+    bool LoadBuiltinPrimitiveMesh(const std::string& modelPath);
     bool CreateBuffers(VulkanDevice& device);
     bool EnsureLodBuffers(VulkanDevice& device, const LodConfig& config, std::uint64_t configHash, std::uint32_t entityId);
     bool ApplyPendingLodResult(VulkanDevice& device, std::uint64_t configHash);
@@ -241,6 +295,17 @@ private:
     void WriteLodCpuCache(const LodCpuSet& set) const;
     std::filesystem::path LodCachePath(const std::string& modelPath, std::uint64_t configHash) const;
     bool CreateTextures(VulkanDevice& device, const std::string& modelPath);
+    bool UploadTexture(VulkanDevice& device, const RgbaImage& source, Texture& texture);
+    const Texture* EnsureMaterialTexture(VulkanDevice& device,
+        const std::optional<Guid>& guid,
+        VkFormat format,
+        const char* role);
+    MaterialTextureViews ResolveMaterialTextureViews(VulkanDevice& device,
+        const Instance& instance,
+        std::uint32_t materialSlot);
+    void UpdateMaterialTextureDescriptors(uint32_t frameIndex,
+        uint32_t uniformSlot,
+        const MaterialTextureViews& textures);
     bool CreateDescriptors();
     bool CreatePipeline(VulkanDevice& device);
     bool EnsureInstanceCapacity(VulkanDevice& device, uint32_t frameIndex, std::uint32_t requiredRecords);
@@ -266,11 +331,18 @@ private:
     Texture m_texture;
     Texture m_normalTexture;
     Texture m_ormTexture;
+    std::unordered_map<std::string, Texture> m_materialTextureCache;
+    std::unordered_set<std::string> m_failedMaterialTextureKeys;
+    std::vector<LastMaterialBinding> m_lastMaterialBindings;
     VkDescriptorSetLayout m_descriptorSetLayout = VK_NULL_HANDLE;
     VkDescriptorPool m_descriptorPool = VK_NULL_HANDLE;
     std::array<std::array<VkDescriptorSet, kUniformSlots>, kFramesInFlight> m_descriptorSets{};
     VkPipelineLayout m_pipelineLayout = VK_NULL_HANDLE;
     VkPipeline m_pipeline = VK_NULL_HANDLE;
+    VkPipeline m_maskPipeline = VK_NULL_HANDLE;
+    VkPipeline m_unlitPipeline = VK_NULL_HANDLE;
+    VkPipeline m_unlitMaskPipeline = VK_NULL_HANDLE;
+    VkPipeline m_outlinePipeline = VK_NULL_HANDLE;
     std::vector<Vertex> m_vertices;
     std::vector<uint32_t> m_indices;
     std::vector<MeshDraw> m_draws;

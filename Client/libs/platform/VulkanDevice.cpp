@@ -101,6 +101,33 @@ const char* SurfaceTransformName(VkSurfaceTransformFlagBitsKHR transform)
     }
 }
 
+const char* PresentModeName(VkPresentModeKHR mode)
+{
+    switch (mode)
+    {
+    case VK_PRESENT_MODE_IMMEDIATE_KHR: return "IMMEDIATE";
+    case VK_PRESENT_MODE_MAILBOX_KHR: return "MAILBOX";
+    case VK_PRESENT_MODE_FIFO_KHR: return "FIFO";
+    case VK_PRESENT_MODE_FIFO_RELAXED_KHR: return "FIFO_RELAXED";
+    default: return "UNKNOWN_PRESENT_MODE";
+    }
+}
+
+VkPresentModeKHR ChooseUncappedPresentMode(const std::vector<VkPresentModeKHR>& presentModes)
+{
+    const auto supports = [&](VkPresentModeKHR mode) {
+        return std::find(presentModes.begin(), presentModes.end(), mode) != presentModes.end();
+    };
+
+    if (supports(VK_PRESENT_MODE_IMMEDIATE_KHR))
+        return VK_PRESENT_MODE_IMMEDIATE_KHR;
+    if (supports(VK_PRESENT_MODE_MAILBOX_KHR))
+        return VK_PRESENT_MODE_MAILBOX_KHR;
+    if (supports(VK_PRESENT_MODE_FIFO_RELAXED_KHR))
+        return VK_PRESENT_MODE_FIFO_RELAXED_KHR;
+    return VK_PRESENT_MODE_FIFO_KHR;
+}
+
 const char* VkImageLayoutName(VkImageLayout layout)
 {
     switch (layout)
@@ -189,17 +216,30 @@ bool VulkanDevice::Create(NativeWindow& window, uint32_t width, uint32_t height)
     if (!CreateInstance(window) || !CreateDebugMessenger() || !CreateSurface(window) ||
         !PickPhysicalDevice() || !CreateLogicalDevice() ||
         !CreateSwapchainObjects(width, height) || !CreateCommandPool() ||
-        !CreateCommandBuffers() || !CreateSyncObjects())
+        !CreateCommandBuffers() || !CreateSyncObjects() || !CreateTimestampQueryPool())
     {
         Destroy();
         return false;
     }
 
+    LogFormat("[FRAMES-IN-FLIGHT] max_frames_in_flight = %u", MAX_FRAMES_IN_FLIGHT);
+    LogFormat("[FRAMES-IN-FLIGHT] command_buffer_count = %zu", m_commandBuffers.size());
+    Log("[FRAMES-IN-FLIGHT] descriptor_pool_size = renderer-local");
     return true;
 }
 
 void VulkanDevice::BeginFrame()
 {
+    const bool captureThisFrame = m_gpuCaptureRequested;
+    m_gpuCaptureRequested = false;
+    m_gpuCaptureActive = false;
+    m_gpuCaptureResultsReady = false;
+    m_gpuCapturePointWritten.fill(false);
+    m_activeCpuFrameTiming = {};
+    m_activeCpuFrameTiming.valid = captureThisFrame;
+    m_activeCpuFrameTiming.frameNumber = m_frameNumber;
+    m_cpuFrameStartTime = std::chrono::steady_clock::now();
+
     m_skipFrame = true;
     m_frameStarted = false;
     m_renderPassStarted = false;
@@ -213,9 +253,14 @@ void VulkanDevice::BeginFrame()
     if (m_swapchainDirty && !RecreateSwapchain(m_width, m_height))
         return;
 
+    auto waitStart = std::chrono::steady_clock::now();
     VK_CHECK(vkWaitForFences(m_device, 1, &m_inFlightFences[m_currentFrame], VK_TRUE, UINT64_MAX));
+    auto waitEnd = std::chrono::steady_clock::now();
+    if (m_activeCpuFrameTiming.valid)
+        m_activeCpuFrameTiming.waitForFencesMs += std::chrono::duration<double, std::milli>(waitEnd - waitStart).count();
     m_safeFrameNumber = m_frameNumber;
 
+    auto acquireStart = std::chrono::steady_clock::now();
     const VkResult acquire = vkAcquireNextImageKHR(
         m_device,
         m_swapchain,
@@ -223,6 +268,9 @@ void VulkanDevice::BeginFrame()
         m_imageAvailable[m_currentFrame],
         VK_NULL_HANDLE,
         &m_imageIndex);
+    auto acquireEnd = std::chrono::steady_clock::now();
+    if (m_activeCpuFrameTiming.valid)
+        m_activeCpuFrameTiming.acquireImageMs = std::chrono::duration<double, std::milli>(acquireEnd - acquireStart).count();
 
     if (acquire == VK_ERROR_OUT_OF_DATE_KHR)
     {
@@ -249,7 +297,13 @@ void VulkanDevice::BeginFrame()
     m_acquiredThisFrame = true;
 
     if (m_imagesInFlight[m_imageIndex] != VK_NULL_HANDLE)
+    {
+        waitStart = std::chrono::steady_clock::now();
         VK_CHECK(vkWaitForFences(m_device, 1, &m_imagesInFlight[m_imageIndex], VK_TRUE, UINT64_MAX));
+        waitEnd = std::chrono::steady_clock::now();
+        if (m_activeCpuFrameTiming.valid)
+            m_activeCpuFrameTiming.waitForFencesMs += std::chrono::duration<double, std::milli>(waitEnd - waitStart).count();
+    }
     m_imagesInFlight[m_imageIndex] = m_inFlightFences[m_currentFrame];
 
     VK_CHECK(vkResetFences(m_device, 1, &m_inFlightFences[m_currentFrame]));
@@ -261,6 +315,9 @@ void VulkanDevice::BeginFrame()
 
     m_skipFrame = false;
     m_frameStarted = true;
+    m_cpuRenderWorkStartTime = std::chrono::steady_clock::now();
+    if (captureThisFrame)
+        BeginGpuFrameCaptureCommands();
 }
 
 void VulkanDevice::BeginSwapchainRenderPass(const char* passName)
@@ -319,6 +376,11 @@ void VulkanDevice::EndFrame()
     if (m_skipFrame || !m_frameStarted)
         return;
 
+    const auto endFrameStart = std::chrono::steady_clock::now();
+    if (m_activeCpuFrameTiming.valid)
+        m_activeCpuFrameTiming.renderLoopCpuWorkMs =
+            std::chrono::duration<double, std::milli>(endFrameStart - m_cpuRenderWorkStartTime).count();
+
     if (!m_renderPassStarted)
         BeginSwapchainRenderPass("auto-empty");
 
@@ -335,6 +397,9 @@ void VulkanDevice::EndFrame()
         m_renderPassStarted = false;
     }
 
+    if (m_gpuCaptureActive)
+        WriteGpuTimestamp(GpuTimestampPoint::FrameEnd);
+
     VK_CHECK(vkEndCommandBuffer(m_commandBuffers[m_currentFrame]));
 
     VkPipelineStageFlags waitStage = VK_PIPELINE_STAGE_COLOR_ATTACHMENT_OUTPUT_BIT;
@@ -349,7 +414,11 @@ void VulkanDevice::EndFrame()
     submit.pSignalSemaphores = &m_renderFinished[m_imageIndex];
 
     // The fence protects CPU reuse of this frame's command buffer and sync objects.
+    auto submitStart = std::chrono::steady_clock::now();
     VK_CHECK(vkQueueSubmit(m_graphicsQueue, 1, &submit, m_inFlightFences[m_currentFrame]));
+    auto submitEnd = std::chrono::steady_clock::now();
+    if (m_activeCpuFrameTiming.valid)
+        m_activeCpuFrameTiming.submitMs = std::chrono::duration<double, std::milli>(submitEnd - submitStart).count();
 
     VkPresentInfoKHR present{};
     present.sType = VK_STRUCTURE_TYPE_PRESENT_INFO_KHR;
@@ -359,7 +428,11 @@ void VulkanDevice::EndFrame()
     present.pSwapchains = &m_swapchain;
     present.pImageIndices = &m_imageIndex;
 
+    auto presentStart = std::chrono::steady_clock::now();
     const VkResult result = vkQueuePresentKHR(m_presentQueue, &present);
+    auto presentEnd = std::chrono::steady_clock::now();
+    if (m_activeCpuFrameTiming.valid)
+        m_activeCpuFrameTiming.presentMs = std::chrono::duration<double, std::milli>(presentEnd - presentStart).count();
     if (result == VK_ERROR_OUT_OF_DATE_KHR)
     {
         Log("[VULKAN] present: VK_ERROR_OUT_OF_DATE_KHR - rebuilding swap-chain");
@@ -383,6 +456,14 @@ void VulkanDevice::EndFrame()
     {
         CheckVk(result, "vkQueuePresentKHR", __FILE__, __LINE__);
     }
+
+    if (m_activeCpuFrameTiming.valid)
+    {
+        m_activeCpuFrameTiming.totalCpuFrameMs =
+            std::chrono::duration<double, std::milli>(presentEnd - m_cpuFrameStartTime).count();
+        m_lastCpuFrameTimingResults = m_activeCpuFrameTiming;
+    }
+    FinishGpuFrameCaptureAfterSubmit();
 
     m_currentFrame = (m_currentFrame + 1) % MAX_FRAMES_IN_FLIGHT;
     ++m_frameNumber;
@@ -438,6 +519,10 @@ void VulkanDevice::WaitIdle()
 void VulkanDevice::Destroy()
 {
     WaitIdle();
+
+    if (m_timestampQueryPool)
+        vkDestroyQueryPool(m_device, m_timestampQueryPool, nullptr);
+    m_timestampQueryPool = VK_NULL_HANDLE;
 
     for (uint32_t i = 0; i < MAX_FRAMES_IN_FLIGHT; ++i)
     {
@@ -758,11 +843,13 @@ bool VulkanDevice::CreateSwapchain(uint32_t width, uint32_t height)
 
     create.preTransform = preTransform;
     create.compositeAlpha = VK_COMPOSITE_ALPHA_OPAQUE_BIT_KHR;
-    create.presentMode = VK_PRESENT_MODE_FIFO_KHR; // FIFO is guaranteed and avoids tearing.
+    create.presentMode = ChooseUncappedPresentMode(support.presentModes);
     create.clipped = VK_TRUE;
 
-    LogFormat("[VULKAN] Swap-chain create: preTransform=%s imageExtent=%u x %u requestedWindow=%u x %u",
+    LogFormat("[VULKAN] Swap-chain create: preTransform=%s presentMode=%s uncapped=%s imageExtent=%u x %u requestedWindow=%u x %u",
         SurfaceTransformName(create.preTransform),
+        PresentModeName(create.presentMode),
+        create.presentMode == VK_PRESENT_MODE_FIFO_KHR ? "no" : "yes",
         create.imageExtent.width,
         create.imageExtent.height,
         width,
@@ -789,8 +876,9 @@ bool VulkanDevice::CreateSwapchain(uint32_t width, uint32_t height)
     m_currentTransform = support.capabilities.currentTransform;
     m_imagesInFlight.assign(imageCount, VK_NULL_HANDLE);
 
-    LogFormat("[VULKAN] Swap-chain created with preTransform=%s imageExtent=%u x %u imageCount=%u",
+    LogFormat("[VULKAN] Swap-chain created with preTransform=%s presentMode=%s imageExtent=%u x %u imageCount=%u",
         SurfaceTransformName(preTransform),
+        PresentModeName(create.presentMode),
         m_swapchainExtent.width,
         m_swapchainExtent.height,
         imageCount);
@@ -1004,6 +1092,143 @@ bool VulkanDevice::CreateSyncObjects()
         VK_CHECK(vkCreateFence(m_device, &fence, nullptr, &m_inFlightFences[i]));
     }
     return true;
+}
+
+bool VulkanDevice::CreateTimestampQueryPool()
+{
+#if !defined(IXTREEME_DEBUG_LOGS)
+    return true;
+#else
+    if (!m_device || !m_physicalDevice)
+        return true;
+
+    VkPhysicalDeviceProperties properties{};
+    vkGetPhysicalDeviceProperties(m_physicalDevice, &properties);
+    m_timestampPeriodNs = properties.limits.timestampPeriod;
+    if (m_timestampPeriodNs <= 0.0f)
+    {
+        Log("[GPU-TIME] timestamp queries unavailable: timestampPeriod=0");
+        return true;
+    }
+
+    VkQueryPoolCreateInfo create{};
+    create.sType = VK_STRUCTURE_TYPE_QUERY_POOL_CREATE_INFO;
+    create.queryType = VK_QUERY_TYPE_TIMESTAMP;
+    create.queryCount = GpuTimestampPointCount;
+    const VkResult result = vkCreateQueryPool(m_device, &create, nullptr, &m_timestampQueryPool);
+    if (result != VK_SUCCESS)
+    {
+        LogFormat("[GPU-TIME] timestamp query pool unavailable: %s", VkResultName(result));
+        m_timestampQueryPool = VK_NULL_HANDLE;
+        return true;
+    }
+    LogFormat("[GPU-TIME] timestamp query pool ready count=%u periodNs=%.3f",
+        GpuTimestampPointCount,
+        m_timestampPeriodNs);
+    return true;
+#endif
+}
+
+void VulkanDevice::RequestGpuFrameCapture()
+{
+#if defined(IXTREEME_DEBUG_LOGS)
+    m_gpuCaptureRequested = true;
+    Log("[GPU-TIME] capture requested");
+#endif
+}
+
+void VulkanDevice::BeginGpuFrameCaptureCommands()
+{
+#if defined(IXTREEME_DEBUG_LOGS)
+    if (!m_timestampQueryPool || !m_frameStarted || m_skipFrame)
+        return;
+
+    m_gpuCaptureActive = true;
+    m_lastGpuCaptureResults = {};
+    m_lastGpuCaptureResults.frameNumber = m_frameNumber;
+    vkCmdResetQueryPool(m_commandBuffers[m_currentFrame], m_timestampQueryPool, 0, GpuTimestampPointCount);
+    WriteGpuTimestamp(GpuTimestampPoint::FrameBegin);
+#endif
+}
+
+void VulkanDevice::WriteGpuTimestamp(GpuTimestampPoint point)
+{
+#if defined(IXTREEME_DEBUG_LOGS)
+    if (!m_gpuCaptureActive || !m_timestampQueryPool || !m_frameStarted || m_skipFrame)
+        return;
+    const uint32_t index = static_cast<uint32_t>(point);
+    if (index >= GpuTimestampPointCount)
+        return;
+    vkCmdWriteTimestamp(m_commandBuffers[m_currentFrame],
+        VK_PIPELINE_STAGE_BOTTOM_OF_PIPE_BIT,
+        m_timestampQueryPool,
+        index);
+    m_gpuCapturePointWritten[index] = true;
+#else
+    (void)point;
+#endif
+}
+
+void VulkanDevice::FinishGpuFrameCaptureAfterSubmit()
+{
+#if defined(IXTREEME_DEBUG_LOGS)
+    if (!m_gpuCaptureActive || !m_timestampQueryPool)
+        return;
+
+    VK_CHECK(vkQueueWaitIdle(m_graphicsQueue));
+
+    struct TimestampWithAvailability
+    {
+        uint64_t value = 0;
+        uint64_t available = 0;
+    };
+    std::array<TimestampWithAvailability, GpuTimestampPointCount> raw{};
+    const VkResult result = vkGetQueryPoolResults(m_device,
+        m_timestampQueryPool,
+        0,
+        GpuTimestampPointCount,
+        sizeof(TimestampWithAvailability) * raw.size(),
+        raw.data(),
+        sizeof(TimestampWithAvailability),
+        VK_QUERY_RESULT_64_BIT | VK_QUERY_RESULT_WITH_AVAILABILITY_BIT);
+    if (result != VK_SUCCESS && result != VK_NOT_READY)
+    {
+        LogFormat("[GPU-TIME] query result read failed: %s", VkResultName(result));
+        m_gpuCaptureActive = false;
+        return;
+    }
+
+    GpuTimestampResults results{};
+    results.valid = true;
+    results.frameNumber = m_frameNumber;
+    const uint64_t firstValue = raw[static_cast<uint32_t>(GpuTimestampPoint::FrameBegin)].value;
+    for (uint32_t i = 0; i < GpuTimestampPointCount; ++i)
+    {
+        results.pointValid[i] = m_gpuCapturePointWritten[i] && raw[i].available != 0;
+        if (results.pointValid[i])
+            results.pointMs[i] = static_cast<double>(raw[i].value - firstValue) * static_cast<double>(m_timestampPeriodNs) / 1000000.0;
+    }
+
+    m_lastGpuCaptureResults = results;
+    m_gpuCaptureResultsReady = true;
+    m_gpuCaptureActive = false;
+#endif
+}
+
+bool VulkanDevice::ConsumeGpuFrameCaptureResults(GpuTimestampResults& gpu, CpuFrameTimingResults& cpu)
+{
+#if defined(IXTREEME_DEBUG_LOGS)
+    if (!m_gpuCaptureResultsReady)
+        return false;
+    gpu = m_lastGpuCaptureResults;
+    cpu = m_lastCpuFrameTimingResults;
+    m_gpuCaptureResultsReady = false;
+    return true;
+#else
+    (void)gpu;
+    (void)cpu;
+    return false;
+#endif
 }
 
 void VulkanDevice::DestroySwapchainObjects()

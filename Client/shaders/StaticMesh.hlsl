@@ -22,6 +22,7 @@ struct SpotLightUbo
     float4 u_materialParams; // metallic, roughness, normal strength, AO strength
     float4 u_materialEmissive; // rgb, intensity
     float4 u_materialUv; // tiling.xy, offset.xy
+    float4 u_materialAlpha; // mode: 0 opaque, 1 mask, 2 blend; cutoff
     float4 u_cameraPosition;
     float4 u_sunDir;
     float4 u_sunColor;
@@ -51,6 +52,7 @@ struct StaticMeshInstanceData
     float4 materialParams;
     float4 materialEmissive;
     float4 materialUv;
+    float4 materialAlpha;
 };
 
 [[vk::binding(4, 0)]] StructuredBuffer<StaticMeshInstanceData> u_instances : register(t3);
@@ -72,14 +74,21 @@ struct VSOutput
     nointerpolation float4 materialBaseColor : TEXCOORD3;
     nointerpolation float4 materialParams : TEXCOORD4;
     nointerpolation float4 materialEmissive : TEXCOORD5;
+    nointerpolation float4 materialAlpha : TEXCOORD6;
 };
 
 VSOutput VSMain(VSInput input, uint instanceId : SV_InstanceID)
 {
     StaticMeshInstanceData instance = u_instances[instanceId];
     VSOutput output;
-    output.position = mul(float4(input.position, 1.0), instance.mvp);
-    const float4 worldPos = mul(float4(input.position, 1.0), instance.model);
+    float3 localPosition = input.position;
+#if defined(STATIC_MESH_OUTLINE)
+    const float normalLenSq = dot(input.normal, input.normal);
+    const float3 outlineNormal = normalLenSq > 0.000001 ? input.normal * rsqrt(normalLenSq) : float3(0.0, 1.0, 0.0);
+    localPosition += outlineNormal * 0.045;
+#endif
+    output.position = mul(float4(localPosition, 1.0), instance.mvp);
+    const float4 worldPos = mul(float4(localPosition, 1.0), instance.model);
     output.normal = normalize(mul(float4(input.normal, 0.0), instance.model).xyz);
     output.uv = input.uv * max(instance.materialUv.xy, float2(0.001, 0.001)) + instance.materialUv.zw;
     output.worldPos = worldPos.xyz;
@@ -87,6 +96,7 @@ VSOutput VSMain(VSInput input, uint instanceId : SV_InstanceID)
     output.materialBaseColor = instance.materialBaseColor;
     output.materialParams = instance.materialParams;
     output.materialEmissive = instance.materialEmissive;
+    output.materialAlpha = instance.materialAlpha;
     return output;
 }
 
@@ -120,9 +130,24 @@ float3 ApplyNormalMap(float3 vertexNormal, float3 worldPos, float2 uv, float str
 
 float4 PSMain(VSOutput input) : SV_Target0
 {
+#if defined(STATIC_MESH_OUTLINE)
+    return float4(1.0, 0.78, 0.18, 1.0);
+#else
     if (u_lightPadding.x > 0.5 && input.worldPos.y < u_lightPadding.y)
         discard;
 
+    float4 texSample = u_diffuse.Sample(u_sampler, input.uv);
+    const float alpha = texSample.a * input.materialBaseColor.a * input.tint.a;
+    if (input.materialAlpha.x > 0.5 && input.materialAlpha.x < 1.5 && alpha < input.materialAlpha.y)
+        discard;
+
+    float3 texColor = texSample.rgb;
+    float3 albedo = texColor * input.materialBaseColor.rgb * input.tint.rgb;
+
+#if defined(SHADING_MODE_UNLIT)
+    float3 unlitColor = albedo + input.materialEmissive.rgb * input.materialEmissive.a;
+    return float4(unlitColor, alpha);
+#else
     float3 normal = ApplyNormalMap(normalize(input.normal), input.worldPos, input.uv, input.materialParams.z);
     float3 viewDir = normalize(u_cameraPosition.xyz - input.worldPos);
     float3 lightDir = normalize(u_sunDir.xyz);
@@ -132,8 +157,6 @@ float4 PSMain(VSOutput input) : SV_Target0
     const float metallic = saturate(input.materialParams.x * orm.b);
     const float roughness = saturate(input.materialParams.y * max(orm.g, 0.04));
     const float ao = saturate(input.materialParams.w * orm.r);
-    float3 texColor = u_diffuse.Sample(u_sampler, input.uv).rgb;
-    float3 albedo = texColor * input.materialBaseColor.rgb * input.tint.rgb;
     float3 lighting = u_ambientColor.rgb * ao + u_sunColor.rgb * ndotl;
     float3 specular = u_sunColor.rgb * SpecularTerm(normal, lightDir, viewDir, roughness, metallic);
 
@@ -180,5 +203,7 @@ float4 PSMain(VSOutput input) : SV_Target0
     }
 
     float3 color = albedo * lighting + specular + input.materialEmissive.rgb * input.materialEmissive.a;
-    return float4(color, input.materialBaseColor.a * input.tint.a);
+    return float4(color, alpha);
+#endif
+#endif
 }

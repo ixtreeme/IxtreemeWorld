@@ -1,5 +1,6 @@
 #include "MaterialAssetManager.h"
 
+#include "Common.h"
 #include "Debug.h"
 
 #include <algorithm>
@@ -12,24 +13,10 @@
 
 namespace
 {
-std::string EscapeJson(const std::string& value)
-{
-    std::string out;
-    out.reserve(value.size() + 8);
-    for (char c : value)
-    {
-        switch (c)
-        {
-        case '\\': out += "\\\\"; break;
-        case '"': out += "\\\""; break;
-        case '\n': out += "\\n"; break;
-        case '\r': out += "\\r"; break;
-        case '\t': out += "\\t"; break;
-        default: out += c; break;
-        }
-    }
-    return out;
-}
+using ixtreeme::common::EscapeJson;
+using ixtreeme::common::JsonFloatValue;
+using ixtreeme::common::JsonStringValue;
+using ixtreeme::common::ToLowerAscii;
 
 std::string SanitizeName(std::string value)
 {
@@ -57,14 +44,34 @@ const char* AlphaModeName(MaterialAsset::AlphaMode mode)
 
 MaterialAsset::AlphaMode ParseAlphaMode(std::string value)
 {
-    std::transform(value.begin(), value.end(), value.begin(), [](unsigned char c) {
-        return static_cast<char>(std::tolower(c));
-    });
+    value = ToLowerAscii(std::move(value));
     if (value == "mask")
         return MaterialAsset::AlphaMode::Mask;
     if (value == "blend")
         return MaterialAsset::AlphaMode::Blend;
     return MaterialAsset::AlphaMode::Opaque;
+}
+
+const char* ShadingModeName(MaterialAsset::ShadingMode mode)
+{
+    switch (mode)
+    {
+    case MaterialAsset::ShadingMode::Unlit: return "Unlit";
+    default: return "Lit";
+    }
+}
+
+MaterialAsset::ShadingMode ParseShadingMode(std::string value)
+{
+    value = ToLowerAscii(std::move(value));
+    if (value == "unlit")
+        return MaterialAsset::ShadingMode::Unlit;
+    return MaterialAsset::ShadingMode::Lit;
+}
+
+bool HasJsonKey(const std::string& object, const std::string& key)
+{
+    return object.find("\"" + key + "\"") != std::string::npos;
 }
 
 std::string GuidOrNull(const std::optional<Guid>& guid)
@@ -103,8 +110,9 @@ std::string MaterialJson(const MaterialAsset& material)
 {
     std::ostringstream json;
     json << "{\n"
-         << "  \"version\": 1,\n"
+         << "  \"version\": 2,\n"
          << "  \"shader\": \"PBR-Standard\",\n"
+         << "  \"shadingMode\": \"" << ShadingModeName(material.shadingMode) << "\",\n"
          << "  \"name\": \"" << EscapeJson(material.name) << "\",\n"
          << "  \"baseColor\": " << FloatArray(material.baseColor) << ",\n"
          << "  \"metallic\": " << FloatValue(material.metallic) << ",\n"
@@ -125,57 +133,6 @@ std::string MaterialJson(const MaterialAsset& material)
          << "  }\n"
          << "}\n";
     return json.str();
-}
-
-std::string JsonStringValue(const std::string& object, const std::string& key)
-{
-    const std::string needle = "\"" + key + "\"";
-    const size_t keyPos = object.find(needle);
-    if (keyPos == std::string::npos)
-        return {};
-    const size_t colon = object.find(':', keyPos + needle.size());
-    if (colon == std::string::npos)
-        return {};
-    const size_t firstQuote = object.find('"', colon + 1);
-    if (firstQuote == std::string::npos)
-        return {};
-
-    std::string out;
-    bool escaping = false;
-    for (size_t i = firstQuote + 1; i < object.size(); ++i)
-    {
-        const char c = object[i];
-        if (escaping)
-        {
-            out += c;
-            escaping = false;
-            continue;
-        }
-        if (c == '\\')
-        {
-            escaping = true;
-            continue;
-        }
-        if (c == '"')
-            return out;
-        out += c;
-    }
-    return {};
-}
-
-float JsonFloatValue(const std::string& object, const std::string& key, float fallback)
-{
-    const std::string needle = "\"" + key + "\"";
-    const size_t keyPos = object.find(needle);
-    if (keyPos == std::string::npos)
-        return fallback;
-    const size_t colon = object.find(':', keyPos + needle.size());
-    if (colon == std::string::npos)
-        return fallback;
-    const char* begin = object.c_str() + colon + 1;
-    char* end = nullptr;
-    const float value = std::strtof(begin, &end);
-    return end != begin ? value : fallback;
 }
 
 std::string JsonObjectValue(const std::string& object, const std::string& key)
@@ -329,6 +286,16 @@ MaterialAsset* MaterialAssetManager::getOrLoad(const Guid& guid)
     ReadFloatArray(text, "uvOffset", material->uvOffset);
     material->alphaMode = ParseAlphaMode(JsonStringValue(text, "alphaMode"));
     material->alphaCutoff = JsonFloatValue(text, "alphaCutoff", material->alphaCutoff);
+    if (HasJsonKey(text, "shadingMode"))
+    {
+        material->shadingMode = ParseShadingMode(JsonStringValue(text, "shadingMode"));
+    }
+    else
+    {
+        material->shadingMode = MaterialAsset::ShadingMode::Lit;
+        Tracenf("[MATERIAL] legacy_no_shadingMode_field path=%s migrated_to=Lit",
+            path->generic_string().c_str());
+    }
 
     const std::string textures = JsonObjectValue(text, "textures");
     material->baseColorTexture = JsonGuidOrNull(textures, "baseColor");

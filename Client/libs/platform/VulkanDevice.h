@@ -3,12 +3,65 @@
 #include "NativeWindow.h"
 
 #include <vulkan/vulkan.h>
+#include <array>
+#include <chrono>
 #include <cstdint>
 #include <vector>
 
 class VulkanDevice
 {
 public:
+    enum class GpuTimestampPoint : uint32_t
+    {
+        FrameBegin = 0,
+        ShadowPassBegin,
+        ShadowCascade0Begin,
+        ShadowCascade0End,
+        ShadowCascade1Begin,
+        ShadowCascade1End,
+        ShadowCascade2Begin,
+        ShadowCascade2End,
+        ShadowCascade3Begin,
+        ShadowCascade3End,
+        ShadowPassEnd,
+        WaterReflectionBegin,
+        WaterReflectionEnd,
+        TerrainMainBegin,
+        TerrainMainEnd,
+        SceneOtherBegin,
+        SceneOtherEnd,
+        CompositeBegin,
+        CompositeEnd,
+        RmlUiBegin,
+        RmlUiEnd,
+        ImGuiBegin,
+        ImGuiEnd,
+        FrameEnd,
+        Count
+    };
+
+    static constexpr uint32_t GpuTimestampPointCount = static_cast<uint32_t>(GpuTimestampPoint::Count);
+
+    struct GpuTimestampResults
+    {
+        bool valid = false;
+        uint64_t frameNumber = 0;
+        std::array<bool, GpuTimestampPointCount> pointValid{};
+        std::array<double, GpuTimestampPointCount> pointMs{};
+    };
+
+    struct CpuFrameTimingResults
+    {
+        bool valid = false;
+        uint64_t frameNumber = 0;
+        double acquireImageMs = 0.0;
+        double waitForFencesMs = 0.0;
+        double renderLoopCpuWorkMs = 0.0;
+        double submitMs = 0.0;
+        double presentMs = 0.0;
+        double totalCpuFrameMs = 0.0;
+    };
+
     bool Create(NativeWindow& window, uint32_t width, uint32_t height);
     void BeginFrame();
     void BeginSwapchainRenderPass(const char* passName = "other");
@@ -39,6 +92,11 @@ public:
     uint32_t GetHeight() const { return m_height; }
     bool IsSwapchainFormatSrgb() const;
     uint32_t FindMemoryType(uint32_t typeFilter, VkMemoryPropertyFlags properties) const;
+    static constexpr uint32_t MaxFramesInFlight() { return MAX_FRAMES_IN_FLIGHT; }
+    void RequestGpuFrameCapture();
+    bool IsGpuFrameCaptureActive() const { return m_gpuCaptureActive; }
+    void WriteGpuTimestamp(GpuTimestampPoint point);
+    bool ConsumeGpuFrameCaptureResults(GpuTimestampResults& gpu, CpuFrameTimingResults& cpu);
 
 private:
     static constexpr uint32_t MAX_FRAMES_IN_FLIGHT = 2;
@@ -71,6 +129,9 @@ private:
     bool CreateCommandPool();
     bool CreateCommandBuffers();
     bool CreateSyncObjects();
+    bool CreateTimestampQueryPool();
+    void BeginGpuFrameCaptureCommands();
+    void FinishGpuFrameCaptureAfterSubmit();
 
     void DestroySwapchainObjects();
     bool RecreateSwapchain(uint32_t width, uint32_t height);
@@ -109,6 +170,8 @@ private:
     VkRenderPass m_renderPass = VK_NULL_HANDLE;
     VkCommandPool m_commandPool = VK_NULL_HANDLE;
     std::vector<VkCommandBuffer> m_commandBuffers;
+    VkQueryPool m_timestampQueryPool = VK_NULL_HANDLE;
+    float m_timestampPeriodNs = 0.0f;
 
     VkSemaphore m_imageAvailable[MAX_FRAMES_IN_FLIGHT]{};
     std::vector<VkSemaphore> m_renderFinished;
@@ -132,4 +195,13 @@ private:
     bool m_validationEnabled = false;
     bool m_samplerAnisotropySupported = false;
     float m_maxSamplerAnisotropy = 1.0f;
+    bool m_gpuCaptureRequested = false;
+    bool m_gpuCaptureActive = false;
+    bool m_gpuCaptureResultsReady = false;
+    std::array<bool, GpuTimestampPointCount> m_gpuCapturePointWritten{};
+    GpuTimestampResults m_lastGpuCaptureResults{};
+    CpuFrameTimingResults m_lastCpuFrameTimingResults{};
+    CpuFrameTimingResults m_activeCpuFrameTiming{};
+    std::chrono::steady_clock::time_point m_cpuFrameStartTime{};
+    std::chrono::steady_clock::time_point m_cpuRenderWorkStartTime{};
 };

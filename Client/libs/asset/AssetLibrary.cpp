@@ -1,7 +1,9 @@
 #include "AssetLibrary.h"
 
 #include "AssetDatabase.h"
+#include "Common.h"
 #include "Debug.h"
+#include "MaterialAssetManager.h"
 
 #if defined(_WIN32)
 #ifndef WIN32_LEAN_AND_MEAN
@@ -30,6 +32,7 @@
 #include <iomanip>
 #include <map>
 #include <numeric>
+#include <optional>
 #include <set>
 #include <sstream>
 #include <thread>
@@ -41,10 +44,18 @@ namespace
 {
 std::string ToLower(std::string value)
 {
-    for (char& c : value)
-        c = static_cast<char>(std::tolower(static_cast<unsigned char>(c)));
-    return value;
+    return ixtreeme::common::ToLowerAscii(std::move(value));
 }
+
+using ixtreeme::common::CanonicalPathString;
+using ixtreeme::common::EscapeJson;
+using ixtreeme::common::GenericPath;
+using ixtreeme::common::HasAnyExtension;
+using ixtreeme::common::JsonFloatValue;
+using ixtreeme::common::JsonStringValue;
+using ixtreeme::common::TimestampUtc;
+
+AssetLibrary::FbxSidecarProcessor g_fbxSidecarProcessor = nullptr;
 
 std::string SanitizeStem(std::string value)
 {
@@ -58,78 +69,12 @@ std::string SanitizeStem(std::string value)
     return value.empty() ? "asset" : value;
 }
 
-std::string EscapeJson(const std::string& value)
-{
-    std::string out;
-    out.reserve(value.size() + 8);
-    for (char c : value)
-    {
-        switch (c)
-        {
-        case '\\': out += "\\\\"; break;
-        case '"': out += "\\\""; break;
-        case '\n': out += "\\n"; break;
-        case '\r': out += "\\r"; break;
-        case '\t': out += "\\t"; break;
-        default: out += c; break;
-        }
-    }
-    return out;
-}
-
 bool JsonArrayBody(const std::string& text, const std::string& key, std::string& out);
 std::optional<int> JsonIntValue(const std::string& object, const std::string& key);
 bool HasJsonObjectShape(const std::string& text);
-
-std::string JsonStringValue(const std::string& object, const std::string& key)
-{
-    const std::string needle = "\"" + key + "\"";
-    const size_t keyPos = object.find(needle);
-    if (keyPos == std::string::npos)
-        return {};
-    const size_t colon = object.find(':', keyPos + needle.size());
-    if (colon == std::string::npos)
-        return {};
-    size_t firstQuote = object.find('"', colon + 1);
-    if (firstQuote == std::string::npos)
-        return {};
-    std::string out;
-    bool escaping = false;
-    for (size_t i = firstQuote + 1; i < object.size(); ++i)
-    {
-        const char c = object[i];
-        if (escaping)
-        {
-            out += c;
-            escaping = false;
-            continue;
-        }
-        if (c == '\\')
-        {
-            escaping = true;
-            continue;
-        }
-        if (c == '"')
-            break;
-        out += c;
-    }
-    return out;
-}
-
-float JsonFloatValue(const std::string& object, const std::string& key, float fallback)
-{
-    const std::string needle = "\"" + key + "\"";
-    const size_t keyPos = object.find(needle);
-    if (keyPos == std::string::npos)
-        return fallback;
-    const size_t colon = object.find(':', keyPos + needle.size());
-    if (colon == std::string::npos)
-        return fallback;
-    const char* begin = object.c_str() + colon + 1;
-    char* end = nullptr;
-    const float value = std::strtof(begin, &end);
-    return end != begin ? value : fallback;
-}
+bool ImportFbxSidecars(const std::filesystem::path& destination,
+                       const std::filesystem::path& libraryRoot,
+                       std::string& error);
 
 bool JsonBoolValue(const std::string& object, const std::string& key, bool fallback)
 {
@@ -229,6 +174,21 @@ std::string JsonObjectValue(const std::string& object, const std::string& key)
         }
     }
     return {};
+}
+
+bool ImportFbxSidecars(const std::filesystem::path& destination,
+                       const std::filesystem::path& libraryRoot,
+                       std::string& error)
+{
+    if (!g_fbxSidecarProcessor)
+    {
+        error = "FBX asset processor is not registered";
+        TraceError("[FBX-IMPORT] failed path=%s error=%s",
+            destination.generic_string().c_str(),
+            error.c_str());
+        return false;
+    }
+    return g_fbxSidecarProcessor(destination, libraryRoot, error);
 }
 
 LodConfig ReadLodConfigJson(const std::string& object)
@@ -586,21 +546,6 @@ bool CopyGltfExternalDependencies(const std::filesystem::path& sourceGltf,
     return true;
 }
 
-std::string TimestampUtc()
-{
-    const auto now = std::chrono::system_clock::now();
-    const std::time_t time = std::chrono::system_clock::to_time_t(now);
-    std::tm tm{};
-#if defined(_WIN32)
-    gmtime_s(&tm, &time);
-#else
-    gmtime_r(&time, &tm);
-#endif
-    std::ostringstream out;
-    out << std::put_time(&tm, "%Y-%m-%dT%H:%M:%SZ");
-    return out.str();
-}
-
 const char* NativeErrorName(int code);
 void ClearAtomicWriteFailure();
 void SetAtomicWriteFailure(const std::filesystem::path& path,
@@ -700,6 +645,17 @@ AssetLibrary::MaterialData ClampMaterialData(AssetLibrary::MaterialData material
     material.colorTint[0] = std::clamp(material.colorTint[0], 0.0f, 1.0f);
     material.colorTint[1] = std::clamp(material.colorTint[1], 0.0f, 1.0f);
     material.colorTint[2] = std::clamp(material.colorTint[2], 0.0f, 1.0f);
+    std::transform(material.shadingMode.begin(), material.shadingMode.end(), material.shadingMode.begin(), [](unsigned char c) {
+        return static_cast<char>(std::tolower(c));
+    });
+    if (material.shadingMode != "unlit")
+        material.shadingMode = "lit";
+    std::transform(material.alphaMode.begin(), material.alphaMode.end(), material.alphaMode.begin(), [](unsigned char c) {
+        return static_cast<char>(std::tolower(c));
+    });
+    if (material.alphaMode != "mask" && material.alphaMode != "blend")
+        material.alphaMode = "opaque";
+    material.alphaCutoff = std::clamp(material.alphaCutoff, 0.0f, 1.0f);
     return material;
 }
 
@@ -924,32 +880,12 @@ std::string MaterialFileJson(const AssetLibrary::Entry& entry)
              << "  \"normal_strength\": " << entry.material.normalStrength << ",\n"
              << "  \"ao_strength\": " << entry.material.aoStrength << ",\n"
              << "  \"roughness_strength\": " << entry.material.roughnessStrength << ",\n"
-             << "  \"metallic_strength\": " << entry.material.metallicStrength << "\n"
+             << "  \"metallic_strength\": " << entry.material.metallicStrength << ",\n"
+             << "  \"shadingMode\": \"" << (entry.material.shadingMode == "unlit" ? "Unlit" : "Lit") << "\",\n"
+             << "  \"alphaMode\": \"" << EscapeJson(entry.material.alphaMode) << "\",\n"
+             << "  \"alphaCutoff\": " << entry.material.alphaCutoff << "\n"
              << "}\n";
     return fileJson.str();
-}
-
-bool HasAnyExtension(const std::filesystem::path& path, std::initializer_list<const char*> extensions)
-{
-    const std::string ext = ToLower(path.extension().string());
-    for (const char* allowed : extensions)
-    {
-        if (ext == allowed)
-            return true;
-    }
-    return false;
-}
-
-std::string CanonicalPathString(const std::filesystem::path& path)
-{
-    std::error_code ec;
-    std::filesystem::path normalized = std::filesystem::weakly_canonical(path, ec);
-    if (ec)
-    {
-        ec.clear();
-        normalized = std::filesystem::absolute(path, ec);
-    }
-    return (ec ? path : normalized).generic_string();
 }
 
 bool HasJsonKey(const std::string& object, const std::string& key)
@@ -978,7 +914,7 @@ bool ValidateMaterialAssetSchema(const std::filesystem::path& path,
     }
 
     const auto version = JsonIntValue(text, "version");
-    if (!version || *version != 1)
+    if (!version || (*version != 1 && *version != 2))
     {
         step = "schemaValidate";
         errorMessage = "missing or unsupported field 'version'";
@@ -1008,6 +944,12 @@ bool ValidateMaterialAssetSchema(const std::filesystem::path& path,
             errorMessage = std::string("missing required field '") + key + "'";
             return false;
         }
+    }
+    if (*version >= 2 && !HasJsonKey(text, "shadingMode"))
+    {
+        step = "schemaValidate";
+        errorMessage = "missing required field 'shadingMode'";
+        return false;
     }
 
     const std::string textures = JsonObjectValue(text, "textures");
@@ -1319,27 +1261,31 @@ void RecordMaterialDiscoveryDiag(const std::filesystem::path& path,
                                  const char* action,
                                  const void* returnPtr)
 {
+#if defined(IXTREEME_DEBUG_LOGS)
     auto& state = MaterialDiscoveryDiag();
     const std::string pathText = path.generic_string();
     ++state.calls;
     state.uniquePaths.insert(pathText);
     ++state.callerCounts[caller ? caller : "unknown"];
 
-    Tracenf("[ASSET-LIBRARY-DIAG] discovered material asset path=%s caller=%s callIndexThisFrame=%u",
+    TraceDiagf("[ASSET-LIBRARY-DIAG] discovered material asset path=%s caller=%s callIndexThisFrame=%u",
         pathText.c_str(),
         caller ? caller : "unknown",
         state.calls);
-    Tracenf("[ASSET-LIBRARY-DIAG] discovery_state path=%s cacheHit=%s diskIOExpected=%s action=%s returnPtr=%p",
+    TraceDiagf("[ASSET-LIBRARY-DIAG] discovery_state path=%s cacheHit=%s diskIOExpected=%s action=%s returnPtr=%p",
         pathText.c_str(),
         cacheHit,
         diskIOExpected,
         action,
         returnPtr);
-}
-
-std::string GenericPath(const std::filesystem::path& path)
-{
-    return path.generic_string();
+#else
+    (void)path;
+    (void)caller;
+    (void)cacheHit;
+    (void)diskIOExpected;
+    (void)action;
+    (void)returnPtr;
+#endif
 }
 
 bool ContainsCaseInsensitive(const std::string& haystack, const std::string& needle)
@@ -1485,6 +1431,11 @@ AssetLibrary::AssetLibrary(std::filesystem::path clientRoot, std::filesystem::pa
     : m_clientRoot(std::move(clientRoot))
     , m_libraryRoot(std::move(libraryRoot))
 {
+}
+
+void AssetLibrary::SetFbxSidecarProcessor(FbxSidecarProcessor processor)
+{
+    g_fbxSidecarProcessor = processor;
 }
 
 bool AssetLibrary::Initialize()
@@ -1770,16 +1721,24 @@ std::string AssetLibrary::TagsToCsv(const std::vector<std::string>& tags)
 
 void AssetLibrary::BeginMaterialDiscoveryFrame(std::uint64_t frameNumber)
 {
+#if defined(IXTREEME_DEBUG_LOGS)
     auto& state = MaterialDiscoveryDiag();
     state.frame = frameNumber;
     state.calls = 0;
     state.uniquePaths.clear();
     state.callerCounts.clear();
+#else
+    (void)frameNumber;
+#endif
 }
 
 void AssetLibrary::EndMaterialDiscoveryFrame(std::uint64_t frameNumber)
 {
+#if defined(IXTREEME_DEBUG_LOGS)
     auto& state = MaterialDiscoveryDiag();
+    if (state.calls == 0)
+        return;
+
     std::string topCaller = "none";
     std::uint32_t topCount = 0;
     for (const auto& [caller, count] : state.callerCounts)
@@ -1791,11 +1750,14 @@ void AssetLibrary::EndMaterialDiscoveryFrame(std::uint64_t frameNumber)
         }
     }
 
-    Tracenf("[ASSET-LIBRARY-DIAG] frame_summary frame=%llu material_discovery_calls=%u unique_paths=%zu top_caller=%s",
+    TraceDiagf("[ASSET-LIBRARY-DIAG] frame_summary frame=%llu material_discovery_calls=%u unique_paths=%zu top_caller=%s",
         static_cast<unsigned long long>(frameNumber),
         state.calls,
         state.uniquePaths.size(),
         topCaller.c_str());
+#else
+    (void)frameNumber;
+#endif
 }
 
 std::string AssetLibrary::CategoryString(Category category)
@@ -2064,6 +2026,18 @@ bool AssetLibrary::LoadManifest()
             entry.material.aoStrength = JsonFloatValue(materialObject, "ao_strength", 1.0f);
             entry.material.roughnessStrength = JsonFloatValue(materialObject, "roughness_strength", 1.0f);
             entry.material.metallicStrength = JsonFloatValue(materialObject, "metallic_strength", 1.0f);
+            entry.material.shadingMode = JsonStringValue(materialObject, "shadingMode");
+            if (entry.material.shadingMode.empty())
+                entry.material.shadingMode = JsonStringValue(materialObject, "shading_mode");
+            if (entry.material.shadingMode.empty())
+                entry.material.shadingMode = "lit";
+            entry.material.alphaMode = JsonStringValue(materialObject, "alphaMode");
+            if (entry.material.alphaMode.empty())
+                entry.material.alphaMode = JsonStringValue(materialObject, "alpha_mode");
+            if (entry.material.alphaMode.empty())
+                entry.material.alphaMode = "opaque";
+            entry.material.alphaCutoff = JsonFloatValue(materialObject, "alphaCutoff",
+                JsonFloatValue(materialObject, "alpha_cutoff", 0.5f));
             const std::string tint = JsonStringValue(materialObject, "color_tint");
             if (tint.size() == 7 && tint[0] == '#')
             {
@@ -2176,7 +2150,10 @@ bool AssetLibrary::SaveManifest(std::string& error) const
                  << "        \"normal_strength\": " << entry.material.normalStrength << ",\n"
                  << "        \"ao_strength\": " << entry.material.aoStrength << ",\n"
                  << "        \"roughness_strength\": " << entry.material.roughnessStrength << ",\n"
-                 << "        \"metallic_strength\": " << entry.material.metallicStrength << "\n"
+                 << "        \"metallic_strength\": " << entry.material.metallicStrength << ",\n"
+                 << "        \"shadingMode\": \"" << (entry.material.shadingMode == "unlit" ? "Unlit" : "Lit") << "\",\n"
+                 << "        \"alphaMode\": \"" << EscapeJson(entry.material.alphaMode) << "\",\n"
+                 << "        \"alphaCutoff\": " << entry.material.alphaCutoff << "\n"
                  << "      }\n";
         }
         if (entry.category == Category::WaterMaterial)
@@ -2275,7 +2252,28 @@ bool AssetLibrary::ReconcileFilesystem(std::string& error)
                 changed = PopulateTextureMetadata(entry, false, &error) || changed;
             if (entry.category == Category::Material)
             {
-                knownMaterialPaths.insert(CanonicalPathString(AbsolutePath(entry)));
+                const std::filesystem::path materialPath = AbsolutePath(entry);
+                knownMaterialPaths.insert(CanonicalPathString(materialPath));
+                if (ToLower(materialPath.extension().string()) == ".material")
+                {
+                    std::ifstream materialFile(materialPath, std::ios::binary);
+                    const std::string text((std::istreambuf_iterator<char>(materialFile)), std::istreambuf_iterator<char>());
+                    const std::string shadingMode = JsonStringValue(text, "shadingMode");
+                    const std::string alphaMode = JsonStringValue(text, "alphaMode");
+                    const float alphaCutoff = JsonFloatValue(text, "alphaCutoff", entry.material.alphaCutoff);
+                    if (!shadingMode.empty() && entry.material.shadingMode != ToLower(shadingMode))
+                    {
+                        entry.material.shadingMode = ToLower(shadingMode);
+                        changed = true;
+                    }
+                    if (!alphaMode.empty() && (entry.material.alphaMode != alphaMode ||
+                            std::fabs(entry.material.alphaCutoff - alphaCutoff) > 0.0001f))
+                    {
+                        entry.material.alphaMode = alphaMode;
+                        entry.material.alphaCutoff = alphaCutoff;
+                        changed = true;
+                    }
+                }
             }
             reconciled.push_back(std::move(entry));
             continue;
@@ -2384,6 +2382,18 @@ bool AssetLibrary::ReconcileFilesystem(std::string& error)
             entry.importedAt = TimestampUtc();
             entry.thumbnail = "material_icon";
             entry.tags = {"material"};
+            {
+                std::ifstream materialFile(it->path(), std::ios::binary);
+                const std::string text((std::istreambuf_iterator<char>(materialFile)), std::istreambuf_iterator<char>());
+                entry.material.shadingMode = JsonStringValue(text, "shadingMode");
+                if (entry.material.shadingMode.empty())
+                    entry.material.shadingMode = "lit";
+                entry.material.shadingMode = ToLower(entry.material.shadingMode);
+                entry.material.alphaMode = JsonStringValue(text, "alphaMode");
+                if (entry.material.alphaMode.empty())
+                    entry.material.alphaMode = "opaque";
+                entry.material.alphaCutoff = JsonFloatValue(text, "alphaCutoff", 0.5f);
+            }
             knownMaterialPaths.insert(canonical);
             reconciled.push_back(std::move(entry));
             changed = true;
@@ -2696,6 +2706,23 @@ std::filesystem::path AssetLibrary::MakeUniqueDestination(Category category,
     return candidate;
 }
 
+std::optional<AssetLibrary::Category> DetectDirectImportCategory(const std::filesystem::path& sourcePath)
+{
+    const std::string ext = ToLower(sourcePath.extension().string());
+    if (ext == ".png" || ext == ".jpg" || ext == ".jpeg" || ext == ".tga" ||
+        ext == ".bmp" || ext == ".dds" || ext == ".ktx" || ext == ".ktx2")
+        return AssetLibrary::Category::Texture;
+    if (ext == ".glb" || ext == ".gltf" || ext == ".fbx" || ext == ".obj")
+        return AssetLibrary::Category::Model;
+    if (ext == ".anim" || ext == ".ozz")
+        return AssetLibrary::Category::Animation;
+    if (ext == ".material")
+        return AssetLibrary::Category::Material;
+    if (ext == ".scene")
+        return AssetLibrary::Category::Scene;
+    return std::nullopt;
+}
+
 bool AssetLibrary::Import(Category category, const std::filesystem::path& sourcePath, Entry& outEntry, std::string& error)
 {
     return Import(category, sourcePath, ImportOptions{}, outEntry, error);
@@ -2734,6 +2761,13 @@ bool AssetLibrary::Import(Category category,
         std::filesystem::remove(destination, ec);
         for (const auto& dependency : copiedDependencyFiles)
             std::filesystem::remove(dependency, ec);
+        return false;
+    }
+    if (category == Category::Model &&
+        ToLower(sourcePath.extension().string()) == ".fbx" &&
+        !ImportFbxSidecars(destination, m_libraryRoot, error))
+    {
+        std::filesystem::remove(destination, ec);
         return false;
     }
 
@@ -2778,6 +2812,134 @@ bool AssetLibrary::Import(Category category,
             std::filesystem::remove(dependency, ec);
         if (category == Category::Texture && !entry.thumbnail.empty())
             std::filesystem::remove(m_libraryRoot / entry.thumbnail, ec);
+        m_entries.pop_back();
+        return false;
+    }
+
+    outEntry = entry;
+    return true;
+}
+
+bool AssetLibrary::ImportFileToFolder(const std::filesystem::path& sourcePath,
+                                      const std::filesystem::path& targetFolder,
+                                      Entry& outEntry,
+                                      std::filesystem::path& outFinalPath,
+                                      std::string& error)
+{
+    outEntry = {};
+    outFinalPath.clear();
+
+    const auto category = DetectDirectImportCategory(sourcePath);
+    if (!category)
+    {
+        error = "unsupported file type";
+        return false;
+    }
+
+    std::error_code ec;
+    const std::filesystem::path absoluteSource = std::filesystem::absolute(sourcePath, ec);
+    if (ec || !std::filesystem::exists(absoluteSource, ec) || !std::filesystem::is_regular_file(absoluteSource, ec))
+    {
+        error = "source file not found";
+        return false;
+    }
+
+    const std::filesystem::path absoluteTargetFolder = std::filesystem::absolute(targetFolder, ec);
+    if (ec)
+    {
+        error = ec.message();
+        return false;
+    }
+    std::filesystem::create_directories(absoluteTargetFolder, ec);
+    if (ec)
+    {
+        error = ec.message();
+        return false;
+    }
+
+    const std::filesystem::path destination = absoluteTargetFolder / absoluteSource.filename();
+    outFinalPath = destination;
+
+    bool sameFile = false;
+    ec.clear();
+    if (std::filesystem::exists(destination, ec))
+        sameFile = std::filesystem::equivalent(absoluteSource, destination, ec);
+    if (!sameFile)
+    {
+        ec.clear();
+        std::filesystem::copy_file(absoluteSource, destination, std::filesystem::copy_options::overwrite_existing, ec);
+        if (ec)
+        {
+            error = ec.message();
+            return false;
+        }
+    }
+
+    std::vector<std::filesystem::path> copiedDependencyFiles;
+    if (!sameFile &&
+        (*category == Category::Model || *category == Category::Animation) &&
+        ToLower(absoluteSource.extension().string()) == ".gltf" &&
+        !CopyGltfExternalDependencies(absoluteSource, destination, copiedDependencyFiles, error))
+    {
+        if (!sameFile)
+        {
+            std::filesystem::remove(destination, ec);
+            for (const auto& dependency : copiedDependencyFiles)
+                std::filesystem::remove(dependency, ec);
+        }
+        return false;
+    }
+    if (*category == Category::Model &&
+        ToLower(absoluteSource.extension().string()) == ".fbx" &&
+        !ImportFbxSidecars(destination, m_libraryRoot, error))
+    {
+        if (!sameFile)
+            std::filesystem::remove(destination, ec);
+        return false;
+    }
+
+    Entry entry;
+    entry.id = MakeUniqueId(*category, destination);
+    entry.category = *category;
+    entry.displayName = destination.stem().string();
+    entry.subpath = NormalizeSubpath(std::filesystem::relative(destination.parent_path(), m_libraryRoot, ec).generic_string());
+    if (ec)
+        entry.subpath.clear();
+    entry.filename = destination.filename().generic_string();
+    entry.originalPath = GenericPath(destination);
+    entry.importedAt = TimestampUtc();
+    entry.thumbnail = *category == Category::Texture ? "" :
+        (*category == Category::Model ? "model_icon" :
+            (*category == Category::Animation ? "animation_icon" :
+                (*category == Category::Scene ? "scene_icon" : "material_icon")));
+    if (*category == Category::Texture)
+    {
+        std::string thumbnailError;
+        PopulateTextureMetadata(entry, true, &thumbnailError);
+    }
+    else if (*category == Category::Material)
+    {
+        entry.tags = {"material"};
+    }
+
+    const std::string destinationCanonical = CanonicalPathString(destination);
+    m_entries.erase(std::remove_if(m_entries.begin(), m_entries.end(), [&](const Entry& existing) {
+        return CanonicalPathString(AbsolutePath(existing)) == destinationCanonical;
+    }), m_entries.end());
+    m_entries.push_back(entry);
+
+    AssetDatabase::Instance().runtimeAdd(destination);
+    for (const auto& dependency : copiedDependencyFiles)
+        AssetDatabase::Instance().runtimeAdd(dependency);
+
+    if (!SaveManifest(error))
+    {
+        if (!sameFile)
+        {
+            std::filesystem::remove(destination, ec);
+            for (const auto& dependency : copiedDependencyFiles)
+                std::filesystem::remove(dependency, ec);
+        }
         m_entries.pop_back();
         return false;
     }
@@ -3558,6 +3720,21 @@ bool AssetLibrary::Refresh(std::string& error)
 
 std::filesystem::path AssetLibrary::AbsolutePath(const Entry& entry) const
 {
+    if (!entry.originalPath.empty())
+    {
+        std::error_code originalEc;
+        std::error_code rootEc;
+        const std::filesystem::path original = std::filesystem::absolute(std::filesystem::path(entry.originalPath), originalEc);
+        const std::filesystem::path root = std::filesystem::weakly_canonical(m_libraryRoot, rootEc);
+        const std::filesystem::path canonicalOriginal = std::filesystem::weakly_canonical(original, originalEc);
+        if (!originalEc && !rootEc)
+        {
+            const std::string originalText = ToLower(canonicalOriginal.generic_string());
+            const std::string rootText = ToLower(root.generic_string());
+            if (originalText == rootText || originalText.rfind(rootText + "/", 0) == 0)
+                return canonicalOriginal;
+        }
+    }
     return CategoryDirectory(entry.category) / NormalizeSubpath(entry.subpath) / entry.filename;
 }
 

@@ -24,7 +24,6 @@ struct Vec3
 enum class TreeType : std::uint8_t { Deciduous, Evergreen };
 enum class BarkType : std::uint8_t { Oak, Birch, Pine, Willow, Ash };
 enum class LeafType : std::uint8_t { Oak, Ash, Pine, Willow, Birch };
-enum class LeafBillboard : std::uint8_t { Single, Double };
 
 struct TreeOptions
 {
@@ -61,7 +60,9 @@ struct TreeOptions
     struct Leaves
     {
         LeafType type = LeafType::Oak;
-        LeafBillboard billboard = LeafBillboard::Double;
+        int cardsPerCluster = 3;
+        int atlasGridX = 2;
+        int atlasGridY = 2;
         float angle = 30.0f;
         int count = 5;
         float start = 0.5f;

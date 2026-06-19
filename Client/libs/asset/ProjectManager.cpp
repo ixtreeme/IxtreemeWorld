@@ -1,5 +1,6 @@
 #include "ProjectManager.h"
 
+#include "Common.h"
 #include "Debug.h"
 
 #include <algorithm>
@@ -14,75 +15,9 @@
 
 namespace
 {
-std::string EscapeJson(const std::string& value)
-{
-    std::string out;
-    out.reserve(value.size() + 8);
-    for (char c : value)
-    {
-        switch (c)
-        {
-        case '\\': out += "\\\\"; break;
-        case '"': out += "\\\""; break;
-        case '\n': out += "\\n"; break;
-        case '\r': out += "\\r"; break;
-        case '\t': out += "\\t"; break;
-        default: out += c; break;
-        }
-    }
-    return out;
-}
-
-std::string TimestampUtc()
-{
-    const auto now = std::chrono::system_clock::now();
-    const std::time_t time = std::chrono::system_clock::to_time_t(now);
-    std::tm tm{};
-#if defined(_WIN32)
-    gmtime_s(&tm, &time);
-#else
-    gmtime_r(&time, &tm);
-#endif
-    std::ostringstream out;
-    out << std::put_time(&tm, "%Y-%m-%dT%H:%M:%SZ");
-    return out.str();
-}
-
-std::string JsonStringValue(const std::string& object, const std::string& key)
-{
-    const std::string needle = "\"" + key + "\"";
-    const size_t keyPos = object.find(needle);
-    if (keyPos == std::string::npos)
-        return {};
-    const size_t colon = object.find(':', keyPos + needle.size());
-    if (colon == std::string::npos)
-        return {};
-    const size_t firstQuote = object.find('"', colon + 1);
-    if (firstQuote == std::string::npos)
-        return {};
-
-    std::string out;
-    bool escaping = false;
-    for (size_t i = firstQuote + 1; i < object.size(); ++i)
-    {
-        const char c = object[i];
-        if (escaping)
-        {
-            out += c;
-            escaping = false;
-            continue;
-        }
-        if (c == '\\')
-        {
-            escaping = true;
-            continue;
-        }
-        if (c == '"')
-            return out;
-        out += c;
-    }
-    return {};
-}
+using ixtreeme::common::EscapeJson;
+using ixtreeme::common::JsonStringValue;
+using ixtreeme::common::TimestampUtc;
 
 bool JsonArrayBody(const std::string& text, const std::string& key, std::string& out)
 {

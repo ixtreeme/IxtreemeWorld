@@ -100,12 +100,14 @@ void TransitionImage(VkCommandBuffer cmd,
 }
 }
 
-bool OffscreenSceneRenderer::Create(VulkanDevice& device, client::asset::IAssetReader& assets)
+bool OffscreenSceneRenderer::Create(VulkanDevice& device, client::asset::IAssetReader& assets, VkExtent2D requestedExtent)
 {
     Destroy();
     m_device = device.GetDevice();
     m_assets = &assets;
-    m_extent = device.GetSwapchainExtent();
+    m_extent = requestedExtent.width > 0 && requestedExtent.height > 0
+        ? requestedExtent
+        : device.GetSwapchainExtent();
     m_colorFormat = device.GetSwapchainFormat();
     m_depthFormat = device.GetDepthStencilFormat();
 
@@ -135,12 +137,12 @@ bool OffscreenSceneRenderer::Create(VulkanDevice& device, client::asset::IAssetR
     return m_ready;
 }
 
-bool OffscreenSceneRenderer::Recreate(VulkanDevice& device)
+bool OffscreenSceneRenderer::Recreate(VulkanDevice& device, VkExtent2D requestedExtent)
 {
     if (!m_assets)
         return false;
     device.WaitIdle();
-    return Create(device, *m_assets);
+    return Create(device, *m_assets, requestedExtent);
 }
 
 void OffscreenSceneRenderer::BeginMainPass(VulkanDevice& device, bool clear)

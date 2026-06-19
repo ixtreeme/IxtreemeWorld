@@ -4,7 +4,9 @@
 
 #include <algorithm>
 #include <array>
+#include <cmath>
 #include <cstdint>
+#include <cstring>
 #include <filesystem>
 #include <fstream>
 #include <string>
@@ -82,10 +84,115 @@ void AppendChunk(std::vector<std::uint8_t>& png, const char type[4], const std::
     AppendU32(png, crc);
 }
 
+std::uint8_t MixByte(std::uint8_t a, std::uint8_t b, float t)
+{
+    t = std::clamp(t, 0.0f, 1.0f);
+    return static_cast<std::uint8_t>(static_cast<float>(a) * (1.0f - t) + static_cast<float>(b) * t + 0.5f);
+}
+
+float SmoothStep(float edge0, float edge1, float x)
+{
+    const float t = std::clamp((x - edge0) / std::max(0.0001f, edge1 - edge0), 0.0f, 1.0f);
+    return t * t * (3.0f - 2.0f * t);
+}
+
+float LeafSilhouette(const char* label, int variant, float x, float y)
+{
+    const float bend = 0.08f * std::sin((static_cast<float>(variant) + 1.0f) * 1.7f);
+    x += bend * y * y;
+    const float absY = std::fabs(y);
+    const float vein = std::fabs(x);
+
+    float width = 0.0f;
+    if (std::strcmp(label, "Pine") == 0)
+    {
+        const float centerNeedle = std::max(0.0f, 1.0f - std::fabs(x) / 0.07f) * std::max(0.0f, 1.0f - absY / 0.88f);
+        const float sideNeedleA = std::max(0.0f, 1.0f - std::fabs(x - 0.16f * y) / 0.055f) * std::max(0.0f, 1.0f - absY / 0.78f);
+        const float sideNeedleB = std::max(0.0f, 1.0f - std::fabs(x + 0.15f * y) / 0.055f) * std::max(0.0f, 1.0f - absY / 0.78f);
+        return std::max({centerNeedle, sideNeedleA, sideNeedleB});
+    }
+    if (std::strcmp(label, "Willow") == 0)
+    {
+        width = 0.12f + 0.11f * (1.0f - absY);
+        const float taper = 1.0f - SmoothStep(0.64f, 0.95f, absY);
+        return (1.0f - SmoothStep(width * taper, width * taper + 0.04f, vein)) * taper;
+    }
+    if (std::strcmp(label, "Oak") == 0)
+    {
+        width = 0.22f + 0.33f * (1.0f - y * y);
+        width += 0.08f * std::sin((y * 18.0f) + static_cast<float>(variant));
+        const float body = (1.0f - SmoothStep(width, width + 0.045f, vein)) * (1.0f - SmoothStep(0.83f, 0.99f, absY));
+        const float stemCut = SmoothStep(-0.96f, -0.74f, y);
+        return body * stemCut;
+    }
+    if (std::strcmp(label, "Birch") == 0)
+    {
+        width = 0.16f + 0.37f * (1.0f - std::pow(absY, 1.45f));
+        width *= (y > 0.0f) ? (1.0f - 0.25f * y) : (1.0f + 0.12f * y);
+        return (1.0f - SmoothStep(width, width + 0.04f, vein)) * (1.0f - SmoothStep(0.82f, 0.98f, absY));
+    }
+
+    width = 0.14f + 0.32f * (1.0f - absY);
+    width *= 1.0f + 0.08f * std::sin(y * 22.0f + static_cast<float>(variant));
+    return (1.0f - SmoothStep(width, width + 0.04f, vein)) * (1.0f - SmoothStep(0.86f, 0.99f, absY));
+}
+
+void LeafPixel(const PaletteSpec& spec, std::uint32_t x, std::uint32_t y, std::uint8_t& r, std::uint8_t& g, std::uint8_t& b, std::uint8_t& a)
+{
+    constexpr std::uint32_t cellSize = 256u;
+    const int cellX = static_cast<int>(x / cellSize);
+    const int cellY = static_cast<int>(y / cellSize);
+    const int variant = cellY * 2 + cellX;
+    const float localX = ((static_cast<float>(x % cellSize) + 0.5f) / static_cast<float>(cellSize)) * 2.0f - 1.0f;
+    const float localY = ((static_cast<float>(y % cellSize) + 0.5f) / static_cast<float>(cellSize)) * 2.0f - 1.0f;
+
+    const float rotation = (static_cast<float>(variant) - 1.5f) * 0.18f;
+    const float cr = std::cos(rotation);
+    const float sr = std::sin(rotation);
+    const float rx = localX * cr - localY * sr;
+    const float ry = localX * sr + localY * cr;
+
+    const float mask = LeafSilhouette(spec.label, variant, rx, ry);
+    if (mask <= 0.01f)
+    {
+        r = g = b = a = 0u;
+        return;
+    }
+
+    const float vein = std::max(0.0f, 1.0f - std::fabs(rx) / 0.045f) * std::max(0.0f, 1.0f - std::fabs(ry) / 0.86f);
+    const float edge = 1.0f - SmoothStep(0.04f, 0.16f, mask);
+    const std::uint32_t n = (x * 37u + y * 53u + static_cast<std::uint32_t>(variant * 79)) & 0xffu;
+    const float noise = static_cast<float>(n) / 255.0f;
+    const float accent = std::clamp(edge * 0.65f + vein * 0.45f + noise * 0.12f, 0.0f, 1.0f);
+
+    r = MixByte(spec.baseColor[0], spec.accentColor[0], accent);
+    g = MixByte(spec.baseColor[1], spec.accentColor[1], accent);
+    b = MixByte(spec.baseColor[2], spec.accentColor[2], accent);
+    a = static_cast<std::uint8_t>(std::clamp(mask, 0.0f, 1.0f) * 235.0f + 0.5f);
+}
+
+std::pair<std::uint32_t, std::uint32_t> PngDimensions(const std::filesystem::path& path)
+{
+    std::ifstream in(path, std::ios::binary);
+    if (!in)
+        return {};
+    std::uint8_t header[24]{};
+    in.read(reinterpret_cast<char*>(header), sizeof(header));
+    if (!in || header[0] != 0x89u || header[1] != 'P' || header[2] != 'N' || header[3] != 'G')
+        return {};
+    const auto readU32 = [](const std::uint8_t* p) {
+        return (static_cast<std::uint32_t>(p[0]) << 24u) |
+            (static_cast<std::uint32_t>(p[1]) << 16u) |
+            (static_cast<std::uint32_t>(p[2]) << 8u) |
+            static_cast<std::uint32_t>(p[3]);
+    };
+    return {readU32(header + 16), readU32(header + 20)};
+}
+
 bool WriteFallbackPng(const std::filesystem::path& path, const PaletteSpec& spec, bool leaf)
 {
-    constexpr std::uint32_t width = 256u;
-    constexpr std::uint32_t height = 256u;
+    const std::uint32_t width = leaf ? 512u : 256u;
+    const std::uint32_t height = leaf ? 512u : 256u;
     std::vector<std::uint8_t> raw;
     raw.reserve((width * 4u + 1u) * height);
     for (std::uint32_t y = 0; y < height; ++y)
@@ -93,17 +200,26 @@ bool WriteFallbackPng(const std::filesystem::path& path, const PaletteSpec& spec
         raw.push_back(0u);
         for (std::uint32_t x = 0; x < width; ++x)
         {
+            if (leaf)
+            {
+                std::uint8_t r = 0, g = 0, b = 0, a = 0;
+                LeafPixel(spec, x, y, r, g, b, a);
+                raw.push_back(r);
+                raw.push_back(g);
+                raw.push_back(b);
+                raw.push_back(a);
+                continue;
+            }
+
             const std::uint32_t n = (x * 37u + y * 53u + ((x ^ y) * 11u)) & 0xffu;
-            const bool stripe = leaf
-                ? (((x + y / 2u) % 47u) < 9u)
-                : (((x / 7u + y * 3u) % 23u) < 4u);
+            const bool stripe = (((x / 7u + y * 3u) % 23u) < 4u);
             const auto& a = stripe ? spec.accentColor : spec.baseColor;
             const auto& b = stripe ? spec.baseColor : spec.accentColor;
-            const std::uint32_t mix = leaf ? (n % 42u) : (n % 58u);
+            const std::uint32_t mix = n % 58u;
             raw.push_back(static_cast<std::uint8_t>((a[0] * (255u - mix) + b[0] * mix) / 255u));
             raw.push_back(static_cast<std::uint8_t>((a[1] * (255u - mix) + b[1] * mix) / 255u));
             raw.push_back(static_cast<std::uint8_t>((a[2] * (255u - mix) + b[2] * mix) / 255u));
-            raw.push_back(leaf ? static_cast<std::uint8_t>(stripe ? 205u : 240u) : 255u);
+            raw.push_back(255u);
         }
     }
 
@@ -154,10 +270,17 @@ void EnsureTextureFile(const std::filesystem::path& path, const PaletteSpec& spe
 {
     std::error_code ec;
     if (std::filesystem::exists(path, ec))
-        return;
+    {
+        if (!leaf)
+            return;
+        const auto [width, height] = PngDimensions(path);
+        if (width == 512u && height == 512u)
+            return;
+    }
     if (WriteFallbackPng(path, spec, leaf))
     {
-        Tracenf("[TREE-3] generated procedural fallback for %s",
+        Tracenf("[TREE-3] generated procedural %s for %s",
+            leaf ? "leaf atlas" : "fallback",
             std::filesystem::relative(path, path.parent_path().parent_path().parent_path(), ec).generic_string().c_str());
     }
     else
@@ -233,5 +356,6 @@ void TreeTexturePalette::Load(const std::filesystem::path& internalRoot)
         leaves_[2].guid.toString().c_str(),
         leaves_[3].guid.toString().c_str(),
         leaves_[4].guid.toString().c_str());
+    Tracenf("[TREE-LEAF-FORM-1] atlas_grid=2x2 cardsPerCluster_default=3");
 }
 }

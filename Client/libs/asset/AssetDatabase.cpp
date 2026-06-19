@@ -1,5 +1,6 @@
 #include "AssetDatabase.h"
 
+#include "Common.h"
 #include "Debug.h"
 
 #include <algorithm>
@@ -13,15 +14,14 @@
 #include <sstream>
 #include <system_error>
 #include <unordered_set>
+#include <utility>
 
 namespace
 {
-std::string ToLowerAscii(std::string value)
-{
-    for (char& ch : value)
-        ch = static_cast<char>(std::tolower(static_cast<unsigned char>(ch)));
-    return value;
-}
+using ixtreeme::common::EscapeJson;
+using ixtreeme::common::JsonStringValue;
+using ixtreeme::common::TimestampUtc;
+using ixtreeme::common::ToLowerAscii;
 
 int HexValue(char c)
 {
@@ -32,76 +32,6 @@ int HexValue(char c)
     if (c >= 'A' && c <= 'F')
         return 10 + c - 'A';
     return -1;
-}
-
-std::string EscapeJson(const std::string& value)
-{
-    std::string out;
-    out.reserve(value.size() + 8);
-    for (char c : value)
-    {
-        switch (c)
-        {
-        case '\\': out += "\\\\"; break;
-        case '"': out += "\\\""; break;
-        case '\n': out += "\\n"; break;
-        case '\r': out += "\\r"; break;
-        case '\t': out += "\\t"; break;
-        default: out += c; break;
-        }
-    }
-    return out;
-}
-
-std::string TimestampUtc()
-{
-    const auto now = std::chrono::system_clock::now();
-    const std::time_t time = std::chrono::system_clock::to_time_t(now);
-    std::tm tm{};
-#if defined(_WIN32)
-    gmtime_s(&tm, &time);
-#else
-    gmtime_r(&time, &tm);
-#endif
-    std::ostringstream out;
-    out << std::put_time(&tm, "%Y-%m-%dT%H:%M:%SZ");
-    return out.str();
-}
-
-std::string JsonStringValue(const std::string& object, const std::string& key)
-{
-    const std::string needle = "\"" + key + "\"";
-    const size_t keyPos = object.find(needle);
-    if (keyPos == std::string::npos)
-        return {};
-    const size_t colon = object.find(':', keyPos + needle.size());
-    if (colon == std::string::npos)
-        return {};
-    const size_t firstQuote = object.find('"', colon + 1);
-    if (firstQuote == std::string::npos)
-        return {};
-
-    std::string out;
-    bool escaping = false;
-    for (size_t i = firstQuote + 1; i < object.size(); ++i)
-    {
-        const char c = object[i];
-        if (escaping)
-        {
-            out += c;
-            escaping = false;
-            continue;
-        }
-        if (c == '\\')
-        {
-            escaping = true;
-            continue;
-        }
-        if (c == '"')
-            return out;
-        out += c;
-    }
-    return {};
 }
 
 std::optional<int> JsonIntValue(const std::string& object, const std::string& key)
@@ -184,6 +114,8 @@ std::optional<AssetType> ParseAssetType(const std::string& value)
         return AssetType::Texture;
     if (value == "Material")
         return AssetType::Material;
+    if (value == "Animation")
+        return AssetType::Animation;
     if (value == "Scene")
         return AssetType::Scene;
     if (value == "Project")
@@ -280,6 +212,149 @@ std::string WithDefaultMaterialsField(std::string text, const std::vector<Guid>&
     }
     return text;
 }
+
+std::string RemoveJsonField(std::string text, const std::string& quotedFieldName)
+{
+    const size_t fieldPos = text.find(quotedFieldName);
+    if (fieldPos == std::string::npos)
+        return text;
+
+    const size_t colon = text.find(':', fieldPos + quotedFieldName.size());
+    if (colon == std::string::npos)
+        return text;
+
+    const size_t valueBegin = text.find_first_not_of(" \t\r\n", colon + 1);
+    if (valueBegin == std::string::npos)
+        return text;
+
+    size_t valueEnd = valueBegin;
+    const char opener = text[valueBegin];
+    if (opener == '{' || opener == '[')
+    {
+        const char closer = opener == '{' ? '}' : ']';
+        int depth = 0;
+        bool inString = false;
+        bool escaping = false;
+        for (size_t i = valueBegin; i < text.size(); ++i)
+        {
+            const char c = text[i];
+            if (inString)
+            {
+                if (escaping) escaping = false;
+                else if (c == '\\') escaping = true;
+                else if (c == '"') inString = false;
+                continue;
+            }
+            if (c == '"')
+                inString = true;
+            else if (c == opener)
+                ++depth;
+            else if (c == closer && --depth == 0)
+            {
+                valueEnd = i + 1;
+                break;
+            }
+        }
+    }
+    else if (opener == '"')
+    {
+        bool escaping = false;
+        for (size_t i = valueBegin + 1; i < text.size(); ++i)
+        {
+            const char c = text[i];
+            if (escaping)
+            {
+                escaping = false;
+                continue;
+            }
+            if (c == '\\')
+            {
+                escaping = true;
+                continue;
+            }
+            if (c == '"')
+            {
+                valueEnd = i + 1;
+                break;
+            }
+        }
+    }
+    else
+    {
+        const size_t comma = text.find(',', valueBegin);
+        const size_t newline = text.find('\n', valueBegin);
+        valueEnd = std::min(comma == std::string::npos ? text.size() : comma,
+            newline == std::string::npos ? text.size() : newline);
+    }
+
+    size_t eraseBegin = fieldPos;
+    while (eraseBegin > 0 && (text[eraseBegin - 1] == ' ' || text[eraseBegin - 1] == '\t'))
+        --eraseBegin;
+    if (eraseBegin > 0 && text[eraseBegin - 1] == '\n')
+        --eraseBegin;
+
+    size_t eraseEnd = valueEnd;
+    while (eraseEnd < text.size() && (text[eraseEnd] == ' ' || text[eraseEnd] == '\t'))
+        ++eraseEnd;
+    if (eraseEnd < text.size() && text[eraseEnd] == ',')
+        ++eraseEnd;
+    if (eraseEnd < text.size() && text[eraseEnd] == '\r')
+        ++eraseEnd;
+    if (eraseEnd < text.size() && text[eraseEnd] == '\n')
+        ++eraseEnd;
+
+    text.erase(eraseBegin, eraseEnd - eraseBegin);
+    return text;
+}
+
+std::string InsertJsonFieldBeforeImportedAt(std::string text, const std::string& field)
+{
+    const size_t importedAt = text.find("\"importedAt\"");
+    if (importedAt != std::string::npos)
+    {
+        const size_t lineBegin = text.rfind('\n', importedAt);
+        const size_t insertPos = lineBegin == std::string::npos ? importedAt : lineBegin + 1;
+        text.insert(insertPos, field + ",\n");
+        return text;
+    }
+
+    const size_t closing = text.find_last_of('}');
+    if (closing != std::string::npos)
+    {
+        size_t insertPos = closing;
+        while (insertPos > 0 && (text[insertPos - 1] == '\n' || text[insertPos - 1] == '\r' ||
+                                text[insertPos - 1] == ' ' || text[insertPos - 1] == '\t'))
+        {
+            --insertPos;
+        }
+        if (insertPos > 0 && text[insertPos - 1] != '{')
+            text.insert(insertPos, ",\n" + field);
+        else
+            text.insert(insertPos, "\n" + field + "\n");
+    }
+    return text;
+}
+
+std::string WithSkeletalAssetField(std::string text,
+                                   const Guid& skeletonGuid,
+                                   const std::vector<Guid>& animationGuids)
+{
+    text = RemoveJsonField(std::move(text), "\"skeletalAsset\"");
+
+    std::ostringstream field;
+    field << "  \"skeletalAsset\": {\n";
+    field << "    \"skeletonGuid\": \"" << skeletonGuid.toString() << "\",\n";
+    field << "    \"animationGuids\": [";
+    for (size_t i = 0; i < animationGuids.size(); ++i)
+    {
+        if (i)
+            field << ", ";
+        field << "\"" << animationGuids[i].toString() << "\"";
+    }
+    field << "]\n";
+    field << "  }";
+    return InsertJsonFieldBeforeImportedAt(std::move(text), field.str());
+}
 }
 
 std::string Guid::toString() const
@@ -357,13 +432,15 @@ Guid generateGuidV4()
 AssetType detectAssetType(const std::filesystem::path& filePath)
 {
     const std::string ext = ToLowerAscii(filePath.extension().string());
-    if (ext == ".gltf" || ext == ".glb" || ext == ".fbx")
+    if (ext == ".gltf" || ext == ".glb" || ext == ".fbx" || ext == ".obj")
         return AssetType::Model;
     if (ext == ".png" || ext == ".jpg" || ext == ".jpeg" || ext == ".tga" ||
-        ext == ".dds" || ext == ".ktx" || ext == ".ktx2" || ext == ".hdr")
+        ext == ".bmp" || ext == ".dds" || ext == ".ktx" || ext == ".ktx2" || ext == ".hdr")
         return AssetType::Texture;
     if (ext == ".material")
         return AssetType::Material;
+    if (ext == ".anim" || ext == ".ozz")
+        return AssetType::Animation;
     if (ext == ".scene")
         return AssetType::Scene;
     if (ext == ".ixproj")
@@ -378,6 +455,7 @@ const char* AssetTypeName(AssetType type)
     case AssetType::Model: return "Model";
     case AssetType::Texture: return "Texture";
     case AssetType::Material: return "Material";
+    case AssetType::Animation: return "Animation";
     case AssetType::Scene: return "Scene";
     case AssetType::Project: return "Project";
     default: return "Unknown";
@@ -774,6 +852,51 @@ bool AssetDatabase::writeDefaultMaterials(const std::filesystem::path& modelPath
         text = json.str();
     }
     text = WithDefaultMaterialsField(text, materials);
+
+    std::ofstream file(metaPath, std::ios::binary | std::ios::trunc);
+    if (!file)
+    {
+        TraceError("[ASSET-DB] error path=%s reason=meta_write_open_failed regenerating=no",
+            displayPath(metaPath).c_str());
+        return false;
+    }
+    file << text;
+    return true;
+}
+
+bool AssetDatabase::writeSkeletalAsset(const std::filesystem::path& modelPath,
+                                       const Guid& skeletonGuid,
+                                       const std::vector<Guid>& animationGuids) const
+{
+    const std::filesystem::path assetPath = canonicalPath(modelPath);
+    if (detectAssetType(assetPath) != AssetType::Model)
+        return false;
+
+    Guid modelGuid{};
+    if (const std::optional<Guid> existing = resolvePath(assetPath))
+        modelGuid = *existing;
+    else
+        modelGuid = const_cast<AssetDatabase*>(this)->getOrCreateGuid(assetPath);
+
+    const std::filesystem::path metaPath = metaPathFor(assetPath);
+    std::string text;
+    {
+        std::ifstream file(metaPath, std::ios::binary);
+        if (file)
+            text.assign(std::istreambuf_iterator<char>(file), std::istreambuf_iterator<char>());
+    }
+    if (text.empty())
+    {
+        std::ostringstream json;
+        json << "{\n"
+             << "  \"guid\": \"" << modelGuid.toString() << "\",\n"
+             << "  \"version\": 1,\n"
+             << "  \"assetType\": \"" << AssetTypeName(AssetType::Model) << "\",\n"
+             << "  \"importedAt\": \"" << EscapeJson(TimestampUtc()) << "\"\n"
+             << "}\n";
+        text = json.str();
+    }
+    text = WithSkeletalAssetField(text, skeletonGuid, animationGuids);
 
     std::ofstream file(metaPath, std::ios::binary | std::ios::trunc);
     if (!file)

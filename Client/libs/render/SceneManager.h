@@ -42,6 +42,7 @@ public:
     void SetCurrentSceneSnapshot(const SceneData& scene);
     bool ConsumePendingScene(SceneData& outScene);
     void SetWindowTitleCallback(std::function<void(const std::string&)> callback);
+    void SetWindowTitleSuffix(std::string suffix);
     void SetSceneName(const std::string& name);
 
     const std::string& GetCurrentScenePath() const { return m_currentScenePath; }
@@ -71,4 +72,5 @@ private:
     bool m_isDirty = false;
     std::vector<std::string> m_recentScenes;
     std::function<void(const std::string&)> m_windowTitleCallback;
+    std::string m_windowTitleSuffix;
 };

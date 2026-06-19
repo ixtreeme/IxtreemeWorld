@@ -4,7 +4,7 @@ add_executable(IwSelfTest
 
 target_link_libraries(IwSelfTest
     PRIVATE
-        client_render
+        IXEngineRender
 )
 
 target_compile_features(IwSelfTest PRIVATE cxx_std_20)
@@ -20,8 +20,8 @@ if(WIN32)
         WIN32_EXECUTABLE FALSE
     )
 
-    if(TARGET ClientShaders)
-        add_dependencies(IwSelfTest ClientShaders)
+    if(TARGET IXEngineShaders)
+        add_dependencies(IwSelfTest IXEngineShaders)
     endif()
 endif()
 

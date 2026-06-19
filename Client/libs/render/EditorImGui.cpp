@@ -1,8 +1,11 @@
 #include "EditorImGui.h"
 
 #include "AssetDatabase.h"
+#include "AssimpExporter.h"
 #include "AssetWatcher.h"
+#include "Common.h"
 #include "Debug.h"
+#include "MaterialAssetManager.h"
 #include "ProjectManager.h"
 #include "SceneManager.h"
 #include "VulkanDevice.h"
@@ -15,6 +18,7 @@
 #define VK_USE_PLATFORM_WIN32_KHR
 #include <imgui.h>
 #include <imgui_internal.h>
+#include <ImGuizmo.h>
 #include <imgui_impl_vulkan.h>
 #include <imgui_impl_win32.h>
 #include <stb_image.h>
@@ -46,6 +50,54 @@ constexpr const char* kAssetPayloadType = "ASSET_ID";
 constexpr const char* kAssetFolderPayloadType = "ASSET_FOLDER_PATH";
 constexpr const char* kEditorNoteComponentId = "editor.note";
 constexpr const char* kLodComponentId = "rendering.lod";
+constexpr double kProjectAutoSaveIntervalSeconds = 5.0 * 60.0;
+constexpr float kPi = 3.14159265358979323846f;
+constexpr float kGizmoPlaneScaleUnitsPerPixel = 0.01f;
+
+float Degrees(float radians)
+{
+    return radians * 180.0f / kPi;
+}
+
+float Radians(float degrees)
+{
+    return degrees * kPi / 180.0f;
+}
+
+float UnwrapDegreesNear(float value, float reference)
+{
+    while (value - reference > 180.0f)
+        value -= 360.0f;
+    while (value - reference < -180.0f)
+        value += 360.0f;
+    return value;
+}
+
+ImGuizmo::OPERATION ToImGuizmoOperation(MapEditorGizmoOperation operation)
+{
+    switch (operation)
+    {
+    case MapEditorGizmoOperation::Rotate:
+        return ImGuizmo::ROTATE;
+    case MapEditorGizmoOperation::Scale:
+        return ImGuizmo::SCALE;
+    case MapEditorGizmoOperation::Translate:
+    default:
+        return ImGuizmo::UNIVERSAL;
+    }
+}
+
+ImGuizmo::MODE ToImGuizmoMode(MapEditorGizmoOperation operation)
+{
+    return operation == MapEditorGizmoOperation::Rotate ? ImGuizmo::LOCAL : ImGuizmo::WORLD;
+}
+
+WorldMat4 ImGuizmoPerspective(float fovYRadians, float aspect, float zNear, float zFar)
+{
+    WorldMat4 projection = WorldPerspective(fovYRadians, aspect, zNear, zFar);
+    projection.m[5] = std::fabs(projection.m[5]);
+    return projection;
+}
 
 std::filesystem::path InternalAssetRootFor(const std::filesystem::path& engineRoot)
 {
@@ -117,9 +169,7 @@ uint32_t CountDrawCommands(const ImDrawData* drawData)
 
 std::string ToLowerAscii(std::string value)
 {
-    for (char& ch : value)
-        ch = static_cast<char>(std::tolower(static_cast<unsigned char>(ch)));
-    return value;
+    return ixtreeme::common::ToLowerAscii(std::move(value));
 }
 
 std::string ComparablePath(const std::filesystem::path& path)
@@ -320,50 +370,44 @@ std::string ShortAssetFilename(const AssetLibrary::Entry& entry)
     return name.substr(0, kVisibleCharacters) + "...";
 }
 
-std::optional<std::filesystem::path> PickAssetFileForImport(AssetLibrary::Category category)
+const char* ImportDetectedTypeName(const std::filesystem::path& path)
 {
-    const wchar_t* filter = L"All files (*.*)\0*.*\0\0";
-    const wchar_t* title = L"Import Asset";
-    switch (category)
-    {
-    case AssetLibrary::Category::Texture:
-        filter = L"Image Files (*.png;*.jpg;*.jpeg;*.tga;*.dds)\0*.png;*.jpg;*.jpeg;*.tga;*.dds\0All files (*.*)\0*.*\0\0";
-        title = L"Import Texture";
-        break;
-    case AssetLibrary::Category::Model:
-        filter = L"Model Files (*.glb;*.gltf;*.obj;*.fbx)\0*.glb;*.gltf;*.obj;*.fbx\0All files (*.*)\0*.*\0\0";
-        title = L"Import Model";
-        break;
-    case AssetLibrary::Category::Animation:
-        filter = L"Animation Files (*.ozz;*.glb;*.gltf)\0*.ozz;*.glb;*.gltf\0All files (*.*)\0*.*\0\0";
-        title = L"Import Animation";
-        break;
-    case AssetLibrary::Category::Material:
-        filter = L"Material Files (*.json)\0*.json\0All files (*.*)\0*.*\0\0";
-        title = L"Import Material";
-        break;
-    case AssetLibrary::Category::WaterMaterial:
-        filter = L"Water Materials (*.watermat;*.json)\0*.watermat;*.json\0All files (*.*)\0*.*\0\0";
-        title = L"Import Water Material";
-        break;
-    case AssetLibrary::Category::Scene:
-        filter = L"Scene Files (*.scene)\0*.scene\0All files (*.*)\0*.*\0\0";
-        title = L"Import Scene";
-        break;
-    }
+    const std::string ext = ToLowerAscii(path.extension().string());
+    if (ext == ".png" || ext == ".jpg" || ext == ".jpeg" || ext == ".tga" ||
+        ext == ".bmp" || ext == ".dds" || ext == ".ktx" || ext == ".ktx2")
+        return "Texture";
+    if (ext == ".glb" || ext == ".gltf" || ext == ".fbx" || ext == ".obj")
+        return "Model";
+    if (ext == ".material")
+        return "Material";
+    if (ext == ".anim" || ext == ".ozz")
+        return "Anim";
+    if (ext == ".scene")
+        return "Scene";
+    return "Unknown";
+}
 
-    std::array<wchar_t, 32768> file{};
-    OPENFILENAMEW ofn{};
-    ofn.lStructSize = sizeof(ofn);
-    ofn.hwndOwner = nullptr;
-    ofn.lpstrTitle = title;
-    ofn.lpstrFilter = filter;
-    ofn.lpstrFile = file.data();
-    ofn.nMaxFile = static_cast<DWORD>(file.size());
-    ofn.Flags = OFN_FILEMUSTEXIST | OFN_PATHMUSTEXIST | OFN_NOCHANGEDIR;
-    if (!GetOpenFileNameW(&ofn))
-        return std::nullopt;
-    return std::filesystem::path(file.data());
+std::filesystem::path DefaultExportDirectory()
+{
+    std::error_code ec;
+    return std::filesystem::current_path(ec);
+}
+
+std::filesystem::path DefaultFbxExportPath(const std::string& stem)
+{
+    std::string safeStem = stem.empty() ? "export" : stem;
+    for (char& ch : safeStem)
+    {
+        const unsigned char uch = static_cast<unsigned char>(ch);
+        if (!std::isalnum(uch) && ch != '_' && ch != '-')
+            ch = '_';
+    }
+    return DefaultExportDirectory() / (safeStem + ".fbx");
+}
+
+bool IsSupportedImportFile(const std::filesystem::path& path)
+{
+    return std::strcmp(ImportDetectedTypeName(path), "Unknown") != 0;
 }
 
 std::optional<std::filesystem::path> FindEditorFont(const char* filename)
@@ -878,6 +922,45 @@ void EditorImGui::SetSceneViewTexture(VkSampler sampler,
     }
 }
 
+void EditorImGui::SetSceneViewSelectionOutline(std::vector<std::array<float, 4>> segments)
+{
+    m_sceneViewSelectionOutline = std::move(segments);
+}
+
+void EditorImGui::SetSceneViewGizmo(HierarchyEntityType type,
+                                    std::uint32_t id,
+                                    const WorldCamera& camera,
+                                    const float* position,
+                                    const float* rotation,
+                                    const float* scale,
+                                    MapEditorGizmoOperation operation,
+                                    bool snapEnabled,
+                                    float snapValue)
+{
+    m_sceneGizmoVisible = type != HierarchyEntityType::None && id != 0 && position && rotation && scale;
+    m_sceneGizmoEntityType = type;
+    m_sceneGizmoEntityId = id;
+    m_sceneGizmoCamera = camera;
+    if (position)
+        std::copy(position, position + 3, m_sceneGizmoPosition);
+    if (rotation)
+        std::copy(rotation, rotation + 3, m_sceneGizmoRotation);
+    if (scale)
+        std::copy(scale, scale + 3, m_sceneGizmoScale);
+    m_sceneGizmoOperation = operation;
+    m_gizmoOperation = operation;
+    m_sceneGizmoSnapEnabled = snapEnabled;
+    m_sceneGizmoSnapValue = std::max(0.001f, snapValue);
+}
+
+void EditorImGui::ClearSceneViewGizmo()
+{
+    m_sceneGizmoVisible = false;
+    m_sceneGizmoInputActive = false;
+    m_sceneGizmoEntityType = HierarchyEntityType::None;
+    m_sceneGizmoEntityId = 0;
+}
+
 MapEditorCommands EditorImGui::ConsumeCommands()
 {
     MapEditorCommands commands = m_commands;
@@ -888,11 +971,35 @@ MapEditorCommands EditorImGui::ConsumeCommands()
         const bool exitPlayMode = commands.exitPlayMode;
         const bool pausePlayMode = commands.pausePlayMode;
         const bool resumePlayMode = commands.resumePlayMode;
+        const bool captureGpuFrame = commands.captureGpuFrame;
+        const bool dumpFrameProfile = commands.dumpFrameProfile;
+        const bool debugPerfTogglesChanged = commands.debugPerfTogglesChanged;
+        const bool disableShadowPass = commands.disableShadowPass;
+        const bool disableWaterReflectionPass = commands.disableWaterReflectionPass;
+        const bool disableAssetLibraryDiscovery = commands.disableAssetLibraryDiscovery;
+        const bool disableAssetWatcherPoll = commands.disableAssetWatcherPoll;
+        const bool disableHierarchyIteration = commands.disableHierarchyIteration;
+        const bool renderResolutionChanged = commands.renderResolutionChanged;
+        const bool renderResolutionUseNative = commands.renderResolutionUseNative;
+        const std::uint32_t renderResolutionWidth = commands.renderResolutionWidth;
+        const std::uint32_t renderResolutionHeight = commands.renderResolutionHeight;
         commands = {};
         commands.enterPlayMode = enterPlayMode;
         commands.exitPlayMode = exitPlayMode;
         commands.pausePlayMode = pausePlayMode;
         commands.resumePlayMode = resumePlayMode;
+        commands.captureGpuFrame = captureGpuFrame;
+        commands.dumpFrameProfile = dumpFrameProfile;
+        commands.debugPerfTogglesChanged = debugPerfTogglesChanged;
+        commands.disableShadowPass = disableShadowPass;
+        commands.disableWaterReflectionPass = disableWaterReflectionPass;
+        commands.disableAssetLibraryDiscovery = disableAssetLibraryDiscovery;
+        commands.disableAssetWatcherPoll = disableAssetWatcherPoll;
+        commands.disableHierarchyIteration = disableHierarchyIteration;
+        commands.renderResolutionChanged = renderResolutionChanged;
+        commands.renderResolutionUseNative = renderResolutionUseNative;
+        commands.renderResolutionWidth = renderResolutionWidth;
+        commands.renderResolutionHeight = renderResolutionHeight;
     }
     return commands;
 }
@@ -1884,58 +1991,82 @@ MapEditorPaletteSlot EditorImGui::BuildPaletteSlotFromAsset(std::uint32_t slotIn
     return slot;
 }
 
-void EditorImGui::ImportAssetWithDialog(AssetLibrary::Category category)
+void EditorImGui::OpenImportAssetDialog(const std::string& targetSubpath)
+{
+    m_assetImportTargetSubpath = AssetLibrary::NormalizeSubpath(targetSubpath);
+    m_assetImportPathBuffer[0] = '\0';
+    std::error_code ec;
+    if (m_assetImportBrowserPath.empty() || !std::filesystem::exists(m_assetImportBrowserPath, ec))
+        m_assetImportBrowserPath = std::filesystem::current_path(ec);
+    CopyToBuffer(m_assetImportBrowserPathBuffer, sizeof(m_assetImportBrowserPathBuffer), m_assetImportBrowserPath.string());
+    m_assetImportFilterBuffer[0] = '\0';
+    m_assetOpenImportPopup = true;
+}
+
+void EditorImGui::ImportAssetFromPath(const std::filesystem::path& sourcePath,
+                                      const std::string& targetSubpath,
+                                      const char* trigger)
 {
     if (!m_assetLibrary)
         return;
 
-    const auto path = PickAssetFileForImport(category);
-    if (!path)
-        return;
-
-    AssetLibrary::ImportOptions options{};
-    options.displayName = path->stem().string();
-    options.subpath = m_assetSubpath;
-    AssetLibrary::Entry entry{};
-    std::string error;
-    if (!m_assetLibrary->Import(category, *path, options, entry, error))
+    if (sourcePath.empty())
     {
-        m_assetStatus = "Import failed: " + error;
+        m_assetStatus = "Import skipped: no source file selected";
         return;
     }
 
-    m_selectedAssetId = entry.id;
-    m_assetFilter = category == AssetLibrary::Category::Texture ? AssetBrowserFilter::Texture :
-        category == AssetLibrary::Category::Model ? AssetBrowserFilter::Model :
-        category == AssetLibrary::Category::Animation ? AssetBrowserFilter::Animation :
-        category == AssetLibrary::Category::Material ? AssetBrowserFilter::Material :
-        AssetBrowserFilter::WaterMaterial;
+    const std::string normalizedTarget = AssetLibrary::NormalizeSubpath(targetSubpath);
+    const std::filesystem::path targetFolder = AssetBrowserPath(normalizedTarget);
+    const char* detectedType = ImportDetectedTypeName(sourcePath);
+    const std::filesystem::path expectedFinal = targetFolder / sourcePath.filename();
+    Tracenf("[IMPORT-DIAG] trigger=%s targetFolder=%s userSelected=%s finalPath=%s detectedType=%s",
+        trigger ? trigger : "unknown",
+        targetFolder.generic_string().c_str(),
+        sourcePath.generic_string().c_str(),
+        expectedFinal.generic_string().c_str(),
+        detectedType);
+
+    if (std::strcmp(detectedType, "Unknown") == 0)
+    {
+        m_assetStatus = "Import skipped: unsupported file type";
+        Tracenf("[IMPORT-DIAG] Unsupported file type: %s", sourcePath.extension().string().c_str());
+        return;
+    }
+
+    AssetLibrary::Entry entry{};
+    std::filesystem::path finalPath;
+    std::string error;
+    if (!m_assetLibrary->ImportFileToFolder(sourcePath, targetFolder, entry, finalPath, error))
+    {
+        m_assetStatus = "Import failed: " + error;
+        TraceError("[IMPORT-DIAG] copy failed: %s -> %s error=%s",
+            sourcePath.generic_string().c_str(),
+            expectedFinal.generic_string().c_str(),
+            error.c_str());
+        return;
+    }
+
     RefreshAssetLibrary();
-    m_assetStatus = "Imported: " + entry.displayName;
-    Tracenf("[EDITOR-IMGUI-5] Asset import: type=%s path=%s",
-        AssetLibrary::CategoryName(category),
-        path->generic_string().c_str());
+    SelectAssetBrowserFolder(normalizedTarget);
+    m_selectedAssetId = entry.id;
+    m_assetStatus = "Imported: " + entry.filename;
+}
+
+void EditorImGui::ImportExternalFiles(const std::vector<std::string>& paths, const char* trigger)
+{
+    const std::string target = AssetLibrary::NormalizeSubpath(m_assetSubpath);
+    for (const std::string& path : paths)
+        ImportAssetFromPath(std::filesystem::path(path), target, trigger ? trigger : "dragdrop");
 }
 
 void EditorImGui::CreatePbrMaterialAsset()
 {
     if (!m_assetLibrary)
         return;
-    AssetLibrary::ImportOptions options{};
-    options.displayName = "material";
-    options.subpath = m_assetSubpath;
-    options.tags = {"material"};
-    AssetLibrary::Entry entry{};
-    std::string error;
-    if (!m_assetLibrary->CreateMaterial(options, {}, entry, error))
-    {
-        m_assetStatus = "Material create failed: " + error;
-        return;
-    }
-    m_assetFilter = AssetBrowserFilter::Material;
-    m_selectedAssetId = entry.id;
-    m_assetStatus = "Material created: " + entry.displayName;
-    OpenPbrMaterialEditor(entry.id);
+    CopyToBuffer(m_createMaterialName, sizeof(m_createMaterialName), "material");
+    m_createMaterialShadingMode = -1;
+    m_assetOpenCreateMaterialPopup = true;
 }
 
 void EditorImGui::CreateWaterMaterialAsset()
@@ -2017,6 +2148,27 @@ bool EditorImGui::OpenPbrMaterialEditor(const std::string& materialId)
     m_pbrMaterialEditor.dirty = false;
     m_pbrMaterialEditor.materialId = entry->id;
     m_pbrMaterialEditor.draft = entry->material;
+    if (!entry->originalPath.empty() && ToLowerAscii(std::filesystem::path(entry->originalPath).extension().string()) == ".material")
+    {
+        const std::filesystem::path materialPath(entry->originalPath);
+        const Guid guid = AssetDatabase::Instance().getOrCreateGuid(materialPath);
+        if (MaterialAsset* material = MaterialAssetManager::Instance().getOrLoad(guid))
+        {
+            m_pbrMaterialEditor.draft.alphaMode =
+                material->alphaMode == MaterialAsset::AlphaMode::Mask ? "mask" :
+                (material->alphaMode == MaterialAsset::AlphaMode::Blend ? "blend" : "opaque");
+            m_pbrMaterialEditor.draft.alphaCutoff = material->alphaCutoff;
+            m_pbrMaterialEditor.draft.colorTint[0] = material->baseColor[0];
+            m_pbrMaterialEditor.draft.colorTint[1] = material->baseColor[1];
+            m_pbrMaterialEditor.draft.colorTint[2] = material->baseColor[2];
+            m_pbrMaterialEditor.draft.normalStrength = material->normalStrength;
+            m_pbrMaterialEditor.draft.aoStrength = material->aoStrength;
+            m_pbrMaterialEditor.draft.roughnessStrength = material->roughness;
+            m_pbrMaterialEditor.draft.metallicStrength = material->metallic;
+            m_pbrMaterialEditor.draft.shadingMode =
+                material->shadingMode == MaterialAsset::ShadingMode::Unlit ? "unlit" : "lit";
+        }
+    }
     std::snprintf(m_pbrMaterialEditor.name, sizeof(m_pbrMaterialEditor.name), "%s", entry->displayName.c_str());
     m_assetStatus = "Editing material: " + entry->displayName;
     Tracenf("[EDITOR-IMGUI-4] PBR Material Editor opened: material_id=%s name=%s",
@@ -2075,6 +2227,47 @@ bool EditorImGui::SaveWaterMaterialEditor()
         m_waterMaterialEditor.materialId = renamed.id;
     }
 
+    if (!current.originalPath.empty() && ToLowerAscii(std::filesystem::path(current.originalPath).extension().string()) == ".material")
+    {
+        const std::filesystem::path materialPath(current.originalPath);
+        const Guid guid = AssetDatabase::Instance().getOrCreateGuid(materialPath);
+        MaterialAsset* material = MaterialAssetManager::Instance().getOrLoad(guid);
+        if (!material)
+        {
+            m_assetStatus = "Material save failed: unable to load material asset";
+            return false;
+        }
+        material->name = requestedName;
+        material->baseColor[0] = m_pbrMaterialEditor.draft.colorTint[0];
+        material->baseColor[1] = m_pbrMaterialEditor.draft.colorTint[1];
+        material->baseColor[2] = m_pbrMaterialEditor.draft.colorTint[2];
+        material->metallic = m_pbrMaterialEditor.draft.metallicStrength;
+        material->roughness = m_pbrMaterialEditor.draft.roughnessStrength;
+        material->normalStrength = m_pbrMaterialEditor.draft.normalStrength;
+        material->aoStrength = m_pbrMaterialEditor.draft.aoStrength;
+        const std::string alphaMode = ToLowerAscii(m_pbrMaterialEditor.draft.alphaMode);
+        material->alphaMode = alphaMode == "mask" ? MaterialAsset::AlphaMode::Mask :
+            (alphaMode == "blend" ? MaterialAsset::AlphaMode::Blend : MaterialAsset::AlphaMode::Opaque);
+        material->alphaCutoff = std::clamp(m_pbrMaterialEditor.draft.alphaCutoff, 0.0f, 1.0f);
+        if (!MaterialAssetManager::Instance().save(*material))
+        {
+            m_assetStatus = "Material save failed: write failed";
+            return false;
+        }
+        m_pbrMaterialEditor.draft.alphaMode = alphaMode == "mask" || alphaMode == "blend" ? alphaMode : "opaque";
+        m_pbrMaterialEditor.draft.alphaCutoff = material->alphaCutoff;
+        m_pbrMaterialEditor.dirty = false;
+        m_selectedAssetId = current.id;
+        RefreshAssetLibrary();
+        m_assetStatus = "Material saved: " + current.displayName;
+        Tracenf("[EDITOR-IMGUI-4] Material saved: id=%s name=%s alphaMode=%s alphaCutoff=%.3f",
+            current.id.c_str(),
+            current.displayName.c_str(),
+            m_pbrMaterialEditor.draft.alphaMode.c_str(),
+            m_pbrMaterialEditor.draft.alphaCutoff);
+        return true;
+    }
+
     AssetLibrary::Entry updated{};
     std::string error;
     if (!m_assetLibrary->UpdateWaterMaterial(current.id, m_waterMaterialEditor.draft, updated, error))
@@ -2121,6 +2314,53 @@ bool EditorImGui::SavePbrMaterialEditor()
         }
         current = renamed;
         m_pbrMaterialEditor.materialId = renamed.id;
+    }
+
+    if (!current.originalPath.empty() && ToLowerAscii(std::filesystem::path(current.originalPath).extension().string()) == ".material")
+    {
+        const std::filesystem::path materialPath(current.originalPath);
+        const Guid guid = AssetDatabase::Instance().getOrCreateGuid(materialPath);
+        MaterialAsset* material = MaterialAssetManager::Instance().getOrLoad(guid);
+        if (!material)
+        {
+            m_assetStatus = "Material save failed: unable to load material asset";
+            return false;
+        }
+        material->name = requestedName;
+        material->baseColor[0] = m_pbrMaterialEditor.draft.colorTint[0];
+        material->baseColor[1] = m_pbrMaterialEditor.draft.colorTint[1];
+        material->baseColor[2] = m_pbrMaterialEditor.draft.colorTint[2];
+        material->metallic = m_pbrMaterialEditor.draft.metallicStrength;
+        material->roughness = m_pbrMaterialEditor.draft.roughnessStrength;
+        material->normalStrength = m_pbrMaterialEditor.draft.normalStrength;
+        material->aoStrength = m_pbrMaterialEditor.draft.aoStrength;
+        material->shadingMode =
+            ToLowerAscii(m_pbrMaterialEditor.draft.shadingMode) == "unlit"
+                ? MaterialAsset::ShadingMode::Unlit
+                : MaterialAsset::ShadingMode::Lit;
+        const std::string alphaMode = ToLowerAscii(m_pbrMaterialEditor.draft.alphaMode);
+        material->alphaMode = alphaMode == "mask" ? MaterialAsset::AlphaMode::Mask :
+            (alphaMode == "blend" ? MaterialAsset::AlphaMode::Blend : MaterialAsset::AlphaMode::Opaque);
+        material->alphaCutoff = std::clamp(m_pbrMaterialEditor.draft.alphaCutoff, 0.0f, 1.0f);
+        if (!MaterialAssetManager::Instance().save(*material))
+        {
+            m_assetStatus = "Material save failed: write failed";
+            return false;
+        }
+
+        m_pbrMaterialEditor.draft.shadingMode =
+            material->shadingMode == MaterialAsset::ShadingMode::Unlit ? "unlit" : "lit";
+        m_pbrMaterialEditor.draft.alphaMode = alphaMode == "mask" || alphaMode == "blend" ? alphaMode : "opaque";
+        m_pbrMaterialEditor.draft.alphaCutoff = material->alphaCutoff;
+        m_pbrMaterialEditor.dirty = false;
+        m_selectedAssetId = current.id;
+        RefreshAssetLibrary();
+        m_assetStatus = "Material saved: " + current.displayName;
+        Tracenf("[MATERIAL] saved path=%s shadingMode=%s alphaMode=%s",
+            materialPath.generic_string().c_str(),
+            m_pbrMaterialEditor.draft.shadingMode == "unlit" ? "Unlit" : "Lit",
+            m_pbrMaterialEditor.draft.alphaMode.c_str());
+        return true;
     }
 
     AssetLibrary::Entry updated{};
@@ -2261,7 +2501,7 @@ void EditorImGui::BeginFrame(bool editorModeActive)
         if (!QuietLogsForLodDiag() && beginSkippedLogs < 3)
         {
             ++beginSkippedLogs;
-            Tracenf("[FRAME] imgui_begin called = no, initialized=%d backend_ready=%d frame_active=%d editor_mode=%d",
+            TraceDiagf("[FRAME] imgui_begin called = no, initialized=%d backend_ready=%d frame_active=%d editor_mode=%d",
                 m_initialized ? 1 : 0,
                 m_vulkanBackendReady ? 1 : 0,
                 m_frameActive ? 1 : 0,
@@ -2279,4178 +2519,18 @@ void EditorImGui::BeginFrame(bool editorModeActive)
     if (!QuietLogsForLodDiag() && beginLogs < 3)
     {
         ++beginLogs;
-        Tracenf("[FRAME] imgui_begin called = yes, editor_mode=%d", editorModeActive ? 1 : 0);
+        TraceDiagf("[FRAME] imgui_begin called = yes, editor_mode=%d", editorModeActive ? 1 : 0);
     }
 }
 
-void EditorImGui::RenderDemoPanels()
-{
-    if (!m_editorModeActive)
-        return;
-
-    if (m_showDemoWindow)
-        ImGui::ShowDemoWindow(&m_showDemoWindow);
-}
-
-void EditorImGui::RenderDockSpace()
-{
-    const ImGuiViewport* viewport = ImGui::GetMainViewport();
-    ImGui::SetNextWindowPos(viewport->WorkPos);
-    ImGui::SetNextWindowSize(viewport->WorkSize);
-    ImGui::SetNextWindowViewport(viewport->ID);
-
-    ImGuiWindowFlags flags =
-        ImGuiWindowFlags_NoDocking |
-        ImGuiWindowFlags_NoTitleBar |
-        ImGuiWindowFlags_NoCollapse |
-        ImGuiWindowFlags_NoResize |
-        ImGuiWindowFlags_NoMove |
-        ImGuiWindowFlags_NoBringToFrontOnFocus |
-        ImGuiWindowFlags_NoNavFocus |
-        ImGuiWindowFlags_NoBackground |
-        ImGuiWindowFlags_NoInputs;
-
-    ImGui::PushStyleVar(ImGuiStyleVar_WindowRounding, 0.0f);
-    ImGui::PushStyleVar(ImGuiStyleVar_WindowBorderSize, 0.0f);
-    ImGui::PushStyleVar(ImGuiStyleVar_WindowPadding, ImVec2(0.0f, 0.0f));
-    ImGui::Begin("Editor DockSpace", nullptr, flags);
-    ImGui::PopStyleVar(3);
-
-    const ImGuiID dockspaceId = ImGui::GetID("EditorDockSpace");
-    ImGui::DockSpace(dockspaceId, ImVec2(0.0f, 0.0f), ImGuiDockNodeFlags_PassthruCentralNode);
-
-    if (m_applyDefaultDockLayout && !m_defaultDockLayoutBuilt)
-    {
-        m_defaultDockLayoutBuilt = true;
-        ImGui::DockBuilderRemoveNode(dockspaceId);
-        const ImGuiDockNodeFlags dockBuilderFlags = static_cast<ImGuiDockNodeFlags>(
-            static_cast<int>(ImGuiDockNodeFlags_DockSpace) |
-            static_cast<int>(ImGuiDockNodeFlags_PassthruCentralNode));
-        ImGui::DockBuilderAddNode(dockspaceId, dockBuilderFlags);
-        ImGui::DockBuilderSetNodeSize(dockspaceId, viewport->WorkSize);
-
-        ImGuiID mainId = dockspaceId;
-        ImGuiID leftId = 0;
-        ImGuiID rightId = 0;
-        ImGuiID bottomId = 0;
-        ImGuiID topId = 0;
-        ImGui::DockBuilderSplitNode(mainId, ImGuiDir_Up, 0.06f, &topId, &mainId);
-        ImGui::DockBuilderSplitNode(mainId, ImGuiDir_Left, 0.20f, &leftId, &mainId);
-        ImGui::DockBuilderSplitNode(mainId, ImGuiDir_Right, 0.25f, &rightId, &mainId);
-        ImGui::DockBuilderSplitNode(mainId, ImGuiDir_Down, 0.30f, &bottomId, &mainId);
-        ImGui::DockBuilderDockWindow("Editor Toolbar", topId);
-        ImGui::DockBuilderDockWindow(ICON_FA_LIST_TREE " Hierarchy", leftId);
-        ImGui::DockBuilderDockWindow("Tools", leftId);
-        ImGui::DockBuilderDockWindow("Inspector", rightId);
-        ImGui::DockBuilderDockWindow("Scene Settings", rightId);
-        ImGui::DockBuilderDockWindow(ICON_FA_GLOBE " World", rightId);
-        ImGui::DockBuilderDockWindow("Asset Browser", bottomId);
-        ImGui::DockBuilderDockWindow("Scene View", mainId);
-        ImGui::DockBuilderFinish(dockspaceId);
-        Tracen("[EDITOR-LAYOUT] Default Unity-style dock layout applied");
-    }
-    ImGui::End();
-}
-
-void EditorImGui::RenderSceneViewDropTarget()
-{
-    const ImGuiPayload* activePayload = ImGui::GetDragDropPayload();
-    const bool assetDragActive = activePayload && std::strcmp(activePayload->DataType, kAssetPayloadType) == 0;
-    m_viewportInputDiagnostics = {};
-    m_viewportInputDiagnostics.assetDragActive = assetDragActive;
-    if (!assetDragActive)
-    {
-        m_viewportDropTargetLogged = false;
-        m_loggedDragAssetId.clear();
-    }
-
-    ImGuiWindowFlags flags =
-        ImGuiWindowFlags_NoBackground |
-        ImGuiWindowFlags_NoScrollbar |
-        ImGuiWindowFlags_NoScrollWithMouse |
-        ImGuiWindowFlags_NoCollapse;
-
-    auto acceptModelDrop = [&]() {
-        if (ImGui::BeginDragDropTarget())
-        {
-            if (const ImGuiPayload* payload = ImGui::AcceptDragDropPayload(kAssetPayloadType))
-            {
-                if (payload->IsDelivery())
-                {
-                    const std::string assetId(static_cast<const char*>(payload->Data), payload->DataSize);
-                    const auto entry = m_assetLibrary ? m_assetLibrary->FindById(assetId) : std::optional<AssetLibrary::Entry>{};
-                    if (entry && entry->category == AssetLibrary::Category::Model)
-                    {
-                        const ImVec2 mouse = ImGui::GetMousePos();
-                        const ImGuiViewport* viewport = ImGui::GetMainViewport();
-                        const ImVec2 viewportPos = viewport ? viewport->Pos : ImVec2(0.0f, 0.0f);
-                        InputEvent dropEvent{};
-                        dropEvent.type = InputEvent::MouseUp;
-                        dropEvent.x = static_cast<int>(std::round(mouse.x - viewportPos.x));
-                        dropEvent.y = static_cast<int>(std::round(mouse.y - viewportPos.y));
-                        const InputEvent mappedDropEvent = MapInputToSceneView(dropEvent);
-                        m_commands.addMeshEntity = true;
-                        m_commands.meshAssetId = entry->id;
-                        m_commands.meshDropScreenPositionValid = true;
-                        m_commands.meshDropScreenPosition[0] = static_cast<float>(mappedDropEvent.x);
-                        m_commands.meshDropScreenPosition[1] = static_cast<float>(mappedDropEvent.y);
-                        m_assetStatus = "Mesh entity dropped: " + entry->displayName;
-                        Tracenf("[DND] payload accepted: %s", entry->id.c_str());
-                    }
-                }
-            }
-            ImGui::EndDragDropTarget();
-        }
-    };
-
-    if (!ImGui::Begin("Scene View", nullptr, flags))
-    {
-        ImGui::End();
-        return;
-    }
-
-    const ImVec2 sceneMin = ImGui::GetCursorScreenPos();
-    const ImVec2 avail = ImGui::GetContentRegionAvail();
-    const ImGuiViewport* mainViewport = ImGui::GetMainViewport();
-    const ImVec2 viewportPos = mainViewport ? mainViewport->Pos : ImVec2(0.0f, 0.0f);
-    ImVec2 imageMin = sceneMin;
-    ImVec2 imageSize = avail;
-    if (avail.x > 1.0f && avail.y > 1.0f &&
-        m_sceneViewExtent.width > 0 && m_sceneViewExtent.height > 0)
-    {
-        const float targetAspect = static_cast<float>(m_sceneViewExtent.width) /
-            static_cast<float>(m_sceneViewExtent.height);
-        const float availableAspect = avail.x / avail.y;
-        if (availableAspect > targetAspect)
-        {
-            imageSize.x = avail.y * targetAspect;
-            imageMin.x += (avail.x - imageSize.x) * 0.5f;
-        }
-        else
-        {
-            imageSize.y = avail.x / targetAspect;
-            imageMin.y += (avail.y - imageSize.y) * 0.5f;
-        }
-    }
-    if (avail.x > 1.0f && avail.y > 1.0f)
-    {
-        m_viewportInputDiagnostics.sceneViewRectValid = true;
-        m_viewportInputDiagnostics.sceneViewMin[0] = imageMin.x - viewportPos.x;
-        m_viewportInputDiagnostics.sceneViewMin[1] = imageMin.y - viewportPos.y;
-        m_viewportInputDiagnostics.sceneViewSize[0] = imageSize.x;
-        m_viewportInputDiagnostics.sceneViewSize[1] = imageSize.y;
-        m_viewportInputDiagnostics.sceneViewExtent[0] = m_sceneViewExtent.width;
-        m_viewportInputDiagnostics.sceneViewExtent[1] = m_sceneViewExtent.height;
-    }
-    const bool canDrawSceneView = m_sceneViewDescriptor && avail.x > 1.0f && avail.y > 1.0f;
-    bool sceneViewItemDrawn = false;
-    if (canDrawSceneView)
-    {
-        ImGui::SetCursorScreenPos(imageMin);
-        ImGui::Image(reinterpret_cast<ImTextureID>(m_sceneViewDescriptor), imageSize);
-        sceneViewItemDrawn = true;
-    }
-    else if (avail.x > 1.0f && avail.y > 1.0f)
-    {
-        ImGui::BeginDisabled();
-        ImGui::TextUnformatted("Scene render target unavailable");
-        ImGui::EndDisabled();
-    }
-    m_viewportInputDiagnostics.sceneViewHovered =
-        ImGui::IsWindowHovered(ImGuiHoveredFlags_AllowWhenBlockedByActiveItem) ||
-        (sceneViewItemDrawn && ImGui::IsItemHovered(ImGuiHoveredFlags_AllowWhenBlockedByActiveItem));
-    m_viewportInputDiagnostics.sceneViewFocused =
-        ImGui::IsWindowFocused(ImGuiFocusedFlags_RootAndChildWindows);
-
-    if (assetDragActive && avail.x > 1.0f && avail.y > 1.0f)
-    {
-        if (!m_viewportDropTargetLogged)
-        {
-            m_viewportDropTargetLogged = true;
-            Tracen("[DND] viewport drop target active");
-        }
-
-        ImGuiID dropItemId = 0;
-        if (sceneViewItemDrawn)
-        {
-            dropItemId = ImGui::GetItemID();
-        }
-        else
-        {
-            dropItemId = ImGui::GetID("##SceneViewDropTarget");
-            ImGui::SetCursorScreenPos(imageMin);
-            ImGui::InvisibleButton("##SceneViewDropTarget", imageSize);
-        }
-        m_viewportInputDiagnostics.dropTargetVisible = true;
-        m_viewportInputDiagnostics.dropTargetHovered = ImGui::IsItemHovered();
-        m_viewportInputDiagnostics.dropTargetActive = ImGui::IsItemActive();
-        if (m_viewportInputDiagnostics.dropTargetHovered)
-            m_viewportInputDiagnostics.hoveredItemId = static_cast<std::uint32_t>(dropItemId);
-        m_viewportInputDiagnostics.activeItemId = m_viewportInputDiagnostics.dropTargetActive
-            ? static_cast<std::uint32_t>(dropItemId)
-            : 0u;
-        acceptModelDrop();
-    }
-
-    ImGui::End();
-
-    if (!assetDragActive || m_commands.addMeshEntity)
-        return;
-
-    const ImGuiViewport* viewport = ImGui::GetMainViewport();
-    if (!viewport)
-        return;
-
-    const ImVec2 workPos = viewport->WorkPos;
-    const ImVec2 workSize = viewport->WorkSize;
-    const ImVec2 overlayPos(workPos.x + workSize.x * 0.20f, workPos.y + workSize.y * 0.06f);
-    const ImVec2 overlaySize(workSize.x * 0.55f, workSize.y * 0.64f);
-    if (overlaySize.x <= 1.0f || overlaySize.y <= 1.0f)
-        return;
-
-    ImGui::SetNextWindowPos(overlayPos, ImGuiCond_Always);
-    ImGui::SetNextWindowSize(overlaySize, ImGuiCond_Always);
-    ImGui::SetNextWindowViewport(viewport->ID);
-    ImGui::PushStyleVar(ImGuiStyleVar_WindowPadding, ImVec2(0.0f, 0.0f));
-    ImGui::SetNextWindowBgAlpha(0.0f);
-    const ImGuiWindowFlags overlayFlags =
-        ImGuiWindowFlags_NoDocking |
-        ImGuiWindowFlags_NoTitleBar |
-        ImGuiWindowFlags_NoResize |
-        ImGuiWindowFlags_NoMove |
-        ImGuiWindowFlags_NoScrollbar |
-        ImGuiWindowFlags_NoSavedSettings |
-        ImGuiWindowFlags_NoBackground |
-        ImGuiWindowFlags_NoNavFocus;
-    if (ImGui::Begin("##ViewportDropOverlay", nullptr, overlayFlags))
-    {
-        const ImGuiID overlayItemId = ImGui::GetID("##ViewportDropOverlayTarget");
-        ImGui::InvisibleButton("##ViewportDropOverlayTarget", ImGui::GetContentRegionAvail());
-        m_viewportInputDiagnostics.dropTargetVisible = true;
-        m_viewportInputDiagnostics.overlayDropTargetHovered = ImGui::IsItemHovered();
-        m_viewportInputDiagnostics.overlayDropTargetActive = ImGui::IsItemActive();
-        if (m_viewportInputDiagnostics.overlayDropTargetHovered)
-            m_viewportInputDiagnostics.hoveredItemId = static_cast<std::uint32_t>(overlayItemId);
-        if (m_viewportInputDiagnostics.overlayDropTargetActive)
-            m_viewportInputDiagnostics.activeItemId = static_cast<std::uint32_t>(overlayItemId);
-        acceptModelDrop();
-    }
-    ImGui::End();
-    ImGui::PopStyleVar();
-}
-
-void EditorImGui::OpenProjectDialog(ProjectDialogMode mode)
-{
-    m_projectDialogMode = mode;
-    m_projectPopupNeedsOpen = true;
-    m_projectCreateBrowserVisible = mode == ProjectDialogMode::Open;
-    if (m_projectBrowserPath.empty())
-        m_projectBrowserPath = InitialProjectBrowserPath(m_engineRoot);
-    CopyToBuffer(m_projectBrowsePathBuffer, sizeof(m_projectBrowsePathBuffer), m_projectBrowserPath.string());
-    if (m_projectParentBuffer[0] == '\0')
-        CopyToBuffer(m_projectParentBuffer, sizeof(m_projectParentBuffer), m_projectBrowserPath.string());
-}
-
-bool EditorImGui::NavigateProjectBrowser(const std::filesystem::path& path, bool createMissing)
-{
-    std::error_code ec;
-    std::filesystem::path target = path.empty() ? InitialProjectBrowserPath(m_engineRoot) : path;
-    target = std::filesystem::absolute(target, ec);
-    if (ec)
-    {
-        m_projectStatus = "Browse failed: " + ec.message();
-        return false;
-    }
-
-    if (std::filesystem::is_regular_file(target, ec))
-        target = target.parent_path();
-    bool createdFolder = false;
-    if (!std::filesystem::exists(target, ec) || !std::filesystem::is_directory(target, ec))
-    {
-        if (!createMissing)
-        {
-            m_projectStatus = "Browse failed: folder not found";
-            return false;
-        }
-
-        ec.clear();
-        std::filesystem::create_directories(target, ec);
-        if (ec)
-        {
-            m_projectStatus = "Browse create failed: " + ec.message();
-            return false;
-        }
-        createdFolder = true;
-        m_projectStatus = "Folder created: " + target.string();
-    }
-
-    m_projectBrowserPath = target;
-    CopyToBuffer(m_projectBrowsePathBuffer, sizeof(m_projectBrowsePathBuffer), m_projectBrowserPath.string());
-    if (!createdFolder)
-        m_projectStatus = "Browse folder: " + target.string();
-    return true;
-}
-
-void EditorImGui::ActivateCurrentProject()
-{
-    ProjectManager& projects = ProjectManager::Instance();
-    if (!projects.HasProject())
-        return;
-
-    AssetDatabase::Instance().scan(projects.ProjectRoot());
-    AssetWatcher::Instance().start(projects.ProjectRoot());
-    InitializeProjectAssetLibrary(projects.ProjectRoot(), projects.AssetRootPath());
-    SceneManager::Instance().CloseScene();
-    const bool openedScene = LoadProjectStartupScene();
-    const bool createdScene = openedScene ? false : CreateDefaultProjectScene();
-    m_projectDialogMode = ProjectDialogMode::None;
-    m_projectPopupNeedsOpen = false;
-    m_projectStatus = "Project active: " + projects.CurrentProject().name;
-    if (openedScene)
-        m_projectStatus += " | scene loaded";
-    else if (createdScene)
-        m_projectStatus += " | default scene created";
-    else
-        m_projectStatus += " | no scene";
-
-    m_attachedScenePaths.clear();
-    const std::string activePath = SceneManager::Instance().GetCurrentScenePath();
-    if (!activePath.empty())
-    {
-        std::error_code ec;
-        const std::filesystem::path relative = std::filesystem::relative(activePath, projects.ProjectRoot(), ec);
-        m_attachedScenePaths.push_back(ec ? std::filesystem::path(activePath).generic_string() : relative.generic_string());
-    }
-}
-
-bool EditorImGui::LoadProjectStartupScene()
-{
-    ProjectManager& projects = ProjectManager::Instance();
-    if (!projects.HasProject())
-        return false;
-
-    std::vector<std::string> candidates;
-    const ProjectData& project = projects.CurrentProject();
-    if (!project.startupScene.empty())
-        candidates.push_back(project.startupScene);
-    for (const std::string& recentScene : project.recentScenes)
-    {
-        if (!recentScene.empty() &&
-            std::find(candidates.begin(), candidates.end(), recentScene) == candidates.end())
-        {
-            candidates.push_back(recentScene);
-        }
-    }
-
-    for (const std::string& candidate : candidates)
-    {
-        std::filesystem::path scenePath(candidate);
-        if (!scenePath.is_absolute())
-            scenePath = projects.ProjectRoot() / scenePath;
-        if (!std::filesystem::exists(scenePath))
-        {
-            Tracenf("[PROJECT] startup scene missing: %s", scenePath.string().c_str());
-            continue;
-        }
-        if (SceneManager::Instance().LoadScene(scenePath.string()))
-        {
-            Tracenf("[PROJECT] startup scene loaded: %s", scenePath.string().c_str());
-            return true;
-        }
-        Tracenf("[PROJECT] startup scene load failed: %s", scenePath.string().c_str());
-    }
-
-    return false;
-}
-
-bool EditorImGui::CreateDefaultProjectScene()
-{
-    ProjectManager& projects = ProjectManager::Instance();
-    if (!projects.HasProject())
-        return false;
-
-    std::filesystem::path scenePath = projects.ScenesPath() / "Main" / "Main.scene";
-    if (std::filesystem::exists(scenePath))
-    {
-        if (SceneManager::Instance().LoadScene(scenePath.string()))
-        {
-            Tracenf("[PROJECT] existing default scene loaded: %s", scenePath.string().c_str());
-            return true;
-        }
-
-        for (int index = 2; index < 1000; ++index)
-        {
-            const std::string name = "Main_" + std::to_string(index);
-            std::filesystem::path candidate = projects.ScenesPath() / name / (name + ".scene");
-            if (!std::filesystem::exists(candidate))
-            {
-                scenePath = std::move(candidate);
-                break;
-            }
-        }
-    }
-
-    SceneManager& scenes = SceneManager::Instance();
-    scenes.NewScene();
-    scenes.SetSceneName("Main");
-
-    if (!scenes.SaveSceneAs(scenePath.string()))
-    {
-        TraceError("[PROJECT] default scene create failed: %s", scenePath.string().c_str());
-        return false;
-    }
-
-    AssetDatabase::Instance().getOrCreateGuid(scenePath);
-    Tracenf("[PROJECT] default scene created: %s", scenePath.string().c_str());
-    return true;
-}
-
-void EditorImGui::CreateProjectFromDialog()
-{
-    std::string error;
-    if (!ProjectManager::Instance().CreateProject(m_projectParentBuffer, m_projectNameBuffer, error))
-    {
-        m_projectStatus = "Create failed: " + error;
-        return;
-    }
-
-    ActivateCurrentProject();
-    ImGui::CloseCurrentPopup();
-}
-
-void EditorImGui::OpenProjectFromDialog(const std::filesystem::path& manifestPath)
-{
-    std::string error;
-    if (!ProjectManager::Instance().OpenProject(manifestPath, error))
-    {
-        m_projectStatus = "Open failed: " + error;
-        return;
-    }
-
-    ActivateCurrentProject();
-    ImGui::CloseCurrentPopup();
-}
-
-void EditorImGui::RenderProjectBrowser(bool pickProjectFile)
-{
-    if (m_projectBrowserPath.empty())
-        NavigateProjectBrowser(InitialProjectBrowserPath(m_engineRoot));
-
-    const std::string currentPath = m_projectBrowserPath.string();
-    ImGui::TextUnformatted("Browse Path");
-    ImGui::SetNextItemWidth(-56.0f);
-    if (ImGui::InputText("##ProjectBrowsePath",
-            m_projectBrowsePathBuffer,
-            sizeof(m_projectBrowsePathBuffer),
-            ImGuiInputTextFlags_EnterReturnsTrue))
-    {
-        if (NavigateProjectBrowser(m_projectBrowsePathBuffer, !pickProjectFile) && !pickProjectFile)
-            CopyToBuffer(m_projectParentBuffer, sizeof(m_projectParentBuffer), m_projectBrowserPath.string());
-    }
-    ImGui::SameLine();
-    if (ImGui::Button("Go", ImVec2(44.0f, 0.0f)))
-    {
-        if (NavigateProjectBrowser(m_projectBrowsePathBuffer, !pickProjectFile) && !pickProjectFile)
-            CopyToBuffer(m_projectParentBuffer, sizeof(m_projectParentBuffer), m_projectBrowserPath.string());
-    }
-
-#if defined(_WIN32)
-    ImGui::TextUnformatted("Drives");
-    bool firstDrive = true;
-    for (char drive = 'A'; drive <= 'Z'; ++drive)
-    {
-        const std::string root = std::string(1, drive) + ":\\";
-        std::error_code driveEc;
-        if (!std::filesystem::exists(root, driveEc))
-            continue;
-        if (!firstDrive)
-            ImGui::SameLine();
-        firstDrive = false;
-        if (ImGui::Button((std::string(1, drive) + ":").c_str()))
-            NavigateProjectBrowser(root);
-    }
-#endif
-
-    ImGui::SetNextItemWidth(-1.0f);
-    ImGui::InputTextWithHint("##ProjectBrowseFilter", "Filter folders/projects...", m_projectBrowseFilterBuffer, sizeof(m_projectBrowseFilterBuffer));
-    ImGui::TextDisabled("%s", currentPath.c_str());
-    if (ImGui::Button("Up"))
-    {
-        const std::filesystem::path parent = m_projectBrowserPath.parent_path();
-        if (!parent.empty())
-            NavigateProjectBrowser(parent);
-    }
-    ImGui::SameLine();
-    if (!pickProjectFile && ImGui::Button("Use This Folder"))
-    {
-        CopyToBuffer(m_projectParentBuffer, sizeof(m_projectParentBuffer), m_projectBrowserPath.string());
-        m_projectCreateBrowserVisible = false;
-    }
-
-    ImGui::Separator();
-    if (ImGui::BeginChild(pickProjectFile ? "OpenProjectBrowser" : "CreateProjectBrowser", ImVec2(0.0f, 220.0f), true))
-    {
-        std::vector<std::filesystem::directory_entry> directories;
-        std::vector<std::filesystem::directory_entry> manifests;
-        std::error_code ec;
-        for (const auto& entry : std::filesystem::directory_iterator(m_projectBrowserPath, ec))
-        {
-            if (entry.is_directory(ec))
-                directories.push_back(entry);
-            else if (pickProjectFile && entry.path().extension() == ".ixproj")
-                manifests.push_back(entry);
-        }
-        std::sort(directories.begin(), directories.end(), [](const auto& a, const auto& b) {
-            return a.path().filename().string() < b.path().filename().string();
-        });
-        std::sort(manifests.begin(), manifests.end(), [](const auto& a, const auto& b) {
-            return a.path().filename().string() < b.path().filename().string();
-        });
-
-        for (const auto& entry : directories)
-        {
-            const std::string filename = entry.path().filename().string();
-            if (!ContainsCaseInsensitive(filename, m_projectBrowseFilterBuffer))
-                continue;
-            const std::string label = "[Folder] " + filename;
-            if (ImGui::Selectable(label.c_str()))
-            NavigateProjectBrowser(entry.path());
-        }
-        if (pickProjectFile)
-        {
-            for (const auto& entry : manifests)
-            {
-                const std::string filename = entry.path().filename().string();
-                if (!ContainsCaseInsensitive(filename, m_projectBrowseFilterBuffer))
-                    continue;
-                const std::string label = "[Project] " + filename;
-                if (ImGui::Selectable(label.c_str()))
-                    CopyToBuffer(m_projectOpenPathBuffer, sizeof(m_projectOpenPathBuffer), entry.path().string());
-            }
-        }
-    }
-    ImGui::EndChild();
-}
-
-void EditorImGui::RenderProjectModal()
-{
-    ProjectManager& projects = ProjectManager::Instance();
-    if (m_projectDialogMode == ProjectDialogMode::None)
-        return;
-
-    if (m_projectPopupNeedsOpen)
-    {
-        ImGui::OpenPopup("Project");
-        m_projectPopupNeedsOpen = false;
-    }
-
-    ImGui::SetNextWindowSize(ImVec2(560.0f, 460.0f), ImGuiCond_FirstUseEver);
-    if (!ImGui::BeginPopupModal("Project", nullptr, ImGuiWindowFlags_NoCollapse))
-        return;
-
-    if (m_projectDialogMode == ProjectDialogMode::NoProject)
-    {
-        ImGui::TextUnformatted("No Project");
-        ImGui::TextDisabled("Create or open a project to bind the Asset Browser and scene workspace.");
-        ImGui::Separator();
-        if (ImGui::Button("Create New Project", ImVec2(180.0f, 0.0f)))
-            m_projectDialogMode = ProjectDialogMode::Create;
-        ImGui::SameLine();
-        if (ImGui::Button("Open Project", ImVec2(180.0f, 0.0f)))
-            m_projectDialogMode = ProjectDialogMode::Open;
-
-        ImGui::Separator();
-        ImGui::TextUnformatted("Recent Projects");
-        if (projects.RecentProjects().empty())
-        {
-            ImGui::TextDisabled("No recent projects.");
-        }
-        else
-        {
-            for (const auto& path : projects.RecentProjects())
-            {
-                const std::string label = path.parent_path().filename().string() + "##" + path.string();
-                if (ImGui::Selectable(label.c_str()))
-                    OpenProjectFromDialog(path);
-                if (ImGui::IsItemHovered())
-                    ImGui::SetTooltip("%s", path.string().c_str());
-            }
-        }
-    }
-    else if (m_projectDialogMode == ProjectDialogMode::Create)
-    {
-        ImGui::TextUnformatted("Create New Project");
-        ImGui::TextUnformatted("Parent Folder");
-        const float browseButtonWidth = 96.0f;
-        const float spacing = ImGui::GetStyle().ItemSpacing.x;
-        ImGui::SetNextItemWidth(std::max(120.0f, ImGui::GetContentRegionAvail().x - browseButtonWidth - spacing));
-        ImGui::InputText("##ProjectParentFolder", m_projectParentBuffer, sizeof(m_projectParentBuffer));
-        ImGui::SameLine();
-        if (ImGui::Button("Browse...", ImVec2(96.0f, 0.0f)))
-        {
-            m_projectCreateBrowserVisible = !m_projectCreateBrowserVisible;
-            if (NavigateProjectBrowser(m_projectParentBuffer, true))
-                CopyToBuffer(m_projectParentBuffer, sizeof(m_projectParentBuffer), m_projectBrowserPath.string());
-        }
-        ImGui::TextUnformatted("Project Name");
-        ImGui::SetNextItemWidth(-1.0f);
-        ImGui::InputText("##ProjectName", m_projectNameBuffer, sizeof(m_projectNameBuffer));
-
-        const std::filesystem::path targetProjectPath = std::filesystem::path(m_projectParentBuffer) / m_projectNameBuffer;
-        ImGui::TextDisabled("Target: %s", targetProjectPath.string().c_str());
-        if (ImGui::Button("Create Project", ImVec2(150.0f, 0.0f)))
-            CreateProjectFromDialog();
-        ImGui::SameLine();
-        if (ImGui::Button("Back", ImVec2(120.0f, 0.0f)))
-            m_projectDialogMode = projects.HasProject() ? ProjectDialogMode::None : ProjectDialogMode::NoProject;
-
-        if (m_projectCreateBrowserVisible)
-            RenderProjectBrowser(false);
-    }
-    else if (m_projectDialogMode == ProjectDialogMode::Open)
-    {
-        ImGui::TextUnformatted("Open Project");
-        ImGui::InputText("project.ixproj", m_projectOpenPathBuffer, sizeof(m_projectOpenPathBuffer));
-        RenderProjectBrowser(true);
-        ImGui::Separator();
-        if (ImGui::Button("Open", ImVec2(120.0f, 0.0f)))
-            OpenProjectFromDialog(m_projectOpenPathBuffer);
-        ImGui::SameLine();
-        if (ImGui::Button("Back", ImVec2(120.0f, 0.0f)))
-            m_projectDialogMode = projects.HasProject() ? ProjectDialogMode::None : ProjectDialogMode::NoProject;
-    }
-
-    if (!m_projectStatus.empty())
-    {
-        ImGui::Separator();
-        ImGui::TextDisabled("%s", m_projectStatus.c_str());
-    }
-
-    ImGui::EndPopup();
-}
-
-void EditorImGui::RenderMenuBar()
-{
-    if (!ImGui::BeginMainMenuBar())
-        return;
-
-    SceneManager& scenes = SceneManager::Instance();
-    ProjectManager& projects = ProjectManager::Instance();
-    if (ImGui::BeginMenu("File"))
-    {
-        if (ImGui::MenuItem("New Project..."))
-            OpenProjectDialog(ProjectDialogMode::Create);
-        if (ImGui::MenuItem("Open Project..."))
-            OpenProjectDialog(ProjectDialogMode::Open);
-        if (ImGui::MenuItem("Save Project", nullptr, false, projects.HasProject()))
-        {
-            std::string error;
-            if (!projects.SaveProject(error))
-                m_projectStatus = "Save project failed: " + error;
-            else
-                m_projectStatus = "Project saved";
-        }
-        if (ImGui::BeginMenu("Recent Projects", !projects.RecentProjects().empty()))
-        {
-            for (const auto& path : projects.RecentProjects())
-            {
-                const std::string label = path.parent_path().filename().string();
-                if (ImGui::MenuItem(label.c_str()))
-                    OpenProjectFromDialog(path);
-            }
-            ImGui::EndMenu();
-        }
-        ImGui::Separator();
-        if (ImGui::MenuItem(ICON_FA_FILE "  New Scene", "Ctrl+N"))
-            scenes.NewScene();
-        if (ImGui::MenuItem(ICON_FA_FOLDER_OPEN "  Open Scene...", "Ctrl+O"))
-        {
-#if defined(_WIN32)
-            char file[MAX_PATH]{};
-            OPENFILENAMEA ofn{};
-            ofn.lStructSize = sizeof(ofn);
-            ofn.lpstrTitle = "Open Scene";
-            ofn.lpstrFilter = "Scene Files (*.scene)\0*.scene\0All files (*.*)\0*.*\0\0";
-            ofn.lpstrFile = file;
-            ofn.nMaxFile = MAX_PATH;
-            ofn.Flags = OFN_FILEMUSTEXIST | OFN_PATHMUSTEXIST | OFN_NOCHANGEDIR;
-            if (GetOpenFileNameA(&ofn))
-                scenes.LoadScene(file);
-#endif
-        }
-        ImGui::Separator();
-        if (ImGui::MenuItem(ICON_FA_FLOPPY_DISK "  Save Scene", "Ctrl+S"))
-            scenes.SaveScene();
-        if (ImGui::MenuItem(ICON_FA_FLOPPY_DISK "  Save Scene As...", "Ctrl+Shift+S"))
-            scenes.SaveSceneAs({});
-        ImGui::Separator();
-        if (ImGui::BeginMenu("Recent Scenes", !scenes.GetRecentScenes().empty()))
-        {
-            for (const std::string& path : scenes.GetRecentScenes())
-            {
-                const std::string label = std::filesystem::path(path).filename().string();
-                if (ImGui::MenuItem(label.c_str()))
-                    scenes.LoadScene(path);
-            }
-            ImGui::EndMenu();
-        }
-        ImGui::EndMenu();
-    }
-    if (ImGui::BeginMenu("Edit"))
-    {
-        ImGui::MenuItem("Undo", "Ctrl+Z", false, false);
-        ImGui::MenuItem("Redo", "Ctrl+Y", false, false);
-        ImGui::EndMenu();
-    }
-    if (ImGui::BeginMenu("View"))
-    {
-        ImGui::MenuItem("Demo Window", nullptr, &m_showDemoWindow);
-        ImGui::EndMenu();
-    }
-    if (ImGui::BeginMenu("Tools"))
-    {
-        if (ImGui::MenuItem("Tree Generator..."))
-        {
-            if (!m_treeGeneratorPanel)
-            {
-                const std::filesystem::path presetDir = m_engineRoot.empty()
-                    ? std::filesystem::path{}
-                    : (InternalAssetRootFor(m_engineRoot) / "tree_presets");
-                m_treeGeneratorPanel = std::make_unique<tree_tool::TreeGeneratorPanel>(presetDir);
-            }
-            m_treeGeneratorPanel->SetAssetLibrary(m_assetLibrary.get());
-            m_treeGeneratorPanel->Show();
-        }
-        if (ImGui::BeginMenu("Debug"))
-        {
-            if (ImGui::MenuItem("Dump Material State"))
-                m_commands.dumpMaterialState = true;
-            ImGui::EndMenu();
-        }
-        ImGui::EndMenu();
-    }
-    if (ImGui::BeginMenu("Help"))
-    {
-        ImGui::MenuItem("About IxtreemeEngine", nullptr, false, false);
-        ImGui::EndMenu();
-    }
-
-    ImGui::EndMainMenuBar();
-}
-
-void EditorImGui::HandleEditorHotkeys()
-{
-    if (!m_editorModeActive)
-        return;
-
-    ImGuiIO& io = ImGui::GetIO();
-    if (io.WantCaptureKeyboard)
-        return;
-
-    if (ImGui::IsKeyPressed(ImGuiKey_F5, false))
-    {
-        if (io.KeyShift)
-        {
-            if (m_playModeState.mode != EditorPlayMode::Edit)
-                m_commands.exitPlayMode = true;
-        }
-        else if (m_playModeState.mode == EditorPlayMode::Edit)
-        {
-            if (SceneManager::Instance().HasOpenScene())
-                m_commands.enterPlayMode = true;
-            else
-                Tracen("[EDIT-PLAY] F5 ignored: no open scene");
-        }
-        else
-        {
-            m_commands.exitPlayMode = true;
-        }
-    }
-
-    if (ImGui::IsKeyPressed(ImGuiKey_F6, false))
-    {
-        if (m_playModeState.mode == EditorPlayMode::Play)
-            m_commands.pausePlayMode = true;
-        else if (m_playModeState.mode == EditorPlayMode::PlayPaused)
-            m_commands.resumePlayMode = true;
-    }
-
-    if (!io.KeyCtrl && !io.KeyShift && ImGui::IsKeyPressed(ImGuiKey_F, false))
-    {
-        if (m_waterBodyState.selected)
-        {
-            if (const HierarchySceneEntity* entity = FindHierarchyEntity(HierarchyEntityType::WaterBody, m_waterBodyState.id))
-                QueueHierarchyFocus(*entity);
-        }
-        else if (m_dynamicLightState.type == DynamicLightType::Point)
-        {
-            if (const HierarchySceneEntity* entity = FindHierarchyEntity(HierarchyEntityType::PointLight, m_dynamicLightState.id))
-                QueueHierarchyFocus(*entity);
-        }
-        else if (m_dynamicLightState.type == DynamicLightType::Spot)
-        {
-            if (const HierarchySceneEntity* entity = FindHierarchyEntity(HierarchyEntityType::SpotLight, m_dynamicLightState.id))
-                QueueHierarchyFocus(*entity);
-        }
-    }
-
-    if (!io.KeyCtrl && !io.KeyShift && ImGui::IsKeyPressed(ImGuiKey_F2, false))
-    {
-        if (m_waterBodyState.selected)
-        {
-            if (const HierarchySceneEntity* entity = FindHierarchyEntity(HierarchyEntityType::WaterBody, m_waterBodyState.id))
-                StartHierarchyRename(*entity);
-        }
-        else if (m_dynamicLightState.type == DynamicLightType::Point)
-        {
-            if (const HierarchySceneEntity* entity = FindHierarchyEntity(HierarchyEntityType::PointLight, m_dynamicLightState.id))
-                StartHierarchyRename(*entity);
-        }
-        else if (m_dynamicLightState.type == DynamicLightType::Spot)
-        {
-            if (const HierarchySceneEntity* entity = FindHierarchyEntity(HierarchyEntityType::SpotLight, m_dynamicLightState.id))
-                StartHierarchyRename(*entity);
-        }
-    }
-
-    if (!io.KeyCtrl && !io.KeyShift && ImGui::IsKeyPressed(ImGuiKey_Delete, false))
-    {
-        if (m_waterBodyState.selected)
-        {
-            m_commands.hierarchyDeleteEntity = true;
-            m_commands.hierarchyEntityType = HierarchyEntityType::WaterBody;
-            m_commands.hierarchyEntityId = m_waterBodyState.id;
-            if (const HierarchySceneEntity* entity = FindHierarchyEntity(HierarchyEntityType::WaterBody, m_waterBodyState.id))
-                m_commands.hierarchyEntityHandle = entity->entity;
-        }
-        else if (m_dynamicLightState.type == DynamicLightType::Point)
-        {
-            m_commands.hierarchyDeleteEntity = true;
-            m_commands.hierarchyEntityType = HierarchyEntityType::PointLight;
-            m_commands.hierarchyEntityId = m_dynamicLightState.id;
-            if (const HierarchySceneEntity* entity = FindHierarchyEntity(HierarchyEntityType::PointLight, m_dynamicLightState.id))
-                m_commands.hierarchyEntityHandle = entity->entity;
-        }
-        else if (m_dynamicLightState.type == DynamicLightType::Spot)
-        {
-            m_commands.hierarchyDeleteEntity = true;
-            m_commands.hierarchyEntityType = HierarchyEntityType::SpotLight;
-            m_commands.hierarchyEntityId = m_dynamicLightState.id;
-            if (const HierarchySceneEntity* entity = FindHierarchyEntity(HierarchyEntityType::SpotLight, m_dynamicLightState.id))
-                m_commands.hierarchyEntityHandle = entity->entity;
-        }
-    }
-
-    if (io.KeyCtrl)
-    {
-        SceneManager& scenes = SceneManager::Instance();
-        if (!io.KeyShift && ImGui::IsKeyPressed(ImGuiKey_N, false))
-            scenes.NewScene();
-        if (!io.KeyShift && ImGui::IsKeyPressed(ImGuiKey_O, false))
-        {
-#if defined(_WIN32)
-            char file[MAX_PATH]{};
-            OPENFILENAMEA ofn{};
-            ofn.lStructSize = sizeof(ofn);
-            ofn.lpstrTitle = "Open Scene";
-            ofn.lpstrFilter = "Scene Files (*.scene)\0*.scene\0All files (*.*)\0*.*\0\0";
-            ofn.lpstrFile = file;
-            ofn.nMaxFile = MAX_PATH;
-            ofn.Flags = OFN_FILEMUSTEXIST | OFN_PATHMUSTEXIST | OFN_NOCHANGEDIR;
-            if (GetOpenFileNameA(&ofn))
-                scenes.LoadScene(file);
-#endif
-        }
-        if (ImGui::IsKeyPressed(ImGuiKey_S, false))
-        {
-            if (io.KeyShift)
-                scenes.SaveSceneAs({});
-            else
-                scenes.SaveScene();
-        }
-    }
-}
-
-void EditorImGui::RenderEditorToolbar()
-{
-    if (!m_editorModeActive)
-        return;
-
-    const ImGuiViewport* viewport = ImGui::GetMainViewport();
-    ImGui::SetNextWindowPos(ImVec2(viewport->WorkPos.x + 12.0f, viewport->WorkPos.y + 12.0f), ImGuiCond_FirstUseEver);
-    ImGui::SetNextWindowSize(ImVec2(760.0f, 58.0f), ImGuiCond_FirstUseEver);
-    if (ImGui::Begin("Editor Toolbar", nullptr,
-        ImGuiWindowFlags_NoCollapse | ImGuiWindowFlags_NoScrollbar))
-    {
-        const bool isEdit = m_playModeState.mode == EditorPlayMode::Edit;
-        const bool isPlay = m_playModeState.mode == EditorPlayMode::Play;
-        const bool isPaused = m_playModeState.mode == EditorPlayMode::PlayPaused;
-
-        if (isEdit)
-        {
-            const bool canPlay = SceneManager::Instance().HasOpenScene();
-            if (!canPlay)
-                ImGui::BeginDisabled();
-            if (UI::IconButton(ICON_FA_PLAY, "Play", ImVec2(96.0f, 32.0f)))
-                m_commands.enterPlayMode = true;
-            if (!canPlay)
-            {
-                ImGui::EndDisabled();
-                if (ImGui::IsItemHovered(ImGuiHoveredFlags_AllowWhenDisabled))
-                    ImGui::SetTooltip("Open a scene to Play");
-            }
-        }
-        else
-        {
-            ImGui::PushStyleColor(ImGuiCol_Button, ImVec4(0.70f, 0.20f, 0.20f, 1.0f));
-            if (UI::IconButton(ICON_FA_STOP, "Stop", ImVec2(96.0f, 32.0f)))
-                m_commands.exitPlayMode = true;
-            ImGui::PopStyleColor();
-            ImGui::SameLine();
-            if (isPlay)
-            {
-                if (UI::IconButton(ICON_FA_PAUSE, "Pause", ImVec2(104.0f, 32.0f)))
-                    m_commands.pausePlayMode = true;
-            }
-            else if (isPaused)
-            {
-                if (UI::IconButton(ICON_FA_PLAY, "Resume", ImVec2(112.0f, 32.0f)))
-                    m_commands.resumePlayMode = true;
-            }
-        }
-
-        ImGui::SameLine();
-        ImGui::Dummy(ImVec2(16.0f, 0.0f));
-        ImGui::SameLine();
-
-        const char* modeText = isEdit ? "EDIT MODE" : isPlay ? "PLAY MODE" : "PAUSED";
-        const ImVec4 modeColor = isEdit
-            ? ImVec4(0.72f, 0.72f, 0.72f, 1.0f)
-            : isPlay ? ImVec4(0.35f, 0.90f, 0.35f, 1.0f) : ImVec4(0.95f, 0.74f, 0.30f, 1.0f);
-        ImGui::TextColored(modeColor, "%s", modeText);
-        if (!isEdit)
-        {
-            ImGui::SameLine();
-            ImGui::TextDisabled("(%.1fs, frame %d)", m_playModeState.elapsedSeconds, m_playModeState.frameCount);
-        }
-
-        ImGui::SameLine();
-        ImGui::Dummy(ImVec2(24.0f, 0.0f));
-        ImGui::SameLine();
-        RenderGizmoControls();
-
-        ImGui::SameLine();
-        ImGui::Dummy(ImVec2(18.0f, 0.0f));
-        ImGui::SameLine();
-        ImGui::TextDisabled("FPS %.0f | %.2f ms | CPU %.0f%%",
-            m_engineStats.fps,
-            m_engineStats.averageFrameMs > 0.0 ? m_engineStats.averageFrameMs : m_engineStats.frameMs,
-            m_engineStats.processCpuPercent);
-    }
-    ImGui::End();
-}
-
-void EditorImGui::RenderSceneSettingsPanel()
-{
-    if (ImGui::Begin("Scene Settings"))
-    {
-        SceneManager& scenes = SceneManager::Instance();
-        if (!scenes.HasOpenScene())
-        {
-            ImGui::TextUnformatted("No scene open");
-            ImGui::TextWrapped("Create or open a scene before editing scene metadata.");
-        }
-        else
-        {
-            const SceneData& scene = scenes.GetCurrentScene();
-
-            char nameBuffer[128]{};
-            std::snprintf(nameBuffer, sizeof(nameBuffer), "%s", scene.name.c_str());
-            if (ImGui::InputText("Scene Name", nameBuffer, sizeof(nameBuffer)))
-                scenes.SetSceneName(nameBuffer);
-
-            ImGui::Separator();
-            ImGui::TextUnformatted("Camera");
-            ImGui::Text("Position: %.1f, %.1f, %.1f",
-                scene.cameraPosition[0],
-                scene.cameraPosition[1],
-                scene.cameraPosition[2]);
-            ImGui::Text("FOV: %.1f  Near/Far: %.2f / %.1f",
-                scene.cameraFov,
-                scene.cameraNear,
-                scene.cameraFar);
-
-            ImGui::Separator();
-            ImGui::TextUnformatted("Environment");
-            ImGui::Text("Sun: %.1f / %.1f  Intensity: %.2f",
-                scene.lighting.directional.elevationDegrees,
-                scene.lighting.directional.azimuthDegrees,
-                scene.lighting.directional.intensity);
-            ImGui::Text("Ambient: %.2f", scene.lighting.ambient.intensity);
-        }
-    }
-    ImGui::End();
-}
-
-bool EditorImGui::HierarchyPassesSearch(const std::string& name) const
-{
-    return ContainsCaseInsensitive(name, m_hierarchySearchBuffer);
-}
-
-const HierarchySceneEntity* EditorImGui::FindHierarchyEntity(std::uint64_t entity) const
-{
-    auto it = std::find_if(m_hierarchyEntities.begin(), m_hierarchyEntities.end(),
-        [entity](const HierarchySceneEntity& candidate) {
-            return candidate.entity == entity;
-        });
-    return it == m_hierarchyEntities.end() ? nullptr : &*it;
-}
-
-const HierarchySceneEntity* EditorImGui::FindHierarchyEntity(HierarchyEntityType type, std::uint32_t objectId) const
-{
-    auto it = std::find_if(m_hierarchyEntities.begin(), m_hierarchyEntities.end(),
-        [type, objectId](const HierarchySceneEntity& candidate) {
-            return candidate.type == type && candidate.objectId == objectId;
-        });
-    return it == m_hierarchyEntities.end() ? nullptr : &*it;
-}
-
-bool EditorImGui::HierarchySubtreePassesSearch(std::uint64_t entity) const
-{
-    const HierarchySceneEntity* node = FindHierarchyEntity(entity);
-    if (!node)
-        return false;
-    if (HierarchyPassesSearch(node->name))
-        return true;
-    for (const HierarchySceneEntity& child : m_hierarchyEntities)
-    {
-        if (child.parent == entity && HierarchySubtreePassesSearch(child.entity))
-            return true;
-    }
-    return false;
-}
-
-void EditorImGui::QueueHierarchySelection(const HierarchySceneEntity& entity)
-{
-    m_commands.hierarchySelectEntity = true;
-    m_commands.hierarchyEntityType = entity.type;
-    m_commands.hierarchyEntityId = entity.objectId;
-    m_commands.hierarchyEntityHandle = entity.entity;
-    m_selectedHierarchyEntity = entity.entity;
-    Tracenf("[HIERARCHY] Selected entity: flecs=%llu object=%u type=%d",
-        static_cast<unsigned long long>(entity.entity),
-        entity.objectId,
-        static_cast<int>(entity.type));
-}
-
-void EditorImGui::QueueHierarchyFocus(const HierarchySceneEntity& entity)
-{
-    m_commands.hierarchyFocusEntity = true;
-    m_commands.hierarchyEntityType = entity.type;
-    m_commands.hierarchyEntityId = entity.objectId;
-    m_commands.hierarchyEntityHandle = entity.entity;
-    Tracenf("[HIERARCHY] Focus requested: flecs=%llu object=%u type=%d",
-        static_cast<unsigned long long>(entity.entity),
-        entity.objectId,
-        static_cast<int>(entity.type));
-}
-
-void EditorImGui::StartHierarchyRename(const HierarchySceneEntity& entity)
-{
-    m_hierarchyRenamingEntity = entity.entity;
-    std::snprintf(m_hierarchyRenameBuffer, sizeof(m_hierarchyRenameBuffer), "%s", entity.name.c_str());
-}
-
-void EditorImGui::RenderHierarchyToolbar()
-{
-    ImGui::PushItemWidth(-1.0f);
-    const bool changed = ImGui::InputTextWithHint("##hierarchy_search",
-        ICON_FA_MAGNIFYING_GLASS " Search entities/scenes...",
-        m_hierarchySearchBuffer,
-        sizeof(m_hierarchySearchBuffer));
-    ImGui::PopItemWidth();
-    if (changed)
-        Tracenf("[HIERARCHY] Search filter: '%s'", m_hierarchySearchBuffer);
-
-    if (m_hierarchySearchBuffer[0] != '\0')
-    {
-        ImGui::SameLine();
-        if (ImGui::SmallButton(ICON_FA_XMARK))
-        {
-            m_hierarchySearchBuffer[0] = '\0';
-            Tracen("[HIERARCHY] Search filter cleared");
-        }
-    }
-}
-
-std::vector<EditorImGui::ProjectSceneEntry> EditorImGui::QueryProjectScenes() const
-{
-    std::vector<ProjectSceneEntry> scenes;
-    const SceneManager& sceneManager = SceneManager::Instance();
-    const std::string activePathKey = ComparablePath(sceneManager.GetCurrentScenePath());
-
-    auto appendScene = [&](const std::filesystem::path& path, const std::string& relativePath, bool active) {
-        ProjectSceneEntry entry;
-        entry.path = path;
-        entry.relativePath = relativePath;
-        entry.name = path.empty() ? m_sceneRootName : path.stem().string();
-        if (entry.name.empty())
-            entry.name = "Untitled";
-        entry.active = active;
-        scenes.push_back(std::move(entry));
-    };
-
-    ProjectManager& projects = ProjectManager::Instance();
-    if (projects.HasProject())
-    {
-        for (const std::string& attachedPath : m_attachedScenePaths)
-        {
-            if (attachedPath.empty())
-                continue;
-            std::filesystem::path scenePath(attachedPath);
-            if (!scenePath.is_absolute())
-                scenePath = projects.ProjectRoot() / scenePath;
-            const bool active = !activePathKey.empty() && ComparablePath(scenePath) == activePathKey;
-            appendScene(scenePath, attachedPath, active);
-        }
-
-        if (sceneManager.HasOpenScene())
-        {
-            const bool activeListed = std::any_of(scenes.begin(), scenes.end(), [](const ProjectSceneEntry& scene) {
-                return scene.active;
-            });
-            if (!activeListed)
-            {
-                const std::filesystem::path activePath(sceneManager.GetCurrentScenePath());
-                appendScene(activePath, activePath.empty() ? std::string{} : activePath.generic_string(), true);
-            }
-        }
-    }
-    else if (sceneManager.HasOpenScene())
-    {
-        const std::filesystem::path activePath(sceneManager.GetCurrentScenePath());
-        appendScene(activePath, activePath.empty() ? std::string{} : activePath.generic_string(), true);
-    }
-
-    std::sort(scenes.begin(), scenes.end(), [](const ProjectSceneEntry& a, const ProjectSceneEntry& b) {
-        return ToLowerAscii(a.relativePath.empty() ? a.name : a.relativePath) <
-            ToLowerAscii(b.relativePath.empty() ? b.name : b.relativePath);
-    });
-    return scenes;
-}
-
-std::vector<AssetLibrary::Entry> EditorImGui::QuerySceneAssets() const
-{
-    std::vector<AssetLibrary::Entry> scenes;
-    ProjectManager& projects = ProjectManager::Instance();
-    if (!projects.HasProject())
-        return scenes;
-
-    const std::filesystem::path scenesRoot = projects.ScenesPath();
-    std::error_code ec;
-    if (!std::filesystem::exists(scenesRoot, ec))
-        return scenes;
-
-    for (const auto& entry : std::filesystem::recursive_directory_iterator(
-             scenesRoot,
-             std::filesystem::directory_options::skip_permission_denied,
-             ec))
-    {
-        if (ec)
-            break;
-        std::error_code entryEc;
-        if (!entry.is_regular_file(entryEc) || entry.path().extension() != ".scene")
-            continue;
-
-        std::filesystem::path absolutePath = std::filesystem::absolute(entry.path(), entryEc);
-        if (entryEc)
-            absolutePath = entry.path();
-        const std::filesystem::path relativePath = std::filesystem::relative(absolutePath, projects.ProjectRoot(), entryEc);
-        const std::string relative = entryEc ? entry.path().generic_string() : relativePath.generic_string();
-
-        AssetLibrary::Entry scene;
-        scene.category = AssetLibrary::Category::Scene;
-        scene.displayName = absolutePath.stem().string();
-        scene.filename = absolutePath.filename().string();
-        scene.originalPath = absolutePath.string();
-        const std::filesystem::path sceneRelativePath = std::filesystem::relative(absolutePath, scenesRoot, entryEc);
-        scene.subpath = AssetLibrary::NormalizeSubpath(
-            (entryEc ? std::filesystem::path(relative) : sceneRelativePath).parent_path().generic_string());
-        scene.tags = {"scene"};
-        scene.id = "scene_";
-        for (char ch : relative)
-        {
-            const unsigned char uch = static_cast<unsigned char>(ch);
-            scene.id += std::isalnum(uch) ? static_cast<char>(std::tolower(uch)) : '_';
-        }
-        scenes.push_back(std::move(scene));
-    }
-
-    std::sort(scenes.begin(), scenes.end(), [](const AssetLibrary::Entry& a, const AssetLibrary::Entry& b) {
-        return ToLowerAscii(a.originalPath) < ToLowerAscii(b.originalPath);
-    });
-    return scenes;
-}
-
-bool EditorImGui::AttachSceneToHierarchy(const AssetLibrary::Entry& entry)
-{
-    if (entry.category != AssetLibrary::Category::Scene || entry.originalPath.empty())
-        return false;
-
-    ProjectManager& projects = ProjectManager::Instance();
-    std::filesystem::path scenePath(entry.originalPath);
-    std::string relativePath = entry.originalPath;
-    if (projects.HasProject())
-    {
-        std::error_code ec;
-        const std::filesystem::path relative = std::filesystem::relative(scenePath, projects.ProjectRoot(), ec);
-        if (!ec)
-            relativePath = relative.generic_string();
-    }
-
-    auto samePath = [&](const std::string& existing) {
-        std::filesystem::path existingPath(existing);
-        if (projects.HasProject() && !existingPath.is_absolute())
-            existingPath = projects.ProjectRoot() / existingPath;
-        return ComparablePath(existingPath) == ComparablePath(scenePath);
-    };
-    if (std::none_of(m_attachedScenePaths.begin(), m_attachedScenePaths.end(), samePath))
-        m_attachedScenePaths.push_back(relativePath);
-
-    if (SceneManager::Instance().LoadScene(scenePath.string()))
-    {
-        m_projectStatus = "Scene added to Hierarchy: " + relativePath;
-        Tracenf("[HIERARCHY] Scene attached: %s", relativePath.c_str());
-        return true;
-    }
-
-    m_attachedScenePaths.erase(
-        std::remove_if(m_attachedScenePaths.begin(), m_attachedScenePaths.end(), samePath),
-        m_attachedScenePaths.end());
-    m_projectStatus = "Scene attach failed: " + relativePath;
-    return false;
-}
-
-bool EditorImGui::DetachSceneFromHierarchy(const ProjectSceneEntry& scene)
-{
-    if (scene.relativePath.empty())
-        return false;
-
-    auto matchesScene = [&](const std::string& existing) {
-        std::filesystem::path existingPath(existing);
-        if (ProjectManager::Instance().HasProject() && !existingPath.is_absolute())
-            existingPath = ProjectManager::Instance().ProjectRoot() / existingPath;
-        return ComparablePath(existingPath) == ComparablePath(scene.path);
-    };
-    m_attachedScenePaths.erase(
-        std::remove_if(m_attachedScenePaths.begin(), m_attachedScenePaths.end(), matchesScene),
-        m_attachedScenePaths.end());
-
-    if (scene.active)
-    {
-        if (SceneManager::Instance().IsDirty())
-        {
-            m_attachedScenePaths.push_back(scene.relativePath);
-            m_projectStatus = "Save the scene before removing it from Hierarchy.";
-            Tracenf("[HIERARCHY] Scene detach blocked by dirty scene: %s", scene.relativePath.c_str());
-            return false;
-        }
-        SceneManager::Instance().CloseScene();
-    }
-
-    m_projectStatus = "Scene removed from Hierarchy: " + scene.name;
-    Tracenf("[HIERARCHY] Scene detached: %s", scene.relativePath.c_str());
-    return true;
-}
-
-void EditorImGui::RenderProjectSceneNode(const ProjectSceneEntry& scene)
-{
-    const bool activeHasMatchingEntity =
-        scene.active && m_hierarchySearchBuffer[0] != '\0' && HierarchySubtreePassesSearch(m_sceneRootEntity);
-    if (m_hierarchySearchBuffer[0] != '\0' && !HierarchyPassesSearch(scene.name) && !activeHasMatchingEntity)
-        return;
-
-    ImGui::TableNextRow();
-    ImGui::TableSetColumnIndex(0);
-    ImGui::PushID(scene.relativePath.empty() ? scene.name.c_str() : scene.relativePath.c_str());
-
-    if (!scene.active)
-        ImGui::PushStyleColor(ImGuiCol_Text, ImVec4(0.62f, 0.62f, 0.62f, 1.0f));
-
-    bool hasChildren = scene.active && !m_hierarchyEntities.empty();
-    ImGuiTreeNodeFlags flags =
-        ImGuiTreeNodeFlags_OpenOnArrow |
-        ImGuiTreeNodeFlags_SpanFullWidth |
-        (scene.active ? ImGuiTreeNodeFlags_DefaultOpen : 0);
-    if (!hasChildren)
-        flags |= ImGuiTreeNodeFlags_Leaf | ImGuiTreeNodeFlags_NoTreePushOnOpen;
-
-    const std::string label = std::string(ICON_FA_GLOBE) + " " + scene.name + "##" + scene.relativePath;
-    const bool open = ImGui::TreeNodeEx(label.c_str(), flags);
-    if (ImGui::IsItemHovered() && !scene.relativePath.empty())
-        ImGui::SetTooltip("%s", scene.relativePath.c_str());
-    if (ImGui::IsItemClicked() && !ImGui::IsItemToggledOpen() && !scene.active && !scene.path.empty())
-    {
-        if (SceneManager::Instance().LoadScene(scene.path.string()))
-            m_projectStatus = "Scene loaded: " + scene.relativePath;
-    }
-    if (scene.active && ImGui::BeginPopupContextItem("##scene_context"))
-    {
-        if (ImGui::MenuItem(ICON_FA_MOUNTAIN " Create Terrain"))
-        {
-            if (m_terrainState.exists)
-                m_replaceTerrainConfirmOpen = true;
-            else
-                m_createTerrainModalOpen = true;
-        }
-        ImGui::EndPopup();
-    }
-
-    if (scene.active && ImGui::BeginDragDropTarget())
-    {
-        if (const ImGuiPayload* payload = ImGui::AcceptDragDropPayload(kAssetPayloadType))
-        {
-            const std::string assetId(static_cast<const char*>(payload->Data), payload->DataSize);
-            const auto entry = m_assetLibrary ? m_assetLibrary->FindById(assetId) : std::optional<AssetLibrary::Entry>{};
-            if (entry && entry->category == AssetLibrary::Category::Model)
-            {
-                m_commands.addMeshEntity = true;
-                m_commands.meshAssetId = entry->id;
-                m_assetStatus = "Mesh entity queued: " + entry->displayName;
-                Tracenf("[MESH-ENTITY] Hierarchy drop queued: asset_id=%s", entry->id.c_str());
-            }
-        }
-        ImGui::EndDragDropTarget();
-    }
-
-    if (!scene.active)
-        ImGui::PopStyleColor();
-
-    ImGui::TableSetColumnIndex(1);
-    const ImVec4 eyeColor = scene.active ? ImVec4(0.88f, 0.88f, 0.88f, 1.0f) : ImVec4(0.48f, 0.48f, 0.48f, 1.0f);
-    ImGui::PushStyleColor(ImGuiCol_Text, eyeColor);
-    if (ImGui::SmallButton(scene.active ? ICON_FA_EYE : ICON_FA_EYE_SLASH))
-    {
-        if (!scene.active && !scene.path.empty())
-        {
-            if (SceneManager::Instance().LoadScene(scene.path.string()))
-            {
-                m_projectStatus = "Scene enabled: " + scene.relativePath;
-                Tracenf("[HIERARCHY] Scene enabled: %s", scene.relativePath.c_str());
-            }
-        }
-    }
-    ImGui::PopStyleColor();
-    ImGui::SameLine();
-    ImGui::PushStyleColor(ImGuiCol_Text, ImVec4(0.95f, 0.36f, 0.36f, 1.0f));
-    if (ImGui::SmallButton(ICON_FA_TRASH))
-        DetachSceneFromHierarchy(scene);
-    ImGui::PopStyleColor();
-
-    if (hasChildren && open)
-    {
-        for (const HierarchySceneEntity& entity : m_hierarchyEntities)
-        {
-            if (entity.parent == m_sceneRootEntity || entity.parent == 0)
-                RenderHierarchyEntityNode(entity.entity);
-        }
-        ImGui::TreePop();
-    }
-
-    ImGui::PopID();
-}
-
-void EditorImGui::RenderHierarchyContextMenu(const HierarchySceneEntity& entity)
-{
-    ImGui::TextUnformatted(entity.name.c_str());
-    ImGui::Separator();
-
-    if (ImGui::MenuItem(ICON_FA_BULLSEYE " Focus Camera", "F"))
-        QueueHierarchyFocus(entity);
-    if (ImGui::MenuItem(ICON_FA_COPY " Duplicate"))
-    {
-        m_commands.hierarchyDuplicateEntity = true;
-        m_commands.hierarchyEntityType = entity.type;
-        m_commands.hierarchyEntityId = entity.objectId;
-        m_commands.hierarchyEntityHandle = entity.entity;
-        Tracenf("[HIERARCHY] Duplicate requested: flecs=%llu object=%u type=%d",
-            static_cast<unsigned long long>(entity.entity),
-            entity.objectId,
-            static_cast<int>(entity.type));
-    }
-    if (ImGui::MenuItem(ICON_FA_PEN " Rename", "F2"))
-        StartHierarchyRename(entity);
-
-    ImGui::Separator();
-    ImGui::PushStyleColor(ImGuiCol_Text, ImVec4(0.95f, 0.30f, 0.30f, 1.0f));
-    if (ImGui::MenuItem(ICON_FA_TRASH " Delete", "Del"))
-    {
-        m_commands.hierarchyDeleteEntity = true;
-        m_commands.hierarchyEntityType = entity.type;
-        m_commands.hierarchyEntityId = entity.objectId;
-        m_commands.hierarchyEntityHandle = entity.entity;
-        Tracenf("[HIERARCHY] Delete requested: flecs=%llu object=%u type=%d",
-            static_cast<unsigned long long>(entity.entity),
-            entity.objectId,
-            static_cast<int>(entity.type));
-    }
-    ImGui::PopStyleColor();
-}
-
-void EditorImGui::RenderHierarchyEntityNode(std::uint64_t entityHandle)
-{
-    const HierarchySceneEntity* entity = FindHierarchyEntity(entityHandle);
-    if (!entity)
-        return;
-    if (m_hierarchySearchBuffer[0] != '\0' && !HierarchySubtreePassesSearch(entityHandle))
-        return;
-
-    std::vector<std::uint64_t> children;
-    for (const HierarchySceneEntity& candidate : m_hierarchyEntities)
-    {
-        if (candidate.parent == entityHandle)
-            children.push_back(candidate.entity);
-    }
-
-    ImGui::TableNextRow();
-    ImGui::TableSetColumnIndex(0);
-    ImGui::PushID(static_cast<int>(entity->entity & 0xffffffffu));
-
-    if (entity->editorHidden)
-        ImGui::PushStyleColor(ImGuiCol_Text, ImVec4(0.60f, 0.60f, 0.60f, 1.0f));
-
-    const bool selected = entity->selected || m_selectedHierarchyEntity == entity->entity;
-    ImGuiTreeNodeFlags flags = ImGuiTreeNodeFlags_OpenOnArrow | ImGuiTreeNodeFlags_SpanFullWidth;
-    if (children.empty())
-        flags |= ImGuiTreeNodeFlags_Leaf | ImGuiTreeNodeFlags_NoTreePushOnOpen;
-    if (selected)
-        flags |= ImGuiTreeNodeFlags_Selected;
-
-    const char* icon = ICON_FA_CUBE;
-    if (entity->type == HierarchyEntityType::Terrain)
-        icon = ICON_FA_MOUNTAIN;
-    else if (entity->type == HierarchyEntityType::WaterBody)
-        icon = ICON_FA_DROPLET;
-    else if (entity->type == HierarchyEntityType::PointLight)
-        icon = ICON_FA_LIGHTBULB;
-    else if (entity->type == HierarchyEntityType::SpotLight)
-        icon = ICON_FA_BULLSEYE;
-    else if (entity->type == HierarchyEntityType::MeshEntity)
-        icon = ICON_FA_CUBE;
-
-    bool open = false;
-    if (m_hierarchyRenamingEntity == entity->entity)
-    {
-        ImGui::Indent(ImGui::GetTreeNodeToLabelSpacing());
-        ImGui::SetNextItemWidth(-1.0f);
-        ImGui::SetKeyboardFocusHere();
-        if (ImGui::InputText("##rename",
-                m_hierarchyRenameBuffer,
-                sizeof(m_hierarchyRenameBuffer),
-                ImGuiInputTextFlags_EnterReturnsTrue | ImGuiInputTextFlags_AutoSelectAll))
-        {
-            m_commands.hierarchyRenameEntity = true;
-            m_commands.hierarchyEntityType = entity->type;
-            m_commands.hierarchyEntityId = entity->objectId;
-            m_commands.hierarchyEntityHandle = entity->entity;
-            m_commands.hierarchyRenameValue = m_hierarchyRenameBuffer;
-            m_hierarchyRenamingEntity = 0;
-            Tracenf("[HIERARCHY] Rename requested: flecs=%llu new_name=%s",
-                static_cast<unsigned long long>(entity->entity),
-                m_hierarchyRenameBuffer);
-        }
-        if (ImGui::IsKeyPressed(ImGuiKey_Escape))
-            m_hierarchyRenamingEntity = 0;
-        ImGui::Unindent(ImGui::GetTreeNodeToLabelSpacing());
-    }
-    else
-    {
-        const std::string label = std::string(icon) + " " + entity->name + "##" + std::to_string(entity->entity);
-        open = ImGui::TreeNodeEx(label.c_str(), flags);
-        if (ImGui::IsItemClicked() && !ImGui::IsItemToggledOpen())
-        {
-            QueueHierarchySelection(*entity);
-            if (ImGui::IsMouseDoubleClicked(ImGuiMouseButton_Left))
-                QueueHierarchyFocus(*entity);
-        }
-        if (selected)
-            ImGui::SetScrollHereY(0.5f);
-    }
-
-    if (entity->editorHidden)
-        ImGui::PopStyleColor();
-
-    if (ImGui::BeginPopupContextItem("##hierarchy_context"))
-    {
-        RenderHierarchyContextMenu(*entity);
-        ImGui::EndPopup();
-    }
-
-    ImGui::TableSetColumnIndex(1);
-    const ImVec4 eyeColor = entity->editorHidden ? ImVec4(0.48f, 0.48f, 0.48f, 1.0f) : ImVec4(0.88f, 0.88f, 0.88f, 1.0f);
-    ImGui::PushStyleColor(ImGuiCol_Text, eyeColor);
-    if (ImGui::SmallButton(entity->editorHidden ? ICON_FA_EYE_SLASH : ICON_FA_EYE))
-    {
-        m_commands.hierarchyToggleHidden = true;
-        m_commands.hierarchyEntityType = entity->type;
-        m_commands.hierarchyEntityId = entity->objectId;
-        m_commands.hierarchyEntityHandle = entity->entity;
-        Tracenf("[HIERARCHY] Toggle visibility requested: flecs=%llu object=%u type=%d",
-            static_cast<unsigned long long>(entity->entity),
-            entity->objectId,
-            static_cast<int>(entity->type));
-    }
-    ImGui::PopStyleColor();
-
-    if (!children.empty() && open)
-    {
-        for (std::uint64_t child : children)
-            RenderHierarchyEntityNode(child);
-        ImGui::TreePop();
-    }
-    ImGui::PopID();
-}
-
-void EditorImGui::RenderHierarchyPanel()
-{
-    if (ImGui::Begin(ICON_FA_LIST_TREE " Hierarchy"))
-    {
-        RenderHierarchyToolbar();
-        ImGui::Separator();
-
-        const std::vector<ProjectSceneEntry> projectScenes = QueryProjectScenes();
-        if (projectScenes.empty())
-        {
-            ImGui::TextDisabled("No scene open");
-            ImGui::TextWrapped(ProjectManager::Instance().HasProject()
-                    ? "Create a scene from File to add it to this project."
-                    : "Open a project or create a scene from File.");
-        }
-        else if (ImGui::BeginTable("HierarchyEntityTree", 2,
-            ImGuiTableFlags_Resizable | ImGuiTableFlags_RowBg | ImGuiTableFlags_BordersInnerV | ImGuiTableFlags_SizingStretchProp))
-        {
-            ImGui::TableSetupColumn("Label", ImGuiTableColumnFlags_WidthStretch);
-            ImGui::TableSetupColumn("Visibility", ImGuiTableColumnFlags_WidthFixed, 84.0f);
-            ImGui::TableHeadersRow();
-
-            if (ProjectManager::Instance().HasProject())
-            {
-                ImGui::TableNextRow();
-                ImGui::TableSetColumnIndex(0);
-                const ProjectData& project = ProjectManager::Instance().CurrentProject();
-                const std::string rootLabel = std::string(ICON_FA_FOLDER_OPEN) + " " + project.name;
-                const bool projectOpen = ImGui::TreeNodeEx(rootLabel.c_str(),
-                    ImGuiTreeNodeFlags_DefaultOpen | ImGuiTreeNodeFlags_OpenOnArrow | ImGuiTreeNodeFlags_SpanFullWidth);
-                if (ImGui::BeginDragDropTarget())
-                {
-                    if (const ImGuiPayload* payload = ImGui::AcceptDragDropPayload(kAssetPayloadType))
-                    {
-                        const std::string assetId(static_cast<const char*>(payload->Data), payload->DataSize);
-                        const std::vector<AssetLibrary::Entry> sceneAssets = QuerySceneAssets();
-                        const auto sceneIt = std::find_if(sceneAssets.begin(), sceneAssets.end(), [&assetId](const AssetLibrary::Entry& entry) {
-                            return entry.id == assetId;
-                        });
-                        if (sceneIt != sceneAssets.end())
-                            AttachSceneToHierarchy(*sceneIt);
-                    }
-                    ImGui::EndDragDropTarget();
-                }
-                ImGui::TableSetColumnIndex(1);
-                ImGui::TextDisabled("-");
-                if (projectOpen)
-                {
-                    for (const ProjectSceneEntry& scene : projectScenes)
-                        RenderProjectSceneNode(scene);
-                    ImGui::TreePop();
-                }
-            }
-            else
-            {
-                for (const ProjectSceneEntry& scene : projectScenes)
-                    RenderProjectSceneNode(scene);
-            }
-            ImGui::EndTable();
-
-            if (!m_logHierarchyRendered)
-            {
-                m_logHierarchyRendered = true;
-                Tracenf("[HIERARCHY] Project scene tree rendered, root=%llu scenes=%zu entities=%zu",
-                    static_cast<unsigned long long>(m_sceneRootEntity),
-                    projectScenes.size(),
-                    m_hierarchyEntities.size());
-            }
-        }
-    }
-    ImGui::End();
-}
-void EditorImGui::RenderToolsPanel()
-{
-    if (ImGui::Begin("Tools"))
-    {
-        UI::SectionHeader(ICON_FA_WRENCH " Tools");
-        const bool toolsEnabled = CanUseEditorTools();
-        if (!toolsEnabled)
-        {
-            ImGui::TextColored(ImVec4(0.95f, 0.74f, 0.30f, 1.0f), "Tools disabled in Play Mode");
-            ImGui::BeginDisabled();
-        }
-        if (UI::IconButton(ICON_FA_DROPLET, "Water", ImVec2(-1.0f, 0.0f)))
-        {
-            m_commands.addWaterBody = true;
-            Tracen("[EDITOR-3D-SPAWN] Add water requested");
-        }
-
-        ImGui::Separator();
-        UI::SectionHeader(ICON_FA_HAMMER " Editing");
-        if (UI::IconButton(ICON_FA_WATER, "Water Sculpt", ImVec2(-1.0f, 0.0f)))
-            m_waterSculptToolOpen = !m_waterSculptToolOpen;
-        if (UI::IconButton(ICON_FA_MOUNTAIN, "Heightmap", ImVec2(-1.0f, 0.0f)))
-            m_heightmapToolOpen = !m_heightmapToolOpen;
-        if (UI::IconButton(ICON_FA_PAINTBRUSH, "Splat Paint", ImVec2(-1.0f, 0.0f)))
-            m_splatPaintToolOpen = !m_splatPaintToolOpen;
-
-        ImGui::Separator();
-        if (UI::IconButton(ICON_FA_UNDO, "Undo", ImVec2(-1.0f, 0.0f)))
-            m_commands.undo = true;
-        if (UI::IconButton(ICON_FA_FLOPPY_DISK, "Save", ImVec2(-1.0f, 0.0f)))
-            m_commands.save = true;
-        if (UI::IconButton(ICON_FA_ROTATE, "Reload", ImVec2(-1.0f, 0.0f)))
-            m_commands.reload = true;
-
-        if (!toolsEnabled)
-            ImGui::EndDisabled();
-    }
-    ImGui::End();
-
-    if (!m_logToolsRendered)
-    {
-        m_logToolsRendered = true;
-        Tracen("[EDITOR-IMGUI-2] Tools panel rendered");
-    }
-}
-
-void EditorImGui::MarkSelectedWaterBodyChanged()
-{
-    if (!m_waterBodyState.selected)
-        return;
-    m_waterBodyState.center[1] = m_waterBodyState.config.waterLevelY;
-    SceneManager::Instance().MarkDirty();
-    m_commands.selectedWaterBodyChanged = true;
-    m_commands.selectedWaterBody = m_waterBodyState;
-}
-
-void EditorImGui::MarkSelectedLightChanged()
-{
-    if (m_dynamicLightState.type != DynamicLightType::Point &&
-        m_dynamicLightState.type != DynamicLightType::Spot)
-    {
-        return;
-    }
-    SceneManager::Instance().MarkDirty();
-    m_commands.selectedLightChanged = true;
-    m_commands.selectedLight = m_dynamicLightState;
-}
-
-void EditorImGui::MarkSelectedMeshRendererChanged()
-{
-    if (!m_meshRendererState.selected)
-        return;
-    SceneManager::Instance().MarkDirty();
-    m_commands.selectedMeshEntityChanged = true;
-    m_commands.selectedMeshEntity = m_meshRendererState;
-}
-
-bool EditorImGui::RenderAxisFloat(const char* axis,
-                                  float& value,
-                                  float r,
-                                  float g,
-                                  float b,
-                                  float speed,
-                                  float minValue,
-                                  float maxValue)
-{
-    ImGui::PushID(axis);
-    ImGui::TextColored(ImVec4(r, g, b, 1.0f), "%s", axis);
-    ImGui::SameLine();
-    ImGui::SetNextItemWidth(-1.0f);
-    const bool changed = ImGui::DragFloat("##value", &value, speed, minValue, maxValue, "%.2f");
-    ImGui::PopID();
-    return changed;
-}
-
-bool EditorImGui::RenderTransformComponent(float* position, float* rotation, float* scale)
-{
-    bool changed = false;
-    if (ImGui::CollapsingHeader(ICON_FA_CUBE " Transform", ImGuiTreeNodeFlags_DefaultOpen))
-    {
-        ImGui::TextDisabled("Position");
-        changed |= RenderAxisFloat("X", position[0], 0.86f, 0.25f, 0.25f, 0.1f, -500.0f, 500.0f);
-        changed |= RenderAxisFloat("Y", position[1], 0.30f, 0.78f, 0.34f, 0.1f, -100.0f, 200.0f);
-        changed |= RenderAxisFloat("Z", position[2], 0.28f, 0.45f, 0.92f, 0.1f, -500.0f, 500.0f);
-
-        if (rotation)
-        {
-            ImGui::Spacing();
-            ImGui::TextDisabled("Rotation");
-            changed |= RenderAxisFloat("Pitch", rotation[0], 0.86f, 0.25f, 0.25f, 0.5f, -90.0f, 90.0f);
-            changed |= RenderAxisFloat("Yaw", rotation[1], 0.30f, 0.78f, 0.34f, 0.5f, -180.0f, 180.0f);
-            changed |= RenderAxisFloat("Roll", rotation[2], 0.28f, 0.45f, 0.92f, 0.5f, -180.0f, 180.0f);
-        }
-
-        if (scale)
-        {
-            ImGui::Spacing();
-            ImGui::TextDisabled("Scale");
-            changed |= RenderAxisFloat("W", scale[0], 0.86f, 0.25f, 0.25f, 0.1f, 0.1f, 200.0f);
-            changed |= RenderAxisFloat("H", scale[1], 0.30f, 0.78f, 0.34f, 0.1f, 0.1f, 200.0f);
-            changed |= RenderAxisFloat("D", scale[2], 0.28f, 0.45f, 0.92f, 0.1f, 0.1f, 200.0f);
-        }
-    }
-    return changed;
-}
-
-void EditorImGui::RenderAddComponentMenu()
-{
-    const bool hasWater = m_waterBodyState.selected;
-    const bool hasPoint = m_dynamicLightState.type == DynamicLightType::Point;
-    const bool hasSpot = m_dynamicLightState.type == DynamicLightType::Spot;
-    const bool hasMesh = m_meshRendererState.selected;
-    const bool hasSelection = hasWater || hasPoint || hasSpot || hasMesh;
-    if (!m_componentRegistryLogged)
-    {
-        m_componentRegistryLogged = true;
-        Tracen("[INSPECTOR-COMP] registered=7 categories=[Core, Rendering, Lighting, Editor]");
-    }
-
-    auto hasAttachedComponent = [&](const char* id) {
-        return std::any_of(m_meshRendererState.editorComponents.begin(),
-            m_meshRendererState.editorComponents.end(),
-            [id](const EditorAttachedComponent& component) { return component.type == id; });
-    };
-    auto selectionHasComponent = [&](const InspectorComponentDefinition& definition) {
-        const std::string id = definition.id;
-        if (id == "builtin.transform")
-            return hasSelection;
-        if (id == "builtin.mesh_renderer")
-            return hasMesh;
-        if (id == "builtin.water_body")
-            return hasWater;
-        if (id == "builtin.point_light")
-            return hasPoint;
-        if (id == "builtin.spot_light")
-            return hasSpot;
-        return hasMesh && hasAttachedComponent(definition.id);
-    };
-
-    if (!hasSelection)
-    {
-        ImGui::BeginDisabled();
-        UI::IconButton(ICON_FA_PLUS, "Add Component", ImVec2(-1.0f, 0.0f));
-        ImGui::EndDisabled();
-        return;
-    }
-
-    if (UI::IconButton(ICON_FA_PLUS, "Add Component", ImVec2(-1.0f, 0.0f)))
-    {
-        m_componentSearchBuffer[0] = '\0';
-        ImGui::OpenPopup("AddComponentPopup");
-    }
-
-    if (ImGui::BeginPopup("AddComponentPopup"))
-    {
-        ImGui::SetNextItemWidth(260.0f);
-        ImGui::InputTextWithHint("##componentSearch", "Search components...", m_componentSearchBuffer, sizeof(m_componentSearchBuffer));
-        ImGui::Separator();
-
-        const std::string filter = ToLowerAscii(m_componentSearchBuffer);
-        std::string currentCategory;
-        for (const InspectorComponentDefinition& definition : InspectorComponentRegistry())
-        {
-            if (!filter.empty() &&
-                ToLowerAscii(definition.displayName).find(filter) == std::string::npos &&
-                ToLowerAscii(definition.category).find(filter) == std::string::npos)
-            {
-                continue;
-            }
-
-            if (currentCategory != definition.category)
-            {
-                currentCategory = definition.category;
-                ImGui::TextDisabled("%s", currentCategory.c_str());
-            }
-
-            const bool alreadyPresent = selectionHasComponent(definition);
-            const bool canAddToSelection =
-                definition.legacyType != EditorComponentType::None ||
-                (definition.addableToMesh && hasMesh);
-            const bool disabled = alreadyPresent || !canAddToSelection;
-            if (disabled)
-                ImGui::BeginDisabled();
-            if (ImGui::MenuItem(definition.displayName, nullptr, false, !disabled))
-            {
-                m_commands.addComponentToSelectedEntity = true;
-                m_commands.addComponentType = definition.legacyType;
-                m_commands.addComponentTypeId = definition.id;
-                Tracenf("[INSPECTOR-COMP] add requested component=%s", definition.displayName);
-                ImGui::CloseCurrentPopup();
-            }
-            if (disabled)
-                ImGui::EndDisabled();
-        }
-
-        ImGui::EndPopup();
-    }
-}
-
-bool EditorImGui::RenderAttachedEditorComponents(std::vector<EditorAttachedComponent>& components)
-{
-    bool changed = false;
-    for (EditorAttachedComponent& component : components)
-    {
-        if (component.type != kEditorNoteComponentId && component.type != kLodComponentId)
-            continue;
-
-        ImGui::PushID(component.type.c_str());
-        const bool isLod = component.type == kLodComponentId;
-        const bool open = ImGui::CollapsingHeader(isLod ? "LOD Group" : "Note", ImGuiTreeNodeFlags_DefaultOpen);
-        ImGui::SameLine();
-        if (ImGui::SmallButton("..."))
-            ImGui::OpenPopup("ComponentMenu");
-        if (ImGui::BeginPopup("ComponentMenu"))
-        {
-            if (ImGui::MenuItem("Remove Component"))
-            {
-                m_commands.removeComponentFromSelectedEntity = true;
-                m_commands.removeComponentTypeId = component.type;
-            }
-            ImGui::EndPopup();
-        }
-        if (open)
-        {
-            if (isLod)
-            {
-                LodComponent& lod = m_meshRendererState.lod;
-                lod.enabled = true;
-                bool lodConfigChanged = false;
-                bool lodCommitRequested = false;
-                const std::optional<LodConfig> assetDefault = FindModelLodDefault(m_meshRendererState.meshAssetId);
-                const char* source = lod.overrideAssetDefault
-                    ? "Entity override"
-                    : (assetDefault ? "Asset default" : "Engine default");
-                ImGui::TextDisabled("Source: %s", source);
-                bool overrideEnabled = lod.overrideAssetDefault;
-                if (ImGui::Checkbox("Override on this entity", &overrideEnabled))
-                {
-                    lod.overrideAssetDefault = overrideEnabled;
-                    if (overrideEnabled && assetDefault)
-                        lod.config = *assetDefault;
-                    lodConfigChanged = true;
-                    changed = true;
-                }
-
-                LodConfig displayConfig = lod.overrideAssetDefault
-                    ? lod.config
-                    : (assetDefault ? *assetDefault : LodConfig{});
-                const bool editEnabled = lod.overrideAssetDefault || !assetDefault;
-                if (!editEnabled)
-                    ImGui::BeginDisabled();
-
-                int levelCount = static_cast<int>(std::clamp(displayConfig.levelCount, 1u, LodConfig::MaxLevels));
-                if (ImGui::SliderInt("Levels", &levelCount, 1, static_cast<int>(LodConfig::MaxLevels)))
-                {
-                    displayConfig.levelCount = static_cast<std::uint32_t>(levelCount);
-                    lodConfigChanged = true;
-                    changed = true;
-                }
-                lodCommitRequested = lodCommitRequested || ImGui::IsItemDeactivatedAfterEdit();
-                float hysteresis = displayConfig.hysteresisMeters;
-                if (ImGui::DragFloat("Hysteresis (m)", &hysteresis, 0.25f, 0.0f, 100.0f, "%.2f"))
-                {
-                    displayConfig.hysteresisMeters = std::max(0.0f, hysteresis);
-                    lodConfigChanged = true;
-                    changed = true;
-                }
-                lodCommitRequested = lodCommitRequested || ImGui::IsItemDeactivatedAfterEdit();
-                for (std::uint32_t level = 1; level < static_cast<std::uint32_t>(levelCount); ++level)
-                {
-                    ImGui::Separator();
-                    ImGui::Text("LOD%u", level);
-                    float ratioPercent = std::clamp(displayConfig.targetRatios[level], 0.001f, 1.0f) * 100.0f;
-                    std::string ratioLabel = "Target %##ratio" + std::to_string(level);
-                    if (ImGui::SliderFloat(ratioLabel.c_str(), &ratioPercent, 1.0f, 100.0f, "%.1f"))
-                    {
-                        displayConfig.targetRatios[level] = std::clamp(ratioPercent / 100.0f, 0.001f, 1.0f);
-                        lodConfigChanged = true;
-                        changed = true;
-                    }
-                    lodCommitRequested = lodCommitRequested || ImGui::IsItemDeactivatedAfterEdit();
-                    float distance = displayConfig.distances[level];
-                    std::string distanceLabel = "Distance (m)##distance" + std::to_string(level);
-                    if (ImGui::DragFloat(distanceLabel.c_str(), &distance, 1.0f, 0.0f, 100000.0f, "%.1f"))
-                    {
-                        displayConfig.distances[level] = std::max(0.0f, distance);
-                        lodConfigChanged = true;
-                        changed = true;
-                    }
-                    lodCommitRequested = lodCommitRequested || ImGui::IsItemDeactivatedAfterEdit();
-                }
-                if (!editEnabled)
-                    ImGui::EndDisabled();
-
-                if (lodConfigChanged && editEnabled)
-                {
-                    displayConfig.levelCount = std::clamp(displayConfig.levelCount, 1u, LodConfig::MaxLevels);
-                    displayConfig.targetRatios[0] = 1.0f;
-                    displayConfig.distances[0] = 0.0f;
-                    lod.config = displayConfig;
-                    if (LodLogsEnabled())
-                    {
-                        Tracenf("[LOD] ui edit entity=%u levels=%u override=%d",
-                            m_meshRendererState.id,
-                            lod.config.levelCount,
-                            lod.overrideAssetDefault ? 1 : 0);
-                    }
-                }
-                if (lodCommitRequested && editEnabled)
-                {
-                    m_commands.lodQualityCommitRequested = true;
-                    m_commands.lodQualityCommitEntityId = m_meshRendererState.id;
-                    m_commands.lodQualityCommitConfig = lod.config;
-                }
-                if (UI::IconButton(ICON_FA_FLOPPY_DISK, "Set as asset default", ImVec2(-1.0f, 0.0f)))
-                {
-                    const LodConfig defaultConfig = lod.overrideAssetDefault ? lod.config : displayConfig;
-                    if (SaveModelLodDefault(m_meshRendererState.meshAssetId, defaultConfig))
-                    {
-                        lod.overrideAssetDefault = false;
-                        lod.config = defaultConfig;
-                        changed = true;
-                    }
-                }
-            }
-            else
-            {
-                char noteBuffer[512]{};
-                CopyToBuffer(noteBuffer, sizeof(noteBuffer), component.note);
-                if (ImGui::InputTextMultiline("##note", noteBuffer, sizeof(noteBuffer), ImVec2(-1.0f, 96.0f)))
-                {
-                    component.note = noteBuffer;
-                    changed = true;
-                }
-            }
-        }
-        ImGui::PopID();
-    }
-    return changed;
-}
-
-void EditorImGui::RenderSelectedWaterBodyInspector()
-{
-    if (!m_waterBodyState.selected)
-        return;
-
-    UI::SectionHeader(ICON_FA_CUBE " Entity");
-    ImGui::TextDisabled("flecs=%llu  object=%u",
-        static_cast<unsigned long long>(m_selectedHierarchyEntity),
-        m_waterBodyState.id);
-
-    char nameBuffer[96]{};
-    std::snprintf(nameBuffer, sizeof(nameBuffer), "%s", m_waterBodyState.name.c_str());
-    if (ImGui::InputText("Name", nameBuffer, sizeof(nameBuffer)))
-    {
-        m_waterBodyState.name = nameBuffer[0] != '\0' ? nameBuffer : ("Water_" + std::to_string(m_waterBodyState.id));
-        MarkSelectedWaterBodyChanged();
-    }
-
-    float position[3] = {m_waterBodyState.center[0], m_waterBodyState.config.waterLevelY, m_waterBodyState.center[2]};
-    float scale[3] = {m_waterBodyState.width, 1.0f, m_waterBodyState.depth};
-    if (RenderTransformComponent(position, nullptr, scale))
-    {
-        m_waterBodyState.center[0] = position[0];
-        m_waterBodyState.config.waterLevelY = position[1];
-        m_waterBodyState.center[1] = position[1];
-        m_waterBodyState.center[2] = position[2];
-        m_waterBodyState.width = scale[0];
-        m_waterBodyState.depth = scale[2];
-        MarkSelectedWaterBodyChanged();
-    }
-
-    if (!ImGui::CollapsingHeader(ICON_FA_WATER " Water Body", ImGuiTreeNodeFlags_DefaultOpen))
-        return;
-    const std::string materialLabel = m_waterBodyState.materialName.empty()
-        ? (m_waterBodyState.materialId.empty() ? std::string("Inline Water") : m_waterBodyState.materialId)
-        : m_waterBodyState.materialName;
-    ImGui::TextUnformatted("Material");
-    ImGui::PushStyleColor(ImGuiCol_Button, ImVec4(0.16f, 0.42f, 0.46f, 1.0f));
-    ImGui::Button(materialLabel.c_str(), ImVec2(-1.0f, 42.0f));
-    ImGui::PopStyleColor();
-    if (ImGui::BeginDragDropTarget())
-    {
-        if (const ImGuiPayload* payload = ImGui::AcceptDragDropPayload(kAssetPayloadType))
-        {
-            const std::string assetId(static_cast<const char*>(payload->Data), payload->DataSize);
-            AssignAssetToSelectedWaterBody(assetId);
-        }
-        ImGui::EndDragDropTarget();
-    }
-
-    if (UI::IconButton(ICON_FA_PALETTE, "Edit Material"))
-    {
-        m_commands.selectedWaterBodyChanged = true;
-        m_commands.selectedWaterBody = m_waterBodyState;
-        m_commands.openSelectedWaterMaterialEditor = true;
-        OpenWaterMaterialEditor(m_waterBodyState.materialId);
-    }
-    ImGui::SameLine();
-    if (UI::IconButton(ICON_FA_FOLDER_OPEN, "Change Material"))
-        ImGui::OpenPopup("ChangeWaterMaterial");
-
-    if (ImGui::BeginPopup("ChangeWaterMaterial"))
-    {
-        ImGui::TextUnformatted("Select water material:");
-        ImGui::Separator();
-        for (const auto& material : m_waterMaterials)
-        {
-            const bool selected = material.first == m_waterBodyState.materialId;
-            if (ImGui::Selectable(material.first.c_str(), selected))
-            {
-                const std::string oldId = m_waterBodyState.materialId;
-                m_waterBodyState.materialId = material.first;
-                m_waterBodyState.materialName = material.first;
-                Tracenf("[EDITOR-IMGUI-2] Material change: body_id=%u from=%s to=%s",
-                    m_waterBodyState.id,
-                    oldId.c_str(),
-                    m_waterBodyState.materialId.c_str());
-                MarkSelectedWaterBodyChanged();
-            }
-        }
-        ImGui::EndPopup();
-    }
-
-    ImGui::Separator();
-    RenderAddComponentMenu();
-    ImGui::Separator();
-    if (UI::IconButton(ICON_FA_TRASH, "Delete Water Body", ImVec2(-1.0f, 0.0f)))
-        m_commands.deleteSelectedWaterBody = true;
-}
-
-void EditorImGui::RenderSelectedLightInspector()
-{
-    if (m_dynamicLightState.type == DynamicLightType::None)
-        return;
-
-    const bool isPoint = m_dynamicLightState.type == DynamicLightType::Point;
-    const bool isSpot = m_dynamicLightState.type == DynamicLightType::Spot;
-    UI::SectionHeader(ICON_FA_CUBE " Entity");
-    ImGui::TextDisabled("flecs=%llu  object=%u",
-        static_cast<unsigned long long>(m_selectedHierarchyEntity),
-        m_dynamicLightState.id);
-
-    if (isPoint)
-    {
-        PointLight& point = m_dynamicLightState.point;
-        char nameBuffer[96]{};
-        std::snprintf(nameBuffer, sizeof(nameBuffer), "%s", PointLightDisplayName(point).c_str());
-        if (ImGui::InputText("Name", nameBuffer, sizeof(nameBuffer)))
-        {
-            point.name = nameBuffer;
-            MarkSelectedLightChanged();
-        }
-        float position[3] = {point.position[0], point.position[1], point.position[2]};
-        float scale[3] = {point.radius, point.radius, point.radius};
-        if (RenderTransformComponent(position, nullptr, scale))
-        {
-            point.position[0] = position[0];
-            point.position[1] = position[1];
-            point.position[2] = position[2];
-            point.radius = std::clamp(scale[0], 0.5f, 100.0f);
-            MarkSelectedLightChanged();
-        }
-
-        if (!ImGui::CollapsingHeader(ICON_FA_LIGHTBULB " Point Light", ImGuiTreeNodeFlags_DefaultOpen))
-            return;
-        bool changed = false;
-        changed |= ImGui::Checkbox("Enabled", &point.enabled);
-        changed |= ImGui::ColorEdit3("Color", &point.r);
-        changed |= ImGui::SliderFloat("Intensity", &point.intensity, 0.0f, 10.0f, "%.2f");
-        changed |= ImGui::SliderFloat("Radius", &point.radius, 0.5f, 100.0f, "%.1f m");
-        if (changed)
-            MarkSelectedLightChanged();
-    }
-    else if (isSpot)
-    {
-        SpotLight& spot = m_dynamicLightState.spot;
-        char nameBuffer[96]{};
-        std::snprintf(nameBuffer, sizeof(nameBuffer), "%s", SpotLightDisplayName(spot).c_str());
-        if (ImGui::InputText("Name", nameBuffer, sizeof(nameBuffer)))
-        {
-            spot.name = nameBuffer;
-            MarkSelectedLightChanged();
-        }
-        float position[3] = {spot.position[0], spot.position[1], spot.position[2]};
-        float rotation[3] = {spot.rotation[0] * 57.2957795f, spot.rotation[1] * 57.2957795f, spot.rotation[2] * 57.2957795f};
-        float scale[3] = {spot.radius, spot.radius, spot.radius};
-        if (RenderTransformComponent(position, rotation, scale))
-        {
-            spot.position[0] = position[0];
-            spot.position[1] = position[1];
-            spot.position[2] = position[2];
-            spot.rotation[0] = rotation[0] / 57.2957795f;
-            spot.rotation[1] = rotation[1] / 57.2957795f;
-            spot.rotation[2] = rotation[2] / 57.2957795f;
-            spot.radius = std::clamp(scale[0], 0.5f, 100.0f);
-            MarkSelectedLightChanged();
-        }
-
-        if (!ImGui::CollapsingHeader(ICON_FA_BULLSEYE " Spot Light", ImGuiTreeNodeFlags_DefaultOpen))
-            return;
-        bool changed = false;
-        changed |= ImGui::Checkbox("Enabled", &spot.enabled);
-        changed |= ImGui::ColorEdit3("Color", &spot.r);
-        changed |= ImGui::SliderFloat("Intensity", &spot.intensity, 0.0f, 10.0f, "%.2f");
-        changed |= ImGui::SliderFloat("Radius", &spot.radius, 0.5f, 100.0f, "%.1f m");
-        float pitch = spot.rotation[0] * 57.2957795f;
-        float yaw = spot.rotation[1] * 57.2957795f;
-        if (ImGui::SliderFloat("Pitch", &pitch, -90.0f, 90.0f, "%.1f deg"))
-        {
-            spot.rotation[0] = pitch / 57.2957795f;
-            changed = true;
-        }
-        if (ImGui::SliderFloat("Yaw", &yaw, -180.0f, 180.0f, "%.1f deg"))
-        {
-            spot.rotation[1] = yaw / 57.2957795f;
-            changed = true;
-        }
-        changed |= ImGui::SliderFloat("Inner Cone", &spot.innerConeDegrees, 1.0f, 89.0f, "%.1f deg");
-        changed |= ImGui::SliderFloat("Outer Cone", &spot.outerConeDegrees, 1.0f, 90.0f, "%.1f deg");
-        spot.outerConeDegrees = std::max(spot.outerConeDegrees, spot.innerConeDegrees);
-        if (changed)
-            MarkSelectedLightChanged();
-    }
-
-    ImGui::Separator();
-    RenderAddComponentMenu();
-    ImGui::Separator();
-    if (UI::IconButton(ICON_FA_TRASH, "Delete Light", ImVec2(-1.0f, 0.0f)))
-        m_commands.deleteSelectedLight = true;
-}
-
-void EditorImGui::RenderSelectedMeshRendererInspector()
-{
-    if (!m_meshRendererState.selected)
-        return;
-
-    UI::SectionHeader(ICON_FA_CUBE " Entity");
-    ImGui::TextDisabled("flecs=%llu  object=%u",
-        static_cast<unsigned long long>(m_selectedHierarchyEntity),
-        m_meshRendererState.id);
-
-    char nameBuffer[96]{};
-    std::snprintf(nameBuffer, sizeof(nameBuffer), "%s", m_meshRendererState.name.c_str());
-    if (ImGui::InputText("Name", nameBuffer, sizeof(nameBuffer)))
-    {
-        m_meshRendererState.name = nameBuffer[0] != '\0' ? nameBuffer : ("Mesh Entity " + std::to_string(m_meshRendererState.id));
-        MarkSelectedMeshRendererChanged();
-    }
-
-    float position[3] = {m_meshRendererState.position[0], m_meshRendererState.position[1], m_meshRendererState.position[2]};
-    float rotation[3] = {
-        m_meshRendererState.rotation[0] * 57.2957795f,
-        m_meshRendererState.rotation[1] * 57.2957795f,
-        m_meshRendererState.rotation[2] * 57.2957795f};
-    float scale[3] = {m_meshRendererState.scale[0], m_meshRendererState.scale[1], m_meshRendererState.scale[2]};
-    if (RenderTransformComponent(position, rotation, scale))
-    {
-        m_meshRendererState.position[0] = position[0];
-        m_meshRendererState.position[1] = position[1];
-        m_meshRendererState.position[2] = position[2];
-        m_meshRendererState.rotation[0] = rotation[0] / 57.2957795f;
-        m_meshRendererState.rotation[1] = rotation[1] / 57.2957795f;
-        m_meshRendererState.rotation[2] = rotation[2] / 57.2957795f;
-        m_meshRendererState.scale[0] = std::max(scale[0], 0.001f);
-        m_meshRendererState.scale[1] = std::max(scale[1], 0.001f);
-        m_meshRendererState.scale[2] = std::max(scale[2], 0.001f);
-        MarkSelectedMeshRendererChanged();
-    }
-
-    if (ImGui::CollapsingHeader(ICON_FA_CUBE " MeshRenderer", ImGuiTreeNodeFlags_DefaultOpen))
-    {
-        const std::string meshLabel = m_meshRendererState.meshDisplayName.empty()
-            ? (m_meshRendererState.meshAssetId.empty() ? std::string("No model assigned") : m_meshRendererState.meshAssetId)
-            : m_meshRendererState.meshDisplayName;
-        ImGui::TextUnformatted("Mesh");
-        ImGui::PushStyleColor(ImGuiCol_Button, ImVec4(0.42f, 0.34f, 0.64f, 1.0f));
-        ImGui::Button(meshLabel.c_str(), ImVec2(-1.0f, 42.0f));
-        ImGui::PopStyleColor();
-        if (ImGui::BeginDragDropTarget())
-        {
-            if (const ImGuiPayload* payload = ImGui::AcceptDragDropPayload(kAssetPayloadType))
-            {
-                const std::string assetId(static_cast<const char*>(payload->Data), payload->DataSize);
-                AssignAssetToSelectedMeshRenderer(assetId);
-            }
-            ImGui::EndDragDropTarget();
-        }
-        ImGui::TextDisabled("Asset ID: %s", m_meshRendererState.meshAssetId.empty() ? "<none>" : m_meshRendererState.meshAssetId.c_str());
-        ImGui::TextDisabled("Path: %s", m_meshRendererState.meshAssetPath.empty() ? "<none>" : m_meshRendererState.meshAssetPath.c_str());
-        ImGui::TextDisabled("Render path: %s", m_meshRendererState.skinned ? "SkinnedMeshRenderer" : "StaticMeshRenderer");
-    }
-
-    if (!m_meshRendererState.skinned &&
-        ImGui::CollapsingHeader(ICON_FA_LAYER_GROUP " Material Slots", ImGuiTreeNodeFlags_DefaultOpen))
-    {
-        m_meshRendererState.materialSlotCount = std::max<std::uint32_t>(
-            1u,
-            std::max(m_meshRendererState.materialSlotCount,
-                static_cast<std::uint32_t>(m_meshRendererState.materialSlots.size())));
-        if (m_meshRendererState.materialSlots.size() < m_meshRendererState.materialSlotCount)
-            m_meshRendererState.materialSlots.resize(m_meshRendererState.materialSlotCount);
-
-        auto materialLabelForGuid = [](const std::string& guidText) {
-            if (guidText.empty())
-                return std::string("(Drop Material here)");
-            const std::optional<Guid> guid = Guid::fromString(guidText);
-            if (!guid)
-                return std::string("Invalid material GUID");
-            const std::optional<std::filesystem::path> path = AssetDatabase::Instance().resolveGuid(*guid);
-            if (!path)
-                return std::string("Missing Material");
-            return path->filename().generic_string();
-        };
-
-        for (std::uint32_t slot = 0; slot < m_meshRendererState.materialSlotCount; ++slot)
-        {
-            ImGui::PushID(static_cast<int>(slot));
-            ImGui::Text("[%u] Submesh %u", slot, slot);
-            ImGui::SameLine();
-            if (UI::IconButton(ICON_FA_XMARK, "Clear Material Slot", ImVec2(28.0f, 0.0f)))
-            {
-                m_meshRendererState.materialSlots[slot].clear();
-                MarkSelectedMeshRendererChanged();
-                Tracenf("[MATERIAL-SLOTS] clear entity=%u slot=%u",
-                    m_meshRendererState.id,
-                    slot);
-            }
-            const std::string label = materialLabelForGuid(m_meshRendererState.materialSlots[slot]);
-            const bool emptySlot = m_meshRendererState.materialSlots[slot].empty();
-            ImGui::PushStyleColor(ImGuiCol_Button,
-                emptySlot ? ImVec4(0.22f, 0.22f, 0.25f, 1.0f) : ImVec4(0.34f, 0.42f, 0.34f, 1.0f));
-            ImGui::Button(label.c_str(), ImVec2(-1.0f, 42.0f));
-            ImGui::PopStyleColor();
-            if (ImGui::BeginDragDropTarget())
-            {
-                if (const ImGuiPayload* payload = ImGui::AcceptDragDropPayload(kAssetPayloadType))
-                {
-                    const std::string assetId(static_cast<const char*>(payload->Data), payload->DataSize);
-                    const auto entry = m_assetLibrary ? m_assetLibrary->FindById(assetId) : std::optional<AssetLibrary::Entry>{};
-                    if (entry && entry->category == AssetLibrary::Category::Material)
-                    {
-                        std::filesystem::path materialPath =
-                            entry->originalPath.empty() ? m_assetLibrary->AbsolutePath(*entry) : std::filesystem::path(entry->originalPath);
-                        if (materialPath.is_relative())
-                            materialPath = m_assetLibrary->AbsolutePath(*entry);
-                        const Guid guid = AssetDatabase::Instance().getOrCreateGuid(materialPath);
-                        m_meshRendererState.materialSlots[slot] = guid.toString();
-                        m_assetStatus = "Material slot <- " + entry->displayName;
-                        MarkSelectedMeshRendererChanged();
-                        Tracenf("[MATERIAL-SLOTS] assign entity=%u slot=%u material=%s guid=%s",
-                            m_meshRendererState.id,
-                            slot,
-                            entry->displayName.c_str(),
-                            guid.toString().c_str());
-                    }
-                    else
-                    {
-                        m_assetStatus = "Material Slots accept Material assets";
-                    }
-                }
-                ImGui::EndDragDropTarget();
-            }
-            if (!m_meshRendererState.materialSlots[slot].empty())
-                ImGui::TextDisabled("guid: %s", m_meshRendererState.materialSlots[slot].c_str());
-            ImGui::Spacing();
-            ImGui::PopID();
-        }
-    }
-
-    if (!m_meshRendererState.skinned &&
-        ImGui::CollapsingHeader(ICON_FA_PALETTE " Material", ImGuiTreeNodeFlags_DefaultOpen))
-    {
-        m_meshRendererState.materialSlotCount = std::max<std::uint32_t>(1u, m_meshRendererState.materialSlotCount);
-        m_meshRendererState.selectedMaterialSlot = std::min(m_meshRendererState.selectedMaterialSlot,
-            m_meshRendererState.materialSlotCount - 1u);
-        if (m_meshRendererState.materialSlotCount > 1)
-        {
-            ImGui::TextDisabled("Material Slot");
-            ImGui::SameLine();
-            for (std::uint32_t slot = 0; slot < m_meshRendererState.materialSlotCount; ++slot)
-            {
-                ImGui::PushID(static_cast<int>(slot));
-                if (slot > 0)
-                    ImGui::SameLine();
-                const bool selected = slot == m_meshRendererState.selectedMaterialSlot;
-                if (selected)
-                    ImGui::PushStyleColor(ImGuiCol_Button, ImGui::GetStyleColorVec4(ImGuiCol_ButtonActive));
-                if (ImGui::SmallButton(std::to_string(slot).c_str()))
-                    m_meshRendererState.selectedMaterialSlot = slot;
-                if (selected)
-                    ImGui::PopStyleColor();
-                ImGui::PopID();
-            }
-        }
-
-        auto findOverride = [&]() -> MeshSceneEntity::MaterialOverride& {
-            const std::uint32_t slot = m_meshRendererState.selectedMaterialSlot;
-            auto it = std::find_if(m_meshRendererState.materialOverrides.begin(),
-                m_meshRendererState.materialOverrides.end(),
-                [slot](const MeshSceneEntity::MaterialOverride& material) { return material.slot == slot; });
-            if (it == m_meshRendererState.materialOverrides.end())
-            {
-                MeshSceneEntity::MaterialOverride material{};
-                material.slot = slot;
-                m_meshRendererState.materialOverrides.push_back(material);
-                return m_meshRendererState.materialOverrides.back();
-            }
-            return *it;
-        };
-
-        MeshSceneEntity::MaterialOverride& material = findOverride();
-        bool changed = false;
-        changed |= ImGui::Checkbox("Override Active", &material.enabled);
-        changed |= ImGui::ColorEdit4("BaseColor Tint", material.baseColor, ImGuiColorEditFlags_Float);
-        changed |= ImGui::SliderFloat("Metallic", &material.metallic, 0.0f, 1.0f, "%.2f");
-        changed |= ImGui::SliderFloat("Roughness", &material.roughness, 0.0f, 1.0f, "%.2f");
-        changed |= ImGui::SliderFloat("Normal Strength", &material.normalStrength, 0.0f, 4.0f, "%.2f");
-        changed |= ImGui::SliderFloat("AO Strength", &material.aoStrength, 0.0f, 2.0f, "%.2f");
-        changed |= ImGui::ColorEdit3("Emissive", material.emissive, ImGuiColorEditFlags_Float);
-        changed |= ImGui::SliderFloat("Emissive Intensity", &material.emissiveIntensity, 0.0f, 20.0f, "%.2f");
-        changed |= ImGui::DragFloat2("UV Tiling", material.uvTiling, 0.01f, 0.01f, 64.0f, "%.2f");
-        changed |= ImGui::DragFloat2("UV Offset", material.uvOffset, 0.01f, -1000.0f, 1000.0f, "%.2f");
-
-        material.baseColor[0] = std::clamp(material.baseColor[0], 0.0f, 8.0f);
-        material.baseColor[1] = std::clamp(material.baseColor[1], 0.0f, 8.0f);
-        material.baseColor[2] = std::clamp(material.baseColor[2], 0.0f, 8.0f);
-        material.baseColor[3] = std::clamp(material.baseColor[3], 0.0f, 1.0f);
-        material.metallic = std::clamp(material.metallic, 0.0f, 1.0f);
-        material.roughness = std::clamp(material.roughness, 0.0f, 1.0f);
-        material.normalStrength = std::clamp(material.normalStrength, 0.0f, 4.0f);
-        material.aoStrength = std::clamp(material.aoStrength, 0.0f, 2.0f);
-        material.emissiveIntensity = std::clamp(material.emissiveIntensity, 0.0f, 20.0f);
-        material.uvTiling[0] = std::clamp(material.uvTiling[0], 0.01f, 64.0f);
-        material.uvTiling[1] = std::clamp(material.uvTiling[1], 0.01f, 64.0f);
-
-        if (changed)
-        {
-            material.enabled = true;
-            Tracenf("[MMAT] entity=%u slot=%u baseColor=(%.3f,%.3f,%.3f,%.3f) metallic=%.3f roughness=%.3f normal=%.3f ao=%.3f emissive=(%.3f,%.3f,%.3f,%.3f) uvTiling=(%.3f,%.3f) uvOffset=(%.3f,%.3f) (changed)",
-                m_meshRendererState.id,
-                material.slot,
-                material.baseColor[0], material.baseColor[1], material.baseColor[2], material.baseColor[3],
-                material.metallic,
-                material.roughness,
-                material.normalStrength,
-                material.aoStrength,
-                material.emissive[0], material.emissive[1], material.emissive[2], material.emissiveIntensity,
-                material.uvTiling[0], material.uvTiling[1],
-                material.uvOffset[0], material.uvOffset[1]);
-            Tracen("[MMAT] override buffer updated (live, no reload, no remesh)");
-            MarkSelectedMeshRendererChanged();
-        }
-    }
-
-    ImGui::Separator();
-    if (RenderAttachedEditorComponents(m_meshRendererState.editorComponents))
-        MarkSelectedMeshRendererChanged();
-    RenderAddComponentMenu();
-    ImGui::Separator();
-    if (UI::IconButton(ICON_FA_TRASH, "Delete Mesh Entity", ImVec2(-1.0f, 0.0f)))
-        m_commands.deleteSelectedMeshEntity = true;
-}
-
-void EditorImGui::ApplyTimeOfDayPreset(float hour)
-{
-    if (hour < 6.0f)
-    {
-        m_lightingState.directional.azimuthDegrees = 180.0f;
-        m_lightingState.directional.elevationDegrees = 4.0f;
-        m_lightingState.directional.intensity = 0.2f;
-        m_lightingState.ambient.intensity = 0.35f;
-    }
-    else if (hour < 10.0f)
-    {
-        m_lightingState.directional.azimuthDegrees = 90.0f;
-        m_lightingState.directional.elevationDegrees = 18.0f;
-        m_lightingState.directional.intensity = 0.9f;
-        m_lightingState.ambient.intensity = 0.6f;
-    }
-    else if (hour < 17.0f)
-    {
-        m_lightingState.directional.azimuthDegrees = 180.0f;
-        m_lightingState.directional.elevationDegrees = 75.0f;
-        m_lightingState.directional.intensity = 1.2f;
-        m_lightingState.ambient.intensity = 0.8f;
-    }
-    else
-    {
-        m_lightingState.directional.azimuthDegrees = 270.0f;
-        m_lightingState.directional.elevationDegrees = 10.0f;
-        m_lightingState.directional.intensity = 0.7f;
-        m_lightingState.ambient.intensity = 0.7f;
-    }
-}
-
-void EditorImGui::RenderLightingPanel()
-{
-    UI::SectionHeader(ICON_FA_LIGHTBULB " Directional Light");
-    ImGui::Checkbox("Sun Enabled", &m_lightingState.directional.enabled);
-    ImGui::Checkbox("Sun Shadows", &m_lightingState.sunShadowsEnabled);
-    ImGui::ColorEdit3("Sun Color", &m_lightingState.directional.r);
-    ImGui::SliderFloat("Sun Intensity", &m_lightingState.directional.intensity, 0.0f, 5.0f, "%.2f");
-    ImGui::SliderFloat("Sun Angle X", &m_lightingState.directional.elevationDegrees, -90.0f, 90.0f, "%.1f deg");
-    ImGui::SliderFloat("Sun Angle Y", &m_lightingState.directional.azimuthDegrees, 0.0f, 360.0f, "%.1f deg");
-
-    ImGui::Spacing();
-    UI::SectionHeader(ICON_FA_GEAR " Ambient Light");
-    ImGui::ColorEdit3("Ambient Color", &m_lightingState.ambient.r);
-    ImGui::SliderFloat("Ambient Intensity", &m_lightingState.ambient.intensity, 0.0f, 3.0f, "%.2f");
-
-    ImGui::Spacing();
-    UI::SectionHeader(ICON_FA_GEAR " Time of Day");
-    ImGui::SliderFloat("Hour", &m_timeOfDayHours, 0.0f, 24.0f, "%.1f h");
-    if (UI::IconButton(ICON_FA_CHECK, "Apply Preset"))
-        ApplyTimeOfDayPreset(m_timeOfDayHours);
-}
-
-void EditorImGui::RenderDynamicLightsPanel()
-{
-    const uint32_t total = m_lightingState.numPointLights + m_lightingState.numSpotLights;
-    ImGui::Text("Total: %u / %u", total, kMaxDynamicPointLights + kMaxDynamicSpotLights);
-
-    if (UI::IconButton(ICON_FA_LIGHTBULB, "Point Light"))
-    {
-        m_commands.addPointLight = true;
-        Tracen("[EDITOR-IMGUI-2] Light spawn: type=point id=pending");
-    }
-    ImGui::SameLine();
-    if (UI::IconButton(ICON_FA_LIGHTBULB, "Spot Light"))
-    {
-        m_commands.addSpotLight = true;
-        Tracen("[EDITOR-IMGUI-2] Light spawn: type=spot id=pending");
-    }
-}
-
-void EditorImGui::RenderWorldPanel()
-{
-    if (ImGui::Begin(ICON_FA_GLOBE " World"))
-    {
-        if (ImGui::CollapsingHeader("Performance", ImGuiTreeNodeFlags_DefaultOpen))
-            RenderPerformancePanel();
-        if (ImGui::CollapsingHeader("Terrain", ImGuiTreeNodeFlags_DefaultOpen))
-        {
-            if (UI::IconButton(ICON_FA_MOUNTAIN, "Create Terrain"))
-            {
-                if (m_terrainState.exists)
-                    m_replaceTerrainConfirmOpen = true;
-                else
-                    m_createTerrainModalOpen = true;
-            }
-            if (m_terrainState.exists)
-            {
-                ImGui::SameLine();
-                ImGui::TextDisabled("%.0fm x %.0fm, %.2fm/cell",
-                    m_terrainState.widthMeters,
-                    m_terrainState.depthMeters,
-                    m_terrainState.cellSizeMeters);
-            }
-        }
-        if (ImGui::CollapsingHeader("Environment", ImGuiTreeNodeFlags_DefaultOpen))
-            RenderLightingPanel();
-        if (ImGui::CollapsingHeader("Dynamic Lights", ImGuiTreeNodeFlags_DefaultOpen))
-            RenderDynamicLightsPanel();
-    }
-    ImGui::End();
-    RenderCreateTerrainModal();
-}
-
-void EditorImGui::RenderPerformancePanel()
-{
-    const double frameMs = m_engineStats.averageFrameMs > 0.0 ? m_engineStats.averageFrameMs : m_engineStats.frameMs;
-    ImGui::Text("FPS: %.1f", m_engineStats.fps);
-    ImGui::Text("Frame: %.2f ms  (min %.2f / max %.2f)",
-        frameMs,
-        m_engineStats.minFrameMs,
-        m_engineStats.maxFrameMs);
-    ImGui::Text("Swapchain: %u x %u",
-        m_engineStats.swapchainWidth,
-        m_engineStats.swapchainHeight);
-
-    const float budgetFraction = static_cast<float>(std::clamp(m_engineStats.frameBudgetPercent / 100.0, 0.0, 1.0));
-    const std::string budgetLabel =
-        std::to_string(static_cast<int>(std::round(m_engineStats.frameBudgetPercent))) + "%";
-    ImGui::TextUnformatted("Frame Budget @60 FPS");
-    ImGui::ProgressBar(budgetFraction, ImVec2(-1.0f, 0.0f), budgetLabel.c_str());
-
-    const float cpuFraction = static_cast<float>(std::clamp(m_engineStats.processCpuPercent / 100.0, 0.0, 1.0));
-    const std::string cpuLabel =
-        std::to_string(static_cast<int>(std::round(m_engineStats.processCpuPercent))) + "%";
-    ImGui::TextUnformatted("Process CPU");
-    ImGui::ProgressBar(cpuFraction, ImVec2(-1.0f, 0.0f), cpuLabel.c_str());
-
-    ImGui::TextDisabled("Frame #%llu | scene entities=%zu | static submitted=%zu drawcalls=%zu",
-        static_cast<unsigned long long>(m_engineStats.frameNumber),
-        m_engineStats.sceneEntityCount,
-        m_engineStats.staticMeshSubmitted,
-        m_engineStats.staticMeshDrawCalls);
-}
-
-void EditorImGui::RenderCreateTerrainModal()
-{
-    if (m_replaceTerrainConfirmOpen)
-    {
-        ImGui::OpenPopup("Replace Terrain?");
-        m_replaceTerrainConfirmOpen = false;
-    }
-    if (ImGui::BeginPopupModal("Replace Terrain?", nullptr, ImGuiWindowFlags_AlwaysAutoResize))
-    {
-        ImGui::TextWrapped("The current scene already has a terrain. Creating a new terrain will replace it.");
-        ImGui::Separator();
-        if (ImGui::Button("Replace", ImVec2(120.0f, 0.0f)))
-        {
-            m_createTerrainModalOpen = true;
-            ImGui::CloseCurrentPopup();
-        }
-        ImGui::SameLine();
-        if (ImGui::Button("Cancel", ImVec2(120.0f, 0.0f)))
-            ImGui::CloseCurrentPopup();
-        ImGui::EndPopup();
-    }
-
-    if (m_createTerrainModalOpen)
-    {
-        ImGui::OpenPopup("Create Terrain");
-        m_createTerrainModalOpen = false;
-    }
-    if (ImGui::BeginPopupModal("Create Terrain", nullptr, ImGuiWindowFlags_AlwaysAutoResize))
-    {
-        ImGui::SetNextItemWidth(180.0f);
-        ImGui::InputFloat("Width (m)", &m_createTerrainWidthMeters, 10.0f, 100.0f, "%.1f");
-        ImGui::SetNextItemWidth(180.0f);
-        ImGui::InputFloat("Depth (m)", &m_createTerrainDepthMeters, 10.0f, 100.0f, "%.1f");
-        ImGui::SetNextItemWidth(180.0f);
-        ImGui::InputFloat("Cell size (m/cell)", &m_createTerrainCellSizeMeters, 0.25f, 1.0f, "%.2f");
-        ImGui::SetNextItemWidth(180.0f);
-        ImGui::InputInt("Chunk size (cells/chunk)", &m_createTerrainChunkSizeCells, 16, 32);
-
-        m_createTerrainWidthMeters = std::max(1.0f, m_createTerrainWidthMeters);
-        m_createTerrainDepthMeters = std::max(1.0f, m_createTerrainDepthMeters);
-        m_createTerrainCellSizeMeters = std::max(0.01f, m_createTerrainCellSizeMeters);
-        m_createTerrainChunkSizeCells = std::clamp(m_createTerrainChunkSizeCells, 32, 256);
-        const std::uint32_t cellsX = std::max(1u,
-            static_cast<std::uint32_t>(std::lround(m_createTerrainWidthMeters / m_createTerrainCellSizeMeters)));
-        const std::uint32_t cellsZ = std::max(1u,
-            static_cast<std::uint32_t>(std::lround(m_createTerrainDepthMeters / m_createTerrainCellSizeMeters)));
-        const std::uint32_t chunkSize = static_cast<std::uint32_t>(m_createTerrainChunkSizeCells);
-        const std::uint32_t chunksX = (cellsX + chunkSize - 1u) / chunkSize;
-        const std::uint32_t chunksZ = (cellsZ + chunkSize - 1u) / chunkSize;
-        const std::uint64_t vertexCount =
-            static_cast<std::uint64_t>(cellsX + 1u) * static_cast<std::uint64_t>(cellsZ + 1u);
-        ImGui::Text("Cells: %u x %u", cellsX, cellsZ);
-        ImGui::Text("Chunk grid: %u x %u", chunksX, chunksZ);
-        ImGui::Text("Vertices: %llu", static_cast<unsigned long long>(vertexCount));
-        if (vertexCount > 4000000ull)
-            ImGui::TextColored(ImVec4(0.95f, 0.58f, 0.22f, 1.0f), "Large terrain: this may be heavy to edit/render.");
-
-        ImGui::Separator();
-        if (ImGui::Button("Create", ImVec2(120.0f, 0.0f)))
-        {
-            TerrainSceneData terrain{};
-            terrain.exists = true;
-            terrain.name = "Terrain";
-            terrain.cellSizeMeters = m_createTerrainCellSizeMeters;
-            terrain.cellsX = cellsX;
-            terrain.cellsZ = cellsZ;
-            terrain.chunkSizeCells = chunkSize;
-            terrain.widthMeters = static_cast<float>(cellsX) * terrain.cellSizeMeters;
-            terrain.depthMeters = static_cast<float>(cellsZ) * terrain.cellSizeMeters;
-            m_commands.createTerrain = true;
-            m_commands.terrainCreate = terrain;
-            ImGui::CloseCurrentPopup();
-        }
-        ImGui::SameLine();
-        if (ImGui::Button("Cancel", ImVec2(120.0f, 0.0f)))
-            ImGui::CloseCurrentPopup();
-        ImGui::EndPopup();
-    }
-}
-
-void EditorImGui::RenderWaterSculptToolPanel()
-{
-    if (!m_editorModeActive || !m_waterSculptToolOpen)
-        return;
-
-    if (ImGui::Begin("Water Sculpt Tool", &m_waterSculptToolOpen))
-    {
-        if (!m_waterBodyState.selected)
-        {
-            ImGui::TextWrapped("Select a water body to sculpt its shape.");
-        }
-
-        bool active = m_editorSettings.toolMode == MapEditorToolMode::WaterSculpt;
-        if (ImGui::Checkbox("Sculpt Mode Active", &active))
-            SetToolMode(active ? MapEditorToolMode::WaterSculpt : MapEditorToolMode::None);
-
-        if (!m_waterBodyState.selected)
-            ImGui::BeginDisabled();
-        const char* modes[] = {"Add Water", "Remove Water"};
-        int mode = m_editorSettings.waterSculptAdd ? 0 : 1;
-        if (ImGui::Combo("Mode", &mode, modes, IM_ARRAYSIZE(modes)))
-        {
-            m_editorSettings.waterSculptAdd = mode == 0;
-            Tracenf("[EDITOR-IMGUI-5] Water sculpt brush mode: %s",
-                m_editorSettings.waterSculptAdd ? "add" : "remove");
-        }
-        ImGui::SliderFloat("Radius", &m_editorSettings.waterSculptRadiusMeters, 0.5f, 20.0f, "%.1f m");
-        if (!m_waterBodyState.selected)
-            ImGui::EndDisabled();
-    }
-    ImGui::End();
-}
-
-void EditorImGui::RenderHeightmapToolPanel()
-{
-    if (!m_editorModeActive || !m_heightmapToolOpen)
-        return;
-
-    if (ImGui::Begin("Heightmap Tool", &m_heightmapToolOpen))
-    {
-        bool active = m_editorSettings.toolMode == MapEditorToolMode::Heightmap;
-        if (ImGui::Checkbox("Heightmap Editing Active", &active))
-            SetToolMode(active ? MapEditorToolMode::Heightmap : MapEditorToolMode::None);
-
-        auto modeRadio = [this](const char* label, MapEditorTool tool) {
-            if (ImGui::RadioButton(label, m_editorSettings.tool == tool))
-            {
-                m_editorSettings.tool = tool;
-                if (m_editorSettings.toolMode != MapEditorToolMode::Heightmap)
-                    SetToolMode(MapEditorToolMode::Heightmap);
-            }
-        };
-        modeRadio("Raise", MapEditorTool::Raise);
-        ImGui::SameLine();
-        modeRadio("Lower", MapEditorTool::Lower);
-        modeRadio("Smooth", MapEditorTool::Smooth);
-        ImGui::SameLine();
-        modeRadio("Flatten", MapEditorTool::Flatten);
-
-        ImGui::Separator();
-        ImGui::SliderFloat("Radius", &m_editorSettings.brushRadiusMeters, 1.0f, 100.0f, "%.1f m");
-        ImGui::SliderFloat("Strength", &m_editorSettings.brushStrength, 0.1f, 5.0f, "%.2f");
-        ImGui::SliderFloat("Falloff", &m_editorSettings.brushFalloff, 0.0f, 1.0f, "%.2f");
-        if (m_editorSettings.tool == MapEditorTool::Flatten)
-            ImGui::SliderFloat("Target Height", &m_editorSettings.flattenTargetY, -50.0f, 100.0f, "%.2f m");
-    }
-    ImGui::End();
-}
-
-void EditorImGui::RenderSplatLayerSlot(std::uint32_t slotIndex)
-{
-    if (slotIndex >= m_paletteSlots.size())
-        return;
-
-    MapEditorPaletteSlot& slot = m_paletteSlots[slotIndex];
-    ImGui::PushID(static_cast<int>(slotIndex));
-    const bool selected = m_editorSettings.textureSlot == slotIndex;
-    const ImVec4 selectedColor = ImVec4(0.20f, 0.34f, 0.56f, 1.0f);
-    const ImVec4 selectedHover = ImVec4(0.24f, 0.42f, 0.68f, 1.0f);
-    const ImVec4 idleColor = ImGui::GetStyleColorVec4(ImGuiCol_Button);
-    ImGui::PushStyleColor(ImGuiCol_Button, selected ? selectedColor : idleColor);
-    ImGui::PushStyleColor(ImGuiCol_ButtonHovered, selected ? selectedHover : ImGui::GetStyleColorVec4(ImGuiCol_ButtonHovered));
-    ImGui::PushStyleColor(ImGuiCol_ButtonActive, selected ? selectedHover : ImGui::GetStyleColorVec4(ImGuiCol_ButtonActive));
-    const std::string label = std::to_string(slotIndex) + "##splat_slot";
-    if (ImGui::Button(label.c_str(), ImVec2(48.0f, 38.0f)))
-    {
-        m_editorSettings.textureSlot = slotIndex;
-        m_editorSettings.tool = MapEditorTool::Paint;
-        if (m_editorSettings.toolMode != MapEditorToolMode::SplatPaint)
-            SetToolMode(MapEditorToolMode::SplatPaint);
-    }
-    ImGui::PopStyleColor(3);
-
-    if (m_assetFilter != AssetBrowserFilter::Scene && ImGui::BeginDragDropTarget())
-    {
-        if (const ImGuiPayload* payload = ImGui::AcceptDragDropPayload(kAssetPayloadType))
-        {
-            const std::string assetId(static_cast<const char*>(payload->Data), payload->DataSize);
-            auto entry = m_assetLibrary ? m_assetLibrary->FindById(assetId) : std::optional<AssetLibrary::Entry>{};
-            if (entry && (entry->category == AssetLibrary::Category::Texture ||
-                entry->category == AssetLibrary::Category::Material))
-            {
-                MapEditorPaletteSlot next = BuildPaletteSlotFromAsset(slotIndex, *entry);
-                if (!next.texturePath.empty())
-                {
-                    slot = next;
-                    m_commands.paletteSlotChanged = true;
-                    m_commands.paletteSlot = slotIndex;
-                    m_commands.paletteAssetId = next.assetId;
-                    m_commands.paletteTexturePath = next.texturePath;
-                    m_commands.paletteSlotData = next;
-                    m_assetStatus = "Splat layer texture <- " + entry->displayName;
-                    Tracenf("[EDITOR-IMGUI-5] Splat layer texture changed: layer=%u asset_id=%s",
-                        slotIndex,
-                        entry->id.c_str());
-                }
-            }
-            else
-            {
-                m_assetStatus = "Splat slots accept texture or material assets";
-            }
-        }
-        ImGui::EndDragDropTarget();
-    }
-
-    const std::string name = slot.displayName.empty()
-        ? (slot.texturePath.empty() ? std::string("empty") : slot.texturePath)
-        : slot.displayName;
-    ImGui::TextWrapped("%s", name.c_str());
-    ImGui::PopID();
-}
-
-void EditorImGui::RenderSplatPaintToolPanel()
-{
-    if (!m_editorModeActive || !m_splatPaintToolOpen)
-        return;
-
-    if (ImGui::Begin("Splat Paint Tool", &m_splatPaintToolOpen))
-    {
-        bool active = m_editorSettings.toolMode == MapEditorToolMode::SplatPaint;
-        if (ImGui::Checkbox("Splat Paint Active", &active))
-            SetToolMode(active ? MapEditorToolMode::SplatPaint : MapEditorToolMode::None);
-
-        ImGui::TextUnformatted("Active Layer");
-        for (std::uint32_t i = 0; i < m_paletteSlots.size(); ++i)
-        {
-            ImGui::BeginGroup();
-            RenderSplatLayerSlot(i);
-            ImGui::EndGroup();
-            if (i % 4 != 3)
-                ImGui::SameLine();
-        }
-
-        ImGui::Separator();
-        m_editorSettings.tool = MapEditorTool::Paint;
-        int paintMode = m_editorSettings.paintMode == MapEditorPaintMode::Mix ? 1 : 0;
-        const char* modes[] = {"Replace", "Mix"};
-        if (ImGui::Combo("Paint Mode", &paintMode, modes, IM_ARRAYSIZE(modes)))
-            m_editorSettings.paintMode = paintMode == 1 ? MapEditorPaintMode::Mix : MapEditorPaintMode::Replace;
-        ImGui::SliderFloat("Radius", &m_editorSettings.brushRadiusMeters, 1.0f, 100.0f, "%.1f m");
-        ImGui::SliderFloat("Strength", &m_editorSettings.brushStrength, 0.1f, 1.0f, "%.2f");
-        ImGui::SliderFloat("Falloff", &m_editorSettings.brushFalloff, 0.0f, 1.0f, "%.2f");
-
-        ImGui::Separator();
-        UI::SectionHeader(ICON_FA_PALETTE " Terrain Material");
-        if (m_terrainState.exists)
-        {
-            bool triplanarEnabled = m_terrainState.triplanarEnabled;
-            float triplanarSharpness = std::clamp(m_terrainState.triplanarSharpness, 1.0f, 16.0f);
-            float triplanarSlopeThreshold = std::clamp(m_terrainState.triplanarSlopeThreshold, 0.0f, 1.0f);
-            float triplanarSlopeTransition = std::clamp(m_terrainState.triplanarSlopeTransition, 0.001f, 1.0f);
-            bool triplanarChanged = false;
-            triplanarChanged |= ImGui::Checkbox("Triplanar Mapping", &triplanarEnabled);
-            triplanarChanged |= ImGui::SliderFloat("Triplanar Sharpness", &triplanarSharpness, 1.0f, 16.0f, "%.2f");
-            triplanarChanged |= ImGui::SliderFloat("Slope Threshold", &triplanarSlopeThreshold, 0.0f, 1.0f, "%.3f");
-            triplanarChanged |= ImGui::SliderFloat("Slope Transition", &triplanarSlopeTransition, 0.001f, 1.0f, "%.3f");
-            if (triplanarChanged)
-            {
-                m_terrainState.triplanarEnabled = triplanarEnabled;
-                m_terrainState.triplanarSharpness = triplanarSharpness;
-                m_terrainState.triplanarSlopeThreshold = triplanarSlopeThreshold;
-                m_terrainState.triplanarSlopeTransition = triplanarSlopeTransition;
-                m_commands.terrainTriplanarChanged = true;
-                m_commands.terrainTriplanarEnabled = triplanarEnabled;
-                m_commands.terrainTriplanarSharpness = triplanarSharpness;
-                m_commands.terrainTriplanarSlopeThreshold = triplanarSlopeThreshold;
-                m_commands.terrainTriplanarSlopeTransition = triplanarSlopeTransition;
-                SceneManager::Instance().MarkDirty();
-            }
-        }
-        else
-        {
-            ImGui::TextDisabled("Create a terrain to edit triplanar sampling.");
-        }
-        ImGui::Separator();
-        const std::uint32_t selectedSlot = std::min<std::uint32_t>(m_editorSettings.textureSlot, 7u);
-        MapEditorPaletteSlot& materialSlot = m_paletteSlots[selectedSlot];
-        ImGui::Text("Layer %u: %s",
-            selectedSlot,
-            materialSlot.displayName.empty() ? "empty" : materialSlot.displayName.c_str());
-
-        auto commitMaterialParams = [&]() {
-            materialSlot.slot = selectedSlot;
-            materialSlot.tilingScaleX = std::clamp(materialSlot.tilingScaleX, 0.01f, 64.0f);
-            materialSlot.tilingScaleY = std::clamp(materialSlot.tilingScaleY, 0.01f, 64.0f);
-            materialSlot.normalStrength = std::clamp(materialSlot.normalStrength, 0.0f, 4.0f);
-            materialSlot.roughnessStrength = std::clamp(materialSlot.roughnessStrength, 0.0f, 4.0f);
-            m_commands.paletteSlotParamsChanged = true;
-            m_commands.paletteSlot = selectedSlot;
-            m_commands.paletteSlotData = materialSlot;
-            SceneManager::Instance().MarkDirty();
-        };
-
-        float tiling = (materialSlot.tilingScaleX + materialSlot.tilingScaleY) * 0.5f;
-        if (ImGui::SliderFloat("Tiling", &tiling, 0.05f, 32.0f, "%.2f"))
-        {
-            materialSlot.tilingScaleX = tiling;
-            materialSlot.tilingScaleY = tiling;
-            commitMaterialParams();
-        }
-        if (ImGui::ColorEdit3("Tint", materialSlot.colorTint))
-            commitMaterialParams();
-        if (ImGui::SliderFloat("Normal Strength", &materialSlot.normalStrength, 0.0f, 3.0f, "%.2f"))
-            commitMaterialParams();
-        if (ImGui::SliderFloat("Roughness", &materialSlot.roughnessStrength, 0.0f, 2.0f, "%.2f"))
-            commitMaterialParams();
-        if (ImGui::SliderFloat("Metallic", &materialSlot.metallicStrength, 0.0f, 1.0f, "%.2f"))
-            commitMaterialParams();
-        if (ImGui::SliderFloat("AO Strength", &materialSlot.aoStrength, 0.0f, 1.0f, "%.2f"))
-            commitMaterialParams();
-        if (ImGui::SliderFloat2("UV Offset", materialSlot.uvOffset, -10.0f, 10.0f, "%.3f"))
-            commitMaterialParams();
-        if (ImGui::SliderFloat("UV Rotation", &materialSlot.uvRotationDegrees, -180.0f, 180.0f, "%.1f deg"))
-            commitMaterialParams();
-    }
-    ImGui::End();
-}
-
-void EditorImGui::RenderAssetBrowserToolbar()
-{
-    if (UI::IconButton(ICON_FA_PLUS, "Texture"))
-        ImportAssetWithDialog(AssetLibrary::Category::Texture);
-    ImGui::SameLine();
-    if (UI::IconButton(ICON_FA_CUBE, "Model"))
-        ImportAssetWithDialog(AssetLibrary::Category::Model);
-    ImGui::SameLine();
-    if (UI::IconButton(ICON_FA_PERSON_RUNNING, "Anim"))
-        ImportAssetWithDialog(AssetLibrary::Category::Animation);
-    ImGui::SameLine();
-    if (UI::IconButton(ICON_FA_PALETTE, "Material"))
-        CreatePbrMaterialAsset();
-    ImGui::SameLine();
-    if (UI::IconButton(ICON_FA_DROPLET, "Water Mat"))
-        CreateWaterMaterialAsset();
-
-    ImGui::SameLine();
-    if (UI::IconButton(ICON_FA_ROTATE, "Refresh"))
-        RefreshAssetLibrary();
-}
-
-void EditorImGui::RenderAssetTypeTabs()
-{
-    const auto tab = [this](const char* label, AssetBrowserFilter filter) {
-        const bool active = m_assetFilter == filter;
-        if (active)
-        {
-            ImGui::PushStyleColor(ImGuiCol_Button, ImGui::GetStyleColorVec4(ImGuiCol_TabActive));
-            ImGui::PushStyleColor(ImGuiCol_ButtonHovered, ImGui::GetStyleColorVec4(ImGuiCol_TabActive));
-            ImGui::PushStyleColor(ImGuiCol_ButtonActive, ImGui::GetStyleColorVec4(ImGuiCol_TabActive));
-        }
-        else
-        {
-            ImGui::PushStyleColor(ImGuiCol_Button, ImGui::GetStyleColorVec4(ImGuiCol_Tab));
-            ImGui::PushStyleColor(ImGuiCol_ButtonHovered, ImGui::GetStyleColorVec4(ImGuiCol_TabHovered));
-            ImGui::PushStyleColor(ImGuiCol_ButtonActive, ImGui::GetStyleColorVec4(ImGuiCol_TabActive));
-        }
-
-        if (ImGui::Button(label))
-        {
-            if (m_assetFilter != filter)
-            {
-                m_assetFilter = filter;
-                m_assetSubpath.clear();
-                m_activeAssetTags.clear();
-                m_selectedAssetId.clear();
-            }
-        }
-        ImGui::PopStyleColor(3);
-    };
-
-    tab("All", AssetBrowserFilter::All);
-    ImGui::SameLine();
-    tab("Textures", AssetBrowserFilter::Texture);
-    ImGui::SameLine();
-    tab("Models", AssetBrowserFilter::Model);
-    ImGui::SameLine();
-    tab("Anims", AssetBrowserFilter::Animation);
-    ImGui::SameLine();
-    tab("Materials", AssetBrowserFilter::Material);
-    ImGui::SameLine();
-    tab("Water Mats", AssetBrowserFilter::WaterMaterial);
-    ImGui::SameLine();
-    tab("Scenes", AssetBrowserFilter::Scene);
-}
-
-void EditorImGui::RenderAssetFolderNode(const std::string& path, const std::vector<std::string>& folders)
-{
-    const std::string nodeId = path.empty() ? std::string("__asset_root__") : path;
-    ImGui::PushID(nodeId.c_str());
-
-    const bool selected = AssetLibrary::NormalizeSubpath(path) == AssetLibrary::NormalizeSubpath(m_assetSubpath);
-    ImGuiTreeNodeFlags flags = ImGuiTreeNodeFlags_OpenOnArrow | ImGuiTreeNodeFlags_SpanAvailWidth;
-    if (selected)
-        flags |= ImGuiTreeNodeFlags_Selected;
-
-    bool hasChildren = false;
-    for (const std::string& folder : folders)
-    {
-        if (IsDirectChildFolder(path, folder))
-        {
-            hasChildren = true;
-            break;
-        }
-    }
-    if (!hasChildren)
-        flags |= ImGuiTreeNodeFlags_Leaf;
-
-    const std::string label = FolderDisplayName(path);
-    const bool open = ImGui::TreeNodeEx(label.c_str(), flags);
-    if (ImGui::IsItemClicked() && !ImGui::IsItemToggledOpen())
-    {
-        m_assetSubpath = AssetLibrary::NormalizeSubpath(path);
-        m_selectedAssetId.clear();
-    }
-
-    if (ImGui::BeginDragDropTarget())
-    {
-        if (const ImGuiPayload* payload = ImGui::AcceptDragDropPayload(kAssetPayloadType))
-        {
-            const std::string assetId(static_cast<const char*>(payload->Data), payload->DataSize);
-            AssetLibrary::Entry moved{};
-            std::string error;
-            if (m_assetLibrary && m_assetLibrary->MoveAssetToSubpath(assetId, path, moved, error))
-            {
-                m_assetStatus = "Moved asset to " + FolderDisplayName(path);
-                Tracenf("[EDITOR-IMGUI-3] Drag dropped: asset_id=%s target_type=folder path=%s",
-                    assetId.c_str(),
-                    path.c_str());
-            }
-            else
-            {
-                m_assetStatus = "Move failed: " + error;
-            }
-        }
-        ImGui::EndDragDropTarget();
-    }
-
-    if (open)
-    {
-        for (const std::string& folder : folders)
-        {
-            if (IsDirectChildFolder(path, folder))
-                RenderAssetFolderNode(folder, folders);
-        }
-        ImGui::TreePop();
-    }
-
-    ImGui::PopID();
-}
-
-void EditorImGui::RenderAssetFolderPanel()
-{
-    const bool sceneCategory = m_assetFilter == AssetBrowserFilter::Scene;
-    if (UI::IconButton(ICON_FA_HOUSE, "Home"))
-    {
-        m_assetSubpath.clear();
-        m_selectedAssetId.clear();
-    }
-    ImGui::SameLine();
-    if (UI::IconButton(ICON_FA_FOLDER_OPEN, "Up"))
-    {
-        m_assetSubpath = ParentSubpath(m_assetSubpath);
-        m_selectedAssetId.clear();
-    }
-
-    if (sceneCategory)
-        ImGui::BeginDisabled();
-    if (UI::IconButton(ICON_FA_FOLDER_PLUS, "Folder"))
-        ImGui::OpenPopup("NewAssetFolder");
-    ImGui::SameLine();
-    if (UI::IconButton(ICON_FA_TRASH, "Delete") && !m_assetSubpath.empty())
-        DeleteAssetFolder();
-    if (sceneCategory)
-        ImGui::EndDisabled();
-
-    if (ImGui::BeginPopup("NewAssetFolder"))
-    {
-        ImGui::InputText("Name", m_newAssetFolderName, sizeof(m_newAssetFolderName));
-        if (ImGui::Button("Create"))
-        {
-            CreateAssetFolder();
-            ImGui::CloseCurrentPopup();
-        }
-        ImGui::SameLine();
-        if (ImGui::Button("Cancel"))
-            ImGui::CloseCurrentPopup();
-        ImGui::EndPopup();
-    }
-
-    ImGui::Separator();
-    const std::vector<std::string> folders = QueryVisibleFolders();
-    RenderAssetFolderNode("", folders);
-}
-
-void EditorImGui::RenderAssetTile(const AssetLibrary::Entry& entry, float tileSize)
-{
-    ImGui::PushID(entry.id.c_str());
-    const bool selected = entry.id == m_selectedAssetId;
-    const ImVec4 categoryColor = AssetCategoryColor(entry.category);
-    AssetPreviewTexture* preview = GetAssetPreviewTexture(entry);
-
-    const ImVec2 previewMin = ImGui::GetCursorScreenPos();
-    const ImVec2 previewMax(previewMin.x + tileSize, previewMin.y + tileSize);
-    ImGui::InvisibleButton("##asset_tile", ImVec2(tileSize, tileSize));
-    const bool clicked = ImGui::IsItemClicked(ImGuiMouseButton_Left);
-    const bool doubleClicked = ImGui::IsItemHovered() && ImGui::IsMouseDoubleClicked(ImGuiMouseButton_Left);
-    const bool hovered = ImGui::IsItemHovered();
-
-    ImDrawList* drawList = ImGui::GetWindowDrawList();
-    const ImU32 baseColor = ImGui::ColorConvertFloat4ToU32(hovered
-        ? ImVec4(categoryColor.x + 0.08f, categoryColor.y + 0.08f, categoryColor.z + 0.08f, 1.0f)
-        : categoryColor);
-    drawList->AddRectFilled(previewMin, previewMax, baseColor, 5.0f);
-    if (preview && preview->descriptor)
-    {
-        drawList->AddImage(
-            reinterpret_cast<ImTextureID>(preview->descriptor),
-            previewMin,
-            previewMax,
-            ImVec2(0.0f, 0.0f),
-            ImVec2(1.0f, 1.0f),
-            IM_COL32_WHITE);
-        drawList->AddRectFilled(
-            ImVec2(previewMin.x, previewMax.y - 18.0f),
-            previewMax,
-            IM_COL32(10, 12, 16, 145),
-            0.0f);
-        drawList->AddText(ImVec2(previewMin.x + 6.0f, previewMax.y - 16.0f),
-            IM_COL32(235, 238, 244, 235),
-            AssetLibrary::TextureRoleBadge(entry.textureRole));
-    }
-    else
-    {
-        const char* icon = AssetCategoryIcon(entry.category);
-        if (UI::GetEditorFonts().bold)
-            ImGui::PushFont(UI::GetEditorFonts().bold);
-        const ImVec2 iconSize = ImGui::CalcTextSize(icon);
-        drawList->AddText(
-            ImVec2(previewMin.x + (tileSize - iconSize.x) * 0.5f, previewMin.y + (tileSize - iconSize.y) * 0.5f),
-            IM_COL32(245, 248, 255, 235),
-            icon);
-        if (UI::GetEditorFonts().bold)
-            ImGui::PopFont();
-    }
-    drawList->AddRect(previewMin, previewMax,
-        selected ? IM_COL32(255, 210, 92, 255) : IM_COL32(55, 60, 70, 255),
-        5.0f,
-        0,
-        selected ? 3.0f : 1.0f);
-
-    if (clicked)
-    {
-        m_selectedAssetId = entry.id;
-        m_assetStatus = "Selected: " + entry.displayName;
-        if (doubleClicked && entry.category == AssetLibrary::Category::WaterMaterial)
-        {
-            OpenWaterMaterialEditor(entry.id);
-        }
-        else if (doubleClicked && entry.category == AssetLibrary::Category::Material)
-        {
-            OpenPbrMaterialEditor(entry.id);
-        }
-        else if (doubleClicked && entry.category == AssetLibrary::Category::Model)
-        {
-            m_commands.addMeshEntity = true;
-            m_commands.meshAssetId = entry.id;
-            m_assetStatus = "Mesh entity queued: " + entry.displayName;
-            Tracenf("[MESH-ENTITY] Asset browser model spawn queued: asset_id=%s", entry.id.c_str());
-        }
-        else if (doubleClicked && entry.category == AssetLibrary::Category::Scene)
-        {
-            if (AttachSceneToHierarchy(entry))
-                m_assetStatus = "Scene added to Hierarchy: " + entry.displayName;
-        }
-    }
-
-    if (ImGui::BeginDragDropSource())
-    {
-        ImGui::SetDragDropPayload(kAssetPayloadType, entry.id.data(), entry.id.size());
-        ImGui::Text("%s", entry.displayName.c_str());
-        ImGui::TextDisabled("%s", AssetLibrary::CategoryName(entry.category));
-        if (m_loggedDragAssetId != entry.id)
-        {
-            m_loggedDragAssetId = entry.id;
-            Tracenf("[EDITOR-IMGUI-3] Drag started: asset_id=%s type=%s",
-                entry.id.c_str(),
-                AssetLibrary::CategoryName(entry.category));
-        }
-        ImGui::EndDragDropSource();
-    }
-
-    if (ImGui::BeginPopupContextItem("AssetTileContext"))
-    {
-        ImGui::TextDisabled("%s", entry.displayName.c_str());
-        if (ImGui::MenuItem("Rename"))
-            BeginAssetRename(entry);
-        if (ImGui::MenuItem("Delete"))
-        {
-            const std::filesystem::path path = entry.originalPath.empty() && m_assetLibrary
-                ? m_assetLibrary->AbsolutePath(entry)
-                : std::filesystem::path(entry.originalPath);
-            m_assetDeletePath = path.generic_string();
-            m_assetDeleteIsFolder = false;
-            m_assetOpenDeletePopup = true;
-        }
-        if (entry.category == AssetLibrary::Category::Scene)
-        {
-            ImGui::Separator();
-            if (ImGui::MenuItem("Add to Hierarchy"))
-                AttachSceneToHierarchy(entry);
-        }
-        else
-        {
-            ImGui::Separator();
-            if (ImGui::MenuItem("New Material"))
-                CreatePbrMaterialAsset();
-            if (ImGui::MenuItem("New Water Material"))
-                CreateWaterMaterialAsset();
-        }
-        ImGui::EndPopup();
-    }
-
-    const std::string shortName = ShortAssetFilename(entry);
-    ImGui::TextUnformatted(shortName.c_str());
-    const bool labelHovered = ImGui::IsItemHovered();
-    if (hovered || labelHovered)
-    {
-        ImGui::BeginTooltip();
-        ImGui::PushTextWrapPos(ImGui::GetFontSize() * 34.0f);
-        ImGui::TextUnformatted(entry.filename.empty() ? entry.displayName.c_str() : entry.filename.c_str());
-        if (!entry.displayName.empty() && entry.displayName != entry.filename)
-            ImGui::TextDisabled("Name: %s", entry.displayName.c_str());
-        ImGui::TextDisabled("Type: %s", AssetLibrary::CategoryName(entry.category));
-        if (!entry.subpath.empty())
-            ImGui::TextDisabled("Folder: %s", entry.subpath.c_str());
-        if (entry.category == AssetLibrary::Category::Texture)
-        {
-            ImGui::TextDisabled("Role: %s", AssetLibrary::TextureRoleName(entry.textureRole));
-            if (entry.resolutionWidth > 0 && entry.resolutionHeight > 0)
-                ImGui::TextDisabled("Size: %ux%u", entry.resolutionWidth, entry.resolutionHeight);
-        }
-        if (!entry.thumbnail.empty())
-            ImGui::TextDisabled("Preview: %s", entry.thumbnail.c_str());
-        if (!entry.tags.empty())
-            ImGui::TextDisabled("Tags: %s", AssetLibrary::TagsToCsv(entry.tags).c_str());
-        if (!entry.originalPath.empty())
-            ImGui::TextDisabled("Source: %s", entry.originalPath.c_str());
-        ImGui::PopTextWrapPos();
-        ImGui::EndTooltip();
-    }
-    ImGui::PopID();
-}
-
-void EditorImGui::RenderAssetGrid()
-{
-    const std::vector<AssetLibrary::Entry> visibleAssets = QueryVisibleAssets();
-    const std::vector<std::string> folders = QueryVisibleFolders();
-    uint32_t directFolders = 0;
-    for (const std::string& folder : folders)
-    {
-        if (IsDirectChildFolder(m_assetSubpath, folder))
-            ++directFolders;
-    }
-
-    ImGui::Text("%zu assets, %u folders | %s | %s",
-        visibleAssets.size(),
-        directFolders,
-        AssetFilterName(),
-        m_assetSubpath.empty() ? "Home" : m_assetSubpath.c_str());
-    ImGui::Separator();
-
-    const float tileSize = 86.0f;
-    const float cellWidth = 142.0f;
-    const float panelWidth = std::max(1.0f, ImGui::GetContentRegionAvail().x);
-    const float columnStride = cellWidth + ImGui::GetStyle().ItemSpacing.x;
-    const int columns = std::max(1, static_cast<int>((panelWidth + ImGui::GetStyle().ItemSpacing.x) / columnStride));
-    if (ImGui::BeginTable("AssetGridTiles", columns, ImGuiTableFlags_SizingFixedSame | ImGuiTableFlags_NoSavedSettings))
-    {
-        for (int i = 0; i < columns; ++i)
-            ImGui::TableSetupColumn(nullptr, ImGuiTableColumnFlags_WidthFixed, cellWidth);
-
-        for (const AssetLibrary::Entry& entry : visibleAssets)
-        {
-            ImGui::TableNextColumn();
-            ImGui::BeginGroup();
-            RenderAssetTile(entry, tileSize);
-            ImGui::EndGroup();
-        }
-        ImGui::EndTable();
-    }
-
-    if (visibleAssets.empty())
-        ImGui::TextDisabled("No assets in this view.");
-
-    if (ImGui::BeginPopupContextWindow("AssetGridContext", ImGuiPopupFlags_MouseButtonRight | ImGuiPopupFlags_NoOpenOverItems))
-    {
-        if (ImGui::MenuItem("New Material"))
-            CreatePbrMaterialAsset();
-        if (ImGui::MenuItem("New Water Material"))
-            CreateWaterMaterialAsset();
-        ImGui::EndPopup();
-    }
-
-    if (!m_assetBrowserLogged)
-    {
-        m_assetBrowserLogged = true;
-        Tracenf("[EDITOR-IMGUI-3] Asset Browser rendered, current_path=%s filter_type=%s visible_assets=%zu",
-            m_assetSubpath.c_str(),
-            AssetFilterName(),
-            visibleAssets.size());
-    }
-}
-
-void EditorImGui::RenderAssetBrowserFolderTreeNode(const std::string& subpath)
-{
-    const std::string normalized = AssetLibrary::NormalizeSubpath(subpath);
-    ImGui::PushID(normalized.empty() ? "__assets_root__" : normalized.c_str());
-    const std::vector<std::string> children = QueryFilesystemChildFolders(normalized);
-    ImGuiTreeNodeFlags flags = ImGuiTreeNodeFlags_OpenOnArrow | ImGuiTreeNodeFlags_SpanAvailWidth;
-    if (children.empty())
-        flags |= ImGuiTreeNodeFlags_Leaf;
-    if (AssetLibrary::NormalizeSubpath(m_assetSubpath) == normalized)
-        flags |= ImGuiTreeNodeFlags_Selected;
-    const std::string label = normalized.empty() ? (std::string(ICON_FA_FOLDER_OPEN) + " Assets")
-        : (std::string(ICON_FA_FOLDER) + " " + FolderDisplayName(normalized));
-    const bool open = ImGui::TreeNodeEx(label.c_str(), flags);
-    if (ImGui::IsItemClicked() && !ImGui::IsItemToggledOpen())
-        SelectAssetBrowserFolder(normalized);
-
-    if (!normalized.empty() && ImGui::BeginDragDropSource())
-    {
-        ImGui::SetDragDropPayload(kAssetFolderPayloadType, normalized.data(), normalized.size());
-        ImGui::Text("%s", FolderDisplayName(normalized).c_str());
-        ImGui::EndDragDropSource();
-    }
-
-    if (ImGui::BeginDragDropTarget())
-    {
-        if (const ImGuiPayload* payload = ImGui::AcceptDragDropPayload(kAssetPayloadType))
-        {
-            const std::string assetId(static_cast<const char*>(payload->Data), payload->DataSize);
-            MoveAssetEntryToFolder(assetId, normalized);
-        }
-        if (const ImGuiPayload* payload = ImGui::AcceptDragDropPayload(kAssetFolderPayloadType))
-        {
-            const std::string source(static_cast<const char*>(payload->Data), payload->DataSize);
-            MoveFolderToFolder(source, normalized);
-        }
-        ImGui::EndDragDropTarget();
-    }
-
-    if (ImGui::BeginPopupContextItem("FolderTreeContext"))
-    {
-        if (ImGui::MenuItem("New Folder"))
-        {
-            m_assetNewFolderParent = normalized;
-            CopyToBuffer(m_newAssetFolderName, sizeof(m_newAssetFolderName), UniqueFolderName(AssetBrowserPath(normalized)));
-            m_assetOpenNewFolderPopup = true;
-        }
-        if (!normalized.empty() && ImGui::MenuItem("Rename"))
-            BeginFolderRename(normalized);
-        if (!normalized.empty() && ImGui::MenuItem("Delete"))
-        {
-            m_assetDeletePath = AssetBrowserPath(normalized).generic_string();
-            m_assetDeleteIsFolder = true;
-            m_assetOpenDeletePopup = true;
-        }
-        ImGui::EndPopup();
-    }
-
-    if (open)
-    {
-        for (const std::string& child : children)
-            RenderAssetBrowserFolderTreeNode(child);
-        ImGui::TreePop();
-    }
-    ImGui::PopID();
-}
-
-void EditorImGui::RenderAssetBrowserFolderTree()
-{
-    RenderAssetBrowserFolderTreeNode("");
-}
-
-void EditorImGui::RenderAssetBrowserBreadcrumb()
-{
-    if (ImGui::SmallButton("Assets"))
-        SelectAssetBrowserFolder("");
-    std::filesystem::path current(m_assetSubpath);
-    std::string acc;
-    for (const auto& part : current)
-    {
-        const std::string segment = part.generic_string();
-        if (segment.empty() || segment == ".")
-            continue;
-        acc = acc.empty() ? segment : acc + "/" + segment;
-        ImGui::SameLine();
-        ImGui::TextDisabled(">");
-        ImGui::SameLine();
-        if (AssetLibrary::NormalizeSubpath(acc) == AssetLibrary::NormalizeSubpath(m_assetSubpath))
-            ImGui::TextUnformatted(segment.c_str());
-        else if (ImGui::SmallButton(segment.c_str()))
-            SelectAssetBrowserFolder(acc);
-    }
-}
-
-void EditorImGui::RenderAssetBrowserFolderTile(const std::string& subpath, float tileSize)
-{
-    ImGui::PushID(subpath.c_str());
-    const bool selected = m_selectedAssetId == ("folder:" + subpath);
-    const ImVec2 previewMin = ImGui::GetCursorScreenPos();
-    const ImVec2 previewMax(previewMin.x + tileSize, previewMin.y + tileSize);
-    ImGui::InvisibleButton("##folder_tile", ImVec2(tileSize, tileSize));
-    const bool clicked = ImGui::IsItemClicked(ImGuiMouseButton_Left);
-    const bool doubleClicked = ImGui::IsItemHovered() && ImGui::IsMouseDoubleClicked(ImGuiMouseButton_Left);
-    const bool hovered = ImGui::IsItemHovered();
-    ImDrawList* drawList = ImGui::GetWindowDrawList();
-    drawList->AddRectFilled(previewMin, previewMax, hovered ? IM_COL32(88, 96, 112, 255) : IM_COL32(72, 78, 92, 255), 5.0f);
-    const char* icon = ICON_FA_FOLDER;
-    if (UI::GetEditorFonts().bold)
-        ImGui::PushFont(UI::GetEditorFonts().bold);
-    const ImVec2 iconSize = ImGui::CalcTextSize(icon);
-    drawList->AddText(ImVec2(previewMin.x + (tileSize - iconSize.x) * 0.5f, previewMin.y + (tileSize - iconSize.y) * 0.5f),
-        IM_COL32(245, 248, 255, 235),
-        icon);
-    if (UI::GetEditorFonts().bold)
-        ImGui::PopFont();
-    drawList->AddRect(previewMin, previewMax,
-        selected ? IM_COL32(255, 210, 92, 255) : IM_COL32(55, 60, 70, 255),
-        5.0f,
-        0,
-        selected ? 3.0f : 1.0f);
-    if (clicked)
-    {
-        m_selectedAssetId = "folder:" + subpath;
-        if (doubleClicked)
-            SelectAssetBrowserFolder(subpath);
-    }
-    if (ImGui::BeginDragDropSource())
-    {
-        ImGui::SetDragDropPayload(kAssetFolderPayloadType, subpath.data(), subpath.size());
-        ImGui::Text("%s", FolderDisplayName(subpath).c_str());
-        ImGui::EndDragDropSource();
-    }
-    if (ImGui::BeginDragDropTarget())
-    {
-        if (const ImGuiPayload* payload = ImGui::AcceptDragDropPayload(kAssetPayloadType))
-        {
-            const std::string assetId(static_cast<const char*>(payload->Data), payload->DataSize);
-            MoveAssetEntryToFolder(assetId, subpath);
-        }
-        if (const ImGuiPayload* payload = ImGui::AcceptDragDropPayload(kAssetFolderPayloadType))
-        {
-            const std::string source(static_cast<const char*>(payload->Data), payload->DataSize);
-            MoveFolderToFolder(source, subpath);
-        }
-        ImGui::EndDragDropTarget();
-    }
-    if (ImGui::BeginPopupContextItem("FolderTileContext"))
-    {
-        if (ImGui::MenuItem("New Folder"))
-        {
-            m_assetNewFolderParent = subpath;
-            CopyToBuffer(m_newAssetFolderName, sizeof(m_newAssetFolderName), UniqueFolderName(AssetBrowserPath(subpath)));
-            m_assetOpenNewFolderPopup = true;
-        }
-        if (ImGui::MenuItem("Rename"))
-            BeginFolderRename(subpath);
-        if (ImGui::MenuItem("Delete"))
-        {
-            m_assetDeletePath = AssetBrowserPath(subpath).generic_string();
-            m_assetDeleteIsFolder = true;
-            m_assetOpenDeletePopup = true;
-        }
-        ImGui::EndPopup();
-    }
-    ImGui::TextUnformatted(FolderDisplayName(subpath).c_str());
-    ImGui::PopID();
-}
-
-void EditorImGui::RenderAssetBrowserContent()
-{
-    RenderAssetBrowserBreadcrumb();
-    ImGui::Separator();
-    const std::vector<std::string> folders = QueryFilesystemChildFolders(m_assetSubpath);
-    const std::vector<AssetLibrary::Entry> assets = QueryFilesystemAssetsInFolder(m_assetSubpath);
-    ImGui::Text("%zu assets, %zu folders | Assets%s%s",
-        assets.size(),
-        folders.size(),
-        m_assetSubpath.empty() ? "" : "/",
-        m_assetSubpath.c_str());
-    ImGui::Separator();
-
-    const float tileSize = 76.0f;
-    const float cellWidth = 128.0f;
-    const float panelWidth = std::max(1.0f, ImGui::GetContentRegionAvail().x);
-    const int columns = std::max(1, static_cast<int>(panelWidth / (cellWidth + ImGui::GetStyle().ItemSpacing.x)));
-    if (ImGui::BeginTable("AssetBrowserUnityGrid", columns, ImGuiTableFlags_SizingFixedSame | ImGuiTableFlags_NoSavedSettings))
-    {
-        for (int i = 0; i < columns; ++i)
-            ImGui::TableSetupColumn(nullptr, ImGuiTableColumnFlags_WidthFixed, cellWidth);
-        for (const std::string& folder : folders)
-        {
-            ImGui::TableNextColumn();
-            ImGui::BeginGroup();
-            RenderAssetBrowserFolderTile(folder, tileSize);
-            ImGui::EndGroup();
-        }
-        for (const AssetLibrary::Entry& entry : assets)
-        {
-            ImGui::TableNextColumn();
-            ImGui::BeginGroup();
-            RenderAssetTile(entry, tileSize);
-            ImGui::EndGroup();
-        }
-        ImGui::EndTable();
-    }
-    if (folders.empty() && assets.empty())
-        ImGui::TextDisabled("Empty folder.");
-
-    if (ImGui::BeginPopupContextWindow("AssetBrowserContentContext", ImGuiPopupFlags_MouseButtonRight | ImGuiPopupFlags_NoOpenOverItems))
-    {
-        if (ImGui::MenuItem("New Folder"))
-        {
-            m_assetNewFolderParent = m_assetSubpath;
-            CopyToBuffer(m_newAssetFolderName, sizeof(m_newAssetFolderName), UniqueFolderName(AssetBrowserPath(m_assetSubpath)));
-            m_assetOpenNewFolderPopup = true;
-        }
-        if (ImGui::MenuItem("New Material"))
-            CreatePbrMaterialAsset();
-        if (ImGui::MenuItem("New Water Material"))
-            CreateWaterMaterialAsset();
-        ImGui::EndPopup();
-    }
-}
-
-void EditorImGui::RenderAssetBrowserOperationPopups()
-{
-    if (m_assetOpenNewFolderPopup)
-    {
-        ImGui::OpenPopup("NewAssetFolderUnity");
-        m_assetOpenNewFolderPopup = false;
-    }
-    if (m_assetOpenRenamePopup)
-    {
-        ImGui::OpenPopup("RenameAssetBrowserItem");
-        m_assetOpenRenamePopup = false;
-    }
-    if (m_assetOpenDeletePopup)
-    {
-        ImGui::OpenPopup("DeleteAssetBrowserItem");
-        m_assetOpenDeletePopup = false;
-    }
-
-    if (ImGui::BeginPopupModal("NewAssetFolderUnity", nullptr, ImGuiWindowFlags_AlwaysAutoResize))
-    {
-        ImGui::InputText("Name", m_newAssetFolderName, sizeof(m_newAssetFolderName));
-        if (ImGui::Button("Create") || ImGui::IsKeyPressed(ImGuiKey_Enter))
-        {
-            CreateFilesystemFolder(m_assetNewFolderParent, m_newAssetFolderName);
-            ImGui::CloseCurrentPopup();
-        }
-        ImGui::SameLine();
-        if (ImGui::Button("Cancel") || ImGui::IsKeyPressed(ImGuiKey_Escape))
-            ImGui::CloseCurrentPopup();
-        ImGui::EndPopup();
-    }
-    if (ImGui::BeginPopupModal("RenameAssetBrowserItem", nullptr, ImGuiWindowFlags_AlwaysAutoResize))
-    {
-        ImGui::InputText("Name", m_assetRenameBuffer, sizeof(m_assetRenameBuffer));
-        if (ImGui::Button("Rename") || ImGui::IsKeyPressed(ImGuiKey_Enter))
-        {
-            RenameFilesystemSelection();
-            ImGui::CloseCurrentPopup();
-        }
-        ImGui::SameLine();
-        if (ImGui::Button("Cancel") || ImGui::IsKeyPressed(ImGuiKey_Escape))
-            ImGui::CloseCurrentPopup();
-        ImGui::EndPopup();
-    }
-    if (ImGui::BeginPopupModal("DeleteAssetBrowserItem", nullptr, ImGuiWindowFlags_AlwaysAutoResize))
-    {
-        const std::filesystem::path path(m_assetDeletePath);
-        ImGui::Text("Move '%s' to recycle bin?", path.filename().string().c_str());
-        if (ImGui::Button("Yes"))
-        {
-            DeleteFilesystemSelection();
-            ImGui::CloseCurrentPopup();
-        }
-        ImGui::SameLine();
-        if (ImGui::Button("No") || ImGui::IsKeyPressed(ImGuiKey_Escape))
-            ImGui::CloseCurrentPopup();
-        ImGui::EndPopup();
-    }
-}
-
-void EditorImGui::RenderAssetTagFilters()
-{
-    const std::vector<std::pair<std::string, std::uint32_t>> tags = QueryVisibleTags();
-    ImGui::TextUnformatted("Tags");
-    ImGui::Separator();
-    for (const auto& tag : tags)
-    {
-        bool active = std::find(m_activeAssetTags.begin(), m_activeAssetTags.end(), tag.first) != m_activeAssetTags.end();
-        const std::string label = tag.first + " (" + std::to_string(tag.second) + ")";
-        if (ImGui::Checkbox(label.c_str(), &active))
-        {
-            if (active)
-                m_activeAssetTags.push_back(tag.first);
-            else
-                m_activeAssetTags.erase(std::remove(m_activeAssetTags.begin(), m_activeAssetTags.end(), tag.first), m_activeAssetTags.end());
-        }
-    }
-    if (!m_activeAssetTags.empty() && ImGui::Button("Clear Filters"))
-        m_activeAssetTags.clear();
-}
-
-void EditorImGui::RenderAssetBrowser()
-{
-    if (!m_editorModeActive)
-        return;
-
-    if (ImGui::Begin("Asset Browser"))
-    {
-        if (!m_assetLibrary)
-        {
-            ImGui::TextDisabled("Asset library is not initialized.");
-            ImGui::End();
-            return;
-        }
-
-        RenderAssetBrowserToolbar();
-        ImGui::Separator();
-
-        if (!m_assetStatus.empty())
-        {
-            ImGui::TextDisabled("%s", m_assetStatus.c_str());
-            ImGui::Separator();
-        }
-
-        const float browserPanelHeight = std::max(140.0f, ImGui::GetContentRegionAvail().y);
-        if (ImGui::BeginTable("AssetBrowserLayout", 2, ImGuiTableFlags_Resizable | ImGuiTableFlags_BordersInnerV))
-        {
-            ImGui::TableSetupColumn("Folder Tree", ImGuiTableColumnFlags_WidthFixed, 230.0f);
-            ImGui::TableSetupColumn("Content", ImGuiTableColumnFlags_WidthStretch);
-            ImGui::TableNextRow();
-
-            ImGui::TableSetColumnIndex(0);
-            if (ImGui::BeginChild("AssetFolderTreeScroll", ImVec2(0.0f, browserPanelHeight), false,
-                    ImGuiWindowFlags_HorizontalScrollbar))
-            {
-                RenderAssetBrowserFolderTree();
-            }
-            ImGui::EndChild();
-
-            ImGui::TableSetColumnIndex(1);
-            if (ImGui::BeginChild("AssetContentScroll", ImVec2(0.0f, browserPanelHeight), false,
-                    ImGuiWindowFlags_HorizontalScrollbar))
-            {
-                RenderAssetBrowserContent();
-            }
-            ImGui::EndChild();
-
-            ImGui::EndTable();
-        }
-        if (ImGui::IsWindowFocused(ImGuiFocusedFlags_RootAndChildWindows))
-        {
-            if (ImGui::IsKeyPressed(ImGuiKey_F2) && !m_selectedAssetId.empty())
-            {
-                if (m_selectedAssetId.rfind("folder:", 0) == 0)
-                    BeginFolderRename(m_selectedAssetId.substr(7));
-                else if (auto entry = m_assetLibrary->FindById(m_selectedAssetId))
-                    BeginAssetRename(*entry);
-            }
-            if (ImGui::IsKeyPressed(ImGuiKey_Delete) && !m_selectedAssetId.empty())
-            {
-                if (m_selectedAssetId.rfind("folder:", 0) == 0)
-                {
-                    const std::string folder = m_selectedAssetId.substr(7);
-                    m_assetDeletePath = AssetBrowserPath(folder).generic_string();
-                    m_assetDeleteIsFolder = true;
-                    m_assetOpenDeletePopup = true;
-                }
-                else if (auto entry = m_assetLibrary->FindById(m_selectedAssetId))
-                {
-                    const std::filesystem::path path = entry->originalPath.empty() ? m_assetLibrary->AbsolutePath(*entry) : std::filesystem::path(entry->originalPath);
-                    m_assetDeletePath = path.generic_string();
-                    m_assetDeleteIsFolder = false;
-                    m_assetOpenDeletePopup = true;
-                }
-            }
-        }
-        RenderAssetBrowserOperationPopups();
-        if (!m_assetBrowserLogged)
-        {
-            m_assetBrowserLogged = true;
-            const auto folders = QueryFilesystemChildFolders(m_assetSubpath);
-            const auto assets = QueryFilesystemAssetsInFolder(m_assetSubpath);
-            Tracenf("[EDITOR-IMGUI-3] Asset Browser rendered, current_folder=Assets/%s subfolders=%zu files=%zu",
-                m_assetSubpath.c_str(),
-                folders.size(),
-                assets.size());
-        }
-    }
-    ImGui::End();
-}
-
-void EditorImGui::RenderGizmoControls()
-{
-    auto publish = [this]() {
-        m_commands.gizmoSettingsChanged = true;
-        m_commands.gizmoOperation = m_gizmoOperation;
-        m_commands.gizmoSnapEnabled = m_gizmoSnapEnabled;
-        m_commands.gizmoSnapValue = m_gizmoSnapValue;
-    };
-
-    ImGui::TextUnformatted("Gizmo");
-    ImGui::SameLine();
-
-    auto operationButton = [&](const char* label, const char* tooltip, MapEditorGizmoOperation operation, const char* trace) {
-        const bool active = m_gizmoOperation == operation;
-        if (active)
-            ImGui::PushStyleColor(ImGuiCol_Button, ImVec4(0.22f, 0.48f, 0.86f, 1.0f));
-        if (ImGui::SmallButton(label))
-        {
-            m_gizmoOperation = operation;
-            publish();
-            Tracen(trace);
-        }
-        if (active)
-            ImGui::PopStyleColor();
-        if (ImGui::IsItemHovered())
-            ImGui::SetTooltip("%s", tooltip);
-        ImGui::SameLine();
-    };
-
-    operationButton("W", "Translate", MapEditorGizmoOperation::Translate, "[EDITOR-GIZMO] Gizmo operation changed: translate");
-    operationButton("E", "Rotate", MapEditorGizmoOperation::Rotate, "[EDITOR-GIZMO] Gizmo operation changed: rotate");
-    operationButton("R", "Scale", MapEditorGizmoOperation::Scale, "[EDITOR-GIZMO] Gizmo operation changed: scale");
-
-    bool snapChanged = ImGui::Checkbox("Snap", &m_gizmoSnapEnabled);
-    if (m_gizmoSnapEnabled)
-    {
-        ImGui::SameLine();
-        const char* labels[] = {"0.1", "0.5", "1.0", "5.0"};
-        ImGui::SetNextItemWidth(72.0f);
-        snapChanged = ImGui::Combo("##GizmoSnap", &m_gizmoSnapIndex, labels, IM_ARRAYSIZE(labels)) || snapChanged;
-        constexpr float values[] = {0.1f, 0.5f, 1.0f, 5.0f};
-        m_gizmoSnapIndex = std::clamp(m_gizmoSnapIndex, 0, 3);
-        m_gizmoSnapValue = values[m_gizmoSnapIndex];
-    }
-    if (snapChanged)
-    {
-        publish();
-        Tracenf("[EDITOR-GIZMO] Snapping: enabled=%d value=%.2f",
-            m_gizmoSnapEnabled ? 1 : 0,
-            m_gizmoSnapValue);
-    }
-}
-
-void EditorImGui::RenderWaterMaterialHeader()
-{
-    if (!m_assetLibrary)
-        return;
-
-    auto entry = m_assetLibrary->FindById(m_waterMaterialEditor.materialId);
-    const std::string title = entry ? entry->displayName : m_waterMaterialEditor.materialId;
-    UI::SectionHeader(ICON_FA_PALETTE " Water Material");
-    ImGui::Text("Editing: %s%s", title.c_str(), m_waterMaterialEditor.dirty ? " *" : "");
-    ImGui::InputText("Name", m_waterMaterialEditor.name, sizeof(m_waterMaterialEditor.name));
-
-    if (UI::IconButton(ICON_FA_FLOPPY_DISK, "Save"))
-        SaveWaterMaterialEditor();
-    ImGui::SameLine();
-    if (UI::IconButton(ICON_FA_PLUS, "New Material"))
-        ImGui::OpenPopup("NewWaterMaterialPopup");
-    ImGui::SameLine();
-    if (UI::IconButton(ICON_FA_TRASH, "Delete"))
-        ImGui::OpenPopup("DeleteWaterMaterialConfirm");
-
-    if (ImGui::BeginPopup("NewWaterMaterialPopup"))
-    {
-        ImGui::InputText("Name", m_waterMaterialEditor.newName, sizeof(m_waterMaterialEditor.newName));
-        if (UI::IconButton(ICON_FA_CHECK, "Create"))
-        {
-            AssetLibrary::Entry created{};
-            if (CreateWaterMaterialAsset(m_waterMaterialEditor.newName, created))
-                OpenWaterMaterialEditor(created.id);
-            ImGui::CloseCurrentPopup();
-        }
-        ImGui::SameLine();
-        if (UI::IconButton(ICON_FA_XMARK, "Cancel"))
-            ImGui::CloseCurrentPopup();
-        ImGui::EndPopup();
-    }
-
-    if (ImGui::BeginPopup("DeleteWaterMaterialConfirm"))
-    {
-        const auto usageIt = m_waterMaterialUsageCounts.find(m_waterMaterialEditor.materialId);
-        const std::uint32_t users = usageIt != m_waterMaterialUsageCounts.end() ? usageIt->second : 0u;
-        ImGui::Text("Delete '%s'?", title.c_str());
-        if (users > 0)
-            ImGui::TextColored(ImVec4(1.0f, 0.55f, 0.45f, 1.0f), "%u water bodies will use the default material.", users);
-        if (UI::IconButton(ICON_FA_TRASH, "Yes, delete"))
-        {
-            DeleteWaterMaterialEditor();
-            ImGui::CloseCurrentPopup();
-        }
-        ImGui::SameLine();
-        if (UI::IconButton(ICON_FA_XMARK, "Cancel"))
-            ImGui::CloseCurrentPopup();
-        ImGui::EndPopup();
-    }
-
-    ImGui::Spacing();
-    if (ImGui::BeginListBox("Water Materials", ImVec2(-1.0f, 110.0f)))
-    {
-        for (const AssetLibrary::Entry& material : m_assetLibrary->Entries())
-        {
-            if (material.category != AssetLibrary::Category::WaterMaterial)
-                continue;
-            const bool selected = material.id == m_waterMaterialEditor.materialId;
-            if (ImGui::Selectable(material.displayName.c_str(), selected))
-                OpenWaterMaterialEditor(material.id);
-        }
-        ImGui::EndListBox();
-    }
-}
-
-void EditorImGui::RenderWaterMaterialColorsSection(WaterMaterialData& material)
-{
-    if (!ImGui::CollapsingHeader("Colors", ImGuiTreeNodeFlags_DefaultOpen))
-        return;
-    WaterConfig& config = material.config;
-    if (ImGui::Checkbox("Water Enabled", &config.enabled)) MarkWaterMaterialChanged("enabled");
-    if (ImGui::ColorEdit4("Base Color", config.baseColor)) MarkWaterMaterialChanged("base_color");
-    if (ImGui::ColorEdit3("Deep Color", config.deepColor)) MarkWaterMaterialChanged("deep_color");
-    if (ImGui::ColorEdit3("Shallow Color", config.shallowColor)) MarkWaterMaterialChanged("shallow_color");
-    if (ImGui::SliderFloat("Color Depth Min", &config.depthColorMin, 0.0f, 50.0f, "%.2f m")) MarkWaterMaterialChanged("depth_color_min");
-    if (ImGui::SliderFloat("Color Depth Max", &config.depthColorMax, 0.01f, 50.0f, "%.2f m")) MarkWaterMaterialChanged("depth_color_max");
-    config.depthColorMax = std::max(config.depthColorMax, config.depthColorMin + 0.01f);
-    if (ImGui::SliderFloat("Fade Distance", &config.depthFadeDistance, 0.01f, 50.0f, "%.2f m")) MarkWaterMaterialChanged("depth_fade_distance");
-}
-
-void EditorImGui::RenderWaterMaterialWaveSection(WaterMaterialData& material)
-{
-    if (!ImGui::CollapsingHeader("Wave", ImGuiTreeNodeFlags_DefaultOpen))
-        return;
-    WaterConfig& config = material.config;
-    if (ImGui::SliderFloat("Wave Scale Small", &config.waveScaleSmall, 0.001f, 0.12f, "%.3f")) MarkWaterMaterialChanged("wave_scale_small");
-    if (ImGui::SliderFloat("Wave Scale Large", &config.waveScaleLarge, 0.001f, 0.08f, "%.3f")) MarkWaterMaterialChanged("wave_scale_large");
-    if (ImGui::SliderFloat("Wave Speed Small", &config.waveSpeedSmall, 0.0f, 0.5f, "%.3f")) MarkWaterMaterialChanged("wave_speed_small");
-    if (ImGui::SliderFloat("Wave Speed Large", &config.waveSpeedLarge, 0.0f, 0.5f, "%.3f")) MarkWaterMaterialChanged("wave_speed_large");
-    if (ImGui::SliderFloat("Normal Strength", &config.normalStrength, 0.0f, 2.0f, "%.2f")) MarkWaterMaterialChanged("normal_strength");
-    if (ImGui::SliderFloat("Fresnel Power", &config.fresnelPower, 1.0f, 10.0f, "%.2f")) MarkWaterMaterialChanged("fresnel_power");
-    if (ImGui::SliderFloat("Fresnel Min", &config.fresnelMin, 0.0f, 0.5f, "%.3f")) MarkWaterMaterialChanged("fresnel_min");
-}
-
-void EditorImGui::RenderWaterMaterialFoamSection(WaterMaterialData& material)
-{
-    if (!ImGui::CollapsingHeader("Foam"))
-        return;
-    WaterConfig& config = material.config;
-    if (ImGui::Checkbox("Foam Enabled", &config.foamEnabled)) MarkWaterMaterialChanged("foam_enabled");
-    if (!config.foamEnabled)
-        ImGui::BeginDisabled();
-    if (ImGui::SliderFloat("Foam Distance", &config.foamDistance, 0.02f, 1.5f, "%.3f m")) MarkWaterMaterialChanged("foam_distance");
-    if (ImGui::SliderFloat("Foam Softness", &config.foamSoftness, 0.0f, 0.5f, "%.3f")) MarkWaterMaterialChanged("foam_softness");
-    if (ImGui::SliderFloat("Foam Intensity", &config.foamIntensity, 0.0f, 2.0f, "%.2f")) MarkWaterMaterialChanged("foam_intensity");
-    if (ImGui::SliderFloat("Foam Scroll Speed", &config.foamScrollSpeed, -1.0f, 1.0f, "%.3f")) MarkWaterMaterialChanged("foam_scroll_speed");
-    if (ImGui::SliderFloat("Foam Scale", &config.foamScale, 0.1f, 2.0f, "%.2f")) MarkWaterMaterialChanged("foam_scale");
-    if (ImGui::SliderFloat("Terrain Foam Thickness", &config.foamTerrainThickness, 0.0f, 1.0f, "%.3f m")) MarkWaterMaterialChanged("foam_terrain_thickness");
-    if (!config.foamEnabled)
-        ImGui::EndDisabled();
-}
-
-void EditorImGui::RenderWaterMaterialCausticSection(WaterMaterialData& material)
-{
-    if (!ImGui::CollapsingHeader("Caustic"))
-        return;
-    WaterConfig& config = material.config;
-    const char* modes[] = {"Off", "Animated", "Procedural"};
-    int mode = static_cast<int>(config.causticMode);
-    if (ImGui::Combo("Caustic Mode", &mode, modes, IM_ARRAYSIZE(modes)))
-    {
-        config.causticMode = static_cast<WaterConfig::CausticMode>(std::clamp(mode, 0, 2));
-        MarkWaterMaterialChanged("caustic_mode");
-    }
-    if (config.causticMode == WaterConfig::CausticMode::Off)
-        ImGui::BeginDisabled();
-    if (ImGui::SliderFloat("Caustic Intensity", &config.causticIntensity, 0.0f, 3.0f, "%.2f")) MarkWaterMaterialChanged("caustic_intensity");
-    if (ImGui::SliderFloat("Caustic Scale", &config.causticScale, 0.1f, 2.0f, "%.2f m")) MarkWaterMaterialChanged("caustic_scale");
-    if (ImGui::SliderFloat("Caustic Speed", &config.causticSpeed, 0.0f, 2.0f, "%.2f")) MarkWaterMaterialChanged("caustic_speed");
-    if (ImGui::SliderFloat("Caustic Max Depth", &config.causticMaxDepth, 1.0f, 30.0f, "%.1f m")) MarkWaterMaterialChanged("caustic_max_depth");
-    if (config.causticMode == WaterConfig::CausticMode::Off)
-        ImGui::EndDisabled();
-}
-
-void EditorImGui::RenderWaterMaterialReflectionSection(WaterMaterialData& material)
-{
-    if (!ImGui::CollapsingHeader("Reflection"))
-        return;
-    WaterConfig& config = material.config;
-    if (ImGui::Checkbox("Reflection Enabled", &config.reflectionEnabled)) MarkWaterMaterialChanged("reflection_enabled");
-    if (!config.reflectionEnabled)
-        ImGui::BeginDisabled();
-    if (ImGui::ColorEdit3("Reflection Color", config.reflectionColor)) MarkWaterMaterialChanged("reflection_color");
-    const char* qualities[] = {"Low", "Medium", "High"};
-    int quality = static_cast<int>(config.reflectionQuality);
-    if (ImGui::Combo("Reflection Quality", &quality, qualities, IM_ARRAYSIZE(qualities)))
-    {
-        config.reflectionQuality = static_cast<WaterConfig::ReflectionQuality>(std::clamp(quality, 0, 2));
-        MarkWaterMaterialChanged("reflection_quality");
-    }
-    if (ImGui::SliderFloat("Distortion Strength", &config.reflectionDistortionStrength, 0.0f, 0.2f, "%.3f")) MarkWaterMaterialChanged("reflection_distortion_strength");
-    if (!config.reflectionEnabled)
-        ImGui::EndDisabled();
-}
-
-void EditorImGui::RenderWaterMaterialRefractionSection(WaterMaterialData& material)
-{
-    if (!ImGui::CollapsingHeader("Refraction"))
-        return;
-    WaterConfig& config = material.config;
-    if (ImGui::Checkbox("Refraction Enabled", &config.refractionEnabled)) MarkWaterMaterialChanged("refraction_enabled");
-    if (!config.refractionEnabled)
-        ImGui::BeginDisabled();
-    if (ImGui::SliderFloat("Refraction Strength", &config.refractionStrength, 0.0f, 0.1f, "%.3f")) MarkWaterMaterialChanged("refraction_strength");
-    if (ImGui::SliderFloat("Depth Multiplier", &config.refractionDepthStrength, 0.0f, 2.0f, "%.2f")) MarkWaterMaterialChanged("refraction_depth_strength");
-    if (!config.refractionEnabled)
-        ImGui::EndDisabled();
-}
-
-void EditorImGui::RenderWaterMaterialEdgeFadeSection(WaterMaterialData& material)
-{
-    if (!ImGui::CollapsingHeader("Edge Fade", ImGuiTreeNodeFlags_DefaultOpen))
-        return;
-    WaterConfig& config = material.config;
-    if (ImGui::SliderFloat("Edge Fade Distance", &config.edgeFadeDistance, 0.0f, 3.0f, "%.2f m")) MarkWaterMaterialChanged("edge_fade_distance");
-    const char* curves[] = {"Linear", "Smooth", "Exponential"};
-    int curve = static_cast<int>(config.edgeFadeCurve);
-    if (ImGui::Combo("Edge Fade Curve", &curve, curves, IM_ARRAYSIZE(curves)))
-    {
-        config.edgeFadeCurve = static_cast<WaterConfig::EdgeFadeCurve>(std::clamp(curve, 0, 2));
-        MarkWaterMaterialChanged("edge_fade_curve");
-    }
-}
-
-void EditorImGui::RenderWaterTextureSlot(const char* label, std::string& texturePath, bool& changed)
-{
-    ImGui::PushID(label);
-    ImGui::TextUnformatted(label);
-
-    std::string display = texturePath.empty() ? std::string("empty") : texturePath;
-    if (m_assetLibrary)
-    {
-        for (const AssetLibrary::Entry& entry : m_assetLibrary->Entries())
-        {
-            if (entry.category == AssetLibrary::Category::Texture && m_assetLibrary->AssetRelativePath(entry) == texturePath)
-            {
-                display = entry.displayName;
-                break;
-            }
-        }
-    }
-
-    ImGui::Button("##texture_slot", ImVec2(70.0f, 70.0f));
-    if (ImGui::BeginDragDropTarget())
-    {
-        if (const ImGuiPayload* payload = ImGui::AcceptDragDropPayload(kAssetPayloadType))
-        {
-            const std::string assetId(static_cast<const char*>(payload->Data), payload->DataSize);
-            auto entry = m_assetLibrary ? m_assetLibrary->FindById(assetId) : std::optional<AssetLibrary::Entry>{};
-            if (entry && entry->category == AssetLibrary::Category::Texture)
-            {
-                texturePath = m_assetLibrary->AssetRelativePath(*entry);
-                changed = true;
-                Tracenf("[EDITOR-IMGUI-4] Texture slot assigned: material_id=%s slot=%s asset_id=%s",
-                    m_waterMaterialEditor.materialId.c_str(),
-                    label,
-                    entry->id.c_str());
-            }
-            else
-            {
-                m_assetStatus = "Texture slot accepts texture assets only";
-            }
-        }
-        ImGui::EndDragDropTarget();
-    }
-    ImGui::SameLine();
-    ImGui::BeginGroup();
-    ImGui::TextWrapped("%s", display.c_str());
-    if (!texturePath.empty() && ImGui::SmallButton("Clear"))
-    {
-        texturePath.clear();
-        changed = true;
-    }
-    ImGui::EndGroup();
-    ImGui::PopID();
-}
-
-void EditorImGui::RenderWaterMaterialTexturesSection(WaterMaterialData& material)
-{
-    if (!ImGui::CollapsingHeader("Textures"))
-        return;
-
-    bool changed = false;
-    RenderWaterTextureSlot("Normal Map A", material.normalMapA, changed);
-    RenderWaterTextureSlot("Normal Map B", material.normalMapB, changed);
-    RenderWaterTextureSlot("Diffuse Map", material.diffuseMap, changed);
-    if (changed)
-        MarkWaterMaterialChanged("texture_slot");
-
-    if (ImGui::SliderFloat2("Scroll Speed A", material.scrollSpeedA, -1.0f, 1.0f, "%.3f")) MarkWaterMaterialChanged("scroll_speed_a");
-    if (ImGui::SliderFloat2("Scroll Speed B", material.scrollSpeedB, -1.0f, 1.0f, "%.3f")) MarkWaterMaterialChanged("scroll_speed_b");
-    if (ImGui::SliderFloat("Normal Tiling", &material.normalTiling, 0.1f, 20.0f, "%.2f")) MarkWaterMaterialChanged("normal_tiling");
-}
-
-void EditorImGui::RenderWaterMaterialEditor()
-{
-    if (!m_editorModeActive || !m_waterMaterialEditor.windowOpen)
-        return;
-
-    if (ImGui::Begin("Water Material Editor", &m_waterMaterialEditor.windowOpen))
-    {
-        const bool toolsEnabled = CanUseEditorTools();
-        if (!toolsEnabled)
-        {
-            ImGui::TextColored(ImVec4(0.95f, 0.74f, 0.30f, 1.0f), "Read-only during Play Mode");
-            ImGui::BeginDisabled();
-        }
-        if (m_waterMaterialEditor.materialId.empty())
-        {
-            ImGui::TextDisabled("No water material loaded.");
-            if (!toolsEnabled)
-                ImGui::EndDisabled();
-            ImGui::End();
-            return;
-        }
-
-        RenderWaterMaterialHeader();
-        ImGui::Separator();
-        WaterMaterialData& material = m_waterMaterialEditor.draft;
-        RenderWaterMaterialColorsSection(material);
-        RenderWaterMaterialWaveSection(material);
-        RenderWaterMaterialFoamSection(material);
-        RenderWaterMaterialCausticSection(material);
-        RenderWaterMaterialReflectionSection(material);
-        RenderWaterMaterialRefractionSection(material);
-        RenderWaterMaterialEdgeFadeSection(material);
-        RenderWaterMaterialTexturesSection(material);
-        if (!toolsEnabled)
-            ImGui::EndDisabled();
-    }
-    ImGui::End();
-}
-
-void EditorImGui::RenderPbrMaterialHeader()
-{
-    UI::SectionHeader(ICON_FA_PALETTE " PBR Material");
-    ImGui::Text("Editing: %s%s", m_pbrMaterialEditor.name, m_pbrMaterialEditor.dirty ? " *" : "");
-    ImGui::InputText("Name", m_pbrMaterialEditor.name, sizeof(m_pbrMaterialEditor.name));
-    if (UI::IconButton(ICON_FA_FLOPPY_DISK, "Save"))
-        SavePbrMaterialEditor();
-    ImGui::SameLine();
-    if (UI::IconButton(ICON_FA_PLUS, "New Material"))
-        CreatePbrMaterialAsset();
-}
-
-void EditorImGui::RenderPbrTextureSlot(const char* label, std::string& textureId, bool& changed)
-{
-    ImGui::PushID(label);
-    ImGui::TextUnformatted(label);
-    std::string display = "(empty)";
-    if (m_assetLibrary && !textureId.empty())
-    {
-        auto entry = m_assetLibrary->FindById(textureId);
-        if (entry)
-            display = entry->displayName;
-    }
-
-    ImGui::Button("##pbr_texture_slot", ImVec2(70.0f, 70.0f));
-    if (ImGui::BeginDragDropTarget())
-    {
-        if (const ImGuiPayload* payload = ImGui::AcceptDragDropPayload(kAssetPayloadType))
-        {
-            const std::string assetId(static_cast<const char*>(payload->Data), payload->DataSize);
-            auto entry = m_assetLibrary ? m_assetLibrary->FindById(assetId) : std::optional<AssetLibrary::Entry>{};
-            if (entry && entry->category == AssetLibrary::Category::Texture)
-            {
-                textureId = entry->id;
-                changed = true;
-                Tracenf("[EDITOR-IMGUI-4] Texture slot assigned: material_id=%s slot=%s asset_id=%s",
-                    m_pbrMaterialEditor.materialId.c_str(),
-                    label,
-                    entry->id.c_str());
-            }
-            else
-            {
-                m_assetStatus = "PBR texture slot accepts texture assets only";
-            }
-        }
-        ImGui::EndDragDropTarget();
-    }
-    ImGui::SameLine();
-    ImGui::BeginGroup();
-    ImGui::TextWrapped("%s", display.c_str());
-    if (!textureId.empty() && ImGui::SmallButton("Clear"))
-    {
-        textureId.clear();
-        changed = true;
-    }
-    ImGui::EndGroup();
-    ImGui::PopID();
-}
-
-void EditorImGui::RenderPbrMaterialEditor()
-{
-    if (!m_editorModeActive || !m_pbrMaterialEditor.windowOpen)
-        return;
-
-    if (ImGui::Begin("PBR Material Editor", &m_pbrMaterialEditor.windowOpen))
-    {
-        const bool toolsEnabled = CanUseEditorTools();
-        if (!toolsEnabled)
-        {
-            ImGui::TextColored(ImVec4(0.95f, 0.74f, 0.30f, 1.0f), "Read-only during Play Mode");
-            ImGui::BeginDisabled();
-        }
-        RenderPbrMaterialHeader();
-        ImGui::Separator();
-        AssetLibrary::MaterialData& material = m_pbrMaterialEditor.draft;
-        if (ImGui::CollapsingHeader("Textures", ImGuiTreeNodeFlags_DefaultOpen))
-        {
-            bool changed = false;
-            RenderPbrTextureSlot("Diffuse / Albedo", material.diffuseTextureId, changed);
-            RenderPbrTextureSlot("Normal Map", material.normalTextureId, changed);
-            RenderPbrTextureSlot("AO", material.aoTextureId, changed);
-            RenderPbrTextureSlot("Roughness", material.roughnessTextureId, changed);
-            RenderPbrTextureSlot("Metallic", material.metallicTextureId, changed);
-            RenderPbrTextureSlot("Height", material.heightTextureId, changed);
-            if (changed)
-                MarkPbrMaterialChanged("texture_slot");
-        }
-        if (ImGui::CollapsingHeader("Parameters", ImGuiTreeNodeFlags_DefaultOpen))
-        {
-            if (ImGui::SliderFloat("Tiling X", &material.tilingScaleX, 0.01f, 32.0f, "%.2f")) MarkPbrMaterialChanged("tiling_x");
-            if (ImGui::SliderFloat("Tiling Y", &material.tilingScaleY, 0.01f, 32.0f, "%.2f")) MarkPbrMaterialChanged("tiling_y");
-            if (ImGui::ColorEdit3("Tint", material.colorTint)) MarkPbrMaterialChanged("color_tint");
-            if (ImGui::SliderFloat("Normal Strength", &material.normalStrength, 0.0f, 2.0f, "%.2f")) MarkPbrMaterialChanged("normal_strength");
-            if (ImGui::SliderFloat("AO Strength", &material.aoStrength, 0.0f, 2.0f, "%.2f")) MarkPbrMaterialChanged("ao_strength");
-            if (ImGui::SliderFloat("Roughness Strength", &material.roughnessStrength, 0.0f, 2.0f, "%.2f")) MarkPbrMaterialChanged("roughness_strength");
-            if (ImGui::SliderFloat("Metallic Strength", &material.metallicStrength, 0.0f, 2.0f, "%.2f")) MarkPbrMaterialChanged("metallic_strength");
-        }
-        if (!toolsEnabled)
-            ImGui::EndDisabled();
-    }
-    ImGui::End();
-}
-
-void EditorImGui::RenderSelectedTerrainInspector()
-{
-    if (!m_terrainState.selected)
-        return;
-
-    UI::SectionHeader(ICON_FA_MOUNTAIN " Terrain");
-    ImGui::TextDisabled("flecs=%llu  object=1",
-        static_cast<unsigned long long>(m_selectedHierarchyEntity));
-    ImGui::Text("Name: %s", m_terrainState.name.c_str());
-    ImGui::Separator();
-    ImGui::Text("Size: %.2f m x %.2f m",
-        m_terrainState.widthMeters,
-        m_terrainState.depthMeters);
-    ImGui::Text("Cell size: %.2f m/cell", m_terrainState.cellSizeMeters);
-    ImGui::Text("Cells: %u x %u", m_terrainState.cellsX, m_terrainState.cellsZ);
-    const std::uint64_t verts =
-        static_cast<std::uint64_t>(m_terrainState.cellsX + 1u) *
-        static_cast<std::uint64_t>(m_terrainState.cellsZ + 1u);
-    ImGui::Text("Vertices: %llu", static_cast<unsigned long long>(verts));
-}
-
-void EditorImGui::RenderInspector()
-{
-    if (ImGui::Begin("Inspector"))
-    {
-        if (m_terrainState.selected)
-            RenderSelectedTerrainInspector();
-        else if (m_waterBodyState.selected)
-            RenderSelectedWaterBodyInspector();
-        else if (m_dynamicLightState.type != DynamicLightType::None)
-            RenderSelectedLightInspector();
-        else if (m_meshRendererState.selected)
-            RenderSelectedMeshRendererInspector();
-        else
-        {
-            ImGui::TextUnformatted("Nothing selected");
-            ImGui::TextWrapped("Select an entity in the Hierarchy or 3D viewport to edit its components.");
-        }
-    }
-    ImGui::End();
-
-    if (!m_logInspectorRendered)
-    {
-        m_logInspectorRendered = true;
-        Tracenf("[EDITOR-IMGUI-2] Inspector active: selected_water_body=%u selected_light=%u",
-            m_waterBodyState.selected ? m_waterBodyState.id : 0u,
-            m_dynamicLightState.id);
-    }
-}
-
-void EditorImGui::RenderEditorPanels()
-{
-    if (!m_editorModeActive)
-        return;
-
-    RenderDockSpace();
-    RenderMenuBar();
-    RenderProjectModal();
-    HandleEditorHotkeys();
-    RenderEditorToolbar();
-    RenderHierarchyPanel();
-    RenderSceneSettingsPanel();
-    RenderWorldPanel();
-    RenderToolsPanel();
-    RenderAssetBrowser();
-    RenderInspector();
-    RenderSceneViewDropTarget();
-    RenderWaterSculptToolPanel();
-    RenderHeightmapToolPanel();
-    RenderSplatPaintToolPanel();
-    RenderTreeGeneratorPanel();
-    RenderWaterMaterialEditor();
-    RenderPbrMaterialEditor();
-}
-
-void EditorImGui::RenderTreeGeneratorPanel()
-{
-    if (!m_treeGeneratorPanel)
-        return;
-    m_treeGeneratorPanel->SetAssetLibrary(m_assetLibrary.get());
-    if (m_treeGeneratorPanel->Render())
-    {
-        RefreshAssetLibrary();
-        m_assetFilter = AssetBrowserFilter::Model;
-        m_assetStatus = m_treeGeneratorPanel->Status();
-    }
-}
-
+#include "editor_panels/EditorImGuiSceneViewPanels.inl"
+#include "editor_panels/EditorImGuiProjectPanels.inl"
+#include "editor_panels/EditorImGuiMenuToolbarPanels.inl"
+#include "editor_panels/EditorImGuiHierarchyPanels.inl"
+#include "editor_panels/EditorImGuiInspectorPanels.inl"
+#include "editor_panels/EditorImGuiAssetBrowserPanels.inl"
+#include "editor_panels/EditorImGuiMaterialPanels.inl"
+#include "editor_panels/EditorImGuiPanelDispatcher.inl"
 void EditorImGui::Render(VulkanDevice& device)
 {
     if (!m_initialized || !m_vulkanBackendReady || !m_frameActive)
@@ -6459,7 +2539,7 @@ void EditorImGui::Render(VulkanDevice& device)
         if (!QuietLogsForLodDiag() && renderSkippedLogs < 3)
         {
             ++renderSkippedLogs;
-            Tracenf("[FRAME] imgui_render called = no, initialized=%d backend_ready=%d frame_active=%d editor_mode=%d",
+            TraceDiagf("[FRAME] imgui_render called = no, initialized=%d backend_ready=%d frame_active=%d editor_mode=%d",
                 m_initialized ? 1 : 0,
                 m_vulkanBackendReady ? 1 : 0,
                 m_frameActive ? 1 : 0,
@@ -6476,7 +2556,7 @@ void EditorImGui::Render(VulkanDevice& device)
     const uint64_t frameNumber = device.GetFrameNumber();
     if (!QuietLogsForLodDiag() && (frameNumber < 3 || (frameNumber % 60u) == 0u))
     {
-        Tracenf("[FRAME] imgui_render called = yes, editor_mode=%d draw_lists=%d draw_cmds=%u",
+        TraceDiagf("[FRAME] imgui_render called = yes, editor_mode=%d draw_lists=%d draw_cmds=%u",
             m_editorModeActive ? 1 : 0,
             drawData ? drawData->CmdListsCount : 0,
             CountDrawCommands(drawData));
@@ -6491,7 +2571,7 @@ void EditorImGui::Render(VulkanDevice& device)
         (!QuietLogsForLodDiag() || drawCommandsChanged))
     {
         m_lastLoggedFrame = device.GetFrameNumber();
-        Tracenf("[EDITOR-IMGUI] Frame %llu rendered with %u draw calls",
+        TraceDiagf("[EDITOR-IMGUI] Frame %llu rendered with %u draw calls",
             static_cast<unsigned long long>(device.GetFrameNumber()),
             drawCommands);
         lastLoggedDrawCommands = drawCommands;

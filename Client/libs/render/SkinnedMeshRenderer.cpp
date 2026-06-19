@@ -1,5 +1,6 @@
 #include "SkinnedMeshRenderer.h"
 
+#include "AssimpImporter.h"
 #include "Debug.h"
 #include "asset/IAssetReader.h"
 
@@ -26,6 +27,7 @@
 #include <array>
 #include <chrono>
 #include <cmath>
+#include <cctype>
 #include <cstdarg>
 #include <cstdint>
 #include <cstdio>
@@ -39,6 +41,7 @@
 #include <string>
 #include <string_view>
 #include <unordered_map>
+#include <utility>
 #include <variant>
 #include <vector>
 
@@ -755,6 +758,35 @@ bool LoadGltfBaseColorTexture(client::asset::IAssetReader& assets,
     return false;
 }
 
+bool LoadRgbaTextureFile(const std::filesystem::path& path, DdsImage& out)
+{
+    int width = 0;
+    int height = 0;
+    int channels = 0;
+    stbi_uc* decoded = stbi_load(path.string().c_str(), &width, &height, &channels, 4);
+    if (!decoded || width <= 0 || height <= 0)
+    {
+        if (decoded)
+            stbi_image_free(decoded);
+        return false;
+    }
+
+    std::vector<uint8_t> pixels(
+        decoded, decoded + (static_cast<size_t>(width) * static_cast<size_t>(height) * 4u));
+    stbi_image_free(decoded);
+
+    out = CreateRgbaImage(path.filename().generic_string(),
+        static_cast<uint32_t>(width),
+        static_cast<uint32_t>(height),
+        std::move(pixels));
+    LogFormat("[FBX-IMPORT] skinned diffuse texture loaded path=%s (%ux%u, source channels=%d)",
+        path.generic_string().c_str(),
+        out.width,
+        out.height,
+        channels);
+    return true;
+}
+
 VkShaderModule CreateShaderModule(VkDevice device, client::asset::IAssetReader& assets,
     const std::string& path)
 {
@@ -1166,7 +1198,11 @@ bool SkinnedMeshRenderer::Create(VulkanDevice& device, client::asset::IAssetRead
     m_device = device.GetDevice();
     m_assets = &assets;
 
-    const bool loaded = LoadGltfMesh(modelPath);
+    std::string ext = std::filesystem::path(modelPath).extension().string();
+    std::transform(ext.begin(), ext.end(), ext.begin(), [](unsigned char c) {
+        return static_cast<char>(std::tolower(c));
+    });
+    const bool loaded = ext == ".fbx" ? LoadFbxMesh(modelPath) : LoadGltfMesh(modelPath);
     const bool buffers = loaded ? CreateBuffers(device) : false;
     const bool compute = buffers ? CreateComputeResources(device) : false;
     const bool textures = compute ? CreateTextures(device, modelPath) : false;
@@ -1386,7 +1422,8 @@ void SkinnedMeshRenderer::RenderInWorld(VulkanDevice& device,
     WorldVec3 position,
     float yawRadians,
     uint32_t skinSlot,
-    std::array<float, 4> tint)
+    std::array<float, 4> tint,
+    VkExtent2D targetExtent)
 {
     static bool loggedDraw = false;
     static bool loggedNoPipeline = false;
@@ -1404,7 +1441,9 @@ void SkinnedMeshRenderer::RenderInWorld(VulkanDevice& device,
     if (!device.IsFrameActive())
         return;
 
-    const VkExtent2D extent = device.GetSwapchainExtent();
+    const VkExtent2D extent = (targetExtent.width > 0 && targetExtent.height > 0)
+        ? targetExtent
+        : device.GetSwapchainExtent();
     if (extent.width == 0 || extent.height == 0)
         return;
 
@@ -1564,12 +1603,13 @@ void SkinnedMeshRenderer::Destroy()
 bool SkinnedMeshRenderer::LoadGltfMesh(const std::string& modelPath)
 {
     DestroyAnimation();
+    m_importedDiffuseTexturePath.clear();
     if (!m_assets)
         return false;
 
-    const std::string dir = DirectoryOf(modelPath);
-    if (!LoadOzzPose(dir))
+    if (!LoadOzzPose(modelPath))
         return false;
+    const std::string dir = DirectoryOf(modelPath);
 
     auto modelBytes = m_assets->ReadAll(modelPath);
     if (!modelBytes)
@@ -1829,13 +1869,198 @@ bool SkinnedMeshRenderer::LoadGltfMesh(const std::string& modelPath)
     return true;
 }
 
-bool SkinnedMeshRenderer::LoadOzzPose(const std::string& dir)
+bool SkinnedMeshRenderer::LoadFbxMesh(const std::string& modelPath)
+{
+    DestroyAnimation();
+    m_importedDiffuseTexturePath.clear();
+    if (!m_assets)
+        return false;
+
+    std::filesystem::path fbxPath(modelPath);
+    if (fbxPath.is_relative())
+    {
+        if (auto root = m_assets->RootPath())
+            fbxPath = *root / fbxPath;
+        else
+            fbxPath = std::filesystem::absolute(fbxPath);
+    }
+    std::error_code ec;
+    const std::filesystem::path canonical = std::filesystem::weakly_canonical(fbxPath, ec);
+    if (!ec)
+        fbxPath = canonical;
+
+    AssimpImporter importer;
+    const AssimpImporter::ImportResult result = importer.importFile(fbxPath);
+    if (!result.success)
+    {
+        LogFormat("[FBX-IMPORT] skinned load failed path=%s error=%s",
+            fbxPath.generic_string().c_str(),
+            result.errorMessage.c_str());
+        return false;
+    }
+    if (!result.skeleton || result.skeleton->bones.empty())
+    {
+        LogFormat("[FBX-IMPORT] skinned load skipped path=%s reason=no_skeleton",
+            fbxPath.generic_string().c_str());
+        return false;
+    }
+
+    const std::filesystem::path stemSkeleton = fbxPath.parent_path() /
+        (fbxPath.stem().string() + "_skeleton.ozz");
+    std::vector<std::filesystem::path> animationPaths;
+    for (std::size_t i = 0; i < result.animations.size(); ++i)
+        animationPaths.push_back(fbxPath.parent_path() / (fbxPath.stem().string() + "_anim_" + std::to_string(i) + ".ozz"));
+    if (!std::filesystem::exists(stemSkeleton))
+    {
+        std::string ozzError;
+        if (!importer.writeOzzSidecars(result, stemSkeleton, animationPaths, ozzError))
+        {
+            LogFormat("[FBX-IMPORT] skinned sidecar generation failed path=%s error=%s",
+                fbxPath.generic_string().c_str(),
+                ozzError.c_str());
+            return false;
+        }
+    }
+
+    if (!LoadOzzPose(modelPath))
+        return false;
+
+    m_inverseBindMatrices.assign(m_boneCount, IdentityPaletteMatrix());
+    for (std::size_t i = 0; i < result.skeleton->bones.size() && i < m_inverseBindMatrices.size(); ++i)
+        m_inverseBindMatrices[i] = result.skeleton->bones[i].inverseBindPose;
+
+    m_vertices.clear();
+    m_indices.clear();
+    m_rawMeshes.clear();
+    m_restVerticesGpu.clear();
+    m_draws.clear();
+    for (const GltfMaterialSource& material : result.materials)
+    {
+        if (!material.baseColorTexturePath.empty())
+        {
+            m_importedDiffuseTexturePath = material.baseColorTexturePath;
+            break;
+        }
+    }
+
+    std::unordered_map<int, const AssimpImporter::SkinningData*> skinByMesh;
+    for (const AssimpImporter::SkinningData& skin : result.skinning)
+        skinByMesh[skin.meshIndex] = &skin;
+
+    uint32_t invalidInfluences = 0;
+    uint32_t meshIndex = 0;
+    for (std::size_t sourceMeshIndex = 0; sourceMeshIndex < result.meshes.size(); ++sourceMeshIndex)
+    {
+        const AssimpImporter::StaticMeshData& mesh = result.meshes[sourceMeshIndex];
+        if (mesh.vertices.empty() || mesh.indices.empty())
+            continue;
+        const uint32_t baseVertex = static_cast<uint32_t>(m_vertices.size());
+        m_vertices.resize(m_vertices.size() + mesh.vertices.size());
+
+        RawMesh rawMesh{};
+        rawMesh.meshIndex = meshIndex++;
+        rawMesh.baseVertex = baseVertex;
+        rawMesh.vertexCount = static_cast<uint32_t>(mesh.vertices.size());
+        rawMesh.sourceVertices.resize(mesh.vertices.size());
+
+        const AssimpImporter::SkinningData* skin = nullptr;
+        const auto skinIt = skinByMesh.find(static_cast<int>(sourceMeshIndex));
+        if (skinIt != skinByMesh.end())
+            skin = skinIt->second;
+
+        for (std::size_t vertexIndex = 0; vertexIndex < mesh.vertices.size(); ++vertexIndex)
+        {
+            const AssimpImporter::Vertex& source = mesh.vertices[vertexIndex];
+            SourceVertex& vertex = rawMesh.sourceVertices[vertexIndex];
+            vertex.position[0] = source.position[0];
+            vertex.position[1] = source.position[1];
+            vertex.position[2] = source.position[2];
+            vertex.normal[0] = source.normal[0];
+            vertex.normal[1] = source.normal[1];
+            vertex.normal[2] = source.normal[2];
+            vertex.uv[0] = source.uv[0];
+            vertex.uv[1] = source.uv[1];
+            if (skin && vertexIndex < skin->influences.size())
+            {
+                std::memcpy(vertex.boneIndices, skin->influences[vertexIndex].boneIndices, sizeof(vertex.boneIndices));
+                std::memcpy(vertex.boneWeights, skin->influences[vertexIndex].boneWeights, sizeof(vertex.boneWeights));
+            }
+            else
+            {
+                vertex.boneIndices[0] = 0;
+                vertex.boneWeights[0] = 255;
+            }
+
+            RestVertexGpu gpu{};
+            gpu.position[0] = vertex.position[0];
+            gpu.position[1] = vertex.position[1];
+            gpu.position[2] = vertex.position[2];
+            gpu.normal[0] = vertex.normal[0];
+            gpu.normal[1] = vertex.normal[1];
+            gpu.normal[2] = vertex.normal[2];
+            gpu.uv[0] = vertex.uv[0];
+            gpu.uv[1] = vertex.uv[1];
+            gpu.packedWeights = PackBytes(vertex.boneWeights[0], vertex.boneWeights[1], vertex.boneWeights[2], vertex.boneWeights[3]);
+            gpu.packedBones = PackBytes(vertex.boneIndices[0], vertex.boneIndices[1], vertex.boneIndices[2], vertex.boneIndices[3]);
+            for (uint32_t influence = 0; influence < 4; ++influence)
+            {
+                if (vertex.boneWeights[influence] != 0 && vertex.boneIndices[influence] >= m_boneCount)
+                    ++invalidInfluences;
+            }
+            m_restVerticesGpu.push_back(gpu);
+        }
+
+        const uint32_t firstIndex = static_cast<uint32_t>(m_indices.size());
+        for (uint32_t index : mesh.indices)
+            m_indices.push_back(baseVertex + index);
+        MeshDraw draw{};
+        draw.firstIndex = firstIndex;
+        draw.indexCount = static_cast<uint32_t>(m_indices.size() - firstIndex);
+        draw.textureIndex = 0;
+        m_draws.push_back(draw);
+        m_rawMeshes.push_back(std::move(rawMesh));
+        LogFormat("[FBX-IMPORT] extracted skinned mesh[%zu] name=%s verts=%zu indices=%u skin=%s",
+            sourceMeshIndex,
+            mesh.name.c_str(),
+            mesh.vertices.size(),
+            draw.indexCount,
+            skin ? "yes" : "fallback-root");
+    }
+
+    if (m_vertices.empty() || m_indices.empty())
+    {
+        Log("[FBX-IMPORT] no renderable skinned FBX mesh data extracted");
+        DestroyAnimation();
+        return false;
+    }
+
+    if (!SkinPose(0.0f, true, true))
+        return false;
+
+    m_indexCount = static_cast<uint32_t>(m_indices.size());
+    LogFormat("[FBX-IMPORT] skinned loaded path=%s verts=%zu indices=%zu bones=%u animations=%zu invalidInfluences=%u",
+        fbxPath.generic_string().c_str(),
+        m_vertices.size(),
+        m_indices.size(),
+        m_boneCount,
+        result.animations.size(),
+        invalidInfluences);
+    return true;
+}
+
+bool SkinnedMeshRenderer::LoadOzzPose(const std::string& modelPath)
 {
     if (!m_assets)
         return false;
 
     m_ozz = std::make_unique<OzzRuntime>();
-    const std::string skeletonPath = dir + "/skeleton.ozz";
+    const std::string dir = DirectoryOf(modelPath);
+    const std::string stem = std::filesystem::path(modelPath).stem().string();
+    const std::string stemSkeletonPath = dir + "/" + stem + "_skeleton.ozz";
+    const std::string legacySkeletonPath = dir + "/skeleton.ozz";
+    const std::string skeletonPath = m_assets->ReadAll(stemSkeletonPath).has_value()
+        ? stemSkeletonPath
+        : legacySkeletonPath;
     if (!ReadOzzObject(*m_assets, skeletonPath, m_ozz->skeleton))
     {
         DestroyAnimation();
@@ -1849,7 +2074,11 @@ bool SkinnedMeshRenderer::LoadOzzPose(const std::string& dir)
     m_ozz->models.resize(static_cast<size_t>(m_ozz->skeleton.num_joints()));
     m_ozz->context.Resize(m_ozz->skeleton.num_joints());
 
-    const std::string idlePath = dir + "/idle.ozz";
+    const std::string stemIdlePath = dir + "/" + stem + "_anim_0.ozz";
+    const std::string legacyIdlePath = dir + "/idle.ozz";
+    const std::string idlePath = m_assets->ReadAll(stemIdlePath).has_value()
+        ? stemIdlePath
+        : legacyIdlePath;
     if (ReadOzzObject(*m_assets, idlePath, m_ozz->idle) &&
         m_ozz->idle.num_tracks() == m_ozz->skeleton.num_joints())
     {
@@ -2204,8 +2433,6 @@ bool SkinnedMeshRenderer::CreateComputeResources(VulkanDevice& device)
 
 bool SkinnedMeshRenderer::CreateTextures(VulkanDevice& device, const std::string& modelPath)
 {
-    const size_t slash = modelPath.find_last_of("\\/");
-    const std::string dir = slash == std::string::npos ? std::string(".") : modelPath.substr(0, slash);
     const std::array<std::string, kTextureCount> textureFiles = {
         modelPath + "#baseColor",
         modelPath + "#fallback"};
@@ -2216,9 +2443,14 @@ bool SkinnedMeshRenderer::CreateTextures(VulkanDevice& device, const std::string
     for (uint32_t textureIndex = 0; textureIndex < kTextureCount; ++textureIndex)
     {
         DdsImage dds{};
-        const bool loaded = textureIndex == 0 && m_assets
-            ? LoadGltfBaseColorTexture(*m_assets, modelPath, dds)
-            : false;
+        bool loaded = false;
+        if (textureIndex == 0)
+        {
+            if (!m_importedDiffuseTexturePath.empty())
+                loaded = LoadRgbaTextureFile(m_importedDiffuseTexturePath, dds);
+            if (!loaded && m_assets)
+                loaded = LoadGltfBaseColorTexture(*m_assets, modelPath, dds);
+        }
         if (!loaded)
         {
             LogFormat("[DDS] Falling back to 4x4 white RGBA8888 texture for %s",
@@ -2829,6 +3061,7 @@ void SkinnedMeshRenderer::DestroyAnimation()
     m_ozz.reset();
     m_inverseBindMatrices.clear();
     m_bonePaletteCpu.clear();
+    m_importedDiffuseTexturePath.clear();
     m_boneCount = 0;
     m_motionState = MotionState::Idle;
     m_lastAnimationLogTime = -1000.0;

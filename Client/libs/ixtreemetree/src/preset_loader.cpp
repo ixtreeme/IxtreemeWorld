@@ -479,10 +479,17 @@ void ApplyLeaves(const JsonValue& root, TreeOptions& options)
         {"Willow", LeafType::Willow}, {"leaf_willow", LeafType::Willow}, {"willow", LeafType::Willow},
         {"Birch", LeafType::Birch}, {"leaf_birch", LeafType::Birch}, {"aspen", LeafType::Birch}
     });
-    options.leaves.billboard = EnumOr(*leaves, "billboard", options.leaves.billboard, {
-        {"Single", LeafBillboard::Single}, {"single", LeafBillboard::Single},
-        {"Double", LeafBillboard::Double}, {"double", LeafBillboard::Double}
-    });
+    if (const JsonValue* billboard = Find(*leaves, "billboard"); billboard && billboard->type == JsonValue::Type::String)
+    {
+        const std::string mode = ToLower(billboard->string);
+        if (mode == "single")
+            options.leaves.cardsPerCluster = 1;
+        else if (mode == "double")
+            options.leaves.cardsPerCluster = 2;
+    }
+    options.leaves.cardsPerCluster = std::clamp(IntOr(*leaves, "cardsPerCluster", options.leaves.cardsPerCluster), 1, 7);
+    options.leaves.atlasGridX = std::clamp(IntOr(*leaves, "atlasGridX", options.leaves.atlasGridX), 1, 8);
+    options.leaves.atlasGridY = std::clamp(IntOr(*leaves, "atlasGridY", options.leaves.atlasGridY), 1, 8);
     options.leaves.angle = FloatOr(*leaves, "angle", options.leaves.angle);
     options.leaves.count = IntOr(*leaves, "count", options.leaves.count);
     options.leaves.start = FloatOr(*leaves, "start", options.leaves.start);

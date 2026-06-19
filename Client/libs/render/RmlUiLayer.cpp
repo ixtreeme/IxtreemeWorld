@@ -1812,16 +1812,19 @@ void RmlUiLayer::Render(VulkanDevice& device)
 {
     if (!m_impl || !m_impl->context || !device.IsFrameActive())
     {
+#if defined(IXTREEME_DEBUG_LOGS)
         static uint32_t skippedLogs = 0;
         if (!QuietLogsForLodDiag() && skippedLogs < 3)
         {
             ++skippedLogs;
-            Tracenf("[FRAME] rmlui_render called = no, reason=%s",
+            TraceDiagf("[FRAME] rmlui_render called = no, reason=%s",
                 !m_impl ? "no_impl" : !m_impl->context ? "no_context" : "inactive_frame");
         }
+#endif
         return;
     }
 
+#if defined(IXTREEME_DEBUG_LOGS)
     const uint32_t visibleDocs =
         (m_impl->loginVisible && m_impl->loginDocument ? 1u : 0u) +
         (m_impl->lobbyVisible && m_impl->lobbyDocument ? 1u : 0u) +
@@ -1833,7 +1836,7 @@ void RmlUiLayer::Render(VulkanDevice& device)
     const uint64_t frameNumber = device.GetFrameNumber();
     if (!QuietLogsForLodDiag() && (frameNumber < 3 || (frameNumber % 60u) == 0u))
     {
-        Tracenf("[FRAME] rmlui_render called = yes, visible_docs = %u, login=%d lobby=%d hud=%d menu=%d settings=%d inventory=%d character=%d viewport=%ux%u",
+        TraceDiagf("[FRAME] rmlui_render called = yes, visible_docs = %u, login=%d lobby=%d hud=%d menu=%d settings=%d inventory=%d character=%d viewport=%ux%u",
             visibleDocs,
             m_impl->loginVisible ? 1 : 0,
             m_impl->lobbyVisible ? 1 : 0,
@@ -1845,6 +1848,7 @@ void RmlUiLayer::Render(VulkanDevice& device)
             m_impl->viewportWidth,
             m_impl->viewportHeight);
     }
+#endif
 
     m_impl->renderer.BeginFrame(device.GetCommandBuffer(), device.GetFrameNumber(), device.GetSafeFrameNumber());
     m_impl->context->Render();

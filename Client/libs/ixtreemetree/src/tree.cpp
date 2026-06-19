@@ -225,7 +225,7 @@ BranchEnd GenerateBranch(const TreeOptions& options,
     return end;
 }
 
-void AddLeafQuad(TreeMesh& mesh, Vec3 center, Vec3 normal, Vec3 tangent, float size)
+void AddLeafQuad(TreeMesh& mesh, Vec3 center, Vec3 normal, Vec3 tangent, float size, Vec2 uvMin, Vec2 uvMax)
 {
     normal = Normalize(normal);
     tangent = Normalize(tangent);
@@ -239,10 +239,10 @@ void AddLeafQuad(TreeMesh& mesh, Vec3 center, Vec3 normal, Vec3 tangent, float s
     const Vec3 p1 = Add(Sub(center, y), x);
     const Vec3 p2 = Add(Add(center, x), y);
     const Vec3 p3 = Add(Sub(center, x), y);
-    mesh.leaves.vertices.push_back(Vertex{p0, normal, Vec2{0.0f, 1.0f}});
-    mesh.leaves.vertices.push_back(Vertex{p1, normal, Vec2{1.0f, 1.0f}});
-    mesh.leaves.vertices.push_back(Vertex{p2, normal, Vec2{1.0f, 0.0f}});
-    mesh.leaves.vertices.push_back(Vertex{p3, normal, Vec2{0.0f, 0.0f}});
+    mesh.leaves.vertices.push_back(Vertex{p0, normal, Vec2{uvMin.x, uvMax.y}});
+    mesh.leaves.vertices.push_back(Vertex{p1, normal, Vec2{uvMax.x, uvMax.y}});
+    mesh.leaves.vertices.push_back(Vertex{p2, normal, Vec2{uvMax.x, uvMin.y}});
+    mesh.leaves.vertices.push_back(Vertex{p3, normal, Vec2{uvMin.x, uvMin.y}});
     mesh.leaves.indices.insert(mesh.leaves.indices.end(), {base, base + 1u, base + 2u, base, base + 2u, base + 3u});
     IncludeBounds(mesh, p0);
     IncludeBounds(mesh, p1);
@@ -252,25 +252,53 @@ void AddLeafQuad(TreeMesh& mesh, Vec3 center, Vec3 normal, Vec3 tangent, float s
 
 void GenerateLeaves(const TreeOptions& options, Rng& rng, TreeMesh& mesh, const std::vector<BranchEnd>& branches)
 {
+    const int cardsPerCluster = std::clamp(options.leaves.cardsPerCluster, 1, 7);
+    const int atlasGridX = std::clamp(options.leaves.atlasGridX, 1, 8);
+    const int atlasGridY = std::clamp(options.leaves.atlasGridY, 1, 8);
+    const float start = std::clamp(options.leaves.start, 0.0f, 0.98f);
+    const float leafTilt = options.leaves.angle * kPi / 180.0f;
+
     for (const BranchEnd& branch : branches)
     {
         const int count = std::max(0, options.leaves.count);
         for (int i = 0; i < count; ++i)
         {
-            const float along = options.leaves.start + (1.0f - options.leaves.start) *
-                ((static_cast<float>(i) + rng.uniform(0.0f, 1.0f)) / std::max(1.0f, static_cast<float>(count)));
-            const Vec3 center = Add(branch.position, Mul(branch.direction, rng.uniform(0.0f, 0.35f) * along));
             Vec3 right{};
             Vec3 up{};
             BuildFrame(branch.direction, right, up);
-            const float angle = rng.uniform(0.0f, 2.0f * kPi);
-            const Vec3 tangent = Normalize(Add(Mul(right, std::cos(angle)), Mul(up, std::sin(angle))));
-            const Vec3 normal = Normalize(Mix(branch.direction, up, 0.65f));
+
+            const float clusterT = (static_cast<float>(i) + 0.5f) / std::max(1.0f, static_cast<float>(count));
+            const float along = std::clamp(start + (1.0f - start) * clusterT + rng.uniform(-0.05f, 0.05f), start, 1.0f);
+            Vec3 center = Add(branch.position, Mul(branch.direction, rng.uniform(0.0f, 0.35f) * along));
             const float variance = std::clamp(options.leaves.sizeVariance, 0.0f, 1.0f);
             const float size = std::max(0.02f, options.leaves.size * (1.0f + rng.uniform(-variance, variance)));
-            AddLeafQuad(mesh, center, normal, tangent, size);
-            if (options.leaves.billboard == LeafBillboard::Double)
-                AddLeafQuad(mesh, center, normal, RotateAroundAxis(tangent, normal, kPi * 0.5f), size);
+            center = Add(center, Add(Mul(right, rng.uniform(-0.05f, 0.05f) * size), Mul(up, rng.uniform(-0.05f, 0.05f) * size)));
+
+            const Vec3 clusterAxis = Normalize(Mix(Vec3{0.0f, 1.0f, 0.0f}, branch.direction, 0.25f));
+            const float baseAngle = rng.uniform(0.0f, 2.0f * kPi);
+            const Vec3 baseTangent = Normalize(Add(Mul(right, std::cos(baseAngle)), Mul(up, std::sin(baseAngle))));
+            for (int card = 0; card < cardsPerCluster; ++card)
+            {
+                const float cardAngle = (static_cast<float>(card) / static_cast<float>(cardsPerCluster)) * 2.0f * kPi;
+                Vec3 tangent = RotateAroundAxis(baseTangent, clusterAxis, cardAngle);
+                tangent = RotateAroundAxis(tangent, Normalize(Cross(clusterAxis, tangent)), leafTilt * 0.15f);
+                Vec3 normal = Normalize(Cross(clusterAxis, tangent));
+                if (Length(normal) < 0.001f)
+                    normal = Normalize(Mix(branch.direction, up, 0.65f));
+
+                const int cellX = rng.uniformInt(0, atlasGridX - 1);
+                const int cellY = rng.uniformInt(0, atlasGridY - 1);
+                const Vec2 uvMin{
+                    static_cast<float>(cellX) / static_cast<float>(atlasGridX),
+                    static_cast<float>(cellY) / static_cast<float>(atlasGridY),
+                };
+                const Vec2 uvMax{
+                    static_cast<float>(cellX + 1) / static_cast<float>(atlasGridX),
+                    static_cast<float>(cellY + 1) / static_cast<float>(atlasGridY),
+                };
+                const Vec3 cardCenter = Add(center, Add(Mul(right, rng.uniform(-0.025f, 0.025f) * size), Mul(up, rng.uniform(-0.025f, 0.025f) * size)));
+                AddLeafQuad(mesh, cardCenter, normal, tangent, size, uvMin, uvMax);
+            }
         }
     }
 }

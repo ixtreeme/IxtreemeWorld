@@ -36,6 +36,7 @@ private:
     bool RenderGeneral();
     bool RenderBark();
     bool RenderBranch();
+    bool RenderBranchLevel(int level);
     bool RenderLeaves();
     void RenderSavePopup(bool& savedAsset);
     bool RenderTextureOverrideSlot(const char* label,
@@ -60,6 +61,7 @@ private:
     bool savePopupRequested_ = false;
     bool firstOpenLogged_ = false;
     bool presetsLoaded_ = false;
+    int activeBranchLevel_ = 0;
     ixtreemetree::TreeOptions options_;
     ixtreemetree::TreeMesh mesh_;
     TreePreviewRenderer preview_;

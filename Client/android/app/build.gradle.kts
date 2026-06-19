@@ -50,9 +50,9 @@ android {
 dependencies {
 }
 
-val copyVulkanClearSo by tasks.registering(Copy::class) {
+val copyIxtreemeEngineSo by tasks.registering(Copy::class) {
     val cmakeBuildDir = file("${rootDir}/../build/android-arm64-debug")
-    from("${cmakeBuildDir}/libVulkanClear.so")
+    from("${cmakeBuildDir}/libIxtreemeEngine.so")
     into("src/main/jniLibs/arm64-v8a")
 }
 
@@ -63,5 +63,5 @@ val copyAssets by tasks.registering(Copy::class) {
 }
 
 tasks.named("preBuild") {
-    dependsOn(copyVulkanClearSo, copyAssets)
+    dependsOn(copyIxtreemeEngineSo, copyAssets)
 }

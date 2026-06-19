@@ -11,8 +11,8 @@ class IAssetReader;
 class OffscreenSceneRenderer
 {
 public:
-    bool Create(VulkanDevice& device, client::asset::IAssetReader& assets);
-    bool Recreate(VulkanDevice& device);
+    bool Create(VulkanDevice& device, client::asset::IAssetReader& assets, VkExtent2D requestedExtent = {});
+    bool Recreate(VulkanDevice& device, VkExtent2D requestedExtent = {});
     void BeginMainPass(VulkanDevice& device, bool clear = true);
     void EndMainPass(VulkanDevice& device);
     void SnapshotScene(VulkanDevice& device);

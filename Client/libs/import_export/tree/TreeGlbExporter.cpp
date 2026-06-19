@@ -1,6 +1,7 @@
 #include "TreeGlbExporter.h"
 
 #include "AssetDatabase.h"
+#include "Common.h"
 #include "Debug.h"
 #include "MaterialAssetManager.h"
 
@@ -19,6 +20,8 @@ namespace tree_tool
 {
 namespace
 {
+using ixtreeme::common::EscapeJson;
+
 struct BufferView
 {
     std::size_t offset = 0;
@@ -26,18 +29,6 @@ struct BufferView
     std::size_t stride = 0;
     int target = 0;
 };
-
-std::string EscapeJson(const std::string& value)
-{
-    std::string out;
-    for (char c : value)
-    {
-        if (c == '\\') out += "\\\\";
-        else if (c == '"') out += "\\\"";
-        else out += c;
-    }
-    return out;
-}
 
 std::string SanitizeAssetName(std::string value)
 {

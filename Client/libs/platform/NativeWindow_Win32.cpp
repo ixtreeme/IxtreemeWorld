@@ -11,7 +11,7 @@
 
 namespace
 {
-constexpr const char* kWindowClassName = "StandaloneVulkanClearWindow";
+constexpr const char* kWindowClassName = "IxtreemeEngineWindow";
 
 bool IsEngineMouseInputMessage(UINT message)
 {

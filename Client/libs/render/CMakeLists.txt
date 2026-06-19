@@ -1,23 +1,21 @@
-add_library(client_render STATIC
-    AssetDatabase.cpp
-    AssetDatabase.h
-    AssetWatcher.cpp
-    AssetWatcher.h
-    AssetLibrary.cpp
-    AssetLibrary.h
+add_library(IXEngineRender STATIC
     CubeRenderer.cpp
     CubeRenderer.h
     EditorImGui.cpp
     EditorImGui.h
+    editor_panels/EditorImGuiAssetBrowserPanels.inl
+    editor_panels/EditorImGuiHierarchyPanels.inl
+    editor_panels/EditorImGuiInspectorPanels.inl
+    editor_panels/EditorImGuiMaterialPanels.inl
+    editor_panels/EditorImGuiMenuToolbarPanels.inl
+    editor_panels/EditorImGuiPanelDispatcher.inl
+    editor_panels/EditorImGuiProjectPanels.inl
+    editor_panels/EditorImGuiSceneViewPanels.inl
     MapEditorTypes.h
-    MaterialAssetManager.cpp
-    MaterialAssetManager.h
     WorldLabelRenderer.cpp
     WorldLabelRenderer.h
     OffscreenSceneRenderer.cpp
     OffscreenSceneRenderer.h
-    ProjectManager.cpp
-    ProjectManager.h
     RmlUiLayer.cpp
     RmlUiLayer.h
     RuntimeSession.cpp
@@ -26,6 +24,8 @@ add_library(client_render STATIC
     RuntimeUiAdapter.h
     SceneManager.cpp
     SceneManager.h
+    SelectionOutlineRenderer.cpp
+    SelectionOutlineRenderer.h
     SpatialIndex.cpp
     SpatialIndex.h
     TerrainRenderer.cpp
@@ -40,8 +40,6 @@ add_library(client_render STATIC
     SkinnedMeshRenderer.h
     tools/tree/TreeGeneratorPanel.cpp
     tools/tree/TreeGeneratorPanel.h
-    tools/tree/TreeGlbExporter.cpp
-    tools/tree/TreeGlbExporter.h
     tools/tree/TreePreviewRenderer.cpp
     tools/tree/TreePreviewRenderer.h
     tools/tree/TreeTexturePalette.cpp
@@ -51,19 +49,20 @@ add_library(client_render STATIC
 )
 
 if(IXTREEME_WITH_EDITOR)
-    target_sources(client_render PRIVATE UIHelpers.cpp)
+    target_sources(IXEngineRender PRIVATE UIHelpers.cpp)
 endif()
 
-target_include_directories(client_render
+target_include_directories(IXEngineRender
     PUBLIC
         ${CMAKE_CURRENT_SOURCE_DIR}
         ${CLIENT_LIBS_DIR}
         ${STB_INCLUDE_DIR}
 )
 
-target_compile_definitions(client_render
+target_compile_definitions(IXEngineRender
     PUBLIC
         $<$<BOOL:${IXTREEME_WITH_EDITOR}>:IXTREEME_WITH_EDITOR=1>
+        $<$<BOOL:${IXTREEME_VERBOSE_DIAGNOSTICS}>:IXTREEME_DEBUG_LOGS=1>
         $<$<PLATFORM_ID:Windows>:WIN32_LEAN_AND_MEAN>
         $<$<PLATFORM_ID:Windows>:NOMINMAX>
         $<$<PLATFORM_ID:Windows>:_WIN32_WINNT=0x0601>
@@ -73,14 +72,16 @@ target_compile_definitions(client_render
         IXTREEME_MESHOPT_OPTIMIZED_DEBUG=1
 )
 
-target_link_libraries(client_render
+target_link_libraries(IXEngineRender
     PUBLIC
-        client_platform
-        client_asset
-        mapdata
-        efsw::efsw
+        IXEnginePlatform
+        IXEngineAsset
+        IXEngineCommon
+        IXEngineImportExport
+        IXEngineMapData
         fastgltf::fastgltf
-        ixtreemetree::ixtreemetree
+        assimp::assimp
+        IXEngineTree::IXEngineTree
         meshoptimizer::meshoptimizer
         RmlUi::RmlUi
         ${CLIENT_OZZ_TARGETS}
@@ -88,14 +89,14 @@ target_link_libraries(client_render
 )
 
 if(WIN32)
-    target_link_libraries(client_render
+    target_link_libraries(IXEngineRender
         PUBLIC
             Vulkan::Vulkan
             Gdi32
             Advapi32
     )
     if(IXTREEME_WITH_EDITOR)
-        target_link_libraries(client_render
+        target_link_libraries(IXEngineRender
             PUBLIC
                 imgui::imgui
                 imguizmo::imguizmo
@@ -103,7 +104,7 @@ if(WIN32)
         )
     endif()
 elseif(ANDROID)
-    target_link_libraries(client_render
+    target_link_libraries(IXEngineRender
         PUBLIC
             vulkan
             log
@@ -111,4 +112,4 @@ elseif(ANDROID)
     )
 endif()
 
-target_compile_features(client_render PUBLIC cxx_std_20)
+target_compile_features(IXEngineRender PUBLIC cxx_std_20)

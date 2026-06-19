@@ -9,10 +9,11 @@
 #include <android/log.h>
 #endif
 
-namespace {
+namespace
+{
 
 #if defined(__ANDROID__)
-constexpr const char* kAndroidLogTag = "IxtreemeClient";
+constexpr const char* kAndroidLogTag = "IxtreemeEngine";
 #endif
 
 void LogLine(const char* text)

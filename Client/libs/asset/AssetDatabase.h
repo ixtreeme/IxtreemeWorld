@@ -45,6 +45,7 @@ enum class AssetType
     Model,
     Texture,
     Material,
+    Animation,
     Scene,
     Project,
     Unknown
@@ -73,6 +74,9 @@ public:
     Guid getOrCreateGuid(const std::filesystem::path& absPath);
     std::vector<Guid> loadDefaultMaterials(const std::filesystem::path& modelPath) const;
     bool writeDefaultMaterials(const std::filesystem::path& modelPath, const std::vector<Guid>& materials) const;
+    bool writeSkeletalAsset(const std::filesystem::path& modelPath,
+                            const Guid& skeletonGuid,
+                            const std::vector<Guid>& animationGuids) const;
     ScanStats lastScanStats() const { return lastStats_; }
 
     bool runtimeAdd(const std::filesystem::path& absPath);

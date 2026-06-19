@@ -14,7 +14,7 @@ import android.view.inputmethod.InputConnection;
 
 public class IxtreemeNativeActivity extends NativeActivity {
     static {
-        System.loadLibrary("VulkanClear");
+        System.loadLibrary("IxtreemeEngine");
     }
 
     public static native void nativeOnTextInput(String text);

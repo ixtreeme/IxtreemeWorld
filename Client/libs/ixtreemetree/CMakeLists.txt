@@ -1,4 +1,4 @@
-add_library(ixtreemetree STATIC
+add_library(IXEngineTree STATIC
     src/tree.cpp
     src/branch_gen.cpp
     src/leaf_gen.cpp
@@ -6,11 +6,11 @@ add_library(ixtreemetree STATIC
     src/preset_loader.cpp
 )
 
-target_include_directories(ixtreemetree
+target_include_directories(IXEngineTree
     PUBLIC
         ${CMAKE_CURRENT_SOURCE_DIR}/include
 )
 
-target_compile_features(ixtreemetree PUBLIC cxx_std_17)
+target_compile_features(IXEngineTree PUBLIC cxx_std_17)
 
-add_library(ixtreemetree::ixtreemetree ALIAS ixtreemetree)
+add_library(IXEngineTree::IXEngineTree ALIAS IXEngineTree)
