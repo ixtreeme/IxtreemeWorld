@@ -34,6 +34,8 @@
 
 namespace
 {
+namespace xm = ixtreeme::math;
+
 constexpr uint32_t kMaxWaterBodyDraws = 64;
 
 bool HasStencilAspect(VkFormat format)
@@ -226,12 +228,12 @@ void FillDynamicLightingUniforms(const LightingState& lighting, UniformBlockT& u
         out.direction[0] = std::sin(yaw) * cosPitch;
         out.direction[1] = std::sin(pitch);
         out.direction[2] = std::cos(yaw) * cosPitch;
-        out.direction[3] = std::cos(spot.innerConeDegrees * 3.1415926535f / 180.0f);
+        out.direction[3] = std::cos(xm::DegreesToRadians(spot.innerConeDegrees));
         const float intensity = spot.enabled ? std::max(0.0f, spot.intensity) : 0.0f;
         out.color[0] = std::max(0.0f, spot.r) * intensity;
         out.color[1] = std::max(0.0f, spot.g) * intensity;
         out.color[2] = std::max(0.0f, spot.b) * intensity;
-        out.color[3] = std::cos(spot.outerConeDegrees * 3.1415926535f / 180.0f);
+        out.color[3] = std::cos(xm::DegreesToRadians(spot.outerConeDegrees));
         out.direction[3] = std::max(out.direction[3], out.color[3]);
     }
 }
@@ -743,7 +745,7 @@ std::vector<std::uint8_t> GenerateWaterNormalPixels(uint32_t width,
                                                     float amplitude)
 {
     std::vector<std::uint8_t> pixels(static_cast<size_t>(width) * height * 4u, 255);
-    constexpr float pi = 3.1415926535f;
+    constexpr float pi = xm::Pi;
     for (uint32_t y = 0; y < height; ++y)
     {
         for (uint32_t x = 0; x < width; ++x)
@@ -757,7 +759,7 @@ std::vector<std::uint8_t> GenerateWaterNormalPixels(uint32_t width,
             const float dz = amplitude * (std::cos((u * frequencyA + v * 0.35f) * pi * 2.0f) * 0.35f * frequencyA +
                 -std::sin((v * frequencyB - u * 0.28f) * pi * 2.0f) * frequencyB);
             const float ripple = (h0 + h1) * 0.04f;
-            WorldVec3 n = WorldNormalize({-dx + ripple, 1.0f, -dz - ripple});
+            WorldVec3 n = xm::Normalize(WorldVec3{-dx + ripple, 1.0f, -dz - ripple});
             const size_t offset = (static_cast<size_t>(y) * width + x) * 4u;
             pixels[offset + 0] = static_cast<std::uint8_t>(std::clamp(n.x * 0.5f + 0.5f, 0.0f, 1.0f) * 255.0f);
             pixels[offset + 1] = static_cast<std::uint8_t>(std::clamp(n.y * 0.5f + 0.5f, 0.0f, 1.0f) * 255.0f);
@@ -1363,7 +1365,7 @@ WorldMat4 WorldOrthographicOffCenter(float left, float right, float bottom, floa
     return r;
 }
 
-WorldVec3 TransformPoint(const WorldMat4& m, WorldVec3 p)
+WorldVec3 TransformWorldPointNoPerspective(const WorldMat4& m, WorldVec3 p)
 {
     return {
         p.x * m.m[0] + p.y * m.m[4] + p.z * m.m[8] + m.m[12],
@@ -2197,13 +2199,13 @@ void TerrainRenderer::SetWaterRefractionInputs(VkImageView colorView,
 
 void TerrainRenderer::UpdateShadowCascades(const WorldCamera& camera)
 {
-    const WorldVec3 forward = WorldNormalize(WorldSub(camera.target, camera.eye));
-    WorldVec3 right = WorldNormalize(WorldCross({0.0f, 1.0f, 0.0f}, forward));
-    if (WorldDot(right, right) <= 0.0001f)
+    const WorldVec3 forward = xm::Normalize(camera.target - camera.eye);
+    WorldVec3 right = xm::Normalize(xm::Cross({0.0f, 1.0f, 0.0f}, forward));
+    if (xm::Dot(right, right) <= 0.0001f)
         right = {1.0f, 0.0f, 0.0f};
-    const WorldVec3 up = WorldNormalize(WorldCross(forward, right));
+    const WorldVec3 up = xm::Normalize(xm::Cross(forward, right));
     const float aspect = 16.0f / 9.0f;
-    const float tanHalfFov = std::tan(45.0f * 3.1415926535f / 180.0f * 0.5f);
+    const float tanHalfFov = std::tan(xm::DegreesToRadians(45.0f) * 0.5f);
     const float nearPlane = 0.1f;
     const float farPlane = 200.0f;
     constexpr float lambda = 0.7f;
@@ -2220,14 +2222,14 @@ void TerrainRenderer::UpdateShadowCascades(const WorldCamera& camera)
     splitPlanes[kShadowCascadeCount] = farPlane;
 
     const DirectionalLight& sun = m_lightingState.directional;
-    const float azimuthRadians = std::clamp(sun.azimuthDegrees, 0.0f, 360.0f) * 3.1415926535f / 180.0f;
-    const float elevationRadians = std::clamp(sun.elevationDegrees, 0.0f, 90.0f) * 3.1415926535f / 180.0f;
+    const float azimuthRadians = xm::DegreesToRadians(std::clamp(sun.azimuthDegrees, 0.0f, 360.0f));
+    const float elevationRadians = xm::DegreesToRadians(std::clamp(sun.elevationDegrees, 0.0f, 90.0f));
     const float cosElevation = std::cos(elevationRadians);
-    WorldVec3 sunDir = WorldNormalize({
+    WorldVec3 sunDir = xm::Normalize(WorldVec3{
         cosElevation * std::sin(azimuthRadians),
         std::sin(elevationRadians),
         cosElevation * std::cos(azimuthRadians)});
-    if (WorldDot(sunDir, sunDir) <= 0.0001f)
+    if (xm::Dot(sunDir, sunDir) <= 0.0001f)
         sunDir = {0.0f, 1.0f, 0.0f};
 
     for (uint32_t cascade = 0; cascade < kShadowCascadeCount; ++cascade)
@@ -2238,32 +2240,32 @@ void TerrainRenderer::UpdateShadowCascades(const WorldCamera& camera)
         const float nearW = nearH * aspect;
         const float farH = 2.0f * tanHalfFov * zf;
         const float farW = farH * aspect;
-        const WorldVec3 nearCenter = WorldAdd(camera.eye, WorldScale(forward, zn));
-        const WorldVec3 farCenter = WorldAdd(camera.eye, WorldScale(forward, zf));
+        const WorldVec3 nearCenter = camera.eye + forward * zn;
+        const WorldVec3 farCenter = camera.eye + forward * zf;
         std::array<WorldVec3, 8> corners = {
-            WorldAdd(WorldAdd(nearCenter, WorldScale(up, nearH * 0.5f)), WorldScale(right, -nearW * 0.5f)),
-            WorldAdd(WorldAdd(nearCenter, WorldScale(up, nearH * 0.5f)), WorldScale(right, nearW * 0.5f)),
-            WorldAdd(WorldAdd(nearCenter, WorldScale(up, -nearH * 0.5f)), WorldScale(right, -nearW * 0.5f)),
-            WorldAdd(WorldAdd(nearCenter, WorldScale(up, -nearH * 0.5f)), WorldScale(right, nearW * 0.5f)),
-            WorldAdd(WorldAdd(farCenter, WorldScale(up, farH * 0.5f)), WorldScale(right, -farW * 0.5f)),
-            WorldAdd(WorldAdd(farCenter, WorldScale(up, farH * 0.5f)), WorldScale(right, farW * 0.5f)),
-            WorldAdd(WorldAdd(farCenter, WorldScale(up, -farH * 0.5f)), WorldScale(right, -farW * 0.5f)),
-            WorldAdd(WorldAdd(farCenter, WorldScale(up, -farH * 0.5f)), WorldScale(right, farW * 0.5f)),
+            nearCenter + up * (nearH * 0.5f) + right * (-nearW * 0.5f),
+            nearCenter + up * (nearH * 0.5f) + right * (nearW * 0.5f),
+            nearCenter + up * (-nearH * 0.5f) + right * (-nearW * 0.5f),
+            nearCenter + up * (-nearH * 0.5f) + right * (nearW * 0.5f),
+            farCenter + up * (farH * 0.5f) + right * (-farW * 0.5f),
+            farCenter + up * (farH * 0.5f) + right * (farW * 0.5f),
+            farCenter + up * (-farH * 0.5f) + right * (-farW * 0.5f),
+            farCenter + up * (-farH * 0.5f) + right * (farW * 0.5f),
         };
 
         WorldVec3 center{};
         for (WorldVec3 corner : corners)
-            center = WorldAdd(center, corner);
-        center = WorldScale(center, 1.0f / static_cast<float>(corners.size()));
+            center = center + corner;
+        center = center * (1.0f / static_cast<float>(corners.size()));
 
-        const WorldVec3 lightEye = WorldSub(center, WorldScale(sunDir, 120.0f));
+        const WorldVec3 lightEye = center - sunDir * 120.0f;
         WorldMat4 lightView = WorldLookAt(lightEye, center, {0.0f, 1.0f, 0.0f});
 
         WorldVec3 minBound{std::numeric_limits<float>::max(), std::numeric_limits<float>::max(), std::numeric_limits<float>::max()};
         WorldVec3 maxBound{-std::numeric_limits<float>::max(), -std::numeric_limits<float>::max(), -std::numeric_limits<float>::max()};
         for (WorldVec3 corner : corners)
         {
-            const WorldVec3 p = TransformPoint(lightView, corner);
+            const WorldVec3 p = TransformWorldPointNoPerspective(lightView, corner);
             minBound.x = std::min(minBound.x, p.x);
             minBound.y = std::min(minBound.y, p.y);
             minBound.z = std::min(minBound.z, p.z);
@@ -2377,7 +2379,7 @@ WorldCamera TerrainRenderer::ComputeMirrorCamera(const WorldCamera& camera, VkEx
     const WorldMat4 view = WorldLookAt(mirror.eye, mirror.target, {0.0f, 1.0f, 0.0f});
     mirror.nearPlane = camera.nearPlane;
     mirror.farPlane = camera.farPlane;
-    const WorldMat4 projection = WorldPerspective(45.0f * 3.1415926535f / 180.0f, aspect, mirror.nearPlane, mirror.farPlane);
+    const WorldMat4 projection = WorldPerspective(xm::DegreesToRadians(45.0f), aspect, mirror.nearPlane, mirror.farPlane);
     mirror.viewProjection = WorldMultiply(view, projection);
     return mirror;
 }
@@ -4561,16 +4563,16 @@ bool TerrainRenderer::RaycastEditorBrush(const WorldCamera& camera,
     }
 
     const float aspect = static_cast<float>(viewportWidth) / static_cast<float>(viewportHeight);
-    const float tanHalfFov = std::tan(45.0f * 3.1415926535f / 180.0f * 0.5f);
+    const float tanHalfFov = std::tan(xm::DegreesToRadians(45.0f) * 0.5f);
     const float ndcX = (static_cast<float>(m_editorCursorX) / static_cast<float>(viewportWidth)) * 2.0f - 1.0f;
     const float ndcY = 1.0f - (static_cast<float>(m_editorCursorY) / static_cast<float>(viewportHeight)) * 2.0f;
 
-    const WorldVec3 forward = WorldNormalize(WorldSub(camera.target, camera.eye));
-    const WorldVec3 right = WorldNormalize(WorldCross({0.0f, 1.0f, 0.0f}, forward));
-    const WorldVec3 up = WorldCross(forward, right);
-    WorldVec3 rayDir = WorldNormalize(WorldAdd(forward,
-        WorldAdd(WorldScale(right, ndcX * aspect * tanHalfFov),
-                 WorldScale(up, ndcY * tanHalfFov))));
+    const WorldVec3 forward = xm::Normalize(camera.target - camera.eye);
+    const WorldVec3 right = xm::Normalize(xm::Cross({0.0f, 1.0f, 0.0f}, forward));
+    const WorldVec3 up = xm::Cross(forward, right);
+    WorldVec3 rayDir = xm::Normalize(forward +
+        right * (ndcX * aspect * tanHalfFov) +
+        up * (ndcY * tanHalfFov));
 
     const MovementBounds bounds = GetMovementBounds();
     if (!bounds.valid)
@@ -4594,7 +4596,7 @@ bool TerrainRenderer::RaycastEditorBrush(const WorldCamera& camera,
     float previousDelta = camera.eye.y - SampleHeight(camera.eye);
     for (float t = kStepMeters; t <= kMaxDistanceMeters; t += kStepMeters)
     {
-        const WorldVec3 p = WorldAdd(camera.eye, WorldScale(rayDir, t));
+        const WorldVec3 p = camera.eye + rayDir * t;
         if (p.x < bounds.minX || p.x > bounds.maxX || p.z < bounds.minZ || p.z > bounds.maxZ)
         {
             previousT = t;
@@ -4609,7 +4611,7 @@ bool TerrainRenderer::RaycastEditorBrush(const WorldCamera& camera,
             const float denom = previousDelta - delta;
             const float lerp = denom > 0.0001f ? previousDelta / denom : 0.0f;
             const float hitT = previousT + (t - previousT) * std::clamp(lerp, 0.0f, 1.0f);
-            const WorldVec3 hit = WorldAdd(camera.eye, WorldScale(rayDir, hitT));
+            const WorldVec3 hit = camera.eye + rayDir * hitT;
             m_editorBrushLocalX = std::clamp(hit.x, bounds.minX, bounds.maxX);
             m_editorBrushLocalZ = std::clamp(hit.z, bounds.minZ, bounds.maxZ);
             m_editorBrushVisible = true;
@@ -7728,7 +7730,7 @@ void TerrainRenderer::UpdateUniform(uint32_t frameIndex, const WorldCamera& came
         uniform.materialPbr[i][0] = std::clamp(m_paletteSlots[i].aoStrength, 0.0f, 1.0f);
         uniform.materialPbr[i][1] = std::clamp(m_paletteSlots[i].roughnessStrength, 0.0f, 2.0f);
         uniform.materialPbr[i][2] = std::clamp(m_paletteSlots[i].metallicStrength, 0.0f, 1.0f);
-        uniform.materialPbr[i][3] = m_paletteSlots[i].uvRotationDegrees * 3.1415926535f / 180.0f;
+        uniform.materialPbr[i][3] = xm::DegreesToRadians(m_paletteSlots[i].uvRotationDegrees);
     }
     uniform.terrainMaterialParams[0] = m_sceneTerrain.triplanarEnabled ? 1.0f : 0.0f;
     uniform.terrainMaterialParams[1] = std::clamp(m_sceneTerrain.triplanarSharpness, 1.0f, 16.0f);
@@ -7740,8 +7742,8 @@ void TerrainRenderer::UpdateUniform(uint32_t frameIndex, const WorldCamera& came
     uniform.cameraPos[3] = 1.0f;
     const DirectionalLight& directional = m_lightingState.directional;
     const AmbientLight& ambient = m_lightingState.ambient;
-    const float azimuthRadians = std::clamp(directional.azimuthDegrees, 0.0f, 360.0f) * 3.1415926535f / 180.0f;
-    const float elevationRadians = std::clamp(directional.elevationDegrees, 0.0f, 90.0f) * 3.1415926535f / 180.0f;
+    const float azimuthRadians = xm::DegreesToRadians(std::clamp(directional.azimuthDegrees, 0.0f, 360.0f));
+    const float elevationRadians = xm::DegreesToRadians(std::clamp(directional.elevationDegrees, 0.0f, 90.0f));
     const float cosElevation = std::cos(elevationRadians);
     const float sunEnabled = directional.enabled ? 1.0f : 0.0f;
     const float sunIntensity = std::max(0.0f, directional.intensity) * sunEnabled;
@@ -7912,8 +7914,8 @@ TerrainRenderer::WaterUniformBlock TerrainRenderer::BuildWaterUniform(const Worl
 
     const DirectionalLight& directional = m_lightingState.directional;
     const AmbientLight& ambient = m_lightingState.ambient;
-    const float azimuthRadians = std::clamp(directional.azimuthDegrees, 0.0f, 360.0f) * 3.1415926535f / 180.0f;
-    const float elevationRadians = std::clamp(directional.elevationDegrees, 0.0f, 90.0f) * 3.1415926535f / 180.0f;
+    const float azimuthRadians = xm::DegreesToRadians(std::clamp(directional.azimuthDegrees, 0.0f, 360.0f));
+    const float elevationRadians = xm::DegreesToRadians(std::clamp(directional.elevationDegrees, 0.0f, 90.0f));
     const float cosElevation = std::cos(elevationRadians);
     const float sunEnabled = directional.enabled ? 1.0f : 0.0f;
     const float sunIntensity = std::max(0.0f, directional.intensity) * sunEnabled;

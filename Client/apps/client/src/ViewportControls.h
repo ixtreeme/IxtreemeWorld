@@ -77,7 +77,7 @@ public:
     void FocusOn(WorldVec3 target, float distance = 15.0f);
 
 private:
-    static constexpr float kMaxPitch = 80.0f * 3.1415926535f / 180.0f;
+    static constexpr float kMaxPitch = ixtreeme::math::DegreesToRadians(80.0f);
 
     void ApplyMouseDelta(float dx, float dy);
     void UpdateFly(float dt, const MovementInputState& movement);
@@ -88,7 +88,7 @@ private:
     int lastMouseX_ = 0;
     int lastMouseY_ = 0;
     float yaw_ = 0.0f;
-    float pitch_ = -25.0f * 3.1415926535f / 180.0f;
+    float pitch_ = -ixtreeme::math::DegreesToRadians(25.0f);
     float speedScale_ = 1.0f;
     WorldVec3 eye_ = {0.0f, 8.0f, -18.0f};
 };

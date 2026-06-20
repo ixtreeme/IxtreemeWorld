@@ -206,37 +206,7 @@ SpatialIndex::Aabb SpatialIndex::ChildBounds(const Aabb& parent, std::uint32_t c
 
 bool SpatialIndex::OutsideFrustum(const Frustum& frustum, const Aabb& bounds) const
 {
-    bool outsideLeft = true;
-    bool outsideRight = true;
-    bool outsideBottom = true;
-    bool outsideTop = true;
-    bool outsideNear = true;
-    bool outsideFar = true;
-    const float* m = frustum.viewProjection;
-    for (int z = 0; z < 2; ++z)
-    {
-        for (int y = 0; y < 2; ++y)
-        {
-            for (int x = 0; x < 2; ++x)
-            {
-                const Vec3 p{
-                    x == 0 ? bounds.min.x : bounds.max.x,
-                    y == 0 ? bounds.min.y : bounds.max.y,
-                    z == 0 ? bounds.min.z : bounds.max.z};
-                const float clipX = p.x * m[0] + p.y * m[4] + p.z * m[8] + m[12];
-                const float clipY = p.x * m[1] + p.y * m[5] + p.z * m[9] + m[13];
-                const float clipZ = p.x * m[2] + p.y * m[6] + p.z * m[10] + m[14];
-                const float clipW = p.x * m[3] + p.y * m[7] + p.z * m[11] + m[15];
-                outsideLeft = outsideLeft && (clipX < -clipW);
-                outsideRight = outsideRight && (clipX > clipW);
-                outsideBottom = outsideBottom && (clipY < -clipW);
-                outsideTop = outsideTop && (clipY > clipW);
-                outsideNear = outsideNear && (clipZ < 0.0f);
-                outsideFar = outsideFar && (clipZ > clipW);
-            }
-        }
-    }
-    return outsideLeft || outsideRight || outsideBottom || outsideTop || outsideNear || outsideFar;
+    return !ixtreeme::math::Intersects(frustum, bounds);
 }
 
 std::vector<std::uint32_t> SpatialIndex::QueryFrustum(const Frustum& frustum, QueryStats* stats) const

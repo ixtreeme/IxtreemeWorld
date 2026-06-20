@@ -11,6 +11,11 @@ target_include_directories(IXEngineTree
         ${CMAKE_CURRENT_SOURCE_DIR}/include
 )
 
+target_link_libraries(IXEngineTree
+    PRIVATE
+        IXEngineMath
+)
+
 target_compile_features(IXEngineTree PUBLIC cxx_std_17)
 
 add_library(IXEngineTree::IXEngineTree ALIAS IXEngineTree)

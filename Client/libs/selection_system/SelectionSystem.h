@@ -76,14 +76,14 @@ std::optional<std::uint32_t> PickMeshEntity(const std::vector<MeshSceneEntity>& 
         if (mesh.skinned)
         {
             const WorldVec3 position{mesh.position[0], mesh.position[1], mesh.position[2]};
-            const WorldVec3 toMesh = WorldSub(position, camera.eye);
-            const float t = WorldDot(toMesh, rayDir);
+            const WorldVec3 toMesh = position - camera.eye;
+            const float t = ixtreeme::math::Dot(toMesh, rayDir);
             if (t <= 0.0f || t >= bestT)
                 continue;
-            const WorldVec3 closest = WorldAdd(camera.eye, WorldScale(rayDir, t));
-            const WorldVec3 delta = WorldSub(position, closest);
+            const WorldVec3 closest = camera.eye + rayDir * t;
+            const WorldVec3 delta = position - closest;
             const float pickRadius = std::max({1.25f, mesh.scale[0], mesh.scale[1], mesh.scale[2]});
-            if (WorldDot(delta, delta) <= pickRadius * pickRadius)
+            if (ixtreeme::math::Dot(delta, delta) <= pickRadius * pickRadius)
             {
                 bestT = t;
                 bestId = mesh.id;
@@ -121,14 +121,14 @@ std::optional<std::uint32_t> PickDynamicLight(const std::vector<LightT>& lights,
         if (light.editorHidden)
             continue;
         const WorldVec3 position{light.position[0], light.position[1], light.position[2]};
-        const WorldVec3 toLight = WorldSub(position, camera.eye);
-        const float t = WorldDot(toLight, rayDir);
+        const WorldVec3 toLight = position - camera.eye;
+        const float t = ixtreeme::math::Dot(toLight, rayDir);
         if (t <= 0.0f || t >= bestT)
             continue;
-        const WorldVec3 closest = WorldAdd(camera.eye, WorldScale(rayDir, t));
-        const WorldVec3 delta = WorldSub(position, closest);
+        const WorldVec3 closest = camera.eye + rayDir * t;
+        const WorldVec3 delta = position - closest;
         constexpr float kPickRadius = 0.9f;
-        if (WorldDot(delta, delta) <= kPickRadius * kPickRadius)
+        if (ixtreeme::math::Dot(delta, delta) <= kPickRadius * kPickRadius)
         {
             bestT = t;
             bestId = light.id;

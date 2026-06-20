@@ -1,6 +1,7 @@
 #include "CubeRenderer.h"
 
 #include "Debug.h"
+#include "math/IXMath.h"
 #include "asset/IAssetReader.h"
 
 #include <algorithm>
@@ -71,10 +72,7 @@ struct Vertex
     float color[3];
 };
 
-struct Mat4
-{
-    float m[16];
-};
+using Mat4 = ixtreeme::math::Mat4;
 
 struct UniformBlock
 {
@@ -105,73 +103,35 @@ constexpr std::array<uint16_t, 36> kIndices =
 
 Mat4 Identity()
 {
-    Mat4 r{};
-    r.m[0] = r.m[5] = r.m[10] = r.m[15] = 1.0f;
-    return r;
+    return ixtreeme::math::Mat4Identity();
 }
 
 Mat4 Multiply(const Mat4& a, const Mat4& b)
 {
-    Mat4 r{};
-    for (int row = 0; row < 4; ++row)
-    {
-        for (int col = 0; col < 4; ++col)
-        {
-            for (int k = 0; k < 4; ++k)
-                r.m[row * 4 + col] += a.m[row * 4 + k] * b.m[k * 4 + col];
-        }
-    }
-    return r;
+    return ixtreeme::math::MultiplyRowMajor(a, b);
 }
 
 Mat4 Rotation(float angle)
 {
-    const float c = std::cos(angle);
-    const float s = std::sin(angle);
-
-    Mat4 y = Identity();
-    y.m[0] = c;
-    y.m[2] = s;
-    y.m[8] = -s;
-    y.m[10] = c;
-
-    Mat4 x = Identity();
-    x.m[5] = c;
-    x.m[6] = -s;
-    x.m[9] = s;
-    x.m[10] = c;
+    const Mat4 y = ixtreeme::math::RotationYRowMajor(angle);
+    const Mat4 x = ixtreeme::math::RotationXRowMajor(angle);
 
     return Multiply(x, y);
 }
 
 Mat4 Scale(float value)
 {
-    Mat4 r = Identity();
-    r.m[0] = value;
-    r.m[5] = value;
-    r.m[10] = value;
-    return r;
+    return ixtreeme::math::Scale({value, value, value});
 }
 
 Mat4 Translation(float x, float y, float z)
 {
-    Mat4 r = Identity();
-    r.m[12] = x;
-    r.m[13] = y;
-    r.m[14] = z;
-    return r;
+    return ixtreeme::math::Translation({x, y, z});
 }
 
 Mat4 Perspective(float fovYRadians, float aspect, float zNear, float zFar)
 {
-    const float f = 1.0f / std::tan(fovYRadians * 0.5f);
-    Mat4 r{};
-    r.m[0] = f / aspect;
-    r.m[5] = -f;
-    r.m[10] = zFar / (zFar - zNear);
-    r.m[11] = 1.0f;
-    r.m[14] = -(zNear * zFar) / (zFar - zNear);
-    return r;
+    return ixtreeme::math::PerspectiveVulkan(fovYRadians, aspect, zNear, zFar);
 }
 
 std::vector<char> ReadBinaryFile(client::asset::IAssetReader& assets, const std::string& path)
@@ -664,7 +624,7 @@ void CubeRenderer::UpdateUniform(uint32_t frameIndex, double timeSeconds, float 
     }
 
     const Mat4 model = Multiply(Multiply(Scale(1.4f), Rotation(static_cast<float>(timeSeconds))), Translation(0.0f, 0.0f, 1.8f));
-    const Mat4 projection = Perspective(60.0f * 3.1415926535f / 180.0f, aspect, 0.1f, 20.0f);
+    const Mat4 projection = Perspective(ixtreeme::math::DegreesToRadians(60.0f), aspect, 0.1f, 20.0f);
     const Mat4 mvp = Multiply(model, projection);
     LogNdcZRangeOnce(mvp);
     const UniformBlock uniform{mvp};

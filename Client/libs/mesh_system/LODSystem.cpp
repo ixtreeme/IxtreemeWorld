@@ -1,7 +1,6 @@
 #include "LODSystem.h"
 
 #include <algorithm>
-#include <cmath>
 #include <functional>
 
 std::uint64_t HashLodConfig(const LodConfig& config)
@@ -23,10 +22,7 @@ std::uint64_t HashLodConfig(const LodConfig& config)
 
 float DistanceToAabb(const WorldVec3& point, const SpatialIndex::Aabb& bounds)
 {
-    const float dx = std::max({bounds.min.x - point.x, 0.0f, point.x - bounds.max.x});
-    const float dy = std::max({bounds.min.y - point.y, 0.0f, point.y - bounds.max.y});
-    const float dz = std::max({bounds.min.z - point.z, 0.0f, point.z - bounds.max.z});
-    return std::sqrt(dx * dx + dy * dy + dz * dz);
+    return ixtreeme::math::Distance(point, ixtreeme::math::ClosestPoint(bounds, point));
 }
 
 std::uint32_t SelectLodLevel(const LodConfig& config, float distanceMeters, std::uint32_t previousLevel)

@@ -36,6 +36,8 @@
 
 namespace
 {
+namespace xm = ixtreeme::math;
+
 using RgbaImage = StaticMeshRenderer::RgbaImage;
 
 void LogFormat(const char* format, ...)
@@ -73,10 +75,7 @@ void CheckVk(VkResult result, const char* call, const char* file, int line)
 
 #define VK_CHECK(call) CheckVk((call), #call, __FILE__, __LINE__)
 
-struct Mat4
-{
-    float m[16];
-};
+using Mat4 = ixtreeme::math::Mat4;
 
 struct UniformBlock
 {
@@ -180,77 +179,37 @@ const char* LodSourceName(StaticMeshRenderer::LodBufferSource source)
 
 Mat4 Identity()
 {
-    Mat4 r{};
-    r.m[0] = r.m[5] = r.m[10] = r.m[15] = 1.0f;
-    return r;
+    return xm::Mat4Identity();
 }
 
 Mat4 Multiply(const Mat4& a, const Mat4& b)
 {
-    Mat4 r{};
-    for (int row = 0; row < 4; ++row)
-    {
-        for (int col = 0; col < 4; ++col)
-        {
-            for (int k = 0; k < 4; ++k)
-                r.m[row * 4 + col] += a.m[row * 4 + k] * b.m[k * 4 + col];
-        }
-    }
-    return r;
+    return xm::MultiplyRowMajor(a, b);
 }
 
 Mat4 Scale(float x, float y, float z)
 {
-    Mat4 r = Identity();
-    r.m[0] = x;
-    r.m[5] = y;
-    r.m[10] = z;
-    return r;
+    return xm::Scale({x, y, z});
 }
 
 Mat4 RotationX(float angle)
 {
-    const float c = std::cos(angle);
-    const float s = std::sin(angle);
-    Mat4 r = Identity();
-    r.m[5] = c;
-    r.m[6] = s;
-    r.m[9] = -s;
-    r.m[10] = c;
-    return r;
+    return xm::RotationX(angle);
 }
 
 Mat4 RotationY(float angle)
 {
-    const float c = std::cos(angle);
-    const float s = std::sin(angle);
-    Mat4 r = Identity();
-    r.m[0] = c;
-    r.m[2] = s;
-    r.m[8] = -s;
-    r.m[10] = c;
-    return r;
+    return xm::RotationYRowMajor(angle);
 }
 
 Mat4 RotationZ(float angle)
 {
-    const float c = std::cos(angle);
-    const float s = std::sin(angle);
-    Mat4 r = Identity();
-    r.m[0] = c;
-    r.m[1] = s;
-    r.m[4] = -s;
-    r.m[5] = c;
-    return r;
+    return xm::RotationZ(angle);
 }
 
 Mat4 Translation(float x, float y, float z)
 {
-    Mat4 r = Identity();
-    r.m[12] = x;
-    r.m[13] = y;
-    r.m[14] = z;
-    return r;
+    return xm::Translation({x, y, z});
 }
 
 Mat4 ToLocalMat4(const WorldMat4& matrix)
@@ -264,8 +223,8 @@ void FillLightingUniform(const LightingState& lighting, UniformBlock& uniform)
 {
     const DirectionalLight& directional = lighting.directional;
     const AmbientLight& ambient = lighting.ambient;
-    const float azimuthRadians = std::clamp(directional.azimuthDegrees, 0.0f, 360.0f) * 3.1415926535f / 180.0f;
-    const float elevationRadians = std::clamp(directional.elevationDegrees, 0.0f, 90.0f) * 3.1415926535f / 180.0f;
+    const float azimuthRadians = xm::DegreesToRadians(std::clamp(directional.azimuthDegrees, 0.0f, 360.0f));
+    const float elevationRadians = xm::DegreesToRadians(std::clamp(directional.elevationDegrees, 0.0f, 90.0f));
     const float cosElevation = std::cos(elevationRadians);
     const float sunIntensity = std::max(0.0f, directional.intensity) * (directional.enabled ? 1.0f : 0.0f);
     const float ambientIntensity = std::max(0.0f, ambient.intensity);
@@ -315,12 +274,12 @@ void FillLightingUniform(const LightingState& lighting, UniformBlock& uniform)
         out.direction[0] = std::sin(yaw) * cosPitch;
         out.direction[1] = std::sin(pitch);
         out.direction[2] = std::cos(yaw) * cosPitch;
-        out.direction[3] = std::cos(spot.innerConeDegrees * 3.1415926535f / 180.0f);
+        out.direction[3] = std::cos(xm::DegreesToRadians(spot.innerConeDegrees));
         const float intensity = spot.enabled ? std::max(0.0f, spot.intensity) : 0.0f;
         out.color[0] = std::max(0.0f, spot.r) * intensity;
         out.color[1] = std::max(0.0f, spot.g) * intensity;
         out.color[2] = std::max(0.0f, spot.b) * intensity;
-        out.color[3] = std::cos(spot.outerConeDegrees * 3.1415926535f / 180.0f);
+        out.color[3] = std::cos(xm::DegreesToRadians(spot.outerConeDegrees));
         out.direction[3] = std::max(out.direction[3], out.color[3]);
     }
 }
@@ -1764,13 +1723,13 @@ bool StaticMeshRenderer::LoadBuiltinPrimitiveMesh(const std::string& modelPath)
         for (std::uint32_t y = 0; y <= rings; ++y)
         {
             const float v = static_cast<float>(y) / static_cast<float>(rings);
-            const float theta = v * 3.14159265358979323846f;
+            const float theta = v * xm::Pi;
             const float sinTheta = std::sin(theta);
             const float cosTheta = std::cos(theta);
             for (std::uint32_t x = 0; x <= segments; ++x)
             {
                 const float u = static_cast<float>(x) / static_cast<float>(segments);
-                const float phi = u * 6.28318530717958647692f;
+                const float phi = u * xm::TwoPi;
                 const float nx = std::cos(phi) * sinTheta;
                 const float ny = cosTheta;
                 const float nz = std::sin(phi) * sinTheta;

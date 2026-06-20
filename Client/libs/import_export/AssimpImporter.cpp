@@ -1,6 +1,7 @@
 #include "AssimpImporter.h"
 
 #include "Debug.h"
+#include "math/IXMath.h"
 
 #include <assimp/Importer.hpp>
 #include <assimp/material.h>
@@ -32,6 +33,8 @@
 
 namespace
 {
+namespace xm = ixtreeme::math;
+
 constexpr unsigned int kFbxImportFlags =
     aiProcess_Triangulate |
     aiProcess_GenSmoothNormals |
@@ -211,50 +214,36 @@ float MetadataFloat(const aiScene& scene, const char* key, float fallback)
     return fallback;
 }
 
-std::array<float, 16> UpAxisTransform(const aiScene& scene)
+xm::Mat4 UpAxisTransform(const aiScene& scene)
 {
     const int upAxis = static_cast<int>(MetadataFloat(scene, "UpAxis", 2.0f));
     const int upSign = static_cast<int>(MetadataFloat(scene, "UpAxisSign", 1.0f));
     if (upAxis == 1 && upSign == 1)
-        return {1, 0, 0, 0,
-                0, 1, 0, 0,
-                0, 0, 1, 0,
-                0, 0, 0, 1};
+        return xm::Mat4Identity();
 
-    const float angle = upSign >= 0 ? -1.5707963267948966f : 1.5707963267948966f;
+    const float angle = upSign >= 0 ? -xm::HalfPi : xm::HalfPi;
     const float c = std::cos(angle);
     const float s = std::sin(angle);
-    return {1, 0, 0, 0,
-            0, c, s, 0,
-            0, -s, c, 0,
-            0, 0, 0, 1};
+    return xm::Mat4{{1, 0, 0, 0,
+                     0, c, s, 0,
+                     0, -s, c, 0,
+                     0, 0, 0, 1}};
 }
 
-void TransformPoint(const std::array<float, 16>& m, float& x, float& y, float& z)
+void ApplyPointTransform(const xm::Mat4& transform, float& x, float& y, float& z)
 {
-    const float ox = x;
-    const float oy = y;
-    const float oz = z;
-    x = ox * m[0] + oy * m[4] + oz * m[8] + m[12];
-    y = ox * m[1] + oy * m[5] + oz * m[9] + m[13];
-    z = ox * m[2] + oy * m[6] + oz * m[10] + m[14];
+    const xm::Vec3 transformed = xm::TransformPoint(transform, {x, y, z});
+    x = transformed.x;
+    y = transformed.y;
+    z = transformed.z;
 }
 
-void TransformVector(const std::array<float, 16>& m, float& x, float& y, float& z)
+void ApplyVectorTransform(const xm::Mat4& transform, float& x, float& y, float& z)
 {
-    const float ox = x;
-    const float oy = y;
-    const float oz = z;
-    x = ox * m[0] + oy * m[4] + oz * m[8];
-    y = ox * m[1] + oy * m[5] + oz * m[9];
-    z = ox * m[2] + oy * m[6] + oz * m[10];
-    const float len = std::sqrt(x * x + y * y + z * z);
-    if (len > 0.0001f)
-    {
-        x /= len;
-        y /= len;
-        z /= len;
-    }
+    const xm::Vec3 transformed = xm::SafeNormalize(xm::TransformVector(transform, {x, y, z}), {x, y, z});
+    x = transformed.x;
+    y = transformed.y;
+    z = transformed.z;
 }
 
 std::filesystem::path TextureFor(aiMaterial& material,
@@ -691,7 +680,7 @@ AssimpImporter::ImportResult AssimpImporter::importFile(const std::filesystem::p
         return result;
     }
 
-    const std::array<float, 16> axisTransform = UpAxisTransform(*scene);
+    const xm::Mat4 axisTransform = UpAxisTransform(*scene);
     result.skeletalIgnored = scene->HasAnimations();
     ExtractSkeleton(*scene, result);
     std::unordered_map<std::string, int> boneIndexByName;
@@ -734,14 +723,14 @@ AssimpImporter::ImportResult AssimpImporter::importFile(const std::filesystem::p
             vertex.position[0] = mesh->mVertices[vertexIndex].x;
             vertex.position[1] = mesh->mVertices[vertexIndex].y;
             vertex.position[2] = mesh->mVertices[vertexIndex].z;
-            TransformPoint(axisTransform, vertex.position[0], vertex.position[1], vertex.position[2]);
+            ApplyPointTransform(axisTransform, vertex.position[0], vertex.position[1], vertex.position[2]);
 
             if (mesh->HasNormals())
             {
                 vertex.normal[0] = mesh->mNormals[vertexIndex].x;
                 vertex.normal[1] = mesh->mNormals[vertexIndex].y;
                 vertex.normal[2] = mesh->mNormals[vertexIndex].z;
-                TransformVector(axisTransform, vertex.normal[0], vertex.normal[1], vertex.normal[2]);
+                ApplyVectorTransform(axisTransform, vertex.normal[0], vertex.normal[1], vertex.normal[2]);
             }
             if (mesh->HasTextureCoords(0))
             {

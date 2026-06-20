@@ -18,6 +18,8 @@
 
 namespace
 {
+namespace xm = ixtreeme::math;
+
 constexpr uint32_t kMaxVertices = 131072;
 constexpr uint32_t kFirstGlyph = 32;
 constexpr uint32_t kLastGlyph = 126;
@@ -773,17 +775,16 @@ void WorldLabelRenderer::UpdateUniform(uint32_t frameIndex, const WorldCamera& c
 
 void WorldLabelRenderer::BuildVertices(const WorldCamera& camera, const std::vector<Label>& worldLabels, std::vector<Vertex>& vertices) const
 {
-    const WorldVec3 forward = WorldNormalize(WorldSub(camera.target, camera.eye));
-    WorldVec3 right = WorldNormalize(WorldCross({0.0f, 1.0f, 0.0f}, forward));
-    if (WorldDot(right, right) <= 0.000001f)
+    const WorldVec3 forward = xm::Normalize(camera.target - camera.eye);
+    WorldVec3 right = xm::Normalize(xm::Cross({0.0f, 1.0f, 0.0f}, forward));
+    if (xm::Dot(right, right) <= 0.000001f)
         right = {1.0f, 0.0f, 0.0f};
-    const WorldVec3 up = WorldNormalize(WorldCross(forward, right));
+    const WorldVec3 up = xm::Normalize(xm::Cross(forward, right));
 
     vertices.reserve(std::min<size_t>(kMaxVertices, worldLabels.size() * 96u * 6u * 2u));
     for (const Label& label : worldLabels)
     {
-        const WorldVec3 toCamera = WorldSub(label.position, camera.eye);
-        const float distance = std::sqrt(WorldDot(toCamera, toCamera));
+        const float distance = xm::Distance(label.position, camera.eye);
         const float fade = std::clamp(
             (kFadeEndMeters - distance) / (kFadeEndMeters - kFadeStartMeters),
             0.0f,
@@ -793,9 +794,9 @@ void WorldLabelRenderer::BuildVertices(const WorldCamera& camera, const std::vec
 
         const std::string text = ToPrintableAscii(label.text.empty() ? std::string("Label") : label.text);
 
-        WorldVec3 origin = WorldAdd(label.position, {0.0f, kHeadOffsetMeters, 0.0f});
+        WorldVec3 origin = label.position + WorldVec3{0.0f, kHeadOffsetMeters, 0.0f};
         const float nameLineHeight = kAtlasCell * kNamePixelScale;
-        origin = WorldAdd(origin, WorldScale(up, nameLineHeight * 0.5f));
+        origin = origin + up * (nameLineHeight * 0.5f);
 
         float textColor[4] = {label.color[0], label.color[1], label.color[2], label.color[3]};
         if (label.selected)

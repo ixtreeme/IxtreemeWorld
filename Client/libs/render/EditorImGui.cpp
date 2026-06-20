@@ -9,6 +9,7 @@
 #include "ProjectManager.h"
 #include "SceneManager.h"
 #include "VulkanDevice.h"
+#include "math/IXMath.h"
 #include "platform/trash.h"
 #include "tools/tree/TreeTexturePalette.h"
 
@@ -51,17 +52,17 @@ constexpr const char* kAssetFolderPayloadType = "ASSET_FOLDER_PATH";
 constexpr const char* kEditorNoteComponentId = "editor.note";
 constexpr const char* kLodComponentId = "rendering.lod";
 constexpr double kProjectAutoSaveIntervalSeconds = 5.0 * 60.0;
-constexpr float kPi = 3.14159265358979323846f;
+constexpr float kPi = ixtreeme::math::Pi;
 constexpr float kGizmoPlaneScaleUnitsPerPixel = 0.01f;
 
 float Degrees(float radians)
 {
-    return radians * 180.0f / kPi;
+    return ixtreeme::math::RadiansToDegrees(radians);
 }
 
 float Radians(float degrees)
 {
-    return degrees * kPi / 180.0f;
+    return ixtreeme::math::DegreesToRadians(degrees);
 }
 
 float UnwrapDegreesNear(float value, float reference)

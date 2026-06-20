@@ -1,5 +1,7 @@
 #include "TreePreviewRenderer.h"
 
+#include "math/IXMath.h"
+
 #include <imgui.h>
 
 #include <algorithm>
@@ -10,6 +12,8 @@ namespace tree_tool
 {
 namespace
 {
+namespace xm = ixtreeme::math;
+
 ImU32 Color(const std::array<float, 4>& value)
 {
     const auto byte = [](float v) {
@@ -35,31 +39,34 @@ struct PreviewTriangle
     bool outline = false;
 };
 
+xm::Vec3 ToMath(const ixtreemetree::Vec3& v)
+{
+    return {v.x, v.y, v.z};
+}
+
+ixtreemetree::Vec3 ToTree(xm::Vec3 v)
+{
+    return {v.x, v.y, v.z};
+}
+
 ixtreemetree::Vec3 Sub(const ixtreemetree::Vec3& a, const ixtreemetree::Vec3& b)
 {
-    return {a.x - b.x, a.y - b.y, a.z - b.z};
+    return ToTree(ToMath(a) - ToMath(b));
 }
 
 ixtreemetree::Vec3 Cross(const ixtreemetree::Vec3& a, const ixtreemetree::Vec3& b)
 {
-    return {
-        a.y * b.z - a.z * b.y,
-        a.z * b.x - a.x * b.z,
-        a.x * b.y - a.y * b.x,
-    };
+    return ToTree(xm::Cross(ToMath(a), ToMath(b)));
 }
 
 ixtreemetree::Vec3 Normalize(ixtreemetree::Vec3 v)
 {
-    const float len = std::sqrt(v.x * v.x + v.y * v.y + v.z * v.z);
-    if (len <= 0.00001f)
-        return {0.0f, 1.0f, 0.0f};
-    return {v.x / len, v.y / len, v.z / len};
+    return ToTree(xm::SafeNormalize(ToMath(v), {0.0f, 1.0f, 0.0f}));
 }
 
 float Dot(const ixtreemetree::Vec3& a, const ixtreemetree::Vec3& b)
 {
-    return a.x * b.x + a.y * b.y + a.z * b.z;
+    return xm::Dot(ToMath(a), ToMath(b));
 }
 
 std::array<float, 4> ShadeColor(std::array<float, 4> color, float shade)

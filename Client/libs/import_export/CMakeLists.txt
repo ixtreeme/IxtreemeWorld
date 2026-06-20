@@ -20,6 +20,7 @@ target_link_libraries(IXEngineImportExport
     PUBLIC
         IXEngineAsset
         IXEngineDebug
+        IXEngineMath
         IXEngineCommon
         IXEngineTree::IXEngineTree
         assimp::assimp

@@ -75,6 +75,8 @@
 
 namespace
 {
+namespace xm = ixtreeme::math;
+
 const char* InputEventTypeName(InputEvent::Type type)
 {
     switch (type)
@@ -392,7 +394,7 @@ std::optional<WorldVec3> RaycastTerrainPoint(const TerrainRenderer& terrain,
     float previousDelta = camera.eye.y - terrain.SampleHeight(camera.eye);
     for (float t = kStepMeters; t <= kMaxDistanceMeters; t += kStepMeters)
     {
-        const WorldVec3 p = WorldAdd(camera.eye, WorldScale(rayDir, t));
+        const WorldVec3 p = camera.eye + rayDir * t;
         const float terrainY = terrain.SampleHeight(p);
         const float delta = p.y - terrainY;
         if (delta <= 0.0f && previousDelta > 0.0f)
@@ -400,7 +402,7 @@ std::optional<WorldVec3> RaycastTerrainPoint(const TerrainRenderer& terrain,
             const float denom = previousDelta - delta;
             const float lerp = denom > 0.0001f ? previousDelta / denom : 0.0f;
             const float hitT = previousT + (t - previousT) * std::clamp(lerp, 0.0f, 1.0f);
-            WorldVec3 hit = WorldAdd(camera.eye, WorldScale(rayDir, hitT));
+            WorldVec3 hit = camera.eye + rayDir * hitT;
             hit.y = terrain.SampleHeight(hit);
             return hit;
         }
@@ -2242,13 +2244,12 @@ int RunGame(NativeWindow& window,
                         editorObjectDragLastY = event.y;
                         auto moveLight = [&](auto& light) {
                             WorldVec3 position{light.position[0], light.position[1], light.position[2]};
-                            const float scale = 0.025f * std::max(1.0f, std::sqrt(WorldDot(WorldSub(position, lastPickCamera.eye),
-                                WorldSub(position, lastPickCamera.eye))));
+                            const float scale = 0.025f * std::max(1.0f, xm::Distance(position, lastPickCamera.eye));
                             if (editorGizmoMode == EditorGizmoMode::Translate)
                             {
-                                position = WorldAdd(position,
-                                    WorldAdd(WorldScale(CameraRight(lastPickCamera), static_cast<float>(dx) * scale),
-                                             WorldScale(CameraUp(lastPickCamera), static_cast<float>(-dy) * scale)));
+                                position = position +
+                                    CameraRight(lastPickCamera) * (static_cast<float>(dx) * scale) +
+                                    CameraUp(lastPickCamera) * (static_cast<float>(-dy) * scale);
                                 if (editorGizmoSnapEnabled)
                                     position = SnapPoint(position, editorGizmoSnapValue);
                                 light.position[0] = position.x;
@@ -2298,13 +2299,12 @@ int RunGame(NativeWindow& window,
                             if (it != editorMeshEntities.end())
                             {
                                 WorldVec3 position{it->position[0], it->position[1], it->position[2]};
-                                const float scale = 0.025f * std::max(1.0f, std::sqrt(WorldDot(WorldSub(position, lastPickCamera.eye),
-                                    WorldSub(position, lastPickCamera.eye))));
+                                const float scale = 0.025f * std::max(1.0f, xm::Distance(position, lastPickCamera.eye));
                                 if (editorGizmoMode == EditorGizmoMode::Translate)
                                 {
-                                    position = WorldAdd(position,
-                                        WorldAdd(WorldScale(CameraRight(lastPickCamera), static_cast<float>(dx) * scale),
-                                                 WorldScale(CameraUp(lastPickCamera), static_cast<float>(-dy) * scale)));
+                                    position = position +
+                                        CameraRight(lastPickCamera) * (static_cast<float>(dx) * scale) +
+                                        CameraUp(lastPickCamera) * (static_cast<float>(-dy) * scale);
                                     if (editorGizmoSnapEnabled)
                                         position = SnapPoint(position, editorGizmoSnapValue);
                                     it->position[0] = position.x;
@@ -2348,13 +2348,12 @@ int RunGame(NativeWindow& window,
                         {
                             WaterBodyEditorState state = BuildWaterBodyEditorState(editorWaterBodies, it->id);
                             const WorldVec3 center{state.center[0], state.center[1], state.center[2]};
-                            const float scale = 0.025f * std::max(1.0f, std::sqrt(WorldDot(WorldSub(center, lastPickCamera.eye),
-                                WorldSub(center, lastPickCamera.eye))));
+                            const float scale = 0.025f * std::max(1.0f, xm::Distance(center, lastPickCamera.eye));
                             if (editorGizmoMode == EditorGizmoMode::Translate)
                             {
-                                const WorldVec3 moved = WorldAdd(center,
-                                    WorldAdd(WorldScale(CameraRight(lastPickCamera), static_cast<float>(dx) * scale),
-                                             WorldScale(CameraUp(lastPickCamera), static_cast<float>(-dy) * scale)));
+                                const WorldVec3 moved = center +
+                                    CameraRight(lastPickCamera) * (static_cast<float>(dx) * scale) +
+                                    CameraUp(lastPickCamera) * (static_cast<float>(-dy) * scale);
                                 const WorldVec3 snapped = editorGizmoSnapEnabled ? SnapPoint(moved, editorGizmoSnapValue) : moved;
                                 state.center[0] = snapped.x;
                                 state.center[1] = snapped.y;
@@ -2809,7 +2808,7 @@ int RunGame(NativeWindow& window,
                     if (hit)
                         return *hit;
 
-                    WorldVec3 fallback = WorldAdd(frameCamera.eye, WorldScale(CameraForward(frameCamera), 30.0f));
+                    WorldVec3 fallback = frameCamera.eye + CameraForward(frameCamera) * 30.0f;
                     fallback.y = terrain.SampleHeight(fallback);
                     return fallback;
                 };
@@ -2827,8 +2826,8 @@ int RunGame(NativeWindow& window,
                     if (hit)
                         return *hit;
 
-                    WorldVec3 fallback = WorldAdd(frameCamera.eye,
-                        WorldScale(ScreenRayDirection(frameCamera, renderSize.width, renderSize.height, mouseX, mouseY), 30.0f));
+                    WorldVec3 fallback = frameCamera.eye +
+                        ScreenRayDirection(frameCamera, renderSize.width, renderSize.height, mouseX, mouseY) * 30.0f;
                     fallback.y = terrain.SampleHeight(fallback);
                     return fallback;
                 };
@@ -4402,7 +4401,7 @@ int RunGame(NativeWindow& window,
                             renderSize);
                     }
                     plates.push_back(WorldLabelRenderer::Label{
-                        WorldAdd(position, {0.0f, 2.2f, 0.0f}),
+                        position + WorldVec3{0.0f, 2.2f, 0.0f},
                         entity.name,
                         entity.netId == selectedTargetNetId
                             ? std::array<float, 4>{1.0f, 0.86f, 0.32f, 1.0f}

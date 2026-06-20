@@ -1,5 +1,7 @@
 #pragma once
 
+#include "math/Geometry.h"
+
 #include <array>
 #include <cstdint>
 #include <limits>
@@ -9,23 +11,9 @@
 class SpatialIndex
 {
 public:
-    struct Vec3
-    {
-        float x = 0.0f;
-        float y = 0.0f;
-        float z = 0.0f;
-    };
-
-    struct Aabb
-    {
-        Vec3 min;
-        Vec3 max;
-    };
-
-    struct Frustum
-    {
-        float viewProjection[16]{};
-    };
+    using Vec3 = ixtreeme::math::Vec3;
+    using Aabb = ixtreeme::math::Aabb;
+    using Frustum = ixtreeme::math::Frustum;
 
     struct Config
     {

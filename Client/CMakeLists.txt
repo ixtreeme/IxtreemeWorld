@@ -130,6 +130,7 @@ endif()
 set(CLIENT_ROOT "${CMAKE_CURRENT_SOURCE_DIR}")
 set(CLIENT_LIBS_DIR "${CLIENT_ROOT}/libs")
 
+add_subdirectory(libs/math)
 add_subdirectory(${CLIENT_LIBS_DIR}/ixtreemetree)
 add_subdirectory(libs/common)
 add_subdirectory(libs/debug)

@@ -1,5 +1,7 @@
 #include "ixtreemetree/tree.h"
 
+#include "math/IXMath.h"
+
 #include <algorithm>
 #include <chrono>
 #include <cmath>
@@ -9,27 +11,31 @@ namespace ixtreemetree
 {
 namespace
 {
-constexpr float kPi = 3.14159265358979323846f;
+namespace xm = ixtreeme::math;
 
-Vec3 Add(Vec3 a, Vec3 b) { return {a.x + b.x, a.y + b.y, a.z + b.z}; }
-Vec3 Sub(Vec3 a, Vec3 b) { return {a.x - b.x, a.y - b.y, a.z - b.z}; }
-Vec3 Mul(Vec3 v, float s) { return {v.x * s, v.y * s, v.z * s}; }
-float Dot(Vec3 a, Vec3 b) { return a.x * b.x + a.y * b.y + a.z * b.z; }
-Vec3 Cross(Vec3 a, Vec3 b)
+constexpr float kPi = xm::Pi;
+
+xm::Vec3 ToMath(Vec3 v)
 {
-    return {
-        a.y * b.z - a.z * b.y,
-        a.z * b.x - a.x * b.z,
-        a.x * b.y - a.y * b.x,
-    };
+    return {v.x, v.y, v.z};
 }
-float Length(Vec3 v) { return std::sqrt(std::max(0.0f, Dot(v, v))); }
+
+Vec3 ToTree(xm::Vec3 v)
+{
+    return {v.x, v.y, v.z};
+}
+
+Vec3 Add(Vec3 a, Vec3 b) { return ToTree(ToMath(a) + ToMath(b)); }
+Vec3 Sub(Vec3 a, Vec3 b) { return ToTree(ToMath(a) - ToMath(b)); }
+Vec3 Mul(Vec3 v, float s) { return ToTree(ToMath(v) * s); }
+float Dot(Vec3 a, Vec3 b) { return xm::Dot(ToMath(a), ToMath(b)); }
+Vec3 Cross(Vec3 a, Vec3 b) { return ToTree(xm::Cross(ToMath(a), ToMath(b))); }
+float Length(Vec3 v) { return xm::Length(ToMath(v)); }
 Vec3 Normalize(Vec3 v)
 {
-    const float len = Length(v);
-    return len > 0.00001f ? Mul(v, 1.0f / len) : Vec3{0.0f, 1.0f, 0.0f};
+    return ToTree(xm::SafeNormalize(ToMath(v), {0.0f, 1.0f, 0.0f}));
 }
-Vec3 Mix(Vec3 a, Vec3 b, float t) { return Add(Mul(a, 1.0f - t), Mul(b, t)); }
+Vec3 Mix(Vec3 a, Vec3 b, float t) { return ToTree(xm::Lerp(ToMath(a), ToMath(b), t)); }
 
 class Rng
 {

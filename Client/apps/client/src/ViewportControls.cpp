@@ -5,6 +5,8 @@
 #include <algorithm>
 #include <cmath>
 
+namespace xm = ixtreeme::math;
+
 WorldVec3 ServerMetersToDisplay(RuntimeVec3 position)
 {
     return {position.x, position.z, -position.y};
@@ -41,17 +43,17 @@ bool ProjectWorldToScreen(const WorldCamera& camera,
 
 WorldVec3 CameraForward(const WorldCamera& camera)
 {
-    return WorldNormalize(WorldSub(camera.target, camera.eye));
+    return xm::Normalize(camera.target - camera.eye);
 }
 
 WorldVec3 CameraRight(const WorldCamera& camera)
 {
-    return WorldNormalize(WorldCross({0.0f, 1.0f, 0.0f}, CameraForward(camera)));
+    return xm::Normalize(xm::Cross({0.0f, 1.0f, 0.0f}, CameraForward(camera)));
 }
 
 WorldVec3 CameraUp(const WorldCamera& camera)
 {
-    return WorldNormalize(WorldCross(CameraForward(camera), CameraRight(camera)));
+    return xm::Normalize(xm::Cross(CameraForward(camera), CameraRight(camera)));
 }
 
 WorldVec3 ScreenRayDirection(const WorldCamera& camera, uint32_t width, uint32_t height, int mouseX, int mouseY)
@@ -60,9 +62,10 @@ WorldVec3 ScreenRayDirection(const WorldCamera& camera, uint32_t width, uint32_t
     const float ndcX = width != 0 ? (2.0f * static_cast<float>(mouseX) / static_cast<float>(width)) - 1.0f : 0.0f;
     const float ndcY = height != 0 ? 1.0f - (2.0f * static_cast<float>(mouseY) / static_cast<float>(height)) : 0.0f;
     constexpr float kTanHalfFov = 0.41421356237f; // tan(45deg / 2)
-    return WorldNormalize(WorldAdd(
-        WorldAdd(CameraForward(camera), WorldScale(CameraRight(camera), ndcX * aspect * kTanHalfFov)),
-        WorldScale(CameraUp(camera), ndcY * kTanHalfFov)));
+    return xm::Normalize(
+        CameraForward(camera) +
+        CameraRight(camera) * (ndcX * aspect * kTanHalfFov) +
+        CameraUp(camera) * (ndcY * kTanHalfFov));
 }
 
 std::uint32_t PickRenderEntityTarget(const std::vector<WorldRenderEntity>& entities,
@@ -80,7 +83,7 @@ std::uint32_t PickRenderEntityTarget(const std::vector<WorldRenderEntity>& entit
         if (entity.visualClassId == 0)
             continue;
 
-        WorldVec3 screenAnchor = WorldAdd(ServerMetersToDisplay(entity.position), {0.0f, 1.4f, 0.0f});
+        WorldVec3 screenAnchor = ServerMetersToDisplay(entity.position) + WorldVec3{0.0f, 1.4f, 0.0f};
         float sx = 0.0f;
         float sy = 0.0f;
         if (!ProjectWorldToScreen(camera, screenAnchor, width, height, sx, sy))
@@ -185,7 +188,7 @@ float MovementInputState::DirectionAngle(float cameraYawRadians) const
 
     const WorldVec3 forward = {std::sin(cameraYawRadians), 0.0f, std::cos(cameraYawRadians)};
     const WorldVec3 right = {std::cos(cameraYawRadians), 0.0f, -std::sin(cameraYawRadians)};
-    const WorldVec3 displayDir = WorldAdd(WorldScale(right, localX), WorldScale(forward, localZ));
+    const WorldVec3 displayDir = right * localX + forward * localZ;
     return std::atan2(displayDir.x, -displayDir.z);
 }
 
@@ -267,7 +270,7 @@ void FlyCameraController::FocusOn(WorldVec3 target, float distance)
 {
     inputEnabled_ = true;
     const WorldVec3 eye = {target.x, target.y + 5.0f, target.z - distance};
-    const WorldVec3 forward = WorldNormalize(WorldSub(target, eye));
+    const WorldVec3 forward = xm::Normalize(target - eye);
     eye_ = eye;
     yaw_ = std::atan2(forward.x, forward.z);
     pitch_ = std::clamp(std::asin(std::clamp(forward.y, -1.0f, 1.0f)), -kMaxPitch, kMaxPitch);
@@ -297,13 +300,12 @@ void FlyCameraController::UpdateFly(float dt, const MovementInputState& movement
     const float cosPitch = std::cos(pitch_);
     const WorldVec3 forward = {std::sin(yaw_) * cosPitch, std::sin(pitch_), std::cos(yaw_) * cosPitch};
     const WorldVec3 right = {std::cos(yaw_), 0.0f, -std::sin(yaw_)};
-    WorldVec3 delta = WorldAdd(WorldAdd(WorldScale(forward, localZ), WorldScale(right, localX)),
-        {0.0f, localY, 0.0f});
-    if (WorldDot(delta, delta) > 0.0001f)
-        delta = WorldNormalize(delta);
+    WorldVec3 delta = forward * localZ + right * localX + WorldVec3{0.0f, localY, 0.0f};
+    if (xm::Dot(delta, delta) > 0.0001f)
+        delta = xm::Normalize(delta);
 
     const float speed = (movement.shift ? 22.0f : 9.0f) * speedScale_;
-    eye_ = WorldAdd(eye_, WorldScale(delta, speed * dt));
+    eye_ = eye_ + delta * (speed * dt);
 }
 
 WorldCamera FlyCameraController::BuildFlyCamera(uint32_t width, uint32_t height) const
@@ -313,11 +315,11 @@ WorldCamera FlyCameraController::BuildFlyCamera(uint32_t width, uint32_t height)
     const WorldVec3 forward = {std::sin(yaw_) * cosPitch, std::sin(pitch_), std::cos(yaw_) * cosPitch};
     WorldCamera camera{};
     camera.eye = eye_;
-    camera.target = WorldAdd(eye_, forward);
+    camera.target = eye_ + forward;
     const WorldMat4 view = WorldLookAt(camera.eye, camera.target, {0.0f, 1.0f, 0.0f});
     camera.nearPlane = 0.1f;
     camera.farPlane = 1000.0f;
-    const WorldMat4 projection = WorldPerspective(45.0f * 3.1415926535f / 180.0f, aspect, camera.nearPlane, camera.farPlane);
+    const WorldMat4 projection = WorldPerspective(xm::DegreesToRadians(45.0f), aspect, camera.nearPlane, camera.farPlane);
     camera.viewProjection = WorldMultiply(view, projection);
     return camera;
 }
