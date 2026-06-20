@@ -68,7 +68,7 @@ inline float Fade(float t)
 
 inline float ValueNoise1D(float x, int32_t seed = 0)
 {
-    const int32_t x0 = static_cast<int32_t>(std::floor(x));
+    const int32_t x0 = static_cast<int32_t>(Floor(x));
     const int32_t x1 = x0 + 1;
     const float tx = Fade(x - static_cast<float>(x0));
     return Lerp(Value1D(x0, seed), Value1D(x1, seed), tx);
@@ -76,8 +76,8 @@ inline float ValueNoise1D(float x, int32_t seed = 0)
 
 inline float ValueNoise2D(Vec2 p, int32_t seed = 0)
 {
-    const int32_t x0 = static_cast<int32_t>(std::floor(p.x));
-    const int32_t y0 = static_cast<int32_t>(std::floor(p.y));
+    const int32_t x0 = static_cast<int32_t>(Floor(p.x));
+    const int32_t y0 = static_cast<int32_t>(Floor(p.y));
     const int32_t x1 = x0 + 1;
     const int32_t y1 = y0 + 1;
     const float tx = Fade(p.x - static_cast<float>(x0));
@@ -90,9 +90,9 @@ inline float ValueNoise2D(Vec2 p, int32_t seed = 0)
 
 inline float ValueNoise3D(Vec3 p, int32_t seed = 0)
 {
-    const int32_t x0 = static_cast<int32_t>(std::floor(p.x));
-    const int32_t y0 = static_cast<int32_t>(std::floor(p.y));
-    const int32_t z0 = static_cast<int32_t>(std::floor(p.z));
+    const int32_t x0 = static_cast<int32_t>(Floor(p.x));
+    const int32_t y0 = static_cast<int32_t>(Floor(p.y));
+    const int32_t z0 = static_cast<int32_t>(Floor(p.z));
     const int32_t x1 = x0 + 1;
     const int32_t y1 = y0 + 1;
     const int32_t z1 = z0 + 1;

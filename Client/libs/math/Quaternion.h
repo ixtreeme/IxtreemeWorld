@@ -57,7 +57,7 @@ inline float LengthSquared(Quat q)
 
 inline float Length(Quat q)
 {
-    return std::sqrt(LengthSquared(q));
+    return Sqrt(LengthSquared(q));
 }
 
 inline Quat Normalize(Quat q)
@@ -66,7 +66,7 @@ inline Quat Normalize(Quat q)
     const float lengthSq = simd::Dot4(v, v);
     if (lengthSq <= Epsilon)
         return QuatIdentity();
-    const Vec4 normalized = simd::StoreVec4(simd::Mul(v, simd::Splat(1.0f / std::sqrt(lengthSq))));
+    const Vec4 normalized = simd::StoreVec4(simd::Mul(v, simd::Splat(1.0f / Sqrt(lengthSq))));
     return {normalized.x, normalized.y, normalized.z, normalized.w};
 }
 
@@ -127,8 +127,8 @@ inline Quat AngleAxisRadians(float radians, Vec3 axis)
 {
     const Vec3 normalizedAxis = SafeNormalize(axis);
     const float halfAngle = radians * 0.5f;
-    const float s = std::sin(halfAngle);
-    return Normalize(Quat{normalizedAxis.x * s, normalizedAxis.y * s, normalizedAxis.z * s, std::cos(halfAngle)});
+    const float s = Sin(halfAngle);
+    return Normalize(Quat{normalizedAxis.x * s, normalizedAxis.y * s, normalizedAxis.z * s, Cos(halfAngle)});
 }
 
 inline Quat AngleAxisDegrees(float degrees, Vec3 axis)
@@ -155,14 +155,14 @@ inline Vec3 ToEulerRadians(Quat rotation)
 
     const float sinrCosp = 2.0f * (q.w * q.x + q.y * q.z);
     const float cosrCosp = 1.0f - 2.0f * (q.x * q.x + q.y * q.y);
-    const float x = std::atan2(sinrCosp, cosrCosp);
+    const float x = Atan2(sinrCosp, cosrCosp);
 
     const float sinp = 2.0f * (q.w * q.y - q.z * q.x);
-    const float y = std::fabs(sinp) >= 1.0f ? std::copysign(HalfPi, sinp) : std::asin(sinp);
+    const float y = Abs(sinp) >= 1.0f ? CopySign(HalfPi, sinp) : Asin(sinp);
 
     const float sinyCosp = 2.0f * (q.w * q.z + q.x * q.y);
     const float cosyCosp = 1.0f - 2.0f * (q.y * q.y + q.z * q.z);
-    const float z = std::atan2(sinyCosp, cosyCosp);
+    const float z = Atan2(sinyCosp, cosyCosp);
 
     return {x, y, z};
 }
@@ -191,7 +191,7 @@ inline Quat FromToRotation(Vec3 fromDirection, Vec3 toDirection)
     }
 
     const Vec3 axis = Cross(from, to);
-    const float s = std::sqrt((1.0f + cosTheta) * 2.0f);
+    const float s = Sqrt((1.0f + cosTheta) * 2.0f);
     const float invS = 1.0f / s;
     return Normalize(Quat{axis.x * invS, axis.y * invS, axis.z * invS, s * 0.5f});
 }
@@ -209,7 +209,7 @@ inline Quat LookRotation(Vec3 forward, Vec3 up = {0.0f, 1.0f, 0.0f})
     Quat q{};
     if (trace > 0.0f)
     {
-        const float s = std::sqrt(trace + 1.0f) * 2.0f;
+        const float s = Sqrt(trace + 1.0f) * 2.0f;
         q.w = 0.25f * s;
         q.x = (u.z - f.y) / s;
         q.y = (f.x - r.z) / s;
@@ -217,7 +217,7 @@ inline Quat LookRotation(Vec3 forward, Vec3 up = {0.0f, 1.0f, 0.0f})
     }
     else if (r.x > u.y && r.x > f.z)
     {
-        const float s = std::sqrt(1.0f + r.x - u.y - f.z) * 2.0f;
+        const float s = Sqrt(1.0f + r.x - u.y - f.z) * 2.0f;
         q.w = (u.z - f.y) / s;
         q.x = 0.25f * s;
         q.y = (u.x + r.y) / s;
@@ -225,7 +225,7 @@ inline Quat LookRotation(Vec3 forward, Vec3 up = {0.0f, 1.0f, 0.0f})
     }
     else if (u.y > f.z)
     {
-        const float s = std::sqrt(1.0f + u.y - r.x - f.z) * 2.0f;
+        const float s = Sqrt(1.0f + u.y - r.x - f.z) * 2.0f;
         q.w = (f.x - r.z) / s;
         q.x = (u.x + r.y) / s;
         q.y = 0.25f * s;
@@ -233,7 +233,7 @@ inline Quat LookRotation(Vec3 forward, Vec3 up = {0.0f, 1.0f, 0.0f})
     }
     else
     {
-        const float s = std::sqrt(1.0f + f.z - r.x - u.y) * 2.0f;
+        const float s = Sqrt(1.0f + f.z - r.x - u.y) * 2.0f;
         q.w = (r.y - u.x) / s;
         q.x = (f.x + r.z) / s;
         q.y = (f.y + u.z) / s;
@@ -266,13 +266,13 @@ inline Quat Slerp(Quat a, Quat b, float t)
         return Nlerp(a, b, t);
 
     cosTheta = Clamp(cosTheta, -1.0f, 1.0f);
-    const float theta = std::acos(cosTheta);
-    const float sinTheta = std::sin(theta);
-    if (std::fabs(sinTheta) <= Epsilon)
+    const float theta = Acos(cosTheta);
+    const float sinTheta = Sin(theta);
+    if (Abs(sinTheta) <= Epsilon)
         return Nlerp(a, b, t);
 
-    const float weightA = std::sin((1.0f - t) * theta) / sinTheta;
-    const float weightB = std::sin(t * theta) / sinTheta;
+    const float weightA = Sin((1.0f - t) * theta) / sinTheta;
+    const float weightB = Sin(t * theta) / sinTheta;
     return Normalize(Quat{
         a.x * weightA + b.x * weightB,
         a.y * weightA + b.y * weightB,

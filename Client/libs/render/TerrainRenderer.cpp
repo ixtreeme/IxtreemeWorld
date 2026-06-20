@@ -77,7 +77,7 @@ float ApplyWaterEdgeCurve(float t, WaterConfig::EdgeFadeCurve curve)
     case WaterConfig::EdgeFadeCurve::Linear:
         return t;
     case WaterConfig::EdgeFadeCurve::Exponential:
-        return 1.0f - std::exp(-3.0f * t);
+        return 1.0f - xm::Exp(-3.0f * t);
     case WaterConfig::EdgeFadeCurve::Smooth:
     default:
         return t * t * (3.0f - 2.0f * t);
@@ -94,7 +94,7 @@ void ComputeWaterBodyDistanceField(const WaterBody& body,
     const std::uint32_t height = body.maskHeight;
     outDistanceField.assign(static_cast<std::size_t>(width) * height, 0.0f);
     const float searchCell = std::max(0.001f, std::min(cellX, cellZ));
-    const int searchRadius = std::max(1, static_cast<int>(std::ceil(maxDistanceMeters / searchCell)) + 1);
+    const int searchRadius = std::max(1, static_cast<int>(xm::Ceil(maxDistanceMeters / searchCell)) + 1);
     std::uint32_t waterCells = 0;
     std::uint32_t terrainCells = 0;
     float maxFoundDistance = 0.0f;
@@ -141,7 +141,7 @@ void ComputeWaterBodyDistanceField(const WaterBody& body,
 
             if (!std::isfinite(minDistSq) || minDistSq == std::numeric_limits<float>::max())
                 minDistSq = maxDistanceMeters * maxDistanceMeters;
-            const float distanceMeters = std::sqrt(minDistSq);
+            const float distanceMeters = xm::Sqrt(minDistSq);
             maxFoundDistance = std::max(maxFoundDistance, distanceMeters);
             outDistanceField[index] = isWater ? distanceMeters : -distanceMeters;
         }
@@ -161,8 +161,8 @@ float BilinearSampleWaterDistance(const std::vector<float>& distanceField,
         return 0.0f;
     const float sx = std::clamp(u * static_cast<float>(width) - 0.5f, 0.0f, static_cast<float>(width - 1u));
     const float sy = std::clamp(v * static_cast<float>(height) - 0.5f, 0.0f, static_cast<float>(height - 1u));
-    const std::uint32_t x0 = static_cast<std::uint32_t>(std::floor(sx));
-    const std::uint32_t y0 = static_cast<std::uint32_t>(std::floor(sy));
+    const std::uint32_t x0 = static_cast<std::uint32_t>(xm::Floor(sx));
+    const std::uint32_t y0 = static_cast<std::uint32_t>(xm::Floor(sy));
     const std::uint32_t x1 = std::min(width - 1u, x0 + 1u);
     const std::uint32_t y1 = std::min(height - 1u, y0 + 1u);
     const float tx = sx - static_cast<float>(x0);
@@ -217,23 +217,21 @@ void FillDynamicLightingUniforms(const LightingState& lighting, UniformBlockT& u
         SpotLight spot = lighting.spotLights[i];
         spot.outerConeDegrees = std::clamp(spot.outerConeDegrees, 1.0f, 90.0f);
         spot.innerConeDegrees = std::clamp(spot.innerConeDegrees, 1.0f, spot.outerConeDegrees);
-        const float pitch = spot.rotation[0];
-        const float yaw = spot.rotation[1];
-        const float cosPitch = std::cos(pitch);
+        const WorldVec3 spotDir = WorldForwardFromYawPitch(spot.rotation[1], spot.rotation[0]);
         auto& out = uniform.spotLights[i];
         out.position[0] = spot.position[0];
         out.position[1] = spot.position[1];
         out.position[2] = spot.position[2];
         out.position[3] = std::max(0.1f, spot.radius);
-        out.direction[0] = std::sin(yaw) * cosPitch;
-        out.direction[1] = std::sin(pitch);
-        out.direction[2] = std::cos(yaw) * cosPitch;
-        out.direction[3] = std::cos(xm::DegreesToRadians(spot.innerConeDegrees));
+        out.direction[0] = spotDir.x;
+        out.direction[1] = spotDir.y;
+        out.direction[2] = spotDir.z;
+        out.direction[3] = xm::Cos(xm::DegreesToRadians(spot.innerConeDegrees));
         const float intensity = spot.enabled ? std::max(0.0f, spot.intensity) : 0.0f;
         out.color[0] = std::max(0.0f, spot.r) * intensity;
         out.color[1] = std::max(0.0f, spot.g) * intensity;
         out.color[2] = std::max(0.0f, spot.b) * intensity;
-        out.color[3] = std::cos(xm::DegreesToRadians(spot.outerConeDegrees));
+        out.color[3] = xm::Cos(xm::DegreesToRadians(spot.outerConeDegrees));
         out.direction[3] = std::max(out.direction[3], out.color[3]);
     }
 }
@@ -752,12 +750,12 @@ std::vector<std::uint8_t> GenerateWaterNormalPixels(uint32_t width,
         {
             const float u = static_cast<float>(x) / static_cast<float>(width);
             const float v = static_cast<float>(y) / static_cast<float>(height);
-            const float h0 = std::sin((u * frequencyA + v * 0.35f) * pi * 2.0f);
-            const float h1 = std::cos((v * frequencyB - u * 0.28f) * pi * 2.0f);
-            const float dx = amplitude * (std::cos((u * frequencyA + v * 0.35f) * pi * 2.0f) * frequencyA -
-                std::sin((v * frequencyB - u * 0.28f) * pi * 2.0f) * 0.28f * frequencyB);
-            const float dz = amplitude * (std::cos((u * frequencyA + v * 0.35f) * pi * 2.0f) * 0.35f * frequencyA +
-                -std::sin((v * frequencyB - u * 0.28f) * pi * 2.0f) * frequencyB);
+            const float h0 = xm::Sin((u * frequencyA + v * 0.35f) * pi * 2.0f);
+            const float h1 = xm::Cos((v * frequencyB - u * 0.28f) * pi * 2.0f);
+            const float dx = amplitude * (xm::Cos((u * frequencyA + v * 0.35f) * pi * 2.0f) * frequencyA -
+                xm::Sin((v * frequencyB - u * 0.28f) * pi * 2.0f) * 0.28f * frequencyB);
+            const float dz = amplitude * (xm::Cos((u * frequencyA + v * 0.35f) * pi * 2.0f) * 0.35f * frequencyA +
+                -xm::Sin((v * frequencyB - u * 0.28f) * pi * 2.0f) * frequencyB);
             const float ripple = (h0 + h1) * 0.04f;
             WorldVec3 n = xm::Normalize(WorldVec3{-dx + ripple, 1.0f, -dz - ripple});
             const size_t offset = (static_cast<size_t>(y) * width + x) * 4u;
@@ -1004,13 +1002,13 @@ uint32_t FullMipCount(uint32_t width, uint32_t height)
 float SrgbToLinear(float value)
 {
     value = std::clamp(value, 0.0f, 1.0f);
-    return value <= 0.04045f ? value / 12.92f : std::pow((value + 0.055f) / 1.055f, 2.4f);
+    return value <= 0.04045f ? value / 12.92f : xm::Pow((value + 0.055f) / 1.055f, 2.4f);
 }
 
 float LinearToSrgb(float value)
 {
     value = std::clamp(value, 0.0f, 1.0f);
-    return value <= 0.0031308f ? value * 12.92f : 1.055f * std::pow(value, 1.0f / 2.4f) - 0.055f;
+    return value <= 0.0031308f ? value * 12.92f : 1.055f * xm::Pow(value, 1.0f / 2.4f) - 0.055f;
 }
 
 uint8_t QuantizeByte(float value)
@@ -1105,7 +1103,7 @@ ArrayMipUpload BuildRgbaArrayMipUpload(uint32_t width,
                     if (normalMap)
                     {
                         const float len2 = normal[0] * normal[0] + normal[1] * normal[1] + normal[2] * normal[2];
-                        const float invLen = len2 > 0.000001f ? 1.0f / std::sqrt(len2) : 1.0f;
+                        const float invLen = len2 > 0.000001f ? 1.0f / xm::Sqrt(len2) : 1.0f;
                         next[dst + 0] = QuantizeByte(normal[0] * invLen * 0.5f + 0.5f);
                         next[dst + 1] = QuantizeByte(normal[1] * invLen * 0.5f + 0.5f);
                         next[dst + 2] = QuantizeByte(normal[2] * invLen * 0.5f + 0.5f);
@@ -1297,7 +1295,7 @@ double EstimateAverageSlopeAxes(const std::vector<float>& heightCmGrid,
             const float dxDenom = static_cast<float>(std::max(1u, x1 - x0)) * cellScaleMeters;
             const float dhdx = (heightMeters(x1, z) - heightMeters(x0, z)) / std::max(dxDenom, 0.0001f);
             const float dhdz = (heightMeters(x, z1) - heightMeters(x, z0)) / std::max(dzDenom, 0.0001f);
-            const float normalY = 1.0f / std::sqrt(1.0f + dhdx * dhdx + dhdz * dhdz);
+            const float normalY = 1.0f / xm::Sqrt(1.0f + dhdx * dhdx + dhdz * dhdz);
             const float slope = 1.0f - std::clamp(normalY, 0.0f, 1.0f);
             const float blend = Smoothstep(slopeThreshold, slopeThreshold + slopeTransition, slope);
             axesTotal += 1.0 + 2.0 * static_cast<double>(blend);
@@ -2230,13 +2228,13 @@ void TerrainRenderer::SetWaterRefractionInputs(VkImageView colorView,
 
 void TerrainRenderer::UpdateShadowCascades(const WorldCamera& camera)
 {
-    const WorldVec3 forward = xm::Normalize(camera.target - camera.eye);
-    WorldVec3 right = xm::Normalize(xm::Cross({0.0f, 1.0f, 0.0f}, forward));
+    const WorldVec3 forward = WorldCameraForward(camera);
+    WorldVec3 right = WorldCameraRight(camera);
     if (xm::Dot(right, right) <= 0.0001f)
         right = {1.0f, 0.0f, 0.0f};
-    const WorldVec3 up = xm::Normalize(xm::Cross(forward, right));
+    const WorldVec3 up = WorldCameraUp(camera);
     const float aspect = 16.0f / 9.0f;
-    const float tanHalfFov = std::tan(xm::DegreesToRadians(45.0f) * 0.5f);
+    constexpr float tanHalfFov = 0.41421356237f;
     const float nearPlane = 0.1f;
     const float farPlane = 200.0f;
     constexpr float lambda = 0.7f;
@@ -2246,7 +2244,7 @@ void TerrainRenderer::UpdateShadowCascades(const WorldCamera& camera)
     for (uint32_t i = 1; i < kShadowCascadeCount; ++i)
     {
         const float p = static_cast<float>(i) / static_cast<float>(kShadowCascadeCount);
-        const float logSplit = nearPlane * std::pow(farPlane / nearPlane, p);
+        const float logSplit = nearPlane * xm::Pow(farPlane / nearPlane, p);
         const float uniformSplit = nearPlane + (farPlane - nearPlane) * p;
         splitPlanes[i] = uniformSplit * (1.0f - lambda) + logSplit * lambda;
     }
@@ -2255,11 +2253,7 @@ void TerrainRenderer::UpdateShadowCascades(const WorldCamera& camera)
     const DirectionalLight& sun = m_lightingState.directional;
     const float azimuthRadians = xm::DegreesToRadians(std::clamp(sun.azimuthDegrees, 0.0f, 360.0f));
     const float elevationRadians = xm::DegreesToRadians(std::clamp(sun.elevationDegrees, 0.0f, 90.0f));
-    const float cosElevation = std::cos(elevationRadians);
-    WorldVec3 sunDir = xm::Normalize(WorldVec3{
-        cosElevation * std::sin(azimuthRadians),
-        std::sin(elevationRadians),
-        cosElevation * std::cos(azimuthRadians)});
+    WorldVec3 sunDir = WorldDirectionFromAzimuthElevation(azimuthRadians, elevationRadians);
     if (xm::Dot(sunDir, sunDir) <= 0.0001f)
         sunDir = {0.0f, 1.0f, 0.0f};
 
@@ -2438,7 +2432,7 @@ const TerrainRenderer::WaterBodyGpu* TerrainRenderer::FindClosestWaterBody(const
     }
 
     if (outDistanceMeters)
-        *outDistanceMeters = closest ? std::sqrt(closestDistanceSq) : 0.0f;
+        *outDistanceMeters = closest ? xm::Sqrt(closestDistanceSq) : 0.0f;
     return closest;
 }
 
@@ -3193,7 +3187,7 @@ bool TerrainRenderer::SetSelectedWaterBodyHighlight(VulkanDevice& device, std::u
     };
     if (m_selectedWaterBodyId == selectedBody->id &&
         std::equal(std::begin(signature), std::end(signature), std::begin(m_selectedWaterBodySignature),
-            [](float a, float b) { return std::abs(a - b) < 0.001f; }))
+            [](float a, float b) { return xm::Abs(a - b) < 0.001f; }))
     {
         return true;
     }
@@ -3330,9 +3324,9 @@ bool TerrainRenderer::SetTriplanarSettings(bool enabled, float sharpness, float 
     const float clampedSlopeThreshold = std::clamp(slopeThreshold, 0.0f, 1.0f);
     const float clampedSlopeTransition = std::clamp(slopeTransition, 0.001f, 1.0f);
     const bool changed = m_sceneTerrain.triplanarEnabled != enabled ||
-        std::abs(m_sceneTerrain.triplanarSharpness - clampedSharpness) > 0.0001f ||
-        std::abs(m_sceneTerrain.triplanarSlopeThreshold - clampedSlopeThreshold) > 0.0001f ||
-        std::abs(m_sceneTerrain.triplanarSlopeTransition - clampedSlopeTransition) > 0.0001f;
+        xm::Abs(m_sceneTerrain.triplanarSharpness - clampedSharpness) > 0.0001f ||
+        xm::Abs(m_sceneTerrain.triplanarSlopeThreshold - clampedSlopeThreshold) > 0.0001f ||
+        xm::Abs(m_sceneTerrain.triplanarSlopeTransition - clampedSlopeTransition) > 0.0001f;
     m_sceneTerrain.triplanarEnabled = enabled;
     m_sceneTerrain.triplanarSharpness = clampedSharpness;
     m_sceneTerrain.triplanarSlopeThreshold = clampedSlopeThreshold;
@@ -4511,14 +4505,14 @@ void TerrainRenderer::ApplyLegacyHeightBrush(VulkanDevice& device, float sign, d
     const uint32_t chunkMaxY = std::min(chunkMinY + m_chunkSizeCells, m_heightGridHeight - 1u);
 
     const float radiusCells = m_editorBrushRadiusMeters / std::max(m_cellScaleMeters, 0.001f);
-    const uint32_t minX = std::max(chunkMinX, static_cast<uint32_t>(std::max(0.0f, std::floor(centerGridX - radiusCells))));
-    const uint32_t minY = std::max(chunkMinY, static_cast<uint32_t>(std::max(0.0f, std::floor(centerGridY - radiusCells))));
-    const uint32_t maxX = std::min(chunkMaxX, static_cast<uint32_t>(std::ceil(centerGridX + radiusCells)));
-    const uint32_t maxY = std::min(chunkMaxY, static_cast<uint32_t>(std::ceil(centerGridY + radiusCells)));
+    const uint32_t minX = std::max(chunkMinX, static_cast<uint32_t>(std::max(0.0f, xm::Floor(centerGridX - radiusCells))));
+    const uint32_t minY = std::max(chunkMinY, static_cast<uint32_t>(std::max(0.0f, xm::Floor(centerGridY - radiusCells))));
+    const uint32_t maxX = std::min(chunkMaxX, static_cast<uint32_t>(xm::Ceil(centerGridX + radiusCells)));
+    const uint32_t maxY = std::min(chunkMaxY, static_cast<uint32_t>(xm::Ceil(centerGridY + radiusCells)));
 
     const float deltaCenterCm =
         sign * m_editorBrushStrength * static_cast<float>(deltaSeconds) * 100.0f;
-    if (std::abs(deltaCenterCm) < 0.0001f)
+    if (xm::Abs(deltaCenterCm) < 0.0001f)
         return;
 
     void* mapped = nullptr;
@@ -4533,7 +4527,7 @@ void TerrainRenderer::ApplyLegacyHeightBrush(VulkanDevice& device, float sign, d
         {
             const float dx = (static_cast<float>(gx) - centerGridX) * m_cellScaleMeters;
             const float dy = (static_cast<float>(gy) - centerGridY) * m_cellScaleMeters;
-            const float dist = std::sqrt(dx * dx + dy * dy);
+            const float dist = xm::Sqrt(dx * dx + dy * dy);
             if (dist > m_editorBrushRadiusMeters)
                 continue;
 
@@ -4569,17 +4563,12 @@ bool TerrainRenderer::RaycastEditorBrush(const WorldCamera& camera,
         return false;
     }
 
-    const float aspect = static_cast<float>(viewportWidth) / static_cast<float>(viewportHeight);
-    const float tanHalfFov = std::tan(xm::DegreesToRadians(45.0f) * 0.5f);
-    const float ndcX = (static_cast<float>(m_editorCursorX) / static_cast<float>(viewportWidth)) * 2.0f - 1.0f;
-    const float ndcY = 1.0f - (static_cast<float>(m_editorCursorY) / static_cast<float>(viewportHeight)) * 2.0f;
-
-    const WorldVec3 forward = xm::Normalize(camera.target - camera.eye);
-    const WorldVec3 right = xm::Normalize(xm::Cross({0.0f, 1.0f, 0.0f}, forward));
-    const WorldVec3 up = xm::Cross(forward, right);
-    WorldVec3 rayDir = xm::Normalize(forward +
-        right * (ndcX * aspect * tanHalfFov) +
-        up * (ndcY * tanHalfFov));
+    WorldVec3 rayDir = WorldScreenRayDirection(
+        camera,
+        viewportWidth,
+        viewportHeight,
+        m_editorCursorX,
+        m_editorCursorY);
 
     const MovementBounds bounds = GetMovementBounds();
     if (!bounds.valid)
@@ -4803,10 +4792,10 @@ void TerrainRenderer::ApplyEditorBrush(VulkanDevice& device, double deltaSeconds
         const float centerSplatY = std::clamp(centerGridY * splatScaleY, 0.0f, static_cast<float>(m_splatHeight - 1u));
         const float radiusSplatX = std::max(radiusCells * splatScaleX, 1.0f);
         const float radiusSplatY = std::max(radiusCells * splatScaleY, 1.0f);
-        const uint32_t minX = static_cast<uint32_t>(std::max(0.0f, std::floor(centerSplatX - radiusSplatX)));
-        const uint32_t minY = static_cast<uint32_t>(std::max(0.0f, std::floor(centerSplatY - radiusSplatY)));
-        const uint32_t maxX = std::min(m_splatWidth - 1u, static_cast<uint32_t>(std::ceil(centerSplatX + radiusSplatX)));
-        const uint32_t maxY = std::min(m_splatHeight - 1u, static_cast<uint32_t>(std::ceil(centerSplatY + radiusSplatY)));
+        const uint32_t minX = static_cast<uint32_t>(std::max(0.0f, xm::Floor(centerSplatX - radiusSplatX)));
+        const uint32_t minY = static_cast<uint32_t>(std::max(0.0f, xm::Floor(centerSplatY - radiusSplatY)));
+        const uint32_t maxX = std::min(m_splatWidth - 1u, static_cast<uint32_t>(xm::Ceil(centerSplatX + radiusSplatX)));
+        const uint32_t maxY = std::min(m_splatHeight - 1u, static_cast<uint32_t>(xm::Ceil(centerSplatY + radiusSplatY)));
         bool changed = false;
         std::uint32_t changedCells = 0;
         std::unordered_set<std::uint32_t> touchedChunks;
@@ -4816,7 +4805,7 @@ void TerrainRenderer::ApplyEditorBrush(VulkanDevice& device, double deltaSeconds
             {
                 const float dx = (static_cast<float>(sx) - centerSplatX) / std::max(splatScaleX, 0.001f) * m_cellScaleMeters;
                 const float dy = (static_cast<float>(sy) - centerSplatY) / std::max(splatScaleY, 0.001f) * m_cellScaleMeters;
-                const float dist = std::sqrt(dx * dx + dy * dy);
+                const float dist = xm::Sqrt(dx * dx + dy * dy);
                 if (dist > m_editorBrushRadiusMeters)
                     continue;
 
@@ -4933,10 +4922,10 @@ void TerrainRenderer::ApplyEditorBrush(VulkanDevice& device, double deltaSeconds
     if (m_editorTool == MapEditorTool::Smooth)
         smoothSource = m_heightCmGrid;
 
-    const uint32_t minX = static_cast<uint32_t>(std::max(0.0f, std::floor(centerGridX - radiusCells)));
-    const uint32_t minY = static_cast<uint32_t>(std::max(0.0f, std::floor(centerGridY - radiusCells)));
-    const uint32_t maxX = std::min(m_heightGridWidth - 1u, static_cast<uint32_t>(std::ceil(centerGridX + radiusCells)));
-    const uint32_t maxY = std::min(m_heightGridHeight - 1u, static_cast<uint32_t>(std::ceil(centerGridY + radiusCells)));
+    const uint32_t minX = static_cast<uint32_t>(std::max(0.0f, xm::Floor(centerGridX - radiusCells)));
+    const uint32_t minY = static_cast<uint32_t>(std::max(0.0f, xm::Floor(centerGridY - radiusCells)));
+    const uint32_t maxX = std::min(m_heightGridWidth - 1u, static_cast<uint32_t>(xm::Ceil(centerGridX + radiusCells)));
+    const uint32_t maxY = std::min(m_heightGridHeight - 1u, static_cast<uint32_t>(xm::Ceil(centerGridY + radiusCells)));
     std::uint32_t changedHeights = 0;
     float maxHeightDeltaCm = 0.0f;
     std::unordered_set<std::uint32_t> touchedChunks;
@@ -4952,7 +4941,7 @@ void TerrainRenderer::ApplyEditorBrush(VulkanDevice& device, double deltaSeconds
         {
             const float dx = (static_cast<float>(gx) - centerGridX) * m_cellScaleMeters;
             const float dy = (static_cast<float>(gy) - centerGridY) * m_cellScaleMeters;
-            const float dist = std::sqrt(dx * dx + dy * dy);
+            const float dist = xm::Sqrt(dx * dx + dy * dy);
             if (dist > m_editorBrushRadiusMeters)
                 continue;
             const float t = 1.0f - dist / std::max(m_editorBrushRadiusMeters, 0.001f);
@@ -4995,9 +4984,9 @@ void TerrainRenderer::ApplyEditorBrush(VulkanDevice& device, double deltaSeconds
 
             newHeight = std::clamp(newHeight, -32768.0f, 32767.0f);
             const float heightDeltaCm = newHeight - m_heightCmGrid[index];
-            if (std::abs(heightDeltaCm) <= 0.001f)
+            if (xm::Abs(heightDeltaCm) <= 0.001f)
                 continue;
-            if (std::abs(heightDeltaCm) > std::abs(maxHeightDeltaCm))
+            if (xm::Abs(heightDeltaCm) > xm::Abs(maxHeightDeltaCm))
                 maxHeightDeltaCm = heightDeltaCm;
             RecordHeightUndo(index);
             m_heightCmGrid[index] = newHeight;
@@ -7753,13 +7742,13 @@ void TerrainRenderer::UpdateUniform(uint32_t frameIndex, const WorldCamera& came
     const AmbientLight& ambient = m_lightingState.ambient;
     const float azimuthRadians = xm::DegreesToRadians(std::clamp(directional.azimuthDegrees, 0.0f, 360.0f));
     const float elevationRadians = xm::DegreesToRadians(std::clamp(directional.elevationDegrees, 0.0f, 90.0f));
-    const float cosElevation = std::cos(elevationRadians);
+    const WorldVec3 sunDir = WorldDirectionFromAzimuthElevation(azimuthRadians, elevationRadians);
     const float sunEnabled = directional.enabled ? 1.0f : 0.0f;
     const float sunIntensity = std::max(0.0f, directional.intensity) * sunEnabled;
     const float ambientIntensity = std::max(0.0f, ambient.intensity);
-    uniform.sunDir[0] = cosElevation * std::sin(azimuthRadians);
-    uniform.sunDir[1] = std::sin(elevationRadians);
-    uniform.sunDir[2] = cosElevation * std::cos(azimuthRadians);
+    uniform.sunDir[0] = sunDir.x;
+    uniform.sunDir[1] = sunDir.y;
+    uniform.sunDir[2] = sunDir.z;
     uniform.sunDir[3] = 0.0f;
     uniform.sunColor[0] = std::max(0.0f, directional.r) * sunIntensity;
     uniform.sunColor[1] = std::max(0.0f, directional.g) * sunIntensity;
@@ -7925,13 +7914,13 @@ TerrainRenderer::WaterUniformBlock TerrainRenderer::BuildWaterUniform(const Worl
     const AmbientLight& ambient = m_lightingState.ambient;
     const float azimuthRadians = xm::DegreesToRadians(std::clamp(directional.azimuthDegrees, 0.0f, 360.0f));
     const float elevationRadians = xm::DegreesToRadians(std::clamp(directional.elevationDegrees, 0.0f, 90.0f));
-    const float cosElevation = std::cos(elevationRadians);
+    const WorldVec3 sunDir = WorldDirectionFromAzimuthElevation(azimuthRadians, elevationRadians);
     const float sunEnabled = directional.enabled ? 1.0f : 0.0f;
     const float sunIntensity = std::max(0.0f, directional.intensity) * sunEnabled;
     const float ambientIntensity = std::max(0.0f, ambient.intensity);
-    uniform.sunDir[0] = cosElevation * std::sin(azimuthRadians);
-    uniform.sunDir[1] = std::sin(elevationRadians);
-    uniform.sunDir[2] = cosElevation * std::cos(azimuthRadians);
+    uniform.sunDir[0] = sunDir.x;
+    uniform.sunDir[1] = sunDir.y;
+    uniform.sunDir[2] = sunDir.z;
     uniform.sunDir[3] = 0.0f;
     uniform.sunColor[0] = std::max(0.0f, directional.r) * sunIntensity;
     uniform.sunColor[1] = std::max(0.0f, directional.g) * sunIntensity;
@@ -8067,10 +8056,10 @@ void TerrainRenderer::UpdateWaterBodyUniform(uint32_t frameIndex,
         uniform.textureScroll[1] = material->scrollSpeedA[1];
         uniform.textureScroll[2] = material->scrollSpeedB[0];
         uniform.textureScroll[3] = material->scrollSpeedB[1];
-        const bool hasCustomScroll = std::abs(uniform.textureScroll[0]) > 0.00001f ||
-            std::abs(uniform.textureScroll[1]) > 0.00001f ||
-            std::abs(uniform.textureScroll[2]) > 0.00001f ||
-            std::abs(uniform.textureScroll[3]) > 0.00001f;
+        const bool hasCustomScroll = xm::Abs(uniform.textureScroll[0]) > 0.00001f ||
+            xm::Abs(uniform.textureScroll[1]) > 0.00001f ||
+            xm::Abs(uniform.textureScroll[2]) > 0.00001f ||
+            xm::Abs(uniform.textureScroll[3]) > 0.00001f;
         if (!hasCustomScroll)
         {
             uniform.textureScroll[0] = 0.03f;

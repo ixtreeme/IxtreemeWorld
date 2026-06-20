@@ -84,17 +84,17 @@ inline float LengthSquared(Vec4 v)
 
 inline float Length(Vec2 v)
 {
-    return std::sqrt(LengthSquared(v));
+    return Sqrt(LengthSquared(v));
 }
 
 inline float Length(Vec3 v)
 {
-    return std::sqrt(LengthSquared(v));
+    return Sqrt(LengthSquared(v));
 }
 
 inline float Length(Vec4 v)
 {
-    return std::sqrt(LengthSquared(v));
+    return Sqrt(LengthSquared(v));
 }
 
 inline float DistanceSquared(Vec2 a, Vec2 b)
@@ -305,7 +305,7 @@ inline Vec3 Refract(Vec3 direction, Vec3 normal, float eta)
     const float k = 1.0f - eta * eta * (1.0f - cosI * cosI);
     if (k < 0.0f)
         return {};
-    return d * eta - n * (eta * cosI + std::sqrt(k));
+    return d * eta - n * (eta * cosI + Sqrt(k));
 }
 
 inline Vec2 ClampLength(Vec2 v, float maxLength)
@@ -313,7 +313,7 @@ inline Vec2 ClampLength(Vec2 v, float maxLength)
     const float lengthSq = LengthSquared(v);
     if (lengthSq <= maxLength * maxLength || lengthSq <= Epsilon)
         return v;
-    return v * (maxLength / std::sqrt(lengthSq));
+    return v * (maxLength / Sqrt(lengthSq));
 }
 
 inline Vec3 ClampLength(Vec3 v, float maxLength)
@@ -321,7 +321,7 @@ inline Vec3 ClampLength(Vec3 v, float maxLength)
     const float lengthSq = LengthSquared(v);
     if (lengthSq <= maxLength * maxLength || lengthSq <= Epsilon)
         return v;
-    return v * (maxLength / std::sqrt(lengthSq));
+    return v * (maxLength / Sqrt(lengthSq));
 }
 
 inline float AngleBetweenRadians(Vec2 a, Vec2 b)
@@ -329,7 +329,7 @@ inline float AngleBetweenRadians(Vec2 a, Vec2 b)
     const float denom = Length(a) * Length(b);
     if (denom <= Epsilon)
         return 0.0f;
-    return std::acos(Clamp(Dot(a, b) / denom, -1.0f, 1.0f));
+    return Acos(Clamp(Dot(a, b) / denom, -1.0f, 1.0f));
 }
 
 inline float AngleBetweenRadians(Vec3 a, Vec3 b)
@@ -337,7 +337,7 @@ inline float AngleBetweenRadians(Vec3 a, Vec3 b)
     const float denom = Length(a) * Length(b);
     if (denom <= Epsilon)
         return 0.0f;
-    return std::acos(Clamp(Dot(a, b) / denom, -1.0f, 1.0f));
+    return Acos(Clamp(Dot(a, b) / denom, -1.0f, 1.0f));
 }
 
 inline float AngleBetweenDegrees(Vec2 a, Vec2 b)

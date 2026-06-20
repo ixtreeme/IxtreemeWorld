@@ -1,7 +1,5 @@
 #include "SelectionSystem.h"
 
-#include <cmath>
-
 namespace xm = ixtreeme::math;
 
 namespace
@@ -10,8 +8,7 @@ WorldVec3 SpotLightDirection(const SpotLight& spot)
 {
     const float pitch = spot.rotation[0];
     const float yaw = spot.rotation[1];
-    const float cosPitch = std::cos(pitch);
-    return xm::Normalize(WorldVec3{std::sin(yaw) * cosPitch, std::sin(pitch), std::cos(yaw) * cosPitch});
+    return WorldForwardFromYawPitch(yaw, pitch);
 }
 
 WorldVec3 SafePerpendicular(WorldVec3 direction)
@@ -44,9 +41,7 @@ void AddCircle(std::vector<SelectionOutlineRenderer::Line>& lines,
     for (int i = 0; i < segments; ++i)
     {
         const float angle = (static_cast<float>(i) / static_cast<float>(segments)) * xm::TwoPi;
-        const WorldVec3 point = center +
-            axisA * (std::cos(angle) * radius) +
-            axisB * (std::sin(angle) * radius);
+        const WorldVec3 point = WorldCirclePoint(center, axisA, axisB, radius, angle);
         if (!hasPrevious)
             first = point;
         else
@@ -92,17 +87,17 @@ HierarchyEntityType ToHierarchyEntityType(SelectedEditorObjectType type)
 
 WorldVec3 SelectionCameraForward(const WorldCamera& camera)
 {
-    return xm::Normalize(camera.target - camera.eye);
+    return WorldCameraForward(camera);
 }
 
 WorldVec3 SelectionCameraRight(const WorldCamera& camera)
 {
-    return xm::Normalize(xm::Cross({0.0f, 1.0f, 0.0f}, SelectionCameraForward(camera)));
+    return WorldCameraRight(camera);
 }
 
 WorldVec3 SelectionCameraUp(const WorldCamera& camera)
 {
-    return xm::Normalize(xm::Cross(SelectionCameraForward(camera), SelectionCameraRight(camera)));
+    return WorldCameraUp(camera);
 }
 
 WorldVec3 SelectionScreenRayDirection(const WorldCamera& camera,
@@ -111,14 +106,7 @@ WorldVec3 SelectionScreenRayDirection(const WorldCamera& camera,
                                       int mouseX,
                                       int mouseY)
 {
-    const float aspect = height != 0 ? static_cast<float>(width) / static_cast<float>(height) : 1.0f;
-    const float ndcX = width != 0 ? (2.0f * static_cast<float>(mouseX) / static_cast<float>(width)) - 1.0f : 0.0f;
-    const float ndcY = height != 0 ? 1.0f - (2.0f * static_cast<float>(mouseY) / static_cast<float>(height)) : 0.0f;
-    constexpr float kTanHalfFov = 0.41421356237f;
-    return xm::Normalize(
-        SelectionCameraForward(camera) +
-        SelectionCameraRight(camera) * (ndcX * aspect * kTanHalfFov) +
-        SelectionCameraUp(camera) * (ndcY * kTanHalfFov));
+    return WorldScreenRayDirection(camera, width, height, mouseX, mouseY);
 }
 
 std::optional<std::uint32_t> PickWaterBody(const std::vector<WaterBody>& bodies,
@@ -142,7 +130,7 @@ std::optional<std::uint32_t> PickWaterBody(const std::vector<WaterBody>& bodies,
         }
 
         const float denom = rayDir.y;
-        if (std::abs(denom) < 0.0001f)
+        if (xm::Abs(denom) < 0.0001f)
             continue;
         const float t = (body.waterLevelY - camera.eye.y) / denom;
         if (t <= 0.0f || t >= bestT)
@@ -191,9 +179,7 @@ std::vector<SelectionOutlineRenderer::Line> BuildSelectionOutlineLines(
         for (int i = 0; i < 32; ++i)
         {
             const float angle = (static_cast<float>(i) / 32.0f) * xm::TwoPi;
-            const WorldVec3 point = center +
-                right * (std::cos(angle) * radius) +
-                up * (std::sin(angle) * radius);
+            const WorldVec3 point = WorldCirclePoint(center, right, up, radius, angle);
             if (!hasPrevious)
                 first = point;
             else
@@ -316,15 +302,13 @@ std::vector<SelectionOutlineRenderer::Line> BuildEditorLightShapeLines(
         const WorldVec3 up = xm::Normalize(xm::Cross(direction, right));
         const float range = std::max(0.25f, light.radius);
         const float outerRadians = xm::DegreesToRadians(std::clamp(light.outerConeDegrees, 1.0f, 90.0f));
-        const float baseRadius = std::tan(outerRadians) * range;
+        const float baseRadius = xm::Tan(outerRadians) * range;
         const WorldVec3 baseCenter = apex + direction * range;
         AddCircle(lines, baseCenter, right, up, baseRadius, color, 32);
         for (int i = 0; i < 4; ++i)
         {
             const float angle = (static_cast<float>(i) / 4.0f) * xm::TwoPi + xm::Pi * 0.25f;
-            const WorldVec3 rim = baseCenter +
-                right * (std::cos(angle) * baseRadius) +
-                up * (std::sin(angle) * baseRadius);
+            const WorldVec3 rim = WorldCirclePoint(baseCenter, right, up, baseRadius, angle);
             AddLine(lines, apex, rim, color);
         }
         const float iconRadius = std::clamp(range * 0.035f, 0.20f, 0.75f);

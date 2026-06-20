@@ -208,7 +208,7 @@ inline bool Overlaps(Sphere sphere, Aabb box)
 inline bool IntersectRayPlane(Ray ray, Plane plane, float& distance)
 {
     const float denom = Dot(plane.normal, ray.direction);
-    if (std::fabs(denom) <= Epsilon)
+    if (Abs(denom) <= Epsilon)
         return false;
 
     distance = -SignedDistance(plane, ray.origin) / denom;
@@ -222,10 +222,10 @@ inline bool IntersectRaySphere(Ray ray, Sphere sphere, float& distance)
     const float b = 2.0f * Dot(oc, ray.direction);
     const float c = Dot(oc, oc) - sphere.radius * sphere.radius;
     const float discriminant = b * b - 4.0f * a * c;
-    if (discriminant < 0.0f || std::fabs(a) <= Epsilon)
+    if (discriminant < 0.0f || Abs(a) <= Epsilon)
         return false;
 
-    const float sqrtDisc = std::sqrt(discriminant);
+    const float sqrtDisc = Sqrt(discriminant);
     const float invDenom = 1.0f / (2.0f * a);
     const float t0 = (-b - sqrtDisc) * invDenom;
     const float t1 = (-b + sqrtDisc) * invDenom;
@@ -254,7 +254,7 @@ inline bool IntersectRayAabb(Ray ray, Aabb box, float& distanceMin, float& dista
         const float minValue = box.min[axis];
         const float maxValue = box.max[axis];
 
-        if (std::fabs(direction) <= Epsilon)
+        if (Abs(direction) <= Epsilon)
         {
             if (origin < minValue || origin > maxValue)
                 return false;
@@ -295,7 +295,7 @@ inline Vec3 Barycentric(Vec3 point, Vec3 a, Vec3 b, Vec3 c)
     const float d20 = Dot(v2, v0);
     const float d21 = Dot(v2, v1);
     const float denom = d00 * d11 - d01 * d01;
-    if (std::fabs(denom) <= Epsilon)
+    if (Abs(denom) <= Epsilon)
         return {};
     const float v = (d11 * d20 - d01 * d21) / denom;
     const float w = (d00 * d21 - d01 * d20) / denom;
@@ -321,7 +321,7 @@ inline bool IntersectRayTriangle(Ray ray, Vec3 a, Vec3 b, Vec3 c, RaycastHit& hi
         if (det <= Epsilon)
             return false;
     }
-    else if (std::fabs(det) <= Epsilon)
+    else if (Abs(det) <= Epsilon)
     {
         return false;
     }

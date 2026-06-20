@@ -77,7 +77,7 @@ inline float SrgbToLinearChannel(float value)
     value = Saturate(value);
     if (value <= 0.04045f)
         return value / 12.92f;
-    return std::pow((value + 0.055f) / 1.055f, 2.4f);
+    return Pow((value + 0.055f) / 1.055f, 2.4f);
 }
 
 inline float LinearToSrgbChannel(float value)
@@ -85,7 +85,7 @@ inline float LinearToSrgbChannel(float value)
     value = Saturate(value);
     if (value <= 0.0031308f)
         return value * 12.92f;
-    return 1.055f * std::pow(value, 1.0f / 2.4f) - 0.055f;
+    return 1.055f * Pow(value, 1.0f / 2.4f) - 0.055f;
 }
 
 inline Color SrgbToLinear(Color color)
@@ -155,7 +155,7 @@ inline Color HsvToRgb(float hue, float saturation, float value, float alpha = 1.
     value = Saturate(value);
 
     const float h = hue * 6.0f;
-    const int sector = static_cast<int>(std::floor(h));
+    const int sector = static_cast<int>(Floor(h));
     const float f = h - static_cast<float>(sector);
     const float p = value * (1.0f - saturation);
     const float q = value * (1.0f - saturation * f);

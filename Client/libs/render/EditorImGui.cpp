@@ -96,7 +96,7 @@ ImGuizmo::MODE ToImGuizmoMode(MapEditorGizmoOperation operation)
 WorldMat4 ImGuizmoPerspective(float fovYRadians, float aspect, float zNear, float zFar)
 {
     WorldMat4 projection = WorldPerspective(fovYRadians, aspect, zNear, zFar);
-    projection.m[5] = std::fabs(projection.m[5]);
+    projection.m[5] = ixtreeme::math::Abs(projection.m[5]);
     return projection;
 }
 
@@ -486,7 +486,7 @@ ImVec4 ColorU8(int r, int g, int b, int a = 255)
 {
     const auto toLinear = [](int value) {
         const float srgb = static_cast<float>(value) / 255.0f;
-        return srgb <= 0.04045f ? srgb / 12.92f : std::pow((srgb + 0.055f) / 1.055f, 2.4f);
+        return srgb <= 0.04045f ? srgb / 12.92f : ixtreeme::math::Pow((srgb + 0.055f) / 1.055f, 2.4f);
     };
     return ImVec4(
         toLinear(r),
@@ -2700,8 +2700,8 @@ InputEvent EditorImGui::MapInputToSceneView(const InputEvent& event) const
     {
         const float u = std::clamp((static_cast<float>(event.x) - diag.sceneViewMin[0]) / diag.sceneViewSize[0], 0.0f, 1.0f);
         const float v = std::clamp((static_cast<float>(event.y) - diag.sceneViewMin[1]) / diag.sceneViewSize[1], 0.0f, 1.0f);
-        mapped.x = static_cast<int>(std::round(u * static_cast<float>(diag.sceneViewExtent[0] - 1u)));
-        mapped.y = static_cast<int>(std::round(v * static_cast<float>(diag.sceneViewExtent[1] - 1u)));
+        mapped.x = static_cast<int>(ixtreeme::math::Round(u * static_cast<float>(diag.sceneViewExtent[0] - 1u)));
+        mapped.y = static_cast<int>(ixtreeme::math::Round(v * static_cast<float>(diag.sceneViewExtent[1] - 1u)));
         break;
     }
     default:

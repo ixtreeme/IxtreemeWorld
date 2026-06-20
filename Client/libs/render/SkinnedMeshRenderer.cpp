@@ -149,12 +149,12 @@ void FillLightingUniform(const LightingState& lighting, UniformBlock& uniform)
     const AmbientLight& ambient = lighting.ambient;
     const float azimuthRadians = xm::DegreesToRadians(std::clamp(directional.azimuthDegrees, 0.0f, 360.0f));
     const float elevationRadians = xm::DegreesToRadians(std::clamp(directional.elevationDegrees, 0.0f, 90.0f));
-    const float cosElevation = std::cos(elevationRadians);
+    const WorldVec3 sunDir = WorldDirectionFromAzimuthElevation(azimuthRadians, elevationRadians);
     const float sunIntensity = std::max(0.0f, directional.intensity) * (directional.enabled ? 1.0f : 0.0f);
     const float ambientIntensity = std::max(0.0f, ambient.intensity);
-    uniform.sunDir[0] = cosElevation * std::sin(azimuthRadians);
-    uniform.sunDir[1] = std::sin(elevationRadians);
-    uniform.sunDir[2] = cosElevation * std::cos(azimuthRadians);
+    uniform.sunDir[0] = sunDir.x;
+    uniform.sunDir[1] = sunDir.y;
+    uniform.sunDir[2] = sunDir.z;
     uniform.sunDir[3] = 0.0f;
     uniform.sunColor[0] = std::max(0.0f, directional.r) * sunIntensity;
     uniform.sunColor[1] = std::max(0.0f, directional.g) * sunIntensity;
@@ -187,23 +187,21 @@ void FillLightingUniform(const LightingState& lighting, UniformBlock& uniform)
         SpotLight spot = lighting.spotLights[i];
         spot.outerConeDegrees = std::clamp(spot.outerConeDegrees, 1.0f, 90.0f);
         spot.innerConeDegrees = std::clamp(spot.innerConeDegrees, 1.0f, spot.outerConeDegrees);
-        const float pitch = spot.rotation[0];
-        const float yaw = spot.rotation[1];
-        const float cosPitch = std::cos(pitch);
+        const WorldVec3 spotDir = WorldForwardFromYawPitch(spot.rotation[1], spot.rotation[0]);
         auto& out = uniform.spotLights[i];
         out.position[0] = spot.position[0];
         out.position[1] = spot.position[1];
         out.position[2] = spot.position[2];
         out.position[3] = std::max(0.1f, spot.radius);
-        out.direction[0] = std::sin(yaw) * cosPitch;
-        out.direction[1] = std::sin(pitch);
-        out.direction[2] = std::cos(yaw) * cosPitch;
-        out.direction[3] = std::cos(xm::DegreesToRadians(spot.innerConeDegrees));
+        out.direction[0] = spotDir.x;
+        out.direction[1] = spotDir.y;
+        out.direction[2] = spotDir.z;
+        out.direction[3] = xm::Cos(xm::DegreesToRadians(spot.innerConeDegrees));
         const float intensity = spot.enabled ? std::max(0.0f, spot.intensity) : 0.0f;
         out.color[0] = std::max(0.0f, spot.r) * intensity;
         out.color[1] = std::max(0.0f, spot.g) * intensity;
         out.color[2] = std::max(0.0f, spot.b) * intensity;
-        out.color[3] = std::cos(xm::DegreesToRadians(spot.outerConeDegrees));
+        out.color[3] = xm::Cos(xm::DegreesToRadians(spot.outerConeDegrees));
         out.direction[3] = std::max(out.direction[3], out.color[3]);
     }
 }
@@ -971,33 +969,9 @@ VkRect2D PreviewRect(VkExtent2D extent)
     return rect;
 }
 
-float Length3(const float v[3])
-{
-    return std::sqrt(v[0] * v[0] + v[1] * v[1] + v[2] * v[2]);
-}
-
 void Normalize3(float v[3])
 {
-    const float len = Length3(v);
-    if (len <= 0.000001f)
-        return;
-    v[0] /= len;
-    v[1] /= len;
-    v[2] /= len;
-}
-
-void TransformPointRowVector(const float* matrix, const float in[3], float out[3])
-{
-    out[0] = in[0] * matrix[0] + in[1] * matrix[4] + in[2] * matrix[8] + matrix[12];
-    out[1] = in[0] * matrix[1] + in[1] * matrix[5] + in[2] * matrix[9] + matrix[13];
-    out[2] = in[0] * matrix[2] + in[1] * matrix[6] + in[2] * matrix[10] + matrix[14];
-}
-
-void TransformVectorRowVector(const float* matrix, const float in[3], float out[3])
-{
-    out[0] = in[0] * matrix[0] + in[1] * matrix[4] + in[2] * matrix[8];
-    out[1] = in[0] * matrix[1] + in[1] * matrix[5] + in[2] * matrix[9];
-    out[2] = in[0] * matrix[2] + in[1] * matrix[6] + in[2] * matrix[10];
+    xm::interop::NormalizeFloat3(v);
 }
 
 void SkinVertex(const SkinnedMeshRenderer::SourceVertex& source,
@@ -1038,8 +1012,8 @@ void SkinVertex(const SkinnedMeshRenderer::SourceVertex& source,
 
         float skinnedPosition[3]{};
         float skinnedNormal[3]{};
-        TransformPointRowVector(matrix, source.position, skinnedPosition);
-        TransformVectorRowVector(matrix, source.normal, skinnedNormal);
+        xm::interop::TransformPointRowVector(matrix, source.position, skinnedPosition);
+        xm::interop::TransformVectorRowVector(matrix, source.normal, skinnedNormal);
 
         for (int axis = 0; axis < 3; ++axis)
         {
@@ -1087,32 +1061,12 @@ xm::Mat4 IdentityPaletteMatrix()
 
 xm::Mat4 ToRowMajorMatrix(const ozz::math::Float4x4& matrix)
 {
-    float columns[4][4]{};
-    for (int col = 0; col < 4; ++col)
-        ozz::math::StorePtrU(matrix.cols[col], columns[col]);
-
-    xm::Mat4 out{};
-    for (int row = 0; row < 4; ++row)
-    {
-        for (int col = 0; col < 4; ++col)
-            out.m[row * 4 + col] = columns[col][row];
-    }
-    return out;
+    return xm::interop::FromOzzFloat4x4RowMajor(matrix);
 }
 
 xm::Mat4 ToRowVectorPaletteMatrix(const ozz::math::Float4x4& matrix)
 {
-    float columns[4][4]{};
-    for (int col = 0; col < 4; ++col)
-        ozz::math::StorePtrU(matrix.cols[col], columns[col]);
-
-    xm::Mat4 out{};
-    for (int row = 0; row < 4; ++row)
-    {
-        for (int col = 0; col < 4; ++col)
-            out.m[row * 4 + col] = columns[row][col];
-    }
-    return out;
+    return xm::interop::FromOzzFloat4x4RowVectorPalette(matrix);
 }
 
 ozz::math::Float4x4 ToOzzMatrix(const fastgltf::math::fmat4x4& matrix)
@@ -2290,8 +2244,8 @@ bool SkinnedMeshRenderer::VerifyComputeSkin(VulkanDevice& device)
         float vertexNormalDelta = 0.0f;
         for (int axis = 0; axis < 3; ++axis)
         {
-            vertexPosDelta = std::max(vertexPosDelta, std::fabs(cpuVertices[i].position[axis] - gpuVertices[i].position[axis]));
-            vertexNormalDelta = std::max(vertexNormalDelta, std::fabs(cpuVertices[i].normal[axis] - gpuVertices[i].normal[axis]));
+            vertexPosDelta = std::max(vertexPosDelta, xm::Abs(cpuVertices[i].position[axis] - gpuVertices[i].position[axis]));
+            vertexNormalDelta = std::max(vertexNormalDelta, xm::Abs(cpuVertices[i].normal[axis] - gpuVertices[i].normal[axis]));
         }
         maxPosDelta = std::max(maxPosDelta, vertexPosDelta);
         maxNormalDelta = std::max(maxNormalDelta, vertexNormalDelta);

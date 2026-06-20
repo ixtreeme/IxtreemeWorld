@@ -4,6 +4,7 @@
 #include "Common.h"
 #include "Debug.h"
 #include "MaterialAssetManager.h"
+#include "math/IXMath.h"
 
 #if defined(_WIN32)
 #ifndef WIN32_LEAN_AND_MEAN
@@ -2267,7 +2268,7 @@ bool AssetLibrary::ReconcileFilesystem(std::string& error)
                         changed = true;
                     }
                     if (!alphaMode.empty() && (entry.material.alphaMode != alphaMode ||
-                            std::fabs(entry.material.alphaCutoff - alphaCutoff) > 0.0001f))
+                            ixtreeme::math::Abs(entry.material.alphaCutoff - alphaCutoff) > 0.0001f))
                     {
                         entry.material.alphaMode = alphaMode;
                         entry.material.alphaCutoff = alphaCutoff;

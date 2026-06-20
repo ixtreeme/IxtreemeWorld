@@ -1,5 +1,6 @@
 #pragma once
 
+#include "Scalar.h"
 #include "Types.h"
 
 #include <math.h>
@@ -115,7 +116,7 @@ inline Float4 Normalize3(Float4 v)
     const float lengthSq = Dot3(v, v);
     if (lengthSq <= 0.000001f)
         return _mm_setzero_ps();
-    return _mm_mul_ps(v, _mm_set1_ps(1.0f / std::sqrt(lengthSq)));
+    return _mm_mul_ps(v, _mm_set1_ps(1.0f / ixtreeme::math::Sqrt(lengthSq)));
 }
 
 inline Float4 Normalize4(Float4 v)
@@ -123,7 +124,7 @@ inline Float4 Normalize4(Float4 v)
     const float lengthSq = Dot4(v, v);
     if (lengthSq <= 0.000001f)
         return _mm_setzero_ps();
-    return _mm_mul_ps(v, _mm_set1_ps(1.0f / std::sqrt(lengthSq)));
+    return _mm_mul_ps(v, _mm_set1_ps(1.0f / ixtreeme::math::Sqrt(lengthSq)));
 }
 
 inline Float4 TransformVec4(const Mat4& m, Float4 v)
@@ -180,8 +181,8 @@ inline Float4 Mul(Float4 a, Float4 b) { return {a.x * b.x, a.y * b.y, a.z * b.z,
 inline Float4 Div(Float4 a, Float4 b) { return {a.x / b.x, a.y / b.y, a.z / b.z, a.w / b.w}; }
 inline Float4 Min(Float4 a, Float4 b) { return {a.x < b.x ? a.x : b.x, a.y < b.y ? a.y : b.y, a.z < b.z ? a.z : b.z, a.w < b.w ? a.w : b.w}; }
 inline Float4 Max(Float4 a, Float4 b) { return {a.x > b.x ? a.x : b.x, a.y > b.y ? a.y : b.y, a.z > b.z ? a.z : b.z, a.w > b.w ? a.w : b.w}; }
-inline Float4 Abs(Float4 v) { return {std::fabs(v.x), std::fabs(v.y), std::fabs(v.z), std::fabs(v.w)}; }
-inline Float4 Sqrt(Float4 v) { return {std::sqrt(v.x), std::sqrt(v.y), std::sqrt(v.z), std::sqrt(v.w)}; }
+inline Float4 Abs(Float4 v) { return {ixtreeme::math::Abs(v.x), ixtreeme::math::Abs(v.y), ixtreeme::math::Abs(v.z), ixtreeme::math::Abs(v.w)}; }
+inline Float4 Sqrt(Float4 v) { return {ixtreeme::math::Sqrt(v.x), ixtreeme::math::Sqrt(v.y), ixtreeme::math::Sqrt(v.z), ixtreeme::math::Sqrt(v.w)}; }
 inline float GetX(Float4 v) { return v.x; }
 inline float Dot3(Float4 a, Float4 b) { return a.x * b.x + a.y * b.y + a.z * b.z; }
 inline float Dot4(Float4 a, Float4 b) { return a.x * b.x + a.y * b.y + a.z * b.z + a.w * b.w; }
@@ -195,7 +196,7 @@ inline Float4 Normalize3(Float4 v)
     const float lengthSq = Dot3(v, v);
     if (lengthSq <= 0.000001f)
         return {};
-    const float invLength = 1.0f / std::sqrt(lengthSq);
+    const float invLength = 1.0f / ixtreeme::math::Sqrt(lengthSq);
     return {v.x * invLength, v.y * invLength, v.z * invLength, v.w * invLength};
 }
 
@@ -204,7 +205,7 @@ inline Float4 Normalize4(Float4 v)
     const float lengthSq = Dot4(v, v);
     if (lengthSq <= 0.000001f)
         return {};
-    const float invLength = 1.0f / std::sqrt(lengthSq);
+    const float invLength = 1.0f / ixtreeme::math::Sqrt(lengthSq);
     return {v.x * invLength, v.y * invLength, v.z * invLength, v.w * invLength};
 }
 

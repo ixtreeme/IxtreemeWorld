@@ -5,6 +5,8 @@ add_library(IXEngineMath STATIC
     Geometry.h
     Interpolation.h
     IXMath.h
+    MathInterop.h
+    MathSelfCheck.h
     Matrix.h
     Noise.h
     Quaternion.h

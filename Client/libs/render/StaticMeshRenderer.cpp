@@ -225,12 +225,12 @@ void FillLightingUniform(const LightingState& lighting, UniformBlock& uniform)
     const AmbientLight& ambient = lighting.ambient;
     const float azimuthRadians = xm::DegreesToRadians(std::clamp(directional.azimuthDegrees, 0.0f, 360.0f));
     const float elevationRadians = xm::DegreesToRadians(std::clamp(directional.elevationDegrees, 0.0f, 90.0f));
-    const float cosElevation = std::cos(elevationRadians);
+    const WorldVec3 sunDir = WorldDirectionFromAzimuthElevation(azimuthRadians, elevationRadians);
     const float sunIntensity = std::max(0.0f, directional.intensity) * (directional.enabled ? 1.0f : 0.0f);
     const float ambientIntensity = std::max(0.0f, ambient.intensity);
-    uniform.sunDir[0] = cosElevation * std::sin(azimuthRadians);
-    uniform.sunDir[1] = std::sin(elevationRadians);
-    uniform.sunDir[2] = cosElevation * std::cos(azimuthRadians);
+    uniform.sunDir[0] = sunDir.x;
+    uniform.sunDir[1] = sunDir.y;
+    uniform.sunDir[2] = sunDir.z;
     uniform.sunDir[3] = 0.0f;
     uniform.sunColor[0] = std::max(0.0f, directional.r) * sunIntensity;
     uniform.sunColor[1] = std::max(0.0f, directional.g) * sunIntensity;
@@ -263,23 +263,21 @@ void FillLightingUniform(const LightingState& lighting, UniformBlock& uniform)
         SpotLight spot = lighting.spotLights[i];
         spot.outerConeDegrees = std::clamp(spot.outerConeDegrees, 1.0f, 90.0f);
         spot.innerConeDegrees = std::clamp(spot.innerConeDegrees, 1.0f, spot.outerConeDegrees);
-        const float pitch = spot.rotation[0];
-        const float yaw = spot.rotation[1];
-        const float cosPitch = std::cos(pitch);
+        const WorldVec3 spotDir = WorldForwardFromYawPitch(spot.rotation[1], spot.rotation[0]);
         auto& out = uniform.spotLights[i];
         out.position[0] = spot.position[0];
         out.position[1] = spot.position[1];
         out.position[2] = spot.position[2];
         out.position[3] = std::max(0.1f, spot.radius);
-        out.direction[0] = std::sin(yaw) * cosPitch;
-        out.direction[1] = std::sin(pitch);
-        out.direction[2] = std::cos(yaw) * cosPitch;
-        out.direction[3] = std::cos(xm::DegreesToRadians(spot.innerConeDegrees));
+        out.direction[0] = spotDir.x;
+        out.direction[1] = spotDir.y;
+        out.direction[2] = spotDir.z;
+        out.direction[3] = xm::Cos(xm::DegreesToRadians(spot.innerConeDegrees));
         const float intensity = spot.enabled ? std::max(0.0f, spot.intensity) : 0.0f;
         out.color[0] = std::max(0.0f, spot.r) * intensity;
         out.color[1] = std::max(0.0f, spot.g) * intensity;
         out.color[2] = std::max(0.0f, spot.b) * intensity;
-        out.color[3] = std::cos(xm::DegreesToRadians(spot.outerConeDegrees));
+        out.color[3] = xm::Cos(xm::DegreesToRadians(spot.outerConeDegrees));
         out.direction[3] = std::max(out.direction[3], out.color[3]);
     }
 }
@@ -1724,15 +1722,15 @@ bool StaticMeshRenderer::LoadBuiltinPrimitiveMesh(const std::string& modelPath)
         {
             const float v = static_cast<float>(y) / static_cast<float>(rings);
             const float theta = v * xm::Pi;
-            const float sinTheta = std::sin(theta);
-            const float cosTheta = std::cos(theta);
+            const float sinTheta = xm::Sin(theta);
+            const float cosTheta = xm::Cos(theta);
             for (std::uint32_t x = 0; x <= segments; ++x)
             {
                 const float u = static_cast<float>(x) / static_cast<float>(segments);
                 const float phi = u * xm::TwoPi;
-                const float nx = std::cos(phi) * sinTheta;
+                const float nx = xm::Cos(phi) * sinTheta;
                 const float ny = cosTheta;
-                const float nz = std::sin(phi) * sinTheta;
+                const float nz = xm::Sin(phi) * sinTheta;
                 addVertex(nx * radius, ny * radius, nz * radius, nx, ny, nz, u, v);
             }
         }
@@ -1762,12 +1760,12 @@ bool StaticMeshRenderer::LoadBuiltinPrimitiveMesh(const std::string& modelPath)
             {
                 const float u = static_cast<float>(x) / static_cast<float>(segments);
                 const float phi = u * xm::TwoPi;
-                const float px = std::cos(phi) * ringRadius;
-                const float pz = std::sin(phi) * ringRadius;
+                const float px = xm::Cos(phi) * ringRadius;
+                const float pz = xm::Sin(phi) * ringRadius;
                 float nx = px;
                 float ny = y - normalCenterY;
                 float nz = pz;
-                const float len = std::max(0.0001f, std::sqrt(nx * nx + ny * ny + nz * nz));
+                const float len = std::max(0.0001f, xm::Sqrt(nx * nx + ny * ny + nz * nz));
                 nx /= len;
                 ny /= len;
                 nz /= len;
@@ -1778,14 +1776,14 @@ bool StaticMeshRenderer::LoadBuiltinPrimitiveMesh(const std::string& modelPath)
         {
             const float t = static_cast<float>(ring) / static_cast<float>(hemiRings);
             const float angle = t * xm::HalfPi;
-            addRing(halfCylinder + std::cos(angle) * radius, std::sin(angle) * radius, halfCylinder, t * 0.25f);
+            addRing(halfCylinder + xm::Cos(angle) * radius, xm::Sin(angle) * radius, halfCylinder, t * 0.25f);
         }
         addRing(-halfCylinder, radius, -halfCylinder, 0.75f);
         for (std::uint32_t ring = 1; ring <= hemiRings; ++ring)
         {
             const float t = static_cast<float>(ring) / static_cast<float>(hemiRings);
             const float angle = xm::HalfPi + t * xm::HalfPi;
-            addRing(-halfCylinder + std::cos(angle) * radius, std::sin(angle) * radius, -halfCylinder, 0.75f + t * 0.25f);
+            addRing(-halfCylinder + xm::Cos(angle) * radius, xm::Sin(angle) * radius, -halfCylinder, 0.75f + t * 0.25f);
         }
         const std::uint32_t stride = segments + 1u;
         for (std::size_t ring = 0; ring + 1u < ringStarts.size(); ++ring)

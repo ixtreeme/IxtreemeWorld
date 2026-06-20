@@ -1,6 +1,7 @@
 #include "TreeTexturePalette.h"
 
 #include "Debug.h"
+#include "math/IXMath.h"
 
 #include <algorithm>
 #include <array>
@@ -17,6 +18,8 @@ namespace tree_tool
 {
 namespace
 {
+namespace xm = ixtreeme::math;
+
 struct PaletteSpec
 {
     const char* label;
@@ -98,17 +101,17 @@ float SmoothStep(float edge0, float edge1, float x)
 
 float LeafSilhouette(const char* label, int variant, float x, float y)
 {
-    const float bend = 0.08f * std::sin((static_cast<float>(variant) + 1.0f) * 1.7f);
+    const float bend = 0.08f * xm::Sin((static_cast<float>(variant) + 1.0f) * 1.7f);
     x += bend * y * y;
-    const float absY = std::fabs(y);
-    const float vein = std::fabs(x);
+    const float absY = xm::Abs(y);
+    const float vein = xm::Abs(x);
 
     float width = 0.0f;
     if (std::strcmp(label, "Pine") == 0)
     {
-        const float centerNeedle = std::max(0.0f, 1.0f - std::fabs(x) / 0.07f) * std::max(0.0f, 1.0f - absY / 0.88f);
-        const float sideNeedleA = std::max(0.0f, 1.0f - std::fabs(x - 0.16f * y) / 0.055f) * std::max(0.0f, 1.0f - absY / 0.78f);
-        const float sideNeedleB = std::max(0.0f, 1.0f - std::fabs(x + 0.15f * y) / 0.055f) * std::max(0.0f, 1.0f - absY / 0.78f);
+        const float centerNeedle = std::max(0.0f, 1.0f - xm::Abs(x) / 0.07f) * std::max(0.0f, 1.0f - absY / 0.88f);
+        const float sideNeedleA = std::max(0.0f, 1.0f - xm::Abs(x - 0.16f * y) / 0.055f) * std::max(0.0f, 1.0f - absY / 0.78f);
+        const float sideNeedleB = std::max(0.0f, 1.0f - xm::Abs(x + 0.15f * y) / 0.055f) * std::max(0.0f, 1.0f - absY / 0.78f);
         return std::max({centerNeedle, sideNeedleA, sideNeedleB});
     }
     if (std::strcmp(label, "Willow") == 0)
@@ -120,20 +123,20 @@ float LeafSilhouette(const char* label, int variant, float x, float y)
     if (std::strcmp(label, "Oak") == 0)
     {
         width = 0.22f + 0.33f * (1.0f - y * y);
-        width += 0.08f * std::sin((y * 18.0f) + static_cast<float>(variant));
+        width += 0.08f * xm::Sin((y * 18.0f) + static_cast<float>(variant));
         const float body = (1.0f - SmoothStep(width, width + 0.045f, vein)) * (1.0f - SmoothStep(0.83f, 0.99f, absY));
         const float stemCut = SmoothStep(-0.96f, -0.74f, y);
         return body * stemCut;
     }
     if (std::strcmp(label, "Birch") == 0)
     {
-        width = 0.16f + 0.37f * (1.0f - std::pow(absY, 1.45f));
+        width = 0.16f + 0.37f * (1.0f - xm::Pow(absY, 1.45f));
         width *= (y > 0.0f) ? (1.0f - 0.25f * y) : (1.0f + 0.12f * y);
         return (1.0f - SmoothStep(width, width + 0.04f, vein)) * (1.0f - SmoothStep(0.82f, 0.98f, absY));
     }
 
     width = 0.14f + 0.32f * (1.0f - absY);
-    width *= 1.0f + 0.08f * std::sin(y * 22.0f + static_cast<float>(variant));
+    width *= 1.0f + 0.08f * xm::Sin(y * 22.0f + static_cast<float>(variant));
     return (1.0f - SmoothStep(width, width + 0.04f, vein)) * (1.0f - SmoothStep(0.86f, 0.99f, absY));
 }
 
@@ -147,8 +150,8 @@ void LeafPixel(const PaletteSpec& spec, std::uint32_t x, std::uint32_t y, std::u
     const float localY = ((static_cast<float>(y % cellSize) + 0.5f) / static_cast<float>(cellSize)) * 2.0f - 1.0f;
 
     const float rotation = (static_cast<float>(variant) - 1.5f) * 0.18f;
-    const float cr = std::cos(rotation);
-    const float sr = std::sin(rotation);
+    const float cr = xm::Cos(rotation);
+    const float sr = xm::Sin(rotation);
     const float rx = localX * cr - localY * sr;
     const float ry = localX * sr + localY * cr;
 
@@ -159,7 +162,7 @@ void LeafPixel(const PaletteSpec& spec, std::uint32_t x, std::uint32_t y, std::u
         return;
     }
 
-    const float vein = std::max(0.0f, 1.0f - std::fabs(rx) / 0.045f) * std::max(0.0f, 1.0f - std::fabs(ry) / 0.86f);
+    const float vein = std::max(0.0f, 1.0f - xm::Abs(rx) / 0.045f) * std::max(0.0f, 1.0f - xm::Abs(ry) / 0.86f);
     const float edge = 1.0f - SmoothStep(0.04f, 0.16f, mask);
     const std::uint32_t n = (x * 37u + y * 53u + static_cast<std::uint32_t>(variant * 79)) & 0xffu;
     const float noise = static_cast<float>(n) / 255.0f;

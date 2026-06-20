@@ -892,13 +892,13 @@ void EditorImGui::RenderPerformancePanel()
 
     const float budgetFraction = static_cast<float>(std::clamp(m_engineStats.frameBudgetPercent / 100.0, 0.0, 1.0));
     const std::string budgetLabel =
-        std::to_string(static_cast<int>(std::round(m_engineStats.frameBudgetPercent))) + "%";
+        std::to_string(static_cast<int>(ixtreeme::math::Round(static_cast<float>(m_engineStats.frameBudgetPercent)))) + "%";
     ImGui::TextUnformatted("Frame Budget @60 FPS");
     ImGui::ProgressBar(budgetFraction, ImVec2(-1.0f, 0.0f), budgetLabel.c_str());
 
     const float cpuFraction = static_cast<float>(std::clamp(m_engineStats.processCpuPercent / 100.0, 0.0, 1.0));
     const std::string cpuLabel =
-        std::to_string(static_cast<int>(std::round(m_engineStats.processCpuPercent))) + "%";
+        std::to_string(static_cast<int>(ixtreeme::math::Round(static_cast<float>(m_engineStats.processCpuPercent)))) + "%";
     ImGui::TextUnformatted("Process CPU");
     ImGui::ProgressBar(cpuFraction, ImVec2(-1.0f, 0.0f), cpuLabel.c_str());
 

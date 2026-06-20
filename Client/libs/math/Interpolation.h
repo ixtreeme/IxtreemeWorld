@@ -39,7 +39,7 @@ inline float AngleLerpDegreesClamped(float current, float target, float t)
 inline float AngleMoveTowardsDegrees(float current, float target, float maxDelta)
 {
     const float delta = DeltaAngleDegrees(current, target);
-    if (std::fabs(delta) <= maxDelta)
+    if (Abs(delta) <= maxDelta)
         return target;
     return current + static_cast<float>(Sign(delta)) * maxDelta;
 }
@@ -135,7 +135,7 @@ inline float Damp(float current, float target, float damping, float deltaTime)
 {
     if (deltaTime <= 0.0f)
         return current;
-    const float t = 1.0f - std::exp(-Max(0.0f, damping) * deltaTime);
+    const float t = 1.0f - Exp(-Max(0.0f, damping) * deltaTime);
     return Lerp(current, target, t);
 }
 
@@ -143,7 +143,7 @@ inline Vec2 Damp(Vec2 current, Vec2 target, float damping, float deltaTime)
 {
     if (deltaTime <= 0.0f)
         return current;
-    const float t = 1.0f - std::exp(-Max(0.0f, damping) * deltaTime);
+    const float t = 1.0f - Exp(-Max(0.0f, damping) * deltaTime);
     return Lerp(current, target, t);
 }
 
@@ -151,7 +151,7 @@ inline Vec3 Damp(Vec3 current, Vec3 target, float damping, float deltaTime)
 {
     if (deltaTime <= 0.0f)
         return current;
-    const float t = 1.0f - std::exp(-Max(0.0f, damping) * deltaTime);
+    const float t = 1.0f - Exp(-Max(0.0f, damping) * deltaTime);
     return Lerp(current, target, t);
 }
 
@@ -159,7 +159,7 @@ inline Vec4 Damp(Vec4 current, Vec4 target, float damping, float deltaTime)
 {
     if (deltaTime <= 0.0f)
         return current;
-    const float t = 1.0f - std::exp(-Max(0.0f, damping) * deltaTime);
+    const float t = 1.0f - Exp(-Max(0.0f, damping) * deltaTime);
     return Lerp(current, target, t);
 }
 

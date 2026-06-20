@@ -74,7 +74,77 @@ inline bool IsNan(float value)
 
 inline bool NearlyEqual(float a, float b, float epsilon = Epsilon)
 {
-    return std::fabs(a - b) <= epsilon;
+    return Abs(a - b) <= epsilon;
+}
+
+inline float Sqrt(float value)
+{
+    return std::sqrt(value);
+}
+
+inline float Sin(float radians)
+{
+    return std::sin(radians);
+}
+
+inline float Cos(float radians)
+{
+    return std::cos(radians);
+}
+
+inline float Tan(float radians)
+{
+    return std::tan(radians);
+}
+
+inline float Asin(float value)
+{
+    return std::asin(value);
+}
+
+inline float Acos(float value)
+{
+    return std::acos(value);
+}
+
+inline float Atan2(float y, float x)
+{
+    return std::atan2(y, x);
+}
+
+inline float Pow(float base, float exponent)
+{
+    return std::pow(base, exponent);
+}
+
+inline float Exp(float value)
+{
+    return std::exp(value);
+}
+
+inline float Floor(float value)
+{
+    return std::floor(value);
+}
+
+inline float Ceil(float value)
+{
+    return std::ceil(value);
+}
+
+inline float Round(float value)
+{
+    return std::round(value);
+}
+
+inline float CopySign(float magnitude, float sign)
+{
+    return std::copysign(magnitude, sign);
+}
+
+inline float Cbrt(float value)
+{
+    return std::cbrt(value);
 }
 
 constexpr float DegreesToRadians(float degrees)
@@ -95,7 +165,7 @@ inline float Lerp(float a, float b, float t)
 inline float InverseLerp(float a, float b, float value)
 {
     const float denom = b - a;
-    if (std::fabs(denom) <= Epsilon)
+    if (Abs(denom) <= Epsilon)
         return 0.0f;
     return (value - a) / denom;
 }
@@ -120,37 +190,37 @@ inline float SmootherStep(float edge0, float edge1, float value)
 inline float MoveTowards(float current, float target, float maxDelta)
 {
     const float delta = target - current;
-    if (std::fabs(delta) <= maxDelta)
+    if (Abs(delta) <= maxDelta)
         return target;
     return current + static_cast<float>(Sign(delta)) * maxDelta;
 }
 
 inline float Repeat(float value, float length)
 {
-    if (std::fabs(length) <= Epsilon)
+    if (Abs(length) <= Epsilon)
         return 0.0f;
-    return value - std::floor(value / length) * length;
+    return value - Floor(value / length) * length;
 }
 
 inline float PingPong(float value, float length)
 {
     const float t = Repeat(value, length * 2.0f);
-    return length - std::fabs(t - length);
+    return length - Abs(t - length);
 }
 
 inline float Wrap(float value, float minValue, float maxValue)
 {
     const float length = maxValue - minValue;
-    if (std::fabs(length) <= Epsilon)
+    if (Abs(length) <= Epsilon)
         return minValue;
     return minValue + Repeat(value - minValue, length);
 }
 
 inline float Snap(float value, float step)
 {
-    if (std::fabs(step) <= Epsilon)
+    if (Abs(step) <= Epsilon)
         return value;
-    return std::round(value / step) * step;
+    return Round(value / step) * step;
 }
 
 inline float DeltaAngleDegrees(float current, float target)

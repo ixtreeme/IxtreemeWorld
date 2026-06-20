@@ -222,8 +222,8 @@ xm::Mat4 UpAxisTransform(const aiScene& scene)
         return xm::Mat4Identity();
 
     const float angle = upSign >= 0 ? -xm::HalfPi : xm::HalfPi;
-    const float c = std::cos(angle);
-    const float s = std::sin(angle);
+    const float c = xm::Cos(angle);
+    const float s = xm::Sin(angle);
     return xm::Mat4{{1, 0, 0, 0,
                      0, c, s, 0,
                      0, -s, c, 0,
@@ -339,10 +339,7 @@ xm::Mat4 IdentityMatrix()
 
 xm::Mat4 MatrixToRowMajor(const aiMatrix4x4& matrix)
 {
-    return xm::Mat4{{matrix.a1, matrix.a2, matrix.a3, matrix.a4,
-        matrix.b1, matrix.b2, matrix.b3, matrix.b4,
-        matrix.c1, matrix.c2, matrix.c3, matrix.c4,
-        matrix.d1, matrix.d2, matrix.d3, matrix.d4}};
+    return xm::interop::FromAssimpRowMajor(matrix);
 }
 
 AssimpImporter::AnimationKeyframe DecomposeTransform(const aiMatrix4x4& matrix, float time)
@@ -613,11 +610,7 @@ void ExtractAnimations(const aiScene& scene,
 
 ozz::math::Transform OzzTransformFromMatrix(const xm::Mat4& matrix)
 {
-    aiMatrix4x4 aiMatrix(
-        matrix.m[0], matrix.m[1], matrix.m[2], matrix.m[3],
-        matrix.m[4], matrix.m[5], matrix.m[6], matrix.m[7],
-        matrix.m[8], matrix.m[9], matrix.m[10], matrix.m[11],
-        matrix.m[12], matrix.m[13], matrix.m[14], matrix.m[15]);
+    const aiMatrix4x4 aiMatrix = xm::interop::ToAssimpRowMajor(matrix);
     const AssimpImporter::AnimationKeyframe key = DecomposeTransform(aiMatrix, 0.0f);
     ozz::math::Transform transform{};
     transform.translation = ozz::math::Float3(key.position[0], key.position[1], key.position[2]);

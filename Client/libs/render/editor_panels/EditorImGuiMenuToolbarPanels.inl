@@ -213,7 +213,7 @@ void EditorImGui::UpdateAutoSaveWindowTitle(double now)
 
     const double elapsed = std::max(0.0, now - m_lastAutoSaveSeconds);
     const double remainingSecondsDouble = std::max(0.0, kProjectAutoSaveIntervalSeconds - elapsed);
-    const int remainingSeconds = static_cast<int>(std::ceil(remainingSecondsDouble));
+    const int remainingSeconds = static_cast<int>(ixtreeme::math::Ceil(static_cast<float>(remainingSecondsDouble)));
     if (remainingSeconds == m_lastAutoSaveTitleRemainingSeconds)
         return;
 

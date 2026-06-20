@@ -108,7 +108,7 @@ struct BranchEnd
 void BuildFrame(Vec3 direction, Vec3& right, Vec3& up)
 {
     const Vec3 axis = Normalize(direction);
-    const Vec3 seed = std::fabs(axis.y) > 0.95f ? Vec3{1.0f, 0.0f, 0.0f} : Vec3{0.0f, 1.0f, 0.0f};
+    const Vec3 seed = xm::Abs(axis.y) > 0.95f ? Vec3{1.0f, 0.0f, 0.0f} : Vec3{0.0f, 1.0f, 0.0f};
     right = Normalize(Cross(seed, axis));
     up = Normalize(Cross(axis, right));
 }
@@ -116,8 +116,8 @@ void BuildFrame(Vec3 direction, Vec3& right, Vec3& up)
 Vec3 RotateAroundAxis(Vec3 v, Vec3 axis, float radians)
 {
     axis = Normalize(axis);
-    const float c = std::cos(radians);
-    const float s = std::sin(radians);
+    const float c = xm::Cos(radians);
+    const float s = xm::Sin(radians);
     return Add(Add(Mul(v, c), Mul(Cross(axis, v), s)), Mul(axis, Dot(axis, v) * (1.0f - c)));
 }
 
@@ -179,7 +179,7 @@ BranchEnd GenerateBranch(const TreeOptions& options,
         {
             const float u = static_cast<float>(seg) / static_cast<float>(radialSegments);
             const float a = u * xm::TwoPi;
-            const Vec3 normal = Normalize(Add(Mul(right, std::cos(a)), Mul(up, std::sin(a))));
+            const Vec3 normal = Normalize(Add(Mul(right, xm::Cos(a)), Mul(up, xm::Sin(a))));
             const Vec3 position = Add(centers[static_cast<std::size_t>(ring)], Mul(normal, radius));
             mesh.bark.vertices.push_back(Vertex{position, normal, Vec2{u * options.bark.textureScale.x, t * options.bark.textureScale.y}});
             IncludeBounds(mesh, position);
@@ -220,9 +220,9 @@ BranchEnd GenerateBranch(const TreeOptions& options,
         Vec3 up{};
         BuildFrame(axes[static_cast<std::size_t>(centerIndex)], right, up);
         const float around = rng.uniform(0.0f, xm::TwoPi);
-        const Vec3 radial = Normalize(Add(Mul(right, std::cos(around)), Mul(up, std::sin(around))));
-        const Vec3 childDir = Normalize(Add(Mul(axes[static_cast<std::size_t>(centerIndex)], std::cos(angleRadians)),
-            Mul(radial, std::sin(angleRadians))));
+        const Vec3 radial = Normalize(Add(Mul(right, xm::Cos(around)), Mul(up, xm::Sin(around))));
+        const Vec3 childDir = Normalize(Add(Mul(axes[static_cast<std::size_t>(centerIndex)], xm::Cos(angleRadians)),
+            Mul(radial, xm::Sin(angleRadians))));
         GenerateBranch(options, rng, mesh, childLevel, centers[static_cast<std::size_t>(centerIndex)], childDir, terminalBranches);
     }
 
@@ -280,7 +280,7 @@ void GenerateLeaves(const TreeOptions& options, Rng& rng, TreeMesh& mesh, const 
 
             const Vec3 clusterAxis = Normalize(Mix(Vec3{0.0f, 1.0f, 0.0f}, branch.direction, 0.25f));
             const float baseAngle = rng.uniform(0.0f, xm::TwoPi);
-            const Vec3 baseTangent = Normalize(Add(Mul(right, std::cos(baseAngle)), Mul(up, std::sin(baseAngle))));
+            const Vec3 baseTangent = Normalize(Add(Mul(right, xm::Cos(baseAngle)), Mul(up, xm::Sin(baseAngle))));
             for (int card = 0; card < cardsPerCluster; ++card)
             {
                 const float cardAngle = (static_cast<float>(card) / static_cast<float>(cardsPerCluster)) * xm::TwoPi;

@@ -157,8 +157,8 @@ inline Mat4 Scale(Vec3 scale)
 
 inline Mat4 RotationX(float radians)
 {
-    const float c = std::cos(radians);
-    const float s = std::sin(radians);
+    const float c = Cos(radians);
+    const float s = Sin(radians);
     Mat4 r = Mat4Identity();
     Mat4At(r, 1, 1) = c;
     Mat4At(r, 1, 2) = -s;
@@ -169,8 +169,8 @@ inline Mat4 RotationX(float radians)
 
 inline Mat4 RotationY(float radians)
 {
-    const float c = std::cos(radians);
-    const float s = std::sin(radians);
+    const float c = Cos(radians);
+    const float s = Sin(radians);
     Mat4 r = Mat4Identity();
     Mat4At(r, 0, 0) = c;
     Mat4At(r, 0, 2) = s;
@@ -181,8 +181,8 @@ inline Mat4 RotationY(float radians)
 
 inline Mat4 RotationZ(float radians)
 {
-    const float c = std::cos(radians);
-    const float s = std::sin(radians);
+    const float c = Cos(radians);
+    const float s = Sin(radians);
     Mat4 r = Mat4Identity();
     Mat4At(r, 0, 0) = c;
     Mat4At(r, 0, 1) = -s;
@@ -193,8 +193,8 @@ inline Mat4 RotationZ(float radians)
 
 inline Mat4 RotationXRowMajor(float radians)
 {
-    const float c = std::cos(radians);
-    const float s = std::sin(radians);
+    const float c = Cos(radians);
+    const float s = Sin(radians);
     Mat4 r = Mat4Identity();
     r.m[5] = c;
     r.m[6] = -s;
@@ -205,8 +205,8 @@ inline Mat4 RotationXRowMajor(float radians)
 
 inline Mat4 RotationYRowMajor(float radians)
 {
-    const float c = std::cos(radians);
-    const float s = std::sin(radians);
+    const float c = Cos(radians);
+    const float s = Sin(radians);
     Mat4 r = Mat4Identity();
     r.m[0] = c;
     r.m[2] = s;
@@ -217,8 +217,8 @@ inline Mat4 RotationYRowMajor(float radians)
 
 inline Mat4 RotationZRowMajor(float radians)
 {
-    const float c = std::cos(radians);
-    const float s = std::sin(radians);
+    const float c = Cos(radians);
+    const float s = Sin(radians);
     Mat4 r = Mat4Identity();
     r.m[0] = c;
     r.m[1] = -s;
@@ -240,7 +240,7 @@ inline Mat4 TRS(const Transform& transform)
 inline Vec3 TransformPoint(const Mat4& m, Vec3 point)
 {
     const Vec4 result = m * Vec4{point.x, point.y, point.z, 1.0f};
-    if (std::fabs(result.w) <= Epsilon)
+    if (Abs(result.w) <= Epsilon)
         return {result.x, result.y, result.z};
     return {result.x / result.w, result.y / result.w, result.z / result.w};
 }
@@ -249,6 +249,22 @@ inline Vec3 TransformVector(const Mat4& m, Vec3 vector)
 {
     const Vec4 result = m * Vec4{vector.x, vector.y, vector.z, 0.0f};
     return {result.x, result.y, result.z};
+}
+
+inline Vec3 TransformPointRowVector(const float* matrix, Vec3 point)
+{
+    return {
+        point.x * matrix[0] + point.y * matrix[4] + point.z * matrix[8] + matrix[12],
+        point.x * matrix[1] + point.y * matrix[5] + point.z * matrix[9] + matrix[13],
+        point.x * matrix[2] + point.y * matrix[6] + point.z * matrix[10] + matrix[14]};
+}
+
+inline Vec3 TransformVectorRowVector(const float* matrix, Vec3 vector)
+{
+    return {
+        vector.x * matrix[0] + vector.y * matrix[4] + vector.z * matrix[8],
+        vector.x * matrix[1] + vector.y * matrix[5] + vector.z * matrix[9],
+        vector.x * matrix[2] + vector.y * matrix[6] + vector.z * matrix[10]};
 }
 
 inline Vec3 TransformDirection(const Mat4& m, Vec3 direction)
@@ -271,7 +287,7 @@ inline Vec3 ExtractScale(const Mat4& m)
 
 inline Mat4 PerspectiveVulkan(float fovYRadians, float aspect, float zNear, float zFar)
 {
-    const float f = 1.0f / std::tan(fovYRadians * 0.5f);
+    const float f = 1.0f / Tan(fovYRadians * 0.5f);
     Mat4 r{};
     Mat4At(r, 0, 0) = f / aspect;
     Mat4At(r, 1, 1) = -f;
@@ -325,7 +341,7 @@ inline Mat4 InverseAffine(const Mat4& m)
     const Vec3 t = ExtractTranslation(m);
 
     const float det = Dot(a, Cross(b, c));
-    if (std::fabs(det) <= Epsilon)
+    if (Abs(det) <= Epsilon)
         return Mat4Identity();
     const float invDet = 1.0f / det;
 

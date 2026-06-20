@@ -72,27 +72,27 @@ public:
     Vec2 InsideUnitCircle()
     {
         const float angle = Range(0.0f, TwoPi);
-        const float radius = std::sqrt(NextFloat01());
-        return {std::cos(angle) * radius, std::sin(angle) * radius};
+        const float radius = Sqrt(NextFloat01());
+        return {Cos(angle) * radius, Sin(angle) * radius};
     }
 
     Vec2 OnUnitCircle()
     {
         const float angle = Range(0.0f, TwoPi);
-        return {std::cos(angle), std::sin(angle)};
+        return {Cos(angle), Sin(angle)};
     }
 
     Vec3 OnUnitSphere()
     {
         const float z = Range(-1.0f, 1.0f);
         const float angle = Range(0.0f, TwoPi);
-        const float radius = std::sqrt(Max(0.0f, 1.0f - z * z));
-        return {radius * std::cos(angle), z, radius * std::sin(angle)};
+        const float radius = Sqrt(Max(0.0f, 1.0f - z * z));
+        return {radius * Cos(angle), z, radius * Sin(angle)};
     }
 
     Vec3 InsideUnitSphere()
     {
-        return OnUnitSphere() * std::cbrt(NextFloat01());
+        return OnUnitSphere() * Cbrt(NextFloat01());
     }
 
     Quat Rotation()
@@ -100,13 +100,13 @@ public:
         const float u1 = NextFloat01();
         const float u2 = NextFloat01();
         const float u3 = NextFloat01();
-        const float sqrt1MinusU1 = std::sqrt(1.0f - u1);
-        const float sqrtU1 = std::sqrt(u1);
+        const float sqrt1MinusU1 = Sqrt(1.0f - u1);
+        const float sqrtU1 = Sqrt(u1);
         return Normalize(Quat{
-            sqrt1MinusU1 * std::sin(TwoPi * u2),
-            sqrt1MinusU1 * std::cos(TwoPi * u2),
-            sqrtU1 * std::sin(TwoPi * u3),
-            sqrtU1 * std::cos(TwoPi * u3)});
+            sqrt1MinusU1 * Sin(TwoPi * u2),
+            sqrt1MinusU1 * Cos(TwoPi * u2),
+            sqrtU1 * Sin(TwoPi * u3),
+            sqrtU1 * Cos(TwoPi * u3)});
     }
 
 private:

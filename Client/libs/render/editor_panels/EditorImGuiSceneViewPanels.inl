@@ -104,8 +104,8 @@ void EditorImGui::RenderSceneViewDropTarget()
                         const ImVec2 viewportPos = viewport ? viewport->Pos : ImVec2(0.0f, 0.0f);
                         InputEvent dropEvent{};
                         dropEvent.type = InputEvent::MouseUp;
-                        dropEvent.x = static_cast<int>(std::round(mouse.x - viewportPos.x));
-                        dropEvent.y = static_cast<int>(std::round(mouse.y - viewportPos.y));
+                        dropEvent.x = static_cast<int>(ixtreeme::math::Round(mouse.x - viewportPos.x));
+                        dropEvent.y = static_cast<int>(ixtreeme::math::Round(mouse.y - viewportPos.y));
                         const InputEvent mappedDropEvent = MapInputToSceneView(dropEvent);
                         m_commands.addMeshEntity = true;
                         m_commands.meshAssetId = entry->id;
@@ -358,16 +358,16 @@ void EditorImGui::RenderSceneViewGizmo(const ImVec2& imageMin, const ImVec2& ima
         int changedAxes = 0;
         for (float delta : translationDelta)
         {
-            if (std::fabs(delta) > 0.0005f)
+            if (ixtreeme::math::Abs(delta) > 0.0005f)
                 ++changedAxes;
         }
         if (changedAxes >= 2)
         {
             int planeAxis = 0;
-            float smallestDelta = std::fabs(translationDelta[0]);
+            float smallestDelta = ixtreeme::math::Abs(translationDelta[0]);
             for (int i = 1; i < 3; ++i)
             {
-                const float delta = std::fabs(translationDelta[i]);
+                const float delta = ixtreeme::math::Abs(translationDelta[i]);
                 if (delta < smallestDelta)
                 {
                     smallestDelta = delta;
@@ -375,7 +375,7 @@ void EditorImGui::RenderSceneViewGizmo(const ImVec2& imageMin, const ImVec2& ima
                 }
             }
             const float horizontalScaleDelta = ImGui::GetIO().MouseDelta.x * kGizmoPlaneScaleUnitsPerPixel;
-            if (std::fabs(horizontalScaleDelta) <= 0.000001f)
+            if (ixtreeme::math::Abs(horizontalScaleDelta) <= 0.000001f)
                 return;
             for (int i = 0; i < 3; ++i)
             {

@@ -415,7 +415,7 @@ float SnapValue(float value, float step)
 {
     if (step <= 0.0001f)
         return value;
-    return std::round(value / step) * step;
+    return xm::Round(value / step) * step;
 }
 
 WorldVec3 SnapPoint(WorldVec3 point, float step)
@@ -443,8 +443,8 @@ bool ExpandWaterBodyForSculpt(WaterBody& body, const WorldVec3& point, float rad
     const float nextMaxX = std::max(maxX, point.x + brushRadius);
     const float nextMinZ = std::min(minZ, point.z - brushRadius);
     const float nextMaxZ = std::max(maxZ, point.z + brushRadius);
-    if (std::abs(nextMinX - minX) < 0.001f && std::abs(nextMaxX - maxX) < 0.001f &&
-        std::abs(nextMinZ - minZ) < 0.001f && std::abs(nextMaxZ - maxZ) < 0.001f)
+    if (xm::Abs(nextMinX - minX) < 0.001f && xm::Abs(nextMaxX - maxX) < 0.001f &&
+        xm::Abs(nextMinZ - minZ) < 0.001f && xm::Abs(nextMaxZ - maxZ) < 0.001f)
     {
         return true;
     }
@@ -457,9 +457,9 @@ bool ExpandWaterBodyForSculpt(WaterBody& body, const WorldVec3& point, float rad
     const float newSizeX = std::max(nextMaxX - nextMinX, targetCell);
     const float newSizeZ = std::max(nextMaxZ - nextMinZ, targetCell);
     const std::uint32_t newWidth = std::clamp(
-        static_cast<std::uint32_t>(std::ceil(newSizeX / targetCell)), 8u, 256u);
+        static_cast<std::uint32_t>(xm::Ceil(newSizeX / targetCell)), 8u, 256u);
     const std::uint32_t newHeight = std::clamp(
-        static_cast<std::uint32_t>(std::ceil(newSizeZ / targetCell)), 8u, 256u);
+        static_cast<std::uint32_t>(xm::Ceil(newSizeZ / targetCell)), 8u, 256u);
     std::vector<std::uint8_t> nextMask(static_cast<std::size_t>(newWidth) * newHeight, 0u);
     const std::vector<std::uint8_t> oldMask = body.shapeMask;
 
@@ -521,7 +521,7 @@ std::uint32_t ApplyWaterSculptBrush(WaterBody& body, const WorldVec3& point, flo
     const float radiusPxX = (std::max(radiusMeters, 0.001f) / sizeX) * static_cast<float>(body.maskWidth);
     const float radiusPxY = (std::max(radiusMeters, 0.001f) / sizeZ) * static_cast<float>(body.maskHeight);
     const float radiusPx = std::max(1.0f, (radiusPxX + radiusPxY) * 0.5f);
-    const int radiusCeil = static_cast<int>(std::ceil(radiusPx));
+    const int radiusCeil = static_cast<int>(xm::Ceil(radiusPx));
     const int xMin = std::max(0, centerX - radiusCeil);
     const int xMax = std::min(static_cast<int>(body.maskWidth) - 1, centerX + radiusCeil);
     const int yMin = std::max(0, centerY - radiusCeil);
@@ -2814,8 +2814,8 @@ int RunGame(NativeWindow& window,
                 auto spawnAtScreenPosition = [&](float screenX, float screenY) {
                     const int maxX = renderSize.width > 0 ? static_cast<int>(renderSize.width - 1u) : 0;
                     const int maxY = renderSize.height > 0 ? static_cast<int>(renderSize.height - 1u) : 0;
-                    const int mouseX = std::clamp(static_cast<int>(std::round(screenX)), 0, maxX);
-                    const int mouseY = std::clamp(static_cast<int>(std::round(screenY)), 0, maxY);
+                    const int mouseX = std::clamp(static_cast<int>(xm::Round(screenX)), 0, maxX);
+                    const int mouseY = std::clamp(static_cast<int>(xm::Round(screenY)), 0, maxY);
                     std::optional<WorldVec3> hit = RaycastTerrainPoint(terrain,
                         frameCamera,
                         renderSize.width,

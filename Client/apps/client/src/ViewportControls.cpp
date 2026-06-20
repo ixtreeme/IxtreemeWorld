@@ -3,7 +3,6 @@
 #include "Debug.h"
 
 #include <algorithm>
-#include <cmath>
 
 namespace xm = ixtreeme::math;
 
@@ -21,51 +20,30 @@ bool ProjectWorldToScreen(const WorldCamera& camera,
                           WorldVec3 world,
                           uint32_t width,
                           uint32_t height,
-                          float& outX,
-                          float& outY)
+    float& outX,
+    float& outY)
 {
-    const auto& m = camera.viewProjection.m;
-    const float clipX = world.x * m[0] + world.y * m[4] + world.z * m[8] + m[12];
-    const float clipY = world.x * m[1] + world.y * m[5] + world.z * m[9] + m[13];
-    const float clipW = world.x * m[3] + world.y * m[7] + world.z * m[11] + m[15];
-    if (clipW <= 0.0001f)
-        return false;
-
-    const float ndcX = clipX / clipW;
-    const float ndcY = clipY / clipW;
-    if (ndcX < -1.2f || ndcX > 1.2f || ndcY < -1.2f || ndcY > 1.2f)
-        return false;
-
-    outX = (ndcX * 0.5f + 0.5f) * static_cast<float>(width);
-    outY = (1.0f - (ndcY * 0.5f + 0.5f)) * static_cast<float>(height);
-    return true;
+    return WorldProjectToScreen(camera, world, width, height, outX, outY);
 }
 
 WorldVec3 CameraForward(const WorldCamera& camera)
 {
-    return xm::Normalize(camera.target - camera.eye);
+    return WorldCameraForward(camera);
 }
 
 WorldVec3 CameraRight(const WorldCamera& camera)
 {
-    return xm::Normalize(xm::Cross({0.0f, 1.0f, 0.0f}, CameraForward(camera)));
+    return WorldCameraRight(camera);
 }
 
 WorldVec3 CameraUp(const WorldCamera& camera)
 {
-    return xm::Normalize(xm::Cross(CameraForward(camera), CameraRight(camera)));
+    return WorldCameraUp(camera);
 }
 
 WorldVec3 ScreenRayDirection(const WorldCamera& camera, uint32_t width, uint32_t height, int mouseX, int mouseY)
 {
-    const float aspect = height != 0 ? static_cast<float>(width) / static_cast<float>(height) : 1.0f;
-    const float ndcX = width != 0 ? (2.0f * static_cast<float>(mouseX) / static_cast<float>(width)) - 1.0f : 0.0f;
-    const float ndcY = height != 0 ? 1.0f - (2.0f * static_cast<float>(mouseY) / static_cast<float>(height)) : 0.0f;
-    constexpr float kTanHalfFov = 0.41421356237f; // tan(45deg / 2)
-    return xm::Normalize(
-        CameraForward(camera) +
-        CameraRight(camera) * (ndcX * aspect * kTanHalfFov) +
-        CameraUp(camera) * (ndcY * kTanHalfFov));
+    return WorldScreenRayDirection(camera, width, height, mouseX, mouseY);
 }
 
 std::uint32_t PickRenderEntityTarget(const std::vector<WorldRenderEntity>& entities,
@@ -179,17 +157,18 @@ float MovementInputState::DirectionAngle(float cameraYawRadians) const
     if (d) localX += 1.0f;
     if (a) localX -= 1.0f;
 
-    const float length = std::sqrt(localX * localX + localZ * localZ);
-    if (length > 0.0001f)
+    const float lengthSq = localX * localX + localZ * localZ;
+    if (lengthSq > 0.0001f)
     {
+        const float length = xm::Sqrt(lengthSq);
         localX /= length;
         localZ /= length;
     }
 
-    const WorldVec3 forward = {std::sin(cameraYawRadians), 0.0f, std::cos(cameraYawRadians)};
-    const WorldVec3 right = {std::cos(cameraYawRadians), 0.0f, -std::sin(cameraYawRadians)};
+    const WorldVec3 forward = WorldForwardFromYawPitch(cameraYawRadians, 0.0f);
+    const WorldVec3 right = WorldRightFromYaw(cameraYawRadians);
     const WorldVec3 displayDir = right * localX + forward * localZ;
-    return std::atan2(displayDir.x, -displayDir.z);
+    return xm::Atan2(displayDir.x, -displayDir.z);
 }
 
 RuntimeMoveState MovementInputState::State() const
@@ -272,8 +251,8 @@ void FlyCameraController::FocusOn(WorldVec3 target, float distance)
     const WorldVec3 eye = {target.x, target.y + 5.0f, target.z - distance};
     const WorldVec3 forward = xm::Normalize(target - eye);
     eye_ = eye;
-    yaw_ = std::atan2(forward.x, forward.z);
-    pitch_ = std::clamp(std::asin(std::clamp(forward.y, -1.0f, 1.0f)), -kMaxPitch, kMaxPitch);
+    yaw_ = WorldYawFromDirection(forward);
+    pitch_ = std::clamp(WorldPitchFromDirection(forward), -kMaxPitch, kMaxPitch);
     dragActive_ = false;
     Tracenf("[HIERARCHY] Focused camera on target: %.2f, %.2f, %.2f", target.x, target.y, target.z);
 }
@@ -297,9 +276,8 @@ void FlyCameraController::UpdateFly(float dt, const MovementInputState& movement
     if (movement.space) localY += 1.0f;
     if (movement.control) localY -= 1.0f;
 
-    const float cosPitch = std::cos(pitch_);
-    const WorldVec3 forward = {std::sin(yaw_) * cosPitch, std::sin(pitch_), std::cos(yaw_) * cosPitch};
-    const WorldVec3 right = {std::cos(yaw_), 0.0f, -std::sin(yaw_)};
+    const WorldVec3 forward = WorldForwardFromYawPitch(yaw_, pitch_);
+    const WorldVec3 right = WorldRightFromYaw(yaw_);
     WorldVec3 delta = forward * localZ + right * localX + WorldVec3{0.0f, localY, 0.0f};
     if (xm::Dot(delta, delta) > 0.0001f)
         delta = xm::Normalize(delta);
@@ -311,8 +289,7 @@ void FlyCameraController::UpdateFly(float dt, const MovementInputState& movement
 WorldCamera FlyCameraController::BuildFlyCamera(uint32_t width, uint32_t height) const
 {
     const float aspect = height != 0 ? static_cast<float>(width) / static_cast<float>(height) : 1.0f;
-    const float cosPitch = std::cos(pitch_);
-    const WorldVec3 forward = {std::sin(yaw_) * cosPitch, std::sin(pitch_), std::cos(yaw_) * cosPitch};
+    const WorldVec3 forward = WorldForwardFromYawPitch(yaw_, pitch_);
     WorldCamera camera{};
     camera.eye = eye_;
     camera.target = eye_ + forward;

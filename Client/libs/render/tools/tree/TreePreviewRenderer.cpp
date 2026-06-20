@@ -86,10 +86,10 @@ ProjectedPoint Project(const ixtreemetree::Vec3& p,
                        float pitch,
                        float zoom)
 {
-    const float cy = std::cos(yaw);
-    const float sy = std::sin(yaw);
-    const float cp = std::cos(pitch);
-    const float sp = std::sin(pitch);
+    const float cy = xm::Cos(yaw);
+    const float sy = xm::Sin(yaw);
+    const float cp = xm::Cos(pitch);
+    const float sp = xm::Sin(pitch);
     const ixtreemetree::Vec3 local = Sub(p, center);
     const float x = local.x * cy - local.z * sy;
     const float z = local.x * sy + local.z * cy;
@@ -127,14 +127,14 @@ void PushSurfaceTriangles(std::vector<PreviewTriangle>& triangles,
         if (textured)
         {
             const float uv = (va.uv.x + vb.uv.x + vc.uv.x + va.uv.y + vb.uv.y + vc.uv.y) * 8.0f;
-            shade *= 0.88f + std::sin(uv) * 0.08f;
+            shade *= 0.88f + xm::Sin(uv) * 0.08f;
         }
         std::array<float, 4> fillColor = ShadeColor(baseColor, shade);
         if (leafSurface)
         {
             const float centerU = (va.uv.x + vb.uv.x + vc.uv.x) / 3.0f;
             const float centerV = (va.uv.y + vb.uv.y + vc.uv.y) / 3.0f;
-            const float maskHint = 1.0f - std::max(std::abs(centerU - 0.5f), std::abs(centerV - 0.5f)) * 1.6f;
+            const float maskHint = 1.0f - std::max(xm::Abs(centerU - 0.5f), xm::Abs(centerV - 0.5f)) * 1.6f;
             fillColor[3] = std::clamp(fillColor[3] * (0.72f + maskHint * 0.22f), 0.24f, 0.92f);
         }
         PreviewTriangle tri{};
@@ -173,7 +173,7 @@ void TreePreviewRenderer::FitToMesh(const ixtreemetree::TreeMesh& mesh)
     const float dx = mesh.bboxMax.x - mesh.bboxMin.x;
     const float dy = mesh.bboxMax.y - mesh.bboxMin.y;
     const float dz = mesh.bboxMax.z - mesh.bboxMin.z;
-    radius_ = std::max(0.6f, std::sqrt(dx * dx + dy * dy + dz * dz) * 0.5f);
+    radius_ = std::max(0.6f, xm::Sqrt(dx * dx + dy * dy + dz * dz) * 0.5f);
     zoom_ = 1.0f;
     hasFit_ = true;
 }
