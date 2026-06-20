@@ -1001,7 +1001,7 @@ void TransformVectorRowVector(const float* matrix, const float in[3], float out[
 }
 
 void SkinVertex(const SkinnedMeshRenderer::SourceVertex& source,
-    const std::vector<std::array<float, 16>>& bonePalette, float outPosition[3],
+    const std::vector<Mat4>& bonePalette, float outPosition[3],
     float outNormal[3], float outUv[2], int modelBones[4])
 {
     outPosition[0] = outPosition[1] = outPosition[2] = 0.0f;
@@ -1034,7 +1034,7 @@ void SkinVertex(const SkinnedMeshRenderer::SourceVertex& source,
             continue;
 
         const float weight = static_cast<float>(weightByte) / static_cast<float>(totalWeight);
-        const float* matrix = bonePalette[modelBone].data();
+        const float* matrix = bonePalette[modelBone].m;
 
         float skinnedPosition[3]{};
         float skinnedNormal[3]{};
@@ -1080,40 +1080,37 @@ bool ReadOzzObject(client::asset::IAssetReader& assets, const std::string& path,
     return true;
 }
 
-std::array<float, 16> IdentityPaletteMatrix()
+xm::Mat4 IdentityPaletteMatrix()
 {
-    return {1.0f, 0.0f, 0.0f, 0.0f,
-        0.0f, 1.0f, 0.0f, 0.0f,
-        0.0f, 0.0f, 1.0f, 0.0f,
-        0.0f, 0.0f, 0.0f, 1.0f};
+    return xm::Mat4Identity();
 }
 
-std::array<float, 16> ToRowMajorMatrix(const ozz::math::Float4x4& matrix)
+xm::Mat4 ToRowMajorMatrix(const ozz::math::Float4x4& matrix)
 {
     float columns[4][4]{};
     for (int col = 0; col < 4; ++col)
         ozz::math::StorePtrU(matrix.cols[col], columns[col]);
 
-    std::array<float, 16> out{};
+    xm::Mat4 out{};
     for (int row = 0; row < 4; ++row)
     {
         for (int col = 0; col < 4; ++col)
-            out[row * 4 + col] = columns[col][row];
+            out.m[row * 4 + col] = columns[col][row];
     }
     return out;
 }
 
-std::array<float, 16> ToRowVectorPaletteMatrix(const ozz::math::Float4x4& matrix)
+xm::Mat4 ToRowVectorPaletteMatrix(const ozz::math::Float4x4& matrix)
 {
     float columns[4][4]{};
     for (int col = 0; col < 4; ++col)
         ozz::math::StorePtrU(matrix.cols[col], columns[col]);
 
-    std::array<float, 16> out{};
+    xm::Mat4 out{};
     for (int row = 0; row < 4; ++row)
     {
         for (int col = 0; col < 4; ++col)
-            out[row * 4 + col] = columns[row][col];
+            out.m[row * 4 + col] = columns[row][col];
     }
     return out;
 }
@@ -2112,10 +2109,10 @@ bool SkinnedMeshRenderer::SkinPose(float animTimeSeconds, bool updateBounds, boo
         for (int col = 0; col < 4; ++col)
         {
             inverseBind.cols[col] = ozz::math::simd_float4::Load(
-                m_inverseBindMatrices[bone][0 * 4 + col],
-                m_inverseBindMatrices[bone][1 * 4 + col],
-                m_inverseBindMatrices[bone][2 * 4 + col],
-                m_inverseBindMatrices[bone][3 * 4 + col]);
+                m_inverseBindMatrices[bone].m[0 * 4 + col],
+                m_inverseBindMatrices[bone].m[1 * 4 + col],
+                m_inverseBindMatrices[bone].m[2 * 4 + col],
+                m_inverseBindMatrices[bone].m[3 * 4 + col]);
         }
         m_bonePaletteCpu[bone] = ToRowVectorPaletteMatrix(m_ozz->models[bone] * inverseBind);
     }
@@ -2212,7 +2209,7 @@ bool SkinnedMeshRenderer::UploadBonePalette(MotionState state, float animTimeSec
     if (!SkinPose(animTimeSeconds, false, false))
         return false;
 
-    const VkDeviceSize size = sizeof(std::array<float, 16>) * m_bonePaletteCpu.size();
+    const VkDeviceSize size = sizeof(Mat4) * m_bonePaletteCpu.size();
     void* mapped = nullptr;
     VK_CHECK(vkMapMemory(m_device, m_bonePaletteBuffers[frameIndex][skinSlot].memory, 0, size, 0, &mapped));
     std::memcpy(mapped, m_bonePaletteCpu.data(), static_cast<size_t>(size));
@@ -2357,7 +2354,7 @@ bool SkinnedMeshRenderer::CreateComputeResources(VulkanDevice& device)
 
     const VkDeviceSize restSize = sizeof(RestVertexGpu) * m_restVerticesGpu.size();
     const VkDeviceSize vertexSize = sizeof(Vertex) * m_vertices.size();
-    const VkDeviceSize paletteSize = sizeof(std::array<float, 16>) * static_cast<size_t>(m_boneCount);
+    const VkDeviceSize paletteSize = sizeof(Mat4) * static_cast<size_t>(m_boneCount);
     if (restSize == 0 || vertexSize == 0 || paletteSize == 0)
     {
         LogFormat("[COMPUTE] invalid buffer sizes rest=%llu output=%llu palette=%llu",
@@ -2669,7 +2666,7 @@ bool SkinnedMeshRenderer::CreateComputeDescriptors()
 
             VkDescriptorBufferInfo bonesInfo{};
             bonesInfo.buffer = m_bonePaletteBuffers[frame][skinSlot].buffer;
-            bonesInfo.range = sizeof(std::array<float, 16>) * static_cast<size_t>(m_boneCount);
+            bonesInfo.range = sizeof(Mat4) * static_cast<size_t>(m_boneCount);
 
             VkDescriptorBufferInfo outputInfo{};
             outputInfo.buffer = m_skinnedOutputBuffers[frame][skinSlot].buffer;

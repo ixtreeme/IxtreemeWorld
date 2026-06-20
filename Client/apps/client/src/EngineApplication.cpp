@@ -129,8 +129,7 @@ void ShowFatal(const char* message)
 
 float HeadingFromQuantized(std::uint16_t heading)
 {
-    constexpr float kTwoPi = 6.28318530717958647692f;
-    return (static_cast<float>(heading) / 65535.0f) * kTwoPi;
+    return (static_cast<float>(heading) / 65535.0f) * xm::TwoPi;
 }
 
 struct FrameCpuProfile

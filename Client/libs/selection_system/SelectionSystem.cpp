@@ -6,8 +6,6 @@ namespace xm = ixtreeme::math;
 
 namespace
 {
-constexpr float kPi = xm::Pi;
-
 WorldVec3 SpotLightDirection(const SpotLight& spot)
 {
     const float pitch = spot.rotation[0];
@@ -45,7 +43,7 @@ void AddCircle(std::vector<SelectionOutlineRenderer::Line>& lines,
     bool hasPrevious = false;
     for (int i = 0; i < segments; ++i)
     {
-        const float angle = (static_cast<float>(i) / static_cast<float>(segments)) * kPi * 2.0f;
+        const float angle = (static_cast<float>(i) / static_cast<float>(segments)) * xm::TwoPi;
         const WorldVec3 point = center +
             axisA * (std::cos(angle) * radius) +
             axisB * (std::sin(angle) * radius);
@@ -192,7 +190,7 @@ std::vector<SelectionOutlineRenderer::Line> BuildSelectionOutlineLines(
         WorldVec3 first{};
         for (int i = 0; i < 32; ++i)
         {
-            const float angle = (static_cast<float>(i) / 32.0f) * kPi * 2.0f;
+            const float angle = (static_cast<float>(i) / 32.0f) * xm::TwoPi;
             const WorldVec3 point = center +
                 right * (std::cos(angle) * radius) +
                 up * (std::sin(angle) * radius);
@@ -317,13 +315,13 @@ std::vector<SelectionOutlineRenderer::Line> BuildEditorLightShapeLines(
         const WorldVec3 right = SafePerpendicular(direction);
         const WorldVec3 up = xm::Normalize(xm::Cross(direction, right));
         const float range = std::max(0.25f, light.radius);
-        const float outerRadians = std::clamp(light.outerConeDegrees, 1.0f, 90.0f) * kPi / 180.0f;
+        const float outerRadians = xm::DegreesToRadians(std::clamp(light.outerConeDegrees, 1.0f, 90.0f));
         const float baseRadius = std::tan(outerRadians) * range;
         const WorldVec3 baseCenter = apex + direction * range;
         AddCircle(lines, baseCenter, right, up, baseRadius, color, 32);
         for (int i = 0; i < 4; ++i)
         {
-            const float angle = (static_cast<float>(i) / 4.0f) * kPi * 2.0f + kPi * 0.25f;
+            const float angle = (static_cast<float>(i) / 4.0f) * xm::TwoPi + xm::Pi * 0.25f;
             const WorldVec3 rim = baseCenter +
                 right * (std::cos(angle) * baseRadius) +
                 up * (std::sin(angle) * baseRadius);

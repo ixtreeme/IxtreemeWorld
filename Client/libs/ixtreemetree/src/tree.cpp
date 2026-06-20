@@ -13,8 +13,6 @@ namespace
 {
 namespace xm = ixtreeme::math;
 
-constexpr float kPi = xm::Pi;
-
 xm::Vec3 ToMath(Vec3 v)
 {
     return {v.x, v.y, v.z};
@@ -138,7 +136,7 @@ BranchEnd GenerateBranch(const TreeOptions& options,
     const float baseRadius = std::max(0.01f, options.branch.radius[index]);
     const float taper = std::clamp(options.branch.taper[index], 0.05f, 1.0f);
     const float gnarliness = std::max(0.0f, options.branch.gnarliness[index]);
-    const float twist = options.branch.twist[index] * kPi / 180.0f;
+    const float twist = xm::DegreesToRadians(options.branch.twist[index]);
     const Vec3 forceDirection = Normalize(options.branch.forceDirection);
     const float forceStrength = options.branch.forceStrength;
 
@@ -180,7 +178,7 @@ BranchEnd GenerateBranch(const TreeOptions& options,
         for (int seg = 0; seg <= radialSegments; ++seg)
         {
             const float u = static_cast<float>(seg) / static_cast<float>(radialSegments);
-            const float a = u * 2.0f * kPi;
+            const float a = u * xm::TwoPi;
             const Vec3 normal = Normalize(Add(Mul(right, std::cos(a)), Mul(up, std::sin(a))));
             const Vec3 position = Add(centers[static_cast<std::size_t>(ring)], Mul(normal, radius));
             mesh.bark.vertices.push_back(Vertex{position, normal, Vec2{u * options.bark.textureScale.x, t * options.bark.textureScale.y}});
@@ -212,7 +210,7 @@ BranchEnd GenerateBranch(const TreeOptions& options,
     const int childLevel = level + 1;
     const int childCount = std::max(0, options.branch.children[childLevel]);
     const float start = std::clamp(options.branch.start[childLevel], 0.0f, 0.95f);
-    const float angleRadians = options.branch.angle[childLevel] * kPi / 180.0f;
+    const float angleRadians = xm::DegreesToRadians(options.branch.angle[childLevel]);
     for (int child = 0; child < childCount; ++child)
     {
         const float spanT = (static_cast<float>(child) + rng.uniform(0.15f, 0.85f)) / std::max(1.0f, static_cast<float>(childCount));
@@ -221,7 +219,7 @@ BranchEnd GenerateBranch(const TreeOptions& options,
         Vec3 right{};
         Vec3 up{};
         BuildFrame(axes[static_cast<std::size_t>(centerIndex)], right, up);
-        const float around = rng.uniform(0.0f, 2.0f * kPi);
+        const float around = rng.uniform(0.0f, xm::TwoPi);
         const Vec3 radial = Normalize(Add(Mul(right, std::cos(around)), Mul(up, std::sin(around))));
         const Vec3 childDir = Normalize(Add(Mul(axes[static_cast<std::size_t>(centerIndex)], std::cos(angleRadians)),
             Mul(radial, std::sin(angleRadians))));
@@ -262,7 +260,7 @@ void GenerateLeaves(const TreeOptions& options, Rng& rng, TreeMesh& mesh, const 
     const int atlasGridX = std::clamp(options.leaves.atlasGridX, 1, 8);
     const int atlasGridY = std::clamp(options.leaves.atlasGridY, 1, 8);
     const float start = std::clamp(options.leaves.start, 0.0f, 0.98f);
-    const float leafTilt = options.leaves.angle * kPi / 180.0f;
+    const float leafTilt = xm::DegreesToRadians(options.leaves.angle);
 
     for (const BranchEnd& branch : branches)
     {
@@ -281,11 +279,11 @@ void GenerateLeaves(const TreeOptions& options, Rng& rng, TreeMesh& mesh, const 
             center = Add(center, Add(Mul(right, rng.uniform(-0.05f, 0.05f) * size), Mul(up, rng.uniform(-0.05f, 0.05f) * size)));
 
             const Vec3 clusterAxis = Normalize(Mix(Vec3{0.0f, 1.0f, 0.0f}, branch.direction, 0.25f));
-            const float baseAngle = rng.uniform(0.0f, 2.0f * kPi);
+            const float baseAngle = rng.uniform(0.0f, xm::TwoPi);
             const Vec3 baseTangent = Normalize(Add(Mul(right, std::cos(baseAngle)), Mul(up, std::sin(baseAngle))));
             for (int card = 0; card < cardsPerCluster; ++card)
             {
-                const float cardAngle = (static_cast<float>(card) / static_cast<float>(cardsPerCluster)) * 2.0f * kPi;
+                const float cardAngle = (static_cast<float>(card) / static_cast<float>(cardsPerCluster)) * xm::TwoPi;
                 Vec3 tangent = RotateAroundAxis(baseTangent, clusterAxis, cardAngle);
                 tangent = RotateAroundAxis(tangent, Normalize(Cross(clusterAxis, tangent)), leafTilt * 0.15f);
                 Vec3 normal = Normalize(Cross(clusterAxis, tangent));

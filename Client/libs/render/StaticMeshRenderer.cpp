@@ -1761,7 +1761,7 @@ bool StaticMeshRenderer::LoadBuiltinPrimitiveMesh(const std::string& modelPath)
             for (std::uint32_t x = 0; x <= segments; ++x)
             {
                 const float u = static_cast<float>(x) / static_cast<float>(segments);
-                const float phi = u * 6.28318530717958647692f;
+                const float phi = u * xm::TwoPi;
                 const float px = std::cos(phi) * ringRadius;
                 const float pz = std::sin(phi) * ringRadius;
                 float nx = px;
@@ -1777,14 +1777,14 @@ bool StaticMeshRenderer::LoadBuiltinPrimitiveMesh(const std::string& modelPath)
         for (std::uint32_t ring = 0; ring <= hemiRings; ++ring)
         {
             const float t = static_cast<float>(ring) / static_cast<float>(hemiRings);
-            const float angle = t * 1.57079632679489661923f;
+            const float angle = t * xm::HalfPi;
             addRing(halfCylinder + std::cos(angle) * radius, std::sin(angle) * radius, halfCylinder, t * 0.25f);
         }
         addRing(-halfCylinder, radius, -halfCylinder, 0.75f);
         for (std::uint32_t ring = 1; ring <= hemiRings; ++ring)
         {
             const float t = static_cast<float>(ring) / static_cast<float>(hemiRings);
-            const float angle = 1.57079632679489661923f + t * 1.57079632679489661923f;
+            const float angle = xm::HalfPi + t * xm::HalfPi;
             addRing(-halfCylinder + std::cos(angle) * radius, std::sin(angle) * radius, -halfCylinder, 0.75f + t * 0.25f);
         }
         const std::uint32_t stride = segments + 1u;

@@ -1,6 +1,7 @@
 #include "AssimpExporter.h"
 
 #include "Debug.h"
+#include "math/IXMath.h"
 
 #include <assimp/Exporter.hpp>
 #include <assimp/Importer.hpp>
@@ -41,7 +42,7 @@ aiMatrix4x4 ToAiMatrix(const float* values)
 aiMatrix4x4 YUpToZUp()
 {
     aiMatrix4x4 matrix;
-    aiMatrix4x4::RotationX(1.5707963267948966f, matrix);
+    aiMatrix4x4::RotationX(ixtreeme::math::HalfPi, matrix);
     return matrix;
 }
 

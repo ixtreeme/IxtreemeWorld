@@ -1,6 +1,7 @@
 #pragma once
 
 #include "MaterialAssetManager.h"
+#include "math/Types.h"
 
 #include <array>
 #include <cstdint>
@@ -31,8 +32,8 @@ public:
     {
         std::string name;
         int parentIndex = -1;
-        std::array<float, 16> localTransform{};
-        std::array<float, 16> inverseBindPose{};
+        ixtreeme::math::Mat4 localTransform{};
+        ixtreeme::math::Mat4 inverseBindPose{};
     };
 
     struct SkeletonData

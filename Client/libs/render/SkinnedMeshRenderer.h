@@ -210,8 +210,8 @@ private:
     uint32_t m_indexCount = 0;
     MeshBounds m_bounds{};
     std::unique_ptr<OzzRuntime> m_ozz;
-    std::vector<std::array<float, 16>> m_inverseBindMatrices;
-    std::vector<std::array<float, 16>> m_bonePaletteCpu;
+    std::vector<ixtreeme::math::Mat4> m_inverseBindMatrices;
+    std::vector<ixtreeme::math::Mat4> m_bonePaletteCpu;
     uint32_t m_boneCount = 0;
     MotionState m_motionState = MotionState::Idle;
     LightingState m_lightingState;

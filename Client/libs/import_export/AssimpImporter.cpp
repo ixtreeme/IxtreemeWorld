@@ -332,20 +332,17 @@ GltfMaterialSource BuildMaterialSource(aiMaterial& material,
     return out;
 }
 
-std::array<float, 16> IdentityMatrix()
+xm::Mat4 IdentityMatrix()
 {
-    return {1.0f, 0.0f, 0.0f, 0.0f,
-        0.0f, 1.0f, 0.0f, 0.0f,
-        0.0f, 0.0f, 1.0f, 0.0f,
-        0.0f, 0.0f, 0.0f, 1.0f};
+    return xm::Mat4Identity();
 }
 
-std::array<float, 16> MatrixToRowMajor(const aiMatrix4x4& matrix)
+xm::Mat4 MatrixToRowMajor(const aiMatrix4x4& matrix)
 {
-    return {matrix.a1, matrix.a2, matrix.a3, matrix.a4,
+    return xm::Mat4{{matrix.a1, matrix.a2, matrix.a3, matrix.a4,
         matrix.b1, matrix.b2, matrix.b3, matrix.b4,
         matrix.c1, matrix.c2, matrix.c3, matrix.c4,
-        matrix.d1, matrix.d2, matrix.d3, matrix.d4};
+        matrix.d1, matrix.d2, matrix.d3, matrix.d4}};
 }
 
 AssimpImporter::AnimationKeyframe DecomposeTransform(const aiMatrix4x4& matrix, float time)
@@ -380,7 +377,7 @@ std::unordered_map<std::string, int> BuildBoneIndexMap(const AssimpImporter::Ske
 
 void ExtractSkeleton(const aiScene& scene, AssimpImporter::ImportResult& result)
 {
-    std::unordered_map<std::string, std::array<float, 16>> inverseBindByName;
+    std::unordered_map<std::string, xm::Mat4> inverseBindByName;
     std::unordered_map<std::string, bool> boneNames;
     for (unsigned int meshIndex = 0; meshIndex < scene.mNumMeshes; ++meshIndex)
     {
@@ -614,13 +611,13 @@ void ExtractAnimations(const aiScene& scene,
     }
 }
 
-ozz::math::Transform OzzTransformFromMatrix(const std::array<float, 16>& matrix)
+ozz::math::Transform OzzTransformFromMatrix(const xm::Mat4& matrix)
 {
     aiMatrix4x4 aiMatrix(
-        matrix[0], matrix[1], matrix[2], matrix[3],
-        matrix[4], matrix[5], matrix[6], matrix[7],
-        matrix[8], matrix[9], matrix[10], matrix[11],
-        matrix[12], matrix[13], matrix[14], matrix[15]);
+        matrix.m[0], matrix.m[1], matrix.m[2], matrix.m[3],
+        matrix.m[4], matrix.m[5], matrix.m[6], matrix.m[7],
+        matrix.m[8], matrix.m[9], matrix.m[10], matrix.m[11],
+        matrix.m[12], matrix.m[13], matrix.m[14], matrix.m[15]);
     const AssimpImporter::AnimationKeyframe key = DecomposeTransform(aiMatrix, 0.0f);
     ozz::math::Transform transform{};
     transform.translation = ozz::math::Float3(key.position[0], key.position[1], key.position[2]);
