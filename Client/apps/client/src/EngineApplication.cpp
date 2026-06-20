@@ -986,6 +986,14 @@ int RunGame(NativeWindow& window,
     VkExtent2D requestedRenderResolution{};
     Tracenf("[BOOT] swapchain size = %ux%u", swapchainSize.width, swapchainSize.height);
     Tracenf("[RENDER-RES] initial mode=native size=%ux%u", renderSize.width, renderSize.height);
+    Tracenf("[MATH] backend=%s avx2_fma_preferred=%s",
+        xm::simd::ActiveBackendName(),
+#if defined(IXENGINE_ENABLE_AVX2_FMA)
+        "yes"
+#else
+        "no"
+#endif
+    );
     std::unique_ptr<RuntimeSession> runtimeSession = CreateRuntimeSession();
     if (!runtimeSession->Create(device, assets, swapchainSize.width, swapchainSize.height))
     {
@@ -4996,8 +5004,8 @@ int RunGame(NativeWindow& window,
             engineStats.sceneEntityCount = frameSceneEntityCount;
             engineStats.staticMeshSubmitted = frameStaticMeshSubmitted;
             engineStats.staticMeshDrawCalls = frameStaticMeshDrawCalls;
-            editorImGui.SetSceneViewSelectionOutline({});
             editorImGui.ClearSceneViewGizmo();
+            editorImGui.SetSceneViewSelectionOutline({});
             if (runtimeSession->IsMapEditorOpen() && editorPlay.state.mode == EditorPlayMode::Edit)
             {
                 const SceneGizmoTarget gizmoTarget = BuildSceneGizmoTarget(

@@ -79,21 +79,12 @@ inline Mat4 operator*(const Mat4& a, const Mat4& b)
 
 inline Mat4 MultiplyRowMajor(const Mat4& a, const Mat4& b)
 {
-    Mat4 r{};
-    for (int row = 0; row < 4; ++row)
-    {
-        for (int col = 0; col < 4; ++col)
-        {
-            for (int k = 0; k < 4; ++k)
-                r.m[row * 4 + col] += a.m[row * 4 + k] * b.m[k * 4 + col];
-        }
-    }
-    return r;
+    return simd::MultiplyRowMajor4x4(a, b);
 }
 
 inline Vec4 operator*(const Mat4& m, Vec4 v)
 {
-    return simd::StoreVec4(simd::TransformVec4(m, simd::Load(v)));
+    return simd::TransformVec4(m, v);
 }
 
 inline Mat3 ToMat3(Quat rotation)

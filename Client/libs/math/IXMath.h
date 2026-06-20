@@ -11,6 +11,8 @@
 #include "Easing.h"
 #include "Interpolation.h"
 #include "MathInterop.h"
+#include "MathBatch.h"
+#include "MathDiagnostics.h"
 #include "Random.h"
 #include "Noise.h"
 #include "WorldMath.h"

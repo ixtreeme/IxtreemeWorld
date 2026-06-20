@@ -46,6 +46,9 @@ set(CMAKE_CXX_EXTENSIONS OFF)
 option(ENABLE_ASAN "Enable AddressSanitizer" OFF)
 option(IXTREEME_WITH_EDITOR "Build ImGui-based editor functionality" ON)
 option(IXTREEME_VERBOSE_DIAGNOSTICS "Enable verbose per-frame engine diagnostics" OFF)
+option(IXENGINE_ENABLE_AVX2_FMA "Build AVX2/FMA optimized engine code paths and prefer them at runtime with SSE2 fallback." ON)
+option(IXENGINE_COMPILE_WHOLE_ENGINE_AVX2_FMA "Compile all engine targets with AVX2/FMA instructions. Requires an AVX2/FMA CPU and disables true binary-level SSE2 fallback." OFF)
+mark_as_advanced(IXENGINE_COMPILE_WHOLE_ENGINE_AVX2_FMA)
 
 if(IXTREEME_WITH_EDITOR)
     message(STATUS "IxtreemeEngeni editor build: ENABLED")
@@ -86,6 +89,30 @@ if(MSVC)
 else()
     add_compile_options(-Wall -Wextra -Wpedantic)
 endif()
+
+set(IXENGINE_X86_TARGET OFF)
+if(CMAKE_SYSTEM_PROCESSOR MATCHES "AMD64|x86_64|X86|x86|i[3-6]86")
+    set(IXENGINE_X86_TARGET ON)
+endif()
+
+function(ixengine_apply_cpu_defaults target_name)
+    if(NOT TARGET ${target_name})
+        return()
+    endif()
+
+    if(IXENGINE_ENABLE_AVX2_FMA AND IXENGINE_X86_TARGET)
+        target_compile_definitions(${target_name} PRIVATE IXENGINE_ENABLE_AVX2_FMA=1)
+    endif()
+
+    if(IXENGINE_COMPILE_WHOLE_ENGINE_AVX2_FMA AND IXENGINE_X86_TARGET)
+        target_compile_definitions(${target_name} PRIVATE IXENGINE_WHOLE_ENGINE_AVX2_FMA=1)
+        if(MSVC)
+            target_compile_options(${target_name} PRIVATE /arch:AVX2)
+        else()
+            target_compile_options(${target_name} PRIVATE -mavx2 -mfma)
+        endif()
+    endif()
+endfunction()
 
 include(cmake/BootstrapVcpkg.cmake)
 include(FetchContent)
@@ -472,3 +499,22 @@ add_subdirectory(libs/mesh_system)
 add_subdirectory(libs/terrain_editor_system)
 add_subdirectory(libs/selection_system)
 add_subdirectory(apps/client)
+
+foreach(_ixengine_target IN ITEMS
+    IXEngineMath
+    IXEngineTree
+    IXEngineCommon
+    IXEngineDebug
+    IXEngineMapData
+    meshoptimizer
+    IXEnginePlatform
+    IXEngineAsset
+    IXEngineImportExport
+    IXEngineRender
+    IXEngineMeshSystem
+    IXEngineTerrainEditorSystem
+    IXEngineSelectionSystem
+    IxtreemeEngine
+)
+    ixengine_apply_cpu_defaults(${_ixengine_target})
+endforeach()

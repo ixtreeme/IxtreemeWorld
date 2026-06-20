@@ -142,15 +142,6 @@ inline Float4 TransformVec4(const Mat4& m, Float4 v)
         _mm_add_ps(_mm_mul_ps(col2, zzzz), _mm_mul_ps(col3, wwww)));
 }
 
-inline Mat4 MultiplyMat4(const Mat4& a, const Mat4& b)
-{
-    Mat4 result{};
-    for (int col = 0; col < 4; ++col)
-    {
-        Store(TransformVec4(a, Load(&b.m[col * 4])), &result.m[col * 4]);
-    }
-    return result;
-}
 #else
 struct Float4
 {
@@ -218,14 +209,20 @@ inline Float4 TransformVec4(const Mat4& m, Float4 v)
         m.m[3] * v.x + m.m[7] * v.y + m.m[11] * v.z + m.m[15] * v.w};
 }
 
-inline Mat4 MultiplyMat4(const Mat4& a, const Mat4& b)
-{
-    Mat4 result{};
-    for (int col = 0; col < 4; ++col)
-        Store(TransformVec4(a, Load(&b.m[col * 4])), &result.m[col * 4]);
-    return result;
-}
 #endif
+
+enum class Backend
+{
+    Scalar,
+    SSE2,
+    AVX2FMA
+};
+
+Mat4 MultiplyMat4(const Mat4& a, const Mat4& b);
+Mat4 MultiplyRowMajor4x4(const Mat4& a, const Mat4& b);
+Vec4 TransformVec4(const Mat4& m, Vec4 v);
+Backend ActiveBackend();
+const char* ActiveBackendName();
 
 inline constexpr bool Enabled()
 {

@@ -853,6 +853,36 @@ void EditorImGui::RenderPerformancePanel()
     ImGui::Text("Render Target: %u x %u",
         m_engineStats.renderWidth,
         m_engineStats.renderHeight);
+    ImGui::Separator();
+    ImGui::Text("Math backend: %s", ixtreeme::math::simd::ActiveBackendName());
+    static ixtreeme::math::diagnostics::SelfCheckResult mathSelfCheck = ixtreeme::math::diagnostics::RunSelfCheck();
+    ImGui::Text("Math self-check: %s  max error %.6f  checks %u",
+        mathSelfCheck.passed ? "OK" : "FAILED",
+        mathSelfCheck.maxAbsError,
+        mathSelfCheck.checks);
+    static ixtreeme::math::diagnostics::BenchmarkResult mathBenchmark{};
+    static bool mathBenchmarkReady = false;
+    if (ImGui::Button("Run Math Benchmark"))
+    {
+        mathBenchmark = ixtreeme::math::diagnostics::RunBenchmark(75000);
+        mathBenchmarkReady = true;
+        Tracenf("[MATH-BENCH] backend=%s iters=%u mat4=%.3fms rowMat4=%.3fms vec4=%.3fms frustumAabb=%.3fms checksum=%.3f",
+            mathBenchmark.backend.c_str(),
+            mathBenchmark.iterations,
+            mathBenchmark.columnMajorMat4Ms,
+            mathBenchmark.rowMajorMat4Ms,
+            mathBenchmark.transformVec4Ms,
+            mathBenchmark.frustumAabbMs,
+            mathBenchmark.checksum);
+    }
+    if (mathBenchmarkReady)
+    {
+        ImGui::TextDisabled("Bench: mat4 %.2f ms | row %.2f ms | vec4 %.2f ms | frustum %.2f ms",
+            mathBenchmark.columnMajorMat4Ms,
+            mathBenchmark.rowMajorMat4Ms,
+            mathBenchmark.transformVec4Ms,
+            mathBenchmark.frustumAabbMs);
+    }
 
     const char* modes[] = {
         "Native / Window",

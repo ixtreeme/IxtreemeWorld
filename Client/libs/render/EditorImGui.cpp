@@ -84,7 +84,7 @@ ImGuizmo::OPERATION ToImGuizmoOperation(MapEditorGizmoOperation operation)
         return ImGuizmo::SCALE;
     case MapEditorGizmoOperation::Translate:
     default:
-        return ImGuizmo::UNIVERSAL;
+        return ImGuizmo::TRANSLATE;
     }
 }
 
