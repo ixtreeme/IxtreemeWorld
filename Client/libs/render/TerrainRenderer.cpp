@@ -1229,6 +1229,35 @@ double EstimateAverageActiveSplatLayers(const std::vector<uint8_t>& splatA,
     return static_cast<double>(activeTotal) / static_cast<double>(texelCount);
 }
 
+uint32_t EstimateActiveSplatLayerSpan(const std::vector<uint8_t>& splatA,
+                                      const std::vector<uint8_t>& splatB,
+                                      uint32_t width,
+                                      uint32_t height)
+{
+    const size_t texelCount = static_cast<size_t>(width) * height;
+    if (texelCount == 0 ||
+        splatA.size() < texelCount * 4u ||
+        splatB.size() < texelCount * 4u)
+    {
+        return 1u;
+    }
+
+    uint32_t highestActiveLayer = 0;
+    for (size_t texel = 0; texel < texelCount; ++texel)
+    {
+        const size_t byte = texel * 4u;
+        for (uint32_t i = 0; i < 4; ++i)
+        {
+            if (splatA[byte + i] > 0)
+                highestActiveLayer = std::max(highestActiveLayer, i);
+            if (splatB[byte + i] > 0)
+                highestActiveLayer = std::max(highestActiveLayer, 4u + i);
+        }
+    }
+
+    return std::clamp(highestActiveLayer + 1u, 1u, 8u);
+}
+
 float Smoothstep(float edge0, float edge1, float x)
 {
     const float denom = std::max(edge1 - edge0, 0.0001f);
@@ -2046,6 +2075,7 @@ bool TerrainRenderer::CreateFlatTerrain(VulkanDevice& device, const TerrainScene
     m_sceneTerrainActive = true;
     m_sceneTerrain = next;
     m_triplanarParamsDirty = true;
+    m_terrainShaderOptimDiagLogged = false;
     Tracenf("[TERRAIN-CREATE] dims=%.2fx%.2f m, cellSize=%.2f m, cells=%ux%u, verts=%zu, pos=(0.00,0.00,0.00)",
         next.widthMeters,
         next.depthMeters,
@@ -2112,6 +2142,7 @@ void TerrainRenderer::ClearTerrain(VulkanDevice& device)
     m_mapSizeY = 0;
     m_mapLoaded = false;
     m_sceneTerrainActive = false;
+    m_terrainShaderOptimDiagLogged = false;
     m_sceneTerrain = {};
     CreateDescriptors();
     Tracenf("[TEDIT-DIAG] active terrain cleared id=%p activeTerrain=NULL", static_cast<void*>(this));
@@ -2531,34 +2562,14 @@ void TerrainRenderer::RenderWaterReflection(VulkanDevice& device,
         float layerParams[4];
     };
 
-    if (!m_layers.empty() && m_layerDescriptorSets.size() == m_layers.size() * kFramesInFlight)
-    {
-        for (size_t layerIndex = 0; layerIndex < m_layers.size(); ++layerIndex)
-        {
-            const TerrainLayer& layer = m_layers[layerIndex];
-            TerrainPushConstants push{{layer.tilingU, layer.tilingV, 0.0f, 0.0f}};
-            vkCmdPushConstants(cmd, m_waterReflectionPipelineLayout,
-                VK_SHADER_STAGE_VERTEX_BIT | VK_SHADER_STAGE_FRAGMENT_BIT,
-                0, sizeof(push), &push);
-            const VkDescriptorSet descriptorSet =
-                m_layerDescriptorSets[layerIndex * kFramesInFlight + frameIndex];
-            vkCmdBindDescriptorSets(cmd, VK_PIPELINE_BIND_POINT_GRAPHICS, m_waterReflectionPipelineLayout,
-                0, 1, &descriptorSet, 0, nullptr);
-            vkCmdDrawIndexed(cmd, m_indexCount, 1, 0, 0, 0);
-            ++reflectionStats.drawCalls;
-        }
-    }
-    else
-    {
-        TerrainPushConstants push{{1.0f, 1.0f, 0.0f, 0.0f}};
-        vkCmdPushConstants(cmd, m_waterReflectionPipelineLayout,
-            VK_SHADER_STAGE_VERTEX_BIT | VK_SHADER_STAGE_FRAGMENT_BIT,
-            0, sizeof(push), &push);
-        vkCmdBindDescriptorSets(cmd, VK_PIPELINE_BIND_POINT_GRAPHICS, m_waterReflectionPipelineLayout,
-            0, 1, &m_descriptorSets[frameIndex], 0, nullptr);
-        vkCmdDrawIndexed(cmd, m_indexCount, 1, 0, 0, 0);
-        ++reflectionStats.drawCalls;
-    }
+    TerrainPushConstants push{{1.0f, 1.0f, 0.0f, 0.0f}};
+    vkCmdPushConstants(cmd, m_waterReflectionPipelineLayout,
+        VK_SHADER_STAGE_VERTEX_BIT | VK_SHADER_STAGE_FRAGMENT_BIT,
+        0, sizeof(push), &push);
+    vkCmdBindDescriptorSets(cmd, VK_PIPELINE_BIND_POINT_GRAPHICS, m_waterReflectionPipelineLayout,
+        0, 1, &m_descriptorSets[frameIndex], 0, nullptr);
+    vkCmdDrawIndexed(cmd, m_indexCount, 1, 0, 0, 0);
+    ++reflectionStats.drawCalls;
 
     reflectionStats.executed = reflectionStats.drawCalls > 0;
     reflectionStats.chunksDrawn = m_terrainChunks.empty()
@@ -2684,32 +2695,27 @@ void TerrainRenderer::Render(VulkanDevice& device, const WorldCamera& camera, Vk
         : static_cast<uint32_t>(m_visibleTerrainChunksScratch.size());
     terrainStats.chunksCulled = m_terrainChunks.empty() ? 0u : culledChunks;
 
-    if (!m_layers.empty() && m_layerDescriptorSets.size() == m_layers.size() * kFramesInFlight)
-    {
-        for (size_t layerIndex = 0; layerIndex < m_layers.size(); ++layerIndex)
-        {
-            const TerrainLayer& layer = m_layers[layerIndex];
-            TerrainPushConstants push{{layer.tilingU, layer.tilingV, 0.0f, 0.0f}};
-            vkCmdPushConstants(cmd, m_pipelineLayout,
-                VK_SHADER_STAGE_VERTEX_BIT | VK_SHADER_STAGE_FRAGMENT_BIT,
-                0, sizeof(push), &push);
+    TerrainPushConstants push{{1.0f, 1.0f, 0.0f, 0.0f}};
+    vkCmdPushConstants(cmd, m_pipelineLayout,
+        VK_SHADER_STAGE_VERTEX_BIT | VK_SHADER_STAGE_FRAGMENT_BIT,
+        0, sizeof(push), &push);
+    vkCmdBindDescriptorSets(cmd, VK_PIPELINE_BIND_POINT_GRAPHICS, m_pipelineLayout,
+        0, 1, &m_descriptorSets[frameIndex], 0, nullptr);
+    const uint32_t baseDrawCallsBefore = terrainStats.drawCalls;
+    drawVisibleTerrainChunks();
+    const uint32_t baseDrawCalls = terrainStats.drawCalls - baseDrawCallsBefore;
 
-            const VkDescriptorSet descriptorSet =
-                m_layerDescriptorSets[layerIndex * kFramesInFlight + frameIndex];
-            vkCmdBindDescriptorSets(cmd, VK_PIPELINE_BIND_POINT_GRAPHICS, m_pipelineLayout,
-                0, 1, &descriptorSet, 0, nullptr);
-            drawVisibleTerrainChunks();
-        }
-    }
-    else
+    if (!m_terrainShaderOptimDiagLogged)
     {
-        TerrainPushConstants push{{1.0f, 1.0f, 0.0f, 0.0f}};
-        vkCmdPushConstants(cmd, m_pipelineLayout,
-            VK_SHADER_STAGE_VERTEX_BIT | VK_SHADER_STAGE_FRAGMENT_BIT,
-            0, sizeof(push), &push);
-        vkCmdBindDescriptorSets(cmd, VK_PIPELINE_BIND_POINT_GRAPHICS, m_pipelineLayout,
-            0, 1, &m_descriptorSets[frameIndex], 0, nullptr);
-        drawVisibleTerrainChunks();
+        const uint32_t activeLayerCount =
+            EstimateActiveSplatLayerSpan(m_splatABytes, m_splatBBytes, m_splatWidth, m_splatHeight);
+        const uint32_t samplesPerLayer = m_sceneTerrain.triplanarEnabled ? 16u : 5u;
+        Tracenf("[TERRAIN-SHADER-DIAG] active_layer_count=%u total_layer_count=8 triplanar_enabled=%s samples_per_pixel_estimate=%u render_pass_count=1 draw_calls_per_frame=%u",
+            activeLayerCount,
+            m_sceneTerrain.triplanarEnabled ? "yes" : "no",
+            activeLayerCount * samplesPerLayer,
+            baseDrawCalls);
+        m_terrainShaderOptimDiagLogged = true;
     }
 
     if (m_mapLoaded && m_mapEditorOpen && m_editorBrushVisible)
@@ -4425,6 +4431,7 @@ bool TerrainRenderer::CreateMapBuffers(VulkanDevice& device, const std::string& 
     }
 
     m_mapLoaded = true;
+    m_terrainShaderOptimDiagLogged = false;
     Tracenf("[TERRAIN-MAP] loaded clean-room map dir=%s world=%s sizeCells=%u chunkCells=%u grid=%ux%u spawnServer=(%d,%d) spawnLocalCm=(%.0f,%.0f) spawnHeightCm=%.1f heightCm=%.1f..%.1f vertices=%zu indices=%zu",
         mapDirectory.c_str(),
         field->manifest.world_id.c_str(),
@@ -7736,6 +7743,8 @@ void TerrainRenderer::UpdateUniform(uint32_t frameIndex, const WorldCamera& came
     uniform.terrainMaterialParams[1] = std::clamp(m_sceneTerrain.triplanarSharpness, 1.0f, 16.0f);
     uniform.terrainMaterialParams[2] = std::clamp(m_sceneTerrain.triplanarSlopeThreshold, 0.0f, 1.0f);
     uniform.terrainMaterialParams[3] = std::clamp(m_sceneTerrain.triplanarSlopeTransition, 0.001f, 1.0f);
+    uniform.activeLayerCount = static_cast<std::int32_t>(
+        EstimateActiveSplatLayerSpan(m_splatABytes, m_splatBBytes, m_splatWidth, m_splatHeight));
     uniform.cameraPos[0] = camera.eye.x;
     uniform.cameraPos[1] = camera.eye.y;
     uniform.cameraPos[2] = camera.eye.z;
@@ -7855,7 +7864,7 @@ void TerrainRenderer::UpdateUniform(uint32_t frameIndex, const WorldCamera& came
             std::clamp(m_sceneTerrain.triplanarSlopeThreshold, 0.0f, 1.0f),
             std::clamp(m_sceneTerrain.triplanarSlopeTransition, 0.001f, 1.0f));
         if (m_sceneTerrain.triplanarEnabled)
-            Tracen("[TRIPLANAR] sample mode active, layers=8");
+            Tracenf("[TRIPLANAR] sample mode active, layers=%d", uniform.activeLayerCount);
         m_triplanarParamsDirty = false;
     }
 #if defined(IXTREEME_DEBUG_LOGS)
@@ -7891,7 +7900,7 @@ void TerrainRenderer::UpdateUniform(uint32_t frameIndex, const WorldCamera& came
             terrainMipsUsable ? "yes" : "no",
             terrainMipsUsable ? "no" : "yes",
             terrainMipsUsable ? "terrain-array-textures-have-full-mip-chain-and-branch-safe-gradients" : "one-or-more-terrain-array-textures-have-1-mip");
-        TraceDiag("[TRI-PERF] layer sampling=weight-gated threshold=1/255 derivativeSafe=textureGrad-gradients-before-branch");
+        TraceDiag("[TRI-PERF] layer sampling=weight-gated threshold=1/255 uvWork=after-weight-check derivativeSafe=textureGrad-explicit");
         TraceDiagf("[TRI-PERF] likely bottleneck class=%s",
             terrainMipsUsable ? "active-layer-count-and-remaining-triplanar-sample-count" : "fragment-texture-bandwidth-plus-mip0-cache-pressure");
         m_triPerfStaticLogged = true;

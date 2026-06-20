@@ -1043,12 +1043,21 @@ bool RunRenderChecks(const Options& options, TestContext& ctx)
             terrainRendererSource.find("sampler.mipmapMode = out.mipLevels > 1 ? VK_SAMPLER_MIPMAP_MODE_LINEAR") != std::string::npos,
         "terrain array texture mip chains", "Terrain array textures must upload full mip chains and use trilinear/aniso sampling");
     ctx.Expect(terrainSource.find("const float layerWeightEpsilon = 1.0 / 255.0") != std::string::npos &&
+            terrainSource.find("int u_activeLayerCount") != std::string::npos &&
+            terrainSource.find("const int activeLayerCount = clamp(u_activeLayerCount, 1, 8)") != std::string::npos &&
+            terrainSource.find("for (int layer = 0; layer < activeLayerCount; ++layer)") != std::string::npos &&
             terrainSource.find("if (weights[layer] < layerWeightEpsilon)") != std::string::npos &&
             terrainSource.find("continue;") != std::string::npos &&
             terrainSource.find("SampleGrad") != std::string::npos &&
             terrainSource.find("TriplanarPlaneUvGrad") != std::string::npos &&
             terrainSource.find("if (triplanarSlopeBlend > 0.001)") != std::string::npos,
         "terrain layer weight gating", "Terrain shader must skip zero-weight layers while using explicit gradients for mip-safe sampling");
+    ctx.Expect(terrainRendererSource.find("EstimateActiveSplatLayerSpan") != std::string::npos &&
+            terrainRendererSource.find("[TERRAIN-SHADER-DIAG] active_layer_count=%u total_layer_count=8") != std::string::npos &&
+            terrainRendererSource.find("render_pass_count=1") != std::string::npos &&
+            terrainRendererSource.find("const uint32_t baseDrawCallsBefore = terrainStats.drawCalls") != std::string::npos &&
+            terrainRendererSource.find("&m_descriptorSets[frameIndex]") != std::string::npos,
+        "terrain shader single pass optimization", "Terrain renderer must submit the palette-array terrain in a single material pass with active-layer diagnostics");
     const std::filesystem::path waterBodyIoPath = options.clientRoot / "libs" / "render" / "WaterBodyIO.h";
     std::ifstream waterBodyIo(waterBodyIoPath);
     std::stringstream waterBodyIoText;

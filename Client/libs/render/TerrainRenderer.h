@@ -192,6 +192,8 @@ private:
         float materialTintNormal[8][4];
         float materialPbr[8][4];
         float terrainMaterialParams[4] = {0.0f, 4.0f, 0.18f, 0.20f}; // triplanar enabled, sharpness, slope threshold, slope transition
+        std::int32_t activeLayerCount = 1;
+        std::int32_t terrainPadding0[3] = {0, 0, 0};
         float cameraPos[4];
         float sunDir[4];
         float sunColor[4];
@@ -541,6 +543,7 @@ private:
     bool m_triPerfMainPassLogged = false;
     bool m_triPerfReflectionPassLogged = false;
     bool m_triPerfShadowPassLogged = false;
+    bool m_terrainShaderOptimDiagLogged = false;
     std::string m_loadedMapDirectory;
     int32_t m_loadedServerX = 0;
     int32_t m_loadedServerY = 0;

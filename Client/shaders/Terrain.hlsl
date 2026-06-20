@@ -29,6 +29,8 @@ struct TerrainWaterBodyUbo
     float4 u_materialTintNormal[8];
     float4 u_materialPbr[8];
     float4 u_terrainMaterialParams; // x: triplanar enabled, y: blend sharpness, z: slope threshold, w: slope transition
+    int u_activeLayerCount;
+    int3 u_terrainPadding0;
     float4 u_cameraPos;
     float4 u_sunDir;
     float4 u_sunColor;
@@ -440,9 +442,13 @@ float4 PSMain(VSOutput input) : SV_Target0
     float ao = 0.0;
     float roughness = 0.0;
     float metallic = 0.0;
-    [unroll]
-    for (int layer = 0; layer < 8; ++layer)
+    const int activeLayerCount = clamp(u_activeLayerCount, 1, 8);
+    [loop]
+    for (int layer = 0; layer < activeLayerCount; ++layer)
     {
+        if (weights[layer] < layerWeightEpsilon)
+            continue;
+
         float3 diffuse = 0.0.xxx;
         float3 sampledNormal = float3(0.0, 0.0, 1.0);
         float3 sampledNormalWs = surfaceNormal;
@@ -461,8 +467,6 @@ float4 PSMain(VSOutput input) : SV_Target0
         const float2 uvYDy = TriplanarPlaneUvGrad(worldDy, 1, layer);
         const float2 uvZDx = TriplanarPlaneUvGrad(worldDx, 2, layer);
         const float2 uvZDy = TriplanarPlaneUvGrad(worldDy, 2, layer);
-        if (weights[layer] < layerWeightEpsilon)
-            continue;
 
         if (triplanarEnabled)
         {
