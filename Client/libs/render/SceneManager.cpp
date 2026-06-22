@@ -797,6 +797,15 @@ void ReadFloatArray(const JsonValue& object, const char* key, float* values, siz
         values[i] = static_cast<float>(array->array[i].NumberOr(values[i]));
 }
 
+void ReadBoolArray(const JsonValue& object, const char* key, bool* values, size_t count)
+{
+    const JsonValue* array = Find(object, key);
+    if (!array || array->type != JsonValue::Type::Array)
+        return;
+    for (size_t i = 0; i < count && i < array->array.size(); ++i)
+        values[i] = array->array[i].BoolOr(values[i]);
+}
+
 std::string FloatArray(const float* values, size_t count)
 {
     std::ostringstream out;
@@ -806,6 +815,20 @@ std::string FloatArray(const float* values, size_t count)
         if (i > 0)
             out << ", ";
         out << values[i];
+    }
+    out << ']';
+    return out.str();
+}
+
+std::string BoolArray(const bool* values, size_t count)
+{
+    std::ostringstream out;
+    out << '[';
+    for (size_t i = 0; i < count; ++i)
+    {
+        if (i > 0)
+            out << ", ";
+        out << (values[i] ? "true" : "false");
     }
     out << ']';
     return out.str();
@@ -1044,6 +1067,34 @@ void WriteLodComponent(std::ostream& out, const LodComponent& lod, bool comma)
     out << "      }" << (comma ? "," : "") << "\n";
 }
 
+void WriteRigidbodyComponent(std::ostream& out, const ixtreeme::physics::RigidbodyComponent& rigidbody)
+{
+    out << "      \"rigidbody\": {\n";
+    out << "        \"enabled\": " << (rigidbody.enabled ? "true" : "false") << ",\n";
+    out << "        \"body_type\": \"" << ixtreeme::physics::ToString(rigidbody.bodyType) << "\",\n";
+    out << "        \"mass\": " << rigidbody.mass << ",\n";
+    out << "        \"linear_damping\": " << rigidbody.linearDamping << ",\n";
+    out << "        \"angular_damping\": " << rigidbody.angularDamping << ",\n";
+    out << "        \"use_gravity\": " << (rigidbody.useGravity ? "true" : "false") << ",\n";
+    out << "        \"freeze_position\": " << BoolArray(rigidbody.freezePosition, 3) << ",\n";
+    out << "        \"freeze_rotation\": " << BoolArray(rigidbody.freezeRotation, 3) << "\n";
+    out << "      }";
+}
+
+void WriteColliderComponent(std::ostream& out, const ixtreeme::physics::ColliderComponent& collider)
+{
+    out << "      \"collider\": {\n";
+    out << "        \"enabled\": " << (collider.enabled ? "true" : "false") << ",\n";
+    out << "        \"trigger\": " << (collider.trigger ? "true" : "false") << ",\n";
+    out << "        \"shape\": \"" << ixtreeme::physics::ToString(collider.shape) << "\",\n";
+    out << "        \"center\": " << FloatArray(collider.center, 3) << ",\n";
+    out << "        \"size\": " << FloatArray(collider.size, 3) << ",\n";
+    out << "        \"radius\": " << collider.radius << ",\n";
+    out << "        \"height\": " << collider.height << ",\n";
+    out << "        \"material_asset_id\": \"" << EscapeJson(collider.materialAssetId) << "\"\n";
+    out << "      }";
+}
+
 void WriteSceneEntity(std::ostream& out, const MeshSceneEntity& mesh, bool comma)
 {
     out << "    {\n";
@@ -1094,6 +1145,20 @@ void WriteSceneEntity(std::ostream& out, const MeshSceneEntity& mesh, bool comma
             mesh.id,
             mesh.lod.config.levelCount,
             mesh.lod.overrideAssetDefault ? 1 : 0);
+    }
+    if (mesh.hasRigidbody)
+    {
+        out << ",\n";
+        WriteRigidbodyComponent(out, mesh.rigidbody);
+        out << "\n";
+        Tracenf("[PHYSICS] saved rigidbody entity=%u", mesh.id);
+    }
+    if (mesh.hasCollider)
+    {
+        out << ",\n";
+        WriteColliderComponent(out, mesh.collider);
+        out << "\n";
+        Tracenf("[PHYSICS] saved collider entity=%u shape=%s", mesh.id, ixtreeme::physics::ToString(mesh.collider.shape));
     }
     else
         out << "\n";
@@ -1253,6 +1318,42 @@ LodComponent ReadLodComponent(const JsonValue& entity)
     return lod;
 }
 
+ixtreeme::physics::RigidbodyComponent ReadRigidbodyComponent(const JsonValue& entity)
+{
+    ixtreeme::physics::RigidbodyComponent rigidbody;
+    if (const JsonValue* object = Find(entity, "rigidbody"); object && object->type == JsonValue::Type::Object)
+    {
+        rigidbody.enabled = ReadBool(*object, "enabled", rigidbody.enabled);
+        rigidbody.bodyType = ixtreeme::physics::BodyTypeFromString(ReadString(*object, "body_type"), rigidbody.bodyType);
+        rigidbody.mass = ReadFloat(*object, "mass", rigidbody.mass);
+        rigidbody.linearDamping = ReadFloat(*object, "linear_damping", rigidbody.linearDamping);
+        rigidbody.angularDamping = ReadFloat(*object, "angular_damping", rigidbody.angularDamping);
+        rigidbody.useGravity = ReadBool(*object, "use_gravity", rigidbody.useGravity);
+        ReadBoolArray(*object, "freeze_position", rigidbody.freezePosition, 3);
+        ReadBoolArray(*object, "freeze_rotation", rigidbody.freezeRotation, 3);
+        ixtreeme::physics::Sanitize(rigidbody);
+    }
+    return rigidbody;
+}
+
+ixtreeme::physics::ColliderComponent ReadColliderComponent(const JsonValue& entity)
+{
+    ixtreeme::physics::ColliderComponent collider;
+    if (const JsonValue* object = Find(entity, "collider"); object && object->type == JsonValue::Type::Object)
+    {
+        collider.enabled = ReadBool(*object, "enabled", collider.enabled);
+        collider.trigger = ReadBool(*object, "trigger", collider.trigger);
+        collider.shape = ixtreeme::physics::ColliderShapeFromString(ReadString(*object, "shape"), collider.shape);
+        ReadFloatArray(*object, "center", collider.center, 3);
+        ReadFloatArray(*object, "size", collider.size, 3);
+        collider.radius = ReadFloat(*object, "radius", collider.radius);
+        collider.height = ReadFloat(*object, "height", collider.height);
+        collider.materialAssetId = ReadString(*object, "material_asset_id");
+        ixtreeme::physics::Sanitize(collider);
+    }
+    return collider;
+}
+
 MeshSceneEntity ReadMeshSceneEntity(const JsonValue& entity)
 {
     MeshSceneEntity mesh;
@@ -1288,6 +1389,16 @@ MeshSceneEntity ReadMeshSceneEntity(const JsonValue& entity)
     }
     mesh.editorComponents = ReadEditorComponents(entity);
     mesh.lod = ReadLodComponent(entity);
+    if (Find(entity, "rigidbody"))
+    {
+        mesh.hasRigidbody = true;
+        mesh.rigidbody = ReadRigidbodyComponent(entity);
+    }
+    if (Find(entity, "collider"))
+    {
+        mesh.hasCollider = true;
+        mesh.collider = ReadColliderComponent(entity);
+    }
     if (mesh.lod.enabled &&
         std::none_of(mesh.editorComponents.begin(), mesh.editorComponents.end(), [](const EditorAttachedComponent& component) {
             return component.type == "rendering.lod";
@@ -1311,6 +1422,12 @@ MeshSceneEntity ReadMeshSceneEntity(const JsonValue& entity)
             mesh.id,
             mesh.lod.config.levelCount,
             mesh.lod.overrideAssetDefault ? 1 : 0);
+    if (mesh.hasRigidbody || mesh.hasCollider)
+        Tracenf("[PHYSICS] restored entity=%u rigidbody=%d collider=%d shape=%s",
+            mesh.id,
+            mesh.hasRigidbody ? 1 : 0,
+            mesh.hasCollider ? 1 : 0,
+            mesh.hasCollider ? ixtreeme::physics::ToString(mesh.collider.shape) : "none");
     return mesh;
 }
 }

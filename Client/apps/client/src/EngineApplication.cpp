@@ -246,6 +246,10 @@ MeshRendererEditorState BuildMeshRendererEditorState(const std::vector<MeshScene
     state.materialOverrides = it->materialOverrides;
     state.editorComponents = it->editorComponents;
     state.lod = it->lod;
+    state.hasRigidbody = it->hasRigidbody;
+    state.rigidbody = it->rigidbody;
+    state.hasCollider = it->hasCollider;
+    state.collider = it->collider;
     state.materialSlotCount = std::max<std::uint32_t>(
         1u,
         std::max(static_cast<std::uint32_t>(state.materialSlots.size()),
@@ -269,6 +273,10 @@ void ApplyMeshRendererEditorState(MeshSceneEntity& mesh, const MeshRendererEdito
     mesh.materialOverrides = state.materialOverrides;
     mesh.editorComponents = state.editorComponents;
     mesh.lod = state.lod;
+    mesh.hasRigidbody = state.hasRigidbody;
+    mesh.rigidbody = state.rigidbody;
+    mesh.hasCollider = state.hasCollider;
+    mesh.collider = state.collider;
 }
 
 std::filesystem::path ResolveModelAssetPathForMeta(const std::string& meshAssetPath)
@@ -5349,6 +5357,29 @@ int RunGame(NativeWindow& window,
                         [&](const MeshSceneEntity& mesh) { return mesh.id == selectedEditorObject.id; });
                     if (it == editorMeshEntities.end())
                         return false;
+                    if (componentType == "physics.rigidbody")
+                    {
+                        if (!it->hasRigidbody)
+                            return false;
+                        it->hasRigidbody = false;
+                        it->rigidbody = {};
+                        SceneManager::Instance().MarkDirty();
+                        Tracenf("[INSPECTOR-COMP] remove entity=%u component=Rigidbody", it->id);
+                        return true;
+                    }
+                    if (componentType == "physics.collider" ||
+                        componentType == "physics.box_collider" ||
+                        componentType == "physics.sphere_collider" ||
+                        componentType == "physics.capsule_collider")
+                    {
+                        if (!it->hasCollider)
+                            return false;
+                        it->hasCollider = false;
+                        it->collider = {};
+                        SceneManager::Instance().MarkDirty();
+                        Tracenf("[INSPECTOR-COMP] remove entity=%u component=Collider", it->id);
+                        return true;
+                    }
                     const std::size_t oldSize = it->editorComponents.size();
                     it->editorComponents.erase(std::remove_if(it->editorComponents.begin(), it->editorComponents.end(),
                         [&](const EditorAttachedComponent& component) { return component.type == componentType; }),
@@ -5376,6 +5407,47 @@ int RunGame(NativeWindow& window,
                     {
                         if (addLodComponentToSelectedMesh())
                             runtimeSession->SetEditorStatus("Added LOD Group component");
+                    }
+                    else if (commands.addComponentType == EditorComponentType::Rigidbody ||
+                        commands.addComponentType == EditorComponentType::BoxCollider ||
+                        commands.addComponentType == EditorComponentType::SphereCollider ||
+                        commands.addComponentType == EditorComponentType::CapsuleCollider)
+                    {
+                        if (selectedEditorObject.type == SelectedEditorObjectType::MeshEntity)
+                        {
+                            auto it = std::find_if(editorMeshEntities.begin(), editorMeshEntities.end(),
+                                [&](const MeshSceneEntity& mesh) { return mesh.id == selectedEditorObject.id; });
+                            if (it != editorMeshEntities.end())
+                            {
+                                if (commands.addComponentType == EditorComponentType::Rigidbody)
+                                {
+                                    it->hasRigidbody = true;
+                                    it->rigidbody = {};
+                                    if (!it->hasCollider)
+                                    {
+                                        it->hasCollider = true;
+                                        it->collider.shape = ixtreeme::physics::ColliderShape::Box;
+                                    }
+                                    Tracenf("[INSPECTOR-COMP] add entity=%u component=Rigidbody", it->id);
+                                    runtimeSession->SetEditorStatus("Added Rigidbody component");
+                                }
+                                else
+                                {
+                                    it->hasCollider = true;
+                                    if (commands.addComponentType == EditorComponentType::SphereCollider)
+                                        it->collider.shape = ixtreeme::physics::ColliderShape::Sphere;
+                                    else if (commands.addComponentType == EditorComponentType::CapsuleCollider)
+                                        it->collider.shape = ixtreeme::physics::ColliderShape::Capsule;
+                                    else
+                                        it->collider.shape = ixtreeme::physics::ColliderShape::Box;
+                                    Tracenf("[INSPECTOR-COMP] add entity=%u component=%s Collider",
+                                        it->id,
+                                        ixtreeme::physics::ToString(it->collider.shape));
+                                    runtimeSession->SetEditorStatus("Added Collider component");
+                                }
+                                SceneManager::Instance().MarkDirty();
+                            }
+                        }
                     }
                     else
                     {

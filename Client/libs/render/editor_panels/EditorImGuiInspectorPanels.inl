@@ -60,7 +60,7 @@ void EditorImGui::RenderAddComponentMenu()
     if (!m_componentRegistryLogged)
     {
         m_componentRegistryLogged = true;
-        Tracen("[INSPECTOR-COMP] registered=7 categories=[Core, Rendering, Lighting, Editor]");
+        Tracen("[INSPECTOR-COMP] registered=11 categories=[Core, Rendering, Physics, Lighting, Editor]");
     }
 
     auto hasAttachedComponent = [&](const char* id) {
@@ -80,6 +80,10 @@ void EditorImGui::RenderAddComponentMenu()
             return hasPoint;
         if (id == "builtin.spot_light")
             return hasSpot;
+        if (id == "physics.rigidbody")
+            return hasMesh && m_meshRendererState.hasRigidbody;
+        if (id == "physics.box_collider" || id == "physics.sphere_collider" || id == "physics.capsule_collider")
+            return hasMesh && m_meshRendererState.hasCollider;
         return hasMesh && hasAttachedComponent(definition.id);
     };
 
@@ -122,8 +126,8 @@ void EditorImGui::RenderAddComponentMenu()
 
             const bool alreadyPresent = selectionHasComponent(definition);
             const bool canAddToSelection =
-                definition.legacyType != EditorComponentType::None ||
-                (definition.addableToMesh && hasMesh);
+                (definition.addableToMesh && hasMesh) ||
+                (!definition.addableToMesh && definition.legacyType != EditorComponentType::None);
             const bool disabled = alreadyPresent || !canAddToSelection;
             if (disabled)
                 ImGui::BeginDisabled();
@@ -548,6 +552,100 @@ void EditorImGui::RenderSelectedLightInspector()
         m_commands.deleteSelectedLight = true;
 }
 
+bool EditorImGui::RenderSelectedMeshPhysicsComponents()
+{
+    bool changed = false;
+    auto componentMenu = [&](const char* popupId, const char* componentId) {
+        ImGui::SameLine();
+        if (ImGui::SmallButton("..."))
+            ImGui::OpenPopup(popupId);
+        if (ImGui::BeginPopup(popupId))
+        {
+            if (ImGui::MenuItem("Remove Component"))
+            {
+                m_commands.removeComponentFromSelectedEntity = true;
+                m_commands.removeComponentTypeId = componentId;
+            }
+            ImGui::EndPopup();
+        }
+    };
+
+    if (m_meshRendererState.hasRigidbody)
+    {
+        ImGui::PushID("physics.rigidbody");
+        const bool open = ImGui::CollapsingHeader(ICON_FA_CUBE " Rigidbody", ImGuiTreeNodeFlags_DefaultOpen);
+        componentMenu("RigidbodyComponentMenu", "physics.rigidbody");
+        if (open)
+        {
+            auto& body = m_meshRendererState.rigidbody;
+            const char* bodyTypes[] = {"Static", "Dynamic", "Kinematic"};
+            int bodyTypeIndex = body.bodyType == ixtreeme::physics::BodyType::Static ? 0 :
+                (body.bodyType == ixtreeme::physics::BodyType::Kinematic ? 2 : 1);
+            if (ImGui::Combo("Body Type", &bodyTypeIndex, bodyTypes, IM_ARRAYSIZE(bodyTypes)))
+            {
+                body.bodyType = bodyTypeIndex == 0 ? ixtreeme::physics::BodyType::Static :
+                    (bodyTypeIndex == 2 ? ixtreeme::physics::BodyType::Kinematic : ixtreeme::physics::BodyType::Dynamic);
+                changed = true;
+            }
+            changed |= ImGui::Checkbox("Enabled", &body.enabled);
+            changed |= ImGui::Checkbox("Use Gravity", &body.useGravity);
+            changed |= ImGui::DragFloat("Mass", &body.mass, 0.05f, 0.001f, 100000.0f, "%.3f");
+            changed |= ImGui::DragFloat("Linear Damping", &body.linearDamping, 0.01f, 0.0f, 100.0f, "%.3f");
+            changed |= ImGui::DragFloat("Angular Damping", &body.angularDamping, 0.01f, 0.0f, 100.0f, "%.3f");
+            ImGui::TextDisabled("Freeze Position");
+            changed |= ImGui::Checkbox("X##freeze_pos", &body.freezePosition[0]); ImGui::SameLine();
+            changed |= ImGui::Checkbox("Y##freeze_pos", &body.freezePosition[1]); ImGui::SameLine();
+            changed |= ImGui::Checkbox("Z##freeze_pos", &body.freezePosition[2]);
+            ImGui::TextDisabled("Freeze Rotation");
+            changed |= ImGui::Checkbox("X##freeze_rot", &body.freezeRotation[0]); ImGui::SameLine();
+            changed |= ImGui::Checkbox("Y##freeze_rot", &body.freezeRotation[1]); ImGui::SameLine();
+            changed |= ImGui::Checkbox("Z##freeze_rot", &body.freezeRotation[2]);
+            ixtreeme::physics::Sanitize(body);
+        }
+        ImGui::PopID();
+    }
+
+    if (m_meshRendererState.hasCollider)
+    {
+        ImGui::PushID("physics.collider");
+        const bool open = ImGui::CollapsingHeader(ICON_FA_CUBE " Collider", ImGuiTreeNodeFlags_DefaultOpen);
+        componentMenu("ColliderComponentMenu", "physics.collider");
+        if (open)
+        {
+            auto& collider = m_meshRendererState.collider;
+            const char* shapes[] = {"Box", "Sphere", "Capsule"};
+            int shapeIndex = collider.shape == ixtreeme::physics::ColliderShape::Sphere ? 1 :
+                (collider.shape == ixtreeme::physics::ColliderShape::Capsule ? 2 : 0);
+            if (ImGui::Combo("Shape", &shapeIndex, shapes, IM_ARRAYSIZE(shapes)))
+            {
+                collider.shape = shapeIndex == 1 ? ixtreeme::physics::ColliderShape::Sphere :
+                    (shapeIndex == 2 ? ixtreeme::physics::ColliderShape::Capsule : ixtreeme::physics::ColliderShape::Box);
+                changed = true;
+            }
+            changed |= ImGui::Checkbox("Enabled", &collider.enabled);
+            changed |= ImGui::Checkbox("Is Trigger", &collider.trigger);
+            changed |= ImGui::DragFloat3("Center", collider.center, 0.05f, -1000.0f, 1000.0f, "%.2f");
+            if (collider.shape == ixtreeme::physics::ColliderShape::Box)
+                changed |= ImGui::DragFloat3("Size", collider.size, 0.05f, 0.001f, 10000.0f, "%.2f");
+            else
+                changed |= ImGui::DragFloat("Radius", &collider.radius, 0.025f, 0.001f, 10000.0f, "%.2f");
+            if (collider.shape == ixtreeme::physics::ColliderShape::Capsule)
+                changed |= ImGui::DragFloat("Height", &collider.height, 0.05f, 0.001f, 10000.0f, "%.2f");
+            ixtreeme::physics::Sanitize(collider);
+        }
+        ImGui::PopID();
+    }
+
+    if (changed)
+    {
+        Tracenf("[PHYSICS] inspector entity=%u rigidbody=%d collider=%d",
+            m_meshRendererState.id,
+            m_meshRendererState.hasRigidbody ? 1 : 0,
+            m_meshRendererState.hasCollider ? 1 : 0);
+    }
+    return changed;
+}
+
 void EditorImGui::RenderSelectedMeshRendererInspector()
 {
     if (!m_meshRendererState.selected)
@@ -616,6 +714,9 @@ void EditorImGui::RenderSelectedMeshRendererInspector()
             m_meshRendererState.prefabInstance,
             m_meshRendererState.prefabOverrides);
     }
+
+    if (RenderSelectedMeshPhysicsComponents())
+        MarkSelectedMeshRendererChanged();
 
     if (ImGui::CollapsingHeader(ICON_FA_LAYER_GROUP " Material Slots", ImGuiTreeNodeFlags_DefaultOpen))
     {

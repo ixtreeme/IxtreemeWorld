@@ -78,6 +78,7 @@ target_link_libraries(IXEngineRender
         IXEngineAsset
         IXEngineCommon
         IXEngineMath
+        IXEnginePhysics
         IXEngineImportExport
         IXEngineMapData
         fastgltf::fastgltf

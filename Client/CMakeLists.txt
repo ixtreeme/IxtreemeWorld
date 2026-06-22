@@ -46,6 +46,7 @@ set(CMAKE_CXX_EXTENSIONS OFF)
 option(ENABLE_ASAN "Enable AddressSanitizer" OFF)
 option(IXTREEME_WITH_EDITOR "Build ImGui-based editor functionality" ON)
 option(IXTREEME_VERBOSE_DIAGNOSTICS "Enable verbose per-frame engine diagnostics" OFF)
+option(IXENGINE_PHYSICS_WITH_JOLT "Build the physics module with the Jolt Physics backend." ON)
 option(IXENGINE_ENABLE_AVX2_FMA "Build AVX2/FMA optimized engine code paths and prefer them at runtime with SSE2 fallback." ON)
 option(IXENGINE_COMPILE_WHOLE_ENGINE_AVX2_FMA "Compile all engine targets with AVX2/FMA instructions. Requires an AVX2/FMA CPU and disables true binary-level SSE2 fallback." OFF)
 mark_as_advanced(IXENGINE_COMPILE_WHOLE_ENGINE_AVX2_FMA)
@@ -187,6 +188,29 @@ if(TARGET meshoptimizer)
 else()
     message(FATAL_ERROR "FetchContent meshoptimizer target was not created")
 endif()
+if(IXENGINE_PHYSICS_WITH_JOLT)
+    set(BUILD_SHARED_LIBS OFF CACHE BOOL "" FORCE)
+    set(INTERPROCEDURAL_OPTIMIZATION OFF CACHE BOOL "" FORCE)
+    set(ENABLE_INSTALL OFF CACHE BOOL "" FORCE)
+    set(TARGET_UNIT_TESTS OFF CACHE BOOL "" FORCE)
+    set(TARGET_HELLO_WORLD OFF CACHE BOOL "" FORCE)
+    set(TARGET_PERFORMANCE_TEST OFF CACHE BOOL "" FORCE)
+    set(TARGET_SAMPLES OFF CACHE BOOL "" FORCE)
+    set(TARGET_VIEWER OFF CACHE BOOL "" FORCE)
+    set(ENABLE_ALL_WARNINGS OFF CACHE BOOL "" FORCE)
+    FetchContent_Declare(
+        JoltPhysics
+        GIT_REPOSITORY https://github.com/jrouwe/JoltPhysics.git
+        GIT_TAG v5.5.0
+        GIT_SHALLOW TRUE
+        SOURCE_SUBDIR Build
+    )
+    FetchContent_MakeAvailable(JoltPhysics)
+    if(TARGET Jolt AND NOT TARGET Jolt::Jolt)
+        add_library(Jolt::Jolt ALIAS Jolt)
+    endif()
+endif()
+add_subdirectory(libs/physics)
 set(STB_INCLUDE_DIR "" CACHE PATH "stb include directory")
 if(DEFINED VCPKG_ROOT AND DEFINED VCPKG_TARGET_TRIPLET)
     set(_client_vcpkg_prefix "${VCPKG_ROOT}/installed/${VCPKG_TARGET_TRIPLET}")
@@ -506,6 +530,7 @@ foreach(_ixengine_target IN ITEMS
     IXEngineTree
     IXEngineCommon
     IXEngineDebug
+    IXEnginePhysics
     IXEngineMapData
     meshoptimizer
     IXEnginePlatform

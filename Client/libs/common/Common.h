@@ -15,6 +15,7 @@ std::string JsonStringValue(const std::string& object, const std::string& key);
 float JsonFloatValue(const std::string& object, const std::string& key, float fallback);
 bool JsonBoolValue(const std::string& object, const std::string& key, bool fallback);
 void JsonFloatArrayValue(const std::string& object, const std::string& key, float* values, std::size_t count);
+void JsonBoolArrayValue(const std::string& object, const std::string& key, bool* values, std::size_t count);
 std::vector<std::string> JsonStringArrayValue(const std::string& object, const std::string& key);
 std::string GenericPath(const std::filesystem::path& path);
 std::string CanonicalPathString(const std::filesystem::path& path);

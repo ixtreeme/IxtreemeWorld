@@ -157,12 +157,16 @@ struct InspectorComponentDefinition
     bool addableToMesh;
 };
 
-const std::array<InspectorComponentDefinition, 7>& InspectorComponentRegistry()
+const std::array<InspectorComponentDefinition, 11>& InspectorComponentRegistry()
 {
-    static const std::array<InspectorComponentDefinition, 7> registry{{
+    static const std::array<InspectorComponentDefinition, 11> registry{{
         {"builtin.transform", "Transform", "Core", EditorComponentType::None, false},
         {"builtin.mesh_renderer", "MeshRenderer", "Rendering", EditorComponentType::MeshRenderer, false},
         {kLodComponentId, "LOD Group", "Rendering", EditorComponentType::None, true},
+        {"physics.rigidbody", "Rigidbody", "Physics", EditorComponentType::Rigidbody, true},
+        {"physics.box_collider", "Box Collider", "Physics", EditorComponentType::BoxCollider, true},
+        {"physics.sphere_collider", "Sphere Collider", "Physics", EditorComponentType::SphereCollider, true},
+        {"physics.capsule_collider", "Capsule Collider", "Physics", EditorComponentType::CapsuleCollider, true},
         {"builtin.water_body", "Water Body", "Rendering", EditorComponentType::WaterBody, false},
         {"builtin.point_light", "Point Light", "Lighting", EditorComponentType::PointLight, false},
         {"builtin.spot_light", "Spot Light", "Lighting", EditorComponentType::SpotLight, false},

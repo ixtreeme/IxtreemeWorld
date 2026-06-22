@@ -148,6 +148,40 @@ void JsonFloatArrayValue(const std::string& object, const std::string& key, floa
     }
 }
 
+void JsonBoolArrayValue(const std::string& object, const std::string& key, bool* values, std::size_t count)
+{
+    const std::string needle = "\"" + key + "\"";
+    const size_t keyPos = object.find(needle);
+    if (keyPos == std::string::npos)
+        return;
+    const size_t open = object.find('[', keyPos + needle.size());
+    const size_t close = open == std::string::npos ? std::string::npos : object.find(']', open + 1);
+    if (open == std::string::npos || close == std::string::npos)
+        return;
+
+    size_t cursor = open + 1;
+    for (std::size_t i = 0; i < count && cursor < close; ++i)
+    {
+        cursor = object.find_first_not_of(" \t\r\n,", cursor);
+        if (cursor == std::string::npos || cursor >= close)
+            return;
+        if (object.compare(cursor, 4, "true") == 0)
+        {
+            values[i] = true;
+            cursor += 4;
+        }
+        else if (object.compare(cursor, 5, "false") == 0)
+        {
+            values[i] = false;
+            cursor += 5;
+        }
+        else
+        {
+            return;
+        }
+    }
+}
+
 std::vector<std::string> JsonStringArrayValue(const std::string& object, const std::string& key)
 {
     std::vector<std::string> values;

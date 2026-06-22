@@ -1,5 +1,7 @@
 #pragma once
 
+#include "physics/PhysicsComponents.h"
+
 #include <cstdint>
 #include <cstddef>
 #include <array>
@@ -345,6 +347,10 @@ struct MeshSceneEntity
     std::vector<MaterialOverride> materialOverrides;
     std::vector<EditorAttachedComponent> editorComponents;
     LodComponent lod;
+    bool hasRigidbody = false;
+    ixtreeme::physics::RigidbodyComponent rigidbody;
+    bool hasCollider = false;
+    ixtreeme::physics::ColliderComponent collider;
 };
 
 struct TerrainSceneData
@@ -387,7 +393,11 @@ enum class EditorComponentType
     WaterBody,
     PointLight,
     SpotLight,
-    MeshRenderer
+    MeshRenderer,
+    Rigidbody,
+    BoxCollider,
+    SphereCollider,
+    CapsuleCollider
 };
 
 struct HierarchySceneEntity
@@ -439,6 +449,10 @@ struct MeshRendererEditorState
     std::vector<MeshSceneEntity::MaterialOverride> materialOverrides;
     std::vector<EditorAttachedComponent> editorComponents;
     LodComponent lod;
+    bool hasRigidbody = false;
+    ixtreeme::physics::RigidbodyComponent rigidbody;
+    bool hasCollider = false;
+    ixtreeme::physics::ColliderComponent collider;
 };
 
 struct TerrainEditorState

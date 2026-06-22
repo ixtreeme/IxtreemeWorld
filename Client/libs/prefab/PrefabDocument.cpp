@@ -147,6 +147,86 @@ void WriteMaterialOverrides(std::ostream& out,
     out << indent << "]";
 }
 
+std::string BoolArray(const bool* values, std::size_t count)
+{
+    std::ostringstream out;
+    out << "[";
+    for (std::size_t i = 0; i < count; ++i)
+    {
+        if (i)
+            out << ", ";
+        out << (values[i] ? "true" : "false");
+    }
+    out << "]";
+    return out.str();
+}
+
+void WriteRigidbody(std::ostream& out, const ixtreeme::physics::RigidbodyComponent& rigidbody, const std::string& indent)
+{
+    out << ",\n";
+    out << indent << "\"rigidbody\": {\n";
+    out << indent << "  \"enabled\": " << (rigidbody.enabled ? "true" : "false") << ",\n";
+    out << indent << "  \"body_type\": \"" << ixtreeme::physics::ToString(rigidbody.bodyType) << "\",\n";
+    out << indent << "  \"mass\": " << rigidbody.mass << ",\n";
+    out << indent << "  \"linear_damping\": " << rigidbody.linearDamping << ",\n";
+    out << indent << "  \"angular_damping\": " << rigidbody.angularDamping << ",\n";
+    out << indent << "  \"use_gravity\": " << (rigidbody.useGravity ? "true" : "false") << ",\n";
+    out << indent << "  \"freeze_position\": " << BoolArray(rigidbody.freezePosition, 3) << ",\n";
+    out << indent << "  \"freeze_rotation\": " << BoolArray(rigidbody.freezeRotation, 3) << "\n";
+    out << indent << "}";
+}
+
+void WriteCollider(std::ostream& out, const ixtreeme::physics::ColliderComponent& collider, const std::string& indent)
+{
+    out << ",\n";
+    out << indent << "\"collider\": {\n";
+    out << indent << "  \"enabled\": " << (collider.enabled ? "true" : "false") << ",\n";
+    out << indent << "  \"trigger\": " << (collider.trigger ? "true" : "false") << ",\n";
+    out << indent << "  \"shape\": \"" << ixtreeme::physics::ToString(collider.shape) << "\",\n";
+    out << indent << "  \"center\": " << FloatArray(collider.center, 3) << ",\n";
+    out << indent << "  \"size\": " << FloatArray(collider.size, 3) << ",\n";
+    out << indent << "  \"radius\": " << collider.radius << ",\n";
+    out << indent << "  \"height\": " << collider.height << ",\n";
+    out << indent << "  \"material_asset_id\": \"" << ixtreeme::common::EscapeJson(collider.materialAssetId) << "\"\n";
+    out << indent << "}";
+}
+
+ixtreeme::physics::RigidbodyComponent ReadRigidbody(const std::string& object)
+{
+    ixtreeme::physics::RigidbodyComponent rigidbody;
+    const std::string component = ExtractNamedObject(object, "rigidbody");
+    if (component.empty())
+        return rigidbody;
+    rigidbody.enabled = ixtreeme::common::JsonBoolValue(component, "enabled", rigidbody.enabled);
+    rigidbody.bodyType = ixtreeme::physics::BodyTypeFromString(ixtreeme::common::JsonStringValue(component, "body_type"), rigidbody.bodyType);
+    rigidbody.mass = ixtreeme::common::JsonFloatValue(component, "mass", rigidbody.mass);
+    rigidbody.linearDamping = ixtreeme::common::JsonFloatValue(component, "linear_damping", rigidbody.linearDamping);
+    rigidbody.angularDamping = ixtreeme::common::JsonFloatValue(component, "angular_damping", rigidbody.angularDamping);
+    rigidbody.useGravity = ixtreeme::common::JsonBoolValue(component, "use_gravity", rigidbody.useGravity);
+    ixtreeme::common::JsonBoolArrayValue(component, "freeze_position", rigidbody.freezePosition, 3);
+    ixtreeme::common::JsonBoolArrayValue(component, "freeze_rotation", rigidbody.freezeRotation, 3);
+    ixtreeme::physics::Sanitize(rigidbody);
+    return rigidbody;
+}
+
+ixtreeme::physics::ColliderComponent ReadCollider(const std::string& object)
+{
+    ixtreeme::physics::ColliderComponent collider;
+    const std::string component = ExtractNamedObject(object, "collider");
+    if (component.empty())
+        return collider;
+    collider.enabled = ixtreeme::common::JsonBoolValue(component, "enabled", collider.enabled);
+    collider.trigger = ixtreeme::common::JsonBoolValue(component, "trigger", collider.trigger);
+    collider.shape = ixtreeme::physics::ColliderShapeFromString(ixtreeme::common::JsonStringValue(component, "shape"), collider.shape);
+    ixtreeme::common::JsonFloatArrayValue(component, "center", collider.center, 3);
+    ixtreeme::common::JsonFloatArrayValue(component, "size", collider.size, 3);
+    collider.radius = ixtreeme::common::JsonFloatValue(component, "radius", collider.radius);
+    collider.height = ixtreeme::common::JsonFloatValue(component, "height", collider.height);
+    collider.materialAssetId = ixtreeme::common::JsonStringValue(component, "material_asset_id");
+    ixtreeme::physics::Sanitize(collider);
+    return collider;
+}
+
 MeshSceneEntity::MaterialOverride ReadMaterialOverride(const std::string& object)
 {
     MeshSceneEntity::MaterialOverride material;
@@ -223,6 +303,10 @@ void WriteMeshObject(std::ostream& out, const MeshSceneEntity& mesh, const std::
     out << indent << "\"skinned\": " << (mesh.skinned ? "true" : "false");
     WriteMaterials(out, mesh.materialSlots, indent);
     WriteMaterialOverrides(out, mesh.materialOverrides, indent);
+    if (mesh.hasRigidbody)
+        WriteRigidbody(out, mesh.rigidbody, indent);
+    if (mesh.hasCollider)
+        WriteCollider(out, mesh.collider, indent);
     out << "\n";
 }
 
@@ -285,6 +369,16 @@ PrefabEntity ParseEntityObject(const std::string& object, const std::string& fal
         const std::vector<std::string> materialOverrides = ExtractNamedArrayObjects(object, "material_overrides");
         for (const std::string& materialOverride : materialOverrides)
             entity.mesh.materialOverrides.push_back(ReadMaterialOverride(materialOverride));
+        if (!ExtractNamedObject(object, "rigidbody").empty())
+        {
+            entity.mesh.hasRigidbody = true;
+            entity.mesh.rigidbody = ReadRigidbody(object);
+        }
+        if (!ExtractNamedObject(object, "collider").empty())
+        {
+            entity.mesh.hasCollider = true;
+            entity.mesh.collider = ReadCollider(object);
+        }
         return entity;
     }
 

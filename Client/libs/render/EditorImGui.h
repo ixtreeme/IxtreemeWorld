@@ -223,6 +223,7 @@ private:
     void RenderSelectedTerrainInspector();
     void RenderSelectedLightInspector();
     void RenderSelectedMeshRendererInspector();
+    bool RenderSelectedMeshPhysicsComponents();
     void RenderPrefabOverrideControls(const std::string& assetId,
                                       const PrefabInstanceState& instance,
                                       const std::vector<std::string>& overrides);
