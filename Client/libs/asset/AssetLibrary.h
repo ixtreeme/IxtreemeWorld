@@ -25,7 +25,8 @@ public:
         Animation,
         Material,
         WaterMaterial,
-        Scene
+        Scene,
+        Prefab
     };
 
     enum class TextureRole

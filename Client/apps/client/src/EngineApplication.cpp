@@ -9,6 +9,7 @@
 #include "AssetDatabase.h"
 #include "AssimpExporter.h"
 #include "AssimpImporter.h"
+#include "Common.h"
 #include "FbxAssetSidecars.h"
 #include "WorldLabelRenderer.h"
 #include "AssetWatcher.h"
@@ -23,6 +24,7 @@
 #include "NativeWindow_Android.h"
 #endif
 #include "OffscreenSceneRenderer.h"
+#include "PrefabDocument.h"
 #include "ProjectManager.h"
 #include "RmlUiLayer.h"
 #include "RuntimeSession.h"
@@ -61,10 +63,12 @@
 #include <cstring>
 #include <ctime>
 #include <filesystem>
+#include <fstream>
 #include <functional>
 #include <limits>
 #include <memory>
 #include <optional>
+#include <sstream>
 #include <string>
 #include <thread>
 #include <type_traits>
@@ -76,6 +80,7 @@
 namespace
 {
 namespace xm = ixtreeme::math;
+namespace prefab = ixtreeme::prefab;
 
 const char* InputEventTypeName(InputEvent::Type type)
 {
@@ -175,6 +180,43 @@ std::string EditorDisplayName(const TerrainSceneData& terrain)
     return terrain.name.empty() ? "Terrain" : terrain.name;
 }
 
+std::string SceneParentTypeName(HierarchyEntityType type)
+{
+    switch (type)
+    {
+    case HierarchyEntityType::Terrain: return "terrain";
+    case HierarchyEntityType::WaterBody: return "water_body";
+    case HierarchyEntityType::PointLight: return "point_light";
+    case HierarchyEntityType::SpotLight: return "spot_light";
+    case HierarchyEntityType::MeshEntity: return "mesh_entity";
+    case HierarchyEntityType::None:
+    default: return {};
+    }
+}
+
+HierarchyEntityType SceneParentTypeFromName(const std::string& type)
+{
+    if (type == "terrain")
+        return HierarchyEntityType::Terrain;
+    if (type == "water_body")
+        return HierarchyEntityType::WaterBody;
+    if (type == "point_light")
+        return HierarchyEntityType::PointLight;
+    if (type == "spot_light")
+        return HierarchyEntityType::SpotLight;
+    if (type == "mesh_entity")
+        return HierarchyEntityType::MeshEntity;
+    return HierarchyEntityType::None;
+}
+
+SceneParentRef MakeSceneParentRef(HierarchyEntityType type, std::uint32_t id)
+{
+    SceneParentRef parent;
+    parent.type = SceneParentTypeName(type);
+    parent.id = id;
+    return parent.IsValid() ? parent : SceneParentRef{};
+}
+
 MeshRendererEditorState BuildMeshRendererEditorState(const std::vector<MeshSceneEntity>& meshes,
                                                      std::uint32_t selectedId)
 {
@@ -188,6 +230,11 @@ MeshRendererEditorState BuildMeshRendererEditorState(const std::vector<MeshScene
     state.selected = true;
     state.id = it->id;
     state.name = EditorDisplayName(*it);
+    state.prefabAssetId = it->prefabAssetId;
+    state.prefabInstance = it->prefabInstance;
+    state.prefabOverrides = it->prefabInstance.assetId.empty() && it->prefabAssetId.empty()
+        ? std::vector<std::string>{}
+        : std::vector<std::string>{"Transform"};
     state.meshAssetId = it->meshAssetId;
     state.meshAssetPath = it->meshAssetPath;
     state.meshDisplayName = it->meshAssetId.empty() ? it->meshAssetPath : it->meshAssetId;
@@ -210,6 +257,8 @@ MeshRendererEditorState BuildMeshRendererEditorState(const std::vector<MeshScene
 void ApplyMeshRendererEditorState(MeshSceneEntity& mesh, const MeshRendererEditorState& state)
 {
     mesh.name = state.name;
+    mesh.prefabAssetId = state.prefabAssetId;
+    mesh.prefabInstance = state.prefabInstance;
     mesh.meshAssetId = state.meshAssetId;
     mesh.meshAssetPath = state.meshAssetPath;
     std::copy(std::begin(state.position), std::end(state.position), std::begin(mesh.position));
@@ -799,6 +848,43 @@ void MergeMapEditorCommands(MapEditorCommands& target, const MapEditorCommands& 
         target.addPrimitiveEntity = true;
         target.primitiveType = source.primitiveType;
     }
+    if (source.addPrefabInstance)
+    {
+        target.addPrefabInstance = true;
+        target.prefabAssetId = source.prefabAssetId;
+        target.prefabDropScreenPositionValid = source.prefabDropScreenPositionValid;
+        target.prefabDropScreenPosition[0] = source.prefabDropScreenPosition[0];
+        target.prefabDropScreenPosition[1] = source.prefabDropScreenPosition[1];
+    }
+    target.createPrefabFromSelection =
+        target.createPrefabFromSelection || source.createPrefabFromSelection;
+    target.refreshSelectedPrefabInstance =
+        target.refreshSelectedPrefabInstance || source.refreshSelectedPrefabInstance;
+    target.refreshAllPrefabInstances =
+        target.refreshAllPrefabInstances || source.refreshAllPrefabInstances;
+    target.revertSelectedPrefabInstance =
+        target.revertSelectedPrefabInstance || source.revertSelectedPrefabInstance;
+    target.applySelectedPrefabToAsset =
+        target.applySelectedPrefabToAsset || source.applySelectedPrefabToAsset;
+    if (source.revertSelectedPrefabOverride)
+    {
+        target.revertSelectedPrefabOverride = true;
+        target.selectedPrefabOverrideName = source.selectedPrefabOverrideName;
+    }
+    if (source.applySelectedPrefabOverrideToAsset)
+    {
+        target.applySelectedPrefabOverrideToAsset = true;
+        target.selectedPrefabOverrideName = source.selectedPrefabOverrideName;
+    }
+    target.unpackSelectedPrefabInstance =
+        target.unpackSelectedPrefabInstance || source.unpackSelectedPrefabInstance;
+    if (source.savePrefabAssetEdit)
+    {
+        target.savePrefabAssetEdit = true;
+        target.editPrefabAssetId = source.editPrefabAssetId;
+        target.editPrefabName = source.editPrefabName;
+        target.editPrefabEntityNames = source.editPrefabEntityNames;
+    }
     if (source.addComponentToSelectedEntity)
     {
         target.addComponentToSelectedEntity = true;
@@ -884,6 +970,15 @@ void MergeMapEditorCommands(MapEditorCommands& target, const MapEditorCommands& 
         target.hierarchyToggleHidden = true;
         target.hierarchyEntityType = source.hierarchyEntityType;
         target.hierarchyEntityId = source.hierarchyEntityId;
+    }
+    if (source.hierarchyReparentEntity)
+    {
+        target.hierarchyReparentEntity = true;
+        target.hierarchyEntityType = source.hierarchyEntityType;
+        target.hierarchyEntityId = source.hierarchyEntityId;
+        target.hierarchyEntityHandle = source.hierarchyEntityHandle;
+        target.hierarchyParentType = source.hierarchyParentType;
+        target.hierarchyParentId = source.hierarchyParentId;
     }
     if (source.exportMeshEntityToFbx)
     {
@@ -1544,11 +1639,90 @@ int RunGame(NativeWindow& window,
             else
                 ecs_remove_id(editorHierarchyWorld.get(), entity, editorNoteComponentEntity);
         };
+        std::unordered_map<std::uint64_t, SceneParentRef> pendingParents;
+        auto prefabAssetIdForHierarchyObject = [&](HierarchyEntityType type, std::uint32_t objectId) -> std::string {
+            if (type == HierarchyEntityType::MeshEntity)
+            {
+                auto it = std::find_if(editorMeshEntities.begin(), editorMeshEntities.end(),
+                    [&](const MeshSceneEntity& mesh) { return mesh.id == objectId; });
+                if (it == editorMeshEntities.end())
+                    return {};
+                return !it->prefabInstance.assetId.empty() ? it->prefabInstance.assetId : it->prefabAssetId;
+            }
+            if (type == HierarchyEntityType::PointLight)
+            {
+                auto it = std::find_if(editorPointLights.begin(), editorPointLights.end(),
+                    [&](const PointLight& light) { return light.id == objectId; });
+                if (it == editorPointLights.end())
+                    return {};
+                return !it->prefabInstance.assetId.empty() ? it->prefabInstance.assetId : it->prefabAssetId;
+            }
+            if (type == HierarchyEntityType::SpotLight)
+            {
+                auto it = std::find_if(editorSpotLights.begin(), editorSpotLights.end(),
+                    [&](const SpotLight& light) { return light.id == objectId; });
+                if (it == editorSpotLights.end())
+                    return {};
+                return !it->prefabInstance.assetId.empty() ? it->prefabInstance.assetId : it->prefabAssetId;
+            }
+            return {};
+        };
+        auto hierarchyParentRefForObject = [&](HierarchyEntityType type, std::uint32_t objectId) -> SceneParentRef {
+            if (type == HierarchyEntityType::MeshEntity)
+            {
+                auto it = std::find_if(editorMeshEntities.begin(), editorMeshEntities.end(),
+                    [&](const MeshSceneEntity& mesh) { return mesh.id == objectId; });
+                return it == editorMeshEntities.end() ? SceneParentRef{} : it->parent;
+            }
+            if (type == HierarchyEntityType::PointLight)
+            {
+                auto it = std::find_if(editorPointLights.begin(), editorPointLights.end(),
+                    [&](const PointLight& light) { return light.id == objectId; });
+                return it == editorPointLights.end() ? SceneParentRef{} : it->parent;
+            }
+            if (type == HierarchyEntityType::SpotLight)
+            {
+                auto it = std::find_if(editorSpotLights.begin(), editorSpotLights.end(),
+                    [&](const SpotLight& light) { return light.id == objectId; });
+                return it == editorSpotLights.end() ? SceneParentRef{} : it->parent;
+            }
+            return {};
+        };
+        std::function<std::pair<HierarchyEntityType, std::uint32_t>(HierarchyEntityType, std::uint32_t)> prefabRootForHierarchyObject;
+        prefabRootForHierarchyObject = [&](HierarchyEntityType type, std::uint32_t objectId) {
+            const std::string assetId = prefabAssetIdForHierarchyObject(type, objectId);
+            if (assetId.empty())
+                return std::make_pair(type, objectId);
+
+            HierarchyEntityType currentType = type;
+            std::uint32_t currentId = objectId;
+            std::unordered_set<std::uint64_t> visited;
+            while (true)
+            {
+                const std::uint64_t currentKey = HierarchyObjectKey(currentType, currentId);
+                if (!visited.insert(currentKey).second)
+                    break;
+                const SceneParentRef parent = hierarchyParentRefForObject(currentType, currentId);
+                if (!parent.IsValid())
+                    break;
+                const HierarchyEntityType parentType = SceneParentTypeFromName(parent.type);
+                if (parentType == HierarchyEntityType::None)
+                    break;
+                if (prefabAssetIdForHierarchyObject(parentType, parent.id) != assetId)
+                    break;
+                currentType = parentType;
+                currentId = parent.id;
+            }
+            return std::make_pair(currentType, currentId);
+        };
 
         auto ensureEntity = [&](HierarchyEntityType type,
                                 std::uint32_t objectId,
                                 const std::string& displayName,
-                                bool editorHidden) {
+                                bool editorHidden,
+                                const SceneParentRef& parent = {},
+                                bool prefabRoot = false,
+                                const std::string& prefabAssetId = {}) {
             const std::uint64_t key = HierarchyObjectKey(type, objectId);
             liveKeys.push_back(key);
             ecs_entity_t entity = 0;
@@ -1569,7 +1743,7 @@ int RunGame(NativeWindow& window,
             }
 
             ecs_set_name(editorHierarchyWorld.get(), entity, displayName.c_str());
-            ecs_add_pair(editorHierarchyWorld.get(), entity, EcsChildOf, editorSceneRootEntity);
+            pendingParents[key] = parent;
 
             const bool selected =
                 selectedEditorObject.type == ToSelectedObjectType(type) &&
@@ -1583,6 +1757,8 @@ int RunGame(NativeWindow& window,
                 type,
                 objectId,
                 displayName,
+                prefabRoot,
+                prefabAssetId,
                 editorHidden,
                 selected});
         };
@@ -1594,12 +1770,42 @@ int RunGame(NativeWindow& window,
             const TerrainSceneData terrainData = terrain.GetTerrainSceneData();
             ensureEntity(HierarchyEntityType::Terrain, 1u, EditorDisplayName(terrainData), terrainData.editorHidden);
         }
-        for (const PointLight& light : editorPointLights)
-            ensureEntity(HierarchyEntityType::PointLight, light.id, EditorDisplayName(light), light.editorHidden);
-        for (const SpotLight& light : editorSpotLights)
-            ensureEntity(HierarchyEntityType::SpotLight, light.id, EditorDisplayName(light), light.editorHidden);
         for (const MeshSceneEntity& mesh : editorMeshEntities)
-            ensureEntity(HierarchyEntityType::MeshEntity, mesh.id, EditorDisplayName(mesh), mesh.editorHidden);
+        {
+            const std::string prefabAssetId = prefabAssetIdForHierarchyObject(HierarchyEntityType::MeshEntity, mesh.id);
+            const auto prefabRoot = prefabRootForHierarchyObject(HierarchyEntityType::MeshEntity, mesh.id);
+            ensureEntity(HierarchyEntityType::MeshEntity,
+                mesh.id,
+                EditorDisplayName(mesh),
+                mesh.editorHidden,
+                mesh.parent,
+                !prefabAssetId.empty() && prefabRoot.first == HierarchyEntityType::MeshEntity && prefabRoot.second == mesh.id,
+                prefabAssetId);
+        }
+        for (const PointLight& light : editorPointLights)
+        {
+            const std::string prefabAssetId = prefabAssetIdForHierarchyObject(HierarchyEntityType::PointLight, light.id);
+            const auto prefabRoot = prefabRootForHierarchyObject(HierarchyEntityType::PointLight, light.id);
+            ensureEntity(HierarchyEntityType::PointLight,
+                light.id,
+                EditorDisplayName(light),
+                light.editorHidden,
+                light.parent,
+                !prefabAssetId.empty() && prefabRoot.first == HierarchyEntityType::PointLight && prefabRoot.second == light.id,
+                prefabAssetId);
+        }
+        for (const SpotLight& light : editorSpotLights)
+        {
+            const std::string prefabAssetId = prefabAssetIdForHierarchyObject(HierarchyEntityType::SpotLight, light.id);
+            const auto prefabRoot = prefabRootForHierarchyObject(HierarchyEntityType::SpotLight, light.id);
+            ensureEntity(HierarchyEntityType::SpotLight,
+                light.id,
+                EditorDisplayName(light),
+                light.editorHidden,
+                light.parent,
+                !prefabAssetId.empty() && prefabRoot.first == HierarchyEntityType::SpotLight && prefabRoot.second == light.id,
+                prefabAssetId);
+        }
 
         for (auto it = editorHierarchyEntities.begin(); it != editorHierarchyEntities.end();)
         {
@@ -1612,6 +1818,24 @@ int RunGame(NativeWindow& window,
             {
                 ++it;
             }
+        }
+
+        for (HierarchySceneEntity& entity : entities)
+        {
+            const std::uint64_t key = HierarchyObjectKey(entity.type, entity.objectId);
+            const auto pendingIt = pendingParents.find(key);
+            const SceneParentRef& parent = pendingIt == pendingParents.end() ? SceneParentRef{} : pendingIt->second;
+            const HierarchyEntityType parentType = SceneParentTypeFromName(parent.type);
+            const std::uint64_t parentKey = parent.IsValid() ? HierarchyObjectKey(parentType, parent.id) : 0;
+            std::uint64_t parentHandle = static_cast<std::uint64_t>(editorSceneRootEntity);
+            if (parentKey != 0)
+            {
+                auto parentIt = editorHierarchyEntities.find(parentKey);
+                if (parentIt != editorHierarchyEntities.end())
+                    parentHandle = static_cast<std::uint64_t>(parentIt->second);
+            }
+            entity.parent = parentHandle;
+            ecs_add_pair(editorHierarchyWorld.get(), static_cast<ecs_entity_t>(entity.entity), EcsChildOf, static_cast<ecs_entity_t>(parentHandle));
         }
 
         for (const MeshSceneEntity& mesh : editorMeshEntities)
@@ -2907,7 +3131,161 @@ int RunGame(NativeWindow& window,
                     runtimeSession->SetEditorStatus("Focused camera on entity #" + std::to_string(id));
                     Tracenf("[HIERARCHY] Focused camera on entity: id=%u type=%d", id, static_cast<int>(type));
                 };
-                auto deleteHierarchyEntity = [&](HierarchyEntityType type, std::uint32_t id) {
+                auto isHierarchyReparentableType = [](HierarchyEntityType type) {
+                    return type == HierarchyEntityType::MeshEntity ||
+                        type == HierarchyEntityType::PointLight ||
+                        type == HierarchyEntityType::SpotLight;
+                };
+                auto hierarchyObjectExists = [&](HierarchyEntityType type, std::uint32_t id) {
+                    if (type == HierarchyEntityType::MeshEntity)
+                        return std::any_of(editorMeshEntities.begin(), editorMeshEntities.end(),
+                            [&](const MeshSceneEntity& mesh) { return mesh.id == id; });
+                    if (type == HierarchyEntityType::PointLight)
+                        return std::any_of(editorPointLights.begin(), editorPointLights.end(),
+                            [&](const PointLight& light) { return light.id == id; });
+                    if (type == HierarchyEntityType::SpotLight)
+                        return std::any_of(editorSpotLights.begin(), editorSpotLights.end(),
+                            [&](const SpotLight& light) { return light.id == id; });
+                    return false;
+                };
+                auto hierarchyParentOf = [&](HierarchyEntityType type, std::uint32_t id) {
+                    if (type == HierarchyEntityType::MeshEntity)
+                    {
+                        auto it = std::find_if(editorMeshEntities.begin(), editorMeshEntities.end(),
+                            [&](const MeshSceneEntity& mesh) { return mesh.id == id; });
+                        return it == editorMeshEntities.end() ? SceneParentRef{} : it->parent;
+                    }
+                    if (type == HierarchyEntityType::PointLight)
+                    {
+                        auto it = std::find_if(editorPointLights.begin(), editorPointLights.end(),
+                            [&](const PointLight& light) { return light.id == id; });
+                        return it == editorPointLights.end() ? SceneParentRef{} : it->parent;
+                    }
+                    if (type == HierarchyEntityType::SpotLight)
+                    {
+                        auto it = std::find_if(editorSpotLights.begin(), editorSpotLights.end(),
+                            [&](const SpotLight& light) { return light.id == id; });
+                        return it == editorSpotLights.end() ? SceneParentRef{} : it->parent;
+                    }
+                    return SceneParentRef{};
+                };
+                auto isHierarchyDescendantOf = [&](HierarchyEntityType type,
+                                                   std::uint32_t id,
+                                                   HierarchyEntityType ancestorType,
+                                                   std::uint32_t ancestorId) {
+                    for (SceneParentRef parent = hierarchyParentOf(type, id); parent.IsValid();)
+                    {
+                        const HierarchyEntityType parentType = SceneParentTypeFromName(parent.type);
+                        if (parentType == HierarchyEntityType::None)
+                            return false;
+                        if (parentType == ancestorType && parent.id == ancestorId)
+                            return true;
+                        parent = hierarchyParentOf(parentType, parent.id);
+                    }
+                    return false;
+                };
+                auto setHierarchyParent = [&](HierarchyEntityType type, std::uint32_t id, const SceneParentRef& parent) {
+                    if (type == HierarchyEntityType::MeshEntity)
+                    {
+                        auto it = std::find_if(editorMeshEntities.begin(), editorMeshEntities.end(),
+                            [&](const MeshSceneEntity& mesh) { return mesh.id == id; });
+                        if (it == editorMeshEntities.end())
+                            return false;
+                        it->parent = parent;
+                        return true;
+                    }
+                    if (type == HierarchyEntityType::PointLight)
+                    {
+                        auto it = std::find_if(editorPointLights.begin(), editorPointLights.end(),
+                            [&](const PointLight& light) { return light.id == id; });
+                        if (it == editorPointLights.end())
+                            return false;
+                        it->parent = parent;
+                        return true;
+                    }
+                    if (type == HierarchyEntityType::SpotLight)
+                    {
+                        auto it = std::find_if(editorSpotLights.begin(), editorSpotLights.end(),
+                            [&](const SpotLight& light) { return light.id == id; });
+                        if (it == editorSpotLights.end())
+                            return false;
+                        it->parent = parent;
+                        return true;
+                    }
+                    return false;
+                };
+                auto reparentHierarchyEntity = [&](HierarchyEntityType type,
+                                                   std::uint32_t id,
+                                                   HierarchyEntityType parentType,
+                                                   std::uint32_t parentId) {
+                    if (!isHierarchyReparentableType(type) || !hierarchyObjectExists(type, id))
+                    {
+                        runtimeSession->SetEditorStatus("Cannot parent this hierarchy item");
+                        return false;
+                    }
+
+                    SceneParentRef parent;
+                    if (parentType != HierarchyEntityType::None && parentId != 0)
+                    {
+                        if (!isHierarchyReparentableType(parentType) || !hierarchyObjectExists(parentType, parentId))
+                        {
+                            runtimeSession->SetEditorStatus("Parent target is not a scene entity");
+                            return false;
+                        }
+                        if (parentType == type && parentId == id)
+                        {
+                            runtimeSession->SetEditorStatus("Cannot parent an entity to itself");
+                            return false;
+                        }
+                        if (isHierarchyDescendantOf(parentType, parentId, type, id))
+                        {
+                            runtimeSession->SetEditorStatus("Cannot create a hierarchy cycle");
+                            return false;
+                        }
+                        parent = MakeSceneParentRef(parentType, parentId);
+                    }
+
+                    if (!setHierarchyParent(type, id, parent))
+                        return false;
+                    SceneManager::Instance().MarkDirty();
+                    runtimeSession->SetEditorStatus(parent.IsValid()
+                        ? "Hierarchy parent changed"
+                        : "Hierarchy entity moved to scene root");
+                    Tracenf("[HIERARCHY] Reparented entity: id=%u type=%d parent_id=%u parent_type=%d",
+                        id,
+                        static_cast<int>(type),
+                        parentId,
+                        static_cast<int>(parentType));
+                    return true;
+                };
+                auto directHierarchyChildren = [&](HierarchyEntityType parentType, std::uint32_t parentId) {
+                    std::vector<std::pair<HierarchyEntityType, std::uint32_t>> children;
+                    const std::string parentTypeName = SceneParentTypeName(parentType);
+                    if (parentTypeName.empty())
+                        return children;
+                    for (const MeshSceneEntity& mesh : editorMeshEntities)
+                    {
+                        if (mesh.parent.type == parentTypeName && mesh.parent.id == parentId)
+                            children.push_back({HierarchyEntityType::MeshEntity, mesh.id});
+                    }
+                    for (const PointLight& light : editorPointLights)
+                    {
+                        if (light.parent.type == parentTypeName && light.parent.id == parentId)
+                            children.push_back({HierarchyEntityType::PointLight, light.id});
+                    }
+                    for (const SpotLight& light : editorSpotLights)
+                    {
+                        if (light.parent.type == parentTypeName && light.parent.id == parentId)
+                            children.push_back({HierarchyEntityType::SpotLight, light.id});
+                    }
+                    return children;
+                };
+                std::function<void(HierarchyEntityType, std::uint32_t)> deleteHierarchyEntity;
+                deleteHierarchyEntity = [&](HierarchyEntityType type, std::uint32_t id) {
+                    const std::vector<std::pair<HierarchyEntityType, std::uint32_t>> children = directHierarchyChildren(type, id);
+                    for (const auto& child : children)
+                        deleteHierarchyEntity(child.first, child.second);
+
                     if (type == HierarchyEntityType::WaterBody)
                     {
                         editorWaterBodies.erase(std::remove_if(editorWaterBodies.begin(), editorWaterBodies.end(),
@@ -3255,6 +3633,22 @@ int RunGame(NativeWindow& window,
                     commands.addMeshEntity = false;
                     commands.addPrimitiveEntity = false;
                     commands.primitiveType.clear();
+                    commands.addPrefabInstance = false;
+                    commands.prefabAssetId.clear();
+                    commands.prefabDropScreenPositionValid = false;
+                    commands.createPrefabFromSelection = false;
+                    commands.refreshSelectedPrefabInstance = false;
+                    commands.refreshAllPrefabInstances = false;
+                    commands.revertSelectedPrefabInstance = false;
+                    commands.applySelectedPrefabToAsset = false;
+                    commands.revertSelectedPrefabOverride = false;
+                    commands.applySelectedPrefabOverrideToAsset = false;
+                    commands.selectedPrefabOverrideName.clear();
+                    commands.unpackSelectedPrefabInstance = false;
+                    commands.savePrefabAssetEdit = false;
+                    commands.editPrefabAssetId.clear();
+                    commands.editPrefabName.clear();
+                    commands.editPrefabEntityNames.clear();
                     commands.addComponentToSelectedEntity = false;
                     commands.addComponentType = EditorComponentType::None;
                     commands.addComponentTypeId.clear();
@@ -3275,6 +3669,9 @@ int RunGame(NativeWindow& window,
                     commands.hierarchyDuplicateEntity = false;
                     commands.hierarchyRenameEntity = false;
                     commands.hierarchyToggleHidden = false;
+                    commands.hierarchyReparentEntity = false;
+                    commands.hierarchyParentType = HierarchyEntityType::None;
+                    commands.hierarchyParentId = 0;
                     commands.paletteSlotChanged = false;
                     commands.save = false;
                     commands.reload = false;
@@ -3293,6 +3690,11 @@ int RunGame(NativeWindow& window,
                     renameHierarchyEntity(commands.hierarchyEntityType, commands.hierarchyEntityId, commands.hierarchyRenameValue);
                 if (commands.hierarchyToggleHidden)
                     toggleHierarchyHidden(commands.hierarchyEntityType, commands.hierarchyEntityId);
+                if (commands.hierarchyReparentEntity)
+                    reparentHierarchyEntity(commands.hierarchyEntityType,
+                        commands.hierarchyEntityId,
+                        commands.hierarchyParentType,
+                        commands.hierarchyParentId);
                 auto selectedEntityPosition = [&]() {
                     if (selectedEditorObject.type == SelectedEditorObjectType::Terrain)
                     {
@@ -3416,6 +3818,1480 @@ int RunGame(NativeWindow& window,
                         spawn.x,
                         spawn.y,
                         spawn.z);
+                };
+                auto resolvePrefabAssetPath = [&](const std::string& assetId)
+                    -> std::optional<std::pair<AssetLibrary::Entry, std::filesystem::path>> {
+                    if (assetId.empty())
+                        return std::nullopt;
+                    if (ProjectManager::Instance().HasProject())
+                    {
+                        AssetLibrary projectAssets(ProjectManager::Instance().ProjectRoot(),
+                            ProjectManager::Instance().AssetRootPath());
+                        if (projectAssets.Initialize())
+                        {
+                            auto entry = projectAssets.FindById(assetId);
+                            if (entry && entry->category == AssetLibrary::Category::Prefab)
+                                return std::make_pair(*entry, projectAssets.AbsolutePath(*entry));
+                        }
+                    }
+                    if (auto root = assets.RootPath())
+                    {
+                        AssetLibrary engineAssets(*root);
+                        if (engineAssets.Initialize())
+                        {
+                            auto entry = engineAssets.FindById(assetId);
+                            if (entry && entry->category == AssetLibrary::Category::Prefab)
+                                return std::make_pair(*entry, engineAssets.AbsolutePath(*entry));
+                        }
+                    }
+                    return std::nullopt;
+                };
+                auto loadPrefabDocument = [&](const std::string& assetId)
+                    -> std::optional<std::pair<prefab::PrefabDocument, std::filesystem::path>> {
+                    const auto resolved = resolvePrefabAssetPath(assetId);
+                    if (!resolved)
+                    {
+                        TraceError("[PREFAB] load failed: asset not found id=%s", assetId.c_str());
+                        return std::nullopt;
+                    }
+                    std::ifstream file(resolved->second, std::ios::binary);
+                    if (!file)
+                    {
+                        TraceError("[PREFAB] load failed: unreadable path=%s", resolved->second.string().c_str());
+                        return std::nullopt;
+                    }
+                    const std::string text((std::istreambuf_iterator<char>(file)), std::istreambuf_iterator<char>());
+                    prefab::PrefabDocument prefabData = prefab::ParseDocument(text, resolved->first.displayName);
+                    if (prefabData.entities.empty())
+                    {
+                        TraceError("[PREFAB] load failed: unsupported file=%s", resolved->second.string().c_str());
+                        return std::nullopt;
+                    }
+                    return std::make_pair(std::move(prefabData), resolved->second);
+                };
+                auto selectedPrefabRoot = [&]() -> std::optional<std::pair<HierarchyEntityType, std::uint32_t>> {
+                    if (selectedEditorObject.type == SelectedEditorObjectType::MeshEntity)
+                        return std::make_pair(HierarchyEntityType::MeshEntity, selectedEditorObject.id);
+                    if (selectedEditorObject.type == SelectedEditorObjectType::PointLight)
+                        return std::make_pair(HierarchyEntityType::PointLight, selectedEditorObject.id);
+                    if (selectedEditorObject.type == SelectedEditorObjectType::SpotLight)
+                        return std::make_pair(HierarchyEntityType::SpotLight, selectedEditorObject.id);
+                    return std::nullopt;
+                };
+                auto buildPrefabDocumentFromRoot = [&](HierarchyEntityType rootType,
+                                                       std::uint32_t rootId,
+                                                       std::string prefabName) -> std::optional<prefab::PrefabDocument> {
+                    prefab::PrefabDocument document;
+                    struct PendingPrefabEntity
+                    {
+                        HierarchyEntityType type = HierarchyEntityType::None;
+                        std::uint32_t id = 0;
+                        std::uint32_t parentLocalId = 0;
+                    };
+                    std::vector<PendingPrefabEntity> pending;
+                    pending.push_back({rootType, rootId, 0});
+
+                    std::unordered_map<std::uint64_t, std::uint32_t> localIds;
+                    auto enqueueChildren = [&](HierarchyEntityType parentType, std::uint32_t parentId, std::uint32_t parentLocalId) {
+                        const std::string parentTypeName = SceneParentTypeName(parentType);
+                        for (const MeshSceneEntity& mesh : editorMeshEntities)
+                        {
+                            if (mesh.parent.type == parentTypeName && mesh.parent.id == parentId)
+                                pending.push_back({HierarchyEntityType::MeshEntity, mesh.id, parentLocalId});
+                        }
+                        for (const PointLight& light : editorPointLights)
+                        {
+                            if (light.parent.type == parentTypeName && light.parent.id == parentId)
+                                pending.push_back({HierarchyEntityType::PointLight, light.id, parentLocalId});
+                        }
+                        for (const SpotLight& light : editorSpotLights)
+                        {
+                            if (light.parent.type == parentTypeName && light.parent.id == parentId)
+                                pending.push_back({HierarchyEntityType::SpotLight, light.id, parentLocalId});
+                        }
+                    };
+
+                    for (std::size_t i = 0; i < pending.size(); ++i)
+                    {
+                        const PendingPrefabEntity item = pending[i];
+                        const std::uint64_t key = HierarchyObjectKey(item.type, item.id);
+                        if (localIds.find(key) != localIds.end())
+                            continue;
+                        const std::uint32_t localId = static_cast<std::uint32_t>(localIds.size() + 1u);
+                        localIds[key] = localId;
+
+                        prefab::PrefabEntity entity;
+                        entity.localId = localId;
+                        entity.parentLocalId = item.parentLocalId;
+                        if (item.type == HierarchyEntityType::MeshEntity)
+                        {
+                            auto it = std::find_if(editorMeshEntities.begin(), editorMeshEntities.end(),
+                                [&](const MeshSceneEntity& mesh) { return mesh.id == item.id; });
+                            if (it == editorMeshEntities.end())
+                                continue;
+                            MeshSceneEntity mesh = *it;
+                            if (localId == 1)
+                            {
+                                mesh.prefabAssetId.clear();
+                                mesh.prefabInstance = {};
+                            }
+                            mesh.parent = {};
+                            entity.kind = prefab::PrefabTemplate::Kind::Mesh;
+                            entity.name = EditorDisplayName(*it);
+                            entity.mesh = std::move(mesh);
+                            if (localId == 1)
+                                prefabName = entity.name;
+                        }
+                        else if (item.type == HierarchyEntityType::PointLight)
+                        {
+                            auto it = std::find_if(editorPointLights.begin(), editorPointLights.end(),
+                                [&](const PointLight& light) { return light.id == item.id; });
+                            if (it == editorPointLights.end())
+                                continue;
+                            PointLight light = *it;
+                            if (localId == 1)
+                            {
+                                light.prefabAssetId.clear();
+                                light.prefabInstance = {};
+                            }
+                            light.parent = {};
+                            entity.kind = prefab::PrefabTemplate::Kind::PointLight;
+                            entity.name = EditorDisplayName(*it);
+                            entity.point = light;
+                            if (localId == 1)
+                                prefabName = entity.name;
+                        }
+                        else if (item.type == HierarchyEntityType::SpotLight)
+                        {
+                            auto it = std::find_if(editorSpotLights.begin(), editorSpotLights.end(),
+                                [&](const SpotLight& light) { return light.id == item.id; });
+                            if (it == editorSpotLights.end())
+                                continue;
+                            SpotLight light = *it;
+                            if (localId == 1)
+                            {
+                                light.prefabAssetId.clear();
+                                light.prefabInstance = {};
+                            }
+                            light.parent = {};
+                            entity.kind = prefab::PrefabTemplate::Kind::SpotLight;
+                            entity.name = EditorDisplayName(*it);
+                            entity.spot = light;
+                            if (localId == 1)
+                                prefabName = entity.name;
+                        }
+                        if (entity.kind == prefab::PrefabTemplate::Kind::Unsupported)
+                            continue;
+                        document.entities.push_back(std::move(entity));
+                        enqueueChildren(item.type, item.id, localId);
+                    }
+
+                    if (document.entities.empty())
+                        return std::nullopt;
+                    document.name = prefabName.empty() ? "Prefab" : prefabName;
+                    return document;
+                };
+                auto createPrefabFromSelection = [&]() {
+                    if (!ProjectManager::Instance().HasProject())
+                    {
+                        runtimeSession->SetEditorStatus("Open or create a project before creating prefabs");
+                        return false;
+                    }
+                    const auto root = selectedPrefabRoot();
+                    if (!root)
+                    {
+                        runtimeSession->SetEditorStatus("Select a mesh or light before creating a prefab");
+                        return false;
+                    }
+                    auto document = buildPrefabDocumentFromRoot(root->first, root->second, "Prefab");
+                    if (!document)
+                    {
+                        runtimeSession->SetEditorStatus("Select a mesh or light before creating a prefab");
+                        return false;
+                    }
+                    const std::string prefabName = document->name.empty() ? "Prefab" : document->name;
+
+                    std::error_code ec;
+                    std::filesystem::path tempPath = std::filesystem::temp_directory_path(ec);
+                    if (ec)
+                        tempPath = ProjectManager::Instance().ProjectRoot();
+                    std::string fileStem = prefabName;
+                    for (char& ch : fileStem)
+                    {
+                        const unsigned char c = static_cast<unsigned char>(ch);
+                        if (!std::isalnum(c) && ch != '_' && ch != '-')
+                            ch = '_';
+                    }
+                    if (fileStem.empty())
+                        fileStem = "Prefab";
+                    tempPath /= fileStem + ".ixprefab";
+                    {
+                        std::ofstream file(tempPath, std::ios::binary);
+                        if (!file)
+                        {
+                            runtimeSession->SetEditorStatus("Prefab create failed: temp write");
+                            return false;
+                        }
+                        std::ostringstream json;
+                        prefab::WriteDocument(json, *document);
+                        const std::string text = json.str();
+                        file.write(text.data(), static_cast<std::streamsize>(text.size()));
+                    }
+
+                    AssetLibrary projectAssets(ProjectManager::Instance().ProjectRoot(),
+                        ProjectManager::Instance().AssetRootPath());
+                    if (!projectAssets.Initialize())
+                    {
+                        std::filesystem::remove(tempPath, ec);
+                        runtimeSession->SetEditorStatus("Prefab create failed: asset library");
+                        return false;
+                    }
+                    AssetLibrary::ImportOptions options;
+                    options.displayName = prefabName;
+                    options.tags = {"prefab"};
+                    AssetLibrary::Entry entry;
+                    std::string error;
+                    if (!projectAssets.Import(AssetLibrary::Category::Prefab, tempPath, options, entry, error))
+                    {
+                        std::filesystem::remove(tempPath, ec);
+                        runtimeSession->SetEditorStatus("Prefab create failed: " + error);
+                        return false;
+                    }
+                    std::filesystem::remove(tempPath, ec);
+                    AssetDatabase::Instance().runtimeAdd(projectAssets.AbsolutePath(entry));
+                    editorImGui.RefreshAssetLibrary();
+                    runtimeSession->SetEditorStatus("Prefab created: " + entry.displayName);
+                    Tracenf("[PREFAB] created asset_id=%s name=%s file=%s",
+                        entry.id.c_str(),
+                        entry.displayName.c_str(),
+                        projectAssets.AssetRelativePath(entry).c_str());
+                    return true;
+                };
+                auto writePrefabTemplateToPath = [&](const std::filesystem::path& path,
+                                                     const std::string& prefabName,
+                                                     auto&& writeEntity) {
+                    std::filesystem::path tempPath = path;
+                    tempPath += ".tmp";
+                    {
+                        std::ofstream file(tempPath, std::ios::binary | std::ios::trunc);
+                        if (!file)
+                            return false;
+                        file << "{\n";
+                        file << "  \"version\": 1,\n";
+                        file << "  \"name\": \"" << ixtreeme::common::EscapeJson(prefabName) << "\",\n";
+                        writeEntity(file, prefabName);
+                        file << "}\n";
+                    }
+                    std::error_code ec;
+                    std::filesystem::rename(tempPath, path, ec);
+                    if (ec)
+                    {
+                        std::filesystem::remove(path, ec);
+                        ec.clear();
+                        std::filesystem::rename(tempPath, path, ec);
+                    }
+                    if (ec)
+                    {
+                        std::filesystem::remove(tempPath, ec);
+                        return false;
+                    }
+                    return true;
+                };
+                auto writePrefabDocumentToPath = [&](const std::filesystem::path& path,
+                                                     const prefab::PrefabDocument& document) {
+                    std::filesystem::path tempPath = path;
+                    tempPath += ".tmp";
+                    {
+                        std::ofstream file(tempPath, std::ios::binary | std::ios::trunc);
+                        if (!file)
+                            return false;
+                        prefab::WriteDocument(file, document);
+                    }
+                    std::error_code ec;
+                    std::filesystem::rename(tempPath, path, ec);
+                    if (ec)
+                    {
+                        std::filesystem::remove(path, ec);
+                        ec.clear();
+                        std::filesystem::rename(tempPath, path, ec);
+                    }
+                    if (ec)
+                    {
+                        std::filesystem::remove(tempPath, ec);
+                        return false;
+                    }
+                    return true;
+                };
+                auto writePrefabDependencies = [&](const std::filesystem::path& path,
+                                                   const prefab::PrefabDocument& document) {
+                    std::vector<Guid> dependencies;
+                    auto addGuidText = [&](const std::string& guidText) {
+                        if (const std::optional<Guid> guid = Guid::fromString(guidText))
+                            dependencies.push_back(*guid);
+                    };
+                    for (const prefab::PrefabEntity& entity : document.entities)
+                    {
+                        if (entity.kind == prefab::PrefabTemplate::Kind::Mesh)
+                        {
+                            addGuidText(entity.mesh.meshAssetId);
+                            addGuidText(entity.mesh.prefabAssetId);
+                            if (!entity.mesh.prefabInstance.assetId.empty())
+                                addGuidText(entity.mesh.prefabInstance.assetId);
+                            for (const std::string& material : entity.mesh.materialSlots)
+                                addGuidText(material);
+                        }
+                        else if (entity.kind == prefab::PrefabTemplate::Kind::PointLight)
+                        {
+                            addGuidText(entity.point.prefabAssetId);
+                            if (!entity.point.prefabInstance.assetId.empty())
+                                addGuidText(entity.point.prefabInstance.assetId);
+                        }
+                        else if (entity.kind == prefab::PrefabTemplate::Kind::SpotLight)
+                        {
+                            addGuidText(entity.spot.prefabAssetId);
+                            if (!entity.spot.prefabInstance.assetId.empty())
+                                addGuidText(entity.spot.prefabInstance.assetId);
+                        }
+                    }
+                    return AssetDatabase::Instance().writeDependencies(path, dependencies);
+                };
+                auto savePrefabAssetEdit = [&](const std::string& assetId,
+                                               const std::string& prefabName,
+                                               const std::vector<PrefabAssetEntityNameEdit>& entityNames) {
+                    if (assetId.empty())
+                        return false;
+                    auto loaded = loadPrefabDocument(assetId);
+                    if (!loaded)
+                        return false;
+
+                    prefab::PrefabDocument& document = loaded->first;
+                    if (!prefabName.empty())
+                        document.name = prefabName;
+
+                    std::unordered_set<std::uint32_t> editedLocalIds;
+                    for (const PrefabAssetEntityNameEdit& edit : entityNames)
+                    {
+                        if (edit.localId != 0)
+                            editedLocalIds.insert(edit.localId);
+                    }
+                    document.entities.erase(
+                        std::remove_if(document.entities.begin(),
+                            document.entities.end(),
+                            [&](const prefab::PrefabEntity& entity) {
+                                return entity.localId != 0 && !editedLocalIds.contains(entity.localId);
+                            }),
+                        document.entities.end());
+
+                    auto kindForEdit = [](const PrefabAssetEntityNameEdit& edit) {
+                        if (edit.type == "mesh_entity")
+                            return prefab::PrefabTemplate::Kind::Mesh;
+                        if (edit.type == "dynamic_light" && edit.lightType == "point")
+                            return prefab::PrefabTemplate::Kind::PointLight;
+                        if (edit.type == "dynamic_light" && edit.lightType == "spot")
+                            return prefab::PrefabTemplate::Kind::SpotLight;
+                        return prefab::PrefabTemplate::Kind::Unsupported;
+                    };
+
+                    for (const PrefabAssetEntityNameEdit& edit : entityNames)
+                    {
+                        if (edit.localId == 0 || edit.name.empty())
+                            continue;
+                        const prefab::PrefabTemplate::Kind editKind = kindForEdit(edit);
+                        if (editKind == prefab::PrefabTemplate::Kind::Unsupported)
+                            continue;
+                        auto entityIt = std::find_if(document.entities.begin(), document.entities.end(),
+                            [&](const prefab::PrefabEntity& entity) {
+                                return entity.localId == edit.localId;
+                            });
+                        if (entityIt == document.entities.end())
+                        {
+                            prefab::PrefabEntity newEntity{};
+                            newEntity.localId = edit.localId;
+                            newEntity.kind = editKind;
+                            if (editKind == prefab::PrefabTemplate::Kind::Mesh)
+                            {
+                                newEntity.mesh.meshAssetId = edit.meshAssetId;
+                                newEntity.mesh.meshAssetPath = edit.meshAssetPath;
+                                newEntity.mesh.prefabAssetId = edit.prefabAssetId;
+                                newEntity.mesh.prefabInstance = MakePrefabInstanceState(edit.prefabAssetId);
+                            }
+                            document.entities.push_back(std::move(newEntity));
+                            entityIt = std::prev(document.entities.end());
+                        }
+                        entityIt->kind = editKind;
+
+                        entityIt->parentLocalId = edit.parentLocalId;
+                        entityIt->name = edit.name;
+                        if (entityIt->kind == prefab::PrefabTemplate::Kind::Mesh)
+                        {
+                            entityIt->mesh.name = edit.name;
+                            entityIt->mesh.meshAssetId = edit.meshAssetId.empty() ? entityIt->mesh.meshAssetId : edit.meshAssetId;
+                            entityIt->mesh.meshAssetPath = edit.meshAssetPath.empty() ? entityIt->mesh.meshAssetPath : edit.meshAssetPath;
+                            entityIt->mesh.prefabAssetId = edit.prefabAssetId;
+                            if (!edit.prefabAssetId.empty())
+                            {
+                                entityIt->mesh.prefabInstance = MakePrefabInstanceState(edit.prefabAssetId);
+                                entityIt->mesh.prefabInstance.localId =
+                                    entityIt->mesh.prefabInstance.localId == 0 ? 1u : entityIt->mesh.prefabInstance.localId;
+                            }
+                            entityIt->mesh.materialSlots = edit.materialSlots;
+                            if (edit.transformValid)
+                            {
+                                std::copy(std::begin(edit.position), std::end(edit.position), std::begin(entityIt->mesh.position));
+                                std::copy(std::begin(edit.rotation), std::end(edit.rotation), std::begin(entityIt->mesh.rotation));
+                                std::copy(std::begin(edit.scale), std::end(edit.scale), std::begin(entityIt->mesh.scale));
+                            }
+                        }
+                        else if (entityIt->kind == prefab::PrefabTemplate::Kind::PointLight)
+                        {
+                            entityIt->point.name = edit.name;
+                            if (entityIt->point.radius <= 0.0f)
+                                entityIt->point.radius = 10.0f;
+                            if (edit.transformValid)
+                                std::copy(std::begin(edit.position), std::end(edit.position), std::begin(entityIt->point.position));
+                            if (edit.lightValid)
+                            {
+                                entityIt->point.r = edit.color[0];
+                                entityIt->point.g = edit.color[1];
+                                entityIt->point.b = edit.color[2];
+                                entityIt->point.intensity = edit.intensity;
+                                entityIt->point.radius = edit.radius;
+                                entityIt->point.enabled = edit.enabled;
+                            }
+                        }
+                        else if (entityIt->kind == prefab::PrefabTemplate::Kind::SpotLight)
+                        {
+                            entityIt->spot.name = edit.name;
+                            if (entityIt->spot.radius <= 0.0f)
+                                entityIt->spot.radius = 20.0f;
+                            if (edit.transformValid)
+                            {
+                                std::copy(std::begin(edit.position), std::end(edit.position), std::begin(entityIt->spot.position));
+                                std::copy(std::begin(edit.rotation), std::end(edit.rotation), std::begin(entityIt->spot.rotation));
+                            }
+                            if (edit.lightValid)
+                            {
+                                entityIt->spot.r = edit.color[0];
+                                entityIt->spot.g = edit.color[1];
+                                entityIt->spot.b = edit.color[2];
+                                entityIt->spot.intensity = edit.intensity;
+                                entityIt->spot.radius = edit.radius;
+                                entityIt->spot.innerConeDegrees = edit.innerConeDegrees;
+                                entityIt->spot.outerConeDegrees = std::max(edit.outerConeDegrees, edit.innerConeDegrees);
+                                entityIt->spot.enabled = edit.enabled;
+                            }
+                        }
+                    }
+
+                    if (!writePrefabDocumentToPath(loaded->second, document))
+                    {
+                        TraceError("[PREFAB] asset edit save failed: path=%s", loaded->second.string().c_str());
+                        return false;
+                    }
+                    AssetDatabase::Instance().runtimeAdd(loaded->second);
+                    writePrefabDependencies(loaded->second, document);
+                    editorImGui.RefreshAssetLibrary();
+                    runtimeSession->SetEditorStatus("Prefab asset saved: " + document.name);
+                    Tracenf("[PREFAB] asset edit saved asset=%s entities=%zu",
+                        assetId.c_str(),
+                        document.entities.size());
+                    return true;
+                };
+                auto applySelectedPrefabToAsset = [&]() {
+                    const auto root = selectedPrefabRoot();
+                    if (!root)
+                        return false;
+
+                    std::string assetId;
+                    std::string fallbackName;
+                    if (root->first == HierarchyEntityType::MeshEntity)
+                    {
+                        auto it = std::find_if(editorMeshEntities.begin(), editorMeshEntities.end(),
+                            [&](const MeshSceneEntity& mesh) { return mesh.id == root->second; });
+                        if (it == editorMeshEntities.end())
+                            return false;
+                        assetId = !it->prefabInstance.assetId.empty() ? it->prefabInstance.assetId : it->prefabAssetId;
+                        fallbackName = EditorDisplayName(*it);
+                    }
+                    else if (root->first == HierarchyEntityType::PointLight)
+                    {
+                        auto it = std::find_if(editorPointLights.begin(), editorPointLights.end(),
+                            [&](const PointLight& light) { return light.id == root->second; });
+                        if (it == editorPointLights.end())
+                            return false;
+                        assetId = !it->prefabInstance.assetId.empty() ? it->prefabInstance.assetId : it->prefabAssetId;
+                        fallbackName = EditorDisplayName(*it);
+                    }
+                    else if (root->first == HierarchyEntityType::SpotLight)
+                    {
+                        auto it = std::find_if(editorSpotLights.begin(), editorSpotLights.end(),
+                            [&](const SpotLight& light) { return light.id == root->second; });
+                        if (it == editorSpotLights.end())
+                            return false;
+                        assetId = !it->prefabInstance.assetId.empty() ? it->prefabInstance.assetId : it->prefabAssetId;
+                        fallbackName = EditorDisplayName(*it);
+                    }
+
+                    const auto resolved = resolvePrefabAssetPath(assetId);
+                    if (!resolved)
+                        return false;
+                    const std::string prefabName = resolved->first.displayName.empty() ? fallbackName : resolved->first.displayName;
+                    auto document = buildPrefabDocumentFromRoot(root->first, root->second, prefabName);
+                    if (!document)
+                        return false;
+                    document->name = prefabName;
+                    if (!writePrefabDocumentToPath(resolved->second, *document))
+                    {
+                        TraceError("[PREFAB] apply failed: write path=%s", resolved->second.string().c_str());
+                        return false;
+                    }
+                    AssetDatabase::Instance().runtimeAdd(resolved->second);
+                    writePrefabDependencies(resolved->second, *document);
+                    editorImGui.RefreshAssetLibrary();
+                    runtimeSession->SetEditorStatus("Applied instance subtree to prefab: " + prefabName);
+                    Tracenf("[PREFAB] applied instance subtree root=%u root_type=%d prefab=%s entities=%zu",
+                        root->second,
+                        static_cast<int>(root->first),
+                        assetId.c_str(),
+                        document->entities.size());
+                    return true;
+                };
+                auto instantiatePrefabAt = [&](const std::string& assetId, WorldVec3 spawn) {
+                    const auto loaded = loadPrefabDocument(assetId);
+                    if (!loaded)
+                    {
+                        runtimeSession->SetEditorStatus("Prefab not found: " + assetId);
+                        return false;
+                    }
+                    const prefab::PrefabDocument& prefabData = loaded->first;
+                    if (prefabData.entities.empty())
+                    {
+                        runtimeSession->SetEditorStatus("Unsupported prefab entity");
+                        TraceError("[PREFAB] instantiate failed: unsupported file=%s", loaded->second.string().c_str());
+                        return false;
+                    }
+
+                    WorldVec3 rootPosition{0.0f, 0.0f, 0.0f};
+                    const prefab::PrefabEntity& rootEntity = prefabData.entities.front();
+                    if (rootEntity.kind == prefab::PrefabTemplate::Kind::Mesh)
+                        rootPosition = {rootEntity.mesh.position[0], rootEntity.mesh.position[1], rootEntity.mesh.position[2]};
+                    else if (rootEntity.kind == prefab::PrefabTemplate::Kind::PointLight)
+                        rootPosition = {rootEntity.point.position[0], rootEntity.point.position[1], rootEntity.point.position[2]};
+                    else if (rootEntity.kind == prefab::PrefabTemplate::Kind::SpotLight)
+                        rootPosition = {rootEntity.spot.position[0], rootEntity.spot.position[1], rootEntity.spot.position[2]};
+
+                    std::unordered_map<std::uint32_t, SceneParentRef> instantiatedRefs;
+                    SelectedEditorObject firstCreated{};
+                    std::size_t createdCount = 0;
+                    auto offsetPosition = [&](float* position) {
+                        position[0] = spawn.x + (position[0] - rootPosition.x);
+                        position[1] = spawn.y + (position[1] - rootPosition.y);
+                        position[2] = spawn.z + (position[2] - rootPosition.z);
+                    };
+                    auto assignPrefabLink = [&](auto& object, const prefab::PrefabEntity& prefabEntity) {
+                        const std::string nestedAssetId = !object.prefabInstance.assetId.empty()
+                            ? object.prefabInstance.assetId
+                            : object.prefabAssetId;
+                        if (!nestedAssetId.empty() && nestedAssetId != assetId)
+                        {
+                            object.prefabAssetId = nestedAssetId;
+                            if (object.prefabInstance.assetId.empty())
+                                object.prefabInstance = MakePrefabInstanceState(nestedAssetId);
+                            object.prefabInstance.assetId = nestedAssetId;
+                            object.prefabInstance.linked = true;
+                            object.prefabInstance.localId = object.prefabInstance.localId == 0 ? 1u : object.prefabInstance.localId;
+                            return;
+                        }
+
+                        object.prefabAssetId = assetId;
+                        object.prefabInstance = MakePrefabInstanceState(assetId);
+                        object.prefabInstance.localId = prefabEntity.localId == 0 ? 1u : prefabEntity.localId;
+                    };
+
+                    for (const prefab::PrefabEntity& prefabEntity : prefabData.entities)
+                    {
+                        const std::uint32_t prefabLocalRefId = prefabEntity.localId == 0 ? 1u : prefabEntity.localId;
+                        SceneParentRef parent;
+                        if (prefabEntity.parentLocalId != 0)
+                        {
+                            auto parentIt = instantiatedRefs.find(prefabEntity.parentLocalId);
+                            if (parentIt != instantiatedRefs.end())
+                                parent = parentIt->second;
+                        }
+
+                        if (prefabEntity.kind == prefab::PrefabTemplate::Kind::Mesh)
+                        {
+                            MeshSceneEntity mesh = prefabEntity.mesh;
+                            mesh.id = nextEditorMeshEntityId++;
+                            mesh.name = makeUniqueSceneEntityName(prefabEntity.name.empty() ? "Prefab Mesh" : prefabEntity.name);
+                            assignPrefabLink(mesh, prefabEntity);
+                            mesh.parent = parent;
+                            offsetPosition(mesh.position);
+                            if (mesh.materialSlots.empty())
+                                mesh.materialSlots = LoadDefaultMaterialSlotGuids(mesh.meshAssetPath, ResolveModelSubmeshCount(mesh.meshAssetPath));
+                            editorMeshEntities.push_back(mesh);
+                            editorMeshEntityLookup[mesh.id] = editorMeshEntities.size() - 1u;
+                            syncStaticMeshSpatialEntity(editorMeshEntities.back());
+                            instantiatedRefs[prefabLocalRefId] = MakeSceneParentRef(HierarchyEntityType::MeshEntity, mesh.id);
+                            if (createdCount == 0)
+                                firstCreated = {SelectedEditorObjectType::MeshEntity, mesh.id};
+                            ++createdCount;
+                        }
+                        else if (prefabEntity.kind == prefab::PrefabTemplate::Kind::PointLight)
+                        {
+                            if (editorPointLights.size() >= kMaxDynamicPointLights)
+                                continue;
+                            PointLight light = prefabEntity.point;
+                            light.id = nextEditorLightId++;
+                            light.name = makeUniqueSceneEntityName(prefabEntity.name.empty() ? "Point Light" : prefabEntity.name);
+                            assignPrefabLink(light, prefabEntity);
+                            light.parent = parent;
+                            offsetPosition(light.position);
+                            editorPointLights.push_back(light);
+                            instantiatedRefs[prefabLocalRefId] = MakeSceneParentRef(HierarchyEntityType::PointLight, light.id);
+                            if (createdCount == 0)
+                                firstCreated = {SelectedEditorObjectType::PointLight, light.id};
+                            ++createdCount;
+                        }
+                        else if (prefabEntity.kind == prefab::PrefabTemplate::Kind::SpotLight)
+                        {
+                            if (editorSpotLights.size() >= kMaxDynamicSpotLights)
+                                continue;
+                            SpotLight light = prefabEntity.spot;
+                            light.id = nextEditorLightId++;
+                            light.name = makeUniqueSceneEntityName(prefabEntity.name.empty() ? "Spot Light" : prefabEntity.name);
+                            assignPrefabLink(light, prefabEntity);
+                            light.parent = parent;
+                            offsetPosition(light.position);
+                            editorSpotLights.push_back(light);
+                            instantiatedRefs[prefabLocalRefId] = MakeSceneParentRef(HierarchyEntityType::SpotLight, light.id);
+                            if (createdCount == 0)
+                                firstCreated = {SelectedEditorObjectType::SpotLight, light.id};
+                            ++createdCount;
+                        }
+                    }
+                    if (createdCount == 0)
+                    {
+                        runtimeSession->SetEditorStatus("Prefab instantiate failed: no supported entities");
+                        return false;
+                    }
+                    selectedEditorObject = firstCreated;
+                    editorGizmoMode = EditorGizmoMode::Translate;
+                    SceneManager::Instance().MarkDirty();
+                    runtimeSession->SetEditorStatus("Prefab instantiated: " + prefabData.name);
+                    Tracenf("[PREFAB] instantiated prefab=%s entities=%zu position=(%.2f,%.2f,%.2f)",
+                        assetId.c_str(), createdCount, spawn.x, spawn.y, spawn.z);
+                    return true;
+                };
+                auto refreshMeshPrefabInstance = [&](MeshSceneEntity& mesh, bool preserveInstanceOverrides = true) {
+                    const std::string sourcePrefabAssetId =
+                        !mesh.prefabInstance.assetId.empty() ? mesh.prefabInstance.assetId : mesh.prefabAssetId;
+                    if (sourcePrefabAssetId.empty())
+                        return false;
+                    const auto loaded = loadPrefabDocument(sourcePrefabAssetId);
+                    const std::uint32_t localId = mesh.prefabInstance.localId == 0 ? 1u : mesh.prefabInstance.localId;
+                    const prefab::PrefabEntity* prefabEntity = nullptr;
+                    if (loaded)
+                    {
+                        auto entityIt = std::find_if(loaded->first.entities.begin(), loaded->first.entities.end(),
+                            [&](const prefab::PrefabEntity& entity) {
+                                return entity.localId == localId && entity.kind == prefab::PrefabTemplate::Kind::Mesh;
+                            });
+                        if (entityIt != loaded->first.entities.end())
+                            prefabEntity = &*entityIt;
+                    }
+                    if (!prefabEntity)
+                    {
+                        TraceError("[PREFAB] refresh failed: mesh instance id=%u prefab=%s", mesh.id, sourcePrefabAssetId.c_str());
+                        return false;
+                    }
+
+                    const std::uint32_t id = mesh.id;
+                    const std::string name = preserveInstanceOverrides
+                        ? mesh.name
+                        : (prefabEntity->name.empty() ? prefabEntity->mesh.name : prefabEntity->name);
+                    const std::string prefabAssetId = sourcePrefabAssetId;
+                    PrefabInstanceState prefabInstance = mesh.prefabInstance;
+                    if (prefabInstance.assetId.empty())
+                        prefabInstance = MakePrefabInstanceState(prefabAssetId);
+                    const bool editorHidden = mesh.editorHidden;
+                    const SceneParentRef parent = mesh.parent;
+                    const auto materialOverrides = preserveInstanceOverrides
+                        ? mesh.materialOverrides
+                        : std::vector<MeshSceneEntity::MaterialOverride>{};
+                    const auto editorComponents = preserveInstanceOverrides
+                        ? mesh.editorComponents
+                        : std::vector<EditorAttachedComponent>{};
+                    const LodComponent lod = preserveInstanceOverrides ? mesh.lod : prefabEntity->mesh.lod;
+                    float position[3] = {mesh.position[0], mesh.position[1], mesh.position[2]};
+                    float rotation[3] = {mesh.rotation[0], mesh.rotation[1], mesh.rotation[2]};
+                    float scale[3] = {mesh.scale[0], mesh.scale[1], mesh.scale[2]};
+
+                    mesh.meshAssetId = prefabEntity->mesh.meshAssetId;
+                    mesh.meshAssetPath = prefabEntity->mesh.meshAssetPath;
+                    mesh.skinned = prefabEntity->mesh.skinned;
+                    mesh.materialSlots = prefabEntity->mesh.materialSlots;
+                    if (mesh.materialSlots.empty())
+                        mesh.materialSlots = LoadDefaultMaterialSlotGuids(mesh.meshAssetPath, ResolveModelSubmeshCount(mesh.meshAssetPath));
+                    mesh.materialOverrides = materialOverrides;
+                    mesh.editorComponents = editorComponents;
+                    mesh.lod = lod;
+                    mesh.id = id;
+                    mesh.name = name;
+                    mesh.prefabAssetId = prefabAssetId;
+                    mesh.prefabInstance = prefabInstance;
+                    mesh.prefabInstance.assetId = prefabAssetId;
+                    mesh.prefabInstance.linked = true;
+                    mesh.prefabInstance.localId = localId;
+                    mesh.parent = parent;
+                    mesh.editorHidden = editorHidden;
+                    if (preserveInstanceOverrides)
+                    {
+                        std::copy(std::begin(position), std::end(position), std::begin(mesh.position));
+                        std::copy(std::begin(rotation), std::end(rotation), std::begin(mesh.rotation));
+                        std::copy(std::begin(scale), std::end(scale), std::begin(mesh.scale));
+                    }
+                    syncStaticMeshSpatialEntity(mesh);
+                    Tracenf("[PREFAB] refreshed instance id=%u prefab=%s type=mesh preserveOverrides=%d",
+                        mesh.id,
+                        mesh.prefabAssetId.c_str(),
+                        preserveInstanceOverrides ? 1 : 0);
+                    return true;
+                };
+                auto refreshPointPrefabInstance = [&](PointLight& light, bool preserveInstanceOverrides = true) {
+                    const std::string sourcePrefabAssetId =
+                        !light.prefabInstance.assetId.empty() ? light.prefabInstance.assetId : light.prefabAssetId;
+                    if (sourcePrefabAssetId.empty())
+                        return false;
+                    const auto loaded = loadPrefabDocument(sourcePrefabAssetId);
+                    const std::uint32_t localId = light.prefabInstance.localId == 0 ? 1u : light.prefabInstance.localId;
+                    const prefab::PrefabEntity* prefabEntity = nullptr;
+                    if (loaded)
+                    {
+                        auto entityIt = std::find_if(loaded->first.entities.begin(), loaded->first.entities.end(),
+                            [&](const prefab::PrefabEntity& entity) {
+                                return entity.localId == localId && entity.kind == prefab::PrefabTemplate::Kind::PointLight;
+                            });
+                        if (entityIt != loaded->first.entities.end())
+                            prefabEntity = &*entityIt;
+                    }
+                    if (!prefabEntity)
+                    {
+                        TraceError("[PREFAB] refresh failed: point_light id=%u prefab=%s", light.id, sourcePrefabAssetId.c_str());
+                        return false;
+                    }
+                    const std::uint32_t id = light.id;
+                    const std::string name = preserveInstanceOverrides
+                        ? light.name
+                        : (prefabEntity->name.empty() ? prefabEntity->point.name : prefabEntity->name);
+                    const std::string prefabAssetId = sourcePrefabAssetId;
+                    PrefabInstanceState prefabInstance = light.prefabInstance;
+                    if (prefabInstance.assetId.empty())
+                        prefabInstance = MakePrefabInstanceState(prefabAssetId);
+                    const bool editorHidden = light.editorHidden;
+                    const SceneParentRef parent = light.parent;
+                    const float position[3] = {light.position[0], light.position[1], light.position[2]};
+                    light = prefabEntity->point;
+                    light.id = id;
+                    light.name = name;
+                    light.prefabAssetId = prefabAssetId;
+                    light.prefabInstance = prefabInstance;
+                    light.prefabInstance.assetId = prefabAssetId;
+                    light.prefabInstance.linked = true;
+                    light.prefabInstance.localId = localId;
+                    light.parent = parent;
+                    light.editorHidden = editorHidden;
+                    if (preserveInstanceOverrides)
+                        std::copy(std::begin(position), std::end(position), std::begin(light.position));
+                    Tracenf("[PREFAB] refreshed instance id=%u prefab=%s type=point_light preserveOverrides=%d",
+                        light.id,
+                        light.prefabAssetId.c_str(),
+                        preserveInstanceOverrides ? 1 : 0);
+                    return true;
+                };
+                auto refreshSpotPrefabInstance = [&](SpotLight& light, bool preserveInstanceOverrides = true) {
+                    const std::string sourcePrefabAssetId =
+                        !light.prefabInstance.assetId.empty() ? light.prefabInstance.assetId : light.prefabAssetId;
+                    if (sourcePrefabAssetId.empty())
+                        return false;
+                    const auto loaded = loadPrefabDocument(sourcePrefabAssetId);
+                    const std::uint32_t localId = light.prefabInstance.localId == 0 ? 1u : light.prefabInstance.localId;
+                    const prefab::PrefabEntity* prefabEntity = nullptr;
+                    if (loaded)
+                    {
+                        auto entityIt = std::find_if(loaded->first.entities.begin(), loaded->first.entities.end(),
+                            [&](const prefab::PrefabEntity& entity) {
+                                return entity.localId == localId && entity.kind == prefab::PrefabTemplate::Kind::SpotLight;
+                            });
+                        if (entityIt != loaded->first.entities.end())
+                            prefabEntity = &*entityIt;
+                    }
+                    if (!prefabEntity)
+                    {
+                        TraceError("[PREFAB] refresh failed: spot_light id=%u prefab=%s", light.id, sourcePrefabAssetId.c_str());
+                        return false;
+                    }
+                    const std::uint32_t id = light.id;
+                    const std::string name = preserveInstanceOverrides
+                        ? light.name
+                        : (prefabEntity->name.empty() ? prefabEntity->spot.name : prefabEntity->name);
+                    const std::string prefabAssetId = sourcePrefabAssetId;
+                    PrefabInstanceState prefabInstance = light.prefabInstance;
+                    if (prefabInstance.assetId.empty())
+                        prefabInstance = MakePrefabInstanceState(prefabAssetId);
+                    const bool editorHidden = light.editorHidden;
+                    const SceneParentRef parent = light.parent;
+                    const float position[3] = {light.position[0], light.position[1], light.position[2]};
+                    const float rotation[3] = {light.rotation[0], light.rotation[1], light.rotation[2]};
+                    light = prefabEntity->spot;
+                    light.id = id;
+                    light.name = name;
+                    light.prefabAssetId = prefabAssetId;
+                    light.prefabInstance = prefabInstance;
+                    light.prefabInstance.assetId = prefabAssetId;
+                    light.prefabInstance.linked = true;
+                    light.prefabInstance.localId = localId;
+                    light.parent = parent;
+                    light.editorHidden = editorHidden;
+                    if (preserveInstanceOverrides)
+                    {
+                        std::copy(std::begin(position), std::end(position), std::begin(light.position));
+                        std::copy(std::begin(rotation), std::end(rotation), std::begin(light.rotation));
+                    }
+                    Tracenf("[PREFAB] refreshed instance id=%u prefab=%s type=spot_light preserveOverrides=%d",
+                        light.id,
+                        light.prefabAssetId.c_str(),
+                        preserveInstanceOverrides ? 1 : 0);
+                    return true;
+                };
+                auto refreshSelectedPrefabInstance = [&]() {
+                    bool changed = false;
+                    if (selectedEditorObject.type == SelectedEditorObjectType::MeshEntity)
+                    {
+                        auto it = std::find_if(editorMeshEntities.begin(), editorMeshEntities.end(),
+                            [&](const MeshSceneEntity& mesh) { return mesh.id == selectedEditorObject.id; });
+                        changed = it != editorMeshEntities.end() && refreshMeshPrefabInstance(*it);
+                    }
+                    else if (selectedEditorObject.type == SelectedEditorObjectType::PointLight)
+                    {
+                        auto it = std::find_if(editorPointLights.begin(), editorPointLights.end(),
+                            [&](const PointLight& light) { return light.id == selectedEditorObject.id; });
+                        changed = it != editorPointLights.end() && refreshPointPrefabInstance(*it);
+                    }
+                    else if (selectedEditorObject.type == SelectedEditorObjectType::SpotLight)
+                    {
+                        auto it = std::find_if(editorSpotLights.begin(), editorSpotLights.end(),
+                            [&](const SpotLight& light) { return light.id == selectedEditorObject.id; });
+                        changed = it != editorSpotLights.end() && refreshSpotPrefabInstance(*it);
+                    }
+                    if (changed)
+                    {
+                        SceneManager::Instance().MarkDirty();
+                        runtimeSession->SetEditorStatus("Prefab instance refreshed");
+                    }
+                    else
+                    {
+                        runtimeSession->SetEditorStatus("Selected entity is not a refreshable prefab instance");
+                    }
+                    return changed;
+                };
+                auto revertSelectedPrefabInstance = [&]() {
+                    bool changed = false;
+                    if (selectedEditorObject.type == SelectedEditorObjectType::MeshEntity)
+                    {
+                        auto it = std::find_if(editorMeshEntities.begin(), editorMeshEntities.end(),
+                            [&](const MeshSceneEntity& mesh) { return mesh.id == selectedEditorObject.id; });
+                        changed = it != editorMeshEntities.end() && refreshMeshPrefabInstance(*it, false);
+                    }
+                    else if (selectedEditorObject.type == SelectedEditorObjectType::PointLight)
+                    {
+                        auto it = std::find_if(editorPointLights.begin(), editorPointLights.end(),
+                            [&](const PointLight& light) { return light.id == selectedEditorObject.id; });
+                        changed = it != editorPointLights.end() && refreshPointPrefabInstance(*it, false);
+                    }
+                    else if (selectedEditorObject.type == SelectedEditorObjectType::SpotLight)
+                    {
+                        auto it = std::find_if(editorSpotLights.begin(), editorSpotLights.end(),
+                            [&](const SpotLight& light) { return light.id == selectedEditorObject.id; });
+                        changed = it != editorSpotLights.end() && refreshSpotPrefabInstance(*it, false);
+                    }
+                    if (changed)
+                    {
+                        SceneManager::Instance().MarkDirty();
+                        runtimeSession->SetEditorStatus("Prefab overrides reverted");
+                        Tracen("[PREFAB] reverted selected instance overrides");
+                    }
+                    else
+                    {
+                        runtimeSession->SetEditorStatus("Selected entity is not a revertable prefab instance");
+                    }
+                    return changed;
+                };
+                auto applySelectedPrefabOverrideToAsset = [&](const std::string& overrideName) {
+                    if (overrideName.empty())
+                        return false;
+
+                    std::string assetId;
+                    std::uint32_t localId = 1;
+                    prefab::PrefabTemplate::Kind kind = prefab::PrefabTemplate::Kind::Unsupported;
+                    MeshSceneEntity* selectedMesh = nullptr;
+                    PointLight* selectedPoint = nullptr;
+                    SpotLight* selectedSpot = nullptr;
+
+                    if (selectedEditorObject.type == SelectedEditorObjectType::MeshEntity)
+                    {
+                        auto it = std::find_if(editorMeshEntities.begin(), editorMeshEntities.end(),
+                            [&](const MeshSceneEntity& mesh) { return mesh.id == selectedEditorObject.id; });
+                        if (it == editorMeshEntities.end())
+                            return false;
+                        selectedMesh = &*it;
+                        assetId = !it->prefabInstance.assetId.empty() ? it->prefabInstance.assetId : it->prefabAssetId;
+                        localId = it->prefabInstance.localId == 0 ? 1u : it->prefabInstance.localId;
+                        kind = prefab::PrefabTemplate::Kind::Mesh;
+                    }
+                    else if (selectedEditorObject.type == SelectedEditorObjectType::PointLight)
+                    {
+                        auto it = std::find_if(editorPointLights.begin(), editorPointLights.end(),
+                            [&](const PointLight& light) { return light.id == selectedEditorObject.id; });
+                        if (it == editorPointLights.end())
+                            return false;
+                        selectedPoint = &*it;
+                        assetId = !it->prefabInstance.assetId.empty() ? it->prefabInstance.assetId : it->prefabAssetId;
+                        localId = it->prefabInstance.localId == 0 ? 1u : it->prefabInstance.localId;
+                        kind = prefab::PrefabTemplate::Kind::PointLight;
+                    }
+                    else if (selectedEditorObject.type == SelectedEditorObjectType::SpotLight)
+                    {
+                        auto it = std::find_if(editorSpotLights.begin(), editorSpotLights.end(),
+                            [&](const SpotLight& light) { return light.id == selectedEditorObject.id; });
+                        if (it == editorSpotLights.end())
+                            return false;
+                        selectedSpot = &*it;
+                        assetId = !it->prefabInstance.assetId.empty() ? it->prefabInstance.assetId : it->prefabAssetId;
+                        localId = it->prefabInstance.localId == 0 ? 1u : it->prefabInstance.localId;
+                        kind = prefab::PrefabTemplate::Kind::SpotLight;
+                    }
+
+                    if (assetId.empty())
+                        return false;
+                    auto loaded = loadPrefabDocument(assetId);
+                    if (!loaded)
+                        return false;
+                    prefab::PrefabDocument& document = loaded->first;
+                    auto entityIt = std::find_if(document.entities.begin(), document.entities.end(),
+                        [&](const prefab::PrefabEntity& entity) {
+                            return entity.localId == localId && entity.kind == kind;
+                        });
+                    if (entityIt == document.entities.end())
+                        return false;
+
+                    bool changed = false;
+                    if (selectedMesh && kind == prefab::PrefabTemplate::Kind::Mesh)
+                    {
+                        MeshSceneEntity& target = entityIt->mesh;
+                        if (overrideName == "Name")
+                        {
+                            entityIt->name = selectedMesh->name;
+                            target.name = selectedMesh->name;
+                            changed = true;
+                        }
+                        else if (overrideName == "Transform")
+                        {
+                            std::copy(std::begin(selectedMesh->position), std::end(selectedMesh->position), std::begin(target.position));
+                            std::copy(std::begin(selectedMesh->rotation), std::end(selectedMesh->rotation), std::begin(target.rotation));
+                            std::copy(std::begin(selectedMesh->scale), std::end(selectedMesh->scale), std::begin(target.scale));
+                            changed = true;
+                        }
+                        else if (overrideName == "Position")
+                        {
+                            std::copy(std::begin(selectedMesh->position), std::end(selectedMesh->position), std::begin(target.position));
+                            changed = true;
+                        }
+                        else if (overrideName == "Rotation")
+                        {
+                            std::copy(std::begin(selectedMesh->rotation), std::end(selectedMesh->rotation), std::begin(target.rotation));
+                            changed = true;
+                        }
+                        else if (overrideName == "Scale")
+                        {
+                            std::copy(std::begin(selectedMesh->scale), std::end(selectedMesh->scale), std::begin(target.scale));
+                            changed = true;
+                        }
+                        else if (overrideName == "Mesh asset")
+                        {
+                            target.meshAssetId = selectedMesh->meshAssetId;
+                            target.meshAssetPath = selectedMesh->meshAssetPath;
+                            target.skinned = selectedMesh->skinned;
+                            changed = true;
+                        }
+                        else if (overrideName == "Material slots")
+                        {
+                            target.materialSlots = selectedMesh->materialSlots;
+                            changed = true;
+                        }
+                        else if (overrideName == "Material overrides")
+                        {
+                            target.materialOverrides = selectedMesh->materialOverrides;
+                            changed = true;
+                        }
+                    }
+                    else if (selectedPoint && kind == prefab::PrefabTemplate::Kind::PointLight)
+                    {
+                        PointLight& target = entityIt->point;
+                        if (overrideName == "Name")
+                        {
+                            entityIt->name = EditorDisplayName(*selectedPoint);
+                            target.name = selectedPoint->name;
+                            changed = true;
+                        }
+                        else if (overrideName == "Transform" || overrideName == "Position")
+                        {
+                            std::copy(std::begin(selectedPoint->position), std::end(selectedPoint->position), std::begin(target.position));
+                            changed = true;
+                        }
+                        else if (overrideName == "Color")
+                        {
+                            target.r = selectedPoint->r;
+                            target.g = selectedPoint->g;
+                            target.b = selectedPoint->b;
+                            changed = true;
+                        }
+                        else if (overrideName == "Intensity")
+                        {
+                            target.intensity = selectedPoint->intensity;
+                            changed = true;
+                        }
+                        else if (overrideName == "Radius")
+                        {
+                            target.radius = selectedPoint->radius;
+                            changed = true;
+                        }
+                        else if (overrideName == "Enabled")
+                        {
+                            target.enabled = selectedPoint->enabled;
+                            changed = true;
+                        }
+                    }
+                    else if (selectedSpot && kind == prefab::PrefabTemplate::Kind::SpotLight)
+                    {
+                        SpotLight& target = entityIt->spot;
+                        if (overrideName == "Name")
+                        {
+                            entityIt->name = EditorDisplayName(*selectedSpot);
+                            target.name = selectedSpot->name;
+                            changed = true;
+                        }
+                        else if (overrideName == "Transform")
+                        {
+                            std::copy(std::begin(selectedSpot->position), std::end(selectedSpot->position), std::begin(target.position));
+                            std::copy(std::begin(selectedSpot->rotation), std::end(selectedSpot->rotation), std::begin(target.rotation));
+                            changed = true;
+                        }
+                        else if (overrideName == "Position")
+                        {
+                            std::copy(std::begin(selectedSpot->position), std::end(selectedSpot->position), std::begin(target.position));
+                            changed = true;
+                        }
+                        else if (overrideName == "Rotation")
+                        {
+                            std::copy(std::begin(selectedSpot->rotation), std::end(selectedSpot->rotation), std::begin(target.rotation));
+                            changed = true;
+                        }
+                        else if (overrideName == "Color")
+                        {
+                            target.r = selectedSpot->r;
+                            target.g = selectedSpot->g;
+                            target.b = selectedSpot->b;
+                            changed = true;
+                        }
+                        else if (overrideName == "Intensity")
+                        {
+                            target.intensity = selectedSpot->intensity;
+                            changed = true;
+                        }
+                        else if (overrideName == "Radius")
+                        {
+                            target.radius = selectedSpot->radius;
+                            changed = true;
+                        }
+                        else if (overrideName == "Cone")
+                        {
+                            target.innerConeDegrees = selectedSpot->innerConeDegrees;
+                            target.outerConeDegrees = selectedSpot->outerConeDegrees;
+                            changed = true;
+                        }
+                        else if (overrideName == "Enabled")
+                        {
+                            target.enabled = selectedSpot->enabled;
+                            changed = true;
+                        }
+                    }
+
+                    if (!changed)
+                        return false;
+                    if (!writePrefabDocumentToPath(loaded->second, document))
+                    {
+                        TraceError("[PREFAB] apply override failed: write path=%s", loaded->second.string().c_str());
+                        return false;
+                    }
+                    AssetDatabase::Instance().runtimeAdd(loaded->second);
+                    writePrefabDependencies(loaded->second, document);
+                    editorImGui.RefreshAssetLibrary();
+                    runtimeSession->SetEditorStatus("Applied prefab override: " + overrideName);
+                    Tracenf("[PREFAB] applied override=%s prefab=%s local_id=%u",
+                        overrideName.c_str(),
+                        assetId.c_str(),
+                        localId);
+                    return true;
+                };
+                auto revertSelectedPrefabOverride = [&](const std::string& overrideName) {
+                    if (overrideName.empty())
+                        return false;
+
+                    auto loadedMeshSource = [&](const MeshSceneEntity& mesh) -> std::optional<prefab::PrefabEntity> {
+                        const std::string assetId = !mesh.prefabInstance.assetId.empty() ? mesh.prefabInstance.assetId : mesh.prefabAssetId;
+                        const std::uint32_t localId = mesh.prefabInstance.localId == 0 ? 1u : mesh.prefabInstance.localId;
+                        const auto loaded = loadPrefabDocument(assetId);
+                        if (!loaded)
+                            return std::nullopt;
+                        auto entityIt = std::find_if(loaded->first.entities.begin(), loaded->first.entities.end(),
+                            [&](const prefab::PrefabEntity& entity) {
+                                return entity.localId == localId && entity.kind == prefab::PrefabTemplate::Kind::Mesh;
+                            });
+                        return entityIt == loaded->first.entities.end()
+                            ? std::optional<prefab::PrefabEntity>{}
+                            : std::optional<prefab::PrefabEntity>{*entityIt};
+                    };
+                    auto loadedPointSource = [&](const PointLight& light) -> std::optional<prefab::PrefabEntity> {
+                        const std::string assetId = !light.prefabInstance.assetId.empty() ? light.prefabInstance.assetId : light.prefabAssetId;
+                        const std::uint32_t localId = light.prefabInstance.localId == 0 ? 1u : light.prefabInstance.localId;
+                        const auto loaded = loadPrefabDocument(assetId);
+                        if (!loaded)
+                            return std::nullopt;
+                        auto entityIt = std::find_if(loaded->first.entities.begin(), loaded->first.entities.end(),
+                            [&](const prefab::PrefabEntity& entity) {
+                                return entity.localId == localId && entity.kind == prefab::PrefabTemplate::Kind::PointLight;
+                            });
+                        return entityIt == loaded->first.entities.end()
+                            ? std::optional<prefab::PrefabEntity>{}
+                            : std::optional<prefab::PrefabEntity>{*entityIt};
+                    };
+                    auto loadedSpotSource = [&](const SpotLight& light) -> std::optional<prefab::PrefabEntity> {
+                        const std::string assetId = !light.prefabInstance.assetId.empty() ? light.prefabInstance.assetId : light.prefabAssetId;
+                        const std::uint32_t localId = light.prefabInstance.localId == 0 ? 1u : light.prefabInstance.localId;
+                        const auto loaded = loadPrefabDocument(assetId);
+                        if (!loaded)
+                            return std::nullopt;
+                        auto entityIt = std::find_if(loaded->first.entities.begin(), loaded->first.entities.end(),
+                            [&](const prefab::PrefabEntity& entity) {
+                                return entity.localId == localId && entity.kind == prefab::PrefabTemplate::Kind::SpotLight;
+                            });
+                        return entityIt == loaded->first.entities.end()
+                            ? std::optional<prefab::PrefabEntity>{}
+                            : std::optional<prefab::PrefabEntity>{*entityIt};
+                    };
+
+                    bool changed = false;
+                    if (selectedEditorObject.type == SelectedEditorObjectType::MeshEntity)
+                    {
+                        auto it = std::find_if(editorMeshEntities.begin(), editorMeshEntities.end(),
+                            [&](const MeshSceneEntity& mesh) { return mesh.id == selectedEditorObject.id; });
+                        if (it == editorMeshEntities.end())
+                            return false;
+                        const auto loaded = loadedMeshSource(*it);
+                        if (!loaded)
+                            return false;
+                        const MeshSceneEntity& source = loaded->mesh;
+                        if (overrideName == "Name")
+                        {
+                            it->name = loaded->name.empty() ? source.name : loaded->name;
+                            changed = true;
+                        }
+                        else if (overrideName == "Transform")
+                        {
+                            std::copy(std::begin(source.position), std::end(source.position), std::begin(it->position));
+                            std::copy(std::begin(source.rotation), std::end(source.rotation), std::begin(it->rotation));
+                            std::copy(std::begin(source.scale), std::end(source.scale), std::begin(it->scale));
+                            syncStaticMeshSpatialEntity(*it);
+                            changed = true;
+                        }
+                        else if (overrideName == "Position")
+                        {
+                            std::copy(std::begin(source.position), std::end(source.position), std::begin(it->position));
+                            syncStaticMeshSpatialEntity(*it);
+                            changed = true;
+                        }
+                        else if (overrideName == "Rotation")
+                        {
+                            std::copy(std::begin(source.rotation), std::end(source.rotation), std::begin(it->rotation));
+                            syncStaticMeshSpatialEntity(*it);
+                            changed = true;
+                        }
+                        else if (overrideName == "Scale")
+                        {
+                            std::copy(std::begin(source.scale), std::end(source.scale), std::begin(it->scale));
+                            syncStaticMeshSpatialEntity(*it);
+                            changed = true;
+                        }
+                        else if (overrideName == "Mesh asset")
+                        {
+                            it->meshAssetId = source.meshAssetId;
+                            it->meshAssetPath = source.meshAssetPath;
+                            it->skinned = source.skinned;
+                            changed = true;
+                        }
+                        else if (overrideName == "Material slots")
+                        {
+                            it->materialSlots = source.materialSlots.empty()
+                                ? LoadDefaultMaterialSlotGuids(source.meshAssetPath, ResolveModelSubmeshCount(source.meshAssetPath))
+                                : source.materialSlots;
+                            changed = true;
+                        }
+                        else if (overrideName == "Material overrides")
+                        {
+                            it->materialOverrides = source.materialOverrides;
+                            changed = true;
+                        }
+                    }
+                    else if (selectedEditorObject.type == SelectedEditorObjectType::PointLight)
+                    {
+                        auto it = std::find_if(editorPointLights.begin(), editorPointLights.end(),
+                            [&](const PointLight& light) { return light.id == selectedEditorObject.id; });
+                        if (it == editorPointLights.end())
+                            return false;
+                        const auto loaded = loadedPointSource(*it);
+                        if (!loaded)
+                            return false;
+                        const PointLight& source = loaded->point;
+                        if (overrideName == "Name")
+                        {
+                            it->name = loaded->name.empty() ? source.name : loaded->name;
+                            changed = true;
+                        }
+                        else if (overrideName == "Transform" || overrideName == "Position")
+                        {
+                            std::copy(std::begin(source.position), std::end(source.position), std::begin(it->position));
+                            changed = true;
+                        }
+                        else if (overrideName == "Color")
+                        {
+                            it->r = source.r;
+                            it->g = source.g;
+                            it->b = source.b;
+                            changed = true;
+                        }
+                        else if (overrideName == "Intensity")
+                        {
+                            it->intensity = source.intensity;
+                            changed = true;
+                        }
+                        else if (overrideName == "Radius")
+                        {
+                            it->radius = source.radius;
+                            changed = true;
+                        }
+                        else if (overrideName == "Enabled")
+                        {
+                            it->enabled = source.enabled;
+                            changed = true;
+                        }
+                    }
+                    else if (selectedEditorObject.type == SelectedEditorObjectType::SpotLight)
+                    {
+                        auto it = std::find_if(editorSpotLights.begin(), editorSpotLights.end(),
+                            [&](const SpotLight& light) { return light.id == selectedEditorObject.id; });
+                        if (it == editorSpotLights.end())
+                            return false;
+                        const auto loaded = loadedSpotSource(*it);
+                        if (!loaded)
+                            return false;
+                        const SpotLight& source = loaded->spot;
+                        if (overrideName == "Name")
+                        {
+                            it->name = loaded->name.empty() ? source.name : loaded->name;
+                            changed = true;
+                        }
+                        else if (overrideName == "Transform")
+                        {
+                            std::copy(std::begin(source.position), std::end(source.position), std::begin(it->position));
+                            std::copy(std::begin(source.rotation), std::end(source.rotation), std::begin(it->rotation));
+                            changed = true;
+                        }
+                        else if (overrideName == "Position")
+                        {
+                            std::copy(std::begin(source.position), std::end(source.position), std::begin(it->position));
+                            changed = true;
+                        }
+                        else if (overrideName == "Rotation")
+                        {
+                            std::copy(std::begin(source.rotation), std::end(source.rotation), std::begin(it->rotation));
+                            changed = true;
+                        }
+                        else if (overrideName == "Color")
+                        {
+                            it->r = source.r;
+                            it->g = source.g;
+                            it->b = source.b;
+                            changed = true;
+                        }
+                        else if (overrideName == "Intensity")
+                        {
+                            it->intensity = source.intensity;
+                            changed = true;
+                        }
+                        else if (overrideName == "Radius")
+                        {
+                            it->radius = source.radius;
+                            changed = true;
+                        }
+                        else if (overrideName == "Cone")
+                        {
+                            it->innerConeDegrees = source.innerConeDegrees;
+                            it->outerConeDegrees = source.outerConeDegrees;
+                            changed = true;
+                        }
+                        else if (overrideName == "Enabled")
+                        {
+                            it->enabled = source.enabled;
+                            changed = true;
+                        }
+                    }
+
+                    if (changed)
+                    {
+                        SceneManager::Instance().MarkDirty();
+                        runtimeSession->SetEditorStatus("Reverted prefab override: " + overrideName);
+                        Tracenf("[PREFAB] reverted override=%s", overrideName.c_str());
+                    }
+                    return changed;
+                };
+                auto refreshAllPrefabInstances = [&]() {
+                    std::size_t refreshed = 0;
+                    for (MeshSceneEntity& mesh : editorMeshEntities)
+                    {
+                        if (refreshMeshPrefabInstance(mesh))
+                            ++refreshed;
+                    }
+                    for (PointLight& light : editorPointLights)
+                    {
+                        if (refreshPointPrefabInstance(light))
+                            ++refreshed;
+                    }
+                    for (SpotLight& light : editorSpotLights)
+                    {
+                        if (refreshSpotPrefabInstance(light))
+                            ++refreshed;
+                    }
+                    if (refreshed > 0)
+                    {
+                        SceneManager::Instance().MarkDirty();
+                        runtimeSession->SetEditorStatus("Prefab instances refreshed: " + std::to_string(refreshed));
+                    }
+                    Tracenf("[PREFAB] refresh_all refreshed=%zu", refreshed);
+                    return refreshed;
+                };
+                auto refreshPrefabInstancesForAsset = [&](const std::string& assetId) {
+                    if (assetId.empty())
+                        return std::size_t{0};
+
+                    std::size_t refreshed = 0;
+                    auto matchesAsset = [&](const auto& object) {
+                        const std::string objectAssetId =
+                            !object.prefabInstance.assetId.empty() ? object.prefabInstance.assetId : object.prefabAssetId;
+                        return objectAssetId == assetId;
+                    };
+                    for (MeshSceneEntity& mesh : editorMeshEntities)
+                    {
+                        if (matchesAsset(mesh) && refreshMeshPrefabInstance(mesh))
+                            ++refreshed;
+                    }
+                    for (PointLight& light : editorPointLights)
+                    {
+                        if (matchesAsset(light) && refreshPointPrefabInstance(light))
+                            ++refreshed;
+                    }
+                    for (SpotLight& light : editorSpotLights)
+                    {
+                        if (matchesAsset(light) && refreshSpotPrefabInstance(light))
+                            ++refreshed;
+                    }
+                    if (refreshed > 0)
+                    {
+                        SceneManager::Instance().MarkDirty();
+                        runtimeSession->SetEditorStatus("Prefab asset saved; instances refreshed: " + std::to_string(refreshed));
+                    }
+                    Tracenf("[PREFAB] refresh_asset asset=%s refreshed=%zu", assetId.c_str(), refreshed);
+                    return refreshed;
+                };
+                auto unpackSelectedPrefabInstance = [&]() {
+                    const auto root = selectedPrefabRoot();
+                    if (!root)
+                        return false;
+
+                    std::size_t unpacked = 0;
+                    std::string firstPrefab;
+                    auto clearPrefabLink = [&](HierarchyEntityType type, std::uint32_t id) {
+                        if (type == HierarchyEntityType::MeshEntity)
+                        {
+                            auto it = std::find_if(editorMeshEntities.begin(), editorMeshEntities.end(),
+                                [&](const MeshSceneEntity& mesh) { return mesh.id == id; });
+                            if (it == editorMeshEntities.end() || (it->prefabAssetId.empty() && it->prefabInstance.assetId.empty()))
+                                return false;
+                            if (firstPrefab.empty())
+                                firstPrefab = !it->prefabInstance.assetId.empty() ? it->prefabInstance.assetId : it->prefabAssetId;
+                            it->prefabAssetId.clear();
+                            it->prefabInstance = {};
+                            ++unpacked;
+                            return true;
+                        }
+                        if (type == HierarchyEntityType::PointLight)
+                        {
+                            auto it = std::find_if(editorPointLights.begin(), editorPointLights.end(),
+                                [&](const PointLight& light) { return light.id == id; });
+                            if (it == editorPointLights.end() || (it->prefabAssetId.empty() && it->prefabInstance.assetId.empty()))
+                                return false;
+                            if (firstPrefab.empty())
+                                firstPrefab = !it->prefabInstance.assetId.empty() ? it->prefabInstance.assetId : it->prefabAssetId;
+                            it->prefabAssetId.clear();
+                            it->prefabInstance = {};
+                            ++unpacked;
+                            return true;
+                        }
+                        if (type == HierarchyEntityType::SpotLight)
+                        {
+                            auto it = std::find_if(editorSpotLights.begin(), editorSpotLights.end(),
+                                [&](const SpotLight& light) { return light.id == id; });
+                            if (it == editorSpotLights.end() || (it->prefabAssetId.empty() && it->prefabInstance.assetId.empty()))
+                                return false;
+                            if (firstPrefab.empty())
+                                firstPrefab = !it->prefabInstance.assetId.empty() ? it->prefabInstance.assetId : it->prefabAssetId;
+                            it->prefabAssetId.clear();
+                            it->prefabInstance = {};
+                            ++unpacked;
+                            return true;
+                        }
+                        return false;
+                    };
+
+                    std::function<void(HierarchyEntityType, std::uint32_t)> unpackSubtree;
+                    unpackSubtree = [&](HierarchyEntityType type, std::uint32_t id) {
+                        clearPrefabLink(type, id);
+                        const auto children = directHierarchyChildren(type, id);
+                        for (const auto& child : children)
+                            unpackSubtree(child.first, child.second);
+                    };
+                    unpackSubtree(root->first, root->second);
+                    if (unpacked == 0)
+                        return false;
+
+                    SceneManager::Instance().MarkDirty();
+                    runtimeSession->SetEditorStatus("Prefab instance subtree unpacked");
+                    Tracenf("[PREFAB] unpacked instance subtree root=%u root_type=%d prefab=%s entities=%zu",
+                        root->second,
+                        static_cast<int>(root->first),
+                        firstPrefab.c_str(),
+                        unpacked);
+                    return true;
                 };
                 auto addEditorNoteComponentToSelectedMesh = [&]() {
                     if (selectedEditorObject.type != SelectedEditorObjectType::MeshEntity)
@@ -3593,6 +5469,36 @@ int RunGame(NativeWindow& window,
                     {
                         runtimeSession->SetEditorStatus("Removed component");
                     }
+                }
+                if (commands.createPrefabFromSelection)
+                    createPrefabFromSelection();
+                if (commands.refreshSelectedPrefabInstance)
+                    refreshSelectedPrefabInstance();
+                if (commands.refreshAllPrefabInstances)
+                    refreshAllPrefabInstances();
+                if (commands.revertSelectedPrefabInstance)
+                    revertSelectedPrefabInstance();
+                if (commands.revertSelectedPrefabOverride && !revertSelectedPrefabOverride(commands.selectedPrefabOverrideName))
+                    runtimeSession->SetEditorStatus("Prefab override cannot be reverted: " + commands.selectedPrefabOverrideName);
+                if (commands.applySelectedPrefabOverrideToAsset && !applySelectedPrefabOverrideToAsset(commands.selectedPrefabOverrideName))
+                    runtimeSession->SetEditorStatus("Prefab override cannot be applied: " + commands.selectedPrefabOverrideName);
+                if (commands.applySelectedPrefabToAsset && !applySelectedPrefabToAsset())
+                    runtimeSession->SetEditorStatus("Selected entity is not an applicable prefab instance");
+                if (commands.unpackSelectedPrefabInstance && !unpackSelectedPrefabInstance())
+                    runtimeSession->SetEditorStatus("Selected entity is not a prefab instance");
+                if (commands.savePrefabAssetEdit)
+                {
+                    if (savePrefabAssetEdit(commands.editPrefabAssetId, commands.editPrefabName, commands.editPrefabEntityNames))
+                        refreshPrefabInstancesForAsset(commands.editPrefabAssetId);
+                    else
+                        runtimeSession->SetEditorStatus("Prefab asset save failed");
+                }
+                if (commands.addPrefabInstance)
+                {
+                    const WorldVec3 spawn = commands.prefabDropScreenPositionValid
+                        ? spawnAtScreenPosition(commands.prefabDropScreenPosition[0], commands.prefabDropScreenPosition[1])
+                        : spawnAtCameraCenter();
+                    instantiatePrefabAt(commands.prefabAssetId, spawn);
                 }
                 if (commands.addMeshEntity)
                 {
@@ -3945,6 +5851,128 @@ int RunGame(NativeWindow& window,
 
                 logStaticMeshSpatialMutations();
 
+                auto floatDiffers = [](float a, float b, float epsilon = 0.0005f) {
+                    return std::fabs(a - b) > epsilon;
+                };
+                auto floatArrayDiffers = [&](const float* a, const float* b, std::size_t count, float epsilon = 0.0005f) {
+                    for (std::size_t i = 0; i < count; ++i)
+                    {
+                        if (floatDiffers(a[i], b[i], epsilon))
+                            return true;
+                    }
+                    return false;
+                };
+                auto prefabAssetIdFor = [](const auto& entity) -> std::string {
+                    return !entity.prefabInstance.assetId.empty() ? entity.prefabInstance.assetId : entity.prefabAssetId;
+                };
+                auto prefabLocalIdFor = [](const auto& entity) {
+                    return entity.prefabInstance.localId == 0 ? 1u : entity.prefabInstance.localId;
+                };
+                auto findPrefabEntityForInstance = [&](const std::string& assetId,
+                                                       std::uint32_t localId,
+                                                       prefab::PrefabTemplate::Kind kind) -> std::optional<prefab::PrefabEntity> {
+                    const auto loaded = loadPrefabDocument(assetId);
+                    if (!loaded)
+                        return std::nullopt;
+                    auto entityIt = std::find_if(loaded->first.entities.begin(), loaded->first.entities.end(),
+                        [&](const prefab::PrefabEntity& entity) {
+                            return entity.localId == localId && entity.kind == kind;
+                        });
+                    if (entityIt == loaded->first.entities.end())
+                        return std::nullopt;
+                    return *entityIt;
+                };
+                auto meshPrefabOverrides = [&](const MeshSceneEntity& mesh) {
+                    std::vector<std::string> overrides;
+                    const std::string assetId = prefabAssetIdFor(mesh);
+                    if (assetId.empty())
+                        return overrides;
+                    const auto loaded = findPrefabEntityForInstance(assetId, prefabLocalIdFor(mesh), prefab::PrefabTemplate::Kind::Mesh);
+                    if (!loaded)
+                    {
+                        overrides.push_back("Prefab asset missing");
+                        return overrides;
+                    }
+                    const MeshSceneEntity& source = loaded->mesh;
+                    const std::string sourceName = loaded->name.empty() ? source.name : loaded->name;
+                    if (mesh.name != sourceName)
+                        overrides.push_back("Name");
+                    if (floatArrayDiffers(mesh.position, source.position, 3))
+                        overrides.push_back("Position");
+                    if (floatArrayDiffers(mesh.rotation, source.rotation, 3))
+                        overrides.push_back("Rotation");
+                    if (floatArrayDiffers(mesh.scale, source.scale, 3))
+                        overrides.push_back("Scale");
+                    if (mesh.meshAssetId != source.meshAssetId || mesh.meshAssetPath != source.meshAssetPath || mesh.skinned != source.skinned)
+                        overrides.push_back("Mesh asset");
+                    if (!source.materialSlots.empty() && mesh.materialSlots != source.materialSlots)
+                        overrides.push_back("Material slots");
+                    if (!mesh.materialOverrides.empty())
+                        overrides.push_back("Material overrides");
+                    return overrides;
+                };
+                auto pointPrefabOverrides = [&](const PointLight& light) {
+                    std::vector<std::string> overrides;
+                    const std::string assetId = prefabAssetIdFor(light);
+                    if (assetId.empty())
+                        return overrides;
+                    const auto loaded = findPrefabEntityForInstance(assetId, prefabLocalIdFor(light), prefab::PrefabTemplate::Kind::PointLight);
+                    if (!loaded)
+                    {
+                        overrides.push_back("Prefab asset missing");
+                        return overrides;
+                    }
+                    const PointLight& source = loaded->point;
+                    const std::string sourceName = loaded->name.empty() ? EditorDisplayName(source) : loaded->name;
+                    if (EditorDisplayName(light) != sourceName)
+                        overrides.push_back("Name");
+                    if (floatArrayDiffers(light.position, source.position, 3))
+                        overrides.push_back("Position");
+                    if (floatDiffers(light.r, source.r) || floatDiffers(light.g, source.g) || floatDiffers(light.b, source.b))
+                        overrides.push_back("Color");
+                    if (floatDiffers(light.intensity, source.intensity))
+                        overrides.push_back("Intensity");
+                    if (floatDiffers(light.radius, source.radius))
+                        overrides.push_back("Radius");
+                    if (light.enabled != source.enabled)
+                        overrides.push_back("Enabled");
+                    return overrides;
+                };
+                auto spotPrefabOverrides = [&](const SpotLight& light) {
+                    std::vector<std::string> overrides;
+                    const std::string assetId = prefabAssetIdFor(light);
+                    if (assetId.empty())
+                        return overrides;
+                    const auto loaded = findPrefabEntityForInstance(assetId, prefabLocalIdFor(light), prefab::PrefabTemplate::Kind::SpotLight);
+                    if (!loaded)
+                    {
+                        overrides.push_back("Prefab asset missing");
+                        return overrides;
+                    }
+                    const SpotLight& source = loaded->spot;
+                    const std::string sourceName = loaded->name.empty() ? EditorDisplayName(source) : loaded->name;
+                    if (EditorDisplayName(light) != sourceName)
+                        overrides.push_back("Name");
+                    if (floatArrayDiffers(light.position, source.position, 3))
+                        overrides.push_back("Position");
+                    if (floatArrayDiffers(light.rotation, source.rotation, 3))
+                        overrides.push_back("Rotation");
+                    if (floatDiffers(light.r, source.r) || floatDiffers(light.g, source.g) || floatDiffers(light.b, source.b))
+                        overrides.push_back("Color");
+                    if (floatDiffers(light.intensity, source.intensity))
+                        overrides.push_back("Intensity");
+                    if (floatDiffers(light.radius, source.radius))
+                        overrides.push_back("Radius");
+                    if (floatDiffers(light.innerConeDegrees, source.innerConeDegrees) ||
+                        floatDiffers(light.outerConeDegrees, source.outerConeDegrees))
+                    {
+                        overrides.push_back("Cone");
+                    }
+                    if (light.enabled != source.enabled)
+                        overrides.push_back("Enabled");
+                    return overrides;
+                };
+
                 DynamicLightEditorState dynamicLightState{};
                 dynamicLightState.pointCount = static_cast<std::uint32_t>(std::min<std::size_t>(editorPointLights.size(), kMaxDynamicPointLights));
                 dynamicLightState.spotCount = static_cast<std::uint32_t>(std::min<std::size_t>(editorSpotLights.size(), kMaxDynamicSpotLights));
@@ -3957,6 +5985,7 @@ int RunGame(NativeWindow& window,
                         dynamicLightState.type = DynamicLightType::Point;
                         dynamicLightState.id = it->id;
                         dynamicLightState.point = *it;
+                        dynamicLightState.prefabOverrides = pointPrefabOverrides(*it);
                     }
                 }
                 else if (selectedEditorObject.type == SelectedEditorObjectType::SpotLight)
@@ -3968,6 +5997,7 @@ int RunGame(NativeWindow& window,
                         dynamicLightState.type = DynamicLightType::Spot;
                         dynamicLightState.id = it->id;
                         dynamicLightState.spot = *it;
+                        dynamicLightState.prefabOverrides = spotPrefabOverrides(*it);
                     }
                 }
                 editorImGui.SetDynamicLightEditorState(dynamicLightState);
@@ -3985,6 +6015,7 @@ int RunGame(NativeWindow& window,
                         [&](const MeshSceneEntity& mesh) { return mesh.id == meshRendererState.id; });
                     if (meshIt != editorMeshEntities.end())
                     {
+                        meshRendererState.prefabOverrides = meshPrefabOverrides(*meshIt);
                         const std::string runtimePath = resolveMeshRuntimePath(*meshIt);
                         if (meshIt->skinned)
                         {
@@ -4933,7 +6964,7 @@ int RunGame(NativeWindow& window,
                 if (selectionOutlinesOk)
                 {
                     std::vector<SelectionOutlineRenderer::Line> selectionLines =
-                        BuildEditorLightShapeLines(editorPointLights, editorSpotLights);
+                        BuildEditorLightShapeLines(editorPointLights, editorSpotLights, selectedEditorObject);
                     std::vector<SelectionOutlineRenderer::Line> selectedObjectLines =
                         BuildSelectionOutlineLines(
                             selectedEditorObject,

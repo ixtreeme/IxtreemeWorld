@@ -115,6 +115,24 @@ void EditorImGui::RenderSceneViewDropTarget()
                         m_assetStatus = "Mesh entity dropped: " + entry->displayName;
                         Tracenf("[DND] payload accepted: %s", entry->id.c_str());
                     }
+                    else if (entry && entry->category == AssetLibrary::Category::Prefab)
+                    {
+                        const ImVec2 mouse = ImGui::GetMousePos();
+                        const ImGuiViewport* viewport = ImGui::GetMainViewport();
+                        const ImVec2 viewportPos = viewport ? viewport->Pos : ImVec2(0.0f, 0.0f);
+                        InputEvent dropEvent{};
+                        dropEvent.type = InputEvent::MouseUp;
+                        dropEvent.x = static_cast<int>(ixtreeme::math::Round(mouse.x - viewportPos.x));
+                        dropEvent.y = static_cast<int>(ixtreeme::math::Round(mouse.y - viewportPos.y));
+                        const InputEvent mappedDropEvent = MapInputToSceneView(dropEvent);
+                        m_commands.addPrefabInstance = true;
+                        m_commands.prefabAssetId = entry->id;
+                        m_commands.prefabDropScreenPositionValid = true;
+                        m_commands.prefabDropScreenPosition[0] = static_cast<float>(mappedDropEvent.x);
+                        m_commands.prefabDropScreenPosition[1] = static_cast<float>(mappedDropEvent.y);
+                        m_assetStatus = "Prefab dropped: " + entry->displayName;
+                        Tracenf("[PREFAB] viewport drop queued: asset_id=%s", entry->id.c_str());
+                    }
                 }
             }
             ImGui::EndDragDropTarget();

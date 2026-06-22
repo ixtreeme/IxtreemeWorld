@@ -103,6 +103,78 @@ float JsonFloatValue(const std::string& object, const std::string& key, float fa
     return end != begin ? value : fallback;
 }
 
+bool JsonBoolValue(const std::string& object, const std::string& key, bool fallback)
+{
+    const std::string needle = "\"" + key + "\"";
+    const size_t keyPos = object.find(needle);
+    if (keyPos == std::string::npos)
+        return fallback;
+    const size_t colon = object.find(':', keyPos + needle.size());
+    if (colon == std::string::npos)
+        return fallback;
+    const size_t begin = object.find_first_not_of(" \t\r\n", colon + 1);
+    if (begin == std::string::npos)
+        return fallback;
+    if (object.compare(begin, 4, "true") == 0)
+        return true;
+    if (object.compare(begin, 5, "false") == 0)
+        return false;
+    return fallback;
+}
+
+void JsonFloatArrayValue(const std::string& object, const std::string& key, float* values, std::size_t count)
+{
+    const std::string needle = "\"" + key + "\"";
+    const size_t keyPos = object.find(needle);
+    if (keyPos == std::string::npos)
+        return;
+    const size_t open = object.find('[', keyPos + needle.size());
+    const size_t close = open == std::string::npos ? std::string::npos : object.find(']', open + 1);
+    if (open == std::string::npos || close == std::string::npos)
+        return;
+
+    const std::string arrayText = object.substr(open + 1, close - open - 1);
+    const char* cursor = arrayText.c_str();
+    for (std::size_t i = 0; i < count; ++i)
+    {
+        char* end = nullptr;
+        const float value = std::strtof(cursor, &end);
+        if (end == cursor)
+            return;
+        values[i] = value;
+        cursor = end;
+        while (*cursor == ' ' || *cursor == '\t' || *cursor == ',')
+            ++cursor;
+    }
+}
+
+std::vector<std::string> JsonStringArrayValue(const std::string& object, const std::string& key)
+{
+    std::vector<std::string> values;
+    const std::string needle = "\"" + key + "\"";
+    const size_t keyPos = object.find(needle);
+    if (keyPos == std::string::npos)
+        return values;
+    const size_t open = object.find('[', keyPos + needle.size());
+    const size_t close = open == std::string::npos ? std::string::npos : object.find(']', open + 1);
+    if (open == std::string::npos || close == std::string::npos)
+        return values;
+
+    size_t cursor = open + 1;
+    while (cursor < close)
+    {
+        const size_t begin = object.find('"', cursor);
+        if (begin == std::string::npos || begin >= close)
+            break;
+        const size_t end = object.find('"', begin + 1);
+        if (end == std::string::npos || end > close)
+            break;
+        values.push_back(object.substr(begin + 1, end - begin - 1));
+        cursor = end + 1;
+    }
+    return values;
+}
+
 std::string GenericPath(const std::filesystem::path& path)
 {
     return path.generic_string();

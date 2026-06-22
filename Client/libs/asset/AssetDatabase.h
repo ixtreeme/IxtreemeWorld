@@ -47,6 +47,7 @@ enum class AssetType
     Material,
     Animation,
     Scene,
+    Prefab,
     Project,
     Unknown
 };
@@ -74,6 +75,7 @@ public:
     Guid getOrCreateGuid(const std::filesystem::path& absPath);
     std::vector<Guid> loadDefaultMaterials(const std::filesystem::path& modelPath) const;
     bool writeDefaultMaterials(const std::filesystem::path& modelPath, const std::vector<Guid>& materials) const;
+    bool writeDependencies(const std::filesystem::path& assetPath, const std::vector<Guid>& dependencies) const;
     bool writeSkeletalAsset(const std::filesystem::path& modelPath,
                             const Guid& skeletonGuid,
                             const std::vector<Guid>& animationGuids) const;

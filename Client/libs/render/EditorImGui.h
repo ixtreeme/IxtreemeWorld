@@ -122,7 +122,8 @@ private:
         Animation,
         Material,
         WaterMaterial,
-        Scene
+        Scene,
+        Prefab
     };
 
     enum class ProjectDialogMode
@@ -143,6 +144,30 @@ private:
         uint32_t width = 0;
         uint32_t height = 0;
         bool failed = false;
+    };
+
+    struct PrefabInspectorEditRow
+    {
+        std::uint32_t localId = 0;
+        std::uint32_t parentLocalId = 0;
+        std::string type;
+        std::string lightType;
+        std::string meshAssetId;
+        std::string meshAssetPath;
+        std::string prefabAssetId;
+        std::vector<std::array<char, 128>> materialSlotBuffers;
+        char name[128]{};
+        bool transformValid = false;
+        float position[3] = {0.0f, 0.0f, 0.0f};
+        float rotation[3] = {0.0f, 0.0f, 0.0f};
+        float scale[3] = {1.0f, 1.0f, 1.0f};
+        bool lightValid = false;
+        float color[3] = {1.0f, 1.0f, 1.0f};
+        float intensity = 1.0f;
+        float radius = 1.0f;
+        float innerConeDegrees = 20.0f;
+        float outerConeDegrees = 35.0f;
+        bool enabled = true;
     };
 
     bool CreateDescriptorPool(VulkanDevice& device);
@@ -198,6 +223,9 @@ private:
     void RenderSelectedTerrainInspector();
     void RenderSelectedLightInspector();
     void RenderSelectedMeshRendererInspector();
+    void RenderPrefabOverrideControls(const std::string& assetId,
+                                      const PrefabInstanceState& instance,
+                                      const std::vector<std::string>& overrides);
     void RenderAddComponentMenu();
     bool RenderAttachedEditorComponents(std::vector<EditorAttachedComponent>& components);
     bool RenderTransformComponent(float* position, float* rotation, float* scale);
@@ -227,6 +255,7 @@ private:
     void RenderPbrMaterialEditor();
     void RenderPbrMaterialHeader();
     void RenderPbrTextureSlot(const char* label, std::string& textureId, bool& changed);
+    bool RenderSelectedPrefabAssetInspector();
     void RenderAssetBrowser();
     void RenderAssetBrowserToolbar();
     void RenderAssetTypeTabs();
@@ -385,6 +414,11 @@ private:
     AssetBrowserFilter m_assetFilter = AssetBrowserFilter::All;
     std::string m_assetSubpath;
     std::string m_selectedAssetId;
+    bool m_assetInspectorSelectionActive = false;
+    std::string m_prefabInspectorEditAssetId;
+    char m_prefabInspectorNameBuffer[128]{};
+    std::vector<PrefabInspectorEditRow> m_prefabInspectorEditRows;
+    bool m_prefabInspectorDirty = false;
     std::vector<std::string> m_activeAssetTags;
     std::string m_assetStatus;
     char m_assetSearchBuffer[128]{};

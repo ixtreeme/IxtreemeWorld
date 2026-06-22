@@ -259,6 +259,30 @@ void EditorImGui::RenderProjectSceneNode(const ProjectSceneEntry& scene)
                 m_assetStatus = "Mesh entity queued: " + entry->displayName;
                 Tracenf("[MESH-ENTITY] Hierarchy drop queued: asset_id=%s", entry->id.c_str());
             }
+            else if (entry && entry->category == AssetLibrary::Category::Prefab)
+            {
+                m_commands.addPrefabInstance = true;
+                m_commands.prefabAssetId = entry->id;
+                m_assetStatus = "Prefab instance queued: " + entry->displayName;
+                Tracenf("[PREFAB] Hierarchy drop queued: asset_id=%s", entry->id.c_str());
+            }
+        }
+        if (const ImGuiPayload* payload = ImGui::AcceptDragDropPayload(kHierarchyEntityPayloadType))
+        {
+            if (payload->DataSize == sizeof(HierarchyEntityDragPayload))
+            {
+                const auto* dropped = static_cast<const HierarchyEntityDragPayload*>(payload->Data);
+                m_commands.hierarchyReparentEntity = true;
+                m_commands.hierarchyEntityType = static_cast<HierarchyEntityType>(dropped->type);
+                m_commands.hierarchyEntityId = dropped->id;
+                m_commands.hierarchyEntityHandle = dropped->entity;
+                m_commands.hierarchyParentType = HierarchyEntityType::None;
+                m_commands.hierarchyParentId = 0;
+                m_projectStatus = "Entity moved to scene root";
+                Tracenf("[HIERARCHY] Reparent requested: object=%u type=%d parent=root",
+                    dropped->id,
+                    dropped->type);
+            }
         }
         ImGui::EndDragDropTarget();
     }
@@ -320,6 +344,56 @@ void EditorImGui::RenderHierarchyContextMenu(const HierarchySceneEntity& entity)
     }
     if (ImGui::MenuItem(ICON_FA_PEN " Rename", "F2"))
         StartHierarchyRename(entity);
+    if (entity.type == HierarchyEntityType::MeshEntity ||
+        entity.type == HierarchyEntityType::PointLight ||
+        entity.type == HierarchyEntityType::SpotLight)
+    {
+        if (ImGui::MenuItem(ICON_FA_LAYER_GROUP " Create Prefab"))
+        {
+            QueueHierarchySelection(entity);
+            m_commands.createPrefabFromSelection = true;
+            Tracenf("[PREFAB] Create requested: flecs=%llu object=%u type=%d",
+                static_cast<unsigned long long>(entity.entity),
+                entity.objectId,
+                static_cast<int>(entity.type));
+        }
+        if (ImGui::MenuItem(ICON_FA_ROTATE " Revert Prefab Overrides"))
+        {
+            QueueHierarchySelection(entity);
+            m_commands.revertSelectedPrefabInstance = true;
+        }
+        if (ImGui::MenuItem(ICON_FA_FLOPPY_DISK " Apply to Prefab"))
+        {
+            QueueHierarchySelection(entity);
+            m_commands.applySelectedPrefabToAsset = true;
+        }
+        if (ImGui::MenuItem(ICON_FA_ROTATE " Refresh All Prefab Instances"))
+            m_commands.refreshAllPrefabInstances = true;
+        if (ImGui::MenuItem("Unpack Prefab Instance"))
+        {
+            QueueHierarchySelection(entity);
+            m_commands.unpackSelectedPrefabInstance = true;
+        }
+    }
+    if (entity.parent != 0 && entity.parent != m_sceneRootEntity &&
+        (entity.type == HierarchyEntityType::MeshEntity ||
+            entity.type == HierarchyEntityType::PointLight ||
+            entity.type == HierarchyEntityType::SpotLight))
+    {
+        if (ImGui::MenuItem("Detach From Parent"))
+        {
+            m_commands.hierarchyReparentEntity = true;
+            m_commands.hierarchyEntityType = entity.type;
+            m_commands.hierarchyEntityId = entity.objectId;
+            m_commands.hierarchyEntityHandle = entity.entity;
+            m_commands.hierarchyParentType = HierarchyEntityType::None;
+            m_commands.hierarchyParentId = 0;
+            Tracenf("[HIERARCHY] Detach requested: flecs=%llu object=%u type=%d",
+                static_cast<unsigned long long>(entity.entity),
+                entity.objectId,
+                static_cast<int>(entity.type));
+        }
+    }
 
     if (entity.type == HierarchyEntityType::MeshEntity)
     {
@@ -373,8 +447,10 @@ void EditorImGui::RenderHierarchyEntityNode(std::uint64_t entityHandle)
     if (selected)
         flags |= ImGuiTreeNodeFlags_Selected;
 
-    const char* icon = ICON_FA_CUBE;
-    if (entity->type == HierarchyEntityType::Terrain)
+    const char* icon = entity->prefabRoot ? ICON_FA_LAYER_GROUP : ICON_FA_CUBE;
+    if (entity->prefabRoot)
+        icon = ICON_FA_LAYER_GROUP;
+    else if (entity->type == HierarchyEntityType::Terrain)
         icon = ICON_FA_MOUNTAIN;
     else if (entity->type == HierarchyEntityType::WaterBody)
         icon = ICON_FA_DROPLET;
@@ -412,8 +488,11 @@ void EditorImGui::RenderHierarchyEntityNode(std::uint64_t entityHandle)
     }
     else
     {
-        const std::string label = std::string(icon) + " " + entity->name + "##" + std::to_string(entity->entity);
+        const std::string displayName = entity->prefabRoot ? ("Prefab: " + entity->name) : entity->name;
+        const std::string label = std::string(icon) + " " + displayName + "##" + std::to_string(entity->entity);
         open = ImGui::TreeNodeEx(label.c_str(), flags);
+        if (entity->prefabRoot && ImGui::IsItemHovered())
+            ImGui::SetTooltip("Prefab instance\nAsset: %s", entity->prefabAssetId.c_str());
         if (ImGui::IsItemClicked() && !ImGui::IsItemToggledOpen())
         {
             QueueHierarchySelection(*entity);
@@ -422,6 +501,58 @@ void EditorImGui::RenderHierarchyEntityNode(std::uint64_t entityHandle)
         }
         if (selected)
             ImGui::SetScrollHereY(0.5f);
+    }
+
+    if (m_hierarchyRenamingEntity != entity->entity)
+    {
+        const bool draggable =
+            entity->type == HierarchyEntityType::MeshEntity ||
+            entity->type == HierarchyEntityType::PointLight ||
+            entity->type == HierarchyEntityType::SpotLight;
+        if (draggable && ImGui::BeginDragDropSource(ImGuiDragDropFlags_SourceAllowNullID))
+        {
+            const HierarchyEntityDragPayload payload{
+                static_cast<int>(entity->type),
+                entity->objectId,
+                entity->entity};
+            ImGui::SetDragDropPayload(kHierarchyEntityPayloadType, &payload, sizeof(payload));
+            if (entity->prefabRoot)
+                ImGui::Text("%s %s", ICON_FA_LAYER_GROUP, entity->name.c_str());
+            else
+                ImGui::TextUnformatted(entity->name.c_str());
+            ImGui::EndDragDropSource();
+        }
+
+        const bool validParentTarget =
+            entity->type == HierarchyEntityType::MeshEntity ||
+            entity->type == HierarchyEntityType::PointLight ||
+            entity->type == HierarchyEntityType::SpotLight;
+        if (validParentTarget && ImGui::BeginDragDropTarget())
+        {
+            if (const ImGuiPayload* payload = ImGui::AcceptDragDropPayload(kHierarchyEntityPayloadType))
+            {
+                if (payload->DataSize == sizeof(HierarchyEntityDragPayload))
+                {
+                    const auto* dropped = static_cast<const HierarchyEntityDragPayload*>(payload->Data);
+                    if (!(dropped->id == entity->objectId && dropped->type == static_cast<int>(entity->type)))
+                    {
+                        m_commands.hierarchyReparentEntity = true;
+                        m_commands.hierarchyEntityType = static_cast<HierarchyEntityType>(dropped->type);
+                        m_commands.hierarchyEntityId = dropped->id;
+                        m_commands.hierarchyEntityHandle = dropped->entity;
+                        m_commands.hierarchyParentType = entity->type;
+                        m_commands.hierarchyParentId = entity->objectId;
+                        m_projectStatus = "Entity parent changed: " + entity->name;
+                        Tracenf("[HIERARCHY] Reparent requested: object=%u type=%d parent=%u parent_type=%d",
+                            dropped->id,
+                            dropped->type,
+                            entity->objectId,
+                            static_cast<int>(entity->type));
+                    }
+                }
+            }
+            ImGui::EndDragDropTarget();
+        }
     }
 
     if (entity->editorHidden)

@@ -32,6 +32,7 @@ void EditorImGui::RenderAssetTypeTabs()
                 m_assetSubpath.clear();
                 m_activeAssetTags.clear();
                 m_selectedAssetId.clear();
+                m_assetInspectorSelectionActive = false;
             }
         }
         ImGui::PopStyleColor(3);
@@ -50,6 +51,8 @@ void EditorImGui::RenderAssetTypeTabs()
     tab("Water Mats", AssetBrowserFilter::WaterMaterial);
     ImGui::SameLine();
     tab("Scenes", AssetBrowserFilter::Scene);
+    ImGui::SameLine();
+    tab("Prefabs", AssetBrowserFilter::Prefab);
 }
 
 void EditorImGui::RenderAssetFolderNode(const std::string& path, const std::vector<std::string>& folders)
@@ -80,6 +83,7 @@ void EditorImGui::RenderAssetFolderNode(const std::string& path, const std::vect
     {
         m_assetSubpath = AssetLibrary::NormalizeSubpath(path);
         m_selectedAssetId.clear();
+        m_assetInspectorSelectionActive = false;
     }
 
     if (ImGui::BeginDragDropTarget())
@@ -124,12 +128,14 @@ void EditorImGui::RenderAssetFolderPanel()
     {
         m_assetSubpath.clear();
         m_selectedAssetId.clear();
+        m_assetInspectorSelectionActive = false;
     }
     ImGui::SameLine();
     if (UI::IconButton(ICON_FA_FOLDER_OPEN, "Up"))
     {
         m_assetSubpath = ParentSubpath(m_assetSubpath);
         m_selectedAssetId.clear();
+        m_assetInspectorSelectionActive = false;
     }
 
     if (sceneCategory)
@@ -220,6 +226,7 @@ void EditorImGui::RenderAssetTile(const AssetLibrary::Entry& entry, float tileSi
     if (clicked)
     {
         m_selectedAssetId = entry.id;
+        m_assetInspectorSelectionActive = true;
         m_assetStatus = "Selected: " + entry.displayName;
         if (doubleClicked && entry.category == AssetLibrary::Category::WaterMaterial)
         {
@@ -240,6 +247,13 @@ void EditorImGui::RenderAssetTile(const AssetLibrary::Entry& entry, float tileSi
         {
             if (AttachSceneToHierarchy(entry))
                 m_assetStatus = "Scene added to Hierarchy: " + entry.displayName;
+        }
+        else if (doubleClicked && entry.category == AssetLibrary::Category::Prefab)
+        {
+            m_commands.addPrefabInstance = true;
+            m_commands.prefabAssetId = entry.id;
+            m_assetStatus = "Prefab instance queued: " + entry.displayName;
+            Tracenf("[PREFAB] Asset browser spawn queued: asset_id=%s", entry.id.c_str());
         }
     }
 
@@ -277,6 +291,17 @@ void EditorImGui::RenderAssetTile(const AssetLibrary::Entry& entry, float tileSi
             ImGui::Separator();
             if (ImGui::MenuItem("Add to Hierarchy"))
                 AttachSceneToHierarchy(entry);
+        }
+        else if (entry.category == AssetLibrary::Category::Prefab)
+        {
+            ImGui::Separator();
+            if (ImGui::MenuItem("Instantiate Prefab"))
+            {
+                m_commands.addPrefabInstance = true;
+                m_commands.prefabAssetId = entry.id;
+                m_assetStatus = "Prefab instance queued: " + entry.displayName;
+                Tracenf("[PREFAB] Context instantiate queued: asset_id=%s", entry.id.c_str());
+            }
         }
         else
         {
@@ -507,6 +532,7 @@ void EditorImGui::RenderAssetBrowserFolderTile(const std::string& subpath, float
     if (clicked)
     {
         m_selectedAssetId = "folder:" + subpath;
+        m_assetInspectorSelectionActive = false;
         if (doubleClicked)
             SelectAssetBrowserFolder(subpath);
     }

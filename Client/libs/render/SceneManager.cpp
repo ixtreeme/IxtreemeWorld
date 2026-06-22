@@ -908,12 +908,48 @@ void WriteSceneEntity(std::ostream& out,
     out << "\n    }" << (comma ? "," : "") << "\n";
 }
 
+std::string PrefabAssetIdForSave(const std::string& legacyAssetId, const PrefabInstanceState& prefab)
+{
+    return !prefab.assetId.empty() ? prefab.assetId : legacyAssetId;
+}
+
+void WritePrefabInstance(std::ostream& out,
+                         const std::string& legacyAssetId,
+                         const PrefabInstanceState& prefab,
+                         const std::string& indent)
+{
+    const std::string assetId = PrefabAssetIdForSave(legacyAssetId, prefab);
+    if (assetId.empty())
+        return;
+
+    out << indent << "\"prefab_asset_id\": \"" << EscapeJson(assetId) << "\",\n";
+    out << indent << "\"prefab_instance\": {\n";
+    out << indent << "  \"linked\": " << (prefab.linked || !assetId.empty() ? "true" : "false") << ",\n";
+    out << indent << "  \"asset_id\": \"" << EscapeJson(assetId) << "\",\n";
+    out << indent << "  \"local_id\": " << (prefab.localId == 0 ? 1u : prefab.localId) << ",\n";
+    out << indent << "  \"preserve_transform\": " << (prefab.preserveTransform ? "true" : "false") << ",\n";
+    out << indent << "  \"name_override\": " << (prefab.nameOverride ? "true" : "false") << "\n";
+    out << indent << "},\n";
+}
+
+void WriteParentRef(std::ostream& out, const SceneParentRef& parent, const std::string& indent)
+{
+    if (!parent.IsValid())
+        return;
+    out << indent << "\"parent\": {\n";
+    out << indent << "  \"type\": \"" << EscapeJson(parent.type) << "\",\n";
+    out << indent << "  \"id\": " << parent.id << "\n";
+    out << indent << "},\n";
+}
+
 void WriteSceneEntity(std::ostream& out, const PointLight& light, bool comma)
 {
     out << "    {\n";
     out << "      \"type\": \"dynamic_light\",\n";
     out << "      \"id\": " << light.id << ",\n";
     out << "      \"name\": \"" << EscapeJson(light.name) << "\",\n";
+    WritePrefabInstance(out, light.prefabAssetId, light.prefabInstance, "      ");
+    WriteParentRef(out, light.parent, "      ");
     out << "      \"light_type\": \"point\",\n";
     out << "      \"position\": " << FloatArray(light.position, 3) << ",\n";
     const float color[3] = {light.r, light.g, light.b};
@@ -930,6 +966,8 @@ void WriteSceneEntity(std::ostream& out, const SpotLight& light, bool comma)
     out << "      \"type\": \"dynamic_light\",\n";
     out << "      \"id\": " << light.id << ",\n";
     out << "      \"name\": \"" << EscapeJson(light.name) << "\",\n";
+    WritePrefabInstance(out, light.prefabAssetId, light.prefabInstance, "      ");
+    WriteParentRef(out, light.parent, "      ");
     out << "      \"light_type\": \"spot\",\n";
     out << "      \"position\": " << FloatArray(light.position, 3) << ",\n";
     out << "      \"rotation\": " << FloatArray(light.rotation, 3) << ",\n";
@@ -1012,6 +1050,8 @@ void WriteSceneEntity(std::ostream& out, const MeshSceneEntity& mesh, bool comma
     out << "      \"type\": \"mesh_entity\",\n";
     out << "      \"id\": " << mesh.id << ",\n";
     out << "      \"name\": \"" << EscapeJson(mesh.name) << "\",\n";
+    WritePrefabInstance(out, mesh.prefabAssetId, mesh.prefabInstance, "      ");
+    WriteParentRef(out, mesh.parent, "      ");
     out << "      \"position\": " << FloatArray(mesh.position, 3) << ",\n";
     out << "      \"rotation\": " << FloatArray(mesh.rotation, 3) << ",\n";
     out << "      \"scale\": " << FloatArray(mesh.scale, 3) << ",\n";
@@ -1060,11 +1100,49 @@ void WriteSceneEntity(std::ostream& out, const MeshSceneEntity& mesh, bool comma
     out << "    }" << (comma ? "," : "") << "\n";
 }
 
+PrefabInstanceState ReadPrefabInstance(const JsonValue& entity, const std::string& legacyAssetId)
+{
+    PrefabInstanceState prefab = MakePrefabInstanceState(legacyAssetId);
+    if (const JsonValue* object = Find(entity, "prefab_instance"); object && object->type == JsonValue::Type::Object)
+    {
+        prefab.assetId = ReadString(*object, "asset_id", legacyAssetId);
+        prefab.linked = ReadBool(*object, "linked", !prefab.assetId.empty());
+        prefab.localId = ReadU32(*object, "local_id", prefab.localId);
+        prefab.preserveTransform = ReadBool(*object, "preserve_transform", prefab.preserveTransform);
+        prefab.nameOverride = ReadBool(*object, "name_override", prefab.nameOverride);
+    }
+    if (prefab.assetId.empty())
+        prefab.linked = false;
+    return prefab;
+}
+
+SceneParentRef ReadParentRef(const JsonValue& entity)
+{
+    SceneParentRef parent;
+    if (const JsonValue* object = Find(entity, "parent"); object && object->type == JsonValue::Type::Object)
+    {
+        parent.type = ReadString(*object, "type");
+        parent.id = ReadU32(*object, "id", 0);
+    }
+    else
+    {
+        parent.type = ReadString(entity, "parent_type");
+        parent.id = ReadU32(entity, "parent_id", 0);
+    }
+    if (!parent.IsValid())
+        return {};
+    return parent;
+}
+
 PointLight ReadPointLight(const JsonValue& entity)
 {
     PointLight light;
     light.id = ReadU32(entity, "id", light.id);
     light.name = ReadString(entity, "name", light.name);
+    light.prefabAssetId = ReadString(entity, "prefab_asset_id");
+    light.prefabInstance = ReadPrefabInstance(entity, light.prefabAssetId);
+    light.prefabAssetId = light.prefabInstance.assetId;
+    light.parent = ReadParentRef(entity);
     ReadFloatArray(entity, "position", light.position, 3);
     float color[3] = {light.r, light.g, light.b};
     ReadFloatArray(entity, "color", color, 3);
@@ -1082,6 +1160,10 @@ SpotLight ReadSpotLight(const JsonValue& entity)
     SpotLight light;
     light.id = ReadU32(entity, "id", light.id);
     light.name = ReadString(entity, "name", light.name);
+    light.prefabAssetId = ReadString(entity, "prefab_asset_id");
+    light.prefabInstance = ReadPrefabInstance(entity, light.prefabAssetId);
+    light.prefabAssetId = light.prefabInstance.assetId;
+    light.parent = ReadParentRef(entity);
     ReadFloatArray(entity, "position", light.position, 3);
     ReadFloatArray(entity, "rotation", light.rotation, 3);
     float color[3] = {light.r, light.g, light.b};
@@ -1176,6 +1258,10 @@ MeshSceneEntity ReadMeshSceneEntity(const JsonValue& entity)
     MeshSceneEntity mesh;
     mesh.id = ReadU32(entity, "id", mesh.id);
     mesh.name = ReadString(entity, "name", mesh.name);
+    mesh.prefabAssetId = ReadString(entity, "prefab_asset_id");
+    mesh.prefabInstance = ReadPrefabInstance(entity, mesh.prefabAssetId);
+    mesh.prefabAssetId = mesh.prefabInstance.assetId;
+    mesh.parent = ReadParentRef(entity);
     ReadFloatArray(entity, "position", mesh.position, 3);
     ReadFloatArray(entity, "rotation", mesh.rotation, 3);
     ReadFloatArray(entity, "scale", mesh.scale, 3);

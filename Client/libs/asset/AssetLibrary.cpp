@@ -1455,6 +1455,7 @@ bool AssetLibrary::EnsureDirectories() const
     std::filesystem::create_directories(m_libraryRoot / "materials", ec);
     std::filesystem::create_directories(m_libraryRoot / "materials" / "water", ec);
     std::filesystem::create_directories(m_libraryRoot / "scenes", ec);
+    std::filesystem::create_directories(m_libraryRoot / "prefabs", ec);
     std::filesystem::create_directories(m_libraryRoot / "thumbnails", ec);
     return !ec;
 }
@@ -1469,6 +1470,7 @@ const char* AssetLibrary::CategoryName(Category category)
     case Category::Material: return "Materials";
     case Category::WaterMaterial: return "Water Materials";
     case Category::Scene: return "Scenes";
+    case Category::Prefab: return "Prefabs";
     default: return "Assets";
     }
 }
@@ -1771,6 +1773,7 @@ std::string AssetLibrary::CategoryString(Category category)
     case Category::Material: return "material";
     case Category::WaterMaterial: return "water_material";
     case Category::Scene: return "scene";
+    case Category::Prefab: return "prefab";
     default: return "texture";
     }
 }
@@ -1783,6 +1786,7 @@ std::optional<AssetLibrary::Category> AssetLibrary::ParseCategory(const std::str
     if (value == "material") return Category::Material;
     if (value == "water_material" || value == "watermaterial") return Category::WaterMaterial;
     if (value == "scene") return Category::Scene;
+    if (value == "prefab") return Category::Prefab;
     return std::nullopt;
 }
 
@@ -1809,6 +1813,7 @@ std::filesystem::path AssetLibrary::CategoryDirectory(Category category) const
     case Category::Material: return m_libraryRoot / "materials";
     case Category::WaterMaterial: return m_libraryRoot / "materials" / "water";
     case Category::Scene: return m_libraryRoot / "scenes";
+    case Category::Prefab: return m_libraryRoot / "prefabs";
     default: return m_libraryRoot / "textures";
     }
 }
@@ -2668,6 +2673,13 @@ bool AssetLibrary::ValidateFile(Category category, const std::filesystem::path& 
             return false;
         }
         break;
+    case Category::Prefab:
+        if (!HasAnyExtension(path, {".ixprefab"}))
+        {
+            error = "prefabs must be IXPREFAB files";
+            return false;
+        }
+        break;
     }
     return true;
 }
@@ -2678,7 +2690,8 @@ std::string AssetLibrary::MakeUniqueId(Category category, const std::filesystem:
         (category == Category::Model ? "model_" :
             (category == Category::Animation ? "anim_" :
                 (category == Category::WaterMaterial ? "watermat_" :
-                    (category == Category::Scene ? "scene_" : "mat_"))));
+                    (category == Category::Scene ? "scene_" :
+                        (category == Category::Prefab ? "prefab_" : "mat_")))));
     const std::string base = prefix + SanitizeStem(sourcePath.stem().string());
     std::unordered_set<std::string> existing;
     for (const Entry& entry : m_entries)
@@ -2721,6 +2734,8 @@ std::optional<AssetLibrary::Category> DetectDirectImportCategory(const std::file
         return AssetLibrary::Category::Material;
     if (ext == ".scene")
         return AssetLibrary::Category::Scene;
+    if (ext == ".ixprefab")
+        return AssetLibrary::Category::Prefab;
     return std::nullopt;
 }
 
@@ -2785,7 +2800,9 @@ bool AssetLibrary::Import(Category category,
     entry.thumbnail = category == Category::Texture ? "" :
         (category == Category::Model ? "model_icon" :
             (category == Category::Animation ? "animation_icon" :
-                (category == Category::WaterMaterial ? "water_material_icon" : "material_icon")));
+                (category == Category::WaterMaterial ? "water_material_icon" :
+                    (category == Category::Prefab ? "prefab_icon" :
+                        (category == Category::Scene ? "scene_icon" : "material_icon")))));
     entry.tags = NormalizeTags(options.tags);
     if (category == Category::Texture)
     {
@@ -2912,7 +2929,8 @@ bool AssetLibrary::ImportFileToFolder(const std::filesystem::path& sourcePath,
     entry.thumbnail = *category == Category::Texture ? "" :
         (*category == Category::Model ? "model_icon" :
             (*category == Category::Animation ? "animation_icon" :
-                (*category == Category::Scene ? "scene_icon" : "material_icon")));
+                (*category == Category::Scene ? "scene_icon" :
+                    (*category == Category::Prefab ? "prefab_icon" : "material_icon"))));
     if (*category == Category::Texture)
     {
         std::string thumbnailError;

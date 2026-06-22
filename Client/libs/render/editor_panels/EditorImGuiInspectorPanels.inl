@@ -285,6 +285,66 @@ bool EditorImGui::RenderAttachedEditorComponents(std::vector<EditorAttachedCompo
     return changed;
 }
 
+void EditorImGui::RenderPrefabOverrideControls(const std::string& assetId,
+                                               const PrefabInstanceState& instance,
+                                               const std::vector<std::string>& overrides)
+{
+    const std::string effectiveAssetId = !instance.assetId.empty() ? instance.assetId : assetId;
+    std::string assetLabel = effectiveAssetId.empty() ? std::string("<missing>") : effectiveAssetId;
+    if (m_assetLibrary)
+    {
+        if (const auto entry = m_assetLibrary->FindById(effectiveAssetId))
+            assetLabel = entry->displayName.empty() ? entry->filename : entry->displayName;
+    }
+
+    ImGui::TextUnformatted("Linked Prefab Instance");
+    ImGui::TextDisabled("Asset: %s", assetLabel.c_str());
+    ImGui::TextDisabled("Asset ID: %s", effectiveAssetId.c_str());
+    ImGui::TextDisabled("Local ID: %u", instance.localId == 0 ? 1u : instance.localId);
+    ImGui::TextDisabled("Overrides: %zu", overrides.size());
+    ImGui::Separator();
+
+    if (overrides.empty())
+    {
+        ImGui::TextDisabled("No instance overrides.");
+    }
+    else
+    {
+        for (const std::string& overrideName : overrides)
+        {
+            ImGui::PushID(overrideName.c_str());
+            ImGui::BulletText("%s", overrideName.c_str());
+            if (overrideName != "Prefab asset missing")
+            {
+                ImGui::SameLine();
+                if (ImGui::SmallButton("Revert"))
+                {
+                    m_commands.revertSelectedPrefabOverride = true;
+                    m_commands.selectedPrefabOverrideName = overrideName;
+                }
+                ImGui::SameLine();
+                if (ImGui::SmallButton("Apply"))
+                {
+                    m_commands.applySelectedPrefabOverrideToAsset = true;
+                    m_commands.selectedPrefabOverrideName = overrideName;
+                }
+            }
+            ImGui::PopID();
+        }
+    }
+    ImGui::Separator();
+    if (UI::IconButton(ICON_FA_ROTATE, "Refresh Selected Instance", ImVec2(-1.0f, 0.0f)))
+        m_commands.refreshSelectedPrefabInstance = true;
+    if (UI::IconButton(ICON_FA_ROTATE, "Revert All Overrides", ImVec2(-1.0f, 0.0f)))
+        m_commands.revertSelectedPrefabInstance = true;
+    if (UI::IconButton(ICON_FA_FLOPPY_DISK, "Apply All Overrides to Prefab", ImVec2(-1.0f, 0.0f)))
+        m_commands.applySelectedPrefabToAsset = true;
+    if (UI::IconButton(ICON_FA_ROTATE, "Refresh All Prefab Instances", ImVec2(-1.0f, 0.0f)))
+        m_commands.refreshAllPrefabInstances = true;
+    if (UI::IconButton(ICON_FA_LAYER_GROUP, "Unpack Prefab Instance", ImVec2(-1.0f, 0.0f)))
+        m_commands.unpackSelectedPrefabInstance = true;
+}
+
 void EditorImGui::RenderSelectedWaterBodyInspector()
 {
     if (!m_waterBodyState.selected)
@@ -417,6 +477,12 @@ void EditorImGui::RenderSelectedLightInspector()
         changed |= ImGui::SliderFloat("Radius", &point.radius, 0.5f, 100.0f, "%.1f m");
         if (changed)
             MarkSelectedLightChanged();
+
+        if (!point.prefabAssetId.empty() &&
+            ImGui::CollapsingHeader(ICON_FA_LAYER_GROUP " Prefab", ImGuiTreeNodeFlags_DefaultOpen))
+        {
+            RenderPrefabOverrideControls(point.prefabAssetId, point.prefabInstance, m_dynamicLightState.prefabOverrides);
+        }
     }
     else if (isSpot)
     {
@@ -467,6 +533,12 @@ void EditorImGui::RenderSelectedLightInspector()
         spot.outerConeDegrees = std::max(spot.outerConeDegrees, spot.innerConeDegrees);
         if (changed)
             MarkSelectedLightChanged();
+
+        if (!spot.prefabAssetId.empty() &&
+            ImGui::CollapsingHeader(ICON_FA_LAYER_GROUP " Prefab", ImGuiTreeNodeFlags_DefaultOpen))
+        {
+            RenderPrefabOverrideControls(spot.prefabAssetId, spot.prefabInstance, m_dynamicLightState.prefabOverrides);
+        }
     }
 
     ImGui::Separator();
@@ -535,6 +607,14 @@ void EditorImGui::RenderSelectedMeshRendererInspector()
         ImGui::TextDisabled("Asset ID: %s", m_meshRendererState.meshAssetId.empty() ? "<none>" : m_meshRendererState.meshAssetId.c_str());
         ImGui::TextDisabled("Path: %s", m_meshRendererState.meshAssetPath.empty() ? "<none>" : m_meshRendererState.meshAssetPath.c_str());
         ImGui::TextDisabled("Render path: %s", m_meshRendererState.skinned ? "SkinnedMeshRenderer" : "StaticMeshRenderer");
+    }
+
+    if (!m_meshRendererState.prefabAssetId.empty() &&
+        ImGui::CollapsingHeader(ICON_FA_LAYER_GROUP " Prefab", ImGuiTreeNodeFlags_DefaultOpen))
+    {
+        RenderPrefabOverrideControls(m_meshRendererState.prefabAssetId,
+            m_meshRendererState.prefabInstance,
+            m_meshRendererState.prefabOverrides);
     }
 
     if (ImGui::CollapsingHeader(ICON_FA_LAYER_GROUP " Material Slots", ImGuiTreeNodeFlags_DefaultOpen))

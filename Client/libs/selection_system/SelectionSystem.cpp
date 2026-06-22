@@ -256,63 +256,81 @@ std::vector<SelectionOutlineRenderer::Line> BuildSelectionOutlineLines(
 
 std::vector<SelectionOutlineRenderer::Line> BuildEditorLightShapeLines(
     const std::vector<PointLight>& pointLights,
-    const std::vector<SpotLight>& spotLights)
+    const std::vector<SpotLight>& spotLights,
+    const SelectedEditorObject& selected,
+    bool showAllLightBounds)
 {
     std::vector<SelectionOutlineRenderer::Line> lines;
-    lines.reserve(pointLights.size() * 96 + spotLights.size() * 48);
+    lines.reserve(pointLights.size() * 32 + spotLights.size() * 24);
 
     for (const PointLight& light : pointLights)
     {
         if (light.editorHidden)
             continue;
+        const bool selectedLight =
+            selected.type == SelectedEditorObjectType::PointLight &&
+            selected.id == light.id;
         const float intensity = light.enabled ? 1.0f : 0.35f;
         const std::array<float, 4> color{
             std::max(0.25f, light.r) * intensity,
             std::max(0.25f, light.g) * intensity,
             std::max(0.10f, light.b) * intensity,
-            0.85f
+            selectedLight ? 0.95f : 0.55f
         };
         const WorldVec3 center{light.position[0], light.position[1], light.position[2]};
-        const float markerRadius = std::clamp(light.radius * 0.12f, 0.45f, 2.25f);
-        AddCircle(lines, center, {1.0f, 0.0f, 0.0f}, {0.0f, 0.0f, 1.0f}, markerRadius, color, 24);
-        AddCircle(lines, center, {1.0f, 0.0f, 0.0f}, {0.0f, 1.0f, 0.0f}, markerRadius, color, 24);
-        AddCircle(lines, center, {0.0f, 1.0f, 0.0f}, {0.0f, 0.0f, 1.0f}, markerRadius, color, 24);
-        AddLine(lines, center + WorldVec3{-markerRadius * 1.25f, 0.0f, 0.0f},
-            center + WorldVec3{markerRadius * 1.25f, 0.0f, 0.0f}, color);
-        AddLine(lines, center + WorldVec3{0.0f, -markerRadius * 1.25f, 0.0f},
-            center + WorldVec3{0.0f, markerRadius * 1.25f, 0.0f}, color);
-        AddLine(lines, center + WorldVec3{0.0f, 0.0f, -markerRadius * 1.25f},
-            center + WorldVec3{0.0f, 0.0f, markerRadius * 1.25f}, color);
+        const float iconRadius = selectedLight
+            ? std::clamp(light.radius * 0.06f, 0.45f, 1.25f)
+            : 0.35f;
+        AddCircle(lines, center, {1.0f, 0.0f, 0.0f}, {0.0f, 0.0f, 1.0f}, iconRadius, color, 16);
+        AddCircle(lines, center, {1.0f, 0.0f, 0.0f}, {0.0f, 1.0f, 0.0f}, iconRadius, color, 16);
+        AddCircle(lines, center, {0.0f, 1.0f, 0.0f}, {0.0f, 0.0f, 1.0f}, iconRadius, color, 16);
+        if (selectedLight || showAllLightBounds)
+        {
+            const std::array<float, 4> boundsColor{color[0], color[1], color[2], selectedLight ? 0.80f : 0.22f};
+            const float boundsRadius = std::max(0.25f, light.radius);
+            AddCircle(lines, center, {1.0f, 0.0f, 0.0f}, {0.0f, 0.0f, 1.0f}, boundsRadius, boundsColor, 48);
+            AddCircle(lines, center, {1.0f, 0.0f, 0.0f}, {0.0f, 1.0f, 0.0f}, boundsRadius, boundsColor, 48);
+            AddCircle(lines, center, {0.0f, 1.0f, 0.0f}, {0.0f, 0.0f, 1.0f}, boundsRadius, boundsColor, 48);
+        }
     }
 
     for (const SpotLight& light : spotLights)
     {
         if (light.editorHidden)
             continue;
+        const bool selectedLight =
+            selected.type == SelectedEditorObjectType::SpotLight &&
+            selected.id == light.id;
         const float intensity = light.enabled ? 1.0f : 0.35f;
         const std::array<float, 4> color{
             std::max(0.15f, light.r) * intensity,
             std::max(0.15f, light.g) * intensity,
             std::max(0.20f, light.b) * intensity,
-            0.90f
+            selectedLight ? 0.95f : 0.55f
         };
         const WorldVec3 apex{light.position[0], light.position[1], light.position[2]};
         const WorldVec3 direction = SpotLightDirection(light);
         const WorldVec3 right = SafePerpendicular(direction);
         const WorldVec3 up = xm::Normalize(xm::Cross(direction, right));
         const float range = std::max(0.25f, light.radius);
-        const float outerRadians = xm::DegreesToRadians(std::clamp(light.outerConeDegrees, 1.0f, 90.0f));
-        const float baseRadius = xm::Tan(outerRadians) * range;
-        const WorldVec3 baseCenter = apex + direction * range;
-        AddCircle(lines, baseCenter, right, up, baseRadius, color, 32);
-        for (int i = 0; i < 4; ++i)
-        {
-            const float angle = (static_cast<float>(i) / 4.0f) * xm::TwoPi + xm::Pi * 0.25f;
-            const WorldVec3 rim = WorldCirclePoint(baseCenter, right, up, baseRadius, angle);
-            AddLine(lines, apex, rim, color);
-        }
-        const float iconRadius = std::clamp(range * 0.035f, 0.20f, 0.75f);
+        const float iconRadius = selectedLight ? std::clamp(range * 0.025f, 0.25f, 0.65f) : 0.28f;
         AddCircle(lines, apex, right, up, iconRadius, color, 16);
+        AddLine(lines, apex, apex + direction * std::clamp(range * 0.18f, 0.8f, 2.5f), color);
+
+        if (selectedLight || showAllLightBounds)
+        {
+            const std::array<float, 4> boundsColor{color[0], color[1], color[2], selectedLight ? 0.85f : 0.22f};
+            const float outerRadians = xm::DegreesToRadians(std::clamp(light.outerConeDegrees, 1.0f, 90.0f));
+            const float baseRadius = xm::Tan(outerRadians) * range;
+            const WorldVec3 baseCenter = apex + direction * range;
+            AddCircle(lines, baseCenter, right, up, baseRadius, boundsColor, 32);
+            for (int i = 0; i < 4; ++i)
+            {
+                const float angle = (static_cast<float>(i) / 4.0f) * xm::TwoPi + xm::Pi * 0.25f;
+                const WorldVec3 rim = WorldCirclePoint(baseCenter, right, up, baseRadius, angle);
+                AddLine(lines, apex, rim, boundsColor);
+            }
+        }
     }
 
     return lines;

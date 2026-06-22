@@ -32,11 +32,13 @@
 #include <cstdlib>
 #include <cstring>
 #include <cstdio>
+#include <fstream>
 #include <filesystem>
 #include <limits>
 #include <map>
 #include <optional>
 #include <set>
+#include <sstream>
 #include <vector>
 
 #include <commdlg.h>
@@ -49,11 +51,43 @@ constexpr uint32_t kMinImageCount = 2;
 constexpr const char* kLayoutFile = "editor_layout.ini";
 constexpr const char* kAssetPayloadType = "ASSET_ID";
 constexpr const char* kAssetFolderPayloadType = "ASSET_FOLDER_PATH";
+constexpr const char* kHierarchyEntityPayloadType = "HIERARCHY_ENTITY";
 constexpr const char* kEditorNoteComponentId = "editor.note";
 constexpr const char* kLodComponentId = "rendering.lod";
 constexpr double kProjectAutoSaveIntervalSeconds = 5.0 * 60.0;
 constexpr float kPi = ixtreeme::math::Pi;
 constexpr float kGizmoPlaneScaleUnitsPerPixel = 0.01f;
+
+struct HierarchyEntityDragPayload
+{
+    int type = 0;
+    std::uint32_t id = 0;
+    std::uint64_t entity = 0;
+};
+
+struct PrefabInspectorEntity
+{
+    std::uint32_t localId = 0;
+    std::uint32_t parentLocalId = 0;
+    std::string type;
+    std::string lightType;
+    std::string name;
+    std::string meshAssetId;
+    std::string meshAssetPath;
+    std::string prefabAssetId;
+    std::vector<std::string> materialSlots;
+    bool transformValid = false;
+    float position[3] = {0.0f, 0.0f, 0.0f};
+    float rotation[3] = {0.0f, 0.0f, 0.0f};
+    float scale[3] = {1.0f, 1.0f, 1.0f};
+    bool lightValid = false;
+    float color[3] = {1.0f, 1.0f, 1.0f};
+    float intensity = 1.0f;
+    float radius = 1.0f;
+    float innerConeDegrees = 20.0f;
+    float outerConeDegrees = 35.0f;
+    bool enabled = true;
+};
 
 float Degrees(float radians)
 {
@@ -344,6 +378,7 @@ ImVec4 AssetCategoryColor(AssetLibrary::Category category)
     case AssetLibrary::Category::Material: return ImVec4(0.38f, 0.58f, 0.36f, 1.0f);
     case AssetLibrary::Category::WaterMaterial: return ImVec4(0.16f, 0.58f, 0.64f, 1.0f);
     case AssetLibrary::Category::Scene: return ImVec4(0.42f, 0.50f, 0.66f, 1.0f);
+    case AssetLibrary::Category::Prefab: return ImVec4(0.67f, 0.48f, 0.82f, 1.0f);
     default: return ImVec4(0.35f, 0.35f, 0.35f, 1.0f);
     }
 }
@@ -358,6 +393,7 @@ const char* AssetCategoryIcon(AssetLibrary::Category category)
     case AssetLibrary::Category::Material: return ICON_FA_PALETTE;
     case AssetLibrary::Category::WaterMaterial: return ICON_FA_DROPLET;
     case AssetLibrary::Category::Scene: return ICON_FA_GLOBE;
+    case AssetLibrary::Category::Prefab: return ICON_FA_LAYER_GROUP;
     default: return ICON_FA_FILE;
     }
 }
@@ -741,6 +777,7 @@ void EditorImGui::SetHierarchySceneState(std::uint64_t sceneRootEntity,
                                          std::string sceneRootName,
                                          std::vector<HierarchySceneEntity> entities)
 {
+    const std::uint64_t previousSelectedEntity = m_selectedHierarchyEntity;
     m_sceneRootEntity = sceneRootEntity;
     m_sceneRootName = sceneRootName.empty() ? "Untitled" : std::move(sceneRootName);
     m_hierarchyEntities = std::move(entities);
@@ -753,6 +790,8 @@ void EditorImGui::SetHierarchySceneState(std::uint64_t sceneRootEntity,
             break;
         }
     }
+    if (m_selectedHierarchyEntity != 0 && m_selectedHierarchyEntity != previousSelectedEntity)
+        m_assetInspectorSelectionActive = false;
 }
 
 void EditorImGui::SetWaterMaterials(std::vector<std::pair<std::string, WaterMaterialData>> materials)
@@ -851,6 +890,8 @@ void EditorImGui::InitializeAssetLibrary(const std::filesystem::path& clientRoot
     }
 
     m_assetStatus = "Asset library ready";
+    m_selectedAssetId.clear();
+    m_assetInspectorSelectionActive = false;
     tree_tool::TreeTexturePalette::Instance().EnsureLoaded(InternalAssetRootFor(m_engineRoot));
     SyncWaterMaterialSnapshot();
     Tracenf("[EDITOR-IMGUI-3] Asset library root=%s", m_assetLibrary->LibraryRoot().generic_string().c_str());
@@ -872,6 +913,7 @@ void EditorImGui::InitializeProjectAssetLibrary(const std::filesystem::path& pro
     m_assetFilter = AssetBrowserFilter::All;
     m_assetSubpath.clear();
     m_selectedAssetId.clear();
+    m_assetInspectorSelectionActive = false;
     m_activeAssetTags.clear();
     m_assetStatus = "Project assets ready";
     tree_tool::TreeTexturePalette::Instance().EnsureLoaded(InternalAssetRootFor(m_engineRoot));
@@ -952,6 +994,156 @@ void EditorImGui::SetSceneViewGizmo(HierarchyEntityType type,
     m_gizmoOperation = operation;
     m_sceneGizmoSnapEnabled = snapEnabled;
     m_sceneGizmoSnapValue = std::max(0.001f, snapValue);
+}
+
+std::uint32_t JsonU32ValueForInspector(const std::string& object, const std::string& key, std::uint32_t fallback = 0)
+{
+    const float value = ixtreeme::common::JsonFloatValue(object, key, static_cast<float>(fallback));
+    return value < 0.0f ? fallback : static_cast<std::uint32_t>(value);
+}
+
+std::size_t FindMatchingJsonBracket(const std::string& text, std::size_t open, char openCh, char closeCh)
+{
+    bool inString = false;
+    bool escaping = false;
+    int depth = 0;
+    for (std::size_t i = open; i < text.size(); ++i)
+    {
+        const char ch = text[i];
+        if (inString)
+        {
+            if (escaping)
+                escaping = false;
+            else if (ch == '\\')
+                escaping = true;
+            else if (ch == '"')
+                inString = false;
+            continue;
+        }
+        if (ch == '"')
+        {
+            inString = true;
+            continue;
+        }
+        if (ch == openCh)
+            ++depth;
+        else if (ch == closeCh)
+        {
+            --depth;
+            if (depth == 0)
+                return i;
+        }
+    }
+    return std::string::npos;
+}
+
+std::vector<std::string> ExtractJsonArrayObjectsForInspector(const std::string& text, const std::string& key)
+{
+    std::vector<std::string> objects;
+    const std::string needle = "\"" + key + "\"";
+    const std::size_t keyPos = text.find(needle);
+    if (keyPos == std::string::npos)
+        return objects;
+    const std::size_t openArray = text.find('[', keyPos + needle.size());
+    if (openArray == std::string::npos)
+        return objects;
+    const std::size_t closeArray = FindMatchingJsonBracket(text, openArray, '[', ']');
+    if (closeArray == std::string::npos)
+        return objects;
+
+    std::size_t cursor = openArray + 1;
+    while (cursor < closeArray)
+    {
+        const std::size_t openObject = text.find('{', cursor);
+        if (openObject == std::string::npos || openObject >= closeArray)
+            break;
+        const std::size_t closeObject = FindMatchingJsonBracket(text, openObject, '{', '}');
+        if (closeObject == std::string::npos || closeObject > closeArray)
+            break;
+        objects.push_back(text.substr(openObject, closeObject - openObject + 1));
+        cursor = closeObject + 1;
+    }
+    return objects;
+}
+
+std::string ExtractJsonObjectForInspector(const std::string& text, const std::string& key)
+{
+    const std::string needle = "\"" + key + "\"";
+    const std::size_t keyPos = text.find(needle);
+    if (keyPos == std::string::npos)
+        return {};
+    const std::size_t openObject = text.find('{', keyPos + needle.size());
+    if (openObject == std::string::npos)
+        return {};
+    const std::size_t closeObject = FindMatchingJsonBracket(text, openObject, '{', '}');
+    return closeObject == std::string::npos ? std::string{} : text.substr(openObject, closeObject - openObject + 1);
+}
+
+bool ReadPrefabAssetForInspector(const std::filesystem::path& path,
+                                 std::string& outName,
+                                 std::vector<PrefabInspectorEntity>& outEntities,
+                                 std::string& outError)
+{
+    std::ifstream file(path, std::ios::binary);
+    if (!file)
+    {
+        outError = "failed to open prefab file";
+        return false;
+    }
+
+    std::ostringstream buffer;
+    buffer << file.rdbuf();
+    const std::string text = buffer.str();
+    outName = ixtreeme::common::JsonStringValue(text, "name");
+
+    std::vector<std::string> entityObjects = ExtractJsonArrayObjectsForInspector(text, "entities");
+    if (entityObjects.empty())
+    {
+        const std::string legacyEntity = ExtractJsonObjectForInspector(text, "entity");
+        if (!legacyEntity.empty())
+            entityObjects.push_back(legacyEntity);
+    }
+
+    outEntities.clear();
+    outEntities.reserve(entityObjects.size());
+    for (const std::string& object : entityObjects)
+    {
+        PrefabInspectorEntity entity{};
+        entity.localId = JsonU32ValueForInspector(object, "local_id", static_cast<std::uint32_t>(outEntities.size() + 1u));
+        entity.parentLocalId = JsonU32ValueForInspector(object, "parent_local_id", 0);
+        entity.type = ixtreeme::common::JsonStringValue(object, "type");
+        entity.lightType = ixtreeme::common::JsonStringValue(object, "light_type");
+        entity.name = ixtreeme::common::JsonStringValue(object, "name");
+        entity.prefabAssetId = ixtreeme::common::JsonStringValue(object, "prefab_asset_id");
+        entity.meshAssetId = ixtreeme::common::JsonStringValue(object, "mesh_asset_id");
+        entity.meshAssetPath = ixtreeme::common::JsonStringValue(object, "mesh_asset_path");
+        if (entity.type == "mesh_entity")
+        {
+            entity.transformValid = true;
+            entity.materialSlots = ixtreeme::common::JsonStringArrayValue(object, "materials");
+            ixtreeme::common::JsonFloatArrayValue(object, "position", entity.position, 3);
+            ixtreeme::common::JsonFloatArrayValue(object, "rotation", entity.rotation, 3);
+            ixtreeme::common::JsonFloatArrayValue(object, "scale", entity.scale, 3);
+        }
+        else if (entity.type == "dynamic_light")
+        {
+            entity.transformValid = true;
+            entity.lightValid = true;
+            ixtreeme::common::JsonFloatArrayValue(object, "position", entity.position, 3);
+            if (entity.lightType == "spot")
+                ixtreeme::common::JsonFloatArrayValue(object, "rotation", entity.rotation, 3);
+            ixtreeme::common::JsonFloatArrayValue(object, "color", entity.color, 3);
+            entity.intensity = ixtreeme::common::JsonFloatValue(object, "intensity", entity.intensity);
+            entity.radius = ixtreeme::common::JsonFloatValue(object, "radius", entity.radius);
+            entity.innerConeDegrees = ixtreeme::common::JsonFloatValue(object, "inner_cone_deg", entity.innerConeDegrees);
+            entity.outerConeDegrees = ixtreeme::common::JsonFloatValue(object, "outer_cone_deg", entity.outerConeDegrees);
+            entity.enabled = ixtreeme::common::JsonBoolValue(object, "enabled", entity.enabled);
+        }
+        if (entity.name.empty())
+            entity.name = entity.type.empty() ? "Entity" : entity.type;
+        outEntities.push_back(std::move(entity));
+    }
+    return true;
 }
 
 void EditorImGui::ClearSceneViewGizmo()
@@ -1058,6 +1250,7 @@ bool EditorImGui::ActiveAssetCategory(AssetLibrary::Category category) const
     case AssetBrowserFilter::Material: return category == AssetLibrary::Category::Material;
     case AssetBrowserFilter::WaterMaterial: return category == AssetLibrary::Category::WaterMaterial;
     case AssetBrowserFilter::Scene: return category == AssetLibrary::Category::Scene;
+    case AssetBrowserFilter::Prefab: return category == AssetLibrary::Category::Prefab;
     default: return true;
     }
 }
@@ -1071,6 +1264,7 @@ AssetLibrary::Category EditorImGui::FolderCategory() const
     case AssetBrowserFilter::Material: return AssetLibrary::Category::Material;
     case AssetBrowserFilter::WaterMaterial: return AssetLibrary::Category::WaterMaterial;
     case AssetBrowserFilter::Scene: return AssetLibrary::Category::Scene;
+    case AssetBrowserFilter::Prefab: return AssetLibrary::Category::Prefab;
     case AssetBrowserFilter::All:
     case AssetBrowserFilter::Texture:
     default:
@@ -1089,6 +1283,7 @@ const char* EditorImGui::AssetFilterName() const
     case AssetBrowserFilter::Material: return "Materials";
     case AssetBrowserFilter::WaterMaterial: return "Water Mats";
     case AssetBrowserFilter::Scene: return "Scenes";
+    case AssetBrowserFilter::Prefab: return "Prefabs";
     default: return "Assets";
     }
 }
@@ -1157,6 +1352,7 @@ std::vector<std::string> EditorImGui::QueryVisibleFolders() const
         AssetLibrary::Category::Material,
         AssetLibrary::Category::WaterMaterial,
         AssetLibrary::Category::Scene,
+        AssetLibrary::Category::Prefab,
     };
     for (AssetLibrary::Category category : categories)
     {
@@ -1239,6 +1435,7 @@ void EditorImGui::SelectAssetBrowserFolder(const std::string& subpath)
 {
     m_assetSubpath = AssetLibrary::NormalizeSubpath(subpath);
     m_selectedAssetId.clear();
+    m_assetInspectorSelectionActive = false;
     m_activeAssetTags.clear();
 }
 
@@ -1667,7 +1864,10 @@ void EditorImGui::DeleteAsset(const AssetLibrary::Entry& entry)
     }
 
     if (m_selectedAssetId == deletedId)
+    {
         m_selectedAssetId.clear();
+        m_assetInspectorSelectionActive = false;
+    }
     if (m_waterMaterialEditor.materialId == deletedId)
         m_waterMaterialEditor = {};
     if (m_pbrMaterialEditor.materialId == deletedId)
@@ -1816,7 +2016,10 @@ void EditorImGui::DeleteFilesystemSelection()
     if (m_assetDeleteIsFolder && IsSubpathOrSelf(m_assetSubpath, AssetBrowserSubpath(path)))
         SelectAssetBrowserFolder(ParentSubpath(AssetBrowserSubpath(path)));
     if (!m_assetDeleteIsFolder)
+    {
         m_selectedAssetId.clear();
+        m_assetInspectorSelectionActive = false;
+    }
     RefreshAssetLibrary();
     m_assetStatus = "Deleted: " + path.filename().string();
     Tracenf("[EDITOR-ASSET-BROWSER] deleted path=Assets/%s metaDeleted=%s targetTrash=ok",
@@ -2402,7 +2605,10 @@ bool EditorImGui::DeleteWaterMaterialEditor()
     }
 
     if (m_selectedAssetId == deletedId)
+    {
         m_selectedAssetId.clear();
+        m_assetInspectorSelectionActive = false;
+    }
     m_waterMaterialEditor = {};
     m_commands.waterMaterialDeleted = true;
     m_commands.deletedWaterMaterialId = deletedId;

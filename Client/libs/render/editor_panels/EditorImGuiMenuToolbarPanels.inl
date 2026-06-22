@@ -531,6 +531,7 @@ void EditorImGui::QueueHierarchySelection(const HierarchySceneEntity& entity)
     m_commands.hierarchyEntityId = entity.objectId;
     m_commands.hierarchyEntityHandle = entity.entity;
     m_selectedHierarchyEntity = entity.entity;
+    m_assetInspectorSelectionActive = false;
     Tracenf("[HIERARCHY] Selected entity: flecs=%llu object=%u type=%d",
         static_cast<unsigned long long>(entity.entity),
         entity.objectId,

@@ -510,11 +510,432 @@ void EditorImGui::RenderSelectedTerrainInspector()
     ImGui::Text("Vertices: %llu", static_cast<unsigned long long>(verts));
 }
 
+bool EditorImGui::RenderSelectedPrefabAssetInspector()
+{
+    if (!m_assetInspectorSelectionActive || !m_assetLibrary || m_selectedAssetId.empty())
+        return false;
+
+    const auto entry = m_assetLibrary->FindById(m_selectedAssetId);
+    if (!entry || entry->category != AssetLibrary::Category::Prefab)
+        return false;
+
+    const std::filesystem::path path = entry->originalPath.empty()
+        ? m_assetLibrary->AbsolutePath(*entry)
+        : std::filesystem::path(entry->originalPath);
+
+    std::string prefabName;
+    std::vector<PrefabInspectorEntity> entities;
+    std::string error;
+    const bool loaded = ReadPrefabAssetForInspector(path, prefabName, entities, error);
+    if (prefabName.empty())
+        prefabName = entry->displayName.empty() ? entry->filename : entry->displayName;
+    auto resetEditState = [&]() {
+        m_prefabInspectorEditAssetId = entry->id;
+        CopyToBuffer(m_prefabInspectorNameBuffer, sizeof(m_prefabInspectorNameBuffer), prefabName);
+        m_prefabInspectorEditRows.clear();
+        m_prefabInspectorEditRows.reserve(entities.size());
+        for (const PrefabInspectorEntity& entity : entities)
+        {
+            PrefabInspectorEditRow row{};
+            row.localId = entity.localId;
+            row.parentLocalId = entity.parentLocalId;
+            row.type = entity.type;
+            row.lightType = entity.lightType;
+            row.meshAssetId = entity.meshAssetId;
+            row.meshAssetPath = entity.meshAssetPath;
+            row.prefabAssetId = entity.prefabAssetId;
+            row.materialSlotBuffers.clear();
+            row.materialSlotBuffers.reserve(entity.materialSlots.size());
+            for (const std::string& materialSlot : entity.materialSlots)
+            {
+                std::array<char, 128> buffer{};
+                CopyToBuffer(buffer.data(), buffer.size(), materialSlot);
+                row.materialSlotBuffers.push_back(buffer);
+            }
+            CopyToBuffer(row.name, sizeof(row.name), entity.name);
+            row.transformValid = entity.transformValid;
+            std::copy(std::begin(entity.position), std::end(entity.position), std::begin(row.position));
+            std::copy(std::begin(entity.rotation), std::end(entity.rotation), std::begin(row.rotation));
+            std::copy(std::begin(entity.scale), std::end(entity.scale), std::begin(row.scale));
+            row.lightValid = entity.lightValid;
+            std::copy(std::begin(entity.color), std::end(entity.color), std::begin(row.color));
+            row.intensity = entity.intensity;
+            row.radius = entity.radius;
+            row.innerConeDegrees = entity.innerConeDegrees;
+            row.outerConeDegrees = entity.outerConeDegrees;
+            row.enabled = entity.enabled;
+            m_prefabInspectorEditRows.push_back(std::move(row));
+        }
+        m_prefabInspectorDirty = false;
+    };
+    if (loaded &&
+        (m_prefabInspectorEditAssetId != entry->id ||
+            (!m_prefabInspectorDirty && m_prefabInspectorEditRows.size() != entities.size())))
+    {
+        resetEditState();
+    }
+
+    UI::SectionHeader(ICON_FA_LAYER_GROUP " Prefab Asset");
+    ImGui::TextDisabled("Asset ID: %s", entry->id.c_str());
+    ImGui::TextDisabled("File: %s", path.generic_string().c_str());
+    ImGui::Separator();
+
+    if (!loaded)
+    {
+        ImGui::TextColored(ImVec4(0.95f, 0.35f, 0.28f, 1.0f), "Failed to read prefab: %s", error.c_str());
+        return true;
+    }
+
+    ImGui::SetNextItemWidth(-1.0f);
+    if (ImGui::InputText("Prefab Name", m_prefabInspectorNameBuffer, sizeof(m_prefabInspectorNameBuffer)))
+        m_prefabInspectorDirty = true;
+
+    ImGui::Text("Entities: %zu", entities.size());
+    if (UI::IconButton(ICON_FA_CUBE, "Instantiate Prefab", ImVec2(-1.0f, 0.0f)))
+    {
+        m_commands.addPrefabInstance = true;
+        m_commands.prefabAssetId = entry->id;
+        m_assetStatus = "Prefab instance queued: " + entry->displayName;
+        Tracenf("[PREFAB] Inspector instantiate queued: asset_id=%s", entry->id.c_str());
+    }
+    auto nextPrefabLocalId = [&]() {
+        std::uint32_t nextId = 1;
+        for (const PrefabInspectorEditRow& row : m_prefabInspectorEditRows)
+            nextId = std::max(nextId, row.localId + 1u);
+        return nextId;
+    };
+    auto addPrefabLightRow = [&](const char* lightType, const char* displayName) {
+        PrefabInspectorEditRow row{};
+        row.localId = nextPrefabLocalId();
+        row.type = "dynamic_light";
+        row.lightType = lightType;
+        row.transformValid = true;
+        row.lightValid = true;
+        CopyToBuffer(row.name, sizeof(row.name), displayName);
+        row.position[1] = 2.0f;
+        row.intensity = std::strcmp(lightType, "spot") == 0 ? 5.0f : 3.0f;
+        row.radius = std::strcmp(lightType, "spot") == 0 ? 20.0f : 10.0f;
+        row.rotation[0] = std::strcmp(lightType, "spot") == 0 ? -1.5708f : 0.0f;
+        m_prefabInspectorEditRows.push_back(row);
+        m_prefabInspectorDirty = true;
+    };
+    if (UI::IconButton(ICON_FA_LIGHTBULB, "Add Point Light", ImVec2(-1.0f, 0.0f)))
+        addPrefabLightRow("point", "Point Light");
+    if (UI::IconButton(ICON_FA_BULLSEYE, "Add Spot Light", ImVec2(-1.0f, 0.0f)))
+        addPrefabLightRow("spot", "Spot Light");
+    if (m_prefabInspectorDirty)
+        ImGui::TextColored(ImVec4(0.96f, 0.77f, 0.28f, 1.0f), "Unsaved prefab edits");
+
+    auto findRowByLocalId = [&](std::uint32_t localId) -> PrefabInspectorEditRow* {
+        auto it = std::find_if(m_prefabInspectorEditRows.begin(), m_prefabInspectorEditRows.end(),
+            [&](const PrefabInspectorEditRow& row) { return row.localId == localId; });
+        return it == m_prefabInspectorEditRows.end() ? nullptr : &*it;
+    };
+    auto wouldCreateParentCycle = [&](std::uint32_t localId, std::uint32_t parentLocalId) {
+        std::set<std::uint32_t> visited;
+        std::uint32_t cursor = parentLocalId;
+        while (cursor != 0)
+        {
+            if (cursor == localId || !visited.insert(cursor).second)
+                return true;
+            PrefabInspectorEditRow* parent = findRowByLocalId(cursor);
+            if (!parent)
+                return false;
+            cursor = parent->parentLocalId;
+        }
+        return false;
+    };
+    std::vector<std::string> validationErrors;
+    std::set<std::uint32_t> seenLocalIds;
+    for (const PrefabInspectorEditRow& row : m_prefabInspectorEditRows)
+    {
+        if (row.localId == 0 || !seenLocalIds.insert(row.localId).second)
+            validationErrors.push_back("Duplicate or missing local id in prefab hierarchy.");
+        if (row.parentLocalId != 0 && !findRowByLocalId(row.parentLocalId))
+            validationErrors.push_back("Entity " + std::to_string(row.localId) + " has a missing parent.");
+        if (wouldCreateParentCycle(row.localId, row.parentLocalId))
+            validationErrors.push_back("Entity " + std::to_string(row.localId) + " would create a parent cycle.");
+        if (row.type == "mesh_entity" && row.meshAssetId.empty() && row.meshAssetPath.empty())
+            validationErrors.push_back("Mesh entity " + std::to_string(row.localId) + " has no mesh asset.");
+    }
+    if (!validationErrors.empty())
+    {
+        ImGui::TextColored(ImVec4(0.95f, 0.35f, 0.28f, 1.0f), "Prefab validation failed:");
+        for (const std::string& errorText : validationErrors)
+            ImGui::BulletText("%s", errorText.c_str());
+    }
+    const bool canSave = m_prefabInspectorDirty && m_prefabInspectorNameBuffer[0] != '\0' && validationErrors.empty();
+    if (!canSave)
+        ImGui::BeginDisabled();
+    if (UI::IconButton(ICON_FA_FLOPPY_DISK, "Save Prefab Asset", ImVec2(-1.0f, 0.0f)))
+    {
+        m_commands.savePrefabAssetEdit = true;
+        m_commands.editPrefabAssetId = entry->id;
+        m_commands.editPrefabName = m_prefabInspectorNameBuffer;
+        m_commands.editPrefabEntityNames.clear();
+        for (const PrefabInspectorEditRow& row : m_prefabInspectorEditRows)
+        {
+            PrefabAssetEntityNameEdit edit{};
+            edit.localId = row.localId;
+            edit.parentLocalId = row.parentLocalId;
+            edit.type = row.type;
+            edit.lightType = row.lightType;
+            edit.name = row.name;
+            edit.meshAssetId = row.meshAssetId;
+            edit.meshAssetPath = row.meshAssetPath;
+            edit.prefabAssetId = row.prefabAssetId;
+            edit.materialSlots.clear();
+            edit.materialSlots.reserve(row.materialSlotBuffers.size());
+            for (const auto& materialSlot : row.materialSlotBuffers)
+            {
+                std::string value = materialSlot.data();
+                if (!value.empty())
+                    edit.materialSlots.push_back(std::move(value));
+            }
+            edit.transformValid = row.transformValid;
+            std::copy(std::begin(row.position), std::end(row.position), std::begin(edit.position));
+            std::copy(std::begin(row.rotation), std::end(row.rotation), std::begin(edit.rotation));
+            std::copy(std::begin(row.scale), std::end(row.scale), std::begin(edit.scale));
+            edit.lightValid = row.lightValid;
+            std::copy(std::begin(row.color), std::end(row.color), std::begin(edit.color));
+            edit.intensity = row.intensity;
+            edit.radius = row.radius;
+            edit.innerConeDegrees = row.innerConeDegrees;
+            edit.outerConeDegrees = row.outerConeDegrees;
+            edit.enabled = row.enabled;
+            m_commands.editPrefabEntityNames.push_back(std::move(edit));
+        }
+        m_assetStatus = "Prefab asset save queued: " + entry->displayName;
+        m_prefabInspectorDirty = false;
+    }
+    if (!canSave)
+        ImGui::EndDisabled();
+    if (UI::IconButton(ICON_FA_ROTATE, "Reload Prefab Asset", ImVec2(-1.0f, 0.0f)))
+        resetEditState();
+
+    ImGui::Separator();
+    if (entities.empty())
+    {
+        ImGui::TextDisabled("This prefab has no scene entities.");
+        return true;
+    }
+
+    if (ImGui::BeginTable("PrefabAssetEntities", 4, ImGuiTableFlags_BordersInnerV | ImGuiTableFlags_RowBg | ImGuiTableFlags_SizingStretchProp))
+    {
+        ImGui::TableSetupColumn("ID", ImGuiTableColumnFlags_WidthFixed, 44.0f);
+        ImGui::TableSetupColumn("Name");
+        ImGui::TableSetupColumn("Type", ImGuiTableColumnFlags_WidthFixed, 92.0f);
+        ImGui::TableSetupColumn("Parent", ImGuiTableColumnFlags_WidthFixed, 64.0f);
+        ImGui::TableHeadersRow();
+        std::uint32_t deleteLocalId = 0;
+        for (PrefabInspectorEditRow& entity : m_prefabInspectorEditRows)
+        {
+            ImGui::TableNextRow();
+            ImGui::PushID(static_cast<int>(entity.localId));
+            ImGui::TableSetColumnIndex(0);
+            ImGui::Text("%u", entity.localId);
+            ImGui::TableSetColumnIndex(1);
+            ImGui::SetNextItemWidth(-1.0f);
+            if (ImGui::InputText("##name", entity.name, sizeof(entity.name)))
+                m_prefabInspectorDirty = true;
+            if (entity.parentLocalId == 0)
+            {
+                ImGui::SameLine();
+                ImGui::TextDisabled("root");
+            }
+            if (entity.transformValid)
+            {
+                ImGui::SetNextItemWidth(-1.0f);
+                if (ImGui::DragFloat3("Position", entity.position, 0.05f, 0.0f, 0.0f, "%.2f"))
+                    m_prefabInspectorDirty = true;
+                if (entity.type == "mesh_entity")
+                {
+                    float rotationDegrees[3] = {
+                        Degrees(entity.rotation[0]),
+                        Degrees(entity.rotation[1]),
+                        Degrees(entity.rotation[2])};
+                    ImGui::SetNextItemWidth(-1.0f);
+                    if (ImGui::DragFloat3("Rotation", rotationDegrees, 0.5f, 0.0f, 0.0f, "%.1f deg"))
+                    {
+                        entity.rotation[0] = Radians(rotationDegrees[0]);
+                        entity.rotation[1] = Radians(rotationDegrees[1]);
+                        entity.rotation[2] = Radians(rotationDegrees[2]);
+                        m_prefabInspectorDirty = true;
+                    }
+                    ImGui::SetNextItemWidth(-1.0f);
+                    if (ImGui::DragFloat3("Scale", entity.scale, 0.02f, 0.001f, 0.0f, "%.3f"))
+                    {
+                        entity.scale[0] = std::max(entity.scale[0], 0.001f);
+                        entity.scale[1] = std::max(entity.scale[1], 0.001f);
+                        entity.scale[2] = std::max(entity.scale[2], 0.001f);
+                        m_prefabInspectorDirty = true;
+                    }
+                    if (!entity.meshAssetId.empty())
+                        ImGui::TextDisabled("Mesh asset: %s", entity.meshAssetId.c_str());
+                    if (!entity.meshAssetPath.empty())
+                        ImGui::TextDisabled("Mesh path: %s", entity.meshAssetPath.c_str());
+                    if (!entity.prefabAssetId.empty())
+                        ImGui::TextDisabled("Nested prefab: %s", entity.prefabAssetId.c_str());
+                    if (ImGui::TreeNodeEx("Material Slots", ImGuiTreeNodeFlags_DefaultOpen))
+                    {
+                        for (std::size_t slotIndex = 0; slotIndex < entity.materialSlotBuffers.size(); ++slotIndex)
+                        {
+                            ImGui::PushID(static_cast<int>(slotIndex));
+                            ImGui::SetNextItemWidth(-1.0f);
+                            const std::string label = "Slot " + std::to_string(slotIndex);
+                            if (ImGui::InputText(label.c_str(),
+                                    entity.materialSlotBuffers[slotIndex].data(),
+                                    entity.materialSlotBuffers[slotIndex].size()))
+                            {
+                                m_prefabInspectorDirty = true;
+                            }
+                            if (ImGui::BeginDragDropTarget())
+                            {
+                                if (const ImGuiPayload* payload = ImGui::AcceptDragDropPayload(kAssetPayloadType))
+                                {
+                                    const std::string assetId(static_cast<const char*>(payload->Data), payload->DataSize);
+                                    auto materialEntry = m_assetLibrary ? m_assetLibrary->FindById(assetId) : std::optional<AssetLibrary::Entry>{};
+                                    if (materialEntry && materialEntry->category == AssetLibrary::Category::Material)
+                                    {
+                                        CopyToBuffer(entity.materialSlotBuffers[slotIndex].data(),
+                                            entity.materialSlotBuffers[slotIndex].size(),
+                                            materialEntry->id);
+                                        m_prefabInspectorDirty = true;
+                                    }
+                                    else
+                                    {
+                                        m_assetStatus = "Prefab material slots accept PBR material assets only";
+                                    }
+                                }
+                                ImGui::EndDragDropTarget();
+                            }
+                            ImGui::PopID();
+                        }
+                        if (ImGui::SmallButton("Add Material Slot"))
+                        {
+                            entity.materialSlotBuffers.push_back({});
+                            m_prefabInspectorDirty = true;
+                        }
+                        ImGui::SameLine();
+                        if (!entity.materialSlotBuffers.empty() && ImGui::SmallButton("Remove Last Slot"))
+                        {
+                            entity.materialSlotBuffers.pop_back();
+                            m_prefabInspectorDirty = true;
+                        }
+                        ImGui::TreePop();
+                    }
+                }
+                else if (entity.lightType == "spot")
+                {
+                    float rotationDegrees[3] = {
+                        Degrees(entity.rotation[0]),
+                        Degrees(entity.rotation[1]),
+                        Degrees(entity.rotation[2])};
+                    ImGui::SetNextItemWidth(-1.0f);
+                    if (ImGui::DragFloat3("Rotation", rotationDegrees, 0.5f, 0.0f, 0.0f, "%.1f deg"))
+                    {
+                        entity.rotation[0] = Radians(rotationDegrees[0]);
+                        entity.rotation[1] = Radians(rotationDegrees[1]);
+                        entity.rotation[2] = Radians(rotationDegrees[2]);
+                        m_prefabInspectorDirty = true;
+                    }
+                }
+            }
+            if (entity.lightValid)
+            {
+                if (ImGui::Checkbox("Enabled", &entity.enabled))
+                    m_prefabInspectorDirty = true;
+                ImGui::SetNextItemWidth(-1.0f);
+                if (ImGui::ColorEdit3("Color", entity.color))
+                    m_prefabInspectorDirty = true;
+                ImGui::SetNextItemWidth(-1.0f);
+                if (ImGui::DragFloat("Intensity", &entity.intensity, 0.05f, 0.0f, 100.0f, "%.2f"))
+                    m_prefabInspectorDirty = true;
+                ImGui::SetNextItemWidth(-1.0f);
+                if (ImGui::DragFloat("Radius", &entity.radius, 0.1f, 0.1f, 1000.0f, "%.2f"))
+                    m_prefabInspectorDirty = true;
+                if (entity.lightType == "spot")
+                {
+                    ImGui::SetNextItemWidth(-1.0f);
+                    if (ImGui::DragFloat("Inner Cone", &entity.innerConeDegrees, 0.25f, 1.0f, 89.0f, "%.1f deg"))
+                        m_prefabInspectorDirty = true;
+                    ImGui::SetNextItemWidth(-1.0f);
+                    if (ImGui::DragFloat("Outer Cone", &entity.outerConeDegrees, 0.25f, 1.0f, 90.0f, "%.1f deg"))
+                        m_prefabInspectorDirty = true;
+                    entity.outerConeDegrees = std::max(entity.outerConeDegrees, entity.innerConeDegrees);
+                }
+            }
+            ImGui::TableSetColumnIndex(2);
+            const std::string typeLabel = entity.type == "dynamic_light" && !entity.lightType.empty()
+                ? entity.lightType + " light"
+                : (entity.type.empty() ? std::string("entity") : entity.type);
+            ImGui::TextDisabled("%s", typeLabel.c_str());
+            if (m_prefabInspectorEditRows.size() > 1)
+            {
+                ImGui::SameLine();
+                if (ImGui::SmallButton("Delete"))
+                    deleteLocalId = entity.localId;
+            }
+            ImGui::TableSetColumnIndex(3);
+            const std::string parentPreview = entity.parentLocalId == 0
+                ? std::string("root")
+                : ("#" + std::to_string(entity.parentLocalId));
+            ImGui::SetNextItemWidth(-1.0f);
+            if (ImGui::BeginCombo("##parent", parentPreview.c_str()))
+            {
+                if (ImGui::Selectable("root", entity.parentLocalId == 0))
+                {
+                    entity.parentLocalId = 0;
+                    m_prefabInspectorDirty = true;
+                }
+                for (const PrefabInspectorEditRow& candidate : m_prefabInspectorEditRows)
+                {
+                    if (candidate.localId == entity.localId)
+                        continue;
+                    const bool createsCycle = wouldCreateParentCycle(entity.localId, candidate.localId);
+                    if (createsCycle)
+                        ImGui::BeginDisabled();
+                    const std::string candidateLabel = "#" + std::to_string(candidate.localId) + " " + candidate.name;
+                    if (ImGui::Selectable(candidateLabel.c_str(), entity.parentLocalId == candidate.localId) && !createsCycle)
+                    {
+                        entity.parentLocalId = candidate.localId;
+                        m_prefabInspectorDirty = true;
+                    }
+                    if (createsCycle)
+                        ImGui::EndDisabled();
+                }
+                ImGui::EndCombo();
+            }
+            ImGui::PopID();
+        }
+        if (deleteLocalId != 0)
+        {
+            m_prefabInspectorEditRows.erase(
+                std::remove_if(m_prefabInspectorEditRows.begin(),
+                    m_prefabInspectorEditRows.end(),
+                    [&](const PrefabInspectorEditRow& row) { return row.localId == deleteLocalId; }),
+                m_prefabInspectorEditRows.end());
+            for (PrefabInspectorEditRow& row : m_prefabInspectorEditRows)
+            {
+                if (row.parentLocalId == deleteLocalId)
+                    row.parentLocalId = 0;
+            }
+            m_prefabInspectorDirty = true;
+        }
+        ImGui::EndTable();
+    }
+
+    return true;
+}
+
 void EditorImGui::RenderInspector()
 {
     if (ImGui::Begin("Inspector"))
     {
-        if (m_terrainState.selected)
+        if (RenderSelectedPrefabAssetInspector())
+        {
+        }
+        else if (m_terrainState.selected)
             RenderSelectedTerrainInspector();
         else if (m_waterBodyState.selected)
             RenderSelectedWaterBodyInspector();

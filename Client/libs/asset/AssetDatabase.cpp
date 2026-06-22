@@ -118,6 +118,8 @@ std::optional<AssetType> ParseAssetType(const std::string& value)
         return AssetType::Animation;
     if (value == "Scene")
         return AssetType::Scene;
+    if (value == "Prefab")
+        return AssetType::Prefab;
     if (value == "Project")
         return AssetType::Project;
     return std::nullopt;
@@ -355,6 +357,22 @@ std::string WithSkeletalAssetField(std::string text,
     field << "  }";
     return InsertJsonFieldBeforeImportedAt(std::move(text), field.str());
 }
+
+std::string WithDependenciesField(std::string text, const std::vector<Guid>& dependencies)
+{
+    text = RemoveJsonField(std::move(text), "\"dependencies\"");
+
+    std::ostringstream field;
+    field << "  \"dependencies\": [";
+    for (size_t i = 0; i < dependencies.size(); ++i)
+    {
+        if (i)
+            field << ", ";
+        field << "\"" << dependencies[i].toString() << "\"";
+    }
+    field << "]";
+    return InsertJsonFieldBeforeImportedAt(std::move(text), field.str());
+}
 }
 
 std::string Guid::toString() const
@@ -443,6 +461,8 @@ AssetType detectAssetType(const std::filesystem::path& filePath)
         return AssetType::Animation;
     if (ext == ".scene")
         return AssetType::Scene;
+    if (ext == ".ixprefab")
+        return AssetType::Prefab;
     if (ext == ".ixproj")
         return AssetType::Project;
     return AssetType::Unknown;
@@ -457,6 +477,7 @@ const char* AssetTypeName(AssetType type)
     case AssetType::Material: return "Material";
     case AssetType::Animation: return "Animation";
     case AssetType::Scene: return "Scene";
+    case AssetType::Prefab: return "Prefab";
     case AssetType::Project: return "Project";
     default: return "Unknown";
     }
@@ -861,6 +882,65 @@ bool AssetDatabase::writeDefaultMaterials(const std::filesystem::path& modelPath
         return false;
     }
     file << text;
+    return true;
+}
+
+bool AssetDatabase::writeDependencies(const std::filesystem::path& assetPathInput,
+                                      const std::vector<Guid>& dependencies) const
+{
+    const std::filesystem::path assetPath = canonicalPath(assetPathInput);
+    const AssetType assetType = detectAssetType(assetPath);
+    if (assetType == AssetType::Unknown)
+        return false;
+
+    Guid assetGuid{};
+    if (const std::optional<Guid> existing = resolvePath(assetPath))
+        assetGuid = *existing;
+    else
+        assetGuid = const_cast<AssetDatabase*>(this)->getOrCreateGuid(assetPath);
+
+    const std::filesystem::path metaPath = metaPathFor(assetPath);
+    std::string text;
+    {
+        std::ifstream file(metaPath, std::ios::binary);
+        if (file)
+            text.assign(std::istreambuf_iterator<char>(file), std::istreambuf_iterator<char>());
+    }
+    if (text.empty())
+    {
+        std::ostringstream json;
+        json << "{\n"
+             << "  \"guid\": \"" << assetGuid.toString() << "\",\n"
+             << "  \"version\": 1,\n"
+             << "  \"assetType\": \"" << AssetTypeName(assetType) << "\",\n"
+             << "  \"importedAt\": \"" << EscapeJson(TimestampUtc()) << "\"\n"
+             << "}\n";
+        text = json.str();
+    }
+
+    std::vector<Guid> uniqueDependencies;
+    std::unordered_set<Guid> seen;
+    uniqueDependencies.reserve(dependencies.size());
+    for (const Guid& dependency : dependencies)
+    {
+        if (dependency == assetGuid || seen.contains(dependency))
+            continue;
+        seen.insert(dependency);
+        uniqueDependencies.push_back(dependency);
+    }
+
+    text = WithDependenciesField(std::move(text), uniqueDependencies);
+    std::ofstream file(metaPath, std::ios::binary | std::ios::trunc);
+    if (!file)
+    {
+        TraceError("[ASSET-DB] error path=%s reason=meta_write_open_failed regenerating=no",
+            displayPath(metaPath).c_str());
+        return false;
+    }
+    file << text;
+    Tracenf("[ASSET-DB] dependencies_written path=%s count=%zu",
+        displayPath(assetPath).c_str(),
+        uniqueDependencies.size());
     return true;
 }
 

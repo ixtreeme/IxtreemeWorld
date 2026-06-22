@@ -495,6 +495,7 @@ add_subdirectory(libs/platform)
 add_subdirectory(libs/asset)
 add_subdirectory(libs/import_export)
 add_subdirectory(libs/render)
+add_subdirectory(libs/prefab)
 add_subdirectory(libs/mesh_system)
 add_subdirectory(libs/terrain_editor_system)
 add_subdirectory(libs/selection_system)
@@ -511,6 +512,7 @@ foreach(_ixengine_target IN ITEMS
     IXEngineAsset
     IXEngineImportExport
     IXEngineRender
+    IXEnginePrefab
     IXEngineMeshSystem
     IXEngineTerrainEditorSystem
     IXEngineSelectionSystem

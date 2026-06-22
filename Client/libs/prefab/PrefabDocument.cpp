@@ -1,0 +1,442 @@
+#include "PrefabDocument.h"
+
+#include "Common.h"
+
+#include <algorithm>
+#include <cstdlib>
+#include <sstream>
+
+namespace ixtreeme::prefab
+{
+namespace
+{
+std::uint32_t JsonU32Value(const std::string& object, const std::string& key, std::uint32_t fallback = 0)
+{
+    const float value = ixtreeme::common::JsonFloatValue(object, key, static_cast<float>(fallback));
+    return value < 0.0f ? fallback : static_cast<std::uint32_t>(value);
+}
+
+std::size_t FindMatchingBracket(const std::string& text, std::size_t open, char openCh, char closeCh)
+{
+    bool inString = false;
+    bool escaping = false;
+    int depth = 0;
+    for (std::size_t i = open; i < text.size(); ++i)
+    {
+        const char ch = text[i];
+        if (inString)
+        {
+            if (escaping)
+            {
+                escaping = false;
+            }
+            else if (ch == '\\')
+            {
+                escaping = true;
+            }
+            else if (ch == '"')
+            {
+                inString = false;
+            }
+            continue;
+        }
+        if (ch == '"')
+        {
+            inString = true;
+            continue;
+        }
+        if (ch == openCh)
+            ++depth;
+        else if (ch == closeCh)
+        {
+            --depth;
+            if (depth == 0)
+                return i;
+        }
+    }
+    return std::string::npos;
+}
+
+std::string ExtractNamedObject(const std::string& text, const std::string& key)
+{
+    const std::string needle = "\"" + key + "\"";
+    const std::size_t keyPos = text.find(needle);
+    if (keyPos == std::string::npos)
+        return {};
+    const std::size_t open = text.find('{', keyPos + needle.size());
+    if (open == std::string::npos)
+        return {};
+    const std::size_t close = FindMatchingBracket(text, open, '{', '}');
+    return close == std::string::npos ? std::string{} : text.substr(open, close - open + 1);
+}
+
+std::vector<std::string> ExtractNamedArrayObjects(const std::string& text, const std::string& key)
+{
+    std::vector<std::string> objects;
+    const std::string needle = "\"" + key + "\"";
+    const std::size_t keyPos = text.find(needle);
+    if (keyPos == std::string::npos)
+        return objects;
+    const std::size_t openArray = text.find('[', keyPos + needle.size());
+    if (openArray == std::string::npos)
+        return objects;
+    const std::size_t closeArray = FindMatchingBracket(text, openArray, '[', ']');
+    if (closeArray == std::string::npos)
+        return objects;
+
+    std::size_t cursor = openArray + 1;
+    while (cursor < closeArray)
+    {
+        const std::size_t openObject = text.find('{', cursor);
+        if (openObject == std::string::npos || openObject >= closeArray)
+            break;
+        const std::size_t closeObject = FindMatchingBracket(text, openObject, '{', '}');
+        if (closeObject == std::string::npos || closeObject > closeArray)
+            break;
+        objects.push_back(text.substr(openObject, closeObject - openObject + 1));
+        cursor = closeObject + 1;
+    }
+    return objects;
+}
+
+void WriteMaterials(std::ostream& out, const std::vector<std::string>& materials, const std::string& indent)
+{
+    if (materials.empty())
+        return;
+    out << ",\n";
+    out << indent << "\"materials\": [";
+    for (std::size_t i = 0; i < materials.size(); ++i)
+    {
+        if (i)
+            out << ", ";
+        out << "\"" << ixtreeme::common::EscapeJson(materials[i]) << "\"";
+    }
+    out << "]";
+}
+
+void WriteMaterialOverride(std::ostream& out,
+                           const MeshSceneEntity::MaterialOverride& material,
+                           const std::string& indent,
+                           bool comma)
+{
+    out << indent << "{\n";
+    out << indent << "  \"slot\": " << material.slot << ",\n";
+    out << indent << "  \"enabled\": " << (material.enabled ? "true" : "false") << ",\n";
+    out << indent << "  \"base_color\": " << FloatArray(material.baseColor, 4) << ",\n";
+    out << indent << "  \"metallic\": " << material.metallic << ",\n";
+    out << indent << "  \"roughness\": " << material.roughness << ",\n";
+    out << indent << "  \"normal_strength\": " << material.normalStrength << ",\n";
+    out << indent << "  \"ao_strength\": " << material.aoStrength << ",\n";
+    out << indent << "  \"emissive\": " << FloatArray(material.emissive, 3) << ",\n";
+    out << indent << "  \"emissive_intensity\": " << material.emissiveIntensity << ",\n";
+    out << indent << "  \"uv_tiling\": " << FloatArray(material.uvTiling, 2) << ",\n";
+    out << indent << "  \"uv_offset\": " << FloatArray(material.uvOffset, 2) << "\n";
+    out << indent << "}" << (comma ? "," : "") << "\n";
+}
+
+void WriteMaterialOverrides(std::ostream& out,
+                            const std::vector<MeshSceneEntity::MaterialOverride>& overrides,
+                            const std::string& indent)
+{
+    if (overrides.empty())
+        return;
+    out << ",\n";
+    out << indent << "\"material_overrides\": [\n";
+    for (std::size_t i = 0; i < overrides.size(); ++i)
+        WriteMaterialOverride(out, overrides[i], indent + "  ", i + 1 < overrides.size());
+    out << indent << "]";
+}
+
+MeshSceneEntity::MaterialOverride ReadMaterialOverride(const std::string& object)
+{
+    MeshSceneEntity::MaterialOverride material;
+    material.slot = JsonU32Value(object, "slot", material.slot);
+    material.enabled = ixtreeme::common::JsonBoolValue(object, "enabled", material.enabled);
+    ixtreeme::common::JsonFloatArrayValue(object, "base_color", material.baseColor, 4);
+    material.metallic = ixtreeme::common::JsonFloatValue(object, "metallic", material.metallic);
+    material.roughness = ixtreeme::common::JsonFloatValue(object, "roughness", material.roughness);
+    material.normalStrength = ixtreeme::common::JsonFloatValue(object, "normal_strength", material.normalStrength);
+    material.aoStrength = ixtreeme::common::JsonFloatValue(object, "ao_strength", material.aoStrength);
+    ixtreeme::common::JsonFloatArrayValue(object, "emissive", material.emissive, 3);
+    material.emissiveIntensity = ixtreeme::common::JsonFloatValue(object, "emissive_intensity", material.emissiveIntensity);
+    ixtreeme::common::JsonFloatArrayValue(object, "uv_tiling", material.uvTiling, 2);
+    ixtreeme::common::JsonFloatArrayValue(object, "uv_offset", material.uvOffset, 2);
+    return material;
+}
+
+std::string PrefabAssetIdForSave(const std::string& legacyAssetId, const PrefabInstanceState& prefab)
+{
+    return !prefab.assetId.empty() ? prefab.assetId : legacyAssetId;
+}
+
+void WritePrefabInstance(std::ostream& out,
+                         const std::string& legacyAssetId,
+                         const PrefabInstanceState& prefab,
+                         const std::string& indent)
+{
+    const std::string assetId = PrefabAssetIdForSave(legacyAssetId, prefab);
+    if (assetId.empty())
+        return;
+
+    out << indent << "\"prefab_asset_id\": \"" << ixtreeme::common::EscapeJson(assetId) << "\",\n";
+    out << indent << "\"prefab_instance\": {\n";
+    out << indent << "  \"linked\": " << (prefab.linked || !assetId.empty() ? "true" : "false") << ",\n";
+    out << indent << "  \"asset_id\": \"" << ixtreeme::common::EscapeJson(assetId) << "\",\n";
+    out << indent << "  \"local_id\": " << (prefab.localId == 0 ? 1u : prefab.localId) << ",\n";
+    out << indent << "  \"preserve_transform\": " << (prefab.preserveTransform ? "true" : "false") << ",\n";
+    out << indent << "  \"name_override\": " << (prefab.nameOverride ? "true" : "false") << "\n";
+    out << indent << "},\n";
+}
+
+PrefabInstanceState ReadPrefabInstance(const std::string& object, const std::string& legacyAssetId)
+{
+    PrefabInstanceState prefab;
+    prefab.assetId = legacyAssetId;
+    const std::string instanceObject = ExtractNamedObject(object, "prefab_instance");
+    if (!instanceObject.empty())
+    {
+        prefab.linked = ixtreeme::common::JsonBoolValue(instanceObject, "linked", !prefab.assetId.empty());
+        prefab.assetId = ixtreeme::common::JsonStringValue(instanceObject, "asset_id");
+        if (prefab.assetId.empty())
+            prefab.assetId = legacyAssetId;
+        prefab.localId = JsonU32Value(instanceObject, "local_id", 1);
+        prefab.preserveTransform = ixtreeme::common::JsonBoolValue(instanceObject, "preserve_transform", true);
+        prefab.nameOverride = ixtreeme::common::JsonBoolValue(instanceObject, "name_override", true);
+    }
+    else
+    {
+        prefab.linked = !prefab.assetId.empty();
+    }
+    return prefab;
+}
+
+void WriteMeshObject(std::ostream& out, const MeshSceneEntity& mesh, const std::string& displayName, const std::string& indent)
+{
+    WritePrefabInstance(out, mesh.prefabAssetId, mesh.prefabInstance, indent);
+    out << indent << "\"type\": \"mesh_entity\",\n";
+    out << indent << "\"name\": \"" << ixtreeme::common::EscapeJson(displayName) << "\",\n";
+    out << indent << "\"mesh_asset_id\": \"" << ixtreeme::common::EscapeJson(mesh.meshAssetId) << "\",\n";
+    out << indent << "\"mesh_asset_path\": \"" << ixtreeme::common::EscapeJson(mesh.meshAssetPath) << "\",\n";
+    out << indent << "\"position\": " << FloatArray(mesh.position, 3) << ",\n";
+    out << indent << "\"rotation\": " << FloatArray(mesh.rotation, 3) << ",\n";
+    out << indent << "\"scale\": " << FloatArray(mesh.scale, 3) << ",\n";
+    out << indent << "\"skinned\": " << (mesh.skinned ? "true" : "false");
+    WriteMaterials(out, mesh.materialSlots, indent);
+    WriteMaterialOverrides(out, mesh.materialOverrides, indent);
+    out << "\n";
+}
+
+void WritePointObject(std::ostream& out, const PointLight& light, const std::string& displayName, const std::string& indent)
+{
+    const float color[3] = {light.r, light.g, light.b};
+    WritePrefabInstance(out, light.prefabAssetId, light.prefabInstance, indent);
+    out << indent << "\"type\": \"dynamic_light\",\n";
+    out << indent << "\"light_type\": \"point\",\n";
+    out << indent << "\"name\": \"" << ixtreeme::common::EscapeJson(displayName) << "\",\n";
+    out << indent << "\"position\": " << FloatArray(light.position, 3) << ",\n";
+    out << indent << "\"color\": " << FloatArray(color, 3) << ",\n";
+    out << indent << "\"intensity\": " << light.intensity << ",\n";
+    out << indent << "\"radius\": " << light.radius << ",\n";
+    out << indent << "\"enabled\": " << (light.enabled ? "true" : "false") << "\n";
+}
+
+void WriteSpotObject(std::ostream& out, const SpotLight& light, const std::string& displayName, const std::string& indent)
+{
+    const float color[3] = {light.r, light.g, light.b};
+    WritePrefabInstance(out, light.prefabAssetId, light.prefabInstance, indent);
+    out << indent << "\"type\": \"dynamic_light\",\n";
+    out << indent << "\"light_type\": \"spot\",\n";
+    out << indent << "\"name\": \"" << ixtreeme::common::EscapeJson(displayName) << "\",\n";
+    out << indent << "\"position\": " << FloatArray(light.position, 3) << ",\n";
+    out << indent << "\"rotation\": " << FloatArray(light.rotation, 3) << ",\n";
+    out << indent << "\"color\": " << FloatArray(color, 3) << ",\n";
+    out << indent << "\"intensity\": " << light.intensity << ",\n";
+    out << indent << "\"radius\": " << light.radius << ",\n";
+    out << indent << "\"inner_cone_deg\": " << light.innerConeDegrees << ",\n";
+    out << indent << "\"outer_cone_deg\": " << light.outerConeDegrees << ",\n";
+    out << indent << "\"enabled\": " << (light.enabled ? "true" : "false") << "\n";
+}
+
+PrefabEntity ParseEntityObject(const std::string& object, const std::string& fallbackName)
+{
+    PrefabEntity entity;
+    entity.localId = JsonU32Value(object, "local_id", 1);
+    entity.parentLocalId = JsonU32Value(object, "parent_local_id", 0);
+    entity.name = ixtreeme::common::JsonStringValue(object, "name");
+    if (entity.name.empty())
+        entity.name = fallbackName;
+
+    const std::string type = ixtreeme::common::JsonStringValue(object, "type");
+    if (type == "mesh_entity")
+    {
+        entity.kind = PrefabTemplate::Kind::Mesh;
+        entity.mesh.name = entity.name;
+        entity.mesh.prefabAssetId = ixtreeme::common::JsonStringValue(object, "prefab_asset_id");
+        entity.mesh.prefabInstance = ReadPrefabInstance(object, entity.mesh.prefabAssetId);
+        entity.mesh.meshAssetId = ixtreeme::common::JsonStringValue(object, "mesh_asset_id");
+        entity.mesh.meshAssetPath = ixtreeme::common::JsonStringValue(object, "mesh_asset_path");
+        if (entity.mesh.meshAssetPath.empty())
+            entity.mesh.meshAssetPath = entity.mesh.meshAssetId;
+        ixtreeme::common::JsonFloatArrayValue(object, "position", entity.mesh.position, 3);
+        ixtreeme::common::JsonFloatArrayValue(object, "rotation", entity.mesh.rotation, 3);
+        ixtreeme::common::JsonFloatArrayValue(object, "scale", entity.mesh.scale, 3);
+        entity.mesh.skinned = ixtreeme::common::JsonBoolValue(object, "skinned", entity.mesh.skinned);
+        entity.mesh.materialSlots = ixtreeme::common::JsonStringArrayValue(object, "materials");
+        const std::vector<std::string> materialOverrides = ExtractNamedArrayObjects(object, "material_overrides");
+        for (const std::string& materialOverride : materialOverrides)
+            entity.mesh.materialOverrides.push_back(ReadMaterialOverride(materialOverride));
+        return entity;
+    }
+
+    if (type == "dynamic_light")
+    {
+        const std::string lightType = ixtreeme::common::JsonStringValue(object, "light_type");
+        if (lightType == "point")
+        {
+            entity.kind = PrefabTemplate::Kind::PointLight;
+            entity.point.name = entity.name;
+            entity.point.prefabAssetId = ixtreeme::common::JsonStringValue(object, "prefab_asset_id");
+            entity.point.prefabInstance = ReadPrefabInstance(object, entity.point.prefabAssetId);
+            ixtreeme::common::JsonFloatArrayValue(object, "position", entity.point.position, 3);
+            float color[3] = {entity.point.r, entity.point.g, entity.point.b};
+            ixtreeme::common::JsonFloatArrayValue(object, "color", color, 3);
+            entity.point.r = color[0];
+            entity.point.g = color[1];
+            entity.point.b = color[2];
+            entity.point.intensity = ixtreeme::common::JsonFloatValue(object, "intensity", entity.point.intensity);
+            entity.point.radius = ixtreeme::common::JsonFloatValue(object, "radius", entity.point.radius);
+            entity.point.enabled = ixtreeme::common::JsonBoolValue(object, "enabled", entity.point.enabled);
+            return entity;
+        }
+        if (lightType == "spot")
+        {
+            entity.kind = PrefabTemplate::Kind::SpotLight;
+            entity.spot.name = entity.name;
+            entity.spot.prefabAssetId = ixtreeme::common::JsonStringValue(object, "prefab_asset_id");
+            entity.spot.prefabInstance = ReadPrefabInstance(object, entity.spot.prefabAssetId);
+            ixtreeme::common::JsonFloatArrayValue(object, "position", entity.spot.position, 3);
+            ixtreeme::common::JsonFloatArrayValue(object, "rotation", entity.spot.rotation, 3);
+            float color[3] = {entity.spot.r, entity.spot.g, entity.spot.b};
+            ixtreeme::common::JsonFloatArrayValue(object, "color", color, 3);
+            entity.spot.r = color[0];
+            entity.spot.g = color[1];
+            entity.spot.b = color[2];
+            entity.spot.intensity = ixtreeme::common::JsonFloatValue(object, "intensity", entity.spot.intensity);
+            entity.spot.radius = ixtreeme::common::JsonFloatValue(object, "radius", entity.spot.radius);
+            entity.spot.innerConeDegrees = ixtreeme::common::JsonFloatValue(object, "inner_cone_deg", entity.spot.innerConeDegrees);
+            entity.spot.outerConeDegrees = ixtreeme::common::JsonFloatValue(object, "outer_cone_deg", entity.spot.outerConeDegrees);
+            entity.spot.enabled = ixtreeme::common::JsonBoolValue(object, "enabled", entity.spot.enabled);
+            return entity;
+        }
+    }
+
+    return entity;
+}
+} // namespace
+
+std::string FloatArray(const float* values, std::size_t count)
+{
+    std::ostringstream out;
+    out << "[";
+    for (std::size_t i = 0; i < count; ++i)
+    {
+        if (i)
+            out << ", ";
+        out << values[i];
+    }
+    out << "]";
+    return out.str();
+}
+
+void WriteMesh(std::ostream& out, const MeshSceneEntity& mesh, const std::string& displayName)
+{
+    out << "  \"entity\": {\n";
+    WriteMeshObject(out, mesh, displayName, "    ");
+    out << "  }\n";
+}
+
+void WritePointLight(std::ostream& out, const PointLight& light, const std::string& displayName)
+{
+    const float color[3] = {light.r, light.g, light.b};
+    out << "  \"entity\": {\n";
+    (void)color;
+    WritePointObject(out, light, displayName, "    ");
+    out << "  }\n";
+}
+
+void WriteSpotLight(std::ostream& out, const SpotLight& light, const std::string& displayName)
+{
+    const float color[3] = {light.r, light.g, light.b};
+    out << "  \"entity\": {\n";
+    (void)color;
+    WriteSpotObject(out, light, displayName, "    ");
+    out << "  }\n";
+}
+
+void WriteDocument(std::ostream& out, const PrefabDocument& document)
+{
+    out << "{\n";
+    out << "  \"version\": 2,\n";
+    out << "  \"name\": \"" << ixtreeme::common::EscapeJson(document.name.empty() ? "Prefab" : document.name) << "\",\n";
+    out << "  \"entities\": [\n";
+    for (std::size_t i = 0; i < document.entities.size(); ++i)
+    {
+        const PrefabEntity& entity = document.entities[i];
+        out << "    {\n";
+        out << "      \"local_id\": " << (entity.localId == 0 ? static_cast<std::uint32_t>(i + 1) : entity.localId) << ",\n";
+        out << "      \"parent_local_id\": " << entity.parentLocalId << ",\n";
+        if (entity.kind == PrefabTemplate::Kind::Mesh)
+            WriteMeshObject(out, entity.mesh, entity.name.empty() ? entity.mesh.name : entity.name, "      ");
+        else if (entity.kind == PrefabTemplate::Kind::PointLight)
+            WritePointObject(out, entity.point, entity.name.empty() ? entity.point.name : entity.name, "      ");
+        else if (entity.kind == PrefabTemplate::Kind::SpotLight)
+            WriteSpotObject(out, entity.spot, entity.name.empty() ? entity.spot.name : entity.name, "      ");
+        out << "    }" << (i + 1 < document.entities.size() ? "," : "") << "\n";
+    }
+    out << "  ]\n";
+    out << "}\n";
+}
+
+PrefabDocument ParseDocument(const std::string& text, const std::string& fallbackName)
+{
+    PrefabDocument document;
+    document.name = ixtreeme::common::JsonStringValue(text, "name");
+    if (document.name.empty())
+        document.name = fallbackName;
+
+    std::vector<std::string> entityObjects = ExtractNamedArrayObjects(text, "entities");
+    if (entityObjects.empty())
+    {
+        std::string legacy = ExtractNamedObject(text, "entity");
+        if (legacy.empty())
+            legacy = text;
+        entityObjects.push_back(std::move(legacy));
+    }
+
+    for (std::string& object : entityObjects)
+    {
+        PrefabEntity entity = ParseEntityObject(object, document.name);
+        if (entity.kind != PrefabTemplate::Kind::Unsupported)
+            document.entities.push_back(std::move(entity));
+    }
+    return document;
+}
+
+PrefabTemplate ParseTemplate(const std::string& text, const std::string& fallbackName)
+{
+    PrefabTemplate prefab{};
+    const PrefabDocument document = ParseDocument(text, fallbackName);
+    prefab.name = document.name.empty() ? fallbackName : document.name;
+    if (document.entities.empty())
+        return prefab;
+
+    const PrefabEntity& entity = document.entities.front();
+    prefab.kind = entity.kind;
+    prefab.name = entity.name.empty() ? prefab.name : entity.name;
+    prefab.mesh = entity.mesh;
+    prefab.point = entity.point;
+    prefab.spot = entity.spot;
+    return prefab;
+}
+
+} // namespace ixtreeme::prefab

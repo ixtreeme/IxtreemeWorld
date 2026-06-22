@@ -157,7 +157,9 @@ std::vector<SelectionOutlineRenderer::Line> BuildSelectionOutlineLines(
 
 std::vector<SelectionOutlineRenderer::Line> BuildEditorLightShapeLines(
     const std::vector<PointLight>& pointLights,
-    const std::vector<SpotLight>& spotLights);
+    const std::vector<SpotLight>& spotLights,
+    const SelectedEditorObject& selected,
+    bool showAllLightBounds = false);
 
 SceneGizmoTarget BuildSceneGizmoTarget(const SelectedEditorObject& selected,
                                        const std::vector<MeshSceneEntity>& meshes,

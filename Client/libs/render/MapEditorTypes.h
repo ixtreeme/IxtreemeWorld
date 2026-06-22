@@ -102,10 +102,62 @@ struct AmbientLight
 constexpr std::uint32_t kMaxDynamicPointLights = 16;
 constexpr std::uint32_t kMaxDynamicSpotLights = 16;
 
+struct PrefabInstanceState
+{
+    bool linked = false;
+    std::string assetId;
+    std::uint32_t localId = 1;
+    bool preserveTransform = true;
+    bool nameOverride = true;
+};
+
+struct SceneParentRef
+{
+    std::string type;
+    std::uint32_t id = 0;
+
+    bool IsValid() const { return !type.empty() && id != 0; }
+};
+
+struct PrefabAssetEntityNameEdit
+{
+    std::uint32_t localId = 0;
+    std::uint32_t parentLocalId = 0;
+    std::string type;
+    std::string lightType;
+    std::string name;
+    std::string meshAssetId;
+    std::string meshAssetPath;
+    std::string prefabAssetId;
+    std::vector<std::string> materialSlots;
+    bool transformValid = false;
+    float position[3] = {0.0f, 0.0f, 0.0f};
+    float rotation[3] = {0.0f, 0.0f, 0.0f};
+    float scale[3] = {1.0f, 1.0f, 1.0f};
+    bool lightValid = false;
+    float color[3] = {1.0f, 1.0f, 1.0f};
+    float intensity = 1.0f;
+    float radius = 1.0f;
+    float innerConeDegrees = 20.0f;
+    float outerConeDegrees = 35.0f;
+    bool enabled = true;
+};
+
+inline PrefabInstanceState MakePrefabInstanceState(const std::string& assetId)
+{
+    PrefabInstanceState state;
+    state.linked = !assetId.empty();
+    state.assetId = assetId;
+    return state;
+}
+
 struct PointLight
 {
     std::uint32_t id = 0;
     std::string name;
+    std::string prefabAssetId;
+    PrefabInstanceState prefabInstance;
+    SceneParentRef parent;
     float position[3] = {0.0f, 0.0f, 0.0f};
     float r = 1.0f;
     float g = 0.95f;
@@ -120,6 +172,9 @@ struct SpotLight
 {
     std::uint32_t id = 0;
     std::string name;
+    std::string prefabAssetId;
+    PrefabInstanceState prefabInstance;
+    SceneParentRef parent;
     float position[3] = {0.0f, 0.0f, 0.0f};
     float rotation[3] = {-1.5708f, 0.0f, 0.0f};
     float r = 1.0f;
@@ -261,6 +316,9 @@ struct MeshSceneEntity
 {
     std::uint32_t id = 0;
     std::string name;
+    std::string prefabAssetId;
+    PrefabInstanceState prefabInstance;
+    SceneParentRef parent;
     std::string meshAssetId;
     std::string meshAssetPath;
     float position[3] = {0.0f, 0.0f, 0.0f};
@@ -339,6 +397,8 @@ struct HierarchySceneEntity
     HierarchyEntityType type = HierarchyEntityType::None;
     std::uint32_t objectId = 0;
     std::string name;
+    bool prefabRoot = false;
+    std::string prefabAssetId;
     bool editorHidden = false;
     bool selected = false;
 };
@@ -363,6 +423,9 @@ struct MeshRendererEditorState
     std::uint32_t id = 0;
     std::uint32_t count = 0;
     std::string name;
+    std::string prefabAssetId;
+    PrefabInstanceState prefabInstance;
+    std::vector<std::string> prefabOverrides;
     std::string meshAssetId;
     std::string meshAssetPath;
     std::string meshDisplayName;
@@ -414,6 +477,7 @@ struct DynamicLightEditorState
     std::uint32_t id = 0;
     std::uint32_t pointCount = 0;
     std::uint32_t spotCount = 0;
+    std::vector<std::string> prefabOverrides;
     PointLight point;
     SpotLight spot;
 };
@@ -468,6 +532,23 @@ struct MapEditorCommands
     float meshDropScreenPosition[2] = {0.0f, 0.0f};
     bool addPrimitiveEntity = false;
     std::string primitiveType;
+    bool addPrefabInstance = false;
+    std::string prefabAssetId;
+    bool prefabDropScreenPositionValid = false;
+    float prefabDropScreenPosition[2] = {0.0f, 0.0f};
+    bool createPrefabFromSelection = false;
+    bool refreshSelectedPrefabInstance = false;
+    bool refreshAllPrefabInstances = false;
+    bool revertSelectedPrefabInstance = false;
+    bool applySelectedPrefabToAsset = false;
+    bool revertSelectedPrefabOverride = false;
+    bool applySelectedPrefabOverrideToAsset = false;
+    std::string selectedPrefabOverrideName;
+    bool unpackSelectedPrefabInstance = false;
+    bool savePrefabAssetEdit = false;
+    std::string editPrefabAssetId;
+    std::string editPrefabName;
+    std::vector<PrefabAssetEntityNameEdit> editPrefabEntityNames;
     bool addComponentToSelectedEntity = false;
     EditorComponentType addComponentType = EditorComponentType::None;
     std::string addComponentTypeId;
@@ -498,9 +579,12 @@ struct MapEditorCommands
     bool hierarchyDuplicateEntity = false;
     bool hierarchyRenameEntity = false;
     bool hierarchyToggleHidden = false;
+    bool hierarchyReparentEntity = false;
     HierarchyEntityType hierarchyEntityType = HierarchyEntityType::None;
     std::uint32_t hierarchyEntityId = 0;
     std::uint64_t hierarchyEntityHandle = 0;
+    HierarchyEntityType hierarchyParentType = HierarchyEntityType::None;
+    std::uint32_t hierarchyParentId = 0;
     std::string hierarchyRenameValue;
     bool exportMeshEntityToFbx = false;
     std::uint32_t exportMeshEntityId = 0;
