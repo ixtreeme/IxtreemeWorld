@@ -187,6 +187,8 @@ void WriteCollider(std::ostream& out, const ixtreeme::physics::ColliderComponent
     out << indent << "  \"size\": " << FloatArray(collider.size, 3) << ",\n";
     out << indent << "  \"radius\": " << collider.radius << ",\n";
     out << indent << "  \"height\": " << collider.height << ",\n";
+    out << indent << "  \"friction\": " << collider.friction << ",\n";
+    out << indent << "  \"restitution\": " << collider.restitution << ",\n";
     out << indent << "  \"material_asset_id\": \"" << ixtreeme::common::EscapeJson(collider.materialAssetId) << "\"\n";
     out << indent << "}";
 }
@@ -222,6 +224,8 @@ ixtreeme::physics::ColliderComponent ReadCollider(const std::string& object)
     ixtreeme::common::JsonFloatArrayValue(component, "size", collider.size, 3);
     collider.radius = ixtreeme::common::JsonFloatValue(component, "radius", collider.radius);
     collider.height = ixtreeme::common::JsonFloatValue(component, "height", collider.height);
+    collider.friction = ixtreeme::common::JsonFloatValue(component, "friction", collider.friction);
+    collider.restitution = ixtreeme::common::JsonFloatValue(component, "restitution", collider.restitution);
     collider.materialAssetId = ixtreeme::common::JsonStringValue(component, "material_asset_id");
     ixtreeme::physics::Sanitize(collider);
     return collider;

@@ -17,6 +17,7 @@
 #include "MeshSystem.h"
 #include "NativeWindow.h"
 #include "EditorImGui.h"
+#include "physics/PhysicsWorld.h"
 #if defined(_WIN32)
 #include "NativeWindow_Win32.h"
 #endif
@@ -81,6 +82,7 @@ namespace
 {
 namespace xm = ixtreeme::math;
 namespace prefab = ixtreeme::prefab;
+namespace phys = ixtreeme::physics;
 
 const char* InputEventTypeName(InputEvent::Type type)
 {
@@ -810,6 +812,185 @@ bool LoadRuntimeScene(client::asset::IAssetReader& assets, const std::string& sc
     return SceneManager::Instance().LoadScene(scenePath.string());
 }
 
+phys::PhysicsTransform PhysicsTransformFromMesh(const MeshSceneEntity& mesh)
+{
+    phys::PhysicsTransform transform{};
+    transform.position[0] = mesh.position[0];
+    transform.position[1] = mesh.position[1];
+    transform.position[2] = mesh.position[2];
+    const xm::Quat rotation = xm::FromEulerRadians({mesh.rotation[0], mesh.rotation[1], mesh.rotation[2]});
+    transform.rotation[0] = rotation.x;
+    transform.rotation[1] = rotation.y;
+    transform.rotation[2] = rotation.z;
+    transform.rotation[3] = rotation.w;
+    return transform;
+}
+
+bool ApplyPhysicsTransformToMesh(const phys::PhysicsTransform& transform, MeshSceneEntity& mesh)
+{
+    constexpr float kPositionEpsilon = 0.0005f;
+    constexpr float kRotationEpsilon = 0.0005f;
+    const xm::Quat bodyRotation{
+        transform.rotation[0],
+        transform.rotation[1],
+        transform.rotation[2],
+        transform.rotation[3]};
+    const xm::Vec3 position{transform.position[0], transform.position[1], transform.position[2]};
+    const xm::Vec3 rotation = xm::ToEulerRadians(bodyRotation);
+    const bool changed =
+        xm::Abs(mesh.position[0] - position.x) > kPositionEpsilon ||
+        xm::Abs(mesh.position[1] - position.y) > kPositionEpsilon ||
+        xm::Abs(mesh.position[2] - position.z) > kPositionEpsilon ||
+        xm::Abs(mesh.rotation[0] - rotation.x) > kRotationEpsilon ||
+        xm::Abs(mesh.rotation[1] - rotation.y) > kRotationEpsilon ||
+        xm::Abs(mesh.rotation[2] - rotation.z) > kRotationEpsilon;
+    if (!changed)
+        return false;
+    mesh.position[0] = position.x;
+    mesh.position[1] = position.y;
+    mesh.position[2] = position.z;
+    mesh.rotation[0] = rotation.x;
+    mesh.rotation[1] = rotation.y;
+    mesh.rotation[2] = rotation.z;
+    return true;
+}
+
+WorldVec3 TransformColliderLocalPoint(const MeshSceneEntity& mesh, WorldVec3 local)
+{
+    xm::Mat4 model = xm::MultiplyRowMajor(
+        xm::MultiplyRowMajor(
+            xm::MultiplyRowMajor(
+                xm::MultiplyRowMajor(xm::Scale({mesh.scale[0], mesh.scale[1], mesh.scale[2]}),
+                    xm::RotationX(mesh.rotation[0])),
+                xm::RotationYRowMajor(mesh.rotation[1])),
+            xm::RotationZ(mesh.rotation[2])),
+        xm::Translation({mesh.position[0], mesh.position[1], mesh.position[2]}));
+    const xm::Vec3 world = xm::TransformPointRowVector(model.m, {local.x, local.y, local.z});
+    return {world.x, world.y, world.z};
+}
+
+void AddColliderCircle(std::vector<SelectionOutlineRenderer::Line>& lines,
+                       const MeshSceneEntity& mesh,
+                       WorldVec3 center,
+                       WorldVec3 axisA,
+                       WorldVec3 axisB,
+                       float radius,
+                       const std::array<float, 4>& color,
+                       int segments = 32)
+{
+    WorldVec3 previous{};
+    WorldVec3 first{};
+    bool hasPrevious = false;
+    for (int i = 0; i < segments; ++i)
+    {
+        const float angle = (static_cast<float>(i) / static_cast<float>(segments)) * xm::TwoPi;
+        const WorldVec3 local = center + axisA * (xm::Cos(angle) * radius) + axisB * (xm::Sin(angle) * radius);
+        const WorldVec3 point = TransformColliderLocalPoint(mesh, local);
+        if (!hasPrevious)
+            first = point;
+        else
+            lines.push_back({previous, point, color});
+        previous = point;
+        hasPrevious = true;
+    }
+    if (hasPrevious)
+        lines.push_back({previous, first, color});
+}
+
+std::array<float, 4> ColliderDebugColor(const MeshSceneEntity& mesh)
+{
+    if (mesh.hasCollider && mesh.collider.trigger)
+        return {1.0f, 0.62f, 0.10f, 0.88f};
+    if (mesh.hasRigidbody && mesh.rigidbody.bodyType == phys::BodyType::Dynamic)
+        return {0.24f, 0.92f, 0.38f, 0.88f};
+    return {0.24f, 0.66f, 1.0f, 0.80f};
+}
+
+void AppendColliderLines(
+    std::vector<SelectionOutlineRenderer::Line>& lines,
+    const MeshSceneEntity& mesh,
+    const std::array<float, 4>& color)
+{
+    if (!mesh.hasCollider || !mesh.collider.enabled)
+        return;
+
+    phys::ColliderComponent collider = mesh.collider;
+    phys::Sanitize(collider);
+    const WorldVec3 center{collider.center[0], collider.center[1], collider.center[2]};
+    if (collider.shape == phys::ColliderShape::Box)
+    {
+        const WorldVec3 half{
+            collider.size[0] * 0.5f,
+            collider.size[1] * 0.5f,
+            collider.size[2] * 0.5f};
+        const std::array<WorldVec3, 8> corners{{
+            TransformColliderLocalPoint(mesh, center + WorldVec3{-half.x, -half.y, -half.z}),
+            TransformColliderLocalPoint(mesh, center + WorldVec3{ half.x, -half.y, -half.z}),
+            TransformColliderLocalPoint(mesh, center + WorldVec3{-half.x,  half.y, -half.z}),
+            TransformColliderLocalPoint(mesh, center + WorldVec3{ half.x,  half.y, -half.z}),
+            TransformColliderLocalPoint(mesh, center + WorldVec3{-half.x, -half.y,  half.z}),
+            TransformColliderLocalPoint(mesh, center + WorldVec3{ half.x, -half.y,  half.z}),
+            TransformColliderLocalPoint(mesh, center + WorldVec3{-half.x,  half.y,  half.z}),
+            TransformColliderLocalPoint(mesh, center + WorldVec3{ half.x,  half.y,  half.z}),
+        }};
+        constexpr std::array<std::array<int, 2>, 12> edges{{
+            {{0, 1}}, {{0, 2}}, {{1, 3}}, {{2, 3}},
+            {{4, 5}}, {{4, 6}}, {{5, 7}}, {{6, 7}},
+            {{0, 4}}, {{1, 5}}, {{2, 6}}, {{3, 7}},
+        }};
+        for (const auto& edge : edges)
+            lines.push_back({corners[edge[0]], corners[edge[1]], color});
+    }
+    else if (collider.shape == phys::ColliderShape::Sphere)
+    {
+        AddColliderCircle(lines, mesh, center, {1.0f, 0.0f, 0.0f}, {0.0f, 1.0f, 0.0f}, collider.radius, color);
+        AddColliderCircle(lines, mesh, center, {1.0f, 0.0f, 0.0f}, {0.0f, 0.0f, 1.0f}, collider.radius, color);
+        AddColliderCircle(lines, mesh, center, {0.0f, 1.0f, 0.0f}, {0.0f, 0.0f, 1.0f}, collider.radius, color);
+    }
+    else
+    {
+        const float halfCylinder = std::max(0.0f, (collider.height - collider.radius * 2.0f) * 0.5f);
+        const WorldVec3 top = center + WorldVec3{0.0f, halfCylinder, 0.0f};
+        const WorldVec3 bottom = center - WorldVec3{0.0f, halfCylinder, 0.0f};
+        AddColliderCircle(lines, mesh, top, {1.0f, 0.0f, 0.0f}, {0.0f, 0.0f, 1.0f}, collider.radius, color);
+        AddColliderCircle(lines, mesh, bottom, {1.0f, 0.0f, 0.0f}, {0.0f, 0.0f, 1.0f}, collider.radius, color);
+        AddColliderCircle(lines, mesh, center, {1.0f, 0.0f, 0.0f}, {0.0f, 1.0f, 0.0f}, collider.radius, color, 24);
+        AddColliderCircle(lines, mesh, center, {0.0f, 0.0f, 1.0f}, {0.0f, 1.0f, 0.0f}, collider.radius, color, 24);
+        for (const WorldVec3& offset : {WorldVec3{collider.radius, 0.0f, 0.0f},
+                                        WorldVec3{-collider.radius, 0.0f, 0.0f},
+                                        WorldVec3{0.0f, 0.0f, collider.radius},
+                                        WorldVec3{0.0f, 0.0f, -collider.radius}})
+        {
+            lines.push_back({
+                TransformColliderLocalPoint(mesh, bottom + offset),
+                TransformColliderLocalPoint(mesh, top + offset),
+                color});
+        }
+    }
+}
+
+std::vector<SelectionOutlineRenderer::Line> BuildPhysicsColliderLines(
+    const SelectedEditorObject& selected,
+    const std::vector<MeshSceneEntity>& meshes,
+    bool showAllColliders)
+{
+    std::vector<SelectionOutlineRenderer::Line> lines;
+    lines.reserve(showAllColliders ? meshes.size() * 36u : 36u);
+    if (showAllColliders)
+    {
+        for (const MeshSceneEntity& mesh : meshes)
+            AppendColliderLines(lines, mesh, ColliderDebugColor(mesh));
+    }
+    else if (selected.type == SelectedEditorObjectType::MeshEntity)
+    {
+        auto it = std::find_if(meshes.begin(), meshes.end(),
+            [&](const MeshSceneEntity& mesh) { return mesh.id == selected.id; });
+        if (it != meshes.end())
+            AppendColliderLines(lines, *it, {0.95f, 0.82f, 0.18f, 0.95f});
+    }
+    return lines;
+}
+
 void MergeMapEditorCommands(MapEditorCommands& target, const MapEditorCommands& source)
 {
     target.save = target.save || source.save;
@@ -825,6 +1006,7 @@ void MergeMapEditorCommands(MapEditorCommands& target, const MapEditorCommands& 
         target.disableAssetLibraryDiscovery = source.disableAssetLibraryDiscovery;
         target.disableAssetWatcherPoll = source.disableAssetWatcherPoll;
         target.disableHierarchyIteration = source.disableHierarchyIteration;
+        target.showPhysicsColliders = source.showPhysicsColliders;
     }
     if (source.renderResolutionChanged)
     {
@@ -1486,6 +1668,10 @@ int RunGame(NativeWindow& window,
     MPerfMeshesState previousMperfMeshes;
     InstSummaryState previousInstSummary;
     InstBufferState previousInstBuffer;
+    phys::PhysicsWorld editorPhysicsWorld;
+    std::unordered_map<std::uint32_t, phys::BodyId> editorPhysicsBodies;
+    bool editorPhysicsWorldActive = false;
+    std::uint32_t editorPhysicsStepLogFrames = 0;
     std::size_t previousMeshSubmitDetailInstances = 0;
     std::size_t previousMeshSubmitDetailDrawCalls = 0;
     bool previousMeshSubmitDetailInitialized = false;
@@ -1575,11 +1761,202 @@ int RunGame(NativeWindow& window,
         }
         return true;
     };
+    auto fitMeshColliderToBounds = [&](MeshSceneEntity& mesh) {
+        if (!mesh.hasCollider)
+            return false;
+        const std::string runtimePath = resolveMeshRuntimePath(mesh);
+        StaticMeshRenderer* renderer = getStaticMeshRenderer(runtimePath);
+        if (!renderer || !renderer->IsLoaded())
+        {
+            Tracenf("[PHYSICS] collider fit skipped entity=%u name=%s reason=mesh-bounds-unavailable",
+                mesh.id,
+                mesh.name.c_str());
+            return false;
+        }
+
+        const auto& bmin = renderer->BoundsMin();
+        const auto& bmax = renderer->BoundsMax();
+        const float sizeX = std::max(0.001f, bmax[0] - bmin[0]);
+        const float sizeY = std::max(0.001f, bmax[1] - bmin[1]);
+        const float sizeZ = std::max(0.001f, bmax[2] - bmin[2]);
+        mesh.collider.center[0] = (bmin[0] + bmax[0]) * 0.5f;
+        mesh.collider.center[1] = (bmin[1] + bmax[1]) * 0.5f;
+        mesh.collider.center[2] = (bmin[2] + bmax[2]) * 0.5f;
+        if (mesh.collider.shape == phys::ColliderShape::Sphere)
+        {
+            mesh.collider.radius = std::max({sizeX, sizeY, sizeZ}) * 0.5f;
+        }
+        else if (mesh.collider.shape == phys::ColliderShape::Capsule)
+        {
+            mesh.collider.radius = std::max(sizeX, sizeZ) * 0.5f;
+            mesh.collider.height = std::max(sizeY, mesh.collider.radius * 2.0f);
+        }
+        else
+        {
+            mesh.collider.size[0] = sizeX;
+            mesh.collider.size[1] = sizeY;
+            mesh.collider.size[2] = sizeZ;
+        }
+        phys::Sanitize(mesh.collider);
+        Tracenf("[PHYSICS] collider fit entity=%u name=%s shape=%s center=(%.3f,%.3f,%.3f) size=(%.3f,%.3f,%.3f) radius=%.3f height=%.3f",
+            mesh.id,
+            mesh.name.c_str(),
+            phys::ToString(mesh.collider.shape),
+            mesh.collider.center[0],
+            mesh.collider.center[1],
+            mesh.collider.center[2],
+            mesh.collider.size[0],
+            mesh.collider.size[1],
+            mesh.collider.size[2],
+            mesh.collider.radius,
+            mesh.collider.height);
+        return true;
+    };
     auto removeStaticMeshSpatialEntity = [&](std::uint32_t id) {
         staticMeshSelectedLods.erase(id);
         staticMeshLodDispositionStates.erase(id);
+        auto physicsIt = editorPhysicsBodies.find(id);
+        if (physicsIt != editorPhysicsBodies.end())
+        {
+            editorPhysicsWorld.DestroyBody(physicsIt->second);
+            editorPhysicsBodies.erase(physicsIt);
+        }
         if (staticMeshSpatialIndexed.erase(id) > 0)
             staticMeshSpatialIndex.Remove(id);
+    };
+    auto clearEditorPhysicsWorld = [&]() {
+        editorPhysicsBodies.clear();
+        editorPhysicsWorld.Destroy();
+        editorPhysicsWorldActive = false;
+        editorPhysicsStepLogFrames = 0;
+    };
+    auto rebuildEditorPhysicsWorld = [&]() {
+        clearEditorPhysicsWorld();
+        if (!editorPhysicsWorld.Create())
+        {
+            Tracen("[PHYSICS] world create failed");
+            return false;
+        }
+        std::uint32_t createdBodies = 0;
+        std::uint32_t dynamicBodies = 0;
+        std::uint32_t staticBodies = 0;
+        std::uint32_t kinematicBodies = 0;
+        std::uint32_t gravityBodies = 0;
+        if (terrainOk && terrain.HasTerrain())
+        {
+            const TerrainSceneData terrainData = terrain.GetTerrainSceneData();
+            phys::TerrainColliderDesc terrainCollider{};
+            terrainCollider.widthMeters = terrainData.widthMeters;
+            terrainCollider.depthMeters = terrainData.depthMeters;
+            terrainCollider.cellSizeMeters = terrainData.cellSizeMeters;
+            terrainCollider.cellsX = terrainData.cellsX;
+            terrainCollider.cellsZ = terrainData.cellsZ;
+            terrainCollider.heightCmGrid = terrainData.heightCmGrid;
+            const phys::BodyId terrainBodyId = editorPhysicsWorld.CreateTerrainCollider(terrainCollider);
+            if (terrainBodyId != 0)
+            {
+                ++createdBodies;
+                ++staticBodies;
+            }
+        }
+        for (const MeshSceneEntity& mesh : editorMeshEntities)
+        {
+            if (!mesh.hasCollider || !mesh.collider.enabled)
+                continue;
+            phys::PhysicsBodyDesc desc{};
+            const bool rigidbodyEnabled = mesh.hasRigidbody && mesh.rigidbody.enabled;
+            desc.bodyType = rigidbodyEnabled ? mesh.rigidbody.bodyType : phys::BodyType::Static;
+            desc.rigidbody = rigidbodyEnabled ? mesh.rigidbody : phys::RigidbodyComponent{};
+            if (!rigidbodyEnabled)
+                desc.rigidbody.useGravity = false;
+            desc.collider = mesh.collider;
+            desc.transform = PhysicsTransformFromMesh(mesh);
+            desc.scale[0] = mesh.scale[0];
+            desc.scale[1] = mesh.scale[1];
+            desc.scale[2] = mesh.scale[2];
+            if (rigidbodyEnabled &&
+                desc.rigidbody.useGravity &&
+                desc.bodyType == phys::BodyType::Static)
+            {
+                desc.bodyType = phys::BodyType::Dynamic;
+                Tracenf("[PHYSICS] body auto-promoted entity=%u name=%s reason=static-rigidbody-with-gravity",
+                    mesh.id,
+                    mesh.name.c_str());
+            }
+            const phys::BodyId bodyId = editorPhysicsWorld.CreateBody(desc);
+            if (bodyId == 0)
+                continue;
+            editorPhysicsBodies[mesh.id] = bodyId;
+            ++createdBodies;
+            if (desc.bodyType == phys::BodyType::Dynamic)
+            {
+                ++dynamicBodies;
+                if (desc.rigidbody.useGravity)
+                    ++gravityBodies;
+            }
+            else if (desc.bodyType == phys::BodyType::Kinematic)
+            {
+                ++kinematicBodies;
+            }
+            else
+            {
+                ++staticBodies;
+            }
+            Tracenf("[PHYSICS] body entity=%u name=%s type=%s gravity=%u collider=%s mass=%.3f friction=%.2f bounce=%.2f scale=(%.3f,%.3f,%.3f)",
+                mesh.id,
+                mesh.name.c_str(),
+                phys::ToString(desc.bodyType),
+                desc.rigidbody.useGravity ? 1u : 0u,
+                phys::ToString(desc.collider.shape),
+                desc.rigidbody.mass,
+                desc.collider.friction,
+                desc.collider.restitution,
+                desc.scale[0],
+                desc.scale[1],
+                desc.scale[2]);
+        }
+        editorPhysicsWorldActive = true;
+        editorPhysicsStepLogFrames = 0;
+        Tracenf("[PHYSICS] play world rebuilt bodies=%u dynamic=%u static=%u kinematic=%u gravity=%u meshEntities=%zu",
+            createdBodies,
+            dynamicBodies,
+            staticBodies,
+            kinematicBodies,
+            gravityBodies,
+            editorMeshEntities.size());
+        return true;
+    };
+    auto stepEditorPhysicsWorld = [&](float deltaSeconds) {
+        if (!editorPhysicsWorldActive || editorPlay.state.mode != EditorPlayMode::Play)
+            return;
+        editorPhysicsWorld.Step(std::clamp(deltaSeconds, 0.0f, 1.0f / 15.0f));
+        std::uint32_t movedDynamicBodies = 0;
+        for (const auto& [meshId, bodyId] : editorPhysicsBodies)
+        {
+            MeshSceneEntity* mesh = findMeshEntityById(meshId);
+            if (!mesh || !mesh->hasRigidbody || !mesh->rigidbody.enabled ||
+                mesh->rigidbody.bodyType != phys::BodyType::Dynamic)
+                continue;
+            phys::PhysicsTransform transform{};
+            if (!editorPhysicsWorld.GetBodyTransform(bodyId, transform))
+                continue;
+            if (ApplyPhysicsTransformToMesh(transform, *mesh))
+            {
+                syncStaticMeshSpatialEntity(*mesh);
+                ++movedDynamicBodies;
+            }
+        }
+        if (editorPhysicsStepLogFrames < 3)
+        {
+            const phys::PhysicsWorldStats physicsStats = editorPhysicsWorld.Stats();
+            Tracenf("[PHYSICS] step frame=%u bodies=%u meshBodies=%zu movedDynamic=%u dt=%.4f",
+                editorPhysicsStepLogFrames,
+                physicsStats.bodyCount,
+                editorPhysicsBodies.size(),
+                movedDynamicBodies,
+                deltaSeconds);
+            ++editorPhysicsStepLogFrames;
+        }
     };
     auto logStaticMeshSpatialBuild = [&]() {
         const SpatialIndex::Aabb& b = staticMeshSpatialIndex.WorldBounds();
@@ -2670,6 +3047,7 @@ int RunGame(NativeWindow& window,
     bool debugDisableAssetLibraryDiscovery = false;
     bool debugDisableAssetWatcherPoll = false;
     bool debugDisableHierarchyIteration = false;
+    bool debugShowPhysicsColliders = false;
     bool dumpFrameProfileRequested = false;
     Tracen("[VISIBILITY-RESPECT] shadow_pass=yes water_reflection_pass=yes main_pass=yes");
 #endif
@@ -2859,6 +3237,7 @@ int RunGame(NativeWindow& window,
         {
             editorPlay.state.elapsedSeconds += deltaSeconds;
             ++editorPlay.state.frameCount;
+            stepEditorPhysicsWorld(static_cast<float>(deltaSeconds));
         }
 #endif
         {
@@ -2943,12 +3322,14 @@ int RunGame(NativeWindow& window,
                     debugDisableAssetLibraryDiscovery = commands.disableAssetLibraryDiscovery;
                     debugDisableAssetWatcherPoll = commands.disableAssetWatcherPoll;
                     debugDisableHierarchyIteration = commands.disableHierarchyIteration;
-                    Tracenf("[FRAME-PROFILE] toggles shadow=%s water_reflection=%s asset_library_discovery=%s asset_watcher_poll=%s hierarchy_iteration=%s",
+                    debugShowPhysicsColliders = commands.showPhysicsColliders;
+                    Tracenf("[FRAME-PROFILE] toggles shadow=%s water_reflection=%s asset_library_discovery=%s asset_watcher_poll=%s hierarchy_iteration=%s physics_colliders=%s",
                         debugDisableShadowPass ? "disabled" : "enabled",
                         debugDisableWaterReflectionPass ? "disabled" : "enabled",
                         debugDisableAssetLibraryDiscovery ? "disabled" : "enabled",
                         debugDisableAssetWatcherPoll ? "disabled" : "enabled",
-                        debugDisableHierarchyIteration ? "disabled" : "enabled");
+                        debugDisableHierarchyIteration ? "disabled" : "enabled",
+                        debugShowPhysicsColliders ? "shown" : "selected-only");
                 }
                 if (commands.renderResolutionChanged)
                 {
@@ -3552,8 +3933,97 @@ int RunGame(NativeWindow& window,
                 if (commands.exportMeshEntityToFbx)
                     exportMeshEntityToFbx(commands.exportMeshEntityId, commands);
 #if defined(IXTREEME_WITH_EDITOR)
+                auto applyPendingSelectedMeshEntityChange = [&]() {
+                    if (!commands.selectedMeshEntityChanged)
+                        return false;
+                    auto it = std::find_if(editorMeshEntities.begin(), editorMeshEntities.end(),
+                        [&](const MeshSceneEntity& mesh) { return mesh.id == commands.selectedMeshEntity.id; });
+                    if (it == editorMeshEntities.end())
+                    {
+                        commands.selectedMeshEntityChanged = false;
+                        commands.fitSelectedColliderToMesh = false;
+                        return false;
+                    }
+                    auto floatsDiffer = [](const float* a, const float* b, std::size_t count, float epsilon = 0.0001f) {
+                        for (std::size_t i = 0; i < count; ++i)
+                        {
+                            if (std::abs(a[i] - b[i]) > epsilon)
+                                return true;
+                        }
+                        return false;
+                    };
+                    auto boolsDiffer = [](const bool* a, const bool* b, std::size_t count) {
+                        for (std::size_t i = 0; i < count; ++i)
+                        {
+                            if (a[i] != b[i])
+                                return true;
+                        }
+                        return false;
+                    };
+                    auto rigidbodyDiffers = [&](const phys::RigidbodyComponent& a, const phys::RigidbodyComponent& b) {
+                        return a.enabled != b.enabled ||
+                            a.bodyType != b.bodyType ||
+                            std::abs(a.mass - b.mass) > 0.0001f ||
+                            std::abs(a.linearDamping - b.linearDamping) > 0.0001f ||
+                            std::abs(a.angularDamping - b.angularDamping) > 0.0001f ||
+                            a.useGravity != b.useGravity ||
+                            boolsDiffer(a.freezePosition, b.freezePosition, 3) ||
+                            boolsDiffer(a.freezeRotation, b.freezeRotation, 3);
+                    };
+                    auto colliderDiffers = [&](const phys::ColliderComponent& a, const phys::ColliderComponent& b) {
+                        return a.enabled != b.enabled ||
+                            a.trigger != b.trigger ||
+                            a.shape != b.shape ||
+                            floatsDiffer(a.center, b.center, 3) ||
+                            floatsDiffer(a.size, b.size, 3) ||
+                            std::abs(a.radius - b.radius) > 0.0001f ||
+                            std::abs(a.height - b.height) > 0.0001f ||
+                            std::abs(a.friction - b.friction) > 0.0001f ||
+                            std::abs(a.restitution - b.restitution) > 0.0001f ||
+                            a.materialAssetId != b.materialAssetId;
+                    };
+                    const bool transformChanged =
+                        !std::equal(std::begin(it->position), std::end(it->position), std::begin(commands.selectedMeshEntity.position)) ||
+                        !std::equal(std::begin(it->rotation), std::end(it->rotation), std::begin(commands.selectedMeshEntity.rotation)) ||
+                        !std::equal(std::begin(it->scale), std::end(it->scale), std::begin(commands.selectedMeshEntity.scale));
+                    const bool meshAssetChanged =
+                        it->meshAssetId != commands.selectedMeshEntity.meshAssetId ||
+                        it->meshAssetPath != commands.selectedMeshEntity.meshAssetPath ||
+                        it->skinned != commands.selectedMeshEntity.skinned;
+                    bool physicsChanged =
+                        transformChanged ||
+                        it->hasRigidbody != commands.selectedMeshEntity.hasRigidbody ||
+                        it->hasCollider != commands.selectedMeshEntity.hasCollider ||
+                        (it->hasRigidbody && commands.selectedMeshEntity.hasRigidbody &&
+                            rigidbodyDiffers(it->rigidbody, commands.selectedMeshEntity.rigidbody)) ||
+                        (it->hasCollider && commands.selectedMeshEntity.hasCollider &&
+                            colliderDiffers(it->collider, commands.selectedMeshEntity.collider));
+                    ApplyMeshRendererEditorState(*it, commands.selectedMeshEntity);
+                    if (commands.fitSelectedColliderToMesh)
+                    {
+                        if (fitMeshColliderToBounds(*it))
+                        {
+                            physicsChanged = true;
+                            runtimeSession->SetEditorStatus("Collider fitted to mesh");
+                        }
+                        commands.fitSelectedColliderToMesh = false;
+                    }
+                    if (transformChanged || meshAssetChanged)
+                        syncStaticMeshSpatialEntity(*it);
+                    if (physicsChanged && editorPlay.state.mode == EditorPlayMode::Play && editorPhysicsWorldActive)
+                    {
+                        rebuildEditorPhysicsWorld();
+                        runtimeSession->SetEditorStatus("Physics body rebuilt");
+                    }
+                    selectedEditorObject = {SelectedEditorObjectType::MeshEntity, it->id};
+                    SceneManager::Instance().MarkDirty();
+                    commands.selectedMeshEntityChanged = false;
+                    commands.fitSelectedColliderToMesh = false;
+                    return true;
+                };
                 if (commands.enterPlayMode)
                 {
+                    applyPendingSelectedMeshEntityChange();
                     if (SceneManager::Instance().HasOpenScene())
                         editorPlay.state.mode = EditorPlayMode::Play;
                     else
@@ -3585,6 +4055,7 @@ int RunGame(NativeWindow& window,
                     terrain.SetWaterSculptBrush(false, 0.0f, 0.0f, 0.0f, true);
                     cameraController.SetFreeCameraEnabled(true);
                     runtimeSession->Start(SceneManager::Instance().GetCurrentScene());
+                    rebuildEditorPhysicsWorld();
                     editorPlay.state.frameCount = 0;
                     editorPlay.state.elapsedSeconds = 0.0;
                     editorPlay.appliedMode = editorPlay.state.mode;
@@ -3599,6 +4070,7 @@ int RunGame(NativeWindow& window,
                         editorPlay.state.frameCount);
                     runtimeUi->HideAll();
                     runtimeSession->Stop();
+                    clearEditorPhysicsWorld();
                     editorWaterBodiesDirty = true;
                     if (editorPlay.playStartSceneWasOpen)
                     {
@@ -5427,6 +5899,7 @@ int RunGame(NativeWindow& window,
                                     {
                                         it->hasCollider = true;
                                         it->collider.shape = ixtreeme::physics::ColliderShape::Box;
+                                        fitMeshColliderToBounds(*it);
                                     }
                                     Tracenf("[INSPECTOR-COMP] add entity=%u component=Rigidbody", it->id);
                                     runtimeSession->SetEditorStatus("Added Rigidbody component");
@@ -5440,6 +5913,7 @@ int RunGame(NativeWindow& window,
                                         it->collider.shape = ixtreeme::physics::ColliderShape::Capsule;
                                     else
                                         it->collider.shape = ixtreeme::physics::ColliderShape::Box;
+                                    fitMeshColliderToBounds(*it);
                                     Tracenf("[INSPECTOR-COMP] add entity=%u component=%s Collider",
                                         it->id,
                                         ixtreeme::physics::ToString(it->collider.shape));
@@ -5726,26 +6200,7 @@ int RunGame(NativeWindow& window,
                     }
                 }
                 if (commands.selectedMeshEntityChanged)
-                {
-                    auto it = std::find_if(editorMeshEntities.begin(), editorMeshEntities.end(),
-                        [&](const MeshSceneEntity& mesh) { return mesh.id == commands.selectedMeshEntity.id; });
-                    if (it != editorMeshEntities.end())
-                    {
-                        const bool transformChanged =
-                            !std::equal(std::begin(it->position), std::end(it->position), std::begin(commands.selectedMeshEntity.position)) ||
-                            !std::equal(std::begin(it->rotation), std::end(it->rotation), std::begin(commands.selectedMeshEntity.rotation)) ||
-                            !std::equal(std::begin(it->scale), std::end(it->scale), std::begin(commands.selectedMeshEntity.scale));
-                        const bool meshAssetChanged =
-                            it->meshAssetId != commands.selectedMeshEntity.meshAssetId ||
-                            it->meshAssetPath != commands.selectedMeshEntity.meshAssetPath ||
-                            it->skinned != commands.selectedMeshEntity.skinned;
-                        ApplyMeshRendererEditorState(*it, commands.selectedMeshEntity);
-                        if (transformChanged || meshAssetChanged)
-                            syncStaticMeshSpatialEntity(*it);
-                        selectedEditorObject = {SelectedEditorObjectType::MeshEntity, it->id};
-                        SceneManager::Instance().MarkDirty();
-                    }
-                }
+                    applyPendingSelectedMeshEntityChange();
                 if (commands.dumpMaterialState)
                 {
                     Tracenf("[MATBIND-DIAG] dump requested meshEntities=%zu", editorMeshEntities.size());
@@ -7051,6 +7506,11 @@ int RunGame(NativeWindow& window,
                     selectionLines.insert(selectionLines.end(),
                         selectedObjectLines.begin(),
                         selectedObjectLines.end());
+                    std::vector<SelectionOutlineRenderer::Line> selectedColliderLines =
+                        BuildPhysicsColliderLines(selectedEditorObject, editorMeshEntities, debugShowPhysicsColliders);
+                    selectionLines.insert(selectionLines.end(),
+                        selectedColliderLines.begin(),
+                        selectedColliderLines.end());
                     selectionOutlines.Render(device, camera, selectionLines, renderSize);
                 }
                 if (!useOffscreenScene && hasSceneTerrain)

@@ -529,6 +529,7 @@ struct MapEditorCommands
     bool disableAssetLibraryDiscovery = false;
     bool disableAssetWatcherPoll = false;
     bool disableHierarchyIteration = false;
+    bool showPhysicsColliders = false;
     bool renderResolutionChanged = false;
     bool renderResolutionUseNative = true;
     std::uint32_t renderResolutionWidth = 0;
@@ -568,6 +569,7 @@ struct MapEditorCommands
     std::string addComponentTypeId;
     bool removeComponentFromSelectedEntity = false;
     std::string removeComponentTypeId;
+    bool fitSelectedColliderToMesh = false;
     bool lodQualityCommitRequested = false;
     std::uint32_t lodQualityCommitEntityId = 0;
     LodConfig lodQualityCommitConfig;

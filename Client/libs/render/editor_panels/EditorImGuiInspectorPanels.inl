@@ -613,6 +613,11 @@ bool EditorImGui::RenderSelectedMeshPhysicsComponents()
         if (open)
         {
             auto& collider = m_meshRendererState.collider;
+            auto requestColliderFit = [&]() {
+                m_commands.fitSelectedColliderToMesh = true;
+                m_commands.selectedMeshEntityChanged = true;
+                m_commands.selectedMeshEntity = m_meshRendererState;
+            };
             const char* shapes[] = {"Box", "Sphere", "Capsule"};
             int shapeIndex = collider.shape == ixtreeme::physics::ColliderShape::Sphere ? 1 :
                 (collider.shape == ixtreeme::physics::ColliderShape::Capsule ? 2 : 0);
@@ -624,6 +629,32 @@ bool EditorImGui::RenderSelectedMeshPhysicsComponents()
             }
             changed |= ImGui::Checkbox("Enabled", &collider.enabled);
             changed |= ImGui::Checkbox("Is Trigger", &collider.trigger);
+            ImGui::TextDisabled("Fit Collider");
+            if (ImGui::Button("Box", ImVec2(92.0f, 0.0f)))
+            {
+                collider.shape = ixtreeme::physics::ColliderShape::Box;
+                requestColliderFit();
+            }
+            ImGui::SameLine();
+            if (ImGui::Button("Sphere", ImVec2(92.0f, 0.0f)))
+            {
+                collider.shape = ixtreeme::physics::ColliderShape::Sphere;
+                requestColliderFit();
+            }
+            ImGui::SameLine();
+            if (ImGui::Button("Capsule", ImVec2(92.0f, 0.0f)))
+            {
+                collider.shape = ixtreeme::physics::ColliderShape::Capsule;
+                requestColliderFit();
+            }
+            ImGui::SameLine();
+            if (ImGui::Button("Center", ImVec2(64.0f, 0.0f)))
+            {
+                collider.center[0] = 0.0f;
+                collider.center[1] = 0.0f;
+                collider.center[2] = 0.0f;
+                changed = true;
+            }
             changed |= ImGui::DragFloat3("Center", collider.center, 0.05f, -1000.0f, 1000.0f, "%.2f");
             if (collider.shape == ixtreeme::physics::ColliderShape::Box)
                 changed |= ImGui::DragFloat3("Size", collider.size, 0.05f, 0.001f, 10000.0f, "%.2f");
@@ -631,6 +662,8 @@ bool EditorImGui::RenderSelectedMeshPhysicsComponents()
                 changed |= ImGui::DragFloat("Radius", &collider.radius, 0.025f, 0.001f, 10000.0f, "%.2f");
             if (collider.shape == ixtreeme::physics::ColliderShape::Capsule)
                 changed |= ImGui::DragFloat("Height", &collider.height, 0.05f, 0.001f, 10000.0f, "%.2f");
+            changed |= ImGui::SliderFloat("Friction", &collider.friction, 0.0f, 4.0f, "%.2f");
+            changed |= ImGui::SliderFloat("Bounciness", &collider.restitution, 0.0f, 1.0f, "%.2f");
             ixtreeme::physics::Sanitize(collider);
         }
         ImGui::PopID();
@@ -1063,6 +1096,16 @@ void EditorImGui::RenderPerformancePanel()
             mathBenchmark.rowMajorMat4Ms,
             mathBenchmark.transformVec4Ms,
             mathBenchmark.frustumAabbMs);
+    }
+    if (ImGui::Checkbox("Show Physics Colliders", &m_debugShowPhysicsColliders))
+    {
+        m_commands.debugPerfTogglesChanged = true;
+        m_commands.disableShadowPass = m_debugDisableShadowPass;
+        m_commands.disableWaterReflectionPass = m_debugDisableWaterReflectionPass;
+        m_commands.disableAssetLibraryDiscovery = m_debugDisableAssetLibraryDiscovery;
+        m_commands.disableAssetWatcherPoll = m_debugDisableAssetWatcherPoll;
+        m_commands.disableHierarchyIteration = m_debugDisableHierarchyIteration;
+        m_commands.showPhysicsColliders = m_debugShowPhysicsColliders;
     }
 
     const char* modes[] = {

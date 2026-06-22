@@ -367,6 +367,7 @@ private:
     bool m_debugDisableAssetLibraryDiscovery = false;
     bool m_debugDisableAssetWatcherPoll = false;
     bool m_debugDisableHierarchyIteration = false;
+    bool m_debugShowPhysicsColliders = false;
     int m_renderResolutionMode = 0;
     int m_customRenderResolutionWidth = 1920;
     int m_customRenderResolutionHeight = 1080;

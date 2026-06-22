@@ -42,6 +42,8 @@ struct ColliderComponent
     float size[3] = {1.0f, 1.0f, 1.0f};
     float radius = 0.5f;
     float height = 2.0f;
+    float friction = 0.6f;
+    float restitution = 0.0f;
     std::string materialAssetId;
 };
 
@@ -103,6 +105,8 @@ inline void Sanitize(ColliderComponent& collider)
     collider.size[2] = std::max(0.001f, collider.size[2]);
     collider.radius = std::max(0.001f, collider.radius);
     collider.height = std::max(collider.radius * 2.0f, collider.height);
+    collider.friction = std::clamp(collider.friction, 0.0f, 4.0f);
+    collider.restitution = std::clamp(collider.restitution, 0.0f, 1.0f);
 }
 
 } // namespace ixtreeme::physics

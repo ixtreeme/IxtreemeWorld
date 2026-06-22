@@ -3,6 +3,7 @@
 #include "Debug.h"
 
 #include <algorithm>
+#include <cmath>
 #include <thread>
 #include <unordered_map>
 
@@ -15,9 +16,16 @@
 #include <Jolt/Physics/Body/BodyActivationListener.h>
 #include <Jolt/Physics/Body/BodyCreationSettings.h>
 #include <Jolt/Physics/Body/BodyInterface.h>
+#include <Jolt/Physics/Body/BodyLock.h>
+#include <Jolt/Physics/Body/BodyLockInterface.h>
 #include <Jolt/Physics/Collision/BroadPhase/BroadPhaseLayer.h>
+#include <Jolt/Physics/Collision/CastResult.h>
+#include <Jolt/Physics/Collision/NarrowPhaseQuery.h>
+#include <Jolt/Physics/Collision/RayCast.h>
 #include <Jolt/Physics/Collision/Shape/BoxShape.h>
 #include <Jolt/Physics/Collision/Shape/CapsuleShape.h>
+#include <Jolt/Physics/Collision/Shape/MeshShape.h>
+#include <Jolt/Physics/Collision/Shape/RotatedTranslatedShape.h>
 #include <Jolt/Physics/Collision/Shape/SphereShape.h>
 #include <Jolt/Physics/PhysicsSystem.h>
 #endif
@@ -95,26 +103,59 @@ JPH::ObjectLayer ToJoltLayer(BodyType type)
     return type == BodyType::Static ? Layers::NonMoving : Layers::Moving;
 }
 
-JPH::ShapeRefC CreateShape(const ColliderComponent& input)
+JPH::ShapeRefC CreateShape(const ColliderComponent& input, const float scale[3])
 {
     ColliderComponent collider = input;
     Sanitize(collider);
+    const float sx = std::max(0.001f, std::abs(scale[0]));
+    const float sy = std::max(0.001f, std::abs(scale[1]));
+    const float sz = std::max(0.001f, std::abs(scale[2]));
+    collider.center[0] *= sx;
+    collider.center[1] *= sy;
+    collider.center[2] *= sz;
+    JPH::ShapeRefC baseShape;
     switch (collider.shape)
     {
     case ColliderShape::Sphere:
-        return new JPH::SphereShape(collider.radius);
+        baseShape = new JPH::SphereShape(collider.radius * std::max({sx, sy, sz}));
+        break;
     case ColliderShape::Capsule:
     {
-        const float cylinderHalfHeight = std::max(0.001f, (collider.height - collider.radius * 2.0f) * 0.5f);
-        return new JPH::CapsuleShape(cylinderHalfHeight, collider.radius);
+        const float radius = collider.radius * std::max(sx, sz);
+        const float height = std::max(radius * 2.0f, collider.height * sy);
+        const float cylinderHalfHeight = std::max(0.001f, (height - radius * 2.0f) * 0.5f);
+        baseShape = new JPH::CapsuleShape(cylinderHalfHeight, radius);
+        break;
     }
     case ColliderShape::Box:
     default:
-        return new JPH::BoxShape(JPH::Vec3(
-            std::max(0.001f, collider.size[0] * 0.5f),
-            std::max(0.001f, collider.size[1] * 0.5f),
-            std::max(0.001f, collider.size[2] * 0.5f)));
+        baseShape = new JPH::BoxShape(JPH::Vec3(
+            std::max(0.001f, collider.size[0] * sx * 0.5f),
+            std::max(0.001f, collider.size[1] * sy * 0.5f),
+            std::max(0.001f, collider.size[2] * sz * 0.5f)));
+        break;
     }
+
+    if (std::abs(collider.center[0]) > 0.0001f ||
+        std::abs(collider.center[1]) > 0.0001f ||
+        std::abs(collider.center[2]) > 0.0001f)
+    {
+        return JPH::RotatedTranslatedShapeSettings(
+            JPH::Vec3(collider.center[0], collider.center[1], collider.center[2]),
+            JPH::Quat::sIdentity(),
+            baseShape).Create().Get();
+    }
+    return baseShape;
+}
+
+BodyId FindEngineBodyId(const std::unordered_map<BodyId, JPH::BodyID>& bodies, JPH::BodyID joltBodyId)
+{
+    for (const auto& entry : bodies)
+    {
+        if (entry.second == joltBodyId)
+            return entry.first;
+    }
+    return kInvalidBodyId;
 }
 #endif
 }
@@ -161,7 +202,8 @@ bool PhysicsWorld::Create()
     constexpr std::uint32_t bodyMutexes = 0;
     constexpr std::uint32_t maxBodyPairs = 65536;
     constexpr std::uint32_t maxContactConstraints = 20480;
-    m_impl->tempAllocator = std::make_unique<JPH::TempAllocatorImpl>(16 * 1024 * 1024);
+    constexpr std::uint32_t tempAllocatorSizeBytes = 128u * 1024u * 1024u;
+    m_impl->tempAllocator = std::make_unique<JPH::TempAllocatorImpl>(tempAllocatorSizeBytes);
     m_impl->jobSystem = std::make_unique<JPH::JobSystemThreadPool>(
         JPH::cMaxPhysicsJobs,
         JPH::cMaxPhysicsBarriers,
@@ -173,7 +215,9 @@ bool PhysicsWorld::Create()
         m_impl->broadPhaseLayers,
         m_impl->objectVsBroadPhaseLayerFilter,
         m_impl->objectLayerPairFilter);
-    Tracen("[PHYSICS] backend=Jolt created");
+    m_impl->system.SetGravity(JPH::Vec3(0.0f, -9.81f, 0.0f));
+    Tracenf("[PHYSICS] backend=Jolt created gravity=(0.00,-9.81,0.00) tempAllocatorMB=%u",
+        tempAllocatorSizeBytes / (1024u * 1024u));
 #else
     Tracen("[PHYSICS] backend=Null created");
 #endif
@@ -199,6 +243,7 @@ void PhysicsWorld::Destroy()
 #endif
     m_impl->bodies.clear();
     m_impl->created = false;
+    m_impl.reset();
 }
 
 bool PhysicsWorld::IsCreated() const
@@ -219,12 +264,12 @@ BodyId PhysicsWorld::CreateBody(const PhysicsBodyDesc& desc)
     const BodyId id = m_impl->nextBodyId++;
 #if defined(IXENGINE_PHYSICS_WITH_JOLT)
     JPH::BodyInterface& bodies = m_impl->system.GetBodyInterface();
-    JPH::ShapeRefC shape = CreateShape(collider);
+    JPH::ShapeRefC shape = CreateShape(collider, desc.scale);
     JPH::BodyCreationSettings settings(
         shape,
-        JPH::RVec3(desc.transform.position[0] + collider.center[0],
-            desc.transform.position[1] + collider.center[1],
-            desc.transform.position[2] + collider.center[2]),
+        JPH::RVec3(desc.transform.position[0],
+            desc.transform.position[1],
+            desc.transform.position[2]),
         JPH::Quat(desc.transform.rotation[0], desc.transform.rotation[1], desc.transform.rotation[2], desc.transform.rotation[3]),
         ToJoltMotion(desc.bodyType),
         ToJoltLayer(desc.bodyType));
@@ -236,11 +281,101 @@ BodyId PhysicsWorld::CreateBody(const PhysicsBodyDesc& desc)
     settings.mLinearDamping = rigidbody.linearDamping;
     settings.mAngularDamping = rigidbody.angularDamping;
     settings.mGravityFactor = rigidbody.useGravity ? 1.0f : 0.0f;
+    settings.mFriction = collider.friction;
+    settings.mRestitution = collider.restitution;
     const JPH::BodyID bodyId = bodies.CreateAndAddBody(settings, JPH::EActivation::Activate);
     m_impl->bodies[id] = bodyId;
 #else
     m_impl->bodies[id] = desc.transform;
 #endif
+    return id;
+}
+
+BodyId PhysicsWorld::CreateTerrainCollider(const TerrainColliderDesc& desc)
+{
+    if (!Create())
+        return kInvalidBodyId;
+    if (desc.cellsX == 0 || desc.cellsZ == 0 || desc.widthMeters <= 0.0f || desc.depthMeters <= 0.0f)
+    {
+        Tracenf("[PHYSICS] terrain collider skipped reason=invalid-dims cells=%ux%u size=%.2fx%.2f",
+            desc.cellsX,
+            desc.cellsZ,
+            desc.widthMeters,
+            desc.depthMeters);
+        return kInvalidBodyId;
+    }
+
+    const std::uint32_t vertsX = desc.cellsX + 1u;
+    const std::uint32_t vertsZ = desc.cellsZ + 1u;
+    const std::size_t expectedHeights = static_cast<std::size_t>(vertsX) * static_cast<std::size_t>(vertsZ);
+    const bool hasHeightGrid = desc.heightCmGrid.size() >= expectedHeights;
+    const float cellX = desc.widthMeters / static_cast<float>(desc.cellsX);
+    const float cellZ = desc.depthMeters / static_cast<float>(desc.cellsZ);
+
+    const BodyId id = m_impl->nextBodyId++;
+#if defined(IXENGINE_PHYSICS_WITH_JOLT)
+    JPH::VertexList vertices;
+    vertices.reserve(expectedHeights);
+    for (std::uint32_t z = 0; z < vertsZ; ++z)
+    {
+        const float worldZ = desc.depthMeters * 0.5f - static_cast<float>(z) * cellZ;
+        for (std::uint32_t x = 0; x < vertsX; ++x)
+        {
+            const float worldX = -desc.widthMeters * 0.5f + static_cast<float>(x) * cellX;
+            const std::size_t index = static_cast<std::size_t>(z) * vertsX + x;
+            const float worldY = hasHeightGrid ? desc.heightCmGrid[index] * 0.01f : 0.0f;
+            vertices.emplace_back(worldX, worldY, worldZ);
+        }
+    }
+
+    JPH::IndexedTriangleList triangles;
+    triangles.reserve(static_cast<std::size_t>(desc.cellsX) * static_cast<std::size_t>(desc.cellsZ) * 2u);
+    for (std::uint32_t z = 0; z < desc.cellsZ; ++z)
+    {
+        for (std::uint32_t x = 0; x < desc.cellsX; ++x)
+        {
+            const std::uint32_t v00 = z * vertsX + x;
+            const std::uint32_t v10 = v00 + 1u;
+            const std::uint32_t v01 = (z + 1u) * vertsX + x;
+            const std::uint32_t v11 = v01 + 1u;
+            triangles.emplace_back(v00, v10, v01, 0u);
+            triangles.emplace_back(v10, v11, v01, 0u);
+        }
+    }
+
+    JPH::MeshShapeSettings shapeSettings(std::move(vertices), std::move(triangles));
+    JPH::ShapeSettings::ShapeResult shapeResult = shapeSettings.Create();
+    if (shapeResult.HasError())
+    {
+        Tracenf("[PHYSICS] terrain collider failed reason=%s", shapeResult.GetError().c_str());
+        return kInvalidBodyId;
+    }
+
+    JPH::BodyCreationSettings bodySettings(
+        shapeResult.Get(),
+        JPH::RVec3::sZero(),
+        JPH::Quat::sIdentity(),
+        JPH::EMotionType::Static,
+        Layers::NonMoving);
+    bodySettings.mFriction = std::clamp(desc.friction, 0.0f, 4.0f);
+    bodySettings.mRestitution = std::clamp(desc.restitution, 0.0f, 1.0f);
+    JPH::BodyInterface& bodies = m_impl->system.GetBodyInterface();
+    const JPH::BodyID bodyId = bodies.CreateAndAddBody(bodySettings, JPH::EActivation::DontActivate);
+    m_impl->bodies[id] = bodyId;
+#else
+    PhysicsTransform transform{};
+    m_impl->bodies[id] = transform;
+#endif
+
+    Tracenf("[PHYSICS] terrain collider created body=%llu cells=%ux%u verts=%zu tris=%zu size=%.2fx%.2f heightGrid=%s",
+        static_cast<unsigned long long>(id),
+        desc.cellsX,
+        desc.cellsZ,
+        expectedHeights,
+        static_cast<std::size_t>(desc.cellsX) * static_cast<std::size_t>(desc.cellsZ) * 2u,
+        desc.widthMeters,
+        desc.depthMeters,
+        hasHeightGrid ? "yes" : "flat");
     return id;
 }
 
@@ -299,6 +434,65 @@ bool PhysicsWorld::GetBodyTransform(BodyId id, PhysicsTransform& outTransform) c
     outTransform = it->second;
 #endif
     return true;
+}
+
+bool PhysicsWorld::Raycast(
+    const float origin[3],
+    const float direction[3],
+    float maxDistance,
+    PhysicsRaycastHit& outHit) const
+{
+    outHit = {};
+    if (!m_impl || !m_impl->created || maxDistance <= 0.0f)
+        return false;
+
+    const float lengthSq =
+        direction[0] * direction[0] +
+        direction[1] * direction[1] +
+        direction[2] * direction[2];
+    if (lengthSq <= 0.0000001f)
+        return false;
+
+    const float invLength = 1.0f / std::sqrt(lengthSq);
+    const float rayDir[3] = {
+        direction[0] * invLength * maxDistance,
+        direction[1] * invLength * maxDistance,
+        direction[2] * invLength * maxDistance,
+    };
+
+#if defined(IXENGINE_PHYSICS_WITH_JOLT)
+    const JPH::RRayCast ray(
+        JPH::RVec3(origin[0], origin[1], origin[2]),
+        JPH::Vec3(rayDir[0], rayDir[1], rayDir[2]));
+    JPH::RayCastResult result;
+    if (!m_impl->system.GetNarrowPhaseQuery().CastRay(ray, result))
+        return false;
+
+    const JPH::RVec3 hitPosition = ray.GetPointOnRay(result.mFraction);
+    JPH::Vec3 hitNormal = JPH::Vec3::sAxisY();
+    {
+        JPH::BodyLockRead lock(m_impl->system.GetBodyLockInterface(), result.mBodyID);
+        if (lock.Succeeded())
+            hitNormal = lock.GetBody().GetWorldSpaceSurfaceNormal(result.mSubShapeID2, hitPosition);
+    }
+
+    outHit.hit = true;
+    outHit.bodyId = FindEngineBodyId(m_impl->bodies, result.mBodyID);
+    outHit.position[0] = static_cast<float>(hitPosition.GetX());
+    outHit.position[1] = static_cast<float>(hitPosition.GetY());
+    outHit.position[2] = static_cast<float>(hitPosition.GetZ());
+    outHit.normal[0] = hitNormal.GetX();
+    outHit.normal[1] = hitNormal.GetY();
+    outHit.normal[2] = hitNormal.GetZ();
+    outHit.fraction = result.mFraction;
+    outHit.distance = result.mFraction * maxDistance;
+    return true;
+#else
+    (void)origin;
+    (void)rayDir;
+    (void)outHit;
+    return false;
+#endif
 }
 
 void PhysicsWorld::Step(float deltaSeconds)

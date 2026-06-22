@@ -1176,6 +1176,7 @@ MapEditorCommands EditorImGui::ConsumeCommands()
         const bool disableAssetLibraryDiscovery = commands.disableAssetLibraryDiscovery;
         const bool disableAssetWatcherPoll = commands.disableAssetWatcherPoll;
         const bool disableHierarchyIteration = commands.disableHierarchyIteration;
+        const bool showPhysicsColliders = commands.showPhysicsColliders;
         const bool renderResolutionChanged = commands.renderResolutionChanged;
         const bool renderResolutionUseNative = commands.renderResolutionUseNative;
         const std::uint32_t renderResolutionWidth = commands.renderResolutionWidth;
@@ -1193,6 +1194,7 @@ MapEditorCommands EditorImGui::ConsumeCommands()
         commands.disableAssetLibraryDiscovery = disableAssetLibraryDiscovery;
         commands.disableAssetWatcherPoll = disableAssetWatcherPoll;
         commands.disableHierarchyIteration = disableHierarchyIteration;
+        commands.showPhysicsColliders = showPhysicsColliders;
         commands.renderResolutionChanged = renderResolutionChanged;
         commands.renderResolutionUseNative = renderResolutionUseNative;
         commands.renderResolutionWidth = renderResolutionWidth;

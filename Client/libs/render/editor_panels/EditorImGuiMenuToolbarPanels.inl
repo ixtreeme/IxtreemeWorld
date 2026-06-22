@@ -100,6 +100,8 @@ void EditorImGui::RenderMenuBar()
             debugTogglesChanged = ImGui::MenuItem("Disable Asset Library Discovery", nullptr, &m_debugDisableAssetLibraryDiscovery) || debugTogglesChanged;
             debugTogglesChanged = ImGui::MenuItem("Disable Asset Watcher Poll", nullptr, &m_debugDisableAssetWatcherPoll) || debugTogglesChanged;
             debugTogglesChanged = ImGui::MenuItem("Disable Hierarchy Iteration", nullptr, &m_debugDisableHierarchyIteration) || debugTogglesChanged;
+            ImGui::Separator();
+            debugTogglesChanged = ImGui::MenuItem("Show Physics Colliders", nullptr, &m_debugShowPhysicsColliders) || debugTogglesChanged;
             if (debugTogglesChanged)
             {
                 m_commands.debugPerfTogglesChanged = true;
@@ -108,6 +110,7 @@ void EditorImGui::RenderMenuBar()
                 m_commands.disableAssetLibraryDiscovery = m_debugDisableAssetLibraryDiscovery;
                 m_commands.disableAssetWatcherPoll = m_debugDisableAssetWatcherPoll;
                 m_commands.disableHierarchyIteration = m_debugDisableHierarchyIteration;
+                m_commands.showPhysicsColliders = m_debugShowPhysicsColliders;
             }
             ImGui::EndMenu();
         }
