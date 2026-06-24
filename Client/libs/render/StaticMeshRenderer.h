@@ -373,6 +373,11 @@ private:
     LoadStatus m_status = LoadStatus::NotLoaded;
     uint32_t m_worldRenderFrameIndex = std::numeric_limits<uint32_t>::max();
     uint32_t m_worldUniformCursor = 0;
+    // Per-frame write cursor into the instance storage buffer. The same renderer can be
+    // drawn multiple times per frame (Scene-view batch + Game-view per-entity, into one
+    // command buffer); each call appends its instance blocks here instead of overwriting
+    // offset 0, so earlier draws still read their own transforms at GPU execute.
+    uint32_t m_worldInstanceCursor = 0;
     std::uint32_t m_lastSubmittedDrawCalls = 0;
     std::uint32_t m_lastSubmittedInstances = 0;
     std::uint32_t m_lastSubmittedIndexCount = 0;

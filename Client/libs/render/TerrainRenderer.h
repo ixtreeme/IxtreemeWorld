@@ -109,7 +109,9 @@ public:
     // its own per-frame uniform buffer + descriptor set so the terrain can be drawn from
     // two cameras in the same frame without the second draw clobbering the first.
     void Render(VulkanDevice& device, const WorldCamera& camera, VkExtent2D targetExtent = {}, uint32_t viewIndex = 0);
-    void RenderWater(VulkanDevice& device, const WorldCamera& camera, double timeSeconds, VkExtent2D targetExtent = {});
+    // viewIndex selects the camera-uniform path: 0 = primary (Scene View / free-fly),
+    // 1 = secondary (Game view / Main Camera). Mirrors TerrainRenderer::Render.
+    void RenderWater(VulkanDevice& device, const WorldCamera& camera, double timeSeconds, VkExtent2D targetExtent = {}, uint32_t viewIndex = 0);
     void RenderSunShadowMap(VulkanDevice& device, const WorldCamera& camera);
     void ResetFrameDrawStats() { m_frameDrawStats = {}; }
     FrameDrawStats GetFrameDrawStats() const { return m_frameDrawStats; }
@@ -265,6 +267,11 @@ private:
         Buffer indexBuffer;
         std::array<Buffer, kFramesInFlight> uniformBuffers{};
         std::array<VkDescriptorSet, kFramesInFlight> descriptorSets{};
+        // Secondary camera-uniform path for the Game view (project Main Camera), parallel to
+        // the primary (Scene View / free-fly) so the same water body can be drawn from two
+        // cameras in one frame without clobbering. Selected by RenderWater(viewIndex).
+        std::array<Buffer, kFramesInFlight> uniformBuffersSecondary{};
+        std::array<VkDescriptorSet, kFramesInFlight> descriptorSetsSecondary{};
         uint32_t indexCount = 0;
     };
 
@@ -372,7 +379,8 @@ private:
                                 const WorldCamera& camera,
                                 double timeSeconds,
                                 WaterBodyGpu& waterBody,
-                                bool reflectionTarget);
+                                bool reflectionTarget,
+                                uint32_t viewIndex = 0);
     WaterUniformBlock BuildWaterUniform(const WorldCamera& camera,
                                         double timeSeconds,
                                         const WaterConfig& water,

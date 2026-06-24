@@ -2840,7 +2840,7 @@ void TerrainRenderer::RenderSelectedWaterBodyHighlight(VulkanDevice& device, con
     vkCmdDrawIndexed(cmd, m_selectedWaterBodyIndexCount, 1, 0, 0, 0);
 }
 
-void TerrainRenderer::RenderWater(VulkanDevice& device, const WorldCamera& camera, double timeSeconds, VkExtent2D targetExtent)
+void TerrainRenderer::RenderWater(VulkanDevice& device, const WorldCamera& camera, double timeSeconds, VkExtent2D targetExtent, uint32_t viewIndex)
 {
     m_latestWaterTimeSeconds = timeSeconds;
     if (!m_sceneTerrainActive || m_sceneTerrain.editorHidden || m_waterBodies.empty() || !m_waterPipeline || !device.IsFrameActive())
@@ -2890,18 +2890,21 @@ void TerrainRenderer::RenderWater(VulkanDevice& device, const WorldCamera& camer
     VkDeviceSize offset = 0;
     for (WaterBodyGpu& waterBody : m_waterBodies)
     {
+        VkDescriptorSet waterDescriptorSet = (viewIndex == 0)
+            ? waterBody.descriptorSets[frameIndex]
+            : waterBody.descriptorSetsSecondary[frameIndex];
         if (!ResolveWaterConfig(waterBody.body).enabled || !waterBody.indexCount ||
             !waterBody.vertexBuffer.buffer || !waterBody.indexBuffer.buffer ||
-            !waterBody.descriptorSets[frameIndex])
+            !waterDescriptorSet)
         {
             continue;
         }
         const bool isReflectionTarget = (&waterBody == reflectionTarget);
-        UpdateWaterBodyUniform(frameIndex, camera, timeSeconds, waterBody, isReflectionTarget);
+        UpdateWaterBodyUniform(frameIndex, camera, timeSeconds, waterBody, isReflectionTarget, viewIndex);
         vkCmdBindVertexBuffers(cmd, 0, 1, &waterBody.vertexBuffer.buffer, &offset);
         vkCmdBindIndexBuffer(cmd, waterBody.indexBuffer.buffer, 0, VK_INDEX_TYPE_UINT32);
         vkCmdBindDescriptorSets(cmd, VK_PIPELINE_BIND_POINT_GRAPHICS, m_waterPipelineLayout,
-            0, 1, &waterBody.descriptorSets[frameIndex], 0, nullptr);
+            0, 1, &waterDescriptorSet, 0, nullptr);
         vkCmdDrawIndexed(cmd, waterBody.indexCount, 1, 0, 0, 0);
     }
 }
@@ -6641,15 +6644,18 @@ bool TerrainRenderer::LoadWaterBodies(VulkanDevice& device, const std::string& m
 
 bool TerrainRenderer::CreateWaterBodyUniformBuffers(VulkanDevice& device, WaterBodyGpu& waterBody)
 {
-    for (Buffer& buffer : waterBody.uniformBuffers)
-    {
-        DestroyBuffer(buffer);
-        CreateHostVisibleBuffer(device, m_device, sizeof(WaterUniformBlock),
-            VK_BUFFER_USAGE_UNIFORM_BUFFER_BIT, nullptr, buffer);
-        if (!buffer.buffer || !buffer.memory)
-            return false;
-    }
-    return true;
+    auto createSet = [&](std::array<Buffer, kFramesInFlight>& buffers) -> bool {
+        for (Buffer& buffer : buffers)
+        {
+            DestroyBuffer(buffer);
+            CreateHostVisibleBuffer(device, m_device, sizeof(WaterUniformBlock),
+                VK_BUFFER_USAGE_UNIFORM_BUFFER_BIT, nullptr, buffer);
+            if (!buffer.buffer || !buffer.memory)
+                return false;
+        }
+        return true;
+    };
+    return createSet(waterBody.uniformBuffers) && createSet(waterBody.uniformBuffersSecondary);
 }
 
 bool TerrainRenderer::CreateWaterBodyMesh(VulkanDevice& device, WaterBodyGpu& waterBody)
@@ -6789,10 +6795,14 @@ bool TerrainRenderer::CreateWaterDescriptors()
     m_waterDescriptorPool = VK_NULL_HANDLE;
     m_waterDescriptorSets.fill(VK_NULL_HANDLE);
     for (WaterBodyGpu& waterBody : m_waterBodies)
+    {
         waterBody.descriptorSets.fill(VK_NULL_HANDLE);
+        waterBody.descriptorSetsSecondary.fill(VK_NULL_HANDLE);
+    }
 
     std::array<VkDescriptorPoolSize, 2> poolSizes{};
-    const uint32_t maxWaterSets = kFramesInFlight * (1u + kMaxWaterBodyDraws);
+    // Each water body needs primary + secondary descriptor sets (Scene + Game view).
+    const uint32_t maxWaterSets = kFramesInFlight * (1u + kMaxWaterBodyDraws * 2u);
     poolSizes[0].type = VK_DESCRIPTOR_TYPE_UNIFORM_BUFFER;
     poolSizes[0].descriptorCount = maxWaterSets;
     poolSizes[1].type = VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER;
@@ -6810,6 +6820,8 @@ bool TerrainRenderer::CreateWaterDescriptors()
     for (WaterBodyGpu& waterBody : m_waterBodies)
     {
         if (!AllocateWaterDescriptorSets(waterBody.uniformBuffers, waterBody.descriptorSets))
+            return false;
+        if (!AllocateWaterDescriptorSets(waterBody.uniformBuffersSecondary, waterBody.descriptorSetsSecondary))
             return false;
     }
     UpdateWaterDescriptors();
@@ -6930,8 +6942,11 @@ void TerrainRenderer::UpdateWaterDescriptors()
 
     WriteWaterDescriptorSets(m_waterUniformBuffers, m_waterDescriptorSets);
     for (WaterBodyGpu& waterBody : m_waterBodies)
-        WriteWaterDescriptorSets(waterBody.uniformBuffers, waterBody.descriptorSets,
-            ResolveWaterMaterialTextures(waterBody.body));
+    {
+        const WaterMaterialTextureSet* textures = ResolveWaterMaterialTextures(waterBody.body);
+        WriteWaterDescriptorSets(waterBody.uniformBuffers, waterBody.descriptorSets, textures);
+        WriteWaterDescriptorSets(waterBody.uniformBuffersSecondary, waterBody.descriptorSetsSecondary, textures);
+    }
 }
 
 bool TerrainRenderer::CreateOrRecreateWaterReflectionResources(VulkanDevice& device, bool force)
@@ -7660,7 +7675,10 @@ void TerrainRenderer::DestroyWaterBodyResources(WaterBodyGpu& waterBody)
     DestroyBuffer(waterBody.indexBuffer);
     for (Buffer& buffer : waterBody.uniformBuffers)
         DestroyBuffer(buffer);
+    for (Buffer& buffer : waterBody.uniformBuffersSecondary)
+        DestroyBuffer(buffer);
     waterBody.descriptorSets.fill(VK_NULL_HANDLE);
+    waterBody.descriptorSetsSecondary.fill(VK_NULL_HANDLE);
     waterBody.indexCount = 0;
 }
 
@@ -8068,7 +8086,8 @@ void TerrainRenderer::UpdateWaterBodyUniform(uint32_t frameIndex,
                                              const WorldCamera& camera,
                                              double timeSeconds,
                                              WaterBodyGpu& waterBody,
-                                             bool reflectionTarget)
+                                             bool reflectionTarget,
+                                             uint32_t viewIndex)
 {
     if (frameIndex >= kFramesInFlight)
         return;
@@ -8107,5 +8126,7 @@ void TerrainRenderer::UpdateWaterBodyUniform(uint32_t frameIndex,
             uniform.textureScroll[3] = 0.02f;
         }
     }
-    UploadWaterUniform(waterBody.uniformBuffers[frameIndex], uniform);
+    UploadWaterUniform(
+        (viewIndex == 0) ? waterBody.uniformBuffers[frameIndex] : waterBody.uniformBuffersSecondary[frameIndex],
+        uniform);
 }

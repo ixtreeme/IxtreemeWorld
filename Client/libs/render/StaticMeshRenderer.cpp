@@ -2984,13 +2984,31 @@ bool StaticMeshRenderer::EnsureInstanceCapacity(VulkanDevice& device, uint32_t f
     while (nextCapacity < requiredRecords)
         nextCapacity *= 2u;
 
-    DestroyBuffer(m_instanceBuffers[frameIndex]);
+    // Preserve instance records already written this frame: growing mid-frame rebinds the
+    // descriptor sets to the new buffer, so earlier (recorded but not executed) draws must
+    // still find their transforms at the same offsets.
+    Buffer previous = m_instanceBuffers[frameIndex];
+    const std::uint32_t previousCapacity = m_instanceBufferCapacity[frameIndex];
+    m_instanceBuffers[frameIndex] = {};
     CreateHostVisibleBuffer(device,
         m_device,
         sizeof(StaticMeshInstanceBlock) * nextCapacity,
         VK_BUFFER_USAGE_STORAGE_BUFFER_BIT,
         nullptr,
         m_instanceBuffers[frameIndex]);
+    if (previous.buffer && previous.memory && previousCapacity > 0)
+    {
+        void* src = nullptr;
+        void* dst = nullptr;
+        if (vkMapMemory(m_device, previous.memory, 0, VK_WHOLE_SIZE, 0, &src) == VK_SUCCESS &&
+            vkMapMemory(m_device, m_instanceBuffers[frameIndex].memory, 0, VK_WHOLE_SIZE, 0, &dst) == VK_SUCCESS)
+        {
+            std::memcpy(dst, src, sizeof(StaticMeshInstanceBlock) * previousCapacity);
+            vkUnmapMemory(m_device, m_instanceBuffers[frameIndex].memory);
+            vkUnmapMemory(m_device, previous.memory);
+        }
+    }
+    DestroyBuffer(previous);
     m_instanceBufferCapacity[frameIndex] = nextCapacity;
     UpdateInstanceDescriptorSets(frameIndex);
     m_lastInstanceBufferRebuilt = true;
@@ -3230,7 +3248,9 @@ void StaticMeshRenderer::RenderLodBatchInWorld(VulkanDevice& device,
     {
         m_worldRenderFrameIndex = frameIndex;
         m_worldUniformCursor = 0;
+        m_worldInstanceCursor = 0;
     }
+    const uint32_t instanceBase = m_worldInstanceCursor;
 
     std::vector<StaticMeshInstanceBlock> instanceBlocks;
     std::vector<InstancedDrawCommand> drawCommands;
@@ -3248,7 +3268,7 @@ void StaticMeshRenderer::RenderLodBatchInWorld(VulkanDevice& device,
             InstancedDrawCommand command{};
             command.firstIndex = firstIndex;
             command.indexCount = indexCount;
-            command.firstInstance = static_cast<uint32_t>(instanceBlocks.size());
+            command.firstInstance = instanceBase + static_cast<uint32_t>(instanceBlocks.size());
             command.instanceCount = static_cast<uint32_t>(instances.size());
             command.materialSlot = materialSlot;
             command.sourceSubmesh = sourceSubmesh;
@@ -3288,18 +3308,25 @@ void StaticMeshRenderer::RenderLodBatchInWorld(VulkanDevice& device,
         }
     }
 
-    if (instanceBlocks.empty() || !EnsureInstanceCapacity(device, frameIndex, static_cast<std::uint32_t>(instanceBlocks.size())))
+    const std::uint32_t instanceCount = static_cast<std::uint32_t>(instanceBlocks.size());
+    if (instanceBlocks.empty() || !EnsureInstanceCapacity(device, frameIndex, instanceBase + instanceCount))
         return;
-    m_lastInstanceBufferBytes = instanceBlocks.size() * sizeof(StaticMeshInstanceBlock);
+    const VkDeviceSize blockBytes = sizeof(StaticMeshInstanceBlock);
+    m_lastInstanceBufferBytes = instanceCount * blockBytes;
+    // Append at the per-frame cursor offset (not offset 0) so multiple calls to this
+    // renderer in one frame don't clobber each other's instance transforms.
     void* mapped = nullptr;
     VK_CHECK(vkMapMemory(m_device,
         m_instanceBuffers[frameIndex].memory,
         0,
-        static_cast<VkDeviceSize>(m_lastInstanceBufferBytes),
+        VK_WHOLE_SIZE,
         0,
         &mapped));
-    std::memcpy(mapped, instanceBlocks.data(), m_lastInstanceBufferBytes);
+    std::memcpy(static_cast<char*>(mapped) + static_cast<VkDeviceSize>(instanceBase) * blockBytes,
+        instanceBlocks.data(),
+        m_lastInstanceBufferBytes);
     vkUnmapMemory(m_device, m_instanceBuffers[frameIndex].memory);
+    m_worldInstanceCursor = instanceBase + instanceCount;
 
     VkCommandBuffer cmd = device.GetCommandBuffer();
     VkViewport viewport{};

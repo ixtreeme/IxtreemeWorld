@@ -9451,9 +9451,10 @@ int RunGame(NativeWindow& window,
                         // Scene View's free-fly terrain (viewIndex=0, recorded earlier this
                         // frame into the same command buffer). Static meshes already use
                         // per-draw uniforms and are safe.
-                        // NOTE: water (RenderWater) still uses per-water-body uniforms shared
-                        // across views, so it is not yet drawn here — that needs a per-body
-                        // secondary path (follow-up). Default scenes have no water.
+                        // Water uses the secondary per-water-body uniform/descriptor path
+                        // (viewIndex=1) so it can be drawn from the Main Camera without
+                        // clobbering the Scene View's water; reflection/refraction reuse this
+                        // frame's Scene-view textures (acceptable; per-view RTs are a refinement).
                         if (hasSceneTerrain)
                         {
                             terrain.Render(device, gameCamera, gameExtent, /*viewIndex=*/1);
@@ -9480,6 +9481,10 @@ int RunGame(NativeWindow& window,
                                 instance.materialOverrides = mesh.materialOverrides;
                                 renderer->RenderInWorld(device, seconds, gameCamera, instance, gameExtent);
                             }
+                        }
+                        if (hasSceneTerrain)
+                        {
+                            terrain.RenderWater(device, gameCamera, seconds, gameExtent, /*viewIndex=*/1);
                         }
                         gameView.EndMainPass(device);
                     }
