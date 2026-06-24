@@ -1213,6 +1213,63 @@ std::vector<SelectionOutlineRenderer::Line> BuildPhysicsContactLines(const std::
     return lines;
 }
 
+// Builds a wireframe view frustum (near quad + far quad + connecting edges, plus a small
+// roof triangle marking "up") for a scene CameraEntity, so the editor Scene View shows
+// what the Game / Main Camera sees. Matches BuildCameraFromEntity's basis convention
+// (rotation[0]=pitch, rotation[1]=yaw, no roll); aspect should be the Game view's.
+std::vector<SelectionOutlineRenderer::Line> BuildCameraFrustumLines(
+    const CameraEntity& cameraEntity,
+    std::uint32_t viewWidth,
+    std::uint32_t viewHeight,
+    const std::array<float, 4>& color)
+{
+    std::vector<SelectionOutlineRenderer::Line> lines;
+
+    const float aspect = viewHeight != 0
+        ? static_cast<float>(viewWidth) / static_cast<float>(viewHeight)
+        : 1.0f;
+    const float yaw = cameraEntity.rotation[1];
+    const WorldVec3 eye{cameraEntity.position[0], cameraEntity.position[1], cameraEntity.position[2]};
+    const WorldVec3 forward = WorldForwardFromYawPitch(yaw, cameraEntity.rotation[0]);
+    // right is horizontal (no roll); up = forward x right is already unit since forward and
+    // right are orthonormal. This matches WorldLookAt(eye, target, {0,1,0}).
+    const WorldVec3 right{std::cos(yaw), 0.0f, -std::sin(yaw)};
+    const WorldVec3 up{
+        forward.y * right.z - forward.z * right.y,
+        forward.z * right.x - forward.x * right.z,
+        forward.x * right.y - forward.y * right.x};
+
+    const float fovY = xm::DegreesToRadians(std::clamp(cameraEntity.fovDegrees, 1.0f, 179.0f));
+    const float tanHalf = std::tan(fovY * 0.5f);
+    const float nearDist = std::max(0.001f, cameraEntity.nearPlane);
+    const float farDist = std::max(nearDist + 0.001f, cameraEntity.farPlane);
+
+    auto planeCorners = [&](float dist, WorldVec3 out[4]) {
+        const float halfH = tanHalf * dist;
+        const float halfW = halfH * aspect;
+        const WorldVec3 center = eye + forward * dist;
+        out[0] = center - right * halfW - up * halfH; // bottom-left
+        out[1] = center + right * halfW - up * halfH; // bottom-right
+        out[2] = center + right * halfW + up * halfH; // top-right
+        out[3] = center - right * halfW + up * halfH; // top-left
+    };
+
+    WorldVec3 nearC[4];
+    WorldVec3 farC[4];
+    planeCorners(nearDist, nearC);
+    planeCorners(farDist, farC);
+
+    lines.reserve(12u);
+    for (int i = 0; i < 4; ++i)
+        lines.push_back({nearC[i], nearC[(i + 1) % 4], color}); // near quad
+    for (int i = 0; i < 4; ++i)
+        lines.push_back({farC[i], farC[(i + 1) % 4], color});   // far quad
+    for (int i = 0; i < 4; ++i)
+        lines.push_back({nearC[i], farC[i], color});            // connectors
+
+    return lines;
+}
+
 void AppendPhysicsDebugCircle(
     std::vector<PhysicsDebugLine>& lines,
     WorldVec3 center,
@@ -1513,6 +1570,16 @@ void MergeMapEditorCommands(MapEditorCommands& target, const MapEditorCommands& 
     {
         target.selectedMeshEntityChanged = true;
         target.selectedMeshEntity = source.selectedMeshEntity;
+    }
+    if (source.selectedCameraChanged)
+    {
+        target.selectedCameraChanged = true;
+        target.selectedCamera = source.selectedCamera;
+    }
+    if (source.setMainCameraRequested)
+    {
+        target.setMainCameraRequested = true;
+        target.setMainCameraId = source.setMainCameraId;
     }
     if (source.hierarchySelectEntity)
     {
@@ -8988,6 +9055,25 @@ int RunGame(NativeWindow& window,
                         selectionLines.insert(selectionLines.end(),
                             physicsQueryLines.begin(),
                             physicsQueryLines.end());
+                    }
+                    // Draw the selected camera's view frustum so the Scene View shows what the
+                    // Game / Main Camera sees. Uses the Game view's aspect for an accurate cone.
+                    if (selectedEditorObject.type == SelectedEditorObjectType::Camera)
+                    {
+                        for (const CameraEntity& cameraEntity : editorCameras)
+                        {
+                            if (cameraEntity.id != selectedEditorObject.id)
+                                continue;
+                            const VkExtent2D frustumExtent = gameViewOk ? gameView.GetExtent() : renderSize;
+                            std::vector<SelectionOutlineRenderer::Line> frustumLines =
+                                BuildCameraFrustumLines(cameraEntity,
+                                    frustumExtent.width, frustumExtent.height,
+                                    {0.30f, 0.85f, 1.0f, 0.9f});
+                            selectionLines.insert(selectionLines.end(),
+                                frustumLines.begin(),
+                                frustumLines.end());
+                            break;
+                        }
                     }
                     selectionOutlines.Render(device, camera, selectionLines, renderSize);
                 }
