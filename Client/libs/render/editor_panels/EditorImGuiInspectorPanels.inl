@@ -96,6 +96,8 @@ void EditorImGui::RenderAddComponentMenu()
             return hasMesh && m_meshRendererState.hasFixedJoint;
         if (id == "physics.hinge_joint")
             return hasMesh && m_meshRendererState.hasHingeJoint;
+        if (id == "physics.character_controller")
+            return hasMesh && m_meshRendererState.hasCharacterController;
         return hasMesh && hasAttachedComponent(definition.id);
     };
 
@@ -748,6 +750,60 @@ bool EditorImGui::RenderSelectedMeshPhysicsComponents()
                 ImGui::TextDisabled("Pick another mesh entity with a Rigidbody before entering Play.");
             else
                 ImGui::TextDisabled("Allows rotation around the axis between this body and entity %u.", joint.connectedEntityId);
+        }
+        ImGui::PopID();
+    }
+
+    if (m_meshRendererState.hasCharacterController)
+    {
+        ImGui::PushID("physics.character_controller");
+        const bool open = ImGui::CollapsingHeader(ICON_FA_PERSON_RUNNING " Character Controller", ImGuiTreeNodeFlags_DefaultOpen);
+        componentMenu("CharacterControllerComponentMenu", "physics.character_controller");
+        if (open)
+        {
+            auto& cc = m_meshRendererState.characterController;
+            changed |= ImGui::Checkbox("Enabled", &cc.enabled);
+            ImGui::TextDisabled("Tags this entity as the player. WASD + Space drive it in Play.");
+
+            const char* cameraModes[] = {"First Person", "Third Person", "Top Down"};
+            int cameraModeIndex = std::clamp(static_cast<int>(cc.cameraMode), 0, 2);
+            if (ImGui::Combo("Camera Mode", &cameraModeIndex, cameraModes, IM_ARRAYSIZE(cameraModes)))
+            {
+                cc.cameraMode = static_cast<ixtreeme::physics::CameraMode>(cameraModeIndex);
+                changed = true;
+            }
+
+            ImGui::SeparatorText("Movement");
+            changed |= ImGui::DragFloat("Walk Speed", &cc.walkSpeed, 0.1f, 0.1f, 100.0f, "%.1f m/s");
+            changed |= ImGui::DragFloat("Run Speed", &cc.runSpeed, 0.1f, 0.1f, 100.0f, "%.1f m/s");
+            changed |= ImGui::DragFloat("Jump Height", &cc.jumpHeight, 0.05f, 0.0f, 50.0f, "%.2f m");
+            changed |= ImGui::DragFloat("Gravity Scale", &cc.gravityScale, 0.05f, 0.0f, 10.0f, "%.2f");
+            changed |= ImGui::DragFloat("Slope Limit", &cc.slopeLimitDegrees, 0.5f, 1.0f, 89.0f, "%.0f deg");
+            changed |= ImGui::DragFloat("Step Height", &cc.stepHeight, 0.01f, 0.0f, 5.0f, "%.2f m");
+
+            ImGui::SeparatorText("Capsule");
+            changed |= ImGui::DragFloat("Capsule Radius", &cc.capsuleRadius, 0.01f, 0.05f, 5.0f, "%.2f m");
+            changed |= ImGui::DragFloat("Capsule Height", &cc.capsuleHeight, 0.05f, 0.2f, 10.0f, "%.2f m");
+
+            ImGui::SeparatorText("Camera");
+            changed |= ImGui::DragFloat("Mouse Sensitivity", &cc.mouseSensitivity, 0.01f, 0.01f, 2.0f, "%.2f");
+            if (cc.cameraMode == ixtreeme::physics::CameraMode::FirstPerson)
+            {
+                changed |= ImGui::DragFloat("Eye Height", &cc.eyeHeight, 0.02f, 0.1f, 10.0f, "%.2f m");
+            }
+            else if (cc.cameraMode == ixtreeme::physics::CameraMode::ThirdPerson)
+            {
+                changed |= ImGui::DragFloat("Distance", &cc.thirdPersonDistance, 0.1f, 0.5f, 50.0f, "%.1f m");
+                changed |= ImGui::DragFloat("Height", &cc.thirdPersonHeight, 0.05f, 0.0f, 50.0f, "%.2f m");
+                changed |= ImGui::DragFloat("Pitch", &cc.thirdPersonPitchDegrees, 0.5f, -89.0f, 89.0f, "%.0f deg");
+            }
+            else
+            {
+                changed |= ImGui::DragFloat("Camera Height", &cc.topDownHeight, 0.2f, 1.0f, 200.0f, "%.1f m");
+                changed |= ImGui::DragFloat("Camera Pitch", &cc.topDownPitchDegrees, 0.5f, 10.0f, 89.0f, "%.0f deg");
+            }
+            ixtreeme::physics::Sanitize(cc);
+            ImGui::TextDisabled("Right-drag in the Game view to look around.");
         }
         ImGui::PopID();
     }

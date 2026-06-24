@@ -93,6 +93,41 @@ struct HingeJointComponent
     float frictionTorque = 0.0f;
 };
 
+// Selectable camera perspective for a player character (Unity/Unreal-style).
+enum class CameraMode : std::uint8_t
+{
+    FirstPerson,
+    ThirdPerson,
+    TopDown
+};
+
+// Tags a MeshSceneEntity as a player character and holds movement + camera tunables.
+// At Play, a kinematic capsule is driven by input (camera-relative WASD + jump), gravity,
+// ground raycast, slope limit and step-up; the Main Camera follows per cameraMode.
+struct CharacterControllerComponent
+{
+    bool enabled = true;
+    // Movement
+    float walkSpeed = 4.0f;            // m/s
+    float runSpeed = 7.0f;             // m/s (Shift held)
+    float jumpHeight = 1.2f;           // meters apex above feet
+    float gravityScale = 1.0f;         // multiplies world gravity
+    float slopeLimitDegrees = 50.0f;   // steepest walkable ground
+    float stepHeight = 0.35f;          // max auto step-up height
+    // Capsule (defaults; the entity's Capsule collider overrides if present)
+    float capsuleRadius = 0.35f;
+    float capsuleHeight = 1.8f;
+    // Camera
+    CameraMode cameraMode = CameraMode::ThirdPerson;
+    float eyeHeight = 1.6f;             // FirstPerson: camera height above feet
+    float thirdPersonDistance = 5.0f;  // ThirdPerson: distance behind character
+    float thirdPersonHeight = 2.0f;    // ThirdPerson: height above feet of pivot
+    float thirdPersonPitchDegrees = 15.0f; // ThirdPerson: default downward look
+    float topDownHeight = 14.0f;       // TopDown: camera height above character
+    float topDownPitchDegrees = 70.0f; // TopDown: downward angle
+    float mouseSensitivity = 0.15f;    // degrees per pixel of mouse-look
+};
+
 inline const char* ToString(BodyType type)
 {
     switch (type)
@@ -286,6 +321,58 @@ inline void Sanitize(ColliderComponent& collider)
     collider.height = std::max(collider.radius * 2.0f, collider.height);
     collider.friction = std::clamp(collider.friction, 0.0f, 4.0f);
     collider.restitution = std::clamp(collider.restitution, 0.0f, 1.0f);
+}
+
+inline const char* ToString(CameraMode mode)
+{
+    switch (mode)
+    {
+    case CameraMode::FirstPerson: return "first_person";
+    case CameraMode::ThirdPerson: return "third_person";
+    case CameraMode::TopDown: return "top_down";
+    default: return "third_person";
+    }
+}
+
+inline const char* DisplayName(CameraMode mode)
+{
+    switch (mode)
+    {
+    case CameraMode::FirstPerson: return "First Person";
+    case CameraMode::ThirdPerson: return "Third Person";
+    case CameraMode::TopDown: return "Top Down";
+    default: return "Third Person";
+    }
+}
+
+inline CameraMode CameraModeFromString(const std::string& text, CameraMode fallback = CameraMode::ThirdPerson)
+{
+    if (text == "first_person" || text == "fps")
+        return CameraMode::FirstPerson;
+    if (text == "third_person" || text == "tps")
+        return CameraMode::ThirdPerson;
+    if (text == "top_down" || text == "topdown")
+        return CameraMode::TopDown;
+    return fallback;
+}
+
+inline void Sanitize(CharacterControllerComponent& controller)
+{
+    controller.walkSpeed = std::clamp(controller.walkSpeed, 0.1f, 100.0f);
+    controller.runSpeed = std::max(controller.walkSpeed, controller.runSpeed);
+    controller.jumpHeight = std::clamp(controller.jumpHeight, 0.0f, 50.0f);
+    controller.gravityScale = std::clamp(controller.gravityScale, 0.0f, 10.0f);
+    controller.slopeLimitDegrees = std::clamp(controller.slopeLimitDegrees, 1.0f, 89.0f);
+    controller.stepHeight = std::clamp(controller.stepHeight, 0.0f, 5.0f);
+    controller.capsuleRadius = std::clamp(controller.capsuleRadius, 0.05f, 5.0f);
+    controller.capsuleHeight = std::max(controller.capsuleRadius * 2.0f, controller.capsuleHeight);
+    controller.eyeHeight = std::clamp(controller.eyeHeight, 0.1f, 10.0f);
+    controller.thirdPersonDistance = std::clamp(controller.thirdPersonDistance, 0.5f, 50.0f);
+    controller.thirdPersonHeight = std::clamp(controller.thirdPersonHeight, 0.0f, 50.0f);
+    controller.thirdPersonPitchDegrees = std::clamp(controller.thirdPersonPitchDegrees, -89.0f, 89.0f);
+    controller.topDownHeight = std::clamp(controller.topDownHeight, 1.0f, 200.0f);
+    controller.topDownPitchDegrees = std::clamp(controller.topDownPitchDegrees, 10.0f, 89.0f);
+    controller.mouseSensitivity = std::clamp(controller.mouseSensitivity, 0.01f, 2.0f);
 }
 
 } // namespace ixtreeme::physics

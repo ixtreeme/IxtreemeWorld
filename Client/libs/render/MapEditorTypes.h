@@ -392,6 +392,8 @@ struct MeshSceneEntity
     ixtreeme::physics::FixedJointComponent fixedJoint;
     bool hasHingeJoint = false;
     ixtreeme::physics::HingeJointComponent hingeJoint;
+    bool hasCharacterController = false;
+    ixtreeme::physics::CharacterControllerComponent characterController;
 };
 
 struct TerrainSceneData
@@ -450,7 +452,8 @@ enum class EditorComponentType
     TriggerSphere,
     TriggerCapsule,
     FixedJoint,
-    HingeJoint
+    HingeJoint,
+    CharacterController
 };
 
 struct HierarchySceneEntity
@@ -515,6 +518,8 @@ struct MeshRendererEditorState
     ixtreeme::physics::FixedJointComponent fixedJoint;
     bool hasHingeJoint = false;
     ixtreeme::physics::HingeJointComponent hingeJoint;
+    bool hasCharacterController = false;
+    ixtreeme::physics::CharacterControllerComponent characterController;
 };
 
 struct TerrainEditorState

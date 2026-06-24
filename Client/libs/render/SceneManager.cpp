@@ -1139,6 +1139,29 @@ void WriteHingeJointComponent(std::ostream& out, const ixtreeme::physics::HingeJ
     out << "      }";
 }
 
+void WriteCharacterControllerComponent(std::ostream& out, const ixtreeme::physics::CharacterControllerComponent& cc)
+{
+    out << "      \"character_controller\": {\n";
+    out << "        \"enabled\": " << (cc.enabled ? "true" : "false") << ",\n";
+    out << "        \"walk_speed\": " << cc.walkSpeed << ",\n";
+    out << "        \"run_speed\": " << cc.runSpeed << ",\n";
+    out << "        \"jump_height\": " << cc.jumpHeight << ",\n";
+    out << "        \"gravity_scale\": " << cc.gravityScale << ",\n";
+    out << "        \"slope_limit_deg\": " << cc.slopeLimitDegrees << ",\n";
+    out << "        \"step_height\": " << cc.stepHeight << ",\n";
+    out << "        \"capsule_radius\": " << cc.capsuleRadius << ",\n";
+    out << "        \"capsule_height\": " << cc.capsuleHeight << ",\n";
+    out << "        \"camera_mode\": \"" << ixtreeme::physics::ToString(cc.cameraMode) << "\",\n";
+    out << "        \"eye_height\": " << cc.eyeHeight << ",\n";
+    out << "        \"third_person_distance\": " << cc.thirdPersonDistance << ",\n";
+    out << "        \"third_person_height\": " << cc.thirdPersonHeight << ",\n";
+    out << "        \"third_person_pitch_deg\": " << cc.thirdPersonPitchDegrees << ",\n";
+    out << "        \"top_down_height\": " << cc.topDownHeight << ",\n";
+    out << "        \"top_down_pitch_deg\": " << cc.topDownPitchDegrees << ",\n";
+    out << "        \"mouse_sensitivity\": " << cc.mouseSensitivity << "\n";
+    out << "      }";
+}
+
 void WriteSceneEntity(std::ostream& out, const MeshSceneEntity& mesh, bool comma)
 {
     out << "    {\n";
@@ -1218,6 +1241,14 @@ void WriteSceneEntity(std::ostream& out, const MeshSceneEntity& mesh, bool comma
         Tracenf("[PHYSICS-JOINT] saved hinge entity=%u connected=%u",
             mesh.id,
             mesh.hingeJoint.connectedEntityId);
+    }
+    if (mesh.hasCharacterController)
+    {
+        out << ",\n";
+        WriteCharacterControllerComponent(out, mesh.characterController);
+        Tracenf("[CHARACTER] saved controller entity=%u camera=%s",
+            mesh.id,
+            ixtreeme::physics::ToString(mesh.characterController.cameraMode));
     }
     out << "\n";
     out << "    }" << (comma ? "," : "") << "\n";
@@ -1463,6 +1494,33 @@ ixtreeme::physics::HingeJointComponent ReadHingeJointComponent(const JsonValue& 
     return joint;
 }
 
+ixtreeme::physics::CharacterControllerComponent ReadCharacterControllerComponent(const JsonValue& entity)
+{
+    ixtreeme::physics::CharacterControllerComponent cc;
+    if (const JsonValue* object = Find(entity, "character_controller"); object && object->type == JsonValue::Type::Object)
+    {
+        cc.enabled = ReadBool(*object, "enabled", cc.enabled);
+        cc.walkSpeed = ReadFloat(*object, "walk_speed", cc.walkSpeed);
+        cc.runSpeed = ReadFloat(*object, "run_speed", cc.runSpeed);
+        cc.jumpHeight = ReadFloat(*object, "jump_height", cc.jumpHeight);
+        cc.gravityScale = ReadFloat(*object, "gravity_scale", cc.gravityScale);
+        cc.slopeLimitDegrees = ReadFloat(*object, "slope_limit_deg", cc.slopeLimitDegrees);
+        cc.stepHeight = ReadFloat(*object, "step_height", cc.stepHeight);
+        cc.capsuleRadius = ReadFloat(*object, "capsule_radius", cc.capsuleRadius);
+        cc.capsuleHeight = ReadFloat(*object, "capsule_height", cc.capsuleHeight);
+        cc.cameraMode = ixtreeme::physics::CameraModeFromString(ReadString(*object, "camera_mode"), cc.cameraMode);
+        cc.eyeHeight = ReadFloat(*object, "eye_height", cc.eyeHeight);
+        cc.thirdPersonDistance = ReadFloat(*object, "third_person_distance", cc.thirdPersonDistance);
+        cc.thirdPersonHeight = ReadFloat(*object, "third_person_height", cc.thirdPersonHeight);
+        cc.thirdPersonPitchDegrees = ReadFloat(*object, "third_person_pitch_deg", cc.thirdPersonPitchDegrees);
+        cc.topDownHeight = ReadFloat(*object, "top_down_height", cc.topDownHeight);
+        cc.topDownPitchDegrees = ReadFloat(*object, "top_down_pitch_deg", cc.topDownPitchDegrees);
+        cc.mouseSensitivity = ReadFloat(*object, "mouse_sensitivity", cc.mouseSensitivity);
+        ixtreeme::physics::Sanitize(cc);
+    }
+    return cc;
+}
+
 MeshSceneEntity ReadMeshSceneEntity(const JsonValue& entity)
 {
     MeshSceneEntity mesh;
@@ -1517,6 +1575,11 @@ MeshSceneEntity ReadMeshSceneEntity(const JsonValue& entity)
     {
         mesh.hasHingeJoint = true;
         mesh.hingeJoint = ReadHingeJointComponent(entity);
+    }
+    if (Find(entity, "character_controller"))
+    {
+        mesh.hasCharacterController = true;
+        mesh.characterController = ReadCharacterControllerComponent(entity);
     }
     if (mesh.lod.enabled &&
         std::none_of(mesh.editorComponents.begin(), mesh.editorComponents.end(), [](const EditorAttachedComponent& component) {

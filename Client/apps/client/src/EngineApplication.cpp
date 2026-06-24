@@ -106,6 +106,184 @@ WorldCamera BuildCameraFromEntity(const CameraEntity& cameraEntity, uint32_t wid
     return camera;
 }
 
+// Per-frame runtime state for a player character (persists across frames in Play mode).
+struct CharacterRuntimeState
+{
+    bool initialized = false;
+    WorldVec3 velocity{0.0f, 0.0f, 0.0f};
+    bool grounded = false;
+    float lookYaw = 0.0f;   // camera/heading yaw (radians)
+    float lookPitch = 0.0f; // camera pitch (radians)
+};
+
+// Advances one player character (kinematic capsule) for this frame: camera-relative WASD
+// move + run, gravity, downward-raycast ground detection + jump, slope limit, and wall
+// depenetration via capsule overlap. Writes the resolved transform back to the mesh; the
+// existing kinematic sync in stepEditorPhysicsWorld then moves the Jolt body to match.
+void UpdateCharacterController(
+    phys::PhysicsWorld& world,
+    phys::BodyId selfBody,
+    MeshSceneEntity& mesh,
+    const phys::CharacterControllerComponent& cc,
+    CharacterRuntimeState& state,
+    const MovementInputState& input,
+    bool inputActive,
+    float lookDx,
+    float lookDy,
+    const float worldGravity[3],
+    float dt)
+{
+    if (dt <= 0.0f)
+        return;
+    dt = std::min(dt, 0.05f); // clamp for stability under frame spikes
+
+    // --- mouse-look (right-drag deltas in pixels) ---
+    const float sens = cc.mouseSensitivity;
+    state.lookYaw += xm::DegreesToRadians(lookDx * sens);
+    state.lookPitch -= xm::DegreesToRadians(lookDy * sens);
+    const float pitchLimit = xm::DegreesToRadians(85.0f);
+    state.lookPitch = std::clamp(state.lookPitch, -pitchLimit, pitchLimit);
+
+    // --- camera-relative horizontal input ---
+    const float yaw = state.lookYaw;
+    const float fwdX = std::sin(yaw), fwdZ = std::cos(yaw);
+    const float rightX = std::cos(yaw), rightZ = -std::sin(yaw);
+    float fb = 0.0f, lr = 0.0f;
+    if (inputActive)
+    {
+        fb = (input.w ? 1.0f : 0.0f) - (input.s ? 1.0f : 0.0f);
+        lr = (input.d ? 1.0f : 0.0f) - (input.a ? 1.0f : 0.0f);
+    }
+    float moveX = fwdX * fb + rightX * lr;
+    float moveZ = fwdZ * fb + rightZ * lr;
+    const float moveLen = std::sqrt(moveX * moveX + moveZ * moveZ);
+    if (moveLen > 0.0001f)
+    {
+        moveX /= moveLen;
+        moveZ /= moveLen;
+    }
+    else
+    {
+        moveX = 0.0f;
+        moveZ = 0.0f;
+    }
+    const float speed = (inputActive && input.shift) ? cc.runSpeed : cc.walkSpeed;
+
+    // --- gravity / jump (vertical velocity) ---
+    const float gY = worldGravity[1] * cc.gravityScale; // negative downward
+    const bool jumpPressed = inputActive && input.space;
+    if (state.grounded && jumpPressed)
+        state.velocity.y = std::sqrt(std::max(0.0f, -2.0f * gY * cc.jumpHeight));
+    else if (state.grounded)
+        state.velocity.y = -2.0f; // small stick-down so the ground ray keeps contact
+    else
+        state.velocity.y += gY * dt;
+
+    // --- integrate position (feet) ---
+    float feetX = mesh.position[0] + moveX * speed * dt;
+    float feetY = mesh.position[1] + state.velocity.y * dt;
+    float feetZ = mesh.position[2] + moveZ * speed * dt;
+
+    const float radius = cc.capsuleRadius;
+    const float height = std::max(cc.capsuleHeight, radius * 2.0f + 0.01f);
+    const float cylinderHalf = std::max(0.001f, height * 0.5f - radius);
+
+    phys::PhysicsQueryFilter filter{};
+    filter.hitTriggers = false;
+    filter.ignoreBody = selfBody;
+
+    // --- wall depenetration via capsule overlap (skip walkable floors) ---
+    for (int iter = 0; iter < 3; ++iter)
+    {
+        const float center[3] = {feetX, feetY + height * 0.5f, feetZ};
+        const std::vector<phys::PhysicsOverlapHit> hits =
+            world.OverlapCapsule(center, cylinderHalf, radius, filter, 16);
+        bool pushed = false;
+        for (const phys::PhysicsOverlapHit& hit : hits)
+        {
+            if (hit.bodyId == selfBody || hit.normal[1] > 0.7f || hit.penetrationDepth <= 0.0f)
+                continue;
+            feetX += hit.normal[0] * hit.penetrationDepth;
+            feetZ += hit.normal[2] * hit.penetrationDepth;
+            pushed = true;
+        }
+        if (!pushed)
+            break;
+    }
+
+    // --- ground detection (downward ray from capsule center) ---
+    const float origin[3] = {feetX, feetY + height * 0.5f, feetZ};
+    const float down[3] = {0.0f, -1.0f, 0.0f};
+    const float maxDist = height * 0.5f + cc.stepHeight + 0.4f;
+    phys::PhysicsRaycastHit groundHit{};
+    bool grounded = false;
+    if (world.Raycast(origin, down, maxDist, filter, groundHit) && groundHit.hit)
+    {
+        const float groundY = groundHit.position[1];
+        const float walkableCos = std::cos(xm::DegreesToRadians(cc.slopeLimitDegrees));
+        const float feetToGround = feetY - groundY;
+        if (groundHit.normal[1] >= walkableCos &&
+            feetToGround <= cc.stepHeight + 0.05f &&
+            state.velocity.y <= 0.01f)
+        {
+            feetY = groundY; // snap onto ground / small step
+            state.velocity.y = 0.0f;
+            grounded = true;
+        }
+    }
+    state.grounded = grounded;
+
+    mesh.position[0] = feetX;
+    mesh.position[1] = feetY;
+    mesh.position[2] = feetZ;
+    if (moveLen > 0.0001f)
+        mesh.rotation[1] = std::atan2(moveX, moveZ); // face travel direction
+}
+
+// Builds the Game-view camera transform that follows a player character, per camera mode.
+// Copies fov/near/far from the scene's Main Camera and overrides position/rotation.
+CameraEntity ComputeCharacterCameraEntity(
+    const CameraEntity& base,
+    const MeshSceneEntity& mesh,
+    const phys::CharacterControllerComponent& cc,
+    const CharacterRuntimeState& state)
+{
+    CameraEntity cam = base;
+    const float feetX = mesh.position[0], feetY = mesh.position[1], feetZ = mesh.position[2];
+    const float yaw = state.lookYaw;
+    if (cc.cameraMode == phys::CameraMode::FirstPerson)
+    {
+        cam.position[0] = feetX;
+        cam.position[1] = feetY + cc.eyeHeight;
+        cam.position[2] = feetZ;
+        cam.rotation[0] = state.lookPitch;
+        cam.rotation[1] = yaw;
+        cam.rotation[2] = 0.0f;
+    }
+    else if (cc.cameraMode == phys::CameraMode::ThirdPerson)
+    {
+        const WorldVec3 dir = WorldForwardFromYawPitch(yaw, state.lookPitch);
+        cam.position[0] = feetX - dir.x * cc.thirdPersonDistance;
+        cam.position[1] = feetY + cc.thirdPersonHeight - dir.y * cc.thirdPersonDistance;
+        cam.position[2] = feetZ - dir.z * cc.thirdPersonDistance;
+        cam.rotation[0] = state.lookPitch;
+        cam.rotation[1] = yaw;
+        cam.rotation[2] = 0.0f;
+    }
+    else // TopDown
+    {
+        const float pitch = -xm::DegreesToRadians(cc.topDownPitchDegrees);
+        const WorldVec3 dir = WorldForwardFromYawPitch(yaw, pitch);
+        cam.position[0] = feetX - dir.x * cc.topDownHeight;
+        cam.position[1] = feetY + 1.0f - dir.y * cc.topDownHeight;
+        cam.position[2] = feetZ - dir.z * cc.topDownHeight;
+        cam.rotation[0] = pitch;
+        cam.rotation[1] = yaw;
+        cam.rotation[2] = 0.0f;
+    }
+    return cam;
+}
+
 const char* InputEventTypeName(InputEvent::Type type)
 {
     switch (type)
@@ -335,6 +513,8 @@ MeshRendererEditorState BuildMeshRendererEditorState(const std::vector<MeshScene
     state.fixedJoint = it->fixedJoint;
     state.hasHingeJoint = it->hasHingeJoint;
     state.hingeJoint = it->hingeJoint;
+    state.hasCharacterController = it->hasCharacterController;
+    state.characterController = it->characterController;
     state.materialSlotCount = std::max<std::uint32_t>(
         1u,
         std::max(static_cast<std::uint32_t>(state.materialSlots.size()),
@@ -366,6 +546,8 @@ void ApplyMeshRendererEditorState(MeshSceneEntity& mesh, const MeshRendererEdito
     mesh.fixedJoint = state.fixedJoint;
     mesh.hasHingeJoint = state.hasHingeJoint;
     mesh.hingeJoint = state.hingeJoint;
+    mesh.hasCharacterController = state.hasCharacterController;
+    mesh.characterController = state.characterController;
 }
 
 std::filesystem::path ResolveModelAssetPathForMeta(const std::string& meshAssetPath)
@@ -2158,6 +2340,10 @@ int RunGame(NativeWindow& window,
     std::vector<PhysicsDebugContact> editorPhysicsDebugContacts;
     std::vector<PhysicsDebugLine> editorPhysicsDebugLines;
     PhysicsLayerMatrix editorPhysicsLayerMatrix{};
+    // Player character controllers: per-entity runtime state + accumulated right-drag look.
+    std::unordered_map<std::uint32_t, CharacterRuntimeState> editorCharacterStates;
+    float editorPlayerLookDx = 0.0f;
+    float editorPlayerLookDy = 0.0f;
     bool editorPhysicsWorldActive = false;
     float editorPhysicsAccumulatorSeconds = 0.0f;
     std::uint32_t editorPhysicsStepLogFrames = 0;
@@ -2379,7 +2565,8 @@ int RunGame(NativeWindow& window,
         }
         for (const MeshSceneEntity& mesh : editorMeshEntities)
         {
-            if (!mesh.hasCollider || !mesh.collider.enabled)
+            const bool isCharacter = mesh.hasCharacterController && mesh.characterController.enabled;
+            if ((!mesh.hasCollider || !mesh.collider.enabled) && !isCharacter)
                 continue;
             phys::PhysicsBodyDesc desc{};
             const bool rigidbodyEnabled = mesh.hasRigidbody && mesh.rigidbody.enabled;
@@ -2392,6 +2579,28 @@ int RunGame(NativeWindow& window,
             desc.scale[0] = mesh.scale[0];
             desc.scale[1] = mesh.scale[1];
             desc.scale[2] = mesh.scale[2];
+            if (isCharacter)
+            {
+                // Player character: kinematic capsule on the Player layer, driven by the
+                // CharacterController. Movement is resolved in UpdateCharacterController; the
+                // kinematic sync moves this body to match the mesh each physics step.
+                phys::CharacterControllerComponent cc = mesh.characterController;
+                phys::Sanitize(cc);
+                desc.bodyType = phys::BodyType::Kinematic;
+                desc.rigidbody = phys::RigidbodyComponent{};
+                desc.rigidbody.enabled = true;
+                desc.rigidbody.bodyType = phys::BodyType::Kinematic;
+                desc.rigidbody.useGravity = false;
+                if (!mesh.hasCollider || mesh.collider.shape != phys::ColliderShape::Capsule)
+                {
+                    desc.collider = phys::ColliderComponent{};
+                    desc.collider.shape = phys::ColliderShape::Capsule;
+                    desc.collider.radius = cc.capsuleRadius;
+                    desc.collider.height = cc.capsuleHeight;
+                    desc.collider.center[1] = cc.capsuleHeight * 0.5f; // seat capsule on feet
+                }
+                desc.collider.layer = phys::PhysicsLayer::Player;
+            }
             if (desc.collider.shape == phys::ColliderShape::Mesh ||
                 desc.collider.shape == phys::ColliderShape::ConvexHull)
             {
@@ -2605,8 +2814,12 @@ int RunGame(NativeWindow& window,
             for (const auto& [meshId, bodyId] : editorPhysicsBodies)
             {
                 MeshSceneEntity* mesh = findMeshEntityById(meshId);
-                if (!mesh || !mesh->hasRigidbody || !mesh->rigidbody.enabled ||
-                    mesh->rigidbody.bodyType != phys::BodyType::Kinematic)
+                if (!mesh)
+                    continue;
+                const bool isCharacter = mesh->hasCharacterController && mesh->characterController.enabled;
+                const bool isKinematicRigidbody = mesh->hasRigidbody && mesh->rigidbody.enabled &&
+                    mesh->rigidbody.bodyType == phys::BodyType::Kinematic;
+                if (!isCharacter && !isKinematicRigidbody)
                     continue;
                 if (editorPhysicsWorld.MoveKinematic(bodyId, PhysicsTransformFromMesh(*mesh), fixedDeltaSeconds))
                     ++movedKinematicBodies;
@@ -3147,6 +3360,8 @@ int RunGame(NativeWindow& window,
                              &editorHasMousePosition,
                              &editorLastMouseX,
                              &editorLastMouseY,
+                             &editorPlayerLookDx,
+                             &editorPlayerLookDy,
                              &editorFlyMovement,
                              &rebuildMeshEntityLookup,
                              &syncStaticMeshSpatialEntity,
@@ -3162,6 +3377,15 @@ int RunGame(NativeWindow& window,
             event.type == InputEvent::MouseUp ||
             event.type == InputEvent::MouseWheel)
         {
+            // Accumulate right-drag mouse-look for the player character in Play mode
+            // (cross-platform: uses event deltas, no cursor capture). Consumed + reset
+            // by the per-frame character update.
+            if (event.type == InputEvent::MouseMove && editorRightMouseHeld &&
+                editorHasMousePosition && editorPlay.state.mode == EditorPlayMode::Play)
+            {
+                editorPlayerLookDx += static_cast<float>(event.x - editorLastMouseX);
+                editorPlayerLookDy += static_cast<float>(event.y - editorLastMouseY);
+            }
             editorHasMousePosition = true;
             editorLastMouseX = event.x;
             editorLastMouseY = event.y;
@@ -3274,7 +3498,15 @@ int RunGame(NativeWindow& window,
             editorFlyMovement.ApplyGatedEdge(event, gateOpen);
             return;
         }
-        if (editorImGui.WantsInputCapture(event) && !sceneViewInputTarget && !editorFlyCameraKey)
+        // While a player character is being controlled (Play + editor free-fly handed off),
+        // gameplay input must keep flowing even when the cursor is over the Game view panel
+        // (ImGui reports WantCaptureMouse there); otherwise mouse-look would clear WASD.
+        bool playerInputActive = false;
+#if defined(IXTREEME_WITH_EDITOR)
+        playerInputActive = editorPlay.state.mode == EditorPlayMode::Play && !cameraController.IsFreeCameraEnabled();
+#endif
+        if (editorImGui.WantsInputCapture(event) && !sceneViewInputTarget && !editorFlyCameraKey &&
+            !playerInputActive)
         {
             movement.Clear();
             return;
@@ -4121,13 +4353,47 @@ int RunGame(NativeWindow& window,
         {
             editorPlay.state.elapsedSeconds += deltaSeconds;
             ++editorPlay.state.frameCount;
+            // Drive player character controllers BEFORE the physics step: each writes its
+            // resolved transform to the mesh; the kinematic sync in stepEditorPhysicsWorld
+            // then moves the Jolt body to match (so it pushes dynamic objects).
+            if (editorPhysicsWorldActive)
+            {
+                const PhysicsSceneSettings characterPhysics = SceneManager::Instance().GetCurrentScene().physics;
+                const bool characterInputActive = !runtimeSession->IsTextInputFocused();
+                for (MeshSceneEntity& characterMesh : editorMeshEntities)
+                {
+                    if (!characterMesh.hasCharacterController || !characterMesh.characterController.enabled)
+                        continue;
+                    phys::CharacterControllerComponent cc = characterMesh.characterController;
+                    phys::Sanitize(cc);
+                    CharacterRuntimeState& characterState = editorCharacterStates[characterMesh.id];
+                    if (!characterState.initialized)
+                    {
+                        characterState.lookYaw = characterMesh.rotation[1];
+                        characterState.lookPitch = (cc.cameraMode == phys::CameraMode::ThirdPerson)
+                            ? -xm::DegreesToRadians(cc.thirdPersonPitchDegrees)
+                            : 0.0f;
+                        characterState.initialized = true;
+                    }
+                    phys::BodyId characterBody = 0;
+                    if (auto bodyIt = editorPhysicsBodies.find(characterMesh.id); bodyIt != editorPhysicsBodies.end())
+                        characterBody = bodyIt->second;
+                    UpdateCharacterController(editorPhysicsWorld, characterBody, characterMesh, cc,
+                        characterState, movement, characterInputActive,
+                        editorPlayerLookDx, editorPlayerLookDy,
+                        characterPhysics.gravity, static_cast<float>(deltaSeconds));
+                    syncStaticMeshSpatialEntity(characterMesh);
+                }
+                editorPlayerLookDx = 0.0f;
+                editorPlayerLookDy = 0.0f;
+            }
             stepEditorPhysicsWorld(static_cast<float>(deltaSeconds));
         }
 #endif
         {
             const auto ecsUpdateBegin = std::chrono::steady_clock::now();
             runtimeSession->UpdateNetwork();
-            runtimeSession->SendMoveInput(movement.DirectionAngle(cameraController.MovementYaw()), RuntimeMoveState::Idle);
+            runtimeSession->SendMoveInput(movement.DirectionAngle(cameraController.MovementYaw()), movement.State());
             runtimeSession->Update(seconds);
             rmlUi.Update();
 #if defined(IXTREEME_WITH_EDITOR)
@@ -5412,9 +5678,18 @@ int RunGame(NativeWindow& window,
                     waterSculptStrokeActive = false;
                     editorWaterBodiesDirty = true;
                     terrain.SetWaterSculptBrush(false, 0.0f, 0.0f, 0.0f, true);
-                    cameraController.SetFreeCameraEnabled(true);
+                    // With a player character present, Play hands WASD/Space to the character
+                    // (the editor free-fly would otherwise capture those keys via editorFlyCameraKey).
+                    // Without one, keep free-fly so you can fly around the running simulation.
+                    const bool hasPlayerCharacter = std::any_of(
+                        editorMeshEntities.begin(), editorMeshEntities.end(),
+                        [](const MeshSceneEntity& m) { return m.hasCharacterController && m.characterController.enabled; });
+                    cameraController.SetFreeCameraEnabled(!hasPlayerCharacter);
                     runtimeSession->Start(SceneManager::Instance().GetCurrentScene());
                     rebuildEditorPhysicsWorld();
+                    editorCharacterStates.clear();
+                    editorPlayerLookDx = 0.0f;
+                    editorPlayerLookDy = 0.0f;
                     editorPlay.state.frameCount = 0;
                     editorPlay.state.elapsedSeconds = 0.0;
                     editorPlay.appliedMode = editorPlay.state.mode;
@@ -5430,6 +5705,7 @@ int RunGame(NativeWindow& window,
                     runtimeUi->HideAll();
                     runtimeSession->Stop();
                     clearEditorPhysicsWorld();
+                    editorCharacterStates.clear();
                     editorWaterBodiesDirty = true;
                     if (editorPlay.playStartSceneWasOpen)
                     {
@@ -5448,6 +5724,7 @@ int RunGame(NativeWindow& window,
                         cameraController.RestoreSnapshot(*editorPlay.editorCameraSnapshot);
                         editorPlay.editorCameraSnapshot.reset();
                     }
+                    cameraController.SetFreeCameraEnabled(true); // restore editor free-fly after Play
                     movement.Clear();
                     editorPlay.state.frameCount = 0;
                     editorPlay.state.elapsedSeconds = 0.0;
@@ -7240,6 +7517,16 @@ int RunGame(NativeWindow& window,
                         Tracenf("[INSPECTOR-COMP] remove entity=%u component=Hinge Joint", it->id);
                         return true;
                     }
+                    if (componentType == "physics.character_controller")
+                    {
+                        if (!it->hasCharacterController)
+                            return false;
+                        it->hasCharacterController = false;
+                        it->characterController = {};
+                        SceneManager::Instance().MarkDirty();
+                        Tracenf("[INSPECTOR-COMP] remove entity=%u component=Character Controller", it->id);
+                        return true;
+                    }
                     const std::size_t oldSize = it->editorComponents.size();
                     it->editorComponents.erase(std::remove_if(it->editorComponents.begin(), it->editorComponents.end(),
                         [&](const EditorAttachedComponent& component) { return component.type == componentType; }),
@@ -7276,7 +7563,8 @@ int RunGame(NativeWindow& window,
                         commands.addComponentType == EditorComponentType::TriggerSphere ||
                         commands.addComponentType == EditorComponentType::TriggerCapsule ||
                         commands.addComponentType == EditorComponentType::FixedJoint ||
-                        commands.addComponentType == EditorComponentType::HingeJoint)
+                        commands.addComponentType == EditorComponentType::HingeJoint ||
+                        commands.addComponentType == EditorComponentType::CharacterController)
                     {
                         if (selectedEditorObject.type == SelectedEditorObjectType::MeshEntity)
                         {
@@ -7335,6 +7623,13 @@ int RunGame(NativeWindow& window,
                                     }
                                     Tracenf("[INSPECTOR-COMP] add entity=%u component=Rigidbody", it->id);
                                     runtimeSession->SetEditorStatus("Added Rigidbody component");
+                                }
+                                else if (commands.addComponentType == EditorComponentType::CharacterController)
+                                {
+                                    it->hasCharacterController = true;
+                                    it->characterController = {};
+                                    Tracenf("[INSPECTOR-COMP] add entity=%u component=Character Controller", it->id);
+                                    runtimeSession->SetEditorStatus("Added Character Controller component");
                                 }
                                 else
                                 {
@@ -9127,8 +9422,28 @@ int RunGame(NativeWindow& window,
                     if (mainCameraEntity)
                     {
                         const VkExtent2D gameExtent = gameView.GetExtent();
+                        // In Play, the first active player character drives the Game camera
+                        // (follow/first-person/top-down per its CameraMode). Otherwise the
+                        // scene's static Main Camera is used.
+                        CameraEntity gameCameraEntity = *mainCameraEntity;
+                        if (editorPlay.state.mode == EditorPlayMode::Play)
+                        {
+                            for (const MeshSceneEntity& characterMesh : editorMeshEntities)
+                            {
+                                if (!characterMesh.hasCharacterController || !characterMesh.characterController.enabled)
+                                    continue;
+                                auto stateIt = editorCharacterStates.find(characterMesh.id);
+                                if (stateIt == editorCharacterStates.end() || !stateIt->second.initialized)
+                                    continue;
+                                phys::CharacterControllerComponent cc = characterMesh.characterController;
+                                phys::Sanitize(cc);
+                                gameCameraEntity = ComputeCharacterCameraEntity(
+                                    *mainCameraEntity, characterMesh, cc, stateIt->second);
+                                break;
+                            }
+                        }
                         const WorldCamera gameCamera =
-                            BuildCameraFromEntity(*mainCameraEntity, gameExtent.width, gameExtent.height);
+                            BuildCameraFromEntity(gameCameraEntity, gameExtent.width, gameExtent.height);
                         gameView.BeginMainPass(device);
                         // Terrain is drawn from the project Main Camera using the secondary
                         // camera-uniform path (viewIndex=1). That path has its own per-frame

@@ -172,9 +172,9 @@ struct InspectorComponentDefinition
     bool addableToMesh;
 };
 
-const std::array<InspectorComponentDefinition, 16>& InspectorComponentRegistry()
+const std::array<InspectorComponentDefinition, 17>& InspectorComponentRegistry()
 {
-    static const std::array<InspectorComponentDefinition, 16> registry{{
+    static const std::array<InspectorComponentDefinition, 17> registry{{
         {"builtin.transform", "Transform", "Core", EditorComponentType::None, false},
         {"builtin.mesh_renderer", "MeshRenderer", "Rendering", EditorComponentType::MeshRenderer, false},
         {kLodComponentId, "LOD Group", "Rendering", EditorComponentType::None, true},
@@ -187,6 +187,7 @@ const std::array<InspectorComponentDefinition, 16>& InspectorComponentRegistry()
         {"physics.trigger_capsule", "Trigger Capsule", "Physics", EditorComponentType::TriggerCapsule, true},
         {"physics.fixed_joint", "Fixed Joint", "Physics", EditorComponentType::FixedJoint, true},
         {"physics.hinge_joint", "Hinge Joint", "Physics", EditorComponentType::HingeJoint, true},
+        {"physics.character_controller", "Character Controller", "Physics", EditorComponentType::CharacterController, true},
         {"builtin.water_body", "Water Body", "Rendering", EditorComponentType::WaterBody, false},
         {"builtin.point_light", "Point Light", "Lighting", EditorComponentType::PointLight, false},
         {"builtin.spot_light", "Spot Light", "Lighting", EditorComponentType::SpotLight, false},
