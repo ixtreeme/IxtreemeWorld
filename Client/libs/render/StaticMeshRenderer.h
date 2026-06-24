@@ -150,6 +150,7 @@ public:
     const std::array<float, 3>& BoundsMin() const { return m_boundsMin; }
     const std::array<float, 3>& BoundsMax() const { return m_boundsMax; }
     const std::string& TextureName() const { return m_texture.name; }
+    bool CopyPhysicsMesh(std::vector<std::array<float, 3>>& outVertices, std::vector<std::uint32_t>& outIndices) const;
 
     static bool DetectSkinnedGltf(client::asset::IAssetReader& assets,
         const std::string& modelPath,

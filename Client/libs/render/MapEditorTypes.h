@@ -8,6 +8,8 @@
 #include <string>
 #include <vector>
 
+using PhysicsLayerMatrix = std::array<std::array<bool, static_cast<std::size_t>(ixtreeme::physics::PhysicsLayer::Count)>, static_cast<std::size_t>(ixtreeme::physics::PhysicsLayer::Count)>;
+
 enum class MapEditorTool
 {
     Raise,
@@ -101,6 +103,13 @@ struct AmbientLight
     float intensity = 1.0f;
 };
 
+struct PhysicsSceneSettings
+{
+    float gravity[3] = {0.0f, -9.81f, 0.0f};
+    float fixedDeltaSeconds = 1.0f / 60.0f;
+    std::uint32_t maxSubsteps = 4;
+};
+
 constexpr std::uint32_t kMaxDynamicPointLights = 16;
 constexpr std::uint32_t kMaxDynamicSpotLights = 16;
 
@@ -188,6 +197,34 @@ struct SpotLight
     float outerConeDegrees = 35.0f;
     bool enabled = true;
     bool editorHidden = false;
+};
+
+// A game camera that lives in the scene as a hierarchy entity (Unity/Unreal style).
+// Every scene has at least one; the SceneData::mainCameraId selects which one drives
+// the Game view. rotation is Euler radians (pitch=X, yaw=Y, roll=Z), matching the
+// convention used by the editor free-fly camera (see WorldForwardFromYawPitch).
+struct CameraEntity
+{
+    std::uint32_t id = 0;
+    std::string name = "Main Camera";
+    std::string prefabAssetId;
+    PrefabInstanceState prefabInstance;
+    SceneParentRef parent;
+    float position[3] = {0.0f, 8.0f, -18.0f};
+    float rotation[3] = {-0.4363323f, 0.0f, 0.0f};
+    float fovDegrees = 60.0f;
+    float nearPlane = 0.1f;
+    float farPlane = 1000.0f;
+    bool editorHidden = false;
+};
+
+// Persisted editor free-fly viewpoint, so reopening a scene/project restores the
+// camera where you left off (matches the Unreal editor-viewport behavior).
+struct EditorCameraState
+{
+    float eye[3] = {0.0f, 8.0f, -18.0f};
+    float yaw = 0.0f;
+    float pitch = -0.4363323f;
 };
 
 struct LightingState
@@ -351,6 +388,10 @@ struct MeshSceneEntity
     ixtreeme::physics::RigidbodyComponent rigidbody;
     bool hasCollider = false;
     ixtreeme::physics::ColliderComponent collider;
+    bool hasFixedJoint = false;
+    ixtreeme::physics::FixedJointComponent fixedJoint;
+    bool hasHingeJoint = false;
+    ixtreeme::physics::HingeJointComponent hingeJoint;
 };
 
 struct TerrainSceneData
@@ -384,7 +425,14 @@ enum class HierarchyEntityType
     WaterBody,
     PointLight,
     SpotLight,
-    MeshEntity
+    MeshEntity,
+    Camera
+};
+
+enum class SceneGizmoTargetKind
+{
+    Object,
+    ColliderCenter
 };
 
 enum class EditorComponentType
@@ -397,7 +445,12 @@ enum class EditorComponentType
     Rigidbody,
     BoxCollider,
     SphereCollider,
-    CapsuleCollider
+    CapsuleCollider,
+    TriggerBox,
+    TriggerSphere,
+    TriggerCapsule,
+    FixedJoint,
+    HingeJoint
 };
 
 struct HierarchySceneEntity
@@ -451,8 +504,17 @@ struct MeshRendererEditorState
     LodComponent lod;
     bool hasRigidbody = false;
     ixtreeme::physics::RigidbodyComponent rigidbody;
+    bool physicsRuntimeValid = false;
+    bool physicsRuntimeActive = false;
+    std::uint64_t physicsRuntimeBodyId = 0;
+    float physicsRuntimeLinearVelocity[3] = {0.0f, 0.0f, 0.0f};
+    float physicsRuntimeAngularVelocity[3] = {0.0f, 0.0f, 0.0f};
     bool hasCollider = false;
     ixtreeme::physics::ColliderComponent collider;
+    bool hasFixedJoint = false;
+    ixtreeme::physics::FixedJointComponent fixedJoint;
+    bool hasHingeJoint = false;
+    ixtreeme::physics::HingeJointComponent hingeJoint;
 };
 
 struct TerrainEditorState
@@ -496,6 +558,14 @@ struct DynamicLightEditorState
     SpotLight spot;
 };
 
+struct CameraEditorState
+{
+    bool selected = false;
+    bool isMain = false;
+    std::uint32_t cameraCount = 0;
+    CameraEntity camera;
+};
+
 struct EngineStats
 {
     double fps = 0.0;
@@ -515,6 +585,21 @@ struct EngineStats
     std::size_t staticMeshDrawCalls = 0;
 };
 
+struct PhysicsEventEditorState
+{
+    std::string phase;
+    std::string kind;
+    std::uint32_t entityA = 0;
+    std::uint32_t entityB = 0;
+    std::string nameA;
+    std::string nameB;
+    std::uint64_t bodyA = 0;
+    std::uint64_t bodyB = 0;
+    float point[3] = {0.0f, 0.0f, 0.0f};
+    float normal[3] = {0.0f, 1.0f, 0.0f};
+    float penetrationDepth = 0.0f;
+};
+
 struct MapEditorCommands
 {
     bool save = false;
@@ -530,6 +615,33 @@ struct MapEditorCommands
     bool disableAssetWatcherPoll = false;
     bool disableHierarchyIteration = false;
     bool showPhysicsColliders = false;
+    bool showPhysicsContacts = false;
+    bool showPhysicsBodyCenters = false;
+    bool physicsRaycastFromCamera = false;
+    std::uint32_t physicsRaycastLayerMask = ixtreeme::physics::AllPhysicsLayerMask();
+    bool physicsRaycastHitTriggers = true;
+    float physicsRaycastDistance = 500.0f;
+    bool physicsOverlapSphereFromCamera = false;
+    bool physicsOverlapBoxFromCamera = false;
+    bool physicsOverlapCapsuleFromCamera = false;
+    std::uint32_t physicsOverlapLayerMask = ixtreeme::physics::AllPhysicsLayerMask();
+    bool physicsOverlapHitTriggers = true;
+    float physicsOverlapDistance = 20.0f;
+    float physicsOverlapRadius = 2.0f;
+    float physicsOverlapBoxHalfExtents[3] = {1.0f, 1.0f, 1.0f};
+    float physicsOverlapCapsuleRadius = 0.5f;
+    float physicsOverlapCapsuleHeight = 2.0f;
+    bool physicsSetLinearVelocityForSelected = false;
+    bool physicsApplyForceToSelected = false;
+    bool physicsApplyImpulseToSelected = false;
+    bool physicsApplyAngularImpulseToSelected = false;
+    std::uint32_t physicsRuntimeEntityId = 0;
+    float physicsLinearVelocity[3] = {0.0f, 0.0f, 0.0f};
+    float physicsForce[3] = {0.0f, 20.0f, 0.0f};
+    float physicsImpulse[3] = {0.0f, 5.0f, 0.0f};
+    float physicsAngularImpulse[3] = {0.0f, 1.0f, 0.0f};
+    bool physicsLayerMatrixChanged = false;
+    PhysicsLayerMatrix physicsLayerMatrix{};
     bool renderResolutionChanged = false;
     bool renderResolutionUseNative = true;
     std::uint32_t renderResolutionWidth = 0;
@@ -586,6 +698,10 @@ struct MapEditorCommands
     bool deleteSelectedLight = false;
     bool selectedLightChanged = false;
     DynamicLightEditorState selectedLight;
+    bool selectedCameraChanged = false;
+    CameraEntity selectedCamera;
+    bool setMainCameraRequested = false;
+    std::uint32_t setMainCameraId = 0;
     bool deleteSelectedMeshEntity = false;
     bool selectedMeshEntityChanged = false;
     MeshRendererEditorState selectedMeshEntity;
@@ -624,8 +740,10 @@ struct MapEditorCommands
     bool gizmoSnapEnabled = false;
     float gizmoSnapValue = 1.0f;
     bool sceneGizmoTransformChanged = false;
+    SceneGizmoTargetKind sceneGizmoTarget = SceneGizmoTargetKind::Object;
     HierarchyEntityType sceneGizmoEntityType = HierarchyEntityType::None;
     std::uint32_t sceneGizmoEntityId = 0;
+    MapEditorGizmoOperation sceneGizmoOperation = MapEditorGizmoOperation::Translate;
     float sceneGizmoPosition[3] = {0.0f, 0.0f, 0.0f};
     float sceneGizmoRotation[3] = {0.0f, 0.0f, 0.0f};
     float sceneGizmoScale[3] = {1.0f, 1.0f, 1.0f};

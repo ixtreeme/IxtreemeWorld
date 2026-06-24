@@ -1,6 +1,46 @@
 // This file is included from EditorImGui.cpp inside the editor-enabled implementation block.
 // Keep shared anonymous-namespace helpers in EditorImGui.cpp until this panel group is fully decoupled.
 
+static std::vector<std::string> PhysicsMatrixToProjectRows(const PhysicsLayerMatrix& matrix)
+{
+    constexpr std::size_t kLayerCount = static_cast<std::size_t>(ixtreeme::physics::PhysicsLayer::Count);
+    std::vector<std::string> rows;
+    rows.reserve(kLayerCount);
+    for (std::size_t row = 0; row < kLayerCount; ++row)
+    {
+        std::string encoded;
+        encoded.reserve(kLayerCount);
+        for (std::size_t col = 0; col < kLayerCount; ++col)
+            encoded.push_back(matrix[row][col] ? '1' : '0');
+        rows.push_back(std::move(encoded));
+    }
+    return rows;
+}
+
+static bool ProjectRowsToPhysicsMatrix(const std::vector<std::string>& rows, PhysicsLayerMatrix& matrix)
+{
+    constexpr std::size_t kLayerCount = static_cast<std::size_t>(ixtreeme::physics::PhysicsLayer::Count);
+    if (rows.size() != kLayerCount)
+        return false;
+
+    PhysicsLayerMatrix parsed{};
+    for (std::size_t row = 0; row < kLayerCount; ++row)
+    {
+        if (rows[row].size() != kLayerCount)
+            return false;
+        for (std::size_t col = 0; col < kLayerCount; ++col)
+        {
+            const char value = rows[row][col];
+            if (value != '0' && value != '1')
+                return false;
+            parsed[row][col] = value == '1';
+        }
+    }
+
+    matrix = parsed;
+    return true;
+}
+
 void EditorImGui::RenderMenuBar()
 {
     if (!ImGui::BeginMainMenuBar())
@@ -102,6 +142,8 @@ void EditorImGui::RenderMenuBar()
             debugTogglesChanged = ImGui::MenuItem("Disable Hierarchy Iteration", nullptr, &m_debugDisableHierarchyIteration) || debugTogglesChanged;
             ImGui::Separator();
             debugTogglesChanged = ImGui::MenuItem("Show Physics Colliders", nullptr, &m_debugShowPhysicsColliders) || debugTogglesChanged;
+            debugTogglesChanged = ImGui::MenuItem("Show Physics Contacts", nullptr, &m_debugShowPhysicsContacts) || debugTogglesChanged;
+            debugTogglesChanged = ImGui::MenuItem("Show Physics Body Centers", nullptr, &m_debugShowPhysicsBodyCenters) || debugTogglesChanged;
             if (debugTogglesChanged)
             {
                 m_commands.debugPerfTogglesChanged = true;
@@ -111,6 +153,8 @@ void EditorImGui::RenderMenuBar()
                 m_commands.disableAssetWatcherPoll = m_debugDisableAssetWatcherPoll;
                 m_commands.disableHierarchyIteration = m_debugDisableHierarchyIteration;
                 m_commands.showPhysicsColliders = m_debugShowPhysicsColliders;
+                m_commands.showPhysicsContacts = m_debugShowPhysicsContacts;
+                m_commands.showPhysicsBodyCenters = m_debugShowPhysicsBodyCenters;
             }
             ImGui::EndMenu();
         }
@@ -123,6 +167,46 @@ void EditorImGui::RenderMenuBar()
     }
 
     ImGui::EndMainMenuBar();
+}
+
+void EditorImGui::LoadProjectPhysicsSettings()
+{
+    ProjectManager& projects = ProjectManager::Instance();
+    constexpr std::size_t kLayerCount = static_cast<std::size_t>(ixtreeme::physics::PhysicsLayer::Count);
+    PhysicsLayerMatrix matrix{};
+    for (std::size_t row = 0; row < kLayerCount; ++row)
+    {
+        for (std::size_t col = 0; col < kLayerCount; ++col)
+        {
+            matrix[row][col] = ixtreeme::physics::DefaultLayerCollision(
+                static_cast<ixtreeme::physics::PhysicsLayer>(row),
+                static_cast<ixtreeme::physics::PhysicsLayer>(col));
+        }
+    }
+
+    if (projects.HasProject())
+    {
+        const std::vector<std::string>& rows = projects.CurrentProject().physicsCollisionMatrixRows;
+        if (!rows.empty())
+        {
+            if (ProjectRowsToPhysicsMatrix(rows, matrix))
+                Tracen("[PHYSICS-LAYER] project matrix loaded");
+            else
+                TraceError("[PHYSICS-LAYER] project matrix invalid, using defaults");
+        }
+    }
+
+    m_physicsLayerMatrix = matrix;
+    m_commands.physicsLayerMatrixChanged = true;
+    m_commands.physicsLayerMatrix = m_physicsLayerMatrix;
+}
+
+void EditorImGui::StoreProjectPhysicsSettings()
+{
+    ProjectManager& projects = ProjectManager::Instance();
+    if (!projects.HasProject())
+        return;
+    projects.SetPhysicsCollisionMatrixRows(PhysicsMatrixToProjectRows(m_physicsLayerMatrix));
 }
 
 bool EditorImGui::SaveProjectAndCurrentScene(bool automatic)
@@ -149,6 +233,8 @@ bool EditorImGui::SaveProjectAndCurrentScene(bool automatic)
             return false;
         }
     }
+
+    StoreProjectPhysicsSettings();
 
     std::string error;
     if (!projects.SaveProject(error))
@@ -467,15 +553,27 @@ void EditorImGui::RenderSceneSettingsPanel()
                 scenes.SetSceneName(nameBuffer);
 
             ImGui::Separator();
-            ImGui::TextUnformatted("Camera");
-            ImGui::Text("Position: %.1f, %.1f, %.1f",
-                scene.cameraPosition[0],
-                scene.cameraPosition[1],
-                scene.cameraPosition[2]);
-            ImGui::Text("FOV: %.1f  Near/Far: %.2f / %.1f",
-                scene.cameraFov,
-                scene.cameraNear,
-                scene.cameraFar);
+            ImGui::TextUnformatted("Editor Camera");
+            ImGui::Text("Eye: %.1f, %.1f, %.1f",
+                scene.editorCamera.eye[0],
+                scene.editorCamera.eye[1],
+                scene.editorCamera.eye[2]);
+            const CameraEntity* mainCamera = nullptr;
+            for (const CameraEntity& cam : scene.cameras)
+            {
+                if (cam.id == scene.mainCameraId)
+                {
+                    mainCamera = &cam;
+                    break;
+                }
+            }
+            if (mainCamera)
+                ImGui::Text("Main Camera FOV: %.1f  Near/Far: %.2f / %.1f",
+                    mainCamera->fovDegrees,
+                    mainCamera->nearPlane,
+                    mainCamera->farPlane);
+            else
+                ImGui::TextDisabled("No main camera");
 
             ImGui::Separator();
             ImGui::TextUnformatted("Environment");
@@ -484,6 +582,22 @@ void EditorImGui::RenderSceneSettingsPanel()
                 scene.lighting.directional.azimuthDegrees,
                 scene.lighting.directional.intensity);
             ImGui::Text("Ambient: %.2f", scene.lighting.ambient.intensity);
+
+            ImGui::Separator();
+            ImGui::TextUnformatted("Physics");
+            PhysicsSceneSettings physicsSettings = scene.physics;
+            bool physicsSettingsChanged = false;
+            physicsSettingsChanged |= ImGui::DragFloat3("Gravity", physicsSettings.gravity, 0.05f, -1000.0f, 1000.0f, "%.2f");
+            physicsSettingsChanged |= ImGui::DragFloat("Fixed Timestep", &physicsSettings.fixedDeltaSeconds, 0.001f, 0.001f, 0.1f, "%.4f s");
+            int maxSubsteps = static_cast<int>(physicsSettings.maxSubsteps);
+            if (ImGui::SliderInt("Max Substeps", &maxSubsteps, 1, 16))
+            {
+                physicsSettings.maxSubsteps = static_cast<std::uint32_t>(std::clamp(maxSubsteps, 1, 16));
+                physicsSettingsChanged = true;
+            }
+            if (physicsSettingsChanged)
+                scenes.SetPhysicsSettings(physicsSettings);
+            ImGui::TextDisabled("Default Earth gravity: 0.00, -9.81, 0.00");
         }
     }
     ImGui::End();

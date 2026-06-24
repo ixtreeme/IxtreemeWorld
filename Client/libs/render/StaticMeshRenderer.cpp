@@ -1334,6 +1334,22 @@ StaticMeshRenderer::LodDiagnostics StaticMeshRenderer::GetLodDiagnostics(std::ui
     return diag;
 }
 
+bool StaticMeshRenderer::CopyPhysicsMesh(
+    std::vector<std::array<float, 3>>& outVertices,
+    std::vector<std::uint32_t>& outIndices) const
+{
+    if (!IsLoaded() || m_vertices.empty() || m_indices.size() < 3)
+        return false;
+
+    outVertices.clear();
+    outVertices.reserve(m_vertices.size());
+    for (const Vertex& vertex : m_vertices)
+        outVertices.push_back({vertex.position[0], vertex.position[1], vertex.position[2]});
+
+    outIndices = m_indices;
+    return !outVertices.empty() && outIndices.size() >= 3;
+}
+
 void StaticMeshRenderer::DumpMaterialState(const char* entityName, const Instance& instance) const
 {
     LogFormat("[MATBIND-DIAG] === entity name=%s entityId=%u submeshCount=%zu ===",

@@ -708,6 +708,16 @@ WaterMaterialData ClampWaterMaterialData(WaterMaterialData material)
     return material;
 }
 
+AssetLibrary::PhysicsMaterialData ClampPhysicsMaterialData(AssetLibrary::PhysicsMaterialData material)
+{
+    material.friction = std::clamp(material.friction, 0.0f, 4.0f);
+    material.restitution = std::clamp(material.restitution, 0.0f, 1.0f);
+    material.density = std::max(0.001f, material.density);
+    material.linearDamping = std::clamp(material.linearDamping, 0.0f, 100.0f);
+    material.angularDamping = std::clamp(material.angularDamping, 0.0f, 100.0f);
+    return material;
+}
+
 void WriteWaterConfigJson(std::ostringstream& json, const WaterConfig& config, const char* indent)
 {
     json << indent << "\"enabled\": " << (config.enabled ? "true" : "false") << ",\n"
@@ -851,6 +861,42 @@ std::string WaterMaterialFileJson(const AssetLibrary::Entry& entry)
              << "  \"water_config\": {\n";
     WriteWaterConfigJson(fileJson, entry.waterMaterial.config, "    ");
     fileJson << "\n  }\n}\n";
+    return fileJson.str();
+}
+
+AssetLibrary::PhysicsMaterialData ReadPhysicsMaterialJson(
+    const std::string& object,
+    AssetLibrary::PhysicsMaterialData fallback = {})
+{
+    AssetLibrary::PhysicsMaterialData material = fallback;
+    material.friction = JsonFloatValue(object, "friction", material.friction);
+    material.restitution = JsonFloatValue(object, "restitution", material.restitution);
+    material.density = JsonFloatValue(object, "density", material.density);
+    material.linearDamping = JsonFloatValue(object, "linear_damping", material.linearDamping);
+    material.angularDamping = JsonFloatValue(object, "angular_damping", material.angularDamping);
+    material.frictionCombine = ixtreeme::physics::PhysicsMaterialCombineModeFromString(
+        JsonStringValue(object, "friction_combine"),
+        material.frictionCombine);
+    material.restitutionCombine = ixtreeme::physics::PhysicsMaterialCombineModeFromString(
+        JsonStringValue(object, "restitution_combine"),
+        material.restitutionCombine);
+    return ClampPhysicsMaterialData(material);
+}
+
+std::string PhysicsMaterialFileJson(const AssetLibrary::Entry& entry)
+{
+    std::ostringstream fileJson;
+    fileJson << "{\n"
+             << "  \"id\": \"" << EscapeJson(entry.id) << "\",\n"
+             << "  \"display_name\": \"" << EscapeJson(entry.displayName) << "\",\n"
+             << "  \"friction\": " << entry.physicsMaterial.friction << ",\n"
+             << "  \"restitution\": " << entry.physicsMaterial.restitution << ",\n"
+             << "  \"density\": " << entry.physicsMaterial.density << ",\n"
+             << "  \"linear_damping\": " << entry.physicsMaterial.linearDamping << ",\n"
+             << "  \"angular_damping\": " << entry.physicsMaterial.angularDamping << ",\n"
+             << "  \"friction_combine\": \"" << ixtreeme::physics::ToString(entry.physicsMaterial.frictionCombine) << "\",\n"
+             << "  \"restitution_combine\": \"" << ixtreeme::physics::ToString(entry.physicsMaterial.restitutionCombine) << "\"\n"
+             << "}\n";
     return fileJson.str();
 }
 
@@ -1454,6 +1500,7 @@ bool AssetLibrary::EnsureDirectories() const
     std::filesystem::create_directories(m_libraryRoot / "animations", ec);
     std::filesystem::create_directories(m_libraryRoot / "materials", ec);
     std::filesystem::create_directories(m_libraryRoot / "materials" / "water", ec);
+    std::filesystem::create_directories(m_libraryRoot / "materials" / "physics", ec);
     std::filesystem::create_directories(m_libraryRoot / "scenes", ec);
     std::filesystem::create_directories(m_libraryRoot / "prefabs", ec);
     std::filesystem::create_directories(m_libraryRoot / "thumbnails", ec);
@@ -1469,6 +1516,7 @@ const char* AssetLibrary::CategoryName(Category category)
     case Category::Animation: return "Animations";
     case Category::Material: return "Materials";
     case Category::WaterMaterial: return "Water Materials";
+    case Category::PhysicsMaterial: return "Physics Materials";
     case Category::Scene: return "Scenes";
     case Category::Prefab: return "Prefabs";
     default: return "Assets";
@@ -1772,6 +1820,7 @@ std::string AssetLibrary::CategoryString(Category category)
     case Category::Animation: return "animation";
     case Category::Material: return "material";
     case Category::WaterMaterial: return "water_material";
+    case Category::PhysicsMaterial: return "physics_material";
     case Category::Scene: return "scene";
     case Category::Prefab: return "prefab";
     default: return "texture";
@@ -1785,6 +1834,7 @@ std::optional<AssetLibrary::Category> AssetLibrary::ParseCategory(const std::str
     if (value == "animation") return Category::Animation;
     if (value == "material") return Category::Material;
     if (value == "water_material" || value == "watermaterial") return Category::WaterMaterial;
+    if (value == "physics_material" || value == "physicsmaterial") return Category::PhysicsMaterial;
     if (value == "scene") return Category::Scene;
     if (value == "prefab") return Category::Prefab;
     return std::nullopt;
@@ -1812,6 +1862,7 @@ std::filesystem::path AssetLibrary::CategoryDirectory(Category category) const
     case Category::Animation: return m_libraryRoot / "animations";
     case Category::Material: return m_libraryRoot / "materials";
     case Category::WaterMaterial: return m_libraryRoot / "materials" / "water";
+    case Category::PhysicsMaterial: return m_libraryRoot / "materials" / "physics";
     case Category::Scene: return m_libraryRoot / "scenes";
     case Category::Prefab: return m_libraryRoot / "prefabs";
     default: return m_libraryRoot / "textures";
@@ -2066,6 +2117,12 @@ bool AssetLibrary::LoadManifest()
             if (!waterObject.empty())
                 entry.waterMaterial = ReadWaterMaterialJson(waterObject, entry.waterMaterial);
         }
+        if (entry.category == Category::PhysicsMaterial)
+        {
+            const std::string physicsObject = JsonObjectValue(object, "physics_material_data");
+            if (!physicsObject.empty())
+                entry.physicsMaterial = ReadPhysicsMaterialJson(physicsObject, entry.physicsMaterial);
+        }
         if (entry.category == Category::Model)
         {
             const std::string lodObject = JsonObjectValue(object, "lod_default");
@@ -2178,6 +2235,19 @@ bool AssetLibrary::SaveManifest(std::string& error) const
                  << "        \"water_config\": {\n";
             WriteWaterConfigJson(json, entry.waterMaterial.config, "          ");
             json << "\n        }\n"
+                 << "      }\n";
+        }
+        if (entry.category == Category::PhysicsMaterial)
+        {
+            json << ",\n"
+                 << "      \"physics_material_data\": {\n"
+                 << "        \"friction\": " << entry.physicsMaterial.friction << ",\n"
+                 << "        \"restitution\": " << entry.physicsMaterial.restitution << ",\n"
+                 << "        \"density\": " << entry.physicsMaterial.density << ",\n"
+                 << "        \"linear_damping\": " << entry.physicsMaterial.linearDamping << ",\n"
+                 << "        \"angular_damping\": " << entry.physicsMaterial.angularDamping << ",\n"
+                 << "        \"friction_combine\": \"" << ixtreeme::physics::ToString(entry.physicsMaterial.frictionCombine) << "\",\n"
+                 << "        \"restitution_combine\": \"" << ixtreeme::physics::ToString(entry.physicsMaterial.restitutionCombine) << "\"\n"
                  << "      }\n";
         }
         if (entry.category == Category::Model && entry.hasLodDefault)
@@ -2666,6 +2736,13 @@ bool AssetLibrary::ValidateFile(Category category, const std::filesystem::path& 
             return false;
         }
         break;
+    case Category::PhysicsMaterial:
+        if (!HasAnyExtension(path, {".physmat", ".json"}))
+        {
+            error = "physics materials must be PHYSMAT or JSON";
+            return false;
+        }
+        break;
     case Category::Scene:
         if (!HasAnyExtension(path, {".scene"}))
         {
@@ -2690,8 +2767,9 @@ std::string AssetLibrary::MakeUniqueId(Category category, const std::filesystem:
         (category == Category::Model ? "model_" :
             (category == Category::Animation ? "anim_" :
                 (category == Category::WaterMaterial ? "watermat_" :
-                    (category == Category::Scene ? "scene_" :
-                        (category == Category::Prefab ? "prefab_" : "mat_")))));
+                    (category == Category::PhysicsMaterial ? "physmat_" :
+                        (category == Category::Scene ? "scene_" :
+                            (category == Category::Prefab ? "prefab_" : "mat_"))))));
     const std::string base = prefix + SanitizeStem(sourcePath.stem().string());
     std::unordered_set<std::string> existing;
     for (const Entry& entry : m_entries)
@@ -2732,6 +2810,8 @@ std::optional<AssetLibrary::Category> DetectDirectImportCategory(const std::file
         return AssetLibrary::Category::Animation;
     if (ext == ".material")
         return AssetLibrary::Category::Material;
+    if (ext == ".physmat")
+        return AssetLibrary::Category::PhysicsMaterial;
     if (ext == ".scene")
         return AssetLibrary::Category::Scene;
     if (ext == ".ixprefab")
@@ -2801,8 +2881,9 @@ bool AssetLibrary::Import(Category category,
         (category == Category::Model ? "model_icon" :
             (category == Category::Animation ? "animation_icon" :
                 (category == Category::WaterMaterial ? "water_material_icon" :
-                    (category == Category::Prefab ? "prefab_icon" :
-                        (category == Category::Scene ? "scene_icon" : "material_icon")))));
+                    (category == Category::PhysicsMaterial ? "physics_material_icon" :
+                        (category == Category::Prefab ? "prefab_icon" :
+                            (category == Category::Scene ? "scene_icon" : "material_icon"))))));
     entry.tags = NormalizeTags(options.tags);
     if (category == Category::Texture)
     {
@@ -2820,6 +2901,12 @@ bool AssetLibrary::Import(Category category,
         std::ifstream importedFile(destination, std::ios::binary);
         std::string importedText((std::istreambuf_iterator<char>(importedFile)), std::istreambuf_iterator<char>());
         entry.waterMaterial = ReadWaterMaterialJson(importedText);
+    }
+    else if (category == Category::PhysicsMaterial)
+    {
+        std::ifstream importedFile(destination, std::ios::binary);
+        std::string importedText((std::istreambuf_iterator<char>(importedFile)), std::istreambuf_iterator<char>());
+        entry.physicsMaterial = ReadPhysicsMaterialJson(importedText);
     }
     m_entries.push_back(entry);
 
@@ -2930,7 +3017,8 @@ bool AssetLibrary::ImportFileToFolder(const std::filesystem::path& sourcePath,
         (*category == Category::Model ? "model_icon" :
             (*category == Category::Animation ? "animation_icon" :
                 (*category == Category::Scene ? "scene_icon" :
-                    (*category == Category::Prefab ? "prefab_icon" : "material_icon"))));
+                    (*category == Category::Prefab ? "prefab_icon" :
+                        (*category == Category::PhysicsMaterial ? "physics_material_icon" : "material_icon")))));
     if (*category == Category::Texture)
     {
         std::string thumbnailError;
@@ -2939,6 +3027,13 @@ bool AssetLibrary::ImportFileToFolder(const std::filesystem::path& sourcePath,
     else if (*category == Category::Material)
     {
         entry.tags = {"material"};
+    }
+    else if (*category == Category::PhysicsMaterial)
+    {
+        std::ifstream importedFile(destination, std::ios::binary);
+        std::string importedText((std::istreambuf_iterator<char>(importedFile)), std::istreambuf_iterator<char>());
+        entry.physicsMaterial = ReadPhysicsMaterialJson(importedText);
+        entry.tags = {"physics", "material"};
     }
 
     const std::string destinationCanonical = CanonicalPathString(destination);
@@ -3193,6 +3288,126 @@ bool AssetLibrary::UpdateWaterMaterial(const std::string& id,
     return true;
 }
 
+bool AssetLibrary::CreatePhysicsMaterial(const ImportOptions& options,
+                                         const PhysicsMaterialData& material,
+                                         Entry& outEntry,
+                                         std::string& error)
+{
+    const std::string displayName = options.displayName.empty() ? "Physics_Material" : options.displayName;
+    const std::string subpath = NormalizeSubpath(options.subpath);
+    Entry entry;
+    entry.id = MakeUniqueId(Category::PhysicsMaterial, displayName);
+    entry.category = Category::PhysicsMaterial;
+    entry.displayName = displayName;
+    entry.subpath = subpath;
+    entry.filename = SanitizeStem(displayName) + ".physmat";
+    entry.originalPath.clear();
+    entry.importedAt = TimestampUtc();
+    entry.tags = NormalizeTags(options.tags.empty() ? std::vector<std::string>{"physics", "material"} : options.tags);
+    entry.thumbnail = "physics_material_icon";
+    entry.physicsMaterial = ClampPhysicsMaterialData(material);
+
+    std::filesystem::path destination = AbsolutePath(entry);
+    for (uint32_t i = 2; std::filesystem::exists(destination); ++i)
+    {
+        entry.filename = SanitizeStem(displayName) + "_" + std::to_string(i) + ".physmat";
+        destination = AbsolutePath(entry);
+    }
+
+    if (!AtomicWriteText(destination, PhysicsMaterialFileJson(entry), error))
+        return false;
+
+    m_entries.push_back(entry);
+    if (!SaveManifest(error))
+    {
+        std::error_code ec;
+        std::filesystem::remove(destination, ec);
+        m_entries.pop_back();
+        return false;
+    }
+
+    Tracenf("[PHYSICS-MAT] created id=%s friction=%.2f bounce=%.2f density=%.2f combine=(%s,%s)",
+        entry.id.c_str(),
+        entry.physicsMaterial.friction,
+        entry.physicsMaterial.restitution,
+        entry.physicsMaterial.density,
+        ixtreeme::physics::ToString(entry.physicsMaterial.frictionCombine),
+        ixtreeme::physics::ToString(entry.physicsMaterial.restitutionCombine));
+    outEntry = entry;
+    return true;
+}
+
+bool AssetLibrary::UpdatePhysicsMaterial(const std::string& id,
+                                         const PhysicsMaterialData& material,
+                                         Entry& outEntry,
+                                         std::string& error)
+{
+    const auto it = std::find_if(m_entries.begin(), m_entries.end(), [&id](const Entry& entry) {
+        return entry.id == id;
+    });
+    if (it == m_entries.end())
+    {
+        error = "asset not found";
+        return false;
+    }
+    if (it->category != Category::PhysicsMaterial)
+    {
+        error = "asset is not a physics material";
+        return false;
+    }
+
+    const Entry oldEntry = *it;
+    Entry updated = oldEntry;
+    updated.physicsMaterial = ClampPhysicsMaterialData(material);
+    const std::filesystem::path destination = AbsolutePath(updated);
+
+    std::string oldFileText;
+    const bool hadOldFile = std::filesystem::exists(destination);
+    if (hadOldFile)
+    {
+        std::ifstream oldFile(destination, std::ios::binary);
+        oldFileText.assign(std::istreambuf_iterator<char>(oldFile), std::istreambuf_iterator<char>());
+    }
+
+    if (!AtomicWriteText(destination, PhysicsMaterialFileJson(updated), error))
+        return false;
+
+    *it = updated;
+    if (!SaveManifest(error))
+    {
+        const std::string manifestError = error;
+        *it = oldEntry;
+
+        std::string rollbackError;
+        bool rolledBack = false;
+        if (hadOldFile)
+            rolledBack = AtomicWriteText(destination, oldFileText, rollbackError);
+        else
+        {
+            std::error_code ec;
+            std::filesystem::remove(destination, ec);
+            rolledBack = !ec;
+            if (ec)
+                rollbackError = ec.message();
+        }
+
+        error = "manifest save failed: " + manifestError;
+        if (!rolledBack)
+            error += "; rollback failed: " + rollbackError;
+        return false;
+    }
+
+    Tracenf("[PHYSICS-MAT] updated id=%s friction=%.2f bounce=%.2f density=%.2f combine=(%s,%s)",
+        updated.id.c_str(),
+        updated.physicsMaterial.friction,
+        updated.physicsMaterial.restitution,
+        updated.physicsMaterial.density,
+        ixtreeme::physics::ToString(updated.physicsMaterial.frictionCombine),
+        ixtreeme::physics::ToString(updated.physicsMaterial.restitutionCombine));
+    outEntry = updated;
+    return true;
+}
+
 bool AssetLibrary::Remove(const std::string& id, std::string& error)
 {
     const auto it = std::find_if(m_entries.begin(), m_entries.end(), [&id](const Entry& entry) {
@@ -3358,7 +3573,9 @@ bool AssetLibrary::RenameAsset(const std::string& id,
         ? ".material.json"
         : (it->category == Category::WaterMaterial && filenameLower.ends_with(".watermat")
             ? ".watermat"
-            : ToLower(std::filesystem::path(it->filename).extension().string()));
+            : (it->category == Category::PhysicsMaterial && filenameLower.ends_with(".physmat")
+                ? ".physmat"
+                : ToLower(std::filesystem::path(it->filename).extension().string())));
     std::filesystem::path typedName(baseName);
     const std::string typedNameLower = ToLower(baseName);
     if (oldExtension == ".material.json" && typedNameLower.ends_with(oldExtension))
@@ -3432,7 +3649,9 @@ bool AssetLibrary::RenameAsset(const std::string& id,
     }
 
     std::string oldStructuredText;
-    if (oldEntry.category == Category::Material || oldEntry.category == Category::WaterMaterial)
+    if (oldEntry.category == Category::Material ||
+        oldEntry.category == Category::WaterMaterial ||
+        oldEntry.category == Category::PhysicsMaterial)
     {
         std::ifstream oldFile(source, std::ios::binary);
         oldStructuredText.assign(std::istreambuf_iterator<char>(oldFile), std::istreambuf_iterator<char>());
@@ -3478,6 +3697,22 @@ bool AssetLibrary::RenameAsset(const std::string& id,
             return false;
         }
     }
+    else if (renamed.category == Category::PhysicsMaterial)
+    {
+        if (!AtomicWriteText(destination, PhysicsMaterialFileJson(renamed), error))
+        {
+            std::error_code rollbackEc;
+            std::filesystem::rename(destination, source, rollbackEc);
+            if (!oldStructuredText.empty())
+            {
+                std::string ignored;
+                AtomicWriteText(source, oldStructuredText, ignored);
+            }
+            if (rollbackEc)
+                error += "; rollback failed: " + rollbackEc.message();
+            return false;
+        }
+    }
 
     *it = renamed;
     if (!SaveManifest(error))
@@ -3485,7 +3720,9 @@ bool AssetLibrary::RenameAsset(const std::string& id,
         const std::string manifestError = error;
         std::error_code rollbackEc;
         std::filesystem::rename(destination, source, rollbackEc);
-        if ((oldEntry.category == Category::Material || oldEntry.category == Category::WaterMaterial) &&
+        if ((oldEntry.category == Category::Material ||
+                oldEntry.category == Category::WaterMaterial ||
+                oldEntry.category == Category::PhysicsMaterial) &&
             !oldStructuredText.empty())
         {
             std::string ignored;

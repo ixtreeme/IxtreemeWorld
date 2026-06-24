@@ -84,6 +84,28 @@ namespace xm = ixtreeme::math;
 namespace prefab = ixtreeme::prefab;
 namespace phys = ixtreeme::physics;
 
+// Builds a render camera from a scene CameraEntity, matching the editor free-fly
+// convention (rotation[0]=pitch, rotation[1]=yaw). Used to drive the Game view.
+WorldCamera BuildCameraFromEntity(const CameraEntity& cameraEntity, uint32_t width, uint32_t height)
+{
+    const float aspect = height != 0 ? static_cast<float>(width) / static_cast<float>(height) : 1.0f;
+    const WorldVec3 eye{cameraEntity.position[0], cameraEntity.position[1], cameraEntity.position[2]};
+    const WorldVec3 forward = WorldForwardFromYawPitch(cameraEntity.rotation[1], cameraEntity.rotation[0]);
+    WorldCamera camera{};
+    camera.eye = eye;
+    camera.target = eye + forward;
+    camera.nearPlane = cameraEntity.nearPlane;
+    camera.farPlane = std::max(cameraEntity.nearPlane + 0.001f, cameraEntity.farPlane);
+    const WorldMat4 view = WorldLookAt(camera.eye, camera.target, {0.0f, 1.0f, 0.0f});
+    const WorldMat4 projection = WorldPerspective(
+        xm::DegreesToRadians(std::clamp(cameraEntity.fovDegrees, 1.0f, 179.0f)),
+        aspect,
+        camera.nearPlane,
+        camera.farPlane);
+    camera.viewProjection = WorldMultiply(view, projection);
+    return camera;
+}
+
 const char* InputEventTypeName(InputEvent::Type type)
 {
     switch (type)
@@ -151,6 +173,60 @@ struct FrameCpuProfile
     double totalCpuFrameMs = 0.0;
 };
 
+struct PhysicsDebugContact
+{
+    WorldVec3 point{};
+    WorldVec3 normal{0.0f, 1.0f, 0.0f};
+    std::array<float, 4> color{0.25f, 1.0f, 0.35f, 0.95f};
+    float ttlSeconds = 0.25f;
+};
+
+struct PhysicsDebugLine
+{
+    WorldVec3 a{};
+    WorldVec3 b{};
+    std::array<float, 4> color{1.0f, 0.82f, 0.18f, 0.95f};
+    float ttlSeconds = 2.5f;
+};
+
+struct PhysicsBodyEntityBinding
+{
+    std::uint32_t entityId = 0;
+    std::string name;
+    bool terrain = false;
+};
+
+struct PhysicsEntityEvent
+{
+    phys::PhysicsContactPhase phase = phys::PhysicsContactPhase::Started;
+    phys::PhysicsContactKind kind = phys::PhysicsContactKind::Collision;
+    std::uint32_t entityA = 0;
+    std::uint32_t entityB = 0;
+    std::string nameA;
+    std::string nameB;
+    phys::BodyId bodyA = 0;
+    phys::BodyId bodyB = 0;
+    WorldVec3 point{};
+    WorldVec3 normal{0.0f, 1.0f, 0.0f};
+    float penetrationDepth = 0.0f;
+};
+
+const char* PhysicsEventKindName(phys::PhysicsContactKind kind)
+{
+    return kind == phys::PhysicsContactKind::Trigger ? "Trigger" : "Collision";
+}
+
+const char* PhysicsEventPhaseName(phys::PhysicsContactPhase phase)
+{
+    switch (phase)
+    {
+    case phys::PhysicsContactPhase::Started: return "Enter";
+    case phys::PhysicsContactPhase::Stayed: return "Stay";
+    case phys::PhysicsContactPhase::Ended: return "Exit";
+    default: return "Unknown";
+    }
+}
+
 double MillisecondsBetween(std::chrono::steady_clock::time_point begin,
                            std::chrono::steady_clock::time_point end)
 {
@@ -191,6 +267,7 @@ std::string SceneParentTypeName(HierarchyEntityType type)
     case HierarchyEntityType::PointLight: return "point_light";
     case HierarchyEntityType::SpotLight: return "spot_light";
     case HierarchyEntityType::MeshEntity: return "mesh_entity";
+    case HierarchyEntityType::Camera: return "camera";
     case HierarchyEntityType::None:
     default: return {};
     }
@@ -208,6 +285,8 @@ HierarchyEntityType SceneParentTypeFromName(const std::string& type)
         return HierarchyEntityType::SpotLight;
     if (type == "mesh_entity")
         return HierarchyEntityType::MeshEntity;
+    if (type == "camera")
+        return HierarchyEntityType::Camera;
     return HierarchyEntityType::None;
 }
 
@@ -252,6 +331,10 @@ MeshRendererEditorState BuildMeshRendererEditorState(const std::vector<MeshScene
     state.rigidbody = it->rigidbody;
     state.hasCollider = it->hasCollider;
     state.collider = it->collider;
+    state.hasFixedJoint = it->hasFixedJoint;
+    state.fixedJoint = it->fixedJoint;
+    state.hasHingeJoint = it->hasHingeJoint;
+    state.hingeJoint = it->hingeJoint;
     state.materialSlotCount = std::max<std::uint32_t>(
         1u,
         std::max(static_cast<std::uint32_t>(state.materialSlots.size()),
@@ -279,6 +362,10 @@ void ApplyMeshRendererEditorState(MeshSceneEntity& mesh, const MeshRendererEdito
     mesh.rigidbody = state.rigidbody;
     mesh.hasCollider = state.hasCollider;
     mesh.collider = state.collider;
+    mesh.hasFixedJoint = state.hasFixedJoint;
+    mesh.fixedJoint = state.fixedJoint;
+    mesh.hasHingeJoint = state.hasHingeJoint;
+    mesh.hingeJoint = state.hingeJoint;
 }
 
 std::filesystem::path ResolveModelAssetPathForMeta(const std::string& meshAssetPath)
@@ -869,6 +956,90 @@ WorldVec3 TransformColliderLocalPoint(const MeshSceneEntity& mesh, WorldVec3 loc
     return {world.x, world.y, world.z};
 }
 
+WorldVec3 ColliderWorldDeltaToLocalDelta(const MeshSceneEntity& mesh, WorldVec3 worldDelta)
+{
+    xm::Mat4 inverseRotation = xm::MultiplyRowMajor(
+        xm::MultiplyRowMajor(
+            xm::RotationZRowMajor(-mesh.rotation[2]),
+            xm::RotationYRowMajor(-mesh.rotation[1])),
+        xm::RotationXRowMajor(-mesh.rotation[0]));
+    const xm::Vec3 rotated = xm::TransformVectorRowVector(inverseRotation.m, {worldDelta.x, worldDelta.y, worldDelta.z});
+    return {
+        rotated.x / std::max(0.001f, mesh.scale[0]),
+        rotated.y / std::max(0.001f, mesh.scale[1]),
+        rotated.z / std::max(0.001f, mesh.scale[2])};
+}
+
+bool ApplySceneGizmoToCollider(MeshSceneEntity& mesh,
+                               const float* gizmoPosition,
+                               const float* gizmoScale,
+                               MapEditorGizmoOperation operation)
+{
+    if (!mesh.hasCollider)
+        return false;
+
+    if (operation == MapEditorGizmoOperation::Scale && gizmoScale)
+    {
+        phys::ColliderComponent updated = mesh.collider;
+        const float invScaleX = 1.0f / std::max(0.001f, mesh.scale[0]);
+        const float invScaleY = 1.0f / std::max(0.001f, mesh.scale[1]);
+        const float invScaleZ = 1.0f / std::max(0.001f, mesh.scale[2]);
+        if (updated.shape == phys::ColliderShape::Sphere)
+        {
+            const float localDiameter = std::max({
+                gizmoScale[0] * invScaleX,
+                gizmoScale[1] * invScaleY,
+                gizmoScale[2] * invScaleZ,
+                0.001f});
+            updated.radius = localDiameter * 0.5f;
+        }
+        else if (updated.shape == phys::ColliderShape::Capsule)
+        {
+            const float localDiameter = std::max(gizmoScale[0] * invScaleX, gizmoScale[2] * invScaleZ);
+            updated.radius = std::max(0.001f, localDiameter * 0.5f);
+            updated.height = std::max(updated.radius * 2.0f, gizmoScale[1] * invScaleY);
+        }
+        else
+        {
+            updated.size[0] = std::max(0.001f, gizmoScale[0] * invScaleX);
+            updated.size[1] = std::max(0.001f, gizmoScale[1] * invScaleY);
+            updated.size[2] = std::max(0.001f, gizmoScale[2] * invScaleZ);
+        }
+        phys::Sanitize(updated);
+        const bool changed =
+            xm::Abs(updated.size[0] - mesh.collider.size[0]) > 0.0005f ||
+            xm::Abs(updated.size[1] - mesh.collider.size[1]) > 0.0005f ||
+            xm::Abs(updated.size[2] - mesh.collider.size[2]) > 0.0005f ||
+            xm::Abs(updated.radius - mesh.collider.radius) > 0.0005f ||
+            xm::Abs(updated.height - mesh.collider.height) > 0.0005f;
+        if (!changed)
+            return false;
+        mesh.collider = updated;
+        return true;
+    }
+
+    if (!gizmoPosition)
+        return false;
+
+    const WorldVec3 previousWorldCenter = TransformColliderLocalPoint(
+        mesh,
+        {mesh.collider.center[0], mesh.collider.center[1], mesh.collider.center[2]});
+    const WorldVec3 nextWorldCenter{gizmoPosition[0], gizmoPosition[1], gizmoPosition[2]};
+    const WorldVec3 localDelta = ColliderWorldDeltaToLocalDelta(mesh, nextWorldCenter - previousWorldCenter);
+    if (xm::Abs(localDelta.x) < 0.0005f &&
+        xm::Abs(localDelta.y) < 0.0005f &&
+        xm::Abs(localDelta.z) < 0.0005f)
+    {
+        return false;
+    }
+
+    mesh.collider.center[0] += localDelta.x;
+    mesh.collider.center[1] += localDelta.y;
+    mesh.collider.center[2] += localDelta.z;
+    phys::Sanitize(mesh.collider);
+    return true;
+}
+
 void AddColliderCircle(std::vector<SelectionOutlineRenderer::Line>& lines,
                        const MeshSceneEntity& mesh,
                        WorldVec3 center,
@@ -991,6 +1162,162 @@ std::vector<SelectionOutlineRenderer::Line> BuildPhysicsColliderLines(
     return lines;
 }
 
+void AppendPhysicsBodyCenterLines(
+    std::vector<SelectionOutlineRenderer::Line>& lines,
+    const MeshSceneEntity& mesh,
+    const std::array<float, 4>& color)
+{
+    if (!mesh.hasRigidbody && !mesh.hasCollider)
+        return;
+
+    const WorldVec3 center{mesh.position[0], mesh.position[1], mesh.position[2]};
+    constexpr float kSize = 0.22f;
+    lines.push_back({center - WorldVec3{kSize, 0.0f, 0.0f}, center + WorldVec3{kSize, 0.0f, 0.0f}, color});
+    lines.push_back({center - WorldVec3{0.0f, kSize, 0.0f}, center + WorldVec3{0.0f, kSize, 0.0f}, color});
+    lines.push_back({center - WorldVec3{0.0f, 0.0f, kSize}, center + WorldVec3{0.0f, 0.0f, kSize}, color});
+}
+
+std::vector<SelectionOutlineRenderer::Line> BuildPhysicsBodyCenterLines(
+    const SelectedEditorObject& selected,
+    const std::vector<MeshSceneEntity>& meshes,
+    bool showAllCenters)
+{
+    std::vector<SelectionOutlineRenderer::Line> lines;
+    if (!showAllCenters)
+        return lines;
+
+    lines.reserve(meshes.size() * 3u);
+    for (const MeshSceneEntity& mesh : meshes)
+    {
+        const bool selectedMesh = selected.type == SelectedEditorObjectType::MeshEntity && selected.id == mesh.id;
+        AppendPhysicsBodyCenterLines(lines, mesh, selectedMesh
+            ? std::array<float, 4>{1.0f, 0.90f, 0.15f, 0.95f}
+            : std::array<float, 4>{0.85f, 0.85f, 1.0f, 0.75f});
+    }
+    return lines;
+}
+
+std::vector<SelectionOutlineRenderer::Line> BuildPhysicsContactLines(const std::vector<PhysicsDebugContact>& contacts)
+{
+    std::vector<SelectionOutlineRenderer::Line> lines;
+    lines.reserve(contacts.size() * 4u);
+    for (const PhysicsDebugContact& contact : contacts)
+    {
+        const WorldVec3 p = contact.point;
+        constexpr float kCross = 0.08f;
+        lines.push_back({p - WorldVec3{kCross, 0.0f, 0.0f}, p + WorldVec3{kCross, 0.0f, 0.0f}, contact.color});
+        lines.push_back({p - WorldVec3{0.0f, kCross, 0.0f}, p + WorldVec3{0.0f, kCross, 0.0f}, contact.color});
+        lines.push_back({p - WorldVec3{0.0f, 0.0f, kCross}, p + WorldVec3{0.0f, 0.0f, kCross}, contact.color});
+        lines.push_back({p, p + contact.normal * 0.55f, contact.color});
+    }
+    return lines;
+}
+
+void AppendPhysicsDebugCircle(
+    std::vector<PhysicsDebugLine>& lines,
+    WorldVec3 center,
+    WorldVec3 axisA,
+    WorldVec3 axisB,
+    float radius,
+    const std::array<float, 4>& color)
+{
+    constexpr int kSegments = 32;
+    constexpr float kTau = 6.28318530718f;
+    for (int segment = 0; segment < kSegments; ++segment)
+    {
+        const float a0 = (static_cast<float>(segment) / static_cast<float>(kSegments)) * kTau;
+        const float a1 = (static_cast<float>(segment + 1) / static_cast<float>(kSegments)) * kTau;
+        PhysicsDebugLine line{};
+        line.a = center + axisA * (std::cos(a0) * radius) + axisB * (std::sin(a0) * radius);
+        line.b = center + axisA * (std::cos(a1) * radius) + axisB * (std::sin(a1) * radius);
+        line.color = color;
+        line.ttlSeconds = 2.5f;
+        lines.push_back(line);
+    }
+}
+
+void AppendPhysicsDebugSphere(
+    std::vector<PhysicsDebugLine>& lines,
+    WorldVec3 center,
+    float radius,
+    const std::array<float, 4>& color)
+{
+    AppendPhysicsDebugCircle(lines, center, {1.0f, 0.0f, 0.0f}, {0.0f, 1.0f, 0.0f}, radius, color);
+    AppendPhysicsDebugCircle(lines, center, {1.0f, 0.0f, 0.0f}, {0.0f, 0.0f, 1.0f}, radius, color);
+    AppendPhysicsDebugCircle(lines, center, {0.0f, 1.0f, 0.0f}, {0.0f, 0.0f, 1.0f}, radius, color);
+}
+
+void AppendPhysicsDebugBox(
+    std::vector<PhysicsDebugLine>& lines,
+    WorldVec3 center,
+    WorldVec3 halfExtents,
+    const std::array<float, 4>& color)
+{
+    const WorldVec3 corners[8] = {
+        center + WorldVec3{-halfExtents.x, -halfExtents.y, -halfExtents.z},
+        center + WorldVec3{ halfExtents.x, -halfExtents.y, -halfExtents.z},
+        center + WorldVec3{ halfExtents.x, -halfExtents.y,  halfExtents.z},
+        center + WorldVec3{-halfExtents.x, -halfExtents.y,  halfExtents.z},
+        center + WorldVec3{-halfExtents.x,  halfExtents.y, -halfExtents.z},
+        center + WorldVec3{ halfExtents.x,  halfExtents.y, -halfExtents.z},
+        center + WorldVec3{ halfExtents.x,  halfExtents.y,  halfExtents.z},
+        center + WorldVec3{-halfExtents.x,  halfExtents.y,  halfExtents.z},
+    };
+    constexpr int edges[12][2] = {
+        {0, 1}, {1, 2}, {2, 3}, {3, 0},
+        {4, 5}, {5, 6}, {6, 7}, {7, 4},
+        {0, 4}, {1, 5}, {2, 6}, {3, 7},
+    };
+    for (const auto& edge : edges)
+    {
+        PhysicsDebugLine line{};
+        line.a = corners[edge[0]];
+        line.b = corners[edge[1]];
+        line.color = color;
+        line.ttlSeconds = 2.5f;
+        lines.push_back(line);
+    }
+}
+
+void AppendPhysicsDebugCapsule(
+    std::vector<PhysicsDebugLine>& lines,
+    WorldVec3 center,
+    float halfHeight,
+    float radius,
+    const std::array<float, 4>& color)
+{
+    const WorldVec3 top = center + WorldVec3{0.0f, halfHeight, 0.0f};
+    const WorldVec3 bottom = center - WorldVec3{0.0f, halfHeight, 0.0f};
+    AppendPhysicsDebugCircle(lines, top, {1.0f, 0.0f, 0.0f}, {0.0f, 0.0f, 1.0f}, radius, color);
+    AppendPhysicsDebugCircle(lines, bottom, {1.0f, 0.0f, 0.0f}, {0.0f, 0.0f, 1.0f}, radius, color);
+    AppendPhysicsDebugCircle(lines, center, {1.0f, 0.0f, 0.0f}, {0.0f, 1.0f, 0.0f}, radius, color);
+    AppendPhysicsDebugCircle(lines, center, {0.0f, 0.0f, 1.0f}, {0.0f, 1.0f, 0.0f}, radius, color);
+    const WorldVec3 offsets[4] = {
+        {radius, 0.0f, 0.0f},
+        {-radius, 0.0f, 0.0f},
+        {0.0f, 0.0f, radius},
+        {0.0f, 0.0f, -radius},
+    };
+    for (const WorldVec3& offset : offsets)
+    {
+        PhysicsDebugLine line{};
+        line.a = bottom + offset;
+        line.b = top + offset;
+        line.color = color;
+        line.ttlSeconds = 2.5f;
+        lines.push_back(line);
+    }
+}
+
+std::vector<SelectionOutlineRenderer::Line> BuildPhysicsDebugLines(const std::vector<PhysicsDebugLine>& debugLines)
+{
+    std::vector<SelectionOutlineRenderer::Line> lines;
+    lines.reserve(debugLines.size());
+    for (const PhysicsDebugLine& line : debugLines)
+        lines.push_back({line.a, line.b, line.color});
+    return lines;
+}
+
 void MergeMapEditorCommands(MapEditorCommands& target, const MapEditorCommands& source)
 {
     target.save = target.save || source.save;
@@ -1007,6 +1334,69 @@ void MergeMapEditorCommands(MapEditorCommands& target, const MapEditorCommands& 
         target.disableAssetWatcherPoll = source.disableAssetWatcherPoll;
         target.disableHierarchyIteration = source.disableHierarchyIteration;
         target.showPhysicsColliders = source.showPhysicsColliders;
+        target.showPhysicsContacts = source.showPhysicsContacts;
+        target.showPhysicsBodyCenters = source.showPhysicsBodyCenters;
+    }
+    if (source.physicsLayerMatrixChanged)
+    {
+        target.physicsLayerMatrixChanged = true;
+        target.physicsLayerMatrix = source.physicsLayerMatrix;
+    }
+    if (source.physicsRaycastFromCamera)
+    {
+        target.physicsRaycastFromCamera = true;
+        target.physicsRaycastLayerMask = source.physicsRaycastLayerMask;
+        target.physicsRaycastHitTriggers = source.physicsRaycastHitTriggers;
+        target.physicsRaycastDistance = source.physicsRaycastDistance;
+    }
+    if (source.physicsOverlapSphereFromCamera)
+    {
+        target.physicsOverlapSphereFromCamera = true;
+        target.physicsOverlapLayerMask = source.physicsOverlapLayerMask;
+        target.physicsOverlapHitTriggers = source.physicsOverlapHitTriggers;
+        target.physicsOverlapDistance = source.physicsOverlapDistance;
+        target.physicsOverlapRadius = source.physicsOverlapRadius;
+    }
+    if (source.physicsOverlapBoxFromCamera)
+    {
+        target.physicsOverlapBoxFromCamera = true;
+        target.physicsOverlapLayerMask = source.physicsOverlapLayerMask;
+        target.physicsOverlapHitTriggers = source.physicsOverlapHitTriggers;
+        target.physicsOverlapDistance = source.physicsOverlapDistance;
+        std::copy(std::begin(source.physicsOverlapBoxHalfExtents), std::end(source.physicsOverlapBoxHalfExtents), std::begin(target.physicsOverlapBoxHalfExtents));
+    }
+    if (source.physicsOverlapCapsuleFromCamera)
+    {
+        target.physicsOverlapCapsuleFromCamera = true;
+        target.physicsOverlapLayerMask = source.physicsOverlapLayerMask;
+        target.physicsOverlapHitTriggers = source.physicsOverlapHitTriggers;
+        target.physicsOverlapDistance = source.physicsOverlapDistance;
+        target.physicsOverlapCapsuleRadius = source.physicsOverlapCapsuleRadius;
+        target.physicsOverlapCapsuleHeight = source.physicsOverlapCapsuleHeight;
+    }
+    if (source.physicsSetLinearVelocityForSelected)
+    {
+        target.physicsSetLinearVelocityForSelected = true;
+        target.physicsRuntimeEntityId = source.physicsRuntimeEntityId;
+        std::copy(std::begin(source.physicsLinearVelocity), std::end(source.physicsLinearVelocity), std::begin(target.physicsLinearVelocity));
+    }
+    if (source.physicsApplyForceToSelected)
+    {
+        target.physicsApplyForceToSelected = true;
+        target.physicsRuntimeEntityId = source.physicsRuntimeEntityId;
+        std::copy(std::begin(source.physicsForce), std::end(source.physicsForce), std::begin(target.physicsForce));
+    }
+    if (source.physicsApplyImpulseToSelected)
+    {
+        target.physicsApplyImpulseToSelected = true;
+        target.physicsRuntimeEntityId = source.physicsRuntimeEntityId;
+        std::copy(std::begin(source.physicsImpulse), std::end(source.physicsImpulse), std::begin(target.physicsImpulse));
+    }
+    if (source.physicsApplyAngularImpulseToSelected)
+    {
+        target.physicsApplyAngularImpulseToSelected = true;
+        target.physicsRuntimeEntityId = source.physicsRuntimeEntityId;
+        std::copy(std::begin(source.physicsAngularImpulse), std::end(source.physicsAngularImpulse), std::begin(target.physicsAngularImpulse));
     }
     if (source.renderResolutionChanged)
     {
@@ -1211,8 +1601,10 @@ void MergeMapEditorCommands(MapEditorCommands& target, const MapEditorCommands& 
     if (source.sceneGizmoTransformChanged)
     {
         target.sceneGizmoTransformChanged = true;
+        target.sceneGizmoTarget = source.sceneGizmoTarget;
         target.sceneGizmoEntityType = source.sceneGizmoEntityType;
         target.sceneGizmoEntityId = source.sceneGizmoEntityId;
+        target.sceneGizmoOperation = source.sceneGizmoOperation;
         std::copy(std::begin(source.sceneGizmoPosition), std::end(source.sceneGizmoPosition), std::begin(target.sceneGizmoPosition));
         std::copy(std::begin(source.sceneGizmoRotation), std::end(source.sceneGizmoRotation), std::begin(target.sceneGizmoRotation));
         std::copy(std::begin(source.sceneGizmoScale), std::end(source.sceneGizmoScale), std::begin(target.sceneGizmoScale));
@@ -1418,6 +1810,18 @@ int RunGame(NativeWindow& window,
             offscreenScene.GetExtent());
 #endif
     }
+
+    // Second offscreen target for the Game view (rendered from the scene's main camera).
+    // Uses a render-pass-compatible target, so the renderers' existing pipelines work as-is.
+    OffscreenSceneRenderer gameView;
+    bool gameViewOk = gameView.Create(device, assets, renderSize);
+#if defined(IXTREEME_WITH_EDITOR)
+    if (gameViewOk)
+        editorImGui.SetGameViewTexture(gameView.GetLinearSampler(),
+            gameView.GetSceneColorView(),
+            VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL,
+            gameView.GetExtent());
+#endif
     struct StaticMeshCacheEntry
     {
         enum class State
@@ -1601,6 +2005,15 @@ int RunGame(NativeWindow& window,
             offscreenScene.GetSceneColorView(),
             VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL,
             offscreenScene.GetExtent());
+        if (gameViewOk)
+        {
+            gameViewOk = gameView.Recreate(device, renderSize);
+            editorImGui.SetGameViewTexture(
+                gameViewOk ? gameView.GetLinearSampler() : VK_NULL_HANDLE,
+                gameViewOk ? gameView.GetSceneColorView() : VK_NULL_HANDLE,
+                gameViewOk ? VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL : VK_IMAGE_LAYOUT_UNDEFINED,
+                gameViewOk ? gameView.GetExtent() : VkExtent2D{});
+        }
 #endif
     };
     auto recreateOffscreenScene = [&](const char* reason) {
@@ -1651,6 +2064,9 @@ int RunGame(NativeWindow& window,
     std::vector<PointLight> editorPointLights;
     std::vector<SpotLight> editorSpotLights;
     std::vector<MeshSceneEntity> editorMeshEntities;
+    std::vector<CameraEntity> editorCameras;
+    std::uint32_t nextEditorCameraEntityId = 1;
+    std::uint32_t editorMainCameraId = 0;
     std::unordered_map<std::uint32_t, std::size_t> editorMeshEntityLookup;
     SpatialIndex staticMeshSpatialIndex;
     std::unordered_set<std::uint32_t> staticMeshSpatialIndexed;
@@ -1670,8 +2086,23 @@ int RunGame(NativeWindow& window,
     InstBufferState previousInstBuffer;
     phys::PhysicsWorld editorPhysicsWorld;
     std::unordered_map<std::uint32_t, phys::BodyId> editorPhysicsBodies;
+    std::unordered_map<phys::BodyId, PhysicsBodyEntityBinding> editorPhysicsBodyBindings;
+    std::vector<PhysicsEntityEvent> editorPhysicsEntityEvents;
+    std::vector<PhysicsDebugContact> editorPhysicsDebugContacts;
+    std::vector<PhysicsDebugLine> editorPhysicsDebugLines;
+    PhysicsLayerMatrix editorPhysicsLayerMatrix{};
     bool editorPhysicsWorldActive = false;
+    float editorPhysicsAccumulatorSeconds = 0.0f;
     std::uint32_t editorPhysicsStepLogFrames = 0;
+    for (std::size_t a = 0; a < static_cast<std::size_t>(phys::PhysicsLayer::Count); ++a)
+    {
+        for (std::size_t b = 0; b < static_cast<std::size_t>(phys::PhysicsLayer::Count); ++b)
+        {
+            editorPhysicsLayerMatrix[a][b] = phys::DefaultLayerCollision(
+                static_cast<phys::PhysicsLayer>(a),
+                static_cast<phys::PhysicsLayer>(b));
+        }
+    }
     std::size_t previousMeshSubmitDetailInstances = 0;
     std::size_t previousMeshSubmitDetailDrawCalls = 0;
     bool previousMeshSubmitDetailInitialized = false;
@@ -1826,12 +2257,20 @@ int RunGame(NativeWindow& window,
     };
     auto clearEditorPhysicsWorld = [&]() {
         editorPhysicsBodies.clear();
+        editorPhysicsBodyBindings.clear();
+        editorPhysicsEntityEvents.clear();
+        editorPhysicsDebugContacts.clear();
+        editorPhysicsDebugLines.clear();
         editorPhysicsWorld.Destroy();
         editorPhysicsWorldActive = false;
+        editorPhysicsAccumulatorSeconds = 0.0f;
         editorPhysicsStepLogFrames = 0;
     };
     auto rebuildEditorPhysicsWorld = [&]() {
         clearEditorPhysicsWorld();
+        editorPhysicsWorld.SetCollisionMatrix(editorPhysicsLayerMatrix);
+        const PhysicsSceneSettings physicsSettings = SceneManager::Instance().GetCurrentScene().physics;
+        editorPhysicsWorld.SetGravity(physicsSettings.gravity);
         if (!editorPhysicsWorld.Create())
         {
             Tracen("[PHYSICS] world create failed");
@@ -1842,6 +2281,14 @@ int RunGame(NativeWindow& window,
         std::uint32_t staticBodies = 0;
         std::uint32_t kinematicBodies = 0;
         std::uint32_t gravityBodies = 0;
+        std::uint32_t fixedJoints = 0;
+        std::uint32_t hingeJoints = 0;
+        auto makeJointPairKey = [](std::uint32_t a, std::uint32_t b) -> std::uint64_t {
+            const std::uint32_t lo = std::min(a, b);
+            const std::uint32_t hi = std::max(a, b);
+            return (static_cast<std::uint64_t>(lo) << 32u) | static_cast<std::uint64_t>(hi);
+        };
+        std::unordered_set<std::uint64_t> createdJointPairs;
         if (terrainOk && terrain.HasTerrain())
         {
             const TerrainSceneData terrainData = terrain.GetTerrainSceneData();
@@ -1855,6 +2302,10 @@ int RunGame(NativeWindow& window,
             const phys::BodyId terrainBodyId = editorPhysicsWorld.CreateTerrainCollider(terrainCollider);
             if (terrainBodyId != 0)
             {
+                editorPhysicsBodyBindings[terrainBodyId] = PhysicsBodyEntityBinding{
+                    0u,
+                    terrainData.name.empty() ? std::string("Terrain") : terrainData.name,
+                    true};
                 ++createdBodies;
                 ++staticBodies;
             }
@@ -1874,6 +2325,27 @@ int RunGame(NativeWindow& window,
             desc.scale[0] = mesh.scale[0];
             desc.scale[1] = mesh.scale[1];
             desc.scale[2] = mesh.scale[2];
+            if (desc.collider.shape == phys::ColliderShape::Mesh ||
+                desc.collider.shape == phys::ColliderShape::ConvexHull)
+            {
+                StaticMeshRenderer* renderer = getStaticMeshRenderer(resolveMeshRuntimePath(mesh));
+                if (renderer && renderer->CopyPhysicsMesh(desc.meshVertices, desc.meshIndices))
+                {
+                    Tracenf("[PHYSICS] %s collider geometry entity=%u name=%s verts=%zu tris=%zu",
+                        phys::ToString(desc.collider.shape),
+                        mesh.id,
+                        mesh.name.c_str(),
+                        desc.meshVertices.size(),
+                        desc.meshIndices.size() / 3u);
+                }
+                else
+                {
+                    Tracenf("[PHYSICS] %s collider geometry missing entity=%u name=%s fallback=box",
+                        phys::ToString(desc.collider.shape),
+                        mesh.id,
+                        mesh.name.c_str());
+                }
+            }
             if (rigidbodyEnabled &&
                 desc.rigidbody.useGravity &&
                 desc.bodyType == phys::BodyType::Static)
@@ -1883,10 +2355,33 @@ int RunGame(NativeWindow& window,
                     mesh.id,
                     mesh.name.c_str());
             }
+            bool physicsMaterialApplied = false;
+            if (!desc.collider.materialAssetId.empty())
+            {
+                if (auto physicsMaterial = editorImGui.FindPhysicsMaterial(desc.collider.materialAssetId))
+                {
+                    desc.collider.friction = physicsMaterial->friction;
+                    desc.collider.restitution = physicsMaterial->restitution;
+                    desc.collider.frictionCombine = physicsMaterial->frictionCombine;
+                    desc.collider.restitutionCombine = physicsMaterial->restitutionCombine;
+                    desc.rigidbody.linearDamping = physicsMaterial->linearDamping;
+                    desc.rigidbody.angularDamping = physicsMaterial->angularDamping;
+                    if (rigidbodyEnabled && desc.bodyType == phys::BodyType::Dynamic)
+                        desc.rigidbody.mass = std::max(0.001f, desc.rigidbody.mass * physicsMaterial->density);
+                    physicsMaterialApplied = true;
+                }
+                else
+                {
+                    Tracenf("[PHYSICS-MAT] missing entity=%u material=%s",
+                        mesh.id,
+                        desc.collider.materialAssetId.c_str());
+                }
+            }
             const phys::BodyId bodyId = editorPhysicsWorld.CreateBody(desc);
             if (bodyId == 0)
                 continue;
             editorPhysicsBodies[mesh.id] = bodyId;
+            editorPhysicsBodyBindings[bodyId] = PhysicsBodyEntityBinding{mesh.id, mesh.name, false};
             ++createdBodies;
             if (desc.bodyType == phys::BodyType::Dynamic)
             {
@@ -1902,60 +2397,325 @@ int RunGame(NativeWindow& window,
             {
                 ++staticBodies;
             }
-            Tracenf("[PHYSICS] body entity=%u name=%s type=%s gravity=%u collider=%s mass=%.3f friction=%.2f bounce=%.2f scale=(%.3f,%.3f,%.3f)",
+            Tracenf("[PHYSICS] body entity=%u name=%s type=%s gravity=%u sleep=%u ccd=%u collider=%s layer=%s material=%s mass=%.3f friction=%.2f bounce=%.2f combine=(%s,%s) scale=(%.3f,%.3f,%.3f)",
                 mesh.id,
                 mesh.name.c_str(),
                 phys::ToString(desc.bodyType),
                 desc.rigidbody.useGravity ? 1u : 0u,
+                desc.rigidbody.allowSleeping ? 1u : 0u,
+                desc.rigidbody.continuousCollision ? 1u : 0u,
                 phys::ToString(desc.collider.shape),
+                phys::ToString(desc.collider.layer),
+                physicsMaterialApplied ? desc.collider.materialAssetId.c_str() : "none",
                 desc.rigidbody.mass,
                 desc.collider.friction,
                 desc.collider.restitution,
+                phys::ToString(desc.collider.frictionCombine),
+                phys::ToString(desc.collider.restitutionCombine),
                 desc.scale[0],
                 desc.scale[1],
                 desc.scale[2]);
         }
+        for (const MeshSceneEntity& mesh : editorMeshEntities)
+        {
+            if (!mesh.hasFixedJoint || !mesh.fixedJoint.enabled || mesh.fixedJoint.connectedEntityId == 0)
+                continue;
+            const auto bodyA = editorPhysicsBodies.find(mesh.id);
+            const auto bodyB = editorPhysicsBodies.find(mesh.fixedJoint.connectedEntityId);
+            if (bodyA == editorPhysicsBodies.end() || bodyB == editorPhysicsBodies.end())
+            {
+                Tracenf("[PHYSICS-JOINT] fixed skipped entity=%u connected=%u reason=missing-body",
+                    mesh.id,
+                    mesh.fixedJoint.connectedEntityId);
+                continue;
+            }
+            if (!createdJointPairs.insert(makeJointPairKey(mesh.id, mesh.fixedJoint.connectedEntityId)).second)
+            {
+                Tracenf("[PHYSICS-JOINT] fixed skipped entity=%u connected=%u reason=duplicate-pair",
+                    mesh.id,
+                    mesh.fixedJoint.connectedEntityId);
+                continue;
+            }
+            phys::FixedJointDesc jointDesc{};
+            jointDesc.bodyA = bodyA->second;
+            jointDesc.bodyB = bodyB->second;
+            const phys::ConstraintId jointId = editorPhysicsWorld.CreateFixedJoint(jointDesc);
+            if (jointId == 0)
+            {
+                Tracenf("[PHYSICS-JOINT] fixed skipped entity=%u connected=%u reason=create-failed",
+                    mesh.id,
+                    mesh.fixedJoint.connectedEntityId);
+                continue;
+            }
+            ++fixedJoints;
+            Tracenf("[PHYSICS-JOINT] fixed created id=%llu entity=%u connected=%u",
+                static_cast<unsigned long long>(jointId),
+                mesh.id,
+                mesh.fixedJoint.connectedEntityId);
+        }
+        for (const MeshSceneEntity& mesh : editorMeshEntities)
+        {
+            if (!mesh.hasHingeJoint || !mesh.hingeJoint.enabled || mesh.hingeJoint.connectedEntityId == 0)
+                continue;
+            const auto bodyA = editorPhysicsBodies.find(mesh.id);
+            const auto bodyB = editorPhysicsBodies.find(mesh.hingeJoint.connectedEntityId);
+            if (bodyA == editorPhysicsBodies.end() || bodyB == editorPhysicsBodies.end())
+            {
+                Tracenf("[PHYSICS-JOINT] hinge skipped entity=%u connected=%u reason=missing-body",
+                    mesh.id,
+                    mesh.hingeJoint.connectedEntityId);
+                continue;
+            }
+            if (!createdJointPairs.insert(makeJointPairKey(mesh.id, mesh.hingeJoint.connectedEntityId)).second)
+            {
+                Tracenf("[PHYSICS-JOINT] hinge skipped entity=%u connected=%u reason=duplicate-pair",
+                    mesh.id,
+                    mesh.hingeJoint.connectedEntityId);
+                continue;
+            }
+            phys::HingeJointDesc jointDesc{};
+            jointDesc.bodyA = bodyA->second;
+            jointDesc.bodyB = bodyB->second;
+            std::copy(std::begin(mesh.hingeJoint.anchor), std::end(mesh.hingeJoint.anchor), std::begin(jointDesc.anchor));
+            std::copy(std::begin(mesh.hingeJoint.axis), std::end(mesh.hingeJoint.axis), std::begin(jointDesc.axis));
+            jointDesc.limitsEnabled = mesh.hingeJoint.limitsEnabled;
+            jointDesc.minAngleRadians = mesh.hingeJoint.minAngleDegrees * 0.017453292519943295f;
+            jointDesc.maxAngleRadians = mesh.hingeJoint.maxAngleDegrees * 0.017453292519943295f;
+            jointDesc.frictionTorque = mesh.hingeJoint.frictionTorque;
+            const phys::ConstraintId jointId = editorPhysicsWorld.CreateHingeJoint(jointDesc);
+            if (jointId == 0)
+            {
+                Tracenf("[PHYSICS-JOINT] hinge skipped entity=%u connected=%u reason=create-failed",
+                    mesh.id,
+                    mesh.hingeJoint.connectedEntityId);
+                continue;
+            }
+            ++hingeJoints;
+            Tracenf("[PHYSICS-JOINT] hinge created id=%llu entity=%u connected=%u anchor=(%.3f,%.3f,%.3f) axis=(%.3f,%.3f,%.3f)",
+                static_cast<unsigned long long>(jointId),
+                mesh.id,
+                mesh.hingeJoint.connectedEntityId,
+                mesh.hingeJoint.anchor[0],
+                mesh.hingeJoint.anchor[1],
+                mesh.hingeJoint.anchor[2],
+                mesh.hingeJoint.axis[0],
+                mesh.hingeJoint.axis[1],
+                mesh.hingeJoint.axis[2]);
+        }
         editorPhysicsWorldActive = true;
         editorPhysicsStepLogFrames = 0;
-        Tracenf("[PHYSICS] play world rebuilt bodies=%u dynamic=%u static=%u kinematic=%u gravity=%u meshEntities=%zu",
+        Tracenf("[PHYSICS] play world rebuilt bodies=%u dynamic=%u static=%u kinematic=%u gravityBodies=%u worldGravity=(%.2f,%.2f,%.2f) fixedDt=%.4f maxSubsteps=%u fixedJoints=%u hingeJoints=%u meshEntities=%zu",
             createdBodies,
             dynamicBodies,
             staticBodies,
             kinematicBodies,
             gravityBodies,
+            physicsSettings.gravity[0],
+            physicsSettings.gravity[1],
+            physicsSettings.gravity[2],
+            physicsSettings.fixedDeltaSeconds,
+            physicsSettings.maxSubsteps,
+            fixedJoints,
+            hingeJoints,
             editorMeshEntities.size());
         return true;
     };
     auto stepEditorPhysicsWorld = [&](float deltaSeconds) {
         if (!editorPhysicsWorldActive || editorPlay.state.mode != EditorPlayMode::Play)
             return;
-        editorPhysicsWorld.Step(std::clamp(deltaSeconds, 0.0f, 1.0f / 15.0f));
-        std::uint32_t movedDynamicBodies = 0;
-        for (const auto& [meshId, bodyId] : editorPhysicsBodies)
+        const PhysicsSceneSettings physicsSettings = SceneManager::Instance().GetCurrentScene().physics;
+        const float fixedDeltaSeconds = std::clamp(physicsSettings.fixedDeltaSeconds, 0.001f, 0.1f);
+        const std::uint32_t maxSubsteps = std::clamp(physicsSettings.maxSubsteps, 1u, 16u);
+        const float frameDeltaSeconds = std::clamp(deltaSeconds, 0.0f, 0.25f);
+        editorPhysicsAccumulatorSeconds += frameDeltaSeconds;
+
+        std::uint32_t substeps = 0;
+        std::uint32_t movedKinematicBodies = 0;
+        std::vector<phys::PhysicsContactEvent> contactEvents;
+        while (editorPhysicsAccumulatorSeconds + 0.000001f >= fixedDeltaSeconds &&
+               substeps < maxSubsteps)
         {
-            MeshSceneEntity* mesh = findMeshEntityById(meshId);
-            if (!mesh || !mesh->hasRigidbody || !mesh->rigidbody.enabled ||
-                mesh->rigidbody.bodyType != phys::BodyType::Dynamic)
-                continue;
-            phys::PhysicsTransform transform{};
-            if (!editorPhysicsWorld.GetBodyTransform(bodyId, transform))
-                continue;
-            if (ApplyPhysicsTransformToMesh(transform, *mesh))
+            for (const auto& [meshId, bodyId] : editorPhysicsBodies)
             {
-                syncStaticMeshSpatialEntity(*mesh);
-                ++movedDynamicBodies;
+                MeshSceneEntity* mesh = findMeshEntityById(meshId);
+                if (!mesh || !mesh->hasRigidbody || !mesh->rigidbody.enabled ||
+                    mesh->rigidbody.bodyType != phys::BodyType::Kinematic)
+                    continue;
+                if (editorPhysicsWorld.MoveKinematic(bodyId, PhysicsTransformFromMesh(*mesh), fixedDeltaSeconds))
+                    ++movedKinematicBodies;
+            }
+            editorPhysicsWorld.Step(fixedDeltaSeconds);
+            const std::vector<phys::PhysicsContactEvent>& stepEvents = editorPhysicsWorld.ContactEvents();
+            contactEvents.insert(contactEvents.end(), stepEvents.begin(), stepEvents.end());
+            editorPhysicsAccumulatorSeconds -= fixedDeltaSeconds;
+            ++substeps;
+        }
+
+        const bool droppedSubsteps = editorPhysicsAccumulatorSeconds >= fixedDeltaSeconds;
+        if (droppedSubsteps)
+            editorPhysicsAccumulatorSeconds = 0.0f;
+
+        std::uint32_t collisionStarted = 0;
+        std::uint32_t collisionStayed = 0;
+        std::uint32_t collisionEnded = 0;
+        std::uint32_t triggerStarted = 0;
+        std::uint32_t triggerStayed = 0;
+        std::uint32_t triggerEnded = 0;
+        for (const phys::PhysicsContactEvent& event : contactEvents)
+        {
+            const bool trigger = event.kind == phys::PhysicsContactKind::Trigger;
+            if (event.phase == phys::PhysicsContactPhase::Started)
+                trigger ? ++triggerStarted : ++collisionStarted;
+            else if (event.phase == phys::PhysicsContactPhase::Stayed)
+                trigger ? ++triggerStayed : ++collisionStayed;
+            else
+                trigger ? ++triggerEnded : ++collisionEnded;
+        }
+        std::uint32_t detailedEventLogs = 0;
+        for (const phys::PhysicsContactEvent& event : contactEvents)
+        {
+            const auto bindingA = editorPhysicsBodyBindings.find(event.bodyA);
+            const auto bindingB = editorPhysicsBodyBindings.find(event.bodyB);
+            PhysicsBodyEntityBinding fallbackA{};
+            fallbackA.name = "Unknown";
+            PhysicsBodyEntityBinding fallbackB{};
+            fallbackB.name = "Unknown";
+            const PhysicsBodyEntityBinding& bodyA =
+                bindingA == editorPhysicsBodyBindings.end() ? fallbackA : bindingA->second;
+            const PhysicsBodyEntityBinding& bodyB =
+                bindingB == editorPhysicsBodyBindings.end() ? fallbackB : bindingB->second;
+
+            PhysicsEntityEvent routed{};
+            routed.phase = event.phase;
+            routed.kind = event.kind;
+            routed.entityA = bodyA.entityId;
+            routed.entityB = bodyB.entityId;
+            routed.nameA = bodyA.name;
+            routed.nameB = bodyB.name;
+            routed.bodyA = event.bodyA;
+            routed.bodyB = event.bodyB;
+            routed.point = {event.point[0], event.point[1], event.point[2]};
+            routed.normal = {event.normal[0], event.normal[1], event.normal[2]};
+            routed.penetrationDepth = event.penetrationDepth;
+            editorPhysicsEntityEvents.push_back(std::move(routed));
+
+            if ((event.phase == phys::PhysicsContactPhase::Started ||
+                 event.phase == phys::PhysicsContactPhase::Ended) &&
+                detailedEventLogs < 8)
+            {
+                const PhysicsEntityEvent& logged = editorPhysicsEntityEvents.back();
+                Tracenf("[PHYSICS-EVENT] %s%s entityA=%u(%s) entityB=%u(%s) bodyA=%llu bodyB=%llu point=(%.2f,%.2f,%.2f) depth=%.3f",
+                    PhysicsEventKindName(logged.kind),
+                    PhysicsEventPhaseName(logged.phase),
+                    logged.entityA,
+                    logged.nameA.c_str(),
+                    logged.entityB,
+                    logged.nameB.c_str(),
+                    static_cast<unsigned long long>(logged.bodyA),
+                    static_cast<unsigned long long>(logged.bodyB),
+                    logged.point.x,
+                    logged.point.y,
+                    logged.point.z,
+                    logged.penetrationDepth);
+                ++detailedEventLogs;
+            }
+        }
+        if (editorPhysicsEntityEvents.size() > 512)
+        {
+            editorPhysicsEntityEvents.erase(
+                editorPhysicsEntityEvents.begin(),
+                editorPhysicsEntityEvents.begin() + static_cast<std::ptrdiff_t>(editorPhysicsEntityEvents.size() - 512));
+        }
+        for (const phys::PhysicsContactEvent& event : contactEvents)
+        {
+            if (event.phase == phys::PhysicsContactPhase::Ended)
+                continue;
+            PhysicsDebugContact debugContact{};
+            debugContact.point = {event.point[0], event.point[1], event.point[2]};
+            debugContact.normal = {event.normal[0], event.normal[1], event.normal[2]};
+            debugContact.color = event.kind == phys::PhysicsContactKind::Trigger
+                ? std::array<float, 4>{1.0f, 0.62f, 0.10f, 0.95f}
+                : std::array<float, 4>{0.25f, 1.0f, 0.35f, 0.95f};
+            debugContact.ttlSeconds = 0.25f;
+            editorPhysicsDebugContacts.push_back(debugContact);
+        }
+        for (PhysicsDebugContact& contact : editorPhysicsDebugContacts)
+            contact.ttlSeconds -= deltaSeconds;
+        editorPhysicsDebugContacts.erase(
+            std::remove_if(editorPhysicsDebugContacts.begin(), editorPhysicsDebugContacts.end(),
+                [](const PhysicsDebugContact& contact) { return contact.ttlSeconds <= 0.0f; }),
+            editorPhysicsDebugContacts.end());
+        for (PhysicsDebugLine& line : editorPhysicsDebugLines)
+            line.ttlSeconds -= deltaSeconds;
+        editorPhysicsDebugLines.erase(
+            std::remove_if(editorPhysicsDebugLines.begin(), editorPhysicsDebugLines.end(),
+                [](const PhysicsDebugLine& line) { return line.ttlSeconds <= 0.0f; }),
+            editorPhysicsDebugLines.end());
+        if (editorPhysicsDebugContacts.size() > 256)
+        {
+            editorPhysicsDebugContacts.erase(
+                editorPhysicsDebugContacts.begin(),
+                editorPhysicsDebugContacts.begin() + static_cast<std::ptrdiff_t>(editorPhysicsDebugContacts.size() - 256));
+        }
+        if (editorPhysicsDebugLines.size() > 256)
+        {
+            editorPhysicsDebugLines.erase(
+                editorPhysicsDebugLines.begin(),
+                editorPhysicsDebugLines.begin() + static_cast<std::ptrdiff_t>(editorPhysicsDebugLines.size() - 256));
+        }
+        std::uint32_t movedDynamicBodies = 0;
+        if (substeps > 0)
+        {
+            for (const auto& [meshId, bodyId] : editorPhysicsBodies)
+            {
+                MeshSceneEntity* mesh = findMeshEntityById(meshId);
+                if (!mesh || !mesh->hasRigidbody || !mesh->rigidbody.enabled ||
+                    mesh->rigidbody.bodyType != phys::BodyType::Dynamic)
+                    continue;
+                phys::PhysicsTransform transform{};
+                if (!editorPhysicsWorld.GetBodyTransform(bodyId, transform))
+                    continue;
+                if (ApplyPhysicsTransformToMesh(transform, *mesh))
+                {
+                    syncStaticMeshSpatialEntity(*mesh);
+                    ++movedDynamicBodies;
+                }
             }
         }
         if (editorPhysicsStepLogFrames < 3)
         {
             const phys::PhysicsWorldStats physicsStats = editorPhysicsWorld.Stats();
-            Tracenf("[PHYSICS] step frame=%u bodies=%u meshBodies=%zu movedDynamic=%u dt=%.4f",
+            Tracenf("[PHYSICS] step frame=%u bodies=%u meshBodies=%zu movedDynamic=%u movedKinematic=%u frameDt=%.4f fixedDt=%.4f substeps=%u accumulator=%.4f dropped=%u",
                 editorPhysicsStepLogFrames,
                 physicsStats.bodyCount,
                 editorPhysicsBodies.size(),
                 movedDynamicBodies,
-                deltaSeconds);
+                movedKinematicBodies,
+                deltaSeconds,
+                fixedDeltaSeconds,
+                substeps,
+                editorPhysicsAccumulatorSeconds,
+                droppedSubsteps ? 1u : 0u);
+            if (!contactEvents.empty())
+            {
+                Tracenf("[PHYSICS-EVENT] frame=%u collision(start=%u stay=%u end=%u) trigger(start=%u stay=%u end=%u)",
+                    editorPhysicsStepLogFrames,
+                    collisionStarted,
+                    collisionStayed,
+                    collisionEnded,
+                    triggerStarted,
+                    triggerStayed,
+                    triggerEnded);
+            }
             ++editorPhysicsStepLogFrames;
+        }
+        else if (collisionStarted + collisionEnded + triggerStarted + triggerEnded > 0)
+        {
+            Tracenf("[PHYSICS-EVENT] collision(start=%u end=%u) trigger(start=%u end=%u)",
+                collisionStarted,
+                collisionEnded,
+                triggerStarted,
+                triggerEnded);
         }
     };
     auto logStaticMeshSpatialBuild = [&]() {
@@ -2004,7 +2764,27 @@ int RunGame(NativeWindow& window,
         resetEditorHierarchyEntities,
         rebuildStaticMeshSpatialIndex,
         syncTerrainAssetRoots,
-        [](MeshSceneEntity& mesh) { EnsureMeshEntityMaterialSlots(mesh); }});
+        [](MeshSceneEntity& mesh) { EnsureMeshEntityMaterialSlots(mesh); },
+        &editorCameras,
+        &nextEditorCameraEntityId,
+        &editorMainCameraId,
+        [&cameraController]() {
+            const FlyCameraController::Snapshot snap = cameraController.SaveSnapshot();
+            EditorCameraState state;
+            state.eye[0] = static_cast<float>(snap.eye.x);
+            state.eye[1] = static_cast<float>(snap.eye.y);
+            state.eye[2] = static_cast<float>(snap.eye.z);
+            state.yaw = snap.yaw;
+            state.pitch = snap.pitch;
+            return state;
+        },
+        [&cameraController](const EditorCameraState& state) {
+            FlyCameraController::Snapshot snap;
+            snap.eye = WorldVec3{state.eye[0], state.eye[1], state.eye[2]};
+            snap.yaw = state.yaw;
+            snap.pitch = state.pitch;
+            cameraController.RestoreSnapshot(snap);
+        }});
     auto buildHierarchyEntities = [&]() {
         std::vector<HierarchySceneEntity> entities;
         std::vector<std::uint64_t> liveKeys;
@@ -2191,6 +2971,17 @@ int RunGame(NativeWindow& window,
                 !prefabAssetId.empty() && prefabRoot.first == HierarchyEntityType::SpotLight && prefabRoot.second == light.id,
                 prefabAssetId);
         }
+        for (const CameraEntity& cameraEntity : editorCameras)
+        {
+            std::string cameraLabel = cameraEntity.name.empty() ? std::string("Camera") : cameraEntity.name;
+            if (cameraEntity.id == editorMainCameraId)
+                cameraLabel += " (Main)";
+            ensureEntity(HierarchyEntityType::Camera,
+                cameraEntity.id,
+                cameraLabel,
+                cameraEntity.editorHidden,
+                cameraEntity.parent);
+        }
 
         for (auto it = editorHierarchyEntities.begin(); it != editorHierarchyEntities.end();)
         {
@@ -2267,6 +3058,7 @@ int RunGame(NativeWindow& window,
                              &editorPointLights,
                              &editorSpotLights,
                              &editorMeshEntities,
+                             &editorCameras,
                              &editorWaterBodies,
                              &editorWaterBodiesDirty,
                              &selectedEditorObject,
@@ -2806,6 +3598,20 @@ int RunGame(NativeWindow& window,
                             runtimeSession->SetEditorStatus("Selected spot light #" + std::to_string(*spotId));
                             return;
                         }
+                        if (auto cameraId = PickDynamicLight(editorCameras,
+                                lastPickCamera,
+                                renderSize.width,
+                                renderSize.height,
+                                viewportEvent.x,
+                                viewportEvent.y))
+                        {
+                            selectedEditorObject = {SelectedEditorObjectType::Camera, *cameraId};
+                            editorObjectDragActive = false;
+                            editorObjectDragLastX = event.x;
+                            editorObjectDragLastY = event.y;
+                            runtimeSession->SetEditorStatus("Selected camera #" + std::to_string(*cameraId));
+                            return;
+                        }
                         if (auto meshId = PickMeshEntity(editorMeshEntities,
                                 lastPickCamera,
                                 renderSize.width,
@@ -3048,6 +3854,8 @@ int RunGame(NativeWindow& window,
     bool debugDisableAssetWatcherPoll = false;
     bool debugDisableHierarchyIteration = false;
     bool debugShowPhysicsColliders = false;
+    bool debugShowPhysicsContacts = false;
+    bool debugShowPhysicsBodyCenters = false;
     bool dumpFrameProfileRequested = false;
     Tracen("[VISIBILITY-RESPECT] shadow_pass=yes water_reflection_pass=yes main_pass=yes");
 #endif
@@ -3121,6 +3929,15 @@ int RunGame(NativeWindow& window,
                             offscreenScene.GetSceneColorView(),
                             VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL,
                             offscreenScene.GetExtent());
+                        if (gameViewOk)
+                        {
+                            gameViewOk = gameView.Recreate(device, renderSize);
+                            editorImGui.SetGameViewTexture(
+                                gameViewOk ? gameView.GetLinearSampler() : VK_NULL_HANDLE,
+                                gameViewOk ? gameView.GetSceneColorView() : VK_NULL_HANDLE,
+                                gameViewOk ? VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL : VK_IMAGE_LAYOUT_UNDEFINED,
+                                gameViewOk ? gameView.GetExtent() : VkExtent2D{});
+                        }
 #endif
                     }
 #if defined(IXTREEME_WITH_EDITOR)
@@ -3323,13 +4140,418 @@ int RunGame(NativeWindow& window,
                     debugDisableAssetWatcherPoll = commands.disableAssetWatcherPoll;
                     debugDisableHierarchyIteration = commands.disableHierarchyIteration;
                     debugShowPhysicsColliders = commands.showPhysicsColliders;
-                    Tracenf("[FRAME-PROFILE] toggles shadow=%s water_reflection=%s asset_library_discovery=%s asset_watcher_poll=%s hierarchy_iteration=%s physics_colliders=%s",
+                    debugShowPhysicsContacts = commands.showPhysicsContacts;
+                    debugShowPhysicsBodyCenters = commands.showPhysicsBodyCenters;
+                    Tracenf("[FRAME-PROFILE] toggles shadow=%s water_reflection=%s asset_library_discovery=%s asset_watcher_poll=%s hierarchy_iteration=%s physics_colliders=%s physics_contacts=%s physics_centers=%s",
                         debugDisableShadowPass ? "disabled" : "enabled",
                         debugDisableWaterReflectionPass ? "disabled" : "enabled",
                         debugDisableAssetLibraryDiscovery ? "disabled" : "enabled",
                         debugDisableAssetWatcherPoll ? "disabled" : "enabled",
                         debugDisableHierarchyIteration ? "disabled" : "enabled",
-                        debugShowPhysicsColliders ? "shown" : "selected-only");
+                        debugShowPhysicsColliders ? "shown" : "selected-only",
+                        debugShowPhysicsContacts ? "shown" : "hidden",
+                        debugShowPhysicsBodyCenters ? "shown" : "hidden");
+                }
+                if (commands.physicsLayerMatrixChanged)
+                {
+                    editorPhysicsLayerMatrix = commands.physicsLayerMatrix;
+                    Tracen("[PHYSICS-LAYER] matrix applied");
+                    runtimeSession->SetEditorStatus("Physics collision matrix updated");
+                    if (editorPlay.state.mode == EditorPlayMode::Play && editorPhysicsWorldActive)
+                        rebuildEditorPhysicsWorld();
+                }
+                if (commands.physicsRaycastFromCamera)
+                {
+                    if (editorPlay.state.mode != EditorPlayMode::Play || !editorPhysicsWorldActive)
+                    {
+                        runtimeSession->SetEditorStatus("Physics raycast needs Play mode");
+                        Tracen("[PHYSICS-QUERY] raycast skipped reason=world-inactive");
+                    }
+                    else
+                    {
+                        const WorldVec3 origin = frameCamera.eye;
+                        const WorldVec3 direction = WorldCameraForward(frameCamera);
+                        phys::PhysicsQueryFilter queryFilter{};
+                        queryFilter.layerMask = commands.physicsRaycastLayerMask;
+                        queryFilter.hitTriggers = commands.physicsRaycastHitTriggers;
+                        phys::PhysicsRaycastHit hit{};
+                        const float originRaw[3] = {origin.x, origin.y, origin.z};
+                        const float directionRaw[3] = {direction.x, direction.y, direction.z};
+                        const bool didHit = editorPhysicsWorld.Raycast(
+                            originRaw,
+                            directionRaw,
+                            commands.physicsRaycastDistance,
+                            queryFilter,
+                            hit);
+                        PhysicsDebugLine rayLine{};
+                        rayLine.a = origin;
+                        rayLine.b = didHit
+                            ? WorldVec3{hit.position[0], hit.position[1], hit.position[2]}
+                            : origin + direction * commands.physicsRaycastDistance;
+                        rayLine.color = didHit
+                            ? std::array<float, 4>{1.0f, 0.86f, 0.15f, 0.95f}
+                            : std::array<float, 4>{0.55f, 0.62f, 0.75f, 0.65f};
+                        rayLine.ttlSeconds = 2.5f;
+                        editorPhysicsDebugLines.push_back(rayLine);
+                        if (didHit)
+                        {
+                            PhysicsDebugContact marker{};
+                            marker.point = rayLine.b;
+                            marker.normal = {hit.normal[0], hit.normal[1], hit.normal[2]};
+                            marker.color = hit.trigger
+                                ? std::array<float, 4>{1.0f, 0.62f, 0.10f, 0.95f}
+                                : std::array<float, 4>{1.0f, 0.86f, 0.15f, 0.95f};
+                            marker.ttlSeconds = 2.5f;
+                            editorPhysicsDebugContacts.push_back(marker);
+
+                            std::uint32_t meshEntityId = 0;
+                            for (const auto& [candidateMeshId, bodyId] : editorPhysicsBodies)
+                            {
+                                if (bodyId == hit.bodyId)
+                                {
+                                    meshEntityId = candidateMeshId;
+                                    break;
+                                }
+                            }
+                            Tracenf("[PHYSICS-QUERY] raycast hit body=%llu mesh=%u layer=%s trigger=%u dist=%.3f pos=(%.3f,%.3f,%.3f) normal=(%.3f,%.3f,%.3f)",
+                                static_cast<unsigned long long>(hit.bodyId),
+                                meshEntityId,
+                                phys::ToString(hit.layer),
+                                hit.trigger ? 1u : 0u,
+                                hit.distance,
+                                hit.position[0],
+                                hit.position[1],
+                                hit.position[2],
+                                hit.normal[0],
+                                hit.normal[1],
+                                hit.normal[2]);
+                            runtimeSession->SetEditorStatus("Physics raycast hit");
+                        }
+                        else
+                        {
+                            Tracenf("[PHYSICS-QUERY] raycast miss distance=%.3f layerMask=0x%08X hitTriggers=%u",
+                                commands.physicsRaycastDistance,
+                                commands.physicsRaycastLayerMask,
+                                commands.physicsRaycastHitTriggers ? 1u : 0u);
+                            runtimeSession->SetEditorStatus("Physics raycast miss");
+                        }
+                    }
+                }
+                if (commands.physicsOverlapSphereFromCamera)
+                {
+                    if (editorPlay.state.mode != EditorPlayMode::Play || !editorPhysicsWorldActive)
+                    {
+                        runtimeSession->SetEditorStatus("Physics overlap needs Play mode");
+                        Tracen("[PHYSICS-QUERY] overlap sphere skipped reason=world-inactive");
+                    }
+                    else
+                    {
+                        const WorldVec3 origin = frameCamera.eye;
+                        const WorldVec3 direction = WorldCameraForward(frameCamera);
+                        const WorldVec3 center = origin + direction * commands.physicsOverlapDistance;
+                        phys::PhysicsQueryFilter queryFilter{};
+                        queryFilter.layerMask = commands.physicsOverlapLayerMask;
+                        queryFilter.hitTriggers = commands.physicsOverlapHitTriggers;
+                        const float centerRaw[3] = {center.x, center.y, center.z};
+                        const std::vector<phys::PhysicsOverlapHit> hits = editorPhysicsWorld.OverlapSphere(
+                            centerRaw,
+                            commands.physicsOverlapRadius,
+                            queryFilter,
+                            64);
+
+                        AppendPhysicsDebugSphere(
+                            editorPhysicsDebugLines,
+                            center,
+                            commands.physicsOverlapRadius,
+                            hits.empty()
+                                ? std::array<float, 4>{0.55f, 0.62f, 0.75f, 0.65f}
+                                : std::array<float, 4>{0.35f, 0.90f, 1.0f, 0.95f});
+                        for (const phys::PhysicsOverlapHit& hit : hits)
+                        {
+                            PhysicsDebugContact marker{};
+                            marker.point = {hit.position[0], hit.position[1], hit.position[2]};
+                            marker.normal = {hit.normal[0], hit.normal[1], hit.normal[2]};
+                            marker.color = hit.trigger
+                                ? std::array<float, 4>{1.0f, 0.62f, 0.10f, 0.95f}
+                                : std::array<float, 4>{0.35f, 0.90f, 1.0f, 0.95f};
+                            marker.ttlSeconds = 2.5f;
+                            editorPhysicsDebugContacts.push_back(marker);
+                        }
+
+                        std::ostringstream bodyList;
+                        std::uint32_t printed = 0;
+                        for (const phys::PhysicsOverlapHit& hit : hits)
+                        {
+                            if (printed >= 8)
+                                break;
+                            std::uint32_t meshEntityId = 0;
+                            for (const auto& [candidateMeshId, bodyId] : editorPhysicsBodies)
+                            {
+                                if (bodyId == hit.bodyId)
+                                {
+                                    meshEntityId = candidateMeshId;
+                                    break;
+                                }
+                            }
+                            if (printed > 0)
+                                bodyList << ",";
+                            bodyList << "{body=" << static_cast<unsigned long long>(hit.bodyId)
+                                     << " mesh=" << meshEntityId
+                                     << " layer=" << phys::ToString(hit.layer)
+                                     << " trigger=" << (hit.trigger ? 1 : 0)
+                                     << "}";
+                            ++printed;
+                        }
+                        if (hits.size() > printed)
+                            bodyList << ",...";
+
+                        Tracenf("[PHYSICS-QUERY] overlap sphere center=(%.3f,%.3f,%.3f) radius=%.3f hits=%zu layerMask=0x%08X hitTriggers=%u bodies=[%s]",
+                            center.x,
+                            center.y,
+                            center.z,
+                            commands.physicsOverlapRadius,
+                            hits.size(),
+                            commands.physicsOverlapLayerMask,
+                            commands.physicsOverlapHitTriggers ? 1u : 0u,
+                            bodyList.str().c_str());
+                        runtimeSession->SetEditorStatus(hits.empty()
+                            ? "Physics overlap found 0 bodies"
+                            : "Physics overlap found bodies");
+                    }
+                }
+                if (commands.physicsOverlapBoxFromCamera)
+                {
+                    if (editorPlay.state.mode != EditorPlayMode::Play || !editorPhysicsWorldActive)
+                    {
+                        runtimeSession->SetEditorStatus("Physics overlap needs Play mode");
+                        Tracen("[PHYSICS-QUERY] overlap box skipped reason=world-inactive");
+                    }
+                    else
+                    {
+                        const WorldVec3 origin = frameCamera.eye;
+                        const WorldVec3 direction = WorldCameraForward(frameCamera);
+                        const WorldVec3 center = origin + direction * commands.physicsOverlapDistance;
+                        phys::PhysicsQueryFilter queryFilter{};
+                        queryFilter.layerMask = commands.physicsOverlapLayerMask;
+                        queryFilter.hitTriggers = commands.physicsOverlapHitTriggers;
+                        const float centerRaw[3] = {center.x, center.y, center.z};
+                        const float halfExtents[3] = {
+                            std::max(0.05f, commands.physicsOverlapBoxHalfExtents[0]),
+                            std::max(0.05f, commands.physicsOverlapBoxHalfExtents[1]),
+                            std::max(0.05f, commands.physicsOverlapBoxHalfExtents[2]),
+                        };
+                        const std::vector<phys::PhysicsOverlapHit> hits = editorPhysicsWorld.OverlapBox(
+                            centerRaw,
+                            halfExtents,
+                            queryFilter,
+                            64);
+
+                        AppendPhysicsDebugBox(
+                            editorPhysicsDebugLines,
+                            center,
+                            {halfExtents[0], halfExtents[1], halfExtents[2]},
+                            hits.empty()
+                                ? std::array<float, 4>{0.55f, 0.62f, 0.75f, 0.65f}
+                                : std::array<float, 4>{0.35f, 0.90f, 1.0f, 0.95f});
+                        for (const phys::PhysicsOverlapHit& hit : hits)
+                        {
+                            PhysicsDebugContact marker{};
+                            marker.point = {hit.position[0], hit.position[1], hit.position[2]};
+                            marker.normal = {hit.normal[0], hit.normal[1], hit.normal[2]};
+                            marker.color = hit.trigger
+                                ? std::array<float, 4>{1.0f, 0.62f, 0.10f, 0.95f}
+                                : std::array<float, 4>{0.35f, 0.90f, 1.0f, 0.95f};
+                            marker.ttlSeconds = 2.5f;
+                            editorPhysicsDebugContacts.push_back(marker);
+                        }
+
+                        std::ostringstream bodyList;
+                        std::uint32_t printed = 0;
+                        for (const phys::PhysicsOverlapHit& hit : hits)
+                        {
+                            if (printed >= 8)
+                                break;
+                            std::uint32_t meshEntityId = 0;
+                            for (const auto& [candidateMeshId, bodyId] : editorPhysicsBodies)
+                            {
+                                if (bodyId == hit.bodyId)
+                                {
+                                    meshEntityId = candidateMeshId;
+                                    break;
+                                }
+                            }
+                            if (printed > 0)
+                                bodyList << ",";
+                            bodyList << "{body=" << static_cast<unsigned long long>(hit.bodyId)
+                                     << " mesh=" << meshEntityId
+                                     << " layer=" << phys::ToString(hit.layer)
+                                     << " trigger=" << (hit.trigger ? 1 : 0)
+                                     << "}";
+                            ++printed;
+                        }
+                        if (hits.size() > printed)
+                            bodyList << ",...";
+
+                        Tracenf("[PHYSICS-QUERY] overlap box center=(%.3f,%.3f,%.3f) half=(%.3f,%.3f,%.3f) hits=%zu layerMask=0x%08X hitTriggers=%u bodies=[%s]",
+                            center.x,
+                            center.y,
+                            center.z,
+                            halfExtents[0],
+                            halfExtents[1],
+                            halfExtents[2],
+                            hits.size(),
+                            commands.physicsOverlapLayerMask,
+                            commands.physicsOverlapHitTriggers ? 1u : 0u,
+                            bodyList.str().c_str());
+                        runtimeSession->SetEditorStatus(hits.empty()
+                            ? "Physics overlap found 0 bodies"
+                            : "Physics overlap found bodies");
+                    }
+                }
+                if (commands.physicsOverlapCapsuleFromCamera)
+                {
+                    if (editorPlay.state.mode != EditorPlayMode::Play || !editorPhysicsWorldActive)
+                    {
+                        runtimeSession->SetEditorStatus("Physics overlap needs Play mode");
+                        Tracen("[PHYSICS-QUERY] overlap capsule skipped reason=world-inactive");
+                    }
+                    else
+                    {
+                        const WorldVec3 origin = frameCamera.eye;
+                        const WorldVec3 direction = WorldCameraForward(frameCamera);
+                        const WorldVec3 center = origin + direction * commands.physicsOverlapDistance;
+                        phys::PhysicsQueryFilter queryFilter{};
+                        queryFilter.layerMask = commands.physicsOverlapLayerMask;
+                        queryFilter.hitTriggers = commands.physicsOverlapHitTriggers;
+                        const float centerRaw[3] = {center.x, center.y, center.z};
+                        const float radius = std::max(0.05f, commands.physicsOverlapCapsuleRadius);
+                        const float totalHeight = std::max(radius * 2.0f, commands.physicsOverlapCapsuleHeight);
+                        const float cylinderHalfHeight = std::max(0.0f, (totalHeight - radius * 2.0f) * 0.5f);
+                        const std::vector<phys::PhysicsOverlapHit> hits = editorPhysicsWorld.OverlapCapsule(
+                            centerRaw,
+                            cylinderHalfHeight,
+                            radius,
+                            queryFilter,
+                            64);
+
+                        AppendPhysicsDebugCapsule(
+                            editorPhysicsDebugLines,
+                            center,
+                            cylinderHalfHeight,
+                            radius,
+                            hits.empty()
+                                ? std::array<float, 4>{0.55f, 0.62f, 0.75f, 0.65f}
+                                : std::array<float, 4>{0.35f, 0.90f, 1.0f, 0.95f});
+                        for (const phys::PhysicsOverlapHit& hit : hits)
+                        {
+                            PhysicsDebugContact marker{};
+                            marker.point = {hit.position[0], hit.position[1], hit.position[2]};
+                            marker.normal = {hit.normal[0], hit.normal[1], hit.normal[2]};
+                            marker.color = hit.trigger
+                                ? std::array<float, 4>{1.0f, 0.62f, 0.10f, 0.95f}
+                                : std::array<float, 4>{0.35f, 0.90f, 1.0f, 0.95f};
+                            marker.ttlSeconds = 2.5f;
+                            editorPhysicsDebugContacts.push_back(marker);
+                        }
+
+                        std::ostringstream bodyList;
+                        std::uint32_t printed = 0;
+                        for (const phys::PhysicsOverlapHit& hit : hits)
+                        {
+                            if (printed >= 8)
+                                break;
+                            std::uint32_t meshEntityId = 0;
+                            for (const auto& [candidateMeshId, bodyId] : editorPhysicsBodies)
+                            {
+                                if (bodyId == hit.bodyId)
+                                {
+                                    meshEntityId = candidateMeshId;
+                                    break;
+                                }
+                            }
+                            if (printed > 0)
+                                bodyList << ",";
+                            bodyList << "{body=" << static_cast<unsigned long long>(hit.bodyId)
+                                     << " mesh=" << meshEntityId
+                                     << " layer=" << phys::ToString(hit.layer)
+                                     << " trigger=" << (hit.trigger ? 1 : 0)
+                                     << "}";
+                            ++printed;
+                        }
+                        if (hits.size() > printed)
+                            bodyList << ",...";
+
+                        Tracenf("[PHYSICS-QUERY] overlap capsule center=(%.3f,%.3f,%.3f) radius=%.3f height=%.3f hits=%zu layerMask=0x%08X hitTriggers=%u bodies=[%s]",
+                            center.x,
+                            center.y,
+                            center.z,
+                            radius,
+                            totalHeight,
+                            hits.size(),
+                            commands.physicsOverlapLayerMask,
+                            commands.physicsOverlapHitTriggers ? 1u : 0u,
+                            bodyList.str().c_str());
+                        runtimeSession->SetEditorStatus(hits.empty()
+                            ? "Physics overlap found 0 bodies"
+                            : "Physics overlap found bodies");
+                    }
+                }
+                auto runPhysicsBodyCommand = [&](const char* actionName, const float* vector, auto&& apply) {
+                    if (editorPlay.state.mode != EditorPlayMode::Play || !editorPhysicsWorldActive)
+                    {
+                        runtimeSession->SetEditorStatus("Physics control needs Play mode");
+                        Tracenf("[PHYSICS-CONTROL] %s skipped reason=world-inactive entity=%u",
+                            actionName,
+                            commands.physicsRuntimeEntityId);
+                        return;
+                    }
+                    const auto bodyIt = editorPhysicsBodies.find(commands.physicsRuntimeEntityId);
+                    if (bodyIt == editorPhysicsBodies.end())
+                    {
+                        runtimeSession->SetEditorStatus("Selected entity has no physics body");
+                        Tracenf("[PHYSICS-CONTROL] %s skipped reason=body-not-found entity=%u",
+                            actionName,
+                            commands.physicsRuntimeEntityId);
+                        return;
+                    }
+                    const bool applied = apply(bodyIt->second, vector);
+                    Tracenf("[PHYSICS-CONTROL] %s entity=%u body=%llu vector=(%.3f,%.3f,%.3f) applied=%u",
+                        actionName,
+                        commands.physicsRuntimeEntityId,
+                        static_cast<unsigned long long>(bodyIt->second),
+                        vector[0],
+                        vector[1],
+                        vector[2],
+                        applied ? 1u : 0u);
+                    runtimeSession->SetEditorStatus(applied ? "Physics control applied" : "Physics control ignored");
+                };
+                if (commands.physicsSetLinearVelocityForSelected)
+                {
+                    runPhysicsBodyCommand("set_velocity", commands.physicsLinearVelocity,
+                        [&](phys::BodyId bodyId, const float* value) {
+                            return editorPhysicsWorld.SetLinearVelocity(bodyId, value);
+                        });
+                }
+                if (commands.physicsApplyForceToSelected)
+                {
+                    runPhysicsBodyCommand("add_force", commands.physicsForce,
+                        [&](phys::BodyId bodyId, const float* value) {
+                            return editorPhysicsWorld.AddForce(bodyId, value);
+                        });
+                }
+                if (commands.physicsApplyImpulseToSelected)
+                {
+                    runPhysicsBodyCommand("add_impulse", commands.physicsImpulse,
+                        [&](phys::BodyId bodyId, const float* value) {
+                            return editorPhysicsWorld.AddImpulse(bodyId, value);
+                        });
+                }
+                if (commands.physicsApplyAngularImpulseToSelected)
+                {
+                    runPhysicsBodyCommand("add_angular_impulse", commands.physicsAngularImpulse,
+                        [&](phys::BodyId bodyId, const float* value) {
+                            return editorPhysicsWorld.AddAngularImpulse(bodyId, value);
+                        });
                 }
                 if (commands.renderResolutionChanged)
                 {
@@ -3364,17 +4586,41 @@ int RunGame(NativeWindow& window,
                             [&](const MeshSceneEntity& mesh) { return mesh.id == commands.sceneGizmoEntityId; });
                         if (it != editorMeshEntities.end())
                         {
-                            StaticMeshRenderer* renderer = it->skinned
-                                ? nullptr
-                                : getStaticMeshRenderer(resolveMeshRuntimePath(*it));
-                            transformApplied = ApplySceneGizmoToMesh(
-                                *it,
-                                commands.sceneGizmoPosition,
-                                commands.sceneGizmoRotation,
-                                commands.sceneGizmoScale,
-                                renderer);
-                            if (transformApplied)
-                                syncStaticMeshSpatialEntity(*it);
+                            if (commands.sceneGizmoTarget == SceneGizmoTargetKind::ColliderCenter)
+                            {
+                                transformApplied = ApplySceneGizmoToCollider(
+                                    *it,
+                                    commands.sceneGizmoPosition,
+                                    commands.sceneGizmoScale,
+                                    commands.sceneGizmoOperation);
+                                if (transformApplied)
+                                    Tracenf("[PHYSICS] collider gizmo entity=%u op=%d shape=%s center=(%.3f,%.3f,%.3f) size=(%.3f,%.3f,%.3f) radius=%.3f height=%.3f",
+                                        it->id,
+                                        static_cast<int>(commands.sceneGizmoOperation),
+                                        phys::ToString(it->collider.shape),
+                                        it->collider.center[0],
+                                        it->collider.center[1],
+                                        it->collider.center[2],
+                                        it->collider.size[0],
+                                        it->collider.size[1],
+                                        it->collider.size[2],
+                                        it->collider.radius,
+                                        it->collider.height);
+                            }
+                            else
+                            {
+                                StaticMeshRenderer* renderer = it->skinned
+                                    ? nullptr
+                                    : getStaticMeshRenderer(resolveMeshRuntimePath(*it));
+                                transformApplied = ApplySceneGizmoToMesh(
+                                    *it,
+                                    commands.sceneGizmoPosition,
+                                    commands.sceneGizmoRotation,
+                                    commands.sceneGizmoScale,
+                                    renderer);
+                                if (transformApplied)
+                                    syncStaticMeshSpatialEntity(*it);
+                            }
                         }
                     }
                     else if (commands.sceneGizmoEntityType == HierarchyEntityType::PointLight)
@@ -3413,6 +4659,18 @@ int RunGame(NativeWindow& window,
                                 commands.sceneGizmoPosition,
                                 commands.sceneGizmoScale);
                             editorWaterBodiesDirty = true;
+                        }
+                    }
+                    else if (commands.sceneGizmoEntityType == HierarchyEntityType::Camera)
+                    {
+                        auto it = std::find_if(editorCameras.begin(), editorCameras.end(),
+                            [&](const CameraEntity& camera) { return camera.id == commands.sceneGizmoEntityId; });
+                        if (it != editorCameras.end())
+                        {
+                            transformApplied = ApplySceneGizmoToCamera(
+                                *it,
+                                commands.sceneGizmoPosition,
+                                commands.sceneGizmoRotation);
                         }
                     }
                     if (transformApplied)
@@ -3474,6 +4732,10 @@ int RunGame(NativeWindow& window,
                         selectedEditorObject = {SelectedEditorObjectType::MeshEntity, id, flecsEntity};
                         runtimeSession->SetEditorStatus("Selected mesh entity #" + std::to_string(id));
                         break;
+                    case HierarchyEntityType::Camera:
+                        selectedEditorObject = {SelectedEditorObjectType::Camera, id, flecsEntity};
+                        runtimeSession->SetEditorStatus("Selected camera #" + std::to_string(id));
+                        break;
                     default:
                         break;
                     }
@@ -3512,6 +4774,13 @@ int RunGame(NativeWindow& window,
                         auto it = std::find_if(editorMeshEntities.begin(), editorMeshEntities.end(),
                             [&](const MeshSceneEntity& mesh) { return mesh.id == id; });
                         if (it != editorMeshEntities.end())
+                            target = WorldVec3{it->position[0], it->position[1], it->position[2]};
+                    }
+                    else if (type == HierarchyEntityType::Camera)
+                    {
+                        auto it = std::find_if(editorCameras.begin(), editorCameras.end(),
+                            [&](const CameraEntity& camera) { return camera.id == id; });
+                        if (it != editorCameras.end())
                             target = WorldVec3{it->position[0], it->position[1], it->position[2]};
                     }
                     if (!target)
@@ -3967,6 +5236,8 @@ int RunGame(NativeWindow& window,
                             std::abs(a.linearDamping - b.linearDamping) > 0.0001f ||
                             std::abs(a.angularDamping - b.angularDamping) > 0.0001f ||
                             a.useGravity != b.useGravity ||
+                            a.allowSleeping != b.allowSleeping ||
+                            a.continuousCollision != b.continuousCollision ||
                             boolsDiffer(a.freezePosition, b.freezePosition, 3) ||
                             boolsDiffer(a.freezeRotation, b.freezeRotation, 3);
                     };
@@ -3980,7 +5251,22 @@ int RunGame(NativeWindow& window,
                             std::abs(a.height - b.height) > 0.0001f ||
                             std::abs(a.friction - b.friction) > 0.0001f ||
                             std::abs(a.restitution - b.restitution) > 0.0001f ||
+                            a.layer != b.layer ||
                             a.materialAssetId != b.materialAssetId;
+                    };
+                    auto fixedJointDiffers = [&](const phys::FixedJointComponent& a, const phys::FixedJointComponent& b) {
+                        return a.enabled != b.enabled ||
+                            a.connectedEntityId != b.connectedEntityId;
+                    };
+                    auto hingeJointDiffers = [&](const phys::HingeJointComponent& a, const phys::HingeJointComponent& b) {
+                        return a.enabled != b.enabled ||
+                            a.connectedEntityId != b.connectedEntityId ||
+                            floatsDiffer(a.anchor, b.anchor, 3) ||
+                            floatsDiffer(a.axis, b.axis, 3) ||
+                            a.limitsEnabled != b.limitsEnabled ||
+                            std::abs(a.minAngleDegrees - b.minAngleDegrees) > 0.0001f ||
+                            std::abs(a.maxAngleDegrees - b.maxAngleDegrees) > 0.0001f ||
+                            std::abs(a.frictionTorque - b.frictionTorque) > 0.0001f;
                     };
                     const bool transformChanged =
                         !std::equal(std::begin(it->position), std::end(it->position), std::begin(commands.selectedMeshEntity.position)) ||
@@ -3994,10 +5280,16 @@ int RunGame(NativeWindow& window,
                         transformChanged ||
                         it->hasRigidbody != commands.selectedMeshEntity.hasRigidbody ||
                         it->hasCollider != commands.selectedMeshEntity.hasCollider ||
+                        it->hasFixedJoint != commands.selectedMeshEntity.hasFixedJoint ||
+                        it->hasHingeJoint != commands.selectedMeshEntity.hasHingeJoint ||
                         (it->hasRigidbody && commands.selectedMeshEntity.hasRigidbody &&
                             rigidbodyDiffers(it->rigidbody, commands.selectedMeshEntity.rigidbody)) ||
                         (it->hasCollider && commands.selectedMeshEntity.hasCollider &&
-                            colliderDiffers(it->collider, commands.selectedMeshEntity.collider));
+                            colliderDiffers(it->collider, commands.selectedMeshEntity.collider)) ||
+                        (it->hasFixedJoint && commands.selectedMeshEntity.hasFixedJoint &&
+                            fixedJointDiffers(it->fixedJoint, commands.selectedMeshEntity.fixedJoint)) ||
+                        (it->hasHingeJoint && commands.selectedMeshEntity.hasHingeJoint &&
+                            hingeJointDiffers(it->hingeJoint, commands.selectedMeshEntity.hingeJoint));
                     ApplyMeshRendererEditorState(*it, commands.selectedMeshEntity);
                     if (commands.fitSelectedColliderToMesh)
                     {
@@ -4134,6 +5426,15 @@ int RunGame(NativeWindow& window,
                     commands.addComponentTypeId.clear();
                     commands.removeComponentFromSelectedEntity = false;
                     commands.removeComponentTypeId.clear();
+                    commands.physicsRaycastFromCamera = false;
+                    commands.physicsOverlapSphereFromCamera = false;
+                    commands.physicsOverlapBoxFromCamera = false;
+                    commands.physicsOverlapCapsuleFromCamera = false;
+                    commands.physicsSetLinearVelocityForSelected = false;
+                    commands.physicsApplyForceToSelected = false;
+                    commands.physicsApplyImpulseToSelected = false;
+                    commands.physicsApplyAngularImpulseToSelected = false;
+                    commands.physicsRuntimeEntityId = 0;
                     commands.lodQualityCommitRequested = false;
                     commands.lodQualityCommitEntityId = 0;
                     commands.assignMeshAssetToSelectedEntity = false;
@@ -5852,6 +7153,26 @@ int RunGame(NativeWindow& window,
                         Tracenf("[INSPECTOR-COMP] remove entity=%u component=Collider", it->id);
                         return true;
                     }
+                    if (componentType == "physics.fixed_joint")
+                    {
+                        if (!it->hasFixedJoint)
+                            return false;
+                        it->hasFixedJoint = false;
+                        it->fixedJoint = {};
+                        SceneManager::Instance().MarkDirty();
+                        Tracenf("[INSPECTOR-COMP] remove entity=%u component=Fixed Joint", it->id);
+                        return true;
+                    }
+                    if (componentType == "physics.hinge_joint")
+                    {
+                        if (!it->hasHingeJoint)
+                            return false;
+                        it->hasHingeJoint = false;
+                        it->hingeJoint = {};
+                        SceneManager::Instance().MarkDirty();
+                        Tracenf("[INSPECTOR-COMP] remove entity=%u component=Hinge Joint", it->id);
+                        return true;
+                    }
                     const std::size_t oldSize = it->editorComponents.size();
                     it->editorComponents.erase(std::remove_if(it->editorComponents.begin(), it->editorComponents.end(),
                         [&](const EditorAttachedComponent& component) { return component.type == componentType; }),
@@ -5883,7 +7204,12 @@ int RunGame(NativeWindow& window,
                     else if (commands.addComponentType == EditorComponentType::Rigidbody ||
                         commands.addComponentType == EditorComponentType::BoxCollider ||
                         commands.addComponentType == EditorComponentType::SphereCollider ||
-                        commands.addComponentType == EditorComponentType::CapsuleCollider)
+                        commands.addComponentType == EditorComponentType::CapsuleCollider ||
+                        commands.addComponentType == EditorComponentType::TriggerBox ||
+                        commands.addComponentType == EditorComponentType::TriggerSphere ||
+                        commands.addComponentType == EditorComponentType::TriggerCapsule ||
+                        commands.addComponentType == EditorComponentType::FixedJoint ||
+                        commands.addComponentType == EditorComponentType::HingeJoint)
                     {
                         if (selectedEditorObject.type == SelectedEditorObjectType::MeshEntity)
                         {
@@ -5891,7 +7217,46 @@ int RunGame(NativeWindow& window,
                                 [&](const MeshSceneEntity& mesh) { return mesh.id == selectedEditorObject.id; });
                             if (it != editorMeshEntities.end())
                             {
-                                if (commands.addComponentType == EditorComponentType::Rigidbody)
+                                if (commands.addComponentType == EditorComponentType::FixedJoint)
+                                {
+                                    it->hasFixedJoint = true;
+                                    it->fixedJoint = {};
+                                    if (!it->hasRigidbody)
+                                    {
+                                        it->hasRigidbody = true;
+                                        it->rigidbody = {};
+                                    }
+                                    if (!it->hasCollider)
+                                    {
+                                        it->hasCollider = true;
+                                        it->collider.shape = ixtreeme::physics::ColliderShape::Box;
+                                        fitMeshColliderToBounds(*it);
+                                    }
+                                    Tracenf("[INSPECTOR-COMP] add entity=%u component=Fixed Joint", it->id);
+                                    runtimeSession->SetEditorStatus("Added Fixed Joint component");
+                                }
+                                else if (commands.addComponentType == EditorComponentType::HingeJoint)
+                                {
+                                    it->hasHingeJoint = true;
+                                    it->hingeJoint = {};
+                                    it->hingeJoint.anchor[0] = it->position[0];
+                                    it->hingeJoint.anchor[1] = it->position[1];
+                                    it->hingeJoint.anchor[2] = it->position[2];
+                                    if (!it->hasRigidbody)
+                                    {
+                                        it->hasRigidbody = true;
+                                        it->rigidbody = {};
+                                    }
+                                    if (!it->hasCollider)
+                                    {
+                                        it->hasCollider = true;
+                                        it->collider.shape = ixtreeme::physics::ColliderShape::Box;
+                                        fitMeshColliderToBounds(*it);
+                                    }
+                                    Tracenf("[INSPECTOR-COMP] add entity=%u component=Hinge Joint", it->id);
+                                    runtimeSession->SetEditorStatus("Added Hinge Joint component");
+                                }
+                                else if (commands.addComponentType == EditorComponentType::Rigidbody)
                                 {
                                     it->hasRigidbody = true;
                                     it->rigidbody = {};
@@ -5907,17 +7272,36 @@ int RunGame(NativeWindow& window,
                                 else
                                 {
                                     it->hasCollider = true;
-                                    if (commands.addComponentType == EditorComponentType::SphereCollider)
+                                    const bool isTriggerPreset =
+                                        commands.addComponentType == EditorComponentType::TriggerBox ||
+                                        commands.addComponentType == EditorComponentType::TriggerSphere ||
+                                        commands.addComponentType == EditorComponentType::TriggerCapsule;
+                                    if (commands.addComponentType == EditorComponentType::SphereCollider ||
+                                        commands.addComponentType == EditorComponentType::TriggerSphere)
+                                    {
                                         it->collider.shape = ixtreeme::physics::ColliderShape::Sphere;
-                                    else if (commands.addComponentType == EditorComponentType::CapsuleCollider)
+                                    }
+                                    else if (commands.addComponentType == EditorComponentType::CapsuleCollider ||
+                                        commands.addComponentType == EditorComponentType::TriggerCapsule)
+                                    {
                                         it->collider.shape = ixtreeme::physics::ColliderShape::Capsule;
+                                    }
                                     else
+                                    {
                                         it->collider.shape = ixtreeme::physics::ColliderShape::Box;
+                                    }
+                                    if (isTriggerPreset)
+                                    {
+                                        it->collider.trigger = true;
+                                        it->collider.layer = ixtreeme::physics::PhysicsLayer::Trigger;
+                                    }
                                     fitMeshColliderToBounds(*it);
-                                    Tracenf("[INSPECTOR-COMP] add entity=%u component=%s Collider",
+                                    const char* colliderShapeName = ixtreeme::physics::ToString(it->collider.shape);
+                                    Tracenf("[INSPECTOR-COMP] add entity=%u component=%s%s_collider",
                                         it->id,
-                                        ixtreeme::physics::ToString(it->collider.shape));
-                                    runtimeSession->SetEditorStatus("Added Collider component");
+                                        isTriggerPreset ? "trigger_" : "",
+                                        colliderShapeName);
+                                    runtimeSession->SetEditorStatus(isTriggerPreset ? "Added Trigger Collider component" : "Added Collider component");
                                 }
                                 SceneManager::Instance().MarkDirty();
                             }
@@ -6197,6 +7581,28 @@ int RunGame(NativeWindow& window,
                             selectedEditorObject = {SelectedEditorObjectType::SpotLight, it->id};
                             SceneManager::Instance().MarkDirty();
                         }
+                    }
+                }
+                if (commands.selectedCameraChanged)
+                {
+                    auto it = std::find_if(editorCameras.begin(), editorCameras.end(),
+                        [&](const CameraEntity& camera) { return camera.id == commands.selectedCamera.id; });
+                    if (it != editorCameras.end())
+                    {
+                        *it = commands.selectedCamera;
+                        selectedEditorObject = {SelectedEditorObjectType::Camera, it->id};
+                        SceneManager::Instance().MarkDirty();
+                    }
+                }
+                if (commands.setMainCameraRequested)
+                {
+                    auto it = std::find_if(editorCameras.begin(), editorCameras.end(),
+                        [&](const CameraEntity& camera) { return camera.id == commands.setMainCameraId; });
+                    if (it != editorCameras.end())
+                    {
+                        editorMainCameraId = it->id;
+                        SceneManager::Instance().MarkDirty();
+                        runtimeSession->SetEditorStatus("Set Main Camera #" + std::to_string(it->id));
                     }
                 }
                 if (commands.selectedMeshEntityChanged)
@@ -6528,6 +7934,20 @@ int RunGame(NativeWindow& window,
                     }
                 }
                 editorImGui.SetDynamicLightEditorState(dynamicLightState);
+                CameraEditorState cameraEditorState{};
+                cameraEditorState.cameraCount = static_cast<std::uint32_t>(editorCameras.size());
+                if (selectedEditorObject.type == SelectedEditorObjectType::Camera)
+                {
+                    auto it = std::find_if(editorCameras.begin(), editorCameras.end(),
+                        [&](const CameraEntity& camera) { return camera.id == selectedEditorObject.id; });
+                    if (it != editorCameras.end())
+                    {
+                        cameraEditorState.selected = true;
+                        cameraEditorState.isMain = (it->id == editorMainCameraId);
+                        cameraEditorState.camera = *it;
+                    }
+                }
+                editorImGui.SetCameraEditorState(cameraEditorState);
                 WaterBodyEditorState waterBodyState = BuildWaterBodyEditorState(editorWaterBodies,
                     selectedEditorObject.type == SelectedEditorObjectType::WaterBody ? selectedEditorObject.id : 0u);
                 runtimeSession->SetWaterBodyEditorState(waterBodyState);
@@ -6543,6 +7963,21 @@ int RunGame(NativeWindow& window,
                     if (meshIt != editorMeshEntities.end())
                     {
                         meshRendererState.prefabOverrides = meshPrefabOverrides(*meshIt);
+                        const auto physicsBodyIt = editorPhysicsBodies.find(meshRendererState.id);
+                        if (editorPlay.state.mode == EditorPlayMode::Play &&
+                            editorPhysicsWorldActive &&
+                            physicsBodyIt != editorPhysicsBodies.end())
+                        {
+                            meshRendererState.physicsRuntimeValid = true;
+                            meshRendererState.physicsRuntimeBodyId = physicsBodyIt->second;
+                            meshRendererState.physicsRuntimeActive = editorPhysicsWorld.IsBodyActive(physicsBodyIt->second);
+                            editorPhysicsWorld.GetLinearVelocity(
+                                physicsBodyIt->second,
+                                meshRendererState.physicsRuntimeLinearVelocity);
+                            editorPhysicsWorld.GetAngularVelocity(
+                                physicsBodyIt->second,
+                                meshRendererState.physicsRuntimeAngularVelocity);
+                        }
                         const std::string runtimePath = resolveMeshRuntimePath(*meshIt);
                         if (meshIt->skinned)
                         {
@@ -6575,6 +8010,29 @@ int RunGame(NativeWindow& window,
                         meshRendererState.materialSlotCount > 0 ? meshRendererState.materialSlotCount - 1u : 0u);
                 }
                 editorImGui.SetMeshRendererEditorState(meshRendererState);
+                std::vector<PhysicsEventEditorState> physicsEventStates;
+                physicsEventStates.reserve(editorPhysicsEntityEvents.size());
+                for (const PhysicsEntityEvent& event : editorPhysicsEntityEvents)
+                {
+                    PhysicsEventEditorState state{};
+                    state.phase = PhysicsEventPhaseName(event.phase);
+                    state.kind = PhysicsEventKindName(event.kind);
+                    state.entityA = event.entityA;
+                    state.entityB = event.entityB;
+                    state.nameA = event.nameA;
+                    state.nameB = event.nameB;
+                    state.bodyA = event.bodyA;
+                    state.bodyB = event.bodyB;
+                    state.point[0] = event.point.x;
+                    state.point[1] = event.point.y;
+                    state.point[2] = event.point.z;
+                    state.normal[0] = event.normal.x;
+                    state.normal[1] = event.normal.y;
+                    state.normal[2] = event.normal.z;
+                    state.penetrationDepth = event.penetrationDepth;
+                    physicsEventStates.push_back(std::move(state));
+                }
+                editorImGui.SetPhysicsEvents(std::move(physicsEventStates));
                 TerrainEditorState terrainState{};
                 if (terrainOk && terrain.HasTerrain())
                 {
@@ -7219,8 +8677,7 @@ int RunGame(NativeWindow& window,
                                     logLodDisposition(record);
                                 }
                                 const bool cullLogChanged = previousCulledMeshLogSet.find(mesh.id) == previousCulledMeshLogSet.end();
-                                if ((!QuietLogsForLodDiag() && (frameNumber < 3 || (frameNumber % 60u) == 0u)) ||
-                                    (QuietLogsForLodDiag() && cullLogChanged))
+                                if (cullLogChanged)
                                 {
                                     Tracenf("[MESH-CULL] culled id=%u name=%s path=%s",
                                         mesh.id,
@@ -7511,6 +8968,27 @@ int RunGame(NativeWindow& window,
                     selectionLines.insert(selectionLines.end(),
                         selectedColliderLines.begin(),
                         selectedColliderLines.end());
+                    std::vector<SelectionOutlineRenderer::Line> physicsCenterLines =
+                        BuildPhysicsBodyCenterLines(selectedEditorObject, editorMeshEntities, debugShowPhysicsBodyCenters);
+                    selectionLines.insert(selectionLines.end(),
+                        physicsCenterLines.begin(),
+                        physicsCenterLines.end());
+                    if (debugShowPhysicsContacts)
+                    {
+                        std::vector<SelectionOutlineRenderer::Line> physicsContactLines =
+                            BuildPhysicsContactLines(editorPhysicsDebugContacts);
+                        selectionLines.insert(selectionLines.end(),
+                            physicsContactLines.begin(),
+                            physicsContactLines.end());
+                    }
+                    if (!editorPhysicsDebugLines.empty())
+                    {
+                        std::vector<SelectionOutlineRenderer::Line> physicsQueryLines =
+                            BuildPhysicsDebugLines(editorPhysicsDebugLines);
+                        selectionLines.insert(selectionLines.end(),
+                            physicsQueryLines.begin(),
+                            physicsQueryLines.end());
+                    }
                     selectionOutlines.Render(device, camera, selectionLines, renderSize);
                 }
                 if (!useOffscreenScene && hasSceneTerrain)
@@ -7544,6 +9022,68 @@ int RunGame(NativeWindow& window,
                     terrain.RenderWater(device, camera, seconds, renderSize);
                     offscreenScene.EndMainPass(device);
                 }
+#if defined(IXTREEME_WITH_EDITOR)
+                // --- Game view: render the scene from the main camera into the second offscreen target.
+                // Reuses this frame's shadow map (light-space, view-independent) and water reflection.
+                if (gameViewOk && runtimeSession->IsMapEditorOpen())
+                {
+                    const CameraEntity* mainCameraEntity = nullptr;
+                    for (const CameraEntity& cameraEntity : editorCameras)
+                    {
+                        if (cameraEntity.id == editorMainCameraId)
+                        {
+                            mainCameraEntity = &cameraEntity;
+                            break;
+                        }
+                    }
+                    if (!mainCameraEntity && !editorCameras.empty())
+                        mainCameraEntity = &editorCameras.front();
+                    if (mainCameraEntity)
+                    {
+                        const VkExtent2D gameExtent = gameView.GetExtent();
+                        const WorldCamera gameCamera =
+                            BuildCameraFromEntity(*mainCameraEntity, gameExtent.width, gameExtent.height);
+                        gameView.BeginMainPass(device);
+                        // Terrain is drawn from the project Main Camera using the secondary
+                        // camera-uniform path (viewIndex=1). That path has its own per-frame
+                        // uniform buffer + descriptor set, so this draw no longer clobbers the
+                        // Scene View's free-fly terrain (viewIndex=0, recorded earlier this
+                        // frame into the same command buffer). Static meshes already use
+                        // per-draw uniforms and are safe.
+                        // NOTE: water (RenderWater) still uses per-water-body uniforms shared
+                        // across views, so it is not yet drawn here — that needs a per-body
+                        // secondary path (follow-up). Default scenes have no water.
+                        if (hasSceneTerrain)
+                        {
+                            terrain.Render(device, gameCamera, gameExtent, /*viewIndex=*/1);
+                        }
+                        if (isInWorld)
+                        {
+                            for (const MeshSceneEntity& mesh : editorMeshEntities)
+                            {
+                                if (mesh.editorHidden || mesh.skinned)
+                                    continue;
+                                StaticMeshRenderer* renderer = getStaticMeshRenderer(resolveMeshRuntimePath(mesh));
+                                if (!renderer || !renderer->IsLoaded())
+                                    continue;
+                                StaticMeshRenderer::Instance instance{};
+                                instance.entityId = mesh.id;
+                                instance.position = {mesh.position[0], mesh.position[1], mesh.position[2]};
+                                instance.rotation[0] = mesh.rotation[0];
+                                instance.rotation[1] = mesh.rotation[1];
+                                instance.rotation[2] = mesh.rotation[2];
+                                instance.scale[0] = mesh.scale[0];
+                                instance.scale[1] = mesh.scale[1];
+                                instance.scale[2] = mesh.scale[2];
+                                instance.materialSlots = mesh.materialSlots;
+                                instance.materialOverrides = mesh.materialOverrides;
+                                renderer->RenderInWorld(device, seconds, gameCamera, instance, gameExtent);
+                            }
+                        }
+                        gameView.EndMainPass(device);
+                    }
+                }
+#endif
                 device.BeginSwapchainRenderPass("composite");
                 device.WriteGpuTimestamp(VulkanDevice::GpuTimestampPoint::CompositeBegin);
                 offscreenScene.RenderComposite(device);
@@ -7577,6 +9117,7 @@ int RunGame(NativeWindow& window,
                     editorPointLights,
                     editorSpotLights,
                     editorWaterBodies,
+                    editorCameras,
                     [&](const MeshSceneEntity& mesh) {
                         return getStaticMeshRenderer(resolveMeshRuntimePath(mesh));
                     });
@@ -7877,6 +9418,7 @@ int RunGame(NativeWindow& window,
     }
     if (offscreenSceneOk)
         offscreenScene.Destroy();
+        gameView.Destroy();
     if (terrainOk)
         terrain.Destroy();
     if (skinnedMeshOk)

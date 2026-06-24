@@ -171,6 +171,8 @@ void WriteRigidbody(std::ostream& out, const ixtreeme::physics::RigidbodyCompone
     out << indent << "  \"linear_damping\": " << rigidbody.linearDamping << ",\n";
     out << indent << "  \"angular_damping\": " << rigidbody.angularDamping << ",\n";
     out << indent << "  \"use_gravity\": " << (rigidbody.useGravity ? "true" : "false") << ",\n";
+    out << indent << "  \"allow_sleeping\": " << (rigidbody.allowSleeping ? "true" : "false") << ",\n";
+    out << indent << "  \"continuous_collision\": " << (rigidbody.continuousCollision ? "true" : "false") << ",\n";
     out << indent << "  \"freeze_position\": " << BoolArray(rigidbody.freezePosition, 3) << ",\n";
     out << indent << "  \"freeze_rotation\": " << BoolArray(rigidbody.freezeRotation, 3) << "\n";
     out << indent << "}";
@@ -189,7 +191,32 @@ void WriteCollider(std::ostream& out, const ixtreeme::physics::ColliderComponent
     out << indent << "  \"height\": " << collider.height << ",\n";
     out << indent << "  \"friction\": " << collider.friction << ",\n";
     out << indent << "  \"restitution\": " << collider.restitution << ",\n";
+    out << indent << "  \"layer\": \"" << ixtreeme::physics::ToString(collider.layer) << "\",\n";
     out << indent << "  \"material_asset_id\": \"" << ixtreeme::common::EscapeJson(collider.materialAssetId) << "\"\n";
+    out << indent << "}";
+}
+
+void WriteFixedJoint(std::ostream& out, const ixtreeme::physics::FixedJointComponent& joint, const std::string& indent)
+{
+    out << ",\n";
+    out << indent << "\"fixed_joint\": {\n";
+    out << indent << "  \"enabled\": " << (joint.enabled ? "true" : "false") << ",\n";
+    out << indent << "  \"connected_entity_id\": " << joint.connectedEntityId << "\n";
+    out << indent << "}";
+}
+
+void WriteHingeJoint(std::ostream& out, const ixtreeme::physics::HingeJointComponent& joint, const std::string& indent)
+{
+    out << ",\n";
+    out << indent << "\"hinge_joint\": {\n";
+    out << indent << "  \"enabled\": " << (joint.enabled ? "true" : "false") << ",\n";
+    out << indent << "  \"connected_entity_id\": " << joint.connectedEntityId << ",\n";
+    out << indent << "  \"anchor\": " << FloatArray(joint.anchor, 3) << ",\n";
+    out << indent << "  \"axis\": " << FloatArray(joint.axis, 3) << ",\n";
+    out << indent << "  \"limits_enabled\": " << (joint.limitsEnabled ? "true" : "false") << ",\n";
+    out << indent << "  \"min_angle_deg\": " << joint.minAngleDegrees << ",\n";
+    out << indent << "  \"max_angle_deg\": " << joint.maxAngleDegrees << ",\n";
+    out << indent << "  \"friction_torque\": " << joint.frictionTorque << "\n";
     out << indent << "}";
 }
 
@@ -205,6 +232,8 @@ ixtreeme::physics::RigidbodyComponent ReadRigidbody(const std::string& object)
     rigidbody.linearDamping = ixtreeme::common::JsonFloatValue(component, "linear_damping", rigidbody.linearDamping);
     rigidbody.angularDamping = ixtreeme::common::JsonFloatValue(component, "angular_damping", rigidbody.angularDamping);
     rigidbody.useGravity = ixtreeme::common::JsonBoolValue(component, "use_gravity", rigidbody.useGravity);
+    rigidbody.allowSleeping = ixtreeme::common::JsonBoolValue(component, "allow_sleeping", rigidbody.allowSleeping);
+    rigidbody.continuousCollision = ixtreeme::common::JsonBoolValue(component, "continuous_collision", rigidbody.continuousCollision);
     ixtreeme::common::JsonBoolArrayValue(component, "freeze_position", rigidbody.freezePosition, 3);
     ixtreeme::common::JsonBoolArrayValue(component, "freeze_rotation", rigidbody.freezeRotation, 3);
     ixtreeme::physics::Sanitize(rigidbody);
@@ -226,9 +255,40 @@ ixtreeme::physics::ColliderComponent ReadCollider(const std::string& object)
     collider.height = ixtreeme::common::JsonFloatValue(component, "height", collider.height);
     collider.friction = ixtreeme::common::JsonFloatValue(component, "friction", collider.friction);
     collider.restitution = ixtreeme::common::JsonFloatValue(component, "restitution", collider.restitution);
+    collider.layer = ixtreeme::physics::PhysicsLayerFromString(
+        ixtreeme::common::JsonStringValue(component, "layer"),
+        collider.layer);
     collider.materialAssetId = ixtreeme::common::JsonStringValue(component, "material_asset_id");
     ixtreeme::physics::Sanitize(collider);
     return collider;
+}
+
+ixtreeme::physics::FixedJointComponent ReadFixedJoint(const std::string& object)
+{
+    ixtreeme::physics::FixedJointComponent joint;
+    const std::string component = ExtractNamedObject(object, "fixed_joint");
+    if (component.empty())
+        return joint;
+    joint.enabled = ixtreeme::common::JsonBoolValue(component, "enabled", joint.enabled);
+    joint.connectedEntityId = JsonU32Value(component, "connected_entity_id", joint.connectedEntityId);
+    return joint;
+}
+
+ixtreeme::physics::HingeJointComponent ReadHingeJoint(const std::string& object)
+{
+    ixtreeme::physics::HingeJointComponent joint;
+    const std::string component = ExtractNamedObject(object, "hinge_joint");
+    if (component.empty())
+        return joint;
+    joint.enabled = ixtreeme::common::JsonBoolValue(component, "enabled", joint.enabled);
+    joint.connectedEntityId = JsonU32Value(component, "connected_entity_id", joint.connectedEntityId);
+    ixtreeme::common::JsonFloatArrayValue(component, "anchor", joint.anchor, 3);
+    ixtreeme::common::JsonFloatArrayValue(component, "axis", joint.axis, 3);
+    joint.limitsEnabled = ixtreeme::common::JsonBoolValue(component, "limits_enabled", joint.limitsEnabled);
+    joint.minAngleDegrees = ixtreeme::common::JsonFloatValue(component, "min_angle_deg", joint.minAngleDegrees);
+    joint.maxAngleDegrees = ixtreeme::common::JsonFloatValue(component, "max_angle_deg", joint.maxAngleDegrees);
+    joint.frictionTorque = std::max(0.0f, ixtreeme::common::JsonFloatValue(component, "friction_torque", joint.frictionTorque));
+    return joint;
 }
 
 MeshSceneEntity::MaterialOverride ReadMaterialOverride(const std::string& object)
@@ -311,6 +371,10 @@ void WriteMeshObject(std::ostream& out, const MeshSceneEntity& mesh, const std::
         WriteRigidbody(out, mesh.rigidbody, indent);
     if (mesh.hasCollider)
         WriteCollider(out, mesh.collider, indent);
+    if (mesh.hasFixedJoint)
+        WriteFixedJoint(out, mesh.fixedJoint, indent);
+    if (mesh.hasHingeJoint)
+        WriteHingeJoint(out, mesh.hingeJoint, indent);
     out << "\n";
 }
 
@@ -382,6 +446,16 @@ PrefabEntity ParseEntityObject(const std::string& object, const std::string& fal
         {
             entity.mesh.hasCollider = true;
             entity.mesh.collider = ReadCollider(object);
+        }
+        if (!ExtractNamedObject(object, "fixed_joint").empty())
+        {
+            entity.mesh.hasFixedJoint = true;
+            entity.mesh.fixedJoint = ReadFixedJoint(object);
+        }
+        if (!ExtractNamedObject(object, "hinge_joint").empty())
+        {
+            entity.mesh.hasHingeJoint = true;
+            entity.mesh.hingeJoint = ReadHingeJoint(object);
         }
         return entity;
     }

@@ -134,6 +134,21 @@ WorldMat4 ImGuizmoPerspective(float fovYRadians, float aspect, float zNear, floa
     return projection;
 }
 
+WorldVec3 TransformEditorColliderLocalPoint(const MeshRendererEditorState& mesh, WorldVec3 local)
+{
+    namespace xm = ixtreeme::math;
+    xm::Mat4 model = xm::MultiplyRowMajor(
+        xm::MultiplyRowMajor(
+            xm::MultiplyRowMajor(
+                xm::MultiplyRowMajor(xm::Scale({mesh.scale[0], mesh.scale[1], mesh.scale[2]}),
+                    xm::RotationX(mesh.rotation[0])),
+                xm::RotationYRowMajor(mesh.rotation[1])),
+            xm::RotationZ(mesh.rotation[2])),
+        xm::Translation({mesh.position[0], mesh.position[1], mesh.position[2]}));
+    const xm::Vec3 world = xm::TransformPointRowVector(model.m, {local.x, local.y, local.z});
+    return {world.x, world.y, world.z};
+}
+
 std::filesystem::path InternalAssetRootFor(const std::filesystem::path& engineRoot)
 {
     if (engineRoot.empty())
@@ -157,9 +172,9 @@ struct InspectorComponentDefinition
     bool addableToMesh;
 };
 
-const std::array<InspectorComponentDefinition, 11>& InspectorComponentRegistry()
+const std::array<InspectorComponentDefinition, 16>& InspectorComponentRegistry()
 {
-    static const std::array<InspectorComponentDefinition, 11> registry{{
+    static const std::array<InspectorComponentDefinition, 16> registry{{
         {"builtin.transform", "Transform", "Core", EditorComponentType::None, false},
         {"builtin.mesh_renderer", "MeshRenderer", "Rendering", EditorComponentType::MeshRenderer, false},
         {kLodComponentId, "LOD Group", "Rendering", EditorComponentType::None, true},
@@ -167,6 +182,11 @@ const std::array<InspectorComponentDefinition, 11>& InspectorComponentRegistry()
         {"physics.box_collider", "Box Collider", "Physics", EditorComponentType::BoxCollider, true},
         {"physics.sphere_collider", "Sphere Collider", "Physics", EditorComponentType::SphereCollider, true},
         {"physics.capsule_collider", "Capsule Collider", "Physics", EditorComponentType::CapsuleCollider, true},
+        {"physics.trigger_box", "Trigger Box", "Physics", EditorComponentType::TriggerBox, true},
+        {"physics.trigger_sphere", "Trigger Sphere", "Physics", EditorComponentType::TriggerSphere, true},
+        {"physics.trigger_capsule", "Trigger Capsule", "Physics", EditorComponentType::TriggerCapsule, true},
+        {"physics.fixed_joint", "Fixed Joint", "Physics", EditorComponentType::FixedJoint, true},
+        {"physics.hinge_joint", "Hinge Joint", "Physics", EditorComponentType::HingeJoint, true},
         {"builtin.water_body", "Water Body", "Rendering", EditorComponentType::WaterBody, false},
         {"builtin.point_light", "Point Light", "Lighting", EditorComponentType::PointLight, false},
         {"builtin.spot_light", "Spot Light", "Lighting", EditorComponentType::SpotLight, false},
@@ -381,6 +401,7 @@ ImVec4 AssetCategoryColor(AssetLibrary::Category category)
     case AssetLibrary::Category::Animation: return ImVec4(0.72f, 0.50f, 0.20f, 1.0f);
     case AssetLibrary::Category::Material: return ImVec4(0.38f, 0.58f, 0.36f, 1.0f);
     case AssetLibrary::Category::WaterMaterial: return ImVec4(0.16f, 0.58f, 0.64f, 1.0f);
+    case AssetLibrary::Category::PhysicsMaterial: return ImVec4(0.64f, 0.54f, 0.30f, 1.0f);
     case AssetLibrary::Category::Scene: return ImVec4(0.42f, 0.50f, 0.66f, 1.0f);
     case AssetLibrary::Category::Prefab: return ImVec4(0.67f, 0.48f, 0.82f, 1.0f);
     default: return ImVec4(0.35f, 0.35f, 0.35f, 1.0f);
@@ -396,6 +417,7 @@ const char* AssetCategoryIcon(AssetLibrary::Category category)
     case AssetLibrary::Category::Animation: return ICON_FA_PERSON_RUNNING;
     case AssetLibrary::Category::Material: return ICON_FA_PALETTE;
     case AssetLibrary::Category::WaterMaterial: return ICON_FA_DROPLET;
+    case AssetLibrary::Category::PhysicsMaterial: return ICON_FA_GEAR;
     case AssetLibrary::Category::Scene: return ICON_FA_GLOBE;
     case AssetLibrary::Category::Prefab: return ICON_FA_LAYER_GROUP;
     default: return ICON_FA_FILE;
@@ -733,6 +755,12 @@ void EditorImGui::SetMapEditorSettings(const MapEditorSettings& settings)
 
 void EditorImGui::SetEditorPlayModeState(const EditorPlayModeState& state)
 {
+    const bool wasEditing = m_playModeState.mode == EditorPlayMode::Edit;
+    const bool nowEditing = state.mode == EditorPlayMode::Edit;
+    if (wasEditing && !nowEditing)
+        m_pendingViewFocusWindow = "Game";        // entered Play: show the Main Camera
+    else if (!wasEditing && nowEditing)
+        m_pendingViewFocusWindow = "Scene View";  // stopped Play: back to free-fly editor camera
     m_playModeState = state;
     if (!CanUseEditorTools())
     {
@@ -749,6 +777,11 @@ void EditorImGui::SetLightingState(const LightingState& state)
 void EditorImGui::SetDynamicLightEditorState(const DynamicLightEditorState& state)
 {
     m_dynamicLightState = state;
+}
+
+void EditorImGui::SetCameraEditorState(const CameraEditorState& state)
+{
+    m_cameraEditorState = state;
 }
 
 void EditorImGui::SetWaterBodyEditorState(const WaterBodyEditorState& state)
@@ -775,6 +808,11 @@ void EditorImGui::SetTerrainEditorState(const TerrainEditorState& state)
 void EditorImGui::SetEngineStats(const EngineStats& stats)
 {
     m_engineStats = stats;
+}
+
+void EditorImGui::SetPhysicsEvents(std::vector<PhysicsEventEditorState> events)
+{
+    m_physicsEvents = std::move(events);
 }
 
 void EditorImGui::SetHierarchySceneState(std::uint64_t sceneRootEntity,
@@ -969,6 +1007,50 @@ void EditorImGui::SetSceneViewTexture(VkSampler sampler,
     }
 }
 
+void EditorImGui::ReleaseGameViewTextureDescriptor()
+{
+    if (m_gameViewDescriptor && m_vulkanBackendReady)
+        ImGui_ImplVulkan_RemoveTexture(m_gameViewDescriptor);
+    m_gameViewDescriptor = VK_NULL_HANDLE;
+    m_gameViewDescriptorSampler = VK_NULL_HANDLE;
+    m_gameViewDescriptorImageView = VK_NULL_HANDLE;
+    m_gameViewDescriptorImageLayout = VK_IMAGE_LAYOUT_UNDEFINED;
+}
+
+void EditorImGui::SetGameViewTexture(VkSampler sampler,
+                                     VkImageView imageView,
+                                     VkImageLayout layout,
+                                     VkExtent2D extent)
+{
+    m_gameViewSampler = sampler;
+    m_gameViewImageView = imageView;
+    m_gameViewImageLayout = layout;
+    m_gameViewExtent = extent;
+
+    const bool descriptorMatches =
+        m_gameViewDescriptor &&
+        m_gameViewDescriptorSampler == sampler &&
+        m_gameViewDescriptorImageView == imageView &&
+        m_gameViewDescriptorImageLayout == layout;
+    if (descriptorMatches)
+        return;
+
+    ReleaseGameViewTextureDescriptor();
+    if (!m_vulkanBackendReady || !sampler || !imageView || layout == VK_IMAGE_LAYOUT_UNDEFINED)
+        return;
+
+    m_gameViewDescriptor = ImGui_ImplVulkan_AddTexture(sampler, imageView, layout);
+    if (m_gameViewDescriptor)
+    {
+        m_gameViewDescriptorSampler = sampler;
+        m_gameViewDescriptorImageView = imageView;
+        m_gameViewDescriptorImageLayout = layout;
+        Tracenf("[EDITOR-GAME-VIEW] bound offscreen texture extent=%ux%u",
+            extent.width,
+            extent.height);
+    }
+}
+
 void EditorImGui::SetSceneViewSelectionOutline(std::vector<std::array<float, 4>> segments)
 {
     m_sceneViewSelectionOutline = std::move(segments);
@@ -998,6 +1080,56 @@ void EditorImGui::SetSceneViewGizmo(HierarchyEntityType type,
     m_gizmoOperation = operation;
     m_sceneGizmoSnapEnabled = snapEnabled;
     m_sceneGizmoSnapValue = std::max(0.001f, snapValue);
+
+    if (m_sceneGizmoVisible &&
+        m_editSelectedColliderInScene &&
+        type == HierarchyEntityType::MeshEntity &&
+        m_meshRendererState.selected &&
+        m_meshRendererState.id == id &&
+        m_meshRendererState.hasCollider)
+    {
+        const auto& collider = m_meshRendererState.collider;
+        const WorldVec3 colliderWorldCenter = TransformEditorColliderLocalPoint(
+            m_meshRendererState,
+            {collider.center[0], collider.center[1], collider.center[2]});
+        m_sceneGizmoPosition[0] = colliderWorldCenter.x;
+        m_sceneGizmoPosition[1] = colliderWorldCenter.y;
+        m_sceneGizmoPosition[2] = colliderWorldCenter.z;
+        m_sceneGizmoRotation[0] = m_meshRendererState.rotation[0];
+        m_sceneGizmoRotation[1] = m_meshRendererState.rotation[1];
+        m_sceneGizmoRotation[2] = m_meshRendererState.rotation[2];
+        if (operation == MapEditorGizmoOperation::Scale)
+        {
+            if (collider.shape == ixtreeme::physics::ColliderShape::Sphere)
+            {
+                const float diameter = std::max(0.001f, collider.radius * 2.0f);
+                m_sceneGizmoScale[0] = diameter * std::max(0.001f, m_meshRendererState.scale[0]);
+                m_sceneGizmoScale[1] = diameter * std::max(0.001f, m_meshRendererState.scale[1]);
+                m_sceneGizmoScale[2] = diameter * std::max(0.001f, m_meshRendererState.scale[2]);
+            }
+            else if (collider.shape == ixtreeme::physics::ColliderShape::Capsule)
+            {
+                const float diameter = std::max(0.001f, collider.radius * 2.0f);
+                m_sceneGizmoScale[0] = diameter * std::max(0.001f, m_meshRendererState.scale[0]);
+                m_sceneGizmoScale[1] = std::max(0.001f, collider.height) * std::max(0.001f, m_meshRendererState.scale[1]);
+                m_sceneGizmoScale[2] = diameter * std::max(0.001f, m_meshRendererState.scale[2]);
+            }
+            else
+            {
+                m_sceneGizmoScale[0] = std::max(0.001f, collider.size[0]) * std::max(0.001f, m_meshRendererState.scale[0]);
+                m_sceneGizmoScale[1] = std::max(0.001f, collider.size[1]) * std::max(0.001f, m_meshRendererState.scale[1]);
+                m_sceneGizmoScale[2] = std::max(0.001f, collider.size[2]) * std::max(0.001f, m_meshRendererState.scale[2]);
+            }
+            m_sceneGizmoOperation = MapEditorGizmoOperation::Scale;
+        }
+        else
+        {
+            m_sceneGizmoScale[0] = 0.35f;
+            m_sceneGizmoScale[1] = 0.35f;
+            m_sceneGizmoScale[2] = 0.35f;
+            m_sceneGizmoOperation = MapEditorGizmoOperation::Translate;
+        }
+    }
 }
 
 std::uint32_t JsonU32ValueForInspector(const std::string& object, const std::string& key, std::uint32_t fallback = 0)
@@ -1177,6 +1309,10 @@ MapEditorCommands EditorImGui::ConsumeCommands()
         const bool disableAssetWatcherPoll = commands.disableAssetWatcherPoll;
         const bool disableHierarchyIteration = commands.disableHierarchyIteration;
         const bool showPhysicsColliders = commands.showPhysicsColliders;
+        const bool showPhysicsContacts = commands.showPhysicsContacts;
+        const bool showPhysicsBodyCenters = commands.showPhysicsBodyCenters;
+        const bool physicsLayerMatrixChanged = commands.physicsLayerMatrixChanged;
+        const PhysicsLayerMatrix physicsLayerMatrix = commands.physicsLayerMatrix;
         const bool renderResolutionChanged = commands.renderResolutionChanged;
         const bool renderResolutionUseNative = commands.renderResolutionUseNative;
         const std::uint32_t renderResolutionWidth = commands.renderResolutionWidth;
@@ -1195,6 +1331,10 @@ MapEditorCommands EditorImGui::ConsumeCommands()
         commands.disableAssetWatcherPoll = disableAssetWatcherPoll;
         commands.disableHierarchyIteration = disableHierarchyIteration;
         commands.showPhysicsColliders = showPhysicsColliders;
+        commands.showPhysicsContacts = showPhysicsContacts;
+        commands.showPhysicsBodyCenters = showPhysicsBodyCenters;
+        commands.physicsLayerMatrixChanged = physicsLayerMatrixChanged;
+        commands.physicsLayerMatrix = physicsLayerMatrix;
         commands.renderResolutionChanged = renderResolutionChanged;
         commands.renderResolutionUseNative = renderResolutionUseNative;
         commands.renderResolutionWidth = renderResolutionWidth;
@@ -1255,6 +1395,7 @@ bool EditorImGui::ActiveAssetCategory(AssetLibrary::Category category) const
     case AssetBrowserFilter::Animation: return category == AssetLibrary::Category::Animation;
     case AssetBrowserFilter::Material: return category == AssetLibrary::Category::Material;
     case AssetBrowserFilter::WaterMaterial: return category == AssetLibrary::Category::WaterMaterial;
+    case AssetBrowserFilter::PhysicsMaterial: return category == AssetLibrary::Category::PhysicsMaterial;
     case AssetBrowserFilter::Scene: return category == AssetLibrary::Category::Scene;
     case AssetBrowserFilter::Prefab: return category == AssetLibrary::Category::Prefab;
     default: return true;
@@ -1269,6 +1410,7 @@ AssetLibrary::Category EditorImGui::FolderCategory() const
     case AssetBrowserFilter::Animation: return AssetLibrary::Category::Animation;
     case AssetBrowserFilter::Material: return AssetLibrary::Category::Material;
     case AssetBrowserFilter::WaterMaterial: return AssetLibrary::Category::WaterMaterial;
+    case AssetBrowserFilter::PhysicsMaterial: return AssetLibrary::Category::PhysicsMaterial;
     case AssetBrowserFilter::Scene: return AssetLibrary::Category::Scene;
     case AssetBrowserFilter::Prefab: return AssetLibrary::Category::Prefab;
     case AssetBrowserFilter::All:
@@ -1288,6 +1430,7 @@ const char* EditorImGui::AssetFilterName() const
     case AssetBrowserFilter::Animation: return "Anims";
     case AssetBrowserFilter::Material: return "Materials";
     case AssetBrowserFilter::WaterMaterial: return "Water Mats";
+    case AssetBrowserFilter::PhysicsMaterial: return "Physics Mats";
     case AssetBrowserFilter::Scene: return "Scenes";
     case AssetBrowserFilter::Prefab: return "Prefabs";
     default: return "Assets";
@@ -1357,6 +1500,7 @@ std::vector<std::string> EditorImGui::QueryVisibleFolders() const
         AssetLibrary::Category::Animation,
         AssetLibrary::Category::Material,
         AssetLibrary::Category::WaterMaterial,
+        AssetLibrary::Category::PhysicsMaterial,
         AssetLibrary::Category::Scene,
         AssetLibrary::Category::Prefab,
     };
@@ -2312,6 +2456,44 @@ bool EditorImGui::CreateWaterMaterialAsset(const std::string& displayName, Asset
     return true;
 }
 
+void EditorImGui::CreatePhysicsMaterialAsset()
+{
+    if (!m_assetLibrary)
+    {
+        m_assetStatus = "Physics material create failed: asset library unavailable";
+        return;
+    }
+
+    AssetLibrary::ImportOptions options{};
+    options.displayName = "Physics_Material";
+    options.subpath = m_assetSubpath;
+    options.tags = {"physics", "material"};
+    AssetLibrary::PhysicsMaterialData material{};
+    AssetLibrary::Entry entry{};
+    std::string error;
+    if (!m_assetLibrary->CreatePhysicsMaterial(options, material, entry, error))
+    {
+        m_assetStatus = "Physics material create failed: " + error;
+        return;
+    }
+
+    m_assetFilter = AssetBrowserFilter::PhysicsMaterial;
+    m_selectedAssetId = entry.id;
+    m_assetInspectorSelectionActive = true;
+    m_assetStatus = "Physics material created: " + entry.displayName;
+    Tracenf("[PHYSICS-MAT] asset created path=%s", m_assetLibrary->AbsolutePath(entry).generic_string().c_str());
+}
+
+std::optional<AssetLibrary::PhysicsMaterialData> EditorImGui::FindPhysicsMaterial(const std::string& id) const
+{
+    if (!m_assetLibrary || id.empty())
+        return std::nullopt;
+    const auto entry = m_assetLibrary->FindById(id);
+    if (!entry || entry->category != AssetLibrary::Category::PhysicsMaterial)
+        return std::nullopt;
+    return entry->physicsMaterial;
+}
+
 bool EditorImGui::OpenWaterMaterialEditor(const std::string& materialId)
 {
     if (!m_assetLibrary)
@@ -2934,6 +3116,7 @@ void EditorImGui::Destroy()
 {
     DestroyAssetPreviewTextures();
     ReleaseSceneViewTextureDescriptor();
+    ReleaseGameViewTextureDescriptor();
 
     if (m_vulkanBackendReady)
     {
@@ -2996,6 +3179,10 @@ void EditorImGui::SetSceneViewTexture(VkSampler, VkImageView, VkImageLayout, VkE
 {
 }
 
+void EditorImGui::SetGameViewTexture(VkSampler, VkImageView, VkImageLayout, VkExtent2D)
+{
+}
+
 bool EditorImGui::WantsInputCapture(const InputEvent&) const
 {
     return false;
@@ -3024,6 +3211,10 @@ void EditorImGui::SetLightingState(const LightingState&)
 }
 
 void EditorImGui::SetDynamicLightEditorState(const DynamicLightEditorState&)
+{
+}
+
+void EditorImGui::SetCameraEditorState(const CameraEditorState&)
 {
 }
 
@@ -3080,6 +3271,11 @@ bool EditorImGui::OpenWaterMaterialEditor(const std::string&)
 bool EditorImGui::OpenPbrMaterialEditor(const std::string&)
 {
     return false;
+}
+
+std::optional<AssetLibrary::PhysicsMaterialData> EditorImGui::FindPhysicsMaterial(const std::string&) const
+{
+    return std::nullopt;
 }
 
 MapEditorCommands EditorImGui::ConsumeCommands()

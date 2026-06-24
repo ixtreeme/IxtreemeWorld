@@ -455,7 +455,7 @@ AssetType detectAssetType(const std::filesystem::path& filePath)
     if (ext == ".png" || ext == ".jpg" || ext == ".jpeg" || ext == ".tga" ||
         ext == ".bmp" || ext == ".dds" || ext == ".ktx" || ext == ".ktx2" || ext == ".hdr")
         return AssetType::Texture;
-    if (ext == ".material")
+    if (ext == ".material" || ext == ".physmat")
         return AssetType::Material;
     if (ext == ".anim" || ext == ".ozz")
         return AssetType::Animation;

@@ -2579,7 +2579,7 @@ void TerrainRenderer::RenderWaterReflection(VulkanDevice& device,
     m_reflectionClipWaterLevelY = std::numeric_limits<float>::quiet_NaN();
 }
 
-void TerrainRenderer::Render(VulkanDevice& device, const WorldCamera& camera, VkExtent2D targetExtent)
+void TerrainRenderer::Render(VulkanDevice& device, const WorldCamera& camera, VkExtent2D targetExtent, uint32_t viewIndex)
 {
     static bool loggedDraw = false;
     static bool loggedSkip = false;
@@ -2606,7 +2606,7 @@ void TerrainRenderer::Render(VulkanDevice& device, const WorldCamera& camera, Vk
     }
 
     const uint32_t frameIndex = device.GetFrameIndex();
-    UpdateUniform(frameIndex, camera);
+    UpdateUniform(frameIndex, camera, false, viewIndex);
 
     VkCommandBuffer cmd = device.GetCommandBuffer();
 
@@ -2693,8 +2693,10 @@ void TerrainRenderer::Render(VulkanDevice& device, const WorldCamera& camera, Vk
     vkCmdPushConstants(cmd, m_pipelineLayout,
         VK_SHADER_STAGE_VERTEX_BIT | VK_SHADER_STAGE_FRAGMENT_BIT,
         0, sizeof(push), &push);
+    VkDescriptorSet terrainDescriptorSet =
+        (viewIndex == 0) ? m_descriptorSets[frameIndex] : m_descriptorSetsSecondary[frameIndex];
     vkCmdBindDescriptorSets(cmd, VK_PIPELINE_BIND_POINT_GRAPHICS, m_pipelineLayout,
-        0, 1, &m_descriptorSets[frameIndex], 0, nullptr);
+        0, 1, &terrainDescriptorSet, 0, nullptr);
     const uint32_t baseDrawCallsBefore = terrainStats.drawCalls;
     drawVisibleTerrainChunks();
     const uint32_t baseDrawCalls = terrainStats.drawCalls - baseDrawCallsBefore;
@@ -3592,6 +3594,8 @@ void TerrainRenderer::Destroy()
     DestroyBuffer(m_selectedWaterBodyIndexBuffer);
     for (Buffer& buffer : m_uniformBuffers)
         DestroyBuffer(buffer);
+    for (Buffer& buffer : m_uniformBuffersSecondary)
+        DestroyBuffer(buffer);
     for (Buffer& buffer : m_waterUniformBuffers)
         DestroyBuffer(buffer);
     DestroyTerrainLayers();
@@ -3680,21 +3684,33 @@ bool TerrainRenderer::CreateBuffers(VulkanDevice& device)
 
 bool TerrainRenderer::EnsureUniformBuffers(VulkanDevice& device)
 {
-    for (Buffer& buffer : m_uniformBuffers)
-    {
-        if (buffer.buffer && buffer.memory)
-            continue;
+    auto ensure = [&](std::array<Buffer, kFramesInFlight>& buffers) {
+        for (Buffer& buffer : buffers)
+        {
+            if (buffer.buffer && buffer.memory)
+                continue;
 
-        DestroyBuffer(buffer);
-        CreateHostVisibleBuffer(device, m_device, sizeof(UniformBlock),
-            VK_BUFFER_USAGE_UNIFORM_BUFFER_BIT, nullptr, buffer);
-    }
+            DestroyBuffer(buffer);
+            CreateHostVisibleBuffer(device, m_device, sizeof(UniformBlock),
+                VK_BUFFER_USAGE_UNIFORM_BUFFER_BIT, nullptr, buffer);
+        }
+    };
+    ensure(m_uniformBuffers);
+    ensure(m_uniformBuffersSecondary);
 
     for (const Buffer& buffer : m_uniformBuffers)
     {
         if (!buffer.buffer || !buffer.memory)
         {
             Tracen("[TERRAIN] uniform buffer creation failed");
+            return false;
+        }
+    }
+    for (const Buffer& buffer : m_uniformBuffersSecondary)
+    {
+        if (!buffer.buffer || !buffer.memory)
+        {
+            Tracen("[TERRAIN] secondary uniform buffer creation failed");
             return false;
         }
     }
@@ -6171,6 +6187,14 @@ bool TerrainRenderer::CreateDescriptors()
             return false;
         }
     }
+    for (const Buffer& buffer : m_uniformBuffersSecondary)
+    {
+        if (!buffer.buffer || !buffer.memory)
+        {
+            Tracen("[TERRAIN] CreateDescriptors skipped: secondary uniform buffer is not ready");
+            return false;
+        }
+    }
 
     if (!m_descriptorSetLayout)
     {
@@ -6248,9 +6272,12 @@ bool TerrainRenderer::CreateDescriptors()
         vkDestroyDescriptorPool(m_device, m_descriptorPool, nullptr);
     m_descriptorPool = VK_NULL_HANDLE;
     m_descriptorSets.fill(VK_NULL_HANDLE);
+    m_descriptorSetsSecondary.fill(VK_NULL_HANDLE);
     m_layerDescriptorSets.clear();
 
-    const uint32_t descriptorSetCount = kFramesInFlight;
+    // Two camera views (primary = Scene View / free-fly, secondary = Game view / Main
+    // Camera), each with one descriptor set per frame-in-flight.
+    const uint32_t descriptorSetCount = kFramesInFlight * 2u;
 
     std::array<VkDescriptorPoolSize, 2> poolSizes{};
     poolSizes[0].type = VK_DESCRIPTOR_TYPE_UNIFORM_BUFFER;
@@ -6266,13 +6293,20 @@ bool TerrainRenderer::CreateDescriptors()
     VK_CHECK(vkCreateDescriptorPool(m_device, &pool, nullptr, &m_descriptorPool));
 
     std::vector<VkDescriptorSetLayout> layouts(descriptorSetCount, m_descriptorSetLayout);
+    std::vector<VkDescriptorSet> allocated(descriptorSetCount, VK_NULL_HANDLE);
 
     VkDescriptorSetAllocateInfo alloc{};
     alloc.sType = VK_STRUCTURE_TYPE_DESCRIPTOR_SET_ALLOCATE_INFO;
     alloc.descriptorPool = m_descriptorPool;
     alloc.descriptorSetCount = descriptorSetCount;
     alloc.pSetLayouts = layouts.data();
-    VK_CHECK(vkAllocateDescriptorSets(m_device, &alloc, m_descriptorSets.data()));
+    VK_CHECK(vkAllocateDescriptorSets(m_device, &alloc, allocated.data()));
+
+    for (uint32_t frame = 0; frame < kFramesInFlight; ++frame)
+    {
+        m_descriptorSets[frame] = allocated[frame];
+        m_descriptorSetsSecondary[frame] = allocated[kFramesInFlight + frame];
+    }
 
     UpdateDescriptors();
 
@@ -6373,7 +6407,7 @@ void TerrainRenderer::UpdateDescriptors()
     if (!m_descriptorPool)
         return;
 
-    auto writeSet = [this](VkDescriptorSet descriptorSet, uint32_t frame)
+    auto writeSet = [this](VkDescriptorSet descriptorSet, const Buffer& uniformBuffer)
     {
         if (!descriptorSet || !m_baseTexture.view || !m_baseTexture.sampler ||
             !m_normalTexture.view || !m_normalTexture.sampler ||
@@ -6384,14 +6418,14 @@ void TerrainRenderer::UpdateDescriptors()
             !m_shadowArrayView || !m_shadowSampler ||
             !m_splatA.view || !m_splatA.sampler || !m_splatB.view || !m_splatB.sampler)
             return;
-        if (!m_uniformBuffers[frame].buffer || !m_uniformBuffers[frame].memory)
+        if (!uniformBuffer.buffer || !uniformBuffer.memory)
         {
             Tracen("[TERRAIN] descriptor update skipped: uniform buffer is not ready");
             return;
         }
 
         VkDescriptorBufferInfo bufferInfo{};
-        bufferInfo.buffer = m_uniformBuffers[frame].buffer;
+        bufferInfo.buffer = uniformBuffer.buffer;
         bufferInfo.offset = 0;
         bufferInfo.range = sizeof(UniformBlock);
 
@@ -6515,7 +6549,10 @@ void TerrainRenderer::UpdateDescriptors()
     };
 
     for (uint32_t frame = 0; frame < kFramesInFlight; ++frame)
-        writeSet(m_descriptorSets[frame], frame);
+    {
+        writeSet(m_descriptorSets[frame], m_uniformBuffers[frame]);
+        writeSet(m_descriptorSetsSecondary[frame], m_uniformBuffersSecondary[frame]);
+    }
 }
 
 bool TerrainRenderer::CreateWaterResources(VulkanDevice& device)
@@ -7703,9 +7740,11 @@ void TerrainRenderer::DestroyTerrainLayers()
     m_layerDescriptorSets.clear();
 }
 
-void TerrainRenderer::UpdateUniform(uint32_t frameIndex, const WorldCamera& camera, bool reflectionPass)
+void TerrainRenderer::UpdateUniform(uint32_t frameIndex, const WorldCamera& camera, bool reflectionPass, uint32_t viewIndex)
 {
-    if (frameIndex >= kFramesInFlight || !m_uniformBuffers[frameIndex].memory)
+    std::array<Buffer, kFramesInFlight>& targetBuffers =
+        (viewIndex == 0) ? m_uniformBuffers : m_uniformBuffersSecondary;
+    if (frameIndex >= kFramesInFlight || !targetBuffers[frameIndex].memory)
     {
         Tracen("[TERRAIN] UpdateUniform skipped: uniform buffer is not ready");
         return;
@@ -7837,9 +7876,9 @@ void TerrainRenderer::UpdateUniform(uint32_t frameIndex, const WorldCamera& came
         loggedLighting = true;
     }
     void* mapped = nullptr;
-    VK_CHECK(vkMapMemory(m_device, m_uniformBuffers[frameIndex].memory, 0, sizeof(uniform), 0, &mapped));
+    VK_CHECK(vkMapMemory(m_device, targetBuffers[frameIndex].memory, 0, sizeof(uniform), 0, &mapped));
     std::memcpy(mapped, &uniform, sizeof(uniform));
-    vkUnmapMemory(m_device, m_uniformBuffers[frameIndex].memory);
+    vkUnmapMemory(m_device, targetBuffers[frameIndex].memory);
     if (m_materialParamsDirty)
     {
         Tracen("[TMAT] params buffer updated (live, no reload, no remesh)");

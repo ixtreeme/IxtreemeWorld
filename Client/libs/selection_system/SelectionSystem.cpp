@@ -68,6 +68,7 @@ SelectedEditorObjectType ToSelectedObjectType(HierarchyEntityType type)
     case HierarchyEntityType::PointLight: return SelectedEditorObjectType::PointLight;
     case HierarchyEntityType::SpotLight: return SelectedEditorObjectType::SpotLight;
     case HierarchyEntityType::MeshEntity: return SelectedEditorObjectType::MeshEntity;
+    case HierarchyEntityType::Camera: return SelectedEditorObjectType::Camera;
     default: return SelectedEditorObjectType::None;
     }
 }
@@ -81,6 +82,7 @@ HierarchyEntityType ToHierarchyEntityType(SelectedEditorObjectType type)
     case SelectedEditorObjectType::PointLight: return HierarchyEntityType::PointLight;
     case SelectedEditorObjectType::SpotLight: return HierarchyEntityType::SpotLight;
     case SelectedEditorObjectType::MeshEntity: return HierarchyEntityType::MeshEntity;
+    case SelectedEditorObjectType::Camera: return HierarchyEntityType::Camera;
     default: return HierarchyEntityType::None;
     }
 }
@@ -341,6 +343,7 @@ SceneGizmoTarget BuildSceneGizmoTarget(const SelectedEditorObject& selected,
                                        const std::vector<PointLight>& pointLights,
                                        const std::vector<SpotLight>& spotLights,
                                        const std::vector<WaterBody>& waterBodies,
+                                       const std::vector<CameraEntity>& cameras,
                                        const StaticMeshResolver& resolveStaticMesh)
 {
     SceneGizmoTarget target{};
@@ -409,6 +412,19 @@ SceneGizmoTarget BuildSceneGizmoTarget(const SelectedEditorObject& selected,
         target.scale[1] = 1.0f;
         target.scale[2] = WaterBodyDepth(*it);
     }
+    else if (selected.type == SelectedEditorObjectType::Camera)
+    {
+        auto it = std::find_if(cameras.begin(), cameras.end(),
+            [&](const CameraEntity& camera) { return camera.id == selected.id; });
+        if (it == cameras.end() || it->editorHidden)
+            return target;
+        target.visible = true;
+        target.type = HierarchyEntityType::Camera;
+        target.id = it->id;
+        std::copy(std::begin(it->position), std::end(it->position), std::begin(target.position));
+        std::copy(std::begin(it->rotation), std::end(it->rotation), std::begin(target.rotation));
+        target.scale[0] = target.scale[1] = target.scale[2] = 1.0f;
+    }
     return target;
 }
 
@@ -465,6 +481,15 @@ bool ApplySceneGizmoToSpotLight(SpotLight& light, const float* position, const f
     std::copy(rotation, rotation + 3, std::begin(light.rotation));
     const float radius = (scale[0] + scale[1] + scale[2]) / 3.0f;
     light.radius = std::clamp(radius, 0.5f, 100.0f);
+    return true;
+}
+
+bool ApplySceneGizmoToCamera(CameraEntity& camera, const float* position, const float* rotation)
+{
+    if (!position || !rotation)
+        return false;
+    std::copy(position, position + 3, std::begin(camera.position));
+    std::copy(rotation, rotation + 3, std::begin(camera.rotation));
     return true;
 }
 

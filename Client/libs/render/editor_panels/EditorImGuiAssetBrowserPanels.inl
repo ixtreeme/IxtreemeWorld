@@ -50,6 +50,8 @@ void EditorImGui::RenderAssetTypeTabs()
     ImGui::SameLine();
     tab("Water Mats", AssetBrowserFilter::WaterMaterial);
     ImGui::SameLine();
+    tab("Physics Mats", AssetBrowserFilter::PhysicsMaterial);
+    ImGui::SameLine();
     tab("Scenes", AssetBrowserFilter::Scene);
     ImGui::SameLine();
     tab("Prefabs", AssetBrowserFilter::Prefab);
@@ -312,6 +314,8 @@ void EditorImGui::RenderAssetTile(const AssetLibrary::Entry& entry, float tileSi
                 CreatePbrMaterialAsset();
             if (ImGui::MenuItem("New Water Material"))
                 CreateWaterMaterialAsset();
+            if (ImGui::MenuItem("New Physics Material"))
+                CreatePhysicsMaterialAsset();
         }
         ImGui::EndPopup();
     }
@@ -394,6 +398,8 @@ void EditorImGui::RenderAssetGrid()
             CreatePbrMaterialAsset();
         if (ImGui::MenuItem("New Water Material"))
             CreateWaterMaterialAsset();
+        if (ImGui::MenuItem("New Physics Material"))
+            CreatePhysicsMaterialAsset();
         ImGui::EndPopup();
     }
 
@@ -633,6 +639,8 @@ void EditorImGui::RenderAssetBrowserContent()
             CreatePbrMaterialAsset();
         if (ImGui::MenuItem("New Water Material"))
             CreateWaterMaterialAsset();
+        if (ImGui::MenuItem("New Physics Material"))
+            CreatePhysicsMaterialAsset();
         ImGui::Separator();
         if (ImGui::MenuItem("Import Asset..."))
             OpenImportAssetDialog(m_assetSubpath);

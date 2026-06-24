@@ -25,6 +25,7 @@ public:
         Animation,
         Material,
         WaterMaterial,
+        PhysicsMaterial,
         Scene,
         Prefab
     };
@@ -61,6 +62,17 @@ public:
         float alphaCutoff = 0.5f;
     };
 
+    struct PhysicsMaterialData
+    {
+        float friction = 0.6f;
+        float restitution = 0.0f;
+        float density = 1.0f;
+        float linearDamping = 0.05f;
+        float angularDamping = 0.05f;
+        ixtreeme::physics::PhysicsMaterialCombineMode frictionCombine = ixtreeme::physics::PhysicsMaterialCombineMode::Average;
+        ixtreeme::physics::PhysicsMaterialCombineMode restitutionCombine = ixtreeme::physics::PhysicsMaterialCombineMode::Maximum;
+    };
+
     struct Entry
     {
         std::string id;
@@ -79,6 +91,7 @@ public:
         std::uint32_t resolutionHeight = 0;
         MaterialData material;
         WaterMaterialData waterMaterial;
+        PhysicsMaterialData physicsMaterial;
         bool hasLodDefault = false;
         LodConfig lodDefault;
     };
@@ -136,6 +149,14 @@ public:
                              const WaterMaterialData& material,
                              Entry& outEntry,
                              std::string& error);
+    bool CreatePhysicsMaterial(const ImportOptions& options,
+                               const PhysicsMaterialData& material,
+                               Entry& outEntry,
+                               std::string& error);
+    bool UpdatePhysicsMaterial(const std::string& id,
+                               const PhysicsMaterialData& material,
+                               Entry& outEntry,
+                               std::string& error);
     bool Remove(const std::string& id, std::string& error);
     bool UpdateAssetMetadata(const std::string& id,
                              const std::string& displayName,

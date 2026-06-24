@@ -17,6 +17,7 @@ EditorSceneRuntime::EditorSceneRuntime(Context context)
 SceneData EditorSceneRuntime::BuildSceneSnapshot() const
 {
     SceneData scene;
+    scene.physics = SceneManager::Instance().GetCurrentScene().physics;
     if (m_context.editorImGui)
         scene.lighting = m_context.editorImGui->GetLightingState();
     if (m_context.waterBodies)
@@ -27,6 +28,12 @@ SceneData EditorSceneRuntime::BuildSceneSnapshot() const
         scene.spotLights = *m_context.spotLights;
     if (m_context.meshEntities)
         scene.meshEntities = *m_context.meshEntities;
+    if (m_context.cameras)
+        scene.cameras = *m_context.cameras;
+    if (m_context.mainCameraId)
+        scene.mainCameraId = *m_context.mainCameraId;
+    if (m_context.captureEditorCamera)
+        scene.editorCamera = m_context.captureEditorCamera();
 
     if (m_context.terrainOk && m_context.terrain)
     {
@@ -89,6 +96,22 @@ void EditorSceneRuntime::ApplySceneData(const SceneData& scene)
         for (const MeshSceneEntity& mesh : *m_context.meshEntities)
             *m_context.nextMeshEntityId = std::max(*m_context.nextMeshEntityId, mesh.id + 1u);
     }
+
+    if (m_context.cameras)
+        *m_context.cameras = scene.cameras;
+    if (m_context.mainCameraId)
+        *m_context.mainCameraId = scene.mainCameraId;
+    if (m_context.nextCameraEntityId)
+    {
+        *m_context.nextCameraEntityId = 1;
+        if (m_context.cameras)
+        {
+            for (const CameraEntity& camera : *m_context.cameras)
+                *m_context.nextCameraEntityId = std::max(*m_context.nextCameraEntityId, camera.id + 1u);
+        }
+    }
+    if (m_context.applyEditorCamera)
+        m_context.applyEditorCamera(scene.editorCamera);
 
     if (m_context.rebuildStaticMeshSpatialIndex)
         m_context.rebuildStaticMeshSpatialIndex();

@@ -60,7 +60,8 @@ void EditorImGui::RenderAddComponentMenu()
     if (!m_componentRegistryLogged)
     {
         m_componentRegistryLogged = true;
-        Tracen("[INSPECTOR-COMP] registered=11 categories=[Core, Rendering, Physics, Lighting, Editor]");
+        Tracenf("[INSPECTOR-COMP] registered=%zu categories=[Core, Rendering, Physics, Lighting, Editor]",
+            InspectorComponentRegistry().size());
     }
 
     auto hasAttachedComponent = [&](const char* id) {
@@ -82,8 +83,19 @@ void EditorImGui::RenderAddComponentMenu()
             return hasSpot;
         if (id == "physics.rigidbody")
             return hasMesh && m_meshRendererState.hasRigidbody;
-        if (id == "physics.box_collider" || id == "physics.sphere_collider" || id == "physics.capsule_collider")
+        if (id == "physics.box_collider" ||
+            id == "physics.sphere_collider" ||
+            id == "physics.capsule_collider" ||
+            id == "physics.trigger_box" ||
+            id == "physics.trigger_sphere" ||
+            id == "physics.trigger_capsule")
+        {
             return hasMesh && m_meshRendererState.hasCollider;
+        }
+        if (id == "physics.fixed_joint")
+            return hasMesh && m_meshRendererState.hasFixedJoint;
+        if (id == "physics.hinge_joint")
+            return hasMesh && m_meshRendererState.hasHingeJoint;
         return hasMesh && hasAttachedComponent(definition.id);
     };
 
@@ -589,7 +601,27 @@ bool EditorImGui::RenderSelectedMeshPhysicsComponents()
             }
             changed |= ImGui::Checkbox("Enabled", &body.enabled);
             changed |= ImGui::Checkbox("Use Gravity", &body.useGravity);
+            changed |= ImGui::Checkbox("Allow Sleeping", &body.allowSleeping);
+            if (ImGui::IsItemHovered())
+            {
+                ImGui::BeginTooltip();
+                ImGui::TextUnformatted("Sleeping lets inactive bodies stop simulating until they are touched or moved.");
+                ImGui::EndTooltip();
+            }
+            changed |= ImGui::Checkbox("Continuous Collision", &body.continuousCollision);
+            if (ImGui::IsItemHovered())
+            {
+                ImGui::BeginTooltip();
+                ImGui::TextUnformatted("Uses linear-cast motion quality for fast dynamic bodies to reduce tunneling.");
+                ImGui::EndTooltip();
+            }
             changed |= ImGui::DragFloat("Mass", &body.mass, 0.05f, 0.001f, 100000.0f, "%.3f");
+            if (ImGui::IsItemHovered())
+            {
+                ImGui::BeginTooltip();
+                ImGui::TextUnformatted("Dynamic body mass in kilograms. Static and kinematic bodies ignore mass.");
+                ImGui::EndTooltip();
+            }
             changed |= ImGui::DragFloat("Linear Damping", &body.linearDamping, 0.01f, 0.0f, 100.0f, "%.3f");
             changed |= ImGui::DragFloat("Angular Damping", &body.angularDamping, 0.01f, 0.0f, 100.0f, "%.3f");
             ImGui::TextDisabled("Freeze Position");
@@ -601,6 +633,121 @@ bool EditorImGui::RenderSelectedMeshPhysicsComponents()
             changed |= ImGui::Checkbox("Y##freeze_rot", &body.freezeRotation[1]); ImGui::SameLine();
             changed |= ImGui::Checkbox("Z##freeze_rot", &body.freezeRotation[2]);
             ixtreeme::physics::Sanitize(body);
+
+            ImGui::SeparatorText("Runtime State");
+            if (m_meshRendererState.physicsRuntimeValid)
+            {
+                const float* linear = m_meshRendererState.physicsRuntimeLinearVelocity;
+                const float* angular = m_meshRendererState.physicsRuntimeAngularVelocity;
+                const float speed = std::sqrt(
+                    linear[0] * linear[0] +
+                    linear[1] * linear[1] +
+                    linear[2] * linear[2]);
+                ImGui::TextDisabled("Body: %llu  %s",
+                    static_cast<unsigned long long>(m_meshRendererState.physicsRuntimeBodyId),
+                    m_meshRendererState.physicsRuntimeActive ? "active" : "sleeping");
+                ImGui::Text("Linear:  %.3f, %.3f, %.3f  | speed %.3f m/s",
+                    linear[0],
+                    linear[1],
+                    linear[2],
+                    speed);
+                ImGui::Text("Angular: %.3f, %.3f, %.3f rad/s",
+                    angular[0],
+                    angular[1],
+                    angular[2]);
+            }
+            else
+            {
+                ImGui::TextDisabled("Runtime body unavailable. Enter Play mode to inspect live physics.");
+            }
+
+            ImGui::SeparatorText("Runtime Test");
+            ImGui::DragFloat3("Linear Velocity", m_physicsTestLinearVelocity, 0.1f, -1000.0f, 1000.0f, "%.2f");
+            if (ImGui::Button("Set Velocity"))
+            {
+                m_commands.physicsSetLinearVelocityForSelected = true;
+                m_commands.physicsRuntimeEntityId = m_meshRendererState.id;
+                std::copy(std::begin(m_physicsTestLinearVelocity), std::end(m_physicsTestLinearVelocity), std::begin(m_commands.physicsLinearVelocity));
+            }
+            ImGui::DragFloat3("Force", m_physicsTestForce, 0.5f, -100000.0f, 100000.0f, "%.2f");
+            if (ImGui::Button("Apply Force"))
+            {
+                m_commands.physicsApplyForceToSelected = true;
+                m_commands.physicsRuntimeEntityId = m_meshRendererState.id;
+                std::copy(std::begin(m_physicsTestForce), std::end(m_physicsTestForce), std::begin(m_commands.physicsForce));
+            }
+            ImGui::DragFloat3("Impulse", m_physicsTestImpulse, 0.1f, -10000.0f, 10000.0f, "%.2f");
+            if (ImGui::Button("Apply Impulse"))
+            {
+                m_commands.physicsApplyImpulseToSelected = true;
+                m_commands.physicsRuntimeEntityId = m_meshRendererState.id;
+                std::copy(std::begin(m_physicsTestImpulse), std::end(m_physicsTestImpulse), std::begin(m_commands.physicsImpulse));
+            }
+            ImGui::DragFloat3("Angular Impulse", m_physicsTestAngularImpulse, 0.1f, -10000.0f, 10000.0f, "%.2f");
+            if (ImGui::Button("Apply Angular Impulse"))
+            {
+                m_commands.physicsApplyAngularImpulseToSelected = true;
+                m_commands.physicsRuntimeEntityId = m_meshRendererState.id;
+                std::copy(std::begin(m_physicsTestAngularImpulse), std::end(m_physicsTestAngularImpulse), std::begin(m_commands.physicsAngularImpulse));
+            }
+        }
+        ImGui::PopID();
+    }
+
+    if (m_meshRendererState.hasFixedJoint)
+    {
+        ImGui::PushID("physics.fixed_joint");
+        const bool open = ImGui::CollapsingHeader(ICON_FA_GEAR " Fixed Joint", ImGuiTreeNodeFlags_DefaultOpen);
+        componentMenu("FixedJointComponentMenu", "physics.fixed_joint");
+        if (open)
+        {
+            auto& joint = m_meshRendererState.fixedJoint;
+            ImGui::TextDisabled("Add this to one body only; Connected Entity is the other body.");
+            changed |= ImGui::Checkbox("Enabled", &joint.enabled);
+            int connectedEntity = static_cast<int>(joint.connectedEntityId);
+            if (ImGui::InputInt("Connected Entity ID", &connectedEntity))
+            {
+                joint.connectedEntityId = static_cast<std::uint32_t>(std::max(0, connectedEntity));
+                changed = true;
+            }
+            if (joint.connectedEntityId == 0)
+                ImGui::TextDisabled("Pick another mesh entity with a Rigidbody before entering Play.");
+            else
+                ImGui::TextDisabled("Connects this Rigidbody to entity %u in Play mode.", joint.connectedEntityId);
+        }
+        ImGui::PopID();
+    }
+
+    if (m_meshRendererState.hasHingeJoint)
+    {
+        ImGui::PushID("physics.hinge_joint");
+        const bool open = ImGui::CollapsingHeader(ICON_FA_GEAR " Hinge Joint", ImGuiTreeNodeFlags_DefaultOpen);
+        componentMenu("HingeJointComponentMenu", "physics.hinge_joint");
+        if (open)
+        {
+            auto& joint = m_meshRendererState.hingeJoint;
+            ImGui::TextDisabled("Add this to one body only; Connected Entity is the other body.");
+            changed |= ImGui::Checkbox("Enabled", &joint.enabled);
+            int connectedEntity = static_cast<int>(joint.connectedEntityId);
+            if (ImGui::InputInt("Connected Entity ID", &connectedEntity))
+            {
+                joint.connectedEntityId = static_cast<std::uint32_t>(std::max(0, connectedEntity));
+                changed = true;
+            }
+            changed |= ImGui::DragFloat3("Anchor", joint.anchor, 0.05f, -10000.0f, 10000.0f, "%.2f");
+            changed |= ImGui::DragFloat3("Axis", joint.axis, 0.02f, -1.0f, 1.0f, "%.2f");
+            changed |= ImGui::Checkbox("Limits", &joint.limitsEnabled);
+            if (joint.limitsEnabled)
+            {
+                changed |= ImGui::DragFloat("Min Angle", &joint.minAngleDegrees, 0.5f, -180.0f, 0.0f, "%.1f deg");
+                changed |= ImGui::DragFloat("Max Angle", &joint.maxAngleDegrees, 0.5f, 0.0f, 180.0f, "%.1f deg");
+            }
+            changed |= ImGui::DragFloat("Friction Torque", &joint.frictionTorque, 0.1f, 0.0f, 100000.0f, "%.2f");
+            joint.frictionTorque = std::max(0.0f, joint.frictionTorque);
+            if (joint.connectedEntityId == 0)
+                ImGui::TextDisabled("Pick another mesh entity with a Rigidbody before entering Play.");
+            else
+                ImGui::TextDisabled("Allows rotation around the axis between this body and entity %u.", joint.connectedEntityId);
         }
         ImGui::PopID();
     }
@@ -618,17 +765,106 @@ bool EditorImGui::RenderSelectedMeshPhysicsComponents()
                 m_commands.selectedMeshEntityChanged = true;
                 m_commands.selectedMeshEntity = m_meshRendererState;
             };
-            const char* shapes[] = {"Box", "Sphere", "Capsule"};
+            const char* shapes[] = {"Box", "Sphere", "Capsule", "Mesh", "Convex Hull"};
             int shapeIndex = collider.shape == ixtreeme::physics::ColliderShape::Sphere ? 1 :
-                (collider.shape == ixtreeme::physics::ColliderShape::Capsule ? 2 : 0);
+                (collider.shape == ixtreeme::physics::ColliderShape::Capsule ? 2 :
+                (collider.shape == ixtreeme::physics::ColliderShape::Mesh ? 3 :
+                (collider.shape == ixtreeme::physics::ColliderShape::ConvexHull ? 4 : 0)));
             if (ImGui::Combo("Shape", &shapeIndex, shapes, IM_ARRAYSIZE(shapes)))
             {
                 collider.shape = shapeIndex == 1 ? ixtreeme::physics::ColliderShape::Sphere :
-                    (shapeIndex == 2 ? ixtreeme::physics::ColliderShape::Capsule : ixtreeme::physics::ColliderShape::Box);
+                    (shapeIndex == 2 ? ixtreeme::physics::ColliderShape::Capsule :
+                    (shapeIndex == 3 ? ixtreeme::physics::ColliderShape::Mesh :
+                    (shapeIndex == 4 ? ixtreeme::physics::ColliderShape::ConvexHull : ixtreeme::physics::ColliderShape::Box)));
                 changed = true;
             }
             changed |= ImGui::Checkbox("Enabled", &collider.enabled);
             changed |= ImGui::Checkbox("Is Trigger", &collider.trigger);
+            ImGui::Checkbox("Edit Collider In Scene", &m_editSelectedColliderInScene);
+            if (ImGui::IsItemHovered())
+            {
+                ImGui::BeginTooltip();
+                ImGui::TextUnformatted("Shows the Scene View gizmo at the collider center. Translate moves the collider offset, not the object.");
+                ImGui::EndTooltip();
+            }
+            const char* layerNames[] = {
+                ixtreeme::physics::DisplayName(ixtreeme::physics::PhysicsLayer::Default),
+                ixtreeme::physics::DisplayName(ixtreeme::physics::PhysicsLayer::StaticWorld),
+                ixtreeme::physics::DisplayName(ixtreeme::physics::PhysicsLayer::DynamicObject),
+                ixtreeme::physics::DisplayName(ixtreeme::physics::PhysicsLayer::Player),
+                ixtreeme::physics::DisplayName(ixtreeme::physics::PhysicsLayer::Trigger),
+                ixtreeme::physics::DisplayName(ixtreeme::physics::PhysicsLayer::Projectile),
+                ixtreeme::physics::DisplayName(ixtreeme::physics::PhysicsLayer::Foliage),
+                ixtreeme::physics::DisplayName(ixtreeme::physics::PhysicsLayer::NoCollision),
+            };
+            int layerIndex = static_cast<int>(ixtreeme::physics::PhysicsLayerIndex(collider.layer));
+            layerIndex = std::clamp(layerIndex, 0, static_cast<int>(ixtreeme::physics::PhysicsLayerCount()) - 1);
+            if (ImGui::Combo("Physics Layer", &layerIndex, layerNames, IM_ARRAYSIZE(layerNames)))
+            {
+                collider.layer = static_cast<ixtreeme::physics::PhysicsLayer>(layerIndex);
+                changed = true;
+            }
+            if (m_assetLibrary)
+            {
+                std::vector<AssetLibrary::Entry> physicsMaterials =
+                    m_assetLibrary->EntriesFor(AssetLibrary::Category::PhysicsMaterial);
+                int selectedPhysicsMaterial = 0;
+                std::vector<std::string> physicsMaterialNames;
+                physicsMaterialNames.reserve(physicsMaterials.size() + 1);
+                physicsMaterialNames.push_back("None");
+                for (std::size_t i = 0; i < physicsMaterials.size(); ++i)
+                {
+                    physicsMaterialNames.push_back(physicsMaterials[i].displayName.empty()
+                        ? physicsMaterials[i].id
+                        : physicsMaterials[i].displayName);
+                    if (physicsMaterials[i].id == collider.materialAssetId)
+                        selectedPhysicsMaterial = static_cast<int>(i + 1);
+                }
+                const auto comboPreview = [&]() -> const char* {
+                    if (selectedPhysicsMaterial < 0 ||
+                        selectedPhysicsMaterial >= static_cast<int>(physicsMaterialNames.size()))
+                    {
+                        return "None";
+                    }
+                    return physicsMaterialNames[static_cast<std::size_t>(selectedPhysicsMaterial)].c_str();
+                };
+                if (ImGui::BeginCombo("Physics Material", comboPreview()))
+                {
+                    if (ImGui::Selectable("None", selectedPhysicsMaterial == 0))
+                    {
+                        collider.materialAssetId.clear();
+                        changed = true;
+                    }
+                    for (std::size_t i = 0; i < physicsMaterials.size(); ++i)
+                    {
+                        const bool selectedMaterial = selectedPhysicsMaterial == static_cast<int>(i + 1);
+                        if (ImGui::Selectable(physicsMaterialNames[i + 1].c_str(), selectedMaterial))
+                        {
+                            collider.materialAssetId = physicsMaterials[i].id;
+                            changed = true;
+                        }
+                    }
+                    ImGui::EndCombo();
+                }
+                if (!collider.materialAssetId.empty())
+                {
+                    const auto material = m_assetLibrary->FindById(collider.materialAssetId);
+                    if (material && material->category == AssetLibrary::Category::PhysicsMaterial)
+                    {
+                        ImGui::TextDisabled("Material: friction %.2f, bounce %.2f, density %.2f",
+                            material->physicsMaterial.friction,
+                            material->physicsMaterial.restitution,
+                            material->physicsMaterial.density);
+                        ImGui::TextDisabled("Combine: friction %s, bounce %s",
+                            ixtreeme::physics::DisplayName(material->physicsMaterial.frictionCombine),
+                            ixtreeme::physics::DisplayName(material->physicsMaterial.restitutionCombine));
+                    }
+                    else
+                    {
+                        ImGui::TextDisabled("Material: missing (%s)", collider.materialAssetId.c_str());
+                    }
+                }
+            }
             ImGui::TextDisabled("Fit Collider");
             if (ImGui::Button("Box", ImVec2(92.0f, 0.0f)))
             {
@@ -648,6 +884,18 @@ bool EditorImGui::RenderSelectedMeshPhysicsComponents()
                 requestColliderFit();
             }
             ImGui::SameLine();
+            if (ImGui::Button("Mesh", ImVec2(92.0f, 0.0f)))
+            {
+                collider.shape = ixtreeme::physics::ColliderShape::Mesh;
+                changed = true;
+            }
+            ImGui::SameLine();
+            if (ImGui::Button("Hull", ImVec2(72.0f, 0.0f)))
+            {
+                collider.shape = ixtreeme::physics::ColliderShape::ConvexHull;
+                changed = true;
+            }
+            ImGui::SameLine();
             if (ImGui::Button("Center", ImVec2(64.0f, 0.0f)))
             {
                 collider.center[0] = 0.0f;
@@ -658,12 +906,60 @@ bool EditorImGui::RenderSelectedMeshPhysicsComponents()
             changed |= ImGui::DragFloat3("Center", collider.center, 0.05f, -1000.0f, 1000.0f, "%.2f");
             if (collider.shape == ixtreeme::physics::ColliderShape::Box)
                 changed |= ImGui::DragFloat3("Size", collider.size, 0.05f, 0.001f, 10000.0f, "%.2f");
+            else if (collider.shape == ixtreeme::physics::ColliderShape::Mesh)
+                ImGui::TextDisabled("Mesh collider uses the render mesh triangles. Static/Kinematic recommended.");
+            else if (collider.shape == ixtreeme::physics::ColliderShape::ConvexHull)
+                ImGui::TextDisabled("Convex Hull uses the render mesh shape and is suitable for dynamic bodies.");
             else
                 changed |= ImGui::DragFloat("Radius", &collider.radius, 0.025f, 0.001f, 10000.0f, "%.2f");
             if (collider.shape == ixtreeme::physics::ColliderShape::Capsule)
                 changed |= ImGui::DragFloat("Height", &collider.height, 0.05f, 0.001f, 10000.0f, "%.2f");
             changed |= ImGui::SliderFloat("Friction", &collider.friction, 0.0f, 4.0f, "%.2f");
             changed |= ImGui::SliderFloat("Bounciness", &collider.restitution, 0.0f, 1.0f, "%.2f");
+            ImGui::TextDisabled("Physics Presets");
+            auto applyPhysicsPreset = [&](const char* name,
+                float friction,
+                float restitution,
+                bool trigger,
+                ixtreeme::physics::PhysicsLayer layer,
+                float mass,
+                float linearDamping,
+                float angularDamping) {
+                collider.friction = friction;
+                collider.restitution = restitution;
+                collider.trigger = trigger;
+                collider.layer = layer;
+                if (m_meshRendererState.hasRigidbody)
+                {
+                    auto& body = m_meshRendererState.rigidbody;
+                    body.mass = mass;
+                    body.linearDamping = linearDamping;
+                    body.angularDamping = angularDamping;
+                    if (trigger)
+                        body.useGravity = false;
+                    ixtreeme::physics::Sanitize(body);
+                }
+                changed = true;
+                Tracenf("[PHYSICS] preset entity=%u name=%s friction=%.2f bounce=%.2f trigger=%d",
+                    m_meshRendererState.id,
+                    name,
+                    friction,
+                    restitution,
+                    trigger ? 1 : 0);
+            };
+            if (ImGui::Button("Default", ImVec2(78.0f, 0.0f)))
+                applyPhysicsPreset("Default", 0.60f, 0.00f, false, ixtreeme::physics::PhysicsLayer::Default, 1.0f, 0.05f, 0.05f);
+            ImGui::SameLine();
+            if (ImGui::Button("Bouncy", ImVec2(78.0f, 0.0f)))
+                applyPhysicsPreset("Bouncy", 0.40f, 0.85f, false, ixtreeme::physics::PhysicsLayer::DynamicObject, 1.0f, 0.02f, 0.02f);
+            ImGui::SameLine();
+            if (ImGui::Button("Ice", ImVec2(78.0f, 0.0f)))
+                applyPhysicsPreset("Ice", 0.02f, 0.02f, false, ixtreeme::physics::PhysicsLayer::DynamicObject, 1.0f, 0.0f, 0.0f);
+            if (ImGui::Button("Heavy", ImVec2(78.0f, 0.0f)))
+                applyPhysicsPreset("Heavy", 0.90f, 0.05f, false, ixtreeme::physics::PhysicsLayer::DynamicObject, 20.0f, 0.10f, 0.10f);
+            ImGui::SameLine();
+            if (ImGui::Button("Trigger", ImVec2(78.0f, 0.0f)))
+                applyPhysicsPreset("Trigger", 0.60f, 0.00f, true, ixtreeme::physics::PhysicsLayer::Trigger, 1.0f, 0.05f, 0.05f);
             ixtreeme::physics::Sanitize(collider);
         }
         ImGui::PopID();
@@ -677,6 +973,65 @@ bool EditorImGui::RenderSelectedMeshPhysicsComponents()
             m_meshRendererState.hasCollider ? 1 : 0);
     }
     return changed;
+}
+
+void EditorImGui::RenderSelectedCameraInspector()
+{
+    if (!m_cameraEditorState.selected)
+        return;
+
+    CameraEntity& camera = m_cameraEditorState.camera;
+    UI::SectionHeader(ICON_FA_CUBE " Entity");
+    ImGui::TextDisabled("flecs=%llu  object=%u",
+        static_cast<unsigned long long>(m_selectedHierarchyEntity),
+        camera.id);
+
+    char nameBuffer[96]{};
+    std::snprintf(nameBuffer, sizeof(nameBuffer), "%s", camera.name.c_str());
+    if (ImGui::InputText("Name", nameBuffer, sizeof(nameBuffer)))
+    {
+        camera.name = nameBuffer;
+        MarkSelectedCameraChanged();
+    }
+
+    float position[3] = {camera.position[0], camera.position[1], camera.position[2]};
+    float rotation[3] = {camera.rotation[0], camera.rotation[1], camera.rotation[2]};
+    if (RenderTransformComponent(position, rotation, nullptr))
+    {
+        camera.position[0] = position[0];
+        camera.position[1] = position[1];
+        camera.position[2] = position[2];
+        camera.rotation[0] = rotation[0];
+        camera.rotation[1] = rotation[1];
+        camera.rotation[2] = rotation[2];
+        MarkSelectedCameraChanged();
+    }
+
+    if (ImGui::CollapsingHeader(ICON_FA_EYE " Camera", ImGuiTreeNodeFlags_DefaultOpen))
+    {
+        bool changed = false;
+        changed |= ImGui::SliderFloat("Field of View", &camera.fovDegrees, 10.0f, 120.0f, "%.1f deg");
+        changed |= ImGui::DragFloat("Near Plane", &camera.nearPlane, 0.01f, 0.01f, 100.0f, "%.2f");
+        changed |= ImGui::DragFloat("Far Plane", &camera.farPlane, 1.0f, 1.0f, 100000.0f, "%.1f");
+        if (changed)
+        {
+            camera.fovDegrees = std::clamp(camera.fovDegrees, 1.0f, 179.0f);
+            camera.nearPlane = std::max(0.001f, camera.nearPlane);
+            camera.farPlane = std::max(camera.nearPlane + 0.001f, camera.farPlane);
+            MarkSelectedCameraChanged();
+        }
+
+        ImGui::Spacing();
+        if (m_cameraEditorState.isMain)
+        {
+            ImGui::TextDisabled(ICON_FA_CHECK " Main Camera (drives the Game view)");
+        }
+        else if (UI::IconButton(ICON_FA_CHECK, "Set as Main Camera", ImVec2(-1.0f, 0.0f)))
+        {
+            m_commands.setMainCameraRequested = true;
+            m_commands.setMainCameraId = camera.id;
+        }
+    }
 }
 
 void EditorImGui::RenderSelectedMeshRendererInspector()
@@ -1037,6 +1392,40 @@ void EditorImGui::RenderWorldPanel()
             RenderLightingPanel();
         if (ImGui::CollapsingHeader("Dynamic Lights", ImGuiTreeNodeFlags_DefaultOpen))
             RenderDynamicLightsPanel();
+        if (ImGui::CollapsingHeader("Physics Events"))
+        {
+            ImGui::TextDisabled("Recent collision / trigger events: %zu", m_physicsEvents.size());
+            if (m_physicsEvents.empty())
+            {
+                ImGui::TextDisabled("No events yet. Enter Play mode and collide/trigger bodies.");
+            }
+            else if (ImGui::BeginTable("PhysicsEventsTable", 5, ImGuiTableFlags_BordersInnerV | ImGuiTableFlags_RowBg | ImGuiTableFlags_ScrollY, ImVec2(0.0f, 180.0f)))
+            {
+                ImGui::TableSetupColumn("Event");
+                ImGui::TableSetupColumn("A");
+                ImGui::TableSetupColumn("B");
+                ImGui::TableSetupColumn("Point");
+                ImGui::TableSetupColumn("Depth");
+                ImGui::TableHeadersRow();
+                const std::size_t maxRows = std::min<std::size_t>(m_physicsEvents.size(), 48u);
+                for (std::size_t row = 0; row < maxRows; ++row)
+                {
+                    const PhysicsEventEditorState& event = m_physicsEvents[m_physicsEvents.size() - 1u - row];
+                    ImGui::TableNextRow();
+                    ImGui::TableSetColumnIndex(0);
+                    ImGui::Text("%s %s", event.kind.c_str(), event.phase.c_str());
+                    ImGui::TableSetColumnIndex(1);
+                    ImGui::Text("#%u %s", event.entityA, event.nameA.c_str());
+                    ImGui::TableSetColumnIndex(2);
+                    ImGui::Text("#%u %s", event.entityB, event.nameB.c_str());
+                    ImGui::TableSetColumnIndex(3);
+                    ImGui::Text("%.2f, %.2f, %.2f", event.point[0], event.point[1], event.point[2]);
+                    ImGui::TableSetColumnIndex(4);
+                    ImGui::Text("%.3f", event.penetrationDepth);
+                }
+                ImGui::EndTable();
+            }
+        }
     }
     ImGui::End();
     RenderCreateTerrainModal();
@@ -1097,8 +1486,7 @@ void EditorImGui::RenderPerformancePanel()
             mathBenchmark.transformVec4Ms,
             mathBenchmark.frustumAabbMs);
     }
-    if (ImGui::Checkbox("Show Physics Colliders", &m_debugShowPhysicsColliders))
-    {
+    auto queuePhysicsDebugCommands = [&]() {
         m_commands.debugPerfTogglesChanged = true;
         m_commands.disableShadowPass = m_debugDisableShadowPass;
         m_commands.disableWaterReflectionPass = m_debugDisableWaterReflectionPass;
@@ -1106,6 +1494,162 @@ void EditorImGui::RenderPerformancePanel()
         m_commands.disableAssetWatcherPoll = m_debugDisableAssetWatcherPoll;
         m_commands.disableHierarchyIteration = m_debugDisableHierarchyIteration;
         m_commands.showPhysicsColliders = m_debugShowPhysicsColliders;
+        m_commands.showPhysicsContacts = m_debugShowPhysicsContacts;
+        m_commands.showPhysicsBodyCenters = m_debugShowPhysicsBodyCenters;
+    };
+    if (ImGui::Checkbox("Show Physics Colliders", &m_debugShowPhysicsColliders))
+    {
+        queuePhysicsDebugCommands();
+    }
+    if (ImGui::Checkbox("Show Physics Contacts", &m_debugShowPhysicsContacts))
+    {
+        queuePhysicsDebugCommands();
+    }
+    if (ImGui::Checkbox("Show Physics Body Centers", &m_debugShowPhysicsBodyCenters))
+    {
+        queuePhysicsDebugCommands();
+    }
+    if (ImGui::CollapsingHeader("Physics Query"))
+    {
+        ImGui::DragFloat("Ray Distance", &m_physicsRaycastDistance, 5.0f, 0.1f, 5000.0f, "%.1f m");
+        m_physicsRaycastDistance = std::clamp(m_physicsRaycastDistance, 0.1f, 5000.0f);
+        ImGui::Checkbox("Hit Triggers", &m_physicsRaycastHitTriggers);
+        ImGui::TextDisabled("Layer Mask");
+        constexpr std::size_t kLayerCount = static_cast<std::size_t>(ixtreeme::physics::PhysicsLayer::Count);
+        for (std::size_t layerIndex = 0; layerIndex < kLayerCount; ++layerIndex)
+        {
+            const auto layer = static_cast<ixtreeme::physics::PhysicsLayer>(layerIndex);
+            bool enabled = (m_physicsRaycastLayerMask & ixtreeme::physics::PhysicsLayerMask(layer)) != 0u;
+            ImGui::PushID(static_cast<int>(layerIndex));
+            if (ImGui::Checkbox(ixtreeme::physics::DisplayName(layer), &enabled))
+            {
+                if (enabled)
+                    m_physicsRaycastLayerMask |= ixtreeme::physics::PhysicsLayerMask(layer);
+                else
+                    m_physicsRaycastLayerMask &= ~ixtreeme::physics::PhysicsLayerMask(layer);
+            }
+            ImGui::PopID();
+            if ((layerIndex % 2u) == 0u && layerIndex + 1u < kLayerCount)
+                ImGui::SameLine();
+        }
+        if (ImGui::Button("Raycast From Camera"))
+        {
+            m_commands.physicsRaycastFromCamera = true;
+            m_commands.physicsRaycastLayerMask = m_physicsRaycastLayerMask;
+            m_commands.physicsRaycastHitTriggers = m_physicsRaycastHitTriggers;
+            m_commands.physicsRaycastDistance = m_physicsRaycastDistance;
+        }
+
+        ImGui::SeparatorText("Sphere Overlap");
+        ImGui::DragFloat("Overlap Distance", &m_physicsOverlapDistance, 1.0f, 0.0f, 5000.0f, "%.1f m");
+        ImGui::DragFloat("Overlap Radius", &m_physicsOverlapRadius, 0.1f, 0.05f, 100.0f, "%.2f m");
+        ImGui::DragFloat3("Box Half Extents", m_physicsOverlapBoxHalfExtents, 0.1f, 0.05f, 100.0f, "%.2f m");
+        ImGui::DragFloat("Capsule Radius", &m_physicsOverlapCapsuleRadius, 0.05f, 0.05f, 100.0f, "%.2f m");
+        ImGui::DragFloat("Capsule Height", &m_physicsOverlapCapsuleHeight, 0.1f, 0.1f, 200.0f, "%.2f m");
+        m_physicsOverlapDistance = std::clamp(m_physicsOverlapDistance, 0.0f, 5000.0f);
+        m_physicsOverlapRadius = std::clamp(m_physicsOverlapRadius, 0.05f, 100.0f);
+        for (float& extent : m_physicsOverlapBoxHalfExtents)
+            extent = std::clamp(extent, 0.05f, 100.0f);
+        m_physicsOverlapCapsuleRadius = std::clamp(m_physicsOverlapCapsuleRadius, 0.05f, 100.0f);
+        m_physicsOverlapCapsuleHeight = std::clamp(m_physicsOverlapCapsuleHeight, m_physicsOverlapCapsuleRadius * 2.0f, 200.0f);
+        ImGui::Checkbox("Overlap Hit Triggers", &m_physicsOverlapHitTriggers);
+        ImGui::TextDisabled("Overlap Layer Mask");
+        for (std::size_t layerIndex = 0; layerIndex < kLayerCount; ++layerIndex)
+        {
+            const auto layer = static_cast<ixtreeme::physics::PhysicsLayer>(layerIndex);
+            bool enabled = (m_physicsOverlapLayerMask & ixtreeme::physics::PhysicsLayerMask(layer)) != 0u;
+            ImGui::PushID(static_cast<int>(1000u + layerIndex));
+            if (ImGui::Checkbox(ixtreeme::physics::DisplayName(layer), &enabled))
+            {
+                if (enabled)
+                    m_physicsOverlapLayerMask |= ixtreeme::physics::PhysicsLayerMask(layer);
+                else
+                    m_physicsOverlapLayerMask &= ~ixtreeme::physics::PhysicsLayerMask(layer);
+            }
+            ImGui::PopID();
+            if ((layerIndex % 2u) == 0u && layerIndex + 1u < kLayerCount)
+                ImGui::SameLine();
+        }
+        if (ImGui::Button("Overlap Sphere From Camera"))
+        {
+            m_commands.physicsOverlapSphereFromCamera = true;
+            m_commands.physicsOverlapLayerMask = m_physicsOverlapLayerMask;
+            m_commands.physicsOverlapHitTriggers = m_physicsOverlapHitTriggers;
+            m_commands.physicsOverlapDistance = m_physicsOverlapDistance;
+            m_commands.physicsOverlapRadius = m_physicsOverlapRadius;
+        }
+        ImGui::SameLine();
+        if (ImGui::Button("Overlap Box From Camera"))
+        {
+            m_commands.physicsOverlapBoxFromCamera = true;
+            m_commands.physicsOverlapLayerMask = m_physicsOverlapLayerMask;
+            m_commands.physicsOverlapHitTriggers = m_physicsOverlapHitTriggers;
+            m_commands.physicsOverlapDistance = m_physicsOverlapDistance;
+            std::copy(std::begin(m_physicsOverlapBoxHalfExtents), std::end(m_physicsOverlapBoxHalfExtents), std::begin(m_commands.physicsOverlapBoxHalfExtents));
+        }
+        ImGui::SameLine();
+        if (ImGui::Button("Overlap Capsule From Camera"))
+        {
+            m_commands.physicsOverlapCapsuleFromCamera = true;
+            m_commands.physicsOverlapLayerMask = m_physicsOverlapLayerMask;
+            m_commands.physicsOverlapHitTriggers = m_physicsOverlapHitTriggers;
+            m_commands.physicsOverlapDistance = m_physicsOverlapDistance;
+            m_commands.physicsOverlapCapsuleRadius = m_physicsOverlapCapsuleRadius;
+            m_commands.physicsOverlapCapsuleHeight = m_physicsOverlapCapsuleHeight;
+        }
+    }
+    if (ImGui::CollapsingHeader("Physics Collision Matrix"))
+    {
+        constexpr std::size_t kLayerCount = static_cast<std::size_t>(ixtreeme::physics::PhysicsLayer::Count);
+        bool matrixChanged = false;
+        if (ImGui::Button("Reset Physics Matrix"))
+        {
+            for (std::size_t a = 0; a < kLayerCount; ++a)
+            {
+                for (std::size_t b = 0; b < kLayerCount; ++b)
+                {
+                    m_physicsLayerMatrix[a][b] = ixtreeme::physics::DefaultLayerCollision(
+                        static_cast<ixtreeme::physics::PhysicsLayer>(a),
+                        static_cast<ixtreeme::physics::PhysicsLayer>(b));
+                }
+            }
+            matrixChanged = true;
+        }
+        const char* shortNames[] = {"Def", "World", "Dyn", "Player", "Trig", "Proj", "Foliage", "None"};
+        if (ImGui::BeginTable("PhysicsLayerMatrix", static_cast<int>(kLayerCount) + 1, ImGuiTableFlags_Borders | ImGuiTableFlags_RowBg))
+        {
+            ImGui::TableSetupColumn("");
+            for (std::size_t i = 0; i < kLayerCount; ++i)
+                ImGui::TableSetupColumn(shortNames[i]);
+            ImGui::TableHeadersRow();
+            for (std::size_t row = 0; row < kLayerCount; ++row)
+            {
+                ImGui::TableNextRow();
+                ImGui::TableSetColumnIndex(0);
+                ImGui::TextUnformatted(ixtreeme::physics::DisplayName(static_cast<ixtreeme::physics::PhysicsLayer>(row)));
+                for (std::size_t col = 0; col < kLayerCount; ++col)
+                {
+                    ImGui::TableSetColumnIndex(static_cast<int>(col) + 1);
+                    ImGui::PushID(static_cast<int>(row * kLayerCount + col));
+                    bool value = m_physicsLayerMatrix[row][col];
+                    if (ImGui::Checkbox("", &value))
+                    {
+                        m_physicsLayerMatrix[row][col] = value;
+                        m_physicsLayerMatrix[col][row] = value;
+                        matrixChanged = true;
+                    }
+                    ImGui::PopID();
+                }
+            }
+            ImGui::EndTable();
+        }
+        if (matrixChanged)
+        {
+            m_commands.physicsLayerMatrixChanged = true;
+            m_commands.physicsLayerMatrix = m_physicsLayerMatrix;
+            StoreProjectPhysicsSettings();
+            Tracen("[PHYSICS-LAYER] matrix edited");
+        }
     }
 
     const char* modes[] = {

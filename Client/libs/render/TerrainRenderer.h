@@ -104,7 +104,11 @@ public:
                                const WorldCamera& camera,
                                double timeSeconds,
                                const std::function<void(const WorldCamera&, VkExtent2D, VkRenderPass, float)>& renderEntities = {});
-    void Render(VulkanDevice& device, const WorldCamera& camera, VkExtent2D targetExtent = {});
+    // viewIndex selects which camera-uniform path to use: 0 = primary (editor Scene
+    // View / free-fly), 1 = secondary (Game view / project Main Camera). Each view has
+    // its own per-frame uniform buffer + descriptor set so the terrain can be drawn from
+    // two cameras in the same frame without the second draw clobbering the first.
+    void Render(VulkanDevice& device, const WorldCamera& camera, VkExtent2D targetExtent = {}, uint32_t viewIndex = 0);
     void RenderWater(VulkanDevice& device, const WorldCamera& camera, double timeSeconds, VkExtent2D targetExtent = {});
     void RenderSunShadowMap(VulkanDevice& device, const WorldCamera& camera);
     void ResetFrameDrawStats() { m_frameDrawStats = {}; }
@@ -378,7 +382,7 @@ private:
     void DestroyBuffer(Buffer& buffer);
     void DestroyTexture(Texture& texture);
     void DestroyTerrainLayers();
-    void UpdateUniform(uint32_t frameIndex, const WorldCamera& camera, bool reflectionPass = false);
+    void UpdateUniform(uint32_t frameIndex, const WorldCamera& camera, bool reflectionPass = false, uint32_t viewIndex = 0);
     bool CreateShadowResources(VulkanDevice& device);
     bool CreateShadowPipeline();
     void DestroyShadowResources();
@@ -421,10 +425,15 @@ private:
     Buffer m_selectedWaterBodyVertexBuffer;
     Buffer m_selectedWaterBodyIndexBuffer;
     std::array<Buffer, kFramesInFlight> m_uniformBuffers{};
+    // Secondary camera-uniform path for the Game view (project Main Camera). Parallel to
+    // m_uniformBuffers so terrain can be drawn from a second camera in the same frame
+    // without clobbering the primary (free-fly) terrain draw. See Render(viewIndex).
+    std::array<Buffer, kFramesInFlight> m_uniformBuffersSecondary{};
     std::array<Buffer, kFramesInFlight> m_waterUniformBuffers{};
     VkDescriptorSetLayout m_descriptorSetLayout = VK_NULL_HANDLE;
     VkDescriptorPool m_descriptorPool = VK_NULL_HANDLE;
     std::array<VkDescriptorSet, kFramesInFlight> m_descriptorSets{};
+    std::array<VkDescriptorSet, kFramesInFlight> m_descriptorSetsSecondary{};
     std::vector<VkDescriptorSet> m_layerDescriptorSets;
     VkPipelineLayout m_pipelineLayout = VK_NULL_HANDLE;
     VkPipeline m_pipeline = VK_NULL_HANDLE;

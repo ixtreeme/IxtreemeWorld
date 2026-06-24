@@ -228,6 +228,13 @@ void ProjectManager::SetRecentScenes(const std::vector<std::string>& recentScene
     SaveProject(ignored);
 }
 
+void ProjectManager::SetPhysicsCollisionMatrixRows(const std::vector<std::string>& rows)
+{
+    if (!m_hasProject)
+        return;
+    m_project.physicsCollisionMatrixRows = rows;
+}
+
 std::filesystem::path ProjectManager::ProjectRoot() const
 {
     return m_project.rootPath;
@@ -277,6 +284,17 @@ bool ProjectManager::WriteManifest(std::string& error)
     json << "  \"asset_root\": \"" << EscapeJson(m_project.assetRoot) << "\",\n";
     json << "  \"scenes_dir\": \"" << EscapeJson(m_project.scenesDir) << "\",\n";
     json << "  \"startup_scene\": \"" << EscapeJson(m_project.startupScene) << "\",\n";
+    if (!m_project.physicsCollisionMatrixRows.empty())
+    {
+        json << "  \"physics_collision_matrix\": [";
+        for (size_t i = 0; i < m_project.physicsCollisionMatrixRows.size(); ++i)
+        {
+            if (i > 0)
+                json << ", ";
+            json << "\"" << EscapeJson(m_project.physicsCollisionMatrixRows[i]) << "\"";
+        }
+        json << "],\n";
+    }
     json << "  \"recent_scenes\": [";
     for (size_t i = 0; i < m_project.recentScenes.size(); ++i)
     {
@@ -333,6 +351,7 @@ bool ProjectManager::ReadManifest(const std::filesystem::path& manifestPath, std
     loaded.assetRoot = JsonStringValue(text, "asset_root");
     loaded.scenesDir = JsonStringValue(text, "scenes_dir");
     loaded.startupScene = JsonStringValue(text, "startup_scene");
+    loaded.physicsCollisionMatrixRows = JsonStringArrayValue(text, "physics_collision_matrix");
     loaded.recentScenes = JsonStringArrayValue(text, "recent_scenes");
 
     if (loaded.name.empty())

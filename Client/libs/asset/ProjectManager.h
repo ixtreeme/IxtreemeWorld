@@ -14,6 +14,7 @@ struct ProjectData
     std::string scenesDir = "Scenes";
     std::string startupScene;
     std::vector<std::string> recentScenes;
+    std::vector<std::string> physicsCollisionMatrixRows;
     std::filesystem::path manifestPath;
     std::filesystem::path rootPath;
 };
@@ -34,6 +35,7 @@ public:
     bool SaveProject(std::string& error);
 
     void SetRecentScenes(const std::vector<std::string>& recentScenes);
+    void SetPhysicsCollisionMatrixRows(const std::vector<std::string>& rows);
     std::filesystem::path ProjectRoot() const;
     std::filesystem::path AssetRootPath() const;
     std::filesystem::path ScenesPath() const;

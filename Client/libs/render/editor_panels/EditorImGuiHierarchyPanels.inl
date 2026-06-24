@@ -756,6 +756,15 @@ void EditorImGui::MarkSelectedLightChanged()
     m_commands.selectedLight = m_dynamicLightState;
 }
 
+void EditorImGui::MarkSelectedCameraChanged()
+{
+    if (!m_cameraEditorState.selected)
+        return;
+    SceneManager::Instance().MarkDirty();
+    m_commands.selectedCameraChanged = true;
+    m_commands.selectedCamera = m_cameraEditorState.camera;
+}
+
 void EditorImGui::MarkSelectedMeshRendererChanged()
 {
     if (!m_meshRendererState.selected)

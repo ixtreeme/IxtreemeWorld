@@ -40,6 +40,12 @@ public:
         std::function<void()> rebuildStaticMeshSpatialIndex;
         std::function<void()> syncTerrainAssetRoots;
         std::function<void(MeshSceneEntity&)> ensureMeshMaterialSlots;
+
+        std::vector<CameraEntity>* cameras = nullptr;
+        std::uint32_t* nextCameraEntityId = nullptr;
+        std::uint32_t* mainCameraId = nullptr;
+        std::function<EditorCameraState()> captureEditorCamera;
+        std::function<void(const EditorCameraState&)> applyEditorCamera;
     };
 
     explicit EditorSceneRuntime(Context context);

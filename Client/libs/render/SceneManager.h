@@ -12,12 +12,11 @@
 struct SceneData
 {
     std::string name = "Untitled";
-    float cameraPosition[3] = {0.0f, 50.0f, 0.0f};
-    float cameraRotation[4] = {0.0f, 0.0f, 0.0f, 1.0f};
-    float cameraFov = 60.0f;
-    float cameraNear = 0.1f;
-    float cameraFar = 1000.0f;
+    EditorCameraState editorCamera;
+    std::vector<CameraEntity> cameras;
+    std::uint32_t mainCameraId = 0;
     LightingState lighting;
+    PhysicsSceneSettings physics;
     TerrainSceneData terrain;
     std::vector<WaterBody> waterBodies;
     std::vector<PointLight> pointLights;
@@ -44,6 +43,7 @@ public:
     void SetWindowTitleCallback(std::function<void(const std::string&)> callback);
     void SetWindowTitleSuffix(std::string suffix);
     void SetSceneName(const std::string& name);
+    void SetPhysicsSettings(const PhysicsSceneSettings& settings);
 
     const std::string& GetCurrentScenePath() const { return m_currentScenePath; }
     bool IsDirty() const { return m_isDirty; }

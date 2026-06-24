@@ -1004,6 +1004,23 @@ void WriteSceneEntity(std::ostream& out, const SpotLight& light, bool comma)
     out << "    }" << (comma ? "," : "") << "\n";
 }
 
+void WriteSceneEntity(std::ostream& out, const CameraEntity& camera, bool comma)
+{
+    out << "    {\n";
+    out << "      \"type\": \"camera\",\n";
+    out << "      \"id\": " << camera.id << ",\n";
+    out << "      \"name\": \"" << EscapeJson(camera.name) << "\",\n";
+    WritePrefabInstance(out, camera.prefabAssetId, camera.prefabInstance, "      ");
+    WriteParentRef(out, camera.parent, "      ");
+    out << "      \"position\": " << FloatArray(camera.position, 3) << ",\n";
+    out << "      \"rotation\": " << FloatArray(camera.rotation, 3) << ",\n";
+    out << "      \"fov\": " << camera.fovDegrees << ",\n";
+    out << "      \"near\": " << camera.nearPlane << ",\n";
+    out << "      \"far\": " << camera.farPlane << ",\n";
+    out << "      \"editor_hidden\": " << (camera.editorHidden ? "true" : "false") << "\n";
+    out << "    }" << (comma ? "," : "") << "\n";
+}
+
 void WriteMaterialOverride(std::ostream& out, const MeshSceneEntity::MaterialOverride& material, bool comma)
 {
     out << "        {\n";
@@ -1076,6 +1093,8 @@ void WriteRigidbodyComponent(std::ostream& out, const ixtreeme::physics::Rigidbo
     out << "        \"linear_damping\": " << rigidbody.linearDamping << ",\n";
     out << "        \"angular_damping\": " << rigidbody.angularDamping << ",\n";
     out << "        \"use_gravity\": " << (rigidbody.useGravity ? "true" : "false") << ",\n";
+    out << "        \"allow_sleeping\": " << (rigidbody.allowSleeping ? "true" : "false") << ",\n";
+    out << "        \"continuous_collision\": " << (rigidbody.continuousCollision ? "true" : "false") << ",\n";
     out << "        \"freeze_position\": " << BoolArray(rigidbody.freezePosition, 3) << ",\n";
     out << "        \"freeze_rotation\": " << BoolArray(rigidbody.freezeRotation, 3) << "\n";
     out << "      }";
@@ -1093,7 +1112,30 @@ void WriteColliderComponent(std::ostream& out, const ixtreeme::physics::Collider
     out << "        \"height\": " << collider.height << ",\n";
     out << "        \"friction\": " << collider.friction << ",\n";
     out << "        \"restitution\": " << collider.restitution << ",\n";
+    out << "        \"layer\": \"" << ixtreeme::physics::ToString(collider.layer) << "\",\n";
     out << "        \"material_asset_id\": \"" << EscapeJson(collider.materialAssetId) << "\"\n";
+    out << "      }";
+}
+
+void WriteFixedJointComponent(std::ostream& out, const ixtreeme::physics::FixedJointComponent& joint)
+{
+    out << "      \"fixed_joint\": {\n";
+    out << "        \"enabled\": " << (joint.enabled ? "true" : "false") << ",\n";
+    out << "        \"connected_entity_id\": " << joint.connectedEntityId << "\n";
+    out << "      }";
+}
+
+void WriteHingeJointComponent(std::ostream& out, const ixtreeme::physics::HingeJointComponent& joint)
+{
+    out << "      \"hinge_joint\": {\n";
+    out << "        \"enabled\": " << (joint.enabled ? "true" : "false") << ",\n";
+    out << "        \"connected_entity_id\": " << joint.connectedEntityId << ",\n";
+    out << "        \"anchor\": " << FloatArray(joint.anchor, 3) << ",\n";
+    out << "        \"axis\": " << FloatArray(joint.axis, 3) << ",\n";
+    out << "        \"limits_enabled\": " << (joint.limitsEnabled ? "true" : "false") << ",\n";
+    out << "        \"min_angle_deg\": " << joint.minAngleDegrees << ",\n";
+    out << "        \"max_angle_deg\": " << joint.maxAngleDegrees << ",\n";
+    out << "        \"friction_torque\": " << joint.frictionTorque << "\n";
     out << "      }";
 }
 
@@ -1159,11 +1201,25 @@ void WriteSceneEntity(std::ostream& out, const MeshSceneEntity& mesh, bool comma
     {
         out << ",\n";
         WriteColliderComponent(out, mesh.collider);
-        out << "\n";
         Tracenf("[PHYSICS] saved collider entity=%u shape=%s", mesh.id, ixtreeme::physics::ToString(mesh.collider.shape));
     }
-    else
-        out << "\n";
+    if (mesh.hasFixedJoint)
+    {
+        out << ",\n";
+        WriteFixedJointComponent(out, mesh.fixedJoint);
+        Tracenf("[PHYSICS-JOINT] saved fixed entity=%u connected=%u",
+            mesh.id,
+            mesh.fixedJoint.connectedEntityId);
+    }
+    if (mesh.hasHingeJoint)
+    {
+        out << ",\n";
+        WriteHingeJointComponent(out, mesh.hingeJoint);
+        Tracenf("[PHYSICS-JOINT] saved hinge entity=%u connected=%u",
+            mesh.id,
+            mesh.hingeJoint.connectedEntityId);
+    }
+    out << "\n";
     out << "    }" << (comma ? "," : "") << "\n";
 }
 
@@ -1244,6 +1300,24 @@ SpotLight ReadSpotLight(const JsonValue& entity)
     light.outerConeDegrees = ReadFloat(entity, "outer_cone_deg", light.outerConeDegrees);
     light.enabled = ReadBool(entity, "enabled", light.enabled);
     return light;
+}
+
+CameraEntity ReadCameraEntity(const JsonValue& entity)
+{
+    CameraEntity camera;
+    camera.id = ReadU32(entity, "id", camera.id);
+    camera.name = ReadString(entity, "name", camera.name);
+    camera.prefabAssetId = ReadString(entity, "prefab_asset_id");
+    camera.prefabInstance = ReadPrefabInstance(entity, camera.prefabAssetId);
+    camera.prefabAssetId = camera.prefabInstance.assetId;
+    camera.parent = ReadParentRef(entity);
+    ReadFloatArray(entity, "position", camera.position, 3);
+    ReadFloatArray(entity, "rotation", camera.rotation, 3);
+    camera.fovDegrees = ReadFloat(entity, "fov", camera.fovDegrees);
+    camera.nearPlane = ReadFloat(entity, "near", camera.nearPlane);
+    camera.farPlane = ReadFloat(entity, "far", camera.farPlane);
+    camera.editorHidden = ReadBool(entity, "editor_hidden", camera.editorHidden);
+    return camera;
 }
 
 MeshSceneEntity::MaterialOverride ReadMaterialOverride(const JsonValue& object)
@@ -1331,6 +1405,8 @@ ixtreeme::physics::RigidbodyComponent ReadRigidbodyComponent(const JsonValue& en
         rigidbody.linearDamping = ReadFloat(*object, "linear_damping", rigidbody.linearDamping);
         rigidbody.angularDamping = ReadFloat(*object, "angular_damping", rigidbody.angularDamping);
         rigidbody.useGravity = ReadBool(*object, "use_gravity", rigidbody.useGravity);
+        rigidbody.allowSleeping = ReadBool(*object, "allow_sleeping", rigidbody.allowSleeping);
+        rigidbody.continuousCollision = ReadBool(*object, "continuous_collision", rigidbody.continuousCollision);
         ReadBoolArray(*object, "freeze_position", rigidbody.freezePosition, 3);
         ReadBoolArray(*object, "freeze_rotation", rigidbody.freezeRotation, 3);
         ixtreeme::physics::Sanitize(rigidbody);
@@ -1352,10 +1428,39 @@ ixtreeme::physics::ColliderComponent ReadColliderComponent(const JsonValue& enti
         collider.height = ReadFloat(*object, "height", collider.height);
         collider.friction = ReadFloat(*object, "friction", collider.friction);
         collider.restitution = ReadFloat(*object, "restitution", collider.restitution);
+        collider.layer = ixtreeme::physics::PhysicsLayerFromString(ReadString(*object, "layer"), collider.layer);
         collider.materialAssetId = ReadString(*object, "material_asset_id");
         ixtreeme::physics::Sanitize(collider);
     }
     return collider;
+}
+
+ixtreeme::physics::FixedJointComponent ReadFixedJointComponent(const JsonValue& entity)
+{
+    ixtreeme::physics::FixedJointComponent joint;
+    if (const JsonValue* object = Find(entity, "fixed_joint"); object && object->type == JsonValue::Type::Object)
+    {
+        joint.enabled = ReadBool(*object, "enabled", joint.enabled);
+        joint.connectedEntityId = ReadU32(*object, "connected_entity_id", joint.connectedEntityId);
+    }
+    return joint;
+}
+
+ixtreeme::physics::HingeJointComponent ReadHingeJointComponent(const JsonValue& entity)
+{
+    ixtreeme::physics::HingeJointComponent joint;
+    if (const JsonValue* object = Find(entity, "hinge_joint"); object && object->type == JsonValue::Type::Object)
+    {
+        joint.enabled = ReadBool(*object, "enabled", joint.enabled);
+        joint.connectedEntityId = ReadU32(*object, "connected_entity_id", joint.connectedEntityId);
+        ReadFloatArray(*object, "anchor", joint.anchor, 3);
+        ReadFloatArray(*object, "axis", joint.axis, 3);
+        joint.limitsEnabled = ReadBool(*object, "limits_enabled", joint.limitsEnabled);
+        joint.minAngleDegrees = ReadFloat(*object, "min_angle_deg", joint.minAngleDegrees);
+        joint.maxAngleDegrees = ReadFloat(*object, "max_angle_deg", joint.maxAngleDegrees);
+        joint.frictionTorque = std::max(0.0f, ReadFloat(*object, "friction_torque", joint.frictionTorque));
+    }
+    return joint;
 }
 
 MeshSceneEntity ReadMeshSceneEntity(const JsonValue& entity)
@@ -1403,6 +1508,16 @@ MeshSceneEntity ReadMeshSceneEntity(const JsonValue& entity)
         mesh.hasCollider = true;
         mesh.collider = ReadColliderComponent(entity);
     }
+    if (Find(entity, "fixed_joint"))
+    {
+        mesh.hasFixedJoint = true;
+        mesh.fixedJoint = ReadFixedJointComponent(entity);
+    }
+    if (Find(entity, "hinge_joint"))
+    {
+        mesh.hasHingeJoint = true;
+        mesh.hingeJoint = ReadHingeJointComponent(entity);
+    }
     if (mesh.lod.enabled &&
         std::none_of(mesh.editorComponents.begin(), mesh.editorComponents.end(), [](const EditorAttachedComponent& component) {
             return component.type == "rendering.lod";
@@ -1426,12 +1541,15 @@ MeshSceneEntity ReadMeshSceneEntity(const JsonValue& entity)
             mesh.id,
             mesh.lod.config.levelCount,
             mesh.lod.overrideAssetDefault ? 1 : 0);
-    if (mesh.hasRigidbody || mesh.hasCollider)
-        Tracenf("[PHYSICS] restored entity=%u rigidbody=%d collider=%d shape=%s",
+    if (mesh.hasRigidbody || mesh.hasCollider || mesh.hasFixedJoint || mesh.hasHingeJoint)
+        Tracenf("[PHYSICS] restored entity=%u rigidbody=%d collider=%d fixed=%d hinge=%d shape=%s layer=%s",
             mesh.id,
             mesh.hasRigidbody ? 1 : 0,
             mesh.hasCollider ? 1 : 0,
-            mesh.hasCollider ? ixtreeme::physics::ToString(mesh.collider.shape) : "none");
+            mesh.hasFixedJoint ? 1 : 0,
+            mesh.hasHingeJoint ? 1 : 0,
+            mesh.hasCollider ? ixtreeme::physics::ToString(mesh.collider.shape) : "none",
+            mesh.hasCollider ? ixtreeme::physics::ToString(mesh.collider.layer) : "none");
     return mesh;
 }
 }
@@ -1487,19 +1605,34 @@ bool SceneManager::ConsumePendingScene(SceneData& outScene)
     return true;
 }
 
+static void EnsureSceneMainCamera(SceneData& scene)
+{
+    if (scene.cameras.empty())
+    {
+        CameraEntity camera;
+        camera.id = 1;
+        scene.cameras.push_back(camera);
+    }
+    const bool mainValid = std::any_of(scene.cameras.begin(), scene.cameras.end(),
+        [&](const CameraEntity& cam) { return cam.id == scene.mainCameraId; });
+    if (!mainValid)
+        scene.mainCameraId = scene.cameras.front().id;
+}
+
 void SceneManager::NewScene()
 {
     if (m_isDirty && !PromptSaveBeforeAction("New Scene"))
         return;
 
     m_currentScene = SceneData{};
+    EnsureSceneMainCamera(m_currentScene);
     m_currentScenePath.clear();
     m_sceneOpen = true;
     m_isDirty = false;
     m_pendingScene = m_currentScene;
     m_hasPendingScene = true;
     UpdateWindowTitle();
-    Tracen("[SCENE] New empty scene created");
+    Tracenf("[SCENE] New empty scene created (Main Camera id=%u)", m_currentScene.mainCameraId);
 }
 
 bool SceneManager::LoadScene(const std::string& path)
@@ -1546,6 +1679,25 @@ void SceneManager::SetSceneName(const std::string& name)
     MarkDirty();
 }
 
+void SceneManager::SetPhysicsSettings(const PhysicsSceneSettings& settings)
+{
+    PhysicsSceneSettings sanitized = settings;
+    for (float& value : sanitized.gravity)
+        value = std::clamp(value, -1000.0f, 1000.0f);
+    sanitized.fixedDeltaSeconds = std::clamp(sanitized.fixedDeltaSeconds, 0.001f, 0.1f);
+    sanitized.maxSubsteps = std::clamp(sanitized.maxSubsteps, 1u, 16u);
+    if (std::abs(m_currentScene.physics.gravity[0] - sanitized.gravity[0]) <= 0.0001f &&
+        std::abs(m_currentScene.physics.gravity[1] - sanitized.gravity[1]) <= 0.0001f &&
+        std::abs(m_currentScene.physics.gravity[2] - sanitized.gravity[2]) <= 0.0001f &&
+        std::abs(m_currentScene.physics.fixedDeltaSeconds - sanitized.fixedDeltaSeconds) <= 0.000001f &&
+        m_currentScene.physics.maxSubsteps == sanitized.maxSubsteps)
+    {
+        return;
+    }
+    m_currentScene.physics = sanitized;
+    MarkDirty();
+}
+
 void SceneManager::MarkDirty()
 {
     if (!m_isDirty)
@@ -1588,14 +1740,13 @@ bool SceneManager::LoadSceneInternal(const std::string& path)
     {
         scene.name = ReadString(*metadata, "name", SceneNameFromPath(path));
     }
-    if (const JsonValue* camera = Find(root, "camera"))
+    if (const JsonValue* editorCamera = Find(root, "editor_camera"))
     {
-        ReadFloatArray(*camera, "position", scene.cameraPosition, 3);
-        ReadFloatArray(*camera, "rotation", scene.cameraRotation, 4);
-        scene.cameraFov = ReadFloat(*camera, "fov", scene.cameraFov);
-        scene.cameraNear = ReadFloat(*camera, "near", scene.cameraNear);
-        scene.cameraFar = ReadFloat(*camera, "far", scene.cameraFar);
+        ReadFloatArray(*editorCamera, "eye", scene.editorCamera.eye, 3);
+        scene.editorCamera.yaw = ReadFloat(*editorCamera, "yaw", scene.editorCamera.yaw);
+        scene.editorCamera.pitch = ReadFloat(*editorCamera, "pitch", scene.editorCamera.pitch);
     }
+    scene.mainCameraId = ReadU32(root, "main_camera_id", scene.mainCameraId);
     if (const JsonValue* env = Find(root, "environment"))
     {
         scene.lighting.directional.elevationDegrees = ReadFloat(*env, "directional_light_angle_x", scene.lighting.directional.elevationDegrees);
@@ -1612,6 +1763,26 @@ bool SceneManager::LoadSceneInternal(const std::string& path)
         scene.lighting.ambient.r = ambientColor[0];
         scene.lighting.ambient.g = ambientColor[1];
         scene.lighting.ambient.b = ambientColor[2];
+    }
+    if (const JsonValue* physics = Find(root, "physics"); physics && physics->type == JsonValue::Type::Object)
+    {
+        ReadFloatArray(*physics, "gravity", scene.physics.gravity, 3);
+        for (float& value : scene.physics.gravity)
+            value = std::clamp(value, -1000.0f, 1000.0f);
+        scene.physics.fixedDeltaSeconds = std::clamp(
+            ReadFloat(*physics, "fixed_delta_seconds", scene.physics.fixedDeltaSeconds),
+            0.001f,
+            0.1f);
+        scene.physics.maxSubsteps = std::clamp(
+            ReadU32(*physics, "max_substeps", scene.physics.maxSubsteps),
+            1u,
+            16u);
+        Tracenf("[PHYSICS] scene settings loaded gravity=(%.2f,%.2f,%.2f) fixedDt=%.4f maxSubsteps=%u",
+            scene.physics.gravity[0],
+            scene.physics.gravity[1],
+            scene.physics.gravity[2],
+            scene.physics.fixedDeltaSeconds,
+            scene.physics.maxSubsteps);
     }
     const std::filesystem::path sceneDir = std::filesystem::path(path).parent_path();
     if (const JsonValue* terrain = Find(root, "terrain"); terrain && terrain->type == JsonValue::Type::Object)
@@ -1728,6 +1899,10 @@ bool SceneManager::LoadSceneInternal(const std::string& path)
             {
                 scene.meshEntities.push_back(ReadMeshSceneEntity(entity));
             }
+            else if (type == "camera")
+            {
+                scene.cameras.push_back(ReadCameraEntity(entity));
+            }
             else
             {
                 Tracenf("[SCENE] Unknown entity type: %s", type.c_str());
@@ -1755,6 +1930,8 @@ bool SceneManager::LoadSceneInternal(const std::string& path)
     scene.lighting.numSpotLights = static_cast<std::uint32_t>(std::min<std::size_t>(scene.spotLights.size(), kMaxDynamicSpotLights));
     for (std::uint32_t i = 0; i < scene.lighting.numSpotLights; ++i)
         scene.lighting.spotLights[i] = scene.spotLights[i];
+
+    EnsureSceneMainCamera(scene);
 
     m_currentScene = scene;
     m_pendingScene = scene;
@@ -1825,13 +2002,12 @@ bool SceneManager::SaveSceneInternal(const std::string& path)
     out << "    \"author\": \"editor\",\n";
     out << "    \"modified_at\": \"" << TimestampUtc() << "\"\n";
     out << "  },\n";
-    out << "  \"camera\": {\n";
-    out << "    \"position\": " << FloatArray(scene.cameraPosition, 3) << ",\n";
-    out << "    \"rotation\": " << FloatArray(scene.cameraRotation, 4) << ",\n";
-    out << "    \"fov\": " << scene.cameraFov << ",\n";
-    out << "    \"near\": " << scene.cameraNear << ",\n";
-    out << "    \"far\": " << scene.cameraFar << "\n";
+    out << "  \"editor_camera\": {\n";
+    out << "    \"eye\": " << FloatArray(scene.editorCamera.eye, 3) << ",\n";
+    out << "    \"yaw\": " << scene.editorCamera.yaw << ",\n";
+    out << "    \"pitch\": " << scene.editorCamera.pitch << "\n";
     out << "  },\n";
+    out << "  \"main_camera_id\": " << scene.mainCameraId << ",\n";
     out << "  \"environment\": {\n";
     out << "    \"time_of_day\": 12.0,\n";
     const float dirColor[3] = {scene.lighting.directional.r, scene.lighting.directional.g, scene.lighting.directional.b};
@@ -1842,6 +2018,11 @@ bool SceneManager::SaveSceneInternal(const std::string& path)
     const float ambientColor[3] = {scene.lighting.ambient.r, scene.lighting.ambient.g, scene.lighting.ambient.b};
     out << "    \"ambient_color\": " << FloatArray(ambientColor, 3) << ",\n";
     out << "    \"ambient_intensity\": " << scene.lighting.ambient.intensity << "\n";
+    out << "  },\n";
+    out << "  \"physics\": {\n";
+    out << "    \"gravity\": " << FloatArray(scene.physics.gravity, 3) << ",\n";
+    out << "    \"fixed_delta_seconds\": " << scene.physics.fixedDeltaSeconds << ",\n";
+    out << "    \"max_substeps\": " << scene.physics.maxSubsteps << "\n";
     out << "  },\n";
     if (scene.terrain.exists)
     {
@@ -1871,7 +2052,8 @@ bool SceneManager::SaveSceneInternal(const std::string& path)
     out << "  \"entities\": [\n";
 
     const size_t entityCount =
-        scene.waterBodies.size() + scene.pointLights.size() + scene.spotLights.size() + scene.meshEntities.size();
+        scene.waterBodies.size() + scene.pointLights.size() + scene.spotLights.size() +
+        scene.meshEntities.size() + scene.cameras.size();
     size_t entityIndex = 0;
     for (const WaterBody& body : scene.waterBodies)
     {
@@ -1886,6 +2068,8 @@ bool SceneManager::SaveSceneInternal(const std::string& path)
         WriteSceneEntity(out, light, ++entityIndex < entityCount);
     for (const MeshSceneEntity& mesh : scene.meshEntities)
         WriteSceneEntity(out, mesh, ++entityIndex < entityCount);
+    for (const CameraEntity& camera : scene.cameras)
+        WriteSceneEntity(out, camera, ++entityIndex < entityCount);
 
     out << "  ],\n";
     out << "  \"terrain_palette\": [\n";

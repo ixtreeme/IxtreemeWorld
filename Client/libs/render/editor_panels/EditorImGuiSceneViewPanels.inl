@@ -141,6 +141,13 @@ void EditorImGui::RenderSceneViewDropTarget()
 
     if (!ImGui::Begin("Scene View", nullptr, flags))
     {
+        // Scene View is not visible (e.g. the Game tab is in front in the same dock).
+        // Invalidate its viewport input rect so mouse input over the now-hidden region
+        // does not leak into scene picking / object manipulation, and so the free-fly
+        // camera input gate (which keys off this rect) does not misfire.
+        m_viewportInputDiagnostics.sceneViewRectValid = false;
+        m_viewportInputDiagnostics.sceneViewHovered = false;
+        m_viewportInputDiagnostics.sceneViewFocused = false;
         ImGui::End();
         return;
     }
@@ -364,7 +371,14 @@ void EditorImGui::RenderSceneViewGizmo(const ImVec2& imageMin, const ImVec2& ima
     for (int i = 0; i < 3; ++i)
         outRotationDegrees[i] = UnwrapDegreesNear(outRotationDegrees[i], Degrees(m_sceneGizmoRotation[i]));
 
+    const bool editingColliderCenter =
+        m_editSelectedColliderInScene &&
+        m_sceneGizmoEntityType == HierarchyEntityType::MeshEntity &&
+        m_meshRendererState.selected &&
+        m_meshRendererState.id == m_sceneGizmoEntityId &&
+        m_meshRendererState.hasCollider;
     if (m_sceneGizmoOperation == MapEditorGizmoOperation::Translate &&
+        !editingColliderCenter &&
         (m_sceneGizmoEntityType == HierarchyEntityType::MeshEntity ||
             m_sceneGizmoEntityType == HierarchyEntityType::WaterBody))
     {
@@ -406,8 +420,12 @@ void EditorImGui::RenderSceneViewGizmo(const ImVec2& imageMin, const ImVec2& ima
     }
 
     m_commands.sceneGizmoTransformChanged = true;
+    m_commands.sceneGizmoTarget = editingColliderCenter
+        ? SceneGizmoTargetKind::ColliderCenter
+        : SceneGizmoTargetKind::Object;
     m_commands.sceneGizmoEntityType = m_sceneGizmoEntityType;
     m_commands.sceneGizmoEntityId = m_sceneGizmoEntityId;
+    m_commands.sceneGizmoOperation = m_sceneGizmoOperation;
     for (int i = 0; i < 3; ++i)
     {
         m_commands.sceneGizmoPosition[i] = outTranslation[i];
@@ -418,6 +436,53 @@ void EditorImGui::RenderSceneViewGizmo(const ImVec2& imageMin, const ImVec2& ima
     std::copy(std::begin(m_commands.sceneGizmoPosition), std::end(m_commands.sceneGizmoPosition), m_sceneGizmoPosition);
     std::copy(std::begin(m_commands.sceneGizmoRotation), std::end(m_commands.sceneGizmoRotation), m_sceneGizmoRotation);
     std::copy(std::begin(m_commands.sceneGizmoScale), std::end(m_commands.sceneGizmoScale), m_sceneGizmoScale);
+}
+
+void EditorImGui::RenderGameViewPanel()
+{
+    ImGuiWindowFlags flags =
+        ImGuiWindowFlags_NoScrollbar |
+        ImGuiWindowFlags_NoScrollWithMouse |
+        ImGuiWindowFlags_NoCollapse;
+    if (!ImGui::Begin("Game", nullptr, flags))
+    {
+        ImGui::End();
+        return;
+    }
+
+    const ImVec2 regionMin = ImGui::GetCursorScreenPos();
+    const ImVec2 avail = ImGui::GetContentRegionAvail();
+    ImVec2 imageMin = regionMin;
+    ImVec2 imageSize = avail;
+    if (avail.x > 1.0f && avail.y > 1.0f &&
+        m_gameViewExtent.width > 0 && m_gameViewExtent.height > 0)
+    {
+        const float targetAspect = static_cast<float>(m_gameViewExtent.width) /
+            static_cast<float>(m_gameViewExtent.height);
+        const float availableAspect = avail.x / avail.y;
+        if (availableAspect > targetAspect)
+        {
+            imageSize.x = avail.y * targetAspect;
+            imageMin.x += (avail.x - imageSize.x) * 0.5f;
+        }
+        else
+        {
+            imageSize.y = avail.x / targetAspect;
+            imageMin.y += (avail.y - imageSize.y) * 0.5f;
+        }
+    }
+    if (m_gameViewDescriptor && avail.x > 1.0f && avail.y > 1.0f)
+    {
+        ImGui::SetCursorScreenPos(imageMin);
+        ImGui::Image(reinterpret_cast<ImTextureID>(m_gameViewDescriptor), imageSize);
+    }
+    else if (avail.x > 1.0f && avail.y > 1.0f)
+    {
+        ImGui::BeginDisabled();
+        ImGui::TextUnformatted("Game render target unavailable");
+        ImGui::EndDisabled();
+    }
+    ImGui::End();
 }
 
 void EditorImGui::OpenProjectDialog(ProjectDialogMode mode)
@@ -481,6 +546,7 @@ void EditorImGui::ActivateCurrentProject()
     AssetDatabase::Instance().scan(projects.ProjectRoot());
     AssetWatcher::Instance().start(projects.ProjectRoot());
     InitializeProjectAssetLibrary(projects.ProjectRoot(), projects.AssetRootPath());
+    LoadProjectPhysicsSettings();
     SceneManager::Instance().CloseScene();
     const bool openedScene = LoadProjectStartupScene();
     const bool createdScene = openedScene ? false : CreateDefaultProjectScene();

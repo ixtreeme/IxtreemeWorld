@@ -13,6 +13,7 @@
 #include <vulkan/vulkan.h>
 
 #include <cstdint>
+#include <cstddef>
 #include <array>
 #include <filesystem>
 #include <functional>
@@ -65,6 +66,7 @@ public:
     void Render(VulkanDevice& device);
     void OnRenderPassChanged(VulkanDevice& device);
     void SetSceneViewTexture(VkSampler sampler, VkImageView imageView, VkImageLayout layout, VkExtent2D extent);
+    void SetGameViewTexture(VkSampler sampler, VkImageView imageView, VkImageLayout layout, VkExtent2D extent);
     void SetSceneViewSelectionOutline(std::vector<std::array<float, 4>> segments);
     void SetSceneViewGizmo(HierarchyEntityType type,
                            std::uint32_t id,
@@ -88,10 +90,12 @@ public:
     void SetLightingState(const LightingState& state);
     LightingState GetLightingState() const { return m_lightingState; }
     void SetDynamicLightEditorState(const DynamicLightEditorState& state);
+    void SetCameraEditorState(const CameraEditorState& state);
     void SetWaterBodyEditorState(const WaterBodyEditorState& state);
     void SetMeshRendererEditorState(const MeshRendererEditorState& state);
     void SetTerrainEditorState(const TerrainEditorState& state);
     void SetEngineStats(const EngineStats& stats);
+    void SetPhysicsEvents(std::vector<PhysicsEventEditorState> events);
     void SetHierarchySceneState(std::uint64_t sceneRootEntity,
                                 std::string sceneRootName,
                                 std::vector<HierarchySceneEntity> entities);
@@ -107,6 +111,7 @@ public:
     void ImportExternalFiles(const std::vector<std::string>& paths, const char* trigger = "dragdrop");
     std::optional<LodConfig> FindModelLodDefault(const std::string& assetId) const;
     bool SaveModelLodDefault(const std::string& assetId, const LodConfig& config);
+    std::optional<AssetLibrary::PhysicsMaterialData> FindPhysicsMaterial(const std::string& id) const;
     bool OpenWaterMaterialEditor(const std::string& materialId);
     bool OpenPbrMaterialEditor(const std::string& materialId);
     MapEditorCommands ConsumeCommands();
@@ -122,6 +127,7 @@ private:
         Animation,
         Material,
         WaterMaterial,
+        PhysicsMaterial,
         Scene,
         Prefab
     };
@@ -176,12 +182,16 @@ private:
     void RenderDemoPanels();
     void RenderDockSpace();
     void RenderSceneViewDropTarget();
+    void RenderGameViewPanel();
     void RenderSceneViewGizmo(const ImVec2& imageMin, const ImVec2& imageSize);
     void ReleaseSceneViewTextureDescriptor();
+    void ReleaseGameViewTextureDescriptor();
     void RenderMenuBar();
     bool SaveProjectAndCurrentScene(bool automatic = false);
     void RunProjectAutoSave();
     void UpdateAutoSaveWindowTitle(double now);
+    void LoadProjectPhysicsSettings();
+    void StoreProjectPhysicsSettings();
     void RenderProjectModal();
     void RenderProjectBrowser(bool pickProjectFile);
     void OpenProjectDialog(ProjectDialogMode mode);
@@ -222,6 +232,7 @@ private:
     void RenderSelectedWaterBodyInspector();
     void RenderSelectedTerrainInspector();
     void RenderSelectedLightInspector();
+    void RenderSelectedCameraInspector();
     void RenderSelectedMeshRendererInspector();
     bool RenderSelectedMeshPhysicsComponents();
     void RenderPrefabOverrideControls(const std::string& assetId,
@@ -256,6 +267,7 @@ private:
     void RenderPbrMaterialEditor();
     void RenderPbrMaterialHeader();
     void RenderPbrTextureSlot(const char* label, std::string& textureId, bool& changed);
+    bool RenderSelectedPhysicsMaterialAssetInspector();
     bool RenderSelectedPrefabAssetInspector();
     void RenderAssetBrowser();
     void RenderAssetBrowserToolbar();
@@ -285,6 +297,7 @@ private:
     void CreatePbrMaterialAsset();
     void CreateWaterMaterialAsset();
     bool CreateWaterMaterialAsset(const std::string& displayName, AssetLibrary::Entry& outEntry);
+    void CreatePhysicsMaterialAsset();
     void AssignAssetToSelectedWaterBody(const std::string& assetId);
     void AssignAssetToSelectedMeshRenderer(const std::string& assetId);
     void MarkWaterMaterialChanged(const char* field);
@@ -322,6 +335,7 @@ private:
     void ApplyTimeOfDayPreset(float hour);
     void MarkSelectedWaterBodyChanged();
     void MarkSelectedLightChanged();
+    void MarkSelectedCameraChanged();
     void MarkSelectedMeshRendererChanged();
     void HandleEditorHotkeys();
     bool CanUseEditorTools() const;
@@ -368,6 +382,36 @@ private:
     bool m_debugDisableAssetWatcherPoll = false;
     bool m_debugDisableHierarchyIteration = false;
     bool m_debugShowPhysicsColliders = false;
+    bool m_debugShowPhysicsContacts = false;
+    bool m_debugShowPhysicsBodyCenters = false;
+    std::uint32_t m_physicsRaycastLayerMask = ixtreeme::physics::AllPhysicsLayerMask();
+    bool m_physicsRaycastHitTriggers = true;
+    float m_physicsRaycastDistance = 500.0f;
+    std::uint32_t m_physicsOverlapLayerMask = ixtreeme::physics::AllPhysicsLayerMask();
+    bool m_physicsOverlapHitTriggers = true;
+    float m_physicsOverlapDistance = 20.0f;
+    float m_physicsOverlapRadius = 2.0f;
+    float m_physicsOverlapBoxHalfExtents[3] = {1.0f, 1.0f, 1.0f};
+    float m_physicsOverlapCapsuleRadius = 0.5f;
+    float m_physicsOverlapCapsuleHeight = 2.0f;
+    float m_physicsTestLinearVelocity[3] = {0.0f, 0.0f, 0.0f};
+    float m_physicsTestForce[3] = {0.0f, 20.0f, 0.0f};
+    float m_physicsTestImpulse[3] = {0.0f, 5.0f, 0.0f};
+    float m_physicsTestAngularImpulse[3] = {0.0f, 1.0f, 0.0f};
+    bool m_editSelectedColliderInScene = false;
+    PhysicsLayerMatrix m_physicsLayerMatrix = [] {
+        PhysicsLayerMatrix matrix{};
+        for (std::size_t a = 0; a < static_cast<std::size_t>(ixtreeme::physics::PhysicsLayer::Count); ++a)
+        {
+            for (std::size_t b = 0; b < static_cast<std::size_t>(ixtreeme::physics::PhysicsLayer::Count); ++b)
+            {
+                matrix[a][b] = ixtreeme::physics::DefaultLayerCollision(
+                    static_cast<ixtreeme::physics::PhysicsLayer>(a),
+                    static_cast<ixtreeme::physics::PhysicsLayer>(b));
+            }
+        }
+        return matrix;
+    }();
     int m_renderResolutionMode = 0;
     int m_customRenderResolutionWidth = 1920;
     int m_customRenderResolutionHeight = 1080;
@@ -377,12 +421,18 @@ private:
     float m_gizmoSnapValue = 1.0f;
     MapEditorSettings m_editorSettings;
     EditorPlayModeState m_playModeState;
+    // When entering/leaving Play mode, the viewport auto-switches between the Scene
+    // View (free-fly editor camera) and the Game view (project Main Camera). Holds the
+    // pending ImGui window to focus, applied at the start of the next panel render.
+    const char* m_pendingViewFocusWindow = nullptr;
     LightingState m_lightingState;
     DynamicLightEditorState m_dynamicLightState;
+    CameraEditorState m_cameraEditorState;
     WaterBodyEditorState m_waterBodyState;
     MeshRendererEditorState m_meshRendererState;
     TerrainEditorState m_terrainState;
     EngineStats m_engineStats;
+    std::vector<PhysicsEventEditorState> m_physicsEvents;
     MapEditorCommands m_commands;
     std::array<MapEditorPaletteSlot, 8> m_paletteSlots{};
     std::vector<std::pair<std::string, WaterMaterialData>> m_waterMaterials;
@@ -479,6 +529,14 @@ private:
     VkSampler m_sceneViewDescriptorSampler = VK_NULL_HANDLE;
     VkImageView m_sceneViewDescriptorImageView = VK_NULL_HANDLE;
     VkImageLayout m_sceneViewDescriptorImageLayout = VK_IMAGE_LAYOUT_UNDEFINED;
+    VkSampler m_gameViewSampler = VK_NULL_HANDLE;
+    VkImageView m_gameViewImageView = VK_NULL_HANDLE;
+    VkImageLayout m_gameViewImageLayout = VK_IMAGE_LAYOUT_UNDEFINED;
+    VkExtent2D m_gameViewExtent{};
+    VkDescriptorSet m_gameViewDescriptor = VK_NULL_HANDLE;
+    VkSampler m_gameViewDescriptorSampler = VK_NULL_HANDLE;
+    VkImageView m_gameViewDescriptorImageView = VK_NULL_HANDLE;
+    VkImageLayout m_gameViewDescriptorImageLayout = VK_IMAGE_LAYOUT_UNDEFINED;
     bool m_sceneViewKeyboardFocus = false;
     std::vector<std::array<float, 4>> m_sceneViewSelectionOutline;
     bool m_viewportDropTargetLogged = false;

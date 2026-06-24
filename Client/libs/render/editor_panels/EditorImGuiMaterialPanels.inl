@@ -510,6 +510,72 @@ void EditorImGui::RenderSelectedTerrainInspector()
     ImGui::Text("Vertices: %llu", static_cast<unsigned long long>(verts));
 }
 
+bool EditorImGui::RenderSelectedPhysicsMaterialAssetInspector()
+{
+    if (!m_assetInspectorSelectionActive || !m_assetLibrary || m_selectedAssetId.empty())
+        return false;
+
+    const auto entry = m_assetLibrary->FindById(m_selectedAssetId);
+    if (!entry || entry->category != AssetLibrary::Category::PhysicsMaterial)
+        return false;
+
+    AssetLibrary::PhysicsMaterialData material = entry->physicsMaterial;
+    bool changed = false;
+
+    UI::SectionHeader(ICON_FA_GEAR " Physics Material Asset");
+    ImGui::TextDisabled("Asset ID: %s", entry->id.c_str());
+    ImGui::TextDisabled("File: %s", m_assetLibrary->AbsolutePath(*entry).generic_string().c_str());
+    ImGui::Separator();
+
+    changed |= ImGui::SliderFloat("Friction", &material.friction, 0.0f, 4.0f, "%.2f");
+    changed |= ImGui::SliderFloat("Bounciness", &material.restitution, 0.0f, 1.0f, "%.2f");
+    changed |= ImGui::DragFloat("Density", &material.density, 0.05f, 0.001f, 1000.0f, "%.3f");
+    changed |= ImGui::DragFloat("Linear Damping", &material.linearDamping, 0.01f, 0.0f, 100.0f, "%.3f");
+    changed |= ImGui::DragFloat("Angular Damping", &material.angularDamping, 0.01f, 0.0f, 100.0f, "%.3f");
+    auto combineCombo = [](const char* label, ixtreeme::physics::PhysicsMaterialCombineMode& mode) {
+        const char* modes[] = {"Average", "Minimum", "Maximum", "Multiply"};
+        int index = mode == ixtreeme::physics::PhysicsMaterialCombineMode::Minimum ? 1 :
+            (mode == ixtreeme::physics::PhysicsMaterialCombineMode::Maximum ? 2 :
+            (mode == ixtreeme::physics::PhysicsMaterialCombineMode::Multiply ? 3 : 0));
+        if (!ImGui::Combo(label, &index, modes, IM_ARRAYSIZE(modes)))
+            return false;
+        mode = index == 1 ? ixtreeme::physics::PhysicsMaterialCombineMode::Minimum :
+            (index == 2 ? ixtreeme::physics::PhysicsMaterialCombineMode::Maximum :
+            (index == 3 ? ixtreeme::physics::PhysicsMaterialCombineMode::Multiply :
+                ixtreeme::physics::PhysicsMaterialCombineMode::Average));
+        return true;
+    };
+    changed |= combineCombo("Friction Combine", material.frictionCombine);
+    changed |= combineCombo("Bounce Combine", material.restitutionCombine);
+
+    if (changed)
+    {
+        AssetLibrary::Entry updated{};
+        std::string error;
+        if (m_assetLibrary->UpdatePhysicsMaterial(entry->id, material, updated, error))
+        {
+            m_assetStatus = "Physics material saved: " + updated.displayName;
+            Tracenf("[PHYSICS-MAT] inspector updated id=%s friction=%.2f bounce=%.2f density=%.3f damping=(%.3f,%.3f) combine=(%s,%s)",
+                updated.id.c_str(),
+                updated.physicsMaterial.friction,
+                updated.physicsMaterial.restitution,
+                updated.physicsMaterial.density,
+                updated.physicsMaterial.linearDamping,
+                updated.physicsMaterial.angularDamping,
+                ixtreeme::physics::ToString(updated.physicsMaterial.frictionCombine),
+                ixtreeme::physics::ToString(updated.physicsMaterial.restitutionCombine));
+        }
+        else
+        {
+            m_assetStatus = "Physics material save failed: " + error;
+            ImGui::TextColored(ImVec4(0.95f, 0.35f, 0.28f, 1.0f), "%s", m_assetStatus.c_str());
+        }
+    }
+
+    ImGui::TextWrapped("Assigned colliders use these values when the Play physics world is built. Combine modes control how this material mixes with the other collider in a contact.");
+    return true;
+}
+
 bool EditorImGui::RenderSelectedPrefabAssetInspector()
 {
     if (!m_assetInspectorSelectionActive || !m_assetLibrary || m_selectedAssetId.empty())
@@ -932,7 +998,10 @@ void EditorImGui::RenderInspector()
 {
     if (ImGui::Begin("Inspector"))
     {
-        if (RenderSelectedPrefabAssetInspector())
+        if (RenderSelectedPhysicsMaterialAssetInspector())
+        {
+        }
+        else if (RenderSelectedPrefabAssetInspector())
         {
         }
         else if (m_terrainState.selected)
@@ -941,6 +1010,8 @@ void EditorImGui::RenderInspector()
             RenderSelectedWaterBodyInspector();
         else if (m_dynamicLightState.type != DynamicLightType::None)
             RenderSelectedLightInspector();
+        else if (m_cameraEditorState.selected)
+            RenderSelectedCameraInspector();
         else if (m_meshRendererState.selected)
             RenderSelectedMeshRendererInspector();
         else

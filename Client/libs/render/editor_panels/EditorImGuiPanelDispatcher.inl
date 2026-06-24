@@ -19,6 +19,7 @@ void EditorImGui::RenderEditorPanels()
     RenderAssetBrowser();
     RenderInspector();
     RenderSceneViewDropTarget();
+    RenderGameViewPanel();
     RenderWaterSculptToolPanel();
     RenderHeightmapToolPanel();
     RenderSplatPaintToolPanel();
@@ -27,6 +28,24 @@ void EditorImGui::RenderEditorPanels()
     RenderPbrMaterialEditor();
     RenderCreatePbrMaterialPopup();
     RenderFbxExportPopup();
+
+    // Auto-switch the active viewport tab on Play/Stop: Game (project Main Camera)
+    // while playing, Scene View (free-fly editor camera) while editing. ImGui's public
+    // focus API does not reliably select a docked tab, so set the dock node's selected
+    // tab directly (imgui_internal), with SetWindowFocus as a fallback for the
+    // non-docked (floating / side-by-side) layout.
+    if (m_pendingViewFocusWindow)
+    {
+        ImGuiWindow* viewWindow = ImGui::FindWindowByName(m_pendingViewFocusWindow);
+        if (viewWindow != nullptr && viewWindow->DockNode != nullptr)
+        {
+            if (viewWindow->DockNode->TabBar != nullptr)
+                viewWindow->DockNode->TabBar->NextSelectedTabId = viewWindow->TabId;
+            viewWindow->DockNode->SelectedTabId = viewWindow->TabId;
+        }
+        ImGui::SetWindowFocus(m_pendingViewFocusWindow);
+        m_pendingViewFocusWindow = nullptr;
+    }
 }
 
 void EditorImGui::RenderTreeGeneratorPanel()

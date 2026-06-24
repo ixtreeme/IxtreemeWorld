@@ -23,7 +23,8 @@ enum class SelectedEditorObjectType
     PointLight,
     SpotLight,
     WaterBody,
-    MeshEntity
+    MeshEntity,
+    Camera
 };
 
 struct SelectedEditorObject
@@ -166,6 +167,7 @@ SceneGizmoTarget BuildSceneGizmoTarget(const SelectedEditorObject& selected,
                                        const std::vector<PointLight>& pointLights,
                                        const std::vector<SpotLight>& spotLights,
                                        const std::vector<WaterBody>& waterBodies,
+                                       const std::vector<CameraEntity>& cameras,
                                        const StaticMeshResolver& resolveStaticMesh);
 
 bool ApplySceneGizmoToMesh(MeshSceneEntity& mesh,
@@ -176,3 +178,4 @@ bool ApplySceneGizmoToMesh(MeshSceneEntity& mesh,
 bool ApplySceneGizmoToPointLight(PointLight& light, const float* position, const float* scale);
 bool ApplySceneGizmoToSpotLight(SpotLight& light, const float* position, const float* rotation, const float* scale);
 bool ApplySceneGizmoToWaterBody(WaterBody& body, const float* position, const float* scale);
+bool ApplySceneGizmoToCamera(CameraEntity& camera, const float* position, const float* rotation);
