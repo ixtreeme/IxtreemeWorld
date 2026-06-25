@@ -158,7 +158,7 @@ private:
     bool CreateComputeDescriptors();
     bool CreateComputePipeline();
     bool VerifyComputeSkin(VulkanDevice& device);
-    bool SkinPose(float animTimeSeconds, bool updateBounds, bool logSamples);
+    bool SkinPose(float animTimeSeconds, bool updateBounds, bool logSamples, MotionState state = MotionState::Idle);
     bool UploadBonePalette(MotionState state, float animTimeSeconds, uint32_t frameIndex, uint32_t skinSlot);
     bool UploadBonePalette(float animTimeSeconds, uint32_t frameIndex);
     void DispatchSkin(VkCommandBuffer cmd, uint32_t frameIndex, uint32_t skinSlot);

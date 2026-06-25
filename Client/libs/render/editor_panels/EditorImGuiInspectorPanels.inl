@@ -1512,6 +1512,18 @@ void EditorImGui::RenderPerformancePanel()
     ImGui::Text("Render Target: %u x %u",
         m_engineStats.renderWidth,
         m_engineStats.renderHeight);
+    if (m_engineStats.presentUncapped)
+        ImGui::TextDisabled("Present: UNCAPPED (no vsync)");
+    else
+        ImGui::TextColored(ImVec4(1.0f, 0.7f, 0.2f, 1.0f), "Present: FIFO / VSYNC-CAPPED (FPS limited to monitor Hz)");
+    ImGui::Separator();
+    ImGui::TextDisabled("CPU frame breakdown (previous frame):");
+    ImGui::Text("  Total CPU:          %.2f ms", m_engineStats.cpuTotalMs);
+    ImGui::Text("  Scene render:       %.2f ms", m_engineStats.cpuSceneRenderMs);
+    ImGui::Text("  Editor UI (ImGui):  %.2f ms", m_engineStats.cpuEditorUiMs);
+    ImGui::Text("  Submit / Present:   %.2f ms", m_engineStats.cpuSubmitPresentMs);
+    ImGui::Text("  ECS update:         %.2f ms", m_engineStats.cpuEcsUpdateMs);
+    ImGui::Text("  Asset watcher poll: %.2f ms", m_engineStats.cpuAssetWatcherMs);
     ImGui::Separator();
     ImGui::Text("Math backend: %s", ixtreeme::math::simd::ActiveBackendName());
     static ixtreeme::math::diagnostics::SelfCheckResult mathSelfCheck = ixtreeme::math::diagnostics::RunSelfCheck();

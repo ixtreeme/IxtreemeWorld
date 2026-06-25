@@ -588,6 +588,15 @@ struct EngineStats
     std::size_t sceneEntityCount = 0;
     std::size_t staticMeshSubmitted = 0;
     std::size_t staticMeshDrawCalls = 0;
+    // Frame timing breakdown (previous frame's CPU profile + present mode), for the
+    // Performance panel so the cost source is visible without a debug-logs build.
+    bool presentUncapped = true;
+    double cpuTotalMs = 0.0;
+    double cpuSceneRenderMs = 0.0;
+    double cpuEditorUiMs = 0.0;
+    double cpuSubmitPresentMs = 0.0;
+    double cpuEcsUpdateMs = 0.0;
+    double cpuAssetWatcherMs = 0.0;
 };
 
 struct PhysicsEventEditorState

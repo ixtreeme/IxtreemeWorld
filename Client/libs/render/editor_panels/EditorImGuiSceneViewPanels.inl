@@ -446,9 +446,13 @@ void EditorImGui::RenderGameViewPanel()
         ImGuiWindowFlags_NoCollapse;
     if (!ImGui::Begin("Game", nullptr, flags))
     {
+        // Window collapsed or its dock tab is inactive — not visible, so the engine can
+        // skip rendering the Game view this frame.
+        m_gameViewVisible = false;
         ImGui::End();
         return;
     }
+    m_gameViewVisible = true;
 
     const ImVec2 regionMin = ImGui::GetCursorScreenPos();
     const ImVec2 avail = ImGui::GetContentRegionAvail();

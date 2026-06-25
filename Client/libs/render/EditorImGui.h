@@ -67,6 +67,9 @@ public:
     void OnRenderPassChanged(VulkanDevice& device);
     void SetSceneViewTexture(VkSampler sampler, VkImageView imageView, VkImageLayout layout, VkExtent2D extent);
     void SetGameViewTexture(VkSampler sampler, VkImageView imageView, VkImageLayout layout, VkExtent2D extent);
+    // True when the Game panel was actually visible (active dock tab, not collapsed) last
+    // frame. Lets the engine skip the expensive Game-view scene render when it's not shown.
+    bool IsGameViewVisible() const { return m_gameViewVisible; }
     void SetSceneViewSelectionOutline(std::vector<std::array<float, 4>> segments);
     void SetSceneViewGizmo(HierarchyEntityType type,
                            std::uint32_t id,
@@ -533,6 +536,7 @@ private:
     VkImageView m_gameViewImageView = VK_NULL_HANDLE;
     VkImageLayout m_gameViewImageLayout = VK_IMAGE_LAYOUT_UNDEFINED;
     VkExtent2D m_gameViewExtent{};
+    bool m_gameViewVisible = false;
     VkDescriptorSet m_gameViewDescriptor = VK_NULL_HANDLE;
     VkSampler m_gameViewDescriptorSampler = VK_NULL_HANDLE;
     VkImageView m_gameViewDescriptorImageView = VK_NULL_HANDLE;

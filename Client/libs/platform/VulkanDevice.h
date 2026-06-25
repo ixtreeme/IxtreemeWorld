@@ -80,6 +80,9 @@ public:
     VkCommandBuffer GetCommandBuffer() const { return m_commandBuffers[m_currentFrame]; }
     uint32_t GetFrameIndex() const { return m_currentFrame; }
     VkExtent2D GetSwapchainExtent() const { return m_swapchainExtent; }
+    // False when the swapchain fell back to FIFO (vsync) — i.e. FPS is capped to the
+    // monitor refresh. True for IMMEDIATE/MAILBOX (uncapped).
+    bool IsPresentUncapped() const { return m_swapchainPresentMode != VK_PRESENT_MODE_FIFO_KHR; }
     VkFormat GetSwapchainFormat() const { return m_swapchainFormat; }
     VkFormat GetDepthStencilFormat() const { return m_depthStencilFormat; }
     VkSurfaceTransformFlagBitsKHR GetSurfaceTransform() const { return m_currentTransform; }
@@ -158,6 +161,7 @@ private:
     VkSwapchainKHR m_swapchain = VK_NULL_HANDLE;
     VkFormat m_swapchainFormat = VK_FORMAT_UNDEFINED;
     VkExtent2D m_swapchainExtent{};
+    VkPresentModeKHR m_swapchainPresentMode = VK_PRESENT_MODE_FIFO_KHR;
     VkSurfaceTransformFlagBitsKHR m_currentTransform = VK_SURFACE_TRANSFORM_IDENTITY_BIT_KHR;
     std::vector<VkImage> m_swapchainImages;
     std::vector<VkImageView> m_swapchainImageViews;

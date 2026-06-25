@@ -844,6 +844,7 @@ bool VulkanDevice::CreateSwapchain(uint32_t width, uint32_t height)
     create.preTransform = preTransform;
     create.compositeAlpha = VK_COMPOSITE_ALPHA_OPAQUE_BIT_KHR;
     create.presentMode = ChooseUncappedPresentMode(support.presentModes);
+    m_swapchainPresentMode = create.presentMode;
     create.clipped = VK_TRUE;
 
     LogFormat("[VULKAN] Swap-chain create: preTransform=%s presentMode=%s uncapped=%s imageExtent=%u x %u requestedWindow=%u x %u",

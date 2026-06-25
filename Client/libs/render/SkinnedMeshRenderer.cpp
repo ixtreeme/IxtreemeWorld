@@ -50,10 +50,14 @@ struct SkinnedMeshRenderer::OzzRuntime
 {
     ozz::animation::Skeleton skeleton;
     ozz::animation::Animation idle;
+    ozz::animation::Animation walk;
+    ozz::animation::Animation run;
     ozz::animation::SamplingJob::Context context;
     std::vector<ozz::math::SoaTransform> locals;
     std::vector<ozz::math::Float4x4> models;
     bool hasIdle = false;
+    bool hasWalk = false;
+    bool hasRun = false;
 };
 
 namespace
@@ -1524,6 +1528,53 @@ bool SkinnedMeshRenderer::LoadGltfMesh(const std::string& modelPath)
     if (!m_assets)
         return false;
 
+    // The glTF/GLB asset-import path doesn't generate ozz skeleton/animation sidecars (only
+    // FBX did), so a rigged .glb has no _skeleton.ozz and would fail to load as skinned.
+    // Generate them on demand here from the glTF via Assimp (LoadGltfMesh below remaps the
+    // mesh's bone indices to this ozz skeleton BY JOINT NAME, so the two stay consistent).
+    {
+        std::filesystem::path gltfPath(modelPath);
+        if (gltfPath.is_relative())
+        {
+            if (auto root = m_assets->RootPath())
+                gltfPath = *root / gltfPath;
+            else
+                gltfPath = std::filesystem::absolute(gltfPath);
+        }
+        std::error_code canonicalEc;
+        const std::filesystem::path canonicalGltf = std::filesystem::weakly_canonical(gltfPath, canonicalEc);
+        if (!canonicalEc)
+            gltfPath = canonicalGltf;
+        const std::filesystem::path stemSkeleton = gltfPath.parent_path() /
+            (gltfPath.stem().string() + "_skeleton.ozz");
+        const std::filesystem::path legacySkeleton = gltfPath.parent_path() / "skeleton.ozz";
+        if (!std::filesystem::exists(stemSkeleton) && !std::filesystem::exists(legacySkeleton))
+        {
+            AssimpImporter importer;
+            const AssimpImporter::ImportResult result = importer.importFile(gltfPath);
+            if (result.success && result.skeleton && !result.skeleton->bones.empty())
+            {
+                std::vector<std::filesystem::path> animationPaths;
+                for (std::size_t i = 0; i < result.animations.size(); ++i)
+                    animationPaths.push_back(gltfPath.parent_path() /
+                        (gltfPath.stem().string() + "_anim_" + std::to_string(i) + ".ozz"));
+                std::string ozzError;
+                if (!importer.writeOzzSidecars(result, stemSkeleton, animationPaths, ozzError))
+                    LogFormat("[GLTF] skinned sidecar generation failed path=%s error=%s",
+                        gltfPath.generic_string().c_str(), ozzError.c_str());
+                else
+                    LogFormat("[GLTF] generated skinned sidecars path=%s animations=%zu",
+                        gltfPath.generic_string().c_str(), animationPaths.size());
+            }
+            else
+            {
+                LogFormat("[GLTF] skinned sidecar skipped path=%s reason=%s",
+                    gltfPath.generic_string().c_str(),
+                    result.success ? "no_skeleton" : "import_failed");
+            }
+        }
+    }
+
     if (!LoadOzzPose(modelPath))
         return false;
     const std::string dir = DirectoryOf(modelPath);
@@ -1991,24 +2042,31 @@ bool SkinnedMeshRenderer::LoadOzzPose(const std::string& modelPath)
     m_ozz->models.resize(static_cast<size_t>(m_ozz->skeleton.num_joints()));
     m_ozz->context.Resize(m_ozz->skeleton.num_joints());
 
-    const std::string stemIdlePath = dir + "/" + stem + "_anim_0.ozz";
-    const std::string legacyIdlePath = dir + "/idle.ozz";
-    const std::string idlePath = m_assets->ReadAll(stemIdlePath).has_value()
-        ? stemIdlePath
-        : legacyIdlePath;
-    if (ReadOzzObject(*m_assets, idlePath, m_ozz->idle) &&
-        m_ozz->idle.num_tracks() == m_ozz->skeleton.num_joints())
-    {
-        m_ozz->hasIdle = true;
-        LogFormat("[OZZ] loaded skeleton=%s bones=%u idle=%s duration=%.3f",
-            skeletonPath.c_str(), m_boneCount, idlePath.c_str(), m_ozz->idle.duration());
-    }
-    else
-    {
-        m_ozz->hasIdle = false;
-        LogFormat("[OZZ] loaded skeleton=%s bones=%u; idle.ozz missing or incompatible, using rest pose",
-            skeletonPath.c_str(), m_boneCount);
-    }
+    // Load up to three motion clips: idle (_anim_0), walk (_anim_1), run (_anim_2). Each is
+    // optional; a missing/incompatible clip is simply skipped and the renderer falls back to
+    // idle (then rest pose) at sample time. This lets walk/run light up automatically once a
+    // character model with multiple animation clips is imported.
+    auto loadClip = [&](const std::string& stemSuffix, const std::string& legacyName,
+                        ozz::animation::Animation& anim) -> bool {
+        const std::string stemPath = dir + "/" + stem + stemSuffix;
+        const std::string legacyPath = dir + "/" + legacyName;
+        const std::string path = m_assets->ReadAll(stemPath).has_value() ? stemPath : legacyPath;
+        if (ReadOzzObject(*m_assets, path, anim) &&
+            anim.num_tracks() == m_ozz->skeleton.num_joints())
+        {
+            LogFormat("[OZZ] loaded clip=%s duration=%.3f", path.c_str(), anim.duration());
+            return true;
+        }
+        return false;
+    };
+    m_ozz->hasIdle = loadClip("_anim_0.ozz", "idle.ozz", m_ozz->idle);
+    m_ozz->hasWalk = loadClip("_anim_1.ozz", "walk.ozz", m_ozz->walk);
+    m_ozz->hasRun = loadClip("_anim_2.ozz", "run.ozz", m_ozz->run);
+    LogFormat("[OZZ] loaded skeleton=%s bones=%u clips: idle=%s walk=%s run=%s",
+        skeletonPath.c_str(), m_boneCount,
+        m_ozz->hasIdle ? "yes" : "no",
+        m_ozz->hasWalk ? "yes" : "no",
+        m_ozz->hasRun ? "yes" : "no");
     return true;
 }
 
@@ -2025,19 +2083,29 @@ float SkinnedMeshRenderer::GroundOffsetY() const
     return -m_bounds.min[1];
 }
 
-bool SkinnedMeshRenderer::SkinPose(float animTimeSeconds, bool updateBounds, bool logSamples)
+bool SkinnedMeshRenderer::SkinPose(float animTimeSeconds, bool updateBounds, bool logSamples, MotionState state)
 {
     if (!m_ozz || m_boneCount == 0)
         return false;
 
-    if (m_ozz->hasIdle)
+    // Select the clip for the requested motion state, falling back to idle (then the rest
+    // pose) when the requested clip isn't loaded.
+    const ozz::animation::Animation* clip = nullptr;
+    if (state == MotionState::Walk && m_ozz->hasWalk)
+        clip = &m_ozz->walk;
+    else if (state == MotionState::Run && m_ozz->hasRun)
+        clip = &m_ozz->run;
+    else if (m_ozz->hasIdle)
+        clip = &m_ozz->idle;
+
+    if (clip)
     {
-        const float duration = m_ozz->idle.duration();
+        const float duration = clip->duration();
         const float ratio = duration > 0.0f
             ? std::fmod(std::max(animTimeSeconds, 0.0f), duration) / duration
             : 0.0f;
         ozz::animation::SamplingJob samplingJob;
-        samplingJob.animation = &m_ozz->idle;
+        samplingJob.animation = clip;
         samplingJob.context = &m_ozz->context;
         samplingJob.ratio = ratio;
         samplingJob.output = ozz::make_span(m_ozz->locals);
@@ -2159,8 +2227,7 @@ bool SkinnedMeshRenderer::UploadBonePalette(MotionState state, float animTimeSec
         return false;
     }
 
-    (void)state;
-    if (!SkinPose(animTimeSeconds, false, false))
+    if (!SkinPose(animTimeSeconds, false, false, state))
         return false;
 
     const VkDeviceSize size = sizeof(Mat4) * m_bonePaletteCpu.size();

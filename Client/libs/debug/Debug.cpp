@@ -27,6 +27,24 @@ void LogLine(const char* text)
 #else
     std::fprintf(stderr, "%s\n", text);
 #endif
+#if !defined(__ANDROID__)
+    // Also append to a log file so logs are capturable from the GUI app (whose stderr a
+    // shell redirect can't reach). Opened once (truncating) in the working directory.
+    static std::FILE* s_logFile = []() -> std::FILE* {
+        std::FILE* file = nullptr;
+#if defined(_MSC_VER)
+        fopen_s(&file, "ixtreeme_engine.log", "w");
+#else
+        file = std::fopen("ixtreeme_engine.log", "w");
+#endif
+        return file;
+    }();
+    if (s_logFile != nullptr)
+    {
+        std::fprintf(s_logFile, "%s\n", text);
+        std::fflush(s_logFile);
+    }
+#endif
 }
 
 void LogFormatV(const char* format, va_list args)
