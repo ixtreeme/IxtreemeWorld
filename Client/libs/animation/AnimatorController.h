@@ -44,6 +44,29 @@ struct AnimatorCondition
     float value = 0.0f;
 };
 
+// Stage 5: a state's motion is either a single clip or a blend tree (children blended by a param).
+enum class BlendTreeType
+{
+    Single,   // use AnimatorState::clipId (legacy / default)
+    Blend1D,  // blend children along one Float param (threshold per child)
+    Blend2D   // blend children in a 2D param space (position per child) — Chunk 4
+};
+
+struct BlendTreeChild
+{
+    std::string clipId;
+    float threshold = 0.0f;            // Blend1D: param value at which this child reaches full weight
+    float position[2] = {0.0f, 0.0f};  // Blend2D: child position in (X,Y) param space
+};
+
+struct BlendTree
+{
+    BlendTreeType type = BlendTreeType::Single;
+    std::string blendParam;            // X-axis Float param (Blend1D + Blend2D)
+    std::string blendParamY;           // Y-axis Float param (Blend2D only)
+    std::vector<BlendTreeChild> children;  // Blend1D: kept sorted by threshold (at apply/bind time)
+};
+
 struct AnimatorState
 {
     std::uint32_t id = 0;
@@ -53,6 +76,7 @@ struct AnimatorState
     std::string speedParam;    // optional Float param multiplying speed
     bool loop = true;
     float graphPos[2] = {0.0f, 0.0f};  // node-graph editor position (Stage 6)
+    BlendTree blendTree;       // Stage 5: motion source when type != Single (else clipId is used)
 };
 
 static constexpr std::uint32_t kAnyStateId = 0xFFFFFFFFu;

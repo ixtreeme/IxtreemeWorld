@@ -556,6 +556,13 @@ struct AnimatorGraphParameter
     float defaultValue = 0.0f;
 };
 
+// Stage 5: one child motion of a blend tree (display copy for the inspector).
+struct AnimatorGraphBlendChild
+{
+    std::string clipId;
+    float threshold = 0.0f;            // 1D
+    float pos[2] = {0.0f, 0.0f};       // 2D
+};
 struct AnimatorGraphNode
 {
     std::uint32_t id = 0;            // AnimatorState::id (or 0xFFFFFFFF for Any-State, 0 for Entry)
@@ -569,6 +576,11 @@ struct AnimatorGraphNode
     bool isAnyState = false;
     bool isEntry = false;
     bool isActive = false;          // Stage 7 live highlight (== current state in Play)
+    // Stage 5 blend tree (motion source when blendTreeType != 0; else clipId is used).
+    int blendTreeType = 0;          // 0 Single, 1 Blend1D, 2 Blend2D
+    std::string blendParam;         // X-axis param (1D + 2D)
+    std::string blendParamY;        // Y-axis param (2D)
+    std::vector<AnimatorGraphBlendChild> blendChildren;
 };
 struct AnimatorGraphEdge
 {
@@ -602,7 +614,10 @@ enum class AnimatorGraphEditType
 {
     MoveNode, AddState, DeleteState, RenameState, AssignClip, SetStateSpeed, SetStateLoop,
     SetDefaultState, CreateTransition, DeleteTransition, EditTransition,
-    AddParameter, DeleteParameter, RenameParameter, SetParameterType, SetParameterDefault
+    AddParameter, DeleteParameter, RenameParameter, SetParameterType, SetParameterDefault,
+    // Stage 5 blend tree:
+    SetStateMotionType, SetStateBlendParam, SetStateBlendParamY,
+    AddBlendTreeChild, DeleteBlendTreeChild, EditBlendTreeChild
 };
 struct AnimatorGraphEdit
 {
@@ -611,15 +626,17 @@ struct AnimatorGraphEdit
     std::uint32_t toStateId = 0;     // transition target
     float graphDeltaX = 0.0f;        // MoveNode: centroid-invariant delta (graph units)
     float graphDeltaY = 0.0f;
-    float floatValue = 0.0f;         // SetStateSpeed / SetParameterDefault
+    float floatValue = 0.0f;         // SetStateSpeed / SetParameterDefault / child threshold
     bool boolValue = false;          // SetStateLoop
-    std::string text;                // AddState/RenameState name, AssignClip clipId, param name
-    std::string text2;               // RenameParameter new name
+    int intValue = -1;               // blend-tree child index (Delete/EditBlendTreeChild)
+    std::string text;                // AddState/RenameState name, AssignClip/child clipId, param name
+    std::string text2;               // RenameParameter new name / motion type ("single"|"1d"|"2d")
     AnimEditParamType paramType = AnimEditParamType::Float;
     bool hasExitTime = false;        // EditTransition payload:
     float exitTime = 0.0f;
     float duration = 0.15f;
     bool canTransitionToSelf = false;
+    float vec2Value[2] = {0.0f, 0.0f};  // 2D child position (EditBlendTreeChild)
     std::vector<AnimatorGraphCondition> conditions;
 };
 

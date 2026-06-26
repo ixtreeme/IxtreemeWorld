@@ -28,7 +28,12 @@ void EditorImGui::RenderAnimatorPanel()
     const bool showTransitionEditor = m_animatorGraphState.hasController && m_animatorEditEdgeValid;
     const bool showStateInspector = m_animatorGraphState.hasController && !showTransitionEditor &&
         m_animatorSelectedStateId != 0u && m_animatorSelectedStateId != 0xFFFFFFFFu;
-    const float inspectorStripH = showTransitionEditor ? 210.0f : (showStateInspector ? 132.0f : 0.0f);
+    int selStateMotionType = 0;  // 0 Single, 1 1D, 2 2D — a blend-tree state needs a taller strip
+    if (showStateInspector)
+        for (const AnimatorGraphNode& n : m_animatorGraphState.nodes)
+            if (n.id == m_animatorSelectedStateId) { selStateMotionType = n.blendTreeType; break; }
+    const float stateStripH = (selStateMotionType != 0) ? 244.0f : 132.0f;
+    const float inspectorStripH = showTransitionEditor ? 210.0f : (showStateInspector ? stateStripH : 0.0f);
     const ImVec2 canvasMin(origin.x + paramPanelW, origin.y);
     const ImVec2 canvasSize(availSize.x - paramPanelW, availSize.y - inspectorStripH);
     const ImVec2 canvasMax(canvasMin.x + canvasSize.x, canvasMin.y + canvasSize.y);
@@ -522,42 +527,216 @@ void EditorImGui::RenderAnimatorPanel()
         if (selNode != nullptr && !selNode->isEntry && !selNode->isAnyState)
         {
             ImGui::SetCursorScreenPos(ImVec2(canvasMin.x + 6.0f, canvasMax.y + 4.0f));
-            ImGui::BeginGroup();
+            ImGui::BeginChild("##anim_state_inspector", ImVec2(canvasSize.x - 12.0f, inspectorStripH - 8.0f), true);
             ImGui::TextUnformatted(selNode->name.c_str());
-            ImGui::TextDisabled("Clip");
-            ImGui::SameLine();
 
             const std::vector<AssetLibrary::Entry> clips =
                 m_assetLibrary->EntriesFor(AssetLibrary::Category::AnimationClip);
-            std::string preview = "(no clip)";
-            for (const AssetLibrary::Entry& e : clips)
-                if (e.id == selNode->clipId) { preview = e.displayName; break; }
+            // Renders a clip combo; on a pick, writes the chosen clip id (empty = "(no clip)") into
+            // outClip and returns true.
+            auto clipCombo = [&](const char* id, float width, const std::string& current,
+                                 std::string& outClip) -> bool {
+                std::string preview = "(no clip)";
+                for (const AssetLibrary::Entry& e : clips)
+                    if (e.id == current) { preview = e.displayName; break; }
+                bool changed = false;
+                ImGui::SetNextItemWidth(width);
+                if (ImGui::BeginCombo(id, preview.c_str()))
+                {
+                    if (ImGui::Selectable("(no clip)", current.empty())) { outClip.clear(); changed = true; }
+                    for (const AssetLibrary::Entry& entry : clips)
+                    {
+                        const bool isSel = (entry.id == current);
+                        if (ImGui::Selectable(entry.displayName.c_str(), isSel)) { outClip = entry.id; changed = true; }
+                        if (isSel) ImGui::SetItemDefaultFocus();
+                    }
+                    ImGui::EndCombo();
+                }
+                return changed;
+            };
 
-            ImGui::SetNextItemWidth(280.0f);
-            if (ImGui::BeginCombo("##anim_state_clip", preview.c_str()))
+            // Motion type selector (2D editing arrives in Chunk 4).
+            const char* motionNames[] = {"Single", "1D Blend", "2D Blend"};
+            const int motionIdx = std::clamp(selNode->blendTreeType, 0, 2);
+            ImGui::TextDisabled("Motion");
+            ImGui::SameLine();
+            ImGui::SetNextItemWidth(150.0f);
+            if (ImGui::BeginCombo("##anim_motion", motionNames[motionIdx]))
             {
-                if (ImGui::Selectable("(no clip)", selNode->clipId.empty()))
+                for (int m = 0; m < 3; ++m)
+                    if (ImGui::Selectable(motionNames[m], m == motionIdx))
+                    {
+                        AnimatorGraphEdit e;
+                        e.type = AnimatorGraphEditType::SetStateMotionType;
+                        e.stateId = m_animatorSelectedStateId;
+                        e.text2 = (m == 1) ? "1d" : (m == 2) ? "2d" : "single";
+                        m_commands.animatorEdits.push_back(std::move(e));
+                    }
+                ImGui::EndCombo();
+            }
+
+            if (motionIdx == 0)  // single clip
+            {
+                ImGui::TextDisabled("Clip");
+                ImGui::SameLine();
+                std::string newClip;
+                if (clipCombo("##anim_state_clip", 280.0f, selNode->clipId, newClip))
                 {
                     AnimatorGraphEdit clipEdit;
                     clipEdit.type = AnimatorGraphEditType::AssignClip;
                     clipEdit.stateId = m_animatorSelectedStateId;
+                    clipEdit.text = newClip;
                     m_commands.animatorEdits.push_back(std::move(clipEdit));
                 }
-                for (const AssetLibrary::Entry& entry : clips)
-                {
-                    const bool isSel = (entry.id == selNode->clipId);
-                    if (ImGui::Selectable(entry.displayName.c_str(), isSel))
+            }
+            else if (motionIdx == 1 || motionIdx == 2)  // 1D / 2D blend tree
+            {
+                const bool is2D = (motionIdx == 2);
+
+                auto blendParamCombo = [&](const char* id, const std::string& current,
+                                           AnimatorGraphEditType editType) {
+                    ImGui::SetNextItemWidth(120.0f);
+                    if (ImGui::BeginCombo(id, current.empty() ? "(param)" : current.c_str()))
                     {
-                        AnimatorGraphEdit clipEdit;
-                        clipEdit.type = AnimatorGraphEditType::AssignClip;
-                        clipEdit.stateId = m_animatorSelectedStateId;
-                        clipEdit.text = entry.id;
-                        m_commands.animatorEdits.push_back(std::move(clipEdit));
+                        for (const AnimatorGraphParameter& p : m_animatorGraphState.parameters)
+                            if (p.type == AnimEditParamType::Float || p.type == AnimEditParamType::Int)
+                                if (ImGui::Selectable(p.name.c_str(), p.name == current))
+                                {
+                                    AnimatorGraphEdit e;
+                                    e.type = editType;
+                                    e.stateId = m_animatorSelectedStateId;
+                                    e.text = p.name;
+                                    m_commands.animatorEdits.push_back(std::move(e));
+                                }
+                        ImGui::EndCombo();
                     }
-                    if (isSel)
-                        ImGui::SetItemDefaultFocus();
+                };
+
+                ImGui::TextDisabled(is2D ? "Param X" : "Param");
+                ImGui::SameLine();
+                blendParamCombo("##anim_blend_param", selNode->blendParam,
+                    AnimatorGraphEditType::SetStateBlendParam);
+                if (is2D)
+                {
+                    ImGui::SameLine();
+                    ImGui::TextDisabled("Y");
+                    ImGui::SameLine();
+                    blendParamCombo("##anim_blend_paramy", selNode->blendParamY,
+                        AnimatorGraphEditType::SetStateBlendParamY);
                 }
-                ImGui::EndCombo();
+
+                ImGui::TextDisabled(is2D ? "Motions (clip @ X, Y)" : "Motions (clip @ threshold)");
+
+                // Commit-on-release numeric field (one field edited at a time, keyed by state+child+axis).
+                static std::uint32_t s_childEditState = 0;
+                static int s_childEditIdx = -1;
+                static int s_childEditAxis = 0;
+                static float s_childEditVal = 0.0f;
+                auto editNum = [&](const char* fid, int childIdx, int axis, float current,
+                                   bool& committed) -> float {
+                    const bool editing = (s_childEditState == m_animatorSelectedStateId &&
+                                          s_childEditIdx == childIdx && s_childEditAxis == axis);
+                    float v = editing ? s_childEditVal : current;
+                    ImGui::SetNextItemWidth(58.0f);
+                    ImGui::DragFloat(fid, &v, 0.05f, 0.0f, 0.0f, "%.2f");
+                    if (ImGui::IsItemActivated())
+                    {
+                        s_childEditState = m_animatorSelectedStateId;
+                        s_childEditIdx = childIdx;
+                        s_childEditAxis = axis;
+                        s_childEditVal = current;
+                    }
+                    if (ImGui::IsItemActive())
+                        s_childEditVal = v;
+                    committed = ImGui::IsItemDeactivatedAfterEdit();
+                    if (committed || ImGui::IsItemDeactivated())
+                    {
+                        s_childEditState = 0;
+                        s_childEditIdx = -1;
+                    }
+                    return v;
+                };
+
+                int delChild = -1;
+                for (int i = 0; i < static_cast<int>(selNode->blendChildren.size()); ++i)
+                {
+                    ImGui::PushID(i);
+                    const AnimatorGraphBlendChild& ch = selNode->blendChildren[i];
+
+                    std::string newClip;
+                    if (clipCombo("##c", 130.0f, ch.clipId, newClip))
+                    {
+                        AnimatorGraphEdit e;
+                        e.type = AnimatorGraphEditType::EditBlendTreeChild;
+                        e.stateId = m_animatorSelectedStateId;
+                        e.intValue = i;
+                        e.text = newClip;
+                        e.floatValue = ch.threshold;
+                        e.vec2Value[0] = ch.pos[0];
+                        e.vec2Value[1] = ch.pos[1];
+                        m_commands.animatorEdits.push_back(std::move(e));
+                    }
+
+                    if (is2D)
+                    {
+                        ImGui::SameLine();
+                        bool cx = false, cy = false;
+                        const float nx = editNum("##px", i, 0, ch.pos[0], cx);
+                        ImGui::SameLine();
+                        const float ny = editNum("##py", i, 1, ch.pos[1], cy);
+                        if (cx || cy)
+                        {
+                            AnimatorGraphEdit e;
+                            e.type = AnimatorGraphEditType::EditBlendTreeChild;
+                            e.stateId = m_animatorSelectedStateId;
+                            e.intValue = i;
+                            e.text = ch.clipId;
+                            e.floatValue = ch.threshold;
+                            e.vec2Value[0] = cx ? nx : ch.pos[0];
+                            e.vec2Value[1] = cy ? ny : ch.pos[1];
+                            m_commands.animatorEdits.push_back(std::move(e));
+                        }
+                    }
+                    else
+                    {
+                        ImGui::SameLine();
+                        bool commit = false;
+                        const float nthr = editNum("##thr", i, 0, ch.threshold, commit);
+                        if (commit)
+                        {
+                            AnimatorGraphEdit e;
+                            e.type = AnimatorGraphEditType::EditBlendTreeChild;
+                            e.stateId = m_animatorSelectedStateId;
+                            e.intValue = i;
+                            e.text = ch.clipId;
+                            e.floatValue = nthr;
+                            e.vec2Value[0] = ch.pos[0];
+                            e.vec2Value[1] = ch.pos[1];
+                            m_commands.animatorEdits.push_back(std::move(e));
+                        }
+                    }
+
+                    ImGui::SameLine();
+                    if (ImGui::SmallButton("X"))
+                        delChild = i;
+                    ImGui::PopID();
+                }
+                if (delChild >= 0)
+                {
+                    AnimatorGraphEdit e;
+                    e.type = AnimatorGraphEditType::DeleteBlendTreeChild;
+                    e.stateId = m_animatorSelectedStateId;
+                    e.intValue = delChild;
+                    m_commands.animatorEdits.push_back(std::move(e));
+                }
+                if (ImGui::SmallButton("+ Add Motion"))
+                {
+                    AnimatorGraphEdit e;
+                    e.type = AnimatorGraphEditType::AddBlendTreeChild;
+                    e.stateId = m_animatorSelectedStateId;
+                    e.floatValue = 0.0f;
+                    m_commands.animatorEdits.push_back(std::move(e));
+                }
             }
 
             // Speed (commit on release via a backing value so we don't save once per drag-frame).
@@ -597,7 +776,7 @@ void EditorImGui::RenderAnimatorPanel()
                 loopEdit.boolValue = loopVal;
                 m_commands.animatorEdits.push_back(std::move(loopEdit));
             }
-            ImGui::EndGroup();
+            ImGui::EndChild();
         }
     }
 

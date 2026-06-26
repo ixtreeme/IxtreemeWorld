@@ -14,6 +14,7 @@
 #include <unordered_map>
 #include <vector>
 
+#include <ozz/animation/runtime/blending_job.h>
 #include <ozz/base/maths/soa_transform.h>
 #include <ozz/base/span.h>
 
@@ -42,7 +43,13 @@ struct AnimatorRuntime
     // One ClipPlayback per state's clip id, bound to THIS entity's skeleton (lazy; a default-
     // constructed/!ready entry is cached for clips that fail to load, to avoid per-frame retries).
     std::unordered_map<std::string, ClipPlayback> clipPlaybacks;
-    std::vector<ozz::math::SoaTransform> blendedLocals;  // crossfade output buffer
+    std::vector<ozz::math::SoaTransform> blendedLocals;  // final crossfade output buffer
+    // Stage 5: each transition side is evaluated to its OWN buffer (a state may be a blend tree of
+    // several clips), then the two are crossfaded into blendedLocals — three distinct outputs, no
+    // aliasing. treeLayerScratch is the reused per-tree BlendingJob layer list (no per-frame heap).
+    std::vector<ozz::math::SoaTransform> stateLocalsA;
+    std::vector<ozz::math::SoaTransform> stateLocalsB;
+    std::vector<ozz::animation::BlendingJob::Layer> treeLayerScratch;
 
     int targetNumJoints = 0;
     int targetNumSoa = 0;

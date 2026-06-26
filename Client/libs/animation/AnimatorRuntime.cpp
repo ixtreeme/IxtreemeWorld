@@ -2,6 +2,7 @@
 
 #include <algorithm>
 #include <cmath>
+#include <utility>
 
 #include <ozz/animation/runtime/blending_job.h>
 
@@ -96,6 +97,220 @@ float AdvancePhase(float normTime, float dt, float speed, float duration, bool l
     return normTime;
 }
 
+// The clip whose duration drives a state's phase: the single clip, or a blend tree's first child
+// (children are authored to share a comparable loop length, so any one works as the phase length).
+const std::string& StatePhaseClipId(const AnimatorState& state)
+{
+    if (state.blendTree.type != BlendTreeType::Single && !state.blendTree.children.empty())
+        return state.blendTree.children.front().clipId;
+    return state.clipId;
+}
+
+float StateDuration(AnimatorRuntime& rt, const AnimatorState& state, const ClipPathResolver& resolveClipPath)
+{
+    ClipPlayback* pb = EnsurePlayback(rt, StatePhaseClipId(state), resolveClipPath);
+    return (pb && pb->clip) ? pb->clip->duration : 0.0f;
+}
+
+// 1D bracket-and-lerp weights over thresholds (sorted locally so authoring order is irrelevant).
+// At most two children are non-zero; weights sum to 1. weights is indexed by ORIGINAL child index.
+void Compute1DWeights(const std::vector<BlendTreeChild>& children, float param, std::vector<float>& weights)
+{
+    weights.assign(children.size(), 0.0f);
+    if (children.empty())
+        return;
+    std::vector<std::pair<float, std::size_t>> order;  // (threshold, child index)
+    order.reserve(children.size());
+    for (std::size_t i = 0; i < children.size(); ++i)
+        order.emplace_back(children[i].threshold, i);
+    std::sort(order.begin(), order.end(),
+        [](const std::pair<float, std::size_t>& a, const std::pair<float, std::size_t>& b) {
+            return a.first < b.first;
+        });
+
+    if (order.size() == 1 || param <= order.front().first)
+    {
+        weights[order.front().second] = 1.0f;
+    }
+    else if (param >= order.back().first)
+    {
+        weights[order.back().second] = 1.0f;
+    }
+    else
+    {
+        for (std::size_t i = 0; i + 1 < order.size(); ++i)
+        {
+            const float lo = order[i].first;
+            const float hi = order[i + 1].first;
+            if (param >= lo && param <= hi)
+            {
+                const float spanLen = hi - lo;
+                const float t = (spanLen > 1e-6f) ? (param - lo) / spanLen : 0.0f;
+                weights[order[i].second] = 1.0f - t;
+                weights[order[i + 1].second] = t;
+                break;
+            }
+        }
+    }
+}
+
+// 2D blend weights via the Unity "Freeform Cartesian" gradient-band algorithm (Johansen): for each
+// child i, weight = min over j!=i of clamp(1 - ((p - p_i)·(p_j - p_i)) / |p_j - p_i|^2, 0, 1), then
+// normalize. Sharp, no ghost contributions from far children (the IDW failure mode). weights is
+// indexed by child index; falls back to the nearest child if everything collapses to ~0.
+void Compute2DWeights(const std::vector<BlendTreeChild>& children, float px, float py,
+                      std::vector<float>& weights)
+{
+    const std::size_t n = children.size();
+    weights.assign(n, 0.0f);
+    if (n == 0)
+        return;
+    if (n == 1)
+    {
+        weights[0] = 1.0f;
+        return;
+    }
+
+    float sum = 0.0f;
+    for (std::size_t i = 0; i < n; ++i)
+    {
+        const float ix = children[i].position[0];
+        const float iy = children[i].position[1];
+        const float pix = px - ix;
+        const float piy = py - iy;
+        float w = 1.0f;
+        for (std::size_t j = 0; j < n; ++j)
+        {
+            if (j == i)
+                continue;
+            const float jx = children[j].position[0] - ix;
+            const float jy = children[j].position[1] - iy;
+            const float lenSq = jx * jx + jy * jy;
+            if (lenSq > 1e-8f)  // coincident children impose no constraint (h stays 1)
+            {
+                const float t = (pix * jx + piy * jy) / lenSq;
+                w = std::min(w, std::clamp(1.0f - t, 0.0f, 1.0f));
+            }
+        }
+        weights[i] = w;
+        sum += w;
+    }
+
+    if (sum > 1e-6f)
+    {
+        for (float& w : weights)
+            w /= sum;
+    }
+    else
+    {
+        std::size_t nearest = 0;
+        float best = 3.4e38f;
+        for (std::size_t i = 0; i < n; ++i)
+        {
+            const float dx = px - children[i].position[0];
+            const float dy = py - children[i].position[1];
+            const float d = dx * dx + dy * dy;
+            if (d < best) { best = d; nearest = i; }
+        }
+        weights[nearest] = 1.0f;
+    }
+}
+
+// Evaluates one state (single clip OR a 1D/2D blend tree) to outLocals at the shared normalized phase
+// (so a tree's children stay footfall-synced). ALWAYS writes the final pose into outLocals (even for
+// a single clip) so the two transition sides never alias a shared per-clipId ClipPlayback buffer.
+// Returns the span over outLocals, or an empty span if nothing loadable (caller uses the rest pose).
+ozz::span<const ozz::math::SoaTransform> EvaluateStateToBuffer(
+    AnimatorRuntime& rt,
+    const AnimatorState& state,
+    float normTime,
+    ozz::span<const ozz::math::SoaTransform> targetRest,
+    std::vector<ozz::math::SoaTransform>& outLocals,
+    const ClipPathResolver& resolveClipPath)
+{
+    const BlendTree& tree = state.blendTree;
+    const bool isTree = (tree.type == BlendTreeType::Blend1D || tree.type == BlendTreeType::Blend2D)
+                        && !tree.children.empty();
+
+    auto copyOut = [&](const ozz::span<const ozz::math::SoaTransform>& pose)
+        -> ozz::span<const ozz::math::SoaTransform> {
+        if (pose.size() == 0 || pose.size() > outLocals.size())
+            return {};
+        std::copy(pose.begin(), pose.end(), outLocals.begin());
+        return ozz::make_span(outLocals);
+    };
+
+    // Single clip (Single type) or an empty tree → play the state's own clip.
+    if (!isTree)
+    {
+        ClipPlayback* pb = EnsurePlayback(rt, state.clipId, resolveClipPath);
+        if (!pb)
+            return {};
+        return copyOut(SampleAndRetargetAt(*pb, targetRest, normTime));
+    }
+
+    // --- Blend tree: compute per-child weights (1D bracket-lerp / 2D gradient bands), then dedup
+    //     duplicate clipIds (summing weights) and blend the active set. ---
+    std::vector<float> weights;
+    if (tree.type == BlendTreeType::Blend2D)
+        Compute2DWeights(tree.children, ParamValue(rt, tree.blendParam),
+                         ParamValue(rt, tree.blendParamY), weights);
+    else
+        Compute1DWeights(tree.children, ParamValue(rt, tree.blendParam), weights);
+
+    std::vector<std::pair<std::string, float>> active;  // (clipId, summed weight)
+    for (std::size_t i = 0; i < tree.children.size(); ++i)
+    {
+        if (weights[i] <= 1e-4f)
+            continue;
+        const std::string& cid = tree.children[i].clipId;
+        bool merged = false;
+        for (std::pair<std::string, float>& a : active)
+            if (a.first == cid) { a.second += weights[i]; merged = true; break; }
+        if (!merged)
+            active.emplace_back(cid, weights[i]);
+    }
+    if (active.empty())
+        return {};
+    if (active.size() == 1)
+    {
+        ClipPlayback* pb = EnsurePlayback(rt, active.front().first, resolveClipPath);
+        if (!pb)
+            return {};
+        return copyOut(SampleAndRetargetAt(*pb, targetRest, normTime));
+    }
+
+    // >=2 distinct active clips: each clipId has its OWN ClipPlayback::targetLocals buffer, so all
+    // sampled poses stay valid simultaneously for one N-layer BlendingJob.
+    rt.treeLayerScratch.clear();
+    for (const std::pair<std::string, float>& a : active)
+    {
+        ClipPlayback* pb = EnsurePlayback(rt, a.first, resolveClipPath);
+        if (!pb)
+            continue;
+        const ozz::span<const ozz::math::SoaTransform> pose = SampleAndRetargetAt(*pb, targetRest, normTime);
+        if (pose.size() == 0)
+            continue;
+        ozz::animation::BlendingJob::Layer layer;
+        layer.transform = pose;
+        layer.weight = a.second;
+        rt.treeLayerScratch.push_back(layer);
+    }
+    if (rt.treeLayerScratch.empty())
+        return {};
+    if (rt.treeLayerScratch.size() == 1)
+        return copyOut(rt.treeLayerScratch.front().transform);  // a child failed to load → survivor
+
+    ozz::animation::BlendingJob blend;
+    blend.threshold = 0.01f;
+    blend.layers = ozz::make_span(rt.treeLayerScratch);
+    blend.rest_pose = targetRest;
+    blend.output = ozz::make_span(outLocals);
+    if (!blend.Run())
+        return copyOut(rt.treeLayerScratch.front().transform);
+    return ozz::make_span(outLocals);
+}
+
 } // namespace
 
 void BindAnimator(AnimatorRuntime& rt,
@@ -109,7 +324,10 @@ void BindAnimator(AnimatorRuntime& rt,
     rt.targetJointNames = targetJointNames;
     rt.targetNumJoints = targetNumJoints;
     rt.targetNumSoa = targetNumSoa;
-    rt.blendedLocals.assign(static_cast<std::size_t>(std::max(0, targetNumSoa)), ozz::math::SoaTransform());
+    const std::size_t soaCount = static_cast<std::size_t>(std::max(0, targetNumSoa));
+    rt.blendedLocals.assign(soaCount, ozz::math::SoaTransform());
+    rt.stateLocalsA.assign(soaCount, ozz::math::SoaTransform());
+    rt.stateLocalsB.assign(soaCount, ozz::math::SoaTransform());
     if (!controller || targetNumJoints <= 0 || targetNumSoa <= 0)
         return;
 
@@ -171,9 +389,8 @@ ozz::span<const ozz::math::SoaTransform> EvaluateAnimator(
     }
 
     // Advance the current state's phase.
-    ClipPlayback* curPb = EnsurePlayback(rt, cur->clipId, resolveClipPath);
     {
-        const float dur = (curPb && curPb->clip) ? curPb->clip->duration : 0.0f;
+        const float dur = StateDuration(rt, *cur, resolveClipPath);
         const float speed = cur->speed * (cur->speedParam.empty() ? 1.0f : ParamValue(rt, cur->speedParam));
         rt.currentNormTime = AdvancePhase(rt.currentNormTime, dtSeconds, speed, dur, cur->loop);
     }
@@ -185,8 +402,7 @@ ozz::span<const ozz::math::SoaTransform> EvaluateAnimator(
         rt.transitionElapsed += dtSeconds;
         if (const AnimatorState* dst = FindState(c, rt.transitionToStateId))
         {
-            ClipPlayback* dstPb = EnsurePlayback(rt, dst->clipId, resolveClipPath);
-            const float dur = (dstPb && dstPb->clip) ? dstPb->clip->duration : 0.0f;
+            const float dur = StateDuration(rt, *dst, resolveClipPath);
             const float speed = dst->speed * (dst->speedParam.empty() ? 1.0f : ParamValue(rt, dst->speedParam));
             rt.transitionToNormTime = AdvancePhase(rt.transitionToNormTime, dtSeconds, speed, dur, dst->loop);
         }
@@ -199,7 +415,6 @@ ozz::span<const ozz::math::SoaTransform> EvaluateAnimator(
             cur = FindState(c, rt.currentStateId);
             if (!cur)
                 return {};
-            curPb = EnsurePlayback(rt, cur->clipId, resolveClipPath);
         }
     }
 
@@ -233,23 +448,20 @@ ozz::span<const ozz::math::SoaTransform> EvaluateAnimator(
         }
     }
 
-    // Sample + (during a transition) crossfade.
+    // Evaluate the current state (single clip or blend tree) into its own buffer.
     const ozz::span<const ozz::math::SoaTransform> curPose =
-        curPb ? SampleAndRetargetAt(*curPb, targetRest, rt.currentNormTime)
-              : ozz::span<const ozz::math::SoaTransform>{};
+        EvaluateStateToBuffer(rt, *cur, rt.currentNormTime, targetRest, rt.stateLocalsA, resolveClipPath);
 
     if (!rt.inTransition)
-        return curPose.size() != 0 ? curPose : targetRest;  // clipless state → rest pose
+        return curPose.size() != 0 ? curPose : targetRest;  // motionless state → rest pose
 
+    // Evaluate the destination into a DISTINCT buffer. Because EvaluateStateToBuffer always writes
+    // its final pose into the passed buffer, curPose (stateLocalsA) and dstPose (stateLocalsB) can
+    // never alias a shared per-clipId ClipPlayback buffer — even if both sides use the same clip.
     const AnimatorState* dst = FindState(c, rt.transitionToStateId);
-    ClipPlayback* dstPb = dst ? EnsurePlayback(rt, dst->clipId, resolveClipPath) : nullptr;
-    // Same underlying clip on both sides: curPose and dstPose would alias one targetLocals buffer
-    // (the second sample overwrites the first), so skip the crossfade and just keep the source.
-    if (dstPb == curPb)
-        return curPose.size() != 0 ? curPose : targetRest;
     const ozz::span<const ozz::math::SoaTransform> dstPose =
-        dstPb ? SampleAndRetargetAt(*dstPb, targetRest, rt.transitionToNormTime)
-              : ozz::span<const ozz::math::SoaTransform>{};
+        dst ? EvaluateStateToBuffer(rt, *dst, rt.transitionToNormTime, targetRest, rt.stateLocalsB, resolveClipPath)
+            : ozz::span<const ozz::math::SoaTransform>{};
 
     const float t = std::clamp(rt.transitionElapsed / rt.transitionDuration, 0.0f, 1.0f);
 

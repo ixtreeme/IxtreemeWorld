@@ -194,6 +194,47 @@ std::vector<std::string> SplitObjects(const std::string& body)
     return out;
 }
 
+// Returns the "{...}" body of the named object (brace-matched, inclusive), or "" if absent. Used to
+// scope the nested blend_tree object so inner JStr/JNum lookups don't match identically-named keys
+// elsewhere in the enclosing state object.
+std::string ObjectBody(const std::string& text, const char* key)
+{
+    const std::string needle = std::string("\"") + key + "\"";
+    const std::size_t p = text.find(needle);
+    if (p == std::string::npos)
+        return {};
+    const std::size_t lb = text.find('{', p + needle.size());
+    if (lb == std::string::npos)
+        return {};
+    int depth = 0;
+    for (std::size_t i = lb; i < text.size(); ++i)
+    {
+        if (text[i] == '{')
+            ++depth;
+        else if (text[i] == '}' && --depth == 0)
+            return text.substr(lb, i - lb + 1);
+    }
+    return {};
+}
+
+const char* BlendTreeTypeName(BlendTreeType t)
+{
+    switch (t)
+    {
+    case BlendTreeType::Blend1D: return "blend_1d";
+    case BlendTreeType::Blend2D: return "blend_2d";
+    case BlendTreeType::Single: return "single";
+    }
+    return "single";
+}
+
+BlendTreeType ParseBlendTreeType(const std::string& s)
+{
+    if (s == "blend_1d") return BlendTreeType::Blend1D;
+    if (s == "blend_2d") return BlendTreeType::Blend2D;
+    return BlendTreeType::Single;
+}
+
 } // namespace
 
 std::string ControllerToJson(const AnimatorController& c)
@@ -225,7 +266,26 @@ std::string ControllerToJson(const AnimatorController& c)
           << "\", \"speed\": " << s.speed
           << ", \"speed_param\": \"" << EscapeJson(s.speedParam)
           << "\", \"loop\": " << (s.loop ? 1 : 0)
-          << ", \"pos\": [" << s.graphPos[0] << ", " << s.graphPos[1] << "] }";
+          << ", \"pos\": [" << s.graphPos[0] << ", " << s.graphPos[1] << "]";
+        // Emit the blend tree only when it is actually a tree, so existing single-clip controllers
+        // stay byte-identical (backward compatible).
+        if (s.blendTree.type != BlendTreeType::Single)
+        {
+            o << ", \"blend_tree\": { \"type\": \"" << BlendTreeTypeName(s.blendTree.type)
+              << "\", \"blend_param\": \"" << EscapeJson(s.blendTree.blendParam)
+              << "\", \"blend_param_y\": \"" << EscapeJson(s.blendTree.blendParamY)
+              << "\", \"children\": [";
+            for (std::size_t k = 0; k < s.blendTree.children.size(); ++k)
+            {
+                const BlendTreeChild& ch = s.blendTree.children[k];
+                o << (k ? ", " : "")
+                  << "{ \"clip_id\": \"" << EscapeJson(ch.clipId)
+                  << "\", \"threshold\": " << ch.threshold
+                  << ", \"position\": [" << ch.position[0] << ", " << ch.position[1] << "] }";
+            }
+            o << "] }";
+        }
+        o << " }";
     }
     o << (c.states.empty() ? "" : "\n  ") << "],\n";
 
@@ -282,6 +342,23 @@ bool ControllerFromJson(const std::string& text, AnimatorController& out)
         s.speedParam = JStr(obj, "speed_param");
         s.loop = JBool(obj, "loop", true);
         JVec2(obj, "pos", s.graphPos);
+        // Stage 5: optional blend tree (absent in legacy single-clip controllers). Scope to the
+        // blend_tree sub-object so inner keys don't collide with the state's own keys.
+        const std::string bt = ObjectBody(obj, "blend_tree");
+        if (!bt.empty())
+        {
+            s.blendTree.type = ParseBlendTreeType(JStr(bt, "type"));
+            s.blendTree.blendParam = JStr(bt, "blend_param");
+            s.blendTree.blendParamY = JStr(bt, "blend_param_y");
+            for (const std::string& ch : SplitObjects(ArrayBody(bt, "children")))
+            {
+                BlendTreeChild c;
+                c.clipId = JStr(ch, "clip_id");
+                c.threshold = static_cast<float>(JNum(ch, "threshold", 0.0));
+                JVec2(ch, "position", c.position);
+                s.blendTree.children.push_back(std::move(c));
+            }
+        }
         out.states.push_back(std::move(s));
     }
 

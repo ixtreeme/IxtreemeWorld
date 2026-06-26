@@ -2082,6 +2082,69 @@ bool ApplyAnimatorGraphEdits(ixanim::AnimatorController& controller,
             for (ixanim::AnimatorParameter& p : controller.parameters)
                 if (p.name == edit.text) { p.defaultValue = edit.floatValue; break; }
             break;  // takes effect at next bind — no rebind
+        // --- Stage 5 blend tree. The runtime reads state.blendTree LIVE each frame and lazily
+        //     EnsurePlayback()s any new child clip onto the already-bound target skeleton, so NONE
+        //     of these need a rebind (no play-state reset). ---
+        case AnimatorGraphEditType::SetStateMotionType:
+            for (ixanim::AnimatorState& state : controller.states)
+                if (state.id == edit.stateId)
+                {
+                    if (edit.text2 == "1d") state.blendTree.type = ixanim::BlendTreeType::Blend1D;
+                    else if (edit.text2 == "2d") state.blendTree.type = ixanim::BlendTreeType::Blend2D;
+                    else state.blendTree.type = ixanim::BlendTreeType::Single;
+                    break;
+                }
+            break;
+        case AnimatorGraphEditType::SetStateBlendParam:
+            for (ixanim::AnimatorState& state : controller.states)
+                if (state.id == edit.stateId) { state.blendTree.blendParam = edit.text; break; }
+            break;
+        case AnimatorGraphEditType::SetStateBlendParamY:
+            for (ixanim::AnimatorState& state : controller.states)
+                if (state.id == edit.stateId) { state.blendTree.blendParamY = edit.text; break; }
+            break;
+        case AnimatorGraphEditType::AddBlendTreeChild:
+            for (ixanim::AnimatorState& state : controller.states)
+                if (state.id == edit.stateId)
+                {
+                    ixanim::BlendTreeChild ch;
+                    ch.clipId = edit.text;
+                    ch.threshold = edit.floatValue;
+                    ch.position[0] = edit.vec2Value[0];
+                    ch.position[1] = edit.vec2Value[1];
+                    // Append in insertion order; the runtime sorts by threshold per-eval, so the
+                    // stored order is free to stay stable (keeps the editor's child indices steady).
+                    state.blendTree.children.push_back(std::move(ch));
+                    break;
+                }
+            break;
+        case AnimatorGraphEditType::DeleteBlendTreeChild:
+            for (ixanim::AnimatorState& state : controller.states)
+                if (state.id == edit.stateId)
+                {
+                    auto& kids = state.blendTree.children;
+                    if (edit.intValue >= 0 && edit.intValue < static_cast<int>(kids.size()))
+                        kids.erase(kids.begin() + edit.intValue);
+                    break;
+                }
+            break;
+        case AnimatorGraphEditType::EditBlendTreeChild:
+            for (ixanim::AnimatorState& state : controller.states)
+                if (state.id == edit.stateId)
+                {
+                    auto& kids = state.blendTree.children;
+                    if (edit.intValue >= 0 && edit.intValue < static_cast<int>(kids.size()))
+                    {
+                        ixanim::BlendTreeChild& ch = kids[edit.intValue];
+                        ch.clipId = edit.text;  // panel always sends the intended clipId (may clear)
+                        ch.threshold = edit.floatValue;
+                        ch.position[0] = edit.vec2Value[0];
+                        ch.position[1] = edit.vec2Value[1];
+                        // No re-sort: indices stay stable for the editor; the runtime sorts per-eval.
+                    }
+                    break;
+                }
+            break;
         default:
             break;  // later chunks handle the remaining edit types
         }
@@ -8742,6 +8805,24 @@ int RunGame(NativeWindow& window,
                                 node.clipId = s.clipId;
                                 node.speed = s.speed;
                                 node.loop = s.loop;
+                                // Stage 5: blend tree (display copy for the inspector + node label).
+                                node.blendTreeType = static_cast<int>(s.blendTree.type);
+                                node.blendParam = s.blendTree.blendParam;
+                                node.blendParamY = s.blendTree.blendParamY;
+                                for (const ixanim::BlendTreeChild& bc : s.blendTree.children)
+                                {
+                                    AnimatorGraphBlendChild gbc;
+                                    gbc.clipId = bc.clipId;
+                                    gbc.threshold = bc.threshold;
+                                    gbc.pos[0] = bc.position[0];
+                                    gbc.pos[1] = bc.position[1];
+                                    node.blendChildren.push_back(std::move(gbc));
+                                }
+                                if (s.blendTree.type == ixanim::BlendTreeType::Blend1D)
+                                    node.clipLabel = "1D: " + (s.blendTree.blendParam.empty() ? std::string("(param)") : s.blendTree.blendParam)
+                                        + " (" + std::to_string(s.blendTree.children.size()) + ")";
+                                else if (s.blendTree.type == ixanim::BlendTreeType::Blend2D)
+                                    node.clipLabel = "2D (" + std::to_string(s.blendTree.children.size()) + ")";
                                 node.graphPos[0] = s.graphPos[0];
                                 node.graphPos[1] = s.graphPos[1];
                                 node.isDefault = (s.id == ctrl.defaultStateId);
