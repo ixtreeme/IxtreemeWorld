@@ -103,5 +103,6 @@ public:
     bool writeOzzSidecars(const ImportResult& result,
                           const std::filesystem::path& skeletonPath,
                           const std::vector<std::filesystem::path>& animationPaths,
-                          std::string& error) const;
+                          std::string& error,
+                          std::vector<std::string>* outJointNames = nullptr) const;
 };

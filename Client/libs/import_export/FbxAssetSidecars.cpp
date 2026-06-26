@@ -7,7 +7,9 @@
 
 #include <cctype>
 #include <filesystem>
+#include <fstream>
 #include <optional>
+#include <sstream>
 #include <string>
 #include <vector>
 
@@ -23,6 +25,63 @@ std::string SanitizeStem(std::string value)
     while (!value.empty() && value.back() == '_')
         value.pop_back();
     return value.empty() ? "asset" : value;
+}
+
+std::string EscapeJsonInline(const std::string& value)
+{
+    std::string out;
+    out.reserve(value.size() + 2);
+    for (char c : value)
+    {
+        if (c == '"' || c == '\\')
+            out.push_back('\\');
+        out.push_back(c);
+    }
+    return out;
+}
+
+// Writes a retargetable .ixclip wrapper next to the model's ozz sidecars (under the library's
+// animation_clips/ folder). joint_names are the SOURCE bones in track order (track i targets
+// bones[i]) — the retarget key. Keys must match AssetLibrary's ReadAnimationClipJson.
+bool WriteAnimationClipSidecar(const std::filesystem::path& clipPath,
+                               const std::string& id,
+                               const std::string& displayName,
+                               const std::string& sourceAnimGuid,
+                               const std::string& sourceSkeletonGuid,
+                               const std::string& sourceAnimPath,
+                               float duration,
+                               const std::vector<std::string>& jointNames)
+{
+    std::ostringstream json;
+    json << "{\n"
+         << "  \"version\": 1,\n"
+         << "  \"id\": \"" << EscapeJsonInline(id) << "\",\n"
+         << "  \"display_name\": \"" << EscapeJsonInline(displayName) << "\",\n"
+         << "  \"source_anim_guid\": \"" << EscapeJsonInline(sourceAnimGuid) << "\",\n"
+         << "  \"source_skeleton_guid\": \"" << EscapeJsonInline(sourceSkeletonGuid) << "\",\n"
+         << "  \"source_anim_path\": \"" << EscapeJsonInline(sourceAnimPath) << "\",\n"
+         << "  \"duration\": " << duration << ",\n"
+         << "  \"loop\": 1,\n"
+         << "  \"sample_rate\": 30.0,\n"
+         << "  \"root_joint\": \"" << (jointNames.empty() ? std::string() : EscapeJsonInline(jointNames.front())) << "\",\n"
+         << "  \"root_motion_mode\": \"none\",\n"
+         << "  \"joint_names\": [";
+    for (std::size_t j = 0; j < jointNames.size(); ++j)
+    {
+        if (j != 0)
+            json << ", ";
+        json << "\"" << EscapeJsonInline(jointNames[j]) << "\"";
+    }
+    json << "]\n}\n";
+
+    std::error_code ec;
+    std::filesystem::create_directories(clipPath.parent_path(), ec);
+    std::ofstream out(clipPath, std::ios::binary | std::ios::trunc);
+    if (!out)
+        return false;
+    const std::string text = json.str();
+    out.write(text.data(), static_cast<std::streamsize>(text.size()));
+    return out.good();
 }
 }
 
@@ -60,7 +119,8 @@ bool ProcessImportedFbxAsset(const std::filesystem::path& destination,
         for (std::size_t i = 0; i < result.animations.size(); ++i)
             animationPaths.push_back(destination.parent_path() / (stem + "_anim_" + std::to_string(i) + ".ozz"));
         std::string ozzError;
-        if (!importer.writeOzzSidecars(result, skeletonPath, animationPaths, ozzError))
+        std::vector<std::string> builtJointNames;
+        if (!importer.writeOzzSidecars(result, skeletonPath, animationPaths, ozzError, &builtJointNames))
         {
             TraceError("[FBX-IMPORT] ozz sidecar generation failed path=%s error=%s",
                 destination.generic_string().c_str(),
@@ -80,6 +140,31 @@ bool ProcessImportedFbxAsset(const std::filesystem::path& destination,
                 destination.generic_string().c_str(),
                 skeletonPath.filename().generic_string().c_str(),
                 animationPaths.size());
+
+            // Emit a retargetable .ixclip wrapper per animation into the library's
+            // animation_clips/ folder so each becomes a standalone, skeleton-agnostic clip
+            // (AssetLibrary::ReconcileFilesystem discovers them as browser entries).
+            const std::filesystem::path clipDir = libraryRoot / "animation_clips" / stem;
+            const std::string skeletonGuidStr = skeletonGuid ? skeletonGuid->toString() : std::string();
+            for (std::size_t i = 0; i < animationPaths.size() && i < result.animations.size(); ++i)
+            {
+                if (!std::filesystem::exists(animationPaths[i]))
+                    continue;  // animation was skipped during ozz generation (e.g. zero duration)
+                const std::string clipName = result.animations[i].name.empty()
+                    ? (stem + "_anim_" + std::to_string(i))
+                    : result.animations[i].name;
+                const std::string clipId = "clip_" + SanitizeStem(stem + "_" + clipName);
+                const std::filesystem::path clipPath = clipDir / (SanitizeStem(clipName) + ".ixclip");
+                const std::string animGuidStr = (i < animationGuids.size()) ? animationGuids[i].toString() : std::string();
+                if (WriteAnimationClipSidecar(clipPath, clipId, clipName, animGuidStr, skeletonGuidStr,
+                        animationPaths[i].generic_string(), result.animations[i].duration, builtJointNames))
+                {
+                    db.runtimeAdd(clipPath);
+                    Tracenf("[FBX-IMPORT] animation clip emitted name=%s joints=%zu",
+                        clipName.c_str(),
+                        builtJointNames.size());
+                }
+            }
         }
     }
     if (std::filesystem::exists(options.textureOutputDir))

@@ -900,6 +900,57 @@ std::string PhysicsMaterialFileJson(const AssetLibrary::Entry& entry)
     return fileJson.str();
 }
 
+AssetLibrary::AnimationClipData ReadAnimationClipJson(
+    const std::string& object,
+    AssetLibrary::AnimationClipData fallback = {})
+{
+    AssetLibrary::AnimationClipData clip = fallback;
+    auto str = [&](const char* key, std::string& dst) {
+        const std::string value = JsonStringValue(object, key);
+        if (!value.empty())
+            dst = value;
+    };
+    str("source_anim_guid", clip.sourceAnimGuid);
+    str("source_skeleton_guid", clip.sourceSkeletonGuid);
+    str("source_anim_path", clip.sourceAnimPath);
+    clip.duration = JsonFloatValue(object, "duration", clip.duration);
+    if (const std::optional<int> loopValue = JsonIntValue(object, "loop"))
+        clip.loop = *loopValue != 0;
+    clip.sampleRate = JsonFloatValue(object, "sample_rate", clip.sampleRate);
+    str("root_joint", clip.rootJoint);
+    str("root_motion_mode", clip.rootMotionMode);
+    std::vector<std::string> names = JsonStringArrayValue(object, "joint_names");
+    if (!names.empty())
+        clip.jointNames = std::move(names);
+    return clip;
+}
+
+std::string AnimationClipFileJson(const AssetLibrary::Entry& entry)
+{
+    std::ostringstream fileJson;
+    fileJson << "{\n"
+             << "  \"version\": 1,\n"
+             << "  \"id\": \"" << EscapeJson(entry.id) << "\",\n"
+             << "  \"display_name\": \"" << EscapeJson(entry.displayName) << "\",\n"
+             << "  \"source_anim_guid\": \"" << EscapeJson(entry.animationClip.sourceAnimGuid) << "\",\n"
+             << "  \"source_skeleton_guid\": \"" << EscapeJson(entry.animationClip.sourceSkeletonGuid) << "\",\n"
+             << "  \"source_anim_path\": \"" << EscapeJson(entry.animationClip.sourceAnimPath) << "\",\n"
+             << "  \"duration\": " << entry.animationClip.duration << ",\n"
+             << "  \"loop\": " << (entry.animationClip.loop ? 1 : 0) << ",\n"
+             << "  \"sample_rate\": " << entry.animationClip.sampleRate << ",\n"
+             << "  \"root_joint\": \"" << EscapeJson(entry.animationClip.rootJoint) << "\",\n"
+             << "  \"root_motion_mode\": \"" << EscapeJson(entry.animationClip.rootMotionMode) << "\",\n"
+             << "  \"joint_names\": [";
+    for (std::size_t i = 0; i < entry.animationClip.jointNames.size(); ++i)
+    {
+        if (i != 0)
+            fileJson << ", ";
+        fileJson << "\"" << EscapeJson(entry.animationClip.jointNames[i]) << "\"";
+    }
+    fileJson << "]\n}\n";
+    return fileJson.str();
+}
+
 std::string MaterialFileJson(const AssetLibrary::Entry& entry)
 {
     auto tintByte = [](float value) {
@@ -1517,6 +1568,8 @@ const char* AssetLibrary::CategoryName(Category category)
     case Category::Material: return "Materials";
     case Category::WaterMaterial: return "Water Materials";
     case Category::PhysicsMaterial: return "Physics Materials";
+    case Category::AnimationClip: return "Animation Clips";
+    case Category::AnimatorController: return "Animators";
     case Category::Scene: return "Scenes";
     case Category::Prefab: return "Prefabs";
     default: return "Assets";
@@ -1821,6 +1874,8 @@ std::string AssetLibrary::CategoryString(Category category)
     case Category::Material: return "material";
     case Category::WaterMaterial: return "water_material";
     case Category::PhysicsMaterial: return "physics_material";
+    case Category::AnimationClip: return "animation_clip";
+    case Category::AnimatorController: return "animator_controller";
     case Category::Scene: return "scene";
     case Category::Prefab: return "prefab";
     default: return "texture";
@@ -1835,6 +1890,8 @@ std::optional<AssetLibrary::Category> AssetLibrary::ParseCategory(const std::str
     if (value == "material") return Category::Material;
     if (value == "water_material" || value == "watermaterial") return Category::WaterMaterial;
     if (value == "physics_material" || value == "physicsmaterial") return Category::PhysicsMaterial;
+    if (value == "animation_clip" || value == "animationclip") return Category::AnimationClip;
+    if (value == "animator_controller" || value == "animatorcontroller") return Category::AnimatorController;
     if (value == "scene") return Category::Scene;
     if (value == "prefab") return Category::Prefab;
     return std::nullopt;
@@ -1863,6 +1920,8 @@ std::filesystem::path AssetLibrary::CategoryDirectory(Category category) const
     case Category::Material: return m_libraryRoot / "materials";
     case Category::WaterMaterial: return m_libraryRoot / "materials" / "water";
     case Category::PhysicsMaterial: return m_libraryRoot / "materials" / "physics";
+    case Category::AnimationClip: return m_libraryRoot / "animation_clips";
+    case Category::AnimatorController: return m_libraryRoot / "animator_controllers";
     case Category::Scene: return m_libraryRoot / "scenes";
     case Category::Prefab: return m_libraryRoot / "prefabs";
     default: return m_libraryRoot / "textures";
@@ -2123,6 +2182,12 @@ bool AssetLibrary::LoadManifest()
             if (!physicsObject.empty())
                 entry.physicsMaterial = ReadPhysicsMaterialJson(physicsObject, entry.physicsMaterial);
         }
+        if (entry.category == Category::AnimationClip)
+        {
+            const std::string clipObject = JsonObjectValue(object, "animation_clip_data");
+            if (!clipObject.empty())
+                entry.animationClip = ReadAnimationClipJson(clipObject, entry.animationClip);
+        }
         if (entry.category == Category::Model)
         {
             const std::string lodObject = JsonObjectValue(object, "lod_default");
@@ -2248,6 +2313,19 @@ bool AssetLibrary::SaveManifest(std::string& error) const
                  << "        \"angular_damping\": " << entry.physicsMaterial.angularDamping << ",\n"
                  << "        \"friction_combine\": \"" << ixtreeme::physics::ToString(entry.physicsMaterial.frictionCombine) << "\",\n"
                  << "        \"restitution_combine\": \"" << ixtreeme::physics::ToString(entry.physicsMaterial.restitutionCombine) << "\"\n"
+                 << "      }\n";
+        }
+        if (entry.category == Category::AnimationClip)
+        {
+            json << ",\n"
+                 << "      \"animation_clip_data\": {\n"
+                 << "        \"source_anim_guid\": \"" << EscapeJson(entry.animationClip.sourceAnimGuid) << "\",\n"
+                 << "        \"source_skeleton_guid\": \"" << EscapeJson(entry.animationClip.sourceSkeletonGuid) << "\",\n"
+                 << "        \"duration\": " << entry.animationClip.duration << ",\n"
+                 << "        \"loop\": " << (entry.animationClip.loop ? 1 : 0) << ",\n"
+                 << "        \"sample_rate\": " << entry.animationClip.sampleRate << ",\n"
+                 << "        \"root_joint\": \"" << EscapeJson(entry.animationClip.rootJoint) << "\",\n"
+                 << "        \"root_motion_mode\": \"" << EscapeJson(entry.animationClip.rootMotionMode) << "\"\n"
                  << "      }\n";
         }
         if (entry.category == Category::Model && entry.hasLodDefault)
@@ -2493,6 +2571,111 @@ bool AssetLibrary::ReconcileFilesystem(std::string& error)
                 Tracenf("[ASSET-LIBRARY] discovered material asset path=%s",
                     it->path().generic_string().c_str());
             }
+        }
+    }
+
+    // Discover orphan .ixclip animation-clip files (emitted by the FBX/GLB importer next to a
+    // model's ozz sidecars) that aren't yet in the manifest, and register them as browser entries.
+    const auto animationClipDir = CategoryDirectory(Category::AnimationClip);
+    if (std::filesystem::exists(animationClipDir, ec))
+    {
+        std::unordered_set<std::string> knownClipPaths;
+        std::unordered_set<std::string> existingIds;
+        for (const Entry& existing : reconciled)
+        {
+            existingIds.insert(existing.id);
+            if (existing.category == Category::AnimationClip)
+                knownClipPaths.insert(CanonicalPathString(AbsolutePath(existing)));
+        }
+        for (std::filesystem::recursive_directory_iterator clipIt(animationClipDir, ec), clipEnd;
+             clipIt != clipEnd && !ec; clipIt.increment(ec))
+        {
+            if (!clipIt->is_regular_file(ec) || !HasAnyExtension(clipIt->path(), {".ixclip"}))
+                continue;
+            const std::string canonical = CanonicalPathString(clipIt->path());
+            if (knownClipPaths.find(canonical) != knownClipPaths.end())
+                continue;
+
+            std::ifstream clipFile(clipIt->path(), std::ios::binary);
+            const std::string text((std::istreambuf_iterator<char>(clipFile)), std::istreambuf_iterator<char>());
+
+            Entry entry;
+            entry.category = Category::AnimationClip;
+            entry.filename = clipIt->path().filename().generic_string();
+            std::error_code relEc;
+            std::filesystem::path parentRel = std::filesystem::relative(clipIt->path().parent_path(), animationClipDir, relEc);
+            entry.subpath = relEc ? "" : NormalizeSubpath(parentRel.generic_string());
+            entry.displayName = JsonStringValue(text, "display_name");
+            if (entry.displayName.empty())
+                entry.displayName = clipIt->path().stem().string();
+            entry.originalPath = GenericPath(clipIt->path());
+            entry.importedAt = TimestampUtc();
+            entry.thumbnail = "animation_clip_icon";
+            entry.tags = {"animation", "clip"};
+            entry.animationClip = ReadAnimationClipJson(text);
+
+            std::string clipId = JsonStringValue(text, "id");
+            if (clipId.empty() || existingIds.find(clipId) != existingIds.end())
+                clipId = MakeUniqueId(Category::AnimationClip, clipIt->path());
+            entry.id = clipId;
+
+            existingIds.insert(entry.id);
+            knownClipPaths.insert(canonical);
+            reconciled.push_back(std::move(entry));
+            changed = true;
+            Tracenf("[ANIM-CLIP] discovered path=%s", clipIt->path().generic_string().c_str());
+        }
+    }
+
+    // Discover orphan .controller animator assets (created via CreateAnimatorController or written
+    // by the editor) not yet in the manifest, and register them as browser entries.
+    const auto animatorControllerDir = CategoryDirectory(Category::AnimatorController);
+    if (std::filesystem::exists(animatorControllerDir, ec))
+    {
+        std::unordered_set<std::string> knownControllerPaths;
+        std::unordered_set<std::string> existingIds;
+        for (const Entry& existing : reconciled)
+        {
+            existingIds.insert(existing.id);
+            if (existing.category == Category::AnimatorController)
+                knownControllerPaths.insert(CanonicalPathString(AbsolutePath(existing)));
+        }
+        for (std::filesystem::recursive_directory_iterator ctrlIt(animatorControllerDir, ec), ctrlEnd;
+             ctrlIt != ctrlEnd && !ec; ctrlIt.increment(ec))
+        {
+            if (!ctrlIt->is_regular_file(ec) || !HasAnyExtension(ctrlIt->path(), {".controller"}))
+                continue;
+            const std::string canonical = CanonicalPathString(ctrlIt->path());
+            if (knownControllerPaths.find(canonical) != knownControllerPaths.end())
+                continue;
+
+            std::ifstream ctrlFile(ctrlIt->path(), std::ios::binary);
+            const std::string text((std::istreambuf_iterator<char>(ctrlFile)), std::istreambuf_iterator<char>());
+
+            Entry entry;
+            entry.category = Category::AnimatorController;
+            entry.filename = ctrlIt->path().filename().generic_string();
+            std::error_code relEc;
+            std::filesystem::path parentRel = std::filesystem::relative(ctrlIt->path().parent_path(), animatorControllerDir, relEc);
+            entry.subpath = relEc ? "" : NormalizeSubpath(parentRel.generic_string());
+            entry.displayName = JsonStringValue(text, "display_name");
+            if (entry.displayName.empty())
+                entry.displayName = ctrlIt->path().stem().string();
+            entry.originalPath = GenericPath(ctrlIt->path());
+            entry.importedAt = TimestampUtc();
+            entry.thumbnail = "animator_controller_icon";
+            entry.tags = {"animator", "controller"};
+
+            std::string ctrlId = JsonStringValue(text, "id");
+            if (ctrlId.empty() || existingIds.find(ctrlId) != existingIds.end())
+                ctrlId = MakeUniqueId(Category::AnimatorController, ctrlIt->path());
+            entry.id = ctrlId;
+
+            existingIds.insert(entry.id);
+            knownControllerPaths.insert(canonical);
+            reconciled.push_back(std::move(entry));
+            changed = true;
+            Tracenf("[ANIM-CTRL] discovered path=%s", ctrlIt->path().generic_string().c_str());
         }
     }
 
@@ -2743,6 +2926,20 @@ bool AssetLibrary::ValidateFile(Category category, const std::filesystem::path& 
             return false;
         }
         break;
+    case Category::AnimationClip:
+        if (!HasAnyExtension(path, {".ixclip", ".ozz", ".gltf", ".glb", ".fbx"}))
+        {
+            error = "animation clips must be IXCLIP, OZZ, GLTF, GLB or FBX";
+            return false;
+        }
+        break;
+    case Category::AnimatorController:
+        if (!HasAnyExtension(path, {".controller"}))
+        {
+            error = "animator controllers must be CONTROLLER files";
+            return false;
+        }
+        break;
     case Category::Scene:
         if (!HasAnyExtension(path, {".scene"}))
         {
@@ -2768,8 +2965,10 @@ std::string AssetLibrary::MakeUniqueId(Category category, const std::filesystem:
             (category == Category::Animation ? "anim_" :
                 (category == Category::WaterMaterial ? "watermat_" :
                     (category == Category::PhysicsMaterial ? "physmat_" :
-                        (category == Category::Scene ? "scene_" :
-                            (category == Category::Prefab ? "prefab_" : "mat_"))))));
+                        (category == Category::AnimationClip ? "clip_" :
+                            (category == Category::AnimatorController ? "ctrl_" :
+                                (category == Category::Scene ? "scene_" :
+                                    (category == Category::Prefab ? "prefab_" : "mat_"))))))));
     const std::string base = prefix + SanitizeStem(sourcePath.stem().string());
     std::unordered_set<std::string> existing;
     for (const Entry& entry : m_entries)
@@ -3333,6 +3532,117 @@ bool AssetLibrary::CreatePhysicsMaterial(const ImportOptions& options,
         entry.physicsMaterial.density,
         ixtreeme::physics::ToString(entry.physicsMaterial.frictionCombine),
         ixtreeme::physics::ToString(entry.physicsMaterial.restitutionCombine));
+    outEntry = entry;
+    return true;
+}
+
+bool AssetLibrary::CreateAnimationClip(const ImportOptions& options,
+                                       const AnimationClipData& clip,
+                                       Entry& outEntry,
+                                       std::string& error)
+{
+    const std::string displayName = options.displayName.empty() ? "Animation_Clip" : options.displayName;
+    const std::string subpath = NormalizeSubpath(options.subpath);
+    Entry entry;
+    entry.id = MakeUniqueId(Category::AnimationClip, displayName);
+    entry.category = Category::AnimationClip;
+    entry.displayName = displayName;
+    entry.subpath = subpath;
+    entry.filename = SanitizeStem(displayName) + ".ixclip";
+    entry.originalPath.clear();
+    entry.importedAt = TimestampUtc();
+    entry.tags = NormalizeTags(options.tags.empty() ? std::vector<std::string>{"animation", "clip"} : options.tags);
+    entry.thumbnail = "animation_clip_icon";
+    entry.animationClip = clip;
+
+    std::filesystem::path destination = AbsolutePath(entry);
+    for (uint32_t i = 2; std::filesystem::exists(destination); ++i)
+    {
+        entry.filename = SanitizeStem(displayName) + "_" + std::to_string(i) + ".ixclip";
+        destination = AbsolutePath(entry);
+    }
+
+    if (!AtomicWriteText(destination, AnimationClipFileJson(entry), error))
+        return false;
+
+    m_entries.push_back(entry);
+    if (!SaveManifest(error))
+    {
+        std::error_code ec;
+        std::filesystem::remove(destination, ec);
+        m_entries.pop_back();
+        return false;
+    }
+
+    Tracenf("[ANIM-CLIP] created id=%s duration=%.3f loop=%d joints=%zu",
+        entry.id.c_str(),
+        entry.animationClip.duration,
+        entry.animationClip.loop ? 1 : 0,
+        entry.animationClip.jointNames.size());
+    outEntry = entry;
+    return true;
+}
+
+bool AssetLibrary::CreateAnimatorController(const ImportOptions& options, Entry& outEntry, std::string& error)
+{
+    const std::string displayName = options.displayName.empty() ? "Animator_Controller" : options.displayName;
+    const std::string subpath = NormalizeSubpath(options.subpath);
+    Entry entry;
+    entry.id = MakeUniqueId(Category::AnimatorController, displayName);
+    entry.category = Category::AnimatorController;
+    entry.displayName = displayName;
+    entry.subpath = subpath;
+    entry.filename = SanitizeStem(displayName) + ".controller";
+    entry.originalPath.clear();
+    entry.importedAt = TimestampUtc();
+    entry.tags = NormalizeTags(options.tags.empty() ? std::vector<std::string>{"animator", "controller"} : options.tags);
+    entry.thumbnail = "animator_controller_icon";
+
+    std::filesystem::path destination = AbsolutePath(entry);
+    for (uint32_t i = 2; std::filesystem::exists(destination); ++i)
+    {
+        entry.filename = SanitizeStem(displayName) + "_" + std::to_string(i) + ".controller";
+        destination = AbsolutePath(entry);
+    }
+
+    // Default Idle/Walk/Run locomotion graph (keys must match ixanim::ControllerFromJson). Clip
+    // ids are empty — the Inspector / graph editor assigns them per state.
+    std::ostringstream body;
+    body << "{\n"
+         << "  \"version\": 1,\n"
+         << "  \"id\": \"" << EscapeJson(entry.id) << "\",\n"
+         << "  \"display_name\": \"" << EscapeJson(displayName) << "\",\n"
+         << "  \"default_state_id\": 1,\n"
+         << "  \"parameters\": [\n"
+         << "    { \"name\": \"Speed\", \"type\": \"float\", \"default\": 0 },\n"
+         << "    { \"name\": \"IsGrounded\", \"type\": \"bool\", \"default\": 1 },\n"
+         << "    { \"name\": \"Jump\", \"type\": \"trigger\", \"default\": 0 }\n"
+         << "  ],\n"
+         << "  \"states\": [\n"
+         << "    { \"id\": 1, \"name\": \"Idle\", \"clip_id\": \"\", \"speed\": 1, \"speed_param\": \"\", \"loop\": 1, \"pos\": [120, 80] },\n"
+         << "    { \"id\": 2, \"name\": \"Walk\", \"clip_id\": \"\", \"speed\": 1, \"speed_param\": \"\", \"loop\": 1, \"pos\": [340, 80] },\n"
+         << "    { \"id\": 3, \"name\": \"Run\", \"clip_id\": \"\", \"speed\": 1, \"speed_param\": \"\", \"loop\": 1, \"pos\": [560, 80] }\n"
+         << "  ],\n"
+         << "  \"transitions\": [\n"
+         << "    { \"from\": 1, \"to\": 2, \"has_exit_time\": 0, \"exit_time\": 0, \"duration\": 0.15, \"can_self\": 0, \"conditions\": [ { \"param\": \"Speed\", \"op\": \"greater\", \"value\": 0.1 } ] },\n"
+         << "    { \"from\": 2, \"to\": 1, \"has_exit_time\": 0, \"exit_time\": 0, \"duration\": 0.15, \"can_self\": 0, \"conditions\": [ { \"param\": \"Speed\", \"op\": \"less\", \"value\": 0.1 } ] },\n"
+         << "    { \"from\": 2, \"to\": 3, \"has_exit_time\": 0, \"exit_time\": 0, \"duration\": 0.15, \"can_self\": 0, \"conditions\": [ { \"param\": \"Speed\", \"op\": \"greater\", \"value\": 3.5 } ] },\n"
+         << "    { \"from\": 3, \"to\": 2, \"has_exit_time\": 0, \"exit_time\": 0, \"duration\": 0.15, \"can_self\": 0, \"conditions\": [ { \"param\": \"Speed\", \"op\": \"less\", \"value\": 3.5 } ] }\n"
+         << "  ]\n}\n";
+
+    if (!AtomicWriteText(destination, body.str(), error))
+        return false;
+
+    m_entries.push_back(entry);
+    if (!SaveManifest(error))
+    {
+        std::error_code ec;
+        std::filesystem::remove(destination, ec);
+        m_entries.pop_back();
+        return false;
+    }
+
+    Tracenf("[ANIM-CTRL] created id=%s file=%s", entry.id.c_str(), entry.filename.c_str());
     outEntry = entry;
     return true;
 }

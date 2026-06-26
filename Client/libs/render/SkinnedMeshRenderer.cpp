@@ -1214,6 +1214,84 @@ void SkinnedMeshRenderer::SkinInstance(VulkanDevice& device, uint32_t skinSlot, 
    //}
 }
 
+void SkinnedMeshRenderer::SkinInstanceFromPose(VulkanDevice& device, uint32_t skinSlot,
+    ozz::span<const ozz::math::SoaTransform> localPose)
+{
+    if (!m_computePipeline || !device.IsFrameActive())
+        return;
+    if (skinSlot >= kSkinSlots)
+        return;
+
+    const uint32_t frameIndex = device.GetFrameIndex();
+    if (frameIndex >= kFramesInFlight || !m_bonePaletteBuffers[frameIndex][skinSlot].memory ||
+        !m_ozz || m_bonePaletteCpu.empty())
+    {
+        return;
+    }
+    // The supplied pose must cover this skeleton's joints, or LocalToModelJob would read past it
+    // (or skin against a foreign skeleton's data). Fail safe rather than render garbage.
+    if (localPose.size() < NumSoaJoints())
+        return;
+
+    // Build the GPU bone palette directly from the externally supplied local pose (no clip
+    // sampling, no CPU vertex skin), upload it, and dispatch compute skinning for this slot.
+    if (!BuildPaletteFromLocals(localPose))
+        return;
+    if (!UploadPaletteToBuffer(frameIndex, skinSlot))
+        return;
+
+    VkCommandBuffer cmd = device.GetCommandBuffer();
+    DispatchSkin(cmd, frameIndex, skinSlot);
+
+    VkBufferMemoryBarrier computeToVertex{};
+    computeToVertex.sType = VK_STRUCTURE_TYPE_BUFFER_MEMORY_BARRIER;
+    computeToVertex.srcAccessMask = VK_ACCESS_SHADER_WRITE_BIT;
+    computeToVertex.dstAccessMask = VK_ACCESS_VERTEX_ATTRIBUTE_READ_BIT;
+    computeToVertex.srcQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;
+    computeToVertex.dstQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;
+    computeToVertex.buffer = m_skinnedOutputBuffers[frameIndex][skinSlot].buffer;
+    computeToVertex.offset = 0;
+    computeToVertex.size = sizeof(Vertex) * m_vertices.size();
+    vkCmdPipelineBarrier(cmd,
+        VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT,
+        VK_PIPELINE_STAGE_VERTEX_INPUT_BIT,
+        0, 0, nullptr, 1, &computeToVertex, 0, nullptr);
+}
+
+const ozz::animation::Skeleton* SkinnedMeshRenderer::Skeleton() const
+{
+    return m_ozz ? &m_ozz->skeleton : nullptr;
+}
+
+ozz::span<const ozz::math::SoaTransform> SkinnedMeshRenderer::RestPoseLocals() const
+{
+    if (!m_ozz)
+        return {};
+    return m_ozz->skeleton.joint_rest_poses();
+}
+
+std::uint32_t SkinnedMeshRenderer::NumJoints() const
+{
+    return m_ozz ? static_cast<std::uint32_t>(m_ozz->skeleton.num_joints()) : 0u;
+}
+
+std::uint32_t SkinnedMeshRenderer::NumSoaJoints() const
+{
+    return m_ozz ? static_cast<std::uint32_t>(m_ozz->skeleton.num_soa_joints()) : 0u;
+}
+
+std::vector<std::string> SkinnedMeshRenderer::JointNames() const
+{
+    std::vector<std::string> names;
+    if (!m_ozz)
+        return names;
+    const ozz::span<const char* const> jointNames = m_ozz->skeleton.joint_names();
+    names.reserve(jointNames.size());
+    for (const char* name : jointNames)
+        names.emplace_back(name ? name : "");
+    return names;
+}
+
 void SkinnedMeshRenderer::Render(VulkanDevice& device, double timeSeconds)
 {
     static bool loggedNoPipeline = false;
@@ -2083,9 +2161,10 @@ float SkinnedMeshRenderer::GroundOffsetY() const
     return -m_bounds.min[1];
 }
 
-bool SkinnedMeshRenderer::SkinPose(float animTimeSeconds, bool updateBounds, bool logSamples, MotionState state)
+bool SkinnedMeshRenderer::SamplePoseFromState(float animTimeSeconds, MotionState state,
+    ozz::span<ozz::math::SoaTransform> outLocals)
 {
-    if (!m_ozz || m_boneCount == 0)
+    if (!m_ozz)
         return false;
 
     // Select the clip for the requested motion state, falling back to idle (then the rest
@@ -2108,19 +2187,26 @@ bool SkinnedMeshRenderer::SkinPose(float animTimeSeconds, bool updateBounds, boo
         samplingJob.animation = clip;
         samplingJob.context = &m_ozz->context;
         samplingJob.ratio = ratio;
-        samplingJob.output = ozz::make_span(m_ozz->locals);
+        samplingJob.output = outLocals;
         if (!samplingJob.Run())
             return false;
     }
     else
     {
         const auto rest = m_ozz->skeleton.joint_rest_poses();
-        std::copy(rest.begin(), rest.end(), m_ozz->locals.begin());
+        std::copy(rest.begin(), rest.end(), outLocals.begin());
     }
+    return true;
+}
+
+bool SkinnedMeshRenderer::BuildPaletteFromLocals(ozz::span<const ozz::math::SoaTransform> locals)
+{
+    if (!m_ozz || m_boneCount == 0)
+        return false;
 
     ozz::animation::LocalToModelJob localToModel;
     localToModel.skeleton = &m_ozz->skeleton;
-    localToModel.input = ozz::make_span(m_ozz->locals);
+    localToModel.input = locals;
     localToModel.output = ozz::make_span(m_ozz->models);
     if (!localToModel.Run())
         return false;
@@ -2138,7 +2224,11 @@ bool SkinnedMeshRenderer::SkinPose(float animTimeSeconds, bool updateBounds, boo
         }
         m_bonePaletteCpu[bone] = ToRowVectorPaletteMatrix(m_ozz->models[bone] * inverseBind);
     }
+    return true;
+}
 
+bool SkinnedMeshRenderer::CpuSkinVertices(bool updateBounds, bool logSamples)
+{
     float minValue[3] = {
         std::numeric_limits<float>::max(),
         std::numeric_limits<float>::max(),
@@ -2214,6 +2304,39 @@ bool SkinnedMeshRenderer::SkinPose(float animTimeSeconds, bool updateBounds, boo
     return true;
 }
 
+bool SkinnedMeshRenderer::SkinPose(float animTimeSeconds, bool updateBounds, bool logSamples, MotionState state)
+{
+    if (!m_ozz || m_boneCount == 0)
+        return false;
+
+    // Full path (load-time bounds + the one-time compute-skin verification): sample the clip,
+    // build the GPU palette, AND CPU-skin every vertex. The CPU vertex loop populates
+    // m_vertices, which VerifyComputeSkin compares against the GPU result and which the bounds
+    // pass reads — so it must always run here. The per-frame runtime path goes through
+    // UploadBonePalette, which deliberately skips this loop.
+    if (!SamplePoseFromState(animTimeSeconds, state, ozz::make_span(m_ozz->locals)))
+        return false;
+    if (!BuildPaletteFromLocals(ozz::make_span(m_ozz->locals)))
+        return false;
+    return CpuSkinVertices(updateBounds, logSamples);
+}
+
+bool SkinnedMeshRenderer::UploadPaletteToBuffer(uint32_t frameIndex, uint32_t skinSlot)
+{
+    if (frameIndex >= kFramesInFlight || skinSlot >= kSkinSlots ||
+        !m_bonePaletteBuffers[frameIndex][skinSlot].memory || m_bonePaletteCpu.empty())
+    {
+        return false;
+    }
+
+    const VkDeviceSize size = sizeof(Mat4) * m_bonePaletteCpu.size();
+    void* mapped = nullptr;
+    VK_CHECK(vkMapMemory(m_device, m_bonePaletteBuffers[frameIndex][skinSlot].memory, 0, size, 0, &mapped));
+    std::memcpy(mapped, m_bonePaletteCpu.data(), static_cast<size_t>(size));
+    vkUnmapMemory(m_device, m_bonePaletteBuffers[frameIndex][skinSlot].memory);
+    return true;
+}
+
 bool SkinnedMeshRenderer::UploadBonePalette(float animTimeSeconds, uint32_t frameIndex)
 {
     return UploadBonePalette(m_motionState, animTimeSeconds, frameIndex, 0);
@@ -2227,15 +2350,13 @@ bool SkinnedMeshRenderer::UploadBonePalette(MotionState state, float animTimeSec
         return false;
     }
 
-    if (!SkinPose(animTimeSeconds, false, false, state))
+    // Runtime per-frame path: sample the clip + build the GPU palette, but SKIP the CPU
+    // vertex-skinning loop (it only feeds bounds/verification, which are done at load).
+    if (!SamplePoseFromState(animTimeSeconds, state, ozz::make_span(m_ozz->locals)))
         return false;
-
-    const VkDeviceSize size = sizeof(Mat4) * m_bonePaletteCpu.size();
-    void* mapped = nullptr;
-    VK_CHECK(vkMapMemory(m_device, m_bonePaletteBuffers[frameIndex][skinSlot].memory, 0, size, 0, &mapped));
-    std::memcpy(mapped, m_bonePaletteCpu.data(), static_cast<size_t>(size));
-    vkUnmapMemory(m_device, m_bonePaletteBuffers[frameIndex][skinSlot].memory);
-    return true;
+    if (!BuildPaletteFromLocals(ozz::make_span(m_ozz->locals)))
+        return false;
+    return UploadPaletteToBuffer(frameIndex, skinSlot);
 }
 
 void SkinnedMeshRenderer::DispatchSkin(VkCommandBuffer cmd, uint32_t frameIndex)

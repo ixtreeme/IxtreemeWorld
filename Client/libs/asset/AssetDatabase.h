@@ -49,6 +49,8 @@ enum class AssetType
     Scene,
     Prefab,
     Project,
+    AnimationClip,
+    AnimatorController,
     Unknown
 };
 

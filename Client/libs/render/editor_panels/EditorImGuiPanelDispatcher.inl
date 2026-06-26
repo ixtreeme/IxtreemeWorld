@@ -20,6 +20,7 @@ void EditorImGui::RenderEditorPanels()
     RenderInspector();
     RenderSceneViewDropTarget();
     RenderGameViewPanel();
+    RenderAnimatorPanel();
     RenderWaterSculptToolPanel();
     RenderHeightmapToolPanel();
     RenderSplatPaintToolPanel();

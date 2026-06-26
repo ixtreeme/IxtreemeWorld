@@ -4,6 +4,7 @@
 #include "math/IXMath.h"
 
 #include <assimp/Importer.hpp>
+#include <assimp/config.h>
 #include <assimp/material.h>
 #include <assimp/postprocess.h>
 #include <assimp/scene.h>
@@ -391,6 +392,28 @@ void ExtractSkeleton(const aiScene& scene, AssimpImporter::ImportResult& result)
             inverseBindByName[name] = MatrixToRowMajor(bone->mOffsetMatrix);
         }
     }
+
+    // Animation-only FBX (e.g. a standalone Mixamo download) has no meshes and therefore no aiBone
+    // entries, so the mesh scan above finds nothing. Fall back to treating every node targeted by an
+    // animation channel as a bone: the node-hierarchy walk below then builds the skeleton from the
+    // scene graph. Inverse-bind poses stay identity — they are only needed for skinning, which an
+    // animation-only clip never does.
+    if (boneNames.empty())
+    {
+        for (unsigned int animIndex = 0; animIndex < scene.mNumAnimations; ++animIndex)
+        {
+            const aiAnimation* animation = scene.mAnimations[animIndex];
+            if (!animation)
+                continue;
+            for (unsigned int channelIndex = 0; channelIndex < animation->mNumChannels; ++channelIndex)
+            {
+                const aiNodeAnim* channel = animation->mChannels[channelIndex];
+                if (channel)
+                    boneNames[channel->mNodeName.C_Str()] = true;
+            }
+        }
+    }
+
     if (boneNames.empty())
         return;
 
@@ -547,9 +570,17 @@ void ExtractAnimations(const aiScene& scene,
             continue;
         const double ticksPerSecond = aiAnim->mTicksPerSecond > 0.0 ? aiAnim->mTicksPerSecond : 25.0;
         AssimpImporter::AnimationData animation{};
-        animation.name = aiAnim->mName.length > 0
-            ? aiAnim->mName.C_Str()
-            : (fbxPath.stem().string() + "_anim_" + std::to_string(animationIndex));
+        // Mixamo exports always name their single take "mixamo.com" — meaningless and collision-
+        // prone across separate walk/run downloads — so treat it (and an empty name) as a request
+        // to fall back to the file stem, giving each clip a distinguishable name (e.g.
+        // "Walking_anim_0").
+        std::string takeName = aiAnim->mName.length > 0 ? std::string(aiAnim->mName.C_Str()) : std::string();
+        std::string takeNameLower = takeName;
+        std::transform(takeNameLower.begin(), takeNameLower.end(), takeNameLower.begin(),
+            [](unsigned char c) { return static_cast<char>(std::tolower(c)); });
+        if (takeName.empty() || takeNameLower == "mixamo.com")
+            takeName = fbxPath.stem().string() + "_anim_" + std::to_string(animationIndex);
+        animation.name = std::move(takeName);
         animation.ticksPerSecond = static_cast<float>(ticksPerSecond);
         animation.duration = static_cast<float>(aiAnim->mDuration / ticksPerSecond);
 
@@ -661,8 +692,20 @@ AssimpImporter::ImportResult AssimpImporter::importFile(const std::filesystem::p
     result.assetName = fbxPath.stem().string();
 
     Assimp::Importer importer;
+    // Collapse FBX pivot helper nodes so each bone is a single node whose name matches both its
+    // animation channel target and its aiBone name. Left at Assimp's default, FBX rigs (Mixamo in
+    // particular) emit intermediate "<bone>_$AssimpFbx$_Rotation/Translation" nodes that the
+    // channel-to-bone lookup and the name-based retarget onto another rig cannot resolve. Clean
+    // rigs without pivots are unaffected (no helper nodes are generated either way).
+    importer.SetPropertyInteger(AI_CONFIG_IMPORT_FBX_PRESERVE_PIVOTS, 0);
     const aiScene* scene = importer.ReadFile(fbxPath.string(), kFbxImportFlags);
-    if (!scene || (scene->mFlags & AI_SCENE_FLAGS_INCOMPLETE) || !scene->mRootNode)
+    // Assimp flags a scene AI_SCENE_FLAGS_INCOMPLETE when it carries no meshes — the normal state
+    // for a standalone animation FBX (e.g. a Mixamo download). Tolerate that as long as the scene
+    // still has a node graph and at least one animation to extract; only a genuinely unreadable
+    // scene (null / no root) or an incomplete scene with nothing to salvage is fatal.
+    const bool incompleteScene = scene && (scene->mFlags & AI_SCENE_FLAGS_INCOMPLETE);
+    const bool sceneHasAnimations = scene && scene->mNumAnimations > 0;
+    if (!scene || !scene->mRootNode || (incompleteScene && !sceneHasAnimations))
     {
         result.errorMessage = importer.GetErrorString();
         if (result.errorMessage.empty())
@@ -747,9 +790,14 @@ AssimpImporter::ImportResult AssimpImporter::importFile(const std::filesystem::p
         }
     }
 
-    if (result.meshes.empty())
+    // A mesh-less FBX is still a valid import when it carries skeletal animation (a standalone
+    // Mixamo-style animation file): the skeleton and animations were already extracted above and
+    // are written as .ozz/.ixclip sidecars downstream. Only fail when there is neither mesh nor
+    // animation data to import.
+    const bool hasAnimationData = result.skeleton && !result.animations.empty();
+    if (result.meshes.empty() && !hasAnimationData)
     {
-        result.errorMessage = "no static mesh data extracted";
+        result.errorMessage = "no static mesh or animation data extracted";
         return result;
     }
 
@@ -771,7 +819,8 @@ AssimpImporter::ImportResult AssimpImporter::importFile(const std::filesystem::p
 bool AssimpImporter::writeOzzSidecars(const ImportResult& result,
                                       const std::filesystem::path& skeletonPath,
                                       const std::vector<std::filesystem::path>& animationPaths,
-                                      std::string& error) const
+                                      std::string& error,
+                                      std::vector<std::string>* outJointNames) const
 {
     if (!result.skeleton || result.skeleton->bones.empty())
     {
@@ -806,6 +855,33 @@ bool AssimpImporter::writeOzzSidecars(const ImportResult& result,
     if (!SaveOzzObject(skeletonPath, *skeleton, error))
         return false;
 
+    // Built skeleton joint order (ozz reorders depth-first inside SkeletonBuilder, which can
+    // differ from the raw bone order). The runtime Animation tracks MUST be in THIS order — not
+    // raw bone order — for SamplingJob output to align with the skeleton joints. Map each raw
+    // bone to its built joint index by name, and report joint_names (the clip's retarget key).
+    const ozz::span<const char* const> builtJointNames = skeleton->joint_names();
+    const int builtJointCount = static_cast<int>(builtJointNames.size());
+    if (outJointNames)
+    {
+        outJointNames->clear();
+        outJointNames->reserve(static_cast<std::size_t>(builtJointCount));
+        for (const char* name : builtJointNames)
+            outJointNames->emplace_back(name ? name : "");
+    }
+    std::vector<int> builtIndexForRaw(result.skeleton->bones.size(), -1);
+    for (std::size_t r = 0; r < result.skeleton->bones.size(); ++r)
+    {
+        const std::string& rawName = result.skeleton->bones[r].name;
+        for (int j = 0; j < builtJointCount; ++j)
+        {
+            if (builtJointNames[j] && rawName == builtJointNames[j])
+            {
+                builtIndexForRaw[r] = j;
+                break;
+            }
+        }
+    }
+
     std::size_t animationCount = std::min(animationPaths.size(), result.animations.size());
     for (std::size_t animIndex = 0; animIndex < animationCount; ++animIndex)
     {
@@ -816,12 +892,15 @@ bool AssimpImporter::writeOzzSidecars(const ImportResult& result,
         ozz::animation::offline::RawAnimation rawAnimation;
         rawAnimation.name = source.name.c_str();
         rawAnimation.duration = std::max(0.001f, source.duration);
-        rawAnimation.tracks.resize(result.skeleton->bones.size());
+        rawAnimation.tracks.resize(static_cast<std::size_t>(builtJointCount));
         for (const BoneTrack& track : source.tracks)
         {
-            if (track.boneIndex < 0 || track.boneIndex >= static_cast<int>(rawAnimation.tracks.size()))
+            if (track.boneIndex < 0 || track.boneIndex >= static_cast<int>(builtIndexForRaw.size()))
                 continue;
-            auto& rawTrack = rawAnimation.tracks[track.boneIndex];
+            const int builtIdx = builtIndexForRaw[track.boneIndex];
+            if (builtIdx < 0 || builtIdx >= static_cast<int>(rawAnimation.tracks.size()))
+                continue;
+            auto& rawTrack = rawAnimation.tracks[builtIdx];
             float previousTime = -1.0f;
             for (const AnimationKeyframe& key : track.keyframes)
             {

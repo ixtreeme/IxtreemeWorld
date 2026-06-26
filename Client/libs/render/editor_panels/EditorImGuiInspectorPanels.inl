@@ -754,6 +754,87 @@ bool EditorImGui::RenderSelectedMeshPhysicsComponents()
         ImGui::PopID();
     }
 
+    if (m_meshRendererState.skinned)
+    {
+        ImGui::PushID("animation.debug_clip");
+        if (ImGui::CollapsingHeader(ICON_FA_PERSON_RUNNING " Animation (debug)", ImGuiTreeNodeFlags_DefaultOpen))
+        {
+            std::vector<AssetLibrary::Entry> clips;
+            if (m_assetLibrary)
+                clips = m_assetLibrary->EntriesFor(AssetLibrary::Category::AnimationClip);
+
+            std::vector<const char*> labels;
+            labels.reserve(clips.size() + 1);
+            labels.push_back("(none)");
+            int currentIndex = 0;
+            for (std::size_t i = 0; i < clips.size(); ++i)
+            {
+                labels.push_back(clips[i].displayName.c_str());
+                if (clips[i].id == m_meshRendererState.debugAnimationClipId)
+                    currentIndex = static_cast<int>(i) + 1;
+            }
+            if (ImGui::Combo("Clip", &currentIndex, labels.data(), static_cast<int>(labels.size())))
+            {
+                m_meshRendererState.debugAnimationClipId =
+                    (currentIndex <= 0) ? std::string() : clips[static_cast<std::size_t>(currentIndex - 1)].id;
+                changed = true;
+            }
+            ImGui::TextDisabled("Debug single clip (Stage 3). The Animator Controller below");
+            ImGui::TextDisabled("overrides it when assigned.");
+
+            ImGui::Separator();
+            // Stage-4 Animator Controller (state machine; takes priority over the debug clip).
+            std::vector<AssetLibrary::Entry> controllers;
+            if (m_assetLibrary)
+                controllers = m_assetLibrary->EntriesFor(AssetLibrary::Category::AnimatorController);
+            std::vector<const char*> ctrlLabels;
+            ctrlLabels.reserve(controllers.size() + 1);
+            ctrlLabels.push_back("(none)");
+            int ctrlIndex = 0;
+            for (std::size_t i = 0; i < controllers.size(); ++i)
+            {
+                ctrlLabels.push_back(controllers[i].displayName.c_str());
+                if (controllers[i].id == m_meshRendererState.animatorControllerId)
+                    ctrlIndex = static_cast<int>(i) + 1;
+            }
+            if (ImGui::Combo("Controller", &ctrlIndex, ctrlLabels.data(), static_cast<int>(ctrlLabels.size())))
+            {
+                m_meshRendererState.animatorControllerId =
+                    (ctrlIndex <= 0) ? std::string() : controllers[static_cast<std::size_t>(ctrlIndex - 1)].id;
+                changed = true;
+            }
+            if (ImGui::Button("Create Locomotion Controller") && m_assetLibrary)
+            {
+                AssetLibrary::ImportOptions opts;
+                opts.displayName = "Locomotion";
+                AssetLibrary::Entry created;
+                std::string createErr;
+                if (m_assetLibrary->CreateAnimatorController(opts, created, createErr))
+                {
+                    m_meshRendererState.animatorControllerId = created.id;
+                    changed = true;
+                    m_assetStatus = "Created controller " + created.displayName;
+                }
+                else
+                {
+                    m_assetStatus = "Create controller failed: " + createErr;
+                }
+            }
+            if (!m_meshRendererState.animatorControllerId.empty())
+            {
+                ImGui::SameLine();
+                if (ImGui::Button(ICON_FA_PERSON_RUNNING " Open in Animator"))
+                {
+                    m_animatorPanelOpen = true;
+                    m_pendingViewFocusWindow = ICON_FA_PERSON_RUNNING " Animator";
+                }
+            }
+            ImGui::TextDisabled("Drives idle/walk/run by Speed (auto-bound from movement in Play).");
+            ImGui::TextDisabled("Empty states auto-fill with this character's <name>_anim_<i> clips.");
+        }
+        ImGui::PopID();
+    }
+
     if (m_meshRendererState.hasCharacterController)
     {
         ImGui::PushID("physics.character_controller");

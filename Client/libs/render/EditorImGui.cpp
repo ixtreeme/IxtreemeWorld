@@ -1360,6 +1360,99 @@ void EditorImGui::RefreshAssetLibrary()
     Tracen("[EDITOR-IMGUI-3] Asset Browser refreshed");
 }
 
+void EditorImGui::EnsureModelAnimationClips(const std::filesystem::path& modelPath,
+    const std::vector<std::string>& jointNames)
+{
+    if (!m_assetLibrary || jointNames.empty() || modelPath.empty())
+        return;
+
+    const std::filesystem::path modelDir = modelPath.parent_path();
+    const std::string stem = modelPath.stem().string();
+    std::string subpath;
+    subpath.reserve(stem.size());
+    for (char c : stem)
+        subpath.push_back(std::isalnum(static_cast<unsigned char>(c)) ? c : '_');
+
+    bool createdAny = false;
+    for (int i = 0; i < 8; ++i)
+    {
+        std::error_code ec;
+        const std::filesystem::path animPath = modelDir / (stem + "_anim_" + std::to_string(i) + ".ozz");
+        if (!std::filesystem::exists(animPath, ec))
+            continue;  // clip indices may be sparse
+
+        const std::string displayName = stem + "_anim_" + std::to_string(i);
+        bool alreadyPresent = false;
+        for (const AssetLibrary::Entry& entry : m_assetLibrary->Entries())
+        {
+            if (entry.category == AssetLibrary::Category::AnimationClip &&
+                entry.displayName == displayName &&
+                AssetLibrary::NormalizeSubpath(entry.subpath) == AssetLibrary::NormalizeSubpath(subpath))
+            {
+                alreadyPresent = true;
+                break;
+            }
+        }
+        if (alreadyPresent)
+            continue;
+
+        AssetLibrary::ImportOptions options;
+        options.displayName = displayName;
+        options.subpath = subpath;
+        AssetLibrary::AnimationClipData clip;
+        clip.jointNames = jointNames;
+        clip.loop = true;
+        clip.rootJoint = jointNames.front();
+        clip.sourceAnimPath = animPath.generic_string();
+        AssetLibrary::Entry outEntry;
+        std::string error;
+        if (m_assetLibrary->CreateAnimationClip(options, clip, outEntry, error))
+        {
+            createdAny = true;
+            Tracenf("[ANIM-CLIP] generated from model id=%s model=%s joints=%zu",
+                outEntry.id.c_str(), stem.c_str(), jointNames.size());
+        }
+        else
+        {
+            Tracenf("[ANIM-CLIP] generate failed model=%s anim=%d error=%s", stem.c_str(), i, error.c_str());
+        }
+    }
+    if (createdAny)
+        m_assetStatus = "Animation clips generated for " + stem;
+}
+
+std::string EditorImGui::AnimationClipFilePath(const std::string& clipId) const
+{
+    if (!m_assetLibrary || clipId.empty())
+        return {};
+    const auto entry = m_assetLibrary->FindById(clipId);
+    if (!entry || entry->category != AssetLibrary::Category::AnimationClip)
+        return {};
+    return m_assetLibrary->AbsolutePath(*entry).generic_string();
+}
+
+std::string EditorImGui::AnimatorControllerFilePath(const std::string& controllerId) const
+{
+    if (!m_assetLibrary || controllerId.empty())
+        return {};
+    const auto entry = m_assetLibrary->FindById(controllerId);
+    if (!entry || entry->category != AssetLibrary::Category::AnimatorController)
+        return {};
+    return m_assetLibrary->AbsolutePath(*entry).generic_string();
+}
+
+std::string EditorImGui::FindAnimationClipIdByDisplayName(const std::string& displayName) const
+{
+    if (!m_assetLibrary || displayName.empty())
+        return {};
+    for (const AssetLibrary::Entry& entry : m_assetLibrary->Entries())
+    {
+        if (entry.category == AssetLibrary::Category::AnimationClip && entry.displayName == displayName)
+            return entry.id;
+    }
+    return {};
+}
+
 std::optional<LodConfig> EditorImGui::FindModelLodDefault(const std::string& assetId) const
 {
     if (!m_assetLibrary || assetId.empty())
@@ -1394,6 +1487,8 @@ bool EditorImGui::ActiveAssetCategory(AssetLibrary::Category category) const
     case AssetBrowserFilter::Texture: return category == AssetLibrary::Category::Texture;
     case AssetBrowserFilter::Model: return category == AssetLibrary::Category::Model;
     case AssetBrowserFilter::Animation: return category == AssetLibrary::Category::Animation;
+    case AssetBrowserFilter::AnimationClip: return category == AssetLibrary::Category::AnimationClip;
+    case AssetBrowserFilter::AnimatorController: return category == AssetLibrary::Category::AnimatorController;
     case AssetBrowserFilter::Material: return category == AssetLibrary::Category::Material;
     case AssetBrowserFilter::WaterMaterial: return category == AssetLibrary::Category::WaterMaterial;
     case AssetBrowserFilter::PhysicsMaterial: return category == AssetLibrary::Category::PhysicsMaterial;
@@ -1409,6 +1504,8 @@ AssetLibrary::Category EditorImGui::FolderCategory() const
     {
     case AssetBrowserFilter::Model: return AssetLibrary::Category::Model;
     case AssetBrowserFilter::Animation: return AssetLibrary::Category::Animation;
+    case AssetBrowserFilter::AnimationClip: return AssetLibrary::Category::AnimationClip;
+    case AssetBrowserFilter::AnimatorController: return AssetLibrary::Category::AnimatorController;
     case AssetBrowserFilter::Material: return AssetLibrary::Category::Material;
     case AssetBrowserFilter::WaterMaterial: return AssetLibrary::Category::WaterMaterial;
     case AssetBrowserFilter::PhysicsMaterial: return AssetLibrary::Category::PhysicsMaterial;
@@ -1429,6 +1526,8 @@ const char* EditorImGui::AssetFilterName() const
     case AssetBrowserFilter::Texture: return "Textures";
     case AssetBrowserFilter::Model: return "Models";
     case AssetBrowserFilter::Animation: return "Anims";
+    case AssetBrowserFilter::AnimationClip: return "Anim Clips";
+    case AssetBrowserFilter::AnimatorController: return "Animators";
     case AssetBrowserFilter::Material: return "Materials";
     case AssetBrowserFilter::WaterMaterial: return "Water Mats";
     case AssetBrowserFilter::PhysicsMaterial: return "Physics Mats";
@@ -1499,6 +1598,8 @@ std::vector<std::string> EditorImGui::QueryVisibleFolders() const
         AssetLibrary::Category::Texture,
         AssetLibrary::Category::Model,
         AssetLibrary::Category::Animation,
+        AssetLibrary::Category::AnimationClip,
+        AssetLibrary::Category::AnimatorController,
         AssetLibrary::Category::Material,
         AssetLibrary::Category::WaterMaterial,
         AssetLibrary::Category::PhysicsMaterial,
@@ -2920,6 +3021,7 @@ void EditorImGui::BeginFrame(bool editorModeActive)
 }
 
 #include "editor_panels/EditorImGuiSceneViewPanels.inl"
+#include "editor_panels/EditorImGuiAnimatorPanels.inl"
 #include "editor_panels/EditorImGuiProjectPanels.inl"
 #include "editor_panels/EditorImGuiMenuToolbarPanels.inl"
 #include "editor_panels/EditorImGuiHierarchyPanels.inl"

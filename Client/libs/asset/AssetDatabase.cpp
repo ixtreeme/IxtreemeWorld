@@ -116,6 +116,10 @@ std::optional<AssetType> ParseAssetType(const std::string& value)
         return AssetType::Material;
     if (value == "Animation")
         return AssetType::Animation;
+    if (value == "AnimationClip")
+        return AssetType::AnimationClip;
+    if (value == "AnimatorController")
+        return AssetType::AnimatorController;
     if (value == "Scene")
         return AssetType::Scene;
     if (value == "Prefab")
@@ -459,6 +463,10 @@ AssetType detectAssetType(const std::filesystem::path& filePath)
         return AssetType::Material;
     if (ext == ".anim" || ext == ".ozz")
         return AssetType::Animation;
+    if (ext == ".ixclip")
+        return AssetType::AnimationClip;
+    if (ext == ".controller")
+        return AssetType::AnimatorController;
     if (ext == ".scene")
         return AssetType::Scene;
     if (ext == ".ixprefab")
@@ -476,6 +484,8 @@ const char* AssetTypeName(AssetType type)
     case AssetType::Texture: return "Texture";
     case AssetType::Material: return "Material";
     case AssetType::Animation: return "Animation";
+    case AssetType::AnimationClip: return "AnimationClip";
+    case AssetType::AnimatorController: return "AnimatorController";
     case AssetType::Scene: return "Scene";
     case AssetType::Prefab: return "Prefab";
     case AssetType::Project: return "Project";

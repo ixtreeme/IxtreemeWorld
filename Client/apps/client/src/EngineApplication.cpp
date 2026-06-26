@@ -16,6 +16,8 @@
 #include "LODSystem.h"
 #include "MeshSystem.h"
 #include "NativeWindow.h"
+#include "AnimationRuntime.h"
+#include "AnimatorRuntime.h"
 #include "EditorImGui.h"
 #include "physics/PhysicsWorld.h"
 #if defined(_WIN32)
@@ -115,6 +117,8 @@ struct CharacterRuntimeState
     float lookYaw = 0.0f;   // camera/heading yaw (radians)
     float lookPitch = 0.0f; // camera pitch (radians)
     RuntimeMoveState moveState = RuntimeMoveState::Idle; // drives walk/run animation
+    float planarSpeed = 0.0f;        // continuous horizontal speed (m/s) — drives the Animator "Speed" param
+    bool jumpedThisFrame = false;    // a jump was initiated this frame — drives the "Jump" trigger
 };
 
 // Advances one player character (kinematic capsule) for this frame: camera-relative WASD
@@ -176,12 +180,17 @@ void UpdateCharacterController(
         state.moveState = (inputActive && input.shift) ? RuntimeMoveState::Running : RuntimeMoveState::Walking;
     else
         state.moveState = RuntimeMoveState::Idle;
+    state.planarSpeed = (moveLen > 0.0001f) ? speed : 0.0f;
+    state.jumpedThisFrame = false;
 
     // --- gravity / jump (vertical velocity) ---
     const float gY = worldGravity[1] * cc.gravityScale; // negative downward
     const bool jumpPressed = inputActive && input.space;
     if (state.grounded && jumpPressed)
+    {
         state.velocity.y = std::sqrt(std::max(0.0f, -2.0f * gY * cc.jumpHeight));
+        state.jumpedThisFrame = true;
+    }
     else if (state.grounded)
         state.velocity.y = -2.0f; // small stick-down so the ground ray keeps contact
     else
@@ -523,6 +532,8 @@ MeshRendererEditorState BuildMeshRendererEditorState(const std::vector<MeshScene
     state.hingeJoint = it->hingeJoint;
     state.hasCharacterController = it->hasCharacterController;
     state.characterController = it->characterController;
+    state.debugAnimationClipId = it->debugAnimationClipId;
+    state.animatorControllerId = it->animatorControllerId;
     state.materialSlotCount = std::max<std::uint32_t>(
         1u,
         std::max(static_cast<std::uint32_t>(state.materialSlots.size()),
@@ -556,6 +567,8 @@ void ApplyMeshRendererEditorState(MeshSceneEntity& mesh, const MeshRendererEdito
     mesh.hingeJoint = state.hingeJoint;
     mesh.hasCharacterController = state.hasCharacterController;
     mesh.characterController = state.characterController;
+    mesh.debugAnimationClipId = state.debugAnimationClipId;
+    mesh.animatorControllerId = state.animatorControllerId;
 }
 
 std::filesystem::path ResolveModelAssetPathForMeta(const std::string& meshAssetPath)
@@ -1866,6 +1879,214 @@ void MergeMapEditorCommands(MapEditorCommands& target, const MapEditorCommands& 
         std::copy(std::begin(source.sceneGizmoRotation), std::end(source.sceneGizmoRotation), std::begin(target.sceneGizmoRotation));
         std::copy(std::begin(source.sceneGizmoScale), std::end(source.sceneGizmoScale), std::begin(target.sceneGizmoScale));
     }
+    // Stage 7: Animator graph edits are a stream — APPEND, never overwrite (the MergeMapEditorCommands
+    // silent-drop gotcha). Multiple fragments across a frame all accumulate.
+    if (!source.animatorEdits.empty())
+        target.animatorEdits.insert(target.animatorEdits.end(),
+            source.animatorEdits.begin(), source.animatorEdits.end());
+}
+
+// The display-layer (MapEditorTypes.h) mirrors of the ixanim enums must keep identical ordinals,
+// since edits cast between them. This is the only place both enums are visible.
+static_assert(static_cast<int>(AnimEditConditionOp::Greater) == static_cast<int>(ixanim::ConditionOp::Greater));
+static_assert(static_cast<int>(AnimEditConditionOp::IfNot) == static_cast<int>(ixanim::ConditionOp::IfNot));
+static_assert(static_cast<int>(AnimEditParamType::Float) == static_cast<int>(ixanim::ParamType::Float));
+static_assert(static_cast<int>(AnimEditParamType::Trigger) == static_cast<int>(ixanim::ParamType::Trigger));
+
+// Stage 7: apply a batch of Animator graph edits to the real controller in place. Returns true if a
+// runtime re-bind is needed (any behavior-changing edit) — a pure-layout MoveNode must NOT rebind,
+// or dragging a node in Play would reset the animation to its default state. The caller saves the
+// .controller asset regardless. v1 implements clip-assign + node-drag; later chunks extend the switch.
+bool ApplyAnimatorGraphEdits(ixanim::AnimatorController& controller,
+                             const std::vector<AnimatorGraphEdit>& edits)
+{
+    bool needsRebind = false;
+    for (const AnimatorGraphEdit& edit : edits)
+    {
+        switch (edit.type)
+        {
+        case AnimatorGraphEditType::MoveNode:
+            for (ixanim::AnimatorState& state : controller.states)
+            {
+                if (state.id == edit.stateId)
+                {
+                    state.graphPos[0] += edit.graphDeltaX;
+                    state.graphPos[1] += edit.graphDeltaY;
+                    break;
+                }
+            }
+            break;  // cosmetic: no rebind
+        case AnimatorGraphEditType::AssignClip:
+            for (ixanim::AnimatorState& state : controller.states)
+            {
+                if (state.id == edit.stateId)
+                {
+                    state.clipId = edit.text;
+                    break;
+                }
+            }
+            needsRebind = true;
+            break;
+        case AnimatorGraphEditType::RenameState:
+            for (ixanim::AnimatorState& state : controller.states)
+                if (state.id == edit.stateId) { state.name = edit.text; break; }
+            break;  // cosmetic
+        case AnimatorGraphEditType::SetStateSpeed:
+            for (ixanim::AnimatorState& state : controller.states)
+                if (state.id == edit.stateId) { state.speed = edit.floatValue; break; }
+            break;  // read live by the runtime
+        case AnimatorGraphEditType::SetStateLoop:
+            for (ixanim::AnimatorState& state : controller.states)
+                if (state.id == edit.stateId) { state.loop = edit.boolValue; break; }
+            break;  // read live by the runtime
+        case AnimatorGraphEditType::SetDefaultState:
+            controller.defaultStateId = edit.stateId;
+            break;  // matters at entry; the default-marker updates live, no reset needed
+        case AnimatorGraphEditType::AddState:
+        {
+            std::uint32_t maxId = 0;
+            for (const ixanim::AnimatorState& state : controller.states)
+                if (state.id != ixanim::kAnyStateId && state.id > maxId)
+                    maxId = state.id;
+            const bool wasEmpty = controller.states.empty();
+            ixanim::AnimatorState ns;
+            ns.id = maxId + 1u;
+            ns.name = edit.text.empty() ? ("State " + std::to_string(ns.id)) : edit.text;
+            ns.graphPos[0] = edit.graphDeltaX;  // AddState reuses the delta fields as an absolute pos
+            ns.graphPos[1] = edit.graphDeltaY;
+            controller.states.push_back(std::move(ns));
+            if (wasEmpty)
+            {
+                controller.defaultStateId = maxId + 1u;
+                needsRebind = true;  // the first state becomes the entry state
+            }
+            break;
+        }
+        case AnimatorGraphEditType::DeleteState:
+            controller.transitions.erase(
+                std::remove_if(controller.transitions.begin(), controller.transitions.end(),
+                    [&](const ixanim::AnimatorTransition& t) {
+                        return t.fromStateId == edit.stateId || t.toStateId == edit.stateId;
+                    }),
+                controller.transitions.end());
+            controller.states.erase(
+                std::remove_if(controller.states.begin(), controller.states.end(),
+                    [&](const ixanim::AnimatorState& s) { return s.id == edit.stateId; }),
+                controller.states.end());
+            if (controller.defaultStateId == edit.stateId)
+                controller.defaultStateId = controller.states.empty() ? 0u : controller.states.front().id;
+            needsRebind = true;  // the deleted state may have been the current one
+            break;
+        case AnimatorGraphEditType::CreateTransition:
+        {
+            ixanim::AnimatorTransition t;
+            t.fromStateId = edit.stateId;     // kAnyStateId for an Any-State transition
+            t.toStateId = edit.toStateId;
+            controller.transitions.push_back(std::move(t));
+            break;  // transitions are evaluated live by the runtime — no rebind
+        }
+        case AnimatorGraphEditType::DeleteTransition:
+        {
+            for (auto it = controller.transitions.begin(); it != controller.transitions.end(); ++it)
+            {
+                if (it->fromStateId == edit.stateId && it->toStateId == edit.toStateId)
+                {
+                    controller.transitions.erase(it);
+                    break;  // remove a single matching transition
+                }
+            }
+            break;  // evaluated live — no rebind
+        }
+        case AnimatorGraphEditType::EditTransition:
+            for (ixanim::AnimatorTransition& t : controller.transitions)
+            {
+                if (t.fromStateId == edit.stateId && t.toStateId == edit.toStateId)
+                {
+                    t.hasExitTime = edit.hasExitTime;
+                    t.exitTime = edit.exitTime;
+                    t.duration = edit.duration;
+                    t.canTransitionToSelf = edit.canTransitionToSelf;
+                    t.conditions.clear();
+                    for (const AnimatorGraphCondition& gc : edit.conditions)
+                    {
+                        ixanim::AnimatorCondition c;
+                        c.param = gc.param;
+                        c.op = static_cast<ixanim::ConditionOp>(static_cast<int>(gc.op));
+                        c.value = gc.value;
+                        t.conditions.push_back(std::move(c));
+                    }
+                    break;  // edit the first matching transition (replace-all semantics)
+                }
+            }
+            break;  // evaluated live by the runtime — no rebind
+        case AnimatorGraphEditType::AddParameter:
+        {
+            ixanim::AnimatorParameter p;
+            const std::string base = edit.text.empty() ? std::string("NewParam") : edit.text;
+            std::string name = base;
+            int suffix = 1;
+            auto nameTaken = [&](const std::string& n) {
+                for (const ixanim::AnimatorParameter& q : controller.parameters)
+                    if (q.name == n) return true;
+                return false;
+            };
+            while (nameTaken(name))
+                name = base + std::to_string(suffix++);
+            p.name = name;
+            p.type = static_cast<ixanim::ParamType>(static_cast<int>(edit.paramType));
+            p.defaultValue = edit.floatValue;
+            controller.parameters.push_back(std::move(p));
+            needsRebind = true;  // the runtime's paramIndex/paramValues are rebuilt at bind
+            break;
+        }
+        case AnimatorGraphEditType::DeleteParameter:
+            for (ixanim::AnimatorTransition& t : controller.transitions)
+                t.conditions.erase(
+                    std::remove_if(t.conditions.begin(), t.conditions.end(),
+                        [&](const ixanim::AnimatorCondition& c) { return c.param == edit.text; }),
+                    t.conditions.end());
+            controller.parameters.erase(
+                std::remove_if(controller.parameters.begin(), controller.parameters.end(),
+                    [&](const ixanim::AnimatorParameter& p) { return p.name == edit.text; }),
+                controller.parameters.end());
+            needsRebind = true;
+            break;
+        case AnimatorGraphEditType::RenameParameter:
+            if (!edit.text2.empty() && edit.text != edit.text2)
+            {
+                // Skip if the target name already exists — duplicate names would collide in the
+                // runtime's name-keyed paramIndex (the second silently shadows the first).
+                bool targetTaken = false;
+                for (const ixanim::AnimatorParameter& p : controller.parameters)
+                    if (p.name == edit.text2) { targetTaken = true; break; }
+                if (!targetTaken)
+                {
+                    for (ixanim::AnimatorParameter& p : controller.parameters)
+                        if (p.name == edit.text) { p.name = edit.text2; break; }
+                    for (ixanim::AnimatorTransition& t : controller.transitions)
+                        for (ixanim::AnimatorCondition& c : t.conditions)
+                            if (c.param == edit.text) c.param = edit.text2;
+                    needsRebind = true;  // paramIndex is keyed by name
+                }
+            }
+            break;
+        case AnimatorGraphEditType::SetParameterType:
+            for (ixanim::AnimatorParameter& p : controller.parameters)
+                if (p.name == edit.text)
+                {
+                    p.type = static_cast<ixanim::ParamType>(static_cast<int>(edit.paramType));
+                    break;
+                }
+            break;  // runtime stores floats — no rebind
+        case AnimatorGraphEditType::SetParameterDefault:
+            for (ixanim::AnimatorParameter& p : controller.parameters)
+                if (p.name == edit.text) { p.defaultValue = edit.floatValue; break; }
+            break;  // takes effect at next bind — no rebind
+        default:
+            break;  // later chunks handle the remaining edit types
+        }
+    }
+    return needsRebind;
 }
 
 struct EditorPlayRuntime
@@ -2156,6 +2377,11 @@ int RunGame(NativeWindow& window,
         entry.renderer->SetLightingState(skinnedCacheLighting);
         entry.state = SkinnedMeshCacheEntry::State::Loaded;
         Tracenf("[MESH-ENTITY] SkinnedMeshRenderer loaded: %s", modelPath.c_str());
+#if defined(IXTREEME_WITH_EDITOR)
+        // Auto-generate retargetable .ixclip assets from this model's existing _anim_<i>.ozz
+        // sidecars so they appear under the asset browser's "Anim Clips" tab (idempotent).
+        editorImGui.EnsureModelAnimationClips(modelPath, entry.renderer->JointNames());
+#endif
         return entry.renderer.get();
     };
     auto resolveMeshRuntimePath = [&](const MeshSceneEntity& mesh) {
@@ -2395,6 +2621,16 @@ int RunGame(NativeWindow& window,
     PhysicsLayerMatrix editorPhysicsLayerMatrix{};
     // Player character controllers: per-entity runtime state + accumulated right-drag look.
     std::unordered_map<std::uint32_t, CharacterRuntimeState> editorCharacterStates;
+    // Stage-3 temp clip binding: per-entity retarget playback + the currently-bound clip id
+    // (to detect changes and rebind). Cleared lazily when an entity's clip is unset.
+    std::unordered_map<std::uint32_t, ixanim::ClipPlayback> entityClipPlaybacks;
+    std::unordered_map<std::uint32_t, std::string> entityBoundClipId;
+    // Stage-4 Animator: per-entity FSM runtime + its (auto-filled) controller copy + the bound
+    // controller asset id (to detect reassignment). Takes priority over the debug clip binding.
+    std::unordered_map<std::uint32_t, ixanim::AnimatorRuntime> entityAnimators;
+    std::unordered_map<std::uint32_t, ixanim::AnimatorController> entityControllers;
+    std::unordered_map<std::uint32_t, std::string> entityBoundControllerId;
+    double animPrevFrameSeconds = 0.0;
     float editorPlayerLookDx = 0.0f;
     float editorPlayerLookDy = 0.0f;
     bool editorPhysicsWorldActive = false;
@@ -8445,6 +8681,171 @@ int RunGame(NativeWindow& window,
                         meshRendererState.materialSlotCount > 0 ? meshRendererState.materialSlotCount - 1u : 0u);
                 }
                 editorImGui.SetMeshRendererEditorState(meshRendererState);
+
+                // Stage-6 Animator graph snapshot for the dedicated Animator window (read-only).
+                // Flatten the selected entity's bound AnimatorController (auto-filled clip ids and
+                // all) into display nodes/edges plus synthetic Entry / Any-State nodes. The runtime
+                // map is populated one frame later by the skinned pre-pass, so a freshly-selected
+                // entity shows its graph on the next frame — invisible to the eye.
+                {
+                    // Stage 7: apply any pending graph edits from the Animator panel to the selected
+                    // entity's controller, persist the .controller, and clear the bound-controller id
+                    // so the skinned pre-pass (later this frame) reloads the saved file and re-binds —
+                    // the edit takes effect immediately.
+                    if (!commands.animatorEdits.empty() &&
+                        selectedEditorObject.type == SelectedEditorObjectType::MeshEntity)
+                    {
+                        auto editIt = entityControllers.find(selectedEditorObject.id);
+                        if (editIt != entityControllers.end())
+                        {
+                            const bool needsRebind =
+                                ApplyAnimatorGraphEdits(editIt->second, commands.animatorEdits);
+                            const std::string ctrlPath =
+                                editorImGui.AnimatorControllerFilePath(editIt->second.id);
+                            if (!ctrlPath.empty())
+                            {
+                                std::ofstream ctrlOut(ctrlPath, std::ios::binary | std::ios::trunc);
+                                ctrlOut << ixanim::ControllerToJson(editIt->second);
+                            }
+                            // Only behavior-changing edits force a re-bind (which resets play state);
+                            // a cosmetic node move persists in-memory + on disk without rebinding.
+                            if (needsRebind)
+                                entityBoundControllerId[selectedEditorObject.id].clear();
+                        }
+                    }
+
+                    AnimatorGraphEditorState animatorGraphState;
+                    if (selectedEditorObject.type == SelectedEditorObjectType::MeshEntity)
+                    {
+                        auto ctrlIt = entityControllers.find(selectedEditorObject.id);
+                        if (ctrlIt != entityControllers.end())
+                        {
+                            const ixanim::AnimatorController& ctrl = ctrlIt->second;
+                            animatorGraphState.hasController = true;
+                            animatorGraphState.controllerId = ctrl.id;
+                            animatorGraphState.controllerDisplayName =
+                                ctrl.displayName.empty() ? ctrl.id : ctrl.displayName;
+                            animatorGraphState.defaultStateId = ctrl.defaultStateId;
+
+                            bool hasAnyState = false;
+                            for (const ixanim::AnimatorTransition& t : ctrl.transitions)
+                                if (t.fromStateId == ixanim::kAnyStateId) { hasAnyState = true; break; }
+
+                            // State nodes (track the default state's position to anchor Entry).
+                            float defaultX = 120.0f, defaultY = 80.0f;
+                            for (const ixanim::AnimatorState& s : ctrl.states)
+                            {
+                                AnimatorGraphNode node;
+                                node.id = s.id;
+                                node.name = s.name;
+                                node.clipLabel = s.clipId.empty() ? "(no clip)" : s.clipId;
+                                node.clipId = s.clipId;
+                                node.speed = s.speed;
+                                node.loop = s.loop;
+                                node.graphPos[0] = s.graphPos[0];
+                                node.graphPos[1] = s.graphPos[1];
+                                node.isDefault = (s.id == ctrl.defaultStateId);
+                                if (s.id == ctrl.defaultStateId)
+                                {
+                                    defaultX = s.graphPos[0];
+                                    defaultY = s.graphPos[1];
+                                }
+                                animatorGraphState.nodes.push_back(std::move(node));
+                            }
+
+                            // Synthetic Entry node (id 0) left of the default state, + its edge.
+                            {
+                                AnimatorGraphNode entry;
+                                entry.id = 0u;
+                                entry.name = "Entry";
+                                entry.isEntry = true;
+                                entry.graphPos[0] = defaultX - 200.0f;
+                                entry.graphPos[1] = defaultY;
+                                animatorGraphState.nodes.push_back(std::move(entry));
+
+                                AnimatorGraphEdge entryEdge;
+                                entryEdge.fromStateId = 0u;
+                                entryEdge.toStateId = ctrl.defaultStateId;
+                                animatorGraphState.edges.push_back(entryEdge);
+                            }
+
+                            // Synthetic Any-State node (id kAnyStateId) above the states; its edges
+                            // already carry fromStateId == kAnyStateId, so they resolve to it.
+                            if (hasAnyState)
+                            {
+                                float minX = 120.0f, minY = 80.0f;
+                                bool first = true;
+                                for (const ixanim::AnimatorState& s : ctrl.states)
+                                {
+                                    minX = first ? s.graphPos[0] : std::min(minX, s.graphPos[0]);
+                                    minY = first ? s.graphPos[1] : std::min(minY, s.graphPos[1]);
+                                    first = false;
+                                }
+                                AnimatorGraphNode anyNode;
+                                anyNode.id = ixanim::kAnyStateId;
+                                anyNode.name = "Any State";
+                                anyNode.isAnyState = true;
+                                anyNode.graphPos[0] = minX;
+                                anyNode.graphPos[1] = minY - 120.0f;
+                                animatorGraphState.nodes.push_back(std::move(anyNode));
+                            }
+
+                            // Transition edges (Any-State ones flagged for the cyan style).
+                            for (const ixanim::AnimatorTransition& t : ctrl.transitions)
+                            {
+                                AnimatorGraphEdge edge;
+                                edge.fromStateId = t.fromStateId;
+                                edge.toStateId = t.toStateId;
+                                edge.isAnyState = (t.fromStateId == ixanim::kAnyStateId);
+                                edge.conditionCount = static_cast<int>(t.conditions.size());
+                                edge.hasExitTime = t.hasExitTime;
+                                edge.exitTime = t.exitTime;
+                                edge.duration = t.duration;
+                                edge.canTransitionToSelf = t.canTransitionToSelf;
+                                for (const ixanim::AnimatorCondition& c : t.conditions)
+                                {
+                                    AnimatorGraphCondition gc;
+                                    gc.param = c.param;
+                                    gc.op = static_cast<AnimEditConditionOp>(static_cast<int>(c.op));
+                                    gc.value = c.value;
+                                    edge.conditions.push_back(std::move(gc));
+                                }
+                                animatorGraphState.edges.push_back(std::move(edge));
+                            }
+
+                            // Parameters (for the Stage-7 parameter panel + transition editor).
+                            for (const ixanim::AnimatorParameter& p : ctrl.parameters)
+                            {
+                                AnimatorGraphParameter gp;
+                                gp.name = p.name;
+                                gp.type = static_cast<AnimEditParamType>(static_cast<int>(p.type));
+                                gp.defaultValue = p.defaultValue;
+                                animatorGraphState.parameters.push_back(std::move(gp));
+                            }
+
+                            // Live highlight: whenever the runtime is bound (idles in Edit, drives in
+                            // Play), mark the active state + in-flight transition so the panel tints them.
+                            if (auto rtIt = entityAnimators.find(selectedEditorObject.id);
+                                rtIt != entityAnimators.end() && rtIt->second.bound)
+                            {
+                                const ixanim::AnimatorRuntime& rt = rtIt->second;
+                                animatorGraphState.activeStateId = rt.currentStateId;
+                                for (AnimatorGraphNode& n : animatorGraphState.nodes)
+                                    n.isActive = (n.id == rt.currentStateId);
+                                for (AnimatorGraphEdge& e : animatorGraphState.edges)
+                                    e.active = rt.inTransition &&
+                                               e.fromStateId == rt.currentStateId &&
+                                               e.toStateId == rt.transitionToStateId;
+                            }
+
+                            // Node positions stay in raw controller coordinates; the Animator panel
+                            // centers the view ONCE (via pan) when the controller first appears, so
+                            // editing a node never makes the rest of the graph drift.
+                        }
+                    }
+                    editorImGui.SetAnimatorGraphEditorState(animatorGraphState);
+                }
+
                 std::vector<PhysicsEventEditorState> physicsEventStates;
                 physicsEventStates.reserve(editorPhysicsEntityEvents.size());
                 for (const PhysicsEntityEvent& event : editorPhysicsEntityEvents)
@@ -8665,9 +9066,15 @@ int RunGame(NativeWindow& window,
                     return std::numeric_limits<std::uint32_t>::max();
                 return --e.gameSlotCursor;
             };
-            // Skinned draws recorded by the Scene-view pre-pass; reflection + main reuse the
-            // exact (renderer, slot) so poses stay in lockstep across passes.
+            // Skinned draws recorded by the pre-pass (which issues the compute SkinInstance
+            // BEFORE any render pass begins — a compute dispatch + barrier inside a render pass
+            // is illegal). The render passes only replay these as RenderInWorld draws:
+            //   sceneSkinnedDraws       — networked entities (Scene/offscreen + water reflection)
+            //   sceneEditorSkinnedDraws — editor mesh entities, Scene-view (bottom-up) slots
+            //   gameEditorSkinnedDraws  — editor mesh entities, Game-view (top-down) slots
             std::vector<SkinnedDrawRecord> sceneSkinnedDraws;
+            std::vector<SkinnedDrawRecord> sceneEditorSkinnedDraws;
+            std::vector<SkinnedDrawRecord> gameEditorSkinnedDraws;
             terrain.ResetFrameDrawStats();
             bool frameRmlUiRenderCalled = false;
             bool frameImGuiRenderCalled = false;
@@ -8726,6 +9133,233 @@ int RunGame(NativeWindow& window,
                                   : std::array<float, 4>{0.65f, 0.95f, 1.35f, 1.0f});
                         sceneSkinnedDraws.push_back(SkinnedDrawRecord{
                             defaultSkinned, slot, position, HeadingFromQuantized(entity.heading), tint});
+                    }
+                }
+
+                // Editor mesh entities (characters) are skinned HERE in the pre-pass — the compute
+                // dispatch + barrier inside SkinInstance must be recorded OUTSIDE any render pass.
+                // We allocate a Scene-view slot (and, when the Game view is visible, a separate
+                // top-of-range Game slot) per entity, run the compute skin into each, and record
+                // the (renderer, slot) so the offscreen and game passes only issue draws later.
+                if (runtimeSession->IsMapEditorOpen())
+                {
+                    bool willRenderGameView = false;
+#if defined(IXTREEME_WITH_EDITOR)
+                    willRenderGameView = gameViewOk && editorImGui.IsGameViewVisible();
+#endif
+                    // Frame delta for clip-playback clocks (clamped; 0 on the first frame).
+                    const float animDeltaSeconds = animPrevFrameSeconds > 0.0
+                        ? static_cast<float>(std::clamp(seconds - animPrevFrameSeconds, 0.0, 0.25))
+                        : 0.0f;
+                    animPrevFrameSeconds = seconds;
+                    for (MeshSceneEntity& skinnedEntity : editorMeshEntities)
+                    {
+                        if (editorPlay.state.mode == EditorPlayMode::Edit && skinnedEntity.editorHidden)
+                            continue;
+                        const std::string skinnedRuntimePath = resolveMeshRuntimePath(skinnedEntity);
+                        // Self-heal: an entity flagged static whose model is actually a rigged
+                        // glTF/FBX (static path reports UnsupportedSkinned) is promoted to skinned.
+                        if (!skinnedEntity.skinned)
+                        {
+                            auto skinnedCacheIt = staticMeshCache.find(skinnedRuntimePath);
+                            if (skinnedCacheIt != staticMeshCache.end() &&
+                                skinnedCacheIt->second.state == StaticMeshCacheEntry::State::UnsupportedSkinned)
+                            {
+                                skinnedEntity.skinned = true;
+                                SceneManager::Instance().MarkDirty();
+                            }
+                        }
+                        if (!skinnedEntity.skinned)
+                            continue;
+                        const std::size_t beforeSlotCount = skinnedEntity.materialSlots.size();
+                        EnsureMeshEntityMaterialSlots(skinnedEntity);
+                        if (skinnedEntity.materialSlots.size() != beforeSlotCount)
+                            SceneManager::Instance().MarkDirty();
+                        SkinnedMeshRenderer* skinnedRenderer = getSkinnedMeshRenderer(skinnedRuntimePath);
+                        if (!skinnedRenderer)
+                            continue;
+                        SkinnedMeshCacheEntry& skinnedEntry = skinnedMeshCache[skinnedRuntimePath];
+                        // Player characters animate per their movement state (walk/run/idle);
+                        // others stay idle. editorCharacterStates only has an entry while in Play.
+                        SkinnedMeshRenderer::MotionState editorMeshMotion = SkinnedMeshRenderer::MotionState::Idle;
+                        if (auto csIt = editorCharacterStates.find(skinnedEntity.id); csIt != editorCharacterStates.end())
+                            editorMeshMotion = ToSkinnedMeshMotion(csIt->second.moveState);
+                        const bool skinnedSelected =
+                            selectedEditorObject.type == SelectedEditorObjectType::MeshEntity &&
+                            selectedEditorObject.id == skinnedEntity.id;
+                        const WorldVec3 skinnedPosition{skinnedEntity.position[0],
+                            skinnedEntity.position[1] + skinnedRenderer->GroundOffsetY(),
+                            skinnedEntity.position[2]};
+                        const float skinnedYaw = skinnedEntity.rotation[1];
+
+                        // Stage-4 Animator: if an AnimatorController is assigned, evaluate the FSM
+                        // and use its pose (highest priority — over the debug clip and MotionState).
+                        ozz::span<const ozz::math::SoaTransform> animatorPose;
+#if defined(IXTREEME_WITH_EDITOR)
+                        if (!skinnedEntity.animatorControllerId.empty())
+                        {
+                            const std::string& ctrlId = skinnedEntity.animatorControllerId;
+                            std::string& boundCtrlId = entityBoundControllerId[skinnedEntity.id];
+                            const auto existingAnim = entityAnimators.find(skinnedEntity.id);
+                            const bool needBind = boundCtrlId != ctrlId ||
+                                existingAnim == entityAnimators.end() || !existingAnim->second.bound;
+                            if (needBind)
+                            {
+                                boundCtrlId = ctrlId;
+                                const std::string ctrlPath = editorImGui.AnimatorControllerFilePath(ctrlId);
+                                ixanim::AnimatorController controller;
+                                bool ok = false;
+                                if (!ctrlPath.empty())
+                                {
+                                    std::ifstream ctrlFile(ctrlPath, std::ios::binary);
+                                    const std::string ctrlText((std::istreambuf_iterator<char>(ctrlFile)),
+                                        std::istreambuf_iterator<char>());
+                                    ok = ixanim::ControllerFromJson(ctrlText, controller);
+                                }
+                                if (ok)
+                                {
+                                    // Auto-fill empty state clips with this character's own
+                                    // <stem>_anim_<i> clips (by state order) so a generic locomotion
+                                    // controller drives the character with no per-state editing.
+                                    const std::string stem = std::filesystem::path(skinnedRuntimePath).stem().string();
+                                    for (std::size_t si = 0; si < controller.states.size(); ++si)
+                                    {
+                                        if (!controller.states[si].clipId.empty())
+                                            continue;
+                                        const std::string foundClip = editorImGui.FindAnimationClipIdByDisplayName(
+                                            stem + "_anim_" + std::to_string(si));
+                                        if (!foundClip.empty())
+                                            controller.states[si].clipId = foundClip;
+                                    }
+                                    entityControllers[skinnedEntity.id] = std::move(controller);
+                                    ixanim::BindAnimator(entityAnimators[skinnedEntity.id],
+                                        &entityControllers[skinnedEntity.id],
+                                        skinnedRenderer->JointNames(),
+                                        static_cast<int>(skinnedRenderer->NumJoints()),
+                                        static_cast<int>(skinnedRenderer->NumSoaJoints()));
+                                }
+                                else
+                                {
+                                    entityAnimators.erase(skinnedEntity.id);
+                                    entityControllers.erase(skinnedEntity.id);
+                                }
+                            }
+                            if (auto animIt = entityAnimators.find(skinnedEntity.id);
+                                animIt != entityAnimators.end() && animIt->second.bound)
+                            {
+                                ixanim::AnimatorRuntime& animator = animIt->second;
+                                if (auto csIt = editorCharacterStates.find(skinnedEntity.id);
+                                    csIt != editorCharacterStates.end())
+                                {
+                                    ixanim::SetFloat(animator, "Speed", csIt->second.planarSpeed);
+                                    ixanim::SetBool(animator, "IsGrounded", csIt->second.grounded);
+                                    if (csIt->second.jumpedThisFrame)
+                                        ixanim::SetTrigger(animator, "Jump");
+                                }
+                                animatorPose = ixanim::EvaluateAnimator(animator, animDeltaSeconds,
+                                    skinnedRenderer->RestPoseLocals(),
+                                    [&](const std::string& clipId) { return editorImGui.AnimationClipFilePath(clipId); });
+                            }
+                        }
+                        else
+                        {
+                            entityAnimators.erase(skinnedEntity.id);
+                            entityControllers.erase(skinnedEntity.id);
+                            entityBoundControllerId.erase(skinnedEntity.id);
+                        }
+#endif
+
+                        // Stage-3 temp binding: if a debug clip is assigned, (re)bind it retargeted
+                        // onto this character's skeleton and sample it ONCE this frame. The slots
+                        // below then skin from that pose (SkinInstanceFromPose) instead of the
+                        // built-in MotionState clip. Sampling here (pre-pass) keeps Scene + Game in
+                        // lockstep on the same pose and advances the clock exactly once per frame.
+                        ozz::span<const ozz::math::SoaTransform> retargetedPose;
+#if defined(IXTREEME_WITH_EDITOR)
+                        {
+                            const std::string& clipId = skinnedEntity.debugAnimationClipId;
+                            if (clipId.empty())
+                            {
+                                entityClipPlaybacks.erase(skinnedEntity.id);
+                                entityBoundClipId.erase(skinnedEntity.id);
+                            }
+                            else
+                            {
+                                std::string& boundId = entityBoundClipId[skinnedEntity.id];
+                                if (boundId != clipId ||
+                                    entityClipPlaybacks.find(skinnedEntity.id) == entityClipPlaybacks.end())
+                                {
+                                    boundId = clipId;
+                                    ixanim::ClipPlayback playback;
+                                    const std::string ixclipPath = editorImGui.AnimationClipFilePath(clipId);
+                                    std::shared_ptr<ixanim::ClipAsset> clipAsset =
+                                        ixclipPath.empty() ? nullptr : ixanim::LoadClipAsset(ixclipPath);
+                                    if (clipAsset && ixanim::BindClip(playback, clipAsset, skinnedRenderer->JointNames(),
+                                            static_cast<int>(skinnedRenderer->NumJoints()),
+                                            static_cast<int>(skinnedRenderer->NumSoaJoints())))
+                                        entityClipPlaybacks[skinnedEntity.id] = std::move(playback);
+                                    else
+                                        entityClipPlaybacks.erase(skinnedEntity.id);
+                                }
+                                if (auto pbIt = entityClipPlaybacks.find(skinnedEntity.id);
+                                    pbIt != entityClipPlaybacks.end() && pbIt->second.ready)
+                                {
+                                    retargetedPose = ixanim::SampleAndRetarget(pbIt->second,
+                                        skinnedRenderer->RestPoseLocals(), animDeltaSeconds);
+                                }
+                            }
+                        }
+#endif
+
+                        const std::uint32_t sceneSlot = allocSceneSkinSlot(skinnedEntry);
+                        if (sceneSlot != std::numeric_limits<std::uint32_t>::max())
+                        {
+                            if (animatorPose.size() != 0)
+                                skinnedRenderer->SkinInstanceFromPose(device, sceneSlot, animatorPose);
+                            else if (retargetedPose.size() != 0)
+                                skinnedRenderer->SkinInstanceFromPose(device, sceneSlot, retargetedPose);
+                            else
+                                skinnedRenderer->SkinInstance(device, sceneSlot, editorMeshMotion, static_cast<float>(seconds));
+                            sceneEditorSkinnedDraws.push_back(SkinnedDrawRecord{skinnedRenderer, sceneSlot, skinnedPosition, skinnedYaw,
+                                skinnedSelected ? std::array<float, 4>{1.25f, 1.15f, 0.65f, 1.0f}
+                                                : std::array<float, 4>{1.0f, 1.0f, 1.0f, 1.0f}});
+                        }
+                        else
+                        {
+                            static bool loggedSceneSkinPoolFull = false;
+                            if (!loggedSceneSkinPoolFull)
+                            {
+                                TraceError("[MESH-ENTITY] Scene skin-slot pool exhausted for model %s (>%u instances/frame); extra characters dropped",
+                                    skinnedRuntimePath.c_str(), SkinnedMeshRenderer::MaxSkinSlots());
+                                loggedSceneSkinPoolFull = true;
+                            }
+                        }
+
+                        if (willRenderGameView)
+                        {
+                            const std::uint32_t gameSlot = allocGameSkinSlot(skinnedEntry);
+                            if (gameSlot != std::numeric_limits<std::uint32_t>::max())
+                            {
+                                if (animatorPose.size() != 0)
+                                    skinnedRenderer->SkinInstanceFromPose(device, gameSlot, animatorPose);
+                                else if (retargetedPose.size() != 0)
+                                    skinnedRenderer->SkinInstanceFromPose(device, gameSlot, retargetedPose);
+                                else
+                                    skinnedRenderer->SkinInstance(device, gameSlot, editorMeshMotion, static_cast<float>(seconds));
+                                gameEditorSkinnedDraws.push_back(SkinnedDrawRecord{skinnedRenderer, gameSlot, skinnedPosition, skinnedYaw,
+                                    std::array<float, 4>{1.0f, 1.0f, 1.0f, 1.0f}});
+                            }
+                            else
+                            {
+                                static bool loggedGameSkinPoolFull = false;
+                                if (!loggedGameSkinPoolFull)
+                                {
+                                    TraceError("[MESH-ENTITY] Game skin-slot pool exhausted for model %s (>%u instances/frame across Scene+Game); extra characters dropped",
+                                        skinnedRuntimePath.c_str(), SkinnedMeshRenderer::MaxSkinSlots());
+                                    loggedGameSkinPoolFull = true;
+                                }
+                            }
+                        }
                     }
                 }
             }
@@ -8858,77 +9492,21 @@ int RunGame(NativeWindow& window,
                         frameStaticMeshSpatialStats.totalObjects > frameStaticMeshSpatialStats.candidates
                             ? static_cast<std::size_t>(frameStaticMeshSpatialStats.totalObjects - frameStaticMeshSpatialStats.candidates)
                             : 0u;
-                    // Skinned mesh entities (characters) are drawn via the per-model skinned
-                    // cache (one SkinnedMeshRenderer per distinct rigged model path), so multiple
-                    // DIFFERENT characters render at once. They are NOT tracked in the static
-                    // spatial index, so render them here in a dedicated pass over all editor mesh
-                    // entities. Also self-heals an entity mistakenly flagged static whose model is
-                    // a rigged glTF/FBX the static path reports as UnsupportedSkinned.
-                    for (MeshSceneEntity& skinnedEntity : editorMeshEntities)
+                    // Skinned mesh entities (characters) were already compute-skinned in the
+                    // pre-pass (before this render pass began); here we only issue their Scene-view
+                    // draws from the recorded (renderer, slot). Per-model cache + per-renderer slots
+                    // mean multiple DIFFERENT characters draw at once.
+                    for (const SkinnedDrawRecord& rec : sceneEditorSkinnedDraws)
                     {
-                        if (editorPlay.state.mode == EditorPlayMode::Edit && skinnedEntity.editorHidden)
+                        if (!rec.renderer)
                             continue;
-                        const std::string skinnedRuntimePath = resolveMeshRuntimePath(skinnedEntity);
-                        if (!skinnedEntity.skinned)
-                        {
-                            auto skinnedCacheIt = staticMeshCache.find(skinnedRuntimePath);
-                            if (skinnedCacheIt != staticMeshCache.end() &&
-                                skinnedCacheIt->second.state == StaticMeshCacheEntry::State::UnsupportedSkinned)
-                            {
-                                skinnedEntity.skinned = true;
-                                SceneManager::Instance().MarkDirty();
-                            }
-                        }
-                        if (!skinnedEntity.skinned)
-                            continue;
-                        const std::size_t beforeSlotCount = skinnedEntity.materialSlots.size();
-                        EnsureMeshEntityMaterialSlots(skinnedEntity);
-                        if (skinnedEntity.materialSlots.size() != beforeSlotCount)
-                            SceneManager::Instance().MarkDirty();
-                        SkinnedMeshRenderer* skinnedRenderer = getSkinnedMeshRenderer(skinnedRuntimePath);
-                        if (!skinnedRenderer)
-                            continue;
-                        // Allocate a slot from THIS model's own pool (per-renderer; the old global
-                        // entities+lights+meshIndex offset math is gone). Bottom-up for the Scene view.
-                        SkinnedMeshCacheEntry& skinnedEntry = skinnedMeshCache[skinnedRuntimePath];
-                        const std::uint32_t skinSlot = allocSceneSkinSlot(skinnedEntry);
-                        if (skinSlot == std::numeric_limits<std::uint32_t>::max())
-                        {
-                            // Per-model skin-slot pool exhausted this frame (>MaxSkinSlots()
-                            // simultaneous instances of one model across Scene+Game). Instance is
-                            // dropped; log once so the silent vanish is diagnosable.
-                            static bool loggedSceneSkinPoolFull = false;
-                            if (!loggedSceneSkinPoolFull)
-                            {
-                                TraceError("[MESH-ENTITY] Scene skin-slot pool exhausted for model %s (>%u instances/frame); extra characters dropped",
-                                    skinnedRuntimePath.c_str(),
-                                    SkinnedMeshRenderer::MaxSkinSlots());
-                                loggedSceneSkinPoolFull = true;
-                            }
-                            continue;
-                        }
-                        // Player characters animate per their movement state (walk/run/idle);
-                        // other skinned meshes stay idle. editorCharacterStates only has an
-                        // entry while in Play, so edit mode renders idle.
-                        SkinnedMeshRenderer::MotionState editorMeshMotion = SkinnedMeshRenderer::MotionState::Idle;
-                        if (auto csIt = editorCharacterStates.find(skinnedEntity.id); csIt != editorCharacterStates.end())
-                            editorMeshMotion = ToSkinnedMeshMotion(csIt->second.moveState);
-                        const bool skinnedSelected =
-                            selectedEditorObject.type == SelectedEditorObjectType::MeshEntity &&
-                            selectedEditorObject.id == skinnedEntity.id;
-                        skinnedRenderer->SkinInstance(device,
-                            skinSlot,
-                            editorMeshMotion,
-                            static_cast<float>(seconds));
-                        skinnedRenderer->RenderInWorld(device,
+                        rec.renderer->RenderInWorld(device,
                             seconds,
                             camera,
-                            {skinnedEntity.position[0], skinnedEntity.position[1] + skinnedRenderer->GroundOffsetY(), skinnedEntity.position[2]},
-                            skinnedEntity.rotation[1],
-                            skinSlot,
-                            skinnedSelected
-                                ? std::array<float, 4>{1.25f, 1.15f, 0.65f, 1.0f}
-                                : std::array<float, 4>{1.0f, 1.0f, 1.0f, 1.0f},
+                            rec.position,
+                            rec.yaw,
+                            rec.slot,
+                            rec.tint,
                             renderSize);
                         ++frameStaticMeshDrawCalls;
                     }
@@ -9540,44 +10118,15 @@ int RunGame(NativeWindow& window,
                             for (auto& [gameRenderer, gameInstances] : gameMeshBatches)
                                 gameRenderer->RenderBatchInWorld(device, seconds, gameCamera, gameInstances, gameExtent);
 
-                            // Skinned meshes (incl. the player character) — the static path
-                            // skips them. Render from the Main Camera, animated per the
-                            // character's move state, via the per-model skinned cache. Allocates
-                            // slots from the TOP of each renderer's own pool (allocGameSkinSlot)
-                            // so the Game view never clobbers the Scene view's bottom-allocated
-                            // slots in the same frame/command buffer.
-                            for (const MeshSceneEntity& skinnedEntity : editorMeshEntities)
+                            // Skinned meshes (incl. the player character) were compute-skinned in
+                            // the pre-pass into their own top-of-range Game slots; here we only
+                            // issue the Game-view draws from the recorded (renderer, slot).
+                            for (const SkinnedDrawRecord& rec : gameEditorSkinnedDraws)
                             {
-                                if (skinnedEntity.editorHidden || !skinnedEntity.skinned)
+                                if (!rec.renderer)
                                     continue;
-                                const std::string gameSkinnedPath = resolveMeshRuntimePath(skinnedEntity);
-                                SkinnedMeshRenderer* gameSkinned = getSkinnedMeshRenderer(gameSkinnedPath);
-                                if (!gameSkinned)
-                                    continue;
-                                SkinnedMeshCacheEntry& gameSkinnedEntry = skinnedMeshCache[gameSkinnedPath];
-                                const std::uint32_t gameSkinSlot = allocGameSkinSlot(gameSkinnedEntry);
-                                if (gameSkinSlot == std::numeric_limits<std::uint32_t>::max())
-                                {
-                                    static bool loggedGameSkinPoolFull = false;
-                                    if (!loggedGameSkinPoolFull)
-                                    {
-                                        TraceError("[MESH-ENTITY] Game-view skin-slot pool exhausted for model %s (>%u instances/frame across Scene+Game); extra characters dropped",
-                                            gameSkinnedPath.c_str(),
-                                            SkinnedMeshRenderer::MaxSkinSlots());
-                                        loggedGameSkinPoolFull = true;
-                                    }
-                                    continue;
-                                }
-                                SkinnedMeshRenderer::MotionState gameMotion = SkinnedMeshRenderer::MotionState::Idle;
-                                if (auto csIt = editorCharacterStates.find(skinnedEntity.id); csIt != editorCharacterStates.end())
-                                    gameMotion = ToSkinnedMeshMotion(csIt->second.moveState);
-                                gameSkinned->SkinInstance(device, gameSkinSlot, gameMotion, static_cast<float>(seconds));
-                                gameSkinned->RenderInWorld(device, seconds, gameCamera,
-                                    {skinnedEntity.position[0],
-                                     skinnedEntity.position[1] + gameSkinned->GroundOffsetY(),
-                                     skinnedEntity.position[2]},
-                                    skinnedEntity.rotation[1], gameSkinSlot,
-                                    std::array<float, 4>{1.0f, 1.0f, 1.0f, 1.0f}, gameExtent);
+                                rec.renderer->RenderInWorld(device, seconds, gameCamera,
+                                    rec.position, rec.yaw, rec.slot, rec.tint, gameExtent);
                             }
                         }
                         if (hasSceneTerrain)

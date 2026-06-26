@@ -3,6 +3,7 @@ add_library(IXEngineRender STATIC
     CubeRenderer.h
     EditorImGui.cpp
     EditorImGui.h
+    editor_panels/EditorImGuiAnimatorPanels.inl
     editor_panels/EditorImGuiAssetBrowserPanels.inl
     editor_panels/EditorImGuiHierarchyPanels.inl
     editor_panels/EditorImGuiInspectorPanels.inl

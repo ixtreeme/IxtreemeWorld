@@ -96,6 +96,8 @@ public:
     void SetCameraEditorState(const CameraEditorState& state);
     void SetWaterBodyEditorState(const WaterBodyEditorState& state);
     void SetMeshRendererEditorState(const MeshRendererEditorState& state);
+    void SetAnimatorGraphEditorState(const AnimatorGraphEditorState& state) { m_animatorGraphState = state; }
+    bool IsAnimatorGraphVisible() const { return m_animatorGraphVisible; }
     void SetTerrainEditorState(const TerrainEditorState& state);
     void SetEngineStats(const EngineStats& stats);
     void SetPhysicsEvents(std::vector<PhysicsEventEditorState> events);
@@ -111,6 +113,16 @@ public:
     void InitializeAssetLibrary(const std::filesystem::path& clientRoot);
     void InitializeProjectAssetLibrary(const std::filesystem::path& projectRoot, const std::filesystem::path& assetRoot);
     void RefreshAssetLibrary();
+    // Generates retargetable .ixclip assets for a loaded rigged model's existing _anim_<i>.ozz
+    // sidecars (joint names come from the model's skeleton). Idempotent; no-op if already present.
+    void EnsureModelAnimationClips(const std::filesystem::path& modelPath, const std::vector<std::string>& jointNames);
+    // Absolute filesystem path of an AnimationClip asset's .ixclip file (empty if not found).
+    std::string AnimationClipFilePath(const std::string& clipId) const;
+    // Absolute filesystem path of an AnimatorController asset's .controller file (empty if none).
+    std::string AnimatorControllerFilePath(const std::string& controllerId) const;
+    // Id of the first AnimationClip whose display name matches (empty if none) — for auto-filling
+    // a controller's states with a character's own <stem>_anim_<i> clips.
+    std::string FindAnimationClipIdByDisplayName(const std::string& displayName) const;
     void ImportExternalFiles(const std::vector<std::string>& paths, const char* trigger = "dragdrop");
     std::optional<LodConfig> FindModelLodDefault(const std::string& assetId) const;
     bool SaveModelLodDefault(const std::string& assetId, const LodConfig& config);
@@ -128,6 +140,8 @@ private:
         Texture,
         Model,
         Animation,
+        AnimationClip,
+        AnimatorController,
         Material,
         WaterMaterial,
         PhysicsMaterial,
@@ -186,6 +200,7 @@ private:
     void RenderDockSpace();
     void RenderSceneViewDropTarget();
     void RenderGameViewPanel();
+    void RenderAnimatorPanel();
     void RenderSceneViewGizmo(const ImVec2& imageMin, const ImVec2& imageSize);
     void ReleaseSceneViewTextureDescriptor();
     void ReleaseGameViewTextureDescriptor();
@@ -433,6 +448,7 @@ private:
     CameraEditorState m_cameraEditorState;
     WaterBodyEditorState m_waterBodyState;
     MeshRendererEditorState m_meshRendererState;
+    AnimatorGraphEditorState m_animatorGraphState;
     TerrainEditorState m_terrainState;
     EngineStats m_engineStats;
     std::vector<PhysicsEventEditorState> m_physicsEvents;
@@ -537,6 +553,27 @@ private:
     VkImageLayout m_gameViewImageLayout = VK_IMAGE_LAYOUT_UNDEFINED;
     VkExtent2D m_gameViewExtent{};
     bool m_gameViewVisible = false;
+    bool m_animatorGraphVisible = false;
+    bool m_animatorPanelOpen = true;
+    float m_animatorPan[2] = {0.0f, 0.0f};
+    float m_animatorZoom = 1.0f;
+    std::uint32_t m_animatorSelectedStateId = 0;
+    std::string m_animatorCenteredControllerId;  // pan auto-centered once per controller (Stage 7)
+    bool m_animatorRenameRequested = false;       // Stage 7: state-rename modal trigger
+    std::uint32_t m_animatorRenameStateId = 0;
+    char m_animatorRenameBuf[128] = {};
+    // Stage 7: transition editor working copy (seeded from the snapshot edge, edited in place so the
+    // widgets don't snap back; committed via EditTransition with replace-all semantics).
+    bool m_animatorEditEdgeValid = false;
+    std::uint32_t m_animatorEditEdgeFrom = 0;
+    std::uint32_t m_animatorEditEdgeTo = 0;
+    bool m_animatorEditHasExitTime = false;
+    float m_animatorEditExitTime = 0.0f;
+    float m_animatorEditDuration = 0.15f;
+    bool m_animatorEditCanSelf = false;
+    std::vector<AnimatorGraphCondition> m_animatorEditConditions;
+    std::uint32_t m_animatorEditSeededFrom = 0xFFFFFFFEu;  // "not seeded" sentinel
+    std::uint32_t m_animatorEditSeededTo = 0xFFFFFFFEu;
     VkDescriptorSet m_gameViewDescriptor = VK_NULL_HANDLE;
     VkSampler m_gameViewDescriptorSampler = VK_NULL_HANDLE;
     VkImageView m_gameViewDescriptorImageView = VK_NULL_HANDLE;

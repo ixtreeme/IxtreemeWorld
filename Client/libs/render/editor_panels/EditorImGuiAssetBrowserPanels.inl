@@ -46,6 +46,10 @@ void EditorImGui::RenderAssetTypeTabs()
     ImGui::SameLine();
     tab("Anims", AssetBrowserFilter::Animation);
     ImGui::SameLine();
+    tab("Anim Clips", AssetBrowserFilter::AnimationClip);
+    ImGui::SameLine();
+    tab("Animators", AssetBrowserFilter::AnimatorController);
+    ImGui::SameLine();
     tab("Materials", AssetBrowserFilter::Material);
     ImGui::SameLine();
     tab("Water Mats", AssetBrowserFilter::WaterMaterial);

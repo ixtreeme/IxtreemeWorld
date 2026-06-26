@@ -64,6 +64,7 @@ void EditorImGui::RenderDockSpace()
         ImGui::DockBuilderDockWindow(ICON_FA_GLOBE " World", rightId);
         ImGui::DockBuilderDockWindow("Asset Browser", bottomId);
         ImGui::DockBuilderDockWindow("Scene View", mainId);
+        ImGui::DockBuilderDockWindow(ICON_FA_PERSON_RUNNING " Animator", mainId);
         ImGui::DockBuilderFinish(dockspaceId);
         Tracen("[EDITOR-LAYOUT] Default Unity-style dock layout applied");
     }

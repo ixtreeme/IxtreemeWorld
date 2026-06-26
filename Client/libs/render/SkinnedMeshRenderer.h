@@ -4,6 +4,9 @@
 #include "WorldCamera.h"
 #include "MapEditorTypes.h"
 
+#include <ozz/base/maths/soa_transform.h>
+#include <ozz/base/span.h>
+
 #include <algorithm>
 #include <array>
 #include <cstdint>
@@ -15,6 +18,10 @@
 
 namespace client::asset {
 class IAssetReader;
+}
+
+namespace ozz::animation {
+class Skeleton;
 }
 
 class SkinnedMeshRenderer
@@ -42,6 +49,19 @@ public:
     void SetMainRenderPass(VkRenderPass renderPass);
     void Skin(VulkanDevice& device, double timeSeconds);
     void SkinInstance(VulkanDevice& device, uint32_t skinSlot, MotionState state, float animTimeSeconds);
+    // Pose-injection entry point: skin one instance from an EXTERNALLY computed local pose
+    // (e.g. the animator's blended ozz output) instead of selecting a built-in MotionState
+    // clip. `localPose` must hold exactly NumSoaJoints() SoaTransforms for this skeleton.
+    void SkinInstanceFromPose(VulkanDevice& device, uint32_t skinSlot,
+        ozz::span<const ozz::math::SoaTransform> localPose);
+    // Skeleton accessors for the animation layer (clip retargeting, rest-pose fallback).
+    // Return null/empty when no skeleton is loaded yet.
+    const ozz::animation::Skeleton* Skeleton() const;
+    ozz::span<const ozz::math::SoaTransform> RestPoseLocals() const;
+    std::uint32_t NumJoints() const;
+    std::uint32_t NumSoaJoints() const;
+    // Ordered joint names of the loaded skeleton (empty if none) — the retarget key for clips.
+    std::vector<std::string> JointNames() const;
     void Render(VulkanDevice& device, double timeSeconds);
     void RenderInWorld(VulkanDevice& device,
         double timeSeconds,
@@ -159,6 +179,13 @@ private:
     bool CreateComputePipeline();
     bool VerifyComputeSkin(VulkanDevice& device);
     bool SkinPose(float animTimeSeconds, bool updateBounds, bool logSamples, MotionState state = MotionState::Idle);
+    // Decomposed pieces of the old monolithic SkinPose, so the runtime path can build a GPU
+    // palette without the (CPU-only, bounds/verify) vertex-skinning loop, and so an external
+    // pose can be injected (SkinInstanceFromPose).
+    bool SamplePoseFromState(float animTimeSeconds, MotionState state, ozz::span<ozz::math::SoaTransform> outLocals);
+    bool BuildPaletteFromLocals(ozz::span<const ozz::math::SoaTransform> locals);
+    bool CpuSkinVertices(bool updateBounds, bool logSamples);
+    bool UploadPaletteToBuffer(uint32_t frameIndex, uint32_t skinSlot);
     bool UploadBonePalette(MotionState state, float animTimeSeconds, uint32_t frameIndex, uint32_t skinSlot);
     bool UploadBonePalette(float animTimeSeconds, uint32_t frameIndex);
     void DispatchSkin(VkCommandBuffer cmd, uint32_t frameIndex, uint32_t skinSlot);

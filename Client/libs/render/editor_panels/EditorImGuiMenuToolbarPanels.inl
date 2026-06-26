@@ -108,6 +108,7 @@ void EditorImGui::RenderMenuBar()
     }
     if (ImGui::BeginMenu("View"))
     {
+        ImGui::MenuItem(ICON_FA_PERSON_RUNNING " Animator", nullptr, &m_animatorPanelOpen);
         ImGui::MenuItem("Demo Window", nullptr, &m_showDemoWindow);
         ImGui::EndMenu();
     }

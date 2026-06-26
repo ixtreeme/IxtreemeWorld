@@ -394,6 +394,12 @@ struct MeshSceneEntity
     ixtreeme::physics::HingeJointComponent hingeJoint;
     bool hasCharacterController = false;
     ixtreeme::physics::CharacterControllerComponent characterController;
+    // Stage-3 temporary clip binding (id of an AnimationClip asset, or empty). Runtime-only —
+    // not serialized; replaced by the real Animator component in Stage 4.
+    std::string debugAnimationClipId;
+    // Stage-4 Animator: id of an AnimatorController asset (or empty). Runtime-only for now (full
+    // AnimatorComponent + serialization is a follow-up); takes priority over debugAnimationClipId.
+    std::string animatorControllerId;
 };
 
 struct TerrainSceneData
@@ -520,6 +526,101 @@ struct MeshRendererEditorState
     ixtreeme::physics::HingeJointComponent hingeJoint;
     bool hasCharacterController = false;
     ixtreeme::physics::CharacterControllerComponent characterController;
+    // Stage-3 temporary clip binding (id of an AnimationClip asset, or empty). Runtime-only —
+    // not serialized; replaced by the real Animator component in Stage 4.
+    std::string debugAnimationClipId;
+    // Stage-4 Animator: id of an AnimatorController asset (or empty). Runtime-only for now (full
+    // AnimatorComponent + serialization is a follow-up); takes priority over debugAnimationClipId.
+    std::string animatorControllerId;
+};
+
+// Stage-6 read-only snapshot of an AnimatorController for the node-graph editor panel. Filled by
+// EngineApplication (which owns the ixanim types — libs/render must NOT depend on apps/client) and
+// pushed via EditorImGui::SetAnimatorGraphEditorState each frame. kAnyState sentinel = 0xFFFFFFFF.
+// Stage 7: mirrors of ixanim::ConditionOp / ixanim::ParamType. MapEditorTypes.h (libs/render) must
+// NOT include the apps/client AnimatorController.h (one-way layering), so these enums are duplicated
+// here with IDENTICAL ordinals; EngineApplication static_asserts them against the real enums.
+enum class AnimEditConditionOp { Greater, Less, Equals, NotEquals, If, IfNot };
+enum class AnimEditParamType { Float, Int, Bool, Trigger };
+
+struct AnimatorGraphCondition
+{
+    std::string param;
+    AnimEditConditionOp op = AnimEditConditionOp::Greater;
+    float value = 0.0f;
+};
+struct AnimatorGraphParameter
+{
+    std::string name;
+    AnimEditParamType type = AnimEditParamType::Float;
+    float defaultValue = 0.0f;
+};
+
+struct AnimatorGraphNode
+{
+    std::uint32_t id = 0;            // AnimatorState::id (or 0xFFFFFFFF for Any-State, 0 for Entry)
+    std::string name;
+    std::string clipLabel;          // clip basename, "(no clip)", or empty for synthetic nodes
+    std::string clipId;             // backing AnimationClip asset id (for the clip combo selection)
+    float graphPos[2] = {0.0f, 0.0f};
+    float speed = 1.0f;
+    bool loop = true;
+    bool isDefault = false;
+    bool isAnyState = false;
+    bool isEntry = false;
+    bool isActive = false;          // Stage 7 live highlight (== current state in Play)
+};
+struct AnimatorGraphEdge
+{
+    std::uint32_t fromStateId = 0;  // 0xFFFFFFFF for Any-State transitions
+    std::uint32_t toStateId = 0;
+    bool isAnyState = false;
+    int conditionCount = 0;
+    bool active = false;            // Stage 7 live highlight (currently-taken transition)
+    bool hasExitTime = false;       // full data for the transition editor (Stage 7)
+    float exitTime = 0.0f;
+    float duration = 0.15f;
+    bool canTransitionToSelf = false;
+    std::vector<AnimatorGraphCondition> conditions;
+};
+struct AnimatorGraphEditorState
+{
+    bool hasController = false;
+    std::string controllerId;
+    std::string controllerDisplayName;
+    std::vector<AnimatorGraphNode> nodes;
+    std::vector<AnimatorGraphEdge> edges;
+    std::vector<AnimatorGraphParameter> parameters;
+    std::uint32_t defaultStateId = 0;
+    std::uint32_t activeStateId = 0;
+};
+
+// Stage 7: one user edit emitted by the Animator graph panel, applied by EngineApplication to the
+// real ixanim::AnimatorController (then saved + re-bound). MoveNode carries a centroid-invariant
+// DELTA, not an absolute position, because the display snapshot is re-centered every frame.
+enum class AnimatorGraphEditType
+{
+    MoveNode, AddState, DeleteState, RenameState, AssignClip, SetStateSpeed, SetStateLoop,
+    SetDefaultState, CreateTransition, DeleteTransition, EditTransition,
+    AddParameter, DeleteParameter, RenameParameter, SetParameterType, SetParameterDefault
+};
+struct AnimatorGraphEdit
+{
+    AnimatorGraphEditType type = AnimatorGraphEditType::MoveNode;
+    std::uint32_t stateId = 0;       // primary state / transition source (0xFFFFFFFF = Any-State)
+    std::uint32_t toStateId = 0;     // transition target
+    float graphDeltaX = 0.0f;        // MoveNode: centroid-invariant delta (graph units)
+    float graphDeltaY = 0.0f;
+    float floatValue = 0.0f;         // SetStateSpeed / SetParameterDefault
+    bool boolValue = false;          // SetStateLoop
+    std::string text;                // AddState/RenameState name, AssignClip clipId, param name
+    std::string text2;               // RenameParameter new name
+    AnimEditParamType paramType = AnimEditParamType::Float;
+    bool hasExitTime = false;        // EditTransition payload:
+    float exitTime = 0.0f;
+    float duration = 0.15f;
+    bool canTransitionToSelf = false;
+    std::vector<AnimatorGraphCondition> conditions;
 };
 
 struct TerrainEditorState
@@ -761,4 +862,5 @@ struct MapEditorCommands
     float sceneGizmoPosition[3] = {0.0f, 0.0f, 0.0f};
     float sceneGizmoRotation[3] = {0.0f, 0.0f, 0.0f};
     float sceneGizmoScale[3] = {1.0f, 1.0f, 1.0f};
+    std::vector<AnimatorGraphEdit> animatorEdits;  // Stage 7: Animator graph edits (append-merged)
 };

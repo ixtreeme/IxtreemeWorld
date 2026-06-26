@@ -27,7 +27,9 @@ public:
         WaterMaterial,
         PhysicsMaterial,
         Scene,
-        Prefab
+        Prefab,
+        AnimationClip,
+        AnimatorController
     };
 
     enum class TextureRole
@@ -73,6 +75,22 @@ public:
         ixtreeme::physics::PhysicsMaterialCombineMode restitutionCombine = ixtreeme::physics::PhysicsMaterialCombineMode::Maximum;
     };
 
+    // Retargetable animation clip (.ixclip) — a skeleton-agnostic wrapper over a raw ozz
+    // Animation archive. jointNames is the ordered source-skeleton joint list (the retarget
+    // key); it lives in the .ixclip file body (not the lean manifest), loaded on demand.
+    struct AnimationClipData
+    {
+        std::string sourceAnimGuid;       // GUID of the raw ozz Animation archive (.ozz)
+        std::string sourceSkeletonGuid;   // GUID of the source skeleton the tracks are indexed against
+        std::string sourceAnimPath;       // path to the raw ozz Animation archive (.ozz) — runtime load (file body only)
+        std::vector<std::string> jointNames;  // ordered source joint names — the retarget key (file body only)
+        float duration = 0.0f;
+        bool loop = true;
+        float sampleRate = 30.0f;
+        std::string rootJoint;
+        std::string rootMotionMode = "none";  // none | bake_xz | bake_full
+    };
+
     struct Entry
     {
         std::string id;
@@ -92,6 +110,7 @@ public:
         MaterialData material;
         WaterMaterialData waterMaterial;
         PhysicsMaterialData physicsMaterial;
+        AnimationClipData animationClip;
         bool hasLodDefault = false;
         LodConfig lodDefault;
     };
@@ -157,6 +176,13 @@ public:
                                const PhysicsMaterialData& material,
                                Entry& outEntry,
                                std::string& error);
+    bool CreateAnimationClip(const ImportOptions& options,
+                             const AnimationClipData& clip,
+                             Entry& outEntry,
+                             std::string& error);
+    // Creates a .controller asset seeded with a default Idle/Walk/Run locomotion graph
+    // (Speed/IsGrounded/Jump params; clip ids empty — assigned later in the Inspector/graph editor).
+    bool CreateAnimatorController(const ImportOptions& options, Entry& outEntry, std::string& error);
     bool Remove(const std::string& id, std::string& error);
     bool UpdateAssetMetadata(const std::string& id,
                              const std::string& displayName,
