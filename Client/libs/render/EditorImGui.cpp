@@ -172,9 +172,9 @@ struct InspectorComponentDefinition
     bool addableToMesh;
 };
 
-const std::array<InspectorComponentDefinition, 17>& InspectorComponentRegistry()
+const std::array<InspectorComponentDefinition, 19>& InspectorComponentRegistry()
 {
-    static const std::array<InspectorComponentDefinition, 17> registry{{
+    static const std::array<InspectorComponentDefinition, 19> registry{{
         {"builtin.transform", "Transform", "Core", EditorComponentType::None, false},
         {"builtin.mesh_renderer", "MeshRenderer", "Rendering", EditorComponentType::MeshRenderer, false},
         {kLodComponentId, "LOD Group", "Rendering", EditorComponentType::None, true},
@@ -188,6 +188,8 @@ const std::array<InspectorComponentDefinition, 17>& InspectorComponentRegistry()
         {"physics.fixed_joint", "Fixed Joint", "Physics", EditorComponentType::FixedJoint, true},
         {"physics.hinge_joint", "Hinge Joint", "Physics", EditorComponentType::HingeJoint, true},
         {"physics.character_controller", "Character Controller", "Physics", EditorComponentType::CharacterController, true},
+        {"audio.audio_source", "Audio Source", "Audio", EditorComponentType::AudioSource, true},
+        {"audio.audio_listener", "Audio Listener", "Audio", EditorComponentType::AudioListener, true},
         {"builtin.water_body", "Water Body", "Rendering", EditorComponentType::WaterBody, false},
         {"builtin.point_light", "Point Light", "Lighting", EditorComponentType::PointLight, false},
         {"builtin.spot_light", "Spot Light", "Lighting", EditorComponentType::SpotLight, false},
@@ -446,6 +448,8 @@ const char* ImportDetectedTypeName(const std::filesystem::path& path)
         return "Material";
     if (ext == ".anim" || ext == ".ozz")
         return "Anim";
+    if (ext == ".wav" || ext == ".ogg" || ext == ".mp3" || ext == ".flac")
+        return "Audio";
     if (ext == ".scene")
         return "Scene";
     return "Unknown";
@@ -1441,6 +1445,16 @@ std::string EditorImGui::AnimatorControllerFilePath(const std::string& controlle
     return m_assetLibrary->AbsolutePath(*entry).generic_string();
 }
 
+std::string EditorImGui::AudioClipFilePath(const std::string& clipId) const
+{
+    if (!m_assetLibrary || clipId.empty())
+        return {};
+    const auto entry = m_assetLibrary->FindById(clipId);
+    if (!entry || entry->category != AssetLibrary::Category::Audio)
+        return {};
+    return m_assetLibrary->AbsolutePath(*entry).generic_string();
+}
+
 std::string EditorImGui::FindAnimationClipIdByDisplayName(const std::string& displayName) const
 {
     if (!m_assetLibrary || displayName.empty())
@@ -1489,6 +1503,7 @@ bool EditorImGui::ActiveAssetCategory(AssetLibrary::Category category) const
     case AssetBrowserFilter::Animation: return category == AssetLibrary::Category::Animation;
     case AssetBrowserFilter::AnimationClip: return category == AssetLibrary::Category::AnimationClip;
     case AssetBrowserFilter::AnimatorController: return category == AssetLibrary::Category::AnimatorController;
+    case AssetBrowserFilter::Audio: return category == AssetLibrary::Category::Audio;
     case AssetBrowserFilter::Material: return category == AssetLibrary::Category::Material;
     case AssetBrowserFilter::WaterMaterial: return category == AssetLibrary::Category::WaterMaterial;
     case AssetBrowserFilter::PhysicsMaterial: return category == AssetLibrary::Category::PhysicsMaterial;
@@ -1506,6 +1521,7 @@ AssetLibrary::Category EditorImGui::FolderCategory() const
     case AssetBrowserFilter::Animation: return AssetLibrary::Category::Animation;
     case AssetBrowserFilter::AnimationClip: return AssetLibrary::Category::AnimationClip;
     case AssetBrowserFilter::AnimatorController: return AssetLibrary::Category::AnimatorController;
+    case AssetBrowserFilter::Audio: return AssetLibrary::Category::Audio;
     case AssetBrowserFilter::Material: return AssetLibrary::Category::Material;
     case AssetBrowserFilter::WaterMaterial: return AssetLibrary::Category::WaterMaterial;
     case AssetBrowserFilter::PhysicsMaterial: return AssetLibrary::Category::PhysicsMaterial;
@@ -1528,6 +1544,7 @@ const char* EditorImGui::AssetFilterName() const
     case AssetBrowserFilter::Animation: return "Anims";
     case AssetBrowserFilter::AnimationClip: return "Anim Clips";
     case AssetBrowserFilter::AnimatorController: return "Animators";
+    case AssetBrowserFilter::Audio: return "Audio";
     case AssetBrowserFilter::Material: return "Materials";
     case AssetBrowserFilter::WaterMaterial: return "Water Mats";
     case AssetBrowserFilter::PhysicsMaterial: return "Physics Mats";

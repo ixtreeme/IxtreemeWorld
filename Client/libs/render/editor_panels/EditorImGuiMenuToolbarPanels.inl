@@ -112,6 +112,25 @@ void EditorImGui::RenderMenuBar()
         ImGui::MenuItem("Demo Window", nullptr, &m_showDemoWindow);
         ImGui::EndMenu();
     }
+    if (ImGui::BeginMenu("Audio"))
+    {
+        ImGui::TextDisabled("Bus Volumes");
+        bool volChanged = false;
+        ImGui::SetNextItemWidth(160.0f);
+        volChanged |= ImGui::SliderFloat("Master", &m_audioVolume[0], 0.0f, 1.0f, "%.2f");
+        ImGui::SetNextItemWidth(160.0f);
+        volChanged |= ImGui::SliderFloat("Music", &m_audioVolume[1], 0.0f, 1.0f, "%.2f");
+        ImGui::SetNextItemWidth(160.0f);
+        volChanged |= ImGui::SliderFloat("SFX", &m_audioVolume[2], 0.0f, 1.0f, "%.2f");
+        if (volChanged)
+        {
+            m_commands.audioVolumesChanged = true;
+            m_commands.audioVolume[0] = m_audioVolume[0];
+            m_commands.audioVolume[1] = m_audioVolume[1];
+            m_commands.audioVolume[2] = m_audioVolume[2];
+        }
+        ImGui::EndMenu();
+    }
     if (ImGui::BeginMenu("Tools"))
     {
         if (ImGui::MenuItem("Tree Generator..."))

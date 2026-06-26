@@ -244,6 +244,23 @@ void WriteCharacterController(std::ostream& out, const ixtreeme::physics::Charac
     out << indent << "}";
 }
 
+void WriteAudioSource(std::ostream& out, const ixaudio::AudioSourceComponent& a, const std::string& indent)
+{
+    out << ",\n";
+    out << indent << "\"audio_source\": {\n";
+    out << indent << "  \"clip_asset_id\": \"" << ixtreeme::common::EscapeJson(a.clipAssetId) << "\",\n";
+    out << indent << "  \"enabled\": " << (a.enabled ? "true" : "false") << ",\n";
+    out << indent << "  \"loop\": " << (a.loop ? "true" : "false") << ",\n";
+    out << indent << "  \"is_3d\": " << (a.is3d ? "true" : "false") << ",\n";
+    out << indent << "  \"play_on_start\": " << (a.playOnStart ? "true" : "false") << ",\n";
+    out << indent << "  \"volume\": " << a.volume << ",\n";
+    out << indent << "  \"pitch\": " << a.pitch << ",\n";
+    out << indent << "  \"min_distance\": " << a.minDistance << ",\n";
+    out << indent << "  \"max_distance\": " << a.maxDistance << ",\n";
+    out << indent << "  \"bus\": \"" << ixaudio::BusName(a.bus) << "\"\n";
+    out << indent << "}";
+}
+
 ixtreeme::physics::RigidbodyComponent ReadRigidbody(const std::string& object)
 {
     ixtreeme::physics::RigidbodyComponent rigidbody;
@@ -342,6 +359,26 @@ ixtreeme::physics::CharacterControllerComponent ReadCharacterController(const st
     return cc;
 }
 
+ixaudio::AudioSourceComponent ReadAudioSource(const std::string& object)
+{
+    ixaudio::AudioSourceComponent a;
+    const std::string component = ExtractNamedObject(object, "audio_source");
+    if (component.empty())
+        return a;
+    a.clipAssetId = ixtreeme::common::JsonStringValue(component, "clip_asset_id");
+    a.enabled = ixtreeme::common::JsonBoolValue(component, "enabled", a.enabled);
+    a.loop = ixtreeme::common::JsonBoolValue(component, "loop", a.loop);
+    a.is3d = ixtreeme::common::JsonBoolValue(component, "is_3d", a.is3d);
+    a.playOnStart = ixtreeme::common::JsonBoolValue(component, "play_on_start", a.playOnStart);
+    a.volume = ixtreeme::common::JsonFloatValue(component, "volume", a.volume);
+    a.pitch = ixtreeme::common::JsonFloatValue(component, "pitch", a.pitch);
+    a.minDistance = ixtreeme::common::JsonFloatValue(component, "min_distance", a.minDistance);
+    a.maxDistance = ixtreeme::common::JsonFloatValue(component, "max_distance", a.maxDistance);
+    a.bus = ixaudio::ParseBus(ixtreeme::common::JsonStringValue(component, "bus"));
+    ixaudio::Sanitize(a);
+    return a;
+}
+
 MeshSceneEntity::MaterialOverride ReadMaterialOverride(const std::string& object)
 {
     MeshSceneEntity::MaterialOverride material;
@@ -428,6 +465,15 @@ void WriteMeshObject(std::ostream& out, const MeshSceneEntity& mesh, const std::
         WriteHingeJoint(out, mesh.hingeJoint, indent);
     if (mesh.hasCharacterController)
         WriteCharacterController(out, mesh.characterController, indent);
+    if (mesh.hasAudioSource)
+        WriteAudioSource(out, mesh.audioSource, indent);
+    if (mesh.hasAudioListener)
+    {
+        out << ",\n";
+        out << indent << "\"audio_listener\": {\n";
+        out << indent << "  \"enabled\": " << (mesh.audioListener.enabled ? "true" : "false") << "\n";
+        out << indent << "}";
+    }
     out << "\n";
 }
 
@@ -514,6 +560,16 @@ PrefabEntity ParseEntityObject(const std::string& object, const std::string& fal
         {
             entity.mesh.hasCharacterController = true;
             entity.mesh.characterController = ReadCharacterController(object);
+        }
+        if (!ExtractNamedObject(object, "audio_source").empty())
+        {
+            entity.mesh.hasAudioSource = true;
+            entity.mesh.audioSource = ReadAudioSource(object);
+        }
+        if (const std::string listenerObj = ExtractNamedObject(object, "audio_listener"); !listenerObj.empty())
+        {
+            entity.mesh.hasAudioListener = true;
+            entity.mesh.audioListener.enabled = ixtreeme::common::JsonBoolValue(listenerObj, "enabled", true);
         }
         return entity;
     }

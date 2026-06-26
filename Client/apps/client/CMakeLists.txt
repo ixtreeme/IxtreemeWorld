@@ -37,6 +37,7 @@ target_link_libraries(IxtreemeEngine
         IXEnginePhysics
         IXEngineRender
         IXEngineAnimation
+        IXEngineAudio
 )
 
 target_compile_features(IxtreemeEngine PRIVATE cxx_std_20)

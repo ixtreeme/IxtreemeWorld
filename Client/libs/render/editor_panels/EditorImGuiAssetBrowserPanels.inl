@@ -50,6 +50,8 @@ void EditorImGui::RenderAssetTypeTabs()
     ImGui::SameLine();
     tab("Animators", AssetBrowserFilter::AnimatorController);
     ImGui::SameLine();
+    tab("Audio", AssetBrowserFilter::Audio);
+    ImGui::SameLine();
     tab("Materials", AssetBrowserFilter::Material);
     ImGui::SameLine();
     tab("Water Mats", AssetBrowserFilter::WaterMaterial);
@@ -261,6 +263,11 @@ void EditorImGui::RenderAssetTile(const AssetLibrary::Entry& entry, float tileSi
             m_assetStatus = "Prefab instance queued: " + entry.displayName;
             Tracenf("[PREFAB] Asset browser spawn queued: asset_id=%s", entry.id.c_str());
         }
+        else if (doubleClicked && entry.category == AssetLibrary::Category::Audio)
+        {
+            m_commands.previewAudioClipId = entry.id;
+            m_assetStatus = "Preview: " + entry.displayName;
+        }
     }
 
     if (ImGui::BeginDragDropSource())
@@ -307,6 +314,15 @@ void EditorImGui::RenderAssetTile(const AssetLibrary::Entry& entry, float tileSi
                 m_commands.prefabAssetId = entry.id;
                 m_assetStatus = "Prefab instance queued: " + entry.displayName;
                 Tracenf("[PREFAB] Context instantiate queued: asset_id=%s", entry.id.c_str());
+            }
+        }
+        else if (entry.category == AssetLibrary::Category::Audio)
+        {
+            ImGui::Separator();
+            if (ImGui::MenuItem("Play Preview"))
+            {
+                m_commands.previewAudioClipId = entry.id;
+                m_assetStatus = "Preview: " + entry.displayName;
             }
         }
         else
@@ -721,7 +737,7 @@ void EditorImGui::RenderAssetBrowserOperationPopups()
         ImGui::TextDisabled("Target: %s", target.generic_string().c_str());
         ImGui::TextWrapped("Choose a supported source file, or drag files from Explorer onto the editor window.");
         ImGui::InputText("Source File", m_assetImportPathBuffer, sizeof(m_assetImportPathBuffer));
-        ImGui::TextDisabled("Supported: png jpg jpeg tga bmp dds ktx glb gltf fbx obj material anim ozz");
+        ImGui::TextDisabled("Supported: png jpg jpeg tga bmp dds ktx glb gltf fbx obj material anim ozz wav ogg mp3 flac");
 
         ImGui::Separator();
         ImGui::InputText("Browse Path", m_assetImportBrowserPathBuffer, sizeof(m_assetImportBrowserPathBuffer));

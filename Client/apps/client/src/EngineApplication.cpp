@@ -18,6 +18,7 @@
 #include "NativeWindow.h"
 #include "AnimationRuntime.h"
 #include "AnimatorRuntime.h"
+#include "AudioEngine.h"
 #include "EditorImGui.h"
 #include "physics/PhysicsWorld.h"
 #if defined(_WIN32)
@@ -532,6 +533,10 @@ MeshRendererEditorState BuildMeshRendererEditorState(const std::vector<MeshScene
     state.hingeJoint = it->hingeJoint;
     state.hasCharacterController = it->hasCharacterController;
     state.characterController = it->characterController;
+    state.hasAudioSource = it->hasAudioSource;
+    state.audioSource = it->audioSource;
+    state.hasAudioListener = it->hasAudioListener;
+    state.audioListener = it->audioListener;
     state.debugAnimationClipId = it->debugAnimationClipId;
     state.animatorControllerId = it->animatorControllerId;
     state.materialSlotCount = std::max<std::uint32_t>(
@@ -567,6 +572,10 @@ void ApplyMeshRendererEditorState(MeshSceneEntity& mesh, const MeshRendererEdito
     mesh.hingeJoint = state.hingeJoint;
     mesh.hasCharacterController = state.hasCharacterController;
     mesh.characterController = state.characterController;
+    mesh.hasAudioSource = state.hasAudioSource;
+    mesh.audioSource = state.audioSource;
+    mesh.hasAudioListener = state.hasAudioListener;
+    mesh.audioListener = state.audioListener;
     mesh.debugAnimationClipId = state.debugAnimationClipId;
     mesh.animatorControllerId = state.animatorControllerId;
 }
@@ -1884,6 +1893,15 @@ void MergeMapEditorCommands(MapEditorCommands& target, const MapEditorCommands& 
     if (!source.animatorEdits.empty())
         target.animatorEdits.insert(target.animatorEdits.end(),
             source.animatorEdits.begin(), source.animatorEdits.end());
+    if (!source.previewAudioClipId.empty())
+        target.previewAudioClipId = source.previewAudioClipId;
+    if (source.audioVolumesChanged)
+    {
+        target.audioVolumesChanged = true;
+        target.audioVolume[0] = source.audioVolume[0];
+        target.audioVolume[1] = source.audioVolume[1];
+        target.audioVolume[2] = source.audioVolume[2];
+    }
 }
 
 // The display-layer (MapEditorTypes.h) mirrors of the ixanim enums must keep identical ordinals,
@@ -2239,6 +2257,12 @@ int RunGame(NativeWindow& window,
 #endif
 
     EditorImGui editorImGui;
+
+    // Audio: one engine for the whole run. Device-init failure is silent-safe (no crash without
+    // sound hardware); the destructor shuts it down at function exit.
+    ixaudio::AudioEngine audioEngine;
+    audioEngine.Initialize();
+
 #if defined(IXTREEME_WITH_EDITOR)
 #if defined(_WIN32)
     NativeWindow_Win32* win32Window = dynamic_cast<NativeWindow_Win32*>(&window);
@@ -2692,6 +2716,7 @@ int RunGame(NativeWindow& window,
     // controller asset id (to detect reassignment). Takes priority over the debug clip binding.
     std::unordered_map<std::uint32_t, ixanim::AnimatorRuntime> entityAnimators;
     std::unordered_map<std::uint32_t, ixanim::AnimatorController> entityControllers;
+    std::unordered_map<std::uint32_t, ixaudio::AudioSourceRuntime> entityAudioSources;  // per-entity, Play-only
     std::unordered_map<std::uint32_t, std::string> entityBoundControllerId;
     double animPrevFrameSeconds = 0.0;
     float editorPlayerLookDx = 0.0f;
@@ -4748,6 +4773,25 @@ int RunGame(NativeWindow& window,
                 editorPlayerLookDy = 0.0f;
             }
             stepEditorPhysicsWorld(static_cast<float>(deltaSeconds));
+
+            // Audio: push live AudioSource state (volume/pitch/3D position) each Play frame, after
+            // transforms settle. Drop sources whose entity vanished (the dtor stops the sound).
+            if (audioEngine.IsInitialized() && !entityAudioSources.empty())
+            {
+                for (auto it = entityAudioSources.begin(); it != entityAudioSources.end();)
+                {
+                    auto meshIt = std::find_if(editorMeshEntities.begin(), editorMeshEntities.end(),
+                        [&](const MeshSceneEntity& m) { return m.id == it->first; });
+                    if (meshIt == editorMeshEntities.end() || !meshIt->hasAudioSource)
+                    {
+                        it = entityAudioSources.erase(it);
+                        continue;
+                    }
+                    const float audioPos[3] = {meshIt->position[0], meshIt->position[1], meshIt->position[2]};
+                    audioEngine.UpdateSource(it->second, meshIt->audioSource, audioPos);
+                    ++it;
+                }
+            }
         }
 #endif
         {
@@ -4772,6 +4816,24 @@ int RunGame(NativeWindow& window,
             lastPickEntities = frameEntities;
             lastPickCamera = frameCamera;
             hasLastPickCamera = true;
+
+            // Audio: the 3D listener (the "ears") follows the active Play camera. An enabled
+            // AudioListener component overrides the position (e.g. puts the ears on the player).
+            if (editorPlay.state.mode == EditorPlayMode::Play && audioEngine.IsInitialized())
+            {
+                const WorldVec3 listenForward = WorldCameraForward(frameCamera);
+                WorldVec3 listenPos = frameCamera.eye;
+                for (const MeshSceneEntity& listenerMesh : editorMeshEntities)
+                    if (listenerMesh.hasAudioListener && listenerMesh.audioListener.enabled)
+                    {
+                        listenPos = WorldVec3{listenerMesh.position[0], listenerMesh.position[1], listenerMesh.position[2]};
+                        break;
+                    }
+                const float lp[3] = {static_cast<float>(listenPos.x), static_cast<float>(listenPos.y), static_cast<float>(listenPos.z)};
+                const float lf[3] = {static_cast<float>(listenForward.x), static_cast<float>(listenForward.y), static_cast<float>(listenForward.z)};
+                const float lu[3] = {0.0f, 1.0f, 0.0f};
+                audioEngine.SetListener(lp, lf, lu);
+            }
             const bool selectedStillVisible = std::any_of(lastPickEntities.begin(),
                 lastPickEntities.end(),
                 [selectedTargetNetId](const WorldRenderEntity& entity) {
@@ -4821,6 +4883,14 @@ int RunGame(NativeWindow& window,
                     sceneRuntime.ApplySceneData(pendingScene);
                 MapEditorCommands commands = runtimeSession->ConsumeMapEditorCommands();
                 MergeMapEditorCommands(commands, editorImGui.ConsumeCommands());
+                if (!commands.previewAudioClipId.empty())
+                    audioEngine.PlayOneShot(editorImGui.AudioClipFilePath(commands.previewAudioClipId));
+                if (commands.audioVolumesChanged)
+                {
+                    audioEngine.SetMasterVolume(commands.audioVolume[0]);
+                    audioEngine.SetBusVolume(ixaudio::AudioBus::Music, commands.audioVolume[1]);
+                    audioEngine.SetBusVolume(ixaudio::AudioBus::SFX, commands.audioVolume[2]);
+                }
                 if (commands.captureGpuFrame)
                     device.RequestGpuFrameCapture();
                 if (commands.dumpFrameProfile)
@@ -6048,6 +6118,27 @@ int RunGame(NativeWindow& window,
                     runtimeSession->Start(SceneManager::Instance().GetCurrentScene());
                     rebuildEditorPhysicsWorld();
                     editorCharacterStates.clear();
+                    // Audio: create (+ playOnStart-start) each entity's AudioSource for this Play session.
+                    entityAudioSources.clear();
+                    if (audioEngine.IsInitialized())
+                    {
+                        for (const MeshSceneEntity& audioMesh : editorMeshEntities)
+                        {
+                            if (!audioMesh.hasAudioSource || !audioMesh.audioSource.enabled ||
+                                audioMesh.audioSource.clipAssetId.empty())
+                                continue;
+                            const std::string clipPath = editorImGui.AudioClipFilePath(audioMesh.audioSource.clipAssetId);
+                            if (clipPath.empty())
+                                continue;
+                            ixaudio::AudioSourceRuntime rt;
+                            if (audioEngine.CreateSource(rt, audioMesh.audioSource, clipPath))
+                            {
+                                if (audioMesh.audioSource.playOnStart)
+                                    audioEngine.StartSource(rt);
+                                entityAudioSources[audioMesh.id] = std::move(rt);
+                            }
+                        }
+                    }
                     editorPlayerLookDx = 0.0f;
                     editorPlayerLookDy = 0.0f;
                     editorPlay.state.frameCount = 0;
@@ -6066,6 +6157,7 @@ int RunGame(NativeWindow& window,
                     runtimeSession->Stop();
                     clearEditorPhysicsWorld();
                     editorCharacterStates.clear();
+                    entityAudioSources.clear();  // dtors stop + uninit every ma_sound
                     editorWaterBodiesDirty = true;
                     if (editorPlay.playStartSceneWasOpen)
                     {
@@ -7898,6 +7990,26 @@ int RunGame(NativeWindow& window,
                         Tracenf("[INSPECTOR-COMP] remove entity=%u component=Character Controller", it->id);
                         return true;
                     }
+                    if (componentType == "audio.audio_source")
+                    {
+                        if (!it->hasAudioSource)
+                            return false;
+                        it->hasAudioSource = false;
+                        it->audioSource = {};
+                        SceneManager::Instance().MarkDirty();
+                        Tracenf("[INSPECTOR-COMP] remove entity=%u component=Audio Source", it->id);
+                        return true;
+                    }
+                    if (componentType == "audio.audio_listener")
+                    {
+                        if (!it->hasAudioListener)
+                            return false;
+                        it->hasAudioListener = false;
+                        it->audioListener = {};
+                        SceneManager::Instance().MarkDirty();
+                        Tracenf("[INSPECTOR-COMP] remove entity=%u component=Audio Listener", it->id);
+                        return true;
+                    }
                     const std::size_t oldSize = it->editorComponents.size();
                     it->editorComponents.erase(std::remove_if(it->editorComponents.begin(), it->editorComponents.end(),
                         [&](const EditorAttachedComponent& component) { return component.type == componentType; }),
@@ -7935,7 +8047,9 @@ int RunGame(NativeWindow& window,
                         commands.addComponentType == EditorComponentType::TriggerCapsule ||
                         commands.addComponentType == EditorComponentType::FixedJoint ||
                         commands.addComponentType == EditorComponentType::HingeJoint ||
-                        commands.addComponentType == EditorComponentType::CharacterController)
+                        commands.addComponentType == EditorComponentType::CharacterController ||
+                        commands.addComponentType == EditorComponentType::AudioSource ||
+                        commands.addComponentType == EditorComponentType::AudioListener)
                     {
                         if (selectedEditorObject.type == SelectedEditorObjectType::MeshEntity)
                         {
@@ -8001,6 +8115,20 @@ int RunGame(NativeWindow& window,
                                     it->characterController = {};
                                     Tracenf("[INSPECTOR-COMP] add entity=%u component=Character Controller", it->id);
                                     runtimeSession->SetEditorStatus("Added Character Controller component");
+                                }
+                                else if (commands.addComponentType == EditorComponentType::AudioSource)
+                                {
+                                    it->hasAudioSource = true;
+                                    it->audioSource = {};
+                                    Tracenf("[INSPECTOR-COMP] add entity=%u component=Audio Source", it->id);
+                                    runtimeSession->SetEditorStatus("Added Audio Source component");
+                                }
+                                else if (commands.addComponentType == EditorComponentType::AudioListener)
+                                {
+                                    it->hasAudioListener = true;
+                                    it->audioListener = {};
+                                    Tracenf("[INSPECTOR-COMP] add entity=%u component=Audio Listener", it->id);
+                                    runtimeSession->SetEditorStatus("Added Audio Listener component");
                                 }
                                 else
                                 {

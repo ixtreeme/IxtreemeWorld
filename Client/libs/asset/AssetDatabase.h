@@ -51,6 +51,7 @@ enum class AssetType
     Project,
     AnimationClip,
     AnimatorController,
+    AudioClip,
     Unknown
 };
 

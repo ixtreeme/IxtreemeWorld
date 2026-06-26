@@ -80,6 +80,7 @@ target_link_libraries(IXEngineRender
         IXEngineCommon
         IXEngineMath
         IXEnginePhysics
+        IXEngineAudio
         IXEngineImportExport
         IXEngineMapData
         fastgltf::fastgltf

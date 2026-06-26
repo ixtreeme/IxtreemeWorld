@@ -517,6 +517,7 @@ endif()
 
 add_subdirectory(libs/platform)
 add_subdirectory(libs/asset)
+add_subdirectory(libs/audio)
 add_subdirectory(libs/import_export)
 add_subdirectory(libs/animation)
 add_subdirectory(libs/render)

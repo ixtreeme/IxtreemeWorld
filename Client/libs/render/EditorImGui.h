@@ -120,6 +120,7 @@ public:
     std::string AnimationClipFilePath(const std::string& clipId) const;
     // Absolute filesystem path of an AnimatorController asset's .controller file (empty if none).
     std::string AnimatorControllerFilePath(const std::string& controllerId) const;
+    std::string AudioClipFilePath(const std::string& clipId) const;
     // Id of the first AnimationClip whose display name matches (empty if none) — for auto-filling
     // a controller's states with a character's own <stem>_anim_<i> clips.
     std::string FindAnimationClipIdByDisplayName(const std::string& displayName) const;
@@ -142,6 +143,7 @@ private:
         Animation,
         AnimationClip,
         AnimatorController,
+        Audio,
         Material,
         WaterMaterial,
         PhysicsMaterial,
@@ -559,6 +561,7 @@ private:
     float m_animatorZoom = 1.0f;
     std::uint32_t m_animatorSelectedStateId = 0;
     std::string m_animatorCenteredControllerId;  // pan auto-centered once per controller (Stage 7)
+    float m_audioVolume[3] = {1.0f, 1.0f, 1.0f};   // audio mixer sliders (Master/Music/SFX)
     bool m_animatorRenameRequested = false;       // Stage 7: state-rename modal trigger
     std::uint32_t m_animatorRenameStateId = 0;
     char m_animatorRenameBuf[128] = {};

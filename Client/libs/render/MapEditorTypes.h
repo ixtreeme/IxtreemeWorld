@@ -1,6 +1,7 @@
 #pragma once
 
 #include "physics/PhysicsComponents.h"
+#include "audio/AudioComponents.h"
 
 #include <cstdint>
 #include <cstddef>
@@ -394,6 +395,10 @@ struct MeshSceneEntity
     ixtreeme::physics::HingeJointComponent hingeJoint;
     bool hasCharacterController = false;
     ixtreeme::physics::CharacterControllerComponent characterController;
+    bool hasAudioSource = false;
+    ixaudio::AudioSourceComponent audioSource;
+    bool hasAudioListener = false;
+    ixaudio::AudioListenerComponent audioListener;
     // Stage-3 temporary clip binding (id of an AnimationClip asset, or empty). Runtime-only —
     // not serialized; replaced by the real Animator component in Stage 4.
     std::string debugAnimationClipId;
@@ -459,7 +464,9 @@ enum class EditorComponentType
     TriggerCapsule,
     FixedJoint,
     HingeJoint,
-    CharacterController
+    CharacterController,
+    AudioSource,
+    AudioListener
 };
 
 struct HierarchySceneEntity
@@ -526,6 +533,10 @@ struct MeshRendererEditorState
     ixtreeme::physics::HingeJointComponent hingeJoint;
     bool hasCharacterController = false;
     ixtreeme::physics::CharacterControllerComponent characterController;
+    bool hasAudioSource = false;
+    ixaudio::AudioSourceComponent audioSource;
+    bool hasAudioListener = false;
+    ixaudio::AudioListenerComponent audioListener;
     // Stage-3 temporary clip binding (id of an AnimationClip asset, or empty). Runtime-only —
     // not serialized; replaced by the real Animator component in Stage 4.
     std::string debugAnimationClipId;
@@ -880,4 +891,7 @@ struct MapEditorCommands
     float sceneGizmoRotation[3] = {0.0f, 0.0f, 0.0f};
     float sceneGizmoScale[3] = {1.0f, 1.0f, 1.0f};
     std::vector<AnimatorGraphEdit> animatorEdits;  // Stage 7: Animator graph edits (append-merged)
+    std::string previewAudioClipId;                // asset-browser "Play Preview" for an audio clip
+    bool audioVolumesChanged = false;              // audio mixer (Master/Music/SFX bus volumes)
+    float audioVolume[3] = {1.0f, 1.0f, 1.0f};
 };

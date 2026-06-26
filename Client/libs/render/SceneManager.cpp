@@ -1162,6 +1162,22 @@ void WriteCharacterControllerComponent(std::ostream& out, const ixtreeme::physic
     out << "      }";
 }
 
+void WriteAudioSourceComponent(std::ostream& out, const ixaudio::AudioSourceComponent& a)
+{
+    out << "      \"audio_source\": {\n";
+    out << "        \"clip_asset_id\": \"" << EscapeJson(a.clipAssetId) << "\",\n";
+    out << "        \"enabled\": " << (a.enabled ? "true" : "false") << ",\n";
+    out << "        \"loop\": " << (a.loop ? "true" : "false") << ",\n";
+    out << "        \"is_3d\": " << (a.is3d ? "true" : "false") << ",\n";
+    out << "        \"play_on_start\": " << (a.playOnStart ? "true" : "false") << ",\n";
+    out << "        \"volume\": " << a.volume << ",\n";
+    out << "        \"pitch\": " << a.pitch << ",\n";
+    out << "        \"min_distance\": " << a.minDistance << ",\n";
+    out << "        \"max_distance\": " << a.maxDistance << ",\n";
+    out << "        \"bus\": \"" << ixaudio::BusName(a.bus) << "\"\n";
+    out << "      }";
+}
+
 void WriteSceneEntity(std::ostream& out, const MeshSceneEntity& mesh, bool comma)
 {
     out << "    {\n";
@@ -1249,6 +1265,18 @@ void WriteSceneEntity(std::ostream& out, const MeshSceneEntity& mesh, bool comma
         Tracenf("[CHARACTER] saved controller entity=%u camera=%s",
             mesh.id,
             ixtreeme::physics::ToString(mesh.characterController.cameraMode));
+    }
+    if (mesh.hasAudioSource)
+    {
+        out << ",\n";
+        WriteAudioSourceComponent(out, mesh.audioSource);
+    }
+    if (mesh.hasAudioListener)
+    {
+        out << ",\n";
+        out << "      \"audio_listener\": {\n";
+        out << "        \"enabled\": " << (mesh.audioListener.enabled ? "true" : "false") << "\n";
+        out << "      }";
     }
     out << "\n";
     out << "    }" << (comma ? "," : "") << "\n";
@@ -1521,6 +1549,26 @@ ixtreeme::physics::CharacterControllerComponent ReadCharacterControllerComponent
     return cc;
 }
 
+ixaudio::AudioSourceComponent ReadAudioSourceComponent(const JsonValue& entity)
+{
+    ixaudio::AudioSourceComponent a;
+    if (const JsonValue* object = Find(entity, "audio_source"); object && object->type == JsonValue::Type::Object)
+    {
+        a.clipAssetId = ReadString(*object, "clip_asset_id");
+        a.enabled = ReadBool(*object, "enabled", a.enabled);
+        a.loop = ReadBool(*object, "loop", a.loop);
+        a.is3d = ReadBool(*object, "is_3d", a.is3d);
+        a.playOnStart = ReadBool(*object, "play_on_start", a.playOnStart);
+        a.volume = ReadFloat(*object, "volume", a.volume);
+        a.pitch = ReadFloat(*object, "pitch", a.pitch);
+        a.minDistance = ReadFloat(*object, "min_distance", a.minDistance);
+        a.maxDistance = ReadFloat(*object, "max_distance", a.maxDistance);
+        a.bus = ixaudio::ParseBus(ReadString(*object, "bus"));
+        ixaudio::Sanitize(a);
+    }
+    return a;
+}
+
 MeshSceneEntity ReadMeshSceneEntity(const JsonValue& entity)
 {
     MeshSceneEntity mesh;
@@ -1580,6 +1628,16 @@ MeshSceneEntity ReadMeshSceneEntity(const JsonValue& entity)
     {
         mesh.hasCharacterController = true;
         mesh.characterController = ReadCharacterControllerComponent(entity);
+    }
+    if (Find(entity, "audio_source"))
+    {
+        mesh.hasAudioSource = true;
+        mesh.audioSource = ReadAudioSourceComponent(entity);
+    }
+    if (const JsonValue* listenerObj = Find(entity, "audio_listener"); listenerObj && listenerObj->type == JsonValue::Type::Object)
+    {
+        mesh.hasAudioListener = true;
+        mesh.audioListener.enabled = ReadBool(*listenerObj, "enabled", true);
     }
     if (mesh.lod.enabled &&
         std::none_of(mesh.editorComponents.begin(), mesh.editorComponents.end(), [](const EditorAttachedComponent& component) {

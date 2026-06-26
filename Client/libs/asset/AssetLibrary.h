@@ -29,7 +29,8 @@ public:
         Scene,
         Prefab,
         AnimationClip,
-        AnimatorController
+        AnimatorController,
+        Audio
     };
 
     enum class TextureRole

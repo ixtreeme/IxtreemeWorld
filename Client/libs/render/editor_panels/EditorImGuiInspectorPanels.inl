@@ -98,6 +98,10 @@ void EditorImGui::RenderAddComponentMenu()
             return hasMesh && m_meshRendererState.hasHingeJoint;
         if (id == "physics.character_controller")
             return hasMesh && m_meshRendererState.hasCharacterController;
+        if (id == "audio.audio_source")
+            return hasMesh && m_meshRendererState.hasAudioSource;
+        if (id == "audio.audio_listener")
+            return hasMesh && m_meshRendererState.hasAudioListener;
         return hasMesh && hasAttachedComponent(definition.id);
     };
 
@@ -885,6 +889,78 @@ bool EditorImGui::RenderSelectedMeshPhysicsComponents()
             }
             ixtreeme::physics::Sanitize(cc);
             ImGui::TextDisabled("Right-drag in the Game view to look around.");
+        }
+        ImGui::PopID();
+    }
+
+    if (m_meshRendererState.hasAudioSource)
+    {
+        ImGui::PushID("audio.audio_source");
+        const bool open = ImGui::CollapsingHeader("Audio Source", ImGuiTreeNodeFlags_DefaultOpen);
+        componentMenu("AudioSourceComponentMenu", "audio.audio_source");
+        if (open)
+        {
+            auto& a = m_meshRendererState.audioSource;
+
+            if (m_assetLibrary)
+            {
+                const std::vector<AssetLibrary::Entry> clips =
+                    m_assetLibrary->EntriesFor(AssetLibrary::Category::Audio);
+                std::string preview = "(no clip)";
+                for (const AssetLibrary::Entry& e : clips)
+                    if (e.id == a.clipAssetId) { preview = e.displayName; break; }
+                if (ImGui::BeginCombo("Clip", preview.c_str()))
+                {
+                    if (ImGui::Selectable("(no clip)", a.clipAssetId.empty())) { a.clipAssetId.clear(); changed = true; }
+                    for (const AssetLibrary::Entry& e : clips)
+                    {
+                        const bool sel = (e.id == a.clipAssetId);
+                        if (ImGui::Selectable(e.displayName.c_str(), sel)) { a.clipAssetId = e.id; changed = true; }
+                        if (sel) ImGui::SetItemDefaultFocus();
+                    }
+                    ImGui::EndCombo();
+                }
+            }
+
+            changed |= ImGui::Checkbox("Enabled", &a.enabled);
+            changed |= ImGui::Checkbox("Play On Start", &a.playOnStart);
+            ImGui::SameLine();
+            changed |= ImGui::Checkbox("Loop", &a.loop);
+            ImGui::SameLine();
+            changed |= ImGui::Checkbox("3D", &a.is3d);
+
+            changed |= ImGui::SliderFloat("Volume", &a.volume, 0.0f, 1.0f, "%.2f");
+            changed |= ImGui::SliderFloat("Pitch", &a.pitch, 0.5f, 2.0f, "%.2f");
+
+            const char* buses[] = {"Master", "Music", "SFX"};
+            int busIdx = std::clamp(static_cast<int>(a.bus), 0, 2);
+            if (ImGui::Combo("Bus", &busIdx, buses, IM_ARRAYSIZE(buses)))
+            {
+                a.bus = static_cast<ixaudio::AudioBus>(busIdx);
+                changed = true;
+            }
+
+            if (a.is3d)
+            {
+                ImGui::SeparatorText("3D");
+                changed |= ImGui::DragFloat("Min Distance", &a.minDistance, 0.1f, 0.01f, 1000.0f, "%.2f m");
+                changed |= ImGui::DragFloat("Max Distance", &a.maxDistance, 0.5f, 0.1f, 5000.0f, "%.1f m");
+            }
+            ixaudio::Sanitize(a);
+            ImGui::TextDisabled("Plays in Play mode (Play On Start). Stops on Stop.");
+        }
+        ImGui::PopID();
+    }
+
+    if (m_meshRendererState.hasAudioListener)
+    {
+        ImGui::PushID("audio.audio_listener");
+        const bool open = ImGui::CollapsingHeader("Audio Listener", ImGuiTreeNodeFlags_DefaultOpen);
+        componentMenu("AudioListenerComponentMenu", "audio.audio_listener");
+        if (open)
+        {
+            changed |= ImGui::Checkbox("Enabled", &m_meshRendererState.audioListener.enabled);
+            ImGui::TextDisabled("Puts the 3D \"ears\" at this entity. Without one, the camera listens.");
         }
         ImGui::PopID();
     }
