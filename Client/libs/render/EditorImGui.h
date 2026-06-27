@@ -4,6 +4,7 @@
 #include "InputEvent.h"
 #include "MapEditorTypes.h"
 #include "WorldCamera.h"
+#include "platform/dynamic_library.h"
 #include "tools/tree/TreeGeneratorPanel.h"
 
 #if defined(_WIN32) && !defined(VK_USE_PLATFORM_WIN32_KHR)
@@ -70,6 +71,37 @@ public:
     // True when the Game panel was actually visible (active dock tab, not collapsed) last
     // frame. Lets the engine skip the expensive Game-view scene render when it's not shown.
     bool IsGameViewVisible() const { return m_gameViewVisible; }
+
+    // Native C++ game-module DLLs (Unreal-style): load/unload the project's modules, and the in-engine
+    // Build pipeline driven from RunGame's frame loop. Called from EngineApplication.
+    void LoadProjectGameModules(const std::filesystem::path& projectRoot);
+    void UnloadGameModules();
+    // Ensure <ProjectRoot>/Scripts exists with an engine-owned CMakeLists.txt (ALWAYS regenerated, the
+    // dev never edits it) + a starter Game.cpp (only if no *.cpp). Idempotent; called before every Build.
+    void EnsureProjectScriptsScaffold(const std::filesystem::path& projectRoot);
+    std::filesystem::path EngineSdkIncludeDir() const;  // resolves <root>/sdk/include (searches up)
+    void SetBuildRunning() { m_buildState = ScriptBuildState::Running; }
+    void SetBuildResult(bool ok, std::string log)
+    {
+        m_buildState = ScriptBuildState::Done;
+        m_buildSucceeded = ok;
+        m_buildLog = std::move(log);
+        m_buildOutputPanelOpen = true;
+    }
+
+    // Save-to-live iteration: a per-frame (throttled) mtime poll over the project's .lua Script assets
+    // and <ProjectRoot>/Scripts/*.cpp,*.h. EngineApplication drains m_pendingScriptChanges each frame to
+    // hot-reload Lua (in Play) and auto-build native C++ (in Edit).
+    struct ScriptFileChanges
+    {
+        std::vector<std::string> changedLua;  // Script asset ids whose .lua mtime changed
+        bool changedCpp = false;              // any <Project>/Scripts/*.cpp,*.h,*.hpp changed/added/removed
+    };
+    ScriptFileChanges PollScriptFileChanges();
+    ScriptFileChanges m_pendingScriptChanges;  // set in RenderEditorPanels, drained by EngineApplication
+    bool AutoBuildOnSave() const { return m_autoBuildOnSave; }
+    void SetAutoBuildOnSave(bool on) { m_autoBuildOnSave = on; }
+
     void SetSceneViewSelectionOutline(std::vector<std::array<float, 4>> segments);
     void SetSceneViewGizmo(HierarchyEntityType type,
                            std::uint32_t id,
@@ -121,6 +153,8 @@ public:
     // Absolute filesystem path of an AnimatorController asset's .controller file (empty if none).
     std::string AnimatorControllerFilePath(const std::string& controllerId) const;
     std::string AudioClipFilePath(const std::string& clipId) const;
+    // Absolute filesystem path of a Script asset's .lua file (empty if none) — for the Lua backend.
+    std::string ScriptSourceFilePath(const std::string& scriptId) const;
     // Id of the first AnimationClip whose display name matches (empty if none) — for auto-filling
     // a controller's states with a character's own <stem>_anim_<i> clips.
     std::string FindAnimationClipIdByDisplayName(const std::string& displayName) const;
@@ -144,6 +178,7 @@ private:
         AnimationClip,
         AnimatorController,
         Audio,
+        Script,
         Material,
         WaterMaterial,
         PhysicsMaterial,
@@ -217,11 +252,14 @@ private:
     void OpenProjectDialog(ProjectDialogMode mode);
     bool NavigateProjectBrowser(const std::filesystem::path& path, bool createMissing = false);
     void ActivateCurrentProject();
+    bool IsBuildRunning() const { return m_buildState == ScriptBuildState::Running; }
     bool LoadProjectStartupScene();
     bool CreateDefaultProjectScene();
     void CreateProjectFromDialog();
     void OpenProjectFromDialog(const std::filesystem::path& manifestPath);
     void RenderEditorToolbar();
+    void RenderBuildOutputPanel();
+    void RenderScriptsPanel();
     void RenderSceneSettingsPanel();
     struct ProjectSceneEntry
     {
@@ -455,6 +493,12 @@ private:
     EngineStats m_engineStats;
     std::vector<PhysicsEventEditorState> m_physicsEvents;
     MapEditorCommands m_commands;
+    // Game-script build state (driven by EngineApplication's worker thread; UI reads it).
+    enum class ScriptBuildState { Idle, Running, Done };
+    ScriptBuildState m_buildState = ScriptBuildState::Idle;
+    bool m_buildSucceeded = false;
+    bool m_buildOutputPanelOpen = false;
+    std::string m_buildLog;
     std::array<MapEditorPaletteSlot, 8> m_paletteSlots{};
     std::vector<std::pair<std::string, WaterMaterialData>> m_waterMaterials;
     std::unordered_map<std::string, std::uint32_t> m_waterMaterialUsageCounts;
@@ -469,6 +513,11 @@ private:
     std::filesystem::path m_projectBrowserPath;
     std::string m_projectStatus;
     double m_lastAutoSaveSeconds = 0.0;
+    // Script file-change poll (save-to-live).
+    double m_lastScriptPollSeconds = 0.0;
+    bool m_autoBuildOnSave = true;
+    std::unordered_map<std::string, std::filesystem::file_time_type> m_luaMtimes;  // key = Script asset id
+    std::unordered_map<std::string, std::filesystem::file_time_type> m_cppMtimes;  // key = abs source path
     int m_lastAutoSaveTitleRemainingSeconds = -1;
     char m_projectParentBuffer[512]{};
     char m_projectNameBuffer[128] = "NewProject";
@@ -533,6 +582,7 @@ private:
     std::string m_sceneRootName = "Untitled";
     std::vector<HierarchySceneEntity> m_hierarchyEntities;
     std::vector<std::string> m_attachedScenePaths;
+    std::vector<platform::DynamicLibraryHandle> m_loadedGameModules;  // native C++ game-module DLLs
     std::uint64_t m_selectedHierarchyEntity = 0;
     std::uint64_t m_hierarchyRenamingEntity = 0;
     char m_hierarchyRenameBuffer[128]{};

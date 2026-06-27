@@ -1,5 +1,8 @@
 #include "EditorImGui.h"
 
+#include "NativeBackend.h"  // ixscript::NativeBackend::RegisteredNames() for the Script inspector
+#include "platform/open_external.h"  // open .lua/.cpp scripts in the OS default editor
+
 #include "AssetDatabase.h"
 #include "AssimpExporter.h"
 #include "AssetWatcher.h"
@@ -55,6 +58,7 @@ constexpr const char* kHierarchyEntityPayloadType = "HIERARCHY_ENTITY";
 constexpr const char* kEditorNoteComponentId = "editor.note";
 constexpr const char* kLodComponentId = "rendering.lod";
 constexpr double kProjectAutoSaveIntervalSeconds = 5.0 * 60.0;
+constexpr double kScriptFilePollIntervalSeconds = 0.5;
 constexpr float kPi = ixtreeme::math::Pi;
 constexpr float kGizmoPlaneScaleUnitsPerPixel = 0.01f;
 
@@ -172,9 +176,9 @@ struct InspectorComponentDefinition
     bool addableToMesh;
 };
 
-const std::array<InspectorComponentDefinition, 19>& InspectorComponentRegistry()
+const std::array<InspectorComponentDefinition, 20>& InspectorComponentRegistry()
 {
-    static const std::array<InspectorComponentDefinition, 19> registry{{
+    static const std::array<InspectorComponentDefinition, 20> registry{{
         {"builtin.transform", "Transform", "Core", EditorComponentType::None, false},
         {"builtin.mesh_renderer", "MeshRenderer", "Rendering", EditorComponentType::MeshRenderer, false},
         {kLodComponentId, "LOD Group", "Rendering", EditorComponentType::None, true},
@@ -190,6 +194,7 @@ const std::array<InspectorComponentDefinition, 19>& InspectorComponentRegistry()
         {"physics.character_controller", "Character Controller", "Physics", EditorComponentType::CharacterController, true},
         {"audio.audio_source", "Audio Source", "Audio", EditorComponentType::AudioSource, true},
         {"audio.audio_listener", "Audio Listener", "Audio", EditorComponentType::AudioListener, true},
+        {"scripting.script", "Script", "Scripting", EditorComponentType::Script, true},
         {"builtin.water_body", "Water Body", "Rendering", EditorComponentType::WaterBody, false},
         {"builtin.point_light", "Point Light", "Lighting", EditorComponentType::PointLight, false},
         {"builtin.spot_light", "Spot Light", "Lighting", EditorComponentType::SpotLight, false},
@@ -450,6 +455,8 @@ const char* ImportDetectedTypeName(const std::filesystem::path& path)
         return "Anim";
     if (ext == ".wav" || ext == ".ogg" || ext == ".mp3" || ext == ".flac")
         return "Audio";
+    if (ext == ".lua")
+        return "Script";
     if (ext == ".scene")
         return "Scene";
     return "Unknown";
@@ -644,6 +651,7 @@ void ApplyEditorStyle()
 
 EditorImGui::~EditorImGui()
 {
+    UnloadGameModules();  // close any loaded game-module DLLs (purges their registry entries first)
     Destroy();
 }
 
@@ -1455,6 +1463,16 @@ std::string EditorImGui::AudioClipFilePath(const std::string& clipId) const
     return m_assetLibrary->AbsolutePath(*entry).generic_string();
 }
 
+std::string EditorImGui::ScriptSourceFilePath(const std::string& scriptId) const
+{
+    if (!m_assetLibrary || scriptId.empty())
+        return {};
+    const auto entry = m_assetLibrary->FindById(scriptId);
+    if (!entry || entry->category != AssetLibrary::Category::Script)
+        return {};
+    return m_assetLibrary->AbsolutePath(*entry).generic_string();
+}
+
 std::string EditorImGui::FindAnimationClipIdByDisplayName(const std::string& displayName) const
 {
     if (!m_assetLibrary || displayName.empty())
@@ -1504,6 +1522,7 @@ bool EditorImGui::ActiveAssetCategory(AssetLibrary::Category category) const
     case AssetBrowserFilter::AnimationClip: return category == AssetLibrary::Category::AnimationClip;
     case AssetBrowserFilter::AnimatorController: return category == AssetLibrary::Category::AnimatorController;
     case AssetBrowserFilter::Audio: return category == AssetLibrary::Category::Audio;
+    case AssetBrowserFilter::Script: return category == AssetLibrary::Category::Script;
     case AssetBrowserFilter::Material: return category == AssetLibrary::Category::Material;
     case AssetBrowserFilter::WaterMaterial: return category == AssetLibrary::Category::WaterMaterial;
     case AssetBrowserFilter::PhysicsMaterial: return category == AssetLibrary::Category::PhysicsMaterial;
@@ -1522,6 +1541,7 @@ AssetLibrary::Category EditorImGui::FolderCategory() const
     case AssetBrowserFilter::AnimationClip: return AssetLibrary::Category::AnimationClip;
     case AssetBrowserFilter::AnimatorController: return AssetLibrary::Category::AnimatorController;
     case AssetBrowserFilter::Audio: return AssetLibrary::Category::Audio;
+    case AssetBrowserFilter::Script: return AssetLibrary::Category::Script;
     case AssetBrowserFilter::Material: return AssetLibrary::Category::Material;
     case AssetBrowserFilter::WaterMaterial: return AssetLibrary::Category::WaterMaterial;
     case AssetBrowserFilter::PhysicsMaterial: return AssetLibrary::Category::PhysicsMaterial;
@@ -1545,6 +1565,7 @@ const char* EditorImGui::AssetFilterName() const
     case AssetBrowserFilter::AnimationClip: return "Anim Clips";
     case AssetBrowserFilter::AnimatorController: return "Animators";
     case AssetBrowserFilter::Audio: return "Audio";
+    case AssetBrowserFilter::Script: return "Scripts";
     case AssetBrowserFilter::Material: return "Materials";
     case AssetBrowserFilter::WaterMaterial: return "Water Mats";
     case AssetBrowserFilter::PhysicsMaterial: return "Physics Mats";

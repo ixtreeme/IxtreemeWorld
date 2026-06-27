@@ -305,6 +305,75 @@ void EditorImGui::RunProjectAutoSave()
     UpdateAutoSaveWindowTitle(now);
 }
 
+EditorImGui::ScriptFileChanges EditorImGui::PollScriptFileChanges()
+{
+    ScriptFileChanges changes;
+    const double now = ImGui::GetTime();
+    if (!ProjectManager::Instance().HasProject() || !m_assetLibrary)
+    {
+        m_lastScriptPollSeconds = now;
+        return changes;
+    }
+    const bool firstPass = (m_lastScriptPollSeconds <= 0.0);
+    if (!firstPass && now - m_lastScriptPollSeconds < kScriptFilePollIntervalSeconds)
+        return changes;  // throttle
+    m_lastScriptPollSeconds = now;
+
+    std::error_code ec;
+
+    // (a) .lua Script assets — report each changed asset id.
+    for (const AssetLibrary::Entry& e : m_assetLibrary->EntriesFor(AssetLibrary::Category::Script))
+    {
+        const std::filesystem::path p = m_assetLibrary->AbsolutePath(e);
+        const std::filesystem::file_time_type mt = std::filesystem::last_write_time(p, ec);
+        if (ec)
+            continue;  // mid-write/locked — catch it next tick
+        const auto it = m_luaMtimes.find(e.id);
+        if (it == m_luaMtimes.end())
+            m_luaMtimes[e.id] = mt;
+        else if (it->second != mt)
+        {
+            it->second = mt;
+            if (!firstPass)
+                changes.changedLua.push_back(e.id);
+        }
+    }
+
+    // (b) <ProjectRoot>/Scripts/*.cpp,*.h,*.hpp — a single "something changed" flag.
+    const std::filesystem::path scriptsDir = ProjectManager::Instance().ProjectRoot() / "Scripts";
+    std::unordered_map<std::string, std::filesystem::file_time_type> seen;
+    if (std::filesystem::is_directory(scriptsDir, ec))
+    {
+        for (const std::filesystem::directory_entry& de : std::filesystem::recursive_directory_iterator(
+                 scriptsDir, std::filesystem::directory_options::skip_permission_denied, ec))
+        {
+            if (!de.is_regular_file(ec))
+                continue;
+            // Skip the CMake build tree (its churn isn't a source edit).
+            const std::string full = de.path().generic_string();
+            if (full.find("/Scripts/build/") != std::string::npos)
+                continue;
+            std::string ext = de.path().extension().string();
+            std::transform(ext.begin(), ext.end(), ext.begin(),
+                [](unsigned char c) { return static_cast<char>(std::tolower(c)); });
+            if (ext != ".cpp" && ext != ".h" && ext != ".hpp" && ext != ".cxx" && ext != ".cc")
+                continue;
+            const std::filesystem::file_time_type mt = std::filesystem::last_write_time(de.path(), ec);
+            if (ec)
+                continue;
+            seen[full] = mt;
+            const auto it = m_cppMtimes.find(full);
+            if (it != m_cppMtimes.end() && it->second != mt && !firstPass)
+                changes.changedCpp = true;
+        }
+    }
+    if (!firstPass && seen.size() != m_cppMtimes.size())
+        changes.changedCpp = true;  // an add or delete
+    m_cppMtimes.swap(seen);
+
+    return changes;
+}
+
 void EditorImGui::UpdateAutoSaveWindowTitle(double now)
 {
     if (!ProjectManager::Instance().HasProject())
@@ -538,6 +607,26 @@ void EditorImGui::RenderEditorToolbar()
         }
 
         ImGui::SameLine();
+        ImGui::Dummy(ImVec2(16.0f, 0.0f));
+        ImGui::SameLine();
+        {
+            // Build the project's native C++ game scripts (<ProjectRoot>/Scripts) into the module DLL.
+            const bool canBuild = isEdit && ProjectManager::Instance().HasProject() && !IsBuildRunning();
+            if (!canBuild)
+                ImGui::BeginDisabled();
+            const char* buildLabel = IsBuildRunning() ? "Building..." : "Build";
+            if (UI::IconButton(ICON_FA_HAMMER, buildLabel, ImVec2(120.0f, 32.0f)))
+                m_commands.buildGameScripts = true;
+            if (!canBuild)
+            {
+                ImGui::EndDisabled();
+                if (ImGui::IsItemHovered(ImGuiHoveredFlags_AllowWhenDisabled))
+                    ImGui::SetTooltip(IsBuildRunning() ? "Build in progress..."
+                        : !isEdit ? "Stop Play to build" : "Open a project to build C++ scripts");
+            }
+        }
+
+        ImGui::SameLine();
         ImGui::Dummy(ImVec2(24.0f, 0.0f));
         ImGui::SameLine();
         RenderGizmoControls();
@@ -549,6 +638,27 @@ void EditorImGui::RenderEditorToolbar()
             m_engineStats.fps,
             m_engineStats.averageFrameMs > 0.0 ? m_engineStats.averageFrameMs : m_engineStats.frameMs,
             m_engineStats.processCpuPercent);
+    }
+    ImGui::End();
+}
+
+void EditorImGui::RenderBuildOutputPanel()
+{
+    if (!m_buildOutputPanelOpen)
+        return;
+    if (ImGui::Begin("Build Output", &m_buildOutputPanelOpen))
+    {
+        if (m_buildState == ScriptBuildState::Running)
+            ImGui::TextColored(ImVec4(0.95f, 0.74f, 0.30f, 1.0f), "Building game scripts...");
+        else if (m_buildState == ScriptBuildState::Done && m_buildSucceeded)
+            ImGui::TextColored(ImVec4(0.35f, 0.90f, 0.35f, 1.0f), "Build succeeded — module reloaded.");
+        else if (m_buildState == ScriptBuildState::Done)
+            ImGui::TextColored(ImVec4(0.95f, 0.35f, 0.35f, 1.0f), "Build FAILED — see the log below.");
+        ImGui::Separator();
+        ImGui::BeginChild("##buildlog", ImVec2(0, 0), ImGuiChildFlags_Borders,
+            ImGuiWindowFlags_HorizontalScrollbar);
+        ImGui::TextUnformatted(m_buildLog.empty() ? "(no output)" : m_buildLog.c_str());
+        ImGui::EndChild();
     }
     ImGui::End();
 }

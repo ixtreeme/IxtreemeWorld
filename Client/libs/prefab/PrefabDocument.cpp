@@ -4,6 +4,7 @@
 
 #include <algorithm>
 #include <cstdlib>
+#include <map>
 #include <sstream>
 
 namespace ixtreeme::prefab
@@ -261,6 +262,109 @@ void WriteAudioSource(std::ostream& out, const ixaudio::AudioSourceComponent& a,
     out << indent << "}";
 }
 
+void WriteScript(std::ostream& out, const ixscript::ScriptComponent& s, const std::string& indent)
+{
+    out << ",\n";
+    out << indent << "\"script\": {\n";
+    out << indent << "  \"backend\": \"" << ixscript::BackendName(s.backend) << "\",\n";
+    out << indent << "  \"script_asset_id\": \"" << ixtreeme::common::EscapeJson(s.scriptAssetId) << "\",\n";
+    out << indent << "  \"native_class\": \"" << ixtreeme::common::EscapeJson(s.nativeClassName) << "\",\n";
+    out << indent << "  \"enabled\": " << (s.enabled ? "true" : "false") << ",\n";
+    out << indent << "  \"parameters\": {";
+    bool first = true;
+    for (const auto& [key, value] : s.parameters)
+    {
+        out << (first ? "\n" : ",\n");
+        out << indent << "    \"" << ixtreeme::common::EscapeJson(key) << "\": \""
+            << ixtreeme::common::EscapeJson(value) << "\"";
+        first = false;
+    }
+    out << (first ? "}\n" : "\n" + indent + "  }\n");
+    out << indent << "}";
+}
+
+// Scans a JSON string literal starting at the opening quote `open`, returning the unescaped contents
+// and advancing `open` past the closing quote. Mirrors common::EscapeJson (\\ \" \n \r \t). Returns
+// false if there is no well-formed string at `open`.
+bool ScanJsonString(const std::string& text, std::size_t& open, std::string& out)
+{
+    if (open >= text.size() || text[open] != '"')
+        return false;
+    out.clear();
+    std::size_t i = open + 1;
+    while (i < text.size())
+    {
+        const char c = text[i];
+        if (c == '\\' && i + 1 < text.size())
+        {
+            const char esc = text[i + 1];
+            switch (esc)
+            {
+            case 'n': out.push_back('\n'); break;
+            case 'r': out.push_back('\r'); break;
+            case 't': out.push_back('\t'); break;
+            default: out.push_back(esc); break;  // \" \\ and any other escaped char -> literal
+            }
+            i += 2;
+            continue;
+        }
+        if (c == '"')
+        {
+            open = i + 1;  // advance past the closing quote
+            return true;
+        }
+        out.push_back(c);
+        ++i;
+    }
+    return false;  // unterminated string
+}
+
+// Parse a flat {"key":"value",...} object of string->string into the parameters map. Escape-aware so
+// it round-trips values written through EscapeJson (quotes, backslashes, newlines).
+std::map<std::string, std::string> ParseStringMap(const std::string& object)
+{
+    std::map<std::string, std::string> result;
+    std::size_t cursor = 0;
+    while (cursor < object.size())
+    {
+        const std::size_t keyOpen = object.find('"', cursor);
+        if (keyOpen == std::string::npos)
+            break;
+        std::size_t scan = keyOpen;
+        std::string key;
+        if (!ScanJsonString(object, scan, key))
+            break;
+        const std::size_t colon = object.find(':', scan);
+        if (colon == std::string::npos)
+            break;
+        const std::size_t valOpen = object.find('"', colon + 1);
+        if (valOpen == std::string::npos)
+            break;
+        scan = valOpen;
+        std::string value;
+        if (!ScanJsonString(object, scan, value))
+            break;
+        result[key] = value;
+        cursor = scan;
+    }
+    return result;
+}
+
+ixscript::ScriptComponent ReadScript(const std::string& object)
+{
+    ixscript::ScriptComponent s;
+    const std::string component = ExtractNamedObject(object, "script");
+    if (component.empty())
+        return s;
+    s.backend = ixscript::ParseBackend(ixtreeme::common::JsonStringValue(component, "backend"));
+    s.scriptAssetId = ixtreeme::common::JsonStringValue(component, "script_asset_id");
+    s.nativeClassName = ixtreeme::common::JsonStringValue(component, "native_class");
+    s.enabled = ixtreeme::common::JsonBoolValue(component, "enabled", s.enabled);
+    if (const std::string params = ExtractNamedObject(component, "parameters"); !params.empty())
+        s.parameters = ParseStringMap(params);
+    return s;
+}
+
 ixtreeme::physics::RigidbodyComponent ReadRigidbody(const std::string& object)
 {
     ixtreeme::physics::RigidbodyComponent rigidbody;
@@ -474,6 +578,8 @@ void WriteMeshObject(std::ostream& out, const MeshSceneEntity& mesh, const std::
         out << indent << "  \"enabled\": " << (mesh.audioListener.enabled ? "true" : "false") << "\n";
         out << indent << "}";
     }
+    if (mesh.hasScript)
+        WriteScript(out, mesh.script, indent);
     out << "\n";
 }
 
@@ -570,6 +676,11 @@ PrefabEntity ParseEntityObject(const std::string& object, const std::string& fal
         {
             entity.mesh.hasAudioListener = true;
             entity.mesh.audioListener.enabled = ixtreeme::common::JsonBoolValue(listenerObj, "enabled", true);
+        }
+        if (!ExtractNamedObject(object, "script").empty())
+        {
+            entity.mesh.hasScript = true;
+            entity.mesh.script = ReadScript(object);
         }
         return entity;
     }

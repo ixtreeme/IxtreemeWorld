@@ -2,6 +2,8 @@ if(ANDROID)
     add_library(IxtreemeEngine SHARED
         src/EngineApplication.cpp
         src/EngineApplication.h
+        src/ScriptApiImpl.cpp
+        src/ScriptApiImpl.h
         src/EditorSceneRuntime.cpp
         src/EditorSceneRuntime.h
         src/ViewportControls.cpp
@@ -20,6 +22,8 @@ else()
     add_executable(IxtreemeEngine
         src/EngineApplication.cpp
         src/EngineApplication.h
+        src/ScriptApiImpl.cpp
+        src/ScriptApiImpl.h
         src/EditorSceneRuntime.cpp
         src/EditorSceneRuntime.h
         src/ViewportControls.cpp
@@ -38,6 +42,7 @@ target_link_libraries(IxtreemeEngine
         IXEngineRender
         IXEngineAnimation
         IXEngineAudio
+        IXEngineScript
 )
 
 target_compile_features(IxtreemeEngine PRIVATE cxx_std_20)
@@ -47,6 +52,12 @@ target_compile_definitions(IxtreemeEngine
         $<$<BOOL:${IXTREEME_WITH_EDITOR}>:IXTREEME_WITH_EDITOR=1>
         $<$<BOOL:${IXTREEME_VERBOSE_DIAGNOSTICS}>:IXTREEME_DEBUG_LOGS=1>
 )
+
+if(MSVC)
+    # Force-link IXEngineScript so the IXSCRIPT_REGISTER static initializers (native script
+    # self-registration in scripts_native/*.cpp) are not stripped from the static lib.
+    target_link_options(IxtreemeEngine PRIVATE "/WHOLEARCHIVE:IXEngineScript")
+endif()
 
 if(WIN32)
     if(TARGET IXEngineShaders)

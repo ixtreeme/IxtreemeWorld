@@ -1571,6 +1571,7 @@ const char* AssetLibrary::CategoryName(Category category)
     case Category::AnimationClip: return "Animation Clips";
     case Category::AnimatorController: return "Animators";
     case Category::Audio: return "Audio Clips";
+    case Category::Script: return "Scripts";
     case Category::Scene: return "Scenes";
     case Category::Prefab: return "Prefabs";
     default: return "Assets";
@@ -1878,6 +1879,7 @@ std::string AssetLibrary::CategoryString(Category category)
     case Category::AnimationClip: return "animation_clip";
     case Category::AnimatorController: return "animator_controller";
     case Category::Audio: return "audio";
+    case Category::Script: return "script";
     case Category::Scene: return "scene";
     case Category::Prefab: return "prefab";
     default: return "texture";
@@ -1895,6 +1897,7 @@ std::optional<AssetLibrary::Category> AssetLibrary::ParseCategory(const std::str
     if (value == "animation_clip" || value == "animationclip") return Category::AnimationClip;
     if (value == "animator_controller" || value == "animatorcontroller") return Category::AnimatorController;
     if (value == "audio") return Category::Audio;
+    if (value == "script") return Category::Script;
     if (value == "scene") return Category::Scene;
     if (value == "prefab") return Category::Prefab;
     return std::nullopt;
@@ -1926,6 +1929,7 @@ std::filesystem::path AssetLibrary::CategoryDirectory(Category category) const
     case Category::AnimationClip: return m_libraryRoot / "animation_clips";
     case Category::AnimatorController: return m_libraryRoot / "animator_controllers";
     case Category::Audio: return m_libraryRoot / "audio_clips";
+    case Category::Script: return m_libraryRoot / "scripts";
     case Category::Scene: return m_libraryRoot / "scenes";
     case Category::Prefab: return m_libraryRoot / "prefabs";
     default: return m_libraryRoot / "textures";
@@ -2944,6 +2948,13 @@ bool AssetLibrary::ValidateFile(Category category, const std::filesystem::path& 
             return false;
         }
         break;
+    case Category::Script:
+        if (!HasAnyExtension(path, {".lua"}))
+        {
+            error = "scripts must be LUA";
+            return false;
+        }
+        break;
     case Category::AnimatorController:
         if (!HasAnyExtension(path, {".controller"}))
         {
@@ -2979,8 +2990,9 @@ std::string AssetLibrary::MakeUniqueId(Category category, const std::filesystem:
                         (category == Category::AnimationClip ? "clip_" :
                             (category == Category::AnimatorController ? "ctrl_" :
                                 (category == Category::Audio ? "audio_" :
-                                    (category == Category::Scene ? "scene_" :
-                                        (category == Category::Prefab ? "prefab_" : "mat_")))))))));
+                                    (category == Category::Script ? "script_" :
+                                        (category == Category::Scene ? "scene_" :
+                                            (category == Category::Prefab ? "prefab_" : "mat_"))))))))));
     const std::string base = prefix + SanitizeStem(sourcePath.stem().string());
     std::unordered_set<std::string> existing;
     for (const Entry& entry : m_entries)
@@ -3021,6 +3033,8 @@ std::optional<AssetLibrary::Category> DetectDirectImportCategory(const std::file
         return AssetLibrary::Category::Animation;
     if (ext == ".wav" || ext == ".ogg" || ext == ".mp3" || ext == ".flac")
         return AssetLibrary::Category::Audio;
+    if (ext == ".lua")
+        return AssetLibrary::Category::Script;
     if (ext == ".material")
         return AssetLibrary::Category::Material;
     if (ext == ".physmat")

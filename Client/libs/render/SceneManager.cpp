@@ -1178,6 +1178,25 @@ void WriteAudioSourceComponent(std::ostream& out, const ixaudio::AudioSourceComp
     out << "      }";
 }
 
+void WriteScriptComponent(std::ostream& out, const ixscript::ScriptComponent& s)
+{
+    out << "      \"script\": {\n";
+    out << "        \"backend\": \"" << ixscript::BackendName(s.backend) << "\",\n";
+    out << "        \"script_asset_id\": \"" << EscapeJson(s.scriptAssetId) << "\",\n";
+    out << "        \"native_class\": \"" << EscapeJson(s.nativeClassName) << "\",\n";
+    out << "        \"enabled\": " << (s.enabled ? "true" : "false") << ",\n";
+    out << "        \"parameters\": {";
+    bool first = true;
+    for (const auto& [key, value] : s.parameters)
+    {
+        out << (first ? "\n" : ",\n");
+        out << "          \"" << EscapeJson(key) << "\": \"" << EscapeJson(value) << "\"";
+        first = false;
+    }
+    out << (first ? "}\n" : "\n        }\n");
+    out << "      }";
+}
+
 void WriteSceneEntity(std::ostream& out, const MeshSceneEntity& mesh, bool comma)
 {
     out << "    {\n";
@@ -1277,6 +1296,11 @@ void WriteSceneEntity(std::ostream& out, const MeshSceneEntity& mesh, bool comma
         out << "      \"audio_listener\": {\n";
         out << "        \"enabled\": " << (mesh.audioListener.enabled ? "true" : "false") << "\n";
         out << "      }";
+    }
+    if (mesh.hasScript)
+    {
+        out << ",\n";
+        WriteScriptComponent(out, mesh.script);
     }
     out << "\n";
     out << "    }" << (comma ? "," : "") << "\n";
@@ -1569,6 +1593,27 @@ ixaudio::AudioSourceComponent ReadAudioSourceComponent(const JsonValue& entity)
     return a;
 }
 
+ixscript::ScriptComponent ReadScriptComponent(const JsonValue& entity)
+{
+    ixscript::ScriptComponent s;
+    if (const JsonValue* object = Find(entity, "script"); object && object->type == JsonValue::Type::Object)
+    {
+        s.backend = ixscript::ParseBackend(ReadString(*object, "backend"));
+        s.scriptAssetId = ReadString(*object, "script_asset_id");
+        s.nativeClassName = ReadString(*object, "native_class");
+        s.enabled = ReadBool(*object, "enabled", s.enabled);
+        if (const JsonValue* params = object->Find("parameters"); params && params->type == JsonValue::Type::Object)
+        {
+            for (const auto& [key, value] : params->object)
+            {
+                if (value.type == JsonValue::Type::String)
+                    s.parameters[key] = value.string;
+            }
+        }
+    }
+    return s;
+}
+
 MeshSceneEntity ReadMeshSceneEntity(const JsonValue& entity)
 {
     MeshSceneEntity mesh;
@@ -1638,6 +1683,11 @@ MeshSceneEntity ReadMeshSceneEntity(const JsonValue& entity)
     {
         mesh.hasAudioListener = true;
         mesh.audioListener.enabled = ReadBool(*listenerObj, "enabled", true);
+    }
+    if (const JsonValue* scriptObj = Find(entity, "script"); scriptObj && scriptObj->type == JsonValue::Type::Object)
+    {
+        mesh.hasScript = true;
+        mesh.script = ReadScriptComponent(entity);
     }
     if (mesh.lod.enabled &&
         std::none_of(mesh.editorComponents.begin(), mesh.editorComponents.end(), [](const EditorAttachedComponent& component) {

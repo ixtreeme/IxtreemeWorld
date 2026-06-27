@@ -19,6 +19,9 @@
 #include "AnimationRuntime.h"
 #include "AnimatorRuntime.h"
 #include "AudioEngine.h"
+#include "ScriptSystem.h"
+#include "ScriptApiImpl.h"
+#include "platform/process.h"  // RunProcess — drives cmake for the in-engine game-script Build
 #include "EditorImGui.h"
 #include "physics/PhysicsWorld.h"
 #if defined(_WIN32)
@@ -68,9 +71,11 @@
 #include <ctime>
 #include <filesystem>
 #include <fstream>
+#include <atomic>
 #include <functional>
 #include <limits>
 #include <memory>
+#include <mutex>
 #include <optional>
 #include <sstream>
 #include <string>
@@ -537,6 +542,8 @@ MeshRendererEditorState BuildMeshRendererEditorState(const std::vector<MeshScene
     state.audioSource = it->audioSource;
     state.hasAudioListener = it->hasAudioListener;
     state.audioListener = it->audioListener;
+    state.hasScript = it->hasScript;
+    state.script = it->script;
     state.debugAnimationClipId = it->debugAnimationClipId;
     state.animatorControllerId = it->animatorControllerId;
     state.materialSlotCount = std::max<std::uint32_t>(
@@ -576,6 +583,8 @@ void ApplyMeshRendererEditorState(MeshSceneEntity& mesh, const MeshRendererEdito
     mesh.audioSource = state.audioSource;
     mesh.hasAudioListener = state.hasAudioListener;
     mesh.audioListener = state.audioListener;
+    mesh.hasScript = state.hasScript;
+    mesh.script = state.script;
     mesh.debugAnimationClipId = state.debugAnimationClipId;
     mesh.animatorControllerId = state.animatorControllerId;
 }
@@ -1678,6 +1687,7 @@ void MergeMapEditorCommands(MapEditorCommands& target, const MapEditorCommands& 
     target.exitPlayMode = target.exitPlayMode || source.exitPlayMode;
     target.pausePlayMode = target.pausePlayMode || source.pausePlayMode;
     target.resumePlayMode = target.resumePlayMode || source.resumePlayMode;
+    target.buildGameScripts = target.buildGameScripts || source.buildGameScripts;
     target.addWaterBody = target.addWaterBody || source.addWaterBody;
     if (source.createTerrain)
     {
@@ -2263,6 +2273,9 @@ int RunGame(NativeWindow& window,
     ixaudio::AudioEngine audioEngine;
     audioEngine.Initialize();
 
+    // Chunk-1 scripting proof: confirm the Lua VM compiles + runs (logs "[SCRIPT] lua ok").
+    ixscript::ScriptSystem::RunLuaString("local x = 2 + 2; assert(x == 4)");
+
 #if defined(IXTREEME_WITH_EDITOR)
 #if defined(_WIN32)
     NativeWindow_Win32* win32Window = dynamic_cast<NativeWindow_Win32*>(&window);
@@ -2703,6 +2716,7 @@ int RunGame(NativeWindow& window,
     std::unordered_map<std::uint32_t, phys::BodyId> editorPhysicsBodies;
     std::unordered_map<phys::BodyId, PhysicsBodyEntityBinding> editorPhysicsBodyBindings;
     std::vector<PhysicsEntityEvent> editorPhysicsEntityEvents;
+    std::size_t editorLastStepEntityEventCount = 0;  // entity events appended by the last physics step
     std::vector<PhysicsDebugContact> editorPhysicsDebugContacts;
     std::vector<PhysicsDebugLine> editorPhysicsDebugLines;
     PhysicsLayerMatrix editorPhysicsLayerMatrix{};
@@ -2717,6 +2731,20 @@ int RunGame(NativeWindow& window,
     std::unordered_map<std::uint32_t, ixanim::AnimatorRuntime> entityAnimators;
     std::unordered_map<std::uint32_t, ixanim::AnimatorController> entityControllers;
     std::unordered_map<std::uint32_t, ixaudio::AudioSourceRuntime> entityAudioSources;  // per-entity, Play-only
+    // Scripting: the facade (wired once below), the subsystem (created on Play-enter), and one live
+    // ScriptInstance per scripted entity. All Play-only; torn down on Play-exit.
+    ScriptApiImpl scriptApi;
+    std::unique_ptr<ixscript::ScriptSystem> scriptSystem;
+    std::unordered_map<std::uint32_t, std::unique_ptr<ixscript::ScriptInstance>> entityScripts;
+    // In-engine game-script Build: cmake runs on a worker thread (10-30s) so the UI stays responsive;
+    // the reload + log update happen on the main thread when the worker signals done. std::jthread so
+    // that even an exception unwinding the main loop auto-joins it (no std::terminate on a live thread).
+    std::jthread buildThread;
+    std::atomic<bool> buildFinished{false};
+    std::atomic<bool> buildOk{false};
+    std::mutex buildLogMutex;
+    std::string buildLogShared;
+    bool buildInFlight = false;
     std::unordered_map<std::uint32_t, std::string> entityBoundControllerId;
     double animPrevFrameSeconds = 0.0;
     float editorPlayerLookDx = 0.0f;
@@ -2821,6 +2849,114 @@ int RunGame(NativeWindow& window,
             staticMeshSpatialIndex.Update(mesh.id, bounds);
         }
         return true;
+    };
+    // Wire the script facade's stable members once. Per-frame scalars (dt/movement/mouse) are refreshed
+    // before each Play frame's OnUpdate loop. The callbacks capture RunGame-local state by reference.
+    scriptApi.meshes = &editorMeshEntities;
+    scriptApi.syncMesh = [&](MeshSceneEntity& mesh) { syncStaticMeshSpatialEntity(mesh); };
+    scriptApi.markDirty = [] { SceneManager::Instance().MarkDirty(); };
+    scriptApi.audio = &audioEngine;
+    scriptApi.resolveAudioClip = [&](const std::string& clipAssetId) {
+        return editorImGui.AudioClipFilePath(clipAssetId);
+    };
+    // Lua backend: resolve a .lua asset id -> file path, then slurp its UTF-8 source. Cross-platform
+    // ifstream idiom (same as the scene/prefab text loads); libs/script never sees the filesystem.
+    scriptApi.resolveScriptSource = [&](const std::string& scriptAssetId) -> std::string {
+        const std::string path = editorImGui.ScriptSourceFilePath(scriptAssetId);
+        if (path.empty())
+            return {};
+        std::ifstream file(path, std::ios::binary);
+        if (!file)
+            return {};
+        return std::string((std::istreambuf_iterator<char>(file)), std::istreambuf_iterator<char>());
+    };
+    // Rich API: the shared entity-id allocator (for deferred spawn), the animator-param setter, and a
+    // synchronous physics raycast that reverse-maps the hit body back to an entity id.
+    scriptApi.nextEntityId = &nextEditorMeshEntityId;
+    scriptApi.setAnimatorParam = [&](std::uint32_t id, const std::string& name,
+                                     ScriptApiImpl::AnimatorParamType type, float fv, bool bv) {
+        auto it = entityAnimators.find(id);
+        if (it == entityAnimators.end() || !it->second.bound)
+            return;  // no bound animator on this entity — silent no-op
+        switch (type)
+        {
+        case ScriptApiImpl::AnimatorParamType::Float: ixanim::SetFloat(it->second, name, fv); break;
+        case ScriptApiImpl::AnimatorParamType::Bool: ixanim::SetBool(it->second, name, bv); break;
+        case ScriptApiImpl::AnimatorParamType::Trigger: ixanim::SetTrigger(it->second, name); break;
+        }
+    };
+    scriptApi.raycast = [&](const float origin[3], const float dir[3], float maxDist, std::uint32_t& outId,
+                            float outPoint[3], float outNormal[3], float& outDist) -> bool {
+        phys::PhysicsRaycastHit hit;
+        if (!editorPhysicsWorld.Raycast(origin, dir, maxDist, hit) || !hit.hit)
+            return false;
+        outPoint[0] = hit.position[0]; outPoint[1] = hit.position[1]; outPoint[2] = hit.position[2];
+        outNormal[0] = hit.normal[0]; outNormal[1] = hit.normal[1]; outNormal[2] = hit.normal[2];
+        outDist = hit.distance;
+        outId = 0;  // reverse-map the physics body back to an entity id (linear scan, fine for v1)
+        for (const auto& [entId, bodyId] : editorPhysicsBodies)
+            if (bodyId == hit.bodyId) { outId = entId; break; }
+        return true;
+    };
+    // Creates a mesh entity for a deferred script spawn, reusing the pre-allocated id (self-contained
+    // asset resolution + skinned detection, mirroring the editor's createMeshEntityAt).
+    auto spawnMeshEntityForScript = [&](const std::string& assetId, const float pos[3],
+                                        std::uint32_t preallocId) {
+        std::optional<AssetLibrary::Entry> entry;
+        if (!assetId.empty())
+        {
+            if (ProjectManager::Instance().HasProject())
+            {
+                AssetLibrary projectAssets(ProjectManager::Instance().ProjectRoot(),
+                    ProjectManager::Instance().AssetRootPath());
+                if (projectAssets.Initialize())
+                    if (auto e = projectAssets.FindById(assetId);
+                        e && e->category == AssetLibrary::Category::Model)
+                    {
+                        e->originalPath = projectAssets.AssetRelativePath(*e);
+                        entry = e;
+                    }
+            }
+            if (!entry)
+                if (auto root = assets.RootPath())
+                {
+                    AssetLibrary engineAssets(*root);
+                    if (engineAssets.Initialize())
+                        if (auto e = engineAssets.FindById(assetId);
+                            e && e->category == AssetLibrary::Category::Model)
+                        {
+                            e->originalPath = engineAssets.AssetRelativePath(*e);
+                            entry = e;
+                        }
+                }
+        }
+        MeshSceneEntity mesh{};
+        mesh.id = preallocId;
+        mesh.meshAssetId = assetId;
+        mesh.meshAssetPath = entry ? entry->originalPath : assetId;
+        mesh.name = makeUniqueSceneEntityName(
+            entry && !entry->displayName.empty() ? entry->displayName : std::string("Spawned"));
+        mesh.position[0] = pos[0];
+        mesh.position[1] = pos[1];
+        mesh.position[2] = pos[2];
+        std::filesystem::path path(mesh.meshAssetPath);
+        if (path.is_relative() && ProjectManager::Instance().HasProject())
+            path = ProjectManager::Instance().ProjectRoot() / path;
+        std::string ext = path.extension().string();
+        std::transform(ext.begin(), ext.end(), ext.begin(),
+            [](unsigned char c) { return static_cast<char>(std::tolower(c)); });
+        if (ext == ".fbx")
+            mesh.skinned = std::filesystem::exists(path.parent_path() / (path.stem().string() + "_skeleton.ozz"));
+        else if (ext == ".glb" || ext == ".gltf")
+        {
+            bool isSkinned = false;
+            std::string detectError;
+            mesh.skinned = StaticMeshRenderer::DetectSkinnedGltf(assets, path.string(), isSkinned, &detectError) && isSkinned;
+        }
+        mesh.materialSlots = LoadDefaultMaterialSlotGuids(mesh.meshAssetPath, ResolveModelSubmeshCount(mesh.meshAssetPath));
+        editorMeshEntities.push_back(mesh);
+        editorMeshEntityLookup[mesh.id] = editorMeshEntities.size() - 1u;
+        syncStaticMeshSpatialEntity(editorMeshEntities.back());
     };
     auto fitMeshColliderToBounds = [&](MeshSceneEntity& mesh) {
         if (!mesh.hasCollider)
@@ -3229,6 +3365,7 @@ int RunGame(NativeWindow& window,
                 trigger ? ++triggerEnded : ++collisionEnded;
         }
         std::uint32_t detailedEventLogs = 0;
+        const std::size_t entityEventsBeforeAppend = editorPhysicsEntityEvents.size();
         for (const phys::PhysicsContactEvent& event : contactEvents)
         {
             const auto bindingA = editorPhysicsBodyBindings.find(event.bodyA);
@@ -3277,6 +3414,9 @@ int RunGame(NativeWindow& window,
                 ++detailedEventLogs;
             }
         }
+        // Record this step's appended count BEFORE the front-trim, so OnCollision dispatch can find this
+        // frame's new events as the tail (the trim only removes the oldest from the front).
+        editorLastStepEntityEventCount = editorPhysicsEntityEvents.size() - entityEventsBeforeAppend;
         if (editorPhysicsEntityEvents.size() > 512)
         {
             editorPhysicsEntityEvents.erase(
@@ -3695,6 +3835,7 @@ int RunGame(NativeWindow& window,
     bool editorShiftDown = false;
     bool editorLeftMouseHeld = false;
     bool editorRightMouseHeld = false;
+    ScriptApiImpl::ScriptInputState editorScriptInput;  // arrow keys + mouse buttons for scripts
     bool editorHasMousePosition = false;
     int editorLastMouseX = 0;
     int editorLastMouseY = 0;
@@ -3734,6 +3875,7 @@ int RunGame(NativeWindow& window,
                              &editorShiftDown,
                              &editorLeftMouseHeld,
                              &editorRightMouseHeld,
+                             &editorScriptInput,
                              &editorHasMousePosition,
                              &editorLastMouseX,
                              &editorLastMouseY,
@@ -3777,6 +3919,20 @@ int RunGame(NativeWindow& window,
         else if (event.type == InputEvent::MouseUp && event.button == MouseButton_Right)
             editorRightMouseHeld = false;
 
+        // Arrow-key held-state for scripts (IsKeyDown(Up/Down/Left/Right)).
+        if (event.type == InputEvent::KeyDown || event.type == InputEvent::KeyUp)
+        {
+            const bool down = (event.type == InputEvent::KeyDown);
+            switch (event.key)
+            {
+            case Key_Up: editorScriptInput.up = down; break;
+            case Key_Down: editorScriptInput.down = down; break;
+            case Key_Left: editorScriptInput.left = down; break;
+            case Key_Right: editorScriptInput.right = down; break;
+            default: break;
+            }
+        }
+
         if (event.type == InputEvent::KeyDown && event.key == Key_Shift)
             editorShiftDown = true;
         else if (event.type == InputEvent::KeyUp && event.key == Key_Shift)
@@ -3803,6 +3959,7 @@ int RunGame(NativeWindow& window,
             movement.Clear();
 #if defined(IXTREEME_WITH_EDITOR)
             editorFlyMovement.Clear();
+            editorScriptInput = {};  // avoid a stuck arrow/mouse-button across a Play/Edit toggle
 #endif
             return;
         }
@@ -4566,6 +4723,51 @@ int RunGame(NativeWindow& window,
                 editorImGui.RefreshAssetLibrary();
             frameProfile.assetLibraryPollMs += MillisecondsBetween(assetRefreshBegin, std::chrono::steady_clock::now());
         }
+
+        // Save-to-live: drain the editor's per-frame script-file poll.
+        EditorImGui::ScriptFileChanges scriptChanges = std::move(editorImGui.m_pendingScriptChanges);
+        editorImGui.m_pendingScriptChanges = {};
+
+        // Lua hot-reload (no build): if a live .lua changed, rebuild every Play-live instance bound to it
+        // from fresh source — instantly. scriptSystem is non-null only in Play/PlayPaused; in Edit nothing
+        // is live and the per-Play backend is recreated fresh on the next Play-enter, so Edit is a no-op.
+        if (!scriptChanges.changedLua.empty() && scriptSystem)
+        {
+            const std::unordered_set<std::string> changedSet(
+                scriptChanges.changedLua.begin(), scriptChanges.changedLua.end());
+            for (const std::string& assetId : changedSet)
+                scriptSystem->InvalidateLuaSource(assetId);
+            for (MeshSceneEntity& reloadMesh : editorMeshEntities)
+            {
+                if (!reloadMesh.hasScript || !reloadMesh.script.enabled ||
+                    reloadMesh.script.backend != ixscript::ScriptBackendType::Lua ||
+                    changedSet.find(reloadMesh.script.scriptAssetId) == changedSet.end())
+                    continue;
+                auto it = entityScripts.find(reloadMesh.id);
+                if (it == entityScripts.end())
+                    continue;  // not live yet; a later CreateInstance will use the fresh source
+                // Destroy the old instance (releasing its sol::environment) BEFORE recreating.
+                if (it->second)
+                {
+                    try { it->second->OnDestroy(); }
+                    catch (...) { TraceError("[SCRIPT] OnDestroy threw entity=%u", reloadMesh.id); }
+                }
+                it->second.reset();
+                std::unique_ptr<ixscript::ScriptInstance> fresh =
+                    scriptSystem->CreateInstance(reloadMesh.id, reloadMesh.script);
+                if (!fresh)
+                {
+                    entityScripts.erase(it);  // recompile failed — drop (the backend logged the error)
+                    continue;
+                }
+                try { fresh->OnStart(); }
+                catch (...) { TraceError("[SCRIPT] OnStart threw entity=%u", reloadMesh.id); }
+                it->second = std::move(fresh);
+                Tracenf("[SCRIPT] hot-reloaded Lua entity=%u asset=%s",
+                    reloadMesh.id, reloadMesh.script.scriptAssetId.c_str());
+            }
+        }
+        // scriptChanges.changedCpp is consumed in the command block below (where `commands` is in scope).
 #endif
 
         uint32_t width = 0;
@@ -4738,6 +4940,20 @@ int RunGame(NativeWindow& window,
         {
             editorPlay.state.elapsedSeconds += deltaSeconds;
             ++editorPlay.state.frameCount;
+            // Refresh the script facade's per-frame scalars now, before the character controller
+            // consumes (and zeroes) the look deltas — so scripts see this frame's mouse movement.
+            // Input comes from whichever movement state is live this frame: with a player character
+            // free-fly is off (gameplay `movement`); without one, WASD drives the free-fly camera
+            // (`editorFlyMovement`) — point scripts at that so an input script is testable either way.
+            scriptApi.deltaSeconds = deltaSeconds;
+            scriptApi.elapsedSeconds = editorPlay.state.elapsedSeconds;
+            scriptApi.movement = cameraController.IsFreeCameraEnabled() ? &editorFlyMovement : &movement;
+            scriptApi.mouseDx = editorPlayerLookDx;
+            scriptApi.mouseDy = editorPlayerLookDy;
+            // Arrow keys are captured by the input handler; mouse buttons reuse the held-state bools.
+            editorScriptInput.mouseLeft = editorLeftMouseHeld;
+            editorScriptInput.mouseRight = editorRightMouseHeld;
+            scriptApi.input = &editorScriptInput;
             // Drive player character controllers BEFORE the physics step: each writes its
             // resolved transform to the mesh; the kinematic sync in stepEditorPhysicsWorld
             // then moves the Jolt body to match (so it pushes dynamic objects).
@@ -4773,6 +4989,125 @@ int RunGame(NativeWindow& window,
                 editorPlayerLookDy = 0.0f;
             }
             stepEditorPhysicsWorld(static_cast<float>(deltaSeconds));
+
+            // Scripting: drive each live instance's OnUpdate after physics/character have settled, so a
+            // script's SetPosition wins for this frame (and the audio push below sees the new transform).
+            // A throwing hook is isolated so one bad script can't take down the Play session.
+            if (!entityScripts.empty())
+            {
+                for (auto it = entityScripts.begin(); it != entityScripts.end();)
+                {
+                    auto meshIt = std::find_if(editorMeshEntities.begin(), editorMeshEntities.end(),
+                        [&](const MeshSceneEntity& m) { return m.id == it->first; });
+                    const bool entityGone = (meshIt == editorMeshEntities.end()) || !meshIt->hasScript;
+                    if (entityGone || !it->second)
+                    {
+                        if (it->second)
+                        {
+                            try { it->second->OnDestroy(); }
+                            catch (...) { TraceError("[SCRIPT] OnDestroy threw entity=%u", it->first); }
+                        }
+                        it = entityScripts.erase(it);
+                        continue;
+                    }
+                    if (!meshIt->script.enabled)  // disabled mid-Play: keep the instance, skip its update
+                    {
+                        ++it;
+                        continue;
+                    }
+                    try
+                    {
+                        it->second->OnUpdate(static_cast<float>(deltaSeconds));
+                    }
+                    catch (const std::exception& e)
+                    {
+                        TraceError("[SCRIPT] OnUpdate threw entity=%u: %s", it->first, e.what());
+                    }
+                    catch (...)
+                    {
+                        TraceError("[SCRIPT] OnUpdate threw entity=%u (unknown)", it->first);
+                    }
+                    ++it;
+                }
+            }
+
+            // OnCollision dispatch: fire enter-only contacts (phase==Started, like Unity OnCollisionEnter)
+            // from this frame's new physics events into each side's live script. Runs after OnUpdate and
+            // BEFORE the deferred drain, so an entity that destroys itself in OnCollision is reaped below.
+            if (!entityScripts.empty() && !editorPhysicsEntityEvents.empty())
+            {
+                // This step's new events are the LAST editorLastStepEntityEventCount entries (the trim
+                // only erases from the front), so the cursor is correct even when the 512-cap trims.
+                const std::size_t start = editorPhysicsEntityEvents.size() -
+                    std::min(editorLastStepEntityEventCount, editorPhysicsEntityEvents.size());
+                auto fireCollision = [&](std::uint32_t self, std::uint32_t other) {
+                    auto it = entityScripts.find(self);
+                    if (it == entityScripts.end() || !it->second)
+                        return;
+                    try { it->second->OnCollision(other); }
+                    catch (...) { TraceError("[SCRIPT] OnCollision threw entity=%u", self); }
+                };
+                for (std::size_t i = start; i < editorPhysicsEntityEvents.size(); ++i)
+                {
+                    const PhysicsEntityEvent& ev = editorPhysicsEntityEvents[i];
+                    if (ev.phase != phys::PhysicsContactPhase::Started ||
+                        ev.entityA == 0 || ev.entityB == 0 || ev.entityA == ev.entityB)
+                        continue;
+                    fireCollision(ev.entityA, ev.entityB);
+                    fireCollision(ev.entityB, ev.entityA);
+                }
+            }
+
+            // Deferred spawn/destroy: apply the script-queued ops AFTER the OnUpdate loop (mutating
+            // editorMeshEntities/entityScripts mid-loop would invalidate its iterators). The entity set
+            // changed, so the spatial lookup + physics world are rebuilt once at the end.
+            if (!scriptApi.deferredOps.empty())
+            {
+                // Drain by index against a snapshot count + COPY each op: a script's OnDestroy (below) may
+                // legally enqueue more ops, reallocating the vector — a range-for/reference would dangle.
+                // Ops queued during the drain run next frame.
+                const std::size_t drainCount = scriptApi.deferredOps.size();
+                for (std::size_t opIdx = 0; opIdx < drainCount; ++opIdx)
+                {
+                    const ScriptApiImpl::DeferredOp op = scriptApi.deferredOps[opIdx];
+                    if (op.kind == ScriptApiImpl::DeferredKind::Destroy)
+                    {
+                        if (auto sit = entityScripts.find(op.id); sit != entityScripts.end())
+                        {
+                            if (sit->second)
+                            {
+                                try { sit->second->OnDestroy(); }
+                                catch (...) { TraceError("[SCRIPT] OnDestroy threw entity=%u", op.id); }
+                            }
+                            entityScripts.erase(sit);
+                        }
+                        entityAudioSources.erase(op.id);
+                        removeStaticMeshSpatialEntity(op.id);
+                        auto meshIt = std::find_if(editorMeshEntities.begin(), editorMeshEntities.end(),
+                            [&](const MeshSceneEntity& m) { return m.id == op.id; });
+                        if (meshIt != editorMeshEntities.end())
+                            editorMeshEntities.erase(meshIt);
+                        if (selectedEditorObject.type == SelectedEditorObjectType::MeshEntity &&
+                            selectedEditorObject.id == op.id)
+                            selectedEditorObject = {};
+                    }
+                    else if (op.kind == ScriptApiImpl::DeferredKind::SpawnPrefab)
+                    {
+                        Tracenf("[SCRIPT] SpawnPrefab not yet supported (entity=%u asset=%s) — use SpawnMesh",
+                            op.id, op.assetId.c_str());
+                    }
+                    else  // SpawnMesh
+                    {
+                        spawnMeshEntityForScript(op.assetId, op.pos, op.id);
+                    }
+                }
+                // Erase only what we drained; any ops a hook queued during the drain stay for next frame.
+                scriptApi.deferredOps.erase(scriptApi.deferredOps.begin(),
+                    scriptApi.deferredOps.begin() + static_cast<std::ptrdiff_t>(drainCount));
+                rebuildMeshEntityLookup();
+                rebuildEditorPhysicsWorld();  // the entity set changed
+                SceneManager::Instance().MarkDirty();
+            }
 
             // Audio: push live AudioSource state (volume/pitch/3D position) each Play frame, after
             // transforms settle. Drop sources whose entity vanished (the dtor stops the sound).
@@ -4883,6 +5218,17 @@ int RunGame(NativeWindow& window,
                     sceneRuntime.ApplySceneData(pendingScene);
                 MapEditorCommands commands = runtimeSession->ConsumeMapEditorCommands();
                 MergeMapEditorCommands(commands, editorImGui.ConsumeCommands());
+                // Native C++ auto-build-on-save: a changed Scripts/*.cpp raises the SAME build the manual
+                // button uses — only in Edit (build/unload mid-Play would crash live instances), with a
+                // project, when idle, and only if the dev left auto-build on. The authoritative re-gate +
+                // worker-thread build are in the play-mode command block below.
+                if (scriptChanges.changedCpp && editorImGui.AutoBuildOnSave() &&
+                    editorPlay.state.mode == EditorPlayMode::Edit &&
+                    ProjectManager::Instance().HasProject() && !buildInFlight)
+                {
+                    commands.buildGameScripts = true;
+                    Tracen("[BUILD] auto-build on save: Scripts/*.cpp changed");
+                }
                 if (!commands.previewAudioClipId.empty())
                     audioEngine.PlayOneShot(editorImGui.AudioClipFilePath(commands.previewAudioClipId));
                 if (commands.audioVolumesChanged)
@@ -6091,6 +6437,74 @@ int RunGame(NativeWindow& window,
                 if (commands.resumePlayMode && editorPlay.state.mode == EditorPlayMode::PlayPaused)
                     editorPlay.state.mode = EditorPlayMode::Play;
 
+                // Build the project's native C++ game scripts (only in Edit, with a project, one at a
+                // time). MUST unload the module first so cmake can overwrite the locked DLL; the worker
+                // thread runs cmake and the main-thread poll (below) reloads on success.
+                if (commands.buildGameScripts &&
+                    editorPlay.state.mode == EditorPlayMode::Edit &&
+                    ProjectManager::Instance().HasProject() &&
+                    !buildInFlight)
+                {
+                    const std::filesystem::path projectRoot = ProjectManager::Instance().ProjectRoot();
+                    const std::filesystem::path scriptsDir = projectRoot / "Scripts";
+                    const std::filesystem::path buildDir = scriptsDir / "build";
+                    editorImGui.EnsureProjectScriptsScaffold(projectRoot);
+                    editorImGui.UnloadGameModules();  // *** release the LoadLibrary lock before overwrite ***
+                    buildInFlight = true;
+                    buildFinished.store(false);
+                    editorImGui.SetBuildRunning();
+                    // The module MUST be built with the SAME config (CRT + iterator-debug-level) as the
+                    // running engine, or const std::string&/STL params across the boundary corrupt: a
+                    // Release engine is /MT (IDL=0), a Debug engine /MTd (IDL=2). Match it.
+#if defined(NDEBUG)
+                    const std::string buildConfig = "Release";
+#else
+                    const std::string buildConfig = "Debug";
+#endif
+                    Tracenf("[BUILD] game scripts: starting cmake (config=%s)", buildConfig.c_str());
+                    buildThread = std::jthread(
+                        [&buildFinished, &buildOk, &buildLogMutex, &buildLogShared, scriptsDir, buildDir, buildConfig] {
+                            platform::ProcessResult cfg = platform::RunProcess(
+                                {"cmake", "-S", scriptsDir.string(), "-B", buildDir.string(), "-A", "x64"});
+                            std::string log = cfg.output;
+                            bool ok = cfg.launched && cfg.exitCode == 0;
+                            if (!cfg.launched)
+                                log += "\n[BUILD] cmake not found on PATH — install CMake or add it to PATH.";
+                            else if (ok)
+                            {
+                                platform::ProcessResult bld = platform::RunProcess(
+                                    {"cmake", "--build", buildDir.string(), "--config", buildConfig});
+                                log += "\n" + bld.output;
+                                ok = bld.launched && bld.exitCode == 0;
+                            }
+                            {
+                                std::lock_guard<std::mutex> lk(buildLogMutex);
+                                buildLogShared = std::move(log);
+                            }
+                            buildOk.store(ok);
+                            buildFinished.store(true);
+                        });
+                }
+
+                // Build completion (main thread): reload the module on success — the registry mutation
+                // must NOT happen on the worker thread (the render/Play path reads it).
+                if (buildInFlight && buildFinished.load())
+                {
+                    buildInFlight = false;
+                    if (buildThread.joinable())
+                        buildThread.join();  // the worker has finished; join returns immediately
+                    std::string buildLog;
+                    {
+                        std::lock_guard<std::mutex> lk(buildLogMutex);
+                        buildLog = std::move(buildLogShared);
+                    }
+                    const bool ok = buildOk.load();
+                    if (ok && ProjectManager::Instance().HasProject())
+                        editorImGui.LoadProjectGameModules(ProjectManager::Instance().ProjectRoot());
+                    editorImGui.SetBuildResult(ok, std::move(buildLog));
+                    Tracenf("[BUILD] game scripts %s", ok ? "OK" : "FAILED");
+                }
+
                 if (editorPlay.appliedMode == EditorPlayMode::Edit &&
                     editorPlay.state.mode != EditorPlayMode::Edit)
                 {
@@ -6139,6 +6553,33 @@ int RunGame(NativeWindow& window,
                             }
                         }
                     }
+                    // Scripting: spin up the subsystem and create one live instance per scripted entity,
+                    // firing OnStart now. A throwing hook must not abort Play, so isolate every call.
+                    entityScripts.clear();
+                    scriptSystem = std::make_unique<ixscript::ScriptSystem>(scriptApi);
+                    for (const MeshSceneEntity& scriptMesh : editorMeshEntities)
+                    {
+                        if (!scriptMesh.hasScript || !scriptMesh.script.enabled)
+                            continue;
+                        std::unique_ptr<ixscript::ScriptInstance> instance =
+                            scriptSystem->CreateInstance(scriptMesh.id, scriptMesh.script);
+                        if (!instance)
+                            continue;
+                        try
+                        {
+                            instance->OnStart();
+                        }
+                        catch (const std::exception& e)
+                        {
+                            TraceError("[SCRIPT] OnStart threw entity=%u: %s", scriptMesh.id, e.what());
+                        }
+                        catch (...)
+                        {
+                            TraceError("[SCRIPT] OnStart threw entity=%u (unknown)", scriptMesh.id);
+                        }
+                        entityScripts[scriptMesh.id] = std::move(instance);
+                    }
+                    Tracenf("[SCRIPT] Play started: %zu live script instance(s)", entityScripts.size());
                     editorPlayerLookDx = 0.0f;
                     editorPlayerLookDy = 0.0f;
                     editorPlay.state.frameCount = 0;
@@ -6157,6 +6598,16 @@ int RunGame(NativeWindow& window,
                     runtimeSession->Stop();
                     clearEditorPhysicsWorld();
                     editorCharacterStates.clear();
+                    // Scripting: fire OnDestroy on every live instance, then drop them and the subsystem.
+                    for (auto& [scriptEntityId, instance] : entityScripts)
+                    {
+                        if (!instance)
+                            continue;
+                        try { instance->OnDestroy(); }
+                        catch (...) { TraceError("[SCRIPT] OnDestroy threw entity=%u", scriptEntityId); }
+                    }
+                    entityScripts.clear();
+                    scriptSystem.reset();
                     entityAudioSources.clear();  // dtors stop + uninit every ma_sound
                     editorWaterBodiesDirty = true;
                     if (editorPlay.playStartSceneWasOpen)
@@ -8010,6 +8461,16 @@ int RunGame(NativeWindow& window,
                         Tracenf("[INSPECTOR-COMP] remove entity=%u component=Audio Listener", it->id);
                         return true;
                     }
+                    if (componentType == "scripting.script")
+                    {
+                        if (!it->hasScript)
+                            return false;
+                        it->hasScript = false;
+                        it->script = {};
+                        SceneManager::Instance().MarkDirty();
+                        Tracenf("[INSPECTOR-COMP] remove entity=%u component=Script", it->id);
+                        return true;
+                    }
                     const std::size_t oldSize = it->editorComponents.size();
                     it->editorComponents.erase(std::remove_if(it->editorComponents.begin(), it->editorComponents.end(),
                         [&](const EditorAttachedComponent& component) { return component.type == componentType; }),
@@ -8049,7 +8510,8 @@ int RunGame(NativeWindow& window,
                         commands.addComponentType == EditorComponentType::HingeJoint ||
                         commands.addComponentType == EditorComponentType::CharacterController ||
                         commands.addComponentType == EditorComponentType::AudioSource ||
-                        commands.addComponentType == EditorComponentType::AudioListener)
+                        commands.addComponentType == EditorComponentType::AudioListener ||
+                        commands.addComponentType == EditorComponentType::Script)
                     {
                         if (selectedEditorObject.type == SelectedEditorObjectType::MeshEntity)
                         {
@@ -8129,6 +8591,13 @@ int RunGame(NativeWindow& window,
                                     it->audioListener = {};
                                     Tracenf("[INSPECTOR-COMP] add entity=%u component=Audio Listener", it->id);
                                     runtimeSession->SetEditorStatus("Added Audio Listener component");
+                                }
+                                else if (commands.addComponentType == EditorComponentType::Script)
+                                {
+                                    it->hasScript = true;
+                                    it->script = {};
+                                    Tracenf("[INSPECTOR-COMP] add entity=%u component=Script", it->id);
+                                    runtimeSession->SetEditorStatus("Added Script component");
                                 }
                                 else
                                 {
@@ -10675,6 +11144,24 @@ int RunGame(NativeWindow& window,
         }
 #endif
     }
+
+#if defined(IXTREEME_WITH_EDITOR)
+    // Wait out any in-flight game-script build so its worker thread (which references RunGame locals)
+    // can't outlive this scope.
+    if (buildThread.joinable())
+        buildThread.join();
+    // Closing the window while still in Play must still honor the script lifecycle: fire OnDestroy on
+    // every live instance before the maps unwind (their dtors would otherwise free without the hook).
+    for (auto& [scriptEntityId, instance] : entityScripts)
+    {
+        if (!instance)
+            continue;
+        try { instance->OnDestroy(); }
+        catch (...) { TraceError("[SCRIPT] OnDestroy threw entity=%u (shutdown)", scriptEntityId); }
+    }
+    entityScripts.clear();
+    scriptSystem.reset();
+#endif
 
     device.WaitIdle();
     if (worldLabelsOk)

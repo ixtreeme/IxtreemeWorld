@@ -551,6 +551,12 @@ void EditorImGui::ActivateCurrentProject()
     AssetDatabase::Instance().scan(projects.ProjectRoot());
     AssetWatcher::Instance().start(projects.ProjectRoot());
     InitializeProjectAssetLibrary(projects.ProjectRoot(), projects.AssetRootPath());
+    LoadProjectGameModules(projects.ProjectRoot());  // native C++ game-module DLLs (Unreal-style)
+    // Reset the save-to-live poll for the new project: clear the old project's mtimes and force a fresh
+    // first-pass seed (so a project switch never spuriously reports changes / auto-builds).
+    m_luaMtimes.clear();
+    m_cppMtimes.clear();
+    m_lastScriptPollSeconds = 0.0;
     LoadProjectPhysicsSettings();
     SceneManager::Instance().CloseScene();
     const bool openedScene = LoadProjectStartupScene();
@@ -573,6 +579,198 @@ void EditorImGui::ActivateCurrentProject()
         std::error_code ec;
         const std::filesystem::path relative = std::filesystem::relative(activePath, projects.ProjectRoot(), ec);
         m_attachedScenePaths.push_back(ec ? std::filesystem::path(activePath).generic_string() : relative.generic_string());
+    }
+}
+
+void EditorImGui::LoadProjectGameModules(const std::filesystem::path& projectRoot)
+{
+    // Native C++ game modules (Unreal-style): a third-party dev compiles their NativeScript classes into
+    // a DLL against the SDK and drops it in <ProjectRoot>/Binaries. We load each, resolve the C-ABI entry
+    // point, and let it register its classes into the shared native registry — so they appear in the
+    // Script inspector and run in Play, all without the engine source. Reload on every project activation.
+    UnloadGameModules();
+
+    const std::filesystem::path modulesDir = projectRoot / "Binaries";
+    std::error_code ec;
+    if (!std::filesystem::is_directory(modulesDir, ec))
+        return;
+
+#if defined(_WIN32)
+    const std::string moduleExt = ".dll";
+#else
+    const std::string moduleExt = ".so";
+#endif
+
+    for (const std::filesystem::directory_entry& entry : std::filesystem::directory_iterator(modulesDir, ec))
+    {
+        if (!entry.is_regular_file(ec))
+            continue;
+        std::string ext = entry.path().extension().string();
+        std::transform(ext.begin(), ext.end(), ext.begin(),
+            [](unsigned char c) { return static_cast<char>(std::tolower(c)); });
+        if (ext != moduleExt)
+            continue;
+
+        std::string loadError;
+        platform::DynamicLibraryHandle handle = platform::OpenLibrary(entry.path(), &loadError);
+        if (!handle)
+        {
+            TraceError("[SCRIPT] game module failed to load: %s (%s)",
+                entry.path().filename().string().c_str(), loadError.c_str());
+            continue;
+        }
+        auto entryFn = reinterpret_cast<ixscript::IxModuleEntryFn>(
+            platform::GetLibrarySymbol(handle, IXTREEME_MODULE_ENTRY_SYMBOL));
+        if (!entryFn)
+        {
+            // Not an Ixtreeme game module (no entry export) — unload and ignore.
+            platform::CloseLibrary(handle);
+            continue;
+        }
+        const ixscript::ModuleLoadResult result = ixscript::InvokeGameModule(entryFn);
+        if (!result.versionOk)
+        {
+            platform::CloseLibrary(handle);
+            continue;  // InvokeGameModule already logged the version mismatch
+        }
+        m_loadedGameModules.push_back(handle);
+        Tracenf("[SCRIPT] loaded game module %s: %d native class(es) registered",
+            entry.path().filename().string().c_str(), result.registeredCount);
+    }
+}
+
+void EditorImGui::UnloadGameModules()
+{
+    // Purge module-registered classes from the native registry BEFORE unloading their DLLs, so no
+    // factory points into freed code. Only safe outside Play (live ScriptInstances hold DLL vtables);
+    // ActivateCurrentProject runs at project open, never mid-Play. v1: no hot reload.
+    if (!m_loadedGameModules.empty())
+        ixscript::ClearExternalNativeScripts();
+    for (platform::DynamicLibraryHandle handle : m_loadedGameModules)
+        platform::CloseLibrary(handle);
+    m_loadedGameModules.clear();
+}
+
+std::filesystem::path EditorImGui::EngineSdkIncludeDir() const
+{
+    // m_engineRoot may be the engine SOURCE root (has sdk/) OR the exe directory (several levels below
+    // it, e.g. build/apps/client/Release). Search the engine root and its parents for a real
+    // sdk/include/ixtreeme; this also picks up a packaged "sdk next to the exe" layout (checked first).
+    auto hasSdk = [](const std::filesystem::path& base) {
+        std::error_code ec;
+        return std::filesystem::exists(base / "sdk" / "include" / "ixtreeme" / "NativeScript.h", ec);
+    };
+    std::filesystem::path dir = m_engineRoot;
+    for (int i = 0; i < 10 && !dir.empty(); ++i)
+    {
+        if (hasSdk(dir))
+            return dir / "sdk" / "include";
+        if (dir.parent_path() == dir)
+            break;
+        dir = dir.parent_path();
+    }
+    return m_engineRoot / "sdk" / "include";  // not found — emit the nominal path (build fails loudly)
+}
+
+void EditorImGui::EnsureProjectScriptsScaffold(const std::filesystem::path& projectRoot)
+{
+    std::error_code ec;
+    const std::filesystem::path scriptsDir = projectRoot / "Scripts";
+    std::filesystem::create_directories(scriptsDir, ec);
+    if (ec)
+    {
+        m_projectStatus = "Failed to create Scripts/: " + ec.message();
+        return;
+    }
+
+    // CMake target name must be a bare identifier — sanitize the (possibly spaced) project name.
+    std::string proj = ProjectManager::Instance().CurrentProject().name;
+    if (proj.empty())
+        proj = "Game";
+    for (char& c : proj)
+    {
+        const unsigned char uc = static_cast<unsigned char>(c);
+        if (!std::isalnum(uc) && c != '_')
+            c = '_';
+    }
+    if (std::isdigit(static_cast<unsigned char>(proj[0])))
+        proj = "_" + proj;
+
+    // Generated CMakeLists.txt — ALWAYS regenerated (engine-owned, like Unreal's UBT-generated project
+    // files): the dev never edits it, and regenerating each build keeps the SDK include path + flags
+    // correct (a stale path can't persist). The dev's *.cpp are NEVER touched.
+    const std::filesystem::path cmakeFile = scriptsDir / "CMakeLists.txt";
+    {
+        const std::string sdkInclude = EngineSdkIncludeDir().generic_string();
+        std::string tmpl =
+            "# GENERATED by the IxtreemeWorld editor — DO NOT EDIT. Regenerated on every build.\n"
+            "# Compiles <ProjectRoot>/Scripts/*.cpp into <ProjectRoot>/Binaries/@PROJ@.dll (SDK headers only).\n"
+            "cmake_minimum_required(VERSION 3.20)\n"
+            "project(@PROJ@ CXX)\n\n"
+            "file(GLOB GAME_MODULE_SOURCES CONFIGURE_DEPENDS \"${CMAKE_CURRENT_SOURCE_DIR}/*.cpp\")\n\n"
+            "# Runtime-loaded shared library (MODULE — only loaded by the engine, never linked).\n"
+            "add_library(@PROJ@ MODULE ${GAME_MODULE_SOURCES})\n\n"
+            "set_target_properties(@PROJ@ PROPERTIES\n"
+            "    PREFIX \"\"\n"
+            "    CXX_STANDARD 20\n"
+            "    CXX_STANDARD_REQUIRED ON\n"
+            "    LIBRARY_OUTPUT_DIRECTORY         \"${CMAKE_CURRENT_SOURCE_DIR}/../Binaries\"\n"
+            "    RUNTIME_OUTPUT_DIRECTORY         \"${CMAKE_CURRENT_SOURCE_DIR}/../Binaries\"\n"
+            "    LIBRARY_OUTPUT_DIRECTORY_RELEASE \"${CMAKE_CURRENT_SOURCE_DIR}/../Binaries\"\n"
+            "    RUNTIME_OUTPUT_DIRECTORY_RELEASE \"${CMAKE_CURRENT_SOURCE_DIR}/../Binaries\")\n\n"
+            "target_compile_definitions(@PROJ@ PRIVATE IXTREEME_GAME_MODULE=1)\n"
+            "target_include_directories(@PROJ@ PRIVATE \"@SDK_INCLUDE@\")\n\n"
+            "if(MSVC)\n"
+            "    # Match the engine's STATIC CRT (/MT) so the C++/heap ABI lines up across the load boundary.\n"
+            "    set_property(TARGET @PROJ@ PROPERTY\n"
+            "        MSVC_RUNTIME_LIBRARY \"MultiThreaded$<$<CONFIG:Debug>:Debug>\")\n"
+            "endif()\n";
+        for (size_t p = tmpl.find("@PROJ@"); p != std::string::npos; p = tmpl.find("@PROJ@"))
+            tmpl.replace(p, 6, proj);
+        for (size_t p = tmpl.find("@SDK_INCLUDE@"); p != std::string::npos; p = tmpl.find("@SDK_INCLUDE@"))
+            tmpl.replace(p, 13, sdkInclude);
+        std::ofstream(cmakeFile, std::ios::binary) << tmpl;
+    }
+
+    // Seed a starter Game.cpp if the project has no C++ source yet.
+    bool hasCpp = false;
+    for (const std::filesystem::directory_entry& e : std::filesystem::directory_iterator(scriptsDir, ec))
+    {
+        if (e.is_regular_file(ec) && e.path().extension() == ".cpp")
+        {
+            hasCpp = true;
+            break;
+        }
+    }
+    if (!hasCpp)
+    {
+        const char* seed =
+            "#define IXTREEME_GAME_MODULE 1\n"
+            "#include \"ixtreeme/NativeScript.h\"\n"
+            "#include \"ixtreeme/IxModuleRegistry.inl\"  // include in exactly ONE .cpp of your module\n\n"
+            "// Your first game script. Spins the entity around Y at `speed` deg/sec. `speed` is editable\n"
+            "// in the inspector and serialized, thanks to IX_REFLECT. Add your own classes below.\n"
+            "class GameSpinner : public ixscript::NativeScript\n"
+            "{\n"
+            "public:\n"
+            "    float speed = 90.0f;  // deg/sec\n\n"
+            "    void OnUpdate(float dt) override\n"
+            "    {\n"
+            "        float r[3];\n"
+            "        GetRotation(r);  // Euler degrees\n"
+            "        r[1] += speed * dt;\n"
+            "        SetRotation(r);\n"
+            "    }\n\n"
+            "    IX_REFLECT(GameSpinner, speed)\n"
+            "};\n"
+            "IXSCRIPT_REGISTER(GameSpinner)\n";
+        const std::filesystem::path seedPath = scriptsDir / "Game.cpp";
+        std::ofstream(seedPath, std::ios::binary) << seed;
+        // Stamp the just-seeded file into the poll map so it isn't seen as a "new .cpp" on the next
+        // poll (which would otherwise fire one redundant auto-build right after the first build).
+        const std::filesystem::file_time_type mt = std::filesystem::last_write_time(seedPath, ec);
+        if (!ec)
+            m_cppMtimes[seedPath.generic_string()] = mt;
     }
 }
 

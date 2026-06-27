@@ -2,7 +2,13 @@ add_library(IXEnginePlatform STATIC
     InputEvent.h
     NativeWindow.h
     platform/trash.h
+    platform/dynamic_library.h
+    platform/process.h
+    platform/open_external.h
     Trash_Stub.cpp
+    DynamicLibrary_Posix.cpp
+    Process_Posix.cpp
+    OpenExternal_Posix.cpp
     VulkanDevice.cpp
     VulkanDevice.h
 )
@@ -12,6 +18,9 @@ if(WIN32)
         NativeWindow_Win32.cpp
         NativeWindow_Win32.h
         Trash_Win32.cpp
+        DynamicLibrary_Win32.cpp
+        Process_Win32.cpp
+        OpenExternal_Win32.cpp
     )
     target_link_libraries(IXEnginePlatform PUBLIC
         Vulkan::Vulkan
@@ -44,6 +53,7 @@ endif()
 target_link_libraries(IXEnginePlatform
     PUBLIC
         IXEngineDebug
+        ${CMAKE_DL_LIBS}   # dlopen/dlsym for DynamicLibrary on POSIX (empty on Windows)
 )
 
 target_include_directories(IXEnginePlatform

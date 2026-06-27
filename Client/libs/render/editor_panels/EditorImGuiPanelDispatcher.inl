@@ -11,13 +11,16 @@ void EditorImGui::RenderEditorPanels()
     RenderProjectModal();
     HandleEditorHotkeys();
     RunProjectAutoSave();
+    m_pendingScriptChanges = PollScriptFileChanges();  // save-to-live: drained by EngineApplication
     RenderEditorToolbar();
     RenderHierarchyPanel();
     RenderSceneSettingsPanel();
     RenderWorldPanel();
     RenderToolsPanel();
     RenderAssetBrowser();
+    RenderScriptsPanel();
     RenderInspector();
+    RenderBuildOutputPanel();
     RenderSceneViewDropTarget();
     RenderGameViewPanel();
     RenderAnimatorPanel();

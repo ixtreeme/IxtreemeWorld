@@ -52,6 +52,8 @@ void EditorImGui::RenderAssetTypeTabs()
     ImGui::SameLine();
     tab("Audio", AssetBrowserFilter::Audio);
     ImGui::SameLine();
+    tab("Scripts", AssetBrowserFilter::Script);
+    ImGui::SameLine();
     tab("Materials", AssetBrowserFilter::Material);
     ImGui::SameLine();
     tab("Water Mats", AssetBrowserFilter::WaterMaterial);
@@ -267,6 +269,15 @@ void EditorImGui::RenderAssetTile(const AssetLibrary::Entry& entry, float tileSi
         {
             m_commands.previewAudioClipId = entry.id;
             m_assetStatus = "Preview: " + entry.displayName;
+        }
+        else if (doubleClicked && entry.category == AssetLibrary::Category::Script)
+        {
+            std::string err;
+            const std::filesystem::path path = m_assetLibrary->AbsolutePath(entry);
+            if (platform::OpenInDefaultApp(path, &err))
+                m_assetStatus = "Opened: " + entry.displayName;
+            else
+                m_assetStatus = "Open failed: " + err;
         }
     }
 
@@ -1114,6 +1125,107 @@ void EditorImGui::RenderAssetBrowser()
                 assets.size());
         }
     }
+    ImGui::End();
+}
+
+void EditorImGui::RenderScriptsPanel()
+{
+    if (!m_editorModeActive)
+        return;
+    if (!ImGui::Begin("Scripts"))
+    {
+        ImGui::End();
+        return;
+    }
+
+    const bool hasProject = ProjectManager::Instance().HasProject();
+
+    // Build the project's native C++ game scripts (same action as the toolbar Build button).
+    const bool canBuild = hasProject && m_playModeState.mode == EditorPlayMode::Edit && !IsBuildRunning();
+    if (!canBuild)
+        ImGui::BeginDisabled();
+    if (ImGui::Button(IsBuildRunning() ? ICON_FA_HAMMER " Building..." : ICON_FA_HAMMER " Build Game Scripts"))
+        m_commands.buildGameScripts = true;
+    if (!canBuild)
+        ImGui::EndDisabled();
+    ImGui::SameLine();
+    ImGui::TextDisabled("compiles <Project>/Scripts -> Binaries + reloads");
+    ImGui::Checkbox("Auto-build on save", &m_autoBuildOnSave);
+    ImGui::SameLine();
+    ImGui::TextDisabled("(.cpp save -> auto Build in Edit; .lua hot-reloads live in Play)");
+    ImGui::Separator();
+
+    auto openExternal = [this](const std::filesystem::path& p) {
+        std::string err;
+        if (platform::OpenInDefaultApp(p, &err))
+            m_assetStatus = "Opened: " + p.filename().string();
+        else
+            m_assetStatus = "Open failed: " + err;
+    };
+
+    // --- Native C++ source (<ProjectRoot>/Scripts/*.cpp,*.h) ---
+    ImGui::SeparatorText("C++ source (Scripts/)");
+    if (!hasProject)
+    {
+        ImGui::TextDisabled("No project open.");
+    }
+    else
+    {
+        const std::filesystem::path scriptsDir = ProjectManager::Instance().ProjectRoot() / "Scripts";
+        std::error_code ec;
+        bool anySource = false;
+        if (std::filesystem::is_directory(scriptsDir, ec))
+        {
+            for (const std::filesystem::directory_entry& e :
+                 std::filesystem::recursive_directory_iterator(
+                     scriptsDir, std::filesystem::directory_options::skip_permission_denied, ec))
+            {
+                if (!e.is_regular_file(ec))
+                    continue;
+                std::string ext = e.path().extension().string();
+                std::transform(ext.begin(), ext.end(), ext.begin(),
+                    [](unsigned char c) { return static_cast<char>(std::tolower(c)); });
+                if (ext != ".cpp" && ext != ".h" && ext != ".hpp" && ext != ".cxx" && ext != ".cc")
+                    continue;
+                anySource = true;
+                const std::string rel = std::filesystem::relative(e.path(), scriptsDir, ec).generic_string();
+                ImGui::PushID(rel.c_str());
+                if (ImGui::Selectable((ICON_FA_FILE " " + rel).c_str(), false,
+                        ImGuiSelectableFlags_AllowDoubleClick) &&
+                    ImGui::IsMouseDoubleClicked(ImGuiMouseButton_Left))
+                {
+                    openExternal(e.path());
+                }
+                ImGui::PopID();
+            }
+        }
+        if (!anySource)
+            ImGui::TextDisabled("No C++ scripts yet — click Build to scaffold Scripts/Game.cpp.");
+    }
+
+    // --- Lua script assets ---
+    ImGui::SeparatorText("Lua scripts (.lua assets)");
+    if (m_assetLibrary)
+    {
+        const std::vector<AssetLibrary::Entry> luaScripts =
+            m_assetLibrary->EntriesFor(AssetLibrary::Category::Script);
+        if (luaScripts.empty())
+            ImGui::TextDisabled("No .lua scripts. Drop a .lua into the asset browser.");
+        for (const AssetLibrary::Entry& e : luaScripts)
+        {
+            ImGui::PushID(e.id.c_str());
+            if (ImGui::Selectable((ICON_FA_FILE " " + e.displayName).c_str(), false,
+                    ImGuiSelectableFlags_AllowDoubleClick) &&
+                ImGui::IsMouseDoubleClicked(ImGuiMouseButton_Left))
+            {
+                openExternal(m_assetLibrary->AbsolutePath(e));
+            }
+            ImGui::PopID();
+        }
+    }
+
+    ImGui::Spacing();
+    ImGui::TextDisabled("Double-click a script to open it in your editor.");
     ImGui::End();
 }
 

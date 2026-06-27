@@ -2,6 +2,7 @@
 
 #include "physics/PhysicsComponents.h"
 #include "audio/AudioComponents.h"
+#include "script/ScriptComponent.h"
 
 #include <cstdint>
 #include <cstddef>
@@ -399,6 +400,8 @@ struct MeshSceneEntity
     ixaudio::AudioSourceComponent audioSource;
     bool hasAudioListener = false;
     ixaudio::AudioListenerComponent audioListener;
+    bool hasScript = false;
+    ixscript::ScriptComponent script;
     // Stage-3 temporary clip binding (id of an AnimationClip asset, or empty). Runtime-only —
     // not serialized; replaced by the real Animator component in Stage 4.
     std::string debugAnimationClipId;
@@ -466,7 +469,8 @@ enum class EditorComponentType
     HingeJoint,
     CharacterController,
     AudioSource,
-    AudioListener
+    AudioListener,
+    Script
 };
 
 struct HierarchySceneEntity
@@ -537,6 +541,8 @@ struct MeshRendererEditorState
     ixaudio::AudioSourceComponent audioSource;
     bool hasAudioListener = false;
     ixaudio::AudioListenerComponent audioListener;
+    bool hasScript = false;
+    ixscript::ScriptComponent script;
     // Stage-3 temporary clip binding (id of an AnimationClip asset, or empty). Runtime-only —
     // not serialized; replaced by the real Animator component in Stage 4.
     std::string debugAnimationClipId;
@@ -793,6 +799,7 @@ struct MapEditorCommands
     bool exitPlayMode = false;
     bool pausePlayMode = false;
     bool resumePlayMode = false;
+    bool buildGameScripts = false;  // compile <ProjectRoot>/Scripts into the game-module DLL + reload
     bool addWaterBody = false;
     bool createTerrain = false;
     TerrainSceneData terrainCreate;

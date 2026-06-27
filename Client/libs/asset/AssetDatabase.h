@@ -52,6 +52,7 @@ enum class AssetType
     AnimationClip,
     AnimatorController,
     AudioClip,
+    Script,
     Unknown
 };
 

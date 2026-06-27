@@ -102,6 +102,8 @@ void EditorImGui::RenderAddComponentMenu()
             return hasMesh && m_meshRendererState.hasAudioSource;
         if (id == "audio.audio_listener")
             return hasMesh && m_meshRendererState.hasAudioListener;
+        if (id == "scripting.script")
+            return hasMesh && m_meshRendererState.hasScript;
         return hasMesh && hasAttachedComponent(definition.id);
     };
 
@@ -961,6 +963,204 @@ bool EditorImGui::RenderSelectedMeshPhysicsComponents()
         {
             changed |= ImGui::Checkbox("Enabled", &m_meshRendererState.audioListener.enabled);
             ImGui::TextDisabled("Puts the 3D \"ears\" at this entity. Without one, the camera listens.");
+        }
+        ImGui::PopID();
+    }
+
+    if (m_meshRendererState.hasScript)
+    {
+        ImGui::PushID("scripting.script");
+        const bool open = ImGui::CollapsingHeader("Script", ImGuiTreeNodeFlags_DefaultOpen);
+        componentMenu("ScriptComponentMenu", "scripting.script");
+        if (open)
+        {
+            auto& sc = m_meshRendererState.script;
+            changed |= ImGui::Checkbox("Enabled", &sc.enabled);
+
+            const char* backends[] = {"Native (C++)", "Lua"};
+            int backendIdx = (sc.backend == ixscript::ScriptBackendType::Lua) ? 1 : 0;
+            if (ImGui::Combo("Backend", &backendIdx, backends, IM_ARRAYSIZE(backends)))
+            {
+                sc.backend = (backendIdx == 1) ? ixscript::ScriptBackendType::Lua
+                                               : ixscript::ScriptBackendType::Native;
+                changed = true;
+            }
+
+            if (sc.backend == ixscript::ScriptBackendType::Native)
+            {
+                const std::vector<std::string> classes = ixscript::NativeBackend::RegisteredNames();
+                const std::string preview = sc.nativeClassName.empty() ? "(class)" : sc.nativeClassName;
+                if (ImGui::BeginCombo("Class", preview.c_str()))
+                {
+                    for (const std::string& cls : classes)
+                        if (ImGui::Selectable(cls.c_str(), cls == sc.nativeClassName))
+                        {
+                            sc.nativeClassName = cls;
+                            changed = true;
+                        }
+                    ImGui::EndCombo();
+                }
+                if (classes.empty())
+                    ImGui::TextDisabled("No native scripts registered (IXSCRIPT_REGISTER).");
+            }
+            else if (m_assetLibrary)  // Lua: pick a .lua asset from the project library
+            {
+                const std::vector<AssetLibrary::Entry> scripts =
+                    m_assetLibrary->EntriesFor(AssetLibrary::Category::Script);
+                std::string preview = sc.scriptAssetId.empty() ? "(no script)" : sc.scriptAssetId;
+                for (const AssetLibrary::Entry& e : scripts)
+                    if (e.id == sc.scriptAssetId) { preview = e.displayName; break; }
+                if (ImGui::BeginCombo("Script", preview.c_str()))
+                {
+                    if (ImGui::Selectable("(no script)", sc.scriptAssetId.empty())) { sc.scriptAssetId.clear(); changed = true; }
+                    for (const AssetLibrary::Entry& e : scripts)
+                    {
+                        const bool sel = (e.id == sc.scriptAssetId);
+                        if (ImGui::Selectable(e.displayName.c_str(), sel)) { sc.scriptAssetId = e.id; changed = true; }
+                        if (sel) ImGui::SetItemDefaultFocus();
+                    }
+                    ImGui::EndCombo();
+                }
+                if (scripts.empty())
+                    ImGui::TextDisabled("No .lua scripts in the project. Drop a .lua into the asset browser.");
+            }
+
+            // Reflected fields (Unity-[SerializeField] style): if the chosen native class declares fields
+            // via IX_REFLECT, show typed widgets bound to parameters[name]; an unedited field uses its
+            // code default (no key stored). Lua and schema-less native classes fall back to the manual
+            // key/value table below.
+            std::vector<ixscript::ScriptFieldDesc> fieldSchema;
+            if (sc.backend == ixscript::ScriptBackendType::Native && !sc.nativeClassName.empty())
+                fieldSchema = ixscript::NativeBackend::DescribeFields(sc.nativeClassName);
+
+            if (!fieldSchema.empty())
+            {
+                ImGui::SeparatorText("Script Fields");
+                // Parse up to n comma-separated floats (no sscanf — C4996; matches the runtime ApplyBinder).
+                auto parseFloats = [](const std::string& s, float* out, int n) {
+                    const char* p = s.c_str();
+                    for (int i = 0; i < n && *p; ++i)
+                    {
+                        char* end = nullptr;
+                        out[i] = std::strtof(p, &end);
+                        if (end == p)
+                            break;
+                        p = end;
+                        while (*p == ',' || *p == ' ')
+                            ++p;
+                    }
+                };
+                for (const ixscript::ScriptFieldDesc& fd : fieldSchema)
+                {
+                    ImGui::PushID(fd.name.c_str());
+                    const auto existing = sc.parameters.find(fd.name);
+                    const std::string current =
+                        (existing != sc.parameters.end()) ? existing->second : fd.defaultValue;
+                    char buf[160];
+                    switch (fd.type)
+                    {
+                    case ixscript::ScriptFieldType::Float:
+                    {
+                        float v = std::strtof(current.c_str(), nullptr);
+                        if (ImGui::DragFloat(fd.name.c_str(), &v, 0.1f, 0.0f, 0.0f, "%.3f"))
+                        {
+                            std::snprintf(buf, sizeof(buf), "%g", static_cast<double>(v));
+                            sc.parameters[fd.name] = buf;
+                            changed = true;
+                        }
+                        break;
+                    }
+                    case ixscript::ScriptFieldType::Int:
+                    {
+                        int v = std::atoi(current.c_str());
+                        if (ImGui::DragInt(fd.name.c_str(), &v, 0.1f))
+                        {
+                            sc.parameters[fd.name] = std::to_string(v);
+                            changed = true;
+                        }
+                        break;
+                    }
+                    case ixscript::ScriptFieldType::Bool:
+                    {
+                        bool v = (current == "1" || current == "true" || current == "True");
+                        if (ImGui::Checkbox(fd.name.c_str(), &v))
+                        {
+                            sc.parameters[fd.name] = v ? "1" : "0";
+                            changed = true;
+                        }
+                        break;
+                    }
+                    case ixscript::ScriptFieldType::Vec3:
+                    {
+                        float v[3] = {0.0f, 0.0f, 0.0f};
+                        parseFloats(current, v, 3);
+                        if (ImGui::DragFloat3(fd.name.c_str(), v, 0.1f, 0.0f, 0.0f, "%.3f"))
+                        {
+                            std::snprintf(buf, sizeof(buf), "%g,%g,%g",
+                                static_cast<double>(v[0]), static_cast<double>(v[1]), static_cast<double>(v[2]));
+                            sc.parameters[fd.name] = buf;
+                            changed = true;
+                        }
+                        break;
+                    }
+                    case ixscript::ScriptFieldType::Color:
+                    {
+                        float v[4] = {0.0f, 0.0f, 0.0f, 1.0f};
+                        parseFloats(current, v, 4);
+                        if (ImGui::ColorEdit4(fd.name.c_str(), v))
+                        {
+                            std::snprintf(buf, sizeof(buf), "%g,%g,%g,%g", static_cast<double>(v[0]),
+                                static_cast<double>(v[1]), static_cast<double>(v[2]), static_cast<double>(v[3]));
+                            sc.parameters[fd.name] = buf;
+                            changed = true;
+                        }
+                        break;
+                    }
+                    }
+                    ImGui::PopID();
+                }
+                ImGui::TextDisabled("Fields declared in C++ via IX_REFLECT (defaults from code).");
+            }
+            else
+            {
+                // Exposed string parameters (key/value), read by the script via Param/ParamFloat or
+                // (Lua) self.params. Fallback for Lua + native classes that declare no IX_REFLECT fields.
+                ImGui::SeparatorText("Parameters");
+                std::string removeKey;
+                for (auto& kv : sc.parameters)
+                {
+                    ImGui::PushID(kv.first.c_str());
+                    ImGui::TextUnformatted(kv.first.c_str());
+                    ImGui::SameLine(140.0f);
+                    char valueBuf[128];
+                    std::snprintf(valueBuf, sizeof(valueBuf), "%s", kv.second.c_str());
+                    ImGui::SetNextItemWidth(150.0f);
+                    if (ImGui::InputText("##val", valueBuf, sizeof(valueBuf)))
+                    {
+                        kv.second = valueBuf;
+                        changed = true;
+                    }
+                    ImGui::SameLine();
+                    if (ImGui::SmallButton("X"))
+                        removeKey = kv.first;
+                    ImGui::PopID();
+                }
+                if (!removeKey.empty())
+                {
+                    sc.parameters.erase(removeKey);
+                    changed = true;
+                }
+                static char s_newParamKey[64] = {};
+                ImGui::SetNextItemWidth(120.0f);
+                ImGui::InputText("##newparam", s_newParamKey, sizeof(s_newParamKey));
+                ImGui::SameLine();
+                if (ImGui::SmallButton("+ Add Param") && s_newParamKey[0] != '\0')
+                {
+                    sc.parameters[s_newParamKey] = "0";
+                    s_newParamKey[0] = '\0';
+                    changed = true;
+                }
+            }
         }
         ImGui::PopID();
     }
