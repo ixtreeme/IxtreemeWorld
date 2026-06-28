@@ -353,6 +353,13 @@ private:
                              const std::string& targetSubpath,
                              const char* trigger);
     void CreatePbrMaterialAsset();
+    void CreateLuaScriptAsset();                            // new .lua Script asset (browser/Scripts panel)
+    void CreateNativeScriptAsset();                         // new .cpp Script asset (browser, default name)
+    void CreateNativeScriptFile(const std::string& className);  // new <className>.cpp Script asset
+    // The directory holding native C++ game-script sources (.cpp). They live alongside .lua in the
+    // asset library's scripts folder so both are first-class, browsable assets; the Build pipeline's
+    // CMake project (in <ProjectRoot>/Scripts) compiles them from here.
+    std::filesystem::path ProjectScriptSourceDir() const;
     void CreateWaterMaterialAsset();
     bool CreateWaterMaterialAsset(const std::string& displayName, AssetLibrary::Entry& outEntry);
     void CreatePhysicsMaterialAsset();
@@ -556,6 +563,8 @@ private:
     bool m_assetOpenDeletePopup = false;
     bool m_assetOpenImportPopup = false;
     bool m_assetOpenCreateMaterialPopup = false;
+    char m_newCppScriptName[96] = "MyScript";  // New C++ Script class-name popup
+    bool m_openNewCppScriptPopup = false;
     char m_createMaterialName[96] = "material";
     int m_createMaterialShadingMode = -1;
     enum class FbxExportSource

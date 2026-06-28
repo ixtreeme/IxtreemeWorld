@@ -321,9 +321,14 @@ EditorImGui::ScriptFileChanges EditorImGui::PollScriptFileChanges()
 
     std::error_code ec;
 
-    // (a) .lua Script assets — report each changed asset id.
+    // (a) .lua Script assets — report each changed asset id (hot-reloaded live). Native .cpp Script
+    // assets are ALSO in this category now, but they're compiled (handled by the .cpp poll below), not
+    // hot-reloaded — so skip them here or we'd fire a bogus Lua reload on a C++ edit.
     for (const AssetLibrary::Entry& e : m_assetLibrary->EntriesFor(AssetLibrary::Category::Script))
     {
+        if (e.filename.size() < 4 ||
+            e.filename.compare(e.filename.size() - 4, 4, ".lua") != 0)
+            continue;
         const std::filesystem::path p = m_assetLibrary->AbsolutePath(e);
         const std::filesystem::file_time_type mt = std::filesystem::last_write_time(p, ec);
         if (ec)
@@ -339,8 +344,10 @@ EditorImGui::ScriptFileChanges EditorImGui::PollScriptFileChanges()
         }
     }
 
-    // (b) <ProjectRoot>/Scripts/*.cpp,*.h,*.hpp — a single "something changed" flag.
-    const std::filesystem::path scriptsDir = ProjectManager::Instance().ProjectRoot() / "Scripts";
+    // (b) native C++ sources (the asset scripts folder, *.cpp,*.h,*.hpp) — a single "something changed"
+    // flag that triggers an auto-build. Headers aren't assets, and brand-new .cpp may not be registered
+    // yet, so scan the directory directly rather than rely on the manifest.
+    const std::filesystem::path scriptsDir = ProjectScriptSourceDir();
     std::unordered_map<std::string, std::filesystem::file_time_type> seen;
     if (std::filesystem::is_directory(scriptsDir, ec))
     {
@@ -349,9 +356,9 @@ EditorImGui::ScriptFileChanges EditorImGui::PollScriptFileChanges()
         {
             if (!de.is_regular_file(ec))
                 continue;
-            // Skip the CMake build tree (its churn isn't a source edit).
+            // Skip any CMake build tree that might sit under the scripts dir (its churn isn't a source edit).
             const std::string full = de.path().generic_string();
-            if (full.find("/Scripts/build/") != std::string::npos)
+            if (full.find("/build/") != std::string::npos)
                 continue;
             std::string ext = de.path().extension().string();
             std::transform(ext.begin(), ext.end(), ext.begin(),

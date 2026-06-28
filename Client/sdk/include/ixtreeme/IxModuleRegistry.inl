@@ -1,12 +1,17 @@
-// Include this ONCE in a game-module DLL (exactly one .cpp) to provide the module's registration plumbing
-// and its exported entry point. It is compiled ONLY into the module (never into the engine), and only
-// makes sense when IXTREEME_GAME_MODULE is defined.
+// Provides the game-module DLL's registration plumbing and its exported entry point. Compiled ONLY into
+// the module (never the engine), and only meaningful when IXTREEME_GAME_MODULE is defined.
 //
-// Usage (in one .cpp of your module):
-//     #define IXTREEME_GAME_MODULE 1
+// Include it in EVERY script .cpp (right after NativeScript.h) so each file is self-contained — the
+// entry point + DLL-local list are `inline`, so the linker merges them across all your module's .cpp
+// into a single export. There is no special "first file": adding or deleting any one script is safe.
+//
+// Usage (in each .cpp of your module):
 //     #include "ixtreeme/NativeScript.h"
 //     #include "ixtreeme/IxModuleRegistry.inl"
-//     // ... your IXSCRIPT_REGISTER(MyScript) classes, here or in other .cpp of the module ...
+//     // ... your class(es) + IXSCRIPT_REGISTER(MyScript) ...
+//
+// (IXTREEME_GAME_MODULE must be on for module mode: the editor-generated CMakeLists sets it for the
+//  whole target; building standalone with your own CMakeLists, #define it atop each .cpp — see the SDK example.)
 
 #pragma once
 

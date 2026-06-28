@@ -831,6 +831,12 @@ struct MapEditorCommands
     std::string addComponentTypeId;
     bool removeComponentFromSelectedEntity = false;
     std::string removeComponentTypeId;
+    // Drag-drop attach: a script asset/class dropped onto an entity row -> add a Script component to it.
+    bool attachScriptToEntity = false;
+    std::uint32_t attachScriptEntityId = 0;  // MeshSceneEntity.id of the dropped-on row
+    ixscript::ScriptBackendType attachScriptBackend = ixscript::ScriptBackendType::None;
+    std::string attachScriptAssetId;    // Lua backend: the .lua asset id
+    std::string attachScriptClassName;  // Native backend: the registered class name
     bool fitSelectedColliderToMesh = false;
     bool lodQualityCommitRequested = false;
     std::uint32_t lodQualityCommitEntityId = 0;

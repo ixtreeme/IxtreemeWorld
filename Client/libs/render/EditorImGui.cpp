@@ -55,6 +55,7 @@ constexpr const char* kLayoutFile = "editor_layout.ini";
 constexpr const char* kAssetPayloadType = "ASSET_ID";
 constexpr const char* kAssetFolderPayloadType = "ASSET_FOLDER_PATH";
 constexpr const char* kHierarchyEntityPayloadType = "HIERARCHY_ENTITY";
+constexpr const char* kNativeClassPayloadType = "IXSCRIPT_NATIVE_CLASS";  // drag a registered C++ class
 constexpr const char* kEditorNoteComponentId = "editor.note";
 constexpr const char* kLodComponentId = "rendering.lod";
 constexpr double kProjectAutoSaveIntervalSeconds = 5.0 * 60.0;
@@ -2563,6 +2564,70 @@ void EditorImGui::CreatePbrMaterialAsset()
     m_assetOpenCreateMaterialPopup = true;
 }
 
+void EditorImGui::CreateLuaScriptAsset()
+{
+    if (!m_assetLibrary)
+        return;
+    AssetLibrary::ImportOptions options;
+    options.displayName = "Script";  // CreateLuaScript uniquifies (Script_2, ...); rename via F2 after
+    options.subpath = m_assetSubpath;
+    options.tags = {"script", "lua"};
+    AssetLibrary::Entry entry;
+    std::string error;
+    if (m_assetLibrary->CreateLuaScript(options, entry, error))
+    {
+        m_selectedAssetId = entry.id;
+        m_assetInspectorSelectionActive = true;
+        m_assetStatus = "Created Lua script: " + entry.displayName + " (drag it onto an entity to attach)";
+    }
+    else
+    {
+        m_assetStatus = "Create Lua script failed: " + error;
+    }
+}
+
+std::filesystem::path EditorImGui::ProjectScriptSourceDir() const
+{
+    // Native .cpp game scripts live alongside .lua in the asset library's scripts folder (so both are
+    // first-class, browsable, drag-attachable assets). CategoryDirectory(Script) resolves here too.
+    return ProjectManager::Instance().AssetRootPath() / "scripts";
+}
+
+void EditorImGui::CreateNativeScriptAsset()
+{
+    CreateNativeScriptFile("MyScript");  // default name; CreateNativeScript uniquifies + rename via F2
+}
+
+void EditorImGui::CreateNativeScriptFile(const std::string& className)
+{
+    if (!m_assetLibrary)
+    {
+        m_projectStatus = "Open a project to create a C++ script";
+        return;
+    }
+    // Create the .cpp as a first-class Script asset (same path as a Lua script): written into the
+    // library scripts dir, registered, browsable + drag-attachable. The class is named after the file.
+    AssetLibrary::ImportOptions options;
+    options.displayName = className.empty() ? "MyScript" : className;
+    options.subpath = m_assetSubpath;
+    options.tags = {"script", "cpp"};
+    AssetLibrary::Entry entry;
+    std::string error;
+    if (!m_assetLibrary->CreateNativeScript(options, entry, error))
+    {
+        m_assetStatus = "Create C++ script failed: " + error;
+        return;
+    }
+    m_selectedAssetId = entry.id;
+    m_assetInspectorSelectionActive = true;
+    // Stamp the new file so the save-to-live poll doesn't see it as a spurious "new .cpp" change.
+    std::error_code ec;
+    const std::filesystem::path dest = m_assetLibrary->AbsolutePath(entry);
+    if (const auto mt = std::filesystem::last_write_time(dest, ec); !ec)
+        m_cppMtimes[dest.generic_string()] = mt;
+    m_assetStatus = "Created C++ script: " + entry.filename + " (drag it onto an entity, then Build)";
+}
+
 void EditorImGui::CreateWaterMaterialAsset()
 {
     AssetLibrary::Entry entry{};
@@ -3400,8 +3465,72 @@ void EditorImGui::InitializeAssetLibrary(const std::filesystem::path&)
 {
 }
 
+// Real (non-stub) project asset-library management for the runtime: it owns m_assetLibrary, which the
+// shared asset-path resolvers (AudioClipFilePath/ScriptSourceFilePath) query. No editor UI involved.
+void EditorImGui::InitializeProjectAssetLibrary(const std::filesystem::path& projectRoot,
+                                                const std::filesystem::path& assetRoot)
+{
+    m_assetLibrary = std::make_unique<AssetLibrary>(projectRoot, assetRoot);
+    if (!m_assetLibrary->Initialize())
+        m_assetLibrary.reset();
+}
+
 void EditorImGui::RefreshAssetLibrary()
 {
+    if (!m_assetLibrary)
+        return;
+    std::string error;
+    m_assetLibrary->Refresh(error);
+}
+
+// Real (non-stub) native game-module loader for the runtime: scans <ProjectRoot>/Binaries for module
+// DLLs and registers their native script classes (so a shipped game's C++ scripts run). Imgui-free; the
+// runtime loads once at boot (no project-switch reload, so no UnloadGameModules dance).
+void EditorImGui::LoadProjectGameModules(const std::filesystem::path& projectRoot)
+{
+    const std::filesystem::path modulesDir = projectRoot / "Binaries";
+    std::error_code ec;
+    if (!std::filesystem::is_directory(modulesDir, ec))
+        return;
+#if defined(_WIN32)
+    const std::string moduleExt = ".dll";
+#else
+    const std::string moduleExt = ".so";
+#endif
+    for (const std::filesystem::directory_entry& entry : std::filesystem::directory_iterator(modulesDir, ec))
+    {
+        if (!entry.is_regular_file(ec))
+            continue;
+        std::string ext = entry.path().extension().string();
+        std::transform(ext.begin(), ext.end(), ext.begin(),
+            [](unsigned char c) { return static_cast<char>(std::tolower(c)); });
+        if (ext != moduleExt)
+            continue;
+        std::string loadError;
+        platform::DynamicLibraryHandle handle = platform::OpenLibrary(entry.path(), &loadError);
+        if (!handle)
+        {
+            TraceError("[SCRIPT] game module failed to load: %s (%s)",
+                entry.path().filename().string().c_str(), loadError.c_str());
+            continue;
+        }
+        auto entryFn = reinterpret_cast<ixscript::IxModuleEntryFn>(
+            platform::GetLibrarySymbol(handle, IXTREEME_MODULE_ENTRY_SYMBOL));
+        if (!entryFn)
+        {
+            platform::CloseLibrary(handle);
+            continue;
+        }
+        const ixscript::ModuleLoadResult result = ixscript::InvokeGameModule(entryFn);
+        if (!result.versionOk)
+        {
+            platform::CloseLibrary(handle);
+            continue;
+        }
+        m_loadedGameModules.push_back(handle);
+        Tracenf("[SCRIPT] loaded game module %s: %d native class(es) registered",
+            entry.path().filename().string().c_str(), result.registeredCount);
+    }
 }
 
 bool EditorImGui::OpenWaterMaterialEditor(const std::string&)
@@ -3422,6 +3551,39 @@ std::optional<AssetLibrary::PhysicsMaterialData> EditorImGui::FindPhysicsMateria
 MapEditorCommands EditorImGui::ConsumeCommands()
 {
     return {};
+}
+
+bool EditorImGui::IsTextInputActive() const
+{
+    return false;
+}
+
+std::optional<LodConfig> EditorImGui::FindModelLodDefault(const std::string&) const
+{
+    return std::nullopt;
+}
+
+// Asset-path resolvers are NOT editor UI — they're plain asset-library lookups (imgui-free), so they
+// get REAL implementations in the runtime build too. They resolve once the runtime initializes the
+// project asset library (InitializeProjectAssetLibrary), letting the shared sim load audio + Lua.
+std::string EditorImGui::AudioClipFilePath(const std::string& clipId) const
+{
+    if (!m_assetLibrary || clipId.empty())
+        return {};
+    const auto entry = m_assetLibrary->FindById(clipId);
+    if (!entry || entry->category != AssetLibrary::Category::Audio)
+        return {};
+    return m_assetLibrary->AbsolutePath(*entry).generic_string();
+}
+
+std::string EditorImGui::ScriptSourceFilePath(const std::string& scriptId) const
+{
+    if (!m_assetLibrary || scriptId.empty())
+        return {};
+    const auto entry = m_assetLibrary->FindById(scriptId);
+    if (!entry || entry->category != AssetLibrary::Category::Script)
+        return {};
+    return m_assetLibrary->AbsolutePath(*entry).generic_string();
 }
 
 void EditorImGui::Destroy()

@@ -666,6 +666,10 @@ void EditorImGui::RenderAssetBrowserContent()
             CopyToBuffer(m_newAssetFolderName, sizeof(m_newAssetFolderName), UniqueFolderName(AssetBrowserPath(m_assetSubpath)));
             m_assetOpenNewFolderPopup = true;
         }
+        if (ImGui::MenuItem("New Lua Script"))
+            CreateLuaScriptAsset();
+        if (ImGui::MenuItem("New C++ Script"))
+            CreateNativeScriptAsset();
         if (ImGui::MenuItem("New Material"))
             CreatePbrMaterialAsset();
         if (ImGui::MenuItem("New Water Material"))
@@ -1165,13 +1169,37 @@ void EditorImGui::RenderScriptsPanel()
 
     // --- Native C++ source (<ProjectRoot>/Scripts/*.cpp,*.h) ---
     ImGui::SeparatorText("C++ source (Scripts/)");
+    if (hasProject && ImGui::Button(ICON_FA_PLUS " New C++ Script"))
+    {
+        CopyToBuffer(m_newCppScriptName, sizeof(m_newCppScriptName), std::string("MyScript"));
+        m_openNewCppScriptPopup = true;
+    }
+    if (m_openNewCppScriptPopup)
+    {
+        ImGui::OpenPopup("NewCppScript");
+        m_openNewCppScriptPopup = false;
+    }
+    if (ImGui::BeginPopupModal("NewCppScript", nullptr, ImGuiWindowFlags_AlwaysAutoResize))
+    {
+        ImGui::TextUnformatted("Class name (the file is named after it):");
+        ImGui::InputText("##cppname", m_newCppScriptName, sizeof(m_newCppScriptName));
+        if (ImGui::Button("Create") && m_newCppScriptName[0] != '\0')
+        {
+            CreateNativeScriptFile(m_newCppScriptName);
+            ImGui::CloseCurrentPopup();
+        }
+        ImGui::SameLine();
+        if (ImGui::Button("Cancel"))
+            ImGui::CloseCurrentPopup();
+        ImGui::EndPopup();
+    }
     if (!hasProject)
     {
         ImGui::TextDisabled("No project open.");
     }
     else
     {
-        const std::filesystem::path scriptsDir = ProjectManager::Instance().ProjectRoot() / "Scripts";
+        const std::filesystem::path scriptsDir = ProjectScriptSourceDir();
         std::error_code ec;
         bool anySource = false;
         if (std::filesystem::is_directory(scriptsDir, ec))
@@ -1181,6 +1209,8 @@ void EditorImGui::RenderScriptsPanel()
                      scriptsDir, std::filesystem::directory_options::skip_permission_denied, ec))
             {
                 if (!e.is_regular_file(ec))
+                    continue;
+                if (e.path().generic_string().find("/build/") != std::string::npos)
                     continue;
                 std::string ext = e.path().extension().string();
                 std::transform(ext.begin(), ext.end(), ext.begin(),
@@ -1200,11 +1230,13 @@ void EditorImGui::RenderScriptsPanel()
             }
         }
         if (!anySource)
-            ImGui::TextDisabled("No C++ scripts yet — click Build to scaffold Scripts/Game.cpp.");
+            ImGui::TextDisabled("No C++ scripts yet — use \"New C++ Script\" or click Build to scaffold Game.cpp.");
     }
 
     // --- Lua script assets ---
     ImGui::SeparatorText("Lua scripts (.lua assets)");
+    if (m_assetLibrary && ImGui::Button(ICON_FA_PLUS " New Lua Script"))
+        CreateLuaScriptAsset();
     if (m_assetLibrary)
     {
         const std::vector<AssetLibrary::Entry> luaScripts =
@@ -1220,12 +1252,41 @@ void EditorImGui::RenderScriptsPanel()
             {
                 openExternal(m_assetLibrary->AbsolutePath(e));
             }
+            // Drag a .lua onto an entity row in the hierarchy to attach it (Unity-style).
+            if (ImGui::BeginDragDropSource())
+            {
+                ImGui::SetDragDropPayload(kAssetPayloadType, e.id.data(), e.id.size());
+                ImGui::Text("%s", e.displayName.c_str());
+                ImGui::TextDisabled("Lua script");
+                ImGui::EndDragDropSource();
+            }
+            ImGui::PopID();
+        }
+    }
+
+    // --- Registered native C++ classes (drag onto an entity to attach a Native Script component) ---
+    ImGui::SeparatorText("Registered C++ classes");
+    {
+        const std::vector<std::string> classes = ixscript::NativeBackend::RegisteredNames();
+        if (classes.empty())
+            ImGui::TextDisabled("No native classes — Build your C++ scripts first.");
+        for (const std::string& cls : classes)
+        {
+            ImGui::PushID(cls.c_str());
+            ImGui::Selectable((ICON_FA_FILE " " + cls).c_str());
+            if (ImGui::BeginDragDropSource())
+            {
+                ImGui::SetDragDropPayload(kNativeClassPayloadType, cls.data(), cls.size());
+                ImGui::Text("%s", cls.c_str());
+                ImGui::TextDisabled("C++ class");
+                ImGui::EndDragDropSource();
+            }
             ImGui::PopID();
         }
     }
 
     ImGui::Spacing();
-    ImGui::TextDisabled("Double-click a script to open it in your editor.");
+    ImGui::TextDisabled("Drag a script onto an entity in the Hierarchy to attach it; double-click to open.");
     ImGui::End();
 }
 

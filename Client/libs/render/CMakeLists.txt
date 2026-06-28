@@ -39,9 +39,7 @@ add_library(IXEngineRender STATIC
     StaticMeshRenderer.h
     SkinnedMeshRenderer.cpp
     SkinnedMeshRenderer.h
-    tools/tree/TreeGeneratorPanel.cpp
     tools/tree/TreeGeneratorPanel.h
-    tools/tree/TreePreviewRenderer.cpp
     tools/tree/TreePreviewRenderer.h
     tools/tree/TreeTexturePalette.cpp
     tools/tree/TreeTexturePalette.h
@@ -49,8 +47,16 @@ add_library(IXEngineRender STATIC
     WorldComponents.h
 )
 
+# Editor-only translation units. These pull in ImGui/ImGuizmo (only fetched when the editor is on),
+# so they must NOT be compiled into a runtime (IXTREEME_WITH_EDITOR=OFF) build. EditorImGui.cpp stays
+# in the unconditional list because it self-guards (full body under the editor flag, link stubs in the
+# #else branch) so the always-compiled engine can reference EditorImGui symbols in both builds.
 if(IXTREEME_WITH_EDITOR)
-    target_sources(IXEngineRender PRIVATE UIHelpers.cpp)
+    target_sources(IXEngineRender PRIVATE
+        UIHelpers.cpp
+        tools/tree/TreeGeneratorPanel.cpp
+        tools/tree/TreePreviewRenderer.cpp
+    )
 endif()
 
 target_include_directories(IXEngineRender

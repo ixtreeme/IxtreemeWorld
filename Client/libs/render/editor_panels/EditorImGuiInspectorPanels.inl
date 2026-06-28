@@ -1010,7 +1010,8 @@ bool EditorImGui::RenderSelectedMeshPhysicsComponents()
                 std::string preview = sc.scriptAssetId.empty() ? "(no script)" : sc.scriptAssetId;
                 for (const AssetLibrary::Entry& e : scripts)
                     if (e.id == sc.scriptAssetId) { preview = e.displayName; break; }
-                if (ImGui::BeginCombo("Script", preview.c_str()))
+                // Label must differ from the "Script" CollapsingHeader above (same PushID scope → ID clash).
+                if (ImGui::BeginCombo("Lua Script", preview.c_str()))
                 {
                     if (ImGui::Selectable("(no script)", sc.scriptAssetId.empty())) { sc.scriptAssetId.clear(); changed = true; }
                     for (const AssetLibrary::Entry& e : scripts)

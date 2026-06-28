@@ -185,6 +185,13 @@ public:
     // Creates a .controller asset seeded with a default Idle/Walk/Run locomotion graph
     // (Speed/IsGrounded/Jump params; clip ids empty — assigned later in the Inspector/graph editor).
     bool CreateAnimatorController(const ImportOptions& options, Entry& outEntry, std::string& error);
+    // Creates a new .lua Script asset seeded with an OnStart/OnUpdate/OnDestroy template.
+    bool CreateLuaScript(const ImportOptions& options, Entry& outEntry, std::string& error);
+    // Creates a native C++ game script (.cpp) as a first-class Script asset, the same way as a Lua
+    // script: written into the library scripts dir, registered, browsable + drag-attachable. The
+    // class is named after the (sanitized) display name (one class per file, Unity-style); the
+    // Build pipeline compiles it into the project's game-module DLL.
+    bool CreateNativeScript(const ImportOptions& options, Entry& outEntry, std::string& error);
     bool Remove(const std::string& id, std::string& error);
     bool UpdateAssetMetadata(const std::string& id,
                              const std::string& displayName,

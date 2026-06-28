@@ -1755,6 +1755,14 @@ void MergeMapEditorCommands(MapEditorCommands& target, const MapEditorCommands& 
         target.removeComponentFromSelectedEntity = true;
         target.removeComponentTypeId = source.removeComponentTypeId;
     }
+    if (source.attachScriptToEntity)
+    {
+        target.attachScriptToEntity = true;
+        target.attachScriptEntityId = source.attachScriptEntityId;
+        target.attachScriptBackend = source.attachScriptBackend;
+        target.attachScriptAssetId = source.attachScriptAssetId;
+        target.attachScriptClassName = source.attachScriptClassName;
+    }
     if (source.lodQualityCommitRequested)
     {
         target.lodQualityCommitRequested = true;
@@ -2675,8 +2683,11 @@ int RunGame(NativeWindow& window,
 
     MovementInputState movement;
     FlyCameraController cameraController;
-#if defined(IXTREEME_WITH_EDITOR)
+    // The Play state machine drives the simulation in BOTH builds: the editor toggles it Edit<->Play,
+    // the standalone runtime forces it to Play at boot. So the struct is declared unconditionally; only
+    // the editor's "open the map editor at boot" side-effects stay editor-gated.
     EditorPlayRuntime editorPlay;
+#if defined(IXTREEME_WITH_EDITOR)
     runtimeSession->SetMapEditorOpen(true);
     if (terrainOk)
         terrain.SetMapEditorOpen(true);
@@ -2766,9 +2777,7 @@ int RunGame(NativeWindow& window,
     bool previousMeshSubmitDetailInitialized = false;
     std::vector<WaterBody> editorWaterBodies = terrainOk ? terrain.GetWaterBodies() : std::vector<WaterBody>{};
     bool editorWaterBodiesDirty = false;
-#if defined(IXTREEME_WITH_EDITOR)
     std::uint32_t nextEditorLightId = 1;
-#endif
     std::uint32_t nextEditorWaterBodyId = 1;
     for (const WaterBody& body : editorWaterBodies)
         nextEditorWaterBodyId = std::max(nextEditorWaterBodyId, body.id + 1u);
@@ -2815,7 +2824,8 @@ int RunGame(NativeWindow& window,
     bool editorObjectDragActive = false;
     int editorObjectDragLastX = 0;
     int editorObjectDragLastY = 0;
-#if defined(IXTREEME_WITH_EDITOR)
+    // Shared sim helpers (the mesh-entity set + its id->index lookup are unguarded state, and these are
+    // used by the standalone runtime's per-frame sim, e.g. the deferred spawn/destroy drain).
     auto rebuildMeshEntityLookup = [&]() {
         editorMeshEntityLookup.clear();
         for (std::size_t i = 0; i < editorMeshEntities.size(); ++i)
@@ -2828,6 +2838,8 @@ int RunGame(NativeWindow& window,
         MeshSceneEntity& mesh = editorMeshEntities[lookupIt->second];
         return mesh.id == id ? &mesh : nullptr;
     };
+    // Shared sim/render/physics helpers (mesh spatial sync, script-spawn, physics world build/step) —
+    // the standalone runtime's per-frame sim calls these; everything they touch is unguarded state.
     auto syncStaticMeshSpatialEntity = [&](const MeshSceneEntity& mesh) {
         const std::string runtimePath = resolveMeshRuntimePath(mesh);
         StaticMeshRenderer* renderer = getStaticMeshRenderer(runtimePath);
@@ -3515,6 +3527,9 @@ int RunGame(NativeWindow& window,
                 triggerEnded);
         }
     };
+    // Shared: the static-mesh spatial-index rebuild + the EditorSceneRuntime (scene materializer) are
+    // used by the standalone runtime too (to populate + render a loaded scene). The editor-only
+    // hierarchy/UI lambdas after sceneRuntime stay gated.
     auto logStaticMeshSpatialBuild = [&]() {
         const SpatialIndex::Aabb& b = staticMeshSpatialIndex.WorldBounds();
         Tracenf("[SPATIAL] built nodes=%u maxDepth=%u objects=%u worldBounds=(%.1f,%.1f,%.1f)-(%.1f,%.1f,%.1f)",
@@ -3582,6 +3597,7 @@ int RunGame(NativeWindow& window,
             snap.pitch = state.pitch;
             cameraController.RestoreSnapshot(snap);
         }});
+#if defined(IXTREEME_WITH_EDITOR)
     auto buildHierarchyEntities = [&]() {
         std::vector<HierarchySceneEntity> entities;
         std::vector<std::uint64_t> liveKeys;
@@ -3831,7 +3847,8 @@ int RunGame(NativeWindow& window,
     std::uint32_t waterSculptStrokeBodyId = 0;
     std::uint32_t waterSculptStrokeModifiedCells = 0;
     bool waterSculptMeshRegenPending = false;
-#if defined(IXTREEME_WITH_EDITOR)
+    // Input + look state. Shared: the standalone runtime feeds the same script-input struct + mouse-held
+    // bools to gameplay scripts (the editor additionally uses these for its viewport-camera gating).
     bool editorShiftDown = false;
     bool editorLeftMouseHeld = false;
     bool editorRightMouseHeld = false;
@@ -3840,7 +3857,6 @@ int RunGame(NativeWindow& window,
     int editorLastMouseX = 0;
     int editorLastMouseY = 0;
     MovementInputState editorFlyMovement;
-#endif
 
     window.SetInputCallback([&runtimeSession,
                              &runtimeUi,
@@ -3870,7 +3886,6 @@ int RunGame(NativeWindow& window,
                              &waterSculptStrokeBodyId,
                              &waterSculptStrokeModifiedCells,
                              &waterSculptMeshRegenPending,
-#if defined(IXTREEME_WITH_EDITOR)
                              &editorPlay,
                              &editorShiftDown,
                              &editorLeftMouseHeld,
@@ -3883,6 +3898,7 @@ int RunGame(NativeWindow& window,
                              &editorPlayerLookDy,
                              &editorFlyMovement,
                              &rebuildMeshEntityLookup,
+#if defined(IXTREEME_WITH_EDITOR)
                              &syncStaticMeshSpatialEntity,
                              &removeStaticMeshSpatialEntity,
                              &resolveMeshRuntimePath,
@@ -4672,7 +4688,8 @@ int RunGame(NativeWindow& window,
     double previousSeconds = 0.0;
     bool debugDisableShadowPass = false;
     bool debugDisableWaterReflectionPass = false;
-#if defined(IXTREEME_WITH_EDITOR)
+    // Frame stats + debug toggles: cheap POD, shared so the runtime's render/stats path compiles. The
+    // editor-only perf-overlay accumulators ride along harmlessly (they just go unused in the runtime).
     EngineStats engineStats{};
     double statsAccumSeconds = 0.0;
     double statsFrameMsAccum = 0.0;
@@ -4691,6 +4708,90 @@ int RunGame(NativeWindow& window,
     bool debugShowPhysicsBodyCenters = false;
     bool dumpFrameProfileRequested = false;
     Tracen("[VISIBILITY-RESPECT] shadow_pass=yes water_reflection_pass=yes main_pass=yes");
+#if !defined(IXTREEME_WITH_EDITOR)
+    // ---- Standalone runtime boot ----------------------------------------------------------------
+    // No editor: find the packaged game (project.ixproj sits next to the runtime exe, placed there by
+    // the "Build Game" packager — or run the exe from the project folder), open it, load its startup
+    // scene, and force Play. The shared materialize (ConsumePendingScene -> ApplySceneData), Play-enter
+    // (physics/audio/scripts), per-frame sim, and scene render then run with no editor UI.
+    {
+        std::error_code bootEc;
+        std::vector<std::filesystem::path> candidates;
+        auto addProjectCandidate = [&](const std::filesystem::path& p) {
+            // Accept either a manifest file (...project.ixproj) or a project ROOT directory.
+            if (p.empty())
+                return;
+            candidates.push_back(p.extension() == ".ixproj" ? p : (p / "project.ixproj"));
+        };
+        if (auto root = assets.RootPath())
+        {
+            const std::filesystem::path engineRoot(*root);
+            // (1) A boot config the "Build Game" packager writes next to the exe: game.txt, with the
+            // project root (or its .ixproj) on the first line. This is the robust path — works on
+            // double-click regardless of the working directory.
+            std::ifstream cfg(engineRoot / "game.txt");
+            if (cfg)
+            {
+                std::string line;
+                std::getline(cfg, line);
+                while (!line.empty() && (line.back() == '\r' || line.back() == '\n' || line.back() == ' '))
+                    line.pop_back();
+                addProjectCandidate(std::filesystem::path(line));
+            }
+            // (2) Packaged layout: the project sits next to the exe (or an ancestor dir of it).
+            for (std::filesystem::path d = engineRoot; ; d = d.parent_path())
+            {
+                addProjectCandidate(d);
+                if (!d.has_parent_path() || d == d.parent_path())
+                    break;
+            }
+        }
+        // (3) Run the exe FROM the project folder (cwd has project.ixproj).
+        if (const std::filesystem::path cwd = std::filesystem::current_path(bootEc); !bootEc)
+            addProjectCandidate(cwd);
+        std::filesystem::path projectManifest;
+        for (const std::filesystem::path& candidate : candidates)
+            if (std::filesystem::exists(candidate, bootEc)) { projectManifest = candidate; break; }
+
+        if (projectManifest.empty())
+        {
+            ShowFatal("No game found: expected project.ixproj next to the runtime (or run from the project folder).");
+        }
+        else
+        {
+            std::string openError;
+            if (!ProjectManager::Instance().OpenProject(projectManifest, openError))
+            {
+                Tracenf("[RUNTIME-BOOT] OpenProject failed: %s", openError.c_str());
+            }
+            else
+            {
+                ProjectManager& projects = ProjectManager::Instance();
+                Tracenf("[RUNTIME-BOOT] project '%s' at %s",
+                    projects.CurrentProject().name.c_str(), projects.ProjectRoot().generic_string().c_str());
+                syncTerrainAssetRoots();
+                // The scene-mesh + terrain render path is driven by the "map editor open" signal (the
+                // editor sets it at boot); the runtime needs it on too so the loaded scene is drawn. The
+                // game camera is owned by the Play-enter (character controller / game camera), not free-fly.
+                runtimeSession->SetMapEditorOpen(true);
+                if (terrainOk)
+                    terrain.SetMapEditorOpen(true);
+                editorImGui.InitializeProjectAssetLibrary(projects.ProjectRoot(), projects.AssetRootPath());
+                editorImGui.RefreshAssetLibrary();
+                editorImGui.LoadProjectGameModules(projects.ProjectRoot());  // native C++ game-module DLLs
+                const std::string startupScene = projects.CurrentProject().startupScene;
+                if (!startupScene.empty() && SceneManager::Instance().LoadScene(startupScene))
+                {
+                    Tracenf("[RUNTIME-BOOT] scene '%s' loaded — entering Play", startupScene.c_str());
+                    editorPlay.state.mode = EditorPlayMode::Play;  // shared Play-enter fires on frame 1
+                }
+                else
+                {
+                    Tracenf("[RUNTIME-BOOT] startup scene missing/failed to load: '%s'", startupScene.c_str());
+                }
+            }
+        }
+    }
 #endif
     bool running = true;
     while (running)
@@ -4935,7 +5036,9 @@ int RunGame(NativeWindow& window,
 #else
         cameraController.Update(deltaSeconds, movement);
 #endif
-#if defined(IXTREEME_WITH_EDITOR)
+        // Per-frame game simulation — runs in BOTH the editor (Play mode) and the standalone runtime
+        // (which forces mode=Play at boot). The state it touches is all shared/unguarded; only the
+        // editor's Edit-mode tooling around it stays gated.
         if (editorPlay.state.mode == EditorPlayMode::Play)
         {
             editorPlay.state.elapsedSeconds += deltaSeconds;
@@ -5128,7 +5231,6 @@ int RunGame(NativeWindow& window,
                 }
             }
         }
-#endif
         {
             const auto ecsUpdateBegin = std::chrono::steady_clock::now();
             runtimeSession->UpdateNetwork();
@@ -5207,6 +5309,16 @@ int RunGame(NativeWindow& window,
             }
             runtimeUi->UpdateHud(hudData);
 
+#if !defined(IXTREEME_WITH_EDITOR)
+            // Standalone runtime: materialize a freshly-loaded scene into the live entity set (the editor
+            // does this inside its own block below). Without this, editorMeshEntities stays empty -> the
+            // scene never renders. ApplySceneData also applies the scene's saved camera.
+            {
+                SceneData runtimePendingScene;
+                if (SceneManager::Instance().ConsumePendingScene(runtimePendingScene))
+                    sceneRuntime.ApplySceneData(runtimePendingScene);
+            }
+#endif
 #if defined(IXTREEME_WITH_EDITOR)
             if (terrainOk)
             {
@@ -6671,6 +6783,11 @@ int RunGame(NativeWindow& window,
                     commands.addComponentToSelectedEntity = false;
                     commands.addComponentType = EditorComponentType::None;
                     commands.addComponentTypeId.clear();
+                    commands.attachScriptToEntity = false;
+                    commands.attachScriptEntityId = 0;
+                    commands.attachScriptBackend = ixscript::ScriptBackendType::None;
+                    commands.attachScriptAssetId.clear();
+                    commands.attachScriptClassName.clear();
                     commands.removeComponentFromSelectedEntity = false;
                     commands.removeComponentTypeId.clear();
                     commands.physicsRaycastFromCamera = false;
@@ -8487,6 +8604,29 @@ int RunGame(NativeWindow& window,
                         componentType == "editor.note" ? "Note" : (componentType == "rendering.lod" ? "LOD Group" : componentType.c_str()));
                     return true;
                 };
+                // Drag-drop attach: a script dropped onto an entity row -> set its Script component. Unlike
+                // the inspector add (which only flips hasScript), this carries the backend + binding, and
+                // targets the dropped entity by id (not the selection).
+                if (commands.attachScriptToEntity)
+                {
+                    auto it = std::find_if(editorMeshEntities.begin(), editorMeshEntities.end(),
+                        [&](const MeshSceneEntity& m) { return m.id == commands.attachScriptEntityId; });
+                    if (it != editorMeshEntities.end())
+                    {
+                        const bool replaced = it->hasScript;
+                        it->hasScript = true;
+                        it->script = {};
+                        it->script.backend = commands.attachScriptBackend;
+                        if (commands.attachScriptBackend == ixscript::ScriptBackendType::Lua)
+                            it->script.scriptAssetId = commands.attachScriptAssetId;
+                        else
+                            it->script.nativeClassName = commands.attachScriptClassName;
+                        SceneManager::Instance().MarkDirty();
+                        runtimeSession->SetEditorStatus(replaced ? "Replaced Script component" : "Attached Script component");
+                        Tracenf("[SCRIPT] attach via drop: entity=%u backend=%s", it->id,
+                            ixscript::BackendName(it->script.backend));
+                    }
+                }
                 if (commands.addComponentToSelectedEntity)
                 {
                     if (commands.addComponentTypeId == "editor.note")

@@ -2687,6 +2687,62 @@ bool AssetLibrary::ReconcileFilesystem(std::string& error)
         }
     }
 
+    // Discover orphan script sources in the scripts dir not yet in the manifest, and register them as
+    // browser entries. This makes both languages first-class, drag-attachable assets — and upgrades
+    // existing projects (a native .cpp moved/seeded into the scripts dir shows up without a manual
+    // import). Lua (.lua) hot-reloads; C++ (.cpp) is compiled by the Build pipeline.
+    const auto scriptDir = CategoryDirectory(Category::Script);
+    if (std::filesystem::exists(scriptDir, ec))
+    {
+        std::unordered_set<std::string> knownScriptPaths;
+        std::unordered_set<std::string> existingIds;
+        for (const Entry& existing : reconciled)
+        {
+            existingIds.insert(existing.id);
+            if (existing.category == Category::Script)
+                knownScriptPaths.insert(CanonicalPathString(AbsolutePath(existing)));
+        }
+        for (std::filesystem::recursive_directory_iterator scriptIt(scriptDir, ec), scriptEnd;
+             scriptIt != scriptEnd && !ec; scriptIt.increment(ec))
+        {
+            if (!scriptIt->is_regular_file(ec) || !HasAnyExtension(scriptIt->path(), {".lua", ".cpp"}))
+                continue;
+            // Never index a CMake build tree that might sit under the scripts dir (its probe .cpp
+            // files are not game scripts).
+            if (scriptIt->path().generic_string().find("/build/") != std::string::npos)
+                continue;
+            const std::string canonical = CanonicalPathString(scriptIt->path());
+            if (knownScriptPaths.find(canonical) != knownScriptPaths.end())
+                continue;
+
+            const bool isCpp = HasAnyExtension(scriptIt->path(), {".cpp"});
+            Entry entry;
+            entry.category = Category::Script;
+            entry.filename = scriptIt->path().filename().generic_string();
+            std::error_code relEc;
+            std::filesystem::path parentRel = std::filesystem::relative(scriptIt->path().parent_path(), scriptDir, relEc);
+            entry.subpath = relEc ? "" : NormalizeSubpath(parentRel.generic_string());
+            entry.displayName = scriptIt->path().stem().string();
+            entry.originalPath = GenericPath(scriptIt->path());
+            entry.importedAt = TimestampUtc();
+            entry.tags = isCpp ? std::vector<std::string>{"script", "cpp"}
+                               : std::vector<std::string>{"script", "lua"};
+            // MakeUniqueId only dedupes against m_entries (still the pre-reconcile list here), so two
+            // same-stem sources discovered in ONE pass (e.g. a/Foo.cpp + b/Foo.cpp) would otherwise
+            // collide. Disambiguate against the ids already chosen in this pass.
+            std::string scriptId = MakeUniqueId(Category::Script, scriptIt->path());
+            for (uint32_t bump = 2; existingIds.find(scriptId) != existingIds.end(); ++bump)
+                scriptId = MakeUniqueId(Category::Script, scriptIt->path()) + "_" + std::to_string(bump);
+            entry.id = scriptId;
+
+            existingIds.insert(entry.id);
+            knownScriptPaths.insert(canonical);
+            reconciled.push_back(std::move(entry));
+            changed = true;
+            Tracenf("[SCRIPT-ASSET] discovered path=%s", scriptIt->path().generic_string().c_str());
+        }
+    }
+
     if (changed)
     {
         m_entries = std::move(reconciled);
@@ -2949,9 +3005,11 @@ bool AssetLibrary::ValidateFile(Category category, const std::filesystem::path& 
         }
         break;
     case Category::Script:
-        if (!HasAnyExtension(path, {".lua"}))
+        // Scripts are either Lua (.lua, hot-reloaded) or native C++ game-module sources (.cpp,
+        // compiled by the Build pipeline). Both are first-class, browsable, drag-attachable assets.
+        if (!HasAnyExtension(path, {".lua", ".cpp"}))
         {
-            error = "scripts must be LUA";
+            error = "scripts must be LUA or C++ (.cpp)";
             return false;
         }
         break;
@@ -3033,7 +3091,7 @@ std::optional<AssetLibrary::Category> DetectDirectImportCategory(const std::file
         return AssetLibrary::Category::Animation;
     if (ext == ".wav" || ext == ".ogg" || ext == ".mp3" || ext == ".flac")
         return AssetLibrary::Category::Audio;
-    if (ext == ".lua")
+    if (ext == ".lua" || ext == ".cpp")
         return AssetLibrary::Category::Script;
     if (ext == ".material")
         return AssetLibrary::Category::Material;
@@ -3331,6 +3389,130 @@ bool AssetLibrary::CreateMaterial(const ImportOptions& options,
         entry.id.c_str(),
         entry.material.diffuseTextureId.c_str(),
         entry.material.normalTextureId.c_str());
+    outEntry = entry;
+    return true;
+}
+
+bool AssetLibrary::CreateLuaScript(const ImportOptions& options, Entry& outEntry, std::string& error)
+{
+    const std::string displayName = options.displayName.empty() ? "Script" : options.displayName;
+    const std::string subpath = NormalizeSubpath(options.subpath);
+    Entry entry;
+    entry.id = MakeUniqueId(Category::Script, displayName);
+    entry.category = Category::Script;
+    entry.displayName = displayName;
+    entry.subpath = subpath;
+    entry.filename = SanitizeStem(displayName) + ".lua";
+    entry.originalPath.clear();
+    entry.importedAt = TimestampUtc();
+    entry.tags = NormalizeTags(options.tags);
+
+    std::filesystem::path destination = AbsolutePath(entry);
+    for (uint32_t i = 2; std::filesystem::exists(destination); ++i)
+    {
+        entry.filename = SanitizeStem(displayName) + "_" + std::to_string(i) + ".lua";
+        destination = AbsolutePath(entry);
+    }
+
+    const std::string body =
+        "-- " + displayName + " : a Lua script. Attach by dragging it onto an entity (or pick it in the\n"
+        "-- Script component). Edit + save -> it hot-reloads live in Play. Parameters are in self.params.\n\n"
+        "function OnStart(self)\n"
+        "    self.speed = tonumber(self.params.speed) or 90.0\n"
+        "end\n\n"
+        "function OnUpdate(self, dt)\n"
+        "    local rx, ry, rz = GetRotation(self.id)   -- Euler degrees\n"
+        "    SetRotation(self.id, rx, (ry + self.speed * dt) % 360.0, rz)\n"
+        "end\n\n"
+        "function OnDestroy(self)\n"
+        "end\n";
+    if (!AtomicWriteText(destination, body, error))
+        return false;
+
+    m_entries.push_back(entry);
+    if (!SaveManifest(error))
+    {
+        std::error_code ec;
+        std::filesystem::remove(destination, ec);
+        m_entries.pop_back();
+        return false;
+    }
+    Tracenf("[ASSET-LIBRARY] lua script created id=%s file=%s", entry.id.c_str(), entry.filename.c_str());
+    outEntry = entry;
+    return true;
+}
+
+bool AssetLibrary::CreateNativeScript(const ImportOptions& options, Entry& outEntry, std::string& error)
+{
+    const std::string displayName = options.displayName.empty() ? "MyScript" : options.displayName;
+    // The file is named after the class, and the class is registered by that name — so it MUST be a
+    // valid C++ identifier (one class per file, named after the file, Unity-style). Sanitize.
+    std::string className = SanitizeStem(displayName);
+    for (char& c : className)
+    {
+        const unsigned char uc = static_cast<unsigned char>(c);
+        if (!std::isalnum(uc) && c != '_')
+            c = '_';
+    }
+    if (className.empty() || std::isdigit(static_cast<unsigned char>(className[0])))
+        className = "MyScript";
+
+    Entry entry;
+    entry.id = MakeUniqueId(Category::Script, className);
+    entry.category = Category::Script;
+    entry.displayName = className;
+    entry.subpath = NormalizeSubpath(options.subpath);
+    entry.filename = className + ".cpp";
+    entry.originalPath.clear();
+    entry.importedAt = TimestampUtc();
+    entry.tags = NormalizeTags(options.tags.empty() ? std::vector<std::string>{"script", "cpp"} : options.tags);
+
+    std::filesystem::path destination = AbsolutePath(entry);
+    std::string uniqueClass = className;
+    for (uint32_t i = 2; std::filesystem::exists(destination); ++i)
+    {
+        uniqueClass = className + "_" + std::to_string(i);
+        entry.displayName = uniqueClass;
+        entry.filename = uniqueClass + ".cpp";
+        destination = AbsolutePath(entry);
+    }
+
+    // Every C++ script is self-contained (like a .lua): it includes the module registry .inl, whose
+    // entry point + DLL-local list are `inline` so the linker merges them across all the module's .cpp
+    // into one export. This means scripts have no special "first file" ordering AND deleting any one
+    // never orphans the module's exported entry point.
+    const std::string body =
+        "#include \"ixtreeme/NativeScript.h\"\n"
+        "#include \"ixtreeme/IxModuleRegistry.inl\"\n\n"
+        "// " + uniqueClass + " : a native C++ game script. Drag it from the asset browser onto an entity\n"
+        "// to attach it (Build to compile), or pick it in the Script component. Edit + save -> the editor\n"
+        "// auto-builds. `speed` is inspector-editable + serialized via IX_REFLECT. Add fields/methods below.\n"
+        "class " + uniqueClass + " : public ixscript::NativeScript\n"
+        "{\n"
+        "public:\n"
+        "    float speed = 90.0f;  // deg/sec\n\n"
+        "    void OnUpdate(float dt) override\n"
+        "    {\n"
+        "        float r[3];\n"
+        "        GetRotation(r);  // Euler degrees\n"
+        "        r[1] += speed * dt;\n"
+        "        SetRotation(r);\n"
+        "    }\n\n"
+        "    IX_REFLECT(" + uniqueClass + ", speed)\n"
+        "};\n"
+        "IXSCRIPT_REGISTER(" + uniqueClass + ")\n";
+    if (!AtomicWriteText(destination, body, error))
+        return false;
+
+    m_entries.push_back(entry);
+    if (!SaveManifest(error))
+    {
+        std::error_code ec;
+        std::filesystem::remove(destination, ec);
+        m_entries.pop_back();
+        return false;
+    }
+    Tracenf("[ASSET-LIBRARY] native script created id=%s file=%s", entry.id.c_str(), entry.filename.c_str());
     outEntry = entry;
     return true;
 }

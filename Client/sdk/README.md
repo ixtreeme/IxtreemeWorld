@@ -23,9 +23,9 @@ guards against a stale SDK, but it cannot detect a toolchain mismatch — that i
 ## Write a script
 
 ```cpp
-#define IXTREEME_GAME_MODULE 1
+#define IXTREEME_GAME_MODULE 1             // module mode (the example CMakeLists doesn't set this for you)
 #include "ixtreeme/NativeScript.h"
-#include "ixtreeme/IxModuleRegistry.inl"   // include in exactly ONE .cpp of the module
+#include "ixtreeme/IxModuleRegistry.inl"   // include in EVERY script .cpp (inline-merged — no special file)
 
 class MyScript : public ixscript::NativeScript {
 public:
@@ -113,7 +113,7 @@ from the **Class** dropdown, set any parameters, and press **Play**.
 | `NativeScript.h` | the base class you derive from + `IXSCRIPT_REGISTER` |
 | `ScriptApi.h` | the engine facade (`IScriptApi`) your script calls |
 | `IxModuleApi.h` | the C-ABI module contract + version constant |
-| `IxModuleRegistry.inl` | registration plumbing + the exported entry point (include once) |
+| `IxModuleRegistry.inl` | registration plumbing + the exported entry point (include in each script .cpp — inline-merged) |
 
 ## v1 limitations
 
