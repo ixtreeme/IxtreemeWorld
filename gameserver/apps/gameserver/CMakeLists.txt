@@ -11,7 +11,32 @@ endif()
 add_executable(gameserver
     src/main.cpp
     src/GameConnectionHandler.cpp
-    src/SimWorld.cpp
+    src/world/WorldRuntime.cpp
+    src/world/zone/Zone.cpp
+    src/world/zone/ZoneGraph.cpp
+    src/world/zone/ZoneManager.cpp
+    src/world/zone/ZoneOwnership.cpp
+    src/world/zone/ZoneScheduler.cpp
+    src/world/zone/ZoneWorkerPool.cpp
+    src/world/systems/AiSystem.cpp
+    src/world/systems/CombatSystem.cpp
+    src/world/systems/CooldownSystem.cpp
+    src/world/systems/MovementSystem.cpp
+    src/world/spatial/AoiSystem.cpp
+    src/world/spatial/SpatialGrid.cpp
+    src/world/visibility/BorderPublisher.cpp
+    src/world/visibility/GhostSystem.cpp
+    src/world/visibility/VisibilitySystem.cpp
+    src/world/migration/EntityTransfer.cpp
+    src/world/migration/MigrationSystem.cpp
+    src/world/terrain/TerrainService.cpp
+    src/world/spawn/MobPrototypeRegistry.cpp
+    src/world/spawn/RespawnSystem.cpp
+    src/world/spawn/SpawnLoader.cpp
+    src/world/spawn/SpawnSystem.cpp
+    src/world/replication/ProtocolEncoder.cpp
+    src/world/replication/ReplicationSystem.cpp
+    src/world/replication/SnapshotBuilder.cpp
 )
 
 target_link_libraries(gameserver
@@ -23,6 +48,7 @@ target_link_libraries(gameserver
         db
         ${GS_FLECS_TARGET}
 )
+
 
 target_compile_definitions(gameserver
     PRIVATE

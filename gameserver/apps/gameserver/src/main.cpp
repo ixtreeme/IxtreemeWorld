@@ -23,7 +23,7 @@
 #include "network/Server.h"
 
 #include "GameConnectionHandler.h"
-#include "SimWorld.h"
+#include "world/WorldRuntime.h"
 
 namespace {
 
@@ -101,7 +101,7 @@ int main(int argc, char* argv[])
 
         gs::db::CharacterRepository characters(db_pool);
         gs::db::HandoffTokenRepository handoff_tokens(db_pool);
-        gs::game::SimWorld sim(io);
+        gs::game::WorldRuntime sim(io);
         sim.Start();
 
         gs::game::GameConnectionHandler handler(handoff_tokens, characters, sim, game_server);

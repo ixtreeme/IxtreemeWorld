@@ -11,7 +11,7 @@
 #include "network/Session.h"
 #include "schema/packet.capnp.h"
 
-#include "SimWorld.h"
+#include "world/WorldRuntime.h"
 
 namespace gs::game {
 
@@ -29,9 +29,9 @@ struct GameSessionContext {
 class GameConnectionHandler {
 public:
     GameConnectionHandler(gs::db::HandoffTokenRepository& handoff_tokens,
-                          gs::db::CharacterRepository& characters,
-                          SimWorld& sim,
-                          std::string game_server);
+                           gs::db::CharacterRepository& characters,
+                           WorldRuntime& sim,
+                           std::string game_server);
 
     void OnPayload(std::shared_ptr<gs::network::Session> session,
                    std::vector<std::uint8_t> payload);
@@ -55,7 +55,7 @@ private:
 
     gs::db::HandoffTokenRepository& handoff_tokens_;
     gs::db::CharacterRepository& characters_;
-    SimWorld& sim_;
+    WorldRuntime& sim_;
     std::string game_server_;
     std::mutex contexts_mutex_;
     std::unordered_map<gs::common::SessionId, GameSessionContext> contexts_;

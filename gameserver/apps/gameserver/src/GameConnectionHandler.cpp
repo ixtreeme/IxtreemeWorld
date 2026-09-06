@@ -80,9 +80,9 @@ gs::protocol::S2cEnterWorldReject::RejectReason ToRejectReason(
 } // namespace
 
 GameConnectionHandler::GameConnectionHandler(gs::db::HandoffTokenRepository& handoff_tokens,
-                                             gs::db::CharacterRepository& characters,
-                                             SimWorld& sim,
-                                             std::string game_server)
+                                              gs::db::CharacterRepository& characters,
+                                              WorldRuntime& sim,
+                                              std::string game_server)
     : handoff_tokens_(handoff_tokens)
     , characters_(characters)
     , sim_(sim)
