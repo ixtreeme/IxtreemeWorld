@@ -4,6 +4,7 @@
 #include <unordered_set>
 
 #include "../components/Tags.h"
+#include "../distributed/WorldDirectory.h"
 #include "../migration/MigrationQueue.h"
 #include "../spatial/SpatialValidator.h"
 #include "../zone/Zone.h"
@@ -23,6 +24,7 @@ bool Fail(std::string& out_error, const std::string& message)
 bool ValidateWorldConsistency(ZoneManager& zones,
                               const OwnerMap& owners,
                               const MigrationQueue& migrations,
+                              const WorldDirectory& directory,
                               std::string& out_error)
 {
     std::unordered_set<std::uint32_t> authoritative_nets;
@@ -106,7 +108,8 @@ bool ValidateWorldConsistency(ZoneManager& zones,
         }
     }
 
-    // OwnerMap entries point at a live binding + entity in the recorded zone.
+    // OwnerMap entries point at a live binding + entity in the recorded zone,
+    // and the fast-path caches agree with the global identity + directory.
     for (const auto& [session_id, owner] : owners) {
         if (owner.zone_index >= zones.ZoneCount()) {
             std::ostringstream message;
@@ -115,6 +118,23 @@ bool ValidateWorldConsistency(ZoneManager& zones,
             return Fail(out_error, message.str());
         }
         auto& zone = zones.GetZone(owner.zone_index);
+        if (owner.location.zone != zone.Id()) {
+            std::ostringstream message;
+            message << "owner map: session " << session_id << " location zone "
+                    << owner.location.zone << " disagrees with indexed zone " << zone.Id();
+            return Fail(out_error, message.str());
+        }
+        if (owner.entity != ToGlobalEntityId(owner.net_id, NamespaceOf(owner.entity))) {
+            std::ostringstream message;
+            message << "owner map: session " << session_id << " net/global id mismatch";
+            return Fail(out_error, message.str());
+        }
+        const auto directory_location = directory.ResolveZone(zone.Id());
+        if (!directory_location || !(*directory_location == owner.location)) {
+            std::ostringstream message;
+            message << "owner map: session " << session_id << " location disagrees with directory";
+            return Fail(out_error, message.str());
+        }
         const auto* binding = zone.FindPlayer(owner.net_id);
         if (binding == nullptr || !binding->session || binding->session->Id() != session_id) {
             std::ostringstream message;

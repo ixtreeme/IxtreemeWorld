@@ -20,6 +20,10 @@
 #include "components/MovementComponents.h"
 #include "OwnerMap.h"
 #include "debug/WorldValidator.h"
+#include "distributed/MigrationTransport.h"
+#include "distributed/RuntimeIds.h"
+#include "distributed/WorldDirectory.h"
+#include "distributed/WorldMessageRouter.h"
 #include "input/InputRouter.h"
 #include "migration/MigrationCoordinator.h"
 #include "migration/MigrationQueue.h"
@@ -28,6 +32,7 @@
 #include "zone/ZoneManager.h"
 #include "zone/ZoneScheduler.h"
 #include "zone/ZoneWorkerPool.h"
+#include "zone/ZoneLoadMetrics.h"
 
 // Thin world orchestrator. Owns ONLY:
 //  - startup/shutdown, supervisor thread, global command routing
@@ -42,7 +47,8 @@ namespace gs::game {
 
 class WorldRuntime {
 public:
-    explicit WorldRuntime(boost::asio::io_context& io);
+    // identity defaults to the single-process deployment (node=1/process=1).
+    explicit WorldRuntime(boost::asio::io_context& io, RuntimeIdentity identity = {});
     ~WorldRuntime();
 
     WorldRuntime(const WorldRuntime&) = delete;
@@ -79,6 +85,35 @@ public:
     {
         return migration_queue_;
     }
+    // Routing table + router. Non-const access is for emulation/admin setup
+    // (SetAssignment, SetRemoteMode) and routing self-tests -- never for
+    // gameplay writes from other threads.
+    WorldDirectory& Directory() noexcept
+    {
+        return directory_;
+    }
+    RuntimeIdentity Identity() const noexcept
+    {
+        return identity_;
+    }
+    WorldMessageRouter& Router() noexcept
+    {
+        return router_;
+    }
+    // Test seam: direct queue access for routing self-tests (stale/duplicate
+    // injection). Production producers enqueue via gameplay systems.
+    MigrationQueue& TestMigrationQueue() noexcept
+    {
+        return migration_queue_;
+    }
+    // Logical-distribution emulation (§33): partition local zones across K
+    // logical processes in this binary (round-robin by zone index). Routing
+    // and migration treat non-local partitions as remote-emulated while all
+    // delivery stays local. Benchmark/balancer use only.
+    void EmulateDistribution(std::uint32_t logical_processes);
+    // Cluster-scheduler input snapshot (also used by benchmarks). Cheap,
+    // non-destructive reads; values are point-in-time approximations.
+    ProcessLoadSnapshot CollectProcessLoad() const;
     std::uint64_t DeathsTotal() const noexcept
     {
         return deaths_total_.load(std::memory_order_relaxed);
@@ -106,6 +141,8 @@ public:
     double SupervisorAvgMs() const;
     ZoneWorkerPool::Utilization WorkerUtilization() const;
     std::size_t MigrationQuarantined() const;
+    MigrationId LastCommittedMigration() const;
+    MigrationMetrics::Snapshot MigrationMetrics() const;
 
 private:
     void Enqueue(std::function<void()> command);
@@ -126,6 +163,11 @@ private:
     ZoneManager zones_;
     ZoneScheduler scheduler_;
     ZoneWorkerPool workers_;
+
+    RuntimeIdentity identity_;
+    WorldDirectory directory_;
+    WorldMessageRouter router_;
+    MigrationTransport migration_transport_;
 
     TerrainService terrain_;
     mx::map::WorldLogic world_logic_;

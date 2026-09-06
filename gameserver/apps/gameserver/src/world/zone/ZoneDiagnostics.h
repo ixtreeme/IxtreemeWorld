@@ -30,6 +30,16 @@ struct ZoneDiagnostics {
     std::atomic<std::uint64_t> migrations_since_diag{0};
     std::atomic<std::uint64_t> tick_micros_since_diag{0};
     std::atomic<std::uint64_t> aoi_queries_since_diag{0};
+    // Dirty pipeline (§27): entities whose transform actually moved this
+    // tick, vs. records sent. Sending is unchanged (full frames); the ratio
+    // shows what a future delta protocol could skip.
+    std::atomic<std::uint64_t> transform_dirty_since_diag{0};
+    // Relevance tiers (§29): emitted AOI candidates by distance band. No
+    // behavior change today; the seam for future frequency tiers
+    // (near 20 Hz / mid 10 Hz / far 2-5 Hz / unchanged 0 Hz).
+    std::atomic<std::uint64_t> tier_near_since_diag{0};
+    std::atomic<std::uint64_t> tier_mid_since_diag{0};
+    std::atomic<std::uint64_t> tier_far_since_diag{0};
 
     // Subsystem stage sums (microseconds, since last diag read).
     std::atomic<std::uint64_t> gameplay_micros_since_diag{0};

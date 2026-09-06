@@ -17,9 +17,10 @@
 #include "network/Session.h"
 
 #include "../components/TransformComponents.h"
+#include "../distributed/Routing.h"
+#include "../distributed/RuntimeIds.h"
 #include "../OwnerMap.h"
 #include "../replication/NetworkEntityId.h"
-#include "../zone/ZoneCommandQueue.h"
 #include "MobPrototypeRegistry.h"
 #include "RespawnSystem.h"
 #include "SpawnLoader.h"
@@ -32,8 +33,11 @@
 // Concrete class, no interface (single implementation).
 namespace gs::game {
 
+class Zone;
 class ZoneManager;
 class TerrainService;
+class WorldDirectory;
+class WorldMessageRouter;
 
 struct DebugSpawnOverride {
     float x = 0.0f;
@@ -42,7 +46,6 @@ struct DebugSpawnOverride {
 
 class SpawnCoordinator {
 public:
-    using PostZoneFn = std::function<void(std::size_t zone_index, ZoneCommandQueue::Command command)>;
     using SendFn =
         std::function<void(std::shared_ptr<gs::network::Session>, std::vector<std::uint8_t>)>;
 
@@ -51,8 +54,11 @@ public:
                      TerrainService& terrain,
                      const mx::map::WorldLogic& world_logic,
                      OwnerMap& owners,
-                     PostZoneFn post_zone,
-                     SendFn send);
+                     WorldMessageRouter& router,
+                     WakeFn wake,
+                     SendFn send,
+                     RuntimeIdentity identity,
+                     WorldDirectory& directory);
 
     // Loads prototypes + spawn points and spawns the configured mobs.
     void Initialize(const std::string& map_root, const std::string& mob_types_config);
@@ -91,6 +97,8 @@ public:
     }
 
 private:
+    void PostToOwner(std::size_t zone_index, std::function<void(Zone&)> command);
+
     Position ResolveSpawnPosition(const gs::db::Character& character,
                                   std::optional<DebugSpawnOverride> debug_spawn,
                                   gs::common::SessionId session_id);
@@ -102,8 +110,11 @@ private:
     TerrainService& terrain_;
     const mx::map::WorldLogic& world_logic_;
     OwnerMap& owners_;
-    PostZoneFn post_zone_;
+    WorldMessageRouter& router_;
+    WakeFn wake_;
     SendFn send_;
+    RuntimeIdentity identity_;
+    WorldDirectory& directory_;
 
     MobPrototypeRegistry mob_types_;
     mutable std::mutex spawn_points_mutex_;

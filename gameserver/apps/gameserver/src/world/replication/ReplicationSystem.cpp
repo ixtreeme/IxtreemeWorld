@@ -1,7 +1,5 @@
 #include "ReplicationSystem.h"
 
-#include <unordered_map>
-
 #include "../spatial/AoiSystem.h"
 #include "../visibility/VisibilitySystem.h"
 #include "../zone/Zone.h"
@@ -27,6 +25,18 @@ std::size_t ReplicationSystem::BroadcastTransforms(Zone& zone, const SendFn& sen
     const auto ghosts = AoiSystem::BuildGhostCache(zone);
     VisibilitySystem::SpawnCache spawn_cache;
     VisibilitySystem::SnapshotCache snapshot_cache;
+    // Pre-size the per-tick caches: without this every tick pays a full
+    // rehash ladder (0->512 buckets) on top of the inserts themselves.
+    // (A per-record shared-encoding cache was also tried here and measured:
+    // at 19 bytes/record the map overhead eats the re-encode saving, so it
+    // was removed again. Revisit if records grow.)
+    {
+        const std::size_t residents =
+            zone.Players().size() +
+            zone.Diagnostics().mob_count.load(std::memory_order_relaxed) + zone.Ghosts().size();
+        spawn_cache.reserve(64);
+        snapshot_cache.reserve(residents + 16);
+    }
 
     std::size_t transform_records_sent = 0;
     for (const auto& [viewer_net_id, binding] : zone.Players()) {
@@ -50,7 +60,8 @@ std::size_t ReplicationSystem::BroadcastTransforms(Zone& zone, const SendFn& sen
             zone, viewer_net_id, candidates, send, spawn_cache, snapshot_cache);
 
         const auto viewer_snapshot = BuildPlayerSnapshot(zone, viewer_entity);
-        send(binding.session, EncodeTransformFrame(viewer_snapshot, visible_snapshots, zone.TickIndex()));
+        send(binding.session,
+             EncodeTransformFrame(viewer_snapshot, visible_snapshots, zone.TickIndex()));
         transform_records_sent += 1 + visible_snapshots.size();
     }
     return transform_records_sent;

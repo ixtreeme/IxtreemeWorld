@@ -28,6 +28,10 @@ struct BorderEntitySnapshot {
 };
 
 struct GhostRecord {
+    // entity is zone-LOCAL runtime state (this zone's flecs world only, never
+    // stored or sent anywhere else). The cross-process unit -- now across
+    // threads via publish buffers, later across processes via BorderSnapshot
+    // transport (§23) -- is `snapshot` alone: stable NetId + plain data.
     flecs::entity entity;
     BorderEntitySnapshot snapshot;
 };

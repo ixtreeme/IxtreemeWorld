@@ -113,6 +113,10 @@ public:
     {
         return commands_;
     }
+    const ZoneCommandQueue& Commands() const noexcept
+    {
+        return commands_;
+    }
     SpatialGrid& Grid() noexcept
     {
         return grid_;

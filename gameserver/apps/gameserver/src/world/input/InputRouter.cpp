@@ -5,13 +5,14 @@
 #include "../components/MovementComponents.h"
 #include "../components/NetworkComponents.h"
 #include "../components/TransformComponents.h"
+#include "../distributed/WorldMessageRouter.h"
 #include "../zone/Zone.h"
 #include "../zone/ZoneOwnership.h"
 
 namespace gs::game {
 
-InputRouter::InputRouter(PostZoneFn post_zone, std::function<void()> wake)
-    : post_zone_(std::move(post_zone))
+InputRouter::InputRouter(WorldMessageRouter& router, WakeFn wake)
+    : router_(router)
     , wake_(std::move(wake))
 {
 }
@@ -37,6 +38,21 @@ void InputRouter::PostAttackTarget(gs::common::SessionId session_id, std::uint32
     wake_();
 }
 
+void InputRouter::PostToOwner(OwnerMap& owners,
+                              gs::common::SessionId session_id,
+                              std::function<void(Zone&)> command)
+{
+    const auto owner_it = owners.find(session_id);
+    if (owner_it == owners.end()) {
+        return;
+    }
+    // Routed by stable zone index through the message router: local today,
+    // location-aware tomorrow. The scheduler wake stays unconditional --
+    // even an unavailable route must not stall the supervisor loop.
+    router_.RouteZoneCommand(owner_it->second.zone_index, std::move(command));
+    wake_();
+}
+
 void InputRouter::DrainMoves(OwnerMap& owners)
 {
     std::vector<MoveInput> inputs;
@@ -46,11 +62,7 @@ void InputRouter::DrainMoves(OwnerMap& owners)
     }
 
     for (const auto& input : inputs) {
-        const auto owner_it = owners.find(input.session_id);
-        if (owner_it == owners.end()) {
-            continue;
-        }
-        post_zone_(owner_it->second.zone_index, [input](Zone& zone) {
+        PostToOwner(owners, input.session_id, [input](Zone& zone) {
             AssertZoneOwner(zone, "zone input command");
             // O(1) session -> net lookup via the zone's reverse index
             // (previously a linear scan per input).
@@ -83,15 +95,10 @@ void InputRouter::DrainAttacks(OwnerMap& owners, const AttackHandler& handle)
     }
 
     for (const auto& input : inputs) {
-        const auto owner_it = owners.find(input.session_id);
-        if (owner_it == owners.end()) {
-            continue;
-        }
-        post_zone_(owner_it->second.zone_index,
-                   [handle, input](Zone& zone) {
-                       AssertZoneOwner(zone, "zone attack command");
-                       handle(zone, input.session_id, input.target_net_id);
-                   });
+        PostToOwner(owners, input.session_id, [handle, input](Zone& zone) {
+            AssertZoneOwner(zone, "zone attack command");
+            handle(zone, input.session_id, input.target_net_id);
+        });
     }
 }
 

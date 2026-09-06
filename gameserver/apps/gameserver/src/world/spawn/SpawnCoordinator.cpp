@@ -6,6 +6,8 @@
 
 #include "common/Logging.h"
 
+#include "../distributed/WorldDirectory.h"
+#include "../distributed/WorldMessageRouter.h"
 #include "../replication/NetworkSend.h"
 #include "../replication/ProtocolEncoder.h"
 #include "../spawn/SpawnRandom.h"
@@ -35,16 +37,28 @@ SpawnCoordinator::SpawnCoordinator(boost::asio::io_context& io,
                                    TerrainService& terrain,
                                    const mx::map::WorldLogic& world_logic,
                                    OwnerMap& owners,
-                                   PostZoneFn post_zone,
-                                   SendFn send)
+                                   WorldMessageRouter& router,
+                                   WakeFn wake,
+                                   SendFn send,
+                                   RuntimeIdentity identity,
+                                   WorldDirectory& directory)
     : io_(io)
     , zones_(zones)
     , terrain_(terrain)
     , world_logic_(world_logic)
     , owners_(owners)
-    , post_zone_(std::move(post_zone))
+    , router_(router)
+    , wake_(std::move(wake))
     , send_(std::move(send))
+    , identity_(identity)
+    , directory_(directory)
 {
+}
+
+void SpawnCoordinator::PostToOwner(std::size_t zone_index, std::function<void(Zone&)> command)
+{
+    router_.RouteZoneCommand(zone_index, std::move(command));
+    wake_();
 }
 
 void SpawnCoordinator::Initialize(const std::string& map_root, const std::string& mob_types_config)
@@ -79,7 +93,19 @@ void SpawnCoordinator::Spawn(std::shared_ptr<gs::network::Session> session,
     position.z = terrain_.SampleGroundHeight(position.x, position.y);
     const auto net_id = net_ids_.AllocatePlayerNetId();
 
-    owners_[session_id] = OwnerInfo{zone_index, net_id};
+    // The routing location comes from the directory, not from the fact
+    // that the entity physically spawns here: under logical-distribution
+    // emulation (or a future balancer) this zone may be assigned elsewhere
+    // while still simulated locally.
+    const ZoneId spawn_zone_id = zones_.GetZone(zone_index).Id();
+    const auto spawn_location =
+        directory_.ResolveZone(spawn_zone_id).value_or(LocalZoneLocation(identity_, spawn_zone_id));
+    OwnerInfo owner;
+    owner.entity = ToGlobalEntityId(net_id, NamespaceFor(identity_));
+    owner.location = spawn_location;
+    owner.zone_index = zone_index;
+    owner.net_id = net_id;
+    owners_[session_id] = owner;
     send_(session, MakeEnterWorldAccept(net_id, position, world_tick));
 
     LOG_INFO("Session {} assigned to zone {} ('{}') as net_id {} at {}, {}, ground_z={}",
@@ -91,8 +117,8 @@ void SpawnCoordinator::Spawn(std::shared_ptr<gs::network::Session> session,
              position.y,
              position.z);
 
-    post_zone_(zone_index,
-               [session = std::move(session),
+    PostToOwner(zone_index,
+                [session = std::move(session),
                 character = std::move(character),
                 position,
                 net_id](Zone& zone) mutable {
@@ -117,7 +143,7 @@ void SpawnCoordinator::Despawn(gs::common::SessionId session_id)
     const auto net_id = owner_it->second.net_id;
     owners_.erase(owner_it);
 
-    post_zone_(zone_index, [this, session_id, net_id](Zone& zone) {
+    PostToOwner(zone_index, [this, session_id, net_id](Zone& zone) {
         AssertZoneOwner(zone, "zone despawn command");
         // O(1) session -> net lookup via the zone's reverse index.
         const auto found = zone.NetIdForSession(session_id);

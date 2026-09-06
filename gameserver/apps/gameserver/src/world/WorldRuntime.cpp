@@ -52,38 +52,40 @@ mx::map::WorldLogic LoadWorldLogicFromMapRoot(const std::string& map_root)
 
 } // namespace
 
-WorldRuntime::WorldRuntime(boost::asio::io_context& io)
+WorldRuntime::WorldRuntime(boost::asio::io_context& io, RuntimeIdentity identity)
     : io_(io)
     , workers_([this](std::size_t zone_index) {
         TickZone(zone_index);
     })
+    , identity_(identity)
+    , directory_(identity)
+    , router_(zones_, directory_)
     , spawn_(io_,
              zones_,
              terrain_,
              world_logic_,
              owners_by_session_,
-             [this](std::size_t zone_index, ZoneCommandQueue::Command command) {
-                 zones_.PostCommand(zone_index, std::move(command));
+             router_,
+             [this] {
                  cv_.notify_one();
              },
              [this](std::shared_ptr<gs::network::Session> session, std::vector<std::uint8_t> payload) {
                  SendToSession(io_, session, std::move(payload));
-             })
-    , migration_(zones_, terrain_, owners_by_session_, migration_queue_)
-    , inputs_(
-          [this](std::size_t zone_index, ZoneCommandQueue::Command command) {
-              zones_.PostCommand(zone_index, std::move(command));
-              cv_.notify_one();
-          },
-          [this] {
-              cv_.notify_one();
-          })
+             },
+             identity_,
+             directory_)
+    , migration_(zones_, terrain_, owners_by_session_, migration_queue_, directory_,
+                 migration_transport_, identity_)
+    , inputs_(router_, [this] {
+        cv_.notify_one();
+    })
 {
     const std::string map_root = IXTREEME_DEFAULT_MAP_ROOT;
     terrain_ = TerrainService::LoadFromMapRoot(map_root);
     world_logic_ = LoadWorldLogicFromMapRoot(map_root);
 
     zones_.BuildFromWorldLogic(world_logic_, terrain_.WorldExtentMeters());
+    directory_.RebuildFromManager(zones_);
     spawn_.Initialize(map_root, IXTREEME_DEFAULT_MOB_TYPES_CONFIG);
 }
 
@@ -245,8 +247,8 @@ void WorldRuntime::Run()
             if (!zones_.AnyTickInProgress()) {
                 validation_requested_.store(false, std::memory_order_relaxed);
                 std::string error;
-                const bool ok =
-                    ValidateWorldConsistency(zones_, owners_by_session_, migration_queue_, error);
+                const bool ok = ValidateWorldConsistency(zones_, owners_by_session_, migration_queue_,
+                                                         directory_, error);
                 std::lock_guard lock(validation_mutex_);
                 validation_result_ = ok ? std::string("OK") : "FAIL: " + error;
                 validation_ready_ = true;
@@ -268,6 +270,10 @@ void WorldRuntime::Run()
             std::uint64_t total_migrations = 0;
             std::uint64_t total_tick_micros = 0;
             std::uint64_t total_aoi_queries = 0;
+            std::uint64_t total_dirty_xf = 0;
+            std::uint64_t total_tier_near = 0;
+            std::uint64_t total_tier_mid = 0;
+            std::uint64_t total_tier_far = 0;
             std::uint64_t total_gameplay_micros = 0;
             std::uint64_t total_ghost_micros = 0;
             std::uint64_t total_repl_micros = 0;
@@ -294,6 +300,10 @@ void WorldRuntime::Run()
                 total_migrations += zone.Diagnostics().migrations_since_diag.exchange(0);
                 total_tick_micros += zone.Diagnostics().tick_micros_since_diag.exchange(0);
                 total_aoi_queries += zone.Diagnostics().aoi_queries_since_diag.exchange(0);
+                total_dirty_xf += zone.Diagnostics().transform_dirty_since_diag.exchange(0);
+                total_tier_near += zone.Diagnostics().tier_near_since_diag.exchange(0);
+                total_tier_mid += zone.Diagnostics().tier_mid_since_diag.exchange(0);
+                total_tier_far += zone.Diagnostics().tier_far_since_diag.exchange(0);
                 total_gameplay_micros += zone.Diagnostics().gameplay_micros_since_diag.exchange(0);
                 total_ghost_micros += zone.Diagnostics().ghost_micros_since_diag.exchange(0);
                 total_repl_micros += zone.Diagnostics().replication_micros_since_diag.exchange(0);
@@ -318,7 +328,9 @@ void WorldRuntime::Run()
                     ? static_cast<double>(worker_util.busy_micros) / 1'000'000.0 /
                           static_cast<double>(workers_.WorkerCount()) * 100.0
                     : 0.0;
-            LOG_INFO("Game sim diag: world_tick={} zones={} active_zones={} sleeping_zones={} active_sessions={} active_mobs={} wandering_mobs={} idle_mobs={} ghosts={} zone_ticks={} empty_zone_skips={} transform_records_sent={} attacks_per_sec={} deaths_total={} respawns_pending={} respawns_total={} migrations={} mig_pending={} mig_quarantined={} workers={} worker_busy_pct={:.1f} avg_zone_tick_ms={:.3f} aoi_queries={} stage_us=[gameplay={} ghost={} repl={}] avg_supervisor_ms={:.3f}",
+            const auto routes = router_.MetricsSnapshot();
+            const auto mig_metrics = migration_.MetricsSnapshot();
+            LOG_INFO("Game sim diag: world_tick={} zones={} active_zones={} sleeping_zones={} active_sessions={} active_mobs={} wandering_mobs={} idle_mobs={} ghosts={} zone_ticks={} empty_zone_skips={} transform_records_sent={} attacks_per_sec={} deaths_total={} respawns_pending={} respawns_total={} migrations={} mig_pending={} mig_quarantined={} mig_detail=[c={} stale={} dup={} retry={} fail={}] routes=[local={} remu={} unav={} drain={} miss={}] workers={} worker_busy_pct={:.1f}                      avg_zone_tick_ms={:.3f} aoi_queries={} dirty_xf={} tiers=[{}/{}/{}] stage_us=[gameplay={} ghost={} repl={}] avg_supervisor_ms={:.3f}",
                      world_tick_.load(),
                      zones_.ZoneCount(),
                      active_zones,
@@ -338,10 +350,24 @@ void WorldRuntime::Run()
                      total_migrations,
                      migration_queue_.PendingCount(),
                      migration_.QuarantinedCount(),
+                     mig_metrics.committed,
+                     mig_metrics.dropped_stale,
+                     mig_metrics.duplicates,
+                     mig_metrics.retries,
+                     mig_metrics.failures,
+                     routes.local_delivered,
+                     routes.remote_emulated,
+                     routes.unavailable,
+                     routes.draining,
+                     routes.directory_miss,
                      workers_.WorkerCount(),
                      worker_busy_pct,
                      avg_tick_ms,
                      total_aoi_queries,
+                     total_dirty_xf,
+                     total_tier_near,
+                     total_tier_mid,
+                     total_tier_far,
                      total_gameplay_micros,
                      total_ghost_micros,
                      total_repl_micros,
@@ -372,7 +398,8 @@ bool WorldRuntime::ValidateConsistency(std::string& out_error)
     // Debug/test only: the caller must guarantee no zone tick or supervisor
     // mutation is running concurrently (e.g. call between Run iterations in
     // a test harness, or after Stop).
-    return ValidateWorldConsistency(zones_, owners_by_session_, migration_queue_, out_error);
+    return ValidateWorldConsistency(zones_, owners_by_session_, migration_queue_, directory_,
+                                    out_error);
 }
 
 void WorldRuntime::RequestValidation()
@@ -408,6 +435,79 @@ ZoneWorkerPool::Utilization WorldRuntime::WorkerUtilization() const
 std::size_t WorldRuntime::MigrationQuarantined() const
 {
     return migration_.QuarantinedCount();
+}
+
+MigrationId WorldRuntime::LastCommittedMigration() const
+{
+    return migration_.LastCommittedId();
+}
+
+MigrationMetrics::Snapshot WorldRuntime::MigrationMetrics() const
+{
+    return migration_.MetricsSnapshot();
+}
+
+void WorldRuntime::EmulateDistribution(std::uint32_t logical_processes)
+{
+    if (logical_processes < 2) {
+        return;
+    }
+    router_.SetRemoteMode(WorldMessageRouter::RemoteMode::EmulatedLoopback);
+    migration_transport_.SetRemoteMode(MigrationTransport::RemoteMode::EmulatedLoopback);
+    for (std::size_t i = 0; i < zones_.ZoneCount(); ++i) {
+        const ZoneId zone_id = zones_.GetZone(i).Id();
+        // Zone 0 stays home; the rest stripe across logical processes 2..K.
+        // Node stays 1: this emulates multi-PROCESS, single-node sharding.
+        const std::uint32_t process =
+            (i == 0) ? identity_.process.value : static_cast<std::uint32_t>((i % logical_processes) + 1);
+        const ProcessId pid{process == 0 ? 1 : process};
+        directory_.NoteRemoteAlive(identity_.node, pid);
+        directory_.SetAssignment(zone_id, ZoneLocation{identity_.node, pid, zone_id});
+    }
+}
+
+ProcessLoadSnapshot WorldRuntime::CollectProcessLoad() const
+{
+    ProcessLoadSnapshot snapshot;
+    snapshot.identity = identity_;
+    snapshot.world_tick = world_tick_.load(std::memory_order_relaxed);
+    snapshot.zone_count = zones_.ZoneCount();
+    std::uint64_t tick_total = 0;
+    std::uint64_t tick_count = 0;
+    for (std::size_t i = 0; i < zones_.ZoneCount(); ++i) {
+        const auto& zone = zones_.GetZone(i);
+        const auto& diag = zone.Diagnostics();
+        const auto players = diag.player_count.load(std::memory_order_relaxed);
+        const auto mobs = diag.mob_count.load(std::memory_order_relaxed);
+        snapshot.players += players;
+        snapshot.mobs += mobs;
+        snapshot.ghosts += diag.ghost_count.load(std::memory_order_relaxed);
+        if (players > 0 || mobs > 0) {
+            ++snapshot.active_zones;
+        }
+        if (zone.Activity() == ZoneActivity::Sleeping) {
+            ++snapshot.sleeping_zones;
+        }
+        // Non-destructive reads: the periodic diag owns the exchange().
+        const std::uint64_t ticks = diag.ticks_since_diag.load(std::memory_order_relaxed);
+        tick_total += diag.tick_micros_since_diag.load(std::memory_order_relaxed);
+        tick_count += ticks;
+        snapshot.repl_records += diag.transform_records_since_diag.load(std::memory_order_relaxed);
+        snapshot.migrations += diag.migrations_since_diag.load(std::memory_order_relaxed);
+    }
+    snapshot.avg_zone_tick_ms =
+        tick_count > 0 ? static_cast<double>(tick_total) / tick_count / 1000.0 : 0.0;
+    const auto worker_util = workers_.GetUtilization();
+    snapshot.worker_tasks = worker_util.tasks_completed;
+    snapshot.worker_busy_us = worker_util.busy_micros;
+    snapshot.supervisor_avg_ms = SupervisorAvgMs();
+    const auto routes = router_.MetricsSnapshot();
+    snapshot.routes_local = routes.local_delivered;
+    snapshot.routes_remote_emulated = routes.remote_emulated;
+    snapshot.routes_unavailable = routes.unavailable;
+    snapshot.routes_draining = routes.draining;
+    CollectZoneLoadMetrics(zones_, snapshot.zones);
+    return snapshot;
 }
 
 void WorldRuntime::DrainGlobalCommands()

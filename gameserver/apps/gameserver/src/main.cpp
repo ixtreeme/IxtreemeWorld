@@ -65,6 +65,20 @@ std::uint32_t ResolveIoThreads(const gs::common::Config& config)
     return static_cast<std::uint32_t>(std::clamp(value, 1, 4));
 }
 
+// Process topology identity for the distributed-ready runtime (§45).
+// Defaults keep the single-process deployment: node=1/process=1, all
+// configured zones local. A future multi-process deployment assigns
+// distinct namespaces per process; no code changes needed, only config.
+gs::game::RuntimeIdentity ResolveRuntimeIdentity(const gs::common::Config& config)
+{
+    const auto node = config.GetInt("node_id").value_or(1);
+    const auto process = config.GetInt("process_id").value_or(1);
+    gs::game::RuntimeIdentity identity;
+    identity.node = gs::game::NodeId{static_cast<std::uint32_t>(std::max(0, node))};
+    identity.process = gs::game::ProcessId{static_cast<std::uint32_t>(std::max(0, process))};
+    return identity;
+}
+
 } // namespace
 
 int main(int argc, char* argv[])
@@ -101,7 +115,12 @@ int main(int argc, char* argv[])
 
         gs::db::CharacterRepository characters(db_pool);
         gs::db::HandoffTokenRepository handoff_tokens(db_pool);
-        gs::game::WorldRuntime sim(io);
+        const auto runtime_identity = ResolveRuntimeIdentity(config);
+        LOG_INFO("Runtime identity: node={} process={} (namespace {})",
+                 runtime_identity.node.value,
+                 runtime_identity.process.value,
+                 gs::game::NamespaceFor(runtime_identity));
+        gs::game::WorldRuntime sim(io, runtime_identity);
         sim.Start();
 
         gs::game::GameConnectionHandler handler(handoff_tokens, characters, sim, game_server);

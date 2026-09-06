@@ -4,6 +4,7 @@
 #include <utility>
 #include <vector>
 
+#include "../WorldConstants.h"
 #include "../components/TransformComponents.h"
 
 // AOI answers ONLY: "which net_ids are physically near the viewer?"
@@ -20,6 +21,24 @@ class SpatialGrid;
 
 // Ghost positions resolved once per zone tick (not once per viewer).
 using GhostPositionCache = std::vector<std::pair<std::uint32_t, Position>>;
+
+// Relevance tier by viewer distance (§29 seam). Boundaries are thirds of the
+// AOI radius. Classification only -- send rates are unchanged today.
+enum class RelevanceTier : std::uint8_t {
+    Near = 0,
+    Mid,
+    Far,
+};
+
+inline RelevanceTier RelevanceTierForDistanceSq(float distance_sq) noexcept
+{
+    const float third = kAoiRadiusMeters / 3.0f;
+    if (distance_sq <= third * third) {
+        return RelevanceTier::Near;
+    }
+    const float two_thirds = third * 2.0f;
+    return distance_sq <= two_thirds * two_thirds ? RelevanceTier::Mid : RelevanceTier::Far;
+}
 
 class AoiSystem {
 public:

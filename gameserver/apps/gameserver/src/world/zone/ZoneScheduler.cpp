@@ -90,12 +90,12 @@ void ZoneScheduler::ScheduleOnce(ZoneManager& zones,
     }
 }
 
-void CollectZoneLoadMetrics(ZoneManager& zones, std::vector<ZoneLoadMetrics>& out)
+void CollectZoneLoadMetrics(const ZoneManager& zones, std::vector<ZoneLoadMetrics>& out)
 {
     out.clear();
     out.reserve(zones.ZoneCount());
     for (std::size_t i = 0; i < zones.ZoneCount(); ++i) {
-        auto& zone = zones.GetZone(i);
+        const auto& zone = zones.GetZone(i);
         const auto& diag = zone.Diagnostics();
         ZoneLoadMetrics metrics;
         metrics.zone_id = zone.Id();
@@ -110,6 +110,7 @@ void CollectZoneLoadMetrics(ZoneManager& zones, std::vector<ZoneLoadMetrics>& ou
         metrics.migrations = diag.migrations_since_diag.load(std::memory_order_relaxed);
         metrics.repl_records = diag.transform_records_since_diag.load(std::memory_order_relaxed);
         metrics.queue_depth = zone.Commands().Depth();
+        metrics.max_queue_depth = zone.Commands().MaxDepthObserved();
         metrics.activity = zone.Activity();
         out.push_back(metrics);
     }

@@ -6,10 +6,11 @@
 
 namespace gs::game {
 
-EntityTransfer BuildTransfer(flecs::entity entity, bool is_player)
+EntityTransfer BuildTransfer(flecs::entity entity, bool is_player, std::uint16_t namespace_id)
 {
     EntityTransfer transfer;
     transfer.net_id = entity.get<NetId>().value;
+    transfer.entity_id = ToGlobalEntityId(transfer.net_id, namespace_id);
     transfer.is_player = is_player;
     transfer.position = entity.get<Position>();
     transfer.heading = entity.get<Heading>();
@@ -32,9 +33,12 @@ EntityTransfer BuildTransfer(flecs::entity entity, bool is_player)
 
 flecs::entity ApplyTransfer(flecs::world& world, const EntityTransfer& transfer)
 {
-    // A transfer without a global identity must never become an entity:
-    // NetId is the only cross-zone identity, and it is never zero.
+    // A transfer without identity must never become an entity. Both ids
+    // must agree: entity_id is the cross-process truth, net_id its local
+    // low bits (kept for wire/component compatibility).
     assert(transfer.net_id != 0);
+    assert(transfer.entity_id.IsValid());
+    assert(ToNetId(transfer.entity_id) == transfer.net_id);
     auto entity = world.entity()
                       .set<Position>(transfer.position)
                       .set<Heading>(transfer.heading)

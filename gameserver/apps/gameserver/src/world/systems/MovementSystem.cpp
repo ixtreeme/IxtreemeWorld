@@ -87,10 +87,24 @@ void MovementSystem::Step(Zone& zone, float dt, ZoneTickContext& ctx)
         players.push_back(entity);
     });
 
+    std::uint64_t moved_entities = 0;
+    auto note_moved = [&](const Position& before, const Position& after) {
+        // Dirty-transform signal (§27): sub-centimeter moves (warp/clamp
+        // rounding) don't count; real displacement does. Feeds the
+        // dirty-vs-sent ratio in diagnostics; sending itself is unchanged
+        // (wire protocol still takes full frames -- TODO).
+        const float dx = after.x - before.x;
+        const float dy = after.y - before.y;
+        if (dx * dx + dy * dy > 0.0001f) {
+            ++moved_entities;
+        }
+    };
+
     for (auto entity : players) {
         const auto net = entity.get<NetId>();
         const auto speed = entity.get<MoveSpeed>();
         auto position = entity.get<Position>();
+        const Position before_move = position;
         auto heading = entity.get<Heading>();
         auto velocity = entity.get<Velocity>();
         auto intent = entity.get<MoveIntent>();
@@ -121,6 +135,7 @@ void MovementSystem::Step(Zone& zone, float dt, ZoneTickContext& ctx)
         }
         TryApplyWarp(zone, ctx, position, session_id);
         position.z = ctx.terrain.SampleGroundHeight(position.x, position.y);
+        note_moved(before_move, position);
         entity.set<Position>(position);
         entity.set<Heading>(heading);
         entity.set<Velocity>(velocity);
@@ -144,6 +159,7 @@ void MovementSystem::Step(Zone& zone, float dt, ZoneTickContext& ctx)
         const auto speed = entity.get<MoveSpeed>();
         const auto wander = entity.get<WanderState>();
         auto position = entity.get<Position>();
+        const Position before_move = position;
         auto heading = entity.get<Heading>();
         auto velocity = entity.get<Velocity>();
         auto intent = entity.get<MoveIntent>();
@@ -170,6 +186,7 @@ void MovementSystem::Step(Zone& zone, float dt, ZoneTickContext& ctx)
         }
 
         position.z = ctx.terrain.SampleGroundHeight(position.x, position.y);
+        note_moved(before_move, position);
         entity.set<Position>(position);
         entity.set<Heading>(heading);
         entity.set<Velocity>(velocity);
@@ -177,6 +194,7 @@ void MovementSystem::Step(Zone& zone, float dt, ZoneTickContext& ctx)
         zone.Grid().Move(net.value, old_cell, position);
         MigrationSystem::UpdateMarker(zone, ctx.zones, ctx.migration_queue, net.value, entity, position);
     }
+    zone.Diagnostics().transform_dirty_since_diag.fetch_add(moved_entities, std::memory_order_relaxed);
 }
 
 } // namespace gs::game

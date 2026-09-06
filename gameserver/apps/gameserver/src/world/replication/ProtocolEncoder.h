@@ -27,6 +27,8 @@ std::vector<std::uint8_t> EncodeTransformFrame(const BorderEntitySnapshot& viewe
                                                const std::vector<BorderEntitySnapshot>& visible,
                                                std::uint32_t zone_tick);
 
+
+
 std::uint16_t QuantizeHeading(float angle);
 
 } // namespace gs::game

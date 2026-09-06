@@ -125,12 +125,29 @@ std::vector<std::uint32_t> AoiSystem::QueryCandidates(Zone& zone,
         candidates.resize(kAoiEntityCap);
     }
 
+    std::uint64_t tier_near = 0;
+    std::uint64_t tier_mid = 0;
+    std::uint64_t tier_far = 0;
     auto& refs = t_results;
     refs.clear();
     refs.reserve(candidates.size());
     for (const auto& candidate : candidates) {
         refs.push_back(candidate.second);
+        switch (RelevanceTierForDistanceSq(candidate.first)) {
+        case RelevanceTier::Near:
+            ++tier_near;
+            break;
+        case RelevanceTier::Mid:
+            ++tier_mid;
+            break;
+        case RelevanceTier::Far:
+            ++tier_far;
+            break;
+        }
     }
+    zone.Diagnostics().tier_near_since_diag.fetch_add(tier_near, std::memory_order_relaxed);
+    zone.Diagnostics().tier_mid_since_diag.fetch_add(tier_mid, std::memory_order_relaxed);
+    zone.Diagnostics().tier_far_since_diag.fetch_add(tier_far, std::memory_order_relaxed);
     return refs;
 }
 

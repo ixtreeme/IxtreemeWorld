@@ -8,9 +8,10 @@ else()
     message(FATAL_ERROR "flecs CMake target not found")
 endif()
 
-add_executable(gameserver
-    src/main.cpp
-    src/GameConnectionHandler.cpp
+# Shared world-runtime sources: one list feeds both the production server
+# and the benchmark harness, so a new module can never be added to one and
+# forgotten in the other.
+set(GAMESERVER_WORLD_SOURCES
     src/world/WorldRuntime.cpp
     src/world/zone/Zone.cpp
     src/world/zone/ZoneGraph.cpp
@@ -42,6 +43,15 @@ add_executable(gameserver
     src/world/replication/ProtocolEncoder.cpp
     src/world/replication/ReplicationSystem.cpp
     src/world/replication/SnapshotBuilder.cpp
+    src/world/distributed/WorldDirectory.cpp
+    src/world/distributed/WorldMessageRouter.cpp
+    src/world/distributed/MigrationTransport.cpp
+)
+
+add_executable(gameserver
+    src/main.cpp
+    src/GameConnectionHandler.cpp
+    ${GAMESERVER_WORLD_SOURCES}
 )
 
 target_link_libraries(gameserver
@@ -89,37 +99,7 @@ configure_file(
 if(ENABLE_WORLDBENCH)
     add_executable(worldbench
         src/bench/WorldBench.cpp
-        src/world/WorldRuntime.cpp
-        src/world/zone/Zone.cpp
-        src/world/zone/ZoneGraph.cpp
-        src/world/zone/ZoneManager.cpp
-        src/world/zone/ZoneOwnership.cpp
-        src/world/zone/ZoneScheduler.cpp
-        src/world/zone/ZoneWorkerPool.cpp
-        src/world/systems/AiSystem.cpp
-        src/world/systems/CombatSystem.cpp
-        src/world/systems/CooldownSystem.cpp
-        src/world/systems/MovementSystem.cpp
-        src/world/spatial/AoiSystem.cpp
-        src/world/spatial/SpatialGrid.cpp
-        src/world/spatial/SpatialValidator.cpp
-        src/world/debug/WorldValidator.cpp
-        src/world/visibility/BorderPublisher.cpp
-        src/world/visibility/GhostSystem.cpp
-        src/world/visibility/VisibilitySystem.cpp
-        src/world/migration/EntityTransfer.cpp
-        src/world/migration/MigrationCoordinator.cpp
-        src/world/migration/MigrationSystem.cpp
-        src/world/input/InputRouter.cpp
-        src/world/terrain/TerrainService.cpp
-        src/world/spawn/MobPrototypeRegistry.cpp
-        src/world/spawn/RespawnSystem.cpp
-        src/world/spawn/SpawnCoordinator.cpp
-        src/world/spawn/SpawnLoader.cpp
-        src/world/spawn/SpawnSystem.cpp
-        src/world/replication/ProtocolEncoder.cpp
-        src/world/replication/ReplicationSystem.cpp
-        src/world/replication/SnapshotBuilder.cpp
+        ${GAMESERVER_WORLD_SOURCES}
     )
 
     target_link_libraries(worldbench

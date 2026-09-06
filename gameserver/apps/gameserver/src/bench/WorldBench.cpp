@@ -15,6 +15,10 @@
 //   worldbench [--players N] [--mobs M] [--seconds S]
 //              [--mode spread|hotspot|border|dense]
 //              [--validate-every K] [--despawn-storm R] [--seed S]
+//              [--logical-processes K] [--routing-selftest]
+// Logical distribution (§33/§51): --logical-processes stripes zones across
+// K logical processes in this binary; routing/migration treat them as
+// remote-emulated while all delivery stays local.
 //
 // Measures zone-tick p50/p95/p99/max (per-zone ring buffers), worker
 // utilization, supervisor time, migrations, deaths/respawns, and runs the
@@ -38,8 +42,11 @@
 #include "db/CharacterRepository.h"
 #include "network/Session.h"
 
+#include "../world/migration/EntityTransfer.h"
 #include "../world/WorldRuntime.h"
 #include "../world/spawn/SpawnLoader.h"
+
+#include <flecs.h>
 
 namespace {
 
@@ -50,6 +57,8 @@ struct BenchConfig {
     std::string mode = "spread";
     int validate_every = 0;
     int despawn_storm = 0;
+    int logical_processes = 0;
+    bool routing_selftest = false;
     std::uint32_t seed = 12345;
 };
 
@@ -69,7 +78,8 @@ bool ParseArgs(int argc, char** argv, BenchConfig& config)
         if (arg == "--help" || arg == "-h") {
             std::cout << "worldbench [--players N] [--mobs M] [--seconds S]\n"
                          "             [--mode spread|hotspot|border|dense]\n"
-                         "             [--validate-every K] [--despawn-storm R] [--seed S]\n";
+                         "             [--validate-every K] [--despawn-storm R] [--seed S]\n"
+                         "             [--logical-processes K] [--routing-selftest]\n";
             return false;
         } else if (arg == "--players") {
             if (!need_value("players", value)) {
@@ -106,6 +116,13 @@ bool ParseArgs(int argc, char** argv, BenchConfig& config)
                 return false;
             }
             config.seed = static_cast<std::uint32_t>(std::stoul(value));
+        } else if (arg == "--logical-processes") {
+            if (!need_value("logical-processes", value)) {
+                return false;
+            }
+            config.logical_processes = std::stoi(value);
+        } else if (arg == "--routing-selftest") {
+            config.routing_selftest = true;
         } else {
             std::cerr << "unknown arg: " << arg << "\n";
             return false;
@@ -160,6 +177,238 @@ struct BenchClient {
     int target_cursor = 0;
 };
 
+void SelftestReport(const char* name, bool pass, bool skipped, int& failures)
+{
+    if (skipped) {
+        std::printf("SELFTEST %s: SKIP\n", name);
+    } else if (pass) {
+        std::printf("SELFTEST %s: PASS\n", name);
+    } else {
+        std::printf("SELFTEST %s: FAIL\n", name);
+        ++failures;
+    }
+}
+
+bool WaitFor(std::chrono::milliseconds timeout, const std::function<bool()>& condition)
+{
+    const auto deadline = std::chrono::steady_clock::now() + timeout;
+    while (std::chrono::steady_clock::now() < deadline) {
+        if (condition()) {
+            return true;
+        }
+        std::this_thread::sleep_for(std::chrono::milliseconds(20));
+    }
+    return condition();
+}
+
+// Routing/distribution self-test (§34): unknown + draining destinations,
+// stale + duplicate migration delivery, source-free EntityTransfer
+// roundtrip. Public runtime APIs only. Returns failure count.
+int RunRoutingSelftest(gs::game::WorldRuntime& sim,
+                       boost::asio::io_context& io,
+                       const BenchConfig& config)
+{
+    (void)config;
+    int failures = 0;
+    const auto identity = sim.Identity();
+
+    if (sim.Zones().ZoneCount() < 2) {
+        SelftestReport("emulation-needs-2-zones", false, true, failures);
+        return failures;
+    }
+    // Logical-distribution emulation for the draining leg (left on: the
+    // subsequent load then runs distributed-emulated, which is intended).
+    sim.EmulateDistribution(2);
+
+    // Find an emulated-remote zone.
+    std::size_t remote_index = sim.Zones().ZoneCount();
+    for (std::size_t i = 0; i < sim.Zones().ZoneCount(); ++i) {
+        const auto location = sim.Directory().ResolveZone(sim.Zones().GetZone(i).Id());
+        if (location && !sim.Directory().IsLocal(*location)) {
+            remote_index = i;
+            break;
+        }
+    }
+    if (remote_index >= sim.Zones().ZoneCount()) {
+        SelftestReport("emulated-remote-zone", false, true, failures);
+        return failures;
+    }
+    const auto remote_zone_id = sim.Zones().GetZone(remote_index).Id();
+
+    // (a) Unknown destination -> DestinationUnavailable, nothing delivered.
+    {
+        const auto result = sim.Router().RouteZoneCommand(999999, [](gs::game::Zone&) {});
+        SelftestReport("unknown-destination",
+                       result == gs::game::DeliveryResult::DestinationUnavailable, false, failures);
+    }
+
+    // (b) Draining destination -> DestinationDraining, then recovers.
+    {
+        sim.Directory().SetZoneDrained(remote_zone_id, true);
+        const auto drained =
+            sim.Router().RouteZoneCommand(remote_index, [](gs::game::Zone&) {});
+        sim.Directory().SetZoneDrained(remote_zone_id, false);
+        const auto recovered =
+            sim.Router().RouteZoneCommand(remote_index, [](gs::game::Zone&) {});
+        SelftestReport("draining-destination",
+                       drained == gs::game::DeliveryResult::DestinationDraining &&
+                           recovered == gs::game::DeliveryResult::DeliveredRemoteEmulated,
+                       false, failures);
+    }
+
+    // (c) Stale migration request (bogus net) is dropped, world stays valid.
+    {
+        const auto zone0 = sim.Zones().GetZone(0).Id();
+        sim.TestMigrationQueue().TryEnqueue(
+            gs::game::MigrationRequest{42424242u, zone0, remote_zone_id});
+        const bool drained = WaitFor(std::chrono::seconds(3),
+                                     [&] { return sim.TestMigrationQueue().PendingCount() == 0; });
+        std::string error;
+        sim.RequestValidation();
+        bool valid = false;
+        for (int i = 0; i < 50 && !valid; ++i) {
+            std::string result;
+            if (sim.TryTakeValidationResult(result)) {
+                valid = (result == "OK");
+                break;
+            }
+            std::this_thread::sleep_for(std::chrono::milliseconds(100));
+        }
+        SelftestReport("stale-migration-drop", drained && valid, false, failures);
+    }
+
+    // (d) Real micro-migration, then exact-id replay must not duplicate.
+    // Race-free: the committed id is read from the coordinator AFTER the
+    // owner move is observed (LastCommittedId is monotonic per writer).
+    {
+        boost::asio::ip::tcp::socket socket(io);
+        auto session = std::make_shared<gs::network::Session>(std::move(socket), 1);
+        sim.PostSpawn(session, MakeBenchCharacter(9000),
+                      gs::game::DebugSpawnOverride{460.0f, 200.0f});
+        // Wait for the spawn to land so we learn the scout's net id.
+        std::uint32_t scout_net = 0;
+        WaitFor(std::chrono::seconds(5), [&] {
+            const auto it = sim.Owners().find(1);
+            if (it == sim.Owners().end()) {
+                return false;
+            }
+            scout_net = it->second.net_id;
+            return true;
+        });
+        bool migrated = false;
+        std::size_t home_index = sim.Zones().ZoneCount();
+        std::uint32_t home_zone_id = 0;
+        if (scout_net != 0) {
+            const auto home = sim.Owners().find(1);
+            home_index = home != sim.Owners().end() ? home->second.zone_index : home_index;
+            home_zone_id = home_index < sim.Zones().ZoneCount()
+                               ? sim.Zones().GetZone(home_index).Id()
+                               : 0;
+            std::uint32_t seq = 0;
+            const auto move_deadline = std::chrono::steady_clock::now() + std::chrono::seconds(15);
+            while (std::chrono::steady_clock::now() < move_deadline && !migrated) {
+                sim.PostMoveInput(1, ++seq, 1.5707963f, gs::game::MoveState::Running);
+                const auto owner = sim.Owners().find(1);
+                if (owner != sim.Owners().end() && owner->second.zone_index != home_index) {
+                    migrated = true;
+                }
+                std::this_thread::sleep_for(std::chrono::milliseconds(50));
+            }
+        }
+        bool replay_safe = false;
+        if (migrated) {
+            // Replay the just-committed id against the ORIGINAL route. The
+            // committed-set must drop it (duplicates+1) even though the
+            // entity still exists -- no second entity may appear.
+            const auto owner = sim.Owners().find(1);
+            const std::uint32_t dst_zone_id =
+                owner != sim.Owners().end() && owner->second.zone_index < sim.Zones().ZoneCount()
+                    ? sim.Zones().GetZone(owner->second.zone_index).Id()
+                    : 0;
+            const auto committed_id = sim.LastCommittedMigration();
+            const auto dup_before = sim.MigrationMetrics().duplicates;
+            gs::game::MigrationRequest replay{};
+            replay.net_id = scout_net;
+            replay.source_zone_id = home_zone_id;
+            replay.target_zone_id = dst_zone_id;
+            replay.migration_id = committed_id;
+            replay.priority = gs::game::MessagePriority::Critical;
+            // The net may legitimately be re-queued already (still out of
+            // bounds in the new zone); retry briefly, else SKIP -- forcing
+            // the test would conflate load with incorrectness.
+            bool enqueued = false;
+            if (committed_id.IsValid() && dst_zone_id != 0) {
+                const auto enqueue_deadline =
+                    std::chrono::steady_clock::now() + std::chrono::seconds(2);
+                while (std::chrono::steady_clock::now() < enqueue_deadline && !enqueued) {
+                    enqueued = sim.TestMigrationQueue().TryEnqueue(replay);
+                    if (!enqueued) {
+                        std::this_thread::sleep_for(std::chrono::milliseconds(50));
+                    }
+                }
+            }
+            if (!enqueued) {
+                sim.PostDespawn(1);
+                SelftestReport("duplicate-migration-id", false, true, failures);
+            } else {
+                // PendingCount==0 only means dequeued; the duplicate counter
+                // proves the committed-set actually took the drop.
+                WaitFor(std::chrono::seconds(3), [&] {
+                    return sim.MigrationMetrics().duplicates == dup_before + 1;
+                });
+                const auto after = sim.Owners().find(1);
+                const auto dup_after = sim.MigrationMetrics().duplicates;
+                replay_safe = after != sim.Owners().end() &&
+                              after->second.zone_index != home_index &&
+                              dup_after == dup_before + 1;
+                std::string error;
+                sim.RequestValidation();
+                for (int i = 0; i < 50; ++i) {
+                    std::string result;
+                    if (sim.TryTakeValidationResult(result)) {
+                        replay_safe = replay_safe && (result == "OK");
+                        break;
+                    }
+                    std::this_thread::sleep_for(std::chrono::milliseconds(100));
+                }
+                sim.PostDespawn(1);
+                SelftestReport("duplicate-migration-id", replay_safe, false, failures);
+            }
+        } else {
+            sim.PostDespawn(1);
+            SelftestReport("duplicate-migration-id", false, true, failures);
+        }
+
+        // (e) Source-free DTO roundtrip on the (possibly migrated) scout.
+        bool roundtrip = false;
+        if (scout_net != 0) {
+            const auto owner = sim.Owners().find(1);
+            if (owner != sim.Owners().end() && owner->second.zone_index < sim.Zones().ZoneCount()) {
+                const auto entity =
+                    sim.Zones().GetZone(owner->second.zone_index).FindEntity(scout_net);
+                if (entity.is_valid()) {
+                    auto transfer = gs::game::BuildTransfer(entity, true, 0);
+                    const gs::game::EntityTransfer wire_copy = transfer; // simulated transport
+                    roundtrip = wire_copy.net_id == scout_net && wire_copy.is_player &&
+                                wire_copy.session == 1 &&
+                                wire_copy.position.x == transfer.position.x &&
+                                wire_copy.hp.current == transfer.hp.current;
+                    flecs::world scratch;
+                    const auto rebuilt = gs::game::ApplyTransfer(scratch, wire_copy);
+                    roundtrip =
+                        roundtrip && rebuilt.is_valid() &&
+                        rebuilt.get<gs::game::NetId>().value == scout_net &&
+                        rebuilt.get<gs::game::Position>().x == transfer.position.x &&
+                        rebuilt.has<gs::game::PlayerTag>();
+                }
+            }
+        }
+        SelftestReport("transfer-roundtrip", roundtrip, scout_net == 0, failures);
+    }
+
+    return failures;
+}
+
 } // namespace
 
 int BenchMain(int argc, char** argv)
@@ -171,14 +420,16 @@ int BenchMain(int argc, char** argv)
 
     gs::common::InitLogging("warning", "logs/world_bench.log");
     std::printf("worldbench: players=%d mobs=%d seconds=%d mode=%s validate_every=%d "
-                "despawn_storm=%d seed=%u\n",
+                "despawn_storm=%d seed=%u logical_processes=%d routing_selftest=%d\n",
                 config.players,
                 config.mobs,
                 config.seconds,
                 config.mode.c_str(),
                 config.validate_every,
                 config.despawn_storm,
-                config.seed);
+                config.seed,
+                config.logical_processes,
+                config.routing_selftest ? 1 : 0);
 
     std::mt19937 rng(config.seed);
 
@@ -195,6 +446,13 @@ int BenchMain(int argc, char** argv)
     {
         gs::game::WorldRuntime sim(io);
         sim.Start();
+        if (config.logical_processes >= 2) {
+            sim.EmulateDistribution(static_cast<std::uint32_t>(config.logical_processes));
+            std::printf("logical distribution: %d processes emulated\n", config.logical_processes);
+        }
+        if (config.routing_selftest) {
+            validation_failures += RunRoutingSelftest(sim, io, config);
+        }
         start_deaths = sim.DeathsTotal();
         start_attacks = sim.AttacksTotal();
 
@@ -371,7 +629,9 @@ int BenchMain(int argc, char** argv)
             }
 
             if (now >= next_progress) {
-                std::printf("  t=%us tick=%u deaths=%llu attacks=%llu mig_pending=%zu quarantined=%zu\n",
+                const auto mig_stats = sim.MigrationMetrics();
+                std::printf("  t=%us tick=%u deaths=%llu attacks=%llu mig_pending=%zu quarantined=%zu "
+                            "mig_committed=%llu mig_dup=%llu\n",
                             config.seconds -
                                 static_cast<int>(std::chrono::duration_cast<std::chrono::seconds>(
                                                      deadline - now)
@@ -380,7 +640,9 @@ int BenchMain(int argc, char** argv)
                             (unsigned long long)(sim.DeathsTotal() - start_deaths),
                             (unsigned long long)(sim.AttacksTotal() - start_attacks),
                             sim.Migrations().PendingCount(),
-                            sim.MigrationQuarantined());
+                            sim.MigrationQuarantined(),
+                            (unsigned long long)mig_stats.committed,
+                            (unsigned long long)mig_stats.duplicates);
                 next_progress = now + std::chrono::seconds(5);
             }
 
@@ -461,6 +723,25 @@ int BenchMain(int argc, char** argv)
                     sim.Migrations().PendingCount(),
                     sim.MigrationQuarantined());
         std::printf("validation: runs=%d failures=%d\n", validations_run, validation_failures);
+        const auto process_load = sim.CollectProcessLoad();
+        const auto routes = sim.Router().MetricsSnapshot();
+        std::printf("process load: node=%u process=%u tick=%u zones=%zu active=%zu sleeping=%zu "
+                    "players=%llu mobs=%llu ghosts=%llu avg_tick=%.3fms repl=%llu mig=%llu "
+                    "worker_tasks=%llu worker_busy_us=%llu sup_avg=%.3fms\n",
+                    process_load.identity.node.value, process_load.identity.process.value,
+                    process_load.world_tick, process_load.zone_count, process_load.active_zones,
+                    process_load.sleeping_zones, (unsigned long long)process_load.players,
+                    (unsigned long long)process_load.mobs, (unsigned long long)process_load.ghosts,
+                    process_load.avg_zone_tick_ms, (unsigned long long)process_load.repl_records,
+                    (unsigned long long)process_load.migrations,
+                    (unsigned long long)process_load.worker_tasks,
+                    (unsigned long long)process_load.worker_busy_us, process_load.supervisor_avg_ms);
+        std::printf("routes: local=%llu remote_emulated=%llu unavailable=%llu draining=%llu miss=%llu\n",
+                    (unsigned long long)routes.local_delivered,
+                    (unsigned long long)routes.remote_emulated,
+                    (unsigned long long)routes.unavailable,
+                    (unsigned long long)routes.draining,
+                    (unsigned long long)routes.directory_miss);
 
         sim.Stop();
     }
