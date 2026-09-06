@@ -76,4 +76,12 @@ bool ZoneManager::AnyTickInProgress() const
     return false;
 }
 
+void ZoneManager::PostCommand(std::size_t zone_index, ZoneCommandQueue::Command command)
+{
+    if (zone_index >= zones_.size()) {
+        return;
+    }
+    zones_[zone_index]->Commands().Push(std::move(command));
+}
+
 } // namespace gs::game

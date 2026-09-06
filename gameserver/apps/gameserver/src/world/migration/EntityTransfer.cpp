@@ -1,5 +1,7 @@
 #include "EntityTransfer.h"
 
+#include <cassert>
+
 #include "../components/Tags.h"
 
 namespace gs::game {
@@ -30,6 +32,9 @@ EntityTransfer BuildTransfer(flecs::entity entity, bool is_player)
 
 flecs::entity ApplyTransfer(flecs::world& world, const EntityTransfer& transfer)
 {
+    // A transfer without a global identity must never become an entity:
+    // NetId is the only cross-zone identity, and it is never zero.
+    assert(transfer.net_id != 0);
     auto entity = world.entity()
                       .set<Position>(transfer.position)
                       .set<Heading>(transfer.heading)

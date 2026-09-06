@@ -1,6 +1,12 @@
 #include "Zone.h"
 
+#include <cassert>
+#include <exception>
+
+#include "common/Logging.h"
+
 #include "ZoneOwnership.h"
+#include "../spatial/AoiSystem.h"
 #include "../systems/AiSystem.h"
 #include "../systems/CooldownSystem.h"
 #include "../systems/MovementSystem.h"
@@ -36,6 +42,9 @@ flecs::entity Zone::FindEntity(std::uint32_t net_id) const
 
 void Zone::IndexEntity(std::uint32_t net_id, flecs::entity entity)
 {
+    // A live NetId must never be indexed twice: that would orphan the
+    // previous handle and fork authority. Debug-checked; zero Release cost.
+    assert(!HasEntity(net_id));
     entities_[net_id] = entity;
 }
 
@@ -66,6 +75,7 @@ Zone::PlayerBinding* Zone::FindPlayerBySession(gs::common::SessionId session_id)
 
 void Zone::InsertPlayerBinding(std::uint32_t net_id, PlayerBinding binding)
 {
+    assert(players_.find(net_id) == players_.end());
     const auto session_id = binding.session ? binding.session->Id() : 0;
     if (session_id != 0) {
         net_by_session_[session_id] = net_id;
@@ -151,13 +161,26 @@ void Zone::DrainCommands()
     while (!commands.empty()) {
         auto command = std::move(commands.front());
         commands.pop();
-        command(*this);
+        // A failing command must not kill the tick or wedge the zone: log
+        // and continue with the rest. (Previously an exception here escaped
+        // Tick and left tick_in_progress stuck.)
+        try {
+            command(*this);
+        } catch (const std::exception& error) {
+            LOG_ERROR("Zone {} ('{}') command failed: {}", id_, name_, error.what());
+        } catch (...) {
+            LOG_ERROR("Zone {} ('{}') command failed with unknown exception", id_, name_);
+        }
     }
 }
 
 void Zone::Tick(float dt, ZoneTickContext& ctx)
 {
-    {
+    const auto tick_start = std::chrono::steady_clock::now();
+    // The flag is cleared on EVERY exit path below: a tick must never get
+    // stuck "in progress", or the supervisor's migration/respawn/shutdown
+    // waits would hang forever.
+    try {
         ZoneWriteGuard guard(*this, "Zone::Tick");
         DrainCommands();
         CooldownSystem::Step(*this, dt);
@@ -176,13 +199,25 @@ void Zone::Tick(float dt, ZoneTickContext& ctx)
         } else {
             GhostSystem::Rebuild(*this, ctx.zones);
 
+            // Spatial is its own stage: rebuild the index here so the
+            // replication pipeline below only consumes it.
+            AoiSystem::RebuildIndex(*this);
             const auto records = ReplicationSystem::BroadcastTransforms(*this, ctx.send);
             diagnostics_.transform_records_since_diag.fetch_add(records, std::memory_order_relaxed);
         }
         diagnostics_.ticks_since_diag.fetch_add(1, std::memory_order_relaxed);
         ++zone_tick_;
         RefreshResidentCounts();
+    } catch (const std::exception& error) {
+        LOG_ERROR("Zone {} ('{}') tick failed: {}", id_, name_, error.what());
+    } catch (...) {
+        LOG_ERROR("Zone {} ('{}') tick failed with unknown exception", id_, name_);
     }
+    const auto tick_micros = std::chrono::duration_cast<std::chrono::microseconds>(
+                                 std::chrono::steady_clock::now() - tick_start)
+                                 .count();
+    diagnostics_.tick_micros_since_diag.fetch_add(static_cast<std::uint64_t>(tick_micros),
+                                                  std::memory_order_relaxed);
     tick_in_progress_.store(false, std::memory_order_release);
 }
 

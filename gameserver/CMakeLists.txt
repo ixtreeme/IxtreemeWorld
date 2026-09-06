@@ -74,6 +74,20 @@ else()
     add_compile_options(-Wall -Wextra -Wpedantic)
 endif()
 
+# Dev-only sanitizer instrumentation. OFF by default; production builds are
+# unaffected. MSVC supports AddressSanitizer (/fsanitize=address, VS2019
+# 16.9+). ThreadSanitizer and UBSan are NOT available on MSVC -- use
+# clang/gcc builds on other platforms for those.
+if(ENABLE_ASAN)
+    if(MSVC)
+        add_compile_options(/fsanitize=address)
+        add_link_options(/fsanitize=address)
+    else()
+        add_compile_options(-fsanitize=address -fno-omit-frame-pointer)
+        add_link_options(-fsanitize=address)
+    endif()
+endif()
+
 include(cmake/BootstrapVcpkg.cmake)
 
 vcpkg_require(

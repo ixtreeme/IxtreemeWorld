@@ -28,10 +28,13 @@ add_executable(gameserver
     src/world/visibility/GhostSystem.cpp
     src/world/visibility/VisibilitySystem.cpp
     src/world/migration/EntityTransfer.cpp
+    src/world/migration/MigrationCoordinator.cpp
     src/world/migration/MigrationSystem.cpp
+    src/world/input/InputRouter.cpp
     src/world/terrain/TerrainService.cpp
     src/world/spawn/MobPrototypeRegistry.cpp
     src/world/spawn/RespawnSystem.cpp
+    src/world/spawn/SpawnCoordinator.cpp
     src/world/spawn/SpawnLoader.cpp
     src/world/spawn/SpawnSystem.cpp
     src/world/replication/ProtocolEncoder.cpp
@@ -59,6 +62,7 @@ target_compile_definitions(gameserver
         $<$<CONFIG:Release>:MMO_DEBUG_SPAWN_OVERRIDE=0>
         $<$<CONFIG:MinSizeRel>:MMO_DEBUG_SPAWN_OVERRIDE=0>
 )
+
 
 configure_file(
     ${CMAKE_CURRENT_SOURCE_DIR}/config/gameserver.conf.example

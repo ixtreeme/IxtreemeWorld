@@ -38,6 +38,10 @@ public:
     const std::vector<std::size_t>& NeighborsOf(std::size_t zone_index) const;
     bool AnyTickInProgress() const;
 
+    // Pushes a command into a zone's inbound queue (oob-safe no-op).
+    // Waking the supervisor/scheduler after the push is the caller's job.
+    void PostCommand(std::size_t zone_index, ZoneCommandQueue::Command command);
+
     ZoneGraph& Graph() noexcept
     {
         return graph_;

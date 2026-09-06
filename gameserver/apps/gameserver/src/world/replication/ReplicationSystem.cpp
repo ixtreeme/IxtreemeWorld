@@ -9,6 +9,9 @@
 
 namespace gs::game {
 
+// Pipeline: AOI candidates -> visibility reconcile -> encode -> send.
+// The spatial index is rebuilt by the caller (Zone::Tick) beforehand, so
+// this stage only consumes it; wire encoding lives in ProtocolEncoder.
 std::size_t ReplicationSystem::BroadcastTransforms(Zone& zone, const SendFn& send)
 {
     AssertZoneOwner(zone, "zone outgoing snapshot build");
@@ -16,8 +19,6 @@ std::size_t ReplicationSystem::BroadcastTransforms(Zone& zone, const SendFn& sen
     if (zone.Players().empty()) {
         return 0;
     }
-
-    AoiSystem::RebuildIndex(zone);
 
     std::size_t transform_records_sent = 0;
     for (const auto& [viewer_net_id, binding] : zone.Players()) {
@@ -32,6 +33,7 @@ std::size_t ReplicationSystem::BroadcastTransforms(Zone& zone, const SendFn& sen
         const auto viewer_position = viewer_entity.get<Position>();
 
         const auto candidates = AoiSystem::QueryCandidates(zone, viewer_net_id, viewer_position);
+        zone.Diagnostics().aoi_queries_since_diag.fetch_add(1, std::memory_order_relaxed);
         auto visible_snapshots = VisibilitySystem::ReconcileViewer(zone, viewer_net_id, candidates, send);
 
         const auto viewer_snapshot = BuildPlayerSnapshot(zone, viewer_entity);
