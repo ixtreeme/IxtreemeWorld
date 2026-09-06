@@ -44,6 +44,7 @@ void SpawnSystem::SpawnPlayer(Zone& zone,
     binding.character = std::move(character);
     zone.InsertPlayerBinding(net_id, std::move(binding));
     zone.IndexEntity(net_id, entity);
+    zone.Grid().Insert(net_id, position);
     zone.RefreshResidentCounts();
 }
 
@@ -85,6 +86,7 @@ void SpawnSystem::SpawnMob(Zone& zone,
                       .add<MobTag>();
 
     zone.IndexEntity(net_id, entity);
+    zone.Grid().Insert(net_id, position);
     zone.RefreshResidentCounts();
 
     LOG_INFO("mob spawned: net_id={} type={} spawn_point={} zone={} pos=({}, {}, {})",

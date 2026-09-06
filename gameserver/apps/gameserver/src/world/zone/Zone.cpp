@@ -6,7 +6,6 @@
 #include "common/Logging.h"
 
 #include "ZoneOwnership.h"
-#include "../spatial/AoiSystem.h"
 #include "../systems/AiSystem.h"
 #include "../systems/CooldownSystem.h"
 #include "../systems/MovementSystem.h"
@@ -176,34 +175,55 @@ void Zone::DrainCommands()
 
 void Zone::Tick(float dt, ZoneTickContext& ctx)
 {
-    const auto tick_start = std::chrono::steady_clock::now();
+    using Clock = std::chrono::steady_clock;
+    const auto tick_start = Clock::now();
     // The flag is cleared on EVERY exit path below: a tick must never get
     // stuck "in progress", or the supervisor's migration/respawn/shutdown
     // waits would hang forever.
     try {
         ZoneWriteGuard guard(*this, "Zone::Tick");
         DrainCommands();
+
+        const auto gameplay_start = Clock::now();
         CooldownSystem::Step(*this, dt);
         AiSystem::StepWander(*this, dt, ctx.mob_types);
         MovementSystem::Step(*this, dt, ctx);
         AssertZoneOwner(*this, "flecs world progress");
         world_.progress(dt);
+        diagnostics_.gameplay_micros_since_diag.fetch_add(
+            static_cast<std::uint64_t>(
+                std::chrono::duration_cast<std::chrono::microseconds>(Clock::now() - gameplay_start)
+                    .count()),
+            std::memory_order_relaxed);
 
         // The supervisor sync gap before the next worker tick: this worker
-        // only marks MigrateTo; the supervisor performs ownership transfer.
-        // Publish this zone's border residents, then rebuild read-only ghosts
-        // from the previous tick buffers of neighboring zones.
+        // only marks MigrateTo (and enqueues migration events); the
+        // supervisor performs ownership transfer. Publish this zone's border
+        // residents, then rebuild read-only ghosts from the previous tick
+        // buffers of neighboring zones. The spatial index is maintained
+        // incrementally by the systems above, so no rebuild happens here.
+        const auto ghost_start = Clock::now();
         BorderPublisher::Publish(*this);
         if (players_.empty()) {
             GhostSystem::Clear(*this);
         } else {
             GhostSystem::Rebuild(*this, ctx.zones);
+        }
+        diagnostics_.ghost_micros_since_diag.fetch_add(
+            static_cast<std::uint64_t>(
+                std::chrono::duration_cast<std::chrono::microseconds>(Clock::now() - ghost_start)
+                    .count()),
+            std::memory_order_relaxed);
 
-            // Spatial is its own stage: rebuild the index here so the
-            // replication pipeline below only consumes it.
-            AoiSystem::RebuildIndex(*this);
+        if (!players_.empty()) {
+            const auto repl_start = Clock::now();
             const auto records = ReplicationSystem::BroadcastTransforms(*this, ctx.send);
             diagnostics_.transform_records_since_diag.fetch_add(records, std::memory_order_relaxed);
+            diagnostics_.replication_micros_since_diag.fetch_add(
+                static_cast<std::uint64_t>(
+                    std::chrono::duration_cast<std::chrono::microseconds>(Clock::now() - repl_start)
+                        .count()),
+                std::memory_order_relaxed);
         }
         diagnostics_.ticks_since_diag.fetch_add(1, std::memory_order_relaxed);
         ++zone_tick_;
@@ -213,11 +233,10 @@ void Zone::Tick(float dt, ZoneTickContext& ctx)
     } catch (...) {
         LOG_ERROR("Zone {} ('{}') tick failed with unknown exception", id_, name_);
     }
-    const auto tick_micros = std::chrono::duration_cast<std::chrono::microseconds>(
-                                 std::chrono::steady_clock::now() - tick_start)
-                                 .count();
-    diagnostics_.tick_micros_since_diag.fetch_add(static_cast<std::uint64_t>(tick_micros),
-                                                  std::memory_order_relaxed);
+    const auto tick_micros = static_cast<std::uint64_t>(
+        std::chrono::duration_cast<std::chrono::microseconds>(Clock::now() - tick_start).count());
+    diagnostics_.tick_micros_since_diag.fetch_add(tick_micros, std::memory_order_relaxed);
+    diagnostics_.RecordTickSample(tick_micros);
     tick_in_progress_.store(false, std::memory_order_release);
 }
 

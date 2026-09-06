@@ -26,16 +26,12 @@ CombatSystem::AttackResult CombatSystem::ProcessAttack(Zone& zone,
 {
     AssertZoneOwner(zone, "zone combat command");
 
-    std::uint32_t attacker_net_id = 0;
-    for (const auto& [net_id, binding] : zone.Players()) {
-        if (binding.session && binding.session->Id() == attacker_session_id) {
-            attacker_net_id = net_id;
-            break;
-        }
-    }
-    if (attacker_net_id == 0) {
+    // O(1) session -> net lookup via the zone's reverse index.
+    const auto attacker_net = zone.NetIdForSession(attacker_session_id);
+    if (!attacker_net) {
         return {};
     }
+    const std::uint32_t attacker_net_id = *attacker_net;
 
     if (target_net_id == 0 || target_net_id == attacker_net_id) {
         return {};
@@ -134,6 +130,7 @@ CombatSystem::AttackResult CombatSystem::ProcessAttack(Zone& zone,
     ctx.respawn_later(spawn_point_index, respawn_time);
 
     GhostSystem::RemoveByNetId(zone, target_net_id);
+    zone.Grid().Remove(target_net_id, target_position);
     if (target_entity.is_valid()) {
         target_entity.destruct();
     }

@@ -11,33 +11,54 @@
 #include "../components/Tags.h"
 #include "../zone/Zone.h"
 #include "../zone/ZoneOwnership.h"
+#include "SpatialGrid.h"
 
 namespace gs::game {
+namespace {
 
-void AoiSystem::RebuildIndex(Zone& zone)
+// Scratch buffers reused across queries on the same worker thread: the pool
+// threads are long-lived, so thread_locals eliminate per-viewer heap churn
+// without any locking. Zone-local work never migrates threads mid-tick.
+thread_local std::vector<std::pair<float, std::uint32_t>> t_candidates;
+thread_local std::vector<std::uint32_t> t_results;
+
+const Position* FindGhostPosition(const GhostPositionCache& ghosts, std::uint32_t net_id)
+{
+    // Ghost sets are small (border-band residents of neighbors); a sorted
+    // vector with binary search beats a per-query hash map build.
+    std::size_t lo = 0;
+    std::size_t hi = ghosts.size();
+    while (lo < hi) {
+        const std::size_t mid = lo + (hi - lo) / 2;
+        if (ghosts[mid].first < net_id) {
+            lo = mid + 1;
+        } else if (ghosts[mid].first > net_id) {
+            hi = mid;
+        } else {
+            return &ghosts[mid].second;
+        }
+    }
+    return nullptr;
+}
+
+} // namespace
+
+void AoiSystem::RebuildInto(Zone& zone, SpatialGrid& grid)
 {
     AssertZoneOwner(zone, "zone spatial grid rebuild");
 
-    auto& grid = zone.Grid();
     grid.Clear();
 
-    for (const auto& [net_id, binding] : zone.Players()) {
-        const auto entity = zone.FindEntity(net_id);
-        if (!entity.is_valid()) {
-            continue;
-        }
-        grid.Insert(net_id, entity.get<Position>());
-    }
-    // Ghosts with MobTag also match the query below, but they are indexed
-    // separately afterwards; skipping them here keeps every net_id in the
-    // grid exactly once (as before).
+    // Ship-ready: every authoritative resident with an identity and a
+    // position is indexed, regardless of entity kind (player/mob/ship/...).
+    // Ghosts are indexed separately below so each net appears exactly once.
     std::unordered_set<std::uint32_t> ghost_nets;
     ghost_nets.reserve(zone.Ghosts().size());
     for (const auto& ghost : zone.Ghosts()) {
         ghost_nets.insert(ghost.snapshot.net_id);
     }
-    zone.World().query<const MobTag, const NetId, const Position>().each(
-        [&](const MobTag&, const NetId& id, const Position& pos) {
+    zone.World().query<const NetId, const Position>().each(
+        [&](const NetId& id, const Position& pos) {
             if (ghost_nets.contains(id.value)) {
                 return;
             }
@@ -48,41 +69,44 @@ void AoiSystem::RebuildIndex(Zone& zone)
     }
 }
 
+GhostPositionCache AoiSystem::BuildGhostCache(const Zone& zone)
+{
+    GhostPositionCache cache;
+    cache.reserve(zone.Ghosts().size());
+    for (const auto& ghost : zone.Ghosts()) {
+        cache.emplace_back(ghost.snapshot.net_id, ghost.snapshot.position);
+    }
+    std::sort(cache.begin(), cache.end(), [](const auto& lhs, const auto& rhs) {
+        return lhs.first < rhs.first;
+    });
+    return cache;
+}
+
 std::vector<std::uint32_t> AoiSystem::QueryCandidates(Zone& zone,
                                                       std::uint32_t viewer_net_id,
-                                                      const Position& viewer_position)
+                                                      const Position& viewer_position,
+                                                      const GhostPositionCache& ghosts)
 {
     AssertZoneOwner(zone, "zone AOI query");
 
-    struct Candidate {
-        float distance_sq = std::numeric_limits<float>::max();
-        std::uint32_t net_id = 0;
-    };
+    auto& candidates = t_candidates;
+    candidates.clear();
 
-    // Ghost positions by net_id for index-time resolution.
-    std::unordered_map<std::uint32_t, Position> ghost_positions;
-    ghost_positions.reserve(zone.Ghosts().size());
-    for (const auto& ghost : zone.Ghosts()) {
-        ghost_positions[ghost.snapshot.net_id] = ghost.snapshot.position;
-    }
-
-    std::vector<Candidate> candidates;
     zone.Grid().ForEachInRadius(viewer_position, kAoiRadiusMeters, [&](std::uint32_t net_id) {
         if (net_id == 0 || net_id == viewer_net_id) {
             return;
         }
 
-        std::optional<Position> candidate_position;
+        const Position* candidate_position = nullptr;
+        Position resident_position;
         const auto entity = zone.FindEntity(net_id);
         if (entity.is_valid()) {
-            candidate_position = entity.get<Position>();
+            resident_position = entity.get<Position>();
+            candidate_position = &resident_position;
         } else {
-            const auto ghost_it = ghost_positions.find(net_id);
-            if (ghost_it != ghost_positions.end()) {
-                candidate_position = ghost_it->second;
-            }
+            candidate_position = FindGhostPosition(ghosts, net_id);
         }
-        if (!candidate_position) {
+        if (candidate_position == nullptr) {
             return;
         }
 
@@ -90,21 +114,22 @@ std::vector<std::uint32_t> AoiSystem::QueryCandidates(Zone& zone,
         const float dy = candidate_position->y - viewer_position.y;
         const float distance_sq = dx * dx + dy * dy;
         if (distance_sq <= kAoiRadiusSqMeters) {
-            candidates.push_back(Candidate{distance_sq, net_id});
+            candidates.emplace_back(distance_sq, net_id);
         }
     });
 
-    std::sort(candidates.begin(), candidates.end(), [](const Candidate& lhs, const Candidate& rhs) {
-        return lhs.distance_sq < rhs.distance_sq;
+    std::sort(candidates.begin(), candidates.end(), [](const auto& lhs, const auto& rhs) {
+        return lhs.first < rhs.first;
     });
     if (candidates.size() > kAoiEntityCap) {
         candidates.resize(kAoiEntityCap);
     }
 
-    std::vector<std::uint32_t> refs;
+    auto& refs = t_results;
+    refs.clear();
     refs.reserve(candidates.size());
     for (const auto& candidate : candidates) {
-        refs.push_back(candidate.net_id);
+        refs.push_back(candidate.second);
     }
     return refs;
 }

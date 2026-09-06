@@ -28,6 +28,12 @@ public:
         return commands_.empty();
     }
 
+    std::size_t Depth() const
+    {
+        std::lock_guard lock(mutex_);
+        return commands_.size();
+    }
+
     std::queue<Command> TakeAll()
     {
         std::lock_guard lock(mutex_);

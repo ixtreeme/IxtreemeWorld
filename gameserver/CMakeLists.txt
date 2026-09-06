@@ -1,6 +1,7 @@
 cmake_minimum_required(VERSION 3.21)
 
 option(ENABLE_ASAN "Enable AddressSanitizer" OFF)
+option(ENABLE_WORLDBENCH "Build the world load benchmark (dev only, never production)" OFF)
 
 set(VCPKG_TRIPLET_TYPE "static" CACHE STRING "Choose vcpkg triplet type (static/dynamic)")
 set_property(CACHE VCPKG_TRIPLET_TYPE PROPERTY STRINGS static dynamic)

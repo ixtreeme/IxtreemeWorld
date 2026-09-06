@@ -1,7 +1,9 @@
 #pragma once
 
+#include <atomic>
 #include <condition_variable>
 #include <cstddef>
+#include <cstdint>
 #include <functional>
 #include <mutex>
 #include <queue>
@@ -32,12 +34,24 @@ public:
         return workers_.size();
     }
 
+    struct Utilization {
+        std::uint64_t tasks_completed = 0;
+        std::uint64_t busy_micros = 0;
+    };
+    Utilization GetUtilization() const noexcept
+    {
+        return Utilization{tasks_completed_.load(std::memory_order_relaxed),
+                           busy_micros_.load(std::memory_order_relaxed)};
+    }
+
 private:
     void WorkerLoop();
 
     TickFn tick_;
     std::vector<std::thread> workers_;
     std::atomic<bool> stopping_{false};
+    std::atomic<std::uint64_t> tasks_completed_{0};
+    std::atomic<std::uint64_t> busy_micros_{0};
     std::mutex mutex_;
     std::condition_variable cv_;
     std::queue<std::size_t> tasks_;

@@ -50,8 +50,11 @@ SpawnCoordinator::SpawnCoordinator(boost::asio::io_context& io,
 void SpawnCoordinator::Initialize(const std::string& map_root, const std::string& mob_types_config)
 {
     mob_types_.LoadFromFile(mob_types_config);
-    spawn_points_ =
-        SpawnLoader::LoadFromFile((std::filesystem::path(map_root) / "mob_spawns.conf").string());
+    {
+        std::lock_guard lock(spawn_points_mutex_);
+        spawn_points_ =
+            SpawnLoader::LoadFromFile((std::filesystem::path(map_root) / "mob_spawns.conf").string());
+    }
     SpawnConfiguredMobs();
 }
 
@@ -116,22 +119,19 @@ void SpawnCoordinator::Despawn(gs::common::SessionId session_id)
 
     post_zone_(zone_index, [this, session_id, net_id](Zone& zone) {
         AssertZoneOwner(zone, "zone despawn command");
-        std::uint32_t found_net = 0;
-        for (const auto& [candidate_net, binding] : zone.Players()) {
-            if (binding.session && binding.session->Id() == session_id) {
-                found_net = candidate_net;
-                break;
-            }
-        }
-        if (found_net == 0) {
+        // O(1) session -> net lookup via the zone's reverse index.
+        const auto found = zone.NetIdForSession(session_id);
+        if (!found) {
             return;
         }
+        const std::uint32_t found_net = *found;
 
         // Authoritative entity leaves exactly one index: the zone's. The
         // global owner record was already erased above, so no stale routing
         // can reach it after this point.
         const auto entity = zone.FindEntity(found_net);
         if (entity.is_valid()) {
+            zone.Grid().Remove(found_net, entity.get<Position>());
             entity.destruct();
         }
         zone.UnindexEntity(found_net);
@@ -149,13 +149,23 @@ void SpawnCoordinator::Despawn(gs::common::SessionId session_id)
     });
 }
 
+void SpawnCoordinator::AddSpawnPoint(const MobSpawnPoint& point)
+{
+    std::lock_guard lock(spawn_points_mutex_);
+    spawn_points_.push_back(point);
+}
+
 bool SpawnCoordinator::SpawnMobFromSpawnPoint(std::size_t spawn_point_index)
 {
-    if (spawn_point_index >= spawn_points_.size()) {
-        return false;
+    MobSpawnPoint spawn;
+    {
+        std::lock_guard lock(spawn_points_mutex_);
+        if (spawn_point_index >= spawn_points_.size()) {
+            return false;
+        }
+        spawn = spawn_points_[spawn_point_index];
     }
 
-    const auto& spawn = spawn_points_[spawn_point_index];
     const auto* type = mob_types_.Find(spawn.mob_type_id);
     if (type == nullptr) {
         LOG_WARN("Skipping mob spawn: unknown mob_type_id={}", spawn.mob_type_id);
@@ -274,17 +284,23 @@ bool SpawnCoordinator::IsValidDebugSpawnOverride(const DebugSpawnOverride& debug
 
 void SpawnCoordinator::SpawnConfiguredMobs()
 {
-    if (mob_types_.Empty() || spawn_points_.empty() || zones_.ZoneCount() == 0) {
+    std::vector<std::pair<MobSpawnPoint, std::size_t>> points;
+    {
+        std::lock_guard lock(spawn_points_mutex_);
+        for (std::size_t i = 0; i < spawn_points_.size(); ++i) {
+            points.emplace_back(spawn_points_[i], i);
+        }
+    }
+    if (mob_types_.Empty() || points.empty() || zones_.ZoneCount() == 0) {
         LOG_INFO("Mob spawn skipped: types={} spawn_points={} zones={}",
                  mob_types_.Size(),
-                 spawn_points_.size(),
+                 points.size(),
                  zones_.ZoneCount());
         return;
     }
 
     std::uint32_t total = 0;
-    for (std::size_t spawn_index = 0; spawn_index < spawn_points_.size(); ++spawn_index) {
-        const auto& spawn = spawn_points_[spawn_index];
+    for (const auto& [spawn, spawn_index] : points) {
         for (std::uint32_t i = 0; i < spawn.count; ++i) {
             if (SpawnMobFromSpawnPoint(spawn_index)) {
                 ++total;

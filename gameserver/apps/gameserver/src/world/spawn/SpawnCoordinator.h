@@ -4,6 +4,7 @@
 #include <cstdint>
 #include <functional>
 #include <memory>
+#include <mutex>
 #include <optional>
 #include <string>
 #include <vector>
@@ -63,6 +64,9 @@ public:
     void Despawn(gs::common::SessionId session_id);
 
     bool SpawnMobFromSpawnPoint(std::size_t spawn_point_index);
+    // Thread-safe: appends a spawn point usable by later spawns/respawns.
+    // Also serves future runtime (GM) spawn control, not just benchmarks.
+    void AddSpawnPoint(const MobSpawnPoint& point);
     void ProcessRespawns(float dt);
     void ScheduleRespawn(std::size_t spawn_point_index, float delay_sec)
     {
@@ -102,6 +106,7 @@ private:
     SendFn send_;
 
     MobPrototypeRegistry mob_types_;
+    mutable std::mutex spawn_points_mutex_;
     std::vector<MobSpawnPoint> spawn_points_;
     RespawnSystem respawns_;
     NetIdAllocator net_ids_;

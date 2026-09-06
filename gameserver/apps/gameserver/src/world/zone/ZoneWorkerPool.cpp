@@ -1,6 +1,7 @@
 #include "ZoneWorkerPool.h"
 
 #include <algorithm>
+#include <chrono>
 
 namespace gs::game {
 
@@ -68,7 +69,14 @@ void ZoneWorkerPool::WorkerLoop()
             tasks_.pop();
         }
 
+        const auto task_start = std::chrono::steady_clock::now();
         tick_(zone_index);
+        const auto task_micros = static_cast<std::uint64_t>(
+            std::chrono::duration_cast<std::chrono::microseconds>(std::chrono::steady_clock::now() -
+                                                                 task_start)
+                .count());
+        tasks_completed_.fetch_add(1, std::memory_order_relaxed);
+        busy_micros_.fetch_add(task_micros, std::memory_order_relaxed);
     }
 }
 

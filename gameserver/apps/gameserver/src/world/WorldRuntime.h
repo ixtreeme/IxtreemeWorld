@@ -8,6 +8,7 @@
 #include <mutex>
 #include <optional>
 #include <queue>
+#include <string>
 #include <thread>
 
 #include <boost/asio/io_context.hpp>
@@ -18,14 +19,15 @@
 
 #include "components/MovementComponents.h"
 #include "OwnerMap.h"
+#include "debug/WorldValidator.h"
 #include "input/InputRouter.h"
 #include "migration/MigrationCoordinator.h"
+#include "migration/MigrationQueue.h"
 #include "spawn/SpawnCoordinator.h"
 #include "terrain/TerrainService.h"
 #include "zone/ZoneManager.h"
 #include "zone/ZoneScheduler.h"
 #include "zone/ZoneWorkerPool.h"
-#include "OwnerMap.h"
 
 // Thin world orchestrator. Owns ONLY:
 //  - startup/shutdown, supervisor thread, global command routing
@@ -59,6 +61,52 @@ public:
                        MoveState state);
     void PostAttackTarget(gs::common::SessionId session_id, std::uint32_t target_net_id);
 
+    // Runtime spawn control (benchmarks/GM tooling). Thread-safe; the actual
+    // spawn executes supervisor-side like a respawn.
+    void AddMobSpawnPoint(const MobSpawnPoint& point);
+    void RequestMobSpawn(std::size_t spawn_point_index);
+
+    // Read-only observability for benchmarks/admin (no gameplay writes).
+    const ZoneManager& Zones() const noexcept
+    {
+        return zones_;
+    }
+    const OwnerMap& Owners() const noexcept
+    {
+        return owners_by_session_;
+    }
+    const MigrationQueue& Migrations() const noexcept
+    {
+        return migration_queue_;
+    }
+    std::uint64_t DeathsTotal() const noexcept
+    {
+        return deaths_total_.load(std::memory_order_relaxed);
+    }
+    std::uint64_t AttacksTotal() const noexcept
+    {
+        return attacks_total_.load(std::memory_order_relaxed);
+    }
+    std::uint32_t WorldTick() const noexcept
+    {
+        return world_tick_.load(std::memory_order_relaxed);
+    }
+
+    // Debug/test consistency audit. Never called on the hot path. Non-const
+    // because the audit walks live zone state; the caller must quiesce ticks.
+    bool ValidateConsistency(std::string& out_error);
+
+    // Operational audit hook for benchmarks/admin tooling. RequestValidation
+    // asks the supervisor loop to run the consistency audit in its naturally
+    // quiescent window (no zone tick in progress, before new ones are
+    // scheduled); TryTakeValidationResult collects the outcome. Zero hot-path
+    // cost when unused.
+    void RequestValidation();
+    bool TryTakeValidationResult(std::string& out_result);
+    double SupervisorAvgMs() const;
+    ZoneWorkerPool::Utilization WorkerUtilization() const;
+    std::size_t MigrationQuarantined() const;
+
 private:
     void Enqueue(std::function<void()> command);
     void Run();
@@ -82,14 +130,24 @@ private:
     TerrainService terrain_;
     mx::map::WorldLogic world_logic_;
     OwnerMap owners_by_session_;
+    MigrationQueue migration_queue_;
 
     SpawnCoordinator spawn_;
     MigrationCoordinator migration_;
     InputRouter inputs_;
 
     std::atomic<std::uint64_t> attacks_since_diag_{0};
+    std::atomic<std::uint64_t> attacks_total_{0};
     std::atomic<std::uint64_t> deaths_total_{0};
     std::atomic<std::uint32_t> world_tick_{0};
+    std::uint64_t supervisor_micros_since_diag_ = 0;
+    std::atomic<std::uint64_t> supervisor_micros_total_{0};
+    std::atomic<std::uint64_t> supervisor_samples_{0};
+
+    std::atomic<bool> validation_requested_{false};
+    mutable std::mutex validation_mutex_;
+    std::string validation_result_;
+    bool validation_ready_ = false;
 };
 
 } // namespace gs::game

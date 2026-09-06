@@ -53,6 +53,7 @@ void GhostSystem::Rebuild(Zone& zone, ZoneManager& zones)
             if (snapshot.mob_type_id != 0) {
                 entity.set<MobTypeRef>({snapshot.mob_type_id}).add<MobTag>();
             }
+            zone.Grid().Insert(snapshot.net_id, snapshot.position);
             zone.Ghosts().push_back(GhostRecord{entity, snapshot});
         }
     }
@@ -65,6 +66,7 @@ void GhostSystem::Clear(Zone& zone)
     AssertZoneOwner(zone, "zone ghost clear");
 
     for (auto& ghost : zone.Ghosts()) {
+        zone.Grid().Remove(ghost.snapshot.net_id, ghost.snapshot.position);
         if (ghost.entity.is_valid()) {
             ghost.entity.destruct();
         }
@@ -85,6 +87,7 @@ void GhostSystem::RemoveByNetId(Zone& zone, std::uint32_t net_id)
         return;
     }
 
+    zone.Grid().Remove(it->snapshot.net_id, it->snapshot.position);
     if (it->entity.is_valid()) {
         it->entity.destruct();
     }

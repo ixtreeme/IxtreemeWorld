@@ -32,8 +32,20 @@ namespace gs::game {
 class TerrainService;
 class MobPrototypeRegistry;
 class ZoneManager;
+class MigrationQueue;
 
 using ZoneId = std::uint32_t;
+
+// Zone activity for sleeping/inactive support. Sleeping is observational:
+// a zone with no players, no mobs and no pending commands performs no
+// simulation work (the scheduler already skipped such zones); the flag only
+// makes the state explicit, measurable and available for future multi-rate
+// scheduling. Mob-bearing zones stay Active -- freezing them would lose
+// gameplay time with no observer-independent justification.
+enum class ZoneActivity : std::uint8_t {
+    Active = 0,
+    Sleeping = 1,
+};
 
 // Context for a single zone tick. Carries the shared services the zone's
 // systems need WITHOUT giving the zone ownership of them. The zone never
@@ -43,6 +55,9 @@ struct ZoneTickContext {
     const mx::map::WorldLogic& world_logic;
     MobPrototypeRegistry& mob_types;
     ZoneManager& zones;
+    // Border-crossing event sink for the migration queue. May be null in
+    // unit-test contexts; MovementSystem checks before use.
+    MigrationQueue* migration_queue = nullptr;
     std::uint32_t world_tick = 0;
     std::function<void(std::shared_ptr<gs::network::Session>, std::vector<std::uint8_t>)> send;
     std::function<void(std::size_t spawn_point_index, float delay_sec)> respawn_later;
@@ -103,6 +118,10 @@ public:
         return grid_;
     }
     std::vector<GhostRecord>& Ghosts() noexcept
+    {
+        return ghosts_;
+    }
+    const std::vector<GhostRecord>& Ghosts() const noexcept
     {
         return ghosts_;
     }
@@ -175,6 +194,40 @@ public:
     std::optional<std::mt19937> ExtractMobRng(std::uint32_t net_id);
     void InsertMobRng(std::uint32_t net_id, std::mt19937 rng);
 
+    // --- read-only views for validators/benchmarks (no gameplay writes) ---
+    const std::unordered_map<std::uint32_t, flecs::entity>& Entities() const noexcept
+    {
+        return entities_;
+    }
+    const std::unordered_map<gs::common::SessionId, std::uint32_t>& NetBySession() const noexcept
+    {
+        return net_by_session_;
+    }
+    std::vector<std::uint32_t> MobRngKeys() const
+    {
+        std::vector<std::uint32_t> keys;
+        keys.reserve(mob_rng_.size());
+        for (const auto& [net_id, rng] : mob_rng_) {
+            (void)rng;
+            keys.push_back(net_id);
+        }
+        return keys;
+    }
+    std::optional<std::uint32_t> NetIdForSession(gs::common::SessionId session_id) const
+    {
+        const auto it = net_by_session_.find(session_id);
+        return it != net_by_session_.end() ? std::optional<std::uint32_t>(it->second) : std::nullopt;
+    }
+
+    ZoneActivity Activity() const noexcept
+    {
+        return activity_.load(std::memory_order_relaxed);
+    }
+    void SetActivity(ZoneActivity activity) noexcept
+    {
+        activity_.store(activity, std::memory_order_relaxed);
+    }
+
     void RefreshResidentCounts();
 
     // Thin tick: drain commands, run domain steps, publish visibility.
@@ -197,6 +250,7 @@ private:
     std::unordered_map<gs::common::SessionId, std::uint32_t> net_by_session_;
     std::unordered_map<std::uint32_t, std::mt19937> mob_rng_;
     std::uint32_t zone_tick_ = 0;
+    std::atomic<ZoneActivity> activity_{ZoneActivity::Active};
     std::atomic<std::thread::id> owner_thread_id_{std::thread::id{}};
     std::atomic<bool> tick_in_progress_{false};
     std::chrono::steady_clock::time_point next_tick_{};

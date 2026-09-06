@@ -8,11 +8,14 @@
 #include "../zone/Zone.h"
 #include "../zone/ZoneManager.h"
 #include "../zone/ZoneOwnership.h"
+#include "MigrationQueue.h"
 
 namespace gs::game {
 
 void MigrationSystem::UpdateMarker(Zone& zone,
                                    ZoneManager& zones,
+                                   MigrationQueue* queue,
+                                   std::uint32_t net_id,
                                    flecs::entity entity,
                                    const Position& position)
 {
@@ -31,6 +34,13 @@ void MigrationSystem::UpdateMarker(Zone& zone,
     }
 
     entity.set<MigrateTo>({target_zone_id});
+
+    // Event-driven migration: only border crossings touch the queue, and the
+    // dedup set absorbs repeats while a request is pending. The common case
+    // (inside bounds, target 0) never locks.
+    if (target_zone_id != 0 && queue != nullptr && net_id != 0) {
+        queue->TryEnqueue(MigrationRequest{net_id, zone.Id(), target_zone_id});
+    }
 }
 
 } // namespace gs::game

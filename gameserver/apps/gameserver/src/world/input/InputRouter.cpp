@@ -52,17 +52,13 @@ void InputRouter::DrainMoves(OwnerMap& owners)
         }
         post_zone_(owner_it->second.zone_index, [input](Zone& zone) {
             AssertZoneOwner(zone, "zone input command");
-            std::uint32_t net_id = 0;
-            for (const auto& [candidate_net, binding] : zone.Players()) {
-                if (binding.session && binding.session->Id() == input.session_id) {
-                    net_id = candidate_net;
-                    break;
-                }
-            }
-            if (net_id == 0) {
+            // O(1) session -> net lookup via the zone's reverse index
+            // (previously a linear scan per input).
+            const auto net_id = zone.NetIdForSession(input.session_id);
+            if (!net_id) {
                 return;
             }
-            const auto entity = zone.FindEntity(net_id);
+            const auto entity = zone.FindEntity(*net_id);
             if (!entity.is_valid()) {
                 return;
             }

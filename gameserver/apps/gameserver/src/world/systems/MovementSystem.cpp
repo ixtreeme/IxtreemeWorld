@@ -13,6 +13,7 @@
 #include "../components/Tags.h"
 #include "../components/TransformComponents.h"
 #include "../migration/MigrationSystem.h"
+#include "../spatial/SpatialTypes.h"
 #include "../terrain/TerrainService.h"
 #include "../zone/Zone.h"
 #include "../zone/ZoneManager.h"
@@ -93,6 +94,8 @@ void MovementSystem::Step(Zone& zone, float dt, ZoneTickContext& ctx)
         auto heading = entity.get<Heading>();
         auto velocity = entity.get<Velocity>();
         auto intent = entity.get<MoveIntent>();
+        const std::int64_t old_cell = SpatialCellKey(SpatialCellCoord(position.x),
+                                                    SpatialCellCoord(position.y));
 
         const float move_speed = IntentSpeed(intent, speed);
         heading.angle = intent.dir_angle;
@@ -122,7 +125,8 @@ void MovementSystem::Step(Zone& zone, float dt, ZoneTickContext& ctx)
         entity.set<Heading>(heading);
         entity.set<Velocity>(velocity);
         entity.set<MoveIntent>(intent);
-        MigrationSystem::UpdateMarker(zone, ctx.zones, entity, position);
+        zone.Grid().Move(net.value, old_cell, position);
+        MigrationSystem::UpdateMarker(zone, ctx.zones, ctx.migration_queue, net.value, entity, position);
     }
 
     // Ghosts carry MobTag but no WanderState, so they are skipped explicitly
@@ -136,12 +140,15 @@ void MovementSystem::Step(Zone& zone, float dt, ZoneTickContext& ctx)
     });
 
     for (auto entity : mobs) {
+        const auto net = entity.get<NetId>();
         const auto speed = entity.get<MoveSpeed>();
         const auto wander = entity.get<WanderState>();
         auto position = entity.get<Position>();
         auto heading = entity.get<Heading>();
         auto velocity = entity.get<Velocity>();
         auto intent = entity.get<MoveIntent>();
+        const std::int64_t old_cell = SpatialCellKey(SpatialCellCoord(position.x),
+                                                    SpatialCellCoord(position.y));
 
         const float move_speed = IntentSpeed(intent, speed);
         heading.angle = intent.dir_angle;
@@ -167,7 +174,8 @@ void MovementSystem::Step(Zone& zone, float dt, ZoneTickContext& ctx)
         entity.set<Heading>(heading);
         entity.set<Velocity>(velocity);
         entity.set<MoveIntent>(intent);
-        MigrationSystem::UpdateMarker(zone, ctx.zones, entity, position);
+        zone.Grid().Move(net.value, old_cell, position);
+        MigrationSystem::UpdateMarker(zone, ctx.zones, ctx.migration_queue, net.value, entity, position);
     }
 }
 
