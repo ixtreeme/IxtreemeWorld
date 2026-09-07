@@ -120,6 +120,10 @@ public:
     {
         return grid_;
     }
+    const SpatialGrid& Grid() const noexcept
+    {
+        return grid_;
+    }
     std::vector<GhostRecord>& Ghosts() noexcept
     {
         return ghosts_;
@@ -184,6 +188,10 @@ public:
     PlayerBinding* FindPlayer(std::uint32_t net_id);
     PlayerBinding* FindPlayerBySession(gs::common::SessionId session_id);
     std::unordered_map<std::uint32_t, PlayerBinding>& Players() noexcept
+    {
+        return players_;
+    }
+    const std::unordered_map<std::uint32_t, PlayerBinding>& Players() const noexcept
     {
         return players_;
     }

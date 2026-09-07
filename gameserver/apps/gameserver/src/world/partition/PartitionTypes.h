@@ -17,9 +17,11 @@ using RegionId = std::uint16_t;
 // entities and receive no routing.
 enum class PartitionState : std::uint8_t {
     Leaf = 0,
-    SplitPending = 1,
-    Merging = 2,
+    SplitPending = 1, // frozen source draining into staged children
+    Merging = 2,      // frozen source draining into a staged merge target
     Retired = 3,
+    Staging = 4, // created but uncommitted destination: never scheduled,
+                 // never routed, never authoritative until commit flips it
 };
 
 } // namespace gs::game

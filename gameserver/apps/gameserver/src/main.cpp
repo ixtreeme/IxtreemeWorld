@@ -79,6 +79,52 @@ gs::game::RuntimeIdentity ResolveRuntimeIdentity(const gs::common::Config& confi
     return identity;
 }
 
+double GetDoubleOr(const gs::common::Config& config, const char* key, double fallback)
+{
+    const auto raw = config.GetString(key);
+    if (!raw) {
+        return fallback;
+    }
+    try {
+        std::size_t used = 0;
+        const double value = std::stod(*raw, &used);
+        if (used == 0) {
+            throw std::invalid_argument("no digits");
+        }
+        return value;
+    } catch (const std::exception&) {
+        LOG_WARN("Config key '{}' has non-numeric value '{}', using default {}", key, *raw, fallback);
+        return fallback;
+    }
+}
+
+// Dynamic partition configuration (§14). Every key is optional; invalid
+// values warn + fall back per field (see ValidatePartitionConfig), and the
+// effective set is logged by WorldRuntime::ConfigurePartition.
+gs::game::PartitionConfig ResolvePartitionConfig(const gs::common::Config& config)
+{
+    gs::game::PartitionConfig out;
+    out.split_load_threshold =
+        static_cast<float>(GetDoubleOr(config, "partition_split_load_threshold", out.split_load_threshold));
+    out.merge_load_threshold =
+        static_cast<float>(GetDoubleOr(config, "partition_merge_load_threshold", out.merge_load_threshold));
+    out.sustained_window_seconds =
+        config.GetInt("partition_sustained_window_seconds").value_or(out.sustained_window_seconds);
+    out.split_cooldown_seconds =
+        config.GetInt("partition_split_cooldown_seconds").value_or(out.split_cooldown_seconds);
+    out.merge_cooldown_seconds =
+        config.GetInt("partition_merge_cooldown_seconds").value_or(out.merge_cooldown_seconds);
+    out.tick_budget_ms =
+        static_cast<float>(GetDoubleOr(config, "partition_tick_budget_ms", out.tick_budget_ms));
+    out.resident_budget =
+        static_cast<float>(GetDoubleOr(config, "partition_resident_budget", out.resident_budget));
+    out.max_partition_depth =
+        config.GetInt("partition_max_depth").value_or(out.max_partition_depth);
+    out.min_zone_size_m =
+        static_cast<float>(GetDoubleOr(config, "partition_min_zone_size_m", out.min_zone_size_m));
+    return out;
+}
+
 } // namespace
 
 int main(int argc, char* argv[])
@@ -121,6 +167,7 @@ int main(int argc, char* argv[])
                  runtime_identity.process.value,
                  gs::game::NamespaceFor(runtime_identity));
         gs::game::WorldRuntime sim(io, runtime_identity);
+        sim.ConfigurePartition(ResolvePartitionConfig(config));
         sim.Start();
 
         gs::game::GameConnectionHandler handler(handoff_tokens, characters, sim, game_server);

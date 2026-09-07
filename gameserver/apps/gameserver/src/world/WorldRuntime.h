@@ -28,6 +28,8 @@
 #include "input/InputRouter.h"
 #include "migration/MigrationCoordinator.h"
 #include "migration/MigrationQueue.h"
+#include "partition/PartitionConfig.h"
+#include "partition/PartitionMetrics.h"
 #include "partition/ZoneLoadMonitor.h"
 #include "spawn/SpawnCoordinator.h"
 #include "terrain/TerrainService.h"
@@ -145,6 +147,30 @@ public:
     std::size_t MigrationQuarantined() const;
     MigrationId LastCommittedMigration() const;
     MigrationMetrics::Snapshot MigrationMetrics() const;
+    PartitionMetrics::Snapshot PartitionMetricsSnapshot() const
+    {
+        return partition_metrics_.TakeSnapshot();
+    }
+    const PartitionConfig& EffectivePartitionConfig() const noexcept
+    {
+        return effective_partition_config_;
+    }
+
+    // Applies a (validated, clamped) partition configuration: monitor +
+    // scheduler thresholds and region split limits. Call before Start, or
+    // between supervisor passes. Logs every correction + the effective set.
+    void ConfigurePartition(const PartitionConfig& config);
+
+    // Test seams (benchmarks/admin). Enqueued to the supervisor thread like
+    // any other command; they run the FULL transactional path, only the
+    // load-predicate gate is bypassed.
+    void PostForceSplit(ZoneId zone_id);
+    void PostForceMerge(ZoneId parent_node_id);
+    // Arms transfer-failure injection: the next N snapshot-stage / apply-stage
+    // transfers fail deterministically (§17-18). `succeed_first` lets that
+    // many transfers complete before the failure fires (mid-batch abort).
+    void InjectTransferFailuresForTest(int snapshot_failures, int apply_failures,
+                                       int succeed_first = 0);
 
 private:
     void Enqueue(std::function<void()> command);
@@ -156,6 +182,20 @@ private:
     // due split/merge transactions. Runs only when no zone tick is in
     // flight, so partition mutation never races worker threads.
     void ExecutePartitionControl();
+    // One full split transaction: Plan -> Create(staged) -> Transfer ->
+    // Validate -> Commit, with rollback + AbortSplit on any failure (§3-4).
+    // `forced` bypasses load predicates (test seams); the machinery is
+    // otherwise identical. Returns true on commit.
+    bool RunSplitTransaction(ZoneId zone_id, bool forced);
+    // One full merge transaction: Plan -> CreateTarget(staged) -> Transfer
+    // -> Validate -> CommitTreeCollapse, with rollback + AbortMerge (§5).
+    bool RunMergeTransaction(ZoneId parent_node_id, bool forced);
+    // Supervisor-side bodies behind PostForceSplit/PostForceMerge.
+    void ExecuteForcedSplit(ZoneId zone_id);
+    void ExecuteForcedMerge(ZoneId parent_node_id);
+    // True when the migration queue holds a request touching the zone
+    // (source or target): transactions never start under a racing migration.
+    bool ZoneHasPendingMigration(ZoneId zone_id) const;
     // Moves one resident (player or mob) between two LOCAL zones reusing the
     // migration authority-transfer primitive (snapshot -> apply -> release).
     // Acquires both zones' write guards in index order (same convention as
@@ -165,9 +205,15 @@ private:
                           ZoneLocation target_location,
                           std::uint32_t net_id);
     // Same transfer with the caller already holding both write guards.
-    // Apply-first ordering: the source is released only after the target
-    // accepted, so a failure leaves the source untouched (no rollback/quarantine
-    // needed on this always-local path).
+    // Apply-first ordering with an RAII destination rollback guard (§7-8):
+    // the source is released only after the target fully accepted; any
+    // failure before the commit point destroys the partial destination and
+    // leaves the source untouched.
+    //
+    // COMMIT POINT (§10): source Grid.Remove + destruct + Unindex. Before
+    // it, the destination is unobservable (both write guards held, no tick
+    // in flight, staged zones unscheduled/unrouted); after it, the
+    // destination is authoritative and OwnerMap is updated to follow.
     bool TransferResidentLocked(Zone& source_zone,
                                 Zone& target_zone,
                                 std::size_t target_zone_index,
@@ -205,6 +251,18 @@ private:
     // Slow control-plane cadence (§42): topology decisions at ~1 Hz while
     // simulation runs at 20 Hz.
     std::chrono::steady_clock::time_point last_partition_control_{};
+    PartitionMetrics partition_metrics_;
+    PartitionConfig effective_partition_config_;
+
+    // Failure-injection hooks for bench/test only (§17-18). Countdowns of
+    // transfers to fail: snapshot-stage (before any mutation) or
+    // apply-stage (after destination build, exercising the rollback guard).
+    // `test_fail_after_count_` lets that many transfers succeed first, so
+    // mid-batch aborts (non-empty reverse path) are reproducible.
+    // Set from any thread, consumed supervisor-side.
+    std::atomic<int> test_fail_snapshot_count_{0};
+    std::atomic<int> test_fail_apply_count_{0};
+    std::atomic<int> test_fail_after_count_{0};
 
     std::atomic<std::uint64_t> attacks_since_diag_{0};
     std::atomic<std::uint64_t> attacks_total_{0};

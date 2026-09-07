@@ -72,6 +72,9 @@ public:
     // completion, but mark retired so no NEW work routes there.
     void RetireZones(const std::vector<ZoneId>& zone_ids);
 
+    // Debug/validator snapshot of the routing table (copy under lock).
+    std::vector<std::pair<ZoneId, ZoneLocation>> AssignmentSnapshot() const;
+
     // Mark/unmark a zone as drained (rolling restart / load migration).
     // Drained LOCAL zones still tick and serve residents; they just stop
     // receiving NEW migrations (spawn-gating is a documented TODO: spawn

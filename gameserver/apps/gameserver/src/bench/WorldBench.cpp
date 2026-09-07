@@ -31,6 +31,7 @@
 #include <iostream>
 #include <numeric>
 #include <random>
+#include <set>
 #include <string>
 #include <thread>
 #include <vector>
@@ -43,6 +44,7 @@
 #include "network/Session.h"
 
 #include "../world/migration/EntityTransfer.h"
+#include "../world/partition/ZonePartition.h"
 #include "../world/WorldRuntime.h"
 #include "../world/spawn/SpawnLoader.h"
 
@@ -60,6 +62,16 @@ struct BenchConfig {
     int logical_processes = 0;
     bool routing_selftest = false;
     std::uint32_t seed = 12345;
+    // splitmerge scenario: deterministic transfer-failure injection counts
+    // (0 = commit path; >0 = abort path expectations). fail_after lets that
+    // many transfers succeed first (mid-batch abort, non-empty rollback).
+    int fail_snapshot = 0;
+    int fail_apply = 0;
+    int fail_after = 0;
+    // Optional partition floor override in meters (0 = production default).
+    // Lets load-driven scenarios split small test maps; still passes through
+    // ValidatePartitionConfig (AOI floor clamp applies).
+    int partition_min_size = 0;
 };
 
 bool ParseArgs(int argc, char** argv, BenchConfig& config)
@@ -77,9 +89,11 @@ bool ParseArgs(int argc, char** argv, BenchConfig& config)
         std::string value;
         if (arg == "--help" || arg == "-h") {
             std::cout << "worldbench [--players N] [--mobs M] [--seconds S]\n"
-                         "             [--mode spread|hotspot|border|dense]\n"
+                         "             [--mode spread|hotspot|border|dense|splitmerge]\n"
                          "             [--validate-every K] [--despawn-storm R] [--seed S]\n"
-                         "             [--logical-processes K] [--routing-selftest]\n";
+                         "             [--logical-processes K] [--routing-selftest]\n"
+                         "             [--fail-snapshot N] [--fail-apply N] [--fail-after N]\n"
+                         "             [--partition-min-size M]\n";
             return false;
         } else if (arg == "--players") {
             if (!need_value("players", value)) {
@@ -123,13 +137,33 @@ bool ParseArgs(int argc, char** argv, BenchConfig& config)
             config.logical_processes = std::stoi(value);
         } else if (arg == "--routing-selftest") {
             config.routing_selftest = true;
+        } else if (arg == "--fail-snapshot") {
+            if (!need_value("fail-snapshot", value)) {
+                return false;
+            }
+            config.fail_snapshot = std::stoi(value);
+        } else if (arg == "--fail-apply") {
+            if (!need_value("fail-apply", value)) {
+                return false;
+            }
+            config.fail_apply = std::stoi(value);
+        } else if (arg == "--fail-after") {
+            if (!need_value("fail-after", value)) {
+                return false;
+            }
+            config.fail_after = std::stoi(value);
+        } else if (arg == "--partition-min-size") {
+            if (!need_value("partition-min-size", value)) {
+                return false;
+            }
+            config.partition_min_size = std::stoi(value);
         } else {
             std::cerr << "unknown arg: " << arg << "\n";
             return false;
         }
     }
     if (config.mode != "spread" && config.mode != "hotspot" && config.mode != "border" &&
-        config.mode != "dense") {
+        config.mode != "dense" && config.mode != "splitmerge") {
         std::cerr << "bad mode: " << config.mode << "\n";
         return false;
     }
@@ -409,6 +443,355 @@ int RunRoutingSelftest(gs::game::WorldRuntime& sim,
     return failures;
 }
 
+// Deterministic split -> merge transaction scenario (§16-18). Own sim
+// lifecycle; does NOT use the main load loop above.
+//
+//   1. ConfigurePartition (min_zone 100m so the 500m test-map zones can
+//      split; everything else default) + verify effective config.
+//   2. Spawn 8 players + ~20 mobs concentrated in one zone; 3 more players
+//      exactly on the zone's future child midlines (boundary semantics).
+//   3. ForceSplit -> expect COMMIT (or ABORT when --fail-* armed):
+//      topology, totals, boundary placement, validator.
+//   4. Despawn all players, ForceMerge -> merged holds all mobs, children
+//      retired+empty, validator.
+// Returns failure count (0 = PASS).
+int RunSplitMergeScenario(boost::asio::io_context& io, const BenchConfig& config)
+{
+    int failures = 0;
+    int validations = 0;
+    auto check = [&](const char* name, bool pass) {
+        if (pass) {
+            std::printf("SPLITMERGE %s: PASS\n", name);
+        } else {
+            std::printf("SPLITMERGE %s: FAIL\n", name);
+            ++failures;
+        }
+    };
+
+    gs::game::WorldRuntime sim(io);
+    auto validate_now = [&](const char* what) -> bool {
+        sim.RequestValidation();
+        for (int i = 0; i < 100; ++i) {
+            std::string result;
+            if (sim.TryTakeValidationResult(result)) {
+                ++validations;
+                if (result != "OK") {
+                    std::printf("SPLITMERGE validation(%s): FAIL: %s\n", what, result.c_str());
+                    return false;
+                }
+                return true;
+            }
+            std::this_thread::sleep_for(std::chrono::milliseconds(100));
+        }
+        std::printf("SPLITMERGE validation(%s): TIMEOUT\n", what);
+        return false;
+    };
+    auto active_leaf_ids = [&]() {
+        std::set<gs::game::ZoneId> ids;
+        for (const auto* leaf : sim.Zones().GetActiveLeaves()) {
+            ids.insert(leaf->zone_id);
+        }
+        return ids;
+    };
+    auto find_zone = [&](gs::game::ZoneId id) -> const gs::game::Zone* {
+        const std::size_t idx = sim.Zones().FindIndexById(id);
+        return idx < sim.Zones().ZoneCount() ? &sim.Zones().GetZone(idx) : nullptr;
+    };
+
+    const auto deadline =
+        std::chrono::steady_clock::now() + std::chrono::seconds(std::max(60, config.seconds));
+    auto expired = [&] { return std::chrono::steady_clock::now() >= deadline; };
+
+    // ---- 1. config ----
+    gs::game::PartitionConfig pcfg;
+    pcfg.min_zone_size_m = 100.0f; // test map zones are 500m; halves must clear the floor
+    sim.ConfigurePartition(pcfg);
+    // 100m is below the 2x AOI safety floor (240m): validation must clamp
+    // it, and the clamped value is what the split machinery runs on. This
+    // doubles as an end-to-end config-validation check.
+    check("config-effective",
+          sim.EffectivePartitionConfig().min_zone_size_m == 240.0f &&
+              sim.EffectivePartitionConfig().split_load_threshold == 0.9f);
+    sim.Start();
+
+    // ---- 2. populate one zone ----
+    const auto& z0 = sim.Zones().GetZone(0);
+    const float cx = (z0.Bounds().min_x + z0.Bounds().max_x) * 0.5f;
+    const float cy = (z0.Bounds().min_y + z0.Bounds().max_y) * 0.5f;
+    constexpr int kPlayers = 8;
+    constexpr int kBoundaryPlayers = 3;
+    constexpr int kTotalPlayers = kPlayers + kBoundaryPlayers;
+    constexpr gs::common::SessionId kBaseSession = 500;
+    std::vector<std::shared_ptr<gs::network::Session>> sessions;
+    for (int i = 0; i < kPlayers; ++i) {
+        boost::asio::ip::tcp::socket socket(io);
+        auto session = std::make_shared<gs::network::Session>(
+            std::move(socket), static_cast<gs::common::SessionId>(kBaseSession + i));
+        sessions.push_back(session);
+        sim.PostSpawn(session,
+                      MakeBenchCharacter(700 + i),
+                      gs::game::DebugSpawnOverride{cx + static_cast<float>(i),
+                                                   cy + static_cast<float>(i % 3)});
+    }
+    constexpr int kMobPoints = 20;
+    for (int k = 0; k < kMobPoints; ++k) {
+        gs::game::MobSpawnPoint point;
+        point.mob_type_id = 2;
+        point.x = cx;
+        point.y = cy;
+        point.count = 1;
+        point.radius = 2.0f;
+        sim.AddMobSpawnPoint(point);
+    }
+    for (int k = 0; k < kMobPoints; ++k) {
+        sim.RequestMobSpawn(static_cast<std::size_t>(4 + k));
+    }
+    bool populated = WaitFor(std::chrono::seconds(20), [&] {
+        return sim.Owners().size() == static_cast<std::size_t>(kPlayers) &&
+               sim.CollectProcessLoad().mobs >= 16;
+    });
+    check("populate", populated && !expired());
+    if (!populated) {
+        sim.Stop();
+        return failures + 1;
+    }
+    const std::uint64_t mob_total = sim.CollectProcessLoad().mobs;
+
+    // Target = wherever the spawns actually landed (no map assumptions).
+    const gs::game::ZoneId target_id = sim.Owners().at(kBaseSession).location.zone;
+    bool all_in_target = true;
+    for (int i = 0; i < kPlayers; ++i) {
+        const auto it = sim.Owners().find(static_cast<gs::common::SessionId>(kBaseSession + i));
+        if (it == sim.Owners().end() || it->second.location.zone != target_id) {
+            all_in_target = false;
+        }
+    }
+    check("single-target-zone", all_in_target);
+    const auto* target_zone = find_zone(target_id);
+    if (target_zone == nullptr) {
+        sim.Stop();
+        return failures + 1;
+    }
+    const auto tb = target_zone->Bounds();
+    const float mid_x = (tb.min_x + tb.max_x) * 0.5f;
+    const float mid_y = (tb.min_y + tb.max_y) * 0.5f;
+
+    // Boundary players exactly on future child midlines (§23).
+    struct BoundarySpawn {
+        float x, y;
+    };
+    const BoundarySpawn kBoundary[kBoundaryPlayers] = {
+        {mid_x, (tb.min_y + mid_y) * 0.5f}, // vertical midline -> east child
+        {(tb.min_x + mid_x) * 0.5f, mid_y}, // horizontal midline -> north child
+        {mid_x, mid_y},                     // corner shared by 4 -> north-east child
+    };
+    for (int i = 0; i < kBoundaryPlayers; ++i) {
+        boost::asio::ip::tcp::socket socket(io);
+        auto session = std::make_shared<gs::network::Session>(
+            std::move(socket), static_cast<gs::common::SessionId>(kBaseSession + kPlayers + i));
+        sessions.push_back(session);
+        sim.PostSpawn(session,
+                      MakeBenchCharacter(710 + i),
+                      gs::game::DebugSpawnOverride{kBoundary[i].x, kBoundary[i].y});
+    }
+    populated = WaitFor(std::chrono::seconds(15), [&] {
+        return sim.Owners().size() == static_cast<std::size_t>(kTotalPlayers);
+    });
+    check("boundary-spawn", populated && !expired());
+
+    // Boundary spawns must have landed inside the target (interior points).
+    bool boundary_home = true;
+    std::vector<std::uint32_t> boundary_nets;
+    for (int i = 0; i < kBoundaryPlayers; ++i) {
+        const auto it = sim.Owners().find(static_cast<gs::common::SessionId>(kBaseSession + kPlayers + i));
+        if (it == sim.Owners().end() || it->second.location.zone != target_id) {
+            boundary_home = false;
+        } else {
+            boundary_nets.push_back(it->second.net_id);
+        }
+    }
+    check("boundary-in-target", boundary_home);
+    check("pre-split-validate", validate_now("pre-split"));
+
+    const auto pre_leaves = active_leaf_ids();
+    const bool expect_abort = config.fail_snapshot > 0 || config.fail_apply > 0;
+    if (expect_abort) {
+        sim.InjectTransferFailuresForTest(config.fail_snapshot, config.fail_apply,
+                                          config.fail_after);
+    }
+
+    // ---- 3. forced split ----
+    sim.PostForceSplit(target_id);
+    const auto split0 = sim.PartitionMetricsSnapshot();
+    const bool split_settled = WaitFor(std::chrono::seconds(25), [&] {
+        const auto m = sim.PartitionMetricsSnapshot();
+        return m.split_commits + m.split_aborts > split0.split_commits + split0.split_aborts;
+    });
+    check("split-settled", split_settled && !expired());
+    const auto split1 = sim.PartitionMetricsSnapshot();
+    check("pre-merge-validate-split", validate_now("post-split"));
+
+    auto totals_ok = [&] {
+        return sim.Owners().size() == static_cast<std::size_t>(kTotalPlayers) &&
+               sim.CollectProcessLoad().mobs == mob_total;
+    };
+    if (expect_abort) {
+        check("split-aborted",
+              split1.split_aborts > split0.split_aborts &&
+                  split1.split_commits == split0.split_commits);
+        // Parent restored as the sole authority; nothing half-built.
+        const auto leaves = active_leaf_ids();
+        check("abort-parent-authority", leaves.find(target_id) != leaves.end());
+        check("abort-no-loss", totals_ok());
+        // Apply-stage failure additionally proves destination rollback: the
+        // retired-tombstone rule would fail validation otherwise (checked).
+    } else {
+        check("split-committed",
+              split1.split_commits > split0.split_commits &&
+                  split1.split_aborts == split0.split_aborts);
+        const auto leaves = active_leaf_ids();
+        std::set<gs::game::ZoneId> new_children;
+        for (auto id : leaves) {
+            if (pre_leaves.find(id) == pre_leaves.end()) {
+                new_children.insert(id);
+            }
+        }
+        check("split-4-children", new_children.size() == 4);
+        check("split-parent-retired",
+              leaves.find(target_id) == leaves.end() &&
+                  [&] {
+                      const auto* z = find_zone(target_id);
+                      return z != nullptr &&
+                             z->Partition() == gs::game::PartitionState::Retired &&
+                             z->Entities().empty() && z->Players().empty();
+                  }());
+        check("split-no-loss", totals_ok());
+        // Boundary placement: each midline player in exactly the half-open
+        // owner child (§23).
+        bool placement_ok = new_children.size() == 4;
+        for (int i = 0; i < kBoundaryPlayers && placement_ok; ++i) {
+            const auto it =
+                sim.Owners().find(static_cast<gs::common::SessionId>(kBaseSession + kPlayers + i));
+            if (it == sim.Owners().end()) {
+                placement_ok = false;
+                break;
+            }
+            const float px = kBoundary[i].x;
+            const float py = kBoundary[i].y;
+            int matches = 0;
+            gs::game::ZoneId expected = 0;
+            for (auto cid : new_children) {
+                const auto* cz = find_zone(cid);
+                if (cz == nullptr) {
+                    continue;
+                }
+                const auto& b = cz->Bounds();
+                if (px >= b.min_x && px < b.max_x && py >= b.min_y && py < b.max_y) {
+                    ++matches;
+                    expected = cid;
+                }
+            }
+            placement_ok = (matches == 1 && it->second.location.zone == expected);
+        }
+        check("split-boundary-placement", placement_ok);
+    }
+
+    // ---- 4. despawn players, forced merge ----
+    // In abort mode there are no children to merge (the split never
+    // committed): the merge phase is skipped, topology must simply be the
+    // untouched original plus validation + metrics.
+    if (expect_abort) {
+        check("abort-post-validate", validate_now("post-abort"));
+        const auto am = sim.PartitionMetricsSnapshot();
+        check("abort-metrics",
+              am.split_aborts >= 1 && am.split_commits == 0 && am.merge_attempts == 0);
+    }
+    for (int i = 0; i < kTotalPlayers; ++i) {
+        sim.PostDespawn(static_cast<gs::common::SessionId>(kBaseSession + i));
+    }
+    sessions.clear();
+    const bool drained = WaitFor(std::chrono::seconds(15), [&] { return sim.Owners().empty(); });
+    check("despawn-drained", drained && !expired());
+    if (expect_abort) {
+        check("abort-final-validate", validate_now("final-abort"));
+        sim.Stop();
+        std::printf("SPLITMERGE-DONE validations=%d failures=%d\n", validations, failures);
+        return failures;
+    }
+
+    sim.PostForceMerge(target_id);
+    const auto merge0 = sim.PartitionMetricsSnapshot();
+    const bool merge_settled = WaitFor(std::chrono::seconds(25), [&] {
+        const auto m = sim.PartitionMetricsSnapshot();
+        return m.merge_commits + m.merge_aborts > merge0.merge_commits + merge0.merge_aborts;
+    });
+    check("merge-settled", merge_settled && !expired());
+    const auto merge1 = sim.PartitionMetricsSnapshot();
+    check("merge-committed", merge1.merge_commits > merge0.merge_commits);
+    check("post-merge-validate", validate_now("post-merge"));
+
+    // Merged leaf active; all split children retired+empty; mobs preserved.
+    const auto post_leaves = active_leaf_ids();
+    std::set<gs::game::ZoneId> merged_ids;
+    for (auto id : post_leaves) {
+        if (pre_leaves.find(id) == pre_leaves.end()) {
+            merged_ids.insert(id);
+        }
+    }
+    // Note: with expect_abort the split never committed, so there are no
+    // children to merge; the forced merge then operates on whatever the
+    // tree holds (likely a no-op plan refusal). Merge asserts below only
+    // apply to the commit path.
+    if (!expect_abort) {
+        check("merge-single-target", merged_ids.size() == 1);
+        std::uint64_t total_mobs = 0;
+        bool children_clean = true;
+        for (std::size_t zi = 0; zi < sim.Zones().ZoneCount(); ++zi) {
+            const auto& z = sim.Zones().GetZone(zi);
+            total_mobs += z.Entities().size();
+            // Mobs may have wandered out of the merged subtree into
+            // neighbors; the invariant is global preservation + retired
+            // emptiness, not that every mob sits in the merged zone.
+            if (z.Partition() == gs::game::PartitionState::Retired) {
+                if (!z.Entities().empty() || !z.Players().empty()) {
+                    children_clean = false;
+                }
+            }
+        }
+        check("merge-children-retired-empty", children_clean);
+        check("merge-mobs-preserved",
+              total_mobs == mob_total && sim.CollectProcessLoad().mobs == mob_total);
+    }
+
+    const auto pm = sim.PartitionMetricsSnapshot();
+    std::printf("SPLITMERGE metrics: split att=%llu ok=%llu ab=%llu tf=%llu rb=%llu "
+                "merge att=%llu ok=%llu ab=%llu tf=%llu rb=%llu retire_rej=%llu\n",
+                (unsigned long long)pm.split_attempts, (unsigned long long)pm.split_commits,
+                (unsigned long long)pm.split_aborts, (unsigned long long)pm.split_transfer_failures,
+                (unsigned long long)pm.split_rollback_failures,
+                (unsigned long long)pm.merge_attempts, (unsigned long long)pm.merge_commits,
+                (unsigned long long)pm.merge_aborts, (unsigned long long)pm.merge_transfer_failures,
+                (unsigned long long)pm.merge_rollback_failures,
+                (unsigned long long)pm.retire_rejected_nonempty);
+    auto avg = [](std::uint64_t total, std::uint64_t n) {
+        return n > 0 ? static_cast<double>(total) / n / 1000.0 : 0.0;
+    };
+    std::printf("SPLITMERGE phase ms avg: split plan=%.3f xfer=%.3f commit=%.3f rollback=%.3f | "
+                "merge plan=%.3f xfer=%.3f commit=%.3f rollback=%.3f\n",
+                avg(pm.split_plan_us, pm.split_commits + pm.split_aborts),
+                avg(pm.split_transfer_us, pm.split_commits + pm.split_aborts),
+                avg(pm.split_commit_us, pm.split_commits),
+                avg(pm.split_rollback_us, pm.split_aborts),
+                avg(pm.merge_plan_us, pm.merge_commits + pm.merge_aborts),
+                avg(pm.merge_transfer_us, pm.merge_commits + pm.merge_aborts),
+                avg(pm.merge_commit_us, pm.merge_commits),
+                avg(pm.merge_rollback_us, pm.merge_aborts));
+
+    sim.Stop();
+    std::printf("SPLITMERGE-DONE validations=%d failures=%d\n", validations, failures);
+    return failures;
+}
+
 } // namespace
 
 int BenchMain(int argc, char** argv)
@@ -431,6 +814,20 @@ int BenchMain(int argc, char** argv)
                 config.logical_processes,
                 config.routing_selftest ? 1 : 0);
 
+    if (config.mode == "splitmerge") {
+        // Deterministic transaction scenario with its own sim lifecycle;
+        // the load-loop below is skipped entirely for this mode.
+        boost::asio::io_context splitmerge_io;
+        std::thread splitmerge_io_thread([&splitmerge_io] { splitmerge_io.run(); });
+        const int scenario_failures = RunSplitMergeScenario(splitmerge_io, config);
+        splitmerge_io.stop();
+        if (splitmerge_io_thread.joinable()) {
+            splitmerge_io_thread.join();
+        }
+        std::printf("BENCH-DONE splitmerge failures=%d\n", scenario_failures);
+        return scenario_failures == 0 ? 0 : 2;
+    }
+
     std::mt19937 rng(config.seed);
 
     boost::asio::io_context io;
@@ -446,6 +843,14 @@ int BenchMain(int argc, char** argv)
     {
         gs::game::WorldRuntime sim(io);
         sim.Start();
+        if (config.partition_min_size > 0) {
+            gs::game::PartitionConfig override;
+            override.min_zone_size_m = static_cast<float>(config.partition_min_size);
+            sim.ConfigurePartition(override);
+            std::printf("partition override: min_zone_size_m=%d (effective %.0f after validation)\n",
+                        config.partition_min_size,
+                        sim.EffectivePartitionConfig().min_zone_size_m);
+        }
         if (config.logical_processes >= 2) {
             sim.EmulateDistribution(static_cast<std::uint32_t>(config.logical_processes));
             std::printf("logical distribution: %d processes emulated\n", config.logical_processes);

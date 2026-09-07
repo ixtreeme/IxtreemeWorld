@@ -1,8 +1,12 @@
 #include "ZoneManager.h"
 
 #include <algorithm>
+#include <cassert>
 
 #include "common/Logging.h"
+
+#include "../visibility/GhostSystem.h"
+#include "ZoneOwnership.h"
 
 namespace gs::game {
 namespace {
@@ -152,15 +156,20 @@ std::vector<ZonePartition*> ZoneManager::GetActiveLeaves() const
     return leaves;
 }
 
-bool ZoneManager::SplitZone(ZoneId zone_id, std::vector<ZoneId>& out_new_zone_ids)
+bool ZoneManager::PlanSplit(ZoneId zone_id, SplitPlan& out_plan) const
 {
-    out_new_zone_ids.clear();
+    out_plan = SplitPlan{};
     const std::size_t zone_index = FindIndexById(zone_id);
     if (zone_index >= zones_.size()) {
         return false;
     }
-    Zone& zone = *zones_[zone_index];
+    const Zone& zone = *zones_[zone_index];
     if (!zone.SimulationEnabled() || zone.Partition() != PartitionState::Leaf) {
+        return false;
+    }
+    if (!zone.Commands().Empty()) {
+        // Racing commands would strand in the frozen parent: retry next
+        // cycle instead of stranding work.
         return false;
     }
 
@@ -175,7 +184,7 @@ bool ZoneManager::SplitZone(ZoneId zone_id, std::vector<ZoneId>& out_new_zone_id
         return false;
     }
 
-    ZonePartition* leaf = FindNodeInRoots(partition_roots_, zone_id);
+    const ZonePartition* leaf = FindNodeInRoots(partition_roots_, zone_id);
     if (leaf == nullptr || !leaf->IsLeaf()) {
         return false;
     }
@@ -194,58 +203,176 @@ bool ZoneManager::SplitZone(ZoneId zone_id, std::vector<ZoneId>& out_new_zone_id
     // gaps by construction). Half-open ownership is enforced by FindLeaf.
     const float mid_x = bounds.min_x + half_w;
     const float mid_y = bounds.min_y + half_h;
-    const mx::map::Rect child_bounds[4] = {
-        {bounds.min_x, mid_y, mid_x, bounds.max_y}, // NW
-        {mid_x, mid_y, bounds.max_x, bounds.max_y}, // NE
-        {bounds.min_x, bounds.min_y, mid_x, mid_y}, // SW
-        {mid_x, bounds.min_y, bounds.max_x, mid_y}, // SE
-    };
-    const char* child_suffix[4] = {"_nw", "_ne", "_sw", "_se"};
+    out_plan.parent_id = zone_id;
+    out_plan.parent_index = zone_index;
+    out_plan.region_id = zone.Region();
+    out_plan.child_bounds[0] = {bounds.min_x, mid_y, mid_x, bounds.max_y}; // NW
+    out_plan.child_bounds[1] = {mid_x, mid_y, bounds.max_x, bounds.max_y}; // NE
+    out_plan.child_bounds[2] = {bounds.min_x, bounds.min_y, mid_x, mid_y}; // SW
+    out_plan.child_bounds[3] = {mid_x, bounds.min_y, bounds.max_x, mid_y}; // SE
+    out_plan.child_depth = static_cast<std::uint8_t>(leaf->depth + 1);
+    out_plan.valid = true;
+    return true;
+}
 
-    leaf->state = PartitionState::SplitPending;
+bool ZoneManager::CreateStagedSplit(const SplitPlan& plan, std::vector<ZoneId>& out_child_ids)
+{
+    out_child_ids.clear();
+    if (!plan.valid) {
+        return false;
+    }
+    // Re-check liveness: cheap, and turns a raced plan into a clean refusal
+    // instead of a half-built split.
+    ZonePartition* leaf = FindNodeInRoots(partition_roots_, plan.parent_id);
+    const std::size_t zone_index = FindIndexById(plan.parent_id);
+    if (leaf == nullptr || !leaf->IsLeaf() || zone_index >= zones_.size()) {
+        return false;
+    }
+    Zone& zone = *zones_[zone_index];
+    if (!zone.SimulationEnabled() || zone.Partition() != PartitionState::Leaf) {
+        return false;
+    }
+
+    static const char* kSuffix[4] = {"_nw", "_ne", "_sw", "_se"};
     zone.SetPartition(PartitionState::SplitPending);
     zone.SetSimulationEnabled(false);
+    try {
+        zones_.reserve(zones_.size() + 4);
+        const auto now = std::chrono::steady_clock::now();
+        for (int i = 0; i < 4; ++i) {
+            const ZoneId child_id = AllocateZoneId();
+            auto child =
+                std::make_unique<Zone>(child_id, zone.Name() + kSuffix[i], plan.child_bounds[i]);
+            child->SetRegion(plan.region_id);
+            child->SetPartition(PartitionState::Staging);
+            child->SetSimulationEnabled(false);
+            child->NextTick() = now;
+            zones_.push_back(std::move(child));
+            out_child_ids.push_back(child_id);
+        }
+    } catch (...) {
+        // Nothing transferred yet: tombstone what was appended, restore the
+        // parent, and report refusal (no orphan topology: the tree was never
+        // touched).
+        for (const ZoneId id : out_child_ids) {
+            const std::size_t index = FindIndexById(id);
+            if (index < zones_.size()) {
+                zones_[index]->SetPartition(PartitionState::Retired);
+                zones_[index]->SetSimulationEnabled(false);
+            }
+        }
+        out_child_ids.clear();
+        zone.SetPartition(PartitionState::Leaf);
+        zone.SetSimulationEnabled(true);
+        graph_.Rebuild(zones_);
+        return false;
+    }
+    graph_.Rebuild(zones_);
+    return true;
+}
 
+bool ZoneManager::CommitSplit(ZoneId parent_id, const std::vector<ZoneId>& child_ids)
+{
+    if (child_ids.size() != 4) {
+        return false;
+    }
+    const std::size_t parent_index = FindIndexById(parent_id);
+    ZonePartition* leaf = FindNodeInRoots(partition_roots_, parent_id);
+    if (parent_index >= zones_.size() || leaf == nullptr || !leaf->IsLeaf()) {
+        return false;
+    }
+    Zone& parent = *zones_[parent_index];
+    // Commit gate: every resident must have left the parent. Grid follows
+    // entities (validator enforces the correspondence); commands must have
+    // drained (plan phase requires an empty queue; a racing command aborts).
+    if (!parent.Entities().empty() || !parent.Players().empty() || !parent.NetBySession().empty() ||
+        !parent.Commands().Empty()) {
+        return false;
+    }
+    for (const ZoneId child_id : child_ids) {
+        const std::size_t index = FindIndexById(child_id);
+        if (index >= zones_.size()) {
+            return false;
+        }
+        const Zone& child = *zones_[index];
+        if (child.Partition() != PartitionState::Staging || child.SimulationEnabled()) {
+            return false;
+        }
+    }
+
+    // Retire the drained parent first: still no tree change, so a refusal
+    // here aborts cleanly.
+    if (!RetireZone(parent_id)) {
+        return false;
+    }
+
+    // NOW the tree mutates: attach staged children, retire the parent node.
     const auto now = std::chrono::steady_clock::now();
-    for (int i = 0; i < 4; ++i) {
-        const ZoneId child_id = AllocateZoneId();
-        auto child = std::make_unique<Zone>(child_id, zone.Name() + child_suffix[i], child_bounds[i]);
-        child->SetRegion(zone.Region());
-        child->SetSimulationEnabled(true);
-        child->NextTick() = now;
-        zones_.push_back(std::move(child));
-
-        auto node = std::make_unique<ZonePartition>(child_id, zone.Region(), child_bounds[i],
+    for (const ZoneId child_id : child_ids) {
+        const Zone& child = *zones_[FindIndexById(child_id)];
+        auto node = std::make_unique<ZonePartition>(child_id, child.Region(), child.Bounds(),
                                                     static_cast<std::uint8_t>(leaf->depth + 1));
         node->parent = leaf;
         leaf->children.push_back(std::move(node));
-        out_new_zone_ids.push_back(child_id);
     }
-    leaf->last_split_time = std::chrono::steady_clock::now();
+    leaf->state = PartitionState::Retired;
+    leaf->simulation_enabled = false;
+    leaf->last_split_time = now;
+
+    for (const ZoneId child_id : child_ids) {
+        Zone& child = *zones_[FindIndexById(child_id)];
+        child.SetPartition(PartitionState::Leaf);
+        child.SetSimulationEnabled(true);
+        child.NextTick() = now;
+    }
 
     graph_.Rebuild(zones_);
     return true;
 }
 
-bool ZoneManager::MergeZones(const std::vector<ZoneId>& zone_ids, ZoneId& out_merged_zone_id)
+void ZoneManager::AbortSplit(ZoneId parent_id, const std::vector<ZoneId>& child_ids)
 {
-    if (zone_ids.size() < 2) {
+    // Infallible by design: state flips only. The caller rolls entity
+    // transfers back BEFORE calling; anything left behind is caught loudly
+    // by the debug validator (never silently dropped).
+    const std::size_t parent_index = FindIndexById(parent_id);
+    if (parent_index < zones_.size()) {
+        Zone& parent = *zones_[parent_index];
+        parent.SetPartition(PartitionState::Leaf);
+        parent.SetSimulationEnabled(true);
+        parent.NextTick() = std::chrono::steady_clock::now();
+        parent.RefreshResidentCounts();
+    }
+    for (const ZoneId child_id : child_ids) {
+        const std::size_t index = FindIndexById(child_id);
+        if (index >= zones_.size()) {
+            continue;
+        }
+        Zone& child = *zones_[index];
+        assert(child.Entities().empty() && child.Players().empty() &&
+               "AbortSplit: staged child still holds residents (rollback incomplete)");
+        child.SetPartition(PartitionState::Retired);
+        child.SetSimulationEnabled(false);
+        child.RefreshResidentCounts();
+    }
+    // The tree was never touched during staging: nothing to detach.
+    graph_.Rebuild(zones_);
+}
+
+bool ZoneManager::PlanMerge(ZoneId parent_node_id, MergePlan& out_plan) const
+{
+    out_plan = MergePlan{};
+    const ZonePartition* parent = FindNodeInRoots(partition_roots_, parent_node_id);
+    if (parent == nullptr || parent->parent == nullptr || parent->children.size() < 2) {
         return false;
     }
-
-    // All ids must be leaves under ONE common parent (sibling set).
-    ZonePartition* parent = nullptr;
-    for (ZoneId id : zone_ids) {
-        ZonePartition* node = FindNodeInRoots(partition_roots_, id);
-        if (node == nullptr || !node->IsLeaf() || node->parent == nullptr) {
+    // All ids must be active leaves under ONE common parent (exact sibling
+    // set: no partial collapse, keeps tiling exact).
+    for (const auto& child : parent->children) {
+        if (!child->IsLeaf()) {
             return false;
         }
-        if (parent == nullptr) {
-            parent = node->parent;
-        } else if (parent != node->parent) {
-            return false;
-        }
-        const std::size_t index = FindIndexById(id);
+        const std::size_t index = FindIndexById(child->zone_id);
         if (index >= zones_.size()) {
             return false;
         }
@@ -253,45 +380,213 @@ bool ZoneManager::MergeZones(const std::vector<ZoneId>& zone_ids, ZoneId& out_me
         if (!zone.SimulationEnabled() || zone.Partition() != PartitionState::Leaf) {
             return false;
         }
+        if (!zone.Commands().Empty()) {
+            return false;
+        }
+        out_plan.child_ids.push_back(child->zone_id);
     }
-    // Exact sibling set: no partial collapse (keeps tiling exact).
-    if (parent->children.size() != zone_ids.size()) {
+    out_plan.parent_node_id = parent_node_id;
+    out_plan.valid = true;
+    return true;
+}
+
+bool ZoneManager::CreateStagedMergeTarget(const MergePlan& plan, ZoneId& out_merged_id)
+{
+    if (!plan.valid) {
         return false;
     }
+    ZonePartition* parent = FindNodeInRoots(partition_roots_, plan.parent_node_id);
+    if (parent == nullptr) {
+        return false;
+    }
+    // Freeze the children first (still authoritative until commit, but
+    // visibly non-schedulable); tree untouched so abort is trivial.
+    for (const ZoneId id : plan.child_ids) {
+        const std::size_t index = FindIndexById(id);
+        if (index >= zones_.size()) {
+            // Restore whatever was frozen so far; nothing else mutated.
+            for (const ZoneId done : plan.child_ids) {
+                if (done == id) {
+                    break;
+                }
+                const std::size_t done_index = FindIndexById(done);
+                if (done_index < zones_.size()) {
+                    zones_[done_index]->SetPartition(PartitionState::Leaf);
+                    zones_[done_index]->SetSimulationEnabled(true);
+                }
+            }
+            return false;
+        }
+        zones_[index]->SetPartition(PartitionState::Merging);
+        zones_[index]->SetSimulationEnabled(false);
+    }
+    try {
+        zones_.reserve(zones_.size() + 1);
+        const ZoneId merged_id = AllocateZoneId();
+        auto merged = std::make_unique<Zone>(merged_id, "merged", parent->bounds);
+        merged->SetRegion(parent->region_id);
+        merged->SetPartition(PartitionState::Staging);
+        merged->SetSimulationEnabled(false);
+        merged->NextTick() = std::chrono::steady_clock::now();
+        zones_.push_back(std::move(merged));
+        out_merged_id = merged_id;
+    } catch (...) {
+        for (const ZoneId id : plan.child_ids) {
+            const std::size_t index = FindIndexById(id);
+            if (index < zones_.size()) {
+                zones_[index]->SetPartition(PartitionState::Leaf);
+                zones_[index]->SetSimulationEnabled(true);
+            }
+        }
+        graph_.Rebuild(zones_);
+        return false;
+    }
+    graph_.Rebuild(zones_);
+    return true;
+}
 
-    const ZoneId merged_id = AllocateZoneId();
-    auto merged = std::make_unique<Zone>(merged_id, "merged", parent->bounds);
-    merged->SetRegion(parent->region_id);
-    merged->SetSimulationEnabled(true);
-    merged->NextTick() = std::chrono::steady_clock::now();
-    zones_.push_back(std::move(merged));
-    out_merged_zone_id = merged_id;
+bool ZoneManager::CommitMerge(const MergePlan& plan, ZoneId merged_id)
+{
+    if (!plan.valid) {
+        return false;
+    }
+    const std::size_t merged_index = FindIndexById(merged_id);
+    ZonePartition* parent = FindNodeInRoots(partition_roots_, plan.parent_node_id);
+    if (merged_index >= zones_.size() || parent == nullptr) {
+        return false;
+    }
+    Zone& merged = *zones_[merged_index];
+    if (merged.Partition() != PartitionState::Staging || merged.SimulationEnabled()) {
+        return false;
+    }
+    // Exact sibling set still intact?
+    if (parent->children.size() != plan.child_ids.size()) {
+        return false;
+    }
+    for (const ZoneId id : plan.child_ids) {
+        bool found = false;
+        for (const auto& child : parent->children) {
+            if (child->zone_id == id) {
+                found = true;
+                break;
+            }
+        }
+        if (!found) {
+            return false;
+        }
+        const std::size_t index = FindIndexById(id);
+        if (index >= zones_.size()) {
+            return false;
+        }
+        // Commit gate: children fully drained (validated again here so a
+        // refusal aborts before ANY retire is applied).
+        const Zone& child = *zones_[index];
+        if (!child.Entities().empty() || !child.Players().empty() || !child.NetBySession().empty() ||
+            !child.Commands().Empty()) {
+            return false;
+        }
+    }
+    // All gates passed: apply retires (each re-checked inside RetireZone;
+    // single-threaded, so no race between gate and apply).
+    for (const ZoneId id : plan.child_ids) {
+        if (!RetireZone(id)) {
+            return false;
+        }
+    }
 
-    // Collapse the parent back to a leaf carrying the merged zone. Child
-    // metadata is dropped; the child Zone OBJECTS stay in their slots and
-    // are retired by the caller after the entity transfer.
+    // NOW the tree mutates (only place): collapse onto the merged zone.
     parent->children.clear();
     parent->zone_id = merged_id;
     parent->state = PartitionState::Leaf;
     parent->simulation_enabled = true;
     parent->last_merge_time = std::chrono::steady_clock::now();
 
+    merged.SetPartition(PartitionState::Leaf);
+    merged.SetSimulationEnabled(true);
+    merged.NextTick() = std::chrono::steady_clock::now();
+
     graph_.Rebuild(zones_);
     return true;
 }
 
-void ZoneManager::RetireZone(ZoneId zone_id)
+void ZoneManager::AbortMerge(const MergePlan& plan, ZoneId merged_id)
+{
+    // Infallible by design. Children resume authority with whatever the
+    // caller rolled back into them; the staged target becomes a tombstone.
+    // The tree never changed, so there is nothing to detach.
+    for (const ZoneId id : plan.child_ids) {
+        const std::size_t index = FindIndexById(id);
+        if (index >= zones_.size()) {
+            continue;
+        }
+        Zone& child = *zones_[index];
+        child.SetPartition(PartitionState::Leaf);
+        child.SetSimulationEnabled(true);
+        child.NextTick() = std::chrono::steady_clock::now();
+        child.RefreshResidentCounts();
+    }
+    const std::size_t merged_index = FindIndexById(merged_id);
+    if (merged_index < zones_.size()) {
+        Zone& merged = *zones_[merged_index];
+        assert(merged.Entities().empty() && merged.Players().empty() &&
+               "AbortMerge: staged target still holds residents (rollback incomplete)");
+        merged.SetPartition(PartitionState::Retired);
+        merged.SetSimulationEnabled(false);
+        merged.RefreshResidentCounts();
+    }
+    graph_.Rebuild(zones_);
+}
+
+bool ZoneManager::CanRetire(ZoneId zone_id) const
 {
     const std::size_t index = FindIndexById(zone_id);
-    if (index < zones_.size()) {
-        zones_[index]->SetSimulationEnabled(false);
-        zones_[index]->SetPartition(PartitionState::Retired);
+    if (index >= zones_.size()) {
+        return false;
     }
+    const Zone& zone = *zones_[index];
+    // Authority state only. The grid is deliberately NOT checked here: it
+    // also holds non-authoritative ghost entries (see AoiSystem::RebuildInto
+    // + GhostSystem::Clear), which RetireZone wipes below. Grid/entity
+    // correspondence is enforced by ValidateSpatialIndex on live zones and
+    // by the retired Grid().Size()==0 validator check after the wipe.
+    return zone.Entities().empty() && zone.Players().empty() && zone.NetBySession().empty() &&
+           zone.Commands().Empty();
+}
+
+bool ZoneManager::RetireZone(ZoneId zone_id)
+{
+    const std::size_t index = FindIndexById(zone_id);
+    if (index >= zones_.size() || !CanRetire(zone_id)) {
+        // Debug builds fail fast: retiring a live zone is always a caller
+        // bug (drain first). Production refuses and the transaction aborts.
+        assert((index >= zones_.size() || CanRetire(zone_id)) &&
+               "RetireZone: zone still holds authority state");
+        return false;
+    }
+    Zone& zone = *zones_[index];
+    // Ghost teardown is ownership-gated like every other zone mutation:
+    // claim the guard (quiescent supervisor window, so it is always free).
+    ZoneWriteGuard guard(zone, "partition retire");
+    GhostSystem::Clear(zone);
+    zone.RefreshResidentCounts();
+    zone.SetSimulationEnabled(false);
+    zone.SetPartition(PartitionState::Retired);
     if (auto* node = FindNodeInRoots(partition_roots_, zone_id)) {
         node->state = PartitionState::Retired;
         node->simulation_enabled = false;
     }
     graph_.Rebuild(zones_);
+    return true;
+}
+
+void ZoneManager::ApplyRegionLimits(int max_partition_depth, float min_zone_size_m)
+{
+    const auto depth =
+        static_cast<std::uint8_t>(std::clamp(max_partition_depth, 1, 255));
+    for (auto& region : regions_) {
+        region.max_partition_depth = depth;
+        region.min_zone_size = min_zone_size_m;
+    }
 }
 
 const std::vector<std::size_t>& ZoneManager::NeighborsOf(std::size_t zone_index) const

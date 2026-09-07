@@ -2,6 +2,7 @@
 
 #include <cmath>
 #include <sstream>
+#include <unordered_map>
 #include <unordered_set>
 #include <vector>
 
@@ -115,6 +116,54 @@ bool ValidateWorldConsistency(ZoneManager& zones,
         return false;
     }
 
+    // Directory <-> tree <-> runtime cross-check (§21): every active leaf
+    // has exactly one assignment pointing at itself; every assignment
+    // resolves to a known zone; staged (uncommitted) zones are never routed
+    // (assignments publish only at commit); retired assignments are tolerated
+    // as in-flight retention.
+    {
+        const auto assignments = directory.AssignmentSnapshot();
+        std::unordered_map<ZoneId, ZoneLocation> by_zone;
+        for (const auto& [id, loc] : assignments) {
+            if (loc.zone != id) {
+                std::ostringstream message;
+                message << "directory: assignment " << id << " points at zone " << loc.zone;
+                return Fail(out_error, message.str());
+            }
+            if (zones.FindIndexById(id) >= zones.ZoneCount()) {
+                std::ostringstream message;
+                message << "directory: assignment points at unknown zone " << id;
+                return Fail(out_error, message.str());
+            }
+            by_zone.emplace(id, loc);
+        }
+        for (ZonePartition* leaf : zones.GetActiveLeaves()) {
+            const auto it = by_zone.find(leaf->zone_id);
+            if (it == by_zone.end()) {
+                std::ostringstream message;
+                message << "directory: active leaf zone " << leaf->zone_id << " has no assignment";
+                return Fail(out_error, message.str());
+            }
+            const std::size_t index = zones.FindIndexById(leaf->zone_id);
+            const auto& zone = zones.GetZone(index);
+            if (!zone.SimulationEnabled() || zone.Partition() != PartitionState::Leaf) {
+                std::ostringstream message;
+                message << "topology: active leaf zone " << leaf->zone_id
+                        << " is not a simulating leaf runtime";
+                return Fail(out_error, message.str());
+            }
+        }
+        for (std::size_t i = 0; i < zones.ZoneCount(); ++i) {
+            const auto& zone = zones.GetZone(i);
+            if (zone.Partition() == PartitionState::Staging &&
+                by_zone.find(zone.Id()) != by_zone.end()) {
+                std::ostringstream message;
+                message << "directory: staged zone " << zone.Id() << " routed before commit";
+                return Fail(out_error, message.str());
+            }
+        }
+    }
+
     std::unordered_set<std::uint32_t> authoritative_nets;
 
     for (std::size_t i = 0; i < zones.ZoneCount(); ++i) {
@@ -123,7 +172,41 @@ bool ValidateWorldConsistency(ZoneManager& zones,
         // Only simulating leaves hold authority. Anything else must be
         // empty (drained before retirement).
         if (!zone.SimulationEnabled() || zone.Partition() != PartitionState::Leaf) {
-            if (!zone.Entities().empty() || !zone.Players().empty()) {
+            if (zone.Partition() == PartitionState::Retired) {
+                // Retired: zero authority state of every kind (§19). No
+                // entities, no bindings, no session mappings, no queued
+                // commands, no spatial entries, no ghosts, no simulation.
+                if (!zone.Entities().empty()) {
+                    std::ostringstream message;
+                    message << "zone " << zone.Id() << ": retired zone holds indexed entities";
+                    return Fail(out_error, message.str());
+                }
+                if (!zone.Players().empty() || !zone.NetBySession().empty()) {
+                    std::ostringstream message;
+                    message << "zone " << zone.Id() << ": retired zone holds player state";
+                    return Fail(out_error, message.str());
+                }
+                if (!zone.Commands().Empty()) {
+                    std::ostringstream message;
+                    message << "zone " << zone.Id() << ": retired zone holds queued commands";
+                    return Fail(out_error, message.str());
+                }
+                if (zone.Grid().Size() != 0) {
+                    std::ostringstream message;
+                    message << "zone " << zone.Id() << ": retired zone holds spatial entries";
+                    return Fail(out_error, message.str());
+                }
+                if (!zone.Ghosts().empty()) {
+                    std::ostringstream message;
+                    message << "zone " << zone.Id() << ": retired zone holds ghosts";
+                    return Fail(out_error, message.str());
+                }
+                if (zone.SimulationEnabled()) {
+                    std::ostringstream message;
+                    message << "zone " << zone.Id() << ": retired zone still simulating";
+                    return Fail(out_error, message.str());
+                }
+            } else if (!zone.Entities().empty() || !zone.Players().empty()) {
                 std::ostringstream message;
                 message << "zone " << zone.Id() << ": non-authoritative zone still holds residents";
                 return Fail(out_error, message.str());
@@ -163,6 +246,16 @@ bool ValidateWorldConsistency(ZoneManager& zones,
                 std::ostringstream message;
                 message << "zone " << zone.Id() << ": net_by_session disagrees for session "
                         << binding.session->Id();
+                return Fail(out_error, message.str());
+            }
+            // Reverse direction (§22): every live binding has a matching
+            // OwnerMap entry pointing back here.
+            const auto owner_it = owners.find(binding.session->Id());
+            if (owner_it == owners.end() || owner_it->second.net_id != net_id ||
+                owner_it->second.zone_index != i || owner_it->second.location.zone != zone.Id()) {
+                std::ostringstream message;
+                message << "zone " << zone.Id() << ": player net " << net_id
+                        << " has no matching OwnerMap entry";
                 return Fail(out_error, message.str());
             }
         }
@@ -221,6 +314,13 @@ bool ValidateWorldConsistency(ZoneManager& zones,
             std::ostringstream message;
             message << "owner map: session " << session_id << " location zone "
                     << owner.location.zone << " disagrees with indexed zone " << zone.Id();
+            return Fail(out_error, message.str());
+        }
+        // Owners must point at live authority, never at retired/frozen zones.
+        if (!zone.SimulationEnabled() || zone.Partition() != PartitionState::Leaf) {
+            std::ostringstream message;
+            message << "owner map: session " << session_id << " routed to non-authoritative zone "
+                    << zone.Id();
             return Fail(out_error, message.str());
         }
         if (owner.entity != ToGlobalEntityId(owner.net_id, NamespaceOf(owner.entity))) {

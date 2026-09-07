@@ -117,6 +117,12 @@ void WorldDirectory::RetireZones(const std::vector<ZoneId>& zone_ids)
     }
 }
 
+std::vector<std::pair<ZoneId, ZoneLocation>> WorldDirectory::AssignmentSnapshot() const
+{
+    std::lock_guard lock(mutex_);
+    return std::vector<std::pair<ZoneId, ZoneLocation>>(assignments_.begin(), assignments_.end());
+}
+
 void WorldDirectory::SetZoneDrained(ZoneId zone, bool drained)
 {
     std::lock_guard lock(mutex_);

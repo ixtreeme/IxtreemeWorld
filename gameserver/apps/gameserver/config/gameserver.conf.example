@@ -16,8 +16,8 @@ log_file=logs/gameserver.log
 # Dynamic zone partitioning (control plane ~1 Hz; simulation stays 20 Hz).
 # Scores are normalized load fractions (1.0 == at budget). Merge sits far
 # below split (hysteresis) plus cooldowns, so the topology cannot flap.
-# NOTE: plumbing these keys into the runtime is a TODO; the defaults below
-# match ZoneLoadMonitor::Config / ZoneScheduler::Config in code.
+# All keys are optional; invalid values warn + fall back per field, and the
+# effective set is logged at startup by WorldRuntime::ConfigurePartition.
 partition_split_load_threshold=0.9
 partition_merge_load_threshold=0.25
 partition_sustained_window_seconds=10

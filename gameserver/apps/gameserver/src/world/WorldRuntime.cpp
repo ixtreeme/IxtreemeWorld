@@ -336,9 +336,10 @@ void WorldRuntime::Run()
                     ? static_cast<double>(worker_util.busy_micros) / 1'000'000.0 /
                           static_cast<double>(workers_.WorkerCount()) * 100.0
                     : 0.0;
-            const auto routes = router_.MetricsSnapshot();
-            const auto mig_metrics = migration_.MetricsSnapshot();
-            LOG_INFO("Game sim diag: world_tick={} zones={} active_zones={} sleeping_zones={} active_sessions={} active_mobs={} wandering_mobs={} idle_mobs={} ghosts={} zone_ticks={} empty_zone_skips={} transform_records_sent={} attacks_per_sec={} deaths_total={} respawns_pending={} respawns_total={} migrations={} mig_pending={} mig_quarantined={} mig_detail=[c={} stale={} dup={} retry={} fail={}] routes=[local={} remu={} unav={} drain={} miss={}] workers={} worker_busy_pct={:.1f}                      avg_zone_tick_ms={:.3f} aoi_queries={} dirty_xf={} tiers=[{}/{}/{}] stage_us=[gameplay={} ghost={} repl={}] avg_supervisor_ms={:.3f}",
+             const auto routes = router_.MetricsSnapshot();
+             const auto mig_metrics = migration_.MetricsSnapshot();
+             const auto part_metrics = partition_metrics_.TakeSnapshot();
+            LOG_INFO("Game sim diag: world_tick={} zones={} active_zones={} sleeping_zones={} active_sessions={} active_mobs={} wandering_mobs={} idle_mobs={} ghosts={} zone_ticks={} empty_zone_skips={} transform_records_sent={} attacks_per_sec={} deaths_total={} respawns_pending={} respawns_total={} migrations={} mig_pending={} mig_quarantined={} mig_detail=[c={} stale={} dup={} retry={} fail={}] routes=[local={} remu={} unav={} drain={} miss={}] workers={} worker_busy_pct={:.1f}                      avg_zone_tick_ms={:.3f} aoi_queries={} dirty_xf={} tiers=[{}/{}/{}] stage_us=[gameplay={} ghost={} repl={}] avg_supervisor_ms={:.3f} partition=[s_att={} s_ok={} s_ab={} m_att={} m_ok={} m_ab={} rej={}]",
                      world_tick_.load(),
                      zones_.ZoneCount(),
                      active_zones,
@@ -379,7 +380,14 @@ void WorldRuntime::Run()
                      total_gameplay_micros,
                      total_ghost_micros,
                      total_repl_micros,
-                     avg_supervisor_ms);
+                     avg_supervisor_ms,
+                     part_metrics.split_attempts,
+                     part_metrics.split_commits,
+                     part_metrics.split_aborts,
+                     part_metrics.merge_attempts,
+                     part_metrics.merge_commits,
+                     part_metrics.merge_aborts,
+                     part_metrics.retire_rejected_nonempty);
             do {
                 next_diagnostics += std::chrono::seconds(1);
             } while (now >= next_diagnostics);
@@ -518,6 +526,79 @@ ProcessLoadSnapshot WorldRuntime::CollectProcessLoad() const
     return snapshot;
 }
 
+namespace {
+
+// Rolls back a partially built transfer destination (§7-8). Armed until the
+// transfer commits; the destructor never throws, so a failing rollback step
+// cannot mask the original error (nor terminate the supervisor).
+struct DestinationRollback {
+    Zone* target = nullptr;
+    std::uint32_t net_id = 0;
+    Position position{};
+    flecs::entity entity{};
+    bool applied = false;
+    bool indexed = false;
+    bool gridded = false;
+    bool bound = false;
+    bool rng_moved = false;
+    bool committed = false;
+
+    ~DestinationRollback() noexcept
+    {
+        if (committed || target == nullptr || !applied) {
+            return;
+        }
+        try {
+            if (bound) {
+                target->ErasePlayerBinding(net_id);
+            }
+            if (rng_moved) {
+                target->EraseMobRng(net_id);
+            }
+            if (gridded) {
+                target->Grid().Remove(net_id, position);
+            }
+            if (indexed) {
+                target->UnindexEntity(net_id);
+            }
+            if (entity.is_valid()) {
+                entity.destruct();
+            }
+        } catch (...) {
+            // Rollback is last-resort cleanup: never throw out of it.
+        }
+    }
+
+    void commit() noexcept
+    {
+        committed = true;
+    }
+};
+
+// Deterministic failure injection (§17-18): consume one token if armed.
+// Single consumer (supervisor) + single setter (bench between passes).
+bool ConsumeTestFailure(std::atomic<int>& counter)
+{
+    int remaining = counter.load(std::memory_order_relaxed);
+    while (remaining > 0) {
+        if (counter.compare_exchange_weak(remaining,
+                                          remaining - 1,
+                                          std::memory_order_relaxed)) {
+            return true;
+        }
+    }
+    return false;
+}
+
+std::uint64_t ElapsedUs(std::chrono::steady_clock::time_point from,
+                        std::chrono::steady_clock::time_point to)
+{
+    return static_cast<std::uint64_t>(
+        std::chrono::duration_cast<std::chrono::microseconds>(to - from).count());
+}
+
+} // namespace
+
 void WorldRuntime::ExecutePartitionControl()
 {
     // Topology mutation must never race worker zone ticks: bail unless the
@@ -534,165 +615,356 @@ void WorldRuntime::ExecutePartitionControl()
 
     load_monitor_.Update(zones_, scheduler_, now);
 
-    // ---- splits ----
     // Max one topology mutation per control cycle: staged reshaping, never
     // a multi-split spike in one frame.
     for (const ZoneId zone_id : load_monitor_.SplitCandidates()) {
-        const auto parent_loc = directory_.ResolveZone(zone_id);
-        std::vector<ZoneId> children;
-        if (!zones_.SplitZone(zone_id, children)) {
-            continue;
-        }
-        // Each child gets its own location identity (same node/process as
-        // the parent, own zone id). Sharing the parent's location object
-        // would leave OwnerMap/Directory disagreeing on who owns what.
-        std::unordered_map<ZoneId, ZoneLocation> child_locs;
-        for (const ZoneId child_id : children) {
-            ZoneLocation child_loc = parent_loc.value_or(LocalZoneLocation(identity_, child_id));
-            child_loc.zone = child_id;
-            child_locs.emplace(child_id, child_loc);
-            directory_.SetAssignment(child_id, child_loc);
-        }
+        RunSplitTransaction(zone_id, false);
+        break;
+    }
+    for (const ZoneId parent_id : load_monitor_.MergeCandidates()) {
+        RunMergeTransaction(parent_id, false);
+        break;
+    }
+}
 
-        const std::size_t parent_index = zones_.FindIndexById(zone_id);
-        std::uint64_t moved = 0;
-        std::uint64_t skipped = 0;
-        if (parent_index < zones_.ZoneCount()) {
-            Zone& parent = zones_.GetZone(parent_index);
-            struct Target {
-                ZoneId id = 0;
-                std::size_t index = 0;
-            };
-            std::vector<Target> targets;
-            for (const ZoneId child_id : children) {
-                const std::size_t child_index = zones_.FindIndexById(child_id);
-                if (child_index < zones_.ZoneCount()) {
-                    targets.push_back(Target{child_id, child_index});
-                }
-            }
-            // Route every resident to exactly one child by position
-            // (half-open, same rule as FindLeaf; inclusive fallback so float
-            // edges can never lose an entity).
-            std::vector<std::pair<std::uint32_t, std::size_t>> moves;
-            for (const auto& [net_id, entity] : parent.Entities()) {
-                if (!entity.is_valid() || !entity.has<Position>() || targets.empty()) {
-                    ++skipped;
-                    continue;
-                }
-                const auto pos = entity.get<Position>();
-                std::size_t slot = targets.size();
-                for (std::size_t s = 0; s < targets.size(); ++s) {
-                    const auto& b = zones_.GetZone(targets[s].index).Bounds();
-                    if (pos.x >= b.min_x && pos.x < b.max_x && pos.y >= b.min_y &&
-                        pos.y < b.max_y) {
-                        slot = s;
-                        break;
-                    }
-                }
-                if (slot >= targets.size()) {
-                    for (std::size_t s = 0; s < targets.size(); ++s) {
-                        if (zones_.GetZone(targets[s].index).Bounds().Contains(pos.x, pos.y)) {
-                            slot = s;
-                            break;
-                        }
-                    }
-                    if (slot >= targets.size()) {
-                        slot = 0;
-                    }
-                }
-                moves.emplace_back(net_id, slot);
-            }
-            for (const auto& [net_id, slot] : moves) {
-                const ZoneLocation loc = child_locs[targets[slot].id];
-                if (TransferResident(parent_index, targets[slot].index, loc, net_id)) {
-                    ++moved;
-                } else {
-                    ++skipped;
-                }
-            }
-            parent.RefreshResidentCounts();
-            for (const auto& target : targets) {
-                zones_.GetZone(target.index).RefreshResidentCounts();
-            }
+bool WorldRuntime::ZoneHasPendingMigration(ZoneId zone_id) const
+{
+    for (const auto& request : migration_queue_.RequestSnapshot()) {
+        if (request.source_zone_id == zone_id || request.target_zone_id == zone_id) {
+            return true;
         }
-        zones_.RetireZone(zone_id);
-        directory_.RetireZones({zone_id});
-        LOG_INFO("partition: split zone={} children={} moved={} skipped={}",
-                 zone_id,
-                 children.size(),
-                 moved,
-                 skipped);
-        break; // one split per control cycle
+    }
+    return false;
+}
+
+void WorldRuntime::ExecuteForcedSplit(ZoneId zone_id)
+{
+    if (zones_.AnyTickInProgress()) {
+        LOG_WARN("partition: forced split deferred (tick in flight), re-queued");
+        PostForceSplit(zone_id);
+        return;
+    }
+    RunSplitTransaction(zone_id, true);
+}
+
+void WorldRuntime::ExecuteForcedMerge(ZoneId parent_node_id)
+{
+    if (zones_.AnyTickInProgress()) {
+        LOG_WARN("partition: forced merge deferred (tick in flight), re-queued");
+        PostForceMerge(parent_node_id);
+        return;
+    }
+    RunMergeTransaction(parent_node_id, true);
+}
+
+bool WorldRuntime::RunSplitTransaction(ZoneId zone_id, bool forced)
+{
+    const auto t_plan0 = std::chrono::steady_clock::now();
+    ZoneManager::SplitPlan plan;
+    if (!zones_.PlanSplit(zone_id, plan)) {
+        return false; // routine skip, not an abort
+    }
+    if (ZoneHasPendingMigration(zone_id)) {
+        LOG_INFO("partition: split deferred zone={} (racing migration, retry next cycle)", zone_id);
+        return false;
+    }
+    partition_metrics_.split_plan_us.fetch_add(ElapsedUs(t_plan0, std::chrono::steady_clock::now()),
+                                               std::memory_order_relaxed);
+    partition_metrics_.split_attempts.fetch_add(1, std::memory_order_relaxed);
+
+    std::vector<ZoneId> children;
+    if (!zones_.CreateStagedSplit(plan, children)) {
+        partition_metrics_.split_aborts.fetch_add(1, std::memory_order_relaxed);
+        LOG_WARN("partition: split ABORTED zone={} (staging failed, parent restored)", zone_id);
+        return false;
+    }
+    const std::size_t parent_index = plan.parent_index;
+
+    // Per-child locations (same node/process as the parent, own zone id).
+    // Published ONLY at commit: nothing routes here prematurely (§11).
+    const auto parent_loc = directory_.ResolveZone(zone_id);
+    std::unordered_map<ZoneId, ZoneLocation> child_locs;
+    for (const ZoneId child_id : children) {
+        ZoneLocation child_loc = parent_loc.value_or(LocalZoneLocation(identity_, child_id));
+        child_loc.zone = child_id;
+        child_locs.emplace(child_id, child_loc);
     }
 
-    // ---- merges ----
-    for (const ZoneId parent_id : load_monitor_.MergeCandidates()) {
-        ZonePartition* parent_node = nullptr;
-        for (const auto& root : zones_.PartitionRoots()) {
-            parent_node = FindPartitionNode(root.get(), parent_id);
-            if (parent_node != nullptr) {
+    struct PlannedMove {
+        std::uint32_t net_id = 0;
+        std::size_t target_index = 0;
+        ZoneId target_id = 0;
+    };
+    auto abort_split = [&](const char* reason, std::vector<PlannedMove>& moved) -> bool {
+        const auto t_rb0 = std::chrono::steady_clock::now();
+        std::uint64_t rb_fail = 0;
+        ZoneLocation back = parent_loc.value_or(LocalZoneLocation(identity_, zone_id));
+        back.zone = zone_id;
+        for (auto it = moved.rbegin(); it != moved.rend(); ++it) {
+            if (!TransferResident(it->target_index, parent_index, back, it->net_id)) {
+                ++rb_fail;
+                LOG_ERROR("partition: split rollback failed net_id={} (stays staged; validator "
+                          "will flag loudly)",
+                          it->net_id);
+            }
+        }
+        zones_.AbortSplit(zone_id, children);
+        partition_metrics_.split_aborts.fetch_add(1, std::memory_order_relaxed);
+        partition_metrics_.split_rollback_failures.fetch_add(rb_fail, std::memory_order_relaxed);
+        partition_metrics_.split_rollback_us.fetch_add(
+            ElapsedUs(t_rb0, std::chrono::steady_clock::now()), std::memory_order_relaxed);
+        LOG_WARN("partition: split ABORTED zone={} reason={} moved={} rb_fail={} (parent restored)",
+                 zone_id,
+                 reason,
+                 moved.size(),
+                 rb_fail);
+        return false;
+    };
+
+    // ---- Transfer: route every resident to exactly one child (half-open,
+    // same rule as FindLeaf). An unroutable entity ABORTS the split (§24):
+    // silent misplacement would corrupt authority.
+    const auto t_xfer0 = std::chrono::steady_clock::now();
+    Zone& parent = zones_.GetZone(parent_index);
+    std::vector<PlannedMove> moves;
+    bool routable = true;
+    for (const auto& [net_id, entity] : parent.Entities()) {
+        if (!entity.is_valid() || !entity.has<Position>()) {
+            routable = false;
+            break;
+        }
+        const auto pos = entity.get<Position>();
+        ZoneId match_id = 0;
+        std::size_t match_index = 0;
+        bool matched = false;
+        for (const ZoneId child_id : children) {
+            const std::size_t child_index = zones_.FindIndexById(child_id);
+            const auto& b = zones_.GetZone(child_index).Bounds();
+            if (pos.x >= b.min_x && pos.x < b.max_x && pos.y >= b.min_y && pos.y < b.max_y) {
+                match_id = child_id;
+                match_index = child_index;
+                matched = true;
                 break;
             }
         }
-        if (parent_node == nullptr || parent_node->children.size() < 2) {
-            continue;
-        }
-        std::vector<ZoneId> child_ids;
-        for (const auto& child : parent_node->children) {
-            child_ids.push_back(child->zone_id);
-        }
-        const auto loc = directory_.ResolveZone(parent_id);
-        ZoneId merged_id = 0;
-        if (!zones_.MergeZones(child_ids, merged_id)) {
-            continue;
-        }
-        const std::size_t merged_index = zones_.FindIndexById(merged_id);
-        std::uint64_t moved = 0;
-        std::uint64_t skipped = 0;
-        if (merged_index < zones_.ZoneCount()) {
-            Zone& merged = zones_.GetZone(merged_index);
-            ZoneLocation merged_loc = loc.value_or(LocalZoneLocation(identity_, merged_id));
-            merged_loc.zone = merged_id;
-            for (const ZoneId child_id : child_ids) {
+        if (!matched) {
+            for (const ZoneId child_id : children) {
                 const std::size_t child_index = zones_.FindIndexById(child_id);
-                if (child_index >= zones_.ZoneCount()) {
-                    continue;
+                if (zones_.GetZone(child_index).Bounds().Contains(pos.x, pos.y)) {
+                    match_id = child_id;
+                    match_index = child_index;
+                    matched = true;
+                    break;
                 }
-                Zone& child = zones_.GetZone(child_index);
-                std::vector<std::uint32_t> residents;
-                for (const auto& [net_id, entity] : child.Entities()) {
-                    if (entity.is_valid()) {
-                        residents.push_back(net_id);
-                    } else {
-                        ++skipped;
-                    }
-                }
-                for (const std::uint32_t net_id : residents) {
-                    if (TransferResident(child_index, merged_index, merged_loc, net_id)) {
-                        ++moved;
-                    } else {
-                        ++skipped;
-                    }
-                }
-                child.RefreshResidentCounts();
             }
-            merged.RefreshResidentCounts();
         }
-        for (const ZoneId child_id : child_ids) {
-            zones_.RetireZone(child_id);
+        if (!matched) {
+            LOG_ERROR("partition: split abort, net_id={} at ({},{}) matches no child of zone {}",
+                      net_id,
+                      pos.x,
+                      pos.y,
+                      zone_id);
+            routable = false;
+            break;
         }
-        directory_.RetireZones(child_ids);
-        ZoneLocation merged_dir_loc = loc.value_or(LocalZoneLocation(identity_, merged_id));
-        merged_dir_loc.zone = merged_id;
-        directory_.SetAssignment(merged_id, merged_dir_loc);
-        LOG_INFO("partition: merge parent={} merged={} children={} moved={} skipped={}",
-                 parent_id,
-                 merged_id,
-                 child_ids.size(),
-                 moved,
-                 skipped);
-        break; // one merge per control cycle
+        moves.push_back(PlannedMove{net_id, match_index, match_id});
     }
+    if (!routable) {
+        std::vector<PlannedMove> empty;
+        return abort_split("unroutable-resident", empty);
+    }
+    // Only COMPLETED moves are ever reversed: aborting over the planned
+    // list would "roll back" entities that never left the source (their
+    // reverse lookup fails loudly and spuriously).
+    std::vector<PlannedMove> completed;
+    for (const auto& move : moves) {
+        if (!TransferResident(parent_index, move.target_index, child_locs[move.target_id],
+                              move.net_id)) {
+            partition_metrics_.split_transfer_failures.fetch_add(1, std::memory_order_relaxed);
+            return abort_split("transfer-failed", completed);
+        }
+        completed.push_back(move);
+    }
+    partition_metrics_.split_transfer_us.fetch_add(
+        ElapsedUs(t_xfer0, std::chrono::steady_clock::now()), std::memory_order_relaxed);
+
+    // ---- Validate: parent fully drained + every move landed. ----
+    const bool drained =
+        parent.Entities().empty() && parent.Players().empty() && parent.NetBySession().empty();
+    bool landed = drained;
+    if (landed) {
+        for (const auto& move : moves) {
+            if (!zones_.GetZone(move.target_index).FindEntity(move.net_id).is_valid()) {
+                landed = false;
+                break;
+            }
+        }
+    }
+    if (!landed) {
+        return abort_split("validate-failed", moves);
+    }
+
+    // ---- Commit: tree flips + directory publish + counts. ----
+    const auto t_commit0 = std::chrono::steady_clock::now();
+    if (!zones_.CommitSplit(zone_id, children)) {
+        return abort_split("commit-refused", moves);
+    }
+    for (const ZoneId child_id : children) {
+        directory_.SetAssignment(child_id, child_locs[child_id]);
+    }
+    directory_.RetireZones({zone_id});
+    parent.RefreshResidentCounts();
+    for (const ZoneId child_id : children) {
+        zones_.GetZone(zones_.FindIndexById(child_id)).RefreshResidentCounts();
+    }
+    partition_metrics_.split_commits.fetch_add(1, std::memory_order_relaxed);
+    partition_metrics_.split_commit_us.fetch_add(
+        ElapsedUs(t_commit0, std::chrono::steady_clock::now()), std::memory_order_relaxed);
+    LOG_INFO("partition: split {} zone={} children={} moved={}",
+             forced ? "FORCED-COMMIT" : "COMMIT",
+             zone_id,
+             children.size(),
+             moves.size());
+    return true;
+}
+
+bool WorldRuntime::RunMergeTransaction(ZoneId parent_node_id, bool forced)
+{
+    const auto t_plan0 = std::chrono::steady_clock::now();
+    ZoneManager::MergePlan plan;
+    if (!zones_.PlanMerge(parent_node_id, plan)) {
+        return false; // routine skip, not an abort
+    }
+    for (const ZoneId child_id : plan.child_ids) {
+        if (ZoneHasPendingMigration(child_id)) {
+            LOG_INFO("partition: merge deferred parent={} (racing migration, retry next cycle)",
+                     parent_node_id);
+            return false;
+        }
+    }
+    partition_metrics_.merge_plan_us.fetch_add(ElapsedUs(t_plan0, std::chrono::steady_clock::now()),
+                                               std::memory_order_relaxed);
+    partition_metrics_.merge_attempts.fetch_add(1, std::memory_order_relaxed);
+
+    ZoneId merged_id = 0;
+    if (!zones_.CreateStagedMergeTarget(plan, merged_id)) {
+        partition_metrics_.merge_aborts.fetch_add(1, std::memory_order_relaxed);
+        LOG_WARN("partition: merge ABORTED parent={} (staging failed, children restored)",
+                 parent_node_id);
+        return false;
+    }
+    const std::size_t merged_index = zones_.FindIndexById(merged_id);
+    const auto loc = directory_.ResolveZone(parent_node_id);
+    ZoneLocation merged_loc = loc.value_or(LocalZoneLocation(identity_, merged_id));
+    merged_loc.zone = merged_id;
+
+    auto abort_merge = [&](const char* reason, std::vector<std::uint32_t>& moved_from,
+                           const std::unordered_map<std::uint32_t, ZoneId>& home) -> bool {
+        const auto t_rb0 = std::chrono::steady_clock::now();
+        std::uint64_t rb_fail = 0;
+        for (auto it = moved_from.rbegin(); it != moved_from.rend(); ++it) {
+            const auto home_it = home.find(*it);
+            if (home_it == home.end()) {
+                ++rb_fail;
+                continue;
+            }
+            ZoneLocation back = loc.value_or(LocalZoneLocation(identity_, home_it->second));
+            back.zone = home_it->second;
+            const std::size_t home_index = zones_.FindIndexById(home_it->second);
+            if (!TransferResident(merged_index, home_index, back, *it)) {
+                ++rb_fail;
+                LOG_ERROR("partition: merge rollback failed net_id={} (stays staged; validator "
+                          "will flag loudly)",
+                          *it);
+            }
+        }
+        zones_.AbortMerge(plan, merged_id);
+        partition_metrics_.merge_aborts.fetch_add(1, std::memory_order_relaxed);
+        partition_metrics_.merge_rollback_failures.fetch_add(rb_fail, std::memory_order_relaxed);
+        partition_metrics_.merge_rollback_us.fetch_add(
+            ElapsedUs(t_rb0, std::chrono::steady_clock::now()), std::memory_order_relaxed);
+        LOG_WARN("partition: merge ABORTED parent={} reason={} moved={} rb_fail={} (children "
+                 "restored)",
+                 parent_node_id,
+                 reason,
+                 moved_from.size(),
+                 rb_fail);
+        return false;
+    };
+
+    // ---- Transfer: every child resident into the staged target. ----
+    const auto t_xfer0 = std::chrono::steady_clock::now();
+    std::vector<std::uint32_t> moved;
+    std::unordered_map<std::uint32_t, ZoneId> home; // net -> child ZoneId for rollback
+    for (const ZoneId child_id : plan.child_ids) {
+        const std::size_t child_index = zones_.FindIndexById(child_id);
+        if (child_index >= zones_.ZoneCount()) {
+            return abort_merge("child-vanished", moved, home);
+        }
+        Zone& child = zones_.GetZone(child_index);
+        std::vector<std::uint32_t> residents;
+        for (const auto& [net_id, entity] : child.Entities()) {
+            if (!entity.is_valid() || !entity.has<Position>()) {
+                return abort_merge("stale-resident", moved, home);
+            }
+            residents.push_back(net_id);
+        }
+        for (const std::uint32_t net_id : residents) {
+            if (!TransferResident(child_index, merged_index, merged_loc, net_id)) {
+                partition_metrics_.merge_transfer_failures.fetch_add(1, std::memory_order_relaxed);
+                return abort_merge("transfer-failed", moved, home);
+            }
+            moved.push_back(net_id);
+            home.emplace(net_id, child_id);
+        }
+        child.RefreshResidentCounts();
+    }
+    partition_metrics_.merge_transfer_us.fetch_add(
+        ElapsedUs(t_xfer0, std::chrono::steady_clock::now()), std::memory_order_relaxed);
+
+    // ---- Validate: children drained + merged holds everything. ----
+    bool ok = true;
+    for (const ZoneId child_id : plan.child_ids) {
+        const Zone& child = zones_.GetZone(zones_.FindIndexById(child_id));
+        if (!child.Entities().empty() || !child.Players().empty() ||
+            !child.NetBySession().empty()) {
+            ok = false;
+            break;
+        }
+    }
+    if (ok) {
+        Zone& merged = zones_.GetZone(merged_index);
+        for (const std::uint32_t net_id : moved) {
+            if (!merged.FindEntity(net_id).is_valid()) {
+                ok = false;
+                break;
+            }
+        }
+        merged.RefreshResidentCounts();
+    }
+    if (!ok) {
+        return abort_merge("validate-failed", moved, home);
+    }
+
+    // ---- Commit: tree collapse + children retire + directory publish. ----
+    const auto t_commit0 = std::chrono::steady_clock::now();
+    if (!zones_.CommitMerge(plan, merged_id)) {
+        return abort_merge("commit-refused", moved, home);
+    }
+    directory_.RetireZones(plan.child_ids);
+    ZoneLocation merged_dir_loc = loc.value_or(LocalZoneLocation(identity_, merged_id));
+    merged_dir_loc.zone = merged_id;
+    directory_.SetAssignment(merged_id, merged_dir_loc);
+    partition_metrics_.merge_commits.fetch_add(1, std::memory_order_relaxed);
+    partition_metrics_.merge_commit_us.fetch_add(
+        ElapsedUs(t_commit0, std::chrono::steady_clock::now()), std::memory_order_relaxed);
+    LOG_INFO("partition: merge {} parent={} merged={} children={} moved={}",
+             forced ? "FORCED-COMMIT" : "COMMIT",
+             parent_node_id,
+             merged_id,
+             plan.child_ids.size(),
+             moved.size());
+    return true;
 }
 
 bool WorldRuntime::TransferResident(std::size_t source_zone_index,
@@ -730,14 +1002,33 @@ bool WorldRuntime::TransferResidentLocked(Zone& source_zone,
         return false;
     }
     const bool is_player = entity.has<PlayerTag>();
-    if (is_player && source_zone.FindPlayer(net_id) == nullptr) {
+    gs::common::SessionId session_id = 0;
+    if (is_player) {
+        const auto* binding = source_zone.FindPlayer(net_id);
+        if (binding == nullptr) {
+            return false;
+        }
+        session_id = binding->session ? binding->session->Id() : 0;
+    }
+
+    // Failure-injection grace window: let the first N transfers succeed so
+    // mid-batch aborts are reproducible. Single supervisor consumer, so a
+    // plain load/store pair is race-free in practice.
+    bool failure_armed = true;
+    const int grace = test_fail_after_count_.load(std::memory_order_relaxed);
+    if (grace > 0) {
+        test_fail_after_count_.store(grace - 1, std::memory_order_relaxed);
+        failure_armed = false;
+    }
+
+    // Injected snapshot-stage failure: before ANY mutation, source untouched.
+    if (failure_armed && ConsumeTestFailure(test_fail_snapshot_count_)) {
+        LOG_WARN("partition: injected snapshot failure net_id={} (source untouched)", net_id);
         return false;
     }
 
     // Same authority-transfer primitive as MigrationCoordinator, but
-    // apply-first: the source is released only after the target accepted,
-    // so a failure leaves the source untouched (no rollback/quarantine
-    // needed on this always-local path).
+    // apply-first: the source is released only after the target accepted.
     EntityTransfer transfer;
     try {
         transfer = BuildTransfer(entity, is_player, NamespaceFor(identity_));
@@ -750,43 +1041,154 @@ bool WorldRuntime::TransferResidentLocked(Zone& source_zone,
     }
 
     transfer.position.z = terrain_.SampleGroundHeight(transfer.position.x, transfer.position.y);
+    DestinationRollback rollback;
+    rollback.target = &target_zone;
+    rollback.net_id = net_id;
+    rollback.position = transfer.position;
     try {
         GhostSystem::RemoveByNetId(target_zone, net_id);
-        auto new_entity = ApplyTransfer(target_zone.World(), transfer);
-        target_zone.IndexEntity(net_id, new_entity);
+        rollback.entity = ApplyTransfer(target_zone.World(), transfer);
+        rollback.applied = true;
+        target_zone.IndexEntity(net_id, rollback.entity);
+        rollback.indexed = true;
         target_zone.Grid().Insert(net_id, transfer.position);
+        rollback.gridded = true;
     } catch (const std::exception& error) {
         LOG_ERROR("partition: net_id={} apply failed, source untouched: {}", net_id, error.what());
-        return false;
+        return false; // guard destroys the partial destination
     } catch (...) {
         LOG_ERROR("partition: net_id={} apply failed (unknown), source untouched", net_id);
+        return false; // guard destroys the partial destination
+    }
+
+    // Injected apply-stage failure: destination fully built, source still
+    // authoritative. The guard must remove every destination trace.
+    if (failure_armed && ConsumeTestFailure(test_fail_apply_count_)) {
+        LOG_WARN("partition: injected apply failure net_id={} (rollback engages)", net_id);
         return false;
     }
 
-    if (is_player) {
-        auto binding = source_zone.ExtractPlayerBinding(net_id);
-        const auto session_id = binding.session ? binding.session->Id() : 0;
-        target_zone.InsertPlayerBinding(net_id, std::move(binding));
-        if (session_id != 0) {
-            OwnerInfo owner;
-            owner.entity = transfer.entity_id;
-            owner.location = target_location;
-            owner.zone_index = target_zone_index;
-            owner.net_id = net_id;
-            owners_by_session_[session_id] = owner;
+    // Move session/RNG state. If anything here throws, extracted state is
+    // restored to the source and the guard rolls the destination back, so
+    // neither side is left partial.
+    Zone::PlayerBinding moved_binding;
+    std::optional<std::mt19937> moved_rng;
+    try {
+        if (is_player) {
+            moved_binding = source_zone.ExtractPlayerBinding(net_id);
+            target_zone.InsertPlayerBinding(net_id, std::move(moved_binding));
+            rollback.bound = true;
+        } else {
+            moved_rng = source_zone.ExtractMobRng(net_id);
+            if (moved_rng) {
+                target_zone.InsertMobRng(net_id, std::move(*moved_rng));
+                rollback.rng_moved = true;
+            }
         }
-    } else {
-        auto rng = source_zone.ExtractMobRng(net_id);
-        if (rng) {
-            target_zone.InsertMobRng(net_id, std::move(*rng));
+    } catch (const std::exception& error) {
+        LOG_ERROR("partition: net_id={} state move failed: {}", net_id, error.what());
+        try {
+            if (is_player) {
+                source_zone.InsertPlayerBinding(net_id, std::move(moved_binding));
+            } else if (moved_rng) {
+                source_zone.InsertMobRng(net_id, std::move(*moved_rng));
+            }
+        } catch (...) {
+            // Source restore is best-effort; the entity itself was never
+            // released, so authority never forked.
         }
+        return false; // guard rolls back the destination
+    } catch (...) {
+        LOG_ERROR("partition: net_id={} state move failed (unknown)", net_id);
+        return false;
     }
 
+    // ---- COMMIT POINT (§10): release the source. From here the destination
+    // is the single authority. Unobservable before this line: both write
+    // guards held, no tick in flight, staged zones unscheduled/unrouted. ----
     source_zone.Grid().Remove(net_id, transfer.position);
     entity.destruct();
     source_zone.UnindexEntity(net_id);
     source_zone.EraseMobRng(net_id);
+    rollback.commit();
+
+    // Routing follows authority (post-commit; allocation failure here is
+    // fatal-class and cannot fork authority).
+    if (is_player && session_id != 0) {
+        OwnerInfo owner;
+        owner.entity = transfer.entity_id;
+        owner.location = target_location;
+        owner.zone_index = target_zone_index;
+        owner.net_id = net_id;
+        owners_by_session_[session_id] = owner;
+    }
     return true;
+}
+
+void WorldRuntime::ConfigurePartition(const PartitionConfig& config)
+{
+    const auto validated = ValidatePartitionConfig(config);
+    for (const auto& warning : validated.warnings) {
+        LOG_WARN("{}", warning);
+    }
+    const PartitionConfig& e = validated.effective;
+
+    ZoneLoadMonitor::Config monitor;
+    monitor.split_load_threshold = e.split_load_threshold;
+    monitor.merge_load_threshold = e.merge_load_threshold;
+    monitor.sustained_window = std::chrono::seconds(e.sustained_window_seconds);
+    monitor.split_cooldown = std::chrono::seconds(e.split_cooldown_seconds);
+    monitor.merge_cooldown = std::chrono::seconds(e.merge_cooldown_seconds);
+    monitor.tick_budget_ms = e.tick_budget_ms;
+    monitor.resident_budget = e.resident_budget;
+    load_monitor_ = ZoneLoadMonitor(monitor); // resets sustained timers; call pre-Start or idle
+
+    scheduler_.config.split_load_threshold = e.split_load_threshold;
+    scheduler_.config.merge_load_threshold = e.merge_load_threshold;
+    scheduler_.config.sustained_window = std::chrono::seconds(e.sustained_window_seconds);
+    scheduler_.config.split_cooldown = std::chrono::seconds(e.split_cooldown_seconds);
+    scheduler_.config.merge_cooldown = std::chrono::seconds(e.merge_cooldown_seconds);
+    scheduler_.config.max_depth = static_cast<std::uint8_t>(e.max_partition_depth);
+
+    zones_.ApplyRegionLimits(e.max_partition_depth, e.min_zone_size_m);
+    effective_partition_config_ = e;
+
+    LOG_INFO("partition config effective: split>{:.2f} merge<{:.2f} sustained={}s cooldowns={}s/"
+             "{}s tick_budget={:.1f}ms residents={:.0f} depth<={} minsize={:.0f}m",
+             e.split_load_threshold,
+             e.merge_load_threshold,
+             e.sustained_window_seconds,
+             e.split_cooldown_seconds,
+             e.merge_cooldown_seconds,
+             e.tick_budget_ms,
+             e.resident_budget,
+             e.max_partition_depth,
+             e.min_zone_size_m);
+}
+
+void WorldRuntime::PostForceSplit(ZoneId zone_id)
+{
+    Enqueue([this, zone_id] {
+        ExecuteForcedSplit(zone_id);
+    });
+}
+
+void WorldRuntime::PostForceMerge(ZoneId parent_node_id)
+{
+    Enqueue([this, parent_node_id] {
+        ExecuteForcedMerge(parent_node_id);
+    });
+}
+
+void WorldRuntime::InjectTransferFailuresForTest(int snapshot_failures, int apply_failures,
+                                                  int succeed_first)
+{
+    test_fail_snapshot_count_.store(snapshot_failures < 0 ? 0 : snapshot_failures,
+                                    std::memory_order_relaxed);
+    test_fail_apply_count_.store(apply_failures < 0 ? 0 : apply_failures,
+                                 std::memory_order_relaxed);
+    test_fail_after_count_.store(succeed_first < 0 ? 0 : succeed_first,
+                                 std::memory_order_relaxed);
 }
 
 void WorldRuntime::DrainGlobalCommands()
