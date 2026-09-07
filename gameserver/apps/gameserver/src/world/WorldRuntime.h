@@ -1,6 +1,7 @@
 #pragma once
 
 #include <atomic>
+#include <chrono>
 #include <condition_variable>
 #include <cstdint>
 #include <functional>
@@ -27,6 +28,7 @@
 #include "input/InputRouter.h"
 #include "migration/MigrationCoordinator.h"
 #include "migration/MigrationQueue.h"
+#include "partition/ZoneLoadMonitor.h"
 #include "spawn/SpawnCoordinator.h"
 #include "terrain/TerrainService.h"
 #include "zone/ZoneManager.h"
@@ -150,6 +152,27 @@ private:
     void TickZone(std::size_t zone_index);
     ZoneTickContext BuildZoneTickContext();
     void DrainGlobalCommands();
+    // Slow topology control plane (~Hz): load monitor update + at most the
+    // due split/merge transactions. Runs only when no zone tick is in
+    // flight, so partition mutation never races worker threads.
+    void ExecutePartitionControl();
+    // Moves one resident (player or mob) between two LOCAL zones reusing the
+    // migration authority-transfer primitive (snapshot -> apply -> release).
+    // Acquires both zones' write guards in index order (same convention as
+    // MigrationCoordinator), so the transfer never races worker ticks.
+    bool TransferResident(std::size_t source_zone_index,
+                          std::size_t target_zone_index,
+                          ZoneLocation target_location,
+                          std::uint32_t net_id);
+    // Same transfer with the caller already holding both write guards.
+    // Apply-first ordering: the source is released only after the target
+    // accepted, so a failure leaves the source untouched (no rollback/quarantine
+    // needed on this always-local path).
+    bool TransferResidentLocked(Zone& source_zone,
+                                Zone& target_zone,
+                                std::size_t target_zone_index,
+                                ZoneLocation target_location,
+                                std::uint32_t net_id);
 
     boost::asio::io_context& io_;
     std::thread thread_;
@@ -177,6 +200,11 @@ private:
     SpawnCoordinator spawn_;
     MigrationCoordinator migration_;
     InputRouter inputs_;
+
+    ZoneLoadMonitor load_monitor_;
+    // Slow control-plane cadence (§42): topology decisions at ~1 Hz while
+    // simulation runs at 20 Hz.
+    std::chrono::steady_clock::time_point last_partition_control_{};
 
     std::atomic<std::uint64_t> attacks_since_diag_{0};
     std::atomic<std::uint64_t> attacks_total_{0};

@@ -1,11 +1,14 @@
 #include "WorldValidator.h"
 
+#include <cmath>
 #include <sstream>
 #include <unordered_set>
+#include <vector>
 
 #include "../components/Tags.h"
 #include "../distributed/WorldDirectory.h"
 #include "../migration/MigrationQueue.h"
+#include "../partition/ZonePartition.h"
 #include "../spatial/SpatialValidator.h"
 #include "../zone/Zone.h"
 #include "../zone/ZoneManager.h"
@@ -21,16 +24,112 @@ bool Fail(std::string& out_error, const std::string& message)
 
 } // namespace
 
+namespace {
+
+// Partition topology audit (§47-48): active leaves tile their region roots
+// exactly (no gap, no overlap), only leaves are authoritative, retired
+// zones are empty.
+bool ValidatePartitionTopology(const ZoneManager& zones, std::string& out_error)
+{
+    constexpr float kEps = 0.01f;
+    std::vector<ZonePartition*> leaves;
+    for (const auto& root : zones.PartitionRoots()) {
+        CollectActiveLeaves(root.get(), leaves);
+        // Every active leaf must sit inside its region root (map coverage is
+        // whatever the map defines; split subtrees additionally tile).
+        for (ZonePartition* leaf : leaves) {
+            if (leaf->zone_id != 0 && leaf->region_id == root->region_id) {
+                if (leaf->bounds.min_x < root->bounds.min_x - kEps ||
+                    leaf->bounds.min_y < root->bounds.min_y - kEps ||
+                    leaf->bounds.max_x > root->bounds.max_x + kEps ||
+                    leaf->bounds.max_y > root->bounds.max_y + kEps) {
+                    std::ostringstream message;
+                    message << "partition: leaf zone " << leaf->zone_id
+                            << " escapes its region root";
+                    return Fail(out_error, message.str());
+                }
+            }
+        }
+        // Sibling tiling: enforced for split-created internal nodes only.
+        // Region roots are exempt -- map zones never tile the full quadrant,
+        // and promising otherwise would change spawn/lookup behavior.
+        std::vector<const ZonePartition*> stack{root.get()};
+        while (!stack.empty()) {
+            const ZonePartition* node = stack.back();
+            stack.pop_back();
+            if (node->IsLeaf() || node->parent == nullptr) {
+                for (const auto& child : node->children) {
+                    stack.push_back(child.get());
+                }
+                continue;
+            }
+            float min_x = node->bounds.max_x;
+            float min_y = node->bounds.max_y;
+            float max_x = node->bounds.min_x;
+            float max_y = node->bounds.min_y;
+            for (const auto& child : node->children) {
+                min_x = std::min(min_x, child->bounds.min_x);
+                min_y = std::min(min_y, child->bounds.min_y);
+                max_x = std::max(max_x, child->bounds.max_x);
+                max_y = std::max(max_y, child->bounds.max_y);
+                stack.push_back(child.get());
+            }
+            if (std::abs(min_x - node->bounds.min_x) > kEps ||
+                std::abs(min_y - node->bounds.min_y) > kEps ||
+                std::abs(max_x - node->bounds.max_x) > kEps ||
+                std::abs(max_y - node->bounds.max_y) > kEps) {
+                std::ostringstream message;
+                message << "partition: children of zone " << node->zone_id
+                        << " do not tile the parent bounds";
+                return Fail(out_error, message.str());
+            }
+        }
+    }
+    // Pairwise interior-disjoint active leaves.
+    for (std::size_t i = 0; i < leaves.size(); ++i) {
+        for (std::size_t j = i + 1; j < leaves.size(); ++j) {
+            const auto& a = leaves[i]->bounds;
+            const auto& b = leaves[j]->bounds;
+            const bool overlap = a.min_x < b.max_x - kEps && a.max_x > b.min_x + kEps &&
+                                 a.min_y < b.max_y - kEps && a.max_y > b.min_y + kEps;
+            if (overlap) {
+                std::ostringstream message;
+                message << "partition: active leaves " << leaves[i]->zone_id << " and "
+                        << leaves[j]->zone_id << " overlap";
+                return Fail(out_error, message.str());
+            }
+        }
+    }
+    return true;
+}
+
+} // namespace
+
 bool ValidateWorldConsistency(ZoneManager& zones,
                               const OwnerMap& owners,
                               const MigrationQueue& migrations,
                               const WorldDirectory& directory,
                               std::string& out_error)
 {
+    if (!ValidatePartitionTopology(zones, out_error)) {
+        return false;
+    }
+
     std::unordered_set<std::uint32_t> authoritative_nets;
 
     for (std::size_t i = 0; i < zones.ZoneCount(); ++i) {
         auto& zone = zones.GetZone(i);
+
+        // Only simulating leaves hold authority. Anything else must be
+        // empty (drained before retirement).
+        if (!zone.SimulationEnabled() || zone.Partition() != PartitionState::Leaf) {
+            if (!zone.Entities().empty() || !zone.Players().empty()) {
+                std::ostringstream message;
+                message << "zone " << zone.Id() << ": non-authoritative zone still holds residents";
+                return Fail(out_error, message.str());
+            }
+            continue;
+        }
 
         // Every indexed NetId resolves to a live entity, exactly once world-wide.
         for (const auto& [net_id, entity] : zone.Entities()) {

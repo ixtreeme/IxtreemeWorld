@@ -13,15 +13,21 @@ void WorldDirectory::RebuildFromManager(const ZoneManager& zones)
 {
     std::lock_guard lock(mutex_);
     std::unordered_map<ZoneId, ZoneLocation> rebuilt;
-    rebuilt.reserve(zones.ZoneCount());
-    for (std::size_t i = 0; i < zones.ZoneCount(); ++i) {
-        const ZoneId id = zones.GetZone(i).Id();
+    // Only simulating active leaves receive fresh local assignments.
+    // Retired entries survive for in-flight migration completion.
+    for (ZonePartition* leaf : zones.GetActiveLeaves()) {
+        const ZoneId id = leaf->zone_id;
         const auto override_it = assignments_.find(id);
         if (override_it != assignments_.end() && !IsLocal(override_it->second)) {
             // Keep an explicit (emulated/balancer) remote assignment.
             rebuilt.emplace(id, override_it->second);
         } else {
             rebuilt.emplace(id, LocalZoneLocation(identity_, id));
+        }
+    }
+    for (const auto& [id, loc] : assignments_) {
+        if (retired_zones_.find(id) != retired_zones_.end()) {
+            rebuilt.emplace(id, loc);
         }
     }
     assignments_.swap(rebuilt);
@@ -35,6 +41,24 @@ std::optional<ZoneLocation> WorldDirectory::ResolveZone(ZoneId zone) const
         return std::nullopt;
     }
     return it->second;
+}
+
+std::optional<ZoneLocation> WorldDirectory::ResolveZoneForPosition(
+    float world_x,
+    float world_y,
+    const std::vector<std::unique_ptr<ZonePartition>>& partition_roots) const
+{
+    ZoneId leaf_id = 0;
+    for (const auto& root : partition_roots) {
+        if (auto* leaf = FindLeaf(root.get(), world_x, world_y)) {
+            leaf_id = leaf->zone_id;
+            break;
+        }
+    }
+    if (leaf_id == 0) {
+        return std::nullopt;
+    }
+    return ResolveZone(leaf_id);
 }
 
 bool WorldDirectory::IsLocal(ZoneLocation location) const
@@ -75,12 +99,22 @@ void WorldDirectory::SetAssignment(ZoneId zone, ZoneLocation location)
 {
     std::lock_guard lock(mutex_);
     assignments_[zone] = location;
+    retired_zones_.erase(zone);
 }
 
 void WorldDirectory::ClearAssignment(ZoneId zone)
 {
     std::lock_guard lock(mutex_);
     assignments_[zone] = LocalZoneLocation(identity_, zone);
+    retired_zones_.erase(zone);
+}
+
+void WorldDirectory::RetireZones(const std::vector<ZoneId>& zone_ids)
+{
+    std::lock_guard lock(mutex_);
+    for (const ZoneId id : zone_ids) {
+        retired_zones_.insert(id);
+    }
 }
 
 void WorldDirectory::SetZoneDrained(ZoneId zone, bool drained)

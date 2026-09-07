@@ -12,6 +12,7 @@
 
 #include "RuntimeIds.h"
 #include "ZoneLocation.h"
+#include "../partition/ZonePartition.h"
 
 // World-wide LOGICAL routing information: which (node, process) owns each
 // ZoneId, plus process health. This is deliberately NOT the ZoneManager:
@@ -46,6 +47,12 @@ public:
     void RebuildFromManager(const ZoneManager& zones);
 
     std::optional<ZoneLocation> ResolveZone(ZoneId zone) const;
+    // Tree-aware resolution: descends the partition forest to the active
+    // leaf covering a position. Null when nothing covers it.
+    std::optional<ZoneLocation> ResolveZoneForPosition(
+        float world_x,
+        float world_y,
+        const std::vector<std::unique_ptr<ZonePartition>>& partition_roots) const;
     bool IsLocal(ZoneLocation location) const;
     bool IsDraining(ZoneLocation location) const;
 
@@ -60,6 +67,10 @@ public:
     void SetAssignment(ZoneId zone, ZoneLocation location);
     // Drop the override: the zone is local again.
     void ClearAssignment(ZoneId zone);
+
+    // Merge/split support: keep the entry for in-flight migration
+    // completion, but mark retired so no NEW work routes there.
+    void RetireZones(const std::vector<ZoneId>& zone_ids);
 
     // Mark/unmark a zone as drained (rolling restart / load migration).
     // Drained LOCAL zones still tick and serve residents; they just stop
@@ -82,6 +93,7 @@ private:
     mutable std::mutex mutex_;
     std::unordered_map<ZoneId, ZoneLocation> assignments_;
     std::unordered_set<ZoneId> drained_zones_;
+    std::unordered_set<ZoneId> retired_zones_;
     std::set<std::pair<std::uint32_t, std::uint32_t>> alive_remotes_;
     ProcessStatus local_status_ = ProcessStatus::Alive;
 };

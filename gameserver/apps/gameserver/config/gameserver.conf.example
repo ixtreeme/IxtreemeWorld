@@ -12,3 +12,18 @@ io_threads=2
 # Logging
 log_level=info
 log_file=logs/gameserver.log
+
+# Dynamic zone partitioning (control plane ~1 Hz; simulation stays 20 Hz).
+# Scores are normalized load fractions (1.0 == at budget). Merge sits far
+# below split (hysteresis) plus cooldowns, so the topology cannot flap.
+# NOTE: plumbing these keys into the runtime is a TODO; the defaults below
+# match ZoneLoadMonitor::Config / ZoneScheduler::Config in code.
+partition_split_load_threshold=0.9
+partition_merge_load_threshold=0.25
+partition_sustained_window_seconds=10
+partition_split_cooldown_seconds=30
+partition_merge_cooldown_seconds=60
+partition_tick_budget_ms=16.0
+partition_resident_budget=2000
+partition_max_depth=4
+partition_min_zone_size_m=500.0

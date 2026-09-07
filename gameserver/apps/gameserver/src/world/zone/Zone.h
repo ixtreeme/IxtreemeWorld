@@ -22,6 +22,7 @@
 #include "network/Session.h"
 
 #include "../components/ComponentRegistration.h"
+#include "../partition/PartitionTypes.h"
 #include "../spatial/SpatialGrid.h"
 #include "../visibility/BorderSnapshot.h"
 #include "ZoneCommandQueue.h"
@@ -33,8 +34,6 @@ class TerrainService;
 class MobPrototypeRegistry;
 class ZoneManager;
 class MigrationQueue;
-
-using ZoneId = std::uint32_t;
 
 // Zone activity for sleeping/inactive support. Sleeping is observational:
 // a zone with no players, no mobs and no pending commands performs no
@@ -232,6 +231,40 @@ public:
         activity_.store(activity, std::memory_order_relaxed);
     }
 
+    // Stable logical geography (region lifetime == world lifetime).
+    RegionId Region() const noexcept
+    {
+        return region_id_;
+    }
+    void SetRegion(RegionId region) noexcept
+    {
+        region_id_ = region;
+    }
+
+    // Simulation-topology role. Named Partition()/SetPartition() (not
+    // PartitionState()) so the accessors never hide the PartitionState type
+    // in class scope.
+    PartitionState Partition() const noexcept
+    {
+        return partition_state_;
+    }
+    void SetPartition(PartitionState state) noexcept
+    {
+        partition_state_ = state;
+    }
+
+    // Execution gate: retired/splitting parents stop simulating while
+    // keeping metadata for the tree. The scheduler only ticks simulating
+    // active leaves.
+    bool SimulationEnabled() const noexcept
+    {
+        return simulation_enabled_;
+    }
+    void SetSimulationEnabled(bool enabled) noexcept
+    {
+        simulation_enabled_ = enabled;
+    }
+
     void RefreshResidentCounts();
 
     // Thin tick: drain commands, run domain steps, publish visibility.
@@ -243,6 +276,9 @@ private:
     ZoneId id_;
     std::string name_;
     mx::map::Rect bounds_;
+    RegionId region_id_ = 0;
+    PartitionState partition_state_ = PartitionState::Leaf;
+    bool simulation_enabled_ = true;
     flecs::world world_;
     ZoneCommandQueue commands_;
     SpatialGrid grid_;

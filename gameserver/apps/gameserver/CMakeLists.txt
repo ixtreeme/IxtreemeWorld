@@ -46,6 +46,7 @@ set(GAMESERVER_WORLD_SOURCES
     src/world/distributed/WorldDirectory.cpp
     src/world/distributed/WorldMessageRouter.cpp
     src/world/distributed/MigrationTransport.cpp
+    src/world/partition/ZoneLoadMonitor.cpp
 )
 
 add_executable(gameserver

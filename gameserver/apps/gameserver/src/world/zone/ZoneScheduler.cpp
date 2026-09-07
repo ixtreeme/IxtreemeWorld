@@ -7,6 +7,7 @@
 #include "common/Logging.h"
 
 #include "../WorldConstants.h"
+#include "../partition/ZonePartition.h"
 #include "Zone.h"
 #include "ZoneLoadMetrics.h"
 #include "ZoneManager.h"
@@ -40,8 +41,18 @@ void ZoneScheduler::ScheduleOnce(ZoneManager& zones,
     std::vector<std::pair<std::uint64_t, std::size_t>> due;
     due.reserve(zones.ZoneCount());
 
-    for (std::size_t i = 0; i < zones.ZoneCount(); ++i) {
+    // Only simulating active leaves tick. Retired/split parents keep their
+    // slots (index stability) but are skipped here, so the scheduler never
+    // assumes a fixed zone count.
+    for (ZonePartition* leaf : zones.GetActiveLeaves()) {
+        const std::size_t i = zones.FindIndexById(leaf->zone_id);
+        if (i >= zones.ZoneCount()) {
+            continue;
+        }
         auto& zone = zones.GetZone(i);
+        if (!zone.SimulationEnabled()) {
+            continue;
+        }
         const bool has_commands = !zone.Commands().Empty();
 
         // Sleeping: no players, no mobs, no pending commands. Mob-bearing
@@ -88,6 +99,44 @@ void ZoneScheduler::ScheduleOnce(ZoneManager& zones,
         (void)score;
         pool.Enqueue(index);
     }
+}
+
+bool ZoneScheduler::ShouldSplit(const ZonePartition* leaf,
+                                std::chrono::steady_clock::time_point now) const
+{
+    if (leaf == nullptr || !leaf->IsLeaf() || leaf->depth >= config.max_depth) {
+        return false;
+    }
+    if (leaf->load_score < config.split_load_threshold) {
+        return false;
+    }
+    if (leaf->sustained_breach_since == std::chrono::steady_clock::time_point{}) {
+        return false; // timer not started yet (monitor owns it)
+    }
+    if (now - leaf->sustained_breach_since < config.sustained_window) {
+        return false;
+    }
+    return now - leaf->last_split_time >= config.split_cooldown;
+}
+
+bool ZoneScheduler::ShouldMerge(const ZonePartition* leaf,
+                                std::chrono::steady_clock::time_point now) const
+{
+    if (leaf == nullptr || leaf->depth == 0 || !leaf->IsLeaf()) {
+        return false; // roots never merge
+    }
+    const ZonePartition* parent = leaf->parent;
+    if (parent == nullptr) {
+        return false;
+    }
+    // Whole sibling set must be cool; the monitor dedupes per parent.
+    for (const auto& sibling : parent->children) {
+        if (sibling->state != PartitionState::Leaf || !sibling->simulation_enabled ||
+            sibling->load_score >= config.merge_load_threshold) {
+            return false;
+        }
+    }
+    return now - parent->last_merge_time >= config.merge_cooldown;
 }
 
 void CollectZoneLoadMetrics(const ZoneManager& zones, std::vector<ZoneLoadMetrics>& out)
