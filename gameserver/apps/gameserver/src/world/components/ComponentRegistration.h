@@ -8,6 +8,7 @@
 #include "MobComponents.h"
 #include "MovementComponents.h"
 #include "NetworkComponents.h"
+#include "SimulationLod.h"
 #include "Tags.h"
 #include "TransformComponents.h"
 
@@ -27,6 +28,7 @@ inline void RegisterWorldComponents(flecs::world& world)
     world.component<AttackCooldown>();
     world.component<NetId>();
     world.component<SessionRef>();
+    world.component<SimulationLod>();
     world.component<PlayerTag>();
     world.component<MobTag>();
     world.component<MobTypeRef>();

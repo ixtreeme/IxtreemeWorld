@@ -122,6 +122,27 @@ public:
     {
         return deaths_total_.load(std::memory_order_relaxed);
     }
+    // Cumulative simulation-LOD work totals (§22, §25). Never reset (unlike
+    // the per-second diag windows); the bench derives per-second rates.
+    struct LodWorkTotals {
+        std::uint64_t ai_updates = 0;
+        std::uint64_t move_updates = 0;
+        std::uint64_t promotions = 0;
+        std::uint64_t demotions = 0;
+        std::uint64_t wakes = 0;
+        std::uint64_t eval_us = 0;
+    };
+    LodWorkTotals LodWorkTotalsSnapshot() const noexcept
+    {
+        LodWorkTotals totals;
+        totals.ai_updates = lod_ai_total_.load(std::memory_order_relaxed);
+        totals.move_updates = lod_mv_total_.load(std::memory_order_relaxed);
+        totals.promotions = lod_prom_total_.load(std::memory_order_relaxed);
+        totals.demotions = lod_dem_total_.load(std::memory_order_relaxed);
+        totals.wakes = lod_wake_total_.load(std::memory_order_relaxed);
+        totals.eval_us = lod_eval_us_total_.load(std::memory_order_relaxed);
+        return totals;
+    }
     std::uint64_t AttacksTotal() const noexcept
     {
         return attacks_total_.load(std::memory_order_relaxed);
@@ -155,11 +176,21 @@ public:
     {
         return effective_partition_config_;
     }
+    const LodConfig& EffectiveLodConfig() const noexcept
+    {
+        return effective_lod_config_;
+    }
 
     // Applies a (validated, clamped) partition configuration: monitor +
     // scheduler thresholds and region split limits. Call before Start, or
     // between supervisor passes. Logs every correction + the effective set.
     void ConfigurePartition(const PartitionConfig& config);
+
+    // Applies a (validated, clamped) simulation LOD configuration: tier
+    // bubbles, frequencies, demotion graces. Ticks read it through the tick
+    // context; the scheduler sleep rule follows the same switch. Call
+    // before Start, or between supervisor passes.
+    void ConfigureSimulationLod(const LodConfig& config);
 
     // Test seams (benchmarks/admin). Enqueued to the supervisor thread like
     // any other command; they run the FULL transactional path, only the
@@ -253,6 +284,7 @@ private:
     std::chrono::steady_clock::time_point last_partition_control_{};
     PartitionMetrics partition_metrics_;
     PartitionConfig effective_partition_config_;
+    LodConfig effective_lod_config_;
 
     // Failure-injection hooks for bench/test only (§17-18). Countdowns of
     // transfers to fail: snapshot-stage (before any mutation) or
@@ -267,6 +299,12 @@ private:
     std::atomic<std::uint64_t> attacks_since_diag_{0};
     std::atomic<std::uint64_t> attacks_total_{0};
     std::atomic<std::uint64_t> deaths_total_{0};
+    std::atomic<std::uint64_t> lod_ai_total_{0};
+    std::atomic<std::uint64_t> lod_mv_total_{0};
+    std::atomic<std::uint64_t> lod_prom_total_{0};
+    std::atomic<std::uint64_t> lod_dem_total_{0};
+    std::atomic<std::uint64_t> lod_wake_total_{0};
+    std::atomic<std::uint64_t> lod_eval_us_total_{0};
     std::atomic<std::uint32_t> world_tick_{0};
     std::uint64_t supervisor_micros_since_diag_ = 0;
     std::atomic<std::uint64_t> supervisor_micros_total_{0};

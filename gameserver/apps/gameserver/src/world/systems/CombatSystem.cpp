@@ -16,6 +16,7 @@
 #include "../visibility/GhostSystem.h"
 #include "../zone/Zone.h"
 #include "../zone/ZoneOwnership.h"
+#include "LodSystem.h"
 
 namespace gs::game {
 
@@ -84,6 +85,10 @@ CombatSystem::AttackResult CombatSystem::ProcessAttack(Zone& zone,
     auto target_hp = target_entity.get<Hp>();
     target_hp.current = std::max(0.0f, target_hp.current - damage_dealt);
     target_entity.set<Hp>(target_hp);
+    // Combat is an instant wake trigger (§9-10): a hit target simulates
+    // Fully from here on, regardless of distance tier. The demotion grace
+    // (not this call site) decides when it may cool down again.
+    LodSystem::Wake(zone, target_entity, zone.TickIndex());
     auto attacker_cooldown = attacker_entity.get<AttackCooldown>();
     attacker_cooldown.remaining = std::max(0.0f, attacker_stats.attack_cooldown);
     attacker_entity.set<AttackCooldown>(attacker_cooldown);

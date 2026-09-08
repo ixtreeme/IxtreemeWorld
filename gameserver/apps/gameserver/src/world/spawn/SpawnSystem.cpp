@@ -83,10 +83,15 @@ void SpawnSystem::SpawnMob(Zone& zone,
                       .set<MobSpawnRef>({spawn_point_index})
                       .set<MobProfile>({type.model_id, 1, type.name})
                       .set<MigrateTo>({0})
+                      .set<SimulationLod>({})
                       .add<MobTag>();
 
     zone.IndexEntity(net_id, entity);
     zone.Grid().Insert(net_id, position);
+    // Newborns simulate Fully; the 1 Hz evaluation demotes the irrelevant
+    // ones (no grace history to protect). Synchronous bump keeps the sleep
+    // rule exact before the first recount.
+    zone.NoteLodInsert(SimulationTier::Full);
     zone.RefreshResidentCounts();
 
     LOG_INFO("mob spawned: net_id={} type={} spawn_point={} zone={} pos=({}, {}, {})",

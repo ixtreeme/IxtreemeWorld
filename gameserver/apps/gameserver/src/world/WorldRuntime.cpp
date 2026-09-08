@@ -182,6 +182,7 @@ ZoneTickContext WorldRuntime::BuildZoneTickContext()
                         zones_,
                         &migration_queue_,
                         world_tick_.load(std::memory_order_relaxed),
+                        &effective_lod_config_,
                         [this](std::shared_ptr<gs::network::Session> session, std::vector<std::uint8_t> payload) {
                             SendToSession(io_, session, std::move(payload));
                         },
@@ -285,6 +286,16 @@ void WorldRuntime::Run()
             std::uint64_t total_gameplay_micros = 0;
             std::uint64_t total_ghost_micros = 0;
             std::uint64_t total_repl_micros = 0;
+            std::uint64_t total_lod_ai = 0;
+            std::uint64_t total_lod_mv = 0;
+            std::uint64_t total_lod_prom = 0;
+            std::uint64_t total_lod_dem = 0;
+            std::uint64_t total_lod_wake = 0;
+            std::uint64_t total_lod_eval_us = 0;
+            std::uint64_t lod_full = 0;
+            std::uint64_t lod_reduced = 0;
+            std::uint64_t lod_low = 0;
+            std::uint64_t lod_dormant = 0;
             const auto attacks_per_sec = attacks_since_diag_.exchange(0);
             std::size_t active_zones = 0;
             std::size_t sleeping_zones = 0;
@@ -302,6 +313,10 @@ void WorldRuntime::Run()
                 if (zone.Activity() == ZoneActivity::Sleeping) {
                     ++sleeping_zones;
                 }
+                lod_full += zone.Diagnostics().lod_full.load(std::memory_order_relaxed);
+                lod_reduced += zone.Diagnostics().lod_reduced.load(std::memory_order_relaxed);
+                lod_low += zone.Diagnostics().lod_low.load(std::memory_order_relaxed);
+                lod_dormant += zone.Diagnostics().lod_dormant.load(std::memory_order_relaxed);
                 total_ticks += zone.Diagnostics().ticks_since_diag.exchange(0);
                 total_records += zone.Diagnostics().transform_records_since_diag.exchange(0);
                 total_empty_skips += zone.Diagnostics().empty_skips_since_diag.exchange(0);
@@ -315,7 +330,19 @@ void WorldRuntime::Run()
                 total_gameplay_micros += zone.Diagnostics().gameplay_micros_since_diag.exchange(0);
                 total_ghost_micros += zone.Diagnostics().ghost_micros_since_diag.exchange(0);
                 total_repl_micros += zone.Diagnostics().replication_micros_since_diag.exchange(0);
+                total_lod_ai += zone.Diagnostics().lod_ai_updates_since_diag.exchange(0);
+                total_lod_mv += zone.Diagnostics().lod_move_updates_since_diag.exchange(0);
+                total_lod_prom += zone.Diagnostics().lod_promotions_since_diag.exchange(0);
+                total_lod_dem += zone.Diagnostics().lod_demotions_since_diag.exchange(0);
+                total_lod_wake += zone.Diagnostics().lod_wakes_since_diag.exchange(0);
+                total_lod_eval_us += zone.Diagnostics().lod_eval_us_since_diag.exchange(0);
             }
+            lod_ai_total_.fetch_add(total_lod_ai, std::memory_order_relaxed);
+            lod_mv_total_.fetch_add(total_lod_mv, std::memory_order_relaxed);
+            lod_prom_total_.fetch_add(total_lod_prom, std::memory_order_relaxed);
+            lod_dem_total_.fetch_add(total_lod_dem, std::memory_order_relaxed);
+            lod_wake_total_.fetch_add(total_lod_wake, std::memory_order_relaxed);
+            lod_eval_us_total_.fetch_add(total_lod_eval_us, std::memory_order_relaxed);
             std::size_t active_mobs = 0;
             std::size_t wandering_mobs = 0;
             std::size_t idle_mobs = 0;
@@ -339,7 +366,7 @@ void WorldRuntime::Run()
              const auto routes = router_.MetricsSnapshot();
              const auto mig_metrics = migration_.MetricsSnapshot();
              const auto part_metrics = partition_metrics_.TakeSnapshot();
-            LOG_INFO("Game sim diag: world_tick={} zones={} active_zones={} sleeping_zones={} active_sessions={} active_mobs={} wandering_mobs={} idle_mobs={} ghosts={} zone_ticks={} empty_zone_skips={} transform_records_sent={} attacks_per_sec={} deaths_total={} respawns_pending={} respawns_total={} migrations={} mig_pending={} mig_quarantined={} mig_detail=[c={} stale={} dup={} retry={} fail={}] routes=[local={} remu={} unav={} drain={} miss={}] workers={} worker_busy_pct={:.1f}                      avg_zone_tick_ms={:.3f} aoi_queries={} dirty_xf={} tiers=[{}/{}/{}] stage_us=[gameplay={} ghost={} repl={}] avg_supervisor_ms={:.3f} partition=[s_att={} s_ok={} s_ab={} m_att={} m_ok={} m_ab={} rej={}]",
+            LOG_INFO("Game sim diag: world_tick={} zones={} active_zones={} sleeping_zones={} active_sessions={} active_mobs={} wandering_mobs={} idle_mobs={} ghosts={} zone_ticks={} empty_zone_skips={} transform_records_sent={} attacks_per_sec={} deaths_total={} respawns_pending={} respawns_total={} migrations={} mig_pending={} mig_quarantined={} mig_detail=[c={} stale={} dup={} retry={} fail={}] routes=[local={} remu={} unav={} drain={} miss={}] workers={} worker_busy_pct={:.1f}                      avg_zone_tick_ms={:.3f} aoi_queries={} dirty_xf={} tiers=[{}/{}/{}] stage_us=[gameplay={} ghost={} repl={}] avg_supervisor_ms={:.3f} partition=[s_att={} s_ok={} s_ab={} m_att={} m_ok={} m_ab={} rej={}] lod=[{}/{}/{}/{} ai={} mv={} prom={} dem={} wake={} eval_us={}]",
                      world_tick_.load(),
                      zones_.ZoneCount(),
                      active_zones,
@@ -387,7 +414,17 @@ void WorldRuntime::Run()
                      part_metrics.merge_attempts,
                      part_metrics.merge_commits,
                      part_metrics.merge_aborts,
-                     part_metrics.retire_rejected_nonempty);
+                     part_metrics.retire_rejected_nonempty,
+                     lod_full,
+                     lod_reduced,
+                     lod_low,
+                     lod_dormant,
+                     total_lod_ai,
+                     total_lod_mv,
+                     total_lod_prom,
+                     total_lod_dem,
+                     total_lod_wake,
+                     total_lod_eval_us);
             do {
                 next_diagnostics += std::chrono::seconds(1);
             } while (now >= next_diagnostics);
@@ -1111,6 +1148,10 @@ bool WorldRuntime::TransferResidentLocked(Zone& source_zone,
     source_zone.UnindexEntity(net_id);
     source_zone.EraseMobRng(net_id);
     rollback.commit();
+    if (!is_player) {
+        // LOD state rode along in the transfer payload.
+        target_zone.NoteLodInsert(transfer.sim_lod.tier);
+    }
 
     // Routing follows authority (post-commit; allocation failure here is
     // fatal-class and cannot fork authority).
@@ -1164,6 +1205,28 @@ void WorldRuntime::ConfigurePartition(const PartitionConfig& config)
              e.resident_budget,
              e.max_partition_depth,
              e.min_zone_size_m);
+}
+
+void WorldRuntime::ConfigureSimulationLod(const LodConfig& config)
+{
+    const auto validated = ValidateLodConfig(config);
+    for (const auto& warning : validated.warnings) {
+        LOG_WARN("{}", warning);
+    }
+    effective_lod_config_ = validated.effective;
+    scheduler_.SetLodEnabled(validated.effective.enabled);
+    const LodConfig& e = validated.effective;
+    LOG_INFO("simulation lod effective: enabled={} bubbles=[{:.0f}/{:.0f}/{:.0f}]m hz=[20/{:.1f}/{:.1f}] "
+             "demote=[{:.0f}/{:.0f}/{:.0f}]s",
+             e.enabled,
+             e.full_radius_m,
+             e.reduced_radius_m,
+             e.low_radius_m,
+             e.reduced_hz,
+             e.low_hz,
+             e.demote_full_sec,
+             e.demote_reduced_sec,
+             e.demote_low_sec);
 }
 
 void WorldRuntime::PostForceSplit(ZoneId zone_id)

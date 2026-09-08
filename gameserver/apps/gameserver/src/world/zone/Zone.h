@@ -22,6 +22,7 @@
 #include "network/Session.h"
 
 #include "../components/ComponentRegistration.h"
+#include "../components/SimulationLod.h"
 #include "../partition/PartitionTypes.h"
 #include "../spatial/SpatialGrid.h"
 #include "../visibility/BorderSnapshot.h"
@@ -58,6 +59,9 @@ struct ZoneTickContext {
     // unit-test contexts; MovementSystem checks before use.
     MigrationQueue* migration_queue = nullptr;
     std::uint32_t world_tick = 0;
+    // Simulation LOD config (world-global, owned by WorldRuntime). Null or
+    // disabled = legacy behavior: every entity integrates every tick.
+    const LodConfig* lod = nullptr;
     std::function<void(std::shared_ptr<gs::network::Session>, std::vector<std::uint8_t>)> send;
     std::function<void(std::size_t spawn_point_index, float delay_sec)> respawn_later;
 };
@@ -274,6 +278,23 @@ public:
     }
 
     void RefreshResidentCounts();
+
+    // Synchronous tier-gauge bump for freshly inserted mobs (spawn,
+    // migration/transfer apply). The 1 Hz evaluation recounts exactly, so
+    // this only needs to prevent stale-zero sleep decisions in between.
+    void NoteLodInsert(SimulationTier tier) noexcept
+    {
+        auto& diag = diagnostics_;
+        if (tier == SimulationTier::Full) {
+            diag.lod_full.fetch_add(1, std::memory_order_relaxed);
+        } else if (tier == SimulationTier::Reduced) {
+            diag.lod_reduced.fetch_add(1, std::memory_order_relaxed);
+        } else if (tier == SimulationTier::Low) {
+            diag.lod_low.fetch_add(1, std::memory_order_relaxed);
+        } else {
+            diag.lod_dormant.fetch_add(1, std::memory_order_relaxed);
+        }
+    }
 
     // Thin tick: drain commands, run domain steps, publish visibility.
     // All gameplay detail lives in the systems called from here.

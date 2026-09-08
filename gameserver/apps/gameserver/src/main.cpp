@@ -125,6 +125,34 @@ gs::game::PartitionConfig ResolvePartitionConfig(const gs::common::Config& confi
     return out;
 }
 
+// Simulation LOD configuration. Every key is optional; invalid values warn
+// + fall back per field (see ValidateLodConfig). The effective set is logged
+// by WorldRuntime::ConfigureSimulationLod.
+gs::game::LodConfig ResolveLodConfig(const gs::common::Config& config)
+{
+    gs::game::LodConfig out;
+    const auto enabled = config.GetString("simulation_lod_enabled");
+    if (enabled && (*enabled == "0" || *enabled == "false" || *enabled == "off")) {
+        out.enabled = false;
+    }
+    out.full_radius_m =
+        static_cast<float>(GetDoubleOr(config, "simulation_full_radius_m", out.full_radius_m));
+    out.reduced_radius_m =
+        static_cast<float>(GetDoubleOr(config, "simulation_reduced_radius_m", out.reduced_radius_m));
+    out.low_radius_m =
+        static_cast<float>(GetDoubleOr(config, "simulation_low_radius_m", out.low_radius_m));
+    out.reduced_hz =
+        static_cast<float>(GetDoubleOr(config, "simulation_reduced_hz", out.reduced_hz));
+    out.low_hz = static_cast<float>(GetDoubleOr(config, "simulation_low_hz", out.low_hz));
+    out.demote_full_sec =
+        static_cast<float>(GetDoubleOr(config, "simulation_demote_full_sec", out.demote_full_sec));
+    out.demote_reduced_sec = static_cast<float>(
+        GetDoubleOr(config, "simulation_demote_reduced_sec", out.demote_reduced_sec));
+    out.demote_low_sec =
+        static_cast<float>(GetDoubleOr(config, "simulation_demote_low_sec", out.demote_low_sec));
+    return out;
+}
+
 } // namespace
 
 int main(int argc, char* argv[])
@@ -168,6 +196,7 @@ int main(int argc, char* argv[])
                  gs::game::NamespaceFor(runtime_identity));
         gs::game::WorldRuntime sim(io, runtime_identity);
         sim.ConfigurePartition(ResolvePartitionConfig(config));
+        sim.ConfigureSimulationLod(ResolveLodConfig(config));
         sim.Start();
 
         gs::game::GameConnectionHandler handler(handoff_tokens, characters, sim, game_server);

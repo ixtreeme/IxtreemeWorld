@@ -27,6 +27,13 @@ EntityTransfer BuildTransfer(flecs::entity entity, bool is_player, std::uint16_t
         transfer.mob_type_id = entity.get<MobTypeRef>().id;
         transfer.spawn_point_index = entity.get<MobSpawnRef>().spawn_point_index;
         transfer.profile = entity.get<MobProfile>();
+        // LOD rides along only when present; absence means "treat as fresh
+        // Full" on apply (the validator flags lod-less mobs loudly).
+        if (entity.has<SimulationLod>()) {
+            transfer.sim_lod = entity.get<SimulationLod>();
+        } else {
+            transfer.sim_lod = SimulationLod{};
+        }
     }
     return transfer;
 }
@@ -57,6 +64,7 @@ flecs::entity ApplyTransfer(flecs::world& world, const EntityTransfer& transfer)
             .set<MobTypeRef>({transfer.mob_type_id})
             .set<MobSpawnRef>({transfer.spawn_point_index})
             .set<MobProfile>(transfer.profile)
+            .set<SimulationLod>(transfer.sim_lod)
             .add<MobTag>();
     }
     return entity;

@@ -55,12 +55,18 @@ void ZoneScheduler::ScheduleOnce(ZoneManager& zones,
         }
         const bool has_commands = !zone.Commands().Empty();
 
-        // Sleeping: no players, no mobs, no pending commands. Mob-bearing
-        // zones stay Active -- freezing them would lose gameplay time.
+        // Sleeping: no players, no pending commands, and nothing that needs
+        // full-rate simulation. With LOD on, Low/Dormant-only mob zones may
+        // sleep (their mobs freeze unobservably and resume on wake); without
+        // LOD the legacy mob-bearing rule applies unchanged.
         // Wake is implicit: spawn/migration bump the counts synchronously,
         // and any queued command flips has_commands.
-        if (zone.Diagnostics().player_count.load() == 0 && zone.Diagnostics().mob_count.load() == 0 &&
-            !has_commands) {
+        const auto& diag = zone.Diagnostics();
+        const bool lod_quiet = lod_enabled_ && diag.lod_full.load(std::memory_order_relaxed) == 0 &&
+                               diag.lod_reduced.load(std::memory_order_relaxed) == 0;
+        const bool legacy_quiet = diag.mob_count.load(std::memory_order_relaxed) == 0;
+        if (diag.player_count.load(std::memory_order_relaxed) == 0 && !has_commands &&
+            (legacy_quiet || (lod_enabled_ && lod_quiet))) {
             if (zone.Activity() != ZoneActivity::Sleeping) {
                 zone.SetActivity(ZoneActivity::Sleeping);
                 LOG_DEBUG("Zone {} ('{}') sleeping", zone.Id(), zone.Name());

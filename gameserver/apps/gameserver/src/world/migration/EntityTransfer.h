@@ -12,6 +12,7 @@
 #include "../components/MobComponents.h"
 #include "../components/MovementComponents.h"
 #include "../components/NetworkComponents.h"
+#include "../components/SimulationLod.h"
 #include "../components/TransformComponents.h"
 #include "../distributed/GlobalEntityId.h"
 
@@ -47,6 +48,7 @@ static_assert(std::is_standard_layout_v<Hp>);
 static_assert(std::is_standard_layout_v<CombatStats>);
 static_assert(std::is_standard_layout_v<AttackCooldown>);
 static_assert(std::is_standard_layout_v<WanderState>);
+static_assert(std::is_standard_layout_v<SimulationLod>);
 
 struct EntityTransfer {
     GlobalEntityId entity_id;
@@ -66,6 +68,10 @@ struct EntityTransfer {
     std::uint32_t mob_type_id = 0;
     std::size_t spawn_point_index = 0;
     MobProfile profile;
+    // Simulation LOD state rides along so split/merge/migration never lose
+    // tier, schedule or relevance history. Players never carry it (implicit
+    // Full); ghosts are never transferred.
+    SimulationLod sim_lod;
 };
 
 // NOTE on persistence (§41): this is a RUNTIME handoff DTO, not a save

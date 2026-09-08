@@ -46,6 +46,20 @@ struct ZoneDiagnostics {
     std::atomic<std::uint64_t> ghost_micros_since_diag{0};
     std::atomic<std::uint64_t> replication_micros_since_diag{0};
 
+    // Simulation LOD (§22). Tier gauges are recounted exactly by the 1 Hz
+    // zone evaluation; insert paths bump them synchronously so sleep
+    // decisions never observe a stale zero. Work counters are cumulative.
+    std::atomic<std::uint32_t> lod_full{0};
+    std::atomic<std::uint32_t> lod_reduced{0};
+    std::atomic<std::uint32_t> lod_low{0};
+    std::atomic<std::uint32_t> lod_dormant{0};
+    std::atomic<std::uint64_t> lod_ai_updates_since_diag{0};
+    std::atomic<std::uint64_t> lod_move_updates_since_diag{0};
+    std::atomic<std::uint64_t> lod_promotions_since_diag{0};
+    std::atomic<std::uint64_t> lod_demotions_since_diag{0};
+    std::atomic<std::uint64_t> lod_wakes_since_diag{0};
+    std::atomic<std::uint64_t> lod_eval_us_since_diag{0};
+
     // Recent per-tick wall times (microseconds), newest at head-1.
     std::array<std::atomic<std::uint64_t>, kTickSampleCapacity> tick_samples;
     std::atomic<std::size_t> tick_sample_head{0};

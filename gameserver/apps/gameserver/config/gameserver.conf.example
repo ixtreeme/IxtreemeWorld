@@ -27,3 +27,18 @@ partition_tick_budget_ms=16.0
 partition_resident_budget=2000
 partition_max_depth=4
 partition_min_zone_size_m=500.0
+
+# Simulation LOD (server-side compute tiers, not graphics). Mobs simulate at
+# Full (20 Hz) near players, Reduced/Low farther out, Dormant when nothing is
+# relevant. Promotion is immediate (attack/damage/proximity/spawn/migration);
+# demotion cascades down after per-level graces. All keys optional; invalid
+# values warn + fall back, effective set logged at startup.
+simulation_lod_enabled=true
+simulation_full_radius_m=150.0
+simulation_reduced_radius_m=500.0
+simulation_low_radius_m=1500.0
+simulation_reduced_hz=10.0
+simulation_low_hz=1.0
+simulation_demote_full_sec=5.0
+simulation_demote_reduced_sec=30.0
+simulation_demote_low_sec=60.0

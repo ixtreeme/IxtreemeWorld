@@ -1,6 +1,7 @@
 #include "MovementSystem.h"
 
 #include <algorithm>
+#include <cassert>
 #include <cmath>
 #include <vector>
 
@@ -10,6 +11,7 @@
 #include "../components/MobComponents.h"
 #include "../components/MovementComponents.h"
 #include "../components/NetworkComponents.h"
+#include "../components/SimulationLod.h"
 #include "../components/Tags.h"
 #include "../components/TransformComponents.h"
 #include "../migration/MigrationSystem.h"
@@ -18,6 +20,7 @@
 #include "../zone/Zone.h"
 #include "../zone/ZoneManager.h"
 #include "../zone/ZoneOwnership.h"
+#include "LodSystem.h"
 
 namespace gs::game {
 namespace {
@@ -154,7 +157,33 @@ void MovementSystem::Step(Zone& zone, float dt, ZoneTickContext& ctx)
         }
     });
 
+    // Simulation LOD: mobs integrate only when due, with dt scaled by the
+    // tier period. Skipped ticks lose no time (the due tick integrates the
+    // whole interval) and cause no teleports (velocity-bounded steps).
+    // Players above always integrate every tick. Null/disabled config =
+    // legacy behavior.
+    const bool use_lod = ctx.lod != nullptr && ctx.lod->enabled;
+    // LOD timebase: the zone's own tick counter (see SimulationLod.h).
+    const std::uint32_t now_tick = zone.TickIndex();
+    std::uint64_t integrated = 0;
+
     for (auto entity : mobs) {
+        float dt_eff = dt;
+        SimulationTier tier = SimulationTier::Full;
+        if (use_lod) {
+            if (!entity.has<SimulationLod>()) {
+                // Strays integrate fully (safe direction); the validator
+                // flags lod-less mobs so the creation path gets fixed.
+                assert(false && "Movement on mob without SimulationLod");
+            } else {
+                const auto lod = entity.get<SimulationLod>();
+                if (!LodSystem::IsDue(lod, now_tick)) {
+                    continue;
+                }
+                tier = lod.tier;
+                dt_eff = dt * static_cast<float>(LodPeriodTicks(tier, *ctx.lod));
+            }
+        }
         const auto net = entity.get<NetId>();
         const auto speed = entity.get<MoveSpeed>();
         const auto wander = entity.get<WanderState>();
@@ -172,8 +201,8 @@ void MovementSystem::Step(Zone& zone, float dt, ZoneTickContext& ctx)
         velocity.y = std::cos(intent.dir_angle) * move_speed;
         velocity.z = 0.0f;
 
-        position.x = std::clamp(position.x + velocity.x * dt, 0.0f, max_extent);
-        position.y = std::clamp(position.y + velocity.y * dt, 0.0f, max_extent);
+        position.x = std::clamp(position.x + velocity.x * dt_eff, 0.0f, max_extent);
+        position.y = std::clamp(position.y + velocity.y * dt_eff, 0.0f, max_extent);
 
         const float from_center_x = position.x - wander.spawn_center.x;
         const float from_center_y = position.y - wander.spawn_center.y;
@@ -191,10 +220,19 @@ void MovementSystem::Step(Zone& zone, float dt, ZoneTickContext& ctx)
         entity.set<Heading>(heading);
         entity.set<Velocity>(velocity);
         entity.set<MoveIntent>(intent);
+        if (use_lod && entity.has<SimulationLod>()) {
+            // Advance the entity's own schedule; the tier cannot have
+            // changed under us (transitions happen in eval/promotion only).
+            auto lod = entity.get<SimulationLod>();
+            lod.next_tick = now_tick + LodPeriodTicks(lod.tier, *ctx.lod);
+            entity.set<SimulationLod>(lod);
+        }
+        ++integrated;
         zone.Grid().Move(net.value, old_cell, position);
         MigrationSystem::UpdateMarker(zone, ctx.zones, ctx.migration_queue, net.value, entity, position);
     }
     zone.Diagnostics().transform_dirty_since_diag.fetch_add(moved_entities, std::memory_order_relaxed);
+    zone.Diagnostics().lod_move_updates_since_diag.fetch_add(integrated, std::memory_order_relaxed);
 }
 
 } // namespace gs::game

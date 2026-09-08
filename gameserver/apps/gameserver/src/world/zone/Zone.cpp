@@ -8,6 +8,7 @@
 #include "ZoneOwnership.h"
 #include "../systems/AiSystem.h"
 #include "../systems/CooldownSystem.h"
+#include "../systems/LodSystem.h"
 #include "../systems/MovementSystem.h"
 #include "../visibility/BorderPublisher.h"
 #include "../visibility/GhostSystem.h"
@@ -184,9 +185,17 @@ void Zone::Tick(float dt, ZoneTickContext& ctx)
         ZoneWriteGuard guard(*this, "Zone::Tick");
         DrainCommands();
 
+        // Simulation LOD evaluation (1 Hz, staggered by zone id so zones
+        // decluster across passes). Recomputes tiers + tier gauges before
+        // the gameplay steps of this tick consume them.
+        if (ctx.lod != nullptr && ctx.lod->enabled &&
+            ((zone_tick_ + id_) % LodSystem::kEvalPeriodTicks) == 0) {
+            LodSystem::Evaluate(*this, ctx);
+        }
+
         const auto gameplay_start = Clock::now();
         CooldownSystem::Step(*this, dt);
-        AiSystem::StepWander(*this, dt, ctx.mob_types);
+        AiSystem::StepWander(*this, dt, ctx.mob_types, ctx.lod);
         MovementSystem::Step(*this, dt, ctx);
         AssertZoneOwner(*this, "flecs world progress");
         world_.progress(dt);

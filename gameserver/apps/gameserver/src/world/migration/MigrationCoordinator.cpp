@@ -335,6 +335,9 @@ MigrationOutcome MigrationCoordinator::MigrateMob(Zone& source_zone,
     if (moved_rng) {
         target_zone.InsertMobRng(net_id, std::move(*moved_rng));
     }
+    // The LOD state rode along in the transfer payload; count it so sleep
+    // decisions stay exact before the next evaluation recount.
+    target_zone.NoteLodInsert(transfer.sim_lod.tier);
     target_zone.RefreshResidentCounts();
 
     source_zone.Diagnostics().migrations_since_diag.fetch_add(1, std::memory_order_relaxed);

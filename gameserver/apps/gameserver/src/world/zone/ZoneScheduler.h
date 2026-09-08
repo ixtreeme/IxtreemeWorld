@@ -36,7 +36,17 @@ public:
     bool ShouldSplit(const ZonePartition* leaf, std::chrono::steady_clock::time_point now) const;
     bool ShouldMerge(const ZonePartition* leaf, std::chrono::steady_clock::time_point now) const;
 
+    // Simulation LOD master switch (mirrors LodConfig::enabled, set by
+    // WorldRuntime::ConfigureSimulationLod). Off = legacy sleep rule.
+    void SetLodEnabled(bool enabled) noexcept
+    {
+        lod_enabled_ = enabled;
+    }
+
     Config config;
+
+private:
+    bool lod_enabled_ = true;
 };
 
 } // namespace gs::game

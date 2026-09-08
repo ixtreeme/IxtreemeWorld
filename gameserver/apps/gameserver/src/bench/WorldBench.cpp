@@ -68,6 +68,8 @@ struct BenchConfig {
     int fail_snapshot = 0;
     int fail_apply = 0;
     int fail_after = 0;
+    // Simulation LOD master switch for A/B runs (default on).
+    bool lod_off = false;
     // Optional partition floor override in meters (0 = production default).
     // Lets load-driven scenarios split small test maps; still passes through
     // ValidatePartitionConfig (AOI floor clamp applies).
@@ -93,7 +95,7 @@ bool ParseArgs(int argc, char** argv, BenchConfig& config)
                          "             [--validate-every K] [--despawn-storm R] [--seed S]\n"
                          "             [--logical-processes K] [--routing-selftest]\n"
                          "             [--fail-snapshot N] [--fail-apply N] [--fail-after N]\n"
-                         "             [--partition-min-size M]\n";
+                         "             [--partition-min-size M] [--lod-off]\n";
             return false;
         } else if (arg == "--players") {
             if (!need_value("players", value)) {
@@ -157,13 +159,15 @@ bool ParseArgs(int argc, char** argv, BenchConfig& config)
                 return false;
             }
             config.partition_min_size = std::stoi(value);
+        } else if (arg == "--lod-off") {
+            config.lod_off = true;
         } else {
             std::cerr << "unknown arg: " << arg << "\n";
             return false;
         }
     }
     if (config.mode != "spread" && config.mode != "hotspot" && config.mode != "border" &&
-        config.mode != "dense" && config.mode != "splitmerge") {
+        config.mode != "dense" && config.mode != "splitmerge" && config.mode != "lod") {
         std::cerr << "bad mode: " << config.mode << "\n";
         return false;
     }
@@ -792,6 +796,254 @@ int RunSplitMergeScenario(boost::asio::io_context& io, const BenchConfig& config
     return failures;
 }
 
+// Simulation LOD correctness scenario (§26). Own sim lifecycle; default LOD
+// config (enabled). All asserts use thread-safe public reads (diagnostic
+// gauges, Owners, validator, cumulative counters) — never live flecs state.
+//
+//   Phase 1: 1 AFK player + 2 mob clusters (near/far). Far cluster must
+//     cascade to Dormant; near cluster stays Full; validator OK.
+//   Phase 2: spawn a player at the far cluster -> Full jumps within ~2 eval
+//     periods (immediate proximity wake).
+//   Phase 3: blind attack burst around the far cluster -> deaths happen on
+//     previously-dormant mobs (damage path transparent under LOD),
+//     validator OK. (Proximity bubbles do most waking; the synchronous
+//     attack Wake is the sub-eval-period guarantee — both are correct.)
+//   Phase 4: despawn everyone, wait out the cascade -> Full decays to zero
+//     (hysteresis, no flap); cooldowns/respawns advanced meanwhile.
+// Returns failure count (0 = PASS).
+int RunLodScenario(boost::asio::io_context& io, const BenchConfig& config)
+{
+    int failures = 0;
+    int validations = 0;
+    auto check = [&](const char* name, bool pass) {
+        if (pass) {
+            std::printf("LOD %s: PASS\n", name);
+        } else {
+            std::printf("LOD %s: FAIL\n", name);
+            ++failures;
+        }
+    };
+
+    gs::game::WorldRuntime sim(io);
+    auto validate_now = [&](const char* what) -> bool {
+        sim.RequestValidation();
+        for (int i = 0; i < 100; ++i) {
+            std::string result;
+            if (sim.TryTakeValidationResult(result)) {
+                ++validations;
+                if (result != "OK") {
+                    std::printf("LOD validation(%s): FAIL: %s\n", what, result.c_str());
+                    return false;
+                }
+                return true;
+            }
+            std::this_thread::sleep_for(std::chrono::milliseconds(100));
+        }
+        std::printf("LOD validation(%s): TIMEOUT\n", what);
+        return false;
+    };
+    struct TierDist {
+        std::uint64_t full = 0, reduced = 0, low = 0, dormant = 0;
+    };
+    auto tiers = [&]() {
+        TierDist dist;
+        for (std::size_t zi = 0; zi < sim.Zones().ZoneCount(); ++zi) {
+            const auto& diag = sim.Zones().GetZone(zi).Diagnostics();
+            dist.full += diag.lod_full.load(std::memory_order_relaxed);
+            dist.reduced += diag.lod_reduced.load(std::memory_order_relaxed);
+            dist.low += diag.lod_low.load(std::memory_order_relaxed);
+            dist.dormant += diag.lod_dormant.load(std::memory_order_relaxed);
+        }
+        return dist;
+    };
+    auto print_zones = [&](const char* tag) {
+        std::printf("LOD zones@%s:\n", tag);
+        for (std::size_t zi = 0; zi < sim.Zones().ZoneCount(); ++zi) {
+            const auto& z = sim.Zones().GetZone(zi);
+            const auto& diag = z.Diagnostics();
+            const auto& b = z.Bounds();
+            std::printf("  zone=%u bounds=(%.0f,%.0f)-(%.0f,%.0f) mobs=%u tiers=[%u/%u/%u/%u]\n",
+                        z.Id(),
+                        b.min_x,
+                        b.min_y,
+                        b.max_x,
+                        b.max_y,
+                        diag.mob_count.load(std::memory_order_relaxed),
+                        diag.lod_full.load(std::memory_order_relaxed),
+                        diag.lod_reduced.load(std::memory_order_relaxed),
+                        diag.lod_low.load(std::memory_order_relaxed),
+                        diag.lod_dormant.load(std::memory_order_relaxed));
+        }
+        for (const auto& [sid, owner] : sim.Owners()) {
+            std::printf("  owner session=%llu zone=%u net=%u\n",
+                        (unsigned long long)sid,
+                        owner.location.zone,
+                        owner.net_id);
+        }
+    };
+
+    const auto deadline =
+        std::chrono::steady_clock::now() + std::chrono::seconds(std::max(150, config.seconds));
+    auto expired = [&] { return std::chrono::steady_clock::now() >= deadline; };
+
+    sim.Start();
+
+    // ---- Phase 1: populate. Group A near (150,150), group B near (850,850),
+    // player 1 AFK at group A. Mobs spawn via points (type 2) around both.
+    constexpr gs::common::SessionId kPlayer1 = 600;
+    constexpr gs::common::SessionId kPlayer2 = 601;
+    {
+        boost::asio::ip::tcp::socket socket(io);
+        auto session = std::make_shared<gs::network::Session>(std::move(socket), kPlayer1);
+        sim.PostSpawn(session, MakeBenchCharacter(800), gs::game::DebugSpawnOverride{150.0f, 150.0f});
+    }
+    constexpr int kMobPoints = 12;
+    for (int k = 0; k < kMobPoints; ++k) {
+        gs::game::MobSpawnPoint point;
+        point.mob_type_id = 2;
+        if (k < kMobPoints / 2) {
+            point.x = 150.0f;
+            point.y = 150.0f;
+        } else {
+            point.x = 850.0f;
+            point.y = 850.0f;
+        }
+        point.count = 1;
+        point.radius = 3.0f;
+        sim.AddMobSpawnPoint(point);
+    }
+    for (int k = 0; k < kMobPoints; ++k) {
+        sim.RequestMobSpawn(static_cast<std::size_t>(4 + k));
+    }
+    const bool populated = WaitFor(std::chrono::seconds(25), [&] {
+        return sim.Owners().size() == 1 && sim.CollectProcessLoad().mobs >= 10;
+    });
+    check("populate", populated && !expired());
+    if (!populated) {
+        sim.Stop();
+        return failures + 1;
+    }
+    const std::uint64_t mob_total = sim.CollectProcessLoad().mobs;
+    print_zones("populated");
+    std::printf("LOD lookup: (150,150)->zoneidx=%zu (850,850)->zoneidx=%zu\n",
+                sim.Zones().FindIndexForPosition(150.0f, 150.0f),
+                sim.Zones().FindIndexForPosition(850.0f, 850.0f));
+    check("pre-validate", validate_now("pre"));
+    auto tiers_sum = [](const TierDist& d) { return d.full + d.reduced + d.low + d.dormant; };
+
+    // ---- Phase 1: dormancy. Newborns carry no grace history, so group B
+    // (far from the only player) cascades to Dormant within ~3 evals, while
+    // group A stays Full. Wait generously, then assert distribution shape,
+    // exact tier accounting (every mob in exactly one tier) and no loss.
+    std::this_thread::sleep_for(std::chrono::seconds(20));
+    if (expired()) {
+        check("dormancy-window", false);
+        sim.Stop();
+        return failures + 1;
+    }
+    const TierDist d1 = tiers();
+    std::printf("LOD tiers@t+20s: full=%llu reduced=%llu low=%llu dormant=%llu (mobs=%llu)\n",
+                (unsigned long long)d1.full,
+                (unsigned long long)d1.reduced,
+                (unsigned long long)d1.low,
+                (unsigned long long)d1.dormant,
+                (unsigned long long)mob_total);
+    check("near-full", d1.full >= 3);
+    check("far-demoted", d1.dormant + d1.low + d1.reduced >= 3);
+    check("tier-accounting-1", tiers_sum(d1) == mob_total);
+    check("no-loss-phase1", sim.CollectProcessLoad().mobs == mob_total);
+    check("validate-phase1", validate_now("phase1"));
+
+    // ---- Phase 2: leave hysteresis (before any death, so no respawn can
+    // flake the asserts). Player 1 despawns; Full must decay after the 5s
+    // grace (Reduced), with no flap back while nobody is around.
+    sim.PostDespawn(kPlayer1);
+    const bool left1 =
+        WaitFor(std::chrono::seconds(15), [&] { return sim.Owners().empty(); });
+    check("despawn-1-drained", left1 && !expired());
+    std::this_thread::sleep_for(std::chrono::seconds(12));
+    if (expired()) {
+        check("hysteresis-window", false);
+        sim.Stop();
+        return failures + 1;
+    }
+    const TierDist d2 = tiers();
+    std::printf("LOD tiers@left+12s: full=%llu reduced=%llu low=%llu dormant=%llu\n",
+                (unsigned long long)d2.full,
+                (unsigned long long)d2.reduced,
+                (unsigned long long)d2.low,
+                (unsigned long long)d2.dormant);
+    check("hysteresis-decay", d2.full == 0);
+    check("tier-accounting-2", tiers_sum(d2) == mob_total);
+    check("validate-phase2", validate_now("phase2"));
+
+    // ---- Phase 3: wake on approach. Player 2 spawns at group B; Full must
+    // jump within ~2 evaluation periods without any attack input.
+    {
+        boost::asio::ip::tcp::socket socket(io);
+        auto session = std::make_shared<gs::network::Session>(std::move(socket), kPlayer2);
+        sim.PostSpawn(session, MakeBenchCharacter(801), gs::game::DebugSpawnOverride{850.0f, 850.0f});
+    }
+    const bool woke = WaitFor(std::chrono::seconds(10), [&] { return tiers().full >= 5; });
+    print_zones("after-approach");
+    check("wake-on-approach", woke && !expired());
+    check("validate-phase3", validate_now("phase3"));
+
+    // ---- Phase 4: attacks land (damage path transparent under LOD).
+    // Blind burst over the mob net range; deaths prove hits. Proximity
+    // bubbles do most waking; the synchronous attack Wake is the
+    // sub-eval-period guarantee (wakes counter reported, not asserted:
+    // attribution between the two correct paths is timing-dependent).
+    const std::uint64_t deaths_before = sim.DeathsTotal();
+    const auto attack_until = std::chrono::steady_clock::now() + std::chrono::seconds(20);
+    while (std::chrono::steady_clock::now() < attack_until && !expired()) {
+        for (std::uint32_t net = 1000000; net < 1000060; ++net) {
+            sim.PostAttackTarget(kPlayer2, net);
+        }
+        std::this_thread::sleep_for(std::chrono::milliseconds(500));
+    }
+    const std::uint64_t deaths = sim.DeathsTotal() - deaths_before;
+    const auto work = sim.LodWorkTotalsSnapshot();
+    std::printf("LOD combat: deaths=%llu wakes=%llu\n",
+                (unsigned long long)deaths,
+                (unsigned long long)work.wakes);
+    check("attack-kills", deaths > 0);
+    // Deaths remove, respawns (30s timers) add back: conservation means the
+    // count stays within [total-deaths, total], never below (loss) or above
+    // (duplication).
+    {
+        const std::uint64_t mobs_now = sim.CollectProcessLoad().mobs;
+        std::printf("LOD mobs: total=%llu deaths=%llu now=%llu\n",
+                    (unsigned long long)mob_total,
+                    (unsigned long long)deaths,
+                    (unsigned long long)mobs_now);
+        check("no-loss-phase4", mobs_now <= mob_total && mobs_now >= mob_total - deaths);
+    }
+    check("validate-phase4", validate_now("phase4"));
+
+    // ---- Phase 5: respawn timers advance under LOD (supervisor-side
+    // countdowns are tier-independent by design). Deaths from phase 4 must
+    // come back within their window.
+    const bool respawned = WaitFor(std::chrono::seconds(45), [&] {
+        return sim.CollectProcessLoad().mobs >= mob_total;
+    });
+    check("respawn-advance", respawned && !expired());
+    check("validate-phase5", validate_now("phase5"));
+
+    const auto work_end = sim.LodWorkTotalsSnapshot();
+    std::printf("LOD work totals: ai=%llu mv=%llu prom=%llu dem=%llu wakes=%llu eval_us=%llu\n",
+                (unsigned long long)work_end.ai_updates,
+                (unsigned long long)work_end.move_updates,
+                (unsigned long long)work_end.promotions,
+                (unsigned long long)work_end.demotions,
+                (unsigned long long)work_end.wakes,
+                (unsigned long long)work_end.eval_us);
+
+    sim.Stop();
+    std::printf("LOD-DONE validations=%d failures=%d\n", validations, failures);
+    return failures;
+}
+
 } // namespace
 
 int BenchMain(int argc, char** argv)
@@ -828,6 +1080,19 @@ int BenchMain(int argc, char** argv)
         return scenario_failures == 0 ? 0 : 2;
     }
 
+    if (config.mode == "lod") {
+        // Simulation LOD correctness scenario with its own sim lifecycle.
+        boost::asio::io_context lod_io;
+        std::thread lod_io_thread([&lod_io] { lod_io.run(); });
+        const int scenario_failures = RunLodScenario(lod_io, config);
+        lod_io.stop();
+        if (lod_io_thread.joinable()) {
+            lod_io_thread.join();
+        }
+        std::printf("BENCH-DONE lod failures=%d\n", scenario_failures);
+        return scenario_failures == 0 ? 0 : 2;
+    }
+
     std::mt19937 rng(config.seed);
 
     boost::asio::io_context io;
@@ -843,6 +1108,12 @@ int BenchMain(int argc, char** argv)
     {
         gs::game::WorldRuntime sim(io);
         sim.Start();
+        if (config.lod_off) {
+            gs::game::LodConfig lod;
+            lod.enabled = false;
+            sim.ConfigureSimulationLod(lod);
+            std::printf("simulation lod: DISABLED (legacy every-tick behavior)\n");
+        }
         if (config.partition_min_size > 0) {
             gs::game::PartitionConfig override;
             override.min_zone_size_m = static_cast<float>(config.partition_min_size);
@@ -1147,6 +1418,37 @@ int BenchMain(int argc, char** argv)
                     (unsigned long long)routes.unavailable,
                     (unsigned long long)routes.draining,
                     (unsigned long long)routes.directory_miss);
+        {
+            // Simulation LOD distribution (current gauges) + actual update
+            // rates (§25): how many entities really got AI/movement updates
+            // per second. Work totals are cumulative (never reset); the
+            // per-second windows in the diag log reset every second.
+            std::uint64_t t_full = 0, t_reduced = 0, t_low = 0, t_dormant = 0;
+            for (std::size_t zi = 0; zi < sim.Zones().ZoneCount(); ++zi) {
+                const auto& diag = sim.Zones().GetZone(zi).Diagnostics();
+                t_full += diag.lod_full.load(std::memory_order_relaxed);
+                t_reduced += diag.lod_reduced.load(std::memory_order_relaxed);
+                t_low += diag.lod_low.load(std::memory_order_relaxed);
+                t_dormant += diag.lod_dormant.load(std::memory_order_relaxed);
+            }
+            const auto work = sim.LodWorkTotalsSnapshot();
+            const double elapsed = static_cast<double>(std::max(1, config.seconds));
+            std::printf("lod tiers: full=%llu reduced=%llu low=%llu dormant=%llu\n",
+                        (unsigned long long)t_full,
+                        (unsigned long long)t_reduced,
+                        (unsigned long long)t_low,
+                        (unsigned long long)t_dormant);
+            std::printf("lod work: ai_updates=%llu (%.0f/s) move_updates=%llu (%.0f/s) prom=%llu "
+                        "dem=%llu wakes=%llu eval_us=%llu\n",
+                        (unsigned long long)work.ai_updates,
+                        work.ai_updates / elapsed,
+                        (unsigned long long)work.move_updates,
+                        work.move_updates / elapsed,
+                        (unsigned long long)work.promotions,
+                        (unsigned long long)work.demotions,
+                        (unsigned long long)work.wakes,
+                        (unsigned long long)work.eval_us);
+        }
 
         sim.Stop();
     }

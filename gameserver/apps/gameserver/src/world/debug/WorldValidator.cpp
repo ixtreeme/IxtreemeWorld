@@ -6,6 +6,7 @@
 #include <unordered_set>
 #include <vector>
 
+#include "../components/SimulationLod.h"
 #include "../components/Tags.h"
 #include "../distributed/WorldDirectory.h"
 #include "../migration/MigrationQueue.h"
@@ -215,6 +216,11 @@ bool ValidateWorldConsistency(ZoneManager& zones,
         }
 
         // Every indexed NetId resolves to a live entity, exactly once world-wide.
+        // Simulation LOD rules (§27): mobs carry a valid tier (presence-gated
+        // so LOD-off runs stay green); Dormant forbids live combat state;
+        // players and ghosts never carry gameplay-simulation tiers.
+        bool lod_seen_in_zone = false;
+        std::uint32_t lod_missing_mobs = 0;
         for (const auto& [net_id, entity] : zone.Entities()) {
             (void)entity;
             if (!zone.FindEntity(net_id).is_valid()) {
@@ -227,6 +233,77 @@ bool ValidateWorldConsistency(ZoneManager& zones,
                 message << "net " << net_id << " authoritative in two zones (dual authority!)";
                 return Fail(out_error, message.str());
             }
+            const auto live = zone.FindEntity(net_id);
+            if (live.has<PlayerTag>()) {
+                if (live.has<SimulationLod>()) {
+                    std::ostringstream message;
+                    message << "zone " << zone.Id() << ": player net " << net_id
+                            << " carries a simulation tier (players are implicit Full)";
+                    return Fail(out_error, message.str());
+                }
+                continue;
+            }
+            if (live.has<GhostTag>()) {
+                if (live.has<SimulationLod>()) {
+                    std::ostringstream message;
+                    message << "zone " << zone.Id() << ": ghost net " << net_id
+                            << " carries a simulation tier (read-only representation)";
+                    return Fail(out_error, message.str());
+                }
+                continue;
+            }
+            if (!live.has<MobTag>()) {
+                continue;
+            }
+            if (!live.has<SimulationLod>()) {
+                ++lod_missing_mobs;
+                continue;
+            }
+            lod_seen_in_zone = true;
+            const auto lod = live.get<SimulationLod>();
+            switch (lod.tier) {
+            case SimulationTier::Full:
+            case SimulationTier::Reduced:
+            case SimulationTier::Low:
+            case SimulationTier::Dormant:
+                break;
+            default: {
+                std::ostringstream message;
+                message << "zone " << zone.Id() << ": net " << net_id << " has invalid simulation tier";
+                return Fail(out_error, message.str());
+            }
+            }
+            if (lod.tier == SimulationTier::Dormant) {
+                if (lod.next_tick != kLodNeverTick) {
+                    std::ostringstream message;
+                    message << "zone " << zone.Id() << ": dormant net " << net_id
+                            << " has a scheduled tick";
+                    return Fail(out_error, message.str());
+                }
+                if (live.has<AttackCooldown>() && live.get<AttackCooldown>().remaining > 0.0f) {
+                    std::ostringstream message;
+                    message << "zone " << zone.Id() << ": dormant net " << net_id
+                            << " holds a live combat cooldown";
+                    return Fail(out_error, message.str());
+                }
+                if (live.has<MigrateTo>() && live.get<MigrateTo>().target_zone != 0) {
+                    std::ostringstream message;
+                    message << "zone " << zone.Id() << ": dormant net " << net_id
+                            << " holds a pending migration";
+                    return Fail(out_error, message.str());
+                }
+            } else if (lod.next_tick == kLodNeverTick) {
+                std::ostringstream message;
+                message << "zone " << zone.Id() << ": active net " << net_id
+                        << " has no scheduled tick";
+                return Fail(out_error, message.str());
+            }
+        }
+        if (lod_seen_in_zone && lod_missing_mobs > 0) {
+            std::ostringstream message;
+            message << "zone " << zone.Id() << ": " << lod_missing_mobs
+                    << " mobs lack SimulationLod while the zone simulates with tiers";
+            return Fail(out_error, message.str());
         }
 
         // Session bindings point at live indexed entities, both maps agree.
