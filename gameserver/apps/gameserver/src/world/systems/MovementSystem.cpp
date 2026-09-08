@@ -162,6 +162,17 @@ void MovementSystem::Step(Zone& zone, float dt, ZoneTickContext& ctx)
     // whole interval) and cause no teleports (velocity-bounded steps).
     // Players above always integrate every tick. Null/disabled config =
     // legacy behavior.
+    //
+    // Low-tier substep audit (§27): the slowest cadence is Low at 1 Hz, so
+    // dt_eff peaks at ~1.0s. At wander speed (1.5 m/s) that is a 1.5m step:
+    // far below the 5m migration hysteresis, the 120m AOI radius and the
+    // 500m activity cells, so nothing tunnels or skips a boundary band.
+    // Border-crossing detection (UpdateMarker below) runs on every
+    // integration, hence at worst one Low period late — bounded, not lost.
+    // Splitting AI decisions from movement substeps (e.g. 1 Hz decisions
+    // with 50-100ms integration) is deliberately NOT done now: the seam
+    // exists structurally (intent persists across skipped ticks), but the
+    // current speed scales need no finer integration.
     const bool use_lod = ctx.lod != nullptr && ctx.lod->enabled;
     // LOD timebase: the zone's own tick counter (see SimulationLod.h).
     const std::uint32_t now_tick = zone.TickIndex();

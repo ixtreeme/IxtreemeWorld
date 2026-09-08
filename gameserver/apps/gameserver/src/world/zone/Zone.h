@@ -21,6 +21,8 @@
 #include "map/MapData.h"
 #include "network/Session.h"
 
+#include "../activity/ActivityTypes.h"
+#include "../activity/SpatialActivityField.h"
 #include "../components/ComponentRegistration.h"
 #include "../components/SimulationLod.h"
 #include "../partition/PartitionTypes.h"
@@ -62,6 +64,10 @@ struct ZoneTickContext {
     // Simulation LOD config (world-global, owned by WorldRuntime). Null or
     // disabled = legacy behavior: every entity integrates every tick.
     const LodConfig* lod = nullptr;
+    // World-space activity snapshot for this tick (immutable generation,
+    // owned by WorldRuntime's field; null in unit-test contexts). Lets LOD
+    // evaluation see players in ANY zone without cross-zone live reads.
+    std::shared_ptr<const ActivityGrid> activity;
     std::function<void(std::shared_ptr<gs::network::Session>, std::vector<std::uint8_t>)> send;
     std::function<void(std::size_t spawn_point_index, float delay_sec)> respawn_later;
 };
@@ -147,6 +153,30 @@ public:
     {
         return publish_mutex_;
     }
+    // --- spatial activity publication (derived data, never authority) ---
+    // This zone's authoritative player sources for the world-space activity
+    // field. Written by ActivityPublisher at the end of every tick under the
+    // zone guard + this mutex; copied by the supervisor aggregator.
+    std::vector<PlayerInfluenceSource>& ActivitySources() noexcept
+    {
+        return activity_sources_;
+    }
+    const std::vector<PlayerInfluenceSource>& ActivitySources() const noexcept
+    {
+        return activity_sources_;
+    }
+    std::mutex& ActivityMutex() const noexcept
+    {
+        return activity_mutex_;
+    }
+    // Drops all published sources (zone sleep/retire path). Postcondition:
+    // the next aggregation cannot see influence from here, so despawned or
+    // retired players vanish deterministically within one rebuild period.
+    void ClearActivitySources()
+    {
+        std::lock_guard lock(activity_mutex_);
+        activity_sources_.clear();
+    }
     std::uint32_t TickIndex() const noexcept
     {
         return zone_tick_;
@@ -190,6 +220,7 @@ public:
 
     // --- player session bindings (network association, not gameplay) ---
     PlayerBinding* FindPlayer(std::uint32_t net_id);
+    const PlayerBinding* FindPlayer(std::uint32_t net_id) const;
     PlayerBinding* FindPlayerBySession(gs::common::SessionId session_id);
     std::unordered_map<std::uint32_t, PlayerBinding>& Players() noexcept
     {
@@ -314,6 +345,8 @@ private:
     std::vector<GhostRecord> ghosts_;
     std::array<std::vector<BorderEntitySnapshot>, 2> publish_buffers_;
     std::mutex publish_mutex_;
+    std::vector<PlayerInfluenceSource> activity_sources_;
+    mutable std::mutex activity_mutex_;
     std::unordered_map<std::uint32_t, flecs::entity> entities_;
     std::unordered_map<std::uint32_t, PlayerBinding> players_;
     std::unordered_map<gs::common::SessionId, std::uint32_t> net_by_session_;

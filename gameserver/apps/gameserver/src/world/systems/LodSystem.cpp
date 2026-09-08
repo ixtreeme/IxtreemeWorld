@@ -1,9 +1,8 @@
 #include "LodSystem.h"
 
 #include <cassert>
-#include <cfloat>
+#include <chrono>
 #include <cstdint>
-#include <vector>
 
 #include "../WorldConstants.h"
 #include "../components/CombatComponents.h"
@@ -68,25 +67,14 @@ void LodSystem::Evaluate(Zone& zone, ZoneTickContext& ctx)
     const std::uint32_t now = zone.TickIndex();
     const auto eval_start = std::chrono::steady_clock::now();
 
-    // Player bubble centers: authoritative residents only. Zones are small
-    // and player counts per zone are low, so this snapshot is trivial.
-    struct Bubble {
-        float x, y;
-    };
-    std::vector<Bubble> players;
-    players.reserve(static_cast<std::size_t>(zone.Diagnostics().player_count.load(std::memory_order_relaxed)));
-    for (const auto& [net_id, binding] : zone.Players()) {
-        (void)binding;
-        const auto player = zone.FindEntity(net_id);
-        if (player.is_valid() && player.has<Position>()) {
-            const auto pos = player.get<Position>();
-            players.push_back(Bubble{pos.x, pos.y});
-        }
-    }
+    // World-space activity (cross-zone correct, §9): the field sees every
+    // authoritative player regardless of which zone simulates them. The LOD
+    // layer never learns zone topology from this — only world-space tiers.
+    // Null field happens only in unit-test contexts: Full desire there
+    // (conservative direction — simulate rather than wrongly dorm).
+    const std::shared_ptr<const ActivityGrid> field = ctx.activity;
+    const std::uint32_t viewer_zone = zone.Id();
 
-    const float full_sq = config.full_radius_m * config.full_radius_m;
-    const float reduced_sq = config.reduced_radius_m * config.reduced_radius_m;
-    const float low_sq = config.low_radius_m * config.low_radius_m;
     const std::uint32_t grace_full = GraceTicks(config.demote_full_sec);
     const std::uint32_t grace_reduced = GraceTicks(config.demote_reduced_sec);
     const std::uint32_t grace_low = GraceTicks(config.demote_low_sec);
@@ -96,10 +84,10 @@ void LodSystem::Evaluate(Zone& zone, ZoneTickContext& ctx)
     std::uint32_t n_low = 0;
     std::uint32_t n_dormant = 0;
 
-    // Direct nearest-player scan at 1 Hz per zone (deliberately NOT a
-    // per-tick global scan: 1000x cheaper than the 20 Hz strawman, and exact
-    // with no derived-state invalidation. A cell-aggregated variant can
-    // replace this loop body later without touching callers.)
+    // One field query per mob at 1 Hz per zone (deliberately NOT a per-tick
+    // global scan: the field pre-bins all players world-wide, so each query
+    // walks only cells near the mob. Exact distances inside — no boundary
+    // approximation, conservative direction never needed here.
     zone.World().query<const MobTag>().each([&](flecs::entity entity, const MobTag&) {
         if (entity.has<GhostTag>()) {
             return;
@@ -112,25 +100,12 @@ void LodSystem::Evaluate(Zone& zone, ZoneTickContext& ctx)
         const auto pos = entity.get<Position>();
         const std::uint32_t net = entity.get<NetId>().value;
 
-        SimulationTier desired = SimulationTier::Dormant;
-        if (!players.empty()) {
-            float best_sq = FLT_MAX;
-            for (const auto& bubble : players) {
-                const float dx = pos.x - bubble.x;
-                const float dy = pos.y - bubble.y;
-                const float d_sq = dx * dx + dy * dy;
-                if (d_sq < best_sq) {
-                    best_sq = d_sq;
-                    if (best_sq < full_sq) {
-                        break;
-                    }
-                }
-            }
-            desired = best_sq < full_sq
-                          ? SimulationTier::Full
-                          : best_sq < reduced_sq ? SimulationTier::Reduced
-                                                : best_sq < low_sq ? SimulationTier::Low
-                                                                   : SimulationTier::Dormant;
+        SimulationTier desired = SimulationTier::Full; // null-field fallback
+        bool cross_zone = false;
+        if (field) {
+            const InfluenceSample sample = field->QueryPlayerInfluence(pos.x, pos.y, viewer_zone);
+            desired = sample.tier; // Dormant when nothing is in range
+            cross_zone = sample.cross_zone;
         }
         // Overrides: combat recency and pending migration pin Full
         // regardless of distance. (Mobs never initiate attacks in this
@@ -182,6 +157,19 @@ void LodSystem::Evaluate(Zone& zone, ZoneTickContext& ctx)
         case SimulationTier::Dormant:
             ++n_dormant;
             break;
+        }
+        // Cross-zone contribution (§29): the nearest influence came from
+        // another zone. Counted by FINAL tier so the counters stay aligned
+        // with the gauges above (joint semantics: a local source at equal
+        // distance does not clear the flag).
+        if (cross_zone) {
+            if (lod.tier == SimulationTier::Full) {
+                diag.cross_zone_full_since_diag.fetch_add(1, std::memory_order_relaxed);
+            } else if (lod.tier == SimulationTier::Reduced) {
+                diag.cross_zone_reduced_since_diag.fetch_add(1, std::memory_order_relaxed);
+            } else if (lod.tier == SimulationTier::Low) {
+                diag.cross_zone_low_since_diag.fetch_add(1, std::memory_order_relaxed);
+            }
         }
     });
 

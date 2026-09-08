@@ -1,5 +1,6 @@
 #include "WorldValidator.h"
 
+#include <algorithm>
 #include <cmath>
 #include <sstream>
 #include <unordered_map>
@@ -111,6 +112,7 @@ bool ValidateWorldConsistency(ZoneManager& zones,
                               const OwnerMap& owners,
                               const MigrationQueue& migrations,
                               const WorldDirectory& directory,
+                              const ActivityGrid* activity,
                               std::string& out_error)
 {
     if (!ValidatePartitionTopology(zones, out_error)) {
@@ -438,6 +440,198 @@ bool ValidateWorldConsistency(ZoneManager& zones,
         }
     }
 
+    // Activity field consistency (§30). Skipped when no field is available
+    // (unit contexts); the LOD-disabled path publishes an empty disabled
+    // grid, which trivially passes.
+    if (activity != nullptr) {
+        // (a) Every source resolves to a live authoritative player, exactly
+        // once. Positions are NOT compared (snapshot staleness); existence
+        // and uniqueness are exact and staleness-free. A despawned player's
+        // source must be gone: zones refresh every tick while awake and wipe
+        // on sleep/retire, so anything lingering past one rebuild is a leak.
+        std::unordered_set<std::uint32_t> sourced_nets;
+        for (std::size_t ci = 0; ci < activity->CellCount(); ++ci) {
+            // Cells accessed via stable index order (deterministic).
+            const auto& cell = activity->CellAt(ci);
+            for (const auto& source : cell.players) {
+                if (!sourced_nets.insert(source.net_id).second) {
+                    std::ostringstream message;
+                    message << "activity: duplicate source net " << source.net_id;
+                    return Fail(out_error, message.str());
+                }
+                bool live_player = false;
+                for (std::size_t zi = 0; zi < zones.ZoneCount(); ++zi) {
+                    const auto& zone = zones.GetZone(zi);
+                    const auto* binding = zone.FindPlayer(source.net_id);
+                    if (binding != nullptr && binding->session &&
+                        zone.FindEntity(source.net_id).is_valid()) {
+                        if (live_player) {
+                            std::ostringstream message;
+                            message << "activity: source net " << source.net_id
+                                    << " authoritative in two zones";
+                            return Fail(out_error, message.str());
+                        }
+                        live_player = true;
+                    }
+                }
+                if (!live_player) {
+                    std::ostringstream message;
+                    message << "activity: source net " << source.net_id
+                            << " has no live authoritative player (leak)";
+                    return Fail(out_error, message.str());
+                }
+            }
+        }
+
+        // (b) Sleeping zones hold no Full/Reduced-worthy residents, checked
+        // by brute force over CURRENT authoritative positions (exact, no
+        // field involved, hence staleness-free). This is the core cross-zone
+        // correctness proof: a player across the border must keep neighbors
+        // awake. Uses the field's own radii so config stays authority.
+        struct LivePlayer {
+            float x, y;
+        };
+        std::vector<LivePlayer> live_players;
+        for (std::size_t zi = 0; zi < zones.ZoneCount(); ++zi) {
+            const auto& zone = zones.GetZone(zi);
+            for (const auto& [net_id, binding] : zone.Players()) {
+                (void)binding;
+                const auto player = zone.FindEntity(net_id);
+                if (player.is_valid() && player.has<Position>()) {
+                    const auto pos = player.get<Position>();
+                    live_players.push_back(LivePlayer{pos.x, pos.y});
+                }
+            }
+        }
+        for (std::size_t zi = 0; zi < zones.ZoneCount(); ++zi) {
+            const auto& zone = zones.GetZone(zi);
+            if (zone.Activity() != ZoneActivity::Sleeping) {
+                continue;
+            }
+            for (const auto& [net_id, entity] : zone.Entities()) {
+                (void)entity;
+                const auto mob = zone.FindEntity(net_id);
+                if (!mob.is_valid() || !mob.has<MobTag>() || mob.has<GhostTag>()) {
+                    continue;
+                }
+                if (!mob.has<Position>()) {
+                    continue;
+                }
+                const auto pos = mob.get<Position>();
+                SimulationTier brute = SimulationTier::Dormant;
+                for (const auto& player : live_players) {
+                    const float dx = pos.x - player.x;
+                    const float dy = pos.y - player.y;
+                    const SimulationTier t = TierForPlayerDistanceSq(
+                        dx * dx + dy * dy, activity->Radii());
+                    if (t < brute) {
+                        brute = t;
+                        if (brute == SimulationTier::Full) {
+                            break;
+                        }
+                    }
+                }
+                if (brute == SimulationTier::Full || brute == SimulationTier::Reduced) {
+                    std::ostringstream message;
+                    message << "activity: sleeping zone " << zone.Id() << " holds net " << net_id
+                            << " that is brute-force "
+                            << (brute == SimulationTier::Full ? "Full" : "Reduced");
+                    return Fail(out_error, message.str());
+                }
+            }
+        }
+    }
+
+    return true;
+}
+
+bool ValidateActivityFieldDetailed(const ZoneManager& zones,
+                                   const ActivityGrid& grid,
+                                   std::vector<ActivitySampleResult>& out_samples,
+                                   std::string& out_error,
+                                   std::size_t max_samples)
+{
+    out_samples.clear();
+    // Collect every authoritative mob position for brute force. Runs in the
+    // validator's quiescent window, so live reads are stable.
+    struct LivePlayer {
+        float x, y;
+    };
+    std::vector<LivePlayer> live_players;
+    struct Candidate {
+        ZoneId zone_id;
+        std::uint32_t net_id;
+        float x, y;
+    };
+    std::vector<Candidate> candidates;
+    for (std::size_t zi = 0; zi < zones.ZoneCount(); ++zi) {
+        const auto& zone = zones.GetZone(zi);
+        for (const auto& [net_id, binding] : zone.Players()) {
+            (void)binding;
+            const auto player = zone.FindEntity(net_id);
+            if (player.is_valid() && player.has<Position>()) {
+                const auto pos = player.get<Position>();
+                live_players.push_back(LivePlayer{pos.x, pos.y});
+            }
+        }
+        for (const auto& [net_id, entity] : zone.Entities()) {
+            (void)entity;
+            const auto mob = zone.FindEntity(net_id);
+            if (!mob.is_valid() || !mob.has<MobTag>() || mob.has<GhostTag>()) {
+                continue;
+            }
+            if (!mob.has<Position>()) {
+                continue;
+            }
+            const auto pos = mob.get<Position>();
+            candidates.push_back(Candidate{zone.Id(), net_id, pos.x, pos.y});
+        }
+    }
+    // Deterministic sample order: (zone, net) ascending.
+    std::sort(candidates.begin(),
+              candidates.end(),
+              [](const Candidate& lhs, const Candidate& rhs) {
+                  return lhs.zone_id < rhs.zone_id ||
+                         (lhs.zone_id == rhs.zone_id && lhs.net_id < rhs.net_id);
+              });
+    if (max_samples > 0 && candidates.size() > max_samples) {
+        candidates.resize(max_samples);
+    }
+    for (const auto& candidate : candidates) {
+        ActivitySampleResult sample;
+        sample.zone_id = candidate.zone_id;
+        sample.net_id = candidate.net_id;
+        sample.x = candidate.x;
+        sample.y = candidate.y;
+        const InfluenceSample field = grid.QueryPlayerInfluence(candidate.x, candidate.y,
+                                                                candidate.zone_id);
+        sample.field_tier = field.tier;
+        SimulationTier brute = SimulationTier::Dormant;
+        for (const auto& player : live_players) {
+            const float dx = candidate.x - player.x;
+            const float dy = candidate.y - player.y;
+            const SimulationTier t = TierForPlayerDistanceSq(dx * dx + dy * dy, grid.Radii());
+            if (t < brute) {
+                brute = t;
+                if (brute == SimulationTier::Full) {
+                    break;
+                }
+            }
+        }
+        sample.brute_tier = brute;
+        out_samples.push_back(sample);
+        // Strict rule: field must be stronger-or-equal (numerically <=).
+        // Exact match for static entities; conservative-stronger allowed;
+        // weaker NEVER (that would wrongly dormantize nearby mobs).
+        if (static_cast<std::uint8_t>(sample.field_tier) >
+            static_cast<std::uint8_t>(sample.brute_tier)) {
+            std::ostringstream message;
+            message << "activity: net " << sample.net_id << " field tier "
+                    << static_cast<int>(sample.field_tier) << " weaker than brute force "
+                    << static_cast<int>(sample.brute_tier);
+            return Fail(out_error, message.str());
+        }
+    }
     return true;
 }
 

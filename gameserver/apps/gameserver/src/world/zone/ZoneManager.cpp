@@ -568,6 +568,11 @@ bool ZoneManager::RetireZone(ZoneId zone_id)
     // claim the guard (quiescent supervisor window, so it is always free).
     ZoneWriteGuard guard(zone, "partition retire");
     GhostSystem::Clear(zone);
+    // Activity leak-freedom: a retired zone never ticks again, so its last
+    // published sources would linger in the field forever. Wipe them here
+    // (CanRetire already guaranteed zero players, so this is a no-op in the
+    // normal case and a loud backstop otherwise).
+    zone.ClearActivitySources();
     zone.RefreshResidentCounts();
     zone.SetSimulationEnabled(false);
     zone.SetPartition(PartitionState::Retired);

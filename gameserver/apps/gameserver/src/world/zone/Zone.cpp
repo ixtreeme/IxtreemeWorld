@@ -6,6 +6,7 @@
 #include "common/Logging.h"
 
 #include "ZoneOwnership.h"
+#include "../activity/SpatialActivityField.h"
 #include "../systems/AiSystem.h"
 #include "../systems/CooldownSystem.h"
 #include "../systems/LodSystem.h"
@@ -59,6 +60,12 @@ bool Zone::IsResident(std::uint32_t net_id) const
 }
 
 Zone::PlayerBinding* Zone::FindPlayer(std::uint32_t net_id)
+{
+    const auto it = players_.find(net_id);
+    return it != players_.end() ? &it->second : nullptr;
+}
+
+const Zone::PlayerBinding* Zone::FindPlayer(std::uint32_t net_id) const
 {
     const auto it = players_.find(net_id);
     return it != players_.end() ? &it->second : nullptr;
@@ -213,6 +220,9 @@ void Zone::Tick(float dt, ZoneTickContext& ctx)
         // incrementally by the systems above, so no rebuild happens here.
         const auto ghost_start = Clock::now();
         BorderPublisher::Publish(*this);
+        // World-space activity publication (post-movement positions): this
+        // zone's authoritative players for the cross-zone activity field.
+        ActivityPublisher::Publish(*this);
         if (players_.empty()) {
             GhostSystem::Clear(*this);
         } else {

@@ -18,6 +18,7 @@
 #include "map/MapData.h"
 #include "network/Session.h"
 
+#include "activity/SpatialActivityField.h"
 #include "components/MovementComponents.h"
 #include "OwnerMap.h"
 #include "debug/WorldValidator.h"
@@ -163,6 +164,26 @@ public:
     // cost when unused.
     void RequestValidation();
     bool TryTakeValidationResult(std::string& out_result);
+    // Current activity field generation (immutable snapshot, never null).
+    // Readers copy the shared_ptr; no further synchronization needed.
+    std::shared_ptr<const ActivityGrid> ActivitySnapshot() const
+    {
+        return activity_field_.Snapshot();
+    }
+    ActivityMetricsSnapshot ActivityMetrics() const
+    {
+        return activity_field_.Metrics();
+    }
+    // Strict field-vs-brute-force audit (§31): runs in the same quiescent
+    // window as RequestValidation, over a deterministic mob sample. For
+    // STATIC scenarios the field must match brute force exactly (stronger-
+    // or-equal); use only where entities don't move mid-audit. Fills
+    // per-sample results for exact per-mob asserts. max_samples 0 = all.
+    void RequestActivityValidation(std::size_t max_samples = 64);
+    // Collects the detailed activity audit outcome. Returns true only when
+    // ready AND passed; out_error carries the first mismatch otherwise.
+    bool TryTakeActivitySamples(std::vector<ActivitySampleResult>& out_samples,
+                                std::string& out_error);
     double SupervisorAvgMs() const;
     ZoneWorkerPool::Utilization WorkerUtilization() const;
     std::size_t MigrationQuarantined() const;
@@ -282,6 +303,12 @@ private:
     // Slow control-plane cadence (§42): topology decisions at ~1 Hz while
     // simulation runs at 20 Hz.
     std::chrono::steady_clock::time_point last_partition_control_{};
+    // World-space activity field (first Adaptive Simulation Fabric
+    // foundation). Rebuilt ~1Hz on the supervisor from per-zone published
+    // player sources; consumed via immutable snapshots by zone ticks
+    // (LOD eval), the scheduler (sleep/wake) and validators/bench.
+    SpatialActivityField activity_field_;
+    std::chrono::steady_clock::time_point last_activity_build_{};
     PartitionMetrics partition_metrics_;
     PartitionConfig effective_partition_config_;
     LodConfig effective_lod_config_;
@@ -314,6 +341,14 @@ private:
     mutable std::mutex validation_mutex_;
     std::string validation_result_;
     bool validation_ready_ = false;
+
+    std::atomic<bool> activity_validation_requested_{false};
+    std::atomic<std::size_t> activity_validation_max_samples_{64};
+    mutable std::mutex activity_validation_mutex_;
+    std::vector<ActivitySampleResult> activity_samples_;
+    std::string activity_validation_error_;
+    bool activity_samples_ready_ = false;
+    bool activity_validation_ok_ = false;
 };
 
 } // namespace gs::game

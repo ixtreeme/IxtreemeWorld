@@ -7,6 +7,7 @@
 #include "common/Logging.h"
 
 #include "../WorldConstants.h"
+#include "../activity/SpatialActivityField.h"
 #include "../partition/ZonePartition.h"
 #include "Zone.h"
 #include "ZoneLoadMetrics.h"
@@ -36,7 +37,9 @@ std::uint64_t LoadScore(const Zone& zone)
 
 void ZoneScheduler::ScheduleOnce(ZoneManager& zones,
                                  ZoneWorkerPool& pool,
-                                 std::chrono::steady_clock::time_point now)
+                                 std::chrono::steady_clock::time_point now,
+                                 const std::shared_ptr<const ActivityGrid>& activity,
+                                 float wake_radius_m)
 {
     std::vector<std::pair<std::uint64_t, std::size_t>> due;
     due.reserve(zones.ZoneCount());
@@ -60,24 +63,51 @@ void ZoneScheduler::ScheduleOnce(ZoneManager& zones,
         // sleep (their mobs freeze unobservably and resume on wake); without
         // LOD the legacy mob-bearing rule applies unchanged.
         // Wake is implicit: spawn/migration bump the counts synchronously,
-        // and any queued command flips has_commands.
-        const auto& diag = zone.Diagnostics();
+        // queued commands flip has_commands, and external (cross-zone)
+        // player influence keeps/wakes the zone via the activity field.
+        auto& diag = zone.Diagnostics();
         const bool lod_quiet = lod_enabled_ && diag.lod_full.load(std::memory_order_relaxed) == 0 &&
                                diag.lod_reduced.load(std::memory_order_relaxed) == 0;
         const bool legacy_quiet = diag.mob_count.load(std::memory_order_relaxed) == 0;
-        if (diag.player_count.load(std::memory_order_relaxed) == 0 && !has_commands &&
-            (legacy_quiet || (lod_enabled_ && lod_quiet))) {
+        // World-space external influence (§18-19): a player near the zone —
+        // even across a zone or region border — keeps it awake so residents
+        // simulate at the right tier. Exact predicate (no approximation),
+        // so it can neither over- nor under-sleep. Empty zones sleep
+        // regardless: with no residents nothing needs simulating.
+        const bool external = diag.mob_count.load(std::memory_order_relaxed) > 0 && activity &&
+                              activity->HasPlayerWithin(zone.Bounds(), wake_radius_m);
+        const bool locally_quiet = diag.player_count.load(std::memory_order_relaxed) == 0 &&
+                                   !has_commands &&
+                                   (legacy_quiet || (lod_enabled_ && lod_quiet));
+        if (locally_quiet && !external) {
             if (zone.Activity() != ZoneActivity::Sleeping) {
                 zone.SetActivity(ZoneActivity::Sleeping);
+                // Leak-freedom: a sleeping zone never ticks again, so wipe
+                // its last published sources now (despawn/retire races
+                // included). Next aggregation drops them deterministically.
+                zone.ClearActivitySources();
                 LOG_DEBUG("Zone {} ('{}') sleeping", zone.Id(), zone.Name());
             }
             zone.NextTick() = now + kTickDt;
             zone.Diagnostics().empty_skips_since_diag.fetch_add(1, std::memory_order_relaxed);
             continue;
         }
-        if (zone.Activity() != ZoneActivity::Active) {
+        if (zone.Activity() == ZoneActivity::Sleeping) {
+            // Wake transition. Count it as external when outside influence
+            // is present and nothing local explains the wake (spawned/
+            // migrated players bump counts synchronously; commands flip
+            // has_commands) — predictive/external wake signal for §29.
+            if (external && diag.player_count.load(std::memory_order_relaxed) == 0 &&
+                !has_commands) {
+                diag.wake_external_since_diag.fetch_add(1, std::memory_order_relaxed);
+            }
             zone.SetActivity(ZoneActivity::Active);
             LOG_DEBUG("Zone {} ('{}') active", zone.Id(), zone.Name());
+        }
+        if (locally_quiet && external) {
+            // Awake purely on outside influence (0 local players/commands):
+            // observable §29 signal, distinct from normal activity.
+            diag.sleep_blocked_external_since_diag.fetch_add(1, std::memory_order_relaxed);
         }
 
         if (now < zone.NextTick() && !has_commands) {

@@ -59,6 +59,15 @@ struct ZoneDiagnostics {
     std::atomic<std::uint64_t> lod_demotions_since_diag{0};
     std::atomic<std::uint64_t> lod_wakes_since_diag{0};
     std::atomic<std::uint64_t> lod_eval_us_since_diag{0};
+    // Cross-zone activity (§29): LOD tiers granted (at least jointly) by a
+    // foreign-zone player. Counted by final tier, aligned with the gauges.
+    std::atomic<std::uint64_t> cross_zone_full_since_diag{0};
+    std::atomic<std::uint64_t> cross_zone_reduced_since_diag{0};
+    std::atomic<std::uint64_t> cross_zone_low_since_diag{0};
+    // External-activity sleep decisions (§29): passes where outside influence
+    // alone blocked sleep / woke a sleeping zone.
+    std::atomic<std::uint64_t> sleep_blocked_external_since_diag{0};
+    std::atomic<std::uint64_t> wake_external_since_diag{0};
 
     // Recent per-tick wall times (microseconds), newest at head-1.
     std::array<std::atomic<std::uint64_t>, kTickSampleCapacity> tick_samples;

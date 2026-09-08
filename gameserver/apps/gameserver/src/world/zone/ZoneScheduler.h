@@ -2,6 +2,7 @@
 
 #include <chrono>
 #include <cstdint>
+#include <memory>
 
 // Decides WHEN each zone ticks. Gameplay-agnostic: it only looks at resident
 // counts, pending commands and tick deadlines, then hands due zones to the
@@ -12,6 +13,7 @@ namespace gs::game {
 class ZoneManager;
 class ZoneWorkerPool;
 struct ZonePartition;
+struct ActivityGrid;
 
 class ZoneScheduler {
 public:
@@ -27,9 +29,16 @@ public:
         std::uint8_t max_depth = 4;
     };
 
+    // World-space activity snapshot for sleep/wake (may be null in
+    // unit-test contexts: external influence then reads as absent) and the
+    // wake radius in meters (derived from the LOD reduced radius; a player
+    // inside it keeps the zone awake so residents simulate at the right
+    // tier, including wake-before-entry).
     void ScheduleOnce(ZoneManager& zones,
                       ZoneWorkerPool& pool,
-                      std::chrono::steady_clock::time_point now);
+                      std::chrono::steady_clock::time_point now,
+                      const std::shared_ptr<const ActivityGrid>& activity,
+                      float wake_radius_m);
 
     // Pure predicates over leaf state (const: timers are owned/updated by
     // ZoneLoadMonitor::Update). Execution re-validates in ZoneManager.

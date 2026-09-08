@@ -13,7 +13,7 @@
 //
 // Usage:
 //   worldbench [--players N] [--mobs M] [--seconds S]
-//              [--mode spread|hotspot|border|dense]
+//              [--mode spread|hotspot|border|dense|splitmerge|lod|activity]
 //              [--validate-every K] [--despawn-storm R] [--seed S]
 //              [--logical-processes K] [--routing-selftest]
 // Logical distribution (§33/§51): --logical-processes stripes zones across
@@ -91,7 +91,7 @@ bool ParseArgs(int argc, char** argv, BenchConfig& config)
         std::string value;
         if (arg == "--help" || arg == "-h") {
             std::cout << "worldbench [--players N] [--mobs M] [--seconds S]\n"
-                         "             [--mode spread|hotspot|border|dense|splitmerge]\n"
+                         "             [--mode spread|hotspot|border|dense|splitmerge|lod|activity]\n"
                          "             [--validate-every K] [--despawn-storm R] [--seed S]\n"
                          "             [--logical-processes K] [--routing-selftest]\n"
                          "             [--fail-snapshot N] [--fail-apply N] [--fail-after N]\n"
@@ -167,7 +167,8 @@ bool ParseArgs(int argc, char** argv, BenchConfig& config)
         }
     }
     if (config.mode != "spread" && config.mode != "hotspot" && config.mode != "border" &&
-        config.mode != "dense" && config.mode != "splitmerge" && config.mode != "lod") {
+        config.mode != "dense" && config.mode != "splitmerge" && config.mode != "lod" &&
+        config.mode != "activity") {
         std::cerr << "bad mode: " << config.mode << "\n";
         return false;
     }
@@ -1044,6 +1045,348 @@ int RunLodScenario(boost::asio::io_context& io, const BenchConfig& config)
     return failures;
 }
 
+// Cross-zone LOD determinism via the Spatial Activity Field (§32). Own sim
+// lifecycle. Uses SMALL LOD radii (15/50/150, short graces) configured
+// pre-Start, so every tier boundary fits inside the 1km test map while the
+// comparison machinery stays identical (config stays authority).
+//
+//   Phase 1: discover an adjacent zone pair (A,B) from live bounds. Player
+//     in A near the shared edge; 3 static mobs in B at 12/40/110m.
+//     Expect exactly Full/Reduced/Low, all flagged cross-zone.
+//   Phase 2: 9 more static mobs at 14/15/16, 49/50/51, 139/140/141m.
+//     Expect F/R/R, R/L/L, L/Dormant/Dormant (half-open boundaries exact).
+//   Phase 3: despawn the player; everything must reach Dormant (fast
+//     cascade with the short test graces); a zone must fall asleep;
+//     validator Dormant rules execute live.
+//   Phase 4: spawn a player OUTSIDE the sleeping zone but inside the wake
+//     radius: the zone must wake without any entry (predictive wake).
+// Static mobs (spawn radius 0) never move, the AFK player never moves:
+// positions are bit-exact forever, so asserts are deterministic.
+// Returns failure count (0 = PASS).
+int RunActivityScenario(boost::asio::io_context& io, const BenchConfig& config)
+{
+    int failures = 0;
+    int validations = 0;
+    auto check = [&](const char* name, bool pass) {
+        if (pass) {
+            std::printf("ACTIVITY %s: PASS\n", name);
+        } else {
+            std::printf("ACTIVITY %s: FAIL\n", name);
+            ++failures;
+        }
+    };
+
+    gs::game::WorldRuntime sim(io);
+    auto validate_now = [&](const char* what) -> bool {
+        sim.RequestValidation();
+        for (int i = 0; i < 100; ++i) {
+            std::string result;
+            if (sim.TryTakeValidationResult(result)) {
+                ++validations;
+                if (result != "OK") {
+                    std::printf("ACTIVITY validation(%s): FAIL: %s\n", what, result.c_str());
+                    return false;
+                }
+                return true;
+            }
+            std::this_thread::sleep_for(std::chrono::milliseconds(100));
+        }
+        std::printf("ACTIVITY validation(%s): TIMEOUT\n", what);
+        return false;
+    };
+    // Detailed field audit + per-mob samples matched by EXACT position
+    // (static entities: bit-exact forever, no live flecs reads from here).
+    auto activity_samples = [&](const char* what, std::size_t max_samples,
+                                std::vector<gs::game::ActivitySampleResult>& out) -> bool {
+        sim.RequestActivityValidation(max_samples);
+        for (int i = 0; i < 100; ++i) {
+            std::string error;
+            if (sim.TryTakeActivitySamples(out, error)) {
+                ++validations;
+                return true;
+            }
+            if (!error.empty()) {
+                ++validations;
+                std::printf("ACTIVITY detailed(%s): FAIL: %s\n", what, error.c_str());
+                return false;
+            }
+            std::this_thread::sleep_for(std::chrono::milliseconds(100));
+        }
+        std::printf("ACTIVITY detailed(%s): TIMEOUT\n", what);
+        return false;
+    };
+    auto find_sample = [](const std::vector<gs::game::ActivitySampleResult>& samples, float x,
+                          float y) -> const gs::game::ActivitySampleResult* {
+        for (const auto& sample : samples) {
+            if (sample.x == x && sample.y == y) {
+                return &sample;
+            }
+        }
+        return nullptr;
+    };
+
+    // Small radii so every boundary fits in-map; short graces so the
+    // Dormant leg stays fast. Same machinery, config-driven (§5).
+    gs::game::LodConfig test_lod;
+    test_lod.full_radius_m = 15.0f;
+    test_lod.reduced_radius_m = 50.0f;
+    test_lod.low_radius_m = 150.0f;
+    test_lod.demote_full_sec = 2.0f;
+    test_lod.demote_reduced_sec = 2.0f;
+    test_lod.demote_low_sec = 2.0f;
+    sim.ConfigureSimulationLod(test_lod);
+    if (sim.EffectiveLodConfig().low_radius_m != 150.0f) {
+        check("config-authority", false);
+        return failures + 1;
+    }
+    check("config-authority", true);
+    sim.Start();
+
+    const auto deadline =
+        std::chrono::steady_clock::now() + std::chrono::seconds(std::max(120, config.seconds));
+    auto expired = [&] { return std::chrono::steady_clock::now() >= deadline; };
+
+    // ---- Topology discovery: adjacent pair (A,B) sharing an x-edge with
+    // >=100m y-overlap, read from LIVE bounds (robust to splits, of which
+    // none can happen at this load anyway).
+    float x_edge = 0.0f, y_mid = 0.0f;
+    std::size_t zone_a = 0, zone_b = 0;
+    bool have_pair = false;
+    {
+        const auto& zones = sim.Zones();
+        for (std::size_t i = 0; i < zones.ZoneCount() && !have_pair; ++i) {
+            for (std::size_t j = 0; j < zones.ZoneCount() && !have_pair; ++j) {
+                if (i == j) {
+                    continue;
+                }
+                const auto& a = zones.GetZone(i).Bounds();
+                const auto& b = zones.GetZone(j).Bounds();
+                const float overlap =
+                    std::min(a.max_y, b.max_y) - std::max(a.min_y, b.min_y);
+                if (std::abs(a.max_x - b.min_x) < 0.01f && overlap >= 100.0f) {
+                    zone_a = i;
+                    zone_b = j;
+                    x_edge = a.max_x;
+                    y_mid = (std::max(a.min_y, b.min_y) + std::min(a.max_y, b.max_y)) * 0.5f;
+                    have_pair = true;
+                }
+            }
+        }
+    }
+    check("adjacent-pair", have_pair && !expired());
+    if (!have_pair) {
+        sim.Stop();
+        return failures + 1;
+    }
+    std::printf("ACTIVITY edge: A=%zu B=%zu x=%.0f ymid=%.0f\n", zone_a, zone_b, x_edge, y_mid);
+    const float px = x_edge - 10.0f; // player 10m inside A
+
+    // ---- Phase 1: player + 3 static mobs across the border.
+    constexpr gs::common::SessionId kPlayer = 700;
+    {
+        boost::asio::ip::tcp::socket socket(io);
+        auto session = std::make_shared<gs::network::Session>(std::move(socket), kPlayer);
+        sim.PostSpawn(session, MakeBenchCharacter(900), gs::game::DebugSpawnOverride{px, y_mid});
+    }
+    const float kDistances[3] = {12.0f, 40.0f, 110.0f}; // Full / Reduced / Low
+    for (int k = 0; k < 3; ++k) {
+        gs::game::MobSpawnPoint point;
+        point.mob_type_id = 2;
+        point.x = px + kDistances[k];
+        point.y = y_mid;
+        point.count = 1;
+        point.radius = 0.0f; // static mob: exact position forever
+        sim.AddMobSpawnPoint(point);
+    }
+    for (int k = 0; k < 3; ++k) {
+        sim.RequestMobSpawn(static_cast<std::size_t>(4 + k));
+    }
+    const bool populated = WaitFor(std::chrono::seconds(20), [&] {
+        return sim.Owners().size() == 1 && sim.CollectProcessLoad().mobs >= 3;
+    });
+    check("populate", populated && !expired());
+    if (!populated) {
+        sim.Stop();
+        return failures + 1;
+    }
+    // Placement proof via position->zone mapping (no live flecs reads):
+    // player in A, every mob in B.
+    bool placed = sim.Zones().FindIndexForPosition(px, y_mid) == zone_a;
+    for (int k = 0; k < 3 && placed; ++k) {
+        placed = sim.Zones().FindIndexForPosition(px + kDistances[k], y_mid) == zone_b;
+    }
+    check("cross-zone-placement", placed);
+    check("pre-validate", validate_now("pre"));
+    std::this_thread::sleep_for(std::chrono::seconds(6)); // eval + settle
+    if (expired()) {
+        check("settle-window", false);
+        sim.Stop();
+        return failures + 1;
+    }
+    std::vector<gs::game::ActivitySampleResult> samples;
+    bool detailed_ok = activity_samples("distances", 64, samples);
+    check("detailed-ok", detailed_ok);
+    const gs::game::SimulationTier kExpected1[3] = {
+        gs::game::SimulationTier::Full,
+        gs::game::SimulationTier::Reduced,
+        gs::game::SimulationTier::Low,
+    };
+    bool tiers_ok = detailed_ok;
+    for (int k = 0; k < 3 && tiers_ok; ++k) {
+        const auto* sample = find_sample(samples, px + kDistances[k], y_mid);
+        if (sample == nullptr || sample->field_tier != kExpected1[k] ||
+            sample->brute_tier != kExpected1[k]) {
+            std::printf("ACTIVITY distance[%d]: %s (expected %d)\n",
+                        k,
+                        sample == nullptr ? "sample-missing"
+                                          : (sample->field_tier != sample->brute_tier ? "field!=brute"
+                                                                                      : "wrong-tier"),
+                        static_cast<int>(kExpected1[k]));
+            tiers_ok = false;
+        }
+    }
+    check("cross-zone-tiers", tiers_ok);
+    // Metric path: every grant above came from the foreign zone's player,
+    // so the cross-zone counters must observe traffic (accumulated over a
+    // few diag windows to be independent of exchange phasing).
+    {
+        std::uint64_t seen = 0;
+        const auto until = std::chrono::steady_clock::now() + std::chrono::seconds(5);
+        while (std::chrono::steady_clock::now() < until && seen == 0 && !expired()) {
+            for (std::size_t zi = 0; zi < sim.Zones().ZoneCount(); ++zi) {
+                const auto& diag = sim.Zones().GetZone(zi).Diagnostics();
+                seen += diag.cross_zone_full_since_diag.load(std::memory_order_relaxed);
+                seen += diag.cross_zone_reduced_since_diag.load(std::memory_order_relaxed);
+                seen += diag.cross_zone_low_since_diag.load(std::memory_order_relaxed);
+            }
+            std::this_thread::sleep_for(std::chrono::milliseconds(100));
+        }
+        std::printf("ACTIVITY cross-counters observed: %llu\n", (unsigned long long)seen);
+        check("cross-counters-live", seen > 0);
+    }
+    check("validate-distances", validate_now("distances"));
+
+    // ---- Phase 2: half-open boundary exactness (same player, 9 mobs).
+    const float kBounds[9] = {14.0f, 15.0f, 16.0f, 49.0f, 50.0f,  51.0f,
+                              149.0f, 150.0f, 151.0f};
+    const gs::game::SimulationTier kExpected2[9] = {
+        gs::game::SimulationTier::Full,    gs::game::SimulationTier::Reduced,
+        gs::game::SimulationTier::Reduced, gs::game::SimulationTier::Reduced,
+        gs::game::SimulationTier::Low,     gs::game::SimulationTier::Low,
+        gs::game::SimulationTier::Low,     gs::game::SimulationTier::Dormant,
+        gs::game::SimulationTier::Dormant,
+    };
+    for (int k = 0; k < 9; ++k) {
+        gs::game::MobSpawnPoint point;
+        point.mob_type_id = 2;
+        point.x = px + kBounds[k];
+        point.y = y_mid;
+        point.count = 1;
+        point.radius = 0.0f;
+        sim.AddMobSpawnPoint(point);
+    }
+    for (int k = 0; k < 9; ++k) {
+        sim.RequestMobSpawn(static_cast<std::size_t>(7 + k));
+    }
+    const bool populated2 = WaitFor(std::chrono::seconds(25), [&] {
+        return sim.CollectProcessLoad().mobs >= 12;
+    });
+    check("boundary-populate", populated2 && !expired());
+    if (!populated2) {
+        sim.Stop();
+        return failures + 1;
+    }
+    std::this_thread::sleep_for(std::chrono::seconds(6));
+    if (expired()) {
+        check("boundary-window", false);
+        sim.Stop();
+        return failures + 1;
+    }
+    std::vector<gs::game::ActivitySampleResult> samples2;
+    bool detailed2 = activity_samples("boundaries", 64, samples2);
+    check("detailed2-ok", detailed2);
+    bool bounds_ok = detailed2;
+    for (int k = 0; k < 9 && bounds_ok; ++k) {
+        const auto* sample = find_sample(samples2, px + kBounds[k], y_mid);
+        if (sample == nullptr || sample->field_tier != kExpected2[k] ||
+            sample->brute_tier != kExpected2[k]) {
+            std::printf("ACTIVITY boundary[%d] d=%.0f: %s (expected %d)\n",
+                        k,
+                        kBounds[k],
+                        sample == nullptr ? "sample-missing"
+                                          : (sample->field_tier != sample->brute_tier ? "field!=brute"
+                                                                                      : "wrong-tier"),
+                        static_cast<int>(kExpected2[k]));
+            bounds_ok = false;
+        }
+    }
+    check("boundary-exactness", bounds_ok);
+    check("validate-boundaries", validate_now("boundaries"));
+    // No topology churn allowed at this load (determinism guard).
+    check("topology-stable", sim.Zones().ZoneCount() == 3);
+
+    // ---- Phase 3: despawn -> Full/Reduced work must drain (sleep
+    // precondition), zones fall asleep, validator Dormant rules execute
+    // live on the already-Dormant boundary mobs. NOTE: remaining Low mobs
+    // freeze mid-cascade in sleeping zones BY DESIGN (no ticks = no eval);
+    // they resume and finish demoting on wake. Asserting all-Dormant here
+    // would contradict the sleep economy, so assert no-Full/Reduced.
+    sim.PostDespawn(kPlayer);
+    const bool drained = WaitFor(std::chrono::seconds(15), [&] { return sim.Owners().empty(); });
+    check("despawn-drained", drained && !expired());
+    const bool quiet = WaitFor(std::chrono::seconds(20), [&] {
+        std::uint64_t hot = 0, total = 0;
+        for (std::size_t zi = 0; zi < sim.Zones().ZoneCount(); ++zi) {
+            const auto& diag = sim.Zones().GetZone(zi).Diagnostics();
+            hot += diag.lod_full.load(std::memory_order_relaxed) +
+                   diag.lod_reduced.load(std::memory_order_relaxed);
+            total += hot + diag.lod_low.load(std::memory_order_relaxed) +
+                     diag.lod_dormant.load(std::memory_order_relaxed);
+        }
+        return total >= 12 && hot == 0;
+    });
+    check("no-full-reduced", quiet && !expired());
+    check("validate-dormant", validate_now("dormant"));
+    const bool slept = WaitFor(std::chrono::seconds(10), [&] {
+        return sim.CollectProcessLoad().sleeping_zones >= 1;
+    });
+    check("zone-slept", slept && !expired());
+
+    // ---- Phase 4: predictive wake. Spawn OUTSIDE the sleeping zone but
+    // inside the wake radius (reduced 50m): the zone must wake with no
+    // entry, then validate.
+    const float wake_x = x_edge - 40.0f; // zone A side, 40m from B's edge
+    if (sim.Zones().FindIndexForPosition(wake_x, y_mid) == zone_b) {
+        check("wake-point-outside", false);
+        sim.Stop();
+        return failures + 1;
+    }
+    check("wake-point-outside", true);
+    constexpr gs::common::SessionId kWaker = 701;
+    {
+        boost::asio::ip::tcp::socket socket(io);
+        auto session = std::make_shared<gs::network::Session>(std::move(socket), kWaker);
+        sim.PostSpawn(session, MakeBenchCharacter(901), gs::game::DebugSpawnOverride{wake_x, y_mid});
+    }
+    const bool spawned_waker = WaitFor(std::chrono::seconds(10), [&] {
+        return sim.Owners().size() == 1;
+    });
+    check("waker-spawned", spawned_waker && !expired());
+    const bool rewoke = WaitFor(std::chrono::seconds(10), [&] {
+        return sim.Zones().GetZone(zone_b).Activity() == gs::game::ZoneActivity::Active;
+    });
+    check("predictive-wake", rewoke && !expired());
+    check("validate-wake", validate_now("wake"));
+
+    const auto pm = sim.PartitionMetricsSnapshot();
+    std::printf("ACTIVITY metrics: splits=%llu merges=%llu\n",
+                (unsigned long long)(pm.split_commits + pm.split_aborts),
+                (unsigned long long)(pm.merge_commits + pm.merge_aborts));
+    sim.Stop();
+    std::printf("ACTIVITY-DONE validations=%d failures=%d\n", validations, failures);
+    return failures;
+}
+
 } // namespace
 
 int BenchMain(int argc, char** argv)
@@ -1090,6 +1433,19 @@ int BenchMain(int argc, char** argv)
             lod_io_thread.join();
         }
         std::printf("BENCH-DONE lod failures=%d\n", scenario_failures);
+        return scenario_failures == 0 ? 0 : 2;
+    }
+
+    if (config.mode == "activity") {
+        // Cross-zone LOD determinism via the activity field.
+        boost::asio::io_context activity_io;
+        std::thread activity_io_thread([&activity_io] { activity_io.run(); });
+        const int scenario_failures = RunActivityScenario(activity_io, config);
+        activity_io.stop();
+        if (activity_io_thread.joinable()) {
+            activity_io_thread.join();
+        }
+        std::printf("BENCH-DONE activity failures=%d\n", scenario_failures);
         return scenario_failures == 0 ? 0 : 2;
     }
 
@@ -1424,14 +1780,21 @@ int BenchMain(int argc, char** argv)
             // per second. Work totals are cumulative (never reset); the
             // per-second windows in the diag log reset every second.
             std::uint64_t t_full = 0, t_reduced = 0, t_low = 0, t_dormant = 0;
+            std::uint64_t x_full = 0, x_reduced = 0, x_low = 0, sleep_block = 0, wake_ext = 0;
             for (std::size_t zi = 0; zi < sim.Zones().ZoneCount(); ++zi) {
                 const auto& diag = sim.Zones().GetZone(zi).Diagnostics();
                 t_full += diag.lod_full.load(std::memory_order_relaxed);
                 t_reduced += diag.lod_reduced.load(std::memory_order_relaxed);
                 t_low += diag.lod_low.load(std::memory_order_relaxed);
                 t_dormant += diag.lod_dormant.load(std::memory_order_relaxed);
+                x_full += diag.cross_zone_full_since_diag.load(std::memory_order_relaxed);
+                x_reduced += diag.cross_zone_reduced_since_diag.load(std::memory_order_relaxed);
+                x_low += diag.cross_zone_low_since_diag.load(std::memory_order_relaxed);
+                sleep_block += diag.sleep_blocked_external_since_diag.load(std::memory_order_relaxed);
+                wake_ext += diag.wake_external_since_diag.load(std::memory_order_relaxed);
             }
             const auto work = sim.LodWorkTotalsSnapshot();
+            const auto activity = sim.ActivityMetrics();
             const double elapsed = static_cast<double>(std::max(1, config.seconds));
             std::printf("lod tiers: full=%llu reduced=%llu low=%llu dormant=%llu\n",
                         (unsigned long long)t_full,
@@ -1448,6 +1811,18 @@ int BenchMain(int argc, char** argv)
                         (unsigned long long)work.demotions,
                         (unsigned long long)work.wakes,
                         (unsigned long long)work.eval_us);
+            std::printf("activity: sources=%llu cells=%llu/%llu rebuilds=%llu rb_us=%llu "
+                        "xzone=[%llu/%llu/%llu] sleep=[blocked=%llu wext=%llu]\n",
+                        (unsigned long long)activity.sources,
+                        (unsigned long long)activity.cells_nonempty,
+                        (unsigned long long)activity.cells_total,
+                        (unsigned long long)activity.rebuilds,
+                        (unsigned long long)activity.rebuild_us_total,
+                        (unsigned long long)x_full,
+                        (unsigned long long)x_reduced,
+                        (unsigned long long)x_low,
+                        (unsigned long long)sleep_block,
+                        (unsigned long long)wake_ext);
         }
 
         sim.Stop();

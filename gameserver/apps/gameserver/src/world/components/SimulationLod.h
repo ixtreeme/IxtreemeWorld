@@ -30,6 +30,19 @@ inline constexpr std::uint32_t kLodNeverTick = 0xFFFFFFFFu;
 // ORDERING INVARIANT: lower value = HIGHER relevance (Full is most
 // relevant). Promotion compares desired < tier, demotion desired > tier.
 // Never reorder without updating LodSystem::Evaluate.
+//
+// TIER SEMANTICS (§28) — three distinct concepts, do not conflate:
+//   Low:       low-frequency simulation (default 1 Hz) WHILE ITS ZONE IS
+//              ACTIVE. Low is a rate, not a freeze: entities still integrate
+//              (dt-scaled), decide, migrate and die on schedule.
+//   Sleeping:  a ZONE state, not an entity state. A sleeping zone runs no
+//              ticks at all, so even its Low mobs freeze (unobservably;
+//              they resume exact on wake). Sleep needs zero Full/Reduced
+//              work plus no external influence; it is orthogonal to tiers.
+//   Dormant:   an ENTITY state: event-driven only, never scheduled. Wake is
+//              exclusively via promotion paths (proximity eval, attack,
+//              spawn, migration). A Dormant mob in a ticking zone costs a
+//              due-check per tick and nothing else.
 enum class SimulationTier : std::uint8_t {
     Full = 0,    // every tick (20 Hz): players, combat, nearby
     Reduced = 1, // every Nth tick (default 10 Hz): mid relevance

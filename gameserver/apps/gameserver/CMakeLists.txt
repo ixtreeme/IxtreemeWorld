@@ -23,6 +23,7 @@ set(GAMESERVER_WORLD_SOURCES
     src/world/systems/CombatSystem.cpp
     src/world/systems/CooldownSystem.cpp
     src/world/systems/LodSystem.cpp
+    src/world/activity/SpatialActivityField.cpp
     src/world/systems/MovementSystem.cpp
     src/world/spatial/AoiSystem.cpp
     src/world/spatial/SpatialGrid.cpp

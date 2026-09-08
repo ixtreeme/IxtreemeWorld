@@ -93,6 +93,10 @@ WorldRuntime::WorldRuntime(boost::asio::io_context& io, RuntimeIdentity identity
 
     zones_.BuildFromWorldLogic(world_logic_, terrain_.WorldExtentMeters());
     directory_.RebuildFromManager(zones_);
+    // Size the activity grid to the real world extent (test map and 100km
+    // world alike); positions clamp into it by construction.
+    activity_field_.Reconfigure(
+        SpatialActivityField::Config{kActivityCellSizeMeters, terrain_.WorldExtentMeters()});
     spawn_.Initialize(map_root, IXTREEME_DEFAULT_MOB_TYPES_CONFIG);
 }
 
@@ -183,6 +187,7 @@ ZoneTickContext WorldRuntime::BuildZoneTickContext()
                         &migration_queue_,
                         world_tick_.load(std::memory_order_relaxed),
                         &effective_lod_config_,
+                        activity_field_.Snapshot(),
                         [this](std::shared_ptr<gs::network::Session> session, std::vector<std::uint8_t> payload) {
                             SendToSession(io_, session, std::move(payload));
                         },
@@ -236,7 +241,26 @@ void WorldRuntime::Run()
                                      deaths_total_.fetch_add(1, std::memory_order_relaxed);
                                  }
                              });
-        scheduler_.ScheduleOnce(zones_, workers_, std::chrono::steady_clock::now());
+        // World-space activity rebuild (~1Hz, no tick gating: per-zone
+        // buffer copies only). Feeds this pass's LOD evaluations (via tick
+        // contexts) and sleep/wake decisions below.
+        const auto now_activity = std::chrono::steady_clock::now();
+        if (now_activity - last_activity_build_ >= std::chrono::seconds(1)) {
+            last_activity_build_ = now_activity;
+            const auto& lod = effective_lod_config_;
+            activity_field_.Rebuild(zones_,
+                                    ActivityRadii{lod.full_radius_m, lod.reduced_radius_m,
+                                                  lod.low_radius_m},
+                                    lod.enabled);
+        }
+        const auto activity_snapshot = activity_field_.Snapshot();
+        // Wake radius derives from the LOD reduced radius (§20): any player
+        // inside it may grant Full/Reduced relevance, so the zone must tick.
+        scheduler_.ScheduleOnce(zones_,
+                                workers_,
+                                std::chrono::steady_clock::now(),
+                                activity_snapshot,
+                                effective_lod_config_.reduced_radius_m);
         ExecutePartitionControl();
         const auto supervisor_micros = static_cast<std::uint64_t>(
             std::chrono::duration_cast<std::chrono::microseconds>(std::chrono::steady_clock::now() -
@@ -256,11 +280,32 @@ void WorldRuntime::Run()
             if (!zones_.AnyTickInProgress()) {
                 validation_requested_.store(false, std::memory_order_relaxed);
                 std::string error;
-                const bool ok = ValidateWorldConsistency(zones_, owners_by_session_, migration_queue_,
-                                                         directory_, error);
+                const auto activity_for_validation = activity_field_.Snapshot();
+                const bool ok =
+                    ValidateWorldConsistency(zones_, owners_by_session_, migration_queue_, directory_,
+                                             activity_for_validation.get(), error);
                 std::lock_guard lock(validation_mutex_);
                 validation_result_ = ok ? std::string("OK") : "FAIL: " + error;
                 validation_ready_ = true;
+            }
+        }
+        // Strict field-vs-brute-force audit (§31): same quiescent window,
+        // explicit request only (static scenarios; roaming load would race
+        // the 1Hz snapshot). Samples + outcome are stashed for the bench.
+        if (activity_validation_requested_.load(std::memory_order_relaxed)) {
+            if (!zones_.AnyTickInProgress()) {
+                activity_validation_requested_.store(false, std::memory_order_relaxed);
+                const std::size_t max_samples =
+                    activity_validation_max_samples_.load(std::memory_order_relaxed);
+                std::vector<ActivitySampleResult> samples;
+                std::string error;
+                const bool ok = ValidateActivityFieldDetailed(
+                    zones_, *activity_field_.Snapshot(), samples, error, max_samples);
+                std::lock_guard lock(activity_validation_mutex_);
+                activity_samples_ = std::move(samples);
+                activity_validation_error_ = std::move(error);
+                activity_validation_ok_ = ok;
+                activity_samples_ready_ = true;
             }
         }
 
@@ -292,6 +337,11 @@ void WorldRuntime::Run()
             std::uint64_t total_lod_dem = 0;
             std::uint64_t total_lod_wake = 0;
             std::uint64_t total_lod_eval_us = 0;
+            std::uint64_t total_x_full = 0;
+            std::uint64_t total_x_reduced = 0;
+            std::uint64_t total_x_low = 0;
+            std::uint64_t total_sleep_block = 0;
+            std::uint64_t total_wake_ext = 0;
             std::uint64_t lod_full = 0;
             std::uint64_t lod_reduced = 0;
             std::uint64_t lod_low = 0;
@@ -336,6 +386,11 @@ void WorldRuntime::Run()
                 total_lod_dem += zone.Diagnostics().lod_demotions_since_diag.exchange(0);
                 total_lod_wake += zone.Diagnostics().lod_wakes_since_diag.exchange(0);
                 total_lod_eval_us += zone.Diagnostics().lod_eval_us_since_diag.exchange(0);
+                total_x_full += zone.Diagnostics().cross_zone_full_since_diag.exchange(0);
+                total_x_reduced += zone.Diagnostics().cross_zone_reduced_since_diag.exchange(0);
+                total_x_low += zone.Diagnostics().cross_zone_low_since_diag.exchange(0);
+                total_sleep_block += zone.Diagnostics().sleep_blocked_external_since_diag.exchange(0);
+                total_wake_ext += zone.Diagnostics().wake_external_since_diag.exchange(0);
             }
             lod_ai_total_.fetch_add(total_lod_ai, std::memory_order_relaxed);
             lod_mv_total_.fetch_add(total_lod_mv, std::memory_order_relaxed);
@@ -366,7 +421,8 @@ void WorldRuntime::Run()
              const auto routes = router_.MetricsSnapshot();
              const auto mig_metrics = migration_.MetricsSnapshot();
              const auto part_metrics = partition_metrics_.TakeSnapshot();
-            LOG_INFO("Game sim diag: world_tick={} zones={} active_zones={} sleeping_zones={} active_sessions={} active_mobs={} wandering_mobs={} idle_mobs={} ghosts={} zone_ticks={} empty_zone_skips={} transform_records_sent={} attacks_per_sec={} deaths_total={} respawns_pending={} respawns_total={} migrations={} mig_pending={} mig_quarantined={} mig_detail=[c={} stale={} dup={} retry={} fail={}] routes=[local={} remu={} unav={} drain={} miss={}] workers={} worker_busy_pct={:.1f}                      avg_zone_tick_ms={:.3f} aoi_queries={} dirty_xf={} tiers=[{}/{}/{}] stage_us=[gameplay={} ghost={} repl={}] avg_supervisor_ms={:.3f} partition=[s_att={} s_ok={} s_ab={} m_att={} m_ok={} m_ab={} rej={}] lod=[{}/{}/{}/{} ai={} mv={} prom={} dem={} wake={} eval_us={}]",
+             const auto activity_metrics = activity_field_.Metrics();
+            LOG_INFO("Game sim diag: world_tick={} zones={} active_zones={} sleeping_zones={} active_sessions={} active_mobs={} wandering_mobs={} idle_mobs={} ghosts={} zone_ticks={} empty_zone_skips={} transform_records_sent={} attacks_per_sec={} deaths_total={} respawns_pending={} respawns_total={} migrations={} mig_pending={} mig_quarantined={} mig_detail=[c={} stale={} dup={} retry={} fail={}] routes=[local={} remu={} unav={} drain={} miss={}] workers={} worker_busy_pct={:.1f}                      avg_zone_tick_ms={:.3f} aoi_queries={} dirty_xf={} tiers=[{}/{}/{}] stage_us=[gameplay={} ghost={} repl={}] avg_supervisor_ms={:.3f} partition=[s_att={} s_ok={} s_ab={} m_att={} m_ok={} m_ab={} rej={}] lod=[{}/{}/{}/{} ai={} mv={} prom={} dem={} wake={} eval_us={}] xzone=[f={} r={} l={}] sleep=[blocked={} wext={}] activity=[srcs={} cells={} rb_us={}]",
                      world_tick_.load(),
                      zones_.ZoneCount(),
                      active_zones,
@@ -424,7 +480,15 @@ void WorldRuntime::Run()
                      total_lod_prom,
                      total_lod_dem,
                      total_lod_wake,
-                     total_lod_eval_us);
+                     total_lod_eval_us,
+                     total_x_full,
+                     total_x_reduced,
+                     total_x_low,
+                     total_sleep_block,
+                     total_wake_ext,
+                     activity_metrics.sources,
+                     activity_metrics.cells_nonempty,
+                     activity_metrics.rebuild_us_total);
             do {
                 next_diagnostics += std::chrono::seconds(1);
             } while (now >= next_diagnostics);
@@ -451,8 +515,30 @@ bool WorldRuntime::ValidateConsistency(std::string& out_error)
     // Debug/test only: the caller must guarantee no zone tick or supervisor
     // mutation is running concurrently (e.g. call between Run iterations in
     // a test harness, or after Stop).
+    const auto activity = activity_field_.Snapshot();
     return ValidateWorldConsistency(zones_, owners_by_session_, migration_queue_, directory_,
-                                    out_error);
+                                    activity.get(), out_error);
+}
+
+void WorldRuntime::RequestActivityValidation(std::size_t max_samples)
+{
+    activity_validation_max_samples_.store(max_samples, std::memory_order_relaxed);
+    activity_validation_requested_.store(true, std::memory_order_relaxed);
+}
+
+bool WorldRuntime::TryTakeActivitySamples(std::vector<ActivitySampleResult>& out_samples,
+                                          std::string& out_error)
+{
+    std::lock_guard lock(activity_validation_mutex_);
+    if (!activity_samples_ready_) {
+        return false;
+    }
+    out_samples = activity_samples_;
+    out_error = activity_validation_error_;
+    activity_samples_.clear();
+    activity_validation_error_.clear();
+    activity_samples_ready_ = false;
+    return activity_validation_ok_;
 }
 
 void WorldRuntime::RequestValidation()
