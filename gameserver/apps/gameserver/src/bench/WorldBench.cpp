@@ -61,6 +61,9 @@ struct BenchConfig {
     int despawn_storm = 0;
     int logical_processes = 0;
     bool routing_selftest = false;
+    // Pure ActivityGrid unit checks (no world, no threads): origin-aware
+    // indexing and the Fast/Exact query split. Runs standalone and exits.
+    bool field_selftest = false;
     std::uint32_t seed = 12345;
     // splitmerge scenario: deterministic transfer-failure injection counts
     // (0 = commit path; >0 = abort path expectations). fail_after lets that
@@ -94,6 +97,7 @@ bool ParseArgs(int argc, char** argv, BenchConfig& config)
                          "             [--mode spread|hotspot|border|dense|splitmerge|lod|activity]\n"
                          "             [--validate-every K] [--despawn-storm R] [--seed S]\n"
                          "             [--logical-processes K] [--routing-selftest]\n"
+                         "             [--field-selftest]\n"
                          "             [--fail-snapshot N] [--fail-apply N] [--fail-after N]\n"
                          "             [--partition-min-size M] [--lod-off]\n";
             return false;
@@ -139,6 +143,8 @@ bool ParseArgs(int argc, char** argv, BenchConfig& config)
             config.logical_processes = std::stoi(value);
         } else if (arg == "--routing-selftest") {
             config.routing_selftest = true;
+        } else if (arg == "--field-selftest") {
+            config.field_selftest = true;
         } else if (arg == "--fail-snapshot") {
             if (!need_value("fail-snapshot", value)) {
                 return false;
@@ -226,6 +232,139 @@ void SelftestReport(const char* name, bool pass, bool skipped, int& failures)
         std::printf("SELFTEST %s: FAIL\n", name);
         ++failures;
     }
+}
+
+// --- pure ActivityGrid checks (no world, no threads, no timing) -------------
+// They pin the two generalizations of the activity field:
+//   * origin-aware indexing: a world need not start at (0,0) nor be square
+//   * the Fast/Exact query split: identical tier, differing provenance
+gs::game::ActivityGrid MakeTestGrid(gs::game::WorldBounds bounds,
+                                    float cell,
+                                    const std::vector<gs::game::PlayerInfluenceSource>& sources)
+{
+    gs::game::ActivityGrid grid;
+    grid.enabled = true;
+    grid.radii = gs::game::ActivityRadii{}; // 150 / 500 / 1500 m
+    grid.cell_size_m = cell;
+    grid.bounds = bounds;
+    grid.dim_x = static_cast<std::uint32_t>(std::ceil(bounds.ExtentX() / cell));
+    grid.dim_y = static_cast<std::uint32_t>(std::ceil(bounds.ExtentY() / cell));
+    grid.cells.resize(static_cast<std::size_t>(grid.dim_x) * grid.dim_y);
+    for (const auto& source : sources) {
+        const std::size_t index =
+            static_cast<std::size_t>(grid.ClampedCellY(source.y)) * grid.dim_x +
+            grid.ClampedCellX(source.x);
+        grid.cells[index].players.push_back(source);
+    }
+    return grid;
+}
+
+int RunFieldSelftest()
+{
+    using gs::game::ActivityGrid;
+    using gs::game::PlayerInfluenceSource;
+    using gs::game::SimulationTier;
+    using gs::game::WorldBounds;
+
+    int failures = 0;
+
+    // (1) Negative origin: a source deep in the negative quadrant keeps its own
+    // cell instead of being folded into cell 0, and is found from nearby.
+    {
+        const WorldBounds bounds{-50000.0f, -50000.0f, 50000.0f, 50000.0f};
+        const ActivityGrid grid =
+            MakeTestGrid(bounds, 500.0f, {PlayerInfluenceSource{1, -40000.0f, -40000.0f, 7, 0}});
+        const bool dims_ok = grid.dim_x == 200u && grid.dim_y == 200u;
+        const bool index_ok = grid.ClampedCellX(-50000.0f) == 0u &&
+                              grid.ClampedCellX(-40000.0f) == 20u &&
+                              grid.ClampedCellY(-40000.0f) == 20u &&
+                              grid.ClampedCellX(0.0f) == 100u;
+        const auto near_hit = grid.QueryPlayerInfluenceExact(-39900.0f, -40000.0f, 7);
+        const auto far_miss = grid.QueryPlayerInfluenceExact(40000.0f, 40000.0f, 7);
+        SelftestReport("field-negative-origin",
+                       dims_ok && index_ok && near_hit.tier == SimulationTier::Full &&
+                           !far_miss.has_influence,
+                       false,
+                       failures);
+    }
+
+    // (2) Non-square world: the per-axis dims are independent.
+    {
+        const WorldBounds bounds{0.0f, 0.0f, 4000.0f, 1000.0f};
+        const ActivityGrid grid =
+            MakeTestGrid(bounds, 500.0f, {PlayerInfluenceSource{1, 3900.0f, 900.0f, 3, 0}});
+        const auto hit = grid.QueryPlayerInfluenceExact(3900.0f, 900.0f, 3);
+        SelftestReport("field-non-square-bounds",
+                       grid.dim_x == 8u && grid.dim_y == 2u &&
+                           hit.tier == SimulationTier::Full && hit.nearest_sq == 0.0f,
+                       false,
+                       failures);
+    }
+
+    // (3) Fast vs Exact, crafted so the early-out actually matters: two sources
+    // inside the Full bubble on the SAME cell row, the NEARER one in the later
+    // cell. Fast stops at the farther one (its tier is already maxed); Exact
+    // keeps walking and finds the true minimum.
+    {
+        const ActivityGrid grid = MakeTestGrid(
+            WorldBounds::FromExtent(2000.0f),
+            500.0f,
+            {PlayerInfluenceSource{1, 960.0f, 1200.0f, 11, 0},     // cell x=1, d=40
+             PlayerInfluenceSource{2, 1010.0f, 1200.0f, 22, 0}});  // cell x=2, d=10
+        const auto fast = grid.QueryPlayerTierFast(1000.0f, 1200.0f, 22);
+        const auto exact = grid.QueryPlayerInfluenceExact(1000.0f, 1200.0f, 22);
+        // Contract: tier + has_influence are identical in both variants.
+        const bool agree = fast.tier == exact.tier && fast.tier == SimulationTier::Full &&
+                           fast.has_influence && exact.has_influence;
+        // Exact is the true minimum (10m -> 100), Fast settled for 40m -> 1600.
+        const bool exact_is_minimum =
+            exact.nearest_sq == 100.0f && fast.nearest_sq == 1600.0f;
+        // Documents the caveat: Fast provenance is best-effort. The fast walk
+        // attributes the sample to zone 11, the exact walk to the real zone 22.
+        const bool provenance_differs = fast.cross_zone && !exact.cross_zone;
+        SelftestReport("field-fast-vs-exact",
+                       agree && exact_is_minimum && provenance_differs,
+                       false,
+                       failures);
+    }
+
+    // (4) Invariant sweep: across many placements Fast and Exact must ALWAYS
+    // agree on tier and has_influence, and Exact never reports a larger
+    // distance than Fast. Deterministic pattern, no RNG.
+    {
+        std::vector<PlayerInfluenceSource> sources;
+        for (int i = 0; i < 40; ++i) {
+            sources.push_back(
+                PlayerInfluenceSource{static_cast<std::uint32_t>(i + 1),
+                                      60.0f + static_cast<float>(i) * 97.0f,
+                                      40.0f + static_cast<float>((i * 53) % 1900),
+                                      static_cast<std::uint32_t>(i % 3),
+                                      0});
+        }
+        const ActivityGrid grid = MakeTestGrid(WorldBounds::FromExtent(2000.0f), 500.0f, sources);
+        bool ok = true;
+        int checked = 0;
+        for (int gy = 0; gy < 40 && ok; ++gy) {
+            for (int gx = 0; gx < 40 && ok; ++gx) {
+                const auto fast =
+                    grid.QueryPlayerTierFast(static_cast<float>(gx) * 50.0f,
+                                             static_cast<float>(gy) * 50.0f, 0);
+                const auto exact =
+                    grid.QueryPlayerInfluenceExact(static_cast<float>(gx) * 50.0f,
+                                                   static_cast<float>(gy) * 50.0f, 0);
+                ++checked;
+                if (fast.tier != exact.tier || fast.has_influence != exact.has_influence ||
+                    exact.nearest_sq > fast.nearest_sq) {
+                    ok = false;
+                }
+            }
+        }
+        std::printf("FIELD sweep points=%d\n", checked);
+        SelftestReport("field-fast-exact-sweep", ok, false, failures);
+    }
+
+    std::printf("FIELD-SELFTEST-DONE failures=%d\n", failures);
+    return failures;
 }
 
 bool WaitFor(std::chrono::milliseconds timeout, const std::function<bool()>& condition)
@@ -1397,6 +1536,12 @@ int BenchMain(int argc, char** argv)
     }
 
     gs::common::InitLogging("warning", "logs/world_bench.log");
+
+    // Pure field checks need no world, no map and no threads: run and exit.
+    if (config.field_selftest) {
+        return RunFieldSelftest() == 0 ? 0 : 1;
+    }
+
     std::printf("worldbench: players=%d mobs=%d seconds=%d mode=%s validate_every=%d "
                 "despawn_storm=%d seed=%u logical_processes=%d routing_selftest=%d\n",
                 config.players,

@@ -57,13 +57,22 @@ struct ActivityGrid {
     // on stale influence, and validators skip activity checks.
     bool enabled = false;
     float cell_size_m = kActivityCellSizeMeters;
-    float world_extent_m = 0.0f;
-    std::uint32_t dim = 0; // cells per side; world is [0, extent]^2
-    std::vector<ActivityCell> cells; // dim*dim, row-major (y * dim + x)
+    // Explicit world rectangle: the origin may be non-zero and the extents may
+    // differ per axis. Indexing subtracts the origin, so a -50km..+50km world
+    // is addressed correctly (the earlier code folded negatives into cell 0).
+    WorldBounds bounds{};
+    std::uint32_t dim_x = 0; // cells along X
+    std::uint32_t dim_y = 0; // cells along Y
+    std::vector<ActivityCell> cells; // dim_x*dim_y, row-major (y * dim_x + x)
 
-    std::uint32_t CellDim() const noexcept
+    std::uint32_t CellDimX() const noexcept
     {
-        return dim;
+        return dim_x;
+    }
+
+    std::uint32_t CellDimY() const noexcept
+    {
+        return dim_y;
     }
 
     const ActivityRadii& Radii() const noexcept
@@ -98,20 +107,36 @@ struct ActivityGrid {
         return count;
     }
 
-    // Exact nearest-player influence at a world position. Box-walks only
-    // cells overlapping the low-radius disc, then takes the exact minimum
-    // over sources inside (early-out below full radius). Deterministic
-    // given identical input; first-minimum wins exact ties.
-    InfluenceSample QueryPlayerInfluence(float x, float y, std::uint32_t viewer_zone) const noexcept;
+    // TIER CLASSIFICATION (LOD hot path). Box-walks the cells overlapping the
+    // low-radius disc and STOPS as soon as any source is inside the Full
+    // bubble -- nothing closer could raise the tier any further.
+    //
+    //   EXACT:       tier, has_influence.
+    //   BEST-EFFORT: nearest_sq, cross_zone. When the walk early-outs these
+    //                describe SOME source inside the Full bubble, not
+    //                necessarily the nearest one. Never use them for
+    //                provenance, distance reporting or planner input --
+    //                use the Exact query for that.
+    InfluenceSample QueryPlayerTierFast(float x, float y, std::uint32_t viewer_zone) const noexcept;
+
+    // FULL-PRECISION (adaptive planner, diagnostics, validators). Walks every
+    // cell overlapping the low-radius disc with no early-out, so nearest_sq is
+    // the true minimum and cross_zone names the zone of the actually nearest
+    // source. Deterministic; first-minimum wins exact ties. Strictly more work
+    // than the Fast query -- keep it off per-entity hot paths.
+    //
+    //   EXACT: tier, has_influence, nearest_sq, cross_zone.
+    InfluenceSample QueryPlayerInfluenceExact(float x, float y, std::uint32_t viewer_zone) const noexcept;
 
     // Exact predicate: any player source within `radius` of the rect
     // (point-to-rect distance, early-out on first hit). Used for
     // sleep/wake decisions; exact, so never over- or under-sleeps.
-    bool HasPlayerWithin(const mx::map::Rect& bounds, float radius) const noexcept;
+    bool HasPlayerWithin(const mx::map::Rect& rect, float radius) const noexcept;
 
     // Cell helpers (public: the supervisor builder shares them; pure index
     // math, no state beyond grid dims).
-    std::uint32_t ClampedCell(float v) const noexcept;
+    std::uint32_t ClampedCellX(float x) const noexcept;
+    std::uint32_t ClampedCellY(float y) const noexcept;
     void BoxRange(float x, float y, float radius, int& x0, int& x1, int& y0, int& y1) const noexcept;
 };
 
@@ -137,7 +162,9 @@ class SpatialActivityField {
 public:
     struct Config {
         float cell_size_m = kActivityCellSizeMeters;
-        float world_extent_m = 100000.0f;
+        // Defaults to the historic origin-at-zero square world, so existing
+        // deployments keep identical coordinates.
+        WorldBounds bounds = WorldBounds::FromExtent(100000.0f);
     };
 
     explicit SpatialActivityField(Config config = Config{});

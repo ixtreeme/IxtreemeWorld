@@ -12,17 +12,37 @@
 
 namespace gs::game {
 
-std::uint32_t ActivityGrid::ClampedCell(float v) const noexcept
+namespace {
+
+// Shared origin-aware axis mapping: world coordinate -> clamped cell index.
+// Subtracting the origin is what makes a non-zero world origin work; the old
+// code divided the raw coordinate and folded every negative into cell 0.
+std::uint32_t ClampedAxisCell(float world_v,
+                              float origin_v,
+                              float cell_size,
+                              std::uint32_t dim) noexcept
 {
     if (dim == 0) {
         return 0;
     }
-    const int c = static_cast<int>(std::floor(v / cell_size_m));
+    const int c = static_cast<int>(std::floor((world_v - origin_v) / cell_size));
     if (c < 0) {
         return 0;
     }
     const auto last = static_cast<int>(dim) - 1;
     return static_cast<std::uint32_t>(c > last ? last : c);
+}
+
+} // namespace
+
+std::uint32_t ActivityGrid::ClampedCellX(float x) const noexcept
+{
+    return ClampedAxisCell(x, bounds.min_x, cell_size_m, dim_x);
+}
+
+std::uint32_t ActivityGrid::ClampedCellY(float y) const noexcept
+{
+    return ClampedAxisCell(y, bounds.min_y, cell_size_m, dim_y);
 }
 
 void ActivityGrid::BoxRange(float x,
@@ -33,30 +53,44 @@ void ActivityGrid::BoxRange(float x,
                             int& y0,
                             int& y1) const noexcept
 {
-    x0 = static_cast<int>(ClampedCell(x - radius));
-    x1 = static_cast<int>(ClampedCell(x + radius));
-    y0 = static_cast<int>(ClampedCell(y - radius));
-    y1 = static_cast<int>(ClampedCell(y + radius));
+    x0 = static_cast<int>(ClampedCellX(x - radius));
+    x1 = static_cast<int>(ClampedCellX(x + radius));
+    y0 = static_cast<int>(ClampedCellY(y - radius));
+    y1 = static_cast<int>(ClampedCellY(y + radius));
 }
 
-InfluenceSample ActivityGrid::QueryPlayerInfluence(float x,
-                                                   float y,
-                                                   std::uint32_t viewer_zone) const noexcept
+namespace {
+
+// One walk, two semantics.
+//
+// EarlyOutOnFull == true reproduces the historic fast path EXACTLY: stop the
+// source scan and the row scan once a source inside the Full bubble is seen,
+// while the outer row loop keeps going -- as it always did. Tier
+// classification, and the cross-zone diagnostic counters the LOD loop derives
+// from the sample, therefore stay bit-identical to the pre-split behavior.
+//
+// EarlyOutOnFull == false skips nothing, so best_sq is the true minimum and
+// best_zone belongs to the actually nearest source.
+template <bool EarlyOutOnFull>
+InfluenceSample QueryInfluenceImpl(const ActivityGrid& grid,
+                                   float x,
+                                   float y,
+                                   std::uint32_t viewer_zone) noexcept
 {
     InfluenceSample out;
-    if (!enabled || cells.empty()) {
+    if (!grid.enabled || grid.cells.empty()) {
         return out;
     }
-    const float full_sq = radii.full_radius_m * radii.full_radius_m;
+    const float full_sq = grid.radii.full_radius_m * grid.radii.full_radius_m;
     int x0, x1, y0, y1;
-    BoxRange(x, y, radii.low_radius_m, x0, x1, y0, y1);
+    grid.BoxRange(x, y, grid.radii.low_radius_m, x0, x1, y0, y1);
     float best_sq = FLT_MAX;
     std::uint32_t best_zone = 0;
     bool found = false;
     for (int cy = y0; cy <= y1; ++cy) {
         for (int cx = x0; cx <= x1; ++cx) {
-            const auto& cell =
-                cells[static_cast<std::size_t>(cy) * dim + static_cast<std::uint32_t>(cx)];
+            const auto& cell = grid.cells[static_cast<std::size_t>(cy) * grid.dim_x +
+                                          static_cast<std::uint32_t>(cx)];
             for (const auto& source : cell.players) {
                 const float dx = x - source.x;
                 const float dy = y - source.y;
@@ -65,13 +99,17 @@ InfluenceSample ActivityGrid::QueryPlayerInfluence(float x,
                     best_sq = d_sq;
                     best_zone = source.zone_id;
                     found = true;
-                    if (best_sq < full_sq) {
-                        break; // can't beat Full
+                    if constexpr (EarlyOutOnFull) {
+                        if (best_sq < full_sq) {
+                            break; // tier cannot improve past Full
+                        }
                     }
                 }
             }
-            if (found && best_sq < full_sq) {
-                break;
+            if constexpr (EarlyOutOnFull) {
+                if (found && best_sq < full_sq) {
+                    break;
+                }
             }
         }
     }
@@ -80,41 +118,59 @@ InfluenceSample ActivityGrid::QueryPlayerInfluence(float x,
     }
     out.nearest_sq = best_sq;
     out.cross_zone = (best_zone != viewer_zone);
-    out.tier = TierForPlayerDistanceSq(best_sq, radii);
+    out.tier = TierForPlayerDistanceSq(best_sq, grid.radii);
     // Influence means inside the Low bubble; anything beyond is Dormant by
-    // tier anyway, but the flag stays exact for sleep/wake-style consumers.
-    out.has_influence =
-        best_sq < radii.low_radius_m * radii.low_radius_m;
+    // tier anyway. The flag is exact in BOTH variants: an early-out only ever
+    // triggers strictly inside Full, which is strictly inside Low.
+    out.has_influence = best_sq < grid.radii.low_radius_m * grid.radii.low_radius_m;
     return out;
 }
 
-bool ActivityGrid::HasPlayerWithin(const mx::map::Rect& bounds, float radius) const noexcept
+} // namespace
+
+InfluenceSample ActivityGrid::QueryPlayerTierFast(float x,
+                                                  float y,
+                                                  std::uint32_t viewer_zone) const noexcept
+{
+    return QueryInfluenceImpl<true>(*this, x, y, viewer_zone);
+}
+
+InfluenceSample ActivityGrid::QueryPlayerInfluenceExact(float x,
+                                                        float y,
+                                                        std::uint32_t viewer_zone) const noexcept
+{
+    return QueryInfluenceImpl<false>(*this, x, y, viewer_zone);
+}
+
+// `rect` (not `bounds`): the grid now carries a WorldBounds member called
+// bounds, and a same-named parameter of a different type would shadow it.
+bool ActivityGrid::HasPlayerWithin(const mx::map::Rect& rect, float radius) const noexcept
 {
     if (!enabled || cells.empty() || !(radius >= 0.0f)) {
         return false;
     }
-    const float cx = (bounds.min_x + bounds.max_x) * 0.5f;
-    const float cy = (bounds.min_y + bounds.max_y) * 0.5f;
+    const float cx = (rect.min_x + rect.max_x) * 0.5f;
+    const float cy = (rect.min_y + rect.max_y) * 0.5f;
     // The walked box must cover the whole rect expanded by radius (not just
     // a disc around the center): half-extents plus radius on each axis.
-    const float span_x = (bounds.max_x - bounds.min_x) * 0.5f + radius;
-    const float span_y = (bounds.max_y - bounds.min_y) * 0.5f + radius;
-    const int x0 = static_cast<int>(ClampedCell(cx - span_x));
-    const int x1 = static_cast<int>(ClampedCell(cx + span_x));
-    const int y0 = static_cast<int>(ClampedCell(cy - span_y));
-    const int y1 = static_cast<int>(ClampedCell(cy + span_y));
+    const float span_x = (rect.max_x - rect.min_x) * 0.5f + radius;
+    const float span_y = (rect.max_y - rect.min_y) * 0.5f + radius;
+    const int x0 = static_cast<int>(ClampedCellX(cx - span_x));
+    const int x1 = static_cast<int>(ClampedCellX(cx + span_x));
+    const int y0 = static_cast<int>(ClampedCellY(cy - span_y));
+    const int y1 = static_cast<int>(ClampedCellY(cy + span_y));
     const float r_sq = radius * radius;
     for (int cyi = y0; cyi <= y1; ++cyi) {
         for (int cxi = x0; cxi <= x1; ++cxi) {
             const auto& cell =
-                cells[static_cast<std::size_t>(cyi) * dim + static_cast<std::uint32_t>(cxi)];
+                cells[static_cast<std::size_t>(cyi) * dim_x + static_cast<std::uint32_t>(cxi)];
             for (const auto& source : cell.players) {
-                const float dx = source.x < bounds.min_x   ? bounds.min_x - source.x
-                                 : source.x > bounds.max_x ? source.x - bounds.max_x
-                                                           : 0.0f;
-                const float dy = source.y < bounds.min_y   ? bounds.min_y - source.y
-                                 : source.y > bounds.max_y ? source.y - bounds.max_y
-                                                           : 0.0f;
+                const float dx = source.x < rect.min_x   ? rect.min_x - source.x
+                                 : source.x > rect.max_x ? source.x - rect.max_x
+                                                         : 0.0f;
+                const float dy = source.y < rect.min_y   ? rect.min_y - source.y
+                                 : source.y > rect.max_y ? source.y - rect.max_y
+                                                         : 0.0f;
                 if (dx * dx + dy * dy <= r_sq) {
                     return true;
                 }
@@ -150,7 +206,7 @@ SpatialActivityField::SpatialActivityField(Config config)
     auto grid = std::make_shared<ActivityGrid>();
     grid->enabled = false;
     grid->cell_size_m = config_.cell_size_m > 0.0f ? config_.cell_size_m : kActivityCellSizeMeters;
-    grid->world_extent_m = config_.world_extent_m;
+    grid->bounds = config_.bounds;
     current_ = std::move(grid);
 }
 
@@ -161,7 +217,7 @@ void SpatialActivityField::Reconfigure(Config config)
     auto grid = std::make_shared<ActivityGrid>();
     grid->enabled = false;
     grid->cell_size_m = config_.cell_size_m > 0.0f ? config_.cell_size_m : kActivityCellSizeMeters;
-    grid->world_extent_m = config_.world_extent_m;
+    grid->bounds = config_.bounds;
     current_ = std::move(grid);
 }
 
@@ -171,15 +227,22 @@ std::shared_ptr<const ActivityGrid> SpatialActivityField::Rebuild(const ZoneMana
 {
     const auto rebuild_start = std::chrono::steady_clock::now();
     const float cell = config_.cell_size_m > 0.0f ? config_.cell_size_m : kActivityCellSizeMeters;
-    const float extent = config_.world_extent_m > 0.0f ? config_.world_extent_m : 1.0f;
-    const auto dim = static_cast<std::uint32_t>(std::ceil(extent / cell));
+    WorldBounds bounds = config_.bounds;
+    if (!bounds.IsValid()) {
+        // Degenerate/unset world: keep a 1x1 cell grid so every query is a
+        // safe no-op instead of dividing by a zero extent.
+        bounds = WorldBounds::FromExtent(1.0f);
+    }
+    const auto dim_x = static_cast<std::uint32_t>(std::ceil(bounds.ExtentX() / cell));
+    const auto dim_y = static_cast<std::uint32_t>(std::ceil(bounds.ExtentY() / cell));
     auto grid = std::make_shared<ActivityGrid>();
     grid->radii = radii;
     grid->enabled = enabled;
     grid->cell_size_m = cell;
-    grid->world_extent_m = extent;
-    grid->dim = dim > 0 ? dim : 1;
-    grid->cells.resize(static_cast<std::size_t>(grid->dim) * grid->dim);
+    grid->bounds = bounds;
+    grid->dim_x = dim_x > 0 ? dim_x : 1;
+    grid->dim_y = dim_y > 0 ? dim_y : 1;
+    grid->cells.resize(static_cast<std::size_t>(grid->dim_x) * grid->dim_y);
     grid->epoch = epoch_ + 1;
 
     std::uint64_t sources = 0;
@@ -192,9 +255,9 @@ std::shared_ptr<const ActivityGrid> SpatialActivityField::Rebuild(const ZoneMana
             }
             std::lock_guard lock(zone.ActivityMutex());
             for (const auto& source : zone.ActivitySources()) {
-                const std::uint32_t cx = grid->ClampedCell(source.x);
-                const std::uint32_t cy = grid->ClampedCell(source.y);
-                auto& target = grid->cells[static_cast<std::size_t>(cy) * grid->dim + cx];
+                const std::uint32_t cx = grid->ClampedCellX(source.x);
+                const std::uint32_t cy = grid->ClampedCellY(source.y);
+                auto& target = grid->cells[static_cast<std::size_t>(cy) * grid->dim_x + cx];
                 if (target.players.empty()) {
                     ++nonempty;
                 }

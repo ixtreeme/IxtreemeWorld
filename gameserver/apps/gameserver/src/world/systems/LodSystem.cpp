@@ -103,7 +103,7 @@ void LodSystem::Evaluate(Zone& zone, ZoneTickContext& ctx)
         SimulationTier desired = SimulationTier::Full; // null-field fallback
         bool cross_zone = false;
         if (field) {
-            const InfluenceSample sample = field->QueryPlayerInfluence(pos.x, pos.y, viewer_zone);
+            const InfluenceSample sample = field->QueryPlayerTierFast(pos.x, pos.y, viewer_zone);
             desired = sample.tier; // Dormant when nothing is in range
             cross_zone = sample.cross_zone;
         }

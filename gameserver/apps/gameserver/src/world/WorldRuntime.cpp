@@ -96,7 +96,8 @@ WorldRuntime::WorldRuntime(boost::asio::io_context& io, RuntimeIdentity identity
     // Size the activity grid to the real world extent (test map and 100km
     // world alike); positions clamp into it by construction.
     activity_field_.Reconfigure(
-        SpatialActivityField::Config{kActivityCellSizeMeters, terrain_.WorldExtentMeters()});
+        SpatialActivityField::Config{kActivityCellSizeMeters,
+                                    WorldBounds::FromExtent(terrain_.WorldExtentMeters())});
     spawn_.Initialize(map_root, IXTREEME_DEFAULT_MOB_TYPES_CONFIG);
 }
 

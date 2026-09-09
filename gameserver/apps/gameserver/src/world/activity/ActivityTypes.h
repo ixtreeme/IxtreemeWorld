@@ -35,6 +35,39 @@ enum class ActivityLevel : std::uint8_t {
     Local = 0,
 };
 
+// Explicit world rectangle for world-indexed derived fields. Replaces the
+// earlier implicit "the world is [0, extent]^2" assumption, so a world with a
+// non-zero origin (e.g. -50 km .. +50 km) or non-square extents indexes
+// correctly instead of silently folding every negative coordinate into cell 0.
+//
+// Production coordinates are unchanged: FromExtent(e) reproduces the old
+// [0, e] x [0, e] box exactly, bit for bit.
+struct WorldBounds {
+    float min_x = 0.0f;
+    float min_y = 0.0f;
+    float max_x = 0.0f;
+    float max_y = 0.0f;
+
+    // Back-compatible helper for the historic origin-at-zero square world.
+    static WorldBounds FromExtent(float extent) noexcept
+    {
+        return WorldBounds{0.0f, 0.0f, extent, extent};
+    }
+
+    float ExtentX() const noexcept
+    {
+        return max_x - min_x;
+    }
+    float ExtentY() const noexcept
+    {
+        return max_y - min_y;
+    }
+    bool IsValid() const noexcept
+    {
+        return ExtentX() > 0.0f && ExtentY() > 0.0f;
+    }
+};
+
 // Cell size of the world-space activity grid. Deliberately INDEPENDENT of
 // SpatialGrid's cell size (AOI radius): the activity grid trades query box
 // visits against aggregation cost, while the spatial index trades AOI

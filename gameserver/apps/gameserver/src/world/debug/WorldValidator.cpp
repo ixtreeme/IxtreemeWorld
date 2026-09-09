@@ -603,7 +603,7 @@ bool ValidateActivityFieldDetailed(const ZoneManager& zones,
         sample.net_id = candidate.net_id;
         sample.x = candidate.x;
         sample.y = candidate.y;
-        const InfluenceSample field = grid.QueryPlayerInfluence(candidate.x, candidate.y,
+        const InfluenceSample field = grid.QueryPlayerInfluenceExact(candidate.x, candidate.y,
                                                                 candidate.zone_id);
         sample.field_tier = field.tier;
         SimulationTier brute = SimulationTier::Dormant;
