@@ -526,6 +526,7 @@ add_subdirectory(libs/prefab)
 add_subdirectory(libs/mesh_system)
 add_subdirectory(libs/terrain_editor_system)
 add_subdirectory(libs/selection_system)
+add_subdirectory(Editor/Build)
 add_subdirectory(apps/client)
 
 foreach(_ixengine_target IN ITEMS
@@ -544,6 +545,7 @@ foreach(_ixengine_target IN ITEMS
     IXEngineMeshSystem
     IXEngineTerrainEditorSystem
     IXEngineSelectionSystem
+    IXEngineEditorBuild
     IxtreemeEngine
 )
     ixengine_apply_cpu_defaults(${_ixengine_target})

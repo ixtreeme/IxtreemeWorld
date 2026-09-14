@@ -21,7 +21,7 @@
 #include "AudioEngine.h"
 #include "ScriptSystem.h"
 #include "ScriptApiImpl.h"
-#include "platform/process.h"  // RunProcess — drives cmake for the in-engine game-script Build
+#include "BuildService.h"  // ixeditor::build::GameScriptBuildService — cmake Build worker (Editor/Build boundary)
 #include "EditorImGui.h"
 #include "physics/PhysicsWorld.h"
 #if defined(_WIN32)
@@ -2748,14 +2748,11 @@ int RunGame(NativeWindow& window,
     std::unique_ptr<ixscript::ScriptSystem> scriptSystem;
     std::unordered_map<std::uint32_t, std::unique_ptr<ixscript::ScriptInstance>> entityScripts;
     // In-engine game-script Build: cmake runs on a worker thread (10-30s) so the UI stays responsive;
-    // the reload + log update happen on the main thread when the worker signals done. std::jthread so
-    // that even an exception unwinding the main loop auto-joins it (no std::terminate on a live thread).
-    std::jthread buildThread;
-    std::atomic<bool> buildFinished{false};
-    std::atomic<bool> buildOk{false};
-    std::mutex buildLogMutex;
-    std::string buildLogShared;
-    bool buildInFlight = false;
+    // the reload + log update happen on the main thread when the worker signals done. Owned by the
+    // Editor/Build service boundary (ixeditor::build::GameScriptBuildService); the frame loop only
+    // triggers RequestBuild() and drains TryTakeResult(). std::jthread-equivalent lifetime: the
+    // service joins its worker on Shutdown()/dtor, so no live thread can outlive RunGame locals.
+    ixeditor::build::GameScriptBuildService gameScriptBuild;
     std::unordered_map<std::uint32_t, std::string> entityBoundControllerId;
     double animPrevFrameSeconds = 0.0;
     float editorPlayerLookDx = 0.0f;
@@ -5336,7 +5333,7 @@ int RunGame(NativeWindow& window,
                 // worker-thread build are in the play-mode command block below.
                 if (scriptChanges.changedCpp && editorImGui.AutoBuildOnSave() &&
                     editorPlay.state.mode == EditorPlayMode::Edit &&
-                    ProjectManager::Instance().HasProject() && !buildInFlight)
+                    ProjectManager::Instance().HasProject() && !gameScriptBuild.IsRunning())
                 {
                     commands.buildGameScripts = true;
                     Tracen("[BUILD] auto-build on save: Scripts/*.cpp changed");
@@ -6552,68 +6549,39 @@ int RunGame(NativeWindow& window,
                 // Build the project's native C++ game scripts (only in Edit, with a project, one at a
                 // time). MUST unload the module first so cmake can overwrite the locked DLL; the worker
                 // thread runs cmake and the main-thread poll (below) reloads on success.
+                // OWNERSHIP (Phase 1): UI state stays in EditorImGui; cmake execution lives in
+                // ixeditor::build::GameScriptBuildService (Editor/Build boundary).
                 if (commands.buildGameScripts &&
                     editorPlay.state.mode == EditorPlayMode::Edit &&
                     ProjectManager::Instance().HasProject() &&
-                    !buildInFlight)
+                    !gameScriptBuild.IsRunning())
                 {
                     const std::filesystem::path projectRoot = ProjectManager::Instance().ProjectRoot();
-                    const std::filesystem::path scriptsDir = projectRoot / "Scripts";
-                    const std::filesystem::path buildDir = scriptsDir / "build";
+                    const std::filesystem::path scriptsDir =
+                        ixeditor::build::GameScriptBuildService::ScriptsDirFor(projectRoot);
+                    const std::filesystem::path buildDir =
+                        ixeditor::build::GameScriptBuildService::BuildDirFor(projectRoot);
                     editorImGui.EnsureProjectScriptsScaffold(projectRoot);
                     editorImGui.UnloadGameModules();  // *** release the LoadLibrary lock before overwrite ***
-                    buildInFlight = true;
-                    buildFinished.store(false);
-                    editorImGui.SetBuildRunning();
                     // The module MUST be built with the SAME config (CRT + iterator-debug-level) as the
                     // running engine, or const std::string&/STL params across the boundary corrupt: a
                     // Release engine is /MT (IDL=0), a Debug engine /MTd (IDL=2). Match it.
-#if defined(NDEBUG)
-                    const std::string buildConfig = "Release";
-#else
-                    const std::string buildConfig = "Debug";
-#endif
+                    const std::string buildConfig =
+                        ixeditor::build::GameScriptBuildService::BuildConfigForCurrentBinary();
                     Tracenf("[BUILD] game scripts: starting cmake (config=%s)", buildConfig.c_str());
-                    buildThread = std::jthread(
-                        [&buildFinished, &buildOk, &buildLogMutex, &buildLogShared, scriptsDir, buildDir, buildConfig] {
-                            platform::ProcessResult cfg = platform::RunProcess(
-                                {"cmake", "-S", scriptsDir.string(), "-B", buildDir.string(), "-A", "x64"});
-                            std::string log = cfg.output;
-                            bool ok = cfg.launched && cfg.exitCode == 0;
-                            if (!cfg.launched)
-                                log += "\n[BUILD] cmake not found on PATH — install CMake or add it to PATH.";
-                            else if (ok)
-                            {
-                                platform::ProcessResult bld = platform::RunProcess(
-                                    {"cmake", "--build", buildDir.string(), "--config", buildConfig});
-                                log += "\n" + bld.output;
-                                ok = bld.launched && bld.exitCode == 0;
-                            }
-                            {
-                                std::lock_guard<std::mutex> lk(buildLogMutex);
-                                buildLogShared = std::move(log);
-                            }
-                            buildOk.store(ok);
-                            buildFinished.store(true);
-                        });
+                    if (gameScriptBuild.RequestBuild(scriptsDir, buildDir, buildConfig))
+                        editorImGui.SetBuildRunning();
                 }
 
                 // Build completion (main thread): reload the module on success — the registry mutation
                 // must NOT happen on the worker thread (the render/Play path reads it).
-                if (buildInFlight && buildFinished.load())
+                if (ixeditor::build::GameScriptBuildResult buildResult{};
+                    gameScriptBuild.TryTakeResult(buildResult))
                 {
-                    buildInFlight = false;
-                    if (buildThread.joinable())
-                        buildThread.join();  // the worker has finished; join returns immediately
-                    std::string buildLog;
-                    {
-                        std::lock_guard<std::mutex> lk(buildLogMutex);
-                        buildLog = std::move(buildLogShared);
-                    }
-                    const bool ok = buildOk.load();
+                    const bool ok = buildResult.ok;
                     if (ok && ProjectManager::Instance().HasProject())
                         editorImGui.LoadProjectGameModules(ProjectManager::Instance().ProjectRoot());
-                    editorImGui.SetBuildResult(ok, std::move(buildLog));
+                    editorImGui.SetBuildResult(ok, std::move(buildResult.log));
                     Tracenf("[BUILD] game scripts %s", ok ? "OK" : "FAILED");
                 }
 
@@ -11286,10 +11254,9 @@ int RunGame(NativeWindow& window,
     }
 
 #if defined(IXTREEME_WITH_EDITOR)
-    // Wait out any in-flight game-script build so its worker thread (which references RunGame locals)
-    // can't outlive this scope.
-    if (buildThread.joinable())
-        buildThread.join();
+    // Wait out any in-flight game-script build so its worker thread can't outlive this scope.
+    // (GameScriptBuildService joins its worker; paths are captured by value — no RunGame refs.)
+    gameScriptBuild.Shutdown();
     // Closing the window while still in Play must still honor the script lifecycle: fire OnDestroy on
     // every live instance before the maps unwind (their dtors would otherwise free without the hook).
     for (auto& [scriptEntityId, instance] : entityScripts)
