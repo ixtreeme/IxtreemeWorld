@@ -9,7 +9,8 @@ Core            — libs/debug, libs/math, libs/common, libs/platform (OS/window
                     libs/platform/VulkanDevice.* is really Graphics/Vulkan.
 ECS             — Engine/ECS/EcsWorlds.h — EditorWorld vs ClientWorld seam (Flecs preserved,
                     no EnTT, no custom wrapper). No live flecs::world yet; SceneData vectors remain.
-Graphics/IXRHI  — Engine/Graphics/IXRHI/IXRHI.h + IXRHIDesc.h (RESERVED, Phase 2 consumes).
+Graphics/IXRHI  — Engine/Graphics/IXRHI/ (IXRHI.h contract + IXRHIBuffer/Texture/
+                    Shader/Pipeline/Binding/CommandList/Swapchain/Device/Sync/Types/Capabilities).
 Graphics/Vulkan — Engine/Graphics/Vulkan/IXVulkan.h (RESERVED) + live libs/platform/VulkanDevice.*.
 Graphics/Renderer — live libs/render/*Renderer.* (Static/Skinned/Terrain/Water/Selection/WorldLabel/
                     Offscreen/Cube) — behavior unchanged in Phase 1.

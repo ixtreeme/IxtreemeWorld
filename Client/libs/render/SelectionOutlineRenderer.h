@@ -1,10 +1,27 @@
 #pragma once
 
-#include "VulkanDevice.h"
+// SelectionOutlineRenderer — Phase-2 IXRHI-native migration (proof path #1).
+//
+// ZERO Vk* dependency: all buffers/bindings/pipelines/commands go through
+// ixrhi::IXRHIDevice / ixrhi::IXRHICommandList. Visual output and draw order are
+// unchanged (line list, per-frame uniform + vertex uploads, alpha blend).
+//
+// Frame contract: the caller supplies the recording command list (borrowed frame
+// list via ixvulkan::WrapFrameCommandList) and an IXRHIFrameInfo snapshot. The
+// pipeline targets whichever render pass the backend resolves (offscreen scene
+// pass via IXVulkanDevice::SetPipelineRenderPass — see EngineApplication).
+
 #include "WorldCamera.h"
+
+#include "IXRHIBinding.h"
+#include "IXRHIBuffer.h"
+#include "IXRHICommandList.h"
+#include "IXRHIDevice.h"
+#include "IXRHIPipeline.h"
 
 #include <array>
 #include <cstdint>
+#include <memory>
 #include <vector>
 
 namespace client::asset {
@@ -14,12 +31,6 @@ class IAssetReader;
 class SelectionOutlineRenderer
 {
 public:
-    struct Buffer
-    {
-        VkBuffer buffer = VK_NULL_HANDLE;
-        VkDeviceMemory memory = VK_NULL_HANDLE;
-    };
-
     struct Line
     {
         WorldVec3 a{};
@@ -27,10 +38,14 @@ public:
         std::array<float, 4> color = {1.0f, 0.61f, 0.07f, 1.0f};
     };
 
-    bool Create(VulkanDevice& device, client::asset::IAssetReader& assets);
-    bool RecreatePipeline(VulkanDevice& device);
-    void SetMainRenderPass(VkRenderPass renderPass);
-    void Render(VulkanDevice& device, const WorldCamera& camera, const std::vector<Line>& lines, VkExtent2D targetExtent = {});
+    bool Create(ixrhi::IXRHIDevice& rhi, client::asset::IAssetReader& assets);
+    bool RecreatePipeline(ixrhi::IXRHIDevice& rhi);
+    void Render(ixrhi::IXRHICommandList& cmd,
+                const ixrhi::IXRHIFrameInfo& frame,
+                const WorldCamera& camera,
+                const std::vector<Line>& lines,
+                std::uint32_t targetWidth = 0,
+                std::uint32_t targetHeight = 0);
     void Destroy();
 
 private:
@@ -47,21 +62,17 @@ private:
         WorldMat4 mvp;
     };
 
-    bool CreateBuffers(VulkanDevice& device);
-    bool CreateDescriptors();
-    bool CreatePipeline(VulkanDevice& device);
+    bool CreateBuffers(ixrhi::IXRHIDevice& rhi);
+    bool CreateBindGroup(ixrhi::IXRHIDevice& rhi);
+    bool CreatePipeline(ixrhi::IXRHIDevice& rhi);
     void DestroyPipeline();
-    void DestroyBuffer(Buffer& buffer);
     void UpdateUniform(uint32_t frameIndex, const WorldCamera& camera);
 
-    VkDevice m_device = VK_NULL_HANDLE;
+    ixrhi::IXRHIDevice* m_rhi = nullptr;
     client::asset::IAssetReader* m_assets = nullptr;
-    VkRenderPass m_mainRenderPass = VK_NULL_HANDLE;
-    Buffer m_vertexBuffers[kFramesInFlight]{};
-    Buffer m_uniformBuffers[kFramesInFlight]{};
-    VkDescriptorSetLayout m_descriptorSetLayout = VK_NULL_HANDLE;
-    VkDescriptorPool m_descriptorPool = VK_NULL_HANDLE;
-    VkDescriptorSet m_descriptorSets[kFramesInFlight]{};
-    VkPipelineLayout m_pipelineLayout = VK_NULL_HANDLE;
-    VkPipeline m_pipeline = VK_NULL_HANDLE;
+    std::array<std::shared_ptr<ixrhi::IXRHIBuffer>, kFramesInFlight> m_vertexBuffers{};
+    std::array<std::shared_ptr<ixrhi::IXRHIBuffer>, kFramesInFlight> m_uniformBuffers{};
+    std::unique_ptr<ixrhi::IXRHIBindGroupLayout> m_bindLayout;
+    std::unique_ptr<ixrhi::IXRHIBindGroup> m_bindGroup;
+    std::unique_ptr<ixrhi::IXRHIGraphicsPipeline> m_pipeline;
 };

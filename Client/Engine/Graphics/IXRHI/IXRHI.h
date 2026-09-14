@@ -1,70 +1,76 @@
 #pragma once
 
-// IXRHI — Ixtreeme Render Hardware Interface (Phase 1: boundary reservation only).
+// IXRHI — Ixtreeme Render Hardware Interface (Phase 2: production core).
 //
-// Phase 1 rule: this header reserves the canonical IXRHI naming and handle model.
-// It intentionally contains NO backend implementation and NOTHING includes it yet
-// from the Vulkan renderer. The live renderer (libs/platform/VulkanDevice.h and
-// libs/render/*Renderer.*) keeps working unchanged. Phase 2 (IXRHI migration) will
-// make renderers depend on these types instead of Vk* types.
+// The Ixtreeme renderer depends on this engine graphics contract; Vulkan is one
+// implementation behind it (Engine/Graphics/Vulkan/):
 //
-// Canonical naming (do NOT use RHI / RHIDevice / VulkanRHI):
-//   IXRHI*    — platform-independent interface types
-//   IXVulkan* — Vulkan backend implementation types (Engine/Graphics/Vulkan/)
+//   Renderer -> IXRHI -> IXVulkan -> native Vulkan (Win/Linux)
+//                                     -> MoltenVK -> Metal (Apple, future)
 //
-// Dependency direction (future):
-//   StaticMeshRenderer / SkinnedMeshRenderer / TerrainRenderer / WaterRenderer /
-//   SceneRenderer / SelectionOutline / WorldLabel / Offscreen
-//       -> IXRHI -> IXVulkan -> native Vulkan (Win/Linux) or MoltenVK->Metal (Apple)
-
-#include <cstdint>
+// RULES (binding):
+// - No header under Engine/Graphics/IXRHI/ may include <vulkan/vulkan.h> or name
+//   any Vk* type. Verified by the IXRHISmoke compile check (it includes every
+//   IXRHI header in a TU without Vulkan headers on the include path).
+// - Public types keep the IXRHI prefix; backend types use IXVulkan (never RHI*,
+//   IRHI*, VulkanRHI).
+// - No void* native-device casts and no GetNativeVk*() on these interfaces. The
+//   single narrow escape hatch is ixvulkan::WrapFrameCommandList (Vulkan-module
+//   header only) for the in-flight frame command buffer during strangler
+//   migration. Every native access is inventoried in docs/architecture/.
+//
+// OWNERSHIP MODEL (binding, see IXRHIDevice.h for the full contract):
+// - GPU resources (buffer/texture/sampler/shader): std::shared_ptr — real shared
+//   lifetime (e.g. one shader feeding several pipeline variants; bind groups
+//   keeping frame resources alive). Deterministic RAII destruction, no manual
+//   vkDestroy in renderer code, no custom pools.
+// - Pipelines, bind-group layouts/groups, command lists: std::unique_ptr —
+//   unique ownership by the creating renderer.
+// - Descriptors passed to Create* are consumed (copied) at creation; shaders and
+//   layouts need not outlive the pipeline they built.
 
 namespace ixrhi
 {
 
-using IXRHIBool = bool;
+class IXRHIBuffer;
+class IXRHITexture;
+class IXRHISampler;
+class IXRHIShader;
+class IXRHIGraphicsPipeline;
+class IXRHIComputePipeline;
+class IXRHIBindGroupLayout;
+class IXRHIBindGroup;
+class IXRHICommandList;
+class IXRHISwapchain;
+class IXRHIDevice;
 
-// Opaque handle types. Phase 2 will back these with real Vulkan objects owned by
-// IXVulkan*. For now they are intentionally empty structs so no Vk* type leaks
-// through this boundary.
-struct IXRHIBufferHandle
+// Engine-level status. VkResult NEVER crosses this boundary; the backend logs the
+// underlying VkResult for diagnostics and translates it here. Matches current
+// engine policy: creation entry points return bool/status (no exceptions), while
+// unexpected backend failures abort via the backend's CheckVk equivalent, exactly
+// like the renderers did before migration.
+enum class IXRHIResult : int
 {
-    std::uint64_t value = 0;
-    explicit operator bool() const noexcept { return value != 0; }
+    Ok = 0,
+    OutOfMemory,
+    DeviceLost,
+    Unsupported,
+    InvalidArgument,
+    IoError,
 };
 
-struct IXRHITextureHandle
+inline const char* IXRHIResultName(IXRHIResult result)
 {
-    std::uint64_t value = 0;
-    explicit operator bool() const noexcept { return value != 0; }
-};
-
-struct IXRHIShaderHandle
-{
-    std::uint64_t value = 0;
-    explicit operator bool() const noexcept { return value != 0; }
-};
-
-struct IXRHIPipelineHandle
-{
-    std::uint64_t value = 0;
-    explicit operator bool() const noexcept { return value != 0; }
-};
-
-struct IXRHISamplerHandle
-{
-    std::uint64_t value = 0;
-    explicit operator bool() const noexcept { return value != 0; }
-};
-
-// Capability probe returned by the backend. Renderers must branch on this instead
-// of #ifdef _WIN32 / __ANDROID__ once Phase 2 lands.
-struct IXRHICapabilities
-{
-    bool discreteGpu = false;
-    bool supportsBindless = false;
-    bool supportsRayQuery = false;
-    std::uint32_t maxAnisotropy = 1;
-};
+    switch (result)
+    {
+    case IXRHIResult::Ok: return "Ok";
+    case IXRHIResult::OutOfMemory: return "OutOfMemory";
+    case IXRHIResult::DeviceLost: return "DeviceLost";
+    case IXRHIResult::Unsupported: return "Unsupported";
+    case IXRHIResult::InvalidArgument: return "InvalidArgument";
+    case IXRHIResult::IoError: return "IoError";
+    }
+    return "Unknown";
+}
 
 } // namespace ixrhi

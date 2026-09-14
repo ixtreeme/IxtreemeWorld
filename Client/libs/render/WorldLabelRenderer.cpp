@@ -1,6 +1,11 @@
+// WorldLabelRenderer — IXRHI-native implementation. Glyph rasterization (GDI),
+// vertex building and pipeline state are unchanged; buffer/texture/sampler/
+// descriptor/pipeline/command management crossed into IXRHI.
+
 #include "WorldLabelRenderer.h"
 
 #include "Debug.h"
+#include "IXRHIShader.h"
 #include "asset/IAssetReader.h"
 
 #if defined(_WIN32)
@@ -10,6 +15,7 @@
 #include <algorithm>
 #include <array>
 #include <cmath>
+#include <cstddef>
 #include <cstdio>
 #include <cstdlib>
 #include <cstring>
@@ -37,188 +43,30 @@ constexpr float kFadeStartMeters = 25.0f;
 constexpr float kFadeEndMeters = 45.0f;
 constexpr bool kDepthTestLabels = true;
 
-const char* VkResultName(VkResult result)
-{
-    switch (result)
-    {
-    case VK_SUCCESS: return "VK_SUCCESS";
-    case VK_ERROR_OUT_OF_HOST_MEMORY: return "VK_ERROR_OUT_OF_HOST_MEMORY";
-    case VK_ERROR_OUT_OF_DEVICE_MEMORY: return "VK_ERROR_OUT_OF_DEVICE_MEMORY";
-    case VK_ERROR_INITIALIZATION_FAILED: return "VK_ERROR_INITIALIZATION_FAILED";
-    case VK_ERROR_MEMORY_MAP_FAILED: return "VK_ERROR_MEMORY_MAP_FAILED";
-    default: return "VK_RESULT_UNKNOWN";
-    }
-}
-
-void CheckVk(VkResult result, const char* call, const char* file, int line)
-{
-    if (result == VK_SUCCESS)
-        return;
-
-    Tracenf("%s:%d: Vulkan call failed: %s -> %s (%d)",
-        file,
-        line,
-        call,
-        VkResultName(result),
-        result);
-    std::abort();
-}
-
-#define VK_CHECK(call) CheckVk((call), #call, __FILE__, __LINE__)
-
-std::vector<char> ReadBinaryFile(client::asset::IAssetReader& assets, const std::string& path)
+std::vector<std::uint32_t> ReadSpirv(client::asset::IAssetReader& assets, const std::string& path)
 {
     auto bytes = assets.ReadAll(path);
-    if (!bytes)
+    if (!bytes || bytes->empty() || bytes->size() % sizeof(std::uint32_t) != 0)
     {
         Tracenf("[WORLD-LABEL] failed to open shader: %s", path.c_str());
         std::abort();
     }
-
-    return std::vector<char>(bytes->begin(), bytes->end());
+    const auto* words = reinterpret_cast<const std::uint32_t*>(bytes->data());
+    return std::vector<std::uint32_t>(words, words + bytes->size() / sizeof(std::uint32_t));
 }
 
-VkShaderModule CreateShaderModule(VkDevice device, client::asset::IAssetReader& assets,
-    const std::string& path)
+std::shared_ptr<ixrhi::IXRHIShader> LoadShader(ixrhi::IXRHIDevice& rhi,
+                                               client::asset::IAssetReader& assets,
+                                               const std::string& path,
+                                               ixrhi::IXRHIShaderStage stage,
+                                               const char* entry)
 {
-    const std::vector<char> code = ReadBinaryFile(assets, path);
-    VkShaderModuleCreateInfo create{};
-    create.sType = VK_STRUCTURE_TYPE_SHADER_MODULE_CREATE_INFO;
-    create.codeSize = code.size();
-    create.pCode = reinterpret_cast<const uint32_t*>(code.data());
-
-    VkShaderModule module = VK_NULL_HANDLE;
-    VK_CHECK(vkCreateShaderModule(device, &create, nullptr, &module));
-    return module;
-}
-
-bool CreateHostVisibleBuffer(VulkanDevice& device, VkDevice vkDevice, VkDeviceSize size,
-    VkBufferUsageFlags usage, const void* initialData, WorldLabelRenderer::Buffer& out)
-{
-    VkBufferCreateInfo buffer{};
-    buffer.sType = VK_STRUCTURE_TYPE_BUFFER_CREATE_INFO;
-    buffer.size = size;
-    buffer.usage = usage;
-    buffer.sharingMode = VK_SHARING_MODE_EXCLUSIVE;
-    VK_CHECK(vkCreateBuffer(vkDevice, &buffer, nullptr, &out.buffer));
-
-    VkMemoryRequirements req{};
-    vkGetBufferMemoryRequirements(vkDevice, out.buffer, &req);
-
-    VkMemoryAllocateInfo alloc{};
-    alloc.sType = VK_STRUCTURE_TYPE_MEMORY_ALLOCATE_INFO;
-    alloc.allocationSize = req.size;
-    alloc.memoryTypeIndex = device.FindMemoryType(req.memoryTypeBits,
-        VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT | VK_MEMORY_PROPERTY_HOST_COHERENT_BIT);
-    VK_CHECK(vkAllocateMemory(vkDevice, &alloc, nullptr, &out.memory));
-    VK_CHECK(vkBindBufferMemory(vkDevice, out.buffer, out.memory, 0));
-
-    if (initialData)
-    {
-        void* mapped = nullptr;
-        VK_CHECK(vkMapMemory(vkDevice, out.memory, 0, size, 0, &mapped));
-        std::memcpy(mapped, initialData, static_cast<size_t>(size));
-        vkUnmapMemory(vkDevice, out.memory);
-    }
-
-    return true;
-}
-
-bool CreateDeviceLocalImage(VulkanDevice& device, VkDevice vkDevice, uint32_t width, uint32_t height,
-    VkFormat format, VkImage& image, VkDeviceMemory& memory)
-{
-    VkImageCreateInfo create{};
-    create.sType = VK_STRUCTURE_TYPE_IMAGE_CREATE_INFO;
-    create.imageType = VK_IMAGE_TYPE_2D;
-    create.format = format;
-    create.extent = {width, height, 1};
-    create.mipLevels = 1;
-    create.arrayLayers = 1;
-    create.samples = VK_SAMPLE_COUNT_1_BIT;
-    create.tiling = VK_IMAGE_TILING_OPTIMAL;
-    create.usage = VK_IMAGE_USAGE_TRANSFER_DST_BIT | VK_IMAGE_USAGE_SAMPLED_BIT;
-    create.sharingMode = VK_SHARING_MODE_EXCLUSIVE;
-    create.initialLayout = VK_IMAGE_LAYOUT_UNDEFINED;
-    VK_CHECK(vkCreateImage(vkDevice, &create, nullptr, &image));
-
-    VkMemoryRequirements req{};
-    vkGetImageMemoryRequirements(vkDevice, image, &req);
-
-    VkMemoryAllocateInfo alloc{};
-    alloc.sType = VK_STRUCTURE_TYPE_MEMORY_ALLOCATE_INFO;
-    alloc.allocationSize = req.size;
-    alloc.memoryTypeIndex = device.FindMemoryType(req.memoryTypeBits, VK_MEMORY_PROPERTY_DEVICE_LOCAL_BIT);
-    VK_CHECK(vkAllocateMemory(vkDevice, &alloc, nullptr, &memory));
-    VK_CHECK(vkBindImageMemory(vkDevice, image, memory, 0));
-    return true;
-}
-
-VkCommandBuffer BeginOneTimeCommands(VkDevice vkDevice, uint32_t queueFamily, VkCommandPool& pool)
-{
-    VkCommandPoolCreateInfo poolInfo{};
-    poolInfo.sType = VK_STRUCTURE_TYPE_COMMAND_POOL_CREATE_INFO;
-    poolInfo.flags = VK_COMMAND_POOL_CREATE_TRANSIENT_BIT;
-    poolInfo.queueFamilyIndex = queueFamily;
-    VK_CHECK(vkCreateCommandPool(vkDevice, &poolInfo, nullptr, &pool));
-
-    VkCommandBufferAllocateInfo alloc{};
-    alloc.sType = VK_STRUCTURE_TYPE_COMMAND_BUFFER_ALLOCATE_INFO;
-    alloc.commandPool = pool;
-    alloc.level = VK_COMMAND_BUFFER_LEVEL_PRIMARY;
-    alloc.commandBufferCount = 1;
-
-    VkCommandBuffer cmd = VK_NULL_HANDLE;
-    VK_CHECK(vkAllocateCommandBuffers(vkDevice, &alloc, &cmd));
-
-    VkCommandBufferBeginInfo begin{};
-    begin.sType = VK_STRUCTURE_TYPE_COMMAND_BUFFER_BEGIN_INFO;
-    begin.flags = VK_COMMAND_BUFFER_USAGE_ONE_TIME_SUBMIT_BIT;
-    VK_CHECK(vkBeginCommandBuffer(cmd, &begin));
-    return cmd;
-}
-
-void EndOneTimeCommands(VkDevice vkDevice, VkQueue queue, VkCommandPool pool, VkCommandBuffer cmd)
-{
-    VK_CHECK(vkEndCommandBuffer(cmd));
-
-    VkSubmitInfo submit{};
-    submit.sType = VK_STRUCTURE_TYPE_SUBMIT_INFO;
-    submit.commandBufferCount = 1;
-    submit.pCommandBuffers = &cmd;
-    VK_CHECK(vkQueueSubmit(queue, 1, &submit, VK_NULL_HANDLE));
-    VK_CHECK(vkQueueWaitIdle(queue));
-    vkDestroyCommandPool(vkDevice, pool, nullptr);
-}
-
-void TransitionImageLayout(VkCommandBuffer cmd, VkImage image, VkImageLayout oldLayout, VkImageLayout newLayout)
-{
-    VkImageMemoryBarrier barrier{};
-    barrier.sType = VK_STRUCTURE_TYPE_IMAGE_MEMORY_BARRIER;
-    barrier.oldLayout = oldLayout;
-    barrier.newLayout = newLayout;
-    barrier.srcQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;
-    barrier.dstQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;
-    barrier.image = image;
-    barrier.subresourceRange.aspectMask = VK_IMAGE_ASPECT_COLOR_BIT;
-    barrier.subresourceRange.levelCount = 1;
-    barrier.subresourceRange.layerCount = 1;
-
-    VkPipelineStageFlags srcStage = VK_PIPELINE_STAGE_TOP_OF_PIPE_BIT;
-    VkPipelineStageFlags dstStage = VK_PIPELINE_STAGE_TRANSFER_BIT;
-    if (oldLayout == VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL &&
-        newLayout == VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL)
-    {
-        barrier.srcAccessMask = VK_ACCESS_TRANSFER_WRITE_BIT;
-        barrier.dstAccessMask = VK_ACCESS_SHADER_READ_BIT;
-        srcStage = VK_PIPELINE_STAGE_TRANSFER_BIT;
-        dstStage = VK_PIPELINE_STAGE_FRAGMENT_SHADER_BIT;
-    }
-    else
-    {
-        barrier.dstAccessMask = VK_ACCESS_TRANSFER_WRITE_BIT;
-    }
-
-    vkCmdPipelineBarrier(cmd, srcStage, dstStage, 0, 0, nullptr, 0, nullptr, 1, &barrier);
+    ixrhi::IXRHIShaderDesc desc;
+    desc.stage = stage;
+    desc.entryPoint = entry;
+    desc.spirv = ReadSpirv(assets, path);
+    desc.debugName = path;
+    return rhi.CreateShader(desc);
 }
 
 std::string ToPrintableAscii(const std::string& text)
@@ -239,52 +87,55 @@ WorldVec3 AddScaled(WorldVec3 origin, WorldVec3 right, float x, WorldVec3 up, fl
 }
 }
 
-bool WorldLabelRenderer::Create(VulkanDevice& device, client::asset::IAssetReader& assets)
+bool WorldLabelRenderer::Create(ixrhi::IXRHIDevice& rhi, client::asset::IAssetReader& assets)
 {
     Destroy();
-    m_device = device.GetDevice();
+    m_rhi = &rhi;
     m_assets = &assets;
 
-    const bool atlas = CreateFontAtlas(device);
-    const bool buffers = atlas ? CreateBuffers(device) : false;
-    const bool descriptors = buffers ? CreateDescriptors() : false;
-    const bool pipeline = descriptors ? CreatePipeline(device) : false;
+    const bool atlas = CreateFontAtlas(rhi);
+    const bool buffers = atlas ? CreateBuffers(rhi) : false;
+    const bool bindings = buffers ? CreateBindGroup(rhi) : false;
+    const bool pipeline = bindings ? CreatePipeline(rhi) : false;
     Tracenf("[WORLD-LABEL] Create: atlas=%d buffers=%d descriptors=%d pipeline=%d glyphs=%u",
         atlas ? 1 : 0,
         buffers ? 1 : 0,
-        descriptors ? 1 : 0,
+        bindings ? 1 : 0,
         pipeline ? 1 : 0,
         kGlyphCount);
 
-    if (atlas && buffers && descriptors && pipeline)
+    if (atlas && buffers && bindings && pipeline)
         return true;
 
     Destroy();
     return false;
 }
 
-bool WorldLabelRenderer::RecreatePipeline(VulkanDevice& device)
+bool WorldLabelRenderer::RecreatePipeline(ixrhi::IXRHIDevice& rhi)
 {
-    if (!m_device)
+    if (!m_rhi)
         return true;
 
+    m_rhi = &rhi;
     DestroyPipeline();
-    if (device.GetRenderPass() == VK_NULL_HANDLE)
-        return true;
-
-    return CreatePipeline(device);
+    // Deferred-true while the swapchain pass is torn down (parity); real
+    // failures abort in the backend like the pre-migration VK_CHECK path.
+    CreatePipeline(rhi);
+    return true;
 }
 
-void WorldLabelRenderer::Render(VulkanDevice& device, const WorldCamera& camera, const std::vector<Label>& worldLabels)
+void WorldLabelRenderer::Render(ixrhi::IXRHICommandList& cmd,
+                                const ixrhi::IXRHIFrameInfo& frame,
+                                const WorldCamera& camera,
+                                const std::vector<Label>& worldLabels)
 {
-    if (!m_pipeline || !device.IsFrameActive() || worldLabels.empty())
+    if (!m_pipeline || !frame.frameActive || worldLabels.empty())
         return;
 
-    const VkExtent2D extent = device.GetSwapchainExtent();
-    if (extent.width == 0 || extent.height == 0)
+    if (frame.targetWidth == 0 || frame.targetHeight == 0)
         return;
 
-    const uint32_t frameIndex = device.GetFrameIndex();
+    const uint32_t frameIndex = frame.frameIndex % kFramesInFlight;
     std::vector<Vertex> vertices;
     BuildVertices(camera, worldLabels, vertices);
     if (vertices.empty())
@@ -293,32 +144,16 @@ void WorldLabelRenderer::Render(VulkanDevice& device, const WorldCamera& camera,
         vertices.resize(kMaxVertices - (kMaxVertices % 6u));
 
     UpdateUniform(frameIndex, camera);
+    m_vertexBuffers[frameIndex]->Write(
+        0, vertices.data(), sizeof(Vertex) * vertices.size());
 
-    void* mapped = nullptr;
-    const VkDeviceSize vertexBytes = sizeof(Vertex) * vertices.size();
-    VK_CHECK(vkMapMemory(m_device, m_vertexBuffers[frameIndex].memory, 0, vertexBytes, 0, &mapped));
-    std::memcpy(mapped, vertices.data(), static_cast<size_t>(vertexBytes));
-    vkUnmapMemory(m_device, m_vertexBuffers[frameIndex].memory);
-
-    VkCommandBuffer cmd = device.GetCommandBuffer();
-    VkViewport viewport{};
-    viewport.x = 0.0f;
-    viewport.y = 0.0f;
-    viewport.width = static_cast<float>(extent.width);
-    viewport.height = static_cast<float>(extent.height);
-    viewport.minDepth = 0.0f;
-    viewport.maxDepth = 1.0f;
-
-    VkRect2D scissor{{0, 0}, extent};
-    vkCmdSetViewport(cmd, 0, 1, &viewport);
-    vkCmdSetScissor(cmd, 0, 1, &scissor);
-    vkCmdBindPipeline(cmd, VK_PIPELINE_BIND_POINT_GRAPHICS, m_pipeline);
-
-    VkDeviceSize offset = 0;
-    vkCmdBindVertexBuffers(cmd, 0, 1, &m_vertexBuffers[frameIndex].buffer, &offset);
-    vkCmdBindDescriptorSets(cmd, VK_PIPELINE_BIND_POINT_GRAPHICS, m_pipelineLayout,
-        0, 1, &m_descriptorSets[frameIndex], 0, nullptr);
-    vkCmdDraw(cmd, static_cast<uint32_t>(vertices.size()), 1, 0, 0);
+    cmd.SetViewport(
+        0.0f, 0.0f, static_cast<float>(frame.targetWidth), static_cast<float>(frame.targetHeight));
+    cmd.SetScissor(0, 0, frame.targetWidth, frame.targetHeight);
+    cmd.SetGraphicsPipeline(*m_pipeline);
+    cmd.SetVertexBuffer(0, *m_vertexBuffers[frameIndex], 0);
+    cmd.BindGroup(0, *m_bindGroup, frameIndex);
+    cmd.Draw(static_cast<uint32_t>(vertices.size()), 1, 0, 0);
 
     static bool loggedRender = false;
     if (!loggedRender)
@@ -333,45 +168,54 @@ void WorldLabelRenderer::Render(VulkanDevice& device, const WorldCamera& camera,
 
 void WorldLabelRenderer::Destroy()
 {
-    if (!m_device)
+    if (!m_rhi)
         return;
 
     DestroyPipeline();
-    if (m_descriptorPool)
-        vkDestroyDescriptorPool(m_device, m_descriptorPool, nullptr);
-    m_descriptorPool = VK_NULL_HANDLE;
-    if (m_descriptorSetLayout)
-        vkDestroyDescriptorSetLayout(m_device, m_descriptorSetLayout, nullptr);
-    m_descriptorSetLayout = VK_NULL_HANDLE;
-
-    for (Buffer& buffer : m_vertexBuffers)
-        DestroyBuffer(buffer);
-    for (Buffer& buffer : m_uniformBuffers)
-        DestroyBuffer(buffer);
-    DestroyTexture(m_fontAtlas);
-    m_device = VK_NULL_HANDLE;
+    m_bindGroup.reset();
+    m_bindLayout.reset();
+    for (auto& buffer : m_vertexBuffers)
+        buffer.reset();
+    for (auto& buffer : m_uniformBuffers)
+        buffer.reset();
+    m_fontSampler.reset();
+    m_fontAtlas.reset();
+    m_rhi = nullptr;
     m_assets = nullptr;
 }
 
-bool WorldLabelRenderer::CreateBuffers(VulkanDevice& device)
+bool WorldLabelRenderer::CreateBuffers(ixrhi::IXRHIDevice& rhi)
 {
-    for (Buffer& buffer : m_vertexBuffers)
+    for (auto& buffer : m_vertexBuffers)
     {
-        CreateHostVisibleBuffer(device, m_device, sizeof(Vertex) * kMaxVertices,
-            VK_BUFFER_USAGE_VERTEX_BUFFER_BIT, nullptr, buffer);
+        ixrhi::IXRHIBufferDesc desc;
+        desc.sizeBytes = sizeof(Vertex) * kMaxVertices;
+        desc.usage = ixrhi::IXRHIBufferUsage::Vertex;
+        desc.cpuAccess = ixrhi::IXRHICpuAccess::Write;
+        desc.debugName = "WorldLabel VB";
+        buffer = rhi.CreateBuffer(desc, nullptr, 0);
+        if (!buffer)
+            return false;
     }
 
-    for (Buffer& buffer : m_uniformBuffers)
+    for (auto& buffer : m_uniformBuffers)
     {
-        CreateHostVisibleBuffer(device, m_device, sizeof(UniformBlock),
-            VK_BUFFER_USAGE_UNIFORM_BUFFER_BIT, nullptr, buffer);
+        ixrhi::IXRHIBufferDesc desc;
+        desc.sizeBytes = sizeof(UniformBlock);
+        desc.usage = ixrhi::IXRHIBufferUsage::Uniform;
+        desc.cpuAccess = ixrhi::IXRHICpuAccess::Write;
+        desc.debugName = "WorldLabel UBO";
+        buffer = rhi.CreateBuffer(desc, nullptr, 0);
+        if (!buffer)
+            return false;
     }
     return true;
 }
 
-bool WorldLabelRenderer::CreateFontAtlas(VulkanDevice& device)
+bool WorldLabelRenderer::CreateFontAtlas(ixrhi::IXRHIDevice& rhi)
 {
-    DestroyTexture(m_fontAtlas);
+    m_fontSampler.reset();
+    m_fontAtlas.reset();
     m_glyphs = {};
 
     std::vector<uint8_t> rgba(static_cast<size_t>(kAtlasWidth) * kAtlasHeight * 4u, 0);
@@ -483,294 +327,112 @@ bool WorldLabelRenderer::CreateFontAtlas(VulkanDevice& device)
     }
 #endif
 
-    VkQueue graphicsQueue = VK_NULL_HANDLE;
-    vkGetDeviceQueue(m_device, device.GetGraphicsQueueFamily(), 0, &graphicsQueue);
+    // Upload path (previously: device-local image + staging + one-time submit +
+    // layout transitions + view + sampler inline). Now one backend call.
+    ixrhi::IXRHITextureDesc atlasDesc;
+    atlasDesc.width = kAtlasWidth;
+    atlasDesc.height = kAtlasHeight;
+    atlasDesc.format = ixrhi::IXRHIFormat::R8G8B8A8Unorm;
+    atlasDesc.usage = ixrhi::IXRHITextureUsage::Sampled | ixrhi::IXRHITextureUsage::TransferDst;
+    atlasDesc.debugName = "WorldLabel FontAtlas";
+    m_fontAtlas = rhi.CreateTexture(atlasDesc, rgba.data(), rgba.size());
+    if (!m_fontAtlas)
+        return false;
 
-    CreateDeviceLocalImage(device, m_device, kAtlasWidth, kAtlasHeight,
-        VK_FORMAT_R8G8B8A8_UNORM, m_fontAtlas.image, m_fontAtlas.memory);
-
-    Buffer staging{};
-    CreateHostVisibleBuffer(device, m_device, rgba.size(),
-        VK_BUFFER_USAGE_TRANSFER_SRC_BIT, rgba.data(), staging);
-
-    VkBufferImageCopy region{};
-    region.imageSubresource.aspectMask = VK_IMAGE_ASPECT_COLOR_BIT;
-    region.imageSubresource.layerCount = 1;
-    region.imageExtent = {kAtlasWidth, kAtlasHeight, 1};
-
-    VkCommandPool uploadPool = VK_NULL_HANDLE;
-    VkCommandBuffer cmd = BeginOneTimeCommands(m_device, device.GetGraphicsQueueFamily(), uploadPool);
-    TransitionImageLayout(cmd, m_fontAtlas.image, VK_IMAGE_LAYOUT_UNDEFINED, VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL);
-    vkCmdCopyBufferToImage(cmd, staging.buffer, m_fontAtlas.image,
-        VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL, 1, &region);
-    TransitionImageLayout(cmd, m_fontAtlas.image,
-        VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL, VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL);
-    EndOneTimeCommands(m_device, graphicsQueue, uploadPool, cmd);
-    DestroyBuffer(staging);
-
-    m_fontAtlas.width = kAtlasWidth;
-    m_fontAtlas.height = kAtlasHeight;
-
-    VkImageViewCreateInfo view{};
-    view.sType = VK_STRUCTURE_TYPE_IMAGE_VIEW_CREATE_INFO;
-    view.image = m_fontAtlas.image;
-    view.viewType = VK_IMAGE_VIEW_TYPE_2D;
-    view.format = VK_FORMAT_R8G8B8A8_UNORM;
-    view.subresourceRange.aspectMask = VK_IMAGE_ASPECT_COLOR_BIT;
-    view.subresourceRange.levelCount = 1;
-    view.subresourceRange.layerCount = 1;
-    VK_CHECK(vkCreateImageView(m_device, &view, nullptr, &m_fontAtlas.view));
-
-    VkSamplerCreateInfo sampler{};
-    sampler.sType = VK_STRUCTURE_TYPE_SAMPLER_CREATE_INFO;
-    sampler.magFilter = VK_FILTER_LINEAR;
-    sampler.minFilter = VK_FILTER_LINEAR;
-    sampler.mipmapMode = VK_SAMPLER_MIPMAP_MODE_NEAREST;
-    sampler.addressModeU = VK_SAMPLER_ADDRESS_MODE_CLAMP_TO_EDGE;
-    sampler.addressModeV = VK_SAMPLER_ADDRESS_MODE_CLAMP_TO_EDGE;
-    sampler.addressModeW = VK_SAMPLER_ADDRESS_MODE_CLAMP_TO_EDGE;
-    sampler.maxLod = 1.0f;
-    VK_CHECK(vkCreateSampler(m_device, &sampler, nullptr, &m_fontAtlas.sampler));
-
-    return true;
+    ixrhi::IXRHISamplerDesc samplerDesc;
+    samplerDesc.minFilter = ixrhi::IXRHISamplerFilter::Linear;
+    samplerDesc.magFilter = ixrhi::IXRHISamplerFilter::Linear;
+    samplerDesc.mipmapFilter = ixrhi::IXRHISamplerFilter::Nearest;
+    samplerDesc.addressU = ixrhi::IXRHISamplerAddress::ClampToEdge;
+    samplerDesc.addressV = ixrhi::IXRHISamplerAddress::ClampToEdge;
+    samplerDesc.addressW = ixrhi::IXRHISamplerAddress::ClampToEdge;
+    samplerDesc.maxLod = 1.0f;
+    samplerDesc.debugName = "WorldLabel FontSampler";
+    m_fontSampler = rhi.CreateSampler(samplerDesc);
+    return m_fontSampler != nullptr;
 }
 
-bool WorldLabelRenderer::CreateDescriptors()
+bool WorldLabelRenderer::CreateBindGroup(ixrhi::IXRHIDevice& rhi)
 {
-    VkDescriptorSetLayoutBinding ubo{};
-    ubo.binding = 0;
-    ubo.descriptorType = VK_DESCRIPTOR_TYPE_UNIFORM_BUFFER;
-    ubo.descriptorCount = 1;
-    ubo.stageFlags = VK_SHADER_STAGE_VERTEX_BIT;
-
-    VkDescriptorSetLayoutBinding atlas{};
-    atlas.binding = 1;
-    atlas.descriptorType = VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER;
-    atlas.descriptorCount = 1;
-    atlas.stageFlags = VK_SHADER_STAGE_FRAGMENT_BIT;
-
-    std::array<VkDescriptorSetLayoutBinding, 2> bindings = {ubo, atlas};
-    VkDescriptorSetLayoutCreateInfo layout{};
-    layout.sType = VK_STRUCTURE_TYPE_DESCRIPTOR_SET_LAYOUT_CREATE_INFO;
-    layout.bindingCount = static_cast<uint32_t>(bindings.size());
-    layout.pBindings = bindings.data();
-    VK_CHECK(vkCreateDescriptorSetLayout(m_device, &layout, nullptr, &m_descriptorSetLayout));
-
-    std::array<VkDescriptorPoolSize, 2> poolSizes{};
-    poolSizes[0].type = VK_DESCRIPTOR_TYPE_UNIFORM_BUFFER;
-    poolSizes[0].descriptorCount = kFramesInFlight;
-    poolSizes[1].type = VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER;
-    poolSizes[1].descriptorCount = kFramesInFlight;
-
-    VkDescriptorPoolCreateInfo pool{};
-    pool.sType = VK_STRUCTURE_TYPE_DESCRIPTOR_POOL_CREATE_INFO;
-    pool.maxSets = kFramesInFlight;
-    pool.poolSizeCount = static_cast<uint32_t>(poolSizes.size());
-    pool.pPoolSizes = poolSizes.data();
-    VK_CHECK(vkCreateDescriptorPool(m_device, &pool, nullptr, &m_descriptorPool));
-
-    std::array<VkDescriptorSetLayout, kFramesInFlight> layouts{};
-    layouts.fill(m_descriptorSetLayout);
-
-    VkDescriptorSetAllocateInfo alloc{};
-    alloc.sType = VK_STRUCTURE_TYPE_DESCRIPTOR_SET_ALLOCATE_INFO;
-    alloc.descriptorPool = m_descriptorPool;
-    alloc.descriptorSetCount = static_cast<uint32_t>(layouts.size());
-    alloc.pSetLayouts = layouts.data();
-    VK_CHECK(vkAllocateDescriptorSets(m_device, &alloc, m_descriptorSets.data()));
+    const std::vector<ixrhi::IXRHIBinding> bindings = {
+        {0, ixrhi::IXRHIBindingType::UniformBuffer, ixrhi::IXRHIShaderStage::Vertex},
+        {1, ixrhi::IXRHIBindingType::SampledTexture, ixrhi::IXRHIShaderStage::Fragment},
+    };
+    m_bindLayout = rhi.CreateBindGroupLayout(bindings);
+    if (!m_bindLayout)
+        return false;
+    m_bindGroup = rhi.CreateBindGroup(*m_bindLayout, kFramesInFlight);
+    if (!m_bindGroup)
+        return false;
 
     for (uint32_t frame = 0; frame < kFramesInFlight; ++frame)
     {
-        VkDescriptorBufferInfo bufferInfo{};
-        bufferInfo.buffer = m_uniformBuffers[frame].buffer;
-        bufferInfo.offset = 0;
-        bufferInfo.range = sizeof(UniformBlock);
-
-        VkDescriptorImageInfo imageInfo{};
-        imageInfo.sampler = m_fontAtlas.sampler;
-        imageInfo.imageView = m_fontAtlas.view;
-        imageInfo.imageLayout = VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL;
-
-        std::array<VkWriteDescriptorSet, 2> writes{};
-        writes[0].sType = VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET;
-        writes[0].dstSet = m_descriptorSets[frame];
-        writes[0].dstBinding = 0;
-        writes[0].descriptorCount = 1;
-        writes[0].descriptorType = VK_DESCRIPTOR_TYPE_UNIFORM_BUFFER;
-        writes[0].pBufferInfo = &bufferInfo;
-
-        writes[1].sType = VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET;
-        writes[1].dstSet = m_descriptorSets[frame];
-        writes[1].dstBinding = 1;
-        writes[1].descriptorCount = 1;
-        writes[1].descriptorType = VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER;
-        writes[1].pImageInfo = &imageInfo;
-        vkUpdateDescriptorSets(m_device, static_cast<uint32_t>(writes.size()), writes.data(), 0, nullptr);
+        m_bindGroup->UpdateBuffer(frame, 0, m_uniformBuffers[frame], 0, sizeof(UniformBlock));
+        m_bindGroup->UpdateTexture(frame, 1, m_fontAtlas, m_fontSampler);
     }
-
     return true;
 }
 
-bool WorldLabelRenderer::CreatePipeline(VulkanDevice& device)
+bool WorldLabelRenderer::CreatePipeline(ixrhi::IXRHIDevice& rhi)
 {
     if (!m_assets)
         return false;
 
-    VkShaderModule vs = CreateShaderModule(m_device, *m_assets, "assets/shaders/world_label_vs.spv");
-    VkShaderModule ps = CreateShaderModule(m_device, *m_assets, "assets/shaders/world_label_ps.spv");
+    auto vs = LoadShader(rhi,
+        *m_assets,
+        "assets/shaders/world_label_vs.spv",
+        ixrhi::IXRHIShaderStage::Vertex,
+        "VSMain");
+    auto ps = LoadShader(rhi,
+        *m_assets,
+        "assets/shaders/world_label_ps.spv",
+        ixrhi::IXRHIShaderStage::Fragment,
+        "PSMain");
+    if (!vs || !ps)
+        return false;
 
-    VkPipelineShaderStageCreateInfo stages[2]{};
-    stages[0].sType = VK_STRUCTURE_TYPE_PIPELINE_SHADER_STAGE_CREATE_INFO;
-    stages[0].stage = VK_SHADER_STAGE_VERTEX_BIT;
-    stages[0].module = vs;
-    stages[0].pName = "VSMain";
-    stages[1].sType = VK_STRUCTURE_TYPE_PIPELINE_SHADER_STAGE_CREATE_INFO;
-    stages[1].stage = VK_SHADER_STAGE_FRAGMENT_BIT;
-    stages[1].module = ps;
-    stages[1].pName = "PSMain";
+    ixrhi::IXRHIGraphicsPipelineDesc desc;
+    desc.vertexShader = vs;
+    desc.fragmentShader = ps;
+    desc.bindGroupLayouts = {m_bindLayout.get()};
+    desc.vertexBindings = {{0, sizeof(Vertex)}};
+    desc.vertexAttributes = {
+        {0, 0, ixrhi::IXRHIFormat::R32G32B32Float, offsetof(Vertex, position)},
+        {1, 0, ixrhi::IXRHIFormat::R32G32Float, offsetof(Vertex, uv)},
+        {2, 0, ixrhi::IXRHIFormat::R32G32B32A32Float, offsetof(Vertex, color)},
+    };
+    desc.topology = ixrhi::IXRHIPrimitiveTopology::TriangleList;
+    desc.cullMode = ixrhi::IXRHICullMode::None;
+    desc.frontFace = ixrhi::IXRHIFrontFace::Clockwise;
+    desc.depthTestEnable = kDepthTestLabels;
+    desc.depthWriteEnable = false;
+    desc.depthCompareOp = ixrhi::IXRHICompareOp::LessOrEqual;
+    desc.blendAttachments = {{true,
+        ixrhi::IXRHIBlendFactor::SrcAlpha,
+        ixrhi::IXRHIBlendFactor::OneMinusSrcAlpha,
+        ixrhi::IXRHIBlendOp::Add,
+        ixrhi::IXRHIBlendFactor::One,
+        ixrhi::IXRHIBlendFactor::OneMinusSrcAlpha,
+        ixrhi::IXRHIBlendOp::Add}};
+    desc.sampleCount = 1;
+    desc.debugName = "WorldLabel";
 
-    VkVertexInputBindingDescription binding{};
-    binding.binding = 0;
-    binding.stride = sizeof(Vertex);
-    binding.inputRate = VK_VERTEX_INPUT_RATE_VERTEX;
-
-    VkVertexInputAttributeDescription attributes[3]{};
-    attributes[0].location = 0;
-    attributes[0].binding = 0;
-    attributes[0].format = VK_FORMAT_R32G32B32_SFLOAT;
-    attributes[0].offset = offsetof(Vertex, position);
-    attributes[1].location = 1;
-    attributes[1].binding = 0;
-    attributes[1].format = VK_FORMAT_R32G32_SFLOAT;
-    attributes[1].offset = offsetof(Vertex, uv);
-    attributes[2].location = 2;
-    attributes[2].binding = 0;
-    attributes[2].format = VK_FORMAT_R32G32B32A32_SFLOAT;
-    attributes[2].offset = offsetof(Vertex, color);
-
-    VkPipelineVertexInputStateCreateInfo vertexInput{};
-    vertexInput.sType = VK_STRUCTURE_TYPE_PIPELINE_VERTEX_INPUT_STATE_CREATE_INFO;
-    vertexInput.vertexBindingDescriptionCount = 1;
-    vertexInput.pVertexBindingDescriptions = &binding;
-    vertexInput.vertexAttributeDescriptionCount = 3;
-    vertexInput.pVertexAttributeDescriptions = attributes;
-
-    VkPipelineInputAssemblyStateCreateInfo assembly{};
-    assembly.sType = VK_STRUCTURE_TYPE_PIPELINE_INPUT_ASSEMBLY_STATE_CREATE_INFO;
-    assembly.topology = VK_PRIMITIVE_TOPOLOGY_TRIANGLE_LIST;
-
-    VkPipelineViewportStateCreateInfo viewport{};
-    viewport.sType = VK_STRUCTURE_TYPE_PIPELINE_VIEWPORT_STATE_CREATE_INFO;
-    viewport.viewportCount = 1;
-    viewport.scissorCount = 1;
-
-    VkPipelineRasterizationStateCreateInfo raster{};
-    raster.sType = VK_STRUCTURE_TYPE_PIPELINE_RASTERIZATION_STATE_CREATE_INFO;
-    raster.polygonMode = VK_POLYGON_MODE_FILL;
-    raster.cullMode = VK_CULL_MODE_NONE;
-    raster.frontFace = VK_FRONT_FACE_CLOCKWISE;
-    raster.lineWidth = 1.0f;
-
-    VkPipelineMultisampleStateCreateInfo multisample{};
-    multisample.sType = VK_STRUCTURE_TYPE_PIPELINE_MULTISAMPLE_STATE_CREATE_INFO;
-    multisample.rasterizationSamples = VK_SAMPLE_COUNT_1_BIT;
-
-    VkPipelineDepthStencilStateCreateInfo depth{};
-    depth.sType = VK_STRUCTURE_TYPE_PIPELINE_DEPTH_STENCIL_STATE_CREATE_INFO;
-    depth.depthTestEnable = kDepthTestLabels ? VK_TRUE : VK_FALSE;
-    depth.depthWriteEnable = VK_FALSE;
-    depth.depthCompareOp = VK_COMPARE_OP_LESS_OR_EQUAL;
-
-    VkPipelineColorBlendAttachmentState blendAttachment{};
-    blendAttachment.blendEnable = VK_TRUE;
-    blendAttachment.srcColorBlendFactor = VK_BLEND_FACTOR_SRC_ALPHA;
-    blendAttachment.dstColorBlendFactor = VK_BLEND_FACTOR_ONE_MINUS_SRC_ALPHA;
-    blendAttachment.colorBlendOp = VK_BLEND_OP_ADD;
-    blendAttachment.srcAlphaBlendFactor = VK_BLEND_FACTOR_ONE;
-    blendAttachment.dstAlphaBlendFactor = VK_BLEND_FACTOR_ONE_MINUS_SRC_ALPHA;
-    blendAttachment.alphaBlendOp = VK_BLEND_OP_ADD;
-    blendAttachment.colorWriteMask = VK_COLOR_COMPONENT_R_BIT | VK_COLOR_COMPONENT_G_BIT |
-        VK_COLOR_COMPONENT_B_BIT | VK_COLOR_COMPONENT_A_BIT;
-
-    VkPipelineColorBlendStateCreateInfo blend{};
-    blend.sType = VK_STRUCTURE_TYPE_PIPELINE_COLOR_BLEND_STATE_CREATE_INFO;
-    blend.attachmentCount = 1;
-    blend.pAttachments = &blendAttachment;
-
-    VkDynamicState dynamicStates[] = {VK_DYNAMIC_STATE_VIEWPORT, VK_DYNAMIC_STATE_SCISSOR};
-    VkPipelineDynamicStateCreateInfo dynamic{};
-    dynamic.sType = VK_STRUCTURE_TYPE_PIPELINE_DYNAMIC_STATE_CREATE_INFO;
-    dynamic.dynamicStateCount = 2;
-    dynamic.pDynamicStates = dynamicStates;
-
-    VkPipelineLayoutCreateInfo layout{};
-    layout.sType = VK_STRUCTURE_TYPE_PIPELINE_LAYOUT_CREATE_INFO;
-    layout.setLayoutCount = 1;
-    layout.pSetLayouts = &m_descriptorSetLayout;
-    VK_CHECK(vkCreatePipelineLayout(m_device, &layout, nullptr, &m_pipelineLayout));
-
-    VkGraphicsPipelineCreateInfo pipeline{};
-    pipeline.sType = VK_STRUCTURE_TYPE_GRAPHICS_PIPELINE_CREATE_INFO;
-    pipeline.stageCount = 2;
-    pipeline.pStages = stages;
-    pipeline.pVertexInputState = &vertexInput;
-    pipeline.pInputAssemblyState = &assembly;
-    pipeline.pViewportState = &viewport;
-    pipeline.pRasterizationState = &raster;
-    pipeline.pMultisampleState = &multisample;
-    pipeline.pDepthStencilState = &depth;
-    pipeline.pColorBlendState = &blend;
-    pipeline.pDynamicState = &dynamic;
-    pipeline.layout = m_pipelineLayout;
-    pipeline.renderPass = device.GetRenderPass();
-    pipeline.subpass = 0;
-    VK_CHECK(vkCreateGraphicsPipelines(m_device, VK_NULL_HANDLE, 1, &pipeline, nullptr, &m_pipeline));
-
-    vkDestroyShaderModule(m_device, ps, nullptr);
-    vkDestroyShaderModule(m_device, vs, nullptr);
+    auto pipeline = rhi.CreateGraphicsPipeline(desc);
+    if (!pipeline)
+        return false;
+    m_pipeline = std::move(pipeline);
     return true;
 }
 
 void WorldLabelRenderer::DestroyPipeline()
 {
-    if (m_pipeline)
-        vkDestroyPipeline(m_device, m_pipeline, nullptr);
-    m_pipeline = VK_NULL_HANDLE;
-
-    if (m_pipelineLayout)
-        vkDestroyPipelineLayout(m_device, m_pipelineLayout, nullptr);
-    m_pipelineLayout = VK_NULL_HANDLE;
-}
-
-void WorldLabelRenderer::DestroyBuffer(Buffer& buffer)
-{
-    if (buffer.buffer)
-        vkDestroyBuffer(m_device, buffer.buffer, nullptr);
-    if (buffer.memory)
-        vkFreeMemory(m_device, buffer.memory, nullptr);
-    buffer = {};
-}
-
-void WorldLabelRenderer::DestroyTexture(Texture& texture)
-{
-    if (texture.sampler)
-        vkDestroySampler(m_device, texture.sampler, nullptr);
-    if (texture.view)
-        vkDestroyImageView(m_device, texture.view, nullptr);
-    if (texture.image)
-        vkDestroyImage(m_device, texture.image, nullptr);
-    if (texture.memory)
-        vkFreeMemory(m_device, texture.memory, nullptr);
-    texture = {};
+    m_pipeline.reset();
 }
 
 void WorldLabelRenderer::UpdateUniform(uint32_t frameIndex, const WorldCamera& camera)
 {
     const UniformBlock uniform{camera.viewProjection};
-    void* mapped = nullptr;
-    VK_CHECK(vkMapMemory(m_device, m_uniformBuffers[frameIndex].memory, 0, sizeof(uniform), 0, &mapped));
-    std::memcpy(mapped, &uniform, sizeof(uniform));
-    vkUnmapMemory(m_device, m_uniformBuffers[frameIndex].memory);
+    m_uniformBuffers[frameIndex]->Write(0, &uniform, sizeof(uniform));
 }
 
 void WorldLabelRenderer::BuildVertices(const WorldCamera& camera, const std::vector<Label>& worldLabels, std::vector<Vertex>& vertices) const

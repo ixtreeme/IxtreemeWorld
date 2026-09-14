@@ -1,10 +1,22 @@
 #pragma once
 
-#include "VulkanDevice.h"
+// WorldLabelRenderer — Phase-2 IXRHI-native migration (proof path #2, exercises
+// the texture + sampler path: font-atlas upload through IXRHI, sampled in the
+// fragment stage. Zero Vk* dependency; glyph raster and vertex building
+// unchanged. Renders into the swapchain pass (no render-pass override).
+
 #include "WorldCamera.h"
+
+#include "IXRHIBinding.h"
+#include "IXRHIBuffer.h"
+#include "IXRHICommandList.h"
+#include "IXRHIDevice.h"
+#include "IXRHIPipeline.h"
+#include "IXRHITexture.h"
 
 #include <array>
 #include <cstdint>
+#include <memory>
 #include <string>
 #include <vector>
 
@@ -15,22 +27,6 @@ class IAssetReader;
 class WorldLabelRenderer
 {
 public:
-    struct Buffer
-    {
-        VkBuffer buffer = VK_NULL_HANDLE;
-        VkDeviceMemory memory = VK_NULL_HANDLE;
-    };
-
-    struct Texture
-    {
-        VkImage image = VK_NULL_HANDLE;
-        VkDeviceMemory memory = VK_NULL_HANDLE;
-        VkImageView view = VK_NULL_HANDLE;
-        VkSampler sampler = VK_NULL_HANDLE;
-        uint32_t width = 0;
-        uint32_t height = 0;
-    };
-
     struct Label
     {
         WorldVec3 position{};
@@ -39,9 +35,12 @@ public:
         bool selected = false;
     };
 
-    bool Create(VulkanDevice& device, client::asset::IAssetReader& assets);
-    bool RecreatePipeline(VulkanDevice& device);
-    void Render(VulkanDevice& device, const WorldCamera& camera, const std::vector<Label>& worldLabels);
+    bool Create(ixrhi::IXRHIDevice& rhi, client::asset::IAssetReader& assets);
+    bool RecreatePipeline(ixrhi::IXRHIDevice& rhi);
+    void Render(ixrhi::IXRHICommandList& cmd,
+                const ixrhi::IXRHIFrameInfo& frame,
+                const WorldCamera& camera,
+                const std::vector<Label>& worldLabels);
     void Destroy();
 
 private:
@@ -70,13 +69,11 @@ private:
         float advance = 0.0f;
     };
 
-    bool CreateBuffers(VulkanDevice& device);
-    bool CreateFontAtlas(VulkanDevice& device);
-    bool CreateDescriptors();
-    bool CreatePipeline(VulkanDevice& device);
+    bool CreateBuffers(ixrhi::IXRHIDevice& rhi);
+    bool CreateFontAtlas(ixrhi::IXRHIDevice& rhi);
+    bool CreateBindGroup(ixrhi::IXRHIDevice& rhi);
+    bool CreatePipeline(ixrhi::IXRHIDevice& rhi);
     void DestroyPipeline();
-    void DestroyBuffer(Buffer& buffer);
-    void DestroyTexture(Texture& texture);
     void UpdateUniform(uint32_t frameIndex, const WorldCamera& camera);
     void BuildVertices(const WorldCamera& camera, const std::vector<Label>& worldLabels, std::vector<Vertex>& vertices) const;
     void AppendLine(std::vector<Vertex>& vertices, WorldVec3 origin, WorldVec3 right, WorldVec3 up,
@@ -84,15 +81,14 @@ private:
     void AppendQuad(std::vector<Vertex>& vertices, WorldVec3 origin, WorldVec3 right, WorldVec3 up,
         float width, float height, const float color[4], float fade = 1.0f) const;
 
-    VkDevice m_device = VK_NULL_HANDLE;
+    ixrhi::IXRHIDevice* m_rhi = nullptr;
     client::asset::IAssetReader* m_assets = nullptr;
-    Buffer m_vertexBuffers[kFramesInFlight]{};
-    std::array<Buffer, kFramesInFlight> m_uniformBuffers{};
-    VkDescriptorSetLayout m_descriptorSetLayout = VK_NULL_HANDLE;
-    VkDescriptorPool m_descriptorPool = VK_NULL_HANDLE;
-    std::array<VkDescriptorSet, kFramesInFlight> m_descriptorSets{};
-    VkPipelineLayout m_pipelineLayout = VK_NULL_HANDLE;
-    VkPipeline m_pipeline = VK_NULL_HANDLE;
-    Texture m_fontAtlas;
+    std::array<std::shared_ptr<ixrhi::IXRHIBuffer>, kFramesInFlight> m_vertexBuffers{};
+    std::array<std::shared_ptr<ixrhi::IXRHIBuffer>, kFramesInFlight> m_uniformBuffers{};
+    std::unique_ptr<ixrhi::IXRHIBindGroupLayout> m_bindLayout;
+    std::unique_ptr<ixrhi::IXRHIBindGroup> m_bindGroup;
+    std::unique_ptr<ixrhi::IXRHIGraphicsPipeline> m_pipeline;
+    std::shared_ptr<ixrhi::IXRHITexture> m_fontAtlas;
+    std::shared_ptr<ixrhi::IXRHISampler> m_fontSampler;
     std::array<Glyph, 128> m_glyphs{};
 };

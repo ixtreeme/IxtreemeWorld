@@ -95,6 +95,7 @@ target_link_libraries(IXEngineRender
         IXEngineTree::IXEngineTree
         meshoptimizer::meshoptimizer
         RmlUi::RmlUi
+        IXEngineIXRHI
         ${CLIENT_OZZ_TARGETS}
         ${CLIENT_FLECS_TARGET}
 )

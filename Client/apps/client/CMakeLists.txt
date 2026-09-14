@@ -44,6 +44,7 @@ target_link_libraries(IxtreemeEngine
         IXEngineAudio
         IXEngineScript
         IXEngineEditorBuild
+        IXEngineVulkan
 )
 
 target_compile_features(IxtreemeEngine PRIVATE cxx_std_20)

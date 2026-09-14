@@ -516,6 +516,7 @@ elseif(ANDROID)
 endif()
 
 add_subdirectory(libs/platform)
+add_subdirectory(Engine/Graphics)
 add_subdirectory(libs/asset)
 add_subdirectory(libs/audio)
 add_subdirectory(libs/script)
@@ -546,6 +547,7 @@ foreach(_ixengine_target IN ITEMS
     IXEngineTerrainEditorSystem
     IXEngineSelectionSystem
     IXEngineEditorBuild
+    IXEngineVulkan
     IxtreemeEngine
 )
     ixengine_apply_cpu_defaults(${_ixengine_target})

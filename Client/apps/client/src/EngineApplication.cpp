@@ -22,6 +22,8 @@
 #include "ScriptSystem.h"
 #include "ScriptApiImpl.h"
 #include "BuildService.h"  // ixeditor::build::GameScriptBuildService — cmake Build worker (Editor/Build boundary)
+#include "IXVulkanBridge.h" // ixvulkan::WrapFrameCommandList — inventoried frame-list escape hatch
+#include "IXVulkanDevice.h" // ixvulkan::IXVulkanDevice — IXRHI backend over the live frame loop
 #include "EditorImGui.h"
 #include "physics/PhysicsWorld.h"
 #if defined(_WIN32)
@@ -1118,6 +1120,20 @@ bool LoadRuntimeScene(client::asset::IAssetReader& assets, const std::string& sc
         sceneAssetPath.c_str(),
         scenePath.string().c_str());
     return SceneManager::Instance().LoadScene(scenePath.string());
+}
+
+// Phase-2 IXRHI strangler: snapshot of the loop-owned frame for IXRHI-native
+// renderers (replaces their direct GetFrameIndex/GetSwapchainExtent/IsFrameActive
+// calls). Filled at each migrated Render call site from the live VulkanDevice.
+ixrhi::IXRHIFrameInfo MakeRhiFrameInfo(VulkanDevice& device)
+{
+    ixrhi::IXRHIFrameInfo frame;
+    frame.frameIndex = device.GetFrameIndex();
+    const VkExtent2D extent = device.GetSwapchainExtent();
+    frame.targetWidth = extent.width;
+    frame.targetHeight = extent.height;
+    frame.frameActive = device.IsFrameActive();
+    return frame;
 }
 
 phys::PhysicsTransform PhysicsTransformFromMesh(const MeshSceneEntity& mesh)
@@ -2222,6 +2238,10 @@ int RunGame(NativeWindow& window,
         ShowFatal("Failed to create Vulkan device. See debug output/stderr.");
         return 1;
     }
+    // IXRHI backend (Phase 2 strangler): borrows the live frame loop above.
+    // Declared before all renderers so it outlives them; IXRHI-native renderers
+    // take IXRHIDevice& instead of VulkanDevice&.
+    ixvulkan::IXVulkanDevice rhiDevice(device);
 #if defined(IXTREEME_WITH_EDITOR)
     Tracen("[BUILD] Editor: ENABLED");
     Tracen("[BOOT] build = EDITOR");
@@ -2353,7 +2373,7 @@ int RunGame(NativeWindow& window,
     }
 
     WorldLabelRenderer worldLabels;
-    bool worldLabelsOk = worldLabels.Create(device, assets);
+    bool worldLabelsOk = worldLabels.Create(rhiDevice, assets);
     if (!worldLabelsOk)
     {
         Tracenf("[MAIN] WorldLabelRenderer failed to initialize - worldLabels will not be available");
@@ -2361,7 +2381,7 @@ int RunGame(NativeWindow& window,
     }
 
     SelectionOutlineRenderer selectionOutlines;
-    bool selectionOutlinesOk = selectionOutlines.Create(device, assets);
+    bool selectionOutlinesOk = selectionOutlines.Create(rhiDevice, assets);
     if (!selectionOutlinesOk)
     {
         Tracenf("[MAIN] SelectionOutlineRenderer failed to initialize - selection outlines will not be available");
@@ -2385,8 +2405,8 @@ int RunGame(NativeWindow& window,
         }
         if (selectionOutlinesOk)
         {
-            selectionOutlines.SetMainRenderPass(offscreenScene.GetRenderPass());
-            selectionOutlines.RecreatePipeline(device);
+            rhiDevice.SetPipelineRenderPass(offscreenScene.GetRenderPass());
+            selectionOutlines.RecreatePipeline(rhiDevice);
         }
 #if defined(IXTREEME_WITH_EDITOR)
         editorImGui.SetSceneViewTexture(offscreenScene.GetLinearSampler(),
@@ -2633,8 +2653,8 @@ int RunGame(NativeWindow& window,
         }
         if (selectionOutlinesOk)
         {
-            selectionOutlines.SetMainRenderPass(offscreenScene.GetRenderPass());
-            selectionOutlines.RecreatePipeline(device);
+            rhiDevice.SetPipelineRenderPass(offscreenScene.GetRenderPass());
+            selectionOutlines.RecreatePipeline(rhiDevice);
         }
 #if defined(IXTREEME_WITH_EDITOR)
         editorImGui.SetSceneViewTexture(offscreenScene.GetLinearSampler(),
@@ -4903,7 +4923,7 @@ int RunGame(NativeWindow& window,
                                 offscreenScene.GetExtent());
                         }
                         if (selectionOutlinesOk)
-                            selectionOutlines.SetMainRenderPass(offscreenScene.GetRenderPass());
+                            rhiDevice.SetPipelineRenderPass(offscreenScene.GetRenderPass());
 #if defined(IXTREEME_WITH_EDITOR)
                         editorImGui.SetSceneViewTexture(offscreenScene.GetLinearSampler(),
                             offscreenScene.GetSceneColorView(),
@@ -4945,9 +4965,9 @@ int RunGame(NativeWindow& window,
                 if (terrainOk)
                     terrain.RecreatePipeline(device);
                 if (selectionOutlinesOk)
-                    selectionOutlines.RecreatePipeline(device);
+                    selectionOutlines.RecreatePipeline(rhiDevice);
                 if (worldLabelsOk)
-                    worldLabels.RecreatePipeline(device);
+                    worldLabels.RecreatePipeline(rhiDevice);
                 runtimeSession->OnRenderPassChanged(device);
                 rmlUi.OnRenderPassChanged(device);
 #if defined(IXTREEME_WITH_EDITOR)
@@ -10777,14 +10797,25 @@ int RunGame(NativeWindow& window,
                             break;
                         }
                     }
-                    selectionOutlines.Render(device, camera, selectionLines, renderSize);
+                    if (auto outlineCmd =
+                            ixvulkan::WrapFrameCommandList(rhiDevice, device.GetCommandBuffer()))
+                        selectionOutlines.Render(*outlineCmd,
+                            MakeRhiFrameInfo(device),
+                            camera,
+                            selectionLines,
+                            renderSize.width,
+                            renderSize.height);
                 }
                 if (!useOffscreenScene && hasSceneTerrain)
                 {
                     terrain.RenderWater(device, camera, seconds, renderSize);
                 }
                 if (!useOffscreenScene && worldLabelsOk)
-                    worldLabels.Render(device, camera, plates);
+                {
+                    if (auto labelCmd =
+                            ixvulkan::WrapFrameCommandList(rhiDevice, device.GetCommandBuffer()))
+                        worldLabels.Render(*labelCmd, MakeRhiFrameInfo(device), camera, plates);
+                }
                 device.WriteGpuTimestamp(VulkanDevice::GpuTimestampPoint::SceneOtherEnd);
             }
             else if (SkinnedMeshRenderer* lobbySkinned = runtimeSession->IsLobbyActive()
@@ -10928,7 +10959,11 @@ int RunGame(NativeWindow& window,
                 offscreenScene.RenderComposite(device);
                 device.WriteGpuTimestamp(VulkanDevice::GpuTimestampPoint::CompositeEnd);
                 if (isInWorld && worldLabelsOk)
-                    worldLabels.Render(device, camera, plates);
+                {
+                    if (auto compositeLabelCmd =
+                            ixvulkan::WrapFrameCommandList(rhiDevice, device.GetCommandBuffer()))
+                        worldLabels.Render(*compositeLabelCmd, MakeRhiFrameInfo(device), camera, plates);
+                }
             }
             frameProfile.sceneRenderMs = MillisecondsBetween(sceneRenderBegin, std::chrono::steady_clock::now());
             const auto editorUiBegin = std::chrono::steady_clock::now();

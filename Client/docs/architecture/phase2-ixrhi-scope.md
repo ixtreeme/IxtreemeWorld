@@ -26,7 +26,8 @@ DESCRIPTORS, COMMANDS (`IXRHICommandList`), SYNCHRONIZATION
 
 ## 3. Cut renderer<-editor coupling identified in Phase 1
 
-- Replace `SetSceneViewTexture(VkSampler, VkImageView, ...)` with an `IXRHITextureHandle` view struct.
+- Replace `SetSceneViewTexture(VkSampler, VkImageView, ...)` with a shared
+  `IXRHITexture` reference (Phase-2 object model superseded the handle sketch).
 - `OffscreenSceneRenderer` getters return `IXRHI*` handles; editor views consume them opaquely.
 
 ## 4. Split libs/render (transitional) into Engine/Graphics/Renderer + Editor/*
