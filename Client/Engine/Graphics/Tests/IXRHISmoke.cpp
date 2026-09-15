@@ -20,11 +20,14 @@
 #include "IXRHIDevice.h"
 #include "IXRHI.h"
 #include "IXRHIPipeline.h"
+#include "IXRHIRenderTarget.h"
 #include "IXRHIShader.h"
 #include "IXRHISwapchain.h"
 #include "IXRHISync.h"
 #include "IXRHITexture.h"
 #include "IXRHITypes.h"
+
+#include "EditorGraphicsBridge.h"
 
 #include <cstdint>
 #include <cstdio>
@@ -104,6 +107,69 @@ void TestDescriptorDefaults()
 
     const ixrhi::IXRHITextureDesc texDesc{};
     Check(texDesc.sampleCount == 1, "texture samples default 1");
+
+    const ixrhi::IXRHIRenderTargetDesc targetDesc{};
+    Check(targetDesc.colorLoad == ixrhi::IXRHILoadOp::Clear, "target color load defaults Clear");
+    Check(targetDesc.color == nullptr && targetDesc.depth == nullptr, "target textures default null");
+    Check(targetDesc.clearColor[0] == 0.04f && targetDesc.clearColor[3] == 1.0f,
+        "target clear color defaults");
+    Check(targetDesc.clearDepth == 1.0f, "target clear depth defaults");
+
+    const ixrhi::IXRHIImageLayout transferSrc = ixrhi::IXRHIImageLayout::TransferSrc;
+    Check(transferSrc != ixrhi::IXRHIImageLayout::TransferDst, "transfer layouts distinct");
+}
+
+// CPU-only IXRHITexture/Sampler doubles for bridge registry tests (no GPU).
+class StubTexture final : public ixrhi::IXRHITexture
+{
+public:
+    std::uint32_t Width() const override { return 4; }
+    std::uint32_t Height() const override { return 4; }
+    ixrhi::IXRHIFormat Format() const override { return ixrhi::IXRHIFormat::R8G8B8A8Unorm; }
+    const std::string& DebugName() const override { return m_name; }
+
+private:
+    std::string m_name = "Stub";
+};
+
+class StubSampler final : public ixrhi::IXRHISampler
+{
+public:
+    const std::string& DebugName() const override { return m_name; }
+
+private:
+    std::string m_name = "StubSampler";
+};
+
+void TestEditorBridge()
+{
+    ixeditor::graphics::EditorGraphicsBridge bridge;
+    Check(bridge.EntryCount() == 0, "bridge starts empty");
+
+    auto texture = std::make_shared<StubTexture>();
+    auto sampler = std::make_shared<StubSampler>();
+
+    const auto nullHandle = bridge.Register(nullptr, sampler, "null");
+    Check(!nullHandle.IsValid(), "bridge rejects null texture");
+    Check(bridge.EntryCount() == 0, "bridge empty after rejected register");
+
+    const auto first = bridge.Register(texture, sampler, "scene");
+    Check(first.IsValid(), "bridge register valid");
+    Check(bridge.EntryCount() == 1, "bridge count after register");
+
+    std::shared_ptr<ixrhi::IXRHITexture> foundTexture;
+    std::shared_ptr<ixrhi::IXRHISampler> foundSampler;
+    Check(bridge.Lookup(first, foundTexture, foundSampler), "bridge lookup hit");
+    Check(foundTexture == texture && foundSampler == sampler, "bridge lookup identity");
+
+    bridge.Unregister(first);
+    Check(bridge.EntryCount() == 0, "bridge count after unregister");
+    Check(!bridge.Lookup(first, foundTexture, foundSampler), "bridge lookup miss after unregister");
+
+    const auto second = bridge.Register(texture, sampler, "scene");
+    Check(second.IsValid() && !(second == first), "bridge re-register yields new handle");
+    bridge.Clear();
+    Check(bridge.EntryCount() == 0, "bridge clear empties");
 }
 
 } // namespace
@@ -118,6 +184,7 @@ int main(int argc, char** argv)
     }
 
     TestDescriptorDefaults();
+    TestEditorBridge();
 
 #ifdef IXRHI_SMOKE_WITH_VULKAN
     extern void RunConversionChecks();

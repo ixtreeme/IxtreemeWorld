@@ -184,6 +184,7 @@ enum class IXRHIStoreOp : std::uint8_t
 enum class IXRHIImageLayout : std::uint8_t
 {
     Undefined = 0,
+    TransferSrc,
     TransferDst,
     ShaderReadOnly,
     ColorAttachment,

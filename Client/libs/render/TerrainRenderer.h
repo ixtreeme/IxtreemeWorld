@@ -5,12 +5,16 @@
 #include "InputEvent.h"
 #include "MapEditorTypes.h"
 
+#include "IXRHIRenderPass.h"
+#include "IXRHITexture.h"
+
 #include <array>
 #include <cstdint>
 #include <deque>
 #include <filesystem>
 #include <functional>
 #include <limits>
+#include <memory>
 #include <string>
 #include <unordered_map>
 #include <vector>
@@ -89,11 +93,17 @@ public:
     TerrainSceneData GetTerrainSceneData() const;
     void SetTerrainSceneData(const TerrainSceneData& terrain);
     bool RecreatePipeline(VulkanDevice& device);
-    void SetMainRenderPass(VkRenderPass renderPass);
-    void SetWaterRefractionInputs(VkImageView colorView,
-                                  VkImageView depthView,
-                                  VkSampler sampler,
-                                  VkExtent2D extent);
+    // Borrowed IXRHI pass token (Phase 3B): unwrapped backend-locally. The
+    // native pass member below stays until Terrain migrates (later phase).
+    void SetTargetPass(const ixrhi::IXRHIRenderPass* pass);
+    // IXRHI-facing refraction inputs (Phase 3B seam): the offscreen scene
+    // snapshots stay IXRHI-owned; native views are resolved backend-locally at
+    // descriptor-write time. Terrain/Water rendering itself is a later phase.
+    void SetWaterRefractionInputs(std::shared_ptr<ixrhi::IXRHITexture> colorSnapshot,
+                                  std::shared_ptr<ixrhi::IXRHITexture> depthSnapshot,
+                                  std::shared_ptr<ixrhi::IXRHISampler> sampler,
+                                  std::uint32_t width,
+                                  std::uint32_t height);
     bool HandleEditorInput(const InputEvent& event);
     void UpdateEditor(VulkanDevice& device,
                       double deltaSeconds,
@@ -451,10 +461,14 @@ private:
     VkPipelineLayout m_waterPipelineLayout = VK_NULL_HANDLE;
     VkPipeline m_waterPipeline = VK_NULL_HANDLE;
     VkRenderPass m_mainRenderPass = VK_NULL_HANDLE;
-    VkImageView m_waterSceneColorView = VK_NULL_HANDLE;
-    VkImageView m_waterSceneDepthView = VK_NULL_HANDLE;
-    VkSampler m_waterSceneSampler = VK_NULL_HANDLE;
-    VkExtent2D m_waterSceneExtent{};
+    // Refraction inputs are IXRHI-owned (shared lifetime: recreating the
+    // offscreen target cannot dangle these). Native handles resolve locally
+    // at descriptor-write time (backend bridge, transition-only).
+    std::shared_ptr<ixrhi::IXRHITexture> m_waterSceneColor;
+    std::shared_ptr<ixrhi::IXRHITexture> m_waterSceneDepth;
+    std::shared_ptr<ixrhi::IXRHISampler> m_waterSceneSampler;
+    std::uint32_t m_waterSceneWidth = 0;
+    std::uint32_t m_waterSceneHeight = 0;
     WaterReflectionResources m_waterReflection;
     VkPipelineLayout m_waterReflectionPipelineLayout = VK_NULL_HANDLE;
     VkPipeline m_waterReflectionPipeline = VK_NULL_HANDLE;

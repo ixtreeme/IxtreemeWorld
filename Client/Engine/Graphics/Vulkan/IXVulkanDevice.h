@@ -61,6 +61,9 @@ public:
     std::unique_ptr<ixrhi::IXRHICommandList> CreateCommandList() override;
     std::unique_ptr<ixrhi::IXRHIFence> CreateFence(bool signaled) override;
     std::unique_ptr<ixrhi::IXRHISemaphore> CreateSemaphore() override;
+    std::unique_ptr<ixrhi::IXRHIRenderTarget> CreateRenderTarget(
+        const ixrhi::IXRHIRenderTargetDesc& desc) override;
+    void WaitIdle() override;
     const ixrhi::IXRHICapabilities& GetCapabilities() const override { return m_capabilities; }
 
     // ---- backend-internal helpers (Vulkan module only) ----

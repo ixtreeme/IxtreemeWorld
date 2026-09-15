@@ -1,6 +1,8 @@
 #include "TerrainRenderer.h"
 
 #include "Debug.h"
+#include "IXVulkanBridge.h" // NativeViewOf/NativeSamplerOf: transition-only native
+                            // resolution for refraction inputs (documented seam)
 #include "WaterBodyIO.h"
 #include "asset/IAssetReader.h"
 #include "map/MapData.h"
@@ -2200,29 +2202,29 @@ bool TerrainRenderer::RecreatePipeline(VulkanDevice& device)
     return terrainPipeline && reflectionResources && reflectionPipeline && waterPipeline;
 }
 
-void TerrainRenderer::SetMainRenderPass(VkRenderPass renderPass)
+void TerrainRenderer::SetTargetPass(const ixrhi::IXRHIRenderPass* pass)
 {
-    m_mainRenderPass = renderPass;
+    m_mainRenderPass = (pass != nullptr) ? ixvulkan::NativePassOf(*pass) : VK_NULL_HANDLE;
 }
 
-void TerrainRenderer::SetWaterRefractionInputs(VkImageView colorView,
-                                               VkImageView depthView,
-                                               VkSampler sampler,
-                                               VkExtent2D extent)
+void TerrainRenderer::SetWaterRefractionInputs(std::shared_ptr<ixrhi::IXRHITexture> colorSnapshot,
+                                               std::shared_ptr<ixrhi::IXRHITexture> depthSnapshot,
+                                               std::shared_ptr<ixrhi::IXRHISampler> sampler,
+                                               std::uint32_t width,
+                                               std::uint32_t height)
 {
-    if (m_waterSceneColorView == colorView &&
-        m_waterSceneDepthView == depthView &&
-        m_waterSceneSampler == sampler &&
-        m_waterSceneExtent.width == extent.width &&
-        m_waterSceneExtent.height == extent.height)
+    if (m_waterSceneColor == colorSnapshot && m_waterSceneDepth == depthSnapshot &&
+        m_waterSceneSampler == sampler && m_waterSceneWidth == width &&
+        m_waterSceneHeight == height)
     {
         return;
     }
 
-    m_waterSceneColorView = colorView;
-    m_waterSceneDepthView = depthView;
-    m_waterSceneSampler = sampler;
-    m_waterSceneExtent = extent;
+    m_waterSceneColor = std::move(colorSnapshot);
+    m_waterSceneDepth = std::move(depthSnapshot);
+    m_waterSceneSampler = std::move(sampler);
+    m_waterSceneWidth = width;
+    m_waterSceneHeight = height;
     UpdateWaterDescriptors();
 }
 
@@ -6872,14 +6874,27 @@ void TerrainRenderer::WriteWaterDescriptorSets(const std::array<Buffer, kFramesI
         reflectionInfo.imageView = m_waterReflection.colorView;
         reflectionInfo.imageLayout = VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL;
 
+        // Backend-local native resolution (transition-only): the textures stay
+        // IXRHI-owned; views/samplers resolve here at write time, with the
+        // same normal-map fallback as before when unbound or unresolvable.
+        const VkImageView resolvedColorView =
+            m_waterSceneColor ? ixvulkan::NativeViewOf(*m_waterSceneColor) : VK_NULL_HANDLE;
+        const VkImageView resolvedDepthView =
+            m_waterSceneDepth ? ixvulkan::NativeViewOf(*m_waterSceneDepth) : VK_NULL_HANDLE;
+        const VkSampler resolvedSampler =
+            m_waterSceneSampler ? ixvulkan::NativeSamplerOf(*m_waterSceneSampler) : VK_NULL_HANDLE;
         VkDescriptorImageInfo sceneColorInfo{};
-        sceneColorInfo.sampler = m_waterSceneSampler ? m_waterSceneSampler : m_waterNormalSmall.sampler;
-        sceneColorInfo.imageView = m_waterSceneColorView ? m_waterSceneColorView : m_waterNormalSmall.view;
+        sceneColorInfo.sampler =
+            resolvedSampler ? resolvedSampler : m_waterNormalSmall.sampler;
+        sceneColorInfo.imageView =
+            resolvedColorView ? resolvedColorView : m_waterNormalSmall.view;
         sceneColorInfo.imageLayout = VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL;
 
         VkDescriptorImageInfo sceneDepthInfo{};
-        sceneDepthInfo.sampler = m_waterSceneSampler ? m_waterSceneSampler : m_waterNormalLarge.sampler;
-        sceneDepthInfo.imageView = m_waterSceneDepthView ? m_waterSceneDepthView : m_waterNormalLarge.view;
+        sceneDepthInfo.sampler =
+            resolvedSampler ? resolvedSampler : m_waterNormalLarge.sampler;
+        sceneDepthInfo.imageView =
+            resolvedDepthView ? resolvedDepthView : m_waterNormalLarge.view;
         sceneDepthInfo.imageLayout = VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL;
 
         VkDescriptorImageInfo diffuseInfo{};
@@ -8012,10 +8027,10 @@ TerrainRenderer::WaterUniformBlock TerrainRenderer::BuildWaterUniform(const Worl
     uniform.reflectionParams[1] = std::clamp(water.reflectionDistortionStrength, 0.0f, 0.2f);
     uniform.reflectionParams[2] = m_waterReflection.width > 0 ? static_cast<float>(m_waterReflection.width) : 1.0f;
     uniform.reflectionParams[3] = m_waterReflection.height > 0 ? static_cast<float>(m_waterReflection.height) : 1.0f;
-    uniform.refractionParams[0] = (water.refractionEnabled && m_waterSceneColorView && m_waterSceneDepthView) ? 1.0f : 0.0f;
+    uniform.refractionParams[0] = (water.refractionEnabled && m_waterSceneColor && m_waterSceneDepth) ? 1.0f : 0.0f;
     uniform.refractionParams[1] = std::clamp(water.refractionStrength, 0.0f, 0.1f);
     uniform.refractionParams[2] = std::clamp(water.refractionDepthStrength, 0.0f, 2.0f);
-    uniform.refractionParams[3] = m_waterSceneExtent.width > 0 ? static_cast<float>(m_waterSceneExtent.width) : 1.0f;
+    uniform.refractionParams[3] = m_waterSceneWidth > 0 ? static_cast<float>(m_waterSceneWidth) : 1.0f;
     uniform.shallowColor[0] = std::clamp(water.shallowColor[0], 0.0f, 2.0f);
     uniform.shallowColor[1] = std::clamp(water.shallowColor[1], 0.0f, 2.0f);
     uniform.shallowColor[2] = std::clamp(water.shallowColor[2], 0.0f, 2.0f);
@@ -8027,7 +8042,7 @@ TerrainRenderer::WaterUniformBlock TerrainRenderer::BuildWaterUniform(const Worl
     uniform.depthParams[0] = std::clamp(water.depthColorMin, 0.0f, 50.0f);
     uniform.depthParams[1] = std::max(uniform.depthParams[0] + 0.001f, std::clamp(water.depthColorMax, 0.001f, 50.0f));
     uniform.depthParams[2] = std::clamp(water.depthFadeDistance, 0.001f, 50.0f);
-    uniform.depthParams[3] = m_waterSceneExtent.height > 0 ? static_cast<float>(m_waterSceneExtent.height) : 1.0f;
+    uniform.depthParams[3] = m_waterSceneHeight > 0 ? static_cast<float>(m_waterSceneHeight) : 1.0f;
     uniform.foamParams[0] = water.foamEnabled ? 1.0f : 0.0f;
     uniform.foamParams[1] = std::clamp(water.foamScale, 0.05f, 2.0f);
     uniform.foamParams[2] = std::clamp(water.foamScrollSpeed, 0.0f, 0.1f);

@@ -188,6 +188,7 @@ VkImageLayout ToVkImageLayout(ixrhi::IXRHIImageLayout layout)
     switch (layout)
     {
     case L::Undefined: return VK_IMAGE_LAYOUT_UNDEFINED;
+    case L::TransferSrc: return VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL;
     case L::TransferDst: return VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL;
     case L::ShaderReadOnly: return VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL;
     case L::ColorAttachment: return VK_IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL;
@@ -207,6 +208,36 @@ VkSampleCountFlagBits ToVkSampleCount(std::uint32_t count)
     default: break;
     }
     return VK_SAMPLE_COUNT_1_BIT;
+}
+
+VkImageAspectFlags ToVkAspectMask(ixrhi::IXRHIFormat format)
+{
+    using F = ixrhi::IXRHIFormat;
+    switch (format)
+    {
+    case F::D32Float: return VK_IMAGE_ASPECT_DEPTH_BIT;
+    case F::D24UnormS8Uint: return VK_IMAGE_ASPECT_DEPTH_BIT | VK_IMAGE_ASPECT_STENCIL_BIT;
+    default: break;
+    }
+    return VK_IMAGE_ASPECT_COLOR_BIT;
+}
+
+VkAttachmentLoadOp ToVkLoadOp(ixrhi::IXRHILoadOp op)
+{
+    using L = ixrhi::IXRHILoadOp;
+    switch (op)
+    {
+    case L::Load: return VK_ATTACHMENT_LOAD_OP_LOAD;
+    case L::Clear: return VK_ATTACHMENT_LOAD_OP_CLEAR;
+    case L::DontCare: return VK_ATTACHMENT_LOAD_OP_DONT_CARE;
+    }
+    return VK_ATTACHMENT_LOAD_OP_DONT_CARE;
+}
+
+VkAttachmentStoreOp ToVkStoreOp(ixrhi::IXRHIStoreOp op)
+{
+    return op == ixrhi::IXRHIStoreOp::Store ? VK_ATTACHMENT_STORE_OP_STORE
+                                            : VK_ATTACHMENT_STORE_OP_DONT_CARE;
 }
 
 } // namespace ixvulkan

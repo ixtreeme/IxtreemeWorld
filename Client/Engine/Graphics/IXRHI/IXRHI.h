@@ -14,10 +14,12 @@
 //   IXRHI header in a TU without Vulkan headers on the include path).
 // - Public types keep the IXRHI prefix; backend types use IXVulkan (never RHI*,
 //   IRHI*, VulkanRHI).
-// - No void* native-device casts and no GetNativeVk*() on these interfaces. The
-//   single narrow escape hatch is ixvulkan::WrapFrameCommandList (Vulkan-module
-//   header only) for the in-flight frame command buffer during strangler
-//   migration. Every native access is inventoried in docs/architecture/.
+// - No void* native-device casts and no GetNativeVk*() on these interfaces.
+//   Backend-private native resolution for in-transition native consumers lives
+//   in the Vulkan module (IXVulkanBridge.h: WrapFrameCommandList for the
+//   in-flight frame buffer; NativeViewOf/NativeSamplerOf/NativePassOf for
+//   still-native downstream users). Every native access is inventoried in
+//   docs/architecture/phase2-migration-status.md.
 //
 // OWNERSHIP MODEL (binding, see IXRHIDevice.h for the full contract):
 // - GPU resources (buffer/texture/sampler/shader): std::shared_ptr — real shared

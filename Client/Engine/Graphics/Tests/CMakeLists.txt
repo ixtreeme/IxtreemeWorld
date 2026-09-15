@@ -11,6 +11,7 @@ target_link_libraries(IXRHISmoke
     PRIVATE
         IXEngineIXRHI
         IXEngineVulkan
+        IXEngineEditorGraphics
 )
 
 target_compile_definitions(IXRHISmoke PRIVATE IXRHI_SMOKE_WITH_VULKAN=1)

@@ -32,5 +32,8 @@ VkFilter ToVkFilter(ixrhi::IXRHISamplerFilter filter);
 VkSamplerAddressMode ToVkAddressMode(ixrhi::IXRHISamplerAddress mode);
 VkImageLayout ToVkImageLayout(ixrhi::IXRHIImageLayout layout);
 VkSampleCountFlagBits ToVkSampleCount(std::uint32_t count);
+VkImageAspectFlags ToVkAspectMask(ixrhi::IXRHIFormat format);
+VkAttachmentLoadOp ToVkLoadOp(ixrhi::IXRHILoadOp op);
+VkAttachmentStoreOp ToVkStoreOp(ixrhi::IXRHIStoreOp op);
 
 } // namespace ixvulkan

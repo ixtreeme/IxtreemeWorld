@@ -2,6 +2,7 @@
 
 #include "AssimpImporter.h"
 #include "Debug.h"
+#include "IXVulkanBridge.h" // NativePassOf: transition-only pass resolution
 #include "math/IXMath.h"
 #include "asset/IAssetReader.h"
 
@@ -1159,9 +1160,9 @@ bool SkinnedMeshRenderer::RecreatePipeline(VulkanDevice& device)
     return CreatePipeline(device);
 }
 
-void SkinnedMeshRenderer::SetMainRenderPass(VkRenderPass renderPass)
+void SkinnedMeshRenderer::SetTargetPass(const ixrhi::IXRHIRenderPass* pass)
 {
-    m_mainRenderPass = renderPass;
+    m_mainRenderPass = (pass != nullptr) ? ixvulkan::NativePassOf(*pass) : VK_NULL_HANDLE;
 }
 
 void SkinnedMeshRenderer::Skin(VulkanDevice& device, double timeSeconds)

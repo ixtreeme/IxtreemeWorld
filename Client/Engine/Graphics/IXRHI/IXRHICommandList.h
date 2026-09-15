@@ -18,6 +18,8 @@
 namespace ixrhi
 {
 
+class IXRHITexture;
+
 class IXRHICommandList
 {
 public:
@@ -64,6 +66,17 @@ public:
     virtual void Dispatch(std::uint32_t groupsX,
                           std::uint32_t groupsY,
                           std::uint32_t groupsZ) = 0;
+
+    // Explicit layout transition (backend inserts the barrier). The caller
+    // tracks states (as the offscreen snapshot flow does); the backend maps
+    // (from, to, format) to stages/access uniformly — no per-use barrier DSL.
+    virtual void TransitionTexture(IXRHITexture& texture,
+                                   IXRHIImageLayout from,
+                                   IXRHIImageLayout to) = 0;
+
+    // Full-subresource same-size copy. Both textures must already be in
+    // TransferSrc (src) / TransferDst (dst); aspects derive from formats.
+    virtual void CopyTexture(const IXRHITexture& src, IXRHITexture& dst) = 0;
 };
 
 } // namespace ixrhi

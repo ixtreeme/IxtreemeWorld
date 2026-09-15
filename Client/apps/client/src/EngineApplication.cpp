@@ -23,8 +23,9 @@
 #include "ScriptApiImpl.h"
 #include "BuildService.h"  // ixeditor::build::GameScriptBuildService — cmake Build worker (Editor/Build boundary)
 #include "IXVulkanBridge.h" // ixvulkan::WrapFrameCommandList — inventoried frame-list escape hatch
+#include "IXVulkanConversions.h" // FromVkFormat — swapchain format queries for offscreen targets
 #include "IXVulkanDevice.h" // ixvulkan::IXVulkanDevice — IXRHI backend over the live frame loop
-#include "IXVulkanRenderPass.h" // ixvulkan::IXVulkanRenderPass::Borrow — borrowed pass token
+#include "IXVulkanEditorAdapter.h" // backend-specific editor integration (isolated)
 #include "EditorImGui.h"
 #include "physics/PhysicsWorld.h"
 #if defined(_WIN32)
@@ -2245,6 +2246,14 @@ int RunGame(NativeWindow& window,
     // take IXRHIDevice& instead of VulkanDevice&.
     ixvulkan::IXVulkanDevice rhiDevice(device);
 #if defined(IXTREEME_WITH_EDITOR)
+    // Backend-specific editor integration (Phase 3B: isolated ImGui Vulkan
+    // backend + UI texture registrations). Declared early so it outlives the
+    // editor UI and all renderers; explicit ShutdownBackend precedes device
+    // teardown at scope end (the dtor is an idempotent backstop).
+    std::unique_ptr<ixvulkan::IXVulkanEditorAdapter> editorAdapter =
+        ixvulkan::IXVulkanEditorAdapter::Create(device, rhiDevice);
+#endif
+#if defined(IXTREEME_WITH_EDITOR)
     Tracen("[BUILD] Editor: ENABLED");
     Tracen("[BOOT] build = EDITOR");
     Tracen("[BOOT] entry state = editor boot, editor UI available, no startup scene auto-load");
@@ -2309,31 +2318,26 @@ int RunGame(NativeWindow& window,
 #if defined(IXTREEME_WITH_EDITOR)
 #if defined(_WIN32)
     NativeWindow_Win32* win32Window = dynamic_cast<NativeWindow_Win32*>(&window);
-    if (!win32Window || !editorImGui.Create(device, win32Window->GetHwnd()))
-    {
-        ShowFatal("Failed to create ImGui editor layer. See debug output/stderr.");
-        runtimeSession->Destroy();
-        device.Destroy();
-        return 1;
-    }
-    SceneManager::Instance().SetWindowTitleCallback([&window](const std::string& title) {
-        window.SetTitle(title);
-    });
-    win32Window->SetMessageCallback([&editorImGui](HWND hwnd, UINT message, WPARAM wParam, LPARAM lParam, LRESULT& result)
-    {
-        return editorImGui.HandleWin32Message(hwnd, message, wParam, lParam, result);
-    });
+    void* editorWindowHandle = win32Window ? win32Window->GetHwnd() : nullptr;
+    if (!win32Window || !editorAdapter->CreateBackend(editorWindowHandle) || !editorImGui.Create())
 #else
-    if (!editorImGui.Create(device, nullptr))
+    if (!editorAdapter->CreateBackend(nullptr) || !editorImGui.Create())
+#endif
     {
         ShowFatal("Failed to create ImGui editor layer. See debug output/stderr.");
         runtimeSession->Destroy();
         device.Destroy();
         return 1;
     }
+    editorImGui.SetTextureProvider(editorAdapter.get());
     SceneManager::Instance().SetWindowTitleCallback([&window](const std::string& title) {
         window.SetTitle(title);
     });
+#if defined(_WIN32)
+    win32Window->SetMessageCallback(
+        [&editorAdapter](HWND hwnd, UINT message, WPARAM wParam, LPARAM lParam, LRESULT& result) {
+            return editorAdapter->HandleWin32Message(hwnd, message, wParam, lParam, result);
+        });
 #endif
     editorImGui.SetMapEditorSettings(runtimeSession->GetMapEditorSettings());
     editorImGui.SetLightingState(runtimeSession->GetLightingState());
@@ -2391,55 +2395,66 @@ int RunGame(NativeWindow& window,
     }
 
     OffscreenSceneRenderer offscreenScene;
-    bool offscreenSceneOk = offscreenScene.Create(device, assets, renderSize);
-    // Borrowed IXRHI pass token for IXRHI-native renderers targeting the offscreen
-    // scene pass (selection outlines, static meshes). Re-borrowed whenever the
-    // offscreen target is (re)created; null = backend default (swapchain pass).
-    std::unique_ptr<ixvulkan::IXVulkanRenderPass> offscreenPass;
-    auto refreshOffscreenPass = [&]() {
-        if (offscreenSceneOk)
-            offscreenPass =
-                ixvulkan::IXVulkanRenderPass::Borrow(rhiDevice, offscreenScene.GetRenderPass());
-        else
-            offscreenPass.reset();
+    // Offscreen targets resolve formats from the live swapchain (as before,
+    // when the renderer queried them internally). Refreshed on every
+    // (re)creation because a swapchain recreate may re-pick formats.
+    ixrhi::IXRHIFormat offscreenColorFormat = ixrhi::IXRHIFormat::Undefined;
+    ixrhi::IXRHIFormat offscreenDepthFormat = ixrhi::IXRHIFormat::Undefined;
+    auto refreshOffscreenFormats = [&]() {
+        offscreenColorFormat = ixvulkan::FromVkFormat(device.GetSwapchainFormat());
+        offscreenDepthFormat = ixvulkan::FromVkFormat(device.GetDepthStencilFormat());
     };
-    refreshOffscreenPass();
+    refreshOffscreenFormats();
+    bool offscreenSceneOk = offscreenScene.Create(rhiDevice,
+        assets,
+        renderSize.width,
+        renderSize.height,
+        offscreenColorFormat,
+        offscreenDepthFormat,
+        "SceneView");
     if (offscreenSceneOk)
     {
         // (Skinned models are wired to the offscreen render pass per-entry inside
         // getSkinnedMeshRenderer when each is created; the cache is empty here.)
         if (terrainOk)
         {
-            terrain.SetMainRenderPass(offscreenScene.GetRenderPass());
-            terrain.SetWaterRefractionInputs(offscreenScene.GetSceneColorSnapshotView(),
-                offscreenScene.GetSceneDepthSnapshotView(),
-                offscreenScene.GetLinearSampler(),
-                offscreenScene.GetExtent());
+            terrain.SetTargetPass(offscreenScene.GetTargetPass());
+            terrain.SetWaterRefractionInputs(offscreenScene.GetColorSnapshotTexture(),
+                offscreenScene.GetDepthSnapshotTexture(),
+                offscreenScene.GetSampler(),
+                offscreenScene.Width(),
+                offscreenScene.Height());
             terrain.RecreatePipeline(device);
         }
         if (selectionOutlinesOk)
         {
-            selectionOutlines.SetTargetPass(offscreenPass.get());
+            selectionOutlines.SetTargetPass(offscreenScene.GetTargetPass());
             selectionOutlines.RecreatePipeline(rhiDevice);
         }
 #if defined(IXTREEME_WITH_EDITOR)
-        editorImGui.SetSceneViewTexture(offscreenScene.GetLinearSampler(),
-            offscreenScene.GetSceneColorView(),
-            VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL,
-            offscreenScene.GetExtent());
+        editorAdapter->SetSceneViewTexture(offscreenScene.GetColorTexture(),
+            offscreenScene.GetSampler(),
+            offscreenScene.Width(),
+            offscreenScene.Height());
 #endif
     }
 
     // Second offscreen target for the Game view (rendered from the scene's main camera).
     // Uses a render-pass-compatible target, so the renderers' existing pipelines work as-is.
     OffscreenSceneRenderer gameView;
-    bool gameViewOk = gameView.Create(device, assets, renderSize);
+    bool gameViewOk = gameView.Create(rhiDevice,
+        assets,
+        renderSize.width,
+        renderSize.height,
+        offscreenColorFormat,
+        offscreenDepthFormat,
+        "GameView");
 #if defined(IXTREEME_WITH_EDITOR)
     if (gameViewOk)
-        editorImGui.SetGameViewTexture(gameView.GetLinearSampler(),
-            gameView.GetSceneColorView(),
-            VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL,
-            gameView.GetExtent());
+        editorAdapter->SetGameViewTexture(gameView.GetColorTexture(),
+            gameView.GetSampler(),
+            gameView.Width(),
+            gameView.Height());
 #endif
     struct StaticMeshCacheEntry
     {
@@ -2513,7 +2528,7 @@ int RunGame(NativeWindow& window,
         // so wire the offscreen pass + rebuild the pipeline AFTER Create, not before.
         if (offscreenSceneOk)
         {
-            entry.renderer->SetMainRenderPass(offscreenScene.GetRenderPass());
+                entry.renderer->SetTargetPass(offscreenScene.GetTargetPass());
             entry.renderer->RecreatePipeline(device);
         }
         entry.renderer->SetLightingState(skinnedCacheLighting);
@@ -2613,7 +2628,7 @@ int RunGame(NativeWindow& window,
 
         entry.renderer = std::make_unique<StaticMeshRenderer>();
         if (offscreenSceneOk)
-            entry.renderer->SetTargetPass(offscreenPass.get());
+            entry.renderer->SetTargetPass(offscreenScene.GetTargetPass());
         if (!entry.renderer->Create(rhiDevice, assets, modelPath))
         {
             entry.renderer.reset();
@@ -2637,14 +2652,14 @@ int RunGame(NativeWindow& window,
     auto bindOffscreenSceneTargets = [&]() {
         if (!offscreenSceneOk)
             return;
-        refreshOffscreenPass();
-        renderSize = offscreenScene.GetExtent();
+        renderSize.width = offscreenScene.Width();
+        renderSize.height = offscreenScene.Height();
         for (auto& [skinnedPath, skinnedEntry] : skinnedMeshCache)
         {
             (void)skinnedPath;
             if (skinnedEntry.renderer)
             {
-                skinnedEntry.renderer->SetMainRenderPass(offscreenScene.GetRenderPass());
+                skinnedEntry.renderer->SetTargetPass(offscreenScene.GetTargetPass());
                 skinnedEntry.renderer->RecreatePipeline(device);
             }
         }
@@ -2653,37 +2668,44 @@ int RunGame(NativeWindow& window,
             (void)path;
             if (entry.renderer)
             {
-                entry.renderer->SetTargetPass(offscreenPass.get());
+                entry.renderer->SetTargetPass(offscreenScene.GetTargetPass());
                 entry.renderer->RecreatePipeline(rhiDevice);
             }
         }
         if (terrainOk)
         {
-            terrain.SetMainRenderPass(offscreenScene.GetRenderPass());
-            terrain.SetWaterRefractionInputs(offscreenScene.GetSceneColorSnapshotView(),
-                offscreenScene.GetSceneDepthSnapshotView(),
-                offscreenScene.GetLinearSampler(),
-                offscreenScene.GetExtent());
+            terrain.SetTargetPass(offscreenScene.GetTargetPass());
+            terrain.SetWaterRefractionInputs(offscreenScene.GetColorSnapshotTexture(),
+                offscreenScene.GetDepthSnapshotTexture(),
+                offscreenScene.GetSampler(),
+                offscreenScene.Width(),
+                offscreenScene.Height());
             terrain.RecreatePipeline(device);
         }
         if (selectionOutlinesOk)
         {
-            selectionOutlines.SetTargetPass(offscreenPass.get());
+            selectionOutlines.SetTargetPass(offscreenScene.GetTargetPass());
             selectionOutlines.RecreatePipeline(rhiDevice);
         }
 #if defined(IXTREEME_WITH_EDITOR)
-        editorImGui.SetSceneViewTexture(offscreenScene.GetLinearSampler(),
-            offscreenScene.GetSceneColorView(),
-            VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL,
-            offscreenScene.GetExtent());
+        editorAdapter->SetSceneViewTexture(offscreenScene.GetColorTexture(),
+            offscreenScene.GetSampler(),
+            offscreenScene.Width(),
+            offscreenScene.Height());
         if (gameViewOk)
         {
-            gameViewOk = gameView.Recreate(device, renderSize);
-            editorImGui.SetGameViewTexture(
-                gameViewOk ? gameView.GetLinearSampler() : VK_NULL_HANDLE,
-                gameViewOk ? gameView.GetSceneColorView() : VK_NULL_HANDLE,
-                gameViewOk ? VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL : VK_IMAGE_LAYOUT_UNDEFINED,
-                gameViewOk ? gameView.GetExtent() : VkExtent2D{});
+            gameViewOk = gameView.Recreate(rhiDevice,
+                renderSize.width,
+                renderSize.height,
+                offscreenColorFormat,
+                offscreenDepthFormat);
+            if (gameViewOk)
+                editorAdapter->SetGameViewTexture(gameView.GetColorTexture(),
+                    gameView.GetSampler(),
+                    gameView.Width(),
+                    gameView.Height());
+            else
+                editorAdapter->SetGameViewTexture(nullptr, nullptr, 0, 0);
         }
 #endif
     };
@@ -2696,7 +2718,12 @@ int RunGame(NativeWindow& window,
             targetExtent.height,
             device.GetSwapchainExtent().width,
             device.GetSwapchainExtent().height);
-        offscreenSceneOk = offscreenScene.Recreate(device, targetExtent);
+        refreshOffscreenFormats();
+        offscreenSceneOk = offscreenScene.Recreate(rhiDevice,
+            targetExtent.width,
+            targetExtent.height,
+            offscreenColorFormat,
+            offscreenDepthFormat);
         if (offscreenSceneOk)
         {
             bindOffscreenSceneTargets();
@@ -2704,10 +2731,7 @@ int RunGame(NativeWindow& window,
         }
         renderSize = device.GetSwapchainExtent();
 #if defined(IXTREEME_WITH_EDITOR)
-        editorImGui.SetSceneViewTexture(VK_NULL_HANDLE,
-            VK_NULL_HANDLE,
-            VK_IMAGE_LAYOUT_UNDEFINED,
-            {});
+        editorAdapter->SetSceneViewTexture(nullptr, nullptr, 0, 0);
 #endif
     };
 
@@ -4913,56 +4937,66 @@ int RunGame(NativeWindow& window,
                 Tracen("[MAIN] device.Resize() returned true, recreating pipelines");
                 if (offscreenSceneOk)
                 {
-                    offscreenSceneOk = offscreenScene.Recreate(device, effectiveRenderExtent());
-                    refreshOffscreenPass();
+                    const VkExtent2D resizeExtent = effectiveRenderExtent();
+                    refreshOffscreenFormats();
+                    offscreenSceneOk = offscreenScene.Recreate(rhiDevice,
+                        resizeExtent.width,
+                        resizeExtent.height,
+                        offscreenColorFormat,
+                        offscreenDepthFormat);
                     if (offscreenSceneOk)
                     {
-                        renderSize = offscreenScene.GetExtent();
+                        renderSize.width = offscreenScene.Width();
+                        renderSize.height = offscreenScene.Height();
                         for (auto& [skinnedPath, skinnedEntry] : skinnedMeshCache)
                         {
                             (void)skinnedPath;
                             if (skinnedEntry.renderer)
-                                skinnedEntry.renderer->SetMainRenderPass(offscreenScene.GetRenderPass());
+                                skinnedEntry.renderer->SetTargetPass(offscreenScene.GetTargetPass());
                         }
                         for (auto& [path, entry] : staticMeshCache)
                         {
                             (void)path;
                             if (entry.renderer)
-                                entry.renderer->SetTargetPass(offscreenPass.get());
+                                entry.renderer->SetTargetPass(offscreenScene.GetTargetPass());
                         }
                         if (terrainOk)
                         {
-                            terrain.SetMainRenderPass(offscreenScene.GetRenderPass());
-                            terrain.SetWaterRefractionInputs(offscreenScene.GetSceneColorSnapshotView(),
-                                offscreenScene.GetSceneDepthSnapshotView(),
-                                offscreenScene.GetLinearSampler(),
-                                offscreenScene.GetExtent());
+                            terrain.SetTargetPass(offscreenScene.GetTargetPass());
+                            terrain.SetWaterRefractionInputs(offscreenScene.GetColorSnapshotTexture(),
+                                offscreenScene.GetDepthSnapshotTexture(),
+                                offscreenScene.GetSampler(),
+                                offscreenScene.Width(),
+                                offscreenScene.Height());
                         }
                         if (selectionOutlinesOk)
-                            selectionOutlines.SetTargetPass(offscreenPass.get());
+                            selectionOutlines.SetTargetPass(offscreenScene.GetTargetPass());
 #if defined(IXTREEME_WITH_EDITOR)
-                        editorImGui.SetSceneViewTexture(offscreenScene.GetLinearSampler(),
-                            offscreenScene.GetSceneColorView(),
-                            VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL,
-                            offscreenScene.GetExtent());
+                        editorAdapter->SetSceneViewTexture(offscreenScene.GetColorTexture(),
+                            offscreenScene.GetSampler(),
+                            offscreenScene.Width(),
+                            offscreenScene.Height());
                         if (gameViewOk)
                         {
-                            gameViewOk = gameView.Recreate(device, renderSize);
-                            editorImGui.SetGameViewTexture(
-                                gameViewOk ? gameView.GetLinearSampler() : VK_NULL_HANDLE,
-                                gameViewOk ? gameView.GetSceneColorView() : VK_NULL_HANDLE,
-                                gameViewOk ? VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL : VK_IMAGE_LAYOUT_UNDEFINED,
-                                gameViewOk ? gameView.GetExtent() : VkExtent2D{});
+                            gameViewOk = gameView.Recreate(rhiDevice,
+                                renderSize.width,
+                                renderSize.height,
+                                offscreenColorFormat,
+                                offscreenDepthFormat);
+                            if (gameViewOk)
+                                editorAdapter->SetGameViewTexture(gameView.GetColorTexture(),
+                                    gameView.GetSampler(),
+                                    gameView.Width(),
+                                    gameView.Height());
+                            else
+                                editorAdapter->SetGameViewTexture(nullptr, nullptr, 0, 0);
                         }
 #endif
                     }
 #if defined(IXTREEME_WITH_EDITOR)
                     else
                     {
-                        editorImGui.SetSceneViewTexture(VK_NULL_HANDLE,
-                            VK_NULL_HANDLE,
-                            VK_IMAGE_LAYOUT_UNDEFINED,
-                            {});
+                        editorAdapter->SetSceneViewTexture(nullptr, nullptr, 0, 0);
                     }
 #endif
                 }
@@ -4987,7 +5021,7 @@ int RunGame(NativeWindow& window,
                 runtimeSession->OnRenderPassChanged(device);
                 rmlUi.OnRenderPassChanged(device);
 #if defined(IXTREEME_WITH_EDITOR)
-                editorImGui.OnRenderPassChanged(device);
+                editorAdapter->OnRenderPassChanged();
 #endif
                 swapchainSize = device.GetSwapchainExtent();
                 if (!offscreenSceneOk)
@@ -10234,7 +10268,11 @@ int RunGame(NativeWindow& window,
 
             const bool useOffscreenScene = offscreenSceneOk && device.IsFrameActive();
             if (useOffscreenScene)
-                offscreenScene.BeginMainPass(device);
+            {
+                if (auto offscreenBeginCmd =
+                        ixvulkan::WrapFrameCommandList(rhiDevice, device.GetCommandBuffer()))
+                    offscreenScene.BeginMainPass(*offscreenBeginCmd, MakeRhiFrameInfo(device));
+            }
             else
                 device.BeginSwapchainRenderPass("direct");
 
@@ -10822,7 +10860,8 @@ int RunGame(NativeWindow& window,
                         {
                             if (cameraEntity.id != selectedEditorObject.id)
                                 continue;
-                            const VkExtent2D frustumExtent = gameViewOk ? gameView.GetExtent() : renderSize;
+                            const VkExtent2D frustumExtent =
+                                gameViewOk ? VkExtent2D{gameView.Width(), gameView.Height()} : renderSize;
                             std::vector<SelectionOutlineRenderer::Line> frustumLines =
                                 BuildCameraFrustumLines(cameraEntity,
                                     frustumExtent.width, frustumExtent.height,
@@ -10867,17 +10906,22 @@ int RunGame(NativeWindow& window,
 
             if (useOffscreenScene)
             {
-                offscreenScene.EndMainPass(device);
-                if (isInWorld && hasSceneTerrain)
+                if (auto offscreenEndCmd =
+                        ixvulkan::WrapFrameCommandList(rhiDevice, device.GetCommandBuffer()))
                 {
-                    offscreenScene.SnapshotScene(device);
-                    terrain.SetWaterRefractionInputs(offscreenScene.GetSceneColorSnapshotView(),
-                        offscreenScene.GetSceneDepthSnapshotView(),
-                        offscreenScene.GetLinearSampler(),
-                        offscreenScene.GetExtent());
-                    offscreenScene.BeginMainPass(device, false);
-                    terrain.RenderWater(device, camera, seconds, renderSize);
-                    offscreenScene.EndMainPass(device);
+                    offscreenScene.EndMainPass(*offscreenEndCmd);
+                    if (isInWorld && hasSceneTerrain)
+                    {
+                        offscreenScene.SnapshotScene(*offscreenEndCmd, MakeRhiFrameInfo(device));
+                        terrain.SetWaterRefractionInputs(offscreenScene.GetColorSnapshotTexture(),
+                            offscreenScene.GetDepthSnapshotTexture(),
+                            offscreenScene.GetSampler(),
+                            offscreenScene.Width(),
+                            offscreenScene.Height());
+                        offscreenScene.BeginMainPass(*offscreenEndCmd, MakeRhiFrameInfo(device), false);
+                        terrain.RenderWater(device, camera, seconds, renderSize);
+                        offscreenScene.EndMainPass(*offscreenEndCmd);
+                    }
                 }
 #if defined(IXTREEME_WITH_EDITOR)
                 // --- Game view: render the scene from the main camera into the second offscreen target.
@@ -10900,7 +10944,7 @@ int RunGame(NativeWindow& window,
                         mainCameraEntity = &editorCameras.front();
                     if (mainCameraEntity)
                     {
-                        const VkExtent2D gameExtent = gameView.GetExtent();
+                        const VkExtent2D gameExtent{gameView.Width(), gameView.Height()};
                         // In Play, the first active player character drives the Game camera
                         // (follow/first-person/top-down per its CameraMode). Otherwise the
                         // scene's static Main Camera is used.
@@ -10923,7 +10967,9 @@ int RunGame(NativeWindow& window,
                         }
                         const WorldCamera gameCamera =
                             BuildCameraFromEntity(gameCameraEntity, gameExtent.width, gameExtent.height);
-                        gameView.BeginMainPass(device);
+                        if (auto gameBeginCmd =
+                                ixvulkan::WrapFrameCommandList(rhiDevice, device.GetCommandBuffer()))
+                            gameView.BeginMainPass(*gameBeginCmd, MakeRhiFrameInfo(device));
                         // Terrain is drawn from the project Main Camera using the secondary
                         // camera-uniform path (viewIndex=1). That path has its own per-frame
                         // uniform buffer + descriptor set, so this draw no longer clobbers the
@@ -10998,13 +11044,17 @@ int RunGame(NativeWindow& window,
                         {
                             terrain.RenderWater(device, gameCamera, seconds, gameExtent, /*viewIndex=*/1);
                         }
-                        gameView.EndMainPass(device);
+                        if (auto gameEndCmd =
+                                ixvulkan::WrapFrameCommandList(rhiDevice, device.GetCommandBuffer()))
+                            gameView.EndMainPass(*gameEndCmd);
                     }
                 }
 #endif
                 device.BeginSwapchainRenderPass("composite");
                 device.WriteGpuTimestamp(VulkanDevice::GpuTimestampPoint::CompositeBegin);
-                offscreenScene.RenderComposite(device);
+                if (auto compositeCmd =
+                        ixvulkan::WrapFrameCommandList(rhiDevice, device.GetCommandBuffer()))
+                    offscreenScene.RenderComposite(*compositeCmd, MakeRhiFrameInfo(device));
                 device.WriteGpuTimestamp(VulkanDevice::GpuTimestampPoint::CompositeEnd);
                 if (isInWorld && worldLabelsOk)
                 {
@@ -11058,7 +11108,8 @@ int RunGame(NativeWindow& window,
             }
             editorImGui.SetEngineStats(engineStats);
             device.WriteGpuTimestamp(VulkanDevice::GpuTimestampPoint::ImGuiBegin);
-            editorImGui.Render(device);
+            editorImGui.RenderPanels();
+            editorAdapter->DrawFrame(device.GetCommandBuffer(), device.GetFrameNumber());
             device.WriteGpuTimestamp(VulkanDevice::GpuTimestampPoint::ImGuiEnd);
 #else
             frameImGuiRenderCalled = false;
@@ -11167,7 +11218,9 @@ int RunGame(NativeWindow& window,
                         frameStaticMeshSpatialStats.nodesVisited,
                         frameStaticMeshSpatialStats.candidates,
                         frameStaticMeshSpatialStats.totalObjects);
-                    const VkExtent2D mperfExtent = useOffscreenScene ? offscreenScene.GetExtent() : renderSize;
+                    const VkExtent2D mperfExtent = useOffscreenScene
+                        ? VkExtent2D{offscreenScene.Width(), offscreenScene.Height()}
+                        : renderSize;
                     TraceDiagf("[MPERF] offscreen=%ux%u halfResTestFps=n/a boundHint=unknown",
                         mperfExtent.width,
                         mperfExtent.height);
@@ -11378,6 +11431,10 @@ int RunGame(NativeWindow& window,
     skinnedMeshCache.clear();
 #if defined(IXTREEME_WITH_EDITOR)
     editorImGui.Destroy();
+    // Backend UI teardown (pool/descriptors/context) while the device is alive.
+    // The adapter dtor re-entry is an idempotent no-op.
+    if (editorAdapter)
+        editorAdapter->ShutdownBackend();
 #if defined(_WIN32)
     if (NativeWindow_Win32* cleanupWin32Window = dynamic_cast<NativeWindow_Win32*>(&window))
         cleanupWin32Window->SetMessageCallback({});

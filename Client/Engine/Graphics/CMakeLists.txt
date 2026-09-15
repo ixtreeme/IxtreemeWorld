@@ -28,6 +28,8 @@ add_library(IXEngineVulkan STATIC
     Vulkan/IXVulkanPipeline.h
     Vulkan/IXVulkanRenderPass.cpp
     Vulkan/IXVulkanRenderPass.h
+    Vulkan/IXVulkanRenderTarget.cpp
+    Vulkan/IXVulkanRenderTarget.h
     Vulkan/IXVulkanCommandList.cpp
     Vulkan/IXVulkanCommandList.h
     Vulkan/IXVulkanSync.h
@@ -57,6 +59,21 @@ elseif(ANDROID)
 endif()
 
 target_compile_features(IXEngineVulkan PUBLIC cxx_std_20)
+
+# Editor Vulkan adapter (ImGui backend integration). Editor-only: needs imgui
+# bindings, exactly like the editor panels in IXEngineRender.
+if(IXTREEME_WITH_EDITOR)
+    target_sources(IXEngineVulkan PRIVATE
+        Vulkan/IXVulkanEditorAdapter.cpp
+        Vulkan/IXVulkanEditorAdapter.h
+    )
+    target_link_libraries(IXEngineVulkan
+        PUBLIC
+            IXEngineEditorGraphics
+        PRIVATE
+            imgui::imgui
+    )
+endif()
 
 if(BUILD_TESTING)
     add_subdirectory(Tests)

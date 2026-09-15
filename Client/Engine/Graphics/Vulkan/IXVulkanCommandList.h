@@ -49,6 +49,10 @@ public:
                      std::int32_t vertexOffset,
                      std::uint32_t firstInstance) override;
     void Dispatch(std::uint32_t groupsX, std::uint32_t groupsY, std::uint32_t groupsZ) override;
+    void TransitionTexture(ixrhi::IXRHITexture& texture,
+                           ixrhi::IXRHIImageLayout from,
+                           ixrhi::IXRHIImageLayout to) override;
+    void CopyTexture(const ixrhi::IXRHITexture& src, ixrhi::IXRHITexture& dst) override;
 
     VkCommandBuffer Native() const { return m_cmd; }
 

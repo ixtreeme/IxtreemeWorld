@@ -1,8 +1,32 @@
 #pragma once
 
-#include "platform/VulkanDevice.h"
+// OffscreenSceneRenderer — Phase-3B IXRHI-native facade.
+//
+// ZERO Vk* dependency. Owns IXRHI color/depth/snapshot textures, sampler,
+// clear + load render targets (backend-owned passes/framebuffers), and the
+// composite pipeline. Consumers receive IXRHI resources:
+//
+// - renderers bake pipelines against GetTargetPass() (borrowed token,
+//   replaces the app-side Borrow of the native pass),
+// - the editor displays GetColorTexture() through EditorGraphicsBridge,
+// - terrain refraction samples the snapshot textures + sampler.
+//
+// Layout tracking rule (binding): states name the PRODUCING use (e.g. the
+// color image is ColorAttachment after EndMainPass, not ShaderReadOnly), so
+// backend barriers derive correct stages/access from the labels alone.
+
+#include "IXRHIBinding.h"
+#include "IXRHIBuffer.h"
+#include "IXRHICommandList.h"
+#include "IXRHIDevice.h"
+#include "IXRHIPipeline.h"
+#include "IXRHIRenderPass.h"
+#include "IXRHIRenderTarget.h"
+#include "IXRHITexture.h"
 
 #include <cstdint>
+#include <memory>
+#include <string>
 
 namespace client::asset {
 class IAssetReader;
@@ -11,59 +35,76 @@ class IAssetReader;
 class OffscreenSceneRenderer
 {
 public:
-    bool Create(VulkanDevice& device, client::asset::IAssetReader& assets, VkExtent2D requestedExtent = {});
-    bool Recreate(VulkanDevice& device, VkExtent2D requestedExtent = {});
-    void BeginMainPass(VulkanDevice& device, bool clear = true);
-    void EndMainPass(VulkanDevice& device);
-    void SnapshotScene(VulkanDevice& device);
-    void RenderComposite(VulkanDevice& device);
+    bool Create(ixrhi::IXRHIDevice& rhi,
+                client::asset::IAssetReader& assets,
+                std::uint32_t width,
+                std::uint32_t height,
+                ixrhi::IXRHIFormat colorFormat,
+                ixrhi::IXRHIFormat depthFormat,
+                const std::string& tag = "SceneView");
+    bool Recreate(ixrhi::IXRHIDevice& rhi,
+                  std::uint32_t width,
+                  std::uint32_t height,
+                  ixrhi::IXRHIFormat colorFormat,
+                  ixrhi::IXRHIFormat depthFormat);
+    void BeginMainPass(ixrhi::IXRHICommandList& cmd,
+                       const ixrhi::IXRHIFrameInfo& frame,
+                       bool clear = true);
+    void EndMainPass(ixrhi::IXRHICommandList& cmd);
+    void SnapshotScene(ixrhi::IXRHICommandList& cmd, const ixrhi::IXRHIFrameInfo& frame);
+    void RenderComposite(ixrhi::IXRHICommandList& cmd, const ixrhi::IXRHIFrameInfo& frame);
     void Destroy();
 
     bool IsReady() const { return m_ready; }
-    VkRenderPass GetRenderPass() const { return m_renderPass; }
-    VkImageView GetSceneColorView() const { return m_colorView; }
-    VkImageView GetSceneColorSnapshotView() const { return m_sceneColorSnapshotView; }
-    VkImageView GetSceneDepthSnapshotView() const { return m_sceneDepthSnapshotView; }
-    VkSampler GetLinearSampler() const { return m_sampler; }
-    VkExtent2D GetExtent() const { return m_extent; }
+    const ixrhi::IXRHIRenderPass* GetTargetPass() const;
+    const std::shared_ptr<ixrhi::IXRHITexture>& GetColorTexture() const { return m_color; }
+    const std::shared_ptr<ixrhi::IXRHITexture>& GetColorSnapshotTexture() const
+    {
+        return m_colorSnapshot;
+    }
+    const std::shared_ptr<ixrhi::IXRHITexture>& GetDepthSnapshotTexture() const
+    {
+        return m_depthSnapshot;
+    }
+    const std::shared_ptr<ixrhi::IXRHISampler>& GetSampler() const { return m_sampler; }
+    std::uint32_t Width() const { return m_width; }
+    std::uint32_t Height() const { return m_height; }
+    ixrhi::IXRHIFormat ColorFormat() const { return m_colorFormat; }
+    ixrhi::IXRHIFormat DepthFormat() const { return m_depthFormat; }
 
 private:
-    bool CreateRenderPass(VulkanDevice& device);
-    bool CreateImages(VulkanDevice& device);
-    bool CreateFramebuffer(VulkanDevice& device);
-    bool CreateSampler();
-    bool CreateDescriptorResources();
-    bool CreatePipeline(VulkanDevice& device);
-    void UpdateDescriptor();
+    bool CreateTargets(ixrhi::IXRHIDevice& rhi);
+    bool CreateComposite(ixrhi::IXRHIDevice& rhi);
 
-    VkDevice m_device = VK_NULL_HANDLE;
+    ixrhi::IXRHIDevice* m_rhi = nullptr;
     client::asset::IAssetReader* m_assets = nullptr;
-    VkExtent2D m_extent{};
-    VkFormat m_colorFormat = VK_FORMAT_UNDEFINED;
-    VkFormat m_depthFormat = VK_FORMAT_UNDEFINED;
+    std::uint32_t m_width = 0;
+    std::uint32_t m_height = 0;
+    ixrhi::IXRHIFormat m_colorFormat = ixrhi::IXRHIFormat::Undefined;
+    ixrhi::IXRHIFormat m_depthFormat = ixrhi::IXRHIFormat::Undefined;
+    std::string m_tag = "SceneView";
 
-    VkRenderPass m_renderPass = VK_NULL_HANDLE;
-    VkImage m_colorImage = VK_NULL_HANDLE;
-    VkDeviceMemory m_colorMemory = VK_NULL_HANDLE;
-    VkImageView m_colorView = VK_NULL_HANDLE;
-    VkImage m_depthImage = VK_NULL_HANDLE;
-    VkDeviceMemory m_depthMemory = VK_NULL_HANDLE;
-    VkImageView m_depthView = VK_NULL_HANDLE;
-    VkImage m_sceneColorSnapshot = VK_NULL_HANDLE;
-    VkDeviceMemory m_sceneColorSnapshotMemory = VK_NULL_HANDLE;
-    VkImageView m_sceneColorSnapshotView = VK_NULL_HANDLE;
-    VkImage m_sceneDepthSnapshot = VK_NULL_HANDLE;
-    VkDeviceMemory m_sceneDepthSnapshotMemory = VK_NULL_HANDLE;
-    VkImageView m_sceneDepthSnapshotView = VK_NULL_HANDLE;
-    VkFramebuffer m_framebuffer = VK_NULL_HANDLE;
-    VkSampler m_sampler = VK_NULL_HANDLE;
-    VkRenderPass m_loadRenderPass = VK_NULL_HANDLE;
+    std::shared_ptr<ixrhi::IXRHITexture> m_color;
+    std::shared_ptr<ixrhi::IXRHITexture> m_depth;
+    std::shared_ptr<ixrhi::IXRHITexture> m_colorSnapshot;
+    std::shared_ptr<ixrhi::IXRHITexture> m_depthSnapshot;
+    std::shared_ptr<ixrhi::IXRHISampler> m_sampler;
 
-    VkDescriptorSetLayout m_descriptorSetLayout = VK_NULL_HANDLE;
-    VkDescriptorPool m_descriptorPool = VK_NULL_HANDLE;
-    VkDescriptorSet m_descriptorSet = VK_NULL_HANDLE;
-    VkPipelineLayout m_pipelineLayout = VK_NULL_HANDLE;
-    VkPipeline m_pipeline = VK_NULL_HANDLE;
+    std::unique_ptr<ixrhi::IXRHIRenderTarget> m_clearTarget;
+    std::unique_ptr<ixrhi::IXRHIRenderTarget> m_loadTarget;
+    const ixrhi::IXRHIRenderTarget* m_activeTarget = nullptr; // borrowed, begun pass
+
+    std::shared_ptr<ixrhi::IXRHIShader> m_compositeVs;
+    std::shared_ptr<ixrhi::IXRHIShader> m_compositePs;
+    std::unique_ptr<ixrhi::IXRHIBindGroupLayout> m_bindLayout;
+    std::unique_ptr<ixrhi::IXRHIBindGroup> m_bindGroup;
+    std::unique_ptr<ixrhi::IXRHIGraphicsPipeline> m_compositePipeline;
+
+    // Tracked producing-use states (see header contract).
+    ixrhi::IXRHIImageLayout m_colorState = ixrhi::IXRHIImageLayout::Undefined;
+    ixrhi::IXRHIImageLayout m_depthState = ixrhi::IXRHIImageLayout::Undefined;
+    ixrhi::IXRHIImageLayout m_colorSnapshotState = ixrhi::IXRHIImageLayout::Undefined;
+    ixrhi::IXRHIImageLayout m_depthSnapshotState = ixrhi::IXRHIImageLayout::Undefined;
 
     bool m_ready = false;
     bool m_passActive = false;

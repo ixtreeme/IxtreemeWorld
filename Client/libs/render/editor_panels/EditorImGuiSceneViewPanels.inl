@@ -159,11 +159,19 @@ void EditorImGui::RenderSceneViewDropTarget()
     const ImVec2 viewportPos = mainViewport ? mainViewport->Pos : ImVec2(0.0f, 0.0f);
     ImVec2 imageMin = sceneMin;
     ImVec2 imageSize = avail;
-    if (avail.x > 1.0f && avail.y > 1.0f &&
-        m_sceneViewExtent.width > 0 && m_sceneViewExtent.height > 0)
+    std::uint32_t sceneViewWidth = 0;
+    std::uint32_t sceneViewHeight = 0;
+    void* sceneViewTextureId = nullptr;
+    if (m_textureProvider)
     {
-        const float targetAspect = static_cast<float>(m_sceneViewExtent.width) /
-            static_cast<float>(m_sceneViewExtent.height);
+        m_textureProvider->GetSceneViewSize(sceneViewWidth, sceneViewHeight);
+        sceneViewTextureId = m_textureProvider->GetSceneViewTexture();
+    }
+    if (avail.x > 1.0f && avail.y > 1.0f &&
+        sceneViewWidth > 0 && sceneViewHeight > 0)
+    {
+        const float targetAspect = static_cast<float>(sceneViewWidth) /
+            static_cast<float>(sceneViewHeight);
         const float availableAspect = avail.x / avail.y;
         if (availableAspect > targetAspect)
         {
@@ -183,24 +191,24 @@ void EditorImGui::RenderSceneViewDropTarget()
         m_viewportInputDiagnostics.sceneViewMin[1] = imageMin.y - viewportPos.y;
         m_viewportInputDiagnostics.sceneViewSize[0] = imageSize.x;
         m_viewportInputDiagnostics.sceneViewSize[1] = imageSize.y;
-        m_viewportInputDiagnostics.sceneViewExtent[0] = m_sceneViewExtent.width;
-        m_viewportInputDiagnostics.sceneViewExtent[1] = m_sceneViewExtent.height;
+        m_viewportInputDiagnostics.sceneViewExtent[0] = sceneViewWidth;
+        m_viewportInputDiagnostics.sceneViewExtent[1] = sceneViewHeight;
     }
-    const bool canDrawSceneView = m_sceneViewDescriptor && avail.x > 1.0f && avail.y > 1.0f;
+    const bool canDrawSceneView = sceneViewTextureId && avail.x > 1.0f && avail.y > 1.0f;
     bool sceneViewItemDrawn = false;
     if (canDrawSceneView)
     {
         ImGui::SetCursorScreenPos(imageMin);
-        ImGui::Image(reinterpret_cast<ImTextureID>(m_sceneViewDescriptor), imageSize);
+        ImGui::Image(reinterpret_cast<ImTextureID>(sceneViewTextureId), imageSize);
         sceneViewItemDrawn = true;
         if (!m_sceneViewSelectionOutline.empty() &&
-            m_sceneViewExtent.width > 0 &&
-            m_sceneViewExtent.height > 0)
+            sceneViewWidth > 0 &&
+            sceneViewHeight > 0)
         {
             ImDrawList* drawList = ImGui::GetWindowDrawList();
             auto toScenePoint = [&](float x, float y) {
-                const float u = x / static_cast<float>(m_sceneViewExtent.width);
-                const float v = y / static_cast<float>(m_sceneViewExtent.height);
+                const float u = x / static_cast<float>(sceneViewWidth);
+                const float v = y / static_cast<float>(sceneViewHeight);
                 return ImVec2(
                     imageMin.x + u * imageSize.x,
                     imageMin.y + v * imageSize.y);
@@ -459,11 +467,19 @@ void EditorImGui::RenderGameViewPanel()
     const ImVec2 avail = ImGui::GetContentRegionAvail();
     ImVec2 imageMin = regionMin;
     ImVec2 imageSize = avail;
-    if (avail.x > 1.0f && avail.y > 1.0f &&
-        m_gameViewExtent.width > 0 && m_gameViewExtent.height > 0)
+    std::uint32_t gameViewWidth = 0;
+    std::uint32_t gameViewHeight = 0;
+    void* gameViewTextureId = nullptr;
+    if (m_textureProvider)
     {
-        const float targetAspect = static_cast<float>(m_gameViewExtent.width) /
-            static_cast<float>(m_gameViewExtent.height);
+        m_textureProvider->GetGameViewSize(gameViewWidth, gameViewHeight);
+        gameViewTextureId = m_textureProvider->GetGameViewTexture();
+    }
+    if (avail.x > 1.0f && avail.y > 1.0f &&
+        gameViewWidth > 0 && gameViewHeight > 0)
+    {
+        const float targetAspect = static_cast<float>(gameViewWidth) /
+            static_cast<float>(gameViewHeight);
         const float availableAspect = avail.x / avail.y;
         if (availableAspect > targetAspect)
         {
@@ -476,10 +492,10 @@ void EditorImGui::RenderGameViewPanel()
             imageMin.y += (avail.y - imageSize.y) * 0.5f;
         }
     }
-    if (m_gameViewDescriptor && avail.x > 1.0f && avail.y > 1.0f)
+    if (gameViewTextureId && avail.x > 1.0f && avail.y > 1.0f)
     {
         ImGui::SetCursorScreenPos(imageMin);
-        ImGui::Image(reinterpret_cast<ImTextureID>(m_gameViewDescriptor), imageSize);
+        ImGui::Image(reinterpret_cast<ImTextureID>(gameViewTextureId), imageSize);
     }
     else if (avail.x > 1.0f && avail.y > 1.0f)
     {

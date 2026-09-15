@@ -163,6 +163,101 @@ void IXVulkanCommandList::Dispatch(std::uint32_t groupsX, std::uint32_t groupsY,
     vkCmdDispatch(m_cmd, groupsX, groupsY, groupsZ);
 }
 
+namespace
+{
+
+void LayoutStageAccess(ixrhi::IXRHIImageLayout layout,
+                       VkPipelineStageFlags& stage,
+                       VkAccessFlags& access)
+{
+    using L = ixrhi::IXRHIImageLayout;
+    switch (layout)
+    {
+    case L::Undefined:
+        stage = VK_PIPELINE_STAGE_TOP_OF_PIPE_BIT;
+        access = 0;
+        break;
+    case L::TransferSrc:
+        stage = VK_PIPELINE_STAGE_TRANSFER_BIT;
+        access = VK_ACCESS_TRANSFER_READ_BIT;
+        break;
+    case L::TransferDst:
+        stage = VK_PIPELINE_STAGE_TRANSFER_BIT;
+        access = VK_ACCESS_TRANSFER_WRITE_BIT;
+        break;
+    case L::ShaderReadOnly:
+        stage = VK_PIPELINE_STAGE_FRAGMENT_SHADER_BIT;
+        access = VK_ACCESS_SHADER_READ_BIT;
+        break;
+    case L::ColorAttachment:
+        stage = VK_PIPELINE_STAGE_COLOR_ATTACHMENT_OUTPUT_BIT;
+        access = VK_ACCESS_COLOR_ATTACHMENT_WRITE_BIT;
+        break;
+    case L::DepthStencilAttachment:
+        stage = VK_PIPELINE_STAGE_EARLY_FRAGMENT_TESTS_BIT |
+            VK_PIPELINE_STAGE_LATE_FRAGMENT_TESTS_BIT;
+        access = VK_ACCESS_DEPTH_STENCIL_ATTACHMENT_WRITE_BIT;
+        break;
+    case L::Present:
+        stage = VK_PIPELINE_STAGE_BOTTOM_OF_PIPE_BIT;
+        access = 0;
+        break;
+    }
+}
+
+} // namespace
+
+void IXVulkanCommandList::TransitionTexture(ixrhi::IXRHITexture& texture,
+                                            ixrhi::IXRHIImageLayout from,
+                                            ixrhi::IXRHIImageLayout to)
+{
+    auto* native = dynamic_cast<IXVulkanTexture*>(&texture);
+    if (native == nullptr)
+        return;
+    VkPipelineStageFlags srcStage = 0;
+    VkAccessFlags srcAccess = 0;
+    VkPipelineStageFlags dstStage = 0;
+    VkAccessFlags dstAccess = 0;
+    LayoutStageAccess(from, srcStage, srcAccess);
+    LayoutStageAccess(to, dstStage, dstAccess);
+
+    VkImageMemoryBarrier barrier{};
+    barrier.sType = VK_STRUCTURE_TYPE_IMAGE_MEMORY_BARRIER;
+    barrier.oldLayout = ToVkImageLayout(from);
+    barrier.newLayout = ToVkImageLayout(to);
+    barrier.srcQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;
+    barrier.dstQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;
+    barrier.image = native->Native();
+    barrier.subresourceRange.aspectMask = ToVkAspectMask(native->Format());
+    barrier.subresourceRange.levelCount = 1;
+    barrier.subresourceRange.layerCount = 1;
+    barrier.srcAccessMask = srcAccess;
+    barrier.dstAccessMask = dstAccess;
+    vkCmdPipelineBarrier(m_cmd, srcStage, dstStage, 0, 0, nullptr, 0, nullptr, 1, &barrier);
+}
+
+void IXVulkanCommandList::CopyTexture(const ixrhi::IXRHITexture& src, ixrhi::IXRHITexture& dst)
+{
+    auto* nativeSrc = dynamic_cast<const IXVulkanTexture*>(&src);
+    auto* nativeDst = dynamic_cast<IXVulkanTexture*>(&dst);
+    if (nativeSrc == nullptr || nativeDst == nullptr)
+        return;
+    const VkImageAspectFlags aspect = ToVkAspectMask(nativeSrc->Format());
+    VkImageCopy copy{};
+    copy.srcSubresource.aspectMask = aspect;
+    copy.srcSubresource.layerCount = 1;
+    copy.dstSubresource.aspectMask = aspect;
+    copy.dstSubresource.layerCount = 1;
+    copy.extent = {nativeSrc->Width(), nativeSrc->Height(), 1};
+    vkCmdCopyImage(m_cmd,
+        nativeSrc->Native(),
+        VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL,
+        nativeDst->Native(),
+        VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL,
+        1,
+        &copy);
+}
+
 std::unique_ptr<ixrhi::IXRHICommandList> IXVulkanDevice::CreateCommandList()
 {
     VkCommandPoolCreateInfo poolInfo{};

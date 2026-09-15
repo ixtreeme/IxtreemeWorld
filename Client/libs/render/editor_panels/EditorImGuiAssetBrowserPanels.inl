@@ -196,10 +196,14 @@ void EditorImGui::RenderAssetTile(const AssetLibrary::Entry& entry, float tileSi
         ? ImVec4(categoryColor.x + 0.08f, categoryColor.y + 0.08f, categoryColor.z + 0.08f, 1.0f)
         : categoryColor);
     drawList->AddRectFilled(previewMin, previewMax, baseColor, 5.0f);
-    if (preview && preview->descriptor)
+    void* previewTextureId =
+        (preview && preview->handle.IsValid() && m_textureProvider)
+        ? m_textureProvider->GetPreviewTexture(preview->handle)
+        : nullptr;
+    if (previewTextureId)
     {
         drawList->AddImage(
-            reinterpret_cast<ImTextureID>(preview->descriptor),
+            reinterpret_cast<ImTextureID>(previewTextureId),
             previewMin,
             previewMax,
             ImVec2(0.0f, 0.0f),

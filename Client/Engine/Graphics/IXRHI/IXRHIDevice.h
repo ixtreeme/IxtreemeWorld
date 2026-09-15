@@ -24,6 +24,7 @@
 #include "IXRHICapabilities.h"
 #include "IXRHICommandList.h"
 #include "IXRHIPipeline.h"
+#include "IXRHIRenderTarget.h"
 #include "IXRHIShader.h"
 #include "IXRHISwapchain.h"
 #include "IXRHISync.h"
@@ -97,6 +98,14 @@ public:
 
     virtual std::unique_ptr<IXRHIFence> CreateFence(bool signaled) = 0;
     virtual std::unique_ptr<IXRHISemaphore> CreateSemaphore() = 0;
+
+    // Render-target owning its pass + framebuffer in the backend.
+    virtual std::unique_ptr<IXRHIRenderTarget> CreateRenderTarget(
+        const IXRHIRenderTargetDesc& desc) = 0;
+
+    // Host-side GPU drain for teardown/recreation paths (offscreen Recreate).
+    // Must not be called from inside a recording command list.
+    virtual void WaitIdle() = 0;
 
     virtual const IXRHICapabilities& GetCapabilities() const = 0;
 };

@@ -2,11 +2,15 @@
 
 // IXRHITexture / IXRHISampler contracts. Backend owns image, memory, view(s),
 // layout bookkeeping and sampler; renderer code never sees VkImage/View/Sampler.
+//
+// Resources are always shared_ptr-owned (see IXRHIDevice ownership contract),
+// so bases enable shared_from_this for registry keep-alives.
 
 #include "IXRHI.h"
 #include "IXRHITypes.h"
 
 #include <cstdint>
+#include <memory>
 #include <string>
 
 namespace ixrhi
@@ -25,7 +29,7 @@ struct IXRHITextureDesc
     std::string debugName;
 };
 
-class IXRHITexture
+class IXRHITexture : public std::enable_shared_from_this<IXRHITexture>
 {
 public:
     virtual ~IXRHITexture() = default;
@@ -49,7 +53,7 @@ struct IXRHISamplerDesc
     std::string debugName;
 };
 
-class IXRHISampler
+class IXRHISampler : public std::enable_shared_from_this<IXRHISampler>
 {
 public:
     virtual ~IXRHISampler() = default;

@@ -1,5 +1,13 @@
 #pragma once
 
+// EditorImGui — Phase-3B: zero Vulkan types in this header.
+//
+// The ImGui Vulkan backend (descriptor pool, backend init/shutdown, draw-data
+// submission) and all UI texture registrations live in IXVulkanEditorAdapter
+// (Engine/Graphics/Vulkan, backend-specific editor integration). This class
+// consumes the Vk-free IEditorTextureProvider interface for scene/game views
+// and asset-preview thumbnails. imgui.h inclusion is fine (not Vulkan).
+
 #include "AssetLibrary.h"
 #include "InputEvent.h"
 #include "MapEditorTypes.h"
@@ -7,11 +15,7 @@
 #include "platform/dynamic_library.h"
 #include "tools/tree/TreeGeneratorPanel.h"
 
-#if defined(_WIN32) && !defined(VK_USE_PLATFORM_WIN32_KHR)
-#define VK_USE_PLATFORM_WIN32_KHR
-#endif
-
-#include <vulkan/vulkan.h>
+#include "EditorGraphicsBridge.h"
 
 #include <cstdint>
 #include <cstddef>
@@ -29,7 +33,6 @@
 #include <windows.h>
 #endif
 
-class VulkanDevice;
 struct ImVec2;
 
 class EditorImGui
@@ -56,18 +59,17 @@ public:
     EditorImGui() = default;
     ~EditorImGui();
 
-#if defined(_WIN32)
-    bool Create(VulkanDevice& device, HWND hwnd);
-    bool HandleWin32Message(HWND hwnd, UINT message, WPARAM wParam, LPARAM lParam, LRESULT& result);
-#else
-    bool Create(VulkanDevice& device, void* windowHandle);
-#endif
+    // Generic UI init (context/IO/fonts/style). The backend adapter must have
+    // created the ImGui context first (adapter->CreateBackend).
+    bool Create();
+    // Backend UI texture provider (adapter). Must outlive this object.
+    void SetTextureProvider(ixeditor::graphics::IEditorTextureProvider* provider);
+    bool HasTextureProvider() const { return m_textureProvider != nullptr; }
 
     void BeginFrame(bool editorModeActive);
-    void Render(VulkanDevice& device);
-    void OnRenderPassChanged(VulkanDevice& device);
-    void SetSceneViewTexture(VkSampler sampler, VkImageView imageView, VkImageLayout layout, VkExtent2D extent);
-    void SetGameViewTexture(VkSampler sampler, VkImageView imageView, VkImageLayout layout, VkExtent2D extent);
+    // Builds all panels and calls ImGui::Render (generic). The frame owner
+    // submits draw data through the backend adapter afterwards.
+    void RenderPanels();
     // True when the Game panel was actually visible (active dock tab, not collapsed) last
     // frame. Lets the engine skip the expensive Game-view scene render when it's not shown.
     bool IsGameViewVisible() const { return m_gameViewVisible; }
@@ -196,11 +198,7 @@ private:
 
     struct AssetPreviewTexture
     {
-        VkImage image = VK_NULL_HANDLE;
-        VkDeviceMemory memory = VK_NULL_HANDLE;
-        VkImageView view = VK_NULL_HANDLE;
-        VkSampler sampler = VK_NULL_HANDLE;
-        VkDescriptorSet descriptor = VK_NULL_HANDLE;
+        ixeditor::graphics::EditorTextureHandle handle;
         uint32_t width = 0;
         uint32_t height = 0;
         bool failed = false;
@@ -230,8 +228,6 @@ private:
         bool enabled = true;
     };
 
-    bool CreateDescriptorPool(VulkanDevice& device);
-    bool InitVulkanBackend(VulkanDevice& device);
     void RenderEditorPanels();
     void RenderDemoPanels();
     void RenderDockSpace();
@@ -239,8 +235,6 @@ private:
     void RenderGameViewPanel();
     void RenderAnimatorPanel();
     void RenderSceneViewGizmo(const ImVec2& imageMin, const ImVec2& imageSize);
-    void ReleaseSceneViewTextureDescriptor();
-    void ReleaseGameViewTextureDescriptor();
     void RenderMenuBar();
     bool SaveProjectAndCurrentScene(bool automatic = false);
     void RunProjectAutoSave();
@@ -427,13 +421,9 @@ private:
         char newName[96] = "material";
     };
 
-    VkDevice m_device = VK_NULL_HANDLE;
-    VkPhysicalDevice m_physicalDevice = VK_NULL_HANDLE;
-    VkQueue m_graphicsQueue = VK_NULL_HANDLE;
-    uint32_t m_graphicsQueueFamily = UINT32_MAX;
-    VkDescriptorPool m_descriptorPool = VK_NULL_HANDLE;
+    // Backend-owned graphics state (no Vulkan types here by design).
+    ixeditor::graphics::IEditorTextureProvider* m_textureProvider = nullptr;
     bool m_initialized = false;
-    bool m_vulkanBackendReady = false;
     bool m_frameActive = false;
     bool m_editorModeActive = false;
     bool m_showDemoWindow = false;
@@ -601,18 +591,6 @@ private:
     std::unordered_map<std::string, AssetPreviewTexture> m_assetPreviewTextures;
     bool m_assetBrowserLogged = false;
     std::string m_loggedDragAssetId;
-    VkSampler m_sceneViewSampler = VK_NULL_HANDLE;
-    VkImageView m_sceneViewImageView = VK_NULL_HANDLE;
-    VkImageLayout m_sceneViewImageLayout = VK_IMAGE_LAYOUT_UNDEFINED;
-    VkExtent2D m_sceneViewExtent{};
-    VkDescriptorSet m_sceneViewDescriptor = VK_NULL_HANDLE;
-    VkSampler m_sceneViewDescriptorSampler = VK_NULL_HANDLE;
-    VkImageView m_sceneViewDescriptorImageView = VK_NULL_HANDLE;
-    VkImageLayout m_sceneViewDescriptorImageLayout = VK_IMAGE_LAYOUT_UNDEFINED;
-    VkSampler m_gameViewSampler = VK_NULL_HANDLE;
-    VkImageView m_gameViewImageView = VK_NULL_HANDLE;
-    VkImageLayout m_gameViewImageLayout = VK_IMAGE_LAYOUT_UNDEFINED;
-    VkExtent2D m_gameViewExtent{};
     bool m_gameViewVisible = false;
     bool m_animatorGraphVisible = false;
     bool m_animatorPanelOpen = true;
@@ -636,10 +614,6 @@ private:
     std::vector<AnimatorGraphCondition> m_animatorEditConditions;
     std::uint32_t m_animatorEditSeededFrom = 0xFFFFFFFEu;  // "not seeded" sentinel
     std::uint32_t m_animatorEditSeededTo = 0xFFFFFFFEu;
-    VkDescriptorSet m_gameViewDescriptor = VK_NULL_HANDLE;
-    VkSampler m_gameViewDescriptorSampler = VK_NULL_HANDLE;
-    VkImageView m_gameViewDescriptorImageView = VK_NULL_HANDLE;
-    VkImageLayout m_gameViewDescriptorImageLayout = VK_IMAGE_LAYOUT_UNDEFINED;
     bool m_sceneViewKeyboardFocus = false;
     std::vector<std::array<float, 4>> m_sceneViewSelectionOutline;
     bool m_viewportDropTargetLogged = false;
@@ -656,5 +630,4 @@ private:
     bool m_sceneGizmoSnapEnabled = false;
     float m_sceneGizmoSnapValue = 1.0f;
     float m_timeOfDayHours = 12.0f;
-    uint64_t m_lastLoggedFrame = UINT64_MAX;
 };

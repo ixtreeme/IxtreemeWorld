@@ -94,8 +94,16 @@ target_link_libraries(IXEngineRender
         meshoptimizer::meshoptimizer
         RmlUi::RmlUi
         IXEngineIXRHI
+        IXEngineEditorGraphics
         ${CLIENT_OZZ_TARGETS}
         ${CLIENT_FLECS_TARGET}
+)
+
+# PRIVATE backend access for still-native code in transition (TerrainRenderer
+# refraction seam). Does not propagate: migrated renderers see IXRHI only.
+target_link_libraries(IXEngineRender
+    PRIVATE
+        IXEngineVulkan
 )
 
 if(WIN32)

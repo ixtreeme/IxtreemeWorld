@@ -11,7 +11,6 @@
 #include "MaterialAssetManager.h"
 #include "ProjectManager.h"
 #include "SceneManager.h"
-#include "VulkanDevice.h"
 #include "math/IXMath.h"
 #include "platform/trash.h"
 #include "tools/tree/TreeTexturePalette.h"
@@ -19,14 +18,10 @@
 #if defined(IXTREEME_WITH_EDITOR) && defined(_WIN32)
 #include "IconsFontAwesome6.h"
 #include "UIHelpers.h"
-#define VK_USE_PLATFORM_WIN32_KHR
 #include <imgui.h>
 #include <imgui_internal.h>
 #include <ImGuizmo.h>
-#include <imgui_impl_vulkan.h>
-#include <imgui_impl_win32.h>
 #include <stb_image.h>
-#include <vulkan/vulkan.h>
 
 #include <algorithm>
 #include <array>
@@ -46,11 +41,8 @@
 
 #include <commdlg.h>
 
-extern IMGUI_IMPL_API LRESULT ImGui_ImplWin32_WndProcHandler(HWND hWnd, UINT msg, WPARAM wParam, LPARAM lParam);
-
 namespace
 {
-constexpr uint32_t kMinImageCount = 2;
 constexpr const char* kLayoutFile = "editor_layout.ini";
 constexpr const char* kAssetPayloadType = "ASSET_ID";
 constexpr const char* kAssetFolderPayloadType = "ASSET_FOLDER_PATH";
@@ -204,37 +196,6 @@ const std::array<InspectorComponentDefinition, 20>& InspectorComponentRegistry()
     return registry;
 }
 
-void CheckVkResult(VkResult result)
-{
-    if (result == VK_SUCCESS)
-        return;
-    TraceError("[EDITOR-IMGUI] Vulkan backend call failed: %d", static_cast<int>(result));
-}
-
-int CreateWin32VkSurface(ImGuiViewport* viewport, ImU64 vkInstance, const void* vkAllocator, ImU64* outVkSurface)
-{
-    VkWin32SurfaceCreateInfoKHR create{};
-    create.sType = VK_STRUCTURE_TYPE_WIN32_SURFACE_CREATE_INFO_KHR;
-    create.hwnd = static_cast<HWND>(viewport->PlatformHandleRaw);
-    create.hinstance = GetModuleHandle(nullptr);
-    return static_cast<int>(vkCreateWin32SurfaceKHR(
-        reinterpret_cast<VkInstance>(vkInstance),
-        &create,
-        static_cast<const VkAllocationCallbacks*>(vkAllocator),
-        reinterpret_cast<VkSurfaceKHR*>(outVkSurface)));
-}
-
-uint32_t CountDrawCommands(const ImDrawData* drawData)
-{
-    if (!drawData)
-        return 0;
-
-    uint32_t count = 0;
-    for (int listIndex = 0; listIndex < drawData->CmdListsCount; ++listIndex)
-        count += static_cast<uint32_t>(drawData->CmdLists[listIndex]->CmdBuffer.Size);
-    return count;
-}
-
 std::string ToLowerAscii(std::string value)
 {
     return ixtreeme::common::ToLowerAscii(std::move(value));
@@ -361,44 +322,6 @@ bool IsSubpathOrSelf(const std::string& maybeChild, const std::string& maybePare
     if (parent.empty())
         return true;
     return child == parent || child.rfind(parent + "/", 0) == 0;
-}
-
-bool CheckEditorVk(VkResult result, const char* call)
-{
-    if (result == VK_SUCCESS)
-        return true;
-    TraceError("[EDITOR-IMGUI] Vulkan thumbnail call failed: %s result=%d", call, static_cast<int>(result));
-    return false;
-}
-
-void TransitionPreviewImage(VkCommandBuffer cmd, VkImage image, VkImageLayout oldLayout, VkImageLayout newLayout)
-{
-    VkImageMemoryBarrier barrier{};
-    barrier.sType = VK_STRUCTURE_TYPE_IMAGE_MEMORY_BARRIER;
-    barrier.oldLayout = oldLayout;
-    barrier.newLayout = newLayout;
-    barrier.srcQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;
-    barrier.dstQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;
-    barrier.image = image;
-    barrier.subresourceRange.aspectMask = VK_IMAGE_ASPECT_COLOR_BIT;
-    barrier.subresourceRange.levelCount = 1;
-    barrier.subresourceRange.layerCount = 1;
-
-    VkPipelineStageFlags srcStage = VK_PIPELINE_STAGE_TOP_OF_PIPE_BIT;
-    VkPipelineStageFlags dstStage = VK_PIPELINE_STAGE_TRANSFER_BIT;
-    if (newLayout == VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL)
-    {
-        barrier.srcAccessMask = VK_ACCESS_TRANSFER_WRITE_BIT;
-        barrier.dstAccessMask = VK_ACCESS_SHADER_READ_BIT;
-        srcStage = VK_PIPELINE_STAGE_TRANSFER_BIT;
-        dstStage = VK_PIPELINE_STAGE_FRAGMENT_SHADER_BIT;
-    }
-    else
-    {
-        barrier.dstAccessMask = VK_ACCESS_TRANSFER_WRITE_BIT;
-    }
-
-    vkCmdPipelineBarrier(cmd, srcStage, dstStage, 0, 0, nullptr, 0, nullptr, 1, &barrier);
 }
 
 ImVec4 AssetCategoryColor(AssetLibrary::Category category)
@@ -650,24 +573,29 @@ void ApplyEditorStyle()
 }
 }
 
+void EditorImGui::SetTextureProvider(ixeditor::graphics::IEditorTextureProvider* provider)
+{
+    m_textureProvider = provider;
+}
+
 EditorImGui::~EditorImGui()
 {
     UnloadGameModules();  // close any loaded game-module DLLs (purges their registry entries first)
     Destroy();
 }
 
-bool EditorImGui::Create(VulkanDevice& device, HWND hwnd)
+bool EditorImGui::Create()
 {
     if (m_initialized)
         return true;
 
-    m_device = device.GetDevice();
-    m_physicalDevice = device.GetPhysicalDevice();
-    m_graphicsQueue = device.GetGraphicsQueue();
-    m_graphicsQueueFamily = device.GetGraphicsQueueFamily();
-
-    IMGUI_CHECKVERSION();
-    ImGui::CreateContext();
+    // Generic UI init only (context/IO/fonts/style). The backend adapter owns
+    // the ImGui context lifecycle and the Vulkan/Win32 backend init.
+    if (ImGui::GetCurrentContext() == nullptr)
+    {
+        TraceError("[EDITOR-IMGUI] No ImGui context: create the backend adapter first");
+        return false;
+    }
 
     ImGuiIO& io = ImGui::GetIO();
     io.ConfigFlags |= ImGuiConfigFlags_NavEnableKeyboard;
@@ -679,86 +607,12 @@ bool EditorImGui::Create(VulkanDevice& device, HWND hwnd)
     LoadEditorFonts();
     ApplyEditorStyle();
 
-    if (!CreateDescriptorPool(device))
-    {
-        ImGui::DestroyContext();
-        return false;
-    }
-
-    if (!ImGui_ImplWin32_Init(hwnd))
-    {
-        TraceError("[EDITOR-IMGUI] Win32 backend initialization failed");
-        Destroy();
-        return false;
-    }
-
-    ImGui::GetPlatformIO().Platform_CreateVkSurface = CreateWin32VkSurface;
-
-    if (!InitVulkanBackend(device))
-    {
-        Destroy();
-        return false;
-    }
-
     m_initialized = true;
-    Tracenf("[EDITOR-IMGUI] Initialized with imgui version %s, vulkan backend ready", IMGUI_VERSION);
+    Tracenf("[EDITOR-IMGUI] Initialized with imgui version %s", IMGUI_VERSION);
     Tracen("[EDITOR-IMGUI] Docking enabled, multi-viewport enabled");
     Tracenf("[EDITOR-IMGUI] Layout file: %s", kLayoutFile);
     if (!m_applyDefaultDockLayout)
         Tracen("[EDITOR-LAYOUT] Loaded layout from editor_layout.ini");
-    return true;
-}
-
-bool EditorImGui::CreateDescriptorPool(VulkanDevice& device)
-{
-    const VkDescriptorPoolSize poolSizes[] = {
-        { VK_DESCRIPTOR_TYPE_SAMPLED_IMAGE, 1000 },
-        { VK_DESCRIPTOR_TYPE_SAMPLER, 1000 },
-        { VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER, 1000 },
-    };
-
-    VkDescriptorPoolCreateInfo pool{};
-    pool.sType = VK_STRUCTURE_TYPE_DESCRIPTOR_POOL_CREATE_INFO;
-    pool.flags = VK_DESCRIPTOR_POOL_CREATE_FREE_DESCRIPTOR_SET_BIT;
-    pool.maxSets = 3000;
-    pool.poolSizeCount = static_cast<uint32_t>(sizeof(poolSizes) / sizeof(poolSizes[0]));
-    pool.pPoolSizes = poolSizes;
-
-    const VkResult result = vkCreateDescriptorPool(device.GetDevice(), &pool, nullptr, &m_descriptorPool);
-    if (result != VK_SUCCESS)
-    {
-        TraceError("[EDITOR-IMGUI] Failed to create descriptor pool: %d", static_cast<int>(result));
-        m_descriptorPool = VK_NULL_HANDLE;
-        return false;
-    }
-    return true;
-}
-
-bool EditorImGui::InitVulkanBackend(VulkanDevice& device)
-{
-    ImGui_ImplVulkan_InitInfo init{};
-    init.ApiVersion = VK_API_VERSION_1_2;
-    init.Instance = device.GetInstance();
-    init.PhysicalDevice = device.GetPhysicalDevice();
-    init.Device = device.GetDevice();
-    init.QueueFamily = device.GetGraphicsQueueFamily();
-    init.Queue = device.GetGraphicsQueue();
-    init.DescriptorPool = m_descriptorPool;
-    init.MinImageCount = kMinImageCount;
-    init.ImageCount = device.GetSwapchainImageCount();
-    init.PipelineInfoMain.RenderPass = device.GetRenderPass();
-    init.PipelineInfoMain.Subpass = 0;
-    init.PipelineInfoMain.MSAASamples = VK_SAMPLE_COUNT_1_BIT;
-    init.CheckVkResultFn = CheckVkResult;
-
-    if (!ImGui_ImplVulkan_Init(&init))
-    {
-        TraceError("[EDITOR-IMGUI] Vulkan backend initialization failed");
-        m_vulkanBackendReady = false;
-        return false;
-    }
-
-    m_vulkanBackendReady = true;
     return true;
 }
 
@@ -975,94 +829,6 @@ void EditorImGui::InitializeProjectAssetLibrary(const std::filesystem::path& pro
     tree_tool::TreeTexturePalette::Instance().EnsureLoaded(InternalAssetRootFor(m_engineRoot));
     SyncWaterMaterialSnapshot();
     Tracenf("[PROJECT] asset browser root=%s", m_assetLibrary->LibraryRoot().generic_string().c_str());
-}
-
-void EditorImGui::ReleaseSceneViewTextureDescriptor()
-{
-    if (m_sceneViewDescriptor && m_vulkanBackendReady)
-        ImGui_ImplVulkan_RemoveTexture(m_sceneViewDescriptor);
-    m_sceneViewDescriptor = VK_NULL_HANDLE;
-    m_sceneViewDescriptorSampler = VK_NULL_HANDLE;
-    m_sceneViewDescriptorImageView = VK_NULL_HANDLE;
-    m_sceneViewDescriptorImageLayout = VK_IMAGE_LAYOUT_UNDEFINED;
-}
-
-void EditorImGui::SetSceneViewTexture(VkSampler sampler,
-                                      VkImageView imageView,
-                                      VkImageLayout layout,
-                                      VkExtent2D extent)
-{
-    m_sceneViewSampler = sampler;
-    m_sceneViewImageView = imageView;
-    m_sceneViewImageLayout = layout;
-    m_sceneViewExtent = extent;
-
-    const bool descriptorMatches =
-        m_sceneViewDescriptor &&
-        m_sceneViewDescriptorSampler == sampler &&
-        m_sceneViewDescriptorImageView == imageView &&
-        m_sceneViewDescriptorImageLayout == layout;
-    if (descriptorMatches)
-        return;
-
-    ReleaseSceneViewTextureDescriptor();
-    if (!m_vulkanBackendReady || !sampler || !imageView || layout == VK_IMAGE_LAYOUT_UNDEFINED)
-        return;
-
-    m_sceneViewDescriptor = ImGui_ImplVulkan_AddTexture(sampler, imageView, layout);
-    if (m_sceneViewDescriptor)
-    {
-        m_sceneViewDescriptorSampler = sampler;
-        m_sceneViewDescriptorImageView = imageView;
-        m_sceneViewDescriptorImageLayout = layout;
-        Tracenf("[EDITOR-SCENE-VIEW] bound offscreen texture extent=%ux%u",
-            extent.width,
-            extent.height);
-    }
-}
-
-void EditorImGui::ReleaseGameViewTextureDescriptor()
-{
-    if (m_gameViewDescriptor && m_vulkanBackendReady)
-        ImGui_ImplVulkan_RemoveTexture(m_gameViewDescriptor);
-    m_gameViewDescriptor = VK_NULL_HANDLE;
-    m_gameViewDescriptorSampler = VK_NULL_HANDLE;
-    m_gameViewDescriptorImageView = VK_NULL_HANDLE;
-    m_gameViewDescriptorImageLayout = VK_IMAGE_LAYOUT_UNDEFINED;
-}
-
-void EditorImGui::SetGameViewTexture(VkSampler sampler,
-                                     VkImageView imageView,
-                                     VkImageLayout layout,
-                                     VkExtent2D extent)
-{
-    m_gameViewSampler = sampler;
-    m_gameViewImageView = imageView;
-    m_gameViewImageLayout = layout;
-    m_gameViewExtent = extent;
-
-    const bool descriptorMatches =
-        m_gameViewDescriptor &&
-        m_gameViewDescriptorSampler == sampler &&
-        m_gameViewDescriptorImageView == imageView &&
-        m_gameViewDescriptorImageLayout == layout;
-    if (descriptorMatches)
-        return;
-
-    ReleaseGameViewTextureDescriptor();
-    if (!m_vulkanBackendReady || !sampler || !imageView || layout == VK_IMAGE_LAYOUT_UNDEFINED)
-        return;
-
-    m_gameViewDescriptor = ImGui_ImplVulkan_AddTexture(sampler, imageView, layout);
-    if (m_gameViewDescriptor)
-    {
-        m_gameViewDescriptorSampler = sampler;
-        m_gameViewDescriptorImageView = imageView;
-        m_gameViewDescriptorImageLayout = layout;
-        Tracenf("[EDITOR-GAME-VIEW] bound offscreen texture extent=%ux%u",
-            extent.width,
-            extent.height);
-    }
 }
 
 void EditorImGui::SetSceneViewSelectionOutline(std::vector<std::array<float, 4>> segments)
@@ -1790,25 +1556,19 @@ std::vector<AssetLibrary::Entry> EditorImGui::QueryFilesystemAssetsInFolder(cons
 
 void EditorImGui::DestroyAssetPreviewTexture(AssetPreviewTexture& texture)
 {
-    if (texture.descriptor)
-        ImGui_ImplVulkan_RemoveTexture(texture.descriptor);
-    if (texture.sampler)
-        vkDestroySampler(m_device, texture.sampler, nullptr);
-    if (texture.view)
-        vkDestroyImageView(m_device, texture.view, nullptr);
-    if (texture.image)
-        vkDestroyImage(m_device, texture.image, nullptr);
-    if (texture.memory)
-        vkFreeMemory(m_device, texture.memory, nullptr);
+    if (texture.handle.IsValid() && m_textureProvider)
+        m_textureProvider->ReleasePreviewTexture(texture.handle);
     texture = {};
 }
 
 void EditorImGui::DestroyAssetPreviewTextures()
 {
-    if (m_device)
-        vkDeviceWaitIdle(m_device);
+    // Backend waits idle internally (parity: previews were destroyed under
+    // idle before); UI registrations are released with the textures.
+    if (m_textureProvider)
+        m_textureProvider->ReleaseAllPreviewTextures();
     for (auto& preview : m_assetPreviewTextures)
-        DestroyAssetPreviewTexture(preview.second);
+        preview.second = {};
     m_assetPreviewTextures.clear();
 }
 
@@ -1864,7 +1624,8 @@ std::optional<std::filesystem::path> EditorImGui::AssetPreviewPathFor(const Asse
 
 bool EditorImGui::LoadAssetPreviewTexture(const std::filesystem::path& path, AssetPreviewTexture& outTexture)
 {
-    if (!m_device || !m_physicalDevice || !m_graphicsQueue || m_graphicsQueueFamily == UINT32_MAX)
+    outTexture = {};
+    if (!m_textureProvider || !m_textureProvider->IsReady())
         return false;
 
     int width = 0;
@@ -1879,214 +1640,20 @@ bool EditorImGui::LoadAssetPreviewTexture(const std::filesystem::path& path, Ass
         return false;
     }
 
-    const VkDeviceSize byteSize = static_cast<VkDeviceSize>(width) * static_cast<VkDeviceSize>(height) * 4u;
-    VkBuffer stagingBuffer = VK_NULL_HANDLE;
-    VkDeviceMemory stagingMemory = VK_NULL_HANDLE;
-    VkCommandPool uploadPool = VK_NULL_HANDLE;
-    VkCommandBuffer cmd = VK_NULL_HANDLE;
-
-    auto findMemoryType = [this](uint32_t typeFilter, VkMemoryPropertyFlags properties) -> std::optional<uint32_t> {
-        VkPhysicalDeviceMemoryProperties memory{};
-        vkGetPhysicalDeviceMemoryProperties(m_physicalDevice, &memory);
-        for (uint32_t i = 0; i < memory.memoryTypeCount; ++i)
-        {
-            if ((typeFilter & (1u << i)) && (memory.memoryTypes[i].propertyFlags & properties) == properties)
-                return i;
-        }
-        return std::nullopt;
-    };
-
-    auto cleanupUpload = [&]() {
-        if (uploadPool)
-            vkDestroyCommandPool(m_device, uploadPool, nullptr);
-        if (stagingBuffer)
-            vkDestroyBuffer(m_device, stagingBuffer, nullptr);
-        if (stagingMemory)
-            vkFreeMemory(m_device, stagingMemory, nullptr);
-        stbi_image_free(decoded);
-    };
-
-    VkBufferCreateInfo buffer{};
-    buffer.sType = VK_STRUCTURE_TYPE_BUFFER_CREATE_INFO;
-    buffer.size = byteSize;
-    buffer.usage = VK_BUFFER_USAGE_TRANSFER_SRC_BIT;
-    buffer.sharingMode = VK_SHARING_MODE_EXCLUSIVE;
-    if (!CheckEditorVk(vkCreateBuffer(m_device, &buffer, nullptr, &stagingBuffer), "vkCreateBuffer"))
-    {
-        cleanupUpload();
+    // Upload + UI registration through the backend provider (was: inline
+    // staging upload + inline view/sampler/AddTexture here).
+    outTexture.handle = m_textureProvider->UploadPreviewTexture(decoded,
+        static_cast<std::uint32_t>(width),
+        static_cast<std::uint32_t>(height),
+        path.filename().generic_string().c_str());
+    stbi_image_free(decoded);
+    if (!outTexture.handle.IsValid())
         return false;
-    }
 
-    VkMemoryRequirements stagingReq{};
-    vkGetBufferMemoryRequirements(m_device, stagingBuffer, &stagingReq);
-    const auto stagingMemoryType = findMemoryType(stagingReq.memoryTypeBits,
-        VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT | VK_MEMORY_PROPERTY_HOST_COHERENT_BIT);
-    if (!stagingMemoryType)
-    {
-        cleanupUpload();
-        return false;
-    }
-
-    VkMemoryAllocateInfo stagingAlloc{};
-    stagingAlloc.sType = VK_STRUCTURE_TYPE_MEMORY_ALLOCATE_INFO;
-    stagingAlloc.allocationSize = stagingReq.size;
-    stagingAlloc.memoryTypeIndex = *stagingMemoryType;
-    if (!CheckEditorVk(vkAllocateMemory(m_device, &stagingAlloc, nullptr, &stagingMemory), "vkAllocateMemory(staging)") ||
-        !CheckEditorVk(vkBindBufferMemory(m_device, stagingBuffer, stagingMemory, 0), "vkBindBufferMemory"))
-    {
-        cleanupUpload();
-        return false;
-    }
-
-    void* mapped = nullptr;
-    if (!CheckEditorVk(vkMapMemory(m_device, stagingMemory, 0, byteSize, 0, &mapped), "vkMapMemory"))
-    {
-        cleanupUpload();
-        return false;
-    }
-    std::memcpy(mapped, decoded, static_cast<size_t>(byteSize));
-    vkUnmapMemory(m_device, stagingMemory);
-
-    VkImageCreateInfo image{};
-    image.sType = VK_STRUCTURE_TYPE_IMAGE_CREATE_INFO;
-    image.imageType = VK_IMAGE_TYPE_2D;
-    image.extent = {static_cast<uint32_t>(width), static_cast<uint32_t>(height), 1};
-    image.mipLevels = 1;
-    image.arrayLayers = 1;
-    image.format = VK_FORMAT_R8G8B8A8_UNORM;
-    image.tiling = VK_IMAGE_TILING_OPTIMAL;
-    image.initialLayout = VK_IMAGE_LAYOUT_UNDEFINED;
-    image.usage = VK_IMAGE_USAGE_TRANSFER_DST_BIT | VK_IMAGE_USAGE_SAMPLED_BIT;
-    image.samples = VK_SAMPLE_COUNT_1_BIT;
-    image.sharingMode = VK_SHARING_MODE_EXCLUSIVE;
-    if (!CheckEditorVk(vkCreateImage(m_device, &image, nullptr, &outTexture.image), "vkCreateImage"))
-    {
-        cleanupUpload();
-        DestroyAssetPreviewTexture(outTexture);
-        return false;
-    }
-
-    VkMemoryRequirements imageReq{};
-    vkGetImageMemoryRequirements(m_device, outTexture.image, &imageReq);
-    const auto imageMemoryType = findMemoryType(imageReq.memoryTypeBits, VK_MEMORY_PROPERTY_DEVICE_LOCAL_BIT);
-    if (!imageMemoryType)
-    {
-        cleanupUpload();
-        DestroyAssetPreviewTexture(outTexture);
-        return false;
-    }
-
-    VkMemoryAllocateInfo imageAlloc{};
-    imageAlloc.sType = VK_STRUCTURE_TYPE_MEMORY_ALLOCATE_INFO;
-    imageAlloc.allocationSize = imageReq.size;
-    imageAlloc.memoryTypeIndex = *imageMemoryType;
-    if (!CheckEditorVk(vkAllocateMemory(m_device, &imageAlloc, nullptr, &outTexture.memory), "vkAllocateMemory(image)") ||
-        !CheckEditorVk(vkBindImageMemory(m_device, outTexture.image, outTexture.memory, 0), "vkBindImageMemory"))
-    {
-        cleanupUpload();
-        DestroyAssetPreviewTexture(outTexture);
-        return false;
-    }
-
-    VkCommandPoolCreateInfo poolInfo{};
-    poolInfo.sType = VK_STRUCTURE_TYPE_COMMAND_POOL_CREATE_INFO;
-    poolInfo.flags = VK_COMMAND_POOL_CREATE_TRANSIENT_BIT;
-    poolInfo.queueFamilyIndex = m_graphicsQueueFamily;
-    if (!CheckEditorVk(vkCreateCommandPool(m_device, &poolInfo, nullptr, &uploadPool), "vkCreateCommandPool"))
-    {
-        cleanupUpload();
-        DestroyAssetPreviewTexture(outTexture);
-        return false;
-    }
-
-    VkCommandBufferAllocateInfo cmdAlloc{};
-    cmdAlloc.sType = VK_STRUCTURE_TYPE_COMMAND_BUFFER_ALLOCATE_INFO;
-    cmdAlloc.commandPool = uploadPool;
-    cmdAlloc.level = VK_COMMAND_BUFFER_LEVEL_PRIMARY;
-    cmdAlloc.commandBufferCount = 1;
-    if (!CheckEditorVk(vkAllocateCommandBuffers(m_device, &cmdAlloc, &cmd), "vkAllocateCommandBuffers"))
-    {
-        cleanupUpload();
-        DestroyAssetPreviewTexture(outTexture);
-        return false;
-    }
-
-    VkCommandBufferBeginInfo begin{};
-    begin.sType = VK_STRUCTURE_TYPE_COMMAND_BUFFER_BEGIN_INFO;
-    begin.flags = VK_COMMAND_BUFFER_USAGE_ONE_TIME_SUBMIT_BIT;
-    if (!CheckEditorVk(vkBeginCommandBuffer(cmd, &begin), "vkBeginCommandBuffer"))
-    {
-        cleanupUpload();
-        DestroyAssetPreviewTexture(outTexture);
-        return false;
-    }
-
-    TransitionPreviewImage(cmd, outTexture.image, VK_IMAGE_LAYOUT_UNDEFINED, VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL);
-    VkBufferImageCopy copy{};
-    copy.imageSubresource.aspectMask = VK_IMAGE_ASPECT_COLOR_BIT;
-    copy.imageSubresource.mipLevel = 0;
-    copy.imageSubresource.baseArrayLayer = 0;
-    copy.imageSubresource.layerCount = 1;
-    copy.imageExtent = {static_cast<uint32_t>(width), static_cast<uint32_t>(height), 1};
-    vkCmdCopyBufferToImage(cmd, stagingBuffer, outTexture.image, VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL, 1, &copy);
-    TransitionPreviewImage(cmd, outTexture.image, VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL, VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL);
-
-    if (!CheckEditorVk(vkEndCommandBuffer(cmd), "vkEndCommandBuffer"))
-    {
-        cleanupUpload();
-        DestroyAssetPreviewTexture(outTexture);
-        return false;
-    }
-
-    VkSubmitInfo submit{};
-    submit.sType = VK_STRUCTURE_TYPE_SUBMIT_INFO;
-    submit.commandBufferCount = 1;
-    submit.pCommandBuffers = &cmd;
-    if (!CheckEditorVk(vkQueueSubmit(m_graphicsQueue, 1, &submit, VK_NULL_HANDLE), "vkQueueSubmit") ||
-        !CheckEditorVk(vkQueueWaitIdle(m_graphicsQueue), "vkQueueWaitIdle"))
-    {
-        cleanupUpload();
-        DestroyAssetPreviewTexture(outTexture);
-        return false;
-    }
-
-    VkImageViewCreateInfo view{};
-    view.sType = VK_STRUCTURE_TYPE_IMAGE_VIEW_CREATE_INFO;
-    view.image = outTexture.image;
-    view.viewType = VK_IMAGE_VIEW_TYPE_2D;
-    view.format = VK_FORMAT_R8G8B8A8_UNORM;
-    view.subresourceRange.aspectMask = VK_IMAGE_ASPECT_COLOR_BIT;
-    view.subresourceRange.levelCount = 1;
-    view.subresourceRange.layerCount = 1;
-    if (!CheckEditorVk(vkCreateImageView(m_device, &view, nullptr, &outTexture.view), "vkCreateImageView"))
-    {
-        cleanupUpload();
-        DestroyAssetPreviewTexture(outTexture);
-        return false;
-    }
-
-    VkSamplerCreateInfo sampler{};
-    sampler.sType = VK_STRUCTURE_TYPE_SAMPLER_CREATE_INFO;
-    sampler.magFilter = VK_FILTER_LINEAR;
-    sampler.minFilter = VK_FILTER_LINEAR;
-    sampler.mipmapMode = VK_SAMPLER_MIPMAP_MODE_LINEAR;
-    sampler.addressModeU = VK_SAMPLER_ADDRESS_MODE_CLAMP_TO_EDGE;
-    sampler.addressModeV = VK_SAMPLER_ADDRESS_MODE_CLAMP_TO_EDGE;
-    sampler.addressModeW = VK_SAMPLER_ADDRESS_MODE_CLAMP_TO_EDGE;
-    sampler.maxLod = 1.0f;
-    if (!CheckEditorVk(vkCreateSampler(m_device, &sampler, nullptr, &outTexture.sampler), "vkCreateSampler"))
-    {
-        cleanupUpload();
-        DestroyAssetPreviewTexture(outTexture);
-        return false;
-    }
-
-    outTexture.descriptor = ImGui_ImplVulkan_AddTexture(outTexture.sampler, outTexture.view, VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL);
     outTexture.width = static_cast<uint32_t>(width);
     outTexture.height = static_cast<uint32_t>(height);
-    cleanupUpload();
     Tracenf("[EDITOR-ASSET-PREVIEW] Loaded thumbnail: %s %dx%d", path.string().c_str(), width, height);
-    return outTexture.descriptor != VK_NULL_HANDLE;
+    return true;
 }
 
 EditorImGui::AssetPreviewTexture* EditorImGui::GetAssetPreviewTexture(const AssetLibrary::Entry& entry)
@@ -2102,7 +1669,12 @@ EditorImGui::AssetPreviewTexture* EditorImGui::GetAssetPreviewTexture(const Asse
         if (!LoadAssetPreviewTexture(*path, it->second))
             it->second.failed = true;
     }
-    return it->second.failed || !it->second.descriptor ? nullptr : &it->second;
+    if (it->second.failed || !it->second.handle.IsValid())
+        return nullptr;
+    if (m_textureProvider == nullptr ||
+        m_textureProvider->GetPreviewTexture(it->second.handle) == nullptr)
+        return nullptr;
+    return &it->second;
 }
 
 void EditorImGui::CreateAssetFolder()
@@ -3084,18 +2656,10 @@ void EditorImGui::AssignAssetToSelectedMeshRenderer(const std::string& assetId)
         m_meshRendererState.meshAssetPath.c_str());
 }
 
-bool EditorImGui::HandleWin32Message(HWND hwnd, UINT message, WPARAM wParam, LPARAM lParam, LRESULT& result)
-{
-    if (!m_initialized)
-        return false;
-
-    result = ImGui_ImplWin32_WndProcHandler(hwnd, message, wParam, lParam);
-    return result != 0;
-}
-
 void EditorImGui::BeginFrame(bool editorModeActive)
 {
-    if (!m_initialized || !m_vulkanBackendReady || m_frameActive)
+    const bool backendReady = m_textureProvider && m_textureProvider->IsReady();
+    if (!m_initialized || !backendReady || m_frameActive)
     {
         static uint32_t beginSkippedLogs = 0;
         if (!QuietLogsForLodDiag() && beginSkippedLogs < 3)
@@ -3103,7 +2667,7 @@ void EditorImGui::BeginFrame(bool editorModeActive)
             ++beginSkippedLogs;
             TraceDiagf("[FRAME] imgui_begin called = no, initialized=%d backend_ready=%d frame_active=%d editor_mode=%d",
                 m_initialized ? 1 : 0,
-                m_vulkanBackendReady ? 1 : 0,
+                backendReady ? 1 : 0,
                 m_frameActive ? 1 : 0,
                 editorModeActive ? 1 : 0);
         }
@@ -3111,8 +2675,8 @@ void EditorImGui::BeginFrame(bool editorModeActive)
     }
 
     m_editorModeActive = editorModeActive;
-    ImGui_ImplVulkan_NewFrame();
-    ImGui_ImplWin32_NewFrame();
+    if (m_textureProvider)
+        m_textureProvider->BeginBackendFrame();
     ImGui::NewFrame();
     m_frameActive = true;
     static uint32_t beginLogs = 0;
@@ -3132,17 +2696,20 @@ void EditorImGui::BeginFrame(bool editorModeActive)
 #include "editor_panels/EditorImGuiAssetBrowserPanels.inl"
 #include "editor_panels/EditorImGuiMaterialPanels.inl"
 #include "editor_panels/EditorImGuiPanelDispatcher.inl"
-void EditorImGui::Render(VulkanDevice& device)
+void EditorImGui::RenderPanels()
 {
-    if (!m_initialized || !m_vulkanBackendReady || !m_frameActive)
+    const bool backendReady = m_textureProvider && m_textureProvider->IsReady();
+    const bool backendFrameOpen = m_textureProvider && m_textureProvider->IsBackendFrameActive();
+    if (!m_initialized || !backendReady || !m_frameActive || !backendFrameOpen)
     {
+        m_frameActive = false;
         static uint32_t renderSkippedLogs = 0;
         if (!QuietLogsForLodDiag() && renderSkippedLogs < 3)
         {
             ++renderSkippedLogs;
             TraceDiagf("[FRAME] imgui_render called = no, initialized=%d backend_ready=%d frame_active=%d editor_mode=%d",
                 m_initialized ? 1 : 0,
-                m_vulkanBackendReady ? 1 : 0,
+                backendReady ? 1 : 0,
                 m_frameActive ? 1 : 0,
                 m_editorModeActive ? 1 : 0);
         }
@@ -3153,67 +2720,7 @@ void EditorImGui::Render(VulkanDevice& device)
     RenderDemoPanels();
     ImGui::Render();
 
-    ImDrawData* drawData = ImGui::GetDrawData();
-    const uint64_t frameNumber = device.GetFrameNumber();
-    if (!QuietLogsForLodDiag() && (frameNumber < 3 || (frameNumber % 60u) == 0u))
-    {
-        TraceDiagf("[FRAME] imgui_render called = yes, editor_mode=%d draw_lists=%d draw_cmds=%u",
-            m_editorModeActive ? 1 : 0,
-            drawData ? drawData->CmdListsCount : 0,
-            CountDrawCommands(drawData));
-    }
-    ImGui_ImplVulkan_RenderDrawData(drawData, device.GetCommandBuffer());
-
-    static uint32_t lastLoggedDrawCommands = std::numeric_limits<uint32_t>::max();
-    const uint32_t drawCommands = CountDrawCommands(drawData);
-    const bool drawCommandsChanged = lastLoggedDrawCommands != drawCommands;
-    if (device.GetFrameNumber() != m_lastLoggedFrame &&
-        device.GetFrameNumber() % 300 == 0 &&
-        (!QuietLogsForLodDiag() || drawCommandsChanged))
-    {
-        m_lastLoggedFrame = device.GetFrameNumber();
-        TraceDiagf("[EDITOR-IMGUI] Frame %llu rendered with %u draw calls",
-            static_cast<unsigned long long>(device.GetFrameNumber()),
-            drawCommands);
-        lastLoggedDrawCommands = drawCommands;
-    }
-
-    ImGuiIO& io = ImGui::GetIO();
-    if (io.ConfigFlags & ImGuiConfigFlags_ViewportsEnable)
-    {
-        ImGui::UpdatePlatformWindows();
-        ImGui::RenderPlatformWindowsDefault();
-    }
-
     m_frameActive = false;
-}
-
-void EditorImGui::OnRenderPassChanged(VulkanDevice& device)
-{
-    if (!m_initialized || !m_vulkanBackendReady)
-        return;
-
-    if (m_frameActive)
-    {
-        ImGui::EndFrame();
-        ImGuiIO& io = ImGui::GetIO();
-        if (io.ConfigFlags & ImGuiConfigFlags_ViewportsEnable)
-        {
-            ImGui::UpdatePlatformWindows();
-            ImGui::RenderPlatformWindowsDefault();
-        }
-        m_frameActive = false;
-    }
-
-    vkDeviceWaitIdle(device.GetDevice());
-
-    ImGui_ImplVulkan_PipelineInfo pipeline{};
-    pipeline.RenderPass = device.GetRenderPass();
-    pipeline.Subpass = 0;
-    pipeline.MSAASamples = VK_SAMPLE_COUNT_1_BIT;
-    ImGui_ImplVulkan_CreateMainPipeline(&pipeline);
-
-    Tracen("[EDITOR-IMGUI] Vulkan main pipeline recreated for resized render pass");
 }
 
 bool EditorImGui::WantsInputCapture(const InputEvent& event) const
@@ -3320,72 +2827,31 @@ void EditorImGui::SetSceneViewKeyboardFocus(bool focused)
 
 void EditorImGui::Destroy()
 {
+    // Generic teardown only: preview UI registrations release through the
+    // provider (backend stays alive for pool/descriptor teardown, which the
+    // frame owner performs through the backend adapter afterwards).
     DestroyAssetPreviewTextures();
-    ReleaseSceneViewTextureDescriptor();
-    ReleaseGameViewTextureDescriptor();
-
-    if (m_vulkanBackendReady)
-    {
-        ImGui_ImplVulkan_Shutdown();
-        m_vulkanBackendReady = false;
-    }
-
-    if (m_initialized)
-    {
-        ImGui_ImplWin32_Shutdown();
-        ImGui::DestroyContext();
-        m_initialized = false;
-    }
-
-    if (m_descriptorPool && m_device)
-    {
-        vkDestroyDescriptorPool(m_device, m_descriptorPool, nullptr);
-        m_descriptorPool = VK_NULL_HANDLE;
-    }
-
-    m_device = VK_NULL_HANDLE;
-    m_physicalDevice = VK_NULL_HANDLE;
-    m_graphicsQueue = VK_NULL_HANDLE;
-    m_graphicsQueueFamily = UINT32_MAX;
+    m_textureProvider = nullptr;
+    m_initialized = false;
     m_frameActive = false;
 }
 #else
 EditorImGui::~EditorImGui() = default;
 
-#if defined(_WIN32)
-bool EditorImGui::Create(VulkanDevice&, HWND)
+bool EditorImGui::Create()
 {
     return true;
 }
 
-bool EditorImGui::HandleWin32Message(HWND, UINT, WPARAM, LPARAM, LRESULT&)
+void EditorImGui::SetTextureProvider(ixeditor::graphics::IEditorTextureProvider*)
 {
-    return false;
 }
-#else
-bool EditorImGui::Create(VulkanDevice&, void*)
-{
-    return true;
-}
-#endif
 
 void EditorImGui::BeginFrame(bool)
 {
 }
 
-void EditorImGui::Render(VulkanDevice&)
-{
-}
-
-void EditorImGui::OnRenderPassChanged(VulkanDevice&)
-{
-}
-
-void EditorImGui::SetSceneViewTexture(VkSampler, VkImageView, VkImageLayout, VkExtent2D)
-{
-}
-
-void EditorImGui::SetGameViewTexture(VkSampler, VkImageView, VkImageLayout, VkExtent2D)
+void EditorImGui::RenderPanels()
 {
 }
 

@@ -4,6 +4,8 @@
 #include "WorldCamera.h"
 #include "MapEditorTypes.h"
 
+#include "IXRHIRenderPass.h"
+
 #include <ozz/base/maths/soa_transform.h>
 #include <ozz/base/span.h>
 
@@ -46,7 +48,9 @@ public:
     bool Create(VulkanDevice& device, client::asset::IAssetReader& assets,
         const std::string& modelPath);
     bool RecreatePipeline(VulkanDevice& device);
-    void SetMainRenderPass(VkRenderPass renderPass);
+    // Borrowed IXRHI pass token (Phase 3B): unwrapped backend-locally. The
+    // native pass member below stays until SkinnedMesh migrates (Phase 3C+).
+    void SetTargetPass(const ixrhi::IXRHIRenderPass* pass);
     void Skin(VulkanDevice& device, double timeSeconds);
     void SkinInstance(VulkanDevice& device, uint32_t skinSlot, MotionState state, float animTimeSeconds);
     // Pose-injection entry point: skin one instance from an EXTERNALLY computed local pose
