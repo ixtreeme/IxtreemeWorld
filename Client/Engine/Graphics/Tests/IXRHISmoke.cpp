@@ -19,6 +19,7 @@
 #include "IXRHICommandList.h"
 #include "IXRHIDevice.h"
 #include "IXRHI.h"
+#include "IXRHIFrame.h"
 #include "IXRHIPipeline.h"
 #include "IXRHIRenderTarget.h"
 #include "IXRHIShader.h"
@@ -28,6 +29,9 @@
 #include "IXRHITypes.h"
 
 #include "EditorGraphicsBridge.h"
+
+#include "IXRHIQuery.h"
+#include "IXVulkanFrameTracker.h"
 
 #include <cstdint>
 #include <cstdio>
@@ -141,6 +145,41 @@ private:
     std::string m_name = "StubSampler";
 };
 
+void TestFrameContract()
+{
+    // Canonical frame defaults: invalid until a successful BeginFrame.
+    const ixrhi::IXRHIFrame empty{};
+    Check(empty.result == ixrhi::IXRHIFrameResult::Skip, "frame defaults Skip");
+    Check(!static_cast<bool>(empty), "frame bool false when not Success");
+    Check(empty.info.commandList == nullptr, "frame command list defaults null");
+    Check(empty.info.backBuffer == nullptr, "frame backbuffer defaults null");
+    Check(!empty.info.frameActive, "frame inactive by default");
+
+    Check(ixrhi::IXRHITimestampPointCount == 24, "timestamp point count 24");
+    Check(static_cast<std::uint32_t>(ixrhi::IXRHITimestampPoint::FrameBegin) == 0,
+        "timestamp FrameBegin index 0");
+    Check(ixrhi::IXRHI_MAX_TIMESTAMP_POINTS >= ixrhi::IXRHITimestampPointCount,
+        "timestamp pool fits points");
+
+    // Pure state machine: no Vulkan involved.
+    ixvulkan::IXVulkanFrameTracker tracker;
+    Check(tracker.CanBegin(), "tracker begins from Idle");
+    Check(tracker.GetGeneration() == 1, "tracker generation starts at 1");
+    const std::uint64_t token = tracker.OnBegin(0, 0);
+    Check(!tracker.CanBegin() && tracker.IsRecording(), "tracker Recording after Begin");
+    tracker.OnEnd();
+    Check(tracker.CanBegin() && tracker.GetSlot() == 1, "tracker advances slot on End");
+    Check(tracker.GetFrameNumber() == 1, "tracker advances frame number on End");
+    tracker.OnBegin(1, 1);
+    tracker.OnAbort();
+    Check(tracker.CanBegin() && tracker.GetSlot() == 1, "tracker abort keeps slot");
+    Check(tracker.GetFrameNumber() == 1, "tracker abort keeps frame number");
+    const std::uint64_t generation = tracker.GetGeneration();
+    tracker.OnSwapchainRecreated();
+    Check(tracker.GetGeneration() == generation + 1, "tracker bumps generation on recreate");
+    Check(token != 0, "tracker issues nonzero pairing token");
+}
+
 void TestEditorBridge()
 {
     ixeditor::graphics::EditorGraphicsBridge bridge;
@@ -184,6 +223,7 @@ int main(int argc, char** argv)
     }
 
     TestDescriptorDefaults();
+    TestFrameContract();
     TestEditorBridge();
 
 #ifdef IXRHI_SMOKE_WITH_VULKAN

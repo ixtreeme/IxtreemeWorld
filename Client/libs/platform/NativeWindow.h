@@ -1,8 +1,7 @@
 #pragma once
 
 #include "InputEvent.h"
-
-#include <vulkan/vulkan_core.h>
+#include "NativeWindowDesc.h"
 
 #include <cstdint>
 #include <functional>
@@ -26,6 +25,7 @@ public:
 
     virtual uint32_t GetWidth() const = 0;
     virtual uint32_t GetHeight() const = 0;
-    virtual VkResult CreateVulkanSurface(VkInstance instance, VkSurfaceKHR* outSurface) = 0;
-    virtual const char* GetVulkanSurfaceExtensionName() const = 0;
+    // Platform-native description for backend surface creation. No Vulkan here
+    // by design (Phase 3C): IXVulkan builds VkSurfaceKHR from this.
+    virtual NativeWindowDesc DescribeNative() const = 0;
 };

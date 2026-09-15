@@ -22,9 +22,8 @@
 #include "ScriptSystem.h"
 #include "ScriptApiImpl.h"
 #include "BuildService.h"  // ixeditor::build::GameScriptBuildService — cmake Build worker (Editor/Build boundary)
-#include "IXVulkanBridge.h" // ixvulkan::WrapFrameCommandList — inventoried frame-list escape hatch
 #include "IXVulkanConversions.h" // FromVkFormat — swapchain format queries for offscreen targets
-#include "IXVulkanDevice.h" // ixvulkan::IXVulkanDevice — IXRHI backend over the live frame loop
+#include "IXVulkanDevice.h" // ixvulkan::IXVulkanDevice — IXRHI backend owning the frame lifecycle
 #include "IXVulkanEditorAdapter.h" // backend-specific editor integration (isolated)
 #include "EditorImGui.h"
 #include "physics/PhysicsWorld.h"
@@ -1122,21 +1121,6 @@ bool LoadRuntimeScene(client::asset::IAssetReader& assets, const std::string& sc
         sceneAssetPath.c_str(),
         scenePath.string().c_str());
     return SceneManager::Instance().LoadScene(scenePath.string());
-}
-
-// Phase-2 IXRHI strangler: snapshot of the loop-owned frame for IXRHI-native
-// renderers (replaces their direct GetFrameIndex/GetSwapchainExtent/IsFrameActive
-// calls). Filled at each migrated Render call site from the live VulkanDevice.
-ixrhi::IXRHIFrameInfo MakeRhiFrameInfo(VulkanDevice& device)
-{
-    ixrhi::IXRHIFrameInfo frame;
-    frame.frameIndex = device.GetFrameIndex();
-    const VkExtent2D extent = device.GetSwapchainExtent();
-    frame.targetWidth = extent.width;
-    frame.targetHeight = extent.height;
-    frame.frameActive = device.IsFrameActive();
-    frame.frameNumber = device.GetFrameNumber();
-    return frame;
 }
 
 phys::PhysicsTransform PhysicsTransformFromMesh(const MeshSceneEntity& mesh)
@@ -4929,16 +4913,15 @@ int RunGame(NativeWindow& window,
 
         uint32_t width = 0;
         uint32_t height = 0;
-        if (window.ConsumeResize(width, height))
-        {
-            Tracenf("[MAIN] Resize event consumed: %ux%u, calling device.Resize()", width, height);
-            if (device.Resize(width, height))
-            {
-                Tracen("[MAIN] device.Resize() returned true, recreating pipelines");
+        // Resize is backend-driven (Phase 3C): queue the request; the next
+        // BeginFrame recreates and reports SwapchainRecreated, which runs the
+        // shared orchestration below (single authoritative flow, §73).
+        auto handleSwapchainChanged = [&]() {
+            Tracen("[MAIN] swapchain changed, recreating pipelines");
+            refreshOffscreenFormats();
                 if (offscreenSceneOk)
                 {
                     const VkExtent2D resizeExtent = effectiveRenderExtent();
-                    refreshOffscreenFormats();
                     offscreenSceneOk = offscreenScene.Recreate(rhiDevice,
                         resizeExtent.width,
                         resizeExtent.height,
@@ -5028,11 +5011,12 @@ int RunGame(NativeWindow& window,
                     renderSize = swapchainSize;
                 runtimeSession->Resize(swapchainSize.width, swapchainSize.height);
                 rmlUi.Resize(swapchainSize.width, swapchainSize.height);
-            }
-            else
-            {
-                Tracen("[MAIN] device.Resize() returned false (unchanged), skipping pipeline recreate");
-            }
+        };
+        if (window.ConsumeResize(width, height))
+        {
+            Tracenf("[MAIN] Resize event consumed: %ux%u, queueing backend resize", width, height);
+            if (!rhiDevice.RequestResize(width, height))
+                Tracen("[MAIN] resize unchanged, skipping pipeline recreate");
         }
 
 #if defined(IXTREEME_WITH_EDITOR)
@@ -5417,7 +5401,7 @@ int RunGame(NativeWindow& window,
                     audioEngine.SetBusVolume(ixaudio::AudioBus::SFX, commands.audioVolume[2]);
                 }
                 if (commands.captureGpuFrame)
-                    device.RequestGpuFrameCapture();
+                    rhiDevice.RequestGpuFrameCapture();
                 if (commands.dumpFrameProfile)
                     dumpFrameProfileRequested = true;
                 if (commands.debugPerfTogglesChanged)
@@ -9894,10 +9878,21 @@ int RunGame(NativeWindow& window,
 #endif
         }
 
-        device.BeginFrame();
-        if (device.IsFrameActive())
+        // IXRHI frame authority (Phase 3C): the backend acquires, records,
+        // submits and presents. SwapchainRecreated runs the shared resize
+        // orchestration; Skip renders nothing; DeviceLost exits gracefully.
+        ixrhi::IXRHIFrame rhiFrame = rhiDevice.BeginFrame();
+        if (rhiFrame.result == ixrhi::IXRHIFrameResult::SwapchainRecreated)
+            handleSwapchainChanged();
+        if (rhiFrame.result == ixrhi::IXRHIFrameResult::DeviceLost)
         {
-            const uint64_t frameNumber = device.GetFrameNumber();
+            TraceError("[MAIN] graphics device lost, shutting down render loop");
+            window.RequestClose();
+        }
+        if (rhiFrame)
+        {
+            const ixrhi::IXRHIFrameInfo& frameInfo = rhiFrame.info;
+            const uint64_t frameNumber = frameInfo.frameNumber;
             // Per-frame skin-slot allocation over the per-model skinned cache. Each entry owns
             // its own MaxSkinSlots() pool; Scene view (+ water reflection) consumes bottom-up,
             // Game view top-down, both reset lazily once per device frame, so a model drawn in
@@ -10228,13 +10223,13 @@ int RunGame(NativeWindow& window,
             const auto sceneRenderBegin = std::chrono::steady_clock::now();
             if (isInWorld && hasSceneTerrain && hasFrameCamera && !debugDisableShadowPass)
             {
-                device.WriteGpuTimestamp(VulkanDevice::GpuTimestampPoint::ShadowPassBegin);
+                rhiDevice.WriteTimestamp(ixrhi::IXRHITimestampPoint::ShadowPassBegin);
                 terrain.RenderSunShadowMap(device, frameCamera);
-                device.WriteGpuTimestamp(VulkanDevice::GpuTimestampPoint::ShadowPassEnd);
+                rhiDevice.WriteTimestamp(ixrhi::IXRHITimestampPoint::ShadowPassEnd);
             }
             if (isInWorld && hasSceneTerrain && hasFrameCamera && !debugDisableWaterReflectionPass)
             {
-                device.WriteGpuTimestamp(VulkanDevice::GpuTimestampPoint::WaterReflectionBegin);
+                rhiDevice.WriteTimestamp(ixrhi::IXRHITimestampPoint::WaterReflectionBegin);
                 terrain.RenderWaterReflection(device,
                     frameCamera,
                     seconds,
@@ -10263,18 +10258,26 @@ int RunGame(NativeWindow& window,
                         // (Editor lights are not drawn as the skinned character model in the
                         // water reflection either — removed old debug visualization.)
                     });
-                device.WriteGpuTimestamp(VulkanDevice::GpuTimestampPoint::WaterReflectionEnd);
+                rhiDevice.WriteTimestamp(ixrhi::IXRHITimestampPoint::WaterReflectionEnd);
             }
 
-            const bool useOffscreenScene = offscreenSceneOk && device.IsFrameActive();
+            const bool useOffscreenScene = offscreenSceneOk && frameInfo.frameActive;
+            // Main-window pass ownership (Phase 3C): exactly one Begin/End per
+            // frame around ALL swapchain rendering (direct or composite + UI).
+            bool mainPassOpen = false;
+            auto beginMainPass = [&]() {
+                if (mainPassOpen)
+                    return;
+                if (ixrhi::IXRHIRenderTarget* mainTarget = rhiDevice.GetMainRenderTarget())
+                {
+                    mainTarget->Begin(*frameInfo.commandList);
+                    mainPassOpen = true;
+                }
+            };
             if (useOffscreenScene)
-            {
-                if (auto offscreenBeginCmd =
-                        ixvulkan::WrapFrameCommandList(rhiDevice, device.GetCommandBuffer()))
-                    offscreenScene.BeginMainPass(*offscreenBeginCmd, MakeRhiFrameInfo(device));
-            }
+                offscreenScene.BeginMainPass(*frameInfo.commandList, frameInfo);
             else
-                device.BeginSwapchainRenderPass("direct");
+                beginMainPass(); // direct mode renders straight into the swapchain pass
 
             std::vector<WorldLabelRenderer::Label> plates;
             if (isInWorld)
@@ -10282,11 +10285,11 @@ int RunGame(NativeWindow& window,
                 if (hasSceneTerrain)
                 {
                     frameSceneRenderCalled = true;
-                    device.WriteGpuTimestamp(VulkanDevice::GpuTimestampPoint::TerrainMainBegin);
+                    rhiDevice.WriteTimestamp(ixrhi::IXRHITimestampPoint::TerrainMainBegin);
                     terrain.Render(device, camera, renderSize);
-                    device.WriteGpuTimestamp(VulkanDevice::GpuTimestampPoint::TerrainMainEnd);
+                    rhiDevice.WriteTimestamp(ixrhi::IXRHITimestampPoint::TerrainMainEnd);
                 }
-                device.WriteGpuTimestamp(VulkanDevice::GpuTimestampPoint::SceneOtherBegin);
+                rhiDevice.WriteTimestamp(ixrhi::IXRHITimestampPoint::SceneOtherBegin);
 
                 plates.reserve(entities.size());
                 // Draw the networked skinned entities recorded by the pre-pass (dormant until
@@ -10714,14 +10717,9 @@ int RunGame(NativeWindow& window,
                         std::vector<StaticMeshRenderer::Instance>& instances = batch.instances;
                         if (!renderer || instances.empty())
                             continue;
-                        auto batchCmd =
-                            ixvulkan::WrapFrameCommandList(rhiDevice, device.GetCommandBuffer());
-                        if (!batchCmd)
-                            continue;
-                        const ixrhi::IXRHIFrameInfo batchFrame = MakeRhiFrameInfo(device);
                         if (key.configHash != 0)
-                            renderer->RenderLodBatchInWorld(*batchCmd,
-                                batchFrame,
+                            renderer->RenderLodBatchInWorld(*frameInfo.commandList,
+                                frameInfo,
                                 seconds,
                                 camera,
                                 instances,
@@ -10731,8 +10729,8 @@ int RunGame(NativeWindow& window,
                                 renderSize.width,
                                 renderSize.height);
                         else
-                            renderer->RenderBatchInWorld(*batchCmd,
-                                batchFrame,
+                            renderer->RenderBatchInWorld(*frameInfo.commandList,
+                                frameInfo,
                                 seconds,
                                 camera,
                                 instances,
@@ -10872,26 +10870,20 @@ int RunGame(NativeWindow& window,
                             break;
                         }
                     }
-                    if (auto outlineCmd =
-                            ixvulkan::WrapFrameCommandList(rhiDevice, device.GetCommandBuffer()))
-                        selectionOutlines.Render(*outlineCmd,
-                            MakeRhiFrameInfo(device),
-                            camera,
-                            selectionLines,
-                            renderSize.width,
-                            renderSize.height);
+                    selectionOutlines.Render(*frameInfo.commandList,
+                        frameInfo,
+                        camera,
+                        selectionLines,
+                        renderSize.width,
+                        renderSize.height);
                 }
                 if (!useOffscreenScene && hasSceneTerrain)
                 {
                     terrain.RenderWater(device, camera, seconds, renderSize);
                 }
                 if (!useOffscreenScene && worldLabelsOk)
-                {
-                    if (auto labelCmd =
-                            ixvulkan::WrapFrameCommandList(rhiDevice, device.GetCommandBuffer()))
-                        worldLabels.Render(*labelCmd, MakeRhiFrameInfo(device), camera, plates);
-                }
-                device.WriteGpuTimestamp(VulkanDevice::GpuTimestampPoint::SceneOtherEnd);
+                    worldLabels.Render(*frameInfo.commandList, frameInfo, camera, plates);
+                rhiDevice.WriteTimestamp(ixrhi::IXRHITimestampPoint::SceneOtherEnd);
             }
             else if (SkinnedMeshRenderer* lobbySkinned = runtimeSession->IsLobbyActive()
                          ? getSkinnedMeshRenderer(kDefaultCharacterModelPath)
@@ -10899,29 +10891,25 @@ int RunGame(NativeWindow& window,
             {
                 frameSceneRenderCalled = true;
                 frameSceneEntityCount = 1;
-                device.WriteGpuTimestamp(VulkanDevice::GpuTimestampPoint::SceneOtherBegin);
+                rhiDevice.WriteTimestamp(ixrhi::IXRHITimestampPoint::SceneOtherBegin);
                 lobbySkinned->Render(device, seconds);
-                device.WriteGpuTimestamp(VulkanDevice::GpuTimestampPoint::SceneOtherEnd);
+                rhiDevice.WriteTimestamp(ixrhi::IXRHITimestampPoint::SceneOtherEnd);
             }
 
             if (useOffscreenScene)
             {
-                if (auto offscreenEndCmd =
-                        ixvulkan::WrapFrameCommandList(rhiDevice, device.GetCommandBuffer()))
+                offscreenScene.EndMainPass(*frameInfo.commandList);
+                if (isInWorld && hasSceneTerrain)
                 {
-                    offscreenScene.EndMainPass(*offscreenEndCmd);
-                    if (isInWorld && hasSceneTerrain)
-                    {
-                        offscreenScene.SnapshotScene(*offscreenEndCmd, MakeRhiFrameInfo(device));
-                        terrain.SetWaterRefractionInputs(offscreenScene.GetColorSnapshotTexture(),
-                            offscreenScene.GetDepthSnapshotTexture(),
-                            offscreenScene.GetSampler(),
-                            offscreenScene.Width(),
-                            offscreenScene.Height());
-                        offscreenScene.BeginMainPass(*offscreenEndCmd, MakeRhiFrameInfo(device), false);
-                        terrain.RenderWater(device, camera, seconds, renderSize);
-                        offscreenScene.EndMainPass(*offscreenEndCmd);
-                    }
+                    offscreenScene.SnapshotScene(*frameInfo.commandList, frameInfo);
+                    terrain.SetWaterRefractionInputs(offscreenScene.GetColorSnapshotTexture(),
+                        offscreenScene.GetDepthSnapshotTexture(),
+                        offscreenScene.GetSampler(),
+                        offscreenScene.Width(),
+                        offscreenScene.Height());
+                    offscreenScene.BeginMainPass(*frameInfo.commandList, frameInfo, false);
+                    terrain.RenderWater(device, camera, seconds, renderSize);
+                    offscreenScene.EndMainPass(*frameInfo.commandList);
                 }
 #if defined(IXTREEME_WITH_EDITOR)
                 // --- Game view: render the scene from the main camera into the second offscreen target.
@@ -10967,9 +10955,7 @@ int RunGame(NativeWindow& window,
                         }
                         const WorldCamera gameCamera =
                             BuildCameraFromEntity(gameCameraEntity, gameExtent.width, gameExtent.height);
-                        if (auto gameBeginCmd =
-                                ixvulkan::WrapFrameCommandList(rhiDevice, device.GetCommandBuffer()))
-                            gameView.BeginMainPass(*gameBeginCmd, MakeRhiFrameInfo(device));
+                        gameView.BeginMainPass(*frameInfo.commandList, frameInfo);
                         // Terrain is drawn from the project Main Camera using the secondary
                         // camera-uniform path (viewIndex=1). That path has its own per-frame
                         // uniform buffer + descriptor set, so this draw no longer clobbers the
@@ -11015,19 +11001,13 @@ int RunGame(NativeWindow& window,
                                 gameMeshBatches[renderer].push_back(std::move(instance));
                             }
                             for (auto& [gameRenderer, gameInstances] : gameMeshBatches)
-                            {
-                                auto gameMeshCmd = ixvulkan::WrapFrameCommandList(
-                                    rhiDevice, device.GetCommandBuffer());
-                                if (!gameMeshCmd)
-                                    continue;
-                                gameRenderer->RenderBatchInWorld(*gameMeshCmd,
-                                    MakeRhiFrameInfo(device),
+                                gameRenderer->RenderBatchInWorld(*frameInfo.commandList,
+                                    frameInfo,
                                     seconds,
                                     gameCamera,
                                     gameInstances,
                                     gameExtent.width,
                                     gameExtent.height);
-                            }
 
                             // Skinned meshes (incl. the player character) were compute-skinned in
                             // the pre-pass into their own top-of-range Game slots; here we only
@@ -11044,31 +11024,23 @@ int RunGame(NativeWindow& window,
                         {
                             terrain.RenderWater(device, gameCamera, seconds, gameExtent, /*viewIndex=*/1);
                         }
-                        if (auto gameEndCmd =
-                                ixvulkan::WrapFrameCommandList(rhiDevice, device.GetCommandBuffer()))
-                            gameView.EndMainPass(*gameEndCmd);
+                        gameView.EndMainPass(*frameInfo.commandList);
                     }
                 }
 #endif
-                device.BeginSwapchainRenderPass("composite");
-                device.WriteGpuTimestamp(VulkanDevice::GpuTimestampPoint::CompositeBegin);
-                if (auto compositeCmd =
-                        ixvulkan::WrapFrameCommandList(rhiDevice, device.GetCommandBuffer()))
-                    offscreenScene.RenderComposite(*compositeCmd, MakeRhiFrameInfo(device));
-                device.WriteGpuTimestamp(VulkanDevice::GpuTimestampPoint::CompositeEnd);
+                beginMainPass(); // composite + labels + UI share one swapchain pass
+                rhiDevice.WriteTimestamp(ixrhi::IXRHITimestampPoint::CompositeBegin);
+                offscreenScene.RenderComposite(*frameInfo.commandList, frameInfo);
+                rhiDevice.WriteTimestamp(ixrhi::IXRHITimestampPoint::CompositeEnd);
                 if (isInWorld && worldLabelsOk)
-                {
-                    if (auto compositeLabelCmd =
-                            ixvulkan::WrapFrameCommandList(rhiDevice, device.GetCommandBuffer()))
-                        worldLabels.Render(*compositeLabelCmd, MakeRhiFrameInfo(device), camera, plates);
-                }
+                    worldLabels.Render(*frameInfo.commandList, frameInfo, camera, plates);
             }
             frameProfile.sceneRenderMs = MillisecondsBetween(sceneRenderBegin, std::chrono::steady_clock::now());
             const auto editorUiBegin = std::chrono::steady_clock::now();
             frameRmlUiRenderCalled = true;
-            device.WriteGpuTimestamp(VulkanDevice::GpuTimestampPoint::RmlUiBegin);
+            rhiDevice.WriteTimestamp(ixrhi::IXRHITimestampPoint::RmlUiBegin);
             rmlUi.Render(device);
-            device.WriteGpuTimestamp(VulkanDevice::GpuTimestampPoint::RmlUiEnd);
+            rhiDevice.WriteTimestamp(ixrhi::IXRHITimestampPoint::RmlUiEnd);
 #if defined(IXTREEME_WITH_EDITOR)
             frameImGuiRenderCalled = true;
             engineStats.swapchainWidth = swapchainSize.width;
@@ -11107,13 +11079,19 @@ int RunGame(NativeWindow& window,
                 }
             }
             editorImGui.SetEngineStats(engineStats);
-            device.WriteGpuTimestamp(VulkanDevice::GpuTimestampPoint::ImGuiBegin);
+            rhiDevice.WriteTimestamp(ixrhi::IXRHITimestampPoint::ImGuiBegin);
             editorImGui.RenderPanels();
-            editorAdapter->DrawFrame(device.GetCommandBuffer(), device.GetFrameNumber());
-            device.WriteGpuTimestamp(VulkanDevice::GpuTimestampPoint::ImGuiEnd);
+            editorAdapter->DrawFrame(*frameInfo.commandList, frameInfo.frameNumber);
+            rhiDevice.WriteTimestamp(ixrhi::IXRHITimestampPoint::ImGuiEnd);
 #else
             frameImGuiRenderCalled = false;
 #endif
+            if (mainPassOpen)
+            {
+                if (ixrhi::IXRHIRenderTarget* mainEnd = rhiDevice.GetMainRenderTarget())
+                    mainEnd->End(*frameInfo.commandList);
+                mainPassOpen = false;
+            }
             frameProfile.editorUiRenderMs = MillisecondsBetween(editorUiBegin, std::chrono::steady_clock::now());
             const bool frameHeartbeatLog = QuietLogsForLodDiag()
                 ? ((frameNumber % 60u) == 0u)
@@ -11258,7 +11236,10 @@ int RunGame(NativeWindow& window,
         }
 #endif
         const auto submitPresentBegin = std::chrono::steady_clock::now();
-        device.EndFrame();
+        // EndFrame only for successful frames (Skip/Recreated/DeviceLost own
+        // no submission; the backend asserts pairing in Debug).
+        if (rhiFrame)
+            rhiDevice.EndFrame(rhiFrame);
         frameProfile.submitPresentMs = MillisecondsBetween(submitPresentBegin, std::chrono::steady_clock::now());
         frameProfile.totalCpuFrameMs = MillisecondsBetween(frameCpuStart, std::chrono::steady_clock::now());
         // Carry this frame's CPU profile + present mode into engineStats so next frame's
@@ -11298,37 +11279,41 @@ int RunGame(NativeWindow& window,
 #endif
 #if defined(IXTREEME_DEBUG_LOGS)
         {
-            VulkanDevice::GpuTimestampResults gpuTiming{};
-            VulkanDevice::CpuFrameTimingResults cpuTiming{};
-            if (device.ConsumeGpuFrameCaptureResults(gpuTiming, cpuTiming))
+            ixrhi::IXRHITimestampResults gpuTiming{};
+            ixrhi::IXRHICpuFrameTiming cpuTiming{};
+            if (rhiDevice.TryReadTimestamps(gpuTiming, cpuTiming))
             {
                 const TerrainRenderer::FrameDrawStats terrainDrawStats = terrain.GetFrameDrawStats();
-                auto elapsedMs = [&](VulkanDevice::GpuTimestampPoint begin, VulkanDevice::GpuTimestampPoint end) -> double {
+                auto elapsedMs = [&](ixrhi::IXRHITimestampPoint begin, ixrhi::IXRHITimestampPoint end) -> double {
                     const uint32_t beginIndex = static_cast<uint32_t>(begin);
                     const uint32_t endIndex = static_cast<uint32_t>(end);
-                    if (beginIndex >= VulkanDevice::GpuTimestampPointCount ||
-                        endIndex >= VulkanDevice::GpuTimestampPointCount ||
+                    if (beginIndex >= ixrhi::IXRHITimestampPointCount ||
+                        endIndex >= ixrhi::IXRHITimestampPointCount ||
                         !gpuTiming.pointValid[beginIndex] ||
                         !gpuTiming.pointValid[endIndex])
                     {
                         return 0.0;
                     }
-                    return std::max(0.0, gpuTiming.pointMs[endIndex] - gpuTiming.pointMs[beginIndex]);
+                    const double beginMs =
+                        static_cast<double>(gpuTiming.pointNanoseconds[beginIndex]) / 1000000.0;
+                    const double endMs =
+                        static_cast<double>(gpuTiming.pointNanoseconds[endIndex]) / 1000000.0;
+                    return std::max(0.0, endMs - beginMs);
                 };
                 const double shadowCascadeMs[4] = {
-                    elapsedMs(VulkanDevice::GpuTimestampPoint::ShadowCascade0Begin, VulkanDevice::GpuTimestampPoint::ShadowCascade0End),
-                    elapsedMs(VulkanDevice::GpuTimestampPoint::ShadowCascade1Begin, VulkanDevice::GpuTimestampPoint::ShadowCascade1End),
-                    elapsedMs(VulkanDevice::GpuTimestampPoint::ShadowCascade2Begin, VulkanDevice::GpuTimestampPoint::ShadowCascade2End),
-                    elapsedMs(VulkanDevice::GpuTimestampPoint::ShadowCascade3Begin, VulkanDevice::GpuTimestampPoint::ShadowCascade3End),
+                    elapsedMs(ixrhi::IXRHITimestampPoint::ShadowCascade0Begin, ixrhi::IXRHITimestampPoint::ShadowCascade0End),
+                    elapsedMs(ixrhi::IXRHITimestampPoint::ShadowCascade1Begin, ixrhi::IXRHITimestampPoint::ShadowCascade1End),
+                    elapsedMs(ixrhi::IXRHITimestampPoint::ShadowCascade2Begin, ixrhi::IXRHITimestampPoint::ShadowCascade2End),
+                    elapsedMs(ixrhi::IXRHITimestampPoint::ShadowCascade3Begin, ixrhi::IXRHITimestampPoint::ShadowCascade3End),
                 };
-                const double shadowTotalMs = elapsedMs(VulkanDevice::GpuTimestampPoint::ShadowPassBegin, VulkanDevice::GpuTimestampPoint::ShadowPassEnd);
-                const double waterReflectionMs = elapsedMs(VulkanDevice::GpuTimestampPoint::WaterReflectionBegin, VulkanDevice::GpuTimestampPoint::WaterReflectionEnd);
-                const double terrainMainMs = elapsedMs(VulkanDevice::GpuTimestampPoint::TerrainMainBegin, VulkanDevice::GpuTimestampPoint::TerrainMainEnd);
-                const double sceneOtherMs = elapsedMs(VulkanDevice::GpuTimestampPoint::SceneOtherBegin, VulkanDevice::GpuTimestampPoint::SceneOtherEnd);
-                const double compositeMs = elapsedMs(VulkanDevice::GpuTimestampPoint::CompositeBegin, VulkanDevice::GpuTimestampPoint::CompositeEnd);
-                const double rmluiMs = elapsedMs(VulkanDevice::GpuTimestampPoint::RmlUiBegin, VulkanDevice::GpuTimestampPoint::RmlUiEnd);
-                const double imguiMs = elapsedMs(VulkanDevice::GpuTimestampPoint::ImGuiBegin, VulkanDevice::GpuTimestampPoint::ImGuiEnd);
-                const double totalGpuMs = elapsedMs(VulkanDevice::GpuTimestampPoint::FrameBegin, VulkanDevice::GpuTimestampPoint::FrameEnd);
+                const double shadowTotalMs = elapsedMs(ixrhi::IXRHITimestampPoint::ShadowPassBegin, ixrhi::IXRHITimestampPoint::ShadowPassEnd);
+                const double waterReflectionMs = elapsedMs(ixrhi::IXRHITimestampPoint::WaterReflectionBegin, ixrhi::IXRHITimestampPoint::WaterReflectionEnd);
+                const double terrainMainMs = elapsedMs(ixrhi::IXRHITimestampPoint::TerrainMainBegin, ixrhi::IXRHITimestampPoint::TerrainMainEnd);
+                const double sceneOtherMs = elapsedMs(ixrhi::IXRHITimestampPoint::SceneOtherBegin, ixrhi::IXRHITimestampPoint::SceneOtherEnd);
+                const double compositeMs = elapsedMs(ixrhi::IXRHITimestampPoint::CompositeBegin, ixrhi::IXRHITimestampPoint::CompositeEnd);
+                const double rmluiMs = elapsedMs(ixrhi::IXRHITimestampPoint::RmlUiBegin, ixrhi::IXRHITimestampPoint::RmlUiEnd);
+                const double imguiMs = elapsedMs(ixrhi::IXRHITimestampPoint::ImGuiBegin, ixrhi::IXRHITimestampPoint::ImGuiEnd);
+                const double totalGpuMs = elapsedMs(ixrhi::IXRHITimestampPoint::FrameBegin, ixrhi::IXRHITimestampPoint::FrameEnd);
                 const TerrainRenderer::PassDrawStats& terrainMain = terrainDrawStats.terrainMain;
                 const TerrainRenderer::PassDrawStats& reflection = terrainDrawStats.waterReflection;
                 TraceDiagf("[GPU-TIME] frame=%llu",
@@ -11442,6 +11427,9 @@ int RunGame(NativeWindow& window,
 #endif
     rmlUi.Destroy();
     runtimeSession->Destroy();
+    // Backend frame authority teardown BEFORE legacy device teardown (§70):
+    // releases frame contexts, swapchain object, query pool and upload pool.
+    rhiDevice.Shutdown();
     device.Destroy();
     return 0;
 }

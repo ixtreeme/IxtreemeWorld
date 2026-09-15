@@ -85,15 +85,16 @@ void NativeWindow_Android::SetInputCallback(InputCallback cb)
     m_inputCallback = std::move(cb);
 }
 
-VkResult NativeWindow_Android::CreateVulkanSurface(VkInstance instance, VkSurfaceKHR* outSurface)
+NativeWindowDesc NativeWindow_Android::DescribeNative() const
 {
-    if (!m_nativeWindow)
-        return VK_ERROR_SURFACE_LOST_KHR;
-
-    VkAndroidSurfaceCreateInfoKHR create{};
-    create.sType = VK_STRUCTURE_TYPE_ANDROID_SURFACE_CREATE_INFO_KHR;
-    create.window = m_nativeWindow;
-    return vkCreateAndroidSurfaceKHR(instance, &create, nullptr, outSurface);
+    NativeWindowDesc desc;
+    desc.type = NativeWindowDesc::Type::Android;
+    desc.windowHandle = m_nativeWindow;
+    desc.instanceHandle = nullptr;
+    desc.vulkanSurfaceExtension = "VK_KHR_android_surface";
+    desc.width = m_width;
+    desc.height = m_height;
+    return desc;
 }
 
 void NativeWindow_Android::OnAppCmd(android_app* app, int32_t cmd)

@@ -63,12 +63,38 @@ public:
     };
 
     bool Create(NativeWindow& window, uint32_t width, uint32_t height);
+    // DORMANT since Phase 3C: the IXVulkanDevice frame authority owns
+    // acquisition/recording/submission/presentation. Kept compiling until the
+    // last native consumer migrates; do not call.
     void BeginFrame();
     void BeginSwapchainRenderPass(const char* passName = "other");
     void EndFrame();
+    // DORMANT since Phase 3C: use IXRHIDevice::RequestResize (the backend
+    // recreates inside BeginFrame and reports SwapchainRecreated).
     bool Resize(uint32_t width, uint32_t height);
     void WaitIdle();
     void Destroy();
+    // Infrastructure entry used by the IXVulkan frame authority (Phase 3C):
+    // recreates swapchain handle + images + views + depth (NOT passes or
+    // framebuffers — those are backend-owned). Public for backend use only.
+    bool RecreateSwapchain(uint32_t width, uint32_t height);
+
+    // Phase-3C migration shims, synced by IXVulkanDevice every frame so
+    // still-native renderers (terrain/skinned/RmlUi) keep working unchanged.
+    // GetCommandBuffer returns the backend-active buffer; indices/numbers and
+    // IsFrameActive mirror backend authority; GetRenderPass returns the
+    // backend-owned main pass mirror (legacy must never destroy it).
+    void SetMigrationFrameState(VkCommandBuffer activeCmd,
+                                uint32_t frameIndex,
+                                uint32_t imageIndex,
+                                uint64_t frameNumber,
+                                uint64_t safeFrameNumber,
+                                bool frameActive);
+    void SetMigrationMainPass(VkRenderPass pass) { m_renderPass = pass; }
+    VkSwapchainKHR GetSwapchain() const { return m_swapchain; }
+    VkQueue GetPresentQueue() const { return m_presentQueue; }
+    VkImage GetSwapchainImage(uint32_t index) const;
+    VkImageView GetSwapchainImageView(uint32_t index) const;
 
     bool IsFrameActive() const { return m_frameStarted && !m_skipFrame; }
     VkInstance GetInstance() const { return m_instance; }
@@ -77,7 +103,13 @@ public:
     VkQueue GetGraphicsQueue() const { return m_graphicsQueue; }
     uint32_t GetGraphicsQueueFamily() const { return m_queueFamilies.graphics; }
     VkRenderPass GetRenderPass() const { return m_renderPass; }
-    VkCommandBuffer GetCommandBuffer() const { return m_commandBuffers[m_currentFrame]; }
+    // Migration shim: the backend-active command buffer while a frame records.
+    VkCommandBuffer GetCommandBuffer() const
+    {
+        if (m_migrationActiveCmd != VK_NULL_HANDLE)
+            return m_migrationActiveCmd;
+        return m_commandBuffers.empty() ? VK_NULL_HANDLE : m_commandBuffers[m_currentFrame];
+    }
     uint32_t GetFrameIndex() const { return m_currentFrame; }
     VkExtent2D GetSwapchainExtent() const { return m_swapchainExtent; }
     // False when the swapchain fell back to FIFO (vsync) — i.e. FPS is capped to the
@@ -96,6 +128,8 @@ public:
     bool IsSwapchainFormatSrgb() const;
     uint32_t FindMemoryType(uint32_t typeFilter, VkMemoryPropertyFlags properties) const;
     static constexpr uint32_t MaxFramesInFlight() { return MAX_FRAMES_IN_FLIGHT; }
+    // DORMANT since Phase 3C (backend owns the timestamp pool + capture flow;
+    // see IXRHIDevice::WriteTimestamp/TryReadTimestamps). Kept for reference.
     void RequestGpuFrameCapture();
     bool IsGpuFrameCaptureActive() const { return m_gpuCaptureActive; }
     void WriteGpuTimestamp(GpuTimestampPoint point);
@@ -137,7 +171,6 @@ private:
     void FinishGpuFrameCaptureAfterSubmit();
 
     void DestroySwapchainObjects();
-    bool RecreateSwapchain(uint32_t width, uint32_t height);
     int FindSwapchainImageIndex(VkImage image) const;
     void LogSwapchainImageTransition(VkImage image, VkImageLayout oldLayout, VkImageLayout newLayout, const char* passName) const;
 
@@ -171,9 +204,11 @@ private:
     std::vector<VkDeviceMemory> m_depthStencilMemory;
     std::vector<VkImageView> m_depthStencilImageViews;
 
-    VkRenderPass m_renderPass = VK_NULL_HANDLE;
+    VkRenderPass m_renderPass = VK_NULL_HANDLE; // backend-owned mirror (3C); legacy never frees
     VkCommandPool m_commandPool = VK_NULL_HANDLE;
     std::vector<VkCommandBuffer> m_commandBuffers;
+    // Backend-active command buffer for still-native renderers (synced per frame).
+    VkCommandBuffer m_migrationActiveCmd = VK_NULL_HANDLE;
     VkQueryPool m_timestampQueryPool = VK_NULL_HANDLE;
     float m_timestampPeriodNs = 0.0f;
 

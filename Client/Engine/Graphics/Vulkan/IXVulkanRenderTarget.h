@@ -21,10 +21,13 @@ class IXVulkanDevice;
 class IXVulkanRenderTarget final : public ixrhi::IXRHIRenderTarget
 {
 public:
+    // ownPass=false shares a caller-owned pass (swapchain main pass); the
+    // target then destroys only its framebuffer.
     IXVulkanRenderTarget(IXVulkanDevice& device,
                          std::shared_ptr<ixrhi::IXRHITexture> color,
                          std::shared_ptr<ixrhi::IXRHITexture> depth,
                          VkRenderPass pass,
+                         bool ownPass,
                          VkFramebuffer framebuffer,
                          std::unique_ptr<IXVulkanRenderPass> passToken,
                          float clearColor[4],
@@ -46,6 +49,7 @@ private:
     std::shared_ptr<ixrhi::IXRHITexture> m_color;
     std::shared_ptr<ixrhi::IXRHITexture> m_depth;
     VkRenderPass m_pass = VK_NULL_HANDLE;
+    bool m_ownPass = true;
     VkFramebuffer m_framebuffer = VK_NULL_HANDLE;
     std::unique_ptr<IXVulkanRenderPass> m_passToken;
     float m_clearColor[4]{};

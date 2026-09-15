@@ -1,4 +1,4 @@
-# IXRHI portability baseline (Phase 2, §50)
+# IXRHI portability baseline (Phase 2, updated Phase 3C)
 
 No MoltenVK integration in this phase. This document records what the core
 guarantees, what is optional, and which Vulkan-specific assumptions remain.
@@ -34,6 +34,24 @@ rayQuery/rayTracing, meshShaders, variableRateShading, asyncCompute.
 5. Validation layers (`VK_LAYER_KHRONOS_validation`): desktop-only; absence is
    tolerated (logged, non-fatal) so the same binary path works where layers
    don't exist.
+
+## Phase-3C frame/swapchain review (MoltenVK-relevant)
+
+- Surface creation: `NativeWindowDesc` (Win32 HWND/HINSTANCE, Android
+  `ANativeWindow*`) → backend `CreateSurfaceForWindow`. Apple adds a
+  `VK_EXT_metal_surface` branch + descriptor type here; no IXRHI change.
+- Present: binary-semaphore acquire/present, FIFO-or-uncapped preserved from
+  surface capabilities. No timeline semaphores, no present-wait extensions.
+- Swapchain formats/extents: re-queried from the surface on every recreate;
+  generation counter isolates stale references (same discipline ports).
+- Frames in flight = 2, single universal queue. No async-compute assumption.
+- Timestamp queries: gated on `timestampComputeAndGraphics`; absent on some
+  MoltenVK configurations → backend no-ops, profiler reports unavailable
+  (same as the legacy verbose-diagnostics gating).
+- Zero-size handling: Skip without spinning; recreation deferred until a
+  non-zero size arrives (matches mobile backgrounding needs).
+- `VK_SUBOPTIMAL_KHR` continues with warn-once (same as before); only
+  `OUT_OF_DATE` forces recreation. No platform-specific swapchain flags.
 
 ## Future MoltenVK concerns (not implemented)
 

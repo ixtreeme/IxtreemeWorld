@@ -23,7 +23,9 @@
 #include "IXRHIBuffer.h"
 #include "IXRHICapabilities.h"
 #include "IXRHICommandList.h"
+#include "IXRHIFrame.h"
 #include "IXRHIPipeline.h"
+#include "IXRHIQuery.h"
 #include "IXRHIRenderTarget.h"
 #include "IXRHIShader.h"
 #include "IXRHISwapchain.h"
@@ -37,19 +39,6 @@
 
 namespace ixrhi
 {
-
-// Snapshot of the in-flight frame, filled by the frame owner from the loop that
-// still owns swapchain pacing (VulkanDevice in Phase 2). Replaces the renderer's
-// direct GetFrameIndex()/GetSwapchainExtent()/IsFrameActive() calls.
-struct IXRHIFrameInfo
-{
-    std::uint32_t frameIndex = 0;
-    std::uint32_t targetWidth = 0;
-    std::uint32_t targetHeight = 0;
-    bool frameActive = false;
-    // Monotonic frame counter from the loop (diagnostics only, not an index).
-    std::uint64_t frameNumber = 0;
-};
 
 class IXRHIDevice
 {
@@ -106,6 +95,34 @@ public:
     // Host-side GPU drain for teardown/recreation paths (offscreen Recreate).
     // Must not be called from inside a recording command list.
     virtual void WaitIdle() = 0;
+
+    // ---- Frame lifecycle (Phase 3C: IXRHI owns the graphics frame contract).
+    // BeginFrame waits/recycles the frame slot, acquires the swapchain image,
+    // resets per-frame command resources and begins recording. Returns Success
+    // with a valid frame context, or Skip/SwapchainRecreated/DeviceLost (in
+    // which cases EndFrame must NOT be called).
+    virtual IXRHIFrame BeginFrame() = 0;
+    // Ends recording, submits, presents, advances the frame slot. The frame
+    // must be a successful BeginFrame result from this device (Debug-checked).
+    virtual void EndFrame(const IXRHIFrame& frame) = 0;
+    // Queues a resize; the actual recreation happens in BeginFrame (which then
+    // reports SwapchainRecreated). Returns true when the size differs.
+    virtual bool RequestResize(std::uint32_t width, std::uint32_t height) = 0;
+    virtual std::uint32_t GetFramesInFlight() const = 0;
+    virtual std::uint64_t GetSwapchainGeneration() const = 0;
+    virtual IXRHISwapchain& GetMainSwapchain() = 0;
+    // Main-window render target over the current backbuffer (valid during a
+    // successful frame only; framebuffer tracks the acquired image).
+    virtual IXRHIRenderTarget* GetMainRenderTarget() = 0;
+    // Main-window pass for pipeline baking (recreated with the swapchain).
+    virtual const IXRHIRenderPass* GetMainPass() const = 0;
+
+    // ---- GPU timestamps (capture-on-request, same semantics as before).
+    virtual void WriteTimestamp(IXRHITimestampPoint point) = 0;
+    virtual void WriteTimestamp(std::uint32_t pointIndex) = 0;
+    virtual void RequestGpuFrameCapture() = 0;
+    virtual bool TryReadTimestamps(IXRHITimestampResults& gpu,
+                                   IXRHICpuFrameTiming& cpu) = 0;
 
     virtual const IXRHICapabilities& GetCapabilities() const = 0;
 };

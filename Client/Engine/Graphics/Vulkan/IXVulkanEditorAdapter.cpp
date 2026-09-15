@@ -11,6 +11,7 @@
 #include "Debug.h"
 #include "IXRHIDevice.h"
 #include "IXVulkanBridge.h"
+#include "IXVulkanCommandList.h"
 #include "VulkanDevice.h"
 
 #include <imgui.h>
@@ -130,7 +131,10 @@ bool IXVulkanEditorAdapter::CreateBackend(void* windowHandle)
     init.DescriptorPool = m_descriptorPool;
     init.MinImageCount = kAdapterMinImageCount;
     init.ImageCount = m_loop->GetSwapchainImageCount();
-    init.PipelineInfoMain.RenderPass = m_loop->GetRenderPass();
+    // Backend main pass (owned by the swapchain object, not the legacy loop).
+    init.PipelineInfoMain.RenderPass = VK_NULL_HANDLE;
+    if (const ixrhi::IXRHIRenderPass* mainPass = m_rhi->GetMainPass())
+        init.PipelineInfoMain.RenderPass = NativePassOf(*mainPass);
     init.PipelineInfoMain.Subpass = 0;
     init.PipelineInfoMain.MSAASamples = VK_SAMPLE_COUNT_1_BIT;
     init.CheckVkResultFn = CheckBackendResult;
@@ -195,8 +199,13 @@ void IXVulkanEditorAdapter::OnRenderPassChanged()
 
     m_loop->WaitIdle();
 
+    // Re-query the backend main pass (rebuilt with the swapchain); the legacy
+    // mirror would also work, but the adapter resolves backend authority.
+    VkRenderPass mainPass = VK_NULL_HANDLE;
+    if (const ixrhi::IXRHIRenderPass* pass = m_rhi->GetMainPass())
+        mainPass = NativePassOf(*pass);
     ImGui_ImplVulkan_PipelineInfo pipeline{};
-    pipeline.RenderPass = m_loop->GetRenderPass();
+    pipeline.RenderPass = mainPass;
     pipeline.Subpass = 0;
     pipeline.MSAASamples = VK_SAMPLE_COUNT_1_BIT;
     ImGui_ImplVulkan_CreateMainPipeline(&pipeline);
@@ -234,11 +243,15 @@ void IXVulkanEditorAdapter::BeginBackendFrame()
     m_frameActive = true;
 }
 
-void IXVulkanEditorAdapter::DrawFrame(VkCommandBuffer cmd, std::uint64_t frameNumber)
+void IXVulkanEditorAdapter::DrawFrame(ixrhi::IXRHICommandList& cmd, std::uint64_t frameNumber)
 {
     if (!m_backendReady || !m_frameActive)
         return;
     m_frameActive = false;
+
+    auto* native = dynamic_cast<IXVulkanCommandList*>(&cmd);
+    if (native == nullptr)
+        return;
 
     ImDrawData* drawData = ImGui::GetDrawData();
     if (frameNumber < 3 || (frameNumber % 60u) == 0u)
@@ -247,7 +260,7 @@ void IXVulkanEditorAdapter::DrawFrame(VkCommandBuffer cmd, std::uint64_t frameNu
             drawData ? drawData->CmdListsCount : 0,
             CountAdapterDrawCommands(drawData));
     }
-    ImGui_ImplVulkan_RenderDrawData(drawData, cmd);
+    ImGui_ImplVulkan_RenderDrawData(drawData, native->Native());
 
     static std::uint32_t lastLoggedDrawCommands = std::numeric_limits<std::uint32_t>::max();
     const std::uint32_t drawCommands = CountAdapterDrawCommands(drawData);

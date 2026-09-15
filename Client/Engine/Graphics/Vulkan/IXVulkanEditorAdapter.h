@@ -52,7 +52,9 @@ public:
     bool CreateBackend(void* windowHandle);
     void ShutdownBackend();
     void OnRenderPassChanged();
-    void DrawFrame(VkCommandBuffer cmd, std::uint64_t frameNumber);
+    // Submits ImGui draw data into the active frame's owned command list
+    // (unwrapped backend-locally; the app never touches native buffers).
+    void DrawFrame(ixrhi::IXRHICommandList& cmd, std::uint64_t frameNumber);
 #if defined(_WIN32)
     // Forwards to the Win32 backend's message handler (backend ready only).
     bool HandleWin32Message(HWND hwnd, UINT message, WPARAM wParam, LPARAM lParam, LRESULT& result);

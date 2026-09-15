@@ -1,10 +1,8 @@
 #pragma once
 
-// IXVulkan fence/semaphore + swapchain info adapter. The swapchain adapter
-// answers queries from the live VulkanDevice; pacing (acquire/present) stays in
-// the frame loop until Phase 3B.
+// IXVulkan fence/semaphore objects (explicit advanced use only; the normal
+// frame flow needs no manual semaphore wiring — see IXRHIDevice::BeginFrame).
 
-#include "IXRHISwapchain.h"
 #include "IXRHISync.h"
 
 #include <vulkan/vulkan.h>
@@ -40,22 +38,6 @@ public:
 private:
     IXVulkanDevice* m_device = nullptr;
     VkSemaphore m_semaphore = VK_NULL_HANDLE;
-};
-
-class IXVulkanSwapchain final : public ixrhi::IXRHISwapchain
-{
-public:
-    explicit IXVulkanSwapchain(IXVulkanDevice& device);
-
-    std::uint32_t Width() const override;
-    std::uint32_t Height() const override;
-    ixrhi::IXRHIFormat ColorFormat() const override;
-    ixrhi::IXRHIFormat DepthFormat() const override;
-    std::uint32_t ImageCount() const override;
-    bool RequestResize(std::uint32_t width, std::uint32_t height) override;
-
-private:
-    IXVulkanDevice* m_device = nullptr;
 };
 
 } // namespace ixvulkan

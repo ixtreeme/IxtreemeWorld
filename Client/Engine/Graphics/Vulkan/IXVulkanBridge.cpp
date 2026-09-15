@@ -1,4 +1,4 @@
-// Frame-command-buffer bridge: the single inventoried native-access point.
+// Backend-private native resolution (see header inventory).
 
 #include "IXVulkanBridge.h"
 
@@ -9,15 +9,6 @@
 
 namespace ixvulkan
 {
-
-std::unique_ptr<ixrhi::IXRHICommandList> WrapFrameCommandList(ixrhi::IXRHIDevice& device,
-                                                              VkCommandBuffer frameCommandBuffer)
-{
-    auto* backend = dynamic_cast<IXVulkanDevice*>(&device);
-    if (backend == nullptr || frameCommandBuffer == VK_NULL_HANDLE)
-        return nullptr;
-    return std::make_unique<IXVulkanCommandList>(*backend, frameCommandBuffer);
-}
 
 VkImageView NativeViewOf(const ixrhi::IXRHITexture& texture)
 {

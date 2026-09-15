@@ -2,6 +2,8 @@
 
 #include "IXVulkanConversions.h"
 
+#include "IXRHIFrame.h"
+
 namespace ixvulkan
 {
 
@@ -238,6 +240,22 @@ VkAttachmentStoreOp ToVkStoreOp(ixrhi::IXRHIStoreOp op)
 {
     return op == ixrhi::IXRHIStoreOp::Store ? VK_ATTACHMENT_STORE_OP_STORE
                                             : VK_ATTACHMENT_STORE_OP_DONT_CARE;
+}
+
+ixrhi::IXRHIFrameResult TranslateFrameResult(VkResult result)
+{
+    using R = ixrhi::IXRHIFrameResult;
+    switch (result)
+    {
+    case VK_SUCCESS:
+    case VK_SUBOPTIMAL_KHR: return R::Success;
+    case VK_ERROR_OUT_OF_DATE_KHR: return R::SwapchainRecreated;
+    case VK_TIMEOUT:
+    case VK_NOT_READY: return R::Skip;
+    case VK_ERROR_DEVICE_LOST: return R::DeviceLost;
+    default: break;
+    }
+    return R::DeviceLost;
 }
 
 } // namespace ixvulkan

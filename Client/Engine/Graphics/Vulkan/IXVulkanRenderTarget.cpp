@@ -18,6 +18,7 @@ IXVulkanRenderTarget::IXVulkanRenderTarget(IXVulkanDevice& device,
                                            std::shared_ptr<ixrhi::IXRHITexture> color,
                                            std::shared_ptr<ixrhi::IXRHITexture> depth,
                                            VkRenderPass pass,
+                                           bool ownPass,
                                            VkFramebuffer framebuffer,
                                            std::unique_ptr<IXVulkanRenderPass> passToken,
                                            float clearColor[4],
@@ -28,6 +29,7 @@ IXVulkanRenderTarget::IXVulkanRenderTarget(IXVulkanDevice& device,
     , m_color(std::move(color))
     , m_depth(std::move(depth))
     , m_pass(pass)
+    , m_ownPass(ownPass)
     , m_framebuffer(framebuffer)
     , m_passToken(std::move(passToken))
     , m_clearDepth(clearDepth)
@@ -49,7 +51,7 @@ IXVulkanRenderTarget::~IXVulkanRenderTarget()
     const VkDevice native = m_device->NativeDevice();
     if (m_framebuffer != VK_NULL_HANDLE)
         vkDestroyFramebuffer(native, m_framebuffer, nullptr);
-    if (m_pass != VK_NULL_HANDLE)
+    if (m_ownPass && m_pass != VK_NULL_HANDLE)
         vkDestroyRenderPass(native, m_pass, nullptr);
 }
 
@@ -98,25 +100,63 @@ std::unique_ptr<ixrhi::IXRHIRenderTarget> IXVulkanDevice::CreateRenderTarget(
     if (desc.depth && depth == nullptr)
         return nullptr;
 
-    const VkFormat colorFormat = ToVkFormat(desc.color->Format());
     const bool hasDepth = depth != nullptr;
-    const VkFormat depthFormat = hasDepth ? ToVkFormat(desc.depth->Format()) : VK_FORMAT_UNDEFINED;
+    VkRenderPass pass = CreateCompatRenderPass(desc.color->Format(),
+        hasDepth ? desc.depth->Format() : ixrhi::IXRHIFormat::Undefined,
+        desc.colorLoad,
+        desc.colorStore,
+        desc.depthLoad,
+        desc.depthStore,
+        desc.debugName.c_str());
 
+    VkFramebuffer framebuffer = CreateFramebufferFor(pass,
+        color->NativeView(),
+        hasDepth ? depth->NativeView() : VK_NULL_HANDLE,
+        desc.color->Width(),
+        desc.color->Height());
+
+    auto token = IXVulkanRenderPass::Borrow(*this, pass);
+    float clearColor[4] = {
+        desc.clearColor[0], desc.clearColor[1], desc.clearColor[2], desc.clearColor[3]};
+    return std::make_unique<IXVulkanRenderTarget>(*this,
+        desc.color,
+        desc.depth,
+        pass,
+        /*ownPass=*/true,
+        framebuffer,
+        std::move(token),
+        clearColor,
+        desc.clearDepth,
+        desc.clearStencil,
+        desc.debugName);
+}
+
+VkRenderPass IXVulkanDevice::CreateCompatRenderPass(ixrhi::IXRHIFormat colorFormat,
+                                                    ixrhi::IXRHIFormat depthFormat,
+                                                    ixrhi::IXRHILoadOp colorLoad,
+                                                    ixrhi::IXRHIStoreOp colorStore,
+                                                    ixrhi::IXRHILoadOp depthLoad,
+                                                    ixrhi::IXRHIStoreOp depthStore,
+                                                    const char* debugName,
+                                                    bool forPresent) const
+{
     // Pass mirrors the old offscreen clear/load passes: color final READ_ONLY
     // (sampled by composite/editor), depth final ATTACHMENT; initial layouts
     // follow the load ops. Subpass dependencies preserve the old ordering
     // (fragment-shader reads before attachment writes and vice versa).
+    const bool hasDepth = depthFormat != ixrhi::IXRHIFormat::Undefined;
     VkAttachmentDescription attachments[2]{};
-    attachments[0].format = colorFormat;
+    attachments[0].format = ToVkFormat(colorFormat);
     attachments[0].samples = VK_SAMPLE_COUNT_1_BIT;
-    attachments[0].loadOp = ToVkLoadOp(desc.colorLoad);
-    attachments[0].storeOp = ToVkStoreOp(desc.colorStore);
+    attachments[0].loadOp = ToVkLoadOp(colorLoad);
+    attachments[0].storeOp = ToVkStoreOp(colorStore);
     attachments[0].stencilLoadOp = VK_ATTACHMENT_LOAD_OP_DONT_CARE;
     attachments[0].stencilStoreOp = VK_ATTACHMENT_STORE_OP_DONT_CARE;
-    attachments[0].initialLayout = desc.colorLoad == ixrhi::IXRHILoadOp::Clear
+    attachments[0].initialLayout = colorLoad == ixrhi::IXRHILoadOp::Clear
         ? VK_IMAGE_LAYOUT_UNDEFINED
         : VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL;
-    attachments[0].finalLayout = VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL;
+    attachments[0].finalLayout = forPresent ? VK_IMAGE_LAYOUT_PRESENT_SRC_KHR
+                                            : VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL;
 
     VkAttachmentReference colorRef{};
     colorRef.attachment = 0;
@@ -150,13 +190,13 @@ std::unique_ptr<ixrhi::IXRHIRenderTarget> IXVulkanDevice::CreateRenderTarget(
     uint32_t attachmentCount = 1;
     if (hasDepth)
     {
-        attachments[1].format = depthFormat;
+        attachments[1].format = ToVkFormat(depthFormat);
         attachments[1].samples = VK_SAMPLE_COUNT_1_BIT;
-        attachments[1].loadOp = ToVkLoadOp(desc.depthLoad);
-        attachments[1].storeOp = ToVkStoreOp(desc.depthStore);
-        attachments[1].stencilLoadOp = ToVkLoadOp(desc.depthLoad);
+        attachments[1].loadOp = ToVkLoadOp(depthLoad);
+        attachments[1].storeOp = forPresent ? VK_ATTACHMENT_STORE_OP_DONT_CARE : ToVkStoreOp(depthStore);
+        attachments[1].stencilLoadOp = ToVkLoadOp(depthLoad);
         attachments[1].stencilStoreOp = VK_ATTACHMENT_STORE_OP_DONT_CARE;
-        attachments[1].initialLayout = desc.depthLoad == ixrhi::IXRHILoadOp::Clear
+        attachments[1].initialLayout = depthLoad == ixrhi::IXRHILoadOp::Clear
             ? VK_IMAGE_LAYOUT_UNDEFINED
             : VK_IMAGE_LAYOUT_DEPTH_STENCIL_ATTACHMENT_OPTIMAL;
         attachments[1].finalLayout = VK_IMAGE_LAYOUT_DEPTH_STENCIL_ATTACHMENT_OPTIMAL;
@@ -177,38 +217,31 @@ std::unique_ptr<ixrhi::IXRHIRenderTarget> IXVulkanDevice::CreateRenderTarget(
         "vkCreateRenderPass(target)",
         __FILE__,
         __LINE__);
-    SetDebugName(VK_OBJECT_TYPE_RENDER_PASS,
-        reinterpret_cast<std::uint64_t>(pass),
-        desc.debugName.c_str());
+    SetDebugName(VK_OBJECT_TYPE_RENDER_PASS, reinterpret_cast<std::uint64_t>(pass), debugName);
+    return pass;
+}
 
-    VkImageView views[2] = {color->NativeView(), hasDepth ? depth->NativeView() : VK_NULL_HANDLE};
+VkFramebuffer IXVulkanDevice::CreateFramebufferFor(VkRenderPass pass,
+                                                   VkImageView colorView,
+                                                   VkImageView depthViewOrNull,
+                                                   std::uint32_t width,
+                                                   std::uint32_t height) const
+{
+    VkImageView views[2] = {colorView, depthViewOrNull};
     VkFramebufferCreateInfo fbInfo{};
     fbInfo.sType = VK_STRUCTURE_TYPE_FRAMEBUFFER_CREATE_INFO;
     fbInfo.renderPass = pass;
-    fbInfo.attachmentCount = attachmentCount;
+    fbInfo.attachmentCount = depthViewOrNull != VK_NULL_HANDLE ? 2u : 1u;
     fbInfo.pAttachments = views;
-    fbInfo.width = desc.color->Width();
-    fbInfo.height = desc.color->Height();
+    fbInfo.width = width;
+    fbInfo.height = height;
     fbInfo.layers = 1;
     VkFramebuffer framebuffer = VK_NULL_HANDLE;
     CheckVk(vkCreateFramebuffer(NativeDevice(), &fbInfo, nullptr, &framebuffer),
         "vkCreateFramebuffer(target)",
         __FILE__,
         __LINE__);
-
-    auto token = IXVulkanRenderPass::Borrow(*this, pass);
-    float clearColor[4] = {
-        desc.clearColor[0], desc.clearColor[1], desc.clearColor[2], desc.clearColor[3]};
-    return std::make_unique<IXVulkanRenderTarget>(*this,
-        desc.color,
-        desc.depth,
-        pass,
-        framebuffer,
-        std::move(token),
-        clearColor,
-        desc.clearDepth,
-        desc.clearStencil,
-        desc.debugName);
+    return framebuffer;
 }
 
 void IXVulkanDevice::WaitIdle()

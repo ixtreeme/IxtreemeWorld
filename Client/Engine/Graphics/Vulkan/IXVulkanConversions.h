@@ -12,6 +12,11 @@
 
 #include <cstdint>
 
+namespace ixrhi
+{
+enum class IXRHIFrameResult : std::uint8_t;
+}
+
 namespace ixvulkan
 {
 
@@ -35,5 +40,8 @@ VkSampleCountFlagBits ToVkSampleCount(std::uint32_t count);
 VkImageAspectFlags ToVkAspectMask(ixrhi::IXRHIFormat format);
 VkAttachmentLoadOp ToVkLoadOp(ixrhi::IXRHILoadOp op);
 VkAttachmentStoreOp ToVkStoreOp(ixrhi::IXRHIStoreOp op);
+// Maps swapchain acquisition/presentation VkResults to engine frame results
+// (pure; unit-tested). Anything unrecognized is DeviceLost, never success.
+ixrhi::IXRHIFrameResult TranslateFrameResult(VkResult result);
 
 } // namespace ixvulkan

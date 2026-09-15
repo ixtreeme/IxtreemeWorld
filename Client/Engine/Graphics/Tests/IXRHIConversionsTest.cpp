@@ -4,6 +4,8 @@
 
 #include "IXVulkanConversions.h"
 
+#include "IXRHIFrame.h"
+
 #include <cstdio>
 
 extern int g_ixrhiSmokeFailures;
@@ -85,4 +87,21 @@ void RunConversionChecks()
             VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL,
         "conv layout read-only");
     CheckConv(ixvulkan::ToVkSampleCount(1) == VK_SAMPLE_COUNT_1_BIT, "conv samples 1");
+
+    // Frame-result translation: engine semantics, no Vulkan leakage.
+    CheckConv(ixvulkan::TranslateFrameResult(VK_SUCCESS) == ixrhi::IXRHIFrameResult::Success,
+        "frame result success");
+    CheckConv(ixvulkan::TranslateFrameResult(VK_SUBOPTIMAL_KHR) == ixrhi::IXRHIFrameResult::Success,
+        "frame result suboptimal continues");
+    CheckConv(ixvulkan::TranslateFrameResult(VK_ERROR_OUT_OF_DATE_KHR) ==
+            ixrhi::IXRHIFrameResult::SwapchainRecreated,
+        "frame result out-of-date recreates");
+    CheckConv(ixvulkan::TranslateFrameResult(VK_TIMEOUT) == ixrhi::IXRHIFrameResult::Skip,
+        "frame result timeout skips");
+    CheckConv(ixvulkan::TranslateFrameResult(VK_ERROR_DEVICE_LOST) ==
+            ixrhi::IXRHIFrameResult::DeviceLost,
+        "frame result device lost");
+    CheckConv(ixvulkan::TranslateFrameResult(VK_ERROR_OUT_OF_DEVICE_MEMORY) ==
+            ixrhi::IXRHIFrameResult::DeviceLost,
+        "frame result unknown is DeviceLost, never success");
 }

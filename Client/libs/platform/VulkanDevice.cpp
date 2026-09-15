@@ -1,5 +1,7 @@
 #include "VulkanDevice.h"
 
+#include "IXVulkanSurface.h" // backend-owned surface creation (no link cycle: header-only)
+
 #include <algorithm>
 #include <array>
 #include <cstdarg>
@@ -516,8 +518,36 @@ void VulkanDevice::WaitIdle()
         VK_CHECK(vkDeviceWaitIdle(m_device));
 }
 
+void VulkanDevice::SetMigrationFrameState(VkCommandBuffer activeCmd,
+                                         uint32_t frameIndex,
+                                         uint32_t imageIndex,
+                                         uint64_t frameNumber,
+                                         uint64_t safeFrameNumber,
+                                         bool frameActive)
+{
+    m_migrationActiveCmd = activeCmd;
+    m_currentFrame = frameIndex;
+    m_imageIndex = imageIndex;
+    m_frameNumber = frameNumber;
+    m_safeFrameNumber = safeFrameNumber;
+    m_frameStarted = frameActive;
+    m_skipFrame = !frameActive;
+}
+
+VkImage VulkanDevice::GetSwapchainImage(uint32_t index) const
+{
+    return index < m_swapchainImages.size() ? m_swapchainImages[index] : VK_NULL_HANDLE;
+}
+
+VkImageView VulkanDevice::GetSwapchainImageView(uint32_t index) const
+{
+    return index < m_swapchainImageViews.size() ? m_swapchainImageViews[index] : VK_NULL_HANDLE;
+}
+
 void VulkanDevice::Destroy()
 {
+    if (!m_device)
+        return;
     WaitIdle();
 
     if (m_timestampQueryPool)
@@ -569,7 +599,12 @@ bool VulkanDevice::CreateInstance(NativeWindow& window)
         Log("VK_LAYER_KHRONOS_validation unavailable; continuing without validation.");
 #endif
 
-    const char* surfaceExtension = window.GetVulkanSurfaceExtensionName();
+    const char* surfaceExtension = window.DescribeNative().vulkanSurfaceExtension;
+    if (surfaceExtension == nullptr)
+    {
+        Log("Window provides no Vulkan surface extension.");
+        return false;
+    }
     std::vector<const char*> extensions = {VK_KHR_SURFACE_EXTENSION_NAME, surfaceExtension};
     uint32_t extensionCount = 0;
     VK_CHECK(vkEnumerateInstanceExtensionProperties(nullptr, &extensionCount, nullptr));
@@ -643,7 +678,9 @@ bool VulkanDevice::CreateDebugMessenger()
 
 bool VulkanDevice::CreateSurface(NativeWindow& window)
 {
-    VK_CHECK(window.CreateVulkanSurface(m_instance, &m_surface));
+    // Surface creation logic lives in the IXVulkan backend (Phase 3C); legacy
+    // code only holds the resulting handle. See IXVulkanSurface.
+    VK_CHECK(ixvulkan::CreateSurfaceForWindow(window.DescribeNative(), m_instance, &m_surface));
     return true;
 }
 
@@ -763,8 +800,10 @@ bool VulkanDevice::CreateSwapchainObjects(uint32_t width, uint32_t height)
     if (width == 0 || height == 0)
         return true;
 
-    return CreateSwapchain(width, height) && CreateImageViews() && CreateDepthStencilImages() &&
-        CreateRenderPass() && CreateFramebuffers();
+    // NOTE (Phase 3C): the main render pass + framebuffers are backend-owned
+    // (IXVulkanSwapchain). Legacy CreateRenderPass/CreateFramebuffers are
+    // dormant; m_renderPass is a backend-synced mirror, m_framebuffers unused.
+    return CreateSwapchain(width, height) && CreateImageViews() && CreateDepthStencilImages();
 }
 
 bool VulkanDevice::CreateSwapchain(uint32_t width, uint32_t height)
@@ -1246,13 +1285,9 @@ void VulkanDevice::DestroySwapchainObjects()
         vkDestroySemaphore(m_device, semaphore, nullptr);
     m_renderFinished.clear();
 
-    for (VkFramebuffer framebuffer : m_framebuffers)
-        vkDestroyFramebuffer(m_device, framebuffer, nullptr);
-    m_framebuffers.clear();
-
-    if (m_renderPass)
-        vkDestroyRenderPass(m_device, m_renderPass, nullptr);
-    m_renderPass = VK_NULL_HANDLE;
+    // NOTE (Phase 3C): framebuffers + render pass are backend-owned now (see
+    // IXVulkanSwapchain); legacy must not destroy them. m_framebuffers stays
+    // empty; m_renderPass is a backend-synced mirror cleared by the backend.
 
     for (VkImageView view : m_depthStencilImageViews)
         vkDestroyImageView(m_device, view, nullptr);

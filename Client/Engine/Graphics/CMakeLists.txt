@@ -1,9 +1,10 @@
-# Engine/Graphics — IXRHI contract + Vulkan backend (Phase 2).
+# Engine/Graphics — IXRHI contract + Vulkan backend (Phases 2-3C).
 #
 # Dependency (strict, one direction):
 #   IXEngineIXRHI   — pure contract, knows no Vulkan (INTERFACE, header-only).
-#   IXEngineVulkan  — backend, depends on IXEngineIXRHI + Vulkan + loop owner.
-#   Renderer (IXEngineRender) — depends on IXEngineIXRHI for migrated code.
+#   IXEngineVulkan  — backend OWNING the frame contract (acquire/record/submit/
+#                     present/sync/timestamps/swapchain object) + legacy device
+#                     infrastructure use. Renderers depend on IXRHI only.
 # Forbidden: IXRHI -> Vulkan (headers verified by IXRHISmoke TU).
 
 add_library(IXEngineIXRHI INTERFACE)
@@ -32,6 +33,10 @@ add_library(IXEngineVulkan STATIC
     Vulkan/IXVulkanRenderTarget.h
     Vulkan/IXVulkanCommandList.cpp
     Vulkan/IXVulkanCommandList.h
+    Vulkan/IXVulkanFrame.cpp
+    Vulkan/IXVulkanFrameTracker.h
+    Vulkan/IXVulkanSwapchain.cpp
+    Vulkan/IXVulkanSwapchain.h
     Vulkan/IXVulkanSync.h
     Vulkan/IXVulkanBridge.cpp
     Vulkan/IXVulkanBridge.h
@@ -59,6 +64,13 @@ elseif(ANDROID)
 endif()
 
 target_compile_features(IXEngineVulkan PUBLIC cxx_std_20)
+
+# Backend timestamp capture honors the same verbose-diagnostics gate as the
+# legacy loop did (pool created only with IXTREEME_DEBUG_LOGS).
+target_compile_definitions(IXEngineVulkan
+    PUBLIC
+        $<$<BOOL:${IXTREEME_VERBOSE_DIAGNOSTICS}>:IXTREEME_DEBUG_LOGS=1>
+)
 
 # Editor Vulkan adapter (ImGui backend integration). Editor-only: needs imgui
 # bindings, exactly like the editor panels in IXEngineRender.

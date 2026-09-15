@@ -1,4 +1,6 @@
-// IXVulkanDevice implementation: strangler adapter over the live VulkanDevice.
+// IXVulkanDevice implementation: Vulkan backend OWNING the IXRHI graphics
+// frame contract (Phase 3C authority). The legacy VulkanDevice keeps
+// device/queue/swapchain-handle infrastructure plus synced migration shims.
 
 #include "IXVulkanDevice.h"
 
@@ -8,6 +10,7 @@
 #include "IXVulkanPipeline.h"
 #include "IXVulkanRenderPass.h"
 #include "IXVulkanResources.h"
+#include "IXVulkanSwapchain.h"
 #include "IXVulkanSync.h"
 #include "VulkanDevice.h"
 
@@ -45,12 +48,19 @@ IXVulkanDevice::IXVulkanDevice(VulkanDevice& loop) : m_loop(&loop)
         __LINE__);
 
     QueryCapabilities();
+
+    m_swapchain = std::make_unique<IXVulkanSwapchain>(*this);
+    if (m_loop->GetSwapchain() != VK_NULL_HANDLE)
+    {
+        m_swapchain->Rebuild();
+        EnsureSwapchainObjects();
+    }
+    CreateTimestampPool();
 }
 
 IXVulkanDevice::~IXVulkanDevice()
 {
-    if (m_uploadPool != VK_NULL_HANDLE)
-        vkDestroyCommandPool(NativeDevice(), m_uploadPool, nullptr);
+    Shutdown(); // idempotent backstop; explicit Shutdown precedes device teardown
 }
 
 VkDevice IXVulkanDevice::NativeDevice() const

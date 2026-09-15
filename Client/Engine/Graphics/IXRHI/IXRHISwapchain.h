@@ -1,9 +1,13 @@
 #pragma once
 
-// IXRHISwapchain — Phase-2 scope: info queries over the live swapchain plus a
-// resize request. Acquire/present stay inside VulkanDevice's frame loop until the
-// frame-loop migration (Phase 3B, with offscreen decoupling); they are therefore
-// deliberately ABSENT from this interface rather than faked.
+// IXRHISwapchain — main-window swapchain abstraction (Phase 3C: real object,
+// not just info).
+//
+// Acquire/present pacing lives in the IXRHIDevice frame lifecycle (BeginFrame/
+// EndFrame), keeping one authoritative flow (§73). The swapchain object carries
+// properties, the backbuffer format/extent contract, and the generation counter
+// (§53) that detects stale references after recreation. It remains an object
+// (not a global) so future detached windows stay possible (§90).
 
 #include "IXRHI.h"
 #include "IXRHITypes.h"
@@ -23,6 +27,8 @@ public:
     virtual IXRHIFormat ColorFormat() const = 0;
     virtual IXRHIFormat DepthFormat() const = 0;
     virtual std::uint32_t ImageCount() const = 0;
+    // Bumped on every swapchain (re)creation.
+    virtual std::uint64_t Generation() const = 0;
 
     virtual bool RequestResize(std::uint32_t width, std::uint32_t height) = 0;
 };

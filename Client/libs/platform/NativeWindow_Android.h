@@ -19,8 +19,7 @@ public:
     void SetInputCallback(InputCallback cb) override;
     uint32_t GetWidth() const override { return m_width; }
     uint32_t GetHeight() const override { return m_height; }
-    VkResult CreateVulkanSurface(VkInstance instance, VkSurfaceKHR* outSurface) override;
-    const char* GetVulkanSurfaceExtensionName() const override { return "VK_KHR_android_surface"; }
+    NativeWindowDesc DescribeNative() const override;
 
     bool HasNativeWindow() const { return m_nativeWindow != nullptr; }
 

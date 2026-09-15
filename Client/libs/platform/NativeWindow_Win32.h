@@ -23,8 +23,7 @@ public:
     void SetFileDropCallback(FileDropCallback cb) override;
     uint32_t GetWidth() const override { return m_width; }
     uint32_t GetHeight() const override { return m_height; }
-    VkResult CreateVulkanSurface(VkInstance instance, VkSurfaceKHR* outSurface) override;
-    const char* GetVulkanSurfaceExtensionName() const override { return "VK_KHR_win32_surface"; }
+    NativeWindowDesc DescribeNative() const override;
 
     HWND GetHwnd() const { return m_hwnd; }
     void SetMessageCallback(MessageCallback cb);

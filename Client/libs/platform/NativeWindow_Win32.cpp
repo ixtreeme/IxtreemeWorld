@@ -1,4 +1,6 @@
+#if !defined(VK_USE_PLATFORM_WIN32_KHR)
 #define VK_USE_PLATFORM_WIN32_KHR
+#endif
 #include <vulkan/vulkan.h>
 
 #include "NativeWindow_Win32.h"
@@ -261,13 +263,16 @@ bool NativeWindow_Win32::ConsumeResize(uint32_t& width, uint32_t& height)
     return true;
 }
 
-VkResult NativeWindow_Win32::CreateVulkanSurface(VkInstance instance, VkSurfaceKHR* outSurface)
+NativeWindowDesc NativeWindow_Win32::DescribeNative() const
 {
-    VkWin32SurfaceCreateInfoKHR create{};
-    create.sType = VK_STRUCTURE_TYPE_WIN32_SURFACE_CREATE_INFO_KHR;
-    create.hinstance = m_instance;
-    create.hwnd = m_hwnd;
-    return vkCreateWin32SurfaceKHR(instance, &create, nullptr, outSurface);
+    NativeWindowDesc desc;
+    desc.type = NativeWindowDesc::Type::Win32;
+    desc.windowHandle = m_hwnd;
+    desc.instanceHandle = m_instance;
+    desc.vulkanSurfaceExtension = "VK_KHR_win32_surface";
+    desc.width = m_width;
+    desc.height = m_height;
+    return desc;
 }
 
 void NativeWindow_Win32::DispatchInput(const InputEvent& event)

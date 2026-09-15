@@ -60,6 +60,18 @@ target_include_directories(IXEnginePlatform
     PUBLIC
         ${CMAKE_CURRENT_SOURCE_DIR}
         ${CLIENT_LIBS_DIR}
+    # PRIVATE backend surface helper (header-only, no link cycle). Surface
+    # creation logic is backend-owned; legacy code only holds the handle.
+    PRIVATE
+        ${CLIENT_ROOT}/Engine/Graphics/Vulkan
 )
+
+# Platform surface extensions must be visible wherever vulkan.h is included
+# (the backend surface helper needs the Win32/Android entry points).
+if(WIN32)
+    target_compile_definitions(IXEnginePlatform PRIVATE VK_USE_PLATFORM_WIN32_KHR)
+elseif(ANDROID)
+    target_compile_definitions(IXEnginePlatform PRIVATE VK_USE_PLATFORM_ANDROID_KHR)
+endif()
 
 target_compile_features(IXEnginePlatform PUBLIC cxx_std_20)

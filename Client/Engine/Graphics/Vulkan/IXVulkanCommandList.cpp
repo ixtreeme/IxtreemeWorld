@@ -339,38 +339,4 @@ IXVulkanSemaphore::~IXVulkanSemaphore()
         vkDestroySemaphore(m_device->NativeDevice(), m_semaphore, nullptr);
 }
 
-IXVulkanSwapchain::IXVulkanSwapchain(IXVulkanDevice& device) : m_device(&device)
-{
-}
-
-std::uint32_t IXVulkanSwapchain::Width() const
-{
-    return m_device->Loop().GetSwapchainExtent().width;
-}
-
-std::uint32_t IXVulkanSwapchain::Height() const
-{
-    return m_device->Loop().GetSwapchainExtent().height;
-}
-
-ixrhi::IXRHIFormat IXVulkanSwapchain::ColorFormat() const
-{
-    return FromVkFormat(m_device->Loop().GetSwapchainFormat());
-}
-
-ixrhi::IXRHIFormat IXVulkanSwapchain::DepthFormat() const
-{
-    return FromVkFormat(m_device->Loop().GetDepthStencilFormat());
-}
-
-std::uint32_t IXVulkanSwapchain::ImageCount() const
-{
-    return m_device->Loop().GetSwapchainImageCount();
-}
-
-bool IXVulkanSwapchain::RequestResize(std::uint32_t width, std::uint32_t height)
-{
-    return m_device->Loop().Resize(width, height);
-}
-
 } // namespace ixvulkan
