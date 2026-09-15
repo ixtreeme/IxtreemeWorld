@@ -6,6 +6,7 @@
 #include "IXVulkanCommandList.h"
 #include "IXVulkanConversions.h"
 #include "IXVulkanPipeline.h"
+#include "IXVulkanRenderPass.h"
 #include "IXVulkanResources.h"
 #include "IXVulkanSync.h"
 #include "VulkanDevice.h"
@@ -57,16 +58,15 @@ VkDevice IXVulkanDevice::NativeDevice() const
     return m_loop->GetDevice();
 }
 
-VkRenderPass IXVulkanDevice::ResolveRenderPass() const
+VkRenderPass IXVulkanDevice::ResolveRenderPass(const ixrhi::IXRHIRenderPass* pass) const
 {
-    if (m_pipelineRenderPassOverride != VK_NULL_HANDLE)
-        return m_pipelineRenderPassOverride;
+    if (pass != nullptr)
+    {
+        if (auto* native = dynamic_cast<const IXVulkanRenderPass*>(pass))
+            return native->Native();
+        return VK_NULL_HANDLE; // foreign implementation: no compatible pass known
+    }
     return m_loop->GetRenderPass();
-}
-
-void IXVulkanDevice::SetPipelineRenderPass(VkRenderPass pass)
-{
-    m_pipelineRenderPassOverride = pass;
 }
 
 void IXVulkanDevice::SetDebugName(VkObjectType type, std::uint64_t handle, const char* name) const
@@ -129,6 +129,66 @@ void IXVulkanDevice::AllocateAndBind(VkImage image,
         __FILE__,
         __LINE__);
     CheckVk(vkBindImageMemory(NativeDevice(), image, out, 0), "vkBindImageMemory", __FILE__, __LINE__);
+}
+
+void IXVulkanDevice::CopyBufferSync(VkBuffer src, VkBuffer dst, VkDeviceSize size) const
+{
+    if (src == VK_NULL_HANDLE || dst == VK_NULL_HANDLE || size == 0)
+        return;
+    std::lock_guard<std::mutex> lock(m_uploadMutex);
+    VkCommandBufferAllocateInfo alloc{};
+    alloc.sType = VK_STRUCTURE_TYPE_COMMAND_BUFFER_ALLOCATE_INFO;
+    alloc.commandPool = m_uploadPool;
+    alloc.level = VK_COMMAND_BUFFER_LEVEL_PRIMARY;
+    alloc.commandBufferCount = 1;
+    VkCommandBuffer cmd = VK_NULL_HANDLE;
+    CheckVk(vkAllocateCommandBuffers(NativeDevice(), &alloc, &cmd),
+        "vkAllocateCommandBuffers(copy)",
+        __FILE__,
+        __LINE__);
+    VkCommandBufferBeginInfo begin{};
+    begin.sType = VK_STRUCTURE_TYPE_COMMAND_BUFFER_BEGIN_INFO;
+    begin.flags = VK_COMMAND_BUFFER_USAGE_ONE_TIME_SUBMIT_BIT;
+    CheckVk(vkBeginCommandBuffer(cmd, &begin), "vkBeginCommandBuffer(copy)", __FILE__, __LINE__);
+    VkBufferCopy region{};
+    region.size = size;
+    vkCmdCopyBuffer(cmd, src, dst, 1, &region);
+    CheckVk(vkEndCommandBuffer(cmd), "vkEndCommandBuffer(copy)", __FILE__, __LINE__);
+    VkSubmitInfo submit{};
+    submit.sType = VK_STRUCTURE_TYPE_SUBMIT_INFO;
+    submit.commandBufferCount = 1;
+    submit.pCommandBuffers = &cmd;
+    // Parity with pre-migration staging uploads: submit + queue wait-idle.
+    CheckVk(vkQueueSubmit(m_loop->GetGraphicsQueue(), 1, &submit, VK_NULL_HANDLE),
+        "vkQueueSubmit(copy)",
+        __FILE__,
+        __LINE__);
+    CheckVk(vkQueueWaitIdle(m_loop->GetGraphicsQueue()), "vkQueueWaitIdle(copy)", __FILE__, __LINE__);
+    vkFreeCommandBuffers(NativeDevice(), m_uploadPool, 1, &cmd);
+}
+
+bool IXVulkanDevice::IsTextureFormatSupported(ixrhi::IXRHIFormat format,
+                                              ixrhi::IXRHITextureUsage usage) const
+{
+    const VkFormat vkFormat = ToVkFormat(format);
+    if (vkFormat == VK_FORMAT_UNDEFINED)
+        return false;
+    VkFormatProperties props{};
+    vkGetPhysicalDeviceFormatProperties(m_loop->GetPhysicalDevice(), vkFormat, &props);
+    VkFormatFeatureFlags required = 0;
+    const auto bits = static_cast<std::uint32_t>(usage);
+    using U = ixrhi::IXRHITextureUsage;
+    if (bits & static_cast<std::uint32_t>(U::Sampled))
+        required |= VK_FORMAT_FEATURE_SAMPLED_IMAGE_BIT;
+    if (bits & static_cast<std::uint32_t>(U::TransferDst))
+        required |= VK_FORMAT_FEATURE_TRANSFER_DST_BIT;
+    if (bits & static_cast<std::uint32_t>(U::TransferSrc))
+        required |= VK_FORMAT_FEATURE_TRANSFER_SRC_BIT;
+    if (bits & static_cast<std::uint32_t>(U::ColorAttachment))
+        required |= VK_FORMAT_FEATURE_COLOR_ATTACHMENT_BIT;
+    if (bits & static_cast<std::uint32_t>(U::DepthStencilAttachment))
+        required |= VK_FORMAT_FEATURE_DEPTH_STENCIL_ATTACHMENT_BIT;
+    return (props.optimalTilingFeatures & required) == required;
 }
 
 void IXVulkanDevice::QueryCapabilities()
@@ -203,8 +263,46 @@ std::shared_ptr<ixrhi::IXRHIBuffer> IXVulkanDevice::CreateBuffer(
         desc.sizeBytes,
         desc.usage,
         desc.debugName);
-    if (initialDataOrNull != nullptr && initialBytes > 0 && hostVisible)
-        result->Write(0, initialDataOrNull, initialBytes);
+    if (initialDataOrNull != nullptr && initialBytes > 0)
+    {
+        if (hostVisible)
+        {
+            result->Write(0, initialDataOrNull, initialBytes);
+        }
+        else
+        {
+            // Device-local with payload (static vertex/index data): stage through
+            // a host buffer and copy synchronously (parity with the old
+            // CreateDeviceLocalBuffer setup path).
+            const std::size_t bytes = initialBytes < desc.sizeBytes
+                ? initialBytes
+                : static_cast<std::size_t>(desc.sizeBytes);
+            VkBuffer staging = VK_NULL_HANDLE;
+            VkBufferCreateInfo stagingInfo{};
+            stagingInfo.sType = VK_STRUCTURE_TYPE_BUFFER_CREATE_INFO;
+            stagingInfo.size = static_cast<VkDeviceSize>(bytes);
+            stagingInfo.usage = VK_BUFFER_USAGE_TRANSFER_SRC_BIT;
+            stagingInfo.sharingMode = VK_SHARING_MODE_EXCLUSIVE;
+            CheckVk(vkCreateBuffer(NativeDevice(), &stagingInfo, nullptr, &staging),
+                "vkCreateBuffer(staging)",
+                __FILE__,
+                __LINE__);
+            VkDeviceMemory stagingMemory = VK_NULL_HANDLE;
+            AllocateAndBind(staging,
+                VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT | VK_MEMORY_PROPERTY_HOST_COHERENT_BIT,
+                stagingMemory);
+            void* mapped = nullptr;
+            CheckVk(vkMapMemory(NativeDevice(), stagingMemory, 0, stagingInfo.size, 0, &mapped),
+                "vkMapMemory(staging)",
+                __FILE__,
+                __LINE__);
+            std::memcpy(mapped, initialDataOrNull, bytes);
+            vkUnmapMemory(NativeDevice(), stagingMemory);
+            CopyBufferSync(staging, buffer, static_cast<VkDeviceSize>(bytes));
+            vkDestroyBuffer(NativeDevice(), staging, nullptr);
+            vkFreeMemory(NativeDevice(), stagingMemory, nullptr);
+        }
+    }
     return result;
 }
 
@@ -385,6 +483,14 @@ void IXVulkanDevice::UploadTextureBytes(VkImage image,
 
     vkDestroyBuffer(NativeDevice(), staging, nullptr);
     vkFreeMemory(NativeDevice(), stagingMemory, nullptr);
+}
+
+std::unique_ptr<ixrhi::IXRHIBufferUpload> IXVulkanDevice::UploadBufferAsync(
+    const ixrhi::IXRHIBufferDesc& desc, const void* src, std::size_t byteCount)
+{
+    if (desc.sizeBytes == 0 || src == nullptr || byteCount == 0)
+        return nullptr;
+    return std::make_unique<IXVulkanBufferUpload>(*this, desc, src, byteCount);
 }
 
 std::shared_ptr<ixrhi::IXRHISampler> IXVulkanDevice::CreateSampler(

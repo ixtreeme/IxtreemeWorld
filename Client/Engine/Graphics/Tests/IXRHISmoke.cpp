@@ -94,6 +94,16 @@ void TestDescriptorDefaults()
 
     const ixrhi::IXRHISamplerDesc sampler{};
     Check(sampler.maxLod == 1.0f, "sampler lod default");
+
+    Check(ixrhi::IXRHIFormatByteSize(ixrhi::IXRHIFormat::R8G8B8A8Srgb) == 4,
+        "format sRGB RGBA8 size 4");
+
+    ixrhi::IXRHIGraphicsPipelineDesc pipelineWithPass{};
+    Check(pipelineWithPass.targetRenderPass == nullptr, "pipeline target pass defaults null");
+    Check(pipelineWithPass.bindGroupLayouts.empty(), "pipeline layouts default empty");
+
+    const ixrhi::IXRHITextureDesc texDesc{};
+    Check(texDesc.sampleCount == 1, "texture samples default 1");
 }
 
 } // namespace

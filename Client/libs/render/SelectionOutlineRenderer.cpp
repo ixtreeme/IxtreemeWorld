@@ -225,6 +225,7 @@ bool SelectionOutlineRenderer::CreatePipeline(ixrhi::IXRHIDevice& rhi)
         ixrhi::IXRHIBlendFactor::OneMinusSrcAlpha,
         ixrhi::IXRHIBlendOp::Add}};
     desc.sampleCount = 1;
+    desc.targetRenderPass = m_targetPass;
     desc.debugName = "SelectionOutline";
 
     auto pipeline = rhi.CreateGraphicsPipeline(desc);

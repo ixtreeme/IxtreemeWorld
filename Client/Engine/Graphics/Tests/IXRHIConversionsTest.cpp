@@ -39,6 +39,10 @@ void RunConversionChecks()
         "conv Float4 -> Vk");
     CheckConv(ixvulkan::FromVkFormat(VK_FORMAT_B8G8R8A8_SRGB) == IXRHIFormat::B8G8R8A8Srgb,
         "conv swapchain sRGB <- Vk");
+    CheckConv(ixvulkan::FromVkFormat(VK_FORMAT_R8G8B8A8_SRGB) == IXRHIFormat::R8G8B8A8Srgb,
+        "conv sRGB RGBA8 <- Vk");
+    CheckConv(ixvulkan::ToVkFormat(IXRHIFormat::R8G8B8A8Srgb) == VK_FORMAT_R8G8B8A8_SRGB,
+        "conv sRGB RGBA8 -> Vk");
     CheckConv(ixvulkan::FromVkFormat(VK_FORMAT_D32_SFLOAT) == IXRHIFormat::D32Float,
         "conv depth <- Vk");
     CheckConv(ixvulkan::ToVkFormat(IXRHIFormat::Undefined) == VK_FORMAT_UNDEFINED,

@@ -26,6 +26,8 @@ add_library(IXEngineVulkan STATIC
     Vulkan/IXVulkanBinding.h
     Vulkan/IXVulkanPipeline.cpp
     Vulkan/IXVulkanPipeline.h
+    Vulkan/IXVulkanRenderPass.cpp
+    Vulkan/IXVulkanRenderPass.h
     Vulkan/IXVulkanCommandList.cpp
     Vulkan/IXVulkanCommandList.h
     Vulkan/IXVulkanSync.h

@@ -118,4 +118,31 @@ private:
     std::string m_debugName;
 };
 
+// Non-blocking staged upload (see ixrhi::IXRHIBufferUpload). Owns its transient
+// pool + fence; destruction before Take() waits and releases everything.
+class IXVulkanBufferUpload final : public ixrhi::IXRHIBufferUpload
+{
+public:
+    IXVulkanBufferUpload(IXVulkanDevice& device,
+                         const ixrhi::IXRHIBufferDesc& desc,
+                         const void* src,
+                         std::size_t byteCount);
+    ~IXVulkanBufferUpload() override;
+
+    bool IsReady() override;
+    std::shared_ptr<ixrhi::IXRHIBuffer> Take() override;
+
+private:
+    void ReleaseStaging();
+
+    IXVulkanDevice* m_device = nullptr;
+    std::shared_ptr<IXVulkanBuffer> m_target;
+    VkBuffer m_staging = VK_NULL_HANDLE;
+    VkDeviceMemory m_stagingMemory = VK_NULL_HANDLE;
+    VkCommandPool m_pool = VK_NULL_HANDLE;
+    VkFence m_fence = VK_NULL_HANDLE;
+    bool m_ready = false;
+    bool m_taken = false;
+};
+
 } // namespace ixvulkan

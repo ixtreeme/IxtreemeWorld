@@ -43,6 +43,7 @@ class IXRHIBindGroup;
 class IXRHICommandList;
 class IXRHISwapchain;
 class IXRHIDevice;
+class IXRHIRenderPass;
 
 // Engine-level status. VkResult NEVER crosses this boundary; the backend logs the
 // underlying VkResult for diagnostics and translates it here. Matches current

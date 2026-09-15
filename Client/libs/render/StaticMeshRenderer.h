@@ -1,9 +1,29 @@
 #pragma once
 
+// StaticMeshRenderer — Phase-3A IXRHI-native production path.
+//
+// ZERO Vk* dependency (verified by grep): vertex/index/uniform/storage buffers,
+// textures, samplers, shaders, 5 pipeline variants and bind groups are IXRHI
+// objects; draws record through ixrhi::IXRHICommandList. Rendering behavior
+// (passes, cull/depth/blend state, instancing, LOD fallback, outline pass) is
+// unchanged.
+//
+// Frame contract: Render* takes the recording command list (borrowed frame list
+// via ixvulkan::WrapFrameCommandList) and an IXRHIFrameInfo snapshot. Pipelines
+// bake against m_targetPass (offscreen scene pass, borrowed) or the backend
+// default (swapchain pass) when null.
+
 #include "AssetDatabase.h"
 #include "MapEditorTypes.h"
-#include "VulkanDevice.h"
 #include "WorldCamera.h"
+
+#include "IXRHIBinding.h"
+#include "IXRHIBuffer.h"
+#include "IXRHICommandList.h"
+#include "IXRHIDevice.h"
+#include "IXRHIPipeline.h"
+#include "IXRHIRenderPass.h"
+#include "IXRHITexture.h"
 
 #include <algorithm>
 #include <array>
@@ -12,6 +32,7 @@
 #include <cstdint>
 #include <filesystem>
 #include <limits>
+#include <memory>
 #include <mutex>
 #include <optional>
 #include <string>
@@ -35,18 +56,12 @@ public:
         Failed
     };
 
-    struct Buffer
-    {
-        VkBuffer buffer = VK_NULL_HANDLE;
-        VkDeviceMemory memory = VK_NULL_HANDLE;
-    };
-
     struct RgbaImage
     {
         std::string name;
         uint32_t width = 0;
         uint32_t height = 0;
-        VkFormat format = VK_FORMAT_R8G8B8A8_UNORM;
+        ixrhi::IXRHIFormat format = ixrhi::IXRHIFormat::R8G8B8A8Unorm;
         std::vector<uint8_t> pixels;
     };
 
@@ -94,42 +109,65 @@ public:
         Commit
     };
 
+    // Per-instance GPU record (model/mvp, tint, material). Layout must match
+    // the shader's storage block; also the per-frame CPU mirror element type.
+    struct InstanceBlock
+    {
+        WorldMat4 mvp;
+        WorldMat4 model;
+        float tint[4] = {1.0f, 1.0f, 1.0f, 1.0f};
+        float materialBaseColor[4] = {1.0f, 1.0f, 1.0f, 1.0f};
+        float materialParams[4] = {1.0f, 1.0f, 1.0f, 1.0f};
+        float materialEmissive[4] = {0.0f, 0.0f, 0.0f, 0.0f};
+        float materialUv[4] = {1.0f, 1.0f, 0.0f, 0.0f};
+        float materialAlpha[4] = {0.0f, 0.5f, 0.0f, 0.0f};
+    };
+
     StaticMeshRenderer() = default;
     ~StaticMeshRenderer();
 
-    bool Create(VulkanDevice& device, client::asset::IAssetReader& assets, const std::string& modelPath);
-    bool RecreatePipeline(VulkanDevice& device);
-    void SetMainRenderPass(VkRenderPass renderPass);
+    bool Create(ixrhi::IXRHIDevice& rhi,
+                client::asset::IAssetReader& assets,
+                const std::string& modelPath);
+    bool RecreatePipeline(ixrhi::IXRHIDevice& rhi);
+    // Borrowed target pass (offscreen scene pass); null = backend default.
+    void SetTargetPass(const ixrhi::IXRHIRenderPass* pass) { m_targetPass = pass; }
     void SetLightingState(const LightingState& lighting) { m_lightingState = lighting; }
-    void RenderInWorld(VulkanDevice& device,
+    void RenderInWorld(ixrhi::IXRHICommandList& cmd,
+        const ixrhi::IXRHIFrameInfo& frame,
         double timeSeconds,
         const WorldCamera& camera,
         const Instance& instance,
-        VkExtent2D targetExtent = {});
-    void RenderBatchInWorld(VulkanDevice& device,
+        std::uint32_t targetWidth = 0,
+        std::uint32_t targetHeight = 0);
+    void RenderBatchInWorld(ixrhi::IXRHICommandList& cmd,
+        const ixrhi::IXRHIFrameInfo& frame,
         double timeSeconds,
         const WorldCamera& camera,
         const std::vector<Instance>& instances,
-        VkExtent2D targetExtent = {});
-    void RenderLodBatchInWorld(VulkanDevice& device,
+        std::uint32_t targetWidth = 0,
+        std::uint32_t targetHeight = 0);
+    void RenderLodBatchInWorld(ixrhi::IXRHICommandList& cmd,
+        const ixrhi::IXRHIFrameInfo& frame,
         double timeSeconds,
         const WorldCamera& camera,
         const std::vector<Instance>& instances,
         const LodConfig& lodConfig,
         std::uint64_t configHash,
         std::uint32_t lodLevel,
-        VkExtent2D targetExtent = {});
+        std::uint32_t targetWidth = 0,
+        std::uint32_t targetHeight = 0);
     void RequestLodQualityBuild(const LodConfig& lodConfig, std::uint64_t configHash, std::uint32_t entityId);
     void Destroy();
 
     bool IsLoaded() const { return m_status == LoadStatus::LoadedStatic; }
     LoadStatus Status() const { return m_status; }
     bool IsSkinnedModel() const { return m_status == LoadStatus::UnsupportedSkinned; }
-    bool HasPipeline() const { return m_pipeline != VK_NULL_HANDLE; }
-    bool HasVertexBuffer() const { return m_vertexBuffer.buffer != VK_NULL_HANDLE; }
-    bool HasIndexBuffer() const { return m_indexBuffer.buffer != VK_NULL_HANDLE; }
-    bool HasTexture() const { return m_texture.image != VK_NULL_HANDLE && m_texture.view != VK_NULL_HANDLE; }
-    bool HasDescriptors() const { return m_descriptorPool != VK_NULL_HANDLE && m_descriptorSetLayout != VK_NULL_HANDLE; }
+    bool HasPipeline() const { return m_pipeline != nullptr; }
+    bool HasVertexBuffer() const { return m_vertexBuffer != nullptr; }
+    bool HasIndexBuffer() const { return m_indexBuffer != nullptr; }
+    bool HasTexture() const { return m_texture.image != nullptr; }
+    bool HasDescriptors() const { return m_bindGroup != nullptr && m_bindLayout != nullptr; }
     std::size_t VertexCount() const { return m_vertices.size(); }
     std::size_t IndexCount() const { return m_indices.size(); }
     std::size_t TriangleCount() const { return m_indices.size() / 3u; }
@@ -187,7 +225,7 @@ private:
 
     struct LodIndexBuffer
     {
-        Buffer buffer;
+        std::shared_ptr<ixrhi::IXRHIBuffer> buffer;
         std::vector<uint32_t> indices;
         std::vector<LodMeshDraw> draws;
         std::array<std::size_t, LodConfig::MaxLevels> triangles{};
@@ -225,65 +263,66 @@ private:
     {
         std::uint64_t configHash = 0;
         std::uint32_t diagnosticEntityId = 0;
-        LodIndexBuffer lodSet;
-        Buffer staging;
-        VkCommandPool commandPool = VK_NULL_HANDLE;
-        VkFence fence = VK_NULL_HANDLE;
+        LodIndexBuffer lodSet; // buffer filled by Take() on completion
+        std::unique_ptr<ixrhi::IXRHIBufferUpload> upload;
         double uploadMs = 0.0;
     };
 
     struct Texture
     {
-        VkImage image = VK_NULL_HANDLE;
-        VkDeviceMemory memory = VK_NULL_HANDLE;
-        VkImageView view = VK_NULL_HANDLE;
-        VkSampler sampler = VK_NULL_HANDLE;
-        VkFormat format = VK_FORMAT_UNDEFINED;
+        std::shared_ptr<ixrhi::IXRHITexture> image;
+        std::shared_ptr<ixrhi::IXRHISampler> sampler;
+        ixrhi::IXRHIFormat format = ixrhi::IXRHIFormat::Undefined;
         uint32_t width = 0;
         uint32_t height = 0;
         uint32_t mipLevels = 0;
         std::string name;
     };
 
+    struct MaterialTexture
+    {
+        std::shared_ptr<ixrhi::IXRHITexture> texture;
+        std::shared_ptr<ixrhi::IXRHISampler> sampler;
+    };
+
     struct MaterialTextureViews
     {
-        VkDescriptorImageInfo baseColor{};
-        VkDescriptorImageInfo normal{};
-        VkDescriptorImageInfo orm{};
+        MaterialTexture baseColor;
+        MaterialTexture normal;
+        MaterialTexture orm;
         std::string resolvedMaterial = "gltf_baked";
         std::string baseColorTextureGuid = "EMPTY";
         std::string alphaMode = "OPAQUE";
         float alphaCutoff = 0.5f;
         const char* fragmentShaderAlphaPath = "none";
         bool unlit = false;
-        VkPipeline pipeline = VK_NULL_HANDLE;
     };
 
     struct LastMaterialBinding
     {
         std::uint32_t sourceSubmesh = 0;
         std::uint32_t materialSlot = 0;
-        VkDescriptorSet descriptorSet = VK_NULL_HANDLE;
-        VkImageView baseColorView = VK_NULL_HANDLE;
-        VkImageView normalView = VK_NULL_HANDLE;
-        VkImageView ormView = VK_NULL_HANDLE;
+        std::uint32_t bindSlot = 0;
+        std::string baseColorTexture;
+        std::string normalTexture;
+        std::string ormTexture;
         std::string resolvedMaterial = "gltf_baked";
         std::string baseColorTextureGuid = "EMPTY";
         std::string alphaMode = "OPAQUE";
         float alphaCutoff = 0.5f;
         const char* fragmentShaderAlphaPath = "none";
         bool unlit = false;
-        VkPipeline pipeline = VK_NULL_HANDLE;
+        std::string pipelineName;
         bool boundBeforeDraw = false;
     };
 
     bool LoadStaticGltfMesh(const std::string& modelPath);
     bool LoadStaticFbxMesh(const std::string& modelPath);
     bool LoadBuiltinPrimitiveMesh(const std::string& modelPath);
-    bool CreateBuffers(VulkanDevice& device);
-    bool EnsureLodBuffers(VulkanDevice& device, const LodConfig& config, std::uint64_t configHash, std::uint32_t entityId);
-    bool ApplyPendingLodResult(VulkanDevice& device, std::uint64_t configHash);
-    bool QueueLodUpload(VulkanDevice& device, std::uint64_t configHash, LodCpuSet&& cpuSet);
+    bool CreateBuffers(ixrhi::IXRHIDevice& rhi);
+    bool EnsureLodBuffers(const LodConfig& config, std::uint64_t configHash, std::uint32_t entityId);
+    bool ApplyPendingLodResult(std::uint64_t configHash);
+    bool QueueLodUpload(std::uint64_t configHash, LodCpuSet&& cpuSet);
     bool PollPendingLodUploads(std::uint64_t configHash);
     bool HasPendingLodUpload(std::uint64_t configHash) const;
     void RequestLodBuild(const LodConfig& config, std::uint64_t configHash, bool quality, std::uint32_t entityId);
@@ -295,25 +334,23 @@ private:
     bool LoadLodCpuCache(std::uint64_t configHash, LodCpuSet& out) const;
     void WriteLodCpuCache(const LodCpuSet& set) const;
     std::filesystem::path LodCachePath(const std::string& modelPath, std::uint64_t configHash) const;
-    bool CreateTextures(VulkanDevice& device, const std::string& modelPath);
-    bool UploadTexture(VulkanDevice& device, const RgbaImage& source, Texture& texture);
-    const Texture* EnsureMaterialTexture(VulkanDevice& device,
+    bool CreateTextures(ixrhi::IXRHIDevice& rhi, const std::string& modelPath);
+    bool UploadTexture(ixrhi::IXRHIDevice& rhi, const RgbaImage& source, Texture& texture);
+    const Texture* EnsureMaterialTexture(ixrhi::IXRHIDevice& rhi,
         const std::optional<Guid>& guid,
-        VkFormat format,
+        ixrhi::IXRHIFormat format,
         const char* role);
-    MaterialTextureViews ResolveMaterialTextureViews(VulkanDevice& device,
+    MaterialTextureViews ResolveMaterialTextureViews(ixrhi::IXRHIDevice& rhi,
         const Instance& instance,
         std::uint32_t materialSlot);
     void UpdateMaterialTextureDescriptors(uint32_t frameIndex,
         uint32_t uniformSlot,
         const MaterialTextureViews& textures);
-    bool CreateDescriptors();
-    bool CreatePipeline(VulkanDevice& device);
-    bool EnsureInstanceCapacity(VulkanDevice& device, uint32_t frameIndex, std::uint32_t requiredRecords);
+    bool CreateBindGroup(ixrhi::IXRHIDevice& rhi);
+    bool CreatePipeline(ixrhi::IXRHIDevice& rhi);
+    bool EnsureInstanceCapacity(ixrhi::IXRHIDevice& rhi, uint32_t frameIndex, std::uint32_t requiredRecords);
     void UpdateInstanceDescriptorSets(uint32_t frameIndex);
     void DestroyPipeline();
-    void DestroyBuffer(Buffer& buffer);
-    void DestroyTexture(Texture& texture);
     void UpdateWorldUniform(uint32_t frameIndex,
         uint32_t uniformSlot,
         const WorldCamera& camera,
@@ -321,34 +358,37 @@ private:
         double timeSeconds,
         uint32_t materialSlot);
 
-    VkDevice m_device = VK_NULL_HANDLE;
+    ixrhi::IXRHIDevice* m_rhi = nullptr;
+    const ixrhi::IXRHIRenderPass* m_targetPass = nullptr; // borrowed (frame owner)
     client::asset::IAssetReader* m_assets = nullptr;
-    VkRenderPass m_mainRenderPass = VK_NULL_HANDLE;
-    Buffer m_vertexBuffer;
-    Buffer m_indexBuffer;
-    std::array<std::array<Buffer, kUniformSlots>, kFramesInFlight> m_uniformBuffers{};
-    std::array<Buffer, kFramesInFlight> m_instanceBuffers{};
+    std::shared_ptr<ixrhi::IXRHIBuffer> m_vertexBuffer;
+    std::shared_ptr<ixrhi::IXRHIBuffer> m_indexBuffer;
+    std::array<std::array<std::shared_ptr<ixrhi::IXRHIBuffer>, kUniformSlots>, kFramesInFlight> m_uniformBuffers{};
+    std::array<std::shared_ptr<ixrhi::IXRHIBuffer>, kFramesInFlight> m_instanceBuffers{};
     std::array<std::uint32_t, kFramesInFlight> m_instanceBufferCapacity{};
+    // CPU mirror of instance records per frame (lets growth preserve already
+    // written records without GPU readback; same bytes as the old map-copy).
+    std::array<std::vector<InstanceBlock>, kFramesInFlight> m_instanceMirror{};
     Texture m_texture;
     Texture m_normalTexture;
     Texture m_ormTexture;
     std::unordered_map<std::string, Texture> m_materialTextureCache;
     std::unordered_set<std::string> m_failedMaterialTextureKeys;
     std::vector<LastMaterialBinding> m_lastMaterialBindings;
-    VkDescriptorSetLayout m_descriptorSetLayout = VK_NULL_HANDLE;
-    VkDescriptorPool m_descriptorPool = VK_NULL_HANDLE;
-    std::array<std::array<VkDescriptorSet, kUniformSlots>, kFramesInFlight> m_descriptorSets{};
-    VkPipelineLayout m_pipelineLayout = VK_NULL_HANDLE;
-    VkPipeline m_pipeline = VK_NULL_HANDLE;
-    VkPipeline m_maskPipeline = VK_NULL_HANDLE;
-    VkPipeline m_unlitPipeline = VK_NULL_HANDLE;
-    VkPipeline m_unlitMaskPipeline = VK_NULL_HANDLE;
-    VkPipeline m_outlinePipeline = VK_NULL_HANDLE;
+    std::unique_ptr<ixrhi::IXRHIBindGroupLayout> m_bindLayout;
+    std::unique_ptr<ixrhi::IXRHIBindGroup> m_bindGroup;
+    // Pipeline variants (same 5 as before; mask reuses the lit fragment shader):
+    // opaque, alpha-mask, unlit, unlit alpha-mask, selection outline.
+    std::unique_ptr<ixrhi::IXRHIGraphicsPipeline> m_pipeline;
+    std::unique_ptr<ixrhi::IXRHIGraphicsPipeline> m_maskPipeline;
+    std::unique_ptr<ixrhi::IXRHIGraphicsPipeline> m_unlitPipeline;
+    std::unique_ptr<ixrhi::IXRHIGraphicsPipeline> m_unlitMaskPipeline;
+    std::unique_ptr<ixrhi::IXRHIGraphicsPipeline> m_outlinePipeline;
     std::vector<Vertex> m_vertices;
     std::vector<uint32_t> m_indices;
     std::vector<MeshDraw> m_draws;
     std::unordered_map<std::uint64_t, LodIndexBuffer> m_lodBuffers;
-    std::vector<Buffer> m_retiredLodBuffers;
+    std::vector<std::shared_ptr<ixrhi::IXRHIBuffer>> m_retiredLodBuffers;
     std::vector<PendingLodUpload> m_pendingLodUploads;
     std::string m_modelPath;
     bool m_lodProxyBuilt = false;

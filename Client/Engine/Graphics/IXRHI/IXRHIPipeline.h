@@ -11,6 +11,7 @@
 
 #include "IXRHI.h"
 #include "IXRHIBinding.h"
+#include "IXRHIRenderPass.h"
 #include "IXRHITypes.h"
 
 #include <cstdint>
@@ -71,6 +72,9 @@ struct IXRHIGraphicsPipelineDesc
     std::vector<IXRHIFormat> colorFormats; // informational until dynamic rendering
     IXRHIFormat depthFormat = IXRHIFormat::Undefined;
     std::uint32_t sampleCount = 1;
+    // Borrowed target pass (null = backend default, i.e. the swapchain pass).
+    // Replaces per-renderer native SetMainRenderPass state.
+    const IXRHIRenderPass* targetRenderPass = nullptr;
     std::string debugName;
 };
 

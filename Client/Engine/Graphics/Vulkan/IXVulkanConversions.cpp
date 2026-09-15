@@ -11,6 +11,7 @@ VkFormat ToVkFormat(ixrhi::IXRHIFormat format)
     switch (format)
     {
     case F::R8G8B8A8Unorm: return VK_FORMAT_R8G8B8A8_UNORM;
+    case F::R8G8B8A8Srgb: return VK_FORMAT_R8G8B8A8_SRGB;
     case F::B8G8R8A8Unorm: return VK_FORMAT_B8G8R8A8_UNORM;
     case F::B8G8R8A8Srgb: return VK_FORMAT_B8G8R8A8_SRGB;
     case F::R32G32Float: return VK_FORMAT_R32G32_SFLOAT;
@@ -29,6 +30,7 @@ ixrhi::IXRHIFormat FromVkFormat(VkFormat format)
     switch (format)
     {
     case VK_FORMAT_R8G8B8A8_UNORM: return F::R8G8B8A8Unorm;
+    case VK_FORMAT_R8G8B8A8_SRGB: return F::R8G8B8A8Srgb;
     case VK_FORMAT_B8G8R8A8_UNORM: return F::B8G8R8A8Unorm;
     case VK_FORMAT_B8G8R8A8_SRGB: return F::B8G8R8A8Srgb;
     case VK_FORMAT_R32G32_SFLOAT: return F::R32G32Float;

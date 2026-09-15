@@ -46,6 +46,8 @@ struct IXRHIFrameInfo
     std::uint32_t targetWidth = 0;
     std::uint32_t targetHeight = 0;
     bool frameActive = false;
+    // Monotonic frame counter from the loop (diagnostics only, not an index).
+    std::uint64_t frameNumber = 0;
 };
 
 class IXRHIDevice
@@ -82,6 +84,16 @@ public:
         const IXRHIComputePipelineDesc& desc) = 0;
 
     virtual std::unique_ptr<IXRHICommandList> CreateCommandList() = 0;
+
+    // Staged device-local upload without blocking the caller (see
+    // IXRHIBufferUpload). Data is copied into backend staging immediately.
+    virtual std::unique_ptr<IXRHIBufferUpload> UploadBufferAsync(const IXRHIBufferDesc& desc,
+                                                                 const void* src,
+                                                                 std::size_t byteCount) = 0;
+
+    // Format fallback queries (e.g. sRGB sampled support) without touching
+    // Vulkan from renderer code. Needed by texture upload paths.
+    virtual bool IsTextureFormatSupported(IXRHIFormat format, IXRHITextureUsage usage) const = 0;
 
     virtual std::unique_ptr<IXRHIFence> CreateFence(bool signaled) = 0;
     virtual std::unique_ptr<IXRHISemaphore> CreateSemaphore() = 0;

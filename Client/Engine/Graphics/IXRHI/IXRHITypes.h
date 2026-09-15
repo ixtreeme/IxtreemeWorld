@@ -16,6 +16,7 @@ enum class IXRHIFormat : std::uint32_t
 {
     Undefined = 0,
     R8G8B8A8Unorm,
+    R8G8B8A8Srgb,
     B8G8R8A8Unorm,
     B8G8R8A8Srgb,
     R32G32Float,
@@ -30,6 +31,7 @@ inline std::uint32_t IXRHIFormatByteSize(IXRHIFormat format)
     switch (format)
     {
     case IXRHIFormat::R8G8B8A8Unorm:
+    case IXRHIFormat::R8G8B8A8Srgb:
     case IXRHIFormat::B8G8R8A8Unorm:
     case IXRHIFormat::B8G8R8A8Srgb:
     case IXRHIFormat::D24UnormS8Uint: return 4;

@@ -1,6 +1,4 @@
 add_library(IXEngineRender STATIC
-    CubeRenderer.cpp
-    CubeRenderer.h
     EditorImGui.cpp
     EditorImGui.h
     editor_panels/EditorImGuiAnimatorPanels.inl

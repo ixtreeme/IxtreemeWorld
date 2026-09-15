@@ -105,7 +105,7 @@ std::unique_ptr<ixrhi::IXRHIGraphicsPipeline> IXVulkanDevice::CreateGraphicsPipe
     if (vs == nullptr || ps == nullptr)
         return nullptr;
 
-    const VkRenderPass renderPass = ResolveRenderPass();
+    const VkRenderPass renderPass = ResolveRenderPass(desc.targetRenderPass);
     if (renderPass == VK_NULL_HANDLE)
         return nullptr; // swapchain torn down: caller defers (parity with old code)
 

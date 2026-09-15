@@ -24,6 +24,7 @@
 #include "BuildService.h"  // ixeditor::build::GameScriptBuildService — cmake Build worker (Editor/Build boundary)
 #include "IXVulkanBridge.h" // ixvulkan::WrapFrameCommandList — inventoried frame-list escape hatch
 #include "IXVulkanDevice.h" // ixvulkan::IXVulkanDevice — IXRHI backend over the live frame loop
+#include "IXVulkanRenderPass.h" // ixvulkan::IXVulkanRenderPass::Borrow — borrowed pass token
 #include "EditorImGui.h"
 #include "physics/PhysicsWorld.h"
 #if defined(_WIN32)
@@ -1133,6 +1134,7 @@ ixrhi::IXRHIFrameInfo MakeRhiFrameInfo(VulkanDevice& device)
     frame.targetWidth = extent.width;
     frame.targetHeight = extent.height;
     frame.frameActive = device.IsFrameActive();
+    frame.frameNumber = device.GetFrameNumber();
     return frame;
 }
 
@@ -2390,6 +2392,18 @@ int RunGame(NativeWindow& window,
 
     OffscreenSceneRenderer offscreenScene;
     bool offscreenSceneOk = offscreenScene.Create(device, assets, renderSize);
+    // Borrowed IXRHI pass token for IXRHI-native renderers targeting the offscreen
+    // scene pass (selection outlines, static meshes). Re-borrowed whenever the
+    // offscreen target is (re)created; null = backend default (swapchain pass).
+    std::unique_ptr<ixvulkan::IXVulkanRenderPass> offscreenPass;
+    auto refreshOffscreenPass = [&]() {
+        if (offscreenSceneOk)
+            offscreenPass =
+                ixvulkan::IXVulkanRenderPass::Borrow(rhiDevice, offscreenScene.GetRenderPass());
+        else
+            offscreenPass.reset();
+    };
+    refreshOffscreenPass();
     if (offscreenSceneOk)
     {
         // (Skinned models are wired to the offscreen render pass per-entry inside
@@ -2405,7 +2419,7 @@ int RunGame(NativeWindow& window,
         }
         if (selectionOutlinesOk)
         {
-            rhiDevice.SetPipelineRenderPass(offscreenScene.GetRenderPass());
+            selectionOutlines.SetTargetPass(offscreenPass.get());
             selectionOutlines.RecreatePipeline(rhiDevice);
         }
 #if defined(IXTREEME_WITH_EDITOR)
@@ -2599,8 +2613,8 @@ int RunGame(NativeWindow& window,
 
         entry.renderer = std::make_unique<StaticMeshRenderer>();
         if (offscreenSceneOk)
-            entry.renderer->SetMainRenderPass(offscreenScene.GetRenderPass());
-        if (!entry.renderer->Create(device, assets, modelPath))
+            entry.renderer->SetTargetPass(offscreenPass.get());
+        if (!entry.renderer->Create(rhiDevice, assets, modelPath))
         {
             entry.renderer.reset();
             entry.state = StaticMeshCacheEntry::State::Failed;
@@ -2623,6 +2637,7 @@ int RunGame(NativeWindow& window,
     auto bindOffscreenSceneTargets = [&]() {
         if (!offscreenSceneOk)
             return;
+        refreshOffscreenPass();
         renderSize = offscreenScene.GetExtent();
         for (auto& [skinnedPath, skinnedEntry] : skinnedMeshCache)
         {
@@ -2638,8 +2653,8 @@ int RunGame(NativeWindow& window,
             (void)path;
             if (entry.renderer)
             {
-                entry.renderer->SetMainRenderPass(offscreenScene.GetRenderPass());
-                entry.renderer->RecreatePipeline(device);
+                entry.renderer->SetTargetPass(offscreenPass.get());
+                entry.renderer->RecreatePipeline(rhiDevice);
             }
         }
         if (terrainOk)
@@ -2653,7 +2668,7 @@ int RunGame(NativeWindow& window,
         }
         if (selectionOutlinesOk)
         {
-            rhiDevice.SetPipelineRenderPass(offscreenScene.GetRenderPass());
+            selectionOutlines.SetTargetPass(offscreenPass.get());
             selectionOutlines.RecreatePipeline(rhiDevice);
         }
 #if defined(IXTREEME_WITH_EDITOR)
@@ -4899,6 +4914,7 @@ int RunGame(NativeWindow& window,
                 if (offscreenSceneOk)
                 {
                     offscreenSceneOk = offscreenScene.Recreate(device, effectiveRenderExtent());
+                    refreshOffscreenPass();
                     if (offscreenSceneOk)
                     {
                         renderSize = offscreenScene.GetExtent();
@@ -4912,7 +4928,7 @@ int RunGame(NativeWindow& window,
                         {
                             (void)path;
                             if (entry.renderer)
-                                entry.renderer->SetMainRenderPass(offscreenScene.GetRenderPass());
+                                entry.renderer->SetTargetPass(offscreenPass.get());
                         }
                         if (terrainOk)
                         {
@@ -4923,7 +4939,7 @@ int RunGame(NativeWindow& window,
                                 offscreenScene.GetExtent());
                         }
                         if (selectionOutlinesOk)
-                            rhiDevice.SetPipelineRenderPass(offscreenScene.GetRenderPass());
+                            selectionOutlines.SetTargetPass(offscreenPass.get());
 #if defined(IXTREEME_WITH_EDITOR)
                         editorImGui.SetSceneViewTexture(offscreenScene.GetLinearSampler(),
                             offscreenScene.GetSceneColorView(),
@@ -4960,7 +4976,7 @@ int RunGame(NativeWindow& window,
                 {
                     (void)path;
                     if (entry.renderer)
-                        entry.renderer->RecreatePipeline(device);
+                        entry.renderer->RecreatePipeline(rhiDevice);
                 }
                 if (terrainOk)
                     terrain.RecreatePipeline(device);
@@ -10660,10 +10676,30 @@ int RunGame(NativeWindow& window,
                         std::vector<StaticMeshRenderer::Instance>& instances = batch.instances;
                         if (!renderer || instances.empty())
                             continue;
+                        auto batchCmd =
+                            ixvulkan::WrapFrameCommandList(rhiDevice, device.GetCommandBuffer());
+                        if (!batchCmd)
+                            continue;
+                        const ixrhi::IXRHIFrameInfo batchFrame = MakeRhiFrameInfo(device);
                         if (key.configHash != 0)
-                            renderer->RenderLodBatchInWorld(device, seconds, camera, instances, batch.config, key.configHash, key.lodLevel, renderSize);
+                            renderer->RenderLodBatchInWorld(*batchCmd,
+                                batchFrame,
+                                seconds,
+                                camera,
+                                instances,
+                                batch.config,
+                                key.configHash,
+                                key.lodLevel,
+                                renderSize.width,
+                                renderSize.height);
                         else
-                            renderer->RenderBatchInWorld(device, seconds, camera, instances, renderSize);
+                            renderer->RenderBatchInWorld(*batchCmd,
+                                batchFrame,
+                                seconds,
+                                camera,
+                                instances,
+                                renderSize.width,
+                                renderSize.height);
                         const std::uint32_t submittedDrawCalls = renderer->LastSubmittedDrawCalls();
                         const std::uint32_t submittedInstances = renderer->LastSubmittedInstances();
                         const std::uint32_t submittedIndexCount = renderer->LastSubmittedIndexCount();
@@ -10933,7 +10969,19 @@ int RunGame(NativeWindow& window,
                                 gameMeshBatches[renderer].push_back(std::move(instance));
                             }
                             for (auto& [gameRenderer, gameInstances] : gameMeshBatches)
-                                gameRenderer->RenderBatchInWorld(device, seconds, gameCamera, gameInstances, gameExtent);
+                            {
+                                auto gameMeshCmd = ixvulkan::WrapFrameCommandList(
+                                    rhiDevice, device.GetCommandBuffer());
+                                if (!gameMeshCmd)
+                                    continue;
+                                gameRenderer->RenderBatchInWorld(*gameMeshCmd,
+                                    MakeRhiFrameInfo(device),
+                                    seconds,
+                                    gameCamera,
+                                    gameInstances,
+                                    gameExtent.width,
+                                    gameExtent.height);
+                            }
 
                             // Skinned meshes (incl. the player character) were compute-skinned in
                             // the pre-pass into their own top-of-range Game slots; here we only

@@ -2,6 +2,7 @@
 
 #include "AssimpImporter.h"
 #include "Debug.h"
+#include "IXRHIShader.h"
 #include "MaterialAssetManager.h"
 #include "ProjectManager.h"
 #include "asset/IAssetReader.h"
@@ -52,29 +53,6 @@ void LogFormat(const char* format, ...)
     Tracen(buffer);
 }
 
-const char* VkResultName(VkResult result)
-{
-    switch (result)
-    {
-    case VK_SUCCESS: return "VK_SUCCESS";
-    case VK_ERROR_OUT_OF_HOST_MEMORY: return "VK_ERROR_OUT_OF_HOST_MEMORY";
-    case VK_ERROR_OUT_OF_DEVICE_MEMORY: return "VK_ERROR_OUT_OF_DEVICE_MEMORY";
-    case VK_ERROR_INITIALIZATION_FAILED: return "VK_ERROR_INITIALIZATION_FAILED";
-    case VK_ERROR_MEMORY_MAP_FAILED: return "VK_ERROR_MEMORY_MAP_FAILED";
-    default: return "UNKNOWN_VK_RESULT";
-    }
-}
-
-void CheckVk(VkResult result, const char* call, const char* file, int line)
-{
-    if (result == VK_SUCCESS)
-        return;
-    LogFormat("%s:%d: Vulkan call failed: %s -> %s (%d)", file, line, call, VkResultName(result), result);
-    std::abort();
-}
-
-#define VK_CHECK(call) CheckVk((call), #call, __FILE__, __LINE__)
-
 using Mat4 = ixtreeme::math::Mat4;
 
 struct UniformBlock
@@ -113,18 +91,6 @@ struct UniformBlock
     SpotLightUniform spotLights[kMaxDynamicSpotLights]{};
 };
 
-struct StaticMeshInstanceBlock
-{
-    Mat4 mvp;
-    Mat4 model;
-    float tint[4] = {1.0f, 1.0f, 1.0f, 1.0f};
-    float materialBaseColor[4] = {1.0f, 1.0f, 1.0f, 1.0f};
-    float materialParams[4] = {1.0f, 1.0f, 1.0f, 1.0f};
-    float materialEmissive[4] = {0.0f, 0.0f, 0.0f, 0.0f};
-    float materialUv[4] = {1.0f, 1.0f, 0.0f, 0.0f};
-    float materialAlpha[4] = {0.0f, 0.5f, 0.0f, 0.0f};
-};
-
 struct InstancedDrawCommand
 {
     uint32_t firstIndex = 0;
@@ -135,13 +101,61 @@ struct InstancedDrawCommand
     uint32_t sourceSubmesh = 0;
 };
 
-template <typename Handle>
-unsigned long long VkHandleValue(Handle handle)
+// Diagnostic object identity for log lines (replaces raw VkHandleValue dumps;
+// values are IXRHI object addresses, stable within a run).
+template <typename T>
+unsigned long long RhiObjectId(const std::shared_ptr<T>& object)
 {
-    if constexpr (std::is_pointer_v<Handle>)
-        return static_cast<unsigned long long>(reinterpret_cast<std::uintptr_t>(handle));
-    else
-        return static_cast<unsigned long long>(handle);
+    return static_cast<unsigned long long>(reinterpret_cast<std::uintptr_t>(object.get()));
+}
+
+inline unsigned long long RhiObjectId(const void* object)
+{
+    return static_cast<unsigned long long>(reinterpret_cast<std::uintptr_t>(object));
+}
+
+// Loads SPIR-V words via the asset reader (aborts like the old shader loader
+// when the asset is missing or misaligned).
+std::vector<std::uint32_t> ReadSpirv(client::asset::IAssetReader& assets, const std::string& path)
+{
+    auto bytes = assets.ReadAll(path);
+    if (!bytes || bytes->empty() || bytes->size() % sizeof(std::uint32_t) != 0)
+    {
+        LogFormat("[STATIC-MESH] failed to open shader: %s", path.c_str());
+        std::abort();
+    }
+    const auto* words = reinterpret_cast<const std::uint32_t*>(bytes->data());
+    return std::vector<std::uint32_t>(words, words + bytes->size() / sizeof(std::uint32_t));
+}
+
+std::shared_ptr<ixrhi::IXRHIShader> LoadShader(ixrhi::IXRHIDevice& rhi,
+                                               client::asset::IAssetReader& assets,
+                                               const std::string& path,
+                                               ixrhi::IXRHIShaderStage stage,
+                                               const char* entry)
+{
+    ixrhi::IXRHIShaderDesc desc;
+    desc.stage = stage;
+    desc.entryPoint = entry;
+    desc.spirv = ReadSpirv(assets, path);
+    desc.debugName = path;
+    return rhi.CreateShader(desc);
+}
+
+std::shared_ptr<ixrhi::IXRHIBuffer> CreateRhiBuffer(ixrhi::IXRHIDevice& rhi,
+                                                    std::uint64_t sizeBytes,
+                                                    ixrhi::IXRHIBufferUsage usage,
+                                                    ixrhi::IXRHICpuAccess cpuAccess,
+                                                    const void* initialData,
+                                                    const char* debugName)
+{
+    ixrhi::IXRHIBufferDesc desc;
+    desc.sizeBytes = sizeBytes;
+    desc.usage = usage;
+    desc.cpuAccess = cpuAccess;
+    desc.debugName = debugName ? debugName : "";
+    const std::size_t bytes = static_cast<std::size_t>(sizeBytes);
+    return rhi.CreateBuffer(desc, initialData, initialData != nullptr ? bytes : 0);
 }
 
 const char* AlphaModeForLog(const std::string& alphaMode)
@@ -376,7 +390,7 @@ void FillStaticMeshInstanceBlock(const WorldCamera& camera,
     const StaticMeshRenderer::Instance& instance,
     uint32_t materialSlot,
     const std::vector<StaticMeshRenderer::MaterialDefaults>& materialDefaults,
-    StaticMeshInstanceBlock& out)
+    StaticMeshRenderer::InstanceBlock& out)
 {
     out = {};
     out.model = BuildStaticMeshModelMatrix(instance);
@@ -425,17 +439,6 @@ void FillStaticMeshInstanceBlock(const WorldCamera& camera,
         out.materialUv[3] = overrideSlot.uvOffset[1];
         break;
     }
-}
-
-std::vector<char> ReadBinaryFile(client::asset::IAssetReader& assets, const std::string& path)
-{
-    auto bytes = assets.ReadAll(path);
-    if (!bytes)
-    {
-        LogFormat("[STATIC-MESH] failed to open shader: %s", path.c_str());
-        std::abort();
-    }
-    return std::vector<char>(bytes->begin(), bytes->end());
 }
 
 bool CopyDataSourceBytes(const fastgltf::Asset& asset, const fastgltf::DataSource& source,
@@ -792,7 +795,7 @@ RgbaImage CreateFallbackWhiteImage(const std::string& modelPath)
     image.name = modelPath + "#fallback-white";
     image.width = 4;
     image.height = 4;
-    image.format = VK_FORMAT_R8G8B8A8_UNORM;
+    image.format = ixrhi::IXRHIFormat::R8G8B8A8Unorm;
     image.pixels.assign(static_cast<size_t>(image.width) * image.height * 4u, 0xff);
     return image;
 }
@@ -803,7 +806,7 @@ RgbaImage CreateFallbackNormalImage(const std::string& modelPath)
     image.name = modelPath + "#fallback-normal";
     image.width = 4;
     image.height = 4;
-    image.format = VK_FORMAT_R8G8B8A8_UNORM;
+    image.format = ixrhi::IXRHIFormat::R8G8B8A8Unorm;
     image.pixels.resize(static_cast<size_t>(image.width) * image.height * 4u);
     for (size_t i = 0; i < image.pixels.size(); i += 4)
     {
@@ -821,7 +824,7 @@ RgbaImage CreateFallbackOrmImage(const std::string& modelPath)
     image.name = modelPath + "#fallback-orm";
     image.width = 4;
     image.height = 4;
-    image.format = VK_FORMAT_R8G8B8A8_UNORM;
+    image.format = ixrhi::IXRHIFormat::R8G8B8A8Unorm;
     image.pixels.resize(static_cast<size_t>(image.width) * image.height * 4u);
     for (size_t i = 0; i < image.pixels.size(); i += 4)
     {
@@ -835,7 +838,7 @@ RgbaImage CreateFallbackOrmImage(const std::string& modelPath)
 
 bool DecodeGltfTexture(const fastgltf::Asset& asset,
     size_t textureIndex,
-    VkFormat format,
+    ixrhi::IXRHIFormat format,
     const char* label,
     RgbaImage& out)
 {
@@ -875,7 +878,10 @@ bool DecodeGltfTexture(const fastgltf::Asset& asset,
     return true;
 }
 
-bool DecodeTextureFile(const std::filesystem::path& path, VkFormat format, const char* label, RgbaImage& out)
+bool DecodeTextureFile(const std::filesystem::path& path,
+    ixrhi::IXRHIFormat format,
+    const char* label,
+    RgbaImage& out)
 {
     std::ifstream file(path, std::ios::binary);
     if (!file)
@@ -924,218 +930,23 @@ bool LoadGltfMaterialTextures(client::asset::IAssetReader& assets,
     {
         if (material.pbrData.baseColorTexture.has_value())
             loadedAny |= DecodeGltfTexture(asset, material.pbrData.baseColorTexture->textureIndex,
-                VK_FORMAT_R8G8B8A8_SRGB, "baseColorTexture", diffuse);
+                ixrhi::IXRHIFormat::R8G8B8A8Srgb, "baseColorTexture", diffuse);
         if (material.normalTexture.has_value())
             loadedAny |= DecodeGltfTexture(asset, material.normalTexture->textureIndex,
-                VK_FORMAT_R8G8B8A8_UNORM, "normalTexture", normal);
+                ixrhi::IXRHIFormat::R8G8B8A8Unorm, "normalTexture", normal);
         if (material.pbrData.metallicRoughnessTexture.has_value())
             loadedAny |= DecodeGltfTexture(asset, material.pbrData.metallicRoughnessTexture->textureIndex,
-                VK_FORMAT_R8G8B8A8_UNORM, "metallicRoughnessTexture", orm);
+                ixrhi::IXRHIFormat::R8G8B8A8Unorm, "metallicRoughnessTexture", orm);
         else if (material.occlusionTexture.has_value())
             loadedAny |= DecodeGltfTexture(asset, material.occlusionTexture->textureIndex,
-                VK_FORMAT_R8G8B8A8_UNORM, "occlusionTexture", orm);
+                ixrhi::IXRHIFormat::R8G8B8A8Unorm, "occlusionTexture", orm);
         if (loadedAny)
             break;
     }
     return loadedAny;
 }
 
-VkShaderModule CreateShaderModule(VkDevice device, client::asset::IAssetReader& assets, const std::string& path)
-{
-    const std::vector<char> code = ReadBinaryFile(assets, path);
-    VkShaderModuleCreateInfo create{};
-    create.sType = VK_STRUCTURE_TYPE_SHADER_MODULE_CREATE_INFO;
-    create.codeSize = code.size();
-    create.pCode = reinterpret_cast<const uint32_t*>(code.data());
-    VkShaderModule module = VK_NULL_HANDLE;
-    VK_CHECK(vkCreateShaderModule(device, &create, nullptr, &module));
-    return module;
-}
-
-VkCommandBuffer BeginOneTimeCommands(VkDevice vkDevice, uint32_t queueFamily, VkCommandPool& pool)
-{
-    VkCommandPoolCreateInfo poolInfo{};
-    poolInfo.sType = VK_STRUCTURE_TYPE_COMMAND_POOL_CREATE_INFO;
-    poolInfo.flags = VK_COMMAND_POOL_CREATE_TRANSIENT_BIT;
-    poolInfo.queueFamilyIndex = queueFamily;
-    VK_CHECK(vkCreateCommandPool(vkDevice, &poolInfo, nullptr, &pool));
-
-    VkCommandBufferAllocateInfo alloc{};
-    alloc.sType = VK_STRUCTURE_TYPE_COMMAND_BUFFER_ALLOCATE_INFO;
-    alloc.commandPool = pool;
-    alloc.level = VK_COMMAND_BUFFER_LEVEL_PRIMARY;
-    alloc.commandBufferCount = 1;
-
-    VkCommandBuffer cmd = VK_NULL_HANDLE;
-    VK_CHECK(vkAllocateCommandBuffers(vkDevice, &alloc, &cmd));
-    VkCommandBufferBeginInfo begin{};
-    begin.sType = VK_STRUCTURE_TYPE_COMMAND_BUFFER_BEGIN_INFO;
-    begin.flags = VK_COMMAND_BUFFER_USAGE_ONE_TIME_SUBMIT_BIT;
-    VK_CHECK(vkBeginCommandBuffer(cmd, &begin));
-    return cmd;
-}
-
-void EndOneTimeCommands(VkDevice vkDevice, VkQueue queue, VkCommandPool pool, VkCommandBuffer cmd)
-{
-    VK_CHECK(vkEndCommandBuffer(cmd));
-    VkSubmitInfo submit{};
-    submit.sType = VK_STRUCTURE_TYPE_SUBMIT_INFO;
-    submit.commandBufferCount = 1;
-    submit.pCommandBuffers = &cmd;
-    VK_CHECK(vkQueueSubmit(queue, 1, &submit, VK_NULL_HANDLE));
-    VK_CHECK(vkQueueWaitIdle(queue));
-    vkDestroyCommandPool(vkDevice, pool, nullptr);
-}
-
-VkFence SubmitOneTimeCommandsNoWait(VkDevice vkDevice, VkQueue queue, VkCommandBuffer cmd)
-{
-    VK_CHECK(vkEndCommandBuffer(cmd));
-    VkFenceCreateInfo fenceCreate{};
-    fenceCreate.sType = VK_STRUCTURE_TYPE_FENCE_CREATE_INFO;
-    VkFence fence = VK_NULL_HANDLE;
-    VK_CHECK(vkCreateFence(vkDevice, &fenceCreate, nullptr, &fence));
-
-    VkSubmitInfo submit{};
-    submit.sType = VK_STRUCTURE_TYPE_SUBMIT_INFO;
-    submit.commandBufferCount = 1;
-    submit.pCommandBuffers = &cmd;
-    VK_CHECK(vkQueueSubmit(queue, 1, &submit, fence));
-    return fence;
-}
-
-bool CreateHostVisibleBuffer(VulkanDevice& device, VkDevice vkDevice, VkDeviceSize size,
-    VkBufferUsageFlags usage, const void* initialData, StaticMeshRenderer::Buffer& out)
-{
-    VkBufferCreateInfo buffer{};
-    buffer.sType = VK_STRUCTURE_TYPE_BUFFER_CREATE_INFO;
-    buffer.size = size;
-    buffer.usage = usage;
-    buffer.sharingMode = VK_SHARING_MODE_EXCLUSIVE;
-    VK_CHECK(vkCreateBuffer(vkDevice, &buffer, nullptr, &out.buffer));
-
-    VkMemoryRequirements req{};
-    vkGetBufferMemoryRequirements(vkDevice, out.buffer, &req);
-    VkMemoryAllocateInfo alloc{};
-    alloc.sType = VK_STRUCTURE_TYPE_MEMORY_ALLOCATE_INFO;
-    alloc.allocationSize = req.size;
-    alloc.memoryTypeIndex = device.FindMemoryType(req.memoryTypeBits,
-        VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT | VK_MEMORY_PROPERTY_HOST_COHERENT_BIT);
-    VK_CHECK(vkAllocateMemory(vkDevice, &alloc, nullptr, &out.memory));
-    VK_CHECK(vkBindBufferMemory(vkDevice, out.buffer, out.memory, 0));
-
-    if (initialData)
-    {
-        void* mapped = nullptr;
-        VK_CHECK(vkMapMemory(vkDevice, out.memory, 0, size, 0, &mapped));
-        std::memcpy(mapped, initialData, static_cast<size_t>(size));
-        vkUnmapMemory(vkDevice, out.memory);
-    }
-    return true;
-}
-
-void CopyBuffer(VkCommandBuffer cmd, VkBuffer src, VkBuffer dst, VkDeviceSize size)
-{
-    VkBufferCopy copy{};
-    copy.size = size;
-    vkCmdCopyBuffer(cmd, src, dst, 1, &copy);
-}
-
-bool CreateDeviceLocalBuffer(VulkanDevice& device, VkDevice vkDevice, VkQueue queue, VkDeviceSize size,
-    VkBufferUsageFlags usage, const void* initialData, StaticMeshRenderer::Buffer& out)
-{
-    VkBufferCreateInfo buffer{};
-    buffer.sType = VK_STRUCTURE_TYPE_BUFFER_CREATE_INFO;
-    buffer.size = size;
-    buffer.usage = usage | VK_BUFFER_USAGE_TRANSFER_DST_BIT;
-    buffer.sharingMode = VK_SHARING_MODE_EXCLUSIVE;
-    VK_CHECK(vkCreateBuffer(vkDevice, &buffer, nullptr, &out.buffer));
-
-    VkMemoryRequirements req{};
-    vkGetBufferMemoryRequirements(vkDevice, out.buffer, &req);
-    VkMemoryAllocateInfo alloc{};
-    alloc.sType = VK_STRUCTURE_TYPE_MEMORY_ALLOCATE_INFO;
-    alloc.allocationSize = req.size;
-    alloc.memoryTypeIndex = device.FindMemoryType(req.memoryTypeBits, VK_MEMORY_PROPERTY_DEVICE_LOCAL_BIT);
-    VK_CHECK(vkAllocateMemory(vkDevice, &alloc, nullptr, &out.memory));
-    VK_CHECK(vkBindBufferMemory(vkDevice, out.buffer, out.memory, 0));
-
-    if (initialData && size > 0)
-    {
-        StaticMeshRenderer::Buffer staging{};
-        CreateHostVisibleBuffer(device, vkDevice, size, VK_BUFFER_USAGE_TRANSFER_SRC_BIT, initialData, staging);
-        VkCommandPool uploadPool = VK_NULL_HANDLE;
-        VkCommandBuffer cmd = BeginOneTimeCommands(vkDevice, device.GetGraphicsQueueFamily(), uploadPool);
-        CopyBuffer(cmd, staging.buffer, out.buffer, size);
-        EndOneTimeCommands(vkDevice, queue, uploadPool, cmd);
-        if (staging.buffer)
-            vkDestroyBuffer(vkDevice, staging.buffer, nullptr);
-        if (staging.memory)
-            vkFreeMemory(vkDevice, staging.memory, nullptr);
-    }
-    return true;
-}
-
-bool CreateDeviceLocalImage(VulkanDevice& device, VkDevice vkDevice, uint32_t width, uint32_t height,
-    VkFormat format, VkImage& image, VkDeviceMemory& memory)
-{
-    VkImageCreateInfo create{};
-    create.sType = VK_STRUCTURE_TYPE_IMAGE_CREATE_INFO;
-    create.imageType = VK_IMAGE_TYPE_2D;
-    create.format = format;
-    create.extent = {width, height, 1};
-    create.mipLevels = 1;
-    create.arrayLayers = 1;
-    create.samples = VK_SAMPLE_COUNT_1_BIT;
-    create.tiling = VK_IMAGE_TILING_OPTIMAL;
-    create.usage = VK_IMAGE_USAGE_TRANSFER_DST_BIT | VK_IMAGE_USAGE_SAMPLED_BIT;
-    create.sharingMode = VK_SHARING_MODE_EXCLUSIVE;
-    create.initialLayout = VK_IMAGE_LAYOUT_UNDEFINED;
-    VK_CHECK(vkCreateImage(vkDevice, &create, nullptr, &image));
-
-    VkMemoryRequirements req{};
-    vkGetImageMemoryRequirements(vkDevice, image, &req);
-    VkMemoryAllocateInfo alloc{};
-    alloc.sType = VK_STRUCTURE_TYPE_MEMORY_ALLOCATE_INFO;
-    alloc.allocationSize = req.size;
-    alloc.memoryTypeIndex = device.FindMemoryType(req.memoryTypeBits, VK_MEMORY_PROPERTY_DEVICE_LOCAL_BIT);
-    VK_CHECK(vkAllocateMemory(vkDevice, &alloc, nullptr, &memory));
-    VK_CHECK(vkBindImageMemory(vkDevice, image, memory, 0));
-    return true;
-}
-
-void TransitionImageLayout(VkCommandBuffer cmd, VkImage image, VkImageLayout oldLayout, VkImageLayout newLayout)
-{
-    VkImageMemoryBarrier barrier{};
-    barrier.sType = VK_STRUCTURE_TYPE_IMAGE_MEMORY_BARRIER;
-    barrier.oldLayout = oldLayout;
-    barrier.newLayout = newLayout;
-    barrier.srcQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;
-    barrier.dstQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;
-    barrier.image = image;
-    barrier.subresourceRange.aspectMask = VK_IMAGE_ASPECT_COLOR_BIT;
-    barrier.subresourceRange.baseMipLevel = 0;
-    barrier.subresourceRange.levelCount = 1;
-    barrier.subresourceRange.baseArrayLayer = 0;
-    barrier.subresourceRange.layerCount = 1;
-
-    VkPipelineStageFlags srcStage = VK_PIPELINE_STAGE_TOP_OF_PIPE_BIT;
-    VkPipelineStageFlags dstStage = VK_PIPELINE_STAGE_TRANSFER_BIT;
-    if (oldLayout == VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL &&
-        newLayout == VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL)
-    {
-        barrier.srcAccessMask = VK_ACCESS_TRANSFER_WRITE_BIT;
-        barrier.dstAccessMask = VK_ACCESS_SHADER_READ_BIT;
-        srcStage = VK_PIPELINE_STAGE_TRANSFER_BIT;
-        dstStage = VK_PIPELINE_STAGE_FRAGMENT_SHADER_BIT;
-    }
-    else
-    {
-        barrier.srcAccessMask = 0;
-        barrier.dstAccessMask = VK_ACCESS_TRANSFER_WRITE_BIT;
-    }
-    vkCmdPipelineBarrier(cmd, srcStage, dstStage, 0, 0, nullptr, 0, nullptr, 1, &barrier);
-}
-}
+} // namespace
 
 StaticMeshRenderer::~StaticMeshRenderer()
 {
@@ -1155,10 +966,12 @@ bool StaticMeshRenderer::DetectSkinnedGltf(client::asset::IAssetReader& assets,
     return true;
 }
 
-bool StaticMeshRenderer::Create(VulkanDevice& device, client::asset::IAssetReader& assets, const std::string& modelPath)
+bool StaticMeshRenderer::Create(ixrhi::IXRHIDevice& rhi,
+    client::asset::IAssetReader& assets,
+    const std::string& modelPath)
 {
     Destroy();
-    m_device = device.GetDevice();
+    m_rhi = &rhi;
     m_assets = &assets;
     m_modelPath = modelPath;
     m_status = LoadStatus::Failed;
@@ -1225,25 +1038,25 @@ bool StaticMeshRenderer::Create(VulkanDevice& device, client::asset::IAssetReade
         }
     }
     loaded = true;
-    if (!CreateBuffers(device))
+    if (!CreateBuffers(rhi))
     {
         logCreateState();
         return false;
     }
     buffers = HasVertexBuffer() && HasIndexBuffer();
-    if (!CreateTextures(device, modelPath))
+    if (!CreateTextures(rhi, modelPath))
     {
         logCreateState();
         return false;
     }
     textures = HasTexture();
-    if (!CreateDescriptors())
+    if (!CreateBindGroup(rhi))
     {
         logCreateState();
         return false;
     }
     descriptors = HasDescriptors();
-    if (!CreatePipeline(device))
+    if (!CreatePipeline(rhi))
     {
         logCreateState();
         return false;
@@ -1257,12 +1070,16 @@ bool StaticMeshRenderer::Create(VulkanDevice& device, client::asset::IAssetReade
     return true;
 }
 
-bool StaticMeshRenderer::RecreatePipeline(VulkanDevice& device)
+bool StaticMeshRenderer::RecreatePipeline(ixrhi::IXRHIDevice& rhi)
 {
     if (!m_assets || m_status != LoadStatus::LoadedStatic)
         return false;
+    m_rhi = &rhi;
     DestroyPipeline();
-    return CreatePipeline(device);
+    // Deferred-true while the target pass is torn down (parity); real failures
+    // abort in the backend like the pre-migration VK_CHECK path.
+    CreatePipeline(rhi);
+    return true;
 }
 
 std::size_t StaticMeshRenderer::TriangleCountForLod(std::uint64_t configHash, std::uint32_t lodLevel) const
@@ -1283,7 +1100,7 @@ StaticMeshRenderer::LodDiagnostics StaticMeshRenderer::GetLodDiagnostics(std::ui
     if (configHash == 0)
     {
         diag.bufferKnown = true;
-        diag.bufferValid = m_indexBuffer.buffer != VK_NULL_HANDLE;
+        diag.bufferValid = m_indexBuffer != nullptr;
         diag.levelCount = 1;
         diag.levelTris[0] = TriangleCount();
         diag.levelIndices[0] = m_indices.size();
@@ -1295,7 +1112,7 @@ StaticMeshRenderer::LodDiagnostics StaticMeshRenderer::GetLodDiagnostics(std::ui
     if (existing != m_lodBuffers.end())
     {
         diag.bufferKnown = true;
-        diag.bufferValid = existing->second.buffer.buffer != VK_NULL_HANDLE;
+        diag.bufferValid = existing->second.buffer != nullptr;
         diag.levelCount = existing->second.levels;
         diag.levelTris = existing->second.triangles;
         const std::size_t drawsPerLevel = m_draws.size();
@@ -1360,10 +1177,8 @@ void StaticMeshRenderer::DumpMaterialState(const char* entityName, const Instanc
     auto guidText = [](const std::optional<Guid>& guid) {
         return guid ? guid->toString() : std::string("EMPTY");
     };
-    auto handleText = [](auto handle) {
-        char value[32]{};
-        std::snprintf(value, sizeof(value), "0x%llx", VkHandleValue(handle));
-        return std::string(value);
+    auto handleText = [](const std::string& name) {
+        return name.empty() ? std::string("<none>") : name;
     };
     auto lastBindingFor = [&](std::uint32_t sourceSubmesh, std::uint32_t materialSlot) -> const LastMaterialBinding* {
         for (const LastMaterialBinding& binding : m_lastMaterialBindings)
@@ -1393,7 +1208,7 @@ void StaticMeshRenderer::DumpMaterialState(const char* entityName, const Instanc
         float metallic = baked.metallic;
         float roughness = baked.roughness;
         std::string baseColorTextureGuid = "EMPTY";
-        std::string resolvedBaseColorView = handleText(m_texture.view);
+        std::string resolvedBaseColorView = handleText(m_texture.name);
         std::string descriptorSet = "NULL";
         std::string boundBeforeDraw = "no";
 
@@ -1467,8 +1282,8 @@ void StaticMeshRenderer::DumpMaterialState(const char* entityName, const Instanc
 
         if (const LastMaterialBinding* binding = lastBindingFor(static_cast<std::uint32_t>(i), materialSlot))
         {
-            resolvedBaseColorView = handleText(binding->baseColorView);
-            descriptorSet = handleText(binding->descriptorSet);
+            resolvedBaseColorView = handleText(binding->baseColorTexture);
+            descriptorSet = "slot" + std::to_string(binding->bindSlot);
             boundBeforeDraw = binding->boundBeforeDraw ? "yes" : "no";
             alphaMode = binding->alphaMode.c_str();
             alphaCutoff = binding->alphaCutoff;
@@ -1482,12 +1297,12 @@ void StaticMeshRenderer::DumpMaterialState(const char* entityName, const Instanc
         LogFormat("[MATBIND-DIAG]     slotGuid=%s", slotGuid.empty() ? "EMPTY" : slotGuid.c_str());
         LogFormat("[MATBIND-DIAG]     resolvedMaterial=%s source=%s", resolvedName.c_str(), source);
         LogFormat("[MATBIND-DIAG]     baseColorTextureGuid=%s", baseColorTextureGuid.c_str());
-        LogFormat("[MATBIND-DIAG]     resolvedVkImageView=%s", resolvedBaseColorView.c_str());
+        LogFormat("[MATBIND-DIAG]     resolvedBaseColorView=%s", resolvedBaseColorView.c_str());
         LogFormat("[MATBIND-DIAG]     alphaMode=%s", alphaMode);
         LogFormat("[MATBIND-DIAG]     alphaCutoff=%.3f", alphaCutoff);
-        LogFormat("[MATBIND-DIAG]     vkPipeline=%s",
+        LogFormat("[MATBIND-DIAG]     rhiPipeline=%s",
             lastBindingFor(static_cast<std::uint32_t>(i), materialSlot)
-                ? handleText(lastBindingFor(static_cast<std::uint32_t>(i), materialSlot)->pipeline).c_str()
+                ? lastBindingFor(static_cast<std::uint32_t>(i), materialSlot)->pipelineName.c_str()
                 : "NULL");
         LogFormat("[MATBIND-DIAG]     fragmentShaderAlphaPath=%s",
             lastBindingFor(static_cast<std::uint32_t>(i), materialSlot)
@@ -1507,11 +1322,6 @@ void StaticMeshRenderer::DumpMaterialState(const char* entityName, const Instanc
             draw.indexCount,
             draw.indexCount > 0 ? "yes" : "no");
     }
-}
-
-void StaticMeshRenderer::SetMainRenderPass(VkRenderPass renderPass)
-{
-    m_mainRenderPass = renderPass;
 }
 
 bool StaticMeshRenderer::LoadStaticGltfMesh(const std::string& modelPath)
@@ -1966,31 +1776,48 @@ bool StaticMeshRenderer::LoadStaticFbxMesh(const std::string& modelPath)
     return true;
 }
 
-bool StaticMeshRenderer::CreateBuffers(VulkanDevice& device)
+bool StaticMeshRenderer::CreateBuffers(ixrhi::IXRHIDevice& rhi)
 {
-    VkQueue graphicsQueue = VK_NULL_HANDLE;
-    vkGetDeviceQueue(m_device, device.GetGraphicsQueueFamily(), 0, &graphicsQueue);
-    CreateDeviceLocalBuffer(device, m_device, graphicsQueue, sizeof(Vertex) * m_vertices.size(),
-        VK_BUFFER_USAGE_VERTEX_BUFFER_BIT, m_vertices.data(), m_vertexBuffer);
-    CreateDeviceLocalBuffer(device, m_device, graphicsQueue, sizeof(uint32_t) * m_indices.size(),
-        VK_BUFFER_USAGE_INDEX_BUFFER_BIT, m_indices.data(), m_indexBuffer);
+    m_vertexBuffer = CreateRhiBuffer(rhi,
+        sizeof(Vertex) * m_vertices.size(),
+        ixrhi::IXRHIBufferUsage::Vertex,
+        ixrhi::IXRHICpuAccess::None,
+        m_vertices.data(),
+        ("StaticMesh:" + m_modelPath + ":VB").c_str());
+    m_indexBuffer = CreateRhiBuffer(rhi,
+        sizeof(uint32_t) * m_indices.size(),
+        ixrhi::IXRHIBufferUsage::Index,
+        ixrhi::IXRHICpuAccess::None,
+        m_indices.data(),
+        ("StaticMesh:" + m_modelPath + ":IB").c_str());
+    if (!m_vertexBuffer || !m_indexBuffer)
+        return false;
     for (auto& frameBuffers : m_uniformBuffers)
     {
-        for (Buffer& buffer : frameBuffers)
+        for (auto& buffer : frameBuffers)
         {
-            CreateHostVisibleBuffer(device, m_device, sizeof(UniformBlock),
-                VK_BUFFER_USAGE_UNIFORM_BUFFER_BIT, nullptr, buffer);
+            buffer = CreateRhiBuffer(rhi,
+                sizeof(UniformBlock),
+                ixrhi::IXRHIBufferUsage::Uniform,
+                ixrhi::IXRHICpuAccess::Write,
+                nullptr,
+                ("StaticMesh:" + m_modelPath + ":UBO").c_str());
+            if (!buffer)
+                return false;
         }
     }
     for (uint32_t frame = 0; frame < kFramesInFlight; ++frame)
     {
         m_instanceBufferCapacity[frame] = kInitialInstanceCapacity;
-        CreateHostVisibleBuffer(device,
-            m_device,
-            sizeof(StaticMeshInstanceBlock) * m_instanceBufferCapacity[frame],
-            VK_BUFFER_USAGE_STORAGE_BUFFER_BIT,
+        m_instanceBuffers[frame] = CreateRhiBuffer(rhi,
+            sizeof(InstanceBlock) * m_instanceBufferCapacity[frame],
+            ixrhi::IXRHIBufferUsage::Storage,
+            ixrhi::IXRHICpuAccess::Write,
             nullptr,
-            m_instanceBuffers[frame]);
+            ("StaticMesh:" + m_modelPath + ":Instances").c_str());
+        if (!m_instanceBuffers[frame])
+            return false;
+        m_instanceMirror[frame].assign(m_instanceBufferCapacity[frame], InstanceBlock{});
     }
     return true;
 }
@@ -2010,14 +1837,14 @@ std::filesystem::path StaticMeshRenderer::LodCachePath(const std::string& modelP
     return cacheDir / filename;
 }
 
-bool StaticMeshRenderer::EnsureLodBuffers(VulkanDevice& device, const LodConfig& config, std::uint64_t configHash, std::uint32_t entityId)
+bool StaticMeshRenderer::EnsureLodBuffers(const LodConfig& config, std::uint64_t configHash, std::uint32_t entityId)
 {
     if (configHash == 0 || m_vertices.empty() || m_indices.empty() || m_draws.empty())
         return false;
-    ApplyPendingLodResult(device, configHash);
+    ApplyPendingLodResult(configHash);
     auto cached = m_lodBuffers.find(configHash);
     if (cached != m_lodBuffers.end())
-        return cached->second.buffer.buffer != VK_NULL_HANDLE;
+        return cached->second.buffer != nullptr;
     if (HasPendingLodUpload(configHash))
         return false;
 
@@ -2031,7 +1858,7 @@ bool StaticMeshRenderer::EnsureLodBuffers(VulkanDevice& device, const LodConfig&
             std::lock_guard<std::mutex> lock(m_lodMutex);
             m_lodPendingResults[configHash] = std::move(cachedCpu);
         }
-        if (ApplyPendingLodResult(device, configHash))
+        if (ApplyPendingLodResult(configHash))
             return true;
     }
 
@@ -2238,7 +2065,7 @@ StaticMeshRenderer::LodCpuSet StaticMeshRenderer::BuildLodCpuSet(const LodConfig
     return lodSet;
 }
 
-bool StaticMeshRenderer::ApplyPendingLodResult(VulkanDevice& device, std::uint64_t configHash)
+bool StaticMeshRenderer::ApplyPendingLodResult(std::uint64_t configHash)
 {
     if (PollPendingLodUploads(configHash))
         return true;
@@ -2256,56 +2083,37 @@ bool StaticMeshRenderer::ApplyPendingLodResult(VulkanDevice& device, std::uint64
     if (cpuSet.indices.empty())
         return false;
 
-    return QueueLodUpload(device, configHash, std::move(cpuSet));
+    return QueueLodUpload(configHash, std::move(cpuSet));
 }
 
-bool StaticMeshRenderer::QueueLodUpload(VulkanDevice& device, std::uint64_t configHash, LodCpuSet&& cpuSet)
+bool StaticMeshRenderer::QueueLodUpload(std::uint64_t configHash, LodCpuSet&& cpuSet)
 {
-    if (cpuSet.indices.empty() || HasPendingLodUpload(configHash))
+    if (!m_rhi || cpuSet.indices.empty() || HasPendingLodUpload(configHash))
         return false;
 
     const auto begin = std::chrono::steady_clock::now();
-    const VkDeviceSize indexBytes = sizeof(std::uint32_t) * cpuSet.indices.size();
-    VkQueue graphicsQueue = VK_NULL_HANDLE;
-    vkGetDeviceQueue(m_device, device.GetGraphicsQueueFamily(), 0, &graphicsQueue);
-
-    LodIndexBuffer lodSet{};
-    lodSet.indices = std::move(cpuSet.indices);
-    lodSet.draws = std::move(cpuSet.draws);
-    lodSet.triangles = cpuSet.triangles;
-    lodSet.levels = cpuSet.levels;
-    lodSet.quality = cpuSet.quality;
-    lodSet.source = cpuSet.source;
-    if (!CreateDeviceLocalBuffer(device,
-            m_device,
-            graphicsQueue,
-            indexBytes,
-            VK_BUFFER_USAGE_INDEX_BUFFER_BIT,
-            nullptr,
-            lodSet.buffer))
-    {
-        return false;
-    }
-    lodSet.generated = true;
+    ixrhi::IXRHIBufferDesc desc;
+    desc.sizeBytes = sizeof(std::uint32_t) * cpuSet.indices.size();
+    desc.usage = ixrhi::IXRHIBufferUsage::Index;
+    desc.cpuAccess = ixrhi::IXRHICpuAccess::None;
+    desc.debugName = "StaticMesh:" + m_modelPath + ":LOD";
 
     PendingLodUpload upload{};
     upload.configHash = configHash;
     upload.diagnosticEntityId = cpuSet.diagnosticEntityId;
-    upload.lodSet = std::move(lodSet);
-    if (!CreateHostVisibleBuffer(device,
-            m_device,
-            indexBytes,
-            VK_BUFFER_USAGE_TRANSFER_SRC_BIT,
-            upload.lodSet.indices.data(),
-            upload.staging))
-    {
-        DestroyBuffer(upload.lodSet.buffer);
+    upload.lodSet.indices = std::move(cpuSet.indices);
+    upload.lodSet.draws = std::move(cpuSet.draws);
+    upload.lodSet.triangles = cpuSet.triangles;
+    upload.lodSet.levels = cpuSet.levels;
+    upload.lodSet.quality = cpuSet.quality;
+    upload.lodSet.source = cpuSet.source;
+    upload.lodSet.generated = true;
+    upload.upload = m_rhi->UploadBufferAsync(desc,
+        upload.lodSet.indices.data(),
+        desc.sizeBytes);
+    if (!upload.upload)
         return false;
-    }
 
-    VkCommandBuffer cmd = BeginOneTimeCommands(m_device, device.GetGraphicsQueueFamily(), upload.commandPool);
-    CopyBuffer(cmd, upload.staging.buffer, upload.lodSet.buffer.buffer, indexBytes);
-    upload.fence = SubmitOneTimeCommandsNoWait(m_device, graphicsQueue, cmd);
     const auto end = std::chrono::steady_clock::now();
     upload.uploadMs = std::chrono::duration<double, std::milli>(end - begin).count();
     LogFormat("[LOD-ASYNC] swap uploadMs=%.3f blocking=no", upload.uploadMs);
@@ -2318,30 +2126,22 @@ bool StaticMeshRenderer::PollPendingLodUploads(std::uint64_t configHash)
     bool appliedRequested = false;
     for (auto it = m_pendingLodUploads.begin(); it != m_pendingLodUploads.end();)
     {
-        const VkResult fenceStatus = vkGetFenceStatus(m_device, it->fence);
-        if (fenceStatus == VK_NOT_READY)
+        if (!it->upload || !it->upload->IsReady())
         {
             ++it;
             continue;
         }
-        VK_CHECK(fenceStatus);
-
-        if (it->staging.buffer)
-            vkDestroyBuffer(m_device, it->staging.buffer, nullptr);
-        if (it->staging.memory)
-            vkFreeMemory(m_device, it->staging.memory, nullptr);
-        if (it->commandPool)
-            vkDestroyCommandPool(m_device, it->commandPool, nullptr);
-        if (it->fence)
-            vkDestroyFence(m_device, it->fence, nullptr);
+        it->lodSet.buffer = it->upload->Take();
+        it->upload.reset();
 
         const std::uint32_t populatedEntityId = it->diagnosticEntityId;
         const std::uint32_t populatedLevelCount = it->lodSet.levels;
         auto existing = m_lodBuffers.find(it->configHash);
         if (existing != m_lodBuffers.end())
         {
+            // Retain the replaced buffer (shared ownership) so in-flight frames
+            // referencing it stay valid — same as the old retired-buffer list.
             m_retiredLodBuffers.push_back(existing->second.buffer);
-            existing->second.buffer = {};
             existing->second = std::move(it->lodSet);
         }
         else
@@ -2580,85 +2380,55 @@ void StaticMeshRenderer::LodWorkerMain()
     }
 }
 
-bool StaticMeshRenderer::UploadTexture(VulkanDevice& device, const RgbaImage& source, Texture& texture)
+bool StaticMeshRenderer::UploadTexture(ixrhi::IXRHIDevice& rhi, const RgbaImage& source, Texture& texture)
 {
     RgbaImage image = source;
-    VkFormatProperties props{};
-    vkGetPhysicalDeviceFormatProperties(device.GetPhysicalDevice(), image.format, &props);
-    const VkFormatFeatureFlags required =
-        VK_FORMAT_FEATURE_SAMPLED_IMAGE_BIT | VK_FORMAT_FEATURE_TRANSFER_DST_BIT;
-    if ((props.optimalTilingFeatures & required) != required)
+    const ixrhi::IXRHITextureUsage sampledUpload =
+        ixrhi::IXRHITextureUsage::Sampled | ixrhi::IXRHITextureUsage::TransferDst;
+    if (!rhi.IsTextureFormatSupported(image.format, sampledUpload))
     {
-        image.format = VK_FORMAT_R8G8B8A8_UNORM;
-        vkGetPhysicalDeviceFormatProperties(device.GetPhysicalDevice(), image.format, &props);
-        if ((props.optimalTilingFeatures & required) != required)
+        image.format = ixrhi::IXRHIFormat::R8G8B8A8Unorm;
+        if (!rhi.IsTextureFormatSupported(image.format, sampledUpload))
             return false;
     }
 
-    VkQueue graphicsQueue = VK_NULL_HANDLE;
-    vkGetDeviceQueue(m_device, device.GetGraphicsQueueFamily(), 0, &graphicsQueue);
+    ixrhi::IXRHITextureDesc desc;
+    desc.width = image.width;
+    desc.height = image.height;
+    desc.format = image.format;
+    desc.usage = sampledUpload;
+    desc.debugName = "StaticMesh:" + image.name;
+    auto uploaded = rhi.CreateTexture(desc, image.pixels.data(), image.pixels.size());
+    if (!uploaded)
+        return false;
 
+    ixrhi::IXRHISamplerDesc samplerDesc;
+    samplerDesc.minFilter = ixrhi::IXRHISamplerFilter::Linear;
+    samplerDesc.magFilter = ixrhi::IXRHISamplerFilter::Linear;
+    samplerDesc.mipmapFilter = ixrhi::IXRHISamplerFilter::Nearest;
+    samplerDesc.addressU = ixrhi::IXRHISamplerAddress::Repeat;
+    samplerDesc.addressV = ixrhi::IXRHISamplerAddress::Repeat;
+    samplerDesc.addressW = ixrhi::IXRHISamplerAddress::Repeat;
+    samplerDesc.maxLod = 1.0f;
+    const ixrhi::IXRHICapabilities& caps = rhi.GetCapabilities();
+    if (caps.supportsAnisotropy)
+        samplerDesc.maxAnisotropy = caps.maxAnisotropy;
+    samplerDesc.debugName = "StaticMesh:" + image.name + ":Sampler";
+    auto sampler = rhi.CreateSampler(samplerDesc);
+    if (!sampler)
+        return false;
+
+    texture.image = std::move(uploaded);
+    texture.sampler = std::move(sampler);
     texture.name = image.name;
     texture.width = image.width;
     texture.height = image.height;
     texture.mipLevels = 1;
     texture.format = image.format;
-    CreateDeviceLocalImage(device, m_device, image.width, image.height, image.format, texture.image, texture.memory);
-
-    Buffer staging{};
-    CreateHostVisibleBuffer(device, m_device, image.pixels.size(),
-        VK_BUFFER_USAGE_TRANSFER_SRC_BIT, image.pixels.data(), staging);
-
-    VkCommandPool uploadPool = VK_NULL_HANDLE;
-    VkCommandBuffer cmd = BeginOneTimeCommands(m_device, device.GetGraphicsQueueFamily(), uploadPool);
-    TransitionImageLayout(cmd, texture.image, VK_IMAGE_LAYOUT_UNDEFINED, VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL);
-    VkBufferImageCopy region{};
-    region.bufferOffset = 0;
-    region.imageSubresource.aspectMask = VK_IMAGE_ASPECT_COLOR_BIT;
-    region.imageSubresource.mipLevel = 0;
-    region.imageSubresource.baseArrayLayer = 0;
-    region.imageSubresource.layerCount = 1;
-    region.imageExtent = {image.width, image.height, 1};
-    vkCmdCopyBufferToImage(cmd, staging.buffer, texture.image,
-        VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL, 1, &region);
-    TransitionImageLayout(cmd, texture.image,
-        VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL, VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL);
-    EndOneTimeCommands(m_device, graphicsQueue, uploadPool, cmd);
-    DestroyBuffer(staging);
-
-    VkImageViewCreateInfo view{};
-    view.sType = VK_STRUCTURE_TYPE_IMAGE_VIEW_CREATE_INFO;
-    view.image = texture.image;
-    view.viewType = VK_IMAGE_VIEW_TYPE_2D;
-    view.format = texture.format;
-    view.subresourceRange.aspectMask = VK_IMAGE_ASPECT_COLOR_BIT;
-    view.subresourceRange.baseMipLevel = 0;
-    view.subresourceRange.levelCount = 1;
-    view.subresourceRange.baseArrayLayer = 0;
-    view.subresourceRange.layerCount = 1;
-    VK_CHECK(vkCreateImageView(m_device, &view, nullptr, &texture.view));
-
-    VkSamplerCreateInfo sampler{};
-    sampler.sType = VK_STRUCTURE_TYPE_SAMPLER_CREATE_INFO;
-    sampler.magFilter = VK_FILTER_LINEAR;
-    sampler.minFilter = VK_FILTER_LINEAR;
-    sampler.mipmapMode = VK_SAMPLER_MIPMAP_MODE_NEAREST;
-    sampler.addressModeU = VK_SAMPLER_ADDRESS_MODE_REPEAT;
-    sampler.addressModeV = VK_SAMPLER_ADDRESS_MODE_REPEAT;
-    sampler.addressModeW = VK_SAMPLER_ADDRESS_MODE_REPEAT;
-    sampler.minLod = 0.0f;
-    sampler.maxLod = 1.0f;
-    if (device.SupportsSamplerAnisotropy())
-    {
-        sampler.anisotropyEnable = VK_TRUE;
-        sampler.maxAnisotropy = device.GetMaxSamplerAnisotropy();
-    }
-    sampler.borderColor = VK_BORDER_COLOR_FLOAT_OPAQUE_BLACK;
-    VK_CHECK(vkCreateSampler(m_device, &sampler, nullptr, &texture.sampler));
     return true;
 }
 
-bool StaticMeshRenderer::CreateTextures(VulkanDevice& device, const std::string& modelPath)
+bool StaticMeshRenderer::CreateTextures(ixrhi::IXRHIDevice& rhi, const std::string& modelPath)
 {
     RgbaImage diffuse{};
     RgbaImage normal{};
@@ -2674,14 +2444,14 @@ bool StaticMeshRenderer::CreateTextures(VulkanDevice& device, const std::string&
     if (orm.pixels.empty())
         orm = CreateFallbackOrmImage(modelPath);
 
-    return UploadTexture(device, diffuse, m_texture) &&
-        UploadTexture(device, normal, m_normalTexture) &&
-        UploadTexture(device, orm, m_ormTexture);
+    return UploadTexture(rhi, diffuse, m_texture) &&
+        UploadTexture(rhi, normal, m_normalTexture) &&
+        UploadTexture(rhi, orm, m_ormTexture);
 }
 
-const StaticMeshRenderer::Texture* StaticMeshRenderer::EnsureMaterialTexture(VulkanDevice& device,
+const StaticMeshRenderer::Texture* StaticMeshRenderer::EnsureMaterialTexture(ixrhi::IXRHIDevice& rhi,
     const std::optional<Guid>& guid,
-    VkFormat format,
+    ixrhi::IXRHIFormat format,
     const char* role)
 {
     if (!guid)
@@ -2690,7 +2460,7 @@ const StaticMeshRenderer::Texture* StaticMeshRenderer::EnsureMaterialTexture(Vul
     const std::string guidText = guid->toString();
     const std::string key = std::string(role ? role : "texture") + ":" + guidText;
     if (const auto it = m_materialTextureCache.find(key); it != m_materialTextureCache.end())
-        return it->second.view != VK_NULL_HANDLE ? &it->second : nullptr;
+        return it->second.image != nullptr ? &it->second : nullptr;
     if (m_failedMaterialTextureKeys.find(key) != m_failedMaterialTextureKeys.end())
         return nullptr;
 
@@ -2716,7 +2486,7 @@ const StaticMeshRenderer::Texture* StaticMeshRenderer::EnsureMaterialTexture(Vul
     }
 
     Texture texture{};
-    if (!UploadTexture(device, image, texture))
+    if (!UploadTexture(rhi, image, texture))
     {
         m_failedMaterialTextureKeys.insert(key);
         LogFormat("[MATBIND-DIAG] texture upload failed role=%s guid=%s path=%s",
@@ -2727,30 +2497,29 @@ const StaticMeshRenderer::Texture* StaticMeshRenderer::EnsureMaterialTexture(Vul
     }
 
     auto [it, _] = m_materialTextureCache.emplace(key, std::move(texture));
-    LogFormat("[MATBIND-DIAG] texture loaded role=%s guid=%s view=0x%llx path=%s",
+    LogFormat("[MATBIND-DIAG] texture loaded role=%s guid=%s image=%s path=%s",
         role ? role : "texture",
         guidText.c_str(),
-        VkHandleValue(it->second.view),
+        it->second.name.c_str(),
         path->generic_string().c_str());
     return &it->second;
 }
 
-StaticMeshRenderer::MaterialTextureViews StaticMeshRenderer::ResolveMaterialTextureViews(VulkanDevice& device,
+StaticMeshRenderer::MaterialTextureViews StaticMeshRenderer::ResolveMaterialTextureViews(ixrhi::IXRHIDevice& rhi,
     const Instance& instance,
     std::uint32_t materialSlot)
 {
-    auto imageInfo = [](const Texture& texture) {
-        VkDescriptorImageInfo info{};
-        info.sampler = texture.sampler;
-        info.imageView = texture.view;
-        info.imageLayout = VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL;
-        return info;
+    auto materialOf = [](const Texture& texture) {
+        MaterialTexture material{};
+        material.texture = texture.image;
+        material.sampler = texture.sampler;
+        return material;
     };
 
     MaterialTextureViews views{};
-    views.baseColor = imageInfo(m_texture);
-    views.normal = imageInfo(m_normalTexture);
-    views.orm = imageInfo(m_ormTexture);
+    views.baseColor = materialOf(m_texture);
+    views.normal = materialOf(m_normalTexture);
+    views.orm = materialOf(m_ormTexture);
 
     if (materialSlot >= instance.materialSlots.size())
         return views;
@@ -2779,16 +2548,19 @@ StaticMeshRenderer::MaterialTextureViews StaticMeshRenderer::ResolveMaterialText
     views.unlit = material->shadingMode == MaterialAsset::ShadingMode::Unlit;
 
     if (const Texture* texture =
-            EnsureMaterialTexture(device, material->baseColorTexture, VK_FORMAT_R8G8B8A8_SRGB, "baseColor"))
-        views.baseColor = imageInfo(*texture);
+            EnsureMaterialTexture(rhi, material->baseColorTexture, ixrhi::IXRHIFormat::R8G8B8A8Srgb, "baseColor"))
+        views.baseColor = materialOf(*texture);
     if (!views.unlit)
     {
         if (const Texture* texture =
-                EnsureMaterialTexture(device, material->normalTexture, VK_FORMAT_R8G8B8A8_UNORM, "normal"))
-            views.normal = imageInfo(*texture);
+                EnsureMaterialTexture(rhi, material->normalTexture, ixrhi::IXRHIFormat::R8G8B8A8Unorm, "normal"))
+            views.normal = materialOf(*texture);
         if (const Texture* texture =
-                EnsureMaterialTexture(device, material->metallicRoughnessTexture, VK_FORMAT_R8G8B8A8_UNORM, "metallicRoughness"))
-            views.orm = imageInfo(*texture);
+                EnsureMaterialTexture(rhi,
+                    material->metallicRoughnessTexture,
+                    ixrhi::IXRHIFormat::R8G8B8A8Unorm,
+                    "metallicRoughness"))
+            views.orm = materialOf(*texture);
     }
 
     return views;
@@ -2798,186 +2570,82 @@ void StaticMeshRenderer::UpdateMaterialTextureDescriptors(uint32_t frameIndex,
     uint32_t uniformSlot,
     const MaterialTextureViews& textures)
 {
-    if (frameIndex >= kFramesInFlight || uniformSlot >= kUniformSlots)
+    if (!m_bindGroup || frameIndex >= kFramesInFlight || uniformSlot >= kUniformSlots)
         return;
 
-    VkDescriptorSet descriptorSet = m_descriptorSets[frameIndex][uniformSlot];
-    std::array<VkWriteDescriptorSet, 3> writes{};
-    writes[0].sType = VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET;
-    writes[0].dstSet = descriptorSet;
-    writes[0].dstBinding = 1;
-    writes[0].descriptorCount = 1;
-    writes[0].descriptorType = VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER;
-    writes[0].pImageInfo = &textures.baseColor;
-    writes[1].sType = VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET;
-    writes[1].dstSet = descriptorSet;
-    writes[1].dstBinding = 2;
-    writes[1].descriptorCount = 1;
-    writes[1].descriptorType = VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER;
-    writes[1].pImageInfo = &textures.normal;
-    writes[2].sType = VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET;
-    writes[2].dstSet = descriptorSet;
-    writes[2].dstBinding = 3;
-    writes[2].descriptorCount = 1;
-    writes[2].descriptorType = VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER;
-    writes[2].pImageInfo = &textures.orm;
-    vkUpdateDescriptorSets(m_device, static_cast<uint32_t>(writes.size()), writes.data(), 0, nullptr);
+    const uint32_t slot = frameIndex * kUniformSlots + uniformSlot;
+    if (textures.baseColor.texture && textures.baseColor.sampler)
+        m_bindGroup->UpdateTexture(slot, 1, textures.baseColor.texture, textures.baseColor.sampler);
+    if (textures.normal.texture && textures.normal.sampler)
+        m_bindGroup->UpdateTexture(slot, 2, textures.normal.texture, textures.normal.sampler);
+    if (textures.orm.texture && textures.orm.sampler)
+        m_bindGroup->UpdateTexture(slot, 3, textures.orm.texture, textures.orm.sampler);
 }
 
-bool StaticMeshRenderer::CreateDescriptors()
+bool StaticMeshRenderer::CreateBindGroup(ixrhi::IXRHIDevice& rhi)
 {
-    VkDescriptorSetLayoutBinding ubo{};
-    ubo.binding = 0;
-    ubo.descriptorType = VK_DESCRIPTOR_TYPE_UNIFORM_BUFFER;
-    ubo.descriptorCount = 1;
-    ubo.stageFlags = VK_SHADER_STAGE_VERTEX_BIT | VK_SHADER_STAGE_FRAGMENT_BIT;
+    constexpr uint32_t kBindSlots = kFramesInFlight * kUniformSlots;
+    const ixrhi::IXRHIShaderStage allStages =
+        ixrhi::IXRHIShaderStage::Vertex | ixrhi::IXRHIShaderStage::Fragment;
+    const std::vector<ixrhi::IXRHIBinding> bindings = {
+        {0, ixrhi::IXRHIBindingType::UniformBuffer, allStages},
+        {1, ixrhi::IXRHIBindingType::SampledTexture, ixrhi::IXRHIShaderStage::Fragment},
+        {2, ixrhi::IXRHIBindingType::SampledTexture, ixrhi::IXRHIShaderStage::Fragment},
+        {3, ixrhi::IXRHIBindingType::SampledTexture, ixrhi::IXRHIShaderStage::Fragment},
+        {4, ixrhi::IXRHIBindingType::StorageBuffer, allStages},
+    };
+    m_bindLayout = rhi.CreateBindGroupLayout(bindings);
+    if (!m_bindLayout)
+        return false;
+    m_bindGroup = rhi.CreateBindGroup(*m_bindLayout, kBindSlots);
+    if (!m_bindGroup)
+        return false;
 
-    VkDescriptorSetLayoutBinding diffuse{};
-    diffuse.binding = 1;
-    diffuse.descriptorType = VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER;
-    diffuse.descriptorCount = 1;
-    diffuse.stageFlags = VK_SHADER_STAGE_FRAGMENT_BIT;
-
-    VkDescriptorSetLayoutBinding normal = diffuse;
-    normal.binding = 2;
-    VkDescriptorSetLayoutBinding orm = diffuse;
-    orm.binding = 3;
-
-    VkDescriptorSetLayoutBinding instances{};
-    instances.binding = 4;
-    instances.descriptorType = VK_DESCRIPTOR_TYPE_STORAGE_BUFFER;
-    instances.descriptorCount = 1;
-    instances.stageFlags = VK_SHADER_STAGE_VERTEX_BIT | VK_SHADER_STAGE_FRAGMENT_BIT;
-
-    std::array<VkDescriptorSetLayoutBinding, 5> bindings = {ubo, diffuse, normal, orm, instances};
-    VkDescriptorSetLayoutCreateInfo layout{};
-    layout.sType = VK_STRUCTURE_TYPE_DESCRIPTOR_SET_LAYOUT_CREATE_INFO;
-    layout.bindingCount = static_cast<uint32_t>(bindings.size());
-    layout.pBindings = bindings.data();
-    VK_CHECK(vkCreateDescriptorSetLayout(m_device, &layout, nullptr, &m_descriptorSetLayout));
-
-    std::array<VkDescriptorPoolSize, 3> poolSizes{};
-    poolSizes[0].type = VK_DESCRIPTOR_TYPE_UNIFORM_BUFFER;
-    poolSizes[0].descriptorCount = kFramesInFlight * kUniformSlots;
-    poolSizes[1].type = VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER;
-    poolSizes[1].descriptorCount = kFramesInFlight * kUniformSlots * 3u;
-    poolSizes[2].type = VK_DESCRIPTOR_TYPE_STORAGE_BUFFER;
-    poolSizes[2].descriptorCount = kFramesInFlight * kUniformSlots;
-
-    VkDescriptorPoolCreateInfo pool{};
-    pool.sType = VK_STRUCTURE_TYPE_DESCRIPTOR_POOL_CREATE_INFO;
-    pool.maxSets = kFramesInFlight * kUniformSlots;
-    pool.poolSizeCount = static_cast<uint32_t>(poolSizes.size());
-    pool.pPoolSizes = poolSizes.data();
-    VK_CHECK(vkCreateDescriptorPool(m_device, &pool, nullptr, &m_descriptorPool));
-
-    std::array<VkDescriptorSetLayout, kFramesInFlight * kUniformSlots> layouts{};
-    layouts.fill(m_descriptorSetLayout);
-    VkDescriptorSetAllocateInfo alloc{};
-    alloc.sType = VK_STRUCTURE_TYPE_DESCRIPTOR_SET_ALLOCATE_INFO;
-    alloc.descriptorPool = m_descriptorPool;
-    alloc.descriptorSetCount = static_cast<uint32_t>(layouts.size());
-    alloc.pSetLayouts = layouts.data();
-
-    std::array<VkDescriptorSet, kFramesInFlight * kUniformSlots> flatSets{};
-    VK_CHECK(vkAllocateDescriptorSets(m_device, &alloc, flatSets.data()));
-
-    uint32_t setIndex = 0;
     for (uint32_t frame = 0; frame < kFramesInFlight; ++frame)
     {
+        const std::uint64_t instanceBytes =
+            sizeof(InstanceBlock) * m_instanceBufferCapacity[frame];
         for (uint32_t uniformSlot = 0; uniformSlot < kUniformSlots; ++uniformSlot)
         {
-            VkDescriptorSet descriptorSet = flatSets[setIndex++];
-            m_descriptorSets[frame][uniformSlot] = descriptorSet;
-
-            VkDescriptorBufferInfo bufferInfo{};
-            bufferInfo.buffer = m_uniformBuffers[frame][uniformSlot].buffer;
-            bufferInfo.offset = 0;
-            bufferInfo.range = sizeof(UniformBlock);
-
-            VkDescriptorImageInfo imageInfo{};
-            imageInfo.sampler = m_texture.sampler;
-            imageInfo.imageView = m_texture.view;
-            imageInfo.imageLayout = VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL;
-            VkDescriptorImageInfo normalInfo{};
-            normalInfo.sampler = m_normalTexture.sampler;
-            normalInfo.imageView = m_normalTexture.view;
-            normalInfo.imageLayout = VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL;
-            VkDescriptorImageInfo ormInfo{};
-            ormInfo.sampler = m_ormTexture.sampler;
-            ormInfo.imageView = m_ormTexture.view;
-            ormInfo.imageLayout = VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL;
-            VkDescriptorBufferInfo instanceInfo{};
-            instanceInfo.buffer = m_instanceBuffers[frame].buffer;
-            instanceInfo.offset = 0;
-            instanceInfo.range = VK_WHOLE_SIZE;
-
-            std::array<VkWriteDescriptorSet, 5> writes{};
-            writes[0].sType = VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET;
-            writes[0].dstSet = descriptorSet;
-            writes[0].dstBinding = 0;
-            writes[0].descriptorCount = 1;
-            writes[0].descriptorType = VK_DESCRIPTOR_TYPE_UNIFORM_BUFFER;
-            writes[0].pBufferInfo = &bufferInfo;
-            writes[1].sType = VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET;
-            writes[1].dstSet = descriptorSet;
-            writes[1].dstBinding = 1;
-            writes[1].descriptorCount = 1;
-            writes[1].descriptorType = VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER;
-            writes[1].pImageInfo = &imageInfo;
-            writes[2].sType = VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET;
-            writes[2].dstSet = descriptorSet;
-            writes[2].dstBinding = 2;
-            writes[2].descriptorCount = 1;
-            writes[2].descriptorType = VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER;
-            writes[2].pImageInfo = &normalInfo;
-            writes[3].sType = VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET;
-            writes[3].dstSet = descriptorSet;
-            writes[3].dstBinding = 3;
-            writes[3].descriptorCount = 1;
-            writes[3].descriptorType = VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER;
-            writes[3].pImageInfo = &ormInfo;
-            writes[4].sType = VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET;
-            writes[4].dstSet = descriptorSet;
-            writes[4].dstBinding = 4;
-            writes[4].descriptorCount = 1;
-            writes[4].descriptorType = VK_DESCRIPTOR_TYPE_STORAGE_BUFFER;
-            writes[4].pBufferInfo = &instanceInfo;
-            vkUpdateDescriptorSets(m_device, static_cast<uint32_t>(writes.size()), writes.data(), 0, nullptr);
+            const uint32_t slot = frame * kUniformSlots + uniformSlot;
+            m_bindGroup->UpdateBuffer(slot,
+                0,
+                m_uniformBuffers[frame][uniformSlot],
+                0,
+                sizeof(UniformBlock));
+            if (m_texture.image && m_texture.sampler)
+                m_bindGroup->UpdateTexture(slot, 1, m_texture.image, m_texture.sampler);
+            if (m_normalTexture.image && m_normalTexture.sampler)
+                m_bindGroup->UpdateTexture(slot, 2, m_normalTexture.image, m_normalTexture.sampler);
+            if (m_ormTexture.image && m_ormTexture.sampler)
+                m_bindGroup->UpdateTexture(slot, 3, m_ormTexture.image, m_ormTexture.sampler);
+            m_bindGroup->UpdateBuffer(slot, 4, m_instanceBuffers[frame], 0, instanceBytes);
         }
     }
     return true;
 }
-
 void StaticMeshRenderer::UpdateInstanceDescriptorSets(uint32_t frameIndex)
 {
-    if (frameIndex >= kFramesInFlight || !m_descriptorPool || !m_instanceBuffers[frameIndex].buffer)
+    if (!m_bindGroup || frameIndex >= kFramesInFlight || !m_instanceBuffers[frameIndex])
         return;
 
-    VkDescriptorBufferInfo instanceInfo{};
-    instanceInfo.buffer = m_instanceBuffers[frameIndex].buffer;
-    instanceInfo.offset = 0;
-    instanceInfo.range = VK_WHOLE_SIZE;
-
-    std::array<VkWriteDescriptorSet, kUniformSlots> writes{};
+    const std::uint64_t instanceBytes =
+        sizeof(InstanceBlock) * m_instanceBufferCapacity[frameIndex];
     for (uint32_t uniformSlot = 0; uniformSlot < kUniformSlots; ++uniformSlot)
     {
-        writes[uniformSlot].sType = VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET;
-        writes[uniformSlot].dstSet = m_descriptorSets[frameIndex][uniformSlot];
-        writes[uniformSlot].dstBinding = 4;
-        writes[uniformSlot].descriptorCount = 1;
-        writes[uniformSlot].descriptorType = VK_DESCRIPTOR_TYPE_STORAGE_BUFFER;
-        writes[uniformSlot].pBufferInfo = &instanceInfo;
+        const uint32_t slot = frameIndex * kUniformSlots + uniformSlot;
+        m_bindGroup->UpdateBuffer(slot, 4, m_instanceBuffers[frameIndex], 0, instanceBytes);
     }
-    vkUpdateDescriptorSets(m_device, static_cast<uint32_t>(writes.size()), writes.data(), 0, nullptr);
 }
 
-bool StaticMeshRenderer::EnsureInstanceCapacity(VulkanDevice& device, uint32_t frameIndex, std::uint32_t requiredRecords)
+bool StaticMeshRenderer::EnsureInstanceCapacity(ixrhi::IXRHIDevice& rhi,
+    uint32_t frameIndex,
+    std::uint32_t requiredRecords)
 {
     if (frameIndex >= kFramesInFlight)
         return false;
     requiredRecords = std::max<std::uint32_t>(1u, requiredRecords);
-    if (m_instanceBufferCapacity[frameIndex] >= requiredRecords && m_instanceBuffers[frameIndex].buffer)
+    if (m_instanceBufferCapacity[frameIndex] >= requiredRecords && m_instanceBuffers[frameIndex])
         return true;
 
     std::uint32_t nextCapacity = std::max<std::uint32_t>(kInitialInstanceCapacity, m_instanceBufferCapacity[frameIndex]);
@@ -2985,200 +2653,146 @@ bool StaticMeshRenderer::EnsureInstanceCapacity(VulkanDevice& device, uint32_t f
         nextCapacity *= 2u;
 
     // Preserve instance records already written this frame: growing mid-frame rebinds the
-    // descriptor sets to the new buffer, so earlier (recorded but not executed) draws must
-    // still find their transforms at the same offsets.
-    Buffer previous = m_instanceBuffers[frameIndex];
+    // bind groups to the new buffer, so earlier (recorded but not executed) draws must
+    // still find their transforms at the same offsets. The CPU mirror carries the
+    // prefix bytes (same content the old GPU map-copy preserved, without readback).
     const std::uint32_t previousCapacity = m_instanceBufferCapacity[frameIndex];
-    m_instanceBuffers[frameIndex] = {};
-    CreateHostVisibleBuffer(device,
-        m_device,
-        sizeof(StaticMeshInstanceBlock) * nextCapacity,
-        VK_BUFFER_USAGE_STORAGE_BUFFER_BIT,
+    m_instanceBuffers[frameIndex] = CreateRhiBuffer(rhi,
+        sizeof(InstanceBlock) * nextCapacity,
+        ixrhi::IXRHIBufferUsage::Storage,
+        ixrhi::IXRHICpuAccess::Write,
         nullptr,
-        m_instanceBuffers[frameIndex]);
-    if (previous.buffer && previous.memory && previousCapacity > 0)
+        ("StaticMesh:" + m_modelPath + ":Instances").c_str());
+    if (!m_instanceBuffers[frameIndex])
+        return false;
+    m_instanceMirror[frameIndex].resize(nextCapacity);
+    if (previousCapacity > 0)
     {
-        void* src = nullptr;
-        void* dst = nullptr;
-        if (vkMapMemory(m_device, previous.memory, 0, VK_WHOLE_SIZE, 0, &src) == VK_SUCCESS &&
-            vkMapMemory(m_device, m_instanceBuffers[frameIndex].memory, 0, VK_WHOLE_SIZE, 0, &dst) == VK_SUCCESS)
-        {
-            std::memcpy(dst, src, sizeof(StaticMeshInstanceBlock) * previousCapacity);
-            vkUnmapMemory(m_device, m_instanceBuffers[frameIndex].memory);
-            vkUnmapMemory(m_device, previous.memory);
-        }
+        m_instanceBuffers[frameIndex]->Write(0,
+            m_instanceMirror[frameIndex].data(),
+            sizeof(InstanceBlock) * previousCapacity);
     }
-    DestroyBuffer(previous);
     m_instanceBufferCapacity[frameIndex] = nextCapacity;
     UpdateInstanceDescriptorSets(frameIndex);
     m_lastInstanceBufferRebuilt = true;
     return true;
 }
 
-bool StaticMeshRenderer::CreatePipeline(VulkanDevice& device)
+bool StaticMeshRenderer::CreatePipeline(ixrhi::IXRHIDevice& rhi)
 {
-    if (!m_assets)
+    if (!m_assets || !m_bindLayout)
         return false;
 
-    VkShaderModule vs = CreateShaderModule(m_device, *m_assets, "assets/shaders/static_mesh_vs.spv");
-    VkShaderModule ps = CreateShaderModule(m_device, *m_assets, "assets/shaders/static_mesh_ps.spv");
-    VkShaderModule unlitPs = CreateShaderModule(m_device, *m_assets, "assets/shaders/static_mesh_unlit_ps.spv");
-    VkShaderModule outlineVs = CreateShaderModule(m_device, *m_assets, "assets/shaders/static_mesh_outline_vs.spv");
-    VkShaderModule outlinePs = CreateShaderModule(m_device, *m_assets, "assets/shaders/static_mesh_outline_ps.spv");
+    auto vs = LoadShader(rhi, *m_assets, "assets/shaders/static_mesh_vs.spv",
+        ixrhi::IXRHIShaderStage::Vertex, "VSMain");
+    auto ps = LoadShader(rhi, *m_assets, "assets/shaders/static_mesh_ps.spv",
+        ixrhi::IXRHIShaderStage::Fragment, "PSMain");
+    auto unlitPs = LoadShader(rhi, *m_assets, "assets/shaders/static_mesh_unlit_ps.spv",
+        ixrhi::IXRHIShaderStage::Fragment, "PSMain");
+    auto outlineVs = LoadShader(rhi, *m_assets, "assets/shaders/static_mesh_outline_vs.spv",
+        ixrhi::IXRHIShaderStage::Vertex, "VSMain");
+    auto outlinePs = LoadShader(rhi, *m_assets, "assets/shaders/static_mesh_outline_ps.spv",
+        ixrhi::IXRHIShaderStage::Fragment, "PSMain");
+    if (!vs || !ps || !unlitPs || !outlineVs || !outlinePs)
+        return false;
 
-    VkPipelineShaderStageCreateInfo stages[2]{};
-    stages[0].sType = VK_STRUCTURE_TYPE_PIPELINE_SHADER_STAGE_CREATE_INFO;
-    stages[0].stage = VK_SHADER_STAGE_VERTEX_BIT;
-    stages[0].module = vs;
-    stages[0].pName = "VSMain";
-    stages[1].sType = VK_STRUCTURE_TYPE_PIPELINE_SHADER_STAGE_CREATE_INFO;
-    stages[1].stage = VK_SHADER_STAGE_FRAGMENT_BIT;
-    stages[1].module = ps;
-    stages[1].pName = "PSMain";
-
-    VkVertexInputBindingDescription binding{};
-    binding.binding = 0;
-    binding.stride = sizeof(Vertex);
-    binding.inputRate = VK_VERTEX_INPUT_RATE_VERTEX;
-
-    VkVertexInputAttributeDescription attributes[3]{};
-    attributes[0].location = 0;
-    attributes[0].binding = 0;
-    attributes[0].format = VK_FORMAT_R32G32B32_SFLOAT;
-    attributes[0].offset = offsetof(Vertex, position);
-    attributes[1].location = 1;
-    attributes[1].binding = 0;
-    attributes[1].format = VK_FORMAT_R32G32B32_SFLOAT;
-    attributes[1].offset = offsetof(Vertex, normal);
-    attributes[2].location = 2;
-    attributes[2].binding = 0;
-    attributes[2].format = VK_FORMAT_R32G32_SFLOAT;
-    attributes[2].offset = offsetof(Vertex, uv);
-
-    VkPipelineVertexInputStateCreateInfo vertexInput{};
-    vertexInput.sType = VK_STRUCTURE_TYPE_PIPELINE_VERTEX_INPUT_STATE_CREATE_INFO;
-    vertexInput.vertexBindingDescriptionCount = 1;
-    vertexInput.pVertexBindingDescriptions = &binding;
-    vertexInput.vertexAttributeDescriptionCount = 3;
-    vertexInput.pVertexAttributeDescriptions = attributes;
-
-    VkPipelineInputAssemblyStateCreateInfo assembly{};
-    assembly.sType = VK_STRUCTURE_TYPE_PIPELINE_INPUT_ASSEMBLY_STATE_CREATE_INFO;
-    assembly.topology = VK_PRIMITIVE_TOPOLOGY_TRIANGLE_LIST;
-
-    VkPipelineViewportStateCreateInfo viewport{};
-    viewport.sType = VK_STRUCTURE_TYPE_PIPELINE_VIEWPORT_STATE_CREATE_INFO;
-    viewport.viewportCount = 1;
-    viewport.scissorCount = 1;
-
-    VkPipelineRasterizationStateCreateInfo raster{};
-    raster.sType = VK_STRUCTURE_TYPE_PIPELINE_RASTERIZATION_STATE_CREATE_INFO;
-    raster.polygonMode = VK_POLYGON_MODE_FILL;
-    raster.cullMode = VK_CULL_MODE_NONE;
-    raster.frontFace = VK_FRONT_FACE_CLOCKWISE;
-    raster.lineWidth = 1.0f;
-
-    VkPipelineMultisampleStateCreateInfo multisample{};
-    multisample.sType = VK_STRUCTURE_TYPE_PIPELINE_MULTISAMPLE_STATE_CREATE_INFO;
-    multisample.rasterizationSamples = VK_SAMPLE_COUNT_1_BIT;
-
-    VkPipelineDepthStencilStateCreateInfo depth{};
-    depth.sType = VK_STRUCTURE_TYPE_PIPELINE_DEPTH_STENCIL_STATE_CREATE_INFO;
-    depth.depthTestEnable = VK_TRUE;
-    depth.depthWriteEnable = VK_TRUE;
-    depth.depthCompareOp = VK_COMPARE_OP_LESS;
-
-    VkPipelineColorBlendAttachmentState blendAttachment{};
-    blendAttachment.colorWriteMask = VK_COLOR_COMPONENT_R_BIT | VK_COLOR_COMPONENT_G_BIT |
-        VK_COLOR_COMPONENT_B_BIT | VK_COLOR_COMPONENT_A_BIT;
-    VkPipelineColorBlendStateCreateInfo blend{};
-    blend.sType = VK_STRUCTURE_TYPE_PIPELINE_COLOR_BLEND_STATE_CREATE_INFO;
-    blend.attachmentCount = 1;
-    blend.pAttachments = &blendAttachment;
-
-    VkDynamicState dynamicStates[] = {VK_DYNAMIC_STATE_VIEWPORT, VK_DYNAMIC_STATE_SCISSOR};
-    VkPipelineDynamicStateCreateInfo dynamic{};
-    dynamic.sType = VK_STRUCTURE_TYPE_PIPELINE_DYNAMIC_STATE_CREATE_INFO;
-    dynamic.dynamicStateCount = 2;
-    dynamic.pDynamicStates = dynamicStates;
-
-    VkPipelineLayoutCreateInfo layout{};
-    layout.sType = VK_STRUCTURE_TYPE_PIPELINE_LAYOUT_CREATE_INFO;
-    layout.setLayoutCount = 1;
-    layout.pSetLayouts = &m_descriptorSetLayout;
-    VK_CHECK(vkCreatePipelineLayout(m_device, &layout, nullptr, &m_pipelineLayout));
-
-    VkGraphicsPipelineCreateInfo pipeline{};
-    pipeline.sType = VK_STRUCTURE_TYPE_GRAPHICS_PIPELINE_CREATE_INFO;
-    pipeline.stageCount = 2;
-    pipeline.pStages = stages;
-    pipeline.pVertexInputState = &vertexInput;
-    pipeline.pInputAssemblyState = &assembly;
-    pipeline.pViewportState = &viewport;
-    pipeline.pRasterizationState = &raster;
-    pipeline.pMultisampleState = &multisample;
-    pipeline.pDepthStencilState = &depth;
-    pipeline.pColorBlendState = &blend;
-    pipeline.pDynamicState = &dynamic;
-    pipeline.layout = m_pipelineLayout;
-    pipeline.renderPass = m_mainRenderPass ? m_mainRenderPass : device.GetRenderPass();
-    pipeline.subpass = 0;
-    auto createPipelineVariant = [&](VkShaderModule fragmentShader, VkPipeline& target) {
-        stages[1].module = fragmentShader;
-        VK_CHECK(vkCreateGraphicsPipelines(m_device, VK_NULL_HANDLE, 1, &pipeline, nullptr, &target));
+    ixrhi::IXRHIGraphicsPipelineDesc desc;
+    desc.vertexShader = vs;
+    desc.fragmentShader = ps;
+    desc.bindGroupLayouts = {m_bindLayout.get()};
+    desc.vertexBindings = {{0, sizeof(Vertex)}};
+    desc.vertexAttributes = {
+        {0, 0, ixrhi::IXRHIFormat::R32G32B32Float, offsetof(Vertex, position)},
+        {1, 0, ixrhi::IXRHIFormat::R32G32B32Float, offsetof(Vertex, normal)},
+        {2, 0, ixrhi::IXRHIFormat::R32G32Float, offsetof(Vertex, uv)},
     };
-    createPipelineVariant(ps, m_pipeline);
-    createPipelineVariant(ps, m_maskPipeline);
-    createPipelineVariant(unlitPs, m_unlitPipeline);
-    createPipelineVariant(unlitPs, m_unlitMaskPipeline);
+    desc.topology = ixrhi::IXRHIPrimitiveTopology::TriangleList;
+    desc.cullMode = ixrhi::IXRHICullMode::None;
+    desc.frontFace = ixrhi::IXRHIFrontFace::Clockwise;
+    desc.depthTestEnable = true;
+    desc.depthWriteEnable = true;
+    desc.depthCompareOp = ixrhi::IXRHICompareOp::Less;
+    desc.blendAttachments = {{false,
+        ixrhi::IXRHIBlendFactor::One,
+        ixrhi::IXRHIBlendFactor::Zero,
+        ixrhi::IXRHIBlendOp::Add,
+        ixrhi::IXRHIBlendFactor::One,
+        ixrhi::IXRHIBlendFactor::Zero,
+        ixrhi::IXRHIBlendOp::Add}};
+    desc.sampleCount = 1;
+    desc.targetRenderPass = m_targetPass;
 
-    stages[0].module = outlineVs;
-    stages[1].module = outlinePs;
-    raster.cullMode = VK_CULL_MODE_FRONT_BIT;
-    depth.depthWriteEnable = VK_FALSE;
-    depth.depthCompareOp = VK_COMPARE_OP_LESS_OR_EQUAL;
-    VK_CHECK(vkCreateGraphicsPipelines(m_device, VK_NULL_HANDLE, 1, &pipeline, nullptr, &m_outlinePipeline));
+    // All 5 variants share vertex input/assembly/viewport/raster(base)/
+    // multisample/depth(base)/blend/dynamic state; only the fragment shader
+    // (and, for the outline, cull + depth-write/compare) differ — exactly like
+    // the pre-migration single VkGraphicsPipelineCreateInfo reuse.
+    auto createVariant = [&](const char* name,
+                             const std::shared_ptr<ixrhi::IXRHIShader>& fragment,
+                             std::unique_ptr<ixrhi::IXRHIGraphicsPipeline>& target) {
+        ixrhi::IXRHIGraphicsPipelineDesc variant = desc;
+        variant.fragmentShader = fragment;
+        variant.debugName = name;
+        target = rhi.CreateGraphicsPipeline(variant);
+        return target != nullptr;
+    };
+    desc.debugName = "StaticMesh:Opaque";
+    if (!createVariant("StaticMesh:Opaque", ps, m_pipeline) ||
+        !createVariant("StaticMesh:Mask", ps, m_maskPipeline) ||
+        !createVariant("StaticMesh:Unlit", unlitPs, m_unlitPipeline) ||
+        !createVariant("StaticMesh:UnlitMask", unlitPs, m_unlitMaskPipeline))
+        return false;
 
-    vkDestroyShaderModule(m_device, outlinePs, nullptr);
-    vkDestroyShaderModule(m_device, outlineVs, nullptr);
-    vkDestroyShaderModule(m_device, unlitPs, nullptr);
-    vkDestroyShaderModule(m_device, ps, nullptr);
-    vkDestroyShaderModule(m_device, vs, nullptr);
-    LogFormat("[MATERIAL] static mesh shading pipelines ready lit=0x%llx unlit=0x%llx",
-        VkHandleValue(m_pipeline),
-        VkHandleValue(m_unlitPipeline));
+    desc.vertexShader = outlineVs;
+    desc.fragmentShader = outlinePs;
+    desc.cullMode = ixrhi::IXRHICullMode::Front;
+    desc.depthWriteEnable = false;
+    desc.depthCompareOp = ixrhi::IXRHICompareOp::LessOrEqual;
+    desc.debugName = "StaticMesh:Outline";
+    m_outlinePipeline = rhi.CreateGraphicsPipeline(desc);
+    if (!m_outlinePipeline)
+        return false;
+
+    LogFormat("[MATERIAL] static mesh shading pipelines ready lit=%s unlit=%s",
+        m_pipeline->DebugName().c_str(),
+        m_unlitPipeline->DebugName().c_str());
     return true;
 }
 
-void StaticMeshRenderer::RenderInWorld(VulkanDevice& device,
+void StaticMeshRenderer::RenderInWorld(ixrhi::IXRHICommandList& cmd,
+    const ixrhi::IXRHIFrameInfo& frame,
     double timeSeconds,
     const WorldCamera& camera,
     const Instance& instance,
-    VkExtent2D targetExtent)
+    std::uint32_t targetWidth,
+    std::uint32_t targetHeight)
 {
     std::vector<Instance> instances;
     instances.push_back(instance);
-    RenderBatchInWorld(device, timeSeconds, camera, instances, targetExtent);
+    RenderBatchInWorld(cmd, frame, timeSeconds, camera, instances, targetWidth, targetHeight);
 }
 
-void StaticMeshRenderer::RenderBatchInWorld(VulkanDevice& device,
+void StaticMeshRenderer::RenderBatchInWorld(ixrhi::IXRHICommandList& cmd,
+    const ixrhi::IXRHIFrameInfo& frame,
     double timeSeconds,
     const WorldCamera& camera,
     const std::vector<Instance>& instances,
-    VkExtent2D targetExtent)
+    std::uint32_t targetWidth,
+    std::uint32_t targetHeight)
 {
     LodConfig defaultLod{};
-    RenderLodBatchInWorld(device, timeSeconds, camera, instances, defaultLod, 0, 0, targetExtent);
+    RenderLodBatchInWorld(cmd, frame, timeSeconds, camera, instances, defaultLod, 0, 0, targetWidth, targetHeight);
 }
 
-void StaticMeshRenderer::RenderLodBatchInWorld(VulkanDevice& device,
+void StaticMeshRenderer::RenderLodBatchInWorld(ixrhi::IXRHICommandList& cmd,
+    const ixrhi::IXRHIFrameInfo& frame,
     double timeSeconds,
     const WorldCamera& camera,
     const std::vector<Instance>& instances,
     const LodConfig& lodConfig,
     std::uint64_t configHash,
     std::uint32_t lodLevel,
-    VkExtent2D targetExtent)
+    std::uint32_t targetWidth,
+    std::uint32_t targetHeight)
 {
     m_lastSubmittedDrawCalls = 0;
     m_lastSubmittedInstances = 0;
@@ -3188,16 +2802,17 @@ void StaticMeshRenderer::RenderLodBatchInWorld(VulkanDevice& device,
     m_lastOverrideActiveDraws = 0;
     m_lastInstanceBufferBytes = 0;
     m_lastInstanceBufferRebuilt = false;
-    if (!m_pipeline || !m_unlitPipeline || m_indices.empty() || instances.empty() || !device.IsFrameActive())
+    if (!m_pipeline || !m_unlitPipeline || !m_bindGroup || m_indices.empty() || instances.empty() ||
+        !frame.frameActive)
         return;
-    const VkExtent2D extent = (targetExtent.width > 0 && targetExtent.height > 0)
-        ? targetExtent
-        : device.GetSwapchainExtent();
-    if (extent.width == 0 || extent.height == 0)
+    const std::uint32_t extentWidth = targetWidth > 0 ? targetWidth : frame.targetWidth;
+    const std::uint32_t extentHeight = targetHeight > 0 ? targetHeight : frame.targetHeight;
+    if (extentWidth == 0 || extentHeight == 0)
         return;
 
     const std::uint32_t diagnosticEntityId = instances.empty() ? 0u : instances.front().entityId;
-    const bool useLodBuffer = configHash != 0 && lodLevel > 0 && EnsureLodBuffers(device, lodConfig, configHash, diagnosticEntityId);
+    const bool useLodBuffer = configHash != 0 && lodLevel > 0 &&
+        EnsureLodBuffers(lodConfig, configHash, diagnosticEntityId);
     const LodIndexBuffer* lodSet = nullptr;
     if (useLodBuffer)
     {
@@ -3211,7 +2826,7 @@ void StaticMeshRenderer::RenderLodBatchInWorld(VulkanDevice& device,
         const char* fallbackReason = nullptr;
         if (lodSet->levels == 0)
             fallbackReason = "no-levels";
-        else if (lodSet->buffer.buffer == VK_NULL_HANDLE)
+        else if (!lodSet->buffer)
             fallbackReason = "buffer-not-ready";
         else if (requestedLevel >= lodSet->levels)
             fallbackReason = "no-levels";
@@ -3243,7 +2858,7 @@ void StaticMeshRenderer::RenderLodBatchInWorld(VulkanDevice& device,
         lodLevel = 0;
     }
 
-    const uint32_t frameIndex = device.GetFrameIndex();
+    const uint32_t frameIndex = frame.frameIndex % kFramesInFlight;
     if (m_worldRenderFrameIndex != frameIndex)
     {
         m_worldRenderFrameIndex = frameIndex;
@@ -3252,7 +2867,7 @@ void StaticMeshRenderer::RenderLodBatchInWorld(VulkanDevice& device,
     }
     const uint32_t instanceBase = m_worldInstanceCursor;
 
-    std::vector<StaticMeshInstanceBlock> instanceBlocks;
+    std::vector<StaticMeshRenderer::InstanceBlock> instanceBlocks;
     std::vector<InstancedDrawCommand> drawCommands;
     const std::size_t drawCountForLevel = lodSet
         ? std::count_if(lodSet->draws.begin(), lodSet->draws.end(), [&](const LodMeshDraw& draw) {
@@ -3274,7 +2889,7 @@ void StaticMeshRenderer::RenderLodBatchInWorld(VulkanDevice& device,
             command.sourceSubmesh = sourceSubmesh;
             for (const Instance& instance : instances)
             {
-                StaticMeshInstanceBlock block{};
+                StaticMeshRenderer::InstanceBlock block{};
                 FillStaticMeshInstanceBlock(camera, instance, materialSlot, m_materialDefaults, block);
                 instanceBlocks.push_back(block);
                 const bool overrideActive = std::any_of(instance.materialOverrides.begin(),
@@ -3309,39 +2924,32 @@ void StaticMeshRenderer::RenderLodBatchInWorld(VulkanDevice& device,
     }
 
     const std::uint32_t instanceCount = static_cast<std::uint32_t>(instanceBlocks.size());
-    if (instanceBlocks.empty() || !EnsureInstanceCapacity(device, frameIndex, instanceBase + instanceCount))
+    if (instanceBlocks.empty() || !EnsureInstanceCapacity(*m_rhi, frameIndex, instanceBase + instanceCount))
         return;
-    const VkDeviceSize blockBytes = sizeof(StaticMeshInstanceBlock);
+    const std::size_t blockBytes = sizeof(InstanceBlock);
     m_lastInstanceBufferBytes = instanceCount * blockBytes;
     // Append at the per-frame cursor offset (not offset 0) so multiple calls to this
     // renderer in one frame don't clobber each other's instance transforms.
-    void* mapped = nullptr;
-    VK_CHECK(vkMapMemory(m_device,
-        m_instanceBuffers[frameIndex].memory,
-        0,
-        VK_WHOLE_SIZE,
-        0,
-        &mapped));
-    std::memcpy(static_cast<char*>(mapped) + static_cast<VkDeviceSize>(instanceBase) * blockBytes,
+    m_instanceBuffers[frameIndex]->Write(static_cast<std::uint64_t>(instanceBase) * blockBytes,
         instanceBlocks.data(),
         m_lastInstanceBufferBytes);
-    vkUnmapMemory(m_device, m_instanceBuffers[frameIndex].memory);
+    // Mirror the same bytes for growth preservation (no GPU readback).
+    if (m_instanceMirror[frameIndex].size() < static_cast<std::size_t>(instanceBase) + instanceCount)
+        m_instanceMirror[frameIndex].resize(static_cast<std::size_t>(instanceBase) + instanceCount);
+    std::memcpy(m_instanceMirror[frameIndex].data() + instanceBase,
+        instanceBlocks.data(),
+        m_lastInstanceBufferBytes);
     m_worldInstanceCursor = instanceBase + instanceCount;
 
-    VkCommandBuffer cmd = device.GetCommandBuffer();
-    VkViewport viewport{};
-    viewport.x = 0.0f;
-    viewport.y = 0.0f;
-    viewport.width = static_cast<float>(extent.width);
-    viewport.height = static_cast<float>(extent.height);
-    viewport.minDepth = 0.0f;
-    viewport.maxDepth = 1.0f;
-    VkRect2D scissor{{0, 0}, extent};
-    vkCmdSetViewport(cmd, 0, 1, &viewport);
-    vkCmdSetScissor(cmd, 0, 1, &scissor);
-    VkDeviceSize offset = 0;
-    vkCmdBindVertexBuffers(cmd, 0, 1, &m_vertexBuffer.buffer, &offset);
-    vkCmdBindIndexBuffer(cmd, lodSet ? lodSet->buffer.buffer : m_indexBuffer.buffer, 0, VK_INDEX_TYPE_UINT32);
+    cmd.SetViewport(0.0f,
+        0.0f,
+        static_cast<float>(extentWidth),
+        static_cast<float>(extentHeight));
+    cmd.SetScissor(0, 0, extentWidth, extentHeight);
+    cmd.SetVertexBuffer(0, *m_vertexBuffer, 0);
+    const std::shared_ptr<ixrhi::IXRHIBuffer>& boundIndexBuffer =
+        lodSet && lodSet->buffer ? lodSet->buffer : m_indexBuffer;
+    cmd.SetIndexBuffer(*boundIndexBuffer, 0, /*thirtyTwoBit=*/true);
     const auto findInstanceIndex = [&](std::uint32_t entityId) -> std::optional<std::size_t> {
         for (std::size_t i = 0; i < instances.size(); ++i)
         {
@@ -3366,66 +2974,65 @@ void StaticMeshRenderer::RenderLodBatchInWorld(VulkanDevice& device,
     }
     bool loggedMaterialE3 = false;
     bool loggedMaterialRef = false;
-    const std::uint64_t frameNumber = device.GetFrameNumber();
-    const VkBuffer boundIndexBuffer = lodSet ? lodSet->buffer.buffer : m_indexBuffer.buffer;
+    const std::uint64_t frameNumber = frame.frameNumber;
     const auto logDrawDiag = [&](const char* tag,
                                  std::uint32_t entityId,
                                  const InstancedDrawCommand& draw,
                                  std::size_t instanceIndex,
                                  uint32_t uniformSlot,
-                                 VkPipeline pipelineForDraw) {
+                                 const ixrhi::IXRHIGraphicsPipeline* pipelineForDraw) {
         const std::size_t absoluteInstance = static_cast<std::size_t>(draw.firstInstance) + instanceIndex;
-        const std::size_t instanceOffset = absoluteInstance * sizeof(StaticMeshInstanceBlock);
-        LogFormat("%s entity=%u submesh=%u frame=%llu pipeline=0x%llx vbuf=0x%llx vbufOffset=0 vbufRange=%zu ibuf=0x%llx ibufOffset=0 indexCount=%u indexType=UINT32 ibuf_first=%u ibuf_vertexOffset=0 instbuf=0x%llx instbufOffset=%zu instCount=%u firstInstance=%u descSets=[set0=0x%llx] pushConst_bytes=<none> pushConst_size=0",
+        const std::size_t instanceOffset = absoluteInstance * sizeof(InstanceBlock);
+        LogFormat("%s entity=%u submesh=%u frame=%llu pipeline=%s vbuf=0x%llx vbufOffset=0 vbufRange=%zu ibuf=0x%llx ibufOffset=0 indexCount=%u indexType=UINT32 ibuf_first=%u ibuf_vertexOffset=0 instbuf=0x%llx instbufOffset=%zu instCount=%u firstInstance=%u bindSlot=%u pushConst_bytes=<none> pushConst_size=0",
             tag,
             entityId,
             draw.sourceSubmesh,
             static_cast<unsigned long long>(frameNumber),
-            VkHandleValue(pipelineForDraw),
-            VkHandleValue(m_vertexBuffer.buffer),
+            pipelineForDraw ? pipelineForDraw->DebugName().c_str() : "<none>",
+            RhiObjectId(m_vertexBuffer),
             sizeof(Vertex) * m_vertices.size(),
-            VkHandleValue(boundIndexBuffer),
+            RhiObjectId(boundIndexBuffer),
             draw.indexCount,
             draw.firstIndex,
-            VkHandleValue(m_instanceBuffers[frameIndex].buffer),
+            RhiObjectId(m_instanceBuffers[frameIndex]),
             instanceOffset,
             draw.instanceCount,
             draw.firstInstance,
-            VkHandleValue(m_descriptorSets[frameIndex][uniformSlot]));
+            frameIndex * kUniformSlots + uniformSlot);
     };
     const auto logMaterialDiag = [&](const char* tag,
                                      const Instance& instance,
-                                     const StaticMeshInstanceBlock& block,
+                                     const InstanceBlock& block,
                                      uint32_t materialSlot,
                                      std::size_t absoluteInstance,
                                      bool isLodActive) {
-        const std::size_t instanceOffset = absoluteInstance * sizeof(StaticMeshInstanceBlock);
-        const std::size_t materialOffset = instanceOffset + offsetof(StaticMeshInstanceBlock, materialBaseColor);
+        const std::size_t instanceOffset = absoluteInstance * sizeof(InstanceBlock);
+        const std::size_t materialOffset = instanceOffset + offsetof(InstanceBlock, materialBaseColor);
         const std::size_t materialSize =
             sizeof(block.materialBaseColor) +
             sizeof(block.materialParams) +
             sizeof(block.materialEmissive) +
             sizeof(block.materialUv);
-        const std::size_t transformOffset = instanceOffset + offsetof(StaticMeshInstanceBlock, model);
+        const std::size_t transformOffset = instanceOffset + offsetof(InstanceBlock, model);
         const float alphaCutoff = m_alphaModeName == "mask" ? 0.5f : 0.0f;
-        LogFormat("%s entity=%u frame=%llu alphaMode=%s materialIndex=%u materialBuffer=0x%llx matOffset=%zu matSize=%zu baseColorView=0x%llx normalView=0x%llx metallicRoughnessView=0x%llx baseColorFactor=(%.3f,%.3f,%.3f,%.3f) alphaCutoff=%.3f transformBuffer=0x%llx tfOffset=%zu worldMatrix.row0=(%.3f,%.3f,%.3f,%.3f) worldMatrix.row1=(%.3f,%.3f,%.3f,%.3f) worldMatrix.row2=(%.3f,%.3f,%.3f,%.3f) worldMatrix.row3=(%.3f,%.3f,%.3f,%.3f) isLodActive=%s",
+        LogFormat("%s entity=%u frame=%llu alphaMode=%s materialIndex=%u materialBuffer=0x%llx matOffset=%zu matSize=%zu baseColor=%s normal=%s metallicRoughness=%s baseColorFactor=(%.3f,%.3f,%.3f,%.3f) alphaCutoff=%.3f transformBuffer=0x%llx tfOffset=%zu worldMatrix.row0=(%.3f,%.3f,%.3f,%.3f) worldMatrix.row1=(%.3f,%.3f,%.3f,%.3f) worldMatrix.row2=(%.3f,%.3f,%.3f,%.3f) worldMatrix.row3=(%.3f,%.3f,%.3f,%.3f) isLodActive=%s",
             tag,
             instance.entityId,
             static_cast<unsigned long long>(frameNumber),
             AlphaModeForLog(m_alphaModeName),
             materialSlot,
-            VkHandleValue(m_instanceBuffers[frameIndex].buffer),
+            RhiObjectId(m_instanceBuffers[frameIndex]),
             materialOffset,
             materialSize,
-            VkHandleValue(m_texture.view),
-            VkHandleValue(m_normalTexture.view),
-            VkHandleValue(m_ormTexture.view),
+            m_texture.name.c_str(),
+            m_normalTexture.name.c_str(),
+            m_ormTexture.name.c_str(),
             block.materialBaseColor[0],
             block.materialBaseColor[1],
             block.materialBaseColor[2],
             block.materialBaseColor[3],
             alphaCutoff,
-            VkHandleValue(m_instanceBuffers[frameIndex].buffer),
+            RhiObjectId(m_instanceBuffers[frameIndex]),
             transformOffset,
             block.model.m[0], block.model.m[1], block.model.m[2], block.model.m[3],
             block.model.m[4], block.model.m[5], block.model.m[6], block.model.m[7],
@@ -3469,19 +3076,19 @@ void StaticMeshRenderer::RenderLodBatchInWorld(VulkanDevice& device,
     }
     m_lastMaterialBindings.clear();
     m_lastMaterialBindings.reserve(drawCommands.size());
-    VkPipeline boundPipeline = VK_NULL_HANDLE;
+    const ixrhi::IXRHIGraphicsPipeline* boundPipeline = nullptr;
     auto drawPass = [&](bool maskPass) {
         for (const InstancedDrawCommand& draw : drawCommands)
         {
             const MaterialTextureViews materialTextures =
-                ResolveMaterialTextureViews(device, instances.front(), draw.materialSlot);
+                ResolveMaterialTextureViews(*m_rhi, instances.front(), draw.materialSlot);
             const bool isMask = std::strcmp(materialTextures.fragmentShaderAlphaPath, "discard") == 0;
             if (isMask != maskPass)
                 continue;
 
-            VkPipeline pipelineForDraw = materialTextures.unlit
-                ? (isMask ? m_unlitMaskPipeline : m_unlitPipeline)
-                : (isMask ? m_maskPipeline : m_pipeline);
+            const ixrhi::IXRHIGraphicsPipeline* pipelineForDraw = materialTextures.unlit
+                ? (isMask ? m_unlitMaskPipeline.get() : m_unlitPipeline.get())
+                : (isMask ? m_maskPipeline.get() : m_pipeline.get());
             if (std::strcmp(materialTextures.fragmentShaderAlphaPath, "blend-fallback-opaque") == 0)
             {
                 static std::unordered_set<std::string> loggedBlendFallbacks;
@@ -3490,38 +3097,45 @@ void StaticMeshRenderer::RenderLodBatchInWorld(VulkanDevice& device,
                     LogFormat("[MATERIAL] BLEND mode not yet supported, falling back to OPAQUE material=%s slot=%u",
                         materialTextures.resolvedMaterial.c_str(),
                         draw.materialSlot);
-                pipelineForDraw = materialTextures.unlit ? m_unlitPipeline : m_pipeline;
+                pipelineForDraw =
+                    materialTextures.unlit ? m_unlitPipeline.get() : m_pipeline.get();
             }
 
             if (boundPipeline != pipelineForDraw)
             {
-                vkCmdBindPipeline(cmd, VK_PIPELINE_BIND_POINT_GRAPHICS, pipelineForDraw);
+                cmd.SetGraphicsPipeline(*pipelineForDraw);
                 boundPipeline = pipelineForDraw;
             }
 
             const uint32_t uniformSlot = std::min(m_worldUniformCursor++, kUniformSlots - 1);
             UpdateWorldUniform(frameIndex, uniformSlot, camera, instances.front(), timeSeconds, draw.materialSlot);
             UpdateMaterialTextureDescriptors(frameIndex, uniformSlot, materialTextures);
-            VkDescriptorSet descriptorSet = m_descriptorSets[frameIndex][uniformSlot];
+            const uint32_t bindSlot = frameIndex * kUniformSlots + uniformSlot;
             LastMaterialBinding binding{};
             binding.sourceSubmesh = draw.sourceSubmesh;
             binding.materialSlot = draw.materialSlot;
-            binding.descriptorSet = descriptorSet;
-            binding.baseColorView = materialTextures.baseColor.imageView;
-            binding.normalView = materialTextures.normal.imageView;
-            binding.ormView = materialTextures.orm.imageView;
+            binding.bindSlot = bindSlot;
+            binding.baseColorTexture = materialTextures.baseColor.texture
+                ? materialTextures.baseColor.texture->DebugName()
+                : std::string();
+            binding.normalTexture = materialTextures.normal.texture
+                ? materialTextures.normal.texture->DebugName()
+                : std::string();
+            binding.ormTexture = materialTextures.orm.texture
+                ? materialTextures.orm.texture->DebugName()
+                : std::string();
             binding.resolvedMaterial = materialTextures.resolvedMaterial;
             binding.baseColorTextureGuid = materialTextures.baseColorTextureGuid;
             binding.alphaMode = materialTextures.alphaMode;
             binding.alphaCutoff = materialTextures.alphaCutoff;
             binding.fragmentShaderAlphaPath = materialTextures.fragmentShaderAlphaPath;
             binding.unlit = materialTextures.unlit;
-            binding.pipeline = pipelineForDraw;
+            binding.pipelineName =
+                pipelineForDraw ? pipelineForDraw->DebugName() : std::string();
             binding.boundBeforeDraw = true;
             m_lastMaterialBindings.push_back(std::move(binding));
             ++m_lastMaterialUniformUpdates;
-            vkCmdBindDescriptorSets(cmd, VK_PIPELINE_BIND_POINT_GRAPHICS, m_pipelineLayout,
-                0, 1, &descriptorSet, 0, nullptr);
+            cmd.BindGroup(0, *m_bindGroup, bindSlot);
             if (configHash != 0 && diagnosticInstanceIndex)
             {
                 const std::size_t absoluteInstance = static_cast<std::size_t>(draw.firstInstance) + *diagnosticInstanceIndex;
@@ -3558,7 +3172,7 @@ void StaticMeshRenderer::RenderLodBatchInWorld(VulkanDevice& device,
                     logDrawDiag("[LOD-DRAW-REF]", instances[*refInstanceIndex].entityId, draw, *refInstanceIndex, uniformSlot, pipelineForDraw);
                 }
             }
-            vkCmdDrawIndexed(cmd, draw.indexCount, draw.instanceCount, draw.firstIndex, 0, draw.firstInstance);
+            cmd.DrawIndexed(draw.indexCount, draw.instanceCount, draw.firstIndex, 0, draw.firstInstance);
             ++m_lastSubmittedDrawCalls;
             m_lastSubmittedIndexCount += draw.indexCount;
         }
@@ -3576,14 +3190,13 @@ void StaticMeshRenderer::RenderLodBatchInWorld(VulkanDevice& device,
         }
         if (!outlinedInstances.empty())
         {
-            vkCmdBindPipeline(cmd, VK_PIPELINE_BIND_POINT_GRAPHICS, m_outlinePipeline);
-            const MaterialTextureViews materialTextures = ResolveMaterialTextureViews(device, instances.front(), 0);
+            cmd.SetGraphicsPipeline(*m_outlinePipeline);
+            const MaterialTextureViews materialTextures =
+                ResolveMaterialTextureViews(*m_rhi, instances.front(), 0);
             const uint32_t uniformSlot = std::min(m_worldUniformCursor++, kUniformSlots - 1);
             UpdateWorldUniform(frameIndex, uniformSlot, camera, instances.front(), timeSeconds, 0);
             UpdateMaterialTextureDescriptors(frameIndex, uniformSlot, materialTextures);
-            VkDescriptorSet descriptorSet = m_descriptorSets[frameIndex][uniformSlot];
-            vkCmdBindDescriptorSets(cmd, VK_PIPELINE_BIND_POINT_GRAPHICS, m_pipelineLayout,
-                0, 1, &descriptorSet, 0, nullptr);
+            cmd.BindGroup(0, *m_bindGroup, frameIndex * kUniformSlots + uniformSlot);
 
             for (const InstancedDrawCommand& draw : drawCommands)
             {
@@ -3591,8 +3204,7 @@ void StaticMeshRenderer::RenderLodBatchInWorld(VulkanDevice& device,
                 {
                     if (instanceIndex >= draw.instanceCount)
                         continue;
-                    vkCmdDrawIndexed(cmd,
-                        draw.indexCount,
+                    cmd.DrawIndexed(draw.indexCount,
                         1,
                         draw.firstIndex,
                         0,
@@ -3606,94 +3218,42 @@ void StaticMeshRenderer::RenderLodBatchInWorld(VulkanDevice& device,
 
 void StaticMeshRenderer::DestroyPipeline()
 {
-    if (m_pipeline)
-        vkDestroyPipeline(m_device, m_pipeline, nullptr);
-    m_pipeline = VK_NULL_HANDLE;
-    if (m_maskPipeline)
-        vkDestroyPipeline(m_device, m_maskPipeline, nullptr);
-    m_maskPipeline = VK_NULL_HANDLE;
-    if (m_unlitPipeline)
-        vkDestroyPipeline(m_device, m_unlitPipeline, nullptr);
-    m_unlitPipeline = VK_NULL_HANDLE;
-    if (m_unlitMaskPipeline)
-        vkDestroyPipeline(m_device, m_unlitMaskPipeline, nullptr);
-    m_unlitMaskPipeline = VK_NULL_HANDLE;
-    if (m_outlinePipeline)
-        vkDestroyPipeline(m_device, m_outlinePipeline, nullptr);
-    m_outlinePipeline = VK_NULL_HANDLE;
-    if (m_pipelineLayout)
-        vkDestroyPipelineLayout(m_device, m_pipelineLayout, nullptr);
-    m_pipelineLayout = VK_NULL_HANDLE;
-}
-
-void StaticMeshRenderer::DestroyBuffer(Buffer& buffer)
-{
-    if (buffer.buffer)
-        vkDestroyBuffer(m_device, buffer.buffer, nullptr);
-    if (buffer.memory)
-        vkFreeMemory(m_device, buffer.memory, nullptr);
-    buffer = {};
-}
-
-void StaticMeshRenderer::DestroyTexture(Texture& texture)
-{
-    if (texture.sampler)
-        vkDestroySampler(m_device, texture.sampler, nullptr);
-    if (texture.view)
-        vkDestroyImageView(m_device, texture.view, nullptr);
-    if (texture.image)
-        vkDestroyImage(m_device, texture.image, nullptr);
-    if (texture.memory)
-        vkFreeMemory(m_device, texture.memory, nullptr);
-    texture = {};
+    // RAII release (pipelines own VkPipeline + layout in the backend).
+    m_pipeline.reset();
+    m_maskPipeline.reset();
+    m_unlitPipeline.reset();
+    m_unlitMaskPipeline.reset();
+    m_outlinePipeline.reset();
 }
 
 void StaticMeshRenderer::Destroy()
 {
     StopLodWorker();
-    if (!m_device)
+    if (!m_rhi)
         return;
     DestroyPipeline();
-    if (m_descriptorPool)
-        vkDestroyDescriptorPool(m_device, m_descriptorPool, nullptr);
-    m_descriptorPool = VK_NULL_HANDLE;
-    if (m_descriptorSetLayout)
-        vkDestroyDescriptorSetLayout(m_device, m_descriptorSetLayout, nullptr);
-    m_descriptorSetLayout = VK_NULL_HANDLE;
-    DestroyBuffer(m_vertexBuffer);
-    DestroyBuffer(m_indexBuffer);
-    for (auto& [_, lodSet] : m_lodBuffers)
-        DestroyBuffer(lodSet.buffer);
+    m_bindGroup.reset();
+    m_bindLayout.reset();
+    m_vertexBuffer.reset();
+    m_indexBuffer.reset();
     m_lodBuffers.clear();
-    for (PendingLodUpload& upload : m_pendingLodUploads)
-    {
-        if (upload.fence)
-        {
-            vkWaitForFences(m_device, 1, &upload.fence, VK_TRUE, UINT64_MAX);
-            vkDestroyFence(m_device, upload.fence, nullptr);
-        }
-        if (upload.commandPool)
-            vkDestroyCommandPool(m_device, upload.commandPool, nullptr);
-        DestroyBuffer(upload.staging);
-        DestroyBuffer(upload.lodSet.buffer);
-    }
+    // Dropping in-flight uploads waits for their fences and releases staging
+    // (parity with the old fence-wait in Destroy).
     m_pendingLodUploads.clear();
-    for (Buffer& buffer : m_retiredLodBuffers)
-        DestroyBuffer(buffer);
     m_retiredLodBuffers.clear();
     for (auto& frameBuffers : m_uniformBuffers)
     {
-        for (Buffer& buffer : frameBuffers)
-            DestroyBuffer(buffer);
+        for (auto& buffer : frameBuffers)
+            buffer.reset();
     }
-    for (Buffer& buffer : m_instanceBuffers)
-        DestroyBuffer(buffer);
+    for (auto& buffer : m_instanceBuffers)
+        buffer.reset();
     m_instanceBufferCapacity = {};
-    DestroyTexture(m_texture);
-    DestroyTexture(m_normalTexture);
-    DestroyTexture(m_ormTexture);
-    for (auto& [_, texture] : m_materialTextureCache)
-        DestroyTexture(texture);
+    for (auto& mirror : m_instanceMirror)
+        mirror.clear();
+    m_texture = {};
+    m_normalTexture = {};
+    m_ormTexture = {};
     m_materialTextureCache.clear();
     m_failedMaterialTextureKeys.clear();
     m_vertices.clear();
@@ -3712,7 +3272,8 @@ void StaticMeshRenderer::Destroy()
     m_assets = nullptr;
     m_modelPath.clear();
     m_status = LoadStatus::NotLoaded;
-    m_device = VK_NULL_HANDLE;
+    m_targetPass = nullptr;
+    m_rhi = nullptr;
 }
 
 void StaticMeshRenderer::UpdateWorldUniform(uint32_t frameIndex,
@@ -3776,8 +3337,7 @@ void StaticMeshRenderer::UpdateWorldUniform(uint32_t frameIndex,
     uniform.waterParams[0] = 0.0f;
     uniform.causticParams[0] = 0.0f;
 
-    void* mapped = nullptr;
-    VK_CHECK(vkMapMemory(m_device, m_uniformBuffers[frameIndex][uniformSlot].memory, 0, sizeof(uniform), 0, &mapped));
-    std::memcpy(mapped, &uniform, sizeof(uniform));
-    vkUnmapMemory(m_device, m_uniformBuffers[frameIndex][uniformSlot].memory);
+    if (frameIndex < kFramesInFlight && uniformSlot < kUniformSlots &&
+        m_uniformBuffers[frameIndex][uniformSlot])
+        m_uniformBuffers[frameIndex][uniformSlot]->Write(0, &uniform, sizeof(uniform));
 }

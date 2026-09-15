@@ -8,8 +8,8 @@
 //
 // Frame contract: the caller supplies the recording command list (borrowed frame
 // list via ixvulkan::WrapFrameCommandList) and an IXRHIFrameInfo snapshot. The
-// pipeline targets whichever render pass the backend resolves (offscreen scene
-// pass via IXVulkanDevice::SetPipelineRenderPass — see EngineApplication).
+// pipeline bakes against m_targetPass (offscreen scene pass, borrowed) or the
+// backend default when null — see EngineApplication's offscreenPass borrower.
 
 #include "WorldCamera.h"
 
@@ -18,6 +18,7 @@
 #include "IXRHICommandList.h"
 #include "IXRHIDevice.h"
 #include "IXRHIPipeline.h"
+#include "IXRHIRenderPass.h"
 
 #include <array>
 #include <cstdint>
@@ -40,6 +41,9 @@ public:
 
     bool Create(ixrhi::IXRHIDevice& rhi, client::asset::IAssetReader& assets);
     bool RecreatePipeline(ixrhi::IXRHIDevice& rhi);
+    // Borrowed target pass (offscreen scene pass); null = backend default.
+    // Replaces the pre-Phase-3A backend-global pass override for this renderer.
+    void SetTargetPass(const ixrhi::IXRHIRenderPass* pass) { m_targetPass = pass; }
     void Render(ixrhi::IXRHICommandList& cmd,
                 const ixrhi::IXRHIFrameInfo& frame,
                 const WorldCamera& camera,
@@ -69,6 +73,7 @@ private:
     void UpdateUniform(uint32_t frameIndex, const WorldCamera& camera);
 
     ixrhi::IXRHIDevice* m_rhi = nullptr;
+    const ixrhi::IXRHIRenderPass* m_targetPass = nullptr; // borrowed (frame owner)
     client::asset::IAssetReader* m_assets = nullptr;
     std::array<std::shared_ptr<ixrhi::IXRHIBuffer>, kFramesInFlight> m_vertexBuffers{};
     std::array<std::shared_ptr<ixrhi::IXRHIBuffer>, kFramesInFlight> m_uniformBuffers{};

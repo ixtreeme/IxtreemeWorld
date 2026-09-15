@@ -10,11 +10,10 @@
 // It must not leak further: renderer/editor headers take IXRHI types only.
 //
 // Migration exceptions inventoried here:
-// - E1 SetPipelineRenderPass(VkRenderPass): borrowed override so migrated
-//   pipelines targeting the OFFSCREEN pass (selection outlines) resolve a
-//   compatible pass. Dies when OffscreenSceneRenderer exposes IXRHI attachments.
 // - E2 Loop(): borrowed VulkanDevice for the frame owner + bridge. Dies with the
 //   frame-loop migration.
+// (E1 SetPipelineRenderPass was removed in Phase 3A: renderers name their pass
+// through the borrowed ixrhi::IXRHIRenderPass token instead.)
 
 #include "IXRHIDevice.h"
 
@@ -41,6 +40,11 @@ public:
     std::shared_ptr<ixrhi::IXRHIBuffer> CreateBuffer(const ixrhi::IXRHIBufferDesc& desc,
                                                      const void* initialDataOrNull,
                                                      std::size_t initialBytes) override;
+    std::unique_ptr<ixrhi::IXRHIBufferUpload> UploadBufferAsync(const ixrhi::IXRHIBufferDesc& desc,
+                                                                const void* src,
+                                                                std::size_t byteCount) override;
+    bool IsTextureFormatSupported(ixrhi::IXRHIFormat format,
+                                  ixrhi::IXRHITextureUsage usage) const override;
     std::shared_ptr<ixrhi::IXRHITexture> CreateTexture(const ixrhi::IXRHITextureDesc& desc,
                                                        const void* initialDataOrNull,
                                                        std::size_t initialBytes) override;
@@ -62,8 +66,7 @@ public:
     // ---- backend-internal helpers (Vulkan module only) ----
     VulkanDevice& Loop() const { return *m_loop; }
     VkDevice NativeDevice() const;
-    VkRenderPass ResolveRenderPass() const; // override (E1) else swapchain pass
-    void SetPipelineRenderPass(VkRenderPass pass); // E1, borrowed, may be null
+    VkRenderPass ResolveRenderPass(const ixrhi::IXRHIRenderPass* pass) const;
     void SetDebugName(VkObjectType type, std::uint64_t handle, const char* name) const;
     void CheckVk(VkResult result, const char* call, const char* file, int line) const;
 
@@ -72,6 +75,9 @@ public:
     std::uint32_t FindMemoryType(std::uint32_t typeBits, VkMemoryPropertyFlags props) const;
     void AllocateAndBind(VkBuffer buffer, VkMemoryPropertyFlags props, VkDeviceMemory& out) const;
     void AllocateAndBind(VkImage image, VkMemoryPropertyFlags props, VkDeviceMemory& out) const;
+    // Internally synchronized buffer copy (setup-time staging); not for use
+    // inside a recording command list.
+    void CopyBufferSync(VkBuffer src, VkBuffer dst, VkDeviceSize size) const;
 
 private:
     void QueryCapabilities();
@@ -83,7 +89,6 @@ private:
                             std::size_t byteCount) const;
 
     VulkanDevice* m_loop = nullptr; // borrowed frame-loop owner (E2)
-    VkRenderPass m_pipelineRenderPassOverride = VK_NULL_HANDLE; // borrowed (E1)
     ixrhi::IXRHICapabilities m_capabilities;
     PFN_vkSetDebugUtilsObjectNameEXT m_setDebugName = nullptr;
     VkCommandPool m_uploadPool = VK_NULL_HANDLE; // transient uploads (Dedicated)
