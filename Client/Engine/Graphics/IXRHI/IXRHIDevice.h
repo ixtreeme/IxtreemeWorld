@@ -96,6 +96,12 @@ public:
     // Must not be called from inside a recording command list.
     virtual void WaitIdle() = 0;
 
+    // Deterministic backend teardown: releases ALL backend Vulkan objects
+    // (frame contexts, swapchain object, query/upload pools) while the native
+    // device is still alive. Idempotent; must precede native device teardown
+    // (destructors are a backstop, not the ordering mechanism).
+    virtual void Shutdown() = 0;
+
     // ---- Frame lifecycle (Phase 3C: IXRHI owns the graphics frame contract).
     // BeginFrame waits/recycles the frame slot, acquires the swapchain image,
     // resets per-frame command resources and begins recording. Returns Success

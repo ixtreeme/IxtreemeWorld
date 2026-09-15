@@ -1,6 +1,3 @@
-#define VK_USE_PLATFORM_ANDROID_KHR
-#include <vulkan/vulkan.h>
-
 #include "NativeWindow_Android.h"
 #include "Debug.h"
 

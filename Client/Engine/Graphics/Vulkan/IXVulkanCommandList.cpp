@@ -10,6 +10,8 @@
 #include "IXVulkanSync.h"
 #include "VulkanDevice.h"
 
+#include <cassert>
+
 namespace ixvulkan
 {
 
@@ -81,6 +83,7 @@ void IXVulkanCommandList::SetScissor(std::uint32_t x,
 void IXVulkanCommandList::SetGraphicsPipeline(const ixrhi::IXRHIGraphicsPipeline& pipeline)
 {
     auto* native = dynamic_cast<const IXVulkanGraphicsPipeline*>(&pipeline);
+    assert(native != nullptr && "foreign IXRHIGraphicsPipeline used with IXVulkan backend");
     if (native == nullptr)
         return;
     m_lastLayout = native->NativeLayout();
@@ -92,6 +95,7 @@ void IXVulkanCommandList::SetVertexBuffer(std::uint32_t slot,
                                           std::uint64_t offsetBytes)
 {
     auto* native = dynamic_cast<const IXVulkanBuffer*>(&buffer);
+    assert(native != nullptr && "foreign IXRHIBuffer used with IXVulkan backend");
     if (native == nullptr)
         return;
     const VkBuffer handle = native->Native();
@@ -104,6 +108,7 @@ void IXVulkanCommandList::SetIndexBuffer(const ixrhi::IXRHIBuffer& buffer,
                                            bool thirtyTwoBit)
 {
     auto* native = dynamic_cast<const IXVulkanBuffer*>(&buffer);
+    assert(native != nullptr && "foreign IXRHIBuffer used with IXVulkan backend");
     if (native == nullptr)
         return;
     vkCmdBindIndexBuffer(m_cmd,
@@ -116,6 +121,7 @@ void IXVulkanCommandList::BindGroup(std::uint32_t layoutSet,
                                     std::uint32_t slotIndex)
 {
     auto* native = dynamic_cast<const IXVulkanBindGroup*>(&group);
+    assert(native != nullptr && "foreign IXRHIBindGroup used with IXVulkan backend");
     if (native == nullptr || m_lastLayout == VK_NULL_HANDLE)
         return;
     const VkDescriptorSet set = native->NativeSet(slotIndex);
@@ -212,6 +218,7 @@ void IXVulkanCommandList::TransitionTexture(ixrhi::IXRHITexture& texture,
                                             ixrhi::IXRHIImageLayout to)
 {
     auto* native = dynamic_cast<IXVulkanTexture*>(&texture);
+    assert(native != nullptr && "foreign IXRHITexture used with IXVulkan backend");
     if (native == nullptr)
         return;
     VkPipelineStageFlags srcStage = 0;
@@ -240,6 +247,7 @@ void IXVulkanCommandList::CopyTexture(const ixrhi::IXRHITexture& src, ixrhi::IXR
 {
     auto* nativeSrc = dynamic_cast<const IXVulkanTexture*>(&src);
     auto* nativeDst = dynamic_cast<IXVulkanTexture*>(&dst);
+    assert(nativeSrc != nullptr && nativeDst != nullptr && "foreign IXRHITexture used with IXVulkan backend");
     if (nativeSrc == nullptr || nativeDst == nullptr)
         return;
     const VkImageAspectFlags aspect = ToVkAspectMask(nativeSrc->Format());

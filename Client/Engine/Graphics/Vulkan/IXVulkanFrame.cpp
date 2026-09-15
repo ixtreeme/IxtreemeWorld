@@ -21,6 +21,8 @@
 #include <array>
 #include <cassert>
 #include <chrono>
+#include <cstdio>
+#include <string>
 
 namespace ixvulkan
 {
@@ -31,6 +33,9 @@ bool IXVulkanDevice::EnsureFrameSlot(std::uint32_t slot)
     if (context.pool != VK_NULL_HANDLE)
         return true;
 
+    char tag[64]{};
+    std::snprintf(tag, sizeof(tag), "Frame[%u]", slot);
+
     VkCommandPoolCreateInfo poolInfo{};
     poolInfo.sType = VK_STRUCTURE_TYPE_COMMAND_POOL_CREATE_INFO;
     poolInfo.flags = VK_COMMAND_POOL_CREATE_RESET_COMMAND_BUFFER_BIT;
@@ -39,6 +44,10 @@ bool IXVulkanDevice::EnsureFrameSlot(std::uint32_t slot)
         "vkCreateCommandPool(frame)",
         __FILE__,
         __LINE__);
+    std::string poolTag = std::string(tag) + ".CommandPool";
+    SetDebugName(VK_OBJECT_TYPE_COMMAND_POOL,
+        reinterpret_cast<std::uint64_t>(context.pool),
+        poolTag.c_str());
 
     VkCommandBufferAllocateInfo alloc{};
     alloc.sType = VK_STRUCTURE_TYPE_COMMAND_BUFFER_ALLOCATE_INFO;
@@ -49,6 +58,10 @@ bool IXVulkanDevice::EnsureFrameSlot(std::uint32_t slot)
         "vkAllocateCommandBuffers(frame)",
         __FILE__,
         __LINE__);
+    std::string cmdTag = std::string(tag) + ".CommandBuffer";
+    SetDebugName(VK_OBJECT_TYPE_COMMAND_BUFFER,
+        reinterpret_cast<std::uint64_t>(context.cmd),
+        cmdTag.c_str());
     context.list = std::make_unique<IXVulkanCommandList>(*this, context.cmd);
 
     VkFenceCreateInfo fenceInfo{};
@@ -58,6 +71,10 @@ bool IXVulkanDevice::EnsureFrameSlot(std::uint32_t slot)
         "vkCreateFence(frame)",
         __FILE__,
         __LINE__);
+    std::string fenceTag = std::string(tag) + ".Fence";
+    SetDebugName(VK_OBJECT_TYPE_FENCE,
+        reinterpret_cast<std::uint64_t>(context.fence),
+        fenceTag.c_str());
 
     VkSemaphoreCreateInfo semInfo{};
     semInfo.sType = VK_STRUCTURE_TYPE_SEMAPHORE_CREATE_INFO;
@@ -65,6 +82,10 @@ bool IXVulkanDevice::EnsureFrameSlot(std::uint32_t slot)
         "vkCreateSemaphore(acquire)",
         __FILE__,
         __LINE__);
+    std::string semTag = std::string(tag) + ".AcquireSemaphore";
+    SetDebugName(VK_OBJECT_TYPE_SEMAPHORE,
+        reinterpret_cast<std::uint64_t>(context.imageAvailable),
+        semTag.c_str());
     return true;
 }
 
@@ -78,14 +99,19 @@ bool IXVulkanDevice::EnsureSwapchainObjects()
         for (VkSemaphore sem : m_renderFinished)
             vkDestroySemaphore(NativeDevice(), sem, nullptr);
         m_renderFinished.assign(imageCount, VK_NULL_HANDLE);
-        for (VkSemaphore& sem : m_renderFinished)
+        for (std::size_t i = 0; i < m_renderFinished.size(); ++i)
         {
             VkSemaphoreCreateInfo semInfo{};
             semInfo.sType = VK_STRUCTURE_TYPE_SEMAPHORE_CREATE_INFO;
-            CheckVk(vkCreateSemaphore(NativeDevice(), &semInfo, nullptr, &sem),
+            CheckVk(vkCreateSemaphore(NativeDevice(), &semInfo, nullptr, &m_renderFinished[i]),
                 "vkCreateSemaphore(present)",
                 __FILE__,
                 __LINE__);
+            char tag[64]{};
+            std::snprintf(tag, sizeof(tag), "Swapchain.PresentSemaphore[%zu]", i);
+            SetDebugName(VK_OBJECT_TYPE_SEMAPHORE,
+                reinterpret_cast<std::uint64_t>(m_renderFinished[i]),
+                tag);
         }
         m_imagesInFlight.assign(imageCount, VK_NULL_HANDLE);
     }
@@ -335,6 +361,7 @@ ixrhi::IXRHIFrame IXVulkanDevice::BeginFrame()
 void IXVulkanDevice::EndFrame(const ixrhi::IXRHIFrame& frame)
 {
     // Debug pairing: only the live frame may close, exactly once (§51/89).
+    // Release path ignores mismatches safely (no submission).
     assert(m_tracker.IsRecording() && "EndFrame without an active BeginFrame");
     assert(frame.result == ixrhi::IXRHIFrameResult::Success && "EndFrame requires a successful frame");
     assert(frame.frameToken != 0 && frame.frameToken == m_activeToken && "EndFrame token mismatch");
@@ -414,7 +441,11 @@ void IXVulkanDevice::EndFrame(const ixrhi::IXRHIFrame& frame)
     }
     FinishCaptureAfterSubmit();
 
-    m_tracker.OnEnd();
+    if (!m_tracker.OnEnd(m_activeToken))
+    {
+        assert(false && "EndFrame tracker pairing failed");
+        return;
+    }
     m_frameActive = false;
     SyncLegacyFrameState();
 }
@@ -518,6 +549,9 @@ void IXVulkanDevice::CreateTimestampPool()
         "vkCreateQueryPool(timestamps)",
         __FILE__,
         __LINE__);
+    SetDebugName(VK_OBJECT_TYPE_QUERY_POOL,
+        reinterpret_cast<std::uint64_t>(m_queryPool),
+        "TimestampQueryPool");
 #endif
 }
 

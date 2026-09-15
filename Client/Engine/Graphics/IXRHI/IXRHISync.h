@@ -1,11 +1,10 @@
 #pragma once
 
-// IXRHIFence / IXRHISemaphore — minimal GPU synchronization for the paths the
-// current renderer actually needs (upload completion, frame pacing after the
-// frame-loop migration). Per-frame acquire/submit/present fences stay inside
-// VulkanDevice in Phase 2. No Vulkan pipeline barriers here: resource
-// transitions are performed by the backend during texture upload; explicit
-// barrier API arrives with the compute/offscreen migrations.
+// IXRHIFence / IXRHISemaphore — minimal GPU synchronization for explicit
+// advanced use only (async uploads use their own fences internally). Normal
+// frame pacing needs no manual semaphore wiring: acquire/submit/present sync
+// lives inside the backend frame authority. No Vulkan pipeline barriers here:
+// explicit transitions go through IXRHICommandList::TransitionTexture.
 
 #include "IXRHI.h"
 

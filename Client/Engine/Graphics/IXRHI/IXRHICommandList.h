@@ -1,11 +1,12 @@
 #pragma once
 
 // IXRHICommandList — recording-only command interface used INSIDE an active
-// render pass owned by the frame loop (VulkanDevice in Phase 2). Renderers must
-// issue all draw-state commands through this; no vkCmd* outside the backend.
+// frame (IXRHI-owned command list from the frame context) or render target.
+// Renderers must issue all draw-state commands through this; no vkCmd*
+// outside the backend.
 //
 // Begin()/End() bracket OWNED lists (device.CreateCommandList). Borrowed frame
-// lists (ixvulkan::WrapFrameCommandList) are already recording: Begin/End are
+// lists (frame context commandList) are already recording: Begin/End are
 // accepted no-ops so renderer code is identical for both.
 
 #include "IXRHI.h"

@@ -1,19 +1,26 @@
-# Ixtreeme Engine — module map (Phase 1)
+# Ixtreeme Engine — module map (Phases 1–3C)
 
 The engine provides CAPABILITIES. The game provides POLICY. No game-specific
 concept may leak into generic engine modules.
 
 ```
-Core            — libs/debug, libs/math, libs/common, libs/platform (OS/window/process/time/paths)
-                    Engine/Core/Core.h documents the rule. EXCEPTION (Phase 2 moves it):
-                    libs/platform/VulkanDevice.* is really Graphics/Vulkan.
+Core            — libs/debug, libs/math, libs/common, libs/platform (OS/window/process/time/paths).
+                    libs/platform/VulkanDevice.* keeps device/queue/swapchain-handle
+                    infrastructure + backend-synced migration shims; its frame loop
+                    is deleted (Phase 3C). See docs/architecture/ixrhi-frame-lifecycle.md.
 ECS             — Engine/ECS/EcsWorlds.h — EditorWorld vs ClientWorld seam (Flecs preserved,
                     no EnTT, no custom wrapper). No live flecs::world yet; SceneData vectors remain.
-Graphics/IXRHI  — Engine/Graphics/IXRHI/ (IXRHI.h contract + IXRHIBuffer/Texture/
-                    Shader/Pipeline/Binding/CommandList/Swapchain/Device/Sync/Types/Capabilities).
-Graphics/Vulkan — Engine/Graphics/Vulkan/IXVulkan.h (RESERVED) + live libs/platform/VulkanDevice.*.
-Graphics/Renderer — live libs/render/*Renderer.* (Static/Skinned/Terrain/Water/Selection/WorldLabel/
-                    Offscreen/Cube) — behavior unchanged in Phase 1.
+Graphics/IXRHI  — Engine/Graphics/IXRHI/ (contract + Buffer/Texture/Shader/Pipeline/
+                    Binding/CommandList/Swapchain/Device/Sync/Types/Capabilities/Frame/
+                    Query/RenderTarget/RenderPass). Owns the graphics frame contract.
+Graphics/Vulkan — Engine/Graphics/Vulkan/ (IXVulkanDevice frame authority + swapchain,
+                    targets, editor adapter, surface, conversions). Owns acquisition,
+                    recording, submission, presentation, sync, timestamps.
+Graphics/Renderer — libs/render/*Renderer.* — Static/SelectionOutline/WorldLabel/
+                    OffscreenSceneRenderer are IXRHI-native; Skinned/Terrain/Water/
+                    RmlUi remain native (inventoried shims).
+Editor/Graphics — Editor/Graphics/ (EditorGraphicsBridge registry + provider
+                    interface). Backend adapter lives in Engine/Graphics/Vulkan/.
 World           — Engine/World/World.h — Terrain/Water/Spatial ownership + SpatialIndex LOCAL-ONLY policy.
 Assets          — libs/asset (AssetDatabase GUID identity, AssetLibrary, AssetWatcher, ProjectManager,
                     MaterialAssetManager) — engine-owned. Asset Browser (editor_panels) is Editor-only.
@@ -31,8 +38,9 @@ Networking      — NOT implemented. Seam = RuntimeSession::UpdateNetwork/SendMo
                     (stubs). No Boost.Asio in Phase 1.
 Serialization   — libs/render/SceneManager (JSON + sidecars) + libs/prefab/PrefabDocument — unchanged.
 Runtime         — Engine/Runtime/ClientRuntime.h (RESERVED ClientApplication/ClientWorld/Presentation/
-                    GameModule) + live libs/render/RuntimeSession.* (stays put in Phase 1, see its header).
+                    GameModule) + live libs/render/RuntimeSession.* (stays put, see its header).
 ```
 
 Dependency flow: Core <- ECS/Assets/Physics/Animation/Audio/UI <- World/Graphics/Runtime <- Editor.
 Game projects depend on Engine/Runtime. Engine NEVER depends on a game project or Editor.
+Frame flow: Application -> IXRHIDevice::BeginFrame -> IXRHIFrame -> renderers -> EndFrame.

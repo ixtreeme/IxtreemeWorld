@@ -2225,17 +2225,17 @@ int RunGame(NativeWindow& window,
         ShowFatal("Failed to create Vulkan device. See debug output/stderr.");
         return 1;
     }
-    // IXRHI backend (Phase 2 strangler): borrows the live frame loop above.
-    // Declared before all renderers so it outlives them; IXRHI-native renderers
-    // take IXRHIDevice& instead of VulkanDevice&.
-    ixvulkan::IXVulkanDevice rhiDevice(device);
+    // IXRHI backend (Phase 3C authority): owns acquisition, recording,
+    // submission, presentation, sync and timestamps. Generic factory seam
+    // (always Vulkan today); declared before all renderers so it outlives them.
+    std::unique_ptr<ixrhi::IXRHIDevice> rhiDevice = ixvulkan::CreateDevice(device);
 #if defined(IXTREEME_WITH_EDITOR)
     // Backend-specific editor integration (Phase 3B: isolated ImGui Vulkan
     // backend + UI texture registrations). Declared early so it outlives the
     // editor UI and all renderers; explicit ShutdownBackend precedes device
     // teardown at scope end (the dtor is an idempotent backstop).
     std::unique_ptr<ixvulkan::IXVulkanEditorAdapter> editorAdapter =
-        ixvulkan::IXVulkanEditorAdapter::Create(device, rhiDevice);
+        ixvulkan::IXVulkanEditorAdapter::Create(device, *rhiDevice);
 #endif
 #if defined(IXTREEME_WITH_EDITOR)
     Tracen("[BUILD] Editor: ENABLED");
@@ -2339,6 +2339,7 @@ int RunGame(NativeWindow& window,
 
     TerrainRenderer terrain;
     bool terrainOk = terrain.Create(device, assets);
+    terrain.SetRhiDevice(rhiDevice.get());
     auto syncTerrainAssetRoots = [&]() {
         std::vector<std::filesystem::path> roots;
         if (ProjectManager::Instance().HasProject())
@@ -2363,7 +2364,7 @@ int RunGame(NativeWindow& window,
     }
 
     WorldLabelRenderer worldLabels;
-    bool worldLabelsOk = worldLabels.Create(rhiDevice, assets);
+    bool worldLabelsOk = worldLabels.Create(*rhiDevice, assets);
     if (!worldLabelsOk)
     {
         Tracenf("[MAIN] WorldLabelRenderer failed to initialize - worldLabels will not be available");
@@ -2371,7 +2372,7 @@ int RunGame(NativeWindow& window,
     }
 
     SelectionOutlineRenderer selectionOutlines;
-    bool selectionOutlinesOk = selectionOutlines.Create(rhiDevice, assets);
+    bool selectionOutlinesOk = selectionOutlines.Create(*rhiDevice, assets);
     if (!selectionOutlinesOk)
     {
         Tracenf("[MAIN] SelectionOutlineRenderer failed to initialize - selection outlines will not be available");
@@ -2389,7 +2390,7 @@ int RunGame(NativeWindow& window,
         offscreenDepthFormat = ixvulkan::FromVkFormat(device.GetDepthStencilFormat());
     };
     refreshOffscreenFormats();
-    bool offscreenSceneOk = offscreenScene.Create(rhiDevice,
+    bool offscreenSceneOk = offscreenScene.Create(*rhiDevice,
         assets,
         renderSize.width,
         renderSize.height,
@@ -2413,7 +2414,7 @@ int RunGame(NativeWindow& window,
         if (selectionOutlinesOk)
         {
             selectionOutlines.SetTargetPass(offscreenScene.GetTargetPass());
-            selectionOutlines.RecreatePipeline(rhiDevice);
+            selectionOutlines.RecreatePipeline(*rhiDevice);
         }
 #if defined(IXTREEME_WITH_EDITOR)
         editorAdapter->SetSceneViewTexture(offscreenScene.GetColorTexture(),
@@ -2426,7 +2427,7 @@ int RunGame(NativeWindow& window,
     // Second offscreen target for the Game view (rendered from the scene's main camera).
     // Uses a render-pass-compatible target, so the renderers' existing pipelines work as-is.
     OffscreenSceneRenderer gameView;
-    bool gameViewOk = gameView.Create(rhiDevice,
+    bool gameViewOk = gameView.Create(*rhiDevice,
         assets,
         renderSize.width,
         renderSize.height,
@@ -2613,7 +2614,7 @@ int RunGame(NativeWindow& window,
         entry.renderer = std::make_unique<StaticMeshRenderer>();
         if (offscreenSceneOk)
             entry.renderer->SetTargetPass(offscreenScene.GetTargetPass());
-        if (!entry.renderer->Create(rhiDevice, assets, modelPath))
+        if (!entry.renderer->Create(*rhiDevice, assets, modelPath))
         {
             entry.renderer.reset();
             entry.state = StaticMeshCacheEntry::State::Failed;
@@ -2653,7 +2654,7 @@ int RunGame(NativeWindow& window,
             if (entry.renderer)
             {
                 entry.renderer->SetTargetPass(offscreenScene.GetTargetPass());
-                entry.renderer->RecreatePipeline(rhiDevice);
+                entry.renderer->RecreatePipeline(*rhiDevice);
             }
         }
         if (terrainOk)
@@ -2669,7 +2670,7 @@ int RunGame(NativeWindow& window,
         if (selectionOutlinesOk)
         {
             selectionOutlines.SetTargetPass(offscreenScene.GetTargetPass());
-            selectionOutlines.RecreatePipeline(rhiDevice);
+            selectionOutlines.RecreatePipeline(*rhiDevice);
         }
 #if defined(IXTREEME_WITH_EDITOR)
         editorAdapter->SetSceneViewTexture(offscreenScene.GetColorTexture(),
@@ -2678,7 +2679,7 @@ int RunGame(NativeWindow& window,
             offscreenScene.Height());
         if (gameViewOk)
         {
-            gameViewOk = gameView.Recreate(rhiDevice,
+            gameViewOk = gameView.Recreate(*rhiDevice,
                 renderSize.width,
                 renderSize.height,
                 offscreenColorFormat,
@@ -2703,7 +2704,7 @@ int RunGame(NativeWindow& window,
             device.GetSwapchainExtent().width,
             device.GetSwapchainExtent().height);
         refreshOffscreenFormats();
-        offscreenSceneOk = offscreenScene.Recreate(rhiDevice,
+        offscreenSceneOk = offscreenScene.Recreate(*rhiDevice,
             targetExtent.width,
             targetExtent.height,
             offscreenColorFormat,
@@ -4922,7 +4923,7 @@ int RunGame(NativeWindow& window,
                 if (offscreenSceneOk)
                 {
                     const VkExtent2D resizeExtent = effectiveRenderExtent();
-                    offscreenSceneOk = offscreenScene.Recreate(rhiDevice,
+                    offscreenSceneOk = offscreenScene.Recreate(*rhiDevice,
                         resizeExtent.width,
                         resizeExtent.height,
                         offscreenColorFormat,
@@ -4961,7 +4962,7 @@ int RunGame(NativeWindow& window,
                             offscreenScene.Height());
                         if (gameViewOk)
                         {
-                            gameViewOk = gameView.Recreate(rhiDevice,
+                            gameViewOk = gameView.Recreate(*rhiDevice,
                                 renderSize.width,
                                 renderSize.height,
                                 offscreenColorFormat,
@@ -4993,14 +4994,14 @@ int RunGame(NativeWindow& window,
                 {
                     (void)path;
                     if (entry.renderer)
-                        entry.renderer->RecreatePipeline(rhiDevice);
+                        entry.renderer->RecreatePipeline(*rhiDevice);
                 }
                 if (terrainOk)
                     terrain.RecreatePipeline(device);
                 if (selectionOutlinesOk)
-                    selectionOutlines.RecreatePipeline(rhiDevice);
+                    selectionOutlines.RecreatePipeline(*rhiDevice);
                 if (worldLabelsOk)
-                    worldLabels.RecreatePipeline(rhiDevice);
+                    worldLabels.RecreatePipeline(*rhiDevice);
                 runtimeSession->OnRenderPassChanged(device);
                 rmlUi.OnRenderPassChanged(device);
 #if defined(IXTREEME_WITH_EDITOR)
@@ -5015,7 +5016,7 @@ int RunGame(NativeWindow& window,
         if (window.ConsumeResize(width, height))
         {
             Tracenf("[MAIN] Resize event consumed: %ux%u, queueing backend resize", width, height);
-            if (!rhiDevice.RequestResize(width, height))
+            if (!rhiDevice->RequestResize(width, height))
                 Tracen("[MAIN] resize unchanged, skipping pipeline recreate");
         }
 
@@ -5401,7 +5402,7 @@ int RunGame(NativeWindow& window,
                     audioEngine.SetBusVolume(ixaudio::AudioBus::SFX, commands.audioVolume[2]);
                 }
                 if (commands.captureGpuFrame)
-                    rhiDevice.RequestGpuFrameCapture();
+                    rhiDevice->RequestGpuFrameCapture();
                 if (commands.dumpFrameProfile)
                     dumpFrameProfileRequested = true;
                 if (commands.debugPerfTogglesChanged)
@@ -9881,7 +9882,7 @@ int RunGame(NativeWindow& window,
         // IXRHI frame authority (Phase 3C): the backend acquires, records,
         // submits and presents. SwapchainRecreated runs the shared resize
         // orchestration; Skip renders nothing; DeviceLost exits gracefully.
-        ixrhi::IXRHIFrame rhiFrame = rhiDevice.BeginFrame();
+        ixrhi::IXRHIFrame rhiFrame = rhiDevice->BeginFrame();
         if (rhiFrame.result == ixrhi::IXRHIFrameResult::SwapchainRecreated)
             handleSwapchainChanged();
         if (rhiFrame.result == ixrhi::IXRHIFrameResult::DeviceLost)
@@ -10223,13 +10224,13 @@ int RunGame(NativeWindow& window,
             const auto sceneRenderBegin = std::chrono::steady_clock::now();
             if (isInWorld && hasSceneTerrain && hasFrameCamera && !debugDisableShadowPass)
             {
-                rhiDevice.WriteTimestamp(ixrhi::IXRHITimestampPoint::ShadowPassBegin);
+                rhiDevice->WriteTimestamp(ixrhi::IXRHITimestampPoint::ShadowPassBegin);
                 terrain.RenderSunShadowMap(device, frameCamera);
-                rhiDevice.WriteTimestamp(ixrhi::IXRHITimestampPoint::ShadowPassEnd);
+                rhiDevice->WriteTimestamp(ixrhi::IXRHITimestampPoint::ShadowPassEnd);
             }
             if (isInWorld && hasSceneTerrain && hasFrameCamera && !debugDisableWaterReflectionPass)
             {
-                rhiDevice.WriteTimestamp(ixrhi::IXRHITimestampPoint::WaterReflectionBegin);
+                rhiDevice->WriteTimestamp(ixrhi::IXRHITimestampPoint::WaterReflectionBegin);
                 terrain.RenderWaterReflection(device,
                     frameCamera,
                     seconds,
@@ -10258,7 +10259,7 @@ int RunGame(NativeWindow& window,
                         // (Editor lights are not drawn as the skinned character model in the
                         // water reflection either — removed old debug visualization.)
                     });
-                rhiDevice.WriteTimestamp(ixrhi::IXRHITimestampPoint::WaterReflectionEnd);
+                rhiDevice->WriteTimestamp(ixrhi::IXRHITimestampPoint::WaterReflectionEnd);
             }
 
             const bool useOffscreenScene = offscreenSceneOk && frameInfo.frameActive;
@@ -10268,7 +10269,7 @@ int RunGame(NativeWindow& window,
             auto beginMainPass = [&]() {
                 if (mainPassOpen)
                     return;
-                if (ixrhi::IXRHIRenderTarget* mainTarget = rhiDevice.GetMainRenderTarget())
+                if (ixrhi::IXRHIRenderTarget* mainTarget = rhiDevice->GetMainRenderTarget())
                 {
                     mainTarget->Begin(*frameInfo.commandList);
                     mainPassOpen = true;
@@ -10285,11 +10286,11 @@ int RunGame(NativeWindow& window,
                 if (hasSceneTerrain)
                 {
                     frameSceneRenderCalled = true;
-                    rhiDevice.WriteTimestamp(ixrhi::IXRHITimestampPoint::TerrainMainBegin);
+                    rhiDevice->WriteTimestamp(ixrhi::IXRHITimestampPoint::TerrainMainBegin);
                     terrain.Render(device, camera, renderSize);
-                    rhiDevice.WriteTimestamp(ixrhi::IXRHITimestampPoint::TerrainMainEnd);
+                    rhiDevice->WriteTimestamp(ixrhi::IXRHITimestampPoint::TerrainMainEnd);
                 }
-                rhiDevice.WriteTimestamp(ixrhi::IXRHITimestampPoint::SceneOtherBegin);
+                rhiDevice->WriteTimestamp(ixrhi::IXRHITimestampPoint::SceneOtherBegin);
 
                 plates.reserve(entities.size());
                 // Draw the networked skinned entities recorded by the pre-pass (dormant until
@@ -10883,7 +10884,7 @@ int RunGame(NativeWindow& window,
                 }
                 if (!useOffscreenScene && worldLabelsOk)
                     worldLabels.Render(*frameInfo.commandList, frameInfo, camera, plates);
-                rhiDevice.WriteTimestamp(ixrhi::IXRHITimestampPoint::SceneOtherEnd);
+                rhiDevice->WriteTimestamp(ixrhi::IXRHITimestampPoint::SceneOtherEnd);
             }
             else if (SkinnedMeshRenderer* lobbySkinned = runtimeSession->IsLobbyActive()
                          ? getSkinnedMeshRenderer(kDefaultCharacterModelPath)
@@ -10891,9 +10892,9 @@ int RunGame(NativeWindow& window,
             {
                 frameSceneRenderCalled = true;
                 frameSceneEntityCount = 1;
-                rhiDevice.WriteTimestamp(ixrhi::IXRHITimestampPoint::SceneOtherBegin);
+                rhiDevice->WriteTimestamp(ixrhi::IXRHITimestampPoint::SceneOtherBegin);
                 lobbySkinned->Render(device, seconds);
-                rhiDevice.WriteTimestamp(ixrhi::IXRHITimestampPoint::SceneOtherEnd);
+                rhiDevice->WriteTimestamp(ixrhi::IXRHITimestampPoint::SceneOtherEnd);
             }
 
             if (useOffscreenScene)
@@ -11029,18 +11030,18 @@ int RunGame(NativeWindow& window,
                 }
 #endif
                 beginMainPass(); // composite + labels + UI share one swapchain pass
-                rhiDevice.WriteTimestamp(ixrhi::IXRHITimestampPoint::CompositeBegin);
+                rhiDevice->WriteTimestamp(ixrhi::IXRHITimestampPoint::CompositeBegin);
                 offscreenScene.RenderComposite(*frameInfo.commandList, frameInfo);
-                rhiDevice.WriteTimestamp(ixrhi::IXRHITimestampPoint::CompositeEnd);
+                rhiDevice->WriteTimestamp(ixrhi::IXRHITimestampPoint::CompositeEnd);
                 if (isInWorld && worldLabelsOk)
                     worldLabels.Render(*frameInfo.commandList, frameInfo, camera, plates);
             }
             frameProfile.sceneRenderMs = MillisecondsBetween(sceneRenderBegin, std::chrono::steady_clock::now());
             const auto editorUiBegin = std::chrono::steady_clock::now();
             frameRmlUiRenderCalled = true;
-            rhiDevice.WriteTimestamp(ixrhi::IXRHITimestampPoint::RmlUiBegin);
+            rhiDevice->WriteTimestamp(ixrhi::IXRHITimestampPoint::RmlUiBegin);
             rmlUi.Render(device);
-            rhiDevice.WriteTimestamp(ixrhi::IXRHITimestampPoint::RmlUiEnd);
+            rhiDevice->WriteTimestamp(ixrhi::IXRHITimestampPoint::RmlUiEnd);
 #if defined(IXTREEME_WITH_EDITOR)
             frameImGuiRenderCalled = true;
             engineStats.swapchainWidth = swapchainSize.width;
@@ -11079,16 +11080,16 @@ int RunGame(NativeWindow& window,
                 }
             }
             editorImGui.SetEngineStats(engineStats);
-            rhiDevice.WriteTimestamp(ixrhi::IXRHITimestampPoint::ImGuiBegin);
+            rhiDevice->WriteTimestamp(ixrhi::IXRHITimestampPoint::ImGuiBegin);
             editorImGui.RenderPanels();
             editorAdapter->DrawFrame(*frameInfo.commandList, frameInfo.frameNumber);
-            rhiDevice.WriteTimestamp(ixrhi::IXRHITimestampPoint::ImGuiEnd);
+            rhiDevice->WriteTimestamp(ixrhi::IXRHITimestampPoint::ImGuiEnd);
 #else
             frameImGuiRenderCalled = false;
 #endif
             if (mainPassOpen)
             {
-                if (ixrhi::IXRHIRenderTarget* mainEnd = rhiDevice.GetMainRenderTarget())
+                if (ixrhi::IXRHIRenderTarget* mainEnd = rhiDevice->GetMainRenderTarget())
                     mainEnd->End(*frameInfo.commandList);
                 mainPassOpen = false;
             }
@@ -11239,7 +11240,7 @@ int RunGame(NativeWindow& window,
         // EndFrame only for successful frames (Skip/Recreated/DeviceLost own
         // no submission; the backend asserts pairing in Debug).
         if (rhiFrame)
-            rhiDevice.EndFrame(rhiFrame);
+            rhiDevice->EndFrame(rhiFrame);
         frameProfile.submitPresentMs = MillisecondsBetween(submitPresentBegin, std::chrono::steady_clock::now());
         frameProfile.totalCpuFrameMs = MillisecondsBetween(frameCpuStart, std::chrono::steady_clock::now());
         // Carry this frame's CPU profile + present mode into engineStats so next frame's
@@ -11281,7 +11282,7 @@ int RunGame(NativeWindow& window,
         {
             ixrhi::IXRHITimestampResults gpuTiming{};
             ixrhi::IXRHICpuFrameTiming cpuTiming{};
-            if (rhiDevice.TryReadTimestamps(gpuTiming, cpuTiming))
+            if (rhiDevice->TryReadTimestamps(gpuTiming, cpuTiming))
             {
                 const TerrainRenderer::FrameDrawStats terrainDrawStats = terrain.GetFrameDrawStats();
                 auto elapsedMs = [&](ixrhi::IXRHITimestampPoint begin, ixrhi::IXRHITimestampPoint end) -> double {
@@ -11429,7 +11430,7 @@ int RunGame(NativeWindow& window,
     runtimeSession->Destroy();
     // Backend frame authority teardown BEFORE legacy device teardown (§70):
     // releases frame contexts, swapchain object, query pool and upload pool.
-    rhiDevice.Shutdown();
+    rhiDevice->Shutdown();
     device.Destroy();
     return 0;
 }

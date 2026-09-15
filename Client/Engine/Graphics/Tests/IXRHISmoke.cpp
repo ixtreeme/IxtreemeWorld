@@ -165,11 +165,15 @@ void TestFrameContract()
     ixvulkan::IXVulkanFrameTracker tracker;
     Check(tracker.CanBegin(), "tracker begins from Idle");
     Check(tracker.GetGeneration() == 1, "tracker generation starts at 1");
+    Check(!tracker.OnEnd(1), "tracker End without Begin rejected");
     const std::uint64_t token = tracker.OnBegin(0, 0);
     Check(!tracker.CanBegin() && tracker.IsRecording(), "tracker Recording after Begin");
-    tracker.OnEnd();
+    Check(!tracker.OnEnd(token + 1), "tracker stale token rejected");
+    Check(tracker.IsRecording(), "tracker still Recording after rejected End");
+    Check(tracker.OnEnd(token), "tracker matched End accepted");
     Check(tracker.CanBegin() && tracker.GetSlot() == 1, "tracker advances slot on End");
     Check(tracker.GetFrameNumber() == 1, "tracker advances frame number on End");
+    Check(!tracker.OnEnd(token), "tracker double End rejected");
     tracker.OnBegin(1, 1);
     tracker.OnAbort();
     Check(tracker.CanBegin() && tracker.GetSlot() == 1, "tracker abort keeps slot");

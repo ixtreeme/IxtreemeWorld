@@ -16,10 +16,9 @@
 //   IRHI*, VulkanRHI).
 // - No void* native-device casts and no GetNativeVk*() on these interfaces.
 //   Backend-private native resolution for in-transition native consumers lives
-//   in the Vulkan module (IXVulkanBridge.h: WrapFrameCommandList for the
-//   in-flight frame buffer; NativeViewOf/NativeSamplerOf/NativePassOf for
-//   still-native downstream users). Every native access is inventoried in
-//   docs/architecture/phase2-migration-status.md.
+//   in the Vulkan module (IXVulkanBridge.h: NativeViewOf/NativeSamplerOf/
+//   NativePassOf for still-native downstream users). Every native access is
+//   inventoried in docs/architecture/phase2-migration-status.md.
 //
 // OWNERSHIP MODEL (binding, see IXRHIDevice.h for the full contract):
 // - GPU resources (buffer/texture/sampler/shader): std::shared_ptr — real shared

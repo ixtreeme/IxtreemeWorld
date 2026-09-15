@@ -32,6 +32,11 @@ void LogAbort(const char* message)
 
 } // namespace
 
+std::unique_ptr<ixrhi::IXRHIDevice> CreateDevice(VulkanDevice& loop)
+{
+    return std::make_unique<IXVulkanDevice>(loop);
+}
+
 IXVulkanDevice::IXVulkanDevice(VulkanDevice& loop) : m_loop(&loop)
 {
     auto proc = reinterpret_cast<PFN_vkSetDebugUtilsObjectNameEXT>(

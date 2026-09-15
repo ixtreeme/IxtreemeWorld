@@ -11,67 +11,11 @@
 class VulkanDevice
 {
 public:
-    enum class GpuTimestampPoint : uint32_t
-    {
-        FrameBegin = 0,
-        ShadowPassBegin,
-        ShadowCascade0Begin,
-        ShadowCascade0End,
-        ShadowCascade1Begin,
-        ShadowCascade1End,
-        ShadowCascade2Begin,
-        ShadowCascade2End,
-        ShadowCascade3Begin,
-        ShadowCascade3End,
-        ShadowPassEnd,
-        WaterReflectionBegin,
-        WaterReflectionEnd,
-        TerrainMainBegin,
-        TerrainMainEnd,
-        SceneOtherBegin,
-        SceneOtherEnd,
-        CompositeBegin,
-        CompositeEnd,
-        RmlUiBegin,
-        RmlUiEnd,
-        ImGuiBegin,
-        ImGuiEnd,
-        FrameEnd,
-        Count
-    };
-
-    static constexpr uint32_t GpuTimestampPointCount = static_cast<uint32_t>(GpuTimestampPoint::Count);
-
-    struct GpuTimestampResults
-    {
-        bool valid = false;
-        uint64_t frameNumber = 0;
-        std::array<bool, GpuTimestampPointCount> pointValid{};
-        std::array<double, GpuTimestampPointCount> pointMs{};
-    };
-
-    struct CpuFrameTimingResults
-    {
-        bool valid = false;
-        uint64_t frameNumber = 0;
-        double acquireImageMs = 0.0;
-        double waitForFencesMs = 0.0;
-        double renderLoopCpuWorkMs = 0.0;
-        double submitMs = 0.0;
-        double presentMs = 0.0;
-        double totalCpuFrameMs = 0.0;
-    };
+    // NOTE (Phase 3C): the legacy GPU-timestamp enum/structs were deleted with
+    // the dormant capture flow. Engine profiling uses ixrhi::IXRHITimestampPoint
+    // + IXRHITimestampResults/IXRHICpuFrameTiming (Engine/Graphics/IXRHI/).
 
     bool Create(NativeWindow& window, uint32_t width, uint32_t height);
-    // DORMANT since Phase 3C: the IXVulkanDevice frame authority owns
-    // acquisition/recording/submission/presentation. Kept compiling until the
-    // last native consumer migrates; do not call.
-    void BeginFrame();
-    void BeginSwapchainRenderPass(const char* passName = "other");
-    void EndFrame();
-    // DORMANT since Phase 3C: use IXRHIDevice::RequestResize (the backend
-    // recreates inside BeginFrame and reports SwapchainRecreated).
-    bool Resize(uint32_t width, uint32_t height);
     void WaitIdle();
     void Destroy();
     // Infrastructure entry used by the IXVulkan frame authority (Phase 3C):
@@ -103,13 +47,10 @@ public:
     VkQueue GetGraphicsQueue() const { return m_graphicsQueue; }
     uint32_t GetGraphicsQueueFamily() const { return m_queueFamilies.graphics; }
     VkRenderPass GetRenderPass() const { return m_renderPass; }
-    // Migration shim: the backend-active command buffer while a frame records.
-    VkCommandBuffer GetCommandBuffer() const
-    {
-        if (m_migrationActiveCmd != VK_NULL_HANDLE)
-            return m_migrationActiveCmd;
-        return m_commandBuffers.empty() ? VK_NULL_HANDLE : m_commandBuffers[m_currentFrame];
-    }
+    // Migration shim: the backend-active command buffer while a frame records
+    // (null outside frames). Still-native renderers must only call this
+    // between backend BeginFrame success and EndFrame.
+    VkCommandBuffer GetCommandBuffer() const { return m_migrationActiveCmd; }
     uint32_t GetFrameIndex() const { return m_currentFrame; }
     VkExtent2D GetSwapchainExtent() const { return m_swapchainExtent; }
     // False when the swapchain fell back to FIFO (vsync) — i.e. FPS is capped to the
@@ -127,16 +68,8 @@ public:
     uint32_t GetHeight() const { return m_height; }
     bool IsSwapchainFormatSrgb() const;
     uint32_t FindMemoryType(uint32_t typeFilter, VkMemoryPropertyFlags properties) const;
-    static constexpr uint32_t MaxFramesInFlight() { return MAX_FRAMES_IN_FLIGHT; }
-    // DORMANT since Phase 3C (backend owns the timestamp pool + capture flow;
-    // see IXRHIDevice::WriteTimestamp/TryReadTimestamps). Kept for reference.
-    void RequestGpuFrameCapture();
-    bool IsGpuFrameCaptureActive() const { return m_gpuCaptureActive; }
-    void WriteGpuTimestamp(GpuTimestampPoint point);
-    bool ConsumeGpuFrameCaptureResults(GpuTimestampResults& gpu, CpuFrameTimingResults& cpu);
 
 private:
-    static constexpr uint32_t MAX_FRAMES_IN_FLIGHT = 2;
 
     struct QueueFamilies
     {
@@ -161,18 +94,8 @@ private:
     bool CreateSwapchain(uint32_t width, uint32_t height);
     bool CreateImageViews();
     bool CreateDepthStencilImages();
-    bool CreateRenderPass();
-    bool CreateFramebuffers();
-    bool CreateCommandPool();
-    bool CreateCommandBuffers();
-    bool CreateSyncObjects();
-    bool CreateTimestampQueryPool();
-    void BeginGpuFrameCaptureCommands();
-    void FinishGpuFrameCaptureAfterSubmit();
 
     void DestroySwapchainObjects();
-    int FindSwapchainImageIndex(VkImage image) const;
-    void LogSwapchainImageTransition(VkImage image, VkImageLayout oldLayout, VkImageLayout newLayout, const char* passName) const;
 
     QueueFamilies FindQueueFamilies(VkPhysicalDevice device) const;
     SwapchainSupport QuerySwapchainSupport(VkPhysicalDevice device) const;
@@ -198,49 +121,25 @@ private:
     VkSurfaceTransformFlagBitsKHR m_currentTransform = VK_SURFACE_TRANSFORM_IDENTITY_BIT_KHR;
     std::vector<VkImage> m_swapchainImages;
     std::vector<VkImageView> m_swapchainImageViews;
-    std::vector<VkFramebuffer> m_framebuffers;
     VkFormat m_depthStencilFormat = VK_FORMAT_UNDEFINED;
     std::vector<VkImage> m_depthStencilImages;
     std::vector<VkDeviceMemory> m_depthStencilMemory;
     std::vector<VkImageView> m_depthStencilImageViews;
 
     VkRenderPass m_renderPass = VK_NULL_HANDLE; // backend-owned mirror (3C); legacy never frees
-    VkCommandPool m_commandPool = VK_NULL_HANDLE;
-    std::vector<VkCommandBuffer> m_commandBuffers;
     // Backend-active command buffer for still-native renderers (synced per frame).
     VkCommandBuffer m_migrationActiveCmd = VK_NULL_HANDLE;
-    VkQueryPool m_timestampQueryPool = VK_NULL_HANDLE;
-    float m_timestampPeriodNs = 0.0f;
 
-    VkSemaphore m_imageAvailable[MAX_FRAMES_IN_FLIGHT]{};
-    std::vector<VkSemaphore> m_renderFinished;
-    VkFence m_inFlightFences[MAX_FRAMES_IN_FLIGHT]{};
-    std::vector<VkFence> m_imagesInFlight;
-
-    uint32_t m_currentFrame = 0;
-    uint32_t m_imageIndex = 0;
-    int m_lastAcquiredImageIndex = -1;
+    uint32_t m_currentFrame = 0; // backend-synced mirror (deleted with shims)
+    uint32_t m_imageIndex = 0; // backend-synced mirror (deleted with shims)
     uint32_t m_width = 0;
     uint32_t m_height = 0;
-    uint64_t m_frameNumber = 0;
-    uint64_t m_safeFrameNumber = 0;
-    bool m_frameStarted = false;
-    bool m_skipFrame = false;
-    bool m_renderPassStarted = false;
-    bool m_swapchainDirty = false;
-    bool m_acquiredThisFrame = false;
-    bool m_swapchainTransitionThisFrame = false;
-    const char* m_activeSwapchainPass = "none";
+    uint64_t m_frameNumber = 0; // backend-synced mirror (deleted with shims)
+    uint64_t m_safeFrameNumber = 0; // backend-synced mirror (deleted with shims)
+    bool m_frameStarted = false; // backend-synced mirror (deleted with shims)
+    bool m_skipFrame = false; // backend-synced mirror (deleted with shims)
+    bool m_swapchainDirty = false; // vestigial: set by deferred create path, unread
     bool m_validationEnabled = false;
     bool m_samplerAnisotropySupported = false;
     float m_maxSamplerAnisotropy = 1.0f;
-    bool m_gpuCaptureRequested = false;
-    bool m_gpuCaptureActive = false;
-    bool m_gpuCaptureResultsReady = false;
-    std::array<bool, GpuTimestampPointCount> m_gpuCapturePointWritten{};
-    GpuTimestampResults m_lastGpuCaptureResults{};
-    CpuFrameTimingResults m_lastCpuFrameTimingResults{};
-    CpuFrameTimingResults m_activeCpuFrameTiming{};
-    std::chrono::steady_clock::time_point m_cpuFrameStartTime{};
-    std::chrono::steady_clock::time_point m_cpuRenderWorkStartTime{};
 };

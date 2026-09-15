@@ -1,6 +1,8 @@
 #include "TerrainRenderer.h"
 
 #include "Debug.h"
+#include "IXRHIDevice.h" // WriteTimestamp (backend timestamp markers)
+#include "IXRHIQuery.h"
 #include "IXVulkanBridge.h" // NativeViewOf/NativeSamplerOf: transition-only native
                             // resolution for refraction inputs (documented seam)
 #include "WaterBodyIO.h"
@@ -2351,17 +2353,16 @@ void TerrainRenderer::RenderSunShadowMap(VulkanDevice& device, const WorldCamera
 
     for (uint32_t cascade = 0; cascade < kShadowCascadeCount; ++cascade)
     {
-        const VulkanDevice::GpuTimestampPoint cascadeBegin =
-            cascade == 0 ? VulkanDevice::GpuTimestampPoint::ShadowCascade0Begin :
-            cascade == 1 ? VulkanDevice::GpuTimestampPoint::ShadowCascade1Begin :
-            cascade == 2 ? VulkanDevice::GpuTimestampPoint::ShadowCascade2Begin :
-                           VulkanDevice::GpuTimestampPoint::ShadowCascade3Begin;
-        const VulkanDevice::GpuTimestampPoint cascadeEnd =
-            cascade == 0 ? VulkanDevice::GpuTimestampPoint::ShadowCascade0End :
-            cascade == 1 ? VulkanDevice::GpuTimestampPoint::ShadowCascade1End :
-            cascade == 2 ? VulkanDevice::GpuTimestampPoint::ShadowCascade2End :
-                           VulkanDevice::GpuTimestampPoint::ShadowCascade3End;
-        device.WriteGpuTimestamp(cascadeBegin);
+        // Cascade timestamp pairs are sequential in IXRHITimestampPoint
+        // (CascadeNBegin + 1 == CascadeNEnd); routed through the backend so
+        // the legacy timestamp API could be deleted (Phase 3C).
+        const auto cascadeBegin = static_cast<ixrhi::IXRHITimestampPoint>(
+            static_cast<std::uint32_t>(ixrhi::IXRHITimestampPoint::ShadowCascade0Begin) +
+            cascade * 2u);
+        const auto cascadeEnd = static_cast<ixrhi::IXRHITimestampPoint>(
+            static_cast<std::uint32_t>(cascadeBegin) + 1u);
+        if (m_rhi)
+            m_rhi->WriteTimestamp(cascadeBegin);
         VkRenderPassBeginInfo pass{};
         pass.sType = VK_STRUCTURE_TYPE_RENDER_PASS_BEGIN_INFO;
         pass.renderPass = m_shadowRenderPass;
@@ -2387,7 +2388,8 @@ void TerrainRenderer::RenderSunShadowMap(VulkanDevice& device, const WorldCamera
             : static_cast<uint32_t>(m_terrainChunks.size());
         cascadeStats.chunksCulled = 0;
         vkCmdEndRenderPass(cmd);
-        device.WriteGpuTimestamp(cascadeEnd);
+        if (m_rhi)
+            m_rhi->WriteTimestamp(cascadeEnd);
     }
 
     TransitionDepthArrayLayout(cmd, m_shadowImage, kShadowCascadeCount,

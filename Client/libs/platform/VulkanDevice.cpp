@@ -215,302 +215,27 @@ bool VulkanDevice::Create(NativeWindow& window, uint32_t width, uint32_t height)
     m_width = width;
     m_height = height;
 
+    // NOTE (Phase 3C): frame sync objects, command pool/buffers and the
+    // timestamp pool were deleted with the dormant frame loop — the backend
+    // owns per-frame state now (IXVulkanDevice frame authority).
     if (!CreateInstance(window) || !CreateDebugMessenger() || !CreateSurface(window) ||
-        !PickPhysicalDevice() || !CreateLogicalDevice() ||
-        !CreateSwapchainObjects(width, height) || !CreateCommandPool() ||
-        !CreateCommandBuffers() || !CreateSyncObjects() || !CreateTimestampQueryPool())
+        !PickPhysicalDevice() || !CreateLogicalDevice() || !CreateSwapchainObjects(width, height))
     {
         Destroy();
         return false;
     }
 
-    LogFormat("[FRAMES-IN-FLIGHT] max_frames_in_flight = %u", MAX_FRAMES_IN_FLIGHT);
-    LogFormat("[FRAMES-IN-FLIGHT] command_buffer_count = %zu", m_commandBuffers.size());
-    Log("[FRAMES-IN-FLIGHT] descriptor_pool_size = renderer-local");
+    Log("[FRAMES-IN-FLIGHT] frame authority = IXVulkanDevice (legacy loop dormant)");
     return true;
 }
 
-void VulkanDevice::BeginFrame()
-{
-    const bool captureThisFrame = m_gpuCaptureRequested;
-    m_gpuCaptureRequested = false;
-    m_gpuCaptureActive = false;
-    m_gpuCaptureResultsReady = false;
-    m_gpuCapturePointWritten.fill(false);
-    m_activeCpuFrameTiming = {};
-    m_activeCpuFrameTiming.valid = captureThisFrame;
-    m_activeCpuFrameTiming.frameNumber = m_frameNumber;
-    m_cpuFrameStartTime = std::chrono::steady_clock::now();
 
-    m_skipFrame = true;
-    m_frameStarted = false;
-    m_renderPassStarted = false;
-    m_acquiredThisFrame = false;
-    m_swapchainTransitionThisFrame = false;
-    m_activeSwapchainPass = "none";
-
-    if (!m_device || m_width == 0 || m_height == 0 || m_swapchain == VK_NULL_HANDLE)
-        return;
-
-    if (m_swapchainDirty && !RecreateSwapchain(m_width, m_height))
-        return;
-
-    auto waitStart = std::chrono::steady_clock::now();
-    VK_CHECK(vkWaitForFences(m_device, 1, &m_inFlightFences[m_currentFrame], VK_TRUE, UINT64_MAX));
-    auto waitEnd = std::chrono::steady_clock::now();
-    if (m_activeCpuFrameTiming.valid)
-        m_activeCpuFrameTiming.waitForFencesMs += std::chrono::duration<double, std::milli>(waitEnd - waitStart).count();
-    m_safeFrameNumber = m_frameNumber;
-
-    auto acquireStart = std::chrono::steady_clock::now();
-    const VkResult acquire = vkAcquireNextImageKHR(
-        m_device,
-        m_swapchain,
-        UINT64_MAX,
-        m_imageAvailable[m_currentFrame],
-        VK_NULL_HANDLE,
-        &m_imageIndex);
-    auto acquireEnd = std::chrono::steady_clock::now();
-    if (m_activeCpuFrameTiming.valid)
-        m_activeCpuFrameTiming.acquireImageMs = std::chrono::duration<double, std::milli>(acquireEnd - acquireStart).count();
-
-    if (acquire == VK_ERROR_OUT_OF_DATE_KHR)
-    {
-        Log("[VULKAN] acquireNextImage: VK_ERROR_OUT_OF_DATE_KHR - rebuilding swap-chain");
-        LogFormat("[SWP-DIAG] resize/out-of-date branch: acquire result=%s frame=%llu swapchain=0x%llx",
-            VkResultName(acquire),
-            static_cast<unsigned long long>(m_frameNumber),
-            VkHandleBits(m_swapchain));
-        m_swapchainDirty = true;
-        return;
-    }
-    if (acquire == VK_SUBOPTIMAL_KHR)
-    {
-        static bool warnedAcquireSuboptimal = false;
-        if (!warnedAcquireSuboptimal)
-        {
-            Log("[VULKAN] acquireNextImage: VK_SUBOPTIMAL_KHR (continuing) - this is expected on Android");
-            warnedAcquireSuboptimal = true;
-        }
-    }
-    if (acquire != VK_SUCCESS && acquire != VK_SUBOPTIMAL_KHR)
-        CheckVk(acquire, "vkAcquireNextImageKHR", __FILE__, __LINE__);
-    m_lastAcquiredImageIndex = static_cast<int>(m_imageIndex);
-    m_acquiredThisFrame = true;
-
-    if (m_imagesInFlight[m_imageIndex] != VK_NULL_HANDLE)
-    {
-        waitStart = std::chrono::steady_clock::now();
-        VK_CHECK(vkWaitForFences(m_device, 1, &m_imagesInFlight[m_imageIndex], VK_TRUE, UINT64_MAX));
-        waitEnd = std::chrono::steady_clock::now();
-        if (m_activeCpuFrameTiming.valid)
-            m_activeCpuFrameTiming.waitForFencesMs += std::chrono::duration<double, std::milli>(waitEnd - waitStart).count();
-    }
-    m_imagesInFlight[m_imageIndex] = m_inFlightFences[m_currentFrame];
-
-    VK_CHECK(vkResetFences(m_device, 1, &m_inFlightFences[m_currentFrame]));
-    VK_CHECK(vkResetCommandBuffer(m_commandBuffers[m_currentFrame], 0));
-
-    VkCommandBufferBeginInfo begin{};
-    begin.sType = VK_STRUCTURE_TYPE_COMMAND_BUFFER_BEGIN_INFO;
-    VK_CHECK(vkBeginCommandBuffer(m_commandBuffers[m_currentFrame], &begin));
-
-    m_skipFrame = false;
-    m_frameStarted = true;
-    m_cpuRenderWorkStartTime = std::chrono::steady_clock::now();
-    if (captureThisFrame)
-        BeginGpuFrameCaptureCommands();
-}
-
-void VulkanDevice::BeginSwapchainRenderPass(const char* passName)
-{
-    if (m_skipFrame || !m_frameStarted || m_renderPassStarted)
-        return;
-
-    VkClearValue clearValues[2]{};
-    clearValues[0].color.float32[0] = 0.04f;
-    clearValues[0].color.float32[1] = 0.05f;
-    clearValues[0].color.float32[2] = 0.09f;
-    clearValues[0].color.float32[3] = 1.0f;
-    clearValues[1].depthStencil = {1.0f, 0};
-
-    VkRenderPassBeginInfo pass{};
-    pass.sType = VK_STRUCTURE_TYPE_RENDER_PASS_BEGIN_INFO;
-    pass.renderPass = m_renderPass;
-    pass.framebuffer = m_framebuffers[m_imageIndex];
-    pass.renderArea.offset = {0, 0};
-    pass.renderArea.extent = m_swapchainExtent;
-    pass.clearValueCount = 2;
-    pass.pClearValues = clearValues;
-
-    if (m_imageIndex < m_swapchainImages.size())
-    {
-        m_swapchainTransitionThisFrame = true;
-        m_activeSwapchainPass = passName ? passName : "other";
-        LogSwapchainImageTransition(m_swapchainImages[m_imageIndex],
-            VK_IMAGE_LAYOUT_UNDEFINED,
-            VK_IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL,
-            m_activeSwapchainPass);
-    }
-
-    // The pass loadOps clear color plus combined depth/stencil; UI draws into this same onscreen pass.
-    vkCmdBeginRenderPass(m_commandBuffers[m_currentFrame], &pass, VK_SUBPASS_CONTENTS_INLINE);
-
-    VkViewport viewport{};
-    viewport.x = 0.0f;
-    viewport.y = 0.0f;
-    viewport.width = static_cast<float>(m_swapchainExtent.width);
-    viewport.height = static_cast<float>(m_swapchainExtent.height);
-    viewport.minDepth = 0.0f;
-    viewport.maxDepth = 1.0f;
-    vkCmdSetViewport(m_commandBuffers[m_currentFrame], 0, 1, &viewport);
-
-    VkRect2D scissor{};
-    scissor.offset = {0, 0};
-    scissor.extent = m_swapchainExtent;
-    vkCmdSetScissor(m_commandBuffers[m_currentFrame], 0, 1, &scissor);
-
-    m_renderPassStarted = true;
-}
-
-void VulkanDevice::EndFrame()
-{
-    if (m_skipFrame || !m_frameStarted)
-        return;
-
-    const auto endFrameStart = std::chrono::steady_clock::now();
-    if (m_activeCpuFrameTiming.valid)
-        m_activeCpuFrameTiming.renderLoopCpuWorkMs =
-            std::chrono::duration<double, std::milli>(endFrameStart - m_cpuRenderWorkStartTime).count();
-
-    if (!m_renderPassStarted)
-        BeginSwapchainRenderPass("auto-empty");
-
-    if (m_renderPassStarted)
-    {
-        if (m_imageIndex < m_swapchainImages.size())
-        {
-            LogSwapchainImageTransition(m_swapchainImages[m_imageIndex],
-                VK_IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL,
-                VK_IMAGE_LAYOUT_PRESENT_SRC_KHR,
-                m_activeSwapchainPass);
-        }
-        vkCmdEndRenderPass(m_commandBuffers[m_currentFrame]);
-        m_renderPassStarted = false;
-    }
-
-    if (m_gpuCaptureActive)
-        WriteGpuTimestamp(GpuTimestampPoint::FrameEnd);
-
-    VK_CHECK(vkEndCommandBuffer(m_commandBuffers[m_currentFrame]));
-
-    VkPipelineStageFlags waitStage = VK_PIPELINE_STAGE_COLOR_ATTACHMENT_OUTPUT_BIT;
-    VkSubmitInfo submit{};
-    submit.sType = VK_STRUCTURE_TYPE_SUBMIT_INFO;
-    submit.waitSemaphoreCount = 1;
-    submit.pWaitSemaphores = &m_imageAvailable[m_currentFrame];
-    submit.pWaitDstStageMask = &waitStage;
-    submit.commandBufferCount = 1;
-    submit.pCommandBuffers = &m_commandBuffers[m_currentFrame];
-    submit.signalSemaphoreCount = 1;
-    submit.pSignalSemaphores = &m_renderFinished[m_imageIndex];
-
-    // The fence protects CPU reuse of this frame's command buffer and sync objects.
-    auto submitStart = std::chrono::steady_clock::now();
-    VK_CHECK(vkQueueSubmit(m_graphicsQueue, 1, &submit, m_inFlightFences[m_currentFrame]));
-    auto submitEnd = std::chrono::steady_clock::now();
-    if (m_activeCpuFrameTiming.valid)
-        m_activeCpuFrameTiming.submitMs = std::chrono::duration<double, std::milli>(submitEnd - submitStart).count();
-
-    VkPresentInfoKHR present{};
-    present.sType = VK_STRUCTURE_TYPE_PRESENT_INFO_KHR;
-    present.waitSemaphoreCount = 1;
-    present.pWaitSemaphores = &m_renderFinished[m_imageIndex];
-    present.swapchainCount = 1;
-    present.pSwapchains = &m_swapchain;
-    present.pImageIndices = &m_imageIndex;
-
-    auto presentStart = std::chrono::steady_clock::now();
-    const VkResult result = vkQueuePresentKHR(m_presentQueue, &present);
-    auto presentEnd = std::chrono::steady_clock::now();
-    if (m_activeCpuFrameTiming.valid)
-        m_activeCpuFrameTiming.presentMs = std::chrono::duration<double, std::milli>(presentEnd - presentStart).count();
-    if (result == VK_ERROR_OUT_OF_DATE_KHR)
-    {
-        Log("[VULKAN] present: VK_ERROR_OUT_OF_DATE_KHR - rebuilding swap-chain");
-        LogFormat("[SWP-DIAG] resize/out-of-date branch: present result=%s frame=%llu swapchain=0x%llx imageIndex=%u",
-            VkResultName(result),
-            static_cast<unsigned long long>(m_frameNumber),
-            VkHandleBits(m_swapchain),
-            m_imageIndex);
-        m_swapchainDirty = true;
-    }
-    else if (result == VK_SUBOPTIMAL_KHR)
-    {
-        static bool warnedPresentSuboptimal = false;
-        if (!warnedPresentSuboptimal)
-        {
-            Log("[VULKAN] present: VK_SUBOPTIMAL_KHR (continuing) - this is expected on Android");
-            warnedPresentSuboptimal = true;
-        }
-    }
-    else if (result != VK_SUCCESS)
-    {
-        CheckVk(result, "vkQueuePresentKHR", __FILE__, __LINE__);
-    }
-
-    if (m_activeCpuFrameTiming.valid)
-    {
-        m_activeCpuFrameTiming.totalCpuFrameMs =
-            std::chrono::duration<double, std::milli>(presentEnd - m_cpuFrameStartTime).count();
-        m_lastCpuFrameTimingResults = m_activeCpuFrameTiming;
-    }
-    FinishGpuFrameCaptureAfterSubmit();
-
-    m_currentFrame = (m_currentFrame + 1) % MAX_FRAMES_IN_FLIGHT;
-    ++m_frameNumber;
-    m_frameStarted = false;
-    m_acquiredThisFrame = false;
-    m_swapchainTransitionThisFrame = false;
-    m_activeSwapchainPass = "none";
-}
-
-bool VulkanDevice::Resize(uint32_t width, uint32_t height)
-{
-    if (!m_swapchainDirty && width == m_width && height == m_height)
-    {
-        LogFormat("[VULKAN] Resize ignored: %ux%u unchanged (current window size)", width, height);
-        return false;
-    }
-
-    LogFormat("[VULKAN] Resize requested: window %ux%u -> %ux%u, swapchain extent %ux%u",
-        m_width,
-        m_height,
-        width,
-        height,
-        m_swapchainExtent.width,
-        m_swapchainExtent.height);
-    LogFormat("[SWP-DIAG] resize request frame=%llu oldSwapchain=0x%llx oldExtent=%ux%u newWindow=%ux%u frameStarted=%d acquiredThisFrame=%s",
-        static_cast<unsigned long long>(m_frameNumber),
-        VkHandleBits(m_swapchain),
-        m_swapchainExtent.width,
-        m_swapchainExtent.height,
-        width,
-        height,
-        m_frameStarted ? 1 : 0,
-        m_acquiredThisFrame ? "yes" : "no");
-
-    m_width = width;
-    m_height = height;
-
-    if (!m_device || width == 0 || height == 0)
-    {
-        m_swapchainDirty = width != 0 && height != 0;
-        return true;
-    }
-
-    return RecreateSwapchain(width, height);
-}
+// ---------------------------------------------------------------------------
+// Phase-3C deletion: the legacy frame loop (BeginFrame, BeginSwapchainRenderPass,
+// EndFrame, Resize) was removed. IXVulkanDevice owns acquisition, recording,
+// submission, presentation and timestamps; this object keeps device/queue/
+// swapchain-handle infrastructure plus backend-synced migration shims.
+// ---------------------------------------------------------------------------
 
 void VulkanDevice::WaitIdle()
 {
@@ -550,23 +275,9 @@ void VulkanDevice::Destroy()
         return;
     WaitIdle();
 
-    if (m_timestampQueryPool)
-        vkDestroyQueryPool(m_device, m_timestampQueryPool, nullptr);
-    m_timestampQueryPool = VK_NULL_HANDLE;
-
-    for (uint32_t i = 0; i < MAX_FRAMES_IN_FLIGHT; ++i)
-    {
-        if (m_inFlightFences[i]) vkDestroyFence(m_device, m_inFlightFences[i], nullptr);
-        if (m_imageAvailable[i]) vkDestroySemaphore(m_device, m_imageAvailable[i], nullptr);
-        m_inFlightFences[i] = VK_NULL_HANDLE;
-        m_imageAvailable[i] = VK_NULL_HANDLE;
-    }
-
-    if (m_commandPool)
-        vkDestroyCommandPool(m_device, m_commandPool, nullptr);
-    m_commandPool = VK_NULL_HANDLE;
-    m_commandBuffers.clear();
-
+    // NOTE (Phase 3C): frame sync objects, command pool/buffers and the
+    // timestamp pool were deleted with the dormant frame loop — the backend
+    // destroys its own (IXVulkanDevice::Shutdown runs before this).
     DestroySwapchainObjects();
 
     if (m_device)
@@ -914,7 +625,6 @@ bool VulkanDevice::CreateSwapchain(uint32_t width, uint32_t height)
     m_swapchainFormat = format.format;
     m_swapchainExtent = extent;
     m_currentTransform = support.capabilities.currentTransform;
-    m_imagesInFlight.assign(imageCount, VK_NULL_HANDLE);
 
     LogFormat("[VULKAN] Swap-chain created with preTransform=%s presentMode=%s imageExtent=%u x %u imageCount=%u",
         SurfaceTransformName(preTransform),
@@ -938,12 +648,8 @@ bool VulkanDevice::CreateSwapchain(uint32_t width, uint32_t height)
     LogFormat("[SWP-DIAG] INIT transition loop over swapchain images count=0 beforeAnyAcquire=yes swapchain=0x%llx",
         VkHandleBits(m_swapchain));
 
-    VkSemaphoreCreateInfo sem{};
-    sem.sType = VK_STRUCTURE_TYPE_SEMAPHORE_CREATE_INFO;
-    m_renderFinished.assign(imageCount, VK_NULL_HANDLE);
-    for (uint32_t i = 0; i < imageCount; ++i)
-        VK_CHECK(vkCreateSemaphore(m_device, &sem, nullptr, &m_renderFinished[i]));
-
+    // NOTE (Phase 3C): per-image present semaphores are backend-owned now
+    // (IXVulkanDevice frame authority); legacy m_renderFinished is deleted.
     return true;
 }
 
@@ -1016,342 +722,18 @@ bool VulkanDevice::CreateDepthStencilImages()
     return true;
 }
 
-bool VulkanDevice::CreateRenderPass()
-{
-    VkAttachmentDescription color{};
-    color.format = m_swapchainFormat;
-    color.samples = VK_SAMPLE_COUNT_1_BIT;
-    color.loadOp = VK_ATTACHMENT_LOAD_OP_CLEAR;
-    color.storeOp = VK_ATTACHMENT_STORE_OP_STORE;
-    color.stencilLoadOp = VK_ATTACHMENT_LOAD_OP_DONT_CARE;
-    color.stencilStoreOp = VK_ATTACHMENT_STORE_OP_DONT_CARE;
-    color.initialLayout = VK_IMAGE_LAYOUT_UNDEFINED;
-    color.finalLayout = VK_IMAGE_LAYOUT_PRESENT_SRC_KHR; // Presentation engine consumes this layout.
+// NOTE (Phase 3C): legacy CreateRenderPass/CreateFramebuffers were deleted with the
+// dormant frame loop. The backend builds compatible passes/framebuffers itself
+// (IXVulkanDevice::CreateCompatRenderPass/CreateFramebufferFor).
 
-    VkAttachmentDescription depthStencil{};
-    depthStencil.format = m_depthStencilFormat;
-    depthStencil.samples = VK_SAMPLE_COUNT_1_BIT;
-    depthStencil.loadOp = VK_ATTACHMENT_LOAD_OP_CLEAR;
-    depthStencil.storeOp = VK_ATTACHMENT_STORE_OP_DONT_CARE;
-    depthStencil.stencilLoadOp = VK_ATTACHMENT_LOAD_OP_CLEAR;
-    depthStencil.stencilStoreOp = VK_ATTACHMENT_STORE_OP_DONT_CARE;
-    depthStencil.initialLayout = VK_IMAGE_LAYOUT_UNDEFINED;
-    depthStencil.finalLayout = VK_IMAGE_LAYOUT_DEPTH_STENCIL_ATTACHMENT_OPTIMAL;
+// ---------------------------------------------------------------------------
+// Phase-3C deletion: dormant frame-loop, sync-object, timestamp and image-index
+// helpers were removed (BeginFrame/EndFrame/BeginSwapchainRenderPass/Resize,
+// CreateCommandPool/Buffers/SyncObjects/TimestampQueryPool, capture flow,
+// FindSwapchainImageIndex/LogSwapchainImageTransition). IXVulkanDevice owns
+// acquisition, recording, submission, presentation, sync and timestamps.
+// ---------------------------------------------------------------------------
 
-    VkAttachmentReference depthStencilRef{};
-    depthStencilRef.attachment = 1;
-    depthStencilRef.layout = VK_IMAGE_LAYOUT_DEPTH_STENCIL_ATTACHMENT_OPTIMAL;
-
-    VkAttachmentReference colorRef{};
-    colorRef.attachment = 0;
-    colorRef.layout = VK_IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL;
-
-    VkSubpassDescription subpass{};
-    subpass.pipelineBindPoint = VK_PIPELINE_BIND_POINT_GRAPHICS;
-    subpass.colorAttachmentCount = 1;
-    subpass.pColorAttachments = &colorRef;
-    subpass.pDepthStencilAttachment = &depthStencilRef;
-
-    VkSubpassDependency dependency{};
-    dependency.srcSubpass = VK_SUBPASS_EXTERNAL;
-    dependency.dstSubpass = 0;
-    dependency.srcStageMask = VK_PIPELINE_STAGE_COLOR_ATTACHMENT_OUTPUT_BIT;
-    dependency.dstStageMask = VK_PIPELINE_STAGE_COLOR_ATTACHMENT_OUTPUT_BIT |
-        VK_PIPELINE_STAGE_EARLY_FRAGMENT_TESTS_BIT;
-    dependency.dstAccessMask = VK_ACCESS_COLOR_ATTACHMENT_READ_BIT | VK_ACCESS_COLOR_ATTACHMENT_WRITE_BIT |
-        VK_ACCESS_DEPTH_STENCIL_ATTACHMENT_READ_BIT | VK_ACCESS_DEPTH_STENCIL_ATTACHMENT_WRITE_BIT;
-
-    VkAttachmentDescription attachments[] = {color, depthStencil};
-
-    VkRenderPassCreateInfo create{};
-    create.sType = VK_STRUCTURE_TYPE_RENDER_PASS_CREATE_INFO;
-    create.attachmentCount = 2;
-    create.pAttachments = attachments;
-    create.subpassCount = 1;
-    create.pSubpasses = &subpass;
-    create.dependencyCount = 1;
-    create.pDependencies = &dependency;
-
-    VK_CHECK(vkCreateRenderPass(m_device, &create, nullptr, &m_renderPass));
-    return true;
-}
-
-bool VulkanDevice::CreateFramebuffers()
-{
-    m_framebuffers.resize(m_swapchainImageViews.size());
-    for (size_t i = 0; i < m_swapchainImageViews.size(); ++i)
-    {
-        VkImageView attachments[] = {m_swapchainImageViews[i], m_depthStencilImageViews[i]};
-        VkFramebufferCreateInfo create{};
-        create.sType = VK_STRUCTURE_TYPE_FRAMEBUFFER_CREATE_INFO;
-        create.renderPass = m_renderPass;
-        create.attachmentCount = 2;
-        create.pAttachments = attachments;
-        create.width = m_swapchainExtent.width;
-        create.height = m_swapchainExtent.height;
-        create.layers = 1;
-        VK_CHECK(vkCreateFramebuffer(m_device, &create, nullptr, &m_framebuffers[i]));
-    }
-    return true;
-}
-
-bool VulkanDevice::CreateCommandPool()
-{
-    VkCommandPoolCreateInfo create{};
-    create.sType = VK_STRUCTURE_TYPE_COMMAND_POOL_CREATE_INFO;
-    create.flags = VK_COMMAND_POOL_CREATE_RESET_COMMAND_BUFFER_BIT;
-    create.queueFamilyIndex = m_queueFamilies.graphics;
-    VK_CHECK(vkCreateCommandPool(m_device, &create, nullptr, &m_commandPool));
-    return true;
-}
-
-bool VulkanDevice::CreateCommandBuffers()
-{
-    m_commandBuffers.resize(MAX_FRAMES_IN_FLIGHT);
-    VkCommandBufferAllocateInfo alloc{};
-    alloc.sType = VK_STRUCTURE_TYPE_COMMAND_BUFFER_ALLOCATE_INFO;
-    alloc.commandPool = m_commandPool;
-    alloc.level = VK_COMMAND_BUFFER_LEVEL_PRIMARY;
-    alloc.commandBufferCount = static_cast<uint32_t>(m_commandBuffers.size());
-    VK_CHECK(vkAllocateCommandBuffers(m_device, &alloc, m_commandBuffers.data()));
-    return true;
-}
-
-bool VulkanDevice::CreateSyncObjects()
-{
-    VkSemaphoreCreateInfo sem{};
-    sem.sType = VK_STRUCTURE_TYPE_SEMAPHORE_CREATE_INFO;
-
-    VkFenceCreateInfo fence{};
-    fence.sType = VK_STRUCTURE_TYPE_FENCE_CREATE_INFO;
-    fence.flags = VK_FENCE_CREATE_SIGNALED_BIT;
-
-    for (uint32_t i = 0; i < MAX_FRAMES_IN_FLIGHT; ++i)
-    {
-        VK_CHECK(vkCreateSemaphore(m_device, &sem, nullptr, &m_imageAvailable[i]));
-        VK_CHECK(vkCreateFence(m_device, &fence, nullptr, &m_inFlightFences[i]));
-    }
-    return true;
-}
-
-bool VulkanDevice::CreateTimestampQueryPool()
-{
-#if !defined(IXTREEME_DEBUG_LOGS)
-    return true;
-#else
-    if (!m_device || !m_physicalDevice)
-        return true;
-
-    VkPhysicalDeviceProperties properties{};
-    vkGetPhysicalDeviceProperties(m_physicalDevice, &properties);
-    m_timestampPeriodNs = properties.limits.timestampPeriod;
-    if (m_timestampPeriodNs <= 0.0f)
-    {
-        Log("[GPU-TIME] timestamp queries unavailable: timestampPeriod=0");
-        return true;
-    }
-
-    VkQueryPoolCreateInfo create{};
-    create.sType = VK_STRUCTURE_TYPE_QUERY_POOL_CREATE_INFO;
-    create.queryType = VK_QUERY_TYPE_TIMESTAMP;
-    create.queryCount = GpuTimestampPointCount;
-    const VkResult result = vkCreateQueryPool(m_device, &create, nullptr, &m_timestampQueryPool);
-    if (result != VK_SUCCESS)
-    {
-        LogFormat("[GPU-TIME] timestamp query pool unavailable: %s", VkResultName(result));
-        m_timestampQueryPool = VK_NULL_HANDLE;
-        return true;
-    }
-    LogFormat("[GPU-TIME] timestamp query pool ready count=%u periodNs=%.3f",
-        GpuTimestampPointCount,
-        m_timestampPeriodNs);
-    return true;
-#endif
-}
-
-void VulkanDevice::RequestGpuFrameCapture()
-{
-#if defined(IXTREEME_DEBUG_LOGS)
-    m_gpuCaptureRequested = true;
-    Log("[GPU-TIME] capture requested");
-#endif
-}
-
-void VulkanDevice::BeginGpuFrameCaptureCommands()
-{
-#if defined(IXTREEME_DEBUG_LOGS)
-    if (!m_timestampQueryPool || !m_frameStarted || m_skipFrame)
-        return;
-
-    m_gpuCaptureActive = true;
-    m_lastGpuCaptureResults = {};
-    m_lastGpuCaptureResults.frameNumber = m_frameNumber;
-    vkCmdResetQueryPool(m_commandBuffers[m_currentFrame], m_timestampQueryPool, 0, GpuTimestampPointCount);
-    WriteGpuTimestamp(GpuTimestampPoint::FrameBegin);
-#endif
-}
-
-void VulkanDevice::WriteGpuTimestamp(GpuTimestampPoint point)
-{
-#if defined(IXTREEME_DEBUG_LOGS)
-    if (!m_gpuCaptureActive || !m_timestampQueryPool || !m_frameStarted || m_skipFrame)
-        return;
-    const uint32_t index = static_cast<uint32_t>(point);
-    if (index >= GpuTimestampPointCount)
-        return;
-    vkCmdWriteTimestamp(m_commandBuffers[m_currentFrame],
-        VK_PIPELINE_STAGE_BOTTOM_OF_PIPE_BIT,
-        m_timestampQueryPool,
-        index);
-    m_gpuCapturePointWritten[index] = true;
-#else
-    (void)point;
-#endif
-}
-
-void VulkanDevice::FinishGpuFrameCaptureAfterSubmit()
-{
-#if defined(IXTREEME_DEBUG_LOGS)
-    if (!m_gpuCaptureActive || !m_timestampQueryPool)
-        return;
-
-    VK_CHECK(vkQueueWaitIdle(m_graphicsQueue));
-
-    struct TimestampWithAvailability
-    {
-        uint64_t value = 0;
-        uint64_t available = 0;
-    };
-    std::array<TimestampWithAvailability, GpuTimestampPointCount> raw{};
-    const VkResult result = vkGetQueryPoolResults(m_device,
-        m_timestampQueryPool,
-        0,
-        GpuTimestampPointCount,
-        sizeof(TimestampWithAvailability) * raw.size(),
-        raw.data(),
-        sizeof(TimestampWithAvailability),
-        VK_QUERY_RESULT_64_BIT | VK_QUERY_RESULT_WITH_AVAILABILITY_BIT);
-    if (result != VK_SUCCESS && result != VK_NOT_READY)
-    {
-        LogFormat("[GPU-TIME] query result read failed: %s", VkResultName(result));
-        m_gpuCaptureActive = false;
-        return;
-    }
-
-    GpuTimestampResults results{};
-    results.valid = true;
-    results.frameNumber = m_frameNumber;
-    const uint64_t firstValue = raw[static_cast<uint32_t>(GpuTimestampPoint::FrameBegin)].value;
-    for (uint32_t i = 0; i < GpuTimestampPointCount; ++i)
-    {
-        results.pointValid[i] = m_gpuCapturePointWritten[i] && raw[i].available != 0;
-        if (results.pointValid[i])
-            results.pointMs[i] = static_cast<double>(raw[i].value - firstValue) * static_cast<double>(m_timestampPeriodNs) / 1000000.0;
-    }
-
-    m_lastGpuCaptureResults = results;
-    m_gpuCaptureResultsReady = true;
-    m_gpuCaptureActive = false;
-#endif
-}
-
-bool VulkanDevice::ConsumeGpuFrameCaptureResults(GpuTimestampResults& gpu, CpuFrameTimingResults& cpu)
-{
-#if defined(IXTREEME_DEBUG_LOGS)
-    if (!m_gpuCaptureResultsReady)
-        return false;
-    gpu = m_lastGpuCaptureResults;
-    cpu = m_lastCpuFrameTimingResults;
-    m_gpuCaptureResultsReady = false;
-    return true;
-#else
-    (void)gpu;
-    (void)cpu;
-    return false;
-#endif
-}
-
-void VulkanDevice::DestroySwapchainObjects()
-{
-    if (m_swapchain)
-    {
-        LogFormat("[SWP-DIAG] destroy swapchain handle=0x%llx imageCount=%zu frame=%llu",
-            VkHandleBits(m_swapchain),
-            m_swapchainImages.size(),
-            static_cast<unsigned long long>(m_frameNumber));
-    }
-
-    for (VkSemaphore semaphore : m_renderFinished)
-        vkDestroySemaphore(m_device, semaphore, nullptr);
-    m_renderFinished.clear();
-
-    // NOTE (Phase 3C): framebuffers + render pass are backend-owned now (see
-    // IXVulkanSwapchain); legacy must not destroy them. m_framebuffers stays
-    // empty; m_renderPass is a backend-synced mirror cleared by the backend.
-
-    for (VkImageView view : m_depthStencilImageViews)
-        vkDestroyImageView(m_device, view, nullptr);
-    m_depthStencilImageViews.clear();
-
-    for (VkImage image : m_depthStencilImages)
-        vkDestroyImage(m_device, image, nullptr);
-    m_depthStencilImages.clear();
-
-    for (VkDeviceMemory memory : m_depthStencilMemory)
-        vkFreeMemory(m_device, memory, nullptr);
-    m_depthStencilMemory.clear();
-    m_depthStencilFormat = VK_FORMAT_UNDEFINED;
-
-    for (VkImageView view : m_swapchainImageViews)
-        vkDestroyImageView(m_device, view, nullptr);
-    m_swapchainImageViews.clear();
-
-    if (m_swapchain)
-        vkDestroySwapchainKHR(m_device, m_swapchain, nullptr);
-    m_swapchain = VK_NULL_HANDLE;
-    m_swapchainImages.clear();
-    m_imagesInFlight.clear();
-}
-
-bool VulkanDevice::RecreateSwapchain(uint32_t width, uint32_t height)
-{
-    if (width == 0 || height == 0)
-        return true;
-
-    LogFormat("[SWP-DIAG] recreate begin frame=%llu oldSwapchain=0x%llx extent=%ux%u requested=%ux%u frameStarted=%d acquiredThisFrame=%s",
-        static_cast<unsigned long long>(m_frameNumber),
-        VkHandleBits(m_swapchain),
-        m_swapchainExtent.width,
-        m_swapchainExtent.height,
-        width,
-        height,
-        m_frameStarted ? 1 : 0,
-        m_acquiredThisFrame ? "yes" : "no");
-    VK_CHECK(vkDeviceWaitIdle(m_device));
-    DestroySwapchainObjects();
-    m_swapchainDirty = false;
-    return CreateSwapchainObjects(width, height);
-}
-
-int VulkanDevice::FindSwapchainImageIndex(VkImage image) const
-{
-    for (size_t i = 0; i < m_swapchainImages.size(); ++i)
-    {
-        if (m_swapchainImages[i] == image)
-            return static_cast<int>(i);
-    }
-    return -1;
-}
-
-void VulkanDevice::LogSwapchainImageTransition(VkImage image, VkImageLayout oldLayout, VkImageLayout newLayout, const char* passName) const
-{
-    (void)oldLayout;
-    (void)newLayout;
-    (void)passName;
-    const int swapchainIndex = FindSwapchainImageIndex(image);
-    if (swapchainIndex < 0)
-        return;
-}
 
 VulkanDevice::QueueFamilies VulkanDevice::FindQueueFamilies(VkPhysicalDevice device) const
 {
@@ -1425,6 +807,61 @@ VulkanDevice::SwapchainSupport VulkanDevice::QuerySwapchainSupport(VkPhysicalDev
         }
     }
     return support;
+}
+
+void VulkanDevice::DestroySwapchainObjects()
+{
+    if (m_swapchain)
+    {
+        LogFormat("[SWP-DIAG] destroy swapchain handle=0x%llx imageCount=%zu frame=%llu",
+            VkHandleBits(m_swapchain),
+            m_swapchainImages.size(),
+            static_cast<unsigned long long>(m_frameNumber));
+    }
+
+    // NOTE (Phase 3C): framebuffers + render pass are backend-owned now (see
+    // IXVulkanSwapchain); legacy must not destroy them. m_renderPass is a
+    // backend-synced mirror cleared by the backend.
+
+    for (VkImageView view : m_depthStencilImageViews)
+        vkDestroyImageView(m_device, view, nullptr);
+    m_depthStencilImageViews.clear();
+
+    for (VkImage image : m_depthStencilImages)
+        vkDestroyImage(m_device, image, nullptr);
+    m_depthStencilImages.clear();
+
+    for (VkDeviceMemory memory : m_depthStencilMemory)
+        vkFreeMemory(m_device, memory, nullptr);
+    m_depthStencilMemory.clear();
+    m_depthStencilFormat = VK_FORMAT_UNDEFINED;
+
+    for (VkImageView view : m_swapchainImageViews)
+        vkDestroyImageView(m_device, view, nullptr);
+    m_swapchainImageViews.clear();
+
+    if (m_swapchain)
+        vkDestroySwapchainKHR(m_device, m_swapchain, nullptr);
+    m_swapchain = VK_NULL_HANDLE;
+    m_swapchainImages.clear();
+}
+
+bool VulkanDevice::RecreateSwapchain(uint32_t width, uint32_t height)
+{
+    if (width == 0 || height == 0)
+        return true;
+
+    LogFormat("[SWP-DIAG] recreate begin frame=%llu oldSwapchain=0x%llx extent=%ux%u requested=%ux%u",
+        static_cast<unsigned long long>(m_frameNumber),
+        VkHandleBits(m_swapchain),
+        m_swapchainExtent.width,
+        m_swapchainExtent.height,
+        width,
+        height);
+    VK_CHECK(vkDeviceWaitIdle(m_device));
+    DestroySwapchainObjects();
+    m_swapchainDirty = false;
+    return CreateSwapchainObjects(width, height);
 }
 
 bool VulkanDevice::IsDeviceSuitable(VkPhysicalDevice device, QueueFamilies* outFamilies) const

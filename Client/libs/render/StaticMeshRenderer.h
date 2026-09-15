@@ -8,8 +8,8 @@
 // (passes, cull/depth/blend state, instancing, LOD fallback, outline pass) is
 // unchanged.
 //
-// Frame contract: Render* takes the recording command list (borrowed frame list
-// via ixvulkan::WrapFrameCommandList) and an IXRHIFrameInfo snapshot. Pipelines
+// Frame contract: Render* takes the recording command list (owned frame list
+// from the IXRHI frame context) and an IXRHIFrameInfo snapshot. Pipelines
 // bake against m_targetPass (offscreen scene pass, borrowed) or the backend
 // default (swapchain pass) when null.
 

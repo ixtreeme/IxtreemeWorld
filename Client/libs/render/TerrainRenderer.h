@@ -8,6 +8,11 @@
 #include "IXRHIRenderPass.h"
 #include "IXRHITexture.h"
 
+namespace ixrhi
+{
+class IXRHIDevice;
+}
+
 #include <array>
 #include <cstdint>
 #include <deque>
@@ -96,6 +101,9 @@ public:
     // Borrowed IXRHI pass token (Phase 3B): unwrapped backend-locally. The
     // native pass member below stays until Terrain migrates (later phase).
     void SetTargetPass(const ixrhi::IXRHIRenderPass* pass);
+    // Backend for GPU timestamp markers (Phase 3C; shadow-cascade points).
+    // Borrowed, may be null (markers skipped).
+    void SetRhiDevice(ixrhi::IXRHIDevice* rhi) { m_rhi = rhi; }
     // IXRHI-facing refraction inputs (Phase 3B seam): the offscreen scene
     // snapshots stay IXRHI-owned; native views are resolved backend-locally at
     // descriptor-write time. Terrain/Water rendering itself is a later phase.
@@ -461,6 +469,7 @@ private:
     VkPipelineLayout m_waterPipelineLayout = VK_NULL_HANDLE;
     VkPipeline m_waterPipeline = VK_NULL_HANDLE;
     VkRenderPass m_mainRenderPass = VK_NULL_HANDLE;
+    ixrhi::IXRHIDevice* m_rhi = nullptr; // borrowed backend (timestamp markers)
     // Refraction inputs are IXRHI-owned (shared lifetime: recreating the
     // offscreen target cannot dangle these). Native handles resolve locally
     // at descriptor-write time (backend bridge, transition-only).

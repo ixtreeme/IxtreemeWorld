@@ -6,10 +6,10 @@
 // ixrhi::IXRHIDevice / ixrhi::IXRHICommandList. Visual output and draw order are
 // unchanged (line list, per-frame uniform + vertex uploads, alpha blend).
 //
-// Frame contract: the caller supplies the recording command list (borrowed frame
-// list via ixvulkan::WrapFrameCommandList) and an IXRHIFrameInfo snapshot. The
+// Frame contract: the caller supplies the recording command list (owned frame
+// list from the IXRHI frame context) and an IXRHIFrameInfo snapshot. The
 // pipeline bakes against m_targetPass (offscreen scene pass, borrowed) or the
-// backend default when null — see EngineApplication's offscreenPass borrower.
+// backend default when null.
 
 #include "WorldCamera.h"
 

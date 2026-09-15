@@ -6,6 +6,8 @@
 #include "IXVulkanDevice.h"
 #include "IXVulkanResources.h"
 
+#include <cassert>
+
 namespace ixvulkan
 {
 
@@ -56,6 +58,7 @@ void IXVulkanBindGroup::UpdateBuffer(std::uint32_t setIndex,
     if (setIndex >= m_sets.size() || !buffer)
         return;
     auto* native = dynamic_cast<IXVulkanBuffer*>(buffer.get());
+    assert(native != nullptr && "foreign IXRHIBuffer used with IXVulkan backend");
     if (native == nullptr)
         return;
     m_buffers.push_back(buffer); // shared lifetime with the group
@@ -89,6 +92,8 @@ void IXVulkanBindGroup::UpdateTexture(std::uint32_t setIndex,
         return;
     auto* nativeTexture = dynamic_cast<IXVulkanTexture*>(texture.get());
     auto* nativeSampler = dynamic_cast<IXVulkanSampler*>(sampler.get());
+    assert(nativeTexture != nullptr && nativeSampler != nullptr &&
+        "foreign IXRHITexture/Sampler used with IXVulkan backend");
     if (nativeTexture == nullptr || nativeSampler == nullptr)
         return;
     m_textures.push_back(texture);

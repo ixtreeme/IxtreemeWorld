@@ -32,7 +32,7 @@ struct IXRHICapabilities
     bool supportsIndirectDraw = false;
     bool supportsTimestampQueries = false;
     bool supportsAnisotropy = false;
-    bool supportsDynamicRendering = false; // false on current VkRenderPass infra
+    bool supportsDynamicRendering = false; // false on the classic render-pass backend
     bool supportsTimelineSemaphores = false;
     bool supportsMultiDrawIndirect = false;
     bool supportsAsyncCompute = false;

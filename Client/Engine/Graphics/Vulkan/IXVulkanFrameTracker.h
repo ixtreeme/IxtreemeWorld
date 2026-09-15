@@ -31,16 +31,22 @@ public:
         m_activeSlot = slot;
         m_activeFrameNumber = frameNumber;
         m_activeToken = ++m_tokenCounter;
+        if (m_activeToken == 0)
+            m_activeToken = ++m_tokenCounter; // 0 stays invalid
         return m_activeToken;
     }
 
-    // Called on successful EndFrame. Advances slot + frame number.
-    void OnEnd()
+    // Called on successful EndFrame. Returns false (no state change) unless
+    // Recording with a matching token — rejects double-End and stale frames.
+    bool OnEnd(std::uint64_t token)
     {
+        if (m_state != State::Recording || token == 0 || token != m_activeToken)
+            return false;
         m_state = State::Idle;
         m_activeSlot = (m_activeSlot + 1u) % kSlots;
         ++m_activeFrameNumber;
         m_activeToken = 0;
+        return true;
     }
 
     // Called on Skip/SwapchainRecreated/DeviceLost: no advance, no submit.

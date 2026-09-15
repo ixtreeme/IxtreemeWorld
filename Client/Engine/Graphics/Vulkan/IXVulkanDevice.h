@@ -116,7 +116,7 @@ public:
     // query pool, upload pool). Idempotent; must precede legacy device
     // teardown (see shutdown order in the class comment above Shutdown's
     // implementation). The destructor calls it as a backstop.
-    void Shutdown();
+    void Shutdown() override;
 
     // ---- backend-internal helpers (Vulkan module only) ----
     VulkanDevice& Loop() const { return *m_loop; }
@@ -213,5 +213,12 @@ private:
 };
 
 #define IXVULKAN_CHECK(device, call) (device).CheckVk((call), #call, __FILE__, __LINE__)
+
+// Minimum generic factory seam (Phase 3C, §117): backend selection lives
+// here. Today this always builds Vulkan; a future D3D12 backend is selected
+// at this point without changing renderer code. No plugin framework. The
+// legacy loop device stays caller-owned (documented infrastructure debt).
+
+std::unique_ptr<ixrhi::IXRHIDevice> CreateDevice(VulkanDevice& loop);
 
 } // namespace ixvulkan
