@@ -113,6 +113,55 @@ void IXVulkanBindGroup::UpdateTexture(std::uint32_t setIndex,
     vkUpdateDescriptorSets(m_device->NativeDevice(), 1, &write, 0, nullptr);
 }
 
+void IXVulkanBindGroup::UpdateSampledImage(std::uint32_t setIndex,
+                                           std::uint32_t binding,
+                                           std::shared_ptr<ixrhi::IXRHITexture> texture)
+{
+    if (setIndex >= m_sets.size() || !texture)
+        return;
+    auto* nativeTexture = dynamic_cast<IXVulkanTexture*>(texture.get());
+    assert(nativeTexture != nullptr && "foreign IXRHITexture used with IXVulkan backend");
+    if (nativeTexture == nullptr)
+        return;
+    m_textures.push_back(texture);
+
+    VkDescriptorImageInfo info{};
+    info.imageView = nativeTexture->NativeView();
+    info.imageLayout = VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL;
+    VkWriteDescriptorSet write{};
+    write.sType = VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET;
+    write.dstSet = m_sets[setIndex];
+    write.dstBinding = binding;
+    write.descriptorCount = 1;
+    write.descriptorType = VK_DESCRIPTOR_TYPE_SAMPLED_IMAGE;
+    write.pImageInfo = &info;
+    vkUpdateDescriptorSets(m_device->NativeDevice(), 1, &write, 0, nullptr);
+}
+
+void IXVulkanBindGroup::UpdateSampler(std::uint32_t setIndex,
+                                      std::uint32_t binding,
+                                      std::shared_ptr<ixrhi::IXRHISampler> sampler)
+{
+    if (setIndex >= m_sets.size() || !sampler)
+        return;
+    auto* nativeSampler = dynamic_cast<IXVulkanSampler*>(sampler.get());
+    assert(nativeSampler != nullptr && "foreign IXRHISampler used with IXVulkan backend");
+    if (nativeSampler == nullptr)
+        return;
+    m_samplers.push_back(sampler);
+
+    VkDescriptorImageInfo info{};
+    info.sampler = nativeSampler->Native();
+    VkWriteDescriptorSet write{};
+    write.sType = VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET;
+    write.dstSet = m_sets[setIndex];
+    write.dstBinding = binding;
+    write.descriptorCount = 1;
+    write.descriptorType = VK_DESCRIPTOR_TYPE_SAMPLER;
+    write.pImageInfo = &info;
+    vkUpdateDescriptorSets(m_device->NativeDevice(), 1, &write, 0, nullptr);
+}
+
 VkDescriptorSet IXVulkanBindGroup::NativeSet(std::uint32_t setIndex) const
 {
     return setIndex < m_sets.size() ? m_sets[setIndex] : VK_NULL_HANDLE;

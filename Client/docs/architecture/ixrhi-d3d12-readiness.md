@@ -1,4 +1,4 @@
-# IXRHI D3D12 readiness review (Phase 3C, §102-103; Phase-3D compute/buffer update below)
+# IXRHI D3D12 readiness review (Phase 3C, §102-103; Phase-3D compute/buffer and Phase-3E UI updates below)
 
 No D3D12 implementation. Per-concept mapping feasibility for a future backend.
 Verdict: no Vulkan-shaped contract found that would force a redesign; two
@@ -70,3 +70,19 @@ API at all); all feature paths use `IXRHICapabilities` (§116).
 - `ClearDepth` with rect — `ClearDepthStencilView` with a rect.
 - Verdict: no Vulkan-shaped contract added; the (from, to) buffer states
   are, if anything, closer to D3D12 than to Vulkan's stage/access pairing.
+
+## Phase-3E additions: separate image/sampler bindings + UI (no D3D12 implementation)
+
+- `SampledImage` / `Sampler` binding types + `UpdateSampledImage` /
+  `UpdateSampler`: SRV descriptor-table entry, respectively sampler-heap
+  entry — the split the RmlUi shader (apart-declared texture + sampler)
+  requires. No backend branching in generic UI code.
+- UI pipeline state (dynamic viewport/scissor, premultiplied
+  ONE/ONE_MINUS_SRC_ALPHA blend, depth off, push-constant root constants,
+  host-visible VB/IB uploads) maps to PSO + root signature + upload heap
+  without new concepts.
+- UI projection: the baked `rmlui_vs.spv` maps pixels to Vulkan NDC in-shader
+  (no engine-side matrix). A future D3D12 NDC convention difference belongs
+  to shader cooking (recook the same HLSL with the target convention), NOT
+  to gameplay UI code — the IXRHI-facing renderer passes viewport pixels
+  only, which is backend-neutral.

@@ -1,16 +1,31 @@
 #pragma once
 
+// RmlUiLayer — Phase-3E IXRHI-native UI rendering (RmlUi 6.2).
+//
+// ZERO Vk* dependency: compiled-geometry vertex/index buffers, generated
+// textures (font atlas + runtime images), the shared sampler, the UI graphics
+// pipeline and the per-texture bind-group slots are IXRHI objects; draws
+// record through ixrhi::IXRHICommandList from the canonical frame context.
+//
+// Preserved exactly (NOT redesigned): RmlUi 6.2 callback set
+// (Compile/Render/ReleaseGeometry, Load(stub)/Generate/ReleaseTexture,
+// Enable/SetScissorRegion, SetTransform no-op), premultiplied-alpha blend
+// (ONE, ONE_MINUS_SRC_ALPHA), depth off, R8G8B8A8_UNORM UI textures, linear
+// clamp sampling, push-constant viewport+translation projection, deferred
+// retire-frame resource release, per-texture descriptor slots.
+
 #include "InputEvent.h"
 
-#include <vulkan/vulkan.h>
+#include "IXRHICommandList.h"
+#include "IXRHIDevice.h"
+#include "IXRHIFrame.h"
+#include "IXRHIRenderPass.h"
 
 #include <cstdint>
 #include <functional>
 #include <memory>
 #include <string>
 #include <vector>
-
-class VulkanDevice;
 
 namespace client::asset
 {
@@ -56,11 +71,13 @@ public:
     RmlUiLayer();
     ~RmlUiLayer();
 
-    bool Create(VulkanDevice& device, client::asset::IAssetReader& assets, uint32_t width, uint32_t height);
+    bool Create(ixrhi::IXRHIDevice& rhi, client::asset::IAssetReader& assets, uint32_t width, uint32_t height);
     void Update();
-    void Render(VulkanDevice& device);
+    void Render(ixrhi::IXRHICommandList& cmd, const ixrhi::IXRHIFrameInfo& frame);
     void Resize(uint32_t width, uint32_t height);
-    void OnRenderPassChanged(VulkanDevice& device);
+    // Borrowed IXRHI pass token; null = backend default (swapchain pass).
+    void SetTargetPass(const ixrhi::IXRHIRenderPass* pass);
+    bool RecreatePipeline(ixrhi::IXRHIDevice& rhi);
     bool OnInput(const InputEvent& event);
     void HideAll();
     void SetLoginSubmitCallback(std::function<void(const std::string&, const std::string&, bool)> callback);

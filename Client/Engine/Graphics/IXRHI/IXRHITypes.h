@@ -196,7 +196,13 @@ enum class IXRHIBindingType : std::uint8_t
 {
     UniformBuffer = 0,
     StorageBuffer,
+    // Combined image + sampler in one binding (the common case).
     SampledTexture,
+    // Separate image / sampler bindings for shaders that declare them
+    // apart (RmlUi fragment shader: g_texture + g_sampler). D3D12 mapping:
+    // SRV table entry, respectively sampler-heap entry — natural.
+    SampledImage,
+    Sampler,
 };
 
 enum class IXRHISamplerFilter : std::uint8_t

@@ -1,4 +1,4 @@
-# IXRHI portability baseline (Phase 2, updated Phase 3C, compute review Phase 3D)
+# IXRHI portability baseline (Phase 2, updated Phase 3C, compute review Phase 3D, UI review Phase 3E)
 
 No MoltenVK integration in this phase. This document records what the core
 guarantees, what is optional, and which Vulkan-specific assumptions remain.
@@ -59,6 +59,19 @@ rayQuery/rayTracing, meshShaders, variableRateShading, asyncCompute.
   desc clamps (e.g. sampler LOD, multisample counts) — centralize in
   IXVulkanConversions when that backend lands.
 - No Metal backend, no separate shader language: SPIR-V stays the interchange.
+
+## Phase-3E UI review (MoltenVK-relevant, no Apple code)
+
+- Blend ONE/ONE_MINUS_SRC_ALPHA on color+alpha, depth off, scissor-only
+  clipping, R8G8B8A8_UNORM sampled textures, linear clamp-to-edge sampling
+  (single shared sampler, no anisotropy, maxLod 1, no mipmaps) — all inside
+  the portability subset; no separate-sampler friction (Metal supports
+  argument-buffer or bound texture+sampler pairs behind the backend).
+- Dynamic UI buffers are host-visible coherent uploads (no new memory-model
+  assumption); texture staging + TransferDst→ShaderRead transitions stay
+  backend-internal, with no per-draw queue stall.
+- Vertex input R32G32 + R8G8B8A8_UNORM + R32G32 at 20-byte stride: portable
+  attribute formats; compile-time layout asserts guard the RmlUi 6.2 struct.
 
 ## Phase-3D compute review (MoltenVK-relevant, no Apple code)
 

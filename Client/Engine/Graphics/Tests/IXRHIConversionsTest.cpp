@@ -83,6 +83,12 @@ void RunConversionChecks()
     CheckConv(ixvulkan::ToVkDescriptorType(ixrhi::IXRHIBindingType::SampledTexture) ==
             VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER,
         "conv binding sampler");
+    CheckConv(ixvulkan::ToVkDescriptorType(ixrhi::IXRHIBindingType::SampledImage) ==
+            VK_DESCRIPTOR_TYPE_SAMPLED_IMAGE,
+        "conv binding separate image");
+    CheckConv(ixvulkan::ToVkDescriptorType(ixrhi::IXRHIBindingType::Sampler) ==
+            VK_DESCRIPTOR_TYPE_SAMPLER,
+        "conv binding separate sampler");
     CheckConv(ixvulkan::ToVkImageLayout(ixrhi::IXRHIImageLayout::ShaderReadOnly) ==
             VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL,
         "conv layout read-only");

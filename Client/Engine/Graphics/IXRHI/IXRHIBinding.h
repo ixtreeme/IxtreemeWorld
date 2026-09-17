@@ -48,6 +48,17 @@ public:
                                std::uint32_t binding,
                                std::shared_ptr<IXRHITexture> texture,
                                std::shared_ptr<IXRHISampler> sampler) = 0;
+
+    // Separate image / sampler writes for SampledImage / Sampler bindings
+    // (shaders declaring texture and sampler apart, e.g. RmlUi). The group
+    // keeps both alive like the combined path.
+    virtual void UpdateSampledImage(std::uint32_t setIndex,
+                                    std::uint32_t binding,
+                                    std::shared_ptr<IXRHITexture> texture) = 0;
+
+    virtual void UpdateSampler(std::uint32_t setIndex,
+                               std::uint32_t binding,
+                               std::shared_ptr<IXRHISampler> sampler) = 0;
 };
 
 } // namespace ixrhi

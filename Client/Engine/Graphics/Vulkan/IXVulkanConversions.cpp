@@ -169,6 +169,8 @@ VkDescriptorType ToVkDescriptorType(ixrhi::IXRHIBindingType type)
     case B::UniformBuffer: return VK_DESCRIPTOR_TYPE_UNIFORM_BUFFER;
     case B::StorageBuffer: return VK_DESCRIPTOR_TYPE_STORAGE_BUFFER;
     case B::SampledTexture: return VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER;
+    case B::SampledImage: return VK_DESCRIPTOR_TYPE_SAMPLED_IMAGE;
+    case B::Sampler: return VK_DESCRIPTOR_TYPE_SAMPLER;
     }
     return VK_DESCRIPTOR_TYPE_UNIFORM_BUFFER;
 }

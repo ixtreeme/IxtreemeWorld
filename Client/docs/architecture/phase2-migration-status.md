@@ -1,4 +1,4 @@
-# Phase-2/3 migration status (updated at Phase-3D completion)
+# Phase-2/3 migration status (updated at Phase-3E completion)
 
 IXRHI owns the graphics frame contract; IXVulkan implements it. The legacy
 VulkanDevice keeps device/queue/swapchain-handle infrastructure plus synced
@@ -53,6 +53,19 @@ remaining infrastructure migration tracked as debt below).
 - `CubeRenderer.*` DELETED (Phase 3A §44: proven dead, zero references).
   `shaders/Cube.hlsl` + cube SPIR-V build rules intentionally retained
   (inert data; removal is unrelated churn).
+- `RmlUiLayer.*` (Phase 3E) — full UI migration, zero `Vk*` (verified by
+  grep): RmlUi 6.2 callback set preserved (Compile/Render/ReleaseGeometry,
+  Load-stub/Generate/ReleaseTexture, scissor region, SetTransform no-op),
+  per-geometry host-visible VB/IB, premultiplied-alpha RGBA8 generated
+  textures (font atlas + runtime images) via backend-staged upload, one
+  shared linear/clamp sampler, 1 bind-group layout (separate SampledImage +
+  Sampler bindings, mirroring the shader's apart-declared g_texture /
+  g_sampler) + 256-slot group with free-list slot reuse, 1 UI pipeline
+  (premultiplied ONE/ONE_MINUS_SRC_ALPHA blend, depth off, push-constant
+  viewport+translation), deferred retire-frame (+3) geometry/texture release
+  with slot reclaim, recording through the frame-owned `IXRHICommandList`.
+  New minimal primitives: `SampledImage`/`Sampler` binding types +
+  `UpdateSampledImage`/`UpdateSampler` (D3D12: SRV / sampler-heap entries).
 
 ## Still native (inventoried, unchanged behavior)
 
@@ -60,9 +73,9 @@ remaining infrastructure migration tracked as debt below).
   handle, physical/logical device, queues, swapchain handle + images + views +
   depth, formats/extents, validation, FindMemoryType. Its frame loop
   (Begin/End/BeginSwapchainRenderPass/timestamps/Resize) is dormant.
-- `TerrainRenderer` (+water/shadow/reflection), `RmlUiLayer` — frame commands
-  via the synced legacy shim (`GetCommandBuffer`/indices/active); pipelines
-  bake against the backend-mirrored main pass. Migration removes the shim.
+- `TerrainRenderer` (+water/shadow/reflection) — frame commands via the
+  synced legacy shim (`GetCommandBuffer`/indices/active); pipelines bake
+  against the backend-mirrored main pass. Migration removes the shim.
 - `NativeWindow` surface API retired (Phase 3C): `DescribeNative()` only;
   surface creation lives in backend `IXVulkanSurface`.
 
@@ -112,10 +125,10 @@ Migration shims (`SetMigrationFrameState`, `SetMigrationMainPass`,
 the last native renderer. Long-term model: `IXVulkanDevice → Vulkan API`
 (§78 `IXVulkanContext` or equivalent absorbs the remainder).
 
-## Recommended follow-ups (not 3D scope)
+## Recommended follow-ups (not 3E scope)
 
-- Terrain/Water migration (kills refraction seam + reflection target).
-- RmlUi migration (kills `GetSafeFrameNumber` + pipeline mirror needs).
+- Terrain/Water migration (kills refraction seam + reflection target, and
+  with it the last `SetMigrationFrameState`/`GetSafeFrameNumber` consumers).
 - Legacy `VulkanDevice` deletion after the above ( lapses all shims).
 - Fence-based retirement queue replacing blanket shared ownership.
 - `WaitIdle` in offscreen resize → affected-frame wait or deferred retire.

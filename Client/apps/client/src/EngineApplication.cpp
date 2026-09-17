@@ -2272,7 +2272,7 @@ int RunGame(NativeWindow& window,
     }
 
     RmlUiLayer rmlUi;
-    if (!rmlUi.Create(device, assets, swapchainSize.width, swapchainSize.height))
+    if (!rmlUi.Create(*rhiDevice, assets, swapchainSize.width, swapchainSize.height))
     {
         ShowFatal("Failed to create RmlUi layer. See debug output/stderr.");
         runtimeSession->Destroy();
@@ -5003,7 +5003,7 @@ int RunGame(NativeWindow& window,
                 if (worldLabelsOk)
                     worldLabels.RecreatePipeline(*rhiDevice);
                 runtimeSession->OnRenderPassChanged(device);
-                rmlUi.OnRenderPassChanged(device);
+                rmlUi.RecreatePipeline(*rhiDevice);
 #if defined(IXTREEME_WITH_EDITOR)
                 editorAdapter->OnRenderPassChanged();
 #endif
@@ -11052,7 +11052,7 @@ int RunGame(NativeWindow& window,
             const auto editorUiBegin = std::chrono::steady_clock::now();
             frameRmlUiRenderCalled = true;
             rhiDevice->WriteTimestamp(ixrhi::IXRHITimestampPoint::RmlUiBegin);
-            rmlUi.Render(device);
+            rmlUi.Render(*frameInfo.commandList, frameInfo);
             rhiDevice->WriteTimestamp(ixrhi::IXRHITimestampPoint::RmlUiEnd);
 #if defined(IXTREEME_WITH_EDITOR)
             frameImGuiRenderCalled = true;

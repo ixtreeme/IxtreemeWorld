@@ -1302,16 +1302,16 @@ bool RunRenderChecks(const Options& options, TestContext& ctx)
             renderCmakeSource.find("Game" "ClientLayer.cpp") == std::string::npos &&
             clientMainSource.find("RmlUiLayer rmlUi") != std::string::npos &&
             clientMainSource.find("CreateRuntimeSession()") != std::string::npos &&
-            clientMainSource.find("rmlUi.Render(device);") != std::string::npos &&
+            clientMainSource.find("rmlUi.Render(*frameInfo.commandList, frameInfo);") != std::string::npos &&
             clientMainSource.find("editorImGui.Render(device);") != std::string::npos,
         "rmlui build and z-order pipeline", "RMLUI-1 must link RmlUi 6.2, compile shaders, and render before ImGui");
     ctx.Expect(rmlUiLayerSource.find("class RmlAssetFileInterface") != std::string::npos &&
             rmlUiLayerSource.find("class RmlRenderInterface final : public Rml::RenderInterface") != std::string::npos &&
-            rmlUiLayerSource.find("CreateDescriptorPool") != std::string::npos &&
+            rmlUiLayerSource.find("CreateBindGroup") != std::string::npos &&
             rmlUiLayerSource.find("ProcessMouseButtonDown") != std::string::npos &&
             rmlUiLayerSource.find("[RMLUI-DIAG] CreateContext: viewport=") != std::string::npos &&
             rmlUiLayerSource.find("[RMLUI-DIAG] RenderGeometry: vertices=") != std::string::npos &&
-            rmlUiLayerSource.find("[RMLUI-DIAG] vkCmdSetViewport") != std::string::npos &&
+            rmlUiLayerSource.find("[RMLUI-DIAG] SetViewport") != std::string::npos &&
             rmlUiLayerSource.find("[RMLUI-DIAG] Pipeline primitive topology: TRIANGLE_LIST") != std::string::npos &&
             rmlUiLayerSource.find("PendingGeometryDelete") != std::string::npos &&
             rmlUiLayerSource.find("m_pendingGeometryDeletes") != std::string::npos &&

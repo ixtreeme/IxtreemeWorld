@@ -54,6 +54,12 @@ public:
                        std::uint32_t binding,
                        std::shared_ptr<ixrhi::IXRHITexture> texture,
                        std::shared_ptr<ixrhi::IXRHISampler> sampler) override;
+    void UpdateSampledImage(std::uint32_t setIndex,
+                            std::uint32_t binding,
+                            std::shared_ptr<ixrhi::IXRHITexture> texture) override;
+    void UpdateSampler(std::uint32_t setIndex,
+                       std::uint32_t binding,
+                       std::shared_ptr<ixrhi::IXRHISampler> sampler) override;
 
     // Set index within this group (groups are created with maxSets slots).
     VkDescriptorSet NativeSet(std::uint32_t setIndex) const;
