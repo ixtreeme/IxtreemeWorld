@@ -10,6 +10,8 @@
 // accepted no-ops so renderer code is identical for both.
 
 #include "IXRHI.h"
+#include "IXRHIBuffer.h"
+#include "IXRHIPipeline.h"
 #include "IXRHITypes.h"
 
 #include <cstddef>
@@ -37,6 +39,8 @@ public:
 
     virtual void SetGraphicsPipeline(const IXRHIGraphicsPipeline& pipeline) = 0;
 
+    virtual void SetComputePipeline(const IXRHIComputePipeline& pipeline) = 0;
+
     virtual void SetVertexBuffer(std::uint32_t slot,
                                  const IXRHIBuffer& buffer,
                                  std::uint64_t offsetBytes) = 0;
@@ -52,6 +56,14 @@ public:
                            std::uint32_t slotIndex) = 0;
 
     virtual void PushConstants(const void* data, std::size_t byteCount) = 0;
+
+    // Clears the bound depth target inside a rect (lobby preview path).
+    // D3D12 mapping: ClearDepthStencilView with a rect — natural.
+    virtual void ClearDepth(float depth,
+                            std::uint32_t x,
+                            std::uint32_t y,
+                            std::uint32_t width,
+                            std::uint32_t height) = 0;
 
     virtual void Draw(std::uint32_t vertexCount,
                       std::uint32_t instanceCount = 1,
@@ -78,6 +90,20 @@ public:
     // Full-subresource same-size copy. Both textures must already be in
     // TransferSrc (src) / TransferDst (dst); aspects derive from formats.
     virtual void CopyTexture(const IXRHITexture& src, IXRHITexture& dst) = 0;
+
+    // Whole- or part-buffer copy. Ordering with surrounding commands follows
+    // recording order (same queue); explicit state transitions still apply.
+    virtual void CopyBuffer(const IXRHIBuffer& src,
+                            IXRHIBuffer& dst,
+                            std::uint64_t byteCount) = 0;
+
+    // Explicit buffer layout/access transition (backend inserts the barrier).
+    // Unlocks compute->graphics (ShaderWrite -> VertexRead) and
+    // compute->readback (ShaderWrite -> TransferSrc) without native barriers
+    // in renderer code.
+    virtual void TransitionBuffer(IXRHIBuffer& buffer,
+                                  IXRHIBufferState from,
+                                  IXRHIBufferState to) = 0;
 };
 
 } // namespace ixrhi

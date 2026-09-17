@@ -1,10 +1,34 @@
 #pragma once
 
-#include "VulkanDevice.h"
+// SkinnedMeshRenderer — Phase-3D IXRHI-native migration (compute + graphics).
+//
+// ZERO Vk* dependency: rest/palette/output/index/uniform buffers, textures,
+// samplers, shaders, compute + graphics pipelines and bind groups are IXRHI
+// objects; skinning dispatches and draws record through ixrhi::IXRHICommandList.
+//
+// Skinning model (preserved exactly, NOT redesigned):
+//   CPU (Ozz, animation module): sampling, hierarchy evaluation (LocalToModel),
+//       bone palette generation (model * inverse-bind, row-major Mat4).
+//   GPU (compute): linear-blend skinning of rest vertices by palette.
+//   Graphics consumes the compute output buffer as its vertex buffer.
+// Ozz types never cross into IXRHI.
+//
+// Frame contract: Skin*/Render* take the recording command list (owned frame
+// list from the IXRHI frame context) and an IXRHIFrameInfo snapshot. Compute
+// dispatches record into the same graphics command buffer in the pre-pass
+// (same queue, no async compute — parity). Per-frame/per-slot palette + output
+// buffers preserve the frames-in-flight hazard discipline.
+
 #include "WorldCamera.h"
 #include "MapEditorTypes.h"
 
+#include "IXRHIBinding.h"
+#include "IXRHIBuffer.h"
+#include "IXRHICommandList.h"
+#include "IXRHIDevice.h"
+#include "IXRHIPipeline.h"
 #include "IXRHIRenderPass.h"
+#include "IXRHITexture.h"
 
 #include <ozz/base/maths/soa_transform.h>
 #include <ozz/base/span.h>
@@ -39,25 +63,27 @@ public:
         Run = 2
     };
 
-    struct Buffer
-    {
-        VkBuffer buffer = VK_NULL_HANDLE;
-        VkDeviceMemory memory = VK_NULL_HANDLE;
-    };
-
-    bool Create(VulkanDevice& device, client::asset::IAssetReader& assets,
-        const std::string& modelPath);
-    bool RecreatePipeline(VulkanDevice& device);
-    // Borrowed IXRHI pass token (Phase 3B): unwrapped backend-locally. The
-    // native pass member below stays until SkinnedMesh migrates (Phase 3C+).
-    void SetTargetPass(const ixrhi::IXRHIRenderPass* pass);
-    void Skin(VulkanDevice& device, double timeSeconds);
-    void SkinInstance(VulkanDevice& device, uint32_t skinSlot, MotionState state, float animTimeSeconds);
+    bool Create(ixrhi::IXRHIDevice& rhi,
+                client::asset::IAssetReader& assets,
+                const std::string& modelPath);
+    bool RecreatePipeline(ixrhi::IXRHIDevice& rhi);
+    // Borrowed IXRHI pass token; null = backend default (swapchain pass).
+    void SetTargetPass(const ixrhi::IXRHIRenderPass* pass) { m_targetPass = pass; }
+    void Skin(ixrhi::IXRHICommandList& cmd,
+              const ixrhi::IXRHIFrameInfo& frame,
+              double timeSeconds);
+    void SkinInstance(ixrhi::IXRHICommandList& cmd,
+                      const ixrhi::IXRHIFrameInfo& frame,
+                      uint32_t skinSlot,
+                      MotionState state,
+                      float animTimeSeconds);
     // Pose-injection entry point: skin one instance from an EXTERNALLY computed local pose
     // (e.g. the animator's blended ozz output) instead of selecting a built-in MotionState
     // clip. `localPose` must hold exactly NumSoaJoints() SoaTransforms for this skeleton.
-    void SkinInstanceFromPose(VulkanDevice& device, uint32_t skinSlot,
-        ozz::span<const ozz::math::SoaTransform> localPose);
+    void SkinInstanceFromPose(ixrhi::IXRHICommandList& cmd,
+                              const ixrhi::IXRHIFrameInfo& frame,
+                              uint32_t skinSlot,
+                              ozz::span<const ozz::math::SoaTransform> localPose);
     // Skeleton accessors for the animation layer (clip retargeting, rest-pose fallback).
     // Return null/empty when no skeleton is loaded yet.
     const ozz::animation::Skeleton* Skeleton() const;
@@ -66,19 +92,25 @@ public:
     std::uint32_t NumSoaJoints() const;
     // Ordered joint names of the loaded skeleton (empty if none) — the retarget key for clips.
     std::vector<std::string> JointNames() const;
-    void Render(VulkanDevice& device, double timeSeconds);
-    void RenderInWorld(VulkanDevice& device,
+    void Render(ixrhi::IXRHICommandList& cmd,
+                const ixrhi::IXRHIFrameInfo& frame,
+                double timeSeconds);
+    void RenderInWorld(ixrhi::IXRHICommandList& cmd,
+        const ixrhi::IXRHIFrameInfo& frame,
         double timeSeconds,
         const WorldCamera& camera,
         WorldVec3 position,
         float yawRadians,
         uint32_t skinSlot = 0,
         std::array<float, 4> tint = {1.0f, 1.0f, 1.0f, 1.0f},
-        VkExtent2D targetExtent = {});
-    void RenderInWorldReflection(VulkanDevice& device,
+        std::uint32_t targetWidth = 0,
+        std::uint32_t targetHeight = 0);
+    void RenderInWorldReflection(ixrhi::IXRHICommandList& cmd,
+        const ixrhi::IXRHIFrameInfo& frame,
         const WorldCamera& camera,
-        VkExtent2D extent,
-        VkRenderPass renderPass,
+        std::uint32_t targetWidth,
+        std::uint32_t targetHeight,
+        const ixrhi::IXRHIRenderPass* renderPass,
         float waterLevelY,
         WorldVec3 position,
         float yawRadians,
@@ -157,11 +189,9 @@ private:
 
     struct Texture
     {
-        VkImage image = VK_NULL_HANDLE;
-        VkDeviceMemory memory = VK_NULL_HANDLE;
-        VkImageView view = VK_NULL_HANDLE;
-        VkSampler sampler = VK_NULL_HANDLE;
-        VkFormat format = VK_FORMAT_UNDEFINED;
+        std::shared_ptr<ixrhi::IXRHITexture> image;
+        std::shared_ptr<ixrhi::IXRHISampler> sampler;
+        ixrhi::IXRHIFormat format = ixrhi::IXRHIFormat::Undefined;
         uint32_t width = 0;
         uint32_t height = 0;
         uint32_t mipLevels = 0;
@@ -173,15 +203,15 @@ private:
     bool LoadGltfMesh(const std::string& modelPath);
     bool LoadFbxMesh(const std::string& modelPath);
     bool LoadOzzPose(const std::string& modelPath);
-    bool CreateBuffers(VulkanDevice& device);
-    bool CreateTextures(VulkanDevice& device, const std::string& modelPath);
-    bool CreateDescriptors();
-    bool CreatePipeline(VulkanDevice& device);
-    bool CreateReflectionPipeline(VulkanDevice& device, VkRenderPass renderPass);
-    bool CreateComputeResources(VulkanDevice& device);
-    bool CreateComputeDescriptors();
-    bool CreateComputePipeline();
-    bool VerifyComputeSkin(VulkanDevice& device);
+    bool CreateBuffers(ixrhi::IXRHIDevice& rhi);
+    bool CreateTextures(ixrhi::IXRHIDevice& rhi, const std::string& modelPath);
+    bool CreateBindGroup(ixrhi::IXRHIDevice& rhi);
+    bool CreatePipeline(ixrhi::IXRHIDevice& rhi);
+    bool CreateReflectionPipeline(ixrhi::IXRHIDevice& rhi, const ixrhi::IXRHIRenderPass* renderPass);
+    bool CreateComputeResources(ixrhi::IXRHIDevice& rhi);
+    bool CreateComputeBindGroup(ixrhi::IXRHIDevice& rhi);
+    bool CreateComputePipeline(ixrhi::IXRHIDevice& rhi);
+    bool VerifyComputeSkin(ixrhi::IXRHIDevice& rhi);
     bool SkinPose(float animTimeSeconds, bool updateBounds, bool logSamples, MotionState state = MotionState::Idle);
     // Decomposed pieces of the old monolithic SkinPose, so the runtime path can build a GPU
     // palette without the (CPU-only, bounds/verify) vertex-skinning loop, and so an external
@@ -192,14 +222,13 @@ private:
     bool UploadPaletteToBuffer(uint32_t frameIndex, uint32_t skinSlot);
     bool UploadBonePalette(MotionState state, float animTimeSeconds, uint32_t frameIndex, uint32_t skinSlot);
     bool UploadBonePalette(float animTimeSeconds, uint32_t frameIndex);
-    void DispatchSkin(VkCommandBuffer cmd, uint32_t frameIndex, uint32_t skinSlot);
-    void DispatchSkin(VkCommandBuffer cmd, uint32_t frameIndex);
+    void DispatchSkin(ixrhi::IXRHICommandList& cmd, uint32_t frameIndex, uint32_t skinSlot);
+    void DispatchSkin(ixrhi::IXRHICommandList& cmd, uint32_t frameIndex);
+    void EmitSkinBarrier(ixrhi::IXRHICommandList& cmd, uint32_t frameIndex, uint32_t skinSlot);
     void DestroyComputeResources();
     void DestroyAnimation();
     void DestroyPipeline();
     void DestroyReflectionPipeline();
-    void DestroyBuffer(Buffer& buffer);
-    void DestroyTexture(Texture& texture);
     void UpdateUniform(uint32_t frameIndex, uint32_t uniformSlot, double timeSeconds, float aspect);
     void UpdateWorldUniform(uint32_t frameIndex,
         uint32_t uniformSlot,
@@ -211,23 +240,19 @@ private:
         bool reflectionPass = false,
         float waterLevelY = 0.0f);
 
-    VkDevice m_device = VK_NULL_HANDLE;
+    ixrhi::IXRHIDevice* m_rhi = nullptr;
+    const ixrhi::IXRHIRenderPass* m_targetPass = nullptr; // borrowed (frame owner)
     client::asset::IAssetReader* m_assets = nullptr;
-    Buffer m_indexBuffer;
-    std::array<std::array<Buffer, kUniformSlots>, kFramesInFlight> m_uniformBuffers{};
-    VkDescriptorSetLayout m_descriptorSetLayout = VK_NULL_HANDLE;
-    VkDescriptorPool m_descriptorPool = VK_NULL_HANDLE;
-    std::array<std::array<std::array<VkDescriptorSet, kTextureCount>, kUniformSlots>, kFramesInFlight> m_descriptorSets{};
-    VkDescriptorSetLayout m_computeDescriptorSetLayout = VK_NULL_HANDLE;
-    VkDescriptorPool m_computeDescriptorPool = VK_NULL_HANDLE;
-    std::array<std::array<VkDescriptorSet, kSkinSlots>, kFramesInFlight> m_computeDescriptorSets{};
-    VkPipelineLayout m_pipelineLayout = VK_NULL_HANDLE;
-    VkPipeline m_pipeline = VK_NULL_HANDLE;
-    VkRenderPass m_mainRenderPass = VK_NULL_HANDLE;
-    VkPipeline m_reflectionPipeline = VK_NULL_HANDLE;
-    VkRenderPass m_reflectionRenderPass = VK_NULL_HANDLE;
-    VkPipelineLayout m_computePipelineLayout = VK_NULL_HANDLE;
-    VkPipeline m_computePipeline = VK_NULL_HANDLE;
+    std::shared_ptr<ixrhi::IXRHIBuffer> m_indexBuffer;
+    std::array<std::array<std::shared_ptr<ixrhi::IXRHIBuffer>, kUniformSlots>, kFramesInFlight> m_uniformBuffers{};
+    std::unique_ptr<ixrhi::IXRHIBindGroupLayout> m_bindLayout;
+    std::unique_ptr<ixrhi::IXRHIBindGroup> m_bindGroup;
+    std::unique_ptr<ixrhi::IXRHIBindGroupLayout> m_computeBindLayout;
+    std::unique_ptr<ixrhi::IXRHIBindGroup> m_computeBindGroup;
+    std::unique_ptr<ixrhi::IXRHIGraphicsPipeline> m_pipeline;
+    std::unique_ptr<ixrhi::IXRHIGraphicsPipeline> m_reflectionPipeline;
+    const ixrhi::IXRHIRenderPass* m_reflectionPass = nullptr; // borrowed (terrain owns)
+    std::unique_ptr<ixrhi::IXRHIComputePipeline> m_computePipeline;
     std::vector<Vertex> m_vertices;
     std::vector<uint32_t> m_indices;
     std::vector<MeshDraw> m_draws;
@@ -235,9 +260,9 @@ private:
     std::vector<RawMesh> m_rawMeshes;
     std::vector<RestVertexGpu> m_restVerticesGpu;
     std::array<Texture, kTextureCount> m_textures{};
-    Buffer m_restVertexBuffer;
-    std::array<std::array<Buffer, kSkinSlots>, kFramesInFlight> m_bonePaletteBuffers{};
-    std::array<std::array<Buffer, kSkinSlots>, kFramesInFlight> m_skinnedOutputBuffers{};
+    std::shared_ptr<ixrhi::IXRHIBuffer> m_restVertexBuffer;
+    std::array<std::array<std::shared_ptr<ixrhi::IXRHIBuffer>, kSkinSlots>, kFramesInFlight> m_bonePaletteBuffers{};
+    std::array<std::array<std::shared_ptr<ixrhi::IXRHIBuffer>, kSkinSlots>, kFramesInFlight> m_skinnedOutputBuffers{};
     uint32_t m_indexCount = 0;
     MeshBounds m_bounds{};
     std::unique_ptr<OzzRuntime> m_ozz;

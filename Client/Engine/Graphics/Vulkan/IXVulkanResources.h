@@ -33,6 +33,7 @@ public:
     ~IXVulkanBuffer() override;
 
     void Write(std::uint64_t dstOffsetBytes, const void* src, std::size_t byteCount) override;
+    void Read(std::uint64_t srcOffsetBytes, void* dst, std::size_t byteCount) override;
     std::uint64_t SizeBytes() const override { return m_sizeBytes; }
     ixrhi::IXRHIBufferUsage Usage() const override { return m_usage; }
     const std::string& DebugName() const override { return m_debugName; }

@@ -1,6 +1,0 @@
-{
-  "name": "ExampleGame",
-  "engine": "IxtreemeEngine",
-  "version": "0.1.0",
-  "notes": "Phase 1 scaffold only — no gameplay code. Proves the Projects/<Game>/ layout the Editor Build pipeline will compile: Source/ + Assets/ + World/ + Config/ + project metadata. Auriga/IxtreemeWorld will follow this layout later; engine code must not depend on it."
-}

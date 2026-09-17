@@ -52,6 +52,22 @@ void IXVulkanBuffer::Write(std::uint64_t dstOffsetBytes, const void* src, std::s
     vkUnmapMemory(m_device->NativeDevice(), m_memory);
 }
 
+void IXVulkanBuffer::Read(std::uint64_t srcOffsetBytes, void* dst, std::size_t byteCount)
+{
+    if (dst == nullptr || byteCount == 0 || srcOffsetBytes + byteCount > m_sizeBytes)
+        return;
+    void* mapped = nullptr;
+    IXVULKAN_CHECK(*m_device,
+        vkMapMemory(m_device->NativeDevice(),
+            m_memory,
+            static_cast<VkDeviceSize>(srcOffsetBytes),
+            static_cast<VkDeviceSize>(byteCount),
+            0,
+            &mapped));
+    std::memcpy(dst, mapped, byteCount);
+    vkUnmapMemory(m_device->NativeDevice(), m_memory);
+}
+
 IXVulkanTexture::IXVulkanTexture(IXVulkanDevice& device,
                                  VkImage image,
                                  VkDeviceMemory memory,

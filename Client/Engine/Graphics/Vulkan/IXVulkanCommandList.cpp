@@ -11,6 +11,7 @@
 #include "VulkanDevice.h"
 
 #include <cassert>
+#include <functional>
 
 namespace ixvulkan
 {
@@ -87,7 +88,21 @@ void IXVulkanCommandList::SetGraphicsPipeline(const ixrhi::IXRHIGraphicsPipeline
     if (native == nullptr)
         return;
     m_lastLayout = native->NativeLayout();
+    m_lastPushStages = native->PushStages();
+    m_lastBindPoint = VK_PIPELINE_BIND_POINT_GRAPHICS;
     vkCmdBindPipeline(m_cmd, VK_PIPELINE_BIND_POINT_GRAPHICS, native->Native());
+}
+
+void IXVulkanCommandList::SetComputePipeline(const ixrhi::IXRHIComputePipeline& pipeline)
+{
+    auto* native = dynamic_cast<const IXVulkanComputePipeline*>(&pipeline);
+    assert(native != nullptr && "foreign IXRHIComputePipeline used with IXVulkan backend");
+    if (native == nullptr)
+        return;
+    m_lastLayout = native->NativeLayout();
+    m_lastPushStages = native->PushStages();
+    m_lastBindPoint = VK_PIPELINE_BIND_POINT_COMPUTE;
+    vkCmdBindPipeline(m_cmd, VK_PIPELINE_BIND_POINT_COMPUTE, native->Native());
 }
 
 void IXVulkanCommandList::SetVertexBuffer(std::uint32_t slot,
@@ -126,7 +141,7 @@ void IXVulkanCommandList::BindGroup(std::uint32_t layoutSet,
         return;
     const VkDescriptorSet set = native->NativeSet(slotIndex);
     vkCmdBindDescriptorSets(m_cmd,
-        VK_PIPELINE_BIND_POINT_GRAPHICS,
+        m_lastBindPoint,
         m_lastLayout,
         layoutSet,
         1,
@@ -137,11 +152,13 @@ void IXVulkanCommandList::BindGroup(std::uint32_t layoutSet,
 
 void IXVulkanCommandList::PushConstants(const void* data, std::size_t byteCount)
 {
-    if (data == nullptr || byteCount == 0 || m_lastLayout == VK_NULL_HANDLE)
+    // Push only against stages declared by the bound pipeline's layout;
+    // without a declared range this is a safe no-op (never an invalid call).
+    if (data == nullptr || byteCount == 0 || m_lastLayout == VK_NULL_HANDLE || m_lastPushStages == 0)
         return;
     vkCmdPushConstants(m_cmd,
         m_lastLayout,
-        VK_SHADER_STAGE_VERTEX_BIT | VK_SHADER_STAGE_FRAGMENT_BIT | VK_SHADER_STAGE_COMPUTE_BIT,
+        m_lastPushStages,
         0,
         static_cast<std::uint32_t>(byteCount),
         data);
@@ -266,6 +283,115 @@ void IXVulkanCommandList::CopyTexture(const ixrhi::IXRHITexture& src, ixrhi::IXR
         &copy);
 }
 
+void IXVulkanCommandList::ClearDepth(float depth,
+                                     std::uint32_t x,
+                                     std::uint32_t y,
+                                     std::uint32_t width,
+                                     std::uint32_t height)
+{
+    if (width == 0 || height == 0)
+        return;
+    VkClearAttachment clear{};
+    clear.aspectMask = VK_IMAGE_ASPECT_DEPTH_BIT;
+    clear.clearValue.depthStencil.depth = depth;
+    VkClearRect rect{};
+    rect.rect.offset = {static_cast<std::int32_t>(x), static_cast<std::int32_t>(y)};
+    rect.rect.extent = {width, height};
+    rect.baseArrayLayer = 0;
+    rect.layerCount = 1;
+    vkCmdClearAttachments(m_cmd, 1, &clear, 1, &rect);
+}
+
+void IXVulkanCommandList::CopyBuffer(const ixrhi::IXRHIBuffer& src,
+                                     ixrhi::IXRHIBuffer& dst,
+                                     std::uint64_t byteCount)
+{
+    auto* nativeSrc = dynamic_cast<const IXVulkanBuffer*>(&src);
+    auto* nativeDst = dynamic_cast<IXVulkanBuffer*>(&dst);
+    assert(nativeSrc != nullptr && nativeDst != nullptr && "foreign IXRHIBuffer used with IXVulkan backend");
+    if (nativeSrc == nullptr || nativeDst == nullptr || byteCount == 0)
+        return;
+    VkBufferCopy copy{};
+    copy.size = static_cast<VkDeviceSize>(byteCount);
+    vkCmdCopyBuffer(m_cmd, nativeSrc->Native(), nativeDst->Native(), 1, &copy);
+}
+
+namespace
+{
+
+void BufferStageAccess(ixrhi::IXRHIBufferState state,
+                       VkPipelineStageFlags& stage,
+                       VkAccessFlags& access)
+{
+    using S = ixrhi::IXRHIBufferState;
+    switch (state)
+    {
+    case S::Undefined:
+        stage = VK_PIPELINE_STAGE_TOP_OF_PIPE_BIT;
+        access = 0;
+        break;
+    case S::ShaderRead:
+        stage = VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT | VK_PIPELINE_STAGE_FRAGMENT_SHADER_BIT |
+            VK_PIPELINE_STAGE_VERTEX_SHADER_BIT;
+        access = VK_ACCESS_SHADER_READ_BIT;
+        break;
+    case S::ShaderWrite:
+        stage = VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT;
+        access = VK_ACCESS_SHADER_WRITE_BIT;
+        break;
+    case S::VertexRead:
+        stage = VK_PIPELINE_STAGE_VERTEX_INPUT_BIT;
+        access = VK_ACCESS_VERTEX_ATTRIBUTE_READ_BIT;
+        break;
+    case S::IndexRead:
+        stage = VK_PIPELINE_STAGE_VERTEX_INPUT_BIT;
+        access = VK_ACCESS_INDEX_READ_BIT;
+        break;
+    case S::UniformRead:
+        stage = VK_PIPELINE_STAGE_VERTEX_SHADER_BIT | VK_PIPELINE_STAGE_FRAGMENT_SHADER_BIT |
+            VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT;
+        access = VK_ACCESS_UNIFORM_READ_BIT;
+        break;
+    case S::TransferSrc:
+        stage = VK_PIPELINE_STAGE_TRANSFER_BIT;
+        access = VK_ACCESS_TRANSFER_READ_BIT;
+        break;
+    case S::TransferDst:
+        stage = VK_PIPELINE_STAGE_TRANSFER_BIT;
+        access = VK_ACCESS_TRANSFER_WRITE_BIT;
+        break;
+    }
+}
+
+} // namespace
+
+void IXVulkanCommandList::TransitionBuffer(ixrhi::IXRHIBuffer& buffer,
+                                           ixrhi::IXRHIBufferState from,
+                                           ixrhi::IXRHIBufferState to)
+{
+    auto* native = dynamic_cast<IXVulkanBuffer*>(&buffer);
+    assert(native != nullptr && "foreign IXRHIBuffer used with IXVulkan backend");
+    if (native == nullptr)
+        return;
+    VkPipelineStageFlags srcStage = 0;
+    VkAccessFlags srcAccess = 0;
+    VkPipelineStageFlags dstStage = 0;
+    VkAccessFlags dstAccess = 0;
+    BufferStageAccess(from, srcStage, srcAccess);
+    BufferStageAccess(to, dstStage, dstAccess);
+
+    VkBufferMemoryBarrier barrier{};
+    barrier.sType = VK_STRUCTURE_TYPE_BUFFER_MEMORY_BARRIER;
+    barrier.srcAccessMask = srcAccess;
+    barrier.dstAccessMask = dstAccess;
+    barrier.srcQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;
+    barrier.dstQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;
+    barrier.buffer = native->Native();
+    barrier.offset = 0;
+    barrier.size = static_cast<VkDeviceSize>(native->SizeBytes());
+    vkCmdPipelineBarrier(m_cmd, srcStage, dstStage, 0, 0, nullptr, 1, &barrier, 0, nullptr);
+}
+
 std::unique_ptr<ixrhi::IXRHICommandList> IXVulkanDevice::CreateCommandList()
 {
     VkCommandPoolCreateInfo poolInfo{};
@@ -288,6 +414,34 @@ std::unique_ptr<ixrhi::IXRHICommandList> IXVulkanDevice::CreateCommandList()
         __FILE__,
         __LINE__);
     return std::make_unique<IXVulkanCommandList>(*this, pool, cmd);
+}
+
+void IXVulkanDevice::ExecuteAndWait(const std::function<void(ixrhi::IXRHICommandList&)>& record)
+{
+    if (!record)
+        return;
+    auto list = CreateCommandList();
+    if (!list)
+        return;
+    list->Begin();
+    record(*list);
+    list->End();
+
+    auto* native = dynamic_cast<IXVulkanCommandList*>(list.get());
+    if (native == nullptr)
+        return;
+    VkFenceCreateInfo fenceInfo{};
+    fenceInfo.sType = VK_STRUCTURE_TYPE_FENCE_CREATE_INFO;
+    VkFence fence = VK_NULL_HANDLE;
+    IXVULKAN_CHECK(*this, vkCreateFence(NativeDevice(), &fenceInfo, nullptr, &fence));
+    VkSubmitInfo submit{};
+    submit.sType = VK_STRUCTURE_TYPE_SUBMIT_INFO;
+    submit.commandBufferCount = 1;
+    VkCommandBuffer cmd = native->Native();
+    submit.pCommandBuffers = &cmd;
+    IXVULKAN_CHECK(*this, vkQueueSubmit(Loop().GetGraphicsQueue(), 1, &submit, fence));
+    IXVULKAN_CHECK(*this, vkWaitForFences(NativeDevice(), 1, &fence, VK_TRUE, UINT64_MAX));
+    vkDestroyFence(NativeDevice(), fence, nullptr);
 }
 
 std::unique_ptr<ixrhi::IXRHIFence> IXVulkanDevice::CreateFence(bool signaled)

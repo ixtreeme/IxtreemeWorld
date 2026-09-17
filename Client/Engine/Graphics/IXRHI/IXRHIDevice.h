@@ -34,6 +34,7 @@
 
 #include <cstddef>
 #include <cstdint>
+#include <functional>
 #include <memory>
 #include <vector>
 
@@ -74,6 +75,11 @@ public:
         const IXRHIComputePipelineDesc& desc) = 0;
 
     virtual std::unique_ptr<IXRHICommandList> CreateCommandList() = 0;
+
+    // Records `record` into a transient command list, submits it, and blocks
+    // until completion (setup/readback paths such as compute verification).
+    // Must not be called from inside a recording command list.
+    virtual void ExecuteAndWait(const std::function<void(IXRHICommandList&)>& record) = 0;
 
     // Staged device-local upload without blocking the caller (see
     // IXRHIBufferUpload). Data is copied into backend staging immediately.

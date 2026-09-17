@@ -121,6 +121,18 @@ void TestDescriptorDefaults()
 
     const ixrhi::IXRHIImageLayout transferSrc = ixrhi::IXRHIImageLayout::TransferSrc;
     Check(transferSrc != ixrhi::IXRHIImageLayout::TransferDst, "transfer layouts distinct");
+
+    // Phase-3D buffer-state model: distinct engine-level states (no Vulkan clone).
+    Check(ixrhi::IXRHIBufferState::ShaderWrite != ixrhi::IXRHIBufferState::VertexRead,
+        "buffer states ShaderWrite/VertexRead distinct");
+    Check(ixrhi::IXRHIBufferState::TransferSrc != ixrhi::IXRHIBufferState::TransferDst,
+        "buffer states TransferSrc/TransferDst distinct");
+    Check(ixrhi::IXRHIBufferState::Undefined != ixrhi::IXRHIBufferState::UniformRead,
+        "buffer states Undefined/UniformRead distinct");
+
+    ixrhi::IXRHIComputePipelineDesc computeDesc{};
+    Check(computeDesc.computeShader == nullptr, "compute desc shader defaults null");
+    Check(computeDesc.bindGroupLayouts.empty(), "compute desc layouts default empty");
 }
 
 // CPU-only IXRHITexture/Sampler doubles for bridge registry tests (no GPU).

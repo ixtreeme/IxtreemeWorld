@@ -1,4 +1,4 @@
-# Phase-2/3 migration status (updated at Phase-3C completion)
+# Phase-2/3 migration status (updated at Phase-3D completion)
 
 IXRHI owns the graphics frame contract; IXVulkan implements it. The legacy
 VulkanDevice keeps device/queue/swapchain-handle infrastructure plus synced
@@ -36,6 +36,20 @@ remaining infrastructure migration tracked as debt below).
 - `SkinnedMeshRenderer` / `TerrainRenderer::SetTargetPass` (Phase 3B) — take
   the borrowed `IXRHIRenderPass` token, unwrapped backend-locally. No caller
   passes `VkRenderPass` anymore.
+- `SkinnedMeshRenderer.*` (Phase 3D) — full compute + graphics migration,
+  zero `Vk*` (verified by grep): rest-vertex SSBO, per-frame/per-slot bone
+  palettes (host-visible) + skinned-output buffers (Storage|Vertex|
+  TransferSrc), index + 64 host-visible UBOs, 2 IXRHI textures + samplers,
+  1 graphics bind-group layout + 128-slot group (UBO + sampler), 1 compute
+  bind-group layout + 64-slot group (rest/palette/output storage buffers),
+  compute pipeline (`skinned_mesh_cs.spv`, CSMain, push constants,
+  64-thread groups) + opaque graphics pipeline + front-cull reflection
+  pipeline, compute dispatches + compute→graphics barriers
+  (`TransitionBuffer` ShaderWrite→VertexRead) recorded into the same
+  graphics command list pre-pass (no async compute — parity), draws through
+  `IXRHICommandList`, Ozz stays behind the renderer boundary (no Ozz types
+  in IXRHI). CPU skinning loop kept for load-time bounds + one-time
+  GPU-vs-CPU verification (`ExecuteAndWait` + readback, then barriers only).
 - `CubeRenderer.*` DELETED (Phase 3A §44: proven dead, zero references).
   `shaders/Cube.hlsl` + cube SPIR-V build rules intentionally retained
   (inert data; removal is unrelated churn).
@@ -46,8 +60,7 @@ remaining infrastructure migration tracked as debt below).
   handle, physical/logical device, queues, swapchain handle + images + views +
   depth, formats/extents, validation, FindMemoryType. Its frame loop
   (Begin/End/BeginSwapchainRenderPass/timestamps/Resize) is dormant.
-- `SkinnedMeshRenderer` (+compute skinning + push constants),
-  `TerrainRenderer` (+water/shadow/reflection), `RmlUiLayer` — frame commands
+- `TerrainRenderer` (+water/shadow/reflection), `RmlUiLayer` — frame commands
   via the synced legacy shim (`GetCommandBuffer`/indices/active); pipelines
   bake against the backend-mirrored main pass. Migration removes the shim.
 - `NativeWindow` surface API retired (Phase 3C): `DescribeNative()` only;
@@ -99,9 +112,8 @@ Migration shims (`SetMigrationFrameState`, `SetMigrationMainPass`,
 the last native renderer. Long-term model: `IXVulkanDevice → Vulkan API`
 (§78 `IXVulkanContext` or equivalent absorbs the remainder).
 
-## Recommended follow-ups (not 3C scope)
+## Recommended follow-ups (not 3D scope)
 
-- SkinnedMesh + compute migration (kills the biggest shim consumer class).
 - Terrain/Water migration (kills refraction seam + reflection target).
 - RmlUi migration (kills `GetSafeFrameNumber` + pipeline mirror needs).
 - Legacy `VulkanDevice` deletion after the above ( lapses all shims).

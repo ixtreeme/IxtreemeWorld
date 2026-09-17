@@ -29,6 +29,7 @@ public:
     void SetViewport(float x, float y, float width, float height) override;
     void SetScissor(std::uint32_t x, std::uint32_t y, std::uint32_t width, std::uint32_t height) override;
     void SetGraphicsPipeline(const ixrhi::IXRHIGraphicsPipeline& pipeline) override;
+    void SetComputePipeline(const ixrhi::IXRHIComputePipeline& pipeline) override;
     void SetVertexBuffer(std::uint32_t slot,
                          const ixrhi::IXRHIBuffer& buffer,
                          std::uint64_t offsetBytes) override;
@@ -39,6 +40,11 @@ public:
                    const ixrhi::IXRHIBindGroup& group,
                    std::uint32_t slotIndex) override;
     void PushConstants(const void* data, std::size_t byteCount) override;
+    void ClearDepth(float depth,
+                    std::uint32_t x,
+                    std::uint32_t y,
+                    std::uint32_t width,
+                    std::uint32_t height) override;
     void Draw(std::uint32_t vertexCount,
               std::uint32_t instanceCount,
               std::uint32_t firstVertex,
@@ -53,6 +59,12 @@ public:
                            ixrhi::IXRHIImageLayout from,
                            ixrhi::IXRHIImageLayout to) override;
     void CopyTexture(const ixrhi::IXRHITexture& src, ixrhi::IXRHITexture& dst) override;
+    void CopyBuffer(const ixrhi::IXRHIBuffer& src,
+                    ixrhi::IXRHIBuffer& dst,
+                    std::uint64_t byteCount) override;
+    void TransitionBuffer(ixrhi::IXRHIBuffer& buffer,
+                          ixrhi::IXRHIBufferState from,
+                          ixrhi::IXRHIBufferState to) override;
 
     VkCommandBuffer Native() const { return m_cmd; }
 
@@ -61,6 +73,8 @@ private:
     VkCommandBuffer m_cmd = VK_NULL_HANDLE;
     VkCommandPool m_ownedPool = VK_NULL_HANDLE; // null when borrowed
     VkPipelineLayout m_lastLayout = VK_NULL_HANDLE; // stashed for PushConstants
+    VkShaderStageFlags m_lastPushStages = 0; // stashed push-constant stages
+    VkPipelineBindPoint m_lastBindPoint = VK_PIPELINE_BIND_POINT_GRAPHICS;
     bool m_recording = false;
 };
 

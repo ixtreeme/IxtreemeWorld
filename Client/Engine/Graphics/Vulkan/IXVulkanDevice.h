@@ -37,6 +37,7 @@
 #include <array>
 #include <chrono>
 #include <cstdint>
+#include <functional>
 #include <mutex>
 
 class VulkanDevice;
@@ -90,6 +91,7 @@ public:
     std::unique_ptr<ixrhi::IXRHIComputePipeline> CreateComputePipeline(
         const ixrhi::IXRHIComputePipelineDesc& desc) override;
     std::unique_ptr<ixrhi::IXRHICommandList> CreateCommandList() override;
+    void ExecuteAndWait(const std::function<void(ixrhi::IXRHICommandList&)>& record) override;
     std::unique_ptr<ixrhi::IXRHIFence> CreateFence(bool signaled) override;
     std::unique_ptr<ixrhi::IXRHISemaphore> CreateSemaphore() override;
     std::unique_ptr<ixrhi::IXRHIRenderTarget> CreateRenderTarget(

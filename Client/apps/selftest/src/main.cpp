@@ -983,8 +983,11 @@ bool RunRenderChecks(const Options& options, TestContext& ctx)
     std::stringstream staticMeshRendererText;
     staticMeshRendererText << staticMeshRenderer.rdbuf();
     const std::string staticMeshRendererSource = staticMeshRendererText.str();
+    // Phase 3D: the skinned reflection pipeline is IXRHI-native (zero Vk* in
+    // SkinnedMeshRenderer), so the front-cull expectation uses the generic
+    // spelling instead of the retired native enum.
     ctx.Expect(skinnedMeshRendererSource.find("CreateReflectionPipeline") != std::string::npos &&
-            skinnedMeshRendererSource.find("VK_CULL_MODE_FRONT_BIT") != std::string::npos &&
+            skinnedMeshRendererSource.find("IXRHICullMode::Front") != std::string::npos &&
             skinnedMeshRendererSource.find("RenderInWorldReflection") != std::string::npos,
         "skinnedMesh reflection pipeline source", "SkinnedMeshRenderer reflection pipeline entry points are missing");
 

@@ -54,10 +54,12 @@ VkPipelineLayout MakePipelineLayout(IXVulkanDevice& device,
 IXVulkanGraphicsPipeline::IXVulkanGraphicsPipeline(IXVulkanDevice& device,
                                                    VkPipeline pipeline,
                                                    VkPipelineLayout layout,
+                                                   VkShaderStageFlags pushStages,
                                                    std::string debugName)
     : m_device(&device)
     , m_pipeline(pipeline)
     , m_layout(layout)
+    , m_pushStages(pushStages)
     , m_debugName(std::move(debugName))
 {
 }
@@ -76,10 +78,12 @@ IXVulkanGraphicsPipeline::~IXVulkanGraphicsPipeline()
 IXVulkanComputePipeline::IXVulkanComputePipeline(IXVulkanDevice& device,
                                                  VkPipeline pipeline,
                                                  VkPipelineLayout layout,
+                                                 VkShaderStageFlags pushStages,
                                                  std::string debugName)
     : m_device(&device)
     , m_pipeline(pipeline)
     , m_layout(layout)
+    , m_pushStages(pushStages)
     , m_debugName(std::move(debugName))
 {
 }
@@ -227,7 +231,10 @@ std::unique_ptr<ixrhi::IXRHIGraphicsPipeline> IXVulkanDevice::CreateGraphicsPipe
     SetDebugName(VK_OBJECT_TYPE_PIPELINE,
         reinterpret_cast<std::uint64_t>(native),
         desc.debugName.c_str());
-    return std::make_unique<IXVulkanGraphicsPipeline>(*this, native, layout, desc.debugName);
+    VkShaderStageFlags pushStages = 0;
+    for (const ixrhi::IXRHIPushRange& range : desc.pushRanges)
+        pushStages |= ToVkShaderStages(range.stages);
+    return std::make_unique<IXVulkanGraphicsPipeline>(*this, native, layout, pushStages, desc.debugName);
 }
 
 std::unique_ptr<ixrhi::IXRHIComputePipeline> IXVulkanDevice::CreateComputePipeline(
@@ -260,7 +267,10 @@ std::unique_ptr<ixrhi::IXRHIComputePipeline> IXVulkanDevice::CreateComputePipeli
     SetDebugName(VK_OBJECT_TYPE_PIPELINE,
         reinterpret_cast<std::uint64_t>(native),
         desc.debugName.c_str());
-    return std::make_unique<IXVulkanComputePipeline>(*this, native, layout, desc.debugName);
+    VkShaderStageFlags pushStages = 0;
+    for (const ixrhi::IXRHIPushRange& range : desc.pushRanges)
+        pushStages |= ToVkShaderStages(range.stages);
+    return std::make_unique<IXVulkanComputePipeline>(*this, native, layout, pushStages, desc.debugName);
 }
 
 } // namespace ixvulkan

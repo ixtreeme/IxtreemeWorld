@@ -21,6 +21,22 @@ struct IXRHIBufferDesc
     std::string debugName;
 };
 
+// Generic buffer resource states for explicit barriers (Phase 3D, §20).
+// Engine-level names chosen to map naturally to both Vulkan pipeline
+// barriers and D3D12 resource barriers (see ixrhi-d3d12-readiness.md).
+// Only states an actual workload needs are listed — no wholesale enum clone.
+enum class IXRHIBufferState : std::uint8_t
+{
+    Undefined = 0,
+    ShaderRead,
+    ShaderWrite,
+    VertexRead,
+    IndexRead,
+    UniformRead,
+    TransferSrc,
+    TransferDst,
+};
+
 class IXRHIBuffer
 {
 public:
@@ -29,6 +45,10 @@ public:
     // Host write into a Write-visible buffer (map/memcpy/unmap inside backend;
     // coherent memory, no explicit flush needed by the caller).
     virtual void Write(std::uint64_t dstOffsetBytes, const void* src, std::size_t byteCount) = 0;
+
+    // Host read-back from a Write-visible buffer (staging/readback paths such
+    // as compute verification). Out-of-range reads are ignored.
+    virtual void Read(std::uint64_t srcOffsetBytes, void* dst, std::size_t byteCount) = 0;
 
     virtual std::uint64_t SizeBytes() const = 0;
     virtual IXRHIBufferUsage Usage() const = 0;

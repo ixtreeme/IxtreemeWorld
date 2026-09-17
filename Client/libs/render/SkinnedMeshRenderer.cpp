@@ -2,7 +2,7 @@
 
 #include "AssimpImporter.h"
 #include "Debug.h"
-#include "IXVulkanBridge.h" // NativePassOf: transition-only pass resolution
+#include "IXRHIShader.h"
 #include "math/IXMath.h"
 #include "asset/IAssetReader.h"
 
@@ -80,37 +80,10 @@ void LogFormat(const char* format, ...)
     Log(buffer);
 }
 
-unsigned long long HandleValue(VkPipeline handle)
+unsigned long long RhiObjectId(const void* object)
 {
-    return static_cast<unsigned long long>(reinterpret_cast<std::uintptr_t>(handle));
+    return static_cast<unsigned long long>(reinterpret_cast<std::uintptr_t>(object));
 }
-
-const char* VkResultName(VkResult result)
-{
-    switch (result)
-    {
-    case VK_SUCCESS: return "VK_SUCCESS";
-    case VK_ERROR_OUT_OF_HOST_MEMORY: return "VK_ERROR_OUT_OF_HOST_MEMORY";
-    case VK_ERROR_OUT_OF_DEVICE_MEMORY: return "VK_ERROR_OUT_OF_DEVICE_MEMORY";
-    case VK_ERROR_INITIALIZATION_FAILED: return "VK_ERROR_INITIALIZATION_FAILED";
-    case VK_ERROR_MEMORY_MAP_FAILED: return "VK_ERROR_MEMORY_MAP_FAILED";
-    default: return "UNKNOWN_VK_RESULT";
-    }
-}
-
-void CheckVk(VkResult result, const char* call, const char* file, int line)
-{
-    if (result == VK_SUCCESS)
-        return;
-
-    char buffer[512];
-    std::snprintf(buffer, sizeof(buffer), "%s:%d: Vulkan call failed: %s -> %s (%d)",
-        file, line, call, VkResultName(result), result);
-    Log(buffer);
-    std::abort();
-}
-
-#define VK_CHECK(call) CheckVk((call), #call, __FILE__, __LINE__)
 
 using Mat4 = ixtreeme::math::Mat4;
 
@@ -223,61 +196,30 @@ void FillWaterUniform(const WaterConfig& water, double timeSeconds, UniformBlock
     uniform.causticParams[3] = 0.0f;
 }
 
-#pragma pack(push, 1)
-struct DdsPixelFormat
-{
-    uint32_t size;
-    uint32_t flags;
-    uint32_t fourCC;
-    uint32_t rgbBitCount;
-    uint32_t rBitMask;
-    uint32_t gBitMask;
-    uint32_t bBitMask;
-    uint32_t aBitMask;
-};
-
-struct DdsHeader
-{
-    uint32_t size;
-    uint32_t flags;
-    uint32_t height;
-    uint32_t width;
-    uint32_t pitchOrLinearSize;
-    uint32_t depth;
-    uint32_t mipMapCount;
-    uint32_t reserved1[11];
-    DdsPixelFormat pixelFormat;
-    uint32_t caps;
-    uint32_t caps2;
-    uint32_t caps3;
-    uint32_t caps4;
-    uint32_t reserved2;
-};
-
-struct DdsHeaderDxt10
-{
-    uint32_t dxgiFormat;
-    uint32_t resourceDimension;
-    uint32_t miscFlag;
-    uint32_t arraySize;
-    uint32_t miscFlags2;
-};
-#pragma pack(pop)
-
 struct DdsImage
 {
+    // Decoded RGBA level-0 payload (all live producers are single-level RGBA;
+    // the old multi-mip/compressed DDS path had no callers and was removed).
     std::string filename;
     uint32_t width = 0;
     uint32_t height = 0;
-    uint32_t mipLevels = 0;
-    uint32_t blockBytes = 0;
-    uint32_t bytesPerPixel = 0;
-    bool compressed = false;
-    bool srgb = false;
-    VkFormat format = VK_FORMAT_UNDEFINED;
+    uint32_t mipLevels = 1;
+    ixrhi::IXRHIFormat format = ixrhi::IXRHIFormat::R8G8B8A8Unorm;
     std::vector<uint8_t> pixels;
-    std::vector<VkBufferImageCopy> regions;
 };
+
+const char* RhiFormatName(ixrhi::IXRHIFormat format)
+{
+    switch (format)
+    {
+    case ixrhi::IXRHIFormat::R8G8B8A8Unorm: return "R8G8B8A8_UNORM";
+    case ixrhi::IXRHIFormat::R8G8B8A8Srgb: return "R8G8B8A8_SRGB";
+    case ixrhi::IXRHIFormat::B8G8R8A8Unorm: return "B8G8R8A8_UNORM";
+    case ixrhi::IXRHIFormat::B8G8R8A8Srgb: return "B8G8R8A8_SRGB";
+    default: break;
+    }
+    return "UNDEFINED";
+}
 
 Mat4 Identity()
 {
@@ -327,225 +269,9 @@ const char* MotionStateName(SkinnedMeshRenderer::MotionState state)
     }
 }
 
-std::vector<char> ReadBinaryFile(client::asset::IAssetReader& assets, const std::string& path)
-{
-    auto bytes = assets.ReadAll(path);
-    if (!bytes)
-    {
-        std::string message = "Failed to open shader: " + path;
-        Log(message.c_str());
-        std::abort();
-    }
-
-    return std::vector<char>(bytes->begin(), bytes->end());
-}
-
-uint32_t MakeFourCC(char a, char b, char c, char d)
-{
-    return static_cast<uint32_t>(a) |
-        (static_cast<uint32_t>(b) << 8) |
-        (static_cast<uint32_t>(c) << 16) |
-        (static_cast<uint32_t>(d) << 24);
-}
-
-std::string FourCCString(uint32_t fourCC)
-{
-    char text[5]{};
-    text[0] = static_cast<char>(fourCC & 0xff);
-    text[1] = static_cast<char>((fourCC >> 8) & 0xff);
-    text[2] = static_cast<char>((fourCC >> 16) & 0xff);
-    text[3] = static_cast<char>((fourCC >> 24) & 0xff);
-    for (int i = 0; i < 4; ++i)
-    {
-        if (text[i] < 32 || text[i] > 126)
-            text[i] = '?';
-    }
-    return text;
-}
-
-const char* VkFormatName(VkFormat format)
-{
-    switch (format)
-    {
-    case VK_FORMAT_BC1_RGBA_SRGB_BLOCK: return "VK_FORMAT_BC1_RGBA_SRGB_BLOCK";
-    case VK_FORMAT_BC2_SRGB_BLOCK: return "VK_FORMAT_BC2_SRGB_BLOCK";
-    case VK_FORMAT_BC3_SRGB_BLOCK: return "VK_FORMAT_BC3_SRGB_BLOCK";
-    case VK_FORMAT_BC7_SRGB_BLOCK: return "VK_FORMAT_BC7_SRGB_BLOCK";
-    case VK_FORMAT_R8G8B8A8_UNORM: return "VK_FORMAT_R8G8B8A8_UNORM";
-    case VK_FORMAT_R8G8B8A8_SRGB: return "VK_FORMAT_R8G8B8A8_SRGB";
-    case VK_FORMAT_B8G8R8A8_SRGB: return "VK_FORMAT_B8G8R8A8_SRGB";
-    default: return "VK_FORMAT_UNDEFINED";
-    }
-}
-
-bool DxgiFormatToVk(uint32_t dxgiFormat, VkFormat& format, uint32_t& blockBytes, bool& compressed)
-{
-    compressed = true;
-    switch (dxgiFormat)
-    {
-    case 71: format = VK_FORMAT_BC1_RGBA_SRGB_BLOCK; blockBytes = 8; return true;
-    case 74: format = VK_FORMAT_BC2_SRGB_BLOCK; blockBytes = 16; return true;
-    case 77: format = VK_FORMAT_BC3_SRGB_BLOCK; blockBytes = 16; return true;
-    case 99: format = VK_FORMAT_BC7_SRGB_BLOCK; blockBytes = 16; return true;
-    default: return false;
-    }
-}
-
-bool LoadDdsImage(client::asset::IAssetReader& assets, const std::string& path, DdsImage& out)
-{
-    auto maybeBytes = assets.ReadAll(path);
-    if (!maybeBytes)
-    {
-        LogFormat("[DDS] failed to open %s", path.c_str());
-        return false;
-    }
-
-    std::vector<uint8_t> bytes = std::move(*maybeBytes);
-
-    if (bytes.size() < sizeof(uint32_t) + sizeof(DdsHeader))
-    {
-        LogFormat("[DDS] invalid file too small: %s", path.c_str());
-        return false;
-    }
-
-    const uint32_t magic = *reinterpret_cast<const uint32_t*>(bytes.data());
-    if (magic != MakeFourCC('D', 'D', 'S', ' '))
-    {
-        LogFormat("[DDS] invalid magic: %s", path.c_str());
-        return false;
-    }
-
-    const DdsHeader* header = reinterpret_cast<const DdsHeader*>(bytes.data() + sizeof(uint32_t));
-    if (header->size != 124 || header->pixelFormat.size != 32)
-    {
-        LogFormat("[DDS] invalid header sizes: %s", path.c_str());
-        return false;
-    }
-
-    size_t dataOffset = sizeof(uint32_t) + sizeof(DdsHeader);
-    const uint32_t ddpfFourCC = 0x00000004;
-    const uint32_t ddpfRGB = 0x00000040;
-    const uint32_t ddpfAlphaPixels = 0x00000001;
-    std::string fourCC = "----";
-
-    out = {};
-    out.filename = path.substr(path.find_last_of("\\/") + 1);
-    out.width = header->width;
-    out.height = header->height;
-    out.mipLevels = std::max<uint32_t>(1, header->mipMapCount);
-    out.srgb = true;
-
-    if (header->pixelFormat.flags & ddpfFourCC)
-    {
-        fourCC = FourCCString(header->pixelFormat.fourCC);
-        if (header->pixelFormat.fourCC == MakeFourCC('D', 'X', 'T', '1'))
-        {
-            out.format = VK_FORMAT_BC1_RGBA_SRGB_BLOCK;
-            out.blockBytes = 8;
-            out.compressed = true;
-        }
-        else if (header->pixelFormat.fourCC == MakeFourCC('D', 'X', 'T', '3'))
-        {
-            out.format = VK_FORMAT_BC2_SRGB_BLOCK;
-            out.blockBytes = 16;
-            out.compressed = true;
-        }
-        else if (header->pixelFormat.fourCC == MakeFourCC('D', 'X', 'T', '5'))
-        {
-            out.format = VK_FORMAT_BC3_SRGB_BLOCK;
-            out.blockBytes = 16;
-            out.compressed = true;
-        }
-        else if (header->pixelFormat.fourCC == MakeFourCC('D', 'X', '1', '0'))
-        {
-            if (bytes.size() < dataOffset + sizeof(DdsHeaderDxt10))
-            {
-                LogFormat("[DDS] missing DX10 header: %s", path.c_str());
-                return false;
-            }
-            const DdsHeaderDxt10* dxt10 = reinterpret_cast<const DdsHeaderDxt10*>(bytes.data() + dataOffset);
-            dataOffset += sizeof(DdsHeaderDxt10);
-            if (!DxgiFormatToVk(dxt10->dxgiFormat, out.format, out.blockBytes, out.compressed))
-            {
-                LogFormat("[DDS] unsupported DXGI format %u in %s", dxt10->dxgiFormat, path.c_str());
-                return false;
-            }
-        }
-        else
-        {
-            LogFormat("[DDS] unsupported fourCC '%s' in %s", fourCC.c_str(), path.c_str());
-            return false;
-        }
-    }
-    else if ((header->pixelFormat.flags & ddpfRGB) && header->pixelFormat.rgbBitCount == 32)
-    {
-        out.compressed = false;
-        out.bytesPerPixel = 4;
-        const bool hasAlpha = (header->pixelFormat.flags & ddpfAlphaPixels) != 0;
-        (void)hasAlpha;
-        if (header->pixelFormat.rBitMask == 0x00ff0000 &&
-            header->pixelFormat.gBitMask == 0x0000ff00 &&
-            header->pixelFormat.bBitMask == 0x000000ff)
-        {
-            out.format = VK_FORMAT_B8G8R8A8_SRGB;
-        }
-        else
-        {
-            out.format = VK_FORMAT_R8G8B8A8_SRGB;
-        }
-    }
-    else
-    {
-        LogFormat("[DDS] unsupported pixel format flags=0x%08x bpp=%u in %s",
-            header->pixelFormat.flags, header->pixelFormat.rgbBitCount, path.c_str());
-        return false;
-    }
-
-    size_t offset = dataOffset;
-    out.regions.clear();
-    for (uint32_t mip = 0; mip < out.mipLevels; ++mip)
-    {
-        const uint32_t mipWidth = std::max(1u, out.width >> mip);
-        const uint32_t mipHeight = std::max(1u, out.height >> mip);
-        size_t mipSize = 0;
-        if (out.compressed)
-        {
-            const uint32_t blocksWide = std::max(1u, (mipWidth + 3u) / 4u);
-            const uint32_t blocksHigh = std::max(1u, (mipHeight + 3u) / 4u);
-            mipSize = static_cast<size_t>(blocksWide) * blocksHigh * out.blockBytes;
-        }
-        else
-        {
-            mipSize = static_cast<size_t>(mipWidth) * mipHeight * out.bytesPerPixel;
-        }
-
-        if (offset + mipSize > bytes.size())
-        {
-            LogFormat("[DDS] mip data truncated in %s at mip=%u", path.c_str(), mip);
-            return false;
-        }
-
-        VkBufferImageCopy region{};
-        region.bufferOffset = static_cast<VkDeviceSize>(out.pixels.size());
-        region.imageSubresource.aspectMask = VK_IMAGE_ASPECT_COLOR_BIT;
-        region.imageSubresource.mipLevel = mip;
-        region.imageSubresource.baseArrayLayer = 0;
-        region.imageSubresource.layerCount = 1;
-        region.imageExtent = {mipWidth, mipHeight, 1};
-        out.regions.push_back(region);
-        out.pixels.insert(out.pixels.end(), bytes.begin() + offset, bytes.begin() + offset + mipSize);
-        offset += mipSize;
-    }
-
-    LogFormat("[DDS] %s: %ux%u mips=%u fourCC='%s' vkFormat=%s sRGB=yes",
-        out.filename.c_str(),
-        out.width,
-        out.height,
-        out.mipLevels,
-        fourCC.c_str(),
-        VkFormatName(out.format));
-    return true;
-}
+// NOTE (Phase 3D): the dead multi-mip/compressed DDS loader (format-name
+// helpers, LoadDdsImage, ReadBinaryFile) was deleted - it had no callers. All live texture producers yield
+// single-level RGBA via CreateRgbaImage/CreateFallbackWhiteDdsImage.
 
 DdsImage CreateFallbackWhiteDdsImage(const std::string& sourcePath)
 {
@@ -557,20 +283,8 @@ DdsImage CreateFallbackWhiteDdsImage(const std::string& sourcePath)
     out.width = 4;
     out.height = 4;
     out.mipLevels = 1;
-    out.bytesPerPixel = 4;
-    out.compressed = false;
-    out.srgb = false;
-    out.format = VK_FORMAT_R8G8B8A8_UNORM;
-    out.pixels.assign(static_cast<size_t>(out.width) * out.height * out.bytesPerPixel, 0xff);
-
-    VkBufferImageCopy region{};
-    region.bufferOffset = 0;
-    region.imageSubresource.aspectMask = VK_IMAGE_ASPECT_COLOR_BIT;
-    region.imageSubresource.mipLevel = 0;
-    region.imageSubresource.baseArrayLayer = 0;
-    region.imageSubresource.layerCount = 1;
-    region.imageExtent = {out.width, out.height, 1};
-    out.regions.push_back(region);
+    out.format = ixrhi::IXRHIFormat::R8G8B8A8Unorm;
+    out.pixels.assign(static_cast<size_t>(out.width) * out.height * 4u, 0xff);
     return out;
 }
 
@@ -639,20 +353,8 @@ DdsImage CreateRgbaImage(std::string name, uint32_t width, uint32_t height, std:
     out.width = width;
     out.height = height;
     out.mipLevels = 1;
-    out.bytesPerPixel = 4;
-    out.compressed = false;
-    out.srgb = true;
-    out.format = VK_FORMAT_R8G8B8A8_SRGB;
+    out.format = ixrhi::IXRHIFormat::R8G8B8A8Srgb;
     out.pixels = std::move(pixels);
-
-    VkBufferImageCopy region{};
-    region.bufferOffset = 0;
-    region.imageSubresource.aspectMask = VK_IMAGE_ASPECT_COLOR_BIT;
-    region.imageSubresource.mipLevel = 0;
-    region.imageSubresource.baseArrayLayer = 0;
-    region.imageSubresource.layerCount = 1;
-    region.imageExtent = {width, height, 1};
-    out.regions.push_back(region);
     return out;
 }
 
@@ -756,221 +458,76 @@ bool LoadRgbaTextureFile(const std::filesystem::path& path, DdsImage& out)
     return true;
 }
 
-VkShaderModule CreateShaderModule(VkDevice device, client::asset::IAssetReader& assets,
-    const std::string& path)
+std::vector<std::uint32_t> ReadSpirv(client::asset::IAssetReader& assets, const std::string& path)
 {
-    const std::vector<char> code = ReadBinaryFile(assets, path);
-    VkShaderModuleCreateInfo create{};
-    create.sType = VK_STRUCTURE_TYPE_SHADER_MODULE_CREATE_INFO;
-    create.codeSize = code.size();
-    create.pCode = reinterpret_cast<const uint32_t*>(code.data());
-
-    VkShaderModule module = VK_NULL_HANDLE;
-    VK_CHECK(vkCreateShaderModule(device, &create, nullptr, &module));
-    return module;
-}
-
-VkCommandBuffer BeginOneTimeCommands(VkDevice vkDevice, uint32_t queueFamily, VkCommandPool& pool);
-void EndOneTimeCommands(VkDevice vkDevice, VkQueue queue, VkCommandPool pool, VkCommandBuffer cmd);
-
-bool CreateHostVisibleBuffer(VulkanDevice& device, VkDevice vkDevice, VkDeviceSize size,
-    VkBufferUsageFlags usage, const void* initialData, SkinnedMeshRenderer::Buffer& out)
-{
-    VkBufferCreateInfo buffer{};
-    buffer.sType = VK_STRUCTURE_TYPE_BUFFER_CREATE_INFO;
-    buffer.size = size;
-    buffer.usage = usage;
-    buffer.sharingMode = VK_SHARING_MODE_EXCLUSIVE;
-    VK_CHECK(vkCreateBuffer(vkDevice, &buffer, nullptr, &out.buffer));
-
-    VkMemoryRequirements req{};
-    vkGetBufferMemoryRequirements(vkDevice, out.buffer, &req);
-
-    VkMemoryAllocateInfo alloc{};
-    alloc.sType = VK_STRUCTURE_TYPE_MEMORY_ALLOCATE_INFO;
-    alloc.allocationSize = req.size;
-    alloc.memoryTypeIndex = device.FindMemoryType(req.memoryTypeBits,
-        VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT | VK_MEMORY_PROPERTY_HOST_COHERENT_BIT);
-    VK_CHECK(vkAllocateMemory(vkDevice, &alloc, nullptr, &out.memory));
-    VK_CHECK(vkBindBufferMemory(vkDevice, out.buffer, out.memory, 0));
-
-    if (initialData)
+    auto bytes = assets.ReadAll(path);
+    if (!bytes || bytes->empty() || bytes->size() % sizeof(std::uint32_t) != 0)
     {
-        void* mapped = nullptr;
-        VK_CHECK(vkMapMemory(vkDevice, out.memory, 0, size, 0, &mapped));
-        std::memcpy(mapped, initialData, static_cast<size_t>(size));
-        vkUnmapMemory(vkDevice, out.memory);
+        LogFormat("[MESH] failed to open shader: %s", path.c_str());
+        std::abort();
     }
-
-    return true;
+    const auto* words = reinterpret_cast<const std::uint32_t*>(bytes->data());
+    return std::vector<std::uint32_t>(words, words + bytes->size() / sizeof(std::uint32_t));
 }
 
-void CopyBuffer(VkCommandBuffer cmd, VkBuffer src, VkBuffer dst, VkDeviceSize size)
+std::shared_ptr<ixrhi::IXRHIShader> LoadShader(ixrhi::IXRHIDevice& rhi,
+                                               client::asset::IAssetReader& assets,
+                                               const std::string& path,
+                                               ixrhi::IXRHIShaderStage stage,
+                                               const char* entry)
 {
-    VkBufferCopy copy{};
-    copy.size = size;
-    vkCmdCopyBuffer(cmd, src, dst, 1, &copy);
+    ixrhi::IXRHIShaderDesc desc;
+    desc.stage = stage;
+    desc.entryPoint = entry;
+    desc.spirv = ReadSpirv(assets, path);
+    desc.debugName = path;
+    return rhi.CreateShader(desc);
 }
 
-bool CreateDeviceLocalBuffer(VulkanDevice& device, VkDevice vkDevice, VkQueue queue, VkDeviceSize size,
-    VkBufferUsageFlags usage, const void* initialData, SkinnedMeshRenderer::Buffer& out)
+std::shared_ptr<ixrhi::IXRHIBuffer> CreateRhiBuffer(ixrhi::IXRHIDevice& rhi,
+                                                    std::uint64_t sizeBytes,
+                                                    ixrhi::IXRHIBufferUsage usage,
+                                                    ixrhi::IXRHICpuAccess cpuAccess,
+                                                    const void* initialData,
+                                                    const char* debugName)
 {
-    VkBufferCreateInfo buffer{};
-    buffer.sType = VK_STRUCTURE_TYPE_BUFFER_CREATE_INFO;
-    buffer.size = size;
-    buffer.usage = usage | VK_BUFFER_USAGE_TRANSFER_DST_BIT;
-    buffer.sharingMode = VK_SHARING_MODE_EXCLUSIVE;
-    VK_CHECK(vkCreateBuffer(vkDevice, &buffer, nullptr, &out.buffer));
-
-    VkMemoryRequirements req{};
-    vkGetBufferMemoryRequirements(vkDevice, out.buffer, &req);
-
-    VkMemoryAllocateInfo alloc{};
-    alloc.sType = VK_STRUCTURE_TYPE_MEMORY_ALLOCATE_INFO;
-    alloc.allocationSize = req.size;
-    alloc.memoryTypeIndex = device.FindMemoryType(req.memoryTypeBits, VK_MEMORY_PROPERTY_DEVICE_LOCAL_BIT);
-    VK_CHECK(vkAllocateMemory(vkDevice, &alloc, nullptr, &out.memory));
-    VK_CHECK(vkBindBufferMemory(vkDevice, out.buffer, out.memory, 0));
-
-    if (initialData && size > 0)
-    {
-        SkinnedMeshRenderer::Buffer staging{};
-        CreateHostVisibleBuffer(device, vkDevice, size, VK_BUFFER_USAGE_TRANSFER_SRC_BIT, initialData, staging);
-
-        VkCommandPool uploadPool = VK_NULL_HANDLE;
-        VkCommandBuffer cmd = BeginOneTimeCommands(vkDevice, device.GetGraphicsQueueFamily(), uploadPool);
-        CopyBuffer(cmd, staging.buffer, out.buffer, size);
-        EndOneTimeCommands(vkDevice, queue, uploadPool, cmd);
-        if (staging.buffer)
-            vkDestroyBuffer(vkDevice, staging.buffer, nullptr);
-        if (staging.memory)
-            vkFreeMemory(vkDevice, staging.memory, nullptr);
-    }
-
-    return true;
+    ixrhi::IXRHIBufferDesc desc;
+    desc.sizeBytes = sizeBytes;
+    desc.usage = usage;
+    desc.cpuAccess = cpuAccess;
+    desc.debugName = debugName ? debugName : "";
+    const std::size_t bytes = static_cast<std::size_t>(sizeBytes);
+    return rhi.CreateBuffer(desc, initialData, initialData != nullptr ? bytes : 0);
 }
 
-bool CreateDeviceLocalImage(VulkanDevice& device, VkDevice vkDevice, uint32_t width, uint32_t height,
-    uint32_t mipLevels, VkFormat format, VkImage& image, VkDeviceMemory& memory)
+struct PreviewRectResult
 {
-    VkImageCreateInfo create{};
-    create.sType = VK_STRUCTURE_TYPE_IMAGE_CREATE_INFO;
-    create.imageType = VK_IMAGE_TYPE_2D;
-    create.format = format;
-    create.extent = {width, height, 1};
-    create.mipLevels = mipLevels;
-    create.arrayLayers = 1;
-    create.samples = VK_SAMPLE_COUNT_1_BIT;
-    create.tiling = VK_IMAGE_TILING_OPTIMAL;
-    create.usage = VK_IMAGE_USAGE_TRANSFER_DST_BIT | VK_IMAGE_USAGE_SAMPLED_BIT;
-    create.sharingMode = VK_SHARING_MODE_EXCLUSIVE;
-    create.initialLayout = VK_IMAGE_LAYOUT_UNDEFINED;
-    VK_CHECK(vkCreateImage(vkDevice, &create, nullptr, &image));
+    int32_t x = 0;
+    int32_t y = 0;
+    uint32_t width = 0;
+    uint32_t height = 0;
+};
 
-    VkMemoryRequirements req{};
-    vkGetImageMemoryRequirements(vkDevice, image, &req);
-
-    VkMemoryAllocateInfo alloc{};
-    alloc.sType = VK_STRUCTURE_TYPE_MEMORY_ALLOCATE_INFO;
-    alloc.allocationSize = req.size;
-    alloc.memoryTypeIndex = device.FindMemoryType(req.memoryTypeBits, VK_MEMORY_PROPERTY_DEVICE_LOCAL_BIT);
-    VK_CHECK(vkAllocateMemory(vkDevice, &alloc, nullptr, &memory));
-    VK_CHECK(vkBindImageMemory(vkDevice, image, memory, 0));
-    return true;
-}
-
-VkCommandBuffer BeginOneTimeCommands(VkDevice vkDevice, uint32_t queueFamily, VkCommandPool& pool)
-{
-    VkCommandPoolCreateInfo poolInfo{};
-    poolInfo.sType = VK_STRUCTURE_TYPE_COMMAND_POOL_CREATE_INFO;
-    poolInfo.flags = VK_COMMAND_POOL_CREATE_TRANSIENT_BIT;
-    poolInfo.queueFamilyIndex = queueFamily;
-    VK_CHECK(vkCreateCommandPool(vkDevice, &poolInfo, nullptr, &pool));
-
-    VkCommandBufferAllocateInfo alloc{};
-    alloc.sType = VK_STRUCTURE_TYPE_COMMAND_BUFFER_ALLOCATE_INFO;
-    alloc.commandPool = pool;
-    alloc.level = VK_COMMAND_BUFFER_LEVEL_PRIMARY;
-    alloc.commandBufferCount = 1;
-
-    VkCommandBuffer cmd = VK_NULL_HANDLE;
-    VK_CHECK(vkAllocateCommandBuffers(vkDevice, &alloc, &cmd));
-
-    VkCommandBufferBeginInfo begin{};
-    begin.sType = VK_STRUCTURE_TYPE_COMMAND_BUFFER_BEGIN_INFO;
-    begin.flags = VK_COMMAND_BUFFER_USAGE_ONE_TIME_SUBMIT_BIT;
-    VK_CHECK(vkBeginCommandBuffer(cmd, &begin));
-    return cmd;
-}
-
-void EndOneTimeCommands(VkDevice vkDevice, VkQueue queue, VkCommandPool pool, VkCommandBuffer cmd)
-{
-    VK_CHECK(vkEndCommandBuffer(cmd));
-
-    VkSubmitInfo submit{};
-    submit.sType = VK_STRUCTURE_TYPE_SUBMIT_INFO;
-    submit.commandBufferCount = 1;
-    submit.pCommandBuffers = &cmd;
-    VK_CHECK(vkQueueSubmit(queue, 1, &submit, VK_NULL_HANDLE));
-    VK_CHECK(vkQueueWaitIdle(queue));
-    vkDestroyCommandPool(vkDevice, pool, nullptr);
-}
-
-void TransitionImageLayout(VkCommandBuffer cmd, VkImage image, uint32_t mipLevels,
-    VkImageLayout oldLayout, VkImageLayout newLayout)
-{
-    VkImageMemoryBarrier barrier{};
-    barrier.sType = VK_STRUCTURE_TYPE_IMAGE_MEMORY_BARRIER;
-    barrier.oldLayout = oldLayout;
-    barrier.newLayout = newLayout;
-    barrier.srcQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;
-    barrier.dstQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;
-    barrier.image = image;
-    barrier.subresourceRange.aspectMask = VK_IMAGE_ASPECT_COLOR_BIT;
-    barrier.subresourceRange.baseMipLevel = 0;
-    barrier.subresourceRange.levelCount = mipLevels;
-    barrier.subresourceRange.baseArrayLayer = 0;
-    barrier.subresourceRange.layerCount = 1;
-
-    VkPipelineStageFlags srcStage = VK_PIPELINE_STAGE_TOP_OF_PIPE_BIT;
-    VkPipelineStageFlags dstStage = VK_PIPELINE_STAGE_TRANSFER_BIT;
-    if (oldLayout == VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL &&
-        newLayout == VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL)
-    {
-        barrier.srcAccessMask = VK_ACCESS_TRANSFER_WRITE_BIT;
-        barrier.dstAccessMask = VK_ACCESS_SHADER_READ_BIT;
-        srcStage = VK_PIPELINE_STAGE_TRANSFER_BIT;
-        dstStage = VK_PIPELINE_STAGE_FRAGMENT_SHADER_BIT;
-    }
-    else
-    {
-        barrier.srcAccessMask = 0;
-        barrier.dstAccessMask = VK_ACCESS_TRANSFER_WRITE_BIT;
-    }
-
-    vkCmdPipelineBarrier(cmd, srcStage, dstStage, 0, 0, nullptr, 0, nullptr, 1, &barrier);
-}
-
-VkRect2D PreviewRect(VkExtent2D extent)
+PreviewRectResult PreviewRect(uint32_t extentWidth, uint32_t extentHeight)
 {
     // TODO: derive this from the RmlUi lobby preview-frame bounds instead of mirroring the current fixed layout.
     const int32_t cardWidth = 940;
     const int32_t cardHeight = 492;
-    const int32_t cardX = std::max<int32_t>(0, (static_cast<int32_t>(extent.width) - cardWidth) / 2);
-    const int32_t cardY = std::max<int32_t>(0, (static_cast<int32_t>(extent.height) - cardHeight) / 2);
+    const int32_t cardX = std::max<int32_t>(0, (static_cast<int32_t>(extentWidth) - cardWidth) / 2);
+    const int32_t cardY = std::max<int32_t>(0, (static_cast<int32_t>(extentHeight) - cardHeight) / 2);
 
-    VkRect2D rect{};
-    rect.offset.x = cardX + 46;
-    rect.offset.y = cardY + 96;
-    rect.extent.width = 224;
-    rect.extent.height = 324;
+    PreviewRectResult rect{};
+    rect.x = cardX + 46;
+    rect.y = cardY + 96;
+    rect.width = 224;
+    rect.height = 324;
 
-    if (rect.offset.x < 0) rect.offset.x = 0;
-    if (rect.offset.y < 0) rect.offset.y = 0;
-    if (rect.offset.x + static_cast<int32_t>(rect.extent.width) > static_cast<int32_t>(extent.width))
-        rect.extent.width = extent.width - rect.offset.x;
-    if (rect.offset.y + static_cast<int32_t>(rect.extent.height) > static_cast<int32_t>(extent.height))
-        rect.extent.height = extent.height - rect.offset.y;
+    if (rect.x < 0) rect.x = 0;
+    if (rect.y < 0) rect.y = 0;
+    if (rect.x + static_cast<int32_t>(rect.width) > static_cast<int32_t>(extentWidth))
+        rect.width = extentWidth - rect.x;
+    if (rect.y + static_cast<int32_t>(rect.height) > static_cast<int32_t>(extentHeight))
+        rect.height = extentHeight - rect.y;
     return rect;
 }
 
@@ -1113,11 +670,12 @@ SkinnedMeshRenderer::~SkinnedMeshRenderer()
     Destroy();
 }
 
-bool SkinnedMeshRenderer::Create(VulkanDevice& device, client::asset::IAssetReader& assets,
+bool SkinnedMeshRenderer::Create(ixrhi::IXRHIDevice& rhi,
+    client::asset::IAssetReader& assets,
     const std::string& modelPath)
 {
     Destroy();
-    m_device = device.GetDevice();
+    m_rhi = &rhi;
     m_assets = &assets;
 
     std::string ext = std::filesystem::path(modelPath).extension().string();
@@ -1125,11 +683,11 @@ bool SkinnedMeshRenderer::Create(VulkanDevice& device, client::asset::IAssetRead
         return static_cast<char>(std::tolower(c));
     });
     const bool loaded = ext == ".fbx" ? LoadFbxMesh(modelPath) : LoadGltfMesh(modelPath);
-    const bool buffers = loaded ? CreateBuffers(device) : false;
-    const bool compute = buffers ? CreateComputeResources(device) : false;
-    const bool textures = compute ? CreateTextures(device, modelPath) : false;
-    const bool descriptors = textures ? CreateDescriptors() : false;
-    const bool pipeline = descriptors ? CreatePipeline(device) : false;
+    const bool buffers = loaded ? CreateBuffers(rhi) : false;
+    const bool compute = buffers ? CreateComputeResources(rhi) : false;
+    const bool textures = compute ? CreateTextures(rhi, modelPath) : false;
+    const bool descriptors = textures ? CreateBindGroup(rhi) : false;
+    const bool pipeline = descriptors ? CreatePipeline(rhi) : false;
 
     LogFormat("[MESH] Create: loaded=%d buffers=%d compute=%d textures=%d descriptors=%d pipeline=%d",
         loaded ? 1 : 0,
@@ -1140,7 +698,7 @@ bool SkinnedMeshRenderer::Create(VulkanDevice& device, client::asset::IAssetRead
         pipeline ? 1 : 0);
     if (loaded && buffers && compute && textures && descriptors && pipeline)
     {
-        LogFormat("[MESH] Create OK, pipeline=0x%llx", HandleValue(m_pipeline));
+        LogFormat("[MESH] Create OK, pipeline=%s", m_pipeline->DebugName().c_str());
         return true;
     }
 
@@ -1148,36 +706,38 @@ bool SkinnedMeshRenderer::Create(VulkanDevice& device, client::asset::IAssetRead
     return false;
 }
 
-bool SkinnedMeshRenderer::RecreatePipeline(VulkanDevice& device)
+bool SkinnedMeshRenderer::RecreatePipeline(ixrhi::IXRHIDevice& rhi)
 {
-    if (!m_device)
+    if (!m_rhi)
         return true;
 
+    m_rhi = &rhi;
     DestroyPipeline();
-    if ((m_mainRenderPass ? m_mainRenderPass : device.GetRenderPass()) == VK_NULL_HANDLE)
-        return true;
-
-    return CreatePipeline(device);
+    // Deferred-true while the target pass is torn down (parity); real failures
+    // abort in the backend like the pre-migration checked native path.
+    CreatePipeline(rhi);
+    return true;
 }
 
-void SkinnedMeshRenderer::SetTargetPass(const ixrhi::IXRHIRenderPass* pass)
+void SkinnedMeshRenderer::Skin(ixrhi::IXRHICommandList& cmd,
+                               const ixrhi::IXRHIFrameInfo& frame,
+                               double timeSeconds)
 {
-    m_mainRenderPass = (pass != nullptr) ? ixvulkan::NativePassOf(*pass) : VK_NULL_HANDLE;
+    SkinInstance(cmd, frame, 0, m_motionState, static_cast<float>(timeSeconds));
 }
 
-void SkinnedMeshRenderer::Skin(VulkanDevice& device, double timeSeconds)
+void SkinnedMeshRenderer::SkinInstance(ixrhi::IXRHICommandList& cmd,
+                                       const ixrhi::IXRHIFrameInfo& frame,
+                                       uint32_t skinSlot,
+                                       MotionState state,
+                                       float animTimeSeconds)
 {
-    SkinInstance(device, 0, m_motionState, static_cast<float>(timeSeconds));
-}
-
-void SkinnedMeshRenderer::SkinInstance(VulkanDevice& device, uint32_t skinSlot, MotionState state, float animTimeSeconds)
-{
-    if (!m_computePipeline || !device.IsFrameActive())
+    if (!m_computePipeline || !frame.frameActive)
         return;
     if (skinSlot >= kSkinSlots)
         return;
 
-    const uint32_t frameIndex = device.GetFrameIndex();
+    const uint32_t frameIndex = frame.frameIndex % kFramesInFlight;
 
     const auto recordStart = std::chrono::high_resolution_clock::now();
     if (!UploadBonePalette(state, animTimeSeconds, frameIndex, skinSlot))
@@ -1186,25 +746,12 @@ void SkinnedMeshRenderer::SkinInstance(VulkanDevice& device, uint32_t skinSlot, 
         return;
     }
 
-    VkCommandBuffer cmd = device.GetCommandBuffer();
     DispatchSkin(cmd, frameIndex, skinSlot);
-
-    VkBufferMemoryBarrier computeToVertex{};
-    computeToVertex.sType = VK_STRUCTURE_TYPE_BUFFER_MEMORY_BARRIER;
-    computeToVertex.srcAccessMask = VK_ACCESS_SHADER_WRITE_BIT;
-    computeToVertex.dstAccessMask = VK_ACCESS_VERTEX_ATTRIBUTE_READ_BIT;
-    computeToVertex.srcQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;
-    computeToVertex.dstQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;
-    computeToVertex.buffer = m_skinnedOutputBuffers[frameIndex][skinSlot].buffer;
-    computeToVertex.offset = 0;
-    computeToVertex.size = sizeof(Vertex) * m_vertices.size();
-    vkCmdPipelineBarrier(cmd,
-        VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT,
-        VK_PIPELINE_STAGE_VERTEX_INPUT_BIT,
-        0, 0, nullptr, 1, &computeToVertex, 0, nullptr);
+    EmitSkinBarrier(cmd, frameIndex, skinSlot);
 
     const auto recordEnd = std::chrono::high_resolution_clock::now();
     const double recordMs = std::chrono::duration<double, std::milli>(recordEnd - recordStart).count();
+    (void)recordMs;
    //if (timeSeconds - m_lastAnimationLogTime >= 1.0)
    //{
    //    LogFormat("[ANIM] gpu-skin animTime=%.2f/%.2f dispatchMs=%.3f",
@@ -1215,16 +762,18 @@ void SkinnedMeshRenderer::SkinInstance(VulkanDevice& device, uint32_t skinSlot, 
    //}
 }
 
-void SkinnedMeshRenderer::SkinInstanceFromPose(VulkanDevice& device, uint32_t skinSlot,
-    ozz::span<const ozz::math::SoaTransform> localPose)
+void SkinnedMeshRenderer::SkinInstanceFromPose(ixrhi::IXRHICommandList& cmd,
+                                               const ixrhi::IXRHIFrameInfo& frame,
+                                               uint32_t skinSlot,
+                                               ozz::span<const ozz::math::SoaTransform> localPose)
 {
-    if (!m_computePipeline || !device.IsFrameActive())
+    if (!m_computePipeline || !frame.frameActive)
         return;
     if (skinSlot >= kSkinSlots)
         return;
 
-    const uint32_t frameIndex = device.GetFrameIndex();
-    if (frameIndex >= kFramesInFlight || !m_bonePaletteBuffers[frameIndex][skinSlot].memory ||
+    const uint32_t frameIndex = frame.frameIndex % kFramesInFlight;
+    if (frameIndex >= kFramesInFlight || !m_bonePaletteBuffers[frameIndex][skinSlot] ||
         !m_ozz || m_bonePaletteCpu.empty())
     {
         return;
@@ -1241,22 +790,8 @@ void SkinnedMeshRenderer::SkinInstanceFromPose(VulkanDevice& device, uint32_t sk
     if (!UploadPaletteToBuffer(frameIndex, skinSlot))
         return;
 
-    VkCommandBuffer cmd = device.GetCommandBuffer();
     DispatchSkin(cmd, frameIndex, skinSlot);
-
-    VkBufferMemoryBarrier computeToVertex{};
-    computeToVertex.sType = VK_STRUCTURE_TYPE_BUFFER_MEMORY_BARRIER;
-    computeToVertex.srcAccessMask = VK_ACCESS_SHADER_WRITE_BIT;
-    computeToVertex.dstAccessMask = VK_ACCESS_VERTEX_ATTRIBUTE_READ_BIT;
-    computeToVertex.srcQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;
-    computeToVertex.dstQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;
-    computeToVertex.buffer = m_skinnedOutputBuffers[frameIndex][skinSlot].buffer;
-    computeToVertex.offset = 0;
-    computeToVertex.size = sizeof(Vertex) * m_vertices.size();
-    vkCmdPipelineBarrier(cmd,
-        VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT,
-        VK_PIPELINE_STAGE_VERTEX_INPUT_BIT,
-        0, 0, nullptr, 1, &computeToVertex, 0, nullptr);
+    EmitSkinBarrier(cmd, frameIndex, skinSlot);
 }
 
 const ozz::animation::Skeleton* SkinnedMeshRenderer::Skeleton() const
@@ -1293,7 +828,9 @@ std::vector<std::string> SkinnedMeshRenderer::JointNames() const
     return names;
 }
 
-void SkinnedMeshRenderer::Render(VulkanDevice& device, double timeSeconds)
+void SkinnedMeshRenderer::Render(ixrhi::IXRHICommandList& cmd,
+    const ixrhi::IXRHIFrameInfo& frame,
+    double timeSeconds)
 {
     static bool loggedNoPipeline = false;
     static bool loggedFrameInactive = false;
@@ -1301,7 +838,7 @@ void SkinnedMeshRenderer::Render(VulkanDevice& device, double timeSeconds)
     static bool loggedRectZero = false;
     static bool loggedDraw = false;
 
-    if (!m_pipeline || m_indexCount == 0)
+    if (!m_pipeline || !m_bindGroup || !m_indexBuffer || m_indexCount == 0)
     {
         if (!loggedNoPipeline)
         {
@@ -1311,7 +848,7 @@ void SkinnedMeshRenderer::Render(VulkanDevice& device, double timeSeconds)
         return;
     }
 
-    if (!device.IsFrameActive())
+    if (!frame.frameActive || frame.commandList == nullptr)
     {
         if (!loggedFrameInactive)
         {
@@ -1321,8 +858,9 @@ void SkinnedMeshRenderer::Render(VulkanDevice& device, double timeSeconds)
         return;
     }
 
-    const VkExtent2D extent = device.GetSwapchainExtent();
-    if (extent.width == 0 || extent.height == 0)
+    const std::uint32_t extentWidth = frame.targetWidth;
+    const std::uint32_t extentHeight = frame.targetHeight;
+    if (extentWidth == 0 || extentHeight == 0)
     {
         if (!loggedExtentZero)
         {
@@ -1332,12 +870,12 @@ void SkinnedMeshRenderer::Render(VulkanDevice& device, double timeSeconds)
         return;
     }
 
-    const VkRect2D rect = PreviewRect(extent);
-    if (rect.extent.width == 0 || rect.extent.height == 0)
+    const PreviewRectResult rect = PreviewRect(extentWidth, extentHeight);
+    if (rect.width == 0 || rect.height == 0)
     {
         if (!loggedRectZero)
         {
-            LogFormat("[MESH] Render skip: preview rect 0 (extent=%ux%u)", extent.width, extent.height);
+            LogFormat("[MESH] Render skip: preview rect 0 (extent=%ux%u)", extentWidth, extentHeight);
             loggedRectZero = true;
         }
         return;
@@ -1346,54 +884,43 @@ void SkinnedMeshRenderer::Render(VulkanDevice& device, double timeSeconds)
     if (!loggedDraw)
     {
         LogFormat("[MESH] Render: drawing skinnedMesh in rect x=%d y=%d w=%u h=%u (swapchain %ux%u)",
-            rect.offset.x,
-            rect.offset.y,
-            rect.extent.width,
-            rect.extent.height,
-            extent.width,
-            extent.height);
+            rect.x,
+            rect.y,
+            rect.width,
+            rect.height,
+            extentWidth,
+            extentHeight);
         loggedDraw = true;
     }
 
-    const uint32_t frameIndex = device.GetFrameIndex();
-    const float aspect = static_cast<float>(rect.extent.width) / static_cast<float>(rect.extent.height);
+    const uint32_t frameIndex = frame.frameIndex % kFramesInFlight;
+    if (!m_skinnedOutputBuffers[frameIndex][0])
+        return;
+    const float aspect = static_cast<float>(rect.width) / static_cast<float>(rect.height);
     UpdateUniform(frameIndex, 0, timeSeconds, aspect);
 
-    VkCommandBuffer cmd = device.GetCommandBuffer();
+    const std::uint32_t clearX = static_cast<std::uint32_t>(std::max<std::int32_t>(rect.x, 0));
+    const std::uint32_t clearY = static_cast<std::uint32_t>(std::max<std::int32_t>(rect.y, 0));
+    cmd.ClearDepth(1.0f, clearX, clearY, rect.width, rect.height);
 
-    VkClearAttachment depthClear{};
-    depthClear.aspectMask = VK_IMAGE_ASPECT_DEPTH_BIT;
-    depthClear.clearValue.depthStencil.depth = 1.0f;
+    cmd.SetViewport(static_cast<float>(rect.x),
+        static_cast<float>(rect.y),
+        static_cast<float>(rect.width),
+        static_cast<float>(rect.height));
+    cmd.SetScissor(clearX, clearY, rect.width, rect.height);
+    cmd.SetGraphicsPipeline(*m_pipeline);
 
-    VkClearRect depthRect{};
-    depthRect.rect = rect;
-    depthRect.baseArrayLayer = 0;
-    depthRect.layerCount = 1;
-    vkCmdClearAttachments(cmd, 1, &depthClear, 1, &depthRect);
-
-    VkViewport viewport{};
-    viewport.x = static_cast<float>(rect.offset.x);
-    viewport.y = static_cast<float>(rect.offset.y);
-    viewport.width = static_cast<float>(rect.extent.width);
-    viewport.height = static_cast<float>(rect.extent.height);
-    viewport.minDepth = 0.0f;
-    viewport.maxDepth = 1.0f;
-
-    vkCmdSetViewport(cmd, 0, 1, &viewport);
-    vkCmdSetScissor(cmd, 0, 1, &rect);
-    vkCmdBindPipeline(cmd, VK_PIPELINE_BIND_POINT_GRAPHICS, m_pipeline);
-
-    VkDeviceSize offset = 0;
-    vkCmdBindVertexBuffers(cmd, 0, 1, &m_skinnedOutputBuffers[frameIndex][0].buffer, &offset);
-    vkCmdBindIndexBuffer(cmd, m_indexBuffer.buffer, 0, VK_INDEX_TYPE_UINT32);
+    cmd.SetVertexBuffer(0, *m_skinnedOutputBuffers[frameIndex][0], 0);
+    cmd.SetIndexBuffer(*m_indexBuffer, 0, /*thirtyTwoBit=*/true);
 
     static bool loggedDraws = false;
     for (size_t i = 0; i < m_draws.size(); ++i)
     {
         const MeshDraw& draw = m_draws[i];
-        vkCmdBindDescriptorSets(cmd, VK_PIPELINE_BIND_POINT_GRAPHICS, m_pipelineLayout,
-            0, 1, &m_descriptorSets[frameIndex][0][draw.textureIndex], 0, nullptr);
-        vkCmdDrawIndexed(cmd, draw.indexCount, 1, draw.firstIndex, 0, 0);
+        const std::uint32_t slot =
+            (frameIndex * kUniformSlots + 0u) * kTextureCount + draw.textureIndex;
+        cmd.BindGroup(0, *m_bindGroup, slot);
+        cmd.DrawIndexed(draw.indexCount, 1, draw.firstIndex, 0, 0);
 
         if (!loggedDraws)
         {
@@ -1404,31 +931,25 @@ void SkinnedMeshRenderer::Render(VulkanDevice& device, double timeSeconds)
     }
     loggedDraws = true;
 
-    VkViewport fullViewport{};
-    fullViewport.x = 0.0f;
-    fullViewport.y = 0.0f;
-    fullViewport.width = static_cast<float>(extent.width);
-    fullViewport.height = static_cast<float>(extent.height);
-    fullViewport.minDepth = 0.0f;
-    fullViewport.maxDepth = 1.0f;
-    VkRect2D fullScissor{{0, 0}, extent};
-    vkCmdSetViewport(cmd, 0, 1, &fullViewport);
-    vkCmdSetScissor(cmd, 0, 1, &fullScissor);
+    cmd.SetViewport(0.0f, 0.0f, static_cast<float>(extentWidth), static_cast<float>(extentHeight));
+    cmd.SetScissor(0, 0, extentWidth, extentHeight);
 }
 
-void SkinnedMeshRenderer::RenderInWorld(VulkanDevice& device,
+void SkinnedMeshRenderer::RenderInWorld(ixrhi::IXRHICommandList& cmd,
+    const ixrhi::IXRHIFrameInfo& frame,
     double timeSeconds,
     const WorldCamera& camera,
     WorldVec3 position,
     float yawRadians,
     uint32_t skinSlot,
     std::array<float, 4> tint,
-    VkExtent2D targetExtent)
+    std::uint32_t targetWidth,
+    std::uint32_t targetHeight)
 {
     static bool loggedDraw = false;
     static bool loggedNoPipeline = false;
 
-    if (!m_pipeline || m_indexCount == 0)
+    if (!m_pipeline || !m_bindGroup || !m_indexBuffer || m_indexCount == 0)
     {
         if (!loggedNoPipeline)
         {
@@ -1438,18 +959,19 @@ void SkinnedMeshRenderer::RenderInWorld(VulkanDevice& device,
         return;
     }
 
-    if (!device.IsFrameActive())
+    if (!frame.frameActive || frame.commandList == nullptr)
         return;
 
-    const VkExtent2D extent = (targetExtent.width > 0 && targetExtent.height > 0)
-        ? targetExtent
-        : device.GetSwapchainExtent();
-    if (extent.width == 0 || extent.height == 0)
+    const std::uint32_t extentWidth = targetWidth > 0 ? targetWidth : frame.targetWidth;
+    const std::uint32_t extentHeight = targetHeight > 0 ? targetHeight : frame.targetHeight;
+    if (extentWidth == 0 || extentHeight == 0)
         return;
 
-    const uint32_t frameIndex = device.GetFrameIndex();
+    const uint32_t frameIndex = frame.frameIndex % kFramesInFlight;
     if (skinSlot >= kSkinSlots)
         skinSlot = 0;
+    if (!m_skinnedOutputBuffers[frameIndex][skinSlot])
+        return;
     if (m_worldRenderFrameIndex != frameIndex)
     {
         m_worldRenderFrameIndex = frameIndex;
@@ -1459,30 +981,19 @@ void SkinnedMeshRenderer::RenderInWorld(VulkanDevice& device,
     const uint32_t uniformSlot = std::min(m_worldUniformCursor++, kUniformSlots - 1);
     UpdateWorldUniform(frameIndex, uniformSlot, camera, position, yawRadians, timeSeconds, tint);
 
-    VkCommandBuffer cmd = device.GetCommandBuffer();
+    cmd.SetViewport(0.0f, 0.0f, static_cast<float>(extentWidth), static_cast<float>(extentHeight));
+    cmd.SetScissor(0, 0, extentWidth, extentHeight);
+    cmd.SetGraphicsPipeline(*m_pipeline);
 
-    VkViewport viewport{};
-    viewport.x = 0.0f;
-    viewport.y = 0.0f;
-    viewport.width = static_cast<float>(extent.width);
-    viewport.height = static_cast<float>(extent.height);
-    viewport.minDepth = 0.0f;
-    viewport.maxDepth = 1.0f;
-
-    VkRect2D scissor{{0, 0}, extent};
-    vkCmdSetViewport(cmd, 0, 1, &viewport);
-    vkCmdSetScissor(cmd, 0, 1, &scissor);
-    vkCmdBindPipeline(cmd, VK_PIPELINE_BIND_POINT_GRAPHICS, m_pipeline);
-
-    VkDeviceSize offset = 0;
-    vkCmdBindVertexBuffers(cmd, 0, 1, &m_skinnedOutputBuffers[frameIndex][skinSlot].buffer, &offset);
-    vkCmdBindIndexBuffer(cmd, m_indexBuffer.buffer, 0, VK_INDEX_TYPE_UINT32);
+    cmd.SetVertexBuffer(0, *m_skinnedOutputBuffers[frameIndex][skinSlot], 0);
+    cmd.SetIndexBuffer(*m_indexBuffer, 0, /*thirtyTwoBit=*/true);
 
     for (const MeshDraw& draw : m_draws)
     {
-        vkCmdBindDescriptorSets(cmd, VK_PIPELINE_BIND_POINT_GRAPHICS, m_pipelineLayout,
-            0, 1, &m_descriptorSets[frameIndex][uniformSlot][draw.textureIndex], 0, nullptr);
-        vkCmdDrawIndexed(cmd, draw.indexCount, 1, draw.firstIndex, 0, 0);
+        const std::uint32_t slot =
+            (frameIndex * kUniformSlots + uniformSlot) * kTextureCount + draw.textureIndex;
+        cmd.BindGroup(0, *m_bindGroup, slot);
+        cmd.DrawIndexed(draw.indexCount, 1, draw.firstIndex, 0, 0);
     }
 
     if (!loggedDraw)
@@ -1502,32 +1013,47 @@ void SkinnedMeshRenderer::RenderInWorld(VulkanDevice& device,
     }
 }
 
-void SkinnedMeshRenderer::RenderInWorldReflection(VulkanDevice& device,
+void SkinnedMeshRenderer::RenderInWorldReflection(ixrhi::IXRHICommandList& cmd,
+    const ixrhi::IXRHIFrameInfo& frame,
     const WorldCamera& camera,
-    VkExtent2D extent,
-    VkRenderPass renderPass,
+    std::uint32_t targetWidth,
+    std::uint32_t targetHeight,
+    const ixrhi::IXRHIRenderPass* renderPass,
     float waterLevelY,
     WorldVec3 position,
     float yawRadians,
     uint32_t skinSlot,
     std::array<float, 4> tint)
 {
-    if (!m_pipelineLayout || !renderPass || m_indexCount == 0 || !device.IsFrameActive())
+    // Reflection draws run inside the terrain-owned native reflection pass.
+    // That pass uses the swapchain color/depth formats (same as the backend
+    // main pass and the offscreen scene pass), so a pipeline baked against
+    // the borrowed IXRHI pass token is attachment-compatible. The native
+    // render-pass handle never crosses into this renderer.
+    if (!m_bindLayout || !m_pipeline || !m_bindGroup || !m_indexBuffer ||
+        m_indexCount == 0 || !frame.frameActive || frame.commandList == nullptr || m_rhi == nullptr)
         return;
 
-    if (!m_reflectionPipeline || m_reflectionRenderPass != renderPass)
+    // Bake against the explicit pass when the caller supplies one, else the
+    // renderer's own target (offscreen scene pass, or backend default when
+    // null). Comparing the EFFECTIVE token also catches m_targetPass swaps
+    // while the caller passes null.
+    const ixrhi::IXRHIRenderPass* effectivePass = renderPass != nullptr ? renderPass : m_targetPass;
+    if (!m_reflectionPipeline || m_reflectionPass != effectivePass)
     {
         DestroyReflectionPipeline();
-        if (!CreateReflectionPipeline(device, renderPass))
+        if (!CreateReflectionPipeline(*m_rhi, effectivePass))
             return;
     }
 
-    if (extent.width == 0 || extent.height == 0)
+    if (targetWidth == 0 || targetHeight == 0)
         return;
 
-    const uint32_t frameIndex = device.GetFrameIndex();
+    const uint32_t frameIndex = frame.frameIndex % kFramesInFlight;
     if (skinSlot >= kSkinSlots)
         skinSlot = 0;
+    if (!m_skinnedOutputBuffers[frameIndex][skinSlot])
+        return;
     if (m_worldRenderFrameIndex != frameIndex)
     {
         m_worldRenderFrameIndex = frameIndex;
@@ -1537,66 +1063,48 @@ void SkinnedMeshRenderer::RenderInWorldReflection(VulkanDevice& device,
     const uint32_t uniformSlot = std::min(m_worldUniformCursor++, kUniformSlots - 1);
     UpdateWorldUniform(frameIndex, uniformSlot, camera, position, yawRadians, 0.0, tint, true, waterLevelY);
 
-    VkCommandBuffer cmd = device.GetCommandBuffer();
+    cmd.SetViewport(0.0f, 0.0f, static_cast<float>(targetWidth), static_cast<float>(targetHeight));
+    cmd.SetScissor(0, 0, targetWidth, targetHeight);
+    cmd.SetGraphicsPipeline(*m_reflectionPipeline);
 
-    VkViewport viewport{};
-    viewport.x = 0.0f;
-    viewport.y = 0.0f;
-    viewport.width = static_cast<float>(extent.width);
-    viewport.height = static_cast<float>(extent.height);
-    viewport.minDepth = 0.0f;
-    viewport.maxDepth = 1.0f;
-
-    VkRect2D scissor{{0, 0}, extent};
-    vkCmdSetViewport(cmd, 0, 1, &viewport);
-    vkCmdSetScissor(cmd, 0, 1, &scissor);
-    vkCmdBindPipeline(cmd, VK_PIPELINE_BIND_POINT_GRAPHICS, m_reflectionPipeline);
-
-    VkDeviceSize offset = 0;
-    vkCmdBindVertexBuffers(cmd, 0, 1, &m_skinnedOutputBuffers[frameIndex][skinSlot].buffer, &offset);
-    vkCmdBindIndexBuffer(cmd, m_indexBuffer.buffer, 0, VK_INDEX_TYPE_UINT32);
+    cmd.SetVertexBuffer(0, *m_skinnedOutputBuffers[frameIndex][skinSlot], 0);
+    cmd.SetIndexBuffer(*m_indexBuffer, 0, /*thirtyTwoBit=*/true);
 
     for (const MeshDraw& draw : m_draws)
     {
-        vkCmdBindDescriptorSets(cmd, VK_PIPELINE_BIND_POINT_GRAPHICS, m_pipelineLayout,
-            0, 1, &m_descriptorSets[frameIndex][uniformSlot][draw.textureIndex], 0, nullptr);
-        vkCmdDrawIndexed(cmd, draw.indexCount, 1, draw.firstIndex, 0, 0);
+        const std::uint32_t slot =
+            (frameIndex * kUniformSlots + uniformSlot) * kTextureCount + draw.textureIndex;
+        cmd.BindGroup(0, *m_bindGroup, slot);
+        cmd.DrawIndexed(draw.indexCount, 1, draw.firstIndex, 0, 0);
     }
 }
 
 void SkinnedMeshRenderer::Destroy()
 {
     DestroyAnimation();
-
-    if (!m_device)
-        return;
-
     DestroyPipeline();
-
-    if (m_descriptorPool)
-        vkDestroyDescriptorPool(m_device, m_descriptorPool, nullptr);
-    m_descriptorPool = VK_NULL_HANDLE;
-
-    if (m_descriptorSetLayout)
-        vkDestroyDescriptorSetLayout(m_device, m_descriptorSetLayout, nullptr);
-    m_descriptorSetLayout = VK_NULL_HANDLE;
-
     DestroyComputeResources();
-    DestroyBuffer(m_indexBuffer);
+
+    m_bindGroup.reset();
+    m_bindLayout.reset();
+    m_indexBuffer.reset();
     for (auto& frameBuffers : m_uniformBuffers)
     {
-        for (Buffer& buffer : frameBuffers)
-            DestroyBuffer(buffer);
+        for (auto& buffer : frameBuffers)
+            buffer.reset();
     }
     for (Texture& texture : m_textures)
-        DestroyTexture(texture);
+        texture = {};
+    m_restVertexBuffer.reset();
 
     m_vertices.clear();
     m_indices.clear();
     m_draws.clear();
     m_rawMeshes.clear();
+    m_restVerticesGpu.clear();
     m_indexCount = 0;
-    m_device = VK_NULL_HANDLE;
+    m_targetPass = nullptr;
+    m_rhi = nullptr;
     m_assets = nullptr;
 }
 
@@ -2325,16 +1833,13 @@ bool SkinnedMeshRenderer::SkinPose(float animTimeSeconds, bool updateBounds, boo
 bool SkinnedMeshRenderer::UploadPaletteToBuffer(uint32_t frameIndex, uint32_t skinSlot)
 {
     if (frameIndex >= kFramesInFlight || skinSlot >= kSkinSlots ||
-        !m_bonePaletteBuffers[frameIndex][skinSlot].memory || m_bonePaletteCpu.empty())
+        !m_bonePaletteBuffers[frameIndex][skinSlot] || m_bonePaletteCpu.empty())
     {
         return false;
     }
 
-    const VkDeviceSize size = sizeof(Mat4) * m_bonePaletteCpu.size();
-    void* mapped = nullptr;
-    VK_CHECK(vkMapMemory(m_device, m_bonePaletteBuffers[frameIndex][skinSlot].memory, 0, size, 0, &mapped));
-    std::memcpy(mapped, m_bonePaletteCpu.data(), static_cast<size_t>(size));
-    vkUnmapMemory(m_device, m_bonePaletteBuffers[frameIndex][skinSlot].memory);
+    const std::size_t size = sizeof(Mat4) * m_bonePaletteCpu.size();
+    m_bonePaletteBuffers[frameIndex][skinSlot]->Write(0, m_bonePaletteCpu.data(), size);
     return true;
 }
 
@@ -2345,7 +1850,7 @@ bool SkinnedMeshRenderer::UploadBonePalette(float animTimeSeconds, uint32_t fram
 
 bool SkinnedMeshRenderer::UploadBonePalette(MotionState state, float animTimeSeconds, uint32_t frameIndex, uint32_t skinSlot)
 {
-    if (frameIndex >= kFramesInFlight || skinSlot >= kSkinSlots || !m_bonePaletteBuffers[frameIndex][skinSlot].memory ||
+    if (frameIndex >= kFramesInFlight || skinSlot >= kSkinSlots || !m_bonePaletteBuffers[frameIndex][skinSlot] ||
         !m_ozz || m_bonePaletteCpu.empty())
     {
         return false;
@@ -2360,28 +1865,37 @@ bool SkinnedMeshRenderer::UploadBonePalette(MotionState state, float animTimeSec
     return UploadPaletteToBuffer(frameIndex, skinSlot);
 }
 
-void SkinnedMeshRenderer::DispatchSkin(VkCommandBuffer cmd, uint32_t frameIndex)
+void SkinnedMeshRenderer::DispatchSkin(ixrhi::IXRHICommandList& cmd, uint32_t frameIndex)
 {
     DispatchSkin(cmd, frameIndex, 0);
 }
 
-void SkinnedMeshRenderer::DispatchSkin(VkCommandBuffer cmd, uint32_t frameIndex, uint32_t skinSlot)
+void SkinnedMeshRenderer::DispatchSkin(ixrhi::IXRHICommandList& cmd, uint32_t frameIndex, uint32_t skinSlot)
 {
-    vkCmdBindPipeline(cmd, VK_PIPELINE_BIND_POINT_COMPUTE, m_computePipeline);
-    vkCmdBindDescriptorSets(cmd, VK_PIPELINE_BIND_POINT_COMPUTE, m_computePipelineLayout,
-        0, 1, &m_computeDescriptorSets[frameIndex][skinSlot], 0, nullptr);
+    cmd.SetComputePipeline(*m_computePipeline);
+    cmd.BindGroup(0, *m_computeBindGroup, frameIndex * kSkinSlots + skinSlot);
 
     SkinPushConstants push{};
     push.vertexCount = static_cast<uint32_t>(m_vertices.size());
     push.boneCount = m_boneCount;
-    vkCmdPushConstants(cmd, m_computePipelineLayout, VK_SHADER_STAGE_COMPUTE_BIT,
-        0, sizeof(push), &push);
+    cmd.PushConstants(&push, sizeof(push));
 
     const uint32_t groupCount = (push.vertexCount + 63u) / 64u;
-    vkCmdDispatch(cmd, groupCount, 1, 1);
+    cmd.Dispatch(groupCount, 1, 1);
 }
 
-bool SkinnedMeshRenderer::VerifyComputeSkin(VulkanDevice& device)
+void SkinnedMeshRenderer::EmitSkinBarrier(ixrhi::IXRHICommandList& cmd,
+                                          uint32_t frameIndex,
+                                          uint32_t skinSlot)
+{
+    // ComputeShaderWrite -> VertexInputRead, exactly like the pre-migration
+    // native buffer barrier (same stages/access, whole output buffer).
+    cmd.TransitionBuffer(*m_skinnedOutputBuffers[frameIndex][skinSlot],
+        ixrhi::IXRHIBufferState::ShaderWrite,
+        ixrhi::IXRHIBufferState::VertexRead);
+}
+
+bool SkinnedMeshRenderer::VerifyComputeSkin(ixrhi::IXRHIDevice& rhi)
 {
     constexpr float verifyTime = 0.5f;
     if (!SkinPose(verifyTime, false, false))
@@ -2391,37 +1905,29 @@ bool SkinnedMeshRenderer::VerifyComputeSkin(VulkanDevice& device)
     if (!UploadBonePalette(verifyTime, 0))
         return false;
 
-    const VkDeviceSize vertexSize = sizeof(Vertex) * cpuVertices.size();
-    Buffer staging{};
-    CreateHostVisibleBuffer(device, m_device, vertexSize, VK_BUFFER_USAGE_TRANSFER_DST_BIT, nullptr, staging);
+    const std::size_t vertexSize = sizeof(Vertex) * cpuVertices.size();
+    ixrhi::IXRHIBufferDesc stagingDesc;
+    stagingDesc.sizeBytes = vertexSize;
+    stagingDesc.usage = ixrhi::IXRHIBufferUsage::TransferDst;
+    stagingDesc.cpuAccess = ixrhi::IXRHICpuAccess::Write;
+    stagingDesc.debugName = "SkinnedMesh:VerifyStaging";
+    auto staging = rhi.CreateBuffer(stagingDesc, nullptr, 0);
+    if (!staging)
+        return false;
 
-    VkQueue graphicsQueue = VK_NULL_HANDLE;
-    vkGetDeviceQueue(m_device, device.GetGraphicsQueueFamily(), 0, &graphicsQueue);
+    // Same dispatch + compute->transfer barrier + copy as the old one-time
+    // submit path, expressed through public IXRHI primitives and executed
+    // synchronously by the backend.
+    rhi.ExecuteAndWait([&](ixrhi::IXRHICommandList& cmd) {
+        DispatchSkin(cmd, 0);
+        cmd.TransitionBuffer(*m_skinnedOutputBuffers[0][0],
+            ixrhi::IXRHIBufferState::ShaderWrite,
+            ixrhi::IXRHIBufferState::TransferSrc);
+        cmd.CopyBuffer(*m_skinnedOutputBuffers[0][0], *staging, vertexSize);
+    });
 
-    VkCommandPool pool = VK_NULL_HANDLE;
-    VkCommandBuffer cmd = BeginOneTimeCommands(m_device, device.GetGraphicsQueueFamily(), pool);
-    DispatchSkin(cmd, 0);
-
-    VkBufferMemoryBarrier computeToCopy{};
-    computeToCopy.sType = VK_STRUCTURE_TYPE_BUFFER_MEMORY_BARRIER;
-    computeToCopy.srcAccessMask = VK_ACCESS_SHADER_WRITE_BIT;
-    computeToCopy.dstAccessMask = VK_ACCESS_TRANSFER_READ_BIT;
-    computeToCopy.srcQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;
-    computeToCopy.dstQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;
-    computeToCopy.buffer = m_skinnedOutputBuffers[0][0].buffer;
-    computeToCopy.offset = 0;
-    computeToCopy.size = vertexSize;
-    vkCmdPipelineBarrier(cmd,
-        VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT,
-        VK_PIPELINE_STAGE_TRANSFER_BIT,
-        0, 0, nullptr, 1, &computeToCopy, 0, nullptr);
-
-    CopyBuffer(cmd, m_skinnedOutputBuffers[0][0].buffer, staging.buffer, vertexSize);
-    EndOneTimeCommands(m_device, graphicsQueue, pool, cmd);
-
-    void* mapped = nullptr;
-    VK_CHECK(vkMapMemory(m_device, staging.memory, 0, vertexSize, 0, &mapped));
-    const Vertex* gpuVertices = static_cast<const Vertex*>(mapped);
+    std::vector<Vertex> gpuVertices(cpuVertices.size());
+    staging->Read(0, gpuVertices.data(), vertexSize);
 
     float maxPosDelta = 0.0f;
     float maxNormalDelta = 0.0f;
@@ -2456,8 +1962,6 @@ bool SkinnedMeshRenderer::VerifyComputeSkin(VulkanDevice& device)
             ++offendingLogged;
         }
     }
-    vkUnmapMemory(m_device, staging.memory);
-    DestroyBuffer(staging);
 
     LogFormat("[SKIN-VERIFY] verts=%zu maxPosDelta=%.6f cm maxNormalDelta=%.6f within(pos<0.01,nrm<0.001)=%u/%zu",
         cpuVertices.size(),
@@ -2474,30 +1978,37 @@ bool SkinnedMeshRenderer::VerifyComputeSkin(VulkanDevice& device)
     return true;
 }
 
-bool SkinnedMeshRenderer::CreateBuffers(VulkanDevice& device)
+bool SkinnedMeshRenderer::CreateBuffers(ixrhi::IXRHIDevice& rhi)
 {
-    CreateHostVisibleBuffer(device, m_device, sizeof(uint32_t) * m_indices.size(),
-        VK_BUFFER_USAGE_INDEX_BUFFER_BIT, m_indices.data(), m_indexBuffer);
+    m_indexBuffer = CreateRhiBuffer(rhi,
+        sizeof(uint32_t) * m_indices.size(),
+        ixrhi::IXRHIBufferUsage::Index,
+        ixrhi::IXRHICpuAccess::Write,
+        m_indices.data(),
+        "SkinnedMesh:IB");
 
     for (auto& frameBuffers : m_uniformBuffers)
     {
-        for (Buffer& buffer : frameBuffers)
+        for (auto& buffer : frameBuffers)
         {
-            CreateHostVisibleBuffer(device, m_device, sizeof(UniformBlock),
-                VK_BUFFER_USAGE_UNIFORM_BUFFER_BIT, nullptr, buffer);
+            buffer = CreateRhiBuffer(rhi,
+                sizeof(UniformBlock),
+                ixrhi::IXRHIBufferUsage::Uniform,
+                ixrhi::IXRHICpuAccess::Write,
+                nullptr,
+                "SkinnedMesh:UBO");
+            if (!buffer)
+                return false;
         }
     }
-    return true;
+    return m_indexBuffer != nullptr;
 }
 
-bool SkinnedMeshRenderer::CreateComputeResources(VulkanDevice& device)
+bool SkinnedMeshRenderer::CreateComputeResources(ixrhi::IXRHIDevice& rhi)
 {
-    VkQueue graphicsQueue = VK_NULL_HANDLE;
-    vkGetDeviceQueue(m_device, device.GetGraphicsQueueFamily(), 0, &graphicsQueue);
-
-    const VkDeviceSize restSize = sizeof(RestVertexGpu) * m_restVerticesGpu.size();
-    const VkDeviceSize vertexSize = sizeof(Vertex) * m_vertices.size();
-    const VkDeviceSize paletteSize = sizeof(Mat4) * static_cast<size_t>(m_boneCount);
+    const std::uint64_t restSize = sizeof(RestVertexGpu) * m_restVerticesGpu.size();
+    const std::uint64_t vertexSize = sizeof(Vertex) * m_vertices.size();
+    const std::uint64_t paletteSize = sizeof(Mat4) * static_cast<size_t>(m_boneCount);
     if (restSize == 0 || vertexSize == 0 || paletteSize == 0)
     {
         LogFormat("[COMPUTE] invalid buffer sizes rest=%llu output=%llu palette=%llu",
@@ -2507,26 +2018,44 @@ bool SkinnedMeshRenderer::CreateComputeResources(VulkanDevice& device)
         return false;
     }
 
-    CreateDeviceLocalBuffer(device, m_device, graphicsQueue, restSize,
-        VK_BUFFER_USAGE_STORAGE_BUFFER_BIT, m_restVerticesGpu.data(), m_restVertexBuffer);
+    m_restVertexBuffer = CreateRhiBuffer(rhi,
+        restSize,
+        ixrhi::IXRHIBufferUsage::Storage,
+        ixrhi::IXRHICpuAccess::None,
+        m_restVerticesGpu.data(),
+        "SkinnedMesh:RestVertices");
 
     for (uint32_t frame = 0; frame < kFramesInFlight; ++frame)
     {
         for (uint32_t skinSlot = 0; skinSlot < kSkinSlots; ++skinSlot)
         {
-            CreateHostVisibleBuffer(device, m_device, paletteSize,
-                VK_BUFFER_USAGE_STORAGE_BUFFER_BIT, nullptr, m_bonePaletteBuffers[frame][skinSlot]);
-            CreateDeviceLocalBuffer(device, m_device, graphicsQueue, vertexSize,
-                VK_BUFFER_USAGE_STORAGE_BUFFER_BIT | VK_BUFFER_USAGE_VERTEX_BUFFER_BIT | VK_BUFFER_USAGE_TRANSFER_SRC_BIT,
-                nullptr, m_skinnedOutputBuffers[frame][skinSlot]);
+            m_bonePaletteBuffers[frame][skinSlot] = CreateRhiBuffer(rhi,
+                paletteSize,
+                ixrhi::IXRHIBufferUsage::Storage,
+                ixrhi::IXRHICpuAccess::Write,
+                nullptr,
+                "SkinnedMesh:BonePalette");
+            // Skinned output is written by compute and read as vertex input
+            // (plus transfer-source for verification readback).
+            m_skinnedOutputBuffers[frame][skinSlot] = CreateRhiBuffer(rhi,
+                vertexSize,
+                ixrhi::IXRHIBufferUsage::Storage | ixrhi::IXRHIBufferUsage::Vertex |
+                    ixrhi::IXRHIBufferUsage::TransferSrc,
+                ixrhi::IXRHICpuAccess::None,
+                nullptr,
+                "SkinnedMesh:SkinnedOutput");
+            if (!m_bonePaletteBuffers[frame][skinSlot] || !m_skinnedOutputBuffers[frame][skinSlot])
+                return false;
         }
     }
+    if (!m_restVertexBuffer)
+        return false;
 
-    if (!CreateComputeDescriptors())
+    if (!CreateComputeBindGroup(rhi))
         return false;
-    if (!CreateComputePipeline())
+    if (!CreateComputePipeline(rhi))
         return false;
-    if (!VerifyComputeSkin(device))
+    if (!VerifyComputeSkin(rhi))
         return false;
 
     LogFormat("[COMPUTE] resources OK rest=%zu bytes output/frame/slot=%zu bytes palette/frame/slot=%zu bytes slots=%u",
@@ -2537,14 +2066,15 @@ bool SkinnedMeshRenderer::CreateComputeResources(VulkanDevice& device)
     return true;
 }
 
-bool SkinnedMeshRenderer::CreateTextures(VulkanDevice& device, const std::string& modelPath)
+bool SkinnedMeshRenderer::CreateTextures(ixrhi::IXRHIDevice& rhi, const std::string& modelPath)
 {
     const std::array<std::string, kTextureCount> textureFiles = {
         modelPath + "#baseColor",
         modelPath + "#fallback"};
 
-    VkQueue graphicsQueue = VK_NULL_HANDLE;
-    vkGetDeviceQueue(m_device, device.GetGraphicsQueueFamily(), 0, &graphicsQueue);
+    const ixrhi::IXRHITextureUsage sampledUpload =
+        ixrhi::IXRHITextureUsage::Sampled | ixrhi::IXRHITextureUsage::TransferDst;
+    const ixrhi::IXRHICapabilities& caps = rhi.GetCapabilities();
 
     for (uint32_t textureIndex = 0; textureIndex < kTextureCount; ++textureIndex)
     {
@@ -2564,26 +2094,19 @@ bool SkinnedMeshRenderer::CreateTextures(VulkanDevice& device, const std::string
             dds = CreateFallbackWhiteDdsImage(textureFiles[textureIndex]);
         }
 
-        VkFormatProperties props{};
-        vkGetPhysicalDeviceFormatProperties(device.GetPhysicalDevice(), dds.format, &props);
-        const VkFormatFeatureFlags required =
-            VK_FORMAT_FEATURE_SAMPLED_IMAGE_BIT | VK_FORMAT_FEATURE_TRANSFER_DST_BIT;
-        if ((props.optimalTilingFeatures & required) != required)
+        if (!rhi.IsTextureFormatSupported(dds.format, sampledUpload))
         {
-            LogFormat("[DDS] unsupported Vulkan format features for %s format=%s features=0x%08x",
+            LogFormat("[DDS] unsupported format features for %s format=%s",
                 dds.filename.c_str(),
-                VkFormatName(dds.format),
-                props.optimalTilingFeatures);
+                RhiFormatName(dds.format));
             LogFormat("[DDS] Falling back to 4x4 white RGBA8888 texture for %s",
                 dds.filename.c_str());
             dds = CreateFallbackWhiteDdsImage(dds.filename);
-            vkGetPhysicalDeviceFormatProperties(device.GetPhysicalDevice(), dds.format, &props);
-            if ((props.optimalTilingFeatures & required) != required)
+            if (!rhi.IsTextureFormatSupported(dds.format, sampledUpload))
             {
-                LogFormat("[DDS] fallback texture format unsupported for %s format=%s features=0x%08x",
+                LogFormat("[DDS] fallback texture format unsupported for %s format=%s",
                     dds.filename.c_str(),
-                    VkFormatName(dds.format),
-                    props.optimalTilingFeatures);
+                    RhiFormatName(dds.format));
                 return false;
             }
         }
@@ -2595,61 +2118,35 @@ bool SkinnedMeshRenderer::CreateTextures(VulkanDevice& device, const std::string
         texture.mipLevels = dds.mipLevels;
         texture.format = dds.format;
 
-        CreateDeviceLocalImage(device, m_device, dds.width, dds.height, dds.mipLevels,
-            dds.format, texture.image, texture.memory);
+        ixrhi::IXRHITextureDesc imageDesc;
+        imageDesc.width = dds.width;
+        imageDesc.height = dds.height;
+        imageDesc.format = dds.format;
+        imageDesc.usage = sampledUpload;
+        imageDesc.debugName = "SkinnedMesh:" + dds.filename;
+        texture.image = rhi.CreateTexture(imageDesc, dds.pixels.data(), dds.pixels.size());
+        if (!texture.image)
+            return false;
 
-        Buffer staging{};
-        CreateHostVisibleBuffer(device, m_device, dds.pixels.size(),
-            VK_BUFFER_USAGE_TRANSFER_SRC_BIT, dds.pixels.data(), staging);
-
-        VkCommandPool uploadPool = VK_NULL_HANDLE;
-        VkCommandBuffer cmd = BeginOneTimeCommands(m_device, device.GetGraphicsQueueFamily(), uploadPool);
-        TransitionImageLayout(cmd, texture.image, dds.mipLevels,
-            VK_IMAGE_LAYOUT_UNDEFINED, VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL);
-        vkCmdCopyBufferToImage(cmd, staging.buffer, texture.image,
-            VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL,
-            static_cast<uint32_t>(dds.regions.size()),
-            dds.regions.data());
-        TransitionImageLayout(cmd, texture.image, dds.mipLevels,
-            VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL, VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL);
-        EndOneTimeCommands(m_device, graphicsQueue, uploadPool, cmd);
-
-        DestroyBuffer(staging);
-
-        VkImageViewCreateInfo view{};
-        view.sType = VK_STRUCTURE_TYPE_IMAGE_VIEW_CREATE_INFO;
-        view.image = texture.image;
-        view.viewType = VK_IMAGE_VIEW_TYPE_2D;
-        view.format = texture.format;
-        view.subresourceRange.aspectMask = VK_IMAGE_ASPECT_COLOR_BIT;
-        view.subresourceRange.baseMipLevel = 0;
-        view.subresourceRange.levelCount = texture.mipLevels;
-        view.subresourceRange.baseArrayLayer = 0;
-        view.subresourceRange.layerCount = 1;
-        VK_CHECK(vkCreateImageView(m_device, &view, nullptr, &texture.view));
-
-        VkSamplerCreateInfo sampler{};
-        sampler.sType = VK_STRUCTURE_TYPE_SAMPLER_CREATE_INFO;
-        sampler.magFilter = VK_FILTER_LINEAR;
-        sampler.minFilter = VK_FILTER_LINEAR;
-        sampler.mipmapMode = texture.mipLevels > 1 ? VK_SAMPLER_MIPMAP_MODE_LINEAR : VK_SAMPLER_MIPMAP_MODE_NEAREST;
-        sampler.addressModeU = VK_SAMPLER_ADDRESS_MODE_REPEAT;
-        sampler.addressModeV = VK_SAMPLER_ADDRESS_MODE_REPEAT;
-        sampler.addressModeW = VK_SAMPLER_ADDRESS_MODE_REPEAT;
-        sampler.minLod = 0.0f;
-        sampler.maxLod = static_cast<float>(texture.mipLevels);
-        sampler.mipLodBias = -0.25f;
-        if (device.SupportsSamplerAnisotropy())
-        {
-            sampler.anisotropyEnable = VK_TRUE;
-            sampler.maxAnisotropy = device.GetMaxSamplerAnisotropy();
-        }
-        sampler.borderColor = VK_BORDER_COLOR_FLOAT_OPAQUE_BLACK;
-        VK_CHECK(vkCreateSampler(m_device, &sampler, nullptr, &texture.sampler));
+        ixrhi::IXRHISamplerDesc samplerDesc;
+        samplerDesc.minFilter = ixrhi::IXRHISamplerFilter::Linear;
+        samplerDesc.magFilter = ixrhi::IXRHISamplerFilter::Linear;
+        samplerDesc.mipmapFilter = texture.mipLevels > 1 ? ixrhi::IXRHISamplerFilter::Linear
+                                                          : ixrhi::IXRHISamplerFilter::Nearest;
+        samplerDesc.addressU = ixrhi::IXRHISamplerAddress::Repeat;
+        samplerDesc.addressV = ixrhi::IXRHISamplerAddress::Repeat;
+        samplerDesc.addressW = ixrhi::IXRHISamplerAddress::Repeat;
+        samplerDesc.maxLod = static_cast<float>(texture.mipLevels);
+        if (caps.supportsAnisotropy)
+            samplerDesc.maxAnisotropy = caps.maxAnisotropy;
+        samplerDesc.debugName = "SkinnedMesh:" + dds.filename + ":Sampler";
+        texture.sampler = rhi.CreateSampler(samplerDesc);
+        if (!texture.sampler)
+            return false;
 
         LogFormat("[TEX] uploaded %s as %s (%ux%u mips=%u sampler=linear/repeat)",
             texture.name.c_str(),
-            VkFormatName(texture.format),
+            RhiFormatName(texture.format),
             texture.width,
             texture.height,
             texture.mipLevels);
@@ -2658,87 +2155,37 @@ bool SkinnedMeshRenderer::CreateTextures(VulkanDevice& device, const std::string
     return true;
 }
 
-bool SkinnedMeshRenderer::CreateDescriptors()
+bool SkinnedMeshRenderer::CreateBindGroup(ixrhi::IXRHIDevice& rhi)
 {
-    VkDescriptorSetLayoutBinding ubo{};
-    ubo.binding = 0;
-    ubo.descriptorType = VK_DESCRIPTOR_TYPE_UNIFORM_BUFFER;
-    ubo.descriptorCount = 1;
-    ubo.stageFlags = VK_SHADER_STAGE_VERTEX_BIT | VK_SHADER_STAGE_FRAGMENT_BIT;
+    constexpr uint32_t kBindSlots = kFramesInFlight * kUniformSlots * kTextureCount;
+    const ixrhi::IXRHIShaderStage allStages =
+        ixrhi::IXRHIShaderStage::Vertex | ixrhi::IXRHIShaderStage::Fragment;
+    const std::vector<ixrhi::IXRHIBinding> bindings = {
+        {0, ixrhi::IXRHIBindingType::UniformBuffer, allStages},
+        {1, ixrhi::IXRHIBindingType::SampledTexture, ixrhi::IXRHIShaderStage::Fragment},
+    };
+    m_bindLayout = rhi.CreateBindGroupLayout(bindings);
+    if (!m_bindLayout)
+        return false;
+    m_bindGroup = rhi.CreateBindGroup(*m_bindLayout, kBindSlots);
+    if (!m_bindGroup)
+        return false;
 
-    VkDescriptorSetLayoutBinding diffuse{};
-    diffuse.binding = 1;
-    diffuse.descriptorType = VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER;
-    diffuse.descriptorCount = 1;
-    diffuse.stageFlags = VK_SHADER_STAGE_FRAGMENT_BIT;
-
-    VkDescriptorSetLayoutCreateInfo layout{};
-    layout.sType = VK_STRUCTURE_TYPE_DESCRIPTOR_SET_LAYOUT_CREATE_INFO;
-    std::array<VkDescriptorSetLayoutBinding, 2> bindings = {ubo, diffuse};
-    layout.bindingCount = static_cast<uint32_t>(bindings.size());
-    layout.pBindings = bindings.data();
-    VK_CHECK(vkCreateDescriptorSetLayout(m_device, &layout, nullptr, &m_descriptorSetLayout));
-
-    std::array<VkDescriptorPoolSize, 2> poolSizes{};
-    poolSizes[0].type = VK_DESCRIPTOR_TYPE_UNIFORM_BUFFER;
-    poolSizes[0].descriptorCount = kFramesInFlight * kUniformSlots * kTextureCount;
-    poolSizes[1].type = VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER;
-    poolSizes[1].descriptorCount = kFramesInFlight * kUniformSlots * kTextureCount;
-
-    VkDescriptorPoolCreateInfo pool{};
-    pool.sType = VK_STRUCTURE_TYPE_DESCRIPTOR_POOL_CREATE_INFO;
-    pool.maxSets = kFramesInFlight * kUniformSlots * kTextureCount;
-    pool.poolSizeCount = static_cast<uint32_t>(poolSizes.size());
-    pool.pPoolSizes = poolSizes.data();
-    VK_CHECK(vkCreateDescriptorPool(m_device, &pool, nullptr, &m_descriptorPool));
-
-    std::array<VkDescriptorSetLayout, kFramesInFlight * kUniformSlots * kTextureCount> layouts{};
-    layouts.fill(m_descriptorSetLayout);
-
-    VkDescriptorSetAllocateInfo alloc{};
-    alloc.sType = VK_STRUCTURE_TYPE_DESCRIPTOR_SET_ALLOCATE_INFO;
-    alloc.descriptorPool = m_descriptorPool;
-    alloc.descriptorSetCount = static_cast<uint32_t>(layouts.size());
-    alloc.pSetLayouts = layouts.data();
-
-    std::array<VkDescriptorSet, kFramesInFlight * kUniformSlots * kTextureCount> flatSets{};
-    VK_CHECK(vkAllocateDescriptorSets(m_device, &alloc, flatSets.data()));
-
-    uint32_t setIndex = 0;
     for (uint32_t frame = 0; frame < kFramesInFlight; ++frame)
     {
         for (uint32_t uniformSlot = 0; uniformSlot < kUniformSlots; ++uniformSlot)
         {
             for (uint32_t textureIndex = 0; textureIndex < kTextureCount; ++textureIndex)
             {
-                VkDescriptorSet descriptorSet = flatSets[setIndex++];
-                m_descriptorSets[frame][uniformSlot][textureIndex] = descriptorSet;
-
-                VkDescriptorBufferInfo bufferInfo{};
-                bufferInfo.buffer = m_uniformBuffers[frame][uniformSlot].buffer;
-                bufferInfo.offset = 0;
-                bufferInfo.range = sizeof(UniformBlock);
-
-                VkDescriptorImageInfo imageInfo{};
-                imageInfo.sampler = m_textures[textureIndex].sampler;
-                imageInfo.imageView = m_textures[textureIndex].view;
-                imageInfo.imageLayout = VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL;
-
-                std::array<VkWriteDescriptorSet, 2> writes{};
-                writes[0].sType = VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET;
-                writes[0].dstSet = descriptorSet;
-                writes[0].dstBinding = 0;
-                writes[0].descriptorCount = 1;
-                writes[0].descriptorType = VK_DESCRIPTOR_TYPE_UNIFORM_BUFFER;
-                writes[0].pBufferInfo = &bufferInfo;
-
-                writes[1].sType = VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET;
-                writes[1].dstSet = descriptorSet;
-                writes[1].dstBinding = 1;
-                writes[1].descriptorCount = 1;
-                writes[1].descriptorType = VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER;
-                writes[1].pImageInfo = &imageInfo;
-                vkUpdateDescriptorSets(m_device, static_cast<uint32_t>(writes.size()), writes.data(), 0, nullptr);
+                const uint32_t slot = (frame * kUniformSlots + uniformSlot) * kTextureCount + textureIndex;
+                m_bindGroup->UpdateBuffer(slot,
+                    0,
+                    m_uniformBuffers[frame][uniformSlot],
+                    0,
+                    sizeof(UniformBlock));
+                const Texture& texture = m_textures[textureIndex];
+                if (texture.image && texture.sampler)
+                    m_bindGroup->UpdateTexture(slot, 1, texture.image, texture.sampler);
             }
         }
     }
@@ -2746,98 +2193,41 @@ bool SkinnedMeshRenderer::CreateDescriptors()
     return true;
 }
 
-bool SkinnedMeshRenderer::CreateComputeDescriptors()
+bool SkinnedMeshRenderer::CreateComputeBindGroup(ixrhi::IXRHIDevice& rhi)
 {
-    VkDescriptorSetLayoutBinding rest{};
-    rest.binding = 0;
-    rest.descriptorType = VK_DESCRIPTOR_TYPE_STORAGE_BUFFER;
-    rest.descriptorCount = 1;
-    rest.stageFlags = VK_SHADER_STAGE_COMPUTE_BIT;
-
-    VkDescriptorSetLayoutBinding bones{};
-    bones.binding = 1;
-    bones.descriptorType = VK_DESCRIPTOR_TYPE_STORAGE_BUFFER;
-    bones.descriptorCount = 1;
-    bones.stageFlags = VK_SHADER_STAGE_COMPUTE_BIT;
-
-    VkDescriptorSetLayoutBinding output{};
-    output.binding = 2;
-    output.descriptorType = VK_DESCRIPTOR_TYPE_STORAGE_BUFFER;
-    output.descriptorCount = 1;
-    output.stageFlags = VK_SHADER_STAGE_COMPUTE_BIT;
-
-    std::array<VkDescriptorSetLayoutBinding, 3> bindings = {rest, bones, output};
-    VkDescriptorSetLayoutCreateInfo layout{};
-    layout.sType = VK_STRUCTURE_TYPE_DESCRIPTOR_SET_LAYOUT_CREATE_INFO;
-    layout.bindingCount = static_cast<uint32_t>(bindings.size());
-    layout.pBindings = bindings.data();
-    VK_CHECK(vkCreateDescriptorSetLayout(m_device, &layout, nullptr, &m_computeDescriptorSetLayout));
-
-    VkDescriptorPoolSize poolSize{};
-    poolSize.type = VK_DESCRIPTOR_TYPE_STORAGE_BUFFER;
-    poolSize.descriptorCount = kFramesInFlight * kSkinSlots * 3;
-
-    VkDescriptorPoolCreateInfo pool{};
-    pool.sType = VK_STRUCTURE_TYPE_DESCRIPTOR_POOL_CREATE_INFO;
-    pool.maxSets = kFramesInFlight * kSkinSlots;
-    pool.poolSizeCount = 1;
-    pool.pPoolSizes = &poolSize;
-    VK_CHECK(vkCreateDescriptorPool(m_device, &pool, nullptr, &m_computeDescriptorPool));
-
-    std::array<VkDescriptorSetLayout, kFramesInFlight * kSkinSlots> layouts{};
-    layouts.fill(m_computeDescriptorSetLayout);
-    VkDescriptorSetAllocateInfo alloc{};
-    alloc.sType = VK_STRUCTURE_TYPE_DESCRIPTOR_SET_ALLOCATE_INFO;
-    alloc.descriptorPool = m_computeDescriptorPool;
-    alloc.descriptorSetCount = static_cast<uint32_t>(layouts.size());
-    alloc.pSetLayouts = layouts.data();
-    std::array<VkDescriptorSet, kFramesInFlight * kSkinSlots> flatSets{};
-    VK_CHECK(vkAllocateDescriptorSets(m_device, &alloc, flatSets.data()));
-    for (uint32_t frame = 0; frame < kFramesInFlight; ++frame)
-    {
-        for (uint32_t skinSlot = 0; skinSlot < kSkinSlots; ++skinSlot)
-            m_computeDescriptorSets[frame][skinSlot] = flatSets[frame * kSkinSlots + skinSlot];
-    }
+    constexpr uint32_t kComputeSets = kFramesInFlight * kSkinSlots;
+    const std::vector<ixrhi::IXRHIBinding> bindings = {
+        {0, ixrhi::IXRHIBindingType::StorageBuffer, ixrhi::IXRHIShaderStage::Compute},
+        {1, ixrhi::IXRHIBindingType::StorageBuffer, ixrhi::IXRHIShaderStage::Compute},
+        {2, ixrhi::IXRHIBindingType::StorageBuffer, ixrhi::IXRHIShaderStage::Compute},
+    };
+    m_computeBindLayout = rhi.CreateBindGroupLayout(bindings);
+    if (!m_computeBindLayout)
+        return false;
+    m_computeBindGroup = rhi.CreateBindGroup(*m_computeBindLayout, kComputeSets);
+    if (!m_computeBindGroup)
+        return false;
 
     for (uint32_t frame = 0; frame < kFramesInFlight; ++frame)
     {
         for (uint32_t skinSlot = 0; skinSlot < kSkinSlots; ++skinSlot)
         {
-            VkDescriptorBufferInfo restInfo{};
-            restInfo.buffer = m_restVertexBuffer.buffer;
-            restInfo.range = sizeof(RestVertexGpu) * m_restVerticesGpu.size();
-
-            VkDescriptorBufferInfo bonesInfo{};
-            bonesInfo.buffer = m_bonePaletteBuffers[frame][skinSlot].buffer;
-            bonesInfo.range = sizeof(Mat4) * static_cast<size_t>(m_boneCount);
-
-            VkDescriptorBufferInfo outputInfo{};
-            outputInfo.buffer = m_skinnedOutputBuffers[frame][skinSlot].buffer;
-            outputInfo.range = sizeof(Vertex) * m_vertices.size();
-
-            std::array<VkWriteDescriptorSet, 3> writes{};
-            writes[0].sType = VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET;
-            writes[0].dstSet = m_computeDescriptorSets[frame][skinSlot];
-            writes[0].dstBinding = 0;
-            writes[0].descriptorCount = 1;
-            writes[0].descriptorType = VK_DESCRIPTOR_TYPE_STORAGE_BUFFER;
-            writes[0].pBufferInfo = &restInfo;
-
-            writes[1].sType = VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET;
-            writes[1].dstSet = m_computeDescriptorSets[frame][skinSlot];
-            writes[1].dstBinding = 1;
-            writes[1].descriptorCount = 1;
-            writes[1].descriptorType = VK_DESCRIPTOR_TYPE_STORAGE_BUFFER;
-            writes[1].pBufferInfo = &bonesInfo;
-
-            writes[2].sType = VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET;
-            writes[2].dstSet = m_computeDescriptorSets[frame][skinSlot];
-            writes[2].dstBinding = 2;
-            writes[2].descriptorCount = 1;
-            writes[2].descriptorType = VK_DESCRIPTOR_TYPE_STORAGE_BUFFER;
-            writes[2].pBufferInfo = &outputInfo;
-
-            vkUpdateDescriptorSets(m_device, static_cast<uint32_t>(writes.size()), writes.data(), 0, nullptr);
+            const uint32_t slot = frame * kSkinSlots + skinSlot;
+            m_computeBindGroup->UpdateBuffer(slot,
+                0,
+                m_restVertexBuffer,
+                0,
+                sizeof(RestVertexGpu) * m_restVerticesGpu.size());
+            m_computeBindGroup->UpdateBuffer(slot,
+                1,
+                m_bonePaletteBuffers[frame][skinSlot],
+                0,
+                sizeof(Mat4) * static_cast<size_t>(m_boneCount));
+            m_computeBindGroup->UpdateBuffer(slot,
+                2,
+                m_skinnedOutputBuffers[frame][skinSlot],
+                0,
+                sizeof(Vertex) * m_vertices.size());
         }
     }
 
@@ -2845,258 +2235,144 @@ bool SkinnedMeshRenderer::CreateComputeDescriptors()
     return true;
 }
 
-bool SkinnedMeshRenderer::CreateComputePipeline()
+bool SkinnedMeshRenderer::CreateComputePipeline(ixrhi::IXRHIDevice& rhi)
 {
-    if (!m_assets)
+    if (!m_assets || !m_computeBindLayout)
         return false;
 
-    VkShaderModule cs = CreateShaderModule(m_device, *m_assets, "assets/shaders/skinned_mesh_cs.spv");
+    auto cs = LoadShader(rhi,
+        *m_assets,
+        "assets/shaders/skinned_mesh_cs.spv",
+        ixrhi::IXRHIShaderStage::Compute,
+        "CSMain");
+    if (!cs)
+        return false;
 
-    VkPushConstantRange push{};
-    push.stageFlags = VK_SHADER_STAGE_COMPUTE_BIT;
-    push.offset = 0;
-    push.size = sizeof(SkinPushConstants);
+    ixrhi::IXRHIComputePipelineDesc desc;
+    desc.computeShader = cs;
+    desc.bindGroupLayouts = {m_computeBindLayout.get()};
+    desc.pushRanges = {{ixrhi::IXRHIShaderStage::Compute, 0, sizeof(SkinPushConstants)}};
+    desc.debugName = "SkinnedMesh:Skinning";
+    m_computePipeline = rhi.CreateComputePipeline(desc);
+    if (!m_computePipeline)
+        return false;
 
-    VkPipelineLayoutCreateInfo layout{};
-    layout.sType = VK_STRUCTURE_TYPE_PIPELINE_LAYOUT_CREATE_INFO;
-    layout.setLayoutCount = 1;
-    layout.pSetLayouts = &m_computeDescriptorSetLayout;
-    layout.pushConstantRangeCount = 1;
-    layout.pPushConstantRanges = &push;
-    VK_CHECK(vkCreatePipelineLayout(m_device, &layout, nullptr, &m_computePipelineLayout));
-
-    VkComputePipelineCreateInfo pipeline{};
-    pipeline.sType = VK_STRUCTURE_TYPE_COMPUTE_PIPELINE_CREATE_INFO;
-    pipeline.stage.sType = VK_STRUCTURE_TYPE_PIPELINE_SHADER_STAGE_CREATE_INFO;
-    pipeline.stage.stage = VK_SHADER_STAGE_COMPUTE_BIT;
-    pipeline.stage.module = cs;
-    pipeline.stage.pName = "CSMain";
-    pipeline.layout = m_computePipelineLayout;
-    VK_CHECK(vkCreateComputePipelines(m_device, VK_NULL_HANDLE, 1, &pipeline, nullptr, &m_computePipeline));
-
-    vkDestroyShaderModule(m_device, cs, nullptr);
-    LogFormat("[COMPUTE] pipeline OK, pipeline=0x%llx", HandleValue(m_computePipeline));
+    LogFormat("[COMPUTE] pipeline OK, pipeline=%s", m_computePipeline->DebugName().c_str());
     return true;
 }
 
-bool SkinnedMeshRenderer::CreatePipeline(VulkanDevice& device)
+bool SkinnedMeshRenderer::CreatePipeline(ixrhi::IXRHIDevice& rhi)
 {
-    if (!m_assets)
+    if (!m_assets || !m_bindLayout)
         return false;
 
-    VkShaderModule vs = CreateShaderModule(m_device, *m_assets, "assets/shaders/skinned_mesh_vs.spv");
-    VkShaderModule ps = CreateShaderModule(m_device, *m_assets, "assets/shaders/skinned_mesh_ps.spv");
+    auto vs = LoadShader(rhi,
+        *m_assets,
+        "assets/shaders/skinned_mesh_vs.spv",
+        ixrhi::IXRHIShaderStage::Vertex,
+        "VSMain");
+    auto ps = LoadShader(rhi,
+        *m_assets,
+        "assets/shaders/skinned_mesh_ps.spv",
+        ixrhi::IXRHIShaderStage::Fragment,
+        "PSMain");
+    if (!vs || !ps)
+        return false;
 
-    VkPipelineShaderStageCreateInfo stages[2]{};
-    stages[0].sType = VK_STRUCTURE_TYPE_PIPELINE_SHADER_STAGE_CREATE_INFO;
-    stages[0].stage = VK_SHADER_STAGE_VERTEX_BIT;
-    stages[0].module = vs;
-    stages[0].pName = "VSMain";
-    stages[1].sType = VK_STRUCTURE_TYPE_PIPELINE_SHADER_STAGE_CREATE_INFO;
-    stages[1].stage = VK_SHADER_STAGE_FRAGMENT_BIT;
-    stages[1].module = ps;
-    stages[1].pName = "PSMain";
+    // Parity with the pre-migration native graphics pipeline state: triangle
+    // list, fill, cull-none, clockwise front, depth test+write LESS,
+    // single opaque blend attachment, 1 sample, dynamic viewport/scissor
+    // (dynamic state is implicit in the IXRHI backend).
+    ixrhi::IXRHIGraphicsPipelineDesc desc;
+    desc.vertexShader = vs;
+    desc.fragmentShader = ps;
+    desc.bindGroupLayouts = {m_bindLayout.get()};
+    desc.vertexBindings = {{0, sizeof(Vertex)}};
+    desc.vertexAttributes = {
+        {0, 0, ixrhi::IXRHIFormat::R32G32B32Float, offsetof(Vertex, position)},
+        {1, 0, ixrhi::IXRHIFormat::R32G32B32Float, offsetof(Vertex, normal)},
+        {2, 0, ixrhi::IXRHIFormat::R32G32Float, offsetof(Vertex, uv)},
+    };
+    desc.topology = ixrhi::IXRHIPrimitiveTopology::TriangleList;
+    desc.cullMode = ixrhi::IXRHICullMode::None;
+    desc.frontFace = ixrhi::IXRHIFrontFace::Clockwise;
+    desc.depthTestEnable = true;
+    desc.depthWriteEnable = true;
+    desc.depthCompareOp = ixrhi::IXRHICompareOp::Less;
+    desc.blendAttachments = {{false,
+        ixrhi::IXRHIBlendFactor::One,
+        ixrhi::IXRHIBlendFactor::Zero,
+        ixrhi::IXRHIBlendOp::Add,
+        ixrhi::IXRHIBlendFactor::One,
+        ixrhi::IXRHIBlendFactor::Zero,
+        ixrhi::IXRHIBlendOp::Add}};
+    desc.sampleCount = 1;
+    desc.targetRenderPass = m_targetPass;
+    desc.debugName = "SkinnedMesh:Opaque";
+    m_pipeline = rhi.CreateGraphicsPipeline(desc);
+    if (!m_pipeline)
+        return false;
 
-    VkVertexInputBindingDescription binding{};
-    binding.binding = 0;
-    binding.stride = sizeof(Vertex);
-    binding.inputRate = VK_VERTEX_INPUT_RATE_VERTEX;
-
-    VkVertexInputAttributeDescription attributes[3]{};
-    attributes[0].location = 0;
-    attributes[0].binding = 0;
-    attributes[0].format = VK_FORMAT_R32G32B32_SFLOAT;
-    attributes[0].offset = offsetof(Vertex, position);
-    attributes[1].location = 1;
-    attributes[1].binding = 0;
-    attributes[1].format = VK_FORMAT_R32G32B32_SFLOAT;
-    attributes[1].offset = offsetof(Vertex, normal);
-    attributes[2].location = 2;
-    attributes[2].binding = 0;
-    attributes[2].format = VK_FORMAT_R32G32_SFLOAT;
-    attributes[2].offset = offsetof(Vertex, uv);
-
-    VkPipelineVertexInputStateCreateInfo vertexInput{};
-    vertexInput.sType = VK_STRUCTURE_TYPE_PIPELINE_VERTEX_INPUT_STATE_CREATE_INFO;
-    vertexInput.vertexBindingDescriptionCount = 1;
-    vertexInput.pVertexBindingDescriptions = &binding;
-    vertexInput.vertexAttributeDescriptionCount = 3;
-    vertexInput.pVertexAttributeDescriptions = attributes;
-
-    VkPipelineInputAssemblyStateCreateInfo assembly{};
-    assembly.sType = VK_STRUCTURE_TYPE_PIPELINE_INPUT_ASSEMBLY_STATE_CREATE_INFO;
-    assembly.topology = VK_PRIMITIVE_TOPOLOGY_TRIANGLE_LIST;
-
-    VkPipelineViewportStateCreateInfo viewport{};
-    viewport.sType = VK_STRUCTURE_TYPE_PIPELINE_VIEWPORT_STATE_CREATE_INFO;
-    viewport.viewportCount = 1;
-    viewport.scissorCount = 1;
-
-    VkPipelineRasterizationStateCreateInfo raster{};
-    raster.sType = VK_STRUCTURE_TYPE_PIPELINE_RASTERIZATION_STATE_CREATE_INFO;
-    raster.polygonMode = VK_POLYGON_MODE_FILL;
-    raster.cullMode = VK_CULL_MODE_NONE;
-    raster.frontFace = VK_FRONT_FACE_CLOCKWISE;
-    raster.lineWidth = 1.0f;
-
-    VkPipelineMultisampleStateCreateInfo multisample{};
-    multisample.sType = VK_STRUCTURE_TYPE_PIPELINE_MULTISAMPLE_STATE_CREATE_INFO;
-    multisample.rasterizationSamples = VK_SAMPLE_COUNT_1_BIT;
-
-    VkPipelineDepthStencilStateCreateInfo depth{};
-    depth.sType = VK_STRUCTURE_TYPE_PIPELINE_DEPTH_STENCIL_STATE_CREATE_INFO;
-    depth.depthTestEnable = VK_TRUE;
-    depth.depthWriteEnable = VK_TRUE;
-    depth.depthCompareOp = VK_COMPARE_OP_LESS;
-
-    VkPipelineColorBlendAttachmentState blendAttachment{};
-    blendAttachment.colorWriteMask = VK_COLOR_COMPONENT_R_BIT | VK_COLOR_COMPONENT_G_BIT |
-        VK_COLOR_COMPONENT_B_BIT | VK_COLOR_COMPONENT_A_BIT;
-
-    VkPipelineColorBlendStateCreateInfo blend{};
-    blend.sType = VK_STRUCTURE_TYPE_PIPELINE_COLOR_BLEND_STATE_CREATE_INFO;
-    blend.attachmentCount = 1;
-    blend.pAttachments = &blendAttachment;
-
-    VkDynamicState dynamicStates[] = {VK_DYNAMIC_STATE_VIEWPORT, VK_DYNAMIC_STATE_SCISSOR};
-    VkPipelineDynamicStateCreateInfo dynamic{};
-    dynamic.sType = VK_STRUCTURE_TYPE_PIPELINE_DYNAMIC_STATE_CREATE_INFO;
-    dynamic.dynamicStateCount = 2;
-    dynamic.pDynamicStates = dynamicStates;
-
-    VkPipelineLayoutCreateInfo layout{};
-    layout.sType = VK_STRUCTURE_TYPE_PIPELINE_LAYOUT_CREATE_INFO;
-    layout.setLayoutCount = 1;
-    layout.pSetLayouts = &m_descriptorSetLayout;
-    VK_CHECK(vkCreatePipelineLayout(m_device, &layout, nullptr, &m_pipelineLayout));
-
-    VkGraphicsPipelineCreateInfo pipeline{};
-    pipeline.sType = VK_STRUCTURE_TYPE_GRAPHICS_PIPELINE_CREATE_INFO;
-    pipeline.stageCount = 2;
-    pipeline.pStages = stages;
-    pipeline.pVertexInputState = &vertexInput;
-    pipeline.pInputAssemblyState = &assembly;
-    pipeline.pViewportState = &viewport;
-    pipeline.pRasterizationState = &raster;
-    pipeline.pMultisampleState = &multisample;
-    pipeline.pDepthStencilState = &depth;
-    pipeline.pColorBlendState = &blend;
-    pipeline.pDynamicState = &dynamic;
-    pipeline.layout = m_pipelineLayout;
-    pipeline.renderPass = m_mainRenderPass ? m_mainRenderPass : device.GetRenderPass();
-    pipeline.subpass = 0;
-    VK_CHECK(vkCreateGraphicsPipelines(m_device, VK_NULL_HANDLE, 1, &pipeline, nullptr, &m_pipeline));
-
-    vkDestroyShaderModule(m_device, ps, nullptr);
-    vkDestroyShaderModule(m_device, vs, nullptr);
+    LogFormat("[MESH] skinned graphics pipeline OK, pipeline=%s", m_pipeline->DebugName().c_str());
     return true;
 }
 
-bool SkinnedMeshRenderer::CreateReflectionPipeline(VulkanDevice& device, VkRenderPass renderPass)
+bool SkinnedMeshRenderer::CreateReflectionPipeline(ixrhi::IXRHIDevice& rhi,
+    const ixrhi::IXRHIRenderPass* renderPass)
 {
-    if (!m_assets || !m_pipelineLayout || renderPass == VK_NULL_HANDLE)
+    if (!m_assets || !m_bindLayout)
         return false;
 
-    VkShaderModule vs = CreateShaderModule(m_device, *m_assets, "assets/shaders/skinned_mesh_vs.spv");
-    VkShaderModule ps = CreateShaderModule(m_device, *m_assets, "assets/shaders/skinned_mesh_ps.spv");
+    auto vs = LoadShader(rhi,
+        *m_assets,
+        "assets/shaders/skinned_mesh_vs.spv",
+        ixrhi::IXRHIShaderStage::Vertex,
+        "VSMain");
+    auto ps = LoadShader(rhi,
+        *m_assets,
+        "assets/shaders/skinned_mesh_ps.spv",
+        ixrhi::IXRHIShaderStage::Fragment,
+        "PSMain");
+    if (!vs || !ps)
+        return false;
 
-    VkPipelineShaderStageCreateInfo stages[2]{};
-    stages[0].sType = VK_STRUCTURE_TYPE_PIPELINE_SHADER_STAGE_CREATE_INFO;
-    stages[0].stage = VK_SHADER_STAGE_VERTEX_BIT;
-    stages[0].module = vs;
-    stages[0].pName = "VSMain";
-    stages[1].sType = VK_STRUCTURE_TYPE_PIPELINE_SHADER_STAGE_CREATE_INFO;
-    stages[1].stage = VK_SHADER_STAGE_FRAGMENT_BIT;
-    stages[1].module = ps;
-    stages[1].pName = "PSMain";
+    // Same state as the main pipeline except front-face culling (mirrored
+    // winding seen from below the water plane) — exactly like before.
+    // A null pass means the backend default (swapchain pass); the token is
+    // stored EFFECTIVE (null resolved to m_targetPass at bake time) so later
+    // target swaps are detected by RenderInWorldReflection.
+    const ixrhi::IXRHIRenderPass* effectivePass = renderPass != nullptr ? renderPass : m_targetPass;
+    ixrhi::IXRHIGraphicsPipelineDesc desc;
+    desc.vertexShader = vs;
+    desc.fragmentShader = ps;
+    desc.bindGroupLayouts = {m_bindLayout.get()};
+    desc.vertexBindings = {{0, sizeof(Vertex)}};
+    desc.vertexAttributes = {
+        {0, 0, ixrhi::IXRHIFormat::R32G32B32Float, offsetof(Vertex, position)},
+        {1, 0, ixrhi::IXRHIFormat::R32G32B32Float, offsetof(Vertex, normal)},
+        {2, 0, ixrhi::IXRHIFormat::R32G32Float, offsetof(Vertex, uv)},
+    };
+    desc.topology = ixrhi::IXRHIPrimitiveTopology::TriangleList;
+    desc.cullMode = ixrhi::IXRHICullMode::Front;
+    desc.frontFace = ixrhi::IXRHIFrontFace::Clockwise;
+    desc.depthTestEnable = true;
+    desc.depthWriteEnable = true;
+    desc.depthCompareOp = ixrhi::IXRHICompareOp::Less;
+    desc.blendAttachments = {{false,
+        ixrhi::IXRHIBlendFactor::One,
+        ixrhi::IXRHIBlendFactor::Zero,
+        ixrhi::IXRHIBlendOp::Add,
+        ixrhi::IXRHIBlendFactor::One,
+        ixrhi::IXRHIBlendFactor::Zero,
+        ixrhi::IXRHIBlendOp::Add}};
+    desc.sampleCount = 1;
+    desc.targetRenderPass = effectivePass;
+    desc.debugName = "SkinnedMesh:Reflection";
+    m_reflectionPipeline = rhi.CreateGraphicsPipeline(desc);
+    if (!m_reflectionPipeline)
+        return false;
+    m_reflectionPass = effectivePass;
 
-    VkVertexInputBindingDescription binding{};
-    binding.binding = 0;
-    binding.stride = sizeof(Vertex);
-    binding.inputRate = VK_VERTEX_INPUT_RATE_VERTEX;
-
-    VkVertexInputAttributeDescription attributes[3]{};
-    attributes[0].location = 0;
-    attributes[0].binding = 0;
-    attributes[0].format = VK_FORMAT_R32G32B32_SFLOAT;
-    attributes[0].offset = offsetof(Vertex, position);
-    attributes[1].location = 1;
-    attributes[1].binding = 0;
-    attributes[1].format = VK_FORMAT_R32G32B32_SFLOAT;
-    attributes[1].offset = offsetof(Vertex, normal);
-    attributes[2].location = 2;
-    attributes[2].binding = 0;
-    attributes[2].format = VK_FORMAT_R32G32_SFLOAT;
-    attributes[2].offset = offsetof(Vertex, uv);
-
-    VkPipelineVertexInputStateCreateInfo vertexInput{};
-    vertexInput.sType = VK_STRUCTURE_TYPE_PIPELINE_VERTEX_INPUT_STATE_CREATE_INFO;
-    vertexInput.vertexBindingDescriptionCount = 1;
-    vertexInput.pVertexBindingDescriptions = &binding;
-    vertexInput.vertexAttributeDescriptionCount = static_cast<uint32_t>(std::size(attributes));
-    vertexInput.pVertexAttributeDescriptions = attributes;
-
-    VkPipelineInputAssemblyStateCreateInfo assembly{};
-    assembly.sType = VK_STRUCTURE_TYPE_PIPELINE_INPUT_ASSEMBLY_STATE_CREATE_INFO;
-    assembly.topology = VK_PRIMITIVE_TOPOLOGY_TRIANGLE_LIST;
-
-    VkPipelineViewportStateCreateInfo viewport{};
-    viewport.sType = VK_STRUCTURE_TYPE_PIPELINE_VIEWPORT_STATE_CREATE_INFO;
-    viewport.viewportCount = 1;
-    viewport.scissorCount = 1;
-
-    VkPipelineRasterizationStateCreateInfo raster{};
-    raster.sType = VK_STRUCTURE_TYPE_PIPELINE_RASTERIZATION_STATE_CREATE_INFO;
-    raster.polygonMode = VK_POLYGON_MODE_FILL;
-    raster.cullMode = VK_CULL_MODE_FRONT_BIT;
-    raster.frontFace = VK_FRONT_FACE_CLOCKWISE;
-    raster.lineWidth = 1.0f;
-
-    VkPipelineMultisampleStateCreateInfo multisample{};
-    multisample.sType = VK_STRUCTURE_TYPE_PIPELINE_MULTISAMPLE_STATE_CREATE_INFO;
-    multisample.rasterizationSamples = VK_SAMPLE_COUNT_1_BIT;
-
-    VkPipelineDepthStencilStateCreateInfo depth{};
-    depth.sType = VK_STRUCTURE_TYPE_PIPELINE_DEPTH_STENCIL_STATE_CREATE_INFO;
-    depth.depthTestEnable = VK_TRUE;
-    depth.depthWriteEnable = VK_TRUE;
-    depth.depthCompareOp = VK_COMPARE_OP_LESS;
-
-    VkPipelineColorBlendAttachmentState blendAttachment{};
-    blendAttachment.colorWriteMask = VK_COLOR_COMPONENT_R_BIT | VK_COLOR_COMPONENT_G_BIT |
-        VK_COLOR_COMPONENT_B_BIT | VK_COLOR_COMPONENT_A_BIT;
-
-    VkPipelineColorBlendStateCreateInfo blend{};
-    blend.sType = VK_STRUCTURE_TYPE_PIPELINE_COLOR_BLEND_STATE_CREATE_INFO;
-    blend.attachmentCount = 1;
-    blend.pAttachments = &blendAttachment;
-
-    VkDynamicState dynamicStates[] = {VK_DYNAMIC_STATE_VIEWPORT, VK_DYNAMIC_STATE_SCISSOR};
-    VkPipelineDynamicStateCreateInfo dynamic{};
-    dynamic.sType = VK_STRUCTURE_TYPE_PIPELINE_DYNAMIC_STATE_CREATE_INFO;
-    dynamic.dynamicStateCount = 2;
-    dynamic.pDynamicStates = dynamicStates;
-
-    VkGraphicsPipelineCreateInfo pipeline{};
-    pipeline.sType = VK_STRUCTURE_TYPE_GRAPHICS_PIPELINE_CREATE_INFO;
-    pipeline.stageCount = 2;
-    pipeline.pStages = stages;
-    pipeline.pVertexInputState = &vertexInput;
-    pipeline.pInputAssemblyState = &assembly;
-    pipeline.pViewportState = &viewport;
-    pipeline.pRasterizationState = &raster;
-    pipeline.pMultisampleState = &multisample;
-    pipeline.pDepthStencilState = &depth;
-    pipeline.pColorBlendState = &blend;
-    pipeline.pDynamicState = &dynamic;
-    pipeline.layout = m_pipelineLayout;
-    pipeline.renderPass = renderPass;
-    pipeline.subpass = 0;
-    VK_CHECK(vkCreateGraphicsPipelines(m_device, VK_NULL_HANDLE, 1, &pipeline, nullptr, &m_reflectionPipeline));
-    m_reflectionRenderPass = renderPass;
-
-    vkDestroyShaderModule(m_device, ps, nullptr);
-    vkDestroyShaderModule(m_device, vs, nullptr);
     Log("[WATER-3] Skinned mesh reflection pipeline created");
     return true;
 }
@@ -3104,61 +2380,31 @@ bool SkinnedMeshRenderer::CreateReflectionPipeline(VulkanDevice& device, VkRende
 void SkinnedMeshRenderer::DestroyPipeline()
 {
     DestroyReflectionPipeline();
-
-    if (m_pipeline)
-        vkDestroyPipeline(m_device, m_pipeline, nullptr);
-    m_pipeline = VK_NULL_HANDLE;
-
-    if (m_pipelineLayout)
-        vkDestroyPipelineLayout(m_device, m_pipelineLayout, nullptr);
-    m_pipelineLayout = VK_NULL_HANDLE;
+    m_pipeline.reset();
 }
 
 void SkinnedMeshRenderer::DestroyReflectionPipeline()
 {
-    if (m_reflectionPipeline)
-        vkDestroyPipeline(m_device, m_reflectionPipeline, nullptr);
-    m_reflectionPipeline = VK_NULL_HANDLE;
-    m_reflectionRenderPass = VK_NULL_HANDLE;
-}
-
-void SkinnedMeshRenderer::DestroyBuffer(Buffer& buffer)
-{
-    if (buffer.buffer)
-        vkDestroyBuffer(m_device, buffer.buffer, nullptr);
-    if (buffer.memory)
-        vkFreeMemory(m_device, buffer.memory, nullptr);
-    buffer = {};
+    m_reflectionPipeline.reset();
+    m_reflectionPass = nullptr;
 }
 
 void SkinnedMeshRenderer::DestroyComputeResources()
 {
-    if (m_computePipeline)
-        vkDestroyPipeline(m_device, m_computePipeline, nullptr);
-    m_computePipeline = VK_NULL_HANDLE;
+    m_computePipeline.reset();
+    m_computeBindGroup.reset();
+    m_computeBindLayout.reset();
 
-    if (m_computePipelineLayout)
-        vkDestroyPipelineLayout(m_device, m_computePipelineLayout, nullptr);
-    m_computePipelineLayout = VK_NULL_HANDLE;
-
-    if (m_computeDescriptorPool)
-        vkDestroyDescriptorPool(m_device, m_computeDescriptorPool, nullptr);
-    m_computeDescriptorPool = VK_NULL_HANDLE;
-
-    if (m_computeDescriptorSetLayout)
-        vkDestroyDescriptorSetLayout(m_device, m_computeDescriptorSetLayout, nullptr);
-    m_computeDescriptorSetLayout = VK_NULL_HANDLE;
-
-    DestroyBuffer(m_restVertexBuffer);
+    m_restVertexBuffer.reset();
     for (auto& frameBuffers : m_bonePaletteBuffers)
     {
-        for (Buffer& buffer : frameBuffers)
-            DestroyBuffer(buffer);
+        for (auto& buffer : frameBuffers)
+            buffer.reset();
     }
     for (auto& frameBuffers : m_skinnedOutputBuffers)
     {
-        for (Buffer& buffer : frameBuffers)
-            DestroyBuffer(buffer);
+        for (auto& buffer : frameBuffers)
+            buffer.reset();
     }
 }
 
@@ -3171,19 +2417,6 @@ void SkinnedMeshRenderer::DestroyAnimation()
     m_boneCount = 0;
     m_motionState = MotionState::Idle;
     m_lastAnimationLogTime = -1000.0;
-}
-
-void SkinnedMeshRenderer::DestroyTexture(Texture& texture)
-{
-    if (texture.sampler)
-        vkDestroySampler(m_device, texture.sampler, nullptr);
-    if (texture.view)
-        vkDestroyImageView(m_device, texture.view, nullptr);
-    if (texture.image)
-        vkDestroyImage(m_device, texture.image, nullptr);
-    if (texture.memory)
-        vkFreeMemory(m_device, texture.memory, nullptr);
-    texture = {};
 }
 
 void SkinnedMeshRenderer::UpdateUniform(uint32_t frameIndex, uint32_t uniformSlot, double timeSeconds, float aspect)
@@ -3215,10 +2448,9 @@ void SkinnedMeshRenderer::UpdateUniform(uint32_t frameIndex, uint32_t uniformSlo
     noWater.causticMode = WaterConfig::CausticMode::Off;
     FillWaterUniform(noWater, timeSeconds, uniform);
 
-    void* mapped = nullptr;
-    VK_CHECK(vkMapMemory(m_device, m_uniformBuffers[frameIndex][uniformSlot].memory, 0, sizeof(uniform), 0, &mapped));
-    std::memcpy(mapped, &uniform, sizeof(uniform));
-    vkUnmapMemory(m_device, m_uniformBuffers[frameIndex][uniformSlot].memory);
+    if (frameIndex < kFramesInFlight && uniformSlot < kUniformSlots &&
+        m_uniformBuffers[frameIndex][uniformSlot])
+        m_uniformBuffers[frameIndex][uniformSlot]->Write(0, &uniform, sizeof(uniform));
 }
 
 void SkinnedMeshRenderer::UpdateWorldUniform(uint32_t frameIndex,
@@ -3269,8 +2501,7 @@ void SkinnedMeshRenderer::UpdateWorldUniform(uint32_t frameIndex,
         FillWaterUniform(noWater, timeSeconds, uniform);
     }
 
-    void* mapped = nullptr;
-    VK_CHECK(vkMapMemory(m_device, m_uniformBuffers[frameIndex][uniformSlot].memory, 0, sizeof(uniform), 0, &mapped));
-    std::memcpy(mapped, &uniform, sizeof(uniform));
-    vkUnmapMemory(m_device, m_uniformBuffers[frameIndex][uniformSlot].memory);
+    if (frameIndex < kFramesInFlight && uniformSlot < kUniformSlots &&
+        m_uniformBuffers[frameIndex][uniformSlot])
+        m_uniformBuffers[frameIndex][uniformSlot]->Write(0, &uniform, sizeof(uniform));
 }

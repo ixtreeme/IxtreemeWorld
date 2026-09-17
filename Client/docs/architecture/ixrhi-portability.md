@@ -1,4 +1,4 @@
-# IXRHI portability baseline (Phase 2, updated Phase 3C)
+# IXRHI portability baseline (Phase 2, updated Phase 3C, compute review Phase 3D)
 
 No MoltenVK integration in this phase. This document records what the core
 guarantees, what is optional, and which Vulkan-specific assumptions remain.
@@ -59,3 +59,19 @@ rayQuery/rayTracing, meshShaders, variableRateShading, asyncCompute.
   desc clamps (e.g. sampler LOD, multisample counts) — centralize in
   IXVulkanConversions when that backend lands.
 - No Metal backend, no separate shader language: SPIR-V stays the interchange.
+
+## Phase-3D compute review (MoltenVK-relevant, no Apple code)
+
+- Workload: 3 storage buffers (read-only rest vertices, read-only bone
+  palette, read-write skinned output), one `numthreads(64,1,1)` dispatch per
+  (frame, skin slot), same-queue compute→graphics barrier
+  (ShaderWrite→VertexRead). No atomics, no groupshared memory, no
+  cross-queue semaphore — all inside the portability subset.
+- Shader interchange stays SPIR-V via DXC (`CSMain`); the HLSL uses
+  `vk::binding` + `register()` annotations that DXC lowers the same way for
+  the graphics stages already in use — no new shader-language assumption.
+- `Storage` buffer usage + host-visible coherent palette upload uses the
+  same coherent-upload path as the existing uniform/storage usage; no new
+  memory-model assumption.
+- Frames in flight = 2 discipline unchanged: per-frame/per-slot palette +
+  output buffers (64 slots each), no buffer sharing across in-flight frames.

@@ -2502,7 +2502,7 @@ int RunGame(NativeWindow& window,
         if (entry.state == SkinnedMeshCacheEntry::State::Failed)
             return nullptr;
         entry.renderer = std::make_unique<SkinnedMeshRenderer>();
-        if (!entry.renderer->Create(device, assets, modelPath))
+        if (!entry.renderer->Create(*rhiDevice, assets, modelPath))
         {
             entry.renderer.reset();
             entry.state = SkinnedMeshCacheEntry::State::Failed;
@@ -2514,7 +2514,7 @@ int RunGame(NativeWindow& window,
         if (offscreenSceneOk)
         {
                 entry.renderer->SetTargetPass(offscreenScene.GetTargetPass());
-            entry.renderer->RecreatePipeline(device);
+            entry.renderer->RecreatePipeline(*rhiDevice);
         }
         entry.renderer->SetLightingState(skinnedCacheLighting);
         entry.state = SkinnedMeshCacheEntry::State::Loaded;
@@ -2645,7 +2645,7 @@ int RunGame(NativeWindow& window,
             if (skinnedEntry.renderer)
             {
                 skinnedEntry.renderer->SetTargetPass(offscreenScene.GetTargetPass());
-                skinnedEntry.renderer->RecreatePipeline(device);
+                skinnedEntry.renderer->RecreatePipeline(*rhiDevice);
             }
         }
         for (auto& [path, entry] : staticMeshCache)
@@ -4988,7 +4988,7 @@ int RunGame(NativeWindow& window,
                 {
                     (void)skinnedPath;
                     if (skinnedEntry.renderer)
-                        skinnedEntry.renderer->RecreatePipeline(device);
+                        skinnedEntry.renderer->RecreatePipeline(*rhiDevice);
                 }
                 for (auto& [path, entry] : staticMeshCache)
                 {
@@ -9972,7 +9972,8 @@ int RunGame(NativeWindow& window,
                         const std::uint32_t slot = allocSceneSkinSlot(defaultEntry);
                         if (slot == std::numeric_limits<std::uint32_t>::max())
                             break;
-                        defaultSkinned->SkinInstance(device,
+                        defaultSkinned->SkinInstance(*frameInfo.commandList,
+                            frameInfo,
                             slot,
                             ToSkinnedMeshMotion(entity.moveState),
                             static_cast<float>(seconds));
@@ -10167,11 +10168,11 @@ int RunGame(NativeWindow& window,
                         if (sceneSlot != std::numeric_limits<std::uint32_t>::max())
                         {
                             if (animatorPose.size() != 0)
-                                skinnedRenderer->SkinInstanceFromPose(device, sceneSlot, animatorPose);
+                                skinnedRenderer->SkinInstanceFromPose(*frameInfo.commandList, frameInfo, sceneSlot, animatorPose);
                             else if (retargetedPose.size() != 0)
-                                skinnedRenderer->SkinInstanceFromPose(device, sceneSlot, retargetedPose);
+                                skinnedRenderer->SkinInstanceFromPose(*frameInfo.commandList, frameInfo, sceneSlot, retargetedPose);
                             else
-                                skinnedRenderer->SkinInstance(device, sceneSlot, editorMeshMotion, static_cast<float>(seconds));
+                                skinnedRenderer->SkinInstance(*frameInfo.commandList, frameInfo, sceneSlot, editorMeshMotion, static_cast<float>(seconds));
                             sceneEditorSkinnedDraws.push_back(SkinnedDrawRecord{skinnedRenderer, sceneSlot, skinnedPosition, skinnedYaw,
                                 skinnedSelected ? std::array<float, 4>{1.25f, 1.15f, 0.65f, 1.0f}
                                                 : std::array<float, 4>{1.0f, 1.0f, 1.0f, 1.0f}});
@@ -10193,11 +10194,11 @@ int RunGame(NativeWindow& window,
                             if (gameSlot != std::numeric_limits<std::uint32_t>::max())
                             {
                                 if (animatorPose.size() != 0)
-                                    skinnedRenderer->SkinInstanceFromPose(device, gameSlot, animatorPose);
+                                    skinnedRenderer->SkinInstanceFromPose(*frameInfo.commandList, frameInfo, gameSlot, animatorPose);
                                 else if (retargetedPose.size() != 0)
-                                    skinnedRenderer->SkinInstanceFromPose(device, gameSlot, retargetedPose);
+                                    skinnedRenderer->SkinInstanceFromPose(*frameInfo.commandList, frameInfo, gameSlot, retargetedPose);
                                 else
-                                    skinnedRenderer->SkinInstance(device, gameSlot, editorMeshMotion, static_cast<float>(seconds));
+                                    skinnedRenderer->SkinInstance(*frameInfo.commandList, frameInfo, gameSlot, editorMeshMotion, static_cast<float>(seconds));
                                 gameEditorSkinnedDraws.push_back(SkinnedDrawRecord{skinnedRenderer, gameSlot, skinnedPosition, skinnedYaw,
                                     std::array<float, 4>{1.0f, 1.0f, 1.0f, 1.0f}});
                             }
@@ -10218,7 +10219,7 @@ int RunGame(NativeWindow& window,
             else if (runtimeSession->IsLobbyActive())
             {
                 if (SkinnedMeshRenderer* lobbySkinned = getSkinnedMeshRenderer(kDefaultCharacterModelPath))
-                    lobbySkinned->Skin(device, seconds);
+                    lobbySkinned->Skin(*frameInfo.commandList, frameInfo, seconds);
             }
 
             const auto sceneRenderBegin = std::chrono::steady_clock::now();
@@ -10239,16 +10240,23 @@ int RunGame(NativeWindow& window,
                         VkRenderPass reflectionRenderPass,
                         float waterLevelY)
                     {
+                        // The native reflection pass handle stays on the terrain side: the
+                        // skinned reflection pipeline is baked against the borrowed IXRHI
+                        // pass token (attachment-compatible formats), so only the extent
+                        // crosses here.
+                        (void)reflectionRenderPass;
                         // Redraw the exact (renderer, slot) recorded by the Scene pre-pass — the
                         // output buffers are already skinned, so no fresh slot allocation here.
                         for (const SkinnedDrawRecord& rec : sceneSkinnedDraws)
                         {
                             if (!rec.renderer)
                                 continue;
-                            rec.renderer->RenderInWorldReflection(device,
+                            rec.renderer->RenderInWorldReflection(*frameInfo.commandList,
+                                frameInfo,
                                 mirrorCamera,
-                                reflectionExtent,
-                                reflectionRenderPass,
+                                reflectionExtent.width,
+                                reflectionExtent.height,
+                                nullptr,
                                 waterLevelY,
                                 rec.position,
                                 rec.yaw,
@@ -10299,14 +10307,16 @@ int RunGame(NativeWindow& window,
                 {
                     if (!rec.renderer)
                         continue;
-                    rec.renderer->RenderInWorld(device,
+                    rec.renderer->RenderInWorld(*frameInfo.commandList,
+                        frameInfo,
                         seconds,
                         camera,
                         rec.position,
                         rec.yaw,
                         rec.slot,
                         rec.tint,
-                        renderSize);
+                        renderSize.width,
+                        renderSize.height);
                 }
                 // Name plates over each networked entity. The label sits a fixed height above
                 // the model's grounded origin (the default character's ground offset, if any).
@@ -10364,14 +10374,16 @@ int RunGame(NativeWindow& window,
                     {
                         if (!rec.renderer)
                             continue;
-                        rec.renderer->RenderInWorld(device,
+                        rec.renderer->RenderInWorld(*frameInfo.commandList,
+                            frameInfo,
                             seconds,
                             camera,
                             rec.position,
                             rec.yaw,
                             rec.slot,
                             rec.tint,
-                            renderSize);
+                            renderSize.width,
+                            renderSize.height);
                         ++frameStaticMeshDrawCalls;
                     }
                     auto logLodDisposition = [&](const StaticMeshLodBatch::LodDispositionRecord& record) {
@@ -10893,7 +10905,7 @@ int RunGame(NativeWindow& window,
                 frameSceneRenderCalled = true;
                 frameSceneEntityCount = 1;
                 rhiDevice->WriteTimestamp(ixrhi::IXRHITimestampPoint::SceneOtherBegin);
-                lobbySkinned->Render(device, seconds);
+                lobbySkinned->Render(*frameInfo.commandList, frameInfo, seconds);
                 rhiDevice->WriteTimestamp(ixrhi::IXRHITimestampPoint::SceneOtherEnd);
             }
 
@@ -11017,8 +11029,8 @@ int RunGame(NativeWindow& window,
                             {
                                 if (!rec.renderer)
                                     continue;
-                                rec.renderer->RenderInWorld(device, seconds, gameCamera,
-                                    rec.position, rec.yaw, rec.slot, rec.tint, gameExtent);
+                                rec.renderer->RenderInWorld(*frameInfo.commandList, frameInfo, seconds, gameCamera,
+                                    rec.position, rec.yaw, rec.slot, rec.tint, gameExtent.width, gameExtent.height);
                             }
                         }
                         if (hasSceneTerrain)
