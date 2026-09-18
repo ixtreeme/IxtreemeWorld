@@ -22,8 +22,7 @@
 #include "ScriptSystem.h"
 #include "ScriptApiImpl.h"
 #include "BuildService.h"  // ixeditor::build::GameScriptBuildService — cmake Build worker (Editor/Build boundary)
-#include "IXVulkanConversions.h" // FromVkFormat — swapchain format queries for offscreen targets
-#include "IXVulkanDevice.h" // ixvulkan::IXVulkanDevice — IXRHI backend owning the frame lifecycle
+#include "IXVulkanDevice.h" // ixvulkan::CreateDevice factory seam + editor adapter (backend bootstrap)
 #include "IXVulkanEditorAdapter.h" // backend-specific editor integration (isolated)
 #include "EditorImGui.h"
 #include "physics/PhysicsWorld.h"
@@ -2386,8 +2385,8 @@ int RunGame(NativeWindow& window,
     ixrhi::IXRHIFormat offscreenColorFormat = ixrhi::IXRHIFormat::Undefined;
     ixrhi::IXRHIFormat offscreenDepthFormat = ixrhi::IXRHIFormat::Undefined;
     auto refreshOffscreenFormats = [&]() {
-        offscreenColorFormat = ixvulkan::FromVkFormat(device.GetSwapchainFormat());
-        offscreenDepthFormat = ixvulkan::FromVkFormat(device.GetDepthStencilFormat());
+        offscreenColorFormat = rhiDevice->GetMainSwapchain().ColorFormat();
+        offscreenDepthFormat = rhiDevice->GetMainSwapchain().DepthFormat();
     };
     refreshOffscreenFormats();
     bool offscreenSceneOk = offscreenScene.Create(*rhiDevice,

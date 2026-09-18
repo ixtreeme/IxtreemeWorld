@@ -17,8 +17,6 @@
 // Vk* in THIS header is allowed: Engine/Graphics/Vulkan is the backend module.
 // It must not leak further: renderer/editor headers take IXRHI types only.
 
-#pragma once
-
 // IXVulkanDevice — Vulkan backend owning the IXRHI graphics frame contract.
 //
 // Phase 3C authority: frame acquisition, per-frame command ownership,

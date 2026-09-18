@@ -271,8 +271,6 @@ if(WIN32)
     endif()
 
     set(GENERATED_SHADER_DIR "${CLIENT_ROOT}/assets/shaders")
-    set(CUBE_VS_SPV "${GENERATED_SHADER_DIR}/cube_vs.spv")
-    set(CUBE_PS_SPV "${GENERATED_SHADER_DIR}/cube_ps.spv")
     set(SKINNED_MESH_VS_SPV "${GENERATED_SHADER_DIR}/skinned_mesh_vs.spv")
     set(SKINNED_MESH_PS_SPV "${GENERATED_SHADER_DIR}/skinned_mesh_ps.spv")
     set(SKINNED_MESH_CS_SPV "${GENERATED_SHADER_DIR}/skinned_mesh_cs.spv")
@@ -295,22 +293,6 @@ if(WIN32)
     set(RMLUI_VS_SPV "${GENERATED_SHADER_DIR}/rmlui_vs.spv")
     set(RMLUI_PS_SPV "${GENERATED_SHADER_DIR}/rmlui_ps.spv")
 
-    add_custom_command(
-        OUTPUT "${CUBE_VS_SPV}"
-        COMMAND ${CMAKE_COMMAND} -E make_directory "${GENERATED_SHADER_DIR}"
-        COMMAND "${DXC_EXECUTABLE}" -spirv -T vs_6_0 -E VSMain
-            -Fo "${CUBE_VS_SPV}" "${CLIENT_ROOT}/shaders/Cube.hlsl"
-        DEPENDS "${CLIENT_ROOT}/shaders/Cube.hlsl"
-        VERBATIM
-    )
-    add_custom_command(
-        OUTPUT "${CUBE_PS_SPV}"
-        COMMAND ${CMAKE_COMMAND} -E make_directory "${GENERATED_SHADER_DIR}"
-        COMMAND "${DXC_EXECUTABLE}" -spirv -T ps_6_0 -E PSMain
-            -Fo "${CUBE_PS_SPV}" "${CLIENT_ROOT}/shaders/Cube.hlsl"
-        DEPENDS "${CLIENT_ROOT}/shaders/Cube.hlsl"
-        VERBATIM
-    )
     add_custom_command(
         OUTPUT "${SKINNED_MESH_VS_SPV}"
         COMMAND ${CMAKE_COMMAND} -E make_directory "${GENERATED_SHADER_DIR}"
@@ -480,8 +462,6 @@ if(WIN32)
         VERBATIM
     )
     add_custom_target(IXEngineShaders DEPENDS
-        "${CUBE_VS_SPV}"
-        "${CUBE_PS_SPV}"
         "${SKINNED_MESH_VS_SPV}"
         "${SKINNED_MESH_PS_SPV}"
         "${SKINNED_MESH_CS_SPV}"

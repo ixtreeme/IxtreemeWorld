@@ -99,17 +99,13 @@ target_link_libraries(IXEngineRender
         ${CLIENT_FLECS_TARGET}
 )
 
-# PRIVATE backend access for still-native code in transition (TerrainRenderer
-# refraction seam). Does not propagate: migrated renderers see IXRHI only.
-target_link_libraries(IXEngineRender
-    PRIVATE
-        IXEngineVulkan
-)
-
+# NOTE: no Vulkan backend dependency here. Generic render code sees IXRHI
+# only; Vulkan headers/libs reach this target transitively via
+# IXEnginePlatform (VulkanDevice.h) where still needed. The app links
+# IXEngineVulkan directly for the backend factory/adapter.
 if(WIN32)
     target_link_libraries(IXEngineRender
         PUBLIC
-            Vulkan::Vulkan
             Gdi32
             Advapi32
     )
@@ -124,7 +120,6 @@ if(WIN32)
 elseif(ANDROID)
     target_link_libraries(IXEngineRender
         PUBLIC
-            vulkan
             log
             android
     )

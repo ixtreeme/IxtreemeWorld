@@ -1,4 +1,4 @@
-# Phase-2/3 migration status (updated at Phase-3G completion)
+# Phase-2/3 migration status (updated at Phase-3H completion)
 
 IXRHI owns the graphics frame contract; IXVulkan implements it. The legacy
 VulkanDevice keeps device/queue/swapchain-handle infrastructure plus synced
@@ -196,12 +196,15 @@ Vulkan API` (§78 `IXVulkanContext` or equivalent absorbs the remainder).
   swapchain main pass (direct mode) and the game-view target — all share
   the swapchain color/depth formats, hence structurally compatible.
 
-## Recommended follow-ups (not 3F scope)
+## Recommended follow-ups (not 3H scope; see phase3h-audit.md)
 
 - Legacy `VulkanDevice` absorption into the backend (`IXVulkanContext` or
-  equivalent): instance/device/queues/swapchain-handle migration.
+  equivalent): instance/device/queues/swapchain-handle migration (audited
+  in 3H, deliberately not moved — no duplication exists).
 - Fence-based retirement queue replacing blanket shared ownership.
 - `WaitIdle` in offscreen resize → affected-frame wait or deferred retire.
 - Workstation validation: terrain/water/shadow/reflection visual parity,
   edit stress (§89), scene reload (§90), resize (§92) — build + contract
   verified, GPU runtime unverified (§100).
+- Stale `IwSelfTest` source: rewire-or-retire decision (currently unwired,
+  not a gate; do not delete blindly).
