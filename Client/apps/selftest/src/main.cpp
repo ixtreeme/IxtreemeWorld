@@ -1890,7 +1890,7 @@ bool RunRenderChecks(const Options& options, TestContext& ctx)
             clientMainSource.find("body.config = state.config") == std::string::npos &&
             clientMainSource.find("SetWaterMaterials(editorImGui.GetWaterMaterialsSnapshot())") != std::string::npos,
         "water body uses material reference", "Client main must not copy material config into WaterBody");
-    ctx.Expect(clientMainSource.find("terrain.SetSelectedWaterBodyHighlight(device, 0u)") != std::string::npos &&
+    ctx.Expect(clientMainSource.find("terrain.SetSelectedWaterBodyHighlight(*rhiDevice, 0u)") != std::string::npos &&
             clientMainSource.find("RenderSelectedWaterBodyHighlight(device, camera)") == std::string::npos &&
             clientMainSource.find("Water \" + std::to_string(body.id)") == std::string::npos &&
             clientMainSource.find("for (const WaterBody& body : editorWaterBodies)\n                    {\n                        if (skinSlot") == std::string::npos,

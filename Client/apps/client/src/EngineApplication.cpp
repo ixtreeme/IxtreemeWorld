@@ -2264,7 +2264,7 @@ int RunGame(NativeWindow& window,
 #endif
     );
     std::unique_ptr<RuntimeSession> runtimeSession = CreateRuntimeSession();
-    if (!runtimeSession->Create(device, assets, swapchainSize.width, swapchainSize.height))
+    if (!runtimeSession->Create(assets, swapchainSize.width, swapchainSize.height))
     {
         ShowFatal("Failed to create runtime session. See debug output/stderr.");
         device.Destroy();
@@ -5005,7 +5005,7 @@ int RunGame(NativeWindow& window,
                     selectionOutlines.RecreatePipeline(*rhiDevice);
                 if (worldLabelsOk)
                     worldLabels.RecreatePipeline(*rhiDevice);
-                runtimeSession->OnRenderPassChanged(device);
+                runtimeSession->OnRenderPassChanged();
                 rmlUi.RecreatePipeline(*rhiDevice);
 #if defined(IXTREEME_WITH_EDITOR)
                 editorAdapter->OnRenderPassChanged();

@@ -1,4 +1,4 @@
-# Phase-2/3 migration status (updated at Phase-3F completion)
+# Phase-2/3 migration status (updated at Phase-3G completion)
 
 IXRHI owns the graphics frame contract; IXVulkan implements it. The legacy
 VulkanDevice keeps device/queue/swapchain-handle infrastructure plus synced
@@ -165,6 +165,36 @@ Vulkan API` (§78 `IXVulkanContext` or equivalent absorbs the remainder).
   cover full mips/layers; depth sampled as texture uses the depth-read
   layout in barriers and descriptor writes (also fixes the offscreen depth
   snapshot path).
+
+## Phase-3G: Water audit + completion (no new IXRHI primitives)
+
+- Audit result: Phase 3F had already migrated ALL water rendering
+  (bodies, water pipeline, water bind group, reflection target, shadow
+  coupling) inside `TerrainRenderer`; `WaterBodyIO` is pure serialization,
+  editor water code and `terrain_editor_system` contain zero Vulkan.
+  BEFORE count for the remaining surface: only the generic
+  `RuntimeSession` interface (`Create`/`OnRenderPassChanged` taking
+  `VulkanDevice&`, stub-ignored) — migrated to device-free signatures.
+- Ownership audit (§30-31): `TerrainRenderer` is the single owner of the
+  water path (terrain-coupled by design: shared reflection target, shared
+  frame flow, terrain UBO carries water globals). No duplicated
+  Terrain-group/Water-group bindings exist; no transitional seam was
+  created in 3F, so none needed finishing. Shared Terrain→Water resources
+  (reflection color, refraction snapshots) are `shared_ptr`-owned by their
+  producers and rebound only on object change (early-out otherwise).
+- Correctness review of the migrated path: slot math identical at write
+  vs draw (`(body*2+view)*2+frame`); uniform buffers selected by the same
+  triple at both sites; shadow attachment→read transition once per shadow
+  render with Clear/UNDEFINED re-open (no transition back needed);
+  reflection color ends in shader-read layout from the target itself;
+  refraction snapshots rebound per frame with pointer-equality early-out.
+  Water animation uses wall/application `seconds`, never the frame count.
+  No per-frame `WaitIdle` on any water path (event-driven paths keep
+  their setup-time waits, same as before).
+- Pipeline compatibility (§63): the water pipeline bakes against the
+  offscreen scene pass token and draws into the offscreen target, the
+  swapchain main pass (direct mode) and the game-view target — all share
+  the swapchain color/depth formats, hence structurally compatible.
 
 ## Recommended follow-ups (not 3F scope)
 
