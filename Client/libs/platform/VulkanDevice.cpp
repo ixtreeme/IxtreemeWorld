@@ -243,22 +243,6 @@ void VulkanDevice::WaitIdle()
         VK_CHECK(vkDeviceWaitIdle(m_device));
 }
 
-void VulkanDevice::SetMigrationFrameState(VkCommandBuffer activeCmd,
-                                         uint32_t frameIndex,
-                                         uint32_t imageIndex,
-                                         uint64_t frameNumber,
-                                         uint64_t safeFrameNumber,
-                                         bool frameActive)
-{
-    m_migrationActiveCmd = activeCmd;
-    m_currentFrame = frameIndex;
-    m_imageIndex = imageIndex;
-    m_frameNumber = frameNumber;
-    m_safeFrameNumber = safeFrameNumber;
-    m_frameStarted = frameActive;
-    m_skipFrame = !frameActive;
-}
-
 VkImage VulkanDevice::GetSwapchainImage(uint32_t index) const
 {
     return index < m_swapchainImages.size() ? m_swapchainImages[index] : VK_NULL_HANDLE;
@@ -511,9 +495,9 @@ bool VulkanDevice::CreateSwapchainObjects(uint32_t width, uint32_t height)
     if (width == 0 || height == 0)
         return true;
 
-    // NOTE (Phase 3C): the main render pass + framebuffers are backend-owned
-    // (IXVulkanSwapchain). Legacy CreateRenderPass/CreateFramebuffers are
-    // dormant; m_renderPass is a backend-synced mirror, m_framebuffers unused.
+    // NOTE (Phase 3C/3F): the main render pass + framebuffers are
+    // backend-owned (IXVulkanSwapchain). Legacy CreateRenderPass/
+    // CreateFramebuffers are dormant; the 3C pass mirror was deleted in 3F.
     return CreateSwapchain(width, height) && CreateImageViews() && CreateDepthStencilImages();
 }
 
@@ -523,7 +507,6 @@ bool VulkanDevice::CreateSwapchain(uint32_t width, uint32_t height)
     if (support.formats.empty() || support.presentModes.empty())
     {
         Log("[VULKAN] Swap-chain create skipped: surface has no formats or present modes available.");
-        m_swapchainDirty = true;
         return false;
     }
 
@@ -612,7 +595,6 @@ bool VulkanDevice::CreateSwapchain(uint32_t width, uint32_t height)
         createResult == VK_ERROR_INITIALIZATION_FAILED)
     {
         LogFormat("[VULKAN] Swap-chain create deferred: %s", VkResultName(createResult));
-        m_swapchainDirty = true;
         m_swapchain = VK_NULL_HANDLE;
         return false;
     }
@@ -813,15 +795,13 @@ void VulkanDevice::DestroySwapchainObjects()
 {
     if (m_swapchain)
     {
-        LogFormat("[SWP-DIAG] destroy swapchain handle=0x%llx imageCount=%zu frame=%llu",
+        LogFormat("[SWP-DIAG] destroy swapchain handle=0x%llx imageCount=%zu",
             VkHandleBits(m_swapchain),
-            m_swapchainImages.size(),
-            static_cast<unsigned long long>(m_frameNumber));
+            m_swapchainImages.size());
     }
 
     // NOTE (Phase 3C): framebuffers + render pass are backend-owned now (see
-    // IXVulkanSwapchain); legacy must not destroy them. m_renderPass is a
-    // backend-synced mirror cleared by the backend.
+    // IXVulkanSwapchain); legacy must not destroy them.
 
     for (VkImageView view : m_depthStencilImageViews)
         vkDestroyImageView(m_device, view, nullptr);
@@ -851,8 +831,7 @@ bool VulkanDevice::RecreateSwapchain(uint32_t width, uint32_t height)
     if (width == 0 || height == 0)
         return true;
 
-    LogFormat("[SWP-DIAG] recreate begin frame=%llu oldSwapchain=0x%llx extent=%ux%u requested=%ux%u",
-        static_cast<unsigned long long>(m_frameNumber),
+    LogFormat("[SWP-DIAG] recreate begin oldSwapchain=0x%llx extent=%ux%u requested=%ux%u",
         VkHandleBits(m_swapchain),
         m_swapchainExtent.width,
         m_swapchainExtent.height,
@@ -860,7 +839,6 @@ bool VulkanDevice::RecreateSwapchain(uint32_t width, uint32_t height)
         height);
     VK_CHECK(vkDeviceWaitIdle(m_device));
     DestroySwapchainObjects();
-    m_swapchainDirty = false;
     return CreateSwapchainObjects(width, height);
 }
 

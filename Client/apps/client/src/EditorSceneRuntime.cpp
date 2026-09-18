@@ -2,9 +2,9 @@
 
 #include "Debug.h"
 #include "EditorImGui.h"
+#include "IXRHIDevice.h"
 #include "RuntimeSession.h"
 #include "TerrainRenderer.h"
-#include "VulkanDevice.h"
 
 #include <algorithm>
 #include <utility>
@@ -124,7 +124,7 @@ void EditorSceneRuntime::ApplySceneData(const SceneData& scene)
         m_context.runtimeSession->SetWaterBodyEditorState({});
     }
 
-    if (m_context.terrainOk && m_context.terrain && m_context.device)
+    if (m_context.terrainOk && m_context.terrain && m_context.rhi)
     {
         if (m_context.syncTerrainAssetRoots)
             m_context.syncTerrainAssetRoots();
@@ -132,21 +132,21 @@ void EditorSceneRuntime::ApplySceneData(const SceneData& scene)
         m_context.terrain->SetLightingState(scene.lighting);
         if (scene.terrain.exists)
         {
-            m_context.terrain->CreateFlatTerrain(*m_context.device, scene.terrain);
+            m_context.terrain->CreateFlatTerrain(*m_context.rhi, scene.terrain);
             if (m_context.waterBodies)
             {
-                m_context.terrain->SetWaterBodies(*m_context.device, *m_context.waterBodies);
+                m_context.terrain->SetWaterBodies(*m_context.rhi, *m_context.waterBodies);
                 *m_context.waterBodies = m_context.terrain->GetWaterBodies();
             }
         }
         else
         {
-            m_context.terrain->ClearTerrain(*m_context.device);
+            m_context.terrain->ClearTerrain();
             if (m_context.waterBodies)
                 m_context.waterBodies->clear();
             Tracen("[SCENE] no terrain in scene");
         }
-        if (m_context.terrain->ApplyPaletteSlots(*m_context.device, scene.paletteSlots) &&
+        if (m_context.terrain->ApplyPaletteSlots(*m_context.rhi, scene.paletteSlots) &&
             m_context.editorImGui)
         {
             m_context.editorImGui->SetPaletteSlots(m_context.terrain->GetPaletteSlots());

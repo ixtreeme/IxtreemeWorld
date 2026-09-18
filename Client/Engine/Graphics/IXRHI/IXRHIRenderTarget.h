@@ -26,8 +26,9 @@ class IXRHICommandList;
 
 struct IXRHIRenderTargetDesc
 {
-    std::shared_ptr<IXRHITexture> color;
+    std::shared_ptr<IXRHITexture> color; // null = depth-only target (shadow maps)
     std::shared_ptr<IXRHITexture> depth; // null = no depth attachment
+    std::uint32_t depthLayer = 0; // array slice for layered depth (cascades)
     IXRHILoadOp colorLoad = IXRHILoadOp::Clear;
     IXRHIStoreOp colorStore = IXRHIStoreOp::Store;
     IXRHILoadOp depthLoad = IXRHILoadOp::Clear;

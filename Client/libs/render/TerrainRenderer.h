@@ -1,17 +1,32 @@
 #pragma once
 
-#include "VulkanDevice.h"
+// TerrainRenderer — Phase-3F IXRHI-native terrain + water rendering.
+//
+// ZERO Vk* dependency: mesh/uniform buffers, height/splat/material/water
+// textures (including mipmapped arrays), samplers (incl. the shadow
+// comparison sampler), bind groups, main/reflection/water/shadow pipelines
+// and shadow/reflection render targets are IXRHI objects; all draws record
+// through ixrhi::IXRHICommandList from the canonical frame context.
+//
+// Preserved exactly (NOT redesigned): chunk mesh generation + frustum draws,
+// CPU mip-chain generation, full-texture sculpt/paint uploads, mapped-write
+// sculpt semantics (via Read-modify-Write spans), dual camera-uniform paths
+// (Scene/Game views), 4-cascade PCF shadows with depth bias, water
+// reflection/refraction coupling (IXRHI-owned snapshots), editor tools.
+
 #include "WorldCamera.h"
 #include "InputEvent.h"
 #include "MapEditorTypes.h"
 
+#include "IXRHIBinding.h"
+#include "IXRHIBuffer.h"
+#include "IXRHICommandList.h"
+#include "IXRHIDevice.h"
+#include "IXRHIFrame.h"
+#include "IXRHIPipeline.h"
 #include "IXRHIRenderPass.h"
+#include "IXRHIRenderTarget.h"
 #include "IXRHITexture.h"
-
-namespace ixrhi
-{
-class IXRHIDevice;
-}
 
 #include <array>
 #include <cstdint>
@@ -50,22 +65,15 @@ public:
         PassDrawStats terrainMain;
     };
 
-    struct Buffer
-    {
-        VkBuffer buffer = VK_NULL_HANDLE;
-        VkDeviceMemory memory = VK_NULL_HANDLE;
-    };
-
     struct Texture
     {
-        VkImage image = VK_NULL_HANDLE;
-        VkDeviceMemory memory = VK_NULL_HANDLE;
-        VkImageView view = VK_NULL_HANDLE;
-        VkSampler sampler = VK_NULL_HANDLE;
-        VkFormat format = VK_FORMAT_UNDEFINED;
+        std::shared_ptr<ixrhi::IXRHITexture> image;
+        std::shared_ptr<ixrhi::IXRHISampler> sampler;
+        ixrhi::IXRHIFormat format = ixrhi::IXRHIFormat::Undefined;
         uint32_t width = 0;
         uint32_t height = 0;
         uint32_t mipLevels = 0;
+        uint32_t arrayLayers = 0;
         std::string name;
     };
 
@@ -88,49 +96,68 @@ public:
         float maxZ = 0.0f;
     };
 
-    bool Create(VulkanDevice& device, client::asset::IAssetReader& assets);
+    bool Create(ixrhi::IXRHIDevice& rhi, client::asset::IAssetReader& assets);
     void SetAdditionalAssetRoots(std::vector<std::filesystem::path> roots);
-    bool LoadMap(VulkanDevice& device, const std::string& mapDirectory, int32_t serverX, int32_t serverY);
-    bool CreateFlatTerrain(VulkanDevice& device, const TerrainSceneData& terrain);
-    void ClearTerrain(VulkanDevice& device);
+    bool LoadMap(ixrhi::IXRHIDevice& rhi, const std::string& mapDirectory, int32_t serverX, int32_t serverY);
+    bool CreateFlatTerrain(ixrhi::IXRHIDevice& rhi, const TerrainSceneData& terrain);
+    void ClearTerrain();
     bool HasTerrain() const { return m_sceneTerrainActive; }
     bool IsMapLoadedForDiagnostics() const { return m_mapLoaded; }
     TerrainSceneData GetTerrainSceneData() const;
     void SetTerrainSceneData(const TerrainSceneData& terrain);
-    bool RecreatePipeline(VulkanDevice& device);
-    // Borrowed IXRHI pass token (Phase 3B): unwrapped backend-locally. The
-    // native pass member below stays until Terrain migrates (later phase).
+    bool RecreatePipeline(ixrhi::IXRHIDevice& rhi);
+    // Borrowed IXRHI pass token (null = backend default, i.e. the swapchain pass).
     void SetTargetPass(const ixrhi::IXRHIRenderPass* pass);
-    // Backend for GPU timestamp markers (Phase 3C; shadow-cascade points).
+    // Backend for GPU timestamp markers + swapchain queries + teardown drain.
     // Borrowed, may be null (markers skipped).
     void SetRhiDevice(ixrhi::IXRHIDevice* rhi) { m_rhi = rhi; }
-    // IXRHI-facing refraction inputs (Phase 3B seam): the offscreen scene
-    // snapshots stay IXRHI-owned; native views are resolved backend-locally at
-    // descriptor-write time. Terrain/Water rendering itself is a later phase.
+    // IXRHI-owned refraction inputs (shared lifetime: recreating the
+    // offscreen target cannot dangle these). Consumed directly as sampled
+    // textures — no native handle resolution in Terrain.
     void SetWaterRefractionInputs(std::shared_ptr<ixrhi::IXRHITexture> colorSnapshot,
                                   std::shared_ptr<ixrhi::IXRHITexture> depthSnapshot,
                                   std::shared_ptr<ixrhi::IXRHISampler> sampler,
                                   std::uint32_t width,
                                   std::uint32_t height);
     bool HandleEditorInput(const InputEvent& event);
-    void UpdateEditor(VulkanDevice& device,
+    void UpdateEditor(ixrhi::IXRHIDevice& rhi,
                       double deltaSeconds,
                       const WorldCamera& camera,
                       uint32_t viewportWidth,
                       uint32_t viewportHeight);
-    void RenderWaterReflection(VulkanDevice& device,
+    // Reflection callback receives the borrowed IXRHI pass of the reflection
+    // target (plus its extent) so guest draws bake against the real pass.
+    void RenderWaterReflection(ixrhi::IXRHICommandList& cmd,
+                               const ixrhi::IXRHIFrameInfo& frame,
                                const WorldCamera& camera,
                                double timeSeconds,
-                               const std::function<void(const WorldCamera&, VkExtent2D, VkRenderPass, float)>& renderEntities = {});
+                               const std::function<void(const WorldCamera&,
+                                                        std::uint32_t,
+                                                        std::uint32_t,
+                                                        const ixrhi::IXRHIRenderPass*,
+                                                        float)>& renderEntities = {});
     // viewIndex selects which camera-uniform path to use: 0 = primary (editor Scene
     // View / free-fly), 1 = secondary (Game view / project Main Camera). Each view has
     // its own per-frame uniform buffer + descriptor set so the terrain can be drawn from
     // two cameras in the same frame without the second draw clobbering the first.
-    void Render(VulkanDevice& device, const WorldCamera& camera, VkExtent2D targetExtent = {}, uint32_t viewIndex = 0);
+    void Render(ixrhi::IXRHICommandList& cmd,
+                const ixrhi::IXRHIFrameInfo& frame,
+                const WorldCamera& camera,
+                std::uint32_t targetWidth = 0,
+                std::uint32_t targetHeight = 0,
+                uint32_t viewIndex = 0);
     // viewIndex selects the camera-uniform path: 0 = primary (Scene View / free-fly),
     // 1 = secondary (Game view / Main Camera). Mirrors TerrainRenderer::Render.
-    void RenderWater(VulkanDevice& device, const WorldCamera& camera, double timeSeconds, VkExtent2D targetExtent = {}, uint32_t viewIndex = 0);
-    void RenderSunShadowMap(VulkanDevice& device, const WorldCamera& camera);
+    void RenderWater(ixrhi::IXRHICommandList& cmd,
+                     const ixrhi::IXRHIFrameInfo& frame,
+                     const WorldCamera& camera,
+                     double timeSeconds,
+                     std::uint32_t targetWidth = 0,
+                     std::uint32_t targetHeight = 0,
+                     uint32_t viewIndex = 0);
+    void RenderSunShadowMap(ixrhi::IXRHICommandList& cmd,
+                            const ixrhi::IXRHIFrameInfo& frame,
+                            const WorldCamera& camera);
     void ResetFrameDrawStats() { m_frameDrawStats = {}; }
     FrameDrawStats GetFrameDrawStats() const { return m_frameDrawStats; }
     void ToggleWalkabilityDebug();
@@ -141,15 +168,19 @@ public:
     void SetPerformanceFps(double fps) { m_latestFps = fps; }
     void SetWaterMaterials(const std::vector<std::pair<std::string, WaterMaterialData>>& materials);
     std::vector<WaterBody> GetWaterBodies() const;
-    bool SetWaterBodies(VulkanDevice& device, const std::vector<WaterBody>& bodies);
-    bool SetSelectedWaterBodyHighlight(VulkanDevice& device, std::uint32_t selectedWaterBodyId);
-    void RenderSelectedWaterBodyHighlight(VulkanDevice& device, const WorldCamera& camera, VkExtent2D targetExtent = {});
+    bool SetWaterBodies(ixrhi::IXRHIDevice& rhi, const std::vector<WaterBody>& bodies);
+    bool SetSelectedWaterBodyHighlight(ixrhi::IXRHIDevice& rhi, std::uint32_t selectedWaterBodyId);
+    void RenderSelectedWaterBodyHighlight(ixrhi::IXRHICommandList& cmd,
+                                          const ixrhi::IXRHIFrameInfo& frame,
+                                          const WorldCamera& camera,
+                                          std::uint32_t targetWidth = 0,
+                                          std::uint32_t targetHeight = 0);
     void SetWaterSculptBrush(bool visible, float worldX, float worldZ, float radiusMeters, bool addMode);
     void SetPaletteSlots(const std::array<MapEditorPaletteSlot, 8>& slots);
     const std::array<MapEditorPaletteSlot, 8>& GetPaletteSlots() const { return m_paletteSlots; }
-    bool ApplyPaletteSlots(VulkanDevice& device, const std::array<MapEditorPaletteSlot, 8>& slots);
+    bool ApplyPaletteSlots(ixrhi::IXRHIDevice& rhi, const std::array<MapEditorPaletteSlot, 8>& slots);
     bool ApplyPaletteSlotParams(const MapEditorPaletteSlot& slot);
-    bool ApplyPaletteSlotChange(VulkanDevice& device, const MapEditorPaletteSlot& slot);
+    bool ApplyPaletteSlotChange(ixrhi::IXRHIDevice& rhi, const MapEditorPaletteSlot& slot);
     bool SetTriplanarSettings(bool enabled, float sharpness, float slopeThreshold, float slopeTransition);
     void RequestEditorSave();
     void RequestEditorReload();
@@ -261,35 +292,27 @@ private:
 
     struct WaterReflectionResources
     {
-        VkImage colorImage = VK_NULL_HANDLE;
-        VkDeviceMemory colorMemory = VK_NULL_HANDLE;
-        VkImageView colorView = VK_NULL_HANDLE;
-        VkImage depthImage = VK_NULL_HANDLE;
-        VkDeviceMemory depthMemory = VK_NULL_HANDLE;
-        VkImageView depthView = VK_NULL_HANDLE;
-        VkFramebuffer framebuffer = VK_NULL_HANDLE;
-        VkRenderPass renderPass = VK_NULL_HANDLE;
-        VkSampler sampler = VK_NULL_HANDLE;
-        VkFormat colorFormat = VK_FORMAT_UNDEFINED;
-        VkFormat depthFormat = VK_FORMAT_UNDEFINED;
+        std::shared_ptr<ixrhi::IXRHITexture> color;
+        std::shared_ptr<ixrhi::IXRHITexture> depth;
+        std::shared_ptr<ixrhi::IXRHISampler> sampler;
+        std::unique_ptr<ixrhi::IXRHIRenderTarget> target;
+        ixrhi::IXRHIFormat colorFormat = ixrhi::IXRHIFormat::Undefined;
+        ixrhi::IXRHIFormat depthFormat = ixrhi::IXRHIFormat::Undefined;
         uint32_t width = 0;
         uint32_t height = 0;
         WaterConfig::ReflectionQuality quality = WaterConfig::ReflectionQuality::Half;
-        VkImageLayout colorLayout = VK_IMAGE_LAYOUT_UNDEFINED;
     };
 
     struct WaterBodyGpu
     {
         WaterBody body;
-        Buffer vertexBuffer;
-        Buffer indexBuffer;
-        std::array<Buffer, kFramesInFlight> uniformBuffers{};
-        std::array<VkDescriptorSet, kFramesInFlight> descriptorSets{};
+        std::shared_ptr<ixrhi::IXRHIBuffer> vertexBuffer;
+        std::shared_ptr<ixrhi::IXRHIBuffer> indexBuffer;
+        std::array<std::shared_ptr<ixrhi::IXRHIBuffer>, kFramesInFlight> uniformBuffers{};
         // Secondary camera-uniform path for the Game view (project Main Camera), parallel to
         // the primary (Scene View / free-fly) so the same water body can be drawn from two
         // cameras in one frame without clobbering. Selected by RenderWater(viewIndex).
-        std::array<Buffer, kFramesInFlight> uniformBuffersSecondary{};
-        std::array<VkDescriptorSet, kFramesInFlight> descriptorSetsSecondary{};
+        std::array<std::shared_ptr<ixrhi::IXRHIBuffer>, kFramesInFlight> uniformBuffersSecondary{};
         uint32_t indexCount = 0;
     };
 
@@ -310,84 +333,76 @@ private:
         float color[3] = {1.0f, 1.0f, 1.0f};
     };
 
-    bool CreateBuffers(VulkanDevice& device);
-    bool EnsureUniformBuffers(VulkanDevice& device);
-    bool CreateFlatBuffers(VulkanDevice& device);
-    bool CreateMapBuffers(VulkanDevice& device, const std::string& mapDirectory, int32_t serverX, int32_t serverY);
+    bool CreateBuffers(ixrhi::IXRHIDevice& rhi);
+    bool EnsureUniformBuffers(ixrhi::IXRHIDevice& rhi);
+    bool CreateFlatBuffers(ixrhi::IXRHIDevice& rhi);
+    bool CreateMapBuffers(ixrhi::IXRHIDevice& rhi, const std::string& mapDirectory, int32_t serverX, int32_t serverY);
     void BuildTerrainChunkDraws(const std::vector<Vertex>& vertices, std::vector<uint32_t>& indices);
-    bool CreateFallbackTexture(VulkanDevice& device);
-    bool CreateFallbackMask(VulkanDevice& device);
-    bool CreateFallbackSplatTextures(VulkanDevice& device);
-    bool CreateSceneSplatTextures(VulkanDevice& device);
-    bool LoadTerrainPalette(VulkanDevice& device, const mx::map::Manifest& manifest, const std::string& mapDirectory);
-    bool LoadTerrainPaletteFromPaths(VulkanDevice& device, const std::array<MapEditorPaletteSlot, 8>& slots);
-    bool UploadRgbaTexture2D(VulkanDevice& device,
+    bool CreateFallbackTexture(ixrhi::IXRHIDevice& rhi);
+    bool CreateFallbackMask(ixrhi::IXRHIDevice& rhi);
+    bool CreateFallbackSplatTextures(ixrhi::IXRHIDevice& rhi);
+    bool CreateSceneSplatTextures(ixrhi::IXRHIDevice& rhi);
+    bool LoadTerrainPalette(ixrhi::IXRHIDevice& rhi, const mx::map::Manifest& manifest, const std::string& mapDirectory);
+    bool LoadTerrainPaletteFromPaths(ixrhi::IXRHIDevice& rhi, const std::array<MapEditorPaletteSlot, 8>& slots);
+    bool UploadRgbaTexture2D(ixrhi::IXRHIDevice& rhi,
                              const std::string& name,
                              uint32_t width,
                              uint32_t height,
                              const std::vector<std::uint8_t>& pixels,
-                             VkSamplerAddressMode addressMode,
+                             ixrhi::IXRHISamplerAddress addressMode,
                              Texture& out,
-                             VkFormat format = VK_FORMAT_R8G8B8A8_UNORM);
-    bool UpdateRgbaTexture2D(VulkanDevice& device, Texture& texture, const std::vector<std::uint8_t>& pixels);
-    bool UploadRgbaTextureArray(VulkanDevice& device,
+                             ixrhi::IXRHIFormat format = ixrhi::IXRHIFormat::R8G8B8A8Unorm);
+    bool UpdateRgbaTexture2D(ixrhi::IXRHIDevice& rhi, Texture& texture, const std::vector<std::uint8_t>& pixels);
+    bool UploadRgbaTextureArray(ixrhi::IXRHIDevice& rhi,
                                 const std::string& name,
                                 uint32_t width,
                                 uint32_t height,
                                 uint32_t layers,
                                 const std::vector<std::uint8_t>& pixels,
-                                VkFormat format,
+                                ixrhi::IXRHIFormat format,
                                 Texture& out);
-    bool UploadR8TextureArray(VulkanDevice& device,
+    bool UploadR8TextureArray(ixrhi::IXRHIDevice& rhi,
                               const std::string& name,
                               uint32_t width,
                               uint32_t height,
                               uint32_t layers,
                               const std::vector<std::uint8_t>& pixels,
                               Texture& out);
-    bool LoadDominantTerrainTexture(VulkanDevice& device, const std::string& mapDirectory);
-    bool LoadTileIndices(const std::string& mapDirectory);
-    bool BuildTerrainLayers(VulkanDevice& device, const std::string& mapDirectory);
-    bool GenerateLayerMask(VulkanDevice& device, TerrainLayer& layer);
-    bool CreateDescriptors();
-    void UpdateDescriptors();
-    bool CreatePipeline(VulkanDevice& device);
+    bool CreateBindGroup(ixrhi::IXRHIDevice& rhi);
+    void UpdateBindGroup();
+    bool CreatePipeline(ixrhi::IXRHIDevice& rhi);
     void DestroyPipeline();
-    bool CreateWaterResources(VulkanDevice& device);
-    bool LoadWaterBodies(VulkanDevice& device, const std::string& mapDirectory);
-    bool CreateWaterBodyMesh(VulkanDevice& device, WaterBodyGpu& waterBody);
-    bool CreateWaterBodyUniformBuffers(VulkanDevice& device, WaterBodyGpu& waterBody);
-    bool RebuildSelectedWaterBodyHighlight(VulkanDevice& device, const WaterBody* body);
-    bool AllocateWaterDescriptorSets(const std::array<Buffer, kFramesInFlight>& uniformBuffers,
-                                     std::array<VkDescriptorSet, kFramesInFlight>& descriptorSets);
-    bool CreateWaterNormalTextures(VulkanDevice& device);
-    bool CreateWaterDescriptors();
-    void UpdateWaterDescriptors();
-    void WriteWaterDescriptorSets(const std::array<Buffer, kFramesInFlight>& uniformBuffers,
-                                  const std::array<VkDescriptorSet, kFramesInFlight>& descriptorSets,
-                                  const WaterMaterialTextureSet* materialTextures = nullptr);
-    bool CreateWaterPipeline(VulkanDevice& device);
-    bool CreateOrRecreateWaterReflectionResources(VulkanDevice& device, bool force);
-    bool CreateOrRecreateWaterReflectionResources(VulkanDevice& device,
+    bool CreateWaterResources(ixrhi::IXRHIDevice& rhi);
+    bool LoadWaterBodies(ixrhi::IXRHIDevice& rhi, const std::string& mapDirectory);
+    bool CreateWaterBodyMesh(ixrhi::IXRHIDevice& rhi, WaterBodyGpu& waterBody);
+    bool CreateWaterBodyUniformBuffers(ixrhi::IXRHIDevice& rhi, WaterBodyGpu& waterBody);
+    bool RebuildSelectedWaterBodyHighlight(ixrhi::IXRHIDevice& rhi, const WaterBody* body);
+    bool CreateWaterBindGroup(ixrhi::IXRHIDevice& rhi);
+    bool CreateWaterNormalTextures(ixrhi::IXRHIDevice& rhi);
+    void UpdateWaterBindGroup();
+    void WriteWaterBindGroupSets(std::uint32_t bodyIndex,
+                                 uint32_t viewIndex,
+                                 uint32_t frameIndex,
+                                 const WaterMaterialTextureSet* materialTextures = nullptr);
+    bool CreateWaterPipeline(ixrhi::IXRHIDevice& rhi);
+    bool CreateOrRecreateWaterReflectionResources(ixrhi::IXRHIDevice& rhi, bool force);
+    bool CreateOrRecreateWaterReflectionResources(ixrhi::IXRHIDevice& rhi,
                                                   bool force,
                                                   WaterConfig::ReflectionQuality quality);
-    bool CreateWaterReflectionPipeline(VulkanDevice& device);
+    bool CreateWaterReflectionPipeline(ixrhi::IXRHIDevice& rhi);
     void DestroyWaterReflectionResources();
     void DestroyWaterReflectionPipeline();
-    void DrawTerrainSurface(VkCommandBuffer cmd,
-                            uint32_t frameIndex,
-                            VkExtent2D extent,
-                            VkPipeline pipeline,
-                            VkPipelineLayout pipelineLayout,
-                            bool includeDebug);
-    WorldCamera ComputeMirrorCamera(const WorldCamera& camera, VkExtent2D extent, float waterLevelY) const;
+    WorldCamera ComputeMirrorCamera(const WorldCamera& camera,
+                                    std::uint32_t targetWidth,
+                                    std::uint32_t targetHeight,
+                                    float waterLevelY) const;
     const WaterBodyGpu* FindClosestWaterBody(const WorldCamera& camera, float* outDistanceMeters = nullptr) const;
     const WaterConfig& ResolveWaterConfig(const WaterBody& body) const;
     void DestroyWaterResources();
     void DestroyWaterBodyResources();
     void DestroyWaterBodyResources(WaterBodyGpu& waterBody);
     void DestroyWaterMaterialTextureCache();
-    bool LoadWaterMaterialTextureSet(VulkanDevice& device,
+    bool LoadWaterMaterialTextureSet(ixrhi::IXRHIDevice& rhi,
                                      const std::string& id,
                                      const WaterMaterialData& material,
                                      WaterMaterialTextureSet& out);
@@ -404,37 +419,35 @@ private:
                                         const WaterConfig& water,
                                         float waterLevelY,
                                         bool reflectionTarget) const;
-    void UploadWaterUniform(Buffer& buffer, const WaterUniformBlock& uniform);
-    void DestroyBuffer(Buffer& buffer);
-    void DestroyTexture(Texture& texture);
+    void UploadWaterUniform(const std::shared_ptr<ixrhi::IXRHIBuffer>& buffer, const WaterUniformBlock& uniform);
     void DestroyTerrainLayers();
     void UpdateUniform(uint32_t frameIndex, const WorldCamera& camera, bool reflectionPass = false, uint32_t viewIndex = 0);
-    bool CreateShadowResources(VulkanDevice& device);
-    bool CreateShadowPipeline();
+    bool CreateShadowResources(ixrhi::IXRHIDevice& rhi);
+    bool CreateShadowPipeline(ixrhi::IXRHIDevice& rhi);
     void DestroyShadowResources();
     void DestroyShadowPipeline();
     void UpdateShadowCascades(const WorldCamera& camera);
     void LoadEditorConfig();
-    void ApplyLegacyHeightBrush(VulkanDevice& device, float sign, double deltaSeconds);
-    void ApplyEditorBrush(VulkanDevice& device, double deltaSeconds);
+    void ApplyLegacyHeightBrush(float sign, double deltaSeconds);
+    void ApplyEditorBrush(ixrhi::IXRHIDevice& rhi, double deltaSeconds);
     bool RaycastEditorBrush(const WorldCamera& camera, uint32_t viewportWidth, uint32_t viewportHeight);
     void BeginEditorStroke();
     void EndEditorStroke();
     void RecordHeightUndo(size_t index);
     void RecordSplatUndo(size_t index);
-    void UndoLastEditorStroke(VulkanDevice& device);
+    void UndoLastEditorStroke(ixrhi::IXRHIDevice& rhi);
     void MarkHeightDirty(size_t heightIndex);
     void MarkSplatDirty(size_t splatIndex);
-    bool RefreshSplatTextures(VulkanDevice& device);
+    bool RefreshSplatTextures(ixrhi::IXRHIDevice& rhi);
     bool SaveDirtyChunks();
     bool SaveWorldPalette() const;
     bool SaveWaterBodies() const;
     bool SaveChunkHeights(uint32_t chunkX, uint32_t chunkY, uint32_t dirtyTexels);
-    bool ReloadCurrentMap(VulkanDevice& device);
+    bool ReloadCurrentMap(ixrhi::IXRHIDevice& rhi);
     std::string ResolveWritableMapPath(const std::string& relativePath) const;
 
-    VkDevice m_device = VK_NULL_HANDLE;
-    VulkanDevice* m_deviceOwner = nullptr;
+    ixrhi::IXRHIDevice* m_rhi = nullptr; // borrowed backend (timestamps, swapchain queries, teardown drain)
+    const ixrhi::IXRHIRenderPass* m_targetPass = nullptr; // borrowed (frame owner)
     client::asset::IAssetReader* m_assets = nullptr;
     std::unordered_map<std::string, WaterMaterialData> m_waterMaterials;
     std::unordered_map<std::string, WaterMaterialTextureSet> m_waterMaterialTextures;
@@ -442,34 +455,29 @@ private:
     std::string m_waterMaterialEdgeSignature;
     std::vector<std::filesystem::path> m_additionalAssetRoots;
     WaterMaterialData m_defaultWaterMaterial;
-    Buffer m_vertexBuffer;
-    Buffer m_indexBuffer;
-    Buffer m_debugVertexBuffer;
-    Buffer m_debugIndexBuffer;
-    Buffer m_logicVertexBuffer;
-    Buffer m_logicIndexBuffer;
-    Buffer m_selectedWaterBodyVertexBuffer;
-    Buffer m_selectedWaterBodyIndexBuffer;
-    std::array<Buffer, kFramesInFlight> m_uniformBuffers{};
+    std::shared_ptr<ixrhi::IXRHIBuffer> m_vertexBuffer;
+    std::shared_ptr<ixrhi::IXRHIBuffer> m_indexBuffer;
+    std::shared_ptr<ixrhi::IXRHIBuffer> m_debugVertexBuffer;
+    std::shared_ptr<ixrhi::IXRHIBuffer> m_debugIndexBuffer;
+    std::shared_ptr<ixrhi::IXRHIBuffer> m_logicVertexBuffer;
+    std::shared_ptr<ixrhi::IXRHIBuffer> m_logicIndexBuffer;
+    std::shared_ptr<ixrhi::IXRHIBuffer> m_selectedWaterBodyVertexBuffer;
+    std::shared_ptr<ixrhi::IXRHIBuffer> m_selectedWaterBodyIndexBuffer;
+    std::array<std::shared_ptr<ixrhi::IXRHIBuffer>, kFramesInFlight> m_uniformBuffers{};
     // Secondary camera-uniform path for the Game view (project Main Camera). Parallel to
     // m_uniformBuffers so terrain can be drawn from a second camera in the same frame
     // without clobbering the primary (free-fly) terrain draw. See Render(viewIndex).
-    std::array<Buffer, kFramesInFlight> m_uniformBuffersSecondary{};
-    std::array<Buffer, kFramesInFlight> m_waterUniformBuffers{};
-    VkDescriptorSetLayout m_descriptorSetLayout = VK_NULL_HANDLE;
-    VkDescriptorPool m_descriptorPool = VK_NULL_HANDLE;
-    std::array<VkDescriptorSet, kFramesInFlight> m_descriptorSets{};
-    std::array<VkDescriptorSet, kFramesInFlight> m_descriptorSetsSecondary{};
-    std::vector<VkDescriptorSet> m_layerDescriptorSets;
-    VkPipelineLayout m_pipelineLayout = VK_NULL_HANDLE;
-    VkPipeline m_pipeline = VK_NULL_HANDLE;
-    VkDescriptorSetLayout m_waterDescriptorSetLayout = VK_NULL_HANDLE;
-    VkDescriptorPool m_waterDescriptorPool = VK_NULL_HANDLE;
-    std::array<VkDescriptorSet, kFramesInFlight> m_waterDescriptorSets{};
-    VkPipelineLayout m_waterPipelineLayout = VK_NULL_HANDLE;
-    VkPipeline m_waterPipeline = VK_NULL_HANDLE;
-    VkRenderPass m_mainRenderPass = VK_NULL_HANDLE;
-    ixrhi::IXRHIDevice* m_rhi = nullptr; // borrowed backend (timestamp markers)
+    std::array<std::shared_ptr<ixrhi::IXRHIBuffer>, kFramesInFlight> m_uniformBuffersSecondary{};
+    // One bind-group layout (UBO + 9 combined samplers) with a slot per
+    // (view, frame): slot = viewIndex * kFramesInFlight + frameIndex.
+    std::unique_ptr<ixrhi::IXRHIBindGroupLayout> m_bindLayout;
+    std::unique_ptr<ixrhi::IXRHIBindGroup> m_bindGroup;
+    std::unique_ptr<ixrhi::IXRHIGraphicsPipeline> m_pipeline;
+    // One water bind-group layout (UBO + 6 combined samplers) with a slot per
+    // (body, view, frame): slot = (bodyIndex * 2 + viewIndex) * kFramesInFlight + frameIndex.
+    std::unique_ptr<ixrhi::IXRHIBindGroupLayout> m_waterBindLayout;
+    std::unique_ptr<ixrhi::IXRHIBindGroup> m_waterBindGroup;
+    std::unique_ptr<ixrhi::IXRHIGraphicsPipeline> m_waterPipeline;
     // Refraction inputs are IXRHI-owned (shared lifetime: recreating the
     // offscreen target cannot dangle these). Native handles resolve locally
     // at descriptor-write time (backend bridge, transition-only).
@@ -479,19 +487,15 @@ private:
     std::uint32_t m_waterSceneWidth = 0;
     std::uint32_t m_waterSceneHeight = 0;
     WaterReflectionResources m_waterReflection;
-    VkPipelineLayout m_waterReflectionPipelineLayout = VK_NULL_HANDLE;
-    VkPipeline m_waterReflectionPipeline = VK_NULL_HANDLE;
+    std::unique_ptr<ixrhi::IXRHIGraphicsPipeline> m_reflectionPipeline;
     bool m_waterReflectionDescriptorsDirty = true;
-    VkImage m_shadowImage = VK_NULL_HANDLE;
-    VkDeviceMemory m_shadowMemory = VK_NULL_HANDLE;
-    VkImageView m_shadowArrayView = VK_NULL_HANDLE;
-    std::array<VkImageView, kShadowCascadeCount> m_shadowLayerViews{};
-    VkSampler m_shadowSampler = VK_NULL_HANDLE;
-    VkRenderPass m_shadowRenderPass = VK_NULL_HANDLE;
-    std::array<VkFramebuffer, kShadowCascadeCount> m_shadowFramebuffers{};
-    VkPipelineLayout m_shadowPipelineLayout = VK_NULL_HANDLE;
-    VkPipeline m_shadowPipeline = VK_NULL_HANDLE;
-    VkImageLayout m_shadowLayout = VK_IMAGE_LAYOUT_UNDEFINED;
+    // 4-cascade depth array + comparison sampler + one depth-only target per
+    // cascade slice. Sampled by the main pass (binding 9) after an explicit
+    // DepthStencilAttachment -> ShaderReadOnly transition per shadow render.
+    std::shared_ptr<ixrhi::IXRHITexture> m_shadowTexture;
+    std::shared_ptr<ixrhi::IXRHISampler> m_shadowSampler;
+    std::array<std::unique_ptr<ixrhi::IXRHIRenderTarget>, kShadowCascadeCount> m_shadowTargets{};
+    std::unique_ptr<ixrhi::IXRHIGraphicsPipeline> m_shadowPipeline;
     std::array<WorldMat4, kShadowCascadeCount> m_shadowCascadeViewProj{};
     float m_shadowCascadeSplits[kShadowCascadeCount] = {5.0f, 15.0f, 50.0f, 200.0f};
     Texture m_baseTexture;
@@ -506,9 +510,6 @@ private:
     Texture m_waterNormalSmall;
     Texture m_waterNormalLarge;
     std::vector<TerrainLayer> m_layers;
-    std::vector<uint8_t> m_tileIndices;
-    uint32_t m_tileGridWidth = 0;
-    uint32_t m_tileGridHeight = 0;
     uint32_t m_indexCount = 0;
     uint32_t m_debugIndexCount = 0;
     uint32_t m_spawnDebugIndexOffset = 0;

@@ -54,9 +54,19 @@ struct IXRHIPushRange
     std::uint32_t sizeBytes = 0;
 };
 
+struct IXRHIDepthBias
+{
+    bool enable = false;
+    float constantFactor = 0.0f;
+    float slopeFactor = 0.0f;
+};
+
 struct IXRHIGraphicsPipelineDesc
 {
     std::shared_ptr<IXRHIShader> vertexShader;
+    // Null fragment shader = depth-only pipeline (shadow maps): no color
+    // attachments, blendAttachments/colorFormats stay empty. D3D12: PSO with
+    // null PS — natural.
     std::shared_ptr<IXRHIShader> fragmentShader;
     std::vector<const IXRHIBindGroupLayout*> bindGroupLayouts;
     std::vector<IXRHIPushRange> pushRanges;
@@ -68,6 +78,7 @@ struct IXRHIGraphicsPipelineDesc
     bool depthTestEnable = false;
     bool depthWriteEnable = false;
     IXRHICompareOp depthCompareOp = IXRHICompareOp::Less;
+    IXRHIDepthBias depthBias;
     std::vector<IXRHIBlendAttachment> blendAttachments; // one per color target
     std::vector<IXRHIFormat> colorFormats; // informational until dynamic rendering
     IXRHIFormat depthFormat = IXRHIFormat::Undefined;

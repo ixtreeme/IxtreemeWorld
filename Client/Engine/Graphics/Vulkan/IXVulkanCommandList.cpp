@@ -10,6 +10,7 @@
 #include "IXVulkanSync.h"
 #include "VulkanDevice.h"
 
+#include <algorithm>
 #include <cassert>
 #include <functional>
 
@@ -245,16 +246,30 @@ void IXVulkanCommandList::TransitionTexture(ixrhi::IXRHITexture& texture,
     LayoutStageAccess(from, srcStage, srcAccess);
     LayoutStageAccess(to, dstStage, dstAccess);
 
+    // Depth aspects sampled as textures require the depth-read layout; the
+    // color SHADER_READ_ONLY layout is invalid for them. Full-subresource
+    // range so layered depth (shadow cascades) transitions atomically.
+    const bool isDepth = (ToVkAspectMask(native->Format()) & VK_IMAGE_ASPECT_DEPTH_BIT) != 0;
+    VkImageLayout oldLayout = ToVkImageLayout(from);
+    VkImageLayout newLayout = ToVkImageLayout(to);
+    if (isDepth)
+    {
+        if (from == ixrhi::IXRHIImageLayout::ShaderReadOnly)
+            oldLayout = VK_IMAGE_LAYOUT_DEPTH_STENCIL_READ_ONLY_OPTIMAL;
+        if (to == ixrhi::IXRHIImageLayout::ShaderReadOnly)
+            newLayout = VK_IMAGE_LAYOUT_DEPTH_STENCIL_READ_ONLY_OPTIMAL;
+    }
+
     VkImageMemoryBarrier barrier{};
     barrier.sType = VK_STRUCTURE_TYPE_IMAGE_MEMORY_BARRIER;
-    barrier.oldLayout = ToVkImageLayout(from);
-    barrier.newLayout = ToVkImageLayout(to);
+    barrier.oldLayout = oldLayout;
+    barrier.newLayout = newLayout;
     barrier.srcQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;
     barrier.dstQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;
     barrier.image = native->Native();
     barrier.subresourceRange.aspectMask = ToVkAspectMask(native->Format());
-    barrier.subresourceRange.levelCount = 1;
-    barrier.subresourceRange.layerCount = 1;
+    barrier.subresourceRange.levelCount = std::max(1u, native->MipLevels());
+    barrier.subresourceRange.layerCount = std::max(1u, native->ArrayLayers());
     barrier.srcAccessMask = srcAccess;
     barrier.dstAccessMask = dstAccess;
     vkCmdPipelineBarrier(m_cmd, srcStage, dstStage, 0, 0, nullptr, 0, nullptr, 1, &barrier);

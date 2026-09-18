@@ -14,8 +14,10 @@
 #include "IXVulkanSync.h"
 #include "VulkanDevice.h"
 
+#include <algorithm>
 #include <cstdlib>
 #include <cstring>
+#include <vector>
 
 namespace ixvulkan
 {
@@ -81,7 +83,8 @@ VkRenderPass IXVulkanDevice::ResolveRenderPass(const ixrhi::IXRHIRenderPass* pas
             return native->Native();
         return VK_NULL_HANDLE; // foreign implementation: no compatible pass known
     }
-    return m_loop->GetRenderPass();
+    // Backend-owned main pass (null while torn down → caller defers).
+    return m_swapchain ? m_swapchain->NativeMainPass() : VK_NULL_HANDLE;
 }
 
 void IXVulkanDevice::SetDebugName(VkObjectType type, std::uint64_t handle, const char* name) const
@@ -324,10 +327,15 @@ std::shared_ptr<ixrhi::IXRHIBuffer> IXVulkanDevice::CreateBuffer(
 std::shared_ptr<ixrhi::IXRHITexture> IXVulkanDevice::CreateTexture(
     const ixrhi::IXRHITextureDesc& desc, const void* initialDataOrNull, std::size_t initialBytes)
 {
-    if (desc.width == 0 || desc.height == 0 || desc.format == ixrhi::IXRHIFormat::Undefined)
+    if (desc.width == 0 || desc.height == 0 || desc.format == ixrhi::IXRHIFormat::Undefined ||
+        desc.mipLevels == 0 || desc.arrayLayers == 0)
         return nullptr;
 
     const VkFormat format = ToVkFormat(desc.format);
+    const std::uint32_t pixelBytes = ixrhi::IXRHIFormatByteSize(desc.format);
+    if (format == VK_FORMAT_UNDEFINED || pixelBytes == 0)
+        return nullptr;
+
     VkImageCreateInfo create{};
     create.sType = VK_STRUCTURE_TYPE_IMAGE_CREATE_INFO;
     create.imageType = VK_IMAGE_TYPE_2D;
@@ -353,23 +361,50 @@ std::shared_ptr<ixrhi::IXRHITexture> IXVulkanDevice::CreateTexture(
         desc.debugName.c_str());
 
     if (initialDataOrNull != nullptr && initialBytes > 0)
-        UploadTextureBytes(image, desc.width, desc.height, desc.format, initialDataOrNull, initialBytes);
-    else
     {
-        // Render-target/depth textures reach their layout via the render pass;
-        // sampled textures without data are invalid use — flag early in debug.
-        (void)0;
+        // Tight layer-major/mip-minor packing (IXRHITexture.h contract).
+        std::vector<TextureCopyRegion> regions;
+        regions.reserve(static_cast<std::size_t>(desc.arrayLayers) * desc.mipLevels);
+        std::uint64_t offset = 0;
+        for (std::uint32_t layer = 0; layer < desc.arrayLayers; ++layer)
+        {
+            std::uint32_t mipWidth = desc.width;
+            std::uint32_t mipHeight = desc.height;
+            for (std::uint32_t mip = 0; mip < desc.mipLevels; ++mip)
+            {
+                TextureCopyRegion region{};
+                region.mipLevel = mip;
+                region.baseArrayLayer = layer;
+                region.width = mipWidth;
+                region.height = mipHeight;
+                region.bufferOffsetBytes = offset;
+                regions.push_back(region);
+                offset += static_cast<std::uint64_t>(mipWidth) * mipHeight * pixelBytes;
+                mipWidth = std::max(1u, mipWidth >> 1u);
+                mipHeight = std::max(1u, mipHeight >> 1u);
+            }
+        }
+        UploadTextureRegions(image,
+            desc.format,
+            desc.mipLevels,
+            desc.arrayLayers,
+            regions.data(),
+            regions.size(),
+            initialDataOrNull,
+            initialBytes,
+            VK_IMAGE_LAYOUT_UNDEFINED,
+            SampledReadLayout(desc.format));
     }
 
+    const bool isDepth = (ToVkAspectMask(desc.format) & VK_IMAGE_ASPECT_DEPTH_BIT) != 0;
     VkImageViewCreateInfo view{};
     view.sType = VK_STRUCTURE_TYPE_IMAGE_VIEW_CREATE_INFO;
     view.image = image;
-    view.viewType = VK_IMAGE_VIEW_TYPE_2D;
+    view.viewType = desc.arrayLayers > 1 ? VK_IMAGE_VIEW_TYPE_2D_ARRAY : VK_IMAGE_VIEW_TYPE_2D;
     view.format = format;
-    view.subresourceRange.aspectMask =
-        ixrhi::HasUsage(desc.usage, ixrhi::IXRHITextureUsage::DepthStencilAttachment)
-            ? VK_IMAGE_ASPECT_DEPTH_BIT
-            : VK_IMAGE_ASPECT_COLOR_BIT;
+    view.subresourceRange.aspectMask = isDepth
+        ? (ToVkAspectMask(desc.format))
+        : VK_IMAGE_ASPECT_COLOR_BIT;
     view.subresourceRange.levelCount = desc.mipLevels;
     view.subresourceRange.layerCount = desc.arrayLayers;
     VkImageView imageView = VK_NULL_HANDLE;
@@ -384,21 +419,110 @@ std::shared_ptr<ixrhi::IXRHITexture> IXVulkanDevice::CreateTexture(
         imageView,
         desc.width,
         desc.height,
+        desc.mipLevels,
+        desc.arrayLayers,
         desc.format,
         desc.debugName);
 }
 
-void IXVulkanDevice::UploadTextureBytes(VkImage image,
-                                        std::uint32_t width,
-                                        std::uint32_t height,
-                                        ixrhi::IXRHIFormat format,
-                                        const void* bytes,
-                                        std::size_t byteCount) const
+bool IXVulkanDevice::UpdateTexture(ixrhi::IXRHITexture& texture, const void* data, std::size_t byteCount)
+{
+    auto* native = dynamic_cast<IXVulkanTexture*>(&texture);
+    if (native == nullptr || data == nullptr || byteCount == 0)
+        return false;
+
+    const std::uint32_t pixelBytes = ixrhi::IXRHIFormatByteSize(native->Format());
+    if (pixelBytes == 0 || native->Width() == 0 || native->Height() == 0 || native->ArrayLayers() == 0)
+        return false;
+
+    // Full base-level rewrite across all layers (splat paint parity: the old
+    // path rewrote the whole base level; higher mips untouched).
+    const std::uint64_t needBytes = static_cast<std::uint64_t>(native->Width()) * native->Height() *
+        pixelBytes * native->ArrayLayers();
+    if (byteCount < needBytes)
+        return false;
+
+    std::vector<TextureCopyRegion> regions;
+    regions.reserve(native->ArrayLayers());
+    for (std::uint32_t layer = 0; layer < native->ArrayLayers(); ++layer)
+    {
+        TextureCopyRegion region{};
+        region.mipLevel = 0;
+        region.baseArrayLayer = layer;
+        region.width = native->Width();
+        region.height = native->Height();
+        region.bufferOffsetBytes =
+            static_cast<std::uint64_t>(layer) * native->Width() * native->Height() * pixelBytes;
+        regions.push_back(region);
+    }
+
+    // Creation upload leaves sampled textures in the read layout, so the
+    // rewrite brackets from/to the same layout (parity with the old
+    // SHADER_READ_ONLY round-trip).
+    const VkImageLayout readLayout = SampledReadLayout(native->Format());
+    UploadTextureRegions(native->Native(),
+        native->Format(),
+        native->MipLevels(),
+        native->ArrayLayers(),
+        regions.data(),
+        regions.size(),
+        data,
+        static_cast<std::size_t>(needBytes),
+        readLayout,
+        readLayout);
+    return true;
+}
+
+VkImageLayout IXVulkanDevice::SampledReadLayout(ixrhi::IXRHIFormat format)
+{
+    // Depth sampled as a texture must use the depth-read layout; the color
+    // SHADER_READ_ONLY layout is invalid for depth aspects (and was a latent
+    // validation issue wherever depth snapshots are sampled).
+    if ((ToVkAspectMask(format) & VK_IMAGE_ASPECT_DEPTH_BIT) != 0)
+        return VK_IMAGE_LAYOUT_DEPTH_STENCIL_READ_ONLY_OPTIMAL;
+    return VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL;
+}
+
+void IXVulkanDevice::UploadTextureRegions(VkImage image,
+                                         ixrhi::IXRHIFormat format,
+                                         std::uint32_t mipLevels,
+                                         std::uint32_t arrayLayers,
+                                         const TextureCopyRegion* regions,
+                                         std::size_t regionCount,
+                                         const void* bytes,
+                                         std::size_t byteCount,
+                                         VkImageLayout initialLayout,
+                                         VkImageLayout finalLayout) const
 {
     const std::uint32_t pixelBytes = ixrhi::IXRHIFormatByteSize(format);
-    const std::size_t needBytes = static_cast<std::size_t>(width) * height * pixelBytes;
-    if (bytes == nullptr || byteCount < needBytes || pixelBytes == 0)
-        LogAbort("IXVulkanDevice::UploadTextureBytes: bad payload");
+    if (bytes == nullptr || regionCount == 0 || regions == nullptr || pixelBytes == 0 || mipLevels == 0 ||
+        arrayLayers == 0)
+        LogAbort("IXVulkanDevice::UploadTextureRegions: bad payload");
+    (void)pixelBytes;
+
+    std::uint64_t needBytes = 0;
+    std::vector<VkBufferImageCopy> copies;
+    copies.reserve(regionCount);
+    for (std::size_t i = 0; i < regionCount; ++i)
+    {
+        const TextureCopyRegion& region = regions[i];
+        if (region.width == 0 || region.height == 0 || region.layerCount == 0)
+            LogAbort("IXVulkanDevice::UploadTextureRegions: bad region");
+        VkBufferImageCopy copy{};
+        copy.bufferOffset = static_cast<VkDeviceSize>(region.bufferOffsetBytes);
+        copy.imageSubresource.aspectMask = ToVkAspectMask(format);
+        copy.imageSubresource.mipLevel = region.mipLevel;
+        copy.imageSubresource.baseArrayLayer = region.baseArrayLayer;
+        copy.imageSubresource.layerCount = region.layerCount;
+        copy.imageExtent = {region.width, region.height, 1};
+        copies.push_back(copy);
+        const std::uint64_t end =
+            region.bufferOffsetBytes + static_cast<std::uint64_t>(region.width) * region.height *
+            region.layerCount * ixrhi::IXRHIFormatByteSize(format);
+        needBytes = std::max(needBytes, end);
+    }
+    if (byteCount < needBytes)
+        LogAbort("IXVulkanDevice::UploadTextureRegions: bad payload");
 
     // Staging buffer (same host-visible pattern as pre-migration upload code).
     VkBuffer staging = VK_NULL_HANDLE;
@@ -420,7 +544,7 @@ void IXVulkanDevice::UploadTextureBytes(VkImage image,
         "vkMapMemory(staging)",
         __FILE__,
         __LINE__);
-    std::memcpy(mapped, bytes, needBytes);
+    std::memcpy(mapped, bytes, static_cast<std::size_t>(needBytes));
     vkUnmapMemory(NativeDevice(), stagingMemory);
 
     std::lock_guard<std::mutex> lock(m_uploadMutex);
@@ -441,17 +565,19 @@ void IXVulkanDevice::UploadTextureBytes(VkImage image,
 
     VkImageMemoryBarrier toDst{};
     toDst.sType = VK_STRUCTURE_TYPE_IMAGE_MEMORY_BARRIER;
-    toDst.oldLayout = VK_IMAGE_LAYOUT_UNDEFINED;
+    toDst.oldLayout = initialLayout;
     toDst.newLayout = VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL;
     toDst.srcQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;
     toDst.dstQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;
     toDst.image = image;
-    toDst.subresourceRange.aspectMask = VK_IMAGE_ASPECT_COLOR_BIT;
-    toDst.subresourceRange.levelCount = 1;
-    toDst.subresourceRange.layerCount = 1;
+    toDst.subresourceRange.aspectMask = ToVkAspectMask(format);
+    toDst.subresourceRange.levelCount = mipLevels;
+    toDst.subresourceRange.layerCount = arrayLayers;
+    toDst.srcAccessMask = initialLayout == VK_IMAGE_LAYOUT_UNDEFINED ? 0 : VK_ACCESS_SHADER_READ_BIT;
     toDst.dstAccessMask = VK_ACCESS_TRANSFER_WRITE_BIT;
     vkCmdPipelineBarrier(cmd,
-        VK_PIPELINE_STAGE_TOP_OF_PIPE_BIT,
+        initialLayout == VK_IMAGE_LAYOUT_UNDEFINED ? VK_PIPELINE_STAGE_TOP_OF_PIPE_BIT
+                                                   : VK_PIPELINE_STAGE_FRAGMENT_SHADER_BIT,
         VK_PIPELINE_STAGE_TRANSFER_BIT,
         0,
         0,
@@ -461,15 +587,16 @@ void IXVulkanDevice::UploadTextureBytes(VkImage image,
         1,
         &toDst);
 
-    VkBufferImageCopy region{};
-    region.imageSubresource.aspectMask = VK_IMAGE_ASPECT_COLOR_BIT;
-    region.imageSubresource.layerCount = 1;
-    region.imageExtent = {width, height, 1};
-    vkCmdCopyBufferToImage(cmd, staging, image, VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL, 1, &region);
+    vkCmdCopyBufferToImage(cmd,
+        staging,
+        image,
+        VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL,
+        static_cast<std::uint32_t>(copies.size()),
+        copies.data());
 
     VkImageMemoryBarrier toRead = toDst;
     toRead.oldLayout = VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL;
-    toRead.newLayout = VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL;
+    toRead.newLayout = finalLayout;
     toRead.srcAccessMask = VK_ACCESS_TRANSFER_WRITE_BIT;
     toRead.dstAccessMask = VK_ACCESS_SHADER_READ_BIT;
     vkCmdPipelineBarrier(cmd,
@@ -521,6 +648,13 @@ std::shared_ptr<ixrhi::IXRHISampler> IXVulkanDevice::CreateSampler(
     create.addressModeU = ToVkAddressMode(desc.addressU);
     create.addressModeV = ToVkAddressMode(desc.addressV);
     create.addressModeW = ToVkAddressMode(desc.addressW);
+    if (desc.addressU == ixrhi::IXRHISamplerAddress::ClampToBorder ||
+        desc.addressV == ixrhi::IXRHISamplerAddress::ClampToBorder ||
+        desc.addressW == ixrhi::IXRHISamplerAddress::ClampToBorder)
+        create.borderColor = VK_BORDER_COLOR_FLOAT_OPAQUE_WHITE; // shadow-map convention
+    create.compareEnable = desc.compareEnable ? VK_TRUE : VK_FALSE;
+    create.compareOp = ToVkCompareOp(desc.compareOp);
+    create.mipLodBias = desc.mipLodBias;
     create.maxAnisotropy = desc.maxAnisotropy > 1 && m_capabilities.supportsAnisotropy
         ? static_cast<float>(desc.maxAnisotropy)
         : 1.0f;

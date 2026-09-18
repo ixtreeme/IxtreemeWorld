@@ -50,12 +50,21 @@ public:
                                                       const void* initialDataOrNull,
                                                       std::size_t initialBytes) = 0;
 
-    // initialDataOrNull: tightly packed RGBA8 (or format-sized) texels for the
-    // full base level, or null for render-target/depth textures. With data, the
-    // backend stages through a host buffer and transitions to ShaderReadOnly.
+    // initialDataOrNull: tightly packed texels — the full base level for
+    // single-level textures, or the documented layer-major/mip-minor packing
+    // (see IXRHITexture.h) when desc carries mipLevels/arrayLayers — or null
+    // for render-target/depth textures. With data, the backend stages through
+    // a host buffer and transitions to ShaderReadOnly.
     virtual std::shared_ptr<IXRHITexture> CreateTexture(const IXRHITextureDesc& desc,
                                                         const void* initialDataOrNull,
                                                         std::size_t initialBytes) = 0;
+
+    // Synchronous full base-level rewrite of a sampled texture (terrain
+    // sculpt/paint uploads). Payload covers mip 0 of every array layer,
+    // tightly packed like creation data; higher mips are left untouched.
+    // Internally synchronized like creation upload (setup/edit-time only —
+    // never on the per-frame draw path).
+    virtual bool UpdateTexture(IXRHITexture& texture, const void* data, std::size_t byteCount) = 0;
 
     virtual std::shared_ptr<IXRHISampler> CreateSampler(const IXRHISamplerDesc& desc) = 0;
 

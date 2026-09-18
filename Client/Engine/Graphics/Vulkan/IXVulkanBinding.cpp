@@ -99,10 +99,14 @@ void IXVulkanBindGroup::UpdateTexture(std::uint32_t setIndex,
     m_textures.push_back(texture);
     m_samplers.push_back(sampler);
 
+    // Depth sampled as a texture requires the depth-read layout in the
+    // descriptor (terrain shadow map, scene-depth refraction input).
     VkDescriptorImageInfo info{};
     info.sampler = nativeSampler->Native();
     info.imageView = nativeTexture->NativeView();
-    info.imageLayout = VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL;
+    info.imageLayout = (ToVkAspectMask(nativeTexture->Format()) & VK_IMAGE_ASPECT_DEPTH_BIT) != 0
+        ? VK_IMAGE_LAYOUT_DEPTH_STENCIL_READ_ONLY_OPTIMAL
+        : VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL;
     VkWriteDescriptorSet write{};
     write.sType = VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET;
     write.dstSet = m_sets[setIndex];
@@ -127,7 +131,9 @@ void IXVulkanBindGroup::UpdateSampledImage(std::uint32_t setIndex,
 
     VkDescriptorImageInfo info{};
     info.imageView = nativeTexture->NativeView();
-    info.imageLayout = VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL;
+    info.imageLayout = (ToVkAspectMask(nativeTexture->Format()) & VK_IMAGE_ASPECT_DEPTH_BIT) != 0
+        ? VK_IMAGE_LAYOUT_DEPTH_STENCIL_READ_ONLY_OPTIMAL
+        : VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL;
     VkWriteDescriptorSet write{};
     write.sType = VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET;
     write.dstSet = m_sets[setIndex];

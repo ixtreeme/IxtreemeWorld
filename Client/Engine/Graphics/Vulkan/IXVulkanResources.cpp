@@ -74,6 +74,8 @@ IXVulkanTexture::IXVulkanTexture(IXVulkanDevice& device,
                                  VkImageView view,
                                  std::uint32_t width,
                                  std::uint32_t height,
+                                 std::uint32_t mipLevels,
+                                 std::uint32_t arrayLayers,
                                  ixrhi::IXRHIFormat format,
                                  std::string debugName)
     : m_device(&device)
@@ -82,6 +84,8 @@ IXVulkanTexture::IXVulkanTexture(IXVulkanDevice& device,
     , m_view(view)
     , m_width(width)
     , m_height(height)
+    , m_mipLevels(mipLevels == 0 ? 1u : mipLevels)
+    , m_arrayLayers(arrayLayers == 0 ? 1u : arrayLayers)
     , m_format(format)
     , m_debugName(std::move(debugName))
 {

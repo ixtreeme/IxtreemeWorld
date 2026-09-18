@@ -9,7 +9,11 @@
 class EditorImGui;
 class RuntimeSession;
 class TerrainRenderer;
-class VulkanDevice;
+
+namespace ixrhi
+{
+class IXRHIDevice;
+}
 
 struct MeshSceneEntity;
 
@@ -21,7 +25,7 @@ public:
         EditorImGui* editorImGui = nullptr;
         RuntimeSession* runtimeSession = nullptr;
         TerrainRenderer* terrain = nullptr;
-        VulkanDevice* device = nullptr;
+        ixrhi::IXRHIDevice* rhi = nullptr;
 
         std::vector<WaterBody>* waterBodies = nullptr;
         std::vector<PointLight>* pointLights = nullptr;

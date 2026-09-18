@@ -58,12 +58,16 @@ public:
                     VkImageView view,
                     std::uint32_t width,
                     std::uint32_t height,
+                    std::uint32_t mipLevels,
+                    std::uint32_t arrayLayers,
                     ixrhi::IXRHIFormat format,
                     std::string debugName);
     ~IXVulkanTexture() override;
 
     std::uint32_t Width() const override { return m_width; }
     std::uint32_t Height() const override { return m_height; }
+    std::uint32_t MipLevels() const override { return m_mipLevels; }
+    std::uint32_t ArrayLayers() const override { return m_arrayLayers; }
     ixrhi::IXRHIFormat Format() const override { return m_format; }
     const std::string& DebugName() const override { return m_debugName; }
 
@@ -77,6 +81,8 @@ private:
     VkImageView m_view = VK_NULL_HANDLE;
     std::uint32_t m_width = 0;
     std::uint32_t m_height = 0;
+    std::uint32_t m_mipLevels = 1;
+    std::uint32_t m_arrayLayers = 1;
     ixrhi::IXRHIFormat m_format = ixrhi::IXRHIFormat::Undefined;
     std::string m_debugName;
 };

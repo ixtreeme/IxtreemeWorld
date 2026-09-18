@@ -1,4 +1,4 @@
-# IXRHI portability baseline (Phase 2, updated Phase 3C, compute review Phase 3D, UI review Phase 3E)
+# IXRHI portability baseline (Phase 2, updated Phase 3C, compute review Phase 3D, UI review Phase 3E, terrain review Phase 3F)
 
 No MoltenVK integration in this phase. This document records what the core
 guarantees, what is optional, and which Vulkan-specific assumptions remain.
@@ -88,3 +88,23 @@ rayQuery/rayTracing, meshShaders, variableRateShading, asyncCompute.
   memory-model assumption.
 - Frames in flight = 2 discipline unchanged: per-frame/per-slot palette +
   output buffers (64 slots each), no buffer sharing across in-flight frames.
+
+## Phase-3F terrain review (MoltenVK-relevant, no Apple code)
+
+- Texture arrays (RGBA8/R8, mipmapped, trilinear + anisotropy): inside the
+  portability subset; anisotropy stays capability-gated, never assumed.
+- `R8_UNORM` / `R32_FLOAT` / `D32_SFLOAT`: all portable formats.
+- `ClampToBorder` with opaque-white border (shadow sampler): most
+  MoltenVK/Metal configurations support border clamp, but border COLOR
+  support varies — flagged: if a future Apple backend lacks opaque-white,
+  the shadow sampler needs a cooking fallback (edge-pad the cascades),
+  owned by the backend, not Terrain.
+- Comparison sampling (`LessOrEqual`): supported by MoltenVK.
+- Depth-only render targets + layered depth: portable through the Vulkan
+  subset (per-slice framebuffers); Metal translation equivalent exists.
+- Render-target count per frame is unchanged (1 reflection + 4 shadow
+  slices, same as before); no new attachment-count pressure.
+- Mobile flags (report only, no action): 4×2048² D32 shadow array (64 MiB)
+  + mipmapped material arrays dominate the terrain footprint (unchanged
+  from before); per-chunk draw calls unchanged (no batching change);
+  sculpt Read-modify-Write spans are brush-bounded CPU copies.

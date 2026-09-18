@@ -2338,7 +2338,7 @@ int RunGame(NativeWindow& window,
     Tracen("[MAIN] SkinnedMeshRenderer cache initialized; models load on demand per path");
 
     TerrainRenderer terrain;
-    bool terrainOk = terrain.Create(device, assets);
+    bool terrainOk = terrain.Create(*rhiDevice, assets);
     terrain.SetRhiDevice(rhiDevice.get());
     auto syncTerrainAssetRoots = [&]() {
         std::vector<std::filesystem::path> roots;
@@ -2359,7 +2359,7 @@ int RunGame(NativeWindow& window,
         editorImGui.SetPaletteSlots(runtimeSession->GetPaletteSlots());
         editorImGui.SetWaterMaterials(editorImGui.GetWaterMaterialsSnapshot());
 #endif
-        if (!terrain.ApplyPaletteSlots(device, runtimeSession->GetPaletteSlots()))
+        if (!terrain.ApplyPaletteSlots(*rhiDevice, runtimeSession->GetPaletteSlots()))
             Tracenf("[MAIN] world palette could not be applied; keeping initial terrain palette");
     }
 
@@ -2409,7 +2409,7 @@ int RunGame(NativeWindow& window,
                 offscreenScene.GetSampler(),
                 offscreenScene.Width(),
                 offscreenScene.Height());
-            terrain.RecreatePipeline(device);
+            terrain.RecreatePipeline(*rhiDevice);
         }
         if (selectionOutlinesOk)
         {
@@ -2665,7 +2665,7 @@ int RunGame(NativeWindow& window,
                 offscreenScene.GetSampler(),
                 offscreenScene.Width(),
                 offscreenScene.Height());
-            terrain.RecreatePipeline(device);
+            terrain.RecreatePipeline(*rhiDevice);
         }
         if (selectionOutlinesOk)
         {
@@ -3603,7 +3603,7 @@ int RunGame(NativeWindow& window,
         &editorImGui,
         runtimeSession.get(),
         &terrain,
-        &device,
+        rhiDevice.get(),
         &editorWaterBodies,
         &editorPointLights,
         &editorSpotLights,
@@ -4842,7 +4842,10 @@ int RunGame(NativeWindow& window,
         running = window.PumpMessages();
 
 #if defined(IXTREEME_WITH_EDITOR)
-        const std::uint64_t assetLibraryDiagFrame = device.GetFrameNumber() + 1u;
+        // Local discovery batch id (monotonic per loop iteration; the legacy
+        // device frame mirror is gone — graphics frames come from IXRHI).
+        static std::uint64_t assetDiscoveryFrameId = 0;
+        const std::uint64_t assetLibraryDiagFrame = ++assetDiscoveryFrameId;
         bool assetLibraryDiagFrameActive = false;
         const auto assetDiscoveryBegin = std::chrono::steady_clock::now();
         if (!debugDisableAssetLibraryDiscovery)
@@ -4997,7 +5000,7 @@ int RunGame(NativeWindow& window,
                         entry.renderer->RecreatePipeline(*rhiDevice);
                 }
                 if (terrainOk)
-                    terrain.RecreatePipeline(device);
+                    terrain.RecreatePipeline(*rhiDevice);
                 if (selectionOutlinesOk)
                     selectionOutlines.RecreatePipeline(*rhiDevice);
                 if (worldLabelsOk)
@@ -6226,7 +6229,7 @@ int RunGame(NativeWindow& window,
                     else if (type == HierarchyEntityType::Terrain)
                     {
                         if (terrainOk)
-                            terrain.ClearTerrain(device);
+                            terrain.ClearTerrain();
                     }
                     else if (type == HierarchyEntityType::PointLight)
                     {
@@ -8955,7 +8958,7 @@ int RunGame(NativeWindow& window,
                     TerrainSceneData next = NormalizeTerrainCreateRequest(commands.terrainCreate);
                     if (next.name.empty())
                         next.name = makeUniqueSceneEntityName("Terrain");
-                    if (terrain.CreateFlatTerrain(device, next))
+                    if (terrain.CreateFlatTerrain(*rhiDevice, next))
                     {
                         editorWaterBodies.clear();
                         editorWaterBodiesDirty = true;
@@ -9778,11 +9781,11 @@ int RunGame(NativeWindow& window,
                         terrainWaterBodies.erase(std::remove_if(terrainWaterBodies.begin(),
                             terrainWaterBodies.end(),
                             [](const WaterBody& body) { return body.editorHidden; }), terrainWaterBodies.end());
-                        terrain.SetWaterBodies(device, terrainWaterBodies);
+                        terrain.SetWaterBodies(*rhiDevice, terrainWaterBodies);
                     }
                     else
                     {
-                        terrain.SetWaterBodies(device, terrainWaterBodies);
+                        terrain.SetWaterBodies(*rhiDevice, terrainWaterBodies);
                         editorWaterBodies = terrain.GetWaterBodies();
                     }
                     if (waterSculptMeshRegenPending &&
@@ -9805,7 +9808,7 @@ int RunGame(NativeWindow& window,
                     waterSculptMeshRegenPending = false;
                     editorWaterBodiesDirty = false;
                 }
-                terrain.SetSelectedWaterBodyHighlight(device, 0u);
+                terrain.SetSelectedWaterBodyHighlight(*rhiDevice, 0u);
                 // Push the finalized lighting to every cached skinned model, and stash it so a
                 // model loaded later this frame is seeded lit at create time (getSkinnedMeshRenderer).
                 skinnedCacheLighting = lightingState;
@@ -9818,7 +9821,7 @@ int RunGame(NativeWindow& window,
                 if (commands.paletteSlotChanged)
                 {
                     syncTerrainAssetRoots();
-                    if (!terrain.ApplyPaletteSlotChange(device, commands.paletteSlotData))
+                    if (!terrain.ApplyPaletteSlotChange(*rhiDevice, commands.paletteSlotData))
                     {
                         Tracenf("[MAIN] failed to apply terrain palette slot %u", commands.paletteSlot);
                     }
@@ -9866,7 +9869,7 @@ int RunGame(NativeWindow& window,
                 }
                 if (commands.undo)
                     terrain.RequestEditorUndo();
-                terrain.UpdateEditor(device, deltaSeconds, frameCamera, renderSize.width, renderSize.height);
+                terrain.UpdateEditor(*rhiDevice, deltaSeconds, frameCamera, renderSize.width, renderSize.height);
                 if (commands.reload)
                 {
                     editorWaterBodies = terrain.GetWaterBodies();
@@ -10226,27 +10229,26 @@ int RunGame(NativeWindow& window,
             if (isInWorld && hasSceneTerrain && hasFrameCamera && !debugDisableShadowPass)
             {
                 rhiDevice->WriteTimestamp(ixrhi::IXRHITimestampPoint::ShadowPassBegin);
-                terrain.RenderSunShadowMap(device, frameCamera);
+                terrain.RenderSunShadowMap(*frameInfo.commandList, frameInfo, frameCamera);
                 rhiDevice->WriteTimestamp(ixrhi::IXRHITimestampPoint::ShadowPassEnd);
             }
             if (isInWorld && hasSceneTerrain && hasFrameCamera && !debugDisableWaterReflectionPass)
             {
                 rhiDevice->WriteTimestamp(ixrhi::IXRHITimestampPoint::WaterReflectionBegin);
-                terrain.RenderWaterReflection(device,
+                terrain.RenderWaterReflection(*frameInfo.commandList,
+                    frameInfo,
                     frameCamera,
                     seconds,
                     [&](const WorldCamera& mirrorCamera,
-                        VkExtent2D reflectionExtent,
-                        VkRenderPass reflectionRenderPass,
+                        std::uint32_t reflectionWidth,
+                        std::uint32_t reflectionHeight,
+                        const ixrhi::IXRHIRenderPass* reflectionPass,
                         float waterLevelY)
                     {
-                        // The native reflection pass handle stays on the terrain side: the
-                        // skinned reflection pipeline is baked against the borrowed IXRHI
-                        // pass token (attachment-compatible formats), so only the extent
-                        // crosses here.
-                        (void)reflectionRenderPass;
                         // Redraw the exact (renderer, slot) recorded by the Scene pre-pass — the
                         // output buffers are already skinned, so no fresh slot allocation here.
+                        // The borrowed reflection pass bakes the skinned reflection pipeline
+                        // against the real target (Phase-3F seam).
                         for (const SkinnedDrawRecord& rec : sceneSkinnedDraws)
                         {
                             if (!rec.renderer)
@@ -10254,9 +10256,9 @@ int RunGame(NativeWindow& window,
                             rec.renderer->RenderInWorldReflection(*frameInfo.commandList,
                                 frameInfo,
                                 mirrorCamera,
-                                reflectionExtent.width,
-                                reflectionExtent.height,
-                                nullptr,
+                                reflectionWidth,
+                                reflectionHeight,
+                                reflectionPass,
                                 waterLevelY,
                                 rec.position,
                                 rec.yaw,
@@ -10295,7 +10297,7 @@ int RunGame(NativeWindow& window,
                 {
                     frameSceneRenderCalled = true;
                     rhiDevice->WriteTimestamp(ixrhi::IXRHITimestampPoint::TerrainMainBegin);
-                    terrain.Render(device, camera, renderSize);
+                    terrain.Render(*frameInfo.commandList, frameInfo, camera, renderSize.width, renderSize.height);
                     rhiDevice->WriteTimestamp(ixrhi::IXRHITimestampPoint::TerrainMainEnd);
                 }
                 rhiDevice->WriteTimestamp(ixrhi::IXRHITimestampPoint::SceneOtherBegin);
@@ -10892,7 +10894,7 @@ int RunGame(NativeWindow& window,
                 }
                 if (!useOffscreenScene && hasSceneTerrain)
                 {
-                    terrain.RenderWater(device, camera, seconds, renderSize);
+                    terrain.RenderWater(*frameInfo.commandList, frameInfo, camera, seconds, renderSize.width, renderSize.height);
                 }
                 if (!useOffscreenScene && worldLabelsOk)
                     worldLabels.Render(*frameInfo.commandList, frameInfo, camera, plates);
@@ -10921,7 +10923,7 @@ int RunGame(NativeWindow& window,
                         offscreenScene.Width(),
                         offscreenScene.Height());
                     offscreenScene.BeginMainPass(*frameInfo.commandList, frameInfo, false);
-                    terrain.RenderWater(device, camera, seconds, renderSize);
+                    terrain.RenderWater(*frameInfo.commandList, frameInfo, camera, seconds, renderSize.width, renderSize.height);
                     offscreenScene.EndMainPass(*frameInfo.commandList);
                 }
 #if defined(IXTREEME_WITH_EDITOR)
@@ -10981,7 +10983,7 @@ int RunGame(NativeWindow& window,
                         // frame's Scene-view textures (acceptable; per-view RTs are a refinement).
                         if (hasSceneTerrain)
                         {
-                            terrain.Render(device, gameCamera, gameExtent, /*viewIndex=*/1);
+                            terrain.Render(*frameInfo.commandList, frameInfo, gameCamera, gameExtent.width, gameExtent.height, /*viewIndex=*/1);
                         }
                         if (isInWorld)
                         {
@@ -11035,7 +11037,7 @@ int RunGame(NativeWindow& window,
                         }
                         if (hasSceneTerrain)
                         {
-                            terrain.RenderWater(device, gameCamera, seconds, gameExtent, /*viewIndex=*/1);
+                            terrain.RenderWater(*frameInfo.commandList, frameInfo, gameCamera, seconds, gameExtent.width, gameExtent.height, /*viewIndex=*/1);
                         }
                         gameView.EndMainPass(*frameInfo.commandList);
                     }
@@ -11269,7 +11271,7 @@ int RunGame(NativeWindow& window,
         {
             dumpFrameProfileRequested = false;
             TraceDiagf("[FRAME-PROFILE] frame=%llu",
-                static_cast<unsigned long long>(device.GetFrameNumber()));
+                static_cast<unsigned long long>(frameNumber));
             TraceDiagf("[FRAME-PROFILE]   asset_library_poll = %.3f ms",
                 frameProfile.assetLibraryPollMs);
             TraceDiagf("[FRAME-PROFILE]   asset_watcher_poll = %.3f ms",

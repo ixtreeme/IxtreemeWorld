@@ -29,6 +29,7 @@ public:
                          VkRenderPass pass,
                          bool ownPass,
                          VkFramebuffer framebuffer,
+                         VkImageView ownedDepthLayerView,
                          std::unique_ptr<IXVulkanRenderPass> passToken,
                          float clearColor[4],
                          float clearDepth,
@@ -51,6 +52,9 @@ private:
     VkRenderPass m_pass = VK_NULL_HANDLE;
     bool m_ownPass = true;
     VkFramebuffer m_framebuffer = VK_NULL_HANDLE;
+    // Owned per-layer 2D view when the depth texture is an array (shadow
+    // cascades); single-layer targets use the texture's own view.
+    VkImageView m_ownedDepthLayerView = VK_NULL_HANDLE;
     std::unique_ptr<IXVulkanRenderPass> m_passToken;
     float m_clearColor[4]{};
     float m_clearDepth = 1.0f;

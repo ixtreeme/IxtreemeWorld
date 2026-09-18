@@ -89,6 +89,22 @@ void RunConversionChecks()
     CheckConv(ixvulkan::ToVkDescriptorType(ixrhi::IXRHIBindingType::Sampler) ==
             VK_DESCRIPTOR_TYPE_SAMPLER,
         "conv binding separate sampler");
+    CheckConv(ixvulkan::ToVkFormat(ixrhi::IXRHIFormat::R8Unorm) == VK_FORMAT_R8_UNORM,
+        "conv format R8");
+    CheckConv(ixvulkan::ToVkFormat(ixrhi::IXRHIFormat::R32Float) == VK_FORMAT_R32_SFLOAT,
+        "conv format R32");
+    CheckConv(ixvulkan::FromVkFormat(VK_FORMAT_R8_UNORM) == ixrhi::IXRHIFormat::R8Unorm,
+        "conv format R8 round-trip");
+    CheckConv(ixrhi::IXRHIFormatByteSize(ixrhi::IXRHIFormat::R8Unorm) == 1,
+        "conv format R8 size 1");
+    CheckConv(ixrhi::IXRHIFormatByteSize(ixrhi::IXRHIFormat::R32Float) == 4,
+        "conv format R32 size 4");
+    CheckConv(ixvulkan::ToVkAddressMode(ixrhi::IXRHISamplerAddress::ClampToBorder) ==
+            VK_SAMPLER_ADDRESS_MODE_CLAMP_TO_BORDER,
+        "conv address border");
+    CheckConv(ixvulkan::ToVkCompareOp(ixrhi::IXRHICompareOp::LessOrEqual) ==
+            VK_COMPARE_OP_LESS_OR_EQUAL,
+        "conv compare LEQ for shadow sampler");
     CheckConv(ixvulkan::ToVkImageLayout(ixrhi::IXRHIImageLayout::ShaderReadOnly) ==
             VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL,
         "conv layout read-only");

@@ -12,10 +12,12 @@ VkFormat ToVkFormat(ixrhi::IXRHIFormat format)
     using F = ixrhi::IXRHIFormat;
     switch (format)
     {
+    case F::R8Unorm: return VK_FORMAT_R8_UNORM;
     case F::R8G8B8A8Unorm: return VK_FORMAT_R8G8B8A8_UNORM;
     case F::R8G8B8A8Srgb: return VK_FORMAT_R8G8B8A8_SRGB;
     case F::B8G8R8A8Unorm: return VK_FORMAT_B8G8R8A8_UNORM;
     case F::B8G8R8A8Srgb: return VK_FORMAT_B8G8R8A8_SRGB;
+    case F::R32Float: return VK_FORMAT_R32_SFLOAT;
     case F::R32G32Float: return VK_FORMAT_R32G32_SFLOAT;
     case F::R32G32B32Float: return VK_FORMAT_R32G32B32_SFLOAT;
     case F::R32G32B32A32Float: return VK_FORMAT_R32G32B32A32_SFLOAT;
@@ -31,10 +33,12 @@ ixrhi::IXRHIFormat FromVkFormat(VkFormat format)
     using F = ixrhi::IXRHIFormat;
     switch (format)
     {
+    case VK_FORMAT_R8_UNORM: return F::R8Unorm;
     case VK_FORMAT_R8G8B8A8_UNORM: return F::R8G8B8A8Unorm;
     case VK_FORMAT_R8G8B8A8_SRGB: return F::R8G8B8A8Srgb;
     case VK_FORMAT_B8G8R8A8_UNORM: return F::B8G8R8A8Unorm;
     case VK_FORMAT_B8G8R8A8_SRGB: return F::B8G8R8A8Srgb;
+    case VK_FORMAT_R32_SFLOAT: return F::R32Float;
     case VK_FORMAT_R32G32_SFLOAT: return F::R32G32Float;
     case VK_FORMAT_R32G32B32_SFLOAT: return F::R32G32B32Float;
     case VK_FORMAT_R32G32B32A32_SFLOAT: return F::R32G32B32A32Float;
@@ -182,8 +186,14 @@ VkFilter ToVkFilter(ixrhi::IXRHISamplerFilter filter)
 
 VkSamplerAddressMode ToVkAddressMode(ixrhi::IXRHISamplerAddress mode)
 {
-    return mode == ixrhi::IXRHISamplerAddress::Repeat ? VK_SAMPLER_ADDRESS_MODE_REPEAT
-                                                      : VK_SAMPLER_ADDRESS_MODE_CLAMP_TO_EDGE;
+    using A = ixrhi::IXRHISamplerAddress;
+    switch (mode)
+    {
+    case A::Repeat: return VK_SAMPLER_ADDRESS_MODE_REPEAT;
+    case A::ClampToBorder: return VK_SAMPLER_ADDRESS_MODE_CLAMP_TO_BORDER;
+    case A::ClampToEdge: break;
+    }
+    return VK_SAMPLER_ADDRESS_MODE_CLAMP_TO_EDGE;
 }
 
 VkImageLayout ToVkImageLayout(ixrhi::IXRHIImageLayout layout)

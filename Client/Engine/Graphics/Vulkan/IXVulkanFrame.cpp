@@ -166,21 +166,6 @@ void IXVulkanDevice::TeardownFrameObjects()
     }
 }
 
-void IXVulkanDevice::SyncLegacyFrameState() const
-{
-    // Keeps still-native renderers (terrain/skinned/RmlUi) working unchanged:
-    // they read the active command buffer, indices and numbers from the
-    // legacy object, which mirrors backend authority (deleted with them).
-    // safeFrameNumber mirrors legacy: current frame number once its slot
-    // fence has been waited (all older frames complete).
-    m_loop->SetMigrationFrameState(m_frameActive ? m_slots[m_activeSlot].cmd : VK_NULL_HANDLE,
-        m_tracker.GetSlot(),
-        m_activeImage,
-        m_tracker.GetFrameNumber(),
-        m_tracker.GetFrameNumber(),
-        m_frameActive);
-}
-
 ixrhi::IXRHIFrame IXVulkanDevice::BeginFrame()
 {
     ixrhi::IXRHIFrame frame;
@@ -214,7 +199,6 @@ ixrhi::IXRHIFrame IXVulkanDevice::BeginFrame()
     if (NativeDevice() == VK_NULL_HANDLE)
     {
         m_tracker.OnAbort();
-        SyncLegacyFrameState();
         return frame; // Skip
     }
 
@@ -232,11 +216,9 @@ ixrhi::IXRHIFrame IXVulkanDevice::BeginFrame()
         if (!RecreateSwapchainNow(m_requestedWidth, m_requestedHeight))
         {
             m_tracker.OnAbort();
-            SyncLegacyFrameState();
             return frame; // Skip (zero size or legacy failure); retry next frame
         }
         m_tracker.OnAbort();
-        SyncLegacyFrameState();
         frame.result = ixrhi::IXRHIFrameResult::SwapchainRecreated;
         frame.info.swapchainGeneration = m_swapchain->Generation();
         return frame;
@@ -246,7 +228,6 @@ ixrhi::IXRHIFrame IXVulkanDevice::BeginFrame()
     if (extent.width == 0 || extent.height == 0)
     {
         m_tracker.OnAbort();
-        SyncLegacyFrameState();
         return frame; // Skip
     }
     if (m_swapchain->Generation() == 0)
@@ -257,7 +238,6 @@ ixrhi::IXRHIFrame IXVulkanDevice::BeginFrame()
     if (m_swapchain->Generation() == 0 || m_loop->GetSwapchain() == VK_NULL_HANDLE)
     {
         m_tracker.OnAbort();
-        SyncLegacyFrameState();
         return frame; // Skip: no usable swapchain yet
     }
 
@@ -265,7 +245,6 @@ ixrhi::IXRHIFrame IXVulkanDevice::BeginFrame()
     if (!EnsureFrameSlot(slot) || !EnsureSwapchainObjects())
     {
         m_tracker.OnAbort();
-        SyncLegacyFrameState();
         return frame; // Skip
     }
     IXVulkanFrameSlot& context = m_slots[slot];
@@ -299,7 +278,6 @@ ixrhi::IXRHIFrame IXVulkanDevice::BeginFrame()
         if (acquire == VK_ERROR_OUT_OF_DATE_KHR)
             m_swapchainDirty = true;
         m_tracker.OnAbort();
-        SyncLegacyFrameState();
         frame.result = acquireResult; // Skip or DeviceLost; SwapchainRecreated handled next Begin
         if (acquireResult == ixrhi::IXRHIFrameResult::SwapchainRecreated)
             frame.info.swapchainGeneration = m_swapchain->Generation();
@@ -341,7 +319,6 @@ ixrhi::IXRHIFrame IXVulkanDevice::BeginFrame()
     if (captureThisFrame)
         BeginCaptureForFrame();
 
-    SyncLegacyFrameState();
 
     frame.result = ixrhi::IXRHIFrameResult::Success;
     frame.frameToken = m_activeToken;
@@ -447,7 +424,6 @@ void IXVulkanDevice::EndFrame(const ixrhi::IXRHIFrame& frame)
         return;
     }
     m_frameActive = false;
-    SyncLegacyFrameState();
 }
 
 bool IXVulkanDevice::RequestResize(std::uint32_t width, std::uint32_t height)
@@ -517,13 +493,10 @@ void IXVulkanDevice::Shutdown()
         return;
     }
     // Documented order (§70): idle first, then frame objects, swapchain
-    // object (pass/targets/backbuffers), query pool, upload pool. Legacy
-    // shims cleared so late native calls observe inactive state.
+    // object (pass/targets/backbuffers), query pool, upload pool.
     vkDeviceWaitIdle(NativeDevice());
     m_tracker.OnAbort();
     m_frameActive = false;
-    SyncLegacyFrameState();
-    m_loop->SetMigrationMainPass(VK_NULL_HANDLE);
     TeardownFrameObjects();
     m_swapchain.reset();
     if (m_uploadPool != VK_NULL_HANDLE)

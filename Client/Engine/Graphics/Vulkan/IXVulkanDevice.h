@@ -5,8 +5,9 @@
 // Phase 3C authority: frame acquisition, per-frame command ownership,
 // submission, presentation, frames-in-flight sync, GPU timestamps and the main
 // swapchain object live HERE. The legacy VulkanDevice keeps device/queue/
-// swapchain-handle infrastructure (§39 debt) plus per-frame migration shims
-// synced by this backend; its own BeginFrame/EndFrame loop is dormant.
+// swapchain-handle infrastructure (§39 debt); its own BeginFrame/EndFrame
+// loop is dormant. Frame-migration shims were deleted in Phase 3F (no
+// generic native renderer remains).
 //
 // E2 Loop() is RETIRED as frame authority: Loop() remains only as infra
 // access for the backend itself (device/queues/swapchain/images). Generic
@@ -23,8 +24,8 @@
 // Phase 3C authority: frame acquisition, per-frame command ownership,
 // submission, presentation, frames-in-flight sync, GPU timestamps and the main
 // swapchain object live HERE. The legacy VulkanDevice keeps device/queue/
-// swapchain-handle infrastructure (§39 debt) plus migration shims synced by
-// this backend every frame; its own BeginFrame/EndFrame loop is dormant.
+// swapchain-handle infrastructure (§39 debt); its own BeginFrame/EndFrame
+// loop is dormant. Frame-migration shims were deleted in Phase 3F.
 //
 // Vk* in THIS header is allowed: Engine/Graphics/Vulkan is the backend module.
 // It must not leak further: renderer/editor headers take IXRHI types only.
@@ -80,6 +81,7 @@ public:
     std::shared_ptr<ixrhi::IXRHITexture> CreateTexture(const ixrhi::IXRHITextureDesc& desc,
                                                        const void* initialDataOrNull,
                                                        std::size_t initialBytes) override;
+    bool UpdateTexture(ixrhi::IXRHITexture& texture, const void* data, std::size_t byteCount) override;
     std::shared_ptr<ixrhi::IXRHISampler> CreateSampler(const ixrhi::IXRHISamplerDesc& desc) override;
     std::shared_ptr<ixrhi::IXRHIShader> CreateShader(const ixrhi::IXRHIShaderDesc& desc) override;
     std::unique_ptr<ixrhi::IXRHIBindGroupLayout> CreateBindGroupLayout(
@@ -156,17 +158,36 @@ public:
 
 private:
     void QueryCapabilities();
-    void UploadTextureBytes(VkImage image,
-                            std::uint32_t width,
-                            std::uint32_t height,
-                            ixrhi::IXRHIFormat format,
-                            const void* bytes,
-                            std::size_t byteCount) const;
+    // Multi-subresource staged upload (tight layer-major/mip-minor packing,
+    // see IXRHITexture.h). initialLayout/finalLayout bracket the copies;
+    // readLayoutFor() picks the sampled layout (depth-aware). Internally
+    // synchronized submit + queue wait (setup/edit-time parity).
+    struct TextureCopyRegion
+    {
+        std::uint32_t mipLevel = 0;
+        std::uint32_t baseArrayLayer = 0;
+        std::uint32_t layerCount = 1;
+        std::uint32_t width = 0;
+        std::uint32_t height = 0;
+        std::uint64_t bufferOffsetBytes = 0;
+    };
+    void UploadTextureRegions(VkImage image,
+                              ixrhi::IXRHIFormat format,
+                              std::uint32_t mipLevels,
+                              std::uint32_t arrayLayers,
+                              const TextureCopyRegion* regions,
+                              std::size_t regionCount,
+                              const void* bytes,
+                              std::size_t byteCount,
+                              VkImageLayout initialLayout,
+                              VkImageLayout finalLayout) const;
+    // Sampled-layout counterpart of ToVkImageLayout(ShaderReadOnly):
+    // depth aspects require the depth-read layout.
+    static VkImageLayout SampledReadLayout(ixrhi::IXRHIFormat format);
     // Frame authority internals.
     bool EnsureFrameSlot(std::uint32_t slot);
     bool EnsureSwapchainObjects();
     void TeardownFrameObjects();
-    void SyncLegacyFrameState() const;
     void BeginCaptureForFrame();
     void FinishCaptureAfterSubmit();
     void CreateTimestampPool();
