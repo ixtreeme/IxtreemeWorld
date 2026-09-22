@@ -256,6 +256,9 @@ MigrationOutcome MigrationCoordinator::MigratePlayer(Zone& source_zone,
     const auto session_id = moved_binding.session ? moved_binding.session->Id() : 0;
     target_zone.InsertPlayerBinding(net_id, std::move(moved_binding));
     target_zone.RefreshResidentCounts();
+    // Load field attribution: a committed ownership transfer is migration
+    // work at the destination position (target write guard is held).
+    target_zone.LoadBins().NoteMigration(transfer.position.x, transfer.position.y);
     if (session_id != 0) {
         OwnerInfo owner;
         owner.entity = transfer.entity_id;
@@ -339,6 +342,8 @@ MigrationOutcome MigrationCoordinator::MigrateMob(Zone& source_zone,
     // decisions stay exact before the next evaluation recount.
     target_zone.NoteLodInsert(transfer.sim_lod.tier);
     target_zone.RefreshResidentCounts();
+    // Load field attribution: committed ownership transfer at the destination.
+    target_zone.LoadBins().NoteMigration(transfer.position.x, transfer.position.y);
 
     source_zone.Diagnostics().migrations_since_diag.fetch_add(1, std::memory_order_relaxed);
     LOG_INFO("migration: net_id={} (mob, type={}) from_zone={} to_zone={} tick={}",

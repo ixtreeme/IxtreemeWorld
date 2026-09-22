@@ -616,8 +616,8 @@ Az előző commitból javított Fast/Exact semanticsra **tesztet kell írni**:
 | Chunk | Szakaszok | Tartalom | Státusz |
 |---|---|---|---|
 | **A** | §2.1, §2.2, §39 | Fast/Exact query szétválasztás + explicit world origin + a hozzájuk tartozó tesztek | ✅ **KÉSZ** |
-| **B** | §3–6, §13–15, §34–37 | `ContinuousLoadField` váz: `LoadChannels`, dense cella-tár, két-időskálás EMA, decay, normalizáció, L0/L1 seam, Current/Predicted szétválasztás | ⬜ következő |
-| **C** | §7–12 | Térbeli work-attribúció a hívási pontokon: AI, movement, combat, AOI (candidate/cap), replication (byte + spawn/despawn + recipient), migration | ⬜ |
+| **B** | §3–6, §13–15, §34–37 | `ContinuousLoadField` váz: `LoadChannels`, dense cella-tár, két-időskálás EMA, decay, normalizáció, L0/L1 seam, Current/Predicted szétválasztás | ✅ **KÉSZ** (lásd §6) |
+| **C** | §7–12 | Térbeli work-attribúció a hívási pontokon: AI, movement, combat, AOI (candidate/cap), replication (byte + spawn/despawn + recipient), migration | ✅ **KÉSZ** (lásd §6.2) |
 | **D** | §16–17, §28, §30–33 | `PartitionLoadScore`, p95/p99 a control plane-en, strukturált döntési log, why-not diagnostics, `MinExpectedImprovement`, `TopologyComplexityPenalty` | ⬜ |
 | **E** | §18–24, §27 | BoundaryCost field, Partition Objective, hotspot detection (flood fill), hotspot-aware split, multi-candidate split, merge sustained-low timer | ⬜ |
 | **F** | §1, §21, §29 | `worldbench --mode loadfield`, validator-bővítés, regresszió a meglévő 7 módra, control-loop frekvenciák konfigurálhatóvá tétele | ⬜ |
@@ -668,15 +668,11 @@ tier-pillanatképek, prom/dem döntések változatlanok).
    rendelkezésre álló szöveget teljes egészében tartalmazza; ha van folytatás
    (§39 vége, §40+), az ide kerül, és befolyásolhatja a B/C tervezést.
 
-2. **LoadField cellaméret a teszt-térképen (§6/§34 input).** A jelenlegi
-   teszt-világ **1000×1000 m** (`docs/test-zone-map.md`), 3 seeded zónával
-   (500×500 m és 500×1000 m). Az 500 m-es activity cella emiatt összesen **4
-   cellát** ad (`cells=1/4` a hotspot módban), egy zóna pedig pontosan **egy
-   cella** — ezen a felbontáson a §23 hotspot-detektálás (*„nem az egész Zone
-   hot, csak ez a 700×900 m terület"*) elvileg sem működhet.
-   Ezért a LoadField cellaméret **configból jön**, és a benchmark-világ saját,
-   kisebb értéket kap (≈50–125 m), miközben a 100 km-es production world a
-   §34-ben javasolt 250–500 m-t használja.
+2. **LoadField cellaméret a teszt-térképen (§6/§34 input). — MEGOLDVA (§6.3).**
+   A teszt-világ **1000×1000 m**, 3 seeded zónával; 500 m-en ez csak 4 cella,
+   ezért a felbontás **config**: production default 500 m (3.4 MB, ~1.5 ms/1 Hz,
+   benchmarkolt), a bench-világ 100 m-t használ, és a 250 m is elérhető, ha a
+   későbbi boundary-tervezés finomabb felbontást igényel.
 
 3. **A `transfer-roundtrip` selftest időzítés-érzékeny és intermittensen bukik
    a HEAD-en.** Mérve: chunk A binárissal 5-ből 2 FAIL, **érintetlen baseline
@@ -688,3 +684,174 @@ tier-pillanatképek, prom/dem döntések változatlanok).
    entitásonkénti LOD hurokban keletkeznek. Ez teljesítmény-szempontból helyes;
    ha a plannernek egzakt cross-zone attribúció kell, azt a ~1 Hz-es planner
    úton kell számolni az Exact query-vel — **nem** az entitásonkénti hurokban.
+
+---
+
+## 6. Chunk B/C — Continuous Multi-Channel Load Field
+
+> Implementációs jegyzet. Az audit a `e6c9da75` HEAD tényleges source-án
+> készült (nem commit üzenetekből/dokumentumokból): a hívási pontok és a
+> meglévő mérőszámok forrásszinten lettek ellenőrizve.
+
+### 6.1 Audit — mi mérhető, hol, milyen áron
+
+**Ténylegesen működő, újrahasznosított mérési infrastruktúra**
+
+| Terület | Forrás | Mérés | Attribúció |
+|---|---|---|---|
+| Zone tick | `ZoneDiagnostics` | tick µs + 256-os ring (p50/p95/p99 a benchben), stage µs (gameplay/ghost/replication/lod eval) | ZoneId |
+| LOD | `ZoneDiagnostics` / `LodSystem` | ai/move update **darabszám**, eval µs, tier gauge-ok | ZoneId |
+| AOI | `AoiSystem` / `ZoneDiagnostics` | query szám, elfogadott candidate-ek tier bontásban | ZoneId |
+| Replication | `ZoneDiagnostics` | elküldött transform **rekordok** száma | ZoneId |
+| Migration | `ZoneDiagnostics` + `MigrationMetrics` | committed/stale/dup/retry/fail | ZoneId / process |
+| Worker/supervisor | `ZoneWorkerPool` / `WorldRuntime` | task szám, busy µs, supervisor µs | process |
+| Activity field | `SpatialActivityField` | source szám, nem üres cellák, rebuild µs, epoch | **world-space cella** |
+
+**Amit eddig NEM mértünk (és most bekötöttük vagy explicit seam lett)**
+
+1. **Replication byte-ok**: az `EncodeTransformFrame` eredménye eddig egyenesen
+   a `send()`-be ment — a payload mérete sehol nem volt számlálóban. Most a
+   frame + spawn/despawn payload byte-ok mérve (a `ReconcileViewer` opcionális
+   `out_bytes` paramétere; a `send` wrapper-elése elkerülve, mert az viewer-enkénti
+   `std::function` allokáció lenne a hot pathon).
+2. **AOI candidate count a cap előtt**: eddig csak az elfogadott látható
+   entitások voltak meg; a pre-cap candidate szám most mérve (a 100-as sapka
+   levágása így látható marad).
+3. **Combat**: a `CombatSystem`-nek nulla számlálója volt; most sikeres
+   attack/damage event kerül a mezőbe (a támadó pozícióján).
+4. **Migration pozíció**: eddig csak darabszám; most a committed transfer
+   pozíciója (cél oldal) + a boundary-crossing **átmenet** (nem minden tickben
+   ismételve) kerül a mezőbe.
+5. **Nincs megbízható input** (nem hamisítjuk, dokumentált seam):
+   - Replication delta/dirty protokoll: a dirty transform darabszám mérve van
+     (`repl_dirty`), de a küldés továbbra is full-frame — a byte-ok a valós
+     fanout munkát mérik, a dirty csak diagnosztika.
+   - Visibility set churn (enter/leave eseményszám) külön nem számláló; a
+     spawn/despawn payload byte-ok a replication channelben jelennek meg.
+     AOI recipient count közvetve a byte-okban/records-ban van.
+   - Per-entity µs: szándékosan nincs (clock read entitásonként túl drága);
+     a zone-szintű measured stage µs marad a mért horgony, a mező a ténylegesen
+     lefutott update-eket számolja (nem entity countot: LOD-szűrt).
+
+**Thread ownership (auditált, nem változott)**
+
+A zone írási jogát a `ZoneWriteGuard` (`OwnerThreadId` CAS) adja: egyszerre
+egy thread írhat. A load bin írások mind ilyen guard alatt történnek (tick
+rendszerek, combat a command drain-ben, migration/split transfer a supervisor
+guardja alatt), ezért a bin hot path **nem igényel lockot**. A publikálás a
+tick végén a meglévő `activity_mutex_` alatt történik (mikroszekundumos
+szakasz); a supervisor 1 Hz-en drainel.
+
+### 6.2 Architektúra (implementált)
+
+```
+zone-local integer counters (guard alatt, lock nélkül)
+        ↓  sparse touched lista
+tick végi publish (activity_mutex)
+        ↓  batched, csak touched cellák
+supervisor aggregation (~1 Hz, Rebuild)
+        ↓  AsymmetricEwma + normalizáció + L1
+immutable LoadGrid generation (shared_ptr)
+```
+
+- **Fájlok**: `world/activity/LoadFieldTypes.h`, `ContinuousLoadField.h/.cpp`,
+  `LoadFieldPublisher.h/.cpp`; a közös koordináta-primitív
+  (`ClampedAxisCellFor`) az `ActivityTypes.h`-ba került, a `SpatialActivityField`
+  ugyanazt használja (nincs duplikált mapping).
+- **Tárolás (§34-35)**: dense rectangular L0 grid `WorldBounds` fölött
+  (`dim_x × dim_y`, row-major); 100 km / 500 m = 40 000 cella. A zone-oldali
+  gyorsító egy **dense rect a zone saját boundsára** (+32 m margin a
+  boundary-crossing sávnak), a publikálás **sparse** (csak a touched cellák).
+  L1 = `l1_ratio × l1_ratio` L0 blokk összeg (nem külön EMA — az EMA lineáris),
+  így a későbbi L0/L1/L2 irány nem kizárt, de nincs hierarchy framework.
+- **Csatornák**: `Simulation`, `Replication`, `AOI`, `Combat`, `Migration`
+  (`LoadChannelMetadata` mondja meg channelenként a `Measured`/`EventCount`/
+  `Unavailable` forrást és a mértékegységet). Nyersen soha nem adódnak össze:
+  a normalizáció reference budgettel (raw/second ÷ budget/second, clamp [0,1],
+  NaN/Inf → 0), a composite pedig explicit, konfigurálható súlyokkal készül; a
+  channel breakdown mindig elérhető marad.
+- **SimulationCost**: ténylegesen lefutott AI döntések + movement integrációk
+  száma (LOD-szűrve, tehát nem entity count); a zone-szintű measured µs a
+  `ZoneDiagnostics`-ban marad, és a mező nem kever bele hamis per-cell µs-t.
+- **ReplicationPressure**: **mért byte** (frame + spawn/despawn), viewer
+  pozícióra attribútálva; rekord és dirty darabszám külön diagnosztika.
+- **AOIWork**: query + pre-cap candidate (sűrű hotspot drágább, mint ugyanannyi
+  entitás szétszórva).
+- **CombatHeat**: event-derived, az aszimmetrikus EMA-val decay-el (egy régi
+  csata nem marad hot).
+- **MigrationPressure**: committed transfer + boundary-crossing átmenet +
+  split/merge belső transfer.
+- **Smoothing (§13-14, §19)**: két időskálás aszimmetrikus EWMA τ-alapú
+  alpha-val (`alpha = 1 - exp(-dt/τ)`), így a cadence-től független:
+  fast rise τ=1.5 s / fall τ=8 s, slow rise τ=8 s / fall τ=25 s (config).
+  A `predicted` mező a slow EMA másolata — §37 storage seam, nincs trajectory
+  modell.
+- **Immutability (§20)**: a supervisor épít új generációt és `shared_ptr`-t
+  cserél; olvasók (planner/validator/bench) másolják a pointert. A generáció a
+  saját config snapshotját hordozza, így a query-k a build-kori budgettel
+  egyeznek.
+- **§25 topológia-függetlenség**: a mező world-space; split/merge nem írja.
+  Élő teszt: üres zóna force-splitja után a migration channel végig 0 maradt,
+  a mező nem resetelődött; lakott zóna splitja viszont migration workként
+  jelent meg (belső transfer).
+
+### 6.3 Mért eredmények (RelWithDebInfo, 1 km teszt-térkép / 100 km sweep)
+
+**Felbontás sweep** (`worldbench --mode loadfield`, 4200 szintetikus sparse
+entry, 10 rebuild átlag):
+
+| cella | cellák | aktív | memória/generáció | rebuild átlag | dense/sparse kontraszt |
+|---|---|---|---|---|---|
+| 250 m | 160 000 | 216 | 13.60 MB | ~7.1–8.2 ms | 280× |
+| 500 m | 40 000 | 204 | 3.40 MB | ~1.5–1.6 ms | 1031× |
+| 1000 m | 10 000 | 199 | 0.85 MB | ~0.43–0.45 ms | 2000× |
+
+**Döntés: production default 500 m.** Indoklás: a 100 km-es világon 3.4 MB
+generációnként, ~1.5 ms/1 Hz aggregáció (egy mag ~0.15%-a), miközben egy
+hotspot 500 m-re lokalizálható. A 250 m (13.6 MB, ~7 ms) akkor indokolt, ha a
+későbbi boundary-tervezés finomabb felbontást igényel; az 1000 m túl durva
+(2 km kontraszt elveszik a szomszédokban). A felbontás **config**, és nincs
+automatikusan a zone mérethez / AOI sugárhoz / activity cellához kötve. Az 1 km
+teszt-térképen a default 500 m csak 4 cellát adna, ezért a bench 100 m-t
+használ (a hotspot-teszt így értelmes).
+
+**Smoothing válasz** (pure selftest): 1 s lépcsőre fast 5 s alatt 96%-on, slow
+ugyanekkor 46%; egyetlen 1 s spike fast csúcsa 49%, 5 csendes másodperc után
+26% / slow 10%; 30 csendes másodperc után fast 2.3%, slow 14%, és fast < slow
+(a gyors idősík enged el előbb). Tehát rövid spike nem tartósít, a hotspot
+lassan hűl, nem ragad be.
+
+**Instrumentation overhead**: A/B `--mode spread` 100 player / 1000 mob,
+20 s: ON avg 2.766 ms / p99 6.710 ms vs OFF 2.928 ms / 8.376 ms — a különbség
+a futásonkénti szórás alatt van. Az instrumentation entitásonként/eventenként
+1 index-számítás + integer increment (nincs lock, allokáció, string, clock
+read, globális lookup a hot pathon).
+
+### 6.4 Tesztelés
+
+- `worldbench --loadfield-selftest` (pure, world nélkül): mapping (negatív
+  origin, non-square, clamp), zone bin sparse publish + reset + margin,
+  normalizáció (budget, cadence-függetlenség, clamp, NaN/Inf), aszimmetrikus
+  EMA (rise/fall/spike/decay), L1 pontos blokk-összeg + grid audit, config
+  validáció (minden invalid mező javítva, warning).
+- `worldbench --mode loadfield` (élő, saját sim lifecycle): hotspot
+  lokalizáció + második hotspot + hideg cella 0, channel breakdown
+  (sim/repl/AOI), normalizált/composite bounds, fast-leads-slow, combat heat
+  + decay, §25 topológia-függetlenség (üres split nem termel load-ot),
+  split-transfer mint migration work, hotspot decay, generáció-audit
+  (`ValidateLoadFieldGrid` a supervisor quiescent ablakában), majd a
+  felbontás sweep.
+- Regresszió: `--field-selftest` 4/4, `--mode lod` 18/0, `--mode activity`
+  22/0, `--mode splitmerge` 20/0 továbbra is zöld; a viselkedésérzékeny
+  értékek (LOD tier-pillanatképek, cross-counters) változatlanok.
+
+### 6.5 Ami szándékosan kimaradt (következő chunkok)
+
+- `PartitionLoadScore`, p95/p99 a control plane-en, döntési log, why-not
+  diagnostics, `MinExpectedImprovement`, `TopologyComplexityPenalty` (D).
+- BoundaryCost field, Partition Objective, hotspot detection (flood fill),
+  hotspot-aware split, multi-candidate split, merge sustained-low timer (E).
+- `worldbench --mode loadfield` validator-bővítés a meglévő 7 módra (F) —
+  a regresszió már fut, a `LoadFieldValidator` integráció a D chunkkal jön.
+- A replication delta protokoll és a per-entity cost model továbbra is seam;
+  a mező ezek nélkül is korrekt és konzervatív (nullát mér, nem hamisít).

@@ -33,6 +33,17 @@ void MigrationSystem::UpdateMarker(Zone& zone,
         }
     }
 
+    // Load field attribution: count the boundary-crossing TRANSITION once
+    // (the marker persists while the entity stays outside, so only a change
+    // of target counts). This is the earliest spatial signal that a boundary
+    // generates migration work; the committed transfer is counted separately
+    // by the coordinator.
+    const std::uint32_t previous_target =
+        entity.has<MigrateTo>() ? entity.get<MigrateTo>().target_zone : 0u;
+    if (target_zone_id != 0 && target_zone_id != previous_target) {
+        zone.LoadBins().NoteMigration(position.x, position.y);
+    }
+
     entity.set<MigrateTo>({target_zone_id});
 
     // Event-driven migration: only border crossings touch the queue, and the

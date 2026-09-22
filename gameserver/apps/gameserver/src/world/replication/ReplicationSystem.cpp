@@ -1,5 +1,8 @@
 #include "ReplicationSystem.h"
 
+#include <algorithm>
+#include <cstdint>
+
 #include "../spatial/AoiSystem.h"
 #include "../visibility/VisibilitySystem.h"
 #include "../zone/Zone.h"
@@ -55,14 +58,29 @@ std::size_t ReplicationSystem::BroadcastTransforms(Zone& zone, const SendFn& sen
 
         // Visibility reconcile with a shared per-tick spawn cache: encoding
         // a spawn happens once per newly-visible net per tick even when many
-        // viewers discover it simultaneously.
+        // viewers discover it simultaneously. Spawn/despawn bytes are
+        // measured for the load field's ReplicationPressure channel.
+        std::uint64_t spawn_bytes = 0;
         auto visible_snapshots = VisibilitySystem::ReconcileViewer(
-            zone, viewer_net_id, candidates, send, spawn_cache, snapshot_cache);
+            zone, viewer_net_id, candidates, send, spawn_cache, snapshot_cache, &spawn_bytes);
 
         const auto viewer_snapshot = BuildPlayerSnapshot(zone, viewer_entity);
-        send(binding.session,
-             EncodeTransformFrame(viewer_snapshot, visible_snapshots, zone.TickIndex()));
-        transform_records_sent += 1 + visible_snapshots.size();
+        auto frame = EncodeTransformFrame(viewer_snapshot, visible_snapshots, zone.TickIndex());
+        const std::uint64_t frame_bytes = frame.size();
+        const std::uint64_t records = 1 + visible_snapshots.size();
+        send(binding.session, std::move(frame));
+        transform_records_sent += static_cast<std::size_t>(records);
+
+        // Load field attribution: replication is measured in BYTES (the only
+        // measured channel) and attributed to the viewer position -- fanout
+        // is included because every recipient's frame is encoded separately.
+        if (auto* load = zone.LoadBins().CellFor(viewer_position.x, viewer_position.y)) {
+            const std::uint64_t total_bytes = spawn_bytes + frame_bytes;
+            load->repl_bytes += static_cast<std::uint32_t>(
+                total_bytes > 0xFFFFFFFFu ? 0xFFFFFFFFu : total_bytes);
+            load->repl_records += static_cast<std::uint32_t>(
+                records > 0xFFFFFFFFu ? 0xFFFFFFFFu : records);
+        }
     }
     return transform_records_sent;
 }

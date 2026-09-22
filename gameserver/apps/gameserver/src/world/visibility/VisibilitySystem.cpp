@@ -23,7 +23,8 @@ std::vector<BorderEntitySnapshot> VisibilitySystem::ReconcileViewer(
     const std::vector<std::uint32_t>& candidates,
     const SendFn& send,
     SpawnCache& spawn_cache,
-    SnapshotCache& snapshot_cache)
+    SnapshotCache& snapshot_cache,
+    std::uint64_t* out_bytes)
 {
     AssertZoneOwner(zone, "zone visibility reconcile");
 
@@ -59,9 +60,15 @@ std::vector<BorderEntitySnapshot> VisibilitySystem::ReconcileViewer(
         if (!viewer->visible_net_ids.contains(visible_entity.net_id)) {
             const auto encoded = spawn_cache.find(visible_entity.net_id);
             if (encoded != spawn_cache.end()) {
+                if (out_bytes != nullptr) {
+                    *out_bytes += encoded->second.size();
+                }
                 send(viewer->session, encoded->second);
             } else {
                 auto payload = MakeSpawn(visible_entity);
+                if (out_bytes != nullptr) {
+                    *out_bytes += payload.size();
+                }
                 send(viewer->session, payload);
                 spawn_cache.emplace(visible_entity.net_id, std::move(payload));
             }
@@ -70,7 +77,11 @@ std::vector<BorderEntitySnapshot> VisibilitySystem::ReconcileViewer(
 
     for (const std::uint32_t old_net_id : viewer->visible_net_ids) {
         if (!new_visible.contains(old_net_id)) {
-            send(viewer->session, MakeDespawn(old_net_id));
+            const auto payload = MakeDespawn(old_net_id);
+            if (out_bytes != nullptr) {
+                *out_bytes += payload.size();
+            }
+            send(viewer->session, payload);
         }
     }
     // The member set takes over the scratch buckets (no rehash); the scratch

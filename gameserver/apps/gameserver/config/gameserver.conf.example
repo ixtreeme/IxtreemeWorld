@@ -42,3 +42,41 @@ simulation_low_hz=1.0
 simulation_demote_full_sec=5.0
 simulation_demote_reduced_sec=30.0
 simulation_demote_low_sec=60.0
+
+# Continuous Multi-Channel Load Field (Adaptive Simulation Fabric, phase 1).
+# World-space map of actual server work in five independent channels:
+# SimulationCost (executed AI/movement updates), ReplicationPressure
+# (measured outbound bytes), AOIWork (queries + pre-cap candidates),
+# CombatHeat (attack/damage events) and MigrationPressure (transfers +
+# boundary crossings). Derived telemetry only: no gameplay effect, no
+# partition decision reads it yet. All keys optional; invalid values warn +
+# fall back per field, effective set logged at startup. The world bounds are
+# runtime-owned (terrain extent), never config.
+load_field_enabled=true
+# L0 cell size in meters. 500m over the 100km world = 200x200 = 40k cells
+# (~3.2MB per generation); 250m = 160k cells. Benchmarked, not coupled to
+# the activity field or AOI radius.
+load_field_cell_size_m=500.0
+load_field_aggregation_hz=1.0
+# Coarse L1 seam: one L1 cell = l1_ratio x l1_ratio L0 cells.
+load_field_l1_enabled=true
+load_field_l1_ratio=4
+# Normalization reference budgets: raw units per second per cell == 1.0.
+load_field_simulation_budget=5000
+load_field_replication_budget=1000000
+load_field_aoi_budget=20000
+load_field_combat_budget=100
+load_field_migration_budget=50
+# Composite load weights (raw channel breakdown always stays available).
+load_field_weight_simulation=1.0
+load_field_weight_replication=1.0
+load_field_weight_aoi=1.0
+load_field_weight_combat=1.0
+load_field_weight_migration=1.0
+# Asymmetric two-timescale EMA time constants (seconds): fast rise / slow
+# fall on each timescale. A 1-window spike cannot thrash; a dead hotspot
+# cools down instead of staying hot forever.
+load_field_fast_rise_tau_s=1.5
+load_field_fast_fall_tau_s=8.0
+load_field_slow_rise_tau_s=8.0
+load_field_slow_fall_tau_s=25.0

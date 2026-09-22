@@ -100,6 +100,11 @@ void MovementSystem::Step(Zone& zone, float dt, ZoneTickContext& ctx)
         const float dy = after.y - before.y;
         if (dx * dx + dy * dy > 0.0001f) {
             ++moved_entities;
+            // Load field attribution: a dirty transform is replication
+            // pressure in waiting; binned at the destination position.
+            if (auto* load = zone.LoadBins().CellFor(after.x, after.y)) {
+                ++load->repl_dirty;
+            }
         }
     };
 
@@ -139,6 +144,10 @@ void MovementSystem::Step(Zone& zone, float dt, ZoneTickContext& ctx)
         TryApplyWarp(zone, ctx, position, session_id);
         position.z = ctx.terrain.SampleGroundHeight(position.x, position.y);
         note_moved(before_move, position);
+        // Load field attribution: one movement integration happened HERE.
+        if (auto* load = zone.LoadBins().CellFor(position.x, position.y)) {
+            ++load->sim_work;
+        }
         entity.set<Position>(position);
         entity.set<Heading>(heading);
         entity.set<Velocity>(velocity);
@@ -237,6 +246,10 @@ void MovementSystem::Step(Zone& zone, float dt, ZoneTickContext& ctx)
             auto lod = entity.get<SimulationLod>();
             lod.next_tick = now_tick + LodPeriodTicks(lod.tier, *ctx.lod);
             entity.set<SimulationLod>(lod);
+        }
+        // Load field attribution: one movement integration happened HERE.
+        if (auto* load = zone.LoadBins().CellFor(position.x, position.y)) {
+            ++load->sim_work;
         }
         ++integrated;
         zone.Grid().Move(net.value, old_cell, position);

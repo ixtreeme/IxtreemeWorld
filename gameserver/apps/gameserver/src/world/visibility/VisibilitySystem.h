@@ -31,12 +31,16 @@ public:
     // visible to many viewers, but its snapshot is built once per tick.
     using SnapshotCache = std::unordered_map<std::uint32_t, BorderEntitySnapshot>;
 
+    // `out_bytes` (optional) accumulates the encoded spawn/despawn payload
+    // bytes handed to send() for this viewer: the measured ReplicationPressure
+    // input. Null skips the accounting at zero cost.
     static std::vector<BorderEntitySnapshot> ReconcileViewer(Zone& zone,
                                                              std::uint32_t viewer_net_id,
                                                              const std::vector<std::uint32_t>& candidates,
                                                              const SendFn& send,
                                                              SpawnCache& spawn_cache,
-                                                             SnapshotCache& snapshot_cache);
+                                                             SnapshotCache& snapshot_cache,
+                                                             std::uint64_t* out_bytes = nullptr);
 };
 
 } // namespace gs::game

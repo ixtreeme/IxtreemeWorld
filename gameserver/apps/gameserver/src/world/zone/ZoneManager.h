@@ -8,6 +8,7 @@
 
 #include "Zone.h"
 #include "ZoneGraph.h"
+#include "../activity/LoadFieldTypes.h"
 #include "../partition/RegionDefinition.h"
 #include "../partition/ZonePartition.h"
 
@@ -115,6 +116,12 @@ public:
     // before any split runs.
     void ApplyRegionLimits(int max_partition_depth, float min_zone_size_m);
 
+    // Binds the world-space load field mapping to every zone (existing and
+    // future): each zone sizes its local load-bin rectangle to its own bounds
+    // over this grid. Call before Start or between supervisor passes; never
+    // while a zone tick is in flight.
+    void ApplyLoadFieldMapping(const LoadFieldMapping& mapping);
+
     const std::vector<std::size_t>& NeighborsOf(std::size_t zone_index) const;
     bool AnyTickInProgress() const;
 
@@ -135,6 +142,7 @@ private:
     std::vector<std::unique_ptr<ZonePartition>> partition_roots_;
     std::vector<RegionDefinition> regions_;
     ZoneId next_zone_id_ = 1;
+    LoadFieldMapping load_field_mapping_{};
 };
 
 } // namespace gs::game

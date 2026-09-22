@@ -24,6 +24,8 @@ set(GAMESERVER_WORLD_SOURCES
     src/world/systems/CooldownSystem.cpp
     src/world/systems/LodSystem.cpp
     src/world/activity/SpatialActivityField.cpp
+    src/world/activity/ContinuousLoadField.cpp
+    src/world/activity/LoadFieldPublisher.cpp
     src/world/systems/MovementSystem.cpp
     src/world/spatial/AoiSystem.cpp
     src/world/spatial/SpatialGrid.cpp

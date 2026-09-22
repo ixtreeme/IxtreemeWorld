@@ -29,6 +29,7 @@
 #include <cstdint>
 #include <cstdio>
 #include <iostream>
+#include <limits>
 #include <numeric>
 #include <random>
 #include <set>
@@ -43,6 +44,8 @@
 #include "db/CharacterRepository.h"
 #include "network/Session.h"
 
+#include "../world/activity/ContinuousLoadField.h"
+#include "../world/activity/LoadFieldPublisher.h"
 #include "../world/migration/EntityTransfer.h"
 #include "../world/partition/ZonePartition.h"
 #include "../world/WorldRuntime.h"
@@ -64,6 +67,9 @@ struct BenchConfig {
     // Pure ActivityGrid unit checks (no world, no threads): origin-aware
     // indexing and the Fast/Exact query split. Runs standalone and exits.
     bool field_selftest = false;
+    // Pure ContinuousLoadField unit checks (no world, no threads): mapping,
+    // zone bins, normalization, smoothing, L1, config validation.
+    bool load_field_selftest = false;
     std::uint32_t seed = 12345;
     // splitmerge scenario: deterministic transfer-failure injection counts
     // (0 = commit path; >0 = abort path expectations). fail_after lets that
@@ -73,6 +79,9 @@ struct BenchConfig {
     int fail_after = 0;
     // Simulation LOD master switch for A/B runs (default on).
     bool lod_off = false;
+    // Continuous load field master switch for instrumentation-overhead A/B
+    // runs (default on; --loadfield-off restores the pre-instrumentation path).
+    bool load_field_off = false;
     // Optional partition floor override in meters (0 = production default).
     // Lets load-driven scenarios split small test maps; still passes through
     // ValidatePartitionConfig (AOI floor clamp applies).
@@ -94,12 +103,12 @@ bool ParseArgs(int argc, char** argv, BenchConfig& config)
         std::string value;
         if (arg == "--help" || arg == "-h") {
             std::cout << "worldbench [--players N] [--mobs M] [--seconds S]\n"
-                         "             [--mode spread|hotspot|border|dense|splitmerge|lod|activity]\n"
+                         "             [--mode spread|hotspot|border|dense|splitmerge|lod|activity|loadfield]\n"
                          "             [--validate-every K] [--despawn-storm R] [--seed S]\n"
                          "             [--logical-processes K] [--routing-selftest]\n"
-                         "             [--field-selftest]\n"
+                         "             [--field-selftest] [--loadfield-selftest]\n"
                          "             [--fail-snapshot N] [--fail-apply N] [--fail-after N]\n"
-                         "             [--partition-min-size M] [--lod-off]\n";
+                         "             [--partition-min-size M] [--lod-off] [--loadfield-off]\n";
             return false;
         } else if (arg == "--players") {
             if (!need_value("players", value)) {
@@ -145,6 +154,8 @@ bool ParseArgs(int argc, char** argv, BenchConfig& config)
             config.routing_selftest = true;
         } else if (arg == "--field-selftest") {
             config.field_selftest = true;
+        } else if (arg == "--loadfield-selftest") {
+            config.load_field_selftest = true;
         } else if (arg == "--fail-snapshot") {
             if (!need_value("fail-snapshot", value)) {
                 return false;
@@ -167,6 +178,8 @@ bool ParseArgs(int argc, char** argv, BenchConfig& config)
             config.partition_min_size = std::stoi(value);
         } else if (arg == "--lod-off") {
             config.lod_off = true;
+        } else if (arg == "--loadfield-off") {
+            config.load_field_off = true;
         } else {
             std::cerr << "unknown arg: " << arg << "\n";
             return false;
@@ -174,7 +187,7 @@ bool ParseArgs(int argc, char** argv, BenchConfig& config)
     }
     if (config.mode != "spread" && config.mode != "hotspot" && config.mode != "border" &&
         config.mode != "dense" && config.mode != "splitmerge" && config.mode != "lod" &&
-        config.mode != "activity") {
+        config.mode != "activity" && config.mode != "loadfield") {
         std::cerr << "bad mode: " << config.mode << "\n";
         return false;
     }
@@ -364,6 +377,193 @@ int RunFieldSelftest()
     }
 
     std::printf("FIELD-SELFTEST-DONE failures=%d\n", failures);
+    return failures;
+}
+
+// --- pure ContinuousLoadField checks (no world, no threads, no timing) ------
+// They pin the load field's contracts: origin-aware mapping, zone-bin sparse
+// publish + reset, normalization (budgets, cadence independence, clamping,
+// NaN/Inf), asymmetric EMA rise/fall/spike/decay, exact L1 block sums, config
+// validation and composite weighting.
+int RunLoadFieldSelftest()
+{
+    using namespace gs::game;
+    int failures = 0;
+
+    // (1) Mapping: negative origin, non-square extents, out-of-bounds clamp.
+    {
+        const auto square =
+            LoadFieldMapping::FromBounds({-50000.0f, -50000.0f, 50000.0f, 50000.0f}, 500.0f);
+        const bool dims = square.dim_x == 200 && square.dim_y == 200;
+        const bool idx = square.CellX(-50000.0f) == 0 && square.CellX(-40000.0f) == 20 &&
+                         square.CellY(-40000.0f) == 20 && square.CellX(0.0f) == 100 &&
+                         square.CellX(40000.0f) == 180 && square.CellX(60000.0f) == 199;
+        const auto narrow = LoadFieldMapping::FromBounds({0.0f, 0.0f, 4000.0f, 1000.0f}, 500.0f);
+        const bool non_square = narrow.dim_x == 8 && narrow.dim_y == 2;
+        SelftestReport("loadfield-mapping", dims && idx && non_square, false, failures);
+    }
+
+    // (2) Zone bins: local rectangle, one index per touched cell, sparse
+    // publish, post-publish reset, boundary margin, far-miss.
+    {
+        const auto mapping = LoadFieldMapping::FromBounds({0.0f, 0.0f, 1000.0f, 1000.0f}, 100.0f);
+        ZoneLoadBins bins;
+        bins.Configure(mapping, mx::map::Rect{0.0f, 0.0f, 500.0f, 500.0f});
+        bool ok = bins.Enabled();
+        auto* cell = bins.CellFor(250.0f, 250.0f);
+        auto* same = bins.CellFor(260.0f, 260.0f);
+        if (cell == nullptr || same == nullptr || cell != same) {
+            ok = false;
+        } else {
+            cell->sim_work = 3;
+            cell->repl_bytes = 100;
+            same->sim_work += 1; // same cell: deduped in the touched list
+        }
+        std::vector<LoadBinEntry> out;
+        bins.MovePendingTo(out);
+        const bool sparse = out.size() == 1 && out[0].gx == 2 && out[0].gy == 2 &&
+                            out[0].counters.sim_work == 4 && out[0].counters.repl_bytes == 100;
+        std::vector<LoadBinEntry> again;
+        bins.MovePendingTo(again);
+        const bool reset = again.empty();
+        const bool margin_hit = bins.CellFor(-10.0f, 250.0f) != nullptr;
+        const bool far_miss = bins.CellFor(900.0f, 900.0f) == nullptr;
+        SelftestReport("loadfield-zone-bins", ok && sparse && reset && margin_hit && far_miss,
+                       false, failures);
+    }
+
+    // (3) Normalization: reference budgets, cadence independence, clamping,
+    // NaN/Inf safety, composite weighting with the raw breakdown intact.
+    {
+        const bool basic = NormalizeLoadChannel(50.0f, 100.0f, 1.0f) == 0.5f &&
+                           NormalizeLoadChannel(25.0f, 100.0f, 0.5f) == 0.5f &&
+                           NormalizeLoadChannel(200.0f, 100.0f, 1.0f) == 1.0f &&
+                           NormalizeLoadChannel(-5.0f, 100.0f, 1.0f) == 0.0f &&
+                           NormalizeLoadChannel(std::numeric_limits<float>::infinity(), 100.0f, 1.0f) ==
+                               0.0f &&
+                           NormalizeLoadChannel(std::numeric_limits<float>::quiet_NaN(), 100.0f, 1.0f) ==
+                               0.0f;
+        LoadFieldConfig cfg;
+        cfg.simulation_budget = 100.0f;
+        cfg.weight_simulation = 0.5f;
+        LoadChannels raw;
+        raw[LoadChannel::Simulation] = 100.0f; // 100/s -> 1.0
+        const NormalizedLoad norm = NormalizeLoad(raw, cfg, 1.0f);
+        const bool composite =
+            norm[LoadChannel::Simulation] == 1.0f && norm.composite == 0.5f;
+        SelftestReport("loadfield-normalization", basic && composite, false, failures);
+    }
+
+    // (4) Asymmetric EMA: fast rise leads slow, a one-window spike cannot
+    // sustain, sustained load decays after the work stops, predicted == slow.
+    {
+        LoadFieldConfig cfg; // defaults: fast 1.5/8, slow 8/25
+        LoadCell cell;
+        LoadChannels raw;
+        raw[LoadChannel::Simulation] = 1.0f;
+        for (int i = 0; i < 5; ++i) {
+            AdvanceLoadCell(cell, raw, cfg, 1.0f);
+        }
+        const float fast_rise = cell.fast[LoadChannel::Simulation];
+        const float slow_rise = cell.slow[LoadChannel::Simulation];
+        const bool fast_leads = fast_rise > 0.9f && slow_rise < 0.5f;
+
+        LoadCell spike;
+        AdvanceLoadCell(spike, raw, cfg, 1.0f);
+        const float spike_peak = spike.fast[LoadChannel::Simulation];
+        LoadChannels zero;
+        for (int i = 0; i < 5; ++i) {
+            AdvanceLoadCell(spike, zero, cfg, 1.0f);
+        }
+        const bool spike_rejected = spike.fast[LoadChannel::Simulation] < 0.35f &&
+                                    spike.slow[LoadChannel::Simulation] < 0.15f &&
+                                    spike_peak > 0.4f;
+
+        LoadCell decayed;
+        for (int i = 0; i < 5; ++i) {
+            AdvanceLoadCell(decayed, raw, cfg, 1.0f);
+        }
+        for (int i = 0; i < 30; ++i) {
+            AdvanceLoadCell(decayed, zero, cfg, 1.0f);
+        }
+        // After 30 quiet seconds the fast EMA is essentially cold and the
+        // slow EMA is well on its way (25s fall tau); fast < slow proves the
+        // fast timescale releases the hotspot first.
+        const bool decays = decayed.fast[LoadChannel::Simulation] < 0.05f &&
+                            decayed.slow[LoadChannel::Simulation] < 0.2f &&
+                            decayed.fast[LoadChannel::Simulation] <
+                                decayed.slow[LoadChannel::Simulation] &&
+                            decayed.predicted[LoadChannel::Simulation] ==
+                                decayed.slow[LoadChannel::Simulation];
+        std::printf("LOADFIELD smoothing: fast5=%.3f slow5=%.3f spike=[%.3f -> %.3f/%.3f] "
+                    "after30=[%.3f/%.3f]\n",
+                    fast_rise,
+                    slow_rise,
+                    spike_peak,
+                    spike.fast[LoadChannel::Simulation],
+                    spike.slow[LoadChannel::Simulation],
+                    decayed.fast[LoadChannel::Simulation],
+                    decayed.slow[LoadChannel::Simulation]);
+        SelftestReport("loadfield-smoothing", fast_leads && spike_rejected && decays, false,
+                       failures);
+    }
+
+    // (5) L1 = exact block sum of L0; the grid audit accepts a well-formed
+    // generation.
+    {
+        LoadGrid grid;
+        grid.enabled = true;
+        grid.cell_size_m = 100.0f;
+        grid.bounds = {0.0f, 0.0f, 400.0f, 400.0f};
+        grid.dim_x = 4;
+        grid.dim_y = 4;
+        grid.config.l1_enabled = true;
+        grid.config.l1_ratio = 2;
+        grid.window_seconds = 1.0f;
+        grid.cells.assign(16, LoadCell{});
+        grid.cells[0].fast[LoadChannel::AOI] = 1.0f;
+        grid.cells[1].fast[LoadChannel::AOI] = 2.0f;
+        grid.cells[4].fast[LoadChannel::AOI] = 3.0f;
+        grid.cells[15].slow[LoadChannel::Combat] = 7.0f;
+        grid.cells[15].predicted[LoadChannel::Combat] = 7.0f; // seam invariant
+        RebuildL1(grid);
+        grid.active_cells = 4; // the four cells carrying values above
+        const bool dims = grid.l1_dim_x == 2 && grid.l1_dim_y == 2 && grid.l1_cells.size() == 4;
+        const bool sums = grid.l1_cells[0].fast[LoadChannel::AOI] == 6.0f &&
+                          grid.l1_cells[3].slow[LoadChannel::Combat] == 7.0f &&
+                          grid.l1_cells[3].predicted[LoadChannel::Combat] == 7.0f;
+        std::string error;
+        const bool audit = ValidateLoadFieldGrid(grid, error);
+        if (!audit) {
+            std::printf("LOADFIELD audit error: %s\n", error.c_str());
+        }
+        SelftestReport("loadfield-l1-and-audit", dims && sums && audit, false, failures);
+    }
+
+    // (6) Config validation: every invalid field repaired, never UB.
+    {
+        LoadFieldConfig bad;
+        bad.cell_size_m = -1.0f;
+        bad.aggregation_hz = std::numeric_limits<float>::quiet_NaN();
+        bad.l1_ratio = 99;
+        bad.simulation_budget = 0.0f;
+        bad.weight_combat = -2.0f;
+        bad.slow_fall_tau_s = 0.0f;
+        bad.bounds = WorldBounds{1.0f, 1.0f, 0.0f, 0.0f};
+        const auto validated = ValidateLoadFieldConfig(bad);
+        const bool repaired =
+            !validated.warnings.empty() &&
+            validated.effective.cell_size_m == kLoadCellSizeMeters &&
+            validated.effective.aggregation_hz == 1.0f &&
+            validated.effective.l1_ratio == 4 &&
+            validated.effective.simulation_budget == 5000.0f &&
+            validated.effective.weight_combat == 1.0f &&
+            validated.effective.slow_fall_tau_s == 1.0f && validated.effective.bounds.IsValid();
+        std::printf("LOADFIELD config warnings=%zu\n", validated.warnings.size());
+        SelftestReport("loadfield-config-validation", repaired, false, failures);
+    }
+
+    std::printf("LOADFIELD-SELFTEST-DONE failures=%d\n", failures);
     return failures;
 }
 
@@ -1526,6 +1726,442 @@ int RunActivityScenario(boost::asio::io_context& io, const BenchConfig& config)
     return failures;
 }
 
+// Continuous load field live scenario (Adaptive Simulation Fabric phase 1).
+// Own sim lifecycle, 1km test map, 100m L0 cells (10x10) so hotspot
+// localization is observable. Verifies that work lands where it happens, the
+// channel breakdown stays separated, normalization/composite are bounded, the
+// field survives a topology change without gaining load (§25), smoothing
+// ramps fast and decays, and the generation audit passes. Ends with a pure
+// resolution sweep (250/500/1000m over the 100km target world) measuring
+// memory, active cells and aggregation cost. Returns failure count.
+int RunLoadFieldScenario(boost::asio::io_context& io, const BenchConfig& config)
+{
+    using gs::game::LoadChannel;
+    using gs::game::LoadTimescale;
+
+    int failures = 0;
+    int validations = 0;
+    auto check = [&](const char* name, bool pass) {
+        if (pass) {
+            std::printf("LOADFIELD %s: PASS\n", name);
+        } else {
+            std::printf("LOADFIELD %s: FAIL\n", name);
+            ++failures;
+        }
+    };
+
+    gs::game::WorldRuntime sim(io);
+
+    auto validate_now = [&](const char* what) -> bool {
+        sim.RequestLoadFieldValidation();
+        for (int i = 0; i < 100; ++i) {
+            std::string result;
+            if (sim.TryTakeLoadFieldValidationResult(result)) {
+                ++validations;
+                if (result != "OK") {
+                    std::printf("LOADFIELD validation(%s): FAIL: %s\n", what, result.c_str());
+                    return false;
+                }
+                return true;
+            }
+            std::this_thread::sleep_for(std::chrono::milliseconds(50));
+        }
+        std::printf("LOADFIELD validation(%s): TIMEOUT\n", what);
+        return false;
+    };
+
+    // Small LOD radii so far mobs go Dormant (zero work) on the 1km map.
+    gs::game::LodConfig test_lod;
+    test_lod.full_radius_m = 15.0f;
+    test_lod.reduced_radius_m = 50.0f;
+    test_lod.low_radius_m = 150.0f;
+    test_lod.demote_full_sec = 1.0f;
+    test_lod.demote_reduced_sec = 1.0f;
+    test_lod.demote_low_sec = 1.0f;
+    sim.ConfigureSimulationLod(test_lod);
+
+    // Partition floor allows the 500m test zones to split (validated floor is
+    // 2x AOI radius; 250 passes).
+    gs::game::PartitionConfig partition;
+    partition.min_zone_size_m = 250.0f;
+    sim.ConfigurePartition(partition);
+
+    // Load field: 100m cells, 4Hz aggregation for observable smoothing,
+    // reference budgets scaled to the tiny test population.
+    gs::game::LoadFieldConfig lf;
+    lf.cell_size_m = 100.0f;
+    lf.aggregation_hz = 4.0f;
+    lf.l1_enabled = true;
+    lf.l1_ratio = 2;
+    lf.simulation_budget = 200.0f;
+    lf.replication_budget = 200000.0f;
+    lf.aoi_budget = 5000.0f;
+    lf.combat_budget = 20.0f;
+    lf.migration_budget = 10.0f;
+    sim.ConfigureLoadField(lf);
+    const bool config_ok = sim.EffectiveLoadFieldConfig().cell_size_m == 100.0f &&
+                           sim.EffectiveLoadFieldConfig().aggregation_hz == 4.0f &&
+                           sim.EffectiveLoadFieldConfig().enabled;
+    check("config-authority", config_ok);
+    if (!config_ok) {
+        return failures + 1;
+    }
+    sim.Start();
+
+    const auto deadline =
+        std::chrono::steady_clock::now() + std::chrono::seconds(std::max(120, config.seconds));
+    auto expired = [&] { return std::chrono::steady_clock::now() >= deadline; };
+
+    // ---- Phase 1: two hotspots. Player + 5 static mobs at (100,100); a
+    // second player at (850,850). Everything stationary: positions are
+    // bit-exact, so the spatial asserts are deterministic.
+    constexpr gs::common::SessionId kPlayer = 750;
+    constexpr gs::common::SessionId kFarPlayer = 751;
+    {
+        boost::asio::ip::tcp::socket socket(io);
+        auto session = std::make_shared<gs::network::Session>(std::move(socket), kPlayer);
+        sim.PostSpawn(session, MakeBenchCharacter(950), gs::game::DebugSpawnOverride{100.0f, 100.0f});
+    }
+    {
+        boost::asio::ip::tcp::socket socket(io);
+        auto session = std::make_shared<gs::network::Session>(std::move(socket), kFarPlayer);
+        sim.PostSpawn(session, MakeBenchCharacter(951),
+                      gs::game::DebugSpawnOverride{850.0f, 850.0f});
+    }
+    for (int k = 0; k < 5; ++k) {
+        gs::game::MobSpawnPoint point;
+        point.mob_type_id = 2;
+        point.x = 100.0f + static_cast<float>(k) * 2.0f;
+        point.y = 100.0f;
+        point.count = 1;
+        point.radius = 0.0f; // static mob: exact position forever
+        sim.AddMobSpawnPoint(point);
+    }
+    for (int k = 0; k < 5; ++k) {
+        sim.RequestMobSpawn(static_cast<std::size_t>(4 + k));
+    }
+    const bool populated = WaitFor(std::chrono::seconds(20), [&] {
+        return sim.Owners().size() == 2 && sim.CollectProcessLoad().mobs >= 5;
+    });
+    check("populate", populated && !expired());
+    if (!populated) {
+        sim.Stop();
+        return failures + 1;
+    }
+
+    // ---- Phase 2: work lands where it happens. Sample across the ramp so
+    // the fast-leads-slow ordering is observable.
+    bool saw_fast_above_slow = false;
+    bool hotspot_ok = false;
+    bool second_hotspot_ok = false;
+    bool cold_cell_ok = false;
+    bool channels_ok = false;
+    bool bounds_ok = false;
+    gs::game::LoadTotals peak_totals;
+    float peak_sim_fast = 0.0f;
+    float peak_combat_fast = 0.0f;
+    // Tracks the largest per-window totals seen across the whole scenario, so
+    // the report shows the combat/migration windows too (they happen after
+    // the ramp phase). One call per poll; the field rebuilds at 4Hz here.
+    auto track_peak_totals = [&]() {
+        const auto metrics = sim.LoadFieldMetrics();
+        peak_totals.sim_work = std::max(peak_totals.sim_work, metrics.last_totals.sim_work);
+        peak_totals.repl_bytes = std::max(peak_totals.repl_bytes, metrics.last_totals.repl_bytes);
+        peak_totals.repl_records =
+            std::max(peak_totals.repl_records, metrics.last_totals.repl_records);
+        peak_totals.repl_dirty = std::max(peak_totals.repl_dirty, metrics.last_totals.repl_dirty);
+        peak_totals.aoi_queries =
+            std::max(peak_totals.aoi_queries, metrics.last_totals.aoi_queries);
+        peak_totals.aoi_candidates =
+            std::max(peak_totals.aoi_candidates, metrics.last_totals.aoi_candidates);
+        peak_totals.combat_events =
+            std::max(peak_totals.combat_events, metrics.last_totals.combat_events);
+        peak_totals.migration_events =
+            std::max(peak_totals.migration_events, metrics.last_totals.migration_events);
+    };
+    const auto sample_until = std::chrono::steady_clock::now() + std::chrono::seconds(6);
+    while (std::chrono::steady_clock::now() < sample_until && !expired()) {
+        const auto grid = sim.LoadFieldSnapshot();
+        if (grid != nullptr && grid->enabled) {
+            const auto* hot = grid->CellAt(100.0f, 100.0f);
+            const auto* cold = grid->CellAt(500.0f, 500.0f);
+            const auto* far_cell = grid->CellAt(850.0f, 850.0f);
+            if (hot != nullptr && cold != nullptr && far_cell != nullptr) {
+                hotspot_ok = hot->current[LoadChannel::Simulation] > 0.0f &&
+                             hot->fast[LoadChannel::Simulation] > 0.0f;
+                second_hotspot_ok = far_cell->current[LoadChannel::Simulation] > 0.0f;
+                cold_cell_ok = cold->current.IsZero() && cold->fast.IsZero() &&
+                               cold->slow.IsZero();
+                channels_ok = hot->current[LoadChannel::Replication] > 0.0f &&
+                              hot->current[LoadChannel::AOI] > 0.0f;
+                const auto normalized =
+                    grid->NormalizedLoadAt(100.0f, 100.0f, LoadTimescale::Slow);
+                bounds_ok = true;
+                for (std::size_t c = 0; c < gs::game::kLoadChannelCount; ++c) {
+                    if (!(normalized.values[c] >= 0.0f) || normalized.values[c] > 1.0f) {
+                        bounds_ok = false;
+                    }
+                }
+                if (!(normalized.composite >= 0.0f) || normalized.composite > 1.0f) {
+                    bounds_ok = false;
+                }
+                if (hot->fast[LoadChannel::Simulation] >
+                    hot->slow[LoadChannel::Simulation]) {
+                    saw_fast_above_slow = true;
+                }
+                peak_sim_fast = std::max(peak_sim_fast, hot->fast[LoadChannel::Simulation]);
+            }
+        }
+        track_peak_totals();
+        std::this_thread::sleep_for(std::chrono::milliseconds(50));
+    }
+    check("hotspot-localized", hotspot_ok);
+    check("second-hotspot", second_hotspot_ok);
+    check("cold-cell-zero", cold_cell_ok);
+    check("channel-breakdown", channels_ok);
+    check("normalized-bounds", bounds_ok);
+    check("fast-leads-slow", saw_fast_above_slow);
+    check("validate-ramp", validate_now("ramp"));
+
+    // ---- Phase 3: combat heat appears at the hotspot and decays after the
+    // fight stops (a 5-minute-old fight must not stay hot).
+    const std::uint64_t attacks_before = sim.AttacksTotal();
+    const auto attack_until = std::chrono::steady_clock::now() + std::chrono::seconds(4);
+    while (std::chrono::steady_clock::now() < attack_until && !expired()) {
+        for (std::uint32_t net = 1000000; net < 1000010; ++net) {
+            sim.PostAttackTarget(kPlayer, net);
+        }
+        track_peak_totals();
+        std::this_thread::sleep_for(std::chrono::milliseconds(250));
+    }
+    const bool attacked = sim.AttacksTotal() > attacks_before;
+    bool combat_hot = false;
+    const auto combat_wait = std::chrono::steady_clock::now() + std::chrono::seconds(4);
+    while (std::chrono::steady_clock::now() < combat_wait && !combat_hot) {
+        const auto grid = sim.LoadFieldSnapshot();
+        if (grid != nullptr) {
+            const auto* hot = grid->CellAt(100.0f, 100.0f);
+            if (hot != nullptr && hot->fast[LoadChannel::Combat] > 0.0f) {
+                combat_hot = true;
+            }
+            if (hot != nullptr) {
+                peak_combat_fast = std::max(peak_combat_fast, hot->fast[LoadChannel::Combat]);
+            }
+        }
+        track_peak_totals();
+        std::this_thread::sleep_for(std::chrono::milliseconds(50));
+    }
+    std::printf("LOADFIELD combat: attacks=%llu peak_fast=%.3f\n",
+                (unsigned long long)(sim.AttacksTotal() - attacks_before),
+                peak_combat_fast);
+    check("combat-heat", attacked && combat_hot && !expired());
+
+    // ---- Phase 4: §25 topology independence. Force-split the EMPTY zone 2
+    // (250,750): no residents => no transfers => the field must gain no
+    // migration work and must not reset while the topology changes.
+    const std::size_t zone_count_before = sim.Zones().ZoneCount();
+    const std::size_t empty_zone_index = sim.Zones().FindIndexForPosition(250.0f, 750.0f);
+    const bool empty_zone_found = empty_zone_index < sim.Zones().ZoneCount();
+    check("empty-zone-found", empty_zone_found);
+    if (empty_zone_found) {
+        const gs::game::ZoneId empty_zone_id = sim.Zones().GetZone(empty_zone_index).Id();
+        sim.PostForceSplit(empty_zone_id);
+        const bool split_done = WaitFor(std::chrono::seconds(10), [&] {
+            return sim.Zones().ZoneCount() == zone_count_before + 4;
+        });
+        check("empty-split-committed", split_done && !expired());
+        bool no_migration_work = true;
+        bool hotspot_preserved = true;
+        const auto observe_until = std::chrono::steady_clock::now() + std::chrono::seconds(2);
+        while (std::chrono::steady_clock::now() < observe_until && !expired()) {
+            const auto grid = sim.LoadFieldSnapshot();
+            if (grid != nullptr) {
+                for (const auto& cell : grid->cells) {
+                    if (cell.current[LoadChannel::Migration] != 0.0f ||
+                        cell.fast[LoadChannel::Migration] != 0.0f) {
+                        no_migration_work = false;
+                    }
+                }
+                const auto* hot = grid->CellAt(100.0f, 100.0f);
+                if (hot == nullptr || hot->fast[LoadChannel::Simulation] <= 0.0f) {
+                    hotspot_preserved = false;
+                }
+            }
+            std::this_thread::sleep_for(std::chrono::milliseconds(50));
+        }
+        check("topology-change-no-load", no_migration_work);
+        check("field-survives-topology", hotspot_preserved);
+    }
+
+    // ---- Phase 5: split-internal transfers ARE migration work. Force-split
+    // the hotspot zone; its residents move to children and must be counted.
+    const std::size_t hotspot_zone_index = sim.Zones().FindIndexForPosition(100.0f, 100.0f);
+    const bool hotspot_zone_found = hotspot_zone_index < sim.Zones().ZoneCount();
+    check("hotspot-zone-found", hotspot_zone_found);
+    if (hotspot_zone_found) {
+        const gs::game::ZoneId hotspot_zone_id = sim.Zones().GetZone(hotspot_zone_index).Id();
+        sim.PostForceSplit(hotspot_zone_id);
+        bool migration_seen = false;
+        const auto migration_wait = std::chrono::steady_clock::now() + std::chrono::seconds(8);
+        while (std::chrono::steady_clock::now() < migration_wait && !migration_seen && !expired()) {
+            const auto metrics = sim.LoadFieldMetrics();
+            if (metrics.last_totals.migration_events > 0) {
+                migration_seen = true;
+            }
+            const auto grid = sim.LoadFieldSnapshot();
+            if (grid != nullptr) {
+                for (const auto& cell : grid->cells) {
+                    if (cell.fast[LoadChannel::Migration] > 0.0f) {
+                        migration_seen = true;
+                    }
+                }
+            }
+            track_peak_totals();
+            std::this_thread::sleep_for(std::chrono::milliseconds(50));
+        }
+        check("split-transfers-counted", migration_seen);
+    }
+    check("validate-after-splits", validate_now("splits"));
+
+    // ---- Phase 6: decay. Despawn both players (mobs go Dormant after the
+    // short graces), then the hotspot load must fall well below its peak.
+    sim.PostDespawn(kPlayer);
+    sim.PostDespawn(kFarPlayer);
+    const bool drained = WaitFor(std::chrono::seconds(10), [&] { return sim.Owners().empty(); });
+    check("despawn-drained", drained && !expired());
+    std::this_thread::sleep_for(std::chrono::seconds(4));
+    const auto decay_start_grid = sim.LoadFieldSnapshot();
+    float before_decay = 0.0f;
+    if (decay_start_grid != nullptr) {
+        const auto* hot = decay_start_grid->CellAt(100.0f, 100.0f);
+        before_decay = hot != nullptr ? hot->fast[LoadChannel::Simulation] : 0.0f;
+    }
+    std::this_thread::sleep_for(std::chrono::seconds(8));
+    const auto decay_end_grid = sim.LoadFieldSnapshot();
+    float after_decay = 0.0f;
+    if (decay_end_grid != nullptr) {
+        const auto* hot = decay_end_grid->CellAt(100.0f, 100.0f);
+        after_decay = hot != nullptr ? hot->fast[LoadChannel::Simulation] : 0.0f;
+    }
+    std::printf("LOADFIELD decay: peak_fast=%.3f before=%.3f after=%.3f\n",
+                peak_sim_fast,
+                before_decay,
+                after_decay);
+    check("hotspot-decays", after_decay < before_decay * 0.6f && after_decay >= 0.0f);
+    check("validate-final", validate_now("final"));
+
+    const auto metrics = sim.LoadFieldMetrics();
+    std::printf("LOADFIELD metrics: rebuilds=%llu cells=%llu active=%llu l1=%llu/%llu rb_us=%llu "
+                "entries=%llu peak=[norm=%.3f comp=%.3f]\n",
+                (unsigned long long)metrics.rebuilds,
+                (unsigned long long)metrics.cells_total,
+                (unsigned long long)metrics.cells_active,
+                (unsigned long long)metrics.l1_cells_active,
+                (unsigned long long)metrics.l1_cells_total,
+                (unsigned long long)metrics.last_rebuild_us,
+                (unsigned long long)metrics.drained_entries,
+                metrics.peak_normalized,
+                metrics.peak_composite);
+    std::printf("LOADFIELD peak window totals: sim=%llu bytes=%llu records=%llu dirty=%llu "
+                "aoi_q=%llu aoi_c=%llu combat=%llu mig=%llu\n",
+                (unsigned long long)peak_totals.sim_work,
+                (unsigned long long)peak_totals.repl_bytes,
+                (unsigned long long)peak_totals.repl_records,
+                (unsigned long long)peak_totals.repl_dirty,
+                (unsigned long long)peak_totals.aoi_queries,
+                (unsigned long long)peak_totals.aoi_candidates,
+                (unsigned long long)peak_totals.combat_events,
+                (unsigned long long)peak_totals.migration_events);
+
+    sim.Stop();
+
+    // ---- Resolution sweep (pure, no world). Synthetic entries stand in for
+    // zone publications; the measured cost is the real aggregation cost over
+    // the 100km target world. Reports memory, active cells, rebuild time and
+    // hotspot contrast (dense 2km cluster vs sparse single-cell hotspots).
+    for (const float cell_size : {250.0f, 500.0f, 1000.0f}) {
+        gs::game::LoadFieldConfig sweep_cfg;
+        sweep_cfg.cell_size_m = cell_size;
+        sweep_cfg.bounds = gs::game::WorldBounds::FromExtent(100000.0f);
+        sweep_cfg.aggregation_hz = 1.0f;
+        sweep_cfg.l1_enabled = true;
+        sweep_cfg.l1_ratio = 4;
+        gs::game::ContinuousLoadField field(sweep_cfg);
+
+        std::mt19937 sweep_rng(4242);
+        std::uniform_real_distribution<float> dist(0.0f, 100000.0f);
+        std::vector<gs::game::LoadBinEntry> entries;
+        entries.reserve(200 + 4000);
+        for (int h = 0; h < 200; ++h) {
+            gs::game::LoadBinEntry entry;
+            const auto mapping = gs::game::LoadFieldMapping::FromConfig(sweep_cfg);
+            entry.gx = mapping.CellX(dist(sweep_rng));
+            entry.gy = mapping.CellY(dist(sweep_rng));
+            entry.counters.sim_work = 10;
+            entries.push_back(entry);
+        }
+        const auto mapping = gs::game::LoadFieldMapping::FromConfig(sweep_cfg);
+        for (int e = 0; e < 4000; ++e) {
+            gs::game::LoadBinEntry entry;
+            entry.gx = mapping.CellX(50000.0f + dist(sweep_rng) * 0.01f);
+            entry.gy = mapping.CellY(50000.0f + dist(sweep_rng) * 0.01f);
+            entry.counters.sim_work = 10;
+            entries.push_back(entry);
+        }
+
+        double rebuild_us_total = 0.0;
+        for (int r = 0; r < 10; ++r) {
+            const auto t0 = std::chrono::steady_clock::now();
+            field.RebuildFromEntries(entries, 1.0);
+            rebuild_us_total += static_cast<double>(
+                std::chrono::duration_cast<std::chrono::microseconds>(
+                    std::chrono::steady_clock::now() - t0)
+                    .count());
+        }
+        const auto sweep_metrics = field.Metrics();
+        const auto sweep_grid = field.Snapshot();
+        const double memory_mb =
+            static_cast<double>(sweep_grid->CellCount() + sweep_grid->L1CellCount()) *
+            static_cast<double>(sizeof(gs::game::LoadCell)) / 1.0e6;
+        float sparse_peak = 0.0f;
+        float dense_peak = 0.0f;
+        for (std::uint32_t gy = 0; gy < sweep_grid->dim_y; ++gy) {
+            for (std::uint32_t gx = 0; gx < sweep_grid->dim_x; ++gx) {
+                const auto& cell =
+                    sweep_grid->cells[static_cast<std::size_t>(gy) * sweep_grid->dim_x + gx];
+                const float value = cell.fast[LoadChannel::Simulation];
+                if (value <= 0.0f) {
+                    continue;
+                }
+                const float wx = sweep_grid->bounds.min_x +
+                                 (static_cast<float>(gx) + 0.5f) * sweep_grid->cell_size_m;
+                const float wy = sweep_grid->bounds.min_y +
+                                 (static_cast<float>(gy) + 0.5f) * sweep_grid->cell_size_m;
+                const bool in_cluster = wx > 49000.0f && wx < 51000.0f && wy > 49000.0f &&
+                                        wy < 51000.0f;
+                if (in_cluster) {
+                    dense_peak = std::max(dense_peak, value);
+                } else {
+                    sparse_peak = std::max(sparse_peak, value);
+                }
+            }
+        }
+        std::printf("LOADFIELD-RES cell=%.0fm cells=%zu active=%llu l1=%llu mem_mb=%.2f "
+                    "rb_avg_us=%.1f entries=%llu dense/sparse=%.1f\n",
+                    cell_size,
+                    sweep_grid->CellCount(),
+                    (unsigned long long)sweep_metrics.cells_active,
+                    (unsigned long long)sweep_metrics.l1_cells_active,
+                    memory_mb,
+                    rebuild_us_total / 10.0,
+                    (unsigned long long)sweep_metrics.drained_entries,
+                    sparse_peak > 0.0f ? dense_peak / sparse_peak : 0.0f);
+    }
+
+    std::printf("LOADFIELD-DONE validations=%d failures=%d\n", validations, failures);
+    return failures;
+}
+
 } // namespace
 
 int BenchMain(int argc, char** argv)
@@ -1540,6 +2176,9 @@ int BenchMain(int argc, char** argv)
     // Pure field checks need no world, no map and no threads: run and exit.
     if (config.field_selftest) {
         return RunFieldSelftest() == 0 ? 0 : 1;
+    }
+    if (config.load_field_selftest) {
+        return RunLoadFieldSelftest() == 0 ? 0 : 1;
     }
 
     std::printf("worldbench: players=%d mobs=%d seconds=%d mode=%s validate_every=%d "
@@ -1594,6 +2233,19 @@ int BenchMain(int argc, char** argv)
         return scenario_failures == 0 ? 0 : 2;
     }
 
+    if (config.mode == "loadfield") {
+        // Continuous multi-channel load field scenario + resolution sweep.
+        boost::asio::io_context loadfield_io;
+        std::thread loadfield_io_thread([&loadfield_io] { loadfield_io.run(); });
+        const int scenario_failures = RunLoadFieldScenario(loadfield_io, config);
+        loadfield_io.stop();
+        if (loadfield_io_thread.joinable()) {
+            loadfield_io_thread.join();
+        }
+        std::printf("BENCH-DONE loadfield failures=%d\n", scenario_failures);
+        return scenario_failures == 0 ? 0 : 2;
+    }
+
     std::mt19937 rng(config.seed);
 
     boost::asio::io_context io;
@@ -1608,12 +2260,20 @@ int BenchMain(int argc, char** argv)
 
     {
         gs::game::WorldRuntime sim(io);
-        sim.Start();
+        // All configuration is applied pre-Start: zone-bound resources (LOD
+        // switch, load-bin mapping, partition limits) must not be rebound
+        // while a worker tick can be in flight.
         if (config.lod_off) {
             gs::game::LodConfig lod;
             lod.enabled = false;
             sim.ConfigureSimulationLod(lod);
             std::printf("simulation lod: DISABLED (legacy every-tick behavior)\n");
+        }
+        if (config.load_field_off) {
+            gs::game::LoadFieldConfig load_field;
+            load_field.enabled = false;
+            sim.ConfigureLoadField(load_field);
+            std::printf("continuous load field: DISABLED (instrumentation A/B baseline)\n");
         }
         if (config.partition_min_size > 0) {
             gs::game::PartitionConfig override;
@@ -1627,6 +2287,7 @@ int BenchMain(int argc, char** argv)
             sim.EmulateDistribution(static_cast<std::uint32_t>(config.logical_processes));
             std::printf("logical distribution: %d processes emulated\n", config.logical_processes);
         }
+        sim.Start();
         if (config.routing_selftest) {
             validation_failures += RunRoutingSelftest(sim, io, config);
         }

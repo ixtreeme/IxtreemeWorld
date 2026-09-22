@@ -86,6 +86,7 @@ void ZoneManager::BuildFromWorldLogic(const mx::map::WorldLogic& logic, float fa
     const auto now = std::chrono::steady_clock::now();
     for (std::size_t i = 0; i < zones_.size(); ++i) {
         zones_[i]->NextTick() = now;
+        zones_[i]->ConfigureLoadBins(load_field_mapping_);
         const auto& zone = *zones_[i];
         LOG_INFO("Game sim zone registered: id={} name='{}' bounds=({}, {})-({}, {}) neighbors={} region={}",
                  zone.Id(),
@@ -247,6 +248,9 @@ bool ZoneManager::CreateStagedSplit(const SplitPlan& plan, std::vector<ZoneId>& 
             child->SetPartition(PartitionState::Staging);
             child->SetSimulationEnabled(false);
             child->NextTick() = now;
+            // Staged children cannot tick yet, so configuring their load bins
+            // here is race-free; a commit turns them into active leaves.
+            child->ConfigureLoadBins(load_field_mapping_);
             zones_.push_back(std::move(child));
             out_child_ids.push_back(child_id);
         }
@@ -428,6 +432,7 @@ bool ZoneManager::CreateStagedMergeTarget(const MergePlan& plan, ZoneId& out_mer
         merged->SetPartition(PartitionState::Staging);
         merged->SetSimulationEnabled(false);
         merged->NextTick() = std::chrono::steady_clock::now();
+        merged->ConfigureLoadBins(load_field_mapping_);
         zones_.push_back(std::move(merged));
         out_merged_id = merged_id;
     } catch (...) {
@@ -591,6 +596,14 @@ void ZoneManager::ApplyRegionLimits(int max_partition_depth, float min_zone_size
     for (auto& region : regions_) {
         region.max_partition_depth = depth;
         region.min_zone_size = min_zone_size_m;
+    }
+}
+
+void ZoneManager::ApplyLoadFieldMapping(const LoadFieldMapping& mapping)
+{
+    load_field_mapping_ = mapping;
+    for (auto& zone : zones_) {
+        zone->ConfigureLoadBins(load_field_mapping_);
     }
 }
 

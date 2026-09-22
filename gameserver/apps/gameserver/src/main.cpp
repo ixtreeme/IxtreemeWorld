@@ -153,6 +153,58 @@ gs::game::LodConfig ResolveLodConfig(const gs::common::Config& config)
     return out;
 }
 
+// Continuous load field configuration (Adaptive Simulation Fabric phase 1).
+// Every key is optional; invalid values warn + fall back per field (see
+// ValidateLoadFieldConfig), and the effective set is logged by
+// WorldRuntime::ConfigureLoadField. World bounds are runtime-owned.
+gs::game::LoadFieldConfig ResolveLoadFieldConfig(const gs::common::Config& config)
+{
+    gs::game::LoadFieldConfig out;
+    const auto enabled = config.GetString("load_field_enabled");
+    if (enabled && (*enabled == "0" || *enabled == "false" || *enabled == "off")) {
+        out.enabled = false;
+    }
+    out.cell_size_m =
+        static_cast<float>(GetDoubleOr(config, "load_field_cell_size_m", out.cell_size_m));
+    out.aggregation_hz =
+        static_cast<float>(GetDoubleOr(config, "load_field_aggregation_hz", out.aggregation_hz));
+    const auto l1_enabled = config.GetString("load_field_l1_enabled");
+    if (l1_enabled && (*l1_enabled == "0" || *l1_enabled == "false" || *l1_enabled == "off")) {
+        out.l1_enabled = false;
+    }
+    const auto l1_ratio = config.GetInt("load_field_l1_ratio").value_or(
+        static_cast<int>(out.l1_ratio));
+    out.l1_ratio = static_cast<std::uint32_t>(std::max(0, l1_ratio));
+    out.simulation_budget =
+        static_cast<float>(GetDoubleOr(config, "load_field_simulation_budget", out.simulation_budget));
+    out.replication_budget = static_cast<float>(
+        GetDoubleOr(config, "load_field_replication_budget", out.replication_budget));
+    out.aoi_budget =
+        static_cast<float>(GetDoubleOr(config, "load_field_aoi_budget", out.aoi_budget));
+    out.combat_budget =
+        static_cast<float>(GetDoubleOr(config, "load_field_combat_budget", out.combat_budget));
+    out.migration_budget = static_cast<float>(
+        GetDoubleOr(config, "load_field_migration_budget", out.migration_budget));
+    out.weight_simulation = static_cast<float>(
+        GetDoubleOr(config, "load_field_weight_simulation", out.weight_simulation));
+    out.weight_replication = static_cast<float>(
+        GetDoubleOr(config, "load_field_weight_replication", out.weight_replication));
+    out.weight_aoi = static_cast<float>(GetDoubleOr(config, "load_field_weight_aoi", out.weight_aoi));
+    out.weight_combat = static_cast<float>(
+        GetDoubleOr(config, "load_field_weight_combat", out.weight_combat));
+    out.weight_migration = static_cast<float>(
+        GetDoubleOr(config, "load_field_weight_migration", out.weight_migration));
+    out.fast_rise_tau_s = static_cast<float>(
+        GetDoubleOr(config, "load_field_fast_rise_tau_s", out.fast_rise_tau_s));
+    out.fast_fall_tau_s = static_cast<float>(
+        GetDoubleOr(config, "load_field_fast_fall_tau_s", out.fast_fall_tau_s));
+    out.slow_rise_tau_s = static_cast<float>(
+        GetDoubleOr(config, "load_field_slow_rise_tau_s", out.slow_rise_tau_s));
+    out.slow_fall_tau_s = static_cast<float>(
+        GetDoubleOr(config, "load_field_slow_fall_tau_s", out.slow_fall_tau_s));
+    return out;
+}
+
 } // namespace
 
 int main(int argc, char* argv[])
@@ -197,6 +249,7 @@ int main(int argc, char* argv[])
         gs::game::WorldRuntime sim(io, runtime_identity);
         sim.ConfigurePartition(ResolvePartitionConfig(config));
         sim.ConfigureSimulationLod(ResolveLodConfig(config));
+        sim.ConfigureLoadField(ResolveLoadFieldConfig(config));
         sim.Start();
 
         gs::game::GameConnectionHandler handler(handoff_tokens, characters, sim, game_server);

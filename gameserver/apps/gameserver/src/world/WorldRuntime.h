@@ -18,6 +18,7 @@
 #include "map/MapData.h"
 #include "network/Session.h"
 
+#include "activity/ContinuousLoadField.h"
 #include "activity/SpatialActivityField.h"
 #include "components/MovementComponents.h"
 #include "OwnerMap.h"
@@ -174,6 +175,18 @@ public:
     {
         return activity_field_.Metrics();
     }
+    // Current continuous load field generation (immutable snapshot, never
+    // null). Readers copy the shared_ptr; no further synchronization needed.
+    // The field is world-space: its values are independent of the partition
+    // topology by construction (§25).
+    std::shared_ptr<const LoadGrid> LoadFieldSnapshot() const
+    {
+        return load_field_.Snapshot();
+    }
+    LoadFieldMetricsSnapshot LoadFieldMetrics() const
+    {
+        return load_field_.Metrics();
+    }
     // Strict field-vs-brute-force audit (§31): runs in the same quiescent
     // window as RequestValidation, over a deterministic mob sample. For
     // STATIC scenarios the field must match brute force exactly (stronger-
@@ -201,6 +214,10 @@ public:
     {
         return effective_lod_config_;
     }
+    const LoadFieldConfig& EffectiveLoadFieldConfig() const noexcept
+    {
+        return effective_load_field_config_;
+    }
 
     // Applies a (validated, clamped) partition configuration: monitor +
     // scheduler thresholds and region split limits. Call before Start, or
@@ -212,6 +229,19 @@ public:
     // context; the scheduler sleep rule follows the same switch. Call
     // before Start, or between supervisor passes.
     void ConfigureSimulationLod(const LodConfig& config);
+
+    // Applies a (validated, clamped) continuous load field configuration.
+    // The world bounds are runtime-owned (terrain extent), never operator
+    // config. Rebinds every zone's local load-bin rectangle, so call before
+    // Start or between supervisor passes (never with a tick in flight).
+    void ConfigureLoadField(const LoadFieldConfig& config);
+
+    // Load field self-consistency audit in the supervisor's quiescent window
+    // (same pattern as RequestValidation): validates dimensions, finite/
+    // non-negative channels, the predicted==slow seam, raw totals vs cells,
+    // normalization bounds and L1 block sums.
+    void RequestLoadFieldValidation();
+    bool TryTakeLoadFieldValidationResult(std::string& out_result);
 
     // Test seams (benchmarks/admin). Enqueued to the supervisor thread like
     // any other command; they run the FULL transactional path, only the
@@ -309,9 +339,16 @@ private:
     // (LOD eval), the scheduler (sleep/wake) and validators/bench.
     SpatialActivityField activity_field_;
     std::chrono::steady_clock::time_point last_activity_build_{};
+    // Continuous multi-channel load field (Adaptive Simulation Fabric phase 1).
+    // World-space derived work map, aggregated ~1Hz on the supervisor from
+    // per-zone published load bins; consumed via immutable snapshots. The
+    // partition tree is a future consumer, never an owner (§25-26).
+    ContinuousLoadField load_field_;
+    std::chrono::steady_clock::time_point last_load_field_build_{};
     PartitionMetrics partition_metrics_;
     PartitionConfig effective_partition_config_;
     LodConfig effective_lod_config_;
+    LoadFieldConfig effective_load_field_config_;
 
     // Failure-injection hooks for bench/test only (§17-18). Countdowns of
     // transfers to fail: snapshot-stage (before any mutation) or
@@ -349,6 +386,11 @@ private:
     std::string activity_validation_error_;
     bool activity_samples_ready_ = false;
     bool activity_validation_ok_ = false;
+
+    std::atomic<bool> load_field_validation_requested_{false};
+    mutable std::mutex load_field_validation_mutex_;
+    std::string load_field_validation_result_;
+    bool load_field_validation_ready_ = false;
 };
 
 } // namespace gs::game

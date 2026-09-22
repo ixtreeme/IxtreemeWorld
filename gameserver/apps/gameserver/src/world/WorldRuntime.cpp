@@ -98,6 +98,19 @@ WorldRuntime::WorldRuntime(boost::asio::io_context& io, RuntimeIdentity identity
     activity_field_.Reconfigure(
         SpatialActivityField::Config{kActivityCellSizeMeters,
                                     WorldBounds::FromExtent(terrain_.WorldExtentMeters())});
+    // Load field: same world extent, independent cell size (config). The
+    // mapping is bound to every zone so their local load bins line up with
+    // the generation grid before any tick can run.
+    LoadFieldConfig load_field_config;
+    load_field_config.bounds = WorldBounds::FromExtent(terrain_.WorldExtentMeters());
+    load_field_.Reconfigure(load_field_config);
+    {
+        LoadFieldMapping mapping = LoadFieldMapping::FromConfig(load_field_config);
+        mapping.valid = load_field_config.enabled; // disabled = zero-cost bins
+        zones_.ApplyLoadFieldMapping(mapping);
+    }
+    effective_load_field_config_ = load_field_config;
+    last_load_field_build_ = std::chrono::steady_clock::now();
     spawn_.Initialize(map_root, IXTREEME_DEFAULT_MOB_TYPES_CONFIG);
 }
 
@@ -255,6 +268,20 @@ void WorldRuntime::Run()
                                     lod.enabled);
         }
         const auto activity_snapshot = activity_field_.Snapshot();
+        // Continuous load field aggregation (configurable cadence, default
+        // ~1Hz). Drains the load deltas zones published at the end of their
+        // last ticks; the dt is the real elapsed time so the asymmetric EMAs
+        // stay cadence independent.
+        const auto now_load_field = std::chrono::steady_clock::now();
+        const double load_field_interval =
+            1.0 / static_cast<double>(effective_load_field_config_.aggregation_hz);
+        if (std::chrono::duration<double>(now_load_field - last_load_field_build_).count() >=
+            load_field_interval) {
+            const double dt =
+                std::chrono::duration<double>(now_load_field - last_load_field_build_).count();
+            last_load_field_build_ = now_load_field;
+            load_field_.Rebuild(zones_, dt);
+        }
         // Wake radius derives from the LOD reduced radius (§20): any player
         // inside it may grant Full/Reduced relevance, so the zone must tick.
         scheduler_.ScheduleOnce(zones_,
@@ -288,6 +315,21 @@ void WorldRuntime::Run()
                 std::lock_guard lock(validation_mutex_);
                 validation_result_ = ok ? std::string("OK") : "FAIL: " + error;
                 validation_ready_ = true;
+            }
+        }
+        // Continuous load field self-consistency audit: same quiescent
+        // window, explicit request only (the raw work events are already
+        // consumed, so this audits the generation's internal invariants).
+        if (load_field_validation_requested_.load(std::memory_order_relaxed)) {
+            if (!zones_.AnyTickInProgress()) {
+                load_field_validation_requested_.store(false, std::memory_order_relaxed);
+                std::string error;
+                const auto load_field_for_validation = load_field_.Snapshot();
+                const bool ok = load_field_for_validation != nullptr &&
+                                ValidateLoadFieldGrid(*load_field_for_validation, error);
+                std::lock_guard lock(load_field_validation_mutex_);
+                load_field_validation_result_ = ok ? std::string("OK") : "FAIL: " + error;
+                load_field_validation_ready_ = true;
             }
         }
         // Strict field-vs-brute-force audit (§31): same quiescent window,
@@ -490,6 +532,31 @@ void WorldRuntime::Run()
                      activity_metrics.sources,
                      activity_metrics.cells_nonempty,
                      activity_metrics.rebuild_us_total);
+            // Continuous load field: one concise line per diag window. The
+            // channel breakdown stays visible (raw units per window) plus the
+            // peak normalized/composite view; per-cell data is queried
+            // through LoadFieldSnapshot().
+            const auto lf = load_field_.Metrics();
+            LOG_INFO("Load field diag: epoch={} cells={} active={} l1={}/{} rb_us={} entries={} "
+                     "totals=[sim={} bytes={} records={} dirty={} aoi_q={} aoi_c={} combat={} mig={}] "
+                     "peak=[norm={:.3f} comp={:.3f}]",
+                     lf.epoch,
+                     lf.cells_total,
+                     lf.cells_active,
+                     lf.l1_cells_active,
+                     lf.l1_cells_total,
+                     lf.last_rebuild_us,
+                     lf.drained_entries,
+                     lf.last_totals.sim_work,
+                     lf.last_totals.repl_bytes,
+                     lf.last_totals.repl_records,
+                     lf.last_totals.repl_dirty,
+                     lf.last_totals.aoi_queries,
+                     lf.last_totals.aoi_candidates,
+                     lf.last_totals.combat_events,
+                     lf.last_totals.migration_events,
+                     lf.peak_normalized,
+                     lf.peak_composite);
             do {
                 next_diagnostics += std::chrono::seconds(1);
             } while (now >= next_diagnostics);
@@ -1235,6 +1302,9 @@ bool WorldRuntime::TransferResidentLocked(Zone& source_zone,
     source_zone.UnindexEntity(net_id);
     source_zone.EraseMobRng(net_id);
     rollback.commit();
+    // Load field attribution: split/merge internal transfers are real
+    // ownership work; counted at the destination like a migration.
+    target_zone.LoadBins().NoteMigration(transfer.position.x, transfer.position.y);
     if (!is_player) {
         // LOD state rode along in the transfer payload.
         target_zone.NoteLodInsert(transfer.sim_lod.tier);
@@ -1314,6 +1384,67 @@ void WorldRuntime::ConfigureSimulationLod(const LodConfig& config)
              e.demote_full_sec,
              e.demote_reduced_sec,
              e.demote_low_sec);
+}
+
+void WorldRuntime::ConfigureLoadField(const LoadFieldConfig& config)
+{
+    // World geometry is runtime-owned: operator config never moves the world.
+    LoadFieldConfig requested = config;
+    requested.bounds = WorldBounds::FromExtent(terrain_.WorldExtentMeters());
+    const auto validated = ValidateLoadFieldConfig(requested);
+    for (const auto& warning : validated.warnings) {
+        LOG_WARN("{}", warning);
+    }
+    effective_load_field_config_ = validated.effective;
+    load_field_.Reconfigure(validated.effective);
+    // Rebinds every zone's local load-bin rectangle to the effective grid. A
+    // disabled field disables the bins too, so the hot path costs exactly
+    // nothing (CellFor returns nullptr before any index math).
+    // Documented precondition: pre-Start or idle (never with a tick in flight).
+    LoadFieldMapping mapping = LoadFieldMapping::FromConfig(validated.effective);
+    mapping.valid = validated.effective.enabled;
+    zones_.ApplyLoadFieldMapping(mapping);
+    last_load_field_build_ = std::chrono::steady_clock::now();
+    const auto& e = validated.effective;
+    LOG_INFO("load field effective: enabled={} cell={:.0f}m hz={:.2f} l1={}x{} "
+             "budgets/s=[sim={:.0f} repl={:.0f} aoi={:.0f} combat={:.0f} mig={:.0f}] "
+             "weights=[{:.2f}/{:.2f}/{:.2f}/{:.2f}/{:.2f}] taus=[{:.1f}/{:.1f}/{:.1f}/{:.1f}]",
+             e.enabled,
+             e.cell_size_m,
+             e.aggregation_hz,
+             e.l1_enabled ? e.l1_ratio : 0,
+             e.l1_enabled ? e.l1_ratio : 0,
+             e.simulation_budget,
+             e.replication_budget,
+             e.aoi_budget,
+             e.combat_budget,
+             e.migration_budget,
+             e.weight_simulation,
+             e.weight_replication,
+             e.weight_aoi,
+             e.weight_combat,
+             e.weight_migration,
+             e.fast_rise_tau_s,
+             e.fast_fall_tau_s,
+             e.slow_rise_tau_s,
+             e.slow_fall_tau_s);
+}
+
+void WorldRuntime::RequestLoadFieldValidation()
+{
+    load_field_validation_requested_.store(true, std::memory_order_relaxed);
+}
+
+bool WorldRuntime::TryTakeLoadFieldValidationResult(std::string& out_result)
+{
+    std::lock_guard lock(load_field_validation_mutex_);
+    if (!load_field_validation_ready_) {
+        return false;
+    }
+    out_result = std::move(load_field_validation_result_);
+    load_field_validation_result_.clear();
+    load_field_validation_ready_ = false;
+    return true;
 }
 
 void WorldRuntime::PostForceSplit(ZoneId zone_id)

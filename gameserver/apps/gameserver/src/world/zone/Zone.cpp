@@ -244,6 +244,9 @@ void Zone::Tick(float dt, ZoneTickContext& ctx)
                         .count()),
                 std::memory_order_relaxed);
         }
+        // Continuous load field publication (post-everything positions): moves
+        // this tick's touched load deltas into the zone's published buffer.
+        LoadFieldPublisher::Publish(*this);
         diagnostics_.ticks_since_diag.fetch_add(1, std::memory_order_relaxed);
         ++zone_tick_;
         RefreshResidentCounts();

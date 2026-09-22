@@ -81,6 +81,13 @@ void AiSystem::StepWander(Zone& zone,
         const auto position = entity.get<Position>();
         auto intent = entity.get<MoveIntent>();
 
+        // Load field attribution: one AI decision happened HERE (already
+        // LOD-gated above, so skipped mobs cost nothing). One index
+        // computation + increment; no clock, no allocation.
+        if (auto* load = zone.LoadBins().CellFor(position.x, position.y)) {
+            ++load->sim_work;
+        }
+
         const auto* type = mob_types.Find(type_ref.id);
         const float idle_min = type != nullptr ? type->wander_idle_min : 3.0f;
         const float idle_max = type != nullptr ? type->wander_idle_max : 8.0f;

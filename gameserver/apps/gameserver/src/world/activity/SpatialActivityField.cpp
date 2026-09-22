@@ -12,37 +12,14 @@
 
 namespace gs::game {
 
-namespace {
-
-// Shared origin-aware axis mapping: world coordinate -> clamped cell index.
-// Subtracting the origin is what makes a non-zero world origin work; the old
-// code divided the raw coordinate and folded every negative into cell 0.
-std::uint32_t ClampedAxisCell(float world_v,
-                              float origin_v,
-                              float cell_size,
-                              std::uint32_t dim) noexcept
-{
-    if (dim == 0) {
-        return 0;
-    }
-    const int c = static_cast<int>(std::floor((world_v - origin_v) / cell_size));
-    if (c < 0) {
-        return 0;
-    }
-    const auto last = static_cast<int>(dim) - 1;
-    return static_cast<std::uint32_t>(c > last ? last : c);
-}
-
-} // namespace
-
 std::uint32_t ActivityGrid::ClampedCellX(float x) const noexcept
 {
-    return ClampedAxisCell(x, bounds.min_x, cell_size_m, dim_x);
+    return ClampedAxisCellFor(x, bounds.min_x, cell_size_m, dim_x);
 }
 
 std::uint32_t ActivityGrid::ClampedCellY(float y) const noexcept
 {
-    return ClampedAxisCell(y, bounds.min_y, cell_size_m, dim_y);
+    return ClampedAxisCellFor(y, bounds.min_y, cell_size_m, dim_y);
 }
 
 void ActivityGrid::BoxRange(float x,

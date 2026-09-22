@@ -22,6 +22,7 @@
 #include "network/Session.h"
 
 #include "../activity/ActivityTypes.h"
+#include "../activity/LoadFieldPublisher.h"
 #include "../activity/SpatialActivityField.h"
 #include "../components/ComponentRegistration.h"
 #include "../components/SimulationLod.h"
@@ -165,9 +166,39 @@ public:
     {
         return activity_sources_;
     }
+    // Guards both publish buffers below (activity sources + load bins): they
+    // are filled by the tick thread at the end of a tick and drained by the
+    // supervisor at its own cadence.
     std::mutex& ActivityMutex() const noexcept
     {
         return activity_mutex_;
+    }
+    // --- continuous load field publication (derived data, never authority) ---
+    // Zone-local integer work counters, binned by world-space field cell.
+    // Written by whoever holds this zone's write guard (tick systems, combat
+    // commands, guarded transfers); never read by other threads directly.
+    ZoneLoadBins& LoadBins() noexcept
+    {
+        return load_bins_;
+    }
+    const ZoneLoadBins& LoadBins() const noexcept
+    {
+        return load_bins_;
+    }
+    void ConfigureLoadBins(const LoadFieldMapping& mapping)
+    {
+        load_bins_.Configure(mapping, bounds_);
+    }
+    // Sparse published deltas, guarded by ActivityMutex. Filled at the end of
+    // every tick (LoadFieldPublisher::Publish), drained by the supervisor's
+    // load field aggregation.
+    std::vector<LoadBinEntry>& PublishedLoadBins() noexcept
+    {
+        return published_load_bins_;
+    }
+    const std::vector<LoadBinEntry>& PublishedLoadBins() const noexcept
+    {
+        return published_load_bins_;
     }
     // Drops all published sources (zone sleep/retire path). Postcondition:
     // the next aggregation cannot see influence from here, so despawned or
@@ -346,6 +377,8 @@ private:
     std::array<std::vector<BorderEntitySnapshot>, 2> publish_buffers_;
     std::mutex publish_mutex_;
     std::vector<PlayerInfluenceSource> activity_sources_;
+    std::vector<LoadBinEntry> published_load_bins_;
+    ZoneLoadBins load_bins_;
     mutable std::mutex activity_mutex_;
     std::unordered_map<std::uint32_t, flecs::entity> entities_;
     std::unordered_map<std::uint32_t, PlayerBinding> players_;

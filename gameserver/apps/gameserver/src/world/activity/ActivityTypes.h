@@ -1,6 +1,7 @@
 #pragma once
 
 #include <cfloat>
+#include <cmath>
 #include <cstddef>
 #include <cstdint>
 
@@ -73,6 +74,28 @@ struct WorldBounds {
 // visits against aggregation cost, while the spatial index trades AOI
 // fanout. Never unify the two concepts.
 inline constexpr float kActivityCellSizeMeters = 500.0f;
+
+// Shared origin-aware axis mapping: world coordinate -> clamped cell index.
+// Single source of truth for every world-indexed derived field (activity
+// field, continuous load field): subtracting the origin is what makes a
+// non-zero world origin (e.g. -50km..+50km) index correctly, and the clamp
+// keeps out-of-bounds samples on the edge cell instead of folding every
+// negative coordinate into cell 0.
+inline std::uint32_t ClampedAxisCellFor(float world_v,
+                                        float origin_v,
+                                        float cell_size,
+                                        std::uint32_t dim) noexcept
+{
+    if (dim == 0 || !(cell_size > 0.0f)) {
+        return 0;
+    }
+    const int c = static_cast<int>(std::floor((world_v - origin_v) / cell_size));
+    if (c < 0) {
+        return 0;
+    }
+    const auto last = static_cast<int>(dim) - 1;
+    return static_cast<std::uint32_t>(c > last ? last : c);
+}
 
 // Minimal derived datum for cross-zone influence: stable identity +
 // world position + origin metadata. NO health/inventory/stats/session —

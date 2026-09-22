@@ -118,6 +118,17 @@ std::vector<std::uint32_t> AoiSystem::QueryCandidates(Zone& zone,
         }
     });
 
+    // Load field attribution: the AOI cost of this viewer is one query plus
+    // every candidate considered BEFORE the cap -- so a dense hotspot reads
+    // as more expensive than the same entities spread out, and cap clipping
+    // stays visible instead of hiding work (§10).
+    if (auto* load = zone.LoadBins().CellFor(viewer_position.x, viewer_position.y)) {
+        ++load->aoi_queries;
+        const std::size_t pre_cap = candidates.size();
+        load->aoi_candidates += static_cast<std::uint32_t>(
+            pre_cap > 0xFFFFFFFFu ? 0xFFFFFFFFu : pre_cap);
+    }
+
     std::sort(candidates.begin(), candidates.end(), [](const auto& lhs, const auto& rhs) {
         return lhs.first < rhs.first;
     });

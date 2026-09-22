@@ -85,6 +85,10 @@ CombatSystem::AttackResult CombatSystem::ProcessAttack(Zone& zone,
     auto target_hp = target_entity.get<Hp>();
     target_hp.current = std::max(0.0f, target_hp.current - damage_dealt);
     target_entity.set<Hp>(target_hp);
+    // Load field attribution: combat heat is event-derived and decays through
+    // the field's asymmetric EMA. Attributed to the combat location (attacker
+    // position; the target is within attack range by validation above).
+    zone.LoadBins().NoteCombat(attacker_position.x, attacker_position.y);
     // Combat is an instant wake trigger (§9-10): a hit target simulates
     // Fully from here on, regardless of distance tier. The demotion grace
     // (not this call site) decides when it may cool down again.
