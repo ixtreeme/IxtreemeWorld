@@ -31,6 +31,22 @@ struct PartitionMetrics {
     std::atomic<std::uint64_t> merge_commit_us{0};
     std::atomic<std::uint64_t> merge_rollback_us{0};
 
+    // Phase-3 stability controller diagnostics: WHY the controller did not
+    // mutate. These make the stability behavior tunable instead of opaque.
+    std::atomic<std::uint64_t> merge_candidates_evaluated{0};
+    std::atomic<std::uint64_t> merge_suppressed_not_eligible{0};
+    std::atomic<std::uint64_t> merge_suppressed_not_sustained{0};
+    std::atomic<std::uint64_t> merge_suppressed_recent_split{0};
+    std::atomic<std::uint64_t> merge_suppressed_recent_merge{0};
+    std::atomic<std::uint64_t> merge_suppressed_post_merge_unsafe{0};
+    std::atomic<std::uint64_t> merge_suppressed_min_improvement{0};
+    std::atomic<std::uint64_t> merge_suppressed_transaction{0};
+    std::atomic<std::uint64_t> split_suppressed_merge_cooldown{0};
+    std::atomic<std::uint64_t> split_emergency_bypasses{0};
+    // A split and a merge on the same node inside the oscillation window
+    // (diagnostic; the directional cooldowns are the hard guards).
+    std::atomic<std::uint64_t> oscillation_guard_trips{0};
+
     struct Snapshot {
         std::uint64_t split_attempts = 0;
         std::uint64_t split_commits = 0;
@@ -51,6 +67,17 @@ struct PartitionMetrics {
         std::uint64_t merge_transfer_us = 0;
         std::uint64_t merge_commit_us = 0;
         std::uint64_t merge_rollback_us = 0;
+        std::uint64_t merge_candidates_evaluated = 0;
+        std::uint64_t merge_suppressed_not_eligible = 0;
+        std::uint64_t merge_suppressed_not_sustained = 0;
+        std::uint64_t merge_suppressed_recent_split = 0;
+        std::uint64_t merge_suppressed_recent_merge = 0;
+        std::uint64_t merge_suppressed_post_merge_unsafe = 0;
+        std::uint64_t merge_suppressed_min_improvement = 0;
+        std::uint64_t merge_suppressed_transaction = 0;
+        std::uint64_t split_suppressed_merge_cooldown = 0;
+        std::uint64_t split_emergency_bypasses = 0;
+        std::uint64_t oscillation_guard_trips = 0;
     };
 
     Snapshot TakeSnapshot() const noexcept
@@ -75,6 +102,25 @@ struct PartitionMetrics {
         snap.merge_transfer_us = merge_transfer_us.load(std::memory_order_relaxed);
         snap.merge_commit_us = merge_commit_us.load(std::memory_order_relaxed);
         snap.merge_rollback_us = merge_rollback_us.load(std::memory_order_relaxed);
+        snap.merge_candidates_evaluated = merge_candidates_evaluated.load(std::memory_order_relaxed);
+        snap.merge_suppressed_not_eligible =
+            merge_suppressed_not_eligible.load(std::memory_order_relaxed);
+        snap.merge_suppressed_not_sustained =
+            merge_suppressed_not_sustained.load(std::memory_order_relaxed);
+        snap.merge_suppressed_recent_split =
+            merge_suppressed_recent_split.load(std::memory_order_relaxed);
+        snap.merge_suppressed_recent_merge =
+            merge_suppressed_recent_merge.load(std::memory_order_relaxed);
+        snap.merge_suppressed_post_merge_unsafe =
+            merge_suppressed_post_merge_unsafe.load(std::memory_order_relaxed);
+        snap.merge_suppressed_min_improvement =
+            merge_suppressed_min_improvement.load(std::memory_order_relaxed);
+        snap.merge_suppressed_transaction =
+            merge_suppressed_transaction.load(std::memory_order_relaxed);
+        snap.split_suppressed_merge_cooldown =
+            split_suppressed_merge_cooldown.load(std::memory_order_relaxed);
+        snap.split_emergency_bypasses = split_emergency_bypasses.load(std::memory_order_relaxed);
+        snap.oscillation_guard_trips = oscillation_guard_trips.load(std::memory_order_relaxed);
         return snap;
     }
 };

@@ -60,6 +60,38 @@ partition_scoring_instability_window_s=120.0
 partition_scoring_decision_log=true
 partition_scoring_why_not_log_seconds=10.0
 
+# Adaptive merge scoring + partition stability controller (phase 3). The tree
+# only simplifies when a whole quadtree sibling group has been SUSTAINED low
+# and the merge is measurably beneficial. Value hysteresis (merge threshold
+# far below split), time hysteresis (long group sustained-low window),
+# directional cooldowns and a post-merge safety margin prevent split/merge
+# oscillation. Invalid values warn + fall back per field.
+#
+# MergeScore = w_topology * topology_benefit
+#            + w_boundary * boundary_benefit + w_migration * migration_benefit
+#            + w_replication * replication_benefit
+#            - w_risk * parent_load_risk - w_execution * execution_penalty
+#            - w_instability * instability_penalty
+partition_merge_sustained_low_seconds=90.0
+partition_split_to_merge_cooldown_seconds=120.0
+partition_merge_to_split_cooldown_seconds=90.0
+partition_scoring_post_merge_safety_margin=0.15
+partition_scoring_min_merge_improvement=0.10
+partition_scoring_merge_topology_benefit=0.05
+partition_scoring_weight_merge_topology=1.0
+partition_scoring_weight_merge_boundary=0.35
+partition_scoring_weight_merge_migration=0.35
+partition_scoring_weight_merge_replication=0.20
+partition_scoring_weight_merge_risk=1.0
+partition_scoring_weight_merge_execution=0.15
+partition_scoring_weight_merge_instability=0.10
+partition_scoring_oscillation_window_seconds=300.0
+# Emergency split bypass: when the merge-to-split cooldown would block an
+# otherwise-passing split, a measured dual signal (p99 tick >= N x budget on
+# top of the passed load gate) may override it. Set to false to disable.
+partition_scoring_emergency_split_bypass=true
+partition_scoring_emergency_p99_multiplier=2.0
+
 # Simulation LOD (server-side compute tiers, not graphics). Mobs simulate at
 # Full (20 Hz) near players, Reduced/Low farther out, Dormant when nothing is
 # relevant. Promotion is immediate (attack/damage/proximity/spawn/migration);

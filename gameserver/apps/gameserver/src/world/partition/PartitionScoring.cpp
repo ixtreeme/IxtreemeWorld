@@ -19,6 +19,23 @@ float Clamp01(float value) noexcept
     return std::min(value, 1.0f);
 }
 
+// Shared instability decay: a recent mutation contributes a soft penalty
+// that falls linearly to zero over the configured window. Hard guards
+// (directional cooldowns) live in the scheduler.
+float InstabilityDecay(std::chrono::steady_clock::time_point mutation,
+                       std::chrono::steady_clock::time_point now,
+                       float window_s) noexcept
+{
+    if (mutation == std::chrono::steady_clock::time_point{} || !(window_s > 0.0f)) {
+        return 0.0f;
+    }
+    const float elapsed = std::chrono::duration<float>(now - mutation).count();
+    if (elapsed < 0.0f || elapsed >= window_s) {
+        return 0.0f;
+    }
+    return Clamp01(1.0f - elapsed / window_s);
+}
+
 // Candidate cuts are snapped to load-field cell boundaries so the child
 // aggregation tiles cells exactly (no cell counted by two children). The snap
 // is clamped into [lo, hi] (the minimum-zone-size safe range); when that range
@@ -200,14 +217,8 @@ void ScoreCandidate(SplitCandidateScore& score,
 
     // Instability: soft decay after a recent topology mutation (hard gates
     // stay in the scheduler/executor).
-    score.instability_penalty = 0.0f;
-    if (input.last_mutation != std::chrono::steady_clock::time_point{} &&
-        config.instability_window_s > 0.0f) {
-        const float elapsed = std::chrono::duration<float>(now - input.last_mutation).count();
-        if (elapsed >= 0.0f && elapsed < config.instability_window_s) {
-            score.instability_penalty = Clamp01(1.0f - elapsed / config.instability_window_s);
-        }
-    }
+    score.instability_penalty =
+        InstabilityDecay(input.last_mutation, now, config.instability_window_s);
     score.topology_penalty = Clamp01(config.topology_penalty);
 
     const float final_score = config.weight_balance * score.balance_benefit -
@@ -261,10 +272,39 @@ const char* PartitionNoopReasonName(PartitionNoopReason reason) noexcept
         return "below-min-improvement";
     case PartitionNoopReason::TransactionRejected:
         return "transaction-rejected";
+    case PartitionNoopReason::SplitNotSustained:
+        return "split-not-sustained";
+    case PartitionNoopReason::SplitCooldown:
+        return "split-cooldown";
+    case PartitionNoopReason::SplitMaxDepth:
+        return "split-max-depth";
+    case PartitionNoopReason::SplitNotEligible:
+        return "split-not-eligible";
+    case PartitionNoopReason::SplitMinSize:
+        return "split-min-size";
+    case PartitionNoopReason::MergeNotEligible:
+        return "merge-not-eligible";
+    case PartitionNoopReason::MergeNotSustained:
+        return "merge-not-sustained";
+    case PartitionNoopReason::MergeRecentSplit:
+        return "merge-recent-split";
+    case PartitionNoopReason::MergeRecentMerge:
+        return "merge-recent-merge";
+    case PartitionNoopReason::MergeUnsafePostMerge:
+        return "merge-unsafe-post-merge";
+    case PartitionNoopReason::MergeBelowMinImprovement:
+        return "merge-below-min-improvement";
+    case PartitionNoopReason::MergeTransactionRejected:
+        return "merge-transaction-rejected";
     case PartitionNoopReason::None:
     default:
         return "none";
     }
+}
+
+const char* PartitionDecisionKindName(PartitionDecisionKind kind) noexcept
+{
+    return kind == PartitionDecisionKind::Merge ? "merge" : "split";
 }
 
 SplitRecommendation PartitionScorer::ScoreSplit(const PartitionScoreInput& input,
@@ -412,9 +452,211 @@ SplitRecommendation PartitionScorer::ScoreSplit(const PartitionScoreInput& input
     return recommendation;
 }
 
+MergeRecommendation PartitionScorer::ScoreMerge(const MergeScoreInput& input,
+                                                const LoadGrid* field,
+                                                const ActivityGrid* activity,
+                                                std::chrono::steady_clock::time_point now) const
+{
+    MergeRecommendation recommendation;
+    recommendation.parent_id = input.parent_id;
+    recommendation.timestamp = now;
+    const bool parent_valid = input.parent_bounds.max_x > input.parent_bounds.min_x &&
+                              input.parent_bounds.max_y > input.parent_bounds.min_y;
+    bool children_valid = true;
+    for (const auto& child : input.child_bounds) {
+        children_valid = children_valid && child.max_x > child.min_x && child.max_y > child.min_y;
+    }
+    if (field == nullptr || !field->enabled || field->cells.empty() || !parent_valid ||
+        !children_valid) {
+        return recommendation;
+    }
+    recommendation.field_epoch = field->epoch;
+
+    MergeCandidateScore& score = recommendation.best;
+    score.parent_id = input.parent_id;
+    score.child_ids = input.child_ids;
+    score.max_child_load_score = input.max_child_load_score;
+    score.sustained_low_seconds = input.sustained_low_seconds;
+
+    // Predicted parent workload over the WHOLE parent area, on BOTH field
+    // timescales: merging is only safe when the fast view is calm AND the
+    // slow view confirms it is not a brief dip. The aggregate is recomputed
+    // under the parent bounds -- never an average of child scores.
+    const WorldBounds parent_bounds{input.parent_bounds.min_x, input.parent_bounds.min_y,
+                                    input.parent_bounds.max_x, input.parent_bounds.max_y};
+    const LoadAggregate fast = AggregateLoad(*field, parent_bounds, config_.decision_timescale);
+    const LoadAggregate slow = AggregateLoad(*field, parent_bounds, LoadTimescale::Slow);
+    const auto aggregate_score = [](const LoadAggregate& aggregate) {
+        const float mean = aggregate.cells > 0
+                               ? aggregate.composite_sum / static_cast<float>(aggregate.cells)
+                               : 0.0f;
+        return std::max(mean, aggregate.composite_peak);
+    };
+    score.predicted_channels = fast.raw;
+    score.predicted_composite_sum = fast.composite_sum;
+    score.predicted_parent_mean =
+        fast.cells > 0 ? fast.composite_sum / static_cast<float>(fast.cells) : 0.0f;
+    score.predicted_parent_peak = std::max(fast.composite_peak, slow.composite_peak);
+    score.predicted_parent_load =
+        Clamp01(std::max(aggregate_score(fast), aggregate_score(slow)));
+    score.safety_ceiling =
+        std::max(0.0f, config_.split_load_threshold - config_.post_merge_safety_margin);
+    score.safety_ok = score.predicted_parent_load <= score.safety_ceiling + kScoreEpsilon;
+
+    // Internal cut lines from the ACTUAL child bounds (robust to off-midpoint
+    // adaptive splits): the NW child's east and south edges.
+    const float cut_x = input.child_bounds[0].max_x;
+    const float cut_y = input.child_bounds[0].min_y;
+    const float half_band = config_.boundary_band_m * 0.5f;
+    const WorldBounds x_band{
+        cut_x - half_band, input.parent_bounds.min_y, cut_x + half_band, input.parent_bounds.max_y};
+    const WorldBounds y_band{
+        input.parent_bounds.min_x, cut_y - half_band, input.parent_bounds.max_x, cut_y + half_band};
+    const LoadAggregate x_aggregate = AggregateLoad(*field, x_band, config_.decision_timescale);
+    const LoadAggregate y_aggregate = AggregateLoad(*field, y_band, config_.decision_timescale);
+    const std::size_t migration_index = LoadChannelIndex(LoadChannel::Migration);
+    const std::size_t replication_index = LoadChannelIndex(LoadChannel::Replication);
+    const std::size_t combat_index = LoadChannelIndex(LoadChannel::Combat);
+    const float migration_units =
+        x_aggregate.normalized[migration_index] + y_aggregate.normalized[migration_index];
+    const float replication_units =
+        x_aggregate.normalized[replication_index] + y_aggregate.normalized[replication_index];
+    const float combat_units =
+        x_aggregate.normalized[combat_index] + y_aggregate.normalized[combat_index];
+    std::size_t activity_sources = 0;
+    if (activity != nullptr && activity->Enabled()) {
+        activity_sources =
+            activity->CountPlayerSourcesIn(x_band) + activity->CountPlayerSourcesIn(y_band);
+    }
+    score.activity_band =
+        Clamp01(static_cast<float>(activity_sources) / config_.activity_band_budget);
+    score.migration_band = Clamp01(migration_units / config_.migration_band_budget);
+    score.replication_band = Clamp01(replication_units / config_.replication_band_budget);
+    score.combat_band = Clamp01(combat_units / config_.combat_band_budget);
+
+    // Hotspots crossed by an internal cut: those boundaries keep splitting a
+    // hot area, so removing them is a genuine benefit.
+    std::vector<std::uint8_t> hotspot_scratch;
+    const std::vector<LoadHotspot> hotspots =
+        DetectLoadHotspots(*field, parent_bounds, config_.decision_timescale,
+                           config_.hotspot_threshold, config_.hotspot_max_count, hotspot_scratch);
+    float internal_load = 0.0f;
+    std::uint32_t internal_count = 0;
+    for (const auto& hotspot : hotspots) {
+        const bool crosses_x = hotspot.bounds.min_x < cut_x && cut_x < hotspot.bounds.max_x;
+        const bool crosses_y = hotspot.bounds.min_y < cut_y && cut_y < hotspot.bounds.max_y;
+        if (crosses_x || crosses_y) {
+            internal_load += hotspot.load;
+            ++internal_count;
+        }
+    }
+    score.internal_hotspots = internal_count;
+    score.hotspot_internal_frac =
+        fast.composite_sum > kScoreEpsilon ? Clamp01(internal_load / fast.composite_sum) : 0.0f;
+
+    // Benefits: boundary work removed (activity/combat/hotspot) + measured
+    // migration and replication churn removed. Migration/replication are NOT
+    // double-counted inside boundary_benefit.
+    score.topology_benefit = Clamp01(config_.merge_topology_benefit);
+    score.boundary_benefit =
+        Clamp01(kBoundaryActivityWeight * score.activity_band +
+                kBoundaryCombatWeight * score.combat_band +
+                kBoundaryHotspotWeight * score.hotspot_internal_frac);
+    score.migration_benefit = Clamp01(score.migration_band);
+    score.replication_benefit = Clamp01(score.replication_band);
+
+    // Risk grows quadratically as the predicted parent load approaches the
+    // post-merge ceiling (near zero for a calm group, 1.0 at the ceiling).
+    const float ceiling = std::max(kScoreEpsilon, score.safety_ceiling);
+    const float risk_ratio = score.predicted_parent_load / ceiling;
+    score.parent_load_risk = Clamp01(risk_ratio * risk_ratio);
+
+    const float transfer_work =
+        static_cast<float>(input.players) * config_.player_transfer_weight +
+        static_cast<float>(input.mobs) * config_.mob_transfer_weight;
+    score.execution_penalty = Clamp01(transfer_work / config_.migration_work_budget);
+    score.instability_penalty =
+        std::max(InstabilityDecay(input.last_split, now, config_.instability_window_s),
+                 InstabilityDecay(input.last_merge, now, config_.instability_window_s));
+
+    const float final_score = config_.weight_merge_topology * score.topology_benefit +
+                              config_.weight_merge_boundary * score.boundary_benefit +
+                              config_.weight_merge_migration * score.migration_benefit +
+                              config_.weight_merge_replication * score.replication_benefit -
+                              config_.weight_merge_risk * score.parent_load_risk -
+                              config_.weight_merge_execution * score.execution_penalty -
+                              config_.weight_merge_instability * score.instability_penalty;
+    score.final_score =
+        std::isfinite(final_score) ? std::clamp(final_score, -1.0f, 1.0f) : -1.0f;
+    score.valid = true;
+    recommendation.expected_improvement = score.final_score;
+    recommendation.valid = true;
+    return recommendation;
+}
+
 std::string FormatPartitionDecision(const PartitionDecisionRecord& record)
 {
-    char buffer[512];
+    char buffer[640];
+    if (record.kind == PartitionDecisionKind::Merge) {
+        const MergeCandidateScore& merge = record.merge_candidate;
+        if (!record.scored) {
+            // Gate-suppressed group: the controller never got to scoring.
+            std::snprintf(buffer,
+                          sizeof(buffer),
+                          "MERGE-NOOP parent=%u reason=%s detail=%s sustained_low=%.0fs "
+                          "group_load=%.3f",
+                          record.zone_id,
+                          PartitionNoopReasonName(record.noop_reason),
+                          record.detail != nullptr ? record.detail : "",
+                          merge.sustained_low_seconds,
+                          merge.predicted_parent_load);
+        } else if (record.executed) {
+            std::snprintf(buffer,
+                          sizeof(buffer),
+                          "MERGE parent=%u children=[%u,%u,%u,%u] score=%.3f predicted=%.2f peak=%.2f "
+                          "risk=%.3f topology=%.3f boundary=%.3f migration=%.3f repl=%.3f "
+                          "execution=%.3f instability=%.3f sustained_low=%.0fs field_epoch=%llu",
+                          record.zone_id,
+                          merge.child_ids[0],
+                          merge.child_ids[1],
+                          merge.child_ids[2],
+                          merge.child_ids[3],
+                          merge.final_score,
+                          merge.predicted_parent_load,
+                          merge.predicted_parent_peak,
+                          merge.parent_load_risk,
+                          merge.topology_benefit,
+                          merge.boundary_benefit,
+                          merge.migration_benefit,
+                          merge.replication_benefit,
+                          merge.execution_penalty,
+                          merge.instability_penalty,
+                          merge.sustained_low_seconds,
+                          static_cast<unsigned long long>(record.field_epoch));
+        } else {
+            std::snprintf(buffer,
+                          sizeof(buffer),
+                          "MERGE-NOOP parent=%u reason=%s detail=%s safety=%s predicted=%.2f "
+                          "ceiling=%.2f score=%.3f topology=%.3f boundary=%.3f migration=%.3f "
+                          "repl=%.3f risk=%.3f execution=%.3f instability=%.3f sustained_low=%.0fs",
+                          record.zone_id,
+                          PartitionNoopReasonName(record.noop_reason),
+                          record.detail != nullptr ? record.detail : "",
+                          merge.safety_ok ? "ok" : "unsafe",
+                          merge.predicted_parent_load,
+                          merge.safety_ceiling,
+                          merge.final_score,
+                          merge.topology_benefit,
+                          merge.boundary_benefit,
+                          merge.migration_benefit,
+                          merge.replication_benefit,
+                          merge.parent_load_risk,
+                          merge.execution_penalty,
+                          merge.instability_penalty,
+                          merge.sustained_low_seconds);
+        }
+        return std::string(buffer);
+    }
     const SplitCandidateScore& candidate = record.candidate;
     if (record.executed) {
         std::snprintf(buffer,

@@ -91,19 +91,29 @@ void ZoneLoadMonitor::Update(ZoneManager& zones,
             ClampScore(std::max({tick_frac, tick_frac_p99, resident_frac}), 2.0f);
 
         // Field score: world-space load distribution under the zone bounds.
-        // Null/disabled field -> 0, legacy behavior preserved.
+        // Null/disabled field -> 0, legacy behavior preserved. The slow EMA
+        // view is recorded separately: merge eligibility is conservative and
+        // requires BOTH timescales to be calm (phase-3 §11).
         if (load_field != nullptr && load_field->enabled) {
             const auto& bounds = zone.Bounds();
             const WorldBounds zone_bounds{bounds.min_x, bounds.min_y, bounds.max_x, bounds.max_y};
             const LoadAggregate aggregate =
                 AggregateLoad(*load_field, zone_bounds, config_.field_timescale);
+            const LoadAggregate slow_aggregate =
+                AggregateLoad(*load_field, zone_bounds, LoadTimescale::Slow);
             snap.field_peak_cell = aggregate.composite_peak;
             snap.field_active_cells = aggregate.active_cells;
             const float mean =
                 aggregate.cells > 0
                     ? aggregate.composite_sum / static_cast<float>(aggregate.cells)
                     : 0.0f;
+            const float slow_mean =
+                slow_aggregate.cells > 0
+                    ? slow_aggregate.composite_sum / static_cast<float>(slow_aggregate.cells)
+                    : 0.0f;
             snap.field_load_score = ClampScore(std::max(mean, aggregate.composite_peak), 1.0f);
+            snap.field_load_score_slow =
+                ClampScore(std::max(slow_mean, slow_aggregate.composite_peak), 1.0f);
         }
 
         snap.load_score = ClampScore(std::max(snap.legacy_load_score, snap.field_load_score), 2.0f);
@@ -139,17 +149,80 @@ void ZoneLoadMonitor::Update(ZoneManager& zones,
         if (scheduler.ShouldSplit(leaf, now)) {
             split_candidates_.push_back(leaf->zone_id);
         }
-        if (scheduler.ShouldMerge(leaf, now) && leaf->parent != nullptr) {
-            merge_candidates_.push_back(leaf->parent->zone_id);
-        }
     }
 
-    // One merge candidate per parent: siblings are evaluated per leaf, so
-    // the same parent can appear up to 4x. Execution merges the whole
-    // sibling set once; dedupe here.
-    std::sort(merge_candidates_.begin(), merge_candidates_.end());
-    merge_candidates_.erase(std::unique(merge_candidates_.begin(), merge_candidates_.end()),
-                            merge_candidates_.end());
+    // --- merge group observation (phase 3) ---------------------------------
+    // Deterministic DFS over the partition forests: a merge candidate is a
+    // REAL quadtree parent with exactly four authoritative active leaves.
+    // No arbitrary-neighbor or partial-group merges.
+    merge_groups_.clear();
+    merge_candidates_.clear();
+    std::vector<ZonePartition*> internal_nodes;
+    for (const auto& root : zones.PartitionRoots()) {
+        CollectInternalNodes(root.get(), internal_nodes);
+    }
+    merge_groups_.reserve(internal_nodes.size());
+    for (ZonePartition* parent : internal_nodes) {
+        if (parent->children.size() != 4) {
+            continue; // quadtree groups only; the executor re-validates
+        }
+        MergeGroupSnapshot group;
+        group.parent_id = parent->zone_id;
+        float max_child = 0.0f;
+        bool children_ok = true;
+        for (std::size_t i = 0; i < parent->children.size(); ++i) {
+            const ZonePartition* child = parent->children[i].get();
+            group.child_ids[i] = child->zone_id;
+            max_child = std::max(max_child, child->load_score);
+            if (!child->IsActiveLeaf()) {
+                children_ok = false;
+            }
+        }
+        group.max_child_load_score = max_child;
+
+        // Whole-area aggregate on both field timescales. A group is only
+        // eligible when EVERY child AND the aggregate are below the merge
+        // threshold; one hot child keeps the whole group out.
+        if (children_ok && load_field != nullptr && load_field->enabled) {
+            const WorldBounds bounds{parent->bounds.min_x, parent->bounds.min_y,
+                                     parent->bounds.max_x, parent->bounds.max_y};
+            const LoadAggregate fast = AggregateLoad(*load_field, bounds, config_.field_timescale);
+            const LoadAggregate slow = AggregateLoad(*load_field, bounds, LoadTimescale::Slow);
+            const auto score_of = [](const LoadAggregate& aggregate) {
+                const float mean =
+                    aggregate.cells > 0
+                        ? aggregate.composite_sum / static_cast<float>(aggregate.cells)
+                        : 0.0f;
+                return std::max(mean, aggregate.composite_peak);
+            };
+            group.parent_field_fast = ClampScore(score_of(fast), 1.0f);
+            group.parent_field_slow = ClampScore(score_of(slow), 1.0f);
+        }
+        group.group_load_score =
+            ClampScore(std::max({max_child, group.parent_field_fast, group.parent_field_slow}),
+                       2.0f);
+
+        // Sustained-low timer: explicit start/keep/reset. Any child breach or
+        // aggregate breach resets it; no implicit decay, no hidden semantics.
+        if (children_ok && group.group_load_score < config_.merge_load_threshold) {
+            if (parent->group_low_since == std::chrono::steady_clock::time_point{}) {
+                parent->group_low_since = now;
+            }
+        } else {
+            parent->group_low_since = {};
+        }
+        if (parent->group_low_since != std::chrono::steady_clock::time_point{}) {
+            group.sustained_low_seconds =
+                std::chrono::duration<float>(now - parent->group_low_since).count();
+        }
+
+        group.gate = scheduler.EvaluateMergeGate(parent, now);
+        group.candidate = group.gate == ZoneScheduler::MergeGate::Pass;
+        if (group.candidate) {
+            merge_candidates_.push_back(parent->zone_id);
+        }
+        merge_groups_.push_back(group);
+    }
 }
 
 } // namespace gs::game

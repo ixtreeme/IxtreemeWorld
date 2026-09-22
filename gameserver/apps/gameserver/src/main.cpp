@@ -182,6 +182,45 @@ gs::game::PartitionConfig ResolvePartitionConfig(const gs::common::Config& confi
                      *timescale);
         }
     }
+
+    // Phase 3: adaptive merge scoring + partition stability controller. All
+    // keys optional; invalid values warn + fall back (threshold invariant:
+    // merge threshold < split threshold - post-merge safety margin).
+    scoring.merge_sustained_low_s = static_cast<float>(
+        GetDoubleOr(config, "partition_merge_sustained_low_seconds", scoring.merge_sustained_low_s));
+    scoring.split_to_merge_cooldown_s = static_cast<float>(GetDoubleOr(
+        config, "partition_split_to_merge_cooldown_seconds", scoring.split_to_merge_cooldown_s));
+    scoring.merge_to_split_cooldown_s = static_cast<float>(GetDoubleOr(
+        config, "partition_merge_to_split_cooldown_seconds", scoring.merge_to_split_cooldown_s));
+    scoring.post_merge_safety_margin = static_cast<float>(GetDoubleOr(
+        config, "partition_scoring_post_merge_safety_margin", scoring.post_merge_safety_margin));
+    scoring.min_merge_improvement = static_cast<float>(GetDoubleOr(
+        config, "partition_scoring_min_merge_improvement", scoring.min_merge_improvement));
+    scoring.merge_topology_benefit = static_cast<float>(GetDoubleOr(
+        config, "partition_scoring_merge_topology_benefit", scoring.merge_topology_benefit));
+    scoring.weight_merge_topology = static_cast<float>(GetDoubleOr(
+        config, "partition_scoring_weight_merge_topology", scoring.weight_merge_topology));
+    scoring.weight_merge_boundary = static_cast<float>(GetDoubleOr(
+        config, "partition_scoring_weight_merge_boundary", scoring.weight_merge_boundary));
+    scoring.weight_merge_migration = static_cast<float>(GetDoubleOr(
+        config, "partition_scoring_weight_merge_migration", scoring.weight_merge_migration));
+    scoring.weight_merge_replication = static_cast<float>(GetDoubleOr(
+        config, "partition_scoring_weight_merge_replication", scoring.weight_merge_replication));
+    scoring.weight_merge_risk = static_cast<float>(GetDoubleOr(
+        config, "partition_scoring_weight_merge_risk", scoring.weight_merge_risk));
+    scoring.weight_merge_execution = static_cast<float>(GetDoubleOr(
+        config, "partition_scoring_weight_merge_execution", scoring.weight_merge_execution));
+    scoring.weight_merge_instability = static_cast<float>(GetDoubleOr(
+        config, "partition_scoring_weight_merge_instability", scoring.weight_merge_instability));
+    scoring.oscillation_window_s = static_cast<float>(GetDoubleOr(
+        config, "partition_scoring_oscillation_window_seconds", scoring.oscillation_window_s));
+    scoring.emergency_p99_multiplier = static_cast<float>(GetDoubleOr(
+        config, "partition_scoring_emergency_p99_multiplier", scoring.emergency_p99_multiplier));
+    const auto emergency_bypass = config.GetString("partition_scoring_emergency_split_bypass");
+    if (emergency_bypass &&
+        (*emergency_bypass == "0" || *emergency_bypass == "false" || *emergency_bypass == "off")) {
+        scoring.emergency_split_bypass = false;
+    }
     return out;
 }
 

@@ -139,8 +139,12 @@ void ZoneScheduler::ScheduleOnce(ZoneManager& zones,
 
 ZoneScheduler::SplitGate ZoneScheduler::EvaluateSplitGate(
     const ZonePartition* leaf,
-    std::chrono::steady_clock::time_point now) const
+    std::chrono::steady_clock::time_point now,
+    bool* out_emergency) const
 {
+    if (out_emergency != nullptr) {
+        *out_emergency = false;
+    }
     if (leaf == nullptr || !leaf->IsLeaf()) {
         return SplitGate::NotLeaf;
     }
@@ -159,6 +163,24 @@ ZoneScheduler::SplitGate ZoneScheduler::EvaluateSplitGate(
     if (now - leaf->last_split_time < config.split_cooldown) {
         return SplitGate::Cooldown;
     }
+    if (now - leaf->last_merge_time < config.merge_to_split_cooldown) {
+        // The leaf was just produced by a merge. The normal path stays
+        // suppressed; the MEASURED emergency signal (p99 tick at/above the
+        // configured multiple of the budget, on top of the already-passed
+        // load-score gate) may override it. No magic: both signals are
+        // measured, both thresholds are config, and the bypass is countable.
+        const bool emergency =
+            config.emergency_split_bypass && config.tick_budget_ms > 0.0f &&
+            config.emergency_p99_multiplier > 0.0f &&
+            leaf->p99_tick_us >=
+                config.emergency_p99_multiplier * config.tick_budget_ms * 1000.0f;
+        if (!emergency) {
+            return SplitGate::MergeToSplitCooldown;
+        }
+        if (out_emergency != nullptr) {
+            *out_emergency = true;
+        }
+    }
     return SplitGate::Pass;
 }
 
@@ -175,7 +197,66 @@ const char* ZoneScheduler::SplitGateName(SplitGate gate) noexcept
         return "not-sustained";
     case SplitGate::Cooldown:
         return "cooldown";
+    case SplitGate::MergeToSplitCooldown:
+        return "merge-cooldown";
     case SplitGate::Pass:
+    default:
+        return "pass";
+    }
+}
+
+ZoneScheduler::MergeGate ZoneScheduler::EvaluateMergeGate(
+    const ZonePartition* parent,
+    std::chrono::steady_clock::time_point now) const
+{
+    if (parent == nullptr) {
+        return MergeGate::NoParent;
+    }
+    if (parent->parent == nullptr) {
+        return MergeGate::Root; // region roots never merge
+    }
+    // Quadtree merge semantics: exactly the four sibling leaves of one real
+    // parent. No arbitrary-neighbor or partial-set merges.
+    if (parent->children.size() != 4) {
+        return MergeGate::NotFourChildren;
+    }
+    for (const auto& child : parent->children) {
+        if (!child->IsLeaf() || child->state != PartitionState::Leaf ||
+            !child->simulation_enabled) {
+            return MergeGate::ChildNotLeaf;
+        }
+    }
+    if (parent->group_low_since == std::chrono::steady_clock::time_point{} ||
+        now - parent->group_low_since < config.merge_sustained_low) {
+        return MergeGate::NotSustained;
+    }
+    if (now - parent->last_split_time < config.split_to_merge_cooldown) {
+        return MergeGate::SplitToMergeCooldown;
+    }
+    if (now - parent->last_merge_time < config.merge_cooldown) {
+        return MergeGate::MergeCooldown;
+    }
+    return MergeGate::Pass;
+}
+
+const char* ZoneScheduler::MergeGateName(MergeGate gate) noexcept
+{
+    switch (gate) {
+    case MergeGate::NoParent:
+        return "no-parent";
+    case MergeGate::Root:
+        return "root";
+    case MergeGate::NotFourChildren:
+        return "not-four-children";
+    case MergeGate::ChildNotLeaf:
+        return "child-not-leaf";
+    case MergeGate::NotSustained:
+        return "not-sustained";
+    case MergeGate::SplitToMergeCooldown:
+        return "split-cooldown";
+    case MergeGate::MergeCooldown:
+        return "merge-cooldown";
+    case MergeGate::Pass:
     default:
         return "pass";
     }
@@ -185,26 +266,6 @@ bool ZoneScheduler::ShouldSplit(const ZonePartition* leaf,
                                 std::chrono::steady_clock::time_point now) const
 {
     return EvaluateSplitGate(leaf, now) == SplitGate::Pass;
-}
-
-bool ZoneScheduler::ShouldMerge(const ZonePartition* leaf,
-                                std::chrono::steady_clock::time_point now) const
-{
-    if (leaf == nullptr || leaf->depth == 0 || !leaf->IsLeaf()) {
-        return false; // roots never merge
-    }
-    const ZonePartition* parent = leaf->parent;
-    if (parent == nullptr) {
-        return false;
-    }
-    // Whole sibling set must be cool; the monitor dedupes per parent.
-    for (const auto& sibling : parent->children) {
-        if (sibling->state != PartitionState::Leaf || !sibling->simulation_enabled ||
-            sibling->load_score >= config.merge_load_threshold) {
-            return false;
-        }
-    }
-    return now - parent->last_merge_time >= config.merge_cooldown;
 }
 
 void CollectZoneLoadMetrics(const ZoneManager& zones, std::vector<ZoneLoadMetrics>& out)

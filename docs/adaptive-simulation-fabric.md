@@ -619,7 +619,7 @@ Az előző commitból javított Fast/Exact semanticsra **tesztet kell írni**:
 | **B** | §3–6, §13–15, §34–37 | `ContinuousLoadField` váz: `LoadChannels`, dense cella-tár, két-időskálás EMA, decay, normalizáció, L0/L1 seam, Current/Predicted szétválasztás | ✅ **KÉSZ** (lásd §6) |
 | **C** | §7–12 | Térbeli work-attribúció a hívási pontokon: AI, movement, combat, AOI (candidate/cap), replication (byte + spawn/despawn + recipient), migration | ✅ **KÉSZ** (lásd §6.2) |
 | **D** | §16–17, §28, §30–33 | `PartitionLoadScore`, p95/p99 a control plane-en, strukturált döntési log, why-not diagnostics, `MinExpectedImprovement`, `TopologyComplexityPenalty` | ✅ **KÉSZ** (lásd §7) |
-| **E** | §18–24, §27 | BoundaryCost field, Partition Objective, hotspot detection (flood fill), hotspot-aware split, multi-candidate split, merge sustained-low timer | ✅ **KÉSZ** (split rész; merge seam, lásd §7.7) |
+| **E** | §18–24, §27 | BoundaryCost field, Partition Objective, hotspot detection (flood fill), hotspot-aware split, multi-candidate split, merge sustained-low timer | ✅ **KÉSZ** (split §7 + merge/stability §8) |
 | **F** | §1, §21, §29 | `worldbench --mode loadfield`, validator-bővítés, regresszió a meglévő 7 módra, control-loop frekvenciák konfigurálhatóvá tétele | ⚠ **RÉSZLEGES**: `--mode partitionscore` + selftest kész, regresszió zöld; a control-loop frekvencia config még nyitott |
 
 ### Chunk A — elvégzett munka
@@ -1068,3 +1068,219 @@ Minden kulcs opcionális; invalid érték warning + fallback
 - Control-loop frekvenciák configból (§29) — jelenleg 1 Hz fix.
 - Predicted load alapú pre-splitting (§37) — a storage seam kész.
 - Replication delta protokoll (a replication penalty továbbra is estimated).
+
+---
+
+## 8. Phase 3 — Adaptive Merge Scoring + Sustained-Low Merge + Stability Controller
+
+> Implementációs jegyzet. A megrendelői szöveg a §25-nél félbeszakadt
+> (*„Alapvetően vizsgáld meg:"*); az implementáció a §0–§24 követelményeit
+> követi, a §25 prioritást pedig explicit, determinisztikus szabályként
+> rögzíti (lásd §8.6). Az audit a `7caf3c8e` HEAD tényleges source-án készült.
+
+### 8.1 Audit — mi volt meg, mi hiányzott
+
+- **Megvolt és újrahasznosítva** (nem lett újraimplementálva): a teljes
+  tranzakciós merge executor (`PlanMerge` → `CreateStagedMergeTarget` →
+  transfer → validate → `CommitMerge`/`AbortMerge`), a sibling-set
+  validáció (`PlanMerge`), a merge cooldown (`ShouldMerge` /
+  `parent->last_merge_time`), a `field_low_since` leaf-seam, a
+  `PartitionScorer` split rétege, a `ZoneLoadMonitor` observe-lánc, a
+  `PartitionMetrics`, a validator és a bench.
+- **Hiányzott**: csoport-szintű sustained-low állapot, merge scoring
+  (predicted parent load, safety margin, benefit/penalty breakdown),
+  irányfüggő cooldownek, merge why-not, stability metrikák, oscillation
+  guard, moving-hotspot validáció.
+- **Eltérés a prompttól, dokumentálva**: a prompt merge candidate-je a
+  teljes quadtree sibling group — ez pontosan az, amit a meglévő executor
+  tud. A kontroller **pontosan 4 aktív leaf childot** követel meg
+  (`EvaluateMergeGate::NotFourChildren`), míg a `PlanMerge` history okból
+  2+ gyereket tolerál; a kontroller soha nem hívja 4 alatt. A prompt a
+  §25-nél megszakadt; a split-vs-merge prioritást explicit szabályként
+  implementáltam (§8.6).
+
+### 8.2 Architektúra — OBSERVE → SCORE → DECIDE → EXECUTE
+
+```
+ZoneLoadMonitor.Update        OBSERVE  (group sustained-low timer + gate-ek)
+        ↓
+PartitionScorer.ScoreMerge    SCORE    (read-only, stateless, determinisztikus)
+        ↓
+stability gates (cooldown, safety margin, min improvement)
+        ↓
+RunMergeTransaction           EXECUTE  (meglévő tranzakciós rendszer)
+```
+
+- A scorer **stateless és read-only maradt** (§23): a stabilitási állapot
+  (`group_low_since`, `last_split_time`, `last_merge_time`) a
+  partition node-okon él, és **inputként** kerül a `MergeScoreInput`-ba.
+  A `ScoreMerge` minden scratch-e lokális, így a supervisor mellett a
+  bench/admin is párhuzamosan olvashat.
+- Új/ módosított: `PartitionScoring` (merge scoring + breakdown +
+  döntés-formázás), `ZoneScheduler` (`EvaluateMergeGate`, irányfüggő
+  cooldownek, emergency bypass), `ZoneLoadMonitor` (csoport observe),
+  `ZonePartition` (`group_low_since` + `CollectInternalNodes`),
+  `ZoneManager` (állapot-reset a tree-mutációknál), `WorldRuntime`
+  (score-then-decide + metrikák), `PartitionMetrics`.
+
+### 8.3 Merge szemantika — egy geometria, egy executor
+
+- Merge candidate = egy **valódi quadtree parent** teljes sibling groupja
+  (NW/NE/SW/SE). Nincs arbitrary-neighbor, 2-way vagy irregular merge.
+- A discovery determinisztikus DFS a partition-erdőkön
+  (`CollectInternalNodes`, tree/child-vector sorrend) — `unordered_map`
+  iteráció soha nem dönt.
+- A belső cut vonalak a **tényleges child boundsból** származnak
+  (`NW.max_x`, `NW.min_y`), így az off-midpoint (hotspot-aware) splitek
+  után is pontosak.
+
+### 8.4 Sustained-low sibling group (§7-8)
+
+- Csoport-pontszám: `group_load_score = max(max(child.load_score),
+  parent_fast, parent_slow)`, ahol a parent aggregátum a **teljes parent
+  területre** újraszámolt `max(mean, peak)` a load field mindkét
+  idősíkján. Egyetlen hot child → az egész csoport ineligible.
+- A `group_low_since` timer explicit: start, ha a csoport a merge
+  threshold alatt van; **reset**, ha bármely child vagy az aggregátum
+  fölé megy. Nincs implicit lecsengés.
+- Default `merge_sustained_low_seconds = 90` ≈ 3.6× a load field slow
+  fall tau-ja (25 s): mire a csoport sustained-low lesz, a slow EMA
+  gyakorlatilag kiürítette a korábbi hotspotot. A bench rövidebb,
+  kompresszált ablakkal validálja a mechanizmust.
+- Value hysteresis: `merge_load_threshold` (0.25) jóval a
+  `split_load_threshold` (0.9) alatt; time hysteresis: split sustained
+  ~10 s vs. merge sustained ~90 s.
+
+### 8.5 Merge score modell (§12-18)
+
+```
+final_score =  w_mtopo * topology_benefit
+             + w_mbnd  * boundary_benefit      (activity + combat + hotspot)
+             + w_mmig  * migration_benefit     (mért migration churn)
+             + w_mrep  * replication_benefit   (estimated replication churn)
+             - w_mrisk * parent_load_risk      (predicted parent load, négyzetes)
+             - w_mexec * execution_penalty     (transfer-work becslés)
+             - w_minst * instability_penalty
+```
+
+- **predicted parent load**: a teljes parent területre újraszámolt
+  aggregátum mindkét idősíkon — NEM a child-score-ok átlaga (§12).
+- **Post-merge safety margin** (§13): a merge csak akkor mehet, ha
+  `predicted_parent_load <= split_load_threshold - margin` (default
+  0.15 → ceiling 0.75). Ez akadályozza meg a közvetlen visszasplittet.
+- **parent_load_risk**: `(predicted / ceiling)²` — közel nulla nyugodt
+  csoportnál, 1.0 a ceilingnél.
+- **topology_benefit**: dokumentált konstans (default 0.05, szimmetrikus
+  a split `topology_penalty`-jával): 3 kevesebb
+  directory/ghost/scheduler bejegyzés. Szándékosan kicsi — egy csendes,
+  churn nélküli csoport **nem** megy át a min-improvement gate-en.
+- **boundary/migration/replication benefit**: ugyanaz a band-mechanika,
+  mint a split penalty-nél (a belső cut vonalak körüli sáv); a
+  migration/replication **nincs** duplán számolva a boundary_benefitben.
+- **execution_penalty**: a jelenlegi populációból becsült transfer-work
+  (read-only, nincs próbamigráció, §15).
+- **Minimum merge improvement** (§18): default 0.10; alatta NOOP.
+- Minden tag [0,1], a score [-1,1], NaN/Inf-védett, config-driven.
+
+### 8.6 Stabilitás — cooldownek, prioritás, emergency (§19-25)
+
+- **split_to_merge_cooldown** (default 120 s): split után a csoport nem
+  merge-elhető; why-not: `MERGE_SUPPRESSED_RECENT_SPLIT`
+  (`detail=split-cooldown`).
+- **merge_to_split_cooldown** (default 90 s): merge után a leaf nem
+  splittelhető; why-not: `merge-cooldown`.
+- **merge_cooldown** (meglévő, merge→merge) változatlan.
+- **Explicit prioritás** (§25, a szöveg itt megszakadt): egy control
+  ciklusban **max 1 topológia-mutáció**, és a **split elsőbbséget élvez**
+  (aktív compute-nyomás), a merge csak akkor fut, ha nem történt split.
+  Determinisztikus, dokumentált.
+- **Emergency split bypass seam** (§21): a merge-to-split cooldown csak
+  **mért dual signal** esetén ugorható át — a split load-gate már
+  átment, ÉS a p99 tick ≥ `emergency_p99_multiplier` × budget (default
+  2.0). Config-kapcsoló (`emergency_split_bypass`), a bypassok
+  számolódnak (`split_emergency_bypasses`). Nincs magic threshold.
+- **Oscillation guard** (metrika): ha egy node-on split és merge
+  történik az `oscillation_window_s`-en belül, a
+  `oscillation_guard_trips` nő. A hard guard a cooldown; ez a metrika a
+  tuninghoz.
+
+### 8.7 Metrikák és why-not diagnostics
+
+- `PartitionMetrics` bővítés: `merge_candidates_evaluated`,
+  `merge_suppressed_{not_eligible,not_sustained,recent_split,recent_merge,
+  post_merge_unsafe,min_improvement,transaction}`,
+  `split_suppressed_merge_cooldown`, `split_emergency_bypasses`,
+  `oscillation_guard_trips`.
+- Strukturált döntési log: `MERGE parent=3 children=[4,5,6,7] score=0.056
+  predicted=0.09 peak=0.09 risk=0.069 topology=0.150 boundary=0.028
+  migration=0.002 repl=0.004 execution=0.008 instability=0.348
+  sustained_low=3s field_epoch=63`, illetve
+  `MERGE-NOOP parent=3 reason=merge-not-sustained detail=not-sustained
+  sustained_low=1s group_load=0.152`.
+- A split why-not `reason` mezője most pontos: `split-not-sustained`,
+  `split-cooldown`, `split-max-depth`, `split-min-size`,
+  `split-not-eligible` (a `detail` a konkrét gate-et nevezi).
+
+### 8.8 Mért eredmények
+
+**Pure selftest** (`--partitionscore-selftest`, 13 teszt): a 4 új merge
+teszt igazolja, hogy
+- egy hot child → `safety_ok=false` (peak 0.90 > ceiling 0.75), miközben
+  a whole-area mean 0.22 (nem child-átlag);
+- egy csendes, churn nélküli csoport score-ja 0.032 < 0.10 → NOOP
+  (konzervatív);
+- a belső cutokon mért migration churn (0.3/cella) esetén a score 0.116
+  ≥ 0.10 → merge (valódi, mért benefit);
+- determinizmus, config-validáció (threshold invariáns), döntés-formázás.
+
+**Élő szcenárió** (`--mode stability`, kompresszált smoothing/cooldown):
+- Phase A: két klaszter → split commit (split_commits=1).
+- Phase B: a klaszterek eltűnnek, 4 játékos a belső cutokon →
+  csoport sustained-low + valódi boundary benefit → **merge commit**
+  (score 0.056–0.12, predicted 0.07–0.09 < ceiling 0.35).
+- Phase C: hotspot közvetlenül a merge után → a split
+  **elnyomva** (`split_suppressed_merge_cooldown=9`, why-not
+  `merge-cooldown`), majd a cooldown lejárta után split commit.
+- Phase D: a hotspot átkerül egy másik childba → amíg hot, **nincs
+  merge**; lehűlés után újra merge. `oscillation_guard_trips=0`,
+  `emergency_bypass=0`.
+- Validátor minden fázis után zöld.
+
+### 8.9 Config (gameserver.conf.example)
+
+`partition_merge_sustained_low_seconds`,
+`partition_split_to_merge_cooldown_seconds`,
+`partition_merge_to_split_cooldown_seconds`,
+`partition_scoring_post_merge_safety_margin`,
+`partition_scoring_min_merge_improvement`,
+`partition_scoring_merge_topology_benefit`,
+`partition_scoring_weight_merge_{topology,boundary,migration,replication,
+risk,execution,instability}`,
+`partition_scoring_oscillation_window_seconds`,
+`partition_scoring_emergency_split_bypass`,
+`partition_scoring_emergency_p99_multiplier`.
+Minden kulcs opcionális; invalid érték warning + fallback, az effective
+set startupkor logolódik.
+
+### 8.10 Tesztelés
+
+| futtatás | eredmény |
+|---|---|
+| `--field-selftest` | 4/4 PASS |
+| `--loadfield-selftest` | 6/6 PASS |
+| `--partitionscore-selftest` | 13/13 PASS |
+| `--mode splitmerge` | 20/0, validations=3 |
+| `--mode lod` | 18/0, validations=6 |
+| `--mode activity` | 22/0, validations=7 |
+| `--mode loadfield` | 22 check + 3 audit, 0 failure |
+| `--mode partitionscore` | 21 check + 2 audit, 0 failure |
+| `--mode stability` | 25 check + 2 audit, 0 failure |
+| `--routing-selftest` | 5/5 PASS |
+
+### 8.11 Ami szándékosan kimaradt (következő fázis)
+
+- Merge predikció a `predicted` timescale-ből (§37) — a seam kész.
+- Emergency policy finomítása valódi terhelési mérésekből.
+- Control-loop frekvenciák configból (§29).
+- Nem-quadtree merge/elastic boundary — az API nem zárja ki, az executor
+  egyelőre quadtree-only.

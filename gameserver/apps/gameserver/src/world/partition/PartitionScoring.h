@@ -1,5 +1,6 @@
 #pragma once
 
+#include <array>
 #include <chrono>
 #include <cmath>
 #include <cstdint>
@@ -122,6 +123,44 @@ struct PartitionScoringConfig {
     bool decision_log_enabled = true;
     // Minimum seconds between why-not log lines for the same zone.
     float why_not_log_seconds = 10.0f;
+
+    // --- phase 3: adaptive merge / partition stability ----------------------
+
+    // Time hysteresis: a whole sibling group must stay below the merge
+    // threshold this long before it can merge (default 90s ~= 3.6x the load
+    // field's slow fall tau of 25s, so the slow EMA has essentially released
+    // any past hotspot; benchmarked, see docs §8).
+    float merge_sustained_low_s = 90.0f;
+    // Directional cooldowns (mirrored into the scheduler config).
+    float split_to_merge_cooldown_s = 120.0f;
+    float merge_to_split_cooldown_s = 90.0f;
+    // Post-merge safety margin: the predicted parent load must stay below
+    // `split_load_threshold - margin`, otherwise the merge would be a
+    // candidate for immediate re-splitting.
+    float post_merge_safety_margin = 0.15f;
+    float split_load_threshold = 0.9f; // mirror of the effective gate threshold
+    // Minimum expected improvement for a merge recommendation.
+    float min_merge_improvement = 0.10f;
+    // Documented topology benefit of collapsing four partitions into one
+    // (three fewer directory/ghost/scheduler entries). Symmetric with the
+    // split's topology_penalty; deliberately small -- a quiet group with no
+    // measurable boundary/migration churn should NOT clear the gate.
+    float merge_topology_benefit = 0.05f;
+    float weight_merge_topology = 1.0f;
+    float weight_merge_boundary = 0.35f;
+    float weight_merge_migration = 0.35f;
+    float weight_merge_replication = 0.20f;
+    float weight_merge_risk = 1.0f;
+    float weight_merge_execution = 0.15f;
+    float weight_merge_instability = 0.10f;
+    // Oscillation guard window: a split and a merge on the same node inside
+    // this window count as a reversal (diagnostic metric; the hard guards are
+    // the directional cooldowns).
+    float oscillation_window_s = 300.0f;
+    // Emergency split bypass (mirrored into the scheduler): measured dual
+    // signal may override the merge-to-split cooldown. Off = never bypass.
+    bool emergency_split_bypass = true;
+    float emergency_p99_multiplier = 2.0f;
 };
 
 struct ValidatedPartitionScoringConfig {
@@ -201,6 +240,54 @@ inline ValidatedPartitionScoringConfig ValidatePartitionScoringConfig(
         warn("why_not_log_seconds must be finite and >= 0, using 10");
         out.effective.why_not_log_seconds = 10.0f;
     }
+
+    // --- phase 3 merge/stability config -------------------------------------
+    auto check_seconds = [&](float& seconds, const char* name, float fallback) {
+        if (!non_negative(seconds)) {
+            warn((std::string(name) + " must be finite and >= 0, using " +
+                  std::to_string(static_cast<int>(fallback)))
+                     .c_str());
+            seconds = fallback;
+        }
+    };
+    check_seconds(out.effective.merge_sustained_low_s, "merge_sustained_low_s", 90.0f);
+    check_seconds(out.effective.split_to_merge_cooldown_s, "split_to_merge_cooldown_s", 120.0f);
+    check_seconds(out.effective.merge_to_split_cooldown_s, "merge_to_split_cooldown_s", 90.0f);
+    check_seconds(out.effective.oscillation_window_s, "oscillation_window_s", 300.0f);
+    if (!finite(out.effective.post_merge_safety_margin) ||
+        out.effective.post_merge_safety_margin < 0.0f) {
+        warn("post_merge_safety_margin must be finite and >= 0, using 0.15");
+        out.effective.post_merge_safety_margin = 0.15f;
+    }
+    if (!finite(out.effective.split_load_threshold) ||
+        out.effective.split_load_threshold <= 0.0f) {
+        warn("split_load_threshold must be finite and > 0, using 0.9");
+        out.effective.split_load_threshold = 0.9f;
+    }
+    // Threshold invariant (§9): the post-merge ceiling must stay strictly
+    // above the merge threshold, otherwise merging would be self-defeating.
+    if (out.effective.post_merge_safety_margin >= out.effective.split_load_threshold) {
+        warn("post_merge_safety_margin >= split_load_threshold, clamping to half");
+        out.effective.post_merge_safety_margin = out.effective.split_load_threshold * 0.5f;
+    }
+    if (!finite(out.effective.min_merge_improvement) ||
+        out.effective.min_merge_improvement < 0.0f ||
+        out.effective.min_merge_improvement > 1.0f) {
+        warn("min_merge_improvement outside [0,1], using 0.10");
+        out.effective.min_merge_improvement = 0.10f;
+    }
+    check_weight(out.effective.merge_topology_benefit, "merge_topology_benefit");
+    check_weight(out.effective.weight_merge_topology, "weight_merge_topology");
+    check_weight(out.effective.weight_merge_boundary, "weight_merge_boundary");
+    check_weight(out.effective.weight_merge_migration, "weight_merge_migration");
+    check_weight(out.effective.weight_merge_replication, "weight_merge_replication");
+    check_weight(out.effective.weight_merge_risk, "weight_merge_risk");
+    check_weight(out.effective.weight_merge_execution, "weight_merge_execution");
+    check_weight(out.effective.weight_merge_instability, "weight_merge_instability");
+    if (!positive(out.effective.emergency_p99_multiplier)) {
+        warn("emergency_p99_multiplier must be finite and > 0, using 2.0");
+        out.effective.emergency_p99_multiplier = 2.0f;
+    }
     return out;
 }
 
@@ -270,22 +357,117 @@ struct SplitRecommendation {
     float expected_improvement = 0.0f; // == best.final_score
 };
 
-// Why a zone that is overloaded did NOT split (structured, for tuning §31).
+// --- merge scoring (phase 3) ------------------------------------------------
+
+// Everything the merge scorer needs, filled by the caller (WorldRuntime /
+// monitor) so the scorer stays pure. One merge candidate = one real quadtree
+// parent with its four sibling leaves.
+struct MergeScoreInput {
+    ZoneId parent_id = 0;
+    mx::map::Rect parent_bounds{};
+    std::array<mx::map::Rect, 4> child_bounds{};
+    std::array<ZoneId, 4> child_ids{};
+    std::uint8_t parent_depth = 0;
+    std::uint64_t players = 0; // summed over the four children
+    std::uint64_t mobs = 0;
+    // Stability context (controller-owned, passed in; the scorer keeps no
+    // hidden history).
+    std::chrono::steady_clock::time_point last_split{};
+    std::chrono::steady_clock::time_point last_merge{};
+    float sustained_low_seconds = 0.0f;
+    // Max combined load score over the four children at decision time
+    // (monitor-observed, includes the legacy tick/resident component).
+    float max_child_load_score = 0.0f;
+};
+
+struct MergeCandidateScore {
+    bool valid = false;
+    bool safety_ok = false; // predicted parent load below the safety ceiling
+    ZoneId parent_id = 0;
+    std::array<ZoneId, 4> child_ids{};
+
+    // Predicted parent workload over the WHOLE parent area (never an average
+    // of child scores): recomputed from the field under the parent bounds.
+    LoadChannels predicted_channels; // summed raw channels
+    float predicted_composite_sum = 0.0f;
+    float predicted_parent_mean = 0.0f;
+    float predicted_parent_peak = 0.0f;
+    float predicted_parent_load = 0.0f; // conservative max(fast, slow) score
+    float max_child_load_score = 0.0f;
+    float safety_ceiling = 0.0f;
+    float sustained_low_seconds = 0.0f;
+
+    // Benefits (all [0,1]).
+    float topology_benefit = 0.0f;
+    float boundary_benefit = 0.0f;
+    float migration_benefit = 0.0f;
+    float replication_benefit = 0.0f;
+
+    // Risks / costs (all [0,1]).
+    float parent_load_risk = 0.0f;
+    float execution_penalty = 0.0f;
+    float instability_penalty = 0.0f;
+
+    float final_score = 0.0f; // expected improvement over NOOP, [-1,1]
+
+    // Band evidence on the internal cut lines (the removed boundaries).
+    float activity_band = 0.0f;
+    float migration_band = 0.0f;
+    float combat_band = 0.0f;
+    float replication_band = 0.0f;
+    float hotspot_internal_frac = 0.0f;
+    std::uint32_t internal_hotspots = 0;
+};
+
+struct MergeRecommendation {
+    bool valid = false;
+    ZoneId parent_id = 0;
+    std::uint64_t field_epoch = 0;
+    std::uint64_t activity_epoch = 0;
+    std::chrono::steady_clock::time_point timestamp{};
+    MergeCandidateScore best{};
+    float expected_improvement = 0.0f;
+};
+
+// Why a zone that is overloaded did NOT split / a group did NOT merge
+// (structured, for tuning §31 and phase-3 why-not diagnostics).
 enum class PartitionNoopReason : std::uint8_t {
     None = 0,
     NoField,            // load field unavailable/disabled
     NoValidCut,         // geometry cannot host any candidate
     BelowMinImprovement,// scored, but the gate rejected every candidate
     TransactionRejected,// executor refused after scoring (staging/plan)
+    // Split gate why-not (the `detail` literal names the exact gate):
+    SplitNotSustained,
+    SplitCooldown,     // split cooldown or merge-to-split cooldown
+    SplitMaxDepth,
+    SplitNotEligible,  // not a leaf / commands pending / below threshold
+    SplitMinSize,      // plan rejected: geometry below the zone floor
+    // Merge-specific:
+    MergeNotEligible,      // not a 4-leaf quadtree group / child not active
+    MergeNotSustained,     // group sustained-low window not matured
+    MergeRecentSplit,      // split-to-merge cooldown
+    MergeRecentMerge,      // merge-to-merge cooldown
+    MergeUnsafePostMerge,  // predicted parent load above the safety ceiling
+    MergeBelowMinImprovement,
+    MergeTransactionRejected,
 };
 
 const char* PartitionNoopReasonName(PartitionNoopReason reason) noexcept;
 
+enum class PartitionDecisionKind : std::uint8_t {
+    Split = 0,
+    Merge = 1,
+};
+
+const char* PartitionDecisionKindName(PartitionDecisionKind kind) noexcept;
+
 // Structured decision record (§30-31). Stored in a bounded in-memory log;
 // logged as one line only at topology decisions / rate-limited why-not.
 struct PartitionDecisionRecord {
+    PartitionDecisionKind kind = PartitionDecisionKind::Split;
     std::chrono::steady_clock::time_point timestamp{};
-    ZoneId zone_id = 0;
+    ZoneId zone_id = 0; // split: leaf zone; merge: parent node id
     bool executed = false;
     bool scored = false;
     PartitionNoopReason noop_reason = PartitionNoopReason::None;
@@ -297,6 +479,7 @@ struct PartitionDecisionRecord {
     std::uint64_t field_epoch = 0;
     float expected_improvement = 0.0f;
     SplitCandidateScore candidate{};
+    MergeCandidateScore merge_candidate{};
 };
 
 std::string FormatPartitionDecision(const PartitionDecisionRecord& record);
@@ -331,6 +514,15 @@ public:
     // benchmarks, admin) can score while the supervisor scores -- as long as
     // they pass immutable generations. No shared mutable state.
     SplitRecommendation ScoreSplit(const PartitionScoreInput& input,
+                                   const LoadGrid* field,
+                                   const ActivityGrid* activity,
+                                   std::chrono::steady_clock::time_point now) const;
+
+    // Merge scoring for one real quadtree sibling group. Same guarantees:
+    // read-only, stateless, deterministic for identical inputs. The result
+    // carries the full breakdown (predicted parent load, benefits, risks)
+    // plus the safety verdict; the controller applies the gates.
+    MergeRecommendation ScoreMerge(const MergeScoreInput& input,
                                    const LoadGrid* field,
                                    const ActivityGrid* activity,
                                    std::chrono::steady_clock::time_point now) const;

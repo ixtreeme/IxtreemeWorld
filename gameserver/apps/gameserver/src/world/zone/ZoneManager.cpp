@@ -339,6 +339,11 @@ bool ZoneManager::CommitSplit(ZoneId parent_id, const std::vector<ZoneId>& child
     leaf->state = PartitionState::Retired;
     leaf->simulation_enabled = false;
     leaf->last_split_time = now;
+    // The node just became a GROUP: its leaf-level sustained-low state is
+    // stale and its group timer starts from scratch (phase-3 stability).
+    leaf->sustained_breach_since = {};
+    leaf->field_low_since = {};
+    leaf->group_low_since = {};
 
     for (const ZoneId child_id : child_ids) {
         Zone& child = *zones_[FindIndexById(child_id)];
@@ -522,6 +527,11 @@ bool ZoneManager::CommitMerge(const MergePlan& plan, ZoneId merged_id)
     parent->state = PartitionState::Leaf;
     parent->simulation_enabled = true;
     parent->last_merge_time = std::chrono::steady_clock::now();
+    // The node is a leaf again: group state is meaningless, and the stale
+    // leaf timers must not leak into the merged zone's future split gate.
+    parent->group_low_since = {};
+    parent->field_low_since = {};
+    parent->sustained_breach_since = {};
 
     merged.SetPartition(PartitionState::Leaf);
     merged.SetSimulationEnabled(true);
@@ -555,6 +565,14 @@ void ZoneManager::AbortMerge(const MergePlan& plan, ZoneId merged_id)
         merged.SetPartition(PartitionState::Retired);
         merged.SetSimulationEnabled(false);
         merged.RefreshResidentCounts();
+    }
+    // A failed merge attempt resets the group's sustained-low timer: the
+    // conservative direction is to re-earn the merge eligibility.
+    for (const auto& root : partition_roots_) {
+        if (ZonePartition* parent = FindPartitionNode(root.get(), plan.parent_node_id)) {
+            parent->group_low_since = {};
+            break;
+        }
     }
     graph_.Rebuild(zones_);
 }

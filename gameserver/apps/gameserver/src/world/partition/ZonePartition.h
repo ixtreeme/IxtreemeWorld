@@ -34,11 +34,16 @@ struct ZonePartition {
     float p95_tick_us = 0.0f;
     float p99_tick_us = 0.0f;
     std::chrono::steady_clock::time_point sustained_breach_since{};
-    // Merge sustained-low seam: how long the combined score has been below
-    // the merge threshold. Recorded (diagnostics) but not yet gating; the
-    // existing merge predicate stays in charge until split scoring is
-    // validated (phase-2 mandate: do not overcomplicate merge).
+    // Leaf-level sustained-low state: how long this leaf's combined score has
+    // stayed below the merge threshold (written by ZoneLoadMonitor).
     std::chrono::steady_clock::time_point field_low_since{};
+    // Sibling-GROUP sustained-low state (internal nodes only): how long the
+    // whole group -- every child AND the parent-area aggregate on both the
+    // fast and slow field timescales -- has stayed below the merge threshold.
+    // One low child is never enough (phase-3 §8): the timer resets when any
+    // child or the aggregate rises. Written by ZoneLoadMonitor, read by
+    // ZoneScheduler::EvaluateMergeGate.
+    std::chrono::steady_clock::time_point group_low_since{};
     std::chrono::steady_clock::time_point last_split_time{};
     std::chrono::steady_clock::time_point last_merge_time{};
     bool simulation_enabled = true;
@@ -158,6 +163,20 @@ inline void CollectActiveLeaves(ZonePartition* root, std::vector<ZonePartition*>
     }
     for (auto& child : root->children) {
         CollectActiveLeaves(child.get(), out);
+    }
+}
+
+// Deterministic depth-first enumeration of every INTERNAL node (potential
+// merge parent). Order is tree/child-vector order -- never hash order -- so
+// the merge candidate list is reproducible for identical trees.
+inline void CollectInternalNodes(ZonePartition* root, std::vector<ZonePartition*>& out)
+{
+    if (root == nullptr || root->IsLeaf()) {
+        return;
+    }
+    out.push_back(root);
+    for (auto& child : root->children) {
+        CollectInternalNodes(child.get(), out);
     }
 }
 

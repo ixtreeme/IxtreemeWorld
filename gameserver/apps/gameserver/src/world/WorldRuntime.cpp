@@ -815,8 +815,10 @@ void WorldRuntime::ExecutePartitionControl()
     const PartitionScoringConfig& scoring = scorer_.GetConfig();
 
     // SCORE + DECIDE: at most one topology mutation per control cycle. The
-    // scorer only recommends; RunSplitTransaction is the existing
-    // transactional executor and re-validates every gate.
+    // scorer only recommends; the transactional executors re-validate every
+    // gate. Explicit deterministic priority (§25): a split is an active
+    // compute pressure and always goes first; a merge is an optimization and
+    // only runs when no split executed.
     bool mutated = false;
     for (const ZoneId zone_id : load_monitor_.SplitCandidates()) {
         const SplitRecommendation recommendation =
@@ -829,6 +831,20 @@ void WorldRuntime::ExecutePartitionControl()
             }
             return 0.0f;
         }();
+        // Emergency bypass accounting: the gate already passed, so
+        // re-evaluating it only tells us whether the merge-to-split cooldown
+        // was overridden by the measured signal.
+        {
+            const ZonePartition* leaf = FindZoneNode(zone_id);
+            bool emergency = false;
+            if (leaf != nullptr) {
+                (void)scheduler_.EvaluateSplitGate(leaf, now, &emergency);
+            }
+            if (emergency) {
+                partition_metrics_.split_emergency_bypasses.fetch_add(1,
+                                                                      std::memory_order_relaxed);
+            }
+        }
         if (recommendation.valid &&
             recommendation.best.final_score >= scoring.min_expected_improvement) {
             const bool committed =
@@ -854,6 +870,7 @@ void WorldRuntime::ExecutePartitionControl()
             RecordPartitionDecision(std::move(record), committed, false);
             if (committed) {
                 mutated = true;
+                NoteOscillationIfAny(FindZoneNode(zone_id), true, now);
             }
         } else {
             PartitionDecisionRecord record;
@@ -908,6 +925,10 @@ void WorldRuntime::ExecutePartitionControl()
                 }
             }
             const auto gate = scheduler_.EvaluateSplitGate(leaf, now);
+            if (gate == ZoneScheduler::SplitGate::MergeToSplitCooldown) {
+                partition_metrics_.split_suppressed_merge_cooldown.fetch_add(
+                    1, std::memory_order_relaxed);
+            }
             SplitRejectReason plan_reason = SplitRejectReason::None;
             ZoneManager::SplitPlan plan;
             (void)zones_.PlanSplit(zone_id, plan, &plan_reason);
@@ -915,7 +936,28 @@ void WorldRuntime::ExecutePartitionControl()
             record.timestamp = now;
             record.zone_id = zone_id;
             record.scored = false;
-            record.noop_reason = PartitionNoopReason::NoValidCut;
+            // The structured reason names the class of blocker; the detail
+            // literal names the exact gate.
+            switch (gate) {
+            case ZoneScheduler::SplitGate::NotSustained:
+                record.noop_reason = PartitionNoopReason::SplitNotSustained;
+                break;
+            case ZoneScheduler::SplitGate::Cooldown:
+            case ZoneScheduler::SplitGate::MergeToSplitCooldown:
+                record.noop_reason = PartitionNoopReason::SplitCooldown;
+                break;
+            case ZoneScheduler::SplitGate::MaxDepth:
+                record.noop_reason = PartitionNoopReason::SplitMaxDepth;
+                break;
+            case ZoneScheduler::SplitGate::NotLeaf:
+            case ZoneScheduler::SplitGate::BelowThreshold:
+            case ZoneScheduler::SplitGate::Pass:
+            default:
+                record.noop_reason = plan_reason == SplitRejectReason::TooSmall
+                                         ? PartitionNoopReason::SplitMinSize
+                                         : PartitionNoopReason::SplitNotEligible;
+                break;
+            }
             record.detail = gate != ZoneScheduler::SplitGate::Pass
                                 ? ZoneScheduler::SplitGateName(gate)
                                 : SplitRejectReasonName(plan_reason);
@@ -933,10 +975,98 @@ void WorldRuntime::ExecutePartitionControl()
         }
     }
 
+    // ---- MERGE: only when no split executed (explicit priority above) ----
     if (!mutated) {
+        // Gate-state counters for every observed group (deterministic tree
+        // order). These make the stability controller tunable: the report
+        // shows WHY the tree is not simplifying.
+        for (const auto& group : load_monitor_.MergeGroups()) {
+            switch (group.gate) {
+            case ZoneScheduler::MergeGate::NotSustained:
+                if (group.sustained_low_seconds > 0.0f) {
+                    partition_metrics_.merge_suppressed_not_sustained.fetch_add(
+                        1, std::memory_order_relaxed);
+                }
+                break;
+            case ZoneScheduler::MergeGate::SplitToMergeCooldown:
+                partition_metrics_.merge_suppressed_recent_split.fetch_add(
+                    1, std::memory_order_relaxed);
+                break;
+            case ZoneScheduler::MergeGate::MergeCooldown:
+                partition_metrics_.merge_suppressed_recent_merge.fetch_add(
+                    1, std::memory_order_relaxed);
+                break;
+            case ZoneScheduler::MergeGate::Root:
+            case ZoneScheduler::MergeGate::NoParent:
+            case ZoneScheduler::MergeGate::NotFourChildren:
+            case ZoneScheduler::MergeGate::ChildNotLeaf:
+                partition_metrics_.merge_suppressed_not_eligible.fetch_add(
+                    1, std::memory_order_relaxed);
+                break;
+            case ZoneScheduler::MergeGate::Pass:
+            default:
+                break;
+            }
+        }
+
+        // SCORE every gate-passing group; the best recommendation wins
+        // deterministically (higher score, then earlier tree order).
+        MergeRecommendation best;
+        bool have_best = false;
         for (const ZoneId parent_id : load_monitor_.MergeCandidates()) {
-            RunMergeTransaction(parent_id, false);
-            break;
+            const MergeRecommendation recommendation =
+                ScoreMergeWith(parent_id, field, activity, now);
+            partition_metrics_.merge_candidates_evaluated.fetch_add(1,
+                                                                    std::memory_order_relaxed);
+            if (!recommendation.valid) {
+                partition_metrics_.merge_suppressed_not_eligible.fetch_add(
+                    1, std::memory_order_relaxed);
+                continue;
+            }
+            if (!recommendation.best.safety_ok) {
+                partition_metrics_.merge_suppressed_post_merge_unsafe.fetch_add(
+                    1, std::memory_order_relaxed);
+                RecordMergeDecision(recommendation, PartitionNoopReason::MergeUnsafePostMerge,
+                                    "post-merge-unsafe", false, now);
+                continue;
+            }
+            if (recommendation.best.final_score < scoring.min_merge_improvement) {
+                partition_metrics_.merge_suppressed_min_improvement.fetch_add(
+                    1, std::memory_order_relaxed);
+                RecordMergeDecision(recommendation, PartitionNoopReason::MergeBelowMinImprovement,
+                                    "below-min-improvement", false, now);
+                continue;
+            }
+            if (!have_best || recommendation.best.final_score > best.best.final_score) {
+                best = recommendation;
+                have_best = true;
+            }
+        }
+        if (have_best) {
+            const bool committed = RunMergeTransaction(best.parent_id, false);
+            if (!committed) {
+                partition_metrics_.merge_suppressed_transaction.fetch_add(
+                    1, std::memory_order_relaxed);
+            }
+            RecordMergeDecision(best,
+                                committed ? PartitionNoopReason::None
+                                          : PartitionNoopReason::MergeTransactionRejected,
+                                committed ? "executed" : "transaction-rejected", committed, now);
+            if (committed) {
+                mutated = true;
+                NoteOscillationIfAny(FindZoneNode(best.parent_id), false, now);
+            }
+        } else {
+            // Why-not: the first group that is in the merge funnel (low load,
+            // timer running, gate not yet passed) gets one rate-limited
+            // structured record so the controller is not opaque.
+            for (const auto& group : load_monitor_.MergeGroups()) {
+                if (group.candidate || group.sustained_low_seconds <= 0.0f) {
+                    continue;
+                }
+                RecordMergeGateNoop(group, now);
+                break;
+            }
         }
     }
 }
@@ -976,6 +1106,156 @@ SplitRecommendation WorldRuntime::ScorePartition(ZoneId zone_id) const
 {
     return ScorePartitionWith(zone_id, load_field_.Snapshot(), activity_field_.Snapshot(),
                               std::chrono::steady_clock::now());
+}
+
+const ZonePartition* WorldRuntime::FindZoneNode(ZoneId zone_id) const
+{
+    for (const auto& root : zones_.PartitionRoots()) {
+        if (const auto* found = FindPartitionNode(root.get(), zone_id)) {
+            return found;
+        }
+    }
+    return nullptr;
+}
+
+MergeRecommendation WorldRuntime::ScoreMergeWith(
+    ZoneId parent_id,
+    const std::shared_ptr<const LoadGrid>& field,
+    const std::shared_ptr<const ActivityGrid>& activity,
+    std::chrono::steady_clock::time_point now) const
+{
+    const ZonePartition* parent = FindZoneNode(parent_id);
+    if (parent == nullptr || parent->children.size() != 4) {
+        return MergeRecommendation{};
+    }
+    MergeScoreInput input;
+    input.parent_id = parent_id;
+    input.parent_bounds = parent->bounds;
+    input.parent_depth = parent->depth;
+    input.last_split = parent->last_split_time;
+    input.last_merge = parent->last_merge_time;
+    if (parent->group_low_since != std::chrono::steady_clock::time_point{}) {
+        input.sustained_low_seconds =
+            std::chrono::duration<float>(now - parent->group_low_since).count();
+    }
+    float max_child_load = 0.0f;
+    for (std::size_t i = 0; i < parent->children.size(); ++i) {
+        const ZonePartition* child = parent->children[i].get();
+        input.child_ids[i] = child->zone_id;
+        input.child_bounds[i] = child->bounds;
+        max_child_load = std::max(max_child_load, child->load_score);
+        const std::size_t zone_index = zones_.FindIndexById(child->zone_id);
+        if (zone_index < zones_.ZoneCount()) {
+            const auto& diag = zones_.GetZone(zone_index).Diagnostics();
+            input.players += diag.player_count.load(std::memory_order_relaxed);
+            input.mobs += diag.mob_count.load(std::memory_order_relaxed);
+        }
+    }
+    input.max_child_load_score = max_child_load;
+    MergeRecommendation recommendation =
+        scorer_.ScoreMerge(input, field.get(), activity.get(), now);
+    recommendation.activity_epoch = activity != nullptr ? activity->epoch : 0;
+    return recommendation;
+}
+
+MergeRecommendation WorldRuntime::ScoreMerge(ZoneId parent_id) const
+{
+    return ScoreMergeWith(parent_id, load_field_.Snapshot(), activity_field_.Snapshot(),
+                          std::chrono::steady_clock::now());
+}
+
+void WorldRuntime::RecordMergeDecision(const MergeRecommendation& recommendation,
+                                       PartitionNoopReason reason,
+                                       const char* detail,
+                                       bool executed,
+                                       std::chrono::steady_clock::time_point now)
+{
+    PartitionDecisionRecord record;
+    record.kind = PartitionDecisionKind::Merge;
+    record.timestamp = now;
+    record.zone_id = recommendation.parent_id;
+    record.executed = executed;
+    record.scored = true;
+    record.noop_reason = reason;
+    record.detail = detail != nullptr ? detail : "";
+    record.field_epoch = recommendation.field_epoch;
+    record.expected_improvement = recommendation.expected_improvement;
+    record.merge_candidate = recommendation.best;
+    // The parent has no single tick: report the worst child signal so the
+    // record still carries a comparable pressure reading.
+    float max_p99 = 0.0f;
+    float max_load = 0.0f;
+    float max_field = 0.0f;
+    for (const ZoneId child_id : recommendation.best.child_ids) {
+        for (const auto& snap : load_monitor_.RecentSnapshots()) {
+            if (snap.zone_id == child_id) {
+                max_p99 = std::max(max_p99, snap.p99_tick_us / 1000.0f);
+                max_load = std::max(max_load, snap.load_score);
+                max_field = std::max(max_field, snap.field_load_score);
+                break;
+            }
+        }
+    }
+    record.p99_tick_ms = max_p99;
+    record.load_score = max_load;
+    record.field_load_score = max_field;
+    RecordPartitionDecision(std::move(record), executed, !executed);
+}
+
+void WorldRuntime::RecordMergeGateNoop(const MergeGroupSnapshot& group,
+                                       std::chrono::steady_clock::time_point now)
+{
+    PartitionDecisionRecord record;
+    record.kind = PartitionDecisionKind::Merge;
+    record.timestamp = now;
+    record.zone_id = group.parent_id;
+    record.scored = false;
+    record.detail = ZoneScheduler::MergeGateName(group.gate);
+    record.merge_candidate.parent_id = group.parent_id;
+    record.merge_candidate.child_ids = group.child_ids;
+    record.merge_candidate.sustained_low_seconds = group.sustained_low_seconds;
+    record.merge_candidate.predicted_parent_load = group.group_load_score;
+    switch (group.gate) {
+    case ZoneScheduler::MergeGate::SplitToMergeCooldown:
+        record.noop_reason = PartitionNoopReason::MergeRecentSplit;
+        break;
+    case ZoneScheduler::MergeGate::MergeCooldown:
+        record.noop_reason = PartitionNoopReason::MergeRecentMerge;
+        break;
+    case ZoneScheduler::MergeGate::NotSustained:
+        record.noop_reason = PartitionNoopReason::MergeNotSustained;
+        break;
+    default:
+        record.noop_reason = PartitionNoopReason::MergeNotEligible;
+        break;
+    }
+    RecordPartitionDecision(std::move(record), false, true);
+}
+
+void WorldRuntime::NoteOscillationIfAny(const ZonePartition* node,
+                                        bool split_committed,
+                                        std::chrono::steady_clock::time_point now)
+{
+    if (node == nullptr) {
+        return;
+    }
+    const float window_s = scorer_.GetConfig().oscillation_window_s;
+    if (!(window_s > 0.0f)) {
+        return;
+    }
+    const auto window = std::chrono::duration_cast<std::chrono::steady_clock::duration>(
+        std::chrono::duration<float>(window_s));
+    if (split_committed) {
+        if (node->last_merge_time != std::chrono::steady_clock::time_point{} &&
+            now - node->last_merge_time < window) {
+            partition_metrics_.oscillation_guard_trips.fetch_add(1, std::memory_order_relaxed);
+        }
+    } else {
+        if (node->last_split_time != std::chrono::steady_clock::time_point{} &&
+            now - node->last_split_time < window) {
+            partition_metrics_.oscillation_guard_trips.fetch_add(1, std::memory_order_relaxed);
+        }
+    }
 }
 
 void WorldRuntime::RecordPartitionDecision(PartitionDecisionRecord record,
@@ -1545,6 +1825,7 @@ void WorldRuntime::ConfigurePartition(const PartitionConfig& config)
     // The geometric floor mirrors the effective (validated) partition floor.
     PartitionScoringConfig scoring = e.scoring;
     scoring.min_zone_size_m = e.min_zone_size_m;
+    scoring.split_load_threshold = e.split_load_threshold; // post-merge ceiling mirror
     scorer_.SetConfig(scoring);
 
     scheduler_.config.split_load_threshold = e.split_load_threshold;
@@ -1553,6 +1834,17 @@ void WorldRuntime::ConfigurePartition(const PartitionConfig& config)
     scheduler_.config.split_cooldown = std::chrono::seconds(e.split_cooldown_seconds);
     scheduler_.config.merge_cooldown = std::chrono::seconds(e.merge_cooldown_seconds);
     scheduler_.config.max_depth = static_cast<std::uint8_t>(e.max_partition_depth);
+    // Phase-3 stability: directional cooldowns, group sustained-low window and
+    // the measured emergency bypass seam.
+    scheduler_.config.split_to_merge_cooldown =
+        std::chrono::seconds(static_cast<int>(e.scoring.split_to_merge_cooldown_s));
+    scheduler_.config.merge_to_split_cooldown =
+        std::chrono::seconds(static_cast<int>(e.scoring.merge_to_split_cooldown_s));
+    scheduler_.config.merge_sustained_low =
+        std::chrono::seconds(static_cast<int>(e.scoring.merge_sustained_low_s));
+    scheduler_.config.emergency_split_bypass = e.scoring.emergency_split_bypass;
+    scheduler_.config.emergency_p99_multiplier = e.scoring.emergency_p99_multiplier;
+    scheduler_.config.tick_budget_ms = e.tick_budget_ms;
 
     zones_.ApplyRegionLimits(e.max_partition_depth, e.min_zone_size_m);
     effective_partition_config_ = e;
@@ -1591,6 +1883,27 @@ void WorldRuntime::ConfigurePartition(const PartitionConfig& config)
              LoadTimescaleName(s.decision_timescale),
              s.decision_log_enabled ? "on" : "off",
              s.why_not_log_seconds);
+    LOG_INFO("partition stability effective: merge_sustained_low={:.0f}s split_to_merge={:.0f}s "
+             "merge_to_split={:.0f}s safety_margin={:.2f} min_merge_improvement={:.2f} "
+             "merge_weights=[topo={:.2f} bnd={:.2f} mig={:.2f} rep={:.2f} risk={:.2f} exec={:.2f} "
+             "inst={:.2f}] topology_benefit={:.2f} emergency=[bypass={} p99x{:.1f}] "
+             "oscillation_window={:.0f}s",
+             s.merge_sustained_low_s,
+             s.split_to_merge_cooldown_s,
+             s.merge_to_split_cooldown_s,
+             s.post_merge_safety_margin,
+             s.min_merge_improvement,
+             s.weight_merge_topology,
+             s.weight_merge_boundary,
+             s.weight_merge_migration,
+             s.weight_merge_replication,
+             s.weight_merge_risk,
+             s.weight_merge_execution,
+             s.weight_merge_instability,
+             s.merge_topology_benefit,
+             s.emergency_split_bypass ? "on" : "off",
+             s.emergency_p99_multiplier,
+             s.oscillation_window_s);
 }
 
 void WorldRuntime::ConfigureSimulationLod(const LodConfig& config)

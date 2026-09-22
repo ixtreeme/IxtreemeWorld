@@ -234,8 +234,11 @@ public:
     // result as a near-supervisor-cycle approximation (the supervisor path
     // itself is exact).
     SplitRecommendation ScorePartition(ZoneId zone_id) const;
-    // Structured decision log (bounded, newest last). Contains both executed
-    // splits and rate-limited why-not records.
+    // Adaptive merge scoring for one real quadtree sibling group (parent node
+    // id). Read-only, deterministic, never mutates topology.
+    MergeRecommendation ScoreMerge(ZoneId parent_id) const;
+    // Structured decision log (bounded, newest last). Contains executed
+    // splits/merges and rate-limited why-not records.
     std::vector<PartitionDecisionRecord> PartitionDecisionLog() const;
 
     // Applies a (validated, clamped) partition configuration: monitor +
@@ -304,9 +307,29 @@ private:
                                            const std::shared_ptr<const LoadGrid>& field,
                                            const std::shared_ptr<const ActivityGrid>& activity,
                                            std::chrono::steady_clock::time_point now) const;
+    MergeRecommendation ScoreMergeWith(ZoneId parent_id,
+                                       const std::shared_ptr<const LoadGrid>& field,
+                                       const std::shared_ptr<const ActivityGrid>& activity,
+                                       std::chrono::steady_clock::time_point now) const;
+    // Partition-tree node lookup (leaf or internal); null when absent.
+    const ZonePartition* FindZoneNode(ZoneId zone_id) const;
     // Appends one decision record (bounded) and logs it as one line when the
     // decision log is enabled; why-not lines are rate-limited per zone.
     void RecordPartitionDecision(PartitionDecisionRecord record, bool executed, bool why_not);
+    // Merge-specific record builders (structured breakdown preserved).
+    void RecordMergeDecision(const MergeRecommendation& recommendation,
+                             PartitionNoopReason reason,
+                             const char* detail,
+                             bool executed,
+                             std::chrono::steady_clock::time_point now);
+    void RecordMergeGateNoop(const MergeGroupSnapshot& group,
+                             std::chrono::steady_clock::time_point now);
+    // Stability: counts a reversal when a mutation commits while the
+    // opposite-direction mutation on the same node is inside the oscillation
+    // window (diagnostic; directional cooldowns are the hard guards).
+    void NoteOscillationIfAny(const ZonePartition* node,
+                              bool split_committed,
+                              std::chrono::steady_clock::time_point now);
     // Moves one resident (player or mob) between two LOCAL zones reusing the
     // migration authority-transfer primitive (snapshot -> apply -> release).
     // Acquires both zones' write guards in index order (same convention as

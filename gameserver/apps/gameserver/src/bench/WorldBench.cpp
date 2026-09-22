@@ -109,7 +109,7 @@ bool ParseArgs(int argc, char** argv, BenchConfig& config)
         std::string value;
         if (arg == "--help" || arg == "-h") {
             std::cout << "worldbench [--players N] [--mobs M] [--seconds S]\n"
-                         "             [--mode spread|hotspot|border|dense|splitmerge|lod|activity|loadfield|partitionscore]\n"
+                         "             [--mode spread|hotspot|border|dense|splitmerge|lod|activity|loadfield|partitionscore|stability]\n"
                          "             [--validate-every K] [--despawn-storm R] [--seed S]\n"
                          "             [--logical-processes K] [--routing-selftest]\n"
                          "             [--field-selftest] [--loadfield-selftest] [--partitionscore-selftest]\n"
@@ -196,7 +196,7 @@ bool ParseArgs(int argc, char** argv, BenchConfig& config)
     if (config.mode != "spread" && config.mode != "hotspot" && config.mode != "border" &&
         config.mode != "dense" && config.mode != "splitmerge" && config.mode != "lod" &&
         config.mode != "activity" && config.mode != "loadfield" &&
-        config.mode != "partitionscore") {
+        config.mode != "partitionscore" && config.mode != "stability") {
         std::cerr << "bad mode: " << config.mode << "\n";
         return false;
     }
@@ -2517,6 +2517,149 @@ int RunPartitionScoreSelftest()
         SelftestReport("partitionscore-decision-format", ok, false, failures);
     }
 
+    // (10) Merge scoring: the predicted parent load is the WHOLE-area
+    // aggregate; one hot child makes the merge unsafe; a calm group with no
+    // boundary churn does NOT clear the gate; measured churn on the internal
+    // cuts makes it genuinely beneficial.
+    {
+        PartitionScorer scorer;
+        const PartitionScoringConfig config = scorer.GetConfig();
+        MergeScoreInput input;
+        input.parent_id = 10;
+        input.parent_bounds = mx::map::Rect{0.0f, 0.0f, 1000.0f, 1000.0f};
+        mx::map::Rect children[4];
+        BuildQuadtreeChildBounds(input.parent_bounds, 500.0f, 500.0f, children);
+        for (int i = 0; i < 4; ++i) {
+            input.child_bounds[static_cast<std::size_t>(i)] = children[i];
+            input.child_ids[static_cast<std::size_t>(i)] = static_cast<ZoneId>(11 + i);
+        }
+        const auto now = std::chrono::steady_clock::now();
+
+        const LoadGrid hot_child = MakeScoreTestGrid(10, 100.0f, [](float x, float y) {
+            ScoreTestSample sample;
+            sample.composite = (x < 500.0f && y >= 500.0f) ? 0.9f : 0.0f; // NW quadrant
+            return sample;
+        });
+        const auto hot_rec = scorer.ScoreMerge(input, &hot_child, nullptr, now);
+        const bool hot_unsafe = hot_rec.valid && !hot_rec.best.safety_ok &&
+                                hot_rec.best.predicted_parent_peak >= 0.9f - 1e-3f &&
+                                hot_rec.best.predicted_parent_mean < 0.3f; // whole-area mean
+
+        const LoadGrid calm = MakeScoreTestGrid(10, 100.0f, [](float, float) {
+            ScoreTestSample sample;
+            sample.composite = 0.1f;
+            return sample;
+        });
+        const auto calm_rec = scorer.ScoreMerge(input, &calm, nullptr, now);
+        const bool calm_below_gate = calm_rec.valid && calm_rec.best.safety_ok &&
+                                     calm_rec.best.final_score < config.min_merge_improvement;
+
+        const LoadGrid churn = MakeScoreTestGrid(10, 100.0f, [](float x, float y) {
+            ScoreTestSample sample;
+            sample.composite = 0.1f;
+            const int gx = static_cast<int>(x / 100.0f);
+            const int gy = static_cast<int>(y / 100.0f);
+            // Migration churn along the internal cuts (x=500, y=500).
+            sample.migration = (gx == 4 || gy == 4) ? 0.3f : 0.0f;
+            return sample;
+        });
+        const auto churn_rec = scorer.ScoreMerge(input, &churn, nullptr, now);
+        const bool churn_passes = churn_rec.valid && churn_rec.best.safety_ok &&
+                                  churn_rec.best.final_score >= config.min_merge_improvement &&
+                                  churn_rec.best.migration_benefit > 0.5f;
+        std::printf("PARTITIONSCORE merge: hot=[safe=%d peak=%.2f mean=%.2f] calm=[score=%.3f] "
+                    "churn=[score=%.3f mig=%.2f]\n",
+                    hot_rec.best.safety_ok ? 1 : 0,
+                    hot_rec.best.predicted_parent_peak,
+                    hot_rec.best.predicted_parent_mean,
+                    calm_rec.best.final_score,
+                    churn_rec.best.final_score,
+                    churn_rec.best.migration_benefit);
+        SelftestReport("partitionscore-merge-scoring",
+                       hot_unsafe && calm_below_gate && churn_passes,
+                       false,
+                       failures);
+    }
+
+    // (11) Merge determinism: identical inputs -> bit-identical output.
+    {
+        PartitionScorer scorer;
+        const LoadGrid grid = MakeScoreTestGrid(10, 100.0f, [](float, float) {
+            ScoreTestSample sample;
+            sample.composite = 0.1f;
+            sample.migration = 0.2f;
+            return sample;
+        });
+        MergeScoreInput input;
+        input.parent_bounds = mx::map::Rect{0.0f, 0.0f, 1000.0f, 1000.0f};
+        mx::map::Rect children[4];
+        BuildQuadtreeChildBounds(input.parent_bounds, 500.0f, 500.0f, children);
+        for (int i = 0; i < 4; ++i) {
+            input.child_bounds[static_cast<std::size_t>(i)] = children[i];
+        }
+        const auto now = std::chrono::steady_clock::now();
+        const auto first = scorer.ScoreMerge(input, &grid, nullptr, now);
+        const auto second = scorer.ScoreMerge(input, &grid, nullptr, now);
+        const bool ok = first.valid && second.valid &&
+                        first.best.final_score == second.best.final_score &&
+                        first.best.predicted_parent_load == second.best.predicted_parent_load &&
+                        first.best.boundary_benefit == second.best.boundary_benefit &&
+                        first.best.migration_benefit == second.best.migration_benefit;
+        SelftestReport("partitionscore-merge-determinism", ok, false, failures);
+    }
+
+    // (12) Merge/stability config validation: every invalid field repaired,
+    // including the threshold invariant (margin < split threshold).
+    {
+        PartitionScoringConfig bad;
+        bad.merge_sustained_low_s = -1.0f;
+        bad.split_to_merge_cooldown_s = std::numeric_limits<float>::quiet_NaN();
+        bad.merge_to_split_cooldown_s = -5.0f;
+        bad.post_merge_safety_margin = 2.0f; // >= split threshold
+        bad.min_merge_improvement = 5.0f;
+        bad.weight_merge_risk = -1.0f;
+        bad.oscillation_window_s = -3.0f;
+        bad.emergency_p99_multiplier = 0.0f;
+        const auto validated = ValidatePartitionScoringConfig(bad);
+        const bool repaired =
+            !validated.warnings.empty() && validated.effective.merge_sustained_low_s == 90.0f &&
+            validated.effective.split_to_merge_cooldown_s == 120.0f &&
+            validated.effective.merge_to_split_cooldown_s == 90.0f &&
+            validated.effective.post_merge_safety_margin <
+                validated.effective.split_load_threshold &&
+            validated.effective.min_merge_improvement == 0.10f &&
+            validated.effective.weight_merge_risk == 1.0f &&
+            validated.effective.oscillation_window_s == 300.0f &&
+            validated.effective.emergency_p99_multiplier == 2.0f;
+        std::printf("PARTITIONSCORE merge-config warnings=%zu\n", validated.warnings.size());
+        SelftestReport("partitionscore-merge-config-validation", repaired, false, failures);
+    }
+
+    // (13) Merge decision formatter: executed and why-not records.
+    {
+        PartitionDecisionRecord record;
+        record.kind = PartitionDecisionKind::Merge;
+        record.zone_id = 77;
+        record.scored = true;
+        record.executed = true;
+        record.merge_candidate.parent_id = 77;
+        record.merge_candidate.child_ids = {11, 12, 13, 14};
+        record.merge_candidate.final_score = 0.22f;
+        record.merge_candidate.predicted_parent_load = 0.18f;
+        record.merge_candidate.safety_ok = true;
+        const std::string merge_text = FormatPartitionDecision(record);
+        record.executed = false;
+        record.noop_reason = PartitionNoopReason::MergeRecentSplit;
+        record.detail = "split-cooldown";
+        const std::string noop_text = FormatPartitionDecision(record);
+        const bool ok = merge_text.find("MERGE parent=77") != std::string::npos &&
+                        merge_text.find("predicted=0.18") != std::string::npos &&
+                        noop_text.find("MERGE-NOOP parent=77") != std::string::npos &&
+                        noop_text.find("merge-recent-split") != std::string::npos &&
+                        noop_text.find("split-cooldown") != std::string::npos;
+        SelftestReport("partitionscore-merge-decision-format", ok, false, failures);
+    }
+
     std::printf("PARTITIONSCORE-SELFTEST-DONE failures=%d\n", failures);
     return failures;
 }
@@ -2838,6 +2981,346 @@ int RunPartitionScoreScenario(boost::asio::io_context& io, const BenchConfig& co
     return failures;
 }
 
+// Phase-3 partition stability scenario: sustained-low merge, directional
+// cooldowns and moving-hotspot thrash protection. Own sim lifecycle on the
+// 1km test map; smoothing time constants and cooldowns are compressed so the
+// scenario runs in minutes while the conservative structure (two-timescale
+// eligibility, cooldowns, safety margin) stays identical.
+//
+//   Phase A: hotspot -> scored split commits (quadtree group created).
+//   Phase B: hotspot leaves; players sit on the internal cut lines so the
+//     merge has a real boundary benefit -> sustained-low matures -> the
+//     transactional executor commits the merge.
+//   Phase C: a hotspot re-appears immediately after the merge -> the
+//     merge-to-split cooldown suppresses the split (why-not "merge-cooldown";
+//     emergency bypass disabled here) -> after the cooldown it commits.
+//   Phase D: the hotspot moves to another child of the same group -> the
+//     group is NOT eligible while one child is hot (no merge); after it
+//     cools, the tree simplifies again. The oscillation counter (window
+//     matched to the test cooldowns) stays zero.
+int RunStabilityScenario(boost::asio::io_context& io, const BenchConfig& config)
+{
+    int failures = 0;
+    int validations = 0;
+    auto check = [&](const char* name, bool pass) {
+        if (pass) {
+            std::printf("STABILITY %s: PASS\n", name);
+        } else {
+            std::printf("STABILITY %s: FAIL\n", name);
+            ++failures;
+        }
+    };
+
+    gs::game::WorldRuntime sim(io);
+    auto validate_now = [&](const char* what) -> bool {
+        sim.RequestValidation();
+        for (int i = 0; i < 100; ++i) {
+            std::string result;
+            if (sim.TryTakeValidationResult(result)) {
+                ++validations;
+                if (result != "OK") {
+                    std::printf("STABILITY validation(%s): FAIL: %s\n", what, result.c_str());
+                    return false;
+                }
+                return true;
+            }
+            std::this_thread::sleep_for(std::chrono::milliseconds(100));
+        }
+        std::printf("STABILITY validation(%s): TIMEOUT\n", what);
+        return false;
+    };
+
+    gs::game::LoadFieldConfig lf;
+    lf.cell_size_m = 100.0f;
+    lf.aggregation_hz = 4.0f;
+    lf.l1_enabled = false;
+    lf.simulation_budget = 1000.0f;
+    lf.replication_budget = 200000.0f;
+    lf.aoi_budget = 5000.0f;
+    lf.combat_budget = 20.0f;
+    lf.migration_budget = 10.0f;
+    // Compressed smoothing: the test exercises the conservative two-timescale
+    // merge eligibility without waiting minutes for the slow EMA to release.
+    lf.fast_rise_tau_s = 0.5f;
+    lf.fast_fall_tau_s = 2.0f;
+    lf.slow_rise_tau_s = 2.0f;
+    lf.slow_fall_tau_s = 4.0f;
+    sim.ConfigureLoadField(lf);
+
+    gs::game::PartitionConfig pcfg;
+    pcfg.min_zone_size_m = 100.0f; // validated floor clamps to 240
+    pcfg.split_load_threshold = 0.5f;
+    pcfg.merge_load_threshold = 0.25f; // value hysteresis (far below split)
+    pcfg.sustained_window_seconds = 2;
+    pcfg.split_cooldown_seconds = 2;
+    pcfg.merge_cooldown_seconds = 2;
+    pcfg.scoring.merge_sustained_low_s = 3.0f; // time hysteresis (short test)
+    pcfg.scoring.split_to_merge_cooldown_s = 4.0f;
+    pcfg.scoring.merge_to_split_cooldown_s = 12.0f;
+    pcfg.scoring.post_merge_safety_margin = 0.15f; // ceiling 0.35
+    pcfg.scoring.min_merge_improvement = 0.05f;
+    pcfg.scoring.merge_topology_benefit = 0.15f;
+    pcfg.scoring.min_expected_improvement = 0.05f;
+    pcfg.scoring.boundary_band_m = 120.0f;
+    pcfg.scoring.hotspot_threshold = 0.4f;
+    pcfg.scoring.oscillation_window_s = 4.0f;
+    pcfg.scoring.instability_window_s = 20.0f; // matched to the compressed test timeline
+    pcfg.scoring.emergency_split_bypass = false; // deterministic suppression
+    pcfg.scoring.why_not_log_seconds = 2.0f;
+    sim.ConfigurePartition(pcfg);
+    check("config-effective",
+          sim.EffectivePartitionConfig().min_zone_size_m == 240.0f &&
+              sim.EffectivePartitionScoringConfig().min_merge_improvement == 0.05f &&
+              !sim.EffectivePartitionScoringConfig().emergency_split_bypass);
+    sim.Start();
+
+    const auto deadline =
+        std::chrono::steady_clock::now() + std::chrono::seconds(std::max(240, config.seconds));
+    auto expired = [&] { return std::chrono::steady_clock::now() >= deadline; };
+
+    const std::size_t zone3_index = sim.Zones().FindIndexForPosition(750.0f, 500.0f);
+    check("zone-found", zone3_index < sim.Zones().ZoneCount());
+    if (zone3_index >= sim.Zones().ZoneCount()) {
+        sim.Stop();
+        return failures + 1;
+    }
+    const gs::game::ZoneId zone3_id = sim.Zones().GetZone(zone3_index).Id();
+    const mx::map::Rect zone3_bounds = sim.Zones().GetZone(zone3_index).Bounds();
+
+    std::size_t next_spawn_point = 4;
+    auto spawn_cluster = [&](gs::common::SessionId base_session,
+                             int character_base,
+                             int players,
+                             int mobs,
+                             float x,
+                             float y) {
+        for (int i = 0; i < players; ++i) {
+            boost::asio::ip::tcp::socket socket(io);
+            auto session = std::make_shared<gs::network::Session>(
+                std::move(socket), static_cast<gs::common::SessionId>(base_session + i));
+            sim.PostSpawn(session,
+                          MakeBenchCharacter(character_base + i),
+                          gs::game::DebugSpawnOverride{x + static_cast<float>(i % 4) * 2.0f,
+                                                       y + static_cast<float>(i / 4) * 2.0f});
+        }
+        for (int i = 0; i < mobs; ++i) {
+            gs::game::MobSpawnPoint point;
+            point.mob_type_id = 2;
+            point.x = x + static_cast<float>((i * 7) % 50) - 25.0f;
+            point.y = y + static_cast<float>((i * 11) % 50) - 25.0f;
+            point.count = 1;
+            point.radius = 0.0f;
+            sim.AddMobSpawnPoint(point);
+            sim.RequestMobSpawn(next_spawn_point++);
+        }
+    };
+    auto despawn_range = [&](gs::common::SessionId base_session, int count) {
+        for (int i = 0; i < count; ++i) {
+            sim.PostDespawn(static_cast<gs::common::SessionId>(base_session + i));
+        }
+    };
+    auto group_children = [&](gs::game::ZoneId parent_id) {
+        std::vector<const gs::game::ZonePartition*> children;
+        for (const auto* leaf : sim.Zones().GetActiveLeaves()) {
+            if (leaf->parent != nullptr && leaf->parent->zone_id == parent_id) {
+                children.push_back(leaf);
+            }
+        }
+        return children;
+    };
+    auto find_leaf_with_bounds = [&](const mx::map::Rect& bounds) -> gs::game::ZoneId {
+        for (const auto* leaf : sim.Zones().GetActiveLeaves()) {
+            if (leaf->bounds.min_x == bounds.min_x && leaf->bounds.min_y == bounds.min_y &&
+                leaf->bounds.max_x == bounds.max_x && leaf->bounds.max_y == bounds.max_y) {
+                return leaf->zone_id;
+            }
+        }
+        return 0;
+    };
+
+    // ---- Phase A: two player-only clusters make a split genuinely
+    // beneficial (one cluster alone would be a NOOP: the cut cannot reduce
+    // its peak). Players despawn cleanly, so no mob residue can keep the
+    // group warm in Phase B.
+    spawn_cluster(600, 2000, 16, 0, 650.0f, 150.0f);
+    spawn_cluster(616, 2020, 16, 0, 850.0f, 800.0f);
+    const bool populated_a = WaitFor(std::chrono::seconds(25), [&] {
+        return sim.Owners().size() == 32;
+    });
+    check("phase-a-populate", populated_a && !expired());
+    if (!populated_a) {
+        sim.Stop();
+        return failures + 1;
+    }
+    const bool split_a = WaitFor(std::chrono::seconds(40), [&] {
+        return sim.PartitionMetricsSnapshot().split_commits >= 1;
+    });
+    check("phase-a-split", split_a && !expired());
+    const auto children_a = group_children(zone3_id);
+    check("phase-a-four-children", children_a.size() == 4);
+    if (children_a.size() != 4) {
+        sim.Stop();
+        return failures + 1;
+    }
+
+    // ---- Phase B: hotspot leaves; players on the internal cuts give the
+    // merge a real, measurable boundary benefit. Positions avoid the test
+    // map's blocked square (x 720..822, y 240..342) and wall (y 490..496 at
+    // x 360..642): X-cut players sit at y=600, Y-cut players at x=660.
+    despawn_range(600, 32);
+    const bool drained_a = WaitFor(std::chrono::seconds(15), [&] { return sim.Owners().empty(); });
+    check("phase-b-drained", drained_a && !expired());
+    const float cut_x = children_a[0]->bounds.max_x; // NW east edge
+    const float cut_y = children_a[0]->bounds.min_y; // NW south edge
+    const float boundary_positions[4][2] = {{cut_x - 20.0f, 600.0f},
+                                            {cut_x + 20.0f, 600.0f},
+                                            {660.0f, cut_y - 20.0f},
+                                            {660.0f, cut_y + 20.0f}};
+    for (int i = 0; i < 4; ++i) {
+        boost::asio::ip::tcp::socket socket(io);
+        auto session = std::make_shared<gs::network::Session>(
+            std::move(socket), static_cast<gs::common::SessionId>(640 + i));
+        sim.PostSpawn(session,
+                      MakeBenchCharacter(2100 + i),
+                      gs::game::DebugSpawnOverride{boundary_positions[i][0],
+                                                   boundary_positions[i][1]});
+    }
+    const bool populated_b = WaitFor(std::chrono::seconds(15), [&] {
+        return sim.Owners().size() == 4;
+    });
+    check("phase-b-populate", populated_b && !expired());
+    // The group must be genuinely low on BOTH field timescales (conservative
+    // eligibility) before the merge can be scored. Wait until the residual
+    // boundary load has settled well below the ceiling so the risk term is
+    // small -- the same conservatism the production defaults enforce.
+    const bool group_low = WaitFor(std::chrono::seconds(90), [&] {
+        const auto rec = sim.ScoreMerge(zone3_id);
+        return rec.valid && rec.best.safety_ok && rec.best.predicted_parent_load < 0.15f;
+    });
+    check("phase-b-group-low", group_low && !expired());
+    const auto merge_rec = sim.ScoreMerge(zone3_id);
+    check("phase-b-merge-scored", merge_rec.valid && merge_rec.best.activity_band > 0.0f);
+    // The gate passes once the residual boundary load has settled and the
+    // split's instability penalty has decayed -- exactly what the production
+    // controller waits for.
+    const bool gate_ready = WaitFor(std::chrono::seconds(60), [&] {
+        const auto rec = sim.ScoreMerge(zone3_id);
+        return rec.valid && rec.best.safety_ok &&
+               rec.best.final_score >=
+                   sim.EffectivePartitionScoringConfig().min_merge_improvement;
+    });
+    check("phase-b-merge-gate", gate_ready && !expired());
+    const auto gate_rec = sim.ScoreMerge(zone3_id);
+    std::printf("STABILITY phase-b merge: score=%.3f predicted=%.3f ceiling=%.2f "
+                "topology=%.2f boundary=%.2f activity=%.2f migration=%.2f exec=%.3f risk=%.3f "
+                "instability=%.3f\n",
+                gate_rec.best.final_score,
+                gate_rec.best.predicted_parent_load,
+                gate_rec.best.safety_ceiling,
+                gate_rec.best.topology_benefit,
+                gate_rec.best.boundary_benefit,
+                gate_rec.best.activity_band,
+                gate_rec.best.migration_benefit,
+                gate_rec.best.execution_penalty,
+                gate_rec.best.parent_load_risk,
+                gate_rec.best.instability_penalty);
+    const bool merged = WaitFor(std::chrono::seconds(60), [&] {
+        return sim.PartitionMetricsSnapshot().merge_commits >= 1;
+    });
+    check("phase-b-merge-committed", merged && !expired());
+    bool merge_logged = false;
+    for (const auto& record : sim.PartitionDecisionLog()) {
+        if (record.kind == gs::game::PartitionDecisionKind::Merge && record.executed &&
+            record.zone_id == zone3_id) {
+            merge_logged = true;
+            std::printf("STABILITY decision: %s\n",
+                        gs::game::FormatPartitionDecision(record).c_str());
+        }
+    }
+    check("phase-b-merge-logged", merge_logged);
+    check("validate-after-merge", validate_now("merge"));
+    const gs::game::ZoneId merged_zone_id = find_leaf_with_bounds(zone3_bounds);
+    check("phase-b-merged-leaf", merged_zone_id != 0);
+
+    // ---- Phase C: hotspot right after the merge -> merge-to-split cooldown
+    // suppresses the split; after it expires the split commits. Two clusters
+    // again so the eventual split is genuinely beneficial.
+    spawn_cluster(660, 2200, 16, 0, 600.0f, 150.0f);
+    spawn_cluster(676, 2220, 16, 0, 875.0f, 800.0f);
+    const bool populated_c = WaitFor(std::chrono::seconds(20), [&] {
+        return sim.Owners().size() == 36;
+    });
+    check("phase-c-populate", populated_c && !expired());
+    const bool suppressed = WaitFor(std::chrono::seconds(8), [&] {
+        return sim.PartitionMetricsSnapshot().split_suppressed_merge_cooldown > 0;
+    });
+    check("phase-c-split-suppressed", suppressed && !expired());
+    bool cooldown_logged = false;
+    for (const auto& record : sim.PartitionDecisionLog()) {
+        if (record.kind == gs::game::PartitionDecisionKind::Split && !record.executed &&
+            std::string(record.detail) == "merge-cooldown") {
+            cooldown_logged = true;
+        }
+    }
+    check("phase-c-cooldown-logged", cooldown_logged);
+    const bool split_c = WaitFor(std::chrono::seconds(40), [&] {
+        return sim.PartitionMetricsSnapshot().split_commits >= 2;
+    });
+    check("phase-c-split-after-cooldown", split_c && !expired());
+
+    // ---- Phase D: the hotspot moves to another child of the same group.
+    // While one child is hot the group is not merge eligible; after it cools,
+    // the tree simplifies again. No thrash.
+    const auto children_c = group_children(merged_zone_id);
+    check("phase-d-four-children", children_c.size() == 4);
+    if (children_c.size() != 4) {
+        sim.Stop();
+        return failures + 1;
+    }
+    // Pick the child farthest from the current hotspot (600,150): the NE
+    // child in tree order (NW, NE, SW, SE) is children_c[1].
+    const auto& target = children_c[1]->bounds;
+    const float target_x = (target.min_x + target.max_x) * 0.5f;
+    const float target_y = (target.min_y + target.max_y) * 0.5f;
+    despawn_range(660, 32);
+    spawn_cluster(700, 2300, 12, 0, target_x, target_y);
+    const bool populated_d = WaitFor(std::chrono::seconds(20), [&] {
+        return sim.Owners().size() == 16;
+    });
+    check("phase-d-populate", populated_d && !expired());
+    std::this_thread::sleep_for(std::chrono::seconds(8));
+    check("phase-d-no-merge-while-hot", sim.PartitionMetricsSnapshot().merge_commits == 1);
+    despawn_range(700, 12);
+    const bool merged_again = WaitFor(std::chrono::seconds(90), [&] {
+        return sim.PartitionMetricsSnapshot().merge_commits >= 2;
+    });
+    check("phase-d-merge-after-cold", merged_again && !expired());
+    check("phase-d-no-thrash", sim.PartitionMetricsSnapshot().oscillation_guard_trips == 0);
+    check("validate-final", validate_now("final"));
+
+    const auto metrics = sim.PartitionMetricsSnapshot();
+    std::printf("STABILITY metrics: split_commits=%llu merge_commits=%llu "
+                "merge_eval=%llu suppressed=[not_eligible=%llu not_sustained=%llu recent_split=%llu "
+                "recent_merge=%llu unsafe=%llu min_improvement=%llu tx=%llu] "
+                "split_suppressed_merge_cooldown=%llu emergency_bypass=%llu oscillation=%llu\n",
+                (unsigned long long)metrics.split_commits,
+                (unsigned long long)metrics.merge_commits,
+                (unsigned long long)metrics.merge_candidates_evaluated,
+                (unsigned long long)metrics.merge_suppressed_not_eligible,
+                (unsigned long long)metrics.merge_suppressed_not_sustained,
+                (unsigned long long)metrics.merge_suppressed_recent_split,
+                (unsigned long long)metrics.merge_suppressed_recent_merge,
+                (unsigned long long)metrics.merge_suppressed_post_merge_unsafe,
+                (unsigned long long)metrics.merge_suppressed_min_improvement,
+                (unsigned long long)metrics.merge_suppressed_transaction,
+                (unsigned long long)metrics.split_suppressed_merge_cooldown,
+                (unsigned long long)metrics.split_emergency_bypasses,
+                (unsigned long long)metrics.oscillation_guard_trips);
+    sim.Stop();
+    std::printf("STABILITY-DONE validations=%d failures=%d\n", validations, failures);
+    return failures;
+}
+
 } // namespace
 
 int BenchMain(int argc, char** argv)
@@ -2935,6 +3418,19 @@ int BenchMain(int argc, char** argv)
             score_io_thread.join();
         }
         std::printf("BENCH-DONE partitionscore failures=%d\n", scenario_failures);
+        return scenario_failures == 0 ? 0 : 2;
+    }
+
+    if (config.mode == "stability") {
+        // Merge scoring + sustained-low + cooldown/oscillation stability.
+        boost::asio::io_context stability_io;
+        std::thread stability_io_thread([&stability_io] { stability_io.run(); });
+        const int scenario_failures = RunStabilityScenario(stability_io, config);
+        stability_io.stop();
+        if (stability_io_thread.joinable()) {
+            stability_io_thread.join();
+        }
+        std::printf("BENCH-DONE stability failures=%d\n", scenario_failures);
         return scenario_failures == 0 ? 0 : 2;
     }
 
