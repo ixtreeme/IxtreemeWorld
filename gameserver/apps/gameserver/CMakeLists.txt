@@ -105,6 +105,7 @@ configure_file(
 if(ENABLE_WORLDBENCH)
     add_executable(worldbench
         src/bench/WorldBench.cpp
+        src/bench/ReadinessBench.cpp
         ${GAMESERVER_WORLD_SOURCES}
     )
 

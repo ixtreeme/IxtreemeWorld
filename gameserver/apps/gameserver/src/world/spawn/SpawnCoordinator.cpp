@@ -63,13 +63,24 @@ void SpawnCoordinator::PostToOwner(std::size_t zone_index, std::function<void(Zo
 
 void SpawnCoordinator::Initialize(const std::string& map_root, const std::string& mob_types_config)
 {
-    mob_types_.LoadFromFile(mob_types_config);
+    LoadMobTypes(mob_types_config);
     {
         std::lock_guard lock(spawn_points_mutex_);
         spawn_points_ =
             SpawnLoader::LoadFromFile((std::filesystem::path(map_root) / "mob_spawns.conf").string());
     }
-    SpawnConfiguredMobs();
+    (void)SpawnAllConfiguredMobs();
+}
+
+void SpawnCoordinator::LoadMobTypes(const std::string& mob_types_config)
+{
+    mob_types_.LoadFromFile(mob_types_config);
+}
+
+void SpawnCoordinator::ClearSpawnPoints()
+{
+    std::lock_guard lock(spawn_points_mutex_);
+    spawn_points_.clear();
 }
 
 void SpawnCoordinator::Spawn(std::shared_ptr<gs::network::Session> session,
@@ -308,11 +319,12 @@ bool SpawnCoordinator::IsValidDebugSpawnOverride(const DebugSpawnOverride& debug
     return terrain_.IsWalkable(debug_spawn.x, debug_spawn.y);
 }
 
-void SpawnCoordinator::SpawnConfiguredMobs()
+std::size_t SpawnCoordinator::SpawnAllConfiguredMobs()
 {
     std::vector<std::pair<MobSpawnPoint, std::size_t>> points;
     {
         std::lock_guard lock(spawn_points_mutex_);
+        points.reserve(spawn_points_.size());
         for (std::size_t i = 0; i < spawn_points_.size(); ++i) {
             points.emplace_back(spawn_points_[i], i);
         }
@@ -322,10 +334,10 @@ void SpawnCoordinator::SpawnConfiguredMobs()
                  mob_types_.Size(),
                  points.size(),
                  zones_.ZoneCount());
-        return;
+        return 0;
     }
 
-    std::uint32_t total = 0;
+    std::size_t total = 0;
     for (const auto& [spawn, spawn_index] : points) {
         for (std::uint32_t i = 0; i < spawn.count; ++i) {
             if (SpawnMobFromSpawnPoint(spawn_index)) {
@@ -335,6 +347,7 @@ void SpawnCoordinator::SpawnConfiguredMobs()
     }
 
     LOG_INFO("spawn complete: total_mobs={}", total);
+    return total;
 }
 
 } // namespace gs::game

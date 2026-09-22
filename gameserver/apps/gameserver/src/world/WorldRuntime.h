@@ -56,9 +56,30 @@ namespace gs::game {
 
 class WorldRuntime {
 public:
+    // Synthetic world bootstrap for integrated-scale benchmarks: flat terrain
+    // with an explicit extent and a deterministic zone grid. Production
+    // always loads the real map root; this seam exists so a 100km world with
+    // hundreds of thousands of entities can be measured with the production
+    // systems (no mocked simulation, no 100km^2 heightfield asset).
+    struct SyntheticWorldConfig {
+        float extent_m = 100000.0f;
+        std::uint32_t zones_x = 8;
+        std::uint32_t zones_y = 8;
+        std::string mob_types_config; // empty = build-time default
+    };
+
     // identity defaults to the single-process deployment (node=1/process=1).
     explicit WorldRuntime(boost::asio::io_context& io, RuntimeIdentity identity = {});
+    // Synthetic world (benchmark/dev). Same systems, different bootstrap.
+    WorldRuntime(boost::asio::io_context& io,
+                 RuntimeIdentity identity,
+                 const SyntheticWorldConfig& synthetic);
     ~WorldRuntime();
+
+    // Setup seam: spawns every configured spawn point synchronously (bulk
+    // entity creation through the production spawn path). Requires
+    // quiescence: call before Start or between supervisor passes.
+    std::size_t SpawnConfiguredMobsNow();
 
     WorldRuntime(const WorldRuntime&) = delete;
     WorldRuntime& operator=(const WorldRuntime&) = delete;
@@ -277,6 +298,13 @@ public:
                                        int succeed_first = 0);
 
 private:
+    // Shared world bootstrap: geometry, zones, directory and the derived
+    // fields (activity + load). Called by both constructors.
+    void InitializeWorld(TerrainService terrain,
+                         mx::map::WorldLogic logic,
+                         const std::string& mob_types_config,
+                         const std::string& map_root,
+                         bool load_map_spawn_points);
     void Enqueue(std::function<void()> command);
     void Run();
     void TickZone(std::size_t zone_index);

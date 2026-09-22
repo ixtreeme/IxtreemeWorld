@@ -13,6 +13,12 @@ class TerrainService {
 public:
     TerrainService() = default;
     explicit TerrainService(mx::map::HeightField field);
+    // Synthetic world seam (integrated-scale benchmarks): flat, fully
+    // walkable terrain with an explicit extent. Production always loads the
+    // real height field from the map root; a 100km world cannot ship a
+    // 100km^2 heightfield asset, so benchmarks need this explicit extent.
+    // The default (no terrain) fallback stays the historic 1000m.
+    explicit TerrainService(float flat_extent_meters);
 
     // Loads the height field from a map root directory. Returns an invalid
     // (flat-fallback) service when the asset cannot be loaded.
@@ -29,6 +35,7 @@ public:
 
 private:
     mx::map::HeightField field_;
+    float flat_extent_m_ = 1000.0f; // used when the height field is invalid
 };
 
 } // namespace gs::game

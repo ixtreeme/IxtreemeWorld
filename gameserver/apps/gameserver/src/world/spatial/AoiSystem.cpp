@@ -1,6 +1,7 @@
 #include "AoiSystem.h"
 
 #include <algorithm>
+#include <chrono>
 #include <limits>
 #include <optional>
 #include <unordered_set>
@@ -88,6 +89,7 @@ std::vector<std::uint32_t> AoiSystem::QueryCandidates(Zone& zone,
                                                       const GhostPositionCache& ghosts)
 {
     AssertZoneOwner(zone, "zone AOI query");
+    const auto aoi_start = std::chrono::steady_clock::now();
 
     auto& candidates = t_candidates;
     candidates.clear();
@@ -159,6 +161,12 @@ std::vector<std::uint32_t> AoiSystem::QueryCandidates(Zone& zone,
     zone.Diagnostics().tier_near_since_diag.fetch_add(tier_near, std::memory_order_relaxed);
     zone.Diagnostics().tier_mid_since_diag.fetch_add(tier_mid, std::memory_order_relaxed);
     zone.Diagnostics().tier_far_since_diag.fetch_add(tier_far, std::memory_order_relaxed);
+    zone.Diagnostics().aoi_micros_since_diag.fetch_add(
+        static_cast<std::uint64_t>(
+            std::chrono::duration_cast<std::chrono::microseconds>(
+                std::chrono::steady_clock::now() - aoi_start)
+                .count()),
+        std::memory_order_relaxed);
     return refs;
 }
 

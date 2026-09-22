@@ -52,6 +52,7 @@
 #include "../world/partition/ZonePartition.h"
 #include "../world/WorldRuntime.h"
 #include "../world/spawn/SpawnLoader.h"
+#include "ReadinessBench.h"
 
 #include <flecs.h>
 
@@ -92,6 +93,13 @@ struct BenchConfig {
     // Lets load-driven scenarios split small test maps; still passes through
     // ValidatePartitionConfig (AOI floor clamp applies).
     int partition_min_size = 0;
+    // Phase-4 integrated readiness benchmark (synthetic world).
+    std::string scenario = "spread";
+    float world_km = 100.0f;
+    int zones_x = 8;
+    int zones_y = 8;
+    int warmup_seconds = 15;
+    bool asf_off = false;
 };
 
 bool ParseArgs(int argc, char** argv, BenchConfig& config)
@@ -109,12 +117,14 @@ bool ParseArgs(int argc, char** argv, BenchConfig& config)
         std::string value;
         if (arg == "--help" || arg == "-h") {
             std::cout << "worldbench [--players N] [--mobs M] [--seconds S]\n"
-                         "             [--mode spread|hotspot|border|dense|splitmerge|lod|activity|loadfield|partitionscore|stability]\n"
+                         "             [--mode spread|hotspot|border|dense|splitmerge|lod|activity|loadfield|partitionscore|stability|readiness]\n"
                          "             [--validate-every K] [--despawn-storm R] [--seed S]\n"
                          "             [--logical-processes K] [--routing-selftest]\n"
                          "             [--field-selftest] [--loadfield-selftest] [--partitionscore-selftest]\n"
                          "             [--fail-snapshot N] [--fail-apply N] [--fail-after N]\n"
-                         "             [--partition-min-size M] [--lod-off] [--loadfield-off]\n";
+                         "             [--partition-min-size M] [--lod-off] [--loadfield-off]\n"
+                         "             [--scenario NAME] [--world-km K] [--zones-x N] [--zones-y N]\n"
+                         "             [--warmup S] [--asf-off]\n";
             return false;
         } else if (arg == "--players") {
             if (!need_value("players", value)) {
@@ -188,6 +198,33 @@ bool ParseArgs(int argc, char** argv, BenchConfig& config)
             config.lod_off = true;
         } else if (arg == "--loadfield-off") {
             config.load_field_off = true;
+        } else if (arg == "--scenario") {
+            if (!need_value("scenario", value)) {
+                return false;
+            }
+            config.scenario = value;
+        } else if (arg == "--world-km") {
+            if (!need_value("world-km", value)) {
+                return false;
+            }
+            config.world_km = std::stof(value);
+        } else if (arg == "--zones-x") {
+            if (!need_value("zones-x", value)) {
+                return false;
+            }
+            config.zones_x = std::stoi(value);
+        } else if (arg == "--zones-y") {
+            if (!need_value("zones-y", value)) {
+                return false;
+            }
+            config.zones_y = std::stoi(value);
+        } else if (arg == "--warmup") {
+            if (!need_value("warmup", value)) {
+                return false;
+            }
+            config.warmup_seconds = std::stoi(value);
+        } else if (arg == "--asf-off") {
+            config.asf_off = true;
         } else {
             std::cerr << "unknown arg: " << arg << "\n";
             return false;
@@ -196,7 +233,8 @@ bool ParseArgs(int argc, char** argv, BenchConfig& config)
     if (config.mode != "spread" && config.mode != "hotspot" && config.mode != "border" &&
         config.mode != "dense" && config.mode != "splitmerge" && config.mode != "lod" &&
         config.mode != "activity" && config.mode != "loadfield" &&
-        config.mode != "partitionscore" && config.mode != "stability") {
+        config.mode != "partitionscore" && config.mode != "stability" &&
+        config.mode != "readiness") {
         std::cerr << "bad mode: " << config.mode << "\n";
         return false;
     }
@@ -3431,6 +3469,32 @@ int BenchMain(int argc, char** argv)
             stability_io_thread.join();
         }
         std::printf("BENCH-DONE stability failures=%d\n", scenario_failures);
+        return scenario_failures == 0 ? 0 : 2;
+    }
+
+    if (config.mode == "readiness") {
+        // Phase-4 integrated readiness benchmark (synthetic 100km world).
+        gs::bench::ReadinessConfig readiness;
+        readiness.scenario = config.scenario;
+        readiness.world_km = config.world_km;
+        readiness.zones_x = config.zones_x;
+        readiness.zones_y = config.zones_y;
+        readiness.players = config.players;
+        readiness.mobs = config.mobs;
+        readiness.warmup_seconds = config.warmup_seconds;
+        readiness.measure_seconds = config.seconds;
+        readiness.asf_off = config.asf_off;
+        readiness.load_field_off = config.load_field_off;
+        readiness.lod_off = config.lod_off;
+        readiness.seed = config.seed;
+        boost::asio::io_context readiness_io;
+        std::thread readiness_io_thread([&readiness_io] { readiness_io.run(); });
+        const int scenario_failures = gs::bench::RunReadinessBenchmark(readiness_io, readiness);
+        readiness_io.stop();
+        if (readiness_io_thread.joinable()) {
+            readiness_io_thread.join();
+        }
+        std::printf("BENCH-DONE readiness failures=%d\n", scenario_failures);
         return scenario_failures == 0 ? 0 : 2;
     }
 

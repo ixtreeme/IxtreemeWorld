@@ -290,6 +290,18 @@ void CollectZoneLoadMetrics(const ZoneManager& zones, std::vector<ZoneLoadMetric
         metrics.queue_depth = zone.Commands().Depth();
         metrics.max_queue_depth = zone.Commands().MaxDepthObserved();
         metrics.activity = zone.Activity();
+        metrics.gameplay_us = diag.gameplay_micros_since_diag.load(std::memory_order_relaxed);
+        metrics.ai_us = diag.ai_micros_since_diag.load(std::memory_order_relaxed);
+        metrics.movement_us = diag.movement_micros_since_diag.load(std::memory_order_relaxed);
+        metrics.aoi_us = diag.aoi_micros_since_diag.load(std::memory_order_relaxed);
+        metrics.ghost_us = diag.ghost_micros_since_diag.load(std::memory_order_relaxed);
+        metrics.activity_publish_us =
+            diag.activity_publish_micros_since_diag.load(std::memory_order_relaxed);
+        metrics.load_publish_us =
+            diag.load_publish_micros_since_diag.load(std::memory_order_relaxed);
+        metrics.replication_us = diag.replication_micros_since_diag.load(std::memory_order_relaxed);
+        metrics.lod_eval_us = diag.lod_eval_us_since_diag.load(std::memory_order_relaxed);
+        metrics.ghost_entities = diag.ghost_entities_since_diag.load(std::memory_order_relaxed);
         out.push_back(metrics);
     }
 }

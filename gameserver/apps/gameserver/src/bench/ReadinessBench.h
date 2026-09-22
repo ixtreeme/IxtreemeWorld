@@ -1,0 +1,35 @@
+#pragma once
+
+#include <cstdint>
+#include <string>
+
+#include <boost/asio/io_context.hpp>
+
+// Phase-4 integrated readiness benchmark (100 km world / 500 players /
+// 200,000 mobs). Uses a synthetic flat world (no 100 km^2 heightfield asset)
+// but the PRODUCTION systems end to end: zones, scheduler, partition
+// split/merge, migration, ghost, LOD, zone sleep/wake, activity field,
+// load field, monitor, scorer, stability controller, AOI, replication.
+//
+// Deterministic setup; every scenario runs SETUP -> WARMUP -> MEASURE ->
+// FINAL VALIDATION. Setup cost is never mixed into steady-state tick cost.
+namespace gs::bench {
+
+struct ReadinessConfig {
+    std::string scenario = "spread"; // spread|quiet|hotspot|multi|moving|border|combat|replication|churn|dense
+    float world_km = 100.0f;
+    int zones_x = 8;
+    int zones_y = 8;
+    int players = 500;
+    int mobs = 200000;
+    int warmup_seconds = 15;
+    int measure_seconds = 30;
+    bool asf_off = false;        // adaptive control off (observe-only baseline)
+    bool load_field_off = false; // load field telemetry off
+    bool lod_off = false;        // LOD off (every entity Full-equivalent)
+    std::uint32_t seed = 20260922;
+};
+
+int RunReadinessBenchmark(boost::asio::io_context& io, const ReadinessConfig& config);
+
+} // namespace gs::bench

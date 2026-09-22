@@ -202,8 +202,20 @@ void Zone::Tick(float dt, ZoneTickContext& ctx)
 
         const auto gameplay_start = Clock::now();
         CooldownSystem::Step(*this, dt);
+        const auto ai_start = Clock::now();
         AiSystem::StepWander(*this, dt, ctx.mob_types, ctx.lod);
+        diagnostics_.ai_micros_since_diag.fetch_add(
+            static_cast<std::uint64_t>(
+                std::chrono::duration_cast<std::chrono::microseconds>(Clock::now() - ai_start)
+                    .count()),
+            std::memory_order_relaxed);
+        const auto movement_start = Clock::now();
         MovementSystem::Step(*this, dt, ctx);
+        diagnostics_.movement_micros_since_diag.fetch_add(
+            static_cast<std::uint64_t>(
+                std::chrono::duration_cast<std::chrono::microseconds>(Clock::now() - movement_start)
+                    .count()),
+            std::memory_order_relaxed);
         AssertZoneOwner(*this, "flecs world progress");
         world_.progress(dt);
         diagnostics_.gameplay_micros_since_diag.fetch_add(
@@ -222,12 +234,21 @@ void Zone::Tick(float dt, ZoneTickContext& ctx)
         BorderPublisher::Publish(*this);
         // World-space activity publication (post-movement positions): this
         // zone's authoritative players for the cross-zone activity field.
+        const auto activity_start = Clock::now();
         ActivityPublisher::Publish(*this);
+        diagnostics_.activity_publish_micros_since_diag.fetch_add(
+            static_cast<std::uint64_t>(
+                std::chrono::duration_cast<std::chrono::microseconds>(Clock::now() -
+                                                                      activity_start)
+                    .count()),
+            std::memory_order_relaxed);
         if (players_.empty()) {
             GhostSystem::Clear(*this);
         } else {
             GhostSystem::Rebuild(*this, ctx.zones);
         }
+        diagnostics_.ghost_entities_since_diag.fetch_add(ghosts_.size(),
+                                                         std::memory_order_relaxed);
         diagnostics_.ghost_micros_since_diag.fetch_add(
             static_cast<std::uint64_t>(
                 std::chrono::duration_cast<std::chrono::microseconds>(Clock::now() - ghost_start)
@@ -246,7 +267,14 @@ void Zone::Tick(float dt, ZoneTickContext& ctx)
         }
         // Continuous load field publication (post-everything positions): moves
         // this tick's touched load deltas into the zone's published buffer.
+        const auto load_publish_start = Clock::now();
         LoadFieldPublisher::Publish(*this);
+        diagnostics_.load_publish_micros_since_diag.fetch_add(
+            static_cast<std::uint64_t>(
+                std::chrono::duration_cast<std::chrono::microseconds>(Clock::now() -
+                                                                      load_publish_start)
+                    .count()),
+            std::memory_order_relaxed);
         diagnostics_.ticks_since_diag.fetch_add(1, std::memory_order_relaxed);
         ++zone_tick_;
         RefreshResidentCounts();

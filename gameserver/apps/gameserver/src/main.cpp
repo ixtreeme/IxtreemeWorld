@@ -221,6 +221,11 @@ gs::game::PartitionConfig ResolvePartitionConfig(const gs::common::Config& confi
         (*emergency_bypass == "0" || *emergency_bypass == "false" || *emergency_bypass == "off")) {
         scoring.emergency_split_bypass = false;
     }
+    // Adaptive control master switch (observe-only baseline when off).
+    const auto adaptive = config.GetString("partition_scoring_adaptive_enabled");
+    if (adaptive && (*adaptive == "0" || *adaptive == "false" || *adaptive == "off")) {
+        scoring.adaptive_enabled = false;
+    }
     return out;
 }
 

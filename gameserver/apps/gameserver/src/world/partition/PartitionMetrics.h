@@ -47,6 +47,14 @@ struct PartitionMetrics {
     // (diagnostic; the directional cooldowns are the hard guards).
     std::atomic<std::uint64_t> oscillation_guard_trips{0};
 
+    // Control-plane phase timings (microseconds, cumulative). The readiness
+    // benchmark separates telemetry cost (observe), decision cost (score) and
+    // the rest of the control cycle (decide/execute).
+    std::atomic<std::uint64_t> control_us{0};   // whole ExecutePartitionControl
+    std::atomic<std::uint64_t> observe_us{0};   // ZoneLoadMonitor::Update
+    std::atomic<std::uint64_t> score_us{0};     // PartitionScorer calls
+    std::atomic<std::uint64_t> migration_us{0}; // supervisor migration processing
+
     struct Snapshot {
         std::uint64_t split_attempts = 0;
         std::uint64_t split_commits = 0;
@@ -78,6 +86,10 @@ struct PartitionMetrics {
         std::uint64_t split_suppressed_merge_cooldown = 0;
         std::uint64_t split_emergency_bypasses = 0;
         std::uint64_t oscillation_guard_trips = 0;
+        std::uint64_t control_us = 0;
+        std::uint64_t observe_us = 0;
+        std::uint64_t score_us = 0;
+        std::uint64_t migration_us = 0;
     };
 
     Snapshot TakeSnapshot() const noexcept
@@ -121,6 +133,10 @@ struct PartitionMetrics {
             split_suppressed_merge_cooldown.load(std::memory_order_relaxed);
         snap.split_emergency_bypasses = split_emergency_bypasses.load(std::memory_order_relaxed);
         snap.oscillation_guard_trips = oscillation_guard_trips.load(std::memory_order_relaxed);
+        snap.control_us = control_us.load(std::memory_order_relaxed);
+        snap.observe_us = observe_us.load(std::memory_order_relaxed);
+        snap.score_us = score_us.load(std::memory_order_relaxed);
+        snap.migration_us = migration_us.load(std::memory_order_relaxed);
         return snap;
     }
 };

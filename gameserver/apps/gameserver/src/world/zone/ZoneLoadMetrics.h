@@ -27,6 +27,20 @@ struct ZoneLoadMetrics {
     std::size_t queue_depth = 0;
     std::size_t max_queue_depth = 0;
     ZoneActivity activity = ZoneActivity::Active;
+    // Per-stage tick sums of the current diagnostic window (microseconds).
+    // Non-destructive reads; the periodic diag owns the exchange(). These
+    // let the readiness benchmark attribute the tick cost to a stage without
+    // a profiler.
+    std::uint64_t gameplay_us = 0;
+    std::uint64_t ai_us = 0;
+    std::uint64_t movement_us = 0;
+    std::uint64_t aoi_us = 0;
+    std::uint64_t ghost_us = 0;
+    std::uint64_t activity_publish_us = 0;
+    std::uint64_t load_publish_us = 0;
+    std::uint64_t replication_us = 0;
+    std::uint64_t lod_eval_us = 0;
+    std::uint64_t ghost_entities = 0;
 };
 
 void CollectZoneLoadMetrics(const ZoneManager& zones, std::vector<ZoneLoadMetrics>& out);

@@ -40,6 +40,7 @@ partition_min_zone_size_m=500.0
 #       - w_boundary*boundary_penalty - w_migration*migration_penalty
 #       - w_replication*replication_penalty - w_instability*instability_penalty
 #       - topology_penalty
+partition_scoring_adaptive_enabled=true
 partition_min_expected_improvement=0.10
 partition_scoring_timescale=fast
 partition_scoring_boundary_band_m=180.0

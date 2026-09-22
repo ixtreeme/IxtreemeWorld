@@ -41,10 +41,21 @@ struct ZoneDiagnostics {
     std::atomic<std::uint64_t> tier_mid_since_diag{0};
     std::atomic<std::uint64_t> tier_far_since_diag{0};
 
-    // Subsystem stage sums (microseconds, since last diag read).
+    // Subsystem stage sums (microseconds, since last diag read). The finer
+    // scopes (ai/movement/aoi/activity/load publish) are benchmark-facing:
+    // they answer "which stage is the bottleneck" without a profiler. One
+    // clock read per scope per tick is negligible against the tick budget.
     std::atomic<std::uint64_t> gameplay_micros_since_diag{0};
     std::atomic<std::uint64_t> ghost_micros_since_diag{0};
     std::atomic<std::uint64_t> replication_micros_since_diag{0};
+    std::atomic<std::uint64_t> ai_micros_since_diag{0};
+    std::atomic<std::uint64_t> movement_micros_since_diag{0};
+    std::atomic<std::uint64_t> aoi_micros_since_diag{0};
+    std::atomic<std::uint64_t> activity_publish_micros_since_diag{0};
+    std::atomic<std::uint64_t> load_publish_micros_since_diag{0};
+    // Ghost churn proxy: border-snapshot entities copied into the read-only
+    // ghost cache this window (work, not a gauge).
+    std::atomic<std::uint64_t> ghost_entities_since_diag{0};
 
     // Simulation LOD (§22). Tier gauges are recounted exactly by the 1 Hz
     // zone evaluation; insert paths bump them synchronously so sleep

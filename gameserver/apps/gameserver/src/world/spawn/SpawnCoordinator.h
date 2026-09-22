@@ -62,6 +62,17 @@ public:
 
     // Loads prototypes + spawn points and spawns the configured mobs.
     void Initialize(const std::string& map_root, const std::string& mob_types_config);
+    // Synthetic-world seam (integrated-scale benchmarks): load only the mob
+    // prototypes, then let the caller register spawn points and trigger the
+    // bulk spawn explicitly. Production uses Initialize above.
+    void LoadMobTypes(const std::string& mob_types_config);
+    // Drops every registered spawn point (synthetic-world setup must not
+    // inherit the map's spawn points).
+    void ClearSpawnPoints();
+    // Spawns every configured spawn point (point.count each). Synchronous,
+    // supervisor/setup only: callers must guarantee no zone tick is in
+    // flight. Returns the number of mobs actually spawned.
+    std::size_t SpawnAllConfiguredMobs();
 
     void Spawn(std::shared_ptr<gs::network::Session> session,
                gs::db::Character character,
@@ -103,7 +114,6 @@ private:
                                   std::optional<DebugSpawnOverride> debug_spawn,
                                   gs::common::SessionId session_id);
     bool IsValidDebugSpawnOverride(const DebugSpawnOverride& debug_spawn);
-    void SpawnConfiguredMobs();
 
     boost::asio::io_context& io_;
     ZoneManager& zones_;

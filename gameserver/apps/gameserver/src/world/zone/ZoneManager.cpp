@@ -32,6 +32,22 @@ ZonePartition* FindNodeInRoots(const std::vector<std::unique_ptr<ZonePartition>>
     return nullptr;
 }
 
+// A zone that leaves the simulating topology (retired or tombstoned) never
+// ticks again, so its LOD tier gauges would freeze at their last evaluation.
+// World-wide tier reports sum the gauges across ALL zone slots, so a stale
+// gauge would permanently double-count residents (e.g. an aborted split's
+// staged children that received some transfers before the rollback). Reset
+// them whenever a zone is taken out of simulation.
+void ResetZoneDiagnosticGauges(Zone& zone) noexcept
+{
+    auto& diag = zone.Diagnostics();
+    diag.lod_full.store(0, std::memory_order_relaxed);
+    diag.lod_reduced.store(0, std::memory_order_relaxed);
+    diag.lod_low.store(0, std::memory_order_relaxed);
+    diag.lod_dormant.store(0, std::memory_order_relaxed);
+    diag.ghost_count.store(0, std::memory_order_relaxed);
+}
+
 } // namespace
 
 void ZoneManager::BuildFromWorldLogic(const mx::map::WorldLogic& logic, float fallback_extent)
@@ -380,6 +396,11 @@ void ZoneManager::AbortSplit(ZoneId parent_id, const std::vector<ZoneId>& child_
         child.SetPartition(PartitionState::Retired);
         child.SetSimulationEnabled(false);
         child.RefreshResidentCounts();
+        // Partial transfers during the aborted split bumped this staged
+        // child's LOD gauges (NoteLodInsert) before the rollback; the child
+        // never simulates again, so the stale bumps must not leak into the
+        // world-wide tier sums.
+        ResetZoneDiagnosticGauges(child);
     }
     // The tree was never touched during staging: nothing to detach.
     graph_.Rebuild(zones_);
@@ -565,6 +586,9 @@ void ZoneManager::AbortMerge(const MergePlan& plan, ZoneId merged_id)
         merged.SetPartition(PartitionState::Retired);
         merged.SetSimulationEnabled(false);
         merged.RefreshResidentCounts();
+        // The staged merge target may have received transfers before the
+        // rollback bumped its gauges; it never simulates again.
+        ResetZoneDiagnosticGauges(merged);
     }
     // A failed merge attempt resets the group's sustained-low timer: the
     // conservative direction is to re-earn the merge eligibility.
@@ -614,6 +638,7 @@ bool ZoneManager::RetireZone(ZoneId zone_id)
     // normal case and a loud backstop otherwise).
     zone.ClearActivitySources();
     zone.RefreshResidentCounts();
+    ResetZoneDiagnosticGauges(zone);
     zone.SetSimulationEnabled(false);
     zone.SetPartition(PartitionState::Retired);
     if (auto* node = FindNodeInRoots(partition_roots_, zone_id)) {

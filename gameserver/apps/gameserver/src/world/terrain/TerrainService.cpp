@@ -14,6 +14,11 @@ TerrainService::TerrainService(mx::map::HeightField field)
 {
 }
 
+TerrainService::TerrainService(float flat_extent_meters)
+    : flat_extent_m_(flat_extent_meters > 0.0f ? flat_extent_meters : 1000.0f)
+{
+}
+
 TerrainService TerrainService::LoadFromMapRoot(const std::string& map_root)
 {
     const std::filesystem::path root(map_root);
@@ -71,7 +76,7 @@ bool TerrainService::IsWalkable(float world_x, float world_y) const noexcept
 float TerrainService::WorldExtentMeters() const noexcept
 {
     if (!field_.IsValid()) {
-        return 1000.0f;
+        return flat_extent_m_;
     }
     return static_cast<float>(field_.manifest.world_size_cells) * field_.manifest.cell_size_meters;
 }

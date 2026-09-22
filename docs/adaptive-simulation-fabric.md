@@ -620,7 +620,8 @@ Az előző commitból javított Fast/Exact semanticsra **tesztet kell írni**:
 | **C** | §7–12 | Térbeli work-attribúció a hívási pontokon: AI, movement, combat, AOI (candidate/cap), replication (byte + spawn/despawn + recipient), migration | ✅ **KÉSZ** (lásd §6.2) |
 | **D** | §16–17, §28, §30–33 | `PartitionLoadScore`, p95/p99 a control plane-en, strukturált döntési log, why-not diagnostics, `MinExpectedImprovement`, `TopologyComplexityPenalty` | ✅ **KÉSZ** (lásd §7) |
 | **E** | §18–24, §27 | BoundaryCost field, Partition Objective, hotspot detection (flood fill), hotspot-aware split, multi-candidate split, merge sustained-low timer | ✅ **KÉSZ** (split §7 + merge/stability §8) |
-| **F** | §1, §21, §29 | `worldbench --mode loadfield`, validator-bővítés, regresszió a meglévő 7 módra, control-loop frekvenciák konfigurálhatóvá tétele | ⚠ **RÉSZLEGES**: `--mode partitionscore` + selftest kész, regresszió zöld; a control-loop frekvencia config még nyitott |
+| **F** | §1, §21, §29 | `worldbench --mode loadfield`, validator-bővítés, regresszió a meglévő 7 módra, control-loop frekvenciák konfigurálhatóvá tétele | ⚠ **RÉSZLEGES**: `--mode partitionscore`/`--mode stability`/`--mode readiness` + selftestek kész, regresszió zöld; a control-loop frekvencia config még nyitott |
+| **G (Phase 4)** | §0–§28 | Integrált readiness benchmark 100 km / 500 player / 200k mob, stage-instrumentáció, A/B-k, bottleneck audit | ✅ **KÉSZ** (lásd §9) |
 
 ### Chunk A — elvégzett munka
 
@@ -1284,3 +1285,191 @@ set startupkor logolódik.
 - Control-loop frekvenciák configból (§29).
 - Nem-quadtree merge/elastic boundary — az API nem zárja ki, az executor
   egyelőre quadtree-only.
+
+---
+
+## 9. Phase 4 — Integrált readiness benchmark (100 km / 500 player / 200k mob)
+
+> Mérési fázis, nem feature-fejlesztés. A megrendelői szöveg a §29-nél
+> félbeszakadt (*„promotion immediate;"*); a dokumentum a §0–§28 követelményeit
+> dolgozza fel, a §29 LOD-correctness pontjait a meglévő LOD/activity
+> regressziókra és a mért tier-eloszlásra támaszkodva igazolja.
+
+### 9.1 Audit — mi mérhető, mi nem
+
+- **Már mérve volt**: zone tick (ring + p50/p95/p99/max), gameplay/ghost/repl
+  stage-ek, LOD eval µs, AOI query, transform record, migration, worker pool,
+  supervisor, routing, activity/load field rebuild, partition tranzakciók.
+- **Össze volt vonva** → minimálisan instrumentálva (nem új metrics rendszer):
+  `ai_micros`, `movement_micros` (a gameplay-n belül), `aoi_micros` (a
+  replikáción belül), `activity_publish_micros`, `load_publish_micros`,
+  `ghost_entities` (ghost munka-proxy). A supervisor oldalon:
+  `control_us` / `observe_us` / `score_us` / `migration_us`.
+  Minden `*_since_diag` a meglévő 1 Hz exchange-csatornába került (különben
+  a readiness harness first-sample-je a teljes warmupot beleszámolta volna).
+- **Benchmark plumbing újrahasznosítva**: `ZoneDiagnostics` ring,
+  `CollectProcessLoad`, `PartitionMetrics`, `LoadFieldMetrics`,
+  `ActivityMetrics`, `MigrationMetrics`, routing metrikák, `LodWorkTotals`, a
+  meglévő `--lod-off` / `--loadfield-off` kapcsolók + új `--asf-off`
+  (observe-only baseline: a telemetria fut, döntés nincs;
+  `PartitionScoringConfig::adaptive_enabled`).
+
+### 9.2 Mérési módszertan
+
+- **Világ**: szintetikus, flat, 100 km × 100 km, 8×8 = 64 kezdeti zóna
+  (12.5 km), 4 régió. A production rendszerek futnak (nincs mock szimuláció);
+  a 100 km² heightfield asset helyett `TerrainService(extent)` seam.
+- **Fázisok**: SETUP (spawn) → WARMUP (melegítés, nem mért) → MEASURE →
+  FINAL VALIDATION. A setup költség soha nem keveredik a steady-state tickbe.
+- **Determinizmus**: fix seed, determinisztikus spawn-pont generálás (nincs
+  kontrollálatlan RNG a workload-elrendezésben), dokumentált sűrűségek. A
+  mobok spawn-sugara = wander-leash (production szemantika), ezért a "spread"
+  200k mob 200k külön ponton, 40 m leash-csel jelenik meg — nem egyetlen
+  óriás clusterként (ami hamis migration/ghost churn-t gyártana).
+- **Scenario-k**: spread, quiet, hotspot, multi, moving, border, combat,
+  replication, churn (dokumentáltan gyorsított control-timerekkel), dense
+  (legrosszabb praktikus sűrűség: 20k mob + 500 player 2×2 km-en = 5k mob/km²,
+  125 player/km²).
+- **Build/környezet**: Windows, 16 logikai mag, 63.9 GB RAM, MSVC 19.51,
+  **RelWithDebInfo** (NDEBUG=1, LTCG), x64. Nem virtualizált/container.
+- **Mérés**: 200 ms-onkénti mintavétel; a stage-összegek a supervisor 1 Hz-es
+  exchange-ablakait delta-követéssel rekonstruálják; a tick percentilisek a
+  256 mintás ringből (utolsó ~12.8 s/zóna); a globális számlálók cumulatív
+  delták. A validation a supervisor quiescent ablakában fut (max 90 s várakozás).
+
+### 9.3 Eredmények — scenario-k (warmup 60 s, measure 30 s)
+
+| scenario | zónák | tick avg | p50 | p95 | p99 | max | domináns stage |
+|---|---|---|---|---|---|---|---|
+| spread | 320 | 1.97 ms | 1.54 | 5.77 | 7.01 | 17.0 | **ghost 77.3%** |
+| quiet | 320 | 1.97 ms | 1.54 | 5.77 | 7.01 | 17.0 | **ghost 77.3%** |
+| hotspot | 280 | 2.55 ms | 1.70 | 4.25 | 17.28 | 61.6 | ghost 54.2%, repl 26.6% |
+| multi | 180 | 3.14 ms | 0.93 | 14.01 | 20.55 | 46.4 | ghost 59.5%, repl 19.1% |
+| moving | 276 | 3.20 ms | 2.94 | 5.35 | 15.51 | 92.9 | repl 50.0%, gameplay 30.5% |
+| border | 328 | 1.95 ms | 0.95 | 5.33 | 10.52 | 25.6 | ghost 56.3%, gameplay 30.1% |
+| combat | 80 | 3.41 ms | 0.92 | 6.77 | **70.65** | **187.2** | repl 53.2%, gameplay 29.8% |
+| replication | 100 | 3.67 ms | 3.16 | 4.64 | **57.58** | **144.5** | **repl 84.7%** |
+| churn | 158 | 2.10 ms | 1.19 | 4.83 | 10.96 | 33.5 | repl 40.9%, gameplay 38.7% |
+| dense | 68 | 8.73 ms | 2.94 | 4.61 | **294.94** | **1184.1** | **repl 63.9%** |
+
+Megjegyzések:
+- A 64 kezdeti zónát az ASF a warmup/measure alatt 68–328 slotra bontja
+  (split), a sleeping zónák száma 0–272 között mozog (zone sleep működik).
+- **LOD eloszlás** (spread, 90 s warmup): full 728, reduced 7655, low 75751,
+  dormant 115868 — a 200k mob **~58%-a Dormant**, ~0.4% Full. A 30 s warmup
+  után (gyorsabb futások) még kevesebb Dormant: a demóciós kaszkád
+  (5/30/60 s grace) ~95 s alatt teljes, ezért a warmup hossza kritikus.
+- **Migration**: spread 53 commit / 94 boundary crossing 30 s alatt (realista,
+  40 m leash mellett); border/churn 15–114 commit; a hotspot 42k crossingja
+  a sűrű, határhoz közeli mozgásból jön.
+- **ASF döntések**: churn = 21 split + 2 merge commit, 3 merge eval, 6
+  sustained-low és 10 eligibility suppression; a többi scenario split-heavy
+  (a durva 12.5 km-es kezdeti rács finomítása), merge nélkül.
+- **Replication volume**: spread 13.5 MB / 30 s (0.45 MB/s); hotspot 466 MB
+  (15.5 MB/s, 41M record); multi 519 MB (17.3 MB/s); replication 422 MB;
+  dense 87 MB. A byte-ok a fanouttal együtt skálázódnak.
+- **Memória** (working set): spread 2.04 GB, asf-off 1.47 GB, hotspot 3.15 GB,
+  multi 3.22 GB, replication 2.74 GB, dense 1.90 GB. A load grid fix 3.24 MB,
+  az activity grid 0.92 MB — a többi a flecs entity-tár + zóna struktúrák.
+
+### 9.4 A/B mérések
+
+**ASF control ON vs OFF** (spread, 500p/200k):
+
+| | zónák | tick avg | p99 | ghost | control (30 ciklus) |
+|---|---|---|---|---|---|
+| ASF ON | 320 | **1.97 ms** | **7.01** | 77.3% | 700 ms (observe 180) |
+| ASF OFF | 64 | 3.83 ms | 9.82 | 66.8% | 81 ms |
+
+Az adaptive split **~49%-kal csökkentette az átlagos ticket és ~29%-kal a
+p99-et**, miközben a control-plane ~23 ms/ciklus (1 Hz, ~2.3% egy magból) és
+a memória +0.6 GB. Ez a fázis legfontosabb pozitív eredménye.
+
+**Load Field ON vs OFF** (asf-off, mindkettő 64 zóna — tiszta telemetria A/B):
+
+| | tick avg | p99 | gameplay | AI+movement | load_publish |
+|---|---|---|---|---|---|
+| field ON | 3.830 ms | 9.817 | 70.9 s | 69.6 s | 213 µs |
+| field OFF | 3.694 ms | 9.669 | 65.1 s | 64.0 s | 2 µs |
+
+A Load Field telemetria **~3–4%-os tick overhead** (a zóna-bin `CellFor`
+hívások az AI/movement hurkokban), a rebuild ~1.1 s / 30 s (1 Hz, 40k cella).
+Nem bottleneck.
+
+**LOD ON vs OFF** (50k mob, 200 player, 64 zóna, 30 s warmup — kontrollált,
+nem a teljes 200k, hogy a gép ne telítődjön):
+
+| | tick avg | p99 | gameplay | AI+movement | Full mob |
+|---|---|---|---|---|---|
+| LOD ON | **0.644 ms** | **1.22** | 5.49 s | 5.24 s | 137 |
+| LOD OFF | 1.251 ms | 2.68 | 36.6 s | 36.1 s | 50000 |
+
+A LOD **~49%-kal csökkenti a ticket és ~86%-kal a tényleges AI+movement
+munkát** már 30 s warmupnál (a Dormant arány növekedésével ez tovább javul).
+Production default változatlan.
+
+### 9.5 Bottleneck rangsor (mért)
+
+1. **Ghost maintenance** — 54–77% minden spread-jellegű scenarióban. A
+   `GhostSystem::Rebuild` minden tickben **az összes** ghostot eldobja és újra
+   létrehozza flecs entity-ként a szomszédok publish-buffereiből (spread: 97M
+   ghost-entity művelet / 30 s). A költség a player-bearing zónák számával és
+   a szomszédok border-band entitásszámával skálázódik.
+2. **AOI/replikáció nagy sűrűségnél** — replication 84.7% (AOI 29 s/30 s),
+   dense p99 **295 ms**, replication p99 58 ms, combat p99 71 ms. A
+   viewer-enkénti ~240 pre-cap candidate + a 100-as cap előtti rendezés a fő
+   költség; a fanout byte-ok 14–17 MB/s csúcsot érnek el.
+3. **LOD eval az activity-field query-n** — mob-hotspotnál a Fast query
+   O(a low-radius boxban lévő összes player-source)/mob; 20k mob × 400 player
+   = 8M távolságellenőrzés/eval. Ez adja a hotspot/dense max spike-ok egy
+   részét.
+4. **Combat command + fanout** — dense hotspotban 5000 attack command/s, a
+   health/death payload minden látható viewer-nek megy; combat p99 71 ms.
+5. **Control-plane observe** — 320 zónánál ~23 ms/ciklus (1 Hz); most
+   elfogadható, 1000+ zónánál újra kell nézni.
+6. **Supervisor migration** — 9–92 ms / 30 s; nem bottleneck.
+
+A Load Field, Activity Field, LOD eval, zone sleep, migration és a partition
+tranzakciók **nem** jelentenek szűk keresztmetszetet a mért workloadokon.
+
+### 9.6 Talált és javított hibák
+
+1. **Split abort a migration hysteresis sávban lévő resident miatt** (súlyos
+   robustness bug): a parent boundsán kívülre került (de még a parenthez
+   tartozó) mob nem illeszkedett egyetlen childba sem → `unroutable-resident`
+   abort, 200k mobnál **30 abort / 30 s** (a split soha nem tudott lefutni).
+   Javítva: a pozíció a parent rectbe clampolva routolódik a tartalmazó
+   childba (a children pontosan csempézik a parentet).
+2. **Stale LOD tier gauge-ok a retired/tombstoned zónákon**: a világ-szintű
+   tier riportok minden zone slotot összegeznek, így a szülő + gyerekek
+   duplán számolódtak (320 zónánál ~2× túlszámolás), és az aborted split
+   staged childjai (részleges transfer után) véglegesen felszívódtak.
+   Javítva: gauge-reset minden retirement/tombstone úton (`RetireZone`,
+   `AbortSplit`, `AbortMerge`).
+3. **Benchmark harness hibák** (nem production): a per-zóna akkumulátor nem
+   nőtt splitkor (heap corruption), a szintetikus világ örökölte a map base
+   spawn pointjait (+9 mob), a spawn-sugár = wander-leash miatt a korai
+   workload degenerált volt, és az új stage-számlálók exchange-e hiányzott.
+
+### 9.7 Következtetés — Phase 5 javaslat
+
+A mérés alapján a Phase 5 a **ghost/replikáció/AOI skálázás** köré
+szerveződjön:
+
+1. **Inkrementális ghost kezelés**: ne épüljön újra a teljes ghost set
+   tickenként; publish-buffer generáció/diff alapján csak a változások
+   frissüljenek, a ghost entity-k újrahasznosítva (flecs entity churn
+   megszüntetése). Cél: a ghost stage 77% → <20%.
+2. **AOI candidate költség**: cap előtti candidate-szűrés olcsóbbá tétele
+   (távolság-tier prefilter, inkrementális visibility), mert a dense p99 már
+   most 6× a budget felett van.
+3. **Activity-field query**: source-ok cellánkénti indexelése vagy cap, hogy a
+   mob-hotspot LOD eval ne O(players-in-box) legyen mobonként.
+4. **Combat fanout**: health/death payload coalescing a látható viewerek felé.
+5. A stability controller (split/merge/cooldown) **mérten stabil**: a churn
+   scenario 2 merge + 21 split mellett 0 oscillation trip és 0 emergency
+   bypass; a suppression okok mérhetők.
+
+A Phase 4 kódváltozásai: minimál instrumentáció (stage timings + diag
+exchange), a fenti 2 production robustness fix, a szintetikus világ/spawn
+seam, és a `--mode readiness` harness (`ReadinessBench.h/.cpp`).

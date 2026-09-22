@@ -73,6 +73,13 @@ inline constexpr float kBoundaryCombatWeight = 0.15f;
 inline constexpr float kBoundaryHotspotWeight = 0.15f;
 
 struct PartitionScoringConfig {
+    // Adaptive control master switch. When false the observe/telemetry path
+    // still runs (the load field, the monitor scores and the decision log are
+    // still available) but no split/merge recommendation is produced and no
+    // topology mutation happens: the legacy static partition topology is the
+    // baseline. Used for A/B measurement and as an operational kill switch.
+    bool adaptive_enabled = true;
+
     // Geometric floor for candidate cuts (mirrors the effective partition
     // min_zone_size_m; each half must clear it). Set by ConfigurePartition.
     float min_zone_size_m = 500.0f;

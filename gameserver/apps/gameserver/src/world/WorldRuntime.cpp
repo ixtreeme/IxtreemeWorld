@@ -2,6 +2,7 @@
 
 #include <algorithm>
 #include <chrono>
+#include <cmath>
 #include <cstdint>
 #include <filesystem>
 #include <fstream>
@@ -90,8 +91,60 @@ WorldRuntime::WorldRuntime(boost::asio::io_context& io, RuntimeIdentity identity
     })
 {
     const std::string map_root = IXTREEME_DEFAULT_MAP_ROOT;
-    terrain_ = TerrainService::LoadFromMapRoot(map_root);
-    world_logic_ = LoadWorldLogicFromMapRoot(map_root);
+    InitializeWorld(TerrainService::LoadFromMapRoot(map_root),
+                    LoadWorldLogicFromMapRoot(map_root),
+                    IXTREEME_DEFAULT_MOB_TYPES_CONFIG,
+                    map_root,
+                    true);
+}
+
+WorldRuntime::WorldRuntime(boost::asio::io_context& io,
+                           RuntimeIdentity identity,
+                           const SyntheticWorldConfig& synthetic)
+    : WorldRuntime(io, identity)
+{
+    // Deterministic synthetic zone grid tiling [0, extent]^2. Region
+    // assignment (DefaultRegions quadrants) happens in BuildFromWorldLogic.
+    mx::map::WorldLogic logic;
+    const std::uint32_t zones_x = std::max(1u, synthetic.zones_x);
+    const std::uint32_t zones_y = std::max(1u, synthetic.zones_y);
+    const float extent = synthetic.extent_m > 0.0f ? synthetic.extent_m : 100000.0f;
+    const float cell_w = extent / static_cast<float>(zones_x);
+    const float cell_h = extent / static_cast<float>(zones_y);
+    logic.zones.reserve(static_cast<std::size_t>(zones_x) * zones_y);
+    std::uint32_t next_id = 1;
+    for (std::uint32_t gy = 0; gy < zones_y; ++gy) {
+        for (std::uint32_t gx = 0; gx < zones_x; ++gx) {
+            mx::map::Zone zone;
+            zone.id = next_id++;
+            zone.name = "synth_" + std::to_string(gx) + "_" + std::to_string(gy);
+            zone.bounds = mx::map::Rect{static_cast<float>(gx) * cell_w,
+                                        static_cast<float>(gy) * cell_h,
+                                        static_cast<float>(gx + 1) * cell_w,
+                                        static_cast<float>(gy + 1) * cell_h};
+            logic.zones.push_back(std::move(zone));
+        }
+    }
+    // One fallback spawn region at the world center (benchmark players are
+    // placed explicitly; this only feeds the default spawn resolution).
+    logic.spawns.push_back(mx::map::SpawnRegion{
+        1, logic.zones.front().id,
+        mx::map::Rect{extent * 0.5f - 50.0f, extent * 0.5f - 50.0f, extent * 0.5f + 50.0f,
+                      extent * 0.5f + 50.0f}});
+    const std::string types = synthetic.mob_types_config.empty()
+                                  ? std::string(IXTREEME_DEFAULT_MOB_TYPES_CONFIG)
+                                  : synthetic.mob_types_config;
+    InitializeWorld(TerrainService(extent), std::move(logic), types, std::string{}, false);
+}
+
+void WorldRuntime::InitializeWorld(TerrainService terrain,
+                                   mx::map::WorldLogic logic,
+                                   const std::string& mob_types_config,
+                                   const std::string& map_root,
+                                   bool load_map_spawn_points)
+{
+    terrain_ = std::move(terrain);
+    world_logic_ = std::move(logic);
 
     zones_.BuildFromWorldLogic(world_logic_, terrain_.WorldExtentMeters());
     directory_.RebuildFromManager(zones_);
@@ -113,7 +166,21 @@ WorldRuntime::WorldRuntime(boost::asio::io_context& io, RuntimeIdentity identity
     }
     effective_load_field_config_ = load_field_config;
     last_load_field_build_ = std::chrono::steady_clock::now();
-    spawn_.Initialize(map_root, IXTREEME_DEFAULT_MOB_TYPES_CONFIG);
+    if (load_map_spawn_points) {
+        spawn_.Initialize(map_root, mob_types_config);
+    } else {
+        spawn_.ClearSpawnPoints();
+        spawn_.LoadMobTypes(mob_types_config);
+    }
+}
+
+std::size_t WorldRuntime::SpawnConfiguredMobsNow()
+{
+    if (zones_.AnyTickInProgress()) {
+        LOG_WARN("bulk mob spawn refused: zone tick in flight");
+        return 0;
+    }
+    return spawn_.SpawnAllConfiguredMobs();
 }
 
 WorldRuntime::~WorldRuntime()
@@ -239,7 +306,14 @@ void WorldRuntime::Run()
     while (!stopping_) {
         const auto supervisor_start = std::chrono::steady_clock::now();
         DrainGlobalCommands();
+        const auto migration_start = std::chrono::steady_clock::now();
         migration_.ProcessMigrations(world_tick_.load(std::memory_order_relaxed));
+        partition_metrics_.migration_us.fetch_add(
+            static_cast<std::uint64_t>(
+                std::chrono::duration_cast<std::chrono::microseconds>(
+                    std::chrono::steady_clock::now() - migration_start)
+                    .count()),
+            std::memory_order_relaxed);
         spawn_.ProcessRespawns(kTickDtSeconds);
         inputs_.DrainMoves(owners_by_session_);
         inputs_.DrainAttacks(owners_by_session_,
@@ -376,6 +450,12 @@ void WorldRuntime::Run()
             std::uint64_t total_gameplay_micros = 0;
             std::uint64_t total_ghost_micros = 0;
             std::uint64_t total_repl_micros = 0;
+            std::uint64_t total_ai_micros = 0;
+            std::uint64_t total_movement_micros = 0;
+            std::uint64_t total_aoi_micros = 0;
+            std::uint64_t total_activity_publish_micros = 0;
+            std::uint64_t total_load_publish_micros = 0;
+            std::uint64_t total_ghost_entities = 0;
             std::uint64_t total_lod_ai = 0;
             std::uint64_t total_lod_mv = 0;
             std::uint64_t total_lod_prom = 0;
@@ -425,6 +505,14 @@ void WorldRuntime::Run()
                 total_gameplay_micros += zone.Diagnostics().gameplay_micros_since_diag.exchange(0);
                 total_ghost_micros += zone.Diagnostics().ghost_micros_since_diag.exchange(0);
                 total_repl_micros += zone.Diagnostics().replication_micros_since_diag.exchange(0);
+                total_ai_micros += zone.Diagnostics().ai_micros_since_diag.exchange(0);
+                total_movement_micros += zone.Diagnostics().movement_micros_since_diag.exchange(0);
+                total_aoi_micros += zone.Diagnostics().aoi_micros_since_diag.exchange(0);
+                total_activity_publish_micros +=
+                    zone.Diagnostics().activity_publish_micros_since_diag.exchange(0);
+                total_load_publish_micros +=
+                    zone.Diagnostics().load_publish_micros_since_diag.exchange(0);
+                total_ghost_entities += zone.Diagnostics().ghost_entities_since_diag.exchange(0);
                 total_lod_ai += zone.Diagnostics().lod_ai_updates_since_diag.exchange(0);
                 total_lod_mv += zone.Diagnostics().lod_move_updates_since_diag.exchange(0);
                 total_lod_prom += zone.Diagnostics().lod_promotions_since_diag.exchange(0);
@@ -467,7 +555,7 @@ void WorldRuntime::Run()
              const auto mig_metrics = migration_.MetricsSnapshot();
              const auto part_metrics = partition_metrics_.TakeSnapshot();
              const auto activity_metrics = activity_field_.Metrics();
-            LOG_INFO("Game sim diag: world_tick={} zones={} active_zones={} sleeping_zones={} active_sessions={} active_mobs={} wandering_mobs={} idle_mobs={} ghosts={} zone_ticks={} empty_zone_skips={} transform_records_sent={} attacks_per_sec={} deaths_total={} respawns_pending={} respawns_total={} migrations={} mig_pending={} mig_quarantined={} mig_detail=[c={} stale={} dup={} retry={} fail={}] routes=[local={} remu={} unav={} drain={} miss={}] workers={} worker_busy_pct={:.1f}                      avg_zone_tick_ms={:.3f} aoi_queries={} dirty_xf={} tiers=[{}/{}/{}] stage_us=[gameplay={} ghost={} repl={}] avg_supervisor_ms={:.3f} partition=[s_att={} s_ok={} s_ab={} m_att={} m_ok={} m_ab={} rej={}] lod=[{}/{}/{}/{} ai={} mv={} prom={} dem={} wake={} eval_us={}] xzone=[f={} r={} l={}] sleep=[blocked={} wext={}] activity=[srcs={} cells={} rb_us={}]",
+            LOG_INFO("Game sim diag: world_tick={} zones={} active_zones={} sleeping_zones={} active_sessions={} active_mobs={} wandering_mobs={} idle_mobs={} ghosts={} zone_ticks={} empty_zone_skips={} transform_records_sent={} attacks_per_sec={} deaths_total={} respawns_pending={} respawns_total={} migrations={} mig_pending={} mig_quarantined={} mig_detail=[c={} stale={} dup={} retry={} fail={}] routes=[local={} remu={} unav={} drain={} miss={}] workers={} worker_busy_pct={:.1f}                      avg_zone_tick_ms={:.3f} aoi_queries={} dirty_xf={} tiers=[{}/{}/{}] stage_us=[gameplay={} ai={} movement={} aoi={} ghost={} activity={} load={} repl={} ghost_entities={}] avg_supervisor_ms={:.3f} partition=[s_att={} s_ok={} s_ab={} m_att={} m_ok={} m_ab={} rej={}] lod=[{}/{}/{}/{} ai={} mv={} prom={} dem={} wake={} eval_us={}] xzone=[f={} r={} l={}] sleep=[blocked={} wext={}] activity=[srcs={} cells={} rb_us={}]",
                      world_tick_.load(),
                      zones_.ZoneCount(),
                      active_zones,
@@ -506,8 +594,14 @@ void WorldRuntime::Run()
                      total_tier_mid,
                      total_tier_far,
                      total_gameplay_micros,
+                     total_ai_micros,
+                     total_movement_micros,
+                     total_aoi_micros,
                      total_ghost_micros,
+                     total_activity_publish_micros,
+                     total_load_publish_micros,
                      total_repl_micros,
+                     total_ghost_entities,
                      avg_supervisor_ms,
                      part_metrics.split_attempts,
                      part_metrics.split_commits,
@@ -805,14 +899,25 @@ void WorldRuntime::ExecutePartitionControl()
         return;
     }
     last_partition_control_ = now;
+    const auto control_start = std::chrono::steady_clock::now();
+    std::uint64_t score_us = 0;
 
     // OBSERVE: legacy p95/p99 tick + resident pressure, field overload score,
     // sustained timers, candidate lists.
     const auto field = load_field_.Snapshot();
     const auto activity = activity_field_.Snapshot();
+    const auto observe_start = std::chrono::steady_clock::now();
     load_monitor_.Update(zones_, scheduler_, now, field);
+    partition_metrics_.observe_us.fetch_add(ElapsedUs(observe_start, std::chrono::steady_clock::now()),
+                                            std::memory_order_relaxed);
 
     const PartitionScoringConfig& scoring = scorer_.GetConfig();
+    if (!scoring.adaptive_enabled) {
+        // Observe-only baseline: telemetry is intact, decisions are off.
+        partition_metrics_.control_us.fetch_add(
+            ElapsedUs(control_start, std::chrono::steady_clock::now()), std::memory_order_relaxed);
+        return;
+    }
 
     // SCORE + DECIDE: at most one topology mutation per control cycle. The
     // scorer only recommends; the transactional executors re-validate every
@@ -821,8 +926,10 @@ void WorldRuntime::ExecutePartitionControl()
     // only runs when no split executed.
     bool mutated = false;
     for (const ZoneId zone_id : load_monitor_.SplitCandidates()) {
+        const auto score_start = std::chrono::steady_clock::now();
         const SplitRecommendation recommendation =
             ScorePartitionWith(zone_id, field, activity, now);
+        score_us += ElapsedUs(score_start, std::chrono::steady_clock::now());
         const float p99_ms = [&] {
             for (const auto& snap : load_monitor_.RecentSnapshots()) {
                 if (snap.zone_id == zone_id) {
@@ -1014,8 +1121,10 @@ void WorldRuntime::ExecutePartitionControl()
         MergeRecommendation best;
         bool have_best = false;
         for (const ZoneId parent_id : load_monitor_.MergeCandidates()) {
+            const auto score_start = std::chrono::steady_clock::now();
             const MergeRecommendation recommendation =
                 ScoreMergeWith(parent_id, field, activity, now);
+            score_us += ElapsedUs(score_start, std::chrono::steady_clock::now());
             partition_metrics_.merge_candidates_evaluated.fetch_add(1,
                                                                     std::memory_order_relaxed);
             if (!recommendation.valid) {
@@ -1069,6 +1178,10 @@ void WorldRuntime::ExecutePartitionControl()
             }
         }
     }
+
+    partition_metrics_.score_us.fetch_add(score_us, std::memory_order_relaxed);
+    partition_metrics_.control_us.fetch_add(
+        ElapsedUs(control_start, std::chrono::steady_clock::now()), std::memory_order_relaxed);
 }
 
 SplitRecommendation WorldRuntime::ScorePartitionWith(
@@ -1420,6 +1533,32 @@ bool WorldRuntime::RunSplitTransaction(ZoneId zone_id, bool forced, const SplitC
             for (const ZoneId child_id : children) {
                 const std::size_t child_index = zones_.FindIndexById(child_id);
                 if (zones_.GetZone(child_index).Bounds().Contains(pos.x, pos.y)) {
+                    match_id = child_id;
+                    match_index = child_index;
+                    matched = true;
+                    break;
+                }
+            }
+        }
+        if (!matched) {
+            // A resident can sit marginally OUTSIDE the parent bounds while a
+            // pending migration (hysteresis band) has not committed yet: it
+            // still belongs to this parent, so the split must not abort. Clamp
+            // it into the parent rect and route it to the containing child
+            // (the children tile the parent exactly with half-open bounds, so
+            // a clamped point always matches exactly one child).
+            const auto& parent_bounds = zones_.GetZone(parent_index).Bounds();
+            const float clamped_x = std::clamp(
+                pos.x, parent_bounds.min_x,
+                std::nextafter(parent_bounds.max_x, parent_bounds.min_x));
+            const float clamped_y = std::clamp(
+                pos.y, parent_bounds.min_y,
+                std::nextafter(parent_bounds.max_y, parent_bounds.min_y));
+            for (const ZoneId child_id : children) {
+                const std::size_t child_index = zones_.FindIndexById(child_id);
+                const auto& b = zones_.GetZone(child_index).Bounds();
+                if (clamped_x >= b.min_x && clamped_x < b.max_x && clamped_y >= b.min_y &&
+                    clamped_y < b.max_y) {
                     match_id = child_id;
                     match_index = child_index;
                     matched = true;
@@ -1861,10 +2000,11 @@ void WorldRuntime::ConfigurePartition(const PartitionConfig& config)
              e.max_partition_depth,
              e.min_zone_size_m);
     const auto& s = e.scoring;
-    LOG_INFO("partition scoring effective: min_improvement={:.2f} band={:.0f}m hotspot>={:.2f}x{} "
-             "weights=[bal={:.2f} bnd={:.2f} mig={:.2f} rep={:.2f} inst={:.2f} topo={:.2f}] "
-             "budgets=[act={:.0f} mig={:.1f} rep={:.1f} cbt={:.1f} work={:.0f}] "
+    LOG_INFO("partition scoring effective: adaptive={} min_improvement={:.2f} band={:.0f}m "
+             "hotspot>={:.2f}x{} weights=[bal={:.2f} bnd={:.2f} mig={:.2f} rep={:.2f} inst={:.2f} "
+             "topo={:.2f}] budgets=[act={:.0f} mig={:.1f} rep={:.1f} cbt={:.1f} work={:.0f}] "
              "timescale={} log={} why_not_interval={:.0f}s",
+             s.adaptive_enabled ? "on" : "off",
              s.min_expected_improvement,
              s.boundary_band_m,
              s.hotspot_threshold,
