@@ -40,10 +40,26 @@ public:
                       const std::shared_ptr<const ActivityGrid>& activity,
                       float wake_radius_m);
 
+    // Structured split gate: which condition blocks a split right now. The
+    // monitor uses it for why-not diagnostics; ShouldSplit is exactly
+    // "gate == Pass".
+    enum class SplitGate : std::uint8_t {
+        Pass = 0,
+        NotLeaf,
+        MaxDepth,
+        BelowThreshold,
+        NotSustained,
+        Cooldown,
+    };
+
     // Pure predicates over leaf state (const: timers are owned/updated by
     // ZoneLoadMonitor::Update). Execution re-validates in ZoneManager.
+    SplitGate EvaluateSplitGate(const ZonePartition* leaf,
+                                std::chrono::steady_clock::time_point now) const;
     bool ShouldSplit(const ZonePartition* leaf, std::chrono::steady_clock::time_point now) const;
     bool ShouldMerge(const ZonePartition* leaf, std::chrono::steady_clock::time_point now) const;
+
+    static const char* SplitGateName(SplitGate gate) noexcept;
 
     // Simulation LOD master switch (mirrors LodConfig::enabled, set by
     // WorldRuntime::ConfigureSimulationLod). Off = legacy sleep rule.

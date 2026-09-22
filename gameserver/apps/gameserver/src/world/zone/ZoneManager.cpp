@@ -157,21 +157,33 @@ std::vector<ZonePartition*> ZoneManager::GetActiveLeaves() const
     return leaves;
 }
 
-bool ZoneManager::PlanSplit(ZoneId zone_id, SplitPlan& out_plan) const
+bool ZoneManager::PlanSplit(ZoneId zone_id,
+                            SplitPlan& out_plan,
+                            SplitRejectReason* out_reason,
+                            const SplitCenter* center) const
 {
+    auto reject = [out_reason](SplitRejectReason reason) {
+        if (out_reason != nullptr) {
+            *out_reason = reason;
+        }
+        return false;
+    };
+    if (out_reason != nullptr) {
+        *out_reason = SplitRejectReason::None;
+    }
     out_plan = SplitPlan{};
     const std::size_t zone_index = FindIndexById(zone_id);
     if (zone_index >= zones_.size()) {
-        return false;
+        return reject(SplitRejectReason::UnknownZone);
     }
     const Zone& zone = *zones_[zone_index];
     if (!zone.SimulationEnabled() || zone.Partition() != PartitionState::Leaf) {
-        return false;
+        return reject(SplitRejectReason::NotSimulating);
     }
     if (!zone.Commands().Empty()) {
         // Racing commands would strand in the frozen parent: retry next
         // cycle instead of stranding work.
-        return false;
+        return reject(SplitRejectReason::CommandsPending);
     }
 
     const RegionDefinition* region = nullptr;
@@ -182,35 +194,40 @@ bool ZoneManager::PlanSplit(ZoneId zone_id, SplitPlan& out_plan) const
         }
     }
     if (region == nullptr) {
-        return false;
+        return reject(SplitRejectReason::NoRegion);
     }
 
     const ZonePartition* leaf = FindNodeInRoots(partition_roots_, zone_id);
     if (leaf == nullptr || !leaf->IsLeaf()) {
-        return false;
+        return reject(SplitRejectReason::NotLeaf);
     }
     if (leaf->depth >= region->max_partition_depth) {
-        return false;
+        return reject(SplitRejectReason::MaxDepth);
     }
 
     const mx::map::Rect bounds = zone.Bounds();
     const float half_w = (bounds.max_x - bounds.min_x) * 0.5f;
     const float half_h = (bounds.max_y - bounds.min_y) * 0.5f;
     if (half_w < region->min_zone_size || half_h < region->min_zone_size) {
-        return false;
+        return reject(SplitRejectReason::TooSmall);
     }
 
-    // Quadtree children tile the parent exactly (shared float midpoint, no
-    // gaps by construction). Half-open ownership is enforced by FindLeaf.
-    const float mid_x = bounds.min_x + half_w;
-    const float mid_y = bounds.min_y + half_h;
+    // Quadtree children tile the parent exactly (shared cut point, no gaps by
+    // construction). Half-open ownership is enforced by FindLeaf. The
+    // adaptive scorer may supply a load-aware cut point; it is clamped into
+    // the min-zone-size-safe range so every child still clears the floor.
+    float cut_x = bounds.min_x + half_w;
+    float cut_y = bounds.min_y + half_h;
+    if (center != nullptr) {
+        cut_x = std::clamp(center->x, bounds.min_x + region->min_zone_size,
+                           bounds.max_x - region->min_zone_size);
+        cut_y = std::clamp(center->y, bounds.min_y + region->min_zone_size,
+                           bounds.max_y - region->min_zone_size);
+    }
     out_plan.parent_id = zone_id;
     out_plan.parent_index = zone_index;
     out_plan.region_id = zone.Region();
-    out_plan.child_bounds[0] = {bounds.min_x, mid_y, mid_x, bounds.max_y}; // NW
-    out_plan.child_bounds[1] = {mid_x, mid_y, bounds.max_x, bounds.max_y}; // NE
-    out_plan.child_bounds[2] = {bounds.min_x, bounds.min_y, mid_x, mid_y}; // SW
-    out_plan.child_bounds[3] = {mid_x, bounds.min_y, bounds.max_x, mid_y}; // SE
+    BuildQuadtreeChildBounds(bounds, cut_x, cut_y, out_plan.child_bounds);
     out_plan.child_depth = static_cast<std::uint8_t>(leaf->depth + 1);
     out_plan.valid = true;
     return true;

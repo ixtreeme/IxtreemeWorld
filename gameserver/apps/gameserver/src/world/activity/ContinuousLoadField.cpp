@@ -3,6 +3,7 @@
 #include <algorithm>
 #include <chrono>
 #include <cmath>
+#include <limits>
 
 #include "../zone/Zone.h"
 #include "../zone/ZoneManager.h"
@@ -337,6 +338,202 @@ bool ValidateLoadFieldGrid(const LoadGrid& grid, std::string& out_error)
 
     out_error.clear();
     return true;
+}
+
+namespace {
+
+// Half-open cell range covering `rect` within `grid`. Returns false when the
+// rect does not intersect the grid at all (a rect fully outside must never
+// fold into edge cells).
+bool CellRangeForRect(const LoadGrid& grid,
+                      const WorldBounds& rect,
+                      std::uint32_t& x0,
+                      std::uint32_t& x1,
+                      std::uint32_t& y0,
+                      std::uint32_t& y1) noexcept
+{
+    if (!rect.IsValid() || rect.max_x <= grid.bounds.min_x || rect.min_x >= grid.bounds.max_x ||
+        rect.max_y <= grid.bounds.min_y || rect.min_y >= grid.bounds.max_y) {
+        return false;
+    }
+    // Last cell whose START is < rect.max: nextafter(max, min) is inside the
+    // last overlapping cell. Cell-boundary-aligned rects therefore tile
+    // exactly (no double counting between sibling children).
+    x0 = grid.ClampedCellX(rect.min_x);
+    x1 = grid.ClampedCellX(std::nextafter(rect.max_x, rect.min_x));
+    y0 = grid.ClampedCellY(rect.min_y);
+    y1 = grid.ClampedCellY(std::nextafter(rect.max_y, rect.min_y));
+    return x0 <= x1 && y0 <= y1;
+}
+
+} // namespace
+
+LoadAggregate AggregateLoad(const LoadGrid& grid,
+                            const WorldBounds& rect,
+                            LoadTimescale scale) noexcept
+{
+    LoadAggregate out;
+    out.rect = rect;
+    if (!grid.enabled || grid.cells.empty()) {
+        return out;
+    }
+    std::uint32_t x0 = 0, x1 = 0, y0 = 0, y1 = 0;
+    if (!CellRangeForRect(grid, rect, x0, x1, y0, y1)) {
+        out.valid = true; // valid query, genuinely empty region
+        return out;
+    }
+    for (std::uint32_t y = y0; y <= y1; ++y) {
+        for (std::uint32_t x = x0; x <= x1; ++x) {
+            const auto& cell = grid.cells[static_cast<std::size_t>(y) * grid.dim_x + x];
+            const LoadChannels& channels = LoadChannelsFor(cell, scale);
+            const NormalizedLoad normalized = NormalizeLoad(channels, grid.config, grid.window_seconds);
+            ++out.cells;
+            if (IsLoadCellActive(cell)) {
+                ++out.active_cells;
+            }
+            out.raw += channels;
+            for (std::size_t channel = 0; channel < kLoadChannelCount; ++channel) {
+                out.normalized[channel] += normalized.values[channel];
+            }
+            out.composite_sum += normalized.composite;
+            const float center_x =
+                grid.bounds.min_x + (static_cast<float>(x) + 0.5f) * grid.cell_size_m;
+            const float center_y =
+                grid.bounds.min_y + (static_cast<float>(y) + 0.5f) * grid.cell_size_m;
+            if (normalized.composite > out.composite_peak) {
+                out.composite_peak = normalized.composite;
+                out.peak_x = center_x;
+                out.peak_y = center_y;
+            }
+            if (normalized.composite > 0.0f) {
+                out.centroid_x += center_x * normalized.composite;
+                out.centroid_y += center_y * normalized.composite;
+                out.weight_sum += normalized.composite;
+            }
+        }
+    }
+    if (out.weight_sum > 0.0f) {
+        out.centroid_x /= out.weight_sum;
+        out.centroid_y /= out.weight_sum;
+    }
+    out.valid = true;
+    return out;
+}
+
+std::vector<LoadHotspot> DetectLoadHotspots(const LoadGrid& grid,
+                                            const WorldBounds& rect,
+                                            LoadTimescale scale,
+                                            float threshold,
+                                            std::size_t max_hotspots,
+                                            std::vector<std::uint8_t>& scratch)
+{
+    std::vector<LoadHotspot> hotspots;
+    if (!grid.enabled || grid.cells.empty() || !(threshold > 0.0f) || max_hotspots == 0) {
+        return hotspots;
+    }
+    std::uint32_t x0 = 0, x1 = 0, y0 = 0, y1 = 0;
+    if (!CellRangeForRect(grid, rect, x0, x1, y0, y1)) {
+        return hotspots;
+    }
+    const std::uint32_t width = x1 - x0 + 1;
+    const std::uint32_t height = y1 - y0 + 1;
+    scratch.assign(static_cast<std::size_t>(width) * height, 0u);
+
+    auto cell_composite = [&](std::uint32_t x, std::uint32_t y) {
+        const auto& cell = grid.cells[static_cast<std::size_t>(y) * grid.dim_x + x];
+        const NormalizedLoad normalized =
+            NormalizeLoad(LoadChannelsFor(cell, scale), grid.config, grid.window_seconds);
+        return normalized.composite;
+    };
+
+    std::vector<std::uint32_t> stack;
+    stack.reserve(64);
+    for (std::uint32_t y = y0; y <= y1; ++y) {
+        for (std::uint32_t x = x0; x <= x1; ++x) {
+            const std::uint32_t local = (y - y0) * width + (x - x0);
+            if (scratch[local] != 0u || cell_composite(x, y) < threshold) {
+                continue;
+            }
+            // Flood fill this component.
+            LoadHotspot hotspot;
+            hotspot.bounds = WorldBounds{std::numeric_limits<float>::max(),
+                                         std::numeric_limits<float>::max(),
+                                         std::numeric_limits<float>::lowest(),
+                                         std::numeric_limits<float>::lowest()};
+            float weighted_x = 0.0f;
+            float weighted_y = 0.0f;
+            stack.clear();
+            stack.push_back(local);
+            scratch[local] = 1u;
+            while (!stack.empty()) {
+                const std::uint32_t index = stack.back();
+                stack.pop_back();
+                const std::uint32_t lx = index % width;
+                const std::uint32_t ly = index / width;
+                const std::uint32_t gx = x0 + lx;
+                const std::uint32_t gy = y0 + ly;
+                const float composite = cell_composite(gx, gy);
+                const float center_x =
+                    grid.bounds.min_x + (static_cast<float>(gx) + 0.5f) * grid.cell_size_m;
+                const float center_y =
+                    grid.bounds.min_y + (static_cast<float>(gy) + 0.5f) * grid.cell_size_m;
+                const float cell_min_x =
+                    grid.bounds.min_x + static_cast<float>(gx) * grid.cell_size_m;
+                const float cell_min_y =
+                    grid.bounds.min_y + static_cast<float>(gy) * grid.cell_size_m;
+                hotspot.bounds.min_x = std::min(hotspot.bounds.min_x, cell_min_x);
+                hotspot.bounds.min_y = std::min(hotspot.bounds.min_y, cell_min_y);
+                hotspot.bounds.max_x =
+                    std::max(hotspot.bounds.max_x, cell_min_x + grid.cell_size_m);
+                hotspot.bounds.max_y =
+                    std::max(hotspot.bounds.max_y, cell_min_y + grid.cell_size_m);
+                hotspot.load += composite;
+                hotspot.peak = std::max(hotspot.peak, composite);
+                weighted_x += center_x * composite;
+                weighted_y += center_y * composite;
+                ++hotspot.cells;
+                const std::uint32_t neighbors[4][2] = {
+                    {gx > x0 ? gx - 1 : gx, gy},
+                    {gx < x1 ? gx + 1 : gx, gy},
+                    {gx, gy > y0 ? gy - 1 : gy},
+                    {gx, gy < y1 ? gy + 1 : gy},
+                };
+                for (const auto& neighbor : neighbors) {
+                    if (neighbor[0] == gx && neighbor[1] == gy) {
+                        continue; // clamped edge: no neighbor
+                    }
+                    const std::uint32_t neighbor_local =
+                        (neighbor[1] - y0) * width + (neighbor[0] - x0);
+                    if (scratch[neighbor_local] != 0u ||
+                        cell_composite(neighbor[0], neighbor[1]) < threshold) {
+                        continue;
+                    }
+                    scratch[neighbor_local] = 1u;
+                    stack.push_back(neighbor_local);
+                }
+            }
+            if (hotspot.load > 0.0f) {
+                hotspot.center_x = weighted_x / hotspot.load;
+                hotspot.center_y = weighted_y / hotspot.load;
+            }
+            hotspots.push_back(hotspot);
+        }
+    }
+
+    // Deterministic: largest load first, then position (min_y, min_x).
+    std::sort(hotspots.begin(), hotspots.end(), [](const LoadHotspot& lhs, const LoadHotspot& rhs) {
+        if (lhs.load != rhs.load) {
+            return lhs.load > rhs.load;
+        }
+        if (lhs.bounds.min_y != rhs.bounds.min_y) {
+            return lhs.bounds.min_y < rhs.bounds.min_y;
+        }
+        return lhs.bounds.min_x < rhs.bounds.min_x;
+    });
+    if (hotspots.size() > max_hotspots) {
+        hotspots.resize(max_hotspots);
+    }
+    return hotspots;
 }
 
 } // namespace gs::game

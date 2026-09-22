@@ -70,8 +70,16 @@ public:
         bool valid = false;
     };
     // Pure validation, no mutation. False = routine skip (not a leaf, too
-    // small, max depth, unknown region), never an abort.
-    bool PlanSplit(ZoneId zone_id, SplitPlan& out_plan) const;
+    // small, max depth, unknown region), never an abort. `out_reason`
+    // (optional) carries the structured why-not for diagnostics. `center`
+    // (optional) is the adaptive scorer's cut point; it is clamped into the
+    // region's min-zone-size-safe range, so an invalid candidate degrades to
+    // the nearest valid cut instead of bypassing a gate. Null = the historic
+    // geometric midpoint.
+    bool PlanSplit(ZoneId zone_id,
+                   SplitPlan& out_plan,
+                   SplitRejectReason* out_reason = nullptr,
+                   const SplitCenter* center = nullptr) const;
     // Freezes the parent (SplitPending, sim off) and creates 4 staged child
     // Zones (Staging, sim off). No tree/directory/graph-visible change
     // beyond excluding frozen zones from the neighbor graph. On internal

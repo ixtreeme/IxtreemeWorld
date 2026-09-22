@@ -231,6 +231,21 @@ enum class LoadTimescale : std::uint8_t {
     Predicted = 3,
 };
 
+inline const char* LoadTimescaleName(LoadTimescale scale) noexcept
+{
+    switch (scale) {
+    case LoadTimescale::Current:
+        return "current";
+    case LoadTimescale::Fast:
+        return "fast";
+    case LoadTimescale::Slow:
+        return "slow";
+    case LoadTimescale::Predicted:
+        return "predicted";
+    }
+    return "?";
+}
+
 inline const LoadChannels& LoadChannelsFor(const LoadCell& cell, LoadTimescale scale) noexcept
 {
     switch (scale) {

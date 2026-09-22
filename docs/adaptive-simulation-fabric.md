@@ -618,9 +618,9 @@ Az előző commitból javított Fast/Exact semanticsra **tesztet kell írni**:
 | **A** | §2.1, §2.2, §39 | Fast/Exact query szétválasztás + explicit world origin + a hozzájuk tartozó tesztek | ✅ **KÉSZ** |
 | **B** | §3–6, §13–15, §34–37 | `ContinuousLoadField` váz: `LoadChannels`, dense cella-tár, két-időskálás EMA, decay, normalizáció, L0/L1 seam, Current/Predicted szétválasztás | ✅ **KÉSZ** (lásd §6) |
 | **C** | §7–12 | Térbeli work-attribúció a hívási pontokon: AI, movement, combat, AOI (candidate/cap), replication (byte + spawn/despawn + recipient), migration | ✅ **KÉSZ** (lásd §6.2) |
-| **D** | §16–17, §28, §30–33 | `PartitionLoadScore`, p95/p99 a control plane-en, strukturált döntési log, why-not diagnostics, `MinExpectedImprovement`, `TopologyComplexityPenalty` | ⬜ |
-| **E** | §18–24, §27 | BoundaryCost field, Partition Objective, hotspot detection (flood fill), hotspot-aware split, multi-candidate split, merge sustained-low timer | ⬜ |
-| **F** | §1, §21, §29 | `worldbench --mode loadfield`, validator-bővítés, regresszió a meglévő 7 módra, control-loop frekvenciák konfigurálhatóvá tétele | ⬜ |
+| **D** | §16–17, §28, §30–33 | `PartitionLoadScore`, p95/p99 a control plane-en, strukturált döntési log, why-not diagnostics, `MinExpectedImprovement`, `TopologyComplexityPenalty` | ✅ **KÉSZ** (lásd §7) |
+| **E** | §18–24, §27 | BoundaryCost field, Partition Objective, hotspot detection (flood fill), hotspot-aware split, multi-candidate split, merge sustained-low timer | ✅ **KÉSZ** (split rész; merge seam, lásd §7.7) |
+| **F** | §1, §21, §29 | `worldbench --mode loadfield`, validator-bővítés, regresszió a meglévő 7 módra, control-loop frekvenciák konfigurálhatóvá tétele | ⚠ **RÉSZLEGES**: `--mode partitionscore` + selftest kész, regresszió zöld; a control-loop frekvencia config még nyitott |
 
 ### Chunk A — elvégzett munka
 
@@ -855,3 +855,216 @@ read, globális lookup a hot pathon).
   a regresszió már fut, a `LoadFieldValidator` integráció a D chunkkal jön.
 - A replication delta protokoll és a per-entity cost model továbbra is seam;
   a mező ezek nélkül is korrekt és konzervatív (nullát mér, nem hamisít).
+
+---
+
+## 7. Chunk D/E — Adaptive Partition Scoring + Hotspot-Aware Split
+
+> Phase-2 implementációs jegyzet. A megrendelői szöveg a §26-nál félbeszakadt
+> (*„Concept"*); az implementáció a §0–§26 követelményeit ÉS a dokumentum saját
+> D/E chunk-tervét követi. Az audit a `e97333df` HEAD tényleges source-án készült.
+
+### 7.1 Audit — mi volt meg, mi hiányzott
+
+- **Megvolt és újrahasznosítva** (nem lett újraimplementálva): a teljes
+  `ContinuousLoadField` pipeline (5 channel, EMA, normalizáció, L1, immutable
+  generáció), a `ZoneLoadMonitor` (avg tick + resident score, sustained timer),
+  a `ZoneScheduler` gate-jei (sustained/cooldown/depth), a `ZoneManager`
+  tranzakciós quadtree split/merge (Plan→Stage→Transfer→Validate→Commit), a
+  `WorldRuntime` control loop (1 Hz, max 1 mutáció/ciklus), a validator és a
+  bench.
+- **Hiányzott**: térbeli (world-space) partition score, candidate cut
+  pozíciók, boundary cost, p95/p99 a control plane-en, strukturált döntési log,
+  why-not diagnostics, min-improvement gate, hotspot fogalom.
+- **Eltérés a prompttól, dokumentálva**: a prompt candidate-jei 2-way cutok
+  (X/Y); a meglévő executor kizárólag 4-way quadtree splitet tud. Ezért egy
+  candidate itt a **quadtree középpontja**, és a `PlanSplit` kapott egy
+  opcionális, min-size-ra clampolt center override-ot. Egy geometria, egy
+  executor — nincs második split rendszer (a prompt §7 tiltása).
+
+### 7.2 Architektúra — OBSERVE → SCORE → DECIDE → EXECUTE
+
+```
+ZoneLoadMonitor.Update          OBSERVE  (p95/p99 + field overload + timerek)
+        ↓
+PartitionScorer.ScoreSplit      SCORE    (read-only, tiszta, determinisztikus)
+        ↓
+gate-ek (sustained, cooldown, depth, min-size, MinExpectedImprovement)
+        ↓
+RunSplitTransaction             EXECUTE  (meglévő tranzakciós rendszer)
+```
+
+- Új fájlok: `world/partition/PartitionScoring.h/.cpp`. A load field oldalon
+  `LoadAggregate`/`AggregateLoad` + `DetectLoadHotspots` (read-only seam), az
+  activity field oldalon `CountPlayerSourcesIn` (külön boundary signal, §17).
+- A scorer **soha nem mutál**: nincs zone create/retire, transfer, OwnerMap
+  vagy partition tree írás. A `ScoreSplit` stateless (minden scratch lokális),
+  így a supervisor mellett a bench/admin is olvashatja párhuzamosan.
+- A monitor csak pontszámot + timert ír a partition node-ra; a döntést a
+  `WorldRuntime::ExecutePartitionControl` hozza, max 1 topológia-mutáció/ciklus.
+
+### 7.3 Candidate modell (determinisztikus)
+
+Rögzített sorrendben 9 candidate, mind a meglévő quadtree geometriából:
+`midpoint` · `centroid` · `centroid-x` · `centroid-y` · `balanced-x` ·
+`balanced-y` · `hotspot-x` · `hotspot-y` · `hotspot-corner`.
+
+- A cut pozíciók a load field **cellahatáraira snap-elnek** (így a child
+  aggregáció pontosan csempézi a cellákat), majd a min-zone-size sávba
+  clampolódnak; ha abban nincs cellahatár, sima clamp.
+- `balanced-*`: a zóna terhelését legjobban felező cellahatár (prefix-összeg,
+  O(cells), determinisztikus, holtversenynél az alacsonyabb pozíció nyer).
+- `hotspot-*`: a legnagyobb hotspot **izoláló élére** tett cut (a hotspot egész
+  marad egy childban); a `hotspot-corner` mindkét tengelyen.
+- Dedupe az első előfordulást tartja meg; a lista sorrendje a dokumentált
+  végső tie-break.
+- **Tie-break**: (1) nagyobb `final_score`, (2) kisebb `boundary_penalty`,
+  (3) korábbi lista-pozíció. `unordered_map` iteráció soha nem dönt.
+
+### 7.4 Score modell
+
+```
+final_score =  w_balance     * balance_benefit
+             - w_boundary    * boundary_penalty
+             - w_migration   * migration_penalty
+             - w_replication * replication_penalty
+             - w_instability * instability_penalty
+             - topology_penalty
+```
+
+- **balance_benefit = peak_reduction** = `(before_total - max_child)/before_total`.
+  Ez a „legterheltebb resulting partition" csökkentése: 99/1 felosztásnál ~0,
+  kiegyensúlyozottnál nagy — pontosan a §14 elvárása. `balance_ratio`
+  (max/mean child) csak diagnosztika.
+- **boundary_penalty** = `0.35*activity_band + 0.35*migration_band +
+  0.15*combat_band + 0.15*hotspot_crossed_frac`. A band a candidate két belső
+  cut vonala körüli sáv (config `boundary_band_m`, default 1.5×AOI).
+  - `activity_band`: **becsült** — activity-field player source-ok a sávban
+    (külön signal, §17, soha nem keveredik a load channelekbe).
+  - `migration_band`: **mért** — a load field migration channelje a sávban.
+  - `combat_band`: event-alapú, a sávban.
+  - `hotspot_crossed_frac`: a kettévágott hotspot-load aránya (flood-fill
+    komponensek a `hotspot_threshold` felett).
+- **replication_penalty** = replication channel a sávban — **estimated**
+  (a jelenlegi mért byte-okból extrapolált cross-boundary hatás, nem jövőbeli
+  mérés).
+- **migration_penalty** = `(players*w_player + mobs*w_mob)/budget` — a
+  végrehajtási transfer-work **becslése** a jelenlegi populációból; zóna-szintű,
+  ezért candidate-független (nincs csalás a rangsorban), a NOOP-hoz képesti
+  összköltséget reprezentálja. **Nem** azonos a MigrationPressure channellel
+  (§19): az a jelenlegi churn, ez a candidate végrehajtási költsége.
+- **instability_penalty**: recens split/merge után lineárisan lecsengő soft
+  penalty (`instability_window_s`, default 120 s); a hard gate-ek (cooldown,
+  depth, min-size) változatlanok.
+- **topology_penalty**: fix költség a +4 zónáért (§33), default 0.05.
+- Minden tag [0,1]-re clampolt, a score [-1,1], NaN/Inf ellen védett.
+- **Min improvement gate** (§25): split csak akkor, ha
+  `best.final_score >= min_expected_improvement` (default 0.10). A NOOP
+  baseline = 0; a `current_peak`/`before_total`/`after_peak` a breakdownben
+  látható (§24).
+- **Overload detection** (§26): `load_score = max(legacy, field)`, ahol a
+  legacy = max(avg tick, **p99 tick**, resident) és a field = max(zone mean,
+  zone peak cell composite). A sustained szemantika a meglévő
+  `sustained_breach_since` timer (nem duplikálva); egy 1 Hz sample soha nem
+  indít splitet.
+- **Decision timescale audit** (§5): a scorer a **fast** EMA-t olvassa
+  (rise ~1.5 s / fall ~8 s): a `current` egy-window spike-ja zajos lenne, a
+  `slow` (8/25 s) túl lassan követi a hotspot mozgását, a `predicted` pedig
+  `== slow` seam. A sustained timer adja a temporális megerősítést. Config:
+  `partition_scoring_timescale`.
+
+### 7.5 p95/p99 a control plane-en
+
+A `ZoneLoadMonitor` a zóna 256 mintás tick-ringjéből számol p95/p99-et a saját
+1 Hz cadence-én (csak ha a zóna az ablakban tickelt — alvó zóna régi mintái
+nem éleszthetik fel a régi overloadot), és bekerül a legacy score-ba. Ez zárja
+a §1.4-ben dokumentált rést: a hotspot esetben az avg 0.78 volt, miközben a
+p99 a budget 2×-e — most a p99 emeli a gate score-t.
+
+### 7.6 Döntési log és why-not diagnostics
+
+- Minden döntés strukturált `PartitionDecisionRecord` (bounded, 64): executed
+  split vagy NOOP, a teljes candidate-breakdownnal (balance/boundary/migration/
+  replication/instability/topology + channel-bontás a childokra).
+- Logolás CSAK topológia-döntésnél; a why-not sorok zónánként rate-limitáltak
+  (`why_not_log_seconds`, default 10 s) — nem tick-spam (§30).
+- Példa (élő futásból):
+  `SPLIT zone=3 candidate=midpoint@(750,500) score=0.374 benefit=0.440
+  boundary=0.000 migration=0.108 repl=0.000 instability=0.000 topology=0.050
+  before=2.27 after=1.27 p99=1.1ms field_epoch=9`
+  `NOOP zone=3 reason=below-min-improvement ... score=-0.058`
+- Why-not detail a konkrét blokkolót nevezi meg: `not-sustained`, `cooldown`,
+  `max-depth`, `min-size`, `commands-pending` (scheduler gate + PlanSplit
+  dry-run).
+
+### 7.7 Merge — seam, nem újragondolás
+
+A merge predikátum változatlan (sibling threshold + cooldown). A
+`ZonePartition::field_low_since` rögzíti, mióta van a combined score a merge
+threshold alatt — ez a **sustained-low seam** a következő fázisra; egyelőre
+nem gate-el (a phase-2 mandátum: a merge scoringot nem bonyolítjuk, amíg a
+split nincs validálva).
+
+### 7.8 Mért eredmények
+
+**Pure selftest** (`--partitionscore-selftest`, 9 teszt): rect-aggregáció
+(pontos összegek, centroid, fél-nyílt csempézés), hotspot flood-fill,
+candidate-determinizmus + hotspot-kerülés, balance formula (uniform 0.75,
+99/1 → 0.03), boundary penalty (midpoint mig-band 1.00 → best 0.50),
+instability, gate szemantika, config-validáció, döntés-formázás.
+
+**Élő szcenárió** (`--mode partitionscore`, 1 km teszt-térkép, 100 m cella):
+- Phase A — egyetlen klaszter a zóna szélén (a min-size floor miatt egyetlen
+  valid cut sem tudja szétválasztani): overloaded, de a scorer **NOOP**-ot ad
+  (score −0.058 < 0.10), a production loop NOOP-ot logol és **nem** splittel.
+- Phase B — második klaszter a túloldalon: a gate átenged (score 0.19–0.37),
+  a tranzakciós executor commitol (split_commits=1, merge_commits=0), a
+  legnagyobb child terhelés **3.00 → 2.00** (peak reduction ~33%).
+- Determinisztikusság: azonos field+activity generáción bit-azonos
+  candidate-lista/score.
+- Cooldown: a split után nincs azonnali második split.
+- Phase C — despawn után a mező lehűl, a csendes világ nem splittel újra.
+- Validátor minden fázis után zöld.
+
+**Default súlyok viselkedése (dokumentált trade-off):** a compute balance az
+elsődleges; egy tiszta mob-hotspot kettévágása valódi peak-csökkenést hoz, ezért
+a default nem tiltja meg. A hotspot-kerülés a boundary band **mért** jelein
+(player influence, migration churn, combat) és a configurálható
+`weight_boundary`-n keresztül érvényesül; a selftest explicit
+`weight_boundary=5.0`-dal bizonyítja, hogy a mechanizmus képes a hotspot
+körbevágására, amikor a balance elfogadható marad (§24).
+
+### 7.9 Config (gameserver.conf.example)
+
+`partition_min_expected_improvement`, `partition_scoring_timescale`,
+`partition_scoring_boundary_band_m`, `partition_scoring_hotspot_threshold`,
+`partition_scoring_hotspot_max_count`, `partition_scoring_weight_{balance,
+boundary,migration,replication,instability}`, `partition_scoring_topology_penalty`,
+`partition_scoring_{activity,migration,replication,combat}_band_budget`,
+`partition_scoring_migration_work_budget`, `partition_scoring_instability_window_s`,
+`partition_scoring_decision_log`, `partition_scoring_why_not_log_seconds`.
+Minden kulcs opcionális; invalid érték warning + fallback
+(`ValidatePartitionScoringConfig`), az effective set startupkor logolódik.
+
+### 7.10 Tesztelés
+
+| futtatás | eredmény |
+|---|---|
+| `--field-selftest` | 4/4 PASS |
+| `--loadfield-selftest` | 6/6 PASS |
+| `--partitionscore-selftest` | 9/9 PASS |
+| `--mode splitmerge` | 20/0, validations=3 |
+| `--mode lod` | 18/0, validations=6 |
+| `--mode activity` | 22/0, validations=7 |
+| `--mode loadfield` | 22 check + 3 audit, 0 failure |
+| `--mode partitionscore` | 21 check + 2 audit, 0 failure |
+| `--routing-selftest` | 5/5 PASS |
+
+### 7.11 Ami szándékosan kimaradt (következő fázis)
+
+- Merge sustained-low **gate** bekapcsolása (a seam kész).
+- Nem-quadtree candidate-ek tényleges végrehajtása (2-way/elastic boundary):
+  a candidate API nem quadtree-only, de az executor egyelőre az.
+- Control-loop frekvenciák configból (§29) — jelenleg 1 Hz fix.
+- Predicted load alapú pre-splitting (§37) — a storage seam kész.
+- Replication delta protokoll (a replication penalty továbbra is estimated).

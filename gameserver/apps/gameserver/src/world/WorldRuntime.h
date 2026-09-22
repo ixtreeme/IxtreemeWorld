@@ -11,6 +11,8 @@
 #include <queue>
 #include <string>
 #include <thread>
+#include <unordered_map>
+#include <vector>
 
 #include <boost/asio/io_context.hpp>
 
@@ -32,6 +34,7 @@
 #include "migration/MigrationQueue.h"
 #include "partition/PartitionConfig.h"
 #include "partition/PartitionMetrics.h"
+#include "partition/PartitionScoring.h"
 #include "partition/ZoneLoadMonitor.h"
 #include "spawn/SpawnCoordinator.h"
 #include "terrain/TerrainService.h"
@@ -218,6 +221,22 @@ public:
     {
         return effective_load_field_config_;
     }
+    const PartitionScoringConfig& EffectivePartitionScoringConfig() const noexcept
+    {
+        return scorer_.GetConfig();
+    }
+
+    // Adaptive split scoring, read-only (OBSERVE->SCORE view for diagnostics,
+    // benchmarks and admin tooling). Deterministic for the current field
+    // generation; never mutates topology. Point-in-time live read, following
+    // the same convention as Zones()/CollectProcessLoad(): it is NOT
+    // synchronized against a concurrent topology mutation, so treat the
+    // result as a near-supervisor-cycle approximation (the supervisor path
+    // itself is exact).
+    SplitRecommendation ScorePartition(ZoneId zone_id) const;
+    // Structured decision log (bounded, newest last). Contains both executed
+    // splits and rate-limited why-not records.
+    std::vector<PartitionDecisionRecord> PartitionDecisionLog() const;
 
     // Applies a (validated, clamped) partition configuration: monitor +
     // scheduler thresholds and region split limits. Call before Start, or
@@ -266,9 +285,10 @@ private:
     void ExecutePartitionControl();
     // One full split transaction: Plan -> Create(staged) -> Transfer ->
     // Validate -> Commit, with rollback + AbortSplit on any failure (§3-4).
-    // `forced` bypasses load predicates (test seams); the machinery is
-    // otherwise identical. Returns true on commit.
-    bool RunSplitTransaction(ZoneId zone_id, bool forced);
+    // `forced` bypasses load predicates (test seams); `center` is the
+    // adaptive scorer's cut point (null = geometric midpoint). The machinery
+    // is otherwise identical. Returns true on commit.
+    bool RunSplitTransaction(ZoneId zone_id, bool forced, const SplitCenter* center = nullptr);
     // One full merge transaction: Plan -> CreateTarget(staged) -> Transfer
     // -> Validate -> CommitTreeCollapse, with rollback + AbortMerge (§5).
     bool RunMergeTransaction(ZoneId parent_node_id, bool forced);
@@ -278,6 +298,15 @@ private:
     // True when the migration queue holds a request touching the zone
     // (source or target): transactions never start under a racing migration.
     bool ZoneHasPendingMigration(ZoneId zone_id) const;
+    // Read-only scoring helper: builds the scorer input for a zone from live
+    // (quiescent or atomic) state and runs the scorer. Never mutates.
+    SplitRecommendation ScorePartitionWith(ZoneId zone_id,
+                                           const std::shared_ptr<const LoadGrid>& field,
+                                           const std::shared_ptr<const ActivityGrid>& activity,
+                                           std::chrono::steady_clock::time_point now) const;
+    // Appends one decision record (bounded) and logs it as one line when the
+    // decision log is enabled; why-not lines are rate-limited per zone.
+    void RecordPartitionDecision(PartitionDecisionRecord record, bool executed, bool why_not);
     // Moves one resident (player or mob) between two LOCAL zones reusing the
     // migration authority-transfer primitive (snapshot -> apply -> release).
     // Acquires both zones' write guards in index order (same convention as
@@ -345,6 +374,12 @@ private:
     // partition tree is a future consumer, never an owner (§25-26).
     ContinuousLoadField load_field_;
     std::chrono::steady_clock::time_point last_load_field_build_{};
+    // Adaptive partition scoring (read-only). The monitor observes; the
+    // scorer recommends; the existing transactional executor mutates.
+    PartitionScorer scorer_;
+    mutable std::mutex decision_mutex_;
+    std::vector<PartitionDecisionRecord> decisions_;
+    std::unordered_map<ZoneId, std::chrono::steady_clock::time_point> why_not_last_logged_;
     PartitionMetrics partition_metrics_;
     PartitionConfig effective_partition_config_;
     LodConfig effective_lod_config_;

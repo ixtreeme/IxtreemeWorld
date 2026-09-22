@@ -28,6 +28,7 @@
 #include <cmath>
 #include <cstdint>
 #include <cstdio>
+#include <functional>
 #include <iostream>
 #include <limits>
 #include <numeric>
@@ -47,6 +48,7 @@
 #include "../world/activity/ContinuousLoadField.h"
 #include "../world/activity/LoadFieldPublisher.h"
 #include "../world/migration/EntityTransfer.h"
+#include "../world/partition/PartitionScoring.h"
 #include "../world/partition/ZonePartition.h"
 #include "../world/WorldRuntime.h"
 #include "../world/spawn/SpawnLoader.h"
@@ -70,6 +72,10 @@ struct BenchConfig {
     // Pure ContinuousLoadField unit checks (no world, no threads): mapping,
     // zone bins, normalization, smoothing, L1, config validation.
     bool load_field_selftest = false;
+    // Pure Adaptive Partition Scoring checks (no world, no threads):
+    // aggregation, hotspot detection, candidates, balance/boundary formulas,
+    // instability, gate semantics, config validation.
+    bool partition_score_selftest = false;
     std::uint32_t seed = 12345;
     // splitmerge scenario: deterministic transfer-failure injection counts
     // (0 = commit path; >0 = abort path expectations). fail_after lets that
@@ -103,10 +109,10 @@ bool ParseArgs(int argc, char** argv, BenchConfig& config)
         std::string value;
         if (arg == "--help" || arg == "-h") {
             std::cout << "worldbench [--players N] [--mobs M] [--seconds S]\n"
-                         "             [--mode spread|hotspot|border|dense|splitmerge|lod|activity|loadfield]\n"
+                         "             [--mode spread|hotspot|border|dense|splitmerge|lod|activity|loadfield|partitionscore]\n"
                          "             [--validate-every K] [--despawn-storm R] [--seed S]\n"
                          "             [--logical-processes K] [--routing-selftest]\n"
-                         "             [--field-selftest] [--loadfield-selftest]\n"
+                         "             [--field-selftest] [--loadfield-selftest] [--partitionscore-selftest]\n"
                          "             [--fail-snapshot N] [--fail-apply N] [--fail-after N]\n"
                          "             [--partition-min-size M] [--lod-off] [--loadfield-off]\n";
             return false;
@@ -156,6 +162,8 @@ bool ParseArgs(int argc, char** argv, BenchConfig& config)
             config.field_selftest = true;
         } else if (arg == "--loadfield-selftest") {
             config.load_field_selftest = true;
+        } else if (arg == "--partitionscore-selftest") {
+            config.partition_score_selftest = true;
         } else if (arg == "--fail-snapshot") {
             if (!need_value("fail-snapshot", value)) {
                 return false;
@@ -187,7 +195,8 @@ bool ParseArgs(int argc, char** argv, BenchConfig& config)
     }
     if (config.mode != "spread" && config.mode != "hotspot" && config.mode != "border" &&
         config.mode != "dense" && config.mode != "splitmerge" && config.mode != "lod" &&
-        config.mode != "activity" && config.mode != "loadfield") {
+        config.mode != "activity" && config.mode != "loadfield" &&
+        config.mode != "partitionscore") {
         std::cerr << "bad mode: " << config.mode << "\n";
         return false;
     }
@@ -2162,6 +2171,673 @@ int RunLoadFieldScenario(boost::asio::io_context& io, const BenchConfig& config)
     return failures;
 }
 
+// --- pure Adaptive Partition Scoring checks (no world, no threads) ----------
+// Synthetic load grids drive the real scorer: aggregation, hotspot flood fill,
+// candidate generation/determinism, balance formula, boundary/hotspot
+// penalties, instability, config validation and the decision formatter.
+struct ScoreTestSample {
+    float composite = 0.0f;   // normalized composite (simulation channel)
+    float migration = 0.0f;   // normalized migration channel
+    float replication = 0.0f; // normalized replication channel
+    float combat = 0.0f;      // normalized combat channel
+};
+
+gs::game::LoadGrid MakeScoreTestGrid(
+    int dim,
+    float cell,
+    const std::function<ScoreTestSample(float, float)>& sampler)
+{
+    using namespace gs::game;
+    LoadGrid grid;
+    grid.enabled = true;
+    grid.cell_size_m = cell;
+    grid.bounds = WorldBounds::FromExtent(static_cast<float>(dim) * cell);
+    grid.dim_x = static_cast<std::uint32_t>(dim);
+    grid.dim_y = static_cast<std::uint32_t>(dim);
+    grid.window_seconds = 1.0f;
+    grid.config.l1_enabled = false;
+    grid.cells.assign(static_cast<std::size_t>(dim) * dim, LoadCell{});
+    for (int y = 0; y < dim; ++y) {
+        for (int x = 0; x < dim; ++x) {
+            const float cx = (static_cast<float>(x) + 0.5f) * cell;
+            const float cy = (static_cast<float>(y) + 0.5f) * cell;
+            const ScoreTestSample sample = sampler(cx, cy);
+            auto& cell = grid.cells[static_cast<std::size_t>(y) * dim + x];
+            // Channel values chosen so NormalizeLoad returns exactly the
+            // sampler's normalized numbers (default budgets, window 1s).
+            cell.fast[LoadChannel::Simulation] = sample.composite * 5000.0f;
+            cell.fast[LoadChannel::Migration] = sample.migration * 50.0f;
+            cell.fast[LoadChannel::Replication] = sample.replication * 1000000.0f;
+            cell.fast[LoadChannel::Combat] = sample.combat * 100.0f;
+        }
+    }
+    return grid;
+}
+
+int RunPartitionScoreSelftest()
+{
+    using namespace gs::game;
+    int failures = 0;
+
+    // (1) Rect aggregation: exact sums, peak position, centroid, empty and
+    // outside rects, half-open tiling (children sum == parent).
+    {
+        const LoadGrid grid = MakeScoreTestGrid(10, 100.0f, [](float x, float y) {
+            ScoreTestSample sample;
+            sample.composite = (x < 200.0f && y < 200.0f) ? 1.0f : 0.0f;
+            return sample;
+        });
+        const auto block = AggregateLoad(grid, WorldBounds{0, 0, 200, 200}, LoadTimescale::Fast);
+        const bool block_ok =
+            block.valid && block.cells == 4 && std::abs(block.composite_sum - 4.0f) < 1e-3f &&
+            std::abs(block.composite_peak - 1.0f) < 1e-3f && block.active_cells == 4 &&
+            std::abs(block.centroid_x - 100.0f) < 1e-3f &&
+            std::abs(block.centroid_y - 100.0f) < 1e-3f;
+        const auto cold = AggregateLoad(grid, WorldBounds{200, 200, 1000, 1000}, LoadTimescale::Fast);
+        const bool cold_ok = cold.valid && cold.cells == 64 && cold.composite_sum == 0.0f;
+        const auto outside =
+            AggregateLoad(grid, WorldBounds{2000, 2000, 3000, 3000}, LoadTimescale::Fast);
+        const bool outside_ok = outside.valid && outside.cells == 0;
+        const WorldBounds parent_rect{0, 0, 400, 400};
+        float children_sum = 0.0f;
+        const WorldBounds children[4] = {{0, 0, 200, 200},
+                                         {200, 0, 400, 200},
+                                         {0, 200, 200, 400},
+                                         {200, 200, 400, 400}};
+        for (const auto& child : children) {
+            children_sum += AggregateLoad(grid, child, LoadTimescale::Fast).composite_sum;
+        }
+        const bool tiling =
+            std::abs(AggregateLoad(grid, parent_rect, LoadTimescale::Fast).composite_sum -
+                     children_sum) < 1e-3f;
+        SelftestReport("partitionscore-aggregate",
+                       block_ok && cold_ok && outside_ok && tiling,
+                       false,
+                       failures);
+    }
+
+    // (2) Hotspot flood fill: connected components, deterministic order.
+    {
+        const LoadGrid grid = MakeScoreTestGrid(10, 100.0f, [](float x, float y) {
+            const int gx = static_cast<int>(x / 100.0f);
+            const int gy = static_cast<int>(y / 100.0f);
+            ScoreTestSample sample;
+            const bool cluster =
+                (gx == 1 && gy == 1) || (gx == 2 && gy == 1) || (gx == 1 && gy == 2);
+            const bool single = (gx == 8 && gy == 8);
+            sample.composite = cluster ? 0.9f : (single ? 0.8f : 0.0f);
+            return sample;
+        });
+        std::vector<std::uint8_t> scratch;
+        const auto hotspots = DetectLoadHotspots(grid, WorldBounds{0, 0, 1000, 1000},
+                                                 LoadTimescale::Fast, 0.5f, 4, scratch);
+        const bool ok = hotspots.size() == 2 && hotspots[0].cells == 3 &&
+                        std::abs(hotspots[0].load - 2.7f) < 1e-2f &&
+                        std::abs(hotspots[0].bounds.min_x - 100.0f) < 1e-3f &&
+                        std::abs(hotspots[0].bounds.max_x - 300.0f) < 1e-3f &&
+                        hotspots[1].cells == 1;
+        SelftestReport("partitionscore-hotspot-detect", ok, false, failures);
+    }
+
+    // (3) Candidate generation: deterministic list, midpoint baseline crosses
+    // the hotspot, hotspot-aware candidates exist and the weighted scorer can
+    // prefer a non-crossing cut.
+    {
+        // Hotspot straddling the geometric midpoint on X (cells x 4..6).
+        const LoadGrid grid = MakeScoreTestGrid(10, 100.0f, [](float x, float y) {
+            const int gx = static_cast<int>(x / 100.0f);
+            const int gy = static_cast<int>(y / 100.0f);
+            ScoreTestSample sample;
+            sample.composite = (gx >= 4 && gx < 7 && gy >= 1 && gy < 3) ? 0.9f : 0.0f;
+            return sample;
+        });
+        PartitionScorer scorer;
+        PartitionScoringConfig config = scorer.GetConfig();
+        config.min_zone_size_m = 100.0f;
+        config.hotspot_threshold = 0.5f;
+        config.weight_balance = 1.0f;
+        // Hotspot-avoidance priority for this test: keeping the hotspot whole
+        // costs all balance benefit here, so the boundary weight must exceed
+        // the balance benefit to flip the decision (documented trade-off).
+        config.weight_boundary = 5.0f;
+        scorer.SetConfig(config);
+        PartitionScoreInput input;
+        input.zone_id = 1;
+        input.bounds = mx::map::Rect{0.0f, 0.0f, 1000.0f, 1000.0f};
+        const auto now = std::chrono::steady_clock::now();
+        const auto rec = scorer.ScoreSplit(input, &grid, nullptr, now);
+        const auto rec2 = scorer.ScoreSplit(input, &grid, nullptr, now);
+        bool deterministic = rec.valid && rec2.valid &&
+                             rec.candidates.size() == rec2.candidates.size();
+        if (deterministic) {
+            for (std::size_t i = 0; i < rec.candidates.size(); ++i) {
+                deterministic = deterministic && rec.candidates[i].kind == rec2.candidates[i].kind &&
+                                rec.candidates[i].center.x == rec2.candidates[i].center.x &&
+                                rec.candidates[i].center.y == rec2.candidates[i].center.y &&
+                                rec.candidates[i].final_score == rec2.candidates[i].final_score;
+            }
+        }
+        const bool midpoint_first = !rec.candidates.empty() &&
+                                    rec.candidates[0].kind == SplitCandidateKind::Midpoint;
+        const bool midpoint_crosses = rec.baseline.hotspots_crossed == 1;
+        bool has_hotspot_candidate = false;
+        for (const auto& candidate : rec.candidates) {
+            if (candidate.kind == SplitCandidateKind::HotspotX ||
+                candidate.kind == SplitCandidateKind::HotspotY ||
+                candidate.kind == SplitCandidateKind::HotspotCorner) {
+                has_hotspot_candidate = true;
+            }
+        }
+        const bool best_avoids = rec.valid && rec.best.hotspots_crossed == 0;
+        const bool best_beats = rec.best.final_score >= rec.baseline.final_score;
+        std::printf("PARTITIONSCORE candidates=%zu best=%s@(%.0f,%.0f) score=%.3f "
+                    "midpoint=%.3f crossed=%u/%u\n",
+                    rec.candidates.size(),
+                    gs::game::SplitCandidateKindName(rec.best.kind),
+                    rec.best.center.x,
+                    rec.best.center.y,
+                    rec.best.final_score,
+                    rec.baseline.final_score,
+                    rec.best.hotspots_crossed,
+                    rec.baseline.hotspots_crossed);
+        SelftestReport("partitionscore-candidates",
+                       deterministic && midpoint_first && midpoint_crosses &&
+                           has_hotspot_candidate && best_avoids && best_beats,
+                       false,
+                       failures);
+    }
+
+    // (4) Balance formula: uniform load -> peak reduction ~0.75; 99/1 load ->
+    // almost no reduction (a split must not be rewarded for being technical).
+    {
+        const LoadGrid uniform = MakeScoreTestGrid(10, 100.0f, [](float, float) {
+            ScoreTestSample sample;
+            sample.composite = 0.1f;
+            return sample;
+        });
+        PartitionScorer scorer;
+        PartitionScoringConfig config = scorer.GetConfig();
+        config.min_zone_size_m = 100.0f;
+        config.weight_boundary = 0.0f; // isolate the balance term
+        config.topology_penalty = 0.0f;
+        scorer.SetConfig(config);
+        PartitionScoreInput input;
+        input.bounds = mx::map::Rect{0.0f, 0.0f, 1000.0f, 1000.0f};
+        const auto now = std::chrono::steady_clock::now();
+        const auto uniform_rec = scorer.ScoreSplit(input, &uniform, nullptr, now);
+        const bool uniform_ok = uniform_rec.valid &&
+                                std::abs(uniform_rec.baseline.peak_reduction - 0.75f) < 0.05f &&
+                                std::abs(uniform_rec.baseline.balance_ratio - 1.0f) < 0.05f;
+
+        const LoadGrid skewed = MakeScoreTestGrid(10, 100.0f, [](float x, float y) {
+            ScoreTestSample sample;
+            sample.composite = (x < 500.0f && y < 500.0f) ? 1.0f : 0.01f;
+            return sample;
+        });
+        const auto skewed_rec = scorer.ScoreSplit(input, &skewed, nullptr, now);
+        // The midpoint leaves the dominant quadrant whole: the peak barely
+        // drops (~97% of the load is in one child). The scorer is free to
+        // look for a better cut, so the assertion is on the baseline.
+        const bool skewed_ok = skewed_rec.valid && skewed_rec.baseline.peak_reduction < 0.2f;
+        std::printf("PARTITIONSCORE balance: uniform_red=%.3f ratio=%.3f skewed_mid_red=%.3f\n",
+                    uniform_rec.baseline.peak_reduction,
+                    uniform_rec.baseline.balance_ratio,
+                    skewed_rec.baseline.peak_reduction);
+        SelftestReport("partitionscore-balance", uniform_ok && skewed_ok, false, failures);
+    }
+
+    // (5) Boundary penalty: measured migration churn sitting ON a candidate
+    // cut raises its penalty, and the load distribution pulls the best
+    // candidate away from it.
+    {
+        // Load concentrated in the west 40% (so centroid/balanced cuts move
+        // west); migration churn in one center cell (on the midpoint cuts).
+        const LoadGrid grid = MakeScoreTestGrid(10, 100.0f, [](float x, float y) {
+            ScoreTestSample sample;
+            const int gx = static_cast<int>(x / 100.0f);
+            const int gy = static_cast<int>(y / 100.0f);
+            sample.composite = gx < 4 ? 1.0f : 0.0f;
+            sample.migration = (gx == 5 && gy == 5) ? 1.0f : 0.0f;
+            return sample;
+        });
+        PartitionScorer scorer;
+        PartitionScoringConfig config = scorer.GetConfig();
+        config.min_zone_size_m = 100.0f;
+        config.weight_boundary = 1.0f;
+        scorer.SetConfig(config);
+        PartitionScoreInput input;
+        input.bounds = mx::map::Rect{0.0f, 0.0f, 1000.0f, 1000.0f};
+        const auto now = std::chrono::steady_clock::now();
+        const auto rec = scorer.ScoreSplit(input, &grid, nullptr, now);
+        const bool ok = rec.valid && rec.baseline.migration_band > 0.9f &&
+                        rec.best.migration_band < rec.baseline.migration_band &&
+                        rec.best.boundary_penalty < rec.baseline.boundary_penalty;
+        std::printf("PARTITIONSCORE boundary: midpoint_mig=%.3f best_mig=%.3f "
+                    "midpoint_pen=%.3f best_pen=%.3f\n",
+                    rec.baseline.migration_band,
+                    rec.best.migration_band,
+                    rec.baseline.boundary_penalty,
+                    rec.best.boundary_penalty);
+        SelftestReport("partitionscore-boundary", ok, false, failures);
+    }
+
+    // (6) Instability penalty: a recent mutation lowers the score; an old one
+    // does not.
+    {
+        const LoadGrid grid = MakeScoreTestGrid(10, 100.0f, [](float, float) {
+            ScoreTestSample sample;
+            sample.composite = 0.2f;
+            return sample;
+        });
+        PartitionScorer scorer;
+        PartitionScoringConfig config = scorer.GetConfig();
+        config.min_zone_size_m = 100.0f;
+        scorer.SetConfig(config);
+        PartitionScoreInput input;
+        input.bounds = mx::map::Rect{0.0f, 0.0f, 1000.0f, 1000.0f};
+        const auto now = std::chrono::steady_clock::now();
+        input.last_mutation = now - std::chrono::seconds(1);
+        const auto recent = scorer.ScoreSplit(input, &grid, nullptr, now);
+        input.last_mutation = now - std::chrono::hours(2);
+        const auto old = scorer.ScoreSplit(input, &grid, nullptr, now);
+        const bool ok = recent.valid && old.valid && recent.best.instability_penalty > 0.9f &&
+                        old.best.instability_penalty == 0.0f &&
+                        recent.best.final_score < old.best.final_score;
+        SelftestReport("partitionscore-instability", ok, false, failures);
+    }
+
+    // (7) Gate semantics: an empty zone scores negative (NOOP); a uniform
+    // loaded zone clears the default minimum improvement.
+    {
+        const LoadGrid empty = MakeScoreTestGrid(10, 100.0f, [](float, float) {
+            return ScoreTestSample{};
+        });
+        const LoadGrid loaded = MakeScoreTestGrid(10, 100.0f, [](float, float) {
+            ScoreTestSample sample;
+            sample.composite = 0.2f;
+            return sample;
+        });
+        PartitionScorer scorer;
+        PartitionScoringConfig config = scorer.GetConfig();
+        config.min_zone_size_m = 100.0f;
+        scorer.SetConfig(config);
+        PartitionScoreInput input;
+        input.bounds = mx::map::Rect{0.0f, 0.0f, 1000.0f, 1000.0f};
+        const auto now = std::chrono::steady_clock::now();
+        const auto empty_rec = scorer.ScoreSplit(input, &empty, nullptr, now);
+        const auto loaded_rec = scorer.ScoreSplit(input, &loaded, nullptr, now);
+        const bool ok = empty_rec.valid && empty_rec.best.balance_benefit == 0.0f &&
+                        empty_rec.best.final_score < 0.0f &&
+                        loaded_rec.best.final_score >= config.min_expected_improvement;
+        SelftestReport("partitionscore-gate", ok, false, failures);
+    }
+
+    // (8) Config validation: invalid fields repaired, warnings emitted.
+    {
+        PartitionScoringConfig bad;
+        bad.min_zone_size_m = 0.0f;
+        bad.min_expected_improvement = 5.0f;
+        bad.boundary_band_m = -1.0f;
+        bad.hotspot_threshold = std::numeric_limits<float>::quiet_NaN();
+        bad.hotspot_max_count = 99;
+        bad.weight_boundary = -3.0f;
+        bad.activity_band_budget = 0.0f;
+        const auto validated = ValidatePartitionScoringConfig(bad);
+        const bool repaired = !validated.warnings.empty() &&
+                              validated.effective.min_zone_size_m == 500.0f &&
+                              validated.effective.min_expected_improvement == 0.10f &&
+                              validated.effective.boundary_band_m == 180.0f &&
+                              validated.effective.hotspot_threshold == 0.5f &&
+                              validated.effective.hotspot_max_count == 4 &&
+                              validated.effective.weight_boundary == 1.0f &&
+                              validated.effective.activity_band_budget == 50.0f;
+        std::printf("PARTITIONSCORE config warnings=%zu\n", validated.warnings.size());
+        SelftestReport("partitionscore-config-validation", repaired, false, failures);
+    }
+
+    // (9) Decision formatter: both outcomes render with the breakdown.
+    {
+        PartitionDecisionRecord record;
+        record.zone_id = 42;
+        record.executed = true;
+        record.candidate.kind = SplitCandidateKind::BalancedX;
+        record.candidate.center = SplitCenter{500.0f, 250.0f};
+        record.candidate.final_score = 0.31f;
+        record.candidate.balance_benefit = 0.55f;
+        const std::string split_text = FormatPartitionDecision(record);
+        record.executed = false;
+        record.noop_reason = PartitionNoopReason::BelowMinImprovement;
+        record.detail = "not-sustained";
+        const std::string noop_text = FormatPartitionDecision(record);
+        const bool ok = split_text.find("SPLIT zone=42") != std::string::npos &&
+                        split_text.find("balanced-x") != std::string::npos &&
+                        noop_text.find("NOOP zone=42") != std::string::npos &&
+                        noop_text.find("below-min-improvement") != std::string::npos &&
+                        noop_text.find("not-sustained") != std::string::npos;
+        SelftestReport("partitionscore-decision-format", ok, false, failures);
+    }
+
+    std::printf("PARTITIONSCORE-SELFTEST-DONE failures=%d\n", failures);
+    return failures;
+}
+
+// Adaptive Partition Scoring live scenario (phase 2). Own sim lifecycle.
+//
+//   Phase A: a dense cluster confined within the min-zone-size floor of the
+//     zone's edges. The zone is overloaded, but NO valid quadtree cut can
+//     reduce its peak load -> the scorer must recommend NOOP, the production
+//     loop must record a below-min-improvement decision and must NOT split.
+//   Phase B: a second cluster on the far side makes a split genuinely
+//     beneficial -> the scored candidate passes the gate and the EXISTING
+//     transactional executor commits it; the peak child load drops.
+//   Phase C: after everyone despawns and the field decays, the quiet world
+//     must not split again (gate + cooldown).
+// Returns failure count (0 = PASS).
+int RunPartitionScoreScenario(boost::asio::io_context& io, const BenchConfig& config)
+{
+    int failures = 0;
+    int validations = 0;
+    auto check = [&](const char* name, bool pass) {
+        if (pass) {
+            std::printf("PARTITIONSCORE %s: PASS\n", name);
+        } else {
+            std::printf("PARTITIONSCORE %s: FAIL\n", name);
+            ++failures;
+        }
+    };
+
+    gs::game::WorldRuntime sim(io);
+    auto validate_now = [&](const char* what) -> bool {
+        sim.RequestValidation();
+        for (int i = 0; i < 100; ++i) {
+            std::string result;
+            if (sim.TryTakeValidationResult(result)) {
+                ++validations;
+                if (result != "OK") {
+                    std::printf("PARTITIONSCORE validation(%s): FAIL: %s\n", what, result.c_str());
+                    return false;
+                }
+                return true;
+            }
+            std::this_thread::sleep_for(std::chrono::milliseconds(100));
+        }
+        std::printf("PARTITIONSCORE validation(%s): TIMEOUT\n", what);
+        return false;
+    };
+
+    // Load field: 100m cells on the 1km test map, 2Hz aggregation. Budgets
+    // are chosen so the scenario's dense clusters saturate their cells
+    // (peak ~1.0) while the map's base mobs (far away, LOD-Low) stay well
+    // below the split threshold -- the scenario must only exercise zone 3.
+    gs::game::LoadFieldConfig lf;
+    lf.cell_size_m = 100.0f;
+    lf.aggregation_hz = 2.0f;
+    lf.l1_enabled = false;
+    lf.simulation_budget = 1000.0f;
+    lf.replication_budget = 200000.0f;
+    lf.aoi_budget = 5000.0f;
+    lf.combat_budget = 20.0f;
+    lf.migration_budget = 10.0f;
+    sim.ConfigureLoadField(lf);
+
+    // Control plane: high enough threshold that only the scenario clusters
+    // overload; short sustained window so the production loop acts inside the
+    // scenario. Merges are effectively disabled for the run (threshold 0 is
+    // unreachable, cooldown huge) so a decay-time merge cannot reshuffle the
+    // topology under the assertions. The geometric floor is clamped to 2x AOI
+    // radius (240m) by validation, which is exactly what Phase A relies on.
+    gs::game::PartitionConfig pcfg;
+    pcfg.min_zone_size_m = 100.0f;
+    pcfg.split_load_threshold = 0.5f;
+    pcfg.merge_load_threshold = 0.0f;
+    pcfg.sustained_window_seconds = 2;
+    pcfg.split_cooldown_seconds = 5;
+    pcfg.merge_cooldown_seconds = 3600;
+    pcfg.scoring.min_expected_improvement = 0.10f;
+    pcfg.scoring.boundary_band_m = 60.0f;
+    pcfg.scoring.hotspot_threshold = 0.4f;
+    pcfg.scoring.instability_window_s = 60.0f;
+    pcfg.scoring.why_not_log_seconds = 2.0f;
+    sim.ConfigurePartition(pcfg);
+    check("config-effective",
+          sim.EffectivePartitionConfig().min_zone_size_m == 240.0f &&
+              sim.EffectivePartitionScoringConfig().min_expected_improvement == 0.10f);
+    sim.Start();
+
+    const auto deadline =
+        std::chrono::steady_clock::now() + std::chrono::seconds(std::max(180, config.seconds));
+    auto expired = [&] { return std::chrono::steady_clock::now() >= deadline; };
+
+    // Zone 3 is the 500x1000 East Field (500,0)-(1000,1000): its Y cut has
+    // real freedom while the X cut stays clamped near the middle.
+    const std::size_t zone3_index = sim.Zones().FindIndexForPosition(750.0f, 500.0f);
+    check("zone-found", zone3_index < sim.Zones().ZoneCount());
+    if (zone3_index >= sim.Zones().ZoneCount()) {
+        sim.Stop();
+        return failures + 1;
+    }
+    const gs::game::ZoneId zone3_id = sim.Zones().GetZone(zone3_index).Id();
+
+    std::size_t next_spawn_point = 4; // after the 4 base points from mob_spawns.conf
+    auto spawn_cluster = [&](gs::common::SessionId base_session,
+                             int character_base,
+                             int players,
+                             int mobs,
+                             float x,
+                             float y) {
+        for (int i = 0; i < players; ++i) {
+            boost::asio::ip::tcp::socket socket(io);
+            auto session = std::make_shared<gs::network::Session>(
+                std::move(socket), static_cast<gs::common::SessionId>(base_session + i));
+            sim.PostSpawn(session,
+                          MakeBenchCharacter(character_base + i),
+                          gs::game::DebugSpawnOverride{x + static_cast<float>(i % 4) * 2.0f,
+                                                       y + static_cast<float>(i / 4) * 2.0f});
+        }
+        for (int i = 0; i < mobs; ++i) {
+            gs::game::MobSpawnPoint point;
+            point.mob_type_id = 2;
+            point.x = x + static_cast<float>((i * 7) % 50) - 25.0f;
+            point.y = y + static_cast<float>((i * 11) % 50) - 25.0f;
+            point.count = 1;
+            point.radius = 0.0f;
+            sim.AddMobSpawnPoint(point);
+            sim.RequestMobSpawn(next_spawn_point++);
+        }
+    };
+
+    // ---- Phase A: cluster within 240m of the zone's west/south edges.
+    spawn_cluster(800, 1000, 12, 60, 650.0f, 150.0f);
+    const bool populated_a = WaitFor(std::chrono::seconds(25), [&] {
+        return sim.Owners().size() == 12 && sim.CollectProcessLoad().mobs >= 60;
+    });
+    check("phase-a-populate", populated_a && !expired());
+    if (!populated_a) {
+        sim.Stop();
+        return failures + 1;
+    }
+    std::this_thread::sleep_for(std::chrono::seconds(4)); // field ramp
+    const auto rec_a = sim.ScorePartition(zone3_id);
+    check("phase-a-scored", rec_a.valid && rec_a.zone_total_load > 0.0f);
+    const float min_improvement = sim.EffectivePartitionScoringConfig().min_expected_improvement;
+    check("phase-a-noop-recommended", rec_a.valid && rec_a.best.final_score < min_improvement);
+    std::printf("PARTITIONSCORE phase-a: total=%.2f best=%s@(%.0f,%.0f) score=%.3f "
+                "benefit=%.3f crossed=%u\n",
+                rec_a.zone_total_load,
+                gs::game::SplitCandidateKindName(rec_a.best.kind),
+                rec_a.best.center.x,
+                rec_a.best.center.y,
+                rec_a.best.final_score,
+                rec_a.best.balance_benefit,
+                rec_a.best.hotspots_crossed);
+
+    // Determinism holds for the SAME immutable generations (field + activity)
+    // and the same zone input; retry until two consecutive reads share both
+    // epochs. The world is quiet in Phase A (NOOP), so the input is stable.
+    bool deterministic = false;
+    for (int attempt = 0; attempt < 40 && !deterministic; ++attempt) {
+        const auto first = sim.ScorePartition(zone3_id);
+        const auto second = sim.ScorePartition(zone3_id);
+        if (first.field_epoch != second.field_epoch ||
+            first.activity_epoch != second.activity_epoch) {
+            std::this_thread::sleep_for(std::chrono::milliseconds(10));
+            continue;
+        }
+        deterministic = first.valid && second.valid && first.best.kind == second.best.kind &&
+                        first.best.center.x == second.best.center.x &&
+                        first.best.center.y == second.best.center.y &&
+                        first.best.final_score == second.best.final_score;
+    }
+    check("phase-a-deterministic", deterministic);
+
+    bool noop_recorded = false;
+    const auto noop_until = std::chrono::steady_clock::now() + std::chrono::seconds(8);
+    while (std::chrono::steady_clock::now() < noop_until && !noop_recorded && !expired()) {
+        for (const auto& record : sim.PartitionDecisionLog()) {
+            if (record.zone_id == zone3_id && !record.executed &&
+                record.noop_reason == gs::game::PartitionNoopReason::BelowMinImprovement) {
+                noop_recorded = true;
+            }
+        }
+        std::this_thread::sleep_for(std::chrono::milliseconds(100));
+    }
+    check("phase-a-noop-logged", noop_recorded);
+    std::printf("PARTITIONSCORE phase-a commits=%llu records=%zu\n",
+                (unsigned long long)sim.PartitionMetricsSnapshot().split_commits,
+                sim.PartitionDecisionLog().size());
+    for (const auto& record : sim.PartitionDecisionLog()) {
+        std::printf("PARTITIONSCORE record: %s\n", gs::game::FormatPartitionDecision(record).c_str());
+    }
+    check("phase-a-no-split", sim.PartitionMetricsSnapshot().split_commits == 0);
+
+    // ---- Phase B: a second cluster on the far side. Now a cut separates the
+    // load, the gate passes, and the transactional executor commits.
+    spawn_cluster(900, 1100, 12, 60, 850.0f, 800.0f);
+    const bool populated_b = WaitFor(std::chrono::seconds(25), [&] {
+        return sim.Owners().size() == 24 && sim.CollectProcessLoad().mobs >= 120;
+    });
+    check("phase-b-populate", populated_b && !expired());
+    std::this_thread::sleep_for(std::chrono::seconds(5)); // field ramp
+    const auto rec_b = sim.ScorePartition(zone3_id);
+    check("phase-b-scored", rec_b.valid && rec_b.zone_total_load > rec_a.zone_total_load);
+    check("phase-b-gate-pass", rec_b.valid && rec_b.best.final_score >= min_improvement);
+    std::printf("PARTITIONSCORE phase-b: total=%.2f best=%s@(%.0f,%.0f) score=%.3f "
+                "benefit=%.3f boundary=%.3f bands=[act=%.2f mig=%.2f cbt=%.2f hot=%.2f] "
+                "mig=%.3f repl=%.3f\n",
+                rec_b.zone_total_load,
+                gs::game::SplitCandidateKindName(rec_b.best.kind),
+                rec_b.best.center.x,
+                rec_b.best.center.y,
+                rec_b.best.final_score,
+                rec_b.best.balance_benefit,
+                rec_b.best.boundary_penalty,
+                rec_b.best.activity_band,
+                rec_b.best.migration_band,
+                rec_b.best.combat_band,
+                rec_b.best.hotspot_crossed_frac,
+                rec_b.best.migration_penalty,
+                rec_b.best.replication_penalty);
+
+    const float before_total = rec_b.zone_total_load;
+    // Wait for the EXECUTED record of THIS zone: a split of any other zone
+    // must not satisfy the phase.
+    bool executed_recorded = false;
+    const bool split_committed = WaitFor(std::chrono::seconds(40), [&] {
+        for (const auto& record : sim.PartitionDecisionLog()) {
+            if (record.zone_id == zone3_id && record.executed && record.scored) {
+                executed_recorded = true;
+                return true;
+            }
+        }
+        return false;
+    });
+    check("phase-b-split-committed", split_committed && !expired());
+    if (executed_recorded) {
+        for (const auto& record : sim.PartitionDecisionLog()) {
+            if (record.zone_id == zone3_id && record.executed && record.scored) {
+                std::printf("PARTITIONSCORE decision: %s\n",
+                            gs::game::FormatPartitionDecision(record).c_str());
+            }
+        }
+    }
+    check("phase-b-executed-logged", executed_recorded);
+    check("validate-after-split", validate_now("split"));
+
+    // Peak reduction: after one more field generation, the worst child load
+    // must be clearly below the pre-split zone total.
+    std::this_thread::sleep_for(std::chrono::seconds(2));
+    float after_peak = 0.0f;
+    {
+        const auto field = sim.LoadFieldSnapshot();
+        for (const auto* leaf : sim.Zones().GetActiveLeaves()) {
+            const std::size_t index = sim.Zones().FindIndexById(leaf->zone_id);
+            if (index >= sim.Zones().ZoneCount()) {
+                continue;
+            }
+            const auto& bounds = sim.Zones().GetZone(index).Bounds();
+            const auto aggregate = gs::game::AggregateLoad(
+                *field,
+                gs::game::WorldBounds{bounds.min_x, bounds.min_y, bounds.max_x, bounds.max_y},
+                gs::game::LoadTimescale::Fast);
+            if (aggregate.composite_sum > 0.0f) {
+                std::printf("PARTITIONSCORE child zone=%u bounds=(%.0f,%.0f)-(%.0f,%.0f) load=%.2f\n",
+                            leaf->zone_id,
+                            bounds.min_x,
+                            bounds.min_y,
+                            bounds.max_x,
+                            bounds.max_y,
+                            aggregate.composite_sum);
+            }
+            after_peak = std::max(after_peak, aggregate.composite_sum);
+        }
+    }
+    std::printf("PARTITIONSCORE peak: before=%.2f after_peak=%.2f\n",
+                before_total,
+                after_peak);
+    check("phase-b-peak-reduced",
+          before_total > 0.0f && after_peak < before_total * 0.8f);
+
+    // Cooldown: no immediate second split.
+    const std::uint64_t commits_after_split = sim.PartitionMetricsSnapshot().split_commits;
+    std::this_thread::sleep_for(std::chrono::seconds(3));
+    check("phase-b-cooldown",
+          sim.PartitionMetricsSnapshot().split_commits == commits_after_split);
+
+    // ---- Phase C: everyone leaves; wait for the field to actually decay
+    // below the overload threshold, then the quiet world must not split.
+    for (gs::common::SessionId session = 800; session < 824; ++session) {
+        sim.PostDespawn(session);
+    }
+    for (gs::common::SessionId session = 900; session < 924; ++session) {
+        sim.PostDespawn(session);
+    }
+    const bool drained = WaitFor(std::chrono::seconds(20), [&] { return sim.Owners().empty(); });
+    check("phase-c-drained", drained && !expired());
+    // Decay can legitimately trigger further splits while the smoothed field
+    // is still hot; wait until it is genuinely cold before asserting quiet.
+    const bool cold = WaitFor(std::chrono::seconds(60), [&] {
+        const auto field = sim.LoadFieldSnapshot();
+        return field != nullptr && field->peak_composite < 0.1f;
+    });
+    check("phase-c-field-cold", cold && !expired());
+    const std::uint64_t commits_before_quiet = sim.PartitionMetricsSnapshot().split_commits;
+    std::this_thread::sleep_for(std::chrono::seconds(8));
+    check("phase-c-quiet-no-split",
+          sim.PartitionMetricsSnapshot().split_commits == commits_before_quiet);
+    check("validate-final", validate_now("final"));
+
+    const auto metrics = sim.PartitionMetricsSnapshot();
+    std::printf("PARTITIONSCORE metrics: split_commits=%llu split_aborts=%llu merge_commits=%llu "
+                "decisions=%zu\n",
+                (unsigned long long)metrics.split_commits,
+                (unsigned long long)metrics.split_aborts,
+                (unsigned long long)metrics.merge_commits,
+                sim.PartitionDecisionLog().size());
+    sim.Stop();
+    std::printf("PARTITIONSCORE-DONE validations=%d failures=%d\n", validations, failures);
+    return failures;
+}
+
 } // namespace
 
 int BenchMain(int argc, char** argv)
@@ -2179,6 +2855,9 @@ int BenchMain(int argc, char** argv)
     }
     if (config.load_field_selftest) {
         return RunLoadFieldSelftest() == 0 ? 0 : 1;
+    }
+    if (config.partition_score_selftest) {
+        return RunPartitionScoreSelftest() == 0 ? 0 : 1;
     }
 
     std::printf("worldbench: players=%d mobs=%d seconds=%d mode=%s validate_every=%d "
@@ -2243,6 +2922,19 @@ int BenchMain(int argc, char** argv)
             loadfield_io_thread.join();
         }
         std::printf("BENCH-DONE loadfield failures=%d\n", scenario_failures);
+        return scenario_failures == 0 ? 0 : 2;
+    }
+
+    if (config.mode == "partitionscore") {
+        // Adaptive partition scoring + hotspot-aware split scenario.
+        boost::asio::io_context score_io;
+        std::thread score_io_thread([&score_io] { score_io.run(); });
+        const int scenario_failures = RunPartitionScoreScenario(score_io, config);
+        score_io.stop();
+        if (score_io_thread.joinable()) {
+            score_io_thread.join();
+        }
+        std::printf("BENCH-DONE partitionscore failures=%d\n", scenario_failures);
         return scenario_failures == 0 ? 0 : 2;
     }
 

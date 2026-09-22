@@ -137,22 +137,54 @@ void ZoneScheduler::ScheduleOnce(ZoneManager& zones,
     }
 }
 
+ZoneScheduler::SplitGate ZoneScheduler::EvaluateSplitGate(
+    const ZonePartition* leaf,
+    std::chrono::steady_clock::time_point now) const
+{
+    if (leaf == nullptr || !leaf->IsLeaf()) {
+        return SplitGate::NotLeaf;
+    }
+    if (leaf->depth >= config.max_depth) {
+        return SplitGate::MaxDepth;
+    }
+    if (leaf->load_score < config.split_load_threshold) {
+        return SplitGate::BelowThreshold;
+    }
+    if (leaf->sustained_breach_since == std::chrono::steady_clock::time_point{}) {
+        return SplitGate::NotSustained; // timer not started yet (monitor owns it)
+    }
+    if (now - leaf->sustained_breach_since < config.sustained_window) {
+        return SplitGate::NotSustained;
+    }
+    if (now - leaf->last_split_time < config.split_cooldown) {
+        return SplitGate::Cooldown;
+    }
+    return SplitGate::Pass;
+}
+
+const char* ZoneScheduler::SplitGateName(SplitGate gate) noexcept
+{
+    switch (gate) {
+    case SplitGate::NotLeaf:
+        return "not-leaf";
+    case SplitGate::MaxDepth:
+        return "max-depth";
+    case SplitGate::BelowThreshold:
+        return "below-threshold";
+    case SplitGate::NotSustained:
+        return "not-sustained";
+    case SplitGate::Cooldown:
+        return "cooldown";
+    case SplitGate::Pass:
+    default:
+        return "pass";
+    }
+}
+
 bool ZoneScheduler::ShouldSplit(const ZonePartition* leaf,
                                 std::chrono::steady_clock::time_point now) const
 {
-    if (leaf == nullptr || !leaf->IsLeaf() || leaf->depth >= config.max_depth) {
-        return false;
-    }
-    if (leaf->load_score < config.split_load_threshold) {
-        return false;
-    }
-    if (leaf->sustained_breach_since == std::chrono::steady_clock::time_point{}) {
-        return false; // timer not started yet (monitor owns it)
-    }
-    if (now - leaf->sustained_breach_since < config.sustained_window) {
-        return false;
-    }
-    return now - leaf->last_split_time >= config.split_cooldown;
+    return EvaluateSplitGate(leaf, now) == SplitGate::Pass;
 }
 
 bool ZoneScheduler::ShouldMerge(const ZonePartition* leaf,

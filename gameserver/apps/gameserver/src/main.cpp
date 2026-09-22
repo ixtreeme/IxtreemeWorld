@@ -122,6 +122,66 @@ gs::game::PartitionConfig ResolvePartitionConfig(const gs::common::Config& confi
         config.GetInt("partition_max_depth").value_or(out.max_partition_depth);
     out.min_zone_size_m =
         static_cast<float>(GetDoubleOr(config, "partition_min_zone_size_m", out.min_zone_size_m));
+
+    // Adaptive split scoring (phase 2). min_zone_size_m is mirrored from the
+    // effective partition floor by WorldRuntime::ConfigurePartition, never
+    // read separately. All keys optional; invalid values warn + fall back.
+    auto& scoring = out.scoring;
+    scoring.min_expected_improvement = static_cast<float>(GetDoubleOr(
+        config, "partition_min_expected_improvement", scoring.min_expected_improvement));
+    scoring.boundary_band_m = static_cast<float>(
+        GetDoubleOr(config, "partition_scoring_boundary_band_m", scoring.boundary_band_m));
+    scoring.hotspot_threshold = static_cast<float>(
+        GetDoubleOr(config, "partition_scoring_hotspot_threshold", scoring.hotspot_threshold));
+    scoring.hotspot_max_count = static_cast<std::uint32_t>(std::max(
+        0, config.GetInt("partition_scoring_hotspot_max_count")
+               .value_or(static_cast<int>(scoring.hotspot_max_count))));
+    scoring.weight_balance = static_cast<float>(
+        GetDoubleOr(config, "partition_scoring_weight_balance", scoring.weight_balance));
+    scoring.weight_boundary = static_cast<float>(
+        GetDoubleOr(config, "partition_scoring_weight_boundary", scoring.weight_boundary));
+    scoring.weight_migration = static_cast<float>(
+        GetDoubleOr(config, "partition_scoring_weight_migration", scoring.weight_migration));
+    scoring.weight_replication = static_cast<float>(
+        GetDoubleOr(config, "partition_scoring_weight_replication", scoring.weight_replication));
+    scoring.weight_instability = static_cast<float>(
+        GetDoubleOr(config, "partition_scoring_weight_instability", scoring.weight_instability));
+    scoring.topology_penalty = static_cast<float>(
+        GetDoubleOr(config, "partition_scoring_topology_penalty", scoring.topology_penalty));
+    scoring.activity_band_budget = static_cast<float>(GetDoubleOr(
+        config, "partition_scoring_activity_band_budget", scoring.activity_band_budget));
+    scoring.migration_band_budget = static_cast<float>(GetDoubleOr(
+        config, "partition_scoring_migration_band_budget", scoring.migration_band_budget));
+    scoring.replication_band_budget = static_cast<float>(GetDoubleOr(
+        config, "partition_scoring_replication_band_budget", scoring.replication_band_budget));
+    scoring.combat_band_budget = static_cast<float>(GetDoubleOr(
+        config, "partition_scoring_combat_band_budget", scoring.combat_band_budget));
+    scoring.migration_work_budget = static_cast<float>(GetDoubleOr(
+        config, "partition_scoring_migration_work_budget", scoring.migration_work_budget));
+    scoring.instability_window_s = static_cast<float>(GetDoubleOr(
+        config, "partition_scoring_instability_window_s", scoring.instability_window_s));
+    scoring.why_not_log_seconds = static_cast<float>(GetDoubleOr(
+        config, "partition_scoring_why_not_log_seconds", scoring.why_not_log_seconds));
+    const auto decision_log = config.GetString("partition_scoring_decision_log");
+    if (decision_log &&
+        (*decision_log == "0" || *decision_log == "false" || *decision_log == "off")) {
+        scoring.decision_log_enabled = false;
+    }
+    const auto timescale = config.GetString("partition_scoring_timescale");
+    if (timescale) {
+        if (*timescale == "current") {
+            scoring.decision_timescale = gs::game::LoadTimescale::Current;
+        } else if (*timescale == "slow") {
+            scoring.decision_timescale = gs::game::LoadTimescale::Slow;
+        } else if (*timescale == "predicted") {
+            scoring.decision_timescale = gs::game::LoadTimescale::Predicted;
+        } else if (*timescale == "fast") {
+            scoring.decision_timescale = gs::game::LoadTimescale::Fast;
+        } else {
+            LOG_WARN("Config key 'partition_scoring_timescale' has unknown value '{}', using fast",
+                     *timescale);
+        }
+    }
     return out;
 }
 

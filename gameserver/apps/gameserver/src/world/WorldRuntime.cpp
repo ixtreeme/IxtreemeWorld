@@ -1,6 +1,8 @@
 #include "WorldRuntime.h"
 
+#include <algorithm>
 #include <chrono>
+#include <cstdint>
 #include <filesystem>
 #include <fstream>
 #include <unordered_map>
@@ -804,18 +806,214 @@ void WorldRuntime::ExecutePartitionControl()
     }
     last_partition_control_ = now;
 
-    load_monitor_.Update(zones_, scheduler_, now);
+    // OBSERVE: legacy p95/p99 tick + resident pressure, field overload score,
+    // sustained timers, candidate lists.
+    const auto field = load_field_.Snapshot();
+    const auto activity = activity_field_.Snapshot();
+    load_monitor_.Update(zones_, scheduler_, now, field);
 
-    // Max one topology mutation per control cycle: staged reshaping, never
-    // a multi-split spike in one frame.
+    const PartitionScoringConfig& scoring = scorer_.GetConfig();
+
+    // SCORE + DECIDE: at most one topology mutation per control cycle. The
+    // scorer only recommends; RunSplitTransaction is the existing
+    // transactional executor and re-validates every gate.
+    bool mutated = false;
     for (const ZoneId zone_id : load_monitor_.SplitCandidates()) {
-        RunSplitTransaction(zone_id, false);
+        const SplitRecommendation recommendation =
+            ScorePartitionWith(zone_id, field, activity, now);
+        const float p99_ms = [&] {
+            for (const auto& snap : load_monitor_.RecentSnapshots()) {
+                if (snap.zone_id == zone_id) {
+                    return snap.p99_tick_us / 1000.0f;
+                }
+            }
+            return 0.0f;
+        }();
+        if (recommendation.valid &&
+            recommendation.best.final_score >= scoring.min_expected_improvement) {
+            const bool committed =
+                RunSplitTransaction(zone_id, false, &recommendation.best.center);
+            PartitionDecisionRecord record;
+            record.timestamp = now;
+            record.zone_id = zone_id;
+            record.executed = committed;
+            record.scored = true;
+            record.noop_reason = committed ? PartitionNoopReason::None
+                                           : PartitionNoopReason::TransactionRejected;
+            record.p99_tick_ms = p99_ms;
+            record.field_epoch = recommendation.field_epoch;
+            record.expected_improvement = recommendation.expected_improvement;
+            record.candidate = recommendation.best;
+            for (const auto& snap : load_monitor_.RecentSnapshots()) {
+                if (snap.zone_id == zone_id) {
+                    record.load_score = snap.load_score;
+                    record.field_load_score = snap.field_load_score;
+                    break;
+                }
+            }
+            RecordPartitionDecision(std::move(record), committed, false);
+            if (committed) {
+                mutated = true;
+            }
+        } else {
+            PartitionDecisionRecord record;
+            record.timestamp = now;
+            record.zone_id = zone_id;
+            record.scored = recommendation.valid;
+            record.noop_reason = recommendation.valid ? PartitionNoopReason::BelowMinImprovement
+                                                      : PartitionNoopReason::NoValidCut;
+            record.p99_tick_ms = p99_ms;
+            record.field_epoch = recommendation.field_epoch;
+            record.expected_improvement = recommendation.expected_improvement;
+            record.candidate = recommendation.best;
+            for (const auto& snap : load_monitor_.RecentSnapshots()) {
+                if (snap.zone_id == zone_id) {
+                    record.load_score = snap.load_score;
+                    record.field_load_score = snap.field_load_score;
+                    break;
+                }
+            }
+            RecordPartitionDecision(std::move(record), false, true);
+        }
         break;
     }
-    for (const ZoneId parent_id : load_monitor_.MergeCandidates()) {
-        RunMergeTransaction(parent_id, false);
-        break;
+
+    // Why-not diagnostics (§31): sustained-overloaded leaves blocked by a
+    // hard gate (cooldown/depth/size/commands) get one structured record.
+    // Rate-limited so a stuck zone cannot spam the log.
+    if (!mutated) {
+        for (const ZoneId zone_id : load_monitor_.OverloadedLeaves()) {
+            bool already_candidate = false;
+            for (const ZoneId candidate : load_monitor_.SplitCandidates()) {
+                if (candidate == zone_id) {
+                    already_candidate = true;
+                    break;
+                }
+            }
+            if (already_candidate) {
+                continue; // scored path above already recorded it
+            }
+            const std::size_t zone_index = zones_.FindIndexById(zone_id);
+            if (zone_index >= zones_.ZoneCount()) {
+                continue;
+            }
+            // The scheduler gate explains sustained/cooldown blocks; the plan
+            // dry-run explains geometry (depth/min-size/commands). The
+            // structured detail string names the actual blocker.
+            const ZonePartition* leaf = nullptr;
+            for (const auto& root : zones_.PartitionRoots()) {
+                if (const auto* found = FindPartitionNode(root.get(), zone_id)) {
+                    leaf = found;
+                    break;
+                }
+            }
+            const auto gate = scheduler_.EvaluateSplitGate(leaf, now);
+            SplitRejectReason plan_reason = SplitRejectReason::None;
+            ZoneManager::SplitPlan plan;
+            (void)zones_.PlanSplit(zone_id, plan, &plan_reason);
+            PartitionDecisionRecord record;
+            record.timestamp = now;
+            record.zone_id = zone_id;
+            record.scored = false;
+            record.noop_reason = PartitionNoopReason::NoValidCut;
+            record.detail = gate != ZoneScheduler::SplitGate::Pass
+                                ? ZoneScheduler::SplitGateName(gate)
+                                : SplitRejectReasonName(plan_reason);
+            for (const auto& snap : load_monitor_.RecentSnapshots()) {
+                if (snap.zone_id == zone_id) {
+                    record.p99_tick_ms = snap.p99_tick_us / 1000.0f;
+                    record.load_score = snap.load_score;
+                    record.field_load_score = snap.field_load_score;
+                    break;
+                }
+            }
+            record.field_epoch = field != nullptr ? field->epoch : 0;
+            RecordPartitionDecision(std::move(record), false, true);
+            break;
+        }
     }
+
+    if (!mutated) {
+        for (const ZoneId parent_id : load_monitor_.MergeCandidates()) {
+            RunMergeTransaction(parent_id, false);
+            break;
+        }
+    }
+}
+
+SplitRecommendation WorldRuntime::ScorePartitionWith(
+    ZoneId zone_id,
+    const std::shared_ptr<const LoadGrid>& field,
+    const std::shared_ptr<const ActivityGrid>& activity,
+    std::chrono::steady_clock::time_point now) const
+{
+    const std::size_t zone_index = zones_.FindIndexById(zone_id);
+    if (zone_index >= zones_.ZoneCount()) {
+        return SplitRecommendation{};
+    }
+    const Zone& zone = zones_.GetZone(zone_index);
+    PartitionScoreInput input;
+    input.zone_id = zone_id;
+    input.bounds = zone.Bounds();
+    input.players = zone.Diagnostics().player_count.load(std::memory_order_relaxed);
+    input.mobs = zone.Diagnostics().mob_count.load(std::memory_order_relaxed);
+    for (const auto& root : zones_.PartitionRoots()) {
+        if (const auto* leaf = FindPartitionNode(root.get(), zone_id)) {
+            input.depth = leaf->depth;
+            input.last_mutation = leaf->last_split_time;
+            if (leaf->parent != nullptr && leaf->parent->last_merge_time > input.last_mutation) {
+                input.last_mutation = leaf->parent->last_merge_time;
+            }
+            break;
+        }
+    }
+    SplitRecommendation recommendation = scorer_.ScoreSplit(input, field.get(), activity.get(), now);
+    recommendation.activity_epoch = activity != nullptr ? activity->epoch : 0;
+    return recommendation;
+}
+
+SplitRecommendation WorldRuntime::ScorePartition(ZoneId zone_id) const
+{
+    return ScorePartitionWith(zone_id, load_field_.Snapshot(), activity_field_.Snapshot(),
+                              std::chrono::steady_clock::now());
+}
+
+void WorldRuntime::RecordPartitionDecision(PartitionDecisionRecord record,
+                                           bool executed,
+                                           bool why_not)
+{
+    (void)executed; // the record already carries the outcome
+    std::lock_guard lock(decision_mutex_);
+    const PartitionScoringConfig& config = scorer_.GetConfig();
+    bool log_line = config.decision_log_enabled;
+    if (log_line && why_not) {
+        // Rate-limit why-not lines per zone: a stuck overloaded zone must not
+        // log every control cycle (§30: decisions only, not per-tick spam).
+        const auto interval = std::chrono::milliseconds(
+            static_cast<std::int64_t>(std::max(0.0f, config.why_not_log_seconds) * 1000.0f));
+        const auto it = why_not_last_logged_.find(record.zone_id);
+        const bool due =
+            it == why_not_last_logged_.end() || (record.timestamp - it->second) >= interval;
+        if (due) {
+            why_not_last_logged_[record.zone_id] = record.timestamp;
+        } else {
+            log_line = false;
+        }
+    }
+    if (log_line) {
+        LOG_INFO("partition decision: {}", FormatPartitionDecision(record));
+    }
+    constexpr std::size_t kDecisionCapacity = 64;
+    if (decisions_.size() >= kDecisionCapacity) {
+        decisions_.erase(decisions_.begin());
+    }
+    decisions_.push_back(std::move(record));
+}
+
+std::vector<PartitionDecisionRecord> WorldRuntime::PartitionDecisionLog() const
+{
+    std::lock_guard lock(decision_mutex_);
+    return decisions_;
 }
 
 bool WorldRuntime::ZoneHasPendingMigration(ZoneId zone_id) const
@@ -835,7 +1033,7 @@ void WorldRuntime::ExecuteForcedSplit(ZoneId zone_id)
         PostForceSplit(zone_id);
         return;
     }
-    RunSplitTransaction(zone_id, true);
+    RunSplitTransaction(zone_id, true, nullptr);
 }
 
 void WorldRuntime::ExecuteForcedMerge(ZoneId parent_node_id)
@@ -848,11 +1046,11 @@ void WorldRuntime::ExecuteForcedMerge(ZoneId parent_node_id)
     RunMergeTransaction(parent_node_id, true);
 }
 
-bool WorldRuntime::RunSplitTransaction(ZoneId zone_id, bool forced)
+bool WorldRuntime::RunSplitTransaction(ZoneId zone_id, bool forced, const SplitCenter* center)
 {
     const auto t_plan0 = std::chrono::steady_clock::now();
     ZoneManager::SplitPlan plan;
-    if (!zones_.PlanSplit(zone_id, plan)) {
+    if (!zones_.PlanSplit(zone_id, plan, nullptr, center)) {
         return false; // routine skip, not an abort
     }
     if (ZoneHasPendingMigration(zone_id)) {
@@ -1339,7 +1537,15 @@ void WorldRuntime::ConfigurePartition(const PartitionConfig& config)
     monitor.merge_cooldown = std::chrono::seconds(e.merge_cooldown_seconds);
     monitor.tick_budget_ms = e.tick_budget_ms;
     monitor.resident_budget = e.resident_budget;
+    monitor.field_timescale = e.scoring.decision_timescale;
     load_monitor_ = ZoneLoadMonitor(monitor); // resets sustained timers; call pre-Start or idle
+
+    // Adaptive scoring config: the scorer is read-only, the monitor's field
+    // overload signal uses the same timescale so observe and score agree.
+    // The geometric floor mirrors the effective (validated) partition floor.
+    PartitionScoringConfig scoring = e.scoring;
+    scoring.min_zone_size_m = e.min_zone_size_m;
+    scorer_.SetConfig(scoring);
 
     scheduler_.config.split_load_threshold = e.split_load_threshold;
     scheduler_.config.merge_load_threshold = e.merge_load_threshold;
@@ -1362,6 +1568,29 @@ void WorldRuntime::ConfigurePartition(const PartitionConfig& config)
              e.resident_budget,
              e.max_partition_depth,
              e.min_zone_size_m);
+    const auto& s = e.scoring;
+    LOG_INFO("partition scoring effective: min_improvement={:.2f} band={:.0f}m hotspot>={:.2f}x{} "
+             "weights=[bal={:.2f} bnd={:.2f} mig={:.2f} rep={:.2f} inst={:.2f} topo={:.2f}] "
+             "budgets=[act={:.0f} mig={:.1f} rep={:.1f} cbt={:.1f} work={:.0f}] "
+             "timescale={} log={} why_not_interval={:.0f}s",
+             s.min_expected_improvement,
+             s.boundary_band_m,
+             s.hotspot_threshold,
+             s.hotspot_max_count,
+             s.weight_balance,
+             s.weight_boundary,
+             s.weight_migration,
+             s.weight_replication,
+             s.weight_instability,
+             s.topology_penalty,
+             s.activity_band_budget,
+             s.migration_band_budget,
+             s.replication_band_budget,
+             s.combat_band_budget,
+             s.migration_work_budget,
+             LoadTimescaleName(s.decision_timescale),
+             s.decision_log_enabled ? "on" : "off",
+             s.why_not_log_seconds);
 }
 
 void WorldRuntime::ConfigureSimulationLod(const LodConfig& config)

@@ -28,6 +28,38 @@ partition_resident_budget=2000
 partition_max_depth=4
 partition_min_zone_size_m=500.0
 
+# Adaptive split scoring (Adaptive Simulation Fabric phase 2). Read-only
+# scorer over the Continuous Load Field: it evaluates a few deterministic
+# candidate cut points, scores each as expected improvement over doing
+# nothing, and only recommends a split when the best candidate clears the
+# minimum-improvement gate. The existing transactional split/merge executor
+# performs the mutation; all hard gates (sustained window, cooldown, depth,
+# min size) stay in place. Invalid values warn + fall back per field.
+#
+# Score = w_balance*balance_benefit
+#       - w_boundary*boundary_penalty - w_migration*migration_penalty
+#       - w_replication*replication_penalty - w_instability*instability_penalty
+#       - topology_penalty
+partition_min_expected_improvement=0.10
+partition_scoring_timescale=fast
+partition_scoring_boundary_band_m=180.0
+partition_scoring_hotspot_threshold=0.5
+partition_scoring_hotspot_max_count=4
+partition_scoring_weight_balance=1.0
+partition_scoring_weight_boundary=0.35
+partition_scoring_weight_migration=0.15
+partition_scoring_weight_replication=0.20
+partition_scoring_weight_instability=0.10
+partition_scoring_topology_penalty=0.05
+partition_scoring_activity_band_budget=50
+partition_scoring_migration_band_budget=2.0
+partition_scoring_replication_band_budget=10.0
+partition_scoring_combat_band_budget=1.0
+partition_scoring_migration_work_budget=2000
+partition_scoring_instability_window_s=120.0
+partition_scoring_decision_log=true
+partition_scoring_why_not_log_seconds=10.0
+
 # Simulation LOD (server-side compute tiers, not graphics). Mobs simulate at
 # Full (20 Hz) near players, Reduced/Low farther out, Dormant when nothing is
 # relevant. Promotion is immediate (attack/damage/proximity/spawn/migration);

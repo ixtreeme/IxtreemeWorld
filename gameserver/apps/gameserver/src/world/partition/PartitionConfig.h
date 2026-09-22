@@ -5,6 +5,7 @@
 #include <vector>
 
 #include "../WorldConstants.h"
+#include "PartitionScoring.h"
 
 // Runtime-bound partition configuration (§14-15). Field defaults match the
 // gameserver.conf.example keys and the in-code Config defaults they replace.
@@ -23,6 +24,9 @@ struct PartitionConfig {
     float resident_budget = 2000.0f;
     int max_partition_depth = 4;
     float min_zone_size_m = 500.0f;
+    // Adaptive split scoring (phase 2): candidate evaluation, boundary /
+    // migration / replication / instability penalties, min-improvement gate.
+    PartitionScoringConfig scoring;
 };
 
 struct ValidatedPartitionConfig {
@@ -84,6 +88,10 @@ inline ValidatedPartitionConfig ValidatePartitionConfig(const PartitionConfig& i
         out.warnings.emplace_back("partition: min_zone_size_m below 2x AOI radius, clamping");
         out.effective.min_zone_size_m = kMinSafeZone;
     }
+    // Scoring config is validated by its own pure validator; merge warnings.
+    const auto scoring = ValidatePartitionScoringConfig(in.scoring);
+    out.effective.scoring = scoring.effective;
+    out.warnings.insert(out.warnings.end(), scoring.warnings.begin(), scoring.warnings.end());
     return out;
 }
 

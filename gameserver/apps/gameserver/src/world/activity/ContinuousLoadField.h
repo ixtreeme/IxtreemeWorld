@@ -120,6 +120,53 @@ struct LoadGrid {
     }
 };
 
+// --- read-only aggregation seam (Adaptive Partition Scoring input) ----------
+//
+// The partition scorer NEVER walks the grid itself: it asks for the load of a
+// world-space rect at one timescale. Deterministic, allocation-free,
+// O(cells overlapping the rect). Half-open rect semantics: a cell is counted
+// exactly once for a rect whose edges fall on cell boundaries (the scorer
+// snaps its candidate cuts to cell boundaries for exactly this reason).
+struct LoadAggregate {
+    bool valid = false;
+    WorldBounds rect{};
+    std::uint64_t cells = 0;        // cells overlapping the rect
+    std::uint64_t active_cells = 0; // cells with any nonzero smoothed load
+    LoadChannels raw;               // summed raw channel values (chosen scale)
+    float normalized[kLoadChannelCount] = {}; // summed per-cell normalized channels
+    float composite_sum = 0.0f;     // sum of per-cell normalized composite
+    float composite_peak = 0.0f;    // max per-cell normalized composite
+    float peak_x = 0.0f;            // world position of the peak cell center
+    float peak_y = 0.0f;
+    float centroid_x = 0.0f;        // composite-weighted centroid
+    float centroid_y = 0.0f;
+    float weight_sum = 0.0f;        // total composite weight behind the centroid
+};
+
+LoadAggregate AggregateLoad(const LoadGrid& grid,
+                            const WorldBounds& rect,
+                            LoadTimescale scale) noexcept;
+
+// Connected hot cells: 4-connectivity flood fill over cells whose chosen
+// timescale composite >= threshold, clipped to `rect`. Bounded by
+// max_hotspots (largest load first), deterministic ordering. `scratch` is a
+// caller-owned buffer reused across calls (control-plane only; never hot).
+struct LoadHotspot {
+    WorldBounds bounds{}; // cell-aligned bounding box of the component
+    float load = 0.0f;    // sum of per-cell composite over the component
+    float peak = 0.0f;    // max per-cell composite
+    float center_x = 0.0f;
+    float center_y = 0.0f;
+    std::uint32_t cells = 0;
+};
+
+std::vector<LoadHotspot> DetectLoadHotspots(const LoadGrid& grid,
+                                            const WorldBounds& rect,
+                                            LoadTimescale scale,
+                                            float threshold,
+                                            std::size_t max_hotspots,
+                                            std::vector<std::uint8_t>& scratch);
+
 // L1 = sum of the L0 cells in each l1_ratio x l1_ratio block. Because the
 // EMA is linear, summing already-smoothed L0 values yields a correctly
 // smoothed L1 without a second set of filters. Deterministic and O(cells).

@@ -157,6 +157,35 @@ bool ActivityGrid::HasPlayerWithin(const mx::map::Rect& rect, float radius) cons
     return false;
 }
 
+std::size_t ActivityGrid::CountPlayerSourcesIn(const WorldBounds& rect) const noexcept
+{
+    if (!enabled || cells.empty() || !rect.IsValid()) {
+        return 0;
+    }
+    if (rect.max_x <= bounds.min_x || rect.min_x >= bounds.max_x || rect.max_y <= bounds.min_y ||
+        rect.min_y >= bounds.max_y) {
+        return 0;
+    }
+    const std::uint32_t x0 = ClampedCellX(rect.min_x);
+    const std::uint32_t x1 = ClampedCellX(std::nextafter(rect.max_x, rect.min_x));
+    const std::uint32_t y0 = ClampedCellY(rect.min_y);
+    const std::uint32_t y1 = ClampedCellY(std::nextafter(rect.max_y, rect.min_y));
+    std::size_t count = 0;
+    for (std::uint32_t cy = y0; cy <= y1; ++cy) {
+        for (std::uint32_t cx = x0; cx <= x1; ++cx) {
+            const auto& cell =
+                cells[static_cast<std::size_t>(cy) * dim_x + cx];
+            for (const auto& source : cell.players) {
+                if (source.x >= rect.min_x && source.x < rect.max_x && source.y >= rect.min_y &&
+                    source.y < rect.max_y) {
+                    ++count;
+                }
+            }
+        }
+    }
+    return count;
+}
+
 void ActivityPublisher::Publish(Zone& zone)
 {
     AssertZoneOwner(zone, "zone activity publish");

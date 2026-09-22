@@ -133,6 +133,12 @@ struct ActivityGrid {
     // sleep/wake decisions; exact, so never over- or under-sleeps.
     bool HasPlayerWithin(const mx::map::Rect& rect, float radius) const noexcept;
 
+    // Read-only helper for the adaptive boundary-cost estimate: counts player
+    // sources whose exact position lies inside `rect` (half-open). The
+    // activity field stays an independent system -- this is a separate
+    // boundary signal, never folded into a load field channel (§17).
+    std::size_t CountPlayerSourcesIn(const WorldBounds& rect) const noexcept;
+
     // Cell helpers (public: the supervisor builder shares them; pure index
     // math, no state beyond grid dims).
     std::uint32_t ClampedCellX(float x) const noexcept;

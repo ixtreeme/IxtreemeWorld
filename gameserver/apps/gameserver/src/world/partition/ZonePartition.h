@@ -27,8 +27,18 @@ struct ZonePartition {
 
     // Load-control bookkeeping (written by ZoneLoadMonitor, read by the
     // scheduler predicates). Plain data; supervisor thread only.
-    float load_score = 0.0f;
+    float load_score = 0.0f;        // combined gate score (legacy + field)
+    float legacy_load_score = 0.0f; // avg/p99 tick + resident pressure
+    float field_load_score = 0.0f;  // load field mean/peak composite (fast)
+    float field_peak_score = 0.0f;  // max cell composite in the zone
+    float p95_tick_us = 0.0f;
+    float p99_tick_us = 0.0f;
     std::chrono::steady_clock::time_point sustained_breach_since{};
+    // Merge sustained-low seam: how long the combined score has been below
+    // the merge threshold. Recorded (diagnostics) but not yet gating; the
+    // existing merge predicate stays in charge until split scoring is
+    // validated (phase-2 mandate: do not overcomplicate merge).
+    std::chrono::steady_clock::time_point field_low_since{};
     std::chrono::steady_clock::time_point last_split_time{};
     std::chrono::steady_clock::time_point last_merge_time{};
     bool simulation_enabled = true;
@@ -52,6 +62,63 @@ struct ZonePartition {
         return IsLeaf() && state == PartitionState::Leaf && simulation_enabled;
     }
 };
+
+// The cut point of a split (world coordinates). The transactional executor
+// tiles its four children from this point; the adaptive scorer produces it.
+struct SplitCenter {
+    float x = 0.0f;
+    float y = 0.0f;
+};
+
+// Structured reason a split plan was refused (why-not diagnostics, §31).
+enum class SplitRejectReason : std::uint8_t {
+    None = 0,
+    UnknownZone,
+    NotSimulating,
+    CommandsPending,
+    NoRegion,
+    NotLeaf,
+    MaxDepth,
+    TooSmall,
+};
+
+inline const char* SplitRejectReasonName(SplitRejectReason reason) noexcept
+{
+    switch (reason) {
+    case SplitRejectReason::UnknownZone:
+        return "unknown-zone";
+    case SplitRejectReason::NotSimulating:
+        return "not-simulating";
+    case SplitRejectReason::CommandsPending:
+        return "commands-pending";
+    case SplitRejectReason::NoRegion:
+        return "no-region";
+    case SplitRejectReason::NotLeaf:
+        return "not-leaf";
+    case SplitRejectReason::MaxDepth:
+        return "max-depth";
+    case SplitRejectReason::TooSmall:
+        return "min-size";
+    case SplitRejectReason::None:
+    default:
+        return "none";
+    }
+}
+
+// The canonical quadtree tiling shared by the transactional split executor
+// and the adaptive scorer: four children from one center point, half-open
+// ownership, order NW, NE, SW, SE (matches ZoneManager::SplitPlan and the
+// commit-time child locations). One geometry, one source of truth.
+inline void BuildQuadtreeChildBounds(const mx::map::Rect& parent,
+                                     float center_x,
+                                     float center_y,
+                                     mx::map::Rect out_child_bounds[4]) noexcept
+{
+    out_child_bounds[0] = {parent.min_x, center_y, center_x, parent.max_y}; // NW
+    out_child_bounds[1] = {center_x, center_y, parent.max_x, parent.max_y}; // NE
+    out_child_bounds[2] = {parent.min_x, parent.min_y, center_x, center_y}; // SW
+    out_child_bounds[3] = {center_x, parent.min_y, parent.max_x, center_y}; // SE
+}
 
 // Tree descent with half-open bounds [min, max): a point on a shared edge
 // belongs to exactly one child (strict < goes west/south), so siblings
