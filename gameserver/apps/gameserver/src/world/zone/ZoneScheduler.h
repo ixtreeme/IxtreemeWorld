@@ -108,8 +108,30 @@ public:
 
     Config config;
 
+    // Phase 7 scheduler audit counters (cumulative; the supervisor samples
+    // deltas per diagnostics window).
+    struct Counters {
+        std::uint64_t waves = 0;          // ScheduleOnce calls
+        std::uint64_t due_zones = 0;      // zones that were due
+        std::uint64_t enqueued = 0;       // work items handed to the pool
+        std::uint64_t sleeping_skips = 0; // sleeping zones skipped
+        std::uint64_t cas_failures = 0;   // zone already ticking (guarded)
+        std::uint64_t schedule_micros = 0;
+    };
+    const Counters& GetCounters() const noexcept
+    {
+        return counters_;
+    }
+    Counters TakeCounters() noexcept
+    {
+        Counters taken = counters_;
+        counters_ = Counters{};
+        return taken;
+    }
+
 private:
     bool lod_enabled_ = true;
+    Counters counters_;
 };
 
 } // namespace gs::game

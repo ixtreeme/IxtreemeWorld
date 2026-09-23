@@ -52,6 +52,8 @@ struct ReadinessConfig {
     bool netlod_off = false;
     int budget_records = 0;
     int resync_ticks = 0;
+    // Phase 7 scheduler audit: explicit worker count (0 = auto).
+    int workers = 0;
     std::uint32_t seed = 20260922;
 };
 

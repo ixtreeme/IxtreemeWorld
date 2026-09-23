@@ -296,7 +296,7 @@ void WorldRuntime::Run()
 {
     sim_thread_id_ = std::this_thread::get_id();
 
-    workers_.Start(zones_.ZoneCount());
+    workers_.Start(zones_.ZoneCount(), requested_workers_);
 
     LOG_INFO("Game sim supervisor started: zones={} workers={} aoi_radius={} aoi_cap={}",
              zones_.ZoneCount(),
@@ -308,6 +308,20 @@ void WorldRuntime::Run()
 
     while (!stopping_) {
         const auto supervisor_start = std::chrono::steady_clock::now();
+        // Phase 7: worker-phase wall accounting (how much wall time has at
+        // least one zone tick in flight). Sampled at the supervisor cadence
+        // (~5 ms), which is enough for utilization/parallelism aggregates.
+        if (last_phase_sample_ != std::chrono::steady_clock::time_point{}) {
+            const auto delta = supervisor_start - last_phase_sample_;
+            const auto micros = static_cast<std::uint64_t>(
+                std::chrono::duration_cast<std::chrono::microseconds>(delta).count());
+            if (zones_.AnyTickInProgress()) {
+                busy_phase_micros_.fetch_add(micros, std::memory_order_relaxed);
+            } else {
+                idle_phase_micros_.fetch_add(micros, std::memory_order_relaxed);
+            }
+        }
+        last_phase_sample_ = supervisor_start;
         DrainGlobalCommands();
         const auto migration_start = std::chrono::steady_clock::now();
         migration_.ProcessMigrations(world_tick_.load(std::memory_order_relaxed));
@@ -920,6 +934,31 @@ bool WorldRuntime::TryTakeValidationResult(std::string& out_result)
     validation_result_.clear();
     validation_ready_ = false;
     return true;
+}
+
+WorldRuntime::SchedulerSnapshot WorldRuntime::SchedulerStats() const
+{
+    SchedulerSnapshot snapshot;
+    snapshot.workers = workers_.WorkerCount();
+    const auto counters = scheduler_.GetCounters();
+    snapshot.waves = counters.waves;
+    snapshot.due_zones = counters.due_zones;
+    snapshot.enqueued = counters.enqueued;
+    snapshot.sleeping_skips = counters.sleeping_skips;
+    snapshot.cas_failures = counters.cas_failures;
+    snapshot.schedule_micros = counters.schedule_micros;
+    const auto& stats = workers_.WorkerStats();
+    snapshot.worker_work.reserve(stats.size());
+    snapshot.worker_tasks.reserve(stats.size());
+    for (const auto& worker : stats) {
+        snapshot.worker_work.push_back(worker.work_micros);
+        snapshot.worker_tasks.push_back(worker.tasks);
+        snapshot.worker_work_micros += worker.work_micros;
+        snapshot.worker_idle_micros += worker.idle_micros;
+    }
+    snapshot.busy_phase_micros = busy_phase_micros_.load(std::memory_order_relaxed);
+    snapshot.idle_phase_micros = idle_phase_micros_.load(std::memory_order_relaxed);
+    return snapshot;
 }
 
 double WorldRuntime::SupervisorAvgMs() const

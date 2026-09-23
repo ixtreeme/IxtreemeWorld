@@ -41,6 +41,8 @@ void ZoneScheduler::ScheduleOnce(ZoneManager& zones,
                                  const std::shared_ptr<const ActivityGrid>& activity,
                                  float wake_radius_m)
 {
+    const auto schedule_start = std::chrono::steady_clock::now();
+    ++counters_.waves;
     std::vector<std::pair<std::uint64_t, std::size_t>> due;
     due.reserve(zones.ZoneCount());
 
@@ -90,6 +92,7 @@ void ZoneScheduler::ScheduleOnce(ZoneManager& zones,
             }
             zone.NextTick() = now + kTickDt;
             zone.Diagnostics().empty_skips_since_diag.fetch_add(1, std::memory_order_relaxed);
+            ++counters_.sleeping_skips;
             continue;
         }
         if (zone.Activity() == ZoneActivity::Sleeping) {
@@ -116,8 +119,10 @@ void ZoneScheduler::ScheduleOnce(ZoneManager& zones,
 
         bool expected = false;
         if (!zone.TickInProgress().compare_exchange_strong(expected, true)) {
+            ++counters_.cas_failures;
             continue;
         }
+        ++counters_.due_zones;
 
         do {
             zone.NextTick() += kTickDt;
@@ -135,6 +140,11 @@ void ZoneScheduler::ScheduleOnce(ZoneManager& zones,
         (void)score;
         pool.Enqueue(index);
     }
+    counters_.enqueued += due.size();
+    counters_.schedule_micros += static_cast<std::uint64_t>(
+        std::chrono::duration_cast<std::chrono::microseconds>(
+            std::chrono::steady_clock::now() - schedule_start)
+            .count());
 }
 
 ZoneScheduler::SplitGate ZoneScheduler::EvaluateSplitGate(

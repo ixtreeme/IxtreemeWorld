@@ -627,6 +627,7 @@ Az előző commitból javított Fast/Exact semanticsra **tesztet kell írni**:
 | **J (Phase 5C)** | §11.7/1–2 | Canonical 19 B record cache (serialize once / fanout many), memcpy frame assembly, spawn/despawn payload sharing, copy/wire byte accounting, canonical-record audit a shadow validatorban, interest-overlap mérés + grouping-döntés, readiness re-benchmark | ✅ **KÉSZ** (lásd §12) |
 | **K (Phase 5D)** | §12.7/1 | AOI query indexing: tárolt pozíció a grid entryben + `GridSlot` O(1) sync, nth_element top-k, AOI stage-metrikák, index-validator (stored position + slot), `--aoi-reference-positions` A/B, readiness re-benchmark | ✅ **KÉSZ** (lásd §13) |
 | **L (Phase 6)** | §13.7 gate | Replication Protocol v2: field-szintű delta a recipient baseline-hoz, Network LOD (külön rendszer), priority + per-session budget, starvation/resync, shadow kliensmodell, v1/v2 A/B + shadow, 500→7k scaling seam | ✅ **KÉSZ** (lásd §14) |
+| **M (Infra)** | §14.7 gate | Zone worker scheduler / multicore audit: worker-szintű metrikák, `--workers` override, 1→320 zone scaling bizonyítás, hot-split parallelism, worker sweep, 7k acceptance, scheduler diag | ✅ **KÉSZ** (lásd §15) |
 
 ### Chunk A — elvégzett munka
 
@@ -2240,7 +2241,139 @@ phase**, a 4k–7k player tartományban pedig a per-session scheduling/state
 növekedésének figyelése; transport/kernel szint nem indokolt a mérések
 szerint.
 
-### 14.8 Nyitott, nem-protokoll jellegű tételek
+## 15. Infrastructure — Zone worker scheduler / multicore audit
+
+### 15.1 Audit — a jelenlegi thread/scheduling modell
+
+```text
+supervisor thread (WorldRuntime::Run)
+  ├─ DrainGlobalCommands / migration commit / partition control
+  ├─ ZoneScheduler::ScheduleOnce:
+  │    active leaf zone-ok, sleeping skipek, LoadScore (players/mobs/tick),
+  │    TickInProgress CAS guard, due lista heaviest-first
+  │    → pool.Enqueue(zone_index)  (egy GLOBÁLIS FIFO + notify_one)
+  └─ 5 ms-es cv-wait; auditok quiescent ablakban
+
+ZoneWorkerPool (bounded): worker_count = min(zone_count, hw-1) vagy
+  --workers N override; minden worker: FIFO pop → tick_(zone) → Zone::Tick
+  (ZoneWriteGuard owner-thread enforcement) → TickInProgress = false
+```
+
+- **Zone ≠ OS thread**: sok leaf zone → egy bounded pool → CPU magok.
+- **Assignment**: dinamikus, work-conserving: a megosztott FIFO miatt minden
+  task az első szabad workerre kerül; nincs per-worker queue, nincs
+  work stealing (nem is kell: a queue maga a load balancing), nincs affinity.
+- **Dupla/missed execution**: a `TickInProgress` CAS guarantee (a scheduler
+  `cas_failures` countere méri a "már fut" eseteket).
+- A split/merge/retire a `GetActiveLeaves()`-en és a `SimulationEnabled()`
+  flaggen keresztül hat a scheduler-re; a retired zone nem fut.
+
+### 15.2 Instrumentáció
+
+- `ZoneWorkerPool`: worker-enkénti `WorkerStat { tasks, work_micros,
+  idle_micros }` (cache-line paddinggal), összesített utilization.
+- `ZoneScheduler::Counters`: waves, due_zones, enqueued, sleeping_skips,
+  cas_failures, schedule_micros (a scheduler saját költsége).
+- `WorldRuntime::SchedulerStats()` + busy/idle phase wall sampling
+  (`AnyTickInProgress` a supervisor ciklusban).
+- `--workers N` (0 = auto) worker-count override.
+- `READINESS sched:` sor: workers, parallelism, imbalance,
+  worker_work[min/avg/max], idle, phase, sched_us, enqueued/due/waves,
+  cas_failures, sleeping.
+- `--mode scheduler` scenario: uniform 1→320, hot-split, 1-worker reference.
+
+### 15.3 Mérések
+
+**Uniform zone scaling** (szintetikus, 500 mob/zóna + 1 viewer/zóna, 8 km):
+
+| zones | workers | parallelism | imbalance | tick avg | tick p99 | sched_us/3s |
+|---|---|---|---|---|---|---|
+| 1 | 1 | 0.05 | 1.00 | 2.47 ms | 0.69 | 6.0k |
+| 4 | 4 | 0.18 | 1.02 | 2.23 | 0.70 | 5.8k |
+| 16 | 15 | 1.74 | 1.05 | 4.77 | 0.81 | 69.8k |
+| 64 | 15 | 4.11 | 1.02 | 3.30 | 0.77 | 34.1k |
+| 132 | 15 | 6.60 | 1.00 | 2.52 | 0.80 | 43.0k |
+| 320 | 15 | **9.55** | **1.00** | 1.46 | 0.80 | 39.7k |
+
+→ a parallelism a zónaszámmal skálázódik, az **imbalance ~1.0** (a
+legjobb/átlag worker work aránya), a scheduler overhead 40–80 ms / 3 s
+(~1–2%). A 320 zóna 9.55 workert telít ezzel a workloaddal.
+
+**Hot zone + forced split** (16 zóna, 1 hot 4000 mobbal):
+
+```text
+zones=16 -> 20 -> 24   imbalance=1.48 -> 1.30 -> 1.19
+```
+
+→ a hot terület felosztása **ténylegesen több workerre osztja** a munkát
+(az imbalance monoton javul; a hot zone workje a children között oszlik).
+
+**Worker-count sweep** (dense 500p/200k, 60/30):
+
+| workers | parallelism | imbalance | tick avg | p99 | max |
+|---|---|---|---|---|---|
+| 4 | 1.28 | 1.10 | 3.42 ms | 76.4 | 255 |
+| 8 | 1.18 | 1.18 | 5.08 | 72.1 | 125 |
+| 15 (auto) | 1.24 | 1.96 | 7.87 | 160.7 | 798 |
+
+→ a dense workload ~1.2 mag; több worker nem gyorsít (a munka kevés), a
+nagyobb szálszám a tail latency-t rontja (cache/memória-sáv contention a
+kevés, de nagy zónán). **Nem hardcode-oljuk a 16-ot**; a worker count
+config.
+
+**Readiness (500p/200k)**: a `READINESS sched:` sor dense 60/30 futásban
+workers=15, parallelism 7.4, imbalance 1.09, sched_us 164 ms / 10 s (~1.6%),
+cas_failures 406 (a guard működik).
+
+**7000p/200k acceptance**:
+
+| scenario | zones | parallelism | imbalance | tick avg | p99 | max | WS |
+|---|---|---|---|---|---|---|---|
+| spread | 72 | ~10.8 | 1.01 | 8.0 ms | 15.0 | 30 | 2308 MB |
+| multi (4 hotspot) | 64 | ~14.9 | 1.02 | 18.8 | 183.1 | 435 | 2059 MB |
+
+→ 7000 playeren az imbalance ~1.0; a multi-hotspot p99 a néhány sűrű zóna
+saját tick-költsége (gameplay+replication), nem a scheduler.
+
+### 15.4 Következtetések
+
+- A **scheduler nem bottleneck**: imbalance ~1.0–1.2, a saját overhead ~1–2%,
+  a parallelism a zónaszámmal skálázódik, a hot split valóban több magra
+  osztja a munkát.
+- A parallelism felső korlátja **load-oldali**: a dense/spread workloadban a
+  zónák nagy része sleeping/Dormant (LOD), ezért a ~1–10 mag közötti
+  értékek a tényleges munkát tükrözik, nem a scheduler korlátját.
+- A tail latency (dense/multi p99) az egyes **nehéz zónák** tick-költsége
+  (gameplay + replication), nem a worker-imbalance.
+
+### 15.5 Negative results
+
+- **Work stealing**: nem implementálva — a megosztott FIFO már
+  work-conserving, az imbalance ~1.0; a stealing csak contentiont adna.
+- **Zone→worker affinity / pinning**: nem implementálva — az imbalance
+  mérése ~1.0, a tail nem locality-artefakt; a sticky affinity nem hozna
+  mérhető nyereséget.
+- **Zone reassignment threshold/cooldown**: nem szükséges (nincs per-worker
+  assignment).
+- **NUMA-aware scheduling**: a környezet single-NUMA; nem indokolt.
+- **Explicit thread affinity**: nem mért nyereség (a worker count sweep a
+  fontosabb tényező).
+
+### 15.6 Új bottleneck rangsor + következő infrastructure gate
+
+A tick-költség rangsora (dense/multi, Phase 6/7 mérések): **gameplay
+(AI+movement) ~47%**, replication fanout ~33% (ebből AOI ~8%), ghost ~11%,
+scheduler/supervisor ~1–2%. A scheduler/multicore oldal **bizonyítottan
+rendben** van.
+
+**Következő infrastructure gate (mérés alapján)**: a jelenlegi világ
+szintetikus, lapos 100 km-es terrain seam — a legnagyobb hiányzó
+produkciós komponens a **Real World/Map Data Layer** (terrain/height/
+collision/navigation/loading). Alternatíva: Final Networking Transport/API
+hardening, ha a wire-oldali per-recipient fanout válik dominánssá. A
+gameplay/combat hot path külön (nem-infra) fázist érdemel.
+
+### 15.7 Nyitott, nem-protokoll jellegű tételek
 
 A §13.7 gate-en túl (Phase 6 protokoll-irány) nyitva maradt: activity-field
 query O(players-in-box) szűkítése, combat event-fanout coalescing, és a

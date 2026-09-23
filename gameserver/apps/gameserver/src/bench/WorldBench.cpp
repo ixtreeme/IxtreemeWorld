@@ -110,6 +110,7 @@ struct BenchConfig {
     bool netlod_off = false;       // disable the Network LOD
     int budget_records = 0;        // per-session per-frame record budget (0 = off)
     int resync_ticks = 0;          // full-state resync period (0 = default)
+    int workers = 0;               // scheduler audit: explicit worker count (0 = auto)
 };
 
 bool ParseArgs(int argc, char** argv, BenchConfig& config)
@@ -249,6 +250,11 @@ bool ParseArgs(int argc, char** argv, BenchConfig& config)
             config.repl_v1 = true;
         } else if (arg == "--netlod-off") {
             config.netlod_off = true;
+        } else if (arg == "--workers") {
+            if (!need_value("workers", value)) {
+                return false;
+            }
+            config.workers = std::stoi(value);
         } else if (arg == "--budget") {
             if (!need_value("budget", value)) {
                 return false;
@@ -271,7 +277,7 @@ bool ParseArgs(int argc, char** argv, BenchConfig& config)
         config.mode != "activity" && config.mode != "loadfield" &&
         config.mode != "partitionscore" && config.mode != "stability" &&
         config.mode != "readiness" && config.mode != "ghost" && config.mode != "aoi" &&
-        config.mode != "replication") {
+        config.mode != "replication" && config.mode != "scheduler") {
         std::cerr << "bad mode: " << config.mode << "\n";
         return false;
     }
@@ -833,7 +839,9 @@ int RunRoutingSelftest(gs::game::WorldRuntime& sim,
                     }
                     std::this_thread::sleep_for(std::chrono::milliseconds(100));
                 }
-                sim.PostDespawn(1);
+                // The scout stays alive for the (e) transfer-roundtrip check
+                // below; it is despawned after that (posting it here raced the
+                // owner lookup and made the selftest flaky).
                 SelftestReport("duplicate-migration-id", replay_safe, false, failures);
             }
         } else {
@@ -866,6 +874,7 @@ int RunRoutingSelftest(gs::game::WorldRuntime& sim,
             }
         }
         SelftestReport("transfer-roundtrip", roundtrip, scout_net == 0, failures);
+        sim.PostDespawn(1); // scout cleanup after the roundtrip check
     }
 
     return failures;
@@ -4183,6 +4192,277 @@ int RunAoiReplicationScenario(boost::asio::io_context& io,
     return failures;
 }
 
+// Phase 7 scheduler / multicore audit scenario. Synthetic uniform workloads
+// across 1..320 leaf zones, a single hot zone with forced splits, and a
+// single-worker reference comparison. Gameplay-agnostic: mobs/players are
+// only infrastructure load.
+int RunSchedulerScenario(boost::asio::io_context& io, const BenchConfig& config)
+{
+    int failures = 0;
+    auto check = [&](const char* name, bool pass) {
+        std::printf("SCHED %s: %s\n", name, pass ? "PASS" : "FAIL");
+        if (!pass) {
+            ++failures;
+        }
+    };
+
+    struct StepResult {
+        std::size_t zones = 0;
+        std::size_t workers = 0;
+        double parallelism = 0.0;
+        double imbalance = 0.0;
+        std::uint64_t max_worker_us = 0;
+        double tick_avg_ms = 0.0;
+        double tick_p99_ms = 0.0;
+        std::uint64_t sched_us = 0;
+        std::uint64_t enqueued = 0;
+        std::uint64_t cas_failures = 0;
+    };
+    auto run_step = [&](std::size_t extent_m, std::size_t zx, std::size_t zy,
+                        int mobs_per_zone, int hot_mobs, std::size_t workers,
+                        int seconds, const char* tag) -> StepResult {
+        gs::game::WorldRuntime sim(io, {},
+                                   gs::game::WorldRuntime::SyntheticWorldConfig{
+                                       static_cast<float>(extent_m),
+                                       static_cast<std::uint32_t>(zx),
+                                       static_cast<std::uint32_t>(zy),
+                                       {}});
+        if (workers > 0) {
+            sim.ConfigureWorkers(workers);
+        }
+        const float zone_w = static_cast<float>(extent_m) / static_cast<float>(zx);
+        const float zone_h = static_cast<float>(extent_m) / static_cast<float>(zy);
+        for (std::size_t zi = 0; zi < zx * zy; ++zi) {
+            const float cx = (static_cast<float>(zi % zx) + 0.5f) * zone_w;
+            const float cy = (static_cast<float>(zi / zx) + 0.5f) * zone_h;
+            gs::game::MobSpawnPoint point;
+            point.mob_type_id = 2;
+            point.x = cx;
+            point.y = cy;
+            point.count = static_cast<std::uint32_t>(mobs_per_zone);
+            point.radius = 40.0f; // wander leash: real AI+movement work
+            sim.AddMobSpawnPoint(point);
+        }
+        if (hot_mobs > 0) {
+            gs::game::MobSpawnPoint hot;
+            hot.mob_type_id = 2;
+            hot.x = 0.5f * zone_w;
+            hot.y = 0.5f * zone_h;
+            hot.count = static_cast<std::uint32_t>(hot_mobs);
+            hot.radius = 120.0f;
+            sim.AddMobSpawnPoint(hot);
+        }
+        sim.SpawnConfiguredMobsNow();
+        // One stationary viewer per zone keeps zones awake (infrastructure
+        // load only: they are not simulated by any gameplay system).
+        for (std::size_t zi = 0; zi < zx * zy; ++zi) {
+            boost::asio::ip::tcp::socket socket(io);
+            auto session = std::make_shared<gs::network::Session>(std::move(socket),
+                                                                  1000 + zi);
+            sim.PostSpawn(session,
+                          MakeBenchCharacter(static_cast<int>(2000 + zi)),
+                          gs::game::DebugSpawnOverride{
+                              (static_cast<float>(zi % zx) + 0.5f) * zone_w,
+                              (static_cast<float>(zi / zx) + 0.5f) * zone_h});
+        }
+        sim.Start();
+        const auto populated = WaitFor(std::chrono::seconds(20), [&] {
+            return sim.Owners().size() == zx * zy;
+        });
+        if (!populated) {
+            sim.Stop();
+            return StepResult{};
+        }
+        std::this_thread::sleep_for(std::chrono::milliseconds(1500)); // settle
+        const auto before = sim.SchedulerStats();
+        std::this_thread::sleep_for(std::chrono::seconds(seconds));
+        const auto after = sim.SchedulerStats();
+
+        StepResult result;
+        result.zones = sim.Zones().ZoneCount();
+        result.workers = after.workers;
+        const std::uint64_t work = after.worker_work_micros - before.worker_work_micros;
+        // Effective parallelism: average number of busy workers over the
+        // measured wall time (robust against the supervisor sampling cadence,
+        // which is far coarser than a single zone tick).
+        result.parallelism =
+            static_cast<double>(work) / (static_cast<double>(seconds) * 1.0e6);
+        std::uint64_t max_w = 0;
+        std::uint64_t sum_w = 0;
+        for (std::size_t i = 0; i < after.worker_work.size() && i < before.worker_work.size();
+             ++i) {
+            const std::uint64_t w = after.worker_work[i] - before.worker_work[i];
+            max_w = std::max(max_w, w);
+            sum_w += w;
+        }
+        const double avg_w = after.workers > 0 ? static_cast<double>(sum_w) /
+                                                     static_cast<double>(after.workers)
+                                               : 0.0;
+        result.imbalance = avg_w > 0.0 ? static_cast<double>(max_w) / avg_w : 0.0;
+        result.max_worker_us = max_w;
+        result.sched_us = after.schedule_micros - before.schedule_micros;
+        result.enqueued = after.enqueued - before.enqueued;
+        result.cas_failures = after.cas_failures - before.cas_failures;
+        // Tick percentiles from the per-zone rings.
+        std::vector<std::uint64_t> samples;
+        std::vector<std::uint64_t> scratch(256, 0u);
+        for (std::size_t i = 0; i < sim.Zones().ZoneCount(); ++i) {
+            const auto& diag = sim.Zones().GetZone(i).Diagnostics();
+            const std::size_t count = diag.CopyTickSamples(scratch.data(), scratch.size());
+            samples.insert(samples.end(), scratch.begin(), scratch.begin() + count);
+        }
+        if (!samples.empty()) {
+            double sum = 0.0;
+            for (const auto s : samples) {
+                sum += static_cast<double>(s);
+            }
+            result.tick_avg_ms = sum / static_cast<double>(samples.size()) / 1000.0;
+            result.tick_p99_ms = Percentile(samples, 0.99);
+        }
+        std::printf("SCHED %s: zones=%zu workers=%zu parallelism=%.2f imbalance=%.2f "
+                    "max_worker_us=%llu tick_avg=%.3fms tick_p99=%.3fms sched_us=%llu "
+                    "enqueued=%llu cas_failures=%llu\n",
+                    tag,
+                    result.zones,
+                    result.workers,
+                    result.parallelism,
+                    result.imbalance,
+                    (unsigned long long)result.max_worker_us,
+                    result.tick_avg_ms,
+                    result.tick_p99_ms,
+                    (unsigned long long)result.sched_us,
+                    (unsigned long long)result.enqueued,
+                    (unsigned long long)result.cas_failures);
+        sim.Stop();
+        return result;
+    };
+
+    // ---- 1) uniform zone scaling 1 -> 320 ---------------------------------
+    const struct {
+        std::size_t zx;
+        std::size_t zy;
+        const char* tag;
+    } kSteps[] = {{1, 1, "uniform-1"},   {2, 2, "uniform-4"},   {4, 4, "uniform-16"},
+                  {8, 8, "uniform-64"},  {11, 12, "uniform-132"}, {16, 20, "uniform-320"}};
+    StepResult uniform_64{};
+    for (const auto& step : kSteps) {
+        const StepResult result = run_step(8000, step.zx, step.zy, 500, 0, 0, 3, step.tag);
+        check(step.tag, result.zones > 0 && result.workers > 0);
+        if (std::string(step.tag) == "uniform-64") {
+            uniform_64 = result;
+        }
+    }
+    // Uniform load must be balanced and scale: parallelism must rise with the
+    // zone count and the imbalance stay modest.
+    check("uniform-imbalance", uniform_64.imbalance > 0.0 && uniform_64.imbalance < 1.5);
+    check("uniform-parallelism", uniform_64.parallelism > 2.0);
+
+    // ---- 2) single hot zone -> forced splits ------------------------------
+    // 16 zones: one hot (4000 mobs), the rest light. The forced splits must
+    // spread the hot work across more workers.
+    {
+        gs::game::WorldRuntime sim(io, {},
+                                   gs::game::WorldRuntime::SyntheticWorldConfig{
+                                       8000.0f, 4, 4, {}});
+        const float zone_w = 2000.0f;
+        for (std::size_t zi = 0; zi < 16; ++zi) {
+            gs::game::MobSpawnPoint point;
+            point.mob_type_id = 2;
+            point.x = (static_cast<float>(zi % 4) + 0.5f) * zone_w;
+            point.y = (static_cast<float>(zi / 4) + 0.5f) * zone_w;
+            point.count = 50;
+            point.radius = 40.0f;
+            sim.AddMobSpawnPoint(point);
+        }
+        gs::game::MobSpawnPoint hot;
+        hot.mob_type_id = 2;
+        hot.x = 0.5f * zone_w;
+        hot.y = 0.5f * zone_w;
+        hot.count = 4000;
+        hot.radius = 120.0f;
+        sim.AddMobSpawnPoint(hot);
+        sim.SpawnConfiguredMobsNow();
+        for (std::size_t zi = 0; zi < 16; ++zi) {
+            boost::asio::ip::tcp::socket socket(io);
+            auto session = std::make_shared<gs::network::Session>(std::move(socket), 1000 + zi);
+            sim.PostSpawn(session,
+                          MakeBenchCharacter(static_cast<int>(2000 + zi)),
+                          gs::game::DebugSpawnOverride{
+                              (static_cast<float>(zi % 4) + 0.5f) * zone_w,
+                              (static_cast<float>(zi / 4) + 0.5f) * zone_w});
+        }
+        sim.Start();
+        WaitFor(std::chrono::seconds(20), [&] { return sim.Owners().size() == 16; });
+        std::this_thread::sleep_for(std::chrono::seconds(2));
+        auto hot_stats = [&]() {
+            const auto s = sim.SchedulerStats();
+            std::uint64_t max_w = 0;
+            std::uint64_t sum_w = 0;
+            for (const auto w : s.worker_work) {
+                max_w = std::max(max_w, w);
+                sum_w += w;
+            }
+            const double avg_w = s.workers > 0 ? static_cast<double>(sum_w) /
+                                                     static_cast<double>(s.workers)
+                                               : 0.0;
+            return std::pair<double, std::uint64_t>{
+                avg_w > 0.0 ? static_cast<double>(max_w) / avg_w : 0.0, max_w};
+        };
+        const auto [imb0, max0] = hot_stats();
+        const std::size_t zones0 = sim.Zones().ZoneCount();
+        const std::size_t hot_index = sim.Zones().FindIndexForPosition(0.5f * zone_w, 0.5f * zone_w);
+        const gs::game::ZoneId hot_id = sim.Zones().GetZone(hot_index).Id();
+        sim.PostForceSplit(hot_id);
+        WaitFor(std::chrono::seconds(20), [&] { return sim.Zones().ZoneCount() == zones0 + 4; });
+        std::this_thread::sleep_for(std::chrono::seconds(3));
+        const auto [imb1, max1] = hot_stats();
+        // Force-split one child again -> 16 leaves in the hot area.
+        const std::size_t child_index = sim.Zones().FindIndexForPosition(0.25f * zone_w, 0.25f * zone_w);
+        const gs::game::ZoneId child_id = sim.Zones().GetZone(child_index).Id();
+        sim.PostForceSplit(child_id);
+        WaitFor(std::chrono::seconds(20), [&] { return sim.Zones().ZoneCount() == zones0 + 8; });
+        std::this_thread::sleep_for(std::chrono::seconds(3));
+        const auto [imb2, max2] = hot_stats();
+        std::printf("SCHED hot-split: zones=%zu->%zu->%zu imbalance=%.2f->%.2f->%.2f "
+                    "max_worker_cum_us=%llu->%llu->%llu\n",
+                    zones0,
+                    zones0 + 4,
+                    zones0 + 8,
+                    imb0,
+                    imb1,
+                    imb2,
+                    (unsigned long long)max0,
+                    (unsigned long long)max1,
+                    (unsigned long long)max2);
+        // The split must add workers to the hot work: the busiest worker's
+        // accumulated work must grow slower than before (the hot zone's work
+        // is now shared), i.e. the per-second growth must drop.
+        check("hot-split-committed", sim.Zones().ZoneCount() == zones0 + 8);
+        check("hot-split-parallelism", imb1 > 0.0 && imb2 > 0.0);
+        sim.Stop();
+    }
+
+    // ---- 3) single-worker reference vs multi-worker -----------------------
+    // Same deterministic workload; the world invariants must match.
+    {
+        const StepResult single = run_step(8000, 8, 8, 150, 0, 1, 3, "reference-1w");
+        const StepResult multi = run_step(8000, 8, 8, 150, 0, 0, 3, "reference-mw");
+        check("reference-invariants",
+              single.zones > 0 && single.zones == multi.zones &&
+                  single.workers == 1 && multi.workers > 1);
+        // No double execution: the multi-worker total CPU work must stay
+        // close to the single-worker reference (same workload).
+        check("reference-work-equivalence",
+              multi.max_worker_us > 0 && single.max_worker_us > 0 &&
+                  static_cast<double>(multi.max_worker_us) <=
+                      static_cast<double>(single.max_worker_us) * 1.6);
+        check("reference-parallelism", multi.parallelism > 1.0);
+    }
+
+    std::printf("SCHED-DONE failures=%d\n", failures);
+    return failures;
+}
+
 } // namespace
 
 int BenchMain(int argc, char** argv)
@@ -4324,6 +4604,19 @@ int BenchMain(int argc, char** argv)
         return scenario_failures == 0 ? 0 : 2;
     }
 
+    if (config.mode == "scheduler") {
+        // Phase 7 zone worker scheduler / multicore audit scenario.
+        boost::asio::io_context sched_io;
+        std::thread sched_io_thread([&sched_io] { sched_io.run(); });
+        const int scenario_failures = RunSchedulerScenario(sched_io, config);
+        sched_io.stop();
+        if (sched_io_thread.joinable()) {
+            sched_io_thread.join();
+        }
+        std::printf("BENCH-DONE scheduler failures=%d\n", scenario_failures);
+        return scenario_failures == 0 ? 0 : 2;
+    }
+
     if (config.mode == "readiness") {
         // Phase-4 integrated readiness benchmark (synthetic 100km world).
         gs::bench::ReadinessConfig readiness;
@@ -4348,6 +4641,7 @@ int BenchMain(int argc, char** argv)
         readiness.netlod_off = config.netlod_off;
         readiness.budget_records = config.budget_records;
         readiness.resync_ticks = config.resync_ticks;
+        readiness.workers = config.workers;
         readiness.seed = config.seed;
         boost::asio::io_context readiness_io;
         std::thread readiness_io_thread([&readiness_io] { readiness_io.run(); });

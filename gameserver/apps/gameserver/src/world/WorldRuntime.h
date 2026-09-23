@@ -224,6 +224,30 @@ public:
                                 std::string& out_error);
     double SupervisorAvgMs() const;
     ZoneWorkerPool::Utilization WorkerUtilization() const;
+    // Phase 7 scheduler audit: explicit worker count (0 = auto). Must be set
+    // before Start.
+    void ConfigureWorkers(std::size_t count) noexcept
+    {
+        requested_workers_ = count;
+    }
+    // Worker-level scheduling snapshot: per-worker work/tasks, the scheduler
+    // counters and the wall time spent with at least one tick in flight.
+    struct SchedulerSnapshot {
+        std::size_t workers = 0;
+        std::uint64_t waves = 0;
+        std::uint64_t due_zones = 0;
+        std::uint64_t enqueued = 0;
+        std::uint64_t sleeping_skips = 0;
+        std::uint64_t cas_failures = 0;
+        std::uint64_t schedule_micros = 0;
+        std::uint64_t worker_work_micros = 0;
+        std::uint64_t worker_idle_micros = 0;
+        std::uint64_t busy_phase_micros = 0;
+        std::uint64_t idle_phase_micros = 0;
+        std::vector<std::uint64_t> worker_work;
+        std::vector<std::uint64_t> worker_tasks;
+    };
+    SchedulerSnapshot SchedulerStats() const;
     std::size_t MigrationQuarantined() const;
     MigrationId LastCommittedMigration() const;
     MigrationMetrics::Snapshot MigrationMetrics() const;
@@ -561,6 +585,12 @@ private:
     std::atomic<std::uint64_t> replication_validation_runs_{0};
     std::atomic<std::uint64_t> replication_validation_failures_{0};
     std::atomic<bool> replication_audit_{false};
+
+    // Phase 7 scheduler audit.
+    std::size_t requested_workers_ = 0;
+    std::atomic<std::uint64_t> busy_phase_micros_{0};
+    std::atomic<std::uint64_t> idle_phase_micros_{0};
+    std::chrono::steady_clock::time_point last_phase_sample_{};
 };
 
 } // namespace gs::game

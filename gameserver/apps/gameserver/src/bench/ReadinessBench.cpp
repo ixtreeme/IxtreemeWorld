@@ -415,6 +415,9 @@ int RunReadinessBenchmark(boost::asio::io_context& io, const ReadinessConfig& co
         sim.SetReplicationAudit(true);
     }
 
+    if (config.workers > 0) {
+        sim.ConfigureWorkers(static_cast<std::size_t>(config.workers));
+    }
     if (config.lod_off) {
         gs::game::LodConfig lod;
         lod.enabled = false;
@@ -983,6 +986,7 @@ int RunReadinessBenchmark(boost::asio::io_context& io, const ReadinessConfig& co
     std::uint64_t ghost_shadow_failures = 0;
     std::uint64_t replication_shadow_runs = 0;
     std::uint64_t replication_shadow_failures = 0;
+    const auto sched_before = sim.SchedulerStats();
     const GlobalCounters counters_before = snapshot_globals();
     while (Clock::now() < measure_end) {
         const auto now = Clock::now();
@@ -1028,9 +1032,80 @@ int RunReadinessBenchmark(boost::asio::io_context& io, const ReadinessConfig& co
     }
     sample_zones();
     sample_load_field();
+    const auto sched_after = sim.SchedulerStats();
     const GlobalCounters counters_after = snapshot_globals();
     const double measure_actual_s =
         std::chrono::duration<double>(Clock::now() - measure_start).count();
+
+    // ---- Phase 7 scheduler audit line ------------------------------------
+    {
+        const auto delta = [](std::uint64_t after, std::uint64_t before) {
+            return after >= before ? after - before : 0;
+        };
+        const std::uint64_t work = delta(sched_after.worker_work_micros,
+                                         sched_before.worker_work_micros);
+        const std::uint64_t idle = delta(sched_after.worker_idle_micros,
+                                         sched_before.worker_idle_micros);
+        const std::uint64_t busy_phase = delta(sched_after.busy_phase_micros,
+                                               sched_before.busy_phase_micros);
+        const std::uint64_t idle_phase = delta(sched_after.idle_phase_micros,
+                                               sched_before.idle_phase_micros);
+        const std::uint64_t sched_us = delta(sched_after.schedule_micros,
+                                             sched_before.schedule_micros);
+        const std::uint64_t enqueued = delta(sched_after.enqueued, sched_before.enqueued);
+        const std::uint64_t due_zones = delta(sched_after.due_zones, sched_before.due_zones);
+        const std::uint64_t waves = delta(sched_after.waves, sched_before.waves);
+        const std::uint64_t cas_failures = delta(sched_after.cas_failures,
+                                                 sched_before.cas_failures);
+        const std::uint64_t sleeping = delta(sched_after.sleeping_skips,
+                                             sched_before.sleeping_skips);
+        std::uint64_t max_worker = 0;
+        std::uint64_t min_worker = UINT64_MAX;
+        for (std::size_t i = 0; i < sched_after.worker_work.size() &&
+                               i < sched_before.worker_work.size();
+             ++i) {
+            const std::uint64_t w = delta(sched_after.worker_work[i],
+                                          sched_before.worker_work[i]);
+            max_worker = std::max(max_worker, w);
+            min_worker = std::min(min_worker, w);
+        }
+        if (min_worker == UINT64_MAX) {
+            min_worker = 0;
+        }
+        const double avg_worker =
+            sched_after.workers > 0
+                ? static_cast<double>(work) / static_cast<double>(sched_after.workers)
+                : 0.0;
+        const double imbalance = avg_worker > 0.0 ? static_cast<double>(max_worker) / avg_worker
+                                                  : 0.0;
+        // Effective parallelism: average busy workers over the measured wall
+        // time (the supervisor's phase sampling is far coarser than a tick,
+        // so deriving it from busy_phase would overstate it).
+        const double parallelism =
+            measure_actual_s > 0.0
+                ? static_cast<double>(work) / (measure_actual_s * 1.0e6)
+                : 0.0;
+        std::printf("READINESS sched: workers=%zu active_zones=%zu parallelism=%.2f "
+                    "imbalance=%.2f worker_work=[min=%llu avg=%.0f max=%llu us] idle_us=%llu "
+                    "phase=[busy=%llu idle=%llu us] sched_us=%llu enqueued=%llu due=%llu "
+                    "waves=%llu cas_failures=%llu sleeping=%llu\n",
+                    sched_after.workers,
+                    sim.Zones().ZoneCount(),
+                    parallelism,
+                    imbalance,
+                    (unsigned long long)min_worker,
+                    avg_worker,
+                    (unsigned long long)max_worker,
+                    (unsigned long long)idle,
+                    (unsigned long long)busy_phase,
+                    (unsigned long long)idle_phase,
+                    (unsigned long long)sched_us,
+                    (unsigned long long)enqueued,
+                    (unsigned long long)due_zones,
+                    (unsigned long long)waves,
+                    (unsigned long long)cas_failures,
+                    (unsigned long long)sleeping);
+    }
 
     // ---- FINAL VALIDATION -------------------------------------------------
     sim.RequestValidation();
