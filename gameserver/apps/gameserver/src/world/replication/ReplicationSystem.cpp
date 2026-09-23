@@ -32,6 +32,7 @@ thread_local VisibilitySystem::SnapshotCache t_snapshot_cache;
 thread_local VisibilitySystem::DespawnCache t_despawn_cache;
 thread_local RecordCache t_record_cache;
 thread_local std::vector<std::uint32_t> t_record_slots;
+thread_local std::vector<std::uint8_t> t_delta_payload;
 
 // SpawnCache and DespawnCache are the same underlying type; one template
 // covers both.
@@ -113,14 +114,17 @@ std::size_t ReplicationSystem::BroadcastTransforms(Zone& zone,
         diag.repl_aoi_us_since_diag.fetch_add(ElapsedUs(aoi_start), std::memory_order_relaxed);
         diag.aoi_queries_since_diag.fetch_add(1, std::memory_order_relaxed);
 
-        // Staggered full refresh: each viewer refreshes once per
-        // refresh_ticks, spread across ticks by NetId so no tick carries the
-        // whole world's refresh at once. With dirty replication off this is
-        // the legacy "send everything every tick" behavior.
+        // Staggered full refresh/resync: each viewer refreshes once per
+        // refresh_ticks (v2: resync_ticks when configured), spread across
+        // ticks by NetId so no tick carries the whole world's refresh at
+        // once. With dirty replication off this is the legacy "send
+        // everything every tick" behavior.
+        const std::uint32_t refresh_period =
+            effective.v2_enabled && effective.resync_ticks > 0 ? effective.resync_ticks
+                                                               : effective.refresh_ticks;
         const bool refresh_all =
             !effective.dirty_enabled ||
-            (effective.refresh_ticks > 0 &&
-             ((world_tick + viewer_net_id) % effective.refresh_ticks) == 0);
+            (refresh_period > 0 && ((world_tick + viewer_net_id) % refresh_period) == 0);
         if (refresh_all && effective.dirty_enabled) {
             diag.repl_refresh_since_diag.fetch_add(1, std::memory_order_relaxed);
         }
@@ -144,8 +148,11 @@ std::size_t ReplicationSystem::BroadcastTransforms(Zone& zone,
                                           t_snapshot_cache,
                                           t_despawn_cache,
                                           t_record_cache,
+                                          effective,
+                                          world_tick,
                                           refresh_all,
                                           t_record_slots,
+                                          t_delta_payload,
                                           stats);
         const std::uint64_t reconcile_us = ElapsedUs(reconcile_start) >= send_us
                                                ? ElapsedUs(reconcile_start) - send_us
@@ -160,13 +167,21 @@ std::size_t ReplicationSystem::BroadcastTransforms(Zone& zone,
                                   viewer_position,
                                   viewer_entity.get<Heading>(),
                                   viewer_entity.get<MoveIntent>().state);
-        auto frame = EncodeTransformFrameFromRecords(viewer_record,
-                                                     t_record_cache.records,
-                                                     t_record_slots,
-                                                     zone.TickIndex());
+        auto frame = effective.v2_enabled
+                         ? EncodeTransformFrameV2(viewer_record,
+                                                  t_delta_payload,
+                                                  static_cast<std::uint32_t>(stats.delta_records +
+                                                                             stats.full_records),
+                                                  zone.TickIndex())
+                         : EncodeTransformFrameFromRecords(viewer_record,
+                                                           t_record_cache.records,
+                                                           t_record_slots,
+                                                           zone.TickIndex());
         const std::uint64_t encode_us = ElapsedUs(encode_start);
         const std::uint64_t frame_bytes = frame.size();
-        const std::size_t records = 1 + t_record_slots.size();
+        const std::size_t records = 1 + (effective.v2_enabled
+                                             ? stats.delta_records + stats.full_records
+                                             : t_record_slots.size());
         {
             const auto start = Clock::now();
             timed_send(binding.session, std::move(frame));
@@ -196,6 +211,35 @@ std::size_t ReplicationSystem::BroadcastTransforms(Zone& zone,
                                                           std::memory_order_relaxed);
         diag.repl_despawn_cache_misses_since_diag.fetch_add(stats.despawn_cache_misses,
                                                             std::memory_order_relaxed);
+        diag.repl_v2_full_records_since_diag.fetch_add(stats.full_records,
+                                                       std::memory_order_relaxed);
+        diag.repl_v2_delta_records_since_diag.fetch_add(stats.delta_records,
+                                                        std::memory_order_relaxed);
+        diag.repl_v2_deferred_since_diag.fetch_add(stats.deferred, std::memory_order_relaxed);
+        diag.repl_v2_starvation_since_diag.fetch_add(stats.starvation_bypasses,
+                                                     std::memory_order_relaxed);
+        diag.repl_v2_budget_hits_since_diag.fetch_add(stats.budget_hits,
+                                                      std::memory_order_relaxed);
+        diag.repl_v2_critical_since_diag.fetch_add(stats.critical_records,
+                                                   std::memory_order_relaxed);
+        diag.repl_v2_delta_bytes_since_diag.fetch_add(stats.delta_bytes,
+                                                      std::memory_order_relaxed);
+        {
+            std::uint64_t observed =
+                diag.repl_v2_max_defer_ticks.load(std::memory_order_relaxed);
+            while (stats.max_defer_ticks > observed &&
+                   !diag.repl_v2_max_defer_ticks.compare_exchange_weak(
+                       observed, stats.max_defer_ticks, std::memory_order_relaxed)) {
+            }
+        }
+        diag.repl_v2_tier_critical_since_diag.fetch_add(stats.tier_counts[0],
+                                                        std::memory_order_relaxed);
+        diag.repl_v2_tier_near_since_diag.fetch_add(stats.tier_counts[1],
+                                                    std::memory_order_relaxed);
+        diag.repl_v2_tier_normal_since_diag.fetch_add(stats.tier_counts[2],
+                                                      std::memory_order_relaxed);
+        diag.repl_v2_tier_reduced_since_diag.fetch_add(stats.tier_counts[3],
+                                                       std::memory_order_relaxed);
         diag.aoi_visible_final_since_diag.fetch_add(stats.visible, std::memory_order_relaxed);
         diag.interest_enter_since_diag.fetch_add(stats.spawns, std::memory_order_relaxed);
         diag.interest_leave_since_diag.fetch_add(stats.despawns, std::memory_order_relaxed);

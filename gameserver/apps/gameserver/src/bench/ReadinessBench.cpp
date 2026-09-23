@@ -220,6 +220,19 @@ struct ZoneStageTotals {
     WindowDelta grid_removes;
     WindowDelta grid_moves_in_cell;
     WindowDelta grid_moves_cell;
+    // Phase 6 v2.
+    WindowDelta repl_v2_full_records;
+    WindowDelta repl_v2_delta_records;
+    WindowDelta repl_v2_deferred;
+    WindowDelta repl_v2_starvation;
+    WindowDelta repl_v2_budget_hits;
+    WindowDelta repl_v2_critical;
+    WindowDelta repl_v2_delta_bytes;
+    WindowDelta repl_v2_max_defer;
+    WindowDelta repl_v2_tier_critical;
+    WindowDelta repl_v2_tier_near;
+    WindowDelta repl_v2_tier_normal;
+    WindowDelta repl_v2_tier_reduced;
 };
 
 struct GlobalCounters {
@@ -382,6 +395,13 @@ int RunReadinessBenchmark(boost::asio::io_context& io, const ReadinessConfig& co
         replication.aoi_partial_cap = !config.aoi_full_sort;
         replication.aoi_reference_positions = config.aoi_reference_positions;
         replication.aoi_nth_element = !config.aoi_partial_sort;
+        replication.v2_enabled = !config.repl_v1;
+        replication.network_lod_enabled = !config.netlod_off;
+        replication.budget_max_records = static_cast<std::uint32_t>(
+            std::max(0, config.budget_records));
+        if (config.resync_ticks > 0) {
+            replication.resync_ticks = static_cast<std::uint32_t>(config.resync_ticks);
+        }
         sim.ConfigureReplication(replication);
     }
     if (config.ghost_shadow) {
@@ -774,6 +794,36 @@ int RunReadinessBenchmark(boost::asio::io_context& io, const ReadinessConfig& co
                             totals.grid_moves_in_cell);
             AccumulateWindow(diag.grid_moves_cell_since_diag.load(std::memory_order_relaxed),
                             totals.grid_moves_cell);
+            AccumulateWindow(diag.repl_v2_full_records_since_diag.load(std::memory_order_relaxed),
+                            totals.repl_v2_full_records);
+            AccumulateWindow(diag.repl_v2_delta_records_since_diag.load(std::memory_order_relaxed),
+                            totals.repl_v2_delta_records);
+            AccumulateWindow(diag.repl_v2_deferred_since_diag.load(std::memory_order_relaxed),
+                            totals.repl_v2_deferred);
+            AccumulateWindow(diag.repl_v2_starvation_since_diag.load(std::memory_order_relaxed),
+                            totals.repl_v2_starvation);
+            AccumulateWindow(diag.repl_v2_budget_hits_since_diag.load(std::memory_order_relaxed),
+                            totals.repl_v2_budget_hits);
+            AccumulateWindow(diag.repl_v2_critical_since_diag.load(std::memory_order_relaxed),
+                            totals.repl_v2_critical);
+            AccumulateWindow(diag.repl_v2_delta_bytes_since_diag.load(std::memory_order_relaxed),
+                            totals.repl_v2_delta_bytes);
+            // A max counter must not be summed across windows: keep the peak.
+            {
+                const std::uint64_t observed =
+                    diag.repl_v2_max_defer_ticks.load(std::memory_order_relaxed);
+                if (observed > totals.repl_v2_max_defer.total) {
+                    totals.repl_v2_max_defer.total = observed;
+                }
+            }
+            AccumulateWindow(diag.repl_v2_tier_critical_since_diag.load(std::memory_order_relaxed),
+                            totals.repl_v2_tier_critical);
+            AccumulateWindow(diag.repl_v2_tier_near_since_diag.load(std::memory_order_relaxed),
+                            totals.repl_v2_tier_near);
+            AccumulateWindow(diag.repl_v2_tier_normal_since_diag.load(std::memory_order_relaxed),
+                            totals.repl_v2_tier_normal);
+            AccumulateWindow(diag.repl_v2_tier_reduced_since_diag.load(std::memory_order_relaxed),
+                            totals.repl_v2_tier_reduced);
         }
     };
 
@@ -1436,6 +1486,44 @@ int RunReadinessBenchmark(boost::asio::io_context& io, const ReadinessConfig& co
                 (unsigned long long)bytes_copied,
                 (unsigned long long)wire_bytes,
                 copy_amplification);
+
+    // Phase 6 v2: field-delta vs full-state split, deferral/budget/starvation
+    // and Network LOD tier populations (MEASURED; ratios DERIVED).
+    {
+        const std::uint64_t v2_full = total_of(&ZoneStageTotals::repl_v2_full_records);
+        const std::uint64_t v2_delta = total_of(&ZoneStageTotals::repl_v2_delta_records);
+        const std::uint64_t v2_total = v2_full + v2_delta;
+        const std::uint64_t v2_deferred = total_of(&ZoneStageTotals::repl_v2_deferred);
+        const std::uint64_t v2_starvation = total_of(&ZoneStageTotals::repl_v2_starvation);
+        const std::uint64_t v2_budget_hits = total_of(&ZoneStageTotals::repl_v2_budget_hits);
+        const std::uint64_t v2_critical = total_of(&ZoneStageTotals::repl_v2_critical);
+        const std::uint64_t v2_delta_bytes = total_of(&ZoneStageTotals::repl_v2_delta_bytes);
+        const std::uint64_t v2_max_defer = total_of(&ZoneStageTotals::repl_v2_max_defer);
+        const std::uint64_t tier_c = total_of(&ZoneStageTotals::repl_v2_tier_critical);
+        const std::uint64_t tier_n = total_of(&ZoneStageTotals::repl_v2_tier_near);
+        const std::uint64_t tier_no = total_of(&ZoneStageTotals::repl_v2_tier_normal);
+        const std::uint64_t tier_r = total_of(&ZoneStageTotals::repl_v2_tier_reduced);
+        const double delta_ratio =
+            v2_total > 0 ? 100.0 * static_cast<double>(v2_delta) / static_cast<double>(v2_total)
+                         : 0.0;
+        std::printf("READINESS replv2: full=%llu delta=%llu delta_ratio=%.1f%% "
+                    "deferred=%llu starvation=%llu budget_hits=%llu critical=%llu "
+                    "delta_bytes=%llu max_defer_ticks=%llu\n",
+                    (unsigned long long)v2_full,
+                    (unsigned long long)v2_delta,
+                    delta_ratio,
+                    (unsigned long long)v2_deferred,
+                    (unsigned long long)v2_starvation,
+                    (unsigned long long)v2_budget_hits,
+                    (unsigned long long)v2_critical,
+                    (unsigned long long)v2_delta_bytes,
+                    (unsigned long long)v2_max_defer);
+        std::printf("READINESS netlod: critical=%llu near=%llu normal=%llu reduced=%llu\n",
+                    (unsigned long long)tier_c,
+                    (unsigned long long)tier_n,
+                    (unsigned long long)tier_no,
+                    (unsigned long long)tier_r);
+    }
 
     // Interest-overlap measurement (phase 5C §11, report-time only): how
     // similar are the recipients' interest sets? Deterministic FNV-1a over

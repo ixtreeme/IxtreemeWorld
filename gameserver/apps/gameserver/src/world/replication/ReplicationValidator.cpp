@@ -172,7 +172,7 @@ bool ValidateReplicationShadow(ZoneManager& zones,
             }
 
             // (1) identity + coverage for everything the viewer knows.
-            for (const auto& [net_id, last_sent] : binding.visible_net_versions) {
+            for (const auto& [net_id, known] : binding.visible_net_versions) {
                 ++relationships_checked;
                 if (net_id == viewer_net_id) {
                     std::ostringstream message;
@@ -209,13 +209,105 @@ bool ValidateReplicationShadow(ZoneManager& zones,
                     out_error = message.str();
                     return false;
                 }
-                if (last_sent < current) {
-                    std::ostringstream message;
-                    message << "zone " << zone.Id() << " viewer " << viewer_net_id
-                            << ": stale recipient state for net " << net_id << " (last_sent="
-                            << last_sent << " current=" << current << ")";
-                    out_error = message.str();
-                    return false;
+                // Phase 6 shadow client model: the recipient state stores the
+                // replicated field values. When the recipient is caught up
+                // (same version) those fields MUST equal authority -- a
+                // missing/incorrect delta shows up here. A recipient that
+                // lags (Network LOD / budget deferral) must stay within the
+                // starvation/age bound.
+                // Authority transform: resident components or the ghost
+                // snapshot (the same source the reconcile reads).
+                bool authority_ok = false;
+                float ax = 0.0f;
+                float ay = 0.0f;
+                float az = 0.0f;
+                std::uint16_t ahq = 0;
+                std::uint8_t ast = 0;
+                if (const auto entity = zone.FindEntity(net_id);
+                    entity.is_valid() && entity.has<Position>() && entity.has<Heading>()) {
+                    const auto pos = entity.get<Position>();
+                    const auto heading = entity.get<Heading>();
+                    const MoveState state = entity.has<MoveIntent>()
+                                                ? entity.get<MoveIntent>().state
+                                                : MoveState::Idle;
+                    ax = pos.x;
+                    ay = pos.y;
+                    az = pos.z;
+                    ahq = QuantizeHeading(heading.angle);
+                    ast = static_cast<std::uint8_t>(state);
+                    authority_ok = true;
+                } else if (const GhostRecord* ghost = zone.FindGhost(net_id)) {
+                    ax = ghost->snapshot.position.x;
+                    ay = ghost->snapshot.position.y;
+                    az = ghost->snapshot.position.z;
+                    ahq = QuantizeHeading(ghost->snapshot.heading.angle);
+                    ast = static_cast<std::uint8_t>(ghost->snapshot.move_state);
+                    authority_ok = true;
+                }
+                if (authority_ok) {
+                    const bool fields_match = ax == known.x && ay == known.y && az == known.z &&
+                                              ahq == known.heading_q &&
+                                              ast == known.move_state;
+                    // The shadow contract: the recipient's replicated fields
+                    // must converge to authority within the starvation/age
+                    // bound. A transient one-tick lag (e.g. a migration that
+                    // preserved the version but shifted the baseline) is
+                    // corrected by the next delta; a persistent divergence is
+                    // a failure.
+                    // Age of the entity's last change: a fresh change may
+                    // legitimately not have reached the recipient yet (the
+                    // Network LOD period / budget), an old pending change must
+                    // have been delivered.
+                    const std::uint32_t correction_age =
+                        zone.WorldTick() >= current ? zone.WorldTick() - current : 0;
+                    if (!fields_match && correction_age > config.max_defer_ticks + 2) {
+                        std::ostringstream message;
+                        const bool resident = zone.IsResident(net_id);
+                        const bool ghost = zone.FindGhost(net_id) != nullptr;
+                        message << "zone " << zone.Id() << " viewer " << viewer_net_id
+                                << ": shadow client state for net " << net_id
+                                << " does not converge (age=" << correction_age << ")"
+                                << " (client=(" << known.x << ", "
+                                << known.y << ", " << known.z << ") hq=" << known.heading_q
+                                << " state=" << static_cast<int>(known.move_state)
+                                << ", authority=(" << ax << ", " << ay << ", " << az
+                                << ") hq=" << ahq
+                                << " state=" << static_cast<int>(ast) << ")"
+                                << " resident=" << (resident ? 1 : 0)
+                                << " ghost=" << (ghost ? 1 : 0)
+                                << " version=" << known.version << " current=" << current
+                                << " last_sent=" << known.last_sent_tick
+                                << " next_due=" << known.next_due_tick
+                                << " tier=" << static_cast<int>(known.tier)
+                                << " now=" << zone.WorldTick();
+                        float sx = 0.0f;
+                        float sy = 0.0f;
+                        float sz = 0.0f;
+                        if (zone.Grid().DebugStoredPosition(net_id, sx, sy, sz)) {
+                            message << " grid=(" << sx << ", " << sy << ", " << sz << ")";
+                        }
+                        out_error = message.str();
+                        return false;
+                    }
+                } else {
+                    // The recipient lags: the entity's last change (its
+                    // version tick) must not stay unsent beyond the
+                    // starvation bound.
+                    const std::uint32_t age =
+                        zone.WorldTick() >= current ? zone.WorldTick() - current : 0;
+                    if (age > config.max_defer_ticks + 2) {
+                        std::ostringstream message;
+                        message << "zone " << zone.Id() << " viewer " << viewer_net_id
+                                << ": pending change for net " << net_id << " too old (age="
+                                << age << " ticks > bound " << (config.max_defer_ticks + 2)
+                                << "; known_version=" << known.version << " current=" << current
+                                << " next_due=" << known.next_due_tick
+                                << " last_sent=" << known.last_sent_tick
+                                << " now=" << zone.WorldTick()
+                                << " tier=" << static_cast<int>(known.tier) << ")";
+                        out_error = message.str();
+                        return false;
+                    }
                 }
                 if (!expected.contains(net_id)) {
                     std::ostringstream message;

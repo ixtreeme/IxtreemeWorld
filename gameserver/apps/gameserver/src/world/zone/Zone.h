@@ -93,15 +93,28 @@ struct ZoneTickContext {
 //  - grid_: spatial index maintained incrementally by the systems
 class Zone {
 public:
+    // Phase 6: per-recipient entity state. This IS the shadow client model:
+    // the server tracks exactly what the recipient knows (version + the
+    // replicated field values) and sends field-level deltas against it.
+    struct RecipientEntity {
+        std::uint32_t version = 0;        // entity TransformVersion last seen
+        std::uint32_t next_due_tick = 0;  // Network LOD schedule
+        std::uint32_t last_sent_tick = 0; // for starvation / state-age bounds
+        float x = 0.0f;                   // client-known position
+        float y = 0.0f;
+        float z = 0.0f;
+        std::uint16_t heading_q = 0;      // client-known quantized heading
+        std::uint8_t move_state = 0;      // client-known move state
+        std::uint8_t tier = 0;            // Network LOD tier (for diagnostics)
+    };
+
     struct PlayerBinding {
         std::shared_ptr<gs::network::Session> session;
         gs::db::Character character;
-        // Phase 5B interest set: net_id -> world tick at which this viewer
-        // was last sent the entity's transform (a spawn counts as sent). The
-        // key set IS the viewer's visible set; a transform record is only
-        // generated when the entity's TransformVersion is newer (or on the
-        // staggered periodic refresh).
-        std::unordered_map<std::uint32_t, std::uint32_t> visible_net_versions;
+        // Phase 5B/6 interest set: net_id -> recipient entity state. The key
+        // set IS the viewer's visible set; a delta is only generated when the
+        // entity's version moved ahead of the recipient's or a field differs.
+        std::unordered_map<std::uint32_t, RecipientEntity> visible_net_versions;
         // Recipient-level lifecycle counters (phase 5B observability): they
         // travel with the binding across migrations/splits/merges, so churn
         // caused by topology changes is directly measurable per recipient.

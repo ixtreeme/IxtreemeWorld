@@ -31,6 +31,36 @@ struct ReplicationConfig {
     // (optimized, default) instead of from the authoritative flecs component
     // (the pre-5D reference path). Both produce the identical visible set.
     bool aoi_reference_positions = false;
+
+    // ---- Phase 6: replication protocol v2 --------------------------------
+    // v2 sends field-level deltas against the recipient's known state,
+    // scheduled by a recipient-relative Network LOD and constrained by a
+    // per-session budget. false = the v1 full-state behavior (reference).
+    bool v2_enabled = true;
+    // Network LOD (recipient-relative update frequency; distinct from the
+    // Simulation LOD). Distances in meters, periods in ticks (20 Hz base).
+    struct NetworkLodTierConfig {
+        float near_distance_m = 40.0f;
+        float normal_distance_m = 80.0f;
+        std::uint32_t near_period_ticks = 1;    // 20 Hz
+        std::uint32_t normal_period_ticks = 2;  // 10 Hz
+        std::uint32_t reduced_period_ticks = 4; // 5 Hz (beyond normal_distance)
+        // Combat relevance (attacker/target/recent hit) promotes to Critical.
+        std::uint32_t critical_period_ticks = 1;
+    };
+    NetworkLodTierConfig network_lod;
+    bool network_lod_enabled = true;
+    // Per-session per-frame budget. Critical records (lifecycle, combat
+    // promotion, self) always pass; state beyond the budget stays pending and
+    // is retried next frame. 0 = unlimited.
+    std::uint32_t budget_max_records = 0;   // e.g. 64
+    std::uint32_t budget_max_bytes = 0;     // e.g. 2048
+    // Starvation protection: a pending state older than this many ticks is
+    // sent first (bypassing the budget order). Bounds the client state age.
+    std::uint32_t max_defer_ticks = 40;     // 2 s at 20 Hz
+    // Staggered periodic full-state resync (per viewer, phase by NetId).
+    // 0 disables it (only valid with v2 off or as an A/B switch).
+    std::uint32_t resync_ticks = 0;         // 0 = reuse refresh_ticks
 };
 
 // Clamps a candidate config into the supported range. Returns true when any

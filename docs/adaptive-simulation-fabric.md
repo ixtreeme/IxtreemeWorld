@@ -626,6 +626,7 @@ Az előző commitból javított Fast/Exact semanticsra **tesztet kell írni**:
 | **I (Phase 5B)** | §9.7/2–4 | AOI prefilter (top-k cap, grid entity-handle), dirty/interest-aware replication (TransformVersion + per-recipient interest set + staggered refresh), exact/shadow interest + coverage validator, `--mode aoi`/`--mode replication`, A/B (`--repl-full`, `--aoi-full-sort`), readiness re-benchmark | ✅ **KÉSZ** (lásd §11) |
 | **J (Phase 5C)** | §11.7/1–2 | Canonical 19 B record cache (serialize once / fanout many), memcpy frame assembly, spawn/despawn payload sharing, copy/wire byte accounting, canonical-record audit a shadow validatorban, interest-overlap mérés + grouping-döntés, readiness re-benchmark | ✅ **KÉSZ** (lásd §12) |
 | **K (Phase 5D)** | §12.7/1 | AOI query indexing: tárolt pozíció a grid entryben + `GridSlot` O(1) sync, nth_element top-k, AOI stage-metrikák, index-validator (stored position + slot), `--aoi-reference-positions` A/B, readiness re-benchmark | ✅ **KÉSZ** (lásd §13) |
+| **L (Phase 6)** | §13.7 gate | Replication Protocol v2: field-szintű delta a recipient baseline-hoz, Network LOD (külön rendszer), priority + per-session budget, starvation/resync, shadow kliensmodell, v1/v2 A/B + shadow, 500→7k scaling seam | ✅ **KÉSZ** (lásd §14) |
 
 ### Chunk A — elvégzett munka
 
@@ -2120,7 +2121,126 @@ a javaslat:
 
 `PHASE 6 — Replication Protocol v2 / Delta State / Network LOD / Priority & Budget`
 
-### 13.8 Nyitott, nem-protokoll jellegű tételek
+## 14. Phase 6 — Replication Protocol v2
+
+### 14.1 Audit — a v1 wire-modell
+
+A v1 (Phase 5C/5D) modell: viewerenként egy frame = header + a viewer saját
+19 B-os rekordja + a dirty látható entitások 19 B-os **teljes-állapotú**
+rekordjai; spawn/despawn/health/death külön Cap'n Proto event packetek;
+staggered ~1 s refresh; a recipient state egy `version` volt. A dense A/B
+baseline (500p/200k, 60/30): `update=12.5M`, `frame=242 MB/30s`,
+`wire=7.80 MB/s`, suppression 14%, p99 72.1 ms.
+
+**State vs event**: STATE = transform (position/heading/move_state) —
+latest-value; EVENT = spawn/despawn/health/death — nem coalesce-olható. A v1
+a state-et teljes 19 B-os rekordként küldte minden változásnál.
+
+### 14.2 v2 design
+
+1. **Field-szintű delta**: `u32 NetId | u8 mask | [pos 12 B] | [heading 2 B] |
+   [move_state 1 B]` (`kTransformField*`), mindig a **recipient ismert
+   állapotához** képest. A v2 frame opcode `0x11` (a v1 `0x10` marad).
+2. **Recipient baseline = shadow kliensmodell**: a `PlayerBinding` interest
+   entryje a verzió mellett a kliens ismert mezőértékeit tárolja
+   (`RecipientEntity`). ENTER → spawn (full initial state) + baseline;
+   LEAVE → despawn (Critical) + baseline törlés; re-enter → új full.
+3. **Network LOD** (külön rendszertől, a Simulation LOD-tól): recipient-relatív
+   update frekvencia távolság-sávokkal — Critical (combat-promoted) 20 Hz,
+   Near ≤40 m 20 Hz, Normal ≤80 m 10 Hz, Reduced >80 m 5 Hz; `next_due_tick`
+   determinisztikus fázissal. A v1 referencia útvonalon nincs NetLOD.
+4. **Priority + per-session budget**: a jelölt-lista távolság-rendezett
+   (természetes prioritás: Critical/Near/Normal/Reduced); a frame a budget
+   (`--budget`, pl. 64 record) eléréséig vesz fel state-et, a többi
+   **pending** marad (a verzió/due nem advance-el). Critical (lifecycle,
+   combat, refresh, starvation) mindig átmegy.
+5. **Starvation protection**: a **pending change kora** (`now −
+   entity_version_tick`) > `max_defer_ticks` (40) → bypass; a shadow
+   validator ugyanezt a korlátot kéri számon.
+6. **Periodic resync**: staggered (viewer-NetId fázis), `resync_ticks`
+   (default a `refresh_ticks`), full-state maskkal; a delta-nyereséget nem
+   semmisíti meg (1 Hz / entitás).
+7. **Flags**: `--repl-v1` (v1 full-state referencia), `--netlod-off`,
+   `--budget N`, `--resync N`.
+
+### 14.3 Correctness — shadow kliensmodell
+
+A `ValidateReplicationShadow` kiterjesztve: minden látható (viewer, net)
+párnál a **kliens mezőállapotát** hasonlítja az authority-hoz (resident vagy
+ghost snapshot); eltérés esetén a **pending change kora** ≤ `max_defer + 2`
+kell (friss változás még úton lehet; tartós divergencia failure). Emellett
+marad az exact interest-set + ordered AOI equivalence + canonical-record
+audit + lifecycle checks. Nincs silent repair.
+
+- `--mode aoi` / `--mode replication`: 10 shadow poll, 0 failure (3/3 futás).
+- **Full-scale (500p/200k) v2 correctness: dense, spread, combat — 15/15
+  poll, 0 validator/equivalence failure, world validation OK.**
+- Regresszió: 3 selftest + 9 bench mód + routing selftest zöld; ghost
+  `max_copies=1`, `repairs=0`.
+
+### 14.4 A/B mátrix (dense, 500p/200k, 60/30)
+
+| variáns | tick avg | p99 | records | frame MB/30s | **wire MB/s** | suppression | delta ratio |
+|---|---|---|---|---|---|---|---|
+| A: v1 full-state | 5.18 ms | 72.1 | 12.5M | 242 | **7.80** | 14% | 0% |
+| B: v2 delta, NetLOD off | 4.74 | 66.6 | 13.2M | 234 | 7.55 | 14% | 94.7% |
+| C: v2 + NetLOD | 4.91 | 64.7 | 10.5M | 193 | **6.25** | 37% | 92.7% |
+| D: v2 + NetLOD + budget 64 | 4.84 | 66.5 | 9.8M | 178 | **5.79** | 37% | 92.0% |
+
+- **Wire: 7.80 → 5.79 MB/s (−26%)**; records −22%; suppression 14% → 37%.
+- A budget deferred=1.6M recordot halasztott (budget_hits), starvation=0,
+  max pending age 9 tick (a 40-es korlát alatt).
+- A delta-formátum önmagában kevés byte-ot hoz (a mozgó entitás
+  position+heading = 19 B, mint a v1); a **frekvencia (NetLOD) és a budget**
+  a valódi wire-nyereség — a mérés ezt mutatta (a prompt §6 elvárása szerint).
+- Dense p99 ~65 ms (a futásonkénti topology-variance 54–72 ms); a gameplay
+  (mob-szimuláció) a domináns, nem a network.
+
+### 14.5 Player-scaling seam (spread, 200k mob, rövid runok)
+
+| players | zónák | tick avg | p99 | wire MB/s | working set |
+|---|---|---|---|---|---|
+| 1000 | 124 | 3.91 ms | 10.0 | 0.74 | 1575 MB |
+| 2000 | 124 | 3.85 | 9.2 | 2.51 | 1691 MB |
+| 4000 | 124 | 4.12 | 9.5 | 9.02 | 1959 MB |
+| 7000 | 120 | 4.91 | 10.6 | 26.5 | 2459 MB |
+
+- A tick költség 1k→7k playerig ~4–5 ms marad (a mob-szimuláció és a
+  zóna-párhuzamosság dominál); a wire a player-sűrűséggel nő.
+- 2000p multi (több hotspot): tick avg 5.28, p99 28.9, wire 9.07,
+  suppression 83.9% (a nem-mozgó tömeg state-je nem megy).
+- **Nem állítjuk, hogy 50k-ready**: a 7k mért pont; a per-session interest
+  state lineárisan skálázódik (csak látható entitások), de a 50k külön
+  readiness-lépcső.
+
+### 14.6 Negative results
+
+- **Numeric delta** (pozíció-kvantálás/delta): nem implementálva — a
+  field-selection delta + NetLOD mellett a mérhető extra nyereség kicsi, a
+  loss/reorder/resync semantics viszont bonyolódna (a prompt §5 feltétele).
+- **A v2 delta-formátum önmagában** (B vs A): a wire alig változott
+  (7.80 → 7.55); a nyereség a NetLOD-tól (C) és a budgettől (D) jön.
+- **Túl sok Network LOD tier**: 4 tier (Critical/Near/Normal/Reduced)
+  maradt; a finomabb sávok a mérésben nem indokoltak.
+- A korábbi fázisok negatív eredményei (interest grouping, despawn cache,
+  micro-bin) változatlanok.
+
+### 14.7 Bottleneck rangsor + Phase 7 gate
+
+Dense (500p/200k): **gameplay (AI+movement) ~47%**, replication fanout
+(~33%, ebből AOI ~8%), ghost ~11%, lod ~1%. A network-oldali wire a
+v2-vel −26%, a tick p99-et a gameplay dominálja.
+
+**Phase 7 gate (mérés alapján)**: a network volume már nem a domináns
+tényező a tick-időben; a legnagyobb cost a **gameplay/combat hot path**
+(mob AI + movement a sűrű zónákban), a második a **wire-szükséges
+per-recipient fanout** (a protokoll további csökkentése delta-state/priority
+irányban már Phase 6-ban megtörtént). Javaslat: **gameplay/combat hot-path
+phase**, a 4k–7k player tartományban pedig a per-session scheduling/state
+növekedésének figyelése; transport/kernel szint nem indokolt a mérések
+szerint.
+
+### 14.8 Nyitott, nem-protokoll jellegű tételek
 
 A §13.7 gate-en túl (Phase 6 protokoll-irány) nyitva maradt: activity-field
 query O(players-in-box) szűkítése, combat event-fanout coalescing, és a

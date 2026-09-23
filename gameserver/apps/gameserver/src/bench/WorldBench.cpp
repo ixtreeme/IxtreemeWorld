@@ -106,6 +106,10 @@ struct BenchConfig {
     bool aoi_full_sort = false;
     bool aoi_reference_positions = false;
     bool aoi_partial_sort = false;
+    bool repl_v1 = false;          // v1 full-state reference path
+    bool netlod_off = false;       // disable the Network LOD
+    int budget_records = 0;        // per-session per-frame record budget (0 = off)
+    int resync_ticks = 0;          // full-state resync period (0 = default)
 };
 
 bool ParseArgs(int argc, char** argv, BenchConfig& config)
@@ -241,6 +245,20 @@ bool ParseArgs(int argc, char** argv, BenchConfig& config)
             config.aoi_reference_positions = true;
         } else if (arg == "--aoi-partial-sort") {
             config.aoi_partial_sort = true;
+        } else if (arg == "--repl-v1") {
+            config.repl_v1 = true;
+        } else if (arg == "--netlod-off") {
+            config.netlod_off = true;
+        } else if (arg == "--budget") {
+            if (!need_value("budget", value)) {
+                return false;
+            }
+            config.budget_records = std::stoi(value);
+        } else if (arg == "--resync") {
+            if (!need_value("resync", value)) {
+                return false;
+            }
+            config.resync_ticks = std::stoi(value);
         } else if (arg == "--aoi-full-sort") {
             config.aoi_full_sort = true;
         } else {
@@ -4326,6 +4344,10 @@ int BenchMain(int argc, char** argv)
         readiness.aoi_full_sort = config.aoi_full_sort;
         readiness.aoi_reference_positions = config.aoi_reference_positions;
         readiness.aoi_partial_sort = config.aoi_partial_sort;
+        readiness.repl_v1 = config.repl_v1;
+        readiness.netlod_off = config.netlod_off;
+        readiness.budget_records = config.budget_records;
+        readiness.resync_ticks = config.resync_ticks;
         readiness.seed = config.seed;
         boost::asio::io_context readiness_io;
         std::thread readiness_io_thread([&readiness_io] { readiness_io.run(); });

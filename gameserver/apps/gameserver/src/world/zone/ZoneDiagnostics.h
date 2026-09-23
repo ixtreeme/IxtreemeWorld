@@ -154,6 +154,20 @@ struct ZoneDiagnostics {
     std::atomic<std::uint64_t> repl_bytes_generated_since_diag{0};
     std::atomic<std::uint64_t> repl_bytes_copied_since_diag{0};
     std::atomic<std::uint64_t> repl_wire_bytes_since_diag{0};
+    // Phase 6 v2: full/delta split, deferral/budget/starvation, Network LOD
+    // tier populations (0 critical, 1 near, 2 normal, 3 reduced).
+    std::atomic<std::uint64_t> repl_v2_full_records_since_diag{0};
+    std::atomic<std::uint64_t> repl_v2_delta_records_since_diag{0};
+    std::atomic<std::uint64_t> repl_v2_deferred_since_diag{0};
+    std::atomic<std::uint64_t> repl_v2_starvation_since_diag{0};
+    std::atomic<std::uint64_t> repl_v2_budget_hits_since_diag{0};
+    std::atomic<std::uint64_t> repl_v2_critical_since_diag{0};
+    std::atomic<std::uint64_t> repl_v2_delta_bytes_since_diag{0};
+    std::atomic<std::uint64_t> repl_v2_max_defer_ticks{0};
+    std::atomic<std::uint64_t> repl_v2_tier_critical_since_diag{0};
+    std::atomic<std::uint64_t> repl_v2_tier_near_since_diag{0};
+    std::atomic<std::uint64_t> repl_v2_tier_normal_since_diag{0};
+    std::atomic<std::uint64_t> repl_v2_tier_reduced_since_diag{0};
     std::atomic<std::uint64_t> repl_aoi_us_since_diag{0};
     std::atomic<std::uint64_t> repl_reconcile_us_since_diag{0};
     std::atomic<std::uint64_t> repl_encode_us_since_diag{0};

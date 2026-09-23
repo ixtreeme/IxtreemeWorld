@@ -46,6 +46,12 @@ struct ReadinessConfig {
     bool aoi_reference_positions = false;
     // Phase 5D top-k A/B: force the 5B partial_sort instead of nth_element.
     bool aoi_partial_sort = false;
+    // Phase 6 A/B matrix: v1 full-state reference, Network LOD off,
+    // per-session record budget, resync period override.
+    bool repl_v1 = false;
+    bool netlod_off = false;
+    int budget_records = 0;
+    int resync_ticks = 0;
     std::uint32_t seed = 20260922;
 };
 

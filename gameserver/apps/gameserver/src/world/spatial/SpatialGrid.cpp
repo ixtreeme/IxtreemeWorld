@@ -85,6 +85,8 @@ bool SpatialGrid::Move(flecs::entity entity,
             entry.x = new_position.x;
             entry.y = new_position.y;
             entry.z = new_position.z;
+            // Self-heal the handle too: the AOI passes it on as a hint.
+            entry.entity = entity;
             ++maintenance_.moves_in_cell;
             return false;
         }

@@ -82,8 +82,18 @@ bool ValidateSpatialIndex(Zone& zone, const SpatialGrid& grid, std::string& out_
     // entity's GridSlot must resolve back to this exact cell/slot. A stale
     // stored position is a silent AOI false negative, so it is a hard fail.
     bool entries_ok = true;
+    std::unordered_set<std::uint32_t> seen_nets;
+    seen_nets.reserve(expected);
     grid.ForEachEntry([&](const GridEntry& entry, std::int64_t cell_key, std::size_t slot_index) {
         if (!entries_ok) {
+            return;
+        }
+        if (!seen_nets.insert(entry.net_id).second) {
+            std::ostringstream message;
+            message << "zone " << zone.Id() << ": duplicate grid entry for net " << entry.net_id
+                    << " (cell " << cell_key << " slot " << slot_index << ")";
+            out_error = message.str();
+            entries_ok = false;
             return;
         }
         const auto entity = zone.FindEntity(entry.net_id);

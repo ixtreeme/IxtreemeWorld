@@ -81,6 +81,45 @@ TransformRecord EncodeTransformRecord(std::uint32_t net_id,
     return record;
 }
 
+void AppendTransformDelta(std::vector<std::uint8_t>& payload,
+                          std::uint32_t net_id,
+                          std::uint8_t mask,
+                          const Position& position,
+                          float heading_angle,
+                          MoveState move_state)
+{
+    WriteU32(payload, net_id);
+    payload.push_back(mask);
+    if ((mask & kTransformFieldPosition) != 0) {
+        WriteF32(payload, position.x);
+        WriteF32(payload, position.y);
+        WriteF32(payload, position.z);
+    }
+    if ((mask & kTransformFieldHeading) != 0) {
+        WriteU16(payload, QuantizeHeading(heading_angle));
+    }
+    if ((mask & kTransformFieldMoveState) != 0) {
+        payload.push_back(static_cast<std::uint8_t>(move_state));
+    }
+}
+
+std::vector<std::uint8_t> EncodeTransformFrameV2(const TransformRecord& viewer_record,
+                                                 const std::vector<std::uint8_t>& delta_payload,
+                                                 std::uint32_t delta_count,
+                                                 std::uint32_t zone_tick)
+{
+    const std::size_t record_count = 1 + delta_count;
+    std::vector<std::uint8_t> payload;
+    payload.reserve(1 + 1 + 4 + 2 + kTransformRecordSize + delta_payload.size());
+    payload.push_back(gs::protocol::kCodecBinary);
+    payload.push_back(kTransformFrameV2Opcode);
+    WriteU32(payload, zone_tick);
+    WriteU16(payload, static_cast<std::uint16_t>(record_count));
+    payload.insert(payload.end(), viewer_record.begin(), viewer_record.end());
+    payload.insert(payload.end(), delta_payload.begin(), delta_payload.end());
+    return payload;
+}
+
 std::vector<std::uint8_t> EncodeTransformFrameFromRecords(
     const TransformRecord& viewer_record,
     const std::vector<TransformRecord>& records,

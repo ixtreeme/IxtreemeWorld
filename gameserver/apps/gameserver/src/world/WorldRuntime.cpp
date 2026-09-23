@@ -686,6 +686,18 @@ void WorldRuntime::Run()
                 zone.Diagnostics().repl_bytes_generated_since_diag.exchange(0);
                 zone.Diagnostics().repl_bytes_copied_since_diag.exchange(0);
                 zone.Diagnostics().repl_wire_bytes_since_diag.exchange(0);
+                zone.Diagnostics().repl_v2_full_records_since_diag.exchange(0);
+                zone.Diagnostics().repl_v2_delta_records_since_diag.exchange(0);
+                zone.Diagnostics().repl_v2_deferred_since_diag.exchange(0);
+                zone.Diagnostics().repl_v2_starvation_since_diag.exchange(0);
+                zone.Diagnostics().repl_v2_budget_hits_since_diag.exchange(0);
+                zone.Diagnostics().repl_v2_critical_since_diag.exchange(0);
+                zone.Diagnostics().repl_v2_delta_bytes_since_diag.exchange(0);
+                zone.Diagnostics().repl_v2_max_defer_ticks.exchange(0);
+                zone.Diagnostics().repl_v2_tier_critical_since_diag.exchange(0);
+                zone.Diagnostics().repl_v2_tier_near_since_diag.exchange(0);
+                zone.Diagnostics().repl_v2_tier_normal_since_diag.exchange(0);
+                zone.Diagnostics().repl_v2_tier_reduced_since_diag.exchange(0);
                 total_lod_ai += zone.Diagnostics().lod_ai_updates_since_diag.exchange(0);
                 total_lod_mv += zone.Diagnostics().lod_move_updates_since_diag.exchange(0);
                 total_lod_prom += zone.Diagnostics().lod_promotions_since_diag.exchange(0);
