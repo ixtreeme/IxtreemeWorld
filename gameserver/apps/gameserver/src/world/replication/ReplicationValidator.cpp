@@ -1,16 +1,19 @@
 #include "ReplicationValidator.h"
 
 #include <algorithm>
+#include <cstring>
 #include <sstream>
 #include <unordered_set>
 #include <vector>
 
+#include "../components/MovementComponents.h"
 #include "../components/NetworkComponents.h"
 #include "../components/ReplicationComponents.h"
 #include "../components/Tags.h"
 #include "../components/TransformComponents.h"
 #include "../zone/Zone.h"
 #include "../zone/ZoneManager.h"
+#include "ProtocolEncoder.h"
 
 namespace gs::game {
 namespace {
@@ -54,10 +57,12 @@ std::uint32_t TransformVersionOf(Zone& zone, std::uint32_t net_id, bool* out_has
 bool ValidateReplicationShadow(ZoneManager& zones,
                                std::string& out_error,
                                std::size_t* out_viewers_checked,
-                               std::size_t* out_relationships_checked)
+                               std::size_t* out_relationships_checked,
+                               std::size_t* out_records_checked)
 {
     std::size_t viewers_checked = 0;
     std::size_t relationships_checked = 0;
+    std::size_t records_checked = 0;
 
     for (std::size_t i = 0; i < zones.ZoneCount(); ++i) {
         Zone& zone = zones.GetZone(i);
@@ -194,6 +199,60 @@ bool ValidateReplicationShadow(ZoneManager& zones,
                 }
             }
         }
+
+        // (3) Canonical shared-record audit (phase 5C; populated only when
+        // the audit retention flag is on). The retained 19-byte records were
+        // serialized once and shared by many recipients; each must still
+        // match the entity's current transform state. A stale cached payload
+        // (wrong version reused) shows up here as a field mismatch.
+        const auto& audit_records = zone.LastReplicationAuditRecords();
+        for (const TransformRecord& record : audit_records) {
+            ++records_checked;
+            std::uint32_t net_id = 0;
+            float x = 0.0f;
+            float y = 0.0f;
+            float z = 0.0f;
+            std::memcpy(&net_id, record.data(), sizeof(net_id));
+            std::memcpy(&x, record.data() + 4, sizeof(x));
+            std::memcpy(&y, record.data() + 8, sizeof(y));
+            std::memcpy(&z, record.data() + 12, sizeof(z));
+            const std::uint16_t heading_q =
+                static_cast<std::uint16_t>(record[16] | (record[17] << 8));
+            const auto move_state = static_cast<MoveState>(record[18]);
+
+            const auto entity = zone.FindEntity(net_id);
+            if (entity.is_valid()) {
+                const auto position = entity.get<Position>();
+                const auto heading = entity.get<Heading>();
+                const auto intent = entity.get<MoveIntent>();
+                if (position.x != x || position.y != y || position.z != z ||
+                    QuantizeHeading(heading.angle) != heading_q || intent.state != move_state) {
+                    std::ostringstream message;
+                    message << "zone " << zone.Id() << ": shared transform record for net " << net_id
+                            << " does not match authority (record=(" << x << ", " << y << ", " << z
+                            << ") hq=" << heading_q << " state=" << static_cast<int>(move_state)
+                            << ", authority=(" << position.x << ", " << position.y << ", "
+                            << position.z << ") hq=" << QuantizeHeading(heading.angle)
+                            << " state=" << static_cast<int>(intent.state) << ")";
+                    out_error = message.str();
+                    return false;
+                }
+            } else if (const GhostRecord* ghost = zone.FindGhost(net_id)) {
+                if (ghost->snapshot.position.x != x || ghost->snapshot.position.y != y ||
+                    ghost->snapshot.position.z != z ||
+                    QuantizeHeading(ghost->snapshot.heading.angle) != heading_q ||
+                    ghost->snapshot.move_state != move_state) {
+                    std::ostringstream message;
+                    message << "zone " << zone.Id() << ": shared transform record for ghost net "
+                            << net_id << " does not match the ghost snapshot";
+                    out_error = message.str();
+                    return false;
+                }
+            }
+            // A net that no longer resolves was valid at its tick; migrations
+            // and despawns after it are covered by the interest/coverage
+            // checks above.
+        }
     }
 
     if (out_viewers_checked != nullptr) {
@@ -201,6 +260,9 @@ bool ValidateReplicationShadow(ZoneManager& zones,
     }
     if (out_relationships_checked != nullptr) {
         *out_relationships_checked = relationships_checked;
+    }
+    if (out_records_checked != nullptr) {
+        *out_records_checked = records_checked;
     }
     out_error.clear();
     return true;

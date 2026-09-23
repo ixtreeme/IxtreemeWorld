@@ -23,9 +23,14 @@ namespace gs::game {
 
 class ZoneManager;
 
+//  4. CANONICAL RECORD AUDIT (phase 5C, only when the audit retention flag
+//     is on): every retained 19-byte shared record must match the entity's
+//     current transform state -- a stale cached payload would show up as a
+//     field mismatch.
 bool ValidateReplicationShadow(ZoneManager& zones,
                                std::string& out_error,
                                std::size_t* out_viewers_checked = nullptr,
-                               std::size_t* out_relationships_checked = nullptr);
+                               std::size_t* out_relationships_checked = nullptr,
+                               std::size_t* out_records_checked = nullptr);
 
 } // namespace gs::game

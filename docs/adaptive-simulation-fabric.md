@@ -624,6 +624,7 @@ Az előző commitból javított Fast/Exact semanticsra **tesztet kell írni**:
 | **G (Phase 4)** | §0–§28 | Integrált readiness benchmark 100 km / 500 player / 200k mob, stage-instrumentáció, A/B-k, bottleneck audit | ✅ **KÉSZ** (lásd §9) |
 | **H (Phase 5A)** | §9.7/1 | Inkrementális/dirty ghost karbantartás: dirty entity tracking, delta-publish, KEEP/ADD/REMOVE reconcile, egzakt equivalence validator + repair seam, `--mode ghost` + `--ghost-shadow` | ✅ **KÉSZ** (lásd §10) |
 | **I (Phase 5B)** | §9.7/2–4 | AOI prefilter (top-k cap, grid entity-handle), dirty/interest-aware replication (TransformVersion + per-recipient interest set + staggered refresh), exact/shadow interest + coverage validator, `--mode aoi`/`--mode replication`, A/B (`--repl-full`, `--aoi-full-sort`), readiness re-benchmark | ✅ **KÉSZ** (lásd §11) |
+| **J (Phase 5C)** | §11.7/1–2 | Canonical 19 B record cache (serialize once / fanout many), memcpy frame assembly, spawn/despawn payload sharing, copy/wire byte accounting, canonical-record audit a shadow validatorban, interest-overlap mérés + grouping-döntés, readiness re-benchmark | ✅ **KÉSZ** (lásd §12) |
 
 ### Chunk A — elvégzett munka
 
@@ -1794,11 +1795,186 @@ futástól függően 86–105 ms), azaz a javulás a zajon belül van.
   fázist érdemelnek; a jelen fázis a mérést és a biztonságos seam-eket
   adta hozzá.
 
-### 11.7 Következő lépcső (Phase 5C javaslat)
+## 12. Phase 5C — Shared replication payloads + fanout optimalizálás
 
-A Phase 4 rangsor 2–5. pontjai közül az AOI candidate-szűrés (5B.1) és a
-dirty replication (5B.2) elkészült. A mért domináns maradék a **dense frame
-fanout** és a sűrű zónák per-viewer költsége; ehhez jön az activity-field
-query O(players-in-box) és a combat fanout coalescing. A ghost oldalon
-opcionális továbbfejlesztés a `keep`-scan teljes elhagyása (per-source
-slot-lista), de a mért 16.2% mellett ez már nem kritikus.
+### 12.1 Audit (a Phase 5B utáni HEAD)
+
+**A jelenlegi fanout lánc** (`ReplicationSystem::BroadcastTransforms`):
+
+```text
+viewer-enként:
+  AoiSystem::QueryCandidates (grid handle, top-k)
+  VisibilitySystem::ReconcileViewer
+    ENTER → ResolveOrCache(snapshot) → MakeSpawn (spawn_cache: 1x/net/tick) → send
+    KEEP  → CurrentTransformVersion(entity) → ResolveOrCache(snapshot)
+            → out_updates.push_back(snapshot MÁSOLAT ~120 B)
+    LEAVE → MakeDespawn(net) → send (NINCS cache: 1x/recipient)
+  BuildPlayerSnapshot(viewer)
+  EncodeTransformFrame(viewer, out_updates)  ← mezőnkénti 19 B encode / record
+  send(frame)                                 ← 1 vektor allokáció / recipient / tick
+```
+
+**Válaszok az audit-kérdésekre** (dense, 500p/20k mob a 2 km-es magban):
+
+1. **Ugyanaz a logical record hányszor készül el?** Transform: recipientenként
+   és dirty entitásonként (dense ~4×/entitás/tick, mert ~4 viewer látja);
+   spawn: 1×/net/tick (már cache-elt); despawn: 1×/recipient (nincs cache).
+2. **Byte-identikus payload hányszor serializálódik?** Transform ~4×,
+   despawn ~1×/recipient, spawn 1×.
+3. **Hányszor másolódik?** entity → `BorderEntitySnapshot` (1×/net/tick),
+   snapshot → `out_updates` (~120 B, 1×/recipient-dirty), record → frame
+   (19 B/recipient), frame → send (move; az asio oldal másol).
+4. **Recipient-specifikus vs independent?** A frame header (tick, count) és a
+   viewer saját rekordja recipient-specifikus; minden más transform record és
+   a spawn/despawn payload **recipient-independent** (nincs bennük session-,
+   sorrend- vagy visibility-mező).
+5. **Interest overlap**: mérés a `--mode aoi` rigben (signature-ök,
+   lásd 12.3).
+6. **Unique payload / fanout relationship**: dense ~1:4.
+7. **`last_sent_version` bookkeeping**: a reconcile része (~46 µs/viewer/tick
+   dense), a két hash-lookup + snapshot-másolat dominálja.
+8. **`send()`**: ~0.4 s / 30 s dense (asio post), nem domináns.
+9. **A ~758 MB / 30 s**: a jelenlegi per-recipient frame protokoll mellett
+   **mind wire-igény** (minden recipient külön frame-et kap); a redundáns rész
+   nem a wire byte, hanem a ~4× újraserializálás és a ~120 B-os
+   snapshot-másolatok.
+10. **Allokációk**: 1 frame-vektor / recipient / tick; a spawn/snapshot/
+    out_updates cache-ek újrahasznosítottak.
+
+### 12.2 Design — canonical record cache (serialize once, fanout many)
+
+A Phase 5C nem groupingot épít elsőként, hanem **rekord-szintű megosztást**,
+ami szigorúan általánosabb: nem kell azonos interest set, elég az, hogy
+ugyanaz az entitás-verzió sok recipienthez megy.
+
+- **Per-zone-tick canonical transform record cache**:
+  `net → { version, slot }` + `records[slot]` (19 B, byte-identikus). Első
+  kérésre épül (egyszer / net / tick), utána minden recipient csak a slotot
+  referálja. A verzió is egyszer olvasódik (nem viewerenként).
+- **Közvetlen entity → record encode** (Position/Heading/MoveIntent; ghostnál
+  a ghost snapshot move_state-e): a 19 B record mezőnkénti encode-ja
+  megspórolja a `BorderEntitySnapshot` (~120 B + string) buildet/másolatot a
+  KEEP hot pathon.
+- **Frame assembly cache-ből**: a frame a header + viewer-record + a kért
+  slotok `memcpy`-ja; nincs snapshot-vektor, nincs viewerenkénti mező-encode.
+- **Despawn cache**: `net → payload` per tick (a spawn cache párja).
+- **Mérés**: `record_requests` / `record_serializations` / `record_reuse`,
+  `bytes_generated` (unique serializált) / `bytes_copied` (frame assembly
+  memcpy) / `wire_bytes` (ténylegesen `send()`-be adott) — a CPU- és a
+  wire-nyereség külön látszik.
+- **Correctness**: a cache tartalma a tick elején érvényes entitás-állapotból
+  épül; a shadow validator (audit módban) a tick végén a cache-elt record
+  byte-jait az entitás aktuális állapotával veti össze (a 19 B record
+  dekódolható: net, x/y/z, heading, move_state).
+
+### 12.3 Interest overlap mérés
+
+A `--mode aoi` rig (benchmark-only, nem production metrika) viewerenként
+determinisztikus **interest signature**-t számol (rendezett NetId-halmaz
+FNV-1a-ja + méret), és riportolja: distinct signature-ök, legnagyobb azonos
+csoport, átlagos interest-méret. Ez dönti el, hogy az egzakt-azonos interest
+grouping (Phase 5C §13) hozna-e egyáltalán bármit a rekord-szintű megosztás
+fölött.
+
+### 12.4 Implementáció — canonical record cache (serialize once, fanout many)
+
+- **Per-zone-tick canonical transform record cache** (`RecordCache`):
+  `net → {version, slot}` + `records[slot]` (19 B). Az első kérésre épül
+  (egyszer / net / tick), a verzió is egyszer olvasódik; minden további
+  recipient csak a slotot referálja. A cache `thread_local` és tickenként
+  `Clear()`-elődik (a bucketek megmaradnak: nincs steady-state allokáció).
+- **Közvetlen entity → record encode**: a KEEP hot path nem épít
+  `BorderEntitySnapshot`-ot (se stringet, se HP-t); csak Position/Heading/
+  MoveIntent (ghostnál a ghost snapshot move_state-e) kell a 19 B-hoz.
+- **Frame assembly cache-ből**: a frame = header + a viewer saját rekordja
+  (recipient-specifikus, egyszeri encode) + a kért slotok `memcpy`-ja. A
+  frame byte-layout bitre azonos a Phase 5B-vel.
+- **Spawn cache** (már volt) + **despawn cache** (új): a spawn/despawn
+  payload is egyszer / net / tick készül. **Mért negatív eredmény**: a
+  despawn megosztás a dense futásban 89 hit / 66 211 miss — egy net
+  kilépése jellemzően csak egy recipientet érint, ezért a despawn payload
+  cache gyakorlatilag nem hoz nyereséget (a ritka egyezésnél segít; a
+  mérés szerint nem kritikus).
+- **Mérés**: `record_requests` / `record_serializations` / reuse,
+  despawn cache hit/miss, valamint `bytes_generated` (unique serializált) /
+  `bytes_copied` (assembly + payload másolatok) / `wire_bytes` (tényleges
+  `send()`-ba adott) + copy amplification.
+- **Canonical-record audit**: `SetReplicationAudit(true)` esetén a zóna
+  megtartja az utolsó tick recordjait; a shadow validator a quiescent
+  ablakban dekódolja a 19 B-okat (net, x/y/z, heading-q, move_state) és az
+  entitás/ghost aktuális állapotához hasonlítja. Stale payload reuse azonnal
+  failure; nincs csendes repair.
+
+### 12.5 Interest-overlap mérés és grouping-döntés
+
+Report-time mérés (FNV-1a az rendezett látható NetId-halmazon; üres
+interest kizárva):
+
+| scenario | viewers | empty | avg/p95/max interest | distinct signature | max azonos csoport | exact duplicate |
+|---|---|---|---|---|---|---|
+| dense | 500 | 0 | 100/100/100 | 500 | 1 | **0.0%** |
+| replication | 500 | 0 | 100/100/100 | 500 | 1 | **0.0%** |
+| combat | 500 | 0 | 100/100/100 | 500 | 1 | **0.0%** |
+| hotspot | 500 | 29 | 80/100/100 | 471 | 1 | **0.0%** |
+| border | 500 | 20 | 1.0/1/2 | 284 | 2 | 40.8% |
+| spread/quiet | 500 | 62 | 0.9/2/2 | 438 | 1 | 0.0% |
+
+**Következtetés**: a sűrű scenariókban (dense/replication/combat/hotspot) a
+cap-elt interest set **minden viewernél egyedi** (0% exact duplicate,
+max csoport = 1) — az egzakt-azonos-interest grouping (§13) **nulla**
+nyereséget hozna. A border 40.8%-a azonban ~1 elemű halmazokon szól, ahol a
+grouping overhead nagyobb, mint a haszon. Ezért **interest-group frame
+réteg nem készült**; a **rekord-szintű megosztás** (12.4) szigorúan
+általánosabb: nem igényel azonos interestet, és a sűrű scenariókban
+63–95% serialization-reuse-t ad. Ez a mérés vezérelte döntés, nem
+feltevés.
+
+### 12.6 Eredmények — CPU-nyereség vs wire byte
+
+Ugyanaz a környezet és protokoll (500p/200k, warmup 60 s, measure 30 s).
+
+| scenario | zónák | tick avg (5B→5C) | p99 (5B→5C) | repl % | suppression | **record reuse** | encode_ms (5B→5C) |
+|---|---|---|---|---|---|---|---|
+| dense | 64 | 4.25 → **4.25 ms** | 86.1 → **71.1** | 57.8% | 16.7% | **63.1%** | 2083 → **213** |
+| hotspot | 288 | 1.93 → 1.97 ms | 87.7 → **10.7**\* | 50.3% | 39.4% | **90.6%** | — |
+| replication | 212 | 4.16 → 3.34 ms | 57.9 → **43.3** | 80.9% | 29.4% | **95.2%** | — |
+| combat | 112 | 4.05 → 2.98 ms | 49.2 → 48.2 | 82.8% | **94.5%** | **89.2%** | — |
+| border | 320 | 3.32 → 2.43 ms | 10.2 → 10.7 | 20.0% | 40.6% | 42.9% | — |
+| spread | 272 | 1.06 → 1.07 ms | 8.75 → **7.10** | 4.0% | 35.0% | 0%\*\* | — |
+| quiet | 100 | 1.12 → 1.52 ms | 7.36 → 7.76 | 3.5% | 28.7% | 0%\*\* | — |
+
+\* A hotspot zónaszám futásonként 80–288 között mozog (az ASF a mért
+tick-profilra reagál), ezért a hotspot p99 nem közvetlenül összehasonlítható.
+\*\* Spread/quiet: nézet/entitás ≈ 1, nincs mit megosztani — a 0% reuse
+helyes eredmény, nem regresszió.
+
+**Byte-accounting (dense)**: `generated=410 MB` (unique serializált payload)
+vs `copied=926 MB` (assembly + payload másolatok, 2.26×) vs
+`wire=930 MB` (tényleges send). A wire byte a per-recipient frame protokoll
+miatt szükségszerű; a Phase 5C az **application-side** redundanciát
+szüntette meg (a 19 B record ~2.7×-es újraserializálása és a ~120 B-os
+snapshot-másolatok).
+
+**Dense target**: a `p99 < 50 ms` továbbra sem teljesült (86 → **71 ms**).
+A maradék költség: az AOI-scan (~410 kandidátus/viewer a cap előtt), a
+per-recipient interest+record lookup, és a wire-szükséges frame fanout
+(~30 MB/s dense). A további lényegi csökkenés **protokoll-szintű** változást
+igényelne (közös body + recipient delta, azaz a frame formátum
+újratervezése), amit a Phase 5C határozottan kizárt (§4) — ez egy külön
+network phase javaslata.
+
+**Correctness**: `--replication-shadow` full-scale (spread és dense,
+500p/200k): 15/15 poll, 0 validator failure, 0 equivalence failure, a
+canonical-record audit is zöld (a megosztott 19 B recordok bitre egyeznek az
+authority-vel); világ-validáció OK. Regresszió: 3 selftest + 9 bench mód +
+routing selftest zöld.
+
+### 12.7 Következő lépcső (Phase 5C utáni javaslat)
+
+A Phase 4 rangsor 2–5. pontjai közül az AOI candidate-szűrés (5B.1), a
+dirty replication (5B.2) és a shared-payload fanout (5C) elkészült. A mért
+domináns maradék a dense AOI-scan és a wire-szükséges per-recipient frame
+fanout — ez protokoll-szintű megoldást (közös body + recipient delta)
+igényel, külön phase-ként. Emellett nyitott: activity-field query
+O(players-in-box), combat event-fanout coalescing, és a ghost `keep`-scan
+opcionális továbbfejlesztése.

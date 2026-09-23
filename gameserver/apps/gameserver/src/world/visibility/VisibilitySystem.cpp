@@ -16,11 +16,28 @@ namespace {
 thread_local std::unordered_set<std::uint32_t> t_new_visible;
 
 // Current replicated-transform version from the candidate's entity handle
-// (resident or ghost). Only called for already-visible entities, so the AOI
-// hot path never pays a component lookup.
+// (resident or ghost). Only read on a record-cache miss, i.e. once per entity
+// per tick instead of once per interested recipient.
 std::uint32_t CurrentTransformVersion(const flecs::entity& entity)
 {
     return entity.has<TransformVersion>() ? entity.get<TransformVersion>().tick : 0;
+}
+
+// Canonical 19-byte record for a resident or ghost entity. Ghosts carry no
+// MoveIntent, so their move state comes from the ghost record (O(1)).
+TransformRecord BuildCanonicalRecord(Zone& zone,
+                                     std::uint32_t net_id,
+                                     const flecs::entity& entity)
+{
+    const auto position = entity.get<Position>();
+    const auto heading = entity.get<Heading>();
+    MoveState state = MoveState::Idle;
+    if (entity.has<MoveIntent>()) {
+        state = entity.get<MoveIntent>().state;
+    } else if (const GhostRecord* ghost = zone.FindGhost(net_id)) {
+        state = ghost->snapshot.move_state;
+    }
+    return EncodeTransformRecord(net_id, position, heading, state);
 }
 
 // Snapshot lookup through the shared per-tick cache. The returned pointer is
@@ -40,6 +57,21 @@ const BorderEntitySnapshot* ResolveOrCache(Zone& zone,
     return &cache.emplace(net_id, std::move(*built)).first->second;
 }
 
+// Recipient-independent despawn payload, built once per net per tick.
+const std::vector<std::uint8_t>& DespawnPayloadCached(
+    VisibilitySystem::DespawnCache& cache,
+    std::uint32_t net_id,
+    ReconcileStats& stats)
+{
+    const auto it = cache.find(net_id);
+    if (it != cache.end()) {
+        ++stats.despawn_cache_hits;
+        return it->second;
+    }
+    ++stats.despawn_cache_misses;
+    return cache.emplace(net_id, MakeDespawn(net_id)).first->second;
+}
+
 } // namespace
 
 void VisibilitySystem::ReconcileViewer(Zone& zone,
@@ -48,13 +80,15 @@ void VisibilitySystem::ReconcileViewer(Zone& zone,
                                        const SendFn& send,
                                        SpawnCache& spawn_cache,
                                        SnapshotCache& snapshot_cache,
+                                       DespawnCache& despawn_cache,
+                                       RecordCache& record_cache,
                                        bool refresh_all,
-                                       std::vector<BorderEntitySnapshot>& out_updates,
+                                       std::vector<std::uint32_t>& out_record_slots,
                                        ReconcileStats& out_stats)
 {
     AssertZoneOwner(zone, "zone visibility reconcile");
 
-    out_updates.clear();
+    out_record_slots.clear();
     out_stats = ReconcileStats{};
 
     auto* viewer = zone.FindPlayer(viewer_net_id);
@@ -73,7 +107,8 @@ void VisibilitySystem::ReconcileViewer(Zone& zone,
         if (existing == viewer->visible_net_versions.end()) {
             // ENTER: the spawn carries the full initial state (including the
             // current transform), so no transform record is generated for the
-            // same tick -- spawn + update coalescing.
+            // same tick -- spawn + update coalescing. The spawn payload is
+            // serialized once per net per tick and shared across recipients.
             const BorderEntitySnapshot* snapshot = ResolveOrCache(zone, net_id, snapshot_cache);
             if (snapshot == nullptr) {
                 new_visible.erase(net_id);
@@ -82,10 +117,12 @@ void VisibilitySystem::ReconcileViewer(Zone& zone,
             const auto encoded = spawn_cache.find(net_id);
             if (encoded != spawn_cache.end()) {
                 out_stats.payload_bytes += encoded->second.size();
+                out_stats.payload_copied_bytes += encoded->second.size();
                 send(viewer->session, encoded->second);
             } else {
                 auto payload = MakeSpawn(*snapshot);
                 out_stats.payload_bytes += payload.size();
+                out_stats.payload_copied_bytes += payload.size();
                 send(viewer->session, payload);
                 spawn_cache.emplace(net_id, std::move(payload));
             }
@@ -97,20 +134,22 @@ void VisibilitySystem::ReconcileViewer(Zone& zone,
             ++out_stats.spawns;
             continue;
         }
-        // KEEP: replicate the transform only when it changed since the last
-        // send (or on the staggered full refresh). Unchanged state produces
-        // no record at all.
-        const std::uint32_t version = CurrentTransformVersion(candidate.entity);
-        if (refresh_all || version > existing->second) {
-            const BorderEntitySnapshot* snapshot = ResolveOrCache(zone, net_id, snapshot_cache);
-            if (snapshot == nullptr) {
-                // Still indexed but no longer resolvable: treat as LEAVE so
-                // the client never keeps a stale entity.
-                new_visible.erase(net_id);
-                continue;
-            }
-            out_updates.push_back(*snapshot);
-            existing->second = version;
+        // KEEP: consult the canonical record cache. One hash lookup and one
+        // version compare per recipient; the 19-byte record itself is
+        // serialized once per entity per tick, regardless of recipient count.
+        ++record_cache.requests;
+        auto cached = record_cache.index.find(net_id);
+        if (cached == record_cache.index.end()) {
+            const std::uint32_t version = CurrentTransformVersion(candidate.entity);
+            const std::uint32_t slot = static_cast<std::uint32_t>(record_cache.records.size());
+            record_cache.records.push_back(BuildCanonicalRecord(zone, net_id, candidate.entity));
+            cached = record_cache.index.emplace(net_id, RecordCache::Entry{version, slot}).first;
+            ++record_cache.serializations;
+        }
+        const RecordCache::Entry& entry = cached->second;
+        if (refresh_all || entry.version > existing->second) {
+            out_record_slots.push_back(entry.slot);
+            existing->second = entry.version;
             ++viewer->update_events;
             ++out_stats.updates;
         } else {
@@ -119,12 +158,14 @@ void VisibilitySystem::ReconcileViewer(Zone& zone,
     }
 
     // LEAVE: anything no longer in the exact AOI set gets a removal. The
-    // interest entry is dropped only after the despawn is handed to send().
+    // despawn payload is recipient-independent and shared per tick; the
+    // interest entry is dropped only after the payload is handed to send().
     for (auto it = viewer->visible_net_versions.begin();
          it != viewer->visible_net_versions.end();) {
         if (!new_visible.contains(it->first)) {
-            const auto payload = MakeDespawn(it->first);
+            const auto& payload = DespawnPayloadCached(despawn_cache, it->first, out_stats);
             out_stats.payload_bytes += payload.size();
+            out_stats.payload_copied_bytes += payload.size();
             send(viewer->session, payload);
             ++viewer->despawn_events;
             ++out_stats.despawns;

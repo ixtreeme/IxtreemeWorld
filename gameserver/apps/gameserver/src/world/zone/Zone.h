@@ -383,6 +383,28 @@ public:
     {
         return world_tick_;
     }
+    // Phase 5C shadow/debug seam: retain the last tick's canonical transform
+    // records so the quiescent-window validator can compare the shared
+    // payloads against authority. Off by default (zero cost).
+    bool ReplicationAuditEnabled() const noexcept
+    {
+        return replication_audit_;
+    }
+    void SetReplicationAudit(bool enabled) noexcept
+    {
+        replication_audit_ = enabled;
+        if (!enabled) {
+            replication_audit_records_.clear();
+        }
+    }
+    void StoreReplicationAuditRecords(const std::vector<TransformRecord>& records)
+    {
+        replication_audit_records_ = records;
+    }
+    const std::vector<TransformRecord>& LastReplicationAuditRecords() const noexcept
+    {
+        return replication_audit_records_;
+    }
     // Marks an entity's replicated transform (position/heading/move_state) as
     // changed at the current world tick. Callers must only invoke this when a
     // published transform field actually changed.
@@ -595,6 +617,9 @@ private:
     // domain shared by TransformVersion stamps and recipient last-sent
     // values, so migration across zones never invalidates comparisons.
     std::uint32_t world_tick_ = 0;
+    // Phase 5C audit retention (shadow/debug only).
+    bool replication_audit_ = false;
+    std::vector<TransformRecord> replication_audit_records_;
     std::atomic<ZoneActivity> activity_{ZoneActivity::Active};
     std::atomic<std::thread::id> owner_thread_id_{std::thread::id{}};
     std::atomic<bool> tick_in_progress_{false};

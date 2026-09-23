@@ -1,5 +1,6 @@
 #pragma once
 
+#include <array>
 #include <cstdint>
 #include <string>
 
@@ -7,6 +8,14 @@
 
 #include "../components/MovementComponents.h"
 #include "../components/TransformComponents.h"
+
+// Phase 5C canonical transform record: 19 bytes, recipient-independent
+// (NetId + position + quantized heading + move state). Serialized once per
+// entity version per tick and referenced by every interested recipient.
+namespace gs::game {
+inline constexpr std::size_t kTransformRecordSize = 19;
+using TransformRecord = std::array<std::uint8_t, kTransformRecordSize>;
+} // namespace gs::game
 
 // Read-only cross-zone representation of a border-band resident.
 // Produced by the owning zone (BorderPublisher), consumed by neighbor zones

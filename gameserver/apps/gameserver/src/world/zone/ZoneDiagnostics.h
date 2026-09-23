@@ -125,6 +125,18 @@ struct ZoneDiagnostics {
     std::atomic<std::uint64_t> repl_frame_bytes_since_diag{0};
     std::atomic<std::uint64_t> repl_payload_bytes_since_diag{0};
     std::atomic<std::uint64_t> repl_refresh_since_diag{0};
+    // Phase 5C shared-payload accounting. requests = per-recipient record
+    // needs; serializations = unique payload builds (cache misses); reuse =
+    // requests - serializations. generated = unique serialized bytes;
+    // copied = application-side memcpy/assembly bytes; wire = bytes handed to
+    // send() (the actual per-recipient traffic).
+    std::atomic<std::uint64_t> repl_record_requests_since_diag{0};
+    std::atomic<std::uint64_t> repl_record_serializations_since_diag{0};
+    std::atomic<std::uint64_t> repl_despawn_cache_hits_since_diag{0};
+    std::atomic<std::uint64_t> repl_despawn_cache_misses_since_diag{0};
+    std::atomic<std::uint64_t> repl_bytes_generated_since_diag{0};
+    std::atomic<std::uint64_t> repl_bytes_copied_since_diag{0};
+    std::atomic<std::uint64_t> repl_wire_bytes_since_diag{0};
     std::atomic<std::uint64_t> repl_aoi_us_since_diag{0};
     std::atomic<std::uint64_t> repl_reconcile_us_since_diag{0};
     std::atomic<std::uint64_t> repl_encode_us_since_diag{0};

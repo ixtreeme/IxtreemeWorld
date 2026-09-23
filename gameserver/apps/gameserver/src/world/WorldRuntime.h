@@ -329,6 +329,13 @@ public:
     // mismatches are counted and reported, never silently repaired.
     void RequestReplicationValidation();
     bool TryTakeReplicationValidationResult(std::string& out_result);
+    // Phase 5C: retain each tick's canonical shared records so the shadow
+    // validator can compare them against authority (debug/bench only; the
+    // flag is propagated to every zone, including split children).
+    void SetReplicationAudit(bool enabled) noexcept
+    {
+        replication_audit_.store(enabled, std::memory_order_relaxed);
+    }
     struct ReplicationValidationStats {
         std::uint64_t runs = 0;
         std::uint64_t failures = 0;
@@ -553,6 +560,7 @@ private:
     bool replication_validation_ready_ = false;
     std::atomic<std::uint64_t> replication_validation_runs_{0};
     std::atomic<std::uint64_t> replication_validation_failures_{0};
+    std::atomic<bool> replication_audit_{false};
 };
 
 } // namespace gs::game

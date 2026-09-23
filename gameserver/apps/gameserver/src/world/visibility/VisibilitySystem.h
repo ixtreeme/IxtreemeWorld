@@ -36,6 +36,31 @@ struct ReconcileStats {
     std::size_t suppressed = 0;      // visible but already caught up
     std::size_t visible = 0;         // final visible set size
     std::uint64_t payload_bytes = 0; // spawn/despawn payload bytes handed to send
+    std::uint64_t payload_copied_bytes = 0; // bytes copied into those payloads
+    std::uint64_t despawn_cache_hits = 0;
+    std::uint64_t despawn_cache_misses = 0;
+};
+
+// Per-zone-tick canonical transform record cache (phase 5C): each entity
+// version is serialized once into a 19-byte record; every interested
+// recipient references the slot. Reused across ticks (clear keeps capacity).
+struct RecordCache {
+    std::vector<TransformRecord> records;
+    struct Entry {
+        std::uint32_t version = 0;
+        std::uint32_t slot = 0;
+    };
+    std::unordered_map<std::uint32_t, Entry> index;
+    std::uint64_t requests = 0;
+    std::uint64_t serializations = 0;
+
+    void Clear() noexcept
+    {
+        records.clear();
+        index.clear();
+        requests = 0;
+        serializations = 0;
+    }
 };
 
 class VisibilitySystem {
@@ -43,21 +68,27 @@ public:
     using SendFn = std::function<void(std::shared_ptr<gs::network::Session>, std::vector<std::uint8_t>)>;
     using SpawnCache = std::unordered_map<std::uint32_t, std::vector<std::uint8_t>>;
     // Per-tick snapshot cache shared across viewers: the same entity is
-    // visible to many viewers, but its snapshot is built once per tick.
+    // visible to many viewers, but its spawn snapshot is built once per tick.
     using SnapshotCache = std::unordered_map<std::uint32_t, BorderEntitySnapshot>;
+    // Phase 5C: recipient-independent despawn payloads, built once per net
+    // per tick (the spawn cache's counterpart).
+    using DespawnCache = std::unordered_map<std::uint32_t, std::vector<std::uint8_t>>;
 
     // `refresh_all` forces a full transform resend for every visible entity
     // (legacy behavior when dirty replication is off; staggered self-healing
-    // otherwise). `out_updates` is caller-owned scratch filled with the
-    // snapshots to replicate this tick; it is cleared first.
+    // otherwise). `out_record_slots` is caller-owned scratch filled with the
+    // canonical record slots to replicate this tick (in candidate order); it
+    // is cleared first. The record content lives in `record_cache`.
     static void ReconcileViewer(Zone& zone,
                                 std::uint32_t viewer_net_id,
                                 const std::vector<AoiCandidate>& candidates,
                                 const SendFn& send,
                                 SpawnCache& spawn_cache,
                                 SnapshotCache& snapshot_cache,
+                                DespawnCache& despawn_cache,
+                                RecordCache& record_cache,
                                 bool refresh_all,
-                                std::vector<BorderEntitySnapshot>& out_updates,
+                                std::vector<std::uint32_t>& out_record_slots,
                                 ReconcileStats& out_stats);
 };
 

@@ -42,6 +42,14 @@ void WriteF32(std::vector<std::uint8_t>& out, float value)
     WriteU32(out, bits);
 }
 
+void WriteU32At(std::vector<std::uint8_t>& out, std::size_t offset, std::uint32_t value)
+{
+    out[offset] = static_cast<std::uint8_t>(value & 0xff);
+    out[offset + 1] = static_cast<std::uint8_t>((value >> 8) & 0xff);
+    out[offset + 2] = static_cast<std::uint8_t>((value >> 16) & 0xff);
+    out[offset + 3] = static_cast<std::uint8_t>((value >> 24) & 0xff);
+}
+
 void WriteTransformRecord(std::vector<std::uint8_t>& payload, const BorderEntitySnapshot& snapshot)
 {
     WriteU32(payload, snapshot.net_id);
@@ -53,6 +61,51 @@ void WriteTransformRecord(std::vector<std::uint8_t>& payload, const BorderEntity
 }
 
 } // namespace
+
+TransformRecord EncodeTransformRecord(std::uint32_t net_id,
+                                      const Position& position,
+                                      const Heading& heading,
+                                      MoveState move_state)
+{
+    // Same field order/encoding as WriteTransformRecord: one canonical
+    // 19-byte record, reused by every interested recipient this tick.
+    TransformRecord record{};
+    std::memcpy(record.data(), &net_id, sizeof(net_id));
+    std::memcpy(record.data() + 4, &position.x, sizeof(position.x));
+    std::memcpy(record.data() + 8, &position.y, sizeof(position.y));
+    std::memcpy(record.data() + 12, &position.z, sizeof(position.z));
+    const std::uint16_t heading_q = QuantizeHeading(heading.angle);
+    record[16] = static_cast<std::uint8_t>(heading_q & 0xff);
+    record[17] = static_cast<std::uint8_t>((heading_q >> 8) & 0xff);
+    record[18] = static_cast<std::uint8_t>(move_state);
+    return record;
+}
+
+std::vector<std::uint8_t> EncodeTransformFrameFromRecords(
+    const TransformRecord& viewer_record,
+    const std::vector<TransformRecord>& records,
+    const std::vector<std::uint32_t>& record_slots,
+    std::uint32_t zone_tick)
+{
+    const std::size_t record_count = 1 + record_slots.size();
+    std::vector<std::uint8_t> payload;
+    payload.resize(1 + 1 + 4 + 2 + record_count * kTransformRecordSize);
+    std::size_t offset = 0;
+    payload[offset++] = gs::protocol::kCodecBinary;
+    payload[offset++] = 0x10;
+    WriteU32At(payload, offset, zone_tick);
+    offset += 4;
+    const auto count = static_cast<std::uint16_t>(record_count);
+    payload[offset++] = static_cast<std::uint8_t>(count & 0xff);
+    payload[offset++] = static_cast<std::uint8_t>((count >> 8) & 0xff);
+    std::memcpy(payload.data() + offset, viewer_record.data(), kTransformRecordSize);
+    offset += kTransformRecordSize;
+    for (const std::uint32_t slot : record_slots) {
+        std::memcpy(payload.data() + offset, records[slot].data(), kTransformRecordSize);
+        offset += kTransformRecordSize;
+    }
+    return payload;
+}
 
 std::uint16_t QuantizeHeading(float angle)
 {

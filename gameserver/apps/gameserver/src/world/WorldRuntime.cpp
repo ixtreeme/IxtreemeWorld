@@ -380,6 +380,15 @@ void WorldRuntime::Run()
             continue;
         }
 
+        // Phase 5C audit retention flag: propagate to every zone (split
+        // children included) in a quiescent window. Zero cost when off.
+        if (replication_audit_.load(std::memory_order_relaxed) &&
+            !zones_.AnyTickInProgress()) {
+            for (std::size_t i = 0; i < zones_.ZoneCount(); ++i) {
+                zones_.GetZone(i).SetReplicationAudit(true);
+            }
+        }
+
         // Operational audit window: the gate above guarantees no zone tick is
         // in progress here; audits run before scheduling so the window stays
         // quiescent for the duration of the checks. All workers are parked,
@@ -454,15 +463,18 @@ void WorldRuntime::Run()
                 std::string error;
                 std::size_t viewers_checked = 0;
                 std::size_t relationships_checked = 0;
+                std::size_t records_checked = 0;
                 const bool ok = ValidateReplicationShadow(zones_, error, &viewers_checked,
-                                                          &relationships_checked);
+                                                          &relationships_checked,
+                                                          &records_checked);
                 replication_validation_runs_.fetch_add(1, std::memory_order_relaxed);
                 if (!ok) {
                     replication_validation_failures_.fetch_add(1, std::memory_order_relaxed);
-                    LOG_WARN("replication shadow FAIL: {} (viewers={} relationships={})",
+                    LOG_WARN("replication shadow FAIL: {} (viewers={} relationships={} records={})",
                              error,
                              viewers_checked,
-                             relationships_checked);
+                             relationships_checked,
+                             records_checked);
                 }
                 std::lock_guard lock(replication_validation_mutex_);
                 replication_validation_result_ = ok ? std::string("OK") : "FAIL: " + error;

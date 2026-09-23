@@ -1,6 +1,7 @@
 #include "ReadinessBench.h"
 
 #include <algorithm>
+#include <numeric>
 #include <chrono>
 #include <cmath>
 #include <cstdint>
@@ -199,6 +200,13 @@ struct ZoneStageTotals {
     WindowDelta repl_reconcile_us;
     WindowDelta repl_encode_us;
     WindowDelta repl_send_us;
+    WindowDelta repl_record_requests;
+    WindowDelta repl_record_serializations;
+    WindowDelta repl_despawn_cache_hits;
+    WindowDelta repl_despawn_cache_misses;
+    WindowDelta repl_bytes_generated;
+    WindowDelta repl_bytes_copied;
+    WindowDelta repl_wire_bytes;
 };
 
 struct GlobalCounters {
@@ -365,6 +373,11 @@ int RunReadinessBenchmark(boost::asio::io_context& io, const ReadinessConfig& co
         // Correctness run: a validator-detected inconsistency must stay
         // visible (no auto-repair) so the equivalence proof is honest.
         sim.SetGhostAutoRepair(false);
+    }
+    if (config.replication_shadow) {
+        // Correctness run: retain the canonical shared records so the shadow
+        // validator can compare them against authority (phase 5C).
+        sim.SetReplicationAudit(true);
     }
 
     if (config.lod_off) {
@@ -711,6 +724,23 @@ int RunReadinessBenchmark(boost::asio::io_context& io, const ReadinessConfig& co
                             totals.repl_encode_us);
             AccumulateWindow(diag.repl_send_us_since_diag.load(std::memory_order_relaxed),
                             totals.repl_send_us);
+            AccumulateWindow(diag.repl_record_requests_since_diag.load(std::memory_order_relaxed),
+                            totals.repl_record_requests);
+            AccumulateWindow(
+                diag.repl_record_serializations_since_diag.load(std::memory_order_relaxed),
+                totals.repl_record_serializations);
+            AccumulateWindow(
+                diag.repl_despawn_cache_hits_since_diag.load(std::memory_order_relaxed),
+                totals.repl_despawn_cache_hits);
+            AccumulateWindow(
+                diag.repl_despawn_cache_misses_since_diag.load(std::memory_order_relaxed),
+                totals.repl_despawn_cache_misses);
+            AccumulateWindow(diag.repl_bytes_generated_since_diag.load(std::memory_order_relaxed),
+                            totals.repl_bytes_generated);
+            AccumulateWindow(diag.repl_bytes_copied_since_diag.load(std::memory_order_relaxed),
+                            totals.repl_bytes_copied);
+            AccumulateWindow(diag.repl_wire_bytes_since_diag.load(std::memory_order_relaxed),
+                            totals.repl_wire_bytes);
         }
     };
 
@@ -1297,6 +1327,162 @@ int RunReadinessBenchmark(boost::asio::io_context& io, const ReadinessConfig& co
                 static_cast<double>(repl_encode_us) / 1000.0,
                 static_cast<double>(repl_send_us) / 1000.0,
                 static_cast<double>(stage_replication) / 1000.0);
+    // Phase 5C shared-payload accounting: CPU-side reuse vs wire bytes. The
+    // record requests are per-recipient needs; serializations are the unique
+    // payload builds. bytes_generated = unique serialized bytes,
+    // bytes_copied = application-side assembly copies, wire_bytes = bytes
+    // handed to send() (the per-recipient traffic).
+    const std::uint64_t record_requests = total_of(&ZoneStageTotals::repl_record_requests);
+    const std::uint64_t record_serializations =
+        total_of(&ZoneStageTotals::repl_record_serializations);
+    const std::uint64_t despawn_hits = total_of(&ZoneStageTotals::repl_despawn_cache_hits);
+    const std::uint64_t despawn_misses = total_of(&ZoneStageTotals::repl_despawn_cache_misses);
+    const std::uint64_t bytes_generated = total_of(&ZoneStageTotals::repl_bytes_generated);
+    const std::uint64_t bytes_copied = total_of(&ZoneStageTotals::repl_bytes_copied);
+    const std::uint64_t wire_bytes = total_of(&ZoneStageTotals::repl_wire_bytes);
+    const double record_reuse =
+        record_requests > 0
+            ? 100.0 * (1.0 - static_cast<double>(record_serializations) /
+                                 static_cast<double>(record_requests))
+            : 0.0;
+    const double copy_amplification =
+        bytes_generated > 0 ? static_cast<double>(bytes_copied) /
+                                  static_cast<double>(bytes_generated)
+                            : 0.0;
+    std::printf("READINESS shared_payload: record_requests=%llu record_serializations=%llu "
+                "record_reuse=%.1f%% despawn_cache=[hit=%llu miss=%llu] "
+                "bytes=[generated=%llu copied=%llu wire=%llu copy_amplification=%.2fx]\n",
+                (unsigned long long)record_requests,
+                (unsigned long long)record_serializations,
+                record_reuse,
+                (unsigned long long)despawn_hits,
+                (unsigned long long)despawn_misses,
+                (unsigned long long)bytes_generated,
+                (unsigned long long)bytes_copied,
+                (unsigned long long)wire_bytes,
+                copy_amplification);
+
+    // Interest-overlap measurement (phase 5C §11, report-time only): how
+    // similar are the recipients' interest sets? Deterministic FNV-1a over
+    // the sorted visible NetId set per viewer; exact duplicates are the
+    // grouping candidates.
+    {
+        std::vector<std::size_t> sizes;
+        std::unordered_map<std::uint64_t, std::uint32_t> signatures;
+        std::vector<std::uint32_t> nets;
+        for (std::size_t zi = 0; zi < sim.Zones().ZoneCount(); ++zi) {
+            const auto& zone = sim.Zones().GetZone(zi);
+            if (!zone.SimulationEnabled() || zone.Partition() != gs::game::PartitionState::Leaf) {
+                continue;
+            }
+            for (const auto& [viewer_net, binding] : zone.Players()) {
+                (void)viewer_net;
+                nets.clear();
+                nets.reserve(binding.visible_net_versions.size());
+                for (const auto& [net_id, version] : binding.visible_net_versions) {
+                    (void)version;
+                    nets.push_back(net_id);
+                }
+                std::sort(nets.begin(), nets.end());
+                std::uint64_t h = 1469598103934665603ull;
+                for (const std::uint32_t net_id : nets) {
+                    h ^= net_id;
+                    h *= 1099511628211ull;
+                }
+                h ^= static_cast<std::uint64_t>(nets.size());
+                h *= 1099511628211ull;
+                ++signatures[h];
+                sizes.push_back(nets.size());
+            }
+        }
+        // Empty interest sets are trivially "identical": measure overlap on
+        // the non-empty sets only (the sparse scenarios have many idle
+        // viewers and would otherwise report meaningless 90%+ duplicates).
+        std::uint32_t max_group = 0;
+        std::size_t nonempty_viewers = 0;
+        std::size_t nonempty_signatures = 0;
+        for (const auto& [signature, count] : signatures) {
+            (void)signature;
+            // A signature with count>1 may still be the empty set; the empty
+            // signature is unique in the map, so filter by tracking sizes.
+            if (count > max_group) {
+                max_group = count;
+            }
+        }
+        for (const std::size_t size : sizes) {
+            if (size > 0) {
+                ++nonempty_viewers;
+            }
+        }
+        // Recompute distinct signatures over non-empty sets.
+        {
+            std::unordered_map<std::uint64_t, std::uint32_t> nonempty;
+            for (std::size_t zi = 0; zi < sim.Zones().ZoneCount(); ++zi) {
+                const auto& zone = sim.Zones().GetZone(zi);
+                if (!zone.SimulationEnabled() ||
+                    zone.Partition() != gs::game::PartitionState::Leaf) {
+                    continue;
+                }
+                for (const auto& [viewer_net, binding] : zone.Players()) {
+                    (void)viewer_net;
+                    if (binding.visible_net_versions.empty()) {
+                        continue;
+                    }
+                    nets.clear();
+                    nets.reserve(binding.visible_net_versions.size());
+                    for (const auto& [net_id, version] : binding.visible_net_versions) {
+                        (void)version;
+                        nets.push_back(net_id);
+                    }
+                    std::sort(nets.begin(), nets.end());
+                    std::uint64_t h = 1469598103934665603ull;
+                    for (const std::uint32_t net_id : nets) {
+                        h ^= net_id;
+                        h *= 1099511628211ull;
+                    }
+                    h ^= static_cast<std::uint64_t>(nets.size());
+                    h *= 1099511628211ull;
+                    ++nonempty[h];
+                }
+            }
+            nonempty_signatures = nonempty.size();
+            max_group = 0;
+            for (const auto& [signature, count] : nonempty) {
+                (void)signature;
+                max_group = std::max(max_group, count);
+            }
+        }
+        std::sort(sizes.begin(), sizes.end());
+        const std::size_t p50 =
+            sizes.empty() ? 0 : sizes[static_cast<std::size_t>(
+                                      static_cast<double>(sizes.size() - 1) * 0.50)];
+        const std::size_t p95 =
+            sizes.empty() ? 0 : sizes[static_cast<std::size_t>(
+                                      static_cast<double>(sizes.size() - 1) * 0.95)];
+        const std::size_t max_size = sizes.empty() ? 0 : sizes.back();
+        const double avg_size =
+            sizes.empty() ? 0.0
+                          : static_cast<double>(std::accumulate(sizes.begin(), sizes.end(),
+                                                                std::size_t{0})) /
+                                static_cast<double>(sizes.size());
+        std::printf("READINESS interest_overlap: viewers=%zu empty=%zu avg_size=%.1f p50=%zu "
+                    "p95=%zu max=%zu nonempty_signatures=%zu max_identical_group=%u "
+                    "exact_duplicate_ratio=%.1f%%\n",
+                    sizes.size(),
+                    sizes.size() - nonempty_viewers,
+                    avg_size,
+                    p50,
+                    p95,
+                    max_size,
+                    nonempty_signatures,
+                    max_group,
+                    nonempty_viewers == 0
+                        ? 0.0
+                        : 100.0 *
+                              static_cast<double>(nonempty_viewers - nonempty_signatures) /
+                              static_cast<double>(nonempty_viewers));
+    }
+
     if (config.replication_shadow) {
         const auto repl_stats = sim.ReplicationValidationSnapshot();
         std::printf("READINESS replication_shadow: polls=%llu poll_failures=%llu "
