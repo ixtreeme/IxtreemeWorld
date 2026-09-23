@@ -8,6 +8,7 @@
 #include "../components/MobComponents.h"
 #include "../components/MovementComponents.h"
 #include "../components/NetworkComponents.h"
+#include "../components/ReplicationComponents.h"
 #include "../components/Tags.h"
 #include "../WorldConstants.h"
 #include "../zone/Zone.h"
@@ -37,6 +38,10 @@ void SpawnSystem::SpawnPlayer(Zone& zone,
                       .set<NetId>({net_id})
                       .set<SessionRef>({session_id})
                       .set<MigrateTo>({0})
+                      // Phase 5B: every replicated entity carries the
+                      // transform version from birth (recipients stamp their
+                      // last-sent value from the spawn snapshot).
+                      .set<TransformVersion>({zone.WorldTick()})
                       .add<PlayerTag>();
 
     Zone::PlayerBinding binding;
@@ -44,7 +49,7 @@ void SpawnSystem::SpawnPlayer(Zone& zone,
     binding.character = std::move(character);
     zone.InsertPlayerBinding(net_id, std::move(binding));
     zone.IndexEntity(net_id, entity);
-    zone.Grid().Insert(net_id, position);
+    zone.Grid().Insert(net_id, position, entity);
     zone.RefreshResidentCounts();
 }
 
@@ -84,10 +89,11 @@ void SpawnSystem::SpawnMob(Zone& zone,
                       .set<MobProfile>({type.model_id, 1, type.name})
                       .set<MigrateTo>({0})
                       .set<SimulationLod>({})
+                      .set<TransformVersion>({zone.WorldTick()})
                       .add<MobTag>();
 
     zone.IndexEntity(net_id, entity);
-    zone.Grid().Insert(net_id, position);
+    zone.Grid().Insert(net_id, position, entity);
     // Newborns simulate Fully; the 1 Hz evaluation demotes the irrelevant
     // ones (no grace history to protect). Synchronous bump keeps the sleep
     // rule exact before the first recount.

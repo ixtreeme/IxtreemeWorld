@@ -117,6 +117,7 @@ void MovementSystem::Step(Zone& zone, float dt, ZoneTickContext& ctx)
         auto position = entity.get<Position>();
         const Position before_move = position;
         auto heading = entity.get<Heading>();
+        const float before_heading_angle = heading.angle;
         auto velocity = entity.get<Velocity>();
         auto intent = entity.get<MoveIntent>();
         const std::int64_t old_cell = SpatialCellKey(SpatialCellCoord(position.x),
@@ -147,6 +148,12 @@ void MovementSystem::Step(Zone& zone, float dt, ZoneTickContext& ctx)
         TryApplyWarp(zone, ctx, position, session_id);
         position.z = ctx.terrain.SampleGroundHeight(position.x, position.y);
         note_moved(entity, before_move, position);
+        // Phase 5B: the replicated transform (position/heading/move_state)
+        // changed -> stamp the version the dirty replication compares against.
+        if (before_move.x != position.x || before_move.y != position.y ||
+            before_move.z != position.z || before_heading_angle != heading.angle) {
+            zone.NoteTransformChanged(entity);
+        }
         // Load field attribution: one movement integration happened HERE.
         if (auto* load = zone.LoadBins().CellFor(position.x, position.y)) {
             ++load->sim_work;
@@ -213,6 +220,7 @@ void MovementSystem::Step(Zone& zone, float dt, ZoneTickContext& ctx)
         auto position = entity.get<Position>();
         const Position before_move = position;
         auto heading = entity.get<Heading>();
+        const float before_heading_angle = heading.angle;
         auto velocity = entity.get<Velocity>();
         auto intent = entity.get<MoveIntent>();
         const std::int64_t old_cell = SpatialCellKey(SpatialCellCoord(position.x),
@@ -239,6 +247,11 @@ void MovementSystem::Step(Zone& zone, float dt, ZoneTickContext& ctx)
 
         position.z = ctx.terrain.SampleGroundHeight(position.x, position.y);
         note_moved(entity, before_move, position);
+        // Phase 5B: replicated transform changed -> stamp the version.
+        if (before_move.x != position.x || before_move.y != position.y ||
+            before_move.z != position.z || before_heading_angle != heading.angle) {
+            zone.NoteTransformChanged(entity);
+        }
         entity.set<Position>(position);
         entity.set<Heading>(heading);
         entity.set<Velocity>(velocity);

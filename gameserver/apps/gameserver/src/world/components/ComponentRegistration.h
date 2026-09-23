@@ -8,6 +8,7 @@
 #include "MobComponents.h"
 #include "MovementComponents.h"
 #include "NetworkComponents.h"
+#include "ReplicationComponents.h"
 #include "SimulationLod.h"
 #include "Tags.h"
 #include "TransformComponents.h"
@@ -37,6 +38,7 @@ inline void RegisterWorldComponents(flecs::world& world)
     world.component<WanderState>();
     world.component<GhostTag>();
     world.component<MigrateTo>();
+    world.component<TransformVersion>();
 }
 
 } // namespace gs::game

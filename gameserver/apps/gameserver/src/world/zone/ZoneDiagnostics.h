@@ -100,6 +100,36 @@ struct ZoneDiagnostics {
     std::atomic<std::uint64_t> sleep_blocked_external_since_diag{0};
     std::atomic<std::uint64_t> wake_external_since_diag{0};
 
+    // Phase 5B — AOI candidate reduction and the interest diff. Pre-cap is the
+    // exact AOI member count before kAoiEntityCap; post-cap is what the
+    // recipient actually reconciles; visible_final is the per-viewer visible
+    // count (== post-cap). enter/leave/keep are the interest diff outcome.
+    std::atomic<std::uint64_t> aoi_candidates_pre_cap_since_diag{0};
+    std::atomic<std::uint64_t> aoi_candidates_post_cap_since_diag{0};
+    std::atomic<std::uint64_t> aoi_visible_final_since_diag{0};
+    std::atomic<std::uint64_t> interest_enter_since_diag{0};
+    std::atomic<std::uint64_t> interest_leave_since_diag{0};
+    std::atomic<std::uint64_t> interest_keep_since_diag{0};
+
+    // Phase 5B — dirty/change-driven replication. records = transform records
+    // handed to frames (incl. the viewer's own record); suppressed = visible
+    // entities whose transform was already caught up; refresh = staggered full
+    // refreshes; fanout_relationships = recipient x record pairs; frame_bytes
+    // = encoded frame payload bytes; payload_bytes = spawn/despawn event bytes.
+    std::atomic<std::uint64_t> repl_spawn_since_diag{0};
+    std::atomic<std::uint64_t> repl_despawn_since_diag{0};
+    std::atomic<std::uint64_t> repl_update_since_diag{0};
+    std::atomic<std::uint64_t> repl_suppressed_since_diag{0};
+    std::atomic<std::uint64_t> repl_records_since_diag{0};
+    std::atomic<std::uint64_t> repl_fanout_relationships_since_diag{0};
+    std::atomic<std::uint64_t> repl_frame_bytes_since_diag{0};
+    std::atomic<std::uint64_t> repl_payload_bytes_since_diag{0};
+    std::atomic<std::uint64_t> repl_refresh_since_diag{0};
+    std::atomic<std::uint64_t> repl_aoi_us_since_diag{0};
+    std::atomic<std::uint64_t> repl_reconcile_us_since_diag{0};
+    std::atomic<std::uint64_t> repl_encode_us_since_diag{0};
+    std::atomic<std::uint64_t> repl_send_us_since_diag{0};
+
     // Recent per-tick wall times (microseconds), newest at head-1.
     std::array<std::atomic<std::uint64_t>, kTickSampleCapacity> tick_samples;
     std::atomic<std::size_t> tick_sample_head{0};

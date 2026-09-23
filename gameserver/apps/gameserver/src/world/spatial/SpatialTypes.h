@@ -3,6 +3,8 @@
 #include <cmath>
 #include <cstdint>
 
+#include <flecs.h>
+
 #include "../WorldConstants.h"
 #include "../components/TransformComponents.h"
 #include "map/MapData.h"
@@ -11,8 +13,12 @@
 // spatial grid. Free functions on concrete types; no service, no state.
 namespace gs::game {
 
+// Phase 5B: the entry carries the zone-local entity handle so an AOI radius
+// scan never pays a random hash-table lookup per candidate (the cell vectors
+// are walked sequentially; only the component read remains).
 struct GridEntry {
     std::uint32_t net_id = 0;
+    flecs::entity entity;
 };
 
 inline int SpatialCellCoord(float value)

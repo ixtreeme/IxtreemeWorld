@@ -4,6 +4,8 @@
 #include <utility>
 #include <vector>
 
+#include <flecs.h>
+
 #include "../WorldConstants.h"
 #include "../components/TransformComponents.h"
 
@@ -19,8 +21,17 @@ namespace gs::game {
 class Zone;
 class SpatialGrid;
 
-// Ghost positions resolved once per zone tick (not once per viewer).
-using GhostPositionCache = std::vector<std::pair<std::uint32_t, Position>>;
+// One AOI candidate: distance for ordering/cap, identity, and the zone-local
+// entity handle (resident or ghost). The handle lets the visibility reconcile
+// read the transform version without a hash lookup or a ghost scan; the
+// version itself is deliberately NOT cached here (it changes every tick and
+// reading it for every candidate would put two component lookups on the hot
+// AOI path).
+struct AoiCandidate {
+    float distance_sq = 0.0f;
+    std::uint32_t net_id = 0;
+    flecs::entity entity;
+};
 
 // Relevance tier by viewer distance (§29 seam). Boundaries are thirds of the
 // AOI radius. Classification only -- send rates are unchanged today.
@@ -43,11 +54,19 @@ inline RelevanceTier RelevanceTierForDistanceSq(float distance_sq) noexcept
 class AoiSystem {
 public:
     static void RebuildInto(Zone& zone, SpatialGrid& grid);
-    static GhostPositionCache BuildGhostCache(const Zone& zone);
-    static std::vector<std::uint32_t> QueryCandidates(Zone& zone,
-                                                      std::uint32_t viewer_net_id,
-                                                      const Position& viewer_position,
-                                                      const GhostPositionCache& ghosts);
+    // Returns the capped, distance-ordered candidate list (nearest first,
+    // deterministic distance,net tie-break). The returned reference points at
+    // a per-thread scratch buffer: it is valid until the next AOI query on
+    // the same thread (the caller consumes it immediately).
+    //
+    // `partial_cap` selects the top-k reduction (partial_sort) instead of a
+    // full sort when the candidate set exceeds kAoiEntityCap. Both produce
+    // exactly the same selected set -- the prefilter is a grid superset and
+    // the exact distance filter never changes.
+    static const std::vector<AoiCandidate>& QueryCandidates(Zone& zone,
+                                                            std::uint32_t viewer_net_id,
+                                                            const Position& viewer_position,
+                                                            bool partial_cap);
 };
 
 } // namespace gs::game

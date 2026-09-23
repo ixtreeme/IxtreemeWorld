@@ -101,6 +101,9 @@ struct BenchConfig {
     int warmup_seconds = 15;
     bool asf_off = false;
     bool ghost_shadow = false;
+    bool replication_shadow = false;
+    bool repl_full = false;
+    bool aoi_full_sort = false;
 };
 
 bool ParseArgs(int argc, char** argv, BenchConfig& config)
@@ -228,6 +231,12 @@ bool ParseArgs(int argc, char** argv, BenchConfig& config)
             config.asf_off = true;
         } else if (arg == "--ghost-shadow") {
             config.ghost_shadow = true;
+        } else if (arg == "--replication-shadow") {
+            config.replication_shadow = true;
+        } else if (arg == "--repl-full") {
+            config.repl_full = true;
+        } else if (arg == "--aoi-full-sort") {
+            config.aoi_full_sort = true;
         } else {
             std::cerr << "unknown arg: " << arg << "\n";
             return false;
@@ -237,7 +246,8 @@ bool ParseArgs(int argc, char** argv, BenchConfig& config)
         config.mode != "dense" && config.mode != "splitmerge" && config.mode != "lod" &&
         config.mode != "activity" && config.mode != "loadfield" &&
         config.mode != "partitionscore" && config.mode != "stability" &&
-        config.mode != "readiness" && config.mode != "ghost") {
+        config.mode != "readiness" && config.mode != "ghost" && config.mode != "aoi" &&
+        config.mode != "replication") {
         std::cerr << "bad mode: " << config.mode << "\n";
         return false;
     }
@@ -3534,8 +3544,8 @@ int RunGhostScenario(boost::asio::io_context& io, const BenchConfig& config)
         return failures + 1;
     }
     const std::uint32_t player_net = owner_it->second.net_id;
-    const gs::game::Zone& zone_a = sim.Zones().GetZone(zone_a_index);
-    const gs::game::Zone& zone_b = sim.Zones().GetZone(zone_b_index);
+    const const gs::game::Zone& zone_a = sim.Zones().GetZone(zone_a_index);
+    const const gs::game::Zone& zone_b = sim.Zones().GetZone(zone_b_index);
     const std::uint32_t mob_nets[4] = {
         find_net_at(zone_b, mob_x, kPlayerY - 6.0f),
         find_net_at(zone_b, mob_x, kPlayerY - 2.0f),
@@ -3645,6 +3655,441 @@ int RunGhostScenario(boost::asio::io_context& io, const BenchConfig& config)
     std::printf("GHOST-DONE validations=%d equivalence=%d failures=%d\n",
                 validations,
                 equivalence_runs,
+                failures);
+    return failures;
+}
+
+// Phase 5B AOI + dirty replication correctness scenario. Own sim lifecycle on
+// the test map. Covers:
+//   AOI: inside/outside/exact boundary, cross-zone mob + player (ghost
+//        backed), viewer self-exclusion, entity move in/out, spawn/despawn
+//        inside range, split/merge visibility stability, exact shadow
+//        equivalence (brute force vs production interest set).
+//   Replication: clean -> no record, changed transform -> record, multi
+//        recipient fanout, spawn+transform coalescing, transform+despawn,
+//        migration same NetId (no despawn+spawn churn), split/merge no
+//        duplicate spawn, recipient coverage (last-sent >= current).
+int RunAoiReplicationScenario(boost::asio::io_context& io,
+                              const BenchConfig& config,
+                              const char* tag)
+{
+    int failures = 0;
+    int validations = 0;
+    int shadow_runs = 0;
+    int shadow_failures = 0;
+    auto check = [&](const char* name, bool pass) {
+        std::printf("%s %s: %s\n", tag, name, pass ? "PASS" : "FAIL");
+        if (!pass) {
+            ++failures;
+        }
+    };
+
+    gs::game::WorldRuntime sim(io);
+    // Long refresh period: the "clean -> suppressed" window must be
+    // observable, and the staggered refresh must not interfere with the
+    // dirty assertions. Production default is 20 ticks (1 s).
+    gs::game::ReplicationConfig repl_cfg;
+    repl_cfg.dirty_enabled = true;
+    repl_cfg.aoi_partial_cap = true;
+    repl_cfg.refresh_ticks = 400;
+    sim.ConfigureReplication(repl_cfg);
+    // The 500 m test zones can split with the validated 240 m floor.
+    gs::game::PartitionConfig pcfg;
+    pcfg.min_zone_size_m = 100.0f;
+    sim.ConfigurePartition(pcfg);
+
+    auto shadow_now = [&](const char* what) -> bool {
+        sim.RequestReplicationValidation();
+        for (int i = 0; i < 300; ++i) {
+            std::string result;
+            if (sim.TryTakeReplicationValidationResult(result)) {
+                ++shadow_runs;
+                if (result != "OK") {
+                    ++shadow_failures;
+                    std::printf("%s shadow(%s): FAIL: %s\n", tag, what, result.c_str());
+                    return false;
+                }
+                return true;
+            }
+            std::this_thread::sleep_for(std::chrono::milliseconds(50));
+        }
+        std::printf("%s shadow(%s): TIMEOUT\n", tag, what);
+        ++shadow_failures;
+        return false;
+    };
+    auto world_validate = [&](const char* what) -> bool {
+        sim.RequestValidation();
+        for (int i = 0; i < 300; ++i) {
+            std::string result;
+            if (sim.TryTakeValidationResult(result)) {
+                ++validations;
+                if (result != "OK") {
+                    std::printf("%s world-validation(%s): FAIL: %s\n", tag, what, result.c_str());
+                    return false;
+                }
+                return true;
+            }
+            std::this_thread::sleep_for(std::chrono::milliseconds(100));
+        }
+        std::printf("%s world-validation(%s): TIMEOUT\n", tag, what);
+        return false;
+    };
+
+    const auto deadline =
+        std::chrono::steady_clock::now() + std::chrono::seconds(std::max(180, config.seconds));
+    auto expired = [&] { return std::chrono::steady_clock::now() >= deadline; };
+
+    constexpr gs::common::SessionId kV1 = 780;      // viewer in zone A
+    constexpr gs::common::SessionId kV2 = 781;      // second viewer in zone A
+    constexpr gs::common::SessionId kPCross = 782;  // visible player in zone B
+    constexpr gs::common::SessionId kP2 = 783;      // mover in zone B
+    constexpr gs::common::SessionId kP3 = 784;      // spawn/despawn inside range
+    constexpr gs::common::SessionId kP4 = 785;      // spawn + dirty coalescing
+
+    // Viewer at (420,420): 120 m from the x=500 border, 172+ m from the
+    // nearest map base spawn (so only our controlled entities are in AOI).
+    constexpr float kViewerX = 420.0f;
+    constexpr float kViewerY = 420.0f;
+    constexpr float kMobInX = 460.0f;    // 40 m
+    constexpr float kMobCrossX = 540.0f; // exactly 120 m (zone B, ghost path)
+    constexpr float kMobOutX = 545.0f;   // 125 m (zone B, outside exact AOI)
+    constexpr float kPCrossX = 530.0f;   // 110 m (zone B, player ghost)
+    constexpr float kP2X = 600.0f;       // 180 m (zone B, starts invisible)
+
+    sim.Start();
+
+    {
+        boost::asio::ip::tcp::socket socket(io);
+        auto session = std::make_shared<gs::network::Session>(std::move(socket), kV1);
+        sim.PostSpawn(session, MakeBenchCharacter(980),
+                      gs::game::DebugSpawnOverride{kViewerX, kViewerY});
+    }
+    {
+        boost::asio::ip::tcp::socket socket(io);
+        auto session = std::make_shared<gs::network::Session>(std::move(socket), kV2);
+        sim.PostSpawn(session, MakeBenchCharacter(981),
+                      gs::game::DebugSpawnOverride{kViewerX, kViewerY + 10.0f});
+    }
+    {
+        boost::asio::ip::tcp::socket socket(io);
+        auto session = std::make_shared<gs::network::Session>(std::move(socket), kPCross);
+        sim.PostSpawn(session, MakeBenchCharacter(982),
+                      gs::game::DebugSpawnOverride{kPCrossX, kViewerY});
+    }
+    {
+        boost::asio::ip::tcp::socket socket(io);
+        auto session = std::make_shared<gs::network::Session>(std::move(socket), kP2);
+        sim.PostSpawn(session, MakeBenchCharacter(983),
+                      gs::game::DebugSpawnOverride{kP2X, kViewerY});
+    }
+    // Static mobs (radius 0): exact positions forever, so any transform
+    // record for them is a correctness signal.
+    const float mob_x[3] = {kMobInX, kMobCrossX, kMobOutX};
+    for (int i = 0; i < 3; ++i) {
+        gs::game::MobSpawnPoint point;
+        point.mob_type_id = 2;
+        point.x = mob_x[i];
+        point.y = kViewerY;
+        point.count = 1;
+        point.radius = 0.0f;
+        sim.AddMobSpawnPoint(point);
+    }
+    for (int i = 0; i < 3; ++i) {
+        sim.RequestMobSpawn(static_cast<std::size_t>(4 + i));
+    }
+
+    const bool populated = WaitFor(std::chrono::seconds(25), [&] {
+        return sim.Owners().size() == 4 && sim.CollectProcessLoad().mobs >= 3;
+    });
+    check("populate", populated && !expired());
+    if (!populated) {
+        sim.Stop();
+        return failures + 1;
+    }
+    std::this_thread::sleep_for(std::chrono::seconds(2)); // publish + reconcile settle
+
+    auto net_of = [&](gs::common::SessionId session) -> std::uint32_t {
+        const auto it = sim.Owners().find(session);
+        return it != sim.Owners().end() ? it->second.net_id : 0;
+    };
+    auto zone_of = [&](gs::common::SessionId session) -> const gs::game::Zone* {
+        const auto it = sim.Owners().find(session);
+        if (it == sim.Owners().end() || it->second.zone_index >= sim.Zones().ZoneCount()) {
+            return nullptr;
+        }
+        return &sim.Zones().GetZone(it->second.zone_index);
+    };
+    auto visible = [&](gs::common::SessionId session, std::uint32_t net_id) -> bool {
+        const gs::game::Zone* zone = zone_of(session);
+        if (zone == nullptr) {
+            return false;
+        }
+        const auto* binding = zone->FindPlayer(net_of(session));
+        return binding != nullptr && binding->IsVisible(net_id);
+    };
+    auto visible_count = [&](gs::common::SessionId session) -> std::size_t {
+        const gs::game::Zone* zone = zone_of(session);
+        if (zone == nullptr) {
+            return 0;
+        }
+        const auto* binding = zone->FindPlayer(net_of(session));
+        return binding != nullptr ? binding->visible_net_versions.size() : 0;
+    };
+    auto visible_set = [&](gs::common::SessionId session) {
+        std::vector<std::uint32_t> nets;
+        const gs::game::Zone* zone = zone_of(session);
+        if (zone == nullptr) {
+            return nets;
+        }
+        const auto* binding = zone->FindPlayer(net_of(session));
+        if (binding == nullptr) {
+            return nets;
+        }
+        nets.reserve(binding->visible_net_versions.size());
+        for (const auto& [net_id, version] : binding->visible_net_versions) {
+            (void)version;
+            nets.push_back(net_id);
+        }
+        std::sort(nets.begin(), nets.end());
+        return nets;
+    };
+    auto find_net_at = [&](const gs::game::Zone& zone, float x, float y) -> std::uint32_t {
+        for (const auto& [net_id, entity] : zone.Entities()) {
+            if (!entity.is_valid() || !entity.has<gs::game::Position>()) {
+                continue;
+            }
+            const auto pos = entity.get<gs::game::Position>();
+            if (pos.x == x && pos.y == y) {
+                return net_id;
+            }
+        }
+        return 0;
+    };
+    // Recipient-level lifecycle counters (travel with the binding across
+    // topology changes): {spawns, despawns, updates}.
+    auto recipient_events = [&](gs::common::SessionId session) {
+        std::array<std::uint64_t, 3> events{0, 0, 0};
+        const gs::game::Zone* zone = zone_of(session);
+        if (zone == nullptr) {
+            return events;
+        }
+        const auto* binding = zone->FindPlayer(net_of(session));
+        if (binding == nullptr) {
+            return events;
+        }
+        events[0] = binding->spawn_events;
+        events[1] = binding->despawn_events;
+        events[2] = binding->update_events;
+        return events;
+    };
+
+    const std::uint32_t v1_net = net_of(kV1);
+    const std::uint32_t p_cross_net = net_of(kPCross);
+    const std::uint32_t p2_net = net_of(kP2);
+    check("nets-resolved", v1_net != 0 && p_cross_net != 0 && p2_net != 0);
+    if (v1_net == 0 || p_cross_net == 0 || p2_net == 0) {
+        sim.Stop();
+        return failures + 1;
+    }
+    const std::size_t zone_a_index = sim.Zones().FindIndexForPosition(kViewerX, kViewerY);
+    const std::size_t zone_b_index = sim.Zones().FindIndexForPosition(kPCrossX, kViewerY);
+    const gs::game::ZoneId zone_a_id = sim.Zones().GetZone(zone_a_index).Id();
+    const gs::game::Zone& zone_a = sim.Zones().GetZone(zone_a_index);
+    const gs::game::Zone& zone_b = sim.Zones().GetZone(zone_b_index);
+    const std::uint32_t m_in_net = find_net_at(zone_a, kMobInX, kViewerY);
+    const std::uint32_t m_cross_net = find_net_at(zone_b, kMobCrossX, kViewerY);
+    const std::uint32_t m_out_net = find_net_at(zone_b, kMobOutX, kViewerY);
+    check("static-mobs-resolved", m_in_net != 0 && m_cross_net != 0 && m_out_net != 0);
+
+    // ---- AOI exact semantics -------------------------------------------
+    check("aoi-inside-visible", visible(kV1, m_in_net));
+    check("aoi-exact-boundary-visible", visible(kV1, m_cross_net)); // 120.0 m
+    check("aoi-outside-invisible", !visible(kV1, m_out_net));       // 125 m
+    check("aoi-cross-zone-mob-visible", visible(kV1, m_cross_net)); // ghost backed
+    check("aoi-cross-zone-player-visible", visible(kV1, p_cross_net));
+    check("aoi-viewer-self-excluded", !visible(kV1, v1_net));
+    check("aoi-second-viewer-consistent", visible(kV2, m_in_net) && visible(kV2, p_cross_net));
+    check("shadow-initial", shadow_now("initial"));
+
+    // ---- entity moves into range, then out ------------------------------
+    std::uint32_t seq = 0;
+    const auto enter_deadline = std::chrono::steady_clock::now() + std::chrono::seconds(15);
+    bool entered = false;
+    while (std::chrono::steady_clock::now() < enter_deadline && !entered && !expired()) {
+        sim.PostMoveInput(kP2, ++seq, -1.5707963f, gs::game::MoveState::Running);
+        entered = visible(kV1, p2_net);
+        std::this_thread::sleep_for(std::chrono::milliseconds(100));
+    }
+    check("entity-enters-range", entered && !expired());
+    const auto leave_deadline = std::chrono::steady_clock::now() + std::chrono::seconds(15);
+    bool left = false;
+    while (std::chrono::steady_clock::now() < leave_deadline && !left && !expired()) {
+        sim.PostMoveInput(kP2, ++seq, 1.5707963f, gs::game::MoveState::Running);
+        left = !visible(kV1, p2_net);
+        std::this_thread::sleep_for(std::chrono::milliseconds(100));
+    }
+    check("entity-leaves-range", left && !expired());
+    check("shadow-after-entity-move", shadow_now("after-entity-move"));
+
+    // ---- spawn inside range / despawn inside range ----------------------
+    {
+        boost::asio::ip::tcp::socket socket(io);
+        auto session = std::make_shared<gs::network::Session>(std::move(socket), kP3);
+        sim.PostSpawn(session, MakeBenchCharacter(984),
+                      gs::game::DebugSpawnOverride{kViewerX + 40.0f, kViewerY + 40.0f});
+    }
+    const bool p3_visible = WaitFor(std::chrono::seconds(10), [&] {
+        return net_of(kP3) != 0 && visible(kV1, net_of(kP3));
+    });
+    check("spawn-inside-visible", p3_visible && !expired());
+    sim.PostDespawn(kP3);
+    const bool p3_gone = WaitFor(std::chrono::seconds(10), [&] {
+        return sim.Owners().find(kP3) == sim.Owners().end();
+    });
+    std::this_thread::sleep_for(std::chrono::milliseconds(300));
+    check("despawn-inside-removed", p3_gone && !visible(kV1, net_of(kP3) == 0 ? 0 : net_of(kP3)));
+    check("shadow-after-spawn-despawn", shadow_now("after-spawn-despawn"));
+
+    // ---- dirty replication: clean entities produce no records ------------
+    const gs::game::Zone& v1_zone = *zone_of(kV1);
+    auto counters = [&](const gs::game::Zone& zone) {
+        return std::array<std::uint64_t, 4>{
+            zone.Diagnostics().repl_update_since_diag.load(std::memory_order_relaxed),
+            zone.Diagnostics().repl_spawn_since_diag.load(std::memory_order_relaxed),
+            zone.Diagnostics().repl_despawn_since_diag.load(std::memory_order_relaxed),
+            zone.Diagnostics().repl_suppressed_since_diag.load(std::memory_order_relaxed)};
+    };
+    const auto clean_before = counters(v1_zone);
+    std::this_thread::sleep_for(std::chrono::milliseconds(600)); // ~12 ticks
+    const auto clean_after = counters(v1_zone);
+    check("dirty-clean-no-update", clean_after[0] == clean_before[0]);
+    check("dirty-clean-no-lifecycle",
+          clean_after[1] == clean_before[1] && clean_after[2] == clean_before[2]);
+    check("dirty-clean-suppressed", clean_after[3] > clean_before[3]);
+
+    // ---- changed transform -> update; both recipients catch up -----------
+    const auto dirty_before = counters(v1_zone);
+    seq = 0;
+    const auto dirty_deadline = std::chrono::steady_clock::now() + std::chrono::seconds(10);
+    while (std::chrono::steady_clock::now() < dirty_deadline && !expired()) {
+        sim.PostMoveInput(kPCross, ++seq, -1.5707963f, gs::game::MoveState::Walking);
+        const auto now = counters(v1_zone);
+        if (now[0] > dirty_before[0]) {
+            break;
+        }
+        std::this_thread::sleep_for(std::chrono::milliseconds(50));
+    }
+    std::this_thread::sleep_for(std::chrono::milliseconds(200));
+    const auto dirty_after = counters(v1_zone);
+    check("dirty-changed-update", dirty_after[0] > dirty_before[0]);
+    check("dirty-multi-recipient-coverage", shadow_now("multi-recipient"));
+
+    // ---- spawn + dirty transform coalescing (spawn carries the state) ----
+    {
+        boost::asio::ip::tcp::socket socket(io);
+        auto session = std::make_shared<gs::network::Session>(std::move(socket), kP4);
+        sim.PostSpawn(session, MakeBenchCharacter(985),
+                      gs::game::DebugSpawnOverride{kViewerX + 30.0f, kViewerY + 30.0f});
+    }
+    const bool p4_visible = WaitFor(std::chrono::seconds(10), [&] {
+        return net_of(kP4) != 0 && visible(kV1, net_of(kP4));
+    });
+    seq = 0;
+    for (int i = 0; i < 4; ++i) {
+        sim.PostMoveInput(kP4, ++seq, 0.7853982f, gs::game::MoveState::Walking);
+        std::this_thread::sleep_for(std::chrono::milliseconds(50));
+    }
+    check("spawn-plus-dirty-coalesced", p4_visible && shadow_now("spawn-plus-dirty"));
+
+    // ---- dirty transform + despawn -> no stale interest ------------------
+    sim.PostDespawn(kP4);
+    const bool p4_gone = WaitFor(std::chrono::seconds(10), [&] {
+        return sim.Owners().find(kP4) == sim.Owners().end();
+    });
+    std::this_thread::sleep_for(std::chrono::milliseconds(300));
+    check("dirty-despawn-clean", p4_gone && shadow_now("dirty-despawn"));
+
+    // ---- migration: same NetId, no despawn+spawn churn -------------------
+    const auto mig_before = counters(v1_zone);
+    const bool p_cross_visible_before = visible(kV1, p_cross_net);
+    seq = 0;
+    const auto mig_deadline = std::chrono::steady_clock::now() + std::chrono::seconds(20);
+    bool p_cross_migrated = false;
+    while (std::chrono::steady_clock::now() < mig_deadline && !p_cross_migrated && !expired()) {
+        sim.PostMoveInput(kPCross, ++seq, -1.5707963f, gs::game::MoveState::Walking);
+        const auto owner = sim.Owners().find(kPCross);
+        if (owner != sim.Owners().end() && owner->second.zone_index == zone_a_index) {
+            p_cross_migrated = true;
+        }
+        std::this_thread::sleep_for(std::chrono::milliseconds(100));
+    }
+    std::this_thread::sleep_for(std::chrono::milliseconds(300));
+    const auto mig_after = counters(v1_zone);
+    check("migration-same-net",
+          p_cross_visible_before && p_cross_migrated && visible(kV1, p_cross_net));
+    check("migration-no-spawn-despawn-churn",
+          mig_after[1] == mig_before[1] && mig_after[2] == mig_before[2]);
+    check("shadow-after-migration", shadow_now("after-migration"));
+
+    // ---- split / merge: visibility must not change with topology ---------
+    const auto set_before_split = visible_set(kV1);
+    const auto split_events_before = recipient_events(kV1);
+    const std::size_t zones_before = sim.Zones().ZoneCount();
+    sim.PostForceSplit(zone_a_id);
+    const bool split_done = WaitFor(std::chrono::seconds(20), [&] {
+        return sim.Zones().ZoneCount() == zones_before + 4;
+    });
+    std::this_thread::sleep_for(std::chrono::seconds(1));
+    const auto set_after_split = visible_set(kV1);
+    const auto split_events_after = recipient_events(kV1);
+    check("split-committed", split_done && !expired());
+    check("split-visibility-stable", set_before_split == set_after_split);
+    if (split_events_after[0] != split_events_before[0] ||
+        split_events_after[1] != split_events_before[1]) {
+        std::printf("%s split-churn detail: before=[spawn=%llu despawn=%llu upd=%llu] "
+                    "after=[spawn=%llu despawn=%llu upd=%llu] set=%zu/%zu\n",
+                    tag,
+                    (unsigned long long)split_events_before[0],
+                    (unsigned long long)split_events_before[1],
+                    (unsigned long long)split_events_before[2],
+                    (unsigned long long)split_events_after[0],
+                    (unsigned long long)split_events_after[1],
+                    (unsigned long long)split_events_after[2],
+                    set_before_split.size(),
+                    set_after_split.size());
+    }
+    check("split-no-spawn-despawn-churn",
+          split_events_after[0] == split_events_before[0] &&
+              split_events_after[1] == split_events_before[1]);
+    check("shadow-after-split", shadow_now("after-split"));
+
+    sim.PostForceMerge(zone_a_id);
+    const bool merge_done = WaitFor(std::chrono::seconds(20), [&] {
+        return sim.PartitionMetricsSnapshot().merge_commits >= 1;
+    });
+    std::this_thread::sleep_for(std::chrono::seconds(1));
+    const auto set_after_merge = visible_set(kV1);
+    check("merge-committed", merge_done && !expired());
+    check("merge-visibility-stable", set_before_split == set_after_merge);
+    check("shadow-after-merge", shadow_now("after-merge"));
+    check("world-validation-final", world_validate("final"));
+
+    const auto shadow_stats = sim.ReplicationValidationSnapshot();
+    std::printf("%s stats: shadow_runs=%d shadow_failures=%d validator_runs=%llu "
+                "validator_failures=%llu visible=%zu\n",
+                tag,
+                shadow_runs,
+                shadow_failures,
+                (unsigned long long)shadow_stats.runs,
+                (unsigned long long)shadow_stats.failures,
+                visible_count(kV1));
+    check("no-shadow-failures", shadow_stats.failures == 0 && shadow_failures == 0);
+    check("no-validator-failures", sim.GhostValidationSnapshot().failures == 0);
+    sim.Stop();
+    std::printf("%s-DONE validations=%d shadow=%d failures=%d\n",
+                tag,
+                validations,
+                shadow_runs,
                 failures);
     return failures;
 }
@@ -3775,6 +4220,21 @@ int BenchMain(int argc, char** argv)
         return scenario_failures == 0 ? 0 : 2;
     }
 
+    if (config.mode == "aoi" || config.mode == "replication") {
+        // Phase 5B AOI + dirty replication correctness scenario (one rig
+        // covers both; the mode only selects the report prefix).
+        boost::asio::io_context aoi_io;
+        std::thread aoi_io_thread([&aoi_io] { aoi_io.run(); });
+        const char* tag = config.mode == "aoi" ? "AOI" : "REPL";
+        const int scenario_failures = RunAoiReplicationScenario(aoi_io, config, tag);
+        aoi_io.stop();
+        if (aoi_io_thread.joinable()) {
+            aoi_io_thread.join();
+        }
+        std::printf("BENCH-DONE %s failures=%d\n", config.mode.c_str(), scenario_failures);
+        return scenario_failures == 0 ? 0 : 2;
+    }
+
     if (config.mode == "readiness") {
         // Phase-4 integrated readiness benchmark (synthetic 100km world).
         gs::bench::ReadinessConfig readiness;
@@ -3790,6 +4250,9 @@ int BenchMain(int argc, char** argv)
         readiness.load_field_off = config.load_field_off;
         readiness.lod_off = config.lod_off;
         readiness.ghost_shadow = config.ghost_shadow;
+        readiness.replication_shadow = config.replication_shadow;
+        readiness.repl_full = config.repl_full;
+        readiness.aoi_full_sort = config.aoi_full_sort;
         readiness.seed = config.seed;
         boost::asio::io_context readiness_io;
         std::thread readiness_io_thread([&readiness_io] { readiness_io.run(); });

@@ -195,6 +195,10 @@ void Zone::Tick(float dt, ZoneTickContext& ctx)
     // waits would hang forever.
     try {
         ZoneWriteGuard guard(*this, "Zone::Tick");
+        // Phase 5B: the world-global tick is the version domain for
+        // transform replication (shared across zones, so migration never
+        // invalidates a recipient's last-sent comparison).
+        world_tick_ = ctx.world_tick;
         // Phase 5A: the dirty-publish list is per-tick scratch; commands may
         // have marked entities before the tick started, so drain only after
         // the previous tick consumed it (here, at the top).
@@ -280,7 +284,8 @@ void Zone::Tick(float dt, ZoneTickContext& ctx)
 
         if (!players_.empty()) {
             const auto repl_start = Clock::now();
-            const auto records = ReplicationSystem::BroadcastTransforms(*this, ctx.send);
+            const auto records =
+                ReplicationSystem::BroadcastTransforms(*this, ctx.send, ctx.replication);
             diagnostics_.transform_records_since_diag.fetch_add(records, std::memory_order_relaxed);
             diagnostics_.replication_micros_since_diag.fetch_add(
                 static_cast<std::uint64_t>(

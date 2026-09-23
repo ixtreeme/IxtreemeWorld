@@ -36,6 +36,7 @@
 #include "partition/PartitionMetrics.h"
 #include "partition/PartitionScoring.h"
 #include "partition/ZoneLoadMonitor.h"
+#include "replication/ReplicationConfig.h"
 #include "spawn/SpawnCoordinator.h"
 #include "terrain/TerrainService.h"
 #include "zone/ZoneManager.h"
@@ -238,6 +239,10 @@ public:
     {
         return effective_lod_config_;
     }
+    const ReplicationConfig& EffectiveReplicationConfig() const noexcept
+    {
+        return effective_replication_config_;
+    }
     const LoadFieldConfig& EffectiveLoadFieldConfig() const noexcept
     {
         return effective_load_field_config_;
@@ -279,6 +284,11 @@ public:
     // Start or between supervisor passes (never with a tick in flight).
     void ConfigureLoadField(const LoadFieldConfig& config);
 
+    // Applies a (validated, clamped) replication/AOI configuration (phase
+    // 5B): dirty transform replication, AOI top-k cap reduction, refresh
+    // period. Call before Start or between supervisor passes.
+    void ConfigureReplication(const ReplicationConfig& config);
+
     // Load field self-consistency audit in the supervisor's quiescent window
     // (same pattern as RequestValidation): validates dimensions, finite/
     // non-negative channels, the predicted==slow seam, raw totals vs cells,
@@ -309,6 +319,25 @@ public:
         stats.runs = ghost_validation_runs_.load(std::memory_order_relaxed);
         stats.failures = ghost_validation_failures_.load(std::memory_order_relaxed);
         stats.repairs = ghost_repairs_.load(std::memory_order_relaxed);
+        return stats;
+    }
+
+    // Phase 5B replication shadow audit (same quiescent window): exact
+    // interest-set equivalence (brute force vs the production interest set)
+    // plus the recipient coverage invariant (every visible entity's last-sent
+    // transform version is not older than its current one). Read-only;
+    // mismatches are counted and reported, never silently repaired.
+    void RequestReplicationValidation();
+    bool TryTakeReplicationValidationResult(std::string& out_result);
+    struct ReplicationValidationStats {
+        std::uint64_t runs = 0;
+        std::uint64_t failures = 0;
+    };
+    ReplicationValidationStats ReplicationValidationSnapshot() const noexcept
+    {
+        ReplicationValidationStats stats;
+        stats.runs = replication_validation_runs_.load(std::memory_order_relaxed);
+        stats.failures = replication_validation_failures_.load(std::memory_order_relaxed);
         return stats;
     }
 
@@ -461,6 +490,7 @@ private:
     PartitionConfig effective_partition_config_;
     LodConfig effective_lod_config_;
     LoadFieldConfig effective_load_field_config_;
+    ReplicationConfig effective_replication_config_;
 
     // Failure-injection hooks for bench/test only (§17-18). Countdowns of
     // transfers to fail: snapshot-stage (before any mutation) or
@@ -514,6 +544,15 @@ private:
     std::atomic<std::uint64_t> ghost_validation_failures_{0};
     std::atomic<std::uint64_t> ghost_repairs_{0};
     std::atomic<bool> ghost_auto_repair_{true};
+
+    // Phase 5B replication shadow validation (read-only; no repair path --
+    // mismatches must stay visible, see phase 5B §89).
+    std::atomic<bool> replication_validation_requested_{false};
+    mutable std::mutex replication_validation_mutex_;
+    std::string replication_validation_result_;
+    bool replication_validation_ready_ = false;
+    std::atomic<std::uint64_t> replication_validation_runs_{0};
+    std::atomic<std::uint64_t> replication_validation_failures_{0};
 };
 
 } // namespace gs::game

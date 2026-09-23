@@ -22,11 +22,11 @@ std::size_t SpatialGrid::Size() const noexcept
     return total;
 }
 
-void SpatialGrid::Insert(std::uint32_t net_id, const Position& position)
+void SpatialGrid::Insert(std::uint32_t net_id, const Position& position, flecs::entity entity)
 {
     const int cell_x = SpatialCellCoord(position.x);
     const int cell_y = SpatialCellCoord(position.y);
-    cells_[SpatialCellKey(cell_x, cell_y)].push_back(GridEntry{net_id});
+    cells_[SpatialCellKey(cell_x, cell_y)].push_back(GridEntry{net_id, entity});
 }
 
 void SpatialGrid::Remove(std::uint32_t net_id, const Position& position)
@@ -53,14 +53,23 @@ bool SpatialGrid::Move(std::uint32_t net_id,
     if (new_cell_key == old_cell_key) {
         return false;
     }
+    // Carry the zone-local entity handle over to the new cell: the AOI scan
+    // relies on it to avoid a hash lookup per candidate.
+    flecs::entity moved_entity;
     const auto old_it = cells_.find(old_cell_key);
     if (old_it != cells_.end()) {
+        for (const auto& entry : old_it->second) {
+            if (entry.net_id == net_id) {
+                moved_entity = entry.entity;
+                break;
+            }
+        }
         EraseOne(old_it->second, net_id);
         if (old_it->second.empty()) {
             cells_.erase(old_it);
         }
     }
-    cells_[new_cell_key].push_back(GridEntry{net_id});
+    cells_[new_cell_key].push_back(GridEntry{net_id, moved_entity});
     return true;
 }
 

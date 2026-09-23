@@ -178,7 +178,8 @@ void SpawnCoordinator::Despawn(gs::common::SessionId session_id)
         auto payload = MakeDespawn(net_id);
         for (auto& [viewer_net, viewer] : zone.Players()) {
             (void)viewer_net;
-            if (viewer.visible_net_ids.erase(net_id) > 0) {
+            if (viewer.IsVisible(net_id)) {
+                viewer.EraseVisible(net_id);
                 send_(viewer.session, payload);
             }
         }

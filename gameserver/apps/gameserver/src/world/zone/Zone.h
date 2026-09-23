@@ -27,6 +27,7 @@
 #include "../components/ComponentRegistration.h"
 #include "../components/SimulationLod.h"
 #include "../partition/PartitionTypes.h"
+#include "../replication/ReplicationConfig.h"
 #include "../spatial/SpatialGrid.h"
 #include "../visibility/BorderSnapshot.h"
 #include "../visibility/GhostSystem.h"
@@ -66,6 +67,9 @@ struct ZoneTickContext {
     // Simulation LOD config (world-global, owned by WorldRuntime). Null or
     // disabled = legacy behavior: every entity integrates every tick.
     const LodConfig* lod = nullptr;
+    // Phase 5B replication/AOI config (world-global, owned by WorldRuntime).
+    // Null = optimized defaults.
+    const ReplicationConfig* replication = nullptr;
     // World-space activity snapshot for this tick (immutable generation,
     // owned by WorldRuntime's field; null in unit-test contexts). Lets LOD
     // evaluation see players in ANY zone without cross-zone live reads.
@@ -92,7 +96,27 @@ public:
     struct PlayerBinding {
         std::shared_ptr<gs::network::Session> session;
         gs::db::Character character;
-        std::unordered_set<std::uint32_t> visible_net_ids;
+        // Phase 5B interest set: net_id -> world tick at which this viewer
+        // was last sent the entity's transform (a spawn counts as sent). The
+        // key set IS the viewer's visible set; a transform record is only
+        // generated when the entity's TransformVersion is newer (or on the
+        // staggered periodic refresh).
+        std::unordered_map<std::uint32_t, std::uint32_t> visible_net_versions;
+        // Recipient-level lifecycle counters (phase 5B observability): they
+        // travel with the binding across migrations/splits/merges, so churn
+        // caused by topology changes is directly measurable per recipient.
+        std::uint64_t spawn_events = 0;
+        std::uint64_t despawn_events = 0;
+        std::uint64_t update_events = 0;
+
+        bool IsVisible(std::uint32_t net_id) const
+        {
+            return visible_net_versions.find(net_id) != visible_net_versions.end();
+        }
+        void EraseVisible(std::uint32_t net_id)
+        {
+            visible_net_versions.erase(net_id);
+        }
     };
 
     Zone(ZoneId id, std::string name, mx::map::Rect bounds);
@@ -354,6 +378,20 @@ public:
     {
         return zone_tick_;
     }
+    // World-global tick of this zone's last tick (Phase 5B version domain).
+    std::uint32_t WorldTick() const noexcept
+    {
+        return world_tick_;
+    }
+    // Marks an entity's replicated transform (position/heading/move_state) as
+    // changed at the current world tick. Callers must only invoke this when a
+    // published transform field actually changed.
+    void NoteTransformChanged(flecs::entity entity) const
+    {
+        if (entity.is_valid() && entity.has<TransformVersion>()) {
+            entity.set<TransformVersion>({world_tick_});
+        }
+    }
 
     std::atomic<std::thread::id>& OwnerThreadId() noexcept
     {
@@ -553,6 +591,10 @@ private:
     std::unordered_map<gs::common::SessionId, std::uint32_t> net_by_session_;
     std::unordered_map<std::uint32_t, std::mt19937> mob_rng_;
     std::uint32_t zone_tick_ = 0;
+    // World-global tick of the last tick this zone ran (Phase 5B): the
+    // domain shared by TransformVersion stamps and recipient last-sent
+    // values, so migration across zones never invalidates comparisons.
+    std::uint32_t world_tick_ = 0;
     std::atomic<ZoneActivity> activity_{ZoneActivity::Active};
     std::atomic<std::thread::id> owner_thread_id_{std::thread::id{}};
     std::atomic<bool> tick_in_progress_{false};

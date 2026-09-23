@@ -44,11 +44,15 @@ void CreateGhost(Zone& zone,
                       .set<Position>(snapshot.position)
                       .set<Heading>(snapshot.heading)
                       .set<NetId>({snapshot.net_id})
+                      // Phase 5B: the ghost's replicated transform starts at
+                      // the current world tick (its first observer receives a
+                      // spawn carrying the full state).
+                      .set<TransformVersion>({zone.WorldTick()})
                       .add<GhostTag>();
     if (snapshot.mob_type_id != 0) {
         entity.set<MobTypeRef>({snapshot.mob_type_id}).add<MobTag>();
     }
-    zone.Grid().Insert(snapshot.net_id, snapshot.position);
+    zone.Grid().Insert(snapshot.net_id, snapshot.position, entity);
     zone.Ghosts().push_back(GhostRecord{entity, snapshot, source_zone_id, reconcile_generation});
     zone.GhostIndex()[snapshot.net_id] = zone.Ghosts().size() - 1;
 }
@@ -156,11 +160,23 @@ void GhostSystem::Reconcile(Zone& zone, ZoneManager& zones)
                 diag.ghost_spatial_queries_since_diag.fetch_add(1, std::memory_order_relaxed);
                 ++updated;
             }
+            // Phase 5B: bump the ghost's replicated-transform version only
+            // when the replicated transform fields actually changed (an HP
+            // refresh must not generate a transform record).
+            const bool transform_changed =
+                record.snapshot.position.x != snapshot.position.x ||
+                record.snapshot.position.y != snapshot.position.y ||
+                record.snapshot.position.z != snapshot.position.z ||
+                record.snapshot.heading.angle != snapshot.heading.angle ||
+                record.snapshot.move_state != snapshot.move_state;
             if (record.entity.is_valid()) {
                 record.entity.set<Position>(snapshot.position);
                 record.entity.set<Heading>(snapshot.heading);
             }
             ApplyMutableSnapshot(record, snapshot);
+            if (transform_changed) {
+                zone.NoteTransformChanged(record.entity);
+            }
             record.source_zone_id = source_zone_id;
             record.last_seen_generation = reconcile_generation;
             diag.ghost_keep_since_diag.fetch_add(1, std::memory_order_relaxed);
@@ -264,11 +280,20 @@ void GhostSystem::Reconcile(Zone& zone, ZoneManager& zones)
                             1, std::memory_order_relaxed);
                         ++updated;
                     }
+                    const bool transform_changed =
+                        record.snapshot.position.x != other_snapshot.position.x ||
+                        record.snapshot.position.y != other_snapshot.position.y ||
+                        record.snapshot.position.z != other_snapshot.position.z ||
+                        record.snapshot.heading.angle != other_snapshot.heading.angle ||
+                        record.snapshot.move_state != other_snapshot.move_state;
                     if (record.entity.is_valid()) {
                         record.entity.set<Position>(other_snapshot.position);
                         record.entity.set<Heading>(other_snapshot.heading);
                     }
                     ApplyMutableSnapshot(record, other_snapshot);
+                    if (transform_changed) {
+                        zone.NoteTransformChanged(record.entity);
+                    }
                     record.source_zone_id = other_source;
                     record.last_seen_generation = reconcile_generation;
                     continue;
@@ -342,11 +367,20 @@ void GhostSystem::Reconcile(Zone& zone, ZoneManager& zones)
                                                                     std::memory_order_relaxed);
                     ++updated;
                 }
+                const bool transform_changed =
+                    ghost.snapshot.position.x != other_snapshot.position.x ||
+                    ghost.snapshot.position.y != other_snapshot.position.y ||
+                    ghost.snapshot.position.z != other_snapshot.position.z ||
+                    ghost.snapshot.heading.angle != other_snapshot.heading.angle ||
+                    ghost.snapshot.move_state != other_snapshot.move_state;
                 if (ghost.entity.is_valid()) {
                     ghost.entity.set<Position>(other_snapshot.position);
                     ghost.entity.set<Heading>(other_snapshot.heading);
                 }
                 ApplyMutableSnapshot(ghost, other_snapshot);
+                if (transform_changed) {
+                    zone.NoteTransformChanged(ghost.entity);
+                }
                 ghost.source_zone_id = other_zone.Id();
                 ghost.last_seen_generation = reconcile_generation;
                 keep = true;

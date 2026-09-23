@@ -237,7 +237,7 @@ MigrationOutcome MigrationCoordinator::MigratePlayer(Zone& source_zone,
     try {
         auto new_entity = ApplyTransfer(target_zone.World(), transfer);
         target_zone.IndexEntity(net_id, new_entity);
-        target_zone.Grid().Insert(net_id, transfer.position);
+        target_zone.Grid().Insert(net_id, transfer.position, new_entity);
     } catch (const std::exception& error) {
         LOG_ERROR("migration: net_id={} destination apply failed: {}", net_id, error.what());
         Zone::PlayerBinding restore_binding = std::move(moved_binding);
@@ -323,7 +323,7 @@ MigrationOutcome MigrationCoordinator::MigrateMob(Zone& source_zone,
     try {
         auto new_entity = ApplyTransfer(target_zone.World(), transfer);
         target_zone.IndexEntity(net_id, new_entity);
-        target_zone.Grid().Insert(net_id, transfer.position);
+        target_zone.Grid().Insert(net_id, transfer.position, new_entity);
     } catch (const std::exception& error) {
         LOG_ERROR("migration: net_id={} destination apply failed: {}", net_id, error.what());
         if (!RestoreToSource(source_zone, transfer)) {
@@ -360,7 +360,7 @@ bool MigrationCoordinator::RestoreToSource(Zone& source_zone, EntityTransfer tra
     try {
         auto restored = ApplyTransfer(source_zone.World(), transfer);
         source_zone.IndexEntity(transfer.net_id, restored);
-        source_zone.Grid().Insert(transfer.net_id, transfer.position);
+        source_zone.Grid().Insert(transfer.net_id, transfer.position, restored);
         source_zone.RefreshResidentCounts();
         return true;
     } catch (const std::exception& error) {

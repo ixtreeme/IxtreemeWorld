@@ -32,6 +32,15 @@ struct ReadinessConfig {
     // performance numbers of such a run are NOT comparable (shadow scans all
     // authority) -- use a separate performance run with this off.
     bool ghost_shadow = false;
+    // Phase 5B correctness run: exact interest-set + recipient-coverage
+    // shadow validation every ~2 s during the measure phase. Like
+    // ghost_shadow, this is a CORRECTNESS run; its performance numbers are
+    // not comparable to a clean performance run.
+    bool replication_shadow = false;
+    // Phase 5B A/B switches (benchmark-only): legacy full replication (every
+    // visible entity every tick) and legacy full AOI candidate sort.
+    bool repl_full = false;
+    bool aoi_full_sort = false;
     std::uint32_t seed = 20260922;
 };
 

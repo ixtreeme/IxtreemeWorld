@@ -59,10 +59,10 @@ std::optional<BorderEntitySnapshot> ResolveVisibleSnapshot(Zone& zone, std::uint
         }
         return std::nullopt;
     }
-    for (const auto& ghost : zone.Ghosts()) {
-        if (ghost.snapshot.net_id == net_id) {
-            return ghost.snapshot;
-        }
+    // O(1) ghost lookup (phase 5B): the linear scan was O(ghost count) per
+    // ghost candidate per viewer.
+    if (const GhostRecord* ghost = zone.FindGhost(net_id)) {
+        return ghost->snapshot;
     }
     return std::nullopt;
 }

@@ -16,6 +16,7 @@
 #include "migration/EntityTransfer.h"
 #include "partition/ZonePartition.h"
 #include "replication/NetworkSend.h"
+#include "replication/ReplicationValidator.h"
 #include "systems/CombatSystem.h"
 #include "visibility/GhostSystem.h"
 #include "visibility/GhostValidator.h"
@@ -271,6 +272,7 @@ ZoneTickContext WorldRuntime::BuildZoneTickContext()
                         &migration_queue_,
                         world_tick_.load(std::memory_order_relaxed),
                         &effective_lod_config_,
+                        &effective_replication_config_,
                         activity_field_.Snapshot(),
                         [this](std::shared_ptr<gs::network::Session> session, std::vector<std::uint8_t> payload) {
                             SendToSession(io_, session, std::move(payload));
@@ -364,10 +366,12 @@ void WorldRuntime::Run()
         // ticks until the in-flight wave drains. Near saturation the wave
         // covers the whole tick period, so without this gate the quiescent
         // window the audits require may never occur.
-        const bool audit_pending = validation_requested_.load(std::memory_order_relaxed) ||
-                                   load_field_validation_requested_.load(std::memory_order_relaxed) ||
-                                   ghost_validation_requested_.load(std::memory_order_relaxed) ||
-                                   activity_validation_requested_.load(std::memory_order_relaxed);
+        const bool audit_pending =
+            validation_requested_.load(std::memory_order_relaxed) ||
+            load_field_validation_requested_.load(std::memory_order_relaxed) ||
+            ghost_validation_requested_.load(std::memory_order_relaxed) ||
+            replication_validation_requested_.load(std::memory_order_relaxed) ||
+            activity_validation_requested_.load(std::memory_order_relaxed);
         if (audit_pending && zones_.AnyTickInProgress()) {
             std::unique_lock drain_lock(mutex_);
             cv_.wait_for(drain_lock, std::chrono::milliseconds(1), [this] {
@@ -437,6 +441,32 @@ void WorldRuntime::Run()
                 std::lock_guard lock(ghost_validation_mutex_);
                 ghost_validation_result_ = ok ? std::string("OK") : "FAIL: " + error;
                 ghost_validation_ready_ = true;
+            }
+        }
+        // Phase 5B replication shadow audit: same quiescent window, explicit
+        // request only. Exact interest-set equivalence + recipient coverage
+        // (last-sent transform version never older than the entity's current
+        // one). Read-only; mismatches are counted and reported, never
+        // silently repaired.
+        if (replication_validation_requested_.load(std::memory_order_relaxed)) {
+            if (!zones_.AnyTickInProgress()) {
+                replication_validation_requested_.store(false, std::memory_order_relaxed);
+                std::string error;
+                std::size_t viewers_checked = 0;
+                std::size_t relationships_checked = 0;
+                const bool ok = ValidateReplicationShadow(zones_, error, &viewers_checked,
+                                                          &relationships_checked);
+                replication_validation_runs_.fetch_add(1, std::memory_order_relaxed);
+                if (!ok) {
+                    replication_validation_failures_.fetch_add(1, std::memory_order_relaxed);
+                    LOG_WARN("replication shadow FAIL: {} (viewers={} relationships={})",
+                             error,
+                             viewers_checked,
+                             relationships_checked);
+                }
+                std::lock_guard lock(replication_validation_mutex_);
+                replication_validation_result_ = ok ? std::string("OK") : "FAIL: " + error;
+                replication_validation_ready_ = true;
             }
         }
         // Strict field-vs-brute-force audit (§31): same quiescent window,
@@ -1963,7 +1993,7 @@ bool WorldRuntime::TransferResidentLocked(Zone& source_zone,
         rollback.applied = true;
         target_zone.IndexEntity(net_id, rollback.entity);
         rollback.indexed = true;
-        target_zone.Grid().Insert(net_id, transfer.position);
+        target_zone.Grid().Insert(net_id, transfer.position, rollback.entity);
         rollback.gridded = true;
     } catch (const std::exception& error) {
         LOG_ERROR("partition: net_id={} apply failed, source untouched: {}", net_id, error.what());
@@ -2172,6 +2202,20 @@ void WorldRuntime::ConfigureSimulationLod(const LodConfig& config)
              e.demote_low_sec);
 }
 
+void WorldRuntime::ConfigureReplication(const ReplicationConfig& config)
+{
+    ReplicationConfig effective = config;
+    if (ValidateReplicationConfig(effective)) {
+        LOG_WARN("replication config corrected: refresh_ticks clamped to {}",
+                 effective.refresh_ticks);
+    }
+    effective_replication_config_ = effective;
+    LOG_INFO("replication effective: dirty={} aoi_partial_cap={} refresh_ticks={}",
+             effective.dirty_enabled,
+             effective.aoi_partial_cap,
+             effective.refresh_ticks);
+}
+
 void WorldRuntime::ConfigureLoadField(const LoadFieldConfig& config)
 {
     // World geometry is runtime-owned: operator config never moves the world.
@@ -2230,6 +2274,23 @@ bool WorldRuntime::TryTakeGhostValidationResult(std::string& out_result)
     out_result = std::move(ghost_validation_result_);
     ghost_validation_result_.clear();
     ghost_validation_ready_ = false;
+    return true;
+}
+
+void WorldRuntime::RequestReplicationValidation()
+{
+    replication_validation_requested_.store(true, std::memory_order_relaxed);
+}
+
+bool WorldRuntime::TryTakeReplicationValidationResult(std::string& out_result)
+{
+    std::lock_guard lock(replication_validation_mutex_);
+    if (!replication_validation_ready_) {
+        return false;
+    }
+    out_result = std::move(replication_validation_result_);
+    replication_validation_result_.clear();
+    replication_validation_ready_ = false;
     return true;
 }
 

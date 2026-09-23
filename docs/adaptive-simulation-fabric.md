@@ -623,6 +623,7 @@ Az előző commitból javított Fast/Exact semanticsra **tesztet kell írni**:
 | **F** | §1, §21, §29 | `worldbench --mode loadfield`, validator-bővítés, regresszió a meglévő 7 módra, control-loop frekvenciák konfigurálhatóvá tétele | ⚠ **RÉSZLEGES**: `--mode partitionscore`/`--mode stability`/`--mode readiness` + selftestek kész, regresszió zöld; a control-loop frekvencia config még nyitott |
 | **G (Phase 4)** | §0–§28 | Integrált readiness benchmark 100 km / 500 player / 200k mob, stage-instrumentáció, A/B-k, bottleneck audit | ✅ **KÉSZ** (lásd §9) |
 | **H (Phase 5A)** | §9.7/1 | Inkrementális/dirty ghost karbantartás: dirty entity tracking, delta-publish, KEEP/ADD/REMOVE reconcile, egzakt equivalence validator + repair seam, `--mode ghost` + `--ghost-shadow` | ✅ **KÉSZ** (lásd §10) |
+| **I (Phase 5B)** | §9.7/2–4 | AOI prefilter (top-k cap, grid entity-handle), dirty/interest-aware replication (TransformVersion + per-recipient interest set + staggered refresh), exact/shadow interest + coverage validator, `--mode aoi`/`--mode replication`, A/B (`--repl-full`, `--aoi-full-sort`), readiness re-benchmark | ✅ **KÉSZ** (lásd §11) |
 
 ### Chunk A — elvégzett munka
 
@@ -1586,10 +1587,218 @@ A fázis közben talált és javított hibák:
   `--mode ghost` szcenárió: 0 failure, `max_copies=1`.
 - **Regresszió**: a 3 selftest + 7 bench mód + routing selftest zöld.
 
-### 10.5 Következő lépcső (Phase 5B javaslat)
+## 11. Phase 5B — AOI prefilter + dirty/interest-aware replication
 
-A Phase 4 rangsor 2–5. pontjai változatlanok és most **ezek a dominánsak**:
-AOI candidate-szűrés (dense p99), activity-field query O(players-in-box),
-combat fanout coalescing. A ghost oldalon opcionális továbbfejlesztés a
-`keep`-scan teljes elhagyása (per-source slot-lista), de a mért 16.2% mellett
-ez már nem kritikus.
+### 11.1 Audit (a HEAD állapota implementáció előtt)
+
+**Egy replication update útja** (`Zone.cpp:281-290` →
+`ReplicationSystem::BroadcastTransforms`):
+
+```text
+Zone::Tick (20 Hz, zónánként egy szál)
+  → ReplicationSystem::BroadcastTransforms
+      viewer-enként:
+        AoiSystem::BuildGhostCache      (zónánként 1x, sorted vector)
+        AoiSystem::QueryCandidates      (minden tickben, minden viewernek)
+          SpatialGrid::ForEachInRadius  (3x3 cella; cella = AOI r = 120 m)
+          exact distance filter         (dx*dx+dy*dy <= r^2)
+          FULL SORT (distance)          → cap 100
+        VisibilitySystem::ReconcileViewer
+          interest hash-set ÚJRAÉPÍTÉS  (minden tickben)
+          spawn diff  (visible_net_ids)
+          despawn diff
+          ALL visible snapshot másolása (vector by value)
+        EncodeTransformFrame            (1 + visible rekord, 19 B/rekord)
+        send(session, frame)            → SendToSession → asio post
+```
+
+**Válaszok az audit-kérdésekre**:
+
+1. **Record típusok**: transform frame (19 B: net u32, x/y/z f32, heading
+   u16, move_state u8), spawn (`MakeSpawn`, Cap'n Proto), despawn
+   (`MakeDespawn`), health update (`MakeHealthUpdate`), death (`MakeDeath`).
+   A transform frame minden tickben az ÖSSZES látható entitást tartalmazza.
+2. **Candidate population**: `SpatialGrid::ForEachInRadius` — 3×3 cella
+   (mivel `kSpatialCellSizeMeters == kAoiRadiusMeters == 120`), azaz a
+   prefilter már létezik és szuperszet; a pontos szűrés a távolság-check.
+3. **AOI query**: viewerenként, tickenként (20 Hz), a
+   `BroadcastTransforms`-ban.
+4. **Prefilter**: a grid-cellabejárás (superset) — nincs további.
+5. **Relevance filter**: `QueryCandidates` távolság-check; a Near/Mid/Far
+   tier csak diagnosztika.
+6. **Recipient lista**: viewerenként, tickenként újraszámolva; a
+   spawn/despawn a `viewer.visible_net_ids` (unordered_set) diffje.
+7. **Újraépítés gyakorisága**: minden tick (a teljes interest set
+   clear+insert).
+8. **Változatlan entitás generál-e recordot?** IGEN — a frame minden
+   látható entitást tartalmaz, függetlenül attól, hogy változott-e.
+9. **Változatlan recipient reláció újraszámolódik?** IGEN — a hash-set
+   újraépül minden tickben (a spawn-encoding cache csak a spawn
+   újraszerializálást spórolja).
+10. **Ghost path**: a ghost a zóna gridjében van; a candidate ghost
+    snapshotja a `ResolveVisibleSnapshot`-ból jön (ami jelenleg LINEÁRIS
+    ghost-scan — O(ghostszám) ghost-candidateenként).
+11. **Fanout**: viewerenként 1 frame (1 + visible rekord) + esemény
+    packetek. Dense: 500 viewer × ~101 rekord × 19 B ≈ 960 KB/tick ≈
+    19 MB/s.
+12. **Allokációk**: viewer-enként `QueryCandidates` visszatérési másolat,
+    `ReconcileViewer` snapshot-vector másolat (~100 × ~120 B/viewer/tick),
+    frame vector, spawn/despawn payloadok, snapshot/spawn cache entryk.
+13. **Hash/map**: `snapshot_cache`, `spawn_cache`, `visible_net_ids`
+    build+contains, `zone.FindEntity` candidate-onként,
+    `FindGhostPosition` bináris keresés, `ResolveVisibleSnapshot` lineáris
+    ghost-scan, `LoadBins().CellFor` viewer-enként.
+14. **Cross-thread handoff**: a replication maga zóna-szálon fut; a `send()`
+    asio post. Nincs megosztott mutable state a zónán kívül.
+15. **Dense p99 (~82 ms) maradék**: a viewerenkénti teljes sort
+    (n≈300-500), az interest hash-set újraépítés, a ~100 snapshot
+    másolás/viewer és a 19 B × ~100 × 500 fanout byte.
+
+**Optimalizációs irány (5B.1 + 5B.2)**:
+
+- 5B.1: top-k `partial_sort` a cap-hez (a teljes sort helyett); O(1)
+  ghost-lookup; az interest set verzió-térképként él tovább (nem épül újra
+  hash-settel); snapshot csak a tényleg szükséges entitásokra másolódik;
+  mérési counterek (pre/post-cap candidate, visible, enter/leave/keep).
+- 5B.2: world-global `TransformVersion` komponens (mozgás/heading/move_state
+  változás bumpolja), viewer-enkénti `(net → last_sent_version)`, spawn =
+  initial state + verzió-stamp, csak a dirty entitások mennek transform
+  rekordként, + staggered periodikus refresh; A/B kapcsolók (dirty OFF =
+  legacy full frame; partial-cap OFF = legacy full sort).
+- Correctness: exact interest-set validator (brute force vs production) és
+  coverage validator (minden látható (viewer, net) párnál
+  `last_sent >= current_version`), a Phase 5A quiescent audit ablakban.
+
+### 11.2 Implementáció — 5B.1 AOI prefilter
+
+- **Top-k cap**: `AoiSystem::QueryCandidates` a cap felett `partial_sort`-ot
+  használ (a teljes rendezés helyett); a szelektált halmaz bitre azonos a
+  teljes rendezésével (determinisztikus `(distance, NetId)` tie-break). A/B:
+  `--aoi-full-sort` (legacy full sort).
+- **Grid entity-handle**: a `SpatialGrid::GridEntry` a NetId mellett a
+  zóna-lokális `flecs::entity` handle-t is tárolja (Insert/Move viszi
+  tovább). Az AOI sugár-scan így nem fizet random `entities_` hash lookupot
+  kandidátusonként; csak a `Position` komponens-olvasás marad.
+- **Candidate handle**: az `AoiCandidate` a handle-t is hordozza, így a
+  visibility reconcile a `TransformVersion`-t hash lookup és ghost-scan
+  nélkül olvassa. A korábbi per-tick ghost position/version cache és a
+  lineáris `ResolveVisibleSnapshot` ghost-scan megszűnt
+  (`SnapshotBuilder` O(1) `FindGhost`).
+- **Mérés**: `aoi_candidates_pre_cap/post_cap`, `aoi_visible_final`,
+  `interest_enter/leave/keep`, `aoi_us` (a meglévő `aoi_micros`),
+  `repl_aoi_us`.
+
+### 11.3 Implementáció — 5B.2 dirty/interest-aware replication
+
+- **`TransformVersion` komponens** (world-global tick domain): a
+  `MovementSystem` bumpolja, ha a position/heading tényleg változott; a
+  `GhostSystem` a ghost snapshot változásakor; `EntityTransfer` viszi
+  migráció/split/merge alatt (a verzió domain közös, ezért a recipient
+  last-sent összehasonlítás migráció után is érvényes).
+- **Recipient interest set**: `PlayerBinding::visible_net_versions`
+  (`net → last_sent_version`); a kulcshalmaz az interest set, a binding
+  migrációval együtt mozog. Per-recipient lifecycle counterek
+  (`spawn_events`/`despawn_events`/`update_events`) a topológia-független
+  churn-méréshez.
+- **Reconcile**: ENTER → spawn (a teljes initial state; a spawn a jelenlegi
+  transformot is tartalmazza, ezért nincs dupla transform record); KEEP →
+  transform record csak ha `version > last_sent`; LEAVE → despawn. A
+  dirty flag nem törlődik korábban: a `last_sent` csak a payload `send()`
+  utáni átadása után frissül.
+- **Staggered refresh**: minden viewer `refresh_ticks` (default 20 = 1 s)
+  periódussal kap teljes transform refresh-t, NetId-fázissal szétterítve
+  (nincs refresh-vihar egy tickben). Dirty OFF = legacy (minden tickben
+  minden látható entitás).
+- **Mérés**: spawn/despawn/update/suppressed/refresh, records, fanout
+  relationships, frame/payload bytes, MB/s, suppression ratio, valamint
+  stage timing: `aoi_ms`, `reconcile_ms`, `encode_ms`, `send_ms`.
+- **Config/A-B**: `ReplicationConfig { dirty_enabled, aoi_partial_cap,
+  refresh_ticks }`; CLI: `--repl-full`, `--aoi-full-sort`.
+
+### 11.4 Correctness — exact/shadow validátorok
+
+`ReplicationValidator::ValidateReplicationShadow` a Phase 5A quiescent
+audit ablakban (ugyanaz a drain gate):
+
+1. **Interest equivalence**: viewerenként brute-force AOI a teljes
+   rezidens+ghost univerzumon (azonos távolság-teszt, rendezés, cap) vs a
+   produkciós interest set; missing/extra/duplikált NetId azonnali hiba.
+2. **Recipient coverage**: minden látható (viewer, net) párnál
+   `last_sent >= current_version` (a kliens a tick-határon nem tarthat
+   stale transformot); a látható entitásnak pontosan egy reprezentációja
+   van (resident XOR ghost), és van `TransformVersion`-je.
+3. Nincs csendes repair: mismatch → counter + log + bench failure
+   (`repairs = 0` elvárás).
+
+Selftestek: `--mode aoi` / `--mode replication` (közös rig, 36 check):
+inside/outside/pontos határ, cross-zone mob + player (ghost-backed),
+viewer self-exclusion, entitás be-/kilépés, spawn/despawn a hatókörben,
+clean → nincs update, változott transform → update, multi-recipient
+coverage, spawn+transform coalescing, transform+despawn, migráció azonos
+NetId (nincs spawn/despawn churn), split/merge visibility-stabilitás
+(nincs spawn/despawn churn), folyamatos shadow equivalence.
+
+### 11.5 Eredmények (500 player / 200k mob, warmup 60 s, measure 30 s)
+
+Ugyanaz a környezet mint Phase 5A: Windows, 16 logikai mag, 63.9 GB RAM,
+MSVC 19.51, RelWithDebInfo. A zónaszám futásonként változik (az ASF
+döntései a mért tick-terhelésre reagálnak), ezért a táblázat a mért
+zónaszámmal együtt értelmezendő.
+
+| scenario | zónák | tick avg | p99 | ghost % | repl % | suppression | AOI cap-reduction |
+|---|---|---|---|---|---|---|---|
+| spread | 200 | **1.06 ms** | 8.75 | 17.4% | 5.2% | 35.2% | 0% (nincs cap) |
+| quiet | 192 | **1.12 ms** | 7.36 | 14.4% | 5.2% | 34.5% | 0% |
+| hotspot | 80 | 7.41 ms | 87.7 | 11.0% | 37.8% | 28.5% | 32.4% |
+| dense | 72 | 4.28 ms | **86.1** | 7.2% | 62.2% | 17.4% | **59.1%** |
+| replication | 84 | 4.16 ms | 57.9 | 3.1% | 80.1% | 27.3% | **62.4%** |
+| border | 160 | 3.32 ms | 10.2 | 14.3% | 14.8% | 31.0% | 0% |
+| combat | 64 | 4.05 ms | **49.2** | 1.9% | 84.7% | **94.5%** | **76.0%** |
+
+**A/B — dirty replication ON vs OFF** (azonos workload):
+
+| scenario | metrika | dirty ON | dirty OFF (legacy) |
+|---|---|---|---|
+| quiet | tick avg / repl stage / records / frame bytes | **1.12 ms / 5.6 s / 782k / 34.9 MB** | 1.44 ms / 9.2 s / 988k / 40.3 MB |
+| dense | tick avg / p99 / records / frame bytes | 4.28 ms / 86.1 / **24.4M / 758 MB** | 4.24 ms / 88.5 / 27.6M / 888 MB |
+| spread | suppression | **35.2%** | 0% |
+
+- **Quiet**: a dirty path a tick átlagot **-22%**, a replication stage-et
+  **-39%**, a recordokat **-21%**, a frame byte-okat **-16%** csökkenti —
+  a "clean → nincs record" hatás egyértelmű.
+- **Dense**: a dirty path **-17% record / -15% frame byte** (sávszélesség),
+  a tick CPU gyakorlatilag neutrális: sűrű, folyamatosan mozgó tömegben a
+  látható entitások ~83%-a minden tickben dirty, így a suppression kicsi,
+  és a per-recipient verzió-követés költsége offseteli a kevesebb recordot.
+- **Combat**: 94.5% suppression (álló játékosok/mobok; csak a health
+  eventek mennek) — a legjobb eset.
+
+### 11.6 Bottleneck-tanulság és a dense target
+
+A Phase 5B fő célja a dense `p99 < 50 ms` volt (a Phase 5A baseline
+82.2 ms). **Ez nem teljesült**: a mért dense p99 ~86 ms (a zónaszámtól és
+futástól függően 86–105 ms), azaz a javulás a zajon belül van.
+
+- Az AOI oldal **valóban javult**: a cap-reduction 59–76%, a
+  `repl_aoi_us` a Phase 5A-beli szint ~-32–45%-a (a partial_sort +
+  grid-handle + candidate-handle hármas hatása).
+- A dense maradék költsége nem az AOI-scan, hanem a **teljes-állapotú
+  frame fanout** (24–28M record / 758 MB / 30 s a sűrű zónákban), a
+  per-recipient könyvelés és a sűrű zóna mob-szimuláció együttese. A
+  legnehezebb zóna tickje ~86 ms, mert ~250 viewer × ~100 látható
+  entitás × (verzió-check + snapshot + 19 B record + send) fut benne.
+- Következő lépcső (Phase 5C javaslat): a **frame-stratégia** (shared
+  immutable payload / csoportosítás azonos interest-setekre — §27–28),
+  a per-recipient könyvelés olcsóbbá tétele, illetve a sűrű zónák
+  viewer-számának korlátozása (érdeklődés-alapú rétegzés). Ezek külön
+  fázist érdemelnek; a jelen fázis a mérést és a biztonságos seam-eket
+  adta hozzá.
+
+### 11.7 Következő lépcső (Phase 5C javaslat)
+
+A Phase 4 rangsor 2–5. pontjai közül az AOI candidate-szűrés (5B.1) és a
+dirty replication (5B.2) elkészült. A mért domináns maradék a **dense frame
+fanout** és a sűrű zónák per-viewer költsége; ehhez jön az activity-field
+query O(players-in-box) és a combat fanout coalescing. A ghost oldalon
+opcionális továbbfejlesztés a `keep`-scan teljes elhagyása (per-source
+slot-lista), de a mért 16.2% mellett ez már nem kritikus.

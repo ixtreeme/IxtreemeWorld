@@ -180,6 +180,25 @@ struct ZoneStageTotals {
     WindowDelta ghost_full_fallbacks;
     WindowDelta ghost_candidates;
     WindowDelta ghost_spatial_queries;
+    // Phase 5B AOI + replication.
+    WindowDelta aoi_candidates_pre_cap;
+    WindowDelta aoi_candidates_post_cap;
+    WindowDelta aoi_visible_final;
+    WindowDelta interest_enter;
+    WindowDelta interest_leave;
+    WindowDelta interest_keep;
+    WindowDelta repl_spawn;
+    WindowDelta repl_despawn;
+    WindowDelta repl_update;
+    WindowDelta repl_suppressed;
+    WindowDelta repl_fanout_relationships;
+    WindowDelta repl_frame_bytes;
+    WindowDelta repl_payload_bytes;
+    WindowDelta repl_refresh;
+    WindowDelta repl_aoi_us;
+    WindowDelta repl_reconcile_us;
+    WindowDelta repl_encode_us;
+    WindowDelta repl_send_us;
 };
 
 struct GlobalCounters {
@@ -334,6 +353,14 @@ int RunReadinessBenchmark(boost::asio::io_context& io, const ReadinessConfig& co
         partition.scoring.oscillation_window_s = 10.0f;
     }
     sim.ConfigurePartition(partition);
+    {
+        // Phase 5B replication/AOI configuration: A/B switches are
+        // benchmark-only; defaults are the optimized production path.
+        gs::game::ReplicationConfig replication;
+        replication.dirty_enabled = !config.repl_full;
+        replication.aoi_partial_cap = !config.aoi_full_sort;
+        sim.ConfigureReplication(replication);
+    }
     if (config.ghost_shadow) {
         // Correctness run: a validator-detected inconsistency must stay
         // visible (no auto-repair) so the equivalence proof is honest.
@@ -648,6 +675,42 @@ int RunReadinessBenchmark(boost::asio::io_context& io, const ReadinessConfig& co
                             totals.ghost_candidates);
             AccumulateWindow(diag.ghost_spatial_queries_since_diag.load(std::memory_order_relaxed),
                             totals.ghost_spatial_queries);
+            AccumulateWindow(diag.aoi_candidates_pre_cap_since_diag.load(std::memory_order_relaxed),
+                            totals.aoi_candidates_pre_cap);
+            AccumulateWindow(diag.aoi_candidates_post_cap_since_diag.load(std::memory_order_relaxed),
+                            totals.aoi_candidates_post_cap);
+            AccumulateWindow(diag.aoi_visible_final_since_diag.load(std::memory_order_relaxed),
+                            totals.aoi_visible_final);
+            AccumulateWindow(diag.interest_enter_since_diag.load(std::memory_order_relaxed),
+                            totals.interest_enter);
+            AccumulateWindow(diag.interest_leave_since_diag.load(std::memory_order_relaxed),
+                            totals.interest_leave);
+            AccumulateWindow(diag.interest_keep_since_diag.load(std::memory_order_relaxed),
+                            totals.interest_keep);
+            AccumulateWindow(diag.repl_spawn_since_diag.load(std::memory_order_relaxed),
+                            totals.repl_spawn);
+            AccumulateWindow(diag.repl_despawn_since_diag.load(std::memory_order_relaxed),
+                            totals.repl_despawn);
+            AccumulateWindow(diag.repl_update_since_diag.load(std::memory_order_relaxed),
+                            totals.repl_update);
+            AccumulateWindow(diag.repl_suppressed_since_diag.load(std::memory_order_relaxed),
+                            totals.repl_suppressed);
+            AccumulateWindow(diag.repl_fanout_relationships_since_diag.load(std::memory_order_relaxed),
+                            totals.repl_fanout_relationships);
+            AccumulateWindow(diag.repl_frame_bytes_since_diag.load(std::memory_order_relaxed),
+                            totals.repl_frame_bytes);
+            AccumulateWindow(diag.repl_payload_bytes_since_diag.load(std::memory_order_relaxed),
+                            totals.repl_payload_bytes);
+            AccumulateWindow(diag.repl_refresh_since_diag.load(std::memory_order_relaxed),
+                            totals.repl_refresh);
+            AccumulateWindow(diag.repl_aoi_us_since_diag.load(std::memory_order_relaxed),
+                            totals.repl_aoi_us);
+            AccumulateWindow(diag.repl_reconcile_us_since_diag.load(std::memory_order_relaxed),
+                            totals.repl_reconcile_us);
+            AccumulateWindow(diag.repl_encode_us_since_diag.load(std::memory_order_relaxed),
+                            totals.repl_encode_us);
+            AccumulateWindow(diag.repl_send_us_since_diag.load(std::memory_order_relaxed),
+                            totals.repl_send_us);
         }
     };
 
@@ -790,15 +853,22 @@ int RunReadinessBenchmark(boost::asio::io_context& io, const ReadinessConfig& co
         }
     };
 
-    std::printf("READINESS measure: %ds ghost_shadow=%d\n",
+    std::printf("READINESS measure: %ds ghost_shadow=%d replication_shadow=%d "
+                "repl_full=%d aoi_full_sort=%d\n",
                 config.measure_seconds,
-                config.ghost_shadow ? 1 : 0);
+                config.ghost_shadow ? 1 : 0,
+                config.replication_shadow ? 1 : 0,
+                config.repl_full ? 1 : 0,
+                config.aoi_full_sort ? 1 : 0);
     const auto measure_start = Clock::now();
     const auto measure_end = measure_start + std::chrono::seconds(config.measure_seconds);
     auto next_sample = measure_start;
     auto next_ghost_shadow = measure_start;
+    auto next_replication_shadow = measure_start;
     std::uint64_t ghost_shadow_runs = 0;
     std::uint64_t ghost_shadow_failures = 0;
+    std::uint64_t replication_shadow_runs = 0;
+    std::uint64_t replication_shadow_failures = 0;
     const GlobalCounters counters_before = snapshot_globals();
     while (Clock::now() < measure_end) {
         const auto now = Clock::now();
@@ -819,6 +889,22 @@ int RunReadinessBenchmark(boost::asio::io_context& io, const ReadinessConfig& co
                     ++ghost_shadow_failures;
                     if (ghost_shadow_failures <= 3) {
                         std::printf("READINESS ghost-shadow FAIL: %s\n", result.c_str());
+                    }
+                }
+            }
+        }
+        if (config.replication_shadow) {
+            if (now >= next_replication_shadow) {
+                sim.RequestReplicationValidation();
+                next_replication_shadow = now + std::chrono::seconds(2);
+            }
+            std::string result;
+            if (sim.TryTakeReplicationValidationResult(result)) {
+                ++replication_shadow_runs;
+                if (result != "OK") {
+                    ++replication_shadow_failures;
+                    if (replication_shadow_failures <= 3) {
+                        std::printf("READINESS replication-shadow FAIL: %s\n", result.c_str());
                     }
                 }
             }
@@ -1147,6 +1233,80 @@ int RunReadinessBenchmark(boost::asio::io_context& io, const ReadinessConfig& co
                     (unsigned long long)ghost_stats.repairs);
         check("ghost-shadow-equivalence",
               ghost_shadow_failures == 0 && ghost_stats.failures == 0);
+    }
+
+    // ---- Phase 5B: AOI / replication / timing blocks (measured counters) --
+    const std::uint64_t aoi_pre_cap = total_of(&ZoneStageTotals::aoi_candidates_pre_cap);
+    const std::uint64_t aoi_post_cap = total_of(&ZoneStageTotals::aoi_candidates_post_cap);
+    const std::uint64_t aoi_visible = total_of(&ZoneStageTotals::aoi_visible_final);
+    const std::uint64_t interest_enter = total_of(&ZoneStageTotals::interest_enter);
+    const std::uint64_t interest_leave = total_of(&ZoneStageTotals::interest_leave);
+    const std::uint64_t interest_keep = total_of(&ZoneStageTotals::interest_keep);
+    const double aoi_reduction =
+        aoi_pre_cap > 0 ? 100.0 * (1.0 - static_cast<double>(aoi_post_cap) /
+                                             static_cast<double>(aoi_pre_cap))
+                        : 0.0;
+    std::printf("READINESS aoi: queries=%llu pre_cap=%llu post_cap=%llu visible=%llu "
+                "reduction=%.1f%% enter=%llu leave=%llu keep=%llu\n",
+                (unsigned long long)total_of(&ZoneStageTotals::aoi_queries),
+                (unsigned long long)aoi_pre_cap,
+                (unsigned long long)aoi_post_cap,
+                (unsigned long long)aoi_visible,
+                aoi_reduction,
+                (unsigned long long)interest_enter,
+                (unsigned long long)interest_leave,
+                (unsigned long long)interest_keep);
+
+    const std::uint64_t repl_spawn = total_of(&ZoneStageTotals::repl_spawn);
+    const std::uint64_t repl_despawn = total_of(&ZoneStageTotals::repl_despawn);
+    const std::uint64_t repl_update = total_of(&ZoneStageTotals::repl_update);
+    const std::uint64_t repl_suppressed = total_of(&ZoneStageTotals::repl_suppressed);
+    const std::uint64_t repl_records = total_of(&ZoneStageTotals::repl_records);
+    const std::uint64_t repl_fanout = total_of(&ZoneStageTotals::repl_fanout_relationships);
+    const std::uint64_t repl_frame_bytes = total_of(&ZoneStageTotals::repl_frame_bytes);
+    const std::uint64_t repl_payload_bytes = total_of(&ZoneStageTotals::repl_payload_bytes);
+    const std::uint64_t repl_refresh = total_of(&ZoneStageTotals::repl_refresh);
+    const std::uint64_t repl_potential = repl_update + repl_suppressed;
+    const double suppression_ratio =
+        repl_potential > 0 ? 100.0 * static_cast<double>(repl_suppressed) /
+                                 static_cast<double>(repl_potential)
+                           : 0.0;
+    std::printf("READINESS replication: spawn=%llu despawn=%llu update=%llu suppressed=%llu "
+                "suppression=%.1f%% refresh=%llu records=%llu fanout=%llu "
+                "frame_bytes=%llu payload_bytes=%llu MB/s=%.2f\n",
+                (unsigned long long)repl_spawn,
+                (unsigned long long)repl_despawn,
+                (unsigned long long)repl_update,
+                (unsigned long long)repl_suppressed,
+                suppression_ratio,
+                (unsigned long long)repl_refresh,
+                (unsigned long long)repl_records,
+                (unsigned long long)repl_fanout,
+                (unsigned long long)repl_frame_bytes,
+                (unsigned long long)repl_payload_bytes,
+                static_cast<double>(repl_frame_bytes + repl_payload_bytes) /
+                    (1024.0 * 1024.0) / std::max(0.001, measure_actual_s));
+    const std::uint64_t repl_aoi_us = total_of(&ZoneStageTotals::repl_aoi_us);
+    const std::uint64_t repl_reconcile_us = total_of(&ZoneStageTotals::repl_reconcile_us);
+    const std::uint64_t repl_encode_us = total_of(&ZoneStageTotals::repl_encode_us);
+    const std::uint64_t repl_send_us = total_of(&ZoneStageTotals::repl_send_us);
+    std::printf("READINESS replication_timing: aoi_ms=%.1f reconcile_ms=%.1f encode_ms=%.1f "
+                "send_ms=%.1f total_stage_ms=%.1f\n",
+                static_cast<double>(repl_aoi_us) / 1000.0,
+                static_cast<double>(repl_reconcile_us) / 1000.0,
+                static_cast<double>(repl_encode_us) / 1000.0,
+                static_cast<double>(repl_send_us) / 1000.0,
+                static_cast<double>(stage_replication) / 1000.0);
+    if (config.replication_shadow) {
+        const auto repl_stats = sim.ReplicationValidationSnapshot();
+        std::printf("READINESS replication_shadow: polls=%llu poll_failures=%llu "
+                    "validator_runs=%llu validator_failures=%llu\n",
+                    (unsigned long long)replication_shadow_runs,
+                    (unsigned long long)replication_shadow_failures,
+                    (unsigned long long)repl_stats.runs,
+                    (unsigned long long)repl_stats.failures);
+        check("replication-shadow-equivalence",
+              replication_shadow_failures == 0 && repl_stats.failures == 0);
     }
 
     const auto activity_metrics = sim.ActivityMetrics();

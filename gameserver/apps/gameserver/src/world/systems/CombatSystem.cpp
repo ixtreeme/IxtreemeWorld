@@ -103,7 +103,7 @@ CombatSystem::AttackResult CombatSystem::ProcessAttack(Zone& zone,
     const auto health_payload = MakeHealthUpdate(target_net_id, target_hp);
     for (const auto& [viewer_net_id, viewer] : zone.Players()) {
         if (viewer.session &&
-            (viewer_net_id == target_net_id || viewer.visible_net_ids.contains(target_net_id))) {
+            (viewer_net_id == target_net_id || viewer.IsVisible(target_net_id))) {
             ctx.send(viewer.session, health_payload);
         }
     }
@@ -125,12 +125,12 @@ CombatSystem::AttackResult CombatSystem::ProcessAttack(Zone& zone,
     const auto despawn_payload = MakeDespawn(target_net_id);
     for (auto& [viewer_net_id, viewer] : zone.Players()) {
         (void)viewer_net_id;
-        if (!viewer.session || !viewer.visible_net_ids.contains(target_net_id)) {
+        if (!viewer.session || !viewer.IsVisible(target_net_id)) {
             continue;
         }
         ctx.send(viewer.session, death_payload);
         ctx.send(viewer.session, despawn_payload);
-        viewer.visible_net_ids.erase(target_net_id);
+        viewer.EraseVisible(target_net_id);
     }
 
     const std::uint32_t mob_type_id = target_entity.get<MobTypeRef>().id;

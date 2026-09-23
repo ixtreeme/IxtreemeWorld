@@ -20,27 +20,8 @@ namespace {
 // Scratch buffers reused across queries on the same worker thread: the pool
 // threads are long-lived, so thread_locals eliminate per-viewer heap churn
 // without any locking. Zone-local work never migrates threads mid-tick.
-thread_local std::vector<std::pair<float, std::uint32_t>> t_candidates;
-thread_local std::vector<std::uint32_t> t_results;
-
-const Position* FindGhostPosition(const GhostPositionCache& ghosts, std::uint32_t net_id)
-{
-    // Ghost sets are small (border-band residents of neighbors); a sorted
-    // vector with binary search beats a per-query hash map build.
-    std::size_t lo = 0;
-    std::size_t hi = ghosts.size();
-    while (lo < hi) {
-        const std::size_t mid = lo + (hi - lo) / 2;
-        if (ghosts[mid].first < net_id) {
-            lo = mid + 1;
-        } else if (ghosts[mid].first > net_id) {
-            hi = mid;
-        } else {
-            return &ghosts[mid].second;
-        }
-    }
-    return nullptr;
-}
+thread_local std::vector<AoiCandidate> t_candidates;
+thread_local std::vector<AoiCandidate> t_results;
 
 } // namespace
 
@@ -59,34 +40,21 @@ void AoiSystem::RebuildInto(Zone& zone, SpatialGrid& grid)
         ghost_nets.insert(ghost.snapshot.net_id);
     }
     zone.World().query<const NetId, const Position>().each(
-        [&](const NetId& id, const Position& pos) {
+        [&](flecs::entity entity, const NetId& id, const Position& pos) {
             if (ghost_nets.contains(id.value)) {
                 return;
             }
-            grid.Insert(id.value, pos);
+            grid.Insert(id.value, pos, entity);
         });
     for (const auto& ghost : zone.Ghosts()) {
-        grid.Insert(ghost.snapshot.net_id, ghost.snapshot.position);
+        grid.Insert(ghost.snapshot.net_id, ghost.snapshot.position, ghost.entity);
     }
 }
 
-GhostPositionCache AoiSystem::BuildGhostCache(const Zone& zone)
-{
-    GhostPositionCache cache;
-    cache.reserve(zone.Ghosts().size());
-    for (const auto& ghost : zone.Ghosts()) {
-        cache.emplace_back(ghost.snapshot.net_id, ghost.snapshot.position);
-    }
-    std::sort(cache.begin(), cache.end(), [](const auto& lhs, const auto& rhs) {
-        return lhs.first < rhs.first;
-    });
-    return cache;
-}
-
-std::vector<std::uint32_t> AoiSystem::QueryCandidates(Zone& zone,
-                                                      std::uint32_t viewer_net_id,
-                                                      const Position& viewer_position,
-                                                      const GhostPositionCache& ghosts)
+const std::vector<AoiCandidate>& AoiSystem::QueryCandidates(Zone& zone,
+                                                            std::uint32_t viewer_net_id,
+                                                            const Position& viewer_position,
+                                                            bool partial_cap)
 {
     AssertZoneOwner(zone, "zone AOI query");
     const auto aoi_start = std::chrono::steady_clock::now();
@@ -94,31 +62,33 @@ std::vector<std::uint32_t> AoiSystem::QueryCandidates(Zone& zone,
     auto& candidates = t_candidates;
     candidates.clear();
 
-    zone.Grid().ForEachInRadius(viewer_position, kAoiRadiusMeters, [&](std::uint32_t net_id) {
+    // PREFILTER: the grid cell scan is a strict superset of the AOI disc
+    // (cell size == AOI radius, 3x3 neighborhood). EXACT FILTER: the squared
+    // distance check below -- only a candidate that passes is ever visible,
+    // so the prefilter can never cause a false negative.
+    zone.Grid().ForEachInRadius(viewer_position, kAoiRadiusMeters, [&](const GridEntry& entry) {
+        const std::uint32_t net_id = entry.net_id;
         if (net_id == 0 || net_id == viewer_net_id) {
             return;
         }
 
-        const Position* candidate_position = nullptr;
-        Position resident_position;
-        const auto entity = zone.FindEntity(net_id);
-        if (entity.is_valid()) {
-            resident_position = entity.get<Position>();
-            candidate_position = &resident_position;
-        } else {
-            candidate_position = FindGhostPosition(ghosts, net_id);
-        }
-        if (candidate_position == nullptr) {
+        // The grid entry carries the zone-local entity handle, so the radius
+        // scan never pays a random hash lookup per candidate: only the
+        // position component read remains. Ghost entities carry their
+        // reconciled Position the same way.
+        if (!entry.entity.is_valid() || !entry.entity.has<Position>()) {
             return;
         }
-
-        const float dx = candidate_position->x - viewer_position.x;
-        const float dy = candidate_position->y - viewer_position.y;
+        const auto position = entry.entity.get<Position>();
+        const float dx = position.x - viewer_position.x;
+        const float dy = position.y - viewer_position.y;
         const float distance_sq = dx * dx + dy * dy;
         if (distance_sq <= kAoiRadiusSqMeters) {
-            candidates.emplace_back(distance_sq, net_id);
+            candidates.push_back(AoiCandidate{distance_sq, net_id, entry.entity});
         }
     });
+
+    const std::size_t pre_cap = candidates.size();
 
     // Load field attribution: the AOI cost of this viewer is one query plus
     // every candidate considered BEFORE the cap -- so a dense hotspot reads
@@ -126,17 +96,34 @@ std::vector<std::uint32_t> AoiSystem::QueryCandidates(Zone& zone,
     // stays visible instead of hiding work (§10).
     if (auto* load = zone.LoadBins().CellFor(viewer_position.x, viewer_position.y)) {
         ++load->aoi_queries;
-        const std::size_t pre_cap = candidates.size();
         load->aoi_candidates += static_cast<std::uint32_t>(
             pre_cap > 0xFFFFFFFFu ? 0xFFFFFFFFu : pre_cap);
     }
+    auto& diag = zone.Diagnostics();
+    diag.aoi_candidates_pre_cap_since_diag.fetch_add(pre_cap, std::memory_order_relaxed);
 
-    std::sort(candidates.begin(), candidates.end(), [](const auto& lhs, const auto& rhs) {
-        return lhs.first < rhs.first;
-    });
-    if (candidates.size() > kAoiEntityCap) {
+    // Deterministic order: nearest first, NetId tie-break. Both the top-k
+    // reduction and the full sort select exactly the same capped set.
+    const auto by_distance = [](const AoiCandidate& lhs, const AoiCandidate& rhs) {
+        if (lhs.distance_sq != rhs.distance_sq) {
+            return lhs.distance_sq < rhs.distance_sq;
+        }
+        return lhs.net_id < rhs.net_id;
+    };
+    if (candidates.size() > kAoiEntityCap && partial_cap) {
+        std::partial_sort(candidates.begin(),
+                          candidates.begin() + static_cast<std::ptrdiff_t>(kAoiEntityCap),
+                          candidates.end(),
+                          by_distance);
         candidates.resize(kAoiEntityCap);
+    } else {
+        std::sort(candidates.begin(), candidates.end(), by_distance);
+        if (candidates.size() > kAoiEntityCap) {
+            candidates.resize(kAoiEntityCap);
+        }
     }
+    diag.aoi_candidates_post_cap_since_diag.fetch_add(candidates.size(),
+                                                      std::memory_order_relaxed);
 
     std::uint64_t tier_near = 0;
     std::uint64_t tier_mid = 0;
@@ -145,8 +132,8 @@ std::vector<std::uint32_t> AoiSystem::QueryCandidates(Zone& zone,
     refs.clear();
     refs.reserve(candidates.size());
     for (const auto& candidate : candidates) {
-        refs.push_back(candidate.second);
-        switch (RelevanceTierForDistanceSq(candidate.first)) {
+        refs.push_back(candidate);
+        switch (RelevanceTierForDistanceSq(candidate.distance_sq)) {
         case RelevanceTier::Near:
             ++tier_near;
             break;
@@ -158,10 +145,10 @@ std::vector<std::uint32_t> AoiSystem::QueryCandidates(Zone& zone,
             break;
         }
     }
-    zone.Diagnostics().tier_near_since_diag.fetch_add(tier_near, std::memory_order_relaxed);
-    zone.Diagnostics().tier_mid_since_diag.fetch_add(tier_mid, std::memory_order_relaxed);
-    zone.Diagnostics().tier_far_since_diag.fetch_add(tier_far, std::memory_order_relaxed);
-    zone.Diagnostics().aoi_micros_since_diag.fetch_add(
+    diag.tier_near_since_diag.fetch_add(tier_near, std::memory_order_relaxed);
+    diag.tier_mid_since_diag.fetch_add(tier_mid, std::memory_order_relaxed);
+    diag.tier_far_since_diag.fetch_add(tier_far, std::memory_order_relaxed);
+    diag.aoi_micros_since_diag.fetch_add(
         static_cast<std::uint64_t>(
             std::chrono::duration_cast<std::chrono::microseconds>(
                 std::chrono::steady_clock::now() - aoi_start)

@@ -72,6 +72,10 @@ struct EntityTransfer {
     // tier, schedule or relevance history. Players never carry it (implicit
     // Full); ghosts are never transferred.
     SimulationLod sim_lod;
+    // Phase 5B: the world-global transform version rides along so a migration
+    // never invalidates the recipients' last-sent comparison (the same NetId
+    // stays caught up instead of getting a spurious update/despawn).
+    std::uint32_t transform_version = 0;
 };
 
 // NOTE on persistence (§41): this is a RUNTIME handoff DTO, not a save

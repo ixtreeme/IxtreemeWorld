@@ -35,6 +35,7 @@ set(GAMESERVER_WORLD_SOURCES
     src/world/visibility/GhostSystem.cpp
     src/world/visibility/GhostValidator.cpp
     src/world/visibility/VisibilitySystem.cpp
+    src/world/replication/ReplicationValidator.cpp
     src/world/migration/EntityTransfer.cpp
     src/world/migration/MigrationCoordinator.cpp
     src/world/migration/MigrationSystem.cpp

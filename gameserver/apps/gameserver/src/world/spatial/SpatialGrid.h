@@ -29,7 +29,7 @@ public:
     bool Empty() const noexcept;
     std::size_t Size() const noexcept;
 
-    void Insert(std::uint32_t net_id, const Position& position);
+    void Insert(std::uint32_t net_id, const Position& position, flecs::entity entity);
     void Remove(std::uint32_t net_id, const Position& position);
 
     // Moves the entry if the cells differ, inserts if it was missing
@@ -41,8 +41,8 @@ public:
     // Debug/test support: every (net, cell) pair currently indexed.
     std::vector<std::pair<std::uint32_t, std::int64_t>> SnapshotEntries() const;
 
-    // Calls visitor(net_id) for every entry in cells overlapping the
-    // radius-disc around center. Distance filtering is the caller's job.
+    // Calls visitor(const GridEntry&) for every entry in cells overlapping
+    // the radius-disc around center. Distance filtering is the caller's job.
     template <typename Visitor>
     void ForEachInRadius(const Position& center, float radius, Visitor&& visitor) const
     {
@@ -58,7 +58,7 @@ public:
                     continue;
                 }
                 for (const auto& entry : cell_it->second) {
-                    visitor(entry.net_id);
+                    visitor(entry);
                 }
             }
         }

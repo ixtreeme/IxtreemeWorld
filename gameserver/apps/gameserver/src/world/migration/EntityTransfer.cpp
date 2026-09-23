@@ -2,6 +2,7 @@
 
 #include <cassert>
 
+#include "../components/ReplicationComponents.h"
 #include "../components/Tags.h"
 
 namespace gs::game {
@@ -20,6 +21,9 @@ EntityTransfer BuildTransfer(flecs::entity entity, bool is_player, std::uint16_t
     transfer.hp = entity.get<Hp>();
     transfer.combat_stats = entity.get<CombatStats>();
     transfer.attack_cooldown = entity.get<AttackCooldown>();
+    if (entity.has<TransformVersion>()) {
+        transfer.transform_version = entity.get<TransformVersion>().tick;
+    }
     if (is_player) {
         transfer.session = entity.get<SessionRef>().session;
     } else {
@@ -56,7 +60,10 @@ flecs::entity ApplyTransfer(flecs::world& world, const EntityTransfer& transfer)
                       .set<CombatStats>(transfer.combat_stats)
                       .set<AttackCooldown>(transfer.attack_cooldown)
                       .set<NetId>({transfer.net_id})
-                      .set<MigrateTo>({0});
+                      .set<MigrateTo>({0})
+                      // Phase 5B: the transform version survives the transfer
+                      // so existing recipients stay exactly caught up.
+                      .set<TransformVersion>({transfer.transform_version});
     if (transfer.is_player) {
         entity.set<SessionRef>({transfer.session}).add<PlayerTag>();
     } else {
