@@ -464,7 +464,10 @@ void WorldRuntime::Run()
                 std::size_t viewers_checked = 0;
                 std::size_t relationships_checked = 0;
                 std::size_t records_checked = 0;
-                const bool ok = ValidateReplicationShadow(zones_, error, &viewers_checked,
+                const bool ok = ValidateReplicationShadow(zones_,
+                                                          effective_replication_config_,
+                                                          error,
+                                                          &viewers_checked,
                                                           &relationships_checked,
                                                           &records_checked);
                 replication_validation_runs_.fetch_add(1, std::memory_order_relaxed);
@@ -644,6 +647,45 @@ void WorldRuntime::Run()
                     zone.Diagnostics().ghost_candidates_examined_since_diag.exchange(0);
                 total_ghost_spatial_queries +=
                     zone.Diagnostics().ghost_spatial_queries_since_diag.exchange(0);
+                // Phase 5B/5C/5D counters: exchanged here so the readiness
+                // window accumulation never mixes SETUP/WARMUP into the
+                // measure totals (they are read by the bench, not printed in
+                // the supervisor log).
+                zone.Diagnostics().aoi_candidates_pre_cap_since_diag.exchange(0);
+                zone.Diagnostics().aoi_candidates_post_cap_since_diag.exchange(0);
+                zone.Diagnostics().aoi_visible_final_since_diag.exchange(0);
+                zone.Diagnostics().interest_enter_since_diag.exchange(0);
+                zone.Diagnostics().interest_leave_since_diag.exchange(0);
+                zone.Diagnostics().interest_keep_since_diag.exchange(0);
+                zone.Diagnostics().aoi_cells_visited_since_diag.exchange(0);
+                zone.Diagnostics().aoi_entries_visited_since_diag.exchange(0);
+                zone.Diagnostics().aoi_exact_checks_since_diag.exchange(0);
+                zone.Diagnostics().aoi_index_us_since_diag.exchange(0);
+                zone.Diagnostics().aoi_topk_us_since_diag.exchange(0);
+                zone.Diagnostics().grid_inserts_since_diag.exchange(0);
+                zone.Diagnostics().grid_removes_since_diag.exchange(0);
+                zone.Diagnostics().grid_moves_in_cell_since_diag.exchange(0);
+                zone.Diagnostics().grid_moves_cell_since_diag.exchange(0);
+                zone.Diagnostics().repl_spawn_since_diag.exchange(0);
+                zone.Diagnostics().repl_despawn_since_diag.exchange(0);
+                zone.Diagnostics().repl_update_since_diag.exchange(0);
+                zone.Diagnostics().repl_suppressed_since_diag.exchange(0);
+                zone.Diagnostics().repl_records_since_diag.exchange(0);
+                zone.Diagnostics().repl_fanout_relationships_since_diag.exchange(0);
+                zone.Diagnostics().repl_frame_bytes_since_diag.exchange(0);
+                zone.Diagnostics().repl_payload_bytes_since_diag.exchange(0);
+                zone.Diagnostics().repl_refresh_since_diag.exchange(0);
+                zone.Diagnostics().repl_aoi_us_since_diag.exchange(0);
+                zone.Diagnostics().repl_reconcile_us_since_diag.exchange(0);
+                zone.Diagnostics().repl_encode_us_since_diag.exchange(0);
+                zone.Diagnostics().repl_send_us_since_diag.exchange(0);
+                zone.Diagnostics().repl_record_requests_since_diag.exchange(0);
+                zone.Diagnostics().repl_record_serializations_since_diag.exchange(0);
+                zone.Diagnostics().repl_despawn_cache_hits_since_diag.exchange(0);
+                zone.Diagnostics().repl_despawn_cache_misses_since_diag.exchange(0);
+                zone.Diagnostics().repl_bytes_generated_since_diag.exchange(0);
+                zone.Diagnostics().repl_bytes_copied_since_diag.exchange(0);
+                zone.Diagnostics().repl_wire_bytes_since_diag.exchange(0);
                 total_lod_ai += zone.Diagnostics().lod_ai_updates_since_diag.exchange(0);
                 total_lod_mv += zone.Diagnostics().lod_move_updates_since_diag.exchange(0);
                 total_lod_prom += zone.Diagnostics().lod_promotions_since_diag.exchange(0);

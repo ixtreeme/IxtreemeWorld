@@ -162,7 +162,7 @@ void MovementSystem::Step(Zone& zone, float dt, ZoneTickContext& ctx)
         entity.set<Heading>(heading);
         entity.set<Velocity>(velocity);
         entity.set<MoveIntent>(intent);
-        zone.Grid().Move(net.value, old_cell, position);
+        zone.Grid().Move(entity, net.value, old_cell, position);
         MigrationSystem::UpdateMarker(zone, ctx.zones, ctx.migration_queue, net.value, entity, position);
     }
 
@@ -268,7 +268,7 @@ void MovementSystem::Step(Zone& zone, float dt, ZoneTickContext& ctx)
             ++load->sim_work;
         }
         ++integrated;
-        zone.Grid().Move(net.value, old_cell, position);
+        zone.Grid().Move(entity, net.value, old_cell, position);
         MigrationSystem::UpdateMarker(zone, ctx.zones, ctx.migration_queue, net.value, entity, position);
     }
     zone.Diagnostics().transform_dirty_since_diag.fetch_add(moved_entities, std::memory_order_relaxed);

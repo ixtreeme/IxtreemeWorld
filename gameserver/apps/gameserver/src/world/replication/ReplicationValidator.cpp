@@ -11,9 +11,11 @@
 #include "../components/ReplicationComponents.h"
 #include "../components/Tags.h"
 #include "../components/TransformComponents.h"
+#include "../spatial/AoiSystem.h"
 #include "../zone/Zone.h"
 #include "../zone/ZoneManager.h"
 #include "ProtocolEncoder.h"
+#include "ReplicationConfig.h"
 
 namespace gs::game {
 namespace {
@@ -55,6 +57,7 @@ std::uint32_t TransformVersionOf(Zone& zone, std::uint32_t net_id, bool* out_has
 } // namespace
 
 bool ValidateReplicationShadow(ZoneManager& zones,
+                               const ReplicationConfig& config,
                                std::string& out_error,
                                std::size_t* out_viewers_checked,
                                std::size_t* out_relationships_checked,
@@ -133,6 +136,41 @@ bool ValidateReplicationShadow(ZoneManager& zones,
                 expected.insert(candidate.net_id);
             }
 
+            // (5) Ordered AOI equivalence: run the production index query for
+            // this exact viewer and compare the ordered top-k with the
+            // brute-force reference element by element. Metrics are disabled
+            // so the audit cannot pollute what it validates.
+            {
+                const auto& actual = AoiSystem::QueryCandidates(zone,
+                                                                viewer_net_id,
+                                                                viewer_position,
+                                                                config.aoi_partial_cap,
+                                                                false,
+                                                                config.aoi_nth_element,
+                                                                false);
+                if (actual.size() != candidates.size()) {
+                    std::ostringstream message;
+                    message << "zone " << zone.Id() << " viewer " << viewer_net_id
+                            << ": AOI candidate count " << actual.size()
+                            << " != exact top-k " << candidates.size();
+                    out_error = message.str();
+                    return false;
+                }
+                for (std::size_t ci = 0; ci < actual.size(); ++ci) {
+                    if (actual[ci].net_id != candidates[ci].net_id ||
+                        actual[ci].distance_sq != candidates[ci].distance_sq) {
+                        std::ostringstream message;
+                        message << "zone " << zone.Id() << " viewer " << viewer_net_id
+                                << ": AOI candidate " << ci << " mismatch (index net "
+                                << actual[ci].net_id << " d2=" << actual[ci].distance_sq
+                                << ", exact net " << candidates[ci].net_id
+                                << " d2=" << candidates[ci].distance_sq << ")";
+                        out_error = message.str();
+                        return false;
+                    }
+                }
+            }
+
             // (1) identity + coverage for everything the viewer knows.
             for (const auto& [net_id, last_sent] : binding.visible_net_versions) {
                 ++relationships_checked;
@@ -192,8 +230,27 @@ bool ValidateReplicationShadow(ZoneManager& zones,
                 if (binding.visible_net_versions.find(net_id) ==
                     binding.visible_net_versions.end()) {
                     std::ostringstream message;
+                    const auto missing_entity = zone.FindEntity(net_id);
+                    float stored_x = 0.0f;
+                    float stored_y = 0.0f;
+                    float stored_z = 0.0f;
+                    const bool stored = zone.Grid().DebugStoredPosition(net_id, stored_x,
+                                                                        stored_y, stored_z);
                     message << "zone " << zone.Id() << " viewer " << viewer_net_id
-                            << ": missing interest net " << net_id << " (exact AOI includes it)";
+                            << ": missing interest net " << net_id << " (exact AOI includes it)"
+                            << " viewer=(" << viewer_position.x << ", " << viewer_position.y
+                            << ") grid_stored=";
+                    if (stored) {
+                        message << "(" << stored_x << ", " << stored_y << ", " << stored_z << ")";
+                    } else {
+                        message << "absent";
+                    }
+                    if (missing_entity.is_valid() && missing_entity.has<Position>()) {
+                        const auto pos = missing_entity.get<Position>();
+                        message << " authority=(" << pos.x << ", " << pos.y << ", " << pos.z << ")";
+                    } else {
+                        message << " authority=missing";
+                    }
                     out_error = message.str();
                     return false;
                 }

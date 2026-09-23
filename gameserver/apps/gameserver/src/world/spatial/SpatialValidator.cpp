@@ -3,6 +3,7 @@
 #include <sstream>
 #include <unordered_set>
 
+#include "../components/GridSlot.h"
 #include "../components/MobComponents.h"
 #include "../components/NetworkComponents.h"
 #include "../components/Tags.h"
@@ -73,6 +74,69 @@ bool ValidateSpatialIndex(Zone& zone, const SpatialGrid& grid, std::string& out_
         message << "zone " << zone.Id() << ": spatial index holds " << actual << " entries, expected "
                 << expected << " (stale entries present)";
         out_error = message.str();
+        return false;
+    }
+
+    // Phase 5D index audit: every entry's stored position (the value the AOI
+    // radius scan reads) must equal the authoritative position, and the
+    // entity's GridSlot must resolve back to this exact cell/slot. A stale
+    // stored position is a silent AOI false negative, so it is a hard fail.
+    bool entries_ok = true;
+    grid.ForEachEntry([&](const GridEntry& entry, std::int64_t cell_key, std::size_t slot_index) {
+        if (!entries_ok) {
+            return;
+        }
+        const auto entity = zone.FindEntity(entry.net_id);
+        if (entity.is_valid() && entity.has<Position>()) {
+            const auto pos = entity.get<Position>();
+            if (pos.x != entry.x || pos.y != entry.y || pos.z != entry.z) {
+                std::ostringstream message;
+                message << "zone " << zone.Id() << ": grid entry net " << entry.net_id
+                        << " stored position (" << entry.x << ", " << entry.y << ", " << entry.z
+                        << ") != authority (" << pos.x << ", " << pos.y << ", " << pos.z << ")";
+                out_error = message.str();
+                entries_ok = false;
+                return;
+            }
+        } else if (const GhostRecord* ghost = zone.FindGhost(entry.net_id)) {
+            if (ghost->snapshot.position.x != entry.x || ghost->snapshot.position.y != entry.y ||
+                ghost->snapshot.position.z != entry.z) {
+                std::ostringstream message;
+                message << "zone " << zone.Id() << ": grid entry ghost net " << entry.net_id
+                        << " stored position does not match the ghost snapshot";
+                out_error = message.str();
+                entries_ok = false;
+                return;
+            }
+        } else {
+            std::ostringstream message;
+            message << "zone " << zone.Id() << ": grid entry net " << entry.net_id
+                    << " has no resident or ghost (stale index entry)";
+            out_error = message.str();
+            entries_ok = false;
+            return;
+        }
+        const auto* slot = entity.is_valid() ? entity.try_get<GridSlot>() : nullptr;
+        if (slot == nullptr) {
+            if (entity.is_valid()) {
+                std::ostringstream message;
+                message << "zone " << zone.Id() << ": grid entry net " << entry.net_id
+                        << " has no GridSlot bookkeeping";
+                out_error = message.str();
+                entries_ok = false;
+            }
+            return;
+        }
+        if (slot->cell_key != cell_key || slot->index != slot_index) {
+            std::ostringstream message;
+            message << "zone " << zone.Id() << ": net " << entry.net_id
+                    << " GridSlot mismatch (slot cell=" << slot->cell_key << " index=" << slot->index
+                    << ", entry cell=" << cell_key << " index=" << slot_index << ")";
+            out_error = message.str();
+            entries_ok = false;
+        }
+    });
+    if (!entries_ok) {
         return false;
     }
     return true;

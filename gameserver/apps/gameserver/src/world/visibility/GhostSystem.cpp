@@ -152,11 +152,16 @@ void GhostSystem::Reconcile(Zone& zone, ZoneManager& zones)
         const auto existing = zone.GhostIndex().find(snapshot.net_id);
         if (existing != zone.GhostIndex().end()) {
             auto& record = zone.Ghosts()[existing->second];
-            if (!SameSpatialCell(record.snapshot.position, snapshot.position)) {
-                const std::int64_t old_cell =
-                    SpatialCellKey(SpatialCellCoord(record.snapshot.position.x),
-                                   SpatialCellCoord(record.snapshot.position.y));
-                zone.Grid().Move(snapshot.net_id, old_cell, snapshot.position);
+            // Phase 5D: the grid entry stores the position the AOI scans, so
+            // every ghost position change must reach it -- not only the cell
+            // changes (Move is O(1) for the in-cell case).
+            const std::int64_t old_cell =
+                SpatialCellKey(SpatialCellCoord(record.snapshot.position.x),
+                               SpatialCellCoord(record.snapshot.position.y));
+            const bool cell_changed =
+                !SameSpatialCell(record.snapshot.position, snapshot.position);
+            zone.Grid().Move(record.entity, snapshot.net_id, old_cell, snapshot.position);
+            if (cell_changed) {
                 diag.ghost_spatial_queries_since_diag.fetch_add(1, std::memory_order_relaxed);
                 ++updated;
             }
@@ -271,11 +276,15 @@ void GhostSystem::Reconcile(Zone& zone, ZoneManager& zones)
                 }
                 if (other_source != 0) {
                     auto& record = zone.Ghosts()[existing->second];
-                    if (!SameSpatialCell(record.snapshot.position, other_snapshot.position)) {
-                        const std::int64_t old_cell =
-                            SpatialCellKey(SpatialCellCoord(record.snapshot.position.x),
-                                           SpatialCellCoord(record.snapshot.position.y));
-                        zone.Grid().Move(net, old_cell, other_snapshot.position);
+                    // Always sync the grid's stored position (phase 5D); the
+                    // cell-change flag only drives the accounting.
+                    const std::int64_t old_cell =
+                        SpatialCellKey(SpatialCellCoord(record.snapshot.position.x),
+                                       SpatialCellCoord(record.snapshot.position.y));
+                    const bool cell_changed =
+                        !SameSpatialCell(record.snapshot.position, other_snapshot.position);
+                    zone.Grid().Move(record.entity, net, old_cell, other_snapshot.position);
+                    if (cell_changed) {
                         diag.ghost_spatial_queries_since_diag.fetch_add(
                             1, std::memory_order_relaxed);
                         ++updated;
@@ -358,14 +367,20 @@ void GhostSystem::Reconcile(Zone& zone, ZoneManager& zones)
                 if (!found) {
                     continue;
                 }
-                if (!SameSpatialCell(ghost.snapshot.position, other_snapshot.position)) {
+                {
+                    // Always sync the grid's stored position (phase 5D).
                     const std::int64_t old_cell =
                         SpatialCellKey(SpatialCellCoord(ghost.snapshot.position.x),
                                        SpatialCellCoord(ghost.snapshot.position.y));
-                    zone.Grid().Move(ghost.snapshot.net_id, old_cell, other_snapshot.position);
-                    diag.ghost_spatial_queries_since_diag.fetch_add(1,
-                                                                    std::memory_order_relaxed);
-                    ++updated;
+                    const bool cell_changed =
+                        !SameSpatialCell(ghost.snapshot.position, other_snapshot.position);
+                    zone.Grid().Move(ghost.entity, ghost.snapshot.net_id, old_cell,
+                                     other_snapshot.position);
+                    if (cell_changed) {
+                        diag.ghost_spatial_queries_since_diag.fetch_add(
+                            1, std::memory_order_relaxed);
+                        ++updated;
+                    }
                 }
                 const bool transform_changed =
                     ghost.snapshot.position.x != other_snapshot.position.x ||

@@ -16,13 +16,21 @@ struct ReplicationConfig {
     // visible entity is sent every tick.
     bool dirty_enabled = true;
     // AOI candidate reduction: keep only the nearest kAoiEntityCap candidates
-    // (partial_sort) instead of sorting the whole candidate set. The selected
-    // set is identical to the full-sort result (same distance,net tie-break);
+    // instead of sorting the whole candidate set. The selected set is
+    // identical to the full-sort result (same distance,net tie-break);
     // OFF = legacy full sort.
     bool aoi_partial_cap = true;
+    // Phase 5D top-k selection strategy: true = nth_element + sort of the
+    // selected prefix (O(n) selection), false = partial_sort (O(n log k)).
+    // Both produce the identical ordered top-k. A/B only.
+    bool aoi_nth_element = true;
     // Full transform refresh period in ticks (staggered per viewer). Bounds
     // any missed update to this window and keeps the client state exact.
     std::uint32_t refresh_ticks = 20; // 1 s at 20 Hz
+    // Phase 5D A/B: read AOI candidate positions from the spatial grid entry
+    // (optimized, default) instead of from the authoritative flecs component
+    // (the pre-5D reference path). Both produce the identical visible set.
+    bool aoi_reference_positions = false;
 };
 
 // Clamps a candidate config into the supported range. Returns true when any

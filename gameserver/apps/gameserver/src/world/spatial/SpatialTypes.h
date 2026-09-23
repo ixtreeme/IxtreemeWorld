@@ -14,10 +14,15 @@
 namespace gs::game {
 
 // Phase 5B: the entry carries the zone-local entity handle so an AOI radius
-// scan never pays a random hash-table lookup per candidate (the cell vectors
-// are walked sequentially; only the component read remains).
+// scan never pays a random hash-table lookup per candidate.
+// Phase 5D: the entry also carries the entity's position, kept in sync by the
+// grid's Insert/Move (O(1) through the entity's GridSlot component), so the
+// radius scan is a sequential read with no per-candidate component lookup.
 struct GridEntry {
     std::uint32_t net_id = 0;
+    float x = 0.0f;
+    float y = 0.0f;
+    float z = 0.0f;
     flecs::entity entity;
 };
 

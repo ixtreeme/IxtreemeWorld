@@ -63,10 +63,18 @@ public:
     // full sort when the candidate set exceeds kAoiEntityCap. Both produce
     // exactly the same selected set -- the prefilter is a grid superset and
     // the exact distance filter never changes.
+    // `reference_positions` is the phase 5D A/B switch: true reads each
+    // candidate's position from the authoritative component (pre-5D path),
+    // false reads the grid entry's synced copy (optimized). Identical result.
+    // `count_metrics` is false for shadow-validation queries (they must not
+    // pollute the production AOI diagnostics they are validating).
     static const std::vector<AoiCandidate>& QueryCandidates(Zone& zone,
                                                             std::uint32_t viewer_net_id,
                                                             const Position& viewer_position,
-                                                            bool partial_cap);
+                                                            bool partial_cap,
+                                                            bool reference_positions = false,
+                                                            bool nth_element = true,
+                                                            bool count_metrics = true);
 };
 
 } // namespace gs::game

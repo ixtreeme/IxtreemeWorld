@@ -306,6 +306,23 @@ void Zone::Tick(float dt, ZoneTickContext& ctx)
         diagnostics_.ticks_since_diag.fetch_add(1, std::memory_order_relaxed);
         ++zone_tick_;
         RefreshResidentCounts();
+        // Phase 5D: publish this tick's spatial-index maintenance deltas.
+        {
+            const auto& maintenance = grid_.Maintenance();
+            diagnostics_.grid_inserts_since_diag.fetch_add(
+                maintenance.inserts - grid_maintenance_snapshot_.inserts,
+                std::memory_order_relaxed);
+            diagnostics_.grid_removes_since_diag.fetch_add(
+                maintenance.removes - grid_maintenance_snapshot_.removes,
+                std::memory_order_relaxed);
+            diagnostics_.grid_moves_in_cell_since_diag.fetch_add(
+                maintenance.moves_in_cell - grid_maintenance_snapshot_.moves_in_cell,
+                std::memory_order_relaxed);
+            diagnostics_.grid_moves_cell_since_diag.fetch_add(
+                maintenance.moves_cell - grid_maintenance_snapshot_.moves_cell,
+                std::memory_order_relaxed);
+            grid_maintenance_snapshot_ = maintenance;
+        }
     } catch (const std::exception& error) {
         LOG_ERROR("Zone {} ('{}') tick failed: {}", id_, name_, error.what());
     } catch (...) {

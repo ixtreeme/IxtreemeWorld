@@ -108,6 +108,7 @@ public:
         std::uint64_t spawn_events = 0;
         std::uint64_t despawn_events = 0;
         std::uint64_t update_events = 0;
+        std::uint64_t suppressed_events = 0;
 
         bool IsVisible(std::uint32_t net_id) const
         {
@@ -620,6 +621,8 @@ private:
     // Phase 5C audit retention (shadow/debug only).
     bool replication_audit_ = false;
     std::vector<TransformRecord> replication_audit_records_;
+    // Phase 5D spatial-index maintenance delta tracking (see Zone::Tick).
+    SpatialGrid::MaintenanceCounters grid_maintenance_snapshot_;
     std::atomic<ZoneActivity> activity_{ZoneActivity::Active};
     std::atomic<std::thread::id> owner_thread_id_{std::thread::id{}};
     std::atomic<bool> tick_in_progress_{false};

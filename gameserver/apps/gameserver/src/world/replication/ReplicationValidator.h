@@ -22,12 +22,18 @@
 namespace gs::game {
 
 class ZoneManager;
+struct ReplicationConfig;
 
 //  4. CANONICAL RECORD AUDIT (phase 5C, only when the audit retention flag
 //     is on): every retained 19-byte shared record must match the entity's
 //     current transform state -- a stale cached payload would show up as a
 //     field mismatch.
+//  5. ORDERED AOI EQUIVALENCE (phase 5D): the production AOI candidate list
+//     (same config, same index) must equal the brute-force ordered top-k
+//     element by element -- missing/extra/duplicate NetId or a different
+//     (distance,NetId) order is a failure.
 bool ValidateReplicationShadow(ZoneManager& zones,
+                               const ReplicationConfig& config,
                                std::string& out_error,
                                std::size_t* out_viewers_checked = nullptr,
                                std::size_t* out_relationships_checked = nullptr,

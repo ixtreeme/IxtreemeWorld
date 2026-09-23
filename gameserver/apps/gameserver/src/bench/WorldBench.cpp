@@ -104,6 +104,8 @@ struct BenchConfig {
     bool replication_shadow = false;
     bool repl_full = false;
     bool aoi_full_sort = false;
+    bool aoi_reference_positions = false;
+    bool aoi_partial_sort = false;
 };
 
 bool ParseArgs(int argc, char** argv, BenchConfig& config)
@@ -235,6 +237,10 @@ bool ParseArgs(int argc, char** argv, BenchConfig& config)
             config.replication_shadow = true;
         } else if (arg == "--repl-full") {
             config.repl_full = true;
+        } else if (arg == "--aoi-reference-positions") {
+            config.aoi_reference_positions = true;
+        } else if (arg == "--aoi-partial-sort") {
+            config.aoi_partial_sort = true;
         } else if (arg == "--aoi-full-sort") {
             config.aoi_full_sort = true;
         } else {
@@ -3735,8 +3741,11 @@ int RunAoiReplicationScenario(boost::asio::io_context& io,
         return false;
     };
 
+    // The rig runs many sequential phases (movement, lifecycle, migration,
+    // topology, dense cluster, shadow audits); the deadline is a safety net,
+    // not a workload bound, so it is generous.
     const auto deadline =
-        std::chrono::steady_clock::now() + std::chrono::seconds(std::max(180, config.seconds));
+        std::chrono::steady_clock::now() + std::chrono::seconds(std::max(420, config.seconds * 8));
     auto expired = [&] { return std::chrono::steady_clock::now() >= deadline; };
 
     constexpr gs::common::SessionId kV1 = 780;      // viewer in zone A
@@ -3868,7 +3877,7 @@ int RunAoiReplicationScenario(boost::asio::io_context& io,
     // Recipient-level lifecycle counters (travel with the binding across
     // topology changes): {spawns, despawns, updates}.
     auto recipient_events = [&](gs::common::SessionId session) {
-        std::array<std::uint64_t, 3> events{0, 0, 0};
+        std::array<std::uint64_t, 4> events{0, 0, 0, 0};
         const gs::game::Zone* zone = zone_of(session);
         if (zone == nullptr) {
             return events;
@@ -3880,6 +3889,7 @@ int RunAoiReplicationScenario(boost::asio::io_context& io,
         events[0] = binding->spawn_events;
         events[1] = binding->despawn_events;
         events[2] = binding->update_events;
+        events[3] = binding->suppressed_events;
         return events;
     };
 
@@ -3959,13 +3969,29 @@ int RunAoiReplicationScenario(boost::asio::io_context& io,
             zone.Diagnostics().repl_despawn_since_diag.load(std::memory_order_relaxed),
             zone.Diagnostics().repl_suppressed_since_diag.load(std::memory_order_relaxed)};
     };
-    const auto clean_before = counters(v1_zone);
+    const auto clean_events_before = recipient_events(kV1);
     std::this_thread::sleep_for(std::chrono::milliseconds(600)); // ~12 ticks
-    const auto clean_after = counters(v1_zone);
-    check("dirty-clean-no-update", clean_after[0] == clean_before[0]);
+    const auto clean_events_after = recipient_events(kV1);
+    if (clean_events_after[0] != clean_events_before[0] ||
+        clean_events_after[1] != clean_events_before[1] ||
+        clean_events_after[2] != clean_events_before[2]) {
+        std::printf("%s clean-window detail: before=[spawn=%llu despawn=%llu upd=%llu sup=%llu] "
+                    "after=[spawn=%llu despawn=%llu upd=%llu sup=%llu]\n",
+                    tag,
+                    (unsigned long long)clean_events_before[0],
+                    (unsigned long long)clean_events_before[1],
+                    (unsigned long long)clean_events_before[2],
+                    (unsigned long long)clean_events_before[3],
+                    (unsigned long long)clean_events_after[0],
+                    (unsigned long long)clean_events_after[1],
+                    (unsigned long long)clean_events_after[2],
+                    (unsigned long long)clean_events_after[3]);
+    }
+    check("dirty-clean-no-update", clean_events_after[2] == clean_events_before[2]);
     check("dirty-clean-no-lifecycle",
-          clean_after[1] == clean_before[1] && clean_after[2] == clean_before[2]);
-    check("dirty-clean-suppressed", clean_after[3] > clean_before[3]);
+          clean_events_after[0] == clean_events_before[0] &&
+              clean_events_after[1] == clean_events_before[1]);
+    check("dirty-clean-suppressed", clean_events_after[3] > clean_events_before[3]);
 
     // ---- changed transform -> update; both recipients catch up -----------
     const auto dirty_before = counters(v1_zone);
@@ -4010,7 +4036,7 @@ int RunAoiReplicationScenario(boost::asio::io_context& io,
     check("dirty-despawn-clean", p4_gone && shadow_now("dirty-despawn"));
 
     // ---- migration: same NetId, no despawn+spawn churn -------------------
-    const auto mig_before = counters(v1_zone);
+    const auto mig_before = recipient_events(kV1);
     const bool p_cross_visible_before = visible(kV1, p_cross_net);
     seq = 0;
     const auto mig_deadline = std::chrono::steady_clock::now() + std::chrono::seconds(20);
@@ -4024,11 +4050,22 @@ int RunAoiReplicationScenario(boost::asio::io_context& io,
         std::this_thread::sleep_for(std::chrono::milliseconds(100));
     }
     std::this_thread::sleep_for(std::chrono::milliseconds(300));
-    const auto mig_after = counters(v1_zone);
+    const auto mig_after = recipient_events(kV1);
     check("migration-same-net",
           p_cross_visible_before && p_cross_migrated && visible(kV1, p_cross_net));
+    if (mig_after[0] != mig_before[0] || mig_after[1] != mig_before[1]) {
+        std::printf("%s migration-churn detail: before=[spawn=%llu despawn=%llu upd=%llu] "
+                    "after=[spawn=%llu despawn=%llu upd=%llu]\n",
+                    tag,
+                    (unsigned long long)mig_before[0],
+                    (unsigned long long)mig_before[1],
+                    (unsigned long long)mig_before[2],
+                    (unsigned long long)mig_after[0],
+                    (unsigned long long)mig_after[1],
+                    (unsigned long long)mig_after[2]);
+    }
     check("migration-no-spawn-despawn-churn",
-          mig_after[1] == mig_before[1] && mig_after[2] == mig_before[2]);
+          mig_after[0] == mig_before[0] && mig_after[1] == mig_before[1]);
     check("shadow-after-migration", shadow_now("after-migration"));
 
     // ---- split / merge: visibility must not change with topology ---------
@@ -4073,6 +4110,40 @@ int RunAoiReplicationScenario(boost::asio::io_context& io,
     check("merge-visibility-stable", set_before_split == set_after_merge);
     check("shadow-after-merge", shadow_now("after-merge"));
     check("world-validation-final", world_validate("final"));
+
+    // ---- dense cluster: single-cell pressure + deterministic cap ---------
+    // 120 static mobs inside a ~100 m box around (470,470): they land in one
+    // grid cell and its neighbours, and exceed kAoiEntityCap (100), so the
+    // cap must select exactly the nearest 100 deterministically (validated
+    // set-and-order by the ordered AOI shadow check).
+    for (int i = 0; i < 120; ++i) {
+        gs::game::MobSpawnPoint point;
+        point.mob_type_id = 2;
+        point.x = 420.0f + static_cast<float>(i % 12) * 9.0f;
+        point.y = 420.0f + static_cast<float>(i / 12) * 9.0f;
+        point.count = 1;
+        point.radius = 0.0f;
+        sim.AddMobSpawnPoint(point);
+    }
+    for (int i = 0; i < 120; ++i) {
+        sim.RequestMobSpawn(static_cast<std::size_t>(7 + i));
+    }
+    const bool cluster_spawned = WaitFor(std::chrono::seconds(20), [&] {
+        return visible_count(kV1) >= 100;
+    });
+    check("dense-cluster-spawned", cluster_spawned && !expired());
+    check("dense-cluster-cap-100", visible_count(kV1) == 100);
+    check("dense-cluster-shadow", shadow_now("dense-cluster"));
+
+    // ---- grid math: negative origin + cell edges (pure functions) --------
+    check("grid-negative-origin",
+          gs::game::SpatialCellCoord(-0.1f) == -1 &&
+              gs::game::SpatialCellCoord(-120.0f) == -1 &&
+              gs::game::SpatialCellCoord(-120.1f) == -2);
+    check("grid-cell-edge",
+          gs::game::SpatialCellCoord(0.0f) == 0 &&
+              gs::game::SpatialCellCoord(119.999f) == 0 &&
+              gs::game::SpatialCellCoord(120.0f) == 1);
 
     const auto shadow_stats = sim.ReplicationValidationSnapshot();
     std::printf("%s stats: shadow_runs=%d shadow_failures=%d validator_runs=%llu "
@@ -4253,6 +4324,8 @@ int BenchMain(int argc, char** argv)
         readiness.replication_shadow = config.replication_shadow;
         readiness.repl_full = config.repl_full;
         readiness.aoi_full_sort = config.aoi_full_sort;
+        readiness.aoi_reference_positions = config.aoi_reference_positions;
+        readiness.aoi_partial_sort = config.aoi_partial_sort;
         readiness.seed = config.seed;
         boost::asio::io_context readiness_io;
         std::thread readiness_io_thread([&readiness_io] { readiness_io.run(); });

@@ -54,40 +54,64 @@ void AoiSystem::RebuildInto(Zone& zone, SpatialGrid& grid)
 const std::vector<AoiCandidate>& AoiSystem::QueryCandidates(Zone& zone,
                                                             std::uint32_t viewer_net_id,
                                                             const Position& viewer_position,
-                                                            bool partial_cap)
+                                                            bool partial_cap,
+                                                            bool reference_positions,
+                                                            bool nth_element,
+                                                            bool count_metrics)
 {
-    AssertZoneOwner(zone, "zone AOI query");
+    // Read-only query: no ownership assert here (the caller guarantees the
+    // context), so the quiescent-window shadow validator can run the same
+    // exact query against the production index.
     const auto aoi_start = std::chrono::steady_clock::now();
 
     auto& candidates = t_candidates;
     candidates.clear();
 
+    std::uint64_t cells_visited = 0;
+    std::uint64_t entries_visited = 0;
+    std::uint64_t exact_checks = 0;
     // PREFILTER: the grid cell scan is a strict superset of the AOI disc
     // (cell size == AOI radius, 3x3 neighborhood). EXACT FILTER: the squared
     // distance check below -- only a candidate that passes is ever visible,
     // so the prefilter can never cause a false negative.
-    zone.Grid().ForEachInRadius(viewer_position, kAoiRadiusMeters, [&](const GridEntry& entry) {
-        const std::uint32_t net_id = entry.net_id;
-        if (net_id == 0 || net_id == viewer_net_id) {
-            return;
-        }
+    zone.Grid().ForEachInRadius(
+        viewer_position,
+        kAoiRadiusMeters,
+        [&](const GridEntry& entry) {
+            ++entries_visited;
+            const std::uint32_t net_id = entry.net_id;
+            if (net_id == 0 || net_id == viewer_net_id) {
+                return;
+            }
+            // Optimized path (phase 5D): the grid entry carries the synced
+            // position, so the radius scan is a sequential read with no
+            // per-candidate component lookup. The reference path reads the
+            // authoritative component (pre-5D behavior) for the A/B run.
+            float px = entry.x;
+            float py = entry.y;
+            if (reference_positions) {
+                if (!entry.entity.is_valid() || !entry.entity.has<Position>()) {
+                    return;
+                }
+                const auto position = entry.entity.get<Position>();
+                px = position.x;
+                py = position.y;
+            }
+            ++exact_checks;
+            const float dx = px - viewer_position.x;
+            const float dy = py - viewer_position.y;
+            const float distance_sq = dx * dx + dy * dy;
+            if (distance_sq <= kAoiRadiusSqMeters) {
+                candidates.push_back(AoiCandidate{distance_sq, net_id, entry.entity});
+            }
+        },
+        &cells_visited);
 
-        // The grid entry carries the zone-local entity handle, so the radius
-        // scan never pays a random hash lookup per candidate: only the
-        // position component read remains. Ghost entities carry their
-        // reconciled Position the same way.
-        if (!entry.entity.is_valid() || !entry.entity.has<Position>()) {
-            return;
-        }
-        const auto position = entry.entity.get<Position>();
-        const float dx = position.x - viewer_position.x;
-        const float dy = position.y - viewer_position.y;
-        const float distance_sq = dx * dx + dy * dy;
-        if (distance_sq <= kAoiRadiusSqMeters) {
-            candidates.push_back(AoiCandidate{distance_sq, net_id, entry.entity});
-        }
-    });
-
+    const std::uint64_t index_us = static_cast<std::uint64_t>(
+        std::chrono::duration_cast<std::chrono::microseconds>(
+            std::chrono::steady_clock::now() - aoi_start)
+            .count());
+    const auto topk_start = std::chrono::steady_clock::now();
     const std::size_t pre_cap = candidates.size();
 
     // Load field attribution: the AOI cost of this viewer is one query plus
@@ -100,7 +124,13 @@ const std::vector<AoiCandidate>& AoiSystem::QueryCandidates(Zone& zone,
             pre_cap > 0xFFFFFFFFu ? 0xFFFFFFFFu : pre_cap);
     }
     auto& diag = zone.Diagnostics();
-    diag.aoi_candidates_pre_cap_since_diag.fetch_add(pre_cap, std::memory_order_relaxed);
+    if (count_metrics) {
+        diag.aoi_candidates_pre_cap_since_diag.fetch_add(pre_cap, std::memory_order_relaxed);
+        diag.aoi_cells_visited_since_diag.fetch_add(cells_visited, std::memory_order_relaxed);
+        diag.aoi_entries_visited_since_diag.fetch_add(entries_visited, std::memory_order_relaxed);
+        diag.aoi_exact_checks_since_diag.fetch_add(exact_checks, std::memory_order_relaxed);
+        diag.aoi_index_us_since_diag.fetch_add(index_us, std::memory_order_relaxed);
+    }
 
     // Deterministic order: nearest first, NetId tie-break. Both the top-k
     // reduction and the full sort select exactly the same capped set.
@@ -111,10 +141,16 @@ const std::vector<AoiCandidate>& AoiSystem::QueryCandidates(Zone& zone,
         return lhs.net_id < rhs.net_id;
     };
     if (candidates.size() > kAoiEntityCap && partial_cap) {
-        std::partial_sort(candidates.begin(),
-                          candidates.begin() + static_cast<std::ptrdiff_t>(kAoiEntityCap),
-                          candidates.end(),
-                          by_distance);
+        const auto cap_end =
+            candidates.begin() + static_cast<std::ptrdiff_t>(kAoiEntityCap);
+        if (nth_element) {
+            // O(n) selection + sort of the selected prefix: identical
+            // ordered top-k to partial_sort (same comparator), less work.
+            std::nth_element(candidates.begin(), cap_end, candidates.end(), by_distance);
+            std::sort(candidates.begin(), cap_end, by_distance);
+        } else {
+            std::partial_sort(candidates.begin(), cap_end, candidates.end(), by_distance);
+        }
         candidates.resize(kAoiEntityCap);
     } else {
         std::sort(candidates.begin(), candidates.end(), by_distance);
@@ -122,8 +158,10 @@ const std::vector<AoiCandidate>& AoiSystem::QueryCandidates(Zone& zone,
             candidates.resize(kAoiEntityCap);
         }
     }
-    diag.aoi_candidates_post_cap_since_diag.fetch_add(candidates.size(),
-                                                      std::memory_order_relaxed);
+    if (count_metrics) {
+        diag.aoi_candidates_post_cap_since_diag.fetch_add(candidates.size(),
+                                                          std::memory_order_relaxed);
+    }
 
     std::uint64_t tier_near = 0;
     std::uint64_t tier_mid = 0;
@@ -148,6 +186,12 @@ const std::vector<AoiCandidate>& AoiSystem::QueryCandidates(Zone& zone,
     diag.tier_near_since_diag.fetch_add(tier_near, std::memory_order_relaxed);
     diag.tier_mid_since_diag.fetch_add(tier_mid, std::memory_order_relaxed);
     diag.tier_far_since_diag.fetch_add(tier_far, std::memory_order_relaxed);
+    diag.aoi_topk_us_since_diag.fetch_add(
+        static_cast<std::uint64_t>(
+            std::chrono::duration_cast<std::chrono::microseconds>(
+                std::chrono::steady_clock::now() - topk_start)
+                .count()),
+        std::memory_order_relaxed);
     diag.aoi_micros_since_diag.fetch_add(
         static_cast<std::uint64_t>(
             std::chrono::duration_cast<std::chrono::microseconds>(

@@ -133,8 +133,13 @@ bool WaitFor(std::chrono::milliseconds timeout, const std::function<bool()>& con
 
 // --- window delta tracking --------------------------------------------------
 // The supervisor exchanges per-zone diagnostic windows every second; sampling
-// faster than that reconstructs the totals (a value that dropped means the
-// window was exchanged and the previous value is the full window).
+// faster than that reconstructs the totals. On a drop (window exchanged and
+// the counter reset to zero) the window's value was already accumulated
+// incrementally up to `last`, so nothing may be added again -- the previous
+// "add last" logic double-counted every window (up to ~2x totals, which made
+// e.g. aoi_queries exceed the theoretical viewer*tick maximum). The tail
+// between the last sample and the reset (<= sample interval) is not observed;
+// with the 200 ms cadence that is at most ~20% of a 1 s window.
 struct WindowDelta {
     std::uint64_t last = 0;
     std::uint64_t total = 0;
@@ -144,8 +149,6 @@ void AccumulateWindow(std::uint64_t current, WindowDelta& delta)
 {
     if (current >= delta.last) {
         delta.total += current - delta.last;
-    } else {
-        delta.total += delta.last;
     }
     delta.last = current;
 }
@@ -207,6 +210,16 @@ struct ZoneStageTotals {
     WindowDelta repl_bytes_generated;
     WindowDelta repl_bytes_copied;
     WindowDelta repl_wire_bytes;
+    // Phase 5D AOI stage breakdown + spatial index maintenance.
+    WindowDelta aoi_cells_visited;
+    WindowDelta aoi_entries_visited;
+    WindowDelta aoi_exact_checks;
+    WindowDelta aoi_index_us;
+    WindowDelta aoi_topk_us;
+    WindowDelta grid_inserts;
+    WindowDelta grid_removes;
+    WindowDelta grid_moves_in_cell;
+    WindowDelta grid_moves_cell;
 };
 
 struct GlobalCounters {
@@ -367,6 +380,8 @@ int RunReadinessBenchmark(boost::asio::io_context& io, const ReadinessConfig& co
         gs::game::ReplicationConfig replication;
         replication.dirty_enabled = !config.repl_full;
         replication.aoi_partial_cap = !config.aoi_full_sort;
+        replication.aoi_reference_positions = config.aoi_reference_positions;
+        replication.aoi_nth_element = !config.aoi_partial_sort;
         sim.ConfigureReplication(replication);
     }
     if (config.ghost_shadow) {
@@ -741,6 +756,24 @@ int RunReadinessBenchmark(boost::asio::io_context& io, const ReadinessConfig& co
                             totals.repl_bytes_copied);
             AccumulateWindow(diag.repl_wire_bytes_since_diag.load(std::memory_order_relaxed),
                             totals.repl_wire_bytes);
+            AccumulateWindow(diag.aoi_cells_visited_since_diag.load(std::memory_order_relaxed),
+                            totals.aoi_cells_visited);
+            AccumulateWindow(diag.aoi_entries_visited_since_diag.load(std::memory_order_relaxed),
+                            totals.aoi_entries_visited);
+            AccumulateWindow(diag.aoi_exact_checks_since_diag.load(std::memory_order_relaxed),
+                            totals.aoi_exact_checks);
+            AccumulateWindow(diag.aoi_index_us_since_diag.load(std::memory_order_relaxed),
+                            totals.aoi_index_us);
+            AccumulateWindow(diag.aoi_topk_us_since_diag.load(std::memory_order_relaxed),
+                            totals.aoi_topk_us);
+            AccumulateWindow(diag.grid_inserts_since_diag.load(std::memory_order_relaxed),
+                            totals.grid_inserts);
+            AccumulateWindow(diag.grid_removes_since_diag.load(std::memory_order_relaxed),
+                            totals.grid_removes);
+            AccumulateWindow(diag.grid_moves_in_cell_since_diag.load(std::memory_order_relaxed),
+                            totals.grid_moves_in_cell);
+            AccumulateWindow(diag.grid_moves_cell_since_diag.load(std::memory_order_relaxed),
+                            totals.grid_moves_cell);
         }
     };
 
@@ -884,12 +917,13 @@ int RunReadinessBenchmark(boost::asio::io_context& io, const ReadinessConfig& co
     };
 
     std::printf("READINESS measure: %ds ghost_shadow=%d replication_shadow=%d "
-                "repl_full=%d aoi_full_sort=%d\n",
+                "repl_full=%d aoi_full_sort=%d aoi_reference_positions=%d\n",
                 config.measure_seconds,
                 config.ghost_shadow ? 1 : 0,
                 config.replication_shadow ? 1 : 0,
                 config.repl_full ? 1 : 0,
-                config.aoi_full_sort ? 1 : 0);
+                config.aoi_full_sort ? 1 : 0,
+                config.aoi_reference_positions ? 1 : 0);
     const auto measure_start = Clock::now();
     const auto measure_end = measure_start + std::chrono::seconds(config.measure_seconds);
     auto next_sample = measure_start;
@@ -1316,6 +1350,47 @@ int RunReadinessBenchmark(boost::asio::io_context& io, const ReadinessConfig& co
                 (unsigned long long)repl_payload_bytes,
                 static_cast<double>(repl_frame_bytes + repl_payload_bytes) /
                     (1024.0 * 1024.0) / std::max(0.001, measure_actual_s));
+    // Phase 5D AOI stage audit: measured totals plus explicitly DERIVED
+    // per-query averages (the exact-distance check runs inside the traversal;
+    // there is deliberately no per-candidate timer).
+    {
+        const std::uint64_t queries = total_of(&ZoneStageTotals::aoi_queries);
+        const std::uint64_t cells = total_of(&ZoneStageTotals::aoi_cells_visited);
+        const std::uint64_t entries = total_of(&ZoneStageTotals::aoi_entries_visited);
+        const std::uint64_t exact = total_of(&ZoneStageTotals::aoi_exact_checks);
+        const std::uint64_t post = total_of(&ZoneStageTotals::aoi_candidates_pre_cap);
+        const std::uint64_t visible = total_of(&ZoneStageTotals::aoi_visible_final);
+        const std::uint64_t index_us = total_of(&ZoneStageTotals::aoi_index_us);
+        const std::uint64_t topk_us = total_of(&ZoneStageTotals::aoi_topk_us);
+        const auto per_query = [queries](std::uint64_t value) {
+            return queries > 0 ? static_cast<double>(value) / static_cast<double>(queries) : 0.0;
+        };
+        std::printf("READINESS aoi_stages: queries=%llu cells=%llu entries=%llu exact=%llu "
+                    "post_dist=%llu visible=%llu index_us=%llu topk_us=%llu | DERIVED per_query: "
+                    "cells=%.2f entries=%.2f exact=%.2f post_dist=%.2f visible=%.2f "
+                    "index_us=%.2f topk_us=%.2f\n",
+                    (unsigned long long)queries,
+                    (unsigned long long)cells,
+                    (unsigned long long)entries,
+                    (unsigned long long)exact,
+                    (unsigned long long)post,
+                    (unsigned long long)visible,
+                    (unsigned long long)index_us,
+                    (unsigned long long)topk_us,
+                    per_query(cells),
+                    per_query(entries),
+                    per_query(exact),
+                    per_query(post),
+                    per_query(visible),
+                    per_query(index_us),
+                    per_query(topk_us));
+        std::printf("READINESS grid_maintenance: inserts=%llu removes=%llu move_in_cell=%llu "
+                    "move_cell=%llu\n",
+                    (unsigned long long)total_of(&ZoneStageTotals::grid_inserts),
+                    (unsigned long long)total_of(&ZoneStageTotals::grid_removes),
+                    (unsigned long long)total_of(&ZoneStageTotals::grid_moves_in_cell),
+                    (unsigned long long)total_of(&ZoneStageTotals::grid_moves_cell));
+    }
     const std::uint64_t repl_aoi_us = total_of(&ZoneStageTotals::repl_aoi_us);
     const std::uint64_t repl_reconcile_us = total_of(&ZoneStageTotals::repl_reconcile_us);
     const std::uint64_t repl_encode_us = total_of(&ZoneStageTotals::repl_encode_us);

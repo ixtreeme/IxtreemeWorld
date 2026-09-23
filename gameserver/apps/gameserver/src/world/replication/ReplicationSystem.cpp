@@ -107,7 +107,9 @@ std::size_t ReplicationSystem::BroadcastTransforms(Zone& zone,
             AoiSystem::QueryCandidates(zone,
                                        viewer_net_id,
                                        viewer_position,
-                                       effective.aoi_partial_cap);
+                                       effective.aoi_partial_cap,
+                                       effective.aoi_reference_positions,
+                                       effective.aoi_nth_element);
         diag.repl_aoi_us_since_diag.fetch_add(ElapsedUs(aoi_start), std::memory_order_relaxed);
         diag.aoi_queries_since_diag.fetch_add(1, std::memory_order_relaxed);
 

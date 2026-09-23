@@ -41,6 +41,11 @@ struct ReadinessConfig {
     // visible entity every tick) and legacy full AOI candidate sort.
     bool repl_full = false;
     bool aoi_full_sort = false;
+    // Phase 5D A/B: AOI candidates read positions from the authoritative
+    // component (the pre-5D reference path) instead of the grid entry.
+    bool aoi_reference_positions = false;
+    // Phase 5D top-k A/B: force the 5B partial_sort instead of nth_element.
+    bool aoi_partial_sort = false;
     std::uint32_t seed = 20260922;
 };
 

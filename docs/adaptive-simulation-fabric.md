@@ -625,6 +625,7 @@ Az előző commitból javított Fast/Exact semanticsra **tesztet kell írni**:
 | **H (Phase 5A)** | §9.7/1 | Inkrementális/dirty ghost karbantartás: dirty entity tracking, delta-publish, KEEP/ADD/REMOVE reconcile, egzakt equivalence validator + repair seam, `--mode ghost` + `--ghost-shadow` | ✅ **KÉSZ** (lásd §10) |
 | **I (Phase 5B)** | §9.7/2–4 | AOI prefilter (top-k cap, grid entity-handle), dirty/interest-aware replication (TransformVersion + per-recipient interest set + staggered refresh), exact/shadow interest + coverage validator, `--mode aoi`/`--mode replication`, A/B (`--repl-full`, `--aoi-full-sort`), readiness re-benchmark | ✅ **KÉSZ** (lásd §11) |
 | **J (Phase 5C)** | §11.7/1–2 | Canonical 19 B record cache (serialize once / fanout many), memcpy frame assembly, spawn/despawn payload sharing, copy/wire byte accounting, canonical-record audit a shadow validatorban, interest-overlap mérés + grouping-döntés, readiness re-benchmark | ✅ **KÉSZ** (lásd §12) |
+| **K (Phase 5D)** | §12.7/1 | AOI query indexing: tárolt pozíció a grid entryben + `GridSlot` O(1) sync, nth_element top-k, AOI stage-metrikák, index-validator (stored position + slot), `--aoi-reference-positions` A/B, readiness re-benchmark | ✅ **KÉSZ** (lásd §13) |
 
 ### Chunk A — elvégzett munka
 
@@ -1969,12 +1970,159 @@ canonical-record audit is zöld (a megosztott 19 B recordok bitre egyeznek az
 authority-vel); világ-validáció OK. Regresszió: 3 selftest + 9 bench mód +
 routing selftest zöld.
 
-### 12.7 Következő lépcső (Phase 5C utáni javaslat)
+## 13. Phase 5D — AOI query indexing / candidate reduction
 
-A Phase 4 rangsor 2–5. pontjai közül az AOI candidate-szűrés (5B.1), a
-dirty replication (5B.2) és a shared-payload fanout (5C) elkészült. A mért
-domináns maradék a dense AOI-scan és a wire-szükséges per-recipient frame
-fanout — ez protokoll-szintű megoldást (közös body + recipient delta)
-igényel, külön phase-ként. Emellett nyitott: activity-field query
-O(players-in-box), combat event-fanout coalescing, és a ghost `keep`-scan
-opcionális továbbfejlesztése.
+### 13.1 Audit — először a mérést kellett megjavítani
+
+Két mérési hiba torzította a Phase 4–5C riportokat (a Phase 5D baseline
+rögzítése előtt javítva):
+
+1. **`AccumulateWindow` dupla-számolás**: a readiness 200 ms-onként mintavételez,
+   a supervisor 1 Hz-enként cseréli (nullázza) a zóna-diag ablakokat; a régi
+   logika a reset észlelésekor még egyszer hozzáadta a teljes ablakértéket
+   (~2×). Bizonyíték: `aoi_queries=339k` 30 s alatt 500 viewer × 20 Hz mellett
+   (a maximum 300k).
+2. **A Phase 5B/5C/5D counterek nem voltak exchange-elve** a supervisor
+   diag-blokkjában, így a "measure" ablaktól elvárt érték helyett a SETUP +
+   WARMUP (60 s) is beleszámított (~+3,5×).
+
+Mindkettő javítva; a **korrigált baseline** (dense, 5C kód):
+
+```text
+queries/viewer-tick:      146k / 30 s
+cells/query:              8.99   (3x3, cella == AOI r = 120 m)
+entries/query (raw):      688.2
+exact checks/query:       687.2
+post-distance/query:      244.7
+visible/query:            100.0  (cap)
+index_us/query:           42.4   ← 61.6 ns / bejárt entry
+topk_us/query:            6.5    (partial_sort 245 → 100)
+```
+
+**Az amplifikáció oka**: a 3×3 cellanézet 129 600 m²-t fed le a 45 239 m²-es
+kör helyett (2.86×), így 688 entry bejárása kell 245 körön belülihez
+(2.81×) és 100 láthatóhoz (6.9×). **A domináns költség nem a bejárt
+entry-szám, hanem az entry-nkénti ~62 ns**: a `Position` flecs komponens
+random olvasása (cache miss) + a validitás-check. A top-k (partial_sort) a
+második legnagyobb AOI-stage.
+
+### 13.2 Implementáció — a legkisebb korrekt megoldás
+
+1. **Tárolt pozíció a grid entryben**: `GridEntry { net_id, x, y, z, entity }`
+   (24 B). Az AOI sugár-scan így szekvenciális olvasás, entry-nkénti
+   komponens-lookup nélkül.
+2. **`GridSlot { cell_key, index }` komponens** entitásonként: a
+   `SpatialGrid::Move` O(1)-ben frissíti a tárolt pozíciót (in-cell: 1
+   `try_get` + 1 cella-map find + 1 írás; cellaváltás: swap-erase + insert,
+   a szomszéd slot-indexének fix-upjával). Az in-cell eset a hot path
+   (dense: 8,2M in-cell move vs 7,8k cellaváltás / 30 s).
+3. **Minden pozícióíró auditálva**: movement (játékos + mob loop), ghost
+   upsert (3 hely), spawn/migráció/split-transfer insert. A ghost upsert
+   eddig **csak cellaváltáskor** hívta a `Grid().Move`-ot → az in-cell ghost
+   mozgás elavult tárolt pozíciót hagyott (a Phase 5D AOI selftest fogta meg
+   és a javítás után zöld).
+4. **Index-validator** (`SpatialValidator`): minden entry tárolt pozíciója
+   == az authority pozíció, a `GridSlot` pontosan arra a cellára/slotra
+   mutat, nincs stale entry (resident vagy ghost nélkül). A shadow validator
+   **ordered AOI equivalence** ellenőrzése (minden pollnál, viewerenként)
+   a produkciós index-query rendezett top-kját elemenként veti össze a
+   brute-force rendezett top-kkal: missing/extra/duplikált NetId vagy eltérő
+   `(distance,NetId)` sorrend → failure, nincs silent repair. A validátor
+   queryjei `count_metrics=false`-szal futnak, hogy ne szennyezzék a mért
+   AOI metrikákat.
+   **Selftest bővítés** (`--mode aoi`): dense-cluster (120 statikus mob egy
+   cellában és szomszéd cellákban → a cap pontosan 100, rendezetten
+   ekvivalens), grid cella-matek (negatív origó, cella-határok), valamint a
+   meglévő exact-boundary/cross-zone/ghost/migration/split-merge esetek.
+5. **Top-k**: `nth_element` + a kiválasztott prefix rendezése (O(n) select)
+   a `partial_sort` helyett; a top-100 halmaz és sorrend bitre azonos
+   (`(distance,NetId)` comparator).
+6. **A/B**: `--aoi-reference-positions` (authority-pozíció olvasás, a pre-5D
+   útvonal) és `--aoi-partial-sort` (5B partial_sort). A cellageometria
+   (120 m) változatlan — a cell-AABB/micro-bin alternatíva méréssel
+   elvetve (lásd 13.5).
+
+### 13.3 A/B eredmények (dense, 500p/200k, warmup 60 s, measure 30 s)
+
+| metrika | optimized (grid pozíció) | reference (authority pozíció) |
+|---|---|---|
+| index_us/query | **3.81–3.86** | 44.88 |
+| topk_us/query | **4.92** (nth_element) / 6.48 (partial_sort) | 6.57 |
+| entries/query | 688.19 | 688.48 |
+| post-distance/query | 244.71 | 244.70 |
+| visible/query | 100.00 | 100.00 |
+| dense p99 | **55.6–56.3 ms** | 78.0 ms |
+| dense tick avg | 4.78 ms | 4.55 ms |
+
+- **AOI index CPU: −91,5%** úgy, hogy a candidate/exact/visible számok
+  azonosak (exact-equivalent).
+- A **dense AOI részaránya 32% → 8%** a tick-időből (korrigált metrikával).
+- A `nth_element` a top-k időt −24%-kal csökkenti, ugyanazzal a
+  top-100 halmazzal/sorrenddel → marad az default.
+
+### 13.4 Scenario-k (Phase 5D, korrigált metrikák)
+
+| scenario | zónák | avg | p99 | entries/q | index_us/q | topk_us/q |
+|---|---|---|---|---|---|---|
+| dense | 72 | 4.78 ms | **55.6** | 688.2 | 3.86 | 4.92 |
+| replication | 320 | 2.83 ms | 14.8 | 733.2 | 4.07 | 5.79 |
+| combat | 320 | 2.92 ms | 20.2 | 1079.1 | 5.25 | 6.26 |
+| moving | 220 | 3.21 ms | 8.1 | 101.2 | 0.57 | 0.77 |
+| hotspot | 328 | 1.75 ms | 8.1 | 339.8 | 2.66 | 4.13 |
+| border | 148 | 3.75 ms | 9.8 | 5.7 | 0.53 | 0.01 |
+| spread | 228 | 1.36 ms | 7.7 | 3.4 | 1.20 | 0.01 |
+| quiet | 212 | 1.46 ms | 7.8 | 3.4 | 1.14 | 0.01 |
+
+Megjegyzés: a zónaszám futásonként változik (az ASF a mért tick-terhelésre
+reagál; a könnyebb AOI miatt több split), ezért a p99 abszolút értéke
+nehezen vethető össze a korábbi fázisokkal — az AOI stage-metrikák
+közvetlenül összehasonlíthatók.
+
+### 13.5 Negative results (mérés alapján elvetve)
+
+- **Cell-AABB rejection / kétlépcsős micro-bin index**: a pozíció-fix után
+  a bejárt entry költsége ~5 ns; a 2,8×-os geometriai amplifikáció ugyan
+  megmarad, de a teljes index-költség 3,8 µs/query. Egy 40 m-es micro-bin
+  rács ~46%-kal csökkentené a bejárt entryket (688 → ~370), viszont
+  query-nként ~40 extra cella-hash-lookupot és több karbantartást/validátort
+  hozna; a várható nettó nyereség <1 µs/query (<0,2 s/30 s dense) — nem éri
+  meg a komplexitást. Dokumentált döntés, nem implementálva.
+- **Interest grouping** (5C): továbbra is 0% exact duplicate a sűrű
+  scenariókban; rekord-szintű megosztás helyette.
+- **Despawn payload cache** (5C): dense 61 hit / 35,8k miss (~0,2% reuse) —
+  megtartva az egyszerűség miatt, nem nyereségként.
+- **`partial_sort` helyett `nth_element`**: nyert (−24%), megtartva.
+
+### 13.6 Karbantartás / memória tradeoff
+
+- `GridEntry`: 12 → 24 B/entry (dense zónánként ~20k entry → +240 KB).
+- `GridSlot`: 16 B/entitás (+3,2 MB 200k entitásnál).
+- Karbantartási számok (dense, 30 s): inserts=0, removes=5,
+  in-cell move=8,08M, cellaváltás=7,8k. **ESTIMATED** movement-oldali
+  költség ~0,5 s/30 s (~2% egy magból) a slot-lookup + írás miatt; a
+  `movement` stage a zajon belül maradt.
+- Nincs új per-tick allokáció.
+
+### 13.7 Bottleneck rangsor (Phase 5D után, dense)
+
+1. **gameplay (AI + movement)** — 46,7% (a sűrű zóna mob-szimulációja).
+2. **replication fanout** — ~33% (repl 41,4% − AOI 8%): a wire-szükséges
+   per-recipient frame-építés + send (7,9 MB/s dense).
+3. **ghost** — 11,2%.
+4. **AOI** — 8% (3,86 + 4,92 µs/query).
+5. **lod_eval** — 1,2%.
+
+**Phase 6 gate (§37)**: az AOI már **nem domináns** (8%), és a dense
+`p99 ~55,6 ms` a `p99 < 50 ms` cél közelében van úgy, hogy a maradékot a
+gameplay és a wire-szükséges fanout adja. A további érdemi nyereség
+**protokoll-szintű** (delta state / network LOD / priority & budget), ezért
+a javaslat:
+
+`PHASE 6 — Replication Protocol v2 / Delta State / Network LOD / Priority & Budget`
+
+### 13.8 Nyitott, nem-protokoll jellegű tételek
+
+A §13.7 gate-en túl (Phase 6 protokoll-irány) nyitva maradt: activity-field
+query O(players-in-box) szűkítése, combat event-fanout coalescing, és a
+ghost `keep`-scan opcionális továbbfejlesztése. Ezek a Phase 5D rangsorban
+nem dominánsak.

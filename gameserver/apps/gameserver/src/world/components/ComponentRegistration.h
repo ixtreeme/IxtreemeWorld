@@ -4,6 +4,7 @@
 
 #include "AiComponents.h"
 #include "CombatComponents.h"
+#include "GridSlot.h"
 #include "MigrationComponents.h"
 #include "MobComponents.h"
 #include "MovementComponents.h"
@@ -39,6 +40,7 @@ inline void RegisterWorldComponents(flecs::world& world)
     world.component<GhostTag>();
     world.component<MigrateTo>();
     world.component<TransformVersion>();
+    world.component<GridSlot>();
 }
 
 } // namespace gs::game

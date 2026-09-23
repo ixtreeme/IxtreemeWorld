@@ -107,6 +107,23 @@ struct ZoneDiagnostics {
     std::atomic<std::uint64_t> aoi_candidates_pre_cap_since_diag{0};
     std::atomic<std::uint64_t> aoi_candidates_post_cap_since_diag{0};
     std::atomic<std::uint64_t> aoi_visible_final_since_diag{0};
+    // Phase 5D AOI stage breakdown (measured, not derived):
+    //   cells_visited     = non-empty grid cells examined by the radius scan
+    //   entries_visited   = grid entries iterated (raw spatial candidates)
+    //   exact_checks      = entries that reached the squared-distance test
+    //   post_distance     = entries inside the exact AOI radius (== pre_cap)
+    //   index_us / topk_us = traversal vs selection time
+    std::atomic<std::uint64_t> aoi_cells_visited_since_diag{0};
+    std::atomic<std::uint64_t> aoi_entries_visited_since_diag{0};
+    std::atomic<std::uint64_t> aoi_exact_checks_since_diag{0};
+    std::atomic<std::uint64_t> aoi_index_us_since_diag{0};
+    std::atomic<std::uint64_t> aoi_topk_us_since_diag{0};
+    // Spatial index maintenance (phase 5D): counts only, timed in the AOI
+    // microbench; per-call clocks in the movement hot path would distort it.
+    std::atomic<std::uint64_t> grid_inserts_since_diag{0};
+    std::atomic<std::uint64_t> grid_removes_since_diag{0};
+    std::atomic<std::uint64_t> grid_moves_in_cell_since_diag{0};
+    std::atomic<std::uint64_t> grid_moves_cell_since_diag{0};
     std::atomic<std::uint64_t> interest_enter_since_diag{0};
     std::atomic<std::uint64_t> interest_leave_since_diag{0};
     std::atomic<std::uint64_t> interest_keep_since_diag{0};

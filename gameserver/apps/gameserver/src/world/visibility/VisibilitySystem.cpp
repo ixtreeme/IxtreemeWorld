@@ -153,6 +153,7 @@ void VisibilitySystem::ReconcileViewer(Zone& zone,
             ++viewer->update_events;
             ++out_stats.updates;
         } else {
+            ++viewer->suppressed_events;
             ++out_stats.suppressed;
         }
     }
