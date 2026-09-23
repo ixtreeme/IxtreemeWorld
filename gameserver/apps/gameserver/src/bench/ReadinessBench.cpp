@@ -164,6 +164,22 @@ struct ZoneStageTotals {
     WindowDelta repl_records;
     WindowDelta migrations;
     WindowDelta ghost_entities;
+    WindowDelta ghost_publish_micros;
+    WindowDelta ghost_reconcile_micros;
+    WindowDelta ghost_publish_updates;
+    WindowDelta ghost_publish_adds;
+    WindowDelta ghost_publish_removes;
+    WindowDelta ghost_publish_refreshes;
+    WindowDelta ghost_publish_skips;
+    WindowDelta ghost_keep;
+    WindowDelta ghost_add;
+    WindowDelta ghost_remove;
+    WindowDelta ghost_reconcile_skips;
+    WindowDelta ghost_delta_reconciles;
+    WindowDelta ghost_full_reconciles;
+    WindowDelta ghost_full_fallbacks;
+    WindowDelta ghost_candidates;
+    WindowDelta ghost_spatial_queries;
 };
 
 struct GlobalCounters {
@@ -318,6 +334,11 @@ int RunReadinessBenchmark(boost::asio::io_context& io, const ReadinessConfig& co
         partition.scoring.oscillation_window_s = 10.0f;
     }
     sim.ConfigurePartition(partition);
+    if (config.ghost_shadow) {
+        // Correctness run: a validator-detected inconsistency must stay
+        // visible (no auto-repair) so the equivalence proof is honest.
+        sim.SetGhostAutoRepair(false);
+    }
 
     if (config.lod_off) {
         gs::game::LodConfig lod;
@@ -595,6 +616,38 @@ int RunReadinessBenchmark(boost::asio::io_context& io, const ReadinessConfig& co
                             totals.migrations);
             AccumulateWindow(diag.ghost_entities_since_diag.load(std::memory_order_relaxed),
                             totals.ghost_entities);
+            AccumulateWindow(diag.ghost_publish_micros_since_diag.load(std::memory_order_relaxed),
+                            totals.ghost_publish_micros);
+            AccumulateWindow(diag.ghost_reconcile_micros_since_diag.load(std::memory_order_relaxed),
+                            totals.ghost_reconcile_micros);
+            AccumulateWindow(diag.ghost_publish_updates_since_diag.load(std::memory_order_relaxed),
+                            totals.ghost_publish_updates);
+            AccumulateWindow(diag.ghost_publish_adds_since_diag.load(std::memory_order_relaxed),
+                            totals.ghost_publish_adds);
+            AccumulateWindow(diag.ghost_publish_removes_since_diag.load(std::memory_order_relaxed),
+                            totals.ghost_publish_removes);
+            AccumulateWindow(diag.ghost_publish_refreshes_since_diag.load(std::memory_order_relaxed),
+                            totals.ghost_publish_refreshes);
+            AccumulateWindow(diag.ghost_publish_skips_since_diag.load(std::memory_order_relaxed),
+                            totals.ghost_publish_skips);
+            AccumulateWindow(diag.ghost_keep_since_diag.load(std::memory_order_relaxed),
+                            totals.ghost_keep);
+            AccumulateWindow(diag.ghost_add_since_diag.load(std::memory_order_relaxed),
+                            totals.ghost_add);
+            AccumulateWindow(diag.ghost_remove_since_diag.load(std::memory_order_relaxed),
+                            totals.ghost_remove);
+            AccumulateWindow(diag.ghost_reconcile_skips_since_diag.load(std::memory_order_relaxed),
+                            totals.ghost_reconcile_skips);
+            AccumulateWindow(diag.ghost_delta_reconciles_since_diag.load(std::memory_order_relaxed),
+                            totals.ghost_delta_reconciles);
+            AccumulateWindow(diag.ghost_full_reconciles_since_diag.load(std::memory_order_relaxed),
+                            totals.ghost_full_reconciles);
+            AccumulateWindow(diag.ghost_full_fallbacks_since_diag.load(std::memory_order_relaxed),
+                            totals.ghost_full_fallbacks);
+            AccumulateWindow(diag.ghost_candidates_examined_since_diag.load(std::memory_order_relaxed),
+                            totals.ghost_candidates);
+            AccumulateWindow(diag.ghost_spatial_queries_since_diag.load(std::memory_order_relaxed),
+                            totals.ghost_spatial_queries);
         }
     };
 
@@ -737,10 +790,15 @@ int RunReadinessBenchmark(boost::asio::io_context& io, const ReadinessConfig& co
         }
     };
 
-    std::printf("READINESS measure: %ds\n", config.measure_seconds);
+    std::printf("READINESS measure: %ds ghost_shadow=%d\n",
+                config.measure_seconds,
+                config.ghost_shadow ? 1 : 0);
     const auto measure_start = Clock::now();
     const auto measure_end = measure_start + std::chrono::seconds(config.measure_seconds);
     auto next_sample = measure_start;
+    auto next_ghost_shadow = measure_start;
+    std::uint64_t ghost_shadow_runs = 0;
+    std::uint64_t ghost_shadow_failures = 0;
     const GlobalCounters counters_before = snapshot_globals();
     while (Clock::now() < measure_end) {
         const auto now = Clock::now();
@@ -748,6 +806,22 @@ int RunReadinessBenchmark(boost::asio::io_context& io, const ReadinessConfig& co
             sample_zones();
             sample_load_field();
             next_sample = now + std::chrono::milliseconds(200);
+        }
+        if (config.ghost_shadow) {
+            if (now >= next_ghost_shadow) {
+                sim.RequestGhostValidation();
+                next_ghost_shadow = now + std::chrono::seconds(2);
+            }
+            std::string result;
+            if (sim.TryTakeGhostValidationResult(result)) {
+                ++ghost_shadow_runs;
+                if (result != "OK") {
+                    ++ghost_shadow_failures;
+                    if (ghost_shadow_failures <= 3) {
+                        std::printf("READINESS ghost-shadow FAIL: %s\n", result.c_str());
+                    }
+                }
+            }
         }
         run_actions(now);
         std::this_thread::sleep_for(std::chrono::milliseconds(20));
@@ -762,15 +836,32 @@ int RunReadinessBenchmark(boost::asio::io_context& io, const ReadinessConfig& co
     sim.RequestValidation();
     bool validated = false;
     std::string validation_result = "timeout";
+    const auto validation_wait_start = Clock::now();
     // A quiescent window can be rare while hundreds of zones tick in flight;
-    // wait up to 90s for the audit slot.
-    for (int i = 0; i < 900; ++i) {
+    // wait up to 240s for the audit slot (the audit itself scans all
+    // authority, which is why it only runs in this explicit debug window).
+    for (int i = 0; i < 2400; ++i) {
         if (sim.TryTakeValidationResult(validation_result)) {
             validated = validation_result == "OK";
             break;
         }
         std::this_thread::sleep_for(std::chrono::milliseconds(100));
     }
+    const double validation_wait_s =
+        std::chrono::duration<double>(Clock::now() - validation_wait_start).count();
+    std::size_t stuck_zones = 0;
+    std::uint64_t zone_ticks = 0;
+    for (std::size_t zi = 0; zi < sim.Zones().ZoneCount(); ++zi) {
+        auto& zone = sim.Zones().GetZone(zi);
+        if (zone.TickInProgress().load(std::memory_order_acquire)) {
+            ++stuck_zones;
+        }
+        zone_ticks += zone.TickIndex();
+    }
+    std::printf("READINESS validation_wait_s=%.1f stuck_zones=%zu zone_ticks=%llu\n",
+                validation_wait_s,
+                stuck_zones,
+                (unsigned long long)zone_ticks);
     check("validation", validated);
 
     // ---- REPORT -----------------------------------------------------------
@@ -891,6 +982,32 @@ int RunReadinessBenchmark(boost::asio::io_context& io, const ReadinessConfig& co
     const std::uint64_t tier_diff =
         tier_sum > resident_mobs ? tier_sum - resident_mobs : resident_mobs - tier_sum;
     const std::uint64_t tier_tolerance = std::max<std::uint64_t>(32, resident_mobs / 500);
+    if (tier_diff > tier_tolerance) {
+        std::size_t shown = 0;
+        for (std::size_t zi = 0; zi < sim.Zones().ZoneCount() && shown < 8; ++zi) {
+            const auto& zone = sim.Zones().GetZone(zi);
+            const auto& diag = zone.Diagnostics();
+            const std::uint64_t zone_tiers = diag.lod_full.load(std::memory_order_relaxed) +
+                                             diag.lod_reduced.load(std::memory_order_relaxed) +
+                                             diag.lod_low.load(std::memory_order_relaxed) +
+                                             diag.lod_dormant.load(std::memory_order_relaxed);
+            const std::uint64_t zone_mobs = diag.mob_count.load(std::memory_order_relaxed);
+            if (zone_tiers == zone_mobs) {
+                continue;
+            }
+            std::printf("TIER-MISMATCH zone=%u mobs=%llu tiers=%llu tiersum=%llu "
+                        "sleeping=%d sim=%d part=%u players=%llu\n",
+                        zone.Id(),
+                        (unsigned long long)zone_mobs,
+                        (unsigned long long)zone_tiers,
+                        (unsigned long long)zone_tiers,
+                        zone.Activity() == gs::game::ZoneActivity::Sleeping ? 1 : 0,
+                        zone.SimulationEnabled() ? 1 : 0,
+                        static_cast<unsigned>(zone.Partition()),
+                        (unsigned long long)diag.player_count.load(std::memory_order_relaxed));
+            ++shown;
+        }
+    }
     check("tier-accounting", tier_diff <= tier_tolerance);
     std::printf("READINESS residency: players=%llu mobs=%llu ghosts=%llu active_zones=%zu "
                 "sleeping_zones=%zu\n",
@@ -924,7 +1041,7 @@ int RunReadinessBenchmark(boost::asio::io_context& io, const ReadinessConfig& co
     (void)stage_measured_total;
     std::printf("READINESS workload: aoi_queries=%llu repl_records=%llu repl_bytes=%llu "
                 "dirty=%llu aoi_candidates=%llu load_sim=%llu load_combat=%llu "
-                "load_migration=%llu ghost_entities=%llu\n",
+                "load_migration=%llu ghost_ops=%llu\n",
                 (unsigned long long)total_aoi_queries,
                 (unsigned long long)total_repl_records,
                 (unsigned long long)load_window.repl_bytes,
@@ -994,6 +1111,43 @@ int RunReadinessBenchmark(boost::asio::io_context& io, const ReadinessConfig& co
     std::printf("READINESS combat: attacks=%llu deaths=%llu\n",
                 (unsigned long long)delta(counters_after.attacks, counters_before.attacks),
                 (unsigned long long)delta(counters_after.deaths, counters_before.deaths));
+
+    const std::uint64_t ghost_publish_us = total_of(&ZoneStageTotals::ghost_publish_micros);
+    const std::uint64_t ghost_reconcile_us = total_of(&ZoneStageTotals::ghost_reconcile_micros);
+    std::printf("READINESS ghost: publish_ms=%.1f reconcile_ms=%.1f ops=%llu "
+                "diff=[keep=%llu add=%llu rem=%llu] "
+                "publish_diff=[upd=%llu add=%llu rem=%llu refresh=%llu skip=%llu] "
+                "reconcile_skip=%llu delta=%llu full=%llu fallbacks=%llu candidates=%llu "
+                "grid_ops=%llu\n",
+                static_cast<double>(ghost_publish_us) / 1000.0,
+                static_cast<double>(ghost_reconcile_us) / 1000.0,
+                (unsigned long long)total_of(&ZoneStageTotals::ghost_entities),
+                (unsigned long long)total_of(&ZoneStageTotals::ghost_keep),
+                (unsigned long long)total_of(&ZoneStageTotals::ghost_add),
+                (unsigned long long)total_of(&ZoneStageTotals::ghost_remove),
+                (unsigned long long)total_of(&ZoneStageTotals::ghost_publish_updates),
+                (unsigned long long)total_of(&ZoneStageTotals::ghost_publish_adds),
+                (unsigned long long)total_of(&ZoneStageTotals::ghost_publish_removes),
+                (unsigned long long)total_of(&ZoneStageTotals::ghost_publish_refreshes),
+                (unsigned long long)total_of(&ZoneStageTotals::ghost_publish_skips),
+                (unsigned long long)total_of(&ZoneStageTotals::ghost_reconcile_skips),
+                (unsigned long long)total_of(&ZoneStageTotals::ghost_delta_reconciles),
+                (unsigned long long)total_of(&ZoneStageTotals::ghost_full_reconciles),
+                (unsigned long long)total_of(&ZoneStageTotals::ghost_full_fallbacks),
+                (unsigned long long)total_of(&ZoneStageTotals::ghost_candidates),
+                (unsigned long long)total_of(&ZoneStageTotals::ghost_spatial_queries));
+    if (config.ghost_shadow) {
+        const auto ghost_stats = sim.GhostValidationSnapshot();
+        std::printf("READINESS ghost_shadow: polls=%llu poll_failures=%llu validator_runs=%llu "
+                    "validator_failures=%llu repairs=%llu\n",
+                    (unsigned long long)ghost_shadow_runs,
+                    (unsigned long long)ghost_shadow_failures,
+                    (unsigned long long)ghost_stats.runs,
+                    (unsigned long long)ghost_stats.failures,
+                    (unsigned long long)ghost_stats.repairs);
+        check("ghost-shadow-equivalence",
+              ghost_shadow_failures == 0 && ghost_stats.failures == 0);
+    }
 
     const auto activity_metrics = sim.ActivityMetrics();
     const auto load_metrics = sim.LoadFieldMetrics();

@@ -82,6 +82,10 @@ void InputRouter::DrainMoves(OwnerMap& owners)
             intent.state = input.state;
             intent.last_input_seq = input.sequence;
             entity.set<MoveIntent>(intent);
+            // Phase 5A: move_state is a published border field; an intent
+            // change without displacement (e.g. stopping) must still refresh
+            // the entity's border snapshot.
+            zone.MarkEntityDirty(entity);
         });
     }
 }

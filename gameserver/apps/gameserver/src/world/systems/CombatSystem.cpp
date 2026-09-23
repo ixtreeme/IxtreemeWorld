@@ -85,6 +85,9 @@ CombatSystem::AttackResult CombatSystem::ProcessAttack(Zone& zone,
     auto target_hp = target_entity.get<Hp>();
     target_hp.current = std::max(0.0f, target_hp.current - damage_dealt);
     target_entity.set<Hp>(target_hp);
+    // Phase 5A: HP is a published border field; the target's border snapshot
+    // must be refreshed even though it did not move.
+    zone.MarkEntityDirty(target_entity);
     // Load field attribution: combat heat is event-derived and decays through
     // the field's asymmetric EMA. Attributed to the combat location (attacker
     // position; the target is within attack range by validation above).

@@ -33,6 +33,7 @@ set(GAMESERVER_WORLD_SOURCES
     src/world/debug/WorldValidator.cpp
     src/world/visibility/BorderPublisher.cpp
     src/world/visibility/GhostSystem.cpp
+    src/world/visibility/GhostValidator.cpp
     src/world/visibility/VisibilitySystem.cpp
     src/world/migration/EntityTransfer.cpp
     src/world/migration/MigrationCoordinator.cpp

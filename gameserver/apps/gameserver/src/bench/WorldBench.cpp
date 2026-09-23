@@ -100,6 +100,7 @@ struct BenchConfig {
     int zones_y = 8;
     int warmup_seconds = 15;
     bool asf_off = false;
+    bool ghost_shadow = false;
 };
 
 bool ParseArgs(int argc, char** argv, BenchConfig& config)
@@ -117,7 +118,7 @@ bool ParseArgs(int argc, char** argv, BenchConfig& config)
         std::string value;
         if (arg == "--help" || arg == "-h") {
             std::cout << "worldbench [--players N] [--mobs M] [--seconds S]\n"
-                         "             [--mode spread|hotspot|border|dense|splitmerge|lod|activity|loadfield|partitionscore|stability|readiness]\n"
+                         "             [--mode spread|hotspot|border|dense|splitmerge|lod|activity|loadfield|partitionscore|stability|ghost|readiness]\n"
                          "             [--validate-every K] [--despawn-storm R] [--seed S]\n"
                          "             [--logical-processes K] [--routing-selftest]\n"
                          "             [--field-selftest] [--loadfield-selftest] [--partitionscore-selftest]\n"
@@ -225,6 +226,8 @@ bool ParseArgs(int argc, char** argv, BenchConfig& config)
             config.warmup_seconds = std::stoi(value);
         } else if (arg == "--asf-off") {
             config.asf_off = true;
+        } else if (arg == "--ghost-shadow") {
+            config.ghost_shadow = true;
         } else {
             std::cerr << "unknown arg: " << arg << "\n";
             return false;
@@ -234,7 +237,7 @@ bool ParseArgs(int argc, char** argv, BenchConfig& config)
         config.mode != "dense" && config.mode != "splitmerge" && config.mode != "lod" &&
         config.mode != "activity" && config.mode != "loadfield" &&
         config.mode != "partitionscore" && config.mode != "stability" &&
-        config.mode != "readiness") {
+        config.mode != "readiness" && config.mode != "ghost") {
         std::cerr << "bad mode: " << config.mode << "\n";
         return false;
     }
@@ -3359,6 +3362,293 @@ int RunStabilityScenario(boost::asio::io_context& io, const BenchConfig& config)
     return failures;
 }
 
+// Phase 5A ghost correctness scenario: cross-zone ghost add/keep/remove,
+// migration (no duplicate / no authoritative ghost), despawn cleanup,
+// split/merge topology invalidation, and continuous exact equivalence
+// validation (publisher fidelity + reconcile diff) in the supervisor's
+// quiescent window. Own sim lifecycle on the test map. Returns failures.
+int RunGhostScenario(boost::asio::io_context& io, const BenchConfig& config)
+{
+    int failures = 0;
+    int validations = 0;
+    int equivalence_runs = 0;
+    int equivalence_failures = 0;
+    auto check = [&](const char* name, bool pass) {
+        if (pass) {
+            std::printf("GHOST %s: PASS\n", name);
+        } else {
+            std::printf("GHOST %s: FAIL\n", name);
+            ++failures;
+        }
+    };
+
+    gs::game::WorldRuntime sim(io);
+    auto validate_now = [&](const char* what) -> bool {
+        sim.RequestValidation();
+        for (int i = 0; i < 100; ++i) {
+            std::string result;
+            if (sim.TryTakeValidationResult(result)) {
+                ++validations;
+                if (result != "OK") {
+                    std::printf("GHOST validation(%s): FAIL: %s\n", what, result.c_str());
+                    return false;
+                }
+                return true;
+            }
+            std::this_thread::sleep_for(std::chrono::milliseconds(100));
+        }
+        std::printf("GHOST validation(%s): TIMEOUT\n", what);
+        return false;
+    };
+    auto ghost_equivalence = [&](const char* what) -> bool {
+        sim.RequestGhostValidation();
+        for (int i = 0; i < 200; ++i) {
+            std::string result;
+            if (sim.TryTakeGhostValidationResult(result)) {
+                ++equivalence_runs;
+                if (result != "OK") {
+                    ++equivalence_failures;
+                    std::printf("GHOST equivalence(%s): FAIL: %s\n", what, result.c_str());
+                    return false;
+                }
+                return true;
+            }
+            std::this_thread::sleep_for(std::chrono::milliseconds(50));
+        }
+        std::printf("GHOST equivalence(%s): TIMEOUT\n", what);
+        ++equivalence_failures;
+        return false;
+    };
+    // Net id of a static resident at an exact position (deterministic).
+    auto find_net_at = [&](const gs::game::Zone& zone, float x, float y) -> std::uint32_t {
+        for (const auto& [net_id, entity] : zone.Entities()) {
+            if (!entity.is_valid() || !entity.has<gs::game::Position>()) {
+                continue;
+            }
+            const auto pos = entity.get<gs::game::Position>();
+            if (pos.x == x && pos.y == y) {
+                return net_id;
+            }
+        }
+        return 0;
+    };
+    // Count ghost copies of a net across every zone (must be 0 or 1).
+    auto ghost_copies = [&](std::uint32_t net_id) {
+        int copies = 0;
+        for (std::size_t i = 0; i < sim.Zones().ZoneCount(); ++i) {
+            if (sim.Zones().GetZone(i).FindGhost(net_id) != nullptr) {
+                ++copies;
+            }
+        }
+        return copies;
+    };
+    auto ghost_source = [&](std::uint32_t net_id) -> std::uint32_t {
+        for (std::size_t i = 0; i < sim.Zones().ZoneCount(); ++i) {
+            const auto* ghost = sim.Zones().GetZone(i).FindGhost(net_id);
+            if (ghost != nullptr) {
+                return ghost->source_zone_id;
+            }
+        }
+        return 0;
+    };
+
+    const auto deadline =
+        std::chrono::steady_clock::now() + std::chrono::seconds(std::max(180, config.seconds));
+    auto expired = [&] { return std::chrono::steady_clock::now() >= deadline; };
+
+    // The 500m test-map zones can only split with a lowered floor (validated
+    // to 2x AOI radius = 240m).
+    gs::game::PartitionConfig pcfg;
+    pcfg.min_zone_size_m = 100.0f;
+    sim.ConfigurePartition(pcfg);
+
+    sim.Start();
+
+    // ---- Phase 1: cross-zone ghosts (player in zone A, mobs in zone B).
+    const std::size_t zone_a_index = sim.Zones().FindIndexForPosition(100.0f, 100.0f);
+    const std::size_t zone_b_index = sim.Zones().FindIndexForPosition(800.0f, 100.0f);
+    check("zone-pair", zone_a_index < sim.Zones().ZoneCount() &&
+                           zone_b_index < sim.Zones().ZoneCount() &&
+                           zone_a_index != zone_b_index);
+    if (zone_a_index >= sim.Zones().ZoneCount() || zone_b_index >= sim.Zones().ZoneCount()) {
+        sim.Stop();
+        return failures + 1;
+    }
+    const gs::game::ZoneId zone_a_id = sim.Zones().GetZone(zone_a_index).Id();
+    const gs::game::ZoneId zone_b_id = sim.Zones().GetZone(zone_b_index).Id();
+
+    constexpr float kBoundaryX = 500.0f;
+    constexpr float kPlayerY = 250.0f;
+    const float player_x = kBoundaryX - 20.0f;
+    const float mob_x = kBoundaryX + 20.0f;
+    constexpr gs::common::SessionId kPlayer = 770;
+    constexpr gs::common::SessionId kPeer = 771;
+    {
+        boost::asio::ip::tcp::socket socket(io);
+        auto session = std::make_shared<gs::network::Session>(std::move(socket), kPlayer);
+        sim.PostSpawn(session, MakeBenchCharacter(970),
+                      gs::game::DebugSpawnOverride{player_x, kPlayerY});
+    }
+    {
+        // A viewer on the other side: ghosts exist for zones WITH viewers, so
+        // both zones must have a player for the cross-zone ghost assertions.
+        boost::asio::ip::tcp::socket socket(io);
+        auto session = std::make_shared<gs::network::Session>(std::move(socket), kPeer);
+        sim.PostSpawn(session, MakeBenchCharacter(971),
+                      gs::game::DebugSpawnOverride{mob_x, kPlayerY});
+    }
+    {
+        // A second viewer that stays in zone A: after the mobile player
+        // migrates east, zone A must still maintain its ghost set.
+        boost::asio::ip::tcp::socket socket(io);
+        auto session = std::make_shared<gs::network::Session>(std::move(socket), 772);
+        sim.PostSpawn(session, MakeBenchCharacter(972),
+                      gs::game::DebugSpawnOverride{player_x, kPlayerY + 10.0f});
+    }
+    for (int i = 0; i < 4; ++i) {
+        gs::game::MobSpawnPoint point;
+        point.mob_type_id = 2;
+        point.x = mob_x;
+        point.y = kPlayerY - 6.0f + static_cast<float>(i) * 4.0f;
+        point.count = 1;
+        point.radius = 0.0f; // static mob: exact position forever
+        sim.AddMobSpawnPoint(point);
+    }
+    for (int i = 0; i < 4; ++i) {
+        sim.RequestMobSpawn(static_cast<std::size_t>(4 + i));
+    }
+    const bool populated = WaitFor(std::chrono::seconds(20), [&] {
+        return sim.Owners().size() == 3 && sim.CollectProcessLoad().mobs >= 4;
+    });
+    check("populate", populated && !expired());
+    if (!populated) {
+        sim.Stop();
+        return failures + 1;
+    }
+    std::this_thread::sleep_for(std::chrono::seconds(2)); // publish + reconcile settle
+
+    const auto owner_it = sim.Owners().find(kPlayer);
+    check("player-owner", owner_it != sim.Owners().end());
+    if (owner_it == sim.Owners().end()) {
+        sim.Stop();
+        return failures + 1;
+    }
+    const std::uint32_t player_net = owner_it->second.net_id;
+    const gs::game::Zone& zone_a = sim.Zones().GetZone(zone_a_index);
+    const gs::game::Zone& zone_b = sim.Zones().GetZone(zone_b_index);
+    const std::uint32_t mob_nets[4] = {
+        find_net_at(zone_b, mob_x, kPlayerY - 6.0f),
+        find_net_at(zone_b, mob_x, kPlayerY - 2.0f),
+        find_net_at(zone_b, mob_x, kPlayerY + 2.0f),
+        find_net_at(zone_b, mob_x, kPlayerY + 6.0f)};
+    bool mobs_found = true;
+    for (const auto net : mob_nets) {
+        mobs_found = mobs_found && net != 0;
+    }
+    check("mobs-indexed", mobs_found);
+
+    // Zone A must ghost the zone-B mobs; zone B must ghost the zone-A player.
+    bool a_ghosts_mobs = mobs_found;
+    for (const auto net : mob_nets) {
+        const auto* ghost = zone_a.FindGhost(net);
+        a_ghosts_mobs = a_ghosts_mobs && ghost != nullptr &&
+                        ghost->source_zone_id == zone_b_id &&
+                        ghost->snapshot.position.x == mob_x;
+    }
+    const auto* player_ghost_b = zone_b.FindGhost(player_net);
+    check("cross-zone-ghosts", a_ghosts_mobs && player_ghost_b != nullptr &&
+                                   player_ghost_b->source_zone_id == zone_a_id);
+    check("equivalence-initial", ghost_equivalence("initial"));
+    check("validate-initial", validate_now("initial"));
+    std::printf("GHOST metrics: zone_a_ghosts=%zu zone_b_ghosts=%zu copies=%d\n",
+                zone_a.Ghosts().size(),
+                zone_b.Ghosts().size(),
+                ghost_copies(player_net));
+
+    // ---- Phase 2: migration across the boundary. During the crossing the
+    // player is authoritative in exactly one zone and ghosted in at most one;
+    // equivalence must hold throughout.
+    std::uint32_t seq = 0;
+    const auto cross_until = std::chrono::steady_clock::now() + std::chrono::seconds(12);
+    bool crossing_ok = true;
+    int max_copies = 0;
+    while (std::chrono::steady_clock::now() < cross_until && !expired()) {
+        sim.PostMoveInput(kPlayer, ++seq, 1.5707963f, gs::game::MoveState::Running);
+        const int copies = ghost_copies(player_net);
+        max_copies = std::max(max_copies, copies);
+        if (copies > 1) {
+            crossing_ok = false;
+        }
+        std::this_thread::sleep_for(std::chrono::milliseconds(200));
+    }
+    check("migration-no-duplicate", crossing_ok && max_copies <= 1);
+    // The player must now be authoritative in B and ghosted in A.
+    const auto crossed = WaitFor(std::chrono::seconds(10), [&] {
+        const auto it = sim.Owners().find(kPlayer);
+        return it != sim.Owners().end() && it->second.zone_index == zone_b_index;
+    });
+    check("migrated", crossed && !expired());
+    std::this_thread::sleep_for(std::chrono::seconds(2));
+    const auto* player_ghost_a = zone_a.FindGhost(player_net);
+    check("migrated-ghost-source", player_ghost_a != nullptr &&
+                                      player_ghost_a->source_zone_id == zone_b_id &&
+                                      zone_b.FindGhost(player_net) == nullptr);
+    check("equivalence-migrated", ghost_equivalence("migrated"));
+    check("validate-migrated", validate_now("migrated"));
+
+    // ---- Phase 3: despawn cleanup. No stale ghost may survive.
+    sim.PostDespawn(kPlayer);
+    const bool drained = WaitFor(std::chrono::seconds(10), [&] {
+        return sim.Owners().size() == 2; // both stationary viewers stay
+    });
+    check("despawn-drained", drained && !expired());
+    const bool ghosts_gone = WaitFor(std::chrono::seconds(3), [&] {
+        return ghost_copies(player_net) == 0;
+    });
+    check("despawn-ghost-removed", ghosts_gone);
+    check("equivalence-despawn", ghost_equivalence("despawn"));
+
+    // ---- Phase 4: topology invalidation (split + merge). The neighbor sets
+    // change; ghosts from former neighbors must be dropped deterministically.
+    const std::size_t zones_before = sim.Zones().ZoneCount();
+    sim.PostForceSplit(zone_a_id);
+    const bool split_done = WaitFor(std::chrono::seconds(15), [&] {
+        return sim.Zones().ZoneCount() == zones_before + 4;
+    });
+    check("split-committed", split_done && !expired());
+    std::this_thread::sleep_for(std::chrono::seconds(1));
+    check("equivalence-after-split", ghost_equivalence("after-split"));
+    check("validate-after-split", validate_now("after-split"));
+
+    sim.PostForceMerge(zone_a_id);
+    const bool merge_done = WaitFor(std::chrono::seconds(15), [&] {
+        const auto metrics = sim.PartitionMetricsSnapshot();
+        return metrics.merge_commits >= 1;
+    });
+    check("merge-committed", merge_done && !expired());
+    std::this_thread::sleep_for(std::chrono::seconds(1));
+    check("equivalence-after-merge", ghost_equivalence("after-merge"));
+    check("validate-final", validate_now("final"));
+
+    const auto ghost_stats = sim.GhostValidationSnapshot();
+    std::printf("GHOST stats: equivalence_runs=%d equivalence_failures=%d "
+                "validator_runs=%llu validator_failures=%llu repairs=%llu max_copies=%d\n",
+                equivalence_runs,
+                equivalence_failures,
+                (unsigned long long)ghost_stats.runs,
+                (unsigned long long)ghost_stats.failures,
+                (unsigned long long)ghost_stats.repairs,
+                max_copies);
+    check("no-validator-failures", ghost_stats.failures == 0 && ghost_stats.repairs == 0);
+    check("no-equivalence-failures", equivalence_failures == 0);
+    sim.Stop();
+    std::printf("GHOST-DONE validations=%d equivalence=%d failures=%d\n",
+                validations,
+                equivalence_runs,
+                failures);
+    return failures;
+}
+
 } // namespace
 
 int BenchMain(int argc, char** argv)
@@ -3472,6 +3762,19 @@ int BenchMain(int argc, char** argv)
         return scenario_failures == 0 ? 0 : 2;
     }
 
+    if (config.mode == "ghost") {
+        // Phase 5A ghost incremental maintenance correctness scenario.
+        boost::asio::io_context ghost_io;
+        std::thread ghost_io_thread([&ghost_io] { ghost_io.run(); });
+        const int scenario_failures = RunGhostScenario(ghost_io, config);
+        ghost_io.stop();
+        if (ghost_io_thread.joinable()) {
+            ghost_io_thread.join();
+        }
+        std::printf("BENCH-DONE ghost failures=%d\n", scenario_failures);
+        return scenario_failures == 0 ? 0 : 2;
+    }
+
     if (config.mode == "readiness") {
         // Phase-4 integrated readiness benchmark (synthetic 100km world).
         gs::bench::ReadinessConfig readiness;
@@ -3486,6 +3789,7 @@ int BenchMain(int argc, char** argv)
         readiness.asf_off = config.asf_off;
         readiness.load_field_off = config.load_field_off;
         readiness.lod_off = config.lod_off;
+        readiness.ghost_shadow = config.ghost_shadow;
         readiness.seed = config.seed;
         boost::asio::io_context readiness_io;
         std::thread readiness_io_thread([&readiness_io] { readiness_io.run(); });

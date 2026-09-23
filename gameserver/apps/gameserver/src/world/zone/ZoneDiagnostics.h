@@ -53,9 +53,29 @@ struct ZoneDiagnostics {
     std::atomic<std::uint64_t> aoi_micros_since_diag{0};
     std::atomic<std::uint64_t> activity_publish_micros_since_diag{0};
     std::atomic<std::uint64_t> load_publish_micros_since_diag{0};
-    // Ghost churn proxy: border-snapshot entities copied into the read-only
-    // ghost cache this window (work, not a gauge).
+    // Ghost churn proxy: ghost operations this window = entities created +
+    // removed + moved between spatial cells (the expensive lifecycle work;
+    // plain field updates are not counted).
     std::atomic<std::uint64_t> ghost_entities_since_diag{0};
+    // Phase 5A incremental ghost maintenance: publisher vs reconcile split,
+    // and the KEEP/ADD/REMOVE diff outcome. These make the incremental
+    // behavior measurable (skips and keeps are the fast path).
+    std::atomic<std::uint64_t> ghost_publish_micros_since_diag{0};
+    std::atomic<std::uint64_t> ghost_reconcile_micros_since_diag{0};
+    std::atomic<std::uint64_t> ghost_publish_updates_since_diag{0};
+    std::atomic<std::uint64_t> ghost_publish_adds_since_diag{0};
+    std::atomic<std::uint64_t> ghost_publish_removes_since_diag{0};
+    std::atomic<std::uint64_t> ghost_publish_refreshes_since_diag{0};
+    std::atomic<std::uint64_t> ghost_publish_skips_since_diag{0};
+    std::atomic<std::uint64_t> ghost_keep_since_diag{0};
+    std::atomic<std::uint64_t> ghost_add_since_diag{0};
+    std::atomic<std::uint64_t> ghost_remove_since_diag{0};
+    std::atomic<std::uint64_t> ghost_reconcile_skips_since_diag{0};
+    std::atomic<std::uint64_t> ghost_delta_reconciles_since_diag{0};
+    std::atomic<std::uint64_t> ghost_full_reconciles_since_diag{0};
+    std::atomic<std::uint64_t> ghost_full_fallbacks_since_diag{0};
+    std::atomic<std::uint64_t> ghost_candidates_examined_since_diag{0};
+    std::atomic<std::uint64_t> ghost_spatial_queries_since_diag{0};
 
     // Simulation LOD (§22). Tier gauges are recounted exactly by the 1 Hz
     // zone evaluation; insert paths bump them synchronously so sleep

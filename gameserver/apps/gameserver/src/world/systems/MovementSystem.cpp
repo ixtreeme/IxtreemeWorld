@@ -91,7 +91,7 @@ void MovementSystem::Step(Zone& zone, float dt, ZoneTickContext& ctx)
     });
 
     std::uint64_t moved_entities = 0;
-    auto note_moved = [&](const Position& before, const Position& after) {
+    auto note_moved = [&](flecs::entity entity, const Position& before, const Position& after) {
         // Dirty-transform signal (§27): sub-centimeter moves (warp/clamp
         // rounding) don't count; real displacement does. Feeds the
         // dirty-vs-sent ratio in diagnostics; sending itself is unchanged
@@ -100,6 +100,9 @@ void MovementSystem::Step(Zone& zone, float dt, ZoneTickContext& ctx)
         const float dy = after.y - before.y;
         if (dx * dx + dy * dy > 0.0001f) {
             ++moved_entities;
+            // Phase 5A: only entities that actually changed need their border
+            // snapshot re-evaluated (no full resident scan per tick).
+            zone.MarkEntityDirty(entity);
             // Load field attribution: a dirty transform is replication
             // pressure in waiting; binned at the destination position.
             if (auto* load = zone.LoadBins().CellFor(after.x, after.y)) {
@@ -143,7 +146,7 @@ void MovementSystem::Step(Zone& zone, float dt, ZoneTickContext& ctx)
         }
         TryApplyWarp(zone, ctx, position, session_id);
         position.z = ctx.terrain.SampleGroundHeight(position.x, position.y);
-        note_moved(before_move, position);
+        note_moved(entity, before_move, position);
         // Load field attribution: one movement integration happened HERE.
         if (auto* load = zone.LoadBins().CellFor(position.x, position.y)) {
             ++load->sim_work;
@@ -235,7 +238,7 @@ void MovementSystem::Step(Zone& zone, float dt, ZoneTickContext& ctx)
         }
 
         position.z = ctx.terrain.SampleGroundHeight(position.x, position.y);
-        note_moved(before_move, position);
+        note_moved(entity, before_move, position);
         entity.set<Position>(position);
         entity.set<Heading>(heading);
         entity.set<Velocity>(velocity);

@@ -29,6 +29,7 @@
 #include "../partition/PartitionTypes.h"
 #include "../spatial/SpatialGrid.h"
 #include "../visibility/BorderSnapshot.h"
+#include "../visibility/GhostSystem.h"
 #include "ZoneCommandQueue.h"
 #include "ZoneDiagnostics.h"
 
@@ -82,8 +83,10 @@ struct ZoneTickContext {
 //    per-viewer visibility set (network/replication bookkeeping)
 //  - mob_rng_: simulation RNG drivers (never snapshotted/replicated)
 //  - ghosts_: read-only copies of NEIGHBOR snapshots for cross-zone visibility
-//  - publish_buffers_: this zone's outbound border snapshots (plain data)
-//  - grid_: spatial index rebuilt from flecs state every tick
+//  - ghost_index_: net_id -> ghost slot (derived index for O(1) maintenance)
+//  - publish_buffer_: this zone's outbound border snapshots (plain data),
+//    maintained incrementally (phase 5A) with an exact content generation
+//  - grid_: spatial index maintained incrementally by the systems
 class Zone {
 public:
     struct PlayerBinding {
@@ -143,16 +146,155 @@ public:
     {
         return ghosts_;
     }
-    std::array<std::vector<BorderEntitySnapshot>, 2>& PublishBuffers() noexcept
+    // Derived lookup for ghost maintenance (net_id -> ghosts_ slot). Only
+    // GhostSystem mutates it; it is kept in sync with ghosts_ (swap-erase
+    // removes). Consumers that need a single ghost should prefer
+    // FindGhost().
+    std::unordered_map<std::uint32_t, std::size_t>& GhostIndex() noexcept
     {
-        return publish_buffers_;
+        return ghost_index_;
     }
-    // Guards the publish buffers only (see Thread-safety note in the report).
+    const std::unordered_map<std::uint32_t, std::size_t>& GhostIndex() const noexcept
+    {
+        return ghost_index_;
+    }
+    const GhostRecord* FindGhost(std::uint32_t net_id) const noexcept
+    {
+        const auto it = ghost_index_.find(net_id);
+        return it != ghost_index_.end() ? &ghosts_[it->second] : nullptr;
+    }
+    GhostMaintenanceState& GhostMaintenance() noexcept
+    {
+        return ghost_maintenance_;
+    }
+    const GhostMaintenanceState& GhostMaintenance() const noexcept
+    {
+        return ghost_maintenance_;
+    }
+    // Canonical outbound border snapshot buffer, guarded by PublishMutex.
+    // Maintained incrementally: content changes bump PublishGeneration().
+    std::vector<BorderEntitySnapshot>& PublishBuffer() noexcept
+    {
+        return publish_buffer_;
+    }
+    const std::vector<BorderEntitySnapshot>& PublishBuffer() const noexcept
+    {
+        return publish_buffer_;
+    }
+    // Publish generation: consumers compare it to skip a neighbor whose
+    // border set did not change at all. Atomic so the reconcile fast path can
+    // check it without taking the publish mutex; the buffer copy still locks.
+    // Release on bump / acquire on read: a consumer that observes a new
+    // generation and then locks sees the matching buffer content.
+    std::uint64_t PublishGeneration() const noexcept
+    {
+        return publish_generation_.load(std::memory_order_acquire);
+    }
+    void BumpPublishGeneration() noexcept
+    {
+        publish_generation_.fetch_add(1, std::memory_order_release);
+    }
+    // Owner-only full-refill scratch + O(1) net->slot index for the canonical
+    // publish buffer (guarded by PublishMutex).
+    std::vector<BorderEntitySnapshot>& PublishScratch() noexcept
+    {
+        return publish_scratch_;
+    }
+    std::unordered_map<std::uint32_t, std::size_t>& PublishIndex() noexcept
+    {
+        return publish_index_;
+    }
+    // Delta publication (guarded by PublishMutex). Nets added or whose
+    // snapshot changed, and nets removed, in the latest publish generation.
+    // Valid only when PublishDeltaValid() is true: a full refill invalidates
+    // the delta and consumers must rescan the buffer.
+    const std::vector<std::uint32_t>& PublishDeltaNets() const noexcept
+    {
+        return publish_delta_nets_;
+    }
+    const std::vector<std::uint32_t>& PublishDeltaRemoved() const noexcept
+    {
+        return publish_delta_removed_;
+    }
+    bool PublishDeltaValid() const noexcept
+    {
+        return publish_delta_valid_;
+    }
+    std::vector<std::uint32_t>& PublishDeltaNetsScratch() noexcept
+    {
+        return publish_delta_nets_scratch_;
+    }
+    std::vector<std::uint32_t>& PublishDeltaRemovedScratch() noexcept
+    {
+        return publish_delta_removed_scratch_;
+    }
+    // Commits a staged incremental generation: the staged delta becomes the
+    // latest-generation delta and the generation advances. Caller holds the
+    // publish mutex.
+    void CommitPublishDelta() noexcept
+    {
+        publish_delta_nets_.swap(publish_delta_nets_scratch_);
+        publish_delta_removed_.swap(publish_delta_removed_scratch_);
+        publish_delta_nets_scratch_.clear();
+        publish_delta_removed_scratch_.clear();
+        publish_delta_valid_ = true;
+        BumpPublishGeneration();
+    }
+    void InvalidatePublishDelta() noexcept
+    {
+        publish_delta_valid_ = false;
+    }
+    // Producer bookkeeping: which resident-set generation was last published.
+    std::uint64_t PublishedEntitySetGeneration() const noexcept
+    {
+        return published_entity_set_generation_;
+    }
+    void NotePublishedEntitySetGeneration(std::uint64_t generation) noexcept
+    {
+        published_entity_set_generation_ = generation;
+    }
+    // Producer-side: resident set generation (spawn/despawn/transfer bumps
+    // it), so the publisher knows when a full refill is required.
+    std::uint64_t EntitySetGeneration() const noexcept
+    {
+        return entity_set_generation_;
+    }
+    // Guards the publish buffer + generation only (see Thread-safety note).
     // Taken for the short buffer fill/copy; never held across system work and
     // never nested, so no lock ordering issues arise.
-    std::mutex& PublishMutex() noexcept
+    std::mutex& PublishMutex() const noexcept
     {
         return publish_mutex_;
+    }
+    // --- phase 5A: dirty entities for incremental border publication ---
+    // Movement / combat HP / move-intent changes mark the entity here; the
+    // publisher re-evaluates only these instead of scanning every resident.
+    // Owner-thread only (tick or guarded command); cleared at tick start.
+    void MarkEntityDirty(flecs::entity entity)
+    {
+        if (entity.is_valid()) {
+            dirty_publish_entities_.push_back(entity);
+        }
+    }
+    std::vector<flecs::entity>& DirtyPublishEntities() noexcept
+    {
+        return dirty_publish_entities_;
+    }
+    const std::vector<flecs::entity>& DirtyPublishEntities() const noexcept
+    {
+        return dirty_publish_entities_;
+    }
+    // Repair seam: a validator-detected publisher staleness forces the next
+    // tick's publish to be a full refill.
+    void RequestForcePublish() noexcept
+    {
+        force_publish_ = true;
+    }
+    bool ConsumeForcePublish() noexcept
+    {
+        const bool requested = force_publish_;
+        force_publish_ = false;
+        return requested;
     }
     // --- spatial activity publication (derived data, never authority) ---
     // This zone's authoritative player sources for the world-space activity
@@ -374,8 +516,34 @@ private:
     ZoneCommandQueue commands_;
     SpatialGrid grid_;
     std::vector<GhostRecord> ghosts_;
-    std::array<std::vector<BorderEntitySnapshot>, 2> publish_buffers_;
-    std::mutex publish_mutex_;
+    // Incremental border publication (phase 5A). `publish_buffer_` is the
+    // canonical content; `publish_scratch_` is the owner-only full-refill
+    // scratch (compared against the canonical buffer to decide whether the
+    // publish generation advances). `publish_index_` mirrors the buffer for
+    // O(1) dirty-entity updates. All three are guarded by publish_mutex_.
+    std::vector<BorderEntitySnapshot> publish_buffer_;
+    std::vector<BorderEntitySnapshot> publish_scratch_;
+    std::unordered_map<std::uint32_t, std::size_t> publish_index_;
+    // Phase 5A delta publication: nets added/changed and nets removed by the
+    // LATEST publish generation. Consumers that are exactly one generation
+    // behind apply only the delta instead of rescanning the whole buffer
+    // (KEEP becomes O(1)); `publish_delta_valid_` is false when the latest
+    // generation was a full refill (consumers fall back to a full scan).
+    // Scratch vectors are owner-only staging so a no-op publish never
+    // destroys the previous generation's delta.
+    std::vector<std::uint32_t> publish_delta_nets_;
+    std::vector<std::uint32_t> publish_delta_removed_;
+    std::vector<std::uint32_t> publish_delta_nets_scratch_;
+    std::vector<std::uint32_t> publish_delta_removed_scratch_;
+    bool publish_delta_valid_ = false;
+    std::atomic<std::uint64_t> publish_generation_{0};
+    std::uint64_t entity_set_generation_ = 0;
+    std::uint64_t published_entity_set_generation_ = 0;
+    mutable std::mutex publish_mutex_;
+    std::vector<flecs::entity> dirty_publish_entities_;
+    bool force_publish_ = false;
+    std::unordered_map<std::uint32_t, std::size_t> ghost_index_;
+    GhostMaintenanceState ghost_maintenance_;
     std::vector<PlayerInfluenceSource> activity_sources_;
     std::vector<LoadBinEntry> published_load_bins_;
     ZoneLoadBins load_bins_;

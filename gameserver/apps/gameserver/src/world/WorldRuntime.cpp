@@ -18,6 +18,7 @@
 #include "replication/NetworkSend.h"
 #include "systems/CombatSystem.h"
 #include "visibility/GhostSystem.h"
+#include "visibility/GhostValidator.h"
 #include "zone/ZoneOwnership.h"
 #include "WorldConstants.h"
 
@@ -358,28 +359,28 @@ void WorldRuntime::Run()
             last_load_field_build_ = now_load_field;
             load_field_.Rebuild(zones_, dt);
         }
-        // Wake radius derives from the LOD reduced radius (§20): any player
-        // inside it may grant Full/Reduced relevance, so the zone must tick.
-        scheduler_.ScheduleOnce(zones_,
-                                workers_,
-                                std::chrono::steady_clock::now(),
-                                activity_snapshot,
-                                effective_lod_config_.reduced_radius_m);
-        ExecutePartitionControl();
-        const auto supervisor_micros = static_cast<std::uint64_t>(
-            std::chrono::duration_cast<std::chrono::microseconds>(std::chrono::steady_clock::now() -
-                                                                 supervisor_start)
-                .count());
-        supervisor_micros_since_diag_ += supervisor_micros;
-        supervisor_micros_total_.fetch_add(supervisor_micros, std::memory_order_relaxed);
-        supervisor_samples_.fetch_add(1, std::memory_order_relaxed);
+        // Explicit audit gate (debug/bench only; never requested on the
+        // production path): while an audit is pending, stop scheduling new
+        // ticks until the in-flight wave drains. Near saturation the wave
+        // covers the whole tick period, so without this gate the quiescent
+        // window the audits require may never occur.
+        const bool audit_pending = validation_requested_.load(std::memory_order_relaxed) ||
+                                   load_field_validation_requested_.load(std::memory_order_relaxed) ||
+                                   ghost_validation_requested_.load(std::memory_order_relaxed) ||
+                                   activity_validation_requested_.load(std::memory_order_relaxed);
+        if (audit_pending && zones_.AnyTickInProgress()) {
+            std::unique_lock drain_lock(mutex_);
+            cv_.wait_for(drain_lock, std::chrono::milliseconds(1), [this] {
+                return stopping_.load();
+            });
+            continue;
+        }
 
-        // Operational audit window: when no zone tick is in progress and no
-        // new tick will start before ScheduleOnce already ran above... note
-        // new tasks were just enqueued, but their tick_in_progress flags are
-        // already set, so AnyTickInProgress() covers them. All workers are
-        // parked here, and the supervisor itself is between mutations: zone
-        // state is stable to read.
+        // Operational audit window: the gate above guarantees no zone tick is
+        // in progress here; audits run before scheduling so the window stays
+        // quiescent for the duration of the checks. All workers are parked,
+        // and the supervisor itself is between mutations: zone state is
+        // stable to read.
         if (validation_requested_.load(std::memory_order_relaxed)) {
             if (!zones_.AnyTickInProgress()) {
                 validation_requested_.store(false, std::memory_order_relaxed);
@@ -408,6 +409,36 @@ void WorldRuntime::Run()
                 load_field_validation_ready_ = true;
             }
         }
+        // Phase 5A exact ghost equivalence audit: same quiescent window,
+        // explicit request only (shadow/debug; it scans every zone's
+        // authority). A detected inconsistency triggers the fallback repair
+        // when auto-repair is enabled.
+        if (ghost_validation_requested_.load(std::memory_order_relaxed)) {
+            if (!zones_.AnyTickInProgress()) {
+                ghost_validation_requested_.store(false, std::memory_order_relaxed);
+                std::string error;
+                std::size_t zones_checked = 0;
+                std::size_t ghosts_checked = 0;
+                std::size_t zones_skipped = 0;
+                const bool ok = ValidateAllGhostEquivalence(zones_, error, &zones_checked,
+                                                            &ghosts_checked, &zones_skipped);
+                ghost_validation_runs_.fetch_add(1, std::memory_order_relaxed);
+                if (!ok) {
+                    ghost_validation_failures_.fetch_add(1, std::memory_order_relaxed);
+                    LOG_WARN("ghost equivalence FAIL: {} (zones={} ghosts={} skipped={})",
+                             error,
+                             zones_checked,
+                             ghosts_checked,
+                             zones_skipped);
+                    if (ghost_auto_repair_.load(std::memory_order_relaxed)) {
+                        RepairGhosts();
+                    }
+                }
+                std::lock_guard lock(ghost_validation_mutex_);
+                ghost_validation_result_ = ok ? std::string("OK") : "FAIL: " + error;
+                ghost_validation_ready_ = true;
+            }
+        }
         // Strict field-vs-brute-force audit (§31): same quiescent window,
         // explicit request only (static scenarios; roaming load would race
         // the 1Hz snapshot). Samples + outcome are stashed for the bench.
@@ -427,6 +458,22 @@ void WorldRuntime::Run()
                 activity_samples_ready_ = true;
             }
         }
+
+        // Wake radius derives from the LOD reduced radius (§20): any player
+        // inside it may grant Full/Reduced relevance, so the zone must tick.
+        scheduler_.ScheduleOnce(zones_,
+                                workers_,
+                                std::chrono::steady_clock::now(),
+                                activity_snapshot,
+                                effective_lod_config_.reduced_radius_m);
+        ExecutePartitionControl();
+        const auto supervisor_micros = static_cast<std::uint64_t>(
+            std::chrono::duration_cast<std::chrono::microseconds>(std::chrono::steady_clock::now() -
+                                                                 supervisor_start)
+                .count());
+        supervisor_micros_since_diag_ += supervisor_micros;
+        supervisor_micros_total_.fetch_add(supervisor_micros, std::memory_order_relaxed);
+        supervisor_samples_.fetch_add(1, std::memory_order_relaxed);
 
         const auto now = std::chrono::steady_clock::now();
         if (now >= next_world_tick) {
@@ -456,6 +503,21 @@ void WorldRuntime::Run()
             std::uint64_t total_activity_publish_micros = 0;
             std::uint64_t total_load_publish_micros = 0;
             std::uint64_t total_ghost_entities = 0;
+            std::uint64_t total_ghost_publish_micros = 0;
+            std::uint64_t total_ghost_reconcile_micros = 0;
+            std::uint64_t total_ghost_publish_updates = 0;
+            std::uint64_t total_ghost_publish_adds = 0;
+            std::uint64_t total_ghost_publish_removes = 0;
+            std::uint64_t total_ghost_publish_refreshes = 0;
+            std::uint64_t total_ghost_publish_skips = 0;
+            std::uint64_t total_ghost_keep = 0;
+            std::uint64_t total_ghost_add = 0;
+            std::uint64_t total_ghost_remove = 0;
+            std::uint64_t total_ghost_reconcile_skips = 0;
+            std::uint64_t total_ghost_full_reconciles = 0;
+            std::uint64_t total_ghost_full_fallbacks = 0;
+            std::uint64_t total_ghost_candidates = 0;
+            std::uint64_t total_ghost_spatial_queries = 0;
             std::uint64_t total_lod_ai = 0;
             std::uint64_t total_lod_mv = 0;
             std::uint64_t total_lod_prom = 0;
@@ -513,6 +575,33 @@ void WorldRuntime::Run()
                 total_load_publish_micros +=
                     zone.Diagnostics().load_publish_micros_since_diag.exchange(0);
                 total_ghost_entities += zone.Diagnostics().ghost_entities_since_diag.exchange(0);
+                total_ghost_publish_micros +=
+                    zone.Diagnostics().ghost_publish_micros_since_diag.exchange(0);
+                total_ghost_reconcile_micros +=
+                    zone.Diagnostics().ghost_reconcile_micros_since_diag.exchange(0);
+                total_ghost_publish_updates +=
+                    zone.Diagnostics().ghost_publish_updates_since_diag.exchange(0);
+                total_ghost_publish_adds +=
+                    zone.Diagnostics().ghost_publish_adds_since_diag.exchange(0);
+                total_ghost_publish_removes +=
+                    zone.Diagnostics().ghost_publish_removes_since_diag.exchange(0);
+                total_ghost_publish_refreshes +=
+                    zone.Diagnostics().ghost_publish_refreshes_since_diag.exchange(0);
+                total_ghost_publish_skips +=
+                    zone.Diagnostics().ghost_publish_skips_since_diag.exchange(0);
+                total_ghost_keep += zone.Diagnostics().ghost_keep_since_diag.exchange(0);
+                total_ghost_add += zone.Diagnostics().ghost_add_since_diag.exchange(0);
+                total_ghost_remove += zone.Diagnostics().ghost_remove_since_diag.exchange(0);
+                total_ghost_reconcile_skips +=
+                    zone.Diagnostics().ghost_reconcile_skips_since_diag.exchange(0);
+                total_ghost_full_reconciles +=
+                    zone.Diagnostics().ghost_full_reconciles_since_diag.exchange(0);
+                total_ghost_full_fallbacks +=
+                    zone.Diagnostics().ghost_full_fallbacks_since_diag.exchange(0);
+                total_ghost_candidates +=
+                    zone.Diagnostics().ghost_candidates_examined_since_diag.exchange(0);
+                total_ghost_spatial_queries +=
+                    zone.Diagnostics().ghost_spatial_queries_since_diag.exchange(0);
                 total_lod_ai += zone.Diagnostics().lod_ai_updates_since_diag.exchange(0);
                 total_lod_mv += zone.Diagnostics().lod_move_updates_since_diag.exchange(0);
                 total_lod_prom += zone.Diagnostics().lod_promotions_since_diag.exchange(0);
@@ -555,7 +644,7 @@ void WorldRuntime::Run()
              const auto mig_metrics = migration_.MetricsSnapshot();
              const auto part_metrics = partition_metrics_.TakeSnapshot();
              const auto activity_metrics = activity_field_.Metrics();
-            LOG_INFO("Game sim diag: world_tick={} zones={} active_zones={} sleeping_zones={} active_sessions={} active_mobs={} wandering_mobs={} idle_mobs={} ghosts={} zone_ticks={} empty_zone_skips={} transform_records_sent={} attacks_per_sec={} deaths_total={} respawns_pending={} respawns_total={} migrations={} mig_pending={} mig_quarantined={} mig_detail=[c={} stale={} dup={} retry={} fail={}] routes=[local={} remu={} unav={} drain={} miss={}] workers={} worker_busy_pct={:.1f}                      avg_zone_tick_ms={:.3f} aoi_queries={} dirty_xf={} tiers=[{}/{}/{}] stage_us=[gameplay={} ai={} movement={} aoi={} ghost={} activity={} load={} repl={} ghost_entities={}] avg_supervisor_ms={:.3f} partition=[s_att={} s_ok={} s_ab={} m_att={} m_ok={} m_ab={} rej={}] lod=[{}/{}/{}/{} ai={} mv={} prom={} dem={} wake={} eval_us={}] xzone=[f={} r={} l={}] sleep=[blocked={} wext={}] activity=[srcs={} cells={} rb_us={}]",
+            LOG_INFO("Game sim diag: world_tick={} zones={} active_zones={} sleeping_zones={} active_sessions={} active_mobs={} wandering_mobs={} idle_mobs={} ghosts={} zone_ticks={} empty_zone_skips={} transform_records_sent={} attacks_per_sec={} deaths_total={} respawns_pending={} respawns_total={} migrations={} mig_pending={} mig_quarantined={} mig_detail=[c={} stale={} dup={} retry={} fail={}] routes=[local={} remu={} unav={} drain={} miss={}] workers={} worker_busy_pct={:.1f}                      avg_zone_tick_ms={:.3f} aoi_queries={} dirty_xf={} tiers=[{}/{}/{}] stage_us=[gameplay={} ai={} movement={} aoi={} ghost={} ghost_pub={} ghost_recon={} activity={} load={} repl={} ghost_ops={}] ghost_diff=[keep={} add={} rem={} pub_upd={} pub_add={} pub_rem={} refresh={} pub_skip={} recon_skip={} full={} fb={} cand={} grid={}] avg_supervisor_ms={:.3f} partition=[s_att={} s_ok={} s_ab={} m_att={} m_ok={} m_ab={} rej={}] lod=[{}/{}/{}/{} ai={} mv={} prom={} dem={} wake={} eval_us={}] xzone=[f={} r={} l={}] sleep=[blocked={} wext={}] activity=[srcs={} cells={} rb_us={}]",
                      world_tick_.load(),
                      zones_.ZoneCount(),
                      active_zones,
@@ -598,10 +687,25 @@ void WorldRuntime::Run()
                      total_movement_micros,
                      total_aoi_micros,
                      total_ghost_micros,
+                     total_ghost_publish_micros,
+                     total_ghost_reconcile_micros,
                      total_activity_publish_micros,
                      total_load_publish_micros,
                      total_repl_micros,
                      total_ghost_entities,
+                     total_ghost_keep,
+                     total_ghost_add,
+                     total_ghost_remove,
+                     total_ghost_publish_updates,
+                     total_ghost_publish_adds,
+                     total_ghost_publish_removes,
+                     total_ghost_publish_refreshes,
+                     total_ghost_publish_skips,
+                     total_ghost_reconcile_skips,
+                     total_ghost_full_reconciles,
+                     total_ghost_full_fallbacks,
+                     total_ghost_candidates,
+                     total_ghost_spatial_queries,
                      avg_supervisor_ms,
                      part_metrics.split_attempts,
                      part_metrics.split_commits,
@@ -2110,6 +2214,45 @@ void WorldRuntime::ConfigureLoadField(const LoadFieldConfig& config)
              e.fast_fall_tau_s,
              e.slow_rise_tau_s,
              e.slow_fall_tau_s);
+}
+
+void WorldRuntime::RequestGhostValidation()
+{
+    ghost_validation_requested_.store(true, std::memory_order_relaxed);
+}
+
+bool WorldRuntime::TryTakeGhostValidationResult(std::string& out_result)
+{
+    std::lock_guard lock(ghost_validation_mutex_);
+    if (!ghost_validation_ready_) {
+        return false;
+    }
+    out_result = std::move(ghost_validation_result_);
+    ghost_validation_result_.clear();
+    ghost_validation_ready_ = false;
+    return true;
+}
+
+void WorldRuntime::RepairGhosts()
+{
+    // Fallback path (never the production tick): rebuild every simulating
+    // leaf's ghost state exactly from the current publish buffers and force
+    // the next border publish to refill from authority.
+    for (std::size_t i = 0; i < zones_.ZoneCount(); ++i) {
+        Zone& zone = zones_.GetZone(i);
+        if (!zone.SimulationEnabled() || zone.Partition() != PartitionState::Leaf) {
+            continue;
+        }
+        ZoneWriteGuard guard(zone, "ghost repair");
+        if (zone.Players().empty()) {
+            GhostSystem::Clear(zone);
+        } else {
+            GhostSystem::RebuildExact(zone, zones_);
+        }
+        zone.RequestForcePublish();
+    }
+    ghost_repairs_.fetch_add(1, std::memory_order_relaxed);
+    LOG_WARN("ghost repair: exact rebuild applied to all simulating leaves");
 }
 
 void WorldRuntime::RequestLoadFieldValidation()

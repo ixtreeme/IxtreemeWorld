@@ -622,6 +622,7 @@ Az előző commitból javított Fast/Exact semanticsra **tesztet kell írni**:
 | **E** | §18–24, §27 | BoundaryCost field, Partition Objective, hotspot detection (flood fill), hotspot-aware split, multi-candidate split, merge sustained-low timer | ✅ **KÉSZ** (split §7 + merge/stability §8) |
 | **F** | §1, §21, §29 | `worldbench --mode loadfield`, validator-bővítés, regresszió a meglévő 7 módra, control-loop frekvenciák konfigurálhatóvá tétele | ⚠ **RÉSZLEGES**: `--mode partitionscore`/`--mode stability`/`--mode readiness` + selftestek kész, regresszió zöld; a control-loop frekvencia config még nyitott |
 | **G (Phase 4)** | §0–§28 | Integrált readiness benchmark 100 km / 500 player / 200k mob, stage-instrumentáció, A/B-k, bottleneck audit | ✅ **KÉSZ** (lásd §9) |
+| **H (Phase 5A)** | §9.7/1 | Inkrementális/dirty ghost karbantartás: dirty entity tracking, delta-publish, KEEP/ADD/REMOVE reconcile, egzakt equivalence validator + repair seam, `--mode ghost` + `--ghost-shadow` | ✅ **KÉSZ** (lásd §10) |
 
 ### Chunk A — elvégzett munka
 
@@ -1473,3 +1474,122 @@ szerveződjön:
 A Phase 4 kódváltozásai: minimál instrumentáció (stage timings + diag
 exchange), a fenti 2 production robustness fix, a szintetikus világ/spawn
 seam, és a `--mode readiness` harness (`ReadinessBench.h/.cpp`).
+
+---
+
+## 10. Phase 5A — Inkrementális ghost karbantartás (a §9.7/1 megvalósítása)
+
+> Cél (a Phase 4 bottleneck rangsor #1): a ghost stage **77% → <20%**.
+> A ghost modell és a publikus viselkedés változatlan: a ghost read-only,
+> nem-autoritatív, NetId-stabil, és a migrációs ownership-commit pont
+> érintetlen.
+
+### 10.1 Audit — mi volt a költség
+
+A Phase 4-es `GhostSystem::Rebuild` minden tickben **minden** ghostot eldobott
+és flecs entity-ként újra létrehozott a szomszédok publish-buffereiből (spread:
+97M ghost-entity művelet / 30 s), a `BorderPublisher` pedig minden tickben a
+zóna **összes** residentjét újra-skennelte a border-band vizsgálathoz. Mindkettő
+a player-bearing zónák számával és a border-band entitásszámmal skálázódott.
+
+### 10.2 Design — dirty publish + delta + KEEP/ADD/REMOVE reconcile
+
+**Publisher oldal** (`BorderPublisher`, `Zone`):
+
+- A published mezőket (position, heading, move_state, hp) író pathok
+  dirty-jelölést adnak: movement (>1 cm elmozdulás), combat HP-vesztés, player
+  move-intent, és **AI intent-váltás** (arrival-stop / blokkolt lépés is
+  változtat move_state/heading-et, elmozdulás nélkül).
+- `Publish()` csak a dirty entitásokat dolgozza fel (`UpdateDirtyEntities`);
+  full refill csak spawn/despawn/transfer (`entity_set_generation_`),
+  20 tickenkénti öngyógyító refresh, vagy explicit repair esetén fut.
+- A publish-generation **csak akkor lép**, ha a tartalom tényleg változott
+  (`SameBorderSnapshot`, egzakt, sorrend-független összevetés).
+- **Delta-publish**: a legfrissebb generációhoz tartozó változott/hozzáadott és
+  törölt net-id lista (`publish_delta_nets_` / `publish_delta_removed_`). A
+  full refill invalidálja a deltát.
+
+**Consumer oldal** (`GhostSystem::Reconcile`):
+
+- Neighborenkénti cursor (`publish_generation`); a változatlan generációjú
+  neighbor teljesen kimarad (fast path).
+- Ha a generáció pontosan +1 és a delta érvényes: **csak a delta** alapján
+  upsert/remove (a nem érintett ghostok stamp nélkül maradnak és a cursor
+  szerint életben maradnak). Minden más esetben (gap, full-refill generáció,
+  topology-váltás, lokális residency-váltás) teljes buffer-scan fallback.
+- A generation **és** a delta együtt, a neighbor publish-mutexe alatt
+  olvasódik (különben egy régebbi generáció rögzítésével egy újabb delta
+  alkalmazható lenne, és a kimaradt generáció véglegesen elveszne — ez volt a
+  legfontosabb talált race).
+- Removal pass: a ghost életben marad, ha látta ez a reconcile, vagy ha a
+  forrás-neighbor kimaradt; ha a forrás törölte, de egy **változatlan** neighbor
+  még publikálja (migrációs tranziensek), re-attribúció történik **friss
+  snapshot-tal**. Lokális resident soha nem maradhat ghost.
+- Az attribúció unió-szemantikájú: egy net egyszerre két neighbor bufferében
+  (migráció) egy ghost, bármelyik forrással.
+
+### 10.3 Correctness — egzakt equivalence validator
+
+`GhostValidator` (`--mode ghost`, illetve readiness `--ghost-shadow`):
+
+1. **Publisher fidelity**: a publish-buffer == friss, authority-ból épített
+   halmaz (set + mezők). Egy tick türelmet kap, ha a resident-set generation
+   már változott de a publish még nem futott (spawn/transfer).
+2. **Reconcile equivalence**: a ghost-set == a jelenlegi neighbor bufferekből
+   számított egzakt unió (residentek kizárva, unió-szemantika). Tolerált,
+   dokumentált lag: ≤2 publish-generáció, illetve egy tick topology-váltás
+   után (a cursor-lista még a régi gráfot tükrözi) — ezek „skipped" számlálóba
+   mennek, nem passzba.
+3. **Repair seam**: hiba esetén (auto-repair ON) `RepairGhosts()` =
+   `RebuildExact` minden simulating leafre + force publish. A production tick
+   sosem hívja; a `--ghost-shadow` correctness futás szándékosan kikapcsolja,
+   hogy a mérés őszinte legyen.
+
+A validator a supervisor quiescent ablakában fut. ~300 zónánál a világ
+telített lehet, ezért **audit drain gate** került a supervisor loopba: amíg
+audit van függőben, nem indul új tick, amíg a repülő hullám ki nem ürül
+(debug/bench only; a production path sosem kér auditot).
+
+A fázis közben talált és javított hibák:
+
+1. **Delta/generáció race** (generation lock nélkül, delta lock alatt) →
+   kimaradó delta, tartósan stale ghost. Javítva: atomi generation+delta
+   olvasás a publish-mutex alatt.
+2. **Removal-pass duplicate loss**: a forrás által törölt ghostot a pass
+   eldobta, pedig egy változatlan neighbor még publikálta (migrációs
+   tranziensek) → re-attribúció + snapshot-frissítés.
+3. **Re-attribúció stale snapshotja**: a másik neighbor snapshotja eddig nem
+   másolódott át.
+4. **AI intent-váltás dirty-jelölése**: move_state/heading elmozdulás nélkül is
+   változhat (arrival-stop, blokkolt lépés).
+5. **Audit-window éhezés** telített világban (a fenti drain gate).
+
+### 10.4 Eredmények — 500 player / 200k mob, warmup 60 s, measure 30 s
+
+| scenario | zónák (4→5A) | tick avg (4→5A) | p99 (4→5A) | domináns stage (4→5A) |
+|---|---|---|---|---|
+| spread | 320 → 236 | 1.97 → **1.67 ms** | 7.01 → 7.31 | ghost **77.3% → 16.2%**, repl 8.2% |
+| hotspot | 280 → 280/244 | 2.55 → **1.93/1.71 ms** | 17.28 → **11.38/8.99** | ghost **54.2% → 3.4/5.9%**, repl 51.6–56.4% |
+| dense | 68 → 76 | 8.73 → **4.06 ms** | **294.94 → 82.24** | ghost **7.1%**, repl 65.8% |
+| replication | 100 → 68 | 3.67 → 3.64 ms | **57.58 → 51.32** | ghost **2.7%**, repl 85.8% |
+
+- A ghost stage mindenhol a **<20% cél alatt** van (spread 16.2% a legrosszabb;
+  a ghost stage az activity publish-ot is tartalmazza).
+- Ghost munka (spread): `ops=168k` add/remove/move a Phase 4-es 97M helyett,
+  `keep=14.6M` (nagy része a delta-publikációból), publish 10.8 s + reconcile
+  18.5 s / 30 s.
+- A domináns bottleneck átkerült a **replikációra/AOI-ra** (51–86% a
+  hotspot/dense/replication scenariókban) — ez a Phase 5B célja a Phase 4
+  rangsor szerint.
+- **Correctness futás** (`--ghost-shadow`, spread 500p/200k): 15/15 poll,
+  0 validator failure, 0 equivalence failure, 0 repair; a világ-validáció OK.
+  `--mode ghost` szcenárió: 0 failure, `max_copies=1`.
+- **Regresszió**: a 3 selftest + 7 bench mód + routing selftest zöld.
+
+### 10.5 Következő lépcső (Phase 5B javaslat)
+
+A Phase 4 rangsor 2–5. pontjai változatlanok és most **ezek a dominánsak**:
+AOI candidate-szűrés (dense p99), activity-field query O(players-in-box),
+combat fanout coalescing. A ghost oldalon opcionális továbbfejlesztés a
+`keep`-scan teljes elhagyása (per-source slot-lista), de a mért 16.2% mellett
+ez már nem kritikus.

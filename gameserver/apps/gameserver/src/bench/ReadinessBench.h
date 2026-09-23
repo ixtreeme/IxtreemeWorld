@@ -27,6 +27,11 @@ struct ReadinessConfig {
     bool asf_off = false;        // adaptive control off (observe-only baseline)
     bool load_field_off = false; // load field telemetry off
     bool lod_off = false;        // LOD off (every entity Full-equivalent)
+    // Correctness run: exact ghost equivalence validation every ~2 s during
+    // the measure phase (auto-repair disabled so failures are visible). The
+    // performance numbers of such a run are NOT comparable (shadow scans all
+    // authority) -- use a separate performance run with this off.
+    bool ghost_shadow = false;
     std::uint32_t seed = 20260922;
 };
 

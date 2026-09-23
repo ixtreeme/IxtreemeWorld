@@ -123,6 +123,12 @@ void AiSystem::StepWander(Zone& zone,
 
         entity.set<WanderState>(wander);
         entity.set<MoveIntent>(intent);
+        // Phase 5A: move_state/heading are published border fields, and an AI
+        // decision can change them without displacement (arrival stop, blocked
+        // or radius-clamped step), so the border publisher must re-evaluate
+        // this entity even when the movement integration below does not move
+        // it past the dirty-transform epsilon.
+        zone.MarkEntityDirty(entity);
         ++decided;
     }
 

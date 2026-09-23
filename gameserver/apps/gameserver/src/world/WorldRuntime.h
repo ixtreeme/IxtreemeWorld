@@ -286,6 +286,32 @@ public:
     void RequestLoadFieldValidation();
     bool TryTakeLoadFieldValidationResult(std::string& out_result);
 
+    // Phase 5A exact ghost equivalence audit (publisher fidelity + reconcile
+    // diff) in the same quiescent window. Shadow/debug only: it scans all
+    // zones' authority, so never run it during a performance measurement.
+    void RequestGhostValidation();
+    bool TryTakeGhostValidationResult(std::string& out_result);
+    // Auto-repair a detected inconsistency (ForceFullGhostReconcile on the
+    // affected topology): enabled by default, disabled by the benchmark for
+    // pure equivalence measurement.
+    void SetGhostAutoRepair(bool enabled) noexcept
+    {
+        ghost_auto_repair_.store(enabled, std::memory_order_relaxed);
+    }
+    struct GhostValidationStats {
+        std::uint64_t runs = 0;
+        std::uint64_t failures = 0;
+        std::uint64_t repairs = 0;
+    };
+    GhostValidationStats GhostValidationSnapshot() const noexcept
+    {
+        GhostValidationStats stats;
+        stats.runs = ghost_validation_runs_.load(std::memory_order_relaxed);
+        stats.failures = ghost_validation_failures_.load(std::memory_order_relaxed);
+        stats.repairs = ghost_repairs_.load(std::memory_order_relaxed);
+        return stats;
+    }
+
     // Test seams (benchmarks/admin). Enqueued to the supervisor thread like
     // any other command; they run the FULL transactional path, only the
     // load-predicate gate is bypassed.
@@ -477,6 +503,17 @@ private:
     mutable std::mutex load_field_validation_mutex_;
     std::string load_field_validation_result_;
     bool load_field_validation_ready_ = false;
+
+    // Phase 5A ghost equivalence validation + repair seam.
+    void RepairGhosts();
+    std::atomic<bool> ghost_validation_requested_{false};
+    mutable std::mutex ghost_validation_mutex_;
+    std::string ghost_validation_result_;
+    bool ghost_validation_ready_ = false;
+    std::atomic<std::uint64_t> ghost_validation_runs_{0};
+    std::atomic<std::uint64_t> ghost_validation_failures_{0};
+    std::atomic<std::uint64_t> ghost_repairs_{0};
+    std::atomic<bool> ghost_auto_repair_{true};
 };
 
 } // namespace gs::game

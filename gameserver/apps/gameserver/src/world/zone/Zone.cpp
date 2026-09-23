@@ -47,11 +47,16 @@ void Zone::IndexEntity(std::uint32_t net_id, flecs::entity entity)
     // previous handle and fork authority. Debug-checked; zero Release cost.
     assert(!HasEntity(net_id));
     entities_[net_id] = entity;
+    // The resident set changed: the border publisher must do a full refill
+    // and the ghost reconcile must not trust cached neighbor generations
+    // (phase 5A incremental maintenance).
+    ++entity_set_generation_;
 }
 
 void Zone::UnindexEntity(std::uint32_t net_id)
 {
     entities_.erase(net_id);
+    ++entity_set_generation_;
 }
 
 bool Zone::IsResident(std::uint32_t net_id) const
@@ -190,6 +195,10 @@ void Zone::Tick(float dt, ZoneTickContext& ctx)
     // waits would hang forever.
     try {
         ZoneWriteGuard guard(*this, "Zone::Tick");
+        // Phase 5A: the dirty-publish list is per-tick scratch; commands may
+        // have marked entities before the tick started, so drain only after
+        // the previous tick consumed it (here, at the top).
+        dirty_publish_entities_.clear();
         DrainCommands();
 
         // Simulation LOD evaluation (1 Hz, staggered by zone id so zones
@@ -231,7 +240,14 @@ void Zone::Tick(float dt, ZoneTickContext& ctx)
         // buffers of neighboring zones. The spatial index is maintained
         // incrementally by the systems above, so no rebuild happens here.
         const auto ghost_start = Clock::now();
+        const auto border_publish_start = Clock::now();
         BorderPublisher::Publish(*this);
+        diagnostics_.ghost_publish_micros_since_diag.fetch_add(
+            static_cast<std::uint64_t>(
+                std::chrono::duration_cast<std::chrono::microseconds>(Clock::now() -
+                                                                      border_publish_start)
+                    .count()),
+            std::memory_order_relaxed);
         // World-space activity publication (post-movement positions): this
         // zone's authoritative players for the cross-zone activity field.
         const auto activity_start = Clock::now();
@@ -245,10 +261,17 @@ void Zone::Tick(float dt, ZoneTickContext& ctx)
         if (players_.empty()) {
             GhostSystem::Clear(*this);
         } else {
-            GhostSystem::Rebuild(*this, ctx.zones);
+            // Phase 5A: incremental reconcile (KEEP/ADD/REMOVE), never a full
+            // rebuild on the production path.
+            const auto reconcile_start = Clock::now();
+            GhostSystem::Reconcile(*this, ctx.zones);
+            diagnostics_.ghost_reconcile_micros_since_diag.fetch_add(
+                static_cast<std::uint64_t>(
+                    std::chrono::duration_cast<std::chrono::microseconds>(Clock::now() -
+                                                                          reconcile_start)
+                        .count()),
+                std::memory_order_relaxed);
         }
-        diagnostics_.ghost_entities_since_diag.fetch_add(ghosts_.size(),
-                                                         std::memory_order_relaxed);
         diagnostics_.ghost_micros_since_diag.fetch_add(
             static_cast<std::uint64_t>(
                 std::chrono::duration_cast<std::chrono::microseconds>(Clock::now() - ghost_start)
