@@ -40,6 +40,7 @@ SpawnCoordinator::SpawnCoordinator(boost::asio::io_context& io,
                                    WorldMessageRouter& router,
                                    WakeFn wake,
                                    SendFn send,
+                                   SendFn send_and_close,
                                    RuntimeIdentity identity,
                                    WorldDirectory& directory)
     : io_(io)
@@ -50,6 +51,7 @@ SpawnCoordinator::SpawnCoordinator(boost::asio::io_context& io,
     , router_(router)
     , wake_(std::move(wake))
     , send_(std::move(send))
+    , send_and_close_(std::move(send_and_close))
     , identity_(identity)
     , directory_(directory)
 {
@@ -91,6 +93,19 @@ void SpawnCoordinator::Spawn(std::shared_ptr<gs::network::Session> session,
     const auto session_id = session->Id();
     Despawn(session_id);
 
+    // World presence invariant (H4): one character, at most one authoritative
+    // presence. First presence wins; the newcomer is refused before anything
+    // is allocated or routed, so no second entity can ever exist.
+    if (!presence_.Admit(character.id, session_id)) {
+        const auto* holder = presence_.Find(character.id);
+        LOG_WARN("Session {} enter world refused: character {} already present via session {}",
+                 session_id,
+                 gs::db::ToUint64(character.id),
+                 holder != nullptr ? holder->session_id : 0);
+        send_and_close_(session, MakeEnterWorldRejectAlreadyInWorld());
+        return;
+    }
+
     auto position = ResolveSpawnPosition(character, debug_spawn, session_id);
     std::size_t zone_index = zones_.FindIndexForPosition(position.x, position.y);
     if (zone_index >= zones_.ZoneCount()) {
@@ -117,6 +132,7 @@ void SpawnCoordinator::Spawn(std::shared_ptr<gs::network::Session> session,
     owner.zone_index = zone_index;
     owner.net_id = net_id;
     owners_[session_id] = owner;
+    presence_.Claim(character.id, session_id, net_id, world_tick);
     send_(session, MakeEnterWorldAccept(net_id, position, world_tick));
 
     LOG_INFO("Session {} assigned to zone {} ('{}') as net_id {} at {}, {}, ground_z={}",
@@ -144,6 +160,9 @@ void SpawnCoordinator::Spawn(std::shared_ptr<gs::network::Session> session,
 
 void SpawnCoordinator::Despawn(gs::common::SessionId session_id)
 {
+    // Only this session's own presence can be released here (a refused
+    // duplicate session's disconnect never touches the holder's record).
+    presence_.ReleaseBySession(session_id);
     const auto owner_it = owners_.find(session_id);
     if (owner_it == owners_.end()) {
         LOG_INFO("Sim despawn requested for session {}, but no in-world player was found", session_id);

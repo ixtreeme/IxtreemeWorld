@@ -12,7 +12,19 @@
 
 // Sole owner of wire-format knowledge (Cap'n Proto packets + the binary
 // transform codec). The WorldRuntime and Zone never format packets; they hand
-// snapshots/payloads to this module. Protocol FORMAT is unchanged (parity).
+// snapshots/payloads to this module. Transform frames exist in two formats:
+// v1 (opcode 0x10, full 19-byte records) and v2 (opcode 0x11, field-level
+// deltas against the recipient's known state).
+//
+// WIRE TICK CONTRACT (hardening H7). Every tick field on the wire -- the u32
+// in transform frame headers and S2cEnterWorldAccept.serverTick -- is the
+// GLOBAL world tick: the supervisor's 20 Hz counter (kTickDt), shared by all
+// zones. A frame carries the world tick at the start of the zone tick that
+// produced it. Per recipient the sequence is monotonic non-decreasing across
+// zones (migration, split, merge never move it backwards); under scheduling
+// jitter consecutive frames may repeat a value or skip one. A zone's local
+// tick counter (Zone::TickIndex, the LOD timebase) never reaches the wire:
+// it restarts per zone and freezes while a zone sleeps.
 namespace gs::game {
 
 // kTransformRecordSize / TransformRecord live in BorderSnapshot.h (shared
@@ -46,6 +58,8 @@ std::vector<std::uint8_t> EncodeTransformFrameV2(const TransformRecord& viewer_r
 std::vector<std::uint8_t> MakeEnterWorldAccept(std::uint32_t net_id,
                                                const Position& pos,
                                                std::uint32_t world_tick);
+// EnterWorldReject::alreadyInWorld (world presence invariant, hardening H4).
+std::vector<std::uint8_t> MakeEnterWorldRejectAlreadyInWorld();
 
 std::vector<std::uint8_t> MakeSpawn(const BorderEntitySnapshot& snapshot);
 std::vector<std::uint8_t> MakeDespawn(std::uint32_t net_id);

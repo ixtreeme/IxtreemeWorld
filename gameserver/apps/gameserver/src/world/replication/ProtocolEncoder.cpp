@@ -148,13 +148,37 @@ std::vector<std::uint8_t> EncodeTransformFrameFromRecords(
 
 std::uint16_t QuantizeHeading(float angle)
 {
-    while (angle < 0.0f) {
+    // Hardening H7: bounded for every input. The old add/subtract loops never
+    // terminated for +-inf, and for |angle| beyond ~1e8 subtracting 2*pi no
+    // longer changes a float, so one bad heading wedged the zone worker.
+    // Non-finite -> 0 (north). Finite values run the historic loops with a
+    // step budget (so any heading within ~1000 turns wraps bit-identically,
+    // keeping canonical record bytes unchanged -- proved by the replv2
+    // equivalence sweep), and only beyond it fall back to an exact fmod.
+    if (!std::isfinite(angle)) {
+        return 0;
+    }
+    constexpr int kMaxWrapSteps = 1024;
+    int steps = 0;
+    while (angle < 0.0f && steps < kMaxWrapSteps) {
         angle += kTwoPi;
+        ++steps;
     }
-    while (angle >= kTwoPi) {
+    while (angle >= kTwoPi && steps < kMaxWrapSteps) {
         angle -= kTwoPi;
+        ++steps;
     }
-    return static_cast<std::uint16_t>(std::lround((angle / kTwoPi) * 65535.0f));
+    if (!(angle >= 0.0f && angle < kTwoPi)) {
+        angle = std::fmod(angle, kTwoPi);
+        if (angle < 0.0f) {
+            angle += kTwoPi;
+        }
+        if (!(angle >= 0.0f && angle < kTwoPi)) {
+            angle = 0.0f; // rounding at the wrap edge
+        }
+    }
+    const long quantized = std::lround((angle / kTwoPi) * 65535.0f);
+    return static_cast<std::uint16_t>(std::clamp(quantized, 0L, 65535L));
 }
 
 std::vector<std::uint8_t> MakeEnterWorldAccept(std::uint32_t net_id,
@@ -167,6 +191,15 @@ std::vector<std::uint8_t> MakeEnterWorldAccept(std::uint32_t net_id,
     accept.setYourNetId(net_id);
     FillVec3(accept.initSpawnPos(), pos);
     accept.setServerTick(world_tick);
+    return gs::protocol::SerializeToBytes(msg);
+}
+
+std::vector<std::uint8_t> MakeEnterWorldRejectAlreadyInWorld()
+{
+    capnp::MallocMessageBuilder msg;
+    auto packet = msg.initRoot<gs::protocol::Packet>();
+    packet.initEnterWorldReject().setReason(
+        gs::protocol::S2cEnterWorldReject::RejectReason::ALREADY_IN_WORLD);
     return gs::protocol::SerializeToBytes(msg);
 }
 

@@ -331,6 +331,9 @@ void Zone::Tick(float dt, ZoneTickContext& ctx)
     const auto tick_micros = static_cast<std::uint64_t>(
         std::chrono::duration_cast<std::chrono::microseconds>(Clock::now() - tick_start).count());
     diagnostics_.tick_micros_since_diag.fetch_add(tick_micros, std::memory_order_relaxed);
+    diagnostics_.control_ticks_total.fetch_add(1, std::memory_order_relaxed);
+    diagnostics_.control_tick_micros_total.fetch_add(tick_micros, std::memory_order_relaxed);
+    diagnostics_.last_tick_micros.store(tick_micros, std::memory_order_relaxed);
     diagnostics_.RecordTickSample(tick_micros);
     tick_in_progress_.store(false, std::memory_order_release);
 }

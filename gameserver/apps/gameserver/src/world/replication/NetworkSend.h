@@ -21,4 +21,14 @@ inline void SendToSession(boost::asio::io_context& io,
     });
 }
 
+// Final message, then close (e.g. an EnterWorldReject from the supervisor).
+inline void SendToSessionAndClose(boost::asio::io_context& io,
+                                  const std::shared_ptr<gs::network::Session>& session,
+                                  std::vector<std::uint8_t> payload)
+{
+    boost::asio::post(io, [session, payload = std::move(payload)]() mutable {
+        session->SendPayloadAndClose(std::move(payload));
+    });
+}
+
 } // namespace gs::game

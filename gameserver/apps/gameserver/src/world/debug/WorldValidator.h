@@ -31,13 +31,15 @@ namespace gs::game {
 class ZoneManager;
 class MigrationQueue;
 class WorldDirectory;
+class PresenceRegistry;
 
 bool ValidateWorldConsistency(ZoneManager& zones,
                               const OwnerMap& owners,
                               const MigrationQueue& migrations,
                               const WorldDirectory& directory,
                               const ActivityGrid* activity,
-                              std::string& out_error);
+                              std::string& out_error,
+                              const PresenceRegistry* presence = nullptr);
 
 // Strict field-vs-brute-force audit (§31): for a deterministic sample of
 // mobs (zones in index order, nets ascending, first max_samples),

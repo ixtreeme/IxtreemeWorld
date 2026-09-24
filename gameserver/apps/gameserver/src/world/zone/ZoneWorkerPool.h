@@ -25,10 +25,12 @@ public:
     ZoneWorkerPool(const ZoneWorkerPool&) = delete;
     ZoneWorkerPool& operator=(const ZoneWorkerPool&) = delete;
 
-    // `requested_workers` 0 = auto (min(zone_count, hardware_concurrency-1));
-    // any positive value is clamped to [1, zone_count] (scheduler audit /
-    // worker-count sweep).
-    void Start(std::size_t zone_count, std::size_t requested_workers = 0);
+    // `requested_workers` 0 = auto (hardware_concurrency - 1, at least 1);
+    // any positive value is honored, clamped to [1, kMaxWorkers] (scheduler
+    // audit / worker-count sweep). Deliberately independent of the zone
+    // count at startup: zones are created by splits after Start (H6).
+    static constexpr std::size_t kMaxWorkers = 256;
+    void Start(std::size_t requested_workers = 0);
     void Stop();
     void Enqueue(std::size_t zone_index);
 

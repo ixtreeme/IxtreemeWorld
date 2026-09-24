@@ -25,12 +25,10 @@ std::uint64_t LoadScore(const Zone& zone)
     const auto& diag = zone.Diagnostics();
     const std::uint64_t players = diag.player_count.load(std::memory_order_relaxed);
     const std::uint64_t mobs = diag.mob_count.load(std::memory_order_relaxed);
-    const std::uint64_t tick_avg =
-        diag.ticks_since_diag.load(std::memory_order_relaxed) > 0
-            ? diag.tick_micros_since_diag.load(std::memory_order_relaxed) /
-                  diag.ticks_since_diag.load(std::memory_order_relaxed)
-            : 0;
-    return players * 1'000'000 + (players + mobs) * 1'000 + tick_avg;
+    // Last tick cost (H5): independent of the diagnostics reset cadence, so
+    // dispatch order does not flip with the logger's phase.
+    const std::uint64_t tick_cost = diag.last_tick_micros.load(std::memory_order_relaxed);
+    return players * 1'000'000 + (players + mobs) * 1'000 + tick_cost;
 }
 
 } // namespace

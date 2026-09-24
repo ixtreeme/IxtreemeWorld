@@ -47,4 +47,26 @@ struct NetStressConfig {
 };
 int RunNetStressScenario(const NetStressConfig& config);
 
+// H4: world presence invariant -- one CharacterId, at most one authoritative
+// presence -- across duplicate enter, same-session re-enter, ordered and
+// reversed old/new session races, concurrent enters, migration and
+// split/merge retirement. Every step is followed by the consistency audit.
+int RunPresenceScenario();
+
+// H5: control metrics vs diagnostic metrics. Same overloaded workload under
+// three diagnostics cadences (1000/100/37 ms): the partition control decision
+// state (sustained-breach timer, merge-side low timer, split candidacy timing)
+// must not depend on when the diagnostics logger resets its windows.
+int RunAsfDeterminismScenario();
+
+// H6: worker pool revalidation on the current code: pool creation timing,
+// production-map (few seed zones) sizing, --workers override, and whether a
+// split turns into parallelism.
+int RunWorkerPoolScenario();
+
+// H7: replication v2 correctness -- periodic resync reaches unchanged
+// entities, recipient freshness bound under a tight budget, one monotonic
+// wire tick across migrations, QuantizeHeading on non-finite/huge input.
+int RunReplicationV2Scenario();
+
 } // namespace gs::bench

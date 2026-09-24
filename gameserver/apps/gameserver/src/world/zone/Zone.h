@@ -99,7 +99,12 @@ public:
     struct RecipientEntity {
         std::uint32_t version = 0;        // entity TransformVersion last seen
         std::uint32_t next_due_tick = 0;  // Network LOD schedule
-        std::uint32_t last_sent_tick = 0; // for starvation / state-age bounds
+        std::uint32_t last_sent_tick = 0; // last update/spawn sent (diagnostics)
+        // Last tick the recipient's state was CONFIRMED current: sent, or
+        // verified unchanged at a due check. The starvation / freshness bound
+        // measures from here, so a long-static entity that starts moving is a
+        // fresh change, while a budget-deferred one still ages (hardening H7).
+        std::uint32_t synced_tick = 0;
         float x = 0.0f;                   // client-known position
         float y = 0.0f;
         float z = 0.0f;
@@ -122,6 +127,10 @@ public:
         std::uint64_t despawn_events = 0;
         std::uint64_t update_events = 0;
         std::uint64_t suppressed_events = 0;
+        // Periodic resync schedule (world tick, 0 = unscheduled); see
+        // replication/ResyncSchedule.h. Travels with the binding like the
+        // interest set, so a migration neither skips nor doubles a resync.
+        std::uint32_t next_resync_tick = 0;
 
         bool IsVisible(std::uint32_t net_id) const
         {

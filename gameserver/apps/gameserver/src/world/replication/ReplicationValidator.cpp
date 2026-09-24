@@ -254,13 +254,21 @@ bool ValidateReplicationShadow(ZoneManager& zones,
                     // preserved the version but shifted the baseline) is
                     // corrected by the next delta; a persistent divergence is
                     // a failure.
-                    // Age of the entity's last change: a fresh change may
-                    // legitimately not have reached the recipient yet (the
-                    // Network LOD period / budget), an old pending change must
-                    // have been delivered.
+                    // Freshness bound (hardening H7): what must stay bounded is
+                    // the age of the RECIPIENT'S knowledge while a change is
+                    // pending (fields differ, or the version moved since the
+                    // last confirmed-current tick) -- not the age of the
+                    // entity's last change. A continuously moving entity always
+                    // has a fresh change, so the old change-age definition could
+                    // never flag a recipient that had been starved for seconds.
+                    // Measured from synced_tick, not the last send: a static
+                    // entity that just started moving is a fresh change.
+                    const bool pending = !fields_match || known.version != current;
                     const std::uint32_t correction_age =
-                        zone.WorldTick() >= current ? zone.WorldTick() - current : 0;
-                    if (!fields_match && correction_age > config.max_defer_ticks + 2) {
+                        zone.WorldTick() >= known.synced_tick
+                            ? zone.WorldTick() - known.synced_tick
+                            : 0;
+                    if (pending && correction_age > config.max_defer_ticks + 2) {
                         std::ostringstream message;
                         const bool resident = zone.IsResident(net_id);
                         const bool ghost = zone.FindGhost(net_id) != nullptr;
@@ -276,7 +284,7 @@ bool ValidateReplicationShadow(ZoneManager& zones,
                                 << " resident=" << (resident ? 1 : 0)
                                 << " ghost=" << (ghost ? 1 : 0)
                                 << " version=" << known.version << " current=" << current
-                                << " last_sent=" << known.last_sent_tick
+                                << " last_sent=" << known.last_sent_tick << " synced=" << known.synced_tick
                                 << " next_due=" << known.next_due_tick
                                 << " tier=" << static_cast<int>(known.tier)
                                 << " now=" << zone.WorldTick();
@@ -290,19 +298,20 @@ bool ValidateReplicationShadow(ZoneManager& zones,
                         return false;
                     }
                 } else {
-                    // The recipient lags: the entity's last change (its
-                    // version tick) must not stay unsent beyond the
-                    // starvation bound.
-                    const std::uint32_t age =
-                        zone.WorldTick() >= current ? zone.WorldTick() - current : 0;
-                    if (age > config.max_defer_ticks + 2) {
+                    // No authority transform to compare: the recipient's last
+                    // update must still be within the freshness bound while
+                    // the entity's version is ahead of it.
+                    const std::uint32_t age = zone.WorldTick() >= known.synced_tick
+                                                  ? zone.WorldTick() - known.synced_tick
+                                                  : 0;
+                    if (known.version != current && age > config.max_defer_ticks + 2) {
                         std::ostringstream message;
                         message << "zone " << zone.Id() << " viewer " << viewer_net_id
                                 << ": pending change for net " << net_id << " too old (age="
                                 << age << " ticks > bound " << (config.max_defer_ticks + 2)
                                 << "; known_version=" << known.version << " current=" << current
                                 << " next_due=" << known.next_due_tick
-                                << " last_sent=" << known.last_sent_tick
+                                << " last_sent=" << known.last_sent_tick << " synced=" << known.synced_tick
                                 << " now=" << zone.WorldTick()
                                 << " tier=" << static_cast<int>(known.tier) << ")";
                         out_error = message.str();

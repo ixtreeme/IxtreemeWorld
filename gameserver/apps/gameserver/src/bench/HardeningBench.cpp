@@ -14,6 +14,7 @@
 #include <limits>
 #include <memory>
 #include <mutex>
+#include <random>
 #include <sstream>
 #include <string>
 #include <thread>
@@ -41,6 +42,7 @@
 #include "../world/WorldConstants.h"
 #include "../world/WorldRuntime.h"
 #include "../world/replication/ProtocolEncoder.h"
+#include "../world/replication/ResyncSchedule.h"
 
 namespace gs::bench {
 namespace {
@@ -1416,6 +1418,1110 @@ int RunNetStressScenario(const NetStressConfig& config)
     pool.StopAndJoin();
     std::printf("NETSTRESS-DONE failures=%d\n", check.failures);
     return check.failures;
+}
+
+// ============================================================================
+// World presence (H4)
+// ============================================================================
+namespace {
+
+bool IsEnterWorldRejectAlreadyInWorld(const std::vector<std::uint8_t>& payload)
+{
+    try {
+        auto parsed = gs::protocol::ParsePacket(payload);
+        return parsed && parsed->packet.isEnterWorldReject() &&
+               parsed->packet.getEnterWorldReject().getReason() ==
+                   gs::protocol::S2cEnterWorldReject::RejectReason::ALREADY_IN_WORLD;
+    } catch (const kj::Exception&) {
+        return false;
+    }
+}
+
+// Consistency audit in the supervisor's quiescent window (includes the H4
+// presence checks). Returns "OK" or the failure text.
+std::string AuditNow(gs::game::WorldRuntime& sim)
+{
+    sim.RequestValidation();
+    std::string result;
+    for (int i = 0; i < 200; ++i) {
+        if (sim.TryTakeValidationResult(result)) {
+            return result;
+        }
+        std::this_thread::sleep_for(std::chrono::milliseconds(25));
+    }
+    return "TIMEOUT";
+}
+
+// A server-side Session whose client end the test reads (to observe the
+// EnterWorldReject + close a refused duplicate receives).
+struct ObservedSession {
+    std::shared_ptr<gs::network::Session> session;
+    std::unique_ptr<TestClient> client;
+};
+
+ObservedSession MakeObservedSession(asio::io_context& io, gs::common::SessionId id)
+{
+    ObservedSession out;
+    tcp::acceptor acceptor(io, tcp::endpoint(asio::ip::address_v4::loopback(), 0));
+    out.client = std::make_unique<TestClient>();
+    out.client->Connect(acceptor.local_endpoint().port());
+    tcp::socket server_socket(io);
+    acceptor.accept(server_socket);
+    out.session = std::make_shared<gs::network::Session>(std::move(server_socket), id);
+    return out;
+}
+
+// True when the client receives EnterWorldReject::alreadyInWorld and then
+// the server closes the connection.
+bool ExpectRefused(ObservedSession& observed)
+{
+    std::vector<std::uint8_t> frame;
+    for (int i = 0; i < 8; ++i) {
+        const auto read = observed.client->ReadFrame(frame, 3000ms);
+        if (read != TestClient::Read::Frame) {
+            return false;
+        }
+        if (IsEnterWorldRejectAlreadyInWorld(frame)) {
+            return observed.client->WaitClosed(3000ms);
+        }
+    }
+    return false;
+}
+
+} // namespace
+
+int RunPresenceScenario()
+{
+    NetCheck check;
+    auto report = [&](const char* name, bool pass, const std::string& detail) {
+        std::printf("PRESENCE %s %s: %s\n", name, detail.c_str(), pass ? "PASS" : "FAIL");
+        std::fflush(stdout);
+        if (!pass) {
+            ++check.failures;
+        }
+    };
+    const gs::common::SessionId kBase = 30000;
+
+    // ---- single-zone world: enter / re-enter / races / concurrency ----------
+    {
+        IoRunner runner;
+        gs::game::WorldRuntime sim(runner.io, {},
+                                   gs::game::WorldRuntime::SyntheticWorldConfig{2000.0f, 1, 1, {}});
+        sim.Start();
+        const auto character_x = MakeCharacter(1);
+        auto stats = [&] { return sim.PresenceStats(); };
+        auto wait_claims = [&](std::uint64_t claims, std::uint64_t rejects) {
+            return WaitFor(3000ms, [&] {
+                const auto s = stats();
+                return s.claims >= claims && s.rejected_duplicates >= rejects;
+            });
+        };
+
+        // Duplicate enter: A holds X, B (observed) is refused over the wire.
+        sim.PostSpawn(MakeDetachedSession(runner.io, kBase + 1), character_x,
+                      gs::game::DebugSpawnOverride{500.0f, 500.0f});
+        wait_claims(1, 0);
+        ObservedSession b = MakeObservedSession(runner.io, kBase + 2);
+        sim.PostSpawn(b.session, character_x, gs::game::DebugSpawnOverride{600.0f, 600.0f});
+        const bool refused = ExpectRefused(b);
+        wait_claims(1, 1);
+        auto s = stats();
+        std::string audit = AuditNow(sim);
+        report("duplicate-enter-refused",
+               refused && s.claims == 1 && s.rejected_duplicates == 1 && s.present == 1 &&
+                   audit == "OK",
+               Fmt("wire_reject_and_close=%d claims=%llu rejected=%llu present=%llu audit=%s",
+                   refused ? 1 : 0, static_cast<unsigned long long>(s.claims),
+                   static_cast<unsigned long long>(s.rejected_duplicates),
+                   static_cast<unsigned long long>(s.present), audit.c_str()));
+
+        // The refused session's disconnect must not release the holder.
+        sim.PostDespawn(kBase + 2);
+        std::this_thread::sleep_for(200ms);
+        s = stats();
+        audit = AuditNow(sim);
+        report("refused-disconnect-keeps-holder", s.present == 1 && audit == "OK",
+               Fmt("present=%llu audit=%s", static_cast<unsigned long long>(s.present),
+                   audit.c_str()));
+
+        // Same session re-entering: still exactly one presence.
+        sim.PostSpawn(MakeDetachedSession(runner.io, kBase + 1), character_x,
+                      gs::game::DebugSpawnOverride{510.0f, 510.0f});
+        wait_claims(2, 1);
+        s = stats();
+        audit = AuditNow(sim);
+        report("same-session-reenter", s.claims == 2 && s.present == 1 && audit == "OK",
+               Fmt("claims=%llu present=%llu audit=%s", static_cast<unsigned long long>(s.claims),
+                   static_cast<unsigned long long>(s.present), audit.c_str()));
+
+        // Ordered old/new race: A leaves, then C enters -> C holds X.
+        sim.PostDespawn(kBase + 1);
+        sim.PostSpawn(MakeDetachedSession(runner.io, kBase + 3), character_x,
+                      gs::game::DebugSpawnOverride{520.0f, 520.0f});
+        wait_claims(3, 1);
+        s = stats();
+        audit = AuditNow(sim);
+        report("old-leaves-then-new-enters", s.claims == 3 && s.rejected_duplicates == 1 &&
+                                                 s.present == 1 && audit == "OK",
+               Fmt("claims=%llu rejected=%llu present=%llu audit=%s",
+                   static_cast<unsigned long long>(s.claims),
+                   static_cast<unsigned long long>(s.rejected_duplicates),
+                   static_cast<unsigned long long>(s.present), audit.c_str()));
+
+        // Reversed race: D enters BEFORE C's leave is processed -> D refused
+        // (first presence wins), C then leaves -> nobody holds X; a retry by
+        // D succeeds. Never two presences at any point (audited).
+        sim.PostSpawn(MakeDetachedSession(runner.io, kBase + 4), character_x,
+                      gs::game::DebugSpawnOverride{530.0f, 530.0f});
+        sim.PostDespawn(kBase + 3);
+        wait_claims(3, 2);
+        std::this_thread::sleep_for(200ms);
+        const auto after_race = stats();
+        const std::string audit_race = AuditNow(sim);
+        sim.PostSpawn(MakeDetachedSession(runner.io, kBase + 4), character_x,
+                      gs::game::DebugSpawnOverride{530.0f, 530.0f});
+        wait_claims(4, 2);
+        s = stats();
+        audit = AuditNow(sim);
+        report("new-enters-before-old-leaves",
+               after_race.rejected_duplicates == 2 && after_race.present == 0 &&
+                   audit_race == "OK" && s.claims == 4 && s.present == 1 && audit == "OK",
+               Fmt("race_rejected=%llu race_present=%llu retry_claims=%llu present=%llu "
+                   "audits=%s/%s",
+                   static_cast<unsigned long long>(after_race.rejected_duplicates),
+                   static_cast<unsigned long long>(after_race.present),
+                   static_cast<unsigned long long>(s.claims),
+                   static_cast<unsigned long long>(s.present), audit_race.c_str(),
+                   audit.c_str()));
+
+        // Concurrent enters: 20 sessions, 4 threads, one character.
+        const auto character_y = MakeCharacter(2);
+        const auto before = stats();
+        std::vector<std::thread> posters;
+        for (int t = 0; t < 4; ++t) {
+            posters.emplace_back([&, t] {
+                for (int i = 0; i < 5; ++i) {
+                    const auto id = kBase + 100 + static_cast<gs::common::SessionId>(t * 5 + i);
+                    sim.PostSpawn(MakeDetachedSession(runner.io, id), character_y,
+                                  gs::game::DebugSpawnOverride{700.0f + static_cast<float>(i),
+                                                               700.0f + static_cast<float>(t)});
+                }
+            });
+        }
+        for (auto& poster : posters) {
+            poster.join();
+        }
+        WaitFor(3000ms, [&] {
+            const auto now = stats();
+            return (now.claims - before.claims) + (now.rejected_duplicates - before.rejected_duplicates) >= 20;
+        });
+        s = stats();
+        audit = AuditNow(sim);
+        const auto claimed = s.claims - before.claims;
+        const auto refused_n = s.rejected_duplicates - before.rejected_duplicates;
+        report("concurrent-enters-one-winner",
+               claimed == 1 && refused_n == 19 && s.present == 2 && audit == "OK",
+               Fmt("claimed=%llu refused=%llu present=%llu audit=%s",
+                   static_cast<unsigned long long>(claimed),
+                   static_cast<unsigned long long>(refused_n),
+                   static_cast<unsigned long long>(s.present), audit.c_str()));
+        sim.Stop();
+    }
+
+    // ---- migration: the presence follows the player across zones ------------
+    {
+        IoRunner runner;
+        gs::game::WorldRuntime sim(runner.io, {},
+                                   gs::game::WorldRuntime::SyntheticWorldConfig{2000.0f, 2, 1, {}});
+        sim.Start();
+        const auto character_z = MakeCharacter(3);
+        const gs::common::SessionId walker = kBase + 200;
+        sim.PostSpawn(MakeDetachedSession(runner.io, walker), character_z,
+                      gs::game::DebugSpawnOverride{985.0f, 1000.0f});
+        WaitFor(3000ms, [&] { return sim.PresenceStats().claims >= 1; });
+        const auto mig0 = sim.MigrationMetrics();
+        std::atomic<bool> run{true};
+        std::thread poster([&] {
+            std::uint32_t seq = 0;
+            const auto start = Clock::now();
+            while (run.load()) {
+                const double t = std::chrono::duration<double>(Clock::now() - start).count();
+                const bool east = (static_cast<int>(t / 5.0) % 2) == 0;
+                sim.PostMoveInput(walker, ++seq, east ? kHalfPi : -kHalfPi,
+                                  gs::game::MoveState::Running);
+                std::this_thread::sleep_for(20ms);
+            }
+        });
+        int audits_ok = 0;
+        int dup_refused = 0;
+        for (int round = 0; round < 8; ++round) {
+            std::this_thread::sleep_for(2500ms);
+            const auto rejects0 = sim.PresenceStats().rejected_duplicates;
+            sim.PostSpawn(MakeDetachedSession(runner.io, kBase + 300 + round), character_z,
+                          gs::game::DebugSpawnOverride{1500.0f, 1000.0f});
+            if (WaitFor(2000ms,
+                        [&] { return sim.PresenceStats().rejected_duplicates > rejects0; })) {
+                ++dup_refused;
+            }
+            audits_ok += AuditNow(sim) == "OK" ? 1 : 0;
+        }
+        run = false;
+        poster.join();
+        const auto migrations = sim.MigrationMetrics().committed - mig0.committed;
+        const auto s = sim.PresenceStats();
+        report("presence-across-migration",
+               migrations >= 2 && audits_ok == 8 && dup_refused == 8 && s.present == 1,
+               Fmt("migrations=%llu audits_ok=%d/8 duplicates_refused=%d/8 present=%llu",
+                   static_cast<unsigned long long>(migrations), audits_ok, dup_refused,
+                   static_cast<unsigned long long>(s.present)));
+        sim.Stop();
+    }
+
+    // ---- split / merge retirement: presence survives topology changes -------
+    {
+        IoRunner runner;
+        gs::game::WorldRuntime sim(runner.io, {},
+                                   gs::game::WorldRuntime::SyntheticWorldConfig{2000.0f, 1, 1, {}});
+        sim.Start();
+        const auto character_w = MakeCharacter(4);
+        sim.PostSpawn(MakeDetachedSession(runner.io, kBase + 400), character_w,
+                      gs::game::DebugSpawnOverride{400.0f, 400.0f});
+        WaitFor(3000ms, [&] { return sim.PresenceStats().claims >= 1; });
+        const auto p0 = sim.PartitionMetricsSnapshot();
+        sim.PostForceSplit(1);
+        const bool split = WaitFor(5000ms, [&] {
+            return sim.PartitionMetricsSnapshot().split_commits > p0.split_commits;
+        });
+        const std::string audit_split = AuditNow(sim);
+        const auto rejects0 = sim.PresenceStats().rejected_duplicates;
+        sim.PostSpawn(MakeDetachedSession(runner.io, kBase + 401), character_w,
+                      gs::game::DebugSpawnOverride{1500.0f, 1500.0f});
+        const bool dup_after_split = WaitFor(2000ms, [&] {
+            return sim.PresenceStats().rejected_duplicates > rejects0;
+        });
+        sim.PostForceMerge(1);
+        const bool merged = WaitFor(5000ms, [&] {
+            return sim.PartitionMetricsSnapshot().merge_commits > p0.merge_commits;
+        });
+        const std::string audit_merge = AuditNow(sim);
+        const auto s = sim.PresenceStats();
+        report("presence-across-split-merge",
+               split && merged && audit_split == "OK" && audit_merge == "OK" && dup_after_split &&
+                   s.present == 1,
+               Fmt("split=%d merge=%d audits=%s/%s duplicate_refused=%d present=%llu",
+                   split ? 1 : 0, merged ? 1 : 0, audit_split.c_str(), audit_merge.c_str(),
+                   dup_after_split ? 1 : 0, static_cast<unsigned long long>(s.present)));
+        sim.Stop();
+    }
+
+    std::printf("PRESENCE-DONE failures=%d\n", check.failures);
+    return check.failures;
+}
+
+// ============================================================================
+// ASF control-metric determinism (H5)
+// ============================================================================
+namespace {
+
+struct ControlRun {
+    int diag_interval_ms = 0;
+    std::uint64_t updates = 0;
+    std::uint64_t breach_starts = 0;
+    std::uint64_t breach_resets = 0;
+    std::uint64_t low_starts = 0;
+    double first_candidate_s = -1.0; // since the load was established
+};
+
+// One zone permanently over its tick budget (the legacy tick score is the only
+// signal: load field off, resident budget out of reach), adaptive execution off
+// so topology never changes -- only the control DECISION STATE is observed.
+ControlRun RunControlUnderDiagCadence(int diag_interval_ms)
+{
+    ControlRun run;
+    run.diag_interval_ms = diag_interval_ms;
+    IoRunner runner;
+    gs::game::WorldRuntime sim(runner.io, {},
+                               gs::game::WorldRuntime::SyntheticWorldConfig{4000.0f, 1, 1, {}});
+    sim.ConfigureDiagnosticsInterval(std::chrono::milliseconds(diag_interval_ms));
+    gs::game::PartitionConfig partition;
+    partition.tick_budget_ms = 0.25f;     // any real tick of this zone breaches
+    partition.resident_budget = 1.0e7f;   // residents never drive the score
+    partition.sustained_window_seconds = 3;
+    partition.split_cooldown_seconds = 0;
+    partition.scoring.adaptive_enabled = false; // observe only: no topology change
+    sim.ConfigurePartition(partition);
+    gs::game::LoadFieldConfig field;
+    field.enabled = false;
+    sim.ConfigureLoadField(field);
+    gs::game::MobSpawnPoint point;
+    point.mob_type_id = 2;
+    point.x = 2000.0f;
+    point.y = 2000.0f;
+    point.count = 3000;
+    point.radius = 100.0f; // inside the Full LOD bubble of the player below
+    sim.AddMobSpawnPoint(point);
+    sim.SpawnConfiguredMobsNow();
+    sim.PostSpawn(MakeDetachedSession(runner.io, 40000), MakeCharacter(40),
+                  gs::game::DebugSpawnOverride{2000.0f, 2000.0f});
+    sim.Start();
+    WaitFor(5000ms, [&] { return sim.PresenceStats().claims >= 1; });
+    std::this_thread::sleep_for(1500ms); // load established, first windows filled
+    const auto t0 = Clock::now();
+    const auto c0 = sim.PartitionControlCounters();
+    std::this_thread::sleep_for(12s);
+    const auto c1 = sim.PartitionControlCounters();
+    sim.Stop();
+    run.updates = c1.updates - c0.updates;
+    run.breach_starts = c1.breach_starts - c0.breach_starts;
+    run.breach_resets = c1.breach_resets - c0.breach_resets;
+    run.low_starts = c1.low_starts - c0.low_starts;
+    if (c1.first_split_candidate_ns != 0) {
+        const auto t0_ns = std::chrono::duration_cast<std::chrono::nanoseconds>(
+                               t0.time_since_epoch())
+                               .count();
+        run.first_candidate_s = static_cast<double>(c1.first_split_candidate_ns - t0_ns) / 1e9;
+    }
+    return run;
+}
+
+// A merge re-points the PARENT node at a brand-new zone whose cumulative
+// control counters start from zero, while the node still carries the
+// baseline of the zone it held before the split. Every control window --
+// including the first one after the merge -- must stay bounded by the
+// control period, never wrap.
+struct MergeWindowRun {
+    bool split = false;
+    bool merged = false;
+    std::uint64_t updates = 0;
+    std::uint64_t max_window_ticks = 0;
+};
+
+MergeWindowRun RunControlAcrossSplitMerge()
+{
+    MergeWindowRun run;
+    IoRunner runner;
+    gs::game::WorldRuntime sim(runner.io, {},
+                               gs::game::WorldRuntime::SyntheticWorldConfig{4000.0f, 1, 1, {}});
+    gs::game::PartitionConfig partition;
+    partition.scoring.adaptive_enabled = false; // topology changes are forced only
+    sim.ConfigurePartition(partition);
+    gs::game::LoadFieldConfig field;
+    field.enabled = false;
+    sim.ConfigureLoadField(field);
+    gs::game::MobSpawnPoint point;
+    point.mob_type_id = 2;
+    point.x = 2000.0f;
+    point.y = 2000.0f;
+    point.count = 500;
+    point.radius = 100.0f;
+    sim.AddMobSpawnPoint(point);
+    sim.SpawnConfiguredMobsNow();
+    sim.PostSpawn(MakeDetachedSession(runner.io, 41000), MakeCharacter(41),
+                  gs::game::DebugSpawnOverride{2000.0f, 2000.0f});
+    sim.Start();
+    WaitFor(5000ms, [&] { return sim.PresenceStats().claims >= 1; });
+    // Let the original zone accumulate a large baseline on the root node.
+    std::this_thread::sleep_for(4s);
+    const auto p0 = sim.PartitionMetricsSnapshot();
+    const auto c0 = sim.PartitionControlCounters();
+    sim.PostForceSplit(1);
+    run.split = WaitFor(5000ms, [&] {
+        return sim.PartitionMetricsSnapshot().split_commits > p0.split_commits;
+    });
+    std::this_thread::sleep_for(3s);
+    sim.PostForceMerge(1);
+    run.merged = WaitFor(5000ms, [&] {
+        return sim.PartitionMetricsSnapshot().merge_commits > p0.merge_commits;
+    });
+    std::this_thread::sleep_for(3s); // several windows of the merged zone
+    const auto c1 = sim.PartitionControlCounters();
+    sim.Stop();
+    run.updates = c1.updates - c0.updates;
+    run.max_window_ticks = c1.max_window_ticks;
+    return run;
+}
+
+} // namespace
+
+int RunAsfDeterminismScenario()
+{
+    int failures = 0;
+    std::vector<ControlRun> runs;
+    for (const int interval : {1000, 100, 37}) {
+        runs.push_back(RunControlUnderDiagCadence(interval));
+        const auto& r = runs.back();
+        // Continuously overloaded zone: the sustained-breach timer must start
+        // once and never be reset, no leaf may look "low" (merge side), and
+        // the split candidacy must mature one sustained window after the
+        // breach started (the breach itself precedes t0, hence <= window).
+        const bool pass = r.breach_resets == 0 && r.low_starts == 0 && r.first_candidate_s >= -1.5 &&
+                          r.first_candidate_s <= 4.5 && r.updates >= 10;
+        std::printf("ASF diag_interval=%dms control_updates=%llu breach_starts=%llu "
+                    "breach_resets=%llu false_low_starts=%llu first_split_candidate=%.2fs: %s\n",
+                    r.diag_interval_ms,
+                    static_cast<unsigned long long>(r.updates),
+                    static_cast<unsigned long long>(r.breach_starts),
+                    static_cast<unsigned long long>(r.breach_resets),
+                    static_cast<unsigned long long>(r.low_starts),
+                    r.first_candidate_s,
+                    pass ? "PASS" : "FAIL");
+        std::fflush(stdout);
+        if (!pass) {
+            ++failures;
+        }
+    }
+    // Cross-cadence agreement: same workload, different diagnostic phase ->
+    // the same decision timing (within one control period).
+    double lo = 1e9;
+    double hi = -1e9;
+    for (const auto& r : runs) {
+        lo = std::min(lo, r.first_candidate_s);
+        hi = std::max(hi, r.first_candidate_s);
+    }
+    const bool agree = hi - lo <= 1.5;
+    std::printf("ASF cross-cadence candidate spread=%.2fs: %s\n", hi - lo, agree ? "PASS" : "FAIL");
+    if (!agree) {
+        ++failures;
+    }
+
+    // Control window across split -> merge (merged zone reuses the parent
+    // node). 1 Hz control cadence at 20 Hz: a window is ~20 ticks; a zone's
+    // first window covers its lifetime so far. 100 = 5 s of ticks, generous.
+    const MergeWindowRun m = RunControlAcrossSplitMerge();
+    const bool window_ok = m.split && m.merged && m.updates >= 6 && m.max_window_ticks <= 100;
+    std::printf("ASF control-window-across-split-merge split=%d merge=%d control_updates=%llu "
+                "max_window_ticks=%llu: %s\n",
+                m.split ? 1 : 0,
+                m.merged ? 1 : 0,
+                static_cast<unsigned long long>(m.updates),
+                static_cast<unsigned long long>(m.max_window_ticks),
+                window_ok ? "PASS" : "FAIL");
+    if (!window_ok) {
+        ++failures;
+    }
+    std::printf("ASF-DONE failures=%d\n", failures);
+    return failures;
+}
+
+// ============================================================================
+// Worker pool revalidation (H6)
+// ============================================================================
+namespace {
+
+std::size_t WaitWorkers(gs::game::WorldRuntime& sim)
+{
+    std::size_t workers = 0;
+    WaitFor(5000ms, [&] {
+        workers = sim.SchedulerStats().workers;
+        return workers > 0;
+    });
+    return workers;
+}
+
+struct ParallelWindow {
+    double parallelism = 0.0;
+    std::size_t workers = 0;
+    std::size_t active_workers = 0; // workers that ran at least one zone tick
+    std::size_t zones = 0;
+};
+
+ParallelWindow MeasureParallelism(gs::game::WorldRuntime& sim, std::chrono::seconds window)
+{
+    const auto s0 = sim.SchedulerStats();
+    const auto t0 = Clock::now();
+    std::this_thread::sleep_for(window);
+    const auto s1 = sim.SchedulerStats();
+    const double wall_us =
+        std::chrono::duration<double, std::micro>(Clock::now() - t0).count();
+    ParallelWindow out;
+    out.parallelism = wall_us > 0.0 ? static_cast<double>(s1.worker_work_micros -
+                                                          s0.worker_work_micros) /
+                                          wall_us
+                                    : 0.0;
+    out.workers = s1.workers;
+    for (std::size_t i = 0; i < s1.worker_tasks.size(); ++i) {
+        const std::uint64_t before = i < s0.worker_tasks.size() ? s0.worker_tasks[i] : 0;
+        out.active_workers += s1.worker_tasks[i] > before ? 1 : 0;
+    }
+    out.zones = sim.Zones().GetActiveLeaves().size();
+    return out;
+}
+
+} // namespace
+
+int RunWorkerPoolScenario()
+{
+    int failures = 0;
+    const unsigned hw = std::max(1u, std::thread::hardware_concurrency());
+    std::printf("WORKERPOOL hardware_concurrency=%u\n", hw);
+
+    // (a) Production-shaped: the real map (3 seeded zones), automatic sizing.
+    std::size_t production_workers = 0;
+    {
+        IoRunner runner;
+        gs::game::WorldRuntime sim(runner.io);
+        sim.Start();
+        production_workers = WaitWorkers(sim);
+        std::printf("WORKERPOOL production-map zones=%zu workers=%zu (pool sized once at Start)\n",
+                    sim.Zones().ZoneCount(), production_workers);
+        sim.Stop();
+    }
+
+    // (b) Explicit override on a 1-zone world.
+    std::size_t override_workers = 0;
+    {
+        IoRunner runner;
+        gs::game::WorldRuntime sim(runner.io, {},
+                                   gs::game::WorldRuntime::SyntheticWorldConfig{2000.0f, 1, 1, {}});
+        sim.ConfigureWorkers(8);
+        sim.Start();
+        override_workers = WaitWorkers(sim);
+        std::printf("WORKERPOOL override requested=8 zones=1 workers=%zu\n", override_workers);
+        sim.Stop();
+    }
+
+    // (c) Split scaling: one heavily loaded zone split into four. Four player
+    // anchored mob clusters (one per future quadrant) keep all four children
+    // busy; adaptive control is off so topology changes only when forced.
+    ParallelWindow before_split;
+    ParallelWindow after_split;
+    {
+        IoRunner runner;
+        gs::game::WorldRuntime sim(runner.io, {},
+                                   gs::game::WorldRuntime::SyntheticWorldConfig{8000.0f, 1, 1, {}});
+        gs::game::PartitionConfig partition;
+        partition.scoring.adaptive_enabled = false;
+        sim.ConfigurePartition(partition);
+        const float quad[4][2] = {{2000.0f, 2000.0f}, {6000.0f, 2000.0f}, {2000.0f, 6000.0f},
+                                  {6000.0f, 6000.0f}};
+        for (const auto& q : quad) {
+            gs::game::MobSpawnPoint point;
+            point.mob_type_id = 2;
+            point.x = q[0];
+            point.y = q[1];
+            point.count = 2500;
+            point.radius = 100.0f;
+            sim.AddMobSpawnPoint(point);
+        }
+        sim.SpawnConfiguredMobsNow();
+        for (int i = 0; i < 4; ++i) {
+            sim.PostSpawn(MakeDetachedSession(runner.io, 41000 + static_cast<gs::common::SessionId>(i)),
+                          MakeCharacter(50 + static_cast<std::uint64_t>(i)),
+                          gs::game::DebugSpawnOverride{quad[i][0], quad[i][1]});
+        }
+        sim.Start();
+        WaitFor(5000ms, [&] { return sim.PresenceStats().claims >= 4; });
+        std::this_thread::sleep_for(2s);
+        before_split = MeasureParallelism(sim, 5s);
+        const auto p0 = sim.PartitionMetricsSnapshot();
+        sim.PostForceSplit(1);
+        WaitFor(10000ms, [&] {
+            return sim.PartitionMetricsSnapshot().split_commits > p0.split_commits;
+        });
+        std::this_thread::sleep_for(2s);
+        after_split = MeasureParallelism(sim, 5s);
+        sim.Stop();
+    }
+    std::printf("WORKERPOOL split-scaling before: zones=%zu workers=%zu active=%zu parallelism=%.2f | "
+                "after split: zones=%zu workers=%zu active=%zu parallelism=%.2f\n",
+                before_split.zones, before_split.workers, before_split.active_workers,
+                before_split.parallelism, after_split.zones, after_split.workers,
+                after_split.active_workers, after_split.parallelism);
+
+    // Expectations for a pool that can use what the hardware and topology
+    // offer: production map not capped at its seed zone count, an explicit
+    // override honored, and a split turning into real parallelism.
+    const std::size_t hw_workers = hw > 1 ? hw - 1 : 1;
+    const bool production_ok = production_workers == hw_workers;
+    const bool override_ok = override_workers == 8;
+    // Capacity, not load: after the split the four zones' ticks must be able
+    // to run on different workers (parallelism itself depends on how heavy
+    // the zones are and is reported for information).
+    const bool scaling_ok =
+        after_split.zones == 4 && after_split.workers >= 4 && after_split.active_workers >= 2;
+    std::printf("WORKERPOOL production-not-capped-by-seed-zones: %s\n", production_ok ? "PASS" : "FAIL");
+    std::printf("WORKERPOOL override-honored: %s\n", override_ok ? "PASS" : "FAIL");
+    std::printf("WORKERPOOL split-adds-parallelism: %s\n", scaling_ok ? "PASS" : "FAIL");
+    failures += production_ok ? 0 : 1;
+    failures += override_ok ? 0 : 1;
+    failures += scaling_ok ? 0 : 1;
+    std::printf("WORKERPOOL-DONE failures=%d\n", failures);
+    return failures;
+}
+
+// ============================================================================
+// Replication v2 correctness (H7)
+// ============================================================================
+namespace {
+
+// Client-side view decoded from the real wire: per-net record counts (v1 full
+// records and v2 masked deltas), spawn names -> net ids, and the header tick
+// sequence (monotonicity / step size).
+struct ReplWire {
+    std::mutex mutex;
+    std::unordered_map<std::uint32_t, std::uint64_t> records_by_net;
+    std::unordered_map<std::string, std::uint32_t> net_by_name;
+    bool have_tick = false;
+    std::uint32_t last_tick = 0;
+    std::uint64_t backward_steps = 0;
+    std::uint32_t max_forward_step = 0;
+    std::uint64_t frames = 0;
+    float self_x = 0.0f;
+};
+
+void DecodeReplFrames(TestClient& client, ReplWire& wire, const std::atomic<bool>& stop)
+{
+    std::vector<std::uint8_t> payload;
+    while (!stop.load()) {
+        const auto read = client.ReadFrame(payload, 200ms);
+        if (read == TestClient::Read::Closed) {
+            return;
+        }
+        if (read != TestClient::Read::Frame || payload.empty()) {
+            continue;
+        }
+        std::lock_guard lock(wire.mutex);
+        if (payload[0] == 0) {
+            try {
+                auto parsed = gs::protocol::ParsePacket(payload);
+                if (parsed && parsed->packet.isEntitySpawn()) {
+                    const auto spawn = parsed->packet.getEntitySpawn();
+                    wire.net_by_name[spawn.getName().cStr()] = spawn.getNetId();
+                }
+            } catch (const kj::Exception&) {
+            }
+            continue;
+        }
+        if (payload.size() < 8 + 19 || (payload[1] != 0x10 && payload[1] != 0x11)) {
+            continue;
+        }
+        const std::uint32_t tick = ReadU32Le(payload.data() + 2);
+        if (wire.have_tick) {
+            if (tick < wire.last_tick) {
+                ++wire.backward_steps;
+            } else {
+                wire.max_forward_step = std::max(wire.max_forward_step, tick - wire.last_tick);
+            }
+        }
+        wire.have_tick = true;
+        wire.last_tick = tick;
+        ++wire.frames;
+        wire.self_x = ReadF32Le(payload.data() + 8 + 4);
+        const std::uint32_t count = static_cast<std::uint32_t>(payload[6]) |
+                                    (static_cast<std::uint32_t>(payload[7]) << 8);
+        std::size_t offset = 8 + 19; // header + the viewer's own full record
+        for (std::uint32_t i = 1; i < count; ++i) {
+            if (payload[1] == 0x10) {
+                if (offset + 19 > payload.size()) {
+                    break;
+                }
+                ++wire.records_by_net[ReadU32Le(payload.data() + offset)];
+                offset += 19;
+                continue;
+            }
+            if (offset + 5 > payload.size()) {
+                break;
+            }
+            const std::uint32_t net = ReadU32Le(payload.data() + offset);
+            const std::uint8_t mask = payload[offset + 4];
+            offset += 5 + ((mask & 0x01) ? 12 : 0) + ((mask & 0x02) ? 2 : 0) +
+                      ((mask & 0x04) ? 1 : 0);
+            ++wire.records_by_net[net];
+        }
+    }
+}
+
+// Pre-hardening QuantizeHeading loop, kept only as the equivalence reference.
+// `max_iterations` bounds the model: the original had no bound at all.
+bool LegacyQuantizeHeading(float angle, std::uint16_t& out, long long max_iterations)
+{
+    long long iterations = 0;
+    while (angle < 0.0f) {
+        angle += gs::game::kTwoPi;
+        if (++iterations > max_iterations) {
+            return false;
+        }
+    }
+    while (angle >= gs::game::kTwoPi) {
+        angle -= gs::game::kTwoPi;
+        if (++iterations > max_iterations) {
+            return false;
+        }
+    }
+    out = static_cast<std::uint16_t>(std::lround((angle / gs::game::kTwoPi) * 65535.0f));
+    return true;
+}
+
+} // namespace
+
+int RunReplicationV2Scenario()
+{
+    int failures = 0;
+    auto report = [&](const char* name, bool pass, const std::string& detail) {
+        std::printf("REPLV2 %s %s: %s\n", name, detail.c_str(), pass ? "PASS" : "FAIL");
+        std::fflush(stdout);
+        failures += pass ? 0 : 1;
+    };
+
+    // ---- (a) periodic resync reaches UNCHANGED entities ----------------------
+    {
+        IoRunner runner;
+        gs::game::WorldRuntime sim(runner.io, {},
+                                   gs::game::WorldRuntime::SyntheticWorldConfig{2000.0f, 1, 1, {}});
+        sim.Start();
+        ObservedSession viewer = MakeObservedSession(runner.io, 50000);
+        ReplWire wire;
+        std::atomic<bool> stop{false};
+        std::thread reader([&] { DecodeReplFrames(*viewer.client, wire, stop); });
+        sim.PostSpawn(viewer.session, MakeCharacter(60), gs::game::DebugSpawnOverride{1000.0f, 1000.0f});
+        // A static neighbor: spawned, then never changes.
+        sim.PostSpawn(MakeDetachedSession(runner.io, 50001), MakeCharacter(61),
+                      gs::game::DebugSpawnOverride{1010.0f, 1000.0f});
+        const std::string neighbor = "Hardening61";
+        WaitFor(5000ms, [&] {
+            std::lock_guard lock(wire.mutex);
+            return wire.net_by_name.contains(neighbor) && wire.frames > 20;
+        });
+        std::uint32_t neighbor_net = 0;
+        std::uint64_t before = 0;
+        {
+            std::lock_guard lock(wire.mutex);
+            neighbor_net = wire.net_by_name[neighbor];
+            before = wire.records_by_net[neighbor_net];
+        }
+        std::this_thread::sleep_for(3500ms);
+        std::uint64_t after = 0;
+        {
+            std::lock_guard lock(wire.mutex);
+            after = wire.records_by_net[neighbor_net];
+        }
+        stop = true;
+        reader.join();
+        sim.Stop();
+        const auto records = after - before;
+        // refresh_ticks 20 (1 s): at least 3 full-state resync records in 3.5 s.
+        report("resync-reaches-unchanged-entity", neighbor_net != 0 && records >= 3,
+               Fmt("static_neighbor_net=%u records_in_3.5s=%llu", neighbor_net,
+                   static_cast<unsigned long long>(records)));
+    }
+
+    // ---- (b) starvation bound under a tight budget ---------------------------
+    // 30 players keep moving around one viewer (new versions every tick);
+    // 2 records per frame; the periodic refresh pushed out to 20 s so it cannot
+    // mask starvation. The shadow audit checks the recipient freshness bound.
+    {
+        IoRunner runner;
+        gs::game::WorldRuntime sim(runner.io, {},
+                                   gs::game::WorldRuntime::SyntheticWorldConfig{2000.0f, 1, 1, {}});
+        gs::game::ReplicationConfig replication;
+        replication.budget_max_records = 2;
+        replication.refresh_ticks = 400;
+        replication.max_defer_ticks = 40;
+        sim.ConfigureReplication(replication);
+        sim.Start();
+        sim.PostSpawn(MakeDetachedSession(runner.io, 51000), MakeCharacter(70),
+                      gs::game::DebugSpawnOverride{1000.0f, 1000.0f});
+        constexpr int kMovers = 30;
+        for (int i = 0; i < kMovers; ++i) {
+            const float angle = static_cast<float>(i) * 0.2094f;
+            sim.PostSpawn(MakeDetachedSession(runner.io, 51001 + static_cast<gs::common::SessionId>(i)),
+                          MakeCharacter(71 + static_cast<std::uint64_t>(i)),
+                          gs::game::DebugSpawnOverride{1000.0f + 60.0f * std::cos(angle),
+                                                       1000.0f + 60.0f * std::sin(angle)});
+        }
+        WaitFor(5000ms, [&] { return sim.PresenceStats().claims >= kMovers + 1; });
+        std::atomic<bool> run{true};
+        std::thread poster([&] {
+            std::uint32_t seq = 0;
+            const auto start = Clock::now();
+            while (run.load()) {
+                const double t = std::chrono::duration<double>(Clock::now() - start).count();
+                const bool east = (static_cast<int>(t * 2.0) % 2) == 0;
+                ++seq;
+                for (int i = 0; i < kMovers; ++i) {
+                    sim.PostMoveInput(51001 + static_cast<gs::common::SessionId>(i), seq,
+                                      east ? kHalfPi : -kHalfPi, gs::game::MoveState::Walking);
+                }
+                std::this_thread::sleep_for(20ms);
+            }
+        });
+        std::this_thread::sleep_for(4s); // let deferral build up
+        int audits = 0;
+        int audit_failures = 0;
+        std::string first_failure;
+        for (int round = 0; round < 6; ++round) {
+            sim.RequestReplicationValidation();
+            std::string result;
+            if (WaitFor(3000ms, [&] { return sim.TryTakeReplicationValidationResult(result); })) {
+                ++audits;
+                if (result != "OK") {
+                    ++audit_failures;
+                    if (first_failure.empty()) {
+                        first_failure = result.substr(0, 160);
+                    }
+                }
+            }
+            std::this_thread::sleep_for(700ms);
+        }
+        run = false;
+        poster.join();
+        sim.Stop();
+        report("starvation-bound-under-budget", audits == 6 && audit_failures == 0,
+               Fmt("audits=%d failures=%d%s%s", audits, audit_failures,
+                   first_failure.empty() ? "" : " first=", first_failure.c_str()));
+    }
+
+    // ---- (b2) idle-then-move is NOT starvation -------------------------------
+    // No budget: nothing is ever deferred beyond its Network LOD period. Two
+    // neighbors stand still far longer than max_defer_ticks (their last SEND
+    // is old, but the recipient's knowledge is re-verified every due check),
+    // then start moving. Their first move is a fresh change, not a starved
+    // one: zero starvation bypasses, and the audits stay clean.
+    {
+        IoRunner runner;
+        gs::game::WorldRuntime sim(runner.io, {},
+                                   gs::game::WorldRuntime::SyntheticWorldConfig{2000.0f, 1, 1, {}});
+        sim.ConfigureDiagnosticsInterval(std::chrono::hours(1)); // *_since_diag never reset
+        gs::game::ReplicationConfig replication;
+        replication.refresh_ticks = 400; // no periodic resync inside the window
+        replication.max_defer_ticks = 40;
+        sim.ConfigureReplication(replication);
+        sim.Start();
+        sim.PostSpawn(MakeDetachedSession(runner.io, 53000), MakeCharacter(120),
+                      gs::game::DebugSpawnOverride{1000.0f, 1000.0f});
+        // near tier (30 m, period 1) and normal tier (60 m, period 2)
+        sim.PostSpawn(MakeDetachedSession(runner.io, 53001), MakeCharacter(121),
+                      gs::game::DebugSpawnOverride{1030.0f, 1000.0f});
+        sim.PostSpawn(MakeDetachedSession(runner.io, 53002), MakeCharacter(122),
+                      gs::game::DebugSpawnOverride{1000.0f, 1060.0f});
+        WaitFor(5000ms, [&] { return sim.PresenceStats().claims >= 3; });
+        const auto starvation = [&] {
+            std::uint64_t total = 0;
+            const auto& zones = sim.Zones();
+            for (std::size_t i = 0; i < zones.ZoneCount(); ++i) {
+                total += zones.GetZone(i).Diagnostics().repl_v2_starvation_since_diag.load(
+                    std::memory_order_relaxed);
+            }
+            return total;
+        };
+        std::this_thread::sleep_for(3500ms); // idle: 70 ticks > max_defer_ticks
+        const auto s0 = starvation();
+        std::atomic<bool> run{true};
+        std::thread poster([&] {
+            std::uint32_t seq = 0;
+            while (run.load()) {
+                ++seq;
+                sim.PostMoveInput(53001, seq, kHalfPi, gs::game::MoveState::Walking);
+                sim.PostMoveInput(53002, seq, 0.0f, gs::game::MoveState::Walking);
+                std::this_thread::sleep_for(20ms);
+            }
+        });
+        int audits = 0;
+        int audit_failures = 0;
+        for (int round = 0; round < 4; ++round) {
+            std::this_thread::sleep_for(round == 0 ? 60ms : 400ms); // first audit right after the start
+            sim.RequestReplicationValidation();
+            std::string result;
+            if (WaitFor(3000ms, [&] { return sim.TryTakeReplicationValidationResult(result); })) {
+                ++audits;
+                audit_failures += result == "OK" ? 0 : 1;
+            }
+        }
+        run = false;
+        poster.join();
+        const auto s1 = starvation();
+        sim.Stop();
+        report("idle-then-move-not-starvation", s1 - s0 == 0 && audits == 4 && audit_failures == 0,
+               Fmt("starvation_bypasses=%llu audits=%d failures=%d",
+                   static_cast<unsigned long long>(s1 - s0), audits, audit_failures));
+    }
+
+    // ---- (b3) resync schedule under skipped world-tick samples ---------------
+    // Deterministic: 200 viewers (phase key = NetId), period 20, 4000 world
+    // ticks, three sampling patterns of the zone's view of the global tick.
+    // The pre-H7 exact-match predicate vs the due-based schedule.
+    {
+        constexpr std::uint32_t kPeriod = 20;
+        constexpr std::uint32_t kViewers = 200;
+        constexpr std::uint32_t kTicks = 4000;
+        const auto legacy = [](std::uint32_t tick, std::uint32_t key, std::uint32_t period) {
+            return period > 0 && ((tick + key) % period) == 0;
+        };
+        struct Pattern {
+            const char* name;
+            std::vector<std::uint32_t> samples;
+        };
+        std::vector<Pattern> patterns;
+        {
+            Pattern every{"every-tick", {}};
+            for (std::uint32_t t = 1; t <= kTicks; ++t) {
+                every.samples.push_back(t);
+            }
+            patterns.push_back(std::move(every));
+            Pattern half{"every-other-tick", {}};
+            for (std::uint32_t t = 2; t <= kTicks; t += 2) {
+                half.samples.push_back(t);
+            }
+            patterns.push_back(std::move(half));
+            // Jitter: steps of 0 (duplicate sample), 1 or 2 (skip).
+            Pattern jitter{"jitter-dup-skip", {}};
+            std::mt19937 rng(1234);
+            std::uniform_int_distribution<int> step(0, 9);
+            std::uint32_t t = 1;
+            while (t <= kTicks) {
+                jitter.samples.push_back(t);
+                const int r = step(rng);
+                t += r == 0 ? 0u : (r == 1 ? 2u : 1u);
+            }
+            patterns.push_back(std::move(jitter));
+        }
+        for (const auto& pattern : patterns) {
+            std::uint32_t legacy_min = UINT32_MAX;
+            std::uint32_t legacy_starved_viewers = 0;
+            std::uint32_t due_min = UINT32_MAX;
+            std::uint32_t due_max = 0;
+            std::uint32_t due_max_gap = 0;
+            std::uint32_t same_as_legacy = 0;
+            for (std::uint32_t key = 1; key <= kViewers; ++key) {
+                std::uint32_t next_due = 0;
+                std::uint32_t legacy_count = 0;
+                std::uint32_t due_count = 0;
+                std::uint32_t last_refresh = 0;
+                bool identical = true;
+                for (const std::uint32_t tick : pattern.samples) {
+                    const bool a = legacy(tick, key, kPeriod);
+                    const bool b = gs::game::ConsumeResyncDue(next_due, tick, key, kPeriod);
+                    legacy_count += a ? 1u : 0u;
+                    if (b) {
+                        if (due_count > 0) {
+                            due_max_gap = std::max(due_max_gap, tick - last_refresh);
+                        }
+                        last_refresh = tick;
+                        ++due_count;
+                    }
+                    identical = identical && a == b;
+                }
+                legacy_min = std::min(legacy_min, legacy_count);
+                legacy_starved_viewers += legacy_count == 0 ? 1u : 0u;
+                due_min = std::min(due_min, due_count);
+                due_max = std::max(due_max, due_count);
+                same_as_legacy += identical ? 1u : 0u;
+            }
+            const std::uint32_t expected = kTicks / kPeriod; // 200
+            // Every viewer refreshed once per period (+-1 at the edges), and
+            // no gap longer than a period plus the largest sampling step.
+            bool pass = due_min + 1 >= expected && due_max <= expected + 1 && due_max_gap <= kPeriod + 2;
+            if (std::strcmp(pattern.name, "every-tick") == 0) {
+                // Regular sampling: bit-identical to the legacy stagger.
+                pass = pass && same_as_legacy == kViewers;
+            }
+            report("resync-schedule-under-tick-skips",
+                   pass,
+                   Fmt("pattern=%s expected=%u due=[min=%u max=%u max_gap=%u] identical_to_legacy=%u/%u "
+                       "legacy=[min=%u never_refreshed_viewers=%u]",
+                       pattern.name, expected, due_min, due_max, due_max_gap, same_as_legacy,
+                       kViewers, legacy_min, legacy_starved_viewers));
+        }
+    }
+
+    // ---- (c) wire tick semantics across a migration --------------------------
+    // Zone B is empty (asleep, its local tick counter frozen) while the player
+    // lives in zone A; then the player runs across the border.
+    {
+        IoRunner runner;
+        gs::game::WorldRuntime sim(runner.io, {},
+                                   gs::game::WorldRuntime::SyntheticWorldConfig{2000.0f, 2, 1, {}});
+        sim.Start();
+        ObservedSession viewer = MakeObservedSession(runner.io, 52000);
+        ReplWire wire;
+        std::atomic<bool> stop{false};
+        std::thread reader([&] { DecodeReplFrames(*viewer.client, wire, stop); });
+        sim.PostSpawn(viewer.session, MakeCharacter(110), gs::game::DebugSpawnOverride{960.0f, 1000.0f});
+        WaitFor(5000ms, [&] {
+            std::lock_guard lock(wire.mutex);
+            return wire.frames > 0;
+        });
+        std::this_thread::sleep_for(3000ms); // zone A's local counter runs ahead
+        const auto mig0 = sim.MigrationMetrics();
+        std::uint32_t seq = 0;
+        const auto deadline = Clock::now() + 8s;
+        while (Clock::now() < deadline && sim.MigrationMetrics().committed == mig0.committed) {
+            sim.PostMoveInput(52000, ++seq, kHalfPi, gs::game::MoveState::Running);
+            std::this_thread::sleep_for(20ms);
+        }
+        sim.PostMoveInput(52000, ++seq, kHalfPi, gs::game::MoveState::Idle);
+        std::this_thread::sleep_for(1000ms);
+        stop = true;
+        reader.join();
+        const bool migrated = sim.MigrationMetrics().committed > mig0.committed;
+        sim.Stop();
+        std::uint64_t backward = 0;
+        std::uint32_t max_step = 0;
+        {
+            std::lock_guard lock(wire.mutex);
+            backward = wire.backward_steps;
+            max_step = wire.max_forward_step;
+        }
+        report("wire-tick-monotonic-across-migration", migrated && backward == 0 && max_step <= 3,
+               Fmt("migrated=%d backward_steps=%llu max_forward_step=%u", migrated ? 1 : 0,
+                   static_cast<unsigned long long>(backward), max_step));
+    }
+
+    // ---- (d) QuantizeHeading robustness + equivalence ------------------------
+    {
+        const float extremes[] = {std::numeric_limits<float>::quiet_NaN(),
+                                  std::numeric_limits<float>::infinity(),
+                                  -std::numeric_limits<float>::infinity(),
+                                  1.0e30f, -1.0e30f, 3.0e38f, 1.0e8f, -1.0e8f, 2.0e9f};
+        // The production function runs on a watchdog thread: before the fix a
+        // non-finite/huge heading never returned (the test must not hang too).
+        auto done = std::make_shared<std::promise<std::pair<bool, double>>>();
+        auto finished = done->get_future();
+        std::thread probe([done, extremes] {
+            const auto t0 = Clock::now();
+            bool in_range = true;
+            for (const float value : extremes) {
+                const std::uint16_t q = gs::game::QuantizeHeading(value);
+                in_range = in_range && q <= 65535;
+            }
+            done->set_value({in_range, std::chrono::duration<double, std::milli>(
+                                           Clock::now() - t0)
+                                           .count()});
+        });
+        bool returned = finished.wait_for(2s) == std::future_status::ready;
+        bool in_range = false;
+        double elapsed_ms = 2000.0;
+        if (returned) {
+            probe.join();
+            const auto [ok, ms] = finished.get();
+            in_range = ok;
+            elapsed_ms = ms;
+        } else {
+            probe.detach(); // spinning forever; the process exits at the end
+        }
+        int legacy_hangs = 0;
+        for (const float value : extremes) {
+            std::uint16_t legacy = 0;
+            // 10M iterations ~ far beyond any finite normalization need.
+            legacy_hangs += LegacyQuantizeHeading(value, legacy, 10'000'000) ? 0 : 1;
+        }
+        int mismatches = 0;
+        for (int i = 0; i <= 200000; ++i) {
+            const float angle = -4.0f * gs::game::kTwoPi +
+                                8.0f * gs::game::kTwoPi * static_cast<float>(i) / 200000.0f;
+            std::uint16_t legacy = 0;
+            LegacyQuantizeHeading(angle, legacy, 1000);
+            mismatches += gs::game::QuantizeHeading(angle) == legacy ? 0 : 1;
+        }
+        report("quantize-heading-nonfinite-and-huge", returned && in_range && elapsed_ms < 50.0,
+               Fmt("returned=%d inputs=9 elapsed_ms=%.3f legacy_loop_nonterminating=%d/9",
+                   returned ? 1 : 0, elapsed_ms, legacy_hangs));
+        report("quantize-heading-equivalent-in-range", mismatches == 0,
+               Fmt("samples=200001 range=[-4pi,4pi] mismatches=%d", mismatches));
+    }
+
+    std::printf("REPLV2-DONE failures=%d\n", failures);
+    return failures;
 }
 
 } // namespace gs::bench

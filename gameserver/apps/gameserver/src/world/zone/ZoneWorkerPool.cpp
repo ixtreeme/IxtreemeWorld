@@ -26,18 +26,22 @@ ZoneWorkerPool::~ZoneWorkerPool()
     Stop();
 }
 
-void ZoneWorkerPool::Start(std::size_t zone_count, std::size_t requested_workers)
+void ZoneWorkerPool::Start(std::size_t requested_workers)
 {
     if (!workers_.empty()) {
         return;
     }
+    // Sized from the hardware, never from the zone count at startup
+    // (hardening H6): the pool is created once, while splits create zones at
+    // runtime. Capping it at the seed zone count (3 on the test map, 1 on a
+    // single-zone world -- the explicit override was clamped the same way)
+    // meant a split could never run its children in parallel. Idle workers
+    // block on the task condition variable and cost no CPU.
     const unsigned int hardware_threads = std::max(1u, std::thread::hardware_concurrency());
-    const std::size_t automatic = std::max<std::size_t>(
-        1, std::min<std::size_t>(zone_count, hardware_threads > 1 ? hardware_threads - 1 : 1));
+    const std::size_t automatic = hardware_threads > 1 ? hardware_threads - 1 : 1;
     const std::size_t worker_count =
-        requested_workers > 0
-            ? std::clamp<std::size_t>(requested_workers, 1, std::max<std::size_t>(1, zone_count))
-            : automatic;
+        requested_workers > 0 ? std::clamp<std::size_t>(requested_workers, 1, kMaxWorkers)
+                              : automatic;
     workers_.reserve(worker_count);
     worker_stats_.assign(worker_count, WorkerStat{});
     stopping_ = false;

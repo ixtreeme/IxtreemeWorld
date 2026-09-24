@@ -310,7 +310,9 @@ bool ParseArgs(int argc, char** argv, BenchConfig& config)
         config.mode != "readiness" && config.mode != "ghost" && config.mode != "aoi" &&
         config.mode != "replication" && config.mode != "scheduler" &&
         config.mode != "tickrate" && config.mode != "inputpath" &&
-        config.mode != "netstress") {
+        config.mode != "netstress" && config.mode != "presence" &&
+        config.mode != "asfdeterminism" && config.mode != "workerpool" &&
+        config.mode != "replv2") {
         std::cerr << "bad mode: " << config.mode << "\n";
         return false;
     }
@@ -4021,14 +4023,6 @@ int RunAoiReplicationScenario(boost::asio::io_context& io,
     check("shadow-after-spawn-despawn", shadow_now("after-spawn-despawn"));
 
     // ---- dirty replication: clean entities produce no records ------------
-    const gs::game::Zone& v1_zone = *zone_of(kV1);
-    auto counters = [&](const gs::game::Zone& zone) {
-        return std::array<std::uint64_t, 4>{
-            zone.Diagnostics().repl_update_since_diag.load(std::memory_order_relaxed),
-            zone.Diagnostics().repl_spawn_since_diag.load(std::memory_order_relaxed),
-            zone.Diagnostics().repl_despawn_since_diag.load(std::memory_order_relaxed),
-            zone.Diagnostics().repl_suppressed_since_diag.load(std::memory_order_relaxed)};
-    };
     const auto clean_events_before = recipient_events(kV1);
     std::this_thread::sleep_for(std::chrono::milliseconds(600)); // ~12 ticks
     const auto clean_events_after = recipient_events(kV1);
@@ -4054,20 +4048,27 @@ int RunAoiReplicationScenario(boost::asio::io_context& io,
     check("dirty-clean-suppressed", clean_events_after[3] > clean_events_before[3]);
 
     // ---- changed transform -> update; both recipients catch up -----------
-    const auto dirty_before = counters(v1_zone);
+    // Cumulative per-recipient update counters (they travel with the binding
+    // and are never reset). The zone-wide repl_update_since_diag window used
+    // here before is exchanged to zero by the diagnostics logger every
+    // second, so a before/after comparison across that reset failed at
+    // random (hardening H5 lesson: never compare diagnostic windows).
+    auto recipient_updates = [&] {
+        return recipient_events(kV1)[2] + recipient_events(kV2)[2];
+    };
+    const auto dirty_before = recipient_updates();
     seq = 0;
     const auto dirty_deadline = std::chrono::steady_clock::now() + std::chrono::seconds(10);
     while (std::chrono::steady_clock::now() < dirty_deadline && !expired()) {
         sim.PostMoveInput(kPCross, ++seq, -1.5707963f, gs::game::MoveState::Walking);
-        const auto now = counters(v1_zone);
-        if (now[0] > dirty_before[0]) {
+        if (recipient_updates() > dirty_before) {
             break;
         }
         std::this_thread::sleep_for(std::chrono::milliseconds(50));
     }
     std::this_thread::sleep_for(std::chrono::milliseconds(200));
-    const auto dirty_after = counters(v1_zone);
-    check("dirty-changed-update", dirty_after[0] > dirty_before[0]);
+    const auto dirty_after = recipient_updates();
+    check("dirty-changed-update", dirty_after > dirty_before);
     check("dirty-multi-recipient-coverage", shadow_now("multi-recipient"));
 
     // ---- spawn + dirty transform coalescing (spawn carries the state) ----
@@ -4653,6 +4654,37 @@ int BenchMain(int argc, char** argv)
         // under continuous input, input loss across migrations under load).
         const int scenario_failures = gs::bench::RunInputPathScenario();
         std::printf("BENCH-DONE inputpath failures=%d\n", scenario_failures);
+        return scenario_failures == 0 ? 0 : 2;
+    }
+
+    if (config.mode == "replv2") {
+        // Hardening H7: replication v2 correctness.
+        const int scenario_failures = gs::bench::RunReplicationV2Scenario();
+        std::printf("BENCH-DONE replv2 failures=%d\n", scenario_failures);
+        std::fflush(stdout);
+        // A pre-fix QuantizeHeading probe may still be spinning on a detached
+        // thread; leave without joining it.
+        std::_Exit(scenario_failures == 0 ? 0 : 2);
+    }
+
+    if (config.mode == "workerpool") {
+        // Hardening H6: worker pool sizing revalidation.
+        const int scenario_failures = gs::bench::RunWorkerPoolScenario();
+        std::printf("BENCH-DONE workerpool failures=%d\n", scenario_failures);
+        return scenario_failures == 0 ? 0 : 2;
+    }
+
+    if (config.mode == "asfdeterminism") {
+        // Hardening H5: control decisions independent of diagnostics cadence.
+        const int scenario_failures = gs::bench::RunAsfDeterminismScenario();
+        std::printf("BENCH-DONE asfdeterminism failures=%d\n", scenario_failures);
+        return scenario_failures == 0 ? 0 : 2;
+    }
+
+    if (config.mode == "presence") {
+        // Hardening H4: one CharacterId -> at most one world presence.
+        const int scenario_failures = gs::bench::RunPresenceScenario();
+        std::printf("BENCH-DONE presence failures=%d\n", scenario_failures);
         return scenario_failures == 0 ? 0 : 2;
     }
 

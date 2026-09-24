@@ -1,6 +1,7 @@
 #pragma once
 
 #include <array>
+#include <atomic>
 #include <chrono>
 #include <cstdint>
 #include <memory>
@@ -73,6 +74,10 @@ public:
 
     explicit ZoneLoadMonitor(Config config = Config{});
 
+    // Replaces the configuration and drops the per-cycle observations
+    // (candidate lists, snapshots). The cumulative control counters survive.
+    void Reconfigure(Config config);
+
     // Supervisor only. Updates scores/timers, then fills candidates.
     // `load_field` may be null/disabled: the field score is then 0 and the
     // legacy (avg/p99 tick + resident) behavior is preserved exactly.
@@ -112,8 +117,42 @@ public:
         return config_;
     }
 
+    // Control decision-state transitions (cumulative, any thread). A breach
+    // "reset" is a started sustained-overload timer that was cleared again;
+    // a sustained-low reset likewise for the merge-side leaf timer. With the
+    // same workload these must not depend on the diagnostics cadence (H5).
+    struct ControlCounters {
+        std::uint64_t updates = 0;
+        std::uint64_t breach_starts = 0;
+        std::uint64_t breach_resets = 0;
+        std::uint64_t low_starts = 0;
+        std::uint64_t low_resets = 0;
+        // Largest tick count any single leaf control window covered. Bounded
+        // by the control period x 20 Hz; a counter underflow (stale baseline
+        // after topology reuse) would show up here as a huge value.
+        std::uint64_t max_window_ticks = 0;
+        std::int64_t first_split_candidate_ns = 0; // steady_clock epoch ns, 0 = never
+    };
+    ControlCounters GetControlCounters() const noexcept
+    {
+        return ControlCounters{updates_.load(std::memory_order_relaxed),
+                               breach_starts_.load(std::memory_order_relaxed),
+                               breach_resets_.load(std::memory_order_relaxed),
+                               low_starts_.load(std::memory_order_relaxed),
+                               low_resets_.load(std::memory_order_relaxed),
+                               max_window_ticks_.load(std::memory_order_relaxed),
+                               first_split_candidate_ns_.load(std::memory_order_relaxed)};
+    }
+
 private:
     Config config_;
+    std::atomic<std::uint64_t> updates_{0};
+    std::atomic<std::uint64_t> breach_starts_{0};
+    std::atomic<std::uint64_t> breach_resets_{0};
+    std::atomic<std::uint64_t> low_starts_{0};
+    std::atomic<std::uint64_t> low_resets_{0};
+    std::atomic<std::uint64_t> max_window_ticks_{0}; // supervisor writes, any thread reads
+    std::atomic<std::int64_t> first_split_candidate_ns_{0};
     std::vector<ZoneLoadSnapshot> snapshots_;
     std::vector<ZoneId> split_candidates_;
     std::vector<ZoneId> merge_candidates_;

@@ -12,6 +12,7 @@
 #include "../distributed/WorldDirectory.h"
 #include "../migration/MigrationQueue.h"
 #include "../partition/ZonePartition.h"
+#include "../spawn/PresenceRegistry.h"
 #include "../spatial/SpatialValidator.h"
 #include "../zone/Zone.h"
 #include "../zone/ZoneManager.h"
@@ -113,7 +114,8 @@ bool ValidateWorldConsistency(ZoneManager& zones,
                               const MigrationQueue& migrations,
                               const WorldDirectory& directory,
                               const ActivityGrid* activity,
-                              std::string& out_error)
+                              std::string& out_error,
+                              const PresenceRegistry* presence)
 {
     if (!ValidatePartitionTopology(zones, out_error)) {
         return false;
@@ -425,6 +427,63 @@ bool ValidateWorldConsistency(ZoneManager& zones,
             message << "owner map: session " << session_id << " has no live entity in zone "
                     << zone.Id();
             return Fail(out_error, message.str());
+        }
+    }
+
+    // World presence invariant (hardening H4): one CharacterId -> at most one
+    // authoritative presence, across every simulating zone; the presence
+    // registry and the owner map describe the same set of presences.
+    {
+        std::unordered_map<std::uint64_t, std::uint32_t> binding_by_character;
+        for (std::size_t i = 0; i < zones.ZoneCount(); ++i) {
+            const Zone& zone = zones.GetZone(i);
+            if (!zone.SimulationEnabled()) {
+                continue;
+            }
+            for (const auto& [net_id, binding] : zone.Players()) {
+                const std::uint64_t character = gs::db::ToUint64(binding.character.id);
+                const auto [it, inserted] = binding_by_character.emplace(character, net_id);
+                if (!inserted) {
+                    std::ostringstream message;
+                    message << "presence: character " << character << " has two authoritative "
+                            << "presences (net " << it->second << " and net " << net_id << ")";
+                    return Fail(out_error, message.str());
+                }
+                if (presence != nullptr && binding.session) {
+                    const auto* record = presence->Find(binding.character.id);
+                    if (record == nullptr || record->session_id != binding.session->Id() ||
+                        record->net_id != net_id) {
+                        std::ostringstream message;
+                        message << "presence: character " << character << " (net " << net_id
+                                << ", zone " << zone.Id()
+                                << ") is not registered to its session";
+                        return Fail(out_error, message.str());
+                    }
+                }
+            }
+        }
+        if (presence != nullptr) {
+            for (const auto& [character, record] : presence->Records()) {
+                const auto owner = owners.find(record.session_id);
+                if (owner == owners.end() || owner->second.net_id != record.net_id) {
+                    std::ostringstream message;
+                    message << "presence: character " << gs::db::ToUint64(character)
+                            << " registered to session " << record.session_id
+                            << " without a matching owner";
+                    return Fail(out_error, message.str());
+                }
+            }
+            for (const auto& [session_id, owner] : owners) {
+                const auto character = presence->CharacterOf(session_id);
+                const auto* record = character ? presence->Find(*character) : nullptr;
+                if (record == nullptr || record->session_id != session_id ||
+                    record->net_id != owner.net_id) {
+                    std::ostringstream message;
+                    message << "presence: owner session " << session_id
+                            << " holds no registered presence";
+                    return Fail(out_error, message.str());
+                }
+            }
         }
     }
 

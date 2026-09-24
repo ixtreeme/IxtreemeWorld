@@ -28,11 +28,22 @@ ZoneLoadMonitor::ZoneLoadMonitor(Config config)
     tick_scratch_.resize(ZoneDiagnostics::kTickSampleCapacity, 0u);
 }
 
+void ZoneLoadMonitor::Reconfigure(Config config)
+{
+    config_ = config;
+    snapshots_.clear();
+    split_candidates_.clear();
+    merge_candidates_.clear();
+    merge_groups_.clear();
+    overloaded_leaves_.clear();
+}
+
 void ZoneLoadMonitor::Update(ZoneManager& zones,
                              const ZoneScheduler& scheduler,
                              std::chrono::steady_clock::time_point now,
                              const std::shared_ptr<const LoadGrid>& load_field)
 {
+    updates_.fetch_add(1, std::memory_order_relaxed);
     split_candidates_.clear();
     merge_candidates_.clear();
     overloaded_leaves_.clear();
@@ -53,16 +64,34 @@ void ZoneLoadMonitor::Update(ZoneManager& zones,
         snap.zone_id = leaf->zone_id;
         snap.players = diag.player_count.load(std::memory_order_relaxed);
         snap.mobs = diag.mob_count.load(std::memory_order_relaxed);
-        const std::uint64_t ticks = diag.ticks_since_diag.load(std::memory_order_relaxed);
-        snap.avg_tick_us =
-            ticks > 0
-                ? diag.tick_micros_since_diag.load(std::memory_order_relaxed) / ticks
-                : 0;
+        // Control window (H5): deltas of the zone's cumulative control counters
+        // since THIS leaf's previous observation. The diagnostics logger's
+        // *_since_diag windows are never read here, so their reset cadence
+        // cannot move a sustained timer or a split/merge decision.
+        const std::uint64_t ticks_total = diag.control_ticks_total.load(std::memory_order_relaxed);
+        const std::uint64_t micros_total =
+            diag.control_tick_micros_total.load(std::memory_order_relaxed);
+        if (leaf->control_seen_zone != leaf->zone_id) {
+            // First observation of this zone through this node (new split
+            // child, or a merge that re-pointed the parent node at a fresh
+            // zone): the window starts at the zone's creation.
+            leaf->control_seen_zone = leaf->zone_id;
+            leaf->control_ticks_seen = 0;
+            leaf->control_micros_seen = 0;
+        }
+        const std::uint64_t ticks = ticks_total - leaf->control_ticks_seen;
+        const std::uint64_t window_micros = micros_total - leaf->control_micros_seen;
+        leaf->control_ticks_seen = ticks_total;
+        leaf->control_micros_seen = micros_total;
+        if (ticks > max_window_ticks_.load(std::memory_order_relaxed)) {
+            max_window_ticks_.store(ticks, std::memory_order_relaxed);
+        }
+        snap.avg_tick_us = ticks > 0 ? window_micros / ticks : 0;
         snap.timestamp = now;
 
         // p95/p99 from the zone's 256-sample tick ring. Only meaningful when
-        // the zone actually ticked in the last diagnostic window: a sleeping
-        // zone's stale samples must not resurrect an old overload.
+        // the zone actually ticked in this control window: a sleeping zone's
+        // stale samples must not resurrect an old overload.
         if (ticks > 0) {
             const std::size_t count =
                 diag.CopyTickSamples(tick_scratch_.data(), tick_scratch_.size());
@@ -130,9 +159,13 @@ void ZoneLoadMonitor::Update(ZoneManager& zones,
         if (snap.load_score >= config_.split_load_threshold) {
             if (leaf->sustained_breach_since == std::chrono::steady_clock::time_point{}) {
                 leaf->sustained_breach_since = now;
+                breach_starts_.fetch_add(1, std::memory_order_relaxed);
             }
             overloaded_leaves_.push_back(leaf->zone_id);
         } else {
+            if (leaf->sustained_breach_since != std::chrono::steady_clock::time_point{}) {
+                breach_resets_.fetch_add(1, std::memory_order_relaxed);
+            }
             leaf->sustained_breach_since = {};
         }
 
@@ -141,13 +174,23 @@ void ZoneLoadMonitor::Update(ZoneManager& zones,
         if (snap.load_score < config_.merge_load_threshold) {
             if (leaf->field_low_since == std::chrono::steady_clock::time_point{}) {
                 leaf->field_low_since = now;
+                low_starts_.fetch_add(1, std::memory_order_relaxed);
             }
         } else {
+            if (leaf->field_low_since != std::chrono::steady_clock::time_point{}) {
+                low_resets_.fetch_add(1, std::memory_order_relaxed);
+            }
             leaf->field_low_since = {};
         }
 
         if (scheduler.ShouldSplit(leaf, now)) {
             split_candidates_.push_back(leaf->zone_id);
+            std::int64_t expected = 0;
+            first_split_candidate_ns_.compare_exchange_strong(
+                expected,
+                std::chrono::duration_cast<std::chrono::nanoseconds>(now.time_since_epoch())
+                    .count(),
+                std::memory_order_relaxed);
         }
     }
 

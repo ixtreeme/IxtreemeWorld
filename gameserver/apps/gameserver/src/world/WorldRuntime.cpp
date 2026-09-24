@@ -84,6 +84,9 @@ WorldRuntime::WorldRuntime(boost::asio::io_context& io, RuntimeIdentity identity
              [this](std::shared_ptr<gs::network::Session> session, std::vector<std::uint8_t> payload) {
                  SendToSession(io_, session, std::move(payload));
              },
+             [this](std::shared_ptr<gs::network::Session> session, std::vector<std::uint8_t> payload) {
+                 SendToSessionAndClose(io_, session, std::move(payload));
+             },
              identity_,
              directory_)
     , migration_(zones_, terrain_, owners_by_session_, migration_queue_, directory_,
@@ -309,7 +312,7 @@ void WorldRuntime::Run()
 {
     sim_thread_id_ = std::this_thread::get_id();
 
-    workers_.Start(zones_.ZoneCount(), requested_workers_);
+    workers_.Start(requested_workers_);
 
     LOG_INFO("Game sim supervisor started: zones={} workers={} aoi_radius={} aoi_cap={}",
              zones_.ZoneCount(),
@@ -317,7 +320,7 @@ void WorldRuntime::Run()
              kAoiRadiusMeters,
              kAoiEntityCap);
     auto next_world_tick = std::chrono::steady_clock::now() + kTickDt;
-    auto next_diagnostics = std::chrono::steady_clock::now() + std::chrono::seconds(1);
+    auto next_diagnostics = std::chrono::steady_clock::now() + diagnostics_interval_;
 
     while (!stopping_) {
         const auto supervisor_start = std::chrono::steady_clock::now();
@@ -423,7 +426,8 @@ void WorldRuntime::Run()
                 const auto activity_for_validation = activity_field_.Snapshot();
                 const bool ok =
                     ValidateWorldConsistency(zones_, owners_by_session_, migration_queue_, directory_,
-                                             activity_for_validation.get(), error);
+                                             activity_for_validation.get(), error,
+                                             &spawn_.Presence());
                 std::lock_guard lock(validation_mutex_);
                 validation_result_ = ok ? std::string("OK") : "FAIL: " + error;
                 validation_ready_ = true;
@@ -885,7 +889,7 @@ void WorldRuntime::Run()
                      lf.peak_normalized,
                      lf.peak_composite);
             do {
-                next_diagnostics += std::chrono::seconds(1);
+                next_diagnostics += diagnostics_interval_;
             } while (now >= next_diagnostics);
         }
 
@@ -901,6 +905,7 @@ void WorldRuntime::Run()
     }
     zones_.Clear();
     owners_by_session_.clear();
+    spawn_.ClearPresence();
     spawn_.ClearRespawns();
     LOG_INFO("Game sim supervisor stopped");
 }
@@ -912,7 +917,7 @@ bool WorldRuntime::ValidateConsistency(std::string& out_error)
     // a test harness, or after Stop).
     const auto activity = activity_field_.Snapshot();
     return ValidateWorldConsistency(zones_, owners_by_session_, migration_queue_, directory_,
-                                    activity.get(), out_error);
+                                    activity.get(), out_error, &spawn_.Presence());
 }
 
 void WorldRuntime::RequestActivityValidation(std::size_t max_samples)
@@ -2228,7 +2233,7 @@ void WorldRuntime::ConfigurePartition(const PartitionConfig& config)
     monitor.tick_budget_ms = e.tick_budget_ms;
     monitor.resident_budget = e.resident_budget;
     monitor.field_timescale = e.scoring.decision_timescale;
-    load_monitor_ = ZoneLoadMonitor(monitor); // resets sustained timers; call pre-Start or idle
+    load_monitor_.Reconfigure(monitor); // call pre-Start or idle
 
     // Adaptive scoring config: the scorer is read-only, the monitor's field
     // overload signal uses the same timescale so observe and score agree.

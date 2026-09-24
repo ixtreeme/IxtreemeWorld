@@ -33,6 +33,13 @@ struct ZonePartition {
     float field_peak_score = 0.0f;  // max cell composite in the zone
     float p95_tick_us = 0.0f;
     float p99_tick_us = 0.0f;
+    // Control window bookkeeping (H5): the zone's cumulative control counters
+    // as seen at this leaf's previous ZoneLoadMonitor observation, and WHICH
+    // zone they belong to -- a merge reuses the parent node for a brand-new
+    // zone, whose counters start from zero again.
+    ZoneId control_seen_zone = 0;
+    std::uint64_t control_ticks_seen = 0;
+    std::uint64_t control_micros_seen = 0;
     std::chrono::steady_clock::time_point sustained_breach_since{};
     // Leaf-level sustained-low state: how long this leaf's combined score has
     // stayed below the merge threshold (written by ZoneLoadMonitor).

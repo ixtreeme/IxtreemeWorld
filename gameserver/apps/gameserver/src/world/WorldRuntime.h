@@ -226,6 +226,23 @@ public:
     ZoneWorkerPool::Utilization WorkerUtilization() const;
     // Phase 7 scheduler audit: explicit worker count (0 = auto). Must be set
     // before Start.
+    // Diagnostics log cadence (default 1 s). Must be set before Start. The
+    // partition control loop is independent of it (H5).
+    void ConfigureDiagnosticsInterval(std::chrono::milliseconds interval) noexcept
+    {
+        diagnostics_interval_ = interval.count() > 0 ? interval : std::chrono::milliseconds(1000);
+    }
+    // Control decision-state transitions of the partition monitor (H5).
+    ZoneLoadMonitor::ControlCounters PartitionControlCounters() const noexcept
+    {
+        return load_monitor_.GetControlCounters();
+    }
+    // World presence registry counters (H4): claims, releases, refused
+    // duplicates and the live presence gauge (atomics, any thread).
+    PresenceRegistry::Stats PresenceStats() const noexcept
+    {
+        return spawn_.Presence().GetStats();
+    }
     // Cumulative client-input path counters (posted/routed/applied/dropped).
     InputRouter::Stats InputStats() const
     {
@@ -594,6 +611,9 @@ private:
 
     // Phase 7 scheduler audit.
     std::size_t requested_workers_ = 0;
+    // Diagnostics log/exchange cadence (the *_since_diag windows). Decisions
+    // never read those windows (H5); the knob exists to prove it.
+    std::chrono::milliseconds diagnostics_interval_{1000};
     std::atomic<std::uint64_t> busy_phase_micros_{0};
     std::atomic<std::uint64_t> idle_phase_micros_{0};
     std::chrono::steady_clock::time_point last_phase_sample_{};

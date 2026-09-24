@@ -9,6 +9,7 @@
 #include "../zone/Zone.h"
 #include "../zone/ZoneOwnership.h"
 #include "ProtocolEncoder.h"
+#include "ResyncSchedule.h"
 #include "SnapshotBuilder.h"
 
 namespace gs::game {
@@ -90,7 +91,7 @@ std::size_t ReplicationSystem::BroadcastTransforms(Zone& zone,
     auto& diag = zone.Diagnostics();
     const std::uint32_t world_tick = zone.WorldTick();
     std::size_t transform_records_sent = 0;
-    for (const auto& [viewer_net_id, binding] : zone.Players()) {
+    for (auto& [viewer_net_id, binding] : zone.Players()) {
         if (!binding.session) {
             continue;
         }
@@ -118,13 +119,14 @@ std::size_t ReplicationSystem::BroadcastTransforms(Zone& zone,
         // refresh_ticks (v2: resync_ticks when configured), spread across
         // ticks by NetId so no tick carries the whole world's refresh at
         // once. With dirty replication off this is the legacy "send
-        // everything every tick" behavior.
+        // everything every tick" behavior. Due-based (hardening H7): a zone
+        // that skips a world tick value must not skip the resync with it.
         const std::uint32_t refresh_period =
             effective.v2_enabled && effective.resync_ticks > 0 ? effective.resync_ticks
                                                                : effective.refresh_ticks;
         const bool refresh_all =
             !effective.dirty_enabled ||
-            (refresh_period > 0 && ((world_tick + viewer_net_id) % refresh_period) == 0);
+            ConsumeResyncDue(binding.next_resync_tick, world_tick, viewer_net_id, refresh_period);
         if (refresh_all && effective.dirty_enabled) {
             diag.repl_refresh_since_diag.fetch_add(1, std::memory_order_relaxed);
         }
@@ -167,16 +169,18 @@ std::size_t ReplicationSystem::BroadcastTransforms(Zone& zone,
                                   viewer_position,
                                   viewer_entity.get<Heading>(),
                                   viewer_entity.get<MoveIntent>().state);
+        // Wire tick (hardening H7): the GLOBAL world tick, never the zone's
+        // local tick counter -- see ProtocolEncoder.h for the contract.
         auto frame = effective.v2_enabled
                          ? EncodeTransformFrameV2(viewer_record,
                                                   t_delta_payload,
                                                   static_cast<std::uint32_t>(stats.delta_records +
                                                                              stats.full_records),
-                                                  zone.TickIndex())
+                                                  world_tick)
                          : EncodeTransformFrameFromRecords(viewer_record,
                                                            t_record_cache.records,
                                                            t_record_slots,
-                                                           zone.TickIndex());
+                                                           world_tick);
         const std::uint64_t encode_us = ElapsedUs(encode_start);
         const std::uint64_t frame_bytes = frame.size();
         const std::size_t records = 1 + (effective.v2_enabled

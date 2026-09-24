@@ -1185,6 +1185,14 @@ int RunReadinessBenchmark(boost::asio::io_context& io, const ReadinessConfig& co
     for (std::size_t zi = 0; zi < sim.Zones().ZoneCount(); ++zi) {
         const auto& zone = sim.Zones().GetZone(zi);
         const auto& diag = zone.Diagnostics();
+        // A split/merge in flight at report time: its Staging destinations
+        // are never authoritative until commit (the frozen source still
+        // carries every resident in both its mob count and its tier gauges),
+        // but they already hold insert bumps for the transferred entities.
+        // Counting them double-counts a whole zone's residents.
+        if (zone.Partition() == gs::game::PartitionState::Staging) {
+            continue;
+        }
         lod_full += diag.lod_full.load(std::memory_order_relaxed);
         lod_reduced += diag.lod_reduced.load(std::memory_order_relaxed);
         lod_low += diag.lod_low.load(std::memory_order_relaxed);
@@ -1267,7 +1275,11 @@ int RunReadinessBenchmark(boost::asio::io_context& io, const ReadinessConfig& co
                                              diag.lod_low.load(std::memory_order_relaxed) +
                                              diag.lod_dormant.load(std::memory_order_relaxed);
             const std::uint64_t zone_mobs = diag.mob_count.load(std::memory_order_relaxed);
-            if (zone_tiers == zone_mobs) {
+            // Only zones that can explain the breach (a +-1 insert bump is
+            // noise); retired/split parents included.
+            const std::uint64_t zone_diff =
+                zone_tiers > zone_mobs ? zone_tiers - zone_mobs : zone_mobs - zone_tiers;
+            if (zone_diff <= 8) {
                 continue;
             }
             std::printf("TIER-MISMATCH zone=%u mobs=%llu tiers=%llu tiersum=%llu "
@@ -1573,7 +1585,12 @@ int RunReadinessBenchmark(boost::asio::io_context& io, const ReadinessConfig& co
         const std::uint64_t v2_budget_hits = total_of(&ZoneStageTotals::repl_v2_budget_hits);
         const std::uint64_t v2_critical = total_of(&ZoneStageTotals::repl_v2_critical);
         const std::uint64_t v2_delta_bytes = total_of(&ZoneStageTotals::repl_v2_delta_bytes);
-        const std::uint64_t v2_max_defer = total_of(&ZoneStageTotals::repl_v2_max_defer);
+        // A per-zone peak: the world value is the max over zones, never the
+        // sum (summing 160 zones' ~4-tick peaks reported a bogus ~560).
+        std::uint64_t v2_max_defer = 0;
+        for (const auto& zone : zone_totals) {
+            v2_max_defer = std::max(v2_max_defer, zone.repl_v2_max_defer.total);
+        }
         const std::uint64_t tier_c = total_of(&ZoneStageTotals::repl_v2_tier_critical);
         const std::uint64_t tier_n = total_of(&ZoneStageTotals::repl_v2_tier_near);
         const std::uint64_t tier_no = total_of(&ZoneStageTotals::repl_v2_tier_normal);

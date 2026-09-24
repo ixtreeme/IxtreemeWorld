@@ -117,6 +117,9 @@ struct S2cEnterWorldReject {
     expiredToken @1;
     alreadyUsed @2;
     serverError @3;
+    # The character already has an authoritative world presence (another
+    # session holds it); retry once that session is gone.
+    alreadyInWorld @4;
   }
 }
 

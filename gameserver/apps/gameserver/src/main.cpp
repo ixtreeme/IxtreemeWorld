@@ -383,6 +383,11 @@ int main(int argc, char* argv[])
                  runtime_identity.process.value,
                  gs::game::NamespaceFor(runtime_identity));
         gs::game::WorldRuntime sim(io, runtime_identity);
+        // Zone worker threads: 0/absent = hardware_concurrency - 1 (H6: never
+        // derived from the seed zone count; splits add zones at runtime).
+        if (const auto zone_workers = config.GetInt("zone_workers"); zone_workers && *zone_workers > 0) {
+            sim.ConfigureWorkers(static_cast<std::size_t>(*zone_workers));
+        }
         sim.ConfigurePartition(ResolvePartitionConfig(config));
         sim.ConfigureSimulationLod(ResolveLodConfig(config));
         sim.ConfigureLoadField(ResolveLoadFieldConfig(config));

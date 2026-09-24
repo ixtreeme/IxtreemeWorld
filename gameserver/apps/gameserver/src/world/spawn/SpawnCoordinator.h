@@ -22,6 +22,7 @@
 #include "../OwnerMap.h"
 #include "../replication/NetworkEntityId.h"
 #include "MobPrototypeRegistry.h"
+#include "PresenceRegistry.h"
 #include "RespawnSystem.h"
 #include "SpawnLoader.h"
 
@@ -57,6 +58,7 @@ public:
                      WorldMessageRouter& router,
                      WakeFn wake,
                      SendFn send,
+                     SendFn send_and_close,
                      RuntimeIdentity identity,
                      WorldDirectory& directory);
 
@@ -74,11 +76,24 @@ public:
     // flight. Returns the number of mobs actually spawned.
     std::size_t SpawnAllConfiguredMobs();
 
+    // Enforces the world presence invariant (H4): a character already held by
+    // another session is refused with EnterWorldReject::alreadyInWorld and
+    // the requesting session is closed; nothing is spawned.
     void Spawn(std::shared_ptr<gs::network::Session> session,
                gs::db::Character character,
                std::optional<DebugSpawnOverride> debug_spawn,
                std::uint32_t world_tick);
+    // Releases the session's presence (if it holds one) and its entity.
     void Despawn(gs::common::SessionId session_id);
+
+    const PresenceRegistry& Presence() const noexcept
+    {
+        return presence_;
+    }
+    void ClearPresence()
+    {
+        presence_.Clear();
+    }
 
     bool SpawnMobFromSpawnPoint(std::size_t spawn_point_index);
     // Thread-safe: appends a spawn point usable by later spawns/respawns.
@@ -123,7 +138,9 @@ private:
     WorldMessageRouter& router_;
     WakeFn wake_;
     SendFn send_;
+    SendFn send_and_close_;
     RuntimeIdentity identity_;
+    PresenceRegistry presence_;
     WorldDirectory& directory_;
 
     MobPrototypeRegistry mob_types_;

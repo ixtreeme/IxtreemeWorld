@@ -8,6 +8,9 @@ game_server=127.0.0.1:11020
 
 # Runtime
 io_threads=2
+# Zone worker threads (0 = hardware_concurrency - 1). Independent of the map's
+# seed zone count: dynamic splits add zones at runtime.
+zone_workers=0
 
 # Network resource policy (hardening H3). 0 disables a limit.
 # Send queue: frames are never dropped individually (replication v2 deltas

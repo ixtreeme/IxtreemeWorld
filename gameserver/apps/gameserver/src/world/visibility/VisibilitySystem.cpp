@@ -213,6 +213,7 @@ void VisibilitySystem::ReconcileViewer(Zone& zone,
             known.move_state = static_cast<std::uint8_t>(snapshot->move_state);
             known.tier = TierFor(candidate, source, config);
             known.last_sent_tick = world_tick;
+            known.synced_tick = world_tick;
             known.next_due_tick =
                 world_tick + PeriodForTier(known.tier, config.network_lod);
             viewer->visible_net_versions.emplace(net_id, known);
@@ -232,12 +233,19 @@ void VisibilitySystem::ReconcileViewer(Zone& zone,
             ++out_stats.suppressed;
             continue;
         }
-        // Starvation is about the PENDING CHANGE age (the entity's last
-        // change tick), not the time since the last send: a static entity
-        // needs no send at all.
-        const std::uint32_t change_tick = CurrentTransformVersion(source);
+        // Starvation (hardening H7) is the age of the RECIPIENT'S knowledge
+        // while a change is pending: a static entity (version unchanged) needs
+        // no send at all, but an entity with a pending change must reach the
+        // recipient within max_defer_ticks. Measuring the entity's last-change
+        // age instead let a continuously moving entity (change age ~0 every
+        // tick) be deferred by the budget forever. The age runs from the last
+        // CONFIRMED-current tick (sent, or verified unchanged at a due check),
+        // not the last send: a long-static entity's first move is fresh.
+        // Over-estimate is bounded by one Network LOD period.
+        const std::uint32_t change_version = CurrentTransformVersion(source);
+        const bool pending_change = change_version != known.version;
         const std::uint32_t pending_age =
-            world_tick >= change_tick ? world_tick - change_tick : 0;
+            pending_change && world_tick >= known.synced_tick ? world_tick - known.synced_tick : 0;
         const bool starved = pending_age > config.max_defer_ticks;
         const bool critical = refresh_all || known.tier == 0 || starved;
         const bool budget_limited = config.v2_enabled &&
@@ -274,8 +282,14 @@ void VisibilitySystem::ReconcileViewer(Zone& zone,
         if (move_state != known.move_state) {
             mask |= kTransformFieldMoveState;
         }
-        if (mask == 0) {
+        // Periodic resync (hardening H7): a refresh re-sends the full state
+        // even when the recipient model says nothing changed. The model can
+        // only be wrong in ways it cannot see (a client that dropped or
+        // rejected a frame, or rebuilt its entity cache), so the resync must
+        // not trust it -- otherwise an unchanged entity is never repaired.
+        if (mask == 0 && !refresh_all) {
             known.version = CurrentTransformVersion(source);
+            known.synced_tick = world_tick; // the recipient already holds this state
             known.next_due_tick = world_tick + period;
             ++viewer->suppressed_events;
             ++out_stats.suppressed;
@@ -336,6 +350,7 @@ void VisibilitySystem::ReconcileViewer(Zone& zone,
         known.heading_q = heading_q;
         known.move_state = move_state;
         known.last_sent_tick = world_tick;
+        known.synced_tick = world_tick;
         known.next_due_tick = world_tick + period;
         ++viewer->update_events;
         ++out_stats.updates;

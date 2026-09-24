@@ -173,6 +173,15 @@ struct ZoneDiagnostics {
     std::atomic<std::uint64_t> repl_encode_us_since_diag{0};
     std::atomic<std::uint64_t> repl_send_us_since_diag{0};
 
+    // Control-plane tick counters (hardening H5): cumulative and NEVER reset.
+    // The partition control loop derives its own windows from deltas of
+    // these, so the diagnostic *_since_diag counters (owned by the logger /
+    // benches and exchanged to zero at their own cadence) can never change a
+    // split/merge decision or its sustained timers.
+    std::atomic<std::uint64_t> control_ticks_total{0};
+    std::atomic<std::uint64_t> control_tick_micros_total{0};
+    std::atomic<std::uint64_t> last_tick_micros{0};
+
     // Recent per-tick wall times (microseconds), newest at head-1.
     std::array<std::atomic<std::uint64_t>, kTickSampleCapacity> tick_samples;
     std::atomic<std::size_t> tick_sample_head{0};
