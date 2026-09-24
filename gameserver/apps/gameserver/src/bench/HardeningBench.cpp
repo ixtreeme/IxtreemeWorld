@@ -12,7 +12,10 @@
 #include <cstring>
 #include <functional>
 #include <future>
+#include <filesystem>
+#include <fstream>
 #include <limits>
+#include <set>
 #include <memory>
 #include <mutex>
 #include <random>
@@ -50,7 +53,11 @@
 #include "../world/partition/RegionDefinition.h"
 #include "../world/terrain/TerrainService.h"
 #include "map/MapData.h"
+#include "map/WorldPackage.h"
+#include "map/WorldPackageWriter.h"
 #include "schema/map_manifest.capnp.h"
+#include "BenchSnapshot.h"
+#include "BenchWorld.h"
 
 namespace gs::bench {
 namespace {
@@ -58,6 +65,12 @@ namespace {
 using Clock = std::chrono::steady_clock;
 namespace asio = boost::asio;
 using asio::ip::tcp;
+
+// Players present in the world (owner map), via a supervisor snapshot.
+std::size_t OwnerCount(gs::game::WorldRuntime& sim)
+{
+    return ReadWorld(sim, [](const WorldSnapshot& snap) { return snap.owners.size(); });
+}
 
 constexpr float kHalfPi = 1.5707963f;
 
@@ -289,12 +302,24 @@ TickRateResult RunOneRate(const std::string& rate_text, int measure_seconds, std
             });
 
             std::this_thread::sleep_for(std::chrono::milliseconds(500)); // warmup
-            const auto& zone = sim.Zones().GetZone(0);
+            // Single-zone world (no partition control): the command counters of
+            // its one zone, read through a supervisor snapshot.
+            struct CommandTotals {
+                std::uint64_t pushed = 0;
+                std::uint64_t drained = 0;
+                std::size_t max_drained = 0;
+            };
+            const auto command_totals = [&sim] {
+                return ReadWorld(sim, [](const WorldSnapshot& snap) {
+                    const auto& commands = snap.zones.GetZone(0).Commands();
+                    return CommandTotals{commands.PushedTotal(), commands.DrainedTotal(),
+                                         commands.MaxDrainedPerTake()};
+                });
+            };
             const auto t0 = Clock::now();
             const WireSnapshot w0 = TakeWire(wire);
             const std::uint64_t in0 = inputs_posted.load();
-            const std::uint64_t pushed0 = zone.Commands().PushedTotal();
-            const std::uint64_t drained0 = zone.Commands().DrainedTotal();
+            const CommandTotals c0 = command_totals();
             const auto sched0 = sim.SchedulerStats();
 
             std::this_thread::sleep_for(std::chrono::seconds(measure_seconds));
@@ -302,8 +327,7 @@ TickRateResult RunOneRate(const std::string& rate_text, int measure_seconds, std
             const auto t1 = Clock::now();
             const WireSnapshot w1 = TakeWire(wire);
             const std::uint64_t in1 = inputs_posted.load();
-            const std::uint64_t pushed1 = zone.Commands().PushedTotal();
-            const std::uint64_t drained1 = zone.Commands().DrainedTotal();
+            const CommandTotals c1 = command_totals();
             const auto sched1 = sim.SchedulerStats();
             inputs_run = false;
             poster.join();
@@ -325,10 +349,10 @@ TickRateResult RunOneRate(const std::string& rate_text, int measure_seconds, std
             result.move_over_wall = moved / (gs::game::kPlayerRunSpeed * wall);
             result.frames_per_s =
                 static_cast<double>(w1.transform_frames - w0.transform_frames) / wall;
-            result.commands_per_s = static_cast<double>(pushed1 - pushed0) / wall;
+            result.commands_per_s = static_cast<double>(c1.pushed - c0.pushed) / wall;
             result.drained_per_tick =
-                ticks > 0.0 ? static_cast<double>(drained1 - drained0) / ticks : 0.0;
-            result.max_drained = zone.Commands().MaxDrainedPerTake();
+                ticks > 0.0 ? static_cast<double>(c1.drained - c0.drained) / ticks : 0.0;
+            result.max_drained = c1.max_drained;
             result.scheduler_enqueued_per_s =
                 static_cast<double>(sched1.enqueued - sched0.enqueued) / wall;
             {
@@ -386,7 +410,7 @@ bool ForcedSplitUnderInputTrial(std::uint64_t index)
                   gs::game::DebugSpawnOverride{500.0f, 500.0f});
     sim.Start();
     bool committed = false;
-    if (WaitFor(std::chrono::seconds(10), [&] { return sim.Owners().size() == 1; })) {
+    if (WaitFor(std::chrono::seconds(10), [&] { return OwnerCount(sim) == 1; })) {
         std::atomic<bool> run{true};
         std::thread poster([&] {
             std::uint32_t seq = 0;
@@ -467,7 +491,7 @@ int RunInputPathScenario()
         }
         sim.Start();
         if (!WaitFor(std::chrono::seconds(20),
-                     [&] { return sim.Owners().size() == static_cast<std::size_t>(kPlayers); })) {
+                     [&] { return OwnerCount(sim) == static_cast<std::size_t>(kPlayers); })) {
             std::printf("INPUTPATH migration-input-loss: FAIL (players never spawned)\n");
             ++failures;
         } else {
@@ -946,10 +970,10 @@ int RunNetStressScenario(const NetStressConfig& config)
             std::this_thread::sleep_for(200ms);
             check("disconnect-during-entering-world",
                   server_closed == kRuns && drained && cleanups == kRuns &&
-                      sim.Owners().empty(),
+                      OwnerCount(sim) == 0,
                   Fmt("closed=%d/%d contexts_left=%zu cleanups=%llu world_presence=%zu",
                       server_closed, kRuns, handler.ContextCount(),
-                      static_cast<unsigned long long>(cleanups), sim.Owners().size()));
+                      static_cast<unsigned long long>(cleanups), OwnerCount(sim)));
         }
         Progress("input-gate");
         // ---- H3 input state gate (observability now; enforced in H3) ------
@@ -1959,7 +1983,8 @@ ParallelWindow MeasureParallelism(gs::game::WorldRuntime& sim, std::chrono::seco
         const std::uint64_t before = i < s0.worker_tasks.size() ? s0.worker_tasks[i] : 0;
         out.active_workers += s1.worker_tasks[i] > before ? 1 : 0;
     }
-    out.zones = sim.Zones().GetActiveLeaves().size();
+    out.zones = ReadWorld(
+        sim, [](const WorldSnapshot& snap) { return snap.zones.GetActiveLeaves().size(); });
     return out;
 }
 
@@ -1975,11 +2000,12 @@ int RunWorkerPoolScenario()
     std::size_t production_workers = 0;
     {
         IoRunner runner;
-        gs::game::WorldRuntime sim(runner.io);
+        gs::game::WorldRuntime sim(runner.io, {}, LoadBenchTestWorld());
         sim.Start();
         production_workers = WaitWorkers(sim);
         std::printf("WORKERPOOL production-map zones=%zu workers=%zu (pool sized once at Start)\n",
-                    sim.Zones().ZoneCount(), production_workers);
+                    ReadWorld(sim, [](const WorldSnapshot& snap) { return snap.zones.ZoneCount(); }),
+                    production_workers);
         sim.Stop();
     }
 
@@ -2319,13 +2345,15 @@ int RunReplicationV2Scenario()
                       gs::game::DebugSpawnOverride{1000.0f, 1060.0f});
         WaitFor(5000ms, [&] { return sim.PresenceStats().claims >= 3; });
         const auto starvation = [&] {
-            std::uint64_t total = 0;
-            const auto& zones = sim.Zones();
-            for (std::size_t i = 0; i < zones.ZoneCount(); ++i) {
-                total += zones.GetZone(i).Diagnostics().repl_v2_starvation_since_diag.load(
-                    std::memory_order_relaxed);
-            }
-            return total;
+            return ReadWorld(sim, [](const WorldSnapshot& snap) {
+                std::uint64_t total = 0;
+                for (std::size_t i = 0; i < snap.zones.ZoneCount(); ++i) {
+                    total += snap.zones.GetZone(i)
+                                 .Diagnostics()
+                                 .repl_v2_starvation_since_diag.load(std::memory_order_relaxed);
+                }
+                return total;
+            });
         };
         std::this_thread::sleep_for(3500ms); // idle: 70 ticks > max_defer_ticks
         const auto s0 = starvation();
@@ -3047,13 +3075,13 @@ int RunProtocolHardeningScenario()
             WaitFor(5000ms, [&] { return handler.ContextCount() <= contexts0; });
         const bool fuzz_probe = probe();
         report("mutation-fuzz-server-survives",
-               gio.Escaped() == 0 && fuzz_drained && fuzz_probe && sim.Owners().empty() &&
+               gio.Escaped() == 0 && fuzz_drained && fuzz_probe && OwnerCount(sim) == 0 &&
                    sent.load() == kThreads * kIterations,
                Fmt("packets=%d closed_by_server=%d elapsed_s=%.1f io_escapes=%d first=\"%s\" "
                    "contexts_drained=%d server_alive=%d world_presence=%zu",
                    sent.load(), server_closed.load(), fuzz_s, gio.Escaped(),
                    gio.FirstEscape().c_str(), fuzz_drained ? 1 : 0, fuzz_probe ? 1 : 0,
-                   sim.Owners().size()));
+                   OwnerCount(sim)));
         RunOnIo(gio.io, [&] { game_server.Stop(); });
         sim.Stop();
     }
@@ -3206,13 +3234,15 @@ int RunZoneReclamationScenario(int cycles)
 
     // The leaf covering zone A's area (the west half) at this moment.
     const auto west_leaf = [&]() -> gs::game::ZoneId {
-        for (const auto* leaf : sim.Zones().GetActiveLeaves()) {
-            if (leaf->bounds.min_x < 1000.0f && leaf->bounds.max_x > 1000.0f &&
-                leaf->bounds.min_y < 2000.0f && leaf->bounds.max_y > 2000.0f) {
-                return leaf->zone_id;
+        return ReadWorld(sim, [](const WorldSnapshot& snap) -> gs::game::ZoneId {
+            for (const auto* leaf : snap.zones.GetActiveLeaves()) {
+                if (leaf->bounds.min_x < 1000.0f && leaf->bounds.max_x > 1000.0f &&
+                    leaf->bounds.min_y < 2000.0f && leaf->bounds.max_y > 2000.0f) {
+                    return leaf->zone_id;
+                }
             }
-        }
-        return 0;
+            return 0;
+        });
     };
     const auto ghost_audit = [&] {
         sim.RequestGhostValidation();
@@ -3238,16 +3268,33 @@ int RunZoneReclamationScenario(int cycles)
         s.cycle_ms = cycle_ms;
         s.audit = AuditNow(sim); // includes the H9 reclamation invariants
         s.ghost = ghost_audit();
-        const auto& zones = sim.Zones();
-        s.slots = zones.ZoneCount();
-        for (std::size_t i = 0; i < s.slots; ++i) {
-            if (zones.GetZone(i).Partition() == gs::game::PartitionState::Retired) {
-                ++s.retired;
+        // Slot count, retired slots, active leaves, reclaim counters and the
+        // working set: one snapshot, one mutation point (MAP-0).
+        struct TableView {
+            std::size_t slots = 0;
+            std::size_t retired = 0;
+            std::size_t active = 0;
+            std::size_t ws_bytes = 0;
+            gs::game::ZoneManager::ReclaimStats reclaim;
+        };
+        const TableView view = ReadWorld(sim, [](const WorldSnapshot& snap) {
+            TableView v;
+            v.slots = snap.zones.ZoneCount();
+            for (std::size_t i = 0; i < v.slots; ++i) {
+                if (snap.zones.GetZone(i).Partition() == gs::game::PartitionState::Retired) {
+                    ++v.retired;
+                }
             }
-        }
-        s.active = zones.GetActiveLeaves().size();
-        s.ws_mb = static_cast<double>(ProcessWorkingSetBytes()) / (1024.0 * 1024.0);
-        s.reclaim = sim.ZoneReclaimStats();
+            v.active = snap.zones.GetActiveLeaves().size();
+            v.ws_bytes = ProcessWorkingSetBytes();
+            v.reclaim = snap.reclaim;
+            return v;
+        });
+        s.slots = view.slots;
+        s.retired = view.retired;
+        s.active = view.active;
+        s.ws_mb = static_cast<double>(view.ws_bytes) / (1024.0 * 1024.0);
+        s.reclaim = view.reclaim;
         std::printf("RECLAIM cycle=%d zone_slots=%zu retired=%zu active_leaves=%zu "
                     "working_set_mb=%.1f avg_cycle_ms=%.1f reclaimed=%llu reused=%llu trimmed=%llu "
                     "pending=%zu reusable=%zu audit=%s ghost_audit=%s\n",
@@ -3350,6 +3397,386 @@ int RunZoneReclamationScenario(int cycles)
                last.cycle > first.cycle ? growth_mb * 1024.0 / (last.cycle - first.cycle) : 0.0,
                first.cycle_ms, last.cycle_ms));
     std::printf("RECLAIM-DONE failures=%d\n", failures);
+    return failures;
+}
+
+// ============================================================================
+// MAP-0: bench snapshot consistency under concurrent topology mutation
+// ============================================================================
+namespace {
+
+// What one snapshot collector checks and copies out. Every invariant below is
+// exact at a quiescent supervisor point; a raw concurrent read could not
+// promise any of them (and could touch a slot being reclaimed/reused).
+struct SnapshotProbe {
+    std::uint64_t epoch = 0;
+    std::uint32_t world_tick = 0;
+    std::size_t slots = 0;
+    std::size_t leaves = 0;
+    std::size_t retired = 0;
+    std::size_t owners = 0;
+    std::size_t entities = 0;       // authoritative residents, all slots
+    std::size_t bound_players = 0;  // player bindings, all slots
+    std::uint64_t leaf_hash = 0;    // topology fingerprint (sorted leaf ids)
+    std::uint64_t reclaimed_total = 0;
+    std::uint64_t reused_total = 0;
+    std::string violation;          // first violated invariant, empty = OK
+};
+
+SnapshotProbe ProbeWorld(const WorldSnapshot& snap, double world_area)
+{
+    SnapshotProbe p;
+    p.epoch = snap.epoch;
+    p.world_tick = snap.world_tick;
+    p.slots = snap.zones.ZoneCount();
+    p.owners = snap.owners.size();
+    p.reclaimed_total = snap.reclaim.reclaimed_total;
+    p.reused_total = snap.reclaim.reused_total;
+    auto fail = [&p](std::string what) {
+        if (p.violation.empty()) {
+            p.violation = std::move(what);
+        }
+    };
+    std::unordered_map<std::uint32_t, gs::game::ZoneId> authority;
+    for (std::size_t i = 0; i < p.slots; ++i) {
+        const auto& zone = snap.zones.GetZone(i);
+        if (zone.TickInProgress().load(std::memory_order_acquire)) {
+            fail(Fmt("tick in flight zone=%u slot=%zu", zone.Id(), i));
+        }
+        if (zone.Partition() == gs::game::PartitionState::Staging) {
+            fail(Fmt("staged destination visible zone=%u", zone.Id()));
+        }
+        if (zone.Partition() == gs::game::PartitionState::Retired) {
+            ++p.retired;
+            if (!zone.Entities().empty() || !zone.Players().empty()) {
+                fail(Fmt("retired zone=%u holds %zu entities / %zu players", zone.Id(),
+                         zone.Entities().size(), zone.Players().size()));
+            }
+        }
+        p.entities += zone.Entities().size();
+        p.bound_players += zone.Players().size();
+        for (const auto& [net_id, entity] : zone.Entities()) {
+            (void)entity;
+            const auto [it, inserted] = authority.emplace(net_id, zone.Id());
+            if (!inserted) {
+                fail(Fmt("net=%u authoritative in zones %u and %u", net_id, it->second, zone.Id()));
+            }
+        }
+    }
+    // Active leaves: live, simulating Leaf zones tiling the world exactly.
+    std::vector<gs::game::ZoneId> leaf_ids;
+    double area = 0.0;
+    for (const auto* leaf : snap.zones.GetActiveLeaves()) {
+        leaf_ids.push_back(leaf->zone_id);
+        area += static_cast<double>(leaf->bounds.max_x - leaf->bounds.min_x) *
+                static_cast<double>(leaf->bounds.max_y - leaf->bounds.min_y);
+        const std::size_t index = snap.zones.FindIndexById(leaf->zone_id);
+        if (index >= p.slots) {
+            fail(Fmt("leaf zone=%u has no slot", leaf->zone_id));
+            continue;
+        }
+        const auto& zone = snap.zones.GetZone(index);
+        if (zone.Partition() != gs::game::PartitionState::Leaf || !zone.SimulationEnabled()) {
+            fail(Fmt("leaf zone=%u partition=%u sim=%d", leaf->zone_id,
+                     static_cast<unsigned>(zone.Partition()), zone.SimulationEnabled() ? 1 : 0));
+        }
+    }
+    p.leaves = leaf_ids.size();
+    if (std::abs(area - world_area) > world_area * 1e-6) {
+        fail(Fmt("leaves cover %.0f m2 of %.0f m2", area, world_area));
+    }
+    std::sort(leaf_ids.begin(), leaf_ids.end());
+    if (std::adjacent_find(leaf_ids.begin(), leaf_ids.end()) != leaf_ids.end()) {
+        fail("duplicate active leaf id");
+    }
+    std::uint64_t h = 1469598103934665603ull;
+    for (const auto id : leaf_ids) {
+        h = (h ^ id) * 1099511628211ull;
+    }
+    p.leaf_hash = h;
+    // Owner fast-path caches resolve to the live authoritative entity.
+    for (const auto& [session, owner] : snap.owners) {
+        if (owner.zone_index >= p.slots) {
+            fail(Fmt("owner session=%llu slot %zu out of range", (unsigned long long)session,
+                     owner.zone_index));
+            continue;
+        }
+        const auto& zone = snap.zones.GetZone(owner.zone_index);
+        if (zone.Id() != owner.location.zone || !zone.FindEntity(owner.net_id).is_valid()) {
+            fail(Fmt("owner session=%llu slot=%zu zone=%u location=%u net=%u unresolved",
+                     (unsigned long long)session, owner.zone_index, zone.Id(),
+                     owner.location.zone, owner.net_id));
+        }
+    }
+    if (p.bound_players != p.owners) {
+        fail(Fmt("player bindings %zu != owners %zu", p.bound_players, p.owners));
+    }
+    return p;
+}
+
+} // namespace
+
+int RunSnapshotConsistencyScenario(int cycles)
+{
+    int failures = 0;
+    auto report = [&](const char* name, bool pass, const std::string& detail) {
+        std::printf("SNAPSHOT %s %s: %s\n", name, detail.c_str(), pass ? "PASS" : "FAIL");
+        std::fflush(stdout);
+        failures += pass ? 0 : 1;
+    };
+    cycles = std::max(cycles, 10);
+    constexpr float kExtent = 4000.0f;
+    constexpr int kReaders = 3;
+    constexpr int kPlayers = 4;
+    constexpr int kMobs = 400;
+    const double world_area = static_cast<double>(kExtent) * kExtent;
+
+    IoRunner runner;
+    gs::game::WorldRuntime sim(runner.io, {},
+                               gs::game::WorldRuntime::SyntheticWorldConfig{kExtent, 2, 1, {}});
+    gs::game::PartitionConfig partition;
+    partition.scoring.adaptive_enabled = false; // topology changes are forced only
+    sim.ConfigurePartition(partition);
+
+    // Before Start nothing mutates the world: the capture runs inline.
+    const SnapshotProbe before_start =
+        ReadWorld(sim, [&](const WorldSnapshot& snap) { return ProbeWorld(snap, world_area); });
+    report("inline-before-start", before_start.violation.empty() && before_start.leaves == 2,
+           Fmt("epoch=%llu slots=%zu leaves=%zu violation=\"%s\"",
+               (unsigned long long)before_start.epoch, before_start.slots, before_start.leaves,
+               before_start.violation.c_str()));
+
+    gs::game::MobSpawnPoint point;
+    point.mob_type_id = 2;
+    point.x = 2000.0f; // straddles the A|B border: migrations + ghosts both ways
+    point.y = 2000.0f;
+    point.count = kMobs;
+    point.radius = 1200.0f;
+    sim.AddMobSpawnPoint(point);
+    sim.SpawnConfiguredMobsNow();
+    // Two players sit 6 m from the A|B border and run 12 m back and forth over
+    // it in opposite directions (> the 5 m migration hysteresis each way).
+    const float player_x[kPlayers] = {900.0f, 1994.0f, 2006.0f, 3100.0f};
+    for (int i = 0; i < kPlayers; ++i) {
+        sim.PostSpawn(MakeDetachedSession(runner.io, 80000 + i), MakeCharacter(400 + i),
+                      gs::game::DebugSpawnOverride{player_x[i], 2000.0f});
+    }
+    sim.Start();
+    WaitFor(10000ms, [&] { return OwnerCount(sim) == kPlayers; });
+    std::this_thread::sleep_for(500ms);
+    const SnapshotProbe baseline =
+        ReadWorld(sim, [&](const WorldSnapshot& snap) { return ProbeWorld(snap, world_area); });
+    report("baseline", baseline.violation.empty() && baseline.owners == kPlayers &&
+                           baseline.entities == static_cast<std::size_t>(kPlayers + kMobs),
+           Fmt("epoch=%llu tick=%u slots=%zu leaves=%zu owners=%zu entities=%zu violation=\"%s\"",
+               (unsigned long long)baseline.epoch, baseline.world_tick, baseline.slots,
+               baseline.leaves, baseline.owners, baseline.entities, baseline.violation.c_str()));
+
+    // Readers: back-to-back snapshots for the whole churn, each checked
+    // against the invariants and against the reader's previous snapshot.
+    struct ReaderStats {
+        std::uint64_t snapshots = 0;
+        std::uint64_t topology_changes = 0; // leaf set differs from previous
+        std::uint64_t max_wait_us = 0;
+        std::size_t max_slots = 0;
+        std::string first_violation;
+    };
+    std::atomic<bool> churning{true};
+    std::vector<ReaderStats> reader_stats(kReaders);
+    std::vector<std::thread> readers;
+    for (int r = 0; r < kReaders; ++r) {
+        readers.emplace_back([&, r] {
+            ReaderStats& st = reader_stats[static_cast<std::size_t>(r)];
+            SnapshotProbe prev = baseline;
+            while (churning.load(std::memory_order_acquire)) {
+                const auto t0 = Clock::now();
+                const SnapshotProbe p = ReadWorld(
+                    sim, [&](const WorldSnapshot& snap) { return ProbeWorld(snap, world_area); });
+                const auto waited = static_cast<std::uint64_t>(
+                    std::chrono::duration_cast<std::chrono::microseconds>(Clock::now() - t0)
+                        .count());
+                st.max_wait_us = std::max(st.max_wait_us, waited);
+                st.max_slots = std::max(st.max_slots, p.slots);
+                ++st.snapshots;
+                std::string v = p.violation;
+                if (v.empty() && p.epoch <= prev.epoch) {
+                    v = Fmt("epoch %llu after %llu", (unsigned long long)p.epoch,
+                            (unsigned long long)prev.epoch);
+                }
+                if (v.empty() && p.world_tick < prev.world_tick) {
+                    v = Fmt("world tick %u after %u", p.world_tick, prev.world_tick);
+                }
+                if (v.empty() && (p.owners != baseline.owners || p.entities != baseline.entities)) {
+                    v = Fmt("population owners=%zu entities=%zu (baseline %zu/%zu)", p.owners,
+                            p.entities, baseline.owners, baseline.entities);
+                }
+                if (v.empty() && (p.reclaimed_total < prev.reclaimed_total ||
+                                  p.reused_total < prev.reused_total)) {
+                    v = "reclaim counters went backwards";
+                }
+                if (!v.empty() && st.first_violation.empty()) {
+                    st.first_violation = Fmt("epoch=%llu: %s", (unsigned long long)p.epoch,
+                                             v.c_str());
+                }
+                st.topology_changes += p.leaf_hash != prev.leaf_hash ? 1u : 0u;
+                prev = p;
+            }
+        });
+    }
+    // Movers: players walk back and forth across the A|B border.
+    std::thread mover([&] {
+        std::uint32_t seq = 0;
+        int step = 0;
+        while (churning.load(std::memory_order_acquire)) {
+            const float heading = (step / 40) % 2 == 0 ? 1.5707963f : -1.5707963f;
+            for (int i = 0; i < kPlayers; ++i) {
+                sim.PostMoveInput(static_cast<gs::common::SessionId>(80000 + i), ++seq,
+                                  i % 2 == 0 ? -heading : heading,
+                                  gs::game::MoveState::Running);
+            }
+            ++step;
+            std::this_thread::sleep_for(50ms);
+        }
+    });
+
+    // Churn: forced split -> merge of the west leaf, every 3rd cycle also the
+    // east leaf (reclaim + slot reuse on both sides of the border).
+    const auto leaf_covering = [&](float x, float y) -> gs::game::ZoneId {
+        return ReadWorld(sim, [x, y](const WorldSnapshot& snap) -> gs::game::ZoneId {
+            for (const auto* leaf : snap.zones.GetActiveLeaves()) {
+                if (leaf->bounds.min_x <= x && x < leaf->bounds.max_x && leaf->bounds.min_y <= y &&
+                    y < leaf->bounds.max_y) {
+                    return leaf->zone_id;
+                }
+            }
+            return 0;
+        });
+    };
+    const auto p_start = sim.PartitionMetricsSnapshot();
+    const auto t_churn = Clock::now();
+    int completed = 0;
+    bool stuck = false;
+    for (int cycle = 1; cycle <= cycles && !stuck; ++cycle) {
+        std::vector<gs::game::ZoneId> roots = {leaf_covering(1000.0f, 2000.0f)};
+        if (cycle % 3 == 0) {
+            roots.push_back(leaf_covering(3000.0f, 2000.0f));
+        }
+        for (const auto root : roots) {
+            if (root == 0) {
+                stuck = true;
+                break;
+            }
+            const auto p0 = sim.PartitionMetricsSnapshot();
+            sim.PostForceSplit(root);
+            const bool split = WaitFor(5000ms, [&] {
+                return sim.PartitionMetricsSnapshot().split_commits > p0.split_commits;
+            });
+            if (split) {
+                sim.PostForceMerge(root);
+            }
+            if (!split || !WaitFor(5000ms, [&] {
+                    return sim.PartitionMetricsSnapshot().merge_commits > p0.merge_commits;
+                })) {
+                std::printf("SNAPSHOT stuck: cycle=%d root=%u split=%d\n", cycle,
+                            static_cast<unsigned>(root), split ? 1 : 0);
+                stuck = true;
+                break;
+            }
+        }
+        if (!stuck) {
+            completed = cycle;
+        }
+    }
+    const double churn_s = std::chrono::duration<double>(Clock::now() - t_churn).count();
+    churning.store(false, std::memory_order_release);
+    mover.join();
+    for (auto& reader : readers) {
+        reader.join();
+    }
+    const auto p_end = sim.PartitionMetricsSnapshot();
+    const auto mig = sim.MigrationMetrics();
+
+    ReaderStats total;
+    for (const auto& st : reader_stats) {
+        total.snapshots += st.snapshots;
+        total.topology_changes += st.topology_changes;
+        total.max_wait_us = std::max(total.max_wait_us, st.max_wait_us);
+        total.max_slots = std::max(total.max_slots, st.max_slots);
+        if (total.first_violation.empty()) {
+            total.first_violation = st.first_violation;
+        }
+    }
+    const auto stats = sim.GetSnapshotStats();
+    const SnapshotProbe after =
+        ReadWorld(sim, [&](const WorldSnapshot& snap) { return ProbeWorld(snap, world_area); });
+    report("churn-completed", !stuck && completed == cycles,
+           Fmt("cycles=%d/%d splits=%llu merges=%llu migrations=%llu mig_stale=%llu "
+               "mig_retry=%llu churn_s=%.1f",
+               completed,
+               cycles, (unsigned long long)(p_end.split_commits - p_start.split_commits),
+               (unsigned long long)(p_end.merge_commits - p_start.merge_commits),
+               (unsigned long long)mig.committed, (unsigned long long)mig.dropped_stale,
+               (unsigned long long)mig.retries, churn_s));
+    // Coverage: the snapshots must actually have interleaved with the churn
+    // (topology observed changing between consecutive captures, slots
+    // reclaimed and reused while readers were running).
+    report("snapshots-interleaved-with-mutation",
+           total.snapshots >= 100 && total.topology_changes >= static_cast<std::uint64_t>(cycles) &&
+               after.reused_total > baseline.reused_total,
+           Fmt("snapshots=%llu topology_changes_seen=%llu reclaimed=%llu->%llu reused=%llu->%llu "
+               "max_slots=%zu",
+               (unsigned long long)total.snapshots, (unsigned long long)total.topology_changes,
+               (unsigned long long)baseline.reclaimed_total,
+               (unsigned long long)after.reclaimed_total,
+               (unsigned long long)baseline.reused_total, (unsigned long long)after.reused_total,
+               total.max_slots));
+    report("snapshot-invariants", total.first_violation.empty() && after.violation.empty(),
+           Fmt("readers=%d first_violation=\"%s\" final=\"%s\"", kReaders,
+               total.first_violation.c_str(), after.violation.c_str()));
+    report("snapshot-latency", total.max_wait_us < 1000000,
+           Fmt("reader_max_wait_ms=%.1f runtime: captures=%llu requests=%llu "
+               "max_request_to_capture_ms=%.1f supervisor_avg_ms=%.3f",
+               total.max_wait_us / 1000.0, (unsigned long long)stats.captures,
+               (unsigned long long)stats.requests, stats.max_wait_us / 1000.0,
+               sim.SupervisorAvgMs()));
+
+    // A collector runs on the supervisor: it can neither wait for a snapshot
+    // there (it would wait for itself) nor request a nested one.
+    const auto guards = ReadWorld(sim, [&sim](const WorldSnapshot&) {
+        std::pair<bool, bool> refused{false, false};
+        std::promise<int> ready;
+        ready.set_value(1);
+        auto future = ready.get_future();
+        int out = 0;
+        try {
+            sim.WaitSnapshot(future, std::chrono::milliseconds(0), out);
+        } catch (const std::logic_error&) {
+            refused.first = true;
+        }
+        try {
+            auto nested = sim.CaptureSnapshot<int>([](const WorldSnapshot&) { return 0; });
+            (void)nested;
+        } catch (const std::logic_error&) {
+            refused.second = true;
+        }
+        return refused;
+    });
+    report("supervisor-self-wait-refused", guards.first && guards.second,
+           Fmt("wait_on_supervisor_refused=%d nested_request_refused=%d", guards.first ? 1 : 0,
+               guards.second ? 1 : 0));
+
+    // A request still queued when Stop() arrives is answered by the final
+    // quiescent drain (never left hanging); afterwards captures run inline.
+    auto pending = sim.CaptureSnapshot<std::size_t>(
+        [](const WorldSnapshot& snap) { return snap.zones.ZoneCount(); });
+    sim.Stop();
+    const bool answered = pending.wait_for(0ms) == std::future_status::ready;
+    const std::size_t after_stop_slots =
+        ReadWorld(sim, [](const WorldSnapshot& snap) { return snap.zones.ZoneCount(); });
+    report("shutdown-drain", answered && after_stop_slots == 0,
+           Fmt("queued_request_answered=%d slots_after_stop=%zu", answered ? 1 : 0,
+               after_stop_slots));
+    std::printf("SNAPSHOT-DONE failures=%d\n", failures);
     return failures;
 }
 
@@ -3501,12 +3928,85 @@ int RunHygieneScenario()
 // ============================================================================
 // Map data audit (M0)
 // ============================================================================
-// Documents the CURRENT map loader behavior as evidence for the Real World /
-// Map Data Layer requirements (docs/map-data-layer-requirements.md). Read
-// only: nothing here patches the old loader. Each finding prints
-// REPRODUCED (current behavior as documented) or CHANGED (the loader no
-// longer behaves that way -- update the requirements' evidence).
+// Documents map-layer behavior as evidence for the Real World / Map Data
+// Layer requirements (docs/map-data-layer-requirements.md). Two columns per
+// finding since MAP-1:
+//   legacy: the unchanged shared/map MapData.h loaders (client API) --
+//           REPRODUCED while the historic defect is still there;
+//   server: the path the gameserver actually uses now (strict package
+//           loader + runtime) -- CHANGED when the defect no longer reaches
+//           the server, OPEN(MAP-n) when it is scheduled for a later package.
 namespace {
+
+namespace mfs = std::filesystem;
+
+mfs::path AuditDir(const std::string& name)
+{
+    const mfs::path dir = mfs::temp_directory_path() / "ixw_mapaudit" / name;
+    std::error_code ec;
+    mfs::remove_all(dir, ec);
+    mfs::create_directories(dir, ec);
+    return dir;
+}
+
+void WriteBytesTo(const mfs::path& path, const std::vector<std::uint8_t>& bytes)
+{
+    std::error_code ec;
+    mfs::create_directories(path.parent_path(), ec);
+    std::ofstream file(path, std::ios::binary | std::ios::trunc);
+    file.write(reinterpret_cast<const char*>(bytes.data()), static_cast<std::streamsize>(bytes.size()));
+}
+
+// Small valid package: `cells` x `cells`, flat 1 m, one bootstrap zone.
+mx::map::PackageWriteSpec AuditSpec(std::uint32_t cells, float cell_m, std::uint32_t chunk)
+{
+    mx::map::PackageWriteSpec spec;
+    spec.world_id = "audit";
+    spec.world_name = "audit";
+    spec.size_cells = cells;
+    spec.cell_size_m = cell_m;
+    spec.chunk_size_cells = chunk;
+    spec.height_cm = [](std::uint32_t, std::uint32_t) -> std::int16_t { return 100; };
+    const float extent = static_cast<float>(cells) * cell_m;
+    spec.logic.zones.push_back({1, "all", {0.0f, 0.0f, extent, extent}});
+    spec.overwrite = true;
+    return spec;
+}
+
+struct ServerLoadResult {
+    std::optional<gs::game::LoadedWorld> world;
+    mx::map::PackageReport report;
+    bool Has(mx::map::PackageErrorCode code) const
+    {
+        for (const auto& issue : report.issues) {
+            if (issue.code == code && issue.severity == mx::map::IssueSeverity::Error) {
+                return true;
+            }
+        }
+        return false;
+    }
+    std::string ErrorCodes() const
+    {
+        std::string out;
+        std::set<std::string> seen;
+        for (const auto& issue : report.issues) {
+            if (issue.severity == mx::map::IssueSeverity::Error && seen.insert(ToString(issue.code)).second) {
+                out += (out.empty() ? "" : ",") + std::string(ToString(issue.code));
+            }
+        }
+        return out.empty() ? std::string("none") : out;
+    }
+};
+
+ServerLoadResult ServerLoad(const mfs::path& dir)
+{
+    ServerLoadResult out;
+    gs::game::WorldLoadRequest request;
+    request.package_root = dir;
+    request.mob_types_config = IXTREEME_DEFAULT_MOB_TYPES_CONFIG;
+    out.world = gs::game::LoadWorldPackage(request, out.report);
+    return out;
+}
 
 struct MemoryAssets {
     std::unordered_map<std::string, std::vector<std::uint8_t>> files;
@@ -3658,16 +4158,21 @@ std::vector<std::uint8_t> ChunkBytes(std::uint16_t cx, std::uint16_t cy, std::ui
 int RunMapAuditScenario()
 {
     int changed = 0;
-    auto finding = [&](const char* id, bool reproduced, const std::string& observed) {
-        std::printf("MAPAUDIT %s %s: %s\n", id, observed.c_str(),
-                    reproduced ? "REPRODUCED" : "CHANGED");
+    int open = 0;
+    // legacy_reproduced: the historic defect still shows in the legacy
+    // (client) loader API. server_status: CHANGED | PARTIAL | OPEN(MAP-n).
+    auto finding = [&](const char* id, bool legacy_reproduced, const std::string& legacy,
+                       const std::string& server_status, const std::string& server) {
+        std::printf("MAPAUDIT %s legacy: %s [%s] | server: %s [%s]\n", id, legacy.c_str(),
+                    legacy_reproduced ? "REPRODUCED" : "CHANGED", server.c_str(), server_status.c_str());
         std::fflush(stdout);
-        changed += reproduced ? 0 : 1;
+        changed += server_status == "CHANGED" ? 1 : 0;
+        open += server_status == "CHANGED" ? 0 : 1;
     };
     const float kNaN = std::numeric_limits<float>::quiet_NaN();
 
-    // R4: truncated worldlogic accepted -- the field readers clamp the offset
-    // to the end of the buffer, and the truncation check is `offset > size`.
+    // R4: truncated worldlogic -- the legacy field readers clamp the offset
+    // to the end of the buffer and check `offset > size`.
     {
         auto bytes = WorldLogicBytes({{7, mx::map::Rect{0, 0, 100, 100}}}, {}, {});
         bytes.resize(20 + 4); // header + zone id only
@@ -3675,12 +4180,18 @@ int RunMapAuditScenario()
         assets.files["./worldlogic.dat"] = bytes;
         const auto logic = mx::map::LoadWorldLogic(assets.Reader(), ".");
         const bool accepted = logic && logic->zones.size() == 1;
-        finding("R4-truncated-worldlogic-accepted", accepted,
+        const auto dir = AuditDir("r4_truncated");
+        (void)mx::map::WritePackage(dir, AuditSpec(64, 1.0f, 32));
+        WriteBytesTo(dir / "worldlogic.dat", bytes);
+        const auto server = ServerLoad(dir);
+        finding("R4-truncated-worldlogic", accepted,
                 accepted ? Fmt("file=24B claims 1 zone -> zone id=%u bounds=(%.0f,%.0f)-(%.0f,%.0f)",
                                logic->zones[0].id, logic->zones[0].bounds.min_x,
                                logic->zones[0].bounds.min_y, logic->zones[0].bounds.max_x,
                                logic->zones[0].bounds.max_y)
-                         : std::string("rejected"));
+                         : std::string("rejected"),
+                !server.world && server.Has(mx::map::PackageErrorCode::WorldLogicTruncated) ? "CHANGED" : "OPEN",
+                Fmt("load=%s errors=%s", server.world ? "ACCEPTED" : "refused", server.ErrorCodes().c_str()));
     }
     // R4: reserved id 0, duplicate ids, NaN / inverted bounds, overlap, a
     // spawn pointing at an unknown zone, a non-finite warp target.
@@ -3697,14 +4208,24 @@ int RunMapAuditScenario()
         const auto logic = mx::map::LoadWorldLogic(assets.Reader(), ".");
         const bool accepted = logic && logic->zones.size() == 4 && logic->spawns.size() == 1 &&
                               logic->warps.size() == 1;
-        finding("R4-invalid-worldlogic-accepted", accepted,
-                accepted ? std::string("zone id 0, duplicate id 5, NaN bounds, min>max, "
-                                       "overlapping zones, spawn->unknown zone 42, NaN warp "
-                                       "target: all accepted")
-                         : std::string("rejected"));
+        const auto dir = AuditDir("r4_invalid");
+        (void)mx::map::WritePackage(dir, AuditSpec(100, 10.0f, 50)); // 1000 m world
+        WriteBytesTo(dir / "worldlogic.dat", bytes);
+        const auto server = ServerLoad(dir);
+        using C = mx::map::PackageErrorCode;
+        const bool all_named = server.Has(C::WorldLogicIdInvalid) && server.Has(C::WorldLogicIdDuplicate) &&
+                               server.Has(C::WorldLogicRectInvalid) && server.Has(C::WorldLogicZoneOverlap) &&
+                               server.Has(C::WorldLogicReferenceInvalid) &&
+                               server.Has(C::WorldLogicWarpTargetInvalid);
+        finding("R4-invalid-worldlogic", accepted,
+                accepted ? std::string("zone id 0, duplicate id 5, NaN bounds, min>max, overlapping zones, "
+                                       "spawn->unknown zone 42, NaN warp target: all accepted")
+                         : std::string("rejected"),
+                !server.world && all_named ? "CHANGED" : "OPEN",
+                Fmt("load=%s errors=%s", server.world ? "ACCEPTED" : "refused", server.ErrorCodes().c_str()));
     }
-    // R1: chunks are enumerated with the ZONE grid dimensions. World 64
-    // cells, 32-cell chunks (2x2 chunk files), zone grid 1x1.
+    // R1: legacy enumerates chunks by the ZONE grid. World 64 cells, 32-cell
+    // chunks (2x2 chunk files), zoneGridDims 1x1.
     {
         MemoryAssets assets;
         assets.files["./map.manifest"] = ManifestBytes(64, 1.0f, 32, 1);
@@ -3722,13 +4243,30 @@ int RunMapAuditScenario()
         const float h_loaded = field ? field->SampleHeightMeters(10.0f, 10.0f) : -1.0f;
         const float h_missing = field ? field->SampleHeightMeters(50.0f, 50.0f) : -1.0f;
         const bool reproduced = field && chunk_reads == 1 && h_missing == 0.0f && h_loaded > 0.9f;
+        // Server: the same v2 geometry (writer's legacy layout, zoneGridDims
+        // patched to 1x1) through the strict loader.
+        auto spec = AuditSpec(64, 1.0f, 32);
+        spec.format_version = 2;
+        spec.splat_size = 1;
+        spec.patch_manifest = [](mx::map::schema::MapManifest::Builder& m) {
+            m.getZoneGridDims().setX(1);
+            m.getZoneGridDims().setY(1);
+        };
+        const auto dir = AuditDir("r1_grid");
+        (void)mx::map::WritePackage(dir, spec);
+        const auto server = ServerLoad(dir);
+        const float s_far = server.world ? server.world->terrain.SampleHeightMeters(50.0f, 50.0f) : -1.0f;
+        const bool fixed = server.world && server.report.chunks_checked == 4 && s_far > 0.9f;
         finding("R1-chunk-grid-conflated-with-zone-grid", reproduced,
-                Fmt("2x2 chunk files, zone_grid=1x1 -> chunk files read=%zu, height in chunk(0,0)=%.2fm "
+                Fmt("2x2 chunk files, zone_grid=1x1 -> chunk files read=%zu, height chunk(0,0)=%.2fm "
                     "chunk(1,1)=%.2fm (never loaded, reported valid=%d)",
-                    chunk_reads, h_loaded, h_missing, field ? 1 : 0));
+                    chunk_reads, h_loaded, h_missing, field ? 1 : 0),
+                fixed ? "CHANGED" : "OPEN",
+                Fmt("chunks read=%u (chunk grid from world/chunk size), height chunk(1,1)=%.2fm, "
+                    "zoneGridDims reported as ignored legacy field",
+                    server.report.chunks_checked, s_far));
     }
-    // R5: the server cannot load a map without the client's splat textures
-    // (and keeps the whole-world splat RGBA in memory when present).
+    // R5: render splats required by the loader and kept in server memory.
     {
         MemoryAssets assets;
         assets.files["./map.manifest"] = ManifestBytes(32, 1.0f, 32, 1);
@@ -3739,14 +4277,32 @@ int RunMapAuditScenario()
         with_assets.files["./chunks/chunk_0_0.mxchunk"] = ChunkBytes(0, 0, 32, 100, true);
         const auto with = mx::map::LoadHeightField(with_assets.Reader(), ".");
         const bool reproduced = !without && with && !with->splat_a_rgba8.empty();
+        const auto server_only_dir = AuditDir("r5_server_only");
+        (void)mx::map::WritePackage(server_only_dir, AuditSpec(64, 1.0f, 32)); // no splat sections
+        auto with_splats = AuditSpec(64, 1.0f, 32);
+        with_splats.splat_size = 16;
+        const auto client_dir = AuditDir("r5_with_splats");
+        (void)mx::map::WritePackage(client_dir, with_splats);
+        const auto s_only = ServerLoad(server_only_dir);
+        const auto s_with = ServerLoad(client_dir);
+        const bool fixed = s_only.world && s_with.world && s_only.world->terrain.splat_a_rgba8.empty() &&
+                           s_with.world->terrain.splat_a_rgba8.empty() &&
+                           s_with.world->terrain.splat_b_rgba8.empty();
         finding("R5-server-requires-render-splats", reproduced,
-                Fmt("heights+attributes only -> load=%s; with splats -> load=%s, server keeps "
-                    "splat_a+b=%zu B",
+                Fmt("heights+attributes only -> load=%s; with splats -> load=%s, keeps splat_a+b=%zu B",
                     without ? "ok" : "FAILS", with ? "ok" : "fails",
-                    with ? with->splat_a_rgba8.size() + with->splat_b_rgba8.size() : 0));
+                    with ? with->splat_a_rgba8.size() + with->splat_b_rgba8.size() : 0),
+                fixed ? "CHANGED" : "OPEN",
+                Fmt("server-only package -> load=%s; with splats -> load=%s, server keeps splat bytes=%zu, "
+                    "resident terrain=%llu B",
+                    s_only.world ? "ok" : "FAILS", s_with.world ? "ok" : "fails",
+                    s_with.world ? s_with.world->terrain.splat_a_rgba8.size() +
+                                       s_with.world->terrain.splat_b_rgba8.size()
+                                 : 0,
+                    static_cast<unsigned long long>(s_only.report.resident_terrain_bytes)));
     }
-    // R6: a warp whose target lies inside a warp source retriggers every
-    // tick (TryApplyWarp runs per tick on containment, no enter edge).
+    // R6: warp re-trigger. Runtime semantics (enter edge, cooldown) are MAP-4;
+    // MAP-1 adds the load-time rule: a trigger cycle is rejected.
     {
         mx::map::WorldLogic logic;
         logic.warps.push_back(mx::map::WarpRegion{1, mx::map::Rect{0, 0, 20, 20}, 10.0f, 10.0f});
@@ -3755,10 +4311,18 @@ int RunMapAuditScenario()
         const auto* self = logic.FindWarp(10.0f, 10.0f);
         const auto* back = logic.FindWarp(200.0f, 10.0f);
         const bool reproduced = self != nullptr && self->id == 1 && back != nullptr && back->id == 3;
+        auto spec = AuditSpec(100, 10.0f, 50);
+        spec.logic.warps = logic.warps;
+        const auto dir = AuditDir("r6_warp");
+        (void)mx::map::WritePackage(dir, spec);
+        const auto server = ServerLoad(dir);
+        const bool load_rule = !server.world && server.Has(mx::map::PackageErrorCode::WorldLogicWarpCycle);
         finding("R6-warp-retrigger", reproduced,
-                "warp 1 target inside its own source -> fires again next tick; warps 2<->3 "
-                "targets inside each other's source -> ping-pong every tick (no enter "
-                "edge, no cooldown)");
+                "warp 1 target inside its own source -> fires again next tick; warps 2<->3 ping-pong "
+                "(no enter edge, no cooldown)",
+                load_rule ? "PARTIAL" : "OPEN",
+                Fmt("load=%s errors=%s (load-time cycle rule); runtime enter-edge + cooldown: OPEN(MAP-4)",
+                    server.world ? "ACCEPTED" : "refused", server.ErrorCodes().c_str()));
     }
     // R3: fixed 100 km regions at origin (0,0), whatever map is loaded.
     {
@@ -3768,23 +4332,81 @@ int RunMapAuditScenario()
         const bool reproduced = regions.size() == 4 && regions[1].bounds.max_x == 100000.0f &&
                                 outside == nullptr && small_map != nullptr;
         finding("R3-hardcoded-world-bounds", reproduced,
-                Fmt("regions=%zu fixed 0..100000 m quadrants; a 1 km map lands entirely in region "
-                    "%u; a point at (-10,-10) has no region",
-                    regions.size(), small_map != nullptr ? small_map->id : 0u));
+                Fmt("regions=%zu fixed 0..100000 m quadrants; a 1 km map lands in region %u; (-10,-10) "
+                    "has no region",
+                    regions.size(), small_map != nullptr ? small_map->id : 0u),
+                "OPEN(MAP-2)",
+                "ZoneManager still bootstraps DefaultRegions(); v3 origin != (0,0) and non-square worlds are "
+                "refused as UNSUPPORTED_FEATURE until MAP-2 instead of being misread");
     }
-    // R7 + R8: build-time source path + silent flat fallback.
+    // R8: silent flat fallback. The TerrainService::LoadFromMapRoot fallback
+    // is gone; the server path refuses a missing package.
     {
-        const auto missing = gs::game::TerrainService::LoadFromMapRoot("./no-such-map-root");
-        const bool reproduced = !missing.HasTerrain() && missing.WorldExtentMeters() == 1000.0f;
-        finding("R8-silent-flat-fallback", reproduced,
-                Fmt("unloadable map root -> HasTerrain=%d extent=%.0fm (flat), a warning only",
-                    missing.HasTerrain() ? 1 : 0, missing.WorldExtentMeters()));
-        const std::string compiled = IXTREEME_DEFAULT_MAP_ROOT;
-        finding("R7-build-time-map-path", compiled.find("Client/assets/Maps") != std::string::npos,
-                "production map root = compile-time source-tree path \"" + compiled + "\"");
+        const auto server = ServerLoad(mfs::temp_directory_path() / "ixw_mapaudit" / "no-such-package");
+        finding("R8-silent-flat-fallback", false,
+                "TerrainService::LoadFromMapRoot (flat 1000 m on failure) removed from the code base",
+                !server.world && server.Has(mx::map::PackageErrorCode::PackageRootMissing) ? "CHANGED" : "OPEN",
+                Fmt("missing package -> load=%s errors=%s; gameserver exits non-zero before DB/listen "
+                    "(startup acceptance)",
+                    server.world ? "ACCEPTED" : "refused", server.ErrorCodes().c_str()));
     }
-    std::printf("MAPAUDIT-DONE changed=%d\n", changed);
-    return 0; // evidence probe: CHANGED findings are reported, not failed
+    // R7: compile-time source-tree map path.
+    {
+#ifdef IXTREEME_DEFAULT_MAP_ROOT
+        const bool defined = true;
+#else
+        const bool defined = false;
+#endif
+        finding("R7-build-time-map-path", defined,
+                defined ? "IXTREEME_DEFAULT_MAP_ROOT still compiled in"
+                        : "IXTREEME_DEFAULT_MAP_ROOT no longer defined (bench uses IXTREEME_TEST_MAP_ROOT)",
+                defined ? "OPEN" : "CHANGED",
+                "gameserver target: world_package from config (relative to the config file) or "
+                "--world-package; no compile-time world path (startup acceptance runs from another cwd)");
+    }
+    // Rows added with MAP-1 (no legacy reproduction beyond the M0 text).
+    {
+        auto spec = AuditSpec(64, 1.0f, 32);
+        spec.patch_manifest = [](mx::map::schema::MapManifest::Builder& m) {
+            m.initZoneGridDims().setX(2);
+            m.getZoneGridDims().setY(2);
+        };
+        const auto dir = AuditDir("r2_zone_fields");
+        (void)mx::map::WritePackage(dir, spec);
+        const auto server = ServerLoad(dir);
+        finding("R2-map-chunk-vs-server-zone", true, "v2 manifest carries zoneGridDims/zoneSizeCells",
+                server.Has(mx::map::PackageErrorCode::ManifestFieldForbidden) ? "PARTIAL" : "OPEN",
+                Fmt("v3 with zoneGridDims -> errors=%s; worldlogic zones still seed server partitions with "
+                    "their ids as ZoneIds (AreaId/ZoneId split: MAP-2)",
+                    server.ErrorCodes().c_str()));
+        finding("R9-half-open-boundaries", true, "Rect::Contains closed [min,max]", "OPEN(MAP-2)",
+                "bootstrap-zone overlap/coverage validated half-open; runtime map lookups still closed");
+        finding("R10-out-of-bounds-rule", true, "height clamps outside, walkability false", "OPEN(MAP-2)",
+                "unchanged (validator only guarantees targets/spawns inside [0, extent))");
+        mx::map::PackageReport sample;
+        (void)mx::map::LoadServerWorld(mfs::temp_directory_path() / "ixw_mapaudit" / "r4_truncated",
+                                       mx::map::ValidationDepth::Startup, sample);
+        const auto* first = sample.FirstError();
+        finding("R11-structured-errors-versioning", true, "std::optional (no reason) / capnp exception",
+                first != nullptr ? "CHANGED" : "OPEN",
+                first != nullptr ? "e.g. " + first->Format() : std::string("no structured error"));
+        finding("R12-chunk-streamed-terrain", true, "whole world resident (+splats)", "OPEN(MAP-3)",
+                "server terrain resident (heights+attributes only); streaming + budgets: MAP-3");
+        const auto spawn_dir = AuditDir("r13_spawns");
+        auto spawn_spec = AuditSpec(64, 1.0f, 32);
+        spawn_spec.mob_spawns = std::string("mob_type_id=1 x=nan y=5 count=1 radius=1\n");
+        (void)mx::map::WritePackage(spawn_dir, spawn_spec);
+        const auto spawns = ServerLoad(spawn_dir);
+        finding("R13-spawns-in-validated-package", true, "mob_spawns.conf lenient (warn + skip line)",
+                !spawns.world && spawns.Has(mx::map::PackageErrorCode::SpawnsFieldInvalid) ? "PARTIAL" : "OPEN",
+                Fmt("spawn table is a package layer, strictly parsed + bounds + mob type checked "
+                    "(bad line -> errors=%s); area references: MAP-4",
+                    spawns.ErrorCodes().c_str()));
+    }
+    std::error_code ec;
+    mfs::remove_all(mfs::temp_directory_path() / "ixw_mapaudit", ec);
+    std::printf("MAPAUDIT-DONE server_changed=%d server_open_or_partial=%d\n", changed, open);
+    return 0; // evidence probe: statuses are reported, not failed
 }
 
 } // namespace gs::bench

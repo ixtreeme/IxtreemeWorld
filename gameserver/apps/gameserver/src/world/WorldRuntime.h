@@ -5,10 +5,12 @@
 #include <condition_variable>
 #include <cstdint>
 #include <functional>
+#include <future>
 #include <memory>
 #include <mutex>
 #include <optional>
 #include <queue>
+#include <stdexcept>
 #include <string>
 #include <thread>
 #include <unordered_map>
@@ -32,6 +34,7 @@
 #include "input/InputRouter.h"
 #include "migration/MigrationCoordinator.h"
 #include "migration/MigrationQueue.h"
+#include "package/WorldPackageLoader.h"
 #include "partition/PartitionConfig.h"
 #include "partition/PartitionMetrics.h"
 #include "partition/PartitionScoring.h"
@@ -57,21 +60,26 @@ namespace gs::game {
 
 class WorldRuntime {
 public:
-    // Synthetic world bootstrap for integrated-scale benchmarks: flat terrain
-    // with an explicit extent and a deterministic zone grid. Production
-    // always loads the real map root; this seam exists so a 100km world with
-    // hundreds of thousands of entities can be measured with the production
-    // systems (no mocked simulation, no 100km^2 heightfield asset).
+    // Explicit synthetic world (world_mode = synthetic, benchmarks): flat
+    // terrain with an explicit extent and a deterministic zone grid, so a
+    // 100km world with hundreds of thousands of entities can be measured with
+    // the production systems (no mocked simulation, no 100km^2 heightfield
+    // asset). Never used as a fallback for a failed package load.
     struct SyntheticWorldConfig {
         float extent_m = 100000.0f;
         std::uint32_t zones_x = 8;
         std::uint32_t zones_y = 8;
-        std::string mob_types_config; // empty = build-time default
+        // Empty: no mob types, except in builds that define the bench-only
+        // IXTREEME_DEFAULT_MOB_TYPES_CONFIG (worldbench).
+        std::string mob_types_config;
     };
 
-    // identity defaults to the single-process deployment (node=1/process=1).
-    explicit WorldRuntime(boost::asio::io_context& io, RuntimeIdentity identity = {});
-    // Synthetic world (benchmark/dev). Same systems, different bootstrap.
+    // File-backed world from a validated package (MAP-1). The package is
+    // loaded and checked BEFORE the runtime exists (WorldPackageLoader), so
+    // construction cannot fail on world data. identity: node=1/process=1 is
+    // the single-process deployment.
+    WorldRuntime(boost::asio::io_context& io, RuntimeIdentity identity, LoadedWorld world);
+    // Synthetic world (explicit mode). Same systems, different bootstrap.
     WorldRuntime(boost::asio::io_context& io,
                  RuntimeIdentity identity,
                  const SyntheticWorldConfig& synthetic);
@@ -87,6 +95,75 @@ public:
 
     void Start();
     void Stop();
+
+    // --- Consistent world snapshots (MAP-0) ---------------------------------
+    // Readers outside the supervisor (benchmarks, admin tools) must never walk
+    // the zone table themselves: the supervisor splits, merges, retires,
+    // reclaims and reuses zone slots concurrently, and zone ticks update the
+    // per-zone gauges. A snapshot collector instead runs ON the supervisor
+    // thread in a quiescent window -- no zone tick in flight, between two
+    // topology operations -- so everything it reads (zone table, per-zone
+    // diagnostics and LOD gauges, reclamation state, and anything the caller
+    // samples alongside, e.g. process memory) comes from ONE mutation point.
+    // The collector copies what it needs; the requester receives that copy
+    // through the future. No production hot-path lock is involved.
+    // Consistency scope: zone table, topology, per-zone gauges and every
+    // supervisor-owned map belong to one mutation point. Commands already
+    // queued INTO a zone (e.g. a spawn whose owner record exists but whose
+    // entity the zone creates at its next tick) are not drained first -- that
+    // stronger point is the consistency audit's (RequestValidation).
+    struct SnapshotContext {
+        const ZoneManager& zones;
+        const OwnerMap& owners;       // session -> owning zone slot/id
+        std::uint64_t epoch = 0;      // strictly increasing, one per capture
+        std::uint32_t world_tick = 0; // world tick at the capture point
+        std::chrono::steady_clock::time_point captured_at{};
+        ZoneManager::ReclaimStats reclaim{};
+    };
+    // Requests a capture; never blocks. While the runtime is not running
+    // (before Start / after Stop) nothing else mutates the world, so the
+    // collector runs immediately on the calling thread.
+    template <class T>
+    std::future<T> CaptureSnapshot(std::function<T(const SnapshotContext&)> collect)
+    {
+        auto promise = std::make_shared<std::promise<T>>();
+        auto future = promise->get_future();
+        EnqueueSnapshot([promise, collect = std::move(collect)](const SnapshotContext& ctx) {
+            try {
+                promise->set_value(collect(ctx));
+            } catch (...) {
+                promise->set_exception(std::current_exception());
+            }
+        });
+        return future;
+    }
+    // Waits for a capture requested from another thread. Refuses (throws
+    // std::logic_error) on the supervisor thread itself: that thread is the
+    // one that would have to fulfil the request, so waiting there can only
+    // deadlock. Returns false on timeout.
+    template <class T>
+    bool WaitSnapshot(std::future<T>& future, std::chrono::milliseconds timeout, T& out) const
+    {
+        if (std::this_thread::get_id() == sim_thread_id_.load(std::memory_order_acquire)) {
+            throw std::logic_error("WaitSnapshot called on the supervisor thread");
+        }
+        if (future.wait_for(timeout) != std::future_status::ready) {
+            return false;
+        }
+        out = future.get();
+        return true;
+    }
+    struct SnapshotStats {
+        std::uint64_t captures = 0;   // capture points served
+        std::uint64_t requests = 0;   // collectors run
+        std::uint64_t max_wait_us = 0; // longest request -> capture latency
+    };
+    SnapshotStats GetSnapshotStats() const noexcept
+    {
+        return SnapshotStats{snapshot_captures_.load(std::memory_order_relaxed),
+                             snapshot_requests_.load(std::memory_order_relaxed),
+                             snapshot_max_wait_us_.load(std::memory_order_relaxed)};
+    }
 
     void PostSpawn(std::shared_ptr<gs::network::Session> session,
                    gs::db::Character character,
@@ -412,13 +489,17 @@ public:
                                        int succeed_first = 0);
 
 private:
+    // Member wiring only (no world): both public constructors delegate here.
+    struct ConstructMembersOnly {};
+    WorldRuntime(boost::asio::io_context& io, RuntimeIdentity identity, ConstructMembersOnly);
     // Shared world bootstrap: geometry, zones, directory and the derived
-    // fields (activity + load). Called by both constructors.
+    // fields (activity + load). File-backed worlds pass their validated spawn
+    // points (spawned at once); synthetic worlds pass none and register
+    // their own before an explicit bulk spawn.
     void InitializeWorld(TerrainService terrain,
                          mx::map::WorldLogic logic,
                          const std::string& mob_types_config,
-                         const std::string& map_root,
-                         bool load_map_spawn_points);
+                         std::optional<std::vector<MobSpawnPoint>> package_spawn_points);
     void Enqueue(std::function<void()> command);
     void Run();
     void TickZone(std::size_t zone_index);
@@ -428,6 +509,18 @@ private:
     // due split/merge transactions. Runs only when no zone tick is in
     // flight, so partition mutation never races worker threads.
     void ExecutePartitionControl();
+    struct PendingSnapshot {
+        std::function<void(const SnapshotContext&)> task;
+        std::chrono::steady_clock::time_point requested_at;
+    };
+    // MAP-0 snapshots: type-erased request queue + the supervisor-side
+    // capture (only in a quiescent window; the final one at shutdown).
+    void EnqueueSnapshot(std::function<void(const SnapshotContext&)> task);
+    void ServeSnapshots();
+    // Runs a batch of collectors against one capture point (supervisor, or
+    // the requester while the runtime is not running). Caller guarantees
+    // quiescence.
+    void RunSnapshotBatch(std::vector<PendingSnapshot>& batch, std::uint64_t epoch);
     // H9: proves retired zone slots unreferenced (quiescent window, once per
     // world tick) so the next split/merge reuses them; publishes the stats.
     void ReclaimRetiredZones();
@@ -502,7 +595,18 @@ private:
     boost::asio::io_context& io_;
     std::thread thread_;
     std::atomic<bool> stopping_{false};
-    std::thread::id sim_thread_id_{};
+    std::atomic<std::thread::id> sim_thread_id_{};
+    // MAP-0 snapshot requests (any thread enqueues; the supervisor serves
+    // them in a quiescent window, or at shutdown before the world is torn
+    // down, so no future is left hanging).
+    std::mutex snapshot_mutex_;
+    std::vector<PendingSnapshot> pending_snapshots_;
+    bool snapshot_serving_ = false; // guarded by snapshot_mutex_; true while Run() owns the world
+    std::atomic<bool> snapshots_pending_{false};
+    std::uint64_t snapshot_epoch_ = 0;
+    std::atomic<std::uint64_t> snapshot_captures_{0};
+    std::atomic<std::uint64_t> snapshot_requests_{0};
+    std::atomic<std::uint64_t> snapshot_max_wait_us_{0};
 
     std::mutex mutex_;
     std::condition_variable cv_;

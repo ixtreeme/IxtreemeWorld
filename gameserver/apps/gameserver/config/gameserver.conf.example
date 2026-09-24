@@ -6,6 +6,28 @@ listen_port=11020
 # Token game_server identifier. Must match loginserver.conf game_server.
 game_server=127.0.0.1:11020
 
+# World (MAP-1). Precedence: command line > this file > built-in default.
+# Relative paths in THIS file resolve against the directory holding this file
+# (never against the working directory); command-line paths resolve against
+# the working directory at launch. There is no default package: file mode
+# without world_package (or --world-package) refuses to start, and a missing
+# or invalid package ends the process before the database or the listener is
+# touched -- no fallback world.
+#   world_mode       file (default) | synthetic (explicit flat benchmark/dev world)
+#   world_package    world package directory       (CLI: --world-package <dir>)
+#   mob_types_config mob type registry              (CLI: --mob-types <file>)
+# Offline check of a package (every layer): gameserver --validate-world-package <dir>
+# Full startup then clean exit (deploy check): gameserver --startup-check
+world_mode=file
+# Set this (absolute, or relative to this file). Example for a copy of this
+# file placed in gameserver/apps/gameserver/config/:
+#world_package=../../../../Client/assets/Maps/test_zone
+mob_types_config=mob_types.conf
+# Synthetic mode only:
+#synthetic_extent_m=4000
+#synthetic_zones_x=2
+#synthetic_zones_y=2
+
 # Runtime
 io_threads=2
 # Zone worker threads (0 = hardware_concurrency - 1). Independent of the map's

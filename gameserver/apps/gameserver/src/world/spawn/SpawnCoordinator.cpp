@@ -1,7 +1,6 @@
 #include "SpawnCoordinator.h"
 
 #include <cmath>
-#include <filesystem>
 #include <random>
 
 #include "common/Logging.h"
@@ -17,10 +16,6 @@
 #include "../zone/ZoneOwnership.h"
 #include "../terrain/TerrainService.h"
 #include "../WorldConstants.h"
-
-#ifndef IXTREEME_DEFAULT_MOB_TYPES_CONFIG
-#define IXTREEME_DEFAULT_MOB_TYPES_CONFIG "mob_types.conf"
-#endif
 
 namespace gs::game {
 namespace {
@@ -63,13 +58,12 @@ void SpawnCoordinator::PostToOwner(std::size_t zone_index, std::function<void(Zo
     wake_();
 }
 
-void SpawnCoordinator::Initialize(const std::string& map_root, const std::string& mob_types_config)
+void SpawnCoordinator::Initialize(std::vector<MobSpawnPoint> spawn_points, const std::string& mob_types_config)
 {
     LoadMobTypes(mob_types_config);
     {
         std::lock_guard lock(spawn_points_mutex_);
-        spawn_points_ =
-            SpawnLoader::LoadFromFile((std::filesystem::path(map_root) / "mob_spawns.conf").string());
+        spawn_points_ = std::move(spawn_points);
     }
     (void)SpawnAllConfiguredMobs();
 }

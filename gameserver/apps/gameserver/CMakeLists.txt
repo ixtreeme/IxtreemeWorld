@@ -41,6 +41,7 @@ set(GAMESERVER_WORLD_SOURCES
     src/world/migration/MigrationSystem.cpp
     src/world/input/InputRouter.cpp
     src/world/terrain/TerrainService.cpp
+    src/world/package/WorldPackageLoader.cpp
     src/world/spawn/MobPrototypeRegistry.cpp
     src/world/spawn/RespawnSystem.cpp
     src/world/spawn/SpawnCoordinator.cpp
@@ -75,8 +76,6 @@ target_link_libraries(gameserver
 
 target_compile_definitions(gameserver
     PRIVATE
-        IXTREEME_DEFAULT_MAP_ROOT="${CMAKE_CURRENT_SOURCE_DIR}/../../../Client/assets/Maps/test_zone"
-        IXTREEME_DEFAULT_MOB_TYPES_CONFIG="${CMAKE_CURRENT_SOURCE_DIR}/config/mob_types.conf"
         $<$<CONFIG:Debug>:MMO_DEBUG_SPAWN_OVERRIDE=1>
         $<$<CONFIG:RelWithDebInfo>:MMO_DEBUG_SPAWN_OVERRIDE=1>
         $<$<CONFIG:Release>:MMO_DEBUG_SPAWN_OVERRIDE=0>
@@ -109,6 +108,7 @@ if(ENABLE_WORLDBENCH)
         src/bench/WorldBench.cpp
         src/bench/ReadinessBench.cpp
         src/bench/HardeningBench.cpp
+        src/bench/MapPackageBench.cpp
         src/GameConnectionHandler.cpp
         ${GAMESERVER_WORLD_SOURCES}
     )
@@ -125,7 +125,9 @@ if(ENABLE_WORLDBENCH)
 
     target_compile_definitions(worldbench
         PRIVATE
-            IXTREEME_DEFAULT_MAP_ROOT="${CMAKE_CURRENT_SOURCE_DIR}/../../../Client/assets/Maps/test_zone"
+            # Bench-only fixtures (never compiled into the gameserver target):
+            # the checked-in test map package and the source-tree mob types.
+            IXTREEME_TEST_MAP_ROOT="${CMAKE_CURRENT_SOURCE_DIR}/../../../Client/assets/Maps/test_zone"
             IXTREEME_DEFAULT_MOB_TYPES_CONFIG="${CMAKE_CURRENT_SOURCE_DIR}/config/mob_types.conf"
             MMO_DEBUG_SPAWN_OVERRIDE=1
     )

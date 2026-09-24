@@ -81,13 +81,27 @@ int RunProtocolHardeningScenario();
 // checkpoints, plus a consistency audit at each.
 int RunZoneReclamationScenario(int cycles);
 
+// MAP-0: bench snapshot consistency -- reader threads take supervisor
+// snapshots back to back while forced split/merge cycles, slot reclamation +
+// reuse and player/mob migrations run; every snapshot is checked against
+// exact world invariants and the reader's previous snapshot. Also covers the
+// supervisor self-wait refusal and the shutdown drain.
+int RunSnapshotConsistencyScenario(int cycles);
+
 // H10: low-level hygiene -- ZoneWorkerPool::Stop lost wakeup (Start/Stop
 // stress with a watchdog), TCP_NODELAY on accepted sessions, load field cell
 // size safe minimum.
 int RunHygieneScenario();
 
-// M0: map data audit -- reproduces the current loader findings that feed
-// docs/map-data-layer-requirements.md (read-only evidence probe).
+// M0/MAP-1: map data audit -- legacy loader vs the server's package path for
+// every finding of docs/map-data-layer-requirements.md (evidence probe).
 int RunMapAuditScenario();
+
+// MAP-1: world package corpus through the server loader -- positive packages
+// (v3 with/without client data, v2, the checked-in test map vs the legacy
+// loader) and one fixture per rejection rule with its stable error code,
+// plus the map-load baseline. `fixtures_out` (optional) also writes the
+// packages the gameserver startup acceptance script launches against.
+int RunWorldPackageScenario(const std::string& fixtures_out);
 
 } // namespace gs::bench

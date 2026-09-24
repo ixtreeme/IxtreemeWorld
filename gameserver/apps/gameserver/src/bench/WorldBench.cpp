@@ -32,6 +32,7 @@
 #include <iostream>
 #include <limits>
 #include <numeric>
+#include <optional>
 #include <random>
 #include <set>
 #include <string>
@@ -52,6 +53,8 @@
 #include "../world/partition/ZonePartition.h"
 #include "../world/WorldRuntime.h"
 #include "../world/spawn/SpawnLoader.h"
+#include "BenchSnapshot.h"
+#include "BenchWorld.h"
 #include "HardeningBench.h"
 #include "ReadinessBench.h"
 
@@ -121,6 +124,8 @@ struct BenchConfig {
     std::string net_cases = "all";
     // Hardening H9 zone reclamation (--mode reclamation).
     int reclaim_cycles = 100;
+    // MAP-1 world package corpus (--mode worldpackage).
+    std::string fixtures_out;
 };
 
 bool ParseArgs(int argc, char** argv, BenchConfig& config)
@@ -200,6 +205,11 @@ bool ParseArgs(int argc, char** argv, BenchConfig& config)
                 return false;
             }
             config.net_io_threads = std::stoi(value);
+        } else if (arg == "--fixtures-out") {
+            if (!need_value("fixtures-out", value)) {
+                return false;
+            }
+            config.fixtures_out = value;
         } else if (arg == "--cycles") {
             if (!need_value("cycles", value)) {
                 return false;
@@ -321,7 +331,8 @@ bool ParseArgs(int argc, char** argv, BenchConfig& config)
         config.mode != "asfdeterminism" && config.mode != "workerpool" &&
         config.mode != "replv2" && config.mode != "protocol" &&
         config.mode != "reclamation" && config.mode != "hygiene" &&
-        config.mode != "mapaudit") {
+        config.mode != "mapaudit" && config.mode != "snapshot" &&
+        config.mode != "worldpackage") {
         std::cerr << "bad mode: " << config.mode << "\n";
         return false;
     }
@@ -713,6 +724,117 @@ bool WaitFor(std::chrono::milliseconds timeout, const std::function<bool()>& con
     return condition();
 }
 
+// --- MAP-0 snapshot reads ---------------------------------------------------
+// Every look at a running world goes through a supervisor snapshot
+// (gs::bench::ReadWorld); nothing below keeps a Zone&/Zone* across calls.
+using gs::bench::ReadWorld;
+using gs::bench::WorldSnapshot;
+
+std::size_t ZoneSlots(gs::game::WorldRuntime& sim)
+{
+    return ReadWorld(sim, [](const WorldSnapshot& snap) { return snap.zones.ZoneCount(); });
+}
+
+// Zone id in a slot (0 = no such slot).
+gs::game::ZoneId ZoneIdAt(gs::game::WorldRuntime& sim, std::size_t index)
+{
+    return ReadWorld(sim, [index](const WorldSnapshot& snap) -> gs::game::ZoneId {
+        return index < snap.zones.ZoneCount() ? snap.zones.GetZone(index).Id() : 0;
+    });
+}
+
+// Slot of the leaf zone owning a world position (ZoneCount() = none) plus the
+// slot count of the same capture, so "found" is decided at one point.
+struct ZoneAtPosition {
+    std::size_t index = 0;
+    std::size_t slots = 0;
+    gs::game::ZoneId id = 0;
+    mx::map::Rect bounds{};
+    bool found() const noexcept
+    {
+        return index < slots;
+    }
+};
+ZoneAtPosition ZoneForPosition(gs::game::WorldRuntime& sim, float x, float y)
+{
+    return ReadWorld(sim, [x, y](const WorldSnapshot& snap) {
+        ZoneAtPosition out;
+        out.slots = snap.zones.ZoneCount();
+        out.index = snap.zones.FindIndexForPosition(x, y);
+        if (out.index < out.slots) {
+            out.id = snap.zones.GetZone(out.index).Id();
+            out.bounds = snap.zones.GetZone(out.index).Bounds();
+        }
+        return out;
+    });
+}
+
+std::size_t IndexForPosition(gs::game::WorldRuntime& sim, float x, float y)
+{
+    return ZoneForPosition(sim, x, y).index;
+}
+
+std::set<gs::game::ZoneId> ActiveLeafIds(gs::game::WorldRuntime& sim)
+{
+    return ReadWorld(sim, [](const WorldSnapshot& snap) {
+        std::set<gs::game::ZoneId> ids;
+        for (const auto* leaf : snap.zones.GetActiveLeaves()) {
+            ids.insert(leaf->zone_id);
+        }
+        return ids;
+    });
+}
+
+std::size_t OwnerCount(gs::game::WorldRuntime& sim)
+{
+    return ReadWorld(sim, [](const WorldSnapshot& snap) { return snap.owners.size(); });
+}
+
+// A session's owner record, with the owning zone resolved in the same capture.
+struct OwnerView {
+    bool found = false;
+    std::uint32_t net_id = 0;
+    std::size_t zone_index = 0;
+    gs::game::ZoneId zone_id = 0;       // zone in the cached slot (0 = unresolved)
+    gs::game::ZoneId location_zone = 0; // routing truth (owner location)
+};
+OwnerView FindOwner(gs::game::WorldRuntime& sim, gs::common::SessionId session)
+{
+    return ReadWorld(sim, [session](const WorldSnapshot& snap) {
+        OwnerView out;
+        const auto it = snap.owners.find(session);
+        if (it == snap.owners.end()) {
+            return out;
+        }
+        out.found = true;
+        out.net_id = it->second.net_id;
+        out.zone_index = it->second.zone_index;
+        out.location_zone = it->second.location.zone;
+        if (out.zone_index < snap.zones.ZoneCount()) {
+            out.zone_id = snap.zones.GetZone(out.zone_index).Id();
+        }
+        return out;
+    });
+}
+
+// Runtime read APIs that walk the zone table (CollectProcessLoad, the
+// partition scorers) are only race-free on the supervisor, so the bench runs
+// them inside a snapshot too.
+gs::game::ProcessLoadSnapshot ProcessLoad(gs::game::WorldRuntime& sim)
+{
+    return ReadWorld(sim, [&sim](const WorldSnapshot&) { return sim.CollectProcessLoad(); });
+}
+
+gs::game::SplitRecommendation ScorePartitionSnap(gs::game::WorldRuntime& sim, gs::game::ZoneId id)
+{
+    return ReadWorld(sim, [&sim, id](const WorldSnapshot&) { return sim.ScorePartition(id); });
+}
+
+gs::game::MergeRecommendation ScoreMergeSnap(gs::game::WorldRuntime& sim, gs::game::ZoneId id)
+{
+    return ReadWorld(sim, [&sim, id](const WorldSnapshot&) { return sim.ScoreMerge(id); });
+}
+
 // Routing/distribution self-test (§34): unknown + draining destinations,
 // stale + duplicate migration delivery, source-free EntityTransfer
 // roundtrip. Public runtime APIs only. Returns failure count.
@@ -724,7 +846,7 @@ int RunRoutingSelftest(gs::game::WorldRuntime& sim,
     int failures = 0;
     const auto identity = sim.Identity();
 
-    if (sim.Zones().ZoneCount() < 2) {
+    if (ZoneSlots(sim) < 2) {
         SelftestReport("emulation-needs-2-zones", false, true, failures);
         return failures;
     }
@@ -732,20 +854,29 @@ int RunRoutingSelftest(gs::game::WorldRuntime& sim,
     // subsequent load then runs distributed-emulated, which is intended).
     sim.EmulateDistribution(2);
 
-    // Find an emulated-remote zone.
-    std::size_t remote_index = sim.Zones().ZoneCount();
-    for (std::size_t i = 0; i < sim.Zones().ZoneCount(); ++i) {
-        const auto location = sim.Directory().ResolveZone(sim.Zones().GetZone(i).Id());
-        if (location && !sim.Directory().IsLocal(*location)) {
-            remote_index = i;
-            break;
+    // Find an emulated-remote zone (the directory is mutex-guarded).
+    struct RemoteZone {
+        bool found = false;
+        std::size_t index = 0;
+        gs::game::ZoneId id = 0;
+    };
+    const RemoteZone remote = ReadWorld(sim, [&sim](const WorldSnapshot& snap) {
+        RemoteZone out;
+        for (std::size_t i = 0; i < snap.zones.ZoneCount(); ++i) {
+            const auto location = sim.Directory().ResolveZone(snap.zones.GetZone(i).Id());
+            if (location && !sim.Directory().IsLocal(*location)) {
+                out = RemoteZone{true, i, snap.zones.GetZone(i).Id()};
+                break;
+            }
         }
-    }
-    if (remote_index >= sim.Zones().ZoneCount()) {
+        return out;
+    });
+    if (!remote.found) {
         SelftestReport("emulated-remote-zone", false, true, failures);
         return failures;
     }
-    const auto remote_zone_id = sim.Zones().GetZone(remote_index).Id();
+    const std::size_t remote_index = remote.index;
+    const auto remote_zone_id = remote.id;
 
     // (a) Unknown destination -> DestinationUnavailable, nothing delivered.
     {
@@ -770,7 +901,7 @@ int RunRoutingSelftest(gs::game::WorldRuntime& sim,
 
     // (c) Stale migration request (bogus net) is dropped, world stays valid.
     {
-        const auto zone0 = sim.Zones().GetZone(0).Id();
+        const auto zone0 = ZoneIdAt(sim, 0);
         sim.TestMigrationQueue().TryEnqueue(
             gs::game::MigrationRequest{42424242u, zone0, remote_zone_id});
         const bool drained = WaitFor(std::chrono::seconds(3),
@@ -800,28 +931,23 @@ int RunRoutingSelftest(gs::game::WorldRuntime& sim,
         // Wait for the spawn to land so we learn the scout's net id.
         std::uint32_t scout_net = 0;
         WaitFor(std::chrono::seconds(5), [&] {
-            const auto it = sim.Owners().find(1);
-            if (it == sim.Owners().end()) {
+            const OwnerView owner = FindOwner(sim, 1);
+            if (!owner.found) {
                 return false;
             }
-            scout_net = it->second.net_id;
+            scout_net = owner.net_id;
             return true;
         });
         bool migrated = false;
-        std::size_t home_index = sim.Zones().ZoneCount();
         std::uint32_t home_zone_id = 0;
         if (scout_net != 0) {
-            const auto home = sim.Owners().find(1);
-            home_index = home != sim.Owners().end() ? home->second.zone_index : home_index;
-            home_zone_id = home_index < sim.Zones().ZoneCount()
-                               ? sim.Zones().GetZone(home_index).Id()
-                               : 0;
+            home_zone_id = FindOwner(sim, 1).zone_id;
             std::uint32_t seq = 0;
             const auto move_deadline = std::chrono::steady_clock::now() + std::chrono::seconds(15);
             while (std::chrono::steady_clock::now() < move_deadline && !migrated) {
                 sim.PostMoveInput(1, ++seq, 1.5707963f, gs::game::MoveState::Running);
-                const auto owner = sim.Owners().find(1);
-                if (owner != sim.Owners().end() && owner->second.zone_index != home_index) {
+                const OwnerView owner = FindOwner(sim, 1);
+                if (owner.found && owner.zone_id != home_zone_id) {
                     migrated = true;
                 }
                 std::this_thread::sleep_for(std::chrono::milliseconds(50));
@@ -832,11 +958,7 @@ int RunRoutingSelftest(gs::game::WorldRuntime& sim,
             // Replay the just-committed id against the ORIGINAL route. The
             // committed-set must drop it (duplicates+1) even though the
             // entity still exists -- no second entity may appear.
-            const auto owner = sim.Owners().find(1);
-            const std::uint32_t dst_zone_id =
-                owner != sim.Owners().end() && owner->second.zone_index < sim.Zones().ZoneCount()
-                    ? sim.Zones().GetZone(owner->second.zone_index).Id()
-                    : 0;
+            const std::uint32_t dst_zone_id = FindOwner(sim, 1).zone_id;
             const auto committed_id = sim.LastCommittedMigration();
             const auto dup_before = sim.MigrationMetrics().duplicates;
             gs::game::MigrationRequest replay{};
@@ -868,10 +990,9 @@ int RunRoutingSelftest(gs::game::WorldRuntime& sim,
                 WaitFor(std::chrono::seconds(3), [&] {
                     return sim.MigrationMetrics().duplicates == dup_before + 1;
                 });
-                const auto after = sim.Owners().find(1);
+                const OwnerView after = FindOwner(sim, 1);
                 const auto dup_after = sim.MigrationMetrics().duplicates;
-                replay_safe = after != sim.Owners().end() &&
-                              after->second.zone_index != home_index &&
+                replay_safe = after.found && after.zone_id != home_zone_id &&
                               dup_after == dup_before + 1;
                 std::string error;
                 sim.RequestValidation();
@@ -896,12 +1017,23 @@ int RunRoutingSelftest(gs::game::WorldRuntime& sim,
         // (e) Source-free DTO roundtrip on the (possibly migrated) scout.
         bool roundtrip = false;
         if (scout_net != 0) {
-            const auto owner = sim.Owners().find(1);
-            if (owner != sim.Owners().end() && owner->second.zone_index < sim.Zones().ZoneCount()) {
-                const auto entity =
-                    sim.Zones().GetZone(owner->second.zone_index).FindEntity(scout_net);
-                if (entity.is_valid()) {
-                    auto transfer = gs::game::BuildTransfer(entity, true, 0);
+            // The DTO is built from the live entity inside the snapshot (the
+            // flecs world belongs to the zone); the bench only sees the copy.
+            const auto built = ReadWorld(sim, [scout_net](const WorldSnapshot& snap) {
+                std::optional<gs::game::EntityTransfer> out;
+                const auto owner = snap.owners.find(1);
+                if (owner != snap.owners.end() && owner->second.zone_index < snap.zones.ZoneCount()) {
+                    const auto entity =
+                        snap.zones.GetZone(owner->second.zone_index).FindEntity(scout_net);
+                    if (entity.is_valid()) {
+                        out = gs::game::BuildTransfer(entity, true, 0);
+                    }
+                }
+                return out;
+            });
+            {
+                if (built) {
+                    const gs::game::EntityTransfer transfer = *built;
                     const gs::game::EntityTransfer wire_copy = transfer; // simulated transport
                     roundtrip = wire_copy.net_id == scout_net && wire_copy.is_player &&
                                 wire_copy.session == 1 &&
@@ -949,7 +1081,7 @@ int RunSplitMergeScenario(boost::asio::io_context& io, const BenchConfig& config
         }
     };
 
-    gs::game::WorldRuntime sim(io);
+    gs::game::WorldRuntime sim(io, {}, gs::bench::LoadBenchTestWorld());
     auto validate_now = [&](const char* what) -> bool {
         sim.RequestValidation();
         for (int i = 0; i < 100; ++i) {
@@ -967,16 +1099,25 @@ int RunSplitMergeScenario(boost::asio::io_context& io, const BenchConfig& config
         std::printf("SPLITMERGE validation(%s): TIMEOUT\n", what);
         return false;
     };
-    auto active_leaf_ids = [&]() {
-        std::set<gs::game::ZoneId> ids;
-        for (const auto* leaf : sim.Zones().GetActiveLeaves()) {
-            ids.insert(leaf->zone_id);
-        }
-        return ids;
+    auto active_leaf_ids = [&]() { return ActiveLeafIds(sim); };
+    // Copy of the few zone facts the checks need (MAP-0: no Zone* kept).
+    struct ZoneView {
+        mx::map::Rect bounds{};
+        gs::game::PartitionState partition{};
+        std::size_t entities = 0;
+        std::size_t players = 0;
     };
-    auto find_zone = [&](gs::game::ZoneId id) -> const gs::game::Zone* {
-        const std::size_t idx = sim.Zones().FindIndexById(id);
-        return idx < sim.Zones().ZoneCount() ? &sim.Zones().GetZone(idx) : nullptr;
+    auto find_zone = [&](gs::game::ZoneId id) {
+        return ReadWorld(sim, [id](const WorldSnapshot& snap) {
+            std::optional<ZoneView> out;
+            const std::size_t idx = snap.zones.FindIndexById(id);
+            if (idx < snap.zones.ZoneCount()) {
+                const auto& zone = snap.zones.GetZone(idx);
+                out = ZoneView{zone.Bounds(), zone.Partition(), zone.Entities().size(),
+                               zone.Players().size()};
+            }
+            return out;
+        });
     };
 
     const auto deadline =
@@ -996,9 +1137,10 @@ int RunSplitMergeScenario(boost::asio::io_context& io, const BenchConfig& config
     sim.Start();
 
     // ---- 2. populate one zone ----
-    const auto& z0 = sim.Zones().GetZone(0);
-    const float cx = (z0.Bounds().min_x + z0.Bounds().max_x) * 0.5f;
-    const float cy = (z0.Bounds().min_y + z0.Bounds().max_y) * 0.5f;
+    const mx::map::Rect z0 =
+        ReadWorld(sim, [](const WorldSnapshot& snap) { return snap.zones.GetZone(0).Bounds(); });
+    const float cx = (z0.min_x + z0.max_x) * 0.5f;
+    const float cy = (z0.min_y + z0.max_y) * 0.5f;
     constexpr int kPlayers = 8;
     constexpr int kBoundaryPlayers = 3;
     constexpr int kTotalPlayers = kPlayers + kBoundaryPlayers;
@@ -1028,32 +1170,32 @@ int RunSplitMergeScenario(boost::asio::io_context& io, const BenchConfig& config
         sim.RequestMobSpawn(static_cast<std::size_t>(4 + k));
     }
     bool populated = WaitFor(std::chrono::seconds(20), [&] {
-        return sim.Owners().size() == static_cast<std::size_t>(kPlayers) &&
-               sim.CollectProcessLoad().mobs >= 16;
+        return OwnerCount(sim) == static_cast<std::size_t>(kPlayers) &&
+               ProcessLoad(sim).mobs >= 16;
     });
     check("populate", populated && !expired());
     if (!populated) {
         sim.Stop();
         return failures + 1;
     }
-    const std::uint64_t mob_total = sim.CollectProcessLoad().mobs;
+    const std::uint64_t mob_total = ProcessLoad(sim).mobs;
 
     // Target = wherever the spawns actually landed (no map assumptions).
-    const gs::game::ZoneId target_id = sim.Owners().at(kBaseSession).location.zone;
+    const gs::game::ZoneId target_id = FindOwner(sim, kBaseSession).location_zone;
     bool all_in_target = true;
     for (int i = 0; i < kPlayers; ++i) {
-        const auto it = sim.Owners().find(static_cast<gs::common::SessionId>(kBaseSession + i));
-        if (it == sim.Owners().end() || it->second.location.zone != target_id) {
+        const OwnerView owner = FindOwner(sim, static_cast<gs::common::SessionId>(kBaseSession + i));
+        if (!owner.found || owner.location_zone != target_id) {
             all_in_target = false;
         }
     }
     check("single-target-zone", all_in_target);
-    const auto* target_zone = find_zone(target_id);
-    if (target_zone == nullptr) {
+    const auto target_zone = find_zone(target_id);
+    if (!target_zone) {
         sim.Stop();
         return failures + 1;
     }
-    const auto tb = target_zone->Bounds();
+    const auto tb = target_zone->bounds;
     const float mid_x = (tb.min_x + tb.max_x) * 0.5f;
     const float mid_y = (tb.min_y + tb.max_y) * 0.5f;
 
@@ -1076,7 +1218,7 @@ int RunSplitMergeScenario(boost::asio::io_context& io, const BenchConfig& config
                       gs::game::DebugSpawnOverride{kBoundary[i].x, kBoundary[i].y});
     }
     populated = WaitFor(std::chrono::seconds(15), [&] {
-        return sim.Owners().size() == static_cast<std::size_t>(kTotalPlayers);
+        return OwnerCount(sim) == static_cast<std::size_t>(kTotalPlayers);
     });
     check("boundary-spawn", populated && !expired());
 
@@ -1084,11 +1226,12 @@ int RunSplitMergeScenario(boost::asio::io_context& io, const BenchConfig& config
     bool boundary_home = true;
     std::vector<std::uint32_t> boundary_nets;
     for (int i = 0; i < kBoundaryPlayers; ++i) {
-        const auto it = sim.Owners().find(static_cast<gs::common::SessionId>(kBaseSession + kPlayers + i));
-        if (it == sim.Owners().end() || it->second.location.zone != target_id) {
+        const OwnerView owner =
+            FindOwner(sim, static_cast<gs::common::SessionId>(kBaseSession + kPlayers + i));
+        if (!owner.found || owner.location_zone != target_id) {
             boundary_home = false;
         } else {
-            boundary_nets.push_back(it->second.net_id);
+            boundary_nets.push_back(owner.net_id);
         }
     }
     check("boundary-in-target", boundary_home);
@@ -1113,8 +1256,8 @@ int RunSplitMergeScenario(boost::asio::io_context& io, const BenchConfig& config
     check("pre-merge-validate-split", validate_now("post-split"));
 
     auto totals_ok = [&] {
-        return sim.Owners().size() == static_cast<std::size_t>(kTotalPlayers) &&
-               sim.CollectProcessLoad().mobs == mob_total;
+        return OwnerCount(sim) == static_cast<std::size_t>(kTotalPlayers) &&
+               ProcessLoad(sim).mobs == mob_total;
     };
     if (expect_abort) {
         check("split-aborted",
@@ -1141,19 +1284,19 @@ int RunSplitMergeScenario(boost::asio::io_context& io, const BenchConfig& config
         check("split-parent-retired",
               leaves.find(target_id) == leaves.end() &&
                   [&] {
-                      const auto* z = find_zone(target_id);
-                      return z != nullptr &&
-                             z->Partition() == gs::game::PartitionState::Retired &&
-                             z->Entities().empty() && z->Players().empty();
+                      const auto z = find_zone(target_id);
+                      return z.has_value() &&
+                             z->partition == gs::game::PartitionState::Retired &&
+                             z->entities == 0 && z->players == 0;
                   }());
         check("split-no-loss", totals_ok());
         // Boundary placement: each midline player in exactly the half-open
         // owner child (§23).
         bool placement_ok = new_children.size() == 4;
         for (int i = 0; i < kBoundaryPlayers && placement_ok; ++i) {
-            const auto it =
-                sim.Owners().find(static_cast<gs::common::SessionId>(kBaseSession + kPlayers + i));
-            if (it == sim.Owners().end()) {
+            const OwnerView owner =
+                FindOwner(sim, static_cast<gs::common::SessionId>(kBaseSession + kPlayers + i));
+            if (!owner.found) {
                 placement_ok = false;
                 break;
             }
@@ -1162,17 +1305,17 @@ int RunSplitMergeScenario(boost::asio::io_context& io, const BenchConfig& config
             int matches = 0;
             gs::game::ZoneId expected = 0;
             for (auto cid : new_children) {
-                const auto* cz = find_zone(cid);
-                if (cz == nullptr) {
+                const auto cz = find_zone(cid);
+                if (!cz) {
                     continue;
                 }
-                const auto& b = cz->Bounds();
+                const auto& b = cz->bounds;
                 if (px >= b.min_x && px < b.max_x && py >= b.min_y && py < b.max_y) {
                     ++matches;
                     expected = cid;
                 }
             }
-            placement_ok = (matches == 1 && it->second.location.zone == expected);
+            placement_ok = (matches == 1 && owner.location_zone == expected);
         }
         check("split-boundary-placement", placement_ok);
     }
@@ -1191,7 +1334,7 @@ int RunSplitMergeScenario(boost::asio::io_context& io, const BenchConfig& config
         sim.PostDespawn(static_cast<gs::common::SessionId>(kBaseSession + i));
     }
     sessions.clear();
-    const bool drained = WaitFor(std::chrono::seconds(15), [&] { return sim.Owners().empty(); });
+    const bool drained = WaitFor(std::chrono::seconds(15), [&] { return OwnerCount(sim) == 0; });
     check("despawn-drained", drained && !expired());
     if (expect_abort) {
         check("abort-final-validate", validate_now("final-abort"));
@@ -1225,23 +1368,31 @@ int RunSplitMergeScenario(boost::asio::io_context& io, const BenchConfig& config
     // apply to the commit path.
     if (!expect_abort) {
         check("merge-single-target", merged_ids.size() == 1);
-        std::uint64_t total_mobs = 0;
-        bool children_clean = true;
-        for (std::size_t zi = 0; zi < sim.Zones().ZoneCount(); ++zi) {
-            const auto& z = sim.Zones().GetZone(zi);
-            total_mobs += z.Entities().size();
-            // Mobs may have wandered out of the merged subtree into
-            // neighbors; the invariant is global preservation + retired
-            // emptiness, not that every mob sits in the merged zone.
-            if (z.Partition() == gs::game::PartitionState::Retired) {
-                if (!z.Entities().empty() || !z.Players().empty()) {
-                    children_clean = false;
+        struct MergeTotals {
+            std::uint64_t total_mobs = 0;
+            bool children_clean = true;
+        };
+        const MergeTotals merge_totals = ReadWorld(sim, [](const WorldSnapshot& snap) {
+            MergeTotals out;
+            for (std::size_t zi = 0; zi < snap.zones.ZoneCount(); ++zi) {
+                const auto& z = snap.zones.GetZone(zi);
+                out.total_mobs += z.Entities().size();
+                // Mobs may have wandered out of the merged subtree into
+                // neighbors; the invariant is global preservation + retired
+                // emptiness, not that every mob sits in the merged zone.
+                if (z.Partition() == gs::game::PartitionState::Retired) {
+                    if (!z.Entities().empty() || !z.Players().empty()) {
+                        out.children_clean = false;
+                    }
                 }
             }
-        }
+            return out;
+        });
+        const std::uint64_t total_mobs = merge_totals.total_mobs;
+        const bool children_clean = merge_totals.children_clean;
         check("merge-children-retired-empty", children_clean);
         check("merge-mobs-preserved",
-              total_mobs == mob_total && sim.CollectProcessLoad().mobs == mob_total);
+              total_mobs == mob_total && ProcessLoad(sim).mobs == mob_total);
     }
 
     const auto pm = sim.PartitionMetricsSnapshot();
@@ -1301,7 +1452,7 @@ int RunLodScenario(boost::asio::io_context& io, const BenchConfig& config)
         }
     };
 
-    gs::game::WorldRuntime sim(io);
+    gs::game::WorldRuntime sim(io, {}, gs::bench::LoadBenchTestWorld());
     auto validate_now = [&](const char* what) -> bool {
         sim.RequestValidation();
         for (int i = 0; i < 100; ++i) {
@@ -1323,40 +1474,51 @@ int RunLodScenario(boost::asio::io_context& io, const BenchConfig& config)
         std::uint64_t full = 0, reduced = 0, low = 0, dormant = 0;
     };
     auto tiers = [&]() {
-        TierDist dist;
-        for (std::size_t zi = 0; zi < sim.Zones().ZoneCount(); ++zi) {
-            const auto& diag = sim.Zones().GetZone(zi).Diagnostics();
-            dist.full += diag.lod_full.load(std::memory_order_relaxed);
-            dist.reduced += diag.lod_reduced.load(std::memory_order_relaxed);
-            dist.low += diag.lod_low.load(std::memory_order_relaxed);
-            dist.dormant += diag.lod_dormant.load(std::memory_order_relaxed);
-        }
-        return dist;
+        return ReadWorld(sim, [](const WorldSnapshot& snap) {
+            TierDist dist;
+            for (std::size_t zi = 0; zi < snap.zones.ZoneCount(); ++zi) {
+                const auto& diag = snap.zones.GetZone(zi).Diagnostics();
+                dist.full += diag.lod_full.load(std::memory_order_relaxed);
+                dist.reduced += diag.lod_reduced.load(std::memory_order_relaxed);
+                dist.low += diag.lod_low.load(std::memory_order_relaxed);
+                dist.dormant += diag.lod_dormant.load(std::memory_order_relaxed);
+            }
+            return dist;
+        });
     };
     auto print_zones = [&](const char* tag) {
-        std::printf("LOD zones@%s:\n", tag);
-        for (std::size_t zi = 0; zi < sim.Zones().ZoneCount(); ++zi) {
-            const auto& z = sim.Zones().GetZone(zi);
-            const auto& diag = z.Diagnostics();
-            const auto& b = z.Bounds();
-            std::printf("  zone=%u bounds=(%.0f,%.0f)-(%.0f,%.0f) mobs=%u tiers=[%u/%u/%u/%u]\n",
-                        z.Id(),
-                        b.min_x,
-                        b.min_y,
-                        b.max_x,
-                        b.max_y,
-                        diag.mob_count.load(std::memory_order_relaxed),
-                        diag.lod_full.load(std::memory_order_relaxed),
-                        diag.lod_reduced.load(std::memory_order_relaxed),
-                        diag.lod_low.load(std::memory_order_relaxed),
-                        diag.lod_dormant.load(std::memory_order_relaxed));
-        }
-        for (const auto& [sid, owner] : sim.Owners()) {
-            std::printf("  owner session=%llu zone=%u net=%u\n",
-                        (unsigned long long)sid,
-                        owner.location.zone,
-                        owner.net_id);
-        }
+        // Formatted inside the snapshot, printed by the bench thread.
+        const std::string text = ReadWorld(sim, [](const WorldSnapshot& snap) {
+            std::string out;
+            char line[256];
+            for (std::size_t zi = 0; zi < snap.zones.ZoneCount(); ++zi) {
+                const auto& z = snap.zones.GetZone(zi);
+                const auto& diag = z.Diagnostics();
+                const auto& b = z.Bounds();
+                std::snprintf(line, sizeof(line),
+                              "  zone=%u bounds=(%.0f,%.0f)-(%.0f,%.0f) mobs=%u tiers=[%u/%u/%u/%u]\n",
+                              z.Id(),
+                              b.min_x,
+                              b.min_y,
+                              b.max_x,
+                              b.max_y,
+                              diag.mob_count.load(std::memory_order_relaxed),
+                              diag.lod_full.load(std::memory_order_relaxed),
+                              diag.lod_reduced.load(std::memory_order_relaxed),
+                              diag.lod_low.load(std::memory_order_relaxed),
+                              diag.lod_dormant.load(std::memory_order_relaxed));
+                out += line;
+            }
+            for (const auto& [sid, owner] : snap.owners) {
+                std::snprintf(line, sizeof(line), "  owner session=%llu zone=%u net=%u\n",
+                              (unsigned long long)sid,
+                              owner.location.zone,
+                              owner.net_id);
+                out += line;
+            }
+            return out;
+        });
+        std::printf("LOD zones@%s:\n%s", tag, text.c_str());
     };
 
     const auto deadline =
@@ -1393,18 +1555,18 @@ int RunLodScenario(boost::asio::io_context& io, const BenchConfig& config)
         sim.RequestMobSpawn(static_cast<std::size_t>(4 + k));
     }
     const bool populated = WaitFor(std::chrono::seconds(25), [&] {
-        return sim.Owners().size() == 1 && sim.CollectProcessLoad().mobs >= 10;
+        return OwnerCount(sim) == 1 && ProcessLoad(sim).mobs >= 10;
     });
     check("populate", populated && !expired());
     if (!populated) {
         sim.Stop();
         return failures + 1;
     }
-    const std::uint64_t mob_total = sim.CollectProcessLoad().mobs;
+    const std::uint64_t mob_total = ProcessLoad(sim).mobs;
     print_zones("populated");
     std::printf("LOD lookup: (150,150)->zoneidx=%zu (850,850)->zoneidx=%zu\n",
-                sim.Zones().FindIndexForPosition(150.0f, 150.0f),
-                sim.Zones().FindIndexForPosition(850.0f, 850.0f));
+                IndexForPosition(sim, 150.0f, 150.0f),
+                IndexForPosition(sim, 850.0f, 850.0f));
     check("pre-validate", validate_now("pre"));
     auto tiers_sum = [](const TierDist& d) { return d.full + d.reduced + d.low + d.dormant; };
 
@@ -1428,7 +1590,7 @@ int RunLodScenario(boost::asio::io_context& io, const BenchConfig& config)
     check("near-full", d1.full >= 3);
     check("far-demoted", d1.dormant + d1.low + d1.reduced >= 3);
     check("tier-accounting-1", tiers_sum(d1) == mob_total);
-    check("no-loss-phase1", sim.CollectProcessLoad().mobs == mob_total);
+    check("no-loss-phase1", ProcessLoad(sim).mobs == mob_total);
     check("validate-phase1", validate_now("phase1"));
 
     // ---- Phase 2: leave hysteresis (before any death, so no respawn can
@@ -1436,7 +1598,7 @@ int RunLodScenario(boost::asio::io_context& io, const BenchConfig& config)
     // grace (Reduced), with no flap back while nobody is around.
     sim.PostDespawn(kPlayer1);
     const bool left1 =
-        WaitFor(std::chrono::seconds(15), [&] { return sim.Owners().empty(); });
+        WaitFor(std::chrono::seconds(15), [&] { return OwnerCount(sim) == 0; });
     check("despawn-1-drained", left1 && !expired());
     std::this_thread::sleep_for(std::chrono::seconds(12));
     if (expired()) {
@@ -1489,7 +1651,7 @@ int RunLodScenario(boost::asio::io_context& io, const BenchConfig& config)
     // count stays within [total-deaths, total], never below (loss) or above
     // (duplication).
     {
-        const std::uint64_t mobs_now = sim.CollectProcessLoad().mobs;
+        const std::uint64_t mobs_now = ProcessLoad(sim).mobs;
         std::printf("LOD mobs: total=%llu deaths=%llu now=%llu\n",
                     (unsigned long long)mob_total,
                     (unsigned long long)deaths,
@@ -1502,7 +1664,7 @@ int RunLodScenario(boost::asio::io_context& io, const BenchConfig& config)
     // countdowns are tier-independent by design). Deaths from phase 4 must
     // come back within their window.
     const bool respawned = WaitFor(std::chrono::seconds(45), [&] {
-        return sim.CollectProcessLoad().mobs >= mob_total;
+        return ProcessLoad(sim).mobs >= mob_total;
     });
     check("respawn-advance", respawned && !expired());
     check("validate-phase5", validate_now("phase5"));
@@ -1552,7 +1714,7 @@ int RunActivityScenario(boost::asio::io_context& io, const BenchConfig& config)
         }
     };
 
-    gs::game::WorldRuntime sim(io);
+    gs::game::WorldRuntime sim(io, {}, gs::bench::LoadBenchTestWorld());
     auto validate_now = [&](const char* what) -> bool {
         sim.RequestValidation();
         for (int i = 0; i < 100; ++i) {
@@ -1629,14 +1791,21 @@ int RunActivityScenario(boost::asio::io_context& io, const BenchConfig& config)
     std::size_t zone_a = 0, zone_b = 0;
     bool have_pair = false;
     {
-        const auto& zones = sim.Zones();
-        for (std::size_t i = 0; i < zones.ZoneCount() && !have_pair; ++i) {
-            for (std::size_t j = 0; j < zones.ZoneCount() && !have_pair; ++j) {
+        const std::vector<mx::map::Rect> bounds =
+            ReadWorld(sim, [](const WorldSnapshot& snap) {
+                std::vector<mx::map::Rect> out;
+                for (std::size_t i = 0; i < snap.zones.ZoneCount(); ++i) {
+                    out.push_back(snap.zones.GetZone(i).Bounds());
+                }
+                return out;
+            });
+        for (std::size_t i = 0; i < bounds.size() && !have_pair; ++i) {
+            for (std::size_t j = 0; j < bounds.size() && !have_pair; ++j) {
                 if (i == j) {
                     continue;
                 }
-                const auto& a = zones.GetZone(i).Bounds();
-                const auto& b = zones.GetZone(j).Bounds();
+                const auto& a = bounds[i];
+                const auto& b = bounds[j];
                 const float overlap =
                     std::min(a.max_y, b.max_y) - std::max(a.min_y, b.min_y);
                 if (std::abs(a.max_x - b.min_x) < 0.01f && overlap >= 100.0f) {
@@ -1678,7 +1847,7 @@ int RunActivityScenario(boost::asio::io_context& io, const BenchConfig& config)
         sim.RequestMobSpawn(static_cast<std::size_t>(4 + k));
     }
     const bool populated = WaitFor(std::chrono::seconds(20), [&] {
-        return sim.Owners().size() == 1 && sim.CollectProcessLoad().mobs >= 3;
+        return OwnerCount(sim) == 1 && ProcessLoad(sim).mobs >= 3;
     });
     check("populate", populated && !expired());
     if (!populated) {
@@ -1687,9 +1856,9 @@ int RunActivityScenario(boost::asio::io_context& io, const BenchConfig& config)
     }
     // Placement proof via position->zone mapping (no live flecs reads):
     // player in A, every mob in B.
-    bool placed = sim.Zones().FindIndexForPosition(px, y_mid) == zone_a;
+    bool placed = IndexForPosition(sim, px, y_mid) == zone_a;
     for (int k = 0; k < 3 && placed; ++k) {
-        placed = sim.Zones().FindIndexForPosition(px + kDistances[k], y_mid) == zone_b;
+        placed = IndexForPosition(sim, px + kDistances[k], y_mid) == zone_b;
     }
     check("cross-zone-placement", placed);
     check("pre-validate", validate_now("pre"));
@@ -1729,12 +1898,16 @@ int RunActivityScenario(boost::asio::io_context& io, const BenchConfig& config)
         std::uint64_t seen = 0;
         const auto until = std::chrono::steady_clock::now() + std::chrono::seconds(5);
         while (std::chrono::steady_clock::now() < until && seen == 0 && !expired()) {
-            for (std::size_t zi = 0; zi < sim.Zones().ZoneCount(); ++zi) {
-                const auto& diag = sim.Zones().GetZone(zi).Diagnostics();
-                seen += diag.cross_zone_full_since_diag.load(std::memory_order_relaxed);
-                seen += diag.cross_zone_reduced_since_diag.load(std::memory_order_relaxed);
-                seen += diag.cross_zone_low_since_diag.load(std::memory_order_relaxed);
-            }
+            seen += ReadWorld(sim, [](const WorldSnapshot& snap) {
+                std::uint64_t window = 0;
+                for (std::size_t zi = 0; zi < snap.zones.ZoneCount(); ++zi) {
+                    const auto& diag = snap.zones.GetZone(zi).Diagnostics();
+                    window += diag.cross_zone_full_since_diag.load(std::memory_order_relaxed);
+                    window += diag.cross_zone_reduced_since_diag.load(std::memory_order_relaxed);
+                    window += diag.cross_zone_low_since_diag.load(std::memory_order_relaxed);
+                }
+                return window;
+            });
             std::this_thread::sleep_for(std::chrono::milliseconds(100));
         }
         std::printf("ACTIVITY cross-counters observed: %llu\n", (unsigned long long)seen);
@@ -1765,7 +1938,7 @@ int RunActivityScenario(boost::asio::io_context& io, const BenchConfig& config)
         sim.RequestMobSpawn(static_cast<std::size_t>(7 + k));
     }
     const bool populated2 = WaitFor(std::chrono::seconds(25), [&] {
-        return sim.CollectProcessLoad().mobs >= 12;
+        return ProcessLoad(sim).mobs >= 12;
     });
     check("boundary-populate", populated2 && !expired());
     if (!populated2) {
@@ -1799,7 +1972,7 @@ int RunActivityScenario(boost::asio::io_context& io, const BenchConfig& config)
     check("boundary-exactness", bounds_ok);
     check("validate-boundaries", validate_now("boundaries"));
     // No topology churn allowed at this load (determinism guard).
-    check("topology-stable", sim.Zones().ZoneCount() == 3);
+    check("topology-stable", ZoneSlots(sim) == 3);
 
     // ---- Phase 3: despawn -> Full/Reduced work must drain (sleep
     // precondition), zones fall asleep, validator Dormant rules execute
@@ -1808,23 +1981,25 @@ int RunActivityScenario(boost::asio::io_context& io, const BenchConfig& config)
     // they resume and finish demoting on wake. Asserting all-Dormant here
     // would contradict the sleep economy, so assert no-Full/Reduced.
     sim.PostDespawn(kPlayer);
-    const bool drained = WaitFor(std::chrono::seconds(15), [&] { return sim.Owners().empty(); });
+    const bool drained = WaitFor(std::chrono::seconds(15), [&] { return OwnerCount(sim) == 0; });
     check("despawn-drained", drained && !expired());
     const bool quiet = WaitFor(std::chrono::seconds(20), [&] {
-        std::uint64_t hot = 0, total = 0;
-        for (std::size_t zi = 0; zi < sim.Zones().ZoneCount(); ++zi) {
-            const auto& diag = sim.Zones().GetZone(zi).Diagnostics();
-            hot += diag.lod_full.load(std::memory_order_relaxed) +
-                   diag.lod_reduced.load(std::memory_order_relaxed);
-            total += hot + diag.lod_low.load(std::memory_order_relaxed) +
-                     diag.lod_dormant.load(std::memory_order_relaxed);
-        }
-        return total >= 12 && hot == 0;
+        return ReadWorld(sim, [](const WorldSnapshot& snap) {
+            std::uint64_t hot = 0, total = 0;
+            for (std::size_t zi = 0; zi < snap.zones.ZoneCount(); ++zi) {
+                const auto& diag = snap.zones.GetZone(zi).Diagnostics();
+                hot += diag.lod_full.load(std::memory_order_relaxed) +
+                       diag.lod_reduced.load(std::memory_order_relaxed);
+                total += hot + diag.lod_low.load(std::memory_order_relaxed) +
+                         diag.lod_dormant.load(std::memory_order_relaxed);
+            }
+            return total >= 12 && hot == 0;
+        });
     });
     check("no-full-reduced", quiet && !expired());
     check("validate-dormant", validate_now("dormant"));
     const bool slept = WaitFor(std::chrono::seconds(10), [&] {
-        return sim.CollectProcessLoad().sleeping_zones >= 1;
+        return ProcessLoad(sim).sleeping_zones >= 1;
     });
     check("zone-slept", slept && !expired());
 
@@ -1832,7 +2007,7 @@ int RunActivityScenario(boost::asio::io_context& io, const BenchConfig& config)
     // inside the wake radius (reduced 50m): the zone must wake with no
     // entry, then validate.
     const float wake_x = x_edge - 40.0f; // zone A side, 40m from B's edge
-    if (sim.Zones().FindIndexForPosition(wake_x, y_mid) == zone_b) {
+    if (IndexForPosition(sim, wake_x, y_mid) == zone_b) {
         check("wake-point-outside", false);
         sim.Stop();
         return failures + 1;
@@ -1845,11 +2020,13 @@ int RunActivityScenario(boost::asio::io_context& io, const BenchConfig& config)
         sim.PostSpawn(session, MakeBenchCharacter(901), gs::game::DebugSpawnOverride{wake_x, y_mid});
     }
     const bool spawned_waker = WaitFor(std::chrono::seconds(10), [&] {
-        return sim.Owners().size() == 1;
+        return OwnerCount(sim) == 1;
     });
     check("waker-spawned", spawned_waker && !expired());
     const bool rewoke = WaitFor(std::chrono::seconds(10), [&] {
-        return sim.Zones().GetZone(zone_b).Activity() == gs::game::ZoneActivity::Active;
+        return ReadWorld(sim, [zone_b](const WorldSnapshot& snap) {
+            return snap.zones.GetZone(zone_b).Activity() == gs::game::ZoneActivity::Active;
+        });
     });
     check("predictive-wake", rewoke && !expired());
     check("validate-wake", validate_now("wake"));
@@ -1887,7 +2064,7 @@ int RunLoadFieldScenario(boost::asio::io_context& io, const BenchConfig& config)
         }
     };
 
-    gs::game::WorldRuntime sim(io);
+    gs::game::WorldRuntime sim(io, {}, gs::bench::LoadBenchTestWorld());
 
     auto validate_now = [&](const char* what) -> bool {
         sim.RequestLoadFieldValidation();
@@ -1978,7 +2155,7 @@ int RunLoadFieldScenario(boost::asio::io_context& io, const BenchConfig& config)
         sim.RequestMobSpawn(static_cast<std::size_t>(4 + k));
     }
     const bool populated = WaitFor(std::chrono::seconds(20), [&] {
-        return sim.Owners().size() == 2 && sim.CollectProcessLoad().mobs >= 5;
+        return OwnerCount(sim) == 2 && ProcessLoad(sim).mobs >= 5;
     });
     check("populate", populated && !expired());
     if (!populated) {
@@ -2096,15 +2273,15 @@ int RunLoadFieldScenario(boost::asio::io_context& io, const BenchConfig& config)
     // ---- Phase 4: §25 topology independence. Force-split the EMPTY zone 2
     // (250,750): no residents => no transfers => the field must gain no
     // migration work and must not reset while the topology changes.
-    const std::size_t zone_count_before = sim.Zones().ZoneCount();
-    const std::size_t empty_zone_index = sim.Zones().FindIndexForPosition(250.0f, 750.0f);
-    const bool empty_zone_found = empty_zone_index < sim.Zones().ZoneCount();
+    const std::size_t zone_count_before = ZoneSlots(sim);
+    const std::size_t empty_zone_index = IndexForPosition(sim, 250.0f, 750.0f);
+    const bool empty_zone_found = empty_zone_index < ZoneSlots(sim);
     check("empty-zone-found", empty_zone_found);
     if (empty_zone_found) {
-        const gs::game::ZoneId empty_zone_id = sim.Zones().GetZone(empty_zone_index).Id();
+        const gs::game::ZoneId empty_zone_id = ZoneIdAt(sim, empty_zone_index);
         sim.PostForceSplit(empty_zone_id);
         const bool split_done = WaitFor(std::chrono::seconds(10), [&] {
-            return sim.Zones().ZoneCount() == zone_count_before + 4;
+            return ZoneSlots(sim) == zone_count_before + 4;
         });
         check("empty-split-committed", split_done && !expired());
         bool no_migration_work = true;
@@ -2132,11 +2309,11 @@ int RunLoadFieldScenario(boost::asio::io_context& io, const BenchConfig& config)
 
     // ---- Phase 5: split-internal transfers ARE migration work. Force-split
     // the hotspot zone; its residents move to children and must be counted.
-    const std::size_t hotspot_zone_index = sim.Zones().FindIndexForPosition(100.0f, 100.0f);
-    const bool hotspot_zone_found = hotspot_zone_index < sim.Zones().ZoneCount();
+    const std::size_t hotspot_zone_index = IndexForPosition(sim, 100.0f, 100.0f);
+    const bool hotspot_zone_found = hotspot_zone_index < ZoneSlots(sim);
     check("hotspot-zone-found", hotspot_zone_found);
     if (hotspot_zone_found) {
-        const gs::game::ZoneId hotspot_zone_id = sim.Zones().GetZone(hotspot_zone_index).Id();
+        const gs::game::ZoneId hotspot_zone_id = ZoneIdAt(sim, hotspot_zone_index);
         sim.PostForceSplit(hotspot_zone_id);
         bool migration_seen = false;
         const auto migration_wait = std::chrono::steady_clock::now() + std::chrono::seconds(8);
@@ -2164,7 +2341,7 @@ int RunLoadFieldScenario(boost::asio::io_context& io, const BenchConfig& config)
     // short graces), then the hotspot load must fall well below its peak.
     sim.PostDespawn(kPlayer);
     sim.PostDespawn(kFarPlayer);
-    const bool drained = WaitFor(std::chrono::seconds(10), [&] { return sim.Owners().empty(); });
+    const bool drained = WaitFor(std::chrono::seconds(10), [&] { return OwnerCount(sim) == 0; });
     check("despawn-drained", drained && !expired());
     std::this_thread::sleep_for(std::chrono::seconds(4));
     const auto decay_start_grid = sim.LoadFieldSnapshot();
@@ -2817,7 +2994,7 @@ int RunPartitionScoreScenario(boost::asio::io_context& io, const BenchConfig& co
         }
     };
 
-    gs::game::WorldRuntime sim(io);
+    gs::game::WorldRuntime sim(io, {}, gs::bench::LoadBenchTestWorld());
     auto validate_now = [&](const char* what) -> bool {
         sim.RequestValidation();
         for (int i = 0; i < 100; ++i) {
@@ -2881,13 +3058,13 @@ int RunPartitionScoreScenario(boost::asio::io_context& io, const BenchConfig& co
 
     // Zone 3 is the 500x1000 East Field (500,0)-(1000,1000): its Y cut has
     // real freedom while the X cut stays clamped near the middle.
-    const std::size_t zone3_index = sim.Zones().FindIndexForPosition(750.0f, 500.0f);
-    check("zone-found", zone3_index < sim.Zones().ZoneCount());
-    if (zone3_index >= sim.Zones().ZoneCount()) {
+    const std::size_t zone3_index = IndexForPosition(sim, 750.0f, 500.0f);
+    check("zone-found", zone3_index < ZoneSlots(sim));
+    if (zone3_index >= ZoneSlots(sim)) {
         sim.Stop();
         return failures + 1;
     }
-    const gs::game::ZoneId zone3_id = sim.Zones().GetZone(zone3_index).Id();
+    const gs::game::ZoneId zone3_id = ZoneIdAt(sim, zone3_index);
 
     std::size_t next_spawn_point = 4; // after the 4 base points from mob_spawns.conf
     auto spawn_cluster = [&](gs::common::SessionId base_session,
@@ -2920,7 +3097,7 @@ int RunPartitionScoreScenario(boost::asio::io_context& io, const BenchConfig& co
     // ---- Phase A: cluster within 240m of the zone's west/south edges.
     spawn_cluster(800, 1000, 12, 60, 650.0f, 150.0f);
     const bool populated_a = WaitFor(std::chrono::seconds(25), [&] {
-        return sim.Owners().size() == 12 && sim.CollectProcessLoad().mobs >= 60;
+        return OwnerCount(sim) == 12 && ProcessLoad(sim).mobs >= 60;
     });
     check("phase-a-populate", populated_a && !expired());
     if (!populated_a) {
@@ -2928,7 +3105,7 @@ int RunPartitionScoreScenario(boost::asio::io_context& io, const BenchConfig& co
         return failures + 1;
     }
     std::this_thread::sleep_for(std::chrono::seconds(4)); // field ramp
-    const auto rec_a = sim.ScorePartition(zone3_id);
+    const auto rec_a = ScorePartitionSnap(sim, zone3_id);
     check("phase-a-scored", rec_a.valid && rec_a.zone_total_load > 0.0f);
     const float min_improvement = sim.EffectivePartitionScoringConfig().min_expected_improvement;
     check("phase-a-noop-recommended", rec_a.valid && rec_a.best.final_score < min_improvement);
@@ -2947,8 +3124,8 @@ int RunPartitionScoreScenario(boost::asio::io_context& io, const BenchConfig& co
     // epochs. The world is quiet in Phase A (NOOP), so the input is stable.
     bool deterministic = false;
     for (int attempt = 0; attempt < 40 && !deterministic; ++attempt) {
-        const auto first = sim.ScorePartition(zone3_id);
-        const auto second = sim.ScorePartition(zone3_id);
+        const auto first = ScorePartitionSnap(sim, zone3_id);
+        const auto second = ScorePartitionSnap(sim, zone3_id);
         if (first.field_epoch != second.field_epoch ||
             first.activity_epoch != second.activity_epoch) {
             std::this_thread::sleep_for(std::chrono::milliseconds(10));
@@ -2985,11 +3162,11 @@ int RunPartitionScoreScenario(boost::asio::io_context& io, const BenchConfig& co
     // load, the gate passes, and the transactional executor commits.
     spawn_cluster(900, 1100, 12, 60, 850.0f, 800.0f);
     const bool populated_b = WaitFor(std::chrono::seconds(25), [&] {
-        return sim.Owners().size() == 24 && sim.CollectProcessLoad().mobs >= 120;
+        return OwnerCount(sim) == 24 && ProcessLoad(sim).mobs >= 120;
     });
     check("phase-b-populate", populated_b && !expired());
     std::this_thread::sleep_for(std::chrono::seconds(5)); // field ramp
-    const auto rec_b = sim.ScorePartition(zone3_id);
+    const auto rec_b = ScorePartitionSnap(sim, zone3_id);
     check("phase-b-scored", rec_b.valid && rec_b.zone_total_load > rec_a.zone_total_load);
     check("phase-b-gate-pass", rec_b.valid && rec_b.best.final_score >= min_improvement);
     std::printf("PARTITIONSCORE phase-b: total=%.2f best=%s@(%.0f,%.0f) score=%.3f "
@@ -3040,12 +3217,23 @@ int RunPartitionScoreScenario(boost::asio::io_context& io, const BenchConfig& co
     float after_peak = 0.0f;
     {
         const auto field = sim.LoadFieldSnapshot();
-        for (const auto* leaf : sim.Zones().GetActiveLeaves()) {
-            const std::size_t index = sim.Zones().FindIndexById(leaf->zone_id);
-            if (index >= sim.Zones().ZoneCount()) {
-                continue;
+        struct LeafBounds {
+            gs::game::ZoneId zone_id = 0;
+            mx::map::Rect bounds{};
+        };
+        const auto leaves = ReadWorld(sim, [](const WorldSnapshot& snap) {
+            std::vector<LeafBounds> out;
+            for (const auto* leaf : snap.zones.GetActiveLeaves()) {
+                const std::size_t index = snap.zones.FindIndexById(leaf->zone_id);
+                if (index < snap.zones.ZoneCount()) {
+                    out.push_back(LeafBounds{leaf->zone_id, snap.zones.GetZone(index).Bounds()});
+                }
             }
-            const auto& bounds = sim.Zones().GetZone(index).Bounds();
+            return out;
+        });
+        for (const auto& leaf_view : leaves) {
+            const auto* leaf = &leaf_view;
+            const auto& bounds = leaf_view.bounds;
             const auto aggregate = gs::game::AggregateLoad(
                 *field,
                 gs::game::WorldBounds{bounds.min_x, bounds.min_y, bounds.max_x, bounds.max_y},
@@ -3082,7 +3270,7 @@ int RunPartitionScoreScenario(boost::asio::io_context& io, const BenchConfig& co
     for (gs::common::SessionId session = 900; session < 924; ++session) {
         sim.PostDespawn(session);
     }
-    const bool drained = WaitFor(std::chrono::seconds(20), [&] { return sim.Owners().empty(); });
+    const bool drained = WaitFor(std::chrono::seconds(20), [&] { return OwnerCount(sim) == 0; });
     check("phase-c-drained", drained && !expired());
     // Decay can legitimately trigger further splits while the smoothed field
     // is still hot; wait until it is genuinely cold before asserting quiet.
@@ -3139,7 +3327,7 @@ int RunStabilityScenario(boost::asio::io_context& io, const BenchConfig& config)
         }
     };
 
-    gs::game::WorldRuntime sim(io);
+    gs::game::WorldRuntime sim(io, {}, gs::bench::LoadBenchTestWorld());
     auto validate_now = [&](const char* what) -> bool {
         sim.RequestValidation();
         for (int i = 0; i < 100; ++i) {
@@ -3206,14 +3394,14 @@ int RunStabilityScenario(boost::asio::io_context& io, const BenchConfig& config)
         std::chrono::steady_clock::now() + std::chrono::seconds(std::max(240, config.seconds));
     auto expired = [&] { return std::chrono::steady_clock::now() >= deadline; };
 
-    const std::size_t zone3_index = sim.Zones().FindIndexForPosition(750.0f, 500.0f);
-    check("zone-found", zone3_index < sim.Zones().ZoneCount());
-    if (zone3_index >= sim.Zones().ZoneCount()) {
+    const ZoneAtPosition zone3 = ZoneForPosition(sim, 750.0f, 500.0f);
+    check("zone-found", zone3.found());
+    if (!zone3.found()) {
         sim.Stop();
         return failures + 1;
     }
-    const gs::game::ZoneId zone3_id = sim.Zones().GetZone(zone3_index).Id();
-    const mx::map::Rect zone3_bounds = sim.Zones().GetZone(zone3_index).Bounds();
+    const gs::game::ZoneId zone3_id = zone3.id;
+    const mx::map::Rect zone3_bounds = zone3.bounds;
 
     std::size_t next_spawn_point = 4;
     auto spawn_cluster = [&](gs::common::SessionId base_session,
@@ -3247,23 +3435,32 @@ int RunStabilityScenario(boost::asio::io_context& io, const BenchConfig& config)
             sim.PostDespawn(static_cast<gs::common::SessionId>(base_session + i));
         }
     };
+    struct LeafView {
+        gs::game::ZoneId zone_id = 0;
+        mx::map::Rect bounds{};
+    };
+    // Copies (tree order), never partition-node pointers (MAP-0).
     auto group_children = [&](gs::game::ZoneId parent_id) {
-        std::vector<const gs::game::ZonePartition*> children;
-        for (const auto* leaf : sim.Zones().GetActiveLeaves()) {
-            if (leaf->parent != nullptr && leaf->parent->zone_id == parent_id) {
-                children.push_back(leaf);
+        return ReadWorld(sim, [parent_id](const WorldSnapshot& snap) {
+            std::vector<LeafView> children;
+            for (const auto* leaf : snap.zones.GetActiveLeaves()) {
+                if (leaf->parent != nullptr && leaf->parent->zone_id == parent_id) {
+                    children.push_back(LeafView{leaf->zone_id, leaf->bounds});
+                }
             }
-        }
-        return children;
+            return children;
+        });
     };
     auto find_leaf_with_bounds = [&](const mx::map::Rect& bounds) -> gs::game::ZoneId {
-        for (const auto* leaf : sim.Zones().GetActiveLeaves()) {
-            if (leaf->bounds.min_x == bounds.min_x && leaf->bounds.min_y == bounds.min_y &&
-                leaf->bounds.max_x == bounds.max_x && leaf->bounds.max_y == bounds.max_y) {
-                return leaf->zone_id;
+        return ReadWorld(sim, [bounds](const WorldSnapshot& snap) -> gs::game::ZoneId {
+            for (const auto* leaf : snap.zones.GetActiveLeaves()) {
+                if (leaf->bounds.min_x == bounds.min_x && leaf->bounds.min_y == bounds.min_y &&
+                    leaf->bounds.max_x == bounds.max_x && leaf->bounds.max_y == bounds.max_y) {
+                    return leaf->zone_id;
+                }
             }
-        }
-        return 0;
+            return 0;
+        });
     };
 
     // ---- Phase A: two player-only clusters make a split genuinely
@@ -3273,7 +3470,7 @@ int RunStabilityScenario(boost::asio::io_context& io, const BenchConfig& config)
     spawn_cluster(600, 2000, 16, 0, 650.0f, 150.0f);
     spawn_cluster(616, 2020, 16, 0, 850.0f, 800.0f);
     const bool populated_a = WaitFor(std::chrono::seconds(25), [&] {
-        return sim.Owners().size() == 32;
+        return OwnerCount(sim) == 32;
     });
     check("phase-a-populate", populated_a && !expired());
     if (!populated_a) {
@@ -3296,10 +3493,10 @@ int RunStabilityScenario(boost::asio::io_context& io, const BenchConfig& config)
     // map's blocked square (x 720..822, y 240..342) and wall (y 490..496 at
     // x 360..642): X-cut players sit at y=600, Y-cut players at x=660.
     despawn_range(600, 32);
-    const bool drained_a = WaitFor(std::chrono::seconds(15), [&] { return sim.Owners().empty(); });
+    const bool drained_a = WaitFor(std::chrono::seconds(15), [&] { return OwnerCount(sim) == 0; });
     check("phase-b-drained", drained_a && !expired());
-    const float cut_x = children_a[0]->bounds.max_x; // NW east edge
-    const float cut_y = children_a[0]->bounds.min_y; // NW south edge
+    const float cut_x = children_a[0].bounds.max_x; // NW east edge
+    const float cut_y = children_a[0].bounds.min_y; // NW south edge
     const float boundary_positions[4][2] = {{cut_x - 20.0f, 600.0f},
                                             {cut_x + 20.0f, 600.0f},
                                             {660.0f, cut_y - 20.0f},
@@ -3314,7 +3511,7 @@ int RunStabilityScenario(boost::asio::io_context& io, const BenchConfig& config)
                                                    boundary_positions[i][1]});
     }
     const bool populated_b = WaitFor(std::chrono::seconds(15), [&] {
-        return sim.Owners().size() == 4;
+        return OwnerCount(sim) == 4;
     });
     check("phase-b-populate", populated_b && !expired());
     // The group must be genuinely low on BOTH field timescales (conservative
@@ -3322,23 +3519,23 @@ int RunStabilityScenario(boost::asio::io_context& io, const BenchConfig& config)
     // boundary load has settled well below the ceiling so the risk term is
     // small -- the same conservatism the production defaults enforce.
     const bool group_low = WaitFor(std::chrono::seconds(90), [&] {
-        const auto rec = sim.ScoreMerge(zone3_id);
+        const auto rec = ScoreMergeSnap(sim, zone3_id);
         return rec.valid && rec.best.safety_ok && rec.best.predicted_parent_load < 0.15f;
     });
     check("phase-b-group-low", group_low && !expired());
-    const auto merge_rec = sim.ScoreMerge(zone3_id);
+    const auto merge_rec = ScoreMergeSnap(sim, zone3_id);
     check("phase-b-merge-scored", merge_rec.valid && merge_rec.best.activity_band > 0.0f);
     // The gate passes once the residual boundary load has settled and the
     // split's instability penalty has decayed -- exactly what the production
     // controller waits for.
     const bool gate_ready = WaitFor(std::chrono::seconds(60), [&] {
-        const auto rec = sim.ScoreMerge(zone3_id);
+        const auto rec = ScoreMergeSnap(sim, zone3_id);
         return rec.valid && rec.best.safety_ok &&
                rec.best.final_score >=
                    sim.EffectivePartitionScoringConfig().min_merge_improvement;
     });
     check("phase-b-merge-gate", gate_ready && !expired());
-    const auto gate_rec = sim.ScoreMerge(zone3_id);
+    const auto gate_rec = ScoreMergeSnap(sim, zone3_id);
     std::printf("STABILITY phase-b merge: score=%.3f predicted=%.3f ceiling=%.2f "
                 "topology=%.2f boundary=%.2f activity=%.2f migration=%.2f exec=%.3f risk=%.3f "
                 "instability=%.3f\n",
@@ -3376,7 +3573,7 @@ int RunStabilityScenario(boost::asio::io_context& io, const BenchConfig& config)
     spawn_cluster(660, 2200, 16, 0, 600.0f, 150.0f);
     spawn_cluster(676, 2220, 16, 0, 875.0f, 800.0f);
     const bool populated_c = WaitFor(std::chrono::seconds(20), [&] {
-        return sim.Owners().size() == 36;
+        return OwnerCount(sim) == 36;
     });
     check("phase-c-populate", populated_c && !expired());
     const bool suppressed = WaitFor(std::chrono::seconds(8), [&] {
@@ -3407,13 +3604,13 @@ int RunStabilityScenario(boost::asio::io_context& io, const BenchConfig& config)
     }
     // Pick the child farthest from the current hotspot (600,150): the NE
     // child in tree order (NW, NE, SW, SE) is children_c[1].
-    const auto& target = children_c[1]->bounds;
+    const auto& target = children_c[1].bounds;
     const float target_x = (target.min_x + target.max_x) * 0.5f;
     const float target_y = (target.min_y + target.max_y) * 0.5f;
     despawn_range(660, 32);
     spawn_cluster(700, 2300, 12, 0, target_x, target_y);
     const bool populated_d = WaitFor(std::chrono::seconds(20), [&] {
-        return sim.Owners().size() == 16;
+        return OwnerCount(sim) == 16;
     });
     check("phase-d-populate", populated_d && !expired());
     std::this_thread::sleep_for(std::chrono::seconds(8));
@@ -3469,7 +3666,7 @@ int RunGhostScenario(boost::asio::io_context& io, const BenchConfig& config)
         }
     };
 
-    gs::game::WorldRuntime sim(io);
+    gs::game::WorldRuntime sim(io, {}, gs::bench::LoadBenchTestWorld());
     auto validate_now = [&](const char* what) -> bool {
         sim.RequestValidation();
         for (int i = 0; i < 100; ++i) {
@@ -3507,36 +3704,52 @@ int RunGhostScenario(boost::asio::io_context& io, const BenchConfig& config)
         return false;
     };
     // Net id of a static resident at an exact position (deterministic).
-    auto find_net_at = [&](const gs::game::Zone& zone, float x, float y) -> std::uint32_t {
-        for (const auto& [net_id, entity] : zone.Entities()) {
-            if (!entity.is_valid() || !entity.has<gs::game::Position>()) {
-                continue;
+    // Snapshot helpers (MAP-0): entity positions and ghost records live in
+    // the zones, so they are only read inside a supervisor capture.
+    auto find_net_at = [&](std::size_t zone_index, float x, float y) -> std::uint32_t {
+        return ReadWorld(sim, [zone_index, x, y](const WorldSnapshot& snap) -> std::uint32_t {
+            if (zone_index >= snap.zones.ZoneCount()) {
+                return 0;
             }
-            const auto pos = entity.get<gs::game::Position>();
-            if (pos.x == x && pos.y == y) {
-                return net_id;
+            for (const auto& [net_id, entity] : snap.zones.GetZone(zone_index).Entities()) {
+                if (!entity.is_valid() || !entity.has<gs::game::Position>()) {
+                    continue;
+                }
+                const auto pos = entity.get<gs::game::Position>();
+                if (pos.x == x && pos.y == y) {
+                    return net_id;
+                }
             }
-        }
-        return 0;
+            return 0;
+        });
+    };
+    struct GhostView {
+        bool present = false;
+        gs::game::ZoneId source = 0;
+        float x = 0.0f;
+    };
+    auto ghost_in = [&](std::size_t zone_index, std::uint32_t net_id) {
+        return ReadWorld(sim, [zone_index, net_id](const WorldSnapshot& snap) {
+            GhostView out;
+            if (zone_index < snap.zones.ZoneCount()) {
+                if (const auto* ghost = snap.zones.GetZone(zone_index).FindGhost(net_id)) {
+                    out = GhostView{true, ghost->source_zone_id, ghost->snapshot.position.x};
+                }
+            }
+            return out;
+        });
     };
     // Count ghost copies of a net across every zone (must be 0 or 1).
     auto ghost_copies = [&](std::uint32_t net_id) {
-        int copies = 0;
-        for (std::size_t i = 0; i < sim.Zones().ZoneCount(); ++i) {
-            if (sim.Zones().GetZone(i).FindGhost(net_id) != nullptr) {
-                ++copies;
+        return ReadWorld(sim, [net_id](const WorldSnapshot& snap) {
+            int copies = 0;
+            for (std::size_t i = 0; i < snap.zones.ZoneCount(); ++i) {
+                if (snap.zones.GetZone(i).FindGhost(net_id) != nullptr) {
+                    ++copies;
+                }
             }
-        }
-        return copies;
-    };
-    auto ghost_source = [&](std::uint32_t net_id) -> std::uint32_t {
-        for (std::size_t i = 0; i < sim.Zones().ZoneCount(); ++i) {
-            const auto* ghost = sim.Zones().GetZone(i).FindGhost(net_id);
-            if (ghost != nullptr) {
-                return ghost->source_zone_id;
-            }
-        }
-        return 0;
+            return copies;
+        });
     };
 
     const auto deadline =
@@ -3552,17 +3765,17 @@ int RunGhostScenario(boost::asio::io_context& io, const BenchConfig& config)
     sim.Start();
 
     // ---- Phase 1: cross-zone ghosts (player in zone A, mobs in zone B).
-    const std::size_t zone_a_index = sim.Zones().FindIndexForPosition(100.0f, 100.0f);
-    const std::size_t zone_b_index = sim.Zones().FindIndexForPosition(800.0f, 100.0f);
-    check("zone-pair", zone_a_index < sim.Zones().ZoneCount() &&
-                           zone_b_index < sim.Zones().ZoneCount() &&
+    const std::size_t zone_a_index = IndexForPosition(sim, 100.0f, 100.0f);
+    const std::size_t zone_b_index = IndexForPosition(sim, 800.0f, 100.0f);
+    check("zone-pair", zone_a_index < ZoneSlots(sim) &&
+                           zone_b_index < ZoneSlots(sim) &&
                            zone_a_index != zone_b_index);
-    if (zone_a_index >= sim.Zones().ZoneCount() || zone_b_index >= sim.Zones().ZoneCount()) {
+    if (zone_a_index >= ZoneSlots(sim) || zone_b_index >= ZoneSlots(sim)) {
         sim.Stop();
         return failures + 1;
     }
-    const gs::game::ZoneId zone_a_id = sim.Zones().GetZone(zone_a_index).Id();
-    const gs::game::ZoneId zone_b_id = sim.Zones().GetZone(zone_b_index).Id();
+    const gs::game::ZoneId zone_a_id = ZoneIdAt(sim, zone_a_index);
+    const gs::game::ZoneId zone_b_id = ZoneIdAt(sim, zone_b_index);
 
     constexpr float kBoundaryX = 500.0f;
     constexpr float kPlayerY = 250.0f;
@@ -3605,7 +3818,7 @@ int RunGhostScenario(boost::asio::io_context& io, const BenchConfig& config)
         sim.RequestMobSpawn(static_cast<std::size_t>(4 + i));
     }
     const bool populated = WaitFor(std::chrono::seconds(20), [&] {
-        return sim.Owners().size() == 3 && sim.CollectProcessLoad().mobs >= 4;
+        return OwnerCount(sim) == 3 && ProcessLoad(sim).mobs >= 4;
     });
     check("populate", populated && !expired());
     if (!populated) {
@@ -3614,20 +3827,18 @@ int RunGhostScenario(boost::asio::io_context& io, const BenchConfig& config)
     }
     std::this_thread::sleep_for(std::chrono::seconds(2)); // publish + reconcile settle
 
-    const auto owner_it = sim.Owners().find(kPlayer);
-    check("player-owner", owner_it != sim.Owners().end());
-    if (owner_it == sim.Owners().end()) {
+    const OwnerView player_owner = FindOwner(sim, kPlayer);
+    check("player-owner", player_owner.found);
+    if (!player_owner.found) {
         sim.Stop();
         return failures + 1;
     }
-    const std::uint32_t player_net = owner_it->second.net_id;
-    const const gs::game::Zone& zone_a = sim.Zones().GetZone(zone_a_index);
-    const const gs::game::Zone& zone_b = sim.Zones().GetZone(zone_b_index);
+    const std::uint32_t player_net = player_owner.net_id;
     const std::uint32_t mob_nets[4] = {
-        find_net_at(zone_b, mob_x, kPlayerY - 6.0f),
-        find_net_at(zone_b, mob_x, kPlayerY - 2.0f),
-        find_net_at(zone_b, mob_x, kPlayerY + 2.0f),
-        find_net_at(zone_b, mob_x, kPlayerY + 6.0f)};
+        find_net_at(zone_b_index, mob_x, kPlayerY - 6.0f),
+        find_net_at(zone_b_index, mob_x, kPlayerY - 2.0f),
+        find_net_at(zone_b_index, mob_x, kPlayerY + 2.0f),
+        find_net_at(zone_b_index, mob_x, kPlayerY + 6.0f)};
     bool mobs_found = true;
     for (const auto net : mob_nets) {
         mobs_found = mobs_found && net != 0;
@@ -3637,19 +3848,23 @@ int RunGhostScenario(boost::asio::io_context& io, const BenchConfig& config)
     // Zone A must ghost the zone-B mobs; zone B must ghost the zone-A player.
     bool a_ghosts_mobs = mobs_found;
     for (const auto net : mob_nets) {
-        const auto* ghost = zone_a.FindGhost(net);
-        a_ghosts_mobs = a_ghosts_mobs && ghost != nullptr &&
-                        ghost->source_zone_id == zone_b_id &&
-                        ghost->snapshot.position.x == mob_x;
+        const GhostView ghost = ghost_in(zone_a_index, net);
+        a_ghosts_mobs = a_ghosts_mobs && ghost.present && ghost.source == zone_b_id &&
+                        ghost.x == mob_x;
     }
-    const auto* player_ghost_b = zone_b.FindGhost(player_net);
-    check("cross-zone-ghosts", a_ghosts_mobs && player_ghost_b != nullptr &&
-                                   player_ghost_b->source_zone_id == zone_a_id);
+    const GhostView player_ghost_b = ghost_in(zone_b_index, player_net);
+    check("cross-zone-ghosts", a_ghosts_mobs && player_ghost_b.present &&
+                                   player_ghost_b.source == zone_a_id);
     check("equivalence-initial", ghost_equivalence("initial"));
     check("validate-initial", validate_now("initial"));
+    const auto ghost_counts = ReadWorld(sim, [&](const WorldSnapshot& snap) {
+        return std::pair<std::size_t, std::size_t>{
+            snap.zones.GetZone(zone_a_index).Ghosts().size(),
+            snap.zones.GetZone(zone_b_index).Ghosts().size()};
+    });
     std::printf("GHOST metrics: zone_a_ghosts=%zu zone_b_ghosts=%zu copies=%d\n",
-                zone_a.Ghosts().size(),
-                zone_b.Ghosts().size(),
+                ghost_counts.first,
+                ghost_counts.second,
                 ghost_copies(player_net));
 
     // ---- Phase 2: migration across the boundary. During the crossing the
@@ -3671,22 +3886,22 @@ int RunGhostScenario(boost::asio::io_context& io, const BenchConfig& config)
     check("migration-no-duplicate", crossing_ok && max_copies <= 1);
     // The player must now be authoritative in B and ghosted in A.
     const auto crossed = WaitFor(std::chrono::seconds(10), [&] {
-        const auto it = sim.Owners().find(kPlayer);
-        return it != sim.Owners().end() && it->second.zone_index == zone_b_index;
+        const OwnerView owner = FindOwner(sim, kPlayer);
+        return owner.found && owner.zone_index == zone_b_index;
     });
     check("migrated", crossed && !expired());
     std::this_thread::sleep_for(std::chrono::seconds(2));
-    const auto* player_ghost_a = zone_a.FindGhost(player_net);
-    check("migrated-ghost-source", player_ghost_a != nullptr &&
-                                      player_ghost_a->source_zone_id == zone_b_id &&
-                                      zone_b.FindGhost(player_net) == nullptr);
+    const GhostView player_ghost_a = ghost_in(zone_a_index, player_net);
+    check("migrated-ghost-source", player_ghost_a.present &&
+                                      player_ghost_a.source == zone_b_id &&
+                                      !ghost_in(zone_b_index, player_net).present);
     check("equivalence-migrated", ghost_equivalence("migrated"));
     check("validate-migrated", validate_now("migrated"));
 
     // ---- Phase 3: despawn cleanup. No stale ghost may survive.
     sim.PostDespawn(kPlayer);
     const bool drained = WaitFor(std::chrono::seconds(10), [&] {
-        return sim.Owners().size() == 2; // both stationary viewers stay
+        return OwnerCount(sim) == 2; // both stationary viewers stay
     });
     check("despawn-drained", drained && !expired());
     const bool ghosts_gone = WaitFor(std::chrono::seconds(3), [&] {
@@ -3697,10 +3912,10 @@ int RunGhostScenario(boost::asio::io_context& io, const BenchConfig& config)
 
     // ---- Phase 4: topology invalidation (split + merge). The neighbor sets
     // change; ghosts from former neighbors must be dropped deterministically.
-    const std::size_t zones_before = sim.Zones().ZoneCount();
+    const std::size_t zones_before = ZoneSlots(sim);
     sim.PostForceSplit(zone_a_id);
     const bool split_done = WaitFor(std::chrono::seconds(15), [&] {
-        return sim.Zones().ZoneCount() == zones_before + 4;
+        return ZoneSlots(sim) == zones_before + 4;
     });
     check("split-committed", split_done && !expired());
     std::this_thread::sleep_for(std::chrono::seconds(1));
@@ -3761,7 +3976,7 @@ int RunAoiReplicationScenario(boost::asio::io_context& io,
         }
     };
 
-    gs::game::WorldRuntime sim(io);
+    gs::game::WorldRuntime sim(io, {}, gs::bench::LoadBenchTestWorld());
     // Long refresh period: the "clean -> suppressed" window must be
     // observable, and the staggered refresh must not interfere with the
     // dirty assertions. Production default is 20 ticks (1 s).
@@ -3879,7 +4094,7 @@ int RunAoiReplicationScenario(boost::asio::io_context& io,
     }
 
     const bool populated = WaitFor(std::chrono::seconds(25), [&] {
-        return sim.Owners().size() == 4 && sim.CollectProcessLoad().mobs >= 3;
+        return OwnerCount(sim) == 4 && ProcessLoad(sim).mobs >= 3;
     });
     check("populate", populated && !expired());
     if (!populated) {
@@ -3888,80 +4103,70 @@ int RunAoiReplicationScenario(boost::asio::io_context& io,
     }
     std::this_thread::sleep_for(std::chrono::seconds(2)); // publish + reconcile settle
 
-    auto net_of = [&](gs::common::SessionId session) -> std::uint32_t {
-        const auto it = sim.Owners().find(session);
-        return it != sim.Owners().end() ? it->second.net_id : 0;
+    // A recipient's binding, copied out of one supervisor snapshot (MAP-0):
+    // sorted visible set + lifecycle counters (they travel with the binding
+    // across topology changes): {spawns, despawns, updates, suppressed}.
+    struct RecipientView {
+        bool bound = false;
+        std::vector<std::uint32_t> visible;
+        std::array<std::uint64_t, 4> events{0, 0, 0, 0};
     };
-    auto zone_of = [&](gs::common::SessionId session) -> const gs::game::Zone* {
-        const auto it = sim.Owners().find(session);
-        if (it == sim.Owners().end() || it->second.zone_index >= sim.Zones().ZoneCount()) {
-            return nullptr;
-        }
-        return &sim.Zones().GetZone(it->second.zone_index);
+    auto recipient = [&](gs::common::SessionId session) {
+        return ReadWorld(sim, [session](const WorldSnapshot& snap) {
+            RecipientView out;
+            const auto it = snap.owners.find(session);
+            if (it == snap.owners.end() || it->second.zone_index >= snap.zones.ZoneCount()) {
+                return out;
+            }
+            const auto* binding =
+                snap.zones.GetZone(it->second.zone_index).FindPlayer(it->second.net_id);
+            if (binding == nullptr) {
+                return out;
+            }
+            out.bound = true;
+            out.visible.reserve(binding->visible_net_versions.size());
+            for (const auto& [net_id, version] : binding->visible_net_versions) {
+                (void)version;
+                out.visible.push_back(net_id);
+            }
+            std::sort(out.visible.begin(), out.visible.end());
+            out.events[0] = binding->spawn_events;
+            out.events[1] = binding->despawn_events;
+            out.events[2] = binding->update_events;
+            out.events[3] = binding->suppressed_events;
+            return out;
+        });
+    };
+    auto net_of = [&](gs::common::SessionId session) -> std::uint32_t {
+        return FindOwner(sim, session).net_id;
     };
     auto visible = [&](gs::common::SessionId session, std::uint32_t net_id) -> bool {
-        const gs::game::Zone* zone = zone_of(session);
-        if (zone == nullptr) {
-            return false;
-        }
-        const auto* binding = zone->FindPlayer(net_of(session));
-        return binding != nullptr && binding->IsVisible(net_id);
+        const RecipientView view = recipient(session);
+        return view.bound && std::binary_search(view.visible.begin(), view.visible.end(), net_id);
     };
     auto visible_count = [&](gs::common::SessionId session) -> std::size_t {
-        const gs::game::Zone* zone = zone_of(session);
-        if (zone == nullptr) {
+        return recipient(session).visible.size();
+    };
+    auto visible_set = [&](gs::common::SessionId session) { return recipient(session).visible; };
+    auto find_net_at = [&](std::size_t zone_index, float x, float y) -> std::uint32_t {
+        return ReadWorld(sim, [zone_index, x, y](const WorldSnapshot& snap) -> std::uint32_t {
+            if (zone_index >= snap.zones.ZoneCount()) {
+                return 0;
+            }
+            for (const auto& [net_id, entity] : snap.zones.GetZone(zone_index).Entities()) {
+                if (!entity.is_valid() || !entity.has<gs::game::Position>()) {
+                    continue;
+                }
+                const auto pos = entity.get<gs::game::Position>();
+                if (pos.x == x && pos.y == y) {
+                    return net_id;
+                }
+            }
             return 0;
-        }
-        const auto* binding = zone->FindPlayer(net_of(session));
-        return binding != nullptr ? binding->visible_net_versions.size() : 0;
+        });
     };
-    auto visible_set = [&](gs::common::SessionId session) {
-        std::vector<std::uint32_t> nets;
-        const gs::game::Zone* zone = zone_of(session);
-        if (zone == nullptr) {
-            return nets;
-        }
-        const auto* binding = zone->FindPlayer(net_of(session));
-        if (binding == nullptr) {
-            return nets;
-        }
-        nets.reserve(binding->visible_net_versions.size());
-        for (const auto& [net_id, version] : binding->visible_net_versions) {
-            (void)version;
-            nets.push_back(net_id);
-        }
-        std::sort(nets.begin(), nets.end());
-        return nets;
-    };
-    auto find_net_at = [&](const gs::game::Zone& zone, float x, float y) -> std::uint32_t {
-        for (const auto& [net_id, entity] : zone.Entities()) {
-            if (!entity.is_valid() || !entity.has<gs::game::Position>()) {
-                continue;
-            }
-            const auto pos = entity.get<gs::game::Position>();
-            if (pos.x == x && pos.y == y) {
-                return net_id;
-            }
-        }
-        return 0;
-    };
-    // Recipient-level lifecycle counters (travel with the binding across
-    // topology changes): {spawns, despawns, updates}.
     auto recipient_events = [&](gs::common::SessionId session) {
-        std::array<std::uint64_t, 4> events{0, 0, 0, 0};
-        const gs::game::Zone* zone = zone_of(session);
-        if (zone == nullptr) {
-            return events;
-        }
-        const auto* binding = zone->FindPlayer(net_of(session));
-        if (binding == nullptr) {
-            return events;
-        }
-        events[0] = binding->spawn_events;
-        events[1] = binding->despawn_events;
-        events[2] = binding->update_events;
-        events[3] = binding->suppressed_events;
-        return events;
+        return recipient(session).events;
     };
 
     const std::uint32_t v1_net = net_of(kV1);
@@ -3972,14 +4177,12 @@ int RunAoiReplicationScenario(boost::asio::io_context& io,
         sim.Stop();
         return failures + 1;
     }
-    const std::size_t zone_a_index = sim.Zones().FindIndexForPosition(kViewerX, kViewerY);
-    const std::size_t zone_b_index = sim.Zones().FindIndexForPosition(kPCrossX, kViewerY);
-    const gs::game::ZoneId zone_a_id = sim.Zones().GetZone(zone_a_index).Id();
-    const gs::game::Zone& zone_a = sim.Zones().GetZone(zone_a_index);
-    const gs::game::Zone& zone_b = sim.Zones().GetZone(zone_b_index);
-    const std::uint32_t m_in_net = find_net_at(zone_a, kMobInX, kViewerY);
-    const std::uint32_t m_cross_net = find_net_at(zone_b, kMobCrossX, kViewerY);
-    const std::uint32_t m_out_net = find_net_at(zone_b, kMobOutX, kViewerY);
+    const std::size_t zone_a_index = IndexForPosition(sim, kViewerX, kViewerY);
+    const std::size_t zone_b_index = IndexForPosition(sim, kPCrossX, kViewerY);
+    const gs::game::ZoneId zone_a_id = ZoneIdAt(sim, zone_a_index);
+    const std::uint32_t m_in_net = find_net_at(zone_a_index, kMobInX, kViewerY);
+    const std::uint32_t m_cross_net = find_net_at(zone_b_index, kMobCrossX, kViewerY);
+    const std::uint32_t m_out_net = find_net_at(zone_b_index, kMobOutX, kViewerY);
     check("static-mobs-resolved", m_in_net != 0 && m_cross_net != 0 && m_out_net != 0);
 
     // ---- AOI exact semantics -------------------------------------------
@@ -4025,7 +4228,7 @@ int RunAoiReplicationScenario(boost::asio::io_context& io,
     check("spawn-inside-visible", p3_visible && !expired());
     sim.PostDespawn(kP3);
     const bool p3_gone = WaitFor(std::chrono::seconds(10), [&] {
-        return sim.Owners().find(kP3) == sim.Owners().end();
+        return !FindOwner(sim, kP3).found;
     });
     std::this_thread::sleep_for(std::chrono::milliseconds(300));
     check("despawn-inside-removed", p3_gone && !visible(kV1, net_of(kP3) == 0 ? 0 : net_of(kP3)));
@@ -4100,7 +4303,7 @@ int RunAoiReplicationScenario(boost::asio::io_context& io,
     // ---- dirty transform + despawn -> no stale interest ------------------
     sim.PostDespawn(kP4);
     const bool p4_gone = WaitFor(std::chrono::seconds(10), [&] {
-        return sim.Owners().find(kP4) == sim.Owners().end();
+        return !FindOwner(sim, kP4).found;
     });
     std::this_thread::sleep_for(std::chrono::milliseconds(300));
     check("dirty-despawn-clean", p4_gone && shadow_now("dirty-despawn"));
@@ -4113,8 +4316,8 @@ int RunAoiReplicationScenario(boost::asio::io_context& io,
     bool p_cross_migrated = false;
     while (std::chrono::steady_clock::now() < mig_deadline && !p_cross_migrated && !expired()) {
         sim.PostMoveInput(kPCross, ++seq, -1.5707963f, gs::game::MoveState::Walking);
-        const auto owner = sim.Owners().find(kPCross);
-        if (owner != sim.Owners().end() && owner->second.zone_index == zone_a_index) {
+        const OwnerView owner = FindOwner(sim, kPCross);
+        if (owner.found && owner.zone_index == zone_a_index) {
             p_cross_migrated = true;
         }
         std::this_thread::sleep_for(std::chrono::milliseconds(100));
@@ -4141,10 +4344,10 @@ int RunAoiReplicationScenario(boost::asio::io_context& io,
     // ---- split / merge: visibility must not change with topology ---------
     const auto set_before_split = visible_set(kV1);
     const auto split_events_before = recipient_events(kV1);
-    const std::size_t zones_before = sim.Zones().ZoneCount();
+    const std::size_t zones_before = ZoneSlots(sim);
     sim.PostForceSplit(zone_a_id);
     const bool split_done = WaitFor(std::chrono::seconds(20), [&] {
-        return sim.Zones().ZoneCount() == zones_before + 4;
+        return ZoneSlots(sim) == zones_before + 4;
     });
     std::this_thread::sleep_for(std::chrono::seconds(1));
     const auto set_after_split = visible_set(kV1);
@@ -4310,7 +4513,7 @@ int RunSchedulerScenario(boost::asio::io_context& io, const BenchConfig& config)
         }
         sim.Start();
         const auto populated = WaitFor(std::chrono::seconds(20), [&] {
-            return sim.Owners().size() == zx * zy;
+            return OwnerCount(sim) == zx * zy;
         });
         if (!populated) {
             sim.Stop();
@@ -4322,7 +4525,7 @@ int RunSchedulerScenario(boost::asio::io_context& io, const BenchConfig& config)
         const auto after = sim.SchedulerStats();
 
         StepResult result;
-        result.zones = sim.Zones().ZoneCount();
+        result.zones = ZoneSlots(sim);
         result.workers = after.workers;
         const std::uint64_t work = after.worker_work_micros - before.worker_work_micros;
         // Effective parallelism: average number of busy workers over the
@@ -4347,13 +4550,16 @@ int RunSchedulerScenario(boost::asio::io_context& io, const BenchConfig& config)
         result.enqueued = after.enqueued - before.enqueued;
         result.cas_failures = after.cas_failures - before.cas_failures;
         // Tick percentiles from the per-zone rings.
-        std::vector<std::uint64_t> samples;
-        std::vector<std::uint64_t> scratch(256, 0u);
-        for (std::size_t i = 0; i < sim.Zones().ZoneCount(); ++i) {
-            const auto& diag = sim.Zones().GetZone(i).Diagnostics();
-            const std::size_t count = diag.CopyTickSamples(scratch.data(), scratch.size());
-            samples.insert(samples.end(), scratch.begin(), scratch.begin() + count);
-        }
+        std::vector<std::uint64_t> samples = ReadWorld(sim, [](const WorldSnapshot& snap) {
+            std::vector<std::uint64_t> out;
+            std::vector<std::uint64_t> scratch(256, 0u);
+            for (std::size_t i = 0; i < snap.zones.ZoneCount(); ++i) {
+                const auto& diag = snap.zones.GetZone(i).Diagnostics();
+                const std::size_t count = diag.CopyTickSamples(scratch.data(), scratch.size());
+                out.insert(out.end(), scratch.begin(), scratch.begin() + count);
+            }
+            return out;
+        });
         if (!samples.empty()) {
             double sum = 0.0;
             for (const auto s : samples) {
@@ -4435,7 +4641,7 @@ int RunSchedulerScenario(boost::asio::io_context& io, const BenchConfig& config)
                               (static_cast<float>(zi / 4) + 0.5f) * zone_w});
         }
         sim.Start();
-        WaitFor(std::chrono::seconds(20), [&] { return sim.Owners().size() == 16; });
+        WaitFor(std::chrono::seconds(20), [&] { return OwnerCount(sim) == 16; });
         std::this_thread::sleep_for(std::chrono::seconds(2));
         auto hot_stats = [&]() {
             const auto s = sim.SchedulerStats();
@@ -4452,18 +4658,18 @@ int RunSchedulerScenario(boost::asio::io_context& io, const BenchConfig& config)
                 avg_w > 0.0 ? static_cast<double>(max_w) / avg_w : 0.0, max_w};
         };
         const auto [imb0, max0] = hot_stats();
-        const std::size_t zones0 = sim.Zones().ZoneCount();
-        const std::size_t hot_index = sim.Zones().FindIndexForPosition(0.5f * zone_w, 0.5f * zone_w);
-        const gs::game::ZoneId hot_id = sim.Zones().GetZone(hot_index).Id();
+        const std::size_t zones0 = ZoneSlots(sim);
+        const std::size_t hot_index = IndexForPosition(sim, 0.5f * zone_w, 0.5f * zone_w);
+        const gs::game::ZoneId hot_id = ZoneIdAt(sim, hot_index);
         sim.PostForceSplit(hot_id);
-        WaitFor(std::chrono::seconds(20), [&] { return sim.Zones().ZoneCount() == zones0 + 4; });
+        WaitFor(std::chrono::seconds(20), [&] { return ZoneSlots(sim) == zones0 + 4; });
         std::this_thread::sleep_for(std::chrono::seconds(3));
         const auto [imb1, max1] = hot_stats();
         // Force-split one child again -> 16 leaves in the hot area.
-        const std::size_t child_index = sim.Zones().FindIndexForPosition(0.25f * zone_w, 0.25f * zone_w);
-        const gs::game::ZoneId child_id = sim.Zones().GetZone(child_index).Id();
+        const std::size_t child_index = IndexForPosition(sim, 0.25f * zone_w, 0.25f * zone_w);
+        const gs::game::ZoneId child_id = ZoneIdAt(sim, child_index);
         sim.PostForceSplit(child_id);
-        WaitFor(std::chrono::seconds(20), [&] { return sim.Zones().ZoneCount() == zones0 + 8; });
+        WaitFor(std::chrono::seconds(20), [&] { return ZoneSlots(sim) == zones0 + 8; });
         std::this_thread::sleep_for(std::chrono::seconds(3));
         const auto [imb2, max2] = hot_stats();
         std::printf("SCHED hot-split: zones=%zu->%zu->%zu imbalance=%.2f->%.2f->%.2f "
@@ -4480,7 +4686,7 @@ int RunSchedulerScenario(boost::asio::io_context& io, const BenchConfig& config)
         // The split must add workers to the hot work: the busiest worker's
         // accumulated work must grow slower than before (the hot zone's work
         // is now shared), i.e. the per-second growth must drop.
-        check("hot-split-committed", sim.Zones().ZoneCount() == zones0 + 8);
+        check("hot-split-committed", ZoneSlots(sim) == zones0 + 8);
         check("hot-split-parallelism", imb1 > 0.0 && imb2 > 0.0);
         sim.Stop();
     }
@@ -4709,6 +4915,20 @@ int BenchMain(int argc, char** argv)
         std::printf("BENCH-DONE reclamation failures=%d\n", scenario_failures);
         return scenario_failures == 0 ? 0 : 2;
     }
+    if (config.mode == "worldpackage") {
+        // MAP-1: world package corpus (+ --fixtures-out for the startup acceptance).
+        const int scenario_failures = gs::bench::RunWorldPackageScenario(config.fixtures_out);
+        std::printf("BENCH-DONE worldpackage failures=%d\n", scenario_failures);
+        return scenario_failures == 0 ? 0 : 2;
+    }
+    if (config.mode == "snapshot") {
+        // MAP-0: bench snapshot consistency under split/merge/reclaim churn
+        // (--cycles N, default 100).
+        const int scenario_failures =
+            gs::bench::RunSnapshotConsistencyScenario(config.reclaim_cycles);
+        std::printf("BENCH-DONE snapshot failures=%d\n", scenario_failures);
+        return scenario_failures == 0 ? 0 : 2;
+    }
 
     if (config.mode == "workerpool") {
         // Hardening H6: worker pool sizing revalidation.
@@ -4805,7 +5025,7 @@ int BenchMain(int argc, char** argv)
     std::uint64_t start_attacks = 0;
 
     {
-        gs::game::WorldRuntime sim(io);
+        gs::game::WorldRuntime sim(io, {}, gs::bench::LoadBenchTestWorld());
         // All configuration is applied pre-Start: zone-bound resources (LOD
         // switch, load-bin mapping, partition limits) must not be rebound
         // while a worker tick can be in flight.
@@ -5058,19 +5278,28 @@ int BenchMain(int argc, char** argv)
             std::size_t samples = 0;
         };
         std::vector<ZoneAvg> zone_avgs;
-        for (std::size_t zi = 0; zi < sim.Zones().ZoneCount(); ++zi) {
-            const auto& zone = sim.Zones().GetZone(zi);
-            std::uint64_t buffer[gs::game::ZoneDiagnostics::kTickSampleCapacity];
-            const std::size_t n = zone.Diagnostics().CopyTickSamples(buffer, 256);
+        // Per-zone tick rings copied by one snapshot (keyed by zone id).
+        const auto zone_rings = ReadWorld(sim, [](const WorldSnapshot& snap) {
+            std::vector<std::pair<std::uint32_t, std::vector<std::uint64_t>>> out;
+            for (std::size_t zi = 0; zi < snap.zones.ZoneCount(); ++zi) {
+                const auto& zone = snap.zones.GetZone(zi);
+                std::uint64_t buffer[gs::game::ZoneDiagnostics::kTickSampleCapacity];
+                const std::size_t n = zone.Diagnostics().CopyTickSamples(buffer, 256);
+                out.emplace_back(zone.Id(), std::vector<std::uint64_t>(buffer, buffer + n));
+            }
+            return out;
+        });
+        for (const auto& [zone_id, ring] : zone_rings) {
+            const std::size_t n = ring.size();
             std::uint64_t zone_sum = 0;
-            for (std::size_t i = 0; i < n; ++i) {
-                all_samples.push_back(buffer[i]);
-                zone_sum += buffer[i];
-                max_sample = std::max(max_sample, buffer[i]);
-                sum_samples += buffer[i];
+            for (const std::uint64_t sample : ring) {
+                all_samples.push_back(sample);
+                zone_sum += sample;
+                max_sample = std::max(max_sample, sample);
+                sum_samples += sample;
             }
             zone_avgs.push_back(
-                ZoneAvg{zone.Id(), n > 0 ? static_cast<double>(zone_sum) / n / 1000.0 : 0.0, n});
+                ZoneAvg{zone_id, n > 0 ? static_cast<double>(zone_sum) / n / 1000.0 : 0.0, n});
         }
         std::sort(zone_avgs.begin(), zone_avgs.end(), [](const ZoneAvg& a, const ZoneAvg& b) {
             return a.avg_ms > b.avg_ms;
@@ -5107,7 +5336,7 @@ int BenchMain(int argc, char** argv)
                     sim.Migrations().PendingCount(),
                     sim.MigrationQuarantined());
         std::printf("validation: runs=%d failures=%d\n", validations_run, validation_failures);
-        const auto process_load = sim.CollectProcessLoad();
+        const auto process_load = ProcessLoad(sim);
         const auto routes = sim.Router().MetricsSnapshot();
         std::printf("process load: node=%u process=%u tick=%u zones=%zu active=%zu sleeping=%zu "
                     "players=%llu mobs=%llu ghosts=%llu avg_tick=%.3fms repl=%llu mig=%llu "
@@ -5131,20 +5360,32 @@ int BenchMain(int argc, char** argv)
             // rates (§25): how many entities really got AI/movement updates
             // per second. Work totals are cumulative (never reset); the
             // per-second windows in the diag log reset every second.
-            std::uint64_t t_full = 0, t_reduced = 0, t_low = 0, t_dormant = 0;
-            std::uint64_t x_full = 0, x_reduced = 0, x_low = 0, sleep_block = 0, wake_ext = 0;
-            for (std::size_t zi = 0; zi < sim.Zones().ZoneCount(); ++zi) {
-                const auto& diag = sim.Zones().GetZone(zi).Diagnostics();
-                t_full += diag.lod_full.load(std::memory_order_relaxed);
-                t_reduced += diag.lod_reduced.load(std::memory_order_relaxed);
-                t_low += diag.lod_low.load(std::memory_order_relaxed);
-                t_dormant += diag.lod_dormant.load(std::memory_order_relaxed);
-                x_full += diag.cross_zone_full_since_diag.load(std::memory_order_relaxed);
-                x_reduced += diag.cross_zone_reduced_since_diag.load(std::memory_order_relaxed);
-                x_low += diag.cross_zone_low_since_diag.load(std::memory_order_relaxed);
-                sleep_block += diag.sleep_blocked_external_since_diag.load(std::memory_order_relaxed);
-                wake_ext += diag.wake_external_since_diag.load(std::memory_order_relaxed);
-            }
+            struct LodGauges {
+                std::uint64_t t_full = 0, t_reduced = 0, t_low = 0, t_dormant = 0;
+                std::uint64_t x_full = 0, x_reduced = 0, x_low = 0, sleep_block = 0, wake_ext = 0;
+            };
+            const LodGauges gauges = ReadWorld(sim, [](const WorldSnapshot& snap) {
+                LodGauges g;
+                for (std::size_t zi = 0; zi < snap.zones.ZoneCount(); ++zi) {
+                    const auto& diag = snap.zones.GetZone(zi).Diagnostics();
+                    g.t_full += diag.lod_full.load(std::memory_order_relaxed);
+                    g.t_reduced += diag.lod_reduced.load(std::memory_order_relaxed);
+                    g.t_low += diag.lod_low.load(std::memory_order_relaxed);
+                    g.t_dormant += diag.lod_dormant.load(std::memory_order_relaxed);
+                    g.x_full += diag.cross_zone_full_since_diag.load(std::memory_order_relaxed);
+                    g.x_reduced += diag.cross_zone_reduced_since_diag.load(std::memory_order_relaxed);
+                    g.x_low += diag.cross_zone_low_since_diag.load(std::memory_order_relaxed);
+                    g.sleep_block +=
+                        diag.sleep_blocked_external_since_diag.load(std::memory_order_relaxed);
+                    g.wake_ext += diag.wake_external_since_diag.load(std::memory_order_relaxed);
+                }
+                return g;
+            });
+            const std::uint64_t t_full = gauges.t_full, t_reduced = gauges.t_reduced,
+                                t_low = gauges.t_low, t_dormant = gauges.t_dormant;
+            const std::uint64_t x_full = gauges.x_full, x_reduced = gauges.x_reduced,
+                                x_low = gauges.x_low, sleep_block = gauges.sleep_block,
+                                wake_ext = gauges.wake_ext;
             const auto work = sim.LodWorkTotalsSnapshot();
             const auto activity = sim.ActivityMetrics();
             const double elapsed = static_cast<double>(std::max(1, config.seconds));

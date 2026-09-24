@@ -10,6 +10,7 @@
 #include <memory>
 #include <string>
 #include <thread>
+#include <unordered_map>
 #include <vector>
 
 #include <boost/asio/ip/tcp.hpp>
@@ -21,6 +22,7 @@
 #include "../world/WorldRuntime.h"
 #include "../world/partition/PartitionScoring.h"
 #include "../world/spawn/SpawnLoader.h"
+#include "BenchSnapshot.h"
 
 #if defined(_WIN32)
 #ifndef NOMINMAX
@@ -319,6 +321,91 @@ std::size_t CountPartitionNodes(const std::vector<std::unique_ptr<gs::game::Zone
     return total;
 }
 
+// MAP-0: everything the report reads about the world, copied out by ONE
+// supervisor-side snapshot (same epoch / world tick): zone table, per-zone
+// gauges and tick samples, reclamation state, interest sets and the process
+// working set all belong to the same mutation point.
+struct ZoneReportRow {
+    gs::game::ZoneId id = 0;
+    gs::game::PartitionState partition{};
+    bool sim_enabled = false;
+    bool sleeping = false;
+    bool tick_in_flight = false;
+    std::uint64_t tick_index = 0;
+    std::uint64_t lod_full = 0;
+    std::uint64_t lod_reduced = 0;
+    std::uint64_t lod_low = 0;
+    std::uint64_t lod_dormant = 0;
+    std::uint64_t players = 0;
+    std::uint64_t mobs = 0;
+    std::uint64_t ghosts = 0;
+    std::vector<std::uint64_t> tick_samples;
+};
+
+struct ReadinessReport {
+    std::uint64_t epoch = 0;
+    std::uint32_t world_tick = 0;
+    std::size_t zone_slots = 0;
+    std::size_t active_leaves = 0;
+    std::size_t partition_nodes = 0;
+    std::size_t owners = 0;
+    std::size_t working_set_bytes = 0;
+    gs::game::ZoneManager::ReclaimStats reclaim{};
+    std::vector<ZoneReportRow> zones;
+    // Visible NetId set per viewer (sorted), Leaf + simulating zones only.
+    std::vector<std::vector<std::uint32_t>> viewer_sets;
+};
+
+ReadinessReport CollectReadinessReport(const WorldSnapshot& snap)
+{
+    ReadinessReport report;
+    report.epoch = snap.epoch;
+    report.world_tick = snap.world_tick;
+    report.zone_slots = snap.zones.ZoneCount();
+    report.active_leaves = snap.zones.GetActiveLeaves().size();
+    report.partition_nodes = CountPartitionNodes(snap.zones.PartitionRoots());
+    report.owners = snap.owners.size();
+    report.working_set_bytes = ProcessWorkingSetBytes();
+    report.reclaim = snap.reclaim;
+    report.zones.reserve(report.zone_slots);
+    std::vector<std::uint64_t> scratch(256, 0u);
+    for (std::size_t zi = 0; zi < snap.zones.ZoneCount(); ++zi) {
+        const auto& zone = snap.zones.GetZone(zi);
+        const auto& diag = zone.Diagnostics();
+        ZoneReportRow row;
+        row.id = zone.Id();
+        row.partition = zone.Partition();
+        row.sim_enabled = zone.SimulationEnabled();
+        row.sleeping = zone.Activity() == gs::game::ZoneActivity::Sleeping;
+        row.tick_in_flight = zone.TickInProgress().load(std::memory_order_acquire);
+        row.tick_index = zone.TickIndex();
+        row.lod_full = diag.lod_full.load(std::memory_order_relaxed);
+        row.lod_reduced = diag.lod_reduced.load(std::memory_order_relaxed);
+        row.lod_low = diag.lod_low.load(std::memory_order_relaxed);
+        row.lod_dormant = diag.lod_dormant.load(std::memory_order_relaxed);
+        row.players = diag.player_count.load(std::memory_order_relaxed);
+        row.mobs = diag.mob_count.load(std::memory_order_relaxed);
+        row.ghosts = diag.ghost_count.load(std::memory_order_relaxed);
+        const std::size_t count = diag.CopyTickSamples(scratch.data(), scratch.size());
+        row.tick_samples.assign(scratch.begin(), scratch.begin() + count);
+        if (row.sim_enabled && row.partition == gs::game::PartitionState::Leaf) {
+            for (const auto& [viewer_net, binding] : zone.Players()) {
+                (void)viewer_net;
+                std::vector<std::uint32_t> nets;
+                nets.reserve(binding.visible_net_versions.size());
+                for (const auto& [net_id, version] : binding.visible_net_versions) {
+                    (void)version;
+                    nets.push_back(net_id);
+                }
+                std::sort(nets.begin(), nets.end());
+                report.viewer_sets.push_back(std::move(nets));
+            }
+        }
+        report.zones.push_back(std::move(row));
+    }
+    return report;
+}
+
 } // namespace
 
 int RunReadinessBenchmark(boost::asio::io_context& io, const ReadinessConfig& config)
@@ -336,6 +423,10 @@ int RunReadinessBenchmark(boost::asio::io_context& io, const ReadinessConfig& co
     };
 
     PrintEnvironment();
+    // MAP-1: readiness always measures the explicit SYNTHETIC world (flat
+    // terrain, no package) -- stated in every result.
+    std::printf("READINESS world: mode=synthetic terrain=flat package=none (explicit synthetic benchmark "
+                "world, not a map measurement of real terrain)\n");
     std::printf("READINESS config: scenario=%s world_km=%.0f zones=%dx%d players=%d mobs=%d "
                 "warmup_s=%d measure_s=%d asf_off=%d loadfield_off=%d lod_off=%d seed=%u\n",
                 config.scenario.c_str(),
@@ -361,7 +452,9 @@ int RunReadinessBenchmark(boost::asio::io_context& io, const ReadinessConfig& co
                                gs::game::WorldRuntime::SyntheticWorldConfig{
                                    extent, static_cast<std::uint32_t>(zones_x),
                                    static_cast<std::uint32_t>(zones_y), {}});
-    check("zones-built", sim.Zones().ZoneCount() == expected_zones);
+    check("zones-built", ReadWorld(sim, [](const WorldSnapshot& snap) {
+              return snap.zones.ZoneCount();
+          }) == expected_zones);
 
     gs::game::PartitionConfig partition;
     if (config.asf_off) {
@@ -632,13 +725,16 @@ int RunReadinessBenchmark(boost::asio::io_context& io, const ReadinessConfig& co
                       MakeReadinessCharacter(player.character_index),
                       gs::game::DebugSpawnOverride{player.x, player.y});
     }
+    const auto owner_count = [&sim] {
+        return ReadWorld(sim, [](const WorldSnapshot& snap) { return snap.owners.size(); });
+    };
     const bool players_populated = WaitFor(std::chrono::seconds(180), [&] {
-        return sim.Owners().size() == static_cast<std::size_t>(config.players);
+        return owner_count() == static_cast<std::size_t>(config.players);
     });
     const double player_spawn_s =
         std::chrono::duration<double>(Clock::now() - player_spawn_start).count();
     std::printf("READINESS setup: players_spawned=%zu player_spawn_s=%.2f\n",
-                sim.Owners().size(),
+                owner_count(),
                 player_spawn_s);
     check("players-spawned", players_populated);
     if (!players_populated) {
@@ -655,17 +751,19 @@ int RunReadinessBenchmark(boost::asio::io_context& io, const ReadinessConfig& co
     }
 
     // ---- MEASURE ----------------------------------------------------------
-    std::vector<ZoneStageTotals> zone_totals(sim.Zones().ZoneCount());
+    // Keyed by ZoneId, not slot: the partition controller may split/merge
+    // during the measurement and H9 reuses retired slots for new zones, so a
+    // slot index does not identify a zone across samples. The accumulation
+    // runs inside the snapshot collector (supervisor, quiescent window) while
+    // this thread is blocked in ReadWorld, so zone_totals is only ever touched
+    // by one thread at a time (the future hands it back).
+    std::unordered_map<gs::game::ZoneId, ZoneStageTotals> zone_totals;
     auto sample_zones = [&]() {
-        // The partition controller may split zones during the measurement
-        // (zone slots are append-only), so the accumulator array grows with
-        // the live zone count.
-        if (zone_totals.size() < sim.Zones().ZoneCount()) {
-            zone_totals.resize(sim.Zones().ZoneCount());
-        }
-        for (std::size_t zi = 0; zi < sim.Zones().ZoneCount(); ++zi) {
-            const auto& diag = sim.Zones().GetZone(zi).Diagnostics();
-            auto& totals = zone_totals[zi];
+        ReadWorld(sim, [&zone_totals](const WorldSnapshot& snap) {
+        for (std::size_t zi = 0; zi < snap.zones.ZoneCount(); ++zi) {
+            const auto& zone = snap.zones.GetZone(zi);
+            const auto& diag = zone.Diagnostics();
+            auto& totals = zone_totals[zone.Id()];
             AccumulateWindow(diag.tick_micros_since_diag.load(std::memory_order_relaxed),
                             totals.tick_micros);
             AccumulateWindow(diag.gameplay_micros_since_diag.load(std::memory_order_relaxed),
@@ -828,6 +926,8 @@ int RunReadinessBenchmark(boost::asio::io_context& io, const ReadinessConfig& co
             AccumulateWindow(diag.repl_v2_tier_reduced_since_diag.load(std::memory_order_relaxed),
                             totals.repl_v2_tier_reduced);
         }
+        return snap.epoch;
+        });
     };
 
     auto snapshot_globals = [&]() -> GlobalCounters {
@@ -946,7 +1046,7 @@ int RunReadinessBenchmark(boost::asio::io_context& io, const ReadinessConfig& co
             for (auto& player : players) {
                 sim.PostDespawn(player.session_id);
             }
-            WaitFor(std::chrono::seconds(20), [&] { return sim.Owners().empty(); });
+            WaitFor(std::chrono::seconds(20), [&] { return owner_count() == 0; });
             for (auto& player : players) {
                 const float t = static_cast<float>(player.character_index) * 2.39996323f;
                 const float r = 400.0f * std::sqrt(
@@ -1036,6 +1136,8 @@ int RunReadinessBenchmark(boost::asio::io_context& io, const ReadinessConfig& co
     const GlobalCounters counters_after = snapshot_globals();
     const double measure_actual_s =
         std::chrono::duration<double>(Clock::now() - measure_start).count();
+    const std::size_t zones_after_measure =
+        ReadWorld(sim, [](const WorldSnapshot& snap) { return snap.zones.ZoneCount(); });
 
     // ---- Phase 7 scheduler audit line ------------------------------------
     {
@@ -1090,7 +1192,7 @@ int RunReadinessBenchmark(boost::asio::io_context& io, const ReadinessConfig& co
                     "phase=[busy=%llu idle=%llu us] sched_us=%llu enqueued=%llu due=%llu "
                     "waves=%llu cas_failures=%llu sleeping=%llu\n",
                     sched_after.workers,
-                    sim.Zones().ZoneCount(),
+                    zones_after_measure,
                     parallelism,
                     imbalance,
                     (unsigned long long)min_worker,
@@ -1124,36 +1226,61 @@ int RunReadinessBenchmark(boost::asio::io_context& io, const ReadinessConfig& co
     }
     const double validation_wait_s =
         std::chrono::duration<double>(Clock::now() - validation_wait_start).count();
+    // ---- REPORT SNAPSHOT --------------------------------------------------
+    // One supervisor-side capture: every world-derived number below (zone
+    // count, tick samples, tier gauges, residency, interest sets, slot reuse,
+    // working set) comes from this single epoch.
+    const auto report_wait_start = Clock::now();
+    const ReadinessReport report = ReadWorld(sim, CollectReadinessReport);
+    const double report_wait_ms =
+        std::chrono::duration<double, std::milli>(Clock::now() - report_wait_start).count();
     std::size_t stuck_zones = 0;
+    std::size_t staging_zones = 0;
     std::uint64_t zone_ticks = 0;
-    for (std::size_t zi = 0; zi < sim.Zones().ZoneCount(); ++zi) {
-        auto& zone = sim.Zones().GetZone(zi);
-        if (zone.TickInProgress().load(std::memory_order_acquire)) {
-            ++stuck_zones;
-        }
-        zone_ticks += zone.TickIndex();
+    for (const auto& row : report.zones) {
+        stuck_zones += row.tick_in_flight ? 1u : 0u;
+        staging_zones += row.partition == gs::game::PartitionState::Staging ? 1u : 0u;
+        zone_ticks += row.tick_index;
     }
-    std::printf("READINESS validation_wait_s=%.1f stuck_zones=%zu zone_ticks=%llu\n",
+    std::printf("READINESS validation_wait_s=%.1f zone_ticks=%llu\n",
                 validation_wait_s,
-                stuck_zones,
                 (unsigned long long)zone_ticks);
+    std::printf("READINESS snapshot: epoch=%llu world_tick=%u wait_ms=%.1f slots=%zu "
+                "active_leaves=%zu owners=%zu tick_in_flight=%zu staging=%zu "
+                "reclaim=[pending=%zu reusable=%zu reclaimed=%llu reused=%llu trimmed=%llu]\n",
+                (unsigned long long)report.epoch,
+                report.world_tick,
+                report_wait_ms,
+                report.zone_slots,
+                report.active_leaves,
+                report.owners,
+                stuck_zones,
+                staging_zones,
+                report.reclaim.retired_pending,
+                report.reclaim.reusable,
+                (unsigned long long)report.reclaim.reclaimed_total,
+                (unsigned long long)report.reclaim.reused_total,
+                (unsigned long long)report.reclaim.trimmed_total);
     check("validation", validated);
+    // A capture is served only in a quiescent window between two topology
+    // transactions: no tick may be in flight and no staged split/merge
+    // destination may exist in it.
+    check("snapshot-quiescent", stuck_zones == 0 && staging_zones == 0);
 
     // ---- REPORT -----------------------------------------------------------
     std::vector<std::uint64_t> tick_samples;
-    tick_samples.reserve(sim.Zones().ZoneCount() * 64);
-    std::vector<std::uint64_t> zone_scratch(256, 0u);
-    std::size_t worst_zone = 0;
+    tick_samples.reserve(report.zones.size() * 64);
+    gs::game::ZoneId worst_zone_id = 0;
+    bool worst_zone_found = false;
     double worst_zone_p99 = 0.0;
-    for (std::size_t zi = 0; zi < sim.Zones().ZoneCount(); ++zi) {
-        const auto& diag = sim.Zones().GetZone(zi).Diagnostics();
-        const std::size_t count = diag.CopyTickSamples(zone_scratch.data(), zone_scratch.size());
-        std::vector<std::uint64_t> local(zone_scratch.begin(), zone_scratch.begin() + count);
+    for (const auto& row : report.zones) {
+        std::vector<std::uint64_t> local = row.tick_samples;
         if (!local.empty()) {
             const double local_p99 = PercentileMs(local, 0.99);
             if (local_p99 > worst_zone_p99) {
                 worst_zone_p99 = local_p99;
-                worst_zone = zi;
+                worst_zone_id = row.id;
+                worst_zone_found = true;
             }
         }
         tick_samples.insert(tick_samples.end(), local.begin(), local.end());
@@ -1182,36 +1309,28 @@ int RunReadinessBenchmark(boost::asio::io_context& io, const ReadinessConfig& co
     std::uint64_t ghosts = 0;
     std::size_t active_zones = 0;
     std::size_t sleeping_zones = 0;
-    for (std::size_t zi = 0; zi < sim.Zones().ZoneCount(); ++zi) {
-        const auto& zone = sim.Zones().GetZone(zi);
-        const auto& diag = zone.Diagnostics();
-        // A split/merge in flight at report time: its Staging destinations
-        // are never authoritative until commit (the frozen source still
-        // carries every resident in both its mob count and its tier gauges),
-        // but they already hold insert bumps for the transferred entities.
-        // Counting them double-counts a whole zone's residents.
-        if (zone.Partition() == gs::game::PartitionState::Staging) {
-            continue;
-        }
-        lod_full += diag.lod_full.load(std::memory_order_relaxed);
-        lod_reduced += diag.lod_reduced.load(std::memory_order_relaxed);
-        lod_low += diag.lod_low.load(std::memory_order_relaxed);
-        lod_dormant += diag.lod_dormant.load(std::memory_order_relaxed);
-        resident_players += diag.player_count.load(std::memory_order_relaxed);
-        resident_mobs += diag.mob_count.load(std::memory_order_relaxed);
-        ghosts += diag.ghost_count.load(std::memory_order_relaxed);
-        if (zone.Diagnostics().player_count.load(std::memory_order_relaxed) > 0 ||
-            zone.Diagnostics().mob_count.load(std::memory_order_relaxed) > 0) {
+    for (const auto& row : report.zones) {
+        // (The old live-read report skipped Staging destinations of a split
+        // in flight; a snapshot never contains one -- checked above.)
+        lod_full += row.lod_full;
+        lod_reduced += row.lod_reduced;
+        lod_low += row.lod_low;
+        lod_dormant += row.lod_dormant;
+        resident_players += row.players;
+        resident_mobs += row.mobs;
+        ghosts += row.ghosts;
+        if (row.players > 0 || row.mobs > 0) {
             ++active_zones;
         }
-        if (zone.Activity() == gs::game::ZoneActivity::Sleeping) {
+        if (row.sleeping) {
             ++sleeping_zones;
         }
     }
 
     auto total_of = [&](WindowDelta ZoneStageTotals::*member) {
         std::uint64_t total = 0;
-        for (const auto& zone : zone_totals) {
+        for (const auto& [zone_id, zone] : zone_totals) {
+            (void)zone_id;
             total += (zone.*member).total;
         }
         return total;
@@ -1239,16 +1358,16 @@ int RunReadinessBenchmark(boost::asio::io_context& io, const ReadinessConfig& co
 
     std::printf("READINESS tick: zones=%zu samples=%zu avg_ms=%.3f p50_ms=%.3f p95_ms=%.3f "
                 "p99_ms=%.3f max_ms=%.3f\n",
-                sim.Zones().ZoneCount(),
+                report.zone_slots,
                 tick_samples.size(),
                 tick_avg,
                 tick_p50,
                 tick_p95,
                 tick_p99,
                 tick_max);
-    if (worst_zone < sim.Zones().ZoneCount()) {
+    if (worst_zone_found) {
         std::printf("READINESS tick worst-zone: zone_id=%u p99_ms=%.3f\n",
-                    sim.Zones().GetZone(worst_zone).Id(),
+                    worst_zone_id,
                     worst_zone_p99);
     }
     std::printf("READINESS tiers: full=%llu reduced=%llu low=%llu dormant=%llu (mobs=%llu)\n",
@@ -1257,24 +1376,24 @@ int RunReadinessBenchmark(boost::asio::io_context& io, const ReadinessConfig& co
                 (unsigned long long)lod_low,
                 (unsigned long long)lod_dormant,
                 (unsigned long long)resident_mobs);
-    // Tolerance: the report reads live counters while the world keeps
-    // ticking; tier gauges are eventual-consistent (1 Hz recount + insert
-    // bumps during transfers), so a live sum can differ transiently. A
-    // systematic leak (stale retired/tombstoned gauges) would exceed this.
+    // Tolerance: the snapshot removes the read race, but the tier gauges
+    // themselves are eventual-consistent (1 Hz recount + insert bumps during
+    // transfers), so the sum may still differ slightly from the mob count at
+    // one capture point. A systematic leak (stale retired/tombstoned gauges)
+    // would exceed this.
     const std::uint64_t tier_sum = lod_full + lod_reduced + lod_low + lod_dormant;
     const std::uint64_t tier_diff =
         tier_sum > resident_mobs ? tier_sum - resident_mobs : resident_mobs - tier_sum;
     const std::uint64_t tier_tolerance = std::max<std::uint64_t>(32, resident_mobs / 500);
     if (tier_diff > tier_tolerance) {
         std::size_t shown = 0;
-        for (std::size_t zi = 0; zi < sim.Zones().ZoneCount() && shown < 8; ++zi) {
-            const auto& zone = sim.Zones().GetZone(zi);
-            const auto& diag = zone.Diagnostics();
-            const std::uint64_t zone_tiers = diag.lod_full.load(std::memory_order_relaxed) +
-                                             diag.lod_reduced.load(std::memory_order_relaxed) +
-                                             diag.lod_low.load(std::memory_order_relaxed) +
-                                             diag.lod_dormant.load(std::memory_order_relaxed);
-            const std::uint64_t zone_mobs = diag.mob_count.load(std::memory_order_relaxed);
+        for (const auto& row : report.zones) {
+            if (shown >= 8) {
+                break;
+            }
+            const std::uint64_t zone_tiers =
+                row.lod_full + row.lod_reduced + row.lod_low + row.lod_dormant;
+            const std::uint64_t zone_mobs = row.mobs;
             // Only zones that can explain the breach (a +-1 insert bump is
             // noise); retired/split parents included.
             const std::uint64_t zone_diff =
@@ -1284,17 +1403,20 @@ int RunReadinessBenchmark(boost::asio::io_context& io, const ReadinessConfig& co
             }
             std::printf("TIER-MISMATCH zone=%u mobs=%llu tiers=%llu tiersum=%llu "
                         "sleeping=%d sim=%d part=%u players=%llu\n",
-                        zone.Id(),
+                        row.id,
                         (unsigned long long)zone_mobs,
                         (unsigned long long)zone_tiers,
                         (unsigned long long)zone_tiers,
-                        zone.Activity() == gs::game::ZoneActivity::Sleeping ? 1 : 0,
-                        zone.SimulationEnabled() ? 1 : 0,
-                        static_cast<unsigned>(zone.Partition()),
-                        (unsigned long long)diag.player_count.load(std::memory_order_relaxed));
+                        row.sleeping ? 1 : 0,
+                        row.sim_enabled ? 1 : 0,
+                        static_cast<unsigned>(row.partition),
+                        (unsigned long long)row.players);
             ++shown;
         }
     }
+    std::printf("READINESS tier_diff=%llu tolerance=%llu\n",
+                (unsigned long long)tier_diff,
+                (unsigned long long)tier_tolerance);
     check("tier-accounting", tier_diff <= tier_tolerance);
     std::printf("READINESS residency: players=%llu mobs=%llu ghosts=%llu active_zones=%zu "
                 "sleeping_zones=%zu\n",
@@ -1588,7 +1710,8 @@ int RunReadinessBenchmark(boost::asio::io_context& io, const ReadinessConfig& co
         // A per-zone peak: the world value is the max over zones, never the
         // sum (summing 160 zones' ~4-tick peaks reported a bogus ~560).
         std::uint64_t v2_max_defer = 0;
-        for (const auto& zone : zone_totals) {
+        for (const auto& [zone_id, zone] : zone_totals) {
+            (void)zone_id;
             v2_max_defer = std::max(v2_max_defer, zone.repl_v2_max_defer.total);
         }
         const std::uint64_t tier_c = total_of(&ZoneStageTotals::repl_v2_tier_critical);
@@ -1622,90 +1745,34 @@ int RunReadinessBenchmark(boost::asio::io_context& io, const ReadinessConfig& co
     // the sorted visible NetId set per viewer; exact duplicates are the
     // grouping candidates.
     {
-        std::vector<std::size_t> sizes;
-        std::unordered_map<std::uint64_t, std::uint32_t> signatures;
-        std::vector<std::uint32_t> nets;
-        for (std::size_t zi = 0; zi < sim.Zones().ZoneCount(); ++zi) {
-            const auto& zone = sim.Zones().GetZone(zi);
-            if (!zone.SimulationEnabled() || zone.Partition() != gs::game::PartitionState::Leaf) {
-                continue;
-            }
-            for (const auto& [viewer_net, binding] : zone.Players()) {
-                (void)viewer_net;
-                nets.clear();
-                nets.reserve(binding.visible_net_versions.size());
-                for (const auto& [net_id, version] : binding.visible_net_versions) {
-                    (void)version;
-                    nets.push_back(net_id);
-                }
-                std::sort(nets.begin(), nets.end());
-                std::uint64_t h = 1469598103934665603ull;
-                for (const std::uint32_t net_id : nets) {
-                    h ^= net_id;
-                    h *= 1099511628211ull;
-                }
-                h ^= static_cast<std::uint64_t>(nets.size());
-                h *= 1099511628211ull;
-                ++signatures[h];
-                sizes.push_back(nets.size());
-            }
-        }
+        // Viewer sets were copied (sorted) by the report snapshot.
         // Empty interest sets are trivially "identical": measure overlap on
         // the non-empty sets only (the sparse scenarios have many idle
         // viewers and would otherwise report meaningless 90%+ duplicates).
-        std::uint32_t max_group = 0;
+        std::vector<std::size_t> sizes;
+        sizes.reserve(report.viewer_sets.size());
         std::size_t nonempty_viewers = 0;
-        std::size_t nonempty_signatures = 0;
-        for (const auto& [signature, count] : signatures) {
+        std::unordered_map<std::uint64_t, std::uint32_t> nonempty;
+        for (const auto& nets : report.viewer_sets) {
+            sizes.push_back(nets.size());
+            if (nets.empty()) {
+                continue;
+            }
+            ++nonempty_viewers;
+            std::uint64_t h = 1469598103934665603ull;
+            for (const std::uint32_t net_id : nets) {
+                h ^= net_id;
+                h *= 1099511628211ull;
+            }
+            h ^= static_cast<std::uint64_t>(nets.size());
+            h *= 1099511628211ull;
+            ++nonempty[h];
+        }
+        const std::size_t nonempty_signatures = nonempty.size();
+        std::uint32_t max_group = 0;
+        for (const auto& [signature, count] : nonempty) {
             (void)signature;
-            // A signature with count>1 may still be the empty set; the empty
-            // signature is unique in the map, so filter by tracking sizes.
-            if (count > max_group) {
-                max_group = count;
-            }
-        }
-        for (const std::size_t size : sizes) {
-            if (size > 0) {
-                ++nonempty_viewers;
-            }
-        }
-        // Recompute distinct signatures over non-empty sets.
-        {
-            std::unordered_map<std::uint64_t, std::uint32_t> nonempty;
-            for (std::size_t zi = 0; zi < sim.Zones().ZoneCount(); ++zi) {
-                const auto& zone = sim.Zones().GetZone(zi);
-                if (!zone.SimulationEnabled() ||
-                    zone.Partition() != gs::game::PartitionState::Leaf) {
-                    continue;
-                }
-                for (const auto& [viewer_net, binding] : zone.Players()) {
-                    (void)viewer_net;
-                    if (binding.visible_net_versions.empty()) {
-                        continue;
-                    }
-                    nets.clear();
-                    nets.reserve(binding.visible_net_versions.size());
-                    for (const auto& [net_id, version] : binding.visible_net_versions) {
-                        (void)version;
-                        nets.push_back(net_id);
-                    }
-                    std::sort(nets.begin(), nets.end());
-                    std::uint64_t h = 1469598103934665603ull;
-                    for (const std::uint32_t net_id : nets) {
-                        h ^= net_id;
-                        h *= 1099511628211ull;
-                    }
-                    h ^= static_cast<std::uint64_t>(nets.size());
-                    h *= 1099511628211ull;
-                    ++nonempty[h];
-                }
-            }
-            nonempty_signatures = nonempty.size();
-            max_group = 0;
-            for (const auto& [signature, count] : nonempty) {
-                (void)signature;
-                max_group = std::max(max_group, count);
-            }
+            max_group = std::max(max_group, count);
         }
         std::sort(sizes.begin(), sizes.end());
         const std::size_t p50 =
@@ -1760,7 +1827,6 @@ int RunReadinessBenchmark(boost::asio::io_context& io, const ReadinessConfig& co
         load_grid ? load_grid->CellCount() * sizeof(gs::game::LoadCell) +
                         load_grid->L1CellCount() * sizeof(gs::game::LoadCell)
                   : 0;
-    const std::size_t partition_nodes = CountPartitionNodes(sim.Zones().PartitionRoots());
     std::printf("READINESS fields: activity=[sources=%llu cells=%llu rebuilds=%llu rebuild_ms=%.1f] "
                 "load=[cells=%llu active=%llu rebuilds=%llu rebuild_ms=%.1f]\n",
                 (unsigned long long)activity_metrics.sources,
@@ -1771,13 +1837,15 @@ int RunReadinessBenchmark(boost::asio::io_context& io, const ReadinessConfig& co
                 (unsigned long long)load_metrics.cells_active,
                 (unsigned long long)load_metrics.rebuilds,
                 static_cast<double>(load_metrics.rebuild_us_total) / 1000.0);
+    // Working set, partition nodes and zone slots: same snapshot epoch.
     std::printf("READINESS memory: working_set_mb=%.1f activity_grid_mb=%.2f load_grid_mb=%.2f "
-                "partition_nodes=%zu zones=%zu\n",
-                static_cast<double>(ProcessWorkingSetBytes()) / (1024.0 * 1024.0),
+                "partition_nodes=%zu zones=%zu epoch=%llu\n",
+                static_cast<double>(report.working_set_bytes) / (1024.0 * 1024.0),
                 static_cast<double>(activity_bytes) / (1024.0 * 1024.0),
                 static_cast<double>(load_bytes) / (1024.0 * 1024.0),
-                partition_nodes,
-                sim.Zones().ZoneCount());
+                report.partition_nodes,
+                report.zone_slots,
+                (unsigned long long)report.epoch);
     std::printf("READINESS validation: %s\n", validated ? "OK" : validation_result.c_str());
     std::printf("READINESS-DONE failures=%d\n", failures);
     sim.Stop();

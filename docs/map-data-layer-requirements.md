@@ -12,6 +12,12 @@
 > Hatókör: gameserver-oldali világadat (terrain/collision/logikai régiók,
 > spawn/warp adat, betöltés, validáció, konfiguráció). Kliens-renderelés,
 > loginserver, DB és gameplay nem része.
+>
+> **Megvalósítási állapot:** lásd [MAP-0 / MAP-1 státusz](#map-0--map-1-státusz-2026-09-24)
+> (R1–R13 traceability-mátrix, audit, bench snapshot, baseline, nyitott
+> döntések). A mapaudit azóta két oszlopot ír: legacy (kliens-API, a
+> reprodukció változatlan) és szerver (CHANGED / PARTIAL / OPEN(MAP-n)).
+> A formátum-szerződés: [`map-data-format.md`](map-data-format.md).
 
 ## 0. Fogalmak — négy KÜLÖN dolog
 
@@ -267,6 +273,159 @@ világcsomag validált részei (area-hivatkozással, R4 szabályaival), nem kül
 lazán csatolt konfig.
 
 ---
+
+---
+
+## MAP-0 / MAP-1 státusz (2026-09-24)
+
+> Munkaprompt: `IxtreemeWorld_Real_World_Map_Data_Layer_Opus_Prompt.md`.
+> Alap: `With_Auriga` @ `0efc4033` (hardening chunk 3), a MAP-0/MAP-1
+> változások commit nélkül a working tree-ben. Referencia-binárisok:
+> `worldbench_hardening.exe` / `gameserver_hardening.exe` (0efc4033).
+
+### MAP-0 audit — a production indulási út
+
+`main.cpp` → config (`--config`, a világkulcsok a config-fájl könyvtárához
+relatívak) → **világcsomag betöltése és validálása** (`WorldPackageLoader` →
+`mx::map::LoadServerWorld`) → hiba esetén exit 3, még DB és hálózat előtt →
+libsodium → DB pool → `WorldRuntime(io, identity, LoadedWorld)` →
+`TerrainService(HeightField)` + `ZoneManager::BuildFromWorldLogic` (a
+worldlogic zónái a partíció-gyökerek levelei a fix `DefaultRegions` alatt) +
+activity/load field (`WorldBounds::FromExtent`) + spawn (`SpawnCoordinator`) →
+`Start()` (worker pool) → indulási összegzés → `Server::Start()` (world
+admission). MAP-1 előtt a világ fordításkori forrásfa-útból jött, csendes
+lapos/egyzónás fallbackkel, és a DB-csatlakozás megelőzte.
+
+Tényleges szerepek: `RegionDefinition::DefaultRegions` — négy fix 100 km-es
+kvadráns (0,0)-tól (R3, változatlan); `WorldBounds` — `[0, extent]²`;
+`SpawnCoordinator` — játékos alap-spawn a worldlogic első spawn-régiójából,
+mob-spawn a csomag spawn-táblájából, járhatóság-ellenőrzéssel;
+`MovementSystem` — tengelyenkénti `IsWalkable`, magasság-mintavétel,
+`TryApplyWarp` minden tickben zárt téglalap-tartalmazással (R6);
+`SpatialGrid` — zóna-lokális AOI-index, nem térképadat; `mapgen_test_zone` —
+most a közös íróra épül.
+
+**Collision / navigation / water — ami ténylegesen van:** collision = az
+attribútum-rács bit 0-ja (blokkolt cella), tengelyenkénti mozgás-ellenőrzés
+egyetlen célmintán (nincs útvonal-menti ellenőrzés, nincs magassági/lejtő
+korlát, nincs statikus alakzat); navigáció = nincs adat és nincs formátum;
+víz = a kliens `water_bodies.mxwater` (MXWB, a test_zone-ban 0 víztest),
+szerveroldali fogyasztó nincs. A MAP-1 ezt nem bővíti; a víz-réteg a
+csomagban deklarálható, de `LAYER_NOT_VALIDATED` (nem „kész").
+
+### MAP-0 — biztonságos bench snapshot
+
+`WorldRuntime::CaptureSnapshot<T>(collector)` / `WaitSnapshot`: a kollektor a
+supervisor szálon fut, csendes ablakban (nincs repülő zóna-tick, két
+topológia-tranzakció között: a pass elején és a partíció-vezérlés/reclaim
+után), `SnapshotContext{zones, owners, epoch, world_tick, captured_at,
+reclaim}`. A kérő a jövőre vár; a supervisor saját szálán a várakozás és a
+kollektoron belüli új kérés `std::logic_error` (nincs önmagára várás). Leállításkor
+a függő kérések a végső csendes ablakban válaszolódnak meg. Nincs production
+hot-path lock (a mutex csak függő kérés esetén, a supervisoron). Benchen:
+`gs::bench::ReadWorld` (időtúllépésnél abort, hogy lógó referencia ne
+maradjon). **Minden** bench-oldali `sim.Zones()` / `sim.Owners()` olvasás és a
+zónatáblát bejáró futásidejű olvasó API-k bench-hívásai (`CollectProcessLoad`,
+`ScorePartition`, `ScoreMerge`) snapshotra álltak át; zóna-mutató /
+`ZonePartition*` / slot-index nem marad meg hívások között. A readiness
+akkumulátor `ZoneId` kulcsú (a H9 slot-újrahasznosítás miatt), a riport egyetlen
+epochból jön (zónaszám, tier-gauge-ek, slot-reuse, working set).
+
+Bizonyíték: `worldbench --mode snapshot --cycles 300` (3 olvasó szál, 400
+split + 400 merge, 1995 reclaim / 1669 slot-újrahasznosítás, migrációk):
+5916 snapshot, 2400 topológia-változás két egymás utáni capture között, 0
+invariáns-sértés (nincs repülő tick, nincs Staging, levelek hézag/átfedés
+nélkül fedik a világot, egyedi authority, owner-cache feloldható, konzervált
+populáció, monoton epoch / world tick / reclaim számlálók), max várakozás
+~30 ms; Debug buildben (assertekkel) is zöld. A readiness riport
+`snapshot-quiescent` ellenőrzése: 0 repülő tick, 0 Staging zóna.
+
+### MAP-0 — új mérési baseline
+
+Windows 11, 16 mag, RelWithDebInfo; ugyanaz a gép, egymás után futtatva.
+`hardening` = 0efc4033 (nyers, versenyző bench-olvasás), `map0` = snapshot-út.
+
+| Futás | Bináris | Zóna-slot | tick p50 / p95 / p99 / max ms | Tier-eltérés | Working set | Snapshot-várakozás |
+|---|---|---|---|---|---|---|
+| smoke 100p / 20k | hardening | 64 | 0.58 / 2.25 / 4.25 / 12.2 | — | 283 MB | — (stuck_zones=0) |
+| smoke 100p / 20k | map0 | 64 | 0.55 / 1.72 / 3.08 / 6.9 | 8 (≤ 40) | 283 MB | 1.5 ms |
+| dense 500p / 200k | hardening | 64 | 4.19 / 5.76 / 72.6 / 129.1 | — | 1681 MB | — (**stuck_zones=1**: tick olvasás közben) |
+| dense 500p / 200k | map0 | 64 | 4.15 / 5.59 / 72.5 / 133.6 | 2 (≤ 400) | 1686 MB | 72 ms |
+| spread 7000p / 200k | hardening | 160 | 2.01 / 8.29 / 10.66 / 36.6 | — | 2994 MB | — |
+| spread 7000p / 200k | map0 | 164 | 1.90 / 7.97 / 9.93 / 27.3 | 8 (≤ 400) | 2987 MB | 8 ms |
+
+A 7000p topológia eltér (160 vs 164 slot) — nem tiszta A/B. A dense p99 a
+baseline-on is > 50 ms; ezt nem a map-réteg javítja.
+
+**Map-betöltési baseline** (becsekkolt `test_zone`, 500×500 cella, 16 chunk,
+3.1 MB, meleg OS-cache, 20 futás átlaga): legacy `LoadHeightField` 19.5 ms,
+rezidens 3.10 MB (splattel); szigorú szerver-betöltő Startup 4.5 ms, rezidens
+1.00 MB (magasság + attribútum); Full 4.4 ms.
+
+### MAP-1 tesztek és regresszió
+
+- `worldbench --mode worldpackage`: 107 PASS, 0 FAIL, 1 SKIPPED
+  (`path-symlink-escape`: ezen a Windows-fiókon nincs symlink-jogosultság; a
+  kanonikus komponensenkénti tartalmazás elutasító ága így nem futott, a
+  lexikális `..`/abszolút/`\`/`:` esetek igen). RelWithDebInfo és Debug.
+- `scripts/map1_startup_acceptance.sh` (valódi `gameserver`, két idegen cwd,
+  DB-vel): 15/15 PASS.
+- Teljes regresszió a 0efc4033 bináris ellen: minden pár azonos PASS-számmal
+  (readiness +1: `snapshot-quiescent`), minden hardening-mód zöld. Kivétel:
+  `scheduler` — `uniform-parallelism` / `reference-parallelism` falióra-alapú
+  küszöbe (> 2.0) ezen a gépen **mindkét** binárison ingadozik (7-7 futásból
+  4-4 FAIL, uniform-64 párhuzamosság: base 1.84–5.11, új 1.81–4.90):
+  meglévő, nem MAP-eredetű flakiség, nem PASS-ként számolva; munkára
+  normalizált kritérium kellene (külön döntés).
+
+### R1–R13 traceability (az R-azonosítók nincsenek újraszámozva)
+
+„Legacy" = a változatlan `MapData.h` kliens-API; „szerver" = a gameserver
+tényleges útja (`worldbench --mode mapaudit` mindkét oszlopot kiírja).
+
+| R | Jelenlegi kód / hívó | Reprodukció / bizonyíték | Csomag | Elfogadási teszt | Státusz |
+|---|---|---|---|---|---|
+| **R1** Chunk grid ≠ zone grid | szerver: `WorldPackage.cpp` `ParseManifest` (rács = ceil(size/chunk)), `LoadServerWorld`; legacy: `MapData.cpp` `LoadHeightField` (zone grid) | mapaudit R1: legacy REPRODUCED / szerver CHANGED (4 chunk olvasva); korpusz `valid-v2-legacy-layout`, `index-*`, `chunk-file-missing` | MAP-1 (formátum + betöltő); részleges chunk: MAP-2 | (a) minden chunk pontosan egyszer ✓ (b) hiányzó chunk = hiba ✓ (c) split/merge újratöltés nélkül: ma rezidens terrain; streamelve MAP-3 | szerver-úton KÉSZ (a,b); (c) MAP-3 |
+| **R2** Map Chunk ≠ Server Zone ≠ Client Map | v3 tiltja a `zoneGridDims`/`zoneSizeCells`-t; a worldlogic zónái még `ZoneManager::BuildFromWorldLogic` partíció-magjai (ZoneId = worldlogic id), de id 0 / > 0xFFFFFF / duplikált id betöltéskor elutasítva | mapaudit R2 PARTIAL; korpusz `manifest-v3-zone-grid`, `worldlogic-zone-id-*`; server-only csomag (R5) | MAP-1 (formátum, id-szabály), MAP-2 (AreaId/ZoneId szétválasztás, partíció szerver-configból + bounds-ból) | — | RÉSZLEGES |
+| **R3** WorldBounds / origin az adatból | `DefaultRegions` (fix 100 km), `WorldBounds::FromExtent`, `HeightField` origó 0 — változatlan | mapaudit R3 REPRODUCED; nem-nulla origó / nem-négyzetes v3 `UNSUPPORTED_FEATURE`-rel elutasítva (nem félreolvasva) | MAP-2 | nem-nulla origójú, nem-négyzetes tesztvilág | NYITOTT (őrzött) |
+| **R4** Worldlogic validáció | `ParseWorldLogic` (pontos méret, trailing, fejléc) + `ValidateWorldLogic` + `ValidateWarpTargets`; manifest: capnp-kivétel elkapva, cellSize/méretek validálva | mapaudit R4×2: legacy REPRODUCED / szerver CHANGED; korpusz 21 worldlogic + 19 manifest eset | MAP-1 | hibás-bemenet korpusz minden eleme elutasítva, stabil kóddal ✓ | KÉSZ (szerver-út) |
+| **R5** Csak szerver-releváns adat | `LoadServerWorld`: csak magasság + attribútum marad; splat Startup-ban csak tartomány, Full-ban szerkezet; paletta nem töltődik | mapaudit R5 CHANGED; korpusz `valid-v3-server-only` (splat 0 B), `valid-v3-with-client-data`; indulási teszt 5 | MAP-1; memória-budget MAP-3 (R12) | render-szekció nélküli csomaggal indul, nincs render-adat memóriában ✓ | KÉSZ (budget: MAP-3) |
+| **R6** Warp: region-enter + cooldown | futásidő változatlan (`TryApplyWarp` tickenként); betöltéskor: ciklus = hiba, lánc = warning, cél véges/bounds-on belül/járható | mapaudit R6 PARTIAL; korpusz `worldlogic-warp-*`, `warp-chain-warning`; test_zone: warp 1 → warp 2 lánc (warning) | MAP-1 (betöltési szabály), MAP-4 (él, cooldown, cross-zone warp migrációval) | egyszeri teleport, cross-zone warp | RÉSZLEGES |
+| **R7** Runtime map-útvonal | `main.cpp` `ResolveWorldPlan` (CLI > config > default; config-relatív); a gameserver targetben nincs fordításkori világ-út; bench: `IXTREEME_TEST_MAP_ROOT` | mapaudit R7 CHANGED; indulási teszt 1a/1b (két cwd), 1c (CLI felülírás), 2e (nincs csomag → exit 2) | MAP-1 | másolt bináris configgal indul; config nélkül egyértelmű hiba ✓ | KÉSZ |
+| **R8** Nincs csendes fallback | `TerrainService::LoadFromMapRoot`, `LoadWorldLogicFromMapRoot`, `WorldRuntime(io)` alap-konstruktor törölve; validálás a DB/listen előtt, exit 3; synthetic csak `world_mode=synthetic`, WARN-nal jelölve | mapaudit R8 CHANGED; indulási teszt 2a–2f, 3 | MAP-1 | hiányzó/sérült/invalid csomag → nem-nulla exit, nincs world admission ✓ | KÉSZ (a `BuildFromWorldLogic` üres-logika ága elérhetetlen, a MAP-2 bootstrap-átdolgozáskor törlendő) |
+| **R9** Félig nyitott határ | validátor: félig nyitott (zóna átfedés/lefedés, célpont `[0,extent)`); futásidő: `Rect::Contains` zárt, partíció félig nyitott | mapaudit R9 OPEN | MAP-2 | közös élen egy pont pontosan egy area-hoz | NYITOTT |
+| **R10** Bounds-on kívüli szabály | változatlan (magasság clamp, járhatatlan) | mapaudit R10 OPEN | MAP-2 | egyetlen dokumentált szabály minden lekérdezésben | NYITOTT |
+| **R11** Strukturált hibák, verziózás | `PackageIssue` (stabil kód, package/layer/file/field/offset/chunk/reason/expected), capnp-kivétel lezárva; v2→v3 átmeneti szabály; réteg-verziók | mapaudit R11 CHANGED; korpusz (107 eset) | MAP-1 | — | KÉSZ (szerver-út; legacy kliens-API változatlan) |
+| **R12** Chunk-streamelt szerver-terrain | rezidens magasság + attribútum (test_zone 1.0 MB); `(W+1)(H+1) ≤ 2^28` fölött `MANIFEST_SIZE_OVERFLOW` (100 km / 2 m nem tölthető be MAP-3 előtt) | mapaudit R12 OPEN | MAP-3 | világléptékű memória-mérés streameléssel | NYITOTT |
+| **R13** Spawn a validált csomag része | `mobSpawns` réteg: szigorú szintaxis, véges, bounds, mob-típus registry kereszt-ellenőrzés; area-hivatkozás nincs | mapaudit R13 PARTIAL; korpusz `spawns-*` (11 eset) | MAP-1 (réteg), MAP-4 (area-hivatkozás, generikus spawn) | — | RÉSZLEGES |
+
+### Döntést igénylő pontok a MAP-2/3 előtt
+
+1. **AreaId vs ZoneId:** a worldlogic zónái logikai area-vá válnak; mi adja a
+   szerver kezdeti partícióját (config-rács a bounds-on? egy gyökér + ASF?).
+2. **Origó / nem-négyzetes világ / pontosság:** Float64 origó a formátumban,
+   f32 futásidejű pozíció — elfogadható-e 100 km-en (~8 mm), vagy
+   zóna-lokális koordináta kell?
+3. **Részleges szélső chunk** engedélyezése és a szélső minta tulajdonjoga.
+4. **R10 szabály:** a bounds-on kívüli pont nem létező terület (nem járható,
+   nincs magasság, a mozgás nem léphet ki) — megerősítés.
+5. **Warp-lánc:** R6 szerint a cél nem lehet trigger-régióban; most warning
+   (a becsekkolt test_zone warp 1 célja (760,760) a warp 2 forrásának sarkán
+   van). Hibává tétel esetén a test_zone tartalmát javítani kell (automatikus
+   felülírás nélkül).
+6. **Collision/víz/navigáció terjedelme (MAP-3):** attribútum-bitek (felület,
+   víz, PvP) új réteg-verzióként vagy külön rétegként; útvonal-menti
+   mozgás-ellenőrzés; víz deklarációja (nincs / tengerszint / lokális víztestek);
+   navigációs adat formátuma (jelenleg semmi).
+7. **Streaming:** rezidencia-egység (zóna + ghost-sáv chunkjai), per-zóna és
+   per-process budget, I/O-szál modell, sérült későn betöltött chunk kezelése.
+8. **Kliens és v3:** a kliens v2-n marad (a szerkesztő a chunkokat helyben
+   írja, v3 CRC-t nem frissítene) — konverter vagy kliens-v3 később (kliens
+   nem része a fázisnak).
+9. **Mob-típus registry helye:** szerver-config (nem a csomag része) —
+   megerősítés.
+10. **Worldlogic formátum jövője:** MXL1 bináris marad (v2 area-típusokkal),
+    vagy a korábbi Cap'n Proto `MapLogic` koncepció?
 
 ## Nem cél (ebben a lépésben)
 - Gameplay (combat, AI-viselkedés, loot, quest).

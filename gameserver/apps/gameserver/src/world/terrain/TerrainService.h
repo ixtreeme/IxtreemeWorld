@@ -1,6 +1,6 @@
 #pragma once
 
-#include <string>
+#include <cstddef>
 
 #include "map/MapData.h"
 
@@ -12,17 +12,13 @@ namespace gs::game {
 class TerrainService {
 public:
     TerrainService() = default;
+    // File-backed terrain from a validated world package (MAP-1:
+    // WorldPackageLoader). Throws std::invalid_argument for an invalid field
+    // -- there is no silent flat fallback any more.
     explicit TerrainService(mx::map::HeightField field);
-    // Synthetic world seam (integrated-scale benchmarks): flat, fully
-    // walkable terrain with an explicit extent. Production always loads the
-    // real height field from the map root; a 100km world cannot ship a
-    // 100km^2 heightfield asset, so benchmarks need this explicit extent.
-    // The default (no terrain) fallback stays the historic 1000m.
+    // Synthetic world seam (explicit synthetic mode / integrated-scale
+    // benchmarks): flat, fully walkable terrain with an explicit extent.
     explicit TerrainService(float flat_extent_meters);
-
-    // Loads the height field from a map root directory. Returns an invalid
-    // (flat-fallback) service when the asset cannot be loaded.
-    static TerrainService LoadFromMapRoot(const std::string& map_root);
 
     bool HasTerrain() const noexcept
     {
@@ -32,10 +28,12 @@ public:
     float SampleGroundHeight(float world_x, float world_y) const noexcept;
     bool IsWalkable(float world_x, float world_y) const noexcept;
     float WorldExtentMeters() const noexcept;
+    // Bytes held by the resident height + attribute arrays.
+    std::size_t ResidentBytes() const noexcept;
 
 private:
     mx::map::HeightField field_;
-    float flat_extent_m_ = 1000.0f; // used when the height field is invalid
+    float flat_extent_m_ = 1000.0f; // synthetic / not-yet-initialized service
 };
 
 } // namespace gs::game

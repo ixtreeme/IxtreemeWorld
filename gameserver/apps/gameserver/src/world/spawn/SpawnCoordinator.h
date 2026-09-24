@@ -62,8 +62,9 @@ public:
                      RuntimeIdentity identity,
                      WorldDirectory& directory);
 
-    // Loads prototypes + spawn points and spawns the configured mobs.
-    void Initialize(const std::string& map_root, const std::string& mob_types_config);
+    // Loads prototypes, takes the (package-validated) spawn points and spawns
+    // the configured mobs.
+    void Initialize(std::vector<MobSpawnPoint> spawn_points, const std::string& mob_types_config);
     // Synthetic-world seam (integrated-scale benchmarks): load only the mob
     // prototypes, then let the caller register spawn points and trigger the
     // bulk spawn explicitly. Production uses Initialize above.

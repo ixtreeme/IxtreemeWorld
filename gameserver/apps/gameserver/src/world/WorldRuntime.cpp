@@ -25,47 +25,8 @@
 #include "WorldConstants.h"
 
 namespace gs::game {
-namespace {
 
-mx::map::WorldLogic LoadWorldLogicFromMapRoot(const std::string& map_root)
-{
-    const std::filesystem::path root(map_root);
-    auto logic = mx::map::LoadWorldLogic(
-        [&root](std::string_view path) -> std::optional<std::vector<std::uint8_t>> {
-            std::filesystem::path normalized(path);
-            std::ifstream file(root / normalized.relative_path(), std::ios::binary | std::ios::ate);
-            if (!file) {
-                return std::nullopt;
-            }
-            const auto end = file.tellg();
-            if (end < 0) {
-                return std::nullopt;
-            }
-            std::vector<std::uint8_t> bytes(static_cast<std::size_t>(end));
-            file.seekg(0);
-            if (!bytes.empty()) {
-                file.read(reinterpret_cast<char*>(bytes.data()), static_cast<std::streamsize>(bytes.size()));
-                if (!file) {
-                    return std::nullopt;
-                }
-            }
-            return bytes;
-        },
-        ".");
-    if (logic) {
-        LOG_INFO("Game sim loaded worldlogic: zones={} spawns={} warps={}",
-                 logic->zones.size(),
-                 logic->spawns.size(),
-                 logic->warps.size());
-        return std::move(*logic);
-    }
-    LOG_WARN("Game sim worldlogic load failed from {}; using fallback single zone", map_root);
-    return mx::map::WorldLogic{};
-}
-
-} // namespace
-
-WorldRuntime::WorldRuntime(boost::asio::io_context& io, RuntimeIdentity identity)
+WorldRuntime::WorldRuntime(boost::asio::io_context& io, RuntimeIdentity identity, ConstructMembersOnly)
     : io_(io)
     , workers_([this](std::size_t zone_index) {
         TickZone(zone_index);
@@ -108,18 +69,21 @@ WorldRuntime::WorldRuntime(boost::asio::io_context& io, RuntimeIdentity identity
             deaths_total_.fetch_add(1, std::memory_order_relaxed);
         }
     };
-    const std::string map_root = IXTREEME_DEFAULT_MAP_ROOT;
-    InitializeWorld(TerrainService::LoadFromMapRoot(map_root),
-                    LoadWorldLogicFromMapRoot(map_root),
-                    IXTREEME_DEFAULT_MOB_TYPES_CONFIG,
-                    map_root,
-                    true);
+}
+
+WorldRuntime::WorldRuntime(boost::asio::io_context& io, RuntimeIdentity identity, LoadedWorld world)
+    : WorldRuntime(io, identity, ConstructMembersOnly{})
+{
+    InitializeWorld(TerrainService(std::move(world.terrain)),
+                    std::move(world.logic),
+                    world.mob_types_config,
+                    std::move(world.spawn_points));
 }
 
 WorldRuntime::WorldRuntime(boost::asio::io_context& io,
                            RuntimeIdentity identity,
                            const SyntheticWorldConfig& synthetic)
-    : WorldRuntime(io, identity)
+    : WorldRuntime(io, identity, ConstructMembersOnly{})
 {
     // Deterministic synthetic zone grid tiling [0, extent]^2. Region
     // assignment (DefaultRegions quadrants) happens in BuildFromWorldLogic.
@@ -149,17 +113,24 @@ WorldRuntime::WorldRuntime(boost::asio::io_context& io,
         1, logic.zones.front().id,
         mx::map::Rect{extent * 0.5f - 50.0f, extent * 0.5f - 50.0f, extent * 0.5f + 50.0f,
                       extent * 0.5f + 50.0f}});
-    const std::string types = synthetic.mob_types_config.empty()
-                                  ? std::string(IXTREEME_DEFAULT_MOB_TYPES_CONFIG)
-                                  : synthetic.mob_types_config;
-    InitializeWorld(TerrainService(extent), std::move(logic), types, std::string{}, false);
+    std::string types = synthetic.mob_types_config;
+#ifdef IXTREEME_DEFAULT_MOB_TYPES_CONFIG
+    if (types.empty()) {
+        types = IXTREEME_DEFAULT_MOB_TYPES_CONFIG; // bench builds only
+    }
+#endif
+    InitializeWorld(TerrainService(extent), std::move(logic), types, std::nullopt);
+    LOG_INFO("World: SYNTHETIC flat {}m x {}m, {}x{} bootstrap zones (explicit synthetic mode, no package)",
+             extent,
+             extent,
+             zones_x,
+             zones_y);
 }
 
 void WorldRuntime::InitializeWorld(TerrainService terrain,
                                    mx::map::WorldLogic logic,
                                    const std::string& mob_types_config,
-                                   const std::string& map_root,
-                                   bool load_map_spawn_points)
+                                   std::optional<std::vector<MobSpawnPoint>> package_spawn_points)
 {
     terrain_ = std::move(terrain);
     world_logic_ = std::move(logic);
@@ -184,11 +155,13 @@ void WorldRuntime::InitializeWorld(TerrainService terrain,
     }
     effective_load_field_config_ = load_field_config;
     last_load_field_build_ = std::chrono::steady_clock::now();
-    if (load_map_spawn_points) {
-        spawn_.Initialize(map_root, mob_types_config);
+    if (package_spawn_points) {
+        spawn_.Initialize(std::move(*package_spawn_points), mob_types_config);
     } else {
         spawn_.ClearSpawnPoints();
-        spawn_.LoadMobTypes(mob_types_config);
+        if (!mob_types_config.empty()) {
+            spawn_.LoadMobTypes(mob_types_config);
+        }
     }
 }
 
@@ -311,7 +284,13 @@ void WorldRuntime::TickZone(std::size_t zone_index)
 
 void WorldRuntime::Run()
 {
-    sim_thread_id_ = std::this_thread::get_id();
+    sim_thread_id_.store(std::this_thread::get_id(), std::memory_order_release);
+    {
+        // From here on snapshot requests are queued and served in quiescent
+        // windows of this loop instead of being captured inline.
+        std::lock_guard lock(snapshot_mutex_);
+        snapshot_serving_ = true;
+    }
 
     workers_.Start(requested_workers_);
 
@@ -340,6 +319,9 @@ void WorldRuntime::Run()
         }
         last_phase_sample_ = supervisor_start;
         DrainGlobalCommands();
+        // MAP-0 snapshot point 1: top of the pass, after the cv wait -- the
+        // ticks dispatched by the previous pass have usually finished here.
+        ServeSnapshots();
         const auto migration_start = std::chrono::steady_clock::now();
         migration_.ProcessMigrations(world_tick_.load(std::memory_order_relaxed));
         partition_metrics_.migration_us.fetch_add(
@@ -549,6 +531,9 @@ void WorldRuntime::Run()
                                 });
         ExecutePartitionControl();
         ReclaimRetiredZones(); // H9: bounded zone table (quiescent windows only)
+        // MAP-0 snapshot point 2: after this pass's topology step (a split or
+        // merge that just committed is visible at once).
+        ServeSnapshots();
         const auto supervisor_micros = static_cast<std::uint64_t>(
             std::chrono::duration_cast<std::chrono::microseconds>(std::chrono::steady_clock::now() -
                                                                  supervisor_start)
@@ -905,10 +890,24 @@ void WorldRuntime::Run()
     while (zones_.AnyTickInProgress()) {
         std::this_thread::sleep_for(std::chrono::milliseconds(1));
     }
-    zones_.Clear();
-    owners_by_session_.clear();
-    spawn_.ClearPresence();
-    spawn_.ClearRespawns();
+    {
+        // Last quiescent window: answer every queued request against the
+        // final world, then tear down under the same lock so no late request
+        // can observe a half-cleared world (later ones capture it inline).
+        std::lock_guard lock(snapshot_mutex_);
+        snapshot_serving_ = false;
+        std::vector<PendingSnapshot> batch;
+        batch.swap(pending_snapshots_);
+        snapshots_pending_.store(false, std::memory_order_release);
+        if (!batch.empty()) {
+            RunSnapshotBatch(batch, ++snapshot_epoch_);
+        }
+        zones_.Clear();
+        owners_by_session_.clear();
+        spawn_.ClearPresence();
+        spawn_.ClearRespawns();
+    }
+    sim_thread_id_.store(std::thread::id{}, std::memory_order_release);
     LOG_INFO("Game sim supervisor stopped");
 }
 
@@ -1148,6 +1147,80 @@ std::uint64_t ElapsedUs(std::chrono::steady_clock::time_point from,
 }
 
 } // namespace
+
+namespace {
+// Set while snapshot collectors run on this thread: a collector that asked
+// for another snapshot would wait on (or, in the locked shutdown / inline
+// paths, re-lock) the very capture it is part of.
+thread_local bool t_in_snapshot_collector = false;
+} // namespace
+
+void WorldRuntime::EnqueueSnapshot(std::function<void(const SnapshotContext&)> task)
+{
+    if (t_in_snapshot_collector) {
+        throw std::logic_error("snapshot requested from inside a snapshot collector");
+    }
+    std::lock_guard lock(snapshot_mutex_);
+    if (snapshot_serving_) {
+        pending_snapshots_.push_back(PendingSnapshot{std::move(task), std::chrono::steady_clock::now()});
+        snapshots_pending_.store(true, std::memory_order_release);
+        return;
+    }
+    // Not running (before Start, or after Stop tore the world down): nothing
+    // else mutates the world, and Run() takes this same lock before touching
+    // it, so the capture happens right here.
+    std::vector<PendingSnapshot> batch;
+    batch.push_back(PendingSnapshot{std::move(task), std::chrono::steady_clock::now()});
+    RunSnapshotBatch(batch, ++snapshot_epoch_);
+}
+
+void WorldRuntime::RunSnapshotBatch(std::vector<PendingSnapshot>& batch, std::uint64_t epoch)
+{
+    const auto now = std::chrono::steady_clock::now();
+    const SnapshotContext ctx{zones_,
+                              owners_by_session_,
+                              epoch,
+                              world_tick_.load(std::memory_order_relaxed),
+                              now,
+                              zones_.GetReclaimStats()};
+    struct CollectorScope {
+        CollectorScope() { t_in_snapshot_collector = true; }
+        ~CollectorScope() { t_in_snapshot_collector = false; }
+    } scope;
+    for (auto& pending : batch) {
+        const auto waited =
+            static_cast<std::uint64_t>(std::chrono::duration_cast<std::chrono::microseconds>(
+                                           now - pending.requested_at)
+                                           .count());
+        if (waited > snapshot_max_wait_us_.load(std::memory_order_relaxed)) {
+            snapshot_max_wait_us_.store(waited, std::memory_order_relaxed);
+        }
+        pending.task(ctx); // exceptions travel through the promise
+        snapshot_requests_.fetch_add(1, std::memory_order_relaxed);
+    }
+    snapshot_captures_.fetch_add(1, std::memory_order_relaxed);
+}
+
+void WorldRuntime::ServeSnapshots()
+{
+    // Quiescent window only: no zone tick in flight (per-zone gauges are
+    // stable) and between two topology operations (this runs after the
+    // partition control / reclamation step of the pass).
+    if (!snapshots_pending_.load(std::memory_order_acquire) || zones_.AnyTickInProgress()) {
+        return;
+    }
+    std::vector<PendingSnapshot> batch;
+    std::uint64_t epoch = 0;
+    {
+        std::lock_guard lock(snapshot_mutex_);
+        batch.swap(pending_snapshots_);
+        snapshots_pending_.store(false, std::memory_order_release);
+        epoch = ++snapshot_epoch_;
+    }
+    if (!batch.empty()) {
+        RunSnapshotBatch(batch, epoch);
+    }
+}
 
 void WorldRuntime::ReclaimRetiredZones()
 {

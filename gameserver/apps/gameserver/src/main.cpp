@@ -6,6 +6,8 @@
 #include <filesystem>
 #include <iostream>
 #include <limits>
+#include <memory>
+#include <optional>
 #include <string>
 #include <thread>
 #include <vector>
@@ -30,23 +32,282 @@ namespace {
 struct AppOptions {
     std::filesystem::path config_path = "gameserver.conf";
     std::filesystem::path database_config_path = "database.json";
+    // World selection overrides (MAP-1). CLI paths are relative to the
+    // working directory at launch and made absolute immediately.
+    std::optional<std::string> world_mode;
+    std::optional<std::filesystem::path> world_package;
+    std::optional<std::filesystem::path> mob_types_config;
+    std::optional<std::filesystem::path> validate_package; // offline check, then exit
+    bool startup_check = false; // full startup (world, DB, listen), then clean exit
 };
+
+[[noreturn]] void Usage()
+{
+    std::cerr << "Usage: gameserver [--config path] [--database-config path]\n"
+                 "                  [--world-mode file|synthetic] [--world-package dir] [--mob-types path]\n"
+                 "                  [--startup-check]\n"
+                 "       gameserver --validate-world-package dir [--mob-types path] [--config path]\n";
+    std::exit(1);
+}
 
 AppOptions ParseArgs(int argc, char* argv[])
 {
     AppOptions options;
     for (int i = 1; i < argc; ++i) {
         const std::string arg = argv[i];
-        if (arg == "--config" && i + 1 < argc) {
+        const bool has_value = i + 1 < argc;
+        if (arg == "--config" && has_value) {
             options.config_path = argv[++i];
-        } else if (arg == "--database-config" && i + 1 < argc) {
+        } else if (arg == "--database-config" && has_value) {
             options.database_config_path = argv[++i];
+        } else if (arg == "--world-mode" && has_value) {
+            options.world_mode = argv[++i];
+        } else if (arg == "--world-package" && has_value) {
+            options.world_package = std::filesystem::absolute(argv[++i]);
+        } else if (arg == "--mob-types" && has_value) {
+            options.mob_types_config = std::filesystem::absolute(argv[++i]);
+        } else if (arg == "--validate-world-package" && has_value) {
+            options.validate_package = std::filesystem::absolute(argv[++i]);
+        } else if (arg == "--startup-check") {
+            options.startup_check = true;
         } else {
-            std::cerr << "Usage: gameserver [--config path] [--database-config path]\n";
-            std::exit(1);
+            Usage();
         }
     }
     return options;
+}
+
+// ---- world selection (MAP-1) -------------------------------------------------
+// Precedence: command line > config file > built-in default. Bases: a CLI
+// path is relative to the working directory at launch; a config value is
+// relative to the directory holding the config file (never to the cwd), so
+// the same config finds the same package from any working directory.
+// Defaults: world_mode = file; there is no default package or mob type path
+// -- file mode without them is a startup error, not a fallback.
+struct WorldPlan {
+    bool synthetic = false;
+    std::filesystem::path package;
+    std::string package_source;
+    std::filesystem::path mob_types;
+    std::string mob_types_source;
+    gs::game::WorldRuntime::SyntheticWorldConfig synthetic_config;
+    std::string error;
+};
+
+std::filesystem::path ConfigRelative(const std::filesystem::path& config_dir, const std::string& value)
+{
+    const std::filesystem::path path(value);
+    return (path.is_absolute() ? path : config_dir / path).lexically_normal();
+}
+
+// A key that is present but empty counts as not configured.
+std::optional<std::string> NonEmpty(const gs::common::Config& config, const char* key)
+{
+    auto value = config.GetString(key);
+    if (value && value->empty()) {
+        value.reset();
+    }
+    return value;
+}
+
+WorldPlan ResolveWorldPlan(const AppOptions& options,
+                           const gs::common::Config& config,
+                           const std::filesystem::path& config_dir)
+{
+    WorldPlan plan;
+    const std::string mode = options.world_mode.value_or(config.GetString("world_mode").value_or("file"));
+    if (mode != "file" && mode != "synthetic") {
+        plan.error = "world_mode '" + mode + "' is not 'file' or 'synthetic'";
+        return plan;
+    }
+    plan.synthetic = mode == "synthetic";
+    if (options.mob_types_config) {
+        plan.mob_types = *options.mob_types_config;
+        plan.mob_types_source = "cli";
+    } else if (const auto value = NonEmpty(config, "mob_types_config")) {
+        plan.mob_types = ConfigRelative(config_dir, *value);
+        plan.mob_types_source = "config";
+    }
+    if (plan.synthetic) {
+        const auto extent = config.GetString("synthetic_extent_m");
+        plan.synthetic_config.extent_m = 4000.0f;
+        if (extent) {
+            try {
+                plan.synthetic_config.extent_m = std::stof(*extent);
+            } catch (const std::exception&) {
+                plan.error = "synthetic_extent_m '" + *extent + "' is not a number";
+                return plan;
+            }
+        }
+        const int zx = config.GetInt("synthetic_zones_x").value_or(2);
+        const int zy = config.GetInt("synthetic_zones_y").value_or(2);
+        if (!(plan.synthetic_config.extent_m >= 500.0f && plan.synthetic_config.extent_m <= 1000000.0f) ||
+            zx < 1 || zy < 1 || zx > 64 || zy > 64) {
+            plan.error = "synthetic world needs 500 <= synthetic_extent_m <= 1000000 and 1..64 zones per axis";
+            return plan;
+        }
+        plan.synthetic_config.zones_x = static_cast<std::uint32_t>(zx);
+        plan.synthetic_config.zones_y = static_cast<std::uint32_t>(zy);
+        plan.synthetic_config.mob_types_config = plan.mob_types.string();
+        return plan;
+    }
+    if (options.world_package) {
+        plan.package = *options.world_package;
+        plan.package_source = "cli --world-package";
+    } else if (const auto value = NonEmpty(config, "world_package")) {
+        plan.package = ConfigRelative(config_dir, *value);
+        plan.package_source = "config world_package";
+    } else {
+        plan.error = "world_mode=file but no world package is configured (set world_package in the config or "
+                     "pass --world-package)";
+        return plan;
+    }
+    if (plan.mob_types.empty()) {
+        plan.error = "world_mode=file but no mob type registry is configured (set mob_types_config or pass "
+                     "--mob-types)";
+    }
+    return plan;
+}
+
+void PrintPackageReport(const mx::map::PackageReport& report)
+{
+    for (const auto& issue : report.issues) {
+        std::cout << "  " << issue.Format() << "\n";
+    }
+    const auto& m = report.manifest;
+    if (m.format_version != 0) {
+        std::cout << "  package: world_id=" << m.world_id << " format=v" << m.format_version
+                  << " cells=" << m.size_cells_x << "x" << m.size_cells_y << " cell=" << m.cell_size_m
+                  << "m chunks=" << m.chunk_grid_x << "x" << m.chunk_grid_y << " of " << m.chunk_size_cells
+                  << " cells\n";
+        for (const auto& layer : m.layers) {
+            std::cout << "  layer " << mx::map::ToString(layer.kind) << ": " << mx::map::ToString(layer.status)
+                      << (layer.required ? " required" : " optional") << " audience="
+                      << mx::map::ToString(layer.audience) << (layer.implied ? " (v2 implied)" : "")
+                      << (layer.file.empty() ? "" : " file=" + layer.file) << "\n";
+        }
+    }
+    std::cout << "RESULT: " << (report.Ok() ? "VALID" : "INVALID")
+              << " errors=" << report.Count(mx::map::IssueSeverity::Error)
+              << " warnings=" << report.Count(mx::map::IssueSeverity::Warning)
+              << " infos=" << report.Count(mx::map::IssueSeverity::Info) << " files=" << report.files_read
+              << " bytes=" << report.bytes_read << " chunks=" << report.chunks_checked
+              << " ms=" << report.elapsed_ms << "\n";
+}
+
+// One startup summary for the world actually running: identity, format,
+// resolved path, bounds/origin/unit, chunk geometry, declared layers, load
+// mode, memory + I/O, regions / leaf zones (read through a supervisor
+// snapshot) and the real worker count.
+void LogWorldStartupSummary(gs::game::WorldRuntime& sim,
+                            const WorldPlan& plan,
+                            const mx::map::PackageReport& report,
+                            std::size_t spawn_points,
+                            std::size_t mob_types)
+{
+    struct TopologyView {
+        std::size_t regions = 0;
+        std::size_t leaves = 0;
+        std::size_t slots = 0;
+        float extent_m = 0.0f;
+    };
+    auto future = sim.CaptureSnapshot<TopologyView>([](const gs::game::WorldRuntime::SnapshotContext& snap) {
+        TopologyView view;
+        view.regions = snap.zones.PartitionRoots().size();
+        view.leaves = snap.zones.GetActiveLeaves().size();
+        view.slots = snap.zones.ZoneCount();
+        return view;
+    });
+    TopologyView topology;
+    if (!sim.WaitSnapshot(future, std::chrono::seconds(10), topology)) {
+        LOG_WARN("World startup summary: topology snapshot not served within 10s");
+    }
+    std::size_t workers = 0;
+    for (int i = 0; i < 200 && workers == 0; ++i) {
+        workers = sim.SchedulerStats().workers;
+        if (workers == 0) {
+            std::this_thread::sleep_for(std::chrono::milliseconds(10));
+        }
+    }
+    if (plan.synthetic) {
+        LOG_WARN("World startup summary: mode=SYNTHETIC extent={}m x {}m origin=(0,0) terrain=flat (no package) "
+                 "regions={} leaf_zones={} zone_slots={} workers={} -- benchmark/dev world",
+                 plan.synthetic_config.extent_m,
+                 plan.synthetic_config.extent_m,
+                 topology.regions,
+                 topology.leaves,
+                 topology.slots,
+                 workers);
+        return;
+    }
+    const auto& m = report.manifest;
+    std::string layers;
+    for (const auto& layer : m.layers) {
+        if (!layers.empty()) {
+            layers += ", ";
+        }
+        layers += std::string(mx::map::ToString(layer.kind)) + ":" + mx::map::ToString(layer.status) + "/" +
+                  mx::map::ToString(layer.audience) + (layer.required ? "/required" : "/optional");
+    }
+    LOG_INFO("World startup summary: mode=file world_id={} name='{}' format=v{} path={} bounds=(0,0)-({},{})m "
+             "origin=({},{}) cell={}m height_unit=cm chunks={}x{} of {} cells layers=[{}] validation=startup",
+             m.world_id,
+             m.world_name,
+             m.format_version,
+             report.root.string(),
+             m.ExtentX(),
+             m.ExtentY(),
+             m.origin_x,
+             m.origin_y,
+             m.cell_size_m,
+             m.chunk_grid_x,
+             m.chunk_grid_y,
+             m.chunk_size_cells,
+             layers);
+    LOG_INFO("World startup summary: load=eager-resident files={} bytes={} chunks={} load_ms={:.1f} "
+             "resident_terrain={}KB runtime_io=none (whole terrain resident; streaming + budgets arrive with "
+             "MAP-3) spawn_points={} mob_types={} regions={} leaf_zones={} zone_slots={} workers={} "
+             "issues: {} warning(s), {} info",
+             report.files_read,
+             report.bytes_read,
+             report.chunks_checked,
+             report.elapsed_ms,
+             report.resident_terrain_bytes / 1024,
+             spawn_points,
+             mob_types,
+             topology.regions,
+             topology.leaves,
+             topology.slots,
+             workers,
+             report.Count(mx::map::IssueSeverity::Warning),
+             report.Count(mx::map::IssueSeverity::Info));
+}
+
+// Offline validator: every layer of the package at Full depth (plus the
+// server's mob type cross-check when a registry is known). No DB, no network,
+// no world runtime. Exit 0 = valid, 3 = invalid.
+int RunValidateOnly(const AppOptions& options)
+{
+    gs::common::InitLogging("warn", {});
+    gs::common::Config config;
+    const bool config_loaded = config.Load(options.config_path);
+    std::filesystem::path mob_types;
+    if (options.mob_types_config) {
+        mob_types = *options.mob_types_config;
+    } else if (const auto value = config_loaded ? NonEmpty(config, "mob_types_config") : std::nullopt) {
+        mob_types = ConfigRelative(std::filesystem::absolute(options.config_path).parent_path(), *value);
+    }
+    std::cout << "Validating world package " << options.validate_package->string() << " (depth=full"
+              << (mob_types.empty() ? ", no mob type registry: spawn type cross-check skipped" : "") << ")\n";
+    mx::map::PackageReport report;
+    if (mob_types.empty()) {
+        report = mx::map::ValidatePackage(*options.validate_package);
+    } else {
+        gs::game::WorldLoadRequest request{*options.validate_package, mob_types, mx::map::ValidationDepth::Full};
+        (void)gs::game::LoadWorldPackage(request, report);
+    }
+    PrintPackageReport(report);
+    return report.Ok() ? 0 : 3;
 }
 
 std::uint16_t ResolvePort(const gs::common::Config& config)
@@ -347,9 +608,13 @@ int main(int argc, char* argv[])
 {
     try {
         const auto options = ParseArgs(argc, argv);
+        if (options.validate_package) {
+            return RunValidateOnly(options);
+        }
 
         gs::common::Config config;
         const bool loaded = config.Load(options.config_path);
+        const auto config_dir = std::filesystem::absolute(options.config_path).parent_path();
 
         const auto port = ResolvePort(config);
         const auto io_threads = ResolveIoThreads(config);
@@ -361,6 +626,47 @@ int main(int argc, char* argv[])
         gs::common::InitLogging(log_level, log_file);
         if (!loaded) {
             LOG_WARN("Config file '{}' not found, using defaults", options.config_path.string());
+        }
+
+        // ---- World first (MAP-1): the package is loaded and validated before
+        // anything with side effects exists (no DB connection, no listener, no
+        // runtime). A rejected package ends the process here -- there is no
+        // flat/fallback world.
+        const WorldPlan plan = ResolveWorldPlan(options, config, config_dir);
+        if (!plan.error.empty()) {
+            LOG_ERROR("World configuration invalid: {}", plan.error);
+            std::cerr << "Fatal: world configuration invalid: " << plan.error << '\n';
+            return 2;
+        }
+        std::optional<gs::game::LoadedWorld> loaded_world;
+        if (!plan.synthetic) {
+            LOG_INFO("World package: mode=file path={} (from {}) mob_types={} (from {})",
+                     plan.package.string(),
+                     plan.package_source,
+                     plan.mob_types.string(),
+                     plan.mob_types_source);
+            mx::map::PackageReport report;
+            loaded_world = gs::game::LoadWorldPackage(
+                gs::game::WorldLoadRequest{plan.package, plan.mob_types, mx::map::ValidationDepth::Startup},
+                report);
+            gs::game::LogPackageReport(report);
+            if (!loaded_world) {
+                const auto* first = report.FirstError();
+                LOG_ERROR("World package rejected ({} error(s)); refusing to start. No fallback world.",
+                          report.Count(mx::map::IssueSeverity::Error));
+                std::cerr << "Fatal: world package " << plan.package.string() << " rejected ("
+                          << report.Count(mx::map::IssueSeverity::Error) << " error(s)); first: "
+                          << (first != nullptr ? first->Format() : std::string("?")) << '\n';
+                return 3;
+            }
+        } else {
+            LOG_WARN("World mode SYNTHETIC (explicit): flat {}m x {}m world, {}x{} bootstrap zones, mob_types={} "
+                     "-- benchmark/dev only, NOT a real map",
+                     plan.synthetic_config.extent_m,
+                     plan.synthetic_config.extent_m,
+                     plan.synthetic_config.zones_x,
+                     plan.synthetic_config.zones_y,
+                     plan.mob_types.empty() ? std::string("none") : plan.mob_types.string());
         }
 
         if (sodium_init() < 0) {
@@ -382,7 +688,19 @@ int main(int argc, char* argv[])
                  runtime_identity.node.value,
                  runtime_identity.process.value,
                  gs::game::NamespaceFor(runtime_identity));
-        gs::game::WorldRuntime sim(io, runtime_identity);
+        mx::map::PackageReport world_report;
+        std::size_t spawn_point_count = 0;
+        std::size_t mob_type_count = 0;
+        if (loaded_world) {
+            world_report = loaded_world->report;
+            spawn_point_count = loaded_world->spawn_points.size();
+            mob_type_count = loaded_world->mob_type_count;
+        }
+        auto sim_ptr = loaded_world
+                           ? std::make_unique<gs::game::WorldRuntime>(io, runtime_identity, std::move(*loaded_world))
+                           : std::make_unique<gs::game::WorldRuntime>(io, runtime_identity, plan.synthetic_config);
+        loaded_world.reset();
+        gs::game::WorldRuntime& sim = *sim_ptr;
         // Zone worker threads: 0/absent = hardware_concurrency - 1 (H6: never
         // derived from the seed zone count; splits add zones at runtime).
         if (const auto zone_workers = config.GetInt("zone_workers"); zone_workers && *zone_workers > 0) {
@@ -392,6 +710,7 @@ int main(int argc, char* argv[])
         sim.ConfigureSimulationLod(ResolveLodConfig(config));
         sim.ConfigureLoadField(ResolveLoadFieldConfig(config));
         sim.Start();
+        LogWorldStartupSummary(sim, plan, world_report, spawn_point_count, mob_type_count);
 
         const auto session_limits = ResolveSessionLimits(config);
         const auto connection_policy = ResolveConnectionPolicy(config);
@@ -433,6 +752,19 @@ int main(int argc, char* argv[])
         });
 
         server.Start();
+
+        if (options.startup_check) {
+            // Full startup reached (validated world running, DB connected,
+            // listener bound): stop in order instead of serving.
+            LOG_INFO("Startup check passed: world running, database connected, listening on port {}; "
+                     "shutting down",
+                     port);
+            std::cout << "STARTUP-CHECK OK port=" << port << '\n';
+            server.Stop();
+            sim.Stop();
+            db_pool.Stop();
+            return 0;
+        }
 
         std::vector<std::thread> io_workers;
         io_workers.reserve(io_threads > 0 ? io_threads - 1 : 0);

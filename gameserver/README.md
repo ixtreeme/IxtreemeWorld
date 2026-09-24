@@ -80,6 +80,20 @@ configuration directory, for example:
 ./build/windows-debug/apps/gameserver/Debug/gameserver.exe --config gameserver.conf
 ```
 
+The world comes from runtime configuration only (see
+`config/gameserver.conf.example`): `world_mode=file` (default) needs
+`world_package` (relative to the config file) or `--world-package <dir>`
+(relative to the working directory) plus `mob_types_config` / `--mob-types`.
+A missing or invalid package stops the process before the database or the
+listener is touched (exit 3); there is no fallback world. `world_mode=synthetic`
+starts an explicitly marked flat benchmark world. Package format and rules:
+`docs/map-data-format.md`.
+
+```sh
+gameserver --validate-world-package <dir> [--mob-types <file>]   # offline, every layer
+gameserver --config <conf> --startup-check                       # full startup, then exit
+```
+
 ## Test
 
 The world simulation is exercised by `worldbench` (built when
@@ -101,6 +115,14 @@ prints `...: PASS|FAIL` lines and ends with `BENCH-DONE <mode> failures=N`.
   = one presence), `asfdeterminism`, `workerpool`, `replv2`, `protocol`
   (malformed/adversarial input), `reclamation` (`--cycles N` split/merge
   cycles), `hygiene`.
+- Map data layer: `mapaudit` (legacy loader vs server path per R1-R13),
+  `worldpackage` (package corpus through the server loader; `--fixtures-out
+  <dir>` also writes startup fixtures), `snapshot` (`--cycles N`: bench
+  snapshots under split/merge/reclaim). The real startup path is exercised by
+  `scripts/map1_startup_acceptance.sh`.
+
+Benches read a running world only through supervisor snapshots
+(`bench/BenchSnapshot.h`, `ReadWorld`), never through `sim.Zones()` directly.
 
 ## Login server
 
