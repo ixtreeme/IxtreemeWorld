@@ -7,6 +7,7 @@
 #include <filesystem>
 #include <fstream>
 #include <unordered_map>
+#include <unordered_set>
 
 #include "common/Logging.h"
 
@@ -547,6 +548,7 @@ void WorldRuntime::Run()
                                     }
                                 });
         ExecutePartitionControl();
+        ReclaimRetiredZones(); // H9: bounded zone table (quiescent windows only)
         const auto supervisor_micros = static_cast<std::uint64_t>(
             std::chrono::duration_cast<std::chrono::microseconds>(std::chrono::steady_clock::now() -
                                                                  supervisor_start)
@@ -1147,6 +1149,47 @@ std::uint64_t ElapsedUs(std::chrono::steady_clock::time_point from,
 
 } // namespace
 
+void WorldRuntime::ReclaimRetiredZones()
+{
+    const std::uint32_t tick = world_tick_.load(std::memory_order_relaxed);
+    zones_.SetWorldTick(tick); // grace clock for slots retired from here on
+    if (zones_.HasRetiredPending() && tick != last_reclaim_tick_ && !zones_.AnyTickInProgress()) {
+        last_reclaim_tick_ = tick;
+        // Runtime-held references (built lazily, once, only if some slot
+        // passed every ZoneManager-side check): the owner map's fast-path
+        // zone_index, and zone ids in queued migration requests (the only
+        // in-flight migration state; the transport is synchronous).
+        std::vector<std::uint8_t> referenced;
+        std::unordered_set<ZoneId> migrating;
+        bool built = false;
+        const auto reclaimed = zones_.ReclaimRetiredSlots(tick, [&](std::size_t index) {
+            if (!built) {
+                referenced.assign(zones_.ZoneCount(), 0);
+                for (const auto& [session, owner] : owners_by_session_) {
+                    (void)session;
+                    if (owner.zone_index < referenced.size()) {
+                        referenced[owner.zone_index] = 1;
+                    }
+                }
+                for (const auto& request : migration_queue_.RequestSnapshot()) {
+                    migrating.insert(request.source_zone_id);
+                    migrating.insert(request.target_zone_id);
+                }
+                built = true;
+            }
+            return (index < referenced.size() && referenced[index] != 0) ||
+                   migrating.contains(zones_.GetZone(index).Id());
+        });
+        for (const ZoneId id : reclaimed) {
+            directory_.ForgetRetiredZone(id); // retention no longer needed
+            why_not_last_logged_.erase(id);
+        }
+    }
+    const auto stats = zones_.GetReclaimStats();
+    std::lock_guard lock(reclaim_stats_mutex_);
+    reclaim_stats_ = stats;
+}
+
 void WorldRuntime::ExecutePartitionControl()
 {
     // Topology mutation must never race worker zone ticks: bail unless the
@@ -1683,7 +1726,7 @@ bool WorldRuntime::ZoneHasPendingMigration(ZoneId zone_id) const
 void WorldRuntime::ExecuteForcedSplit(ZoneId zone_id)
 {
     if (zones_.AnyTickInProgress()) {
-        LOG_WARN("partition: forced split deferred (tick in flight), re-queued");
+        LOG_DEBUG("partition: forced split deferred (tick in flight), re-queued");
         PostForceSplit(zone_id);
         return;
     }
@@ -1695,13 +1738,21 @@ void WorldRuntime::ExecuteForcedSplit(ZoneId zone_id)
         PostForceSplit(zone_id);
         return;
     }
+    if (ZoneHasPendingMigration(zone_id)) {
+        // The transaction refuses a zone with a racing migration ("retry next
+        // cycle" -- right for the 1 Hz adaptive path); a forced split would
+        // otherwise be silently dropped. Migrations settle within a pass.
+        LOG_DEBUG("partition: forced split deferred (racing migration), re-queued");
+        PostForceSplit(zone_id);
+        return;
+    }
     RunSplitTransaction(zone_id, true, nullptr);
 }
 
 void WorldRuntime::ExecuteForcedMerge(ZoneId parent_node_id)
 {
     if (zones_.AnyTickInProgress()) {
-        LOG_WARN("partition: forced merge deferred (tick in flight), re-queued");
+        LOG_DEBUG("partition: forced merge deferred (tick in flight), re-queued");
         PostForceMerge(parent_node_id);
         return;
     }
@@ -1711,6 +1762,20 @@ void WorldRuntime::ExecuteForcedMerge(ZoneId parent_node_id)
         LOG_DEBUG("partition: forced merge deferred (commands pending), re-queued");
         PostForceMerge(parent_node_id);
         return;
+    }
+    {
+        // Same as the split: a racing migration between the children makes
+        // the transaction refuse, which must not drop a forced merge.
+        ZoneManager::MergePlan plan;
+        if (zones_.PlanMerge(parent_node_id, plan)) {
+            for (const ZoneId child_id : plan.child_ids) {
+                if (ZoneHasPendingMigration(child_id)) {
+                    LOG_DEBUG("partition: forced merge deferred (racing migration), re-queued");
+                    PostForceMerge(parent_node_id);
+                    return;
+                }
+            }
+        }
     }
     RunMergeTransaction(parent_node_id, true);
 }

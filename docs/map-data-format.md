@@ -3,6 +3,8 @@
 > **Cél:** egy önálló, self-describing térkép-formátum, ami a heightmap + chunk + attribútum-rács *koncepciót* megtartja (mainstream, nem elavult), de minden konkrét megvalósítása **saját** — saját konténer, magic, séma, betöltő —, így nem köthető a Metin2/Gameforge formátumához.
 >
 > **Jogi megjegyzés (nem jogi tanács, nem vagyok jogász):** a clean-room cél a saját konténer + saját séma + saját kód + saját/licencelt asszetek. A formátum-koncepció (magasság-rács) általában nem védett; a konkrét kód, asszet, pontos elrendezés átvétele igen. Éles bizonyossághoz konzultálj jogásszal.
+>
+> **Státusz (hardening M0):** a jelenlegi betöltő (`shared/map/src/MapData.cpp`) több ponton eltér ettől a leírástól — chunk-fájlnév, mezőtípusok (u16 vs u32), a `zoneGridDims` jelentése (a betöltő chunk-rácsként használja), a splat-szekciók szerveroldali kötelező betöltése. Ezeket nem a régi betöltőn foltozzuk: a következő Real World / Map Data Layer kötelező követelményei a [`map-data-layer-requirements.md`](map-data-layer-requirements.md)-ben vannak (R1–R13), reprodukálható bizonyítékkal (`worldbench --mode mapaudit`).
 
 ---
 

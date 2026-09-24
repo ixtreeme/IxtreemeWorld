@@ -1,4 +1,5 @@
 #include "HardeningBench.h"
+#include "ReadinessBench.h"
 
 #include <array>
 #include <atomic>
@@ -33,6 +34,7 @@
 #include "db/CharacterRepository.h"
 #include "db/DbPool.h"
 #include "db/HandoffTokenRepository.h"
+#include "network/Framing.h"
 #include "network/Server.h"
 #include "network/Session.h"
 #include "protocol/Protocol.h"
@@ -43,6 +45,12 @@
 #include "../world/WorldRuntime.h"
 #include "../world/replication/ProtocolEncoder.h"
 #include "../world/replication/ResyncSchedule.h"
+#include "../world/activity/LoadFieldTypes.h"
+#include "../world/zone/ZoneWorkerPool.h"
+#include "../world/partition/RegionDefinition.h"
+#include "../world/terrain/TerrainService.h"
+#include "map/MapData.h"
+#include "schema/map_manifest.capnp.h"
 
 namespace gs::bench {
 namespace {
@@ -642,6 +650,14 @@ public:
         frame.insert(frame.end(), payload.begin(), payload.end());
         boost::system::error_code ec;
         asio::write(socket_, asio::buffer(frame), ec);
+        return !ec;
+    }
+
+    // Raw bytes, no framing (e.g. a lying length header).
+    bool SendRaw(const std::vector<std::uint8_t>& bytes)
+    {
+        boost::system::error_code ec;
+        asio::write(socket_, asio::buffer(bytes), ec);
         return !ec;
     }
 
@@ -2067,6 +2083,8 @@ struct ReplWire {
     std::uint32_t max_forward_step = 0;
     std::uint64_t frames = 0;
     float self_x = 0.0f;
+    float self_y = 0.0f;
+    std::uint64_t self_nonfinite_frames = 0; // the viewer's own record carried NaN/Inf
 };
 
 void DecodeReplFrames(TestClient& client, ReplWire& wire, const std::atomic<bool>& stop)
@@ -2107,6 +2125,11 @@ void DecodeReplFrames(TestClient& client, ReplWire& wire, const std::atomic<bool
         wire.last_tick = tick;
         ++wire.frames;
         wire.self_x = ReadF32Le(payload.data() + 8 + 4);
+        wire.self_y = ReadF32Le(payload.data() + 8 + 8);
+        if (!std::isfinite(wire.self_x) || !std::isfinite(wire.self_y) ||
+            !std::isfinite(ReadF32Le(payload.data() + 8 + 12))) {
+            ++wire.self_nonfinite_frames;
+        }
         const std::uint32_t count = static_cast<std::uint32_t>(payload[6]) |
                                     (static_cast<std::uint32_t>(payload[7]) << 8);
         std::size_t offset = 8 + 19; // header + the viewer's own full record
@@ -2522,6 +2545,1246 @@ int RunReplicationV2Scenario()
 
     std::printf("REPLV2-DONE failures=%d\n", failures);
     return failures;
+}
+
+// ============================================================================
+// Protocol input hardening (H8)
+// ============================================================================
+namespace {
+
+// io threads that survive an escaping handler exception and COUNT it, so the
+// pre-fix behavior is observable without tearing the test process down.
+// (Production io threads have no such net: an escape ends the thread, and on
+// a std::thread that is std::terminate.)
+class GuardedIo {
+public:
+    explicit GuardedIo(int threads)
+    {
+        for (int i = 0; i < threads; ++i) {
+            threads_.emplace_back([this] { Run(); });
+        }
+    }
+    ~GuardedIo() { StopAndJoin(); }
+    void StopAndJoin()
+    {
+        work_.reset();
+        io.stop();
+        for (auto& thread : threads_) {
+            if (thread.joinable()) {
+                thread.join();
+            }
+        }
+        threads_.clear();
+    }
+    int Escaped() const { return escaped_.load(); }
+    std::string FirstEscape()
+    {
+        std::lock_guard lock(mutex_);
+        return first_;
+    }
+
+    asio::io_context io;
+
+private:
+    void Note(const char* what)
+    {
+        escaped_.fetch_add(1);
+        std::lock_guard lock(mutex_);
+        if (first_.empty()) {
+            first_ = what;
+        }
+    }
+    void Run()
+    {
+        for (;;) {
+            try {
+                io.run();
+                return;
+            } catch (const std::exception& error) {
+                Note(error.what());
+            } catch (...) {
+                Note("non-std exception");
+            }
+        }
+    }
+
+    asio::executor_work_guard<asio::io_context::executor_type> work_{asio::make_work_guard(io)};
+    std::vector<std::thread> threads_;
+    std::atomic<int> escaped_{0};
+    std::mutex mutex_;
+    std::string first_;
+};
+
+std::vector<std::uint8_t> CapnpWords(std::initializer_list<std::uint64_t> words)
+{
+    std::vector<std::uint8_t> out{0x00};
+    for (const std::uint64_t word : words) {
+        for (int b = 0; b < 8; ++b) {
+            out.push_back(static_cast<std::uint8_t>((word >> (8 * b)) & 0xff));
+        }
+    }
+    return out;
+}
+
+std::vector<std::uint8_t> AttackPayload(std::uint32_t target)
+{
+    capnp::MallocMessageBuilder msg;
+    msg.initRoot<gs::protocol::Packet>().initAttackTarget().setTargetNetId(target);
+    return gs::protocol::SerializeToBytes(msg);
+}
+
+std::vector<std::uint8_t> HandshakeResponsePayload()
+{
+    capnp::MallocMessageBuilder msg;
+    auto response = msg.initRoot<gs::protocol::Packet>().initHandshakeResponse();
+    response.setResult(gs::protocol::HandshakeResult::OK);
+    return gs::protocol::SerializeToBytes(msg);
+}
+
+struct MalformedCase {
+    const char* name;
+    std::vector<std::uint8_t> bytes;
+    bool raw = false; // bytes go on the wire as-is (no length header added)
+};
+
+std::vector<MalformedCase> MalformedCorpus()
+{
+    std::vector<MalformedCase> corpus;
+    corpus.push_back({"empty-payload", {}});
+    corpus.push_back({"codec-byte-only", {0x00}});
+    corpus.push_back({"unaligned-body", MalformedSizePayload()});
+    corpus.push_back({"garbage-segment-table", MalformedCapnpPayload()});
+    // segment count - 1 = 0x7fffffff
+    corpus.push_back({"huge-segment-count", CapnpWords({0x000000007fffffffULL})});
+    // one segment claiming 65535 words, one present
+    corpus.push_back({"segment-size-overrun", CapnpWords({0x0000ffff00000000ULL, 0})});
+    // root = far pointer into segment 7 (does not exist)
+    corpus.push_back({"far-pointer-missing-segment",
+                      CapnpWords({0x0000000100000000ULL, 0x0000000700000002ULL})});
+    // root struct pointer with offset +1,000,000 words
+    corpus.push_back({"root-offset-out-of-bounds",
+                      CapnpWords({0x0000000100000000ULL,
+                                  0x0001000100000000ULL | (1000000ULL << 2)})});
+    // root is a (byte) list pointer, not a struct
+    corpus.push_back({"root-not-a-struct", CapnpWords({0x0000000100000000ULL, 0x0000000200000001ULL})});
+    // root struct pointer (0 data, 1 pointer) pointing at itself
+    corpus.push_back({"self-referential-root",
+                      CapnpWords({0x0000000100000000ULL, 0x00010000fffffffcULL})});
+    corpus.push_back({"unknown-codec", {0x07, 0, 0, 0, 0, 0, 0, 0, 0}});
+    corpus.push_back({"binary-truncated", {0x01, 0x01, 0x00}});
+    corpus.push_back({"binary-bad-opcode", {0x01, 0x02, 1, 0, 0, 0, 0, 0, 0}});
+    corpus.push_back({"binary-bad-move-state", {0x01, 0x01, 1, 0, 0, 0, 0, 0, 0x09}});
+    corpus.push_back({"server-only-packet", HandshakeResponsePayload()});
+    {
+        // max-size frame, zero-filled words: an empty segment table entry
+        std::vector<std::uint8_t> zeros(1 + 8 * 8191, 0x00);
+        corpus.push_back({"max-size-zero-words", std::move(zeros)});
+    }
+    // length header 65537 (> protocol limit), then a few bytes
+    corpus.push_back({"oversize-length-header", {0x00, 0x01, 0x00, 0x01, 0xaa, 0xbb}, true});
+    corpus.push_back({"max-u32-length-header", {0xff, 0xff, 0xff, 0xff, 0x00}, true});
+    return corpus;
+}
+
+void Mutate(std::vector<std::uint8_t>& payload, std::mt19937& rng)
+{
+    switch (rng() % 5) {
+    case 0: // bit flips (may hit the codec byte)
+        for (unsigned k = 0, n = 1 + rng() % 8; k < n && !payload.empty(); ++k) {
+            payload[rng() % payload.size()] ^= static_cast<std::uint8_t>(1u << (rng() % 8));
+        }
+        break;
+    case 1: // random byte overwrites
+        for (unsigned k = 0, n = 1 + rng() % 4; k < n && !payload.empty(); ++k) {
+            payload[rng() % payload.size()] = static_cast<std::uint8_t>(rng());
+        }
+        break;
+    case 2: // truncation
+        if (!payload.empty()) {
+            payload.resize(rng() % payload.size());
+        }
+        break;
+    case 3: { // garbage extension, whole words (stays on the capnp path)
+        const std::size_t extra = 8 * (1 + rng() % 16);
+        for (std::size_t k = 0; k < extra; ++k) {
+            payload.push_back(static_cast<std::uint8_t>(rng()));
+        }
+        break;
+    }
+    default: // smash one whole 8-byte word (pointer / segment table)
+        if (payload.size() > 9) {
+            const std::size_t word = 1 + 8 * (rng() % ((payload.size() - 1) / 8));
+            for (std::size_t b = 0; b < 8 && word + b < payload.size(); ++b) {
+                payload[word + b] = static_cast<std::uint8_t>(rng());
+            }
+        }
+        break;
+    }
+}
+
+// A <= 64 KiB Packet whose CharacterListResponse holds `elements`
+// CharacterInfo structs, every `name` Text aliasing ONE shared blob: a
+// traversal reads the blob once per element (Cap'n Proto amplification).
+struct AmplifiedMessage {
+    std::vector<std::uint8_t> payload;
+    std::size_t body_words = 0;
+    bool ok = false;
+};
+
+AmplifiedMessage BuildAmplifiedPacket(std::size_t elements, std::size_t blob_words)
+{
+    AmplifiedMessage out;
+    capnp::MallocMessageBuilder msg(16384); // one segment
+    msg.initRoot<gs::protocol::Packet>().initCharacterListResponse().initCharacters(
+        static_cast<unsigned>(elements));
+    const auto flat = capnp::messageToFlatArray(msg);
+    std::vector<std::uint64_t> words(flat.size());
+    std::memcpy(words.data(), flat.begin(), flat.size() * sizeof(std::uint64_t));
+    if (words.empty() || (words[0] & 0xffffffffULL) != 0) {
+        return out; // not a single-segment message
+    }
+    const std::size_t seg_size = static_cast<std::size_t>(words[0] >> 32);
+    const auto seg = [&](std::size_t index) -> std::uint64_t& { return words[1 + index]; };
+    const auto target_of = [&](std::size_t at) {
+        const auto lower = static_cast<std::int32_t>(static_cast<std::uint32_t>(seg(at) & 0xffffffffULL));
+        return static_cast<std::size_t>(static_cast<std::int64_t>(at) + 1 + (lower >> 2));
+    };
+    const std::size_t packet = target_of(0);
+    const std::size_t union_ptr = packet + ((seg(0) >> 32) & 0xffff);
+    const std::size_t response = target_of(union_ptr);
+    const std::size_t response_dw = (seg(union_ptr) >> 32) & 0xffff;
+    const std::size_t response_pc = (seg(union_ptr) >> 48) & 0xffff;
+    std::size_t list_ptr = SIZE_MAX;
+    for (std::size_t p = 0; p < response_pc; ++p) {
+        const std::uint64_t word = seg(response + response_dw + p);
+        if ((word & 3) == 1 && ((word >> 32) & 7) == 7) {
+            list_ptr = response + response_dw + p; // the composite struct list
+        }
+    }
+    if (list_ptr == SIZE_MAX) {
+        return out;
+    }
+    const std::size_t tag = target_of(list_ptr);
+    const std::size_t count = static_cast<std::size_t>((seg(tag) & 0xffffffffULL) >> 2);
+    const std::size_t element_dw = (seg(tag) >> 32) & 0xffff;
+    const std::size_t element_pc = (seg(tag) >> 48) & 0xffff;
+    if (count != elements || element_pc != 1) {
+        return out; // CharacterInfo has exactly one pointer: name
+    }
+    const std::size_t blob = seg_size;
+    words.resize(1 + seg_size + blob_words, 0x4141414141414141ULL);
+    words.back() = 0x0041414141414141ULL; // Text NUL terminator (last byte)
+    const std::uint64_t text_bytes = blob_words * 8;
+    for (std::size_t i = 0; i < count; ++i) {
+        const std::size_t name_ptr = tag + 1 + i * (element_dw + element_pc) + element_dw;
+        const std::int64_t offset =
+            static_cast<std::int64_t>(blob) - static_cast<std::int64_t>(name_ptr + 1);
+        const std::uint64_t lower =
+            static_cast<std::uint64_t>(static_cast<std::uint32_t>(offset * 4)) | 1u; // list
+        const std::uint64_t upper = 2u | (text_bytes << 3); // byte elements, count
+        seg(name_ptr) = lower | (upper << 32);
+    }
+    words[0] = static_cast<std::uint64_t>(seg_size + blob_words) << 32;
+    out.payload.push_back(gs::protocol::kCodecCapnp);
+    const auto* raw = reinterpret_cast<const std::uint8_t*>(words.data());
+    out.payload.insert(out.payload.end(), raw, raw + words.size() * sizeof(std::uint64_t));
+    out.body_words = words.size();
+    out.ok = true;
+    return out;
+}
+
+// Full traversal of a parsed packet through the given parse entry point.
+// Returns the traversed word count, or -1 when the reader refused.
+long long TraverseWords(const std::vector<std::uint8_t>& payload, bool gameserver_path)
+{
+    try {
+        auto parsed = gameserver_path ? gs::game::GameConnectionHandler::ParseClientPacket(payload)
+                                      : gs::protocol::ParsePacket(payload);
+        if (!parsed) {
+            return -1;
+        }
+        return static_cast<long long>(parsed->packet.totalSize().wordCount);
+    } catch (const kj::Exception&) {
+        return -1;
+    }
+}
+
+} // namespace
+
+int RunProtocolHardeningScenario()
+{
+    int failures = 0;
+    auto report = [&](const char* name, bool pass, const std::string& detail) {
+        std::printf("PROTOCOL %s %s: %s\n", name, detail.c_str(), pass ? "PASS" : "FAIL");
+        std::fflush(stdout);
+        failures += pass ? 0 : 1;
+    };
+
+    // ---- (a) server-side oversized send ------------------------------------
+    // Production sends are posted onto the io_context; the frame encoder
+    // refuses > kMaxPayloadSize. That refusal must close THIS session, not
+    // escape the io loop (which ends the io thread / the process).
+    {
+        GuardedIo gio(2);
+        std::mutex mutex;
+        std::shared_ptr<gs::network::Session> victim_session;
+        gs::network::Server server(
+            gio.io,
+            tcp::endpoint(asio::ip::address_v4::loopback(), 0),
+            [&](auto session, auto payload) {
+                if (payload.size() == 1 && payload[0] == 0) {
+                    std::lock_guard lock(mutex);
+                    victim_session = session;
+                } else if (payload.size() == 1 && payload[0] == 1) {
+                    session->SendPayload({0x42});
+                }
+            },
+            [](auto) {});
+        server.Start();
+        TestClient victim;
+        victim.Connect(server.LocalPort());
+        victim.SendFrame({0});
+        WaitFor(3000ms, [&] {
+            std::lock_guard lock(mutex);
+            return victim_session != nullptr;
+        });
+        bool victim_closed = false;
+        if (victim_session) {
+            asio::post(gio.io, [session = victim_session] {
+                session->SendPayload(
+                    std::vector<std::uint8_t>(gs::network::Framing::kMaxPayloadSize + 1, 0x11));
+            });
+            victim_closed = victim.WaitClosed(2000ms);
+        }
+        TestClient other;
+        std::vector<std::uint8_t> frame;
+        const bool serving = other.Connect(server.LocalPort()) && other.SendFrame({1}) &&
+                             other.ReadFrame(frame, 2000ms) == TestClient::Read::Frame &&
+                             frame.size() == 1 && frame[0] == 0x42;
+        const auto rejects = gs::network::GlobalSessionCounters().oversized_send_rejects.load();
+        report("oversized-send-closes-only-that-session",
+               gio.Escaped() == 0 && victim_closed && serving && rejects == 1,
+               Fmt("io_escapes=%d first=\"%s\" victim_closed=%d io_still_serving=%d "
+                   "oversized_send_rejects=%llu",
+                   gio.Escaped(), gio.FirstEscape().c_str(), victim_closed ? 1 : 0,
+                   serving ? 1 : 0, static_cast<unsigned long long>(rejects)));
+        RunOnIo(gio.io, [&] { server.Stop(); });
+    }
+
+    // ---- (a2) the production io loop survives a throwing handler -----------
+    {
+        asio::io_context io;
+        auto work = asio::make_work_guard(io);
+        const auto escapes0 = gs::network::GlobalSessionCounters().io_loop_exceptions.load();
+        std::thread runner([&] { gs::network::RunIoContext(io); });
+        std::atomic<int> after{0};
+        asio::post(io, [] { throw std::runtime_error("posted handler failure"); });
+        asio::post(io, [] { throw 7; });
+        asio::post(io, [&] { after.fetch_add(1); });
+        const bool continued = WaitFor(2000ms, [&] { return after.load() == 1; });
+        work.reset();
+        io.stop();
+        runner.join();
+        const auto escapes =
+            gs::network::GlobalSessionCounters().io_loop_exceptions.load() - escapes0;
+        report("io-loop-survives-throwing-handler", continued && escapes == 2,
+               Fmt("later_handler_ran=%d io_loop_exceptions=%llu", continued ? 1 : 0,
+                   static_cast<unsigned long long>(escapes)));
+    }
+
+    // ---- (b) payload-handler exception containment -------------------------
+    {
+        GuardedIo gio(2);
+        std::atomic<int> disconnects{0};
+        gs::network::Server server(
+            gio.io,
+            tcp::endpoint(asio::ip::address_v4::loopback(), 0),
+            [&](auto session, auto payload) {
+                if (payload.size() == 1 && payload[0] == 1) {
+                    throw std::runtime_error("handler failure");
+                }
+                if (payload.size() == 1 && payload[0] == 2) {
+                    throw 42; // not a std::exception
+                }
+                if (payload.size() == 1 && payload[0] == 3) {
+                    session->SendPayload({0x42});
+                }
+            },
+            [&](auto) { disconnects.fetch_add(1); });
+        server.Start();
+        TestClient std_thrower;
+        std_thrower.Connect(server.LocalPort());
+        std_thrower.SendFrame({1});
+        const bool std_closed = std_thrower.WaitClosed(2000ms);
+        TestClient raw_thrower;
+        raw_thrower.Connect(server.LocalPort());
+        raw_thrower.SendFrame({2});
+        const bool raw_closed = raw_thrower.WaitClosed(2000ms);
+        TestClient honest;
+        std::vector<std::uint8_t> frame;
+        const bool serving = honest.Connect(server.LocalPort()) && honest.SendFrame({3}) &&
+                             honest.ReadFrame(frame, 2000ms) == TestClient::Read::Frame;
+        WaitFor(1000ms, [&] { return disconnects.load() >= 2; });
+        const auto handler_exceptions =
+            gs::network::GlobalSessionCounters().payload_handler_exceptions.load();
+        report("handler-exceptions-close-only-that-session",
+               gio.Escaped() == 0 && std_closed && raw_closed && serving &&
+                   disconnects.load() == 2 && handler_exceptions == 2,
+               Fmt("io_escapes=%d first=\"%s\" std_exception_closed=%d non_std_closed=%d "
+                   "disconnect_callbacks=%d io_still_serving=%d payload_handler_exceptions=%llu",
+                   gio.Escaped(), gio.FirstEscape().c_str(), std_closed ? 1 : 0,
+                   raw_closed ? 1 : 0, disconnects.load(), serving ? 1 : 0,
+                   static_cast<unsigned long long>(handler_exceptions)));
+        RunOnIo(gio.io, [&] { server.Stop(); });
+    }
+
+    // ---- (c)+(d) the real gameserver handler: malformed corpus + fuzzer ----
+    {
+        GuardedIo gio(4);
+        gs::game::WorldRuntime sim(gio.io, {},
+                                   gs::game::WorldRuntime::SyntheticWorldConfig{2000.0f, 1, 1, {}});
+        sim.Start();
+        gs::db::DbPool db(gio.io, gs::db::DbConfig{}); // never started: EnterWorld parks
+        gs::db::CharacterRepository characters(db);
+        gs::db::HandoffTokenRepository tokens(db);
+        gs::game::GameConnectionHandler handler(tokens, characters, sim, "127.0.0.1:0");
+        gs::network::Server game_server(
+            gio.io,
+            tcp::endpoint(asio::ip::address_v4::loopback(), 0),
+            [&handler](auto session, auto payload) { handler.OnPayload(session, std::move(payload)); },
+            [&handler](auto session) { handler.OnDisconnect(session); });
+        game_server.Start(); // no timeouts: every close below is the handler's decision
+        const std::uint16_t port = game_server.LocalPort();
+        const auto probe = [&] {
+            TestClient client;
+            std::vector<std::uint8_t> frame;
+            const bool ok = client.Connect(port) && client.SendFrame(HandshakePayload()) &&
+                            client.ReadFrame(frame, 2000ms) == TestClient::Read::Frame &&
+                            IsHandshakeResponse(frame);
+            client.CloseGraceful();
+            return ok;
+        };
+        const std::size_t contexts0 = handler.ContextCount();
+
+        const auto corpus = MalformedCorpus();
+        int closed = 0;
+        int attempts = 0;
+        std::string not_closed;
+        for (const auto& malformed : corpus) {
+            for (const bool after_handshake : {false, true}) {
+                ++attempts;
+                TestClient client;
+                if (!client.Connect(port)) {
+                    continue;
+                }
+                if (after_handshake) {
+                    std::vector<std::uint8_t> frame;
+                    client.SendFrame(HandshakePayload());
+                    client.ReadFrame(frame, 2000ms);
+                }
+                if (malformed.raw) {
+                    client.SendRaw(malformed.bytes);
+                } else {
+                    client.SendFrame(malformed.bytes);
+                }
+                if (client.WaitClosed(1500ms)) {
+                    ++closed;
+                } else if (not_closed.size() < 200) {
+                    not_closed += std::string(malformed.name) + (after_handshake ? "@est " : "@new ");
+                }
+                client.CloseRst();
+            }
+        }
+        const bool corpus_drained =
+            WaitFor(3000ms, [&] { return handler.ContextCount() <= contexts0; });
+        const bool corpus_probe = probe();
+        report("malformed-corpus-closes-session",
+               closed == attempts && gio.Escaped() == 0 && corpus_drained && corpus_probe,
+               Fmt("cases=%zu states=2 closed=%d/%d io_escapes=%d contexts_drained=%d "
+                   "server_alive=%d%s%s",
+                   corpus.size(), closed, attempts, gio.Escaped(), corpus_drained ? 1 : 0,
+                   corpus_probe ? 1 : 0, not_closed.empty() ? "" : " not_closed=",
+                   not_closed.c_str()));
+
+        // Mutation fuzzer: 4 parallel clients x 300 mutated packets.
+        constexpr int kThreads = 4;
+        constexpr int kIterations = 300;
+        std::atomic<int> sent{0};
+        std::atomic<int> server_closed{0};
+        const auto fuzz_start = Clock::now();
+        std::vector<std::thread> fuzzers;
+        for (int t = 0; t < kThreads; ++t) {
+            fuzzers.emplace_back([&, t] {
+                std::mt19937 rng(0xC0FFEEu + static_cast<unsigned>(t));
+                const std::vector<std::vector<std::uint8_t>> bases = {
+                    HandshakePayload(), EnterWorldPayload(), AttackPayload(1234), BinaryMovePayload(7)};
+                for (int i = 0; i < kIterations; ++i) {
+                    auto payload = bases[rng() % bases.size()];
+                    Mutate(payload, rng);
+                    TestClient client;
+                    if (!client.Connect(port)) {
+                        continue;
+                    }
+                    if (rng() % 2 == 0) {
+                        std::vector<std::uint8_t> frame;
+                        client.SendFrame(HandshakePayload());
+                        client.ReadFrame(frame, 1000ms);
+                    }
+                    client.SendFrame(payload);
+                    sent.fetch_add(1);
+                    if (client.WaitClosed(40ms)) {
+                        server_closed.fetch_add(1);
+                    }
+                    client.CloseRst();
+                }
+            });
+        }
+        for (auto& thread : fuzzers) {
+            thread.join();
+        }
+        const double fuzz_s = std::chrono::duration<double>(Clock::now() - fuzz_start).count();
+        const bool fuzz_drained =
+            WaitFor(5000ms, [&] { return handler.ContextCount() <= contexts0; });
+        const bool fuzz_probe = probe();
+        report("mutation-fuzz-server-survives",
+               gio.Escaped() == 0 && fuzz_drained && fuzz_probe && sim.Owners().empty() &&
+                   sent.load() == kThreads * kIterations,
+               Fmt("packets=%d closed_by_server=%d elapsed_s=%.1f io_escapes=%d first=\"%s\" "
+                   "contexts_drained=%d server_alive=%d world_presence=%zu",
+                   sent.load(), server_closed.load(), fuzz_s, gio.Escaped(),
+                   gio.FirstEscape().c_str(), fuzz_drained ? 1 : 0, fuzz_probe ? 1 : 0,
+                   sim.Owners().size()));
+        RunOnIo(gio.io, [&] { game_server.Stop(); });
+        sim.Stop();
+    }
+
+    // ---- (e) Cap'n Proto traversal amplification ----------------------------
+    // 1000 CharacterInfo names aliasing one 3000-word blob in a ~64 KiB frame.
+    // No current C2S handler iterates a list, so this is the reader contract:
+    // the gameserver's parse path must bound traversal by the message size,
+    // while ordinary packets still traverse fine.
+    {
+        const auto amplified = BuildAmplifiedPacket(1000, 3000);
+        const bool fits = amplified.ok &&
+                          amplified.payload.size() <= gs::network::Framing::kMaxPayloadSize;
+        const long long library_default = TraverseWords(amplified.payload, false);
+        const long long gameserver = TraverseWords(amplified.payload, true);
+        const double ratio = amplified.body_words > 0 && library_default > 0
+                                 ? static_cast<double>(library_default) /
+                                       static_cast<double>(amplified.body_words)
+                                 : 0.0;
+        bool legit_ok = true;
+        for (const auto& legit : {HandshakePayload(), EnterWorldPayload(), AttackPayload(9)}) {
+            legit_ok = legit_ok && TraverseWords(legit, true) > 0;
+        }
+        {
+            // a legitimately large packet: a ~60 KiB clientBuild string
+            capnp::MallocMessageBuilder msg;
+            auto request = msg.initRoot<gs::protocol::Packet>().initHandshakeRequest();
+            request.setProtocolVersion(gs::protocol::kProtocolVersion);
+            request.setClientBuild(std::string(60000, 'b'));
+            legit_ok = legit_ok && TraverseWords(gs::protocol::SerializeToBytes(msg), true) > 0;
+        }
+        report("traversal-amplification-bounded",
+               fits && gameserver < 0 && legit_ok,
+               Fmt("frame_bytes=%zu body_words=%zu library_default_traversed_words=%lld "
+                   "amplification=%.0fx gameserver_path=%s legit_packets_ok=%d",
+                   amplified.payload.size(), amplified.body_words, library_default, ratio,
+                   gameserver < 0 ? "refused" : "ACCEPTED", legit_ok ? 1 : 0));
+    }
+
+    // ---- (f) non-finite numeric input at the world boundary ----------------
+    {
+        IoRunner runner;
+        gs::game::WorldRuntime sim(runner.io, {},
+                                   gs::game::WorldRuntime::SyntheticWorldConfig{2000.0f, 1, 1, {}});
+        sim.Start();
+        ObservedSession viewer = MakeObservedSession(runner.io, 60000);
+        ReplWire wire;
+        std::atomic<bool> stop{false};
+        std::thread reader([&] { DecodeReplFrames(*viewer.client, wire, stop); });
+        sim.PostSpawn(viewer.session, MakeCharacter(200), gs::game::DebugSpawnOverride{1000.0f, 1000.0f});
+        WaitFor(5000ms, [&] {
+            std::lock_guard lock(wire.mutex);
+            return wire.frames > 5;
+        });
+        const float kInf = std::numeric_limits<float>::infinity();
+        const float kNaN = std::numeric_limits<float>::quiet_NaN();
+        std::uint32_t seq = 0;
+        for (const float heading : {kNaN, kInf, -kInf, 3.0e38f}) {
+            for (int i = 0; i < 10; ++i) {
+                sim.PostMoveInput(60000, ++seq, heading, gs::game::MoveState::Running);
+                std::this_thread::sleep_for(20ms);
+            }
+        }
+        // then a normal move: the player must still respond
+        float x0 = 0.0f;
+        float y0 = 0.0f;
+        {
+            std::lock_guard lock(wire.mutex);
+            x0 = wire.self_x;
+            y0 = wire.self_y;
+        }
+        for (int i = 0; i < 25; ++i) {
+            sim.PostMoveInput(60000, ++seq, 0.0f, gs::game::MoveState::Running);
+            std::this_thread::sleep_for(20ms);
+        }
+        std::this_thread::sleep_for(200ms);
+        // Spawn overrides that are not finite / out of the world: fall back.
+        std::uint64_t index = 201;
+        for (const auto& spawn :
+             {gs::game::DebugSpawnOverride{kNaN, 1000.0f}, gs::game::DebugSpawnOverride{kInf, 5.0f},
+              gs::game::DebugSpawnOverride{1.0e30f, -1.0e30f},
+              gs::game::DebugSpawnOverride{-kInf, kNaN}}) {
+            sim.PostSpawn(MakeDetachedSession(runner.io, 60000 + index), MakeCharacter(index), spawn);
+            ++index;
+        }
+        const bool spawned = WaitFor(5000ms, [&] { return sim.PresenceStats().claims >= 5; });
+        const std::string audit = AuditNow(sim);
+        std::uint64_t nonfinite = 0;
+        float x1 = 0.0f;
+        float y1 = 0.0f;
+        {
+            std::lock_guard lock(wire.mutex);
+            nonfinite = wire.self_nonfinite_frames;
+            x1 = wire.self_x;
+            y1 = wire.self_y;
+        }
+        stop = true;
+        reader.join();
+        sim.Stop();
+        const bool moved = std::isfinite(x1) && std::isfinite(y1) && (x1 != x0 || y1 != y0);
+        const auto dropped = sim.InputStats().moves_dropped_invalid;
+        report("nonfinite-numeric-input-contained",
+               nonfinite == 0 && moved && spawned && audit == "OK" && dropped == 30,
+               Fmt("nonfinite_self_frames=%llu still_moves_after=%d pos=(%.1f,%.1f)->(%.1f,%.1f) "
+                   "nonfinite_moves_dropped=%llu/30 bad_spawn_overrides_claimed=%d audit=%s",
+                   static_cast<unsigned long long>(nonfinite), moved ? 1 : 0, x0, y0, x1, y1,
+                   static_cast<unsigned long long>(dropped), spawned ? 1 : 0,
+                   audit.substr(0, 120).c_str()));
+    }
+
+    std::printf("PROTOCOL-DONE failures=%d\n", failures);
+    return failures;
+}
+
+// ============================================================================
+// Retired zone reclamation (H9)
+// ============================================================================
+int RunZoneReclamationScenario(int cycles)
+{
+    int failures = 0;
+    auto report = [&](const char* name, bool pass, const std::string& detail) {
+        std::printf("RECLAIM %s %s: %s\n", name, detail.c_str(), pass ? "PASS" : "FAIL");
+        std::fflush(stdout);
+        failures += pass ? 0 : 1;
+    };
+    cycles = std::max(cycles, 10);
+
+    // Two root zones side by side: zone A (west) is split and merged over and
+    // over; zone B (east) is its live neighbor, so B's ghost cursors point at
+    // A's slots while they retire and get reused (the slot-reuse ABA case).
+    IoRunner runner;
+    gs::game::WorldRuntime sim(runner.io, {},
+                               gs::game::WorldRuntime::SyntheticWorldConfig{4000.0f, 2, 1, {}});
+    gs::game::PartitionConfig partition;
+    partition.scoring.adaptive_enabled = false; // topology changes are forced only
+    sim.ConfigurePartition(partition);
+    gs::game::MobSpawnPoint point;
+    point.mob_type_id = 2;
+    point.x = 2000.0f; // straddles the A|B border: ghosts in both directions
+    point.y = 2000.0f;
+    point.count = 400;
+    point.radius = 1200.0f;
+    sim.AddMobSpawnPoint(point);
+    sim.SpawnConfiguredMobsNow();
+    sim.PostSpawn(MakeDetachedSession(runner.io, 70000), MakeCharacter(300),
+                  gs::game::DebugSpawnOverride{1000.0f, 2000.0f});
+    sim.Start();
+    WaitFor(5000ms, [&] { return sim.PresenceStats().claims >= 1; });
+    std::this_thread::sleep_for(500ms);
+
+    // The leaf covering zone A's area (the west half) at this moment.
+    const auto west_leaf = [&]() -> gs::game::ZoneId {
+        for (const auto* leaf : sim.Zones().GetActiveLeaves()) {
+            if (leaf->bounds.min_x < 1000.0f && leaf->bounds.max_x > 1000.0f &&
+                leaf->bounds.min_y < 2000.0f && leaf->bounds.max_y > 2000.0f) {
+                return leaf->zone_id;
+            }
+        }
+        return 0;
+    };
+    const auto ghost_audit = [&] {
+        sim.RequestGhostValidation();
+        std::string result;
+        return WaitFor(5000ms, [&] { return sim.TryTakeGhostValidationResult(result); }) ? result
+                                                                                        : "TIMEOUT";
+    };
+
+    struct Sample {
+        int cycle = 0;
+        std::size_t slots = 0;
+        std::size_t retired = 0;
+        std::size_t active = 0;
+        double ws_mb = 0.0;
+        double cycle_ms = 0.0;
+        std::string audit;
+        std::string ghost;
+        gs::game::ZoneManager::ReclaimStats reclaim;
+    };
+    const auto sample = [&](int cycle, double cycle_ms) {
+        Sample s;
+        s.cycle = cycle;
+        s.cycle_ms = cycle_ms;
+        s.audit = AuditNow(sim); // includes the H9 reclamation invariants
+        s.ghost = ghost_audit();
+        const auto& zones = sim.Zones();
+        s.slots = zones.ZoneCount();
+        for (std::size_t i = 0; i < s.slots; ++i) {
+            if (zones.GetZone(i).Partition() == gs::game::PartitionState::Retired) {
+                ++s.retired;
+            }
+        }
+        s.active = zones.GetActiveLeaves().size();
+        s.ws_mb = static_cast<double>(ProcessWorkingSetBytes()) / (1024.0 * 1024.0);
+        s.reclaim = sim.ZoneReclaimStats();
+        std::printf("RECLAIM cycle=%d zone_slots=%zu retired=%zu active_leaves=%zu "
+                    "working_set_mb=%.1f avg_cycle_ms=%.1f reclaimed=%llu reused=%llu trimmed=%llu "
+                    "pending=%zu reusable=%zu audit=%s ghost_audit=%s\n",
+                    s.cycle, s.slots, s.retired, s.active, s.ws_mb, s.cycle_ms,
+                    static_cast<unsigned long long>(s.reclaim.reclaimed_total),
+                    static_cast<unsigned long long>(s.reclaim.reused_total),
+                    static_cast<unsigned long long>(s.reclaim.trimmed_total),
+                    s.reclaim.retired_pending, s.reclaim.reusable, s.audit.substr(0, 100).c_str(),
+                    s.ghost.substr(0, 100).c_str());
+        std::fflush(stdout);
+        return s;
+    };
+
+    std::vector<Sample> samples;
+    samples.push_back(sample(0, 0.0));
+    const std::vector<int> checkpoints = {10, 50, 100, 250, 500, 1000, 2000, 5000};
+    int completed = 0;
+    bool stuck = false;
+    auto window_start = Clock::now();
+    int window_cycles = 0;
+    for (int cycle = 1; cycle <= cycles; ++cycle) {
+        const gs::game::ZoneId leaf = west_leaf();
+        const auto p0 = sim.PartitionMetricsSnapshot();
+        sim.PostForceSplit(leaf);
+        const bool split = WaitFor(5000ms, [&] {
+            return sim.PartitionMetricsSnapshot().split_commits > p0.split_commits;
+        });
+        if (split) {
+            sim.PostForceMerge(leaf); // the node keeps the parent's id until the merge
+        }
+        if (!split || !WaitFor(5000ms, [&] {
+                return sim.PartitionMetricsSnapshot().merge_commits > p0.merge_commits;
+            })) {
+            const auto p1 = sim.PartitionMetricsSnapshot();
+            std::printf("RECLAIM stuck: cycle=%d leaf=%u split=%d split_attempts=%llu split_aborts=%llu "
+                        "merge_attempts=%llu merge_aborts=%llu\n",
+                        cycle, static_cast<unsigned>(leaf), split ? 1 : 0,
+                        static_cast<unsigned long long>(p1.split_attempts - p0.split_attempts),
+                        static_cast<unsigned long long>(p1.split_aborts - p0.split_aborts),
+                        static_cast<unsigned long long>(p1.merge_attempts - p0.merge_attempts),
+                        static_cast<unsigned long long>(p1.merge_aborts - p0.merge_aborts));
+            stuck = true;
+            break;
+        }
+        completed = cycle;
+        ++window_cycles;
+        if (std::find(checkpoints.begin(), checkpoints.end(), cycle) != checkpoints.end() ||
+            cycle == cycles) {
+            const double ms = std::chrono::duration<double, std::milli>(Clock::now() - window_start)
+                                  .count() /
+                              std::max(window_cycles, 1);
+            samples.push_back(sample(cycle, ms));
+            window_start = Clock::now();
+            window_cycles = 0;
+        }
+    }
+    const auto presence = sim.PresenceStats();
+    sim.Stop();
+
+    const Sample& first = samples[1 < samples.size() ? 1 : 0]; // cycle 10: warm allocator
+    const Sample& last = samples.back();
+    bool audits_ok = true;
+    std::string first_bad;
+    for (const auto& s : samples) {
+        const bool ok = s.audit == "OK" && s.ghost == "OK";
+        if (!ok && first_bad.empty()) {
+            first_bad = "cycle " + std::to_string(s.cycle) + ": " + s.audit.substr(0, 120) + " / " +
+                        s.ghost.substr(0, 120);
+        }
+        audits_ok = audits_ok && ok;
+    }
+    report("split-merge-cycles-consistent",
+           !stuck && completed == cycles && audits_ok && presence.present == 1,
+           Fmt("cycles=%d/%d world+reclaim+ghost_audits_ok=%d present=%llu%s%s", completed, cycles,
+               audits_ok ? 1 : 0, static_cast<unsigned long long>(presence.present),
+               first_bad.empty() ? "" : " first_failure=", first_bad.c_str()));
+    // Bounded: the zone table must not grow with the number of topology
+    // changes (live leaves + a short reclaim backlog), slots really get
+    // reused, and memory from cycle 10 on stays flat within allocator noise.
+    const double growth_mb = last.ws_mb - first.ws_mb;
+    // Bounded at every checkpoint, independent of the cycle count: live
+    // leaves + the reclaim backlog (forced cycles every ~20-40 ms against the
+    // 2-tick grace keep a few cycles in flight -- far faster than any real
+    // ASF cadence), with the vacant tail trimmed back.
+    std::size_t max_slots = 0;
+    for (const auto& s : samples) {
+        max_slots = std::max(max_slots, s.slots);
+    }
+    report("zone-slots-bounded",
+           max_slots <= 32 && last.reclaim.reused_total > 0 && last.reclaim.trimmed_total > 0,
+           Fmt("slots_at_cycle_%d=%zu max_slots_any_checkpoint=%zu retired=%zu active=%zu "
+               "reused=%llu trimmed=%llu (append-only would be 2+5*cycles=%d)",
+               last.cycle, last.slots, max_slots, last.retired, last.active,
+               static_cast<unsigned long long>(last.reclaim.reused_total),
+               static_cast<unsigned long long>(last.reclaim.trimmed_total), 2 + 5 * last.cycle));
+    report("memory-flat-over-cycles", growth_mb < 32.0,
+           Fmt("working_set_mb cycle_%d=%.1f cycle_%d=%.1f growth=%.1f per_cycle_kb=%.1f "
+               "cycle_ms %.1f->%.1f",
+               first.cycle, first.ws_mb, last.cycle, last.ws_mb, growth_mb,
+               last.cycle > first.cycle ? growth_mb * 1024.0 / (last.cycle - first.cycle) : 0.0,
+               first.cycle_ms, last.cycle_ms));
+    std::printf("RECLAIM-DONE failures=%d\n", failures);
+    return failures;
+}
+
+// ============================================================================
+// Low-level hygiene (H10)
+// ============================================================================
+int RunHygieneScenario()
+{
+    int failures = 0;
+    auto report = [&](const char* name, bool pass, const std::string& detail) {
+        std::printf("HYGIENE %s %s: %s\n", name, detail.c_str(), pass ? "PASS" : "FAIL");
+        std::fflush(stdout);
+        failures += pass ? 0 : 1;
+    };
+
+    // ---- (a) ZoneWorkerPool::Stop lost wakeup ------------------------------
+    // Start then immediately Stop: workers are entering their wait exactly
+    // while Stop publishes `stopping_`. A Stop whose store+notify can slip
+    // between a worker's predicate check and its sleep leaves that worker
+    // asleep forever and the join hangs. Runs on its own thread with a
+    // watchdog (a hung join cannot be recovered; the mode _Exits after).
+    {
+        constexpr int kCycles = 20000;
+        std::atomic<int> done{0};
+        std::atomic<bool> finished{false};
+        std::thread stress([&] {
+            for (int i = 0; i < kCycles; ++i) {
+                gs::game::ZoneWorkerPool pool([](std::size_t) {});
+                pool.Start(8);
+                pool.Stop();
+                done.fetch_add(1, std::memory_order_relaxed);
+            }
+            finished.store(true);
+        });
+        int last = -1;
+        auto last_progress = Clock::now();
+        bool hung = false;
+        while (!finished.load()) {
+            std::this_thread::sleep_for(100ms);
+            const int now_done = done.load();
+            if (now_done != last) {
+                last = now_done;
+                last_progress = Clock::now();
+            } else if (Clock::now() - last_progress > 5s) {
+                hung = true;
+                break;
+            }
+        }
+        if (hung) {
+            stress.detach(); // stuck in join(): unrecoverable by design of the bug
+        } else {
+            stress.join();
+        }
+        report("worker-pool-stop-no-lost-wakeup", !hung,
+               Fmt("start_stop_cycles=%d/%d workers=8 hung=%d", done.load(), kCycles, hung ? 1 : 0));
+    }
+
+    // ---- (b) TCP_NODELAY on accepted sessions ------------------------------
+    // Two small frames 2 ms apart, the client never sends (no piggybacked
+    // ACK): with Nagle on, the second frame waits for the first one's ACK.
+    {
+        IoPool pool(2);
+        std::mutex mutex;
+        std::shared_ptr<gs::network::Session> session;
+        gs::network::Server server(
+            pool.io,
+            tcp::endpoint(asio::ip::address_v4::loopback(), 0),
+            [&](auto s, auto) {
+                std::lock_guard lock(mutex);
+                session = s;
+            },
+            [](auto) {});
+        server.Start();
+        TestClient client;
+        client.Connect(server.LocalPort());
+        client.SendFrame({0});
+        WaitFor(3000ms, [&] {
+            std::lock_guard lock(mutex);
+            return session != nullptr;
+        });
+        std::vector<double> gaps_ms;
+        if (session) {
+            std::vector<std::uint8_t> frame;
+            for (int round = 0; round < 30; ++round) {
+                session->SendPayload({0x01, 0x02, 0x03});
+                PreciseSleepUntil(Clock::now() + 2ms);
+                session->SendPayload({0x04, 0x05, 0x06});
+                if (client.ReadFrame(frame, 2000ms) != TestClient::Read::Frame) {
+                    break;
+                }
+                const auto first = Clock::now();
+                if (client.ReadFrame(frame, 2000ms) != TestClient::Read::Frame) {
+                    break;
+                }
+                gaps_ms.push_back(std::chrono::duration<double, std::milli>(Clock::now() - first)
+                                      .count());
+                std::this_thread::sleep_for(50ms);
+            }
+        }
+        std::sort(gaps_ms.begin(), gaps_ms.end());
+        const double p50 = gaps_ms.empty() ? -1.0 : gaps_ms[gaps_ms.size() / 2];
+        const double worst = gaps_ms.empty() ? -1.0 : gaps_ms.back();
+        const bool nodelay = session && session->NoDelay();
+        report("accepted-sessions-tcp-nodelay",
+               nodelay && gaps_ms.size() == 30 && worst < 20.0,
+               Fmt("socket_no_delay=%d rounds=%zu second_frame_gap_ms p50=%.2f max=%.2f "
+                   "(sent 2 ms apart)",
+                   nodelay ? 1 : 0, gaps_ms.size(), p50, worst));
+        if (session) {
+            RunOnIo(pool.io, [&] { session->Stop(); });
+        }
+        RunOnIo(pool.io, [&] { server.Stop(); });
+    }
+
+    // ---- (c) load field cell size: safe minimum -----------------------------
+    // The grid is dim_x * dim_y cells over the world bounds (runtime-owned:
+    // the 100 km production extent here). "finite and > 0" alone admits a
+    // cell size whose grid overflows the u32 dimensions or cannot be
+    // allocated by the supervisor's field rebuild.
+    {
+        bool all_ok = true;
+        std::string detail;
+        for (const float requested : {0.0001f, 0.5f, 5.0f, 50.0f, 100.0f, 500.0f}) {
+            gs::game::LoadFieldConfig config;
+            config.cell_size_m = requested;
+            config.bounds = gs::game::WorldBounds::FromExtent(100000.0f);
+            const auto validated = gs::game::ValidateLoadFieldConfig(config);
+            const float cell = validated.effective.cell_size_m;
+            // Cell counts computed in double: no allocation, no u32 overflow.
+            const double cells = std::ceil(100000.0 / cell) * std::ceil(100000.0 / cell);
+            const double requested_cells =
+                std::ceil(100000.0 / requested) * std::ceil(100000.0 / requested);
+            // A request that is already safe must be kept exactly.
+            const bool safe_request = requested >= 10.0f && requested_cells <= 1048576.0;
+            const bool ok = cell >= 10.0f && cells <= 1048576.0 && (!safe_request || cell == requested);
+            all_ok = all_ok && ok;
+            char line[160];
+            std::snprintf(line, sizeof(line), " %.4g->%.4g(cells=%.3g)", requested, cell, cells);
+            detail += line;
+        }
+        report("load-field-cell-size-safe-minimum", all_ok,
+               Fmt("world=100km requested->effective:%s", detail.c_str()));
+    }
+
+    std::printf("HYGIENE-DONE failures=%d\n", failures);
+    return failures;
+}
+
+// ============================================================================
+// Map data audit (M0)
+// ============================================================================
+// Documents the CURRENT map loader behavior as evidence for the Real World /
+// Map Data Layer requirements (docs/map-data-layer-requirements.md). Read
+// only: nothing here patches the old loader. Each finding prints
+// REPRODUCED (current behavior as documented) or CHANGED (the loader no
+// longer behaves that way -- update the requirements' evidence).
+namespace {
+
+struct MemoryAssets {
+    std::unordered_map<std::string, std::vector<std::uint8_t>> files;
+    std::vector<std::string> reads;
+    mx::map::AssetReadFn Reader()
+    {
+        return [this](std::string_view path) -> std::optional<std::vector<std::uint8_t>> {
+            std::string key(path);
+            reads.push_back(key);
+            const auto it = files.find(key);
+            if (it == files.end()) {
+                return std::nullopt;
+            }
+            return it->second;
+        };
+    }
+};
+
+void PutU32(std::vector<std::uint8_t>& out, std::uint32_t value)
+{
+    for (int b = 0; b < 4; ++b) {
+        out.push_back(static_cast<std::uint8_t>((value >> (8 * b)) & 0xff));
+    }
+}
+
+void PutU16(std::vector<std::uint8_t>& out, std::uint16_t value)
+{
+    out.push_back(static_cast<std::uint8_t>(value & 0xff));
+    out.push_back(static_cast<std::uint8_t>(value >> 8));
+}
+
+void PutF32(std::vector<std::uint8_t>& out, float value)
+{
+    std::uint32_t bits = 0;
+    std::memcpy(&bits, &value, sizeof(bits));
+    PutU32(out, bits);
+}
+
+struct LogicZoneSpec {
+    std::uint32_t id;
+    mx::map::Rect bounds;
+};
+
+std::vector<std::uint8_t> WorldLogicBytes(const std::vector<LogicZoneSpec>& zones,
+                                          const std::vector<std::pair<std::uint32_t, mx::map::Rect>>& spawns,
+                                          const std::vector<mx::map::WarpRegion>& warps)
+{
+    std::vector<std::uint8_t> out;
+    PutU32(out, 0x314c584d);
+    PutU32(out, 1);
+    PutU32(out, static_cast<std::uint32_t>(zones.size()));
+    PutU32(out, static_cast<std::uint32_t>(spawns.size()));
+    PutU32(out, static_cast<std::uint32_t>(warps.size()));
+    for (const auto& zone : zones) {
+        PutU32(out, zone.id);
+        out.push_back(1);
+        out.push_back('z');
+        PutF32(out, zone.bounds.min_x);
+        PutF32(out, zone.bounds.min_y);
+        PutF32(out, zone.bounds.max_x);
+        PutF32(out, zone.bounds.max_y);
+    }
+    std::uint32_t spawn_id = 1;
+    for (const auto& [zone_id, rect] : spawns) {
+        PutU32(out, spawn_id++);
+        PutU32(out, zone_id);
+        PutF32(out, rect.min_x);
+        PutF32(out, rect.min_y);
+        PutF32(out, rect.max_x);
+        PutF32(out, rect.max_y);
+    }
+    for (const auto& warp : warps) {
+        PutU32(out, warp.id);
+        PutF32(out, warp.source.min_x);
+        PutF32(out, warp.source.min_y);
+        PutF32(out, warp.source.max_x);
+        PutF32(out, warp.source.max_y);
+        PutF32(out, warp.target_x);
+        PutF32(out, warp.target_y);
+    }
+    return out;
+}
+
+std::vector<std::uint8_t> ManifestBytes(std::uint32_t world_cells, float cell_m,
+                                        std::uint32_t chunk_cells, std::uint32_t zone_grid)
+{
+    capnp::MallocMessageBuilder msg;
+    auto root = msg.initRoot<mx::map::schema::MapManifest>();
+    root.setFormatVersion(2);
+    root.setWorldId("audit");
+    root.setWorldName("audit");
+    root.setWorldSizeCells(world_cells);
+    root.setCellSizeMeters(cell_m);
+    root.setHeightUnit(mx::map::schema::HeightUnit::CENTIMETERS);
+    root.setChunkSizeCells(chunk_cells);
+    root.initZoneGridDims().setX(zone_grid);
+    root.getZoneGridDims().setY(zone_grid);
+    root.setZoneSizeCells(world_cells / std::max(zone_grid, 1u));
+    const auto flat = capnp::messageToFlatArray(msg);
+    const auto bytes = flat.asBytes();
+    return std::vector<std::uint8_t>(bytes.begin(), bytes.end());
+}
+
+// One MXC1 chunk: heights (all `height_cm`), attributes, optional splats.
+std::vector<std::uint8_t> ChunkBytes(std::uint16_t cx, std::uint16_t cy, std::uint16_t cells,
+                                     std::int16_t height_cm, bool with_splats)
+{
+    const std::uint16_t sections = with_splats ? 4 : 2;
+    const std::size_t header = 14 + 12 * static_cast<std::size_t>(sections);
+    std::vector<std::uint8_t> heights;
+    for (std::size_t i = 0; i < static_cast<std::size_t>(cells + 1) * (cells + 1); ++i) {
+        PutU16(heights, static_cast<std::uint16_t>(height_cm));
+    }
+    std::vector<std::uint8_t> attributes(static_cast<std::size_t>(cells) * cells * 2, 0);
+    std::vector<std::uint8_t> splat;
+    PutU16(splat, 1);
+    PutU16(splat, 1);
+    splat.insert(splat.end(), 4, 0x80);
+    std::vector<std::pair<std::uint16_t, const std::vector<std::uint8_t>*>> payloads = {
+        {1, &heights}, {3, &attributes}};
+    if (with_splats) {
+        payloads.push_back({2, &splat});
+        payloads.push_back({4, &splat});
+    }
+    std::vector<std::uint8_t> out;
+    PutU32(out, 0x3143584d);
+    PutU16(out, 2);
+    PutU16(out, cx);
+    PutU16(out, cy);
+    PutU16(out, cells);
+    PutU16(out, sections);
+    std::uint32_t offset = static_cast<std::uint32_t>(header);
+    for (const auto& [type, data] : payloads) {
+        PutU16(out, type);
+        PutU16(out, 0);
+        PutU32(out, offset);
+        PutU32(out, static_cast<std::uint32_t>(data->size()));
+        offset += static_cast<std::uint32_t>(data->size());
+    }
+    for (const auto& [type, data] : payloads) {
+        (void)type;
+        out.insert(out.end(), data->begin(), data->end());
+    }
+    return out;
+}
+
+} // namespace
+
+int RunMapAuditScenario()
+{
+    int changed = 0;
+    auto finding = [&](const char* id, bool reproduced, const std::string& observed) {
+        std::printf("MAPAUDIT %s %s: %s\n", id, observed.c_str(),
+                    reproduced ? "REPRODUCED" : "CHANGED");
+        std::fflush(stdout);
+        changed += reproduced ? 0 : 1;
+    };
+    const float kNaN = std::numeric_limits<float>::quiet_NaN();
+
+    // R4: truncated worldlogic accepted -- the field readers clamp the offset
+    // to the end of the buffer, and the truncation check is `offset > size`.
+    {
+        auto bytes = WorldLogicBytes({{7, mx::map::Rect{0, 0, 100, 100}}}, {}, {});
+        bytes.resize(20 + 4); // header + zone id only
+        MemoryAssets assets;
+        assets.files["./worldlogic.dat"] = bytes;
+        const auto logic = mx::map::LoadWorldLogic(assets.Reader(), ".");
+        const bool accepted = logic && logic->zones.size() == 1;
+        finding("R4-truncated-worldlogic-accepted", accepted,
+                accepted ? Fmt("file=24B claims 1 zone -> zone id=%u bounds=(%.0f,%.0f)-(%.0f,%.0f)",
+                               logic->zones[0].id, logic->zones[0].bounds.min_x,
+                               logic->zones[0].bounds.min_y, logic->zones[0].bounds.max_x,
+                               logic->zones[0].bounds.max_y)
+                         : std::string("rejected"));
+    }
+    // R4: reserved id 0, duplicate ids, NaN / inverted bounds, overlap, a
+    // spawn pointing at an unknown zone, a non-finite warp target.
+    {
+        const auto bytes = WorldLogicBytes(
+            {{0, mx::map::Rect{0, 0, 500, 500}},
+             {5, mx::map::Rect{400, 400, 900, 900}}, // overlaps zone 0
+             {5, mx::map::Rect{kNaN, 0, 100, 100}},  // duplicate id + NaN
+             {6, mx::map::Rect{900, 900, 100, 100}}}, // min > max
+            {{42, mx::map::Rect{10, 10, 20, 20}}},  // zone 42 does not exist
+            {mx::map::WarpRegion{1, mx::map::Rect{0, 0, 10, 10}, kNaN, 50.0f}});
+        MemoryAssets assets;
+        assets.files["./worldlogic.dat"] = bytes;
+        const auto logic = mx::map::LoadWorldLogic(assets.Reader(), ".");
+        const bool accepted = logic && logic->zones.size() == 4 && logic->spawns.size() == 1 &&
+                              logic->warps.size() == 1;
+        finding("R4-invalid-worldlogic-accepted", accepted,
+                accepted ? std::string("zone id 0, duplicate id 5, NaN bounds, min>max, "
+                                       "overlapping zones, spawn->unknown zone 42, NaN warp "
+                                       "target: all accepted")
+                         : std::string("rejected"));
+    }
+    // R1: chunks are enumerated with the ZONE grid dimensions. World 64
+    // cells, 32-cell chunks (2x2 chunk files), zone grid 1x1.
+    {
+        MemoryAssets assets;
+        assets.files["./map.manifest"] = ManifestBytes(64, 1.0f, 32, 1);
+        for (std::uint16_t cy = 0; cy < 2; ++cy) {
+            for (std::uint16_t cx = 0; cx < 2; ++cx) {
+                assets.files["./chunks/chunk_" + std::to_string(cx) + "_" + std::to_string(cy) +
+                             ".mxchunk"] = ChunkBytes(cx, cy, 32, 100, true);
+            }
+        }
+        const auto field = mx::map::LoadHeightField(assets.Reader(), ".");
+        std::size_t chunk_reads = 0;
+        for (const auto& read : assets.reads) {
+            chunk_reads += read.find("chunks/") != std::string::npos ? 1 : 0;
+        }
+        const float h_loaded = field ? field->SampleHeightMeters(10.0f, 10.0f) : -1.0f;
+        const float h_missing = field ? field->SampleHeightMeters(50.0f, 50.0f) : -1.0f;
+        const bool reproduced = field && chunk_reads == 1 && h_missing == 0.0f && h_loaded > 0.9f;
+        finding("R1-chunk-grid-conflated-with-zone-grid", reproduced,
+                Fmt("2x2 chunk files, zone_grid=1x1 -> chunk files read=%zu, height in chunk(0,0)=%.2fm "
+                    "chunk(1,1)=%.2fm (never loaded, reported valid=%d)",
+                    chunk_reads, h_loaded, h_missing, field ? 1 : 0));
+    }
+    // R5: the server cannot load a map without the client's splat textures
+    // (and keeps the whole-world splat RGBA in memory when present).
+    {
+        MemoryAssets assets;
+        assets.files["./map.manifest"] = ManifestBytes(32, 1.0f, 32, 1);
+        assets.files["./chunks/chunk_0_0.mxchunk"] = ChunkBytes(0, 0, 32, 100, false);
+        const auto without = mx::map::LoadHeightField(assets.Reader(), ".");
+        MemoryAssets with_assets;
+        with_assets.files["./map.manifest"] = ManifestBytes(32, 1.0f, 32, 1);
+        with_assets.files["./chunks/chunk_0_0.mxchunk"] = ChunkBytes(0, 0, 32, 100, true);
+        const auto with = mx::map::LoadHeightField(with_assets.Reader(), ".");
+        const bool reproduced = !without && with && !with->splat_a_rgba8.empty();
+        finding("R5-server-requires-render-splats", reproduced,
+                Fmt("heights+attributes only -> load=%s; with splats -> load=%s, server keeps "
+                    "splat_a+b=%zu B",
+                    without ? "ok" : "FAILS", with ? "ok" : "fails",
+                    with ? with->splat_a_rgba8.size() + with->splat_b_rgba8.size() : 0));
+    }
+    // R6: a warp whose target lies inside a warp source retriggers every
+    // tick (TryApplyWarp runs per tick on containment, no enter edge).
+    {
+        mx::map::WorldLogic logic;
+        logic.warps.push_back(mx::map::WarpRegion{1, mx::map::Rect{0, 0, 20, 20}, 10.0f, 10.0f});
+        logic.warps.push_back(mx::map::WarpRegion{2, mx::map::Rect{100, 0, 120, 20}, 200.0f, 10.0f});
+        logic.warps.push_back(mx::map::WarpRegion{3, mx::map::Rect{190, 0, 210, 20}, 110.0f, 10.0f});
+        const auto* self = logic.FindWarp(10.0f, 10.0f);
+        const auto* back = logic.FindWarp(200.0f, 10.0f);
+        const bool reproduced = self != nullptr && self->id == 1 && back != nullptr && back->id == 3;
+        finding("R6-warp-retrigger", reproduced,
+                "warp 1 target inside its own source -> fires again next tick; warps 2<->3 "
+                "targets inside each other's source -> ping-pong every tick (no enter "
+                "edge, no cooldown)");
+    }
+    // R3: fixed 100 km regions at origin (0,0), whatever map is loaded.
+    {
+        const auto regions = gs::game::DefaultRegions();
+        const auto* outside = gs::game::FindRegionContaining(regions, -10.0f, -10.0f);
+        const auto* small_map = gs::game::FindRegionContaining(regions, 500.0f, 500.0f);
+        const bool reproduced = regions.size() == 4 && regions[1].bounds.max_x == 100000.0f &&
+                                outside == nullptr && small_map != nullptr;
+        finding("R3-hardcoded-world-bounds", reproduced,
+                Fmt("regions=%zu fixed 0..100000 m quadrants; a 1 km map lands entirely in region "
+                    "%u; a point at (-10,-10) has no region",
+                    regions.size(), small_map != nullptr ? small_map->id : 0u));
+    }
+    // R7 + R8: build-time source path + silent flat fallback.
+    {
+        const auto missing = gs::game::TerrainService::LoadFromMapRoot("./no-such-map-root");
+        const bool reproduced = !missing.HasTerrain() && missing.WorldExtentMeters() == 1000.0f;
+        finding("R8-silent-flat-fallback", reproduced,
+                Fmt("unloadable map root -> HasTerrain=%d extent=%.0fm (flat), a warning only",
+                    missing.HasTerrain() ? 1 : 0, missing.WorldExtentMeters()));
+        const std::string compiled = IXTREEME_DEFAULT_MAP_ROOT;
+        finding("R7-build-time-map-path", compiled.find("Client/assets/Maps") != std::string::npos,
+                "production map root = compile-time source-tree path \"" + compiled + "\"");
+    }
+    std::printf("MAPAUDIT-DONE changed=%d\n", changed);
+    return 0; // evidence probe: CHANGED findings are reported, not failed
 }
 
 } // namespace gs::bench

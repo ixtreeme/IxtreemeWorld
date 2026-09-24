@@ -69,4 +69,25 @@ int RunWorkerPoolScenario();
 // wire tick across migrations, QuantizeHeading on non-finite/huge input.
 int RunReplicationV2Scenario();
 
+// H8: protocol input hardening -- a malformed/adversarial client closes at
+// most its own session: malformed frame corpus in every pre-world state, a
+// mutation fuzzer, Cap'n Proto traversal amplification, handler exception
+// containment, an oversized server send, non-finite numeric input at the
+// world boundary. The process and every IO worker must survive.
+int RunProtocolHardeningScenario();
+
+// H9: retired zone reclamation -- `cycles` forced split->merge cycles on a
+// populated zone; zone slots, retired zones, live zone worlds and RSS at
+// checkpoints, plus a consistency audit at each.
+int RunZoneReclamationScenario(int cycles);
+
+// H10: low-level hygiene -- ZoneWorkerPool::Stop lost wakeup (Start/Stop
+// stress with a watchdog), TCP_NODELAY on accepted sessions, load field cell
+// size safe minimum.
+int RunHygieneScenario();
+
+// M0: map data audit -- reproduces the current loader findings that feed
+// docs/map-data-layer-requirements.md (read-only evidence probe).
+int RunMapAuditScenario();
+
 } // namespace gs::bench

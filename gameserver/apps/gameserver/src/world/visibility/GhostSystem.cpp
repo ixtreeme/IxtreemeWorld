@@ -97,10 +97,13 @@ void GhostSystem::Reconcile(Zone& zone, ZoneManager& zones)
     // The neighbor set is the address space of the ghost set: a topology
     // change (split/merge/retire) invalidates every cursor and forces a full
     // pass so ghosts from former neighbors are dropped deterministically.
+    // Identity is slot AND zone id: a retired slot can be reused by a new
+    // zone (H9), which must count as a topology change.
     bool topology_changed = neighbors.size() != state.neighbors.size();
     if (!topology_changed) {
         for (std::size_t i = 0; i < neighbors.size(); ++i) {
-            if (neighbors[i] != state.neighbors[i].zone_index) {
+            if (neighbors[i] != state.neighbors[i].zone_index ||
+                zones.GetZone(neighbors[i]).Id() != state.neighbors[i].zone_id) {
                 topology_changed = true;
                 break;
             }
@@ -111,7 +114,8 @@ void GhostSystem::Reconcile(Zone& zone, ZoneManager& zones)
         state.neighbors.clear();
         state.neighbors.reserve(neighbors.size());
         for (const std::size_t neighbor_index : neighbors) {
-            state.neighbors.push_back(GhostNeighborCursor{neighbor_index, 0, false});
+            state.neighbors.push_back(GhostNeighborCursor{
+                neighbor_index, zones.GetZone(neighbor_index).Id(), 0, false});
         }
     }
     // A local residency change (spawn/despawn/transfer) can make a ghost

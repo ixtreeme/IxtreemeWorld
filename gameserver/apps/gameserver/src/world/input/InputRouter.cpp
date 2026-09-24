@@ -1,5 +1,6 @@
 #include "InputRouter.h"
 
+#include <cmath>
 #include <iterator>
 #include <utility>
 
@@ -22,6 +23,15 @@ void InputRouter::PostMoveInput(gs::common::SessionId session_id,
                                 float dir_angle,
                                 MoveState state)
 {
+    // World boundary (hardening H8): a non-finite heading would integrate
+    // into a NaN position that never recovers (it poisons the grid and the
+    // wire). The network decoder only produces finite headings today; this
+    // guards every other input path too. Dropped, not clamped: there is no
+    // meaningful direction to substitute.
+    if (!std::isfinite(dir_angle)) {
+        moves_dropped_invalid_.fetch_add(1, std::memory_order_relaxed);
+        return;
+    }
     const MoveInput input{session_id, sequence, dir_angle, state};
     {
         std::lock_guard lock(input_mutex_);
@@ -167,6 +177,7 @@ InputRouter::Stats InputRouter::GetStats() const
     stats.moves_dropped_not_resident = moves_dropped_not_resident_.load(std::memory_order_relaxed);
     stats.moves_dropped_stale_sequence =
         moves_dropped_stale_sequence_.load(std::memory_order_relaxed);
+    stats.moves_dropped_invalid = moves_dropped_invalid_.load(std::memory_order_relaxed);
     stats.attacks_posted = attacks_posted_.load(std::memory_order_relaxed);
     stats.attacks_routed = attacks_routed_.load(std::memory_order_relaxed);
     stats.attacks_dropped_overflow = attacks_dropped_overflow_.load(std::memory_order_relaxed);

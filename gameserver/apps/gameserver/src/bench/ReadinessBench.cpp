@@ -32,10 +32,6 @@
 
 namespace gs::bench {
 
-namespace {
-
-using Clock = std::chrono::steady_clock;
-
 // --- environment / memory ---------------------------------------------------
 
 std::size_t ProcessWorkingSetBytes()
@@ -56,6 +52,10 @@ std::size_t ProcessWorkingSetBytes()
     return 0;
 #endif
 }
+
+namespace {
+
+using Clock = std::chrono::steady_clock;
 
 void PrintEnvironment()
 {

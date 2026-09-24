@@ -17,6 +17,22 @@ namespace gs::network {
 namespace asio = boost::asio;
 using boost::asio::ip::tcp;
 
+void RunIoContext(asio::io_context& io)
+{
+    for (;;) {
+        try {
+            io.run();
+            return; // stopped, or out of work
+        } catch (const std::exception& error) {
+            GlobalSessionCounters().io_loop_exceptions.fetch_add(1, std::memory_order_relaxed);
+            LOG_ERROR("io handler threw, io loop resumes: {}", error.what());
+        } catch (...) {
+            GlobalSessionCounters().io_loop_exceptions.fetch_add(1, std::memory_order_relaxed);
+            LOG_ERROR("io handler threw a non-standard exception, io loop resumes");
+        }
+    }
+}
+
 Server::Server(asio::io_context& io,
                std::uint16_t port,
                Session::PayloadHandler on_payload,
@@ -106,6 +122,15 @@ asio::awaitable<void> Server::AcceptLoop()
             dropped_on_setup_.fetch_add(1, std::memory_order_relaxed);
             LOG_DEBUG("Dropped connection before setup: {}", endpoint_ec.message());
             continue;
+        }
+
+        // Hardening H10: a real-time protocol of small frames (20 Hz
+        // replication, input) must not wait for Nagle to coalesce them
+        // behind an unacknowledged frame (with a delayed ACK: 40-200 ms).
+        boost::system::error_code nodelay_ec;
+        socket.set_option(tcp::no_delay(true), nodelay_ec);
+        if (nodelay_ec) {
+            LOG_DEBUG("TCP_NODELAY not applied: {}", nodelay_ec.message());
         }
 
         const auto session_id = next_session_id_++;

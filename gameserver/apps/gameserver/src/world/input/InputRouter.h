@@ -96,6 +96,7 @@ public:
         std::uint64_t moves_dropped_no_owner = 0; // swept orphans / forgotten sessions
         std::uint64_t moves_dropped_not_resident = 0;
         std::uint64_t moves_dropped_stale_sequence = 0;
+        std::uint64_t moves_dropped_invalid = 0; // non-finite heading (H8), never staged
         std::uint64_t attacks_posted = 0;
         std::uint64_t attacks_routed = 0;
         std::uint64_t attacks_dropped_overflow = 0;
@@ -120,6 +121,7 @@ private:
     std::atomic<std::uint64_t> moves_dropped_no_owner_{0};
     std::atomic<std::uint64_t> moves_dropped_not_resident_{0};
     std::atomic<std::uint64_t> moves_dropped_stale_sequence_{0};
+    std::atomic<std::uint64_t> moves_dropped_invalid_{0};
     std::atomic<std::uint64_t> attacks_posted_{0};
     std::atomic<std::uint64_t> attacks_routed_{0};
     std::atomic<std::uint64_t> attacks_dropped_overflow_{0};

@@ -54,7 +54,15 @@ void ZoneWorkerPool::Start(std::size_t requested_workers)
 
 void ZoneWorkerPool::Stop()
 {
-    stopping_ = true;
+    {
+        // Hardening H10: the flag changes under the mutex the workers' wait
+        // predicate is evaluated under. Stored + notified without it, the
+        // pair could land between a worker's predicate check (false) and its
+        // sleep: the notify is lost, the worker sleeps forever and join()
+        // hangs (reproduced: a Start/Stop stress hung within ~1.5k cycles).
+        std::lock_guard lock(mutex_);
+        stopping_ = true;
+    }
     cv_.notify_all();
     for (auto& worker : workers_) {
         if (worker.joinable()) {

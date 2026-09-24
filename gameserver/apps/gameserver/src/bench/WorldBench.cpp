@@ -119,6 +119,8 @@ struct BenchConfig {
     int net_io_threads = 4;
     bool net_no_chaos = false;
     std::string net_cases = "all";
+    // Hardening H9 zone reclamation (--mode reclamation).
+    int reclaim_cycles = 100;
 };
 
 bool ParseArgs(int argc, char** argv, BenchConfig& config)
@@ -198,6 +200,11 @@ bool ParseArgs(int argc, char** argv, BenchConfig& config)
                 return false;
             }
             config.net_io_threads = std::stoi(value);
+        } else if (arg == "--cycles") {
+            if (!need_value("cycles", value)) {
+                return false;
+            }
+            config.reclaim_cycles = std::stoi(value);
         } else if (arg == "--net-no-chaos") {
             config.net_no_chaos = true;
         } else if (arg == "--net-cases") {
@@ -312,7 +319,9 @@ bool ParseArgs(int argc, char** argv, BenchConfig& config)
         config.mode != "tickrate" && config.mode != "inputpath" &&
         config.mode != "netstress" && config.mode != "presence" &&
         config.mode != "asfdeterminism" && config.mode != "workerpool" &&
-        config.mode != "replv2") {
+        config.mode != "replv2" && config.mode != "protocol" &&
+        config.mode != "reclamation" && config.mode != "hygiene" &&
+        config.mode != "mapaudit") {
         std::cerr << "bad mode: " << config.mode << "\n";
         return false;
     }
@@ -4665,6 +4674,40 @@ int BenchMain(int argc, char** argv)
         // A pre-fix QuantizeHeading probe may still be spinning on a detached
         // thread; leave without joining it.
         std::_Exit(scenario_failures == 0 ? 0 : 2);
+    }
+
+    if (config.mode == "protocol") {
+        // Hardening H8: protocol input hardening / adversarial input.
+        const int scenario_failures = gs::bench::RunProtocolHardeningScenario();
+        std::printf("BENCH-DONE protocol failures=%d\n", scenario_failures);
+        std::fflush(stdout);
+        // Pre-fix runs can leave sessions/io in a broken state on purpose;
+        // leave without running their destructors.
+        std::_Exit(scenario_failures == 0 ? 0 : 2);
+    }
+
+    if (config.mode == "mapaudit") {
+        // M0: evidence probe for the map-layer requirements (current loader
+        // behavior; never fails on findings).
+        const int scenario_failures = gs::bench::RunMapAuditScenario();
+        std::printf("BENCH-DONE mapaudit failures=%d\n", scenario_failures);
+        return scenario_failures == 0 ? 0 : 2;
+    }
+
+    if (config.mode == "hygiene") {
+        // Hardening H10: low-level hygiene checks.
+        const int scenario_failures = gs::bench::RunHygieneScenario();
+        std::printf("BENCH-DONE hygiene failures=%d\n", scenario_failures);
+        std::fflush(stdout);
+        // A reproduced lost wakeup leaves a thread stuck in join().
+        std::_Exit(scenario_failures == 0 ? 0 : 2);
+    }
+
+    if (config.mode == "reclamation") {
+        // Hardening H9: retired zone reclamation / memory over split-merge cycles.
+        const int scenario_failures = gs::bench::RunZoneReclamationScenario(config.reclaim_cycles);
+        std::printf("BENCH-DONE reclamation failures=%d\n", scenario_failures);
+        return scenario_failures == 0 ? 0 : 2;
     }
 
     if (config.mode == "workerpool") {

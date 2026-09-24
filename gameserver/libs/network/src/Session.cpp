@@ -181,6 +181,20 @@ void Session::SendPayloadInternal(std::vector<std::uint8_t> payload, bool close_
     if (stopped_.load(std::memory_order_acquire)) {
         return;
     }
+    // Hardening H8: the frame encoder refuses payloads over the protocol
+    // limit by throwing, and callers post sends onto the io_context -- an
+    // exception there escapes io_context::run() and ends the io thread (a
+    // std::thread: std::terminate). A payload this peer can never receive
+    // is a local failure: close THIS session, keep the process.
+    if (payload.size() > Framing::kMaxPayloadSize) {
+        GlobalSessionCounters().oversized_send_rejects.fetch_add(1, std::memory_order_relaxed);
+        LOG_ERROR("Session {} closed: outgoing payload of {} bytes exceeds the {}-byte frame limit",
+                  id_,
+                  payload.size(),
+                  Framing::kMaxPayloadSize);
+        Stop();
+        return;
+    }
 
     PendingWrite pending{Framing::Encode(std::span<const std::uint8_t>(payload.data(), payload.size())),
                          close_after_send,
@@ -311,7 +325,15 @@ asio::awaitable<void> Session::ReadLoop()
             LOG_DEBUG("Session {} closed: {}", id_, error.code().message());
         }
     } catch (const std::exception& error) {
+        GlobalSessionCounters().payload_handler_exceptions.fetch_add(1, std::memory_order_relaxed);
         LOG_ERROR("Session {} error: {}", id_, error.what());
+    } catch (...) {
+        // Hardening H8: anything else a handler throws (non-std types) used
+        // to leave the coroutine through co_spawn/detached, which swallows
+        // it -- skipping StopOnStrand: an open socket with no disconnect
+        // callback, i.e. leaked session state (and world presence).
+        GlobalSessionCounters().payload_handler_exceptions.fetch_add(1, std::memory_order_relaxed);
+        LOG_ERROR("Session {} error: non-standard exception from the payload handler", id_);
     }
 
     StopOnStrand();

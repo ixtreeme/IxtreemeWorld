@@ -14,6 +14,14 @@
 
 namespace gs::network {
 
+// Runs `io` until it is stopped or runs out of work, like io_context::run(),
+// but an exception escaping a handler does not end the calling io thread
+// (hardening H8): it is logged, counted (io_loop_exceptions) and the loop
+// resumes. The known sources are closed at their origin (a session closes
+// on its own failures); this is the last line so one faulty handler cannot
+// take an io worker -- on a std::thread, the whole process -- down.
+void RunIoContext(boost::asio::io_context& io);
+
 // Accept loop contract (hardening H2.3): a failure to accept or to serve ONE
 // connection never ends the loop. Transient accept errors back off briefly
 // and continue; a peer that vanished between accept and setup (e.g. an

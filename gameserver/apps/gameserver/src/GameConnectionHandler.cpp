@@ -182,13 +182,21 @@ void GameConnectionHandler::OnPayload(std::shared_ptr<gs::network::Session> sess
     }
 }
 
+std::optional<gs::protocol::ParsedPacket> GameConnectionHandler::ParseClientPacket(
+    const std::vector<std::uint8_t>& payload)
+{
+    // Hardening H8: client packets are untrusted -- bounded traversal and
+    // nesting (Cap'n Proto amplification cannot outgrow the frame).
+    return gs::protocol::ParseUntrustedPacket(payload);
+}
+
 std::optional<std::string> GameConnectionHandler::ProcessPacketLocked(
     const std::shared_ptr<gs::network::Session>& session,
     GameSessionContext& ctx,
     const std::vector<std::uint8_t>& payload)
 {
     try {
-        auto parsed = gs::protocol::ParsePacket(payload);
+        auto parsed = ParseClientPacket(payload);
         if (!parsed) {
             return std::string("invalid message");
         }

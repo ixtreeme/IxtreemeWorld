@@ -14,6 +14,7 @@
 #include "db/CharacterRepository.h"
 #include "db/HandoffTokenRepository.h"
 #include "network/Session.h"
+#include "protocol/Serialization.h"
 #include "schema/packet.capnp.h"
 
 #include "world/WorldRuntime.h"
@@ -114,6 +115,11 @@ public:
         return disconnect_cleanups_.load(std::memory_order_relaxed);
     }
     ConnectionStats Stats() const noexcept;
+
+    // The one parse entry point for client packets (the handler and the
+    // protocol hardening tests share it).
+    static std::optional<gs::protocol::ParsedPacket> ParseClientPacket(
+        const std::vector<std::uint8_t>& payload);
 
 private:
     // Runs under contexts_mutex_; returns a disconnect reason instead of

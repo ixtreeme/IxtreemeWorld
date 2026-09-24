@@ -1,6 +1,8 @@
 #pragma once
 
 #include <cstddef>
+#include <cstdint>
+#include <functional>
 #include <memory>
 #include <vector>
 
@@ -17,9 +19,11 @@
 //
 // Partitioning: each region owns a forest of ZonePartition metadata whose
 // leaves mirror the simulating zones. Split creates child zones + metadata;
-// merge collapses them. Zone slots are append-only (indices stay stable, so
-// OwnerMap fast-path caches never dangle); retired zones keep their slot
-// but stop simulating and hold no entities.
+// merge collapses them. A slot index stays stable for the whole life of the
+// zone in it (OwnerMap fast-path caches never dangle); a retired zone keeps
+// its slot, simulating nothing and holding no entities, until reclamation
+// proves the slot unreferenced -- then a new zone may take the slot (see
+// "Retired slot reclamation"). Zone ids are never reused.
 namespace gs::game {
 
 class ZoneManager {
@@ -120,6 +124,58 @@ public:
     bool RetireZone(ZoneId zone_id);
     bool CanRetire(ZoneId zone_id) const;
 
+    // --- Retired slot reclamation (hardening H9) ---
+    // A retired zone keeps its slot (and its Zone + flecs world) until
+    // reclamation PROVES nothing can still reach it. Then its storage is
+    // released at once (a vacant placeholder with the same id stays in the
+    // slot), the lowest free slot is reused by the next zone a split/merge
+    // creates, and free slots at the end of the table are trimmed. The table
+    // follows the live topology plus the reclaim backlog instead of growing
+    // by five slots per split->merge cycle. Proof, per retired slot
+    // (supervisor, quiescent window -- no tick in flight):
+    //   - still Retired, not simulating, no tick claim;
+    //   - no authority/ghost/grid state and no queued commands;
+    //   - no partition node carries its zone id (a split parent stays the
+    //     merge anchor until the merge re-points the node);
+    //   - no live zone's graph edge or ghost cursor points at the slot;
+    //   - `externally_referenced(slot)` is false (runtime-held indices,
+    //     e.g. the owner map's fast-path zone_index);
+    //   - retired for at least kReclaimGraceTicks world ticks.
+    // Zone ids are never reused: a stale id simply stops resolving.
+    static constexpr std::uint32_t kReclaimGraceTicks = 2;
+    struct ReclaimStats {
+        std::size_t retired_pending = 0;  // retired, not yet proven free
+        std::size_t reusable = 0;         // proven free, waiting for reuse
+        std::uint64_t reclaimed_total = 0;
+        std::uint64_t reused_total = 0;
+        std::uint64_t trimmed_total = 0; // vacant slots popped off the table tail
+        std::uint64_t blocked_state = 0;  // last pass: slots held back, by reason
+        std::uint64_t blocked_node = 0;
+        std::uint64_t blocked_neighbor = 0;
+        std::uint64_t blocked_external = 0;
+    };
+    // Returns the ids of the zones whose slots were proven free this pass
+    // (the caller drops their remaining id-keyed bookkeeping, e.g. the
+    // directory's retired-assignment retention).
+    std::vector<ZoneId> ReclaimRetiredSlots(std::uint32_t world_tick,
+                                    const std::function<bool(std::size_t)>& externally_referenced);
+    bool HasRetiredPending() const noexcept
+    {
+        return !retired_pending_.empty();
+    }
+    ReclaimStats GetReclaimStats() const;
+    // Validator hook: slots currently proven free (Retired, awaiting reuse).
+    const std::vector<std::size_t>& ReusableSlots() const noexcept
+    {
+        return reusable_slots_;
+    }
+    // Stamps newly retired slots with the world tick they retired at (the
+    // grace clock). Supervisor only, before ReclaimRetiredSlots.
+    void SetWorldTick(std::uint32_t world_tick) noexcept
+    {
+        world_tick_ = world_tick;
+    }
+
     // Applies validated region limits (config binding). Supervisor only,
     // before any split runs.
     void ApplyRegionLimits(int max_partition_depth, float min_zone_size_m);
@@ -151,6 +207,27 @@ public:
 
 private:
     ZoneId AllocateZoneId();
+    // Places a new zone into a reclaimed slot (destroying the retired Zone
+    // it held) or appends one. Returns the slot index.
+    std::size_t PlaceZone(std::unique_ptr<Zone> zone);
+    // Queues a slot that just became Retired for reclamation.
+    void NoteRetired(std::size_t index);
+    // Slot-level reclaim predicate (state + node + neighbor checks).
+    bool SlotReclaimable(std::size_t index, ReclaimStats& blocked) const;
+    // Pops proven-free slots off the end of the table (no live index moves).
+    void TrimVacantTail();
+
+    struct RetiredSlot {
+        std::size_t index = 0;
+        std::uint32_t retired_tick = 0;
+    };
+    std::vector<RetiredSlot> retired_pending_;
+    std::vector<std::size_t> reusable_slots_;
+    std::uint32_t world_tick_ = 0;
+    std::uint64_t reclaimed_total_ = 0;
+    std::uint64_t reused_total_ = 0;
+    std::uint64_t trimmed_total_ = 0;
+    ReclaimStats blocked_{};
 
     std::vector<std::unique_ptr<Zone>> zones_;
     ZoneGraph graph_;

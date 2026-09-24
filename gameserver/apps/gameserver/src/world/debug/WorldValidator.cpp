@@ -121,6 +121,63 @@ bool ValidateWorldConsistency(ZoneManager& zones,
         return false;
     }
 
+    // Zone slot reclamation (hardening H9): a slot proven free is Retired,
+    // empty and unreferenced; and a slot is never reused while a live zone's
+    // ghost cursor points at it, so every cursor still names the zone that
+    // holds its slot.
+    {
+        std::vector<std::uint8_t> owned(zones.ZoneCount(), 0);
+        for (const auto& [session, owner] : owners) {
+            (void)session;
+            if (owner.zone_index < owned.size()) {
+                owned[owner.zone_index] = 1;
+            }
+        }
+        std::vector<std::uint8_t> reusable(zones.ZoneCount(), 0);
+        for (const std::size_t slot : zones.ReusableSlots()) {
+            std::ostringstream message;
+            if (slot >= zones.ZoneCount()) {
+                message << "reclaim: reusable slot " << slot << " out of range";
+                return Fail(out_error, message.str());
+            }
+            const Zone& zone = zones.GetZone(slot);
+            if (zone.Partition() != PartitionState::Retired || zone.SimulationEnabled() ||
+                !zone.Entities().empty() || !zone.Players().empty() || zone.Grid().Size() != 0) {
+                message << "reclaim: reusable slot " << slot << " (zone " << zone.Id()
+                        << ") is not a drained retired zone";
+                return Fail(out_error, message.str());
+            }
+            if (owned[slot] != 0) {
+                message << "reclaim: reusable slot " << slot << " is an owner's zone_index";
+                return Fail(out_error, message.str());
+            }
+            reusable[slot] = 1;
+        }
+        for (std::size_t i = 0; i < zones.ZoneCount(); ++i) {
+            const Zone& zone = zones.GetZone(i);
+            if (zone.Partition() == PartitionState::Retired) {
+                continue;
+            }
+            for (const auto& cursor : zone.GhostMaintenance().neighbors) {
+                if (cursor.zone_index >= zones.ZoneCount() ||
+                    zones.GetZone(cursor.zone_index).Id() != cursor.zone_id ||
+                    reusable[cursor.zone_index] != 0) {
+                    std::ostringstream message;
+                    message << "reclaim: zone " << zone.Id() << " ghost cursor slot "
+                            << cursor.zone_index << " names zone " << cursor.zone_id
+                            << " but the slot holds "
+                            << (cursor.zone_index < zones.ZoneCount()
+                                    ? zones.GetZone(cursor.zone_index).Id()
+                                    : 0)
+                            << (cursor.zone_index < reusable.size() && reusable[cursor.zone_index]
+                                    ? " (slot already reclaimed)"
+                                    : "");
+                    return Fail(out_error, message.str());
+                }
+            }
+        }
+    }
+
     // Directory <-> tree <-> runtime cross-check (§21): every active leaf
     // has exactly one assignment pointing at itself; every assignment
     // resolves to a known zone; staged (uncommitted) zones are never routed

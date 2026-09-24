@@ -82,23 +82,28 @@ configuration directory, for example:
 
 ## Test
 
-Start the server, then run:
+The world simulation is exercised by `worldbench` (built when
+`ENABLE_WORLDBENCH=ON`, e.g. the `windows-relwithdebinfo` preset). Each mode
+prints `...: PASS|FAIL` lines and ends with `BENCH-DONE <mode> failures=N`.
 
 ```sh
-pip install -r tools/requirements.txt
-python tools/test_client.py
+./build/windows-relwithdebinfo/apps/gameserver/RelWithDebInfo/worldbench.exe --mode <mode>
 ```
 
-## Future AuthServer extraction
+- Systems: `lod`, `activity`, `loadfield`, `partitionscore`, `stability`,
+  `splitmerge`, `ghost`, `aoi`, `replication`, `scheduler`, `spread`,
+  `hotspot`, `border`, `readiness` (`--scenario spread|dense|... --players N
+  --mobs N --warmup S --seconds S`), plus the `--field-selftest`,
+  `--loadfield-selftest`, `--partitionscore-selftest`, `--routing-selftest`
+  flags.
+- Infrastructure hardening: `tickrate` (authoritative 20 Hz vs input rate),
+  `inputpath`, `netstress` (`--net-io-threads N`), `presence` (one character
+  = one presence), `asfdeterminism`, `workerpool`, `replv2`, `protocol`
+  (malformed/adversarial input), `reclamation` (`--cycles N` split/merge
+  cycles), `hygiene`.
 
-The auth logic (`AuthHandler`) is intentionally separated from game logic (`GameHandler`)
-so a standalone AuthServer can be extracted later:
+## Login server
 
-1. Create `apps/authserver/` with its own `main.cpp`.
-2. Move `AuthHandler.h/.cpp` and the `AccountRepository` dependency to the new binary.
-3. Add a token system (Redis-backed) for cross-server session validation.
-4. Replace `AuthHandler` in gameserver with a `TokenValidator` that checks the token.
-5. The client connects to AuthServer first, gets a token, then connects to GameServer.
-6. TLS can be added to AuthServer only, where the password travels.
-
-The current code structure makes this extraction mechanical, not a refactor.
+Authentication (login, character list, handoff token issue) lives in the
+separate `loginserver/` application; the gameserver only consumes the
+handoff token on `EnterWorld`.

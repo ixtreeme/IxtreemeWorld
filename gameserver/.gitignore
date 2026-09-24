@@ -12,3 +12,8 @@ install/
 logs/
 vcpkg_installed/
 *.log
+
+# Source snapshots/archives never belong in the repo (history has every version).
+*.zip
+*.7z
+*.rar

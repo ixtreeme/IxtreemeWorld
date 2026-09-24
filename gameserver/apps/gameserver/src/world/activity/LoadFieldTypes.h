@@ -299,6 +299,11 @@ struct LoadTotals {
 // and of the spatial grid: the load field's resolution is a config decision
 // (benchmarked; see docs/adaptive-simulation-fabric.md).
 inline constexpr float kLoadCellSizeMeters = 500.0f;
+// Safe range (hardening H10): absolute floor, and a cap on the L0 cell count
+// over the world bounds (~80 B/cell per generation; 100 m on the 100 km
+// world = 1e6 cells is still accepted).
+inline constexpr float kMinLoadCellSizeMeters = 10.0f;
+inline constexpr std::uint64_t kMaxLoadCells = 1u << 20;
 
 struct LoadFieldConfig {
     bool enabled = true;
@@ -413,6 +418,33 @@ inline ValidatedLoadFieldConfig ValidateLoadFieldConfig(const LoadFieldConfig& i
     if (!out.effective.bounds.IsValid()) {
         warn("bounds must have positive extents, using a 1x1m safe grid");
         out.effective.bounds = WorldBounds::FromExtent(1.0f);
+    }
+    // Hardening H10: "finite and > 0" admitted cell sizes whose grid (dim_x *
+    // dim_y over the runtime-owned world bounds) overflows the u32 dimensions
+    // or cannot be allocated by the supervisor's field rebuild (0.5 m on the
+    // 100 km world = 4e10 cells). Absolute floor + a cell-count cap relative
+    // to the actual bounds; the grid is a coarse control-plane signal.
+    if (out.effective.cell_size_m < kMinLoadCellSizeMeters) {
+        warn("cell_size_m below the 10 m floor, using 10");
+        out.effective.cell_size_m = kMinLoadCellSizeMeters;
+    }
+    {
+        const double extent_x = out.effective.bounds.ExtentX();
+        const double extent_y = out.effective.bounds.ExtentY();
+        const double cell = out.effective.cell_size_m;
+        const double cells = std::ceil(extent_x / cell) * std::ceil(extent_y / cell);
+        if (cells > static_cast<double>(kMaxLoadCells)) {
+            // Smallest whole-meter cell size whose grid fits the cap.
+            double safe = std::ceil(std::sqrt(extent_x * extent_y / static_cast<double>(kMaxLoadCells)));
+            while (std::ceil(extent_x / safe) * std::ceil(extent_y / safe) >
+                   static_cast<double>(kMaxLoadCells)) {
+                safe += 1.0;
+            }
+            warn((std::string("cell_size_m yields more than ") + std::to_string(kMaxLoadCells) +
+                  " cells over the world bounds, using " + std::to_string(static_cast<int>(safe)))
+                     .c_str());
+            out.effective.cell_size_m = static_cast<float>(safe);
+        }
     }
     return out;
 }

@@ -1,5 +1,6 @@
 #pragma once
 
+#include <cstddef>
 #include <cstdint>
 #include <string>
 
@@ -14,6 +15,9 @@
 // Deterministic setup; every scenario runs SETUP -> WARMUP -> MEASURE ->
 // FINAL VALIDATION. Setup cost is never mixed into steady-state tick cost.
 namespace gs::bench {
+
+// Resident set size of this process (bench-side; platform-guarded).
+std::size_t ProcessWorkingSetBytes();
 
 struct ReadinessConfig {
     std::string scenario = "spread"; // spread|quiet|hotspot|multi|moving|border|combat|replication|churn|dense

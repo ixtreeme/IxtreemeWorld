@@ -438,10 +438,10 @@ int main(int argc, char* argv[])
         io_workers.reserve(io_threads > 0 ? io_threads - 1 : 0);
         for (std::uint32_t i = 1; i < io_threads; ++i) {
             io_workers.emplace_back([&io] {
-                io.run();
+                gs::network::RunIoContext(io);
             });
         }
-        io.run();
+        gs::network::RunIoContext(io); // H8: a throwing handler does not end an io thread
 
         for (auto& worker : io_workers) {
             if (worker.joinable()) {

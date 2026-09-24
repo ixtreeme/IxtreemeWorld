@@ -51,6 +51,10 @@ struct SessionCounters {
     std::atomic<std::uint64_t> setup_timeouts{0};
     std::atomic<std::uint64_t> max_queued_bytes{0};  // high-water mark, any session
     std::atomic<std::uint64_t> max_queued_frames{0}; // high-water mark, any session
+    // Protocol hardening (H8): a local failure closes that one session.
+    std::atomic<std::uint64_t> oversized_send_rejects{0};     // outgoing payload > protocol limit
+    std::atomic<std::uint64_t> payload_handler_exceptions{0}; // handler threw (any type)
+    std::atomic<std::uint64_t> io_loop_exceptions{0};         // escaped a handler; see RunIoContext
 };
 SessionCounters& GlobalSessionCounters() noexcept;
 
@@ -97,6 +101,14 @@ public:
     [[nodiscard]] std::size_t MaxQueuedBytes() const noexcept
     {
         return max_queued_bytes_.load(std::memory_order_relaxed);
+    }
+    // Socket-option observability (tests/admin): Nagle disabled?
+    [[nodiscard]] bool NoDelay() const
+    {
+        boost::asio::ip::tcp::no_delay option;
+        boost::system::error_code ec;
+        socket_.get_option(option, ec);
+        return !ec && option.value();
     }
 
 private:

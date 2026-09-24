@@ -54,6 +54,8 @@ void ZoneManager::BuildFromWorldLogic(const mx::map::WorldLogic& logic, float fa
 {
     zones_.clear();
     partition_roots_.clear();
+    retired_pending_.clear();
+    reusable_slots_.clear();
     regions_ = DefaultRegions();
 
     if (!logic.zones.empty()) {
@@ -122,12 +124,154 @@ void ZoneManager::Clear()
     partition_roots_.clear();
     regions_.clear();
     next_zone_id_ = 1;
+    retired_pending_.clear();
+    reusable_slots_.clear();
     graph_.Rebuild(zones_);
 }
 
 ZoneId ZoneManager::AllocateZoneId()
 {
     return next_zone_id_++;
+}
+
+std::size_t ZoneManager::PlaceZone(std::unique_ptr<Zone> zone)
+{
+    while (!reusable_slots_.empty()) {
+        // Lowest free slot first: live zones pack toward the front, so the
+        // vacant tail can be trimmed (TrimVacantTail) and the table follows
+        // the CURRENT topology instead of its historical high-water mark.
+        const auto lowest = std::min_element(reusable_slots_.begin(), reusable_slots_.end());
+        const std::size_t index = *lowest;
+        reusable_slots_.erase(lowest);
+        // Proven free at reclaim time, and the supervisor cannot re-reference
+        // a Retired slot since; the cheap recheck only keeps a logic error
+        // from ever destroying a live zone.
+        if (index < zones_.size() && zones_[index]->Partition() == PartitionState::Retired &&
+            !zones_[index]->SimulationEnabled() && zones_[index]->Entities().empty()) {
+            zones_[index] = std::move(zone); // destroys the retired Zone + flecs world
+            ++reused_total_;
+            return index;
+        }
+    }
+    zones_.push_back(std::move(zone));
+    return zones_.size() - 1;
+}
+
+void ZoneManager::NoteRetired(std::size_t index)
+{
+    for (const auto& pending : retired_pending_) {
+        if (pending.index == index) {
+            return;
+        }
+    }
+    retired_pending_.push_back(RetiredSlot{index, world_tick_});
+}
+
+bool ZoneManager::SlotReclaimable(std::size_t index, ReclaimStats& blocked) const
+{
+    const Zone& zone = *zones_[index];
+    if (zone.Partition() != PartitionState::Retired || zone.SimulationEnabled() ||
+        zone.TickInProgress().load(std::memory_order_acquire) || !zone.Entities().empty() ||
+        !zone.Players().empty() || !zone.NetBySession().empty() || !zone.Commands().Empty() ||
+        zone.Grid().Size() != 0 || !zone.Ghosts().empty()) {
+        ++blocked.blocked_state;
+        return false;
+    }
+    for (const auto& root : partition_roots_) {
+        if (FindPartitionNode(root.get(), zone.Id()) != nullptr) {
+            ++blocked.blocked_node; // e.g. a split parent: the merge anchor
+            return false;
+        }
+    }
+    for (std::size_t other = 0; other < zones_.size(); ++other) {
+        if (other == index || zones_[other]->Partition() == PartitionState::Retired) {
+            continue; // a retired zone never reads its cursors again
+        }
+        for (const std::size_t neighbor : graph_.Neighbors(other)) {
+            if (neighbor == index) {
+                ++blocked.blocked_neighbor;
+                return false;
+            }
+        }
+        for (const auto& cursor : zones_[other]->GhostMaintenance().neighbors) {
+            if (cursor.zone_index == index) {
+                ++blocked.blocked_neighbor; // reconciles away on that zone's next tick
+                return false;
+            }
+        }
+    }
+    return true;
+}
+
+std::vector<ZoneId> ZoneManager::ReclaimRetiredSlots(
+    std::uint32_t world_tick, const std::function<bool(std::size_t)>& externally_referenced)
+{
+    blocked_ = ReclaimStats{}; // blocked_* are last-pass gauges
+    std::vector<ZoneId> reclaimed;
+    for (auto it = retired_pending_.begin(); it != retired_pending_.end();) {
+        const std::size_t index = it->index;
+        if (world_tick - it->retired_tick < kReclaimGraceTicks || !SlotReclaimable(index, blocked_)) {
+            ++it;
+            continue;
+        }
+        if (externally_referenced && externally_referenced(index)) {
+            ++blocked_.blocked_external;
+            ++it;
+            continue;
+        }
+        // Proven unreferenced: release the retired zone's storage NOW (flecs
+        // world with its deleted entities' tables, spatial grid, load bins,
+        // index maps) instead of when a split/merge reuses the slot. The slot
+        // keeps a vacant placeholder -- same id (ids are never reused, so
+        // stale-id lookups still resolve to a Retired zone), empty bounds.
+        const ZoneId id = zones_[index]->Id();
+        auto vacant = std::make_unique<Zone>(id, "vacant", mx::map::Rect{});
+        vacant->SetRegion(zones_[index]->Region());
+        vacant->SetPartition(PartitionState::Retired);
+        vacant->SetSimulationEnabled(false);
+        zones_[index] = std::move(vacant);
+        reusable_slots_.push_back(index);
+        ++reclaimed_total_;
+        reclaimed.push_back(id);
+        it = retired_pending_.erase(it);
+    }
+    if (!reclaimed.empty()) {
+        TrimVacantTail();
+    }
+    return reclaimed;
+}
+
+void ZoneManager::TrimVacantTail()
+{
+    // Only proven-free slots are removed, and only from the END, so no live
+    // index moves. Every holder was proven absent for these slots, and an
+    // index at or past ZoneCount() fails loudly in GetZone (.at()).
+    bool trimmed = false;
+    while (!zones_.empty()) {
+        const std::size_t last = zones_.size() - 1;
+        const auto free_it = std::find(reusable_slots_.begin(), reusable_slots_.end(), last);
+        if (free_it == reusable_slots_.end()) {
+            break;
+        }
+        reusable_slots_.erase(free_it);
+        zones_.pop_back();
+        ++trimmed_total_;
+        trimmed = true;
+    }
+    if (trimmed) {
+        graph_.Rebuild(zones_);
+    }
+}
+
+ZoneManager::ReclaimStats ZoneManager::GetReclaimStats() const
+{
+    ReclaimStats stats = blocked_;
+    stats.retired_pending = retired_pending_.size();
+    stats.reusable = reusable_slots_.size();
+    stats.reclaimed_total = reclaimed_total_;
+    stats.reused_total = reused_total_;
+    stats.trimmed_total = trimmed_total_;
+    return stats;
 }
 
 std::size_t ZoneManager::FindIndexById(ZoneId id) const
@@ -284,7 +428,7 @@ bool ZoneManager::CreateStagedSplit(const SplitPlan& plan, std::vector<ZoneId>& 
             // Staged children cannot tick yet, so configuring their load bins
             // here is race-free; a commit turns them into active leaves.
             child->ConfigureLoadBins(load_field_mapping_);
-            zones_.push_back(std::move(child));
+            PlaceZone(std::move(child));
             out_child_ids.push_back(child_id);
         }
     } catch (...) {
@@ -295,6 +439,7 @@ bool ZoneManager::CreateStagedSplit(const SplitPlan& plan, std::vector<ZoneId>& 
             const std::size_t index = FindIndexById(id);
             if (index < zones_.size()) {
                 zones_[index]->SetPartition(PartitionState::Retired);
+                NoteRetired(index);
                 zones_[index]->SetSimulationEnabled(false);
             }
         }
@@ -394,6 +539,7 @@ void ZoneManager::AbortSplit(ZoneId parent_id, const std::vector<ZoneId>& child_
         assert(child.Entities().empty() && child.Players().empty() &&
                "AbortSplit: staged child still holds residents (rollback incomplete)");
         child.SetPartition(PartitionState::Retired);
+        NoteRetired(index);
         child.SetSimulationEnabled(false);
         child.RefreshResidentCounts();
         // Partial transfers during the aborted split bumped this staged
@@ -476,7 +622,7 @@ bool ZoneManager::CreateStagedMergeTarget(const MergePlan& plan, ZoneId& out_mer
         merged->SetSimulationEnabled(false);
         merged->NextTick() = std::chrono::steady_clock::now();
         merged->ConfigureLoadBins(load_field_mapping_);
-        zones_.push_back(std::move(merged));
+        PlaceZone(std::move(merged));
         out_merged_id = merged_id;
     } catch (...) {
         for (const ZoneId id : plan.child_ids) {
@@ -584,6 +730,7 @@ void ZoneManager::AbortMerge(const MergePlan& plan, ZoneId merged_id)
         assert(merged.Entities().empty() && merged.Players().empty() &&
                "AbortMerge: staged target still holds residents (rollback incomplete)");
         merged.SetPartition(PartitionState::Retired);
+        NoteRetired(merged_index);
         merged.SetSimulationEnabled(false);
         merged.RefreshResidentCounts();
         // The staged merge target may have received transfers before the
@@ -641,6 +788,7 @@ bool ZoneManager::RetireZone(ZoneId zone_id)
     ResetZoneDiagnosticGauges(zone);
     zone.SetSimulationEnabled(false);
     zone.SetPartition(PartitionState::Retired);
+    NoteRetired(index);
     if (auto* node = FindNodeInRoots(partition_roots_, zone_id)) {
         node->state = PartitionState::Retired;
         node->simulation_enabled = false;

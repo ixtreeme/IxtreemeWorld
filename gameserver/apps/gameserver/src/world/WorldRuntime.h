@@ -277,6 +277,12 @@ public:
     {
         return partition_metrics_.TakeSnapshot();
     }
+    // H9: retired zone slot reclamation (published by the supervisor).
+    ZoneManager::ReclaimStats ZoneReclaimStats() const
+    {
+        std::lock_guard lock(reclaim_stats_mutex_);
+        return reclaim_stats_;
+    }
     const PartitionConfig& EffectivePartitionConfig() const noexcept
     {
         return effective_partition_config_;
@@ -422,6 +428,9 @@ private:
     // due split/merge transactions. Runs only when no zone tick is in
     // flight, so partition mutation never races worker threads.
     void ExecutePartitionControl();
+    // H9: proves retired zone slots unreferenced (quiescent window, once per
+    // world tick) so the next split/merge reuses them; publishes the stats.
+    void ReclaimRetiredZones();
     // One full split transaction: Plan -> Create(staged) -> Transfer ->
     // Validate -> Commit, with rollback + AbortSplit on any failure (§3-4).
     // `forced` bypasses load predicates (test seams); `center` is the
@@ -522,6 +531,9 @@ private:
     // Slow control-plane cadence (§42): topology decisions at ~1 Hz while
     // simulation runs at 20 Hz.
     std::chrono::steady_clock::time_point last_partition_control_{};
+    std::uint32_t last_reclaim_tick_ = UINT32_MAX;
+    mutable std::mutex reclaim_stats_mutex_;
+    ZoneManager::ReclaimStats reclaim_stats_{}; // published copy (any thread)
     // World-space activity field (first Adaptive Simulation Fabric
     // foundation). Rebuilt ~1Hz on the supervisor from per-zone published
     // player sources; consumed via immutable snapshots by zone ticks

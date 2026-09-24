@@ -2155,12 +2155,19 @@ a state-et teljes 19 B-os rekordként küldte minden változásnál.
    (`--budget`, pl. 64 record) eléréséig vesz fel state-et, a többi
    **pending** marad (a verzió/due nem advance-el). Critical (lifecycle,
    combat, refresh, starvation) mindig átmegy.
-5. **Starvation protection**: a **pending change kora** (`now −
-   entity_version_tick`) > `max_defer_ticks` (40) → bypass; a shadow
-   validator ugyanezt a korlátot kéri számon.
+5. **Starvation protection**: a **recipient tudásának kora függő változás
+   mellett** (`now − synced_tick`, ahol `synced_tick` = az utolsó tick,
+   amikor a recipient állapota igazoltan aktuális volt: küldés, vagy due
+   ellenőrzésnél változatlannak talált állapot) > `max_defer_ticks` (40) →
+   bypass; a shadow validator ugyanezt a korlátot kéri számon.
+   *(Hardening H7: az eredeti `now − entity_version_tick` definíció egy
+   folyamatosan mozgó entitást soha nem látott „éhezőnek", ezért a budget
+   végtelenül halaszthatta.)*
 6. **Periodic resync**: staggered (viewer-NetId fázis), `resync_ticks`
-   (default a `refresh_ticks`), full-state maskkal; a delta-nyereséget nem
-   semmisíti meg (1 Hz / entitás).
+   (default a `refresh_ticks`), full-state maskkal — a változatlan állapotot
+   is újraküldi; a delta-nyereséget nem semmisíti meg (1 Hz / entitás).
+   *(Hardening H7: due-alapú, viewerenkénti `next_resync_tick`; a korábbi
+   pontos tick-egyezés kimaradt, ha a zóna átugrott egy world tick értéket.)*
 7. **Flags**: `--repl-v1` (v1 full-state referencia), `--netlod-off`,
    `--budget N`, `--resync N`.
 
@@ -2168,8 +2175,9 @@ a state-et teljes 19 B-os rekordként küldte minden változásnál.
 
 A `ValidateReplicationShadow` kiterjesztve: minden látható (viewer, net)
 párnál a **kliens mezőállapotát** hasonlítja az authority-hoz (resident vagy
-ghost snapshot); eltérés esetén a **pending change kora** ≤ `max_defer + 2`
-kell (friss változás még úton lehet; tartós divergencia failure). Emellett
+ghost snapshot); eltérés (vagy verzió-előny) esetén a recipient tudásának
+kora (`now − synced_tick`) ≤ `max_defer + 2` kell (friss változás még úton
+lehet; tartós divergencia failure). Emellett
 marad az exact interest-set + ordered AOI equivalence + canonical-record
 audit + lifecycle checks. Nincs silent repair.
 
@@ -2254,9 +2262,12 @@ supervisor thread (WorldRuntime::Run)
   │    → pool.Enqueue(zone_index)  (egy GLOBÁLIS FIFO + notify_one)
   └─ 5 ms-es cv-wait; auditok quiescent ablakban
 
-ZoneWorkerPool (bounded): worker_count = min(zone_count, hw-1) vagy
-  --workers N override; minden worker: FIFO pop → tick_(zone) → Zone::Tick
-  (ZoneWriteGuard owner-thread enforcement) → TickInProgress = false
+ZoneWorkerPool (bounded): worker_count = hw-1 (legalább 1) vagy
+  --workers N / `zone_workers` override [1, 256]; minden worker: FIFO pop →
+  tick_(zone) → Zone::Tick (ZoneWriteGuard owner-thread enforcement) →
+  TickInProgress = false
+  (Hardening H6: korábban min(zone_count, hw-1) a START-kori zónaszámmal —
+  a 3 zónás test mapen 3 worker, split után sem több.)
 ```
 
 - **Zone ≠ OS thread**: sok leaf zone → egy bounded pool → CPU magok.
@@ -2267,6 +2278,13 @@ ZoneWorkerPool (bounded): worker_count = min(zone_count, hw-1) vagy
   `cas_failures` countere méri a "már fut" eseteket).
 - A split/merge/retire a `GetActiveLeaves()`-en és a `SimulationEnabled()`
   flaggen keresztül hat a scheduler-re; a retired zone nem fut.
+- *(Hardening H9)* A retired zone slotja bizonyítottan hivatkozásmentes
+  állapotban (nincs node, graph-él, ghost cursor, owner `zone_index`,
+  függő migráció; grace 2 tick) felszabadul: a storage azonnal (vacant
+  placeholder, ugyanazzal az id-vel), a slotot a következő split/merge
+  újrahasznosítja (legalacsonyabb először), a tábla vacant farka levágódik.
+  A zone id-k soha nem ismétlődnek. A ghost cursor slot+id párral azonosít
+  (ABA-védelem).
 
 ### 15.2 Instrumentáció
 

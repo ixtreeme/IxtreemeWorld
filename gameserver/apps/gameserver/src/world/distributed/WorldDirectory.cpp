@@ -117,6 +117,16 @@ void WorldDirectory::RetireZones(const std::vector<ZoneId>& zone_ids)
     }
 }
 
+void WorldDirectory::ForgetRetiredZone(ZoneId zone)
+{
+    std::lock_guard lock(mutex_);
+    if (retired_zones_.erase(zone) == 0) {
+        return;
+    }
+    assignments_.erase(zone);
+    drained_zones_.erase(zone);
+}
+
 std::vector<std::pair<ZoneId, ZoneLocation>> WorldDirectory::AssignmentSnapshot() const
 {
     std::lock_guard lock(mutex_);

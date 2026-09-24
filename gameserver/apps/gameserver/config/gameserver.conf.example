@@ -142,7 +142,9 @@ simulation_demote_low_sec=60.0
 load_field_enabled=true
 # L0 cell size in meters. 500m over the 100km world = 200x200 = 40k cells
 # (~3.2MB per generation); 250m = 160k cells. Benchmarked, not coupled to
-# the activity field or AOI radius.
+# the activity field or AOI radius. Safe range: >= 10 m, and at most 2^20
+# cells over the world bounds (100 km world: >= ~98 m); smaller values are
+# raised with a warning.
 load_field_cell_size_m=500.0
 load_field_aggregation_hz=1.0
 # Coarse L1 seam: one L1 cell = l1_ratio x l1_ratio L0 cells.

@@ -71,6 +71,10 @@ public:
     // Merge/split support: keep the entry for in-flight migration
     // completion, but mark retired so no NEW work routes there.
     void RetireZones(const std::vector<ZoneId>& zone_ids);
+    // Ends the retention of a retired zone (hardening H9): called once zone
+    // reclamation proved no queued migration references it. A live
+    // (non-retired) assignment is never touched.
+    void ForgetRetiredZone(ZoneId zone);
 
     // Debug/validator snapshot of the routing table (copy under lock).
     std::vector<std::pair<ZoneId, ZoneLocation>> AssignmentSnapshot() const;

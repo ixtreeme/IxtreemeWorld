@@ -5,6 +5,7 @@
 #include <vector>
 
 #include "BorderSnapshot.h"
+#include "../partition/PartitionTypes.h"
 
 // Maintains a zone's read-only ghost copies of neighbor-zone border
 // residents. Ghosts are NEVER authoritative and NEVER written back; they
@@ -32,6 +33,11 @@ class ZoneManager;
 // guard by GhostSystem).
 struct GhostNeighborCursor {
     std::size_t zone_index = 0;             // neighbor zone slot
+    // The zone that held the slot when the cursor was built. Slots are
+    // reused after retirement (hardening H9), so the slot alone is not an
+    // identity: a reused slot with a coincidentally equal publish generation
+    // would otherwise look like "the same neighbor, unchanged" (ABA).
+    ZoneId zone_id = 0;
     std::uint64_t publish_generation = 0;   // last reconciled neighbor publish
     // True when this neighbor's buffer was processed in the current pass (its
     // ghosts must have been seen); false when skipped as unchanged (its
