@@ -682,6 +682,37 @@ bool ZoneManager::AnyTickInProgress() const
     return false;
 }
 
+bool ZoneManager::AnyCommandsPending() const
+{
+    // Only zones that can still tick: a command stranded in a retired zone
+    // would never drain, and waiting on it would hide exactly the invariant
+    // violation the validator reports ("retired zone holds queued commands").
+    for (const auto& zone : zones_) {
+        if (zone->SimulationEnabled() && !zone->Commands().Empty()) {
+            return true;
+        }
+    }
+    return false;
+}
+
+bool ZoneManager::CommandsPendingUnder(ZoneId node_id) const
+{
+    const ZonePartition* node = FindNodeInRoots(partition_roots_, node_id);
+    auto pending = [this](ZoneId id) {
+        const std::size_t index = FindIndexById(id);
+        return index < zones_.size() && !zones_[index]->Commands().Empty();
+    };
+    if (node == nullptr || node->IsLeaf()) {
+        return pending(node_id);
+    }
+    for (const auto& child : node->children) {
+        if (pending(child->zone_id)) {
+            return true;
+        }
+    }
+    return false;
+}
+
 void ZoneManager::PostCommand(std::size_t zone_index, ZoneCommandQueue::Command command)
 {
     if (zone_index >= zones_.size()) {

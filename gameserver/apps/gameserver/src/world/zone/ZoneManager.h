@@ -132,6 +132,13 @@ public:
 
     const std::vector<std::size_t>& NeighborsOf(std::size_t zone_index) const;
     bool AnyTickInProgress() const;
+    // Hardening H1: commands wait for their zone's next 20 Hz tick, so "no
+    // tick in flight" no longer implies "every posted command was applied".
+    // Audits and forced topology operations need both conditions.
+    bool AnyCommandsPending() const;
+    // Pending commands in the zone of node `node_id` or, for an inner
+    // partition node, in any of its direct children.
+    bool CommandsPendingUnder(ZoneId node_id) const;
 
     // Pushes a command into a zone's inbound queue (oob-safe no-op).
     // Waking the supervisor/scheduler after the push is the caller's job.

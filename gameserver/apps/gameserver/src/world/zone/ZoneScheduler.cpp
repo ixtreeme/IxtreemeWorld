@@ -39,7 +39,8 @@ void ZoneScheduler::ScheduleOnce(ZoneManager& zones,
                                  ZoneWorkerPool& pool,
                                  std::chrono::steady_clock::time_point now,
                                  const std::shared_ptr<const ActivityGrid>& activity,
-                                 float wake_radius_m)
+                                 float wake_radius_m,
+                                 const DueHook& before_dispatch)
 {
     const auto schedule_start = std::chrono::steady_clock::now();
     ++counters_.waves;
@@ -113,7 +114,17 @@ void ZoneScheduler::ScheduleOnce(ZoneManager& zones,
             diag.sleep_blocked_external_since_diag.fetch_add(1, std::memory_order_relaxed);
         }
 
-        if (now < zone.NextTick() && !has_commands) {
+        // Authoritative clock (hardening H1): a zone ticks ONLY on its 20 Hz
+        // cadence. Pending commands keep a zone awake (the sleep test above)
+        // and are drained by the next due tick, but they never schedule an
+        // early tick: every tick integrates a fixed kTickDt, so an early tick
+        // would run simulation time faster than wall time (input rate would
+        // become the tick rate -- a client sending per rendered frame sped
+        // the whole zone up ~7x at 144 FPS, and an input flood starved it).
+        // Model: command -> queue -> wake if sleeping -> wait NextTick -> tick
+        // -> drain. A woken zone keeps the NextTick the sleep branch
+        // maintained (<= one kTickDt away), so wake latency stays bounded.
+        if (now < zone.NextTick()) {
             continue;
         }
 
@@ -136,6 +147,17 @@ void ZoneScheduler::ScheduleOnce(ZoneManager& zones,
     std::sort(due.begin(), due.end(), [](const auto& lhs, const auto& rhs) {
         return lhs.first > rhs.first;
     });
+    if (before_dispatch && !due.empty()) {
+        // Zones are claimed and not yet running: whatever the hook posts is
+        // drained at the top of exactly this tick.
+        std::vector<std::size_t> indices;
+        indices.reserve(due.size());
+        for (const auto& [score, index] : due) {
+            (void)score;
+            indices.push_back(index);
+        }
+        before_dispatch(indices);
+    }
     for (const auto& [score, index] : due) {
         (void)score;
         pool.Enqueue(index);

@@ -82,12 +82,26 @@ gs::protocol::S2cEnterWorldReject::RejectReason ToRejectReason(
 GameConnectionHandler::GameConnectionHandler(gs::db::HandoffTokenRepository& handoff_tokens,
                                               gs::db::CharacterRepository& characters,
                                               WorldRuntime& sim,
-                                              std::string game_server)
+                                              std::string game_server,
+                                              ConnectionPolicy policy)
     : handoff_tokens_(handoff_tokens)
     , characters_(characters)
     , sim_(sim)
     , game_server_(std::move(game_server))
+    , policy_(policy)
 {
+}
+
+ConnectionStats GameConnectionHandler::Stats() const noexcept
+{
+    ConnectionStats stats;
+    stats.moves_accepted = moves_accepted_.load(std::memory_order_relaxed);
+    stats.moves_dropped_entering = moves_dropped_entering_.load(std::memory_order_relaxed);
+    stats.moves_rejected_state = moves_rejected_state_.load(std::memory_order_relaxed);
+    stats.move_flood_disconnects = move_flood_disconnects_.load(std::memory_order_relaxed);
+    stats.attacks_accepted = attacks_accepted_.load(std::memory_order_relaxed);
+    stats.attacks_rate_limited = attacks_rate_limited_.load(std::memory_order_relaxed);
+    return stats;
 }
 
 void GameConnectionHandler::OnPayload(std::shared_ptr<gs::network::Session> session,
@@ -107,6 +121,45 @@ void GameConnectionHandler::OnPayload(std::shared_ptr<gs::network::Session> sess
             return;
         }
 
+        // Input state gate + edge rate policy (hardening H3): decided under
+        // the lock, acted on after it. Only an in-world session's movement
+        // reaches the world; nothing before world entry does.
+        enum class Verdict { Accept, Drop, Refuse };
+        Verdict verdict = Verdict::Refuse;
+        const char* reason = "input before world entry";
+        {
+            std::lock_guard lock(contexts_mutex_);
+            const auto it = contexts_.find(session->Id());
+            const auto state =
+                it == contexts_.end() ? GameSessionState::WaitingHandshake : it->second.state;
+            if (state == GameSessionState::InWorld) {
+                const auto count = it->second.move_window.Note(std::chrono::steady_clock::now());
+                if (policy_.max_move_packets_per_second > 0 &&
+                    count > policy_.max_move_packets_per_second) {
+                    reason = "input flood";
+                    move_flood_disconnects_.fetch_add(1, std::memory_order_relaxed);
+                } else {
+                    verdict = Verdict::Accept;
+                    moves_accepted_.fetch_add(1, std::memory_order_relaxed);
+                }
+            } else if (state == GameSessionState::EnteringWorld) {
+                // The world is not ours yet; a client never legitimately sends
+                // here (it waits for EnterWorldAccept), so this is only
+                // counted, not punished.
+                verdict = Verdict::Drop;
+                moves_dropped_entering_.fetch_add(1, std::memory_order_relaxed);
+            } else {
+                moves_rejected_state_.fetch_add(1, std::memory_order_relaxed);
+            }
+        }
+        if (verdict == Verdict::Refuse) {
+            Disconnect(session, reason);
+            return;
+        }
+        if (verdict == Verdict::Drop) {
+            return;
+        }
+
         sim_.PostMoveInput(session->Id(),
                            sequence,
                            DequantizeHeading(heading_q),
@@ -114,49 +167,70 @@ void GameConnectionHandler::OnPayload(std::shared_ptr<gs::network::Session> sess
         return;
     }
 
-    std::lock_guard lock(contexts_mutex_);
-    auto& ctx = contexts_[session->Id()];
+    // Decide under the lock, act after releasing it (hardening H2.1): a
+    // disconnect runs Session::Stop, whose disconnect callback
+    // (OnDisconnect) takes contexts_mutex_ again on this same thread. Doing
+    // it under the lock was a self-deadlock (POSIX) / std::system_error that
+    // aborted the cleanup (MSVC): leaked context, no world despawn.
+    std::optional<std::string> disconnect_reason;
+    {
+        std::lock_guard lock(contexts_mutex_);
+        disconnect_reason = ProcessPacketLocked(session, contexts_[session->Id()], payload);
+    }
+    if (disconnect_reason) {
+        Disconnect(session, *disconnect_reason);
+    }
+}
 
+std::optional<std::string> GameConnectionHandler::ProcessPacketLocked(
+    const std::shared_ptr<gs::network::Session>& session,
+    GameSessionContext& ctx,
+    const std::vector<std::uint8_t>& payload)
+{
     try {
         auto parsed = gs::protocol::ParsePacket(payload);
         if (!parsed) {
-            Disconnect(session, "invalid message");
-            return;
+            return std::string("invalid message");
         }
 
         auto packet = parsed->packet;
         switch (ctx.state) {
         case GameSessionState::WaitingHandshake:
             if (!packet.isHandshakeRequest()) {
-                Disconnect(session, "wrong state");
-                return;
+                return std::string("wrong state");
             }
             HandleHandshakeRequest(session, ctx, packet.getHandshakeRequest());
-            return;
+            return std::nullopt;
         case GameSessionState::ConnectionEstablished:
             if (!packet.isEnterWorld()) {
-                Disconnect(session, "wrong state");
-                return;
+                return std::string("wrong state");
             }
             HandleEnterWorld(session, ctx, packet.getEnterWorld());
-            return;
+            return std::nullopt;
         case GameSessionState::EnteringWorld:
-            Disconnect(session, "packet during enter world");
-            return;
+            return std::string("packet during enter world");
         case GameSessionState::InWorld:
             if (packet.isAttackTarget()) {
+                if (!ctx.attack_bucket.Take(std::chrono::steady_clock::now(),
+                                            policy_.attacks_per_second,
+                                            policy_.attack_burst)) {
+                    attacks_rate_limited_.fetch_add(1, std::memory_order_relaxed);
+                    return std::nullopt;
+                }
+                attacks_accepted_.fetch_add(1, std::memory_order_relaxed);
                 sim_.PostAttackTarget(session->Id(), packet.getAttackTarget().getTargetNetId());
-                return;
+                return std::nullopt;
             }
             LOG_DEBUG("Session {} sent ignored in-world packet", session->Id());
-            return;
+            return std::nullopt;
         }
     } catch (const kj::Exception& error) {
         LOG_WARN("Session {} sent invalid Cap'n Proto message: {}",
                  session->Id(),
                  error.getDescription().cStr());
-        Disconnect(session, "invalid message");
+        return std::string("invalid message");
     }
+    return std::nullopt;
 }
 
 void GameConnectionHandler::OnDisconnect(std::shared_ptr<gs::network::Session> session)
@@ -167,7 +241,14 @@ void GameConnectionHandler::OnDisconnect(std::shared_ptr<gs::network::Session> s
     }
     LOG_INFO("Game session {} disconnected; posting sim despawn", session->Id());
     sim_.PostDespawn(session->Id());
+    disconnect_cleanups_.fetch_add(1, std::memory_order_relaxed);
     LOG_INFO("Game session {} cleaned up", session->Id());
+}
+
+std::size_t GameConnectionHandler::ContextCount() const
+{
+    std::lock_guard lock(contexts_mutex_);
+    return contexts_.size();
 }
 
 void GameConnectionHandler::HandleHandshakeRequest(
@@ -184,6 +265,7 @@ void GameConnectionHandler::HandleHandshakeRequest(
     }
 
     ctx.state = GameSessionState::ConnectionEstablished;
+    session->MarkEstablished(); // clears the network-layer setup deadline
     SendHandshakeResponse(session, gs::protocol::HandshakeResult::OK, "Welcome to world");
     LOG_INFO("Game session {} handshake OK (build {})",
              session->Id(),

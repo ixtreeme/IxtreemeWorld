@@ -88,10 +88,22 @@ WorldRuntime::WorldRuntime(boost::asio::io_context& io, RuntimeIdentity identity
              directory_)
     , migration_(zones_, terrain_, owners_by_session_, migration_queue_, directory_,
                  migration_transport_, identity_)
-    , inputs_(router_, [this] {
-        cv_.notify_one();
-    })
+    , inputs_(router_)
 {
+    // Runs inside the tick-aligned input command, on the zone's worker.
+    attack_handler_ = [this](Zone& zone,
+                             gs::common::SessionId attacker,
+                             std::uint32_t target_net_id) {
+        auto ctx = BuildZoneTickContext();
+        const auto result = CombatSystem::ProcessAttack(zone, attacker, target_net_id, ctx);
+        if (result.attacked) {
+            attacks_since_diag_.fetch_add(1, std::memory_order_relaxed);
+            attacks_total_.fetch_add(1, std::memory_order_relaxed);
+        }
+        if (result.killed) {
+            deaths_total_.fetch_add(1, std::memory_order_relaxed);
+        }
+    };
     const std::string map_root = IXTREEME_DEFAULT_MAP_ROOT;
     InitializeWorld(TerrainService::LoadFromMapRoot(map_root),
                     LoadWorldLogicFromMapRoot(map_root),
@@ -226,6 +238,7 @@ void WorldRuntime::PostSpawn(std::shared_ptr<gs::network::Session> session,
 
 void WorldRuntime::PostDespawn(gs::common::SessionId session_id)
 {
+    inputs_.ForgetSession(session_id);
     Enqueue([this, session_id] {
         spawn_.Despawn(session_id);
     });
@@ -332,22 +345,8 @@ void WorldRuntime::Run()
                     .count()),
             std::memory_order_relaxed);
         spawn_.ProcessRespawns(kTickDtSeconds);
-        inputs_.DrainMoves(owners_by_session_);
-        inputs_.DrainAttacks(owners_by_session_,
-                             [this](Zone& zone,
-                                     gs::common::SessionId attacker,
-                                     std::uint32_t target_net_id) {
-                                 auto ctx = BuildZoneTickContext();
-                                 const auto result =
-                                     CombatSystem::ProcessAttack(zone, attacker, target_net_id, ctx);
-                                 if (result.attacked) {
-                                     attacks_since_diag_.fetch_add(1, std::memory_order_relaxed);
-                                     attacks_total_.fetch_add(1, std::memory_order_relaxed);
-                                 }
-                                 if (result.killed) {
-                                     deaths_total_.fetch_add(1, std::memory_order_relaxed);
-                                 }
-                             });
+        // Client input is no longer fanned out here: it is delivered
+        // tick-aligned by the scheduler hook below (hardening H1).
         // World-space activity rebuild (~1Hz, no tick gating: per-zone
         // buffer copies only). Feeds this pass's LOD evaluations (via tick
         // contexts) and sleep/wake decisions below.
@@ -359,6 +358,9 @@ void WorldRuntime::Run()
                                     ActivityRadii{lod.full_radius_m, lod.reduced_radius_m,
                                                   lod.low_radius_m},
                                     lod.enabled);
+            // Staged input of sessions that own nothing (never spawned /
+            // already gone) is dropped here: bounded staging memory.
+            inputs_.SweepOrphans(owners_by_session_);
         }
         const auto activity_snapshot = activity_field_.Snapshot();
         // Continuous load field aggregation (configurable cadence, default
@@ -393,6 +395,12 @@ void WorldRuntime::Run()
             });
             continue;
         }
+        // H1: a quiescent audit window also needs every queued command
+        // applied (spawn/despawn wait for their zone's next tick). While
+        // commands are pending the audits simply wait; scheduling below keeps
+        // running, so the owning zones tick and drain them.
+        const bool audit_window =
+            audit_pending && !zones_.AnyTickInProgress() && !zones_.AnyCommandsPending();
 
         // Phase 5C audit retention flag: propagate to every zone (split
         // children included) in a quiescent window. Zero cost when off.
@@ -409,7 +417,7 @@ void WorldRuntime::Run()
         // and the supervisor itself is between mutations: zone state is
         // stable to read.
         if (validation_requested_.load(std::memory_order_relaxed)) {
-            if (!zones_.AnyTickInProgress()) {
+            if (audit_window) {
                 validation_requested_.store(false, std::memory_order_relaxed);
                 std::string error;
                 const auto activity_for_validation = activity_field_.Snapshot();
@@ -425,7 +433,7 @@ void WorldRuntime::Run()
         // window, explicit request only (the raw work events are already
         // consumed, so this audits the generation's internal invariants).
         if (load_field_validation_requested_.load(std::memory_order_relaxed)) {
-            if (!zones_.AnyTickInProgress()) {
+            if (audit_window) {
                 load_field_validation_requested_.store(false, std::memory_order_relaxed);
                 std::string error;
                 const auto load_field_for_validation = load_field_.Snapshot();
@@ -441,7 +449,7 @@ void WorldRuntime::Run()
         // authority). A detected inconsistency triggers the fallback repair
         // when auto-repair is enabled.
         if (ghost_validation_requested_.load(std::memory_order_relaxed)) {
-            if (!zones_.AnyTickInProgress()) {
+            if (audit_window) {
                 ghost_validation_requested_.store(false, std::memory_order_relaxed);
                 std::string error;
                 std::size_t zones_checked = 0;
@@ -472,7 +480,7 @@ void WorldRuntime::Run()
         // one). Read-only; mismatches are counted and reported, never
         // silently repaired.
         if (replication_validation_requested_.load(std::memory_order_relaxed)) {
-            if (!zones_.AnyTickInProgress()) {
+            if (audit_window) {
                 replication_validation_requested_.store(false, std::memory_order_relaxed);
                 std::string error;
                 std::size_t viewers_checked = 0;
@@ -502,7 +510,7 @@ void WorldRuntime::Run()
         // explicit request only (static scenarios; roaming load would race
         // the 1Hz snapshot). Samples + outcome are stashed for the bench.
         if (activity_validation_requested_.load(std::memory_order_relaxed)) {
-            if (!zones_.AnyTickInProgress()) {
+            if (audit_window) {
                 activity_validation_requested_.store(false, std::memory_order_relaxed);
                 const std::size_t max_samples =
                     activity_validation_max_samples_.load(std::memory_order_relaxed);
@@ -520,11 +528,20 @@ void WorldRuntime::Run()
 
         // Wake radius derives from the LOD reduced radius (§20): any player
         // inside it may grant Full/Reduced relevance, so the zone must tick.
+        // Tick-aligned input delivery (H1): each claimed zone gets exactly the
+        // staged input of its resident sessions, drained at the top of the
+        // tick it is about to run.
         scheduler_.ScheduleOnce(zones_,
                                 workers_,
                                 std::chrono::steady_clock::now(),
                                 activity_snapshot,
-                                effective_lod_config_.reduced_radius_m);
+                                effective_lod_config_.reduced_radius_m,
+                                [this](const std::vector<std::size_t>& due) {
+                                    for (const std::size_t index : due) {
+                                        inputs_.DeliverToZone(zones_.GetZone(index), index,
+                                                              attack_handler_);
+                                    }
+                                });
         ExecutePartitionControl();
         const auto supervisor_micros = static_cast<std::uint64_t>(
             std::chrono::duration_cast<std::chrono::microseconds>(std::chrono::steady_clock::now() -
@@ -1665,6 +1682,14 @@ void WorldRuntime::ExecuteForcedSplit(ZoneId zone_id)
         PostForceSplit(zone_id);
         return;
     }
+    if (zones_.CommandsPendingUnder(zone_id)) {
+        // H1: queued commands drain on the zone's next 20 Hz tick (<= one
+        // kTickDt away); the split gate refuses a zone with pending commands,
+        // so wait for that tick instead of failing the forced split.
+        LOG_DEBUG("partition: forced split deferred (commands pending), re-queued");
+        PostForceSplit(zone_id);
+        return;
+    }
     RunSplitTransaction(zone_id, true, nullptr);
 }
 
@@ -1672,6 +1697,13 @@ void WorldRuntime::ExecuteForcedMerge(ZoneId parent_node_id)
 {
     if (zones_.AnyTickInProgress()) {
         LOG_WARN("partition: forced merge deferred (tick in flight), re-queued");
+        PostForceMerge(parent_node_id);
+        return;
+    }
+    if (zones_.CommandsPendingUnder(parent_node_id)) {
+        // H1: e.g. despawn commands still queued in a child until its next
+        // tick; the merge plan refuses children with pending commands.
+        LOG_DEBUG("partition: forced merge deferred (commands pending), re-queued");
         PostForceMerge(parent_node_id);
         return;
     }
@@ -2465,16 +2497,19 @@ void WorldRuntime::InjectTransferFailuresForTest(int snapshot_failures, int appl
 
 void WorldRuntime::DrainGlobalCommands()
 {
-    for (;;) {
-        std::function<void()> command;
-        {
-            std::lock_guard lock(mutex_);
-            if (commands_.empty()) {
-                return;
-            }
-            command = std::move(commands_.front());
-            commands_.pop();
-        }
+    // Only the commands present at entry run in this pass. A command that
+    // re-queues itself (forced split/merge deferring on a tick in flight or
+    // on pending zone commands) therefore retries on the NEXT pass instead of
+    // spinning here forever -- the condition it waits for can only clear once
+    // the loop gets past this point and schedules the zones.
+    std::queue<std::function<void()>> batch;
+    {
+        std::lock_guard lock(mutex_);
+        batch.swap(commands_);
+    }
+    while (!batch.empty()) {
+        auto command = std::move(batch.front());
+        batch.pop();
         // A failing global command must not kill the supervisor loop.
         try {
             command();

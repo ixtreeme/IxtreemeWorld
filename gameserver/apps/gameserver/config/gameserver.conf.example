@@ -9,6 +9,25 @@ game_server=127.0.0.1:11020
 # Runtime
 io_threads=2
 
+# Network resource policy (hardening H3). 0 disables a limit.
+# Send queue: frames are never dropped individually (replication v2 deltas
+# depend on the recipient's known state); a client that cannot keep up is
+# disconnected instead. soft = counted + logged once per episode.
+net_send_queue_soft_kb=512
+net_send_queue_hard_kb=8192
+net_send_queue_hard_frames=20000
+net_send_queue_hard_age_ms=10000
+# Close a connection that sends nothing for this long, and one that does not
+# complete the handshake within net_handshake_timeout_ms of connecting.
+net_idle_timeout_ms=60000
+net_handshake_timeout_ms=10000
+# Client input at the network edge. Movement is latest-state (the world
+# applies one input per tick per player), so only abuse far beyond any real
+# client disconnects; attacks are rate limited (excess dropped + counted).
+input_max_move_packets_per_second=1000
+input_attacks_per_second=20
+input_attack_burst=20
+
 # Logging
 log_level=info
 log_file=logs/gameserver.log

@@ -108,6 +108,8 @@ if(ENABLE_WORLDBENCH)
     add_executable(worldbench
         src/bench/WorldBench.cpp
         src/bench/ReadinessBench.cpp
+        src/bench/HardeningBench.cpp
+        src/GameConnectionHandler.cpp
         ${GAMESERVER_WORLD_SOURCES}
     )
 

@@ -309,6 +309,38 @@ gs::game::LoadFieldConfig ResolveLoadFieldConfig(const gs::common::Config& confi
     return out;
 }
 
+// Network resource policy (hardening H3). Every key optional; negative values
+// fall back to the default, 0 disables that limit.
+gs::network::SessionLimits ResolveSessionLimits(const gs::common::Config& config)
+{
+    gs::network::SessionLimits limits;
+    auto get = [&](const char* key, long long fallback) {
+        const auto value = config.GetInt(key);
+        return value && *value >= 0 ? static_cast<long long>(*value) : fallback;
+    };
+    limits.send_soft_bytes = static_cast<std::size_t>(get("net_send_queue_soft_kb", 512)) * 1024;
+    limits.send_hard_bytes = static_cast<std::size_t>(get("net_send_queue_hard_kb", 8192)) * 1024;
+    limits.send_hard_frames = static_cast<std::size_t>(get("net_send_queue_hard_frames", 20000));
+    limits.send_hard_age = std::chrono::milliseconds(get("net_send_queue_hard_age_ms", 10000));
+    limits.idle_timeout = std::chrono::milliseconds(get("net_idle_timeout_ms", 60000));
+    limits.setup_timeout = std::chrono::milliseconds(get("net_handshake_timeout_ms", 10000));
+    return limits;
+}
+
+gs::game::ConnectionPolicy ResolveConnectionPolicy(const gs::common::Config& config)
+{
+    gs::game::ConnectionPolicy policy;
+    const auto max_moves = config.GetInt("input_max_move_packets_per_second");
+    if (max_moves && *max_moves >= 0) {
+        policy.max_move_packets_per_second = static_cast<std::uint32_t>(*max_moves);
+    }
+    policy.attacks_per_second = static_cast<float>(
+        GetDoubleOr(config, "input_attacks_per_second", policy.attacks_per_second));
+    policy.attack_burst =
+        static_cast<float>(GetDoubleOr(config, "input_attack_burst", policy.attack_burst));
+    return policy;
+}
+
 } // namespace
 
 int main(int argc, char* argv[])
@@ -356,7 +388,21 @@ int main(int argc, char* argv[])
         sim.ConfigureLoadField(ResolveLoadFieldConfig(config));
         sim.Start();
 
-        gs::game::GameConnectionHandler handler(handoff_tokens, characters, sim, game_server);
+        const auto session_limits = ResolveSessionLimits(config);
+        const auto connection_policy = ResolveConnectionPolicy(config);
+        LOG_INFO("Network policy: send_queue soft={}KB hard={}KB/{} frames/{}ms idle={}ms "
+                 "handshake={}ms move_packets_max={}/s attacks={}/s burst={}",
+                 session_limits.send_soft_bytes / 1024,
+                 session_limits.send_hard_bytes / 1024,
+                 session_limits.send_hard_frames,
+                 session_limits.send_hard_age.count(),
+                 session_limits.idle_timeout.count(),
+                 session_limits.setup_timeout.count(),
+                 connection_policy.max_move_packets_per_second,
+                 connection_policy.attacks_per_second,
+                 connection_policy.attack_burst);
+        gs::game::GameConnectionHandler handler(handoff_tokens, characters, sim, game_server,
+                                                connection_policy);
         gs::network::Server server(
             io,
             port,
@@ -369,6 +415,8 @@ int main(int argc, char* argv[])
             [](auto session) {
                 LOG_INFO("GameServer New connection: session id {}", session->Id());
             });
+
+        server.SetSessionLimits(session_limits);
 
         boost::asio::signal_set signals(io, SIGINT, SIGTERM);
         signals.async_wait([&](const boost::system::error_code& error, int signal_number) {

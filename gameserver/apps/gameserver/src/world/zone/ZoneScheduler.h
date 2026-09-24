@@ -2,7 +2,9 @@
 
 #include <chrono>
 #include <cstdint>
+#include <functional>
 #include <memory>
+#include <vector>
 
 // Decides WHEN each zone ticks. Gameplay-agnostic: it only looks at resident
 // counts, pending commands and tick deadlines, then hands due zones to the
@@ -51,11 +53,18 @@ public:
     // wake radius in meters (derived from the LOD reduced radius; a player
     // inside it keeps the zone awake so residents simulate at the right
     // tier, including wake-before-entry).
+    //
+    // before_dispatch (optional) is called once per pass with the due zones,
+    // already claimed (TickInProgress set) but not yet handed to the pool:
+    // the supervisor delivers tick-aligned input into exactly the zones that
+    // are about to drain their queue (hardening H1).
+    using DueHook = std::function<void(const std::vector<std::size_t>& due_zone_indices)>;
     void ScheduleOnce(ZoneManager& zones,
                       ZoneWorkerPool& pool,
                       std::chrono::steady_clock::time_point now,
                       const std::shared_ptr<const ActivityGrid>& activity,
-                      float wake_radius_m);
+                      float wake_radius_m,
+                      const DueHook& before_dispatch = {});
 
     // Structured split gate: which condition blocks a split right now. The
     // monitor uses it for why-not diagnostics; ShouldSplit is exactly

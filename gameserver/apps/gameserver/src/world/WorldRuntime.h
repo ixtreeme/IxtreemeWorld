@@ -226,6 +226,11 @@ public:
     ZoneWorkerPool::Utilization WorkerUtilization() const;
     // Phase 7 scheduler audit: explicit worker count (0 = auto). Must be set
     // before Start.
+    // Cumulative client-input path counters (posted/routed/applied/dropped).
+    InputRouter::Stats InputStats() const
+    {
+        return inputs_.GetStats();
+    }
     void ConfigureWorkers(std::size_t count) noexcept
     {
         requested_workers_ = count;
@@ -494,6 +499,7 @@ private:
     SpawnCoordinator spawn_;
     MigrationCoordinator migration_;
     InputRouter inputs_;
+    InputRouter::AttackHandler attack_handler_;
 
     ZoneLoadMonitor load_monitor_;
     // Slow control-plane cadence (§42): topology decisions at ~1 Hz while

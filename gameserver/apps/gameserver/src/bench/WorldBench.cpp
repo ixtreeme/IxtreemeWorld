@@ -52,6 +52,7 @@
 #include "../world/partition/ZonePartition.h"
 #include "../world/WorldRuntime.h"
 #include "../world/spawn/SpawnLoader.h"
+#include "HardeningBench.h"
 #include "ReadinessBench.h"
 
 #include <flecs.h>
@@ -111,6 +112,13 @@ struct BenchConfig {
     int budget_records = 0;        // per-session per-frame record budget (0 = off)
     int resync_ticks = 0;          // full-state resync period (0 = default)
     int workers = 0;               // scheduler audit: explicit worker count (0 = auto)
+    // Hardening H0/H1 tick-rate audit (--mode tickrate).
+    std::string rates = "20,30,60,144,flood";
+    int measure_seconds = 4;
+    // Hardening H2/H3 network stress (--mode netstress).
+    int net_io_threads = 4;
+    bool net_no_chaos = false;
+    std::string net_cases = "all";
 };
 
 bool ParseArgs(int argc, char** argv, BenchConfig& config)
@@ -135,7 +143,8 @@ bool ParseArgs(int argc, char** argv, BenchConfig& config)
                          "             [--fail-snapshot N] [--fail-apply N] [--fail-after N]\n"
                          "             [--partition-min-size M] [--lod-off] [--loadfield-off]\n"
                          "             [--scenario NAME] [--world-km K] [--zones-x N] [--zones-y N]\n"
-                         "             [--warmup S] [--asf-off]\n";
+                         "             [--warmup S] [--asf-off]\n"
+                         "             [--mode tickrate] [--rates 20,30,60,144,flood] [--measure-seconds S]\n";
             return false;
         } else if (arg == "--players") {
             if (!need_value("players", value)) {
@@ -179,6 +188,28 @@ bool ParseArgs(int argc, char** argv, BenchConfig& config)
             config.logical_processes = std::stoi(value);
         } else if (arg == "--routing-selftest") {
             config.routing_selftest = true;
+        } else if (arg == "--rates") {
+            if (!need_value("rates", value)) {
+                return false;
+            }
+            config.rates = value;
+        } else if (arg == "--net-io-threads") {
+            if (!need_value("net-io-threads", value)) {
+                return false;
+            }
+            config.net_io_threads = std::stoi(value);
+        } else if (arg == "--net-no-chaos") {
+            config.net_no_chaos = true;
+        } else if (arg == "--net-cases") {
+            if (!need_value("net-cases", value)) {
+                return false;
+            }
+            config.net_cases = value;
+        } else if (arg == "--measure-seconds") {
+            if (!need_value("measure-seconds", value)) {
+                return false;
+            }
+            config.measure_seconds = std::stoi(value);
         } else if (arg == "--field-selftest") {
             config.field_selftest = true;
         } else if (arg == "--loadfield-selftest") {
@@ -277,7 +308,9 @@ bool ParseArgs(int argc, char** argv, BenchConfig& config)
         config.mode != "activity" && config.mode != "loadfield" &&
         config.mode != "partitionscore" && config.mode != "stability" &&
         config.mode != "readiness" && config.mode != "ghost" && config.mode != "aoi" &&
-        config.mode != "replication" && config.mode != "scheduler") {
+        config.mode != "replication" && config.mode != "scheduler" &&
+        config.mode != "tickrate" && config.mode != "inputpath" &&
+        config.mode != "netstress") {
         std::cerr << "bad mode: " << config.mode << "\n";
         return false;
     }
@@ -4601,6 +4634,36 @@ int BenchMain(int argc, char** argv)
             aoi_io_thread.join();
         }
         std::printf("BENCH-DONE %s failures=%d\n", config.mode.c_str(), scenario_failures);
+        return scenario_failures == 0 ? 0 : 2;
+    }
+
+    if (config.mode == "tickrate") {
+        // Hardening H0/H1: authoritative 20 Hz vs input rate (own io/sim
+        // lifecycle per rate, real loopback session).
+        gs::bench::TickRateConfig tick_config;
+        tick_config.rates = config.rates;
+        tick_config.measure_seconds = config.measure_seconds;
+        const int scenario_failures = gs::bench::RunTickRateScenario(tick_config);
+        std::printf("BENCH-DONE tickrate failures=%d\n", scenario_failures);
+        return scenario_failures == 0 ? 0 : 2;
+    }
+
+    if (config.mode == "inputpath") {
+        // Hardening H1: input path vs tick-aligned draining (forced split
+        // under continuous input, input loss across migrations under load).
+        const int scenario_failures = gs::bench::RunInputPathScenario();
+        std::printf("BENCH-DONE inputpath failures=%d\n", scenario_failures);
+        return scenario_failures == 0 ? 0 : 2;
+    }
+
+    if (config.mode == "netstress") {
+        // Hardening H2/H3: production network stack under adversarial load.
+        gs::bench::NetStressConfig net_config;
+        net_config.io_threads = config.net_io_threads;
+        net_config.chaos = !config.net_no_chaos;
+        net_config.cases = config.net_cases;
+        const int scenario_failures = gs::bench::RunNetStressScenario(net_config);
+        std::printf("BENCH-DONE netstress failures=%d\n", scenario_failures);
         return scenario_failures == 0 ? 0 : 2;
     }
 
