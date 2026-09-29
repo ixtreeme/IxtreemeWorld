@@ -39,7 +39,15 @@ bool ValidateWorldConsistency(ZoneManager& zones,
                               const WorldDirectory& directory,
                               const ActivityGrid* activity,
                               std::string& out_error,
-                              const PresenceRegistry* presence = nullptr);
+                              const PresenceRegistry* presence = nullptr,
+                              const ActivityWakeFrame* wake = nullptr);
+
+// Read-only, quiescent checks. Generation correctness uses the exact original
+// publisher inputs. Freshness uses the completed scheduling phase input and
+// verifies that current authority was atomically published, including updates
+// committed after that cut (which are pending until the next phase).
+bool ValidateActivityGeneration(const ZoneManager&,const ActivityGrid&,std::string&);
+bool ValidateActivityWake(const ZoneManager&,const ActivityWakeFrame*,std::string&);
 
 // Strict field-vs-brute-force audit (§31): for a deterministic sample of
 // mobs (zones in index order, nets ascending, first max_samples),

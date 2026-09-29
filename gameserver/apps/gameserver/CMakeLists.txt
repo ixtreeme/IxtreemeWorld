@@ -41,6 +41,9 @@ set(GAMESERVER_WORLD_SOURCES
     src/world/migration/MigrationSystem.cpp
     src/world/input/InputRouter.cpp
     src/world/terrain/TerrainService.cpp
+    src/world/terrain/TerrainStreamer.cpp
+    src/world/terrain/NavigationService.cpp
+    src/world/partition/RegionDefinition.cpp
     src/world/package/WorldPackageLoader.cpp
     src/world/spawn/MobPrototypeRegistry.cpp
     src/world/spawn/RespawnSystem.cpp
@@ -108,7 +111,13 @@ if(ENABLE_WORLDBENCH)
         src/bench/WorldBench.cpp
         src/bench/ReadinessBench.cpp
         src/bench/HardeningBench.cpp
+        src/bench/ClosureBench.cpp
+        src/bench/ActivityTemporalBench.cpp
+        src/bench/CaptureProbe.cpp
+        src/bench/TC4Bench.cpp
         src/bench/MapPackageBench.cpp
+        src/bench/MapRuntimeBench.cpp
+        src/bench/MapStreamingBench.cpp
         src/GameConnectionHandler.cpp
         ${GAMESERVER_WORLD_SOURCES}
     )

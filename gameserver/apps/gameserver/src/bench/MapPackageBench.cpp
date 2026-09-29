@@ -102,31 +102,33 @@ struct Loaded {
 };
 
 Loaded Load(const fs::path& dir, ValidationDepth depth = ValidationDepth::Startup,
-            std::string mob_types = IXTREEME_DEFAULT_MOB_TYPES_CONFIG)
+            std::string mob_types = IXTREEME_DEFAULT_MOB_TYPES_CONFIG,
+            mx::map::WarpPolicy policy = mx::map::WarpPolicy::Strict)
 {
     Loaded out;
     gs::game::WorldLoadRequest request;
     request.package_root = dir;
     request.mob_types_config = std::move(mob_types);
     request.depth = depth;
+    request.warp_policy = policy;
     out.world = gs::game::LoadWorldPackage(request, out.report);
     return out;
 }
 
 // Base fixture: 64 x 64 cells of 4 m (256 m world), 32-cell chunks (2x2),
-// gentle slope, a blocked 3x3 cell patch at cells 10..12, two bootstrap
-// zones, one player spawn region, one warp, one mob spawn line.
+// gentle slope, a blocked 3x3 cell patch at cells 10..12, two areas
+// (metadata), one player spawn region, one warp, one mob spawn line.
 mx::map::PackageWriteSpec BaseSpec(std::uint32_t format = 3, bool splats = false)
 {
     mx::map::PackageWriteSpec spec;
     spec.format_version = format;
     spec.world_id = "corpus";
     spec.world_name = "MAP-1 corpus";
-    spec.size_cells = 64;
+    spec.size_cells_x = 64;
     spec.cell_size_m = 4.0f;
     spec.chunk_size_cells = 32;
-    spec.height_cm = [](std::uint32_t vx, std::uint32_t vy) {
-        return static_cast<std::int16_t>(100 + vx * 3 + vy * 2);
+    spec.height_raw = [](std::uint32_t vx, std::uint32_t vy) -> std::int32_t {
+        return static_cast<std::int32_t>(100 + vx * 3 + vy * 2);
     };
     spec.attributes = [](std::uint32_t cx, std::uint32_t cy) -> std::uint16_t {
         return cx >= 10 && cx <= 12 && cy >= 10 && cy <= 12 ? 0x0001 : 0;
@@ -252,25 +254,29 @@ int RunWorldPackageScenario(const std::string& fixtures_out)
         const auto dir = c.Dir("valid_v3_server_only");
         Write(dir, BaseSpec());
         const auto loaded = Load(dir);
-        const bool ok = loaded.world && loaded.world->terrain.splat_a_rgba8.empty() &&
-                        loaded.world->spawn_points.size() == 1 && loaded.world->logic.zones.size() == 2 &&
-                        loaded.report.resident_terrain_bytes == 65ull * 65 * 2 + 64ull * 64 * 2;
+        // Per-chunk storage duplicates the shared border samples: 4 chunks of
+        // 33x33 samples + 32x32 cells, int16 each.
+        const bool ok = loaded.world && loaded.world->spawn_points.size() == 1 &&
+                        loaded.world->logic.zones.size() == 2 &&
+                        loaded.report.resident_terrain_bytes == 4ull * (33 * 33 * 2 + 32 * 32 * 2);
         c.Report("valid-v3-server-only", ok,
-                 Fmt("load=%s chunks=%u resident=%lluB splat_bytes=%zu spawn_points=%zu first=%s",
+                 Fmt("load=%s chunks=%u resident=%lluB (heights+attributes only, no splat storage) "
+                     "spawn_points=%zu first=%s",
                      loaded.world ? "ok" : "REFUSED", loaded.report.chunks_checked,
                      static_cast<unsigned long long>(loaded.report.resident_terrain_bytes),
-                     loaded.world ? loaded.world->terrain.splat_a_rgba8.size() : 0,
                      loaded.world ? loaded.world->spawn_points.size() : 0, loaded.First().c_str()));
         // Terrain content is what the writer put in (height + blocked patch).
         if (loaded.world) {
             const auto& t = loaded.world->terrain;
-            const bool heights = t.HeightMetersAt(10, 20) == static_cast<float>(100 + 30 + 40) * 0.01f &&
-                                 t.HeightMetersAt(64, 64) == static_cast<float>(100 + 192 + 128) * 0.01f;
-            const bool walk = !t.IsWalkable(11 * 4.0f + 1.0f, 11 * 4.0f + 1.0f) && t.IsWalkable(100.0f, 100.0f);
+            const auto h1 = t.Vertex(10, 20);
+            const auto h2 = t.Vertex(64, 64);
+            const bool heights = h1.Ok() && std::abs(h1.meters - 1.70f) < 1e-5f && h2.Ok() &&
+                                 std::abs(h2.meters - 4.20f) < 1e-5f;
+            const bool walk = !t.Cell(45.0, 45.0).Walkable() && t.Cell(100.0, 100.0).Walkable();
             c.Report("valid-v3-content", heights && walk,
-                     Fmt("height(10,20)=%.2fm height(64,64)=%.2fm blocked(cell 11,11)=%d walkable(100,100)=%d",
-                         t.HeightMetersAt(10, 20), t.HeightMetersAt(64, 64),
-                         t.IsWalkable(45.0f, 45.0f) ? 0 : 1, t.IsWalkable(100.0f, 100.0f) ? 1 : 0));
+                     Fmt("vertex(10,20)=%.2fm vertex(64,64)=%.2fm blocked(cell 11,11)=%d walkable(100,100)=%d",
+                         h1.meters, h2.meters, t.Cell(45.0, 45.0).Walkable() ? 0 : 1,
+                         t.Cell(100.0, 100.0).Walkable() ? 1 : 0));
         }
     }
     {
@@ -280,14 +286,20 @@ int RunWorldPackageScenario(const std::string& fixtures_out)
         const auto full = Load(dir, ValidationDepth::Full);
         const auto* startup_splat = startup.report.manifest.FindLayer(mx::map::LayerKind::SplatA);
         const auto* full_splat = full.report.manifest.FindLayer(mx::map::LayerKind::SplatA);
-        const bool ok = startup.world && full.world && startup.world->terrain.splat_a_rgba8.empty() &&
+        const auto server_only = Load(c.root / "valid_v3_server_only");
+        // Same terrain bytes with or without client data: nothing of the
+        // splats is kept by the server.
+        const bool ok = startup.world && full.world && server_only.world &&
+                        startup.report.resident_terrain_bytes == server_only.report.resident_terrain_bytes &&
                         startup_splat != nullptr && startup_splat->status == mx::map::LayerStatus::RangeChecked &&
                         full_splat != nullptr && full_splat->status == mx::map::LayerStatus::Validated;
         c.Report("valid-v3-with-client-data", ok,
-                 Fmt("startup: load=%s splatA=%s kept=%zuB; full: load=%s splatA=%s",
+                 Fmt("startup: load=%s splatA=%s resident=%lluB (server-only package: %lluB); full: load=%s "
+                     "splatA=%s",
                      startup.world ? "ok" : "REFUSED",
                      startup_splat != nullptr ? mx::map::ToString(startup_splat->status) : "-",
-                     startup.world ? startup.world->terrain.splat_a_rgba8.size() : 0,
+                     static_cast<unsigned long long>(startup.report.resident_terrain_bytes),
+                     static_cast<unsigned long long>(server_only.report.resident_terrain_bytes),
                      full.world ? "ok" : "REFUSED",
                      full_splat != nullptr ? mx::map::ToString(full_splat->status) : "-"));
     }
@@ -298,9 +310,10 @@ int RunWorldPackageScenario(const std::string& fixtures_out)
     }
     {
         // The checked-in test map (v2, editor-edited chunks): loads, and its
-        // terrain equals the legacy loader's sample for sample.
+        // terrain equals the legacy loader's sample for sample (every corner
+        // sample, every cell attribute).
         const fs::path test_map = IXTREEME_TEST_MAP_ROOT;
-        const auto loaded = Load(test_map, ValidationDepth::Full);
+        const auto loaded = Load(test_map, ValidationDepth::Full, IXTREEME_DEFAULT_MOB_TYPES_CONFIG, mx::map::WarpPolicy::Legacy);
         const auto legacy = mx::map::LoadHeightField(
             [&](std::string_view path) -> std::optional<std::vector<std::uint8_t>> {
                 std::ifstream file(test_map / fs::path(path).relative_path(), std::ios::binary);
@@ -315,13 +328,25 @@ int RunWorldPackageScenario(const std::string& fixtures_out)
         std::size_t attr_diff = 0;
         if (loaded.world && legacy) {
             const auto& t = loaded.world->terrain;
-            height_diff = t.heights_cm.size() == legacy->heights_cm.size() ? 0 : 1;
-            for (std::size_t i = 0; height_diff == 0 && i < t.heights_cm.size(); ++i) {
-                height_diff += t.heights_cm[i] != legacy->heights_cm[i] ? 1 : 0;
+            const auto& g = t.Geometry();
+            for (std::uint32_t vy = 0; vy <= g.cells_y; ++vy) {
+                for (std::uint32_t vx = 0; vx <= g.cells_x; ++vx) {
+                    const auto s = t.Vertex(vx, vy);
+                    // Same stored centimetres (legacy converts in float, the
+                    // server in double): any real difference is >= 1 cm.
+                    height_diff += !s.Ok() || std::abs(s.meters - legacy->HeightMetersAt(vx, vy)) > 1e-3f ? 1 : 0;
+                }
             }
-            attr_diff = t.attributes.size() == legacy->attributes.size() ? 0 : 1;
-            for (std::size_t i = 0; attr_diff == 0 && i < t.attributes.size(); ++i) {
-                attr_diff += t.attributes[i] != legacy->attributes[i] ? 1 : 0;
+            for (std::uint32_t cy = 0; cy < g.cells_y; ++cy) {
+                for (std::uint32_t cx = 0; cx < g.cells_x; ++cx) {
+                    const auto cell = t.Cell(g.origin_x + (cx + 0.5) * g.cell_size_m,
+                                             g.origin_y + (cy + 0.5) * g.cell_size_m);
+                    attr_diff += !cell.Ok() || cell.attributes != legacy->attributes[static_cast<std::size_t>(cy) *
+                                                                                          g.cells_x +
+                                                                                      cx]
+                                     ? 1
+                                     : 0;
+                }
             }
         }
         c.Report("checked-in-test-map", loaded.world && legacy && height_diff == 0 && attr_diff == 0 &&
@@ -370,11 +395,41 @@ int RunWorldPackageScenario(const std::string& fixtures_out)
                             {2, {200.0f, 200.0f, 204.0f, 204.0f}, 30.0f, 30.0f}};
         const auto dir = c.Dir("warp_chain");
         Write(dir, spec);
-        const auto loaded = Load(dir);
-        c.Report("warp-chain-warning",
+        const auto loaded = Load(dir, ValidationDepth::Startup, IXTREEME_DEFAULT_MOB_TYPES_CONFIG, mx::map::WarpPolicy::Legacy);
+        c.Report("warp-chain-explicit-legacy-warning",
                  loaded.world &&
                      loaded.Has(PackageErrorCode::WorldLogicWarpTargetInTrigger, mx::map::IssueSeverity::Warning),
                  Fmt("load=%s", loaded.world ? "ok + WARP_TARGET_IN_TRIGGER warning" : "REFUSED"));
+    }
+
+    // SL-2 R6: strict is the server default. Test the SAME bytes in both modes.
+    {
+        using mx::map::WarpPolicy;
+        for(const auto policy : {WarpPolicy::Strict,WarpPolicy::Legacy}) {
+            const std::string mode=policy==WarpPolicy::Strict ? "strict" : "legacy";
+            auto test=[&](const std::string& name, auto warps, bool expected, PackageErrorCode code) {
+                auto spec=BaseSpec(); spec.logic.warps=warps;
+                const auto dir=c.Dir("r6-"+mode+"-"+name); Write(dir,spec);
+                const auto loaded=Load(dir,ValidationDepth::Full,IXTREEME_DEFAULT_MOB_TYPES_CONFIG,policy);
+                c.Report("r6-"+mode+"-"+name, expected ? bool(loaded.world) : (!loaded.world && loaded.HasError(code)),loaded.First());
+            };
+            auto warps=BaseSpec().logic.warps;
+            test("valid",warps,true,PackageErrorCode::WorldLogicWarpTargetInTrigger);
+            warps={{1,{60,60,64,64},201,201},{2,{200,200,204,204},30,30}};
+            test("chain",warps,policy==WarpPolicy::Legacy,PackageErrorCode::WorldLogicWarpTargetInTrigger);
+            warps[1].target_x=62;warps[1].target_y=62;
+            test("cycle",warps,false,PackageErrorCode::WorldLogicWarpCycle);
+            warps=BaseSpec().logic.warps;warps[0].target_x=62;warps[0].target_y=62;
+            test("self",warps,false,PackageErrorCode::WorldLogicWarpCycle);
+            for(int edge=0;edge<6;++edge) {
+                const float xs[]={200,201,204,std::nextafter(200.0f,0.0f),std::nextafter(204.0f,0.0f),std::nextafter(204.0f,300.0f)};
+                warps={{1,{60,60,64,64},xs[edge],201},{2,{200,200,204,204},30,30}};
+                const bool inside=edge==0 || edge==1 || edge==4;
+                test("half-open-"+std::to_string(edge),warps,policy==WarpPolicy::Legacy || !inside,PackageErrorCode::WorldLogicWarpTargetInTrigger);
+            }
+        }
+        const auto strict=Load(c.root/"warp_chain");
+        c.Report("r6-default-is-strict",!strict.world && strict.HasError(PackageErrorCode::WorldLogicWarpTargetInTrigger),strict.First());
     }
 
     // ===== package / path =======================================================
@@ -536,29 +591,157 @@ int RunWorldPackageScenario(const std::string& fixtures_out)
         spec.patch_manifest = [](mx::map::schema::MapManifest::Builder& m) {
             m.setWorldSizeCells(65536);
             m.setWorldSizeCellsY(65536);
+            m.setCellSizeMeters(1.0f); // stays inside the coordinate range
             m.setChunkSizeCells(4096);
             m.getChunkGrid().setX(16);
             m.getChunkGrid().setY(16);
         };
         ExpectSpecRejected(c, "manifest-size-overflow", spec, PackageErrorCode::ManifestSizeOverflow);
     }
+    // ---- MAP-2 geometry: negative origin, non-square, partial edge chunks ----
     {
+        // 70 x 45 cells of 4 m at origin (-150, -90): chunks 3x2 of 32 cells,
+        // the last column 6 cells wide and the last row 13 cells high.
         auto spec = BaseSpec();
-        spec.patch_manifest = [](mx::map::schema::MapManifest::Builder& m) { m.setWorldSizeCellsY(32); };
-        ExpectSpecRejected(c, "manifest-non-square", spec, PackageErrorCode::UnsupportedFeature);
+        spec.size_cells_x = 70;
+        spec.size_cells_y = 45;
+        spec.origin_x = -150.0;
+        spec.origin_y = -90.0;
+        spec.logic.zones = {{1, "west", {-150.0f, -90.0f, 0.0f, 90.0f}}, {2, "east", {0.0f, -90.0f, 130.0f, 90.0f}}};
+        spec.logic.spawns = {{1, 1, {-100.0f, -20.0f, -90.0f, -10.0f}}};
+        spec.logic.warps = {{1, {-60.0f, -60.0f, -56.0f, -56.0f}, 100.0f, 50.0f}};
+        spec.mob_spawns = std::string("mob_type_id=1 x=-120 y=-70 count=2 radius=5\n");
+        const auto dir = c.Dir("geometry_origin_nonsquare_partial");
+        Write(dir, spec);
+        const auto loaded = Load(dir);
+        bool ok = loaded.world.has_value();
+        std::string detail = "REFUSED: " + loaded.First();
+        if (loaded.world) {
+            const auto& g = loaded.world->terrain.Geometry();
+            const auto* last = loaded.world->terrain.ChunkAt(2, 1);
+            ok = g.chunks_x == 3 && g.chunks_y == 2 && g.MinX() == -150.0 && g.MaxX() == 130.0 &&
+                 g.MinY() == -90.0 && g.MaxY() == 90.0 && last != nullptr && last->cells_x == 6 &&
+                 last->cells_y == 13 && loaded.report.chunks_checked == 6;
+            detail = Fmt("bounds=[(%.0f,%.0f),(%.0f,%.0f)) chunks=%ux%u last_chunk=%ux%u cells samples=%ux%u",
+                         g.MinX(), g.MinY(), g.MaxX(), g.MaxY(), g.chunks_x, g.chunks_y,
+                         last != nullptr ? last->cells_x : 0, last != nullptr ? last->cells_y : 0, g.SamplesX(),
+                         g.SamplesY());
+        }
+        c.Report("geometry-negative-origin-nonsquare-partial", ok, detail);
     }
     {
-        auto spec = BaseSpec();
-        spec.patch_manifest = [](mx::map::schema::MapManifest::Builder& m) { m.getOrigin().setX(1000.0); };
-        ExpectSpecRejected(c, "manifest-origin-nonzero", spec, PackageErrorCode::UnsupportedFeature);
-    }
-    {
+        // A partial chunk file that still carries full-size sections.
         auto spec = BaseSpec();
         spec.patch_manifest = [](mx::map::schema::MapManifest::Builder& m) {
             m.setWorldSizeCells(60);
             m.setWorldSizeCellsY(60);
         };
-        ExpectSpecRejected(c, "manifest-partial-chunk", spec, PackageErrorCode::UnsupportedFeature);
+        ExpectSpecRejected(c, "partial-chunk-wrong-section-size", spec, PackageErrorCode::ChunkSectionSize);
+    }
+    {
+        auto spec = BaseSpec(2);
+        spec.patch_manifest = [](mx::map::schema::MapManifest::Builder& m) { m.setWorldSizeCells(60); };
+        ExpectSpecRejected(c, "partial-chunk-v2-unsupported", spec, PackageErrorCode::UnsupportedFeature);
+    }
+    {
+        auto spec = BaseSpec();
+        spec.patch_manifest = [](mx::map::schema::MapManifest::Builder& m) { m.getOrigin().setX(200000.0); };
+        ExpectSpecRejected(c, "coordinate-range", spec, PackageErrorCode::UnsupportedFeature);
+    }
+    {
+        auto spec = BaseSpec();
+        spec.patch_manifest = [](mx::map::schema::MapManifest::Builder& m) { m.getOrigin().setY(std::nan("")); };
+        ExpectSpecRejected(c, "origin-non-finite", spec, PackageErrorCode::ManifestFieldInvalid);
+    }
+    {
+        // Moving the origin without moving the logic: the areas fall outside.
+        auto spec = BaseSpec();
+        spec.patch_manifest = [](mx::map::schema::MapManifest::Builder& m) { m.getOrigin().setX(1000.0); };
+        ExpectSpecRejected(c, "origin-shift-leaves-areas-outside", spec, PackageErrorCode::WorldLogicOutOfBounds);
+    }
+    // ---- MAP-2 height range: height layer version 2 ----
+    {
+        // int32 samples, 1 mm per unit, offset -500 m: a 3.2 km relief that
+        // version 1 (int16 cm, +-327 m) cannot store.
+        auto spec = BaseSpec();
+        mx::map::HeightEncoding enc;
+        enc.layer_version = 2;
+        enc.int32_samples = true;
+        enc.meters_per_unit = 0.001;
+        enc.offset_m = -500.0;
+        spec.height_encoding = enc;
+        spec.height_raw = [](std::uint32_t vx, std::uint32_t vy) -> std::int32_t {
+            return static_cast<std::int32_t>(vx * 50000 + vy * 1000); // mm above -500 m
+        };
+        const auto dir = c.Dir("height_v2_int32");
+        Write(dir, spec);
+        const auto loaded = Load(dir);
+        bool ok = loaded.world.has_value();
+        std::string detail = "REFUSED: " + loaded.First();
+        if (loaded.world) {
+            const auto& t = loaded.world->terrain;
+            const auto top = t.Vertex(64, 64);  // -500 + 64*50 + 64*1 = 2764 m
+            const auto low = t.Vertex(0, 0);    // -500 m
+            ok = top.Ok() && low.Ok() && std::abs(top.meters - 2764.0f) < 1e-3f && std::abs(low.meters + 500.0f) < 1e-3f &&
+                 t.Encoding().layer_version == 2 && t.Encoding().int32_samples;
+            detail = Fmt("vertex(64,64)=%.3fm vertex(0,0)=%.3fm range=[%.0f,%.0f]m", top.meters, low.meters,
+                         t.Encoding().MinMeters(), t.Encoding().MaxMeters());
+        }
+        c.Report("height-v2-int32-range", ok, detail);
+    }
+    {
+        auto spec = BaseSpec();
+        mx::map::HeightEncoding enc;
+        enc.layer_version = 2;
+        enc.meters_per_unit = 0.05; // int16 x 5 cm: +-1638 m
+        enc.offset_m = 1000.0;
+        spec.height_encoding = enc;
+        const auto dir = c.Dir("height_v2_int16_scaled");
+        Write(dir, spec);
+        const auto loaded = Load(dir);
+        const auto v = loaded.world ? loaded.world->terrain.Vertex(10, 20) : mx::map::HeightSample{};
+        c.Report("height-v2-int16-scaled", loaded.world && v.Ok() && std::abs(v.meters - (1000.0f + 170 * 0.05f)) < 1e-3f,
+                 Fmt("load=%s vertex(10,20)=%.3fm (expect %.3f)", loaded.world ? "ok" : "REFUSED", v.meters,
+                     1000.0f + 170 * 0.05f));
+    }
+    {
+        auto spec = BaseSpec();
+        spec.patch_manifest = [](mx::map::schema::MapManifest::Builder& m) {
+            for (auto layer : m.getLayers()) {
+                if (layer.getKind() == mx::map::schema::LayerKind::HEIGHT) {
+                    layer.setVersion(2);
+                }
+            }
+        };
+        ExpectSpecRejected(c, "height-v2-without-encoding", spec, PackageErrorCode::ManifestFieldInvalid);
+    }
+    {
+        auto spec = BaseSpec();
+        spec.patch_manifest = [](mx::map::schema::MapManifest::Builder& m) {
+            m.initHeightEncoding().setMetersPerUnit(0.01);
+        };
+        ExpectSpecRejected(c, "height-v1-with-encoding", spec, PackageErrorCode::ManifestFieldForbidden);
+    }
+    {
+        auto spec = BaseSpec();
+        mx::map::HeightEncoding enc;
+        enc.layer_version = 2;
+        enc.meters_per_unit = 0.0; // invalid scale
+        spec.height_encoding = enc;
+        ExpectSpecRejected(c, "height-v2-zero-scale", spec, PackageErrorCode::ManifestFieldInvalid);
+    }
+    {
+        // Chunks written as int32, manifest says int16: element format + size.
+        auto spec = BaseSpec();
+        mx::map::HeightEncoding enc;
+        enc.layer_version = 2;
+        enc.int32_samples = true;
+        enc.meters_per_unit = 0.01;
+        spec.height_encoding = enc;
+        spec.patch_manifest = [](mx::map::schema::MapManifest::Builder& m) {
+            m.getHeightEncoding().setSampleType(mx::map::schema::HeightSampleType::INT16);
+        };
+        ExpectSpecRejected(c, "height-v2-sample-type-mismatch", spec, PackageErrorCode::ChunkTocInvalid);
     }
     {
         auto spec = BaseSpec();
@@ -594,7 +777,7 @@ int RunWorldPackageScenario(const std::string& fixtures_out)
     }
     {
         auto spec = BaseSpec();
-        spec.patch_manifest = patch_layer(mx::map::schema::LayerKind::HEIGHT, [](auto layer) { layer.setVersion(2); });
+        spec.patch_manifest = patch_layer(mx::map::schema::LayerKind::HEIGHT, [](auto layer) { layer.setVersion(3); /* height 1..2 supported */ });
         ExpectSpecRejected(c, "layer-required-version", spec, PackageErrorCode::LayerUnsupported);
     }
     {
@@ -817,16 +1000,52 @@ int RunWorldPackageScenario(const std::string& fixtures_out)
         mutate(spec.logic);
         ExpectSpecRejected(c, name, spec, code);
     };
-    logic_case("worldlogic-no-zones", PackageErrorCode::WorldLogicNoZones, [](auto& l) {
+    // MAP-2: areas are metadata. No areas + no spawn region -> the player
+    // spawn rule has no place: NO_PLAYER_SPAWN (NO_ZONES is retired).
+    logic_case("worldlogic-no-areas-no-spawn", PackageErrorCode::WorldLogicNoPlayerSpawn, [](auto& l) {
         l.zones.clear();
         l.spawns.clear();
+    });
+    logic_case("worldlogic-no-player-spawn", PackageErrorCode::WorldLogicNoPlayerSpawn, [](auto& l) {
+        l.spawns.clear();
+    });
+    {
+        // Zero areas + a world-level spawn region (areaId 0 = no area): valid.
+        // Areas are optional metadata; the mandatory spawn region does not
+        // depend on them.
+        auto spec = BaseSpec();
+        spec.logic.zones.clear();
+        spec.logic.spawns = {{1, 0, {10.0f, 60.0f, 20.0f, 70.0f}}};
+        const auto dir = c.Dir("zero_areas_world_spawn");
+        Write(dir, spec);
+        const auto loaded = Load(dir);
+        c.Report("worldlogic-zero-areas-world-spawn-accepted",
+                 loaded.world.has_value() && loaded.world->logic.zones.empty() &&
+                     loaded.world->logic.spawns.size() == 1 && loaded.world->logic.spawns[0].zone_id == 0,
+                 Fmt("load=%s areas=%zu first=%s", loaded.world ? "ok" : "REFUSED",
+                     loaded.world ? loaded.world->logic.zones.size() : 0, loaded.First().c_str()));
+    }
+    logic_case("worldlogic-world-spawn-outside-world", PackageErrorCode::WorldLogicOutOfBounds, [](auto& l) {
+        l.spawns = {{1, 0, {250.0f, 250.0f, 260.0f, 260.0f}}}; // crosses the 256 m max edge
+    });
+    logic_case("worldlogic-spawn-region-blocked", PackageErrorCode::WorldLogicSpawnBlocked, [](auto& l) {
+        l.spawns[0].bounds = {40.0f, 40.0f, 50.0f, 50.0f}; // centre (45,45) = blocked cell 11,11
     });
     logic_case("worldlogic-zone-id-zero", PackageErrorCode::WorldLogicIdInvalid, [](auto& l) {
         l.zones[1].id = 0;
     });
-    logic_case("worldlogic-zone-id-reserved-range", PackageErrorCode::WorldLogicIdInvalid, [](auto& l) {
-        l.zones[1].id = 0x01000000;
-    });
+    {
+        // AreaIds are their own namespace (no ZoneId range any more), and
+        // areas need not cover the world.
+        auto spec = BaseSpec();
+        spec.logic.zones[1].id = 0x7fffffff;
+        spec.logic.zones[1].bounds.min_x = 140.0f; // gap between the two areas
+        const auto dir = c.Dir("areas_metadata");
+        Write(dir, spec);
+        const auto loaded = Load(dir);
+        c.Report("areas-large-id-and-gap-accepted", loaded.world.has_value(),
+                 Fmt("load=%s first=%s", loaded.world ? "ok" : "REFUSED", loaded.First().c_str()));
+    }
     logic_case("worldlogic-zone-id-duplicate", PackageErrorCode::WorldLogicIdDuplicate, [](auto& l) {
         l.zones[1].id = 1;
     });
@@ -841,9 +1060,6 @@ int RunWorldPackageScenario(const std::string& fixtures_out)
     });
     logic_case("worldlogic-zone-overlap", PackageErrorCode::WorldLogicZoneOverlap, [](auto& l) {
         l.zones[1].bounds.min_x = 100.0f;
-    });
-    logic_case("worldlogic-zone-gap", PackageErrorCode::WorldLogicCoverageGap, [](auto& l) {
-        l.zones[1].bounds.min_x = 140.0f;
     });
     logic_case("worldlogic-spawn-unknown-zone", PackageErrorCode::WorldLogicReferenceInvalid, [](auto& l) {
         l.spawns[0].zone_id = 42;
@@ -959,6 +1175,10 @@ int RunWorldPackageScenario(const std::string& fixtures_out)
             std::printf("WORLDPACKAGE fixture %s -> %s\n", name.c_str(), ok ? dir.string().c_str() : "FAILED");
         };
         emit("valid_v3", BaseSpec(3, true));
+        auto r6=BaseSpec();r6.logic.warps={{1,{60,60,64,64},201,201},{2,{200,200,204,204},30,30}};
+        emit("r6_chain",r6);
+        r6.logic.warps[1].target_x=62;r6.logic.warps[1].target_y=62;emit("r6_cycle",r6);
+        r6=BaseSpec();r6.logic.warps[0].target_x=62;r6.logic.warps[0].target_y=62;emit("r6_self",r6);
         emit("server_only_v3", BaseSpec());
         auto bad_version = BaseSpec();
         bad_version.patch_manifest = [](mx::map::schema::MapManifest::Builder& m) { m.setFormatVersion(7); };
@@ -971,6 +1191,55 @@ int RunWorldPackageScenario(const std::string& fixtures_out)
         auto bad_logic = BaseSpec();
         bad_logic.logic.zones[1].bounds.min_x = 100.0f; // overlapping bootstrap zones
         emit("invalid_worldlogic", bad_logic);
+        // MAP-2: negative origin, non-square, partial edge chunks, negative
+        // heights: [-150, 410) x [-90, 270), 8 m cells, 32-cell chunks.
+        auto geometry = BaseSpec();
+        geometry.size_cells_x = 70;
+        geometry.size_cells_y = 45;
+        geometry.origin_x = -150.0;
+        geometry.origin_y = -90.0;
+        geometry.cell_size_m = 8.0f;
+        geometry.height_raw = [](std::uint32_t vx, std::uint32_t vy) -> std::int32_t {
+            return -2000 + static_cast<std::int32_t>(vx * 30 + vy * 7);
+        };
+        geometry.logic.zones = {{1, "all", {-150.0f, -90.0f, 410.0f, 270.0f}}};
+        geometry.logic.spawns = {{1, 1, {90.0f, 80.0f, 110.0f, 100.0f}}};
+        geometry.mob_spawns = std::string("mob_type_id=1 x=-100 y=-50 count=3 radius=5\n");
+        emit("geometry_v3", geometry);
+        auto spawns_v2 = geometry;
+        spawns_v2.mob_spawns_version = 2;
+        spawns_v2.mob_spawns_required = true;
+        spawns_v2.mob_spawns = "spawn_id=123 area_id=1 mob_type_id=1 x=-100 y=-50 count=3 radius=5\n";
+        emit("spawns_v2", spawns_v2);
+        spawns_v2.mob_spawns = "spawn_id=123 area_id=999 mob_type_id=1 x=-100 y=-50 count=3 radius=5\n";
+        emit("spawns_v2_bad_area", spawns_v2);
+        // MAP-2: height layer v2, int32 samples, 1 mm per unit, offset -500 m.
+        auto int32_heights = BaseSpec();
+        mx::map::HeightEncoding enc;
+        enc.layer_version = 2;
+        enc.int32_samples = true;
+        enc.meters_per_unit = 0.001;
+        enc.offset_m = -500.0;
+        int32_heights.height_encoding = enc;
+        int32_heights.height_raw = [](std::uint32_t vx, std::uint32_t vy) -> std::int32_t {
+            return static_cast<std::int32_t>(vx * 50000 + vy * 1000);
+        };
+        emit("height_v2_int32", int32_heights);
+        // MAP-2: no player spawn region -> WORLDLOGIC_NO_PLAYER_SPAWN (415).
+        auto no_spawn = BaseSpec();
+        no_spawn.logic.spawns.clear();
+        emit("no_player_spawn", no_spawn);
+        // MAP-3: a large chunk index (128 x 64 = 8192 chunks of 16 cells,
+        // 1024 x 512 m) -- the streaming budget startup check.
+        auto many = BaseSpec();
+        many.size_cells_x = 2048;
+        many.size_cells_y = 1024;
+        many.cell_size_m = 0.5f;
+        many.chunk_size_cells = 16;
+        many.logic.zones = {{1, "all", {0.0f, 0.0f, 1024.0f, 512.0f}}};
+        many.logic.spawns = {{1, 1, {10.0f, 10.0f, 20.0f, 20.0f}}};
+        many.logic.warps.clear();
+        emit("many_chunks_v3", many);
     }
 
     fs::remove_all(c.root, ec);

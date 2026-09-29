@@ -7,6 +7,7 @@
 #include "../components/MigrationComponents.h"
 #include "../components/MobComponents.h"
 #include "../components/MovementComponents.h"
+#include "../components/WarpState.h"
 #include "../components/NetworkComponents.h"
 #include "../components/ReplicationComponents.h"
 #include "../components/Tags.h"
@@ -31,6 +32,7 @@ void SpawnSystem::SpawnPlayer(Zone& zone,
                       .set<Heading>({})
                       .set<Velocity>({})
                       .set<MoveIntent>({})
+                      .set<WarpState>({})
                       .set<MoveSpeed>({kPlayerWalkSpeed, kPlayerRunSpeed})
                       .set<Hp>({kPlayerHpMax, kPlayerHpMax})
                       .set<CombatStats>({kPlayerDamage, kPlayerDefense, kPlayerAttackRange, kPlayerAttackCooldown})
@@ -47,9 +49,11 @@ void SpawnSystem::SpawnPlayer(Zone& zone,
     Zone::PlayerBinding binding;
     binding.session = std::move(session);
     binding.character = std::move(character);
-    zone.InsertPlayerBinding(net_id, std::move(binding));
     zone.IndexEntity(net_id, entity);
     zone.Grid().Insert(net_id, position, entity);
+    // Binding insertion is the spawn/transfer authority commit and publishes
+    // its wake source under the same publication lock.
+    zone.InsertPlayerBinding(net_id, std::move(binding));
     zone.RefreshResidentCounts();
 }
 
@@ -85,7 +89,7 @@ void SpawnSystem::SpawnMob(Zone& zone,
                       .set<AttackCooldown>({})
                       .set<NetId>({net_id})
                       .set<MobTypeRef>({type.id})
-                      .set<MobSpawnRef>({spawn_point_index})
+                      .set<MobSpawnRef>({spawn_point_index, spawn.spawn_id})
                       .set<MobProfile>({type.model_id, 1, type.name})
                       .set<MigrateTo>({0})
                       .set<SimulationLod>({})

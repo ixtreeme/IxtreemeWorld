@@ -46,6 +46,7 @@
 #include "../GameConnectionHandler.h"
 #include "../world/WorldConstants.h"
 #include "../world/WorldRuntime.h"
+#include "../world/debug/I1LocalObservation.h"
 #include "../world/replication/ProtocolEncoder.h"
 #include "../world/replication/ResyncSchedule.h"
 #include "../world/activity/LoadFieldTypes.h"
@@ -1542,6 +1543,85 @@ int RunPresenceScenario()
     };
     const gs::common::SessionId kBase = 30000;
 
+    // I1 local observation uses the production collector, without AuditNow
+    // (which drains queued commands). Incomplete captures must stay incomplete.
+    {
+        using namespace gs::game;
+        const auto filter = ParseI1ObservationFilter(
+            std::to_string(gs::db::ToUint64(MakeCharacter(901).id)) + "," +
+            std::to_string(gs::db::ToUint64(MakeCharacter(902).id)));
+        int rejected = 0;
+        for (const auto* text : {"", "901", "901,901", "0,902", "901,902,903", "901,902x"}) {
+            try { (void)ParseI1ObservationFilter(text); } catch (const std::invalid_argument&) { ++rejected; }
+        }
+        report("i1-filter-rejects", rejected == 6, Fmt("rejected=%d", rejected));
+        IoRunner runner;
+        WorldRuntime world(runner.io, {}, WorldRuntime::SyntheticWorldConfig{2000.0f, 1, 1, {}});
+        auto capture = [&world](I1ObservationFilter f) {
+            return ReadWorld(world, [f](const auto& ctx) { return CollectI1Presence(ctx, f); });
+        };
+        const auto empty = capture(filter);
+        report("i1-before-start", !empty.rows[0].registered && !empty.rows[1].registered, "empty copy");
+        world.PostSpawn(MakeDetachedSession(runner.io, 39001), MakeCharacter(901), DebugSpawnOverride{500,500});
+        world.PostSpawn(MakeDetachedSession(runner.io, 39002), MakeCharacter(902), DebugSpawnOverride{520,500});
+        world.Start();
+        I1PresenceSnapshot both;
+        const bool ready = WaitFor(3000ms, [&] {
+            both = capture(filter);
+            return both.rows[0].coherent && both.rows[1].coherent;
+        });
+        report("i1-two-coherent", ready && both.rows[0].tracked.net != both.rows[1].tracked.net,
+               Fmt("epoch=%llu tick=%u", (unsigned long long)both.epoch, both.tick));
+        const bool negatives = ReadWorld(world, [filter](const auto& ctx) {
+            OwnerMap missing_owners;
+            PresenceRegistry missing_registry;
+            WorldRuntime::SnapshotContext no_owner{ctx.zones, missing_owners, ctx.presence};
+            WorldRuntime::SnapshotContext no_registry{ctx.zones, ctx.owners, missing_registry};
+            const auto a = CollectI1Presence(no_owner, filter);
+            const auto b = CollectI1Presence(no_registry, filter);
+            return !a.rows[0].coherent && !a.rows[1].coherent &&
+                   !b.rows[0].coherent && b.rows[0].bindings == 1;
+        });
+        report("i1-negative-owner-registry", negatives, "inconsistent inputs cannot PASS");
+        auto tracked = filter;
+        for (std::size_t i = 0; i < tracked.size(); ++i) tracked[i] = both.rows[i].tracked;
+        world.PostDespawn(39001);
+        I1PresenceSnapshot closed;
+        const bool cleaned = WaitFor(3000ms, [&] {
+            closed = capture(tracked);
+            const auto& a = closed.rows[0];
+            return !a.registered && a.bindings == 0 && a.entities == 0 && a.owners == 0 && closed.rows[1].coherent;
+        });
+        report("i1-cleanup-keeps-peer", cleaned, "tracked old entity/owner absent; peer coherent");
+        // Stop does not wait on its queued future; the queued collector owns
+        // its identities and is safe after the observer object is destroyed.
+        for (int i = 0; i < 8; ++i) {
+            I1LocalObservation observer;
+            observer.Start(world, tracked);
+            std::this_thread::yield();
+            observer.Stop();
+        }
+        world.Stop();
+        const auto stopped = capture(tracked);
+        report("i1-stop-lifetime", !stopped.rows[0].registered && !stopped.rows[1].registered,
+               "observer destruction plus inline stopped capture");
+
+        // A queued command in a detached test zone is not drained by capture.
+        ZoneManager zones;
+        InitialPartition initial;
+        std::string error;
+        const bool built = BuildInitialPartition(WorldBounds::FromExtent(2000.0f), {}, 240.0f, initial, error);
+        if (built) zones.BuildInitialPartition(initial);
+        bool ran = false;
+        if (built) zones.GetZone(0).Commands().Push([&ran](auto&) { ran = true; });
+        OwnerMap owners;
+        PresenceRegistry registry;
+        WorldRuntime::SnapshotContext queued{zones, owners, registry};
+        const auto unchanged = CollectI1Presence(queued, filter);
+        report("i1-observation-no-drain", built && !ran && unchanged.rows[0].queued == 1 &&
+               zones.GetZone(0).Commands().Depth() == 1, "queued command preserved");
+    }
+
     // ---- single-zone world: enter / re-enter / races / concurrency ----------
     {
         IoRunner runner;
@@ -2000,7 +2080,7 @@ int RunWorkerPoolScenario()
     std::size_t production_workers = 0;
     {
         IoRunner runner;
-        gs::game::WorldRuntime sim(runner.io, {}, LoadBenchTestWorld());
+        gs::game::WorldRuntime sim(runner.io, {}, LoadBenchTestWorld(), LegacyTestMapLayout());
         sim.Start();
         production_workers = WaitWorkers(sim);
         std::printf("WORKERPOOL production-map zones=%zu workers=%zu (pool sized once at Start)\n",
@@ -3963,12 +4043,14 @@ mx::map::PackageWriteSpec AuditSpec(std::uint32_t cells, float cell_m, std::uint
     mx::map::PackageWriteSpec spec;
     spec.world_id = "audit";
     spec.world_name = "audit";
-    spec.size_cells = cells;
+    spec.size_cells_x = cells;
     spec.cell_size_m = cell_m;
     spec.chunk_size_cells = chunk;
-    spec.height_cm = [](std::uint32_t, std::uint32_t) -> std::int16_t { return 100; };
+    spec.height_raw = [](std::uint32_t, std::uint32_t) -> std::int32_t { return 100; };
     const float extent = static_cast<float>(cells) * cell_m;
     spec.logic.zones.push_back({1, "all", {0.0f, 0.0f, extent, extent}});
+    // MAP-2: every package needs a player spawn region (walkable centre).
+    spec.logic.spawns.push_back({1, 1, {extent * 0.5f - 5.0f, extent * 0.5f - 5.0f, extent * 0.5f + 5.0f, extent * 0.5f + 5.0f}});
     spec.overwrite = true;
     return spec;
 }
@@ -3998,11 +4080,12 @@ struct ServerLoadResult {
     }
 };
 
-ServerLoadResult ServerLoad(const mfs::path& dir)
+ServerLoadResult ServerLoad(const mfs::path& dir, mx::map::WarpPolicy policy = mx::map::WarpPolicy::Strict)
 {
     ServerLoadResult out;
     gs::game::WorldLoadRequest request;
     request.package_root = dir;
+    request.warp_policy=policy;
     request.mob_types_config = IXTREEME_DEFAULT_MOB_TYPES_CONFIG;
     out.world = gs::game::LoadWorldPackage(request, out.report);
     return out;
@@ -4157,6 +4240,7 @@ std::vector<std::uint8_t> ChunkBytes(std::uint16_t cx, std::uint16_t cy, std::ui
 
 int RunMapAuditScenario()
 {
+    const bool map4_accepted = RunMap4Scenario() == 0;
     int changed = 0;
     int open = 0;
     // legacy_reproduced: the historic defect still shows in the legacy
@@ -4255,7 +4339,8 @@ int RunMapAuditScenario()
         const auto dir = AuditDir("r1_grid");
         (void)mx::map::WritePackage(dir, spec);
         const auto server = ServerLoad(dir);
-        const float s_far = server.world ? server.world->terrain.SampleHeightMeters(50.0f, 50.0f) : -1.0f;
+        const auto far_sample = server.world ? server.world->terrain.Height(50.0, 50.0) : mx::map::HeightSample{};
+        const float s_far = far_sample.Ok() ? far_sample.meters : -1.0f;
         const bool fixed = server.world && server.report.chunks_checked == 4 && s_far > 0.9f;
         finding("R1-chunk-grid-conflated-with-zone-grid", reproduced,
                 Fmt("2x2 chunk files, zone_grid=1x1 -> chunk files read=%zu, height chunk(0,0)=%.2fm "
@@ -4285,21 +4370,20 @@ int RunMapAuditScenario()
         (void)mx::map::WritePackage(client_dir, with_splats);
         const auto s_only = ServerLoad(server_only_dir);
         const auto s_with = ServerLoad(client_dir);
-        const bool fixed = s_only.world && s_with.world && s_only.world->terrain.splat_a_rgba8.empty() &&
-                           s_with.world->terrain.splat_a_rgba8.empty() &&
-                           s_with.world->terrain.splat_b_rgba8.empty();
+        // ServerTerrain has no splat storage at all: the resident bytes with
+        // and without client data must be identical.
+        const bool fixed = s_only.world && s_with.world &&
+                           s_only.report.resident_terrain_bytes == s_with.report.resident_terrain_bytes;
         finding("R5-server-requires-render-splats", reproduced,
                 Fmt("heights+attributes only -> load=%s; with splats -> load=%s, keeps splat_a+b=%zu B",
                     without ? "ok" : "FAILS", with ? "ok" : "fails",
                     with ? with->splat_a_rgba8.size() + with->splat_b_rgba8.size() : 0),
                 fixed ? "CHANGED" : "OPEN",
-                Fmt("server-only package -> load=%s; with splats -> load=%s, server keeps splat bytes=%zu, "
-                    "resident terrain=%llu B",
+                Fmt("server-only package -> load=%s; with splats -> load=%s; resident terrain %llu B vs %llu B "
+                    "(no splat storage on the server)",
                     s_only.world ? "ok" : "FAILS", s_with.world ? "ok" : "fails",
-                    s_with.world ? s_with.world->terrain.splat_a_rgba8.size() +
-                                       s_with.world->terrain.splat_b_rgba8.size()
-                                 : 0,
-                    static_cast<unsigned long long>(s_only.report.resident_terrain_bytes)));
+                    static_cast<unsigned long long>(s_only.report.resident_terrain_bytes),
+                    static_cast<unsigned long long>(s_with.report.resident_terrain_bytes)));
     }
     // R6: warp re-trigger. Runtime semantics (enter edge, cooldown) are MAP-4;
     // MAP-1 adds the load-time rule: a trigger cycle is rejected.
@@ -4317,27 +4401,68 @@ int RunMapAuditScenario()
         (void)mx::map::WritePackage(dir, spec);
         const auto server = ServerLoad(dir);
         const bool load_rule = !server.world && server.Has(mx::map::PackageErrorCode::WorldLogicWarpCycle);
+        auto chain=AuditSpec(64,1.0f,32);
+        chain.logic.warps={{1,{10,10,12,12},21,21},{2,{20,20,22,22},40,40}};
+        const auto chain_dir=AuditDir("r6_chain"); (void)mx::map::WritePackage(chain_dir,chain);
+        const auto strict_chain=ServerLoad(chain_dir);
+        const auto legacy_chain=ServerLoad(chain_dir,mx::map::WarpPolicy::Legacy);
+        const auto legacy_cycle=ServerLoad(dir,mx::map::WarpPolicy::Legacy);
+        const bool policy_ok=!strict_chain.world && strict_chain.Has(mx::map::PackageErrorCode::WorldLogicWarpTargetInTrigger) &&
+            legacy_chain.world && !legacy_cycle.world && legacy_cycle.Has(mx::map::PackageErrorCode::WorldLogicWarpCycle);
         finding("R6-warp-retrigger", reproduced,
                 "warp 1 target inside its own source -> fires again next tick; warps 2<->3 ping-pong "
                 "(no enter edge, no cooldown)",
-                load_rule ? "PARTIAL" : "OPEN",
-                Fmt("load=%s errors=%s (load-time cycle rule); runtime enter-edge + cooldown: OPEN(MAP-4)",
+                load_rule && map4_accepted && policy_ok ? "CHANGED" : "OPEN",
+                Fmt("load=%s errors=%s (load-time cycle rule); map4 runtime acceptance executed above; "
+                    "R6 strict(default) rejects chain; explicit legacy permits chain; cycles rejected in both modes",
                     server.world ? "ACCEPTED" : "refused", server.ErrorCodes().c_str()));
     }
-    // R3: fixed 100 km regions at origin (0,0), whatever map is loaded.
+    // R3: world bounds / origin from the loaded data. The historic
+    // DefaultRegions() (four fixed 0..100 km quadrants) is removed; the
+    // server now builds regions + initial leaves from the loaded bounds.
     {
-        const auto regions = gs::game::DefaultRegions();
-        const auto* outside = gs::game::FindRegionContaining(regions, -10.0f, -10.0f);
-        const auto* small_map = gs::game::FindRegionContaining(regions, 500.0f, 500.0f);
-        const bool reproduced = regions.size() == 4 && regions[1].bounds.max_x == 100000.0f &&
-                                outside == nullptr && small_map != nullptr;
-        finding("R3-hardcoded-world-bounds", reproduced,
-                Fmt("regions=%zu fixed 0..100000 m quadrants; a 1 km map lands in region %u; (-10,-10) "
-                    "has no region",
-                    regions.size(), small_map != nullptr ? small_map->id : 0u),
-                "OPEN(MAP-2)",
-                "ZoneManager still bootstraps DefaultRegions(); v3 origin != (0,0) and non-square worlds are "
-                "refused as UNSUPPORTED_FEATURE until MAP-2 instead of being misread");
+        auto spec = AuditSpec(64, 1.0f, 32);
+        spec.size_cells_x = 640; // 2560 x 2048 m, cell 4 m, origin (-1280, -1024), partial chunks
+        spec.size_cells_y = 512;
+        spec.cell_size_m = 4.0f;
+        spec.chunk_size_cells = 96;
+        spec.origin_x = -1280.0;
+        spec.origin_y = -1024.0;
+        spec.logic.zones = {{1, "all", {-1280.0f, -1024.0f, 1280.0f, 1024.0f}}};
+        spec.logic.spawns = {{1, 1, {-10.0f, -10.0f, 10.0f, 10.0f}}};
+        const auto dir = AuditDir("r3_bounds");
+        (void)mx::map::WritePackage(dir, spec);
+        const auto server = ServerLoad(dir);
+        bool fixed = false;
+        std::string detail = "load refused: " + server.ErrorCodes();
+        if (server.world) {
+            const auto bounds = gs::game::TerrainService::BoundsOf(server.world->terrain);
+            gs::game::PartitionLayout layout; // 2x2 regions, 1 leaf each
+            gs::game::InitialPartition partition;
+            std::string error;
+            const bool built = gs::game::BuildInitialPartition(bounds, layout, 240.0f, partition, error);
+            gs::game::ZoneManager zones;
+            if (built) {
+                zones.BuildInitialPartition(partition);
+            }
+            const std::size_t inside = zones.FindIndexForPosition(-10.0f, -10.0f);   // south-west quadrant
+            const std::size_t east_edge = zones.FindIndexForPosition(1280.0f, 0.0f); // max x: outside
+            const std::size_t beyond = zones.FindIndexForPosition(-1300.0f, 0.0f);
+            fixed = built && partition.regions.size() == 4 && partition.regions[0].name == "SouthWest" &&
+                    partition.regions[0].bounds.min_x == -1280.0f && partition.regions[0].bounds.min_y == -1024.0f &&
+                    partition.regions[3].name == "NorthEast" && partition.regions[3].bounds.max_x == 1280.0f &&
+                    inside < zones.ZoneCount() && zones.GetZone(inside).Region() == partition.regions[0].id &&
+                    east_edge == zones.ZoneCount() && beyond == zones.ZoneCount();
+            detail = Fmt("loaded bounds (%.0f,%.0f)-(%.0f,%.0f) -> regions %s..%s; (-10,-10) -> zone in %s; "
+                         "(1280,0) and (-1300,0) -> no zone",
+                         bounds.min_x, bounds.min_y, bounds.max_x, bounds.max_y,
+                         built ? partition.regions.front().name.c_str() : "?",
+                         built ? partition.regions.back().name.c_str() : "?",
+                         inside < zones.ZoneCount() ? zones.GetZone(inside).Name().c_str() : "NONE");
+        }
+        finding("R3-hardcoded-world-bounds", false,
+                "DefaultRegions() (fixed 0..100000 m quadrants, names not matching geometry) removed",
+                fixed ? "CHANGED" : "OPEN", detail);
     }
     // R8: silent flat fallback. The TerrainService::LoadFromMapRoot fallback
     // is gone; the server path refuses a missing package.
@@ -4374,15 +4499,66 @@ int RunMapAuditScenario()
         const auto dir = AuditDir("r2_zone_fields");
         (void)mx::map::WritePackage(dir, spec);
         const auto server = ServerLoad(dir);
+        // The checked-in test map: 3 areas (AreaId 1..3), partitioned by the
+        // server layout (2x2 regions) into 4 zones (ZoneId 1..4).
+        const auto test_map = ServerLoad(IXTREEME_TEST_MAP_ROOT,mx::map::WarpPolicy::Legacy);
+        gs::game::ZoneManager zones;
+        std::size_t areas = 0;
+        if (test_map.world) {
+            areas = test_map.world->logic.zones.size();
+            gs::game::InitialPartition partition;
+            std::string error;
+            if (gs::game::BuildInitialPartition(gs::game::TerrainService::BoundsOf(test_map.world->terrain),
+                                                gs::game::PartitionLayout{}, 240.0f, partition, error)) {
+                zones.BuildInitialPartition(partition);
+            }
+        }
+        const bool r2 = server.Has(mx::map::PackageErrorCode::ManifestFieldForbidden) && areas == 3 &&
+                        zones.ZoneCount() == 4;
         finding("R2-map-chunk-vs-server-zone", true, "v2 manifest carries zoneGridDims/zoneSizeCells",
-                server.Has(mx::map::PackageErrorCode::ManifestFieldForbidden) ? "PARTIAL" : "OPEN",
-                Fmt("v3 with zoneGridDims -> errors=%s; worldlogic zones still seed server partitions with "
-                    "their ids as ZoneIds (AreaId/ZoneId split: MAP-2)",
-                    server.ErrorCodes().c_str()));
-        finding("R9-half-open-boundaries", true, "Rect::Contains closed [min,max]", "OPEN(MAP-2)",
-                "bootstrap-zone overlap/coverage validated half-open; runtime map lookups still closed");
-        finding("R10-out-of-bounds-rule", true, "height clamps outside, walkability false", "OPEN(MAP-2)",
-                "unchanged (validator only guarantees targets/spawns inside [0, extent))");
+                r2 ? "CHANGED" : "OPEN",
+                Fmt("v3 with zoneGridDims -> errors=%s; test map: %zu areas (AreaId, metadata) vs %zu server "
+                    "zones from partition_regions=2x2 (ZoneId 1..%zu)",
+                    server.ErrorCodes().c_str(), areas, zones.ZoneCount(), zones.ZoneCount()));
+        // R9: a point on the shared x = 500 edge of the test map's SW/SE zones.
+        const mx::map::Rect sw{0.0f, 0.0f, 500.0f, 500.0f};
+        const mx::map::Rect se{500.0f, 0.0f, 1000.0f, 500.0f};
+        const bool legacy_double = sw.Contains(500.0f, 250.0f) && se.Contains(500.0f, 250.0f);
+        const std::size_t owner = zones.FindIndexForPosition(500.0f, 250.0f);
+        const bool r9 = !sw.ContainsHalfOpen(500.0f, 250.0f) && se.ContainsHalfOpen(500.0f, 250.0f) &&
+                        owner < zones.ZoneCount() && zones.GetZone(owner).Bounds().min_x == 500.0f;
+        finding("R9-half-open-boundaries", legacy_double,
+                "client Rect::Contains is closed: (500,250) lies in BOTH neighbouring rectangles",
+                r9 ? "CHANGED" : "OPEN",
+                Fmt("server: half-open everywhere (partition, areas, warps, world); (500,250) -> exactly zone %u "
+                    "(%s)",
+                    owner < zones.ZoneCount() ? zones.GetZone(owner).Id() : 0u,
+                    owner < zones.ZoneCount() ? zones.GetZone(owner).Name().c_str() : "NONE"));
+        // R10: outside the world is not ground.
+        const auto edge = test_map.world ? test_map.world->terrain.Height(1000.0, 10.0) : mx::map::HeightSample{};
+        const auto inside = test_map.world ? test_map.world->terrain.Height(999.5, 10.0) : mx::map::HeightSample{};
+        const bool r10 = edge.status == mx::map::TerrainStatus::OutsideWorld && inside.Ok() &&
+                         zones.FindIndexForPosition(1000.0f, 10.0f) == zones.ZoneCount();
+        const mfs::path test_root = IXTREEME_TEST_MAP_ROOT;
+        const auto legacy_field = mx::map::LoadHeightField(
+            [&](std::string_view path) -> std::optional<std::vector<std::uint8_t>> {
+                std::ifstream file(test_root / mfs::path(path).relative_path(), std::ios::binary);
+                if (!file) {
+                    return std::nullopt;
+                }
+                return std::vector<std::uint8_t>((std::istreambuf_iterator<char>(file)),
+                                                 std::istreambuf_iterator<char>());
+            },
+            ".");
+        const float legacy_out = legacy_field ? legacy_field->SampleHeightMeters(1500.0f, 10.0f) : -1.0f;
+        const float legacy_edge = legacy_field ? legacy_field->SampleHeightMeters(1000.0f, 10.0f) : -2.0f;
+        finding("R10-out-of-bounds-rule", legacy_field && legacy_out == legacy_edge,
+                Fmt("legacy HeightField: height(1500,10)=%.2fm == edge height(1000,10)=%.2fm (clamped)", legacy_out,
+                    legacy_edge),
+                r10 ? "CHANGED" : "OPEN",
+                Fmt("server: Height(1000,10)=%s, Height(999.5,10)=%s; no zone owns (1000,10); movement refuses the "
+                    "step, spawn/warp require inside+walkable (worldbench --mode terrain)",
+                    mx::map::ToString(edge.status), mx::map::ToString(inside.status)));
         mx::map::PackageReport sample;
         (void)mx::map::LoadServerWorld(mfs::temp_directory_path() / "ixw_mapaudit" / "r4_truncated",
                                        mx::map::ValidationDepth::Startup, sample);
@@ -4390,17 +4566,34 @@ int RunMapAuditScenario()
         finding("R11-structured-errors-versioning", true, "std::optional (no reason) / capnp exception",
                 first != nullptr ? "CHANGED" : "OPEN",
                 first != nullptr ? "e.g. " + first->Format() : std::string("no structured error"));
-        finding("R12-chunk-streamed-terrain", true, "whole world resident (+splats)", "OPEN(MAP-3)",
-                "server terrain resident (heights+attributes only); streaming + budgets: MAP-3");
+        {
+            // MAP-3: a streaming load decodes only the startup set; the rest
+            // is loaded on demand within a budget by the terrain streamer.
+            const auto stream_dir = AuditDir("r12_streaming");
+            (void)mx::map::WritePackage(stream_dir, AuditSpec(256, 1.0f, 32)); // 8 x 8 chunks
+            mx::map::PackageReport stream_report;
+            gs::game::WorldLoadRequest request;
+            request.package_root = stream_dir;
+            request.mob_types_config = IXTREEME_DEFAULT_MOB_TYPES_CONFIG;
+            request.residency = mx::map::ResidencyMode::Streaming;
+            const auto streamed = gs::game::LoadWorldPackage(request, stream_report);
+            const bool streaming_ok = streamed && stream_report.chunks_decoded < stream_report.chunks_checked;
+            finding("R12-chunk-streamed-terrain", true, "whole world resident (+splats)",
+                    streaming_ok ? "CHANGED" : "OPEN",
+                    Fmt("terrain_residency=streaming: startup size-checked %u chunk files, decoded %u (spawn/warp "
+                        "startup set); the rest load on demand within terrain_cache_budget_mb, validated on "
+                        "load, LRU-evicted (worldbench --mode streaming / streamsoak: 100 km, 16 MB)",
+                        stream_report.chunks_checked, stream_report.chunks_decoded));
+        }
         const auto spawn_dir = AuditDir("r13_spawns");
         auto spawn_spec = AuditSpec(64, 1.0f, 32);
         spawn_spec.mob_spawns = std::string("mob_type_id=1 x=nan y=5 count=1 radius=1\n");
         (void)mx::map::WritePackage(spawn_dir, spawn_spec);
         const auto spawns = ServerLoad(spawn_dir);
         finding("R13-spawns-in-validated-package", true, "mob_spawns.conf lenient (warn + skip line)",
-                !spawns.world && spawns.Has(mx::map::PackageErrorCode::SpawnsFieldInvalid) ? "PARTIAL" : "OPEN",
+                !spawns.world && spawns.Has(mx::map::PackageErrorCode::SpawnsFieldInvalid) && map4_accepted ? "CHANGED" : "OPEN",
                 Fmt("spawn table is a package layer, strictly parsed + bounds + mob type checked "
-                    "(bad line -> errors=%s); area references: MAP-4",
+                    "(bad line -> errors=%s); v2 identity/area and lifecycle acceptance executed above",
                     spawns.ErrorCodes().c_str()));
     }
     std::error_code ec;

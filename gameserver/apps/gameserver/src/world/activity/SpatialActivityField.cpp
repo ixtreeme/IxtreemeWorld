@@ -191,10 +191,7 @@ void ActivityPublisher::Publish(Zone& zone)
     AssertZoneOwner(zone, "zone activity publish");
     std::lock_guard lock(zone.ActivityMutex());
     auto& out = zone.ActivitySources();
-    out.clear();
     out.reserve(zone.Players().size());
-    const std::uint32_t tick = zone.TickIndex();
-    const auto zone_id = zone.Id();
     for (const auto& [net_id, binding] : zone.Players()) {
         (void)binding;
         const auto player = zone.FindEntity(net_id);
@@ -202,7 +199,7 @@ void ActivityPublisher::Publish(Zone& zone)
             continue;
         }
         const auto pos = player.get<Position>();
-        out.push_back(PlayerInfluenceSource{net_id, pos.x, pos.y, zone_id, tick});
+        zone.UpsertActivitySourceLocked(net_id,pos);
     }
 }
 
@@ -261,6 +258,7 @@ std::shared_ptr<const ActivityGrid> SpatialActivityField::Rebuild(const ZoneMana
             }
             std::lock_guard lock(zone.ActivityMutex());
             for (const auto& source : zone.ActivitySources()) {
+                grid->generation_sources.push_back(source);
                 const std::uint32_t cx = grid->ClampedCellX(source.x);
                 const std::uint32_t cy = grid->ClampedCellY(source.y);
                 auto& target = grid->cells[static_cast<std::size_t>(cy) * grid->dim_x + cx];

@@ -13,6 +13,7 @@
 #include "SimulationLod.h"
 #include "Tags.h"
 #include "TransformComponents.h"
+#include "WarpState.h"
 
 // Registers every component type with a zone-local flecs world.
 // Called once per Zone construction.
@@ -41,6 +42,7 @@ inline void RegisterWorldComponents(flecs::world& world)
     world.component<MigrateTo>();
     world.component<TransformVersion>();
     world.component<GridSlot>();
+    world.component<WarpState>();
 }
 
 } // namespace gs::game

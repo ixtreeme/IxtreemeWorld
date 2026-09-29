@@ -1,4 +1,5 @@
 #include "ReadinessBench.h"
+#include "../world/activity/WakeCaptureProfile.h"
 
 #include <algorithm>
 #include <numeric>
@@ -7,6 +8,7 @@
 #include <cstdint>
 #include <cstdio>
 #include <fstream>
+#include <filesystem>
 #include <memory>
 #include <string>
 #include <thread>
@@ -18,8 +20,10 @@
 #include "common/Logging.h"
 #include "db/CharacterRepository.h"
 #include "network/Session.h"
+#include "map/WorldPackageWriter.h"
 
 #include "../world/WorldRuntime.h"
+#include "../world/debug/WorldValidator.h"
 #include "../world/partition/PartitionScoring.h"
 #include "../world/spawn/SpawnLoader.h"
 #include "BenchSnapshot.h"
@@ -343,6 +347,9 @@ struct ZoneReportRow {
 };
 
 struct ReadinessReport {
+    bool generation_ok=false,wake_ok=false;
+    std::string generation_error,wake_error;
+    std::uint64_t field_generation=0,wake_generation=0,wake_cut_ns=0,capture_ns=0;
     std::uint64_t epoch = 0;
     std::uint32_t world_tick = 0;
     std::size_t zone_slots = 0;
@@ -360,6 +367,12 @@ ReadinessReport CollectReadinessReport(const WorldSnapshot& snap)
 {
     ReadinessReport report;
     report.epoch = snap.epoch;
+    report.field_generation=snap.activity?snap.activity->epoch:0;
+    report.wake_generation=snap.wake_decision?snap.wake_decision->generation:0;
+    report.wake_cut_ns=snap.wake_decision?snap.wake_decision->cut_steady_ns:0;
+    report.capture_ns=static_cast<std::uint64_t>(std::chrono::duration_cast<std::chrono::nanoseconds>(snap.captured_at.time_since_epoch()).count());
+    report.generation_ok=snap.activity && gs::game::ValidateActivityGeneration(snap.zones,*snap.activity,report.generation_error);
+    report.wake_ok=gs::game::ValidateActivityWake(snap.zones,snap.wake_decision.get(),report.wake_error);
     report.world_tick = snap.world_tick;
     report.zone_slots = snap.zones.ZoneCount();
     report.active_leaves = snap.zones.GetActiveLeaves().size();
@@ -423,10 +436,10 @@ int RunReadinessBenchmark(boost::asio::io_context& io, const ReadinessConfig& co
     };
 
     PrintEnvironment();
-    // MAP-1: readiness always measures the explicit SYNTHETIC world (flat
-    // terrain, no package) -- stated in every result.
-    std::printf("READINESS world: mode=synthetic terrain=flat package=none (explicit synthetic benchmark "
-                "world, not a map measurement of real terrain)\n");
+    // Explicit synthetic remains the default; file-backed runs state their
+    // separate residency mode in every result.
+    std::printf("READINESS world: mode=%s terrain=%s\n", config.file_world ? "file-backed" : "synthetic",
+                config.file_world ? (config.eager_terrain ? "eager non-flat" : "streamed non-flat") : "flat");
     std::printf("READINESS config: scenario=%s world_km=%.0f zones=%dx%d players=%d mobs=%d "
                 "warmup_s=%d measure_s=%d asf_off=%d loadfield_off=%d lod_off=%d seed=%u\n",
                 config.scenario.c_str(),
@@ -448,10 +461,55 @@ int RunReadinessBenchmark(boost::asio::io_context& io, const ReadinessConfig& co
     const std::size_t expected_zones = static_cast<std::size_t>(zones_x) * zones_y;
 
     // ---- SETUP ------------------------------------------------------------
-    gs::game::WorldRuntime sim(io, {},
-                               gs::game::WorldRuntime::SyntheticWorldConfig{
-                                   extent, static_cast<std::uint32_t>(zones_x),
-                                   static_cast<std::uint32_t>(zones_y), {}});
+    std::unique_ptr<gs::game::WorldRuntime> runtime;
+    const auto cold_start = Clock::now();
+    if (config.file_world) {
+        mx::map::PackageWriteSpec spec;
+        spec.world_id = "map4-readiness";
+        spec.world_name = "MAP-4 file-backed readiness";
+        spec.cell_size_m = 16;
+        spec.size_cells_x = static_cast<std::uint32_t>(extent / 16);
+        spec.chunk_size_cells = 64;
+        spec.height_raw = [](std::uint32_t x, std::uint32_t y) {
+            return static_cast<std::int32_t>(1000 * std::sin(x * 0.01) + 500 * std::cos(y * 0.02));
+        };
+        spec.logic.spawns = {{1, 0, {10, 10, 20, 20}}};
+        spec.water_model = mx::map::WaterModel::None;
+        spec.overwrite = true;
+        const auto dir = std::filesystem::temp_directory_path() / "ixw_map4_readiness" /
+            (std::to_string(config.world_km) + "km");
+        const auto write = mx::map::WritePackage(dir, spec);
+        if (!write.ok) { std::printf("READINESS fixture failure: %s\n", write.error.c_str()); return 1; }
+        const auto load_start = Clock::now();
+        gs::game::WorldLoadRequest request;
+        request.package_root = dir;
+        request.mob_types_config = IXTREEME_DEFAULT_MOB_TYPES_CONFIG;
+        request.residency = config.eager_terrain ? mx::map::ResidencyMode::Eager : mx::map::ResidencyMode::Streaming;
+        mx::map::PackageReport report;
+        auto world = gs::game::LoadWorldPackage(request, report);
+        if (!world) {
+            for (const auto& issue : report.issues) std::printf("%s\n", issue.Format().c_str());
+            return 1;
+        }
+        gs::game::PartitionLayout layout;
+        layout.regions_x = static_cast<std::uint32_t>(zones_x);
+        layout.regions_y = static_cast<std::uint32_t>(zones_y);
+        gs::game::TerrainStreamingConfig streaming;
+        streaming.budget_bytes = static_cast<std::size_t>(config.terrain_budget_mb) * 1024 * 1024;
+        streaming.retain_seconds = 0.5;
+        runtime = std::make_unique<gs::game::WorldRuntime>(io, gs::game::RuntimeIdentity{},
+            std::move(*world), layout, streaming);
+        std::printf("READINESS package: path=%s chunks=%zu bytes_read=%llu load_ms=%.2f fixture_and_load_s=%.2f "
+                    "cache=application-cold OS-cache=uncontrolled\n", dir.string().c_str(), report.manifest.chunks.size(),
+                    static_cast<unsigned long long>(report.bytes_read),
+                    std::chrono::duration<double, std::milli>(Clock::now() - load_start).count(),
+                    std::chrono::duration<double>(Clock::now() - cold_start).count());
+    } else {
+        runtime = std::make_unique<gs::game::WorldRuntime>(io, gs::game::RuntimeIdentity{},
+            gs::game::WorldRuntime::SyntheticWorldConfig{extent, static_cast<std::uint32_t>(zones_x),
+                static_cast<std::uint32_t>(zones_y), {}});
+    }
+    auto& sim = *runtime;
     check("zones-built", ReadWorld(sim, [](const WorldSnapshot& snap) {
               return snap.zones.ZoneCount();
           }) == expected_zones);
@@ -634,6 +692,13 @@ int RunReadinessBenchmark(boost::asio::io_context& io, const ReadinessConfig& co
         add_player_disc(players_c, cx, cy, 200.0f);
         add_player_grid(config.players - players_a - players_b - players_c, 10, 10,
                         extent * 0.05f, extent * 0.05f, extent * 0.45f, extent * 0.45f);
+    } else if ((scenario == "c-moving-v1" || scenario == "c-moving-v2")) {
+        if(config.players!=500 || config.mobs!=200000 || config.world_km!=100 || !config.file_world || config.eager_terrain || config.terrain_budget_mb!=16) {
+            std::printf("C-MOVING invalid fixed population/geometry/cache contract\n"); return failures+1;
+        }
+        add_mob_points_uniform(config.mobs,0.0f,0.0f,extent,extent,leash);
+        for(int i=0;i<config.players;++i) player_positions.emplace_back((5+i%25+0.5f)*1024,(5+i/25+0.5f)*1024);
+        std::printf("C-MOVING v1: 500 one-player cohorts; A chunks x=5..29 y=5..24; B x=60..84 y=60..79; centre; setup=A; measure=B,A,B at 0,10,20s; production despawn/spawn relocation\n");
     } else if (scenario == "moving") {
         const int hotspot_mobs = std::min(config.mobs / 10, 20000);
         add_mob_points_disc(hotspot_mobs, hot_x, hot_y, 2000.0f, leash);
@@ -647,7 +712,9 @@ int RunReadinessBenchmark(boost::asio::io_context& io, const ReadinessConfig& co
         for (int i = 0; i < config.players; ++i) {
             const float y = extent * 0.2f +
                             static_cast<float>(i) * (extent * 0.6f / config.players);
-            const float x = boundary_x - 50.0f - static_cast<float>(i % 5) * 8.0f;
+            const float x = config.file_world
+                ? (i % 2 ? boundary_x : std::ceil(boundary_x / 1024.0f) * 1024.0f) - 2.0f
+                : boundary_x - 50.0f - static_cast<float>(i % 5) * 8.0f;
             player_positions.emplace_back(x, y);
         }
     } else if (scenario == "combat") {
@@ -710,6 +777,75 @@ int RunReadinessBenchmark(boost::asio::io_context& io, const ReadinessConfig& co
 
     sim.Start();
 
+    // Explicit demand + readiness check prevents the debug-spawn fallback
+    // from silently collapsing a spread workload into the default spawn.
+    auto next_terrain_trace = Clock::now();
+    gs::game::TerrainRequestHandle prepared_terrain;
+    std::vector<gs::game::TerrainRequestHandle> operation_samples;
+    operation_samples.reserve(65536);
+    std::vector<std::uint64_t> terrain_ready_wait_us;
+    std::uint64_t terrain_prepare_failures=0;
+    struct PrepareObservation {std::uint64_t request_id=0,first_poll_ns=0,observed_ns=0,polls=0,sleep_requested_ns=0,sleep_actual_ns=0;};
+    struct BatchObservation {std::uint64_t planned_ns=0,start_ns=0,request_begin_ns=0,request_end_ns=0,completed_ns=0,next_eligible_ns=0;};
+    std::vector<PrepareObservation> prepare_observations;prepare_observations.reserve(65536);
+    std::array<BatchObservation,3> batch_observations{};
+    Clock::time_point tc4_measure_start{};
+    const auto stamp=[](Clock::time_point t){return static_cast<std::uint64_t>(std::chrono::duration_cast<std::chrono::nanoseconds>(t.time_since_epoch()).count());};
+    const auto observed_wait=[&](PrepareObservation& observation,std::chrono::milliseconds timeout,const std::function<bool()>& condition) {
+        const auto deadline=Clock::now()+timeout;
+        const auto poll=[&](){const auto t=stamp(Clock::now());if(!observation.polls)observation.first_poll_ns=t;++observation.polls;const bool done=condition();if(done && !observation.observed_ns)observation.observed_ns=stamp(Clock::now());return done;};
+        while(Clock::now()<deadline) {
+            if(poll())return true;
+            const auto a=Clock::now();std::this_thread::sleep_for(std::chrono::milliseconds(20));
+            observation.sleep_requested_ns+=20000000;observation.sleep_actual_ns+=stamp(Clock::now())-stamp(a);
+        }
+        return poll();
+    };
+    auto prepare_spawn = [&](float x, float y) {
+        if (!config.file_world || config.eager_terrain) return true;
+        prepared_terrain=sim.PrepareTerrain(x,y,1.0f,15.0);
+        if(operation_samples.size()<65536) operation_samples.push_back(prepared_terrain);
+        PrepareObservation observation;observation.request_id=prepared_terrain->id;
+        if(scenario=="c-moving-v2") {
+            observation.first_poll_ns=stamp(Clock::now());observation.polls=1;
+            prepared_terrain->WaitUntilReadyOrTerminal();
+            observation.observed_ns=stamp(Clock::now());
+        } else observed_wait(observation,std::chrono::seconds(15), [&] {
+            if (Clock::now() >= next_terrain_trace) {
+                next_terrain_trace = Clock::now() + std::chrono::seconds(1);
+                const auto s = sim.GetTerrainStats().streamer;
+                std::printf("READINESS admission-trace: target=(%.2f,%.2f) generation=%llu "
+                    "request=%llu age_ms=%.2f status=%u "
+                    "resident=%zu waiting=%zu loading=%zu io_queued=%zu completed_pending=%zu "
+                    "memory=[accounted=%zu pinned=%zu soft=%zu evictable=%zu retired=%zu inflight=%zu metadata=%zu] "
+                    "oldest_ms=%.1f room_checks=%llu blocked=%llu pumps=%llu quiescent=%llu pump_us=%llu\n",
+                    x,y, (unsigned long long)s.generation,(unsigned long long)prepared_terrain->id,
+                    std::chrono::duration<double,std::milli>(Clock::now()-prepared_terrain->started).count(),
+                    unsigned(prepared_terrain->Status()),s.resident,s.waiting,s.loading,s.io_queued,s.completion_pending,
+                    s.accounted_bytes,s.pinned_bytes,s.soft_retained_bytes,s.evictable_bytes,s.retired_bytes,
+                    s.in_flight_bytes,s.metadata_bytes,s.oldest_wait_ms,(unsigned long long)s.room_checks,
+                    (unsigned long long)s.room_blocked,(unsigned long long)s.pump_calls,
+                    (unsigned long long)s.quiescent_pumps,(unsigned long long)s.pump_us);
+            }
+            return prepared_terrain->Status()!=gs::game::TerrainRequestStatus::Pending;
+        });
+        if(prepare_observations.size()<65536)prepare_observations.push_back(observation);
+        const bool ready=prepared_terrain->Status()==gs::game::TerrainRequestStatus::Ready;
+        if(ready) terrain_ready_wait_us.push_back(static_cast<std::uint64_t>(
+            std::chrono::duration_cast<std::chrono::microseconds>(Clock::now()-prepared_terrain->started).count()));
+        else ++terrain_prepare_failures;
+        if (!ready) {
+            const auto stats = sim.GetTerrainStats().streamer;
+            std::printf("READINESS terrain-timeout: x=%.2f y=%.2f limit_s=15 resident=%zu "
+                        "waiting=%zu loading=%zu failed=%zu accounted_mb=%.2f budget_mb=%.2f "
+                        "admission_rejects=%llu\n", x, y, stats.resident, stats.waiting,
+                        stats.loading, stats.failed, stats.accounted_bytes / 1048576.0,
+                        stats.budget_bytes / 1048576.0,
+                        static_cast<unsigned long long>(stats.admission_rejects));
+        }
+        return ready;
+    };
+
     std::vector<BenchPlayer> players(static_cast<std::size_t>(config.players));
     const auto player_spawn_start = Clock::now();
     for (int i = 0; i < config.players; ++i) {
@@ -718,12 +854,17 @@ int RunReadinessBenchmark(boost::asio::io_context& io, const ReadinessConfig& co
         player.character_index = i;
         player.x = player_positions[static_cast<std::size_t>(i)].first;
         player.y = player_positions[static_cast<std::size_t>(i)].second;
+        if (!prepare_spawn(player.x, player.y)) {
+            check("spawn-terrain-ready", false);
+            sim.Stop();
+            return failures;
+        }
         boost::asio::ip::tcp::socket socket(io);
         player.session = std::make_shared<gs::network::Session>(std::move(socket),
                                                                 player.session_id);
         sim.PostSpawn(player.session,
                       MakeReadinessCharacter(player.character_index),
-                      gs::game::DebugSpawnOverride{player.x, player.y});
+                      gs::game::DebugSpawnOverride{player.x, player.y}, prepared_terrain);
     }
     const auto owner_count = [&sim] {
         return ReadWorld(sim, [](const WorldSnapshot& snap) { return snap.owners.size(); });
@@ -741,14 +882,107 @@ int RunReadinessBenchmark(boost::asio::io_context& io, const ReadinessConfig& co
         sim.Stop();
         return failures + 1;
     }
+    auto requested_positions_present = [&] {
+        return ReadWorld(sim, [&](const WorldSnapshot& snap) {
+            for (const auto& player : players) {
+                auto it = snap.owners.find(player.session_id);
+                if (it == snap.owners.end()) return false;
+                const auto e = snap.zones.GetZone(it->second.zone_index).FindEntity(it->second.net_id);
+                if (!e.is_valid() || !e.has<gs::game::Position>()) return false;
+                const auto p = e.get<gs::game::Position>();
+                if (std::abs(p.x - player.x) > 0.01f || std::abs(p.y - player.y) > 0.01f) return false;
+                if((scenario=="c-moving-v1" || scenario=="c-moving-v2")) {
+                    // Independent fixture oracle: cohort centres are exact 16m vertices.
+                    // No terrain query, cache access, fallback or residency assumption here.
+                    const auto vx=static_cast<std::uint32_t>(player.x/16.0f),vy=static_cast<std::uint32_t>(player.y/16.0f);
+                    const double expected=static_cast<std::int32_t>(1000*std::sin(vx*0.01)+500*std::cos(vy*0.02))*0.01;
+                    if(!std::isfinite(p.z) || std::abs(p.z-expected)>0.001) return false;
+                }
+            }
+            return true;
+        });
+    };
+    if (config.file_world) {
+        const bool placed = WaitFor(std::chrono::seconds(10), requested_positions_present);
+        check("requested-player-positions", placed);
+        if (!placed) { sim.Stop(); return failures; }
+    }
 
     // ---- WARMUP -----------------------------------------------------------
+    auto report_terrain_window = [&](const char* phase, const auto& stats) {
+        if(!config.file_world || config.eager_terrain) return;
+        const auto ready_p99=terrain_ready_wait_us.empty() ? std::string("N/A") :
+            std::to_string(PercentileMs(terrain_ready_wait_us,0.99));
+        const auto ready_max=terrain_ready_wait_us.empty() ? std::string("N/A") :
+            std::to_string(*std::max_element(terrain_ready_wait_us.begin(),terrain_ready_wait_us.end())/1000.0);
+        std::printf("READINESS preparation-window: phase=%s ready_samples=%zu failures=%llu "
+            "request_to_ready_p99_ms=%s max_ms=%s (consumer polling included; Consume counted separately)\n",
+            phase,terrain_ready_wait_us.size(),(unsigned long long)terrain_prepare_failures,ready_p99.c_str(),ready_max.c_str());
+        std::vector<std::uint64_t> registered,ready,consume,effect,handoff;
+        std::size_t pending=0,failed=0;
+        for(const auto& r:operation_samples) {
+            if(auto v=r->registered_us.load()) registered.push_back(v);
+            if(auto v=r->ready_us.load()) ready.push_back(v);
+            if(auto v=r->consumed_us.load()) {consume.push_back(v); auto t=r->ready_us.load(); if(t && v>=t) handoff.push_back(v-t);}
+            if(auto v=r->effect_us.load()) effect.push_back(v);
+            const auto status=r->Status(); pending+=status==gs::game::TerrainRequestStatus::Pending;
+            failed+=status!=gs::game::TerrainRequestStatus::Pending && status!=gs::game::TerrainRequestStatus::Ready && status!=gs::game::TerrainRequestStatus::Consumed;
+        }
+        for(std::size_t i=0;i<std::min<std::size_t>(16,operation_samples.size());++i) {
+            const auto& r=operation_samples[i];
+            std::printf("SL2 operation-trace: phase=%s id=%llu class=%u start_us=%llu registered_offset_us=%llu ready_offset_us=%llu consume_offset_us=%llu effect_offset_us=%llu terminal_offset_us=%llu status=%u\n",
+                phase,(unsigned long long)r->id,unsigned(r->priority.load()),
+                (unsigned long long)std::chrono::duration_cast<std::chrono::microseconds>(r->started.time_since_epoch()).count(),
+                (unsigned long long)r->registered_us.load(),(unsigned long long)r->ready_us.load(),(unsigned long long)r->consumed_us.load(),
+                (unsigned long long)r->effect_us.load(),(unsigned long long)r->terminal_us.load(),unsigned(r->Status()));
+        }
+        auto operation_p99=[](auto& v){return v.empty()?std::string("N/A"):std::to_string(PercentileMs(v,0.99));};
+        std::printf("SL2 operations: phase=%s requested=%zu registered=%zu ready=%zu consumed=%zu effect=%zu failed=%zu pending=%zu start_registered_p99_ms=%s start_ready_p99_ms=%s ready_consume_p99_ms=%s start_consume_p99_ms=%s start_effect_p99_ms=%s ingress_requested_lifetime=%llu ingress_rejected_lifetime=%llu\n",
+            phase,operation_samples.size(),registered.size(),ready.size(),consume.size(),effect.size(),failed,pending,
+            operation_p99(registered).c_str(),operation_p99(ready).c_str(),operation_p99(handoff).c_str(),operation_p99(consume).c_str(),operation_p99(effect).c_str(),
+            (unsigned long long)stats.commands_requested,(unsigned long long)stats.ingress_rejected);
+        const auto& s=stats.streamer;
+        std::printf("SL2 window: phase=%s started_us=%llu captured_us=%llu unique_requested=%llu unique_loaded=%llu reloads=%llu short_reload_under_1s=%llu room_us_lifetime=%llu unpublish_us_lifetime=%llu reclaim_us_lifetime=%llu completion_us_lifetime=%llu admission_us_lifetime=%llu\n",phase,
+            (unsigned long long)s.window_started_us,(unsigned long long)s.captured_us,(unsigned long long)s.unique_requested,(unsigned long long)s.unique_loaded,
+            (unsigned long long)s.reloads,(unsigned long long)s.short_reloads,(unsigned long long)s.room_us,(unsigned long long)s.unpublish_us,(unsigned long long)s.reclaim_us,(unsigned long long)s.completion_us,(unsigned long long)s.admission_us);
+        for(unsigned cls=0;cls<3;++cls) std::printf("SL2 class: phase=%s class=%u examined_lifetime=%llu admitted_lifetime=%llu completed_lifetime=%llu waiting=%llu\n",phase,cls,
+            (unsigned long long)s.examined_by_class[cls],(unsigned long long)s.admitted_by_class[cls],(unsigned long long)s.completed_by_class[cls],(unsigned long long)s.waiting_by_class[cls]);
+        for(std::size_t i=0;i<s.reload_trace_count;++i) {const auto& t=s.reload_trace[i];
+            std::printf("SL2 reload: phase=%s key=%u generation=%llu eviction_us=%llu demand_us=%llu publish_us=%llu\n",phase,t.chunk,(unsigned long long)t.generation,(unsigned long long)t.evicted_us,(unsigned long long)t.requested_us,(unsigned long long)t.published_us);}
+
+        const std::string p99=s.window_miss_samples ? std::to_string(s.window_miss_p99_ms) : "N/A";
+        std::printf("READINESS terrain-window: phase=%s id=%llu completed_misses=%llu p99_upper_ms=%s "
+            "initial_waiting=%zu initial_oldest_ms=%.2f remaining_waiting=%zu remaining_oldest_ms=%.2f "
+            "requests=[accepted=%llu consumed=%llu cancelled=%llu timeout=%llu rejected=%llu pending=%zu ready=%zu] "
+            "pressure_evictions=%llu ingress_unique_rejected=%llu retry_suppressed=%llu "
+            "safepoints=%llu drain_wait_us=%llu pump_us=%llu\n",phase,(unsigned long long)s.window_id,
+            (unsigned long long)s.window_miss_samples,p99.c_str(),s.window_initial_waiting,s.window_initial_oldest_ms,
+            s.waiting,s.oldest_wait_ms,(unsigned long long)s.requests_accepted,(unsigned long long)s.requests_consumed,
+            (unsigned long long)s.requests_cancelled,(unsigned long long)s.requests_timed_out,
+            (unsigned long long)s.requests_rejected,s.requests_pending,s.requests_ready,
+            (unsigned long long)s.pressure_evictions,(unsigned long long)s.ingress_unique_rejected,
+            (unsigned long long)s.retry_suppressed,(unsigned long long)stats.safepoints,
+            (unsigned long long)stats.drain_wait_us,(unsigned long long)s.pump_us);
+    };
+    auto begin_terrain_window = [&] {
+        if(!config.file_world || config.eager_terrain) return true;
+        terrain_ready_wait_us.clear();
+        operation_samples.clear();
+        prepare_observations.clear();
+        terrain_prepare_failures=0;
+        const auto previous=sim.GetTerrainStats().streamer.window_id;
+        sim.BeginTerrainMeasurementWindow();
+        return WaitFor(std::chrono::seconds(5),[&]{return sim.GetTerrainStats().streamer.window_id>previous;});
+    };
+    report_terrain_window("setup",sim.GetTerrainStats());
+    if(!begin_terrain_window()) {check("terrain-window-reset",false); sim.Stop(); return failures;}
     std::printf("READINESS warmup: %ds (fields, LOD, partition state settle)\n",
                 config.warmup_seconds);
     const auto warmup_end = Clock::now() + std::chrono::seconds(config.warmup_seconds);
     while (Clock::now() < warmup_end) {
         std::this_thread::sleep_for(std::chrono::milliseconds(100));
     }
+    report_terrain_window("warmup",sim.GetTerrainStats());
 
     // ---- MEASURE ----------------------------------------------------------
     // Keyed by ZoneId, not slot: the partition controller may split/merge
@@ -996,6 +1230,7 @@ int RunReadinessBenchmark(boost::asio::io_context& io, const ReadinessConfig& co
     const float boundary_x = extent * 0.5f;
     int action_tick = 0;
     int relocation_step = 0;
+    bool action_failed = false;
     auto run_actions = [&](Clock::time_point now) {
         static Clock::time_point next_action{};
         if (next_action == Clock::time_point{}) {
@@ -1036,17 +1271,24 @@ int RunReadinessBenchmark(boost::asio::io_context& io, const ReadinessConfig& co
                 }
             }
             next_action = now + std::chrono::seconds(1);
-        } else if (scenario == "moving" || scenario == "churn") {
+        } else if (scenario == "moving" || scenario == "churn" || (scenario == "c-moving-v1" || scenario == "c-moving-v2")) {
             // Relocate the player hotspot (production despawn + spawn). The
             // mob population stays; player influence / AOI / replication move.
             const float path[3][2] = {
                 {extent * 0.2f, extent * 0.3f}, {extent * 0.5f, extent * 0.5f},
                 {extent * 0.8f, extent * 0.7f}};
             const int waypoint = relocation_step % 3;
+            BatchObservation* batch=(scenario=="c-moving-v1" || scenario=="c-moving-v2") && relocation_step<3?&batch_observations[relocation_step]:nullptr;
+            if(batch) {batch->planned_ns=stamp(tc4_measure_start+std::chrono::seconds(relocation_step*(config.measure_seconds/3)));batch->start_ns=stamp(now);}
             for (auto& player : players) {
                 sim.PostDespawn(player.session_id);
             }
-            WaitFor(std::chrono::seconds(20), [&] { return owner_count() == 0; });
+            if (!WaitFor(std::chrono::seconds(20), [&] { return owner_count() == 0; })) {
+                check("relocation-despawn", false);
+                action_failed = true;
+                return;
+            }
+            if(batch)batch->request_begin_ns=stamp(Clock::now());
             for (auto& player : players) {
                 const float t = static_cast<float>(player.character_index) * 2.39996323f;
                 const float r = 400.0f * std::sqrt(
@@ -1054,16 +1296,30 @@ int RunReadinessBenchmark(boost::asio::io_context& io, const ReadinessConfig& co
                     static_cast<float>(std::max(1, config.players)));
                 player.x = path[waypoint][0] + std::cos(t) * r;
                 player.y = path[waypoint][1] + std::sin(t) * r;
+                if((scenario=="c-moving-v1" || scenario=="c-moving-v2")) {
+                    const int origin=relocation_step%2==0 ? 60 : 5;
+                    player.x=(origin+player.character_index%25+0.5f)*1024;
+                    player.y=(origin+player.character_index/25+0.5f)*1024;
+                }
+                if (!prepare_spawn(player.x, player.y)) {
+                    check("relocation-terrain-ready", false);
+                    action_failed = true;
+                    return; // one bounded failure, not N players * 15 seconds
+                }
                 boost::asio::ip::tcp::socket socket(io);
                 player.session = std::make_shared<gs::network::Session>(std::move(socket),
                                                                         player.session_id);
                 sim.PostSpawn(player.session,
                               MakeReadinessCharacter(player.character_index),
-                              gs::game::DebugSpawnOverride{player.x, player.y});
+                              gs::game::DebugSpawnOverride{player.x, player.y}, prepared_terrain);
             }
+            if(batch)batch->request_end_ns=stamp(Clock::now());
             ++relocation_step;
+            if (config.file_world) check("requested-relocation-positions",
+                WaitFor(std::chrono::seconds(10), requested_positions_present));
             next_action = now + std::chrono::seconds(
                                     scenario == "churn" ? 12 : config.measure_seconds / 3);
+            if(batch){batch->completed_ns=stamp(Clock::now());batch->next_eligible_ns=stamp(next_action);}
         } else {
             next_action = now + std::chrono::seconds(2);
         }
@@ -1077,7 +1333,11 @@ int RunReadinessBenchmark(boost::asio::io_context& io, const ReadinessConfig& co
                 config.repl_full ? 1 : 0,
                 config.aoi_full_sort ? 1 : 0,
                 config.aoi_reference_positions ? 1 : 0);
+    if(!begin_terrain_window()) {check("terrain-window-reset",false); sim.Stop(); return failures;}
     const auto measure_start = Clock::now();
+    tc4_measure_start=measure_start;
+    const auto terrain_start = sim.GetTerrainStats();
+    const auto delays_start=sim.GetSchedulingDelays();
     const auto measure_end = measure_start + std::chrono::seconds(config.measure_seconds);
     auto next_sample = measure_start;
     auto next_ghost_shadow = measure_start;
@@ -1087,6 +1347,8 @@ int RunReadinessBenchmark(boost::asio::io_context& io, const ReadinessConfig& co
     std::uint64_t replication_shadow_runs = 0;
     std::uint64_t replication_shadow_failures = 0;
     const auto sched_before = sim.SchedulerStats();
+    const auto wake_before = sim.ActivityWakeMetrics();
+    const auto profile_before=gs::game::wake_profile::Snapshot();
     const GlobalCounters counters_before = snapshot_globals();
     while (Clock::now() < measure_end) {
         const auto now = Clock::now();
@@ -1128,6 +1390,7 @@ int RunReadinessBenchmark(boost::asio::io_context& io, const ReadinessConfig& co
             }
         }
         run_actions(now);
+        if (action_failed) break;
         std::this_thread::sleep_for(std::chrono::milliseconds(20));
     }
     sample_zones();
@@ -1136,6 +1399,41 @@ int RunReadinessBenchmark(boost::asio::io_context& io, const ReadinessConfig& co
     const GlobalCounters counters_after = snapshot_globals();
     const double measure_actual_s =
         std::chrono::duration<double>(Clock::now() - measure_start).count();
+    // Freeze terrain counters with the measured interval, before the final
+    // audit/report snapshots can add further I/O or wait time.
+    const auto terrain_after_measure=sim.GetTerrainStats();
+    const auto wake_after=sim.ActivityWakeMetrics();
+    gs::game::wake_profile::Print("measure",profile_before,gs::game::wake_profile::Snapshot());
+    std::printf("TC wake: input_generations=%llu consumed_updates=%llu capture_us=%llu commit_to_decision_sum_us=%llu max_lifetime_us=%llu (completed phase-input updates; coalesced oldest pending stamp; lifetime max includes setup)\n",
+        (unsigned long long)(wake_after.inputs-wake_before.inputs),(unsigned long long)(wake_after.sources-wake_before.sources),
+        (unsigned long long)(wake_after.capture_us-wake_before.capture_us),(unsigned long long)(wake_after.decision_age_us-wake_before.decision_age_us),
+        (unsigned long long)wake_after.max_decision_age_us);
+    if((scenario=="c-moving-v1" || scenario=="c-moving-v2")) {
+        std::printf("TC4B window_start_ns=%llu cutoff_ns=%llu capture_ns=%llu planned_batches=3 started_batches=%d completed_batches=%d overflow=%d\n",stamp(measure_start),stamp(measure_end),stamp(Clock::now()),int(std::count_if(batch_observations.begin(),batch_observations.end(),[](const auto& b){return b.start_ns!=0;})),int(std::count_if(batch_observations.begin(),batch_observations.end(),[](const auto& b){return b.completed_ns!=0;})),int(operation_samples.size()>=65536));
+        for(std::size_t i=0;i<batch_observations.size();++i) {
+            const auto& b=batch_observations[i];
+            std::printf("TC4BATCH id=%zu planned_ns=%llu start_ns=%llu request_begin_ns=%llu request_end_ns=%llu completed_ns=%llu next_eligible_ns=%llu reason=%s\n",i+1,b.planned_ns?b.planned_ns:stamp(measure_start+std::chrono::seconds(i*(config.measure_seconds/3))),b.start_ns,b.request_begin_ns,b.request_end_ns,b.completed_ns,b.next_eligible_ns,b.start_ns?"started":"outer-cutoff-before-next-start");
+        }
+        bool trace_coherent=operation_samples.size()==prepare_observations.size();
+        for(std::size_t i=0;i<operation_samples.size() && i<prepare_observations.size();++i) {
+            const auto& r=*operation_samples[i];const auto& o=prepare_observations[i];
+            trace_coherent=trace_coherent && o.request_id==r.id && o.first_poll_ns>=stamp(r.started) && o.observed_ns>=o.first_poll_ns;
+            std::printf("TC4REQUEST id=%llu batch=%zu player=%zu start_ns=%llu deadline_ns=%llu registered_us=%llu ready_us=%llu consume_us=%llu effect_us=%llu terminal_us=%llu status=%u first_poll_ns=%llu observed_ns=%llu polls=%llu sleep_requested_ns=%llu sleep_actual_ns=%llu\n",r.id,1+i/std::max(1,config.players),i%std::max(1,config.players),stamp(r.started),stamp(r.deadline),r.registered_us.load(),r.ready_us.load(),r.consumed_us.load(),r.effect_us.load(),r.terminal_us.load(),unsigned(r.Status()),o.first_poll_ns,o.observed_ns,o.polls,o.sleep_requested_ns,o.sleep_actual_ns);
+        }
+        check("tc4-request-trace-coherent",trace_coherent);
+    }
+    report_terrain_window("measure",terrain_after_measure);
+    std::printf("SL2 supervisor: cpu_us=%llu drain_max_lifetime_us=%llu (GetThreadTimes on Windows; 0 on unsupported platforms is NOT MEASURED)\n",(unsigned long long)(terrain_after_measure.supervisor_cpu_us-terrain_start.supervisor_cpu_us),(unsigned long long)terrain_after_measure.drain_max_us);
+    const auto delays_end=sim.GetSchedulingDelays();
+    std::printf("SL2 scheduling: completed_samples=%llu due_enqueue_us=%llu queue_us=%llu due_start_us=%llu finish_after_due_plus_50ms=%llu (sum over zones; not a global pause)\n",
+        (unsigned long long)(delays_end.samples-delays_start.samples),(unsigned long long)(delays_end.due_to_enqueue_us-delays_start.due_to_enqueue_us),
+        (unsigned long long)(delays_end.queue_us-delays_start.queue_us),(unsigned long long)(delays_end.due_to_start_us-delays_start.due_to_start_us),
+        (unsigned long long)(delays_end.finish_deadline_misses-delays_start.finish_deadline_misses));
+    std::printf("SL2 movement: attempted=%llu waiting=%llu blocked=%llu invalid=%llu\n",
+        (unsigned long long)(terrain_after_measure.queries.steps_attempted-terrain_start.queries.steps_attempted),
+        (unsigned long long)(terrain_after_measure.queries.steps_waiting-terrain_start.queries.steps_waiting),
+        (unsigned long long)(terrain_after_measure.queries.steps_blocked-terrain_start.queries.steps_blocked),
+        (unsigned long long)(terrain_after_measure.queries.invalid-terrain_start.queries.invalid));
     const std::size_t zones_after_measure =
         ReadWorld(sim, [](const WorldSnapshot& snap) { return snap.zones.ZoneCount(); });
 
@@ -1262,6 +1560,12 @@ int RunReadinessBenchmark(boost::asio::io_context& io, const ReadinessConfig& co
                 (unsigned long long)report.reclaim.reused_total,
                 (unsigned long long)report.reclaim.trimmed_total);
     check("validation", validated);
+    check("activity-generation",report.generation_ok);
+    check("activity-current-phase",report.wake_ok);
+    std::printf("TC activity-audit: epoch=%llu world_tick=%u capture_ns=%llu field_generation=%llu wake_generation=%llu wake_cut_ns=%llu phase=quiescent-between-scheduling-phases generation_error=%s wake_error=%s\n",
+        (unsigned long long)report.epoch,report.world_tick,(unsigned long long)report.capture_ns,
+        (unsigned long long)report.field_generation,(unsigned long long)report.wake_generation,(unsigned long long)report.wake_cut_ns,
+        report.generation_error.c_str(),report.wake_error.c_str());
     // A capture is served only in a quiescent window between two topology
     // transactions: no tick may be in flight and no staged split/merge
     // destination may exist in it.
@@ -1823,6 +2127,9 @@ int RunReadinessBenchmark(boost::asio::io_context& io, const ReadinessConfig& co
     const auto load_grid = sim.LoadFieldSnapshot();
     const std::size_t activity_bytes =
         activity_grid ? activity_grid->CellCount() * sizeof(gs::game::ActivityCell) : 0;
+    std::size_t source_cell_capacity=0;
+    if(activity_grid)for(const auto& cell:activity_grid->cells)source_cell_capacity+=cell.players.capacity()*sizeof(gs::game::PlayerInfluenceSource);
+    std::printf("TC4MEMORY phase=audit activity_cells_bytes=%zu cell_source_capacity_bytes=%zu retained_generation_input_bytes=%zu attribution=container_capacity_excludes_allocator_overhead\n",activity_bytes,source_cell_capacity,activity_grid?activity_grid->generation_sources.capacity()*sizeof(gs::game::PlayerInfluenceSource):0);
     const std::size_t load_bytes =
         load_grid ? load_grid->CellCount() * sizeof(gs::game::LoadCell) +
                         load_grid->L1CellCount() * sizeof(gs::game::LoadCell)
@@ -1847,6 +2154,49 @@ int RunReadinessBenchmark(boost::asio::io_context& io, const ReadinessConfig& co
                 report.zone_slots,
                 (unsigned long long)report.epoch);
     std::printf("READINESS validation: %s\n", validated ? "OK" : validation_result.c_str());
+    if (config.file_world) {
+        const auto& ts = terrain_after_measure;
+        const auto& s = ts.streamer;
+        // Window observations were frozen before the final audit.
+        std::printf("READINESS terrain: measure_elapsed_s=%.2f loads=%llu evictions=%llu misses=%llu "
+                    "wait_steps=%llu invalid=%llu peak_accounted_mb=%.2f budget_mb=%.2f "
+                    "resident=%zu queued_peak=%zu recent_miss_p99_ms=%.2f bytes_read=%llu\n",
+                    measure_actual_s,
+                    (unsigned long long)(s.loads_completed - terrain_start.streamer.loads_completed),
+                    (unsigned long long)(s.evictions - terrain_start.streamer.evictions),
+                    (unsigned long long)(s.misses - terrain_start.streamer.misses),
+                    (unsigned long long)(ts.queries.steps_waiting - terrain_start.queries.steps_waiting),
+                    (unsigned long long)(ts.queries.invalid - terrain_start.queries.invalid),
+                    s.peak_accounted_bytes / 1048576.0, s.budget_bytes / 1048576.0,
+                    s.resident, s.waiting_high_water, s.miss_ms_p99,
+                    (unsigned long long)(s.bytes_read - terrain_start.streamer.bytes_read));
+        std::printf("READINESS terrain-ledger: accounted=%zu resident=%zu inflight=%zu retired=%zu metadata=%zu "
+                    "pinned=%zu peak_accounted=%zu peak_inflight=%zu peak_retired=%zu peak_pinned_sampled=%zu budget=%zu\n",
+                    s.accounted_bytes,s.resident_bytes,s.in_flight_bytes,s.retired_bytes,s.metadata_bytes,
+                    s.pinned_bytes,s.peak_accounted_bytes,s.peak_in_flight_bytes,s.peak_retired_bytes,
+                    s.peak_pinned_bytes,s.budget_bytes);
+        std::printf("READINESS terrain-work: measure_pumps=%llu work_us=%llu room_checks=%llu blocked=%llu "
+                    "retry_suppressed=%llu frees=%llu safepoints=%llu drain_wait_us=%llu (elapsed work, not OS CPU samples)\n",
+                    (unsigned long long)(s.pump_calls-terrain_start.streamer.pump_calls),
+                    (unsigned long long)(s.pump_us-terrain_start.streamer.pump_us),
+                    (unsigned long long)(s.room_checks-terrain_start.streamer.room_checks),
+                    (unsigned long long)(s.room_blocked-terrain_start.streamer.room_blocked),
+                    (unsigned long long)(s.retry_suppressed-terrain_start.streamer.retry_suppressed),
+                    (unsigned long long)(s.frees-terrain_start.streamer.frees),
+                    (unsigned long long)(ts.safepoints-terrain_start.safepoints),
+                    (unsigned long long)(ts.drain_wait_us-terrain_start.drain_wait_us));
+        if (!config.eager_terrain) {
+            check("terrain-budget", s.peak_accounted_bytes <= s.budget_bytes);
+            if((scenario=="c-moving-v1" || scenario=="c-moving-v2")) {
+                check("c-moving-measure-read-evict-reload",s.reloads>0 && s.bytes_read>terrain_start.streamer.bytes_read && s.evictions>terrain_start.streamer.evictions);
+                check("c-moving-three-relocations",relocation_step>=3);
+                check("c-moving-terrain-height-oracle",requested_positions_present());
+            }
+            if (scenario == "moving") check("real-streaming-churn",
+                s.loads_completed > terrain_start.streamer.loads_completed &&
+                s.evictions > terrain_start.streamer.evictions);
+        }
+    }
     std::printf("READINESS-DONE failures=%d\n", failures);
     sim.Stop();
     return failures;

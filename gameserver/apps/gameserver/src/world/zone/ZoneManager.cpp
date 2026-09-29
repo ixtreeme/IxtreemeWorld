@@ -10,18 +10,6 @@
 
 namespace gs::game {
 namespace {
-
-// Region assignment by CENTER: a map zone straddling a quadrant border
-// belongs to exactly one region (no double ownership), chosen by where its
-// center falls.
-const RegionDefinition* RegionForBounds(const std::vector<RegionDefinition>& regions,
-                                        const mx::map::Rect& bounds)
-{
-    const float cx = (bounds.min_x + bounds.max_x) * 0.5f;
-    const float cy = (bounds.min_y + bounds.max_y) * 0.5f;
-    return FindRegionContaining(regions, cx, cy);
-}
-
 ZonePartition* FindNodeInRoots(const std::vector<std::unique_ptr<ZonePartition>>& roots, ZoneId id)
 {
     for (const auto& root : roots) {
@@ -50,50 +38,42 @@ void ResetZoneDiagnosticGauges(Zone& zone) noexcept
 
 } // namespace
 
-void ZoneManager::BuildFromWorldLogic(const mx::map::WorldLogic& logic, float fallback_extent)
+void ZoneManager::BuildInitialPartition(const InitialPartition& partition)
 {
     zones_.clear();
     partition_roots_.clear();
     retired_pending_.clear();
     reusable_slots_.clear();
-    regions_ = DefaultRegions();
+    regions_ = partition.regions;
 
-    if (!logic.zones.empty()) {
-        zones_.reserve(logic.zones.size());
-        for (const auto& logic_zone : logic.zones) {
-            zones_.push_back(std::make_unique<Zone>(logic_zone.id, logic_zone.name, logic_zone.bounds));
-        }
-    } else {
-        zones_.push_back(std::make_unique<Zone>(1,
-                                                "fallback",
-                                                mx::map::Rect{0.0f, 0.0f, fallback_extent, fallback_extent}));
+    // Server zone ids are allocated here, 1..N in leaf order -- independent
+    // of any map AreaId (R2).
+    zones_.reserve(partition.leaves.size());
+    ZoneId next_id = 1;
+    for (const auto& leaf : partition.leaves) {
+        auto zone = std::make_unique<Zone>(next_id++, leaf.name, leaf.bounds);
+        zone->SetRegion(leaf.region);
+        zones_.push_back(std::move(zone));
     }
+    next_zone_id_ = next_id;
 
-    ZoneId max_id = 0;
-    for (const auto& zone : zones_) {
-        max_id = std::max(max_id, zone->Id());
-    }
-    next_zone_id_ = max_id + 1;
-
-    // One partition root per region; every map zone becomes a depth-1 leaf
-    // in its center's region. Regions with no map zones keep a bare root
-    // (no coverage there, same as before: lookup falls back to linear).
+    // One partition root per region; every initial leaf is a depth-1 child
+    // of its region's root (BuildInitialPartition guarantees the leaves tile
+    // their region, so no point of the world is left without an owner and
+    // no zone escapes the load monitor).
     partition_roots_.reserve(regions_.size());
     for (const auto& region : regions_) {
         auto root = std::make_unique<ZonePartition>(0, region.id, region.bounds, 0);
         for (auto& zone : zones_) {
-            const RegionDefinition* home = RegionForBounds(regions_, zone->Bounds());
-            if (home != nullptr && home->id == region.id) {
-                zone->SetRegion(region.id);
+            if (zone->Region() == region.id) {
                 auto leaf = std::make_unique<ZonePartition>(zone->Id(), region.id, zone->Bounds(), 1);
                 leaf->parent = root.get();
                 root->children.push_back(std::move(leaf));
             }
         }
-        // A region with no map zones simulates nothing: disable the bare
-        // root so it never appears as an active leaf (no phantom zone 0 in
-        // scheduling, directory or validation).
         if (root->children.empty()) {
+            // Not produced by BuildInitialPartition; kept as a loud guard.
+            LOG_ERROR("partition: region {} '{}' has no initial leaf", region.id, region.name);
             root->simulation_enabled = false;
         }
         partition_roots_.push_back(std::move(root));
@@ -286,9 +266,12 @@ std::size_t ZoneManager::FindIndexById(ZoneId id) const
 
 std::size_t ZoneManager::FindIndexForPosition(float world_x, float world_y) const
 {
-    // O(depth) tree descent over active leaves first.
+    // O(depth) half-open descent. The regions tile the world and their leaves
+    // tile each region, so a point inside the world has exactly one owner and
+    // a point outside it (or non-finite) has none -- it never slides into an
+    // edge zone.
     for (const auto& root : partition_roots_) {
-        if (!root->bounds.Contains(world_x, world_y)) {
+        if (!root->bounds.ContainsHalfOpen(world_x, world_y)) {
             continue;
         }
         if (auto* leaf = FindLeaf(root.get(), world_x, world_y)) {
@@ -297,13 +280,7 @@ std::size_t ZoneManager::FindIndexForPosition(float world_x, float world_y) cons
                 return index;
             }
         }
-    }
-    // Linear fallback: positions outside the forest (unmapped area) keep
-    // the old semantics over simulating zones.
-    for (std::size_t i = 0; i < zones_.size(); ++i) {
-        if (zones_[i]->SimulationEnabled() && zones_[i]->Bounds().Contains(world_x, world_y)) {
-            return i;
-        }
+        return zones_.size(); // a region owns the point but no active leaf does
     }
     return zones_.size();
 }

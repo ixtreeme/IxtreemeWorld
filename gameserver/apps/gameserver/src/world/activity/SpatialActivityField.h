@@ -8,6 +8,7 @@
 #include <mutex>
 #include <utility>
 #include <vector>
+#include <unordered_set>
 
 #include "map/MapData.h"
 
@@ -29,18 +30,32 @@
 // (zone ticks via ZoneTickContext, scheduler, validator, bench) hold a
 // snapshot copy: no locks, no races, always a complete generation.
 //
-// STALENESS (documented bound, §11-13): per-zone publish runs every zone
-// tick (≤50ms old); aggregation runs ~1Hz. Influence therefore lags reality
-// by ~1s worst case (≤6m at player run speed). This matches the pre-existing
-// LOD evaluation period, so it introduces no new timing class; static
-// entities (all deterministic tests) observe exactly zero staleness.
-// Despawn/disconnect disappearance is bounded the same way: the owning zone
-// republishes without the source on its next tick (or wipes its buffer on
-// sleep/retire), and the next aggregation drops it.
+// TEMPORAL CONTRACT (TC): player commits publish wake sources atomically.
+// The first scheduling phase whose input cut follows that commit must decide
+// wake/runnable from those sources, without advancing the 20 Hz due time.
+// Periodic aggregation remains ~1Hz for the LOD field; this cadence is NOT
+// a wake-delay allowance or an unconditional wall-clock completion guarantee.
+// Generation audits use the retained publisher inputs; current-state audits
+// independently verify commit publication and the completed scheduling phase.
+// Despawn removes the source publication synchronously. An immutable field
+// may still contain that historically valid source until its next rebuild.
 namespace gs::game {
 
 class Zone;
 class ZoneManager;
+
+// Bounded by current player count and zone count. A scheduler input snapshot,
+// not a second simulation field: only positive zone eligibility is derived.
+// The existing immutable 1 Hz field remains the LOD consumer's input.
+struct ActivityWakeFrame {
+    std::uint64_t generation=0;
+    std::uint64_t cut_steady_ns=0;
+    float radius=0;
+    std::vector<std::pair<std::uint32_t,std::uint64_t>> revisions;
+    std::vector<PlayerInfluenceSource> sources;
+    std::unordered_set<std::uint32_t> influenced;
+    std::unordered_set<std::uint32_t> leaves;
+};
 
 struct ActivityCell {
     std::vector<PlayerInfluenceSource> players;
@@ -64,6 +79,9 @@ struct ActivityGrid {
     std::uint32_t dim_x = 0; // cells along X
     std::uint32_t dim_y = 0; // cells along Y
     std::vector<ActivityCell> cells; // dim_x*dim_y, row-major (y * dim_x + x)
+    // Original publisher inputs retained for a generation-specific independent
+    // audit. No live entity handles; their disappearance does not rewrite history.
+    std::vector<PlayerInfluenceSource> generation_sources;
 
     std::uint32_t CellDimX() const noexcept
     {

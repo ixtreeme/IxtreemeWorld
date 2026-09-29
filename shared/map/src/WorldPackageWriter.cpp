@@ -77,6 +77,23 @@ std::string ChunkFile(std::uint32_t x, std::uint32_t y)
 
 } // namespace
 
+std::vector<std::uint8_t> EncodeWaterBodies(const std::vector<WaterBodyRect>& bodies)
+{
+    std::vector<std::uint8_t> out;
+    PutU32(out, kWaterBodiesFileMagic);
+    PutU32(out, kWaterBodiesFileVersion);
+    PutU32(out, static_cast<std::uint32_t>(bodies.size()));
+    for (const auto& body : bodies) {
+        PutU32(out, body.id);
+        PutF32(out, body.bounds.min_x);
+        PutF32(out, body.bounds.min_y);
+        PutF32(out, body.bounds.max_x);
+        PutF32(out, body.bounds.max_y);
+        PutF32(out, body.surface_m);
+    }
+    return out;
+}
+
 std::vector<std::uint8_t> EncodeWorldLogic(const WorldLogic& logic)
 {
     std::vector<std::uint8_t> out;
@@ -109,10 +126,16 @@ std::vector<std::uint8_t> EncodeWorldLogic(const WorldLogic& logic)
 std::vector<std::uint8_t> EncodeChunk(const PackageWriteSpec& spec, std::uint32_t chunk_x, std::uint32_t chunk_y)
 {
     const std::uint32_t n = spec.chunk_size_cells;
+    const std::uint32_t size_x = spec.size_cells_x;
+    const std::uint32_t size_y = spec.SizeY();
+    // Partial edge chunk: only the in-world cells (and their corner samples).
+    const std::uint32_t cells_x = std::min(n, size_x - chunk_x * n);
+    const std::uint32_t cells_y = std::min(n, size_y - chunk_y * n);
+    const bool int32 = spec.height_encoding && spec.height_encoding->int32_samples;
     const bool splats = spec.splat_size > 0;
     const std::uint16_t section_count = splats ? 4 : 2;
-    const std::size_t height_bytes = static_cast<std::size_t>(n + 1) * (n + 1) * 2;
-    const std::size_t attribute_bytes = static_cast<std::size_t>(n) * n * 2;
+    const std::size_t height_bytes = static_cast<std::size_t>(cells_x + 1) * (cells_y + 1) * (int32 ? 4u : 2u);
+    const std::size_t attribute_bytes = static_cast<std::size_t>(cells_x) * cells_y * 2;
     const std::size_t splat_bytes = splats ? 4u + static_cast<std::size_t>(spec.splat_size) * spec.splat_size * 4u : 0;
     const auto height_offset =
         static_cast<std::uint32_t>(kChunkHeaderBytes + section_count * kChunkTocEntryBytes);
@@ -126,7 +149,7 @@ std::vector<std::uint8_t> EncodeChunk(const PackageWriteSpec& spec, std::uint32_
     PutU16(out, kChunkFileVersion);
     PutU16(out, static_cast<std::uint16_t>(chunk_x));
     PutU16(out, static_cast<std::uint16_t>(chunk_y));
-    PutU16(out, static_cast<std::uint16_t>(n));
+    PutU16(out, static_cast<std::uint16_t>(n)); // nominal pitch, also for partial chunks
     PutU16(out, section_count);
     auto toc = [&](std::uint16_t type, std::uint8_t element, std::uint32_t offset, std::size_t length) {
         PutU16(out, type);
@@ -135,20 +158,24 @@ std::vector<std::uint8_t> EncodeChunk(const PackageWriteSpec& spec, std::uint32_
         PutU32(out, offset);
         PutU32(out, static_cast<std::uint32_t>(length));
     };
-    toc(kSectionHeight, kElementInt16, height_offset, height_bytes);
+    toc(kSectionHeight, int32 ? kElementInt32 : kElementInt16, height_offset, height_bytes);
     toc(kSectionAttributes, kElementU16Bitfield, attribute_offset, attribute_bytes);
     if (splats) {
         toc(kSectionSplatA, kElementRgba8Image, splat_a_offset, splat_bytes);
         toc(kSectionSplatB, kElementRgba8Image, splat_b_offset, splat_bytes);
     }
-    for (std::uint32_t y = 0; y <= n; ++y) {
-        for (std::uint32_t x = 0; x <= n; ++x) {
-            const std::int16_t h = spec.height_cm ? spec.height_cm(chunk_x * n + x, chunk_y * n + y) : 0;
-            PutU16(out, static_cast<std::uint16_t>(h));
+    for (std::uint32_t y = 0; y <= cells_y; ++y) {
+        for (std::uint32_t x = 0; x <= cells_x; ++x) {
+            const std::int32_t raw = spec.height_raw ? spec.height_raw(chunk_x * n + x, chunk_y * n + y) : 0;
+            if (int32) {
+                PutU32(out, static_cast<std::uint32_t>(raw));
+            } else {
+                PutU16(out, static_cast<std::uint16_t>(static_cast<std::int16_t>(raw)));
+            }
         }
     }
-    for (std::uint32_t y = 0; y < n; ++y) {
-        for (std::uint32_t x = 0; x < n; ++x) {
+    for (std::uint32_t y = 0; y < cells_y; ++y) {
+        for (std::uint32_t x = 0; x < cells_x; ++x) {
             PutU16(out, spec.attributes ? spec.attributes(chunk_x * n + x, chunk_y * n + y) : 0);
         }
     }
@@ -177,29 +204,46 @@ PackageWriteResult WritePackage(const fs::path& out_dir, const PackageWriteSpec&
         result.error = "format_version must be 2 or 3";
         return result;
     }
-    if (spec.size_cells == 0 || spec.chunk_size_cells == 0 || spec.size_cells % spec.chunk_size_cells != 0) {
-        result.error = "size_cells must be a positive multiple of chunk_size_cells";
+    const std::uint32_t size_x = spec.size_cells_x;
+    const std::uint32_t size_y = spec.SizeY();
+    const std::uint32_t n = spec.chunk_size_cells;
+    if (size_x == 0 || size_y == 0 || n == 0) {
+        result.error = "size_cells_x/y and chunk_size_cells must be positive";
         return result;
     }
-    if (spec.format_version == kManifestVersionLegacy && spec.splat_size == 0) {
-        result.error = "the legacy (v2) layout always carries splat sections";
+    const bool legacy = spec.format_version == kManifestVersionLegacy;
+    if (spec.mob_spawns && (spec.mob_spawns_version < 1 || spec.mob_spawns_version > 2 ||
+                           (legacy && spec.mob_spawns_version != 1))) {
+        result.error = "mobSpawns requires layer v1 or v2; v2 requires manifest v3";
         return result;
+    }
+    if (legacy) {
+        if (spec.splat_size == 0) {
+            result.error = "the legacy (v2) layout always carries splat sections";
+            return result;
+        }
+        if (size_x != size_y || size_x % n != 0 || spec.origin_x != 0.0 || spec.origin_y != 0.0 ||
+            spec.height_encoding) {
+            result.error = "the legacy (v2) layout is square, whole-chunk, origin (0,0), height v1";
+            return result;
+        }
     }
     std::error_code ec;
     if (!spec.overwrite && fs::exists(out_dir / "map.manifest", ec)) {
         result.error = "refusing to overwrite the existing package at " + out_dir.string();
         return result;
     }
-    const std::uint32_t grid = spec.size_cells / spec.chunk_size_cells;
+    const std::uint32_t grid_x = (size_x + n - 1) / n;
+    const std::uint32_t grid_y = (size_y + n - 1) / n;
     capnp::MallocMessageBuilder message;
     auto manifest = message.initRoot<schema::MapManifest>();
     manifest.setFormatVersion(spec.format_version);
     manifest.setWorldId(spec.world_id);
     manifest.setWorldName(spec.world_name);
-    manifest.setWorldSizeCells(spec.size_cells);
+    manifest.setWorldSizeCells(size_x);
     manifest.setCellSizeMeters(spec.cell_size_m);
     manifest.setHeightUnit(schema::HeightUnit::CENTIMETERS);
-    manifest.setChunkSizeCells(spec.chunk_size_cells);
+    manifest.setChunkSizeCells(n);
     auto palette = manifest.initTexturePalette(static_cast<unsigned>(spec.texture_palette.size()));
     for (std::size_t i = 0; i < spec.texture_palette.size(); ++i) {
         palette[static_cast<unsigned>(i)].setId(static_cast<std::uint16_t>(i));
@@ -207,8 +251,8 @@ PackageWriteResult WritePackage(const fs::path& out_dir, const PackageWriteSpec&
     }
 
     std::vector<std::pair<std::string, std::vector<std::uint8_t>>> files;
-    for (std::uint32_t y = 0; y < grid; ++y) {
-        for (std::uint32_t x = 0; x < grid; ++x) {
+    for (std::uint32_t y = 0; y < grid_y; ++y) {
+        for (std::uint32_t x = 0; x < grid_x; ++x) {
             files.emplace_back(ChunkFile(x, y), EncodeChunk(spec, x, y));
         }
     }
@@ -217,41 +261,60 @@ PackageWriteResult WritePackage(const fs::path& out_dir, const PackageWriteSpec&
         files.emplace_back("mob_spawns.conf",
                            std::vector<std::uint8_t>(spec.mob_spawns->begin(), spec.mob_spawns->end()));
     }
+    if (!legacy && spec.water_model == WaterModel::Bodies) {
+        files.emplace_back("water_bodies.mxws", EncodeWaterBodies(spec.water_bodies));
+    }
 
-    if (spec.format_version == kManifestVersionLegacy) {
+    if (legacy) {
         // v2: the historic generator wrote the chunk count into zoneGridDims.
         auto dims = manifest.initZoneGridDims();
-        dims.setX(grid);
-        dims.setY(grid);
-        manifest.setZoneSizeCells(spec.size_cells);
+        dims.setX(grid_x);
+        dims.setY(grid_y);
+        manifest.setZoneSizeCells(size_x);
         manifest.setWorldLogicFile("");
         manifest.setEnvironmentFile("");
     } else {
-        manifest.setWorldSizeCellsY(spec.size_cells);
+        manifest.setWorldSizeCellsY(size_y);
         auto origin = manifest.initOrigin();
-        origin.setX(0.0);
-        origin.setY(0.0);
+        origin.setX(spec.origin_x);
+        origin.setY(spec.origin_y);
         auto chunk_grid = manifest.initChunkGrid();
-        chunk_grid.setX(grid);
-        chunk_grid.setY(grid);
+        chunk_grid.setX(grid_x);
+        chunk_grid.setY(grid_y);
+        if (spec.height_encoding) {
+            auto enc = manifest.initHeightEncoding();
+            enc.setSampleType(spec.height_encoding->int32_samples ? schema::HeightSampleType::INT32
+                                                                  : schema::HeightSampleType::INT16);
+            enc.setMetersPerUnit(spec.height_encoding->meters_per_unit);
+            enc.setOffsetMeters(spec.height_encoding->offset_m);
+        }
         struct Decl {
             schema::LayerKind kind;
             bool required;
             schema::LayerAudience audience;
             const char* file;
+            std::uint32_t version;
         };
         std::vector<Decl> decls = {
-            {schema::LayerKind::HEIGHT, true, schema::LayerAudience::SHARED, ""},
-            {schema::LayerKind::ATTRIBUTES, true, schema::LayerAudience::SHARED, ""},
+            {schema::LayerKind::HEIGHT, true, schema::LayerAudience::SHARED, "", spec.height_encoding ? 2u : 1u},
+            {schema::LayerKind::ATTRIBUTES, true, schema::LayerAudience::SHARED, "", 1u},
         };
         if (spec.splat_size > 0) {
-            decls.push_back({schema::LayerKind::SPLAT_A, false, schema::LayerAudience::CLIENT, ""});
-            decls.push_back({schema::LayerKind::SPLAT_B, false, schema::LayerAudience::CLIENT, ""});
+            decls.push_back({schema::LayerKind::SPLAT_A, false, schema::LayerAudience::CLIENT, "", 1u});
+            decls.push_back({schema::LayerKind::SPLAT_B, false, schema::LayerAudience::CLIENT, "", 1u});
         }
-        decls.push_back({schema::LayerKind::WORLD_LOGIC, true, schema::LayerAudience::SHARED, "worldlogic.dat"});
+        decls.push_back({schema::LayerKind::WORLD_LOGIC, true, schema::LayerAudience::SHARED, "worldlogic.dat", 1u});
         if (spec.mob_spawns) {
-            decls.push_back(
-                {schema::LayerKind::MOB_SPAWNS, spec.mob_spawns_required, schema::LayerAudience::SERVER, "mob_spawns.conf"});
+            decls.push_back({schema::LayerKind::MOB_SPAWNS, spec.mob_spawns_required, schema::LayerAudience::SERVER,
+                             "mob_spawns.conf", spec.mob_spawns_version});
+        }
+        if (spec.water_model != WaterModel::Undeclared) {
+            auto water = manifest.initWater();
+            water.setModel(static_cast<schema::WaterModel>(static_cast<std::uint16_t>(spec.water_model)));
+            water.setSeaLevelMeters(spec.sea_level_m);
+        }
+        if (spec.water_model == WaterModel::Bodies) {
+            decls.push_back({schema::LayerKind::WATER_BODIES, true, schema::LayerAudience::SERVER, "water_bodies.mxws", 1u});
         }
         auto layers = manifest.initLayers(static_cast<unsigned>(decls.size()));
         for (std::size_t i = 0; i < decls.size(); ++i) {
@@ -259,15 +322,15 @@ PackageWriteResult WritePackage(const fs::path& out_dir, const PackageWriteSpec&
             layer.setKind(decls[i].kind);
             layer.setRequired(decls[i].required);
             layer.setAudience(decls[i].audience);
-            layer.setVersion(kLayerEncodingVersion);
+            layer.setVersion(decls[i].version);
             layer.setFile(decls[i].file);
         }
-        auto chunks = manifest.initChunks(grid * grid);
-        for (std::uint32_t i = 0; i < grid * grid; ++i) {
+        auto chunks = manifest.initChunks(grid_x * grid_y);
+        for (std::uint32_t i = 0; i < grid_x * grid_y; ++i) {
             const auto& [name, bytes] = files[i];
             auto chunk = chunks[i];
-            chunk.setX(i % grid);
-            chunk.setY(i / grid);
+            chunk.setX(i % grid_x);
+            chunk.setY(i / grid_x);
             chunk.setFile(name);
             chunk.setByteSize(bytes.size());
             chunk.setCrc32(Crc32(bytes.data(), bytes.size()));

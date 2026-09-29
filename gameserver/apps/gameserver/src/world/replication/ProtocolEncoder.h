@@ -60,6 +60,8 @@ std::vector<std::uint8_t> MakeEnterWorldAccept(std::uint32_t net_id,
                                                std::uint32_t world_tick);
 // EnterWorldReject::alreadyInWorld (world presence invariant, hardening H4).
 std::vector<std::uint8_t> MakeEnterWorldRejectAlreadyInWorld();
+// No valid spawn position could be resolved (MAP-2 spawn rule): serverError.
+std::vector<std::uint8_t> MakeEnterWorldRejectServerError();
 
 std::vector<std::uint8_t> MakeSpawn(const BorderEntitySnapshot& snapshot);
 std::vector<std::uint8_t> MakeDespawn(std::uint32_t net_id);

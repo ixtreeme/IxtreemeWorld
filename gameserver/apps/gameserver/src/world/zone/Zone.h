@@ -31,6 +31,8 @@
 #include "../spatial/SpatialGrid.h"
 #include "../visibility/BorderSnapshot.h"
 #include "../visibility/GhostSystem.h"
+#include "../terrain/TerrainDemand.h"
+#include "../terrain/TerrainRequest.h"
 #include "ZoneCommandQueue.h"
 #include "ZoneDiagnostics.h"
 
@@ -76,6 +78,7 @@ struct ZoneTickContext {
     std::shared_ptr<const ActivityGrid> activity;
     std::function<void(std::shared_ptr<gs::network::Session>, std::vector<std::uint8_t>)> send;
     std::function<void(std::size_t spawn_point_index, float delay_sec)> respawn_later;
+    std::function<TerrainRequestHandle(float,float)> prepare_terrain;
 };
 
 // A zone owns exactly one flecs::world, which is the SOLE authoritative
@@ -362,6 +365,14 @@ public:
     {
         return activity_mutex_;
     }
+    // Caller holds ActivityMutex for the Locked helpers. Player position
+    // commit and wake publication share this critical section. The scheduler
+    // locks all publication buffers to define one coherent phase input cut.
+    std::uint64_t ActivityRevisionLocked() const noexcept { return activity_revision_; }
+    void UpsertActivitySourceLocked(std::uint32_t net_id, const Position& position);
+    void CommitPlayerPosition(flecs::entity entity, std::uint32_t net_id, const Position& position);
+    std::uint64_t WakeDecisionGeneration() const noexcept { return wake_decision_generation_; }
+    void SetWakeDecisionGeneration(std::uint64_t value) noexcept { wake_decision_generation_=value; }
     // --- continuous load field publication (derived data, never authority) ---
     // Zone-local integer work counters, binned by world-space field cell.
     // Written by whoever holds this zone's write guard (tick systems, combat
@@ -377,6 +388,12 @@ public:
     void ConfigureLoadBins(const LoadFieldMapping& mapping)
     {
         load_bins_.Configure(mapping, bounds_);
+    }
+    // MAP-3: terrain chunks this zone's consumers need (filled during the
+    // tick, published at its end, taken by the supervisor).
+    TerrainDemandBuffer& TerrainDemand() noexcept
+    {
+        return terrain_demand_;
     }
     // Sparse published deltas, guarded by ActivityMutex. Filled at the end of
     // every tick (LoadFieldPublisher::Publish), drained by the supervisor's
@@ -395,6 +412,10 @@ public:
     void ClearActivitySources()
     {
         std::lock_guard lock(activity_mutex_);
+        // A command may commit after the scheduler input cut. Do not erase
+        // that new player's wake publication with an earlier sleep decision.
+        if (!players_.empty()) return;
+        if (!activity_sources_.empty()) ++activity_revision_;
         activity_sources_.clear();
     }
     std::uint32_t TickIndex() const noexcept
@@ -628,7 +649,10 @@ private:
     std::unordered_map<std::uint32_t, std::size_t> ghost_index_;
     GhostMaintenanceState ghost_maintenance_;
     std::vector<PlayerInfluenceSource> activity_sources_;
+    std::uint64_t activity_revision_ = 0;
+    std::uint64_t wake_decision_generation_ = 0; // supervisor only
     std::vector<LoadBinEntry> published_load_bins_;
+    TerrainDemandBuffer terrain_demand_;
     ZoneLoadBins load_bins_;
     mutable std::mutex activity_mutex_;
     std::unordered_map<std::uint32_t, flecs::entity> entities_;

@@ -2,6 +2,7 @@
 
 #include <cstddef>
 #include <filesystem>
+#include <memory>
 #include <optional>
 #include <string>
 #include <vector>
@@ -19,7 +20,13 @@
 namespace gs::game {
 
 struct LoadedWorld {
-    mx::map::HeightField terrain; // heights + attributes only
+    mx::map::ServerTerrain terrain; // per-chunk heights + attributes only
+    // Eager: every chunk published. Streaming: only the startup set; the
+    // runtime's terrain streamer loads the rest through `chunk_source`.
+    mx::map::ResidencyMode residency = mx::map::ResidencyMode::Eager;
+    std::shared_ptr<const mx::map::ChunkSource> chunk_source;
+    std::vector<std::uint32_t> startup_chunks;
+    mx::map::ServerWater water; // declared water capability (MAP-3)
     mx::map::WorldLogic logic;
     std::vector<MobSpawnPoint> spawn_points;
     std::string mob_types_config; // absolute path, loaded and checked
@@ -31,6 +38,8 @@ struct WorldLoadRequest {
     std::filesystem::path package_root;
     std::filesystem::path mob_types_config;
     mx::map::ValidationDepth depth = mx::map::ValidationDepth::Startup;
+    mx::map::ResidencyMode residency = mx::map::ResidencyMode::Eager;
+    mx::map::WarpPolicy warp_policy = mx::map::WarpPolicy::Strict;
 };
 
 // nullopt <=> report has an Error issue. `report` always describes the attempt.

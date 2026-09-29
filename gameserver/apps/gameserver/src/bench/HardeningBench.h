@@ -104,4 +104,62 @@ int RunMapAuditScenario();
 // packages the gameserver startup acceptance script launches against.
 int RunWorldPackageScenario(const std::string& fixtures_out);
 
+// MAP-2: file-backed terrain against an independent height oracle (generator
+// function + hand-computed samples): seams, partial edge chunks, levels,
+// slope, negative heights, the half-open world edge, NotResident vs a
+// legitimate 0 m, height layer v2 int32 range; plus the runtime edge rules
+// (movement without clamp, spawn fallback, mobs inside, loaded bounds in
+// every world-level consumer).
+int RunTerrainScenario();
+
+// MAP-2: forced split 1 -> 4 -> 16 and merge back on a non-flat, negative-
+// origin, non-square world from the real loader (no terrain reload, no entity
+// duplication, partition-independent world queries at every step), the
+// min-size refusal diagnostic, and the checked-in test map under the approved
+// R2 partitioning.
+int RunMapSplitScenario();
+
+// MAP-2 review: aggregate bootstrap resources -- startup cost of the initial
+// partition (1 .. max_grid^2 initial zones on an empty 100 km world:
+// construction/start time, working set, idle supervisor cost), the enforced
+// aggregate caps (initial zone count, world coordinate range, terrain
+// samples) at the limit and one past it.
+int RunBootstrapScenario(int max_grid);
+
+// MAP-3: chunk streaming -- the streamer against a scripted chunk source
+// (cold/hit/miss, one load for many requesters, out-of-order completion,
+// bounded retry then InvalidData, CRC failure on load, seam rejection,
+// budget/admission/eviction, pins above the budget, free only in quiescent
+// windows, cancellation, stale completions, shutdown with reads in flight)
+// and the runtime on a streaming world against a fully resident reference
+// provider (batch spawning, movement across chunk and zone borders, split /
+// merge with slow I/O, generation reset, waiting for data, shutdown).
+int RunStreamingScenario();
+
+// MAP-3: world queries -- static collision on the movement path (thin wall vs
+// large step, chunk border, corner squeeze, slope, NotResident / outside),
+// water (undeclared = unknown, none, sea level with a depth oracle, bodies,
+// ground not resident, deep-water rule, package rules), navigation (NoPath
+// in the window, detour and long cross-chunk paths vs a Dijkstra oracle,
+// budget, cancel, outside, flat = unsupported, streaming waits + pins,
+// bounded wait) and the runtime (wall, shore, PostNavigationRequest).
+int RunWorldQueryScenario();
+
+// MAP-3: 100 km x 100 km file-backed world (9604 chunks) with a `budget_mb`
+// terrain cache (default 16): cold startup eager vs streaming, then
+// `seconds` of 200 roaming players whose active areas keep moving (real
+// misses / loads / evictions), the full own memory / I/O accounting vs
+// process RSS, heights vs the eager reference.
+int RunStreamingSoak(int seconds, int budget_mb);
+
+// MAP-3 review follow-up: lifetime and failure-path evidence -- lock-free
+// tick readers vs eviction with poisoned frees (+ a deliberately broken
+// negative control), a late completion across migration / retire / reclaim
+// / slot reuse, a sleeping zone releasing its terrain and waking onto
+// missing data, permanently failed chunks at runtime (spawn, movement,
+// queries, navigation), and the startup set above the budget.
+int RunStreamLifecycleScenario();
+int RunStreamAdmissionScenario();
+int RunMap4Scenario();
+
 } // namespace gs::bench

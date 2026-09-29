@@ -218,6 +218,11 @@ bool Rect::Contains(float x, float y) const noexcept
     return x >= min_x && x <= max_x && y >= min_y && y <= max_y;
 }
 
+bool Rect::ContainsHalfOpen(float x, float y) const noexcept
+{
+    return x >= min_x && x < max_x && y >= min_y && y < max_y;
+}
+
 float Rect::CenterX() const noexcept
 {
     return (min_x + max_x) * 0.5f;

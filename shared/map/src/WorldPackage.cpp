@@ -2,6 +2,7 @@
 
 #include <algorithm>
 #include <array>
+#include <atomic>
 #include <chrono>
 #include <cmath>
 #include <cstdio>
@@ -281,6 +282,40 @@ struct FileAccess {
         return bytes;
     }
 
+    // Size of a package file without reading it (streaming startup check).
+    // Same reference/containment rules and issues as Read.
+    std::optional<std::uint64_t> Stat(std::string_view reference, IssueSite site)
+    {
+        site.file = std::string(reference);
+        std::string why;
+        const auto path = ResolvePackageReference(root, reference, why);
+        if (!path) {
+            issues.Error(why.find("outside") != std::string::npos
+                             ? PackageErrorCode::PathOutsidePackage
+                             : PackageErrorCode::PathInvalid,
+                         site,
+                         "reference '" + std::string(reference) + "' rejected: " + why,
+                         "a relative '/'-separated path inside the package");
+            return std::nullopt;
+        }
+        std::error_code ec;
+        const auto status = fs::status(*path, ec);
+        if (ec || !fs::exists(status)) {
+            issues.Error(PackageErrorCode::FileMissing, site, "file does not exist");
+            return std::nullopt;
+        }
+        if (!fs::is_regular_file(status)) {
+            issues.Error(PackageErrorCode::FileUnreadable, site, "not a regular file");
+            return std::nullopt;
+        }
+        const auto size = fs::file_size(*path, ec);
+        if (ec) {
+            issues.Error(PackageErrorCode::FileUnreadable, site, "cannot stat: " + ec.message());
+            return std::nullopt;
+        }
+        return size;
+    }
+
     // Existence probe for optional/legacy files (no issue when absent).
     bool Exists(std::string_view reference)
     {
@@ -328,7 +363,9 @@ LayerInfo MakeLayer(LayerKind kind, bool required, LayerAudience audience, std::
     return layer;
 }
 
-bool ParseManifest(const std::vector<std::uint8_t>& bytes, PackageManifest& out, Issues& issues)
+// `eager`: the whole terrain will be resident -> the resident-sample cap
+// applies (checked here, before the chunk index, as the size limit it is).
+bool ParseManifest(const std::vector<std::uint8_t>& bytes, PackageManifest& out, Issues& issues, bool eager)
 {
     const IssueSite site{"manifest", kManifestFile};
     if (bytes.empty() || bytes.size() % sizeof(capnp::word) != 0) {
@@ -414,9 +451,9 @@ bool ParseManifest(const std::vector<std::uint8_t>& bytes, PackageManifest& out,
         if (!v3) {
             // ---- v2 legacy transition rule ----
             if (root.getWorldSizeCellsY() != 0 || root.hasOrigin() || root.hasChunkGrid() ||
-                root.hasLayers() || root.hasChunks()) {
+                root.hasLayers() || root.hasChunks() || root.hasHeightEncoding() || root.hasWater()) {
                 issues.Error(PackageErrorCode::ManifestFieldForbidden,
-                             IssueSite{"manifest", kManifestFile, "@12..@16"},
+                             IssueSite{"manifest", kManifestFile, "@12..@18"},
                              "a formatVersion 2 manifest carries v3 fields (ambiguous)",
                              "formatVersion 3, or no v3 fields");
             }
@@ -475,18 +512,14 @@ bool ParseManifest(const std::vector<std::uint8_t>& bytes, PackageManifest& out,
                              "legacy file references are set",
                              "empty (v3 references come from `layers`)");
             }
+            // MAP-2: independent X/Y sizes, any finite origin (negative
+            // included) inside the f32-precise coordinate range.
             out.size_cells_y = root.getWorldSizeCellsY();
             if (out.size_cells_y == 0 || out.size_cells_y > kMaxWorldSizeCells) {
                 issues.Error(PackageErrorCode::ManifestFieldInvalid,
                              IssueSite{"manifest", kManifestFile, "worldSizeCellsY"},
                              "worldSizeCellsY " + std::to_string(out.size_cells_y),
                              "1 .. " + std::to_string(kMaxWorldSizeCells));
-            } else if (out.size_cells_y != out.size_cells_x) {
-                issues.Error(PackageErrorCode::UnsupportedFeature,
-                             IssueSite{"manifest", kManifestFile, "worldSizeCellsY"},
-                             "non-square world " + std::to_string(out.size_cells_x) + "x" +
-                                 std::to_string(out.size_cells_y),
-                             "square (non-square worlds arrive with MAP-2)");
             }
             out.origin_x = root.getOrigin().getX();
             out.origin_y = root.getOrigin().getY();
@@ -495,11 +528,6 @@ bool ParseManifest(const std::vector<std::uint8_t>& bytes, PackageManifest& out,
                              IssueSite{"manifest", kManifestFile, "origin"},
                              "non-finite origin",
                              "finite coordinates");
-            } else if (out.origin_x != 0.0 || out.origin_y != 0.0) {
-                issues.Error(PackageErrorCode::UnsupportedFeature,
-                             IssueSite{"manifest", kManifestFile, "origin"},
-                             "origin (" + Str(out.origin_x) + ", " + Str(out.origin_y) + ")",
-                             "(0, 0) (non-zero origins arrive with MAP-2)");
             }
             out.chunk_grid_x = root.getChunkGrid().getX();
             out.chunk_grid_y = root.getChunkGrid().getY();
@@ -530,7 +558,7 @@ bool ParseManifest(const std::vector<std::uint8_t>& bytes, PackageManifest& out,
                                      "each kind at most once");
                         continue;
                     }
-                    if (layer.raw_kind > static_cast<std::uint16_t>(LayerKind::Water)) {
+                    if (layer.raw_kind > static_cast<std::uint16_t>(LayerKind::WaterBodies)) {
                         if (layer.required) {
                             issues.Error(PackageErrorCode::LayerUnsupported,
                                          lsite,
@@ -551,13 +579,21 @@ bool ParseManifest(const std::vector<std::uint8_t>& bytes, PackageManifest& out,
                                      "server (0), client (1) or shared (2)");
                         continue;
                     }
-                    if (layer.version != kLayerEncodingVersion) {
+                    const bool version_ok =
+                        layer.kind == LayerKind::Height
+                            ? layer.version >= 1 && layer.version <= kHeightLayerVersionMax
+                            : layer.kind == LayerKind::MobSpawns
+                                ? layer.version >= 1 && layer.version <= 2
+                                : layer.version == kLayerEncodingVersion;
+                    if (!version_ok) {
                         if (layer.required) {
                             issues.Error(PackageErrorCode::LayerUnsupported,
                                          lsite,
                                          std::string(ToString(layer.kind)) + " version " +
                                              std::to_string(layer.version),
-                                         "version " + std::to_string(kLayerEncodingVersion));
+                                         layer.kind == LayerKind::Height
+                                             ? "version 1..." + std::to_string(kHeightLayerVersionMax)
+                                             : "version " + std::to_string(kLayerEncodingVersion));
                         } else {
                             issues.Warning(PackageErrorCode::LayerSkipped,
                                            lsite,
@@ -580,7 +616,8 @@ bool ParseManifest(const std::vector<std::uint8_t>& bytes, PackageManifest& out,
                     const bool server_data = layer.kind == LayerKind::Height ||
                                              layer.kind == LayerKind::Attributes ||
                                              layer.kind == LayerKind::WorldLogic ||
-                                             layer.kind == LayerKind::MobSpawns;
+                                             layer.kind == LayerKind::MobSpawns ||
+                                             layer.kind == LayerKind::WaterBodies;
                     if (server_data && layer.audience == LayerAudience::Client) {
                         issues.Error(PackageErrorCode::LayerDeclInvalid,
                                      lsite,
@@ -609,6 +646,60 @@ bool ParseManifest(const std::vector<std::uint8_t>& bytes, PackageManifest& out,
                     out.chunks.push_back(std::move(entry));
                 }
             }
+            // ---- height encoding (height layer version 2 = range extension) ----
+            const LayerInfo* height_layer = out.FindLayer(LayerKind::Height);
+            const IssueSite esite{"manifest", kManifestFile, "heightEncoding"};
+            if (height_layer != nullptr && height_layer->version == 2) {
+                if (!root.hasHeightEncoding()) {
+                    issues.Error(PackageErrorCode::ManifestFieldInvalid, esite,
+                                 "height layer version 2 without heightEncoding",
+                                 "sampleType, metersPerUnit, offsetMeters");
+                } else {
+                    const auto enc = root.getHeightEncoding();
+                    const auto sample_type = static_cast<std::uint16_t>(enc.getSampleType());
+                    out.height_encoding.layer_version = 2;
+                    out.height_encoding.int32_samples =
+                        sample_type == static_cast<std::uint16_t>(schema::HeightSampleType::INT32);
+                    out.height_encoding.meters_per_unit = enc.getMetersPerUnit();
+                    out.height_encoding.offset_m = enc.getOffsetMeters();
+                    if (sample_type > static_cast<std::uint16_t>(schema::HeightSampleType::INT32)) {
+                        issues.Error(PackageErrorCode::ManifestFieldInvalid, esite,
+                                     "sampleType " + std::to_string(sample_type), "int16 (0) or int32 (1)");
+                    }
+                    const double unit = out.height_encoding.meters_per_unit;
+                    const double offset = out.height_encoding.offset_m;
+                    if (!std::isfinite(unit) || unit < 1e-4 || unit > 10.0) {
+                        issues.Error(PackageErrorCode::ManifestFieldInvalid, esite,
+                                     "metersPerUnit " + Str(unit), "finite, 0.0001 .. 10");
+                    }
+                    if (!std::isfinite(offset) || std::abs(offset) > 1.0e5) {
+                        issues.Error(PackageErrorCode::ManifestFieldInvalid, esite,
+                                     "offsetMeters " + Str(offset), "finite, |offset| <= 100000");
+                    }
+                }
+            } else if (root.hasHeightEncoding()) {
+                issues.Error(PackageErrorCode::ManifestFieldForbidden, esite,
+                             "heightEncoding set for height layer version 1",
+                             "absent (version 1 is int16 centimeters)");
+            }
+            // ---- water capability (MAP-3) ----
+            if (root.hasWater()) {
+                const auto water = root.getWater();
+                const auto raw_model = static_cast<std::uint16_t>(water.getModel());
+                const IssueSite wsite{"manifest", kManifestFile, "water"};
+                if (raw_model > static_cast<std::uint16_t>(schema::WaterModel::BODIES)) {
+                    issues.Error(PackageErrorCode::ManifestFieldInvalid, wsite, "water model " + std::to_string(raw_model),
+                                 "undeclared (0), none (1), seaLevel (2) or bodies (3)");
+                } else {
+                    out.water_model = static_cast<WaterModel>(raw_model);
+                    out.sea_level_m = water.getSeaLevelMeters();
+                    if (out.water_model == WaterModel::SeaLevel &&
+                        (!std::isfinite(out.sea_level_m) || std::abs(out.sea_level_m) > 1.0e5)) {
+                        issues.Error(PackageErrorCode::ManifestFieldInvalid, wsite,
+                                     "seaLevelMeters " + Str(out.sea_level_m), "finite, |sea level| <= 100000");
+                    }
+                }
+            }
         }
     } catch (const kj::Exception& error) {
         issues.Error(PackageErrorCode::ManifestCorrupt,
@@ -627,13 +718,33 @@ bool ParseManifest(const std::vector<std::uint8_t>& bytes, PackageManifest& out,
     // ---- geometry shared by both versions ----
     const std::uint32_t grid_x = (out.size_cells_x + out.chunk_size_cells - 1) / out.chunk_size_cells;
     const std::uint32_t grid_y = (out.size_cells_y + out.chunk_size_cells - 1) / out.chunk_size_cells;
-    if (out.size_cells_x % out.chunk_size_cells != 0 || out.size_cells_y % out.chunk_size_cells != 0) {
+    const bool partial = out.size_cells_x % out.chunk_size_cells != 0 || out.size_cells_y % out.chunk_size_cells != 0;
+    if (partial && out.format_version == kManifestVersionLegacy) {
+        // v2 edge chunks were always written full-size; their out-of-world
+        // samples have no defined meaning, so v2 stays whole-chunk only.
         issues.Error(PackageErrorCode::UnsupportedFeature,
                      IssueSite{"manifest", kManifestFile, "chunkSizeCells"},
-                     "world " + std::to_string(out.size_cells_x) + " cells is not a whole number of " +
-                         std::to_string(out.chunk_size_cells) + "-cell chunks (partial edge chunks)",
-                     "worldSizeCells % chunkSizeCells == 0 (partial chunks arrive with MAP-2)");
+                     "formatVersion 2 world " + std::to_string(out.size_cells_x) +
+                         " cells is not a whole number of " + std::to_string(out.chunk_size_cells) +
+                         "-cell chunks",
+                     "v3 for partial edge chunks (they store only their in-world cells)");
         return false;
+    }
+    {
+        // Every world coordinate within the f32-precise range.
+        const double coords[4] = {out.origin_x, out.origin_y, out.origin_x + out.ExtentX(),
+                                  out.origin_y + out.ExtentY()};
+        for (const double c : coords) {
+            if (std::abs(c) > kMaxWorldCoordinate) {
+                issues.Error(PackageErrorCode::UnsupportedFeature,
+                             IssueSite{"manifest", kManifestFile, "origin/worldSize"},
+                             "world spans (" + Str(out.origin_x) + "," + Str(out.origin_y) + ")-(" +
+                                 Str(coords[2]) + "," + Str(coords[3]) + ") m",
+                             "every coordinate within +-" + Str(kMaxWorldCoordinate) +
+                                 " m (f32 runtime positions, step <= 1/64 m)");
+                return false;
+            }
+        }
     }
     if (out.format_version == kManifestVersionCurrent) {
         if (out.chunk_grid_x != grid_x || out.chunk_grid_y != grid_y) {
@@ -648,17 +759,30 @@ bool ParseManifest(const std::vector<std::uint8_t>& bytes, PackageManifest& out,
     }
     out.chunk_grid_x = grid_x;
     out.chunk_grid_y = grid_y;
+    // The chunk index is the per-package metadata the server always keeps
+    // (streaming too): bounded. The resident-sample cap applies to EAGER
+    // residency only (LoadServerWorld); streaming bounds residency by its
+    // memory budget instead.
     const std::uint64_t samples =
         (static_cast<std::uint64_t>(out.size_cells_x) + 1) * (static_cast<std::uint64_t>(out.size_cells_y) + 1);
-    if (samples > kMaxResidentCells) {
-        issues.Error(PackageErrorCode::ManifestSizeOverflow,
-                     IssueSite{"manifest", kManifestFile, "worldSizeCells"},
+    if (eager && samples > kMaxResidentCells) {
+        issues.Error(PackageErrorCode::ManifestSizeOverflow, IssueSite{"manifest", kManifestFile, "worldSizeCells"},
                      std::to_string(samples) + " height samples",
-                     "<= " + std::to_string(kMaxResidentCells) + " (MAP-1 keeps terrain resident)");
+                     "<= " + std::to_string(kMaxResidentCells) +
+                         " for eager (whole-world) residency; larger worlds need terrain_residency=streaming");
+        return false;
+    }
+    const std::uint64_t chunk_count = static_cast<std::uint64_t>(grid_x) * grid_y;
+    if (chunk_count > kMaxChunkCount) {
+        issues.Error(PackageErrorCode::ManifestSizeOverflow,
+                     IssueSite{"manifest", kManifestFile, "chunkGrid"},
+                     std::to_string(chunk_count) + " chunks",
+                     "<= " + std::to_string(kMaxChunkCount) + " (chunk index size)");
         return false;
     }
     const std::uint64_t chunk_bytes =
-        (static_cast<std::uint64_t>(out.chunk_size_cells) + 1) * (out.chunk_size_cells + 1) * 2 +
+        (static_cast<std::uint64_t>(out.chunk_size_cells) + 1) * (out.chunk_size_cells + 1) *
+            (out.height_encoding.int32_samples ? 4u : 2u) +
         static_cast<std::uint64_t>(out.chunk_size_cells) * out.chunk_size_cells * 2;
     if (chunk_bytes > kMaxChunkFileBytes) {
         issues.Error(PackageErrorCode::ManifestSizeOverflow,
@@ -672,7 +796,8 @@ bool ParseManifest(const std::vector<std::uint8_t>& bytes, PackageManifest& out,
         out.chunks.clear();
         for (std::uint32_t y = 0; y < grid_y; ++y) {
             for (std::uint32_t x = 0; x < grid_x; ++x) {
-                out.chunks.push_back(ChunkEntry{x, y, ChunkFileName(x, y), 0, std::nullopt});
+                out.chunks.push_back(
+                    ChunkEntry{x, y, out.chunk_size_cells, out.chunk_size_cells, ChunkFileName(x, y), 0, std::nullopt});
             }
         }
         issues.Info(PackageErrorCode::ChunkIntegrityUnavailable,
@@ -723,6 +848,11 @@ bool ParseManifest(const std::vector<std::uint8_t>& bytes, PackageManifest& out,
         std::sort(out.chunks.begin(), out.chunks.end(), [](const ChunkEntry& a, const ChunkEntry& b) {
             return a.y != b.y ? a.y < b.y : a.x < b.x;
         });
+        const GridGeometry geometry = out.Geometry();
+        for (auto& c : out.chunks) {
+            c.cells_x = geometry.ChunkCellsX(c.x);
+            c.cells_y = geometry.ChunkCellsY(c.y);
+        }
     }
     return true;
 }
@@ -733,6 +863,7 @@ struct ChunkPlan {
     bool splat_declared = false; // v3: declared => present in every chunk
     bool strict_v3 = false;
     bool decode_client = false;  // Full depth
+    HeightEncoding encoding;     // height element format + storage
 };
 
 struct DecodedChunk {
@@ -742,11 +873,11 @@ struct DecodedChunk {
     bool has_splat_b = false;
 };
 
-std::uint8_t ExpectedElementFormat(std::uint16_t type) noexcept
+std::uint8_t ExpectedElementFormat(std::uint16_t type, const HeightEncoding& encoding) noexcept
 {
     switch (type) {
     case kSectionHeight:
-        return kElementInt16;
+        return encoding.int32_samples ? kElementInt32 : kElementInt16;
     case kSectionAttributes:
         return kElementU16Bitfield;
     case kSectionSplatA:
@@ -773,20 +904,19 @@ const char* SectionLayerName(std::uint16_t type) noexcept
     }
 }
 
-// Decodes one chunk file into the resident terrain arrays. Returns false on
-// any Error (reported); on success the chunk's height/attribute samples have
-// been written into `heights` / `attributes`.
+// Decodes one chunk file into `out` (its own samples; partial edge chunks
+// store only their in-world cells). Returns false on any Error (reported).
 bool DecodeChunk(const std::vector<std::uint8_t>& bytes,
                  const ChunkEntry& entry,
                  const PackageManifest& manifest,
                  const ChunkPlan& plan,
-                 std::vector<std::int16_t>& heights,
-                 std::vector<std::uint16_t>& attributes,
-                 std::vector<std::uint8_t>& written_vertex,
+                 TerrainChunk& out,
                  DecodedChunk& decoded,
                  Issues& issues)
 {
     const std::uint32_t n = manifest.chunk_size_cells;
+    const std::uint32_t cells_x = entry.cells_x;
+    const std::uint32_t cells_y = entry.cells_y;
     IssueSite site{"chunk", entry.file};
     site.chunk_x = static_cast<std::int32_t>(entry.x);
     site.chunk_y = static_cast<std::int32_t>(entry.y);
@@ -825,6 +955,8 @@ bool DecodeChunk(const std::vector<std::uint8_t>& bytes,
                      "header says chunk (" + std::to_string(hx) + "," + std::to_string(hy) + ")",
                      "(" + std::to_string(entry.x) + "," + std::to_string(entry.y) + ")");
     }
+    // cellsPerSide is the nominal chunk pitch, also for a partial edge chunk
+    // (its real extent follows from the manifest geometry).
     if (cells != n) {
         issues.Error(PackageErrorCode::ChunkHeaderInvalid, at("chunk", "cellsPerSide", 10),
                      "cellsPerSide " + std::to_string(cells), std::to_string(n) + " (chunkSizeCells)");
@@ -863,7 +995,7 @@ bool DecodeChunk(const std::vector<std::uint8_t>& bytes,
         s.length = LoadU32(bytes.data() + toc + 8);
         s.toc_offset = toc;
         const std::string field = "toc[" + std::to_string(i) + "]";
-        const std::uint8_t expected_element = ExpectedElementFormat(s.type);
+        const std::uint8_t expected_element = ExpectedElementFormat(s.type, plan.encoding);
         if (expected_element == 0) {
             if (plan.strict_v3) {
                 issues.Error(PackageErrorCode::ChunkTocInvalid, at("chunk", field, static_cast<std::int64_t>(toc)),
@@ -962,69 +1094,59 @@ bool DecodeChunk(const std::vector<std::uint8_t>& bytes,
     if (issues.ErrorCount() != errors_before) {
         return false;
     }
-    const std::uint64_t vertices = static_cast<std::uint64_t>(n + 1) * (n + 1);
-    if (height->length != vertices * 2) {
+    const std::uint64_t sample_bytes = plan.encoding.int32_samples ? 4u : 2u;
+    const std::uint64_t vertices = static_cast<std::uint64_t>(cells_x + 1) * (cells_y + 1);
+    if (height->length != vertices * sample_bytes) {
         issues.Error(PackageErrorCode::ChunkSectionSize,
                      at("height", "length", static_cast<std::int64_t>(height->toc_offset + 8)),
                      "height section is " + std::to_string(height->length) + " bytes",
-                     std::to_string(vertices * 2) + " = (chunkSizeCells+1)^2 * int16");
+                     std::to_string(vertices * sample_bytes) + " = (" + std::to_string(cells_x) + "+1)x(" +
+                         std::to_string(cells_y) + "+1) samples x " + std::to_string(sample_bytes) + " B");
     }
-    const std::uint64_t cell_count = static_cast<std::uint64_t>(n) * n;
+    const std::uint64_t cell_count = static_cast<std::uint64_t>(cells_x) * cells_y;
     if (attr->length != cell_count * 2) {
         issues.Error(PackageErrorCode::ChunkSectionSize,
                      at("attributes", "length", static_cast<std::int64_t>(attr->toc_offset + 8)),
                      "attribute section is " + std::to_string(attr->length) + " bytes",
-                     std::to_string(cell_count * 2) + " = chunkSizeCells^2 * uint16");
+                     std::to_string(cell_count * 2) + " = " + std::to_string(cells_x) + "x" +
+                         std::to_string(cells_y) + " cells x uint16");
     }
     if (issues.ErrorCount() != errors_before) {
         return false;
     }
 
-    // Heights: shared border samples must agree with the neighbour that
-    // already wrote them (no silent last-writer-wins).
-    const std::uint32_t row = manifest.size_cells_x + 1;
-    const std::uint32_t x0 = entry.x * n;
-    const std::uint32_t y0 = entry.y * n;
-    std::uint64_t edge_mismatches = 0;
-    std::int64_t first_mismatch = -1;
-    for (std::uint32_t y = 0; y <= n; ++y) {
-        for (std::uint32_t x = 0; x <= n; ++x) {
-            const std::size_t src = static_cast<std::size_t>(height->offset) +
-                                    (static_cast<std::size_t>(y) * (n + 1) + x) * 2;
-            const auto value = static_cast<std::int16_t>(LoadU16(bytes.data() + src));
-            const std::size_t dst = static_cast<std::size_t>(y0 + y) * row + (x0 + x);
-            if (written_vertex[dst] != 0 && heights[dst] != value) {
-                if (first_mismatch < 0) {
-                    first_mismatch = static_cast<std::int64_t>(src);
-                }
-                ++edge_mismatches;
-                continue;
-            }
-            heights[dst] = value;
-            written_vertex[dst] = 1;
+    out = TerrainChunk{};
+    out.x = entry.x;
+    out.y = entry.y;
+    out.cells_x = cells_x;
+    out.cells_y = cells_y;
+    const std::uint8_t* hp = bytes.data() + height->offset;
+    if (plan.encoding.int32_samples) {
+        out.heights32.resize(static_cast<std::size_t>(vertices));
+        for (std::size_t i = 0; i < out.heights32.size(); ++i) {
+            out.heights32[i] = static_cast<std::int32_t>(LoadU32(hp + i * 4));
+        }
+    } else {
+        out.heights16.resize(static_cast<std::size_t>(vertices));
+        for (std::size_t i = 0; i < out.heights16.size(); ++i) {
+            out.heights16[i] = static_cast<std::int16_t>(LoadU16(hp + i * 2));
         }
     }
-    if (edge_mismatches > 0) {
-        issues.Error(PackageErrorCode::ChunkEdgeMismatch, at("height", "edge samples", first_mismatch),
-                     std::to_string(edge_mismatches) + " shared border sample(s) differ from the neighbour chunk",
-                     "identical samples on shared chunk borders");
-    }
+    out.attributes.resize(static_cast<std::size_t>(cell_count));
     std::uint64_t reserved_cells = 0;
     std::int64_t first_reserved = -1;
-    for (std::uint32_t y = 0; y < n; ++y) {
-        for (std::uint32_t x = 0; x < n; ++x) {
-            const std::size_t src = static_cast<std::size_t>(attr->offset) +
-                                    (static_cast<std::size_t>(y) * n + x) * 2;
-            const std::uint16_t value = LoadU16(bytes.data() + src);
-            if ((value & kAttributeReservedMask) != 0) {
-                if (first_reserved < 0) {
-                    first_reserved = static_cast<std::int64_t>(src);
-                }
-                ++reserved_cells;
+    const std::uint8_t* ap = bytes.data() + attr->offset;
+    for (std::size_t i = 0; i < out.attributes.size(); ++i) {
+        const std::uint16_t value = LoadU16(ap + i * 2);
+        if ((value & kAttributeReservedMask) != 0) {
+            if (first_reserved < 0) {
+                first_reserved = static_cast<std::int64_t>(attr->offset + i * 2);
             }
-            attributes[static_cast<std::size_t>(y0 + y) * manifest.size_cells_x + (x0 + x)] = value;
+            ++reserved_cells;
         }
+        out.attributes[i] = value;
     }
+    out.resident = true;
     if (reserved_cells > 0) {
         issues.Add(plan.strict_v3 ? IssueSeverity::Error : IssueSeverity::Warning,
                    PackageErrorCode::ChunkAttributeReservedBits, at("attributes", "bits 1..15", first_reserved),
@@ -1069,6 +1191,158 @@ bool DecodeChunk(const std::vector<std::uint8_t>& bytes,
     }
     return issues.ErrorCount() == errors_before;
 }
+
+// Shared border samples: chunk (x, y)'s west column must equal chunk
+// (x-1, y)'s east column and its south row chunk (x, y-1)'s north row -- no
+// silent last-writer-wins at a seam.
+void CheckChunkSeams(const GridGeometry& geometry,
+                     const HeightEncoding& encoding,
+                     const std::vector<TerrainChunk>& chunks,
+                     const std::vector<ChunkEntry>& entries,
+                     Issues& issues)
+{
+    auto raw = [&](const TerrainChunk& c, std::uint32_t lx, std::uint32_t ly) -> std::int64_t {
+        const std::size_t i = static_cast<std::size_t>(ly) * (c.cells_x + 1) + lx;
+        return encoding.int32_samples ? c.heights32[i] : c.heights16[i];
+    };
+    for (std::size_t index = 0; index < chunks.size(); ++index) {
+        const TerrainChunk& c = chunks[index];
+        if (!c.resident) {
+            continue;
+        }
+        std::uint64_t mismatches = 0;
+        const char* side = "";
+        if (c.x > 0) {
+            const TerrainChunk& w = chunks[index - 1];
+            if (w.resident) {
+                for (std::uint32_t ly = 0; ly <= c.cells_y; ++ly) {
+                    mismatches += raw(c, 0, ly) != raw(w, w.cells_x, ly) ? 1u : 0u;
+                }
+                side = mismatches > 0 ? "west" : side;
+            }
+        }
+        if (c.y > 0) {
+            const TerrainChunk& s = chunks[index - geometry.chunks_x];
+            if (s.resident) {
+                std::uint64_t south = 0;
+                for (std::uint32_t lx = 0; lx <= c.cells_x; ++lx) {
+                    south += raw(c, lx, 0) != raw(s, lx, s.cells_y) ? 1u : 0u;
+                }
+                if (south > 0) {
+                    side = mismatches > 0 ? "west+south" : "south";
+                }
+                mismatches += south;
+            }
+        }
+        if (mismatches > 0) {
+            IssueSite site{"height", entries[index].file, std::string(side) + " border"};
+            site.chunk_x = static_cast<std::int32_t>(c.x);
+            site.chunk_y = static_cast<std::int32_t>(c.y);
+            issues.Error(PackageErrorCode::ChunkEdgeMismatch, site,
+                         std::to_string(mismatches) + " shared border sample(s) differ from the neighbour chunk",
+                         "identical samples on shared chunk borders");
+        }
+    }
+}
+
+// One chunk: read, v3 size + CRC-32 against the index, decode + validate into
+// `out`. The single path for eager loading, the streaming startup set and
+// runtime (streamed) loads. Errors go to `issues`; true = `out` is usable.
+bool LoadChunkFile(FileAccess& files,
+                   const ChunkEntry& entry,
+                   const PackageManifest& manifest,
+                   const ChunkPlan& plan,
+                   TerrainChunk& out,
+                   DecodedChunk& decoded,
+                   Issues& issues)
+{
+    IssueSite csite{"chunk", entry.file};
+    csite.chunk_x = static_cast<std::int32_t>(entry.x);
+    csite.chunk_y = static_cast<std::int32_t>(entry.y);
+    const auto bytes = files.Read(entry.file, kMaxChunkFileBytes, csite);
+    if (!bytes) {
+        return false;
+    }
+    if (files.report.residency == ResidencyMode::Eager) {
+        ++files.report.chunks_checked; // streaming counted it in the startup size check
+    }
+    if (manifest.format_version == kManifestVersionCurrent) {
+        if (bytes->size() != entry.byte_size) {
+            issues.Error(PackageErrorCode::ChunkSizeMismatch, csite, "file is " + std::to_string(bytes->size()) + " bytes",
+                         std::to_string(entry.byte_size) + " (chunk index)");
+            return false;
+        }
+        const std::uint32_t crc = Crc32(bytes->data(), bytes->size());
+        if (!entry.crc32 || crc != *entry.crc32) {
+            char buf[64];
+            std::snprintf(buf, sizeof(buf), "crc32 %08x", crc);
+            char want[64];
+            std::snprintf(want, sizeof(want), "%08x (chunk index)", entry.crc32.value_or(0));
+            issues.Error(PackageErrorCode::ChunkChecksumMismatch, csite, buf, want);
+            return false;
+        }
+    }
+    if (!DecodeChunk(*bytes, entry, manifest, plan, out, decoded, issues)) {
+        out.resident = false;
+        return false;
+    }
+    ++files.report.chunks_decoded;
+    return true;
+}
+
+// Runtime chunk loader of one validated package (streaming). Each Load owns
+// its report/issues: no shared mutable state, safe on any thread.
+class PackageChunkSource final : public ChunkSource {
+public:
+    PackageChunkSource(fs::path root, PackageManifest manifest, ChunkPlan plan)
+        : root_(std::move(root))
+        , manifest_(std::move(manifest))
+        , plan_(plan)
+    {
+    }
+
+    ChunkLoadResult Load(std::uint32_t chunk_index) const override
+    {
+        ChunkLoadResult result;
+        if (chunk_index >= manifest_.chunks.size()) {
+            result.code = PackageErrorCode::ChunkIndexInvalid;
+            result.error = "chunk index " + std::to_string(chunk_index) + " out of range";
+            return result;
+        }
+        PackageReport report;
+        report.root = root_;
+        Issues issues(report);
+        issues.SetPackage(manifest_.world_id);
+        FileAccess files{root_, report, issues};
+        auto chunk = std::make_shared<TerrainChunk>();
+        DecodedChunk decoded;
+        try {
+            result.ok = LoadChunkFile(files, manifest_.chunks[chunk_index], manifest_, plan_, *chunk, decoded, issues);
+        } catch (const std::exception& error) {
+            issues.Error(PackageErrorCode::Internal, IssueSite{"chunk", manifest_.chunks[chunk_index].file},
+                         std::string("chunk load failed: ") + error.what());
+            result.ok = false;
+        }
+        result.bytes_read = report.bytes_read;
+        if (result.ok) {
+            result.chunk = std::move(chunk);
+        } else if (const auto* first = report.FirstError()) {
+            result.code = first->code;
+            result.error = first->Format();
+        }
+        return result;
+    }
+
+    std::uint64_t FileBytes(std::uint32_t chunk_index) const override
+    {
+        return chunk_index < manifest_.chunks.size() ? manifest_.chunks[chunk_index].byte_size : 0;
+    }
+
+private:
+    fs::path root_;
+    PackageManifest manifest_;
+    ChunkPlan plan_;
+};
 
 // ---- worldlogic (MXL1 v1) --------------------------------------------------------
 
@@ -1178,71 +1452,62 @@ bool ParseWorldLogic(const std::vector<std::uint8_t>& bytes,
     return true;
 }
 
-// Record-level rules that need only the world extent.
+// Record-level rules against the world rectangle (half-open, origin-aware).
+// MAP-2: MXL1 "zone" records are AREAS -- design metadata with their own
+// AreaId namespace. They no longer bootstrap server zones, so they need not
+// cover the world; v1 has no overlay area kind, so they stay disjoint.
 void ValidateWorldLogic(const WorldLogic& logic,
                         const std::string& file,
-                        double extent_x,
-                        double extent_y,
-                        Issues& issues)
+                        const GridGeometry& geometry,
+                        Issues& issues, WarpPolicy policy)
 {
-    const Rect world{0.0f, 0.0f, static_cast<float>(extent_x), static_cast<float>(extent_y)};
+    const Rect world{static_cast<float>(geometry.MinX()), static_cast<float>(geometry.MinY()),
+                     static_cast<float>(geometry.MaxX()), static_cast<float>(geometry.MaxY())};
     auto at = [&](std::string field) { return IssueSite{"worldLogic", file, std::move(field)}; };
-    if (logic.zones.empty()) {
-        issues.Error(PackageErrorCode::WorldLogicNoZones, at("zones"), "no zone records",
-                     ">= 1 zone (MAP-1 bootstraps the server partition from them)");
-    }
-    std::unordered_map<std::uint32_t, std::size_t> zone_index;
-    double area = 0.0;
-    std::vector<std::size_t> valid_zones;
+    std::unordered_map<std::uint32_t, std::size_t> area_index;
+    std::vector<std::size_t> valid_areas;
     for (std::size_t i = 0; i < logic.zones.size(); ++i) {
-        const auto& z = logic.zones[i];
-        const std::string field = "zones[" + std::to_string(i) + "]";
-        if (z.id == 0 || z.id > kMaxZoneId) {
-            issues.Error(PackageErrorCode::WorldLogicIdInvalid, at(field + ".id"),
-                         "zone id " + std::to_string(z.id),
-                         "1 .. " + std::to_string(kMaxZoneId) + " (0 = partition root sentinel)");
-        } else if (!zone_index.emplace(z.id, i).second) {
+        const auto& a = logic.zones[i];
+        const std::string field = "areas[" + std::to_string(i) + "]";
+        if (a.id == 0) {
+            issues.Error(PackageErrorCode::WorldLogicIdInvalid, at(field + ".id"), "area id 0",
+                         ">= 1 (0 = no area)");
+        } else if (!area_index.emplace(a.id, i).second) {
             issues.Error(PackageErrorCode::WorldLogicIdDuplicate, at(field + ".id"),
-                         "zone id " + std::to_string(z.id) + " already used", "unique zone ids");
+                         "area id " + std::to_string(a.id) + " already used", "unique area ids");
         }
-        if (!FiniteRect(z.bounds) || !(z.bounds.min_x < z.bounds.max_x) || !(z.bounds.min_y < z.bounds.max_y)) {
+        if (!FiniteRect(a.bounds) || !(a.bounds.min_x < a.bounds.max_x) || !(a.bounds.min_y < a.bounds.max_y)) {
             issues.Error(PackageErrorCode::WorldLogicRectInvalid, at(field + ".bounds"),
-                         "bounds " + RectText(z.bounds), "finite, min < max");
+                         "bounds " + RectText(a.bounds), "finite, min < max");
             continue;
         }
-        if (!InsideRect(z.bounds, world)) {
+        if (!InsideRect(a.bounds, world)) {
             issues.Error(PackageErrorCode::WorldLogicOutOfBounds, at(field + ".bounds"),
-                         "bounds " + RectText(z.bounds), "inside the world " + RectText(world));
+                         "bounds " + RectText(a.bounds), "inside the world " + RectText(world));
             continue;
         }
-        area += (static_cast<double>(z.bounds.max_x) - z.bounds.min_x) *
-                (static_cast<double>(z.bounds.max_y) - z.bounds.min_y);
-        valid_zones.push_back(i);
+        valid_areas.push_back(i);
     }
-    // Ownership bootstrap: zones tile the world, half-open, no ambiguity.
-    bool overlap = false;
-    for (std::size_t a = 0; a < valid_zones.size(); ++a) {
-        for (std::size_t b = a + 1; b < valid_zones.size(); ++b) {
-            const auto& za = logic.zones[valid_zones[a]];
-            const auto& zb = logic.zones[valid_zones[b]];
+    for (std::size_t a = 0; a < valid_areas.size(); ++a) {
+        for (std::size_t b = a + 1; b < valid_areas.size(); ++b) {
+            const auto& za = logic.zones[valid_areas[a]];
+            const auto& zb = logic.zones[valid_areas[b]];
             if (Overlaps(za.bounds, zb.bounds)) {
-                overlap = true;
                 issues.Error(PackageErrorCode::WorldLogicZoneOverlap,
-                             at("zones[" + std::to_string(valid_zones[a]) + "]"),
-                             "zone " + std::to_string(za.id) + " " + RectText(za.bounds) + " overlaps zone " +
+                             at("areas[" + std::to_string(valid_areas[a]) + "]"),
+                             "area " + std::to_string(za.id) + " " + RectText(za.bounds) + " overlaps area " +
                                  std::to_string(zb.id) + " " + RectText(zb.bounds),
-                             "disjoint half-open [min, max) bootstrap zones");
+                             "disjoint half-open [min, max) areas (MXL1 v1 has no overlay kind)");
             }
         }
     }
-    const double world_area = extent_x * extent_y;
-    if (!overlap && valid_zones.size() == logic.zones.size() && !logic.zones.empty() &&
-        std::abs(area - world_area) > world_area * 1e-6) {
-        issues.Error(PackageErrorCode::WorldLogicCoverageGap, at("zones"),
-                     "zones cover " + Str(area) + " m2 of the " + Str(world_area) + " m2 world",
-                     "the bootstrap zones tile the whole world");
-    }
 
+    // Player spawn regions: at least one (the server's player spawn rule
+    // needs a defined place); areaId 0 = world-level, else inside its area.
+    if (logic.spawns.empty()) {
+        issues.Error(PackageErrorCode::WorldLogicNoPlayerSpawn, at("spawns"), "no player spawn region",
+                     ">= 1 spawn region (where players enter the world)");
+    }
     std::unordered_set<std::uint32_t> spawn_ids;
     for (std::size_t i = 0; i < logic.spawns.size(); ++i) {
         const auto& s = logic.spawns[i];
@@ -1258,17 +1523,28 @@ void ValidateWorldLogic(const WorldLogic& logic,
                          "bounds " + RectText(s.bounds), "finite, min < max");
             continue;
         }
-        const auto zone = zone_index.find(s.zone_id);
-        if (zone == zone_index.end()) {
-            issues.Error(PackageErrorCode::WorldLogicReferenceInvalid, at(field + ".zoneId"),
-                         "spawn references zone " + std::to_string(s.zone_id), "an existing zone id");
+        if (s.zone_id == 0) {
+            // areaId 0 = no area: a world-level spawn region (areas are
+            // optional metadata, the player spawn region is not). It only has
+            // to lie inside the world.
+            if (!InsideRect(s.bounds, world)) {
+                issues.Error(PackageErrorCode::WorldLogicOutOfBounds, at(field + ".bounds"),
+                             "spawn " + RectText(s.bounds), "inside the world " + RectText(world));
+            }
             continue;
         }
-        if (!InsideRect(s.bounds, logic.zones[zone->second].bounds)) {
+        const auto area = area_index.find(s.zone_id);
+        if (area == area_index.end()) {
+            issues.Error(PackageErrorCode::WorldLogicReferenceInvalid, at(field + ".areaId"),
+                         "spawn references area " + std::to_string(s.zone_id),
+                         "an existing area id, or 0 (no area)");
+            continue;
+        }
+        if (!InsideRect(s.bounds, logic.zones[area->second].bounds)) {
             issues.Error(PackageErrorCode::WorldLogicSpawnOutsideZone, at(field + ".bounds"),
-                         "spawn " + RectText(s.bounds) + " is not inside zone " + std::to_string(s.zone_id) +
-                             " " + RectText(logic.zones[zone->second].bounds),
-                         "inside its zone");
+                         "spawn " + RectText(s.bounds) + " is not inside area " + std::to_string(s.zone_id) +
+                             " " + RectText(logic.zones[area->second].bounds),
+                         "inside its area");
         }
     }
 
@@ -1293,19 +1569,18 @@ void ValidateWorldLogic(const WorldLogic& logic,
                          "source " + RectText(w.source), "inside the world " + RectText(world));
             continue;
         }
-        if (!std::isfinite(w.target_x) || !std::isfinite(w.target_y) || w.target_x < 0.0f ||
-            w.target_y < 0.0f || w.target_x >= world.max_x || w.target_y >= world.max_y) {
+        if (!geometry.Contains(w.target_x, w.target_y)) {
             issues.Error(PackageErrorCode::WorldLogicWarpTargetInvalid, at(field + ".target"),
                          "target (" + Str(w.target_x) + "," + Str(w.target_y) + ")",
-                         "finite, inside [0, extent) on both axes");
+                         "finite, inside the world " + RectText(world) + " (half-open)");
             continue;
         }
         warp_ok[i] = true;
     }
-    // Trigger graph with the runtime's (closed-interval) containment: warp i
-    // -> warp j when i's target lies in j's source. A cycle (incl. a warp
-    // into its own source) makes an entity bounce forever: rejected. A chain
-    // is reported (R6: targets should not land in any trigger).
+    // Trigger graph with the server's half-open containment: warp i -> warp
+    // j when i's target lies in j's source. A cycle (incl. a warp into its own
+    // source) makes an entity bounce forever: rejected. A chain is reported
+    // (R6: targets should not land in any trigger).
     const std::size_t n = logic.warps.size();
     std::vector<std::vector<std::size_t>> edges(n);
     for (std::size_t i = 0; i < n; ++i) {
@@ -1313,7 +1588,8 @@ void ValidateWorldLogic(const WorldLogic& logic,
             continue;
         }
         for (std::size_t j = 0; j < n; ++j) {
-            if (warp_ok[j] && logic.warps[j].source.Contains(logic.warps[i].target_x, logic.warps[i].target_y)) {
+            if (warp_ok[j] &&
+                logic.warps[j].source.ContainsHalfOpen(logic.warps[i].target_x, logic.warps[i].target_y)) {
                 edges[i].push_back(j);
             }
         }
@@ -1348,33 +1624,126 @@ void ValidateWorldLogic(const WorldLogic& logic,
                              " is part of a trigger cycle (its target re-enters a warp source)",
                          "no warp target inside a source that leads back");
         } else if (!edges[i].empty()) {
-            issues.Warning(PackageErrorCode::WorldLogicWarpTargetInTrigger,
+            // Stable code 413; only severity depends on the explicit operator policy.
+            auto target_issue = [&](auto code, auto site, auto reason, auto expected) {
+                if(policy==WarpPolicy::Strict) issues.Error(code,site,reason,expected);
+                else issues.Warning(code,site,reason,expected);
+            };
+            target_issue(PackageErrorCode::WorldLogicWarpTargetInTrigger,
                            at("warps[" + std::to_string(i) + "].target"),
                            "warp " + std::to_string(logic.warps[i].id) + " target lands in warp " +
                                std::to_string(logic.warps[edges[i].front()].id) + "'s source (chain)",
-                           "targets outside every trigger (R6; review may make this an error)");
+                           "strict: targets outside every trigger; explicit legacy: acyclic chain only");
         }
     }
 }
 
-// Cross-layer rule: warp targets must be walkable terrain.
-void ValidateWarpTargets(const WorldLogic& logic, const std::string& file, const HeightField& field, Issues& issues)
+// Cross-layer rules against the decoded terrain: warp targets and the
+// centre of every player spawn region must be walkable cells.
+void ValidateAgainstTerrain(const WorldLogic& logic,
+                            const std::string& file,
+                            const ServerTerrain& terrain,
+                            Issues& issues)
 {
     for (std::size_t i = 0; i < logic.warps.size(); ++i) {
         const auto& w = logic.warps[i];
-        if (!std::isfinite(w.target_x) || !std::isfinite(w.target_y)) {
+        const auto cell = terrain.Cell(w.target_x, w.target_y);
+        if (cell.status == TerrainStatus::OutsideWorld) {
             continue; // already reported
         }
-        if (w.target_x >= 0.0f && w.target_y >= 0.0f &&
-            w.target_x < static_cast<float>(field.manifest.world_size_cells) * field.manifest.cell_size_meters &&
-            w.target_y < static_cast<float>(field.manifest.world_size_cells) * field.manifest.cell_size_meters &&
-            !field.IsWalkable(w.target_x, w.target_y)) {
+        if (!cell.Walkable()) {
             issues.Error(PackageErrorCode::WorldLogicWarpTargetInvalid,
                          IssueSite{"worldLogic", file, "warps[" + std::to_string(i) + "].target"},
-                         "target (" + Str(w.target_x) + "," + Str(w.target_y) + ") is a blocked cell",
+                         "target (" + Str(w.target_x) + "," + Str(w.target_y) + ") is " +
+                             (cell.Ok() ? "a blocked cell" : ToString(cell.status)),
                          "a walkable cell (attribute bit 0 clear)");
         }
     }
+    for (std::size_t i = 0; i < logic.spawns.size(); ++i) {
+        const auto& s = logic.spawns[i];
+        if (!FiniteRect(s.bounds)) {
+            continue; // already reported
+        }
+        const auto cell = terrain.Cell(s.bounds.CenterX(), s.bounds.CenterY());
+        if (cell.status != TerrainStatus::OutsideWorld && !cell.Walkable()) {
+            issues.Error(PackageErrorCode::WorldLogicSpawnBlocked,
+                         IssueSite{"worldLogic", file, "spawns[" + std::to_string(i) + "].bounds"},
+                         "spawn region centre (" + Str(s.bounds.CenterX()) + "," + Str(s.bounds.CenterY()) +
+                             ") is not walkable",
+                         "a walkable centre cell (players are placed there)");
+        }
+    }
+}
+
+// ---- server water bodies (MXWS v1, MAP-3) ------------------------------------------
+//   u32 magic "MXWS"  u32 version = 1  u32 count (<= 4096)
+//   count x { u32 id, f32 minX, minY, maxX, maxY, f32 surfaceMeters }
+// Exactly 12 + 24*count bytes. ids >= 1 unique; finite; min < max; inside the
+// world; |surface| <= 100000; bodies disjoint (half-open) so a point has one
+// surface.
+bool ParseWaterBodies(const std::vector<std::uint8_t>& bytes,
+                      const std::string& file,
+                      const GridGeometry& geometry,
+                      std::vector<WaterBodyRect>& out,
+                      Issues& issues)
+{
+    auto at = [&](std::string field, std::size_t offset) {
+        return IssueSite{"waterBodies", file, std::move(field), static_cast<std::int64_t>(offset)};
+    };
+    Cursor cur(bytes);
+    std::uint32_t magic = 0, version = 0, count = 0;
+    if (!cur.U32(magic) || !cur.U32(version) || !cur.U32(count)) {
+        issues.Error(PackageErrorCode::WaterBodiesTruncated, at("header", cur.Offset()),
+                     "file is " + std::to_string(bytes.size()) + " bytes", ">= 12 (header)");
+        return false;
+    }
+    if (magic != kWaterBodiesFileMagic || version != kWaterBodiesFileVersion || count > kMaxWaterBodies) {
+        issues.Error(PackageErrorCode::WaterBodiesHeader, at("header", 0),
+                     "magic/version/count " + std::to_string(magic) + "/" + std::to_string(version) + "/" +
+                         std::to_string(count),
+                     "\"MXWS\", version 1, count <= " + std::to_string(kMaxWaterBodies));
+        return false;
+    }
+    if (bytes.size() != 12u + 24u * static_cast<std::size_t>(count)) {
+        issues.Error(PackageErrorCode::WaterBodiesTruncated, at("records", 12),
+                     "file is " + std::to_string(bytes.size()) + " bytes",
+                     std::to_string(12u + 24u * static_cast<std::size_t>(count)) + " (12 + 24 * count)");
+        return false;
+    }
+    const Rect world{static_cast<float>(geometry.MinX()), static_cast<float>(geometry.MinY()),
+                     static_cast<float>(geometry.MaxX()), static_cast<float>(geometry.MaxY())};
+    std::unordered_set<std::uint32_t> ids;
+    const std::size_t errors_before = issues.ErrorCount();
+    for (std::uint32_t i = 0; i < count; ++i) {
+        WaterBodyRect body;
+        const std::size_t offset = cur.Offset();
+        (void)(cur.U32(body.id) && cur.F32(body.bounds.min_x) && cur.F32(body.bounds.min_y) &&
+               cur.F32(body.bounds.max_x) && cur.F32(body.bounds.max_y) && cur.F32(body.surface_m));
+        const std::string field = "bodies[" + std::to_string(i) + "]";
+        if (body.id == 0 || !ids.insert(body.id).second) {
+            issues.Error(PackageErrorCode::WaterBodyInvalid, at(field + ".id", offset),
+                         "water body id " + std::to_string(body.id), ">= 1, unique");
+        }
+        if (!FiniteRect(body.bounds) || !(body.bounds.min_x < body.bounds.max_x) ||
+            !(body.bounds.min_y < body.bounds.max_y) || !InsideRect(body.bounds, world) ||
+            !std::isfinite(body.surface_m) || std::abs(body.surface_m) > 1.0e5f) {
+            issues.Error(PackageErrorCode::WaterBodyInvalid, at(field, offset),
+                         "bounds " + RectText(body.bounds) + " surface " + Str(body.surface_m),
+                         "finite, min < max, inside the world " + RectText(world) + ", |surface| <= 100000");
+        }
+        out.push_back(body);
+    }
+    for (std::size_t a = 0; a < out.size(); ++a) {
+        for (std::size_t b = a + 1; b < out.size(); ++b) {
+            if (Overlaps(out[a].bounds, out[b].bounds)) {
+                issues.Error(PackageErrorCode::WaterBodyOverlap, at("bodies[" + std::to_string(a) + "]", 12 + 24 * a),
+                             "water body " + std::to_string(out[a].id) + " overlaps body " +
+                                 std::to_string(out[b].id),
+                             "disjoint half-open bodies (one surface per point)");
+            }
+        }
+    }
+    return issues.ErrorCount() == errors_before;
 }
 
 // ---- spawn table (mob_spawns format v1) -----------------------------------------------
@@ -1417,8 +1786,9 @@ bool ParseFloat(const std::string& text, float& out)
 
 void ParseSpawns(const std::vector<std::uint8_t>& bytes,
                  const std::string& file,
-                 double extent_x,
-                 double extent_y,
+                 const GridGeometry& geometry,
+                 std::uint16_t version,
+                 const WorldLogic& logic,
                  std::vector<SpawnRecord>& out,
                  Issues& issues)
 {
@@ -1426,6 +1796,7 @@ void ParseSpawns(const std::vector<std::uint8_t>& bytes,
     std::size_t pos = 0;
     std::uint32_t line_number = 0;
     std::uint32_t records = 0;
+    std::unordered_set<std::uint32_t> ids;
     while (pos <= text.size()) {
         const std::size_t end = std::min(text.find('\n', pos), text.size());
         std::string line = text.substr(pos, end - pos);
@@ -1454,6 +1825,7 @@ void ParseSpawns(const std::vector<std::uint8_t>& bytes,
         std::string token;
         SpawnRecord record;
         record.line = line_number;
+        record.spawn_id = records; // legacy v1: immutable package record order
         std::set<std::string> keys;
         bool line_ok = true;
         while (tokens >> token) {
@@ -1472,7 +1844,11 @@ void ParseSpawns(const std::vector<std::uint8_t>& bytes,
                 continue;
             }
             bool ok = true;
-            if (key == "mob_type_id") {
+            if (key == "spawn_id" && version == 2) {
+                ok = ParseUnsigned(value, record.spawn_id) && record.spawn_id != 0;
+            } else if (key == "area_id" && version == 2) {
+                ok = ParseUnsigned(value, record.area_id);
+            } else if (key == "mob_type_id") {
                 ok = ParseUnsigned(value, record.mob_type_id) && record.mob_type_id != 0;
             } else if (key == "count") {
                 ok = ParseUnsigned(value, record.count) && record.count >= 1 && record.count <= kMaxSpawnCount;
@@ -1482,7 +1858,8 @@ void ParseSpawns(const std::vector<std::uint8_t>& bytes,
                 ok = ParseFloat(value, record.y);
             } else if (key == "radius") {
                 ok = ParseFloat(value, record.radius) && record.radius >= 0.0f &&
-                     record.radius <= static_cast<float>(std::max(extent_x, extent_y));
+                     record.radius <= static_cast<float>(std::max(geometry.MaxX() - geometry.MinX(),
+                                                                  geometry.MaxY() - geometry.MinY()));
             } else {
                 issues.Error(PackageErrorCode::SpawnsSyntax, site, "unknown key '" + key + "'",
                              "mob_type_id, x, y, count, radius");
@@ -1491,7 +1868,8 @@ void ParseSpawns(const std::vector<std::uint8_t>& bytes,
             }
             if (!ok) {
                 issues.Error(PackageErrorCode::SpawnsFieldInvalid, site, key + "='" + value + "'",
-                             key == "mob_type_id" ? "integer 1 .. 4294967295"
+                             key == "mob_type_id" || key == "spawn_id" ? "integer 1 .. 4294967295"
+                             : key == "area_id"   ? "integer 0 .. 4294967295"
                              : key == "count"     ? "integer 1 .. " + std::to_string(kMaxSpawnCount)
                              : key == "radius"    ? "finite, 0 .. world extent"
                                                   : "finite decimal number");
@@ -1509,11 +1887,27 @@ void ParseSpawns(const std::vector<std::uint8_t>& bytes,
         if (!line_ok) {
             continue;
         }
-        if (record.x < 0.0f || record.y < 0.0f || record.x >= static_cast<float>(extent_x) ||
-            record.y >= static_cast<float>(extent_y)) {
+        if (version == 2 && (!keys.contains("spawn_id") || !keys.contains("area_id"))) {
+            issues.Error(PackageErrorCode::SpawnsSyntax, site, "v2 missing identity/reference",
+                         "spawn_id and area_id required");
+            continue;
+        }
+        if (!ids.insert(record.spawn_id).second) {
+            issues.Error(PackageErrorCode::SpawnsFieldInvalid, site, "duplicate spawn_id",
+                         "unique nonzero spawn_id within world package");
+            continue;
+        }
+        if (record.area_id != 0 && std::none_of(logic.zones.begin(), logic.zones.end(),
+                [&](const auto& area) { return area.id == record.area_id &&
+                    area.bounds.ContainsHalfOpen(record.x, record.y); })) {
+            issues.Error(PackageErrorCode::SpawnsFieldInvalid, site, "invalid area_id or centre outside area",
+                         "0 (world) or existing containing area");
+            continue;
+        }
+        if (!geometry.Contains(record.x, record.y)) {
             issues.Error(PackageErrorCode::SpawnsOutOfBounds, site,
                          "spawn centre (" + Str(record.x) + "," + Str(record.y) + ")",
-                         "inside [0, extent) on both axes");
+                         "inside the world [min, max) on both axes");
             continue;
         }
         out.push_back(record);
@@ -1577,11 +1971,18 @@ const char* ToString(PackageErrorCode code) noexcept
     case PackageErrorCode::WorldLogicWarpCycle: return "WORLDLOGIC_WARP_CYCLE";
     case PackageErrorCode::WorldLogicWarpTargetInTrigger: return "WORLDLOGIC_WARP_TARGET_IN_TRIGGER";
     case PackageErrorCode::WorldLogicNoZones: return "WORLDLOGIC_NO_ZONES";
+    case PackageErrorCode::WorldLogicNoPlayerSpawn: return "WORLDLOGIC_NO_PLAYER_SPAWN";
+    case PackageErrorCode::WorldLogicSpawnBlocked: return "WORLDLOGIC_SPAWN_BLOCKED";
     case PackageErrorCode::SpawnsSyntax: return "SPAWNS_SYNTAX";
     case PackageErrorCode::SpawnsFieldInvalid: return "SPAWNS_FIELD_INVALID";
     case PackageErrorCode::SpawnsOutOfBounds: return "SPAWNS_OUT_OF_BOUNDS";
     case PackageErrorCode::SpawnsTooMany: return "SPAWNS_TOO_MANY";
     case PackageErrorCode::SpawnsMobTypeUnknown: return "SPAWNS_MOB_TYPE_UNKNOWN";
+    case PackageErrorCode::WaterDeclInvalid: return "WATER_DECL_INVALID";
+    case PackageErrorCode::WaterBodiesHeader: return "WATER_BODIES_HEADER";
+    case PackageErrorCode::WaterBodiesTruncated: return "WATER_BODIES_TRUNCATED";
+    case PackageErrorCode::WaterBodyInvalid: return "WATER_BODY_INVALID";
+    case PackageErrorCode::WaterBodyOverlap: return "WATER_BODY_OVERLAP";
     case PackageErrorCode::StartupDataInvalid: return "STARTUP_DATA_INVALID";
     case PackageErrorCode::Internal: return "INTERNAL";
     }
@@ -1598,6 +1999,11 @@ const char* ToString(IssueSeverity severity) noexcept
     return "?";
 }
 
+const char* ToString(ResidencyMode mode) noexcept
+{
+    return mode == ResidencyMode::Streaming ? "streaming" : "eager";
+}
+
 const char* ToString(LayerKind kind) noexcept
 {
     switch (kind) {
@@ -1608,6 +2014,7 @@ const char* ToString(LayerKind kind) noexcept
     case LayerKind::WorldLogic: return "worldLogic";
     case LayerKind::MobSpawns: return "mobSpawns";
     case LayerKind::Water: return "water";
+    case LayerKind::WaterBodies: return "waterBodies";
     }
     return "unknown";
 }
@@ -1663,6 +2070,29 @@ std::string PackageIssue::Format() const
         out << " expected=\"" << expected << '"';
     }
     return out.str();
+}
+
+GridGeometry PackageManifest::Geometry() const noexcept
+{
+    GridGeometry g;
+    g.origin_x = origin_x;
+    g.origin_y = origin_y;
+    g.cell_size_m = cell_size_m;
+    g.cells_x = size_cells_x;
+    g.cells_y = size_cells_y;
+    g.chunk_cells = chunk_size_cells;
+    g.chunks_x = chunk_grid_x;
+    g.chunks_y = chunk_grid_y;
+    return g;
+}
+
+namespace {
+std::atomic<std::uint64_t> g_package_loads{0};
+} // namespace
+
+std::uint64_t PackageLoadCount() noexcept
+{
+    return g_package_loads.load(std::memory_order_relaxed);
 }
 
 const LayerInfo* PackageManifest::FindLayer(LayerKind kind) const noexcept
@@ -1796,7 +2226,18 @@ std::optional<ServerWorldData> LoadServerWorld(const fs::path& package_root,
                                                ValidationDepth depth,
                                                PackageReport& report)
 {
+    LoadOptions options;
+    options.depth = depth;
+    return LoadServerWorld(package_root, options, report);
+}
+
+std::optional<ServerWorldData> LoadServerWorld(const fs::path& package_root,
+                                               const LoadOptions& options,
+                                               PackageReport& report)
+{
+    g_package_loads.fetch_add(1, std::memory_order_relaxed);
     const auto started = std::chrono::steady_clock::now();
+    const ValidationDepth depth = options.depth;
     report = PackageReport{};
     report.depth = depth;
     Issues issues(report);
@@ -1826,7 +2267,9 @@ std::optional<ServerWorldData> LoadServerWorld(const fs::path& package_root,
             manifest_bytes = files.Read(kManifestFile, kMaxManifestBytes, IssueSite{"manifest"});
         }
         PackageManifest& manifest = report.manifest;
-        if (manifest_bytes && ParseManifest(*manifest_bytes, manifest, issues)) {
+        const bool eager_residency =
+            !(options.residency == ResidencyMode::Streaming && options.depth == ValidationDepth::Startup);
+        if (manifest_bytes && ParseManifest(*manifest_bytes, manifest, issues, eager_residency)) {
             const bool v3 = manifest.format_version == kManifestVersionCurrent;
             // ---- layer resolution ----
             for (const LayerKind needed : {LayerKind::Height, LayerKind::Attributes, LayerKind::WorldLogic}) {
@@ -1842,57 +2285,30 @@ std::optional<ServerWorldData> LoadServerWorld(const fs::path& package_root,
                 issues.Error(PackageErrorCode::LayerDeclInvalid, IssueSite{"manifest", kManifestFile, "layers"},
                              "only one of splatA / splatB declared", "both or neither");
             }
+            const bool streaming =
+                options.residency == ResidencyMode::Streaming && options.depth == ValidationDepth::Startup;
+            report.residency = streaming ? ResidencyMode::Streaming : ResidencyMode::Eager;
             if (issues.ErrorCount() == 0) {
                 ChunkPlan plan;
                 plan.strict_v3 = v3;
                 plan.splat_declared = splat_a != nullptr && splat_b != nullptr;
                 plan.decode_client = depth == ValidationDepth::Full;
+                plan.encoding = manifest.height_encoding;
                 ServerWorldData data;
-                HeightField& field = data.terrain;
-                field.manifest.format_version = manifest.format_version;
-                field.manifest.world_id = manifest.world_id;
-                field.manifest.world_name = manifest.world_name;
-                field.manifest.world_size_cells = manifest.size_cells_x;
-                field.manifest.cell_size_meters = manifest.cell_size_m;
-                field.manifest.chunk_size_cells = manifest.chunk_size_cells;
-                field.width_vertices = manifest.size_cells_x + 1;
-                field.height_vertices = manifest.size_cells_y + 1;
-                field.heights_cm.assign(static_cast<std::size_t>(field.width_vertices) * field.height_vertices, 0);
-                field.attributes.assign(static_cast<std::size_t>(manifest.size_cells_x) * manifest.size_cells_y, 0);
-                std::vector<std::uint8_t> written(field.heights_cm.size(), 0);
+                const GridGeometry geometry = manifest.Geometry();
+                data.residency = report.residency;
+                std::vector<TerrainChunk> chunks(manifest.chunks.size());
                 bool any_splat = false;
                 std::uint32_t splat_w = 0, splat_h = 0;
                 bool splat_geometry_reported = false;
-                for (const auto& entry : manifest.chunks) {
+                auto load_chunk = [&](std::size_t chunk_index) {
+                    const auto& entry = manifest.chunks[chunk_index];
                     IssueSite csite{"chunk", entry.file};
                     csite.chunk_x = static_cast<std::int32_t>(entry.x);
                     csite.chunk_y = static_cast<std::int32_t>(entry.y);
-                    const auto bytes = files.Read(entry.file, kMaxChunkFileBytes, csite);
-                    if (!bytes) {
-                        continue;
-                    }
-                    ++report.chunks_checked;
-                    if (v3) {
-                        if (bytes->size() != entry.byte_size) {
-                            issues.Error(PackageErrorCode::ChunkSizeMismatch, csite,
-                                         "file is " + std::to_string(bytes->size()) + " bytes",
-                                         std::to_string(entry.byte_size) + " (chunk index)");
-                            continue;
-                        }
-                        const std::uint32_t crc = Crc32(bytes->data(), bytes->size());
-                        if (!entry.crc32 || crc != *entry.crc32) {
-                            char buf[64];
-                            std::snprintf(buf, sizeof(buf), "crc32 %08x", crc);
-                            char want[64];
-                            std::snprintf(want, sizeof(want), "%08x (chunk index)", entry.crc32.value_or(0));
-                            issues.Error(PackageErrorCode::ChunkChecksumMismatch, csite, buf, want);
-                            continue;
-                        }
-                    }
                     DecodedChunk decoded;
-                    if (!DecodeChunk(*bytes, entry, manifest, plan, field.heights_cm, field.attributes, written,
-                                     decoded, issues)) {
-                        continue;
+                    if (!LoadChunkFile(files, entry, manifest, plan, chunks[chunk_index], decoded, issues)) {
+                        return;
                     }
                     any_splat = any_splat || decoded.has_splat_a || decoded.has_splat_b;
                     if (plan.decode_client && (decoded.has_splat_a || decoded.has_splat_b)) {
@@ -1909,9 +2325,31 @@ std::optional<ServerWorldData> LoadServerWorld(const fs::path& package_root,
                                              " in every chunk");
                         }
                     }
+                };
+                if (!streaming) {
+                    for (std::size_t chunk_index = 0; chunk_index < manifest.chunks.size(); ++chunk_index) {
+                        load_chunk(chunk_index);
+                    }
+                } else {
+                    // Every chunk file must exist (and match the index size in
+                    // v3) at startup -- a missing chunk is a load error, never
+                    // free space; its CONTENT is validated when it is loaded.
+                    for (const auto& entry : manifest.chunks) {
+                        IssueSite csite{"chunk", entry.file};
+                        csite.chunk_x = static_cast<std::int32_t>(entry.x);
+                        csite.chunk_y = static_cast<std::int32_t>(entry.y);
+                        const auto size = files.Stat(entry.file, csite);
+                        if (!size) {
+                            continue;
+                        }
+                        ++report.chunks_checked;
+                        if (v3 && *size != entry.byte_size) {
+                            issues.Error(PackageErrorCode::ChunkSizeMismatch, csite,
+                                         "file is " + std::to_string(*size) + " bytes",
+                                         std::to_string(entry.byte_size) + " (chunk index)");
+                        }
+                    }
                 }
-                report.resident_terrain_bytes =
-                    field.heights_cm.size() * sizeof(std::int16_t) + field.attributes.size() * sizeof(std::uint16_t);
 
                 // ---- worldlogic ----
                 const LayerInfo* logic_layer = manifest.FindLayer(LayerKind::WorldLogic);
@@ -1921,15 +2359,44 @@ std::optional<ServerWorldData> LoadServerWorld(const fs::path& package_root,
                                                       IssueSite{"worldLogic"})) {
                         const std::size_t before = issues.ErrorCount();
                         if (ParseWorldLogic(*bytes, logic_layer->file, data.logic, issues)) {
-                            ValidateWorldLogic(data.logic, logic_layer->file, manifest.ExtentX(), manifest.ExtentY(),
-                                               issues);
-                            if (issues.ErrorCount() == 0) {
-                                ValidateWarpTargets(data.logic, logic_layer->file, field, issues);
-                            }
+                            ValidateWorldLogic(data.logic, logic_layer->file, geometry, issues, options.warp_policy);
                         }
                         logic_ok = issues.ErrorCount() == before;
                     }
                 }
+                if (streaming && logic_ok && issues.ErrorCount() == 0) {
+                    // Startup set: the chunks the cross-layer rules below and
+                    // the first player spawns need.
+                    const ServerTerrain probe(geometry, plan.encoding);
+                    std::vector<std::uint32_t> startup;
+                    auto add = [&](double x, double y) {
+                        const std::uint32_t index = probe.ChunkIndexOf(x, y);
+                        if (index != ServerTerrain::kNoChunk) {
+                            startup.push_back(index);
+                        }
+                    };
+                    for (const auto& spawn : data.logic.spawns) {
+                        add(spawn.bounds.CenterX(), spawn.bounds.CenterY());
+                    }
+                    for (const auto& warp : data.logic.warps) {
+                        add(warp.target_x, warp.target_y);
+                    }
+                    std::sort(startup.begin(), startup.end());
+                    startup.erase(std::unique(startup.begin(), startup.end()), startup.end());
+                    for (const std::uint32_t index : startup) {
+                        load_chunk(index);
+                    }
+                    data.startup_chunks = std::move(startup);
+                }
+                CheckChunkSeams(geometry, plan.encoding, chunks, manifest.chunks, issues);
+                data.terrain = ServerTerrain(geometry, plan.encoding, std::move(chunks));
+                report.resident_terrain_bytes = data.terrain.ResidentBytes();
+                if (logic_ok && issues.ErrorCount() == 0) {
+                    const std::size_t before = issues.ErrorCount();
+                    ValidateAgainstTerrain(data.logic, logic_layer->file, data.terrain, issues);
+                    logic_ok = issues.ErrorCount() == before;
+                }
+                data.chunk_source = std::make_shared<PackageChunkSource>(report.root, manifest, plan);
 
                 // ---- spawn table ----
                 // An optional table that is absent is skipped (documented); a
@@ -1943,10 +2410,32 @@ std::optional<ServerWorldData> LoadServerWorld(const fs::path& package_root,
                     } else if (const auto bytes = files.Read(spawn_layer->file, kMaxSpawnFileBytes,
                                                              IssueSite{"mobSpawns"})) {
                         const std::size_t before = issues.ErrorCount();
-                        ParseSpawns(*bytes, spawn_layer->file, manifest.ExtentX(), manifest.ExtentY(),
-                                    data.spawns, issues);
+                        ParseSpawns(*bytes, spawn_layer->file, geometry, spawn_layer->version,
+                                    data.logic, data.spawns, issues);
                         spawn_ok = issues.ErrorCount() == before;
                         data.spawn_layer_present = true;
+                    }
+                }
+
+                // ---- water capability (MAP-3) ----
+                // model = bodies <=> a waterBodies layer; the client MXWB
+                // layer (`water`) never counts as server water.
+                bool water_ok = false;
+                data.water.model = manifest.water_model;
+                data.water.sea_level_m = manifest.sea_level_m;
+                const LayerInfo* water_layer = manifest.FindLayer(LayerKind::WaterBodies);
+                const IssueSite wsite{"manifest", kManifestFile, "water"};
+                if (manifest.water_model == WaterModel::Bodies && water_layer == nullptr) {
+                    issues.Error(PackageErrorCode::WaterDeclInvalid, wsite, "water model bodies without a waterBodies layer",
+                                 "a declared waterBodies layer");
+                } else if (manifest.water_model != WaterModel::Bodies && water_layer != nullptr) {
+                    issues.Error(PackageErrorCode::WaterDeclInvalid, wsite,
+                                 std::string("waterBodies layer declared with water model ") +
+                                     ToString(manifest.water_model),
+                                 "water.model = bodies");
+                } else if (water_layer != nullptr) {
+                    if (const auto bytes = files.Read(water_layer->file, kMaxWaterBodiesBytes, IssueSite{"waterBodies"})) {
+                        water_ok = ParseWaterBodies(*bytes, water_layer->file, geometry, data.water.bodies, issues);
                     }
                 }
 
@@ -1972,6 +2461,9 @@ std::optional<ServerWorldData> LoadServerWorld(const fs::path& package_root,
                             issues.Info(PackageErrorCode::LayerSkipped, IssueSite{"mobSpawns", layer.file},
                                         "optional spawn table not present: no mob spawn points");
                         }
+                        break;
+                    case LayerKind::WaterBodies:
+                        layer.status = water_ok ? LayerStatus::Loaded : LayerStatus::Absent;
                         break;
                     case LayerKind::Water:
                         if (!layer.required && !files.Exists(layer.file)) {
@@ -2012,10 +2504,11 @@ std::optional<ServerWorldData> LoadServerWorld(const fs::path& package_root,
     return result;
 }
 
-PackageReport ValidatePackage(const fs::path& package_root)
+PackageReport ValidatePackage(const fs::path& package_root, WarpPolicy policy)
 {
     PackageReport report;
-    (void)LoadServerWorld(package_root, ValidationDepth::Full, report);
+    LoadOptions options; options.depth=ValidationDepth::Full; options.warp_policy=policy;
+    (void)LoadServerWorld(package_root, options, report);
     return report;
 }
 

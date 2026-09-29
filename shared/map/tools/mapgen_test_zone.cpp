@@ -165,10 +165,10 @@ int main(int argc, char** argv)
     spec.format_version = format;
     spec.world_id = "test_zone";
     spec.world_name = "IxtreemeWorld Test Zone";
-    spec.size_cells = kWorldSizeCells;
+    spec.size_cells_x = kWorldSizeCells;
     spec.cell_size_m = kCellSizeMeters;
     spec.chunk_size_cells = kChunkSizeCells;
-    spec.height_cm = [](std::uint32_t vx, std::uint32_t vy) {
+    spec.height_raw = [](std::uint32_t vx, std::uint32_t vy) -> std::int32_t {
         return HeightCm(static_cast<float>(vx) * kCellSizeMeters, static_cast<float>(vy) * kCellSizeMeters);
     };
     spec.attributes = [](std::uint32_t cx, std::uint32_t cy) -> std::uint16_t {

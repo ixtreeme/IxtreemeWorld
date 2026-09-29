@@ -205,8 +205,9 @@ MigrationOutcome MigrationCoordinator::MigratePlayer(Zone& source_zone,
         return MigrationOutcome::DroppedStale;
     }
     const auto position = entity.get<Position>();
+    const bool warp = entity.has<WarpState>() && entity.get<WarpState>().transfer_pending;
     if (zones_.FindIndexForPosition(position.x, position.y) != target_zone_index ||
-        DistanceOutsideRect(source_zone.Bounds(), position) <= kMigrationHysteresisMeters) {
+        (!warp && DistanceOutsideRect(source_zone.Bounds(), position) <= kMigrationHysteresisMeters)) {
         entity.set<MigrateTo>({0});
         return MigrationOutcome::DroppedStale;
     }
@@ -233,7 +234,10 @@ MigrationOutcome MigrationCoordinator::MigratePlayer(Zone& source_zone,
     source_zone.RefreshResidentCounts();
 
     // Stage 5: apply at the destination, with deterministic recovery.
-    transfer.position.z = terrain_.SampleGroundHeight(transfer.position.x, transfer.position.y);
+    // Unknown height (outside / not resident) keeps the entity's own z.
+    if (const auto ground = terrain_.Height(transfer.position.x, transfer.position.y); ground.Ok()) {
+        transfer.position.z = ground.meters;
+    }
     try {
         auto new_entity = ApplyTransfer(target_zone.World(), transfer);
         target_zone.IndexEntity(net_id, new_entity);
@@ -319,7 +323,10 @@ MigrationOutcome MigrationCoordinator::MigrateMob(Zone& source_zone,
     source_zone.EraseMobRng(net_id);
     source_zone.RefreshResidentCounts();
 
-    transfer.position.z = terrain_.SampleGroundHeight(transfer.position.x, transfer.position.y);
+    // Unknown height (outside / not resident) keeps the entity's own z.
+    if (const auto ground = terrain_.Height(transfer.position.x, transfer.position.y); ground.Ok()) {
+        transfer.position.z = ground.meters;
+    }
     try {
         auto new_entity = ApplyTransfer(target_zone.World(), transfer);
         target_zone.IndexEntity(net_id, new_entity);

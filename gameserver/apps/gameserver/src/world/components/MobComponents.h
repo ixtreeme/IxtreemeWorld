@@ -16,6 +16,7 @@ struct MobTypeRef {
 
 struct MobSpawnRef {
     std::size_t spawn_point_index = 0;
+    std::uint32_t spawn_id = 0; // immutable package identity, independent of zone/chunk
 };
 
 struct MobProfile {

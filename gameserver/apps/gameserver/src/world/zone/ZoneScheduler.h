@@ -5,6 +5,7 @@
 #include <functional>
 #include <memory>
 #include <vector>
+#include <atomic>
 
 // Decides WHEN each zone ticks. Gameplay-agnostic: it only looks at resident
 // counts, pending commands and tick deadlines, then hands due zones to the
@@ -16,6 +17,7 @@ class ZoneManager;
 class ZoneWorkerPool;
 struct ZonePartition;
 struct ActivityGrid;
+struct ActivityWakeFrame;
 
 class ZoneScheduler {
 public:
@@ -64,7 +66,16 @@ public:
                       std::chrono::steady_clock::time_point now,
                       const std::shared_ptr<const ActivityGrid>& activity,
                       float wake_radius_m,
-                      const DueHook& before_dispatch = {});
+                      const DueHook& before_dispatch = {},
+                      const std::shared_ptr<const ActivityWakeFrame>& phase_input = {});
+
+    // Supervisor only. The last acquired publication mutex is the input cut:
+    // all earlier completed commits are included; later commits belong to the
+    // next phase. Exposed for deterministic phase-order tests, never from audit.
+    std::shared_ptr<const ActivityWakeFrame> CaptureWakeInput(ZoneManager& zones,float radius);
+    std::shared_ptr<const ActivityWakeFrame> WakeDecision() const { return wake_decision_; }
+    struct WakeMetrics { std::uint64_t inputs=0,sources=0,capture_us=0,decision_age_us=0,max_decision_age_us=0; };
+    WakeMetrics GetWakeMetrics() const { return {wake_inputs_.load(),wake_sources_.load(),wake_capture_us_.load(),wake_age_us_.load(),wake_age_max_us_.load()}; }
 
     // Structured split gate: which condition blocks a split right now. The
     // monitor uses it for why-not diagnostics; ShouldSplit is exactly
@@ -127,20 +138,24 @@ public:
         std::uint64_t cas_failures = 0;   // zone already ticking (guarded)
         std::uint64_t schedule_micros = 0;
     };
-    const Counters& GetCounters() const noexcept
+    Counters GetCounters() const noexcept
     {
-        return counters_;
+        return {counters_.waves.load(),counters_.due_zones.load(),counters_.enqueued.load(),
+                counters_.sleeping_skips.load(),counters_.cas_failures.load(),counters_.schedule_micros.load()};
     }
     Counters TakeCounters() noexcept
     {
-        Counters taken = counters_;
-        counters_ = Counters{};
-        return taken;
+        return {counters_.waves.exchange(0),counters_.due_zones.exchange(0),counters_.enqueued.exchange(0),
+                counters_.sleeping_skips.exchange(0),counters_.cas_failures.exchange(0),counters_.schedule_micros.exchange(0)};
     }
 
 private:
+    std::shared_ptr<const ActivityWakeFrame> wake_input_, wake_decision_;
+    std::atomic<std::uint64_t> wake_inputs_{0},wake_sources_{0},wake_capture_us_{0},wake_age_us_{0},wake_age_max_us_{0};
     bool lod_enabled_ = true;
-    Counters counters_;
+    struct AtomicCounters {
+        std::atomic<std::uint64_t> waves{0},due_zones{0},enqueued{0},sleeping_skips{0},cas_failures{0},schedule_micros{0};
+    } counters_;
 };
 
 } // namespace gs::game

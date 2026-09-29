@@ -206,7 +206,9 @@ void ZoneLoadMonitor::Update(ZoneManager& zones,
     }
     merge_groups_.reserve(internal_nodes.size());
     for (ZonePartition* parent : internal_nodes) {
-        if (parent->children.size() != 4) {
+        // A region root (zone id 0) is never a merge target, whatever its
+        // child count (a 2x2 initial-leaf region has exactly four children).
+        if (parent->parent == nullptr || parent->children.size() != 4) {
             continue; // quadtree groups only; the executor re-validates
         }
         MergeGroupSnapshot group;

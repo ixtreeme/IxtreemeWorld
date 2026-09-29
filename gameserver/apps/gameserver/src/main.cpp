@@ -25,7 +25,9 @@
 #include "network/Server.h"
 
 #include "GameConnectionHandler.h"
+#include "world/WorldConstants.h"
 #include "world/WorldRuntime.h"
+#include "world/debug/I1LocalObservation.h"
 
 namespace {
 
@@ -35,6 +37,7 @@ struct AppOptions {
     // World selection overrides (MAP-1). CLI paths are relative to the
     // working directory at launch and made absolute immediately.
     std::optional<std::string> world_mode;
+    std::optional<std::string> warp_policy;
     std::optional<std::filesystem::path> world_package;
     std::optional<std::filesystem::path> mob_types_config;
     std::optional<std::filesystem::path> validate_package; // offline check, then exit
@@ -45,7 +48,7 @@ struct AppOptions {
 {
     std::cerr << "Usage: gameserver [--config path] [--database-config path]\n"
                  "                  [--world-mode file|synthetic] [--world-package dir] [--mob-types path]\n"
-                 "                  [--startup-check]\n"
+                 "                  [--warp-policy strict|legacy] [--startup-check]\n"
                  "       gameserver --validate-world-package dir [--mob-types path] [--config path]\n";
     std::exit(1);
 }
@@ -60,6 +63,8 @@ AppOptions ParseArgs(int argc, char* argv[])
             options.config_path = argv[++i];
         } else if (arg == "--database-config" && has_value) {
             options.database_config_path = argv[++i];
+        } else if (arg == "--warp-policy" && has_value) {
+            options.warp_policy = argv[++i];
         } else if (arg == "--world-mode" && has_value) {
             options.world_mode = argv[++i];
         } else if (arg == "--world-package" && has_value) {
@@ -91,6 +96,11 @@ struct WorldPlan {
     std::filesystem::path mob_types;
     std::string mob_types_source;
     gs::game::WorldRuntime::SyntheticWorldConfig synthetic_config;
+    gs::game::PartitionLayout layout; // file mode: initial partition over the package bounds
+    // MAP-3 terrain residency (file mode) + movement collision rules.
+    mx::map::ResidencyMode residency = mx::map::ResidencyMode::Eager;
+    gs::game::TerrainStreamingConfig streaming;
+    gs::game::MovementRules movement;
     std::string error;
 };
 
@@ -110,6 +120,30 @@ std::optional<std::string> NonEmpty(const gs::common::Config& config, const char
     return value;
 }
 
+// "<x>x<y>" with 1 <= x, y <= max_per_axis (e.g. "2x2").
+bool ParseGrid(const std::string& text, std::uint32_t max_per_axis, std::uint32_t& x, std::uint32_t& y)
+{
+    const auto sep = text.find('x');
+    if (sep == std::string::npos || sep == 0 || sep + 1 >= text.size()) {
+        return false;
+    }
+    try {
+        std::size_t used_x = 0;
+        std::size_t used_y = 0;
+        const int vx = std::stoi(text.substr(0, sep), &used_x);
+        const int vy = std::stoi(text.substr(sep + 1), &used_y);
+        const int max = static_cast<int>(max_per_axis);
+        if (used_x != sep || used_y != text.size() - sep - 1 || vx < 1 || vy < 1 || vx > max || vy > max) {
+            return false;
+        }
+        x = static_cast<std::uint32_t>(vx);
+        y = static_cast<std::uint32_t>(vy);
+        return true;
+    } catch (const std::exception&) {
+        return false;
+    }
+}
+
 WorldPlan ResolveWorldPlan(const AppOptions& options,
                            const gs::common::Config& config,
                            const std::filesystem::path& config_dir)
@@ -121,6 +155,28 @@ WorldPlan ResolveWorldPlan(const AppOptions& options,
         return plan;
     }
     plan.synthetic = mode == "synthetic";
+    // Initial partition (MAP-2): regions over the loaded world bounds and the
+    // initial leaves per region; checked against the real bounds once the
+    // package is loaded (still before DB and network).
+    // Synthetic worlds default to one region (their zone grid is the leaf
+    // grid); an explicit partition_regions must divide that grid.
+    const auto configured_regions = NonEmpty(config, "partition_regions");
+    const auto configured_leaves = NonEmpty(config, "partition_initial_leaves");
+    const std::string regions = configured_regions.value_or(plan.synthetic ? "1x1" : "2x2");
+    const std::string leaves = configured_leaves.value_or("1x1");
+    if (plan.synthetic && configured_leaves && *configured_leaves != "1x1") {
+        plan.error = "partition_initial_leaves does not apply to world_mode=synthetic "
+                     "(synthetic_zones_x/synthetic_zones_y is the leaf grid)";
+        return plan;
+    }
+    if (!ParseGrid(regions, 16, plan.layout.regions_x, plan.layout.regions_y)) {
+        plan.error = "partition_regions '" + regions + "' is not <x>x<y> with 1..16 per axis";
+        return plan;
+    }
+    if (!ParseGrid(leaves, 64, plan.layout.leaves_x, plan.layout.leaves_y)) {
+        plan.error = "partition_initial_leaves '" + leaves + "' is not <x>x<y> with 1..64 per axis";
+        return plan;
+    }
     if (options.mob_types_config) {
         plan.mob_types = *options.mob_types_config;
         plan.mob_types_source = "cli";
@@ -141,14 +197,30 @@ WorldPlan ResolveWorldPlan(const AppOptions& options,
         }
         const int zx = config.GetInt("synthetic_zones_x").value_or(2);
         const int zy = config.GetInt("synthetic_zones_y").value_or(2);
-        if (!(plan.synthetic_config.extent_m >= 500.0f && plan.synthetic_config.extent_m <= 1000000.0f) ||
+        // [0, extent) must stay inside the f32-precise world coordinate range
+        // (the same rule as a package world).
+        const float max_extent = static_cast<float>(mx::map::kMaxWorldCoordinate);
+        if (!(plan.synthetic_config.extent_m >= 500.0f && plan.synthetic_config.extent_m <= max_extent) ||
             zx < 1 || zy < 1 || zx > 64 || zy > 64) {
-            plan.error = "synthetic world needs 500 <= synthetic_extent_m <= 1000000 and 1..64 zones per axis";
+            plan.error = "synthetic world needs 500 <= synthetic_extent_m <= " + std::to_string(max_extent) +
+                         " and 1..64 zones per axis";
             return plan;
         }
         plan.synthetic_config.zones_x = static_cast<std::uint32_t>(zx);
         plan.synthetic_config.zones_y = static_cast<std::uint32_t>(zy);
         plan.synthetic_config.mob_types_config = plan.mob_types.string();
+        // Synthetic: the zone grid is the leaf grid; partition_regions groups it.
+        if (static_cast<std::uint32_t>(zx) % plan.layout.regions_x != 0 ||
+            static_cast<std::uint32_t>(zy) % plan.layout.regions_y != 0) {
+            plan.error = "synthetic zone grid " + std::to_string(zx) + "x" + std::to_string(zy) +
+                         " is not divisible by partition_regions " + regions;
+            return plan;
+        }
+        plan.synthetic_config.regions_x = plan.layout.regions_x;
+        plan.synthetic_config.regions_y = plan.layout.regions_y;
+        // The same initial partition the runtime will build (startup check).
+        plan.layout.leaves_x = static_cast<std::uint32_t>(zx) / plan.layout.regions_x;
+        plan.layout.leaves_y = static_cast<std::uint32_t>(zy) / plan.layout.regions_y;
         return plan;
     }
     if (options.world_package) {
@@ -249,30 +321,61 @@ void LogWorldStartupSummary(gs::game::WorldRuntime& sim,
         layers += std::string(mx::map::ToString(layer.kind)) + ":" + mx::map::ToString(layer.status) + "/" +
                   mx::map::ToString(layer.audience) + (layer.required ? "/required" : "/optional");
     }
-    LOG_INFO("World startup summary: mode=file world_id={} name='{}' format=v{} path={} bounds=(0,0)-({},{})m "
-             "origin=({},{}) cell={}m height_unit=cm chunks={}x{} of {} cells layers=[{}] validation=startup",
+    const auto& enc = m.height_encoding;
+    LOG_INFO("World startup summary: mode=file world_id={} name='{}' format=v{} path={} bounds=[({},{}),({},{}))m "
+             "half-open, axes +X east +Y north +Z up, cell={}m cells={}x{} height=v{} {} x {}m + {}m "
+             "([{},{}]m) chunks={}x{} of {} cells (last may be partial) layers=[{}] validation=startup",
              m.world_id,
              m.world_name,
              m.format_version,
              report.root.string(),
-             m.ExtentX(),
-             m.ExtentY(),
              m.origin_x,
              m.origin_y,
+             m.origin_x + m.ExtentX(),
+             m.origin_y + m.ExtentY(),
              m.cell_size_m,
+             m.size_cells_x,
+             m.size_cells_y,
+             enc.layer_version,
+             enc.int32_samples ? "int32" : "int16",
+             enc.meters_per_unit,
+             enc.offset_m,
+             enc.MinMeters(),
+             enc.MaxMeters(),
              m.chunk_grid_x,
              m.chunk_grid_y,
              m.chunk_size_cells,
              layers);
-    LOG_INFO("World startup summary: load=eager-resident files={} bytes={} chunks={} load_ms={:.1f} "
-             "resident_terrain={}KB runtime_io=none (whole terrain resident; streaming + budgets arrive with "
-             "MAP-3) spawn_points={} mob_types={} regions={} leaf_zones={} zone_slots={} workers={} "
-             "issues: {} warning(s), {} info",
+    const auto terrain_stats = sim.GetTerrainStats();
+    if (terrain_stats.streaming) {
+        const auto& s = terrain_stats.streamer;
+        LOG_INFO("World startup summary: terrain residency=streaming budget={}KB accounted={}KB (resident {}KB, "
+                 "metadata {}KB) resident_chunks={}/{} pinned={} io_threads={} max_in_flight={} retain={}s; chunks "
+                 "load on demand (movement, spawns, navigation), validated on load (CRC + decode + seams)",
+                 s.budget_bytes / 1024,
+                 s.accounted_bytes / 1024,
+                 s.resident_bytes / 1024,
+                 s.metadata_bytes / 1024,
+                 s.resident,
+                 s.chunks_total,
+                 s.pinned,
+                 plan.streaming.io_threads,
+                 plan.streaming.max_in_flight,
+                 plan.streaming.retain_seconds);
+    }
+    LOG_INFO("World startup summary: load={} files={} bytes={} chunks={} decoded={} load_ms={:.1f} "
+             "resident_terrain={}KB water={} movement: max_slope={} max_water_depth_m={} spawn_points={} "
+             "mob_types={} regions={} leaf_zones={} zone_slots={} workers={} issues: {} warning(s), {} info",
+             terrain_stats.streaming ? "streaming" : "eager-resident",
              report.files_read,
              report.bytes_read,
              report.chunks_checked,
+             report.chunks_decoded,
              report.elapsed_ms,
              report.resident_terrain_bytes / 1024,
+             mx::map::ToString(report.manifest.water_model),
+             plan.movement.max_slope,
+             plan.movement.max_water_depth_m,
              spawn_points,
              mob_types,
              topology.regions,
@@ -283,6 +386,19 @@ void LogWorldStartupSummary(gs::game::WorldRuntime& sim,
              report.Count(mx::map::IssueSeverity::Info));
 }
 
+// One policy parser for real startup, startup-check and offline validation.
+// An explicitly empty/unknown value is invalid, never a fallback.
+std::optional<mx::map::WarpPolicy> ResolveWarpPolicy(const AppOptions& options, const gs::common::Config& config)
+{
+    const auto value=options.warp_policy.value_or(config.GetString("warp_policy").value_or("strict"));
+    if(value!="strict" && value!="legacy") {
+        std::cerr << "Fatal: warp_policy '" << value << "' is not 'strict' or 'legacy'\n";
+        return std::nullopt;
+    }
+    std::cout << "World warp policy=" << value << " (CLI > config > strict default)\n";
+    return value=="strict" ? mx::map::WarpPolicy::Strict : mx::map::WarpPolicy::Legacy;
+}
+
 // Offline validator: every layer of the package at Full depth (plus the
 // server's mob type cross-check when a registry is known). No DB, no network,
 // no world runtime. Exit 0 = valid, 3 = invalid.
@@ -291,6 +407,8 @@ int RunValidateOnly(const AppOptions& options)
     gs::common::InitLogging("warn", {});
     gs::common::Config config;
     const bool config_loaded = config.Load(options.config_path);
+    const auto warp_policy=ResolveWarpPolicy(options,config);
+    if(!warp_policy) return 2;
     std::filesystem::path mob_types;
     if (options.mob_types_config) {
         mob_types = *options.mob_types_config;
@@ -301,9 +419,10 @@ int RunValidateOnly(const AppOptions& options)
               << (mob_types.empty() ? ", no mob type registry: spawn type cross-check skipped" : "") << ")\n";
     mx::map::PackageReport report;
     if (mob_types.empty()) {
-        report = mx::map::ValidatePackage(*options.validate_package);
+        report = mx::map::ValidatePackage(*options.validate_package,*warp_policy);
     } else {
         gs::game::WorldLoadRequest request{*options.validate_package, mob_types, mx::map::ValidationDepth::Full};
+        request.warp_policy=*warp_policy;
         (void)gs::game::LoadWorldPackage(request, report);
     }
     PrintPackageReport(report);
@@ -338,6 +457,45 @@ gs::game::RuntimeIdentity ResolveRuntimeIdentity(const gs::common::Config& confi
     identity.node = gs::game::NodeId{static_cast<std::uint32_t>(std::max(0, node))};
     identity.process = gs::game::ProcessId{static_cast<std::uint32_t>(std::max(0, process))};
     return identity;
+}
+
+double GetDoubleOr(const gs::common::Config& config, const char* key, double fallback);
+
+// MAP-3 terrain residency + movement rules. Returns false with plan.error for
+// an unusable value (strict: no silent fallback for world data settings).
+bool ResolveTerrainConfig(const gs::common::Config& config, WorldPlan& plan)
+{
+    const std::string residency = NonEmpty(config, "terrain_residency").value_or("eager");
+    if (residency == "eager") {
+        plan.residency = mx::map::ResidencyMode::Eager;
+    } else if (residency == "streaming") {
+        plan.residency = mx::map::ResidencyMode::Streaming;
+    } else {
+        plan.error = "terrain_residency '" + residency + "' is not 'eager' or 'streaming'";
+        return false;
+    }
+    const double budget_mb = GetDoubleOr(config, "terrain_cache_budget_mb", 256.0);
+    const auto io_threads = config.GetInt("terrain_io_threads").value_or(2);
+    const auto in_flight = config.GetInt("terrain_max_in_flight").value_or(32);
+    const double retain = GetDoubleOr(config, "terrain_retain_seconds", 5.0);
+    if (!(budget_mb >= 0.01 && budget_mb <= 1048576.0) || io_threads < 1 || io_threads > 16 || in_flight < 1 ||
+        in_flight > 4096 || !(retain >= 0.0 && retain <= 3600.0)) {
+        plan.error = "terrain streaming needs 0.01 <= terrain_cache_budget_mb <= 1048576, 1 <= terrain_io_threads <= 16, "
+                     "1 <= terrain_max_in_flight <= 4096, 0 <= terrain_retain_seconds <= 3600";
+        return false;
+    }
+    plan.streaming.budget_bytes = static_cast<std::size_t>(budget_mb * 1048576.0);
+    plan.streaming.io_threads = static_cast<std::uint32_t>(io_threads);
+    plan.streaming.max_in_flight = static_cast<std::uint32_t>(in_flight);
+    plan.streaming.retain_seconds = retain;
+    plan.movement.max_slope = static_cast<float>(GetDoubleOr(config, "movement_max_slope", 0.0));
+    plan.movement.max_water_depth_m = static_cast<float>(GetDoubleOr(config, "movement_max_water_depth_m", -1.0));
+    if (!(plan.movement.max_slope >= 0.0f && plan.movement.max_slope <= 100.0f) ||
+        !(plan.movement.max_water_depth_m <= 10000.0f)) {
+        plan.error = "movement_max_slope must be 0 (off) .. 100 and movement_max_water_depth_m < 0 (off) .. 10000";
+        return false;
+    }
+    return true;
 }
 
 double GetDoubleOr(const gs::common::Config& config, const char* key, double fallback)
@@ -622,6 +780,9 @@ int main(int argc, char* argv[])
             config.GetString("game_server").value_or("127.0.0.1:" + std::to_string(port));
         const auto log_level = config.GetString("log_level").value_or("info");
         const auto log_file = config.GetString("log_file").value_or("logs/gameserver.log");
+        std::optional<gs::game::I1ObservationFilter> i1_observation;
+        if (const auto value = config.GetString("i1_local_observe_characters"))
+            i1_observation = gs::game::ParseI1ObservationFilter(*value);
 
         gs::common::InitLogging(log_level, log_file);
         if (!loaded) {
@@ -632,7 +793,12 @@ int main(int argc, char* argv[])
         // anything with side effects exists (no DB connection, no listener, no
         // runtime). A rejected package ends the process here -- there is no
         // flat/fallback world.
-        const WorldPlan plan = ResolveWorldPlan(options, config, config_dir);
+        const auto warp_policy=ResolveWarpPolicy(options,config);
+        if(!warp_policy) return 2;
+        WorldPlan plan = ResolveWorldPlan(options, config, config_dir);
+        if (plan.error.empty()) {
+            (void)ResolveTerrainConfig(config, plan);
+        }
         if (!plan.error.empty()) {
             LOG_ERROR("World configuration invalid: {}", plan.error);
             std::cerr << "Fatal: world configuration invalid: " << plan.error << '\n';
@@ -647,7 +813,8 @@ int main(int argc, char* argv[])
                      plan.mob_types_source);
             mx::map::PackageReport report;
             loaded_world = gs::game::LoadWorldPackage(
-                gs::game::WorldLoadRequest{plan.package, plan.mob_types, mx::map::ValidationDepth::Startup},
+                gs::game::WorldLoadRequest{plan.package, plan.mob_types, mx::map::ValidationDepth::Startup,
+                                           plan.residency, *warp_policy},
                 report);
             gs::game::LogPackageReport(report);
             if (!loaded_world) {
@@ -667,6 +834,51 @@ int main(int argc, char* argv[])
                      plan.synthetic_config.zones_x,
                      plan.synthetic_config.zones_y,
                      plan.mob_types.empty() ? std::string("none") : plan.mob_types.string());
+        }
+        // The initial partition must fit the world bounds (still before DB
+        // and network, both modes): aggregate bootstrap cap, every initial
+        // leaf >= the AOI safety floor.
+        {
+            const gs::game::WorldBounds bounds =
+                plan.synthetic ? gs::game::WorldBounds::FromExtent(plan.synthetic_config.extent_m)
+                               : gs::game::TerrainService::BoundsOf(loaded_world->terrain);
+            gs::game::InitialPartition partition;
+            std::string layout_error;
+            if (!gs::game::BuildInitialPartition(bounds, plan.layout, 2.0f * gs::game::kAoiRadiusMeters,
+                                                 partition, layout_error)) {
+                LOG_ERROR("Partition layout invalid for this world: {}", layout_error);
+                std::cerr << "Fatal: partition layout invalid for this world: " << layout_error << '\n';
+                return 2;
+            }
+            std::string region_list;
+            for (std::size_t i = 0; i < partition.regions.size() && i < 16; ++i) {
+                const auto& r = partition.regions[i];
+                region_list += fmt::format("{}{} [({},{}),({},{}))", i == 0 ? "" : ", ", r.name, r.bounds.min_x,
+                                           r.bounds.min_y, r.bounds.max_x, r.bounds.max_y);
+            }
+            if (partition.regions.size() > 16) {
+                region_list += fmt::format(", ... {} more", partition.regions.size() - 16);
+            }
+            LOG_INFO("Initial partition: {} region(s) x {} initial leaf zone(s) over bounds [({}, {}),({}, {})) "
+                     "from partition_regions/partition_initial_leaves: {}",
+                     partition.regions.size(),
+                     partition.leaves.size(),
+                     bounds.min_x,
+                     bounds.min_y,
+                     bounds.max_x,
+                     bounds.max_y,
+                     region_list);
+            // Aggregate bootstrap resources against their enforced caps.
+            LOG_INFO("Bootstrap resources: initial_zones={} (cap {}) world={}x{}m (coordinates within +-{}m) "
+                     "terrain_resident={}KB in {} chunk(s) (cap {} height samples)",
+                     partition.leaves.size(),
+                     gs::game::kMaxInitialLeafZones,
+                     bounds.ExtentX(),
+                     bounds.ExtentY(),
+                     mx::map::kMaxWorldCoordinate,
+                     plan.synthetic ? 0 : loaded_world->terrain.ResidentBytes() / 1024,
+                     plan.synthetic ? 0 : loaded_world->terrain.ChunkCount(),
+                     mx::map::kMaxResidentCells);
         }
 
         if (sodium_init() < 0) {
@@ -697,7 +909,8 @@ int main(int argc, char* argv[])
             mob_type_count = loaded_world->mob_type_count;
         }
         auto sim_ptr = loaded_world
-                           ? std::make_unique<gs::game::WorldRuntime>(io, runtime_identity, std::move(*loaded_world))
+                           ? std::make_unique<gs::game::WorldRuntime>(io, runtime_identity, std::move(*loaded_world),
+                                                                      plan.layout, plan.streaming)
                            : std::make_unique<gs::game::WorldRuntime>(io, runtime_identity, plan.synthetic_config);
         loaded_world.reset();
         gs::game::WorldRuntime& sim = *sim_ptr;
@@ -709,6 +922,20 @@ int main(int argc, char* argv[])
         sim.ConfigurePartition(ResolvePartitionConfig(config));
         sim.ConfigureSimulationLod(ResolveLodConfig(config));
         sim.ConfigureLoadField(ResolveLoadFieldConfig(config));
+        sim.ConfigureMovementRules(plan.movement);
+        {
+            // MAP-3: the permanently resident startup set (player spawn region
+            // centres, warp targets) must fit the terrain budget.
+            const auto terrain = sim.GetTerrainStats();
+            if (terrain.streaming && terrain.streamer.accounted_bytes > terrain.streamer.budget_bytes) {
+                LOG_ERROR("Terrain budget too small: the startup residency needs {} B, terrain_cache_budget_mb "
+                          "allows {} B",
+                          terrain.streamer.accounted_bytes, terrain.streamer.budget_bytes);
+                std::cerr << "Fatal: terrain_cache_budget_mb below the startup residency\n";
+                sim.Stop();
+                return 2;
+            }
+        }
         sim.Start();
         LogWorldStartupSummary(sim, plan, world_report, spawn_point_count, mob_type_count);
 
@@ -767,6 +994,8 @@ int main(int argc, char* argv[])
         }
 
         std::vector<std::thread> io_workers;
+        gs::game::I1LocalObservation i1_observer;
+        if (i1_observation) i1_observer.Start(sim, *i1_observation);
         io_workers.reserve(io_threads > 0 ? io_threads - 1 : 0);
         for (std::uint32_t i = 1; i < io_threads; ++i) {
             io_workers.emplace_back([&io] {
@@ -781,6 +1010,7 @@ int main(int argc, char* argv[])
             }
         }
 
+        i1_observer.Stop();
         sim.Stop();
         db_pool.Stop();
         LOG_INFO("GameServer shutting down cleanly");

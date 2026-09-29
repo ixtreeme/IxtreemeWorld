@@ -14,6 +14,8 @@ struct MobSpawnPoint {
     float y = 0.0f;
     std::uint32_t count = 0;
     float radius = 0.0f;
+    std::uint32_t spawn_id = 0;
+    std::uint32_t area_id = 0;
 };
 
 class SpawnLoader {

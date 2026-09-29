@@ -24,6 +24,8 @@ capnp_generate_cpp(MAP_CAPNP_SRCS MAP_CAPNP_HDRS ${MAP_SCHEMA_FILES})
 add_library(mapdata STATIC
     ${MAP_CAPNP_SRCS}
     src/MapData.cpp
+    src/ServerTerrain.cpp
+    src/ServerWater.cpp
     src/WorldPackage.cpp
     src/WorldPackageWriter.cpp
 )

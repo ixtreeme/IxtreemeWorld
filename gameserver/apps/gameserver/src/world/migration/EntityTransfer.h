@@ -11,6 +11,7 @@
 #include "../components/MigrationComponents.h"
 #include "../components/MobComponents.h"
 #include "../components/MovementComponents.h"
+#include "../components/WarpState.h"
 #include "../components/NetworkComponents.h"
 #include "../components/SimulationLod.h"
 #include "../components/TransformComponents.h"
@@ -59,6 +60,7 @@ struct EntityTransfer {
     Velocity velocity;
     MoveIntent move_intent;
     MoveSpeed move_speed;
+    WarpState warp_state;
     Hp hp;
     CombatStats combat_stats;
     AttackCooldown attack_cooldown;
@@ -67,6 +69,7 @@ struct EntityTransfer {
     WanderState wander;
     std::uint32_t mob_type_id = 0;
     std::size_t spawn_point_index = 0;
+    std::uint32_t spawn_id = 0;
     MobProfile profile;
     // Simulation LOD state rides along so split/merge/migration never lose
     // tier, schedule or relevance history. Players never carry it (implicit

@@ -34,7 +34,11 @@ void AddIssue(mx::map::PackageReport& report,
 
 std::optional<LoadedWorld> LoadWorldPackage(const WorldLoadRequest& request, mx::map::PackageReport& report)
 {
-    auto data = mx::map::LoadServerWorld(request.package_root, request.depth, report);
+    mx::map::LoadOptions options;
+    options.depth = request.depth;
+    options.residency = request.residency;
+    options.warp_policy = request.warp_policy;
+    auto data = mx::map::LoadServerWorld(request.package_root, options, report);
 
     // Server startup data: the mob type registry the spawn table refers to.
     std::error_code ec;
@@ -66,12 +70,17 @@ std::optional<LoadedWorld> LoadWorldPackage(const WorldLoadRequest& request, mx:
             continue;
         }
         world.spawn_points.push_back(
-            MobSpawnPoint{record.mob_type_id, record.x, record.y, record.count, record.radius});
+            MobSpawnPoint{record.mob_type_id, record.x, record.y, record.count, record.radius,
+                          record.spawn_id, record.area_id});
     }
     if (!report.Ok()) {
         return std::nullopt;
     }
     world.terrain = std::move(data->terrain);
+    world.residency = data->residency;
+    world.chunk_source = std::move(data->chunk_source);
+    world.startup_chunks = std::move(data->startup_chunks);
+    world.water = std::move(data->water);
     world.logic = std::move(data->logic);
     world.mob_types_config = types_path.string();
     world.mob_type_count = registry.Size();

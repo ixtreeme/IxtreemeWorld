@@ -28,7 +28,10 @@ namespace gs::game {
 
 class ZoneManager {
 public:
-    void BuildFromWorldLogic(const mx::map::WorldLogic& logic, float fallback_extent);
+    // Initial topology (MAP-2): one partition root per region, one depth-1
+    // leaf zone per initial leaf; zone ids 1..N allocated here (the map's
+    // AreaIds are a separate namespace). The leaves tile every region.
+    void BuildInitialPartition(const InitialPartition& partition);
     void Clear();
 
     std::size_t ZoneCount() const noexcept
@@ -46,8 +49,9 @@ public:
 
     // Returns ZoneCount() when not found (matches old FindZone* semantics).
     std::size_t FindIndexById(ZoneId id) const;
-    // Tree descent over active leaves (O(depth)), linear fallback over
-    // simulating zones for positions outside the partition forest.
+    // (MAP-2) no linear fallback: the regions tile the world.
+    // Half-open tree descent over the active leaves (O(depth)); ZoneCount()
+    // for a point outside every region (outside the world).
     std::size_t FindIndexForPosition(float world_x, float world_y) const;
 
     // Partition forest: one root per region. Supervisor only.

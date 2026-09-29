@@ -1,5 +1,7 @@
 #include "Zone.h"
+#include "../activity/WakeCaptureProfile.h"
 
+#include <algorithm>
 #include <cassert>
 #include <exception>
 
@@ -87,21 +89,59 @@ Zone::PlayerBinding* Zone::FindPlayerBySession(gs::common::SessionId session_id)
 
 void Zone::InsertPlayerBinding(std::uint32_t net_id, PlayerBinding binding)
 {
+    wake_profile::CommitLock lock(activity_mutex_);
     assert(players_.find(net_id) == players_.end());
     const auto session_id = binding.session ? binding.session->Id() : 0;
     if (session_id != 0) {
         net_by_session_[session_id] = net_id;
     }
     players_[net_id] = std::move(binding);
+    diagnostics_.player_count.store(static_cast<std::uint32_t>(players_.size()),std::memory_order_relaxed);
+    const auto entity=FindEntity(net_id);
+    assert(entity.is_valid() && entity.has<Position>());
+    if (entity.is_valid() && entity.has<Position>()) UpsertActivitySourceLocked(net_id,entity.get<Position>());
+}
+
+void Zone::UpsertActivitySourceLocked(std::uint32_t net_id,const Position& position)
+{
+    auto found=std::find_if(activity_sources_.begin(),activity_sources_.end(),
+        [net_id](const auto& value){return value.net_id==net_id;});
+    if (found!=activity_sources_.end() && found->x==position.x && found->y==position.y) return;
+    const auto sequence=++activity_revision_;
+    const auto stamp=static_cast<std::uint64_t>(std::chrono::duration_cast<std::chrono::nanoseconds>(
+        std::chrono::steady_clock::now().time_since_epoch()).count());
+    const auto pending=found!=activity_sources_.end() && found->pending_since_ns ? found->pending_since_ns : stamp;
+    PlayerInfluenceSource value{net_id,position.x,position.y,id_,zone_tick_,sequence,stamp,world_tick_,pending};
+    if(found==activity_sources_.end()) activity_sources_.push_back(value); else *found=value;
+}
+
+void Zone::CommitPlayerPosition(flecs::entity entity,std::uint32_t net_id,const Position& position)
+{
+    AssertZoneOwner(*this,"player position and wake publication commit");
+    wake_profile::CommitLock lock(activity_mutex_);
+    entity.set<Position>(position);
+    UpsertActivitySourceLocked(net_id,position);
 }
 
 Zone::PlayerBinding Zone::ExtractPlayerBinding(std::uint32_t net_id)
 {
+    wake_profile::CommitLock lock(activity_mutex_);
     PlayerBinding binding;
     const auto it = players_.find(net_id);
     if (it != players_.end()) {
         binding = std::move(it->second);
         players_.erase(it);
+        diagnostics_.player_count.store(static_cast<std::uint32_t>(players_.size()),std::memory_order_relaxed);
+        // The player's published activity source leaves with it. Otherwise a
+        // field rebuild between this removal (migration / split-merge
+        // transfer / despawn) and this zone's next publish could see the
+        // player here AND in the zone it moved to: a duplicate source.
+        ++activity_revision_;
+        activity_sources_.erase(std::remove_if(activity_sources_.begin(), activity_sources_.end(),
+                                               [net_id](const PlayerInfluenceSource& source) {
+                                                   return source.net_id == net_id;
+                                               }),
+                                activity_sources_.end());
     }
     for (auto session_it = net_by_session_.begin(); session_it != net_by_session_.end();) {
         if (session_it->second == net_id) {

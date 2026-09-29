@@ -8,6 +8,12 @@
 #include <fstream>
 #include <unordered_map>
 #include <unordered_set>
+#ifdef _WIN32
+#ifndef NOMINMAX
+#define NOMINMAX
+#endif
+#include <windows.h>
+#endif
 
 #include "common/Logging.h"
 
@@ -25,6 +31,19 @@
 #include "WorldConstants.h"
 
 namespace gs::game {
+namespace {
+std::uint64_t CurrentThreadCpuUs() {
+#ifdef _WIN32
+    FILETIME create{},exit{},kernel{},user{};
+    if(GetThreadTimes(GetCurrentThread(),&create,&exit,&kernel,&user)) {
+        ULARGE_INTEGER k{},u{};k.LowPart=kernel.dwLowDateTime;k.HighPart=kernel.dwHighDateTime;
+        u.LowPart=user.dwLowDateTime;u.HighPart=user.dwHighDateTime;return (k.QuadPart+u.QuadPart)/10;
+    }
+#endif
+    return 0; // NOT MEASURED on unsupported platforms, never derived from wall work.
+}
+}
+
 
 WorldRuntime::WorldRuntime(boost::asio::io_context& io, RuntimeIdentity identity, ConstructMembersOnly)
     : io_(io)
@@ -71,13 +90,25 @@ WorldRuntime::WorldRuntime(boost::asio::io_context& io, RuntimeIdentity identity
     };
 }
 
-WorldRuntime::WorldRuntime(boost::asio::io_context& io, RuntimeIdentity identity, LoadedWorld world)
+WorldRuntime::WorldRuntime(boost::asio::io_context& io,
+                           RuntimeIdentity identity,
+                           LoadedWorld world,
+                           const PartitionLayout& layout,
+                           const TerrainStreamingConfig& streaming)
     : WorldRuntime(io, identity, ConstructMembersOnly{})
 {
-    InitializeWorld(TerrainService(std::move(world.terrain)),
+    std::optional<StreamingSetup> setup;
+    if (world.residency == mx::map::ResidencyMode::Streaming) {
+        setup = StreamingSetup{std::move(world.chunk_source), std::move(world.startup_chunks), streaming};
+    }
+    TerrainService terrain(std::move(world.terrain));
+    terrain.SetWater(std::move(world.water));
+    InitializeWorld(std::move(terrain),
                     std::move(world.logic),
                     world.mob_types_config,
-                    std::move(world.spawn_points));
+                    std::move(world.spawn_points),
+                    layout,
+                    std::move(setup));
 }
 
 WorldRuntime::WorldRuntime(boost::asio::io_context& io,
@@ -85,32 +116,31 @@ WorldRuntime::WorldRuntime(boost::asio::io_context& io,
                            const SyntheticWorldConfig& synthetic)
     : WorldRuntime(io, identity, ConstructMembersOnly{})
 {
-    // Deterministic synthetic zone grid tiling [0, extent]^2. Region
-    // assignment (DefaultRegions quadrants) happens in BuildFromWorldLogic.
-    mx::map::WorldLogic logic;
+    // Flat world on [0, extent)^2 whose initial partition is a zones_x x
+    // zones_y leaf grid, grouped into regions_x x regions_y regions.
     const std::uint32_t zones_x = std::max(1u, synthetic.zones_x);
     const std::uint32_t zones_y = std::max(1u, synthetic.zones_y);
-    const float extent = synthetic.extent_m > 0.0f ? synthetic.extent_m : 100000.0f;
-    const float cell_w = extent / static_cast<float>(zones_x);
-    const float cell_h = extent / static_cast<float>(zones_y);
-    logic.zones.reserve(static_cast<std::size_t>(zones_x) * zones_y);
-    std::uint32_t next_id = 1;
-    for (std::uint32_t gy = 0; gy < zones_y; ++gy) {
-        for (std::uint32_t gx = 0; gx < zones_x; ++gx) {
-            mx::map::Zone zone;
-            zone.id = next_id++;
-            zone.name = "synth_" + std::to_string(gx) + "_" + std::to_string(gy);
-            zone.bounds = mx::map::Rect{static_cast<float>(gx) * cell_w,
-                                        static_cast<float>(gy) * cell_h,
-                                        static_cast<float>(gx + 1) * cell_w,
-                                        static_cast<float>(gy + 1) * cell_h};
-            logic.zones.push_back(std::move(zone));
-        }
+    const std::uint32_t regions_x = std::max(1u, synthetic.regions_x);
+    const std::uint32_t regions_y = std::max(1u, synthetic.regions_y);
+    if (zones_x % regions_x != 0 || zones_y % regions_y != 0) {
+        throw std::invalid_argument("synthetic world: zone grid " + std::to_string(zones_x) + "x" +
+                                    std::to_string(zones_y) + " is not divisible by the region grid " +
+                                    std::to_string(regions_x) + "x" + std::to_string(regions_y));
     }
-    // One fallback spawn region at the world center (benchmark players are
-    // placed explicitly; this only feeds the default spawn resolution).
+    const float extent = synthetic.extent_m > 0.0f ? synthetic.extent_m : 100000.0f;
+    if (!(extent <= static_cast<float>(mx::map::kMaxWorldCoordinate))) {
+        // Same f32 coordinate range as a package world ([0, extent)).
+        throw std::invalid_argument("synthetic world: extent " + std::to_string(extent) + " m exceeds " +
+                                    std::to_string(mx::map::kMaxWorldCoordinate) + " m");
+    }
+    const WorldBounds bounds = WorldBounds::FromExtent(extent);
+    // Metadata: one area covering the world and a player spawn region at its
+    // centre (benchmark players are placed explicitly; this only feeds the
+    // default spawn resolution).
+    mx::map::WorldLogic logic;
+    logic.zones.push_back(mx::map::Area{1, "synthetic world", mx::map::Rect{0.0f, 0.0f, extent, extent}});
     logic.spawns.push_back(mx::map::SpawnRegion{
-        1, logic.zones.front().id,
+        1, 1,
         mx::map::Rect{extent * 0.5f - 50.0f, extent * 0.5f - 50.0f, extent * 0.5f + 50.0f,
                       extent * 0.5f + 50.0f}});
     std::string types = synthetic.mob_types_config;
@@ -119,34 +149,69 @@ WorldRuntime::WorldRuntime(boost::asio::io_context& io,
         types = IXTREEME_DEFAULT_MOB_TYPES_CONFIG; // bench builds only
     }
 #endif
-    InitializeWorld(TerrainService(extent), std::move(logic), types, std::nullopt);
-    LOG_INFO("World: SYNTHETIC flat {}m x {}m, {}x{} bootstrap zones (explicit synthetic mode, no package)",
+    PartitionLayout layout;
+    layout.regions_x = regions_x;
+    layout.regions_y = regions_y;
+    layout.leaves_x = zones_x / regions_x;
+    layout.leaves_y = zones_y / regions_y;
+    InitializeWorld(TerrainService::Flat(bounds), std::move(logic), types, std::nullopt, layout);
+    LOG_INFO("World: SYNTHETIC flat {}m x {}m, {}x{} bootstrap zones in {}x{} regions (explicit synthetic mode, "
+             "no package)",
              extent,
              extent,
              zones_x,
-             zones_y);
+             zones_y,
+             regions_x,
+             regions_y);
 }
 
 void WorldRuntime::InitializeWorld(TerrainService terrain,
                                    mx::map::WorldLogic logic,
                                    const std::string& mob_types_config,
-                                   std::optional<std::vector<MobSpawnPoint>> package_spawn_points)
+                                   std::optional<std::vector<MobSpawnPoint>> package_spawn_points,
+                                   const PartitionLayout& layout,
+                                   std::optional<StreamingSetup> streaming)
 {
     terrain_ = std::move(terrain);
     world_logic_ = std::move(logic);
+    const WorldBounds bounds = terrain_.Bounds();
+    if (streaming && terrain_.MutableTerrain() != nullptr) {
+        // The loader published the startup set (spawn region centres, warp
+        // targets); they stay resident for the world's lifetime.
+        streamer_ = std::make_unique<TerrainStreamer>(*terrain_.MutableTerrain(), std::move(streaming->source),
+                                                      streaming->config, [this] {
+                                                          {
+                                                              std::lock_guard lock(mutex_);
+                                                              terrain_completion_pending_ = true;
+                                                          }
+                                                          cv_.notify_one();
+                                                      });
+        for (const std::uint32_t index : streaming->startup_chunks) {
+            streamer_->PinPermanently(index);
+        }
+        terrain_.AttachStreamer(streamer_.get());
+        spawn_.SetTerrainDemand([this](std::uint32_t chunk_index) {
+            streamer_->Demand(chunk_index, std::chrono::steady_clock::now(), TerrainPriority::Admission);
+        });
+    }
 
-    zones_.BuildFromWorldLogic(world_logic_, terrain_.WorldExtentMeters());
+    // Initial partition = server config applied to the LOADED bounds (MAP-2):
+    // regions and initial leaves tile the world, map areas play no part.
+    InitialPartition partition;
+    std::string layout_error;
+    if (!BuildInitialPartition(bounds, layout, 2.0f * kAoiRadiusMeters, partition, layout_error)) {
+        throw std::invalid_argument("initial partition: " + layout_error);
+    }
+    zones_.BuildInitialPartition(partition);
     directory_.RebuildFromManager(zones_);
-    // Size the activity grid to the real world extent (test map and 100km
-    // world alike); positions clamp into it by construction.
-    activity_field_.Reconfigure(
-        SpatialActivityField::Config{kActivityCellSizeMeters,
-                                    WorldBounds::FromExtent(terrain_.WorldExtentMeters())});
-    // Load field: same world extent, independent cell size (config). The
+    // Every world-indexed derived field uses the same loaded bounds (origin
+    // and non-square extents included).
+    activity_field_.Reconfigure(SpatialActivityField::Config{kActivityCellSizeMeters, bounds});
+    // Load field: same world bounds, independent cell size (config). The
     // mapping is bound to every zone so their local load bins line up with
     // the generation grid before any tick can run.
     LoadFieldConfig load_field_config;
-    load_field_config.bounds = WorldBounds::FromExtent(terrain_.WorldExtentMeters());
+    load_field_config.bounds = bounds;
     load_field_.Reconfigure(load_field_config);
     {
         LoadFieldMapping mapping = LoadFieldMapping::FromConfig(load_field_config);
@@ -155,7 +220,13 @@ void WorldRuntime::InitializeWorld(TerrainService terrain,
     }
     effective_load_field_config_ = load_field_config;
     last_load_field_build_ = std::chrono::steady_clock::now();
-    if (package_spawn_points) {
+    if (package_spawn_points && streamer_) {
+        // Streaming: the spawn circles' chunks are loaded batch by batch
+        // within the budget, never all at once.
+        spawn_.Initialize(std::move(*package_spawn_points), mob_types_config, false);
+        const std::size_t spawned = SpawnConfiguredMobsStreaming();
+        LOG_INFO("spawn complete (streaming batches): total_mobs={}", spawned);
+    } else if (package_spawn_points) {
         spawn_.Initialize(std::move(*package_spawn_points), mob_types_config);
     } else {
         spawn_.ClearSpawnPoints();
@@ -171,7 +242,7 @@ std::size_t WorldRuntime::SpawnConfiguredMobsNow()
         LOG_WARN("bulk mob spawn refused: zone tick in flight");
         return 0;
     }
-    return spawn_.SpawnAllConfiguredMobs();
+    return streamer_ ? SpawnConfiguredMobsStreaming() : spawn_.SpawnAllConfiguredMobs();
 }
 
 WorldRuntime::~WorldRuntime()
@@ -199,17 +270,280 @@ void WorldRuntime::Stop()
         thread_.join();
     }
     workers_.Stop();
+    if (auto* terrain = terrain_.MutableTerrain()) {
+        // The supervisor is gone: the stopping thread owns the terrain now.
+        terrain->BindWriterThread();
+    }
+    if (streamer_) {
+        // Pending loads are dropped; late results are rejected (MAP-3).
+        streamer_->Stop();
+    }
+}
+
+std::size_t WorldRuntime::SpawnConfiguredMobsStreaming()
+{
+    const auto* terrain = terrain_.Terrain();
+    if (!streamer_ || terrain == nullptr) {
+        return spawn_.SpawnAllConfiguredMobs();
+    }
+    const auto& g = terrain->Geometry();
+    const double chunk_m = g.cell_size_m * g.chunk_cells;
+    const auto points = spawn_.SpawnPointsSnapshot();
+    // A spawn point's circle may touch several chunks: all of them must be
+    // resident while its mobs are placed. Batches of points whose chunk sets
+    // fit the FREE budget -- measured in what a load really reserves
+    // (decoded payload + read buffer + overhead), after the fixed metadata
+    // and the pinned startup set -- are loaded, spawned and released in turn.
+    const std::size_t batch_budget = streamer_->FreeBytes() / 10 * 9;
+    struct Batch {
+        std::vector<std::uint32_t> chunks;
+        std::vector<std::size_t> points;
+        std::size_t bytes = 0;
+    };
+    std::vector<Batch> batches(1);
+    std::size_t skipped = 0;
+    for (std::size_t p = 0; p < points.size(); ++p) {
+        const auto& point = points[p];
+        auto axis = [&](double v, double origin, std::uint32_t chunks) {
+            const double c = std::floor((v - origin) / chunk_m);
+            return static_cast<std::uint32_t>(std::clamp(c, 0.0, static_cast<double>(chunks - 1)));
+        };
+        const std::uint32_t cx0 = axis(point.x - point.radius, g.origin_x, g.chunks_x);
+        const std::uint32_t cx1 = axis(point.x + point.radius, g.origin_x, g.chunks_x);
+        const std::uint32_t cy0 = axis(point.y - point.radius, g.origin_y, g.chunks_y);
+        const std::uint32_t cy1 = axis(point.y + point.radius, g.origin_y, g.chunks_y);
+        std::vector<std::uint32_t> needed;
+        std::size_t bytes = 0;
+        for (std::uint32_t cy = cy0; cy <= cy1; ++cy) {
+            for (std::uint32_t cx = cx0; cx <= cx1; ++cx) {
+                const std::uint32_t index = terrain->ChunkIndex(cx, cy);
+                needed.push_back(index);
+                bytes += streamer_->ReservationBytes(index);
+            }
+        }
+        if (bytes > batch_budget) {
+            ++skipped;
+            LOG_ERROR("spawn point {} ({}, {}) r={}: its {} chunk(s) reserve {} B, above the free terrain budget "
+                      "({} B); its mobs are not spawned",
+                      p, point.x, point.y, point.radius, needed.size(), bytes, batch_budget);
+            continue;
+        }
+        if (batches.back().bytes + bytes > batch_budget && !batches.back().points.empty()) {
+            batches.emplace_back();
+        }
+        Batch& batch = batches.back();
+        for (const std::uint32_t index : needed) {
+            if (std::find(batch.chunks.begin(), batch.chunks.end(), index) == batch.chunks.end()) {
+                batch.chunks.push_back(index);
+                batch.bytes += streamer_->ReservationBytes(index);
+            }
+        }
+        batch.points.push_back(p);
+    }
+    std::size_t total = 0;
+    for (const auto& batch : batches) {
+        if (batch.points.empty()) {
+            continue;
+        }
+        std::string error;
+        if (!streamer_->LoadBlocking(batch.chunks, error)) {
+            // Chunks that failed for good are published invalid: mob
+            // candidates on them are refused one by one (counted by the
+            // spawn coordinator, re-rolled inside the circle); the rest of
+            // the batch spawns normally.
+            LOG_ERROR("spawn batch of {} point(s): {}", batch.points.size(), error);
+        }
+        for (const std::size_t p : batch.points) {
+            total += spawn_.SpawnPointMobs(p);
+        }
+        // Nothing runs yet: every tick is quiescent, freed at once.
+        (void)streamer_->EvictUndemanded(std::chrono::steady_clock::now() + std::chrono::seconds(1), true);
+    }
+    if (skipped > 0) {
+        LOG_WARN("streaming spawn: {} spawn point(s) skipped (see errors above)", skipped);
+    }
+    return total;
+}
+
+void WorldRuntime::PumpTerrain()
+{
+    terrain_demand_scratch_.clear();
+    TerrainQueryCounters counters;
+    for (std::size_t i = 0; i < zones_.ZoneCount(); ++i) {
+        zones_.GetZone(i).TerrainDemand().Take(terrain_demand_scratch_, counters);
+    }
+    {
+        std::lock_guard lock(terrain_stats_mutex_);
+        terrain_queries_.Add(counters);
+    }
+    const auto now = std::chrono::steady_clock::now();
+    if (streamer_) {
+        for (const auto& demand : terrain_demand_scratch_) {
+            streamer_->Demand(demand.chunk, now, demand.priority);
+        }
+    }
+    // Navigation jobs: bounded work per pass; they demand + pin chunks.
+    navigation_.Pump(terrain_, streamer_.get(), now, kNavigationExpansionsPerPass);
+    if (streamer_) {
+        // Only the supervisor dispatches zone ticks: no tick in flight now
+        // means none can start before this call returns -- a valid grace
+        // period for freeing evicted chunks.
+        const bool quiescent=!zones_.AnyTickInProgress();
+        if(quiescent && terrain_drain_started_!=std::chrono::steady_clock::time_point{}) {
+            ++terrain_safepoints_;
+            terrain_drain_wait_us_.fetch_add(static_cast<std::uint64_t>(
+                std::chrono::duration_cast<std::chrono::microseconds>(now-terrain_drain_started_).count()));
+            terrain_drain_max_us_.store(std::max(terrain_drain_max_us_.load(),static_cast<std::uint64_t>(std::chrono::duration_cast<std::chrono::microseconds>(now-terrain_drain_started_).count())));
+            terrain_drain_started_={};
+        }
+        streamer_->Pump(now, quiescent);
+        if(streamer_->NeedsQuiescence() && terrain_drain_started_==std::chrono::steady_clock::time_point{})
+            terrain_drain_started_=now;
+    }
+}
+
+std::uint64_t WorldRuntime::PostNavigationRequest(const NavRequest& request)
+{
+    const std::uint64_t id = next_navigation_id_.fetch_add(1, std::memory_order_relaxed) + 1;
+    Enqueue([this, id, request] { navigation_.Request(id, request, std::chrono::steady_clock::now()); });
+    return id;
+}
+
+void WorldRuntime::PostNavigationCancel(std::uint64_t id)
+{
+    Enqueue([this, id] { navigation_.Cancel(id); });
+}
+
+WorldRuntime::TerrainStats WorldRuntime::GetTerrainStats() const
+{
+    TerrainStats stats;
+    stats.streaming = streamer_ != nullptr;
+    if (streamer_) {
+        stats.streamer = streamer_->GetStats();
+    }
+    std::lock_guard lock(terrain_stats_mutex_);
+    stats.queries = terrain_queries_;
+    stats.supervisor_cpu_us=supervisor_cpu_us_.load();
+    stats.drain_max_us=terrain_drain_max_us_.load();
+    stats.commands_requested=terrain_commands_requested_.load();
+    stats.ingress_rejected=terrain_ingress_rejected_.load();
+    stats.safepoints=terrain_safepoints_.load(std::memory_order_relaxed);
+    stats.drain_wait_us=terrain_drain_wait_us_.load(std::memory_order_relaxed);
+    return stats;
+}
+
+void WorldRuntime::PostTerrainDemand(float x, float y, float radius_m)
+{
+    Enqueue([this, x, y, radius_m] {
+        const auto* terrain = terrain_.Terrain();
+        if (!streamer_ || terrain == nullptr) {
+            return;
+        }
+        const auto now = std::chrono::steady_clock::now();
+        if (!std::isfinite(x) || !std::isfinite(y) || !std::isfinite(radius_m) || radius_m < 0) return;
+        const auto& g = terrain->Geometry();
+        const double step = g.cell_size_m * g.chunk_cells;
+        if (x + double(radius_m) < g.MinX() || y + double(radius_m) < g.MinY() ||
+            x - double(radius_m) >= g.MaxX() || y - double(radius_m) >= g.MaxY()) return;
+        auto index = [&](double v, double origin, std::uint32_t count) {
+            return static_cast<std::uint32_t>(std::clamp(std::floor((v-origin)/step), 0.0, double(count-1)));
+        };
+        const auto x0=index(x-double(radius_m),g.origin_x,g.chunks_x), x1=index(x+double(radius_m),g.origin_x,g.chunks_x);
+        const auto y0=index(y-double(radius_m),g.origin_y,g.chunks_y), y1=index(y+double(radius_m),g.origin_y,g.chunks_y);
+        for (auto cy=y0; cy<=y1; ++cy) {
+            for (auto cx=x0; cx<=x1; ++cx) {
+                streamer_->Demand(terrain->ChunkIndex(cx,cy), now);
+            }
+        }
+    });
+}
+
+TerrainRequestHandle WorldRuntime::PrepareTerrain(float x, float y, float radius_m, double timeout_seconds)
+{
+    ++terrain_commands_requested_;
+    auto request=std::make_shared<TerrainRequest>(std::chrono::steady_clock::now(),
+        std::isfinite(timeout_seconds) ? std::clamp(timeout_seconds,0.0,15.0) : 0.0);
+    if(terrain_commands_pending_.fetch_add(1,std::memory_order_acq_rel)>=TerrainStreamer::kMaxRequests) {
+        ++terrain_ingress_rejected_;
+        terrain_commands_pending_.fetch_sub(1,std::memory_order_release);
+        request->SetStatus(TerrainRequestStatus::CapacityRejected);
+        return request;
+    }
+    auto command=[this,x,y,radius_m,request] {
+        terrain_commands_pending_.fetch_sub(1,std::memory_order_release);
+        const auto* terrain=terrain_.Terrain();
+        if(!std::isfinite(x) || !std::isfinite(y) || !std::isfinite(radius_m) || radius_m<0 || !terrain_.Contains(x,y)) {
+            request->SetStatus(TerrainRequestStatus::OutsideWorld); return;
+        }
+        if(!streamer_ || !terrain) {
+            request->SetStatus(TerrainRequestStatus::Ready); return;
+        }
+        const auto& g=terrain->Geometry();
+        const double pitch=g.cell_size_m*g.chunk_cells;
+        auto index=[&](double value,double origin,std::uint32_t count) {
+            return static_cast<std::uint32_t>(std::clamp(std::floor((value-origin)/pitch),0.0,double(count-1)));
+        };
+        const auto x0=index(x-double(radius_m),g.origin_x,g.chunks_x),x1=index(x+double(radius_m),g.origin_x,g.chunks_x);
+        const auto y0=index(y-double(radius_m),g.origin_y,g.chunks_y),y1=index(y+double(radius_m),g.origin_y,g.chunks_y);
+        if(std::uint64_t(x1-x0+1)*(y1-y0+1)>TerrainStreamer::kMaxRequestChunks) {
+            request->SetStatus(TerrainRequestStatus::CapacityRejected); return;
+        }
+        std::vector<std::uint32_t> chunks;
+        for(auto cy=y0;cy<=y1;++cy) for(auto cx=x0;cx<=x1;++cx) chunks.push_back(terrain->ChunkIndex(cx,cy));
+        streamer_->Request(request,chunks);
+    };
+    {
+        std::lock_guard lock(mutex_);
+        // Stop sets stopping_ before the supervisor's final command drain.
+        // Serialize insertion so no terrain request can miss that drain.
+        if(stopping_.load(std::memory_order_acquire)) {
+            terrain_commands_pending_.fetch_sub(1,std::memory_order_release);
+            request->SetStatus(TerrainRequestStatus::Cancelled);
+            return request;
+        }
+        commands_.push(std::move(command));
+    }
+    cv_.notify_one();
+    return request;
+}
+
+void WorldRuntime::BeginTerrainMeasurementWindow()
+{
+    Enqueue([this]{ if(streamer_) streamer_->BeginMeasurementWindow(std::chrono::steady_clock::now()); });
+}
+
+void WorldRuntime::PostTerrainResetForTest()
+{
+    Enqueue([this] {
+        if (streamer_) {
+            streamer_->ResetGenerationForTest(!zones_.AnyTickInProgress());
+        }
+    });
+}
+
+void WorldRuntime::PostTerrainEvictIdleForTest(double idle_seconds)
+{
+    Enqueue([this, idle_seconds] {
+        if (streamer_) {
+            const auto idle = std::chrono::duration_cast<std::chrono::steady_clock::duration>(
+                std::chrono::duration<double>(idle_seconds));
+            (void)streamer_->EvictUndemanded(std::chrono::steady_clock::now() - idle, !zones_.AnyTickInProgress());
+        }
+    });
 }
 
 void WorldRuntime::PostSpawn(std::shared_ptr<gs::network::Session> session,
                              gs::db::Character character,
-                             std::optional<DebugSpawnOverride> debug_spawn)
+                             std::optional<DebugSpawnOverride> debug_spawn,
+                             TerrainRequestHandle terrain_request)
 {
     Enqueue([this,
              session = std::move(session),
              character = std::move(character),
-             debug_spawn]() mutable {
-        spawn_.Spawn(std::move(session), std::move(character), debug_spawn, world_tick_.load());
+             debug_spawn, terrain_request=std::move(terrain_request)]() mutable {
+        if(terrain_request && terrain_request->Status()!=TerrainRequestStatus::Ready) return;
+        spawn_.Spawn(std::move(session), std::move(character), debug_spawn, world_tick_.load(), terrain_request);
+        if(terrain_request) terrain_request->Consume();
     });
 }
 
@@ -270,6 +604,7 @@ ZoneTickContext WorldRuntime::BuildZoneTickContext()
                         [this](std::size_t spawn_point_index, float delay_sec) {
                             spawn_.ScheduleRespawn(spawn_point_index, delay_sec);
                         }};
+    ctx.prepare_terrain=[this](float x,float y){return PrepareTerrain(x,y,0.0f);};
     return ctx;
 }
 
@@ -285,6 +620,11 @@ void WorldRuntime::TickZone(std::size_t zone_index)
 void WorldRuntime::Run()
 {
     sim_thread_id_.store(std::this_thread::get_id(), std::memory_order_release);
+    if (auto* terrain = terrain_.MutableTerrain()) {
+        // MAP-3: the supervisor is the terrain's single writer (publish,
+        // unpublish, pins, frees); Debug builds assert it.
+        terrain->BindWriterThread();
+    }
     {
         // From here on snapshot requests are queued and served in quiescent
         // windows of this loop instead of being captured inline.
@@ -303,6 +643,7 @@ void WorldRuntime::Run()
     auto next_diagnostics = std::chrono::steady_clock::now() + diagnostics_interval_;
 
     while (!stopping_) {
+        supervisor_cpu_us_.store(CurrentThreadCpuUs(),std::memory_order_relaxed);
         const auto supervisor_start = std::chrono::steady_clock::now();
         // Phase 7: worker-phase wall accounting (how much wall time has at
         // least one zone tick in flight). Sampled at the supervisor cadence
@@ -318,10 +659,14 @@ void WorldRuntime::Run()
             }
         }
         last_phase_sample_ = supervisor_start;
+        const auto snapshot_epoch_at_pass_start = snapshot_epoch_;
         DrainGlobalCommands();
         // MAP-0 snapshot point 1: top of the pass, after the cv wait -- the
         // ticks dispatched by the previous pass have usually finished here.
         ServeSnapshots();
+        // MAP-3: zone terrain demand -> streamer; completions published,
+        // admission, eviction; retired chunks freed if quiescent.
+        PumpTerrain();
         const auto migration_start = std::chrono::steady_clock::now();
         migration_.ProcessMigrations(world_tick_.load(std::memory_order_relaxed));
         partition_metrics_.migration_us.fetch_add(
@@ -410,7 +755,7 @@ void WorldRuntime::Run()
                 const bool ok =
                     ValidateWorldConsistency(zones_, owners_by_session_, migration_queue_, directory_,
                                              activity_for_validation.get(), error,
-                                             &spawn_.Presence());
+                                             &spawn_.Presence(), scheduler_.WakeDecision().get());
                 std::lock_guard lock(validation_mutex_);
                 validation_result_ = ok ? std::string("OK") : "FAIL: " + error;
                 validation_ready_ = true;
@@ -518,17 +863,26 @@ void WorldRuntime::Run()
         // Tick-aligned input delivery (H1): each claimed zone gets exactly the
         // staged input of its resident sessions, drained at the top of the
         // tick it is about to run.
-        scheduler_.ScheduleOnce(zones_,
-                                workers_,
-                                std::chrono::steady_clock::now(),
-                                activity_snapshot,
-                                effective_lod_config_.reduced_radius_m,
-                                [this](const std::vector<std::size_t>& due) {
-                                    for (const std::size_t index : due) {
-                                        inputs_.DeliverToZone(zones_.GetZone(index), index,
-                                                              attack_handler_);
-                                    }
-                                });
+        // A saturated pool may never spontaneously have all ticks finished.
+        // Stop admitting another wave while a snapshot awaits quiescence;
+        // already dispatched ticks drain normally. After serving a batch,
+        // always allow one wave even if another reader has already queued:
+        // neither diagnostics nor simulation may starve the other.
+        if ((!snapshots_pending_.load(std::memory_order_acquire) ||
+            snapshot_epoch_ != snapshot_epoch_at_pass_start) &&
+            (!streamer_ || !streamer_->NeedsQuiescence())) {
+            scheduler_.ScheduleOnce(zones_,
+                                    workers_,
+                                    std::chrono::steady_clock::now(),
+                                    activity_snapshot,
+                                    effective_lod_config_.reduced_radius_m,
+                                    [this](const std::vector<std::size_t>& due) {
+                                        for (const std::size_t index : due) {
+                                            inputs_.DeliverToZone(zones_.GetZone(index), index,
+                                                                  attack_handler_);
+                                        }
+                                    });
+        }
         ExecutePartitionControl();
         ReclaimRetiredZones(); // H9: bounded zone table (quiescent windows only)
         // MAP-0 snapshot point 2: after this pass's topology step (a split or
@@ -882,8 +1236,10 @@ void WorldRuntime::Run()
 
         std::unique_lock lock(mutex_);
         cv_.wait_for(lock, std::chrono::milliseconds(5), [this] {
-            return stopping_.load() || !commands_.empty();
+            return stopping_.load() || !commands_.empty() || terrain_completion_pending_;
         });
+        // The next pass's PumpTerrain drains every completion queued so far.
+        terrain_completion_pending_ = false;
     }
 
     DrainGlobalCommands();
@@ -918,7 +1274,7 @@ bool WorldRuntime::ValidateConsistency(std::string& out_error)
     // a test harness, or after Stop).
     const auto activity = activity_field_.Snapshot();
     return ValidateWorldConsistency(zones_, owners_by_session_, migration_queue_, directory_,
-                                    activity.get(), out_error, &spawn_.Presence());
+                                    activity.get(), out_error, &spawn_.Presence(), scheduler_.WakeDecision().get());
 }
 
 void WorldRuntime::RequestActivityValidation(std::size_t max_samples)
@@ -1179,10 +1535,11 @@ void WorldRuntime::RunSnapshotBatch(std::vector<PendingSnapshot>& batch, std::ui
     const auto now = std::chrono::steady_clock::now();
     const SnapshotContext ctx{zones_,
                               owners_by_session_,
+                              spawn_.Presence(),
                               epoch,
                               world_tick_.load(std::memory_order_relaxed),
                               now,
-                              zones_.GetReclaimStats()};
+                              zones_.GetReclaimStats(), activity_field_.Snapshot(), scheduler_.WakeDecision()};
     struct CollectorScope {
         CollectorScope() { t_in_snapshot_collector = true; }
         ~CollectorScope() { t_in_snapshot_collector = false; }
@@ -1857,7 +2214,22 @@ bool WorldRuntime::RunSplitTransaction(ZoneId zone_id, bool forced, const SplitC
 {
     const auto t_plan0 = std::chrono::steady_clock::now();
     ZoneManager::SplitPlan plan;
-    if (!zones_.PlanSplit(zone_id, plan, nullptr, center)) {
+    SplitRejectReason plan_reason = SplitRejectReason::None;
+    if (!zones_.PlanSplit(zone_id, plan, &plan_reason, center)) {
+        if (forced) {
+            // A forced split the partition rules refuse (e.g. a zone already
+            // at the min-zone-size floor) must say why -- never a silent no-op.
+            LOG_WARN("partition: forced split REFUSED zone={} reason={}", zone_id, SplitRejectReasonName(plan_reason));
+            PartitionDecisionRecord record;
+            record.kind = PartitionDecisionKind::Split;
+            record.timestamp = std::chrono::steady_clock::now();
+            record.zone_id = zone_id;
+            record.executed = false;
+            record.noop_reason = plan_reason == SplitRejectReason::TooSmall ? PartitionNoopReason::SplitMinSize
+                                                                            : PartitionNoopReason::SplitNotEligible;
+            record.detail = SplitRejectReasonName(plan_reason);
+            RecordPartitionDecision(std::move(record), false, false);
+        }
         return false; // routine skip, not an abort
     }
     if (ZoneHasPendingMigration(zone_id)) {
@@ -2262,7 +2634,10 @@ bool WorldRuntime::TransferResidentLocked(Zone& source_zone,
         return false;
     }
 
-    transfer.position.z = terrain_.SampleGroundHeight(transfer.position.x, transfer.position.y);
+    // Unknown height (outside / not resident) keeps the entity's own z.
+    if (const auto ground = terrain_.Height(transfer.position.x, transfer.position.y); ground.Ok()) {
+        transfer.position.z = ground.meters;
+    }
     DestinationRollback rollback;
     rollback.target = &target_zone;
     rollback.net_id = net_id;
@@ -2500,7 +2875,7 @@ void WorldRuntime::ConfigureLoadField(const LoadFieldConfig& config)
 {
     // World geometry is runtime-owned: operator config never moves the world.
     LoadFieldConfig requested = config;
-    requested.bounds = WorldBounds::FromExtent(terrain_.WorldExtentMeters());
+    requested.bounds = terrain_.Bounds();
     const auto validated = ValidateLoadFieldConfig(requested);
     for (const auto& warning : validated.warnings) {
         LOG_WARN("{}", warning);

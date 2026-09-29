@@ -54,36 +54,41 @@ bool ValidatePartitionTopology(const ZoneManager& zones, std::string& out_error)
                 }
             }
         }
-        // Sibling tiling: enforced for split-created internal nodes only.
-        // Region roots are exempt -- map zones never tile the full quadrant,
-        // and promising otherwise would change spawn/lookup behavior.
+        // Sibling tiling for every internal node, region roots included
+        // (MAP-2: the initial leaves tile their region): the children's
+        // bounding box is the parent and their areas sum to the parent's --
+        // with pairwise disjoint leaves (below) that is exact tiling.
         std::vector<const ZonePartition*> stack{root.get()};
         while (!stack.empty()) {
             const ZonePartition* node = stack.back();
             stack.pop_back();
-            if (node->IsLeaf() || node->parent == nullptr) {
-                for (const auto& child : node->children) {
-                    stack.push_back(child.get());
-                }
+            if (node->IsLeaf()) {
                 continue;
             }
             float min_x = node->bounds.max_x;
             float min_y = node->bounds.max_y;
             float max_x = node->bounds.min_x;
             float max_y = node->bounds.min_y;
+            double area = 0.0;
             for (const auto& child : node->children) {
                 min_x = std::min(min_x, child->bounds.min_x);
                 min_y = std::min(min_y, child->bounds.min_y);
                 max_x = std::max(max_x, child->bounds.max_x);
                 max_y = std::max(max_y, child->bounds.max_y);
+                area += (static_cast<double>(child->bounds.max_x) - child->bounds.min_x) *
+                        (static_cast<double>(child->bounds.max_y) - child->bounds.min_y);
                 stack.push_back(child.get());
             }
+            const double parent_area = (static_cast<double>(node->bounds.max_x) - node->bounds.min_x) *
+                                       (static_cast<double>(node->bounds.max_y) - node->bounds.min_y);
             if (std::abs(min_x - node->bounds.min_x) > kEps ||
                 std::abs(min_y - node->bounds.min_y) > kEps ||
                 std::abs(max_x - node->bounds.max_x) > kEps ||
-                std::abs(max_y - node->bounds.max_y) > kEps) {
+                std::abs(max_y - node->bounds.max_y) > kEps ||
+                std::abs(area - parent_area) > parent_area * 1e-6) {
                 std::ostringstream message;
-                message << "partition: children of zone " << node->zone_id
+                message << "partition: children of " << (node->parent == nullptr ? "region root " : "zone ")
+                        << (node->parent == nullptr ? node->region_id : node->zone_id)
                         << " do not tile the parent bounds";
                 return Fail(out_error, message.str());
             }
@@ -104,6 +109,21 @@ bool ValidatePartitionTopology(const ZoneManager& zones, std::string& out_error)
             }
         }
     }
+    // Every simulating leaf zone is reachable from a region root: a zone the
+    // forest does not reach would be invisible to the load monitor.
+    std::size_t simulating_leaves = 0;
+    for (std::size_t i = 0; i < zones.ZoneCount(); ++i) {
+        const auto& zone = zones.GetZone(i);
+        if (zone.SimulationEnabled() && zone.Partition() == PartitionState::Leaf) {
+            ++simulating_leaves;
+        }
+    }
+    if (simulating_leaves != leaves.size()) {
+        std::ostringstream message;
+        message << "partition: " << simulating_leaves << " simulating leaf zones but " << leaves.size()
+                << " reachable from the region roots";
+        return Fail(out_error, message.str());
+    }
     return true;
 }
 
@@ -115,7 +135,8 @@ bool ValidateWorldConsistency(ZoneManager& zones,
                               const WorldDirectory& directory,
                               const ActivityGrid* activity,
                               std::string& out_error,
-                              const PresenceRegistry* presence)
+                              const PresenceRegistry* presence,
+                              const ActivityWakeFrame* wake)
 {
     if (!ValidatePartitionTopology(zones, out_error)) {
         return false;
@@ -560,6 +581,10 @@ bool ValidateWorldConsistency(ZoneManager& zones,
     // (unit contexts); the LOD-disabled path publishes an empty disabled
     // grid, which trivially passes.
     if (activity != nullptr) {
+        if (wake != nullptr) {
+            return ValidateActivityGeneration(zones,*activity,out_error) &&
+                   ValidateActivityWake(zones,wake,out_error);
+        }
         // (a) Every source resolves to a live authoritative player, exactly
         // once. Positions are NOT compared (snapshot staleness); existence
         // and uniqueness are exact and staleness-free. A despawned player's
@@ -658,6 +683,84 @@ bool ValidateWorldConsistency(ZoneManager& zones,
         }
     }
 
+    return true;
+}
+
+bool ValidateActivityGeneration(const ZoneManager& zones,const ActivityGrid& grid,std::string& error)
+{
+    std::unordered_map<std::uint32_t,PlayerInfluenceSource> inputs;
+    for(const auto& p:grid.generation_sources) {
+        if(!inputs.emplace(p.net_id,p).second) return Fail(error,"activity generation: duplicate source input");
+    }
+    std::unordered_set<std::uint32_t> seen;
+    for(const auto& cell:grid.cells) for(const auto& p:cell.players) {
+        const auto input=inputs.find(p.net_id);
+        if(!seen.insert(p.net_id).second || input==inputs.end() || input->second.x!=p.x || input->second.y!=p.y ||
+           input->second.zone_id!=p.zone_id || input->second.commit_sequence!=p.commit_sequence)
+            return Fail(error,"activity generation: field differs from captured publisher inputs");
+    }
+    if(seen.size()!=inputs.size()) return Fail(error,"activity generation: missing field source");
+    std::size_t sampled=0;
+    for(std::size_t i=0;i<zones.ZoneCount() && sampled<64;++i) for(const auto& [net,entity]:zones.GetZone(i).Entities()) {
+        (void)net;
+        if(!entity.has<MobTag>() || entity.has<GhostTag>() || !entity.has<Position>()) continue;
+        const auto pos=entity.get<Position>(); auto brute=SimulationTier::Dormant;
+        for(const auto& p:grid.generation_sources) {
+            const auto d=(pos.x-p.x)*(pos.x-p.x)+(pos.y-p.y)*(pos.y-p.y);
+            const auto r=grid.Radii();
+            const auto tier=d<r.full_radius_m*r.full_radius_m?SimulationTier::Full:
+                d<r.reduced_radius_m*r.reduced_radius_m?SimulationTier::Reduced:
+                d<r.low_radius_m*r.low_radius_m?SimulationTier::Low:SimulationTier::Dormant;
+            brute=std::min(brute,tier);
+        }
+        if(grid.QueryPlayerTierFast(pos.x,pos.y,zones.GetZone(i).Id()).tier!=brute ||
+           grid.QueryPlayerInfluenceExact(pos.x,pos.y,zones.GetZone(i).Id()).tier!=brute)
+            return Fail(error,"activity generation: indexed query differs from independent brute force");
+        if(++sampled==64) break;
+    }
+    return true;
+}
+
+bool ValidateActivityWake(const ZoneManager& zones,const ActivityWakeFrame* frame,std::string& error)
+{
+    for(std::size_t i=0;i<zones.ZoneCount();++i) {
+        const auto& z=zones.GetZone(i);
+        // Quiescent authority-to-publication oracle. Withholding a commit's
+        // publication cannot be disguised as an indefinitely pending phase.
+        std::unordered_map<std::uint32_t,PlayerInfluenceSource> published;
+        for(const auto& p:z.ActivitySources()) if(!published.emplace(p.net_id,p).second)
+            return Fail(error,"activity wake: duplicate current publisher source");
+        if(published.size()!=z.Players().size()) return Fail(error,"activity wake: current publisher population mismatch");
+        for(const auto& [net,binding]:z.Players()) {
+            (void)binding; const auto entity=z.FindEntity(net); const auto found=published.find(net);
+            if(!entity.is_valid() || !entity.has<Position>() || found==published.end())
+                return Fail(error,"activity wake: authoritative commit was not published");
+            const auto pos=entity.get<Position>();
+            if(found->second.x!=pos.x || found->second.y!=pos.y || found->second.zone_id!=z.Id())
+                return Fail(error,"activity wake: current position differs from commit publication");
+        }
+        if(!frame || !frame->leaves.contains(z.Id()) || !z.SimulationEnabled()) continue;
+        if(z.WakeDecisionGeneration()!=frame->generation)
+            return Fail(error,"activity wake: stale sleep decision generation for zone "+std::to_string(z.Id()));
+        if(z.Activity()!=ZoneActivity::Sleeping) continue;
+        // Independently test exact resident geometry, not the scheduler's
+        // precomputed influenced set. Only the completed phase's input is
+        // obligatory here. Post-cut commits remain visible above and become
+        // obligatory at the very next phase, without resetting an age timer.
+        for(const auto& [net,entity]:z.Entities()) {
+            if(!entity.has<MobTag>() || entity.has<GhostTag>() || !entity.has<Position>()) continue;
+            const auto pos=entity.get<Position>();
+            for(const auto& p:frame->sources) {
+                const float d=(pos.x-p.x)*(pos.x-p.x)+(pos.y-p.y)*(pos.y-p.y);
+                if(d<frame->radius*frame->radius) {
+                    std::ostringstream message;
+                    message<<"activity wake: missed phase generation="<<frame->generation<<" zone="<<z.Id()<<" mob="<<net
+                           <<" source="<<p.net_id<<" commit_seq="<<p.commit_sequence<<" commit_ns="<<p.commit_steady_ns<<" cut_ns="<<frame->cut_steady_ns;
+                    return Fail(error,message.str());
+                }
+            }
+        }
+    }
     return true;
 }
 

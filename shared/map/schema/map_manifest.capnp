@@ -9,7 +9,7 @@ $Cxx.namespace("mx::map::schema");
 #   chunk grid is ceil(worldSizeCells / chunkSizeCells) per axis and
 #   zoneGridDims / zoneSizeCells are NOT chunk or zone information for the
 #   server (ignored; historically the generator wrote the chunk count there).
-# formatVersion 3 (current): adds @12..@16 below. zoneGridDims and
+# formatVersion 3 (current): adds @12..@17 below. zoneGridDims and
 #   zoneSizeCells must be zero (the map format carries no server-zone
 #   concept), worldLogicFile / environmentFile must be empty (references come
 #   from `layers`). New fields are appended only, so a v2 reader parses a v3
@@ -48,7 +48,8 @@ enum LayerKind {
   splatB @3;       # chunk section 4, RGBA8 (client render data)
   worldLogic @4;   # MXL1 binary: bootstrap zones, spawn regions, warps
   mobSpawns @5;    # text spawn table (mob_spawns format v1)
-  water @6;        # MXWB water bodies (client; no server validator yet)
+  water @6;        # MXWB water bodies (client render data; the server does not read it)
+  waterBodies @7;  # MXWS server water bodies (MAP-3; with water.model = bodies)
 }
 
 enum LayerAudience {
@@ -73,6 +74,35 @@ struct ChunkRef {
   crc32 @4 :UInt32;     # CRC-32 (IEEE 802.3, zlib crc32) of the whole file
 }
 
+# Height layer version 2 (MAP-2 range extension): meters = offsetMeters +
+# raw * metersPerUnit, raw stored as the chosen sample type. Height layer
+# version 1 is fixed: int16, 0.01 m per unit, offset 0 (field unset).
+enum HeightSampleType {
+  int16 @0;
+  int32 @1;
+}
+
+struct HeightEncoding {
+  sampleType @0 :HeightSampleType;
+  metersPerUnit @1 :Float64;
+  offsetMeters @2 :Float64;
+}
+
+# Water capability (MAP-3). Undeclared (the field absent or model =
+# undeclared) means UNKNOWN: server water queries answer UnsupportedLayer,
+# never "land".
+enum WaterModel {
+  undeclared @0;
+  none @1;        # the world has no water
+  seaLevel @2;    # one global water surface at seaLevelMeters
+  bodies @3;      # local water bodies from the waterBodies layer
+}
+
+struct WaterDecl {
+  model @0 :WaterModel;
+  seaLevelMeters @1 :Float64;
+}
+
 struct MapManifest {
   formatVersion @0 :UInt32;
   worldId @1 :Text;
@@ -91,4 +121,6 @@ struct MapManifest {
   chunkGrid @14 :GridDims;       # v3: chunk count per axis
   layers @15 :List(LayerDecl);   # v3
   chunks @16 :List(ChunkRef);    # v3: exactly one entry per chunk grid cell
+  heightEncoding @17 :HeightEncoding; # v3, height layer version 2 only
+  water @18 :WaterDecl;          # v3 (MAP-3): the water capability of the world
 }

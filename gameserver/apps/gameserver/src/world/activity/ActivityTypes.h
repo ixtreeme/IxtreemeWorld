@@ -111,6 +111,10 @@ struct PlayerInfluenceSource {
     // Source zone tick at publish. Bounds snapshot staleness for auditing;
     // readers never branch gameplay on it.
     std::uint32_t tick = 0;
+    std::uint64_t commit_sequence = 0; // scoped to stable zone incarnation
+    std::uint64_t commit_steady_ns = 0;
+    std::uint32_t commit_world_tick = 0;
+    std::uint64_t pending_since_ns = 0; // first unconsumed update, never reset by repeats
 };
 
 // Radii snapshot carried by every immutable field generation, so queries

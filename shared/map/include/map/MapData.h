@@ -49,20 +49,31 @@ struct Rect {
     float max_x = 0.0f;
     float max_y = 0.0f;
 
+    // Closed [min, max] test (legacy client semantics, unchanged).
     bool Contains(float x, float y) const noexcept;
+    // Half-open [min, max): the server's single area/ownership rule (MAP-2,
+    // R9) -- a point on a shared edge belongs to exactly one rectangle.
+    bool ContainsHalfOpen(float x, float y) const noexcept;
     float CenterX() const noexcept;
     float CenterY() const noexcept;
 };
 
+// Worldlogic "zone" records are logical AREAS (design metadata: name +
+// rectangle, referenced by spawn regions). Since MAP-2 they have their own
+// AreaId namespace and are never server simulation zones (ZoneId). The struct
+// keeps its historic name for the client API.
+using AreaId = std::uint32_t;
+
 struct Zone {
-    std::uint32_t id = 0;
+    AreaId id = 0;
     std::string name;
     Rect bounds;
 };
+using Area = Zone;
 
 struct SpawnRegion {
     std::uint32_t id = 0;
-    std::uint32_t zone_id = 0;
+    std::uint32_t zone_id = 0; // area id (MXL1 field "zoneId"); 0 = no area (world-level)
     Rect bounds;
 };
 

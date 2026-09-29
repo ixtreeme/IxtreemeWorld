@@ -26,10 +26,12 @@ EntityTransfer BuildTransfer(flecs::entity entity, bool is_player, std::uint16_t
     }
     if (is_player) {
         transfer.session = entity.get<SessionRef>().session;
+        if (entity.has<WarpState>()) transfer.warp_state = entity.get<WarpState>();
     } else {
         transfer.wander = entity.get<WanderState>();
         transfer.mob_type_id = entity.get<MobTypeRef>().id;
         transfer.spawn_point_index = entity.get<MobSpawnRef>().spawn_point_index;
+        transfer.spawn_id = entity.get<MobSpawnRef>().spawn_id;
         transfer.profile = entity.get<MobProfile>();
         // LOD rides along only when present; absence means "treat as fresh
         // Full" on apply (the validator flags lod-less mobs loudly).
@@ -66,10 +68,11 @@ flecs::entity ApplyTransfer(flecs::world& world, const EntityTransfer& transfer)
                       .set<TransformVersion>({transfer.transform_version});
     if (transfer.is_player) {
         entity.set<SessionRef>({transfer.session}).add<PlayerTag>();
+        entity.set<WarpState>(transfer.warp_state);
     } else {
         entity.set<WanderState>(transfer.wander)
             .set<MobTypeRef>({transfer.mob_type_id})
-            .set<MobSpawnRef>({transfer.spawn_point_index})
+            .set<MobSpawnRef>({transfer.spawn_point_index, transfer.spawn_id})
             .set<MobProfile>(transfer.profile)
             .set<SimulationLod>(transfer.sim_lod)
             .add<MobTag>();

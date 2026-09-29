@@ -56,6 +56,8 @@
 #include "BenchSnapshot.h"
 #include "BenchWorld.h"
 #include "HardeningBench.h"
+#include "ClosureBench.h"
+#include "../world/activity/WakeCaptureProfile.h"
 #include "ReadinessBench.h"
 
 #include <flecs.h>
@@ -115,6 +117,7 @@ struct BenchConfig {
     int budget_records = 0;        // per-session per-frame record budget (0 = off)
     int resync_ticks = 0;          // full-state resync period (0 = default)
     int workers = 0;               // scheduler audit: explicit worker count (0 = auto)
+    std::uint64_t work_iterations = 1000000;
     // Hardening H0/H1 tick-rate audit (--mode tickrate).
     std::string rates = "20,30,60,144,flood";
     int measure_seconds = 4;
@@ -124,6 +127,12 @@ struct BenchConfig {
     std::string net_cases = "all";
     // Hardening H9 zone reclamation (--mode reclamation).
     int reclaim_cycles = 100;
+    // MAP-2 review bootstrap ladder (--mode bootstrap --grid N).
+    int bootstrap_grid = 32;
+    // MAP-3 streaming soak terrain cache (--mode streamsoak --budget-mb M).
+    int soak_budget_mb = 16;
+    bool file_world = false;
+    bool eager_terrain = false;
     // MAP-1 world package corpus (--mode worldpackage).
     std::string fixtures_out;
 };
@@ -150,7 +159,8 @@ bool ParseArgs(int argc, char** argv, BenchConfig& config)
                          "             [--fail-snapshot N] [--fail-apply N] [--fail-after N]\n"
                          "             [--partition-min-size M] [--lod-off] [--loadfield-off]\n"
                          "             [--scenario NAME] [--world-km K] [--zones-x N] [--zones-y N]\n"
-                         "             [--warmup S] [--asf-off]\n"
+                         "             [--warmup S] [--asf-off] [--file-world] [--eager-terrain] [--budget-mb M]\n"
+                         "             [--mode map4|mapaudit|worldpackage|terrain|mapsplit|streaming|worldquery|streamlife|streamadmission|streamsoak]\n"
                          "             [--mode tickrate] [--rates 20,30,60,144,flood] [--measure-seconds S]\n";
             return false;
         } else if (arg == "--players") {
@@ -210,6 +220,16 @@ bool ParseArgs(int argc, char** argv, BenchConfig& config)
                 return false;
             }
             config.fixtures_out = value;
+        } else if (arg == "--budget-mb") {
+            if (!need_value("budget-mb", value)) {
+                return false;
+            }
+            config.soak_budget_mb = std::stoi(value);
+        } else if (arg == "--grid") {
+            if (!need_value("grid", value)) {
+                return false;
+            }
+            config.bootstrap_grid = std::stoi(value);
         } else if (arg == "--cycles") {
             if (!need_value("cycles", value)) {
                 return false;
@@ -262,6 +282,10 @@ bool ParseArgs(int argc, char** argv, BenchConfig& config)
                 return false;
             }
             config.scenario = value;
+        } else if (arg == "--file-world") {
+            config.file_world = true;
+        } else if (arg == "--eager-terrain") {
+            config.eager_terrain = true;
         } else if (arg == "--world-km") {
             if (!need_value("world-km", value)) {
                 return false;
@@ -298,6 +322,11 @@ bool ParseArgs(int argc, char** argv, BenchConfig& config)
             config.repl_v1 = true;
         } else if (arg == "--netlod-off") {
             config.netlod_off = true;
+        } else if (arg == "--wake-profile") {
+            gs::game::wake_profile::enabled.store(true);
+        } else if (arg == "--work-iterations") {
+            if (!need_value("work-iterations", value)) return false;
+            config.work_iterations = std::stoull(value);
         } else if (arg == "--workers") {
             if (!need_value("workers", value)) {
                 return false;
@@ -326,13 +355,19 @@ bool ParseArgs(int argc, char** argv, BenchConfig& config)
         config.mode != "partitionscore" && config.mode != "stability" &&
         config.mode != "readiness" && config.mode != "ghost" && config.mode != "aoi" &&
         config.mode != "replication" && config.mode != "scheduler" &&
+        config.mode != "schedulercontract" && config.mode != "schedulerwork" &&
+        config.mode != "activitytemporalrepro" &&
+        config.mode != "activitytemporal" && config.mode != "captureprobe" && config.mode != "terrainwait" && config.mode != "tc4temporal" &&
         config.mode != "tickrate" && config.mode != "inputpath" &&
         config.mode != "netstress" && config.mode != "presence" &&
         config.mode != "asfdeterminism" && config.mode != "workerpool" &&
         config.mode != "replv2" && config.mode != "protocol" &&
         config.mode != "reclamation" && config.mode != "hygiene" &&
         config.mode != "mapaudit" && config.mode != "snapshot" &&
-        config.mode != "worldpackage") {
+        config.mode != "worldpackage" && config.mode != "terrain" && config.mode != "bootstrap" &&
+        config.mode != "streaming" && config.mode != "worldquery" && config.mode != "streamsoak" &&
+        config.mode != "streamlife" && config.mode != "streamadmission" && config.mode != "map4" &&
+        config.mode != "mapsplit") {
         std::cerr << "bad mode: " << config.mode << "\n";
         return false;
     }
@@ -1081,7 +1116,7 @@ int RunSplitMergeScenario(boost::asio::io_context& io, const BenchConfig& config
         }
     };
 
-    gs::game::WorldRuntime sim(io, {}, gs::bench::LoadBenchTestWorld());
+    gs::game::WorldRuntime sim(io, {}, gs::bench::LoadBenchTestWorld(), gs::bench::LegacyTestMapLayout());
     auto validate_now = [&](const char* what) -> bool {
         sim.RequestValidation();
         for (int i = 0; i < 100; ++i) {
@@ -1452,7 +1487,7 @@ int RunLodScenario(boost::asio::io_context& io, const BenchConfig& config)
         }
     };
 
-    gs::game::WorldRuntime sim(io, {}, gs::bench::LoadBenchTestWorld());
+    gs::game::WorldRuntime sim(io, {}, gs::bench::LoadBenchTestWorld(), gs::bench::LegacyTestMapLayout());
     auto validate_now = [&](const char* what) -> bool {
         sim.RequestValidation();
         for (int i = 0; i < 100; ++i) {
@@ -1714,7 +1749,7 @@ int RunActivityScenario(boost::asio::io_context& io, const BenchConfig& config)
         }
     };
 
-    gs::game::WorldRuntime sim(io, {}, gs::bench::LoadBenchTestWorld());
+    gs::game::WorldRuntime sim(io, {}, gs::bench::LoadBenchTestWorld(), gs::bench::LegacyTestMapLayout());
     auto validate_now = [&](const char* what) -> bool {
         sim.RequestValidation();
         for (int i = 0; i < 100; ++i) {
@@ -2064,7 +2099,7 @@ int RunLoadFieldScenario(boost::asio::io_context& io, const BenchConfig& config)
         }
     };
 
-    gs::game::WorldRuntime sim(io, {}, gs::bench::LoadBenchTestWorld());
+    gs::game::WorldRuntime sim(io, {}, gs::bench::LoadBenchTestWorld(), gs::bench::LegacyTestMapLayout());
 
     auto validate_now = [&](const char* what) -> bool {
         sim.RequestLoadFieldValidation();
@@ -2994,7 +3029,7 @@ int RunPartitionScoreScenario(boost::asio::io_context& io, const BenchConfig& co
         }
     };
 
-    gs::game::WorldRuntime sim(io, {}, gs::bench::LoadBenchTestWorld());
+    gs::game::WorldRuntime sim(io, {}, gs::bench::LoadBenchTestWorld(), gs::bench::LegacyTestMapLayout());
     auto validate_now = [&](const char* what) -> bool {
         sim.RequestValidation();
         for (int i = 0; i < 100; ++i) {
@@ -3327,7 +3362,7 @@ int RunStabilityScenario(boost::asio::io_context& io, const BenchConfig& config)
         }
     };
 
-    gs::game::WorldRuntime sim(io, {}, gs::bench::LoadBenchTestWorld());
+    gs::game::WorldRuntime sim(io, {}, gs::bench::LoadBenchTestWorld(), gs::bench::LegacyTestMapLayout());
     auto validate_now = [&](const char* what) -> bool {
         sim.RequestValidation();
         for (int i = 0; i < 100; ++i) {
@@ -3666,7 +3701,7 @@ int RunGhostScenario(boost::asio::io_context& io, const BenchConfig& config)
         }
     };
 
-    gs::game::WorldRuntime sim(io, {}, gs::bench::LoadBenchTestWorld());
+    gs::game::WorldRuntime sim(io, {}, gs::bench::LoadBenchTestWorld(), gs::bench::LegacyTestMapLayout());
     auto validate_now = [&](const char* what) -> bool {
         sim.RequestValidation();
         for (int i = 0; i < 100; ++i) {
@@ -3976,7 +4011,7 @@ int RunAoiReplicationScenario(boost::asio::io_context& io,
         }
     };
 
-    gs::game::WorldRuntime sim(io, {}, gs::bench::LoadBenchTestWorld());
+    gs::game::WorldRuntime sim(io, {}, gs::bench::LoadBenchTestWorld(), gs::bench::LegacyTestMapLayout());
     // Long refresh period: the "clean -> suppressed" window must be
     // observable, and the staggered refresh must not interfere with the
     // dirty assertions. Production default is 20 ticks (1 s).
@@ -4921,6 +4956,56 @@ int BenchMain(int argc, char** argv)
         std::printf("BENCH-DONE worldpackage failures=%d\n", scenario_failures);
         return scenario_failures == 0 ? 0 : 2;
     }
+    if (config.mode == "map4") {
+        return gs::bench::RunMap4Scenario() == 0 ? 0 : 2;
+    }
+    if (config.mode == "terrain") {
+        // MAP-2: terrain oracle + runtime edge rules on file-backed worlds.
+        const int scenario_failures = gs::bench::RunTerrainScenario();
+        std::printf("BENCH-DONE terrain failures=%d\n", scenario_failures);
+        return scenario_failures == 0 ? 0 : 2;
+    }
+    if (config.mode == "streamsoak") {
+        // MAP-3: 100 km streaming soak (--cycles N = seconds, default 60;
+        // --budget-mb M = terrain cache, default 16).
+        const int seconds = config.reclaim_cycles == 100 ? 60 : config.reclaim_cycles;
+        const int scenario_failures = gs::bench::RunStreamingSoak(seconds, config.soak_budget_mb);
+        std::printf("BENCH-DONE streamsoak failures=%d\n", scenario_failures);
+        return scenario_failures == 0 ? 0 : 2;
+    }
+    if (config.mode == "streamlife") {
+        // MAP-3 review follow-up: lifetime / failure-path / lifecycle.
+        const int scenario_failures = gs::bench::RunStreamLifecycleScenario();
+        std::printf("BENCH-DONE streamlife failures=%d\n", scenario_failures);
+        return scenario_failures == 0 ? 0 : 2;
+    }
+    if (config.mode == "streamadmission") {
+        return gs::bench::RunStreamAdmissionScenario();
+    }
+    if (config.mode == "worldquery") {
+        // MAP-3: collision / water / navigation queries.
+        const int scenario_failures = gs::bench::RunWorldQueryScenario();
+        std::printf("BENCH-DONE worldquery failures=%d\n", scenario_failures);
+        return scenario_failures == 0 ? 0 : 2;
+    }
+    if (config.mode == "streaming") {
+        // MAP-3: chunk streaming, budget, lifetime, runtime integration.
+        const int scenario_failures = gs::bench::RunStreamingScenario();
+        std::printf("BENCH-DONE streaming failures=%d\n", scenario_failures);
+        return scenario_failures == 0 ? 0 : 2;
+    }
+    if (config.mode == "bootstrap") {
+        // MAP-2 review: aggregate bootstrap resources (--grid N, default 32).
+        const int scenario_failures = gs::bench::RunBootstrapScenario(config.bootstrap_grid);
+        std::printf("BENCH-DONE bootstrap failures=%d\n", scenario_failures);
+        return scenario_failures == 0 ? 0 : 2;
+    }
+    if (config.mode == "mapsplit") {
+        // MAP-2: split/merge ladder from the real loader.
+        const int scenario_failures = gs::bench::RunMapSplitScenario();
+        std::printf("BENCH-DONE mapsplit failures=%d\n", scenario_failures);
+        return scenario_failures == 0 ? 0 : 2;
+    }
     if (config.mode == "snapshot") {
         // MAP-0: bench snapshot consistency under split/merge/reclaim churn
         // (--cycles N, default 100).
@@ -4962,6 +5047,15 @@ int BenchMain(int argc, char** argv)
         return scenario_failures == 0 ? 0 : 2;
     }
 
+    if (config.mode == "terrainwait") return gs::bench::RunTerrainWaitTests();
+    if (config.mode == "tc4temporal") return gs::bench::RunTC4TemporalTests();
+    if (config.mode == "captureprobe") return gs::bench::RunCaptureProbe(config.players,config.reclaim_cycles,config.scenario.c_str());
+    if (config.mode == "schedulercontract" || config.mode == "schedulerwork") {
+        return gs::bench::RunSchedulerContract(config.workers > 0 ? config.workers : 4,
+            config.mode == "schedulerwork", config.work_iterations);
+    }
+    if (config.mode == "activitytemporalrepro") return gs::bench::RunActivityTemporalReproduction();
+    if (config.mode == "activitytemporal") return gs::bench::RunActivityTemporalReproduction(true);
     if (config.mode == "scheduler") {
         // Phase 7 zone worker scheduler / multicore audit scenario.
         boost::asio::io_context sched_io;
@@ -5001,6 +5095,9 @@ int BenchMain(int argc, char** argv)
         readiness.resync_ticks = config.resync_ticks;
         readiness.workers = config.workers;
         readiness.seed = config.seed;
+        readiness.file_world = config.file_world;
+        readiness.eager_terrain = config.eager_terrain;
+        readiness.terrain_budget_mb = config.soak_budget_mb;
         boost::asio::io_context readiness_io;
         std::thread readiness_io_thread([&readiness_io] { readiness_io.run(); });
         const int scenario_failures = gs::bench::RunReadinessBenchmark(readiness_io, readiness);
@@ -5025,7 +5122,7 @@ int BenchMain(int argc, char** argv)
     std::uint64_t start_attacks = 0;
 
     {
-        gs::game::WorldRuntime sim(io, {}, gs::bench::LoadBenchTestWorld());
+        gs::game::WorldRuntime sim(io, {}, gs::bench::LoadBenchTestWorld(), gs::bench::LegacyTestMapLayout());
         // All configuration is applied pre-Start: zone-bound resources (LOD
         // switch, load-bin mapping, partition limits) must not be rebound
         // while a worker tick can be in flight.

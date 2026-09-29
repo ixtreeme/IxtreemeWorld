@@ -4,6 +4,7 @@
 
 #include "../WorldConstants.h"
 #include "../components/MigrationComponents.h"
+#include "../components/WarpState.h"
 #include "../spatial/SpatialTypes.h"
 #include "../zone/Zone.h"
 #include "../zone/ZoneManager.h"
@@ -25,10 +26,11 @@ void MigrationSystem::UpdateMarker(Zone& zone,
     const std::size_t target_zone_index = zones.FindIndexForPosition(position.x, position.y);
     std::uint32_t target_zone_id = 0;
 
+    const bool warp = entity.has<WarpState>() && entity.get<WarpState>().transfer_pending;
     if (target_zone_index < zones.ZoneCount() && target_zone_index != current_zone_index &&
-        DistanceOutsideRect(zone.Bounds(), position) > kMigrationHysteresisMeters) {
+        (warp || DistanceOutsideRect(zone.Bounds(), position) > kMigrationHysteresisMeters)) {
         const auto& neighbors = zones.NeighborsOf(current_zone_index);
-        if (std::find(neighbors.begin(), neighbors.end(), target_zone_index) != neighbors.end()) {
+        if (warp || std::find(neighbors.begin(), neighbors.end(), target_zone_index) != neighbors.end()) {
             target_zone_id = zones.GetZone(target_zone_index).Id();
         }
     }

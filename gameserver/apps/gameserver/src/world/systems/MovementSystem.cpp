@@ -10,6 +10,7 @@
 #include "../components/AiComponents.h"
 #include "../components/MobComponents.h"
 #include "../components/MovementComponents.h"
+#include "../components/WarpState.h"
 #include "../components/NetworkComponents.h"
 #include "../components/SimulationLod.h"
 #include "../components/Tags.h"
@@ -36,43 +37,82 @@ float IntentSpeed(const MoveIntent& intent, const MoveSpeed& speed)
     return 0.0f;
 }
 
-void TryApplyWarp(Zone& zone, ZoneTickContext& ctx, Position& position, gs::common::SessionId session_id)
+void TryApplyWarp(Zone& zone, ZoneTickContext& ctx, Position& position,
+                  WarpState& state, float dt)
 {
     AssertZoneOwner(zone, "zone warp application");
-
-    const auto* warp = ctx.world_logic.FindWarp(position.x, position.y);
-    if (warp == nullptr) {
+    auto& metrics = zone.TerrainDemand().Counters();
+    state.cooldown_seconds = std::max(0.0f, state.cooldown_seconds - dt);
+    const mx::map::WarpRegion* warp = nullptr;
+    for (const auto& candidate : ctx.world_logic.warps) {
+        if (candidate.source.ContainsHalfOpen(position.x, position.y)) {
+            warp = &candidate;
+            break;
+        }
+    }
+    if (state.pending_id != 0 && (!warp || warp->id != state.pending_id)) {
+        if(state.terrain_request) state.terrain_request->Cancel();
+        state.terrain_request.reset();
+        state.pending_id = 0;
+        state.pending_seconds = 0;
+        ++state.cancelled;
+        ++metrics.warps_cancelled;
+    }
+    if (!warp) {
+        if (state.cooldown_seconds == 0.0f) state.armed = true;
         return;
     }
-
-    if (!ctx.terrain.IsWalkable(warp->target_x, warp->target_y)) {
-        LOG_WARN("Warp {} target {}, {} is blocked; ignoring warp", warp->id, warp->target_x, warp->target_y);
+    if (state.pending_id == 0) {
+        if (!state.armed) return;
+        state.armed = false;
+        state.pending_id = warp->id;
+        state.pending_seconds = 0;
+    }
+    state.pending_seconds += dt;
+    if (state.pending_seconds > 5.0f) {
+        if(state.terrain_request) state.terrain_request->Cancel();
+        state.terrain_request.reset();
+        state.pending_id = 0;
+        ++state.timed_out;
+        ++metrics.warps_timed_out;
         return;
     }
-
-    const std::size_t target_zone_index = ctx.zones.FindIndexForPosition(warp->target_x, warp->target_y);
-    if (target_zone_index >= ctx.zones.ZoneCount() ||
-        ctx.zones.GetZone(target_zone_index).Id() != zone.Id()) {
-        LOG_WARN("Warp {} target {}, {} leaves home zone {}; cross-zone warp is not enabled in M4",
-                 warp->id,
-                 warp->target_x,
-                 warp->target_y,
-                 zone.Id());
+    if(state.terrain_request) {
+        const auto status=state.terrain_request->Status();
+        if(status!=TerrainRequestStatus::Pending && status!=TerrainRequestStatus::Ready) {
+            state.pending_id=0;
+            if(status==TerrainRequestStatus::TimedOut) {++state.timed_out; ++metrics.warps_timed_out;}
+            else {++state.refused; ++metrics.warps_refused;}
+            state.terrain_request.reset();
+            return;
+        }
+    }
+    const auto cell = ctx.terrain.Cell(warp->target_x, warp->target_y);
+    const auto height = ctx.terrain.Height(warp->target_x, warp->target_y);
+    if (cell.status == mx::map::TerrainStatus::NotResident ||
+        height.status == mx::map::TerrainStatus::NotResident) {
+        if(!state.terrain_request && ctx.prepare_terrain)
+            state.terrain_request=ctx.prepare_terrain(warp->target_x,warp->target_y);
+        zone.TerrainDemand().Add(ctx.terrain.ChunkIndexOf(warp->target_x, warp->target_y));
+        metrics.warp_wait_seconds += dt;
         return;
     }
-
-    LOG_INFO("Session {} triggered warp {} in home zone {} from {}, {} to {}, {}",
-             session_id,
-             warp->id,
-             zone.Id(),
-             position.x,
-             position.y,
-             warp->target_x,
-             warp->target_y);
-    position.x = warp->target_x;
-    position.y = warp->target_y;
+    const auto target = ctx.zones.FindIndexForPosition(warp->target_x, warp->target_y);
+    state.pending_id = 0;
+    if(state.terrain_request) state.terrain_request->Consume();
+    state.terrain_request.reset();
+    if (!cell.Walkable() || !height.Ok() || target >= ctx.zones.ZoneCount()) {
+        // One refusal per entry, no tick-rate log flood or partial teleport.
+        ++state.refused;
+        ++metrics.warps_refused;
+        return;
+    }
+    position = {warp->target_x, warp->target_y, height.meters};
+    state.cooldown_seconds = 1.0f;
+    state.transfer_pending = ctx.zones.GetZone(target).Id() != zone.Id();
+    ++state.completed;
+    ++metrics.warps_completed;
 }
-
 } // namespace
 
 void MovementSystem::Step(Zone& zone, float dt, ZoneTickContext& ctx)
@@ -82,7 +122,52 @@ void MovementSystem::Step(Zone& zone, float dt, ZoneTickContext& ctx)
     // Two-phase iteration with only narrow const queries: wide query-each()
     // with an entity plus 6+ components crashes MSVC 14.51 (ICE), so handles
     // are collected first and components are read/updated per entity after.
-    const float max_extent = ctx.terrain.WorldExtentMeters();
+    // Out-of-world rule (MAP-2, R10): a step whose target is outside the
+    // half-open world, or has no terrain data, is refused on that axis --
+    // never clamped onto the edge. Height follows the terrain query status:
+    // an unknown height keeps the previous z instead of becoming 0 m.
+    auto ground_z = [&ctx](const Position& p, float previous_z) {
+        const auto height = ctx.terrain.Height(p.x, p.y);
+        return height.Ok() ? height.meters : previous_z;
+    };
+
+    // MAP-3: terrain demand (streaming worlds) and query outcome counters.
+    // A step's whole path is checked (collision across chunk borders, not
+    // just the destination sample); a path over a chunk that is not loaded
+    // is refused THIS tick and the chunk demanded -- the entity waits in
+    // place (bounded by the load latency), nothing is guessed.
+    const bool streaming = ctx.terrain.Streaming();
+    const float lookahead = streaming ? ctx.terrain.LookaheadSeconds() : 0.0f;
+    auto& demand = zone.TerrainDemand();
+    auto& counters = demand.Counters();
+    auto try_step = [&](float from_x, float from_y, float to_x, float to_y) {
+        ++counters.steps_attempted;
+        const StepCheck step = ctx.terrain.CheckStep(from_x, from_y, to_x, to_y);
+        switch (step.result) {
+        case StepResult::Clear:
+            ++counters.ok;
+            return true;
+        case StepResult::NotResident:
+            ++counters.not_resident;
+            ++counters.steps_waiting;
+            demand.Add(step.chunk);
+            return false;
+        case StepResult::InvalidData:
+            // Permanently unusable data (chunk published invalid): refused,
+            // not "waiting" -- no demand, nothing will arrive.
+            ++counters.invalid;
+            return false;
+        case StepResult::OutsideWorld:
+            ++counters.outside;
+            return false;
+        case StepResult::Blocked:
+        case StepResult::TooSteep:
+        case StepResult::DeepWater:
+            ++counters.steps_blocked;
+            return false;
+        }
+        return false;
+    };
 
     std::vector<flecs::entity> players;
     players.reserve(static_cast<std::size_t>(zone.Diagnostics().player_count.load(std::memory_order_relaxed)));
@@ -115,6 +200,14 @@ void MovementSystem::Step(Zone& zone, float dt, ZoneTickContext& ctx)
         const auto net = entity.get<NetId>();
         const auto speed = entity.get<MoveSpeed>();
         auto position = entity.get<Position>();
+        auto warp_state = entity.has<WarpState>() ? entity.get<WarpState>() : WarpState{};
+        if (warp_state.transfer_pending) {
+            if (ctx.zones.FindIndexForPosition(position.x, position.y) != ctx.zones.FindIndexById(zone.Id())) {
+                MigrationSystem::UpdateMarker(zone, ctx.zones, ctx.migration_queue, net.value, entity, position);
+                continue; // freeze the validated landing point until ownership commits
+            }
+            warp_state.transfer_pending = false;
+        }
         const Position before_move = position;
         auto heading = entity.get<Heading>();
         const float before_heading_angle = heading.angle;
@@ -131,22 +224,32 @@ void MovementSystem::Step(Zone& zone, float dt, ZoneTickContext& ctx)
 
         const float dx = velocity.x * dt;
         const float dy = velocity.y * dt;
-        const float next_x = std::clamp(position.x + dx, 0.0f, max_extent);
-        if (ctx.terrain.IsWalkable(next_x, position.y)) {
+        if (streaming) {
+            // A player keeps its chunk resident even when standing still; a
+            // moving one also pre-fetches where it will be one load latency
+            // (x3, see TerrainStreamer::LookaheadSeconds) from now.
+            demand.Add(ctx.terrain.ChunkIndexOf(position.x, position.y));
+            if (move_speed > 0.0f) {
+                demand.Add(ctx.terrain.ChunkIndexOf(position.x + velocity.x * lookahead,
+                                                    position.y + velocity.y * lookahead),TerrainPriority::Prefetch);
+            }
+        }
+        // Per axis: a step whose path is not clear (outside, not resident,
+        // blocked, too steep, deep water) is refused on that axis -- never
+        // clamped onto an edge (R10); the other axis may still move.
+        const float next_x = position.x + dx;
+        if (dx != 0.0f && try_step(position.x, position.y, next_x, position.y)) {
             position.x = next_x;
         }
 
-        const float next_y = std::clamp(position.y + dy, 0.0f, max_extent);
-        if (ctx.terrain.IsWalkable(position.x, next_y)) {
+        const float next_y = position.y + dy;
+        if (dy != 0.0f && try_step(position.x, position.y, position.x, next_y)) {
             position.y = next_y;
         }
 
-        gs::common::SessionId session_id = 0;
-        if (const auto* binding = zone.FindPlayer(net.value)) {
-            session_id = binding->session ? binding->session->Id() : 0;
-        }
-        TryApplyWarp(zone, ctx, position, session_id);
-        position.z = ctx.terrain.SampleGroundHeight(position.x, position.y);
+        TryApplyWarp(zone, ctx, position, warp_state, dt);
+        entity.set<WarpState>(warp_state);
+        position.z = ground_z(position, before_move.z);
         note_moved(entity, before_move, position);
         // Phase 5B: the replicated transform (position/heading/move_state)
         // changed -> stamp the version the dirty replication compares against.
@@ -158,7 +261,7 @@ void MovementSystem::Step(Zone& zone, float dt, ZoneTickContext& ctx)
         if (auto* load = zone.LoadBins().CellFor(position.x, position.y)) {
             ++load->sim_work;
         }
-        entity.set<Position>(position);
+        zone.CommitPlayerPosition(entity, net.value, position);
         entity.set<Heading>(heading);
         entity.set<Velocity>(velocity);
         entity.set<MoveIntent>(intent);
@@ -232,20 +335,33 @@ void MovementSystem::Step(Zone& zone, float dt, ZoneTickContext& ctx)
         velocity.y = std::cos(intent.dir_angle) * move_speed;
         velocity.z = 0.0f;
 
-        position.x = std::clamp(position.x + velocity.x * dt_eff, 0.0f, max_extent);
-        position.y = std::clamp(position.y + velocity.y * dt_eff, 0.0f, max_extent);
-
-        const float from_center_x = position.x - wander.spawn_center.x;
-        const float from_center_y = position.y - wander.spawn_center.y;
+        // Candidate step, pulled back onto the wander leash (a gameplay
+        // rule), then accepted only if its whole path is clear: inside the
+        // world, with terrain data, no blocked cell (MAP-3: the blocking grid
+        // applies to mobs too; a large low-LOD step cannot tunnel through a
+        // one-cell wall), within the slope / water rules.
+        if (streaming) {
+            demand.Add(ctx.terrain.ChunkIndexOf(position.x, position.y));
+        }
+        Position next = position;
+        next.x = position.x + velocity.x * dt_eff;
+        next.y = position.y + velocity.y * dt_eff;
+        const float from_center_x = next.x - wander.spawn_center.x;
+        const float from_center_y = next.y - wander.spawn_center.y;
         const float radius_sq = wander.spawn_radius * wander.spawn_radius;
         const float distance_sq = from_center_x * from_center_x + from_center_y * from_center_y;
         if (wander.spawn_radius > 0.0f && distance_sq > radius_sq) {
             const float distance = std::sqrt(distance_sq);
-            position.x = wander.spawn_center.x + (from_center_x / distance) * wander.spawn_radius;
-            position.y = wander.spawn_center.y + (from_center_y / distance) * wander.spawn_radius;
+            next.x = wander.spawn_center.x + (from_center_x / distance) * wander.spawn_radius;
+            next.y = wander.spawn_center.y + (from_center_y / distance) * wander.spawn_radius;
+        }
+        if ((next.x != position.x || next.y != position.y) &&
+            try_step(position.x, position.y, next.x, next.y)) {
+            position.x = next.x;
+            position.y = next.y;
         }
 
-        position.z = ctx.terrain.SampleGroundHeight(position.x, position.y);
+        position.z = ground_z(position, before_move.z);
         note_moved(entity, before_move, position);
         // Phase 5B: replicated transform changed -> stamp the version.
         if (before_move.x != position.x || before_move.y != position.y ||
@@ -271,6 +387,9 @@ void MovementSystem::Step(Zone& zone, float dt, ZoneTickContext& ctx)
         zone.Grid().Move(entity, net.value, old_cell, position);
         MigrationSystem::UpdateMarker(zone, ctx.zones, ctx.migration_queue, net.value, entity, position);
     }
+    // This tick's terrain demand + query outcomes become visible to the
+    // supervisor (streamer aggregation, metrics).
+    demand.Publish();
     zone.Diagnostics().transform_dirty_since_diag.fetch_add(moved_entities, std::memory_order_relaxed);
     zone.Diagnostics().lod_move_updates_since_diag.fetch_add(integrated, std::memory_order_relaxed);
 }

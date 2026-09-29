@@ -42,6 +42,8 @@
 #include "replication/ReplicationConfig.h"
 #include "spawn/SpawnCoordinator.h"
 #include "terrain/TerrainService.h"
+#include "terrain/NavigationService.h"
+#include "terrain/TerrainStreamer.h"
 #include "zone/ZoneManager.h"
 #include "zone/ZoneScheduler.h"
 #include "zone/ZoneWorkerPool.h"
@@ -72,13 +74,26 @@ public:
         // Empty: no mob types, except in builds that define the bench-only
         // IXTREEME_DEFAULT_MOB_TYPES_CONFIG (worldbench).
         std::string mob_types_config;
+        // Region grid over the world; the zone grid must divide into it.
+        std::uint32_t regions_x = 1;
+        std::uint32_t regions_y = 1;
     };
 
     // File-backed world from a validated package (MAP-1). The package is
     // loaded and checked BEFORE the runtime exists (WorldPackageLoader), so
     // construction cannot fail on world data. identity: node=1/process=1 is
     // the single-process deployment.
-    WorldRuntime(boost::asio::io_context& io, RuntimeIdentity identity, LoadedWorld world);
+    // `layout` is the server's initial partition (regions + initial leaves)
+    // over the package's bounds; an unusable layout throws
+    // std::invalid_argument (main validates it before the runtime exists).
+    // A streaming world (world.residency == Streaming) gets a terrain
+    // streamer with `streaming` (budget, I/O threads, ...); ignored for an
+    // eager world.
+    WorldRuntime(boost::asio::io_context& io,
+                 RuntimeIdentity identity,
+                 LoadedWorld world,
+                 const PartitionLayout& layout = {},
+                 const TerrainStreamingConfig& streaming = {});
     // Synthetic world (explicit mode). Same systems, different bootstrap.
     WorldRuntime(boost::asio::io_context& io,
                  RuntimeIdentity identity,
@@ -115,10 +130,13 @@ public:
     struct SnapshotContext {
         const ZoneManager& zones;
         const OwnerMap& owners;       // session -> owning zone slot/id
+        const PresenceRegistry& presence; // same quiescent mutation point
         std::uint64_t epoch = 0;      // strictly increasing, one per capture
         std::uint32_t world_tick = 0; // world tick at the capture point
         std::chrono::steady_clock::time_point captured_at{};
         ZoneManager::ReclaimStats reclaim{};
+        std::shared_ptr<const ActivityGrid> activity;
+        std::shared_ptr<const ActivityWakeFrame> wake_decision;
     };
     // Requests a capture; never blocks. While the runtime is not running
     // (before Start / after Stop) nothing else mutates the world, so the
@@ -167,7 +185,8 @@ public:
 
     void PostSpawn(std::shared_ptr<gs::network::Session> session,
                    gs::db::Character character,
-                   std::optional<DebugSpawnOverride> debug_spawn = std::nullopt);
+                   std::optional<DebugSpawnOverride> debug_spawn = std::nullopt,
+                   TerrainRequestHandle terrain_request = {});
     void PostDespawn(gs::common::SessionId session_id);
     void PostMoveInput(gs::common::SessionId session_id,
                        std::uint32_t sequence,
@@ -184,6 +203,12 @@ public:
     const ZoneManager& Zones() const noexcept
     {
         return zones_;
+    }
+    // Immutable after construction (never reloaded on split/merge), so a
+    // cross-thread read is safe.
+    const TerrainService& Terrain() const noexcept
+    {
+        return terrain_;
     }
     const OwnerMap& Owners() const noexcept
     {
@@ -316,9 +341,69 @@ public:
     }
     // World presence registry counters (H4): claims, releases, refused
     // duplicates and the live presence gauge (atomics, any thread).
+    // MAP-3 terrain residency + query outcome counters (thread-safe
+    // snapshots; streaming off -> the streamer part is empty).
+    struct TerrainStats {
+        bool streaming = false;
+        TerrainStreamer::Stats streamer;
+        TerrainQueryCounters queries;
+        std::uint64_t safepoints = 0, drain_wait_us = 0;
+        std::uint64_t commands_requested = 0, ingress_rejected = 0;
+        std::uint64_t supervisor_cpu_us=0, drain_max_us=0;
+    };
+    TerrainStats GetTerrainStats() const;
+    ZoneWorkerPool::Delays GetSchedulingDelays() const { return workers_.GetDelays(); }
+    // Streaming seams (benchmarks / tools): demand the chunks around a point
+    // (supervisor-side, like a consumer would) and reset the cache
+    // generation (simulated package switch).
+    void PostTerrainDemand(float x, float y, float radius_m);
+    // Running-world production operation, callable from any thread. No
+    // snapshot is needed; Ready pins the set through PostSpawn/Consume.
+    TerrainRequestHandle PrepareTerrain(float x, float y, float radius_m, double timeout_seconds = 5.0);
+    void BeginTerrainMeasurementWindow();
+    void PostTerrainResetForTest();
+    // Test seam: evicts every unpinned chunk nobody demanded for
+    // `idle_seconds` (what budget pressure would do), freeing only in a
+    // quiescent window like the regular path.
+    void PostTerrainEvictIdleForTest(double idle_seconds);
+    // Movement collision rules (slope / water); before Start.
+    void ConfigureMovementRules(const MovementRules& rules) noexcept
+    {
+        terrain_.SetMovementRules(rules);
+    }
+    // MAP-3 navigation (infrastructure; no gameplay caller yet): a grid path
+    // query executed on the supervisor with bounded work per pass. The id
+    // is returned at once; poll NavigationResult (Pending until terminal).
+    std::uint64_t PostNavigationRequest(const NavRequest& request);
+    void PostNavigationCancel(std::uint64_t id);
+    NavResult NavigationResult(std::uint64_t id) const
+    {
+        return navigation_.Result(id);
+    }
+    NavigationService::Stats NavigationStats() const
+    {
+        return navigation_.GetStats();
+    }
+    // Read-only world queries from any thread for tools/benches are NOT
+    // safe while streaming (eviction frees in quiescent windows): use a
+    // snapshot collector (supervisor) instead.
     PresenceRegistry::Stats PresenceStats() const noexcept
     {
         return spawn_.Presence().GetStats();
+    }
+    // Enters refused because no valid spawn position exists.
+    std::uint64_t PlayerSpawnRefusals() const noexcept
+    {
+        return spawn_.PlayerSpawnRefusals();
+    }
+    // MAP-3 spawn outcomes on missing / unusable terrain.
+    std::uint64_t MobSpawnsRefusedInvalidTerrain() const noexcept
+    {
+        return spawn_.MobSpawnsRefusedInvalidTerrain();
+    }
+    std::uint64_t RespawnsDroppedNoTerrain() const noexcept
+    {
+        return spawn_.RespawnsDroppedNoTerrain();
     }
     // Cumulative client-input path counters (posted/routed/applied/dropped).
     InputRouter::Stats InputStats() const
@@ -347,6 +432,7 @@ public:
         std::vector<std::uint64_t> worker_tasks;
     };
     SchedulerSnapshot SchedulerStats() const;
+    ZoneScheduler::WakeMetrics ActivityWakeMetrics() const { return scheduler_.GetWakeMetrics(); }
     std::size_t MigrationQuarantined() const;
     MigrationId LastCommittedMigration() const;
     MigrationMetrics::Snapshot MigrationMetrics() const;
@@ -496,10 +582,23 @@ private:
     // fields (activity + load). File-backed worlds pass their validated spawn
     // points (spawned at once); synthetic worlds pass none and register
     // their own before an explicit bulk spawn.
+    // Streaming setup of a file-backed world (MAP-3).
+    struct StreamingSetup {
+        std::shared_ptr<const mx::map::ChunkSource> source;
+        std::vector<std::uint32_t> startup_chunks;
+        TerrainStreamingConfig config;
+    };
     void InitializeWorld(TerrainService terrain,
                          mx::map::WorldLogic logic,
                          const std::string& mob_types_config,
-                         std::optional<std::vector<MobSpawnPoint>> package_spawn_points);
+                         std::optional<std::vector<MobSpawnPoint>> package_spawn_points,
+                         const PartitionLayout& layout,
+                         std::optional<StreamingSetup> streaming = std::nullopt);
+    // Streaming: spawns the configured mobs in batches of spawn circles whose
+    // chunks fit the terrain budget (blocking loads, before Start).
+    std::size_t SpawnConfiguredMobsStreaming();
+    // Supervisor: zone demand -> streamer, then one streamer control step.
+    void PumpTerrain();
     void Enqueue(std::function<void()> command);
     void Run();
     void TickZone(std::size_t zone_index);
@@ -611,6 +710,10 @@ private:
     std::mutex mutex_;
     std::condition_variable cv_;
     std::queue<std::function<void()>> commands_;
+    // MAP-3: an I/O worker finished a chunk load (guarded by mutex_, part of
+    // the supervisor's wait predicate -- a bare notify would be swallowed by
+    // the predicate and the completion would wait for the idle timeout).
+    bool terrain_completion_pending_ = false;
 
     ZoneManager zones_;
     ZoneScheduler scheduler_;
@@ -622,6 +725,20 @@ private:
     MigrationTransport migration_transport_;
 
     TerrainService terrain_;
+    // MAP-3: chunk streaming (null for eager / flat terrain). Declared after
+    // terrain_: it mutates terrain_'s published slots and is destroyed first.
+    std::unique_ptr<TerrainStreamer> streamer_;
+    std::vector<TerrainDemand> terrain_demand_scratch_;
+    std::chrono::steady_clock::time_point terrain_drain_started_{};
+    std::atomic<std::uint64_t> terrain_safepoints_{0}, terrain_drain_wait_us_{0};
+    std::atomic<std::uint64_t> terrain_commands_requested_{0}, terrain_ingress_rejected_{0};
+    std::atomic<std::uint64_t> supervisor_cpu_us_{0}, terrain_drain_max_us_{0};
+    std::atomic<std::uint32_t> terrain_commands_pending_{0};
+    mutable std::mutex terrain_stats_mutex_;
+    TerrainQueryCounters terrain_queries_;
+    NavigationService navigation_;
+    std::atomic<std::uint64_t> next_navigation_id_{0};
+    static constexpr std::uint32_t kNavigationExpansionsPerPass = 4000;
     mx::map::WorldLogic world_logic_;
     OwnerMap owners_by_session_;
     MigrationQueue migration_queue_;

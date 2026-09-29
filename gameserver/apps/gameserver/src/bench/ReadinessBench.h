@@ -59,6 +59,9 @@ struct ReadinessConfig {
     // Phase 7 scheduler audit: explicit worker count (0 = auto).
     int workers = 0;
     std::uint32_t seed = 20260922;
+    bool file_world = false;
+    bool eager_terrain = false;
+    int terrain_budget_mb = 16;
 };
 
 int RunReadinessBenchmark(boost::asio::io_context& io, const ReadinessConfig& config);

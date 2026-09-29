@@ -2,11 +2,29 @@
 
 #include <algorithm>
 #include <chrono>
+#include "../activity/WakeCaptureProfile.h"
+#ifdef _WIN32
+#define WIN32_LEAN_AND_MEAN
+#define NOMINMAX
+#include <Windows.h>
+#endif
 
 namespace gs::game {
 namespace {
 
 using Clock = std::chrono::steady_clock;
+
+std::uint64_t ThreadCpuUs()
+{
+#ifdef _WIN32
+    FILETIME created,exited,kernel,user;
+    if(GetThreadTimes(GetCurrentThread(),&created,&exited,&kernel,&user)) {
+        ULARGE_INTEGER k{},u{};k.LowPart=kernel.dwLowDateTime;k.HighPart=kernel.dwHighDateTime;
+        u.LowPart=user.dwLowDateTime;u.HighPart=user.dwHighDateTime;return (k.QuadPart+u.QuadPart)/10;
+    }
+#endif
+    return 0; // NOT MEASURED on unsupported platforms.
+}
 
 std::uint64_t Micros(const Clock::time_point& from, const Clock::time_point& to)
 {
@@ -72,11 +90,11 @@ void ZoneWorkerPool::Stop()
     workers_.clear();
 }
 
-void ZoneWorkerPool::Enqueue(std::size_t zone_index)
+void ZoneWorkerPool::Enqueue(std::size_t zone_index, Clock::time_point due)
 {
     {
         std::lock_guard lock(mutex_);
-        tasks_.push(zone_index);
+        tasks_.push({zone_index,due,Clock::now()});
     }
     cv_.notify_one();
 }
@@ -86,7 +104,7 @@ void ZoneWorkerPool::WorkerLoop(std::size_t worker_index)
     WorkerStat* stats = worker_index < worker_stats_.size() ? &worker_stats_[worker_index]
                                                             : nullptr;
     while (true) {
-        std::size_t zone_index = 0;
+        Task task{};
         const auto idle_start = Clock::now();
         {
             std::unique_lock lock(mutex_);
@@ -95,24 +113,34 @@ void ZoneWorkerPool::WorkerLoop(std::size_t worker_index)
             });
             if (stopping_.load()) {
                 if (stats != nullptr) {
-                    stats->idle_micros += Micros(idle_start, Clock::now());
+                    stats->idle_micros.fetch_add(Micros(idle_start, Clock::now()),std::memory_order_relaxed);
                 }
                 return;
             }
-            zone_index = tasks_.front();
+            task = tasks_.front();
             tasks_.pop();
         }
 
         const auto work_start = Clock::now();
-        tick_(zone_index);
+        const bool profiling=wake_profile::enabled.load(std::memory_order_relaxed);
+        const auto cpu_before=profiling?ThreadCpuUs():0;
+        tick_(task.index);
         const auto work_end = Clock::now();
+        if(profiling) wake_profile::counters[wake_profile::worker_cpu_us].fetch_add(ThreadCpuUs()-cpu_before,std::memory_order_relaxed);
+        if(task.due!=Clock::time_point{}) {
+            due_enqueue_us_.fetch_add(Micros(task.due,task.enqueued),std::memory_order_relaxed);
+            queue_us_.fetch_add(Micros(task.enqueued,work_start),std::memory_order_relaxed);
+            due_start_us_.fetch_add(Micros(task.due,work_start),std::memory_order_relaxed);
+            deadline_misses_.fetch_add(work_end>task.due+std::chrono::milliseconds(50),std::memory_order_relaxed);
+            delay_samples_.fetch_add(1,std::memory_order_relaxed);
+        }
 
         tasks_completed_.fetch_add(1, std::memory_order_relaxed);
         busy_micros_.fetch_add(Micros(work_start, work_end), std::memory_order_relaxed);
         if (stats != nullptr) {
-            ++stats->tasks;
-            stats->work_micros += Micros(work_start, work_end);
-            stats->idle_micros += Micros(idle_start, work_start);
+            stats->tasks.fetch_add(1,std::memory_order_relaxed);
+            stats->work_micros.fetch_add(Micros(work_start, work_end),std::memory_order_relaxed);
+            stats->idle_micros.fetch_add(Micros(idle_start, work_start),std::memory_order_relaxed);
         }
     }
 }

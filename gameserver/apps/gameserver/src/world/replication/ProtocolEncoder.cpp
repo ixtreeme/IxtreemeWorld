@@ -203,6 +203,14 @@ std::vector<std::uint8_t> MakeEnterWorldRejectAlreadyInWorld()
     return gs::protocol::SerializeToBytes(msg);
 }
 
+std::vector<std::uint8_t> MakeEnterWorldRejectServerError()
+{
+    capnp::MallocMessageBuilder msg;
+    auto packet = msg.initRoot<gs::protocol::Packet>();
+    packet.initEnterWorldReject().setReason(gs::protocol::S2cEnterWorldReject::RejectReason::SERVER_ERROR);
+    return gs::protocol::SerializeToBytes(msg);
+}
+
 std::vector<std::uint8_t> MakeSpawn(const BorderEntitySnapshot& snapshot)
 {
     capnp::MallocMessageBuilder msg;
