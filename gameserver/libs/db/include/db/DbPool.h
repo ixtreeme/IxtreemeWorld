@@ -53,6 +53,9 @@ private:
 
     static sql::Connection& GetSqlConnection(PooledConnection& conn);
 
+    std::unique_ptr<sql::Connection> OpenConnection();
+    void EnsureConnection(PooledConnection& conn);
+
     std::unique_ptr<PooledConnection> AcquireConnection();
     void ReleaseConnection(std::unique_ptr<PooledConnection> conn);
     void WorkerLoop();

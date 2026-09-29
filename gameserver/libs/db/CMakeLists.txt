@@ -31,3 +31,11 @@ target_compile_definitions(db
     PUBLIC
         $<$<PLATFORM_ID:Windows>:_WIN32_WINNT=0x0A00>
 )
+
+# Explicit opt-in integration test. Uses only its own DB sessions and never
+# changes accounts, tokens, schema, or server-wide settings.
+option(DB_BUILD_LIVENESS_TEST "Build the opt-in DB pool liveness integration test" OFF)
+if(DB_BUILD_LIVENESS_TEST)
+    add_executable(db_pool_liveness_test tests/DbPoolLivenessTest.cpp)
+    target_link_libraries(db_pool_liveness_test PRIVATE db)
+endif()

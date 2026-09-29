@@ -33,13 +33,8 @@ sql::Connection& DbPool::GetSqlConnection(PooledConnection& conn)
     return *conn.connection;
 }
 
-void DbPool::Start()
+std::unique_ptr<sql::Connection> DbPool::OpenConnection()
 {
-    if (started_) {
-        return;
-    }
-
-    stopping_ = false;
     const auto url = std::format("jdbc:mariadb://{}:{}/{}",
                                  config_.host,
                                  config_.port,
@@ -50,16 +45,48 @@ void DbPool::Start()
     props["password"] = config_.password;
     props["connectTimeout"] = std::to_string(config_.connect_timeout_ms);
 
+    std::unique_ptr<sql::Connection> conn(
+        sql::DriverManager::getConnection(sql::SQLString(url), props));
+    if (!conn || conn->isClosed()) {
+        throw std::runtime_error("failed to open database connection");
+    }
+    return conn;
+}
+
+void DbPool::EnsureConnection(PooledConnection& conn)
+{
+    if (conn.connection) {
+        try {
+            // Validate before handing a connection to repository code. Never
+            // replay work: a failed write may already have reached the DB.
+            // Use the existing socket timeout. Connector/C++ 1.1.5's timed
+            // isValid overload can leave a changed query timeout installed.
+            if (!conn.connection->isClosed() && conn.connection->isValid()) {
+                return;
+            }
+        } catch (const std::exception&) {
+            // Treat failed validation as a dead connection, without logging
+            // exception text that could contain endpoint/credential details.
+        }
+    }
+    conn.connection.reset();
+    conn.connection = OpenConnection();
+    LOG_INFO("DB pool replaced an unavailable connection before executing work");
+}
+
+void DbPool::Start()
+{
+    if (started_) {
+        return;
+    }
+
+    stopping_ = false;
+
     {
         std::lock_guard lk(conn_mutex_);
         free_connections_.reserve(config_.pool_size);
         for (std::uint32_t i = 0; i < config_.pool_size; ++i) {
-            std::unique_ptr<sql::Connection> conn(
-                sql::DriverManager::getConnection(sql::SQLString(url), props));
-            if (!conn || conn->isClosed()) {
-                throw std::runtime_error("failed to open database connection");
-            }
-            free_connections_.push_back(std::make_unique<PooledConnection>(std::move(conn)));
+            free_connections_.push_back(std::make_unique<PooledConnection>(OpenConnection()));
         }
     }
 
@@ -156,6 +183,16 @@ std::unique_ptr<DbPool::PooledConnection> DbPool::AcquireConnection()
 
     auto conn = std::move(free_connections_.back());
     free_connections_.pop_back();
+    // Network I/O must not hold the pool mutex. Keep the slot even if opening
+    // a replacement fails, so a temporary outage cannot exhaust the pool.
+    lk.unlock();
+    try {
+        EnsureConnection(*conn);
+    } catch (const std::exception&) {
+        ReleaseConnection(std::move(conn));
+        LOG_WARN("DB connection unavailable; work was not executed");
+        return nullptr;
+    }
     return conn;
 }
 
