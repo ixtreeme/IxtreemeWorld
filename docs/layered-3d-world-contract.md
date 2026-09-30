@@ -88,8 +88,10 @@ surface, including portal traversal and malformed-sidecar rejection.
 
 ## Next milestone boundaries
 
-3D-3 will make the spatial index and AOI key layer-aware. The key must not
-remain only `(cell_x, cell_y)` once layered entities are admitted.
+3D-3 has defined the layer-aware spatial identity in
+`LayeredSpatialCellKey`. The production spatial index and AOI admission still
+need to adopt it together with authoritative entity volume ownership; the key
+must not remain only `(cell_x, cell_y)` once layered entities are admitted.
 
 3D-4 will add server-cooked model collision/navigation and explicit portal
 transitions. 3D-5 will connect movement, migration, replication and the
