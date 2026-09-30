@@ -24,6 +24,7 @@ capnp_generate_cpp(MAP_CAPNP_SRCS MAP_CAPNP_HDRS ${MAP_SCHEMA_FILES})
 add_library(mapdata STATIC
     ${MAP_CAPNP_SRCS}
     src/MapData.cpp
+    src/LayeredWorld.cpp
     src/ServerTerrain.cpp
     src/ServerWater.cpp
     src/WorldPackage.cpp
@@ -57,6 +58,17 @@ if(NOT CMAKE_SYSTEM_NAME STREQUAL "Android")
     target_compile_features(mapgen_test_zone PRIVATE cxx_std_20)
     if(MSVC)
         set_target_properties(mapgen_test_zone PROPERTIES
+            MSVC_RUNTIME_LIBRARY "MultiThreaded$<$<CONFIG:Debug>:Debug>"
+        )
+    endif()
+
+    add_executable(layered_world_contract_test
+        tools/layered_world_contract_test.cpp
+    )
+    target_link_libraries(layered_world_contract_test PRIVATE mapdata)
+    target_compile_features(layered_world_contract_test PRIVATE cxx_std_20)
+    if(MSVC)
+        set_target_properties(layered_world_contract_test PROPERTIES
             MSVC_RUNTIME_LIBRARY "MultiThreaded$<$<CONFIG:Debug>:Debug>"
         )
     endif()
