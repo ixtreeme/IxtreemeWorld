@@ -25,6 +25,8 @@ add_library(IXEngineRender STATIC
     SceneManager.h
     SceneLayerAuthoring.cpp
     SceneLayerAuthoring.h
+    SceneWorldPackage.cpp
+    SceneWorldPackage.h
     SelectionOutlineRenderer.cpp
     SelectionOutlineRenderer.h
     SpatialIndex.cpp
@@ -138,4 +140,12 @@ if(BUILD_TESTING AND NOT ANDROID)
             MSVC_RUNTIME_LIBRARY "MultiThreaded$<$<CONFIG:Debug>:Debug>")
     endif()
     add_test(NAME SceneLayerAuthoringTest COMMAND SceneLayerAuthoringTest)
+    add_executable(SceneWorldPackageTest tests/SceneWorldPackageTest.cpp)
+    target_link_libraries(SceneWorldPackageTest PRIVATE IXEngineRender)
+    target_compile_features(SceneWorldPackageTest PRIVATE cxx_std_20)
+    if(MSVC)
+        set_target_properties(SceneWorldPackageTest PROPERTIES
+            MSVC_RUNTIME_LIBRARY "MultiThreaded$<$<CONFIG:Debug>:Debug>")
+    endif()
+    add_test(NAME SceneWorldPackageTest COMMAND SceneWorldPackageTest)
 endif()

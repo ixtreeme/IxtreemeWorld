@@ -777,7 +777,9 @@ int RunWorldPackageScenario(const std::string& fixtures_out)
     }
     {
         auto spec = BaseSpec();
-        spec.patch_manifest = patch_layer(mx::map::package_schema::LayerKind::HEIGHT, [](auto layer) { layer.setVersion(3); /* height 1..2 supported */ });
+        spec.patch_manifest = patch_layer(mx::map::package_schema::LayerKind::HEIGHT, [](auto layer) {
+            layer.setVersion(mx::map::kHeightLayerVersionMax + 1);
+        });
         ExpectSpecRejected(c, "layer-required-version", spec, PackageErrorCode::LayerUnsupported);
     }
     {

@@ -140,6 +140,17 @@ void EditorImGui::RenderMenuBar()
             if (ImGui::MenuItem("Export layer metadata", nullptr, false, CanUseEditorTools()))
                 m_commands.exportLayers = true;
             ImGui::MenuItem("Show layer volumes", nullptr, &m_showLayerVolumes);
+            ImGui::Separator();
+            ImGui::InputText("World ID", m_serverWorldId, sizeof(m_serverWorldId));
+            ImGui::InputFloat2("Player spawn X/Z (m)", m_serverWorldSpawn);
+            ImGui::TextDisabled("Spawn uses terrain; blocked or outside positions are rejected.");
+            if (ImGui::MenuItem("Export strict server world", nullptr, false, CanUseEditorTools()))
+            {
+                m_commands.exportServerWorld = true;
+                m_commands.serverWorldId = m_serverWorldId;
+                m_commands.serverWorldSpawnX = m_serverWorldSpawn[0];
+                m_commands.serverWorldSpawnZ = m_serverWorldSpawn[1];
+            }
             if (!m_layerAuthoringStatus.empty())
             {
                 ImGui::Separator();

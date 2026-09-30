@@ -431,9 +431,14 @@ struct TerrainSceneData
     std::uint32_t chunkSizeCells = 64;
     std::string chunkManifestRef;
     std::string heightmapRef;
+    // Optional exact float-centimetre snapshot; declared data is authoritative.
+    std::string exactHeightmapRef;
     std::string splatRef;
     std::string maskRef;
     std::vector<float> heightCmGrid;
+    // Cell attributes in the same north-to-south source rows as heights.
+    // Empty is the legacy all-walkable default.
+    std::vector<std::uint16_t> attributes;
     std::vector<std::uint8_t> splatABytes;
     std::vector<std::uint8_t> splatBBytes;
     bool triplanarEnabled = false;
@@ -769,6 +774,10 @@ struct MapEditorCommands
     bool dumpFrameProfile = false;
     bool generateLayers = false;
     bool exportLayers = false;
+    bool exportServerWorld = false;
+    std::string serverWorldId;
+    float serverWorldSpawnX = 0;
+    float serverWorldSpawnZ = 0;
     bool showLayerVolumes = false;
     bool debugPerfTogglesChanged = false;
     bool disableShadowPass = false;

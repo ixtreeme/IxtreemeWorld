@@ -81,15 +81,26 @@ struct ChunkRef {
 # Height layer version 2 (MAP-2 range extension): meters = offsetMeters +
 # raw * metersPerUnit, raw stored as the chosen sample type. Height layer
 # version 1 is fixed: int16, 0.01 m per unit, offset 0 (field unset).
+# Version 3 uses the same explicit sample encoding plus its surface mode.
 enum HeightSampleType {
   int16 @0;
   int32 @1;
+}
+
+# v1/v2 height layers retain bilinear queries. Required height layer v3
+# explicitly selects the canonical SW-NE (h00-h11) cell diagonal, matching
+# the engine's Jolt terrain after converting its descending-Z sample rows.
+# The layer version makes old readers reject rather than silently bilerp.
+enum HeightInterpolation {
+  bilinear @0;
+  triangleMainDiagonal @1;
 }
 
 struct HeightEncoding {
   sampleType @0 :HeightSampleType;
   metersPerUnit @1 :Float64;
   offsetMeters @2 :Float64;
+  interpolation @3 :HeightInterpolation;
 }
 
 # Water capability (MAP-3). Undeclared (the field absent or model =
@@ -125,6 +136,6 @@ struct MapManifest {
   chunkGrid @14 :GridDims;       # v3: chunk count per axis
   layers @15 :List(LayerDecl);   # v3
   chunks @16 :List(ChunkRef);    # v3: exactly one entry per chunk grid cell
-  heightEncoding @17 :HeightEncoding; # v3, height layer version 2 only
+  heightEncoding @17 :HeightEncoding; # manifest v3, height layer version 2 or 3
   water @18 :WaterDecl;          # v3 (MAP-3): the water capability of the world
 }

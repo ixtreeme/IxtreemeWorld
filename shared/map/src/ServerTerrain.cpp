@@ -7,6 +7,24 @@
 
 namespace mx::map {
 
+double InterpolateTerrainHeight(double h00, double h10, double h01, double h11,
+                                double fx, double fy, HeightInterpolation interpolation) noexcept
+{
+    switch (interpolation) {
+    case HeightInterpolation::Bilinear: {
+        const double south = h00 + (h10 - h00) * fx;
+        const double north = h01 + (h11 - h01) * fx;
+        return south + (north - south) * fy;
+    }
+    case HeightInterpolation::TriangleMainDiagonal:
+        // h00/h10/h11 for fx >= fy, otherwise h00/h11/h01. Both
+        // triangles agree exactly on the shared diagonal and outer edges.
+        return fx >= fy ? h00 + (h10 - h00) * fx + (h11 - h10) * fy
+                        : h00 + (h11 - h01) * fx + (h01 - h00) * fy;
+    }
+    return std::numeric_limits<double>::quiet_NaN();
+}
+
 std::uint32_t GridGeometry::ChunkCellsX(std::uint32_t cx) const noexcept
 {
     const std::uint64_t start = static_cast<std::uint64_t>(cx) * chunk_cells;
@@ -337,9 +355,11 @@ HeightSample ServerTerrain::Height(double x, double y) const noexcept
     const double h10 = RawMeters(*chunk, lx + 1, ly);
     const double h01 = RawMeters(*chunk, lx, ly + 1);
     const double h11 = RawMeters(*chunk, lx + 1, ly + 1);
-    const double south = h00 + (h10 - h00) * fx;
-    const double north = h01 + (h11 - h01) * fx;
-    return {TerrainStatus::Ok, static_cast<float>(south + (north - south) * fy)};
+    const double height = InterpolateTerrainHeight(h00, h10, h01, h11, fx, fy, encoding_.interpolation);
+    if (!std::isfinite(height)) {
+        return {TerrainStatus::InvalidData, 0.0f};
+    }
+    return {TerrainStatus::Ok, static_cast<float>(height)};
 }
 
 CellSample ServerTerrain::Cell(double x, double y) const noexcept

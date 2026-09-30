@@ -1329,6 +1329,35 @@ const char* TeditToolName(MapEditorTool tool)
 }
 }
 
+float SampleTerrainCollisionHeightCm(const std::vector<float>& grid,
+                                    std::uint32_t width, std::uint32_t height,
+                                    float localXcm, float localYcm, float cellScaleCm)
+{
+    if (width < 2 || height < 2 || grid.size() < static_cast<std::size_t>(width) * height ||
+        !std::isfinite(localXcm) || !std::isfinite(localYcm) ||
+        !std::isfinite(cellScaleCm) || cellScaleCm <= 0)
+        return 0.0f;
+    const float maxX = static_cast<float>(width - 1) * cellScaleCm;
+    const float maxY = static_cast<float>(height - 1) * cellScaleCm;
+    if (!std::isfinite(maxX) || !std::isfinite(maxY))
+        return 0.0f;
+    const float gx = std::clamp(localXcm, 0.0f, maxX) / cellScaleCm;
+    const float gy = std::clamp(localYcm, 0.0f, maxY) / cellScaleCm;
+    const std::uint32_t x0 = std::min(static_cast<std::uint32_t>(gx), width - 2);
+    const std::uint32_t y0 = std::min(static_cast<std::uint32_t>(gy), height - 2);
+    const float tx = std::clamp(gx - static_cast<float>(x0), 0.0f, 1.0f);
+    const float ty = std::clamp(gy - static_cast<float>(y0), 0.0f, 1.0f);
+    const auto offset = static_cast<std::size_t>(y0) * width + x0;
+    const float h00 = grid[offset];
+    const float h10 = grid[offset + 1];
+    const float h01 = grid[offset + width];
+    const float h11 = grid[offset + width + 1];
+    // Match PhysicsWorld::CreateTerrainCollider: source diagonal v10-v01.
+    if (tx + ty <= 1.0f)
+        return h00 + (h10 - h00) * tx + (h01 - h00) * ty;
+    return h11 + (h01 - h11) * (1.0f - tx) + (h10 - h11) * (1.0f - ty);
+}
+
 bool TerrainRenderer::Create(ixrhi::IXRHIDevice& rhi, client::asset::IAssetReader& assets)
 {
     Destroy();
@@ -1458,6 +1487,27 @@ bool TerrainRenderer::CreateFlatTerrain(ixrhi::IXRHIDevice& rhi, const TerrainSc
     next.triplanarSharpness = std::clamp(next.triplanarSharpness, 1.0f, 16.0f);
     next.triplanarSlopeThreshold = std::clamp(next.triplanarSlopeThreshold, 0.0f, 1.0f);
     next.triplanarSlopeTransition = std::clamp(next.triplanarSlopeTransition, 0.001f, 1.0f);
+    const std::size_t expectedHeightCount =
+        (static_cast<std::size_t>(next.cellsX) + 1) * (static_cast<std::size_t>(next.cellsZ) + 1);
+    if (!next.heightCmGrid.empty() && next.heightCmGrid.size() != expectedHeightCount)
+    {
+        TraceError("[TERRAIN-CREATE] invalid height count: expected=%zu actual=%zu",
+            expectedHeightCount, next.heightCmGrid.size());
+        return false;
+    }
+    if (!std::all_of(next.heightCmGrid.begin(), next.heightCmGrid.end(),
+        [](float value) { return std::isfinite(value); }))
+    {
+        TraceError("[TERRAIN-CREATE] non-finite terrain height");
+        return false;
+    }
+    const std::size_t expectedAttributeCount = static_cast<std::size_t>(next.cellsX) * next.cellsZ;
+    if (!next.attributes.empty() && next.attributes.size() != expectedAttributeCount)
+    {
+        TraceError("[TERRAIN-CREATE] invalid attribute count: expected=%zu actual=%zu",
+            expectedAttributeCount, next.attributes.size());
+        return false;
+    }
 
     rhi.WaitIdle();
     m_vertexBuffer.reset();
@@ -1497,11 +1547,13 @@ bool TerrainRenderer::CreateFlatTerrain(ixrhi::IXRHIDevice& rhi, const TerrainSc
     m_spawnLocalXcm = next.widthMeters * 50.0f;
     m_spawnLocalYcm = next.depthMeters * 50.0f;
     m_spawnHeightCm = 0.0f;
-    const size_t expectedHeightCount = static_cast<size_t>(m_heightGridWidth) * m_heightGridHeight;
     if (next.heightCmGrid.size() == expectedHeightCount)
         m_heightCmGrid = next.heightCmGrid;
     else
         m_heightCmGrid.assign(expectedHeightCount, 0.0f);
+    m_attributes = next.attributes;
+    if (m_attributes.empty())
+        m_attributes.assign(expectedAttributeCount, 0);
     m_heightUndoRecorded.assign(m_heightCmGrid.size(), 0);
     m_splatWidth = std::max(1u, next.cellsX);
     m_splatHeight = std::max(1u, next.cellsZ);
@@ -1621,6 +1673,7 @@ TerrainSceneData TerrainRenderer::GetTerrainSceneData() const
             ? m_flatTerrainDepthMeters
             : static_cast<float>(m_mapSizeY) * m_cellScaleMeters;
         data.heightCmGrid = m_heightCmGrid;
+        data.attributes = m_attributes;
         data.splatABytes = m_splatABytes;
         data.splatBBytes = m_splatBBytes;
     }
@@ -2927,7 +2980,7 @@ float TerrainRenderer::SampleHeightAt(float localX, float localZ) const
 
     const float localXcm = m_spawnLocalXcm + localX * 100.0f;
     const float localYcm = m_spawnLocalYcm - localZ * 100.0f;
-    const float heightCm = BilinearHeightCm(m_heightCmGrid, m_heightGridWidth, m_heightGridHeight,
+    const float heightCm = SampleTerrainCollisionHeightCm(m_heightCmGrid, m_heightGridWidth, m_heightGridHeight,
         localXcm, localYcm, m_cellScaleMeters * 100.0f);
     return heightCm * 0.01f;
 }
@@ -2972,6 +3025,15 @@ void TerrainRenderer::Destroy()
     m_bindLayout.reset();
     m_waterBindGroup.reset();
     m_waterBindLayout.reset();
+
+    // Refraction inputs share ownership with OffscreenSceneRenderer. Release
+    // our copies during explicit teardown while the device is still alive;
+    // leaving them for member destruction would outlive device shutdown.
+    m_waterSceneColor.reset();
+    m_waterSceneDepth.reset();
+    m_waterSceneSampler.reset();
+    m_waterSceneWidth = 0;
+    m_waterSceneHeight = 0;
 
     m_vertexBuffer.reset();
     m_indexBuffer.reset();
@@ -3163,8 +3225,8 @@ void TerrainRenderer::BuildTerrainChunkDraws(const std::vector<Vertex>& vertices
                     const uint32_t i3 = i0 + m_heightGridWidth;
                     indices.push_back(i0);
                     indices.push_back(i1);
-                    indices.push_back(i2);
-                    indices.push_back(i0);
+                    indices.push_back(i3);
+                    indices.push_back(i1);
                     indices.push_back(i2);
                     indices.push_back(i3);
                 }
@@ -3474,7 +3536,7 @@ bool TerrainRenderer::CreateMapBuffers(ixrhi::IXRHIDevice& rhi, const std::strin
         maxHeightCm = std::max(maxHeightCm, m_heightCmGrid[i]);
     }
 
-    m_spawnHeightCm = BilinearHeightCm(m_heightCmGrid, m_heightGridWidth, m_heightGridHeight,
+    m_spawnHeightCm = SampleTerrainCollisionHeightCm(m_heightCmGrid, m_heightGridWidth, m_heightGridHeight,
         m_spawnLocalXcm, m_spawnLocalYcm, m_cellScaleMeters * 100.0f);
 
     std::vector<Vertex> vertices;
@@ -3540,8 +3602,8 @@ bool TerrainRenderer::CreateMapBuffers(ixrhi::IXRHIDevice& rhi, const std::strin
                 }
                 debugIndices.push_back(base + 0);
                 debugIndices.push_back(base + 1);
-                debugIndices.push_back(base + 2);
-                debugIndices.push_back(base + 0);
+                debugIndices.push_back(base + 3);
+                debugIndices.push_back(base + 1);
                 debugIndices.push_back(base + 2);
                 debugIndices.push_back(base + 3);
             }
@@ -3560,7 +3622,7 @@ bool TerrainRenderer::CreateMapBuffers(ixrhi::IXRHIDevice& rhi, const std::strin
         for (const auto& [worldX, worldY] : corners) {
             const float localXcm = worldX * 100.0f;
             const float localYcm = worldY * 100.0f;
-            const float heightCm = BilinearHeightCm(m_heightCmGrid,
+            const float heightCm = SampleTerrainCollisionHeightCm(m_heightCmGrid,
                                       m_heightGridWidth,
                                       m_heightGridHeight,
                                       localXcm,

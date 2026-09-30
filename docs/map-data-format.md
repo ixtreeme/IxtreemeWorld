@@ -77,7 +77,7 @@ legacy `LoadManifest` ezt teszi). Egy `formatVersion = 2` manifest, amely
 | `worldName` @2 | ≤ 256 bájt | ugyanaz |
 | `worldSizeCells` @3 | cellák X-en (és Y-on) | cellák **X-en** (kelet), 1..65536 |
 | `cellSizeMeters` @4 | véges, 0.05..1000 | ugyanaz |
-| `heightUnit` @5 | `centimeters` | `centimeters` (height v1; v2-ben a `heightEncoding` dönt) |
+| `heightUnit` @5 | `centimeters` | `centimeters` (height v1; v2/v3-ban a `heightEncoding` dönt) |
 | `chunkSizeCells` @6 | 1..4096 | ugyanaz |
 | `zoneGridDims` @7 | **figyelmen kívül hagyva** (a régi generátor a chunk-számot írta ide; a legacy betöltő chunk-rácsként olvasta — R1) | **0 kötelező** (`MANIFEST_FIELD_FORBIDDEN`) |
 | `zoneSizeCells` @8 | figyelmen kívül hagyva | **0 kötelező** |
@@ -89,7 +89,7 @@ legacy `LoadManifest` ezt teszi). Egy `formatVersion = 2` manifest, amely
 | `chunkGrid` @14 | tilos | = ceil(worldSize / chunkSize) tengelyenként |
 | `layers` @15 | tilos (v2-ben implicit, lásd lent) | réteg-deklarációk (≤ 32) |
 | `chunks` @16 | tilos | pontosan egy bejegyzés rácscellánként |
-| `heightEncoding` @17 | tilos | height v2-nél kötelező, v1-nél tilos (3.4) |
+| `heightEncoding` @17 | tilos | height v2/v3-nál kötelező, v1-nél tilos (3.4) |
 | `water` @18 (MAP-3) | tilos | a víz-képesség deklarációja (3.5); hiánya = ismeretlen |
 
 Az üzenet legyen pontosan egy Cap'n Proto üzenet (mögötte nincs bájt),
@@ -120,7 +120,7 @@ LayerDecl { kind: LayerKind; required: Bool; audience: server|client|shared;
 
 | kind | Tárolás | Elemformátum | Szerver |
 |---|---|---|---|
-| `height` (0) | chunk-szekció 1 | v1: int16 cm; v2: int16 vagy int32 a `heightEncoding` szerint; `(cx+1)×(cy+1)` minta | kötelező, betölti |
+| `height` (0) | chunk-szekció 1 | v1: int16 cm; v2/v3: int16 vagy int32 a `heightEncoding` szerint; `(cx+1)×(cy+1)` minta | kötelező, betölti |
 | `attributes` (1) | chunk-szekció 3 | uint16 bitmező, `cx×cy` cella | kötelező, betölti |
 | `splatA` (2) / `splatB` (3) | chunk-szekció 2 / 4 | u16 w, u16 h, RGBA8 | kihagyja (Startup: csak tartomány; Full: szerkezet) |
 | `worldLogic` (4) | fájl | MXL1 v1 | kötelező, betölti |
@@ -173,7 +173,7 @@ a v2 chunkokat helyben írja (`SaveChunkHeights`); v3 csomag szerkesztése
 újraindexelést igényel (tooling-döntés, lásd a követelmény-dokumentum
 döntési pontjait).
 
-### 3.4 Magasság-kódolás (height réteg v1 / v2)
+### 3.4 Magasság-kódolás és felület (height réteg v1 / v2 / v3)
 
 `méter = offsetMeters + raw · metersPerUnit` (double-ben számolva).
 
@@ -181,11 +181,35 @@ döntési pontjait).
 |---|---|---|---|
 | **v1** (történeti) | **tilos** (`MANIFEST_FIELD_FORBIDDEN`) | int16, 0.01 m/egység, offset 0 | ±327.67 m |
 | **v2** (MAP-2 bővítés) | **kötelező** (`MANIFEST_FIELD_INVALID`, ha hiányzik) | `sampleType`: `int16` (0) vagy `int32` (1); `metersPerUnit` véges, 0.0001..10; `offsetMeters` véges, \|·\| ≤ 100000 | pl. int32 × 1 mm − 500 m: ≈ −2.1 … +2.1 ezer km; int16 × 5 cm + 1000 m: −638 … +2638 m |
+| **v3** (engine terrain export) | **kötelező**, explicit `interpolation=triangleMainDiagonal` (1) | v2 mintatípus, skála és offset; új felületszerződés | azonos tárolási tartomány; editor export: int32 × 0.0001 m, offset 0 |
 
 A chunk height-szekció `elementFormat`-ja kövesse a mintatípust (1 = int16,
 2 = int32; eltérés: `CHUNK_TOC_INVALID`), a szekció mérete
 `(cx+1)(cy+1)·2` ill. `·4` bájt (`CHUNK_SECTION_SIZE`). A v1 csomagok
-változatlanul érvényesek; v2-t csak a v3 formátum hordozhat.
+változatlanul érvényesek; height v2/v3-at csak a manifest v3 formátum hordozhat.
+
+`HeightEncoding.interpolation @3` enum: `bilinear` (0, alapértelmezett) vagy
+`triangleMainDiagonal` (1). A height v1/v2 lekérdezés továbbra is bilineáris;
+height v2-ben az 1 érték tiltott. Height v1-ben az egész `heightEncoding`
+tiltott. Height v3-ban az 1 érték explicit kötelező; hiányzó mező/0, ismeretlen
+enum vagy optional height v3 deklaráció elutasított. A writer mindig
+**required height v3** deklarációt ír a háromszögmódhoz, ezért a csak height
+v1/v2-t ismerő régi szerver nem értelmezheti bilineárisan az új csomagot.
+A manifest verziója és a chunk-konténer verziója nem változik.
+
+A canonical SW, SE, NW, NE sarkok magassága rendre `h00,h10,h01,h11`.
+A v3 felület SW–NE átlóval két háromszög:
+
+```text
+fx >= fy: h00 + (h10-h00)*fx + (h11-h10)*fy
+fx <  fy: h00 + (h11-h01)*fx + (h01-h00)*fy
+```
+
+Az engine északról délre tárolt mintasorait az export megfordítja; a Jolt
+source `v10–v01` átlója ekkor a canonical `h00–h11` átló lesz. Ez a
+felületszerződés nem teszi exact aritmetikává a float motor-koordinátákat.
+Az editor külön jelenti a vertexmagasság tárolási kvantálását és a float/double
+rácspozíció legnagyobb eltérését; egyik sem teljes collision-hibagarancia.
 
 ### 3.5 Víz-képesség (`water` @18, MAP-3)
 
@@ -223,7 +247,7 @@ Hiba: `CHUNK_HEADER_INVALID` (300), TOC-hiba `CHUNK_TOC_INVALID` (301).
 | Offset | Méret | Mező |
 |---|---|---|
 | 0 | u16 | sectionType (1 height, 2 splatA, 3 attributes, 4 splatB) |
-| 2 | u8 | elementFormat (1 int16, 2 int32 [csak height v2], 3 u16-bitmező, 4 RGBA8-kép) — típushoz kötött |
+| 2 | u8 | elementFormat (1 int16, 2 int32 [height v2/v3], 3 u16-bitmező, 4 RGBA8-kép) — típushoz kötött |
 | 3 | u8 | reserved (v3: 0) |
 | 4 | u32 | byteOffset (fájl elejétől) |
 | 8 | u32 | byteLength |
@@ -520,11 +544,13 @@ partíciót a futásidejű split adja, nem a bootstrap.
 1. **Tárolás:** height réteg v1 (int16 × 0.01 m, offset 0, ±327.67 m) vagy
    v2 (explicit `heightEncoding`: int16 | int32, `metersPerUnit` 0.0001..10,
    `|offsetMeters|` ≤ 100000), `méter = offset + raw·unit` double-ben (3.4).
-   A v1 csomagok változatlanul érvényesek; v2 csak v3 formátumban.
+   Height v3 ugyanilyen tárolás mellett kötelező explicit háromszögmódot ad.
+   A v1 csomagok változatlanul érvényesek; height v2/v3 csak manifest v3-ban.
 2. **Minták** a cellasarkokon, chunkonként; a szomszédos chunkok közös
    határmintái bitre azonosak (betöltéskor validált, `CHUNK_EDGE_MISMATCH` 307).
 3. **Lekérdezés:** a pont celláját világ-egységben dönti el (9.1); a cella
-   négy sarkának bilineáris interpolációja double-ben, az eredmény `f32`. A
+   négy sarkának bilineáris interpolációja height v1/v2-ben; height v3-ban a
+   3.4 szerinti két háromszög. Mindkettő double-ben számol, az eredmény `f32`. A
    mintapontokon a tárolt kvantálás pontos értéke; a `f32`-re kerekítés hibája
    ≤ fél ulp (2.7 km-en ≈ 0.12 mm — a `terrain` mód int32-esete ezt méri).
 4. **Partíció-függetlenség:** az eredmény csak a világkoordinátától és a

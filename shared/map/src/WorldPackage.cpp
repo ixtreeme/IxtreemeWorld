@@ -221,6 +221,15 @@ fs::path PathFromUtf8(std::string_view text)
     return fs::path(utf8);
 }
 
+std::string PathForDiagnostic(const fs::path& path)
+{
+    // Native Windows paths can contain characters outside the active narrow
+    // code page. Diagnostics must not turn an otherwise readable package into
+    // a conversion exception; package references remain UTF-8 as before.
+    const auto utf8 = path.u8string();
+    return {reinterpret_cast<const char*>(utf8.data()), utf8.size()};
+}
+
 struct FileAccess {
     fs::path root;
     PackageReport& report;
@@ -646,22 +655,46 @@ bool ParseManifest(const std::vector<std::uint8_t>& bytes, PackageManifest& out,
                     out.chunks.push_back(std::move(entry));
                 }
             }
-            // ---- height encoding (height layer version 2 = range extension) ----
+            // v2 extends the stored range while retaining bilinear queries;
+            // v3 opts into the explicit h00-h11 triangle surface contract.
             const LayerInfo* height_layer = out.FindLayer(LayerKind::Height);
             const IssueSite esite{"manifest", kManifestFile, "heightEncoding"};
-            if (height_layer != nullptr && height_layer->version == 2) {
+            if (height_layer != nullptr && (height_layer->version == 2 || height_layer->version == 3)) {
                 if (!root.hasHeightEncoding()) {
                     issues.Error(PackageErrorCode::ManifestFieldInvalid, esite,
-                                 "height layer version 2 without heightEncoding",
-                                 "sampleType, metersPerUnit, offsetMeters");
+                                 "height layer version " + std::to_string(height_layer->version) + " without heightEncoding",
+                                 "sampleType, metersPerUnit, offsetMeters, interpolation");
                 } else {
                     const auto enc = root.getHeightEncoding();
                     const auto sample_type = static_cast<std::uint16_t>(enc.getSampleType());
-                    out.height_encoding.layer_version = 2;
+                    out.height_encoding.layer_version = height_layer->version;
                     out.height_encoding.int32_samples =
                         sample_type == static_cast<std::uint16_t>(package_schema::HeightSampleType::INT32);
                     out.height_encoding.meters_per_unit = enc.getMetersPerUnit();
                     out.height_encoding.offset_m = enc.getOffsetMeters();
+                    const auto interpolation = static_cast<std::uint16_t>(enc.getInterpolation());
+                    if (interpolation > static_cast<std::uint16_t>(package_schema::HeightInterpolation::TRIANGLE_MAIN_DIAGONAL)) {
+                        issues.Error(PackageErrorCode::ManifestFieldInvalid, esite,
+                                     "interpolation " + std::to_string(interpolation),
+                                     "bilinear (0) or triangleMainDiagonal (1)");
+                    } else {
+                        out.height_encoding.interpolation = static_cast<HeightInterpolation>(interpolation);
+                        if (height_layer->version == 2 && interpolation != 0) {
+                            issues.Error(PackageErrorCode::ManifestFieldForbidden, esite,
+                                         "non-bilinear interpolation on height layer version 2",
+                                         "bilinear (0); triangle surfaces require required height layer version 3");
+                        }
+                        if (height_layer->version == 3 && interpolation != 1) {
+                            issues.Error(PackageErrorCode::ManifestFieldInvalid, esite,
+                                         "height layer version 3 without explicit triangleMainDiagonal interpolation",
+                                         "triangleMainDiagonal (1)");
+                        }
+                    }
+                    if (height_layer->version == 3 && !height_layer->required) {
+                        issues.Error(PackageErrorCode::LayerDeclInvalid, esite,
+                                     "triangle height layer version 3 declared optional",
+                                     "required so older readers reject the surface contract");
+                    }
                     if (sample_type > static_cast<std::uint16_t>(package_schema::HeightSampleType::INT32)) {
                         issues.Error(PackageErrorCode::ManifestFieldInvalid, esite,
                                      "sampleType " + std::to_string(sample_type), "int16 (0) or int32 (1)");
@@ -2248,22 +2281,22 @@ std::optional<ServerWorldData> LoadServerWorld(const fs::path& package_root,
     Issues issues(report);
     std::optional<ServerWorldData> result;
     try {
-        issues.SetPackage(package_root.filename().string());
+        issues.SetPackage(PathForDiagnostic(package_root.filename()));
         std::error_code ec;
         const auto status = fs::status(package_root, ec);
         if (ec || !fs::exists(status)) {
             issues.Error(PackageErrorCode::PackageRootMissing, IssueSite{"package", {}},
-                         "package directory '" + package_root.string() + "' does not exist",
+                         "package directory '" + PathForDiagnostic(package_root) + "' does not exist",
                          "an existing world package directory");
         } else if (!fs::is_directory(status)) {
             issues.Error(PackageErrorCode::PackageRootNotDirectory, IssueSite{"package", {}},
-                         "'" + package_root.string() + "' is not a directory", "a world package directory");
+                         "'" + PathForDiagnostic(package_root) + "' is not a directory", "a world package directory");
         }
         if (issues.ErrorCount() == 0) {
             report.root = fs::canonical(package_root, ec);
             if (ec) {
                 issues.Error(PackageErrorCode::PackageRootMissing, IssueSite{"package", {}},
-                             "cannot canonicalize '" + package_root.string() + "': " + ec.message());
+                             "cannot canonicalize '" + PathForDiagnostic(package_root) + "': " + ec.message());
             }
         }
         FileAccess files{report.root, report, issues};

@@ -424,7 +424,19 @@ std::vector<std::uint8_t> BuildMxChunkBytes(const TerrainSceneData& terrain,
 
     Section attributes;
     attributes.type = 3;
-    attributes.bytes.assign(static_cast<size_t>(chunkSize) * chunkSize * sizeof(std::uint16_t), 0);
+    attributes.bytes.reserve(static_cast<size_t>(chunkSize) * chunkSize * sizeof(std::uint16_t));
+    for (std::uint32_t y = 0; y < chunkSize; ++y)
+    {
+        for (std::uint32_t x = 0; x < chunkSize; ++x)
+        {
+            const std::uint32_t gx = chunkX * chunkSize + x;
+            const std::uint32_t gy = chunkY * chunkSize + y;
+            const size_t src = static_cast<size_t>(gy) * terrain.cellsX + gx;
+            const std::uint16_t value = gx < terrain.cellsX && gy < terrain.cellsZ &&
+                src < terrain.attributes.size() ? terrain.attributes[src] : 0;
+            PushU16(attributes.bytes, value);
+        }
+    }
     sections.push_back(std::move(attributes));
     buildSplatSection(4, terrain.splatBBytes);
 
@@ -503,6 +515,12 @@ bool WriteTerrainChunkSet(const std::filesystem::path& scenePath,
                           TerrainSceneData& terrain,
                           const std::array<MapEditorPaletteSlot, 8>& paletteSlots)
 {
+    if (!terrain.attributes.empty() &&
+        terrain.attributes.size() != static_cast<size_t>(terrain.cellsX) * terrain.cellsZ)
+    {
+        TraceError("[TCHUNK] invalid attribute grid dimensions");
+        return false;
+    }
     terrain.chunkSizeCells = std::clamp(terrain.chunkSizeCells == 0 ? 64u : terrain.chunkSizeCells, 32u, 256u);
     const std::uint32_t worldCells = std::max(terrain.cellsX, terrain.cellsZ);
     const std::uint32_t chunkSize = terrain.chunkSizeCells;
@@ -583,6 +601,17 @@ bool ReadTerrainChunkSet(const std::filesystem::path& sceneDir,
             terrain.heightCmGrid.push_back(src < field->heights_cm.size() ? static_cast<float>(field->heights_cm[src]) : 0.0f);
         }
     }
+    terrain.attributes.assign(static_cast<size_t>(terrain.cellsX) * terrain.cellsZ, 0);
+    for (std::uint32_t y = 0; y < terrain.cellsZ; ++y)
+    {
+        for (std::uint32_t x = 0; x < terrain.cellsX; ++x)
+        {
+            const size_t src = static_cast<size_t>(y) * field->manifest.world_size_cells + x;
+            const size_t dst = static_cast<size_t>(y) * terrain.cellsX + x;
+            if (src < field->attributes.size())
+                terrain.attributes[dst] = field->attributes[src];
+        }
+    }
     const size_t splatBytes = static_cast<size_t>(terrain.cellsX) * terrain.cellsZ * 4u;
     terrain.splatABytes.assign(splatBytes, 0);
     terrain.splatBBytes.assign(splatBytes, 0);
@@ -641,8 +670,30 @@ bool ReadTerrainChunkSet(const std::filesystem::path& sceneDir,
     return true;
 }
 
+constexpr std::uint64_t kMaxTerrainHeightCount = 100000000ull;
+
+bool TerrainHeightCount(std::uint32_t cellsX, std::uint32_t cellsZ,
+                        float cellSizeMeters, std::uint64_t& count)
+{
+    if (cellsX == 0 || cellsZ == 0 || !std::isfinite(cellSizeMeters) || cellSizeMeters <= 0.0f)
+        return false;
+    const std::uint64_t columns = static_cast<std::uint64_t>(cellsX) + 1ull;
+    const std::uint64_t rows = static_cast<std::uint64_t>(cellsZ) + 1ull;
+    if (columns > kMaxTerrainHeightCount / rows)
+        return false;
+    count = columns * rows;
+    return std::isfinite(static_cast<float>(cellsX) * cellSizeMeters) &&
+        std::isfinite(static_cast<float>(cellsZ) * cellSizeMeters);
+}
+
 bool WriteTerrainHeightmap(const std::filesystem::path& path, const TerrainSceneData& terrain)
 {
+    std::uint64_t expectedCount = 0;
+    if (!TerrainHeightCount(terrain.cellsX, terrain.cellsZ, terrain.cellSizeMeters, expectedCount) ||
+        terrain.heightCmGrid.size() != expectedCount ||
+        !std::all_of(terrain.heightCmGrid.begin(), terrain.heightCmGrid.end(),
+            [](float value) { return std::isfinite(value); }))
+        return false;
     if (!path.parent_path().empty())
         std::filesystem::create_directories(path.parent_path());
     std::ofstream file(path, std::ios::binary);
@@ -660,14 +711,18 @@ bool WriteTerrainHeightmap(const std::filesystem::path& path, const TerrainScene
     if (!terrain.heightCmGrid.empty())
         file.write(reinterpret_cast<const char*>(terrain.heightCmGrid.data()),
             static_cast<std::streamsize>(terrain.heightCmGrid.size() * sizeof(float)));
-    return true;
+    file.close();
+    return static_cast<bool>(file);
 }
 
-bool ReadTerrainHeightmap(const std::filesystem::path& path, TerrainSceneData& terrain)
+bool ReadTerrainHeightmap(const std::filesystem::path& path, TerrainSceneData& terrain,
+                           bool requireMatchingGeometry = false)
 {
-    std::ifstream file(path, std::ios::binary);
+    std::ifstream file(path, std::ios::binary | std::ios::ate);
     if (!file)
         return false;
+    const std::streamoff fileSize = file.tellg();
+    file.seekg(0, std::ios::beg);
     char magic[12]{};
     std::uint32_t version = 0;
     file.read(magic, sizeof(magic));
@@ -682,12 +737,18 @@ bool ReadTerrainHeightmap(const std::filesystem::path& path, TerrainSceneData& t
     file.read(reinterpret_cast<char*>(&cellsZ), sizeof(cellsZ));
     file.read(reinterpret_cast<char*>(&cellSize), sizeof(cellSize));
     file.read(reinterpret_cast<char*>(&count), sizeof(count));
-    if (!file || count > 100000000ull)
+    std::uint64_t expectedCount = 0;
+    if (!file || !TerrainHeightCount(cellsX, cellsZ, cellSize, expectedCount) ||
+        count != expectedCount ||
+        fileSize != static_cast<std::streamoff>(36ull + count * sizeof(float)) ||
+        (requireMatchingGeometry && (cellsX != terrain.cellsX || cellsZ != terrain.cellsZ ||
+            cellSize != terrain.cellSizeMeters)))
         return false;
     std::vector<float> heights(static_cast<size_t>(count));
     if (!heights.empty())
         file.read(reinterpret_cast<char*>(heights.data()), static_cast<std::streamsize>(heights.size() * sizeof(float)));
-    if (!file)
+    if (!file || !std::all_of(heights.begin(), heights.end(),
+        [](float value) { return std::isfinite(value); }))
         return false;
     terrain.cellsX = cellsX;
     terrain.cellsZ = cellsZ;
@@ -1998,6 +2059,15 @@ bool SceneManager::LoadSceneInternal(const std::string& path)
         scene.terrain.chunkSizeCells = ReadU32(*terrain, "chunk_size_cells", scene.terrain.chunkSizeCells);
         scene.terrain.chunkManifestRef = ReadString(*terrain, "chunk_manifest_ref");
         scene.terrain.heightmapRef = ReadString(*terrain, "heightmap_ref");
+        if (const JsonValue* exact = Find(*terrain, "exact_heightmap_ref"))
+        {
+            if (exact->type != JsonValue::Type::String || exact->string.empty())
+            {
+                TraceError("[SCENE] invalid exact terrain heightmap reference: %s", path.c_str());
+                return false;
+            }
+            scene.terrain.exactHeightmapRef = exact->string;
+        }
         scene.terrain.splatRef = ReadString(*terrain, "splat_ref");
         scene.terrain.maskRef = ReadString(*terrain, "mask_ref");
         scene.terrain.triplanarEnabled = ReadBool(*terrain, "triplanar_enabled", scene.terrain.triplanarEnabled);
@@ -2024,6 +2094,17 @@ bool SceneManager::LoadSceneInternal(const std::string& path)
             ReadTerrainHeightmap(sceneDir / scene.terrain.heightmapRef, scene.terrain);
         if (!loadedChunkSet && !scene.terrain.splatRef.empty())
             ReadTerrainSplat(sceneDir / scene.terrain.splatRef, scene.terrain);
+        if (!scene.terrain.exactHeightmapRef.empty())
+        {
+            // New saves declare both the exact heights and their legacy chunk set.
+            // Losing a declared chunk set would also silently lose cell attributes.
+            if ((!scene.terrain.chunkManifestRef.empty() && !loadedChunkSet) ||
+                !ReadTerrainHeightmap(sceneDir / scene.terrain.exactHeightmapRef, scene.terrain, true))
+            {
+                TraceError("[SCENE] declared exact terrain data is missing or invalid: %s", path.c_str());
+                return false;
+            }
+        }
         if (!loadedChunkSet && (!scene.terrain.heightmapRef.empty() || !scene.terrain.splatRef.empty()))
         {
             const std::uint32_t chunkSize = std::clamp(scene.terrain.chunkSizeCells == 0 ? 64u : scene.terrain.chunkSizeCells, 32u, 256u);
@@ -2166,11 +2247,33 @@ bool SceneManager::SaveSceneInternal(const std::string& path)
         scene.name = SceneNameFromPath(path);
     if (scene.terrain.exists)
     {
+        std::uint64_t expectedHeightCount = 0;
+        if (!TerrainHeightCount(scene.terrain.cellsX, scene.terrain.cellsZ,
+                scene.terrain.cellSizeMeters, expectedHeightCount) ||
+            (!scene.terrain.heightCmGrid.empty() &&
+                scene.terrain.heightCmGrid.size() != expectedHeightCount) ||
+            !std::all_of(scene.terrain.heightCmGrid.begin(), scene.terrain.heightCmGrid.end(),
+                [](float value) { return std::isfinite(value); }))
+        {
+            TraceError("[SCENE] invalid terrain height grid: %s", path.c_str());
+            return false;
+        }
+        // An intentionally new flat terrain may omit its all-zero height grid.
+        if (scene.terrain.heightCmGrid.empty())
+            scene.terrain.heightCmGrid.assign(static_cast<size_t>(expectedHeightCount), 0.0f);
         if (!WriteTerrainChunkSet(scenePath, scene.terrain, scene.paletteSlots))
         {
             TraceError("[SCENE] terrain chunk save failed: %s", path.c_str());
             return false;
         }
+        std::filesystem::path exactFilename = scenePath.stem();
+        exactFilename += "_terrain_exact.height";
+        if (!WriteTerrainHeightmap(scenePath.parent_path() / exactFilename, scene.terrain))
+        {
+            TraceError("[SCENE] exact terrain height save failed: %s", path.c_str());
+            return false;
+        }
+        scene.terrain.exactHeightmapRef = GenericPath(exactFilename);
         Tracenf("[SCENE] terrain saved: dims=%.2fx%.2f m cellSize=%.2f cells=%ux%u chunkSize=%u manifest=%s triplanar=%s sharpness=%.2f slopeThreshold=%.3f transition=%.3f",
             scene.terrain.widthMeters,
             scene.terrain.depthMeters,
@@ -2238,6 +2341,7 @@ bool SceneManager::SaveSceneInternal(const std::string& path)
         out << "    \"chunk_size_cells\": " << scene.terrain.chunkSizeCells << ",\n";
         out << "    \"chunk_manifest_ref\": \"" << EscapeJson(scene.terrain.chunkManifestRef) << "\",\n";
         out << "    \"heightmap_ref\": \"" << EscapeJson(scene.terrain.heightmapRef) << "\",\n";
+        out << "    \"exact_heightmap_ref\": \"" << EscapeJson(scene.terrain.exactHeightmapRef) << "\",\n";
         out << "    \"splat_ref\": \"" << EscapeJson(scene.terrain.splatRef) << "\",\n";
         out << "    \"mask_ref\": \"" << EscapeJson(scene.terrain.maskRef) << "\",\n";
         out << "    \"triplanar_enabled\": " << (scene.terrain.triplanarEnabled ? "true" : "false") << ",\n";
@@ -2287,6 +2391,12 @@ bool SceneManager::SaveSceneInternal(const std::string& path)
     out << "]\n";
     out << "}\n";
 
+    out.close();
+    if (!out)
+    {
+        TraceError("[SCENE] Failed to finish writing: %s", path.c_str());
+        return false;
+    }
     m_currentScene = scene;
     m_currentScenePath = path;
     m_sceneOpen = true;

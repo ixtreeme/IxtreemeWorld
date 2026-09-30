@@ -46,6 +46,14 @@ namespace mx::map {
 struct Manifest;
 }
 
+// CPU sampling of the actual rendered/Jolt terrain triangles. Coordinates
+// are centimetres in the existing engine source grid (row zero is north).
+// Client queries retain closed/clamped outer boundaries. This CPU-only entry
+// point can be tested without creating a renderer/device/window.
+float SampleTerrainCollisionHeightCm(const std::vector<float>& grid,
+                                    std::uint32_t width, std::uint32_t height,
+                                    float localXcm, float localYcm, float cellScaleCm);
+
 class TerrainRenderer
 {
 public:

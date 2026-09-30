@@ -66,15 +66,28 @@ struct GridGeometry {
     bool Contains(double x, double y) const noexcept;
 };
 
+enum class HeightInterpolation : std::uint8_t {
+    Bilinear = 0,
+    TriangleMainDiagonal = 1, // canonical h00 (SW) -> h11 (NE), fx == fy
+};
+
+// Pure height evaluation shared by package consumers. Corners are canonical
+// SW/SE/NW/NE; fx/fy are fractional coordinates in the containing cell.
+// Unknown interpolation returns NaN, never a guessed legacy surface.
+double InterpolateTerrainHeight(double h00, double h10, double h01, double h11,
+                                double fx, double fy, HeightInterpolation interpolation) noexcept;
+
 // Stored height -> meters: meters = offset_m + raw * meters_per_unit.
 // Height layer version 1: int16, 0.01 m per unit, offset 0 (historic cm).
 // Height layer version 2: explicit sample type, scale and offset (manifest
-// heightEncoding) -- the range extension.
+// heightEncoding) -- the range extension. Height layer version 3 adds the
+// explicit triangle-main-diagonal surface contract; v1/v2 remain bilinear.
 struct HeightEncoding {
     std::uint32_t layer_version = 1;
     bool int32_samples = false;
     double meters_per_unit = 0.01;
     double offset_m = 0.0;
+    HeightInterpolation interpolation = HeightInterpolation::Bilinear;
 
     double MinMeters() const noexcept;
     double MaxMeters() const noexcept;
@@ -201,8 +214,8 @@ public:
         return slot_count_ == 0;
     }
 
-    // Bilinear interpolation of the four corner samples of the containing
-    // cell (unchanged convention of the historic HeightField sampler).
+    // Evaluates the containing cell with the declared height surface. v1/v2
+    // preserve historic bilinear queries; v3 uses the h00-h11 triangles.
     HeightSample Height(double x, double y) const noexcept;
     // The containing cell's attribute bits (bit 0 = blocked).
     CellSample Cell(double x, double y) const noexcept;

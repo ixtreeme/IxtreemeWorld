@@ -15,6 +15,12 @@ namespace fs = std::filesystem;
 
 namespace {
 
+std::string PathForDiagnostic(const fs::path& path)
+{
+    const auto utf8 = path.u8string();
+    return {reinterpret_cast<const char*>(utf8.data()), utf8.size()};
+}
+
 void PutU8(std::vector<std::uint8_t>& out, std::uint8_t value)
 {
     out.push_back(value);
@@ -54,17 +60,17 @@ bool WriteFile(const fs::path& path, const std::vector<std::uint8_t>& bytes, std
     std::error_code ec;
     fs::create_directories(path.parent_path(), ec);
     if (ec) {
-        error = "cannot create " + path.parent_path().string() + ": " + ec.message();
+        error = "cannot create " + PathForDiagnostic(path.parent_path()) + ": " + ec.message();
         return false;
     }
     std::ofstream file(path, std::ios::binary | std::ios::trunc);
     if (!file) {
-        error = "cannot open " + path.string() + " for writing";
+        error = "cannot open " + PathForDiagnostic(path) + " for writing";
         return false;
     }
     file.write(reinterpret_cast<const char*>(bytes.data()), static_cast<std::streamsize>(bytes.size()));
     if (!file) {
-        error = "short write to " + path.string();
+        error = "short write to " + PathForDiagnostic(path);
         return false;
     }
     return true;
@@ -220,6 +226,12 @@ PackageWriteResult WritePackage(const fs::path& out_dir, const PackageWriteSpec&
         return result;
     }
     const bool legacy = spec.format_version == kManifestVersionLegacy;
+    if (spec.height_encoding &&
+        spec.height_encoding->interpolation != HeightInterpolation::Bilinear &&
+        spec.height_encoding->interpolation != HeightInterpolation::TriangleMainDiagonal) {
+        result.error = "unsupported height interpolation";
+        return result;
+    }
     if (spec.mob_spawns && (spec.mob_spawns_version < 1 || spec.mob_spawns_version > 2 ||
                            (legacy && spec.mob_spawns_version != 1))) {
         result.error = "mobSpawns requires layer v1 or v2; v2 requires manifest v3";
@@ -252,7 +264,7 @@ PackageWriteResult WritePackage(const fs::path& out_dir, const PackageWriteSpec&
     }
     std::error_code ec;
     if (!spec.overwrite && fs::exists(out_dir / "map.manifest", ec)) {
-        result.error = "refusing to overwrite the existing package at " + out_dir.string();
+        result.error = "refusing to overwrite the existing package at " + PathForDiagnostic(out_dir);
         return result;
     }
     const std::uint32_t grid_x = (size_x + n - 1) / n;
@@ -312,6 +324,7 @@ PackageWriteResult WritePackage(const fs::path& out_dir, const PackageWriteSpec&
                                                                   : package_schema::HeightSampleType::INT16);
             enc.setMetersPerUnit(spec.height_encoding->meters_per_unit);
             enc.setOffsetMeters(spec.height_encoding->offset_m);
+            enc.setInterpolation(static_cast<package_schema::HeightInterpolation>(spec.height_encoding->interpolation));
         }
         struct Decl {
             package_schema::LayerKind kind;
@@ -321,7 +334,8 @@ PackageWriteResult WritePackage(const fs::path& out_dir, const PackageWriteSpec&
             std::uint32_t version;
         };
         std::vector<Decl> decls = {
-            {package_schema::LayerKind::HEIGHT, true, package_schema::LayerAudience::SHARED, "", spec.height_encoding ? 2u : 1u},
+            {package_schema::LayerKind::HEIGHT, true, package_schema::LayerAudience::SHARED, "",
+             spec.height_encoding ? (spec.height_encoding->interpolation == HeightInterpolation::TriangleMainDiagonal ? 3u : 2u) : 1u},
             {package_schema::LayerKind::ATTRIBUTES, true, package_schema::LayerAudience::SHARED, "", 1u},
         };
         if (spec.splat_size > 0) {

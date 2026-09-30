@@ -883,8 +883,16 @@ BodyId PhysicsWorld::CreateTerrainCollider(const TerrainColliderDesc& desc)
     const std::uint32_t vertsZ = desc.cellsZ + 1u;
     const std::size_t expectedHeights = static_cast<std::size_t>(vertsX) * static_cast<std::size_t>(vertsZ);
     const bool hasHeightGrid = desc.heightCmGrid.size() >= expectedHeights;
-    const float cellX = desc.widthMeters / static_cast<float>(desc.cellsX);
-    const float cellZ = desc.depthMeters / static_cast<float>(desc.cellsZ);
+    // Authored terrain has an explicit isotropic cell size. Dividing its
+    // rounded float extent back by the cell count can produce a different
+    // float pitch and move the physical triangles away from render vertices.
+    // Keep the historical per-axis interpretation for other legacy callers.
+    const bool authoredCellSize = std::isfinite(desc.cellSizeMeters) && desc.cellSizeMeters > 0.0f &&
+        std::isfinite(desc.widthMeters) && std::isfinite(desc.depthMeters) &&
+        desc.widthMeters == static_cast<float>(desc.cellsX) * desc.cellSizeMeters &&
+        desc.depthMeters == static_cast<float>(desc.cellsZ) * desc.cellSizeMeters;
+    const float cellX = authoredCellSize ? desc.cellSizeMeters : desc.widthMeters / static_cast<float>(desc.cellsX);
+    const float cellZ = authoredCellSize ? desc.cellSizeMeters : desc.depthMeters / static_cast<float>(desc.cellsZ);
 
     const BodyId id = m_impl->nextBodyId++;
 #if defined(IXENGINE_PHYSICS_WITH_JOLT)

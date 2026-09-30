@@ -29,8 +29,10 @@ struct PackageWriteSpec {
     double origin_y = 0.0;
     float cell_size_m = 1.0f;
     std::uint32_t chunk_size_cells = 0; // v3: the last chunk per axis may be partial
-    // Height layer version 2 (explicit encoding) when set; nullopt = version 1
-    // (int16, 0.01 m per unit, offset 0).
+    // Explicit encoding: bilinear emits required height v2, triangle-main-
+    // diagonal emits required v3; nullopt preserves implicit height v1.
+    // Height v1 is int16, 0.01 m per unit, offset 0. The required v3 version
+    // makes older servers reject the new surface contract.
     std::optional<HeightEncoding> height_encoding;
     // Raw stored height at global sample (vx, vy), vx in [0, size_x], vy in
     // [0, size_y]; meters = offset + raw * meters_per_unit. Must fit the

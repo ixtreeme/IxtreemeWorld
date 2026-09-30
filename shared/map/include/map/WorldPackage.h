@@ -31,8 +31,8 @@ inline constexpr std::uint32_t kWaterBodiesFileMagic = 0x5357584d; // "MXWS" lit
 inline constexpr std::uint32_t kWaterBodiesFileVersion = 1;
 inline constexpr std::uint32_t kMaxWaterBodies = 4096;
 inline constexpr std::uint64_t kMaxWaterBodiesBytes = 1ull << 20;
-inline constexpr std::uint32_t kLayerEncodingVersion = 1; // every layer kind except height v2
-inline constexpr std::uint32_t kHeightLayerVersionMax = 2;  // height v2 = explicit encoding (MAP-2)
+inline constexpr std::uint32_t kLayerEncodingVersion = 1; // default layer encoding version
+inline constexpr std::uint32_t kHeightLayerVersionMax = 3;  // v2 encoding; v3 explicit triangle surface
 
 // MXC1 section types and their fixed element formats.
 inline constexpr std::uint16_t kSectionHeight = 1;     // elementFormat 1: int16 LE, 2: int32 LE
@@ -40,7 +40,7 @@ inline constexpr std::uint16_t kSectionSplatA = 2;     // elementFormat 4: u16 w
 inline constexpr std::uint16_t kSectionAttributes = 3; // elementFormat 3: uint16 LE bitfield
 inline constexpr std::uint16_t kSectionSplatB = 4;     // elementFormat 4
 inline constexpr std::uint8_t kElementInt16 = 1;
-inline constexpr std::uint8_t kElementInt32 = 2; // height v2 only
+inline constexpr std::uint8_t kElementInt32 = 2; // explicit height encoding (height v2/v3)
 inline constexpr std::uint8_t kElementU16Bitfield = 3;
 inline constexpr std::uint8_t kElementRgba8Image = 4;
 inline constexpr std::size_t kChunkHeaderBytes = 14;

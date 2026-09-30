@@ -492,6 +492,8 @@ private:
     std::vector<PhysicsEventEditorState> m_physicsEvents;
     MapEditorCommands m_commands;
     bool m_showLayerVolumes = false;
+    float m_serverWorldSpawn[2] = {0, 0};
+    char m_serverWorldId[65] = "editor-world";
     std::string m_layerAuthoringStatus;
     // Game-script build state (driven by EngineApplication's worker thread; UI reads it).
     enum class ScriptBuildState { Idle, Running, Done };

@@ -40,6 +40,7 @@
 #include "RuntimeUiAdapter.h"
 #include "SceneManager.h"
 #include "SceneLayerAuthoring.h"
+#include "SceneWorldPackage.h"
 #include "SelectionSystem.h"
 #include "SelectionOutlineRenderer.h"
 #include "SpatialIndex.h"
@@ -1605,6 +1606,13 @@ void MergeMapEditorCommands(MapEditorCommands& target, const MapEditorCommands& 
 {
     target.generateLayers = target.generateLayers || source.generateLayers;
     target.exportLayers = target.exportLayers || source.exportLayers;
+    if (source.exportServerWorld)
+    {
+        target.exportServerWorld = true;
+        target.serverWorldId = source.serverWorldId;
+        target.serverWorldSpawnX = source.serverWorldSpawnX;
+        target.serverWorldSpawnZ = source.serverWorldSpawnZ;
+    }
     target.showLayerVolumes = source.showLayerVolumes;
     target.save = target.save || source.save;
     target.reload = target.reload || source.reload;
@@ -4847,6 +4855,8 @@ int RunGame(NativeWindow& window,
         const auto frameCpuStart = std::chrono::steady_clock::now();
         FrameCpuProfile frameProfile{};
         running = window.PumpMessages();
+        if (!running)
+            break;
 
 #if defined(IXTREEME_WITH_EDITOR)
         // Local discovery batch id (monotonic per loop iteration; the legacy
@@ -9348,6 +9358,54 @@ int RunGame(NativeWindow& window,
                                     status += "\nExport failed: " + error;
                             }
                         }
+                    }
+                    editorImGui.SetLayerAuthoringStatus(status);
+                    runtimeSession->SetEditorStatus(status);
+                }
+                if (commands.exportServerWorld && editorPlay.state.mode == EditorPlayMode::Edit)
+                {
+                    const std::filesystem::path scenePath(SceneManager::Instance().GetCurrentScenePath());
+                    std::string status;
+                    if (scenePath.empty())
+                        status = "Save the scene before exporting a server world.";
+                    else
+                    {
+                        const auto suffix = std::chrono::system_clock::now().time_since_epoch().count();
+                        auto worldDirectory = scenePath.stem();
+                        worldDirectory += ".server-worlds";
+                        const auto exportPath = scenePath.parent_path() / worldDirectory /
+                            ("export-" + std::to_string(suffix));
+                        SceneWorldExportOptions options;
+                        options.worldId = commands.serverWorldId;
+                        options.spawnX = commands.serverWorldSpawnX;
+                        options.spawnZ = commands.serverWorldSpawnZ;
+                        SceneWorldPackageResult result;
+                        const bool exported = ExportSceneServerWorld(exportPath, sceneRuntime.BuildSceneSnapshot(),
+                            [&](const MeshSceneEntity& mesh, std::vector<std::array<float, 3>>& vertices,
+                                std::vector<std::uint32_t>& indices) {
+                                auto* renderer = getStaticMeshRenderer(resolveMeshRuntimePath(mesh));
+                                return renderer && renderer->CopyPhysicsMesh(vertices, indices);
+                            }, options, result);
+                        if (exported)
+                        {
+                            layerAuthoringPreview = std::move(result.layers);
+                            const auto pathUtf8 = exportPath.u8string();
+                            status = "Strict server world exported: " + std::string(pathUtf8.begin(), pathUtf8.end());
+                            status += "\nPhysical terrain diagonal; height layer v3. Files: " +
+                                std::to_string(result.files.size());
+                            status += "\nMaximum vertex height quantization error: " +
+                                std::to_string(result.maxHeightErrorMeters) + " m.";
+                            status += "\nMaximum grid position difference: " +
+                                std::to_string(result.maxGridPositionErrorMeters) + " m.";
+                        }
+                        else
+                        {
+                            status = "Server world export failed";
+                            for (std::size_t i = 0; i < std::min<std::size_t>(8, result.errors.size()); ++i)
+                                status += "\n" + result.errors[i];
+                        }
+                        Tracenf("[WORLD-AUTHORING] exported=%s files=%zu max_height_error_m=%.8f",
+                            exported ? "yes" : "no", result.files.size(), result.maxHeightErrorMeters);
                     }
                     editorImGui.SetLayerAuthoringStatus(status);
                     runtimeSession->SetEditorStatus(status);
