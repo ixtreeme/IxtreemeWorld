@@ -20,6 +20,7 @@ struct LayerSourceSurface {
     float max_z = 0.0f;
     std::uint32_t tags = VolumeTagNone;
     bool supports_ground_movement = true;
+    std::optional<LayerSupportPlane> ground_support;
 };
 
 struct LayerGenerationOptions {

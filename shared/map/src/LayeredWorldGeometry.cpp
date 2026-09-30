@@ -12,7 +12,7 @@ namespace {
 
 using Point = std::array<float, 3>;
 using Edge = std::pair<std::size_t, std::size_t>;
-constexpr double kPlaneTolerance = 0.00001; // metres; not a layer/wake tolerance
+constexpr double kPlaneTolerance = kLayerSupportCoplanarToleranceMeters;
 
 struct Triangle {
     std::array<std::size_t, 3> vertices{};
@@ -168,7 +168,9 @@ bool ExtractMesh(const LayerCollisionMesh& mesh,
         report.warnings.push_back("collision mesh " + std::to_string(mesh.source_id) + ": no upward walkable faces; skipped");
         return true;
     }
+    std::uint32_t component_id = 0;
     for (const auto& component : components) {
+        ++component_id;
         std::map<Edge, std::size_t> component_edges;
         std::set<std::size_t> component_vertices;
         double area = 0;
@@ -250,6 +252,24 @@ bool ExtractMesh(const LayerCollisionMesh& mesh,
         surface.max_z = floor_max + options.clearance_height;
         surface.tags = mesh.tags;
         surface.supports_ground_movement = mesh.supports_ground_movement;
+        if (mesh.supports_ground_movement && !HasVolumeTag(mesh.tags, VolumeTagWater) &&
+            !HasVolumeTag(mesh.tags, VolumeTagUnderwater)) {
+            const auto& anchor = vertices[plane.vertices[0]];
+            LayerSupportPlane support;
+            support.source_id = mesh.source_id;
+            support.component_id = component_id;
+            support.anchor_x = anchor[0];
+            support.anchor_y = anchor[1];
+            support.anchor_z = anchor[2];
+            support.slope_x = -plane.normal[0] / plane.normal[2];
+            support.slope_y = -plane.normal[1] / plane.normal[2];
+            for (const auto index : component_vertices) {
+                const auto& position = vertices[index];
+                support.max_height_error_m = std::max(support.max_height_error_m,
+                    std::abs(support.Height(position[0], position[1]) - position[2]));
+            }
+            surface.ground_support = support;
+        }
         if (!std::isfinite(surface.min_z) || !std::isfinite(surface.max_z) || !(surface.min_z < surface.max_z)) {
             return fail("floor height band is not representable; check scale and clearance");
         }

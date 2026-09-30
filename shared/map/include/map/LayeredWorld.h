@@ -16,12 +16,15 @@ using VolumeId = std::uint32_t;
 
 inline constexpr LayerId kLegacyLayerId = 0;
 inline constexpr std::uint32_t kLayeredWorldFileMagic = 0x4433584d; // "MX3D" little-endian
-inline constexpr std::uint32_t kLayeredWorldFileVersion = 2;
+inline constexpr std::uint32_t kLayeredWorldFileVersion = 3;
 inline constexpr std::uint32_t kLayeredWorldFileMinVersion = 1;
 inline constexpr std::uint32_t kMaxLayeredWorldVolumes = 4096;
 inline constexpr std::uint32_t kMaxLayeredWorldPortals = 8192;
 inline constexpr std::uint32_t kMaxLayeredWorldNameBytes = 128;
 inline constexpr std::uint64_t kMaxLayeredWorldFileBytes = 4ull << 20;
+// The collision cooker's existing perpendicular coplanarity bound. A stored
+// vertical residual may not exceed this divided by the plane's up-normal.
+inline constexpr double kLayerSupportCoplanarToleranceMeters = 0.00001;
 
 enum class VolumeKind : std::uint8_t {
     Ground = 0,
@@ -63,6 +66,23 @@ inline constexpr bool HasVolumeTag(std::uint32_t tags, VolumeTag tag) noexcept
 
 const char* ToString(VolumeKind kind) noexcept;
 
+// A proven rectangular collision surface, not a solid collider or a
+// clearance guarantee. Coordinates and slopes use canonical server metres.
+// Source/component identify the deterministic collision bake, not a live
+// entity. Legacy v1/v2 records have no support plane.
+struct LayerSupportPlane {
+    std::uint32_t source_id = 0;
+    std::uint32_t component_id = 0;
+    double anchor_x = 0.0;
+    double anchor_y = 0.0;
+    double anchor_z = 0.0;
+    double slope_x = 0.0;
+    double slope_y = 0.0;
+    double max_height_error_m = 0.0;
+
+    double Height(double x, double y) const noexcept;
+};
+
 struct LayerVolume {
     VolumeId id = 0;
     LayerId layer_id = kLegacyLayerId;
@@ -73,8 +93,13 @@ struct LayerVolume {
     VolumeKind kind = VolumeKind::Ground;
     bool supports_ground_movement = true;
     std::uint32_t tags = VolumeTagNone;
+    std::optional<LayerSupportPlane> ground_support;
 
     bool Contains(float x, float y, float z) const noexcept;
+    bool AllowsGroundMovement() const noexcept;
+    // Includes finite fields, nonzero bake identifiers, the cooker-derived
+    // residual bound and corner heights +/- deviation in the half-open band.
+    bool HasValidGroundSupport() const noexcept;
 };
 
 // A portal connects two explicit volume-local footprints. It is the only

@@ -44,6 +44,15 @@ bool Same(const std::vector<LayerSourceSurface>& lhs, const std::vector<LayerSou
             a.supports_ground_movement != b.supports_ground_movement || a.min_z != b.min_z || a.max_z != b.max_z ||
             a.bounds.min_x != b.bounds.min_x || a.bounds.min_y != b.bounds.min_y ||
             a.bounds.max_x != b.bounds.max_x || a.bounds.max_y != b.bounds.max_y) return false;
+        if (a.ground_support.has_value() != b.ground_support.has_value()) return false;
+        if (a.ground_support) {
+            const auto& p = *a.ground_support;
+            const auto& q = *b.ground_support;
+            if (p.source_id != q.source_id || p.component_id != q.component_id ||
+                p.anchor_x != q.anchor_x || p.anchor_y != q.anchor_y || p.anchor_z != q.anchor_z ||
+                p.slope_x != q.slope_x || p.slope_y != q.slope_y ||
+                p.max_height_error_m != q.max_height_error_m) return false;
+        }
     }
     return true;
 }
@@ -130,7 +139,8 @@ int main()
     auto water = Floor(7, 1, VolumeTagWater | VolumeTagDock);
     water.supports_ground_movement = false;
     Check("water-movement-policy-preserved", ExtractLayerSourceSurfaces({water}, options, surfaces, report) &&
-                                                !surfaces[0].supports_ground_movement && surfaces[0].tags == water.tags);
+                                                !surfaces[0].supports_ground_movement && surfaces[0].tags == water.tags &&
+                                                !surfaces[0].ground_support);
 
     auto malformed = Floor(8, 0);
     malformed.indices.pop_back();

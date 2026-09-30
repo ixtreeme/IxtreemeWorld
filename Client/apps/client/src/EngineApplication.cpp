@@ -40,6 +40,7 @@
 #include "RuntimeUiAdapter.h"
 #include "SceneManager.h"
 #include "SceneLayerAuthoring.h"
+#include "SceneLayerGround.h"
 #include "SceneWorldPackage.h"
 #include "SelectionSystem.h"
 #include "SelectionOutlineRenderer.h"
@@ -1614,6 +1615,14 @@ void MergeMapEditorCommands(MapEditorCommands& target, const MapEditorCommands& 
         target.serverWorldSpawnZ = source.serverWorldSpawnZ;
     }
     target.showLayerVolumes = source.showLayerVolumes;
+    if (source.placeLayerGround || source.moveLayerGround)
+    {
+        target.placeLayerGround = source.placeLayerGround;
+        target.moveLayerGround = source.moveLayerGround;
+        target.layerGroundVolume = source.layerGroundVolume;
+        target.layerGroundX = source.layerGroundX;
+        target.layerGroundZ = source.layerGroundZ;
+    }
     target.save = target.save || source.save;
     target.reload = target.reload || source.reload;
     target.undo = target.undo || source.undo;
@@ -4760,6 +4769,10 @@ int RunGame(NativeWindow& window,
     bool debugShowPhysicsColliders = false;
     bool showLayerVolumes = false;
     SceneLayerAuthoringResult layerAuthoringPreview;
+    // Probe ids belong to one immutable bake. The adapter is destroyed before
+    // its owned world; edited scenes require a new explicit placement.
+    std::unique_ptr<SceneLayerAuthoringResult> layerGroundWorld;
+    std::unique_ptr<SceneLayerGround> layerGroundProbe;
     bool debugShowPhysicsContacts = false;
     bool debugShowPhysicsBodyCenters = false;
     bool dumpFrameProfileRequested = false;
@@ -5402,6 +5415,8 @@ int RunGame(NativeWindow& window,
                 {
                     sceneRuntime.ApplySceneData(pendingScene);
                     layerAuthoringPreview = {};
+                    layerGroundProbe.reset();
+                    layerGroundWorld.reset();
                     editorImGui.SetLayerAuthoringStatus("Scene changed: generate layers from collision.");
                 }
                 MapEditorCommands commands = runtimeSession->ConsumeMapEditorCommands();
@@ -9406,6 +9421,78 @@ int RunGame(NativeWindow& window,
                         }
                         Tracenf("[WORLD-AUTHORING] exported=%s files=%zu max_height_error_m=%.8f",
                             exported ? "yes" : "no", result.files.size(), result.maxHeightErrorMeters);
+                    }
+                    editorImGui.SetLayerAuthoringStatus(status);
+                    runtimeSession->SetEditorStatus(status);
+                }
+                if ((commands.placeLayerGround || commands.moveLayerGround) &&
+                    editorPlay.state.mode == EditorPlayMode::Edit)
+                {
+                    auto freshWorld = std::make_unique<SceneLayerAuthoringResult>();
+                    const bool generated = GenerateSceneLayers(sceneRuntime.BuildSceneSnapshot(),
+                        [&](const MeshSceneEntity& mesh, std::vector<std::array<float, 3>>& vertices,
+                            std::vector<std::uint32_t>& indices) {
+                            auto* renderer = getStaticMeshRenderer(resolveMeshRuntimePath(mesh));
+                            return renderer && renderer->CopyPhysicsMesh(vertices, indices);
+                        }, *freshWorld);
+                    std::string status;
+                    mx::map::LayerGroundResult result;
+                    bool queried = false;
+                    if (!generated)
+                    {
+                        status = "Support probe: scene support generation failed.";
+                        for (std::size_t i = 0; i < std::min<std::size_t>(8, freshWorld->errors.size()); ++i)
+                            status += "\n" + freshWorld->errors[i];
+                    }
+                    else if (commands.placeLayerGround)
+                    {
+                        auto freshProbe = std::make_unique<SceneLayerGround>(freshWorld->world);
+                        if (!freshProbe->MatchesWorld(freshWorld->world))
+                            status = "Support probe: scene bake cannot be encoded; placement refused.";
+                        else
+                        {
+                            result = freshProbe->Place(commands.layerGroundVolume,
+                                commands.layerGroundX, commands.layerGroundZ);
+                            queried = true;
+                            if (result.Ok())
+                            {
+                                layerGroundProbe.reset();
+                                layerGroundWorld = std::move(freshWorld);
+                                layerGroundProbe = std::move(freshProbe);
+                                layerAuthoringPreview = *layerGroundWorld;
+                            }
+                        }
+                    }
+                    else if (!layerGroundProbe)
+                        status = "Support probe: place a probe before moving it.";
+                    else if (!layerGroundProbe->MatchesWorld(freshWorld->world))
+                    {
+                        layerGroundProbe.reset();
+                        layerGroundWorld.reset();
+                        status = "Support probe: scene changed; place a new probe for this bake.";
+                    }
+                    else
+                    {
+                        result = layerGroundProbe->Move(commands.layerGroundVolume,
+                            commands.layerGroundX, commands.layerGroundZ);
+                        queried = true;
+                    }
+                    if (queried)
+                    {
+                        status = "Support probe: " + std::string(mx::map::ToString(result.status));
+                        if (layerGroundProbe && layerGroundProbe->HasState())
+                        {
+                            const auto& pose = layerGroundProbe->State();
+                            const auto& enginePoint = layerGroundProbe->EnginePosition();
+                            status += "\nVolume " + std::to_string(pose.volume_id) +
+                                ", layer " + std::to_string(pose.layer_id);
+                            status += "\nEngine X/Y/Z (m): " + std::to_string(enginePoint[0]) + ", " +
+                                std::to_string(enginePoint[1]) + ", " + std::to_string(enginePoint[2]);
+                        }
+                        status += "\nSupport only; character collision and server connection are separate.";
+                        Tracenf("[LAYER-SUPPORT] action=%s status=%s target_volume=%u x=%.6f z=%.6f",
+                            commands.placeLayerGround ? "place" : "move", mx::map::ToString(result.status),
+                            commands.layerGroundVolume, commands.layerGroundX, commands.layerGroundZ);
                     }
                     editorImGui.SetLayerAuthoringStatus(status);
                     runtimeSession->SetEditorStatus(status);

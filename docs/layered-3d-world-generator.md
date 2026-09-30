@@ -91,3 +91,26 @@ sidecar, preserving sculpt precision and range across reload. A missing or
 malformed declared sidecar fails instead of loading rounded chunk heights.
 See `layered-3d-terrain-package-review-20260930.md` for measured numerical
 limits, validation evidence and the later connected engine test project.
+
+## Cooked support and the offline editor probe
+
+Collision cooking now retains the plane of each proven rectangular upward
+component and attaches it to its exact generated volume. New sidecars use
+MX3D v3; old v1/v2 metadata still loads, with unknown support. The gap/AABB
+text generator cannot turn its bounds into a floor. Water is not walking
+support even if a manually authored movement flag says otherwise.
+
+**Tools → Layered world → Support probe (offline)** accepts an explicit
+generated **Support volume** and an engine **X/Z** point. **Place support
+probe** computes the floor and shows engine X/Y/Z plus volume/layer id.
+**Move support probe** stays on that same volume, refuses uncovered points
+and preserves the prior pose on failure. Selecting another volume requires
+a new explicit placement; it does not automatically use a portal. The
+probe binds one immutable bake and refuses a move after the scene's layer
+data changes. This is an authoring check, not a connected game character.
+
+The same support API is available through WorldRuntime's read-only ground
+queries. Full strict package export already carries these optional planes
+inside `layered_world.mx3d`; no additional terrain format or map converter
+is introduced. Support height is not proof of walls, headroom, slope policy
+or a traversable staircase. See `layered-3d-ground-support-review-20260930.md`.

@@ -119,6 +119,7 @@ if(ENABLE_WORLDBENCH)
         src/bench/MapRuntimeBench.cpp
         src/bench/MapStreamingBench.cpp
         src/bench/LayerLookupBench.cpp
+        src/bench/LayerSupportBench.cpp
         src/GameConnectionHandler.cpp
         ${GAMESERVER_WORLD_SOURCES}
     )

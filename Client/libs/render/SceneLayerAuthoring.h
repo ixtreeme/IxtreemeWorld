@@ -32,7 +32,8 @@ bool BuildLayerCollisionMesh(const MeshSceneEntity& mesh,
 
 // Opt-in model colliders and rectangular water surfaces; terrain remains the
 // existing heightfield. The global occupancy band is metadata, not a proof of
-// character clearance or an activation of layered simulation.
+// character clearance or an activation of layered simulation. Exact ground
+// volumes retain the cooker's source/component support plane; water does not.
 bool GenerateSceneLayers(const SceneData& scene,
     const LayerCollisionGeometryProvider& geometryProvider,
     SceneLayerAuthoringResult& result);

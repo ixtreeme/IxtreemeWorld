@@ -219,6 +219,8 @@ bool GenerateSceneLayers(const SceneData& scene,
     }
     mx::map::LayerGenerationOptions options;
     options.world_bounds = result.worldBounds;
+    // One exact collision component per volume preserves the support plane
+    // and its original collider entity/component identity without AABB merging.
     options.require_exact_footprints = true;
     if (!mx::map::GenerateLayeredWorld(surfaces, options, result.world, result.generation)) {
         result.errors = result.generation.errors;

@@ -213,6 +213,11 @@ bool GenerateLayeredWorld(const std::vector<LayerSourceSurface>& surfaces,
         volume.kind = KindFor(components[i].tags);
         volume.supports_ground_movement = components[i].supports_ground_movement;
         volume.tags = components[i].tags;
+        // Gap/AABB merging has no exact physical surface proof. Even an
+        // unmerged legacy adapter record must remain support-unknown.
+        if (options.require_exact_footprints && components[i].members.size() == 1) {
+            volume.ground_support = surfaces[components[i].members[0]].ground_support;
+        }
         output.volumes.push_back(std::move(volume));
         report.surfaces_merged += components[i].members.size() > 1 ? components[i].members.size() - 1 : 0;
     }

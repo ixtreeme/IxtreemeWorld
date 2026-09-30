@@ -75,8 +75,10 @@ gameplay checks.
 
 ## Package integration (3D-2)
 
-Version 2 of the optional `layered_world.mx3d` sidecar stores bounded
-volume and portal records plus semantic volume tags in little-endian form.
+Version 3 of the optional `layered_world.mx3d` sidecar stores bounded
+volume and portal records, semantic volume tags and optional cooked ground
+support planes in little-endian form. Version 1/2 files remain readable;
+they have no ground-support proof and ground queries return unavailable.
 A package without this file
 keeps the legacy contract. When the file is present, the strict package
 loader decodes it, validates its record envelope, validates the 3D contract
@@ -95,9 +97,31 @@ surface, including portal traversal and malformed-sidecar rejection.
 need to adopt it together with authoritative entity volume ownership; the key
 must not remain only `(cell_x, cell_y)` once layered entities are admitted.
 
-3D-4 will add server-cooked model collision/navigation and explicit portal
-transitions. 3D-5 will connect movement, migration, replication and the
-StandaloneVulkanClear client.
+3D-4A preserves a proved rectangular collision component's plane, original
+mesh source id and deterministic component id. The plane evaluates as
+`z = anchor_z + slope_x*(x-anchor_x) + slope_y*(y-anchor_y)`; its measured
+maximum deviation from source vertices is stored separately. Occupancy
+`min_z`/`max_z` is never reinterpreted as floor height or capsule clearance.
+The legacy gap/AABB merge path discards support proof. Water/underwater and
+non-ground movement policy cannot produce walking support.
+
+`ResolveLayerGroundPlacement` requires an explicit volume id.
+`ResolveLayerGroundMove` checks the current pose/identity against that
+surface and retains it on failure. Ordinary moves cannot change volume;
+even a declared portal returns `TransitionRequired` until explicit physical
+transition validation is implemented. There is no nearest-floor selection
+or fallback from unknown support to terrain.
+
+These queries are read-only over a validated immutable world. WorldRuntime
+exposes them for offline ground-state checks; the engine uses the same API
+in an immutable scene adapter and an editor support probe. They do not
+admit production entities or replace the CharacterController. Generated
+volume/component ids belong to one bake; structural rebakes may renumber
+them. A new dataset requires explicit placement, not carrying old ids.
+
+Remaining 3D-4 work is model blocking collision/clearance/navigation and
+explicit portal transitions. 3D-5 connects authoritative entity ownership,
+movement, migration, spatial/AOI/ghost paths, replication and the client.
 
 No layer-aware production path should be enabled before the fixture and
 contract tests prove deterministic lookup, non-overlap, portal validation,

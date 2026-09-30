@@ -71,6 +71,67 @@ bool LayerVolume::Contains(float x, float y, float z) const noexcept
     return bounds.ContainsHalfOpen(x, y) && z >= min_z && z < max_z;
 }
 
+double LayerSupportPlane::Height(double x, double y) const noexcept
+{
+    return anchor_z + slope_x * (x - anchor_x) + slope_y * (y - anchor_y);
+}
+
+bool LayerVolume::AllowsGroundMovement() const noexcept
+{
+    return supports_ground_movement &&
+           static_cast<std::uint8_t>(kind) <= static_cast<std::uint8_t>(VolumeKind::Connector) &&
+           kind != VolumeKind::WaterSurface && kind != VolumeKind::Underwater &&
+           (tags & ~kKnownVolumeTags) == 0 && !HasVolumeTag(tags, VolumeTagWater) &&
+           !HasVolumeTag(tags, VolumeTagUnderwater);
+}
+
+bool LayerVolume::HasValidGroundSupport() const noexcept
+{
+    if (!ground_support || !AllowsGroundMovement() || id == 0 || layer_id == kLegacyLayerId ||
+        !ValidRect(bounds) || !Finite(min_z) || !Finite(max_z) || !(min_z < max_z)) {
+        return false;
+    }
+    const auto& plane = *ground_support;
+    if (plane.source_id == 0 || plane.component_id == 0 ||
+        !std::isfinite(plane.anchor_x) || !std::isfinite(plane.anchor_y) ||
+        !std::isfinite(plane.anchor_z) || !std::isfinite(plane.slope_x) ||
+        !std::isfinite(plane.slope_y) || !std::isfinite(plane.max_height_error_m) ||
+        plane.max_height_error_m < 0.0) {
+        return false;
+    }
+    // Cooker anchors are actual component vertices. Closed XY bounds are
+    // intentional: boundary vertices may lie on the half-open footprint's
+    // maximum edge. Remote anchors can hide huge finite cancellation in the
+    // corner evaluation and must never be accepted as surface proof.
+    if (plane.anchor_x < static_cast<double>(bounds.min_x) ||
+        plane.anchor_x > static_cast<double>(bounds.max_x) ||
+        plane.anchor_y < static_cast<double>(bounds.min_y) ||
+        plane.anchor_y > static_cast<double>(bounds.max_y) ||
+        !std::isfinite(plane.anchor_z - plane.max_height_error_m) ||
+        !std::isfinite(plane.anchor_z + plane.max_height_error_m) ||
+        plane.anchor_z - plane.max_height_error_m < static_cast<double>(min_z) ||
+        plane.anchor_z + plane.max_height_error_m >= static_cast<double>(max_z)) {
+        return false;
+    }
+    const double vertical_error_limit = kLayerSupportCoplanarToleranceMeters *
+        std::hypot(1.0, std::hypot(plane.slope_x, plane.slope_y));
+    if (!std::isfinite(vertical_error_limit) || plane.max_height_error_m > vertical_error_limit) {
+        return false;
+    }
+    for (const double x : {static_cast<double>(bounds.min_x), static_cast<double>(bounds.max_x)}) {
+        for (const double y : {static_cast<double>(bounds.min_y), static_cast<double>(bounds.max_y)}) {
+            const double height = plane.Height(x, y);
+            const double lower = height - plane.max_height_error_m;
+            const double upper = height + plane.max_height_error_m;
+            if (!std::isfinite(height) || !std::isfinite(lower) || !std::isfinite(upper) ||
+                lower < static_cast<double>(min_z) || upper >= static_cast<double>(max_z)) {
+                return false;
+            }
+        }
+    }
+    return true;
+}
+
 bool LayerPortal::SourceContains(float x, float y, float z) const noexcept
 {
     return source_bounds.ContainsHalfOpen(x, y) && z >= source_min_z && z < source_max_z;
@@ -81,6 +142,10 @@ bool LayeredWorld::Validate(const Rect& world_bounds, std::string& error) const
     error.clear();
     if (!ValidRect(world_bounds)) {
         error = "layered-world world bounds are invalid";
+        return false;
+    }
+    if (volumes.size() > kMaxLayeredWorldVolumes || portals.size() > kMaxLayeredWorldPortals) {
+        error = "layered-world record count exceeds the limit";
         return false;
     }
     if (volumes.empty()) {
@@ -101,10 +166,15 @@ bool LayeredWorld::Validate(const Rect& world_bounds, std::string& error) const
             error = "layered-world duplicate volume id " + std::to_string(volume.id);
             return false;
         }
-        if ((volume.tags & ~kKnownVolumeTags) != 0 || !ValidRect(volume.bounds) ||
+        if (static_cast<std::uint8_t>(volume.kind) > static_cast<std::uint8_t>(VolumeKind::Connector) ||
+            (volume.tags & ~kKnownVolumeTags) != 0 || !ValidRect(volume.bounds) ||
             !InsideRect(volume.bounds, world_bounds) || !Finite(volume.min_z) ||
             !Finite(volume.max_z) || !(volume.min_z < volume.max_z)) {
             error = "layered-world volume " + std::to_string(volume.id) + " has invalid bounds";
+            return false;
+        }
+        if (volume.ground_support && !volume.HasValidGroundSupport()) {
+            error = "layered-world volume " + std::to_string(volume.id) + " has invalid ground support";
             return false;
         }
     }
@@ -194,6 +264,21 @@ void PutU32(std::vector<std::uint8_t>& out, std::uint32_t value)
     }
 }
 
+void PutU64(std::vector<std::uint8_t>& out, std::uint64_t value)
+{
+    for (int shift = 0; shift < 64; shift += 8) {
+        out.push_back(static_cast<std::uint8_t>((value >> shift) & 0xffu));
+    }
+}
+
+void PutF64(std::vector<std::uint8_t>& out, double value)
+{
+    std::uint64_t bits = 0;
+    static_assert(sizeof(bits) == sizeof(value));
+    std::memcpy(&bits, &value, sizeof(bits));
+    PutU64(out, bits);
+}
+
 void PutF32(std::vector<std::uint8_t>& out, float value)
 {
     std::uint32_t bits = 0;
@@ -271,6 +356,25 @@ public:
         return true;
     }
 
+    bool U64(std::uint64_t& out) noexcept
+    {
+        if (Remaining() < 8) return false;
+        out = 0;
+        for (int shift = 0; shift < 64; shift += 8) {
+            out |= static_cast<std::uint64_t>(bytes_[offset_++]) << shift;
+        }
+        return true;
+    }
+
+    bool F64(double& out) noexcept
+    {
+        std::uint64_t bits = 0;
+        if (!U64(bits)) return false;
+        static_assert(sizeof(bits) == sizeof(out));
+        std::memcpy(&out, &bits, sizeof(out));
+        return true;
+    }
+
     bool Text(std::size_t length, std::string& out)
     {
         if (Remaining() < length) {
@@ -299,7 +403,8 @@ std::vector<std::uint8_t> EncodeLayeredWorld(const LayeredWorld& world)
         return {};
     }
     for (const auto& volume : world.volumes) {
-        if (volume.name.size() > kMaxLayeredWorldNameBytes) {
+        if (volume.name.size() > kMaxLayeredWorldNameBytes ||
+            (volume.ground_support && !volume.HasValidGroundSupport())) {
             return {};
         }
     }
@@ -321,6 +426,21 @@ std::vector<std::uint8_t> EncodeLayeredWorld(const LayeredWorld& world)
         PutF32(out, volume.min_z);
         PutF32(out, volume.max_z);
         out.insert(out.end(), volume.name.begin(), volume.name.end());
+        PutU8(out, volume.ground_support ? 1 : 0);
+        PutU8(out, 0);
+        PutU8(out, 0);
+        PutU8(out, 0);
+        if (volume.ground_support) {
+            const auto& plane = *volume.ground_support;
+            PutU32(out, plane.source_id);
+            PutU32(out, plane.component_id);
+            PutF64(out, plane.anchor_x);
+            PutF64(out, plane.anchor_y);
+            PutF64(out, plane.anchor_z);
+            PutF64(out, plane.slope_x);
+            PutF64(out, plane.slope_y);
+            PutF64(out, plane.max_height_error_m);
+        }
     }
     for (const auto& portal : world.portals) {
         PutU32(out, portal.id);
@@ -344,6 +464,7 @@ bool DecodeLayeredWorld(const std::vector<std::uint8_t>& bytes, LayeredWorld& wo
 {
     error.clear();
     world = LayeredWorld{};
+    LayeredWorld decoded;
     if (bytes.size() > kMaxLayeredWorldFileBytes) {
         error = "layered-world sidecar exceeds the size limit";
         return false;
@@ -369,8 +490,13 @@ bool DecodeLayeredWorld(const std::vector<std::uint8_t>& bytes, LayeredWorld& wo
         error = "layered-world sidecar record count exceeds the limit";
         return false;
     }
-    world.volumes.reserve(volume_count);
-    world.portals.reserve(portal_count);
+    const std::uint64_t minimum_volume_bytes = version >= 3 ? 44 : (version >= 2 ? 40 : 36);
+    if (minimum_volume_bytes * volume_count + 64ull * portal_count > cursor.Remaining()) {
+        error = "layered-world sidecar records are truncated";
+        return false;
+    }
+    decoded.volumes.reserve(volume_count);
+    decoded.portals.reserve(portal_count);
     for (std::uint32_t i = 0; i < volume_count; ++i) {
         LayerVolume volume;
         std::uint8_t raw_kind = 0;
@@ -403,31 +529,59 @@ bool DecodeLayeredWorld(const std::vector<std::uint8_t>& bytes, LayeredWorld& wo
             error = "layered-world volume record " + std::to_string(i) + " name is truncated";
             return false;
         }
-        world.volumes.push_back(std::move(volume));
+        if (version >= 3) {
+            std::uint8_t support = 0, reserved0 = 0, reserved1 = 0, reserved2 = 0;
+            if (!cursor.U8(support) || !cursor.U8(reserved0) || !cursor.U8(reserved1) ||
+                !cursor.U8(reserved2)) {
+                error = "layered-world support header " + std::to_string(i) + " is truncated";
+                return false;
+            }
+            if (support > 1 || reserved0 != 0 || reserved1 != 0 || reserved2 != 0) {
+                error = "layered-world support header " + std::to_string(i) + " has unsupported flags";
+                return false;
+            }
+            if (support != 0) {
+                LayerSupportPlane plane;
+                if (!cursor.U32(plane.source_id) || !cursor.U32(plane.component_id) ||
+                    !cursor.F64(plane.anchor_x) || !cursor.F64(plane.anchor_y) ||
+                    !cursor.F64(plane.anchor_z) || !cursor.F64(plane.slope_x) ||
+                    !cursor.F64(plane.slope_y) || !cursor.F64(plane.max_height_error_m)) {
+                    error = "layered-world support record " + std::to_string(i) + " is truncated";
+                    return false;
+                }
+                volume.ground_support = plane;
+                if (!volume.HasValidGroundSupport()) {
+                    error = "layered-world support record " + std::to_string(i) + " is invalid";
+                    return false;
+                }
+            }
+        }
+        decoded.volumes.push_back(std::move(volume));
     }
     for (std::uint32_t i = 0; i < portal_count; ++i) {
         LayerPortal portal;
         std::uint8_t direction = 0;
-        std::uint8_t reserved = 0;
+        std::uint8_t reserved0 = 0, reserved1 = 0, reserved2 = 0;
         if (!cursor.U32(portal.id) || !cursor.U32(portal.source_volume) || !cursor.U32(portal.target_volume) ||
             !ReadRect(cursor, portal.source_bounds) || !ReadRect(cursor, portal.target_bounds) ||
             !cursor.F32(portal.source_min_z) || !cursor.F32(portal.source_max_z) ||
             !cursor.F32(portal.target_min_z) || !cursor.F32(portal.target_max_z) || !cursor.U8(direction) ||
-            !cursor.U8(reserved) || !cursor.U8(reserved) || !cursor.U8(reserved)) {
+            !cursor.U8(reserved0) || !cursor.U8(reserved1) || !cursor.U8(reserved2)) {
             error = "layered-world portal record " + std::to_string(i) + " is truncated";
             return false;
         }
-        if (direction > 1) {
+        if (direction > 1 || (version >= 3 && (reserved0 != 0 || reserved1 != 0 || reserved2 != 0))) {
             error = "layered-world portal record " + std::to_string(i) + " has an invalid direction flag";
             return false;
         }
         portal.bidirectional = direction != 0;
-        world.portals.push_back(std::move(portal));
+        decoded.portals.push_back(std::move(portal));
     }
     if (cursor.Remaining() != 0) {
         error = "layered-world sidecar has trailing bytes at offset " + std::to_string(cursor.Offset());
         return false;
     }
+    world = std::move(decoded);
     return true;
 }
 

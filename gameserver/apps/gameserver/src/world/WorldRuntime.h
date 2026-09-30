@@ -19,6 +19,7 @@
 #include <boost/asio/io_context.hpp>
 
 #include "db/CharacterRepository.h"
+#include "map/LayerGroundSupport.h"
 #include "map/MapData.h"
 #include "network/Session.h"
 
@@ -221,6 +222,14 @@ public:
     // volume remains valid until this WorldRuntime is destroyed. Uncovered
     // or non-finite points have no volume; no implicit layer is fabricated.
     const mx::map::LayerVolume* FindLayerVolume(float x, float y, float z) const noexcept;
+    // Offline ground-state queries over immutable, validated package support
+    // planes. These do not spawn/admit an actor, change the ECS, or perform
+    // collision/portal traversal. Missing support never falls back to terrain.
+    mx::map::LayerGroundResult PlaceLayerGround(mx::map::VolumeId volume_id,
+                                              double x, double y) const noexcept;
+    mx::map::LayerGroundResult MoveLayerGround(const mx::map::LayerGroundState& current,
+                                             mx::map::VolumeId target_volume_id,
+                                             double x, double y) const noexcept;
     const OwnerMap& Owners() const noexcept
     {
         return owners_by_session_;

@@ -28,6 +28,7 @@ add_library(IXEngineMapData STATIC
     src/LayeredWorld.cpp
     src/LayeredWorldGenerator.cpp
     src/LayeredWorldGeometry.cpp
+    src/LayerGroundSupport.cpp
     src/ServerTerrain.cpp
     src/ServerWater.cpp
     src/WorldPackage.cpp
@@ -56,6 +57,14 @@ if(MSVC)
 endif()
 
 if(NOT CMAKE_SYSTEM_NAME STREQUAL "Android")
+    add_executable(layer_ground_support_test tools/layer_ground_support_test.cpp)
+    target_link_libraries(layer_ground_support_test PRIVATE mapdata)
+    target_compile_features(layer_ground_support_test PRIVATE cxx_std_20)
+    if(MSVC)
+        set_target_properties(layer_ground_support_test PROPERTIES
+            MSVC_RUNTIME_LIBRARY "MultiThreaded$<$<CONFIG:Debug>:Debug>")
+    endif()
+
     add_executable(terrain_surface_contract_test
         tools/terrain_surface_contract_test.cpp
     )

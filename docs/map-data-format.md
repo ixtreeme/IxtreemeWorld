@@ -991,3 +991,45 @@ A `PostTerrainDemand(x,y,r)` a világra metszett, zárt igénydoboz összes
 érintett chunkját kéri, beleértve a középpontot és a chunkhatár másik
 oldalát. Nem véges/bounds-on kívüli vagy negatív sugarú kérés nem indít I/O-t.
 Ez igény, nem pin és nem betöltési sikerígéret: szűk budgetnél várakozhat.
+
+## 14. Rétegezett modellfelület: MX3D v3 support (2026-09-30)
+
+A külön opcionális `layered_world.mx3d` sidecar v3-ra bővült; ez nem
+manifest-, terrain-height- vagy chunk-verzióváltozás. V1/v2 továbbra is
+beolvasható, de nem tartalmaz ground-support síkot. A régi reader az új
+sidecarverziót elutasítja; a v3 adatból nem gyárt csendben régi felületet.
+
+A v2 volume rekord és name után v3-ban egy `u8 support_present` és három
+nulla reserved byte áll. `support_present=1` esetén a folytatás:
+
+```text
+u32 source_id, u32 component_id
+f64 anchor_x, anchor_y, anchor_z
+f64 slope_x, slope_y, max_height_error_m
+```
+
+Little-endian; a record envelope, 4 MiB méretlimit, 4096 volume és 8192
+portal felső határ megmarad. A támogatási jelző csak 0/1, v3 reserved byte
+csak nulla. Supportos rekordnál finite adatok, nem nulla bake-id-k,
+nonnegative measured error, engedélyezett ground movement és a footprint
+sarkain számított floor ± hiba teljes Z-banden belüli elhelyezkedése kell.
+A horgonypont XY-ban a footprint zárt határain belül, Z-ben a hibaértékkel
+együtt a volume bandben marad. A mért residual felső határa a már meglévő
+`1e-5 m` merőleges coplanaritásból származik:
+`1e-5*sqrt(1+slope_x²+slope_y²)`. Ez nem új mozgási tolerancia.
+Hibás rekord nem ad részben dekódolt világot. A portal rekord mérete nem
+változott, de a v3 reserved byte-ok ott is ellenőrzöttek.
+
+A sík `z=anchor_z+slope_x*(x-anchor_x)+slope_y*(y-anchor_y)` méterben,
+canonical server X/Y vízszintes és Z felfelé. A síkhoz a meglévő bizonyított
+téglalap-footprint tartozik; nincs újabb AABB-floor kitalálás. A cooker a
+tényleges collision vertexekhez mért maximális magasságeltérést menti.
+A source/component az immutable bake-hez tartozik; újrabake után
+átszámozódhat, nem világverziókon át stabil entity-id.
+
+Az új explicit volume alapú placement és az ugyanazon volume-on maradó
+ground move read-only/offline döntés. A min/max Z metaadat nem fejtér vagy
+teljes collisionbizonyíték. Water/underwater, unknown support, hibás current
+pose és volume-váltás külön elutasítás; nincs terrain/nearest-floor fallback.
+Production movement, spatial/AOI, ghost, migration és packet aktiválás
+ehhez a mérföldkőhöz még nem tartozik.

@@ -151,6 +151,20 @@ void EditorImGui::RenderMenuBar()
                 m_commands.serverWorldSpawnX = m_serverWorldSpawn[0];
                 m_commands.serverWorldSpawnZ = m_serverWorldSpawn[1];
             }
+            ImGui::Separator();
+            ImGui::TextUnformatted("Support probe (offline)");
+            ImGui::InputScalar("Support volume", ImGuiDataType_U32, &m_layerGroundVolume);
+            ImGui::InputFloat2("Support point X/Z (m)", m_layerGroundPoint);
+            if (ImGui::MenuItem("Place support probe", nullptr, false, CanUseEditorTools()))
+                m_commands.placeLayerGround = true;
+            if (ImGui::MenuItem("Move support probe", nullptr, false, CanUseEditorTools()))
+                m_commands.moveLayerGround = true;
+            if (m_commands.placeLayerGround || m_commands.moveLayerGround)
+            {
+                m_commands.layerGroundVolume = m_layerGroundVolume;
+                m_commands.layerGroundX = m_layerGroundPoint[0];
+                m_commands.layerGroundZ = m_layerGroundPoint[1];
+            }
             if (!m_layerAuthoringStatus.empty())
             {
                 ImGui::Separator();

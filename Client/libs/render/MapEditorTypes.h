@@ -778,6 +778,11 @@ struct MapEditorCommands
     std::string serverWorldId;
     float serverWorldSpawnX = 0;
     float serverWorldSpawnZ = 0;
+    bool placeLayerGround = false;
+    bool moveLayerGround = false;
+    std::uint32_t layerGroundVolume = 1;
+    float layerGroundX = 0;
+    float layerGroundZ = 0;
     bool showLayerVolumes = false;
     bool debugPerfTogglesChanged = false;
     bool disableShadowPass = false;

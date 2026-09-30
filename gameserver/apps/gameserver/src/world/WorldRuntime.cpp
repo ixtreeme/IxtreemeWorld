@@ -97,6 +97,24 @@ WorldRuntime::WorldRuntime(boost::asio::io_context& io,
                            const TerrainStreamingConfig& streaming)
     : WorldRuntime(io, identity, ConstructMembersOnly{})
 {
+    // The normal loader has already validated this metadata. The public
+    // LoadedWorld constructor can also receive manually assembled data, so
+    // close that trust boundary before retaining it or initializing zones.
+    if (world.layered_world) {
+        if (world.layered_world->volumes.size() > mx::map::kMaxLayeredWorldVolumes ||
+            world.layered_world->portals.size() > mx::map::kMaxLayeredWorldPortals) {
+            throw std::invalid_argument("WorldRuntime: invalid layered metadata: record limits exceeded");
+        }
+        const auto& geometry = world.terrain.Geometry();
+        const mx::map::Rect world_bounds{static_cast<float>(geometry.MinX()),
+                                       static_cast<float>(geometry.MinY()),
+                                       static_cast<float>(geometry.MaxX()),
+                                       static_cast<float>(geometry.MaxY())};
+        std::string error;
+        if (!world.layered_world->Validate(world_bounds, error)) {
+            throw std::invalid_argument("WorldRuntime: invalid layered metadata: " + error);
+        }
+    }
     if (world.layered_world && !world.layered_world->volumes.empty()) {
         layered_metadata_ = std::make_unique<const mx::map::LayeredWorld>(std::move(*world.layered_world));
     }
@@ -133,6 +151,25 @@ const mx::map::LayerVolume* WorldRuntime::FindLayerVolume(float x, float y, floa
         result = &volume;
     }
     return result;
+}
+
+mx::map::LayerGroundResult WorldRuntime::PlaceLayerGround(mx::map::VolumeId volume_id,
+                                                       double x, double y) const noexcept
+{
+    if (!layered_metadata_) {
+        return {mx::map::GroundSupportStatus::NotAvailable};
+    }
+    return mx::map::ResolveLayerGroundPlacement(*layered_metadata_, volume_id, x, y);
+}
+
+mx::map::LayerGroundResult WorldRuntime::MoveLayerGround(const mx::map::LayerGroundState& current,
+                                                      mx::map::VolumeId target_volume_id,
+                                                      double x, double y) const noexcept
+{
+    if (!layered_metadata_) {
+        return {mx::map::GroundSupportStatus::NotAvailable, current};
+    }
+    return mx::map::ResolveLayerGroundMove(*layered_metadata_, current, target_volume_id, x, y);
 }
 
 WorldRuntime::WorldRuntime(boost::asio::io_context& io,
