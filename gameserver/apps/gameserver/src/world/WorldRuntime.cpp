@@ -1,0 +1,3042 @@
+#include "WorldRuntime.h"
+
+#include <algorithm>
+#include <chrono>
+#include <cmath>
+#include <cstdint>
+#include <filesystem>
+#include <fstream>
+#include <unordered_map>
+#include <unordered_set>
+#ifdef _WIN32
+#ifndef NOMINMAX
+#define NOMINMAX
+#endif
+#include <windows.h>
+#endif
+
+#include "common/Logging.h"
+
+#include "components/Tags.h"
+#include "components/TransformComponents.h"
+#include "distributed/RuntimeIds.h"
+#include "migration/EntityTransfer.h"
+#include "partition/ZonePartition.h"
+#include "replication/NetworkSend.h"
+#include "replication/ReplicationValidator.h"
+#include "systems/CombatSystem.h"
+#include "visibility/GhostSystem.h"
+#include "visibility/GhostValidator.h"
+#include "zone/ZoneOwnership.h"
+#include "WorldConstants.h"
+
+namespace gs::game {
+namespace {
+std::uint64_t CurrentThreadCpuUs() {
+#ifdef _WIN32
+    FILETIME create{},exit{},kernel{},user{};
+    if(GetThreadTimes(GetCurrentThread(),&create,&exit,&kernel,&user)) {
+        ULARGE_INTEGER k{},u{};k.LowPart=kernel.dwLowDateTime;k.HighPart=kernel.dwHighDateTime;
+        u.LowPart=user.dwLowDateTime;u.HighPart=user.dwHighDateTime;return (k.QuadPart+u.QuadPart)/10;
+    }
+#endif
+    return 0; // NOT MEASURED on unsupported platforms, never derived from wall work.
+}
+}
+
+
+WorldRuntime::WorldRuntime(boost::asio::io_context& io, RuntimeIdentity identity, ConstructMembersOnly)
+    : io_(io)
+    , workers_([this](std::size_t zone_index) {
+        TickZone(zone_index);
+    })
+    , identity_(identity)
+    , directory_(identity)
+    , router_(zones_, directory_)
+    , spawn_(io_,
+             zones_,
+             terrain_,
+             world_logic_,
+             owners_by_session_,
+             router_,
+             [this] {
+                 cv_.notify_one();
+             },
+             [this](std::shared_ptr<gs::network::Session> session, std::vector<std::uint8_t> payload) {
+                 SendToSession(io_, session, std::move(payload));
+             },
+             [this](std::shared_ptr<gs::network::Session> session, std::vector<std::uint8_t> payload) {
+                 SendToSessionAndClose(io_, session, std::move(payload));
+             },
+             identity_,
+             directory_)
+    , migration_(zones_, terrain_, owners_by_session_, migration_queue_, directory_,
+                 migration_transport_, identity_)
+    , inputs_(router_)
+{
+    // Runs inside the tick-aligned input command, on the zone's worker.
+    attack_handler_ = [this](Zone& zone,
+                             gs::common::SessionId attacker,
+                             std::uint32_t target_net_id) {
+        auto ctx = BuildZoneTickContext();
+        const auto result = CombatSystem::ProcessAttack(zone, attacker, target_net_id, ctx);
+        if (result.attacked) {
+            attacks_since_diag_.fetch_add(1, std::memory_order_relaxed);
+            attacks_total_.fetch_add(1, std::memory_order_relaxed);
+        }
+        if (result.killed) {
+            deaths_total_.fetch_add(1, std::memory_order_relaxed);
+        }
+    };
+}
+
+WorldRuntime::WorldRuntime(boost::asio::io_context& io,
+                           RuntimeIdentity identity,
+                           LoadedWorld world,
+                           const PartitionLayout& layout,
+                           const TerrainStreamingConfig& streaming)
+    : WorldRuntime(io, identity, ConstructMembersOnly{})
+{
+    std::optional<StreamingSetup> setup;
+    if (world.residency == mx::map::ResidencyMode::Streaming) {
+        setup = StreamingSetup{std::move(world.chunk_source), std::move(world.startup_chunks), streaming};
+    }
+    TerrainService terrain(std::move(world.terrain));
+    terrain.SetWater(std::move(world.water));
+    InitializeWorld(std::move(terrain),
+                    std::move(world.logic),
+                    world.mob_types_config,
+                    std::move(world.spawn_points),
+                    layout,
+                    std::move(setup));
+}
+
+WorldRuntime::WorldRuntime(boost::asio::io_context& io,
+                           RuntimeIdentity identity,
+                           const SyntheticWorldConfig& synthetic)
+    : WorldRuntime(io, identity, ConstructMembersOnly{})
+{
+    // Flat world on [0, extent)^2 whose initial partition is a zones_x x
+    // zones_y leaf grid, grouped into regions_x x regions_y regions.
+    const std::uint32_t zones_x = std::max(1u, synthetic.zones_x);
+    const std::uint32_t zones_y = std::max(1u, synthetic.zones_y);
+    const std::uint32_t regions_x = std::max(1u, synthetic.regions_x);
+    const std::uint32_t regions_y = std::max(1u, synthetic.regions_y);
+    if (zones_x % regions_x != 0 || zones_y % regions_y != 0) {
+        throw std::invalid_argument("synthetic world: zone grid " + std::to_string(zones_x) + "x" +
+                                    std::to_string(zones_y) + " is not divisible by the region grid " +
+                                    std::to_string(regions_x) + "x" + std::to_string(regions_y));
+    }
+    const float extent = synthetic.extent_m > 0.0f ? synthetic.extent_m : 100000.0f;
+    if (!(extent <= static_cast<float>(mx::map::kMaxWorldCoordinate))) {
+        // Same f32 coordinate range as a package world ([0, extent)).
+        throw std::invalid_argument("synthetic world: extent " + std::to_string(extent) + " m exceeds " +
+                                    std::to_string(mx::map::kMaxWorldCoordinate) + " m");
+    }
+    const WorldBounds bounds = WorldBounds::FromExtent(extent);
+    // Metadata: one area covering the world and a player spawn region at its
+    // centre (benchmark players are placed explicitly; this only feeds the
+    // default spawn resolution).
+    mx::map::WorldLogic logic;
+    logic.zones.push_back(mx::map::Area{1, "synthetic world", mx::map::Rect{0.0f, 0.0f, extent, extent}});
+    logic.spawns.push_back(mx::map::SpawnRegion{
+        1, 1,
+        mx::map::Rect{extent * 0.5f - 50.0f, extent * 0.5f - 50.0f, extent * 0.5f + 50.0f,
+                      extent * 0.5f + 50.0f}});
+    std::string types = synthetic.mob_types_config;
+#ifdef IXTREEME_DEFAULT_MOB_TYPES_CONFIG
+    if (types.empty()) {
+        types = IXTREEME_DEFAULT_MOB_TYPES_CONFIG; // bench builds only
+    }
+#endif
+    PartitionLayout layout;
+    layout.regions_x = regions_x;
+    layout.regions_y = regions_y;
+    layout.leaves_x = zones_x / regions_x;
+    layout.leaves_y = zones_y / regions_y;
+    InitializeWorld(TerrainService::Flat(bounds), std::move(logic), types, std::nullopt, layout);
+    LOG_INFO("World: SYNTHETIC flat {}m x {}m, {}x{} bootstrap zones in {}x{} regions (explicit synthetic mode, "
+             "no package)",
+             extent,
+             extent,
+             zones_x,
+             zones_y,
+             regions_x,
+             regions_y);
+}
+
+void WorldRuntime::InitializeWorld(TerrainService terrain,
+                                   mx::map::WorldLogic logic,
+                                   const std::string& mob_types_config,
+                                   std::optional<std::vector<MobSpawnPoint>> package_spawn_points,
+                                   const PartitionLayout& layout,
+                                   std::optional<StreamingSetup> streaming)
+{
+    terrain_ = std::move(terrain);
+    world_logic_ = std::move(logic);
+    const WorldBounds bounds = terrain_.Bounds();
+    if (streaming && terrain_.MutableTerrain() != nullptr) {
+        // The loader published the startup set (spawn region centres, warp
+        // targets); they stay resident for the world's lifetime.
+        streamer_ = std::make_unique<TerrainStreamer>(*terrain_.MutableTerrain(), std::move(streaming->source),
+                                                      streaming->config, [this] {
+                                                          {
+                                                              std::lock_guard lock(mutex_);
+                                                              terrain_completion_pending_ = true;
+                                                          }
+                                                          cv_.notify_one();
+                                                      });
+        for (const std::uint32_t index : streaming->startup_chunks) {
+            streamer_->PinPermanently(index);
+        }
+        terrain_.AttachStreamer(streamer_.get());
+        spawn_.SetTerrainDemand([this](std::uint32_t chunk_index) {
+            streamer_->Demand(chunk_index, std::chrono::steady_clock::now(), TerrainPriority::Admission);
+        });
+    }
+
+    // Initial partition = server config applied to the LOADED bounds (MAP-2):
+    // regions and initial leaves tile the world, map areas play no part.
+    InitialPartition partition;
+    std::string layout_error;
+    if (!BuildInitialPartition(bounds, layout, 2.0f * kAoiRadiusMeters, partition, layout_error)) {
+        throw std::invalid_argument("initial partition: " + layout_error);
+    }
+    zones_.BuildInitialPartition(partition);
+    directory_.RebuildFromManager(zones_);
+    // Every world-indexed derived field uses the same loaded bounds (origin
+    // and non-square extents included).
+    activity_field_.Reconfigure(SpatialActivityField::Config{kActivityCellSizeMeters, bounds});
+    // Load field: same world bounds, independent cell size (config). The
+    // mapping is bound to every zone so their local load bins line up with
+    // the generation grid before any tick can run.
+    LoadFieldConfig load_field_config;
+    load_field_config.bounds = bounds;
+    load_field_.Reconfigure(load_field_config);
+    {
+        LoadFieldMapping mapping = LoadFieldMapping::FromConfig(load_field_config);
+        mapping.valid = load_field_config.enabled; // disabled = zero-cost bins
+        zones_.ApplyLoadFieldMapping(mapping);
+    }
+    effective_load_field_config_ = load_field_config;
+    last_load_field_build_ = std::chrono::steady_clock::now();
+    if (package_spawn_points && streamer_) {
+        // Streaming: the spawn circles' chunks are loaded batch by batch
+        // within the budget, never all at once.
+        spawn_.Initialize(std::move(*package_spawn_points), mob_types_config, false);
+        const std::size_t spawned = SpawnConfiguredMobsStreaming();
+        LOG_INFO("spawn complete (streaming batches): total_mobs={}", spawned);
+    } else if (package_spawn_points) {
+        spawn_.Initialize(std::move(*package_spawn_points), mob_types_config);
+    } else {
+        spawn_.ClearSpawnPoints();
+        if (!mob_types_config.empty()) {
+            spawn_.LoadMobTypes(mob_types_config);
+        }
+    }
+}
+
+std::size_t WorldRuntime::SpawnConfiguredMobsNow()
+{
+    if (zones_.AnyTickInProgress()) {
+        LOG_WARN("bulk mob spawn refused: zone tick in flight");
+        return 0;
+    }
+    return streamer_ ? SpawnConfiguredMobsStreaming() : spawn_.SpawnAllConfiguredMobs();
+}
+
+WorldRuntime::~WorldRuntime()
+{
+    Stop();
+}
+
+void WorldRuntime::Start()
+{
+    if (thread_.joinable()) {
+        return;
+    }
+
+    stopping_ = false;
+    thread_ = std::thread([this] {
+        Run();
+    });
+}
+
+void WorldRuntime::Stop()
+{
+    stopping_ = true;
+    cv_.notify_all();
+    if (thread_.joinable()) {
+        thread_.join();
+    }
+    workers_.Stop();
+    if (auto* terrain = terrain_.MutableTerrain()) {
+        // The supervisor is gone: the stopping thread owns the terrain now.
+        terrain->BindWriterThread();
+    }
+    if (streamer_) {
+        // Pending loads are dropped; late results are rejected (MAP-3).
+        streamer_->Stop();
+    }
+}
+
+std::size_t WorldRuntime::SpawnConfiguredMobsStreaming()
+{
+    const auto* terrain = terrain_.Terrain();
+    if (!streamer_ || terrain == nullptr) {
+        return spawn_.SpawnAllConfiguredMobs();
+    }
+    const auto& g = terrain->Geometry();
+    const double chunk_m = g.cell_size_m * g.chunk_cells;
+    const auto points = spawn_.SpawnPointsSnapshot();
+    // A spawn point's circle may touch several chunks: all of them must be
+    // resident while its mobs are placed. Batches of points whose chunk sets
+    // fit the FREE budget -- measured in what a load really reserves
+    // (decoded payload + read buffer + overhead), after the fixed metadata
+    // and the pinned startup set -- are loaded, spawned and released in turn.
+    const std::size_t batch_budget = streamer_->FreeBytes() / 10 * 9;
+    struct Batch {
+        std::vector<std::uint32_t> chunks;
+        std::vector<std::size_t> points;
+        std::size_t bytes = 0;
+    };
+    std::vector<Batch> batches(1);
+    std::size_t skipped = 0;
+    for (std::size_t p = 0; p < points.size(); ++p) {
+        const auto& point = points[p];
+        auto axis = [&](double v, double origin, std::uint32_t chunks) {
+            const double c = std::floor((v - origin) / chunk_m);
+            return static_cast<std::uint32_t>(std::clamp(c, 0.0, static_cast<double>(chunks - 1)));
+        };
+        const std::uint32_t cx0 = axis(point.x - point.radius, g.origin_x, g.chunks_x);
+        const std::uint32_t cx1 = axis(point.x + point.radius, g.origin_x, g.chunks_x);
+        const std::uint32_t cy0 = axis(point.y - point.radius, g.origin_y, g.chunks_y);
+        const std::uint32_t cy1 = axis(point.y + point.radius, g.origin_y, g.chunks_y);
+        std::vector<std::uint32_t> needed;
+        std::size_t bytes = 0;
+        for (std::uint32_t cy = cy0; cy <= cy1; ++cy) {
+            for (std::uint32_t cx = cx0; cx <= cx1; ++cx) {
+                const std::uint32_t index = terrain->ChunkIndex(cx, cy);
+                needed.push_back(index);
+                bytes += streamer_->ReservationBytes(index);
+            }
+        }
+        if (bytes > batch_budget) {
+            ++skipped;
+            LOG_ERROR("spawn point {} ({}, {}) r={}: its {} chunk(s) reserve {} B, above the free terrain budget "
+                      "({} B); its mobs are not spawned",
+                      p, point.x, point.y, point.radius, needed.size(), bytes, batch_budget);
+            continue;
+        }
+        if (batches.back().bytes + bytes > batch_budget && !batches.back().points.empty()) {
+            batches.emplace_back();
+        }
+        Batch& batch = batches.back();
+        for (const std::uint32_t index : needed) {
+            if (std::find(batch.chunks.begin(), batch.chunks.end(), index) == batch.chunks.end()) {
+                batch.chunks.push_back(index);
+                batch.bytes += streamer_->ReservationBytes(index);
+            }
+        }
+        batch.points.push_back(p);
+    }
+    std::size_t total = 0;
+    for (const auto& batch : batches) {
+        if (batch.points.empty()) {
+            continue;
+        }
+        std::string error;
+        if (!streamer_->LoadBlocking(batch.chunks, error)) {
+            // Chunks that failed for good are published invalid: mob
+            // candidates on them are refused one by one (counted by the
+            // spawn coordinator, re-rolled inside the circle); the rest of
+            // the batch spawns normally.
+            LOG_ERROR("spawn batch of {} point(s): {}", batch.points.size(), error);
+        }
+        for (const std::size_t p : batch.points) {
+            total += spawn_.SpawnPointMobs(p);
+        }
+        // Nothing runs yet: every tick is quiescent, freed at once.
+        (void)streamer_->EvictUndemanded(std::chrono::steady_clock::now() + std::chrono::seconds(1), true);
+    }
+    if (skipped > 0) {
+        LOG_WARN("streaming spawn: {} spawn point(s) skipped (see errors above)", skipped);
+    }
+    return total;
+}
+
+void WorldRuntime::PumpTerrain()
+{
+    terrain_demand_scratch_.clear();
+    TerrainQueryCounters counters;
+    for (std::size_t i = 0; i < zones_.ZoneCount(); ++i) {
+        zones_.GetZone(i).TerrainDemand().Take(terrain_demand_scratch_, counters);
+    }
+    {
+        std::lock_guard lock(terrain_stats_mutex_);
+        terrain_queries_.Add(counters);
+    }
+    const auto now = std::chrono::steady_clock::now();
+    if (streamer_) {
+        for (const auto& demand : terrain_demand_scratch_) {
+            streamer_->Demand(demand.chunk, now, demand.priority);
+        }
+    }
+    // Navigation jobs: bounded work per pass; they demand + pin chunks.
+    navigation_.Pump(terrain_, streamer_.get(), now, kNavigationExpansionsPerPass);
+    if (streamer_) {
+        // Only the supervisor dispatches zone ticks: no tick in flight now
+        // means none can start before this call returns -- a valid grace
+        // period for freeing evicted chunks.
+        const bool quiescent=!zones_.AnyTickInProgress();
+        if(quiescent && terrain_drain_started_!=std::chrono::steady_clock::time_point{}) {
+            ++terrain_safepoints_;
+            terrain_drain_wait_us_.fetch_add(static_cast<std::uint64_t>(
+                std::chrono::duration_cast<std::chrono::microseconds>(now-terrain_drain_started_).count()));
+            terrain_drain_max_us_.store(std::max(terrain_drain_max_us_.load(),static_cast<std::uint64_t>(std::chrono::duration_cast<std::chrono::microseconds>(now-terrain_drain_started_).count())));
+            terrain_drain_started_={};
+        }
+        streamer_->Pump(now, quiescent);
+        if(streamer_->NeedsQuiescence() && terrain_drain_started_==std::chrono::steady_clock::time_point{})
+            terrain_drain_started_=now;
+    }
+}
+
+std::uint64_t WorldRuntime::PostNavigationRequest(const NavRequest& request)
+{
+    const std::uint64_t id = next_navigation_id_.fetch_add(1, std::memory_order_relaxed) + 1;
+    Enqueue([this, id, request] { navigation_.Request(id, request, std::chrono::steady_clock::now()); });
+    return id;
+}
+
+void WorldRuntime::PostNavigationCancel(std::uint64_t id)
+{
+    Enqueue([this, id] { navigation_.Cancel(id); });
+}
+
+WorldRuntime::TerrainStats WorldRuntime::GetTerrainStats() const
+{
+    TerrainStats stats;
+    stats.streaming = streamer_ != nullptr;
+    if (streamer_) {
+        stats.streamer = streamer_->GetStats();
+    }
+    std::lock_guard lock(terrain_stats_mutex_);
+    stats.queries = terrain_queries_;
+    stats.supervisor_cpu_us=supervisor_cpu_us_.load();
+    stats.drain_max_us=terrain_drain_max_us_.load();
+    stats.commands_requested=terrain_commands_requested_.load();
+    stats.ingress_rejected=terrain_ingress_rejected_.load();
+    stats.safepoints=terrain_safepoints_.load(std::memory_order_relaxed);
+    stats.drain_wait_us=terrain_drain_wait_us_.load(std::memory_order_relaxed);
+    return stats;
+}
+
+void WorldRuntime::PostTerrainDemand(float x, float y, float radius_m)
+{
+    Enqueue([this, x, y, radius_m] {
+        const auto* terrain = terrain_.Terrain();
+        if (!streamer_ || terrain == nullptr) {
+            return;
+        }
+        const auto now = std::chrono::steady_clock::now();
+        if (!std::isfinite(x) || !std::isfinite(y) || !std::isfinite(radius_m) || radius_m < 0) return;
+        const auto& g = terrain->Geometry();
+        const double step = g.cell_size_m * g.chunk_cells;
+        if (x + double(radius_m) < g.MinX() || y + double(radius_m) < g.MinY() ||
+            x - double(radius_m) >= g.MaxX() || y - double(radius_m) >= g.MaxY()) return;
+        auto index = [&](double v, double origin, std::uint32_t count) {
+            return static_cast<std::uint32_t>(std::clamp(std::floor((v-origin)/step), 0.0, double(count-1)));
+        };
+        const auto x0=index(x-double(radius_m),g.origin_x,g.chunks_x), x1=index(x+double(radius_m),g.origin_x,g.chunks_x);
+        const auto y0=index(y-double(radius_m),g.origin_y,g.chunks_y), y1=index(y+double(radius_m),g.origin_y,g.chunks_y);
+        for (auto cy=y0; cy<=y1; ++cy) {
+            for (auto cx=x0; cx<=x1; ++cx) {
+                streamer_->Demand(terrain->ChunkIndex(cx,cy), now);
+            }
+        }
+    });
+}
+
+TerrainRequestHandle WorldRuntime::PrepareTerrain(float x, float y, float radius_m, double timeout_seconds)
+{
+    ++terrain_commands_requested_;
+    auto request=std::make_shared<TerrainRequest>(std::chrono::steady_clock::now(),
+        std::isfinite(timeout_seconds) ? std::clamp(timeout_seconds,0.0,15.0) : 0.0);
+    if(terrain_commands_pending_.fetch_add(1,std::memory_order_acq_rel)>=TerrainStreamer::kMaxRequests) {
+        ++terrain_ingress_rejected_;
+        terrain_commands_pending_.fetch_sub(1,std::memory_order_release);
+        request->SetStatus(TerrainRequestStatus::CapacityRejected);
+        return request;
+    }
+    auto command=[this,x,y,radius_m,request] {
+        terrain_commands_pending_.fetch_sub(1,std::memory_order_release);
+        const auto* terrain=terrain_.Terrain();
+        if(!std::isfinite(x) || !std::isfinite(y) || !std::isfinite(radius_m) || radius_m<0 || !terrain_.Contains(x,y)) {
+            request->SetStatus(TerrainRequestStatus::OutsideWorld); return;
+        }
+        if(!streamer_ || !terrain) {
+            request->SetStatus(TerrainRequestStatus::Ready); return;
+        }
+        const auto& g=terrain->Geometry();
+        const double pitch=g.cell_size_m*g.chunk_cells;
+        auto index=[&](double value,double origin,std::uint32_t count) {
+            return static_cast<std::uint32_t>(std::clamp(std::floor((value-origin)/pitch),0.0,double(count-1)));
+        };
+        const auto x0=index(x-double(radius_m),g.origin_x,g.chunks_x),x1=index(x+double(radius_m),g.origin_x,g.chunks_x);
+        const auto y0=index(y-double(radius_m),g.origin_y,g.chunks_y),y1=index(y+double(radius_m),g.origin_y,g.chunks_y);
+        if(std::uint64_t(x1-x0+1)*(y1-y0+1)>TerrainStreamer::kMaxRequestChunks) {
+            request->SetStatus(TerrainRequestStatus::CapacityRejected); return;
+        }
+        std::vector<std::uint32_t> chunks;
+        for(auto cy=y0;cy<=y1;++cy) for(auto cx=x0;cx<=x1;++cx) chunks.push_back(terrain->ChunkIndex(cx,cy));
+        streamer_->Request(request,chunks);
+    };
+    {
+        std::lock_guard lock(mutex_);
+        // Stop sets stopping_ before the supervisor's final command drain.
+        // Serialize insertion so no terrain request can miss that drain.
+        if(stopping_.load(std::memory_order_acquire)) {
+            terrain_commands_pending_.fetch_sub(1,std::memory_order_release);
+            request->SetStatus(TerrainRequestStatus::Cancelled);
+            return request;
+        }
+        commands_.push(std::move(command));
+    }
+    cv_.notify_one();
+    return request;
+}
+
+void WorldRuntime::BeginTerrainMeasurementWindow()
+{
+    Enqueue([this]{ if(streamer_) streamer_->BeginMeasurementWindow(std::chrono::steady_clock::now()); });
+}
+
+void WorldRuntime::PostTerrainResetForTest()
+{
+    Enqueue([this] {
+        if (streamer_) {
+            streamer_->ResetGenerationForTest(!zones_.AnyTickInProgress());
+        }
+    });
+}
+
+void WorldRuntime::PostTerrainEvictIdleForTest(double idle_seconds)
+{
+    Enqueue([this, idle_seconds] {
+        if (streamer_) {
+            const auto idle = std::chrono::duration_cast<std::chrono::steady_clock::duration>(
+                std::chrono::duration<double>(idle_seconds));
+            (void)streamer_->EvictUndemanded(std::chrono::steady_clock::now() - idle, !zones_.AnyTickInProgress());
+        }
+    });
+}
+
+void WorldRuntime::PostSpawn(std::shared_ptr<gs::network::Session> session,
+                             gs::db::Character character,
+                             std::optional<DebugSpawnOverride> debug_spawn,
+                             TerrainRequestHandle terrain_request)
+{
+    Enqueue([this,
+             session = std::move(session),
+             character = std::move(character),
+             debug_spawn, terrain_request=std::move(terrain_request)]() mutable {
+        if(terrain_request && terrain_request->Status()!=TerrainRequestStatus::Ready) return;
+        spawn_.Spawn(std::move(session), std::move(character), debug_spawn, world_tick_.load(), terrain_request);
+        if(terrain_request) terrain_request->Consume();
+    });
+}
+
+void WorldRuntime::PostDespawn(gs::common::SessionId session_id)
+{
+    inputs_.ForgetSession(session_id);
+    Enqueue([this, session_id] {
+        spawn_.Despawn(session_id);
+    });
+}
+
+void WorldRuntime::PostMoveInput(gs::common::SessionId session_id,
+                                 std::uint32_t sequence,
+                                 float dir_angle,
+                                 MoveState state)
+{
+    inputs_.PostMoveInput(session_id, sequence, dir_angle, state);
+}
+
+void WorldRuntime::PostAttackTarget(gs::common::SessionId session_id, std::uint32_t target_net_id)
+{
+    inputs_.PostAttackTarget(session_id, target_net_id);
+}
+
+void WorldRuntime::AddMobSpawnPoint(const MobSpawnPoint& point)
+{
+    spawn_.AddSpawnPoint(point);
+}
+
+void WorldRuntime::RequestMobSpawn(std::size_t spawn_point_index)
+{
+    spawn_.ScheduleRespawn(spawn_point_index, 0.0f);
+}
+
+void WorldRuntime::Enqueue(std::function<void()> command)
+{
+    {
+        std::lock_guard lock(mutex_);
+        commands_.push(std::move(command));
+    }
+    cv_.notify_one();
+}
+
+ZoneTickContext WorldRuntime::BuildZoneTickContext()
+{
+    ZoneTickContext ctx{terrain_,
+                        world_logic_,
+                        spawn_.MobTypes(),
+                        zones_,
+                        &migration_queue_,
+                        world_tick_.load(std::memory_order_relaxed),
+                        &effective_lod_config_,
+                        &effective_replication_config_,
+                        activity_field_.Snapshot(),
+                        [this](std::shared_ptr<gs::network::Session> session, std::vector<std::uint8_t> payload) {
+                            SendToSession(io_, session, std::move(payload));
+                        },
+                        [this](std::size_t spawn_point_index, float delay_sec) {
+                            spawn_.ScheduleRespawn(spawn_point_index, delay_sec);
+                        }};
+    ctx.prepare_terrain=[this](float x,float y){return PrepareTerrain(x,y,0.0f);};
+    return ctx;
+}
+
+void WorldRuntime::TickZone(std::size_t zone_index)
+{
+    if (zone_index >= zones_.ZoneCount()) {
+        return;
+    }
+    auto ctx = BuildZoneTickContext();
+    zones_.GetZone(zone_index).Tick(kTickDtSeconds, ctx);
+}
+
+void WorldRuntime::Run()
+{
+    sim_thread_id_.store(std::this_thread::get_id(), std::memory_order_release);
+    if (auto* terrain = terrain_.MutableTerrain()) {
+        // MAP-3: the supervisor is the terrain's single writer (publish,
+        // unpublish, pins, frees); Debug builds assert it.
+        terrain->BindWriterThread();
+    }
+    {
+        // From here on snapshot requests are queued and served in quiescent
+        // windows of this loop instead of being captured inline.
+        std::lock_guard lock(snapshot_mutex_);
+        snapshot_serving_ = true;
+    }
+
+    workers_.Start(requested_workers_);
+
+    LOG_INFO("Game sim supervisor started: zones={} workers={} aoi_radius={} aoi_cap={}",
+             zones_.ZoneCount(),
+             workers_.WorkerCount(),
+             kAoiRadiusMeters,
+             kAoiEntityCap);
+    auto next_world_tick = std::chrono::steady_clock::now() + kTickDt;
+    auto next_diagnostics = std::chrono::steady_clock::now() + diagnostics_interval_;
+
+    while (!stopping_) {
+        supervisor_cpu_us_.store(CurrentThreadCpuUs(),std::memory_order_relaxed);
+        const auto supervisor_start = std::chrono::steady_clock::now();
+        // Phase 7: worker-phase wall accounting (how much wall time has at
+        // least one zone tick in flight). Sampled at the supervisor cadence
+        // (~5 ms), which is enough for utilization/parallelism aggregates.
+        if (last_phase_sample_ != std::chrono::steady_clock::time_point{}) {
+            const auto delta = supervisor_start - last_phase_sample_;
+            const auto micros = static_cast<std::uint64_t>(
+                std::chrono::duration_cast<std::chrono::microseconds>(delta).count());
+            if (zones_.AnyTickInProgress()) {
+                busy_phase_micros_.fetch_add(micros, std::memory_order_relaxed);
+            } else {
+                idle_phase_micros_.fetch_add(micros, std::memory_order_relaxed);
+            }
+        }
+        last_phase_sample_ = supervisor_start;
+        const auto snapshot_epoch_at_pass_start = snapshot_epoch_;
+        DrainGlobalCommands();
+        // MAP-0 snapshot point 1: top of the pass, after the cv wait -- the
+        // ticks dispatched by the previous pass have usually finished here.
+        ServeSnapshots();
+        // MAP-3: zone terrain demand -> streamer; completions published,
+        // admission, eviction; retired chunks freed if quiescent.
+        PumpTerrain();
+        const auto migration_start = std::chrono::steady_clock::now();
+        migration_.ProcessMigrations(world_tick_.load(std::memory_order_relaxed));
+        partition_metrics_.migration_us.fetch_add(
+            static_cast<std::uint64_t>(
+                std::chrono::duration_cast<std::chrono::microseconds>(
+                    std::chrono::steady_clock::now() - migration_start)
+                    .count()),
+            std::memory_order_relaxed);
+        spawn_.ProcessRespawns(kTickDtSeconds);
+        // Client input is no longer fanned out here: it is delivered
+        // tick-aligned by the scheduler hook below (hardening H1).
+        // World-space activity rebuild (~1Hz, no tick gating: per-zone
+        // buffer copies only). Feeds this pass's LOD evaluations (via tick
+        // contexts) and sleep/wake decisions below.
+        const auto now_activity = std::chrono::steady_clock::now();
+        if (now_activity - last_activity_build_ >= std::chrono::seconds(1)) {
+            last_activity_build_ = now_activity;
+            const auto& lod = effective_lod_config_;
+            activity_field_.Rebuild(zones_,
+                                    ActivityRadii{lod.full_radius_m, lod.reduced_radius_m,
+                                                  lod.low_radius_m},
+                                    lod.enabled);
+            // Staged input of sessions that own nothing (never spawned /
+            // already gone) is dropped here: bounded staging memory.
+            inputs_.SweepOrphans(owners_by_session_);
+        }
+        const auto activity_snapshot = activity_field_.Snapshot();
+        // Continuous load field aggregation (configurable cadence, default
+        // ~1Hz). Drains the load deltas zones published at the end of their
+        // last ticks; the dt is the real elapsed time so the asymmetric EMAs
+        // stay cadence independent.
+        const auto now_load_field = std::chrono::steady_clock::now();
+        const double load_field_interval =
+            1.0 / static_cast<double>(effective_load_field_config_.aggregation_hz);
+        if (std::chrono::duration<double>(now_load_field - last_load_field_build_).count() >=
+            load_field_interval) {
+            const double dt =
+                std::chrono::duration<double>(now_load_field - last_load_field_build_).count();
+            last_load_field_build_ = now_load_field;
+            load_field_.Rebuild(zones_, dt);
+        }
+        // Explicit audit gate (debug/bench only; never requested on the
+        // production path): while an audit is pending, stop scheduling new
+        // ticks until the in-flight wave drains. Near saturation the wave
+        // covers the whole tick period, so without this gate the quiescent
+        // window the audits require may never occur.
+        const bool audit_pending =
+            validation_requested_.load(std::memory_order_relaxed) ||
+            load_field_validation_requested_.load(std::memory_order_relaxed) ||
+            ghost_validation_requested_.load(std::memory_order_relaxed) ||
+            replication_validation_requested_.load(std::memory_order_relaxed) ||
+            activity_validation_requested_.load(std::memory_order_relaxed);
+        if (audit_pending && zones_.AnyTickInProgress()) {
+            std::unique_lock drain_lock(mutex_);
+            cv_.wait_for(drain_lock, std::chrono::milliseconds(1), [this] {
+                return stopping_.load();
+            });
+            continue;
+        }
+        // H1: a quiescent audit window also needs every queued command
+        // applied (spawn/despawn wait for their zone's next tick). While
+        // commands are pending the audits simply wait; scheduling below keeps
+        // running, so the owning zones tick and drain them.
+        const bool audit_window =
+            audit_pending && !zones_.AnyTickInProgress() && !zones_.AnyCommandsPending();
+
+        // Phase 5C audit retention flag: propagate to every zone (split
+        // children included) in a quiescent window. Zero cost when off.
+        if (replication_audit_.load(std::memory_order_relaxed) &&
+            !zones_.AnyTickInProgress()) {
+            for (std::size_t i = 0; i < zones_.ZoneCount(); ++i) {
+                zones_.GetZone(i).SetReplicationAudit(true);
+            }
+        }
+
+        // Operational audit window: the gate above guarantees no zone tick is
+        // in progress here; audits run before scheduling so the window stays
+        // quiescent for the duration of the checks. All workers are parked,
+        // and the supervisor itself is between mutations: zone state is
+        // stable to read.
+        if (validation_requested_.load(std::memory_order_relaxed)) {
+            if (audit_window) {
+                validation_requested_.store(false, std::memory_order_relaxed);
+                std::string error;
+                const auto activity_for_validation = activity_field_.Snapshot();
+                const bool ok =
+                    ValidateWorldConsistency(zones_, owners_by_session_, migration_queue_, directory_,
+                                             activity_for_validation.get(), error,
+                                             &spawn_.Presence(), scheduler_.WakeDecision().get());
+                std::lock_guard lock(validation_mutex_);
+                validation_result_ = ok ? std::string("OK") : "FAIL: " + error;
+                validation_ready_ = true;
+            }
+        }
+        // Continuous load field self-consistency audit: same quiescent
+        // window, explicit request only (the raw work events are already
+        // consumed, so this audits the generation's internal invariants).
+        if (load_field_validation_requested_.load(std::memory_order_relaxed)) {
+            if (audit_window) {
+                load_field_validation_requested_.store(false, std::memory_order_relaxed);
+                std::string error;
+                const auto load_field_for_validation = load_field_.Snapshot();
+                const bool ok = load_field_for_validation != nullptr &&
+                                ValidateLoadFieldGrid(*load_field_for_validation, error);
+                std::lock_guard lock(load_field_validation_mutex_);
+                load_field_validation_result_ = ok ? std::string("OK") : "FAIL: " + error;
+                load_field_validation_ready_ = true;
+            }
+        }
+        // Phase 5A exact ghost equivalence audit: same quiescent window,
+        // explicit request only (shadow/debug; it scans every zone's
+        // authority). A detected inconsistency triggers the fallback repair
+        // when auto-repair is enabled.
+        if (ghost_validation_requested_.load(std::memory_order_relaxed)) {
+            if (audit_window) {
+                ghost_validation_requested_.store(false, std::memory_order_relaxed);
+                std::string error;
+                std::size_t zones_checked = 0;
+                std::size_t ghosts_checked = 0;
+                std::size_t zones_skipped = 0;
+                const bool ok = ValidateAllGhostEquivalence(zones_, error, &zones_checked,
+                                                            &ghosts_checked, &zones_skipped);
+                ghost_validation_runs_.fetch_add(1, std::memory_order_relaxed);
+                if (!ok) {
+                    ghost_validation_failures_.fetch_add(1, std::memory_order_relaxed);
+                    LOG_WARN("ghost equivalence FAIL: {} (zones={} ghosts={} skipped={})",
+                             error,
+                             zones_checked,
+                             ghosts_checked,
+                             zones_skipped);
+                    if (ghost_auto_repair_.load(std::memory_order_relaxed)) {
+                        RepairGhosts();
+                    }
+                }
+                std::lock_guard lock(ghost_validation_mutex_);
+                ghost_validation_result_ = ok ? std::string("OK") : "FAIL: " + error;
+                ghost_validation_ready_ = true;
+            }
+        }
+        // Phase 5B replication shadow audit: same quiescent window, explicit
+        // request only. Exact interest-set equivalence + recipient coverage
+        // (last-sent transform version never older than the entity's current
+        // one). Read-only; mismatches are counted and reported, never
+        // silently repaired.
+        if (replication_validation_requested_.load(std::memory_order_relaxed)) {
+            if (audit_window) {
+                replication_validation_requested_.store(false, std::memory_order_relaxed);
+                std::string error;
+                std::size_t viewers_checked = 0;
+                std::size_t relationships_checked = 0;
+                std::size_t records_checked = 0;
+                const bool ok = ValidateReplicationShadow(zones_,
+                                                          effective_replication_config_,
+                                                          error,
+                                                          &viewers_checked,
+                                                          &relationships_checked,
+                                                          &records_checked);
+                replication_validation_runs_.fetch_add(1, std::memory_order_relaxed);
+                if (!ok) {
+                    replication_validation_failures_.fetch_add(1, std::memory_order_relaxed);
+                    LOG_WARN("replication shadow FAIL: {} (viewers={} relationships={} records={})",
+                             error,
+                             viewers_checked,
+                             relationships_checked,
+                             records_checked);
+                }
+                std::lock_guard lock(replication_validation_mutex_);
+                replication_validation_result_ = ok ? std::string("OK") : "FAIL: " + error;
+                replication_validation_ready_ = true;
+            }
+        }
+        // Strict field-vs-brute-force audit (§31): same quiescent window,
+        // explicit request only (static scenarios; roaming load would race
+        // the 1Hz snapshot). Samples + outcome are stashed for the bench.
+        if (activity_validation_requested_.load(std::memory_order_relaxed)) {
+            if (audit_window) {
+                activity_validation_requested_.store(false, std::memory_order_relaxed);
+                const std::size_t max_samples =
+                    activity_validation_max_samples_.load(std::memory_order_relaxed);
+                std::vector<ActivitySampleResult> samples;
+                std::string error;
+                const bool ok = ValidateActivityFieldDetailed(
+                    zones_, *activity_field_.Snapshot(), samples, error, max_samples);
+                std::lock_guard lock(activity_validation_mutex_);
+                activity_samples_ = std::move(samples);
+                activity_validation_error_ = std::move(error);
+                activity_validation_ok_ = ok;
+                activity_samples_ready_ = true;
+            }
+        }
+
+        // Wake radius derives from the LOD reduced radius (§20): any player
+        // inside it may grant Full/Reduced relevance, so the zone must tick.
+        // Tick-aligned input delivery (H1): each claimed zone gets exactly the
+        // staged input of its resident sessions, drained at the top of the
+        // tick it is about to run.
+        // A saturated pool may never spontaneously have all ticks finished.
+        // Stop admitting another wave while a snapshot awaits quiescence;
+        // already dispatched ticks drain normally. After serving a batch,
+        // always allow one wave even if another reader has already queued:
+        // neither diagnostics nor simulation may starve the other.
+        if ((!snapshots_pending_.load(std::memory_order_acquire) ||
+            snapshot_epoch_ != snapshot_epoch_at_pass_start) &&
+            (!streamer_ || !streamer_->NeedsQuiescence())) {
+            scheduler_.ScheduleOnce(zones_,
+                                    workers_,
+                                    std::chrono::steady_clock::now(),
+                                    activity_snapshot,
+                                    effective_lod_config_.reduced_radius_m,
+                                    [this](const std::vector<std::size_t>& due) {
+                                        for (const std::size_t index : due) {
+                                            inputs_.DeliverToZone(zones_.GetZone(index), index,
+                                                                  attack_handler_);
+                                        }
+                                    });
+        }
+        ExecutePartitionControl();
+        ReclaimRetiredZones(); // H9: bounded zone table (quiescent windows only)
+        // MAP-0 snapshot point 2: after this pass's topology step (a split or
+        // merge that just committed is visible at once).
+        ServeSnapshots();
+        const auto supervisor_micros = static_cast<std::uint64_t>(
+            std::chrono::duration_cast<std::chrono::microseconds>(std::chrono::steady_clock::now() -
+                                                                 supervisor_start)
+                .count());
+        supervisor_micros_since_diag_ += supervisor_micros;
+        supervisor_micros_total_.fetch_add(supervisor_micros, std::memory_order_relaxed);
+        supervisor_samples_.fetch_add(1, std::memory_order_relaxed);
+
+        const auto now = std::chrono::steady_clock::now();
+        if (now >= next_world_tick) {
+            do {
+                world_tick_.fetch_add(1, std::memory_order_relaxed);
+                next_world_tick += kTickDt;
+            } while (now >= next_world_tick);
+        }
+
+        if (now >= next_diagnostics) {
+            std::uint64_t total_ticks = 0;
+            std::uint64_t total_records = 0;
+            std::uint64_t total_empty_skips = 0;
+            std::uint64_t total_migrations = 0;
+            std::uint64_t total_tick_micros = 0;
+            std::uint64_t total_aoi_queries = 0;
+            std::uint64_t total_dirty_xf = 0;
+            std::uint64_t total_tier_near = 0;
+            std::uint64_t total_tier_mid = 0;
+            std::uint64_t total_tier_far = 0;
+            std::uint64_t total_gameplay_micros = 0;
+            std::uint64_t total_ghost_micros = 0;
+            std::uint64_t total_repl_micros = 0;
+            std::uint64_t total_ai_micros = 0;
+            std::uint64_t total_movement_micros = 0;
+            std::uint64_t total_aoi_micros = 0;
+            std::uint64_t total_activity_publish_micros = 0;
+            std::uint64_t total_load_publish_micros = 0;
+            std::uint64_t total_ghost_entities = 0;
+            std::uint64_t total_ghost_publish_micros = 0;
+            std::uint64_t total_ghost_reconcile_micros = 0;
+            std::uint64_t total_ghost_publish_updates = 0;
+            std::uint64_t total_ghost_publish_adds = 0;
+            std::uint64_t total_ghost_publish_removes = 0;
+            std::uint64_t total_ghost_publish_refreshes = 0;
+            std::uint64_t total_ghost_publish_skips = 0;
+            std::uint64_t total_ghost_keep = 0;
+            std::uint64_t total_ghost_add = 0;
+            std::uint64_t total_ghost_remove = 0;
+            std::uint64_t total_ghost_reconcile_skips = 0;
+            std::uint64_t total_ghost_full_reconciles = 0;
+            std::uint64_t total_ghost_full_fallbacks = 0;
+            std::uint64_t total_ghost_candidates = 0;
+            std::uint64_t total_ghost_spatial_queries = 0;
+            std::uint64_t total_lod_ai = 0;
+            std::uint64_t total_lod_mv = 0;
+            std::uint64_t total_lod_prom = 0;
+            std::uint64_t total_lod_dem = 0;
+            std::uint64_t total_lod_wake = 0;
+            std::uint64_t total_lod_eval_us = 0;
+            std::uint64_t total_x_full = 0;
+            std::uint64_t total_x_reduced = 0;
+            std::uint64_t total_x_low = 0;
+            std::uint64_t total_sleep_block = 0;
+            std::uint64_t total_wake_ext = 0;
+            std::uint64_t lod_full = 0;
+            std::uint64_t lod_reduced = 0;
+            std::uint64_t lod_low = 0;
+            std::uint64_t lod_dormant = 0;
+            const auto attacks_per_sec = attacks_since_diag_.exchange(0);
+            std::size_t active_zones = 0;
+            std::size_t sleeping_zones = 0;
+            std::size_t active_sessions = 0;
+            std::size_t active_ghosts = 0;
+            for (std::size_t i = 0; i < zones_.ZoneCount(); ++i) {
+                auto& zone = zones_.GetZone(i);
+                const auto player_count = zone.Diagnostics().player_count.load();
+                const auto mob_count = zone.Diagnostics().mob_count.load();
+                active_sessions += player_count;
+                active_ghosts += zone.Diagnostics().ghost_count.load();
+                if (player_count > 0 || mob_count > 0) {
+                    ++active_zones;
+                }
+                if (zone.Activity() == ZoneActivity::Sleeping) {
+                    ++sleeping_zones;
+                }
+                lod_full += zone.Diagnostics().lod_full.load(std::memory_order_relaxed);
+                lod_reduced += zone.Diagnostics().lod_reduced.load(std::memory_order_relaxed);
+                lod_low += zone.Diagnostics().lod_low.load(std::memory_order_relaxed);
+                lod_dormant += zone.Diagnostics().lod_dormant.load(std::memory_order_relaxed);
+                total_ticks += zone.Diagnostics().ticks_since_diag.exchange(0);
+                total_records += zone.Diagnostics().transform_records_since_diag.exchange(0);
+                total_empty_skips += zone.Diagnostics().empty_skips_since_diag.exchange(0);
+                total_migrations += zone.Diagnostics().migrations_since_diag.exchange(0);
+                total_tick_micros += zone.Diagnostics().tick_micros_since_diag.exchange(0);
+                total_aoi_queries += zone.Diagnostics().aoi_queries_since_diag.exchange(0);
+                total_dirty_xf += zone.Diagnostics().transform_dirty_since_diag.exchange(0);
+                total_tier_near += zone.Diagnostics().tier_near_since_diag.exchange(0);
+                total_tier_mid += zone.Diagnostics().tier_mid_since_diag.exchange(0);
+                total_tier_far += zone.Diagnostics().tier_far_since_diag.exchange(0);
+                total_gameplay_micros += zone.Diagnostics().gameplay_micros_since_diag.exchange(0);
+                total_ghost_micros += zone.Diagnostics().ghost_micros_since_diag.exchange(0);
+                total_repl_micros += zone.Diagnostics().replication_micros_since_diag.exchange(0);
+                total_ai_micros += zone.Diagnostics().ai_micros_since_diag.exchange(0);
+                total_movement_micros += zone.Diagnostics().movement_micros_since_diag.exchange(0);
+                total_aoi_micros += zone.Diagnostics().aoi_micros_since_diag.exchange(0);
+                total_activity_publish_micros +=
+                    zone.Diagnostics().activity_publish_micros_since_diag.exchange(0);
+                total_load_publish_micros +=
+                    zone.Diagnostics().load_publish_micros_since_diag.exchange(0);
+                total_ghost_entities += zone.Diagnostics().ghost_entities_since_diag.exchange(0);
+                total_ghost_publish_micros +=
+                    zone.Diagnostics().ghost_publish_micros_since_diag.exchange(0);
+                total_ghost_reconcile_micros +=
+                    zone.Diagnostics().ghost_reconcile_micros_since_diag.exchange(0);
+                total_ghost_publish_updates +=
+                    zone.Diagnostics().ghost_publish_updates_since_diag.exchange(0);
+                total_ghost_publish_adds +=
+                    zone.Diagnostics().ghost_publish_adds_since_diag.exchange(0);
+                total_ghost_publish_removes +=
+                    zone.Diagnostics().ghost_publish_removes_since_diag.exchange(0);
+                total_ghost_publish_refreshes +=
+                    zone.Diagnostics().ghost_publish_refreshes_since_diag.exchange(0);
+                total_ghost_publish_skips +=
+                    zone.Diagnostics().ghost_publish_skips_since_diag.exchange(0);
+                total_ghost_keep += zone.Diagnostics().ghost_keep_since_diag.exchange(0);
+                total_ghost_add += zone.Diagnostics().ghost_add_since_diag.exchange(0);
+                total_ghost_remove += zone.Diagnostics().ghost_remove_since_diag.exchange(0);
+                total_ghost_reconcile_skips +=
+                    zone.Diagnostics().ghost_reconcile_skips_since_diag.exchange(0);
+                total_ghost_full_reconciles +=
+                    zone.Diagnostics().ghost_full_reconciles_since_diag.exchange(0);
+                total_ghost_full_fallbacks +=
+                    zone.Diagnostics().ghost_full_fallbacks_since_diag.exchange(0);
+                total_ghost_candidates +=
+                    zone.Diagnostics().ghost_candidates_examined_since_diag.exchange(0);
+                total_ghost_spatial_queries +=
+                    zone.Diagnostics().ghost_spatial_queries_since_diag.exchange(0);
+                // Phase 5B/5C/5D counters: exchanged here so the readiness
+                // window accumulation never mixes SETUP/WARMUP into the
+                // measure totals (they are read by the bench, not printed in
+                // the supervisor log).
+                zone.Diagnostics().aoi_candidates_pre_cap_since_diag.exchange(0);
+                zone.Diagnostics().aoi_candidates_post_cap_since_diag.exchange(0);
+                zone.Diagnostics().aoi_visible_final_since_diag.exchange(0);
+                zone.Diagnostics().interest_enter_since_diag.exchange(0);
+                zone.Diagnostics().interest_leave_since_diag.exchange(0);
+                zone.Diagnostics().interest_keep_since_diag.exchange(0);
+                zone.Diagnostics().aoi_cells_visited_since_diag.exchange(0);
+                zone.Diagnostics().aoi_entries_visited_since_diag.exchange(0);
+                zone.Diagnostics().aoi_exact_checks_since_diag.exchange(0);
+                zone.Diagnostics().aoi_index_us_since_diag.exchange(0);
+                zone.Diagnostics().aoi_topk_us_since_diag.exchange(0);
+                zone.Diagnostics().grid_inserts_since_diag.exchange(0);
+                zone.Diagnostics().grid_removes_since_diag.exchange(0);
+                zone.Diagnostics().grid_moves_in_cell_since_diag.exchange(0);
+                zone.Diagnostics().grid_moves_cell_since_diag.exchange(0);
+                zone.Diagnostics().repl_spawn_since_diag.exchange(0);
+                zone.Diagnostics().repl_despawn_since_diag.exchange(0);
+                zone.Diagnostics().repl_update_since_diag.exchange(0);
+                zone.Diagnostics().repl_suppressed_since_diag.exchange(0);
+                zone.Diagnostics().repl_records_since_diag.exchange(0);
+                zone.Diagnostics().repl_fanout_relationships_since_diag.exchange(0);
+                zone.Diagnostics().repl_frame_bytes_since_diag.exchange(0);
+                zone.Diagnostics().repl_payload_bytes_since_diag.exchange(0);
+                zone.Diagnostics().repl_refresh_since_diag.exchange(0);
+                zone.Diagnostics().repl_aoi_us_since_diag.exchange(0);
+                zone.Diagnostics().repl_reconcile_us_since_diag.exchange(0);
+                zone.Diagnostics().repl_encode_us_since_diag.exchange(0);
+                zone.Diagnostics().repl_send_us_since_diag.exchange(0);
+                zone.Diagnostics().repl_record_requests_since_diag.exchange(0);
+                zone.Diagnostics().repl_record_serializations_since_diag.exchange(0);
+                zone.Diagnostics().repl_despawn_cache_hits_since_diag.exchange(0);
+                zone.Diagnostics().repl_despawn_cache_misses_since_diag.exchange(0);
+                zone.Diagnostics().repl_bytes_generated_since_diag.exchange(0);
+                zone.Diagnostics().repl_bytes_copied_since_diag.exchange(0);
+                zone.Diagnostics().repl_wire_bytes_since_diag.exchange(0);
+                zone.Diagnostics().repl_v2_full_records_since_diag.exchange(0);
+                zone.Diagnostics().repl_v2_delta_records_since_diag.exchange(0);
+                zone.Diagnostics().repl_v2_deferred_since_diag.exchange(0);
+                zone.Diagnostics().repl_v2_starvation_since_diag.exchange(0);
+                zone.Diagnostics().repl_v2_budget_hits_since_diag.exchange(0);
+                zone.Diagnostics().repl_v2_critical_since_diag.exchange(0);
+                zone.Diagnostics().repl_v2_delta_bytes_since_diag.exchange(0);
+                zone.Diagnostics().repl_v2_max_defer_ticks.exchange(0);
+                zone.Diagnostics().repl_v2_tier_critical_since_diag.exchange(0);
+                zone.Diagnostics().repl_v2_tier_near_since_diag.exchange(0);
+                zone.Diagnostics().repl_v2_tier_normal_since_diag.exchange(0);
+                zone.Diagnostics().repl_v2_tier_reduced_since_diag.exchange(0);
+                total_lod_ai += zone.Diagnostics().lod_ai_updates_since_diag.exchange(0);
+                total_lod_mv += zone.Diagnostics().lod_move_updates_since_diag.exchange(0);
+                total_lod_prom += zone.Diagnostics().lod_promotions_since_diag.exchange(0);
+                total_lod_dem += zone.Diagnostics().lod_demotions_since_diag.exchange(0);
+                total_lod_wake += zone.Diagnostics().lod_wakes_since_diag.exchange(0);
+                total_lod_eval_us += zone.Diagnostics().lod_eval_us_since_diag.exchange(0);
+                total_x_full += zone.Diagnostics().cross_zone_full_since_diag.exchange(0);
+                total_x_reduced += zone.Diagnostics().cross_zone_reduced_since_diag.exchange(0);
+                total_x_low += zone.Diagnostics().cross_zone_low_since_diag.exchange(0);
+                total_sleep_block += zone.Diagnostics().sleep_blocked_external_since_diag.exchange(0);
+                total_wake_ext += zone.Diagnostics().wake_external_since_diag.exchange(0);
+            }
+            lod_ai_total_.fetch_add(total_lod_ai, std::memory_order_relaxed);
+            lod_mv_total_.fetch_add(total_lod_mv, std::memory_order_relaxed);
+            lod_prom_total_.fetch_add(total_lod_prom, std::memory_order_relaxed);
+            lod_dem_total_.fetch_add(total_lod_dem, std::memory_order_relaxed);
+            lod_wake_total_.fetch_add(total_lod_wake, std::memory_order_relaxed);
+            lod_eval_us_total_.fetch_add(total_lod_eval_us, std::memory_order_relaxed);
+            std::size_t active_mobs = 0;
+            std::size_t wandering_mobs = 0;
+            std::size_t idle_mobs = 0;
+            for (std::size_t i = 0; i < zones_.ZoneCount(); ++i) {
+                auto& zone = zones_.GetZone(i);
+                active_mobs += zone.Diagnostics().mob_count.load();
+                wandering_mobs += zone.Diagnostics().wandering_mob_count.load();
+                idle_mobs += zone.Diagnostics().idle_mob_count.load();
+            }
+            const double avg_tick_ms =
+                total_ticks > 0 ? static_cast<double>(total_tick_micros) / total_ticks / 1000.0 : 0.0;
+            const double avg_supervisor_ms =
+                static_cast<double>(supervisor_micros_since_diag_) / 1000.0;
+            supervisor_micros_since_diag_ = 0;
+            const auto worker_util = workers_.GetUtilization();
+            const double worker_busy_pct =
+                workers_.WorkerCount() > 0
+                    ? static_cast<double>(worker_util.busy_micros) / 1'000'000.0 /
+                          static_cast<double>(workers_.WorkerCount()) * 100.0
+                    : 0.0;
+             const auto routes = router_.MetricsSnapshot();
+             const auto mig_metrics = migration_.MetricsSnapshot();
+             const auto part_metrics = partition_metrics_.TakeSnapshot();
+             const auto activity_metrics = activity_field_.Metrics();
+            LOG_INFO("Game sim diag: world_tick={} zones={} active_zones={} sleeping_zones={} active_sessions={} active_mobs={} wandering_mobs={} idle_mobs={} ghosts={} zone_ticks={} empty_zone_skips={} transform_records_sent={} attacks_per_sec={} deaths_total={} respawns_pending={} respawns_total={} migrations={} mig_pending={} mig_quarantined={} mig_detail=[c={} stale={} dup={} retry={} fail={}] routes=[local={} remu={} unav={} drain={} miss={}] workers={} worker_busy_pct={:.1f}                      avg_zone_tick_ms={:.3f} aoi_queries={} dirty_xf={} tiers=[{}/{}/{}] stage_us=[gameplay={} ai={} movement={} aoi={} ghost={} ghost_pub={} ghost_recon={} activity={} load={} repl={} ghost_ops={}] ghost_diff=[keep={} add={} rem={} pub_upd={} pub_add={} pub_rem={} refresh={} pub_skip={} recon_skip={} full={} fb={} cand={} grid={}] avg_supervisor_ms={:.3f} partition=[s_att={} s_ok={} s_ab={} m_att={} m_ok={} m_ab={} rej={}] lod=[{}/{}/{}/{} ai={} mv={} prom={} dem={} wake={} eval_us={}] xzone=[f={} r={} l={}] sleep=[blocked={} wext={}] activity=[srcs={} cells={} rb_us={}]",
+                     world_tick_.load(),
+                     zones_.ZoneCount(),
+                     active_zones,
+                     sleeping_zones,
+                     active_sessions,
+                     active_mobs,
+                     wandering_mobs,
+                     idle_mobs,
+                     active_ghosts,
+                     total_ticks,
+                     total_empty_skips,
+                     total_records,
+                     attacks_per_sec,
+                     deaths_total_.load(),
+                     spawn_.RespawnsPending(),
+                     spawn_.RespawnsTotal(),
+                     total_migrations,
+                     migration_queue_.PendingCount(),
+                     migration_.QuarantinedCount(),
+                     mig_metrics.committed,
+                     mig_metrics.dropped_stale,
+                     mig_metrics.duplicates,
+                     mig_metrics.retries,
+                     mig_metrics.failures,
+                     routes.local_delivered,
+                     routes.remote_emulated,
+                     routes.unavailable,
+                     routes.draining,
+                     routes.directory_miss,
+                     workers_.WorkerCount(),
+                     worker_busy_pct,
+                     avg_tick_ms,
+                     total_aoi_queries,
+                     total_dirty_xf,
+                     total_tier_near,
+                     total_tier_mid,
+                     total_tier_far,
+                     total_gameplay_micros,
+                     total_ai_micros,
+                     total_movement_micros,
+                     total_aoi_micros,
+                     total_ghost_micros,
+                     total_ghost_publish_micros,
+                     total_ghost_reconcile_micros,
+                     total_activity_publish_micros,
+                     total_load_publish_micros,
+                     total_repl_micros,
+                     total_ghost_entities,
+                     total_ghost_keep,
+                     total_ghost_add,
+                     total_ghost_remove,
+                     total_ghost_publish_updates,
+                     total_ghost_publish_adds,
+                     total_ghost_publish_removes,
+                     total_ghost_publish_refreshes,
+                     total_ghost_publish_skips,
+                     total_ghost_reconcile_skips,
+                     total_ghost_full_reconciles,
+                     total_ghost_full_fallbacks,
+                     total_ghost_candidates,
+                     total_ghost_spatial_queries,
+                     avg_supervisor_ms,
+                     part_metrics.split_attempts,
+                     part_metrics.split_commits,
+                     part_metrics.split_aborts,
+                     part_metrics.merge_attempts,
+                     part_metrics.merge_commits,
+                     part_metrics.merge_aborts,
+                     part_metrics.retire_rejected_nonempty,
+                     lod_full,
+                     lod_reduced,
+                     lod_low,
+                     lod_dormant,
+                     total_lod_ai,
+                     total_lod_mv,
+                     total_lod_prom,
+                     total_lod_dem,
+                     total_lod_wake,
+                     total_lod_eval_us,
+                     total_x_full,
+                     total_x_reduced,
+                     total_x_low,
+                     total_sleep_block,
+                     total_wake_ext,
+                     activity_metrics.sources,
+                     activity_metrics.cells_nonempty,
+                     activity_metrics.rebuild_us_total);
+            // Continuous load field: one concise line per diag window. The
+            // channel breakdown stays visible (raw units per window) plus the
+            // peak normalized/composite view; per-cell data is queried
+            // through LoadFieldSnapshot().
+            const auto lf = load_field_.Metrics();
+            LOG_INFO("Load field diag: epoch={} cells={} active={} l1={}/{} rb_us={} entries={} "
+                     "totals=[sim={} bytes={} records={} dirty={} aoi_q={} aoi_c={} combat={} mig={}] "
+                     "peak=[norm={:.3f} comp={:.3f}]",
+                     lf.epoch,
+                     lf.cells_total,
+                     lf.cells_active,
+                     lf.l1_cells_active,
+                     lf.l1_cells_total,
+                     lf.last_rebuild_us,
+                     lf.drained_entries,
+                     lf.last_totals.sim_work,
+                     lf.last_totals.repl_bytes,
+                     lf.last_totals.repl_records,
+                     lf.last_totals.repl_dirty,
+                     lf.last_totals.aoi_queries,
+                     lf.last_totals.aoi_candidates,
+                     lf.last_totals.combat_events,
+                     lf.last_totals.migration_events,
+                     lf.peak_normalized,
+                     lf.peak_composite);
+            do {
+                next_diagnostics += diagnostics_interval_;
+            } while (now >= next_diagnostics);
+        }
+
+        std::unique_lock lock(mutex_);
+        cv_.wait_for(lock, std::chrono::milliseconds(5), [this] {
+            return stopping_.load() || !commands_.empty() || terrain_completion_pending_;
+        });
+        // The next pass's PumpTerrain drains every completion queued so far.
+        terrain_completion_pending_ = false;
+    }
+
+    DrainGlobalCommands();
+    while (zones_.AnyTickInProgress()) {
+        std::this_thread::sleep_for(std::chrono::milliseconds(1));
+    }
+    {
+        // Last quiescent window: answer every queued request against the
+        // final world, then tear down under the same lock so no late request
+        // can observe a half-cleared world (later ones capture it inline).
+        std::lock_guard lock(snapshot_mutex_);
+        snapshot_serving_ = false;
+        std::vector<PendingSnapshot> batch;
+        batch.swap(pending_snapshots_);
+        snapshots_pending_.store(false, std::memory_order_release);
+        if (!batch.empty()) {
+            RunSnapshotBatch(batch, ++snapshot_epoch_);
+        }
+        zones_.Clear();
+        owners_by_session_.clear();
+        spawn_.ClearPresence();
+        spawn_.ClearRespawns();
+    }
+    sim_thread_id_.store(std::thread::id{}, std::memory_order_release);
+    LOG_INFO("Game sim supervisor stopped");
+}
+
+bool WorldRuntime::ValidateConsistency(std::string& out_error)
+{
+    // Debug/test only: the caller must guarantee no zone tick or supervisor
+    // mutation is running concurrently (e.g. call between Run iterations in
+    // a test harness, or after Stop).
+    const auto activity = activity_field_.Snapshot();
+    return ValidateWorldConsistency(zones_, owners_by_session_, migration_queue_, directory_,
+                                    activity.get(), out_error, &spawn_.Presence(), scheduler_.WakeDecision().get());
+}
+
+void WorldRuntime::RequestActivityValidation(std::size_t max_samples)
+{
+    activity_validation_max_samples_.store(max_samples, std::memory_order_relaxed);
+    activity_validation_requested_.store(true, std::memory_order_relaxed);
+}
+
+bool WorldRuntime::TryTakeActivitySamples(std::vector<ActivitySampleResult>& out_samples,
+                                          std::string& out_error)
+{
+    std::lock_guard lock(activity_validation_mutex_);
+    if (!activity_samples_ready_) {
+        return false;
+    }
+    out_samples = activity_samples_;
+    out_error = activity_validation_error_;
+    activity_samples_.clear();
+    activity_validation_error_.clear();
+    activity_samples_ready_ = false;
+    return activity_validation_ok_;
+}
+
+void WorldRuntime::RequestValidation()
+{
+    validation_requested_.store(true, std::memory_order_relaxed);
+}
+
+bool WorldRuntime::TryTakeValidationResult(std::string& out_result)
+{
+    std::lock_guard lock(validation_mutex_);
+    if (!validation_ready_) {
+        return false;
+    }
+    out_result = std::move(validation_result_);
+    validation_result_.clear();
+    validation_ready_ = false;
+    return true;
+}
+
+WorldRuntime::SchedulerSnapshot WorldRuntime::SchedulerStats() const
+{
+    SchedulerSnapshot snapshot;
+    snapshot.workers = workers_.WorkerCount();
+    const auto counters = scheduler_.GetCounters();
+    snapshot.waves = counters.waves;
+    snapshot.due_zones = counters.due_zones;
+    snapshot.enqueued = counters.enqueued;
+    snapshot.sleeping_skips = counters.sleeping_skips;
+    snapshot.cas_failures = counters.cas_failures;
+    snapshot.schedule_micros = counters.schedule_micros;
+    const auto& stats = workers_.WorkerStats();
+    snapshot.worker_work.reserve(stats.size());
+    snapshot.worker_tasks.reserve(stats.size());
+    for (const auto& worker : stats) {
+        snapshot.worker_work.push_back(worker.work_micros);
+        snapshot.worker_tasks.push_back(worker.tasks);
+        snapshot.worker_work_micros += worker.work_micros;
+        snapshot.worker_idle_micros += worker.idle_micros;
+    }
+    snapshot.busy_phase_micros = busy_phase_micros_.load(std::memory_order_relaxed);
+    snapshot.idle_phase_micros = idle_phase_micros_.load(std::memory_order_relaxed);
+    return snapshot;
+}
+
+double WorldRuntime::SupervisorAvgMs() const
+{
+    const auto samples = supervisor_samples_.load(std::memory_order_relaxed);
+    return samples > 0 ? static_cast<double>(supervisor_micros_total_.load(std::memory_order_relaxed)) /
+                             samples / 1000.0
+                       : 0.0;
+}
+
+ZoneWorkerPool::Utilization WorldRuntime::WorkerUtilization() const
+{
+    return workers_.GetUtilization();
+}
+
+std::size_t WorldRuntime::MigrationQuarantined() const
+{
+    return migration_.QuarantinedCount();
+}
+
+MigrationId WorldRuntime::LastCommittedMigration() const
+{
+    return migration_.LastCommittedId();
+}
+
+MigrationMetrics::Snapshot WorldRuntime::MigrationMetrics() const
+{
+    return migration_.MetricsSnapshot();
+}
+
+void WorldRuntime::EmulateDistribution(std::uint32_t logical_processes)
+{
+    if (logical_processes < 2) {
+        return;
+    }
+    router_.SetRemoteMode(WorldMessageRouter::RemoteMode::EmulatedLoopback);
+    migration_transport_.SetRemoteMode(MigrationTransport::RemoteMode::EmulatedLoopback);
+    for (std::size_t i = 0; i < zones_.ZoneCount(); ++i) {
+        const ZoneId zone_id = zones_.GetZone(i).Id();
+        // Zone 0 stays home; the rest stripe across logical processes 2..K.
+        // Node stays 1: this emulates multi-PROCESS, single-node sharding.
+        const std::uint32_t process =
+            (i == 0) ? identity_.process.value : static_cast<std::uint32_t>((i % logical_processes) + 1);
+        const ProcessId pid{process == 0 ? 1 : process};
+        directory_.NoteRemoteAlive(identity_.node, pid);
+        directory_.SetAssignment(zone_id, ZoneLocation{identity_.node, pid, zone_id});
+    }
+}
+
+ProcessLoadSnapshot WorldRuntime::CollectProcessLoad() const
+{
+    ProcessLoadSnapshot snapshot;
+    snapshot.identity = identity_;
+    snapshot.world_tick = world_tick_.load(std::memory_order_relaxed);
+    snapshot.zone_count = zones_.ZoneCount();
+    std::uint64_t tick_total = 0;
+    std::uint64_t tick_count = 0;
+    for (std::size_t i = 0; i < zones_.ZoneCount(); ++i) {
+        const auto& zone = zones_.GetZone(i);
+        const auto& diag = zone.Diagnostics();
+        const auto players = diag.player_count.load(std::memory_order_relaxed);
+        const auto mobs = diag.mob_count.load(std::memory_order_relaxed);
+        snapshot.players += players;
+        snapshot.mobs += mobs;
+        snapshot.ghosts += diag.ghost_count.load(std::memory_order_relaxed);
+        if (players > 0 || mobs > 0) {
+            ++snapshot.active_zones;
+        }
+        if (zone.Activity() == ZoneActivity::Sleeping) {
+            ++snapshot.sleeping_zones;
+        }
+        // Non-destructive reads: the periodic diag owns the exchange().
+        const std::uint64_t ticks = diag.ticks_since_diag.load(std::memory_order_relaxed);
+        tick_total += diag.tick_micros_since_diag.load(std::memory_order_relaxed);
+        tick_count += ticks;
+        snapshot.repl_records += diag.transform_records_since_diag.load(std::memory_order_relaxed);
+        snapshot.migrations += diag.migrations_since_diag.load(std::memory_order_relaxed);
+    }
+    snapshot.avg_zone_tick_ms =
+        tick_count > 0 ? static_cast<double>(tick_total) / tick_count / 1000.0 : 0.0;
+    const auto worker_util = workers_.GetUtilization();
+    snapshot.worker_tasks = worker_util.tasks_completed;
+    snapshot.worker_busy_us = worker_util.busy_micros;
+    snapshot.supervisor_avg_ms = SupervisorAvgMs();
+    const auto routes = router_.MetricsSnapshot();
+    snapshot.routes_local = routes.local_delivered;
+    snapshot.routes_remote_emulated = routes.remote_emulated;
+    snapshot.routes_unavailable = routes.unavailable;
+    snapshot.routes_draining = routes.draining;
+    CollectZoneLoadMetrics(zones_, snapshot.zones);
+    return snapshot;
+}
+
+namespace {
+
+// Rolls back a partially built transfer destination (§7-8). Armed until the
+// transfer commits; the destructor never throws, so a failing rollback step
+// cannot mask the original error (nor terminate the supervisor).
+struct DestinationRollback {
+    Zone* target = nullptr;
+    std::uint32_t net_id = 0;
+    Position position{};
+    flecs::entity entity{};
+    bool applied = false;
+    bool indexed = false;
+    bool gridded = false;
+    bool bound = false;
+    bool rng_moved = false;
+    bool committed = false;
+
+    ~DestinationRollback() noexcept
+    {
+        if (committed || target == nullptr || !applied) {
+            return;
+        }
+        try {
+            if (bound) {
+                target->ErasePlayerBinding(net_id);
+            }
+            if (rng_moved) {
+                target->EraseMobRng(net_id);
+            }
+            if (gridded) {
+                target->Grid().Remove(net_id, position);
+            }
+            if (indexed) {
+                target->UnindexEntity(net_id);
+            }
+            if (entity.is_valid()) {
+                entity.destruct();
+            }
+        } catch (...) {
+            // Rollback is last-resort cleanup: never throw out of it.
+        }
+    }
+
+    void commit() noexcept
+    {
+        committed = true;
+    }
+};
+
+// Deterministic failure injection (§17-18): consume one token if armed.
+// Single consumer (supervisor) + single setter (bench between passes).
+bool ConsumeTestFailure(std::atomic<int>& counter)
+{
+    int remaining = counter.load(std::memory_order_relaxed);
+    while (remaining > 0) {
+        if (counter.compare_exchange_weak(remaining,
+                                          remaining - 1,
+                                          std::memory_order_relaxed)) {
+            return true;
+        }
+    }
+    return false;
+}
+
+std::uint64_t ElapsedUs(std::chrono::steady_clock::time_point from,
+                        std::chrono::steady_clock::time_point to)
+{
+    return static_cast<std::uint64_t>(
+        std::chrono::duration_cast<std::chrono::microseconds>(to - from).count());
+}
+
+} // namespace
+
+namespace {
+// Set while snapshot collectors run on this thread: a collector that asked
+// for another snapshot would wait on (or, in the locked shutdown / inline
+// paths, re-lock) the very capture it is part of.
+thread_local bool t_in_snapshot_collector = false;
+} // namespace
+
+void WorldRuntime::EnqueueSnapshot(std::function<void(const SnapshotContext&)> task)
+{
+    if (t_in_snapshot_collector) {
+        throw std::logic_error("snapshot requested from inside a snapshot collector");
+    }
+    std::lock_guard lock(snapshot_mutex_);
+    if (snapshot_serving_) {
+        pending_snapshots_.push_back(PendingSnapshot{std::move(task), std::chrono::steady_clock::now()});
+        snapshots_pending_.store(true, std::memory_order_release);
+        return;
+    }
+    // Not running (before Start, or after Stop tore the world down): nothing
+    // else mutates the world, and Run() takes this same lock before touching
+    // it, so the capture happens right here.
+    std::vector<PendingSnapshot> batch;
+    batch.push_back(PendingSnapshot{std::move(task), std::chrono::steady_clock::now()});
+    RunSnapshotBatch(batch, ++snapshot_epoch_);
+}
+
+void WorldRuntime::RunSnapshotBatch(std::vector<PendingSnapshot>& batch, std::uint64_t epoch)
+{
+    const auto now = std::chrono::steady_clock::now();
+    const SnapshotContext ctx{zones_,
+                              owners_by_session_,
+                              spawn_.Presence(),
+                              epoch,
+                              world_tick_.load(std::memory_order_relaxed),
+                              now,
+                              zones_.GetReclaimStats(), activity_field_.Snapshot(), scheduler_.WakeDecision()};
+    struct CollectorScope {
+        CollectorScope() { t_in_snapshot_collector = true; }
+        ~CollectorScope() { t_in_snapshot_collector = false; }
+    } scope;
+    for (auto& pending : batch) {
+        const auto waited =
+            static_cast<std::uint64_t>(std::chrono::duration_cast<std::chrono::microseconds>(
+                                           now - pending.requested_at)
+                                           .count());
+        if (waited > snapshot_max_wait_us_.load(std::memory_order_relaxed)) {
+            snapshot_max_wait_us_.store(waited, std::memory_order_relaxed);
+        }
+        pending.task(ctx); // exceptions travel through the promise
+        snapshot_requests_.fetch_add(1, std::memory_order_relaxed);
+    }
+    snapshot_captures_.fetch_add(1, std::memory_order_relaxed);
+}
+
+void WorldRuntime::ServeSnapshots()
+{
+    // Quiescent window only: no zone tick in flight (per-zone gauges are
+    // stable) and between two topology operations (this runs after the
+    // partition control / reclamation step of the pass).
+    if (!snapshots_pending_.load(std::memory_order_acquire) || zones_.AnyTickInProgress()) {
+        return;
+    }
+    std::vector<PendingSnapshot> batch;
+    std::uint64_t epoch = 0;
+    {
+        std::lock_guard lock(snapshot_mutex_);
+        batch.swap(pending_snapshots_);
+        snapshots_pending_.store(false, std::memory_order_release);
+        epoch = ++snapshot_epoch_;
+    }
+    if (!batch.empty()) {
+        RunSnapshotBatch(batch, epoch);
+    }
+}
+
+void WorldRuntime::ReclaimRetiredZones()
+{
+    const std::uint32_t tick = world_tick_.load(std::memory_order_relaxed);
+    zones_.SetWorldTick(tick); // grace clock for slots retired from here on
+    if (zones_.HasRetiredPending() && tick != last_reclaim_tick_ && !zones_.AnyTickInProgress()) {
+        last_reclaim_tick_ = tick;
+        // Runtime-held references (built lazily, once, only if some slot
+        // passed every ZoneManager-side check): the owner map's fast-path
+        // zone_index, and zone ids in queued migration requests (the only
+        // in-flight migration state; the transport is synchronous).
+        std::vector<std::uint8_t> referenced;
+        std::unordered_set<ZoneId> migrating;
+        bool built = false;
+        const auto reclaimed = zones_.ReclaimRetiredSlots(tick, [&](std::size_t index) {
+            if (!built) {
+                referenced.assign(zones_.ZoneCount(), 0);
+                for (const auto& [session, owner] : owners_by_session_) {
+                    (void)session;
+                    if (owner.zone_index < referenced.size()) {
+                        referenced[owner.zone_index] = 1;
+                    }
+                }
+                for (const auto& request : migration_queue_.RequestSnapshot()) {
+                    migrating.insert(request.source_zone_id);
+                    migrating.insert(request.target_zone_id);
+                }
+                built = true;
+            }
+            return (index < referenced.size() && referenced[index] != 0) ||
+                   migrating.contains(zones_.GetZone(index).Id());
+        });
+        for (const ZoneId id : reclaimed) {
+            directory_.ForgetRetiredZone(id); // retention no longer needed
+            why_not_last_logged_.erase(id);
+        }
+    }
+    const auto stats = zones_.GetReclaimStats();
+    std::lock_guard lock(reclaim_stats_mutex_);
+    reclaim_stats_ = stats;
+}
+
+void WorldRuntime::ExecutePartitionControl()
+{
+    // Topology mutation must never race worker zone ticks: bail unless the
+    // world is quiescent. Ticks are short; the 1 Hz control cadence still
+    // gets plenty of windows.
+    if (zones_.AnyTickInProgress()) {
+        return;
+    }
+    const auto now = std::chrono::steady_clock::now();
+    if (now - last_partition_control_ < std::chrono::seconds(1)) {
+        return;
+    }
+    last_partition_control_ = now;
+    const auto control_start = std::chrono::steady_clock::now();
+    std::uint64_t score_us = 0;
+
+    // OBSERVE: legacy p95/p99 tick + resident pressure, field overload score,
+    // sustained timers, candidate lists.
+    const auto field = load_field_.Snapshot();
+    const auto activity = activity_field_.Snapshot();
+    const auto observe_start = std::chrono::steady_clock::now();
+    load_monitor_.Update(zones_, scheduler_, now, field);
+    partition_metrics_.observe_us.fetch_add(ElapsedUs(observe_start, std::chrono::steady_clock::now()),
+                                            std::memory_order_relaxed);
+
+    const PartitionScoringConfig& scoring = scorer_.GetConfig();
+    if (!scoring.adaptive_enabled) {
+        // Observe-only baseline: telemetry is intact, decisions are off.
+        partition_metrics_.control_us.fetch_add(
+            ElapsedUs(control_start, std::chrono::steady_clock::now()), std::memory_order_relaxed);
+        return;
+    }
+
+    // SCORE + DECIDE: at most one topology mutation per control cycle. The
+    // scorer only recommends; the transactional executors re-validate every
+    // gate. Explicit deterministic priority (§25): a split is an active
+    // compute pressure and always goes first; a merge is an optimization and
+    // only runs when no split executed.
+    bool mutated = false;
+    for (const ZoneId zone_id : load_monitor_.SplitCandidates()) {
+        const auto score_start = std::chrono::steady_clock::now();
+        const SplitRecommendation recommendation =
+            ScorePartitionWith(zone_id, field, activity, now);
+        score_us += ElapsedUs(score_start, std::chrono::steady_clock::now());
+        const float p99_ms = [&] {
+            for (const auto& snap : load_monitor_.RecentSnapshots()) {
+                if (snap.zone_id == zone_id) {
+                    return snap.p99_tick_us / 1000.0f;
+                }
+            }
+            return 0.0f;
+        }();
+        // Emergency bypass accounting: the gate already passed, so
+        // re-evaluating it only tells us whether the merge-to-split cooldown
+        // was overridden by the measured signal.
+        {
+            const ZonePartition* leaf = FindZoneNode(zone_id);
+            bool emergency = false;
+            if (leaf != nullptr) {
+                (void)scheduler_.EvaluateSplitGate(leaf, now, &emergency);
+            }
+            if (emergency) {
+                partition_metrics_.split_emergency_bypasses.fetch_add(1,
+                                                                      std::memory_order_relaxed);
+            }
+        }
+        if (recommendation.valid &&
+            recommendation.best.final_score >= scoring.min_expected_improvement) {
+            const bool committed =
+                RunSplitTransaction(zone_id, false, &recommendation.best.center);
+            PartitionDecisionRecord record;
+            record.timestamp = now;
+            record.zone_id = zone_id;
+            record.executed = committed;
+            record.scored = true;
+            record.noop_reason = committed ? PartitionNoopReason::None
+                                           : PartitionNoopReason::TransactionRejected;
+            record.p99_tick_ms = p99_ms;
+            record.field_epoch = recommendation.field_epoch;
+            record.expected_improvement = recommendation.expected_improvement;
+            record.candidate = recommendation.best;
+            for (const auto& snap : load_monitor_.RecentSnapshots()) {
+                if (snap.zone_id == zone_id) {
+                    record.load_score = snap.load_score;
+                    record.field_load_score = snap.field_load_score;
+                    break;
+                }
+            }
+            RecordPartitionDecision(std::move(record), committed, false);
+            if (committed) {
+                mutated = true;
+                NoteOscillationIfAny(FindZoneNode(zone_id), true, now);
+            }
+        } else {
+            PartitionDecisionRecord record;
+            record.timestamp = now;
+            record.zone_id = zone_id;
+            record.scored = recommendation.valid;
+            record.noop_reason = recommendation.valid ? PartitionNoopReason::BelowMinImprovement
+                                                      : PartitionNoopReason::NoValidCut;
+            record.p99_tick_ms = p99_ms;
+            record.field_epoch = recommendation.field_epoch;
+            record.expected_improvement = recommendation.expected_improvement;
+            record.candidate = recommendation.best;
+            for (const auto& snap : load_monitor_.RecentSnapshots()) {
+                if (snap.zone_id == zone_id) {
+                    record.load_score = snap.load_score;
+                    record.field_load_score = snap.field_load_score;
+                    break;
+                }
+            }
+            RecordPartitionDecision(std::move(record), false, true);
+        }
+        break;
+    }
+
+    // Why-not diagnostics (§31): sustained-overloaded leaves blocked by a
+    // hard gate (cooldown/depth/size/commands) get one structured record.
+    // Rate-limited so a stuck zone cannot spam the log.
+    if (!mutated) {
+        for (const ZoneId zone_id : load_monitor_.OverloadedLeaves()) {
+            bool already_candidate = false;
+            for (const ZoneId candidate : load_monitor_.SplitCandidates()) {
+                if (candidate == zone_id) {
+                    already_candidate = true;
+                    break;
+                }
+            }
+            if (already_candidate) {
+                continue; // scored path above already recorded it
+            }
+            const std::size_t zone_index = zones_.FindIndexById(zone_id);
+            if (zone_index >= zones_.ZoneCount()) {
+                continue;
+            }
+            // The scheduler gate explains sustained/cooldown blocks; the plan
+            // dry-run explains geometry (depth/min-size/commands). The
+            // structured detail string names the actual blocker.
+            const ZonePartition* leaf = nullptr;
+            for (const auto& root : zones_.PartitionRoots()) {
+                if (const auto* found = FindPartitionNode(root.get(), zone_id)) {
+                    leaf = found;
+                    break;
+                }
+            }
+            const auto gate = scheduler_.EvaluateSplitGate(leaf, now);
+            if (gate == ZoneScheduler::SplitGate::MergeToSplitCooldown) {
+                partition_metrics_.split_suppressed_merge_cooldown.fetch_add(
+                    1, std::memory_order_relaxed);
+            }
+            SplitRejectReason plan_reason = SplitRejectReason::None;
+            ZoneManager::SplitPlan plan;
+            (void)zones_.PlanSplit(zone_id, plan, &plan_reason);
+            PartitionDecisionRecord record;
+            record.timestamp = now;
+            record.zone_id = zone_id;
+            record.scored = false;
+            // The structured reason names the class of blocker; the detail
+            // literal names the exact gate.
+            switch (gate) {
+            case ZoneScheduler::SplitGate::NotSustained:
+                record.noop_reason = PartitionNoopReason::SplitNotSustained;
+                break;
+            case ZoneScheduler::SplitGate::Cooldown:
+            case ZoneScheduler::SplitGate::MergeToSplitCooldown:
+                record.noop_reason = PartitionNoopReason::SplitCooldown;
+                break;
+            case ZoneScheduler::SplitGate::MaxDepth:
+                record.noop_reason = PartitionNoopReason::SplitMaxDepth;
+                break;
+            case ZoneScheduler::SplitGate::NotLeaf:
+            case ZoneScheduler::SplitGate::BelowThreshold:
+            case ZoneScheduler::SplitGate::Pass:
+            default:
+                record.noop_reason = plan_reason == SplitRejectReason::TooSmall
+                                         ? PartitionNoopReason::SplitMinSize
+                                         : PartitionNoopReason::SplitNotEligible;
+                break;
+            }
+            record.detail = gate != ZoneScheduler::SplitGate::Pass
+                                ? ZoneScheduler::SplitGateName(gate)
+                                : SplitRejectReasonName(plan_reason);
+            for (const auto& snap : load_monitor_.RecentSnapshots()) {
+                if (snap.zone_id == zone_id) {
+                    record.p99_tick_ms = snap.p99_tick_us / 1000.0f;
+                    record.load_score = snap.load_score;
+                    record.field_load_score = snap.field_load_score;
+                    break;
+                }
+            }
+            record.field_epoch = field != nullptr ? field->epoch : 0;
+            RecordPartitionDecision(std::move(record), false, true);
+            break;
+        }
+    }
+
+    // ---- MERGE: only when no split executed (explicit priority above) ----
+    if (!mutated) {
+        // Gate-state counters for every observed group (deterministic tree
+        // order). These make the stability controller tunable: the report
+        // shows WHY the tree is not simplifying.
+        for (const auto& group : load_monitor_.MergeGroups()) {
+            switch (group.gate) {
+            case ZoneScheduler::MergeGate::NotSustained:
+                if (group.sustained_low_seconds > 0.0f) {
+                    partition_metrics_.merge_suppressed_not_sustained.fetch_add(
+                        1, std::memory_order_relaxed);
+                }
+                break;
+            case ZoneScheduler::MergeGate::SplitToMergeCooldown:
+                partition_metrics_.merge_suppressed_recent_split.fetch_add(
+                    1, std::memory_order_relaxed);
+                break;
+            case ZoneScheduler::MergeGate::MergeCooldown:
+                partition_metrics_.merge_suppressed_recent_merge.fetch_add(
+                    1, std::memory_order_relaxed);
+                break;
+            case ZoneScheduler::MergeGate::Root:
+            case ZoneScheduler::MergeGate::NoParent:
+            case ZoneScheduler::MergeGate::NotFourChildren:
+            case ZoneScheduler::MergeGate::ChildNotLeaf:
+                partition_metrics_.merge_suppressed_not_eligible.fetch_add(
+                    1, std::memory_order_relaxed);
+                break;
+            case ZoneScheduler::MergeGate::Pass:
+            default:
+                break;
+            }
+        }
+
+        // SCORE every gate-passing group; the best recommendation wins
+        // deterministically (higher score, then earlier tree order).
+        MergeRecommendation best;
+        bool have_best = false;
+        for (const ZoneId parent_id : load_monitor_.MergeCandidates()) {
+            const auto score_start = std::chrono::steady_clock::now();
+            const MergeRecommendation recommendation =
+                ScoreMergeWith(parent_id, field, activity, now);
+            score_us += ElapsedUs(score_start, std::chrono::steady_clock::now());
+            partition_metrics_.merge_candidates_evaluated.fetch_add(1,
+                                                                    std::memory_order_relaxed);
+            if (!recommendation.valid) {
+                partition_metrics_.merge_suppressed_not_eligible.fetch_add(
+                    1, std::memory_order_relaxed);
+                continue;
+            }
+            if (!recommendation.best.safety_ok) {
+                partition_metrics_.merge_suppressed_post_merge_unsafe.fetch_add(
+                    1, std::memory_order_relaxed);
+                RecordMergeDecision(recommendation, PartitionNoopReason::MergeUnsafePostMerge,
+                                    "post-merge-unsafe", false, now);
+                continue;
+            }
+            if (recommendation.best.final_score < scoring.min_merge_improvement) {
+                partition_metrics_.merge_suppressed_min_improvement.fetch_add(
+                    1, std::memory_order_relaxed);
+                RecordMergeDecision(recommendation, PartitionNoopReason::MergeBelowMinImprovement,
+                                    "below-min-improvement", false, now);
+                continue;
+            }
+            if (!have_best || recommendation.best.final_score > best.best.final_score) {
+                best = recommendation;
+                have_best = true;
+            }
+        }
+        if (have_best) {
+            const bool committed = RunMergeTransaction(best.parent_id, false);
+            if (!committed) {
+                partition_metrics_.merge_suppressed_transaction.fetch_add(
+                    1, std::memory_order_relaxed);
+            }
+            RecordMergeDecision(best,
+                                committed ? PartitionNoopReason::None
+                                          : PartitionNoopReason::MergeTransactionRejected,
+                                committed ? "executed" : "transaction-rejected", committed, now);
+            if (committed) {
+                mutated = true;
+                NoteOscillationIfAny(FindZoneNode(best.parent_id), false, now);
+            }
+        } else {
+            // Why-not: the first group that is in the merge funnel (low load,
+            // timer running, gate not yet passed) gets one rate-limited
+            // structured record so the controller is not opaque.
+            for (const auto& group : load_monitor_.MergeGroups()) {
+                if (group.candidate || group.sustained_low_seconds <= 0.0f) {
+                    continue;
+                }
+                RecordMergeGateNoop(group, now);
+                break;
+            }
+        }
+    }
+
+    partition_metrics_.score_us.fetch_add(score_us, std::memory_order_relaxed);
+    partition_metrics_.control_us.fetch_add(
+        ElapsedUs(control_start, std::chrono::steady_clock::now()), std::memory_order_relaxed);
+}
+
+SplitRecommendation WorldRuntime::ScorePartitionWith(
+    ZoneId zone_id,
+    const std::shared_ptr<const LoadGrid>& field,
+    const std::shared_ptr<const ActivityGrid>& activity,
+    std::chrono::steady_clock::time_point now) const
+{
+    const std::size_t zone_index = zones_.FindIndexById(zone_id);
+    if (zone_index >= zones_.ZoneCount()) {
+        return SplitRecommendation{};
+    }
+    const Zone& zone = zones_.GetZone(zone_index);
+    PartitionScoreInput input;
+    input.zone_id = zone_id;
+    input.bounds = zone.Bounds();
+    input.players = zone.Diagnostics().player_count.load(std::memory_order_relaxed);
+    input.mobs = zone.Diagnostics().mob_count.load(std::memory_order_relaxed);
+    for (const auto& root : zones_.PartitionRoots()) {
+        if (const auto* leaf = FindPartitionNode(root.get(), zone_id)) {
+            input.depth = leaf->depth;
+            input.last_mutation = leaf->last_split_time;
+            if (leaf->parent != nullptr && leaf->parent->last_merge_time > input.last_mutation) {
+                input.last_mutation = leaf->parent->last_merge_time;
+            }
+            break;
+        }
+    }
+    SplitRecommendation recommendation = scorer_.ScoreSplit(input, field.get(), activity.get(), now);
+    recommendation.activity_epoch = activity != nullptr ? activity->epoch : 0;
+    return recommendation;
+}
+
+SplitRecommendation WorldRuntime::ScorePartition(ZoneId zone_id) const
+{
+    return ScorePartitionWith(zone_id, load_field_.Snapshot(), activity_field_.Snapshot(),
+                              std::chrono::steady_clock::now());
+}
+
+const ZonePartition* WorldRuntime::FindZoneNode(ZoneId zone_id) const
+{
+    for (const auto& root : zones_.PartitionRoots()) {
+        if (const auto* found = FindPartitionNode(root.get(), zone_id)) {
+            return found;
+        }
+    }
+    return nullptr;
+}
+
+MergeRecommendation WorldRuntime::ScoreMergeWith(
+    ZoneId parent_id,
+    const std::shared_ptr<const LoadGrid>& field,
+    const std::shared_ptr<const ActivityGrid>& activity,
+    std::chrono::steady_clock::time_point now) const
+{
+    const ZonePartition* parent = FindZoneNode(parent_id);
+    if (parent == nullptr || parent->children.size() != 4) {
+        return MergeRecommendation{};
+    }
+    MergeScoreInput input;
+    input.parent_id = parent_id;
+    input.parent_bounds = parent->bounds;
+    input.parent_depth = parent->depth;
+    input.last_split = parent->last_split_time;
+    input.last_merge = parent->last_merge_time;
+    if (parent->group_low_since != std::chrono::steady_clock::time_point{}) {
+        input.sustained_low_seconds =
+            std::chrono::duration<float>(now - parent->group_low_since).count();
+    }
+    float max_child_load = 0.0f;
+    for (std::size_t i = 0; i < parent->children.size(); ++i) {
+        const ZonePartition* child = parent->children[i].get();
+        input.child_ids[i] = child->zone_id;
+        input.child_bounds[i] = child->bounds;
+        max_child_load = std::max(max_child_load, child->load_score);
+        const std::size_t zone_index = zones_.FindIndexById(child->zone_id);
+        if (zone_index < zones_.ZoneCount()) {
+            const auto& diag = zones_.GetZone(zone_index).Diagnostics();
+            input.players += diag.player_count.load(std::memory_order_relaxed);
+            input.mobs += diag.mob_count.load(std::memory_order_relaxed);
+        }
+    }
+    input.max_child_load_score = max_child_load;
+    MergeRecommendation recommendation =
+        scorer_.ScoreMerge(input, field.get(), activity.get(), now);
+    recommendation.activity_epoch = activity != nullptr ? activity->epoch : 0;
+    return recommendation;
+}
+
+MergeRecommendation WorldRuntime::ScoreMerge(ZoneId parent_id) const
+{
+    return ScoreMergeWith(parent_id, load_field_.Snapshot(), activity_field_.Snapshot(),
+                          std::chrono::steady_clock::now());
+}
+
+void WorldRuntime::RecordMergeDecision(const MergeRecommendation& recommendation,
+                                       PartitionNoopReason reason,
+                                       const char* detail,
+                                       bool executed,
+                                       std::chrono::steady_clock::time_point now)
+{
+    PartitionDecisionRecord record;
+    record.kind = PartitionDecisionKind::Merge;
+    record.timestamp = now;
+    record.zone_id = recommendation.parent_id;
+    record.executed = executed;
+    record.scored = true;
+    record.noop_reason = reason;
+    record.detail = detail != nullptr ? detail : "";
+    record.field_epoch = recommendation.field_epoch;
+    record.expected_improvement = recommendation.expected_improvement;
+    record.merge_candidate = recommendation.best;
+    // The parent has no single tick: report the worst child signal so the
+    // record still carries a comparable pressure reading.
+    float max_p99 = 0.0f;
+    float max_load = 0.0f;
+    float max_field = 0.0f;
+    for (const ZoneId child_id : recommendation.best.child_ids) {
+        for (const auto& snap : load_monitor_.RecentSnapshots()) {
+            if (snap.zone_id == child_id) {
+                max_p99 = std::max(max_p99, snap.p99_tick_us / 1000.0f);
+                max_load = std::max(max_load, snap.load_score);
+                max_field = std::max(max_field, snap.field_load_score);
+                break;
+            }
+        }
+    }
+    record.p99_tick_ms = max_p99;
+    record.load_score = max_load;
+    record.field_load_score = max_field;
+    RecordPartitionDecision(std::move(record), executed, !executed);
+}
+
+void WorldRuntime::RecordMergeGateNoop(const MergeGroupSnapshot& group,
+                                       std::chrono::steady_clock::time_point now)
+{
+    PartitionDecisionRecord record;
+    record.kind = PartitionDecisionKind::Merge;
+    record.timestamp = now;
+    record.zone_id = group.parent_id;
+    record.scored = false;
+    record.detail = ZoneScheduler::MergeGateName(group.gate);
+    record.merge_candidate.parent_id = group.parent_id;
+    record.merge_candidate.child_ids = group.child_ids;
+    record.merge_candidate.sustained_low_seconds = group.sustained_low_seconds;
+    record.merge_candidate.predicted_parent_load = group.group_load_score;
+    switch (group.gate) {
+    case ZoneScheduler::MergeGate::SplitToMergeCooldown:
+        record.noop_reason = PartitionNoopReason::MergeRecentSplit;
+        break;
+    case ZoneScheduler::MergeGate::MergeCooldown:
+        record.noop_reason = PartitionNoopReason::MergeRecentMerge;
+        break;
+    case ZoneScheduler::MergeGate::NotSustained:
+        record.noop_reason = PartitionNoopReason::MergeNotSustained;
+        break;
+    default:
+        record.noop_reason = PartitionNoopReason::MergeNotEligible;
+        break;
+    }
+    RecordPartitionDecision(std::move(record), false, true);
+}
+
+void WorldRuntime::NoteOscillationIfAny(const ZonePartition* node,
+                                        bool split_committed,
+                                        std::chrono::steady_clock::time_point now)
+{
+    if (node == nullptr) {
+        return;
+    }
+    const float window_s = scorer_.GetConfig().oscillation_window_s;
+    if (!(window_s > 0.0f)) {
+        return;
+    }
+    const auto window = std::chrono::duration_cast<std::chrono::steady_clock::duration>(
+        std::chrono::duration<float>(window_s));
+    if (split_committed) {
+        if (node->last_merge_time != std::chrono::steady_clock::time_point{} &&
+            now - node->last_merge_time < window) {
+            partition_metrics_.oscillation_guard_trips.fetch_add(1, std::memory_order_relaxed);
+        }
+    } else {
+        if (node->last_split_time != std::chrono::steady_clock::time_point{} &&
+            now - node->last_split_time < window) {
+            partition_metrics_.oscillation_guard_trips.fetch_add(1, std::memory_order_relaxed);
+        }
+    }
+}
+
+void WorldRuntime::RecordPartitionDecision(PartitionDecisionRecord record,
+                                           bool executed,
+                                           bool why_not)
+{
+    (void)executed; // the record already carries the outcome
+    std::lock_guard lock(decision_mutex_);
+    const PartitionScoringConfig& config = scorer_.GetConfig();
+    bool log_line = config.decision_log_enabled;
+    if (log_line && why_not) {
+        // Rate-limit why-not lines per zone: a stuck overloaded zone must not
+        // log every control cycle (§30: decisions only, not per-tick spam).
+        const auto interval = std::chrono::milliseconds(
+            static_cast<std::int64_t>(std::max(0.0f, config.why_not_log_seconds) * 1000.0f));
+        const auto it = why_not_last_logged_.find(record.zone_id);
+        const bool due =
+            it == why_not_last_logged_.end() || (record.timestamp - it->second) >= interval;
+        if (due) {
+            why_not_last_logged_[record.zone_id] = record.timestamp;
+        } else {
+            log_line = false;
+        }
+    }
+    if (log_line) {
+        LOG_INFO("partition decision: {}", FormatPartitionDecision(record));
+    }
+    constexpr std::size_t kDecisionCapacity = 64;
+    if (decisions_.size() >= kDecisionCapacity) {
+        decisions_.erase(decisions_.begin());
+    }
+    decisions_.push_back(std::move(record));
+}
+
+std::vector<PartitionDecisionRecord> WorldRuntime::PartitionDecisionLog() const
+{
+    std::lock_guard lock(decision_mutex_);
+    return decisions_;
+}
+
+bool WorldRuntime::ZoneHasPendingMigration(ZoneId zone_id) const
+{
+    for (const auto& request : migration_queue_.RequestSnapshot()) {
+        if (request.source_zone_id == zone_id || request.target_zone_id == zone_id) {
+            return true;
+        }
+    }
+    return false;
+}
+
+void WorldRuntime::ExecuteForcedSplit(ZoneId zone_id)
+{
+    if (zones_.AnyTickInProgress()) {
+        LOG_DEBUG("partition: forced split deferred (tick in flight), re-queued");
+        PostForceSplit(zone_id);
+        return;
+    }
+    if (zones_.CommandsPendingUnder(zone_id)) {
+        // H1: queued commands drain on the zone's next 20 Hz tick (<= one
+        // kTickDt away); the split gate refuses a zone with pending commands,
+        // so wait for that tick instead of failing the forced split.
+        LOG_DEBUG("partition: forced split deferred (commands pending), re-queued");
+        PostForceSplit(zone_id);
+        return;
+    }
+    if (ZoneHasPendingMigration(zone_id)) {
+        // The transaction refuses a zone with a racing migration ("retry next
+        // cycle" -- right for the 1 Hz adaptive path); a forced split would
+        // otherwise be silently dropped. Migrations settle within a pass.
+        LOG_DEBUG("partition: forced split deferred (racing migration), re-queued");
+        PostForceSplit(zone_id);
+        return;
+    }
+    RunSplitTransaction(zone_id, true, nullptr);
+}
+
+void WorldRuntime::ExecuteForcedMerge(ZoneId parent_node_id)
+{
+    if (zones_.AnyTickInProgress()) {
+        LOG_DEBUG("partition: forced merge deferred (tick in flight), re-queued");
+        PostForceMerge(parent_node_id);
+        return;
+    }
+    if (zones_.CommandsPendingUnder(parent_node_id)) {
+        // H1: e.g. despawn commands still queued in a child until its next
+        // tick; the merge plan refuses children with pending commands.
+        LOG_DEBUG("partition: forced merge deferred (commands pending), re-queued");
+        PostForceMerge(parent_node_id);
+        return;
+    }
+    {
+        // Same as the split: a racing migration between the children makes
+        // the transaction refuse, which must not drop a forced merge.
+        ZoneManager::MergePlan plan;
+        if (zones_.PlanMerge(parent_node_id, plan)) {
+            for (const ZoneId child_id : plan.child_ids) {
+                if (ZoneHasPendingMigration(child_id)) {
+                    LOG_DEBUG("partition: forced merge deferred (racing migration), re-queued");
+                    PostForceMerge(parent_node_id);
+                    return;
+                }
+            }
+        }
+    }
+    RunMergeTransaction(parent_node_id, true);
+}
+
+bool WorldRuntime::RunSplitTransaction(ZoneId zone_id, bool forced, const SplitCenter* center)
+{
+    const auto t_plan0 = std::chrono::steady_clock::now();
+    ZoneManager::SplitPlan plan;
+    SplitRejectReason plan_reason = SplitRejectReason::None;
+    if (!zones_.PlanSplit(zone_id, plan, &plan_reason, center)) {
+        if (forced) {
+            // A forced split the partition rules refuse (e.g. a zone already
+            // at the min-zone-size floor) must say why -- never a silent no-op.
+            LOG_WARN("partition: forced split REFUSED zone={} reason={}", zone_id, SplitRejectReasonName(plan_reason));
+            PartitionDecisionRecord record;
+            record.kind = PartitionDecisionKind::Split;
+            record.timestamp = std::chrono::steady_clock::now();
+            record.zone_id = zone_id;
+            record.executed = false;
+            record.noop_reason = plan_reason == SplitRejectReason::TooSmall ? PartitionNoopReason::SplitMinSize
+                                                                            : PartitionNoopReason::SplitNotEligible;
+            record.detail = SplitRejectReasonName(plan_reason);
+            RecordPartitionDecision(std::move(record), false, false);
+        }
+        return false; // routine skip, not an abort
+    }
+    if (ZoneHasPendingMigration(zone_id)) {
+        LOG_INFO("partition: split deferred zone={} (racing migration, retry next cycle)", zone_id);
+        return false;
+    }
+    partition_metrics_.split_plan_us.fetch_add(ElapsedUs(t_plan0, std::chrono::steady_clock::now()),
+                                               std::memory_order_relaxed);
+    partition_metrics_.split_attempts.fetch_add(1, std::memory_order_relaxed);
+
+    std::vector<ZoneId> children;
+    if (!zones_.CreateStagedSplit(plan, children)) {
+        partition_metrics_.split_aborts.fetch_add(1, std::memory_order_relaxed);
+        LOG_WARN("partition: split ABORTED zone={} (staging failed, parent restored)", zone_id);
+        return false;
+    }
+    const std::size_t parent_index = plan.parent_index;
+
+    // Per-child locations (same node/process as the parent, own zone id).
+    // Published ONLY at commit: nothing routes here prematurely (§11).
+    const auto parent_loc = directory_.ResolveZone(zone_id);
+    std::unordered_map<ZoneId, ZoneLocation> child_locs;
+    for (const ZoneId child_id : children) {
+        ZoneLocation child_loc = parent_loc.value_or(LocalZoneLocation(identity_, child_id));
+        child_loc.zone = child_id;
+        child_locs.emplace(child_id, child_loc);
+    }
+
+    struct PlannedMove {
+        std::uint32_t net_id = 0;
+        std::size_t target_index = 0;
+        ZoneId target_id = 0;
+    };
+    auto abort_split = [&](const char* reason, std::vector<PlannedMove>& moved) -> bool {
+        const auto t_rb0 = std::chrono::steady_clock::now();
+        std::uint64_t rb_fail = 0;
+        ZoneLocation back = parent_loc.value_or(LocalZoneLocation(identity_, zone_id));
+        back.zone = zone_id;
+        for (auto it = moved.rbegin(); it != moved.rend(); ++it) {
+            if (!TransferResident(it->target_index, parent_index, back, it->net_id)) {
+                ++rb_fail;
+                LOG_ERROR("partition: split rollback failed net_id={} (stays staged; validator "
+                          "will flag loudly)",
+                          it->net_id);
+            }
+        }
+        zones_.AbortSplit(zone_id, children);
+        partition_metrics_.split_aborts.fetch_add(1, std::memory_order_relaxed);
+        partition_metrics_.split_rollback_failures.fetch_add(rb_fail, std::memory_order_relaxed);
+        partition_metrics_.split_rollback_us.fetch_add(
+            ElapsedUs(t_rb0, std::chrono::steady_clock::now()), std::memory_order_relaxed);
+        LOG_WARN("partition: split ABORTED zone={} reason={} moved={} rb_fail={} (parent restored)",
+                 zone_id,
+                 reason,
+                 moved.size(),
+                 rb_fail);
+        return false;
+    };
+
+    // ---- Transfer: route every resident to exactly one child (half-open,
+    // same rule as FindLeaf). An unroutable entity ABORTS the split (§24):
+    // silent misplacement would corrupt authority.
+    const auto t_xfer0 = std::chrono::steady_clock::now();
+    Zone& parent = zones_.GetZone(parent_index);
+    std::vector<PlannedMove> moves;
+    bool routable = true;
+    for (const auto& [net_id, entity] : parent.Entities()) {
+        if (!entity.is_valid() || !entity.has<Position>()) {
+            routable = false;
+            break;
+        }
+        const auto pos = entity.get<Position>();
+        ZoneId match_id = 0;
+        std::size_t match_index = 0;
+        bool matched = false;
+        for (const ZoneId child_id : children) {
+            const std::size_t child_index = zones_.FindIndexById(child_id);
+            const auto& b = zones_.GetZone(child_index).Bounds();
+            if (pos.x >= b.min_x && pos.x < b.max_x && pos.y >= b.min_y && pos.y < b.max_y) {
+                match_id = child_id;
+                match_index = child_index;
+                matched = true;
+                break;
+            }
+        }
+        if (!matched) {
+            for (const ZoneId child_id : children) {
+                const std::size_t child_index = zones_.FindIndexById(child_id);
+                if (zones_.GetZone(child_index).Bounds().Contains(pos.x, pos.y)) {
+                    match_id = child_id;
+                    match_index = child_index;
+                    matched = true;
+                    break;
+                }
+            }
+        }
+        if (!matched) {
+            // A resident can sit marginally OUTSIDE the parent bounds while a
+            // pending migration (hysteresis band) has not committed yet: it
+            // still belongs to this parent, so the split must not abort. Clamp
+            // it into the parent rect and route it to the containing child
+            // (the children tile the parent exactly with half-open bounds, so
+            // a clamped point always matches exactly one child).
+            const auto& parent_bounds = zones_.GetZone(parent_index).Bounds();
+            const float clamped_x = std::clamp(
+                pos.x, parent_bounds.min_x,
+                std::nextafter(parent_bounds.max_x, parent_bounds.min_x));
+            const float clamped_y = std::clamp(
+                pos.y, parent_bounds.min_y,
+                std::nextafter(parent_bounds.max_y, parent_bounds.min_y));
+            for (const ZoneId child_id : children) {
+                const std::size_t child_index = zones_.FindIndexById(child_id);
+                const auto& b = zones_.GetZone(child_index).Bounds();
+                if (clamped_x >= b.min_x && clamped_x < b.max_x && clamped_y >= b.min_y &&
+                    clamped_y < b.max_y) {
+                    match_id = child_id;
+                    match_index = child_index;
+                    matched = true;
+                    break;
+                }
+            }
+        }
+        if (!matched) {
+            LOG_ERROR("partition: split abort, net_id={} at ({},{}) matches no child of zone {}",
+                      net_id,
+                      pos.x,
+                      pos.y,
+                      zone_id);
+            routable = false;
+            break;
+        }
+        moves.push_back(PlannedMove{net_id, match_index, match_id});
+    }
+    if (!routable) {
+        std::vector<PlannedMove> empty;
+        return abort_split("unroutable-resident", empty);
+    }
+    // Only COMPLETED moves are ever reversed: aborting over the planned
+    // list would "roll back" entities that never left the source (their
+    // reverse lookup fails loudly and spuriously).
+    std::vector<PlannedMove> completed;
+    for (const auto& move : moves) {
+        if (!TransferResident(parent_index, move.target_index, child_locs[move.target_id],
+                              move.net_id)) {
+            partition_metrics_.split_transfer_failures.fetch_add(1, std::memory_order_relaxed);
+            return abort_split("transfer-failed", completed);
+        }
+        completed.push_back(move);
+    }
+    partition_metrics_.split_transfer_us.fetch_add(
+        ElapsedUs(t_xfer0, std::chrono::steady_clock::now()), std::memory_order_relaxed);
+
+    // ---- Validate: parent fully drained + every move landed. ----
+    const bool drained =
+        parent.Entities().empty() && parent.Players().empty() && parent.NetBySession().empty();
+    bool landed = drained;
+    if (landed) {
+        for (const auto& move : moves) {
+            if (!zones_.GetZone(move.target_index).FindEntity(move.net_id).is_valid()) {
+                landed = false;
+                break;
+            }
+        }
+    }
+    if (!landed) {
+        return abort_split("validate-failed", moves);
+    }
+
+    // ---- Commit: tree flips + directory publish + counts. ----
+    const auto t_commit0 = std::chrono::steady_clock::now();
+    if (!zones_.CommitSplit(zone_id, children)) {
+        return abort_split("commit-refused", moves);
+    }
+    for (const ZoneId child_id : children) {
+        directory_.SetAssignment(child_id, child_locs[child_id]);
+    }
+    directory_.RetireZones({zone_id});
+    parent.RefreshResidentCounts();
+    for (const ZoneId child_id : children) {
+        zones_.GetZone(zones_.FindIndexById(child_id)).RefreshResidentCounts();
+    }
+    partition_metrics_.split_commits.fetch_add(1, std::memory_order_relaxed);
+    partition_metrics_.split_commit_us.fetch_add(
+        ElapsedUs(t_commit0, std::chrono::steady_clock::now()), std::memory_order_relaxed);
+    LOG_INFO("partition: split {} zone={} children={} moved={}",
+             forced ? "FORCED-COMMIT" : "COMMIT",
+             zone_id,
+             children.size(),
+             moves.size());
+    return true;
+}
+
+bool WorldRuntime::RunMergeTransaction(ZoneId parent_node_id, bool forced)
+{
+    const auto t_plan0 = std::chrono::steady_clock::now();
+    ZoneManager::MergePlan plan;
+    if (!zones_.PlanMerge(parent_node_id, plan)) {
+        return false; // routine skip, not an abort
+    }
+    for (const ZoneId child_id : plan.child_ids) {
+        if (ZoneHasPendingMigration(child_id)) {
+            LOG_INFO("partition: merge deferred parent={} (racing migration, retry next cycle)",
+                     parent_node_id);
+            return false;
+        }
+    }
+    partition_metrics_.merge_plan_us.fetch_add(ElapsedUs(t_plan0, std::chrono::steady_clock::now()),
+                                               std::memory_order_relaxed);
+    partition_metrics_.merge_attempts.fetch_add(1, std::memory_order_relaxed);
+
+    ZoneId merged_id = 0;
+    if (!zones_.CreateStagedMergeTarget(plan, merged_id)) {
+        partition_metrics_.merge_aborts.fetch_add(1, std::memory_order_relaxed);
+        LOG_WARN("partition: merge ABORTED parent={} (staging failed, children restored)",
+                 parent_node_id);
+        return false;
+    }
+    const std::size_t merged_index = zones_.FindIndexById(merged_id);
+    const auto loc = directory_.ResolveZone(parent_node_id);
+    ZoneLocation merged_loc = loc.value_or(LocalZoneLocation(identity_, merged_id));
+    merged_loc.zone = merged_id;
+
+    auto abort_merge = [&](const char* reason, std::vector<std::uint32_t>& moved_from,
+                           const std::unordered_map<std::uint32_t, ZoneId>& home) -> bool {
+        const auto t_rb0 = std::chrono::steady_clock::now();
+        std::uint64_t rb_fail = 0;
+        for (auto it = moved_from.rbegin(); it != moved_from.rend(); ++it) {
+            const auto home_it = home.find(*it);
+            if (home_it == home.end()) {
+                ++rb_fail;
+                continue;
+            }
+            ZoneLocation back = loc.value_or(LocalZoneLocation(identity_, home_it->second));
+            back.zone = home_it->second;
+            const std::size_t home_index = zones_.FindIndexById(home_it->second);
+            if (!TransferResident(merged_index, home_index, back, *it)) {
+                ++rb_fail;
+                LOG_ERROR("partition: merge rollback failed net_id={} (stays staged; validator "
+                          "will flag loudly)",
+                          *it);
+            }
+        }
+        zones_.AbortMerge(plan, merged_id);
+        partition_metrics_.merge_aborts.fetch_add(1, std::memory_order_relaxed);
+        partition_metrics_.merge_rollback_failures.fetch_add(rb_fail, std::memory_order_relaxed);
+        partition_metrics_.merge_rollback_us.fetch_add(
+            ElapsedUs(t_rb0, std::chrono::steady_clock::now()), std::memory_order_relaxed);
+        LOG_WARN("partition: merge ABORTED parent={} reason={} moved={} rb_fail={} (children "
+                 "restored)",
+                 parent_node_id,
+                 reason,
+                 moved_from.size(),
+                 rb_fail);
+        return false;
+    };
+
+    // ---- Transfer: every child resident into the staged target. ----
+    const auto t_xfer0 = std::chrono::steady_clock::now();
+    std::vector<std::uint32_t> moved;
+    std::unordered_map<std::uint32_t, ZoneId> home; // net -> child ZoneId for rollback
+    for (const ZoneId child_id : plan.child_ids) {
+        const std::size_t child_index = zones_.FindIndexById(child_id);
+        if (child_index >= zones_.ZoneCount()) {
+            return abort_merge("child-vanished", moved, home);
+        }
+        Zone& child = zones_.GetZone(child_index);
+        std::vector<std::uint32_t> residents;
+        for (const auto& [net_id, entity] : child.Entities()) {
+            if (!entity.is_valid() || !entity.has<Position>()) {
+                return abort_merge("stale-resident", moved, home);
+            }
+            residents.push_back(net_id);
+        }
+        for (const std::uint32_t net_id : residents) {
+            if (!TransferResident(child_index, merged_index, merged_loc, net_id)) {
+                partition_metrics_.merge_transfer_failures.fetch_add(1, std::memory_order_relaxed);
+                return abort_merge("transfer-failed", moved, home);
+            }
+            moved.push_back(net_id);
+            home.emplace(net_id, child_id);
+        }
+        child.RefreshResidentCounts();
+    }
+    partition_metrics_.merge_transfer_us.fetch_add(
+        ElapsedUs(t_xfer0, std::chrono::steady_clock::now()), std::memory_order_relaxed);
+
+    // ---- Validate: children drained + merged holds everything. ----
+    bool ok = true;
+    for (const ZoneId child_id : plan.child_ids) {
+        const Zone& child = zones_.GetZone(zones_.FindIndexById(child_id));
+        if (!child.Entities().empty() || !child.Players().empty() ||
+            !child.NetBySession().empty()) {
+            ok = false;
+            break;
+        }
+    }
+    if (ok) {
+        Zone& merged = zones_.GetZone(merged_index);
+        for (const std::uint32_t net_id : moved) {
+            if (!merged.FindEntity(net_id).is_valid()) {
+                ok = false;
+                break;
+            }
+        }
+        merged.RefreshResidentCounts();
+    }
+    if (!ok) {
+        return abort_merge("validate-failed", moved, home);
+    }
+
+    // ---- Commit: tree collapse + children retire + directory publish. ----
+    const auto t_commit0 = std::chrono::steady_clock::now();
+    if (!zones_.CommitMerge(plan, merged_id)) {
+        return abort_merge("commit-refused", moved, home);
+    }
+    directory_.RetireZones(plan.child_ids);
+    ZoneLocation merged_dir_loc = loc.value_or(LocalZoneLocation(identity_, merged_id));
+    merged_dir_loc.zone = merged_id;
+    directory_.SetAssignment(merged_id, merged_dir_loc);
+    partition_metrics_.merge_commits.fetch_add(1, std::memory_order_relaxed);
+    partition_metrics_.merge_commit_us.fetch_add(
+        ElapsedUs(t_commit0, std::chrono::steady_clock::now()), std::memory_order_relaxed);
+    LOG_INFO("partition: merge {} parent={} merged={} children={} moved={}",
+             forced ? "FORCED-COMMIT" : "COMMIT",
+             parent_node_id,
+             merged_id,
+             plan.child_ids.size(),
+             moved.size());
+    return true;
+}
+
+bool WorldRuntime::TransferResident(std::size_t source_zone_index,
+                                    std::size_t target_zone_index,
+                                    ZoneLocation target_location,
+                                    std::uint32_t net_id)
+{
+    if (source_zone_index >= zones_.ZoneCount() || target_zone_index >= zones_.ZoneCount() ||
+        source_zone_index == target_zone_index) {
+        return false;
+    }
+    // Ordered acquisition (by index) keeps the two-zone scope deadlock-free.
+    if (source_zone_index < target_zone_index) {
+        ZoneWriteGuard source_guard(zones_.GetZone(source_zone_index), "partition transfer source");
+        ZoneWriteGuard target_guard(zones_.GetZone(target_zone_index), "partition transfer target");
+        return TransferResidentLocked(zones_.GetZone(source_zone_index),
+                                      zones_.GetZone(target_zone_index), target_zone_index,
+                                      target_location, net_id);
+    }
+    ZoneWriteGuard target_guard(zones_.GetZone(target_zone_index), "partition transfer target");
+    ZoneWriteGuard source_guard(zones_.GetZone(source_zone_index), "partition transfer source");
+    return TransferResidentLocked(zones_.GetZone(source_zone_index),
+                                  zones_.GetZone(target_zone_index), target_zone_index,
+                                  target_location, net_id);
+}
+
+bool WorldRuntime::TransferResidentLocked(Zone& source_zone,
+                                          Zone& target_zone,
+                                          std::size_t target_zone_index,
+                                          ZoneLocation target_location,
+                                          std::uint32_t net_id)
+{
+    const auto entity = source_zone.FindEntity(net_id);
+    if (!entity.is_valid()) {
+        return false;
+    }
+    const bool is_player = entity.has<PlayerTag>();
+    gs::common::SessionId session_id = 0;
+    if (is_player) {
+        const auto* binding = source_zone.FindPlayer(net_id);
+        if (binding == nullptr) {
+            return false;
+        }
+        session_id = binding->session ? binding->session->Id() : 0;
+    }
+
+    // Failure-injection grace window: let the first N transfers succeed so
+    // mid-batch aborts are reproducible. Single supervisor consumer, so a
+    // plain load/store pair is race-free in practice.
+    bool failure_armed = true;
+    const int grace = test_fail_after_count_.load(std::memory_order_relaxed);
+    if (grace > 0) {
+        test_fail_after_count_.store(grace - 1, std::memory_order_relaxed);
+        failure_armed = false;
+    }
+
+    // Injected snapshot-stage failure: before ANY mutation, source untouched.
+    if (failure_armed && ConsumeTestFailure(test_fail_snapshot_count_)) {
+        LOG_WARN("partition: injected snapshot failure net_id={} (source untouched)", net_id);
+        return false;
+    }
+
+    // Same authority-transfer primitive as MigrationCoordinator, but
+    // apply-first: the source is released only after the target accepted.
+    EntityTransfer transfer;
+    try {
+        transfer = BuildTransfer(entity, is_player, NamespaceFor(identity_));
+    } catch (const std::exception& error) {
+        LOG_ERROR("partition: net_id={} snapshot failed: {}", net_id, error.what());
+        return false;
+    } catch (...) {
+        LOG_ERROR("partition: net_id={} snapshot failed (unknown)", net_id);
+        return false;
+    }
+
+    // Unknown height (outside / not resident) keeps the entity's own z.
+    if (const auto ground = terrain_.Height(transfer.position.x, transfer.position.y); ground.Ok()) {
+        transfer.position.z = ground.meters;
+    }
+    DestinationRollback rollback;
+    rollback.target = &target_zone;
+    rollback.net_id = net_id;
+    rollback.position = transfer.position;
+    try {
+        GhostSystem::RemoveByNetId(target_zone, net_id);
+        rollback.entity = ApplyTransfer(target_zone.World(), transfer);
+        rollback.applied = true;
+        target_zone.IndexEntity(net_id, rollback.entity);
+        rollback.indexed = true;
+        target_zone.Grid().Insert(net_id, transfer.position, rollback.entity);
+        rollback.gridded = true;
+    } catch (const std::exception& error) {
+        LOG_ERROR("partition: net_id={} apply failed, source untouched: {}", net_id, error.what());
+        return false; // guard destroys the partial destination
+    } catch (...) {
+        LOG_ERROR("partition: net_id={} apply failed (unknown), source untouched", net_id);
+        return false; // guard destroys the partial destination
+    }
+
+    // Injected apply-stage failure: destination fully built, source still
+    // authoritative. The guard must remove every destination trace.
+    if (failure_armed && ConsumeTestFailure(test_fail_apply_count_)) {
+        LOG_WARN("partition: injected apply failure net_id={} (rollback engages)", net_id);
+        return false;
+    }
+
+    // Move session/RNG state. If anything here throws, extracted state is
+    // restored to the source and the guard rolls the destination back, so
+    // neither side is left partial.
+    Zone::PlayerBinding moved_binding;
+    std::optional<std::mt19937> moved_rng;
+    try {
+        if (is_player) {
+            moved_binding = source_zone.ExtractPlayerBinding(net_id);
+            target_zone.InsertPlayerBinding(net_id, std::move(moved_binding));
+            rollback.bound = true;
+        } else {
+            moved_rng = source_zone.ExtractMobRng(net_id);
+            if (moved_rng) {
+                target_zone.InsertMobRng(net_id, std::move(*moved_rng));
+                rollback.rng_moved = true;
+            }
+        }
+    } catch (const std::exception& error) {
+        LOG_ERROR("partition: net_id={} state move failed: {}", net_id, error.what());
+        try {
+            if (is_player) {
+                source_zone.InsertPlayerBinding(net_id, std::move(moved_binding));
+            } else if (moved_rng) {
+                source_zone.InsertMobRng(net_id, std::move(*moved_rng));
+            }
+        } catch (...) {
+            // Source restore is best-effort; the entity itself was never
+            // released, so authority never forked.
+        }
+        return false; // guard rolls back the destination
+    } catch (...) {
+        LOG_ERROR("partition: net_id={} state move failed (unknown)", net_id);
+        return false;
+    }
+
+    // ---- COMMIT POINT (§10): release the source. From here the destination
+    // is the single authority. Unobservable before this line: both write
+    // guards held, no tick in flight, staged zones unscheduled/unrouted. ----
+    source_zone.Grid().Remove(net_id, transfer.position);
+    entity.destruct();
+    source_zone.UnindexEntity(net_id);
+    source_zone.EraseMobRng(net_id);
+    rollback.commit();
+    // Load field attribution: split/merge internal transfers are real
+    // ownership work; counted at the destination like a migration.
+    target_zone.LoadBins().NoteMigration(transfer.position.x, transfer.position.y);
+    if (!is_player) {
+        // LOD state rode along in the transfer payload.
+        target_zone.NoteLodInsert(transfer.sim_lod.tier);
+    }
+
+    // Routing follows authority (post-commit; allocation failure here is
+    // fatal-class and cannot fork authority).
+    if (is_player && session_id != 0) {
+        OwnerInfo owner;
+        owner.entity = transfer.entity_id;
+        owner.location = target_location;
+        owner.zone_index = target_zone_index;
+        owner.net_id = net_id;
+        owners_by_session_[session_id] = owner;
+    }
+    return true;
+}
+
+void WorldRuntime::ConfigurePartition(const PartitionConfig& config)
+{
+    const auto validated = ValidatePartitionConfig(config);
+    for (const auto& warning : validated.warnings) {
+        LOG_WARN("{}", warning);
+    }
+    const PartitionConfig& e = validated.effective;
+
+    ZoneLoadMonitor::Config monitor;
+    monitor.split_load_threshold = e.split_load_threshold;
+    monitor.merge_load_threshold = e.merge_load_threshold;
+    monitor.sustained_window = std::chrono::seconds(e.sustained_window_seconds);
+    monitor.split_cooldown = std::chrono::seconds(e.split_cooldown_seconds);
+    monitor.merge_cooldown = std::chrono::seconds(e.merge_cooldown_seconds);
+    monitor.tick_budget_ms = e.tick_budget_ms;
+    monitor.resident_budget = e.resident_budget;
+    monitor.field_timescale = e.scoring.decision_timescale;
+    load_monitor_.Reconfigure(monitor); // call pre-Start or idle
+
+    // Adaptive scoring config: the scorer is read-only, the monitor's field
+    // overload signal uses the same timescale so observe and score agree.
+    // The geometric floor mirrors the effective (validated) partition floor.
+    PartitionScoringConfig scoring = e.scoring;
+    scoring.min_zone_size_m = e.min_zone_size_m;
+    scoring.split_load_threshold = e.split_load_threshold; // post-merge ceiling mirror
+    scorer_.SetConfig(scoring);
+
+    scheduler_.config.split_load_threshold = e.split_load_threshold;
+    scheduler_.config.merge_load_threshold = e.merge_load_threshold;
+    scheduler_.config.sustained_window = std::chrono::seconds(e.sustained_window_seconds);
+    scheduler_.config.split_cooldown = std::chrono::seconds(e.split_cooldown_seconds);
+    scheduler_.config.merge_cooldown = std::chrono::seconds(e.merge_cooldown_seconds);
+    scheduler_.config.max_depth = static_cast<std::uint8_t>(e.max_partition_depth);
+    // Phase-3 stability: directional cooldowns, group sustained-low window and
+    // the measured emergency bypass seam.
+    scheduler_.config.split_to_merge_cooldown =
+        std::chrono::seconds(static_cast<int>(e.scoring.split_to_merge_cooldown_s));
+    scheduler_.config.merge_to_split_cooldown =
+        std::chrono::seconds(static_cast<int>(e.scoring.merge_to_split_cooldown_s));
+    scheduler_.config.merge_sustained_low =
+        std::chrono::seconds(static_cast<int>(e.scoring.merge_sustained_low_s));
+    scheduler_.config.emergency_split_bypass = e.scoring.emergency_split_bypass;
+    scheduler_.config.emergency_p99_multiplier = e.scoring.emergency_p99_multiplier;
+    scheduler_.config.tick_budget_ms = e.tick_budget_ms;
+
+    zones_.ApplyRegionLimits(e.max_partition_depth, e.min_zone_size_m);
+    effective_partition_config_ = e;
+
+    LOG_INFO("partition config effective: split>{:.2f} merge<{:.2f} sustained={}s cooldowns={}s/"
+             "{}s tick_budget={:.1f}ms residents={:.0f} depth<={} minsize={:.0f}m",
+             e.split_load_threshold,
+             e.merge_load_threshold,
+             e.sustained_window_seconds,
+             e.split_cooldown_seconds,
+             e.merge_cooldown_seconds,
+             e.tick_budget_ms,
+             e.resident_budget,
+             e.max_partition_depth,
+             e.min_zone_size_m);
+    const auto& s = e.scoring;
+    LOG_INFO("partition scoring effective: adaptive={} min_improvement={:.2f} band={:.0f}m "
+             "hotspot>={:.2f}x{} weights=[bal={:.2f} bnd={:.2f} mig={:.2f} rep={:.2f} inst={:.2f} "
+             "topo={:.2f}] budgets=[act={:.0f} mig={:.1f} rep={:.1f} cbt={:.1f} work={:.0f}] "
+             "timescale={} log={} why_not_interval={:.0f}s",
+             s.adaptive_enabled ? "on" : "off",
+             s.min_expected_improvement,
+             s.boundary_band_m,
+             s.hotspot_threshold,
+             s.hotspot_max_count,
+             s.weight_balance,
+             s.weight_boundary,
+             s.weight_migration,
+             s.weight_replication,
+             s.weight_instability,
+             s.topology_penalty,
+             s.activity_band_budget,
+             s.migration_band_budget,
+             s.replication_band_budget,
+             s.combat_band_budget,
+             s.migration_work_budget,
+             LoadTimescaleName(s.decision_timescale),
+             s.decision_log_enabled ? "on" : "off",
+             s.why_not_log_seconds);
+    LOG_INFO("partition stability effective: merge_sustained_low={:.0f}s split_to_merge={:.0f}s "
+             "merge_to_split={:.0f}s safety_margin={:.2f} min_merge_improvement={:.2f} "
+             "merge_weights=[topo={:.2f} bnd={:.2f} mig={:.2f} rep={:.2f} risk={:.2f} exec={:.2f} "
+             "inst={:.2f}] topology_benefit={:.2f} emergency=[bypass={} p99x{:.1f}] "
+             "oscillation_window={:.0f}s",
+             s.merge_sustained_low_s,
+             s.split_to_merge_cooldown_s,
+             s.merge_to_split_cooldown_s,
+             s.post_merge_safety_margin,
+             s.min_merge_improvement,
+             s.weight_merge_topology,
+             s.weight_merge_boundary,
+             s.weight_merge_migration,
+             s.weight_merge_replication,
+             s.weight_merge_risk,
+             s.weight_merge_execution,
+             s.weight_merge_instability,
+             s.merge_topology_benefit,
+             s.emergency_split_bypass ? "on" : "off",
+             s.emergency_p99_multiplier,
+             s.oscillation_window_s);
+}
+
+void WorldRuntime::ConfigureSimulationLod(const LodConfig& config)
+{
+    const auto validated = ValidateLodConfig(config);
+    for (const auto& warning : validated.warnings) {
+        LOG_WARN("{}", warning);
+    }
+    effective_lod_config_ = validated.effective;
+    scheduler_.SetLodEnabled(validated.effective.enabled);
+    const LodConfig& e = validated.effective;
+    LOG_INFO("simulation lod effective: enabled={} bubbles=[{:.0f}/{:.0f}/{:.0f}]m hz=[20/{:.1f}/{:.1f}] "
+             "demote=[{:.0f}/{:.0f}/{:.0f}]s",
+             e.enabled,
+             e.full_radius_m,
+             e.reduced_radius_m,
+             e.low_radius_m,
+             e.reduced_hz,
+             e.low_hz,
+             e.demote_full_sec,
+             e.demote_reduced_sec,
+             e.demote_low_sec);
+}
+
+void WorldRuntime::ConfigureReplication(const ReplicationConfig& config)
+{
+    ReplicationConfig effective = config;
+    if (ValidateReplicationConfig(effective)) {
+        LOG_WARN("replication config corrected: refresh_ticks clamped to {}",
+                 effective.refresh_ticks);
+    }
+    effective_replication_config_ = effective;
+    LOG_INFO("replication effective: dirty={} aoi_partial_cap={} refresh_ticks={}",
+             effective.dirty_enabled,
+             effective.aoi_partial_cap,
+             effective.refresh_ticks);
+}
+
+void WorldRuntime::ConfigureLoadField(const LoadFieldConfig& config)
+{
+    // World geometry is runtime-owned: operator config never moves the world.
+    LoadFieldConfig requested = config;
+    requested.bounds = terrain_.Bounds();
+    const auto validated = ValidateLoadFieldConfig(requested);
+    for (const auto& warning : validated.warnings) {
+        LOG_WARN("{}", warning);
+    }
+    effective_load_field_config_ = validated.effective;
+    load_field_.Reconfigure(validated.effective);
+    // Rebinds every zone's local load-bin rectangle to the effective grid. A
+    // disabled field disables the bins too, so the hot path costs exactly
+    // nothing (CellFor returns nullptr before any index math).
+    // Documented precondition: pre-Start or idle (never with a tick in flight).
+    LoadFieldMapping mapping = LoadFieldMapping::FromConfig(validated.effective);
+    mapping.valid = validated.effective.enabled;
+    zones_.ApplyLoadFieldMapping(mapping);
+    last_load_field_build_ = std::chrono::steady_clock::now();
+    const auto& e = validated.effective;
+    LOG_INFO("load field effective: enabled={} cell={:.0f}m hz={:.2f} l1={}x{} "
+             "budgets/s=[sim={:.0f} repl={:.0f} aoi={:.0f} combat={:.0f} mig={:.0f}] "
+             "weights=[{:.2f}/{:.2f}/{:.2f}/{:.2f}/{:.2f}] taus=[{:.1f}/{:.1f}/{:.1f}/{:.1f}]",
+             e.enabled,
+             e.cell_size_m,
+             e.aggregation_hz,
+             e.l1_enabled ? e.l1_ratio : 0,
+             e.l1_enabled ? e.l1_ratio : 0,
+             e.simulation_budget,
+             e.replication_budget,
+             e.aoi_budget,
+             e.combat_budget,
+             e.migration_budget,
+             e.weight_simulation,
+             e.weight_replication,
+             e.weight_aoi,
+             e.weight_combat,
+             e.weight_migration,
+             e.fast_rise_tau_s,
+             e.fast_fall_tau_s,
+             e.slow_rise_tau_s,
+             e.slow_fall_tau_s);
+}
+
+void WorldRuntime::RequestGhostValidation()
+{
+    ghost_validation_requested_.store(true, std::memory_order_relaxed);
+}
+
+bool WorldRuntime::TryTakeGhostValidationResult(std::string& out_result)
+{
+    std::lock_guard lock(ghost_validation_mutex_);
+    if (!ghost_validation_ready_) {
+        return false;
+    }
+    out_result = std::move(ghost_validation_result_);
+    ghost_validation_result_.clear();
+    ghost_validation_ready_ = false;
+    return true;
+}
+
+void WorldRuntime::RequestReplicationValidation()
+{
+    replication_validation_requested_.store(true, std::memory_order_relaxed);
+}
+
+bool WorldRuntime::TryTakeReplicationValidationResult(std::string& out_result)
+{
+    std::lock_guard lock(replication_validation_mutex_);
+    if (!replication_validation_ready_) {
+        return false;
+    }
+    out_result = std::move(replication_validation_result_);
+    replication_validation_result_.clear();
+    replication_validation_ready_ = false;
+    return true;
+}
+
+void WorldRuntime::RepairGhosts()
+{
+    // Fallback path (never the production tick): rebuild every simulating
+    // leaf's ghost state exactly from the current publish buffers and force
+    // the next border publish to refill from authority.
+    for (std::size_t i = 0; i < zones_.ZoneCount(); ++i) {
+        Zone& zone = zones_.GetZone(i);
+        if (!zone.SimulationEnabled() || zone.Partition() != PartitionState::Leaf) {
+            continue;
+        }
+        ZoneWriteGuard guard(zone, "ghost repair");
+        if (zone.Players().empty()) {
+            GhostSystem::Clear(zone);
+        } else {
+            GhostSystem::RebuildExact(zone, zones_);
+        }
+        zone.RequestForcePublish();
+    }
+    ghost_repairs_.fetch_add(1, std::memory_order_relaxed);
+    LOG_WARN("ghost repair: exact rebuild applied to all simulating leaves");
+}
+
+void WorldRuntime::RequestLoadFieldValidation()
+{
+    load_field_validation_requested_.store(true, std::memory_order_relaxed);
+}
+
+bool WorldRuntime::TryTakeLoadFieldValidationResult(std::string& out_result)
+{
+    std::lock_guard lock(load_field_validation_mutex_);
+    if (!load_field_validation_ready_) {
+        return false;
+    }
+    out_result = std::move(load_field_validation_result_);
+    load_field_validation_result_.clear();
+    load_field_validation_ready_ = false;
+    return true;
+}
+
+void WorldRuntime::PostForceSplit(ZoneId zone_id)
+{
+    Enqueue([this, zone_id] {
+        ExecuteForcedSplit(zone_id);
+    });
+}
+
+void WorldRuntime::PostForceMerge(ZoneId parent_node_id)
+{
+    Enqueue([this, parent_node_id] {
+        ExecuteForcedMerge(parent_node_id);
+    });
+}
+
+void WorldRuntime::InjectTransferFailuresForTest(int snapshot_failures, int apply_failures,
+                                                  int succeed_first)
+{
+    test_fail_snapshot_count_.store(snapshot_failures < 0 ? 0 : snapshot_failures,
+                                    std::memory_order_relaxed);
+    test_fail_apply_count_.store(apply_failures < 0 ? 0 : apply_failures,
+                                 std::memory_order_relaxed);
+    test_fail_after_count_.store(succeed_first < 0 ? 0 : succeed_first,
+                                 std::memory_order_relaxed);
+}
+
+void WorldRuntime::DrainGlobalCommands()
+{
+    // Only the commands present at entry run in this pass. A command that
+    // re-queues itself (forced split/merge deferring on a tick in flight or
+    // on pending zone commands) therefore retries on the NEXT pass instead of
+    // spinning here forever -- the condition it waits for can only clear once
+    // the loop gets past this point and schedules the zones.
+    std::queue<std::function<void()>> batch;
+    {
+        std::lock_guard lock(mutex_);
+        batch.swap(commands_);
+    }
+    while (!batch.empty()) {
+        auto command = std::move(batch.front());
+        batch.pop();
+        // A failing global command must not kill the supervisor loop.
+        try {
+            command();
+        } catch (const std::exception& error) {
+            LOG_ERROR("Game sim global command failed: {}", error.what());
+        } catch (...) {
+            LOG_ERROR("Game sim global command failed with unknown exception");
+        }
+    }
+}
+
+} // namespace gs::game

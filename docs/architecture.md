@@ -106,8 +106,8 @@ A Metin2 naiv megoldása O(n²)-es volt (minden entitás minden közelit követe
 
 - **Border band (határsáv) szélessége = lokális AOI-sugár** az adott határszakaszon. NEM globálisan a max AOI-ra fixálva — sűrű határszakaszon keskenyebb (~150 m), ritkán szélesebb (~350 m). Így a ghost-költség önszabályozó: a sáv ott széles, ahol kevés entitás van (olcsó), és ott keskeny, ahol sok (sűrű).
 - **Mechanizmus:** minden zóna a tick végén publikálja a határsávja entitás-snapshotját (csak a megjelenítéshez kellő állapot: pozíció, irány, megjelenítési állapot — nincs AI, nincs fizika). A szomszéd ezt ghostként materializálja a saját worldjében.
-- **A ghost read-only, nem szimulálódik, és minden tickben újraépül** a szomszéd legutóbb publikált bufferéből. A ghost soha nem migrál — csak a resident autoritatív entitás migrál.
-- **Double-buffer, lock-mentes:** írás `buffer[tick%2]`-be, olvasás `buffer[(tick+1)%2]`-ből.
+- **A ghost read-only, nem szimulálódik**, és a szomszéd legutóbb publikált bufferéből tartódik karban — inkrementálisan (Phase 5A): változatlan ghost megmarad, csak a tagság-változás ad/töröl; a nem változott szomszéd (azonos publish-generáció) kimarad. A ghost soha nem migrál — csak a resident autoritatív entitás migrál.
+- **Publish-buffer, mutexszel + generációval** (a megvalósult forma): zónánként egy publish-buffer, amit a saját tickje ír, a szomszédok a publish-mutex alatt másolnak; a publish-generáció jelzi a változást. (Az eredeti terv lock-mentes `buffer[tick%2]` double-buffer volt; a mért költség mellett az egyszerűbb, bizonyítottan helyes mutexes forma maradt.)
 - **Transzport-absztrakció:** a határcsere interfésze „publikálj snapshotot / olvass szomszéd-snapshotot" legyen. Implementáció most: közös memóriába írt double-buffer. Scale-out esetén csak a transzport cserélődik (memória → hálózat/IPC), a zónalogika változatlan.
 
 ---
