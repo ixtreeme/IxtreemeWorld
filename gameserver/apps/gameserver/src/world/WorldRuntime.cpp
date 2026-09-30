@@ -97,6 +97,9 @@ WorldRuntime::WorldRuntime(boost::asio::io_context& io,
                            const TerrainStreamingConfig& streaming)
     : WorldRuntime(io, identity, ConstructMembersOnly{})
 {
+    if (world.layered_world && !world.layered_world->volumes.empty()) {
+        layered_metadata_ = std::make_unique<const mx::map::LayeredWorld>(std::move(*world.layered_world));
+    }
     std::optional<StreamingSetup> setup;
     if (world.residency == mx::map::ResidencyMode::Streaming) {
         setup = StreamingSetup{std::move(world.chunk_source), std::move(world.startup_chunks), streaming};
@@ -109,6 +112,27 @@ WorldRuntime::WorldRuntime(boost::asio::io_context& io,
                     std::move(world.spawn_points),
                     layout,
                     std::move(setup));
+}
+
+const mx::map::LayerVolume* WorldRuntime::FindLayerVolume(float x, float y, float z) const noexcept
+{
+    if (!layered_metadata_ || !std::isfinite(x) || !std::isfinite(y) || !std::isfinite(z)) {
+        return nullptr;
+    }
+    const mx::map::LayerVolume* result = nullptr;
+    for (const auto& volume : layered_metadata_->volumes) {
+        if (!volume.Contains(x, y, z)) {
+            continue;
+        }
+        // Validated packages cannot be ambiguous. Preserve the shared
+        // contract's fail-closed behaviour if an unchecked LoadedWorld is
+        // supplied by a caller rather than the package loader.
+        if (result != nullptr) {
+            return nullptr;
+        }
+        result = &volume;
+    }
+    return result;
 }
 
 WorldRuntime::WorldRuntime(boost::asio::io_context& io,

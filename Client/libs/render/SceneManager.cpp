@@ -17,6 +17,7 @@
 #include <cmath>
 #include <fstream>
 #include <iomanip>
+#include <limits>
 #include <map>
 #include <optional>
 #include <sstream>
@@ -1211,6 +1212,14 @@ void WriteSceneEntity(std::ostream& out, const MeshSceneEntity& mesh, bool comma
     out << "      \"mesh_asset_id\": \"" << EscapeJson(mesh.meshAssetId) << "\",\n";
     out << "      \"mesh_asset_path\": \"" << EscapeJson(mesh.meshAssetPath) << "\",\n";
     out << "      \"skinned\": " << (mesh.skinned ? "true" : "false");
+    if (mesh.layerAuthoring.enabled || mesh.layerAuthoring.tags != 0)
+    {
+        out << ",\n";
+        out << "      \"layer_authoring\": {\n";
+        out << "        \"enabled\": " << (mesh.layerAuthoring.enabled ? "true" : "false") << ",\n";
+        out << "        \"tags\": " << mesh.layerAuthoring.tags << "\n";
+        out << "      }";
+    }
     if (!mesh.materialSlots.empty())
     {
         out << ",\n";
@@ -1629,6 +1638,27 @@ MeshSceneEntity ReadMeshSceneEntity(const JsonValue& entity)
     mesh.meshAssetId = ReadString(entity, "mesh_asset_id");
     mesh.meshAssetPath = ReadString(entity, "mesh_asset_path");
     mesh.skinned = ReadBool(entity, "skinned", mesh.skinned);
+    if (const JsonValue* authoring = Find(entity, "layer_authoring");
+        authoring && authoring->type == JsonValue::Type::Object)
+    {
+        mesh.layerAuthoring.enabled = ReadBool(*authoring, "enabled", false);
+        if (const JsonValue* tags = Find(*authoring, "tags"))
+        {
+            const double value = tags->number;
+            if (tags->type == JsonValue::Type::Number && std::isfinite(value) &&
+                value >= 0.0 && value <= std::numeric_limits<std::uint32_t>::max() &&
+                value == std::floor(value))
+            {
+                mesh.layerAuthoring.tags = static_cast<std::uint32_t>(value);
+            }
+            else
+            {
+                // Retain an invalid mask for the strict authoring validator;
+                // malformed metadata must not silently become a ground floor.
+                mesh.layerAuthoring.tags = std::numeric_limits<std::uint32_t>::max();
+            }
+        }
+    }
     if (const JsonValue* materials = Find(entity, "materials"); materials && materials->type == JsonValue::Type::Array)
     {
         for (const JsonValue& value : materials->array)

@@ -11,6 +11,7 @@
 #include "MaterialAssetManager.h"
 #include "ProjectManager.h"
 #include "SceneManager.h"
+#include "map/LayeredWorld.h"
 #include "math/IXMath.h"
 #include "platform/trash.h"
 #include "tools/tree/TreeTexturePalette.h"
@@ -1120,6 +1121,7 @@ MapEditorCommands EditorImGui::ConsumeCommands()
         commands.renderResolutionWidth = renderResolutionWidth;
         commands.renderResolutionHeight = renderResolutionHeight;
     }
+    commands.showLayerVolumes = m_showLayerVolumes;
     return commands;
 }
 

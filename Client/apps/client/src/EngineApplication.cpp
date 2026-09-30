@@ -39,6 +39,7 @@
 #include "RuntimeSession.h"
 #include "RuntimeUiAdapter.h"
 #include "SceneManager.h"
+#include "SceneLayerAuthoring.h"
 #include "SelectionSystem.h"
 #include "SelectionOutlineRenderer.h"
 #include "SpatialIndex.h"
@@ -526,6 +527,7 @@ MeshRendererEditorState BuildMeshRendererEditorState(const std::vector<MeshScene
     std::copy(std::begin(it->rotation), std::end(it->rotation), std::begin(state.rotation));
     std::copy(std::begin(it->scale), std::end(it->scale), std::begin(state.scale));
     state.skinned = it->skinned;
+    state.layerAuthoring = it->layerAuthoring;
     state.materialSlots = it->materialSlots;
     state.materialOverrides = it->materialOverrides;
     state.editorComponents = it->editorComponents;
@@ -567,6 +569,7 @@ void ApplyMeshRendererEditorState(MeshSceneEntity& mesh, const MeshRendererEdito
     std::copy(std::begin(state.rotation), std::end(state.rotation), std::begin(mesh.rotation));
     std::copy(std::begin(state.scale), std::end(state.scale), std::begin(mesh.scale));
     mesh.skinned = state.skinned;
+    mesh.layerAuthoring = state.layerAuthoring;
     mesh.materialSlots = state.materialSlots;
     mesh.materialOverrides = state.materialOverrides;
     mesh.editorComponents = state.editorComponents;
@@ -1600,6 +1603,9 @@ std::vector<SelectionOutlineRenderer::Line> BuildPhysicsDebugLines(const std::ve
 
 void MergeMapEditorCommands(MapEditorCommands& target, const MapEditorCommands& source)
 {
+    target.generateLayers = target.generateLayers || source.generateLayers;
+    target.exportLayers = target.exportLayers || source.exportLayers;
+    target.showLayerVolumes = source.showLayerVolumes;
     target.save = target.save || source.save;
     target.reload = target.reload || source.reload;
     target.undo = target.undo || source.undo;
@@ -4744,6 +4750,8 @@ int RunGame(NativeWindow& window,
     bool debugDisableAssetWatcherPoll = false;
     bool debugDisableHierarchyIteration = false;
     bool debugShowPhysicsColliders = false;
+    bool showLayerVolumes = false;
+    SceneLayerAuthoringResult layerAuthoringPreview;
     bool debugShowPhysicsContacts = false;
     bool debugShowPhysicsBodyCenters = false;
     bool dumpFrameProfileRequested = false;
@@ -5381,7 +5389,11 @@ int RunGame(NativeWindow& window,
                 terrain.SetMapEditorSettings(editorSettings);
                 SceneData pendingScene;
                 if (SceneManager::Instance().ConsumePendingScene(pendingScene))
+                {
                     sceneRuntime.ApplySceneData(pendingScene);
+                    layerAuthoringPreview = {};
+                    editorImGui.SetLayerAuthoringStatus("Scene changed: generate layers from collision.");
+                }
                 MapEditorCommands commands = runtimeSession->ConsumeMapEditorCommands();
                 MergeMapEditorCommands(commands, editorImGui.ConsumeCommands());
                 // Native C++ auto-build-on-save: a changed Scripts/*.cpp raises the SAME build the manual
@@ -9278,6 +9290,68 @@ int RunGame(NativeWindow& window,
                     SceneManager::Instance().MarkDirty();
                 }
 
+                showLayerVolumes = commands.showLayerVolumes;
+                if (commands.generateLayers || commands.exportLayers)
+                {
+                    // Bake only on explicit authoring actions, using the latest
+                    // scene state and the collision triangles used by physics.
+                    const auto sourceScene = sceneRuntime.BuildSceneSnapshot();
+                    const auto bakeBegin = std::chrono::steady_clock::now();
+                    const bool generated = GenerateSceneLayers(sourceScene,
+                        [&](const MeshSceneEntity& mesh,
+                            std::vector<std::array<float, 3>>& vertices,
+                            std::vector<std::uint32_t>& indices) {
+                            auto* renderer = getStaticMeshRenderer(resolveMeshRuntimePath(mesh));
+                            return renderer && renderer->CopyPhysicsMesh(vertices, indices);
+                        }, layerAuthoringPreview);
+                    const double bakeMs = MillisecondsBetween(bakeBegin, std::chrono::steady_clock::now());
+                    Tracenf("[LAYER-AUTHORING] generated=%s sources=%zu triangles=%zu volumes=%zu elapsed_ms=%.3f",
+                        generated ? "yes" : "no", layerAuthoringPreview.geometry.meshes_seen,
+                        layerAuthoringPreview.geometry.triangles_seen, layerAuthoringPreview.world.volumes.size(), bakeMs);
+                    std::string status;
+                    if (!generated)
+                    {
+                        status = "Layer generation failed";
+                        for (const auto& error : layerAuthoringPreview.errors)
+                        {
+                            status += "\n" + error;
+                            Tracenf("[LAYER-AUTHORING] %s", error.c_str());
+                        }
+                    }
+                    else
+                    {
+                        status = "Generated " + std::to_string(layerAuthoringPreview.world.volumes.size()) +
+                            " volumes from collision. Snapshot: regenerate after edits.";
+                        status += "\nPreview draws up to 256 volumes. Terrain retains its heightfield.";
+                        for (std::size_t i = 0; i < std::min<std::size_t>(8, layerAuthoringPreview.world.volumes.size()); ++i)
+                        {
+                            const auto& volume = layerAuthoringPreview.world.volumes[i];
+                            status += "\n#" + std::to_string(volume.id) + " " + mx::map::ToString(volume.kind) +
+                                " height [" + std::to_string(volume.min_z) + ", " + std::to_string(volume.max_z) + ") m";
+                        }
+                        if (commands.exportLayers)
+                        {
+                            const std::filesystem::path scenePath(SceneManager::Instance().GetCurrentScenePath());
+                            if (scenePath.empty())
+                                status += "\nSave the scene before exporting layer metadata.";
+                            else
+                            {
+                                const auto suffix = std::chrono::system_clock::now().time_since_epoch().count();
+                                auto layerDirectory = scenePath.stem();
+                                layerDirectory += ".layers";
+                                const auto exportPath = scenePath.parent_path() / layerDirectory /
+                                    ("export-" + std::to_string(suffix)) / "layered_world.mx3d";
+                                std::string error;
+                                if (ExportSceneLayerSidecar(exportPath, layerAuthoringPreview, error))
+                                    status += "\nExported: " + exportPath.string();
+                                else
+                                    status += "\nExport failed: " + error;
+                            }
+                        }
+                    }
+                    editorImGui.SetLayerAuthoringStatus(status);
+                    runtimeSession->SetEditorStatus(status);
+                }
                 logStaticMeshSpatialMutations();
 
                 auto floatDiffers = [](float a, float b, float epsilon = 0.0005f) {
@@ -10840,6 +10914,32 @@ int RunGame(NativeWindow& window,
                         selectedObjectLines.end());
                     std::vector<SelectionOutlineRenderer::Line> selectedColliderLines =
                         BuildPhysicsColliderLines(selectedEditorObject, editorMeshEntities, debugShowPhysicsColliders);
+                    if (showLayerVolumes)
+                    {
+                        // Existing line renderer; no renderer or backend change.
+                        constexpr std::array<std::array<unsigned, 2>, 12> edges{{
+                            {{0,1}}, {{0,2}}, {{1,3}}, {{2,3}},
+                            {{4,5}}, {{4,6}}, {{5,7}}, {{6,7}},
+                            {{0,4}}, {{1,5}}, {{2,6}}, {{3,7}}}};
+                        for (std::size_t i = 0; i < std::min<std::size_t>(256, layerAuthoringPreview.world.volumes.size()); ++i)
+                        {
+                            const auto& volume = layerAuthoringPreview.world.volumes[i];
+                            const std::array<WorldVec3, 8> corners{{
+                                {volume.bounds.min_x, volume.min_z, volume.bounds.min_y},
+                                {volume.bounds.max_x, volume.min_z, volume.bounds.min_y},
+                                {volume.bounds.min_x, volume.min_z, volume.bounds.max_y},
+                                {volume.bounds.max_x, volume.min_z, volume.bounds.max_y},
+                                {volume.bounds.min_x, volume.max_z, volume.bounds.min_y},
+                                {volume.bounds.max_x, volume.max_z, volume.bounds.min_y},
+                                {volume.bounds.min_x, volume.max_z, volume.bounds.max_y},
+                                {volume.bounds.max_x, volume.max_z, volume.bounds.max_y}}};
+                            const float hue = static_cast<float>(i % 3);
+                            const std::array<float, 4> color{hue == 0 ? 0.9f : 0.25f,
+                                hue == 1 ? 0.9f : 0.4f, hue == 2 ? 0.9f : 0.45f, 0.85f};
+                            for (const auto& edge : edges)
+                                selectedColliderLines.push_back({corners[edge[0]], corners[edge[1]], color});
+                        }
+                    }
                     selectionLines.insert(selectionLines.end(),
                         selectedColliderLines.begin(),
                         selectedColliderLines.end());

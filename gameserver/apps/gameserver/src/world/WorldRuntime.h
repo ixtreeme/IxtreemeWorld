@@ -210,6 +210,17 @@ public:
     {
         return terrain_;
     }
+    // Validated package geometry metadata, immutable for this runtime's
+    // lifetime. This does not admit layered actors or change movement/AOI.
+    // Absent/empty sidecars and synthetic worlds retain legacy behaviour.
+    const mx::map::LayeredWorld* LayeredMetadata() const noexcept
+    {
+        return layered_metadata_.get();
+    }
+    // Half-open point lookup against the validated metadata. The returned
+    // volume remains valid until this WorldRuntime is destroyed. Uncovered
+    // or non-finite points have no volume; no implicit layer is fabricated.
+    const mx::map::LayerVolume* FindLayerVolume(float x, float y, float z) const noexcept;
     const OwnerMap& Owners() const noexcept
     {
         return owners_by_session_;
@@ -725,6 +736,7 @@ private:
     MigrationTransport migration_transport_;
 
     TerrainService terrain_;
+    std::unique_ptr<const mx::map::LayeredWorld> layered_metadata_;
     // MAP-3: chunk streaming (null for eager / flat terrain). Declared after
     // terrain_: it mutates terrain_'s published slots and is destroyed first.
     std::unique_ptr<TerrainStreamer> streamer_;

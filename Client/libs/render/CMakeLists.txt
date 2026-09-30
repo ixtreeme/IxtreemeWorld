@@ -23,6 +23,8 @@ add_library(IXEngineRender STATIC
     RuntimeUiAdapter.h
     SceneManager.cpp
     SceneManager.h
+    SceneLayerAuthoring.cpp
+    SceneLayerAuthoring.h
     SelectionOutlineRenderer.cpp
     SelectionOutlineRenderer.h
     SpatialIndex.cpp
@@ -126,3 +128,14 @@ elseif(ANDROID)
 endif()
 
 target_compile_features(IXEngineRender PUBLIC cxx_std_20)
+
+if(BUILD_TESTING AND NOT ANDROID)
+    add_executable(SceneLayerAuthoringTest tests/SceneLayerAuthoringTest.cpp)
+    target_link_libraries(SceneLayerAuthoringTest PRIVATE IXEngineRender)
+    target_compile_features(SceneLayerAuthoringTest PRIVATE cxx_std_20)
+    if(MSVC)
+        set_target_properties(SceneLayerAuthoringTest PROPERTIES
+            MSVC_RUNTIME_LIBRARY "MultiThreaded$<$<CONFIG:Debug>:Debug>")
+    endif()
+    add_test(NAME SceneLayerAuthoringTest COMMAND SceneLayerAuthoringTest)
+endif()

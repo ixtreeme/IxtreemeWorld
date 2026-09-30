@@ -133,6 +133,20 @@ void EditorImGui::RenderMenuBar()
     }
     if (ImGui::BeginMenu("Tools"))
     {
+        if (ImGui::BeginMenu("Layered world"))
+        {
+            if (ImGui::MenuItem("Generate layers from collision", nullptr, false, CanUseEditorTools()))
+                m_commands.generateLayers = true;
+            if (ImGui::MenuItem("Export layer metadata", nullptr, false, CanUseEditorTools()))
+                m_commands.exportLayers = true;
+            ImGui::MenuItem("Show layer volumes", nullptr, &m_showLayerVolumes);
+            if (!m_layerAuthoringStatus.empty())
+            {
+                ImGui::Separator();
+                ImGui::TextWrapped("%s", m_layerAuthoringStatus.c_str());
+            }
+            ImGui::EndMenu();
+        }
         if (ImGui::MenuItem("Tree Generator..."))
         {
             if (!m_treeGeneratorPanel)

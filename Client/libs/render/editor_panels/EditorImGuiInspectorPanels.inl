@@ -1520,6 +1520,47 @@ void EditorImGui::RenderSelectedMeshRendererInspector()
     if (RenderSelectedMeshPhysicsComponents())
         MarkSelectedMeshRendererChanged();
 
+    if (ImGui::CollapsingHeader(ICON_FA_LAYER_GROUP " Layer generation", ImGuiTreeNodeFlags_DefaultOpen))
+    {
+        bool changed = ImGui::Checkbox("Include collision surfaces", &m_meshRendererState.layerAuthoring.enabled);
+        ImGui::TextDisabled("Bounds and floor heights are derived from collision geometry.");
+        ImGui::BeginDisabled(!m_meshRendererState.layerAuthoring.enabled);
+        struct TagOption { const char* name; mx::map::VolumeTag tag; };
+        constexpr TagOption tagOptions[] = {
+            {"Ground", mx::map::VolumeTagGround},
+            {"Building", mx::map::VolumeTagBuilding},
+            {"Bridge", mx::map::VolumeTagBridge},
+            {"Water", mx::map::VolumeTagWater},
+            {"Underwater", mx::map::VolumeTagUnderwater},
+            {"Dungeon", mx::map::VolumeTagDungeon},
+            {"Interior", mx::map::VolumeTagInterior},
+            {"Connector", mx::map::VolumeTagConnector},
+            {"Road", mx::map::VolumeTagRoad},
+            {"Stairs", mx::map::VolumeTagStairs},
+            {"Lift", mx::map::VolumeTagLift},
+            {"Dock", mx::map::VolumeTagDock},
+        };
+        for (const TagOption& option : tagOptions)
+        {
+            bool selected = mx::map::HasVolumeTag(m_meshRendererState.layerAuthoring.tags, option.tag);
+            if (ImGui::Checkbox(option.name, &selected))
+            {
+                if (selected)
+                    m_meshRendererState.layerAuthoring.tags |= option.tag;
+                else
+                    m_meshRendererState.layerAuthoring.tags &= ~static_cast<std::uint32_t>(option.tag);
+                changed = true;
+            }
+        }
+        ImGui::EndDisabled();
+        if (!m_meshRendererState.hasCollider || !m_meshRendererState.collider.enabled)
+            ImGui::TextDisabled("An enabled static collider is required for export.");
+        if ((m_meshRendererState.layerAuthoring.tags & ~mx::map::kKnownVolumeTags) != 0)
+            ImGui::TextUnformatted("Invalid layer tags: generation will reject this source.");
+        if (changed)
+            MarkSelectedMeshRendererChanged();
+    }
+
     if (ImGui::CollapsingHeader(ICON_FA_LAYER_GROUP " Material Slots", ImGuiTreeNodeFlags_DefaultOpen))
     {
         m_meshRendererState.materialSlotCount = std::max<std::uint32_t>(

@@ -98,6 +98,10 @@ bool GenerateLayeredWorld(const std::vector<LayerSourceSurface>& surfaces,
     output = LayeredWorld{};
     report = LayerGenerationReport{};
     report.surfaces_seen = surfaces.size();
+    if (options.require_exact_footprints && surfaces.size() > kMaxLayeredWorldVolumes) {
+        report.errors.push_back("source surface count exceeds the bounded layer limit");
+        return false;
+    }
     std::unordered_set<std::uint32_t> ids;
     if (!std::isfinite(options.merge_xy_gap) || options.merge_xy_gap < 0.0f ||
         !std::isfinite(options.merge_z_gap) || options.merge_z_gap < 0.0f) {
@@ -142,7 +146,7 @@ bool GenerateLayeredWorld(const std::vector<LayerSourceSurface>& surfaces,
         rhs = find(rhs);
         if (lhs != rhs) parent[rhs] = lhs;
     };
-    for (std::size_t i = 0; i < surfaces.size(); ++i) {
+    for (std::size_t i = 0; !options.require_exact_footprints && i < surfaces.size(); ++i) {
         for (std::size_t j = i + 1; j < surfaces.size(); ++j) {
             if (Family(surfaces[i].tags) != Family(surfaces[j].tags)) continue;
             if (!NearOrOverlap(surfaces[i].bounds.min_x, surfaces[i].bounds.max_x,
@@ -199,6 +203,10 @@ bool GenerateLayeredWorld(const std::vector<LayerSourceSurface>& surfaces,
         volume.id = static_cast<VolumeId>(i + 1);
         volume.layer_id = static_cast<LayerId>(i + 1);
         volume.name = "generated_" + std::to_string(volume.id);
+        if (options.require_exact_footprints && components[i].members.size() == 1 &&
+            !surfaces[components[i].members[0]].name.empty()) {
+            volume.name = surfaces[components[i].members[0]].name;
+        }
         volume.bounds = components[i].bounds;
         volume.min_z = components[i].min_z;
         volume.max_z = components[i].max_z;

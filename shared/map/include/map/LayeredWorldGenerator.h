@@ -26,6 +26,9 @@ struct LayerGenerationOptions {
     Rect world_bounds;
     float merge_xy_gap = 0.05f;
     float merge_z_gap = 0.25f;
+    // Collision-derived rectangles must retain their proven footprints and
+    // height bands; legacy gap-based AABB merging may invent uncovered floor.
+    bool require_exact_footprints = false;
 };
 
 struct LayerGenerationReport {

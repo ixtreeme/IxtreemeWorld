@@ -59,6 +59,7 @@
 #include "ClosureBench.h"
 #include "../world/activity/WakeCaptureProfile.h"
 #include "ReadinessBench.h"
+#include "LayerLookupBench.h"
 
 #include <flecs.h>
 
@@ -160,7 +161,7 @@ bool ParseArgs(int argc, char** argv, BenchConfig& config)
                          "             [--partition-min-size M] [--lod-off] [--loadfield-off]\n"
                          "             [--scenario NAME] [--world-km K] [--zones-x N] [--zones-y N]\n"
                          "             [--warmup S] [--asf-off] [--file-world] [--eager-terrain] [--budget-mb M]\n"
-                         "             [--mode map4|mapaudit|worldpackage|terrain|mapsplit|streaming|worldquery|streamlife|streamadmission|streamsoak]\n"
+                         "             [--mode map4|mapaudit|worldpackage|layerlookup|terrain|mapsplit|streaming|worldquery|streamlife|streamadmission|streamsoak]\n"
                          "             [--mode tickrate] [--rates 20,30,60,144,flood] [--measure-seconds S]\n";
             return false;
         } else if (arg == "--players") {
@@ -364,7 +365,7 @@ bool ParseArgs(int argc, char** argv, BenchConfig& config)
         config.mode != "replv2" && config.mode != "protocol" &&
         config.mode != "reclamation" && config.mode != "hygiene" &&
         config.mode != "mapaudit" && config.mode != "snapshot" &&
-        config.mode != "worldpackage" && config.mode != "terrain" && config.mode != "bootstrap" &&
+        config.mode != "worldpackage" && config.mode != "layerlookup" && config.mode != "terrain" && config.mode != "bootstrap" &&
         config.mode != "streaming" && config.mode != "worldquery" && config.mode != "streamsoak" &&
         config.mode != "streamlife" && config.mode != "streamadmission" && config.mode != "map4" &&
         config.mode != "mapsplit") {
@@ -4948,6 +4949,11 @@ int BenchMain(int argc, char** argv)
         // Hardening H9: retired zone reclamation / memory over split-merge cycles.
         const int scenario_failures = gs::bench::RunZoneReclamationScenario(config.reclaim_cycles);
         std::printf("BENCH-DONE reclamation failures=%d\n", scenario_failures);
+        return scenario_failures == 0 ? 0 : 2;
+    }
+    if (config.mode == "layerlookup") {
+        const int scenario_failures = gs::bench::RunLayerLookupScenario();
+        std::printf("BENCH-DONE layerlookup failures=%d\n", scenario_failures);
         return scenario_failures == 0 ? 0 : 2;
     }
     if (config.mode == "worldpackage") {

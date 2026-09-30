@@ -353,6 +353,14 @@ struct LodComponent
     LodConfig config;
 };
 
+// Per-instance world semantics for the offline collision-to-layer authoring
+// path. Existing scenes remain opt-out; heights come from collision geometry.
+struct LayerAuthoringSettings
+{
+    bool enabled = false;
+    std::uint32_t tags = 0;
+};
+
 struct MeshSceneEntity
 {
     std::uint32_t id = 0;
@@ -386,6 +394,7 @@ struct MeshSceneEntity
     std::vector<MaterialOverride> materialOverrides;
     std::vector<EditorAttachedComponent> editorComponents;
     LodComponent lod;
+    LayerAuthoringSettings layerAuthoring;
     bool hasRigidbody = false;
     ixtreeme::physics::RigidbodyComponent rigidbody;
     bool hasCollider = false;
@@ -522,6 +531,7 @@ struct MeshRendererEditorState
     std::vector<MeshSceneEntity::MaterialOverride> materialOverrides;
     std::vector<EditorAttachedComponent> editorComponents;
     LodComponent lod;
+    LayerAuthoringSettings layerAuthoring;
     bool hasRigidbody = false;
     ixtreeme::physics::RigidbodyComponent rigidbody;
     bool physicsRuntimeValid = false;
@@ -757,6 +767,9 @@ struct MapEditorCommands
     bool dumpMaterialState = false;
     bool captureGpuFrame = false;
     bool dumpFrameProfile = false;
+    bool generateLayers = false;
+    bool exportLayers = false;
+    bool showLayerVolumes = false;
     bool debugPerfTogglesChanged = false;
     bool disableShadowPass = false;
     bool disableWaterReflectionPass = false;

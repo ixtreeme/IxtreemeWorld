@@ -130,6 +130,7 @@ public:
     void SetCameraEditorState(const CameraEditorState& state);
     void SetWaterBodyEditorState(const WaterBodyEditorState& state);
     void SetMeshRendererEditorState(const MeshRendererEditorState& state);
+    void SetLayerAuthoringStatus(std::string status) { m_layerAuthoringStatus = std::move(status); }
     void SetAnimatorGraphEditorState(const AnimatorGraphEditorState& state) { m_animatorGraphState = state; }
     bool IsAnimatorGraphVisible() const { return m_animatorGraphVisible; }
     void SetTerrainEditorState(const TerrainEditorState& state);
@@ -490,6 +491,8 @@ private:
     EngineStats m_engineStats;
     std::vector<PhysicsEventEditorState> m_physicsEvents;
     MapEditorCommands m_commands;
+    bool m_showLayerVolumes = false;
+    std::string m_layerAuthoringStatus;
     // Game-script build state (driven by EngineApplication's worker thread; UI reads it).
     enum class ScriptBuildState { Idle, Running, Done };
     ScriptBuildState m_buildState = ScriptBuildState::Idle;

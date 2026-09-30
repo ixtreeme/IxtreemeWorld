@@ -45,3 +45,25 @@ the transition.
 The generated sidecar is still only package geometry metadata. Production AOI,
 movement and migration will consume it after authoritative entity-volume
 ownership is implemented.
+
+## Engine collision adapter
+
+The integrated editor now has a direct adapter in `SceneLayerAuthoring`.
+Static Box and Mesh colliders can opt in through **Inspector → Layer generation**;
+their semantic tags survive scene save/load. **Tools → Layered world** provides
+generation, a bounded volume preview and export to a fresh sidecar path.
+
+`ExtractLayerSourceSurfaces` derives floor bands from actual transformed collision
+triangles. It accepts coplanar upward components with proven axis-aligned
+rectangular footprints, and rejects holes, concave or rotated footprints instead
+of inventing floor within a render AABB. This adapter uses
+`require_exact_footprints=true`, which disables the text adapter's legacy merges.
+
+Coordinates are metres: engine `(x, y-up, z)` becomes package `(x, z, y-up)`.
+Engine terrain is centered, so package bounds and origin must use
+`(-width/2, -depth/2)`. The sidecar export alone does not export the complete
+terrain package or activate layered movement. The production `WorldRuntime`
+retains validated metadata and offers a read-only point query.
+
+See `layered-3d-authoring-engine-review-20260930.md` for verified editor usage,
+tests, geometry limits and the next runtime integration milestone.
