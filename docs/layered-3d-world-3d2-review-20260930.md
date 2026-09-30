@@ -10,8 +10,11 @@ the sidecar and continue through the legacy heightfield path.
 
 - File: `layered_world.mx3d`
 - Magic: `MX3D`, little-endian
-- Version: `1`
+- Version: `2` (the reader also accepts v1 and derives basic tags from its
+  `VolumeKind`)
 - Bounded records: at most 4096 volumes, 8192 portals, 128-byte volume names
+- Volume tags distinguish semantic roles such as `building`, `bridge`,
+  `water`, `underwater`, `dungeon`, `road`, `stairs`, `lift` and `dock`.
 - Records use explicit little-endian integers and IEEE-754 f32 coordinates.
 - The loader rejects bad magic/version, truncation, trailing bytes, invalid
   flags, record limits and geometric contract violations.

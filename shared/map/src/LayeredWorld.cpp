@@ -101,7 +101,8 @@ bool LayeredWorld::Validate(const Rect& world_bounds, std::string& error) const
             error = "layered-world duplicate volume id " + std::to_string(volume.id);
             return false;
         }
-        if (!ValidRect(volume.bounds) || !InsideRect(volume.bounds, world_bounds) || !Finite(volume.min_z) ||
+        if ((volume.tags & ~kKnownVolumeTags) != 0 || !ValidRect(volume.bounds) ||
+            !InsideRect(volume.bounds, world_bounds) || !Finite(volume.min_z) ||
             !Finite(volume.max_z) || !(volume.min_z < volume.max_z)) {
             error = "layered-world volume " + std::to_string(volume.id) + " has invalid bounds";
             return false;
@@ -312,6 +313,7 @@ std::vector<std::uint8_t> EncodeLayeredWorld(const LayeredWorld& world)
     for (const auto& volume : world.volumes) {
         PutU32(out, volume.id);
         PutU32(out, volume.layer_id);
+        PutU32(out, volume.tags);
         PutU8(out, static_cast<std::uint8_t>(volume.kind));
         PutU8(out, volume.supports_ground_movement ? 1 : 0);
         PutU16(out, static_cast<std::uint16_t>(volume.name.size()));
@@ -359,7 +361,7 @@ bool DecodeLayeredWorld(const std::vector<std::uint8_t>& bytes, LayeredWorld& wo
         error = "layered-world sidecar magic is invalid";
         return false;
     }
-    if (version != kLayeredWorldFileVersion) {
+    if (version < kLayeredWorldFileMinVersion || version > kLayeredWorldFileVersion) {
         error = "layered-world sidecar version " + std::to_string(version) + " is unsupported";
         return false;
     }
@@ -374,18 +376,28 @@ bool DecodeLayeredWorld(const std::vector<std::uint8_t>& bytes, LayeredWorld& wo
         std::uint8_t raw_kind = 0;
         std::uint8_t movement = 0;
         std::uint16_t name_length = 0;
-        if (!cursor.U32(volume.id) || !cursor.U32(volume.layer_id) || !cursor.U8(raw_kind) ||
+        if (!cursor.U32(volume.id) || !cursor.U32(volume.layer_id) ||
+            (version >= 2 && !cursor.U32(volume.tags)) || !cursor.U8(raw_kind) ||
             !cursor.U8(movement) || !cursor.U16(name_length) || !ReadRect(cursor, volume.bounds) ||
             !cursor.F32(volume.min_z) || !cursor.F32(volume.max_z)) {
             error = "layered-world volume record " + std::to_string(i) + " is truncated";
             return false;
         }
         if (raw_kind > static_cast<std::uint8_t>(VolumeKind::Connector) || movement > 1 ||
-            name_length > kMaxLayeredWorldNameBytes) {
+            name_length > kMaxLayeredWorldNameBytes || (volume.tags & ~kKnownVolumeTags) != 0) {
             error = "layered-world volume record " + std::to_string(i) + " has an invalid field";
             return false;
         }
         volume.kind = static_cast<VolumeKind>(raw_kind);
+        if (version == 1) {
+            switch (volume.kind) {
+            case VolumeKind::Ground: volume.tags = VolumeTagGround; break;
+            case VolumeKind::Interior: volume.tags = VolumeTagInterior; break;
+            case VolumeKind::WaterSurface: volume.tags = VolumeTagWater; break;
+            case VolumeKind::Underwater: volume.tags = VolumeTagUnderwater; break;
+            case VolumeKind::Connector: volume.tags = VolumeTagConnector; break;
+            }
+        }
         volume.supports_ground_movement = movement != 0;
         if (!cursor.Text(name_length, volume.name)) {
             error = "layered-world volume record " + std::to_string(i) + " name is truncated";

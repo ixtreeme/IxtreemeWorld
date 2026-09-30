@@ -75,12 +75,14 @@ gameplay checks.
 
 ## Package integration (3D-2)
 
-Version 1 of the optional `layered_world.mx3d` sidecar stores bounded
-volume and portal records in little-endian form. A package without this file
+Version 2 of the optional `layered_world.mx3d` sidecar stores bounded
+volume and portal records plus semantic volume tags in little-endian form.
+A package without this file
 keeps the legacy contract. When the file is present, the strict package
 loader decodes it, validates its record envelope, validates the 3D contract
 against the package XY bounds, and exposes it through `ServerWorldData`.
-Malformed headers, unsupported versions, truncation, trailing bytes, record
+Malformed headers, unsupported versions, truncation, trailing bytes, unknown
+tags, record
 limits and geometric violations reject the package before runtime creation.
 
 The strict fixture covers a ground floor, upper floor, underpass and water

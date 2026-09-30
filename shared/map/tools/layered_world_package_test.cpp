@@ -23,10 +23,13 @@ mx::map::LayeredWorld Fixture()
     using namespace mx::map;
     LayeredWorld world;
     world.volumes = {
-        LayerVolume{1, 1, "ground", Rect{0, 0, 32, 32}, 0, 4, VolumeKind::Ground, true},
-        LayerVolume{2, 2, "upper-floor", Rect{8, 8, 24, 24}, 6, 10, VolumeKind::Interior, true},
-        LayerVolume{3, 3, "underpass", Rect{0, 0, 32, 32}, -10, -6, VolumeKind::Connector, false},
-        LayerVolume{4, 4, "water-surface", Rect{20, 20, 28, 28}, 4.5f, 5.5f, VolumeKind::WaterSurface, false},
+        LayerVolume{1, 1, "ground", Rect{0, 0, 32, 32}, 0, 4, VolumeKind::Ground, true, VolumeTagGround | VolumeTagRoad},
+        LayerVolume{2, 2, "upper-floor", Rect{8, 8, 24, 24}, 6, 10, VolumeKind::Interior, true,
+                    VolumeTagBuilding | VolumeTagInterior},
+        LayerVolume{3, 3, "underpass", Rect{0, 0, 32, 32}, -10, -6, VolumeKind::Connector, false,
+                    VolumeTagConnector | VolumeTagRoad},
+        LayerVolume{4, 4, "water-surface", Rect{20, 20, 28, 28}, 4.5f, 5.5f, VolumeKind::WaterSurface, false,
+                    VolumeTagWater},
     };
     world.portals = {
         LayerPortal{1, 1, 2, Rect{10, 10, 12, 12}, Rect{10, 10, 12, 12}, 0, 4, 6, 10, true},
@@ -66,6 +69,12 @@ int main()
     const auto loaded = LoadServerWorld(root, ValidationDepth::Startup, report);
     Check("strict-load", loaded.has_value() && report.Ok());
     Check("layered-world-loaded", loaded.has_value() && loaded->layered_world.has_value());
+    Check("building-tag-roundtrip",
+          loaded.has_value() && loaded->layered_world &&
+              HasVolumeTag(loaded->layered_world->volumes[1].tags, VolumeTagBuilding));
+    Check("road-tag-roundtrip",
+          loaded.has_value() && loaded->layered_world &&
+              HasVolumeTag(loaded->layered_world->volumes[0].tags, VolumeTagRoad));
     Check("upper-volume-lookup",
           loaded.has_value() && loaded->layered_world &&
               loaded->layered_world->FindVolume(10, 10, 7).value_or(0) == 2);

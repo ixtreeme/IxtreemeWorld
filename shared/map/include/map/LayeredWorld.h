@@ -16,7 +16,8 @@ using VolumeId = std::uint32_t;
 
 inline constexpr LayerId kLegacyLayerId = 0;
 inline constexpr std::uint32_t kLayeredWorldFileMagic = 0x4433584d; // "MX3D" little-endian
-inline constexpr std::uint32_t kLayeredWorldFileVersion = 1;
+inline constexpr std::uint32_t kLayeredWorldFileVersion = 2;
+inline constexpr std::uint32_t kLayeredWorldFileMinVersion = 1;
 inline constexpr std::uint32_t kMaxLayeredWorldVolumes = 4096;
 inline constexpr std::uint32_t kMaxLayeredWorldPortals = 8192;
 inline constexpr std::uint32_t kMaxLayeredWorldNameBytes = 128;
@@ -30,6 +31,36 @@ enum class VolumeKind : std::uint8_t {
     Connector = 4,
 };
 
+// Semantic authoring tags. VolumeKind describes the broad structural type;
+// tags carry the information used by automatic layer generation and later
+// collision/AOI policy. Tags are a bitmask so one volume can be, for example,
+// both Building and Interior, or Bridge and Connector.
+enum VolumeTag : std::uint32_t {
+    VolumeTagNone = 0,
+    VolumeTagGround = 1u << 0,
+    VolumeTagBuilding = 1u << 1,
+    VolumeTagBridge = 1u << 2,
+    VolumeTagWater = 1u << 3,
+    VolumeTagUnderwater = 1u << 4,
+    VolumeTagDungeon = 1u << 5,
+    VolumeTagInterior = 1u << 6,
+    VolumeTagConnector = 1u << 7,
+    VolumeTagRoad = 1u << 8,
+    VolumeTagStairs = 1u << 9,
+    VolumeTagLift = 1u << 10,
+    VolumeTagDock = 1u << 11,
+};
+
+inline constexpr std::uint32_t kKnownVolumeTags = VolumeTagGround | VolumeTagBuilding | VolumeTagBridge |
+                                                   VolumeTagWater | VolumeTagUnderwater | VolumeTagDungeon |
+                                                   VolumeTagInterior | VolumeTagConnector | VolumeTagRoad |
+                                                   VolumeTagStairs | VolumeTagLift | VolumeTagDock;
+
+inline constexpr bool HasVolumeTag(std::uint32_t tags, VolumeTag tag) noexcept
+{
+    return (tags & static_cast<std::uint32_t>(tag)) != 0;
+}
+
 const char* ToString(VolumeKind kind) noexcept;
 
 struct LayerVolume {
@@ -41,6 +72,7 @@ struct LayerVolume {
     float max_z = 0.0f;
     VolumeKind kind = VolumeKind::Ground;
     bool supports_ground_movement = true;
+    std::uint32_t tags = VolumeTagNone;
 
     bool Contains(float x, float y, float z) const noexcept;
 };
