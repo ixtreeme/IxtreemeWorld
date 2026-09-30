@@ -29,6 +29,8 @@ add_library(IXEngineMapData STATIC
     src/LayeredWorldGenerator.cpp
     src/LayeredWorldGeometry.cpp
     src/LayerGroundSupport.cpp
+    src/LayerClearance.cpp
+    src/LayerActorMovement.cpp
     src/ServerTerrain.cpp
     src/ServerWater.cpp
     src/WorldPackage.cpp
@@ -57,6 +59,14 @@ if(MSVC)
 endif()
 
 if(NOT CMAKE_SYSTEM_NAME STREQUAL "Android")
+    add_executable(layer_clearance_test tools/layer_clearance_test.cpp)
+    target_link_libraries(layer_clearance_test PRIVATE mapdata)
+    target_compile_features(layer_clearance_test PRIVATE cxx_std_20)
+    if(MSVC)
+        set_target_properties(layer_clearance_test PROPERTIES
+            MSVC_RUNTIME_LIBRARY "MultiThreaded$<$<CONFIG:Debug>:Debug>")
+    endif()
+
     add_executable(layer_ground_support_test tools/layer_ground_support_test.cpp)
     target_link_libraries(layer_ground_support_test PRIVATE mapdata)
     target_compile_features(layer_ground_support_test PRIVATE cxx_std_20)

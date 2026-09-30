@@ -1,7 +1,8 @@
 #include "SceneLayerGround.h"
 
-SceneLayerGround::SceneLayerGround(const mx::map::LayeredWorld& world) noexcept
-    : world_(&world)
+SceneLayerGround::SceneLayerGround(const mx::map::LayeredWorld& world,
+                                   std::optional<mx::map::LayerActorProfile> actor) noexcept
+    : world_(&world), actor_(actor)
 {
 }
 
@@ -21,7 +22,8 @@ mx::map::LayerGroundResult SceneLayerGround::Commit(mx::map::LayerGroundResult r
 mx::map::LayerGroundResult SceneLayerGround::Place(mx::map::VolumeId volume,
                                                 double engineX, double engineZ) noexcept
 {
-    return Commit(mx::map::ResolveLayerGroundPlacement(*world_, volume, engineX, engineZ));
+    return Commit(actor_ ? mx::map::ResolveLayerActorPlacement(*world_, *actor_, volume, engineX, engineZ)
+                         : mx::map::ResolveLayerGroundPlacement(*world_, volume, engineX, engineZ));
 }
 
 mx::map::LayerGroundResult SceneLayerGround::Move(mx::map::VolumeId targetVolume,
@@ -34,7 +36,8 @@ mx::map::LayerGroundResult SceneLayerGround::Move(mx::map::VolumeId targetVolume
         result.state = state_;
         return result;
     }
-    return Commit(mx::map::ResolveLayerGroundMove(*world_, state_, targetVolume, engineX, engineZ));
+    return Commit(actor_ ? mx::map::ResolveLayerActorMove(*world_, *actor_, state_, targetVolume, engineX, engineZ)
+                         : mx::map::ResolveLayerGroundMove(*world_, state_, targetVolume, engineX, engineZ));
 }
 
 bool SceneLayerGround::MatchesWorld(const mx::map::LayeredWorld& candidate) const

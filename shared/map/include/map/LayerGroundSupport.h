@@ -12,6 +12,10 @@ enum class GroundSupportStatus : std::uint8_t {
     UnsupportedMovement,
     InvalidState,
     TransitionRequired,
+    // 3D-4B actor queries (LayerActorMovement.h):
+    Blocked,          // the point or the path is not proven free for the actor
+    NoClearanceProof, // the world/volume carries no cooked clearance
+    ActorNotCovered,  // the actor is larger than the cooked clearance profile
 };
 
 const char* ToString(GroundSupportStatus status) noexcept;
@@ -28,6 +32,8 @@ struct LayerGroundResult {
     GroundSupportStatus status = GroundSupportStatus::NotAvailable;
     LayerGroundState state;
     double max_height_error_m = 0.0;
+    // 3D-4B: the proven portal a successful actor move stepped across (0: none).
+    std::uint32_t portal_id = 0;
 
     bool Ok() const noexcept { return status == GroundSupportStatus::Ok; }
 };

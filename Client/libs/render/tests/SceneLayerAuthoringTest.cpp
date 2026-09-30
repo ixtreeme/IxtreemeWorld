@@ -1,4 +1,6 @@
 #include "SceneLayerAuthoring.h"
+#include "SceneLayerGround.h"
+#include "math/Quaternion.h"
 #include "map/WorldPackage.h"
 #include "map/WorldPackageWriter.h"
 #include "physics/PhysicsWorld.h"
@@ -506,6 +508,312 @@ void TestNegativeControls()
     CheckRejected("nonfinite-model-transform-rejected", scene);
 }
 
+
+// ---------------- 3D-4B clearance against the real Jolt world ----------------
+// Every static collider shape the editor bakes, plus a trigger and a dynamic
+// prop that must not be baked, around a stepped stair (0.75 m treads, 0.25 m
+// risers) onto a landing. The oracle is Jolt itself: a capsule of the actor's
+// radius spanning [support + floor contact, support + actor height] placed
+// anywhere in a cell the bake calls clear must not overlap a static body.
+MeshSceneEntity Obstacle(std::uint32_t id, const char* name, physics::ColliderShape shape,
+    std::array<float, 3> position, std::array<float, 3> size)
+{
+    MeshSceneEntity entity;
+    entity.id = id;
+    entity.name = name;
+    entity.hasCollider = true;
+    entity.collider.shape = shape;
+    entity.collider.layer = physics::PhysicsLayer::StaticWorld;
+    std::copy(size.begin(), size.end(), std::begin(entity.collider.size));
+    std::copy(position.begin(), position.end(), std::begin(entity.position));
+    return entity;
+}
+
+MeshSceneEntity Walkable(std::uint32_t id, const char* name, float minX, float maxX, float minZ, float maxZ, float top)
+{
+    auto entity = Box(id, name, top, map::VolumeTagGround);
+    entity.collider.size[0] = maxX - minX;
+    entity.collider.size[1] = top;
+    entity.collider.size[2] = maxZ - minZ;
+    entity.position[0] = (minX + maxX) * 0.5f;
+    entity.position[1] = top * 0.5f;
+    entity.position[2] = (minZ + maxZ) * 0.5f;
+    return entity;
+}
+
+SceneData ClearanceScene()
+{
+    SceneData scene;
+    scene.name = "Clearance fixture";
+    scene.terrain.exists = true;
+    scene.terrain.widthMeters = 32;
+    scene.terrain.depthMeters = 32;
+    scene.terrain.cellsX = 32;
+    scene.terrain.cellsZ = 32;
+    scene.terrain.cellSizeMeters = 1;
+    scene.terrain.chunkSizeCells = 32;
+    scene.terrain.heightCmGrid.assign(33u * 33u, 0);
+    scene.meshEntities.push_back(Walkable(30, "floor", -8, 8, -8, 8, 1));
+    scene.meshEntities.push_back(Obstacle(31, "wall", physics::ColliderShape::Box, {2, 2.5f, 0}, {0.5f, 3, 6}));
+    auto turned = Obstacle(32, "turned-wall", physics::ColliderShape::Box, {-4, 2, -4}, {0.4f, 2, 3});
+    turned.rotation[1] = 0.5f;
+    scene.meshEntities.push_back(turned);
+    scene.meshEntities.push_back(Obstacle(33, "low-beam", physics::ColliderShape::Box, {-3, 2.5f, 4}, {5, 0.4f, 0.4f}));
+    scene.meshEntities.push_back(Obstacle(34, "high-beam", physics::ColliderShape::Box, {-3, 3.1f, 6}, {5, 0.4f, 0.4f}));
+    scene.meshEntities.push_back(Obstacle(35, "rug", physics::ColliderShape::Box, {4, 1.005f, -5}, {2, 0.01f, 2}));
+    auto sphere = Obstacle(36, "boulder", physics::ColliderShape::Sphere, {5, 1.4f, 5}, {1, 1, 1});
+    sphere.collider.radius = 0.5f;
+    scene.meshEntities.push_back(sphere);
+    auto capsule = Obstacle(37, "post", physics::ColliderShape::Capsule, {-6, 2, 0}, {1, 1, 1});
+    capsule.collider.radius = 0.3f;
+    capsule.collider.height = 2;
+    scene.meshEntities.push_back(capsule);
+    auto trigger = Obstacle(38, "trigger-zone", physics::ColliderShape::Box, {0, 2, -6}, {2, 2, 2});
+    trigger.collider.trigger = true;
+    scene.meshEntities.push_back(trigger);
+    auto crate = Obstacle(39, "dynamic-crate", physics::ColliderShape::Box, {-6, 1.5f, 6}, {1, 1, 1});
+    crate.hasRigidbody = true;
+    crate.rigidbody.bodyType = physics::BodyType::Dynamic;
+    scene.meshEntities.push_back(crate);
+    for (std::uint32_t k = 0; k < 4; ++k) {
+        const float x0 = 8 + 0.75f * static_cast<float>(k);
+        scene.meshEntities.push_back(Walkable(40 + k, "stair-step", x0, x0 + 0.75f, -1.5f, 1.5f,
+            1.25f + 0.25f * static_cast<float>(k)));
+    }
+    scene.meshEntities.push_back(Walkable(44, "landing", 11, 14, -2, 2, 2));
+    return scene;
+}
+
+const map::LayerVolume* VolumeAt(const map::LayeredWorld& world, double x, double y)
+{
+    for (const auto& volume : world.volumes)
+        if (volume.ground_support && x >= volume.bounds.min_x && x < volume.bounds.max_x &&
+            y >= volume.bounds.min_y && y < volume.bounds.max_y)
+            return &volume;
+    return nullptr;
+}
+
+bool CellClear(const map::LayeredWorld& world, double x, double y)
+{
+    const auto* volume = VolumeAt(world, x, y);
+    if (!volume || !volume->clearance || !world.clearance_profile) return false;
+    const double g = world.clearance_profile->cell_size_m;
+    return !volume->clearance->Blocked(static_cast<std::uint32_t>((x - volume->bounds.min_x) / g),
+        static_cast<std::uint32_t>((y - volume->bounds.min_y) / g));
+}
+
+#if defined(IXENGINE_PHYSICS_WITH_JOLT)
+void AddStaticBodies(physics::PhysicsWorld& world, const SceneData& scene)
+{
+    for (const auto& entity : scene.meshEntities) {
+        if (!entity.hasCollider || !entity.collider.enabled) continue;
+        if (entity.hasRigidbody && entity.rigidbody.bodyType != physics::BodyType::Static) continue;
+        physics::PhysicsBodyDesc desc;
+        desc.bodyType = physics::BodyType::Static;
+        desc.rigidbody.bodyType = physics::BodyType::Static;
+        desc.rigidbody.useGravity = false;
+        desc.collider = entity.collider;
+        std::copy(std::begin(entity.position), std::end(entity.position), std::begin(desc.transform.position));
+        const auto rotation = ixtreeme::math::FromEulerRadians({entity.rotation[0], entity.rotation[1], entity.rotation[2]});
+        desc.transform.rotation[0] = rotation.x;
+        desc.transform.rotation[1] = rotation.y;
+        desc.transform.rotation[2] = rotation.z;
+        desc.transform.rotation[3] = rotation.w;
+        std::copy(std::begin(entity.scale), std::end(entity.scale), std::begin(desc.scale));
+        world.CreateBody(desc);
+    }
+}
+
+// Engine X/Z are canonical X/Y; the capsule stands on `support` (engine Y).
+bool CapsuleFree(const physics::PhysicsWorld& world, double x, double y, double support,
+    float radius, float height, float contact, bool triggers = false)
+{
+    const float span = height - contact;
+    const float center[3] = {static_cast<float>(x), static_cast<float>(support + contact + span * 0.5),
+                             static_cast<float>(y)};
+    physics::PhysicsQueryFilter filter;
+    filter.hitTriggers = triggers;
+    return world.OverlapCapsule(center, span * 0.5f - radius, radius, filter, 4).empty();
+}
+
+struct JoltOracle {
+    std::uint64_t samples = 0;
+    std::uint64_t violations = 0;
+    std::uint64_t corridorSamples = 0;
+};
+
+JoltOracle RunJoltOracle(const map::LayeredWorld& world, const physics::PhysicsWorld& physicsWorld,
+    float radius, float height)
+{
+    JoltOracle oracle;
+    if (!world.clearance_profile) return oracle;
+    const auto& profile = *world.clearance_profile;
+    const double g = profile.cell_size_m;
+    for (const auto& volume : world.volumes) {
+        if (!volume.clearance || !volume.ground_support) continue;
+        for (std::uint32_t j = 0; j < volume.clearance->cells_y; ++j) {
+            for (std::uint32_t i = 0; i < volume.clearance->cells_x; ++i) {
+                if (volume.clearance->Blocked(i, j)) continue;
+                const double x0 = volume.bounds.min_x + i * g, y0 = volume.bounds.min_y + j * g;
+                const double x1 = std::min(x0 + g, static_cast<double>(volume.bounds.max_x));
+                const double y1 = std::min(y0 + g, static_cast<double>(volume.bounds.max_y));
+                for (int a = 0; a <= 2; ++a) {
+                    for (int b = 0; b <= 2; ++b) {
+                        const double x = x0 + (x1 - x0) * a / 2, y = y0 + (y1 - y0) * b / 2;
+                        ++oracle.samples;
+                        if (!CapsuleFree(physicsWorld, x, y, volume.ground_support->Height(x, y), radius, height,
+                                profile.floor_contact_m))
+                            ++oracle.violations;
+                    }
+                }
+            }
+        }
+    }
+    for (const auto& portal : world.portals) {
+        if (!portal.proof) continue;
+        const auto& proof = *portal.proof;
+        const map::LayerVolume* a = nullptr;
+        const map::LayerVolume* b = nullptr;
+        for (const auto& volume : world.volumes) {
+            if (volume.id == portal.source_volume) a = &volume;
+            if (volume.id == portal.target_volume) b = &volume;
+        }
+        if (!a || !b) continue;
+        double across0 = 0, across1 = 0;
+        map::LayerPortalCorridorAcross(proof, *a, *b, profile, across0, across1);
+        for (std::uint32_t s = 0; s < proof.slots; ++s) {
+            for (std::uint32_t c = 0; c < proof.across; ++c) {
+                if (proof.CellBlocked(s, c)) continue;
+                const double l0 = proof.span_min + s * g, l1 = std::min(l0 + g, static_cast<double>(proof.span_max));
+                const double c0 = across0 + c * g, c1 = std::min(c0 + g, across1);
+                for (int u = 0; u <= 2; ++u) {
+                    for (int w = 0; w <= 2; ++w) {
+                        const double along = l0 + (l1 - l0) * u / 2, across = c0 + (c1 - c0) * w / 2;
+                        const double x = proof.axis == 0 ? across : along, y = proof.axis == 0 ? along : across;
+                        const double support = std::max(a->ground_support->Height(x, y), b->ground_support->Height(x, y));
+                        ++oracle.samples;
+                        ++oracle.corridorSamples;
+                        if (!CapsuleFree(physicsWorld, x, y, support, radius, height, profile.floor_contact_m))
+                            ++oracle.violations;
+                    }
+                }
+            }
+        }
+    }
+    return oracle;
+}
+#endif
+
+void TestClearanceAgainstJolt()
+{
+    const auto scene = ClearanceScene();
+    SceneLayerAuthoringResult result;
+    const bool generated = GenerateSceneLayers(scene, GeometryProvider, result);
+    Check("clearance-scene-generates", generated && result.errors.empty());
+    if (!generated) {
+        for (const auto& error : result.errors) std::cout << "generation error: " << error << '\n';
+        return;
+    }
+    const physics::CharacterControllerComponent controller;
+    const auto profile = SceneLayerClearanceProfile();
+    Check("bake-profile-is-character-controller-default", profile.actor_radius_m == controller.capsuleRadius &&
+        profile.actor_height_m == controller.capsuleHeight && profile.step_height_m == controller.stepHeight &&
+        result.world.clearance_profile && result.world.clearance_profile->actor_radius_m == controller.capsuleRadius);
+    Check("walkable-volumes-floor-four-steps-landing", result.world.volumes.size() == 6 &&
+        std::all_of(result.world.volumes.begin(), result.world.volumes.end(),
+            [](const auto& volume) { return volume.clearance.has_value(); }));
+    // floor, 2 walls, 2 beams, rug, sphere, capsule, 4 steps, landing; the
+    // trigger and the dynamic crate are not static world.
+    Check("static-obstruction-sources-exclude-trigger-and-dynamic", result.obstructionSources == 13);
+    const auto proven = std::count_if(result.world.portals.begin(), result.world.portals.end(),
+        [](const auto& portal) { return portal.proof.has_value(); });
+    Check("stair-and-landing-edges-proven", proven == 5 && result.clearance.portals_derived == 5);
+    std::cout << "clearance: cells=" << result.clearance.cells_total << " blocked=" << result.clearance.cells_blocked
+              << " triangles=" << result.clearance.obstruction_triangles << " corridor=" << result.clearance.corridor_slots
+              << " corridorBlocked=" << result.clearance.corridor_slots_blocked << '\n';
+    Check("low-beam-below-head-blocked-in-bake", !CellClear(result.world, -3.1, 4.1));
+    Check("high-beam-above-head-clear-in-bake", CellClear(result.world, -3.1, 6.1));
+    Check("thin-rug-under-floor-contact-clear", CellClear(result.world, 4.1, -5.1));
+    Check("trigger-volume-not-an-obstruction", CellClear(result.world, 0.1, -6.1));
+    Check("dynamic-prop-not-baked-as-static", CellClear(result.world, -6.1, 6.1));
+
+#if defined(IXENGINE_PHYSICS_WITH_JOLT)
+    physics::PhysicsWorld physicsWorld;
+    AddStaticBodies(physicsWorld, scene);
+    const float radius = controller.capsuleRadius;
+    const float height = controller.capsuleHeight;
+    const float contact = profile.floor_contact_m;
+    // The oracle is live: known contacts are reported, known gaps are not.
+    Check("jolt-oracle-hits-wall-inside-radius", !CapsuleFree(physicsWorld, 1.75 - 0.3, 0, 1, radius, height, contact));
+    Check("jolt-oracle-hits-low-beam", !CapsuleFree(physicsWorld, -3, 4, 1, radius, height, contact));
+    Check("jolt-oracle-hits-turned-wall", !CapsuleFree(physicsWorld, -4, -4, 1, radius, height, contact));
+    Check("jolt-oracle-hits-sphere-and-capsule", !CapsuleFree(physicsWorld, 5, 5, 1, radius, height, contact) &&
+        !CapsuleFree(physicsWorld, -6, 0, 1, radius, height, contact));
+    Check("jolt-oracle-standing-on-floor-is-free", CapsuleFree(physicsWorld, 0, 3, 1, radius, height, contact));
+    Check("jolt-agrees-high-beam-and-rug-free", CapsuleFree(physicsWorld, -3.1, 6.1, 1, radius, height, contact) &&
+        CapsuleFree(physicsWorld, 4.1, -5.1, 1, radius, height, contact));
+    Check("jolt-trigger-only-hit-when-triggers-queried",
+        CapsuleFree(physicsWorld, 0.1, -6.1, 1, radius, height, contact) &&
+        !CapsuleFree(physicsWorld, 0.1, -6.1, 1, radius, height, contact, true));
+
+    const auto oracle = RunJoltOracle(result.world, physicsWorld, radius, height);
+    Check("jolt-capsule-free-in-every-clear-cell-and-corridor", oracle.samples > 30000 && oracle.corridorSamples > 0 &&
+        oracle.violations == 0);
+    std::cout << "jolt oracle: samples=" << oracle.samples << " corridor=" << oracle.corridorSamples
+              << " violations=" << oracle.violations << '\n';
+
+    // Negative control: a bake for a thinner actor must be caught by Jolt.
+    std::vector<map::LayerObstructionMesh> obstructions;
+    for (const auto& entity : scene.meshEntities) {
+        map::LayerObstructionMesh obstruction;
+        bool physical = false;
+        std::string error;
+        if (BuildLayerObstructionMesh(entity, GeometryProvider, obstruction, physical, error) && physical)
+            obstructions.push_back(std::move(obstruction));
+    }
+    auto thin = profile;
+    thin.actor_radius_m = 0.1f;
+    auto undersized = result.world;
+    map::LayerClearanceReport thinReport;
+    const bool rebaked = map::CookLayerClearance(undersized, result.worldBounds, obstructions, nullptr, thin, thinReport);
+    const auto caught = RunJoltOracle(undersized, physicsWorld, radius, height);
+    Check("jolt-oracle-detects-undersized-radius-bake", rebaked && caught.violations > 0);
+    std::cout << "negative control: violations=" << caught.violations << " of " << caught.samples << '\n';
+#else
+    std::cout << "SCENE LAYER AUTHORING Jolt clearance oracle: NOT_RUN (backend disabled)\n";
+#endif
+
+    // Movement through the same bake with the editor's actor.
+    const auto* floor = VolumeAt(result.world, 0, 0);
+    const auto* landing = VolumeAt(result.world, 12, 0);
+    if (!floor || !landing) {
+        Check("floor-and-landing-volumes-found", false);
+        return;
+    }
+    SceneLayerGround ground(result.world, SceneLayerActorProfile());
+    Check("actor-placed-on-floor", ground.Place(floor->id, 0, 0).Ok());
+    const auto throughWall = ground.Move(floor->id, 4, 0);
+    Check("move-through-non-opted-wall-blocked", throughWall.status == map::GroundSupportStatus::Blocked &&
+        ground.EnginePosition()[0] == 0 && ground.EnginePosition()[2] == 0);
+    Check("move-around-wall-ok", ground.Move(floor->id, 0, -4).Ok() && ground.Move(floor->id, 4, -4).Ok() &&
+        ground.Move(floor->id, 6, 0).Ok());
+    int crossings = 0;
+    bool climbed = true;
+    for (int k = 0; k <= 35 && climbed; ++k) {
+        const double x = (30 + k) * 0.2;
+        const auto* target = VolumeAt(result.world, x, 0);
+        const auto step = target ? ground.Move(target->id, x, 0) : map::LayerGroundResult{};
+        climbed = step.Ok();
+        if (!climbed)
+            std::cout << "stair walk stopped at x=" << x << " status=" << map::ToString(step.status) << '\n';
+        if (step.portal_id != 0) ++crossings;
+    }
+    Check("actor-walks-up-stairs-via-five-proven-portals", climbed && crossings == 5 &&
+        ground.State().volume_id == landing->id && Near(static_cast<float>(ground.EnginePosition()[1]), 2));
+    SceneLayerGround jumper(result.world, SceneLayerActorProfile());
+    Check("skipping-the-stairs-requires-transition", jumper.Place(floor->id, 7, 0).Ok() &&
+        jumper.Move(landing->id, 12, 0).status == map::GroundSupportStatus::TransitionRequired);
+}
 } // namespace
 
 int main()
@@ -516,6 +824,7 @@ int main()
         TestGenerationAndServer(workspace);
         TestPersistence(workspace);
         TestNegativeControls();
+        TestClearanceAgainstJolt();
     } catch (const std::exception& error) {
         Check("unexpected-test-exception", false);
         std::cout << "test exception: " << error.what() << '\n';

@@ -47,7 +47,137 @@ const LayerVolume* FindById(const std::vector<LayerVolume>& volumes, VolumeId id
     return it == volumes.end() ? nullptr : &*it;
 }
 
+std::size_t BitBytes(std::uint64_t bits)
+{
+    return static_cast<std::size_t>((bits + 7) / 8);
+}
+
+bool BitsetShapeValid(const std::vector<std::uint8_t>& bits, std::uint64_t count)
+{
+    if (bits.size() != BitBytes(count)) return false;
+    const unsigned used = static_cast<unsigned>(count % 8);
+    // Padding bits of the last byte must be zero: one canonical encoding.
+    return used == 0 || bits.empty() || (bits.back() >> used) == 0;
+}
+
+bool BitSet(const std::vector<std::uint8_t>& bits, std::uint64_t index)
+{
+    const auto byte = static_cast<std::size_t>(index / 8);
+    return byte >= bits.size() || ((bits[byte] >> (index % 8)) & 1u) != 0; // out of range = blocked
+}
+
+bool ProofGeometryValid(const LayerPortal& portal, const LayerVolume& source, const LayerVolume& target,
+                        const LayerClearanceProfile& profile, std::string& why)
+{
+    const auto& proof = *portal.proof;
+    if (proof.axis > 1) { why = "axis"; return false; }
+    // The shared edge: one volume's maximum equals the other's minimum.
+    const float s_min = proof.axis == 0 ? source.bounds.min_x : source.bounds.min_y;
+    const float s_max = proof.axis == 0 ? source.bounds.max_x : source.bounds.max_y;
+    const float t_min = proof.axis == 0 ? target.bounds.min_x : target.bounds.min_y;
+    const float t_max = proof.axis == 0 ? target.bounds.max_x : target.bounds.max_y;
+    if (!((s_max == proof.edge && t_min == proof.edge) || (s_min == proof.edge && t_max == proof.edge))) {
+        why = "edge is not an exactly shared volume boundary";
+        return false;
+    }
+    const float so_min = proof.axis == 0 ? source.bounds.min_y : source.bounds.min_x;
+    const float so_max = proof.axis == 0 ? source.bounds.max_y : source.bounds.max_x;
+    const float to_min = proof.axis == 0 ? target.bounds.min_y : target.bounds.min_x;
+    const float to_max = proof.axis == 0 ? target.bounds.max_y : target.bounds.max_x;
+    if (proof.span_min != std::max(so_min, to_min) || proof.span_max != std::min(so_max, to_max) ||
+        !(proof.span_min < proof.span_max)) {
+        why = "span is not the exact shared segment";
+        return false;
+    }
+    double across0 = 0.0, across1 = 0.0;
+    LayerPortalCorridorAcross(proof, source, target, profile, across0, across1);
+    const std::uint64_t cells = static_cast<std::uint64_t>(proof.slots) * proof.across;
+    if (proof.slots != LayerClearanceCellCount(proof.span_min, proof.span_max, profile.cell_size_m) ||
+        proof.across != LayerClearanceCellCount(across0, across1, profile.cell_size_m) || cells == 0 ||
+        cells > kMaxLayerClearanceCellsPerVolume || !BitsetShapeValid(proof.blocked, cells)) {
+        why = "corridor grid does not match the shared segment and band";
+        return false;
+    }
+    if (!std::isfinite(proof.max_step_m) || proof.max_step_m < 0.0 ||
+        proof.max_step_m > static_cast<double>(profile.step_height_m)) {
+        why = "step exceeds the profile";
+        return false;
+    }
+    // The planes are linear: the difference is extreme at the segment ends.
+    double measured = 0.0;
+    for (const double along : {static_cast<double>(proof.span_min), static_cast<double>(proof.span_max)}) {
+        const double x = proof.axis == 0 ? static_cast<double>(proof.edge) : along;
+        const double y = proof.axis == 0 ? along : static_cast<double>(proof.edge);
+        measured = std::max(measured,
+            std::abs(source.ground_support->Height(x, y) - target.ground_support->Height(x, y)));
+    }
+    if (!std::isfinite(measured) || std::abs(measured - proof.max_step_m) > kLayerPortalStepToleranceMeters) {
+        why = "stored step does not match the support planes";
+        return false;
+    }
+    return true;
+}
+
 } // namespace
+
+bool LayerClearanceProfile::Valid() const noexcept
+{
+    return std::isfinite(cell_size_m) && cell_size_m >= 0.05f && cell_size_m <= 4.0f &&
+           std::isfinite(actor_radius_m) && actor_radius_m > 0.0f && actor_radius_m <= 10.0f &&
+           std::isfinite(actor_height_m) && actor_height_m >= 2.0f * actor_radius_m && actor_height_m <= 20.0f &&
+           std::isfinite(step_height_m) && step_height_m >= 0.0f && step_height_m < actor_height_m &&
+           std::isfinite(floor_contact_m) && floor_contact_m >= 0.0f && floor_contact_m < actor_height_m;
+}
+
+bool LayerClearanceGrid::Blocked(std::uint32_t x, std::uint32_t y) const noexcept
+{
+    if (x >= cells_x || y >= cells_y) return true;
+    return BitSet(blocked, static_cast<std::uint64_t>(y) * cells_x + x);
+}
+
+std::uint64_t LayerClearanceGrid::BlockedCount() const noexcept
+{
+    std::uint64_t count = 0;
+    for (const auto byte : blocked) {
+        for (unsigned bit = 0; bit < 8; ++bit) count += (byte >> bit) & 1u;
+    }
+    return count;
+}
+
+bool LayerPortalProof::CellBlocked(std::uint32_t slot, std::uint32_t across_cell) const noexcept
+{
+    if (slot >= slots || across_cell >= across) return true;
+    return BitSet(blocked, static_cast<std::uint64_t>(slot) * across + across_cell);
+}
+
+void LayerPortalCorridorAcross(const LayerPortalProof& proof,
+                               const LayerVolume& a,
+                               const LayerVolume& b,
+                               const LayerClearanceProfile& profile,
+                               double& across0,
+                               double& across1) noexcept
+{
+    const double reach = static_cast<double>(profile.actor_radius_m) + static_cast<double>(profile.cell_size_m);
+    const double edge = proof.edge;
+    across0 = edge - reach;
+    across1 = edge + reach;
+    for (const LayerVolume* volume : {&a, &b}) {
+        const double min = proof.axis == 0 ? volume->bounds.min_x : volume->bounds.min_y;
+        const double max = proof.axis == 0 ? volume->bounds.max_x : volume->bounds.max_y;
+        if (max <= edge) across0 = std::max(across0, min); // volume on the low side
+        if (min >= edge) across1 = std::min(across1, max); // volume on the high side
+    }
+}
+
+std::uint32_t LayerClearanceCellCount(double min, double max, float cell_size) noexcept
+{
+    const double length = max - min;
+    const double cell = static_cast<double>(cell_size);
+    if (!std::isfinite(length) || !std::isfinite(cell) || !(length > 0.0) || !(cell > 0.0)) return 0;
+    const double cells = std::ceil(length / cell);
+    if (!(cells >= 1.0) || cells > 4294967295.0) return 0;
+    return static_cast<std::uint32_t>(cells);
+}
 
 const char* ToString(VolumeKind kind) noexcept
 {
@@ -149,8 +279,8 @@ bool LayeredWorld::Validate(const Rect& world_bounds, std::string& error) const
         return false;
     }
     if (volumes.empty()) {
-        if (!portals.empty()) {
-            error = "layered-world portals require at least one volume";
+        if (!portals.empty() || clearance_profile) {
+            error = "layered-world portals and clearance require at least one volume";
             return false;
         }
         return true;
@@ -208,6 +338,60 @@ bool LayeredWorld::Validate(const Rect& world_bounds, std::string& error) const
             portal.source_max_z > source->max_z || portal.target_min_z < target->min_z ||
             portal.target_max_z > target->max_z) {
             error = "layered-world portal " + std::to_string(portal.id) + " has invalid endpoint bounds";
+            return false;
+        }
+    }
+
+    // ---- 3D-4B clearance and transition proofs ----
+    const bool any_proof =
+        std::any_of(volumes.begin(), volumes.end(), [](const LayerVolume& v) { return v.clearance.has_value(); }) ||
+        std::any_of(portals.begin(), portals.end(), [](const LayerPortal& p) { return p.proof.has_value(); });
+    if (clearance_profile.has_value() != any_proof) {
+        error = clearance_profile ? "layered-world clearance profile has no clearance data"
+                                  : "layered-world clearance data requires a clearance profile";
+        return false;
+    }
+    if (!any_proof) {
+        return true;
+    }
+    const auto& profile = *clearance_profile;
+    if (!profile.Valid()) {
+        error = "layered-world clearance profile is invalid";
+        return false;
+    }
+    std::uint64_t total_cells = 0;
+    for (const auto& volume : volumes) {
+        if (!volume.clearance) continue;
+        const auto& grid = *volume.clearance;
+        if (!volume.ground_support || !volume.HasValidGroundSupport()) {
+            error = "layered-world volume " + std::to_string(volume.id) + " has clearance without ground support";
+            return false;
+        }
+        const auto cells_x = LayerClearanceCellCount(volume.bounds.min_x, volume.bounds.max_x, profile.cell_size_m);
+        const auto cells_y = LayerClearanceCellCount(volume.bounds.min_y, volume.bounds.max_y, profile.cell_size_m);
+        const std::uint64_t cells = static_cast<std::uint64_t>(grid.cells_x) * grid.cells_y;
+        if (cells_x == 0 || cells_y == 0 || grid.cells_x != cells_x || grid.cells_y != cells_y ||
+            cells > kMaxLayerClearanceCellsPerVolume || !BitsetShapeValid(grid.blocked, cells)) {
+            error = "layered-world volume " + std::to_string(volume.id) + " clearance grid does not match its footprint";
+            return false;
+        }
+        total_cells += cells;
+        if (total_cells > kMaxLayerClearanceTotalCells) {
+            error = "layered-world clearance grids exceed the total cell limit";
+            return false;
+        }
+    }
+    for (const auto& portal : portals) {
+        if (!portal.proof) continue;
+        const auto* source = FindById(volumes, portal.source_volume);
+        const auto* target = FindById(volumes, portal.target_volume);
+        std::string why;
+        if (source == nullptr || target == nullptr || !source->clearance || !target->clearance ||
+            !source->AllowsGroundMovement() || !target->AllowsGroundMovement()) {
+            why = "both endpoints need walkable support with clearance";
+        }
+        if (!why.empty() || !ProofGeometryValid(portal, *source, *target, profile, why)) {
+            error = "layered-world portal " + std::to_string(portal.id) + " transition proof is invalid: " + why;
             return false;
         }
     }
@@ -407,14 +591,41 @@ std::vector<std::uint8_t> EncodeLayeredWorld(const LayeredWorld& world)
             (volume.ground_support && !volume.HasValidGroundSupport())) {
             return {};
         }
+        if (volume.clearance &&
+            (!world.clearance_profile ||
+             !BitsetShapeValid(volume.clearance->blocked,
+                               static_cast<std::uint64_t>(volume.clearance->cells_x) * volume.clearance->cells_y))) {
+            return {};
+        }
+    }
+    for (const auto& portal : world.portals) {
+        if (portal.proof && (!world.clearance_profile || portal.proof->axis > 1 ||
+                             !BitsetShapeValid(portal.proof->blocked,
+                                              static_cast<std::uint64_t>(portal.proof->slots) * portal.proof->across))) {
+            return {};
+        }
+    }
+    // Version 4 only when the world carries 3D-4B proofs; otherwise the exact
+    // version-3 layout, so support-only worlds keep their previous bytes.
+    const bool v4 = world.clearance_profile.has_value();
+    if (v4 && !world.clearance_profile->Valid()) {
+        return {};
     }
 
     std::vector<std::uint8_t> out;
     out.reserve(16 + world.volumes.size() * 40 + world.portals.size() * 60);
     PutU32(out, kLayeredWorldFileMagic);
-    PutU32(out, kLayeredWorldFileVersion);
+    PutU32(out, v4 ? kLayeredWorldFileVersion : kLayeredWorldSupportFileVersion);
     PutU32(out, static_cast<std::uint32_t>(world.volumes.size()));
     PutU32(out, static_cast<std::uint32_t>(world.portals.size()));
+    if (v4) {
+        const auto& profile = *world.clearance_profile;
+        PutF32(out, profile.cell_size_m);
+        PutF32(out, profile.actor_radius_m);
+        PutF32(out, profile.actor_height_m);
+        PutF32(out, profile.step_height_m);
+        PutF32(out, profile.floor_contact_m);
+    }
     for (const auto& volume : world.volumes) {
         PutU32(out, volume.id);
         PutU32(out, volume.layer_id);
@@ -441,6 +652,17 @@ std::vector<std::uint8_t> EncodeLayeredWorld(const LayeredWorld& world)
             PutF64(out, plane.slope_y);
             PutF64(out, plane.max_height_error_m);
         }
+        if (v4) {
+            PutU8(out, volume.clearance ? 1 : 0);
+            PutU8(out, 0);
+            PutU8(out, 0);
+            PutU8(out, 0);
+            if (volume.clearance) {
+                PutU32(out, volume.clearance->cells_x);
+                PutU32(out, volume.clearance->cells_y);
+                out.insert(out.end(), volume.clearance->blocked.begin(), volume.clearance->blocked.end());
+            }
+        }
     }
     for (const auto& portal : world.portals) {
         PutU32(out, portal.id);
@@ -456,6 +678,25 @@ std::vector<std::uint8_t> EncodeLayeredWorld(const LayeredWorld& world)
         PutU8(out, 0);
         PutU8(out, 0);
         PutU8(out, 0);
+        if (v4) {
+            PutU8(out, portal.proof ? 1 : 0);
+            PutU8(out, portal.proof ? portal.proof->axis : 0);
+            PutU8(out, 0);
+            PutU8(out, 0);
+            if (portal.proof) {
+                const auto& proof = *portal.proof;
+                PutF32(out, proof.edge);
+                PutF32(out, proof.span_min);
+                PutF32(out, proof.span_max);
+                PutF64(out, proof.max_step_m);
+                PutU32(out, proof.slots);
+                PutU32(out, proof.across);
+                out.insert(out.end(), proof.blocked.begin(), proof.blocked.end());
+            }
+        }
+    }
+    if (out.size() > kMaxLayeredWorldFileBytes) {
+        return {};
     }
     return out;
 }
@@ -490,8 +731,23 @@ bool DecodeLayeredWorld(const std::vector<std::uint8_t>& bytes, LayeredWorld& wo
         error = "layered-world sidecar record count exceeds the limit";
         return false;
     }
-    const std::uint64_t minimum_volume_bytes = version >= 3 ? 44 : (version >= 2 ? 40 : 36);
-    if (minimum_volume_bytes * volume_count + 64ull * portal_count > cursor.Remaining()) {
+    if (version >= 4) {
+        LayerClearanceProfile profile;
+        if (!cursor.F32(profile.cell_size_m) || !cursor.F32(profile.actor_radius_m) ||
+            !cursor.F32(profile.actor_height_m) || !cursor.F32(profile.step_height_m) ||
+            !cursor.F32(profile.floor_contact_m)) {
+            error = "layered-world clearance profile is truncated";
+            return false;
+        }
+        if (!profile.Valid()) {
+            error = "layered-world clearance profile is invalid";
+            return false;
+        }
+        decoded.clearance_profile = profile;
+    }
+    const std::uint64_t minimum_volume_bytes = version >= 4 ? 48 : (version >= 3 ? 44 : (version >= 2 ? 40 : 36));
+    const std::uint64_t minimum_portal_bytes = version >= 4 ? 68 : 64;
+    if (minimum_volume_bytes * volume_count + minimum_portal_bytes * portal_count > cursor.Remaining()) {
         error = "layered-world sidecar records are truncated";
         return false;
     }
@@ -556,6 +812,34 @@ bool DecodeLayeredWorld(const std::vector<std::uint8_t>& bytes, LayeredWorld& wo
                 }
             }
         }
+        if (version >= 4) {
+            std::uint8_t has_clearance = 0, reserved0 = 0, reserved1 = 0, reserved2 = 0;
+            if (!cursor.U8(has_clearance) || !cursor.U8(reserved0) || !cursor.U8(reserved1) ||
+                !cursor.U8(reserved2)) {
+                error = "layered-world clearance header " + std::to_string(i) + " is truncated";
+                return false;
+            }
+            if (has_clearance > 1 || reserved0 != 0 || reserved1 != 0 || reserved2 != 0) {
+                error = "layered-world clearance header " + std::to_string(i) + " has unsupported flags";
+                return false;
+            }
+            if (has_clearance != 0) {
+                LayerClearanceGrid grid;
+                if (!cursor.U32(grid.cells_x) || !cursor.U32(grid.cells_y)) {
+                    error = "layered-world clearance grid " + std::to_string(i) + " is truncated";
+                    return false;
+                }
+                const std::uint64_t cells = static_cast<std::uint64_t>(grid.cells_x) * grid.cells_y;
+                if (cells == 0 || cells > kMaxLayerClearanceCellsPerVolume || BitBytes(cells) > cursor.Remaining()) {
+                    error = "layered-world clearance grid " + std::to_string(i) + " has an invalid size";
+                    return false;
+                }
+                std::string raw;
+                cursor.Text(BitBytes(cells), raw);
+                grid.blocked.assign(raw.begin(), raw.end());
+                volume.clearance = std::move(grid);
+            }
+        }
         decoded.volumes.push_back(std::move(volume));
     }
     for (std::uint32_t i = 0; i < portal_count; ++i) {
@@ -575,6 +859,38 @@ bool DecodeLayeredWorld(const std::vector<std::uint8_t>& bytes, LayeredWorld& wo
             return false;
         }
         portal.bidirectional = direction != 0;
+        if (version >= 4) {
+            std::uint8_t has_proof = 0, axis = 0, proof_reserved0 = 0, proof_reserved1 = 0;
+            if (!cursor.U8(has_proof) || !cursor.U8(axis) || !cursor.U8(proof_reserved0) ||
+                !cursor.U8(proof_reserved1)) {
+                error = "layered-world portal proof header " + std::to_string(i) + " is truncated";
+                return false;
+            }
+            if (has_proof > 1 || axis > 1 || (has_proof == 0 && axis != 0) || proof_reserved0 != 0 ||
+                proof_reserved1 != 0) {
+                error = "layered-world portal proof header " + std::to_string(i) + " has unsupported flags";
+                return false;
+            }
+            if (has_proof != 0) {
+                LayerPortalProof proof;
+                proof.axis = axis;
+                if (!cursor.F32(proof.edge) || !cursor.F32(proof.span_min) || !cursor.F32(proof.span_max) ||
+                    !cursor.F64(proof.max_step_m) || !cursor.U32(proof.slots) || !cursor.U32(proof.across)) {
+                    error = "layered-world portal proof " + std::to_string(i) + " is truncated";
+                    return false;
+                }
+                const std::uint64_t corridor_cells = static_cast<std::uint64_t>(proof.slots) * proof.across;
+                if (corridor_cells == 0 || corridor_cells > kMaxLayerClearanceCellsPerVolume ||
+                    BitBytes(corridor_cells) > cursor.Remaining()) {
+                    error = "layered-world portal proof " + std::to_string(i) + " has an invalid size";
+                    return false;
+                }
+                std::string raw;
+                cursor.Text(BitBytes(corridor_cells), raw);
+                proof.blocked.assign(raw.begin(), raw.end());
+                portal.proof = std::move(proof);
+            }
+        }
         decoded.portals.push_back(std::move(portal));
     }
     if (cursor.Remaining() != 0) {

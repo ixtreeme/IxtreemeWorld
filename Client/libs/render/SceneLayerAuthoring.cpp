@@ -6,6 +6,7 @@
 #include <cmath>
 #include <fstream>
 #include <limits>
+#include <optional>
 #include <unordered_set>
 #if defined(_WIN32)
 #include <windows.h>
@@ -38,7 +39,192 @@ void AddBoxGeometry(const phys::ColliderComponent& collider,
     indices = {2,6,7, 2,7,3, 0,1,5, 0,5,4, 0,2,3, 0,3,1,
                4,5,7, 4,7,6, 0,4,6, 0,6,2, 1,3,7, 1,7,5};
 }
+
+float AbsScale(float value) { return std::max(0.001f, std::abs(value)); }
+
+// Box and Mesh colliders: the exact collision triangles, transformed like
+// the Jolt body (scaled centre, Euler rotation, position) into package
+// coordinates with the front-face winding preserved after the axis swap.
+bool ColliderTriangles(const MeshSceneEntity& mesh, const LayerCollisionGeometryProvider& geometryProvider,
+    std::vector<std::array<float, 3>>& layerVertices, std::vector<std::uint32_t>& indices, std::string& reason)
+{
+    std::vector<std::array<float, 3>> vertices;
+    const float scale[3] = {AbsScale(mesh.scale[0]), AbsScale(mesh.scale[1]), AbsScale(mesh.scale[2])};
+    if (mesh.collider.shape == phys::ColliderShape::Box) {
+        if (!Finite(mesh.collider.size, 3) || std::any_of(mesh.collider.size, mesh.collider.size + 3,
+            [](float size) { return size <= 0; })) {
+            reason = "box collider dimensions must be finite and positive";
+            return false;
+        }
+        AddBoxGeometry(mesh.collider, scale, vertices, indices);
+    } else if (mesh.collider.shape == phys::ColliderShape::Mesh) {
+        if (!geometryProvider || !geometryProvider(mesh, vertices, indices) || vertices.empty() || indices.empty()) {
+            reason = "mesh collision triangles unavailable; export has no bounding-box fallback";
+            return false;
+        }
+    } else {
+        reason = "layer generation currently supports Box and Mesh collision shapes";
+        return false;
+    }
+    if (indices.size() % 3 != 0) {
+        reason = "collision index list is not a triangle list";
+        return false;
+    }
+    if (vertices.size() > mx::map::kMaxLayerGeometryVertices ||
+        indices.size() / 3 > mx::map::kMaxLayerGeometryTriangles) {
+        reason = "collision source exceeds the bounded layer cooking limit";
+        return false;
+    }
+    const math::Quat rotation = math::FromEulerRadians({mesh.rotation[0], mesh.rotation[1], mesh.rotation[2]});
+    // Jolt omits the translated shape wrapper for sub-threshold Box centers;
+    // Mesh geometry embeds its scaled center without that threshold.
+    const bool applyCenter = mesh.collider.shape == phys::ColliderShape::Mesh ||
+        std::abs(mesh.collider.center[0] * scale[0]) > 0.0001f ||
+        std::abs(mesh.collider.center[1] * scale[1]) > 0.0001f ||
+        std::abs(mesh.collider.center[2] * scale[2]) > 0.0001f;
+    layerVertices.clear();
+    layerVertices.reserve(vertices.size());
+    for (const auto& vertex : vertices) {
+        const math::Vec3 local{vertex[0] * scale[0] + (applyCenter ? mesh.collider.center[0] * scale[0] : 0),
+                               vertex[1] * scale[1] + (applyCenter ? mesh.collider.center[1] * scale[1] : 0),
+                               vertex[2] * scale[2] + (applyCenter ? mesh.collider.center[2] * scale[2] : 0)};
+        const auto rotated = math::Rotate(rotation, local);
+        layerVertices.push_back(EngineToLayerCoordinates(
+            {rotated.x + mesh.position[0], rotated.y + mesh.position[1], rotated.z + mesh.position[2]}));
+    }
+    // Swapping Y/Z reverses handedness. Preserve the collider's front faces.
+    for (std::size_t i = 0; i < indices.size(); i += 3)
+        std::swap(indices[i + 1], indices[i + 2]);
+    return true;
+}
+
+// Axis-aligned box (engine min/max) as 12 package-space triangles.
+void AppendEngineBox(const std::array<float, 3>& lo, const std::array<float, 3>& hi,
+    std::vector<std::array<float, 3>>& vertices, std::vector<std::uint32_t>& indices)
+{
+    const auto base = static_cast<std::uint32_t>(vertices.size());
+    for (int corner = 0; corner < 8; ++corner) {
+        vertices.push_back(EngineToLayerCoordinates({(corner & 1) ? hi[0] : lo[0],
+                                                     (corner & 2) ? hi[1] : lo[1],
+                                                     (corner & 4) ? hi[2] : lo[2]}));
+    }
+    constexpr std::uint32_t faces[36] = {0,1,3, 0,3,2, 4,6,7, 4,7,5, 0,4,5, 0,5,1,
+                                         2,3,7, 2,7,6, 0,2,6, 0,6,4, 1,5,7, 1,7,3};
+    for (const auto index : faces) indices.push_back(base + index);
+}
+
+// Jolt's default convex radius: convex shapes may extend this far beyond
+// their hull points.
+constexpr float kConvexRadiusMargin = 0.05f;
 } // namespace
+
+mx::map::LayerClearanceProfile SceneLayerClearanceProfile() noexcept
+{
+    const phys::CharacterControllerComponent defaults;
+    mx::map::LayerClearanceProfile profile;
+    profile.cell_size_m = 0.25f;
+    profile.actor_radius_m = defaults.capsuleRadius;
+    profile.actor_height_m = defaults.capsuleHeight;
+    profile.step_height_m = defaults.stepHeight;
+    profile.floor_contact_m = 0.02f;
+    return profile;
+}
+
+mx::map::LayerActorProfile SceneLayerActorProfile() noexcept
+{
+    const auto profile = SceneLayerClearanceProfile();
+    return {profile.actor_radius_m, profile.actor_height_m};
+}
+
+bool BuildLayerObstructionMesh(const MeshSceneEntity& mesh,
+    const LayerCollisionGeometryProvider& geometryProvider,
+    mx::map::LayerObstructionMesh& output, bool& physical, std::string& error)
+{
+    output = {};
+    physical = false;
+    error.clear();
+    // Moving actors and non-colliding sources are not static world geometry.
+    if (mesh.skinned || mesh.hasCharacterController || !mesh.hasCollider || !mesh.collider.enabled ||
+        mesh.collider.trigger || mesh.collider.layer == phys::PhysicsLayer::NoCollision)
+        return true;
+    if (mesh.hasRigidbody && mesh.rigidbody.enabled &&
+        (mesh.rigidbody.bodyType != phys::BodyType::Static || mesh.rigidbody.useGravity))
+        return true;
+    physical = true;
+    const std::string label = "obstruction entity " + std::to_string(mesh.id) + " (" + mesh.name + "): ";
+    if (!Finite(mesh.position, 3) || !Finite(mesh.rotation, 3) || !Finite(mesh.scale, 3) ||
+        !Finite(mesh.collider.center, 3)) {
+        error = label + "collision transform contains non-finite values";
+        return false;
+    }
+    output.source_id = mesh.id;
+    const auto shape = mesh.collider.shape;
+    if (shape == phys::ColliderShape::Box || shape == phys::ColliderShape::Mesh) {
+        std::string reason;
+        if (!ColliderTriangles(mesh, geometryProvider, output.vertices, output.indices, reason)) {
+            error = label + reason;
+            return false;
+        }
+        return true;
+    }
+    const float sx = AbsScale(mesh.scale[0]), sy = AbsScale(mesh.scale[1]), sz = AbsScale(mesh.scale[2]);
+    const math::Quat rotation = math::FromEulerRadians({mesh.rotation[0], mesh.rotation[1], mesh.rotation[2]});
+    const math::Vec3 centre{mesh.collider.center[0] * sx, mesh.collider.center[1] * sy, mesh.collider.center[2] * sz};
+    auto world = [&](const math::Vec3& local) {
+        const auto rotated = math::Rotate(rotation, local);
+        return std::array<float, 3>{rotated.x + mesh.position[0], rotated.y + mesh.position[1], rotated.z + mesh.position[2]};
+    };
+    std::array<float, 3> lo{std::numeric_limits<float>::max(), std::numeric_limits<float>::max(), std::numeric_limits<float>::max()};
+    std::array<float, 3> hi{-lo[0], -lo[1], -lo[2]};
+    auto include = [&](const std::array<float, 3>& p, float grow) {
+        for (int axis = 0; axis < 3; ++axis) {
+            lo[axis] = std::min(lo[axis], p[axis] - grow);
+            hi[axis] = std::max(hi[axis], p[axis] + grow);
+        }
+    };
+    if (shape == phys::ColliderShape::Sphere) {
+        if (!std::isfinite(mesh.collider.radius) || mesh.collider.radius <= 0) {
+            error = label + "sphere collider radius must be finite and positive";
+            return false;
+        }
+        include(world(centre), mesh.collider.radius * std::max({sx, sy, sz}) + kConvexRadiusMargin);
+    } else if (shape == phys::ColliderShape::Capsule) {
+        if (!std::isfinite(mesh.collider.radius) || mesh.collider.radius <= 0 || !std::isfinite(mesh.collider.height)) {
+            error = label + "capsule collider dimensions must be finite and positive";
+            return false;
+        }
+        const float radius = mesh.collider.radius * std::max(sx, sz);
+        const float height = std::max(radius * 2.0f, mesh.collider.height * sy);
+        const float half = std::max(0.001f, (height - radius * 2.0f) * 0.5f);
+        include(world({centre.x, centre.y + half, centre.z}), radius + kConvexRadiusMargin);
+        include(world({centre.x, centre.y - half, centre.z}), radius + kConvexRadiusMargin);
+    } else if (shape == phys::ColliderShape::ConvexHull) {
+        std::vector<std::array<float, 3>> points;
+        std::vector<std::uint32_t> unused;
+        if (geometryProvider && geometryProvider(mesh, points, unused) && !points.empty()) {
+            for (const auto& p : points)
+                include(world({p[0] * sx + centre.x, p[1] * sy + centre.y, p[2] * sz + centre.z}), kConvexRadiusMargin);
+        } else {
+            // The physics body falls back to the collider box without points.
+            const float half[3] = {std::max(0.001f, mesh.collider.size[0]) * sx * 0.5f,
+                                   std::max(0.001f, mesh.collider.size[1]) * sy * 0.5f,
+                                   std::max(0.001f, mesh.collider.size[2]) * sz * 0.5f};
+            for (int corner = 0; corner < 8; ++corner)
+                include(world({centre.x + ((corner & 1) ? half[0] : -half[0]),
+                               centre.y + ((corner & 2) ? half[1] : -half[1]),
+                               centre.z + ((corner & 4) ? half[2] : -half[2])}), kConvexRadiusMargin);
+        }
+    } else {
+        error = label + "unsupported collider shape for the clearance bake";
+        return false;
+    }
+    if (!Finite(lo.data(), 3) || !Finite(hi.data(), 3)) {
+        error = label + "collision bounds are not representable";
+        return false;
+    }
+    AppendEngineBox(lo, hi, output.vertices, output.indices);
+    return true;
+}
 
 std::array<float, 3> EngineToLayerCoordinates(const std::array<float, 3>& point) noexcept
 {
@@ -72,52 +258,17 @@ bool BuildLayerCollisionMesh(const MeshSceneEntity& mesh,
     if (!Finite(mesh.position, 3) || !Finite(mesh.rotation, 3) || !Finite(mesh.scale, 3) ||
         !Finite(mesh.collider.center, 3))
         return reject("collision transform contains non-finite values");
-    std::vector<std::array<float, 3>> vertices;
-    std::vector<std::uint32_t> indices;
-    const float scale[3] = {std::max(0.001f, std::abs(mesh.scale[0])),
-                           std::max(0.001f, std::abs(mesh.scale[1])),
-                           std::max(0.001f, std::abs(mesh.scale[2]))};
-    if (mesh.collider.shape == phys::ColliderShape::Box) {
-        if (!Finite(mesh.collider.size, 3) || std::any_of(mesh.collider.size, mesh.collider.size + 3,
-            [](float size) { return size <= 0; }))
-            return reject("box collider dimensions must be finite and positive");
-        AddBoxGeometry(mesh.collider, scale, vertices, indices);
-    } else if (mesh.collider.shape == phys::ColliderShape::Mesh) {
-        if (!geometryProvider || !geometryProvider(mesh, vertices, indices) || vertices.empty() || indices.empty())
-            return reject("mesh collision triangles unavailable; export has no bounding-box fallback");
-    } else {
-        return reject("layer generation currently supports Box and Mesh collision shapes");
+    std::string reason;
+    if (!ColliderTriangles(mesh, geometryProvider, output.vertices, output.indices, reason)) {
+        output = {};
+        error = label + reason;
+        return false;
     }
-    if (indices.size() % 3 != 0)
-        return reject("collision index list is not a triangle list");
-    if (vertices.size() > mx::map::kMaxLayerGeometryVertices ||
-        indices.size() / 3 > mx::map::kMaxLayerGeometryTriangles)
-        return reject("collision source exceeds the bounded layer cooking limit");
-    const math::Quat rotation = math::FromEulerRadians({mesh.rotation[0], mesh.rotation[1], mesh.rotation[2]});
-    // Jolt omits the translated shape wrapper for sub-threshold Box centers;
-    // Mesh geometry embeds its scaled center without that threshold.
-    const bool applyCenter = mesh.collider.shape == phys::ColliderShape::Mesh ||
-        std::abs(mesh.collider.center[0] * scale[0]) > 0.0001f ||
-        std::abs(mesh.collider.center[1] * scale[1]) > 0.0001f ||
-        std::abs(mesh.collider.center[2] * scale[2]) > 0.0001f;
     output.source_id = mesh.id;
     output.name = mesh.name;
     output.tags = mesh.layerAuthoring.tags;
     output.supports_ground_movement = !mx::map::HasVolumeTag(output.tags, mx::map::VolumeTagWater) &&
         !mx::map::HasVolumeTag(output.tags, mx::map::VolumeTagUnderwater);
-    output.vertices.reserve(vertices.size());
-    for (const auto& vertex : vertices) {
-        const math::Vec3 local{vertex[0] * scale[0] + (applyCenter ? mesh.collider.center[0] * scale[0] : 0),
-                               vertex[1] * scale[1] + (applyCenter ? mesh.collider.center[1] * scale[1] : 0),
-                               vertex[2] * scale[2] + (applyCenter ? mesh.collider.center[2] * scale[2] : 0)};
-        const auto rotated = math::Rotate(rotation, local);
-        output.vertices.push_back(EngineToLayerCoordinates(
-            {rotated.x + mesh.position[0], rotated.y + mesh.position[1], rotated.z + mesh.position[2]}));
-    }
-    output.indices = std::move(indices);
-    // Swapping Y/Z reverses handedness. Preserve the collider's front faces.
-    for (std::size_t i = 0; i < output.indices.size(); i += 3)
-        std::swap(output.indices[i + 1], output.indices[i + 2]);
     return true;
 }
 
@@ -224,6 +375,54 @@ bool GenerateSceneLayers(const SceneData& scene,
     options.require_exact_footprints = true;
     if (!mx::map::GenerateLayeredWorld(surfaces, options, result.world, result.generation)) {
         result.errors = result.generation.errors;
+        return false;
+    }
+
+    // 3D-4B: clearance against EVERY static collider (opted in or not) and
+    // the terrain; an entity whose collision cannot be reproduced fails the
+    // bake instead of silently disappearing from the proof.
+    std::vector<mx::map::LayerObstructionMesh> obstructions;
+    for (const auto& entity : scene.meshEntities) {
+        mx::map::LayerObstructionMesh obstruction;
+        bool physical = false;
+        std::string error;
+        if (!BuildLayerObstructionMesh(entity, geometryProvider, obstruction, physical, error))
+            result.errors.push_back(error);
+        else if (physical)
+            obstructions.push_back(std::move(obstruction));
+    }
+    std::optional<mx::map::LayerTerrainObstruction> terrainObstruction;
+    if (scene.terrain.exists) {
+        const auto& terrain = scene.terrain;
+        const auto samples = (static_cast<std::uint64_t>(terrain.cellsX) + 1) * (static_cast<std::uint64_t>(terrain.cellsZ) + 1);
+        if (terrain.cellsX == 0 || terrain.cellsZ == 0 || !std::isfinite(terrain.cellSizeMeters) ||
+            terrain.cellSizeMeters <= 0 || terrain.heightCmGrid.size() != samples) {
+            result.errors.push_back("terrain clearance needs the exact terrain height grid; missing samples are not free space");
+        } else {
+            // Engine rows run north to south; package rows south to north.
+            mx::map::LayerTerrainObstruction t;
+            t.origin_x = -static_cast<double>(terrain.widthMeters) * 0.5;
+            t.origin_y = -static_cast<double>(terrain.depthMeters) * 0.5;
+            t.cell_size = terrain.cellSizeMeters;
+            t.cells_x = terrain.cellsX;
+            t.cells_y = terrain.cellsZ;
+            t.heights.resize(static_cast<std::size_t>(samples));
+            const std::size_t stride = static_cast<std::size_t>(terrain.cellsX) + 1;
+            for (std::uint32_t row = 0; row <= terrain.cellsZ; ++row)
+                for (std::size_t column = 0; column < stride; ++column)
+                    t.heights[row * stride + column] = terrain.heightCmGrid[(terrain.cellsZ - row) * stride + column] * 0.01f;
+            terrainObstruction = std::move(t);
+        }
+    }
+    if (!result.errors.empty()) {
+        result.world = {};
+        return false;
+    }
+    result.obstructionSources = obstructions.size();
+    if (!mx::map::CookLayerClearance(result.world, result.worldBounds, obstructions,
+            terrainObstruction ? &*terrainObstruction : nullptr, SceneLayerClearanceProfile(), result.clearance)) {
+        result.errors = result.clearance.errors;
+        result.world = {};
         return false;
     }
     return true;

@@ -61,6 +61,17 @@ volume bounds and each endpoint z interval to lie inside its own volume.
 Runtime movement must still perform collision, clearance, ownership and
 gameplay checks.
 
+3D-4B adds an optional `LayerPortalProof` to a portal. It is only derived
+for two walkable volumes whose support rectangles touch exactly (float-equal
+shared edge, axis-aligned) and whose planes differ by at most the profile's
+step height along the shared span. The proof stores the edge axis/position,
+the span, the measured maximum step and a 2D corridor grid (slots along the
+span x cells across a band of edge ± (radius + cell), clamped to both
+footprints). A corridor cell is clear only when the actor capsule is free
+above the upper envelope of the two planes (+ floor contact). Validation
+recomputes the geometry and the step from the planes; any mismatch rejects
+the world. Authored portals without a proof remain metadata only.
+
 ## Validation rules in this milestone
 
 - world bounds are finite and non-degenerate;
@@ -89,6 +100,17 @@ limits and geometric violations reject the package before runtime creation.
 
 The strict fixture covers a ground floor, upper floor, underpass and water
 surface, including portal traversal and malformed-sidecar rejection.
+
+Version 4 (3D-4B) is written only when the world carries a clearance
+profile; a support-only world still encodes byte-identical version 3. The
+v4 header adds the profile (cell size, actor radius, actor height, step
+height, floor contact; 5 x f32). Each volume record gains a flag block and,
+when present, `cells_x`, `cells_y` and a bit-packed blocked grid; each
+portal gains a proof block (axis, edge, span, f64 max step, slots, across,
+bit-packed corridor). Padding bits must be zero. Per-volume and total cell
+counts are bounded, and the encoded sidecar is refused above 4 MiB. The
+profile is present iff at least one grid or proof is present; a grid must
+match its volume footprint exactly and requires valid ground support.
 
 ## Next milestone boundaries
 
@@ -119,9 +141,35 @@ admit production entities or replace the CharacterController. Generated
 volume/component ids belong to one bake; structural rebakes may renumber
 them. A new dataset requires explicit placement, not carrying old ids.
 
-Remaining 3D-4 work is model blocking collision/clearance/navigation and
-explicit portal transitions. 3D-5 connects authoritative entity ownership,
-movement, migration, spatial/AOI/ghost paths, replication and the client.
+3D-4B adds the actor contract. `LayerClearanceProfile` is the actor class
+the world was baked for (editor: the CharacterController default capsule,
+radius 0.35 m, height 1.8 m, step 0.35 m, 0.25 m cells, 2 cm floor
+contact). Each walkable volume's clearance grid marks a cell blocked when
+any static obstruction triangle (every static collider plus the terrain,
+both quad diagonals) intersects the region a capsule centred anywhere in
+that cell may occupy: the cell rectangle dilated by the radius (a square,
+conservative against the disk) between plane + contact and the highest
+plane point + height (+ radius·(sec−1) on slopes). A cell is PASSABLE when
+it is clear in its own grid or inside a clear corridor cell of one of the
+volume's proven portals.
+
+`ResolveLayerActorPlacement` requires the profile, an actor no larger than
+the profile (`ActorNotCovered` otherwise), valid support and passable
+touched cells (`Blocked`). `ResolveLayerActorMove` validates the current
+pose, then requires every cell the straight segment touches (supercover,
+no tunnelling) to be passable. A volume change is accepted only across a
+single proven portal joining the two volumes, crossed inside its span, and
+reports that `portal_id`; anything else stays `TransitionRequired`. A world
+without a clearance bake answers `NoClearanceProof`. Every failure keeps
+the current state. The 3D-4A support-only queries are unchanged.
+
+Not covered by 3D-4B: dynamic/kinematic bodies and triggers (not static
+world), terrain↔volume transitions (terrain is not a volume), portals
+between non-touching or rotated supports, lifts/doors, navigation/path
+finding, and more than one actor class per bake.
+
+3D-5 connects authoritative entity ownership, movement, migration,
+spatial/AOI/ghost paths, replication and the client.
 
 No layer-aware production path should be enabled before the fixture and
 contract tests prove deterministic lookup, non-overlap, portal validation,

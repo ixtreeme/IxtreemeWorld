@@ -172,6 +172,27 @@ mx::map::LayerGroundResult WorldRuntime::MoveLayerGround(const mx::map::LayerGro
     return mx::map::ResolveLayerGroundMove(*layered_metadata_, current, target_volume_id, x, y);
 }
 
+mx::map::LayerGroundResult WorldRuntime::PlaceLayerActor(const mx::map::LayerActorProfile& actor,
+                                                      mx::map::VolumeId volume_id,
+                                                      double x, double y) const noexcept
+{
+    if (!layered_metadata_) {
+        return {mx::map::GroundSupportStatus::NotAvailable};
+    }
+    return mx::map::ResolveLayerActorPlacement(*layered_metadata_, actor, volume_id, x, y);
+}
+
+mx::map::LayerGroundResult WorldRuntime::MoveLayerActor(const mx::map::LayerActorProfile& actor,
+                                                     const mx::map::LayerGroundState& current,
+                                                     mx::map::VolumeId target_volume_id,
+                                                     double x, double y) const noexcept
+{
+    if (!layered_metadata_) {
+        return {mx::map::GroundSupportStatus::NotAvailable, current};
+    }
+    return mx::map::ResolveLayerActorMove(*layered_metadata_, actor, current, target_volume_id, x, y);
+}
+
 WorldRuntime::WorldRuntime(boost::asio::io_context& io,
                            RuntimeIdentity identity,
                            const SyntheticWorldConfig& synthetic)

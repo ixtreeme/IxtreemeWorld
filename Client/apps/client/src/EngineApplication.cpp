@@ -9345,9 +9345,23 @@ int RunGame(NativeWindow& window,
                     }
                     else
                     {
+                        const auto& clearance = layerAuthoringPreview.clearance;
                         status = "Generated " + std::to_string(layerAuthoringPreview.world.volumes.size()) +
                             " volumes from collision. Snapshot: regenerate after edits.";
+                        status += "\nClearance (capsule r=0.35 h=1.8): " + std::to_string(clearance.cells_blocked) +
+                            " of " + std::to_string(clearance.cells_total) + " cells blocked by " +
+                            std::to_string(layerAuthoringPreview.obstructionSources) + " static colliders" +
+                            (clearance.terrain_quads_tested > 0 ? " + terrain" : "") + ".";
+                        status += "\nProven step/ramp portals: " + std::to_string(clearance.portals_derived) +
+                            " (edges above step height: " + std::to_string(clearance.edges_rejected_step) + ").";
                         status += "\nPreview draws up to 256 volumes. Terrain retains its heightfield.";
+                        Tracenf("[LAYER-CLEARANCE] cells=%llu blocked=%llu obstruction_sources=%zu mesh_triangles=%zu terrain_quads=%llu portals=%zu rejected_steps=%zu corridor_cells=%llu corridor_blocked=%llu",
+                            static_cast<unsigned long long>(clearance.cells_total),
+                            static_cast<unsigned long long>(clearance.cells_blocked),
+                            layerAuthoringPreview.obstructionSources, clearance.obstruction_triangles,
+                            static_cast<unsigned long long>(clearance.terrain_quads_tested), clearance.portals_derived,
+                            clearance.edges_rejected_step, static_cast<unsigned long long>(clearance.corridor_slots),
+                            static_cast<unsigned long long>(clearance.corridor_slots_blocked));
                         for (std::size_t i = 0; i < std::min<std::size_t>(8, layerAuthoringPreview.world.volumes.size()); ++i)
                         {
                             const auto& volume = layerAuthoringPreview.world.volumes[i];
@@ -9446,7 +9460,8 @@ int RunGame(NativeWindow& window,
                     }
                     else if (commands.placeLayerGround)
                     {
-                        auto freshProbe = std::make_unique<SceneLayerGround>(freshWorld->world);
+                        // 3D-4B: the probe is the default character capsule.
+                        auto freshProbe = std::make_unique<SceneLayerGround>(freshWorld->world, SceneLayerActorProfile());
                         if (!freshProbe->MatchesWorld(freshWorld->world))
                             status = "Support probe: scene bake cannot be encoded; placement refused.";
                         else
@@ -9480,6 +9495,8 @@ int RunGame(NativeWindow& window,
                     if (queried)
                     {
                         status = "Support probe: " + std::string(mx::map::ToString(result.status));
+                        if (result.Ok() && result.portal_id != 0)
+                            status += " via proven portal " + std::to_string(result.portal_id);
                         if (layerGroundProbe && layerGroundProbe->HasState())
                         {
                             const auto& pose = layerGroundProbe->State();
@@ -9489,10 +9506,10 @@ int RunGame(NativeWindow& window,
                             status += "\nEngine X/Y/Z (m): " + std::to_string(enginePoint[0]) + ", " +
                                 std::to_string(enginePoint[1]) + ", " + std::to_string(enginePoint[2]);
                         }
-                        status += "\nSupport only; character collision and server connection are separate.";
-                        Tracenf("[LAYER-SUPPORT] action=%s status=%s target_volume=%u x=%.6f z=%.6f",
+                        status += "\nCapsule r=0.35 h=1.8 against cooked clearance; no server connection.";
+                        Tracenf("[LAYER-SUPPORT] action=%s status=%s portal=%u target_volume=%u x=%.6f z=%.6f",
                             commands.placeLayerGround ? "place" : "move", mx::map::ToString(result.status),
-                            commands.layerGroundVolume, commands.layerGroundX, commands.layerGroundZ);
+                            result.portal_id, commands.layerGroundVolume, commands.layerGroundX, commands.layerGroundZ);
                     }
                     editorImGui.SetLayerAuthoringStatus(status);
                     runtimeSession->SetEditorStatus(status);
@@ -11083,6 +11100,68 @@ int RunGame(NativeWindow& window,
                                 hue == 1 ? 0.9f : 0.4f, hue == 2 ? 0.9f : 0.45f, 0.85f};
                             for (const auto& edge : edges)
                                 selectedColliderLines.push_back({corners[edge[0]], corners[edge[1]], color});
+                        }
+                        // 3D-4B: blocked clearance cells (red X just above the
+                        // support plane), proven portal edges (green) and the
+                        // support probe (yellow capsule axis).
+                        const auto& world = layerAuthoringPreview.world;
+                        if (world.clearance_profile)
+                        {
+                            const double cell = world.clearance_profile->cell_size_m;
+                            std::size_t drawn = 0;
+                            constexpr std::size_t kMaxBlockedCellsDrawn = 20000;
+                            const std::array<float, 4> red{1.0f, 0.15f, 0.1f, 0.9f};
+                            for (const auto& volume : world.volumes)
+                            {
+                                if (!volume.clearance || !volume.ground_support) continue;
+                                const auto& grid = *volume.clearance;
+                                for (std::uint32_t j = 0; j < grid.cells_y && drawn < kMaxBlockedCellsDrawn; ++j)
+                                {
+                                    for (std::uint32_t c = 0; c < grid.cells_x && drawn < kMaxBlockedCellsDrawn; ++c)
+                                    {
+                                        if (!grid.Blocked(c, j)) continue;
+                                        const double x0 = volume.bounds.min_x + c * cell, y0 = volume.bounds.min_y + j * cell;
+                                        const double x1 = std::min(x0 + cell, static_cast<double>(volume.bounds.max_x));
+                                        const double y1 = std::min(y0 + cell, static_cast<double>(volume.bounds.max_y));
+                                        auto at = [&](double x, double y) {
+                                            return WorldVec3{static_cast<float>(x),
+                                                static_cast<float>(volume.ground_support->Height(x, y) + 0.03),
+                                                static_cast<float>(y)};
+                                        };
+                                        selectedColliderLines.push_back({at(x0, y0), at(x1, y1), red});
+                                        selectedColliderLines.push_back({at(x0, y1), at(x1, y0), red});
+                                        ++drawn;
+                                    }
+                                }
+                            }
+                            const std::array<float, 4> green{0.15f, 1.0f, 0.3f, 1.0f};
+                            for (const auto& portal : world.portals)
+                            {
+                                if (!portal.proof) continue;
+                                const auto& proof = *portal.proof;
+                                const mx::map::LayerVolume* a = nullptr;
+                                for (const auto& volume : world.volumes)
+                                    if (volume.id == portal.source_volume) a = &volume;
+                                if (!a || !a->ground_support) continue;
+                                const double x0 = proof.axis == 0 ? proof.edge : proof.span_min;
+                                const double y0 = proof.axis == 0 ? proof.span_min : proof.edge;
+                                const double x1 = proof.axis == 0 ? proof.edge : proof.span_max;
+                                const double y1 = proof.axis == 0 ? proof.span_max : proof.edge;
+                                for (const double lift : {0.05, 0.25})
+                                    selectedColliderLines.push_back({
+                                        {static_cast<float>(x0), static_cast<float>(a->ground_support->Height(x0, y0) + lift), static_cast<float>(y0)},
+                                        {static_cast<float>(x1), static_cast<float>(a->ground_support->Height(x1, y1) + lift), static_cast<float>(y1)},
+                                        green});
+                            }
+                        }
+                        if (layerGroundProbe && layerGroundProbe->HasState())
+                        {
+                            const auto& p = layerGroundProbe->EnginePosition();
+                            const std::array<float, 4> yellow{1.0f, 0.9f, 0.1f, 1.0f};
+                            const float x = static_cast<float>(p[0]), y = static_cast<float>(p[1]), z = static_cast<float>(p[2]);
+                            selectedColliderLines.push_back({{x, y, z}, {x, y + 1.8f, z}, yellow});
+                            selectedColliderLines.push_back({{x - 0.35f, y + 0.02f, z}, {x + 0.35f, y + 0.02f, z}, yellow});
+                            selectedColliderLines.push_back({{x, y + 0.02f, z - 0.35f}, {x, y + 0.02f, z + 0.35f}, yellow});
                         }
                     }
                     selectionLines.insert(selectionLines.end(),

@@ -114,3 +114,32 @@ queries. Full strict package export already carries these optional planes
 inside `layered_world.mx3d`; no additional terrain format or map converter
 is introduced. Support height is not proof of walls, headroom, slope policy
 or a traversable staircase. See `layered-3d-ground-support-review-20260930.md`.
+
+## Clearance bake and proven step portals (3D-4B)
+
+**Generate layers from collision** now also runs `CookLayerClearance` after
+volume generation. Obstructions are every enabled, non-trigger static
+collider of the scene — whether or not it is opted in to layer authoring —
+plus the terrain height grid. Box and Mesh colliders give their exact
+collision triangles; Sphere, Capsule and ConvexHull give a conservative
+axis-aligned box plus Jolt's 5 cm convex radius. Triggers, the NoCollision
+layer, character controllers, skinned and dynamic/kinematic bodies are not
+static world and are skipped. A missing terrain grid or unreproducible
+collider fails the generation instead of assuming free space.
+
+Stairs are authored as separate walkable boxes whose footprints touch
+exactly (for example 0.75 m treads, 0.25 m risers); each touching edge
+within the step height becomes a proven portal. A tread must be at least
+about radius + cell (≈ 0.6 m) deep to contain standable cells; the corridor
+covers the riser zone. The status line reports blocked/total cells, the
+number of static colliders and the proven portals.
+
+**Show layer volumes** additionally draws blocked cells (X marks on the
+support plane), proven portal edges and the probe's capsule axis; the
+existing line renderer blends these colours with the scene. The support
+probe now uses the baked actor: placements into blocked cells answer
+`blocked`, moves may not cross walls, and a move to another volume succeeds
+only across one proven portal ("ok via proven portal N"). Strict export
+writes MX3D v4; `SceneLayerGroundTest --validate-package <dir>` validates
+the profile, grids and portal crossings of an exported package. See
+`layered-3d-clearance-portal-review-20260930.md`.

@@ -483,7 +483,9 @@ void TestStrictPackageRoundtrip(const TemporaryWorkspace& workspace)
     const std::uint32_t version = bytes.size() >= 8 ? static_cast<std::uint32_t>(bytes[4]) |
         static_cast<std::uint32_t>(bytes[5]) << 8 | static_cast<std::uint32_t>(bytes[6]) << 16 |
         static_cast<std::uint32_t>(bytes[7]) << 24 : 0;
-    Check("scene-support-sidecar-uses-explicit-mx3d-v3",version == 3 && version == map::kLayeredWorldFileVersion);
+    // 3D-4B: scene bakes carry the clearance proof, so the sidecar is v4.
+    Check("scene-support-sidecar-uses-explicit-mx3d-v4-with-clearance",version == 4 &&
+        version == map::kLayeredWorldFileVersion && result.layers.world.clearance_profile.has_value());
     map::LoadOptions options;
     options.depth = map::ValidationDepth::Full;
     options.residency = map::ResidencyMode::Eager;
@@ -512,6 +514,79 @@ void TestStrictPackageRoundtrip(const TemporaryWorkspace& workspace)
 // Read-only verification of a real editor export. The package loader is the
 // independent consumer; these queries prove loaded support semantics, not
 // physical clearance or a Jolt comparison without the original scene assets.
+// 3D-4B checks on a loaded v4 package: the editor's actor profile, a cooked
+// grid per supported volume, blocked cells refusing the actor where support
+// alone still answers, and every proven portal crossable straight across.
+void ValidateExternalClearance(const map::LayeredWorld& world)
+{
+    const auto expected = SceneLayerClearanceProfile();
+    const bool profile = world.clearance_profile &&
+        world.clearance_profile->cell_size_m == expected.cell_size_m &&
+        world.clearance_profile->actor_radius_m == expected.actor_radius_m &&
+        world.clearance_profile->actor_height_m == expected.actor_height_m &&
+        world.clearance_profile->step_height_m == expected.step_height_m &&
+        world.clearance_profile->floor_contact_m == expected.floor_contact_m;
+    Check("external-v4-carries-editor-actor-profile", profile);
+    if (!profile) return;
+    const double cell = world.clearance_profile->cell_size_m;
+    std::size_t graded = 0, blockedCells = 0, blockedRefused = 0;
+    for (const auto& volume : world.volumes) {
+        if (!volume.ground_support || !volume.AllowsGroundMovement()) continue;
+        if (volume.clearance) ++graded;
+        if (!volume.clearance || blockedRefused > 0) continue;
+        for (std::uint32_t j = 0; j < volume.clearance->cells_y && blockedRefused == 0; ++j)
+            for (std::uint32_t i = 0; i < volume.clearance->cells_x && blockedRefused == 0; ++i) {
+                if (!volume.clearance->Blocked(i, j)) continue;
+                ++blockedCells;
+                const double x = volume.bounds.min_x + (i + 0.5) * cell;
+                const double z = volume.bounds.min_y + (j + 0.5) * cell;
+                SceneLayerGround support(world), actor(world, SceneLayerActorProfile());
+                if (support.Place(volume.id, x, z).Ok() &&
+                    actor.Place(volume.id, x, z).status == map::GroundSupportStatus::Blocked)
+                    ++blockedRefused;
+            }
+    }
+    const auto walkable = static_cast<std::size_t>(std::count_if(world.volumes.begin(), world.volumes.end(),
+        [](const auto& volume) { return volume.ground_support && volume.AllowsGroundMovement(); }));
+    Check("external-every-supported-volume-has-clearance", graded == walkable && graded > 0);
+    Check("external-blocked-cell-refuses-actor-where-support-answers", blockedCells == 0 || blockedRefused > 0);
+
+    std::size_t proven = 0, crossed = 0;
+    for (const auto& portal : world.portals) {
+        if (!portal.proof) continue;
+        ++proven;
+        const auto& proof = *portal.proof;
+        const map::LayerVolume* a = nullptr;
+        const map::LayerVolume* b = nullptr;
+        for (const auto& volume : world.volumes) {
+            if (volume.id == portal.source_volume) a = &volume;
+            if (volume.id == portal.target_volume) b = &volume;
+        }
+        if (!a || !b) continue;
+        const double aMax = proof.axis == 0 ? a->bounds.max_x : a->bounds.max_y;
+        const double sideA = aMax <= proof.edge ? -1.0 : 1.0;
+        bool ok = false;
+        for (std::uint32_t k = 0; k < proof.slots && !ok; ++k) {
+            // Middle slot first, then alternating outwards.
+            const std::int64_t middle = proof.slots / 2;
+            const std::int64_t slot = middle + ((k % 2) ? -1 : 1) * static_cast<std::int64_t>((k + 1) / 2);
+            if (slot < 0 || slot >= static_cast<std::int64_t>(proof.slots)) continue;
+            const double along = std::min(static_cast<double>(proof.span_min) + (slot + 0.5) * cell,
+                                          static_cast<double>(proof.span_max) - 0.5 * cell);
+            const double from = proof.edge + sideA * 0.3, to = proof.edge - sideA * 0.3;
+            SceneLayerGround walker(world, SceneLayerActorProfile());
+            const auto start = proof.axis == 0 ? walker.Place(a->id, from, along) : walker.Place(a->id, along, from);
+            if (!start.Ok()) continue;
+            const auto step = proof.axis == 0 ? walker.Move(b->id, to, along) : walker.Move(b->id, along, to);
+            ok = step.Ok() && step.portal_id == portal.id && walker.State().volume_id == b->id;
+        }
+        if (ok) ++crossed;
+    }
+    Check("external-every-proven-portal-crossable-by-baked-actor", crossed == proven);
+    std::cout << "EXTERNAL CLEARANCE summary: graded=" << graded << " walkable=" << walkable <<
+        " proven_portals=" << proven << " crossed=" << crossed << " blocked_refused=" << blockedRefused << '\n';
+}
+
 void ValidateExternalPackage(const fs::path& path)
 {
     map::LoadOptions options;
@@ -531,7 +606,7 @@ void ValidateExternalPackage(const fs::path& path)
     const auto version = static_cast<std::uint32_t>(header[4]) |
         static_cast<std::uint32_t>(header[5]) << 8 | static_cast<std::uint32_t>(header[6]) << 16 |
         static_cast<std::uint32_t>(header[7]) << 24;
-    Check("external-editor-support-sidecar-is-mx3d-v3",file && version == 3);
+    Check("external-editor-support-sidecar-is-mx3d-v3-or-v4",file && (version == 3 || version == 4));
     const auto& world = *loaded->layered_world;
     SceneLayerGround adapter(world);
     std::size_t supported = 0, unavailable = 0, unsupported = 0;
@@ -592,6 +667,7 @@ void ValidateExternalPackage(const fs::path& path)
         SameState(unknown.state,previous) && SameState(adapter.State(),previous));
     std::cout << "EXTERNAL SUPPORT summary: volumes=" << world.volumes.size() << " supported=" << supported <<
         " unavailable=" << unavailable << " unsupported=" << unsupported << " MX3D=" << version << '\n';
+    if (version == 4) ValidateExternalClearance(world);
 }
 
 } // namespace

@@ -19,6 +19,7 @@
 #include <boost/asio/io_context.hpp>
 
 #include "db/CharacterRepository.h"
+#include "map/LayerActorMovement.h"
 #include "map/LayerGroundSupport.h"
 #include "map/MapData.h"
 #include "network/Session.h"
@@ -230,6 +231,18 @@ public:
     mx::map::LayerGroundResult MoveLayerGround(const mx::map::LayerGroundState& current,
                                              mx::map::VolumeId target_volume_id,
                                              double x, double y) const noexcept;
+    // 3D-4B offline actor queries over the same immutable metadata: the
+    // actor capsule must fit the package's cooked clearance, a move may not
+    // pass through a static obstruction, and a volume change is accepted only
+    // across a proven step/ramp portal. Still no admission, ECS, AOI or
+    // replication change; worlds without a clearance bake fail closed.
+    mx::map::LayerGroundResult PlaceLayerActor(const mx::map::LayerActorProfile& actor,
+                                             mx::map::VolumeId volume_id,
+                                             double x, double y) const noexcept;
+    mx::map::LayerGroundResult MoveLayerActor(const mx::map::LayerActorProfile& actor,
+                                            const mx::map::LayerGroundState& current,
+                                            mx::map::VolumeId target_volume_id,
+                                            double x, double y) const noexcept;
     const OwnerMap& Owners() const noexcept
     {
         return owners_by_session_;

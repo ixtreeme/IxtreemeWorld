@@ -31,6 +31,9 @@ const char* ToString(GroundSupportStatus status) noexcept
     case GroundSupportStatus::UnsupportedMovement: return "unsupported_movement";
     case GroundSupportStatus::InvalidState: return "invalid_state";
     case GroundSupportStatus::TransitionRequired: return "transition_required";
+    case GroundSupportStatus::Blocked: return "blocked";
+    case GroundSupportStatus::NoClearanceProof: return "no_clearance_proof";
+    case GroundSupportStatus::ActorNotCovered: return "actor_not_covered";
     }
     return "unknown";
 }
