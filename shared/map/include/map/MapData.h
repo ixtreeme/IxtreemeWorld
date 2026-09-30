@@ -63,16 +63,23 @@ struct Rect {
     float max_x = 0.0f;
     float max_y = 0.0f;
 
+    // Closed containment retained for existing engine/editor consumers.
     bool Contains(float x, float y) const noexcept;
+    // Half-open containment used by server ownership and layered volumes.
+    bool ContainsHalfOpen(float x, float y) const noexcept;
     float CenterX() const noexcept;
     float CenterY() const noexcept;
 };
 
+using AreaId = std::uint32_t;
+
 struct Zone {
-    std::uint32_t id = 0;
+    AreaId id = 0;
     std::string name;
     Rect bounds;
 };
+
+using Area = Zone;
 
 struct SpawnRegion {
     std::uint32_t id = 0;

@@ -17,7 +17,7 @@
 #include "map/MapData.h"
 #include "map/WorldPackage.h"
 #include "map/WorldPackageWriter.h"
-#include "schema/map_manifest.capnp.h"
+#include "schema/world_package_manifest.capnp.h"
 
 #include "../world/package/WorldPackageLoader.h"
 
@@ -373,10 +373,10 @@ int RunWorldPackageScenario(const std::string& fixtures_out)
     {
         // Optional layer of an unsupported version: skipped with a warning.
         auto spec = BaseSpec();
-        spec.patch_manifest = [](mx::map::schema::MapManifest::Builder& m) {
+        spec.patch_manifest = [](mx::map::package_schema::MapManifest::Builder& m) {
             auto layers = m.getLayers();
             for (auto layer : layers) {
-                if (layer.getKind() == mx::map::schema::LayerKind::MOB_SPAWNS) {
+                if (layer.getKind() == mx::map::package_schema::LayerKind::MOB_SPAWNS) {
                     layer.setVersion(9);
                 }
             }
@@ -447,28 +447,28 @@ int RunWorldPackageScenario(const std::string& fixtures_out)
     }
     {
         auto spec = BaseSpec();
-        spec.patch_manifest = [](mx::map::schema::MapManifest::Builder& m) {
+        spec.patch_manifest = [](mx::map::package_schema::MapManifest::Builder& m) {
             m.getChunks()[1].setFile("../escape.mxchunk");
         };
         ExpectSpecRejected(c, "path-traversal", spec, PackageErrorCode::PathInvalid);
     }
     {
         auto spec = BaseSpec();
-        spec.patch_manifest = [](mx::map::schema::MapManifest::Builder& m) {
+        spec.patch_manifest = [](mx::map::package_schema::MapManifest::Builder& m) {
             m.getChunks()[1].setFile("C:/Windows/win.ini");
         };
         ExpectSpecRejected(c, "path-absolute-drive", spec, PackageErrorCode::PathInvalid);
     }
     {
         auto spec = BaseSpec();
-        spec.patch_manifest = [](mx::map::schema::MapManifest::Builder& m) {
+        spec.patch_manifest = [](mx::map::package_schema::MapManifest::Builder& m) {
             m.getChunks()[1].setFile("/etc/passwd");
         };
         ExpectSpecRejected(c, "path-absolute-root", spec, PackageErrorCode::PathInvalid);
     }
     {
         auto spec = BaseSpec();
-        spec.patch_manifest = [](mx::map::schema::MapManifest::Builder& m) {
+        spec.patch_manifest = [](mx::map::package_schema::MapManifest::Builder& m) {
             m.getChunks()[1].setFile("chunks\\chunk_1_0.mxchunk");
         };
         ExpectSpecRejected(c, "path-backslash", spec, PackageErrorCode::PathInvalid);
@@ -479,7 +479,7 @@ int RunWorldPackageScenario(const std::string& fixtures_out)
         const auto dir = c.Dir("path_symlink");
         const auto outside = c.Dir("path_symlink_outside");
         auto spec = BaseSpec();
-        spec.patch_manifest = [](mx::map::schema::MapManifest::Builder& m) {
+        spec.patch_manifest = [](mx::map::package_schema::MapManifest::Builder& m) {
             m.getChunks()[0].setFile("link/chunk_0_0.mxchunk");
         };
         Write(dir, spec);
@@ -547,13 +547,13 @@ int RunWorldPackageScenario(const std::string& fixtures_out)
     }
     for (const std::uint32_t version : {1u, 4u, 7u}) {
         auto spec = BaseSpec();
-        spec.patch_manifest = [version](mx::map::schema::MapManifest::Builder& m) { m.setFormatVersion(version); };
+        spec.patch_manifest = [version](mx::map::package_schema::MapManifest::Builder& m) { m.setFormatVersion(version); };
         ExpectSpecRejected(c, "manifest-version-" + std::to_string(version), spec,
                            PackageErrorCode::ManifestVersionUnsupported);
     }
     {
         auto spec = BaseSpec();
-        spec.patch_manifest = [](mx::map::schema::MapManifest::Builder& m) {
+        spec.patch_manifest = [](mx::map::package_schema::MapManifest::Builder& m) {
             m.initZoneGridDims().setX(2);
             m.getZoneGridDims().setY(2);
         };
@@ -561,34 +561,34 @@ int RunWorldPackageScenario(const std::string& fixtures_out)
     }
     {
         auto spec = BaseSpec();
-        spec.patch_manifest = [](mx::map::schema::MapManifest::Builder& m) { m.setWorldLogicFile("worldlogic.dat"); };
+        spec.patch_manifest = [](mx::map::package_schema::MapManifest::Builder& m) { m.setWorldLogicFile("worldlogic.dat"); };
         ExpectSpecRejected(c, "manifest-v3-legacy-reference", spec, PackageErrorCode::ManifestFieldForbidden);
     }
     {
         auto spec = BaseSpec(2);
-        spec.patch_manifest = [](mx::map::schema::MapManifest::Builder& m) { m.setWorldSizeCellsY(64); };
+        spec.patch_manifest = [](mx::map::package_schema::MapManifest::Builder& m) { m.setWorldSizeCellsY(64); };
         ExpectSpecRejected(c, "manifest-v2-with-v3-fields", spec, PackageErrorCode::ManifestFieldForbidden);
     }
     for (const float cell : {std::numeric_limits<float>::quiet_NaN(), 0.0f, -4.0f,
                              std::numeric_limits<float>::infinity()}) {
         auto spec = BaseSpec();
-        spec.patch_manifest = [cell](mx::map::schema::MapManifest::Builder& m) { m.setCellSizeMeters(cell); };
+        spec.patch_manifest = [cell](mx::map::package_schema::MapManifest::Builder& m) { m.setCellSizeMeters(cell); };
         ExpectSpecRejected(c, "manifest-cell-size-" + std::to_string(cell), spec,
                            PackageErrorCode::ManifestFieldInvalid);
     }
     {
         auto spec = BaseSpec();
-        spec.patch_manifest = [](mx::map::schema::MapManifest::Builder& m) { m.setWorldId("bad id!"); };
+        spec.patch_manifest = [](mx::map::package_schema::MapManifest::Builder& m) { m.setWorldId("bad id!"); };
         ExpectSpecRejected(c, "manifest-world-id", spec, PackageErrorCode::ManifestFieldInvalid);
     }
     {
         auto spec = BaseSpec();
-        spec.patch_manifest = [](mx::map::schema::MapManifest::Builder& m) { m.setWorldSizeCells(0); };
+        spec.patch_manifest = [](mx::map::package_schema::MapManifest::Builder& m) { m.setWorldSizeCells(0); };
         ExpectSpecRejected(c, "manifest-world-size-zero", spec, PackageErrorCode::ManifestFieldInvalid);
     }
     {
         auto spec = BaseSpec();
-        spec.patch_manifest = [](mx::map::schema::MapManifest::Builder& m) {
+        spec.patch_manifest = [](mx::map::package_schema::MapManifest::Builder& m) {
             m.setWorldSizeCells(65536);
             m.setWorldSizeCellsY(65536);
             m.setCellSizeMeters(1.0f); // stays inside the coordinate range
@@ -632,7 +632,7 @@ int RunWorldPackageScenario(const std::string& fixtures_out)
     {
         // A partial chunk file that still carries full-size sections.
         auto spec = BaseSpec();
-        spec.patch_manifest = [](mx::map::schema::MapManifest::Builder& m) {
+        spec.patch_manifest = [](mx::map::package_schema::MapManifest::Builder& m) {
             m.setWorldSizeCells(60);
             m.setWorldSizeCellsY(60);
         };
@@ -640,23 +640,23 @@ int RunWorldPackageScenario(const std::string& fixtures_out)
     }
     {
         auto spec = BaseSpec(2);
-        spec.patch_manifest = [](mx::map::schema::MapManifest::Builder& m) { m.setWorldSizeCells(60); };
+        spec.patch_manifest = [](mx::map::package_schema::MapManifest::Builder& m) { m.setWorldSizeCells(60); };
         ExpectSpecRejected(c, "partial-chunk-v2-unsupported", spec, PackageErrorCode::UnsupportedFeature);
     }
     {
         auto spec = BaseSpec();
-        spec.patch_manifest = [](mx::map::schema::MapManifest::Builder& m) { m.getOrigin().setX(200000.0); };
+        spec.patch_manifest = [](mx::map::package_schema::MapManifest::Builder& m) { m.getOrigin().setX(200000.0); };
         ExpectSpecRejected(c, "coordinate-range", spec, PackageErrorCode::UnsupportedFeature);
     }
     {
         auto spec = BaseSpec();
-        spec.patch_manifest = [](mx::map::schema::MapManifest::Builder& m) { m.getOrigin().setY(std::nan("")); };
+        spec.patch_manifest = [](mx::map::package_schema::MapManifest::Builder& m) { m.getOrigin().setY(std::nan("")); };
         ExpectSpecRejected(c, "origin-non-finite", spec, PackageErrorCode::ManifestFieldInvalid);
     }
     {
         // Moving the origin without moving the logic: the areas fall outside.
         auto spec = BaseSpec();
-        spec.patch_manifest = [](mx::map::schema::MapManifest::Builder& m) { m.getOrigin().setX(1000.0); };
+        spec.patch_manifest = [](mx::map::package_schema::MapManifest::Builder& m) { m.getOrigin().setX(1000.0); };
         ExpectSpecRejected(c, "origin-shift-leaves-areas-outside", spec, PackageErrorCode::WorldLogicOutOfBounds);
     }
     // ---- MAP-2 height range: height layer version 2 ----
@@ -706,9 +706,9 @@ int RunWorldPackageScenario(const std::string& fixtures_out)
     }
     {
         auto spec = BaseSpec();
-        spec.patch_manifest = [](mx::map::schema::MapManifest::Builder& m) {
+        spec.patch_manifest = [](mx::map::package_schema::MapManifest::Builder& m) {
             for (auto layer : m.getLayers()) {
-                if (layer.getKind() == mx::map::schema::LayerKind::HEIGHT) {
+                if (layer.getKind() == mx::map::package_schema::LayerKind::HEIGHT) {
                     layer.setVersion(2);
                 }
             }
@@ -717,7 +717,7 @@ int RunWorldPackageScenario(const std::string& fixtures_out)
     }
     {
         auto spec = BaseSpec();
-        spec.patch_manifest = [](mx::map::schema::MapManifest::Builder& m) {
+        spec.patch_manifest = [](mx::map::package_schema::MapManifest::Builder& m) {
             m.initHeightEncoding().setMetersPerUnit(0.01);
         };
         ExpectSpecRejected(c, "height-v1-with-encoding", spec, PackageErrorCode::ManifestFieldForbidden);
@@ -738,20 +738,20 @@ int RunWorldPackageScenario(const std::string& fixtures_out)
         enc.int32_samples = true;
         enc.meters_per_unit = 0.01;
         spec.height_encoding = enc;
-        spec.patch_manifest = [](mx::map::schema::MapManifest::Builder& m) {
-            m.getHeightEncoding().setSampleType(mx::map::schema::HeightSampleType::INT16);
+        spec.patch_manifest = [](mx::map::package_schema::MapManifest::Builder& m) {
+            m.getHeightEncoding().setSampleType(mx::map::package_schema::HeightSampleType::INT16);
         };
         ExpectSpecRejected(c, "height-v2-sample-type-mismatch", spec, PackageErrorCode::ChunkTocInvalid);
     }
     {
         auto spec = BaseSpec();
-        spec.patch_manifest = [](mx::map::schema::MapManifest::Builder& m) { m.getChunkGrid().setX(3); };
+        spec.patch_manifest = [](mx::map::package_schema::MapManifest::Builder& m) { m.getChunkGrid().setX(3); };
         ExpectSpecRejected(c, "manifest-chunk-grid", spec, PackageErrorCode::ManifestFieldInvalid);
     }
 
     // ===== layers ===================================================================
-    auto patch_layer = [](mx::map::schema::LayerKind kind, std::function<void(mx::map::schema::LayerDecl::Builder)> fn) {
-        return [kind, fn](mx::map::schema::MapManifest::Builder& m) {
+    auto patch_layer = [](mx::map::package_schema::LayerKind kind, std::function<void(mx::map::package_schema::LayerDecl::Builder)> fn) {
+        return [kind, fn](mx::map::package_schema::MapManifest::Builder& m) {
             for (auto layer : m.getLayers()) {
                 if (layer.getKind() == kind) {
                     fn(layer);
@@ -761,32 +761,32 @@ int RunWorldPackageScenario(const std::string& fixtures_out)
     };
     {
         auto spec = BaseSpec();
-        spec.patch_manifest = patch_layer(mx::map::schema::LayerKind::MOB_SPAWNS, [](auto layer) {
-            layer.setKind(mx::map::schema::LayerKind::HEIGHT);
+        spec.patch_manifest = patch_layer(mx::map::package_schema::LayerKind::MOB_SPAWNS, [](auto layer) {
+            layer.setKind(mx::map::package_schema::LayerKind::HEIGHT);
             layer.setFile("");
         });
         ExpectSpecRejected(c, "layer-duplicate", spec, PackageErrorCode::LayerDuplicate);
     }
     {
         auto spec = BaseSpec();
-        spec.patch_manifest = patch_layer(mx::map::schema::LayerKind::MOB_SPAWNS, [](auto layer) {
-            layer.setKind(static_cast<mx::map::schema::LayerKind>(42));
+        spec.patch_manifest = patch_layer(mx::map::package_schema::LayerKind::MOB_SPAWNS, [](auto layer) {
+            layer.setKind(static_cast<mx::map::package_schema::LayerKind>(42));
             layer.setRequired(true);
         });
         ExpectSpecRejected(c, "layer-unknown-required", spec, PackageErrorCode::LayerUnsupported);
     }
     {
         auto spec = BaseSpec();
-        spec.patch_manifest = patch_layer(mx::map::schema::LayerKind::HEIGHT, [](auto layer) { layer.setVersion(3); /* height 1..2 supported */ });
+        spec.patch_manifest = patch_layer(mx::map::package_schema::LayerKind::HEIGHT, [](auto layer) { layer.setVersion(3); /* height 1..2 supported */ });
         ExpectSpecRejected(c, "layer-required-version", spec, PackageErrorCode::LayerUnsupported);
     }
     {
         auto spec = BaseSpec();
-        spec.patch_manifest = [](mx::map::schema::MapManifest::Builder& m) {
+        spec.patch_manifest = [](mx::map::package_schema::MapManifest::Builder& m) {
             auto old = m.getLayers();
-            std::vector<std::tuple<mx::map::schema::LayerKind, bool, mx::map::schema::LayerAudience, std::string>> keep;
+            std::vector<std::tuple<mx::map::package_schema::LayerKind, bool, mx::map::package_schema::LayerAudience, std::string>> keep;
             for (auto layer : old) {
-                if (layer.getKind() != mx::map::schema::LayerKind::HEIGHT) {
+                if (layer.getKind() != mx::map::package_schema::LayerKind::HEIGHT) {
                     keep.emplace_back(layer.getKind(), layer.getRequired(), layer.getAudience(), layer.getFile().cStr());
                 }
             }
@@ -803,13 +803,13 @@ int RunWorldPackageScenario(const std::string& fixtures_out)
     }
     {
         auto spec = BaseSpec();
-        spec.patch_manifest = patch_layer(mx::map::schema::LayerKind::WORLD_LOGIC,
-                                          [](auto layer) { layer.setAudience(mx::map::schema::LayerAudience::CLIENT); });
+        spec.patch_manifest = patch_layer(mx::map::package_schema::LayerKind::WORLD_LOGIC,
+                                          [](auto layer) { layer.setAudience(mx::map::package_schema::LayerAudience::CLIENT); });
         ExpectSpecRejected(c, "layer-server-data-client-only", spec, PackageErrorCode::LayerDeclInvalid);
     }
     {
         auto spec = BaseSpec();
-        spec.patch_manifest = patch_layer(mx::map::schema::LayerKind::HEIGHT, [](auto layer) { layer.setFile("h.bin"); });
+        spec.patch_manifest = patch_layer(mx::map::package_schema::LayerKind::HEIGHT, [](auto layer) { layer.setFile("h.bin"); });
         ExpectSpecRejected(c, "layer-chunk-section-with-file", spec, PackageErrorCode::LayerDeclInvalid);
     }
     {
@@ -830,7 +830,7 @@ int RunWorldPackageScenario(const std::string& fixtures_out)
     // ===== chunk index + integrity (v3) ===================================================
     {
         auto spec = BaseSpec();
-        spec.patch_manifest = [](mx::map::schema::MapManifest::Builder& m) {
+        spec.patch_manifest = [](mx::map::package_schema::MapManifest::Builder& m) {
             auto old = m.getChunks();
             std::vector<std::tuple<std::uint32_t, std::uint32_t, std::string, std::uint64_t, std::uint32_t>> keep;
             for (unsigned i = 0; i + 1 < old.size(); ++i) {
@@ -850,12 +850,12 @@ int RunWorldPackageScenario(const std::string& fixtures_out)
     }
     {
         auto spec = BaseSpec();
-        spec.patch_manifest = [](mx::map::schema::MapManifest::Builder& m) { m.getChunks()[1].setX(0); };
+        spec.patch_manifest = [](mx::map::package_schema::MapManifest::Builder& m) { m.getChunks()[1].setX(0); };
         ExpectSpecRejected(c, "index-duplicate-cell", spec, PackageErrorCode::ChunkIndexInvalid);
     }
     {
         auto spec = BaseSpec();
-        spec.patch_manifest = [](mx::map::schema::MapManifest::Builder& m) { m.getChunks()[1].setX(7); };
+        spec.patch_manifest = [](mx::map::package_schema::MapManifest::Builder& m) { m.getChunks()[1].setX(7); };
         ExpectSpecRejected(c, "index-outside-grid", spec, PackageErrorCode::ChunkIndexInvalid);
     }
     {
@@ -955,12 +955,12 @@ int RunWorldPackageScenario(const std::string& fixtures_out)
     {
         // v3 splat section present although no splat layer is declared.
         auto spec = BaseSpec(3, true);
-        spec.patch_manifest = [](mx::map::schema::MapManifest::Builder& m) {
+        spec.patch_manifest = [](mx::map::package_schema::MapManifest::Builder& m) {
             auto old = m.getLayers();
-            std::vector<std::tuple<mx::map::schema::LayerKind, bool, mx::map::schema::LayerAudience, std::string>> keep;
+            std::vector<std::tuple<mx::map::package_schema::LayerKind, bool, mx::map::package_schema::LayerAudience, std::string>> keep;
             for (auto layer : old) {
-                if (layer.getKind() != mx::map::schema::LayerKind::SPLAT_A &&
-                    layer.getKind() != mx::map::schema::LayerKind::SPLAT_B) {
+                if (layer.getKind() != mx::map::package_schema::LayerKind::SPLAT_A &&
+                    layer.getKind() != mx::map::package_schema::LayerKind::SPLAT_B) {
                     keep.emplace_back(layer.getKind(), layer.getRequired(), layer.getAudience(), layer.getFile().cStr());
                 }
             }
@@ -1181,7 +1181,7 @@ int RunWorldPackageScenario(const std::string& fixtures_out)
         r6=BaseSpec();r6.logic.warps[0].target_x=62;r6.logic.warps[0].target_y=62;emit("r6_self",r6);
         emit("server_only_v3", BaseSpec());
         auto bad_version = BaseSpec();
-        bad_version.patch_manifest = [](mx::map::schema::MapManifest::Builder& m) { m.setFormatVersion(7); };
+        bad_version.patch_manifest = [](mx::map::package_schema::MapManifest::Builder& m) { m.setFormatVersion(7); };
         emit("bad_version", bad_version);
         emit("corrupt_manifest", BaseSpec(), [](const fs::path& dir) {
             auto bytes = ReadAll(dir / "map.manifest");

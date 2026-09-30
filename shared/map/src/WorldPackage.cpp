@@ -22,7 +22,7 @@
 #include <capnp/serialize.h>
 #include <kj/exception.h>
 
-#include "schema/map_manifest.capnp.h"
+#include "schema/world_package_manifest.capnp.h"
 
 namespace mx::map {
 namespace fs = std::filesystem;
@@ -392,7 +392,7 @@ bool ParseManifest(const std::vector<std::uint8_t>& bytes, PackageManifest& out,
                          "exactly one message");
             return false;
         }
-        const auto root = reader.getRoot<schema::MapManifest>();
+        const auto root = reader.getRoot<package_schema::MapManifest>();
         out.format_version = root.getFormatVersion();
         if (out.format_version != kManifestVersionLegacy &&
             out.format_version != kManifestVersionCurrent) {
@@ -419,7 +419,7 @@ bool ParseManifest(const std::vector<std::uint8_t>& bytes, PackageManifest& out,
                          "<= 256 bytes");
         }
         if (static_cast<std::uint16_t>(root.getHeightUnit()) !=
-            static_cast<std::uint16_t>(schema::HeightUnit::CENTIMETERS)) {
+            static_cast<std::uint16_t>(package_schema::HeightUnit::CENTIMETERS)) {
             issues.Error(PackageErrorCode::ManifestFieldInvalid,
                          IssueSite{"manifest", kManifestFile, "heightUnit"},
                          "height unit " + std::to_string(static_cast<unsigned>(root.getHeightUnit())),
@@ -659,10 +659,10 @@ bool ParseManifest(const std::vector<std::uint8_t>& bytes, PackageManifest& out,
                     const auto sample_type = static_cast<std::uint16_t>(enc.getSampleType());
                     out.height_encoding.layer_version = 2;
                     out.height_encoding.int32_samples =
-                        sample_type == static_cast<std::uint16_t>(schema::HeightSampleType::INT32);
+                        sample_type == static_cast<std::uint16_t>(package_schema::HeightSampleType::INT32);
                     out.height_encoding.meters_per_unit = enc.getMetersPerUnit();
                     out.height_encoding.offset_m = enc.getOffsetMeters();
-                    if (sample_type > static_cast<std::uint16_t>(schema::HeightSampleType::INT32)) {
+                    if (sample_type > static_cast<std::uint16_t>(package_schema::HeightSampleType::INT32)) {
                         issues.Error(PackageErrorCode::ManifestFieldInvalid, esite,
                                      "sampleType " + std::to_string(sample_type), "int16 (0) or int32 (1)");
                     }
@@ -687,7 +687,7 @@ bool ParseManifest(const std::vector<std::uint8_t>& bytes, PackageManifest& out,
                 const auto water = root.getWater();
                 const auto raw_model = static_cast<std::uint16_t>(water.getModel());
                 const IssueSite wsite{"manifest", kManifestFile, "water"};
-                if (raw_model > static_cast<std::uint16_t>(schema::WaterModel::BODIES)) {
+                if (raw_model > static_cast<std::uint16_t>(package_schema::WaterModel::BODIES)) {
                     issues.Error(PackageErrorCode::ManifestFieldInvalid, wsite, "water model " + std::to_string(raw_model),
                                  "undeclared (0), none (1), seaLevel (2) or bodies (3)");
                 } else {

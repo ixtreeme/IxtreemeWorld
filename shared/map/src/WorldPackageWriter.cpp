@@ -258,13 +258,13 @@ PackageWriteResult WritePackage(const fs::path& out_dir, const PackageWriteSpec&
     const std::uint32_t grid_x = (size_x + n - 1) / n;
     const std::uint32_t grid_y = (size_y + n - 1) / n;
     capnp::MallocMessageBuilder message;
-    auto manifest = message.initRoot<schema::MapManifest>();
+    auto manifest = message.initRoot<package_schema::MapManifest>();
     manifest.setFormatVersion(spec.format_version);
     manifest.setWorldId(spec.world_id);
     manifest.setWorldName(spec.world_name);
     manifest.setWorldSizeCells(size_x);
     manifest.setCellSizeMeters(spec.cell_size_m);
-    manifest.setHeightUnit(schema::HeightUnit::CENTIMETERS);
+    manifest.setHeightUnit(package_schema::HeightUnit::CENTIMETERS);
     manifest.setChunkSizeCells(n);
     auto palette = manifest.initTexturePalette(static_cast<unsigned>(spec.texture_palette.size()));
     for (std::size_t i = 0; i < spec.texture_palette.size(); ++i) {
@@ -308,38 +308,38 @@ PackageWriteResult WritePackage(const fs::path& out_dir, const PackageWriteSpec&
         chunk_grid.setY(grid_y);
         if (spec.height_encoding) {
             auto enc = manifest.initHeightEncoding();
-            enc.setSampleType(spec.height_encoding->int32_samples ? schema::HeightSampleType::INT32
-                                                                  : schema::HeightSampleType::INT16);
+            enc.setSampleType(spec.height_encoding->int32_samples ? package_schema::HeightSampleType::INT32
+                                                                  : package_schema::HeightSampleType::INT16);
             enc.setMetersPerUnit(spec.height_encoding->meters_per_unit);
             enc.setOffsetMeters(spec.height_encoding->offset_m);
         }
         struct Decl {
-            schema::LayerKind kind;
+            package_schema::LayerKind kind;
             bool required;
-            schema::LayerAudience audience;
+            package_schema::LayerAudience audience;
             const char* file;
             std::uint32_t version;
         };
         std::vector<Decl> decls = {
-            {schema::LayerKind::HEIGHT, true, schema::LayerAudience::SHARED, "", spec.height_encoding ? 2u : 1u},
-            {schema::LayerKind::ATTRIBUTES, true, schema::LayerAudience::SHARED, "", 1u},
+            {package_schema::LayerKind::HEIGHT, true, package_schema::LayerAudience::SHARED, "", spec.height_encoding ? 2u : 1u},
+            {package_schema::LayerKind::ATTRIBUTES, true, package_schema::LayerAudience::SHARED, "", 1u},
         };
         if (spec.splat_size > 0) {
-            decls.push_back({schema::LayerKind::SPLAT_A, false, schema::LayerAudience::CLIENT, "", 1u});
-            decls.push_back({schema::LayerKind::SPLAT_B, false, schema::LayerAudience::CLIENT, "", 1u});
+            decls.push_back({package_schema::LayerKind::SPLAT_A, false, package_schema::LayerAudience::CLIENT, "", 1u});
+            decls.push_back({package_schema::LayerKind::SPLAT_B, false, package_schema::LayerAudience::CLIENT, "", 1u});
         }
-        decls.push_back({schema::LayerKind::WORLD_LOGIC, true, schema::LayerAudience::SHARED, "worldlogic.dat", 1u});
+        decls.push_back({package_schema::LayerKind::WORLD_LOGIC, true, package_schema::LayerAudience::SHARED, "worldlogic.dat", 1u});
         if (spec.mob_spawns) {
-            decls.push_back({schema::LayerKind::MOB_SPAWNS, spec.mob_spawns_required, schema::LayerAudience::SERVER,
+            decls.push_back({package_schema::LayerKind::MOB_SPAWNS, spec.mob_spawns_required, package_schema::LayerAudience::SERVER,
                              "mob_spawns.conf", spec.mob_spawns_version});
         }
         if (spec.water_model != WaterModel::Undeclared) {
             auto water = manifest.initWater();
-            water.setModel(static_cast<schema::WaterModel>(static_cast<std::uint16_t>(spec.water_model)));
+            water.setModel(static_cast<package_schema::WaterModel>(static_cast<std::uint16_t>(spec.water_model)));
             water.setSeaLevelMeters(spec.sea_level_m);
         }
         if (spec.water_model == WaterModel::Bodies) {
-            decls.push_back({schema::LayerKind::WATER_BODIES, true, schema::LayerAudience::SERVER, "water_bodies.mxws", 1u});
+            decls.push_back({package_schema::LayerKind::WATER_BODIES, true, package_schema::LayerAudience::SERVER, "water_bodies.mxws", 1u});
         }
         auto layers = manifest.initLayers(static_cast<unsigned>(decls.size()));
         for (std::size_t i = 0; i < decls.size(); ++i) {

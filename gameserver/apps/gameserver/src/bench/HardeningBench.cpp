@@ -56,7 +56,7 @@
 #include "map/MapData.h"
 #include "map/WorldPackage.h"
 #include "map/WorldPackageWriter.h"
-#include "schema/map_manifest.capnp.h"
+#include "schema/world_package_manifest.capnp.h"
 #include "BenchSnapshot.h"
 #include "BenchWorld.h"
 
@@ -4177,13 +4177,13 @@ std::vector<std::uint8_t> ManifestBytes(std::uint32_t world_cells, float cell_m,
                                         std::uint32_t chunk_cells, std::uint32_t zone_grid)
 {
     capnp::MallocMessageBuilder msg;
-    auto root = msg.initRoot<mx::map::schema::MapManifest>();
+    auto root = msg.initRoot<mx::map::package_schema::MapManifest>();
     root.setFormatVersion(2);
     root.setWorldId("audit");
     root.setWorldName("audit");
     root.setWorldSizeCells(world_cells);
     root.setCellSizeMeters(cell_m);
-    root.setHeightUnit(mx::map::schema::HeightUnit::CENTIMETERS);
+    root.setHeightUnit(mx::map::package_schema::HeightUnit::CENTIMETERS);
     root.setChunkSizeCells(chunk_cells);
     root.initZoneGridDims().setX(zone_grid);
     root.getZoneGridDims().setY(zone_grid);
@@ -4332,7 +4332,7 @@ int RunMapAuditScenario()
         auto spec = AuditSpec(64, 1.0f, 32);
         spec.format_version = 2;
         spec.splat_size = 1;
-        spec.patch_manifest = [](mx::map::schema::MapManifest::Builder& m) {
+        spec.patch_manifest = [](mx::map::package_schema::MapManifest::Builder& m) {
             m.getZoneGridDims().setX(1);
             m.getZoneGridDims().setY(1);
         };
@@ -4492,7 +4492,7 @@ int RunMapAuditScenario()
     // Rows added with MAP-1 (no legacy reproduction beyond the M0 text).
     {
         auto spec = AuditSpec(64, 1.0f, 32);
-        spec.patch_manifest = [](mx::map::schema::MapManifest::Builder& m) {
+        spec.patch_manifest = [](mx::map::package_schema::MapManifest::Builder& m) {
             m.initZoneGridDims().setX(2);
             m.getZoneGridDims().setY(2);
         };

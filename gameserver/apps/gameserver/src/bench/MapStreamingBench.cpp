@@ -1531,8 +1531,8 @@ int RunWorldQueryScenario()
         bad_sea.sea_level_m = std::numeric_limits<double>::quiet_NaN();
         expect_rejected("water-sea-level-non-finite", bad_sea, mx::map::PackageErrorCode::ManifestFieldInvalid);
         auto no_layer = SpecStream(WaterModel::Bodies);
-        no_layer.patch_manifest = [](mx::map::schema::MapManifest::Builder& m) {
-            m.getWater().setModel(mx::map::schema::WaterModel::SEA_LEVEL); // layer present, model not bodies
+        no_layer.patch_manifest = [](mx::map::package_schema::MapManifest::Builder& m) {
+            m.getWater().setModel(mx::map::package_schema::WaterModel::SEA_LEVEL); // layer present, model not bodies
         };
         expect_rejected("water-layer-without-bodies-model", no_layer, mx::map::PackageErrorCode::WaterDeclInvalid);
     }

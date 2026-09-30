@@ -17,11 +17,12 @@ endif()
 
 set(MAP_SCHEMA_FILES
     ${CMAKE_CURRENT_SOURCE_DIR}/schema/map_manifest.capnp
+    ${CMAKE_CURRENT_SOURCE_DIR}/schema/world_package_manifest.capnp
 )
 
 capnp_generate_cpp(MAP_CAPNP_SRCS MAP_CAPNP_HDRS ${MAP_SCHEMA_FILES})
 
-add_library(mapdata STATIC
+add_library(IXEngineMapData STATIC
     ${MAP_CAPNP_SRCS}
     src/MapData.cpp
     src/LayeredWorld.cpp
@@ -32,26 +33,39 @@ add_library(mapdata STATIC
     src/WorldPackageWriter.cpp
 )
 
-target_include_directories(mapdata
+add_library(mapdata ALIAS IXEngineMapData)
+
+target_include_directories(IXEngineMapData
     PUBLIC
         ${CMAKE_CURRENT_SOURCE_DIR}/include
         ${CMAKE_CURRENT_BINARY_DIR}
 )
 
-target_link_libraries(mapdata
+target_link_libraries(IXEngineMapData
     PUBLIC
         CapnProto::capnp
 )
 
-target_compile_features(mapdata PUBLIC cxx_std_20)
+target_compile_features(IXEngineMapData PUBLIC cxx_std_20)
 
 if(MSVC)
-    set_target_properties(mapdata PROPERTIES
+    set_target_properties(IXEngineMapData PROPERTIES
         MSVC_RUNTIME_LIBRARY "MultiThreaded$<$<CONFIG:Debug>:Debug>"
     )
 endif()
 
 if(NOT CMAKE_SYSTEM_NAME STREQUAL "Android")
+    add_executable(engine_server_map_compatibility_test
+        tools/engine_server_map_compatibility_test.cpp
+    )
+    target_link_libraries(engine_server_map_compatibility_test PRIVATE mapdata)
+    target_compile_features(engine_server_map_compatibility_test PRIVATE cxx_std_20)
+    if(MSVC)
+        set_target_properties(engine_server_map_compatibility_test PROPERTIES
+            MSVC_RUNTIME_LIBRARY "MultiThreaded$<$<CONFIG:Debug>:Debug>"
+        )
+    endif()
+
     add_executable(mapgen_test_zone
         tools/mapgen_test_zone.cpp
     )

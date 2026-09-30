@@ -11,7 +11,7 @@
 #include "map/LayeredWorld.h"
 #include "map/ServerTerrain.h"
 #include "map/ServerWater.h"
-#include "schema/map_manifest.capnp.h"
+#include "schema/world_package_manifest.capnp.h"
 
 // World-package writer: the single implementation of the format contract's
 // write side, shared by mapgen_test_zone and the test fixtures. Byte layouts
@@ -59,7 +59,7 @@ struct PackageWriteSpec {
     // Existing map.manifest in the target is never replaced unless set.
     bool overwrite = false;
     // Test hook: last-moment edits of the manifest message (corrupt fixtures).
-    std::function<void(schema::MapManifest::Builder&)> patch_manifest;
+    std::function<void(package_schema::MapManifest::Builder&)> patch_manifest;
 
     std::uint32_t SizeY() const noexcept
     {
