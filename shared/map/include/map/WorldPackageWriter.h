@@ -8,6 +8,7 @@
 #include <vector>
 
 #include "map/MapData.h"
+#include "map/LayeredWorld.h"
 #include "map/ServerTerrain.h"
 #include "map/ServerWater.h"
 #include "schema/map_manifest.capnp.h"
@@ -53,6 +54,8 @@ struct PackageWriteSpec {
     WaterModel water_model = WaterModel::Undeclared;
     double sea_level_m = 0.0;
     std::vector<WaterBodyRect> water_bodies;
+    // Optional 3D-2 sidecar. Empty keeps the package fully legacy-compatible.
+    std::optional<LayeredWorld> layered_world;
     // Existing map.manifest in the target is never replaced unless set.
     bool overwrite = false;
     // Test hook: last-moment edits of the manifest message (corrupt fixtures).

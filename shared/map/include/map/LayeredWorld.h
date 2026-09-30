@@ -15,6 +15,12 @@ using LayerId = std::uint32_t;
 using VolumeId = std::uint32_t;
 
 inline constexpr LayerId kLegacyLayerId = 0;
+inline constexpr std::uint32_t kLayeredWorldFileMagic = 0x4433584d; // "MX3D" little-endian
+inline constexpr std::uint32_t kLayeredWorldFileVersion = 1;
+inline constexpr std::uint32_t kMaxLayeredWorldVolumes = 4096;
+inline constexpr std::uint32_t kMaxLayeredWorldPortals = 8192;
+inline constexpr std::uint32_t kMaxLayeredWorldNameBytes = 128;
+inline constexpr std::uint64_t kMaxLayeredWorldFileBytes = 4ull << 20;
 
 enum class VolumeKind : std::uint8_t {
     Ground = 0,
@@ -81,5 +87,13 @@ struct LayeredWorld {
                     float target_y,
                     float target_z) const noexcept;
 };
+
+// Versioned package sidecar (`layered_world.mx3d`). Decode checks the binary
+// envelope and bounded records; callers must still call Validate() against
+// the package's horizontal world bounds before using the result.
+std::vector<std::uint8_t> EncodeLayeredWorld(const LayeredWorld& world);
+bool DecodeLayeredWorld(const std::vector<std::uint8_t>& bytes,
+                        LayeredWorld& world,
+                        std::string& error);
 
 } // namespace mx::map

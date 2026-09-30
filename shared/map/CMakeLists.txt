@@ -72,4 +72,15 @@ if(NOT CMAKE_SYSTEM_NAME STREQUAL "Android")
             MSVC_RUNTIME_LIBRARY "MultiThreaded$<$<CONFIG:Debug>:Debug>"
         )
     endif()
+
+    add_executable(layered_world_package_test
+        tools/layered_world_package_test.cpp
+    )
+    target_link_libraries(layered_world_package_test PRIVATE mapdata)
+    target_compile_features(layered_world_package_test PRIVATE cxx_std_20)
+    if(MSVC)
+        set_target_properties(layered_world_package_test PROPERTIES
+            MSVC_RUNTIME_LIBRARY "MultiThreaded$<$<CONFIG:Debug>:Debug>"
+        )
+    endif()
 endif()

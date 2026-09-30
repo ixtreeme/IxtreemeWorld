@@ -81,6 +81,7 @@ std::optional<LoadedWorld> LoadWorldPackage(const WorldLoadRequest& request, mx:
     world.chunk_source = std::move(data->chunk_source);
     world.startup_chunks = std::move(data->startup_chunks);
     world.water = std::move(data->water);
+    world.layered_world = std::move(data->layered_world);
     world.logic = std::move(data->logic);
     world.mob_types_config = types_path.string();
     world.mob_type_count = registry.Size();

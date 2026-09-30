@@ -9,6 +9,7 @@
 #include <vector>
 
 #include "map/MapData.h"
+#include "map/LayeredWorld.h"
 #include "map/ServerTerrain.h"
 #include "map/ServerWater.h"
 
@@ -63,6 +64,7 @@ inline constexpr std::uint64_t kMaxManifestBytes = 1ull << 20;
 inline constexpr std::uint64_t kMaxChunkFileBytes = 256ull << 20;
 inline constexpr std::uint64_t kMaxWorldLogicBytes = 16ull << 20;
 inline constexpr std::uint64_t kMaxSpawnFileBytes = 16ull << 20;
+inline constexpr const char* kLayeredWorldFile = "layered_world.mx3d";
 
 // ---- structured issues -------------------------------------------------------
 // Stable numeric codes: never renumber, only append.
@@ -126,6 +128,11 @@ enum class PackageErrorCode : std::uint16_t {
     WaterBodiesTruncated = 602,
     WaterBodyInvalid = 603,
     WaterBodyOverlap = 604,
+    LayeredWorldHeader = 700,
+    LayeredWorldTruncated = 701,
+    LayeredWorldInvalid = 702,
+    LayeredWorldTrailingData = 703,
+    LayeredWorldLimit = 704,
     StartupDataInvalid = 800, // server-side startup data (mob types, config)
     Internal = 900,
 };
@@ -330,6 +337,7 @@ struct ServerWorldData {
     std::shared_ptr<const ChunkSource> chunk_source;
     std::vector<std::uint32_t> startup_chunks; // streaming: the startup set
     ServerWater water;                         // declared water capability (MAP-3)
+    std::optional<LayeredWorld> layered_world; // optional 3D-2 package sidecar
 };
 
 // Number of LoadServerWorld calls in this process (diagnostic: proves that

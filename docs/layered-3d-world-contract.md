@@ -73,10 +73,20 @@ gameplay checks.
 - an empty volume/portal set is a valid legacy contract;
 - point lookup returns at most one volume after validation.
 
-## Next milestone boundaries
+## Package integration (3D-2)
 
-3D-2 will add package serialization/versioning for these declarations and a
-strict fixture with a ground floor, upper floor, underpass and water surface.
+Version 1 of the optional `layered_world.mx3d` sidecar stores bounded
+volume and portal records in little-endian form. A package without this file
+keeps the legacy contract. When the file is present, the strict package
+loader decodes it, validates its record envelope, validates the 3D contract
+against the package XY bounds, and exposes it through `ServerWorldData`.
+Malformed headers, unsupported versions, truncation, trailing bytes, record
+limits and geometric violations reject the package before runtime creation.
+
+The strict fixture covers a ground floor, upper floor, underpass and water
+surface, including portal traversal and malformed-sidecar rejection.
+
+## Next milestone boundaries
 
 3D-3 will make the spatial index and AOI key layer-aware. The key must not
 remain only `(cell_x, cell_y)` once layered entities are admitted.

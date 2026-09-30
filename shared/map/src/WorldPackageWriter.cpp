@@ -75,6 +75,14 @@ std::string ChunkFile(std::uint32_t x, std::uint32_t y)
     return "chunks/chunk_" + std::to_string(x) + "_" + std::to_string(y) + ".mxchunk";
 }
 
+Rect PackageWorldBounds(const PackageWriteSpec& spec)
+{
+    const double max_x = spec.origin_x + static_cast<double>(spec.size_cells_x) * spec.cell_size_m;
+    const double max_y = spec.origin_y + static_cast<double>(spec.SizeY()) * spec.cell_size_m;
+    return Rect{static_cast<float>(spec.origin_x), static_cast<float>(spec.origin_y), static_cast<float>(max_x),
+                static_cast<float>(max_y)};
+}
+
 } // namespace
 
 std::vector<std::uint8_t> EncodeWaterBodies(const std::vector<WaterBodyRect>& bodies)
@@ -227,6 +235,20 @@ PackageWriteResult WritePackage(const fs::path& out_dir, const PackageWriteSpec&
             result.error = "the legacy (v2) layout is square, whole-chunk, origin (0,0), height v1";
             return result;
         }
+        if (spec.layered_world) {
+            result.error = "layered_world sidecar requires manifest format version 3";
+            return result;
+        }
+    } else if (spec.layered_world) {
+        std::string layered_error;
+        if (!spec.layered_world->Validate(PackageWorldBounds(spec), layered_error)) {
+            result.error = "invalid layered_world sidecar: " + layered_error;
+            return result;
+        }
+        if (EncodeLayeredWorld(*spec.layered_world).empty()) {
+            result.error = "invalid layered_world sidecar: record limit or name limit exceeded";
+            return result;
+        }
     }
     std::error_code ec;
     if (!spec.overwrite && fs::exists(out_dir / "map.manifest", ec)) {
@@ -263,6 +285,9 @@ PackageWriteResult WritePackage(const fs::path& out_dir, const PackageWriteSpec&
     }
     if (!legacy && spec.water_model == WaterModel::Bodies) {
         files.emplace_back("water_bodies.mxws", EncodeWaterBodies(spec.water_bodies));
+    }
+    if (!legacy && spec.layered_world) {
+        files.emplace_back("layered_world.mx3d", EncodeLayeredWorld(*spec.layered_world));
     }
 
     if (legacy) {

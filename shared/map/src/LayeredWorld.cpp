@@ -2,6 +2,8 @@
 
 #include <algorithm>
 #include <cmath>
+#include <cstring>
+#include <stdexcept>
 #include <sstream>
 #include <unordered_set>
 
@@ -169,6 +171,252 @@ bool LayeredWorld::CanTraverse(const LayerPortal& portal,
     return source != nullptr && target != nullptr && portal.SourceContains(source_x, source_y, source_z) &&
            target_z >= portal.target_min_z && target_z < portal.target_max_z &&
            target->Contains(target_x, target_y, target_z) && portal.target_bounds.ContainsHalfOpen(target_x, target_y);
+}
+
+namespace {
+
+void PutU8(std::vector<std::uint8_t>& out, std::uint8_t value)
+{
+    out.push_back(value);
+}
+
+void PutU16(std::vector<std::uint8_t>& out, std::uint16_t value)
+{
+    out.push_back(static_cast<std::uint8_t>(value & 0xffu));
+    out.push_back(static_cast<std::uint8_t>((value >> 8) & 0xffu));
+}
+
+void PutU32(std::vector<std::uint8_t>& out, std::uint32_t value)
+{
+    for (int shift = 0; shift < 32; shift += 8) {
+        out.push_back(static_cast<std::uint8_t>((value >> shift) & 0xffu));
+    }
+}
+
+void PutF32(std::vector<std::uint8_t>& out, float value)
+{
+    std::uint32_t bits = 0;
+    static_assert(sizeof(bits) == sizeof(value));
+    std::memcpy(&bits, &value, sizeof(bits));
+    PutU32(out, bits);
+}
+
+void PutRect(std::vector<std::uint8_t>& out, const Rect& rect)
+{
+    PutF32(out, rect.min_x);
+    PutF32(out, rect.min_y);
+    PutF32(out, rect.max_x);
+    PutF32(out, rect.max_y);
+}
+
+class ByteCursor {
+public:
+    explicit ByteCursor(const std::vector<std::uint8_t>& bytes)
+        : bytes_(bytes)
+    {
+    }
+
+    std::size_t Offset() const noexcept
+    {
+        return offset_;
+    }
+
+    std::size_t Remaining() const noexcept
+    {
+        return bytes_.size() - offset_;
+    }
+
+    bool U8(std::uint8_t& out) noexcept
+    {
+        if (Remaining() < 1) {
+            return false;
+        }
+        out = bytes_[offset_++];
+        return true;
+    }
+
+    bool U16(std::uint16_t& out) noexcept
+    {
+        if (Remaining() < 2) {
+            return false;
+        }
+        out = static_cast<std::uint16_t>(bytes_[offset_]) |
+              static_cast<std::uint16_t>(bytes_[offset_ + 1] << 8);
+        offset_ += 2;
+        return true;
+    }
+
+    bool U32(std::uint32_t& out) noexcept
+    {
+        if (Remaining() < 4) {
+            return false;
+        }
+        out = static_cast<std::uint32_t>(bytes_[offset_]) |
+              (static_cast<std::uint32_t>(bytes_[offset_ + 1]) << 8) |
+              (static_cast<std::uint32_t>(bytes_[offset_ + 2]) << 16) |
+              (static_cast<std::uint32_t>(bytes_[offset_ + 3]) << 24);
+        offset_ += 4;
+        return true;
+    }
+
+    bool F32(float& out) noexcept
+    {
+        std::uint32_t bits = 0;
+        if (!U32(bits)) {
+            return false;
+        }
+        static_assert(sizeof(bits) == sizeof(out));
+        std::memcpy(&out, &bits, sizeof(out));
+        return true;
+    }
+
+    bool Text(std::size_t length, std::string& out)
+    {
+        if (Remaining() < length) {
+            return false;
+        }
+        out.assign(reinterpret_cast<const char*>(bytes_.data() + offset_), length);
+        offset_ += length;
+        return true;
+    }
+
+private:
+    const std::vector<std::uint8_t>& bytes_;
+    std::size_t offset_ = 0;
+};
+
+bool ReadRect(ByteCursor& cursor, Rect& rect)
+{
+    return cursor.F32(rect.min_x) && cursor.F32(rect.min_y) && cursor.F32(rect.max_x) && cursor.F32(rect.max_y);
+}
+
+} // namespace
+
+std::vector<std::uint8_t> EncodeLayeredWorld(const LayeredWorld& world)
+{
+    if (world.volumes.size() > kMaxLayeredWorldVolumes || world.portals.size() > kMaxLayeredWorldPortals) {
+        return {};
+    }
+    for (const auto& volume : world.volumes) {
+        if (volume.name.size() > kMaxLayeredWorldNameBytes) {
+            return {};
+        }
+    }
+
+    std::vector<std::uint8_t> out;
+    out.reserve(16 + world.volumes.size() * 40 + world.portals.size() * 60);
+    PutU32(out, kLayeredWorldFileMagic);
+    PutU32(out, kLayeredWorldFileVersion);
+    PutU32(out, static_cast<std::uint32_t>(world.volumes.size()));
+    PutU32(out, static_cast<std::uint32_t>(world.portals.size()));
+    for (const auto& volume : world.volumes) {
+        PutU32(out, volume.id);
+        PutU32(out, volume.layer_id);
+        PutU8(out, static_cast<std::uint8_t>(volume.kind));
+        PutU8(out, volume.supports_ground_movement ? 1 : 0);
+        PutU16(out, static_cast<std::uint16_t>(volume.name.size()));
+        PutRect(out, volume.bounds);
+        PutF32(out, volume.min_z);
+        PutF32(out, volume.max_z);
+        out.insert(out.end(), volume.name.begin(), volume.name.end());
+    }
+    for (const auto& portal : world.portals) {
+        PutU32(out, portal.id);
+        PutU32(out, portal.source_volume);
+        PutU32(out, portal.target_volume);
+        PutRect(out, portal.source_bounds);
+        PutRect(out, portal.target_bounds);
+        PutF32(out, portal.source_min_z);
+        PutF32(out, portal.source_max_z);
+        PutF32(out, portal.target_min_z);
+        PutF32(out, portal.target_max_z);
+        PutU8(out, portal.bidirectional ? 1 : 0);
+        PutU8(out, 0);
+        PutU8(out, 0);
+        PutU8(out, 0);
+    }
+    return out;
+}
+
+bool DecodeLayeredWorld(const std::vector<std::uint8_t>& bytes, LayeredWorld& world, std::string& error)
+{
+    error.clear();
+    world = LayeredWorld{};
+    if (bytes.size() > kMaxLayeredWorldFileBytes) {
+        error = "layered-world sidecar exceeds the size limit";
+        return false;
+    }
+    ByteCursor cursor(bytes);
+    std::uint32_t magic = 0;
+    std::uint32_t version = 0;
+    std::uint32_t volume_count = 0;
+    std::uint32_t portal_count = 0;
+    if (!cursor.U32(magic) || !cursor.U32(version) || !cursor.U32(volume_count) || !cursor.U32(portal_count)) {
+        error = "layered-world sidecar header is truncated";
+        return false;
+    }
+    if (magic != kLayeredWorldFileMagic) {
+        error = "layered-world sidecar magic is invalid";
+        return false;
+    }
+    if (version != kLayeredWorldFileVersion) {
+        error = "layered-world sidecar version " + std::to_string(version) + " is unsupported";
+        return false;
+    }
+    if (volume_count > kMaxLayeredWorldVolumes || portal_count > kMaxLayeredWorldPortals) {
+        error = "layered-world sidecar record count exceeds the limit";
+        return false;
+    }
+    world.volumes.reserve(volume_count);
+    world.portals.reserve(portal_count);
+    for (std::uint32_t i = 0; i < volume_count; ++i) {
+        LayerVolume volume;
+        std::uint8_t raw_kind = 0;
+        std::uint8_t movement = 0;
+        std::uint16_t name_length = 0;
+        if (!cursor.U32(volume.id) || !cursor.U32(volume.layer_id) || !cursor.U8(raw_kind) ||
+            !cursor.U8(movement) || !cursor.U16(name_length) || !ReadRect(cursor, volume.bounds) ||
+            !cursor.F32(volume.min_z) || !cursor.F32(volume.max_z)) {
+            error = "layered-world volume record " + std::to_string(i) + " is truncated";
+            return false;
+        }
+        if (raw_kind > static_cast<std::uint8_t>(VolumeKind::Connector) || movement > 1 ||
+            name_length > kMaxLayeredWorldNameBytes) {
+            error = "layered-world volume record " + std::to_string(i) + " has an invalid field";
+            return false;
+        }
+        volume.kind = static_cast<VolumeKind>(raw_kind);
+        volume.supports_ground_movement = movement != 0;
+        if (!cursor.Text(name_length, volume.name)) {
+            error = "layered-world volume record " + std::to_string(i) + " name is truncated";
+            return false;
+        }
+        world.volumes.push_back(std::move(volume));
+    }
+    for (std::uint32_t i = 0; i < portal_count; ++i) {
+        LayerPortal portal;
+        std::uint8_t direction = 0;
+        std::uint8_t reserved = 0;
+        if (!cursor.U32(portal.id) || !cursor.U32(portal.source_volume) || !cursor.U32(portal.target_volume) ||
+            !ReadRect(cursor, portal.source_bounds) || !ReadRect(cursor, portal.target_bounds) ||
+            !cursor.F32(portal.source_min_z) || !cursor.F32(portal.source_max_z) ||
+            !cursor.F32(portal.target_min_z) || !cursor.F32(portal.target_max_z) || !cursor.U8(direction) ||
+            !cursor.U8(reserved) || !cursor.U8(reserved) || !cursor.U8(reserved)) {
+            error = "layered-world portal record " + std::to_string(i) + " is truncated";
+            return false;
+        }
+        if (direction > 1) {
+            error = "layered-world portal record " + std::to_string(i) + " has an invalid direction flag";
+            return false;
+        }
+        portal.bidirectional = direction != 0;
+        world.portals.push_back(std::move(portal));
+    }
+    if (cursor.Remaining() != 0) {
+        error = "layered-world sidecar has trailing bytes at offset " + std::to_string(cursor.Offset());
+        return false;
+    }
+    return true;
 }
 
 } // namespace mx::map

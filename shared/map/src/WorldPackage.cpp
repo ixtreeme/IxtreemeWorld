@@ -1983,6 +1983,11 @@ const char* ToString(PackageErrorCode code) noexcept
     case PackageErrorCode::WaterBodiesTruncated: return "WATER_BODIES_TRUNCATED";
     case PackageErrorCode::WaterBodyInvalid: return "WATER_BODY_INVALID";
     case PackageErrorCode::WaterBodyOverlap: return "WATER_BODY_OVERLAP";
+    case PackageErrorCode::LayeredWorldHeader: return "LAYERED_WORLD_HEADER";
+    case PackageErrorCode::LayeredWorldTruncated: return "LAYERED_WORLD_TRUNCATED";
+    case PackageErrorCode::LayeredWorldInvalid: return "LAYERED_WORLD_INVALID";
+    case PackageErrorCode::LayeredWorldTrailingData: return "LAYERED_WORLD_TRAILING_DATA";
+    case PackageErrorCode::LayeredWorldLimit: return "LAYERED_WORLD_LIMIT";
     case PackageErrorCode::StartupDataInvalid: return "STARTUP_DATA_INVALID";
     case PackageErrorCode::Internal: return "INTERNAL";
     }
@@ -2297,6 +2302,50 @@ std::optional<ServerWorldData> LoadServerWorld(const fs::path& package_root,
                 ServerWorldData data;
                 const GridGeometry geometry = manifest.Geometry();
                 data.residency = report.residency;
+                // Optional 3D-2 sidecar. Its absence is the legacy contract;
+                // if present, it is strict and must validate before runtime
+                // data can be returned.
+                if (files.Exists(kLayeredWorldFile)) {
+                    if (const auto bytes = files.Read(kLayeredWorldFile,
+                                                      kMaxLayeredWorldFileBytes,
+                                                      IssueSite{"layeredWorld", kLayeredWorldFile})) {
+                        LayeredWorld layered;
+                        std::string layered_error;
+                        if (!DecodeLayeredWorld(*bytes, layered, layered_error)) {
+                            PackageErrorCode code = PackageErrorCode::LayeredWorldInvalid;
+                            if (layered_error.find("header") != std::string::npos ||
+                                layered_error.find("magic") != std::string::npos ||
+                                layered_error.find("version") != std::string::npos) {
+                                code = PackageErrorCode::LayeredWorldHeader;
+                            } else if (layered_error.find("truncated") != std::string::npos) {
+                                code = PackageErrorCode::LayeredWorldTruncated;
+                            } else if (layered_error.find("trailing") != std::string::npos) {
+                                code = PackageErrorCode::LayeredWorldTrailingData;
+                            } else if (layered_error.find("limit") != std::string::npos) {
+                                code = PackageErrorCode::LayeredWorldLimit;
+                            }
+                            issues.Error(code,
+                                         IssueSite{"layeredWorld", kLayeredWorldFile},
+                                         layered_error,
+                                         "MX3D version 1 with bounded records");
+                        } else {
+                            const double max_x = manifest.origin_x + manifest.ExtentX();
+                            const double max_y = manifest.origin_y + manifest.ExtentY();
+                            const Rect world_bounds{static_cast<float>(manifest.origin_x),
+                                                    static_cast<float>(manifest.origin_y),
+                                                    static_cast<float>(max_x),
+                                                    static_cast<float>(max_y)};
+                            if (!layered.Validate(world_bounds, layered_error)) {
+                                issues.Error(PackageErrorCode::LayeredWorldInvalid,
+                                             IssueSite{"layeredWorld", kLayeredWorldFile},
+                                             layered_error,
+                                             "finite, non-overlapping volumes and in-bounds portals");
+                            } else {
+                                data.layered_world = std::move(layered);
+                            }
+                        }
+                    }
+                }
                 std::vector<TerrainChunk> chunks(manifest.chunks.size());
                 bool any_splat = false;
                 std::uint32_t splat_w = 0, splat_h = 0;

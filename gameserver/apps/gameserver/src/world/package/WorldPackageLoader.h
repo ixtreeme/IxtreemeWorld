@@ -27,6 +27,7 @@ struct LoadedWorld {
     std::shared_ptr<const mx::map::ChunkSource> chunk_source;
     std::vector<std::uint32_t> startup_chunks;
     mx::map::ServerWater water; // declared water capability (MAP-3)
+    std::optional<mx::map::LayeredWorld> layered_world; // optional 3D-2 package sidecar
     mx::map::WorldLogic logic;
     std::vector<MobSpawnPoint> spawn_points;
     std::string mob_types_config; // absolute path, loaded and checked
