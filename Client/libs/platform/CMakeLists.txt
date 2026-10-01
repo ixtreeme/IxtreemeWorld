@@ -5,10 +5,12 @@ add_library(IXEnginePlatform STATIC
     platform/dynamic_library.h
     platform/process.h
     platform/open_external.h
+    platform/tcp_stream.h
     Trash_Stub.cpp
     DynamicLibrary_Posix.cpp
     Process_Posix.cpp
     OpenExternal_Posix.cpp
+    TcpStream_Posix.cpp
     VulkanDevice.cpp
     VulkanDevice.h
 )
@@ -21,11 +23,13 @@ if(WIN32)
         DynamicLibrary_Win32.cpp
         Process_Win32.cpp
         OpenExternal_Win32.cpp
+        TcpStream_Win32.cpp
     )
     target_link_libraries(IXEnginePlatform PUBLIC
         Vulkan::Vulkan
         Gdi32
         Shell32
+        Ws2_32
     )
     target_compile_definitions(IXEnginePlatform PUBLIC
         WIN32_LEAN_AND_MEAN

@@ -100,6 +100,15 @@ protected:
     void SetAnimatorBool(const std::string& name, bool v) { api->SetAnimatorBool(entityId, name, v); }
     void SetAnimatorTrigger(const std::string& name) { api->SetAnimatorTrigger(entityId, name); }
 
+    // Generic TCP transport + text prompt (see IScriptApi; v4).
+    std::uint32_t NetConnect(const std::string& host, std::uint32_t port) { return api->NetConnect(host, port); }
+    int NetState(std::uint32_t handle) { return api->NetState(handle); }
+    bool NetSend(std::uint32_t handle, const std::uint8_t* data, std::uint32_t size) { return api->NetSend(handle, data, size); }
+    std::uint32_t NetReceive(std::uint32_t handle, std::uint8_t* out, std::uint32_t capacity) { return api->NetReceive(handle, out, capacity); }
+    void NetClose(std::uint32_t handle) { api->NetClose(handle); }
+    std::uint32_t PromptText(const std::string& title, const std::string& label, bool secret) { return api->PromptText(title, label, secret); }
+    int PromptResult(std::uint32_t promptId, char* out, std::uint32_t capacity) { return api->PromptResult(promptId, out, capacity); }
+
     void Log(const std::string& msg) { api->Log(msg); }
     void LogError(const std::string& msg) { api->LogError(msg); }
 

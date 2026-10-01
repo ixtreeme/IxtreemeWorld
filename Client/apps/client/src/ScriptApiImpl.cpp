@@ -4,7 +4,9 @@
 #include "Debug.h"
 #include "ViewportControls.h"  // MovementInputState
 
+#include <algorithm>
 #include <cmath>
+#include <cstring>
 
 namespace
 {
@@ -212,4 +214,148 @@ void ScriptApiImpl::SetAnimatorTrigger(std::uint32_t id, const std::string& name
 {
     if (setAnimatorParam)
         setAnimatorParam(id, name, AnimatorParamType::Trigger, 0.0f, false);
+}
+
+// --- generic TCP transport: a byte stream only; the game's protocol lives in its scripts ---
+
+namespace
+{
+constexpr std::size_t kMaxScriptStreams = 16;
+constexpr std::size_t kMaxScriptPrompts = 8;
+constexpr std::size_t kMaxPromptText = 256;
+
+void WipeText(std::string& text)
+{
+    // Prompt answers may be passwords: overwrite before releasing the buffer.
+    std::fill(text.begin(), text.end(), '\0');
+    text.clear();
+    text.shrink_to_fit();
+}
+} // namespace
+
+std::uint32_t ScriptApiImpl::NetConnect(const std::string& host, std::uint32_t port)
+{
+    if (host.empty() || port == 0 || port > 65535)
+    {
+        TraceError("[SCRIPT] NetConnect: invalid endpoint '%s:%u'", host.c_str(), port);
+        return 0;
+    }
+    if (m_streams.size() >= kMaxScriptStreams)
+    {
+        TraceError("[SCRIPT] NetConnect: stream limit (%zu) reached", kMaxScriptStreams);
+        return 0;
+    }
+    std::string error;
+    std::unique_ptr<platform::TcpStream> stream =
+        platform::TcpStream::Connect(host, static_cast<std::uint16_t>(port), &error);
+    if (!stream)
+    {
+        TraceError("[SCRIPT] NetConnect %s:%u failed: %s", host.c_str(), port, error.c_str());
+        return 0;
+    }
+    const std::uint32_t handle = m_nextStream++;
+    m_streams.emplace(handle, std::move(stream));
+    return handle;
+}
+
+int ScriptApiImpl::NetState(std::uint32_t handle)
+{
+    const auto it = m_streams.find(handle);
+    if (it == m_streams.end())
+        return 3;
+    switch (it->second->Poll())
+    {
+    case platform::TcpStream::State::Connecting: return 0;
+    case platform::TcpStream::State::Connected: return 1;
+    case platform::TcpStream::State::Closed: return 2;
+    case platform::TcpStream::State::Failed: return 3;
+    }
+    return 3;
+}
+
+bool ScriptApiImpl::NetSend(std::uint32_t handle, const std::uint8_t* data, std::uint32_t size)
+{
+    const auto it = m_streams.find(handle);
+    if (it == m_streams.end() || (size > 0 && data == nullptr))
+        return false;
+    return it->second->Send(data, size);
+}
+
+std::uint32_t ScriptApiImpl::NetReceive(std::uint32_t handle, std::uint8_t* out, std::uint32_t capacity)
+{
+    const auto it = m_streams.find(handle);
+    if (it == m_streams.end() || out == nullptr || capacity == 0)
+        return 0;
+    it->second->Poll();
+    return static_cast<std::uint32_t>(it->second->Receive(out, capacity));
+}
+
+void ScriptApiImpl::NetClose(std::uint32_t handle)
+{
+    const auto it = m_streams.find(handle);
+    if (it == m_streams.end())
+        return;
+    it->second->Close();
+    m_streams.erase(it);
+}
+
+// --- text prompts: the script asks, the host UI (editor) draws, the script collects the answer ---
+
+std::uint32_t ScriptApiImpl::PromptText(const std::string& title, const std::string& label, bool secret)
+{
+    if (!promptsAvailable || m_prompts.size() >= kMaxScriptPrompts)
+        return 0;
+    const std::uint32_t id = m_nextPrompt++;
+    Prompt prompt;
+    prompt.title = title.substr(0, 128);
+    prompt.label = label.substr(0, 128);
+    prompt.secret = secret;
+    m_prompts.emplace(id, std::move(prompt));
+    return id;
+}
+
+int ScriptApiImpl::PromptResult(std::uint32_t promptId, char* out, std::uint32_t capacity)
+{
+    const auto it = m_prompts.find(promptId);
+    if (it == m_prompts.end())
+        return -1;
+    Prompt& prompt = it->second;
+    if (prompt.status == 0)
+        return 0;
+    const int status = prompt.status;
+    if (status == 1 && out != nullptr && capacity > 0)
+    {
+        const std::size_t n = std::min<std::size_t>(prompt.text.size(), capacity - 1);
+        std::memcpy(out, prompt.text.data(), n);
+        out[n] = '\0';
+    }
+    WipeText(prompt.text);
+    m_prompts.erase(it);  // the engine forgets the answer once the script has collected it
+    return status == 1 ? 1 : -1;
+}
+
+void ScriptApiImpl::SubmitPrompt(std::uint32_t id, const std::string& text)
+{
+    const auto it = m_prompts.find(id);
+    if (it == m_prompts.end() || it->second.status != 0)
+        return;
+    it->second.text.assign(text, 0, kMaxPromptText);  // the caller wipes its own copy
+    it->second.status = 1;
+}
+
+void ScriptApiImpl::CancelPrompt(std::uint32_t id)
+{
+    const auto it = m_prompts.find(id);
+    if (it != m_prompts.end() && it->second.status == 0)
+        it->second.status = -1;
+}
+
+void ScriptApiImpl::ResetTransportAndPrompts()
+{
+    for (auto& [handle, stream] : m_streams)
+        stream->Close();
+    m_streams.clear();
+    for (auto& [id, prompt] : m_prompts)
+        WipeText(prompt.text);
+    m_prompts.clear();
 }

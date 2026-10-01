@@ -74,6 +74,25 @@ public:
     // frame. Lets the engine skip the expensive Game-view scene render when it's not shown.
     bool IsGameViewVisible() const { return m_gameViewVisible; }
 
+    // Script text prompts (IScriptApi::PromptText) drawn as small modal-less dialogs during Play. The
+    // engine hands the open prompts in each frame and collects the answers after RenderPanels. Secret
+    // prompts are masked, and every input buffer is wiped once answered or no longer listed.
+    struct ScriptPromptView
+    {
+        std::uint32_t id = 0;
+        std::string title;
+        std::string label;
+        bool secret = false;
+    };
+    struct ScriptPromptAnswer
+    {
+        std::uint32_t id = 0;
+        bool submitted = false;  // false = cancelled
+        std::string text;
+    };
+    void SetScriptPrompts(std::vector<ScriptPromptView> prompts);
+    std::vector<ScriptPromptAnswer> TakeScriptPromptAnswers();
+
     // Native C++ game-module DLLs (Unreal-style): load/unload the project's modules, and the in-engine
     // Build pipeline driven from RunGame's frame loop. Called from EngineApplication.
     void LoadProjectGameModules(const std::filesystem::path& projectRoot);
@@ -494,6 +513,15 @@ private:
     bool m_showLayerVolumes = false;
     float m_serverWorldSpawn[2] = {0, 0};
     std::uint32_t m_serverWorldSpawnVolume = 0;
+    struct ScriptPromptBuffer
+    {
+        ScriptPromptView view;
+        std::array<char, 257> text{};
+        bool focusPending = true;
+    };
+    std::vector<ScriptPromptBuffer> m_scriptPrompts;
+    std::vector<ScriptPromptAnswer> m_scriptPromptAnswers;
+    void RenderScriptPrompts();
     char m_serverWorldId[65] = "editor-world";
     std::uint32_t m_layerGroundVolume = 1;
     float m_layerGroundPoint[2] = {0, 0};

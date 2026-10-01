@@ -4119,8 +4119,13 @@ int RunGame(NativeWindow& window,
 #if defined(IXTREEME_WITH_EDITOR)
         playerInputActive = editorPlay.state.mode == EditorPlayMode::Play && !cameraController.IsFreeCameraEnabled();
 #endif
+        // ...except while a text field (e.g. a script prompt) owns the keyboard: typed keys must not
+        // also drive the player.
+        const bool keyboardEvent = event.type == InputEvent::KeyDown || event.type == InputEvent::KeyUp ||
+            event.type == InputEvent::Char;
+        const bool textInputOwnsKeyboard = keyboardEvent && editorImGui.IsTextInputActive();
         if (editorImGui.WantsInputCapture(event) && !sceneViewInputTarget && !editorFlyCameraKey &&
-            !playerInputActive)
+            (!playerInputActive || textInputOwnsKeyboard))
         {
             movement.Clear();
             return;
@@ -6783,6 +6788,7 @@ int RunGame(NativeWindow& window,
                     }
                     entityScripts.clear();
                     scriptSystem.reset();
+                    scriptApi.ResetTransportAndPrompts();  // close script streams, forget prompts
                     entityAudioSources.clear();  // dtors stop + uninit every ma_sound
                     editorWaterBodiesDirty = true;
                     if (editorPlay.playStartSceneWasOpen)
@@ -11448,7 +11454,25 @@ int RunGame(NativeWindow& window,
             }
             editorImGui.SetEngineStats(engineStats);
             rhiDevice->WriteTimestamp(ixrhi::IXRHITimestampPoint::ImGuiBegin);
+            // Script text prompts (IScriptApi::PromptText): the editor UI draws the open ones and hands
+            // the answers back right after the panels are built.
+            scriptApi.promptsAvailable = true;
+            {
+                std::vector<EditorImGui::ScriptPromptView> promptViews;
+                for (const auto& [promptId, prompt] : scriptApi.Prompts())
+                    if (prompt.status == 0)
+                        promptViews.push_back({promptId, prompt.title, prompt.label, prompt.secret});
+                editorImGui.SetScriptPrompts(std::move(promptViews));
+            }
             editorImGui.RenderPanels();
+            for (EditorImGui::ScriptPromptAnswer& answer : editorImGui.TakeScriptPromptAnswers())
+            {
+                if (answer.submitted)
+                    scriptApi.SubmitPrompt(answer.id, answer.text);
+                else
+                    scriptApi.CancelPrompt(answer.id);
+                std::fill(answer.text.begin(), answer.text.end(), '\0');  // may be a password
+            }
             editorAdapter->DrawFrame(*frameInfo.commandList, frameInfo.frameNumber);
             rhiDevice->WriteTimestamp(ixrhi::IXRHITimestampPoint::ImGuiEnd);
 #else
@@ -11757,6 +11781,7 @@ int RunGame(NativeWindow& window,
     }
     entityScripts.clear();
     scriptSystem.reset();
+    scriptApi.ResetTransportAndPrompts();
 #endif
 
     device.WaitIdle();

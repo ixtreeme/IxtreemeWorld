@@ -84,6 +84,26 @@ public:
     virtual void SetAnimatorBool(std::uint32_t id, const std::string& name, bool value) = 0;
     virtual void SetAnimatorTrigger(std::uint32_t id, const std::string& name) = 0;
 
+    // --- generic TCP transport (v4). A byte stream only: no framing, no protocol -- a game's network
+    //     protocol lives in its scripts. Non-blocking; the engine polls the stream on every call.
+    //     Every stream is closed when Play stops. ---
+    // Starts a connect to host:port (DNS name or IP literal). Returns a handle, 0 if it cannot start.
+    virtual std::uint32_t NetConnect(const std::string& host, std::uint32_t port) = 0;
+    // 0 = connecting, 1 = connected, 2 = closed by the peer / NetClose, 3 = failed or unknown handle.
+    virtual int NetState(std::uint32_t handle) = 0;
+    // Queues bytes (caller-owned buffer, read only). False once the stream is closed/failed.
+    virtual bool NetSend(std::uint32_t handle, const std::uint8_t* data, std::uint32_t size) = 0;
+    // Moves up to `capacity` received bytes into the caller's buffer; returns how many.
+    virtual std::uint32_t NetReceive(std::uint32_t handle, std::uint8_t* out, std::uint32_t capacity) = 0;
+    virtual void NetClose(std::uint32_t handle) = 0;
+
+    // --- text prompt (v4): an engine-drawn dialog asking the player for one line of text (`secret`
+    //     masks the input, e.g. a password). Returns a prompt id (0 = prompts unavailable). ---
+    virtual std::uint32_t PromptText(const std::string& title, const std::string& label, bool secret) = 0;
+    // 0 = still open, 1 = submitted (UTF-8 copied into `out`, NUL-terminated, truncated to capacity-1;
+    // the engine then forgets the text), -1 = cancelled / unknown id.
+    virtual int PromptResult(std::uint32_t promptId, char* out, std::uint32_t capacity) = 0;
+
     // (NEVER add an STL-by-value return here — use a caller-owned char* buffer for strings to keep the
     //  /MT module boundary safe. By-value RaycastHit is fine: it is POD, no heap.)
 };

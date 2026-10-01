@@ -63,6 +63,7 @@
 #include "LayerSupportBench.h"
 #include "LayerClearanceBench.h"
 #include "LayeredPresenceBench.h"
+#include "ScriptWireBench.h"
 
 #include <flecs.h>
 
@@ -164,7 +165,7 @@ bool ParseArgs(int argc, char** argv, BenchConfig& config)
                          "             [--partition-min-size M] [--lod-off] [--loadfield-off]\n"
                          "             [--scenario NAME] [--world-km K] [--zones-x N] [--zones-y N]\n"
                          "             [--warmup S] [--asf-off] [--file-world] [--eager-terrain] [--budget-mb M]\n"
-                         "             [--mode map4|mapaudit|worldpackage|layerlookup|layersupport|layerclearance|layeredpresence|terrain|mapsplit|streaming|worldquery|streamlife|streamadmission|streamsoak]\n"
+                         "             [--mode map4|mapaudit|worldpackage|layerlookup|layersupport|layerclearance|layeredpresence|scriptwire|terrain|mapsplit|streaming|worldquery|streamlife|streamadmission|streamsoak]\n"
                          "             [--mode tickrate] [--rates 20,30,60,144,flood] [--measure-seconds S]\n";
             return false;
         } else if (arg == "--players") {
@@ -368,7 +369,7 @@ bool ParseArgs(int argc, char** argv, BenchConfig& config)
         config.mode != "replv2" && config.mode != "protocol" &&
         config.mode != "reclamation" && config.mode != "hygiene" &&
         config.mode != "mapaudit" && config.mode != "snapshot" &&
-        config.mode != "worldpackage" && config.mode != "layerlookup" && config.mode != "layersupport" && config.mode != "layerclearance" && config.mode != "layeredpresence" && config.mode != "terrain" && config.mode != "bootstrap" &&
+        config.mode != "worldpackage" && config.mode != "layerlookup" && config.mode != "layersupport" && config.mode != "layerclearance" && config.mode != "layeredpresence" && config.mode != "scriptwire" && config.mode != "terrain" && config.mode != "bootstrap" &&
         config.mode != "streaming" && config.mode != "worldquery" && config.mode != "streamsoak" &&
         config.mode != "streamlife" && config.mode != "streamadmission" && config.mode != "map4" &&
         config.mode != "mapsplit") {
@@ -4972,6 +4973,12 @@ int BenchMain(int argc, char** argv)
     if (config.mode == "layeredpresence") {
         const int scenario_failures = gs::bench::RunLayeredPresenceScenario();
         std::printf("BENCH-DONE layeredpresence failures=%d\n", scenario_failures);
+        return scenario_failures == 0 ? 0 : 2;
+    }
+    if (config.mode == "scriptwire") {
+        // 3D-5C2: the scene-script client codec vs real Cap'n Proto, frames and the handler.
+        const int scenario_failures = gs::bench::RunScriptWireScenario();
+        std::printf("BENCH-DONE scriptwire failures=%d\n", scenario_failures);
         return scenario_failures == 0 ? 0 : 2;
     }
     if (config.mode == "worldpackage") {

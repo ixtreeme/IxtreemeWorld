@@ -16,6 +16,8 @@
 #include "platform/trash.h"
 #include "tools/tree/TreeTexturePalette.h"
 
+#include <algorithm>  // script prompt handoff (both editor and runtime builds)
+
 #if defined(IXTREEME_WITH_EDITOR) && defined(_WIN32)
 #include "IconsFontAwesome6.h"
 #include "UIHelpers.h"
@@ -2698,6 +2700,66 @@ void EditorImGui::BeginFrame(bool editorModeActive)
 #include "editor_panels/EditorImGuiAssetBrowserPanels.inl"
 #include "editor_panels/EditorImGuiMaterialPanels.inl"
 #include "editor_panels/EditorImGuiPanelDispatcher.inl"
+void EditorImGui::RenderScriptPrompts()
+{
+    if (m_scriptPrompts.empty())
+        return;
+    const ImGuiViewport* viewport = ImGui::GetMainViewport();
+    const ImVec2 center = viewport->GetCenter();
+    float stagger = 0.0f;
+    for (auto it = m_scriptPrompts.begin(); it != m_scriptPrompts.end();)
+    {
+        ScriptPromptBuffer& prompt = *it;
+        ImGui::SetNextWindowPos(ImVec2(center.x + stagger, center.y + stagger), ImGuiCond_Appearing, ImVec2(0.5f, 0.5f));
+        stagger += 24.0f;
+        const std::string windowName = (prompt.view.title.empty() ? std::string("Script") : prompt.view.title) +
+            "###ScriptPrompt" + std::to_string(prompt.view.id);
+        bool open = true;
+        int outcome = 0;  // 1 submit, -1 cancel
+        if (ImGui::Begin(windowName.c_str(), &open,
+                ImGuiWindowFlags_AlwaysAutoResize | ImGuiWindowFlags_NoCollapse |
+                ImGuiWindowFlags_NoSavedSettings | ImGuiWindowFlags_NoDocking))
+        {
+            if (!prompt.view.label.empty())
+                ImGui::TextUnformatted(prompt.view.label.c_str());
+            if (prompt.focusPending)
+            {
+                ImGui::SetKeyboardFocusHere();
+                prompt.focusPending = false;
+            }
+            ImGuiInputTextFlags flags = ImGuiInputTextFlags_EnterReturnsTrue;
+            if (prompt.view.secret)
+                flags |= ImGuiInputTextFlags_Password | ImGuiInputTextFlags_NoUndoRedo;
+            ImGui::SetNextItemWidth(280.0f);
+            if (ImGui::InputText("##value", prompt.text.data(), prompt.text.size(), flags))
+                outcome = 1;
+            if (ImGui::Button("OK"))
+                outcome = 1;
+            ImGui::SameLine();
+            if (ImGui::Button("Cancel"))
+                outcome = -1;
+        }
+        ImGui::End();
+        if (!open)
+            outcome = -1;
+        if (outcome == 0)
+        {
+            ++it;
+            continue;
+        }
+        ScriptPromptAnswer answer;
+        answer.id = prompt.view.id;
+        answer.submitted = outcome == 1;
+        if (answer.submitted)
+            answer.text = prompt.text.data();
+        std::fill(prompt.text.begin(), prompt.text.end(), '\0');
+        if (prompt.view.secret)
+            ImGui::ClearActiveID();  // ImGui's own edit state must not keep the secret around
+        m_scriptPromptAnswers.push_back(std::move(answer));
+        it = m_scriptPrompts.erase(it);
+    }
+}
+
 void EditorImGui::RenderPanels()
 {
     const bool backendReady = m_textureProvider && m_textureProvider->IsReady();
@@ -2720,6 +2782,7 @@ void EditorImGui::RenderPanels()
 
     RenderEditorPanels();
     RenderDemoPanels();
+    RenderScriptPrompts();
     ImGui::Render();
 
     m_frameActive = false;
@@ -3058,3 +3121,38 @@ void EditorImGui::Destroy()
 {
 }
 #endif
+
+// Script text prompts: the data handoff is build-agnostic; only the drawing needs the editor UI.
+void EditorImGui::SetScriptPrompts(std::vector<ScriptPromptView> prompts)
+{
+    // Drop (and wipe) buffers whose prompt is no longer open.
+    for (auto it = m_scriptPrompts.begin(); it != m_scriptPrompts.end();)
+    {
+        const bool listed = std::any_of(prompts.begin(), prompts.end(),
+            [&](const ScriptPromptView& view) { return view.id == it->view.id; });
+        if (listed)
+        {
+            ++it;
+            continue;
+        }
+        std::fill(it->text.begin(), it->text.end(), '\0');
+        it = m_scriptPrompts.erase(it);
+    }
+    for (ScriptPromptView& view : prompts)
+    {
+        const bool known = std::any_of(m_scriptPrompts.begin(), m_scriptPrompts.end(),
+            [&](const ScriptPromptBuffer& buffer) { return buffer.view.id == view.id; });
+        if (known)
+            continue;
+        ScriptPromptBuffer buffer;
+        buffer.view = std::move(view);
+        m_scriptPrompts.push_back(std::move(buffer));
+    }
+}
+
+std::vector<EditorImGui::ScriptPromptAnswer> EditorImGui::TakeScriptPromptAnswers()
+{
+    std::vector<ScriptPromptAnswer> answers;
+    answers.swap(m_scriptPromptAnswers);
+    return answers;
+}

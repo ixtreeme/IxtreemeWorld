@@ -6,8 +6,11 @@
 
 #include "ScriptApi.h"
 #include "MapEditorTypes.h"  // MeshSceneEntity
+#include "platform/tcp_stream.h"
 
 #include <functional>
+#include <map>
+#include <memory>
 #include <string>
 #include <vector>
 
@@ -67,6 +70,30 @@ public:
     void SetAnimatorFloat(std::uint32_t id, const std::string& name, float value) override;
     void SetAnimatorBool(std::uint32_t id, const std::string& name, bool value) override;
     void SetAnimatorTrigger(std::uint32_t id, const std::string& name) override;
+    std::uint32_t NetConnect(const std::string& host, std::uint32_t port) override;
+    int NetState(std::uint32_t handle) override;
+    bool NetSend(std::uint32_t handle, const std::uint8_t* data, std::uint32_t size) override;
+    std::uint32_t NetReceive(std::uint32_t handle, std::uint8_t* out, std::uint32_t capacity) override;
+    void NetClose(std::uint32_t handle) override;
+    std::uint32_t PromptText(const std::string& title, const std::string& label, bool secret) override;
+    int PromptResult(std::uint32_t promptId, char* out, std::uint32_t capacity) override;
+
+    // --- script text prompts, drawn by the host UI (the editor) ---
+    struct Prompt
+    {
+        std::string title;
+        std::string label;
+        bool secret = false;
+        int status = 0;  // 0 open, 1 submitted, -1 cancelled
+        std::string text;
+    };
+    // True only while a host draws prompts (the editor); otherwise PromptText answers 0.
+    bool promptsAvailable = false;
+    const std::map<std::uint32_t, Prompt>& Prompts() const { return m_prompts; }
+    void SubmitPrompt(std::uint32_t id, const std::string& text);
+    void CancelPrompt(std::uint32_t id);
+    // Play stop: closes every script stream and forgets (wipes) every prompt.
+    void ResetTransportAndPrompts();
 
     // --- deferred spawn/destroy queue (drained by the engine after the script OnUpdate loop) ---
     enum class DeferredKind { SpawnMesh, SpawnPrefab, Destroy };
@@ -88,4 +115,8 @@ public:
 
 private:
     MeshSceneEntity* Find(std::uint32_t id);
+    std::map<std::uint32_t, std::unique_ptr<platform::TcpStream>> m_streams;
+    std::uint32_t m_nextStream = 1;
+    std::map<std::uint32_t, Prompt> m_prompts;
+    std::uint32_t m_nextPrompt = 1;
 };

@@ -52,6 +52,21 @@ IXSCRIPT_REGISTER(MyScript)
 - Physics: `Raycast(ox,oy,oz, dx,dy,dz, maxDist) -> RaycastHit{hit, entityId, point[3], normal[3], distance}`
 - Animator: `SetAnimatorFloat(name,v)` / `SetAnimatorBool(name,v)` / `SetAnimatorTrigger(name)` (no-op if no animator)
 - Parameters: `Param("key")` / `ParamFloat("key", default)` — untyped string values set per-entity
+- Network (v4): `NetConnect(host, port)->handle` (non-blocking; 0 = could not start), `NetState(handle)`
+  (0 connecting, 1 connected, 2 closed, 3 failed), `NetSend(handle, bytes, n)`, `NetReceive(handle, buf, cap)->n`,
+  `NetClose(handle)`. A plain TCP **byte stream** — framing and the game protocol belong in your script.
+  Every stream is closed when Play stops.
+- Prompt (v4): `PromptText(title, label, secret)->id` shows a one-line input dialog (`secret` masks it, e.g. a
+  password; 0 = no prompt UI on this host — today only the editor draws them), then poll
+  `PromptResult(id, buf, cap)`: 0 still open, 1 submitted (text copied, the engine forgets it), -1 cancelled.
+
+### Example: a whole MMO client as a scene script
+
+`examples/mmo_client/MmoClient.cpp` is the IxtreemeWorld MMO client protocol written as a script: login
+prompt, login server handshake/login/character select, game server handshake and EnterWorld, transform
+frames (incl. layered volume/layer changes) and movement packets, with a hand-written Cap'n Proto codec —
+the engine itself knows nothing about the protocol. Attach `MmoClient` to the player's entity (parameters:
+`loginHost`, `loginPort`, `character`, `proxyMesh`, `visualLift`) and press Play.
 
 `ScriptKey`: `W A S D Space Shift Ctrl Up Down Left Right MouseLeft MouseRight` — **all wired** (v3).
 > **Spawn is deferred:** `SpawnMesh` returns a usable id immediately, but the entity actually appears
@@ -118,6 +133,7 @@ from the **Class** dropdown, set any parameters, and press **Play**.
 ## v1 limitations
 
 - **No hot reload.** The DLL is loaded at project open; rebuild + reopen the project to pick up changes.
-- **One ABI version.** A module built against a different `IXTREEME_MODULE_API_VERSION` is rejected.
+- **One ABI version.** A module built against a different `IXTREEME_MODULE_API_VERSION` is rejected
+  (v4 added the network/prompt slots: rebuild v3 modules).
 - **Native only.** This is the C++ path; Lua scripts ship as `.lua` assets (no DLL).
 - **Desktop.** Module DLL loading is the desktop workflow; on Android native code is built into the app.

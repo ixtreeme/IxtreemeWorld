@@ -122,6 +122,10 @@ if(ENABLE_WORLDBENCH)
         src/bench/LayerSupportBench.cpp
         src/bench/LayerClearanceBench.cpp
         src/bench/LayeredPresenceBench.cpp
+        src/bench/ScriptWireBench.cpp
+        # 3D-5C2: the engine's script transport (platform TcpStream), exercised against the real handler.
+        ${CMAKE_CURRENT_SOURCE_DIR}/../../../Client/libs/platform/TcpStream_Win32.cpp
+        ${CMAKE_CURRENT_SOURCE_DIR}/../../../Client/libs/platform/TcpStream_Posix.cpp
         src/GameConnectionHandler.cpp
         ${GAMESERVER_WORLD_SOURCES}
     )
@@ -135,6 +139,11 @@ if(ENABLE_WORLDBENCH)
             db
             ${GS_FLECS_TARGET}
     )
+    target_include_directories(worldbench PRIVATE
+        ${CMAKE_CURRENT_SOURCE_DIR}/../../../Client/libs/platform)
+    if(WIN32)
+        target_link_libraries(worldbench PRIVATE Ws2_32)
+    endif()
 
     target_compile_definitions(worldbench
         PRIVATE
@@ -142,6 +151,8 @@ if(ENABLE_WORLDBENCH)
             # the checked-in test map package and the source-tree mob types.
             IXTREEME_TEST_MAP_ROOT="${CMAKE_CURRENT_SOURCE_DIR}/../../../Client/assets/Maps/test_zone"
             IXTREEME_DEFAULT_MOB_TYPES_CONFIG="${CMAKE_CURRENT_SOURCE_DIR}/config/mob_types.conf"
+            # 3D-5C2: the MMO client scene script, compiled codec-only for the scriptwire cross-check.
+            IXTREEME_MMO_CLIENT_SCRIPT="${CMAKE_CURRENT_SOURCE_DIR}/../../../Client/sdk/examples/mmo_client/MmoClient.cpp"
             MMO_DEBUG_SPAWN_OVERRIDE=1
     )
 endif()

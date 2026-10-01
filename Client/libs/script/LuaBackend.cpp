@@ -5,6 +5,8 @@
 
 #include <sol/sol.hpp>
 
+#include <algorithm>
+#include <iterator>
 #include <tuple>
 #include <utility>
 
@@ -204,6 +206,37 @@ struct LuaBackend::Impl
         });
         t.set_function("SetAnimatorTrigger", [a](std::uint32_t id, const std::string& n) {
             a->SetAnimatorTrigger(id, n);
+        });
+
+        // --- generic TCP transport + text prompts (bytes travel as binary-safe Lua strings) ---
+        t.set_function("NetConnect", [a](const std::string& host, std::uint32_t port) {
+            return a->NetConnect(host, port);
+        });
+        t.set_function("NetState", [a](std::uint32_t handle) { return a->NetState(handle); });
+        t.set_function("NetSend", [a](std::uint32_t handle, const std::string& bytes) {
+            return a->NetSend(handle, reinterpret_cast<const std::uint8_t*>(bytes.data()),
+                static_cast<std::uint32_t>(bytes.size()));
+        });
+        // NetReceive(handle[, maxBytes = 65536]) -> string (empty when nothing arrived)
+        t.set_function("NetReceive", [a](std::uint32_t handle, sol::optional<std::uint32_t> maxBytes) {
+            std::string bytes(std::min<std::uint32_t>(maxBytes.value_or(65536u), 1u << 20), '\0');
+            if (bytes.empty())
+                return bytes;
+            bytes.resize(a->NetReceive(handle, reinterpret_cast<std::uint8_t*>(bytes.data()),
+                static_cast<std::uint32_t>(bytes.size())));
+            return bytes;
+        });
+        t.set_function("NetClose", [a](std::uint32_t handle) { a->NetClose(handle); });
+        t.set_function("PromptText", [a](const std::string& title, const std::string& label, sol::optional<bool> secret) {
+            return a->PromptText(title, label, secret.value_or(false));
+        });
+        // PromptResult(id) -> status (0 open, 1 submitted, -1 cancelled), text
+        t.set_function("PromptResult", [a](std::uint32_t id) {
+            char buffer[257] = {};
+            const int status = a->PromptResult(id, buffer, sizeof(buffer));
+            std::string text = status == 1 ? std::string(buffer) : std::string();
+            std::fill(std::begin(buffer), std::end(buffer), '\0');
+            return std::make_tuple(status, text);
         });
 
         // Ergonomic Key.* table: names map to the same strings IsKeyDown accepts (Key.W == "W").
