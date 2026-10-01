@@ -3,6 +3,8 @@
 #include <algorithm>
 #include <cmath>
 #include <limits>
+#include <utility>
+#include <vector>
 
 namespace mx::map {
 namespace {
@@ -445,7 +447,8 @@ bool PortalCoversSlot(const LayeredWorld& world, const LayerVolume& volume, std:
 // the plane and the local terrain maximum.
 bool CookTerrainEdge(const LayeredWorld& world, const LayerVolume& volume, std::uint8_t axis, std::uint8_t side,
                      const Rect& world_bounds, const LayerTerrainObstruction& terrain, const ObstructionSet& obstructions,
-                     const LayerClearanceProfile& profile, LayerTerrainEdge& out, LayerClearanceReport& report)
+                     const LayerClearanceProfile& profile, LayerTerrainEdge& out, std::vector<Rect2>& support,
+                     LayerClearanceReport& report)
 {
     const float edge = axis == 0 ? (side == 0 ? volume.bounds.min_x : volume.bounds.max_x)
                                  : (side == 0 ? volume.bounds.min_y : volume.bounds.max_y);
@@ -480,6 +483,10 @@ bool CookTerrainEdge(const LayeredWorld& world, const LayerVolume& volume, std::
     };
     std::vector<bool> valid(candidate.slots, false);
     bool any_valid = false;
+    // Terrain beyond each valid slot is ground the actor may rest on (3D-5D
+    // open-ledge erosion support); the strip reaches past the radius.
+    std::vector<Rect2> valid_strips;
+    const double strip_reach = static_cast<double>(profile.actor_radius_m) + static_cast<double>(profile.cell_size_m);
     for (std::uint32_t slot = 0; slot < candidate.slots; ++slot) {
         double a0 = 0, a1 = 0;
         along_range(slot, a0, a1);
@@ -500,8 +507,28 @@ bool CookTerrainEdge(const LayeredWorld& world, const LayerVolume& volume, std::
         valid[slot] = true;
         any_valid = true;
         candidate.max_step_m = std::max(candidate.max_step_m, std::max(0.0, bound));
+        const double outer = side == 0 ? static_cast<double>(edge) - strip_reach : static_cast<double>(edge) + strip_reach;
+        const double t0 = std::min(outer, static_cast<double>(edge)), t1 = std::max(outer, static_cast<double>(edge));
+        valid_strips.push_back(axis == 0 ? Rect2{t0, t1, a0, a1} : Rect2{a0, a1, t0, t1});
     }
     if (!any_valid) return false;
+    // Past a volume corner the terrain continues: a valid end slot also
+    // supports the square beyond the corner when that terrain stays within the
+    // step of the plane at the corner (the same quad-corner bound).
+    for (const std::uint32_t end : {0u, candidate.slots - 1u}) {
+        if (!valid[end]) continue;
+        const double corner = end == 0 ? static_cast<double>(candidate.span_min) : static_cast<double>(candidate.span_max);
+        const double beyond = end == 0 ? corner - strip_reach : corner + strip_reach;
+        const double l0 = std::min(corner, beyond), l1 = std::max(corner, beyond);
+        const double outer = side == 0 ? static_cast<double>(edge) - strip_reach : static_cast<double>(edge) + strip_reach;
+        const double t0 = std::min(outer, static_cast<double>(edge)), t1 = std::max(outer, static_cast<double>(edge));
+        const Rect2 square = axis == 0 ? Rect2{t0, t1, l0, l1} : Rect2{l0, l1, t0, t1};
+        double t_lo = 0, t_hi = 0;
+        if (!TerrainRange(terrain, square.x0, square.x1, square.y0, square.y1, t_lo, t_hi)) continue;
+        const auto p = point(corner, edge);
+        const double plane_z = plane.Height(p[0], p[1]);
+        if (std::max(t_hi - plane_z, plane_z - t_lo) <= step) valid_strips.push_back(square);
+    }
 
     const double grow = radius + kRegionSlack;
     const auto cell_rect = [&](std::uint32_t slot, std::uint32_t c) {
@@ -573,7 +600,146 @@ bool CookTerrainEdge(const LayeredWorld& world, const LayerVolume& volume, std::
         report.corridor_slots_blocked += GetBit(candidate.blocked, bit) ? 1u : 0u;
     }
     out = std::move(candidate);
+    support = std::move(valid_strips);
     return true;
+}
+
+// ---- 3D-5D open-ledge erosion ----------------------------------------------
+
+// Every point of `area` lies in the union of the closed `support` rectangles.
+// Exact for axis-aligned rectangles: the area is split at every support edge
+// inside it and the midpoint of each piece must be supported.
+bool Covered(const Rect2& area, const std::vector<Rect2>& support)
+{
+    std::vector<double> xs{area.x0, area.x1};
+    std::vector<double> ys{area.y0, area.y1};
+    for (const auto& r : support) {
+        for (const double x : {r.x0, r.x1}) {
+            if (x > area.x0 && x < area.x1) xs.push_back(x);
+        }
+        for (const double y : {r.y0, r.y1}) {
+            if (y > area.y0 && y < area.y1) ys.push_back(y);
+        }
+    }
+    std::sort(xs.begin(), xs.end());
+    xs.erase(std::unique(xs.begin(), xs.end()), xs.end());
+    std::sort(ys.begin(), ys.end());
+    ys.erase(std::unique(ys.begin(), ys.end()), ys.end());
+    for (std::size_t i = 0; i + 1 < xs.size(); ++i) {
+        const double mx = 0.5 * (xs[i] + xs[i + 1]);
+        for (std::size_t j = 0; j + 1 < ys.size(); ++j) {
+            const double my = 0.5 * (ys[j] + ys[j + 1]);
+            const bool inside = std::any_of(support.begin(), support.end(), [&](const Rect2& r) {
+                return mx >= r.x0 && mx <= r.x1 && my >= r.y0 && my <= r.y1;
+            });
+            if (!inside) return false;
+        }
+    }
+    return true;
+}
+
+Rect2 FootprintOf(const LayerVolume& volume)
+{
+    return {volume.bounds.min_x, volume.bounds.max_x, volume.bounds.min_y, volume.bounds.max_y};
+}
+
+// Blocks every still-free cell whose capsule footprint square leaves the
+// support of the actor (see CookLayerClearance). `terrain_support` holds the
+// terrain strips beyond each volume's proven terrain-edge slots.
+void ErodeOpenLedges(LayeredWorld& world, const LayerClearanceProfile& profile,
+                     const std::vector<std::pair<VolumeId, Rect2>>& terrain_support, LayerClearanceReport& report)
+{
+    const double cell = static_cast<double>(profile.cell_size_m);
+    const double radius = static_cast<double>(profile.actor_radius_m);
+    const auto grown = [&](const Rect2& c) { return Rect2{c.x0 - radius, c.x1 + radius, c.y0 - radius, c.y1 + radius}; };
+    const auto index_of = [&](VolumeId id) {
+        for (std::size_t i = 0; i < world.volumes.size(); ++i) {
+            if (world.volumes[i].id == id) return i;
+        }
+        return world.volumes.size();
+    };
+
+    std::vector<std::vector<Rect2>> support(world.volumes.size());
+    for (std::size_t i = 0; i < world.volumes.size(); ++i) {
+        const auto& volume = world.volumes[i];
+        if (!volume.clearance) continue;
+        support[i].push_back(FootprintOf(volume));
+        for (const auto& portal : world.portals) {
+            if (!portal.proof) continue;
+            VolumeId other = 0;
+            if (portal.source_volume == volume.id) other = portal.target_volume;
+            else if (portal.target_volume == volume.id) other = portal.source_volume;
+            else continue;
+            const std::size_t o = index_of(other);
+            if (o < world.volumes.size()) support[i].push_back(FootprintOf(world.volumes[o]));
+        }
+        for (const auto& [owner, strip] : terrain_support) {
+            if (owner == volume.id) support[i].push_back(strip);
+        }
+    }
+
+    for (std::size_t i = 0; i < world.volumes.size(); ++i) {
+        auto& volume = world.volumes[i];
+        if (!volume.clearance) continue;
+        auto& grid = *volume.clearance;
+        for (std::uint32_t j = 0; j < grid.cells_y; ++j) {
+            for (std::uint32_t c = 0; c < grid.cells_x; ++c) {
+                const std::uint64_t bit = static_cast<std::uint64_t>(j) * grid.cells_x + c;
+                if (GetBit(grid.blocked, bit) || Covered(grown(CellRect(volume.bounds, cell, c, j)), support[i])) continue;
+                SetBit(grid.blocked, bit);
+                ++report.cells_eroded;
+                ++report.cells_blocked;
+            }
+        }
+    }
+
+    for (auto& portal : world.portals) {
+        if (!portal.proof) continue;
+        const std::size_t ia = index_of(portal.source_volume), ib = index_of(portal.target_volume);
+        if (ia >= world.volumes.size() || ib >= world.volumes.size()) continue;
+        auto& proof = *portal.proof;
+        std::vector<Rect2> both = support[ia];
+        both.insert(both.end(), support[ib].begin(), support[ib].end());
+        double across0 = 0.0, across1 = 0.0;
+        LayerPortalCorridorAcross(proof, world.volumes[ia], world.volumes[ib], profile, across0, across1);
+        for (std::uint32_t slot = 0; slot < proof.slots; ++slot) {
+            const double along0 = static_cast<double>(proof.span_min) + static_cast<double>(slot) * cell;
+            const double along1 = std::min(along0 + cell, static_cast<double>(proof.span_max));
+            for (std::uint32_t c = 0; c < proof.across; ++c) {
+                const std::uint64_t bit = static_cast<std::uint64_t>(slot) * proof.across + c;
+                if (GetBit(proof.blocked, bit)) continue;
+                const double c0 = across0 + static_cast<double>(c) * cell;
+                const double c1 = std::min(c0 + cell, across1);
+                const Rect2 rect = proof.axis == 0 ? Rect2{c0, c1, along0, along1} : Rect2{along0, along1, c0, c1};
+                if (Covered(grown(rect), both)) continue;
+                SetBit(proof.blocked, bit);
+                ++report.corridor_slots_eroded;
+                ++report.corridor_slots_blocked;
+            }
+        }
+    }
+
+    for (auto& edge : world.terrain_edges) {
+        const std::size_t iv = index_of(edge.volume_id);
+        if (iv >= world.volumes.size()) continue;
+        double across0 = 0.0, across1 = 0.0;
+        LayerTerrainEdgeCorridorAcross(edge, world.volumes[iv], profile, across0, across1);
+        for (std::uint32_t slot = 0; slot < edge.slots; ++slot) {
+            const double along0 = static_cast<double>(edge.span_min) + static_cast<double>(slot) * cell;
+            const double along1 = std::min(along0 + cell, static_cast<double>(edge.span_max));
+            for (std::uint32_t c = 0; c < edge.across; ++c) {
+                const std::uint64_t bit = static_cast<std::uint64_t>(slot) * edge.across + c;
+                if (GetBit(edge.blocked, bit)) continue;
+                const double c0 = across0 + static_cast<double>(c) * cell;
+                const double c1 = std::min(c0 + cell, across1);
+                const Rect2 rect = edge.axis == 0 ? Rect2{c0, c1, along0, along1} : Rect2{along0, along1, c0, c1};
+                if (Covered(grown(rect), support[iv])) continue;
+                SetBit(edge.blocked, bit);
+                ++report.corridor_slots_eroded;
+                ++report.corridor_slots_blocked;
+            }
+        }
+    }
 }
 
 } // namespace
@@ -684,6 +850,7 @@ bool CookLayerClearance(LayeredWorld& world,
     }
     report.portals_derived = derived.size();
     for (auto& portal : derived) world.portals.push_back(std::move(portal));
+    std::vector<std::pair<VolumeId, Rect2>> terrain_support;
     if (terrain != nullptr) {
         std::uint32_t edge_id = 0;
         for (const auto& volume : world.volumes) {
@@ -691,17 +858,21 @@ bool CookLayerClearance(LayeredWorld& world,
             for (std::uint8_t axis = 0; axis < 2; ++axis) {
                 for (std::uint8_t side = 0; side < 2; ++side) {
                     LayerTerrainEdge edge;
-                    if (!CookTerrainEdge(world, volume, axis, side, world_bounds, *terrain, set, profile, edge, report)) {
+                    std::vector<Rect2> strips;
+                    if (!CookTerrainEdge(world, volume, axis, side, world_bounds, *terrain, set, profile, edge, strips,
+                                         report)) {
                         continue;
                     }
                     if (world.terrain_edges.size() >= kMaxLayerTerrainEdges) return fail("terrain edges exceed the limit");
                     edge.id = ++edge_id;
                     world.terrain_edges.push_back(std::move(edge));
+                    for (const auto& strip : strips) terrain_support.emplace_back(volume.id, strip);
                 }
             }
         }
         report.terrain_edges_derived = world.terrain_edges.size();
     }
+    ErodeOpenLedges(world, profile, terrain_support, report);
     world.clearance_profile = profile;
     if (!world.Validate(world_bounds, error)) return fail("cooked clearance failed validation: " + error);
     if (EncodeLayeredWorld(world).empty()) return fail("cooked clearance does not fit the layered-world sidecar limits");

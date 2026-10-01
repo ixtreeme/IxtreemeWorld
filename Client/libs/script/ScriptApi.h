@@ -104,6 +104,12 @@ public:
     // the engine then forgets the text), -1 = cancelled / unknown id.
     virtual int PromptResult(std::uint32_t promptId, char* out, std::uint32_t capacity) = 0;
 
+    // --- rendering (v5) ---
+    // Assigns a material asset (its GUID as stored in a scene's "materials" slots, or its asset id) to
+    // material slot `slot` of the entity's mesh. DEFERRED like spawn/destroy, so it also applies to an
+    // entity spawned earlier in the same frame. An unknown entity or material is a logged no-op.
+    virtual void SetMaterial(std::uint32_t id, std::uint32_t slot, const std::string& materialAssetId) = 0;
+
     // (NEVER add an STL-by-value return here — use a caller-owned char* buffer for strings to keep the
     //  /MT module boundary safe. By-value RaycastHit is fine: it is POD, no heap.)
 };

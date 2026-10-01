@@ -204,4 +204,59 @@ void BorderPublisher::Publish(Zone& zone)
     zone.NotePublishedEntitySetGeneration(entity_generation);
 }
 
+void BorderPublisher::RetractNonResidents(Zone& zone)
+{
+    AssertZoneOwner(zone, "zone border retract");
+
+    std::lock_guard publish_lock(zone.PublishMutex());
+    auto& buffer = zone.PublishBuffer();
+    auto& changed = zone.PublishDeltaNetsScratch();
+    auto& removed = zone.PublishDeltaRemovedScratch();
+    changed.clear();
+    removed.clear();
+    for (const auto& snapshot : buffer) {
+        if (!zone.IsResident(snapshot.net_id)) {
+            removed.push_back(snapshot.net_id);
+        }
+    }
+    if (removed.empty()) {
+        return;
+    }
+    buffer.erase(std::remove_if(buffer.begin(), buffer.end(),
+                                [&](const BorderEntitySnapshot& snapshot) {
+                                    return !zone.IsResident(snapshot.net_id);
+                                }),
+                 buffer.end());
+    RebuildPublishIndex(zone);
+    zone.Diagnostics().ghost_publish_removes_since_diag.fetch_add(removed.size(),
+                                                                std::memory_order_relaxed);
+    zone.CommitPublishDelta();
+}
+
+void BorderPublisher::PublishResident(Zone& zone, const BorderEntitySnapshot& snapshot)
+{
+    AssertZoneOwner(zone, "zone border publish resident");
+
+    if (snapshot.net_id == 0 || !zone.IsResident(snapshot.net_id) ||
+        !IsInBorderBand(zone.Bounds(), snapshot.position, kAoiRadiusMeters)) {
+        return;
+    }
+    std::lock_guard publish_lock(zone.PublishMutex());
+    auto& buffer = zone.PublishBuffer();
+    auto& index = zone.PublishIndex();
+    if (const auto it = index.find(snapshot.net_id); it != index.end()) {
+        buffer[it->second] = snapshot;
+    } else {
+        index[snapshot.net_id] = buffer.size();
+        buffer.push_back(snapshot);
+    }
+    auto& changed = zone.PublishDeltaNetsScratch();
+    auto& removed = zone.PublishDeltaRemovedScratch();
+    changed.clear();
+    removed.clear();
+    changed.push_back(snapshot.net_id);
+    zone.Diagnostics().ghost_publish_adds_since_diag.fetch_add(1, std::memory_order_relaxed);
+    zone.CommitPublishDelta();
+}
+
 } // namespace gs::game

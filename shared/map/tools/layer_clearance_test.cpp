@@ -396,6 +396,84 @@ OracleResult RunOracle(const Built& built, const LayerTerrainObstruction* terrai
     return result;
 }
 
+// ---------------- independent support oracle (3D-5D open-ledge erosion) ----------------
+// For every pose the runtime accepts (ResolveLayerActorPlacement Ok) on a 0.1 m lattice over every volume,
+// every rim point of the actor disc must rest on support: the volume's own footprint, a volume reached
+// through a proven portal, or terrain within the profile step of the volume's plane at the nearest
+// footprint point. Independent of the cooker's grids, corridors and terrain-edge records.
+struct SupportResult {
+    std::uint64_t poses = 0;
+    std::uint64_t violations = 0;
+};
+
+bool InsideClosed(const LayerVolume& v, double x, double y)
+{
+    return x >= v.bounds.min_x && x <= v.bounds.max_x && y >= v.bounds.min_y && y <= v.bounds.max_y;
+}
+
+bool TerrainNearPlane(const LayerTerrainObstruction& t, double x, double y, double plane_z, double step)
+{
+    const double fx = (x - t.origin_x) / t.cell_size, fy = (y - t.origin_y) / t.cell_size;
+    if (fx < 0 || fy < 0 || fx > t.cells_x || fy > t.cells_y) return false;
+    const auto i = static_cast<std::uint32_t>(std::min<double>(std::floor(fx), t.cells_x - 1));
+    const auto j = static_cast<std::uint32_t>(std::min<double>(std::floor(fy), t.cells_y - 1));
+    const std::size_t stride = static_cast<std::size_t>(t.cells_x) + 1;
+    for (const std::size_t k : {j * stride + i, j * stride + i + 1, (j + 1) * stride + i, (j + 1) * stride + i + 1}) {
+        if (std::abs(static_cast<double>(t.heights[k]) - plane_z) > step + 1e-6) return false;
+    }
+    return true;
+}
+
+SupportResult RunSupportOracle(const Built& built, const LayerTerrainObstruction* terrain, double check_radius)
+{
+    SupportResult result;
+    const auto& world = built.world;
+    const LayerActorProfile actor;
+    const double step = world.clearance_profile->step_height_m;
+    for (const auto& v : world.volumes) {
+        if (!v.clearance) continue;
+        std::vector<const LayerVolume*> neighbours;
+        for (const auto& portal : world.portals) {
+            if (!portal.proof) continue;
+            const VolumeId other = portal.source_volume == v.id ? portal.target_volume
+                                 : portal.target_volume == v.id ? portal.source_volume : 0;
+            for (const auto& w : world.volumes) {
+                if (other != 0 && w.id == other) neighbours.push_back(&w);
+            }
+        }
+        const auto supported = [&](double qx, double qy) {
+            if (InsideClosed(v, qx, qy)) return true;
+            for (const auto* w : neighbours) {
+                if (InsideClosed(*w, qx, qy)) return true;
+            }
+            if (terrain == nullptr) return false;
+            const double ex = std::clamp(qx, static_cast<double>(v.bounds.min_x), static_cast<double>(v.bounds.max_x));
+            const double ey = std::clamp(qy, static_cast<double>(v.bounds.min_y), static_cast<double>(v.bounds.max_y));
+            return TerrainNearPlane(*terrain, qx, qy, v.ground_support->Height(ex, ey), step);
+        };
+        for (double x = v.bounds.min_x + 0.05; x < v.bounds.max_x; x += 0.1) {
+            for (double y = v.bounds.min_y + 0.05; y < v.bounds.max_y; y += 0.1) {
+                if (!ResolveLayerActorPlacement(world, actor, v.id, x, y).Ok()) continue;
+                ++result.poses;
+                for (int k = 0; k < 32; ++k) {
+                    const double a = k * 3.14159265358979323846 / 16.0;
+                    if (!supported(x + check_radius * std::cos(a), y + check_radius * std::sin(a))) {
+                        ++result.violations;
+                        break;
+                    }
+                }
+            }
+        }
+    }
+    return result;
+}
+
+// Cells of an isolated footprint whose radius-expanded square leaves it (the open-ledge ring).
+bool LedgeRing(double x0, double x1, double y0, double y1, double fx0, double fx1, double fy0, double fy1, double r)
+{
+    return x0 - r < fx0 || x1 + r > fx1 || y0 - r < fy0 || y1 + r > fy1;
+}
+
 std::uint64_t Bits(double value)
 {
     std::uint64_t bits = 0;
@@ -430,6 +508,14 @@ int main()
         Check("oracle-" + fixture, result.samples > 0 && result.violations == 0,
               std::to_string(result.samples) + " centres, violations=" + std::to_string(result.violations));
     };
+    std::uint64_t support_poses = 0, support_violations = 0;
+    auto support = [&](const std::string& fixture, const Built& built, const LayerTerrainObstruction* terrain = nullptr) {
+        const auto result = RunSupportOracle(built, terrain, r - 1e-6);
+        support_poses += result.poses;
+        support_violations += result.violations;
+        Check("support-oracle-" + fixture, result.poses > 0 && result.violations == 0,
+              std::to_string(result.poses) + " poses, overhanging=" + std::to_string(result.violations));
+    };
 
     // ---------- 1. flat floor ----------
     {
@@ -437,9 +523,28 @@ int main()
         scene.layers.push_back(Box(1, 0, 0, -1, 16, 16, 0));
         const auto built = Build(scene);
         const auto* floor = built.ok ? VolumeAt(built.world, 8, 8, 0) : nullptr;
-        Check("flat-floor-all-clear", floor && floor->clearance && floor->clearance->cells_x == 64 &&
-              floor->clearance->cells_y == 64 && floor->clearance->BlockedCount() == 0, built.error);
+        // 3D-5D: an isolated floor has open ledges on every side. Exactly the
+        // cells whose radius-expanded square leaves the footprint are blocked
+        // (two 0.25 m rows/columns at r = 0.35), the interior is clear.
+        std::uint64_t ring = 0, mismatched = 0;
+        if (floor && floor->clearance) {
+            for (std::uint32_t j = 0; j < 64; ++j) {
+                for (std::uint32_t i = 0; i < 64; ++i) {
+                    const bool edge = LedgeRing(i * 0.25, i * 0.25 + 0.25, j * 0.25, j * 0.25 + 0.25, 0, 16, 0, 16, r);
+                    ring += edge ? 1 : 0;
+                    mismatched += edge != floor->clearance->Blocked(i, j) ? 1 : 0;
+                }
+            }
+        }
+        Check("flat-floor-open-ledge-ring-exact", floor && floor->clearance && floor->clearance->cells_x == 64 &&
+              floor->clearance->cells_y == 64 && ring == 64 * 64 - 60 * 60 && mismatched == 0 &&
+              built.report.cells_eroded == ring && floor->clearance->BlockedCount() == ring,
+              "ring=" + std::to_string(ring) + " mismatched=" + std::to_string(mismatched) + " " + built.error);
         Check("flat-floor-no-portals", built.ok && built.world.portals.empty());
+        const auto inner = floor ? ResolveLayerActorPlacement(built.world, actor, floor->id, 0.55, 8) : LayerGroundResult{};
+        const auto ledge = floor ? ResolveLayerActorPlacement(built.world, actor, floor->id, 0.45, 8) : LayerGroundResult{};
+        Check("flat-floor-ledge-placement", inner.Ok() && ledge.status == GroundSupportStatus::Blocked);
+        if (built.ok) support("flat-floor", built);
     }
 
     // ---------- 2. wall, beam, ceilings, floor contact ----------
@@ -470,7 +575,8 @@ int main()
                 const double chebyshev = std::max(gx, gy);
                 const double euclid = CellDistanceToRect(x0, x1, y0, y1, 8.0, 8.2, 0, 6);
                 if (euclid < r - 1e-4 && !grid.Blocked(i, j)) ++wrong_clear;
-                if (chebyshev > r + 1e-4 && grid.Blocked(i, j)) ++wrong_blocked;
+                // The room floor's open-ledge ring is blocked by erosion (3D-5D).
+                if (chebyshev > r + 1e-4 && grid.Blocked(i, j) && !LedgeRing(x0, x1, y0, y1, 0, 16, 0, 16, r)) ++wrong_blocked;
                 ++near_checked;
             }
         }
@@ -485,6 +591,7 @@ int main()
         Check("floor-contact-rug-ignored", !cell(5.5, 8.5));
         Check("ankle-box-blocks", cell(5.5, 11.5));
         oracle("room", roomBuilt);
+        support("room", roomBuilt);
 
         const auto place = [&](double x, double y) { return ResolveLayerActorPlacement(roomBuilt.world, actor, floor->id, x, y); };
         const auto start = place(4, 3);
@@ -540,8 +647,36 @@ int main()
         Check("stairs-derive-three-proven-portals", stairsBuilt.ok && proven == 3 && std::abs(max_step - 0.25) < 1e-9,
               stairsBuilt.error);
         oracle("stairs", stairsBuilt);
+        support("stairs", stairsBuilt);
         const auto* f = VolumeAt(stairsBuilt.world, 8, 2, 0);
         const auto* landing = VolumeAt(stairsBuilt.world, 20, 2, 0.75);
+        // 3D-5D: the landing ends at x = 26 and y = 0 / 4 over a drop.
+        if (landing) {
+            const auto at = [&](double x, double y) { return ResolveLayerActorPlacement(stairsBuilt.world, actor, landing->id, x, y); };
+            Check("landing-open-end-eroded", at(25.4, 2).Ok() && at(25.6, 2).status == GroundSupportStatus::Blocked &&
+                  at(25.8, 2).status == GroundSupportStatus::Blocked);
+            Check("landing-open-sides-eroded", at(20, 3.4).Ok() && at(20, 3.8).status == GroundSupportStatus::Blocked &&
+                  at(20, 0.6).Ok() && at(20, 0.2).status == GroundSupportStatus::Blocked);
+            const auto mid = at(20, 2);
+            const auto off = mid.Ok() ? ResolveLayerActorMove(stairsBuilt.world, actor, mid.state, landing->id, 25.9, 2)
+                                      : LayerGroundResult{};
+            Check("walk-towards-open-end-stops-at-ledge", off.status == GroundSupportStatus::Blocked && off.state.x == 20.0);
+        }
+        // The steps are 4 m wide over a drop on both sides: their y ledges
+        // are eroded too, only the portal ends (x) stay open.
+        std::size_t steps = 0, open_rows_free = 0;
+        for (const auto& volume : stairsBuilt.world.volumes) {
+            if (!volume.clearance || volume.bounds.min_x < 16.0f || volume.bounds.max_x > 17.5f) continue;
+            ++steps;
+            for (const std::uint32_t j : {0u, 1u, 14u, 15u}) {
+                for (std::uint32_t i = 0; i < volume.clearance->cells_x; ++i) open_rows_free += volume.clearance->Blocked(i, j) ? 0 : 1;
+            }
+        }
+        Check("steps-open-sides-eroded", steps == 2 && open_rows_free == 0 && stairsBuilt.report.cells_eroded > 0,
+              "free cells in ledge rows=" + std::to_string(open_rows_free));
+        const auto wide = RunSupportOracle(stairsBuilt, nullptr, 0.6);
+        Check("negative-control-support-oracle-detects-wider-actor", wide.poses > 0 && wide.violations > 0,
+              std::to_string(wide.violations) + " of " + std::to_string(wide.poses) + " poses overhang at r=0.6");
         auto state = f ? ResolveLayerActorPlacement(stairsBuilt.world, actor, f->id, 14, 2) : LayerGroundResult{};
         std::size_t moves = 0, crossings = 0;
         bool walked = state.Ok();
@@ -612,14 +747,18 @@ int main()
         const auto* f = VolumeAt(built.world, 8, 2, 0);
         const auto* p = VolumeAt(built.world, 20, 2, 0.25);
         const auto a = f ? ResolveLayerActorPlacement(built.world, actor, f->id, 15, 1) : LayerGroundResult{};
-        const auto b = f ? ResolveLayerActorPlacement(built.world, actor, f->id, 15, 3.4) : LayerGroundResult{};
+        // y = 3.1: clear of the wall (y < 2) and of the open y = 4 ledge. Near a
+        // portal the band check includes the neighbouring slot of a cell
+        // boundary, so the eroded ledge reaches one cell further there (3D-5D).
+        const auto b = f ? ResolveLayerActorPlacement(built.world, actor, f->id, 15, 3.1) : LayerGroundResult{};
         const auto through = p && a.Ok() ? ResolveLayerActorMove(built.world, actor, a.state, p->id, 17, 1) : LayerGroundResult{};
-        const auto beside = p && b.Ok() ? ResolveLayerActorMove(built.world, actor, b.state, p->id, 17, 3.4) : LayerGroundResult{};
+        const auto beside = p && b.Ok() ? ResolveLayerActorMove(built.world, actor, b.state, p->id, 17, 3.1) : LayerGroundResult{};
         Check("wall-on-edge-blocks-crossing-behind-it", built.ok && through.status == GroundSupportStatus::Blocked,
               std::string(ToString(through.status)));
         Check("edge-beside-wall-still-crossable", beside.Ok() && beside.portal_id != 0 && std::abs(beside.state.z - 0.25) < 1e-9,
               std::string(ToString(beside.status)));
         oracle("walled-edge", built);
+        support("walled-edge", built);
     }
 
     // ---------- 7. ramp (valley transition) to an upper floor ----------
@@ -641,12 +780,17 @@ int main()
             for (std::uint32_t j = 0; j < w->clearance->cells_y; ++j) {
                 for (std::uint32_t i = 0; i < w->clearance->cells_x; ++i) {
                     const double x0 = 16 + i * 0.25;
-                    if (x0 >= 16.75 && x0 + 0.25 <= 21.25) ramp_blocked_middle += w->clearance->Blocked(i, j) ? 1 : 0;
+                    const double y0 = j * 0.25;
+                    // ...away from its open y = 0 / 4 ledges too (3D-5D erosion).
+                    if (x0 >= 16.75 && x0 + 0.25 <= 21.25 && y0 - r >= 0 && y0 + 0.25 + r <= 4) {
+                        ramp_blocked_middle += w->clearance->Blocked(i, j) ? 1 : 0;
+                    }
                 }
             }
         }
         Check("ramp-own-side-faces-do-not-block", w && w->clearance && ramp_blocked_middle == 0);
         oracle("ramp", rampBuilt);
+        support("ramp", rampBuilt);
         auto state = f ? ResolveLayerActorPlacement(rampBuilt.world, actor, f->id, 14, 2) : LayerGroundResult{};
         bool walked = state.Ok();
         std::size_t crossings = 0;
@@ -694,9 +838,10 @@ int main()
         Check("authored-portal-transition-required", start.Ok() &&
               ResolveLayerActorMove(built.world, actor, start.state, upper->id, 8, 8).status ==
                   GroundSupportStatus::TransitionRequired);
-        // The upper slab (5..6 m) is above the 1.8 m capsule on the ground.
+        // The upper slab (5..6 m) is above the 1.8 m capsule on the ground:
+        // only the ground's open-ledge ring is blocked (3D-5D).
         Check("stacked-floor-above-head-height-clear", cooked && ground->clearance &&
-              built.world.volumes[0].clearance && built.world.volumes[0].clearance->BlockedCount() == 0);
+              built.world.volumes[0].clearance && built.world.volumes[0].clearance->BlockedCount() == 64 * 64 - 60 * 60);
     }
 
     // ---------- 9. terrain ----------
@@ -721,6 +866,7 @@ int main()
         Check("terrain-below-floor-clear", v && v->clearance && !blocked(2, 2) && !blocked(14, 14));
         Check("terrain-quads-tested", built.report.terrain_quads_tested > 0);
         if (built.ok) oracle("terrain", built, &*terrainScene.terrain);
+        if (built.ok) support("terrain", built, &*terrainScene.terrain);
     }
 
     // ---------- 9b. terrain edges (3D-5B2) ----------
@@ -761,6 +907,12 @@ int main()
               east && east->CellBlocked(4, east->across - 1) && east->CellBlocked(15, east->across - 1) &&
                   !east->CellBlocked(28, east->across - 1));
         if (built.ok) oracle("terrain-edges", built, &*platform.terrain);
+        if (built.ok) support("terrain-edges", built, &*platform.terrain);
+        // 3D-5D: a proven terrain edge is support, so the actor may stand right
+        // at it, also in the corner of two terrain edges (south-west).
+        Check("terrain-edge-side-not-eroded",
+              v && ResolveLayerActorPlacement(built.world, actor, v->id, 20.1, 25).Ok() &&
+                  ResolveLayerActorPlacement(built.world, actor, v->id, 20.1, 20.1).Ok());
 
         const auto start = v ? ResolveLayerActorPlacement(built.world, actor, v->id, 25, 25) : LayerGroundResult{};
         const auto exit_west = ResolveLayerActorExitToTerrain(built.world, actor, start.state, 19.8, 25);
@@ -831,12 +983,54 @@ int main()
               high_built.ok && high_built.world.terrain_edges.empty() &&
                   Version(EncodeLayeredWorld(high_built.world)) == kLayeredWorldFileVersion,
               high_built.error);
+        // Without a terrain edge the same side is an open ledge (0.5 m drop).
+        const auto* hv = high_built.ok ? VolumeAt(high_built.world, 25, 25, 0.5) : nullptr;
+        Check("ledge-without-terrain-edge-eroded",
+              hv && ResolveLayerActorPlacement(high_built.world, actor, hv->id, 20.1, 25).status == GroundSupportStatus::Blocked &&
+                  ResolveLayerActorPlacement(high_built.world, actor, hv->id, 20.6, 25).Ok());
         Check("no-terrain-edge-without-terrain-data", [&] {
             Scene none = platform;
             none.terrain.reset();
             const auto b = Build(none);
             return b.ok && b.world.terrain_edges.empty();
         }());
+    }
+
+    // ---------- 9c. 3D-5D acceptance scene: floor, south stairs to the terrain, east stairs ----------
+    {
+        Scene acceptance;
+        acceptance.bounds = {-256, -256, 256, 256};
+        acceptance.layers.push_back(Box(1, -8, -8, 0, 8, 8, 1));                 // floor (top 1.0)
+        acceptance.layers.push_back(Box(11, -1.5f, -8.75f, 0, 1.5f, -8, 0.75f)); // S3
+        acceptance.layers.push_back(Box(12, -1.5f, -9.5f, 0, 1.5f, -8.75f, 0.5f)); // S2
+        acceptance.layers.push_back(Box(13, -1.5f, -10.25f, 0, 1.5f, -9.5f, 0.25f)); // S1
+        acceptance.layers.push_back(Box(5, 8, -1.5f, 0, 8.75f, 1.5f, 1.25f));    // E1
+        acceptance.layers.push_back(Box(6, 8.75f, -1.5f, 0, 9.5f, 1.5f, 1.5f));  // E2
+        acceptance.layers.push_back(Box(7, 9.5f, -1.5f, 0, 10.25f, 1.5f, 1.75f)); // E3
+        acceptance.layers.push_back(Box(8, 10.25f, -1.5f, 0, 11, 1.5f, 2));      // E4
+        acceptance.layers.push_back(Box(9, 11, -2, 0, 14, 2, 2));                // landing
+        acceptance.blockers.push_back(Box(2, 1.75f, -3, 1, 2.25f, 3, 4));        // wall
+        LayerTerrainObstruction flat;
+        flat.origin_x = -256;
+        flat.origin_y = -256;
+        flat.cell_size = 8; // coarse: only the terrain-edge proofs need it
+        flat.cells_x = 64;
+        flat.cells_y = 64;
+        flat.heights.assign(65 * 65, 0.0f);
+        acceptance.terrain = flat;
+        const auto built = Build(acceptance);
+        const auto bytes = built.ok ? EncodeLayeredWorld(built.world) : std::vector<std::uint8_t>{};
+        LayeredWorld decoded;
+        std::string error = built.error;
+        const bool round = !bytes.empty() && DecodeLayeredWorld(bytes, decoded, error) &&
+                           decoded.Validate(acceptance.bounds, error) && EncodeLayeredWorld(decoded) == bytes;
+        Check("acceptance-scene-cooks-encodes-and-round-trips",
+              built.ok && built.world.volumes.size() == 9 && built.report.portals_derived == 8 &&
+                  built.world.terrain_edges.size() == 3 && round,
+              "volumes=" + std::to_string(built.world.volumes.size()) + " portals=" +
+                  std::to_string(built.report.portals_derived) + " edges=" + std::to_string(built.world.terrain_edges.size()) +
+                  " bytes=" + std::to_string(bytes.size()) + " " + error);
+        if (built.ok) support("acceptance", built, &*acceptance.terrain);
     }
 
     // ---------- 10. codec, validation, determinism ----------
@@ -944,6 +1138,8 @@ int main()
 
     Check("oracle-total", oracle_samples > 0 && oracle_violations == 0,
           std::to_string(oracle_samples) + " centres, closest obstruction " + std::to_string(oracle_closest) + " m");
+    Check("support-oracle-total", support_poses > 0 && support_violations == 0,
+          std::to_string(support_poses) + " poses, overhanging=" + std::to_string(support_violations));
     std::cout << "LAYER CLEARANCE summary: checks=" << checks << " failures=" << failures << '\n';
     return failures == 0 ? 0 : 1;
 }

@@ -184,6 +184,15 @@ void ScriptApiImpl::DestroyEntity(std::uint32_t id)
     deferredOps.push_back({DeferredKind::Destroy, std::string(), {0.0f, 0.0f, 0.0f}, id});
 }
 
+void ScriptApiImpl::SetMaterial(std::uint32_t id, std::uint32_t slot, const std::string& materialAssetId)
+{
+    if (id == 0 || materialAssetId.empty() || slot >= 64)
+        return;
+    DeferredOp op{DeferredKind::SetMaterial, materialAssetId, {0.0f, 0.0f, 0.0f}, id};
+    op.slot = slot;
+    deferredOps.push_back(std::move(op));
+}
+
 ixscript::RaycastHit ScriptApiImpl::Raycast(float ox, float oy, float oz,
                                             float dx, float dy, float dz, float maxDist)
 {

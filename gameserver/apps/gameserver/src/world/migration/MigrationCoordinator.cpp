@@ -15,6 +15,8 @@
 #include "../components/TransformComponents.h"
 #include "../distributed/MigrationTransport.h"
 #include "../distributed/WorldDirectory.h"
+#include "../replication/SnapshotBuilder.h"
+#include "../visibility/BorderPublisher.h"
 #include "../spatial/SpatialTypes.h"
 #include "../visibility/GhostSystem.h"
 #include "../zone/Zone.h"
@@ -222,6 +224,9 @@ MigrationOutcome MigrationCoordinator::MigratePlayer(Zone& source_zone,
                   error.what());
         return MigrationOutcome::DroppedStale;
     }
+    // 3D-5D: what the source zone's observers keep seeing until the new owner
+    // publishes it (see GhostSystem::AdoptMigratedGhost).
+    BorderEntitySnapshot leaving = BuildPlayerSnapshot(source_zone, entity);
     auto moved_binding = source_zone.ExtractPlayerBinding(net_id);
 
     GhostSystem::RemoveByNetId(target_zone, net_id);
@@ -257,6 +262,14 @@ MigrationOutcome MigrationCoordinator::MigratePlayer(Zone& source_zone,
         }
         return MigrationOutcome::Failed;
     }
+
+    // 3D-5D: hand the border publication over at once (source drops it, new
+    // owner publishes it) and bridge the source zone's own observers with a
+    // ghost, so nobody sees a despawn + spawn churn for a seamless migration.
+    leaving.position = transfer.position;
+    BorderPublisher::RetractNonResidents(source_zone);
+    BorderPublisher::PublishResident(target_zone, leaving);
+    GhostSystem::AdoptMigratedGhost(source_zone, leaving, target_zone.Id());
 
     // Stage 6: commit routing. The global identity and logical location are
     // the cross-process truth; the local caches keep the hot path fast.
@@ -316,6 +329,7 @@ MigrationOutcome MigrationCoordinator::MigrateMob(Zone& source_zone,
                   error.what());
         return MigrationOutcome::DroppedStale;
     }
+    BorderEntitySnapshot leaving = BuildMobSnapshot(entity);
     auto moved_rng = source_zone.ExtractMobRng(net_id);
 
     GhostSystem::RemoveByNetId(target_zone, net_id);
@@ -356,6 +370,13 @@ MigrationOutcome MigrationCoordinator::MigrateMob(Zone& source_zone,
     target_zone.RefreshResidentCounts();
     // Load field attribution: committed ownership transfer at the destination.
     target_zone.LoadBins().NoteMigration(transfer.position.x, transfer.position.y);
+    // 3D-5D: hand the border publication over at once (source drops it, new
+    // owner publishes it) and bridge the source zone's own observers with a
+    // ghost, so nobody sees a despawn + spawn churn for a seamless migration.
+    leaving.position = transfer.position;
+    BorderPublisher::RetractNonResidents(source_zone);
+    BorderPublisher::PublishResident(target_zone, leaving);
+    GhostSystem::AdoptMigratedGhost(source_zone, leaving, target_zone.Id());
 
     source_zone.Diagnostics().migrations_since_diag.fetch_add(1, std::memory_order_relaxed);
     LOG_INFO("migration: net_id={} (mob, type={}) from_zone={} to_zone={} tick={}",

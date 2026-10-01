@@ -79,6 +79,13 @@ public:
     // Explicit invalidation (migration/despawn/death): remove one ghost copy
     // immediately, independent of the reconcile schedule.
     static void RemoveByNetId(Zone& zone, std::uint32_t net_id);
+    // 3D-5D: an entity that just migrated out of `zone` is not resident there
+    // any more and its new owner publishes it only on its next tick, so the
+    // source zone's observers would see a despawn + spawn churn. Bridge the
+    // gap with an immediate ghost sourced from the new owner (stamped with the
+    // current reconcile generation): the next reconcile refreshes it from the
+    // owner's publication or drops it like any other ghost. Zone owner only.
+    static void AdoptMigratedGhost(Zone& zone, const BorderEntitySnapshot& snapshot, ZoneId new_owner_zone_id);
 };
 
 } // namespace gs::game

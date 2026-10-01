@@ -77,6 +77,7 @@ public:
     void NetClose(std::uint32_t handle) override;
     std::uint32_t PromptText(const std::string& title, const std::string& label, bool secret) override;
     int PromptResult(std::uint32_t promptId, char* out, std::uint32_t capacity) override;
+    void SetMaterial(std::uint32_t id, std::uint32_t slot, const std::string& materialAssetId) override;
 
     // --- script text prompts, drawn by the host UI (the editor) ---
     struct Prompt
@@ -96,13 +97,14 @@ public:
     void ResetTransportAndPrompts();
 
     // --- deferred spawn/destroy queue (drained by the engine after the script OnUpdate loop) ---
-    enum class DeferredKind { SpawnMesh, SpawnPrefab, Destroy };
+    enum class DeferredKind { SpawnMesh, SpawnPrefab, Destroy, SetMaterial };
     struct DeferredOp
     {
         DeferredKind kind;
         std::string assetId;
         float pos[3] = {0.0f, 0.0f, 0.0f};
         std::uint32_t id = 0;  // pre-allocated for spawns; target for destroy
+        std::uint32_t slot = 0;  // SetMaterial: material slot (assetId = the material)
     };
     std::vector<DeferredOp> deferredOps;
 

@@ -239,6 +239,11 @@ struct LuaBackend::Impl
             return std::make_tuple(status, text);
         });
 
+        // SetMaterial(id, slot, materialGuidOrAssetId) — deferred, like spawn/destroy (v5)
+        t.set_function("SetMaterial", [a](std::uint32_t id, std::uint32_t slot, const std::string& material) {
+            a->SetMaterial(id, slot, material);
+        });
+
         // Ergonomic Key.* table: names map to the same strings IsKeyDown accepts (Key.W == "W").
         sol::table keys = lua.create_table();
         for (const char* name : {"W", "A", "S", "D", "Space", "Shift", "Ctrl",

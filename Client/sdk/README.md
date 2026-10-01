@@ -59,6 +59,9 @@ IXSCRIPT_REGISTER(MyScript)
 - Prompt (v4): `PromptText(title, label, secret)->id` shows a one-line input dialog (`secret` masks it, e.g. a
   password; 0 = no prompt UI on this host — today only the editor draws them), then poll
   `PromptResult(id, buf, cap)`: 0 still open, 1 submitted (text copied, the engine forgets it), -1 cancelled.
+- Material (v5): `SetMaterial(slot, material)` on this entity, or `api->SetMaterial(id, slot, material)` on any
+  entity (e.g. one just spawned) — `material` is a material asset GUID (as in a scene's `materials`) or its asset
+  id. Deferred like spawn/destroy, so it applies to an entity spawned earlier in the same frame.
 
 ### Example: a whole MMO client as a scene script
 
@@ -134,6 +137,6 @@ from the **Class** dropdown, set any parameters, and press **Play**.
 
 - **No hot reload.** The DLL is loaded at project open; rebuild + reopen the project to pick up changes.
 - **One ABI version.** A module built against a different `IXTREEME_MODULE_API_VERSION` is rejected
-  (v4 added the network/prompt slots: rebuild v3 modules).
+  (v4 added the network/prompt slots, v5 `SetMaterial`: rebuild older modules).
 - **Native only.** This is the C++ path; Lua scripts ship as `.lua` assets (no DLL).
 - **Desktop.** Module DLL loading is the desktop workflow; on Android native code is built into the app.

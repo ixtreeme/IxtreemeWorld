@@ -519,4 +519,19 @@ void GhostSystem::RemoveByNetId(Zone& zone, std::uint32_t net_id)
                                          std::memory_order_relaxed);
 }
 
+void GhostSystem::AdoptMigratedGhost(Zone& zone, const BorderEntitySnapshot& snapshot, ZoneId new_owner_zone_id)
+{
+    AssertZoneOwner(zone, "zone migrated ghost adopt");
+
+    if (snapshot.net_id == 0 || zone.IsResident(snapshot.net_id)) {
+        return;
+    }
+    if (zone.GhostIndex().find(snapshot.net_id) != zone.GhostIndex().end()) {
+        return; // already mirrored (a neighbour published it): the reconcile owns it
+    }
+    CreateGhost(zone, snapshot, new_owner_zone_id, zone.GhostMaintenance().reconcile_generation);
+    zone.Diagnostics().ghost_count.store(static_cast<std::uint32_t>(zone.Ghosts().size()),
+                                         std::memory_order_relaxed);
+}
+
 } // namespace gs::game

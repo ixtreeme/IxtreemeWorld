@@ -18,6 +18,8 @@
 //   loginHost  (127.0.0.1)   loginPort (11000)   character (first character on the account)
 //   proxyMesh  mesh asset id for other players/mobs (empty: others are tracked but not drawn)
 //   visualLift metres added to the drawn height (e.g. half the mesh height when its pivot is centred)
+//   proxyMaterial    material (GUID or asset id) given to every proxy (SetMaterial, SDK v5)
+//   protocolVersion  1 or 2 (default 2); 1 behaves like a pre-layered client (v2 frames, no levels)
 //
 // Coordinates: the server is z-up (x, y, z); the engine is y-up. server (x, y, z) == engine (x, z, y).
 // Heading 0 faces +server-y (engine +Z), pi/2 faces +x. Up/Down (or W/S) move along +-engine Z,
@@ -909,8 +911,10 @@ public:
         m_characterName = Param("character");
         m_proxyMesh = Param("proxyMesh");
         m_visualLift = ParamFloat("visualLift", 0.0f);
+        m_proxyMaterial = Param("proxyMaterial");
+        m_protocol = ParamFloat("protocolVersion", 2.0f) < 1.5f ? 1u : mmowire::kProtocolVersion;
         Log("[MMO] client script started (login " + m_loginHost + ":" + std::to_string(m_loginPort) +
-            ", protocol " + std::to_string(mmowire::kProtocolVersion) + ")");
+            ", protocol " + std::to_string(m_protocol) + ")");
         Enter(Phase::AskUsername);
     }
 
@@ -1106,13 +1110,13 @@ private:
         }
         if (m_phase == Phase::LoginConnecting && state == 1)
         {
-            auto hello = mmowire::EncodeHandshakeRequest(mmowire::kProtocolVersion, "ixtreeme-scene-script");
+            auto hello = mmowire::EncodeHandshakeRequest(m_protocol, "ixtreeme-scene-script");
             SendPayload(hello);
             Enter(Phase::LoginHandshake);
         }
         else if (m_phase == Phase::GameConnecting && state == 1)
         {
-            auto hello = mmowire::EncodeHandshakeRequest(mmowire::kProtocolVersion, "ixtreeme-scene-script");
+            auto hello = mmowire::EncodeHandshakeRequest(m_protocol, "ixtreeme-scene-script");
             SendPayload(hello);
             Enter(Phase::GameHandshake);
         }
@@ -1272,7 +1276,11 @@ private:
             proxy.volumeId = packet.volumeId;
             proxy.layerId = packet.layerId;
             if (proxy.entity == 0 && !m_proxyMesh.empty())
+            {
                 proxy.entity = SpawnMesh(m_proxyMesh, proxy.target[0], proxy.target[1] + m_visualLift, proxy.target[2]);
+                if (proxy.entity != 0 && !m_proxyMaterial.empty())
+                    api->SetMaterial(proxy.entity, 0, m_proxyMaterial);
+            }
             char line[192];
             std::snprintf(line, sizeof(line), "[MMO] spawn net %u '%s' at server (%.2f, %.2f, %.2f) volume %u layer %u",
                 packet.netId, packet.name.c_str(), packet.position[0], packet.position[1], packet.position[2],
@@ -1383,12 +1391,18 @@ private:
         if (m_statusTimer >= 5.0f)
         {
             m_statusTimer = 0.0f;
-            char line[224];
+            // Only layered (v3) frames carry the level; a protocol 1 session has no level after spawn.
+            char level[48];
+            if (m_framesByOpcode[mmowire::kFrameV3] > 0)
+                std::snprintf(level, sizeof(level), "volume %u layer %u", m_volumeId, m_layerId);
+            else
+                std::snprintf(level, sizeof(level), "volume n/a (protocol %u)", m_negotiated);
+            char line[256];
             std::snprintf(line, sizeof(line),
-                "[MMO] status: tick %u frames %u (v1 %u, v2 %u, v3 %u) server (%.2f, %.2f, %.2f) volume %u layer %u proxies %zu",
+                "[MMO] status: tick %u frames %u (v1 %u, v2 %u, v3 %u) server (%.2f, %.2f, %.2f) %s proxies %zu",
                 m_lastTick, m_frames, m_framesByOpcode[mmowire::kFrameV1], m_framesByOpcode[mmowire::kFrameV2],
-                m_framesByOpcode[mmowire::kFrameV3], m_selfServer[0], m_selfServer[1], m_selfServer[2], m_volumeId,
-                m_layerId, m_proxies.size());
+                m_framesByOpcode[mmowire::kFrameV3], m_selfServer[0], m_selfServer[1], m_selfServer[2], level,
+                m_proxies.size());
             Log(line);
         }
     }
@@ -1431,6 +1445,8 @@ private:
     std::string m_characterName;
     std::string m_proxyMesh;
     float m_visualLift = 0.0f;
+    std::string m_proxyMaterial;
+    std::uint32_t m_protocol = mmowire::kProtocolVersion;  // requested in both handshakes
     std::uint32_t m_prompt = 0;
     std::string m_username;
     std::string m_password;              // wiped as soon as the login request is queued

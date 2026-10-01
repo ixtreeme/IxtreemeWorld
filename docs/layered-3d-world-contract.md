@@ -153,6 +153,17 @@ plane point + height (+ radius·(sec−1) on slopes). A cell is PASSABLE when
 it is clear in its own grid or inside a clear corridor cell of one of the
 volume's proven portals.
 
+3D-5D adds open-ledge erosion to the bake: a still-free cell (own grid,
+portal corridor, terrain-edge band) is blocked when the cell expanded by the
+radius (square) is not entirely covered by SUPPORT — the volume's own
+footprint, the footprints of volumes it reaches through a proven portal (a
+corridor uses both ends' support), and the terrain beyond its proven
+terrain-edge slots (extended past a footprint corner when that terrain is
+within the step of the plane at the corner). The actor therefore never
+overhangs a drop; walls, portals and terrain edges are unaffected beyond
+their own proofs. The grid format is unchanged: packages cooked before 3D-5D
+keep centre-based support until re-exported.
+
 `ResolveLayerActorPlacement` requires the profile, an actor no larger than
 the profile (`ActorNotCovered` otherwise), valid support and passable
 touched cells (`Blocked`). `ResolveLayerActorMove` validates the current

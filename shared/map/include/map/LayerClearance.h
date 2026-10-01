@@ -44,6 +44,11 @@ struct LayerClearanceReport {
     std::size_t edges_rejected_step = 0;
     std::uint64_t corridor_slots = 0;
     std::uint64_t corridor_slots_blocked = 0;
+    // 3D-5D open-ledge erosion: of the blocked counts above, how many cells
+    // were blocked only because the actor footprint would overhang an open
+    // ledge (no floor, no proven portal neighbour, no proven terrain edge).
+    std::uint64_t cells_eroded = 0;
+    std::uint64_t corridor_slots_eroded = 0;
     std::vector<std::string> warnings;
     std::vector<std::string> errors;
 
@@ -64,6 +69,15 @@ inline constexpr std::size_t kMaxLayerObstructionTriangles = 1u << 20;
 //              plane(q) + floor_contact <= z <= max plane over cell + height
 //              + radius * (1/cos(slope) - 1) }.
 // The capsule standing on the plane is contained in that region.
+//
+// Open-ledge erosion (3D-5D): after obstructions, portals and terrain edges
+// are cooked, a still-free cell (own grid, portal corridor, terrain-edge
+// band) is blocked when the cell expanded by the radius (square) is not
+// entirely covered by SUPPORT: the volume's own footprint, the footprints of
+// the volumes it reaches through a proven portal (a corridor uses both ends'
+// support), and the terrain beyond its proven terrain-edge slots. So the
+// actor never overhangs a drop; portal, terrain-edge and wall sides are
+// unaffected beyond what their own proofs already block.
 bool CookLayerClearance(LayeredWorld& world,
                         const Rect& world_bounds,
                         const std::vector<LayerObstructionMesh>& obstructions,

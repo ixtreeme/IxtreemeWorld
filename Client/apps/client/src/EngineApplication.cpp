@@ -3665,6 +3665,10 @@ int RunGame(NativeWindow& window,
     auto buildHierarchyEntities = [&]() {
         std::vector<HierarchySceneEntity> entities;
         std::vector<std::uint64_t> liveKeys;
+        // Flecs names are unique per scope: names are applied only after the stale entities are
+        // deleted, so an object destroyed and a same-named one spawned in the same frame (a script
+        // replacing a proxy) cannot collide with the not yet deleted predecessor (flecs aborts).
+        std::vector<std::pair<ecs_entity_t, std::string>> pendingNames;
         selectedEditorObject.flecsEntity = 0;
 
         const SceneData& scene = SceneManager::Instance().GetCurrentScene();
@@ -3784,7 +3788,7 @@ int RunGame(NativeWindow& window,
                 entity = it->second;
             }
 
-            ecs_set_name(editorHierarchyWorld.get(), entity, displayName.c_str());
+            pendingNames.emplace_back(entity, displayName);
             pendingParents[key] = parent;
 
             const bool selected =
@@ -3872,6 +3876,8 @@ int RunGame(NativeWindow& window,
                 ++it;
             }
         }
+        for (const auto& [namedEntity, name] : pendingNames)
+            ecs_set_name(editorHierarchyWorld.get(), namedEntity, name.c_str());
 
         for (HierarchySceneEntity& entity : entities)
         {
@@ -5284,6 +5290,34 @@ int RunGame(NativeWindow& window,
                         if (selectedEditorObject.type == SelectedEditorObjectType::MeshEntity &&
                             selectedEditorObject.id == op.id)
                             selectedEditorObject = {};
+                    }
+                    else if (op.kind == ScriptApiImpl::DeferredKind::SetMaterial)
+                    {
+                        // A material GUID (as in a scene's "materials" slots) or a project asset id.
+                        std::string guid;
+                        if (const auto parsed = Guid::fromString(op.assetId);
+                            parsed && AssetDatabase::Instance().resolveGuid(*parsed))
+                            guid = parsed->toString();
+                        else if (ProjectManager::Instance().HasProject())
+                        {
+                            AssetLibrary projectAssets(ProjectManager::Instance().ProjectRoot(),
+                                ProjectManager::Instance().AssetRootPath());
+                            if (projectAssets.Initialize())
+                                if (auto e = projectAssets.FindById(op.assetId);
+                                    e && e->category == AssetLibrary::Category::Material)
+                                    guid = AssetDatabase::Instance().getOrCreateGuid(projectAssets.AbsolutePath(*e)).toString();
+                        }
+                        auto meshIt = std::find_if(editorMeshEntities.begin(), editorMeshEntities.end(),
+                            [&](const MeshSceneEntity& m) { return m.id == op.id; });
+                        if (guid.empty() || meshIt == editorMeshEntities.end())
+                        {
+                            TraceError("[SCRIPT] SetMaterial: unknown %s (entity=%u material=%s)",
+                                guid.empty() ? "material" : "entity", op.id, op.assetId.c_str());
+                            continue;
+                        }
+                        if (meshIt->materialSlots.size() <= op.slot)
+                            meshIt->materialSlots.resize(op.slot + 1u);
+                        meshIt->materialSlots[op.slot] = guid;
                     }
                     else if (op.kind == ScriptApiImpl::DeferredKind::SpawnPrefab)
                     {
@@ -9358,15 +9392,18 @@ int RunGame(NativeWindow& window,
                         status += "\nClearance (capsule r=0.35 h=1.8): " + std::to_string(clearance.cells_blocked) +
                             " of " + std::to_string(clearance.cells_total) + " cells blocked by " +
                             std::to_string(layerAuthoringPreview.obstructionSources) + " static colliders" +
-                            (clearance.terrain_quads_tested > 0 ? " + terrain" : "") + ".";
+                            (clearance.terrain_quads_tested > 0 ? " + terrain" : "") + " or open ledges (" +
+                            std::to_string(clearance.cells_eroded) + " ledge cells).";
                         status += "\nProven step/ramp portals: " + std::to_string(clearance.portals_derived) +
                             " (edges above step height: " + std::to_string(clearance.edges_rejected_step) + ").";
                         status += "\nProven terrain edges: " + std::to_string(clearance.terrain_edges_derived) +
                             " (volume sides level with the terrain, step <= 0.35 m).";
                         status += "\nPreview draws up to 256 volumes. Terrain retains its heightfield.";
-                        Tracenf("[LAYER-CLEARANCE] cells=%llu blocked=%llu obstruction_sources=%zu mesh_triangles=%zu terrain_quads=%llu portals=%zu terrain_edges=%zu rejected_steps=%zu corridor_cells=%llu corridor_blocked=%llu",
+                        Tracenf("[LAYER-CLEARANCE] cells=%llu blocked=%llu eroded=%llu corridor_eroded=%llu obstruction_sources=%zu mesh_triangles=%zu terrain_quads=%llu portals=%zu terrain_edges=%zu rejected_steps=%zu corridor_cells=%llu corridor_blocked=%llu",
                             static_cast<unsigned long long>(clearance.cells_total),
                             static_cast<unsigned long long>(clearance.cells_blocked),
+                            static_cast<unsigned long long>(clearance.cells_eroded),
+                            static_cast<unsigned long long>(clearance.corridor_slots_eroded),
                             layerAuthoringPreview.obstructionSources, clearance.obstruction_triangles,
                             static_cast<unsigned long long>(clearance.terrain_quads_tested), clearance.portals_derived,
                             clearance.terrain_edges_derived,

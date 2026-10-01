@@ -1016,8 +1016,11 @@ bool DecodeLayeredWorld(const std::vector<std::uint8_t>& bytes, LayeredWorld& wo
             error = "layered-world terrain edge count is truncated";
             return false;
         }
+        // Smallest record: 40 fixed bytes + a 1-byte corridor bitset (a band
+        // of at most 8 cells). 3D-5D: this was 44, which refused small edges.
+        constexpr std::uint64_t kMinTerrainEdgeRecordBytes = 41;
         if (edge_count == 0 || edge_count > kMaxLayerTerrainEdges ||
-            static_cast<std::uint64_t>(edge_count) * 44u > cursor.Remaining()) {
+            static_cast<std::uint64_t>(edge_count) * kMinTerrainEdgeRecordBytes > cursor.Remaining()) {
             error = "layered-world terrain edge count exceeds the limit";
             return false;
         }

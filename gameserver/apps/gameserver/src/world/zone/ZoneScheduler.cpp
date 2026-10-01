@@ -11,6 +11,8 @@
 #include "../WorldConstants.h"
 #include "../activity/SpatialActivityField.h"
 #include "../partition/ZonePartition.h"
+#include "../visibility/BorderPublisher.h"
+#include "ZoneOwnership.h"
 #include "Zone.h"
 #include "ZoneLoadMetrics.h"
 #include "ZoneManager.h"
@@ -188,6 +190,22 @@ void ZoneScheduler::ScheduleOnce(ZoneManager& zones,
                                    (legacy_quiet || (lod_enabled_ && lod_quiet));
         if (locally_quiet && !external) {
             if (zone.Activity() != ZoneActivity::Sleeping) {
+                // 3D-5D: a sleeping zone never republishes, so its border
+                // publication must first drop the entities that left it in
+                // the tick that emptied it (migrated out, despawned), or
+                // neighbours keep -- and later resurrect -- ghosts of them.
+                // Claim the zone like a tick: it may still be finishing one
+                // on a worker, then the sleep is decided on the next wave.
+                bool idle = false;
+                if (!zone.TickInProgress().compare_exchange_strong(idle, true)) {
+                    ++counters_.cas_failures;
+                    continue;
+                }
+                {
+                    ZoneWriteGuard guard(zone, "zone sleep border retract");
+                    BorderPublisher::RetractNonResidents(zone);
+                }
+                zone.TickInProgress().store(false, std::memory_order_release);
                 zone.SetActivity(ZoneActivity::Sleeping);
                 // Leak-freedom: a sleeping zone never ticks again, so wipe
                 // its last published sources now (despawn/retire races

@@ -29,6 +29,7 @@
 #include <limits>
 #include <optional>
 #include <string>
+#include <string_view>
 #include <type_traits>
 #include <unordered_set>
 #include <utility>
@@ -329,6 +330,10 @@ StaticMeshRenderer::MaterialDefaults MaterialDefaultsFromAsset(const MaterialAss
         (material.alphaMode == MaterialAsset::AlphaMode::Blend ? "blend" : "opaque");
     defaults.alphaCutoff = material.alphaCutoff;
     defaults.unlit = material.shadingMode == MaterialAsset::ShadingMode::Unlit;
+    defaults.uvTiling[0] = material.uvTiling[0];
+    defaults.uvTiling[1] = material.uvTiling[1];
+    defaults.uvOffset[0] = material.uvOffset[0];
+    defaults.uvOffset[1] = material.uvOffset[1];
     return defaults;
 }
 
@@ -411,10 +416,10 @@ void FillStaticMeshInstanceBlock(const WorldCamera& camera,
     out.materialEmissive[1] = defaults.emissive[1];
     out.materialEmissive[2] = defaults.emissive[2];
     out.materialEmissive[3] = 1.0f;
-    out.materialUv[0] = 1.0f;
-    out.materialUv[1] = 1.0f;
-    out.materialUv[2] = 0.0f;
-    out.materialUv[3] = 0.0f;
+    out.materialUv[0] = defaults.uvTiling[0];
+    out.materialUv[1] = defaults.uvTiling[1];
+    out.materialUv[2] = defaults.uvOffset[0];
+    out.materialUv[3] = defaults.uvOffset[1];
     out.materialAlpha[0] = AlphaModeCode(defaults.alphaMode);
     out.materialAlpha[1] = std::clamp(defaults.alphaCutoff, 0.0f, 1.0f);
     out.materialAlpha[2] = defaults.unlit ? 1.0f : 0.0f;
@@ -3077,11 +3082,28 @@ void StaticMeshRenderer::RenderLodBatchInWorld(ixrhi::IXRHICommandList& cmd,
     m_lastMaterialBindings.clear();
     m_lastMaterialBindings.reserve(drawCommands.size());
     const ixrhi::IXRHIGraphicsPipeline* boundPipeline = nullptr;
+    // The texture descriptors and the world uniform are bound once per draw call, so one instanced
+    // draw may only cover instances that share this slot's material: split each command into runs of
+    // consecutive instances with the same material GUID (instances of one material stay one draw).
+    const auto materialKey = [](const Instance& instance, std::uint32_t slot) -> std::string_view {
+        return slot < instance.materialSlots.size() ? std::string_view(instance.materialSlots[slot]) : std::string_view();
+    };
     auto drawPass = [&](bool maskPass) {
-        for (const InstancedDrawCommand& draw : drawCommands)
+        for (const InstancedDrawCommand& command : drawCommands)
+        for (std::uint32_t runStart = 0; runStart < command.instanceCount;)
         {
+            std::uint32_t runEnd = runStart + 1;
+            while (runEnd < command.instanceCount &&
+                   materialKey(instances[runEnd], command.materialSlot) ==
+                       materialKey(instances[runStart], command.materialSlot))
+                ++runEnd;
+            InstancedDrawCommand draw = command;
+            draw.firstInstance = command.firstInstance + runStart;
+            draw.instanceCount = runEnd - runStart;
+            const Instance& runInstance = instances[runStart];
+            runStart = runEnd;
             const MaterialTextureViews materialTextures =
-                ResolveMaterialTextureViews(*m_rhi, instances.front(), draw.materialSlot);
+                ResolveMaterialTextureViews(*m_rhi, runInstance, draw.materialSlot);
             const bool isMask = std::strcmp(materialTextures.fragmentShaderAlphaPath, "discard") == 0;
             if (isMask != maskPass)
                 continue;
@@ -3108,7 +3130,7 @@ void StaticMeshRenderer::RenderLodBatchInWorld(ixrhi::IXRHICommandList& cmd,
             }
 
             const uint32_t uniformSlot = std::min(m_worldUniformCursor++, kUniformSlots - 1);
-            UpdateWorldUniform(frameIndex, uniformSlot, camera, instances.front(), timeSeconds, draw.materialSlot);
+            UpdateWorldUniform(frameIndex, uniformSlot, camera, runInstance, timeSeconds, draw.materialSlot);
             UpdateMaterialTextureDescriptors(frameIndex, uniformSlot, materialTextures);
             const uint32_t bindSlot = frameIndex * kUniformSlots + uniformSlot;
             LastMaterialBinding binding{};
@@ -3136,9 +3158,13 @@ void StaticMeshRenderer::RenderLodBatchInWorld(ixrhi::IXRHICommandList& cmd,
             m_lastMaterialBindings.push_back(std::move(binding));
             ++m_lastMaterialUniformUpdates;
             cmd.BindGroup(0, *m_bindGroup, bindSlot);
-            if (configHash != 0 && diagnosticInstanceIndex)
+            const auto inRun = [&](std::size_t index) {
+                const std::size_t first = draw.firstInstance - command.firstInstance;
+                return index >= first && index < first + draw.instanceCount;
+            };
+            if (configHash != 0 && diagnosticInstanceIndex && inRun(*diagnosticInstanceIndex))
             {
-                const std::size_t absoluteInstance = static_cast<std::size_t>(draw.firstInstance) + *diagnosticInstanceIndex;
+                const std::size_t absoluteInstance = static_cast<std::size_t>(command.firstInstance) + *diagnosticInstanceIndex;
                 if (absoluteInstance < instanceBlocks.size())
                 {
                     if (!loggedMaterialE3)
@@ -3151,12 +3177,12 @@ void StaticMeshRenderer::RenderLodBatchInWorld(ixrhi::IXRHICommandList& cmd,
                             true);
                         loggedMaterialE3 = true;
                     }
-                    logDrawDiag("[LOD-DRAW-E3]", diagnosticEntityId, draw, *diagnosticInstanceIndex, uniformSlot, pipelineForDraw);
+                    logDrawDiag("[LOD-DRAW-E3]", diagnosticEntityId, command, *diagnosticInstanceIndex, uniformSlot, pipelineForDraw);
                 }
             }
-            if (refInstanceIndex)
+            if (refInstanceIndex && inRun(*refInstanceIndex))
             {
-                const std::size_t absoluteInstance = static_cast<std::size_t>(draw.firstInstance) + *refInstanceIndex;
+                const std::size_t absoluteInstance = static_cast<std::size_t>(command.firstInstance) + *refInstanceIndex;
                 if (absoluteInstance < instanceBlocks.size())
                 {
                     if (!loggedMaterialRef)
@@ -3169,7 +3195,7 @@ void StaticMeshRenderer::RenderLodBatchInWorld(ixrhi::IXRHICommandList& cmd,
                             false);
                         loggedMaterialRef = true;
                     }
-                    logDrawDiag("[LOD-DRAW-REF]", instances[*refInstanceIndex].entityId, draw, *refInstanceIndex, uniformSlot, pipelineForDraw);
+                    logDrawDiag("[LOD-DRAW-REF]", instances[*refInstanceIndex].entityId, command, *refInstanceIndex, uniformSlot, pipelineForDraw);
                 }
             }
             cmd.DrawIndexed(draw.indexCount, draw.instanceCount, draw.firstIndex, 0, draw.firstInstance);
@@ -3309,6 +3335,10 @@ void StaticMeshRenderer::UpdateWorldUniform(uint32_t frameIndex,
     uniform.materialAlpha[0] = AlphaModeCode(defaults.alphaMode);
     uniform.materialAlpha[1] = std::clamp(defaults.alphaCutoff, 0.0f, 1.0f);
     uniform.materialAlpha[2] = defaults.unlit ? 1.0f : 0.0f;
+    uniform.materialUv[0] = defaults.uvTiling[0];
+    uniform.materialUv[1] = defaults.uvTiling[1];
+    uniform.materialUv[2] = defaults.uvOffset[0];
+    uniform.materialUv[3] = defaults.uvOffset[1];
     uniform.materialAlpha[3] = 0.0f;
     for (const MeshSceneEntity::MaterialOverride& overrideSlot : instance.materialOverrides)
     {

@@ -108,6 +108,8 @@ protected:
     void NetClose(std::uint32_t handle) { api->NetClose(handle); }
     std::uint32_t PromptText(const std::string& title, const std::string& label, bool secret) { return api->PromptText(title, label, secret); }
     int PromptResult(std::uint32_t promptId, char* out, std::uint32_t capacity) { return api->PromptResult(promptId, out, capacity); }
+    // Material slot of THIS entity (see IScriptApi::SetMaterial; v5). Other entities: api->SetMaterial(id, ...).
+    void SetMaterial(std::uint32_t slot, const std::string& materialAssetId) { api->SetMaterial(entityId, slot, materialAssetId); }
 
     void Log(const std::string& msg) { api->Log(msg); }
     void LogError(const std::string& msg) { api->LogError(msg); }

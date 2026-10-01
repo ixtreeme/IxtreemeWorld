@@ -412,10 +412,16 @@ void DeterministicChecks(Checks& checks)
                       diag.layered_portal_crossings_total.load() == 5 && z_on_plane,
                   "volumes " + order);
     const auto stopped = climber.get<Position>();
+    // 3D-5D: the landing's east side is an open ledge (2 m drop): the actor
+    // stops inside it at the eroded ledge band (centre <= 310 - radius, cell
+    // quantised), refused as Blocked before ever reaching the footprint edge.
     checks.Report("deterministic-landing-edge-refuses-leaving-the-volume-system",
-                  stopped.x < 310.0f && stopped.x > 309.0f && climber.get<LayerPresence>().volume_id == landing->id &&
-                      diag.layered_moves_transition_total.load() > 0,
-                  Fmt("x=%.4f", stopped.x));
+                  stopped.x <= 310.0f - 0.35f && stopped.x > 309.0f &&
+                      climber.get<LayerPresence>().volume_id == landing->id &&
+                      diag.layered_moves_blocked_total.load() > 0,
+                  Fmt("x=%.4f blocked=%llu transition=%llu", stopped.x,
+                      static_cast<unsigned long long>(diag.layered_moves_blocked_total.load()),
+                      static_cast<unsigned long long>(diag.layered_moves_transition_total.load())));
 
     // Wall: the exact last accepted piece is the last clear cell.
     const auto walker = spawn(502, 226.0f, 250.0f, *floor);
@@ -796,6 +802,7 @@ struct WireLog {
     std::vector<std::uint32_t> self_volumes; // distinct, in order
     std::unordered_map<std::uint32_t, std::uint32_t> volume_of;         // net -> last known volume
     std::unordered_map<std::uint32_t, std::uint32_t> volume_changes_of; // net -> layer fields received
+    std::vector<std::pair<char, std::uint32_t>> events;                  // ('S' spawn | 'D' despawn, net) in order
 };
 
 void ParseTransformFrame(const std::vector<std::uint8_t>& p, WireLog& log)
@@ -867,6 +874,9 @@ void ReadWire(asio::ip::tcp::socket& socket, WireLog& log)
                 if (const auto parsed = gs::protocol::ParsePacket(payload); parsed && parsed->packet.isEntitySpawn()) {
                     const auto spawn = parsed->packet.getEntitySpawn();
                     log.volume_of[spawn.getNetId()] = spawn.getVolumeId();
+                    log.events.emplace_back('S', spawn.getNetId());
+                } else if (parsed && parsed->packet.isEntityDespawn()) {
+                    log.events.emplace_back('D', parsed->packet.getEntityDespawn().getNetId());
                 } else if (parsed && parsed->packet.isEnterWorldAccept()) {
                     log.self_volume = parsed->packet.getEnterWorldAccept().getSpawnVolumeId();
                     log.self_volumes.push_back(log.self_volume);
@@ -1011,6 +1021,112 @@ void LayeredFrameChecks(Checks& checks)
                           static_cast<unsigned long long>(legacy.log.v3_frames)));
         checks.Report("replication-shadow-audit-with-layered-recipients", repl_done && repl == "OK", repl);
     }
+}
+
+// ---- 3D-5D: a layered player that migrated and then disconnects stays gone ----
+//
+// Live acceptance (two editors) showed an observer receiving a despawn of a
+// disconnected player followed by a spawn of the same net id at a minutes-old
+// position. This drives the same shape on the real runtime: the mover crosses
+// the zone border on the layered floor and back, then disconnects
+// (PostDespawn); the observer must see the despawn and never a later spawn.
+void LayeredDespawnChecks(Checks& checks)
+{
+    ScratchDirectory scratch;
+    map::LayeredWorld layered;
+    std::string error;
+    if (!CookFixture(layered, error)) {
+        checks.Report("despawn-fixture-cooked", false, error);
+        return;
+    }
+    const auto* floor = WalkableAt(layered, 240, 256, -1, 2);
+    if (!floor) return;
+    const std::uint32_t floor_id = floor->id;
+    map::PackageWriteSpec spec;
+    spec.world_id = "layereddespawn_fixture";
+    spec.world_name = "3D-5D layered despawn fixture";
+    spec.size_cells_x = spec.size_cells_y = static_cast<std::uint32_t>(kWorldSize);
+    spec.cell_size_m = 1;
+    spec.chunk_size_cells = 128;
+    spec.height_raw = [](std::uint32_t, std::uint32_t) { return 0; };
+    spec.attributes = [](std::uint32_t, std::uint32_t) { return std::uint16_t{0}; };
+    spec.logic.spawns.push_back(map::SpawnRegion{1, 0, map::Rect{99.5f, 99.5f, 100.5f, 100.5f}});
+    spec.layered_world = layered;
+    const auto root = scratch.root / "despawn_package";
+    const auto written = map::WritePackage(root, spec);
+    gs::game::WorldLoadRequest request;
+    request.package_root = root;
+    request.mob_types_config = IXTREEME_DEFAULT_MOB_TYPES_CONFIG;
+    request.depth = map::ValidationDepth::Full;
+    request.warp_policy = map::WarpPolicy::Strict;
+    map::PackageReport report;
+    auto loaded = written.ok ? gs::game::LoadWorldPackage(request, report) : std::nullopt;
+    if (!loaded) {
+        checks.Report("despawn-package-loads", false, written.error);
+        return;
+    }
+
+    IoRunner runner;
+    asio::ip::tcp::acceptor acceptor(runner.io, asio::ip::tcp::endpoint(asio::ip::address_v4::loopback(), 0));
+    WireClient mover, observer;
+    auto mover_session = Connect(runner.io, acceptor, mover, 95501);
+    auto observer_session = Connect(runner.io, acceptor, observer, 95502);
+    mover_session->SetProtocolVersion(gs::protocol::kLayeredFramesProtocolVersion);
+    observer_session->SetProtocolVersion(gs::protocol::kLayeredFramesProtocolVersion);
+
+    gs::game::PartitionLayout layout;
+    layout.regions_x = 2;
+    layout.regions_y = 1;
+    gs::game::WorldRuntime sim(runner.io, {}, std::move(*loaded), layout);
+    gs::game::PartitionConfig partition;
+    partition.scoring.adaptive_enabled = false;
+    sim.ConfigurePartition(partition);
+    // Both start east of the x = 256 border on the shared floor.
+    sim.PostSpawn(mover_session, MakeCharacter(91), gs::game::DebugSpawnOverride{262.0f, 245.0f, floor_id});
+    sim.PostSpawn(observer_session, MakeCharacter(92), gs::game::DebugSpawnOverride{280.0f, 266.0f, floor_id});
+    sim.Start();
+    const bool entered = WaitFor(10000ms, [&] {
+        return ReadWorld(sim, [](const WorldSnapshot& snap) { return snap.owners.size(); }) == 2;
+    });
+    std::this_thread::sleep_for(500ms);
+    const auto mover_net = ReadPlayer(sim, 95501).net_id;
+    std::uint32_t seq = 0;
+    const auto run = [&](float heading, std::chrono::milliseconds duration) {
+        const auto until = Clock::now() + duration;
+        while (Clock::now() < until) {
+            sim.PostMoveInput(95501, ++seq, heading, gs::game::MoveState::Running);
+            std::this_thread::sleep_for(50ms);
+        }
+    };
+    run(4.712389f, 2500ms);  // west across x = 256 (migrates out)
+    run(1.5707963f, 3500ms); // east, back across the border (migrates back)
+    run(0.0f, 700ms);        // north a little
+    sim.PostMoveInput(95501, ++seq, 0.0f, gs::game::MoveState::Idle);
+    std::this_thread::sleep_for(1500ms);
+    const auto before = ReadPlayer(sim, 95501);
+    sim.PostDespawn(95501); // the disconnect path (GameConnectionHandler::OnDisconnect)
+    std::this_thread::sleep_for(2500ms);
+    const auto owners_after = ReadWorld(sim, [](const WorldSnapshot& snap) { return snap.owners.size(); });
+    sim.Stop();
+
+    std::lock_guard o_lock(observer.log.mutex);
+    std::string sequence;
+    for (const auto& [kind, net] : observer.log.events) {
+        if (net == mover_net) sequence += kind;
+    }
+    // The last despawn is the disconnect; nothing may follow it.
+    const std::size_t last_despawn = sequence.rfind('D');
+    const std::size_t respawns_after =
+        last_despawn == std::string::npos ? 0 : sequence.size() - last_despawn - 1;
+    checks.Report("despawned-layered-player-is-not-respawned-to-observers",
+                  entered && before.layered && last_despawn != std::string::npos && respawns_after == 0 &&
+                      owners_after == 1,
+                  Fmt("mover net=%u events=%s respawns_after_despawn=%zu owners_after=%zu end=(%.1f,%.1f)", mover_net,
+                      sequence.c_str(), respawns_after, owners_after, before.position.x, before.position.y));
+    // Migrating out of the observer's zone and back is seamless: one spawn,
+    // then only the disconnect's despawn (no despawn + spawn churn).
+    checks.Report("layered-migration-out-and-back-without-churn-for-source-zone-observer", sequence == "SD",
+                  "events=" + sequence);
 }
 
 // ---- 3D-5B2: proven terrain <-> volume transitions --------------------------
@@ -1356,6 +1472,7 @@ int RunLayeredPresenceScenario()
         TerrainEdgeDeterministicChecks(checks);
         TerrainEdgeRuntimeChecks(checks);
         LayeredFrameChecks(checks);
+        LayeredDespawnChecks(checks);
     } catch (const std::exception& error) {
         checks.Report("unexpected-exception", false, error.what());
     }

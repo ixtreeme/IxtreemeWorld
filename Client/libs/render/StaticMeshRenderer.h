@@ -76,6 +76,8 @@ public:
         std::string alphaMode = "opaque";
         float alphaCutoff = 0.5f;
         bool unlit = false;
+        float uvTiling[2] = {1.0f, 1.0f}; // the material asset's UV transform (overrides replace it)
+        float uvOffset[2] = {0.0f, 0.0f};
     };
 
     struct Instance
