@@ -1,7 +1,7 @@
 # 3D-5C2 – kliensprotokoll scene-scriptként + általános engine-transzport (review, 2026-10-01)
 
-Állapot: **kód kész, automatikus tesztek zöldek; az élő (GUI-s, adatbázisos) végponttól-végpontig
-futás még nem történt meg** – lásd „Nem futtatott / függő”. Alap: `ab4c499` (3D-5C1).
+Állapot: **kész; automatikus tesztek zöldek, az élő GUI-s, adatbázisos végponttól-végpontig teszt
+(egy és két kliens) lefutott és sikeres** – lásd „Élő teszt”. Kód: `c508f7b`, alap: `ab4c499` (3D-5C1).
 
 ## Cél és döntések
 
@@ -61,16 +61,49 @@ hibaként jelzi („this host has no text prompt UI”). Runtime-UI későbbi fe
 | – a motor saját `platform::TcpStream`-je a valódi handlerrel: nem blokkoló connect, handshake → v2; elutasított connect → `Failed` (10061) | PASS |
 | worldbench regresszió: netstress, layeredpresence, protocol, replv2, hygiene | mind failures=0 |
 
+## Élő teszt (2026-10-01, Windows, Computer Use-zal vezérelt szerkesztő)
+
+Környezet: `IxtreemeEngine` Release (szerkesztő), `loginserver` + `gameserver` a `windows-debug`
+buildből, a meglévő MariaDB-adatbázissal (a DB-konfig csak útvonallal átadva), két meglévő teszt-fiók
+(a felhasználótól; csak a szerkesztő promptjába gépelve, sehol nem tárolva/logolva). Minden új adat
+külön helyen: `Client/build/layer-live-net-20261001/` (a meglévő csomagok és konfigok érintetlenek).
+
+Előkészítés a GUI-ban: projekt megnyitása → toolbar **Build** („Build succeeded — module reloaded”,
+`Layer_Live_Net_Smoke.dll`, 1 natív osztály) → Tools › Layered world › *Generate layers from collision*
+(6 volume: #1 Floor, #2–#5 lépcsőfok, #6 pihenő; 5 bizonyított portál) → spawn X/Z = 4, 0, volume 1 →
+*Export strict server world* → `gameserver --validate-world-package`: **VALID**, errors=0.
+
+| Lépés | Eredmény |
+|---|---|
+| Play → a script „Login” promptja (felhasználónév, majd maszkolt jelszó) | megjelent, a jelszó `*****` |
+| loginserver: handshake (build `ixtreeme-scene-script`) → login OK → 1 karakter → select → handoff-token | PASS (szerverlog) |
+| gameserver: handshake **protocol 2** → `Using layered player spawn region 1 at 4, 0 on volume 1 z=1` | PASS |
+| script: `entered world: net 1 at server (4.00, 0.00, 1.00) volume 1 layer 1` | PASS |
+| jobb nyíl: Floor → 4 lépcsőfok → pihenő; script-log `level change: volume 1→2→3→4→5→6`, z 1.00 → 1.25 → 1.50 → 1.75 → 2.00 | PASS |
+| bal nyíl: vissza 6→5→4→3→2→1, majd újra fel 1→…→6 | PASS |
+| frame-ek: kizárólag v3 (`0x12`), ~20/s (pl. 1901 db, v1/v2 = 0) | PASS |
+| Play leállítása → a stream bezárul; szerver: disconnect → cleanup → despawn | PASS |
+| **két kliens** (második szerkesztőpéldány külön munkakönyvtárból, a projekt másolatával; a második fiók): mindkettő bent, kölcsönös `spawn net N` proxy (`SpawnMesh`) | PASS |
+| az egyik kliens mászik → a másiknál `net N level change: volume 1 -> 2 … 5 -> 6` (a `0x08` delta-bit élőben) | PASS, mindkét irányban |
+| az egyik kliens leáll → a másiknál `despawn net N`, proxy törölve | PASS |
+| Play újraindítás bejelentkezés nélkül, majd leállítás → a prompt eltűnik, kapcsolat nem nyílik | PASS |
+| szerver- és login-log: warning/error a teszt alatt | 0 |
+| Vulkan-validációs hiba a két szerkesztőlogban | 0 / 0 |
+
+A teszthez szükséges, csak a tesztmappát érintő igazítások:
+- A 48×32 m-es clearance-terep kisebb a gameserver fordítási idejű 240 m-es partíció-minimumánál
+  (2 × AOI-sugár), ezért a teszt-projektben 256×256 m-es sík terepet generáltam
+  (`clearance_terrain_exact_256.height`; a régi fájl maradt).
+- A gameserver-konfig másolata (`servers/game/gameserver.live.conf`) `partition_regions=1x1`-gyel
+  (fájl-világnál az alapértelmezés 2×2 régió, ami 128 m-es levelet adna).
+
+Megfigyelés (review-ra, nem 3D-5C2 hiba): a pihenő 14 m-nél végződik, a játékos középpontja 13.90 m-ig
+jutott, azaz a 0.35 m-es kapszula a nyitott perem fölé lóg; a támasz a középpontra számít (3D-4B
+szemantika).
+
 ## Nem futtatott / függő (nem PASS)
 
-- **Élő végponttól-végpontig futás** (szerkesztő Play → prompt → valódi loginserver + gameserver a
-  meglévő adatbázissal → rétegzett lépcsőmászás a hálózaton): előkészítve, de **nem futott**. A
-  szerkesztő vezérlésére kért engedély két kérésre is elutasítva érkezett vissza (a felhasználó nem volt a
-  gépnél). Előkészítve: `Client/build/layer-live-net-20261001/gui-project` (a clearance-jelenet
-  másolata, „Network Player” entitás `MmoClient` scripttel; a régi csomagok érintetlenek), a spawn
-  terve: X/Z = 4, 0, volume 1 (Floor), szerverek a `windows-debug` buildből, saját log-mappákkal.
-- Az editor prompt-UI, a `ScriptApiImpl` Net/Prompt kódja, a szerkesztőbeli integrált modul-build a v4
-  SDK-val és a Lua-kötések futás közben **nincsenek kipróbálva** (csak fordulnak).
+- A Lua-kötések (`Net*`, `Prompt*`) futás közben nincsenek kipróbálva (csak fordulnak).
 - `TcpStream_Posix.cpp` Windows alatt nem fordul (`#if !defined(_WIN32)`); FreeBSD/Linux build nem futott.
 - A standalone runtime (WITH_EDITOR=OFF) build nem futott újra (nincs meglévő runtime build-könyvtár).
 
