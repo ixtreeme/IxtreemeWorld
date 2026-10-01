@@ -6,6 +6,7 @@
 #include "common/Logging.h"
 
 #include "../components/CombatComponents.h"
+#include "../components/LayerComponents.h"
 #include "../components/MobComponents.h"
 #include "../components/MovementComponents.h"
 #include "../components/NetworkComponents.h"
@@ -71,7 +72,12 @@ CombatSystem::AttackResult CombatSystem::ProcessAttack(Zone& zone,
 
     const float dx = target_position.x - attacker_position.x;
     const float dy = target_position.y - attacker_position.y;
-    const float dist_sq = dx * dx + dy * dy;
+    // 3D-5A: when either party stands on a layered volume the range is
+    // three-dimensional (a floor above is not within reach of the floor
+    // below). Terrain-only fights keep the historic horizontal range.
+    const bool layered = attacker_entity.has<LayerPresence>() || target_entity.has<LayerPresence>();
+    const float dz = layered ? target_position.z - attacker_position.z : 0.0f;
+    const float dist_sq = dx * dx + dy * dy + dz * dz;
     const float range = std::max(0.0f, attacker_stats.attack_range);
     if (dist_sq > range * range) {
         LOG_INFO("combat: rejected - out of range attacker={} target={} dist={}",

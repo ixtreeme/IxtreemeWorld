@@ -180,7 +180,7 @@ int RunActivityTemporalReproduction(bool fixed) {
         {
             ZoneWriteGuard guard(target,"temporal boundary fixture");
             auto mob=target.FindEntity(9001); target.Grid().Remove(9001,mob.get<Position>());
-            mob.set<Position>({2000.1f,1000,0}); target.Grid().Insert(9001,mob.get<Position>(),mob);
+            mob.set<Position>({2000.1f,1000,0}); target.Grid().Insert(9001,mob.get<Position>(),mob,0);
         }
         {
             ZoneWriteGuard guard(source,"temporal boundary spawn");
@@ -244,7 +244,7 @@ int RunActivityTemporalReproduction(bool fixed) {
             auto entity=a.FindEntity(43); auto value=BuildTransfer(entity,true);
             auto binding=a.ExtractPlayerBinding(43);
             a.Grid().Remove(43,value.position); entity.destruct(); a.UnindexEntity(43); a.RefreshResidentCounts();
-            auto copy=ApplyTransfer(b.World(),value); b.IndexEntity(43,copy); b.Grid().Insert(43,value.position,copy);
+            auto copy=ApplyTransfer(b.World(),value); b.IndexEntity(43,copy); b.Grid().Insert(43,value.position,copy,value.layer.volume_id);
             b.InsertPlayerBinding(43,std::move(binding)); b.RefreshResidentCounts();
         };
         auto child_for_player=[&](const std::vector<ZoneId>& children) {

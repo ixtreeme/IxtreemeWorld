@@ -183,7 +183,9 @@ std::uint16_t QuantizeHeading(float angle)
 
 std::vector<std::uint8_t> MakeEnterWorldAccept(std::uint32_t net_id,
                                                const Position& pos,
-                                               std::uint32_t world_tick)
+                                               std::uint32_t world_tick,
+                                               std::uint32_t volume_id,
+                                               std::uint32_t layer_id)
 {
     capnp::MallocMessageBuilder msg;
     auto packet = msg.initRoot<gs::protocol::Packet>();
@@ -191,6 +193,8 @@ std::vector<std::uint8_t> MakeEnterWorldAccept(std::uint32_t net_id,
     accept.setYourNetId(net_id);
     FillVec3(accept.initSpawnPos(), pos);
     accept.setServerTick(world_tick);
+    accept.setSpawnVolumeId(volume_id);
+    accept.setSpawnLayerId(layer_id);
     return gs::protocol::SerializeToBytes(msg);
 }
 
@@ -225,6 +229,8 @@ std::vector<std::uint8_t> MakeSpawn(const BorderEntitySnapshot& snapshot)
     spawn.setLevel(snapshot.level);
     spawn.setHpCurrent(snapshot.hp_current);
     spawn.setHpMax(snapshot.hp_max);
+    spawn.setVolumeId(snapshot.volume_id);
+    spawn.setLayerId(snapshot.layer_id);
     return gs::protocol::SerializeToBytes(msg);
 }
 

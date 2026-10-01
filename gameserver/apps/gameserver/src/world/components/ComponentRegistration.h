@@ -5,6 +5,7 @@
 #include "AiComponents.h"
 #include "CombatComponents.h"
 #include "GridSlot.h"
+#include "LayerComponents.h"
 #include "MigrationComponents.h"
 #include "MobComponents.h"
 #include "MovementComponents.h"
@@ -43,6 +44,7 @@ inline void RegisterWorldComponents(flecs::world& world)
     world.component<TransformVersion>();
     world.component<GridSlot>();
     world.component<WarpState>();
+    world.component<LayerPresence>();
 }
 
 } // namespace gs::game

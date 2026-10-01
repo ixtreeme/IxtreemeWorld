@@ -24,6 +24,15 @@ struct ZoneDiagnostics {
     std::atomic<std::uint32_t> wandering_mob_count{0};
     std::atomic<std::uint32_t> idle_mob_count{0};
     std::atomic<std::uint32_t> ghost_count{0};
+    // 3D-5A layered movement outcomes (cumulative, never reset): moves on a
+    // cooked support volume that were accepted, refused by clearance,
+    // refused as an unproven volume change, or refused as invalid state;
+    // and accepted moves that crossed a proven portal.
+    std::atomic<std::uint64_t> layered_moves_ok_total{0};
+    std::atomic<std::uint64_t> layered_moves_blocked_total{0};
+    std::atomic<std::uint64_t> layered_moves_transition_total{0};
+    std::atomic<std::uint64_t> layered_moves_invalid_total{0};
+    std::atomic<std::uint64_t> layered_portal_crossings_total{0};
     std::atomic<std::uint64_t> ticks_since_diag{0};
     std::atomic<std::uint64_t> transform_records_since_diag{0};
     std::atomic<std::uint64_t> empty_skips_since_diag{0};

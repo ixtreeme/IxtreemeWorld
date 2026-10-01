@@ -11,6 +11,7 @@
 #include "../activity/SpatialActivityField.h"
 #include "../components/SimulationLod.h"
 #include "../OwnerMap.h"
+#include "map/LayerActorMovement.h"
 
 // Debug/test world consistency audit across all zones. Checks:
 //  - every indexed NetId resolves to a live entity in exactly that zone
@@ -46,6 +47,16 @@ bool ValidateWorldConsistency(ZoneManager& zones,
 // publisher inputs. Freshness uses the completed scheduling phase input and
 // verifies that current authority was atomically published, including updates
 // committed after that cut (which are pending until the next phase).
+// 3D-5A layered presence audit (all zones): every resident or ghost with
+// LayerPresence names an existing walkable volume of `layered` with the
+// matching layer; residents stand exactly on the support plane (z within
+// float rounding) at a point the baked `actor` may occupy; a ghost's entity
+// presence equals its snapshot; nobody is layered in a world without
+// layered metadata.
+bool ValidateLayeredPresence(const ZoneManager& zones,
+                             const mx::map::LayeredWorld* layered,
+                             const mx::map::LayerActorProfile& actor,
+                             std::string& out_error);
 bool ValidateActivityGeneration(const ZoneManager&,const ActivityGrid&,std::string&);
 bool ValidateActivityWake(const ZoneManager&,const ActivityWakeFrame*,std::string&);
 

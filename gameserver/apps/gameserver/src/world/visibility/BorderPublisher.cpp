@@ -4,6 +4,7 @@
 
 #include "../WorldConstants.h"
 #include "../components/CombatComponents.h"
+#include "../components/LayerComponents.h"
 #include "../components/MobComponents.h"
 #include "../components/MovementComponents.h"
 #include "../components/NetworkComponents.h"
@@ -35,6 +36,9 @@ void UpdateMutableSnapshotFields(BorderEntitySnapshot& target, flecs::entity ent
     const auto hp = entity.get<Hp>();
     target.hp_current = hp.current;
     target.hp_max = hp.max;
+    const auto* presence = entity.try_get<LayerPresence>();
+    target.volume_id = presence != nullptr ? presence->volume_id : 0;
+    target.layer_id = presence != nullptr ? presence->layer_id : 0;
 }
 
 // Exact, order-insensitive content comparison: the scratch (freshly built

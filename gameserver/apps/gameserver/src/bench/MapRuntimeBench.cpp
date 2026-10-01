@@ -1740,7 +1740,7 @@ int RunMap4Scenario()
             auto old = entity.get<Position>();
             entity.set<Position>({x,y,terrain.Height(x,y).meters});
             entity.set<WarpState>({});
-            zone.Grid().Move(entity, 1, SpatialCellKey(SpatialCellCoord(old.x),SpatialCellCoord(old.y)), entity.get<Position>());
+            zone.Grid().Move(entity, 1, SpatialCellKey(SpatialCellCoord(old.x),SpatialCellCoord(old.y)), entity.get<Position>(), 0);
         };
         step(60);
         c.Report("chain-no-retrigger", entity.get<WarpState>().completed == 1 && entity.get<Position>().x == 900,

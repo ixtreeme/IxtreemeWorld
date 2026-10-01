@@ -7,6 +7,7 @@
 #include <unordered_set>
 
 #include "../WorldConstants.h"
+#include "../components/LayerComponents.h"
 #include "../components/MobComponents.h"
 #include "../components/NetworkComponents.h"
 #include "../components/Tags.h"
@@ -44,10 +45,10 @@ void AoiSystem::RebuildInto(Zone& zone, SpatialGrid& grid)
             if (ghost_nets.contains(id.value)) {
                 return;
             }
-            grid.Insert(id.value, pos, entity);
+            grid.Insert(id.value, pos, entity, SpatialVolumeOf(entity));
         });
     for (const auto& ghost : zone.Ghosts()) {
-        grid.Insert(ghost.snapshot.net_id, ghost.snapshot.position, ghost.entity);
+        grid.Insert(ghost.snapshot.net_id, ghost.snapshot.position, ghost.entity, ghost.snapshot.volume_id);
     }
 }
 

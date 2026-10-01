@@ -117,6 +117,8 @@ WorldRuntime::WorldRuntime(boost::asio::io_context& io,
     }
     if (world.layered_world && !world.layered_world->volumes.empty()) {
         layered_metadata_ = std::make_unique<const mx::map::LayeredWorld>(std::move(*world.layered_world));
+        // 3D-5A: explicit layered admission uses the same immutable world.
+        spawn_.SetLayeredWorld(layered_metadata_.get(), LayerActor());
     }
     std::optional<StreamingSetup> setup;
     if (world.residency == mx::map::ResidencyMode::Streaming) {
@@ -687,6 +689,8 @@ ZoneTickContext WorldRuntime::BuildZoneTickContext()
                             spawn_.ScheduleRespawn(spawn_point_index, delay_sec);
                         }};
     ctx.prepare_terrain=[this](float x,float y){return PrepareTerrain(x,y,0.0f);};
+    ctx.layered = layered_metadata_.get();
+    ctx.layer_actor = LayerActor();
     return ctx;
 }
 
@@ -837,7 +841,8 @@ void WorldRuntime::Run()
                 const bool ok =
                     ValidateWorldConsistency(zones_, owners_by_session_, migration_queue_, directory_,
                                              activity_for_validation.get(), error,
-                                             &spawn_.Presence(), scheduler_.WakeDecision().get());
+                                             &spawn_.Presence(), scheduler_.WakeDecision().get()) &&
+                    ValidateLayeredPresence(zones_, layered_metadata_.get(), LayerActor(), error);
                 std::lock_guard lock(validation_mutex_);
                 validation_result_ = ok ? std::string("OK") : "FAIL: " + error;
                 validation_ready_ = true;
@@ -1356,7 +1361,8 @@ bool WorldRuntime::ValidateConsistency(std::string& out_error)
     // a test harness, or after Stop).
     const auto activity = activity_field_.Snapshot();
     return ValidateWorldConsistency(zones_, owners_by_session_, migration_queue_, directory_,
-                                    activity.get(), out_error, &spawn_.Presence(), scheduler_.WakeDecision().get());
+                                    activity.get(), out_error, &spawn_.Presence(), scheduler_.WakeDecision().get()) &&
+           ValidateLayeredPresence(zones_, layered_metadata_.get(), LayerActor(), out_error);
 }
 
 void WorldRuntime::RequestActivityValidation(std::size_t max_samples)
@@ -2717,7 +2723,9 @@ bool WorldRuntime::TransferResidentLocked(Zone& source_zone,
     }
 
     // Unknown height (outside / not resident) keeps the entity's own z.
-    if (const auto ground = terrain_.Height(transfer.position.x, transfer.position.y); ground.Ok()) {
+    // 3D-5A: a layered entity keeps its support-plane z (never the terrain).
+    if (const auto ground = terrain_.Height(transfer.position.x, transfer.position.y);
+        !transfer.IsLayered() && ground.Ok()) {
         transfer.position.z = ground.meters;
     }
     DestinationRollback rollback;
@@ -2730,7 +2738,7 @@ bool WorldRuntime::TransferResidentLocked(Zone& source_zone,
         rollback.applied = true;
         target_zone.IndexEntity(net_id, rollback.entity);
         rollback.indexed = true;
-        target_zone.Grid().Insert(net_id, transfer.position, rollback.entity);
+        target_zone.Grid().Insert(net_id, transfer.position, rollback.entity, transfer.layer.volume_id);
         rollback.gridded = true;
     } catch (const std::exception& error) {
         LOG_ERROR("partition: net_id={} apply failed, source untouched: {}", net_id, error.what());

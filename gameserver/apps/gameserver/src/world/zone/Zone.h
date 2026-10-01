@@ -18,6 +18,7 @@
 
 #include "common/Types.h"
 #include "db/CharacterRepository.h"
+#include "map/LayerActorMovement.h"
 #include "map/MapData.h"
 #include "network/Session.h"
 
@@ -79,6 +80,11 @@ struct ZoneTickContext {
     std::function<void(std::shared_ptr<gs::network::Session>, std::vector<std::uint8_t>)> send;
     std::function<void(std::size_t spawn_point_index, float delay_sec)> respawn_later;
     std::function<TerrainRequestHandle(float,float)> prepare_terrain;
+    // 3D-5A: the package's immutable layered world (null = none) and the
+    // actor class its clearance was baked for. Entities with LayerPresence
+    // move only through these; without them they cannot move at all.
+    const mx::map::LayeredWorld* layered = nullptr;
+    mx::map::LayerActorProfile layer_actor{};
 };
 
 // A zone owns exactly one flecs::world, which is the SOLE authoritative

@@ -7,6 +7,7 @@
 #include "db/CharacterRepository.h"
 #include "network/Session.h"
 
+#include "../components/LayerComponents.h"
 #include "../components/TransformComponents.h"
 
 namespace gs::game {
@@ -26,7 +27,9 @@ public:
                             std::shared_ptr<gs::network::Session> session,
                             gs::db::Character character,
                             const Position& position,
-                            std::uint32_t net_id);
+                            std::uint32_t net_id,
+                            // 3D-5A explicit admission: volume_id 0 = terrain.
+                            LayerPresence layer = {});
 
     static void SpawnMob(Zone& zone,
                          const MobSpawnPoint& spawn,

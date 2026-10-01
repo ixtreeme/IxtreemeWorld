@@ -34,6 +34,10 @@ struct BorderEntitySnapshot {
     std::uint32_t level = 1;
     float hp_current = 1.0f;
     float hp_max = 1.0f;
+    // 3D-5A layered presence (0 = legacy terrain entity). Mutable: a proven
+    // portal crossing changes it together with the position.
+    std::uint32_t volume_id = 0;
+    std::uint32_t layer_id = 0;
 };
 
 struct GhostRecord {
@@ -64,7 +68,8 @@ inline bool SameBorderSnapshot(const BorderEntitySnapshot& lhs,
            lhs.heading.angle == rhs.heading.angle && lhs.move_state == rhs.move_state &&
            lhs.class_id == rhs.class_id && lhs.mob_type_id == rhs.mob_type_id &&
            lhs.level == rhs.level && lhs.hp_current == rhs.hp_current &&
-           lhs.hp_max == rhs.hp_max && lhs.name == rhs.name;
+           lhs.hp_max == rhs.hp_max && lhs.name == rhs.name &&
+           lhs.volume_id == rhs.volume_id && lhs.layer_id == rhs.layer_id;
 }
 
 } // namespace gs::game

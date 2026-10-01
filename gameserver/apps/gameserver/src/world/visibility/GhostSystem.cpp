@@ -3,6 +3,7 @@
 #include <algorithm>
 #include <unordered_set>
 
+#include "../components/LayerComponents.h"
 #include "../components/MobComponents.h"
 #include "../components/NetworkComponents.h"
 #include "../components/Tags.h"
@@ -26,6 +27,22 @@ void ApplyMutableSnapshot(GhostRecord& record, const BorderEntitySnapshot& snaps
     record.snapshot.move_state = snapshot.move_state;
     record.snapshot.hp_current = snapshot.hp_current;
     record.snapshot.hp_max = snapshot.hp_max;
+    record.snapshot.volume_id = snapshot.volume_id;
+    record.snapshot.layer_id = snapshot.layer_id;
+}
+
+// 3D-5A: a ghost mirrors its source entity's layered presence (the
+// component exists iff the snapshot names a volume).
+void SyncGhostPresence(flecs::entity entity, const BorderEntitySnapshot& snapshot)
+{
+    if (!entity.is_valid()) {
+        return;
+    }
+    if (snapshot.volume_id != 0) {
+        entity.set<LayerPresence>({snapshot.volume_id, snapshot.layer_id});
+    } else if (entity.has<LayerPresence>()) {
+        entity.remove<LayerPresence>();
+    }
 }
 
 bool SameSpatialCell(const Position& lhs, const Position& rhs)
@@ -52,7 +69,8 @@ void CreateGhost(Zone& zone,
     if (snapshot.mob_type_id != 0) {
         entity.set<MobTypeRef>({snapshot.mob_type_id}).add<MobTag>();
     }
-    zone.Grid().Insert(snapshot.net_id, snapshot.position, entity);
+    SyncGhostPresence(entity, snapshot);
+    zone.Grid().Insert(snapshot.net_id, snapshot.position, entity, snapshot.volume_id);
     zone.Ghosts().push_back(GhostRecord{entity, snapshot, source_zone_id, reconcile_generation});
     zone.GhostIndex()[snapshot.net_id] = zone.Ghosts().size() - 1;
 }
@@ -164,7 +182,9 @@ void GhostSystem::Reconcile(Zone& zone, ZoneManager& zones)
                                SpatialCellCoord(record.snapshot.position.y));
             const bool cell_changed =
                 !SameSpatialCell(record.snapshot.position, snapshot.position);
-            zone.Grid().Move(record.entity, snapshot.net_id, old_cell, snapshot.position);
+            zone.Grid().Move(record.entity, snapshot.net_id, old_cell, snapshot.position,
+                             snapshot.volume_id);
+            SyncGhostPresence(record.entity, snapshot);
             if (cell_changed) {
                 diag.ghost_spatial_queries_since_diag.fetch_add(1, std::memory_order_relaxed);
                 ++updated;
@@ -287,7 +307,9 @@ void GhostSystem::Reconcile(Zone& zone, ZoneManager& zones)
                                        SpatialCellCoord(record.snapshot.position.y));
                     const bool cell_changed =
                         !SameSpatialCell(record.snapshot.position, other_snapshot.position);
-                    zone.Grid().Move(record.entity, net, old_cell, other_snapshot.position);
+                    zone.Grid().Move(record.entity, net, old_cell, other_snapshot.position,
+                                     other_snapshot.volume_id);
+                    SyncGhostPresence(record.entity, other_snapshot);
                     if (cell_changed) {
                         diag.ghost_spatial_queries_since_diag.fetch_add(
                             1, std::memory_order_relaxed);
@@ -379,7 +401,9 @@ void GhostSystem::Reconcile(Zone& zone, ZoneManager& zones)
                     const bool cell_changed =
                         !SameSpatialCell(ghost.snapshot.position, other_snapshot.position);
                     zone.Grid().Move(ghost.entity, ghost.snapshot.net_id, old_cell,
-                                     other_snapshot.position);
+                                     other_snapshot.position,
+                                     other_snapshot.volume_id);
+                    SyncGhostPresence(ghost.entity, other_snapshot);
                     if (cell_changed) {
                         diag.ghost_spatial_queries_since_diag.fetch_add(
                             1, std::memory_order_relaxed);

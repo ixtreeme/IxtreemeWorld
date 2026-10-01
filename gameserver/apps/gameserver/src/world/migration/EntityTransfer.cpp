@@ -24,6 +24,9 @@ EntityTransfer BuildTransfer(flecs::entity entity, bool is_player, std::uint16_t
     if (entity.has<TransformVersion>()) {
         transfer.transform_version = entity.get<TransformVersion>().tick;
     }
+    if (const auto* presence = entity.try_get<LayerPresence>()) {
+        transfer.layer = *presence;
+    }
     if (is_player) {
         transfer.session = entity.get<SessionRef>().session;
         if (entity.has<WarpState>()) transfer.warp_state = entity.get<WarpState>();
@@ -66,6 +69,9 @@ flecs::entity ApplyTransfer(flecs::world& world, const EntityTransfer& transfer)
                       // Phase 5B: the transform version survives the transfer
                       // so existing recipients stay exactly caught up.
                       .set<TransformVersion>({transfer.transform_version});
+    if (transfer.IsLayered()) {
+        entity.set<LayerPresence>(transfer.layer);
+    }
     if (transfer.is_player) {
         entity.set<SessionRef>({transfer.session}).add<PlayerTag>();
         entity.set<WarpState>(transfer.warp_state);

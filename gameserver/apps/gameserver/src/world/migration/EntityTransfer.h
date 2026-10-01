@@ -8,6 +8,7 @@
 
 #include "../components/AiComponents.h"
 #include "../components/CombatComponents.h"
+#include "../components/LayerComponents.h"
 #include "../components/MigrationComponents.h"
 #include "../components/MobComponents.h"
 #include "../components/MovementComponents.h"
@@ -50,6 +51,7 @@ static_assert(std::is_standard_layout_v<CombatStats>);
 static_assert(std::is_standard_layout_v<AttackCooldown>);
 static_assert(std::is_standard_layout_v<WanderState>);
 static_assert(std::is_standard_layout_v<SimulationLod>);
+static_assert(std::is_standard_layout_v<LayerPresence>);
 
 struct EntityTransfer {
     GlobalEntityId entity_id;
@@ -79,6 +81,15 @@ struct EntityTransfer {
     // never invalidates the recipients' last-sent comparison (the same NetId
     // stays caught up instead of getting a spurious update/despawn).
     std::uint32_t transform_version = 0;
+    // 3D-5A: layered presence (volume_id 0 = legacy terrain entity). Its z
+    // is the support-plane height and must never be re-derived from the
+    // terrain on the destination (see IsLayered()).
+    LayerPresence layer;
+
+    bool IsLayered() const noexcept
+    {
+        return layer.volume_id != 0;
+    }
 };
 
 // NOTE on persistence (§41): this is a RUNTIME handoff DTO, not a save

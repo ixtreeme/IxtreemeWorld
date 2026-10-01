@@ -1,6 +1,7 @@
 #include "SnapshotBuilder.h"
 
 #include "../components/CombatComponents.h"
+#include "../components/LayerComponents.h"
 #include "../components/MobComponents.h"
 #include "../components/MovementComponents.h"
 #include "../components/NetworkComponents.h"
@@ -22,6 +23,10 @@ BorderEntitySnapshot BuildPlayerSnapshot(Zone& zone, flecs::entity entity)
     snapshot.hp_max = hp.max;
     snapshot.mob_type_id = 0;
     snapshot.level = 1;
+    if (const auto* presence = entity.try_get<LayerPresence>()) {
+        snapshot.volume_id = presence->volume_id;
+        snapshot.layer_id = presence->layer_id;
+    }
     if (const auto* binding = zone.FindPlayer(snapshot.net_id)) {
         snapshot.name = binding->character.name;
         snapshot.class_id = binding->character.class_id;
@@ -44,6 +49,10 @@ BorderEntitySnapshot BuildMobSnapshot(flecs::entity entity)
     snapshot.name = profile.name;
     snapshot.class_id = static_cast<std::uint16_t>(profile.model_id);
     snapshot.level = profile.level == 0 ? 1 : profile.level;
+    if (const auto* presence = entity.try_get<LayerPresence>()) {
+        snapshot.volume_id = presence->volume_id;
+        snapshot.layer_id = presence->layer_id;
+    }
     return snapshot;
 }
 

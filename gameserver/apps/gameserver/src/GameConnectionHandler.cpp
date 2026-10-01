@@ -290,11 +290,12 @@ void GameConnectionHandler::HandleEnterWorld(std::shared_ptr<gs::network::Sessio
 #if MMO_DEBUG_SPAWN_OVERRIDE
     if (request.hasDebugSpawnOverride()) {
         auto requested = request.getDebugSpawnOverride();
-        debug_spawn = DebugSpawnOverride{requested.getX(), requested.getY()};
-        LOG_INFO("Session {} requested debug spawn override: ({}, {})",
+        debug_spawn = DebugSpawnOverride{requested.getX(), requested.getY(), requested.getVolumeId()};
+        LOG_INFO("Session {} requested debug spawn override: ({}, {}) volume {}",
                  session->Id(),
                  debug_spawn->x,
-                 debug_spawn->y);
+                 debug_spawn->y,
+                 debug_spawn->volume_id);
     }
 #endif
 

@@ -11,6 +11,7 @@ namespace gs::game {
 
 struct GridSlot {
     std::int64_t cell_key = 0;   // packed spatial cell key
+    std::uint32_t volume_id = 0; // 3D-5A: bucket volume inside the cell (0 = terrain)
     std::uint32_t index = 0;     // slot inside the cell's entry vector
 };
 

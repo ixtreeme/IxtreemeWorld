@@ -236,6 +236,18 @@ public:
     // pass through a static obstruction, and a volume change is accepted only
     // across a proven step/ramp portal. Still no admission, ECS, AOI or
     // replication change; worlds without a clearance bake fail closed.
+    // 3D-5A: the actor class every layered entity of this world moves as:
+    // the clearance profile the package was cooked for (default profile when
+    // the world has no clearance bake; such worlds refuse layered admission).
+    mx::map::LayerActorProfile LayerActor() const noexcept
+    {
+        mx::map::LayerActorProfile actor;
+        if (layered_metadata_ && layered_metadata_->clearance_profile) {
+            actor.radius_m = layered_metadata_->clearance_profile->actor_radius_m;
+            actor.height_m = layered_metadata_->clearance_profile->actor_height_m;
+        }
+        return actor;
+    }
     mx::map::LayerGroundResult PlaceLayerActor(const mx::map::LayerActorProfile& actor,
                                              mx::map::VolumeId volume_id,
                                              double x, double y) const noexcept;

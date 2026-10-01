@@ -235,13 +235,16 @@ MigrationOutcome MigrationCoordinator::MigratePlayer(Zone& source_zone,
 
     // Stage 5: apply at the destination, with deterministic recovery.
     // Unknown height (outside / not resident) keeps the entity's own z.
-    if (const auto ground = terrain_.Height(transfer.position.x, transfer.position.y); ground.Ok()) {
+    // A layered entity (3D-5A) keeps its support-plane z: the terrain under
+    // a floor/bridge is not its ground.
+    if (const auto ground = terrain_.Height(transfer.position.x, transfer.position.y);
+        !transfer.IsLayered() && ground.Ok()) {
         transfer.position.z = ground.meters;
     }
     try {
         auto new_entity = ApplyTransfer(target_zone.World(), transfer);
         target_zone.IndexEntity(net_id, new_entity);
-        target_zone.Grid().Insert(net_id, transfer.position, new_entity);
+        target_zone.Grid().Insert(net_id, transfer.position, new_entity, transfer.layer.volume_id);
     } catch (const std::exception& error) {
         LOG_ERROR("migration: net_id={} destination apply failed: {}", net_id, error.what());
         Zone::PlayerBinding restore_binding = std::move(moved_binding);
@@ -323,14 +326,16 @@ MigrationOutcome MigrationCoordinator::MigrateMob(Zone& source_zone,
     source_zone.EraseMobRng(net_id);
     source_zone.RefreshResidentCounts();
 
-    // Unknown height (outside / not resident) keeps the entity's own z.
-    if (const auto ground = terrain_.Height(transfer.position.x, transfer.position.y); ground.Ok()) {
+    // Unknown height (outside / not resident) keeps the entity's own z;
+    // a layered entity (3D-5A) keeps its support-plane z.
+    if (const auto ground = terrain_.Height(transfer.position.x, transfer.position.y);
+        !transfer.IsLayered() && ground.Ok()) {
         transfer.position.z = ground.meters;
     }
     try {
         auto new_entity = ApplyTransfer(target_zone.World(), transfer);
         target_zone.IndexEntity(net_id, new_entity);
-        target_zone.Grid().Insert(net_id, transfer.position, new_entity);
+        target_zone.Grid().Insert(net_id, transfer.position, new_entity, transfer.layer.volume_id);
     } catch (const std::exception& error) {
         LOG_ERROR("migration: net_id={} destination apply failed: {}", net_id, error.what());
         if (!RestoreToSource(source_zone, transfer)) {
@@ -367,7 +372,7 @@ bool MigrationCoordinator::RestoreToSource(Zone& source_zone, EntityTransfer tra
     try {
         auto restored = ApplyTransfer(source_zone.World(), transfer);
         source_zone.IndexEntity(transfer.net_id, restored);
-        source_zone.Grid().Insert(transfer.net_id, transfer.position, restored);
+        source_zone.Grid().Insert(transfer.net_id, transfer.position, restored, transfer.layer.volume_id);
         source_zone.RefreshResidentCounts();
         return true;
     } catch (const std::exception& error) {

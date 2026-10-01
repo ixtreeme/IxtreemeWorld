@@ -100,6 +100,9 @@ struct C2sEnterWorld {
   struct DebugSpawnOverride {
     x @0 :Float32;
     y @1 :Float32;
+    # 3D-5A: explicit layered volume to stand on (0 = terrain). Validated
+    # against the package's cooked clearance; never inferred from x/y.
+    volumeId @2 :UInt32;
   }
 }
 
@@ -107,6 +110,9 @@ struct S2cEnterWorldAccept {
   yourNetId @0 :UInt32;
   spawnPos @1 :Vec3;
   serverTick @2 :UInt32;
+  # 3D-5A layered presence of the spawned character (0 = terrain).
+  spawnVolumeId @3 :UInt32;
+  spawnLayerId @4 :UInt32;
 }
 
 struct S2cEnterWorldReject {
@@ -133,6 +139,10 @@ struct S2cEntitySpawn {
   level @6 :UInt32;
   hpCurrent @7 :Float32;
   hpMax @8 :Float32;
+  # 3D-5A layered presence at spawn time (0 = terrain). Later volume
+  # changes are not in transform frames yet (3D-5B).
+  volumeId @9 :UInt32;
+  layerId @10 :UInt32;
 }
 
 struct S2cEntityDespawn {

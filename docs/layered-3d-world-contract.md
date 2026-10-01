@@ -169,7 +169,35 @@ between non-touching or rotated supports, lifts/doors, navigation/path
 finding, and more than one actor class per bake.
 
 3D-5 connects authoritative entity ownership, movement, migration,
-spatial/AOI/ghost paths, replication and the client.
+spatial/AOI/ghost paths, replication and the client. It is staged:
+
+**3D-5A (server, done).** `LayerPresence {volume_id, layer_id}` is the
+authoritative layered presence of a gameserver entity; an entity without it
+is a legacy terrain entity. Presence is set only by explicit admission (the
+debug spawn override's `volumeId`, validated with
+`ResolveLayerActorPlacement` against the world's baked actor) and changed
+only by a proven portal crossing. Its z is always the support-plane height;
+terrain heights, terrain step checks and terrain warps never apply to it
+(migration and partition transfers keep its z). Movement goes through
+`ResolveLayerActorMove` per axis in pieces of at most 0.5 m; the target
+volume is the current one or the far end of a proven portal whose footprint
+holds the point; leaving the volume system is refused. The spatial index
+buckets are `(volume, cell_x, cell_y)` (`LayeredSpatialCellKey`): an XY
+column holds one bucket per volume, `GridSlot`/`GridEntry` carry the volume,
+and the AOI radius scan reads every volume of a column, so interest stays
+horizontal and floors see each other. Border snapshots, ghosts and entity
+transfers carry the presence. Combat range is three-dimensional when either
+party is layered. `S2cEntitySpawn` and `S2cEnterWorldAccept` gained
+additive `volumeId`/`layerId` fields; transform frames do not carry volume
+changes yet. The world audit (`ValidateLayeredPresence`) checks every
+layered resident's volume, layer, actor placement and exact support z, and
+that ghosts mirror their snapshot.
+
+Not yet: production spawn regions are terrain-only (a spawn volume in world
+logic or the sidecar is needed), there is no terrain↔volume transition,
+mob spawn points are terrain-only, transform frames do not signal volume
+changes (3D-5B, protocol version bump) and no client consumes the new
+fields (3D-5B/5C).
 
 No layer-aware production path should be enabled before the fixture and
 contract tests prove deterministic lookup, non-overlap, portal validation,

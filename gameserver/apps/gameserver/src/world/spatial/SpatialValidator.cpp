@@ -4,6 +4,7 @@
 #include <unordered_set>
 
 #include "../components/GridSlot.h"
+#include "../components/LayerComponents.h"
 #include "../components/MobComponents.h"
 #include "../components/NetworkComponents.h"
 #include "../components/Tags.h"
@@ -18,12 +19,12 @@ bool ValidateSpatialIndex(Zone& zone, const SpatialGrid& grid, std::string& out_
 {
     std::size_t expected = 0;
 
-    auto check_one = [&](std::uint32_t net_id, const Position& position) -> bool {
+    auto check_one = [&](std::uint32_t net_id, const Position& position, std::uint32_t volume_id) -> bool {
         ++expected;
-        if (!grid.Contains(net_id, position)) {
+        if (!grid.ContainsIn(net_id, position, volume_id)) {
             std::ostringstream message;
             message << "zone " << zone.Id() << ": net " << net_id << " at (" << position.x << ", "
-                    << position.y << ") missing/wrong cell in spatial index";
+                    << position.y << ") volume " << volume_id << " missing/wrong (volume, cell) bucket in spatial index";
             out_error = message.str();
             return false;
         }
@@ -39,7 +40,7 @@ bool ValidateSpatialIndex(Zone& zone, const SpatialGrid& grid, std::string& out_
             out_error = message.str();
             return false;
         }
-        if (!check_one(net_id, entity.get<Position>())) {
+        if (!check_one(net_id, entity.get<Position>(), SpatialVolumeOf(entity))) {
             return false;
         }
     }
@@ -50,11 +51,11 @@ bool ValidateSpatialIndex(Zone& zone, const SpatialGrid& grid, std::string& out_
     }
     bool mobs_ok = true;
     zone.World().query<const MobTag, const NetId, const Position>().each(
-        [&](const MobTag&, const NetId& id, const Position& pos) {
+        [&](flecs::entity mob, const MobTag&, const NetId& id, const Position& pos) {
             if (!mobs_ok || ghost_nets.contains(id.value)) {
                 return;
             }
-            if (!check_one(id.value, pos)) {
+            if (!check_one(id.value, pos, SpatialVolumeOf(mob))) {
                 mobs_ok = false;
             }
         });
@@ -63,7 +64,7 @@ bool ValidateSpatialIndex(Zone& zone, const SpatialGrid& grid, std::string& out_
     }
 
     for (const auto& ghost : zone.Ghosts()) {
-        if (!check_one(ghost.snapshot.net_id, ghost.snapshot.position)) {
+        if (!check_one(ghost.snapshot.net_id, ghost.snapshot.position, ghost.snapshot.volume_id)) {
             return false;
         }
     }
@@ -99,6 +100,14 @@ bool ValidateSpatialIndex(Zone& zone, const SpatialGrid& grid, std::string& out_
         const auto entity = zone.FindEntity(entry.net_id);
         if (entity.is_valid() && entity.has<Position>()) {
             const auto pos = entity.get<Position>();
+            if (SpatialVolumeOf(entity) != entry.volume_id) {
+                std::ostringstream message;
+                message << "zone " << zone.Id() << ": grid entry net " << entry.net_id << " volume "
+                        << entry.volume_id << " != authority volume " << SpatialVolumeOf(entity);
+                out_error = message.str();
+                entries_ok = false;
+                return;
+            }
             if (pos.x != entry.x || pos.y != entry.y || pos.z != entry.z) {
                 std::ostringstream message;
                 message << "zone " << zone.Id() << ": grid entry net " << entry.net_id
@@ -110,7 +119,8 @@ bool ValidateSpatialIndex(Zone& zone, const SpatialGrid& grid, std::string& out_
             }
         } else if (const GhostRecord* ghost = zone.FindGhost(entry.net_id)) {
             if (ghost->snapshot.position.x != entry.x || ghost->snapshot.position.y != entry.y ||
-                ghost->snapshot.position.z != entry.z) {
+                ghost->snapshot.position.z != entry.z ||
+                ghost->snapshot.volume_id != entry.volume_id) {
                 std::ostringstream message;
                 message << "zone " << zone.Id() << ": grid entry ghost net " << entry.net_id
                         << " stored position does not match the ghost snapshot";
@@ -137,7 +147,7 @@ bool ValidateSpatialIndex(Zone& zone, const SpatialGrid& grid, std::string& out_
             }
             return;
         }
-        if (slot->cell_key != cell_key || slot->index != slot_index) {
+        if (slot->cell_key != cell_key || slot->index != slot_index || slot->volume_id != entry.volume_id) {
             std::ostringstream message;
             message << "zone " << zone.Id() << ": net " << entry.net_id
                     << " GridSlot mismatch (slot cell=" << slot->cell_key << " index=" << slot->index

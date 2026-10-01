@@ -7,6 +7,7 @@
 #include <unordered_set>
 #include <vector>
 
+#include "../components/LayerComponents.h"
 #include "../components/SimulationLod.h"
 #include "../components/Tags.h"
 #include "../distributed/WorldDirectory.h"
@@ -849,6 +850,75 @@ bool ValidateActivityFieldDetailed(const ZoneManager& zones,
                     << static_cast<int>(sample.field_tier) << " weaker than brute force "
                     << static_cast<int>(sample.brute_tier);
             return Fail(out_error, message.str());
+        }
+    }
+    return true;
+}
+
+
+bool ValidateLayeredPresence(const ZoneManager& zones,
+                             const mx::map::LayeredWorld* layered,
+                             const mx::map::LayerActorProfile& actor,
+                             std::string& out_error)
+{
+    auto find_volume = [layered](std::uint32_t id) -> const mx::map::LayerVolume* {
+        if (layered == nullptr) {
+            return nullptr;
+        }
+        for (const auto& volume : layered->volumes) {
+            if (volume.id == id) {
+                return &volume;
+            }
+        }
+        return nullptr;
+    };
+    for (std::size_t i = 0; i < zones.ZoneCount(); ++i) {
+        const Zone& zone = zones.GetZone(i);
+        for (const auto& [net_id, entity] : zone.Entities()) {
+            if (!entity.is_valid()) {
+                continue;
+            }
+            const auto* presence = entity.try_get<LayerPresence>();
+            if (presence == nullptr) {
+                continue;
+            }
+            std::ostringstream message;
+            message << "zone " << zone.Id() << ": layered net " << net_id << " volume " << presence->volume_id;
+            const auto* volume = find_volume(presence->volume_id);
+            if (layered == nullptr || volume == nullptr || presence->volume_id == 0) {
+                message << " names no volume of the layered world";
+                return Fail(out_error, message.str());
+            }
+            if (!volume->AllowsGroundMovement() || !volume->HasValidGroundSupport() ||
+                volume->layer_id != presence->layer_id) {
+                message << " is not walkable support of layer " << presence->layer_id;
+                return Fail(out_error, message.str());
+            }
+            const auto position = entity.get<Position>();
+            const auto placed = mx::map::ResolveLayerActorPlacement(*layered, actor, presence->volume_id,
+                                                                    position.x, position.y);
+            if (!placed.Ok()) {
+                message << " at (" << position.x << ", " << position.y << ") is not a place for the baked actor: "
+                        << mx::map::ToString(placed.status);
+                return Fail(out_error, message.str());
+            }
+            // Movement and admission store float(plane height) computed by the
+            // same shared query, so the comparison is exact.
+            if (static_cast<float>(placed.state.z) != position.z) {
+                message << " z " << position.z << " is not its support height " << placed.state.z;
+                return Fail(out_error, message.str());
+            }
+        }
+        for (const auto& ghost : zone.Ghosts()) {
+            const auto* presence = ghost.entity.is_valid() ? ghost.entity.try_get<LayerPresence>() : nullptr;
+            const std::uint32_t entity_volume = presence != nullptr ? presence->volume_id : 0;
+            const std::uint32_t entity_layer = presence != nullptr ? presence->layer_id : 0;
+            if (entity_volume != ghost.snapshot.volume_id || entity_layer != ghost.snapshot.layer_id) {
+                std::ostringstream message;
+                message << "zone " << zone.Id() << ": ghost net " << ghost.snapshot.net_id
+                        << " presence does not match its snapshot volume " << ghost.snapshot.volume_id;
+                return Fail(out_error, message.str());
+            }
         }
     }
     return true;

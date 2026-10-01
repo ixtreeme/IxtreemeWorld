@@ -16,9 +16,11 @@
 
 #include "common/Types.h"
 #include "db/CharacterRepository.h"
+#include "map/LayerActorMovement.h"
 #include "map/MapData.h"
 #include "network/Session.h"
 
+#include "../components/LayerComponents.h"
 #include "../components/TransformComponents.h"
 #include "../distributed/Routing.h"
 #include "../distributed/RuntimeIds.h"
@@ -46,6 +48,16 @@ class WorldMessageRouter;
 struct DebugSpawnOverride {
     float x = 0.0f;
     float y = 0.0f;
+    // 3D-5A: 0 = terrain; otherwise the explicit layered volume to stand on
+    // (validated with the cooked clearance; never inferred from x/y).
+    std::uint32_t volume_id = 0;
+};
+
+// A resolved admission point: position plus explicit layered presence
+// (volume_id 0 = terrain entity).
+struct SpawnPlacement {
+    Position position;
+    LayerPresence layer;
 };
 
 class SpawnCoordinator {
@@ -110,6 +122,13 @@ public:
     std::size_t SpawnPointMobs(std::size_t spawn_point_index);
     std::vector<MobSpawnPoint> SpawnPointsSnapshot() const;
     // MAP-3: chunk demand sink (streaming worlds; supervisor thread).
+    // 3D-5A: the runtime's immutable layered world (outlives this object)
+    // and its baked actor class. Null = layered admission refused.
+    void SetLayeredWorld(const mx::map::LayeredWorld* world, mx::map::LayerActorProfile actor)
+    {
+        layered_ = world;
+        layer_actor_ = actor;
+    }
     void SetTerrainDemand(std::function<void(std::uint32_t)> demand)
     {
         terrain_demand_ = std::move(demand);
@@ -170,8 +189,11 @@ private:
     // it back (no persistence path) and it carries no world identity (map_id
     // is not tied to the package world_id), so it could name a point of a
     // different world. Resuming at a stored position needs both first.
-    std::optional<Position> ResolveSpawnPosition(std::optional<DebugSpawnOverride> debug_spawn,
-                                                 gs::common::SessionId session_id);
+    std::optional<SpawnPlacement> ResolveSpawnPosition(std::optional<DebugSpawnOverride> debug_spawn,
+                                                       gs::common::SessionId session_id);
+    // 3D-5A: explicit layered admission (debug override with a volume): the
+    // baked actor must be placeable there and a zone must own the point.
+    std::optional<SpawnPlacement> ResolveLayeredSpawn(const DebugSpawnOverride& debug_spawn) const;
     // Inside the world, walkable, owned by a zone and with a height.
     bool IsValidSpawnPoint(float x, float y) const;
     bool IsValidDebugSpawnOverride(const DebugSpawnOverride& debug_spawn);
@@ -203,6 +225,8 @@ private:
     std::unordered_map<std::size_t, std::uint32_t> terrain_deferrals_;
     std::atomic<std::uint64_t> respawns_dropped_no_terrain_{0};
     std::atomic<std::uint64_t> mob_spawns_invalid_terrain_{0};
+    const mx::map::LayeredWorld* layered_ = nullptr;
+    mx::map::LayerActorProfile layer_actor_{};
 };
 
 } // namespace gs::game

@@ -8,6 +8,7 @@
 #include "common/Logging.h"
 
 #include "../components/AiComponents.h"
+#include "../components/LayerComponents.h"
 #include "../components/MobComponents.h"
 #include "../components/MovementComponents.h"
 #include "../components/WarpState.h"
@@ -112,6 +113,132 @@ void TryApplyWarp(Zone& zone, ZoneTickContext& ctx, Position& position,
     state.transfer_pending = ctx.zones.GetZone(target).Id() != zone.Id();
     ++state.completed;
     ++metrics.warps_completed;
+}
+
+// ---- 3D-5A layered movement ------------------------------------------------
+// A layered entity's authoritative pose is (volume, x, y); z is derived from
+// the volume's cooked support plane. Targets are float positions passed to
+// the shared contract exactly (float -> double is exact), so the committed
+// point is bit-identical to what was checked for clearance.
+
+const mx::map::LayerVolume* FindLayerVolume(const mx::map::LayeredWorld& world, std::uint32_t id)
+{
+    for (const auto& volume : world.volumes) {
+        if (volume.id == id) {
+            return &volume;
+        }
+    }
+    return nullptr;
+}
+
+bool InsideFootprint(const mx::map::LayerVolume& volume, double x, double y)
+{
+    return x >= volume.bounds.min_x && x < volume.bounds.max_x && y >= volume.bounds.min_y &&
+           y < volume.bounds.max_y;
+}
+
+// One move from `from` to (to_x, to_y). Target volume: the current one when
+// its footprint holds the point, else the far end of a proven portal of the
+// current volume whose footprint holds it (the shared contract re-checks the
+// proof, the crossing and both parts of the segment). Leaving the volume
+// system (no proven neighbour) is refused: there is no terrain transition.
+mx::map::LayerGroundResult TryLayeredMove(const mx::map::LayeredWorld& world,
+                                          const mx::map::LayerActorProfile& actor,
+                                          const LayerPresence& presence,
+                                          const Position& from,
+                                          float to_x,
+                                          float to_y)
+{
+    mx::map::LayerGroundResult result;
+    const auto* volume = FindLayerVolume(world, presence.volume_id);
+    if (volume == nullptr || !volume->HasValidGroundSupport()) {
+        result.status = mx::map::GroundSupportStatus::InvalidState;
+        return result;
+    }
+    mx::map::LayerGroundState current{presence.volume_id, presence.layer_id,
+                                      static_cast<double>(from.x), static_cast<double>(from.y), 0.0};
+    current.z = volume->ground_support->Height(current.x, current.y);
+    const double x = static_cast<double>(to_x);
+    const double y = static_cast<double>(to_y);
+    if (InsideFootprint(*volume, x, y)) {
+        return mx::map::ResolveLayerActorMove(world, actor, current, volume->id, x, y);
+    }
+    result.status = mx::map::GroundSupportStatus::TransitionRequired;
+    result.state = current;
+    for (const auto& portal : world.portals) {
+        if (!portal.proof) {
+            continue;
+        }
+        std::uint32_t other = 0;
+        if (portal.source_volume == volume->id) {
+            other = portal.target_volume;
+        } else if (portal.target_volume == volume->id) {
+            other = portal.source_volume;
+        }
+        const auto* neighbour = other != 0 ? FindLayerVolume(world, other) : nullptr;
+        if (neighbour == nullptr || !InsideFootprint(*neighbour, x, y)) {
+            continue;
+        }
+        auto candidate = mx::map::ResolveLayerActorMove(world, actor, current, other, x, y);
+        if (candidate.Ok()) {
+            return candidate;
+        }
+        result = candidate;
+    }
+    return result;
+}
+
+// Longest straight piece checked as one move: shorter than any standable
+// stair tread (radius + cell), so a single piece crosses at most one portal.
+constexpr float kLayeredSubStepMeters = 0.5f;
+
+// Moves along the straight line to (to_x, to_y) in sub-steps; stops at the
+// last accepted point. Returns true when the pose changed. Outcomes are
+// counted per refused/accepted piece.
+bool StepLayered(Zone& zone,
+                 const mx::map::LayeredWorld& world,
+                 const mx::map::LayerActorProfile& actor,
+                 LayerPresence& presence,
+                 Position& position,
+                 float to_x,
+                 float to_y)
+{
+    auto& diag = zone.Diagnostics();
+    const Position start = position;
+    const float dx = to_x - start.x;
+    const float dy = to_y - start.y;
+    const float length = std::sqrt(dx * dx + dy * dy);
+    const int pieces = std::max(1, static_cast<int>(std::ceil(length / kLayeredSubStepMeters)));
+    bool moved = false;
+    for (int i = 1; i <= pieces; ++i) {
+        const float fraction = static_cast<float>(i) / static_cast<float>(pieces);
+        const float px = i == pieces ? to_x : start.x + dx * fraction;
+        const float py = i == pieces ? to_y : start.y + dy * fraction;
+        const auto step = TryLayeredMove(world, actor, presence, position, px, py);
+        if (!step.Ok()) {
+            switch (step.status) {
+            case mx::map::GroundSupportStatus::Blocked:
+            case mx::map::GroundSupportStatus::OutsideVolume:
+                diag.layered_moves_blocked_total.fetch_add(1, std::memory_order_relaxed);
+                break;
+            case mx::map::GroundSupportStatus::TransitionRequired:
+                diag.layered_moves_transition_total.fetch_add(1, std::memory_order_relaxed);
+                break;
+            default:
+                diag.layered_moves_invalid_total.fetch_add(1, std::memory_order_relaxed);
+                break;
+            }
+            break;
+        }
+        position = {px, py, static_cast<float>(step.state.z)};
+        presence = {step.state.volume_id, step.state.layer_id};
+        diag.layered_moves_ok_total.fetch_add(1, std::memory_order_relaxed);
+        if (step.portal_id != 0) {
+            diag.layered_portal_crossings_total.fetch_add(1, std::memory_order_relaxed);
+        }
+        moved = true;
+    }
+    return moved;
 }
 } // namespace
 
@@ -234,22 +361,46 @@ void MovementSystem::Step(Zone& zone, float dt, ZoneTickContext& ctx)
                                                     position.y + velocity.y * lookahead),TerrainPriority::Prefetch);
             }
         }
-        // Per axis: a step whose path is not clear (outside, not resident,
-        // blocked, too steep, deep water) is refused on that axis -- never
-        // clamped onto an edge (R10); the other axis may still move.
-        const float next_x = position.x + dx;
-        if (dx != 0.0f && try_step(position.x, position.y, next_x, position.y)) {
-            position.x = next_x;
-        }
+        if (const auto* presence_ptr = entity.try_get<LayerPresence>()) {
+            // 3D-5A layered entity: per axis like the terrain path, but every
+            // piece goes through the cooked clearance / proven-portal
+            // contract and z is the support plane. Terrain warps do not apply
+            // on a floor above them; without layered metadata it cannot move.
+            const LayerPresence original = *presence_ptr;
+            LayerPresence presence = original;
+            if (ctx.layered != nullptr) {
+                if (dx != 0.0f) {
+                    StepLayered(zone, *ctx.layered, ctx.layer_actor, presence, position,
+                                position.x + dx, position.y);
+                }
+                if (dy != 0.0f) {
+                    StepLayered(zone, *ctx.layered, ctx.layer_actor, presence, position,
+                                position.x, position.y + dy);
+                }
+            } else if (dx != 0.0f || dy != 0.0f) {
+                zone.Diagnostics().layered_moves_invalid_total.fetch_add(1, std::memory_order_relaxed);
+            }
+            if (presence.volume_id != original.volume_id || presence.layer_id != original.layer_id) {
+                entity.set<LayerPresence>(presence);
+            }
+        } else {
+            // Per axis: a step whose path is not clear (outside, not resident,
+            // blocked, too steep, deep water) is refused on that axis -- never
+            // clamped onto an edge (R10); the other axis may still move.
+            const float next_x = position.x + dx;
+            if (dx != 0.0f && try_step(position.x, position.y, next_x, position.y)) {
+                position.x = next_x;
+            }
 
-        const float next_y = position.y + dy;
-        if (dy != 0.0f && try_step(position.x, position.y, position.x, next_y)) {
-            position.y = next_y;
-        }
+            const float next_y = position.y + dy;
+            if (dy != 0.0f && try_step(position.x, position.y, position.x, next_y)) {
+                position.y = next_y;
+            }
 
-        TryApplyWarp(zone, ctx, position, warp_state, dt);
-        entity.set<WarpState>(warp_state);
-        position.z = ground_z(position, before_move.z);
+            TryApplyWarp(zone, ctx, position, warp_state, dt);
+            entity.set<WarpState>(warp_state);
+            position.z = ground_z(position, before_move.z);
+        }
         note_moved(entity, before_move, position);
         // Phase 5B: the replicated transform (position/heading/move_state)
         // changed -> stamp the version the dirty replication compares against.
@@ -265,7 +416,7 @@ void MovementSystem::Step(Zone& zone, float dt, ZoneTickContext& ctx)
         entity.set<Heading>(heading);
         entity.set<Velocity>(velocity);
         entity.set<MoveIntent>(intent);
-        zone.Grid().Move(entity, net.value, old_cell, position);
+        zone.Grid().Move(entity, net.value, old_cell, position, SpatialVolumeOf(entity));
         MigrationSystem::UpdateMarker(zone, ctx.zones, ctx.migration_queue, net.value, entity, position);
     }
 
@@ -355,13 +506,26 @@ void MovementSystem::Step(Zone& zone, float dt, ZoneTickContext& ctx)
             next.x = wander.spawn_center.x + (from_center_x / distance) * wander.spawn_radius;
             next.y = wander.spawn_center.y + (from_center_y / distance) * wander.spawn_radius;
         }
-        if ((next.x != position.x || next.y != position.y) &&
-            try_step(position.x, position.y, next.x, next.y)) {
-            position.x = next.x;
-            position.y = next.y;
-        }
+        if (const auto* presence_ptr = entity.try_get<LayerPresence>()) {
+            // 3D-5A layered mob: the whole (possibly low-LOD, long) step is
+            // split into pieces of at most one portal each.
+            const LayerPresence original = *presence_ptr;
+            LayerPresence presence = original;
+            if (ctx.layered != nullptr && (next.x != position.x || next.y != position.y)) {
+                StepLayered(zone, *ctx.layered, ctx.layer_actor, presence, position, next.x, next.y);
+            }
+            if (presence.volume_id != original.volume_id || presence.layer_id != original.layer_id) {
+                entity.set<LayerPresence>(presence);
+            }
+        } else {
+            if ((next.x != position.x || next.y != position.y) &&
+                try_step(position.x, position.y, next.x, next.y)) {
+                position.x = next.x;
+                position.y = next.y;
+            }
 
-        position.z = ground_z(position, before_move.z);
+            position.z = ground_z(position, before_move.z);
+        }
         note_moved(entity, before_move, position);
         // Phase 5B: replicated transform changed -> stamp the version.
         if (before_move.x != position.x || before_move.y != position.y ||
@@ -384,7 +548,7 @@ void MovementSystem::Step(Zone& zone, float dt, ZoneTickContext& ctx)
             ++load->sim_work;
         }
         ++integrated;
-        zone.Grid().Move(entity, net.value, old_cell, position);
+        zone.Grid().Move(entity, net.value, old_cell, position, SpatialVolumeOf(entity));
         MigrationSystem::UpdateMarker(zone, ctx.zones, ctx.migration_queue, net.value, entity, position);
     }
     // This tick's terrain demand + query outcomes become visible to the

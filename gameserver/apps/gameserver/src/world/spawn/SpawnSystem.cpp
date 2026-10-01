@@ -23,7 +23,8 @@ void SpawnSystem::SpawnPlayer(Zone& zone,
                               std::shared_ptr<gs::network::Session> session,
                               gs::db::Character character,
                               const Position& position,
-                              std::uint32_t net_id)
+                              std::uint32_t net_id,
+                              LayerPresence layer)
 {
     const auto session_id = session ? session->Id() : 0;
     auto entity = zone.World()
@@ -45,12 +46,15 @@ void SpawnSystem::SpawnPlayer(Zone& zone,
                       // last-sent value from the spawn snapshot).
                       .set<TransformVersion>({zone.WorldTick()})
                       .add<PlayerTag>();
+    if (layer.volume_id != 0) {
+        entity.set<LayerPresence>(layer);
+    }
 
     Zone::PlayerBinding binding;
     binding.session = std::move(session);
     binding.character = std::move(character);
     zone.IndexEntity(net_id, entity);
-    zone.Grid().Insert(net_id, position, entity);
+    zone.Grid().Insert(net_id, position, entity, layer.volume_id);
     // Binding insertion is the spawn/transfer authority commit and publishes
     // its wake source under the same publication lock.
     zone.InsertPlayerBinding(net_id, std::move(binding));
@@ -97,7 +101,7 @@ void SpawnSystem::SpawnMob(Zone& zone,
                       .add<MobTag>();
 
     zone.IndexEntity(net_id, entity);
-    zone.Grid().Insert(net_id, position, entity);
+    zone.Grid().Insert(net_id, position, entity, 0); // mob spawn points are terrain-only (3D-5A)
     // Newborns simulate Fully; the 1 Hz evaluation demotes the irrelevant
     // ones (no grace history to protect). Synchronous bump keeps the sleep
     // rule exact before the first recount.

@@ -99,7 +99,7 @@ void SpawnCoordinator::Spawn(std::shared_ptr<gs::network::Session> session,
 
     const auto resolved = ResolveSpawnPosition(debug_spawn, session_id);
     const std::size_t zone_index =
-        resolved ? zones_.FindIndexForPosition(resolved->x, resolved->y) : zones_.ZoneCount();
+        resolved ? zones_.FindIndexForPosition(resolved->position.x, resolved->position.y) : zones_.ZoneCount();
     if (!resolved || zone_index >= zones_.ZoneCount()) {
         // No valid place to put the character: refuse the enter instead of
         // dropping it into some edge zone (MAP-2 spawn rule).
@@ -111,7 +111,8 @@ void SpawnCoordinator::Spawn(std::shared_ptr<gs::network::Session> session,
         send_and_close_(session, MakeEnterWorldRejectServerError());
         return;
     }
-    const Position position = *resolved;
+    const Position position = resolved->position;
+    const LayerPresence layer = resolved->layer;
     const auto net_id = net_ids_.AllocatePlayerNetId();
 
     // The routing location comes from the directory, not from the fact
@@ -128,28 +129,31 @@ void SpawnCoordinator::Spawn(std::shared_ptr<gs::network::Session> session,
     owner.net_id = net_id;
     owners_[session_id] = owner;
     presence_.Claim(character.id, session_id, net_id, world_tick);
-    send_(session, MakeEnterWorldAccept(net_id, position, world_tick));
+    send_(session, MakeEnterWorldAccept(net_id, position, world_tick, layer.volume_id, layer.layer_id));
 
-    LOG_INFO("Session {} assigned to zone {} ('{}') as net_id {} at {}, {}, ground_z={}",
+    LOG_INFO("Session {} assigned to zone {} ('{}') as net_id {} at {}, {}, ground_z={} volume={}",
              session_id,
              zones_.GetZone(zone_index).Id(),
              zones_.GetZone(zone_index).Name(),
              net_id,
              position.x,
              position.y,
-             position.z);
+             position.z,
+             layer.volume_id);
 
     PostToOwner(zone_index,
                 [session = std::move(session),
                 character = std::move(character),
                 position,
+                layer,
                 net_id, terrain_request=std::move(terrain_request)](Zone& zone) mutable {
                    AssertZoneOwner(zone, "zone spawn command");
                    SpawnSystem::SpawnPlayer(zone,
                                             std::move(session),
                                             std::move(character),
                                             position,
-                                            net_id);
+                                            net_id,
+                                            layer);
                    if(terrain_request) terrain_request->Effect();
                });
 }
@@ -361,18 +365,28 @@ void SpawnCoordinator::ProcessRespawns(float dt)
     }
 }
 
-std::optional<Position> SpawnCoordinator::ResolveSpawnPosition(std::optional<DebugSpawnOverride> debug_spawn,
-                                                               gs::common::SessionId session_id)
+std::optional<SpawnPlacement> SpawnCoordinator::ResolveSpawnPosition(std::optional<DebugSpawnOverride> debug_spawn,
+                                                                     gs::common::SessionId session_id)
 {
-    auto with_height = [this](float x, float y) -> std::optional<Position> {
+    auto with_height = [this](float x, float y) -> std::optional<SpawnPlacement> {
         const auto ground = terrain_.Height(x, y);
         if (!ground.Ok()) {
             return std::nullopt;
         }
-        return Position{x, y, ground.meters};
+        return SpawnPlacement{Position{x, y, ground.meters}, LayerPresence{}};
     };
 #if MMO_DEBUG_SPAWN_OVERRIDE
-    if (debug_spawn) {
+    if (debug_spawn && debug_spawn->volume_id != 0) {
+        // 3D-5A explicit layered admission. A refusal never falls back to
+        // the terrain at the same x/y (that would be a different floor).
+        if (auto layered = ResolveLayeredSpawn(*debug_spawn)) {
+            LOG_INFO("Layered debug spawn honored for session {}: volume {} ({}, {}) z={}", session_id,
+                     debug_spawn->volume_id, debug_spawn->x, debug_spawn->y, layered->position.z);
+            return layered;
+        }
+        LOG_WARN("Layered debug spawn rejected for session {}: volume {} ({}, {}) - using the player spawn region",
+                 session_id, debug_spawn->volume_id, debug_spawn->x, debug_spawn->y);
+    } else if (debug_spawn) {
         if (IsValidDebugSpawnOverride(*debug_spawn)) {
             LOG_INFO("Debug spawn override honored for session {}: ({}, {})", session_id, debug_spawn->x,
                      debug_spawn->y);
@@ -418,6 +432,23 @@ bool SpawnCoordinator::IsValidSpawnPoint(float x, float y) const
 {
     return terrain_.IsWalkable(x, y) && terrain_.Height(x, y).Ok() &&
            zones_.FindIndexForPosition(x, y) < zones_.ZoneCount();
+}
+
+std::optional<SpawnPlacement> SpawnCoordinator::ResolveLayeredSpawn(const DebugSpawnOverride& debug_spawn) const
+{
+    if (layered_ == nullptr || !std::isfinite(debug_spawn.x) || !std::isfinite(debug_spawn.y) ||
+        zones_.FindIndexForPosition(debug_spawn.x, debug_spawn.y) >= zones_.ZoneCount()) {
+        return std::nullopt;
+    }
+    const auto placed = mx::map::ResolveLayerActorPlacement(
+        *layered_, layer_actor_, debug_spawn.volume_id, debug_spawn.x, debug_spawn.y);
+    if (!placed.Ok()) {
+        LOG_WARN("Layered spawn volume {} ({}, {}) refused: {}", debug_spawn.volume_id, debug_spawn.x,
+                 debug_spawn.y, mx::map::ToString(placed.status));
+        return std::nullopt;
+    }
+    return SpawnPlacement{Position{debug_spawn.x, debug_spawn.y, static_cast<float>(placed.state.z)},
+                          LayerPresence{placed.state.volume_id, placed.state.layer_id}};
 }
 
 bool SpawnCoordinator::IsValidDebugSpawnOverride(const DebugSpawnOverride& debug_spawn)

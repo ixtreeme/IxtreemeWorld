@@ -23,6 +23,8 @@ struct GridEntry {
     float x = 0.0f;
     float y = 0.0f;
     float z = 0.0f;
+    // 3D-5A: layered volume of the entry (0 = legacy terrain).
+    std::uint32_t volume_id = 0;
     flecs::entity entity;
 };
 

@@ -57,7 +57,9 @@ std::vector<std::uint8_t> EncodeTransformFrameV2(const TransformRecord& viewer_r
 
 std::vector<std::uint8_t> MakeEnterWorldAccept(std::uint32_t net_id,
                                                const Position& pos,
-                                               std::uint32_t world_tick);
+                                               std::uint32_t world_tick,
+                                               std::uint32_t volume_id = 0,
+                                               std::uint32_t layer_id = 0);
 // EnterWorldReject::alreadyInWorld (world presence invariant, hardening H4).
 std::vector<std::uint8_t> MakeEnterWorldRejectAlreadyInWorld();
 // No valid spawn position could be resolved (MAP-2 spawn rule): serverError.
