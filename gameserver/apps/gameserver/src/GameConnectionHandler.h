@@ -12,6 +12,7 @@
 #include <vector>
 
 #include "db/CharacterRepository.h"
+#include "protocol/Protocol.h"
 #include "db/HandoffTokenRepository.h"
 #include "network/Session.h"
 #include "protocol/Serialization.h"
@@ -137,7 +138,8 @@ private:
     void SendHandshakeResponse(std::shared_ptr<gs::network::Session> session,
                                gs::protocol::HandshakeResult result,
                                const std::string& message,
-                               bool close_after_send = false);
+                               bool close_after_send = false,
+                               std::uint32_t protocol_version = gs::protocol::kProtocolVersion);
     void SendEnterWorldReject(std::shared_ptr<gs::network::Session> session,
                               gs::protocol::S2cEnterWorldReject::RejectReason reason,
                               bool close_after_send = true);

@@ -86,7 +86,9 @@ void AppendTransformDelta(std::vector<std::uint8_t>& payload,
                           std::uint8_t mask,
                           const Position& position,
                           float heading_angle,
-                          MoveState move_state)
+                          MoveState move_state,
+                          std::uint32_t volume_id,
+                          std::uint32_t layer_id)
 {
     WriteU32(payload, net_id);
     payload.push_back(mask);
@@ -100,6 +102,10 @@ void AppendTransformDelta(std::vector<std::uint8_t>& payload,
     }
     if ((mask & kTransformFieldMoveState) != 0) {
         payload.push_back(static_cast<std::uint8_t>(move_state));
+    }
+    if ((mask & kTransformFieldLayer) != 0) {
+        WriteU32(payload, volume_id);
+        WriteU32(payload, layer_id);
     }
 }
 
@@ -116,6 +122,27 @@ std::vector<std::uint8_t> EncodeTransformFrameV2(const TransformRecord& viewer_r
     WriteU32(payload, zone_tick);
     WriteU16(payload, static_cast<std::uint16_t>(record_count));
     payload.insert(payload.end(), viewer_record.begin(), viewer_record.end());
+    payload.insert(payload.end(), delta_payload.begin(), delta_payload.end());
+    return payload;
+}
+
+std::vector<std::uint8_t> EncodeTransformFrameV3(const TransformRecord& viewer_record,
+                                                 std::uint32_t viewer_volume_id,
+                                                 std::uint32_t viewer_layer_id,
+                                                 const std::vector<std::uint8_t>& delta_payload,
+                                                 std::uint32_t delta_count,
+                                                 std::uint32_t zone_tick)
+{
+    const std::size_t record_count = 1 + delta_count;
+    std::vector<std::uint8_t> payload;
+    payload.reserve(1 + 1 + 4 + 2 + kTransformRecordSize + 8 + delta_payload.size());
+    payload.push_back(gs::protocol::kCodecBinary);
+    payload.push_back(kTransformFrameV3Opcode);
+    WriteU32(payload, zone_tick);
+    WriteU16(payload, static_cast<std::uint16_t>(record_count));
+    payload.insert(payload.end(), viewer_record.begin(), viewer_record.end());
+    WriteU32(payload, viewer_volume_id);
+    WriteU32(payload, viewer_layer_id);
     payload.insert(payload.end(), delta_payload.begin(), delta_payload.end());
     return payload;
 }

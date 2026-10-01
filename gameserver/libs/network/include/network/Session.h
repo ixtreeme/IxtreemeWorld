@@ -83,6 +83,17 @@ public:
     void SendPayload(std::vector<std::uint8_t> payload);
     void SendPayloadAndClose(std::vector<std::uint8_t> payload);
     // Clears the setup deadline (any thread).
+    // Negotiated application protocol version (set at the handshake; 1 until
+    // then). Lets the application pick wire formats per session.
+    void SetProtocolVersion(std::uint32_t version) noexcept
+    {
+        protocol_version_.store(version, std::memory_order_release);
+    }
+    [[nodiscard]] std::uint32_t ProtocolVersion() const noexcept
+    {
+        return protocol_version_.load(std::memory_order_acquire);
+    }
+
     void MarkEstablished() noexcept
     {
         established_.store(true, std::memory_order_release);
@@ -137,6 +148,7 @@ private:
     // Written on the strand, read anywhere (cheap early-out for senders).
     std::atomic<bool> stopped_{false};
     std::atomic<bool> established_{false};
+    std::atomic<std::uint32_t> protocol_version_{1};
     std::atomic<std::size_t> queued_bytes_now_{0};
     std::atomic<std::size_t> max_queued_bytes_{0};
     // Strand-only state.

@@ -264,20 +264,26 @@ void GameConnectionHandler::HandleHandshakeRequest(
     GameSessionContext& ctx,
     gs::protocol::HandshakeRequest::Reader request)
 {
-    if (request.getProtocolVersion() != gs::protocol::kProtocolVersion) {
+    const auto client_version = request.getProtocolVersion();
+    if (!gs::protocol::IsSupportedProtocolVersion(client_version)) {
         SendHandshakeResponse(session,
                               gs::protocol::HandshakeResult::PROTOCOL_VERSION_MISMATCH,
                               "Protocol version mismatch",
                               true);
         return;
     }
+    // 3D-5C1: the session speaks the negotiated version; replication sends
+    // layered transform frames only to sessions that understand them.
+    const auto negotiated = gs::protocol::NegotiatedProtocolVersion(client_version);
+    session->SetProtocolVersion(negotiated);
 
     ctx.state = GameSessionState::ConnectionEstablished;
     session->MarkEstablished(); // clears the network-layer setup deadline
-    SendHandshakeResponse(session, gs::protocol::HandshakeResult::OK, "Welcome to world");
-    LOG_INFO("Game session {} handshake OK (build {})",
+    SendHandshakeResponse(session, gs::protocol::HandshakeResult::OK, "Welcome to world", false, negotiated);
+    LOG_INFO("Game session {} handshake OK (build {}, protocol {})",
              session->Id(),
-             request.getClientBuild().cStr());
+             request.getClientBuild().cStr(),
+             negotiated);
 }
 
 void GameConnectionHandler::HandleEnterWorld(std::shared_ptr<gs::network::Session> session,
@@ -340,13 +346,14 @@ void GameConnectionHandler::HandleEnterWorld(std::shared_ptr<gs::network::Sessio
 void GameConnectionHandler::SendHandshakeResponse(std::shared_ptr<gs::network::Session> session,
                                                   gs::protocol::HandshakeResult result,
                                                   const std::string& message,
-                                                  bool close_after_send)
+                                                  bool close_after_send,
+                                                  std::uint32_t protocol_version)
 {
     capnp::MallocMessageBuilder msg;
     auto packet = msg.initRoot<gs::protocol::Packet>();
     auto response = packet.initHandshakeResponse();
     response.setResult(result);
-    response.setServerProtocolVersion(gs::protocol::kProtocolVersion);
+    response.setServerProtocolVersion(protocol_version);
     response.setMessage(message);
     if (close_after_send) {
         session->SendPayloadAndClose(gs::protocol::SerializeToBytes(msg));

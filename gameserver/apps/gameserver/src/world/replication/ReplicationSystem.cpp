@@ -4,6 +4,7 @@
 #include <chrono>
 #include <cstdint>
 
+#include "../components/LayerComponents.h"
 #include "../spatial/AoiSystem.h"
 #include "../visibility/VisibilitySystem.h"
 #include "../zone/Zone.h"
@@ -11,6 +12,7 @@
 #include "ProtocolEncoder.h"
 #include "ResyncSchedule.h"
 #include "SnapshotBuilder.h"
+#include "protocol/Protocol.h"
 
 namespace gs::game {
 namespace {
@@ -171,16 +173,30 @@ std::size_t ReplicationSystem::BroadcastTransforms(Zone& zone,
                                   viewer_entity.get<MoveIntent>().state);
         // Wire tick (hardening H7): the GLOBAL world tick, never the zone's
         // local tick counter -- see ProtocolEncoder.h for the contract.
-        auto frame = effective.v2_enabled
-                         ? EncodeTransformFrameV2(viewer_record,
-                                                  t_delta_payload,
-                                                  static_cast<std::uint32_t>(stats.delta_records +
-                                                                             stats.full_records),
-                                                  world_tick)
-                         : EncodeTransformFrameFromRecords(viewer_record,
-                                                           t_record_cache.records,
-                                                           t_record_slots,
-                                                           world_tick);
+        // 3D-5C1: sessions that negotiated layered frames get the v3 layout
+        // (the viewer's own volume/layer + layer deltas); everybody else the
+        // unchanged v2 / v1 bytes.
+        const bool layered_frames =
+            effective.v2_enabled && binding.session &&
+            binding.session->ProtocolVersion() >= gs::protocol::kLayeredFramesProtocolVersion;
+        const auto delta_count = static_cast<std::uint32_t>(stats.delta_records + stats.full_records);
+        std::vector<std::uint8_t> frame;
+        if (layered_frames) {
+            const auto* presence = viewer_entity.try_get<LayerPresence>();
+            frame = EncodeTransformFrameV3(viewer_record,
+                                           presence != nullptr ? presence->volume_id : 0,
+                                           presence != nullptr ? presence->layer_id : 0,
+                                           t_delta_payload,
+                                           delta_count,
+                                           world_tick);
+        } else if (effective.v2_enabled) {
+            frame = EncodeTransformFrameV2(viewer_record, t_delta_payload, delta_count, world_tick);
+        } else {
+            frame = EncodeTransformFrameFromRecords(viewer_record,
+                                                    t_record_cache.records,
+                                                    t_record_slots,
+                                                    world_tick);
+        }
         const std::uint64_t encode_us = ElapsedUs(encode_start);
         const std::uint64_t frame_bytes = frame.size();
         const std::size_t records = 1 + (effective.v2_enabled

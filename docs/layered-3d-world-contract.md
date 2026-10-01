@@ -231,11 +231,20 @@ end, and the terrain height at the crossing within the step of the plane
 enter; layered players and mobs may leave; terrain mobs never enter.
 Proven volume portals are always tried before a terrain exit.
 
+**3D-5C1 (layered frames, done).** Protocol version 2; servers accept
+versions 1..2 and answer the negotiated version. Sessions that negotiated
+version 2 receive transform frames with opcode `0x12`: the viewer record is
+followed by the viewer's u32 volume + u32 layer, and delta records may set
+mask bit `0x08` (u32 volume + u32 layer) whenever an entity's layered
+presence differs from what the client knows (resyncs send `0x0F`). Version
+1 sessions keep byte-identical `0x11` frames. Wire layout:
+`layered-3d-protocol-3d5c1-review-20261001.md`.
+
 Not yet: terrain entities still have no model collision (a terrain player
 blocked from entering at a walled side keeps walking on the terrain under
-the floor, as before), mob spawn points are terrain-only, transform frames
-do not signal volume changes (protocol version bump) and no client
-consumes the new fields (3D-5C).
+the floor, as before), mob spawn points are terrain-only, and no client
+consumes the new fields: the client protocol is to be written as a scene
+script, not as engine code (3D-5C2).
 
 No layer-aware production path should be enabled before the fixture and
 contract tests prove deterministic lookup, non-overlap, portal validation,

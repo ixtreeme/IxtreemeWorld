@@ -96,16 +96,20 @@ void ConnectionHandler::HandleHandshakeRequest(std::shared_ptr<gs::network::Sess
     const auto client_version = request.getProtocolVersion();
     const auto client_build = request.getClientBuild();
 
-    if (client_version != gs::protocol::kProtocolVersion) {
+    if (!gs::protocol::IsSupportedProtocolVersion(client_version)) {
         SendHandshakeResponse(session,
                               gs::protocol::HandshakeResult::PROTOCOL_VERSION_MISMATCH,
                               "Protocol version mismatch",
-                              true);
+                              true,
+                              gs::protocol::kProtocolVersion);
         LOG_INFO("Disconnecting session {}: protocol version mismatch", session->Id());
         return;
     }
 
-    SendHandshakeResponse(session, gs::protocol::HandshakeResult::OK, "Welcome");
+    // The response names the negotiated version (a version 1 client still
+    // sees exactly the version it speaks).
+    SendHandshakeResponse(session, gs::protocol::HandshakeResult::OK, "Welcome", false,
+                          gs::protocol::NegotiatedProtocolVersion(client_version));
     ctx.state = SessionState::ConnectionEstablished;
     LOG_INFO("Session {} handshake OK (build {})", session->Id(), client_build.cStr());
 }
@@ -113,13 +117,14 @@ void ConnectionHandler::HandleHandshakeRequest(std::shared_ptr<gs::network::Sess
 void ConnectionHandler::SendHandshakeResponse(std::shared_ptr<gs::network::Session> session,
                                               gs::protocol::HandshakeResult result,
                                               const std::string& message,
-                                              bool close_after_send)
+                                              bool close_after_send,
+                                              std::uint32_t protocol_version)
 {
     capnp::MallocMessageBuilder msg;
     auto packet = msg.initRoot<gs::protocol::Packet>();
     auto response = packet.initHandshakeResponse();
     response.setResult(result);
-    response.setServerProtocolVersion(gs::protocol::kProtocolVersion);
+    response.setServerProtocolVersion(protocol_version);
     response.setMessage(message);
 
     if (close_after_send) {

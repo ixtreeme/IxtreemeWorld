@@ -120,6 +120,10 @@ public:
         std::uint16_t heading_q = 0;      // client-known quantized heading
         std::uint8_t move_state = 0;      // client-known move state
         std::uint8_t tier = 0;            // Network LOD tier (for diagnostics)
+        // 3D-5C1: client-known layered presence (0 / 0 = terrain). Only
+        // protocol >= 2 sessions receive it; kept for every recipient.
+        std::uint32_t volume_id = 0;
+        std::uint32_t layer_id = 0;
     };
 
     struct PlayerBinding {

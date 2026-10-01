@@ -4,11 +4,13 @@
 
 
 #include "../components/CombatComponents.h"
+#include "../components/LayerComponents.h"
 #include "../components/ReplicationComponents.h"
 #include "../replication/ProtocolEncoder.h"
 #include "../replication/SnapshotBuilder.h"
 #include "../zone/Zone.h"
 #include "../zone/ZoneOwnership.h"
+#include "protocol/Protocol.h"
 
 namespace gs::game {
 namespace {
@@ -164,6 +166,11 @@ void VisibilitySystem::ReconcileViewer(Zone& zone,
         return;
     }
 
+    // 3D-5C1: layered transform frames only for sessions that negotiated them
+    // (and only on the v2 delta path).
+    const bool layered_frames =
+        config.v2_enabled && viewer->session->ProtocolVersion() >= gs::protocol::kLayeredFramesProtocolVersion;
+
     auto& new_visible = t_new_visible;
     new_visible.clear();
     new_visible.reserve(candidates.size());
@@ -211,6 +218,8 @@ void VisibilitySystem::ReconcileViewer(Zone& zone,
             known.z = snapshot->position.z;
             known.heading_q = QuantizeHeading(snapshot->heading.angle);
             known.move_state = static_cast<std::uint8_t>(snapshot->move_state);
+            known.volume_id = snapshot->volume_id; // the spawn carries it
+            known.layer_id = snapshot->layer_id;
             known.tier = TierFor(candidate, source, config);
             known.last_sent_tick = world_tick;
             known.synced_tick = world_tick;
@@ -282,6 +291,12 @@ void VisibilitySystem::ReconcileViewer(Zone& zone,
         if (move_state != known.move_state) {
             mask |= kTransformFieldMoveState;
         }
+        const auto* presence = source.is_valid() ? source.try_get<LayerPresence>() : nullptr;
+        const std::uint32_t volume_id = presence != nullptr ? presence->volume_id : 0;
+        const std::uint32_t layer_id = presence != nullptr ? presence->layer_id : 0;
+        if (layered_frames && (volume_id != known.volume_id || layer_id != known.layer_id)) {
+            mask |= kTransformFieldLayer;
+        }
         // Periodic resync (hardening H7): a refresh re-sends the full state
         // even when the recipient model says nothing changed. The model can
         // only be wrong in ways it cannot see (a client that dropped or
@@ -296,7 +311,7 @@ void VisibilitySystem::ReconcileViewer(Zone& zone,
             continue;
         }
         if (refresh_all) {
-            mask = kTransformFieldAll;
+            mask = layered_frames ? kTransformFieldAllLayered : kTransformFieldAll;
         }
 
         if (!config.v2_enabled) {
@@ -321,13 +336,16 @@ void VisibilitySystem::ReconcileViewer(Zone& zone,
                                  mask,
                                  Position{x, y, z},
                                  (static_cast<float>(heading_q) / 65535.0f) * kTwoPi,
-                                 static_cast<MoveState>(move_state));
+                                 static_cast<MoveState>(move_state),
+                                 volume_id,
+                                 layer_id);
             ++delta_count;
             const std::size_t record_size = 5 + ((mask & kTransformFieldPosition) ? 12 : 0) +
                                             ((mask & kTransformFieldHeading) ? 2 : 0) +
-                                            ((mask & kTransformFieldMoveState) ? 1 : 0);
+                                            ((mask & kTransformFieldMoveState) ? 1 : 0) +
+                                            ((mask & kTransformFieldLayer) ? 8 : 0);
             out_stats.delta_bytes += record_size;
-            if (mask == kTransformFieldAll) {
+            if (mask == kTransformFieldAll || mask == kTransformFieldAllLayered) {
                 ++out_stats.full_records;
             } else {
                 ++out_stats.delta_records;
@@ -349,6 +367,10 @@ void VisibilitySystem::ReconcileViewer(Zone& zone,
         known.z = z;
         known.heading_q = heading_q;
         known.move_state = move_state;
+        if ((mask & kTransformFieldLayer) != 0) {
+            known.volume_id = volume_id;
+            known.layer_id = layer_id;
+        }
         known.last_sent_tick = world_tick;
         known.synced_tick = world_tick;
         known.next_due_tick = world_tick + period;

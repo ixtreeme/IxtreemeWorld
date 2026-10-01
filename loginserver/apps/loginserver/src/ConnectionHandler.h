@@ -12,6 +12,7 @@
 #include "common/Types.h"
 #include "GameHandler.h"
 #include "SessionContext.h"
+#include "protocol/Protocol.h"
 #include "schema/packet.capnp.h"
 
 namespace gs::server {
@@ -32,7 +33,8 @@ private:
     void SendHandshakeResponse(std::shared_ptr<gs::network::Session> session,
                                gs::protocol::HandshakeResult result,
                                const std::string& message,
-                               bool close_after_send = false);
+                               bool close_after_send = false,
+                               std::uint32_t protocol_version = gs::protocol::kProtocolVersion);
 
     void Disconnect(std::shared_ptr<gs::network::Session> session, const std::string& reason);
 

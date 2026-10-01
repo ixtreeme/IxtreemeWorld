@@ -772,6 +772,15 @@ std::vector<std::uint8_t> HandshakePayload()
     return gs::protocol::SerializeToBytes(msg);
 }
 
+std::vector<std::uint8_t> HandshakePayloadVersion(std::uint32_t version)
+{
+    capnp::MallocMessageBuilder msg;
+    auto request = msg.initRoot<gs::protocol::Packet>().initHandshakeRequest();
+    request.setProtocolVersion(version);
+    request.setClientBuild("negotiation");
+    return gs::protocol::SerializeToBytes(msg);
+}
+
 std::vector<std::uint8_t> EnterWorldPayload()
 {
     capnp::MallocMessageBuilder msg;
@@ -892,6 +901,37 @@ int RunNetStressScenario(const NetStressConfig& config)
             return WaitFor(timeout, [&] { return handler.ContextCount() <= baseline; });
         };
 
+        Progress("negotiation");
+        // ---- 3D-5C1: protocol version negotiation ------------------------
+        {
+            bool all_ok = true;
+            std::string detail;
+            for (const std::uint32_t version : {0u, 1u, 2u, 3u}) {
+                const bool supported = gs::protocol::IsSupportedProtocolVersion(version);
+                TestClient client;
+                std::vector<std::uint8_t> frame;
+                bool ok = client.Connect(port) && client.SendFrame(HandshakePayloadVersion(version)) &&
+                          client.ReadFrame(frame, 2000ms) == TestClient::Read::Frame;
+                std::uint32_t answered = 0;
+                bool accepted = false;
+                if (ok) {
+                    auto parsed = gs::protocol::ParsePacket(frame);
+                    ok = parsed && parsed->packet.isHandshakeResponse();
+                    if (ok) {
+                        const auto response = parsed->packet.getHandshakeResponse();
+                        accepted = response.getResult() == gs::protocol::HandshakeResult::OK;
+                        answered = response.getServerProtocolVersion();
+                    }
+                }
+                const bool closed = !supported && client.WaitClosed(2000ms);
+                const bool expected = ok && accepted == supported &&
+                                      (supported ? answered == version : answered == gs::protocol::kProtocolVersion && closed);
+                all_ok = all_ok && expected;
+                detail += Fmt(" v%u:%s->%u", version, accepted ? "ok" : "refused", answered);
+                client.CloseGraceful();
+            }
+            check("protocol-negotiation-accepts-1-and-2-refuses-others", all_ok, detail);
+        }
         Progress("malformed");
         // ---- H2.1: malformed packets in every pre-world state -------------
         {

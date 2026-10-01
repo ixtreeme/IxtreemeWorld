@@ -6,10 +6,12 @@
 #include <unordered_set>
 #include <vector>
 
+#include "../components/LayerComponents.h"
 #include "../components/MovementComponents.h"
 #include "../components/NetworkComponents.h"
 #include "../components/ReplicationComponents.h"
 #include "../components/Tags.h"
+#include "protocol/Protocol.h"
 #include "../components/TransformComponents.h"
 #include "../spatial/AoiSystem.h"
 #include "../zone/Zone.h"
@@ -171,6 +173,9 @@ bool ValidateReplicationShadow(ZoneManager& zones,
                 }
             }
 
+            // 3D-5C1: a layered-frame recipient must also converge on the volume.
+            const bool layered_viewer = config.v2_enabled && binding.session &&
+                binding.session->ProtocolVersion() >= gs::protocol::kLayeredFramesProtocolVersion;
             // (1) identity + coverage for everything the viewer knows.
             for (const auto& [net_id, known] : binding.visible_net_versions) {
                 ++relationships_checked;
@@ -223,6 +228,8 @@ bool ValidateReplicationShadow(ZoneManager& zones,
                 float az = 0.0f;
                 std::uint16_t ahq = 0;
                 std::uint8_t ast = 0;
+                std::uint32_t avolume = 0; // 3D-5C1 layered presence (0 = terrain)
+                std::uint32_t alayer = 0;
                 if (const auto entity = zone.FindEntity(net_id);
                     entity.is_valid() && entity.has<Position>() && entity.has<Heading>()) {
                     const auto pos = entity.get<Position>();
@@ -235,6 +242,10 @@ bool ValidateReplicationShadow(ZoneManager& zones,
                     az = pos.z;
                     ahq = QuantizeHeading(heading.angle);
                     ast = static_cast<std::uint8_t>(state);
+                    if (const auto* presence = entity.try_get<LayerPresence>()) {
+                        avolume = presence->volume_id;
+                        alayer = presence->layer_id;
+                    }
                     authority_ok = true;
                 } else if (const GhostRecord* ghost = zone.FindGhost(net_id)) {
                     ax = ghost->snapshot.position.x;
@@ -242,12 +253,16 @@ bool ValidateReplicationShadow(ZoneManager& zones,
                     az = ghost->snapshot.position.z;
                     ahq = QuantizeHeading(ghost->snapshot.heading.angle);
                     ast = static_cast<std::uint8_t>(ghost->snapshot.move_state);
+                    avolume = ghost->snapshot.volume_id;
+                    alayer = ghost->snapshot.layer_id;
                     authority_ok = true;
                 }
                 if (authority_ok) {
                     const bool fields_match = ax == known.x && ay == known.y && az == known.z &&
                                               ahq == known.heading_q &&
-                                              ast == known.move_state;
+                                              ast == known.move_state &&
+                                              (!layered_viewer ||
+                                               (avolume == known.volume_id && alayer == known.layer_id));
                     // The shadow contract: the recipient's replicated fields
                     // must converge to authority within the starvation/age
                     // bound. A transient one-tick lag (e.g. a migration that

@@ -1,6 +1,9 @@
 #include "LayeredPresenceBench.h"
 
 #include <algorithm>
+#include <array>
+#include <mutex>
+#include <unordered_map>
 #include <cstdarg>
 #include <chrono>
 #include <cmath>
@@ -19,6 +22,7 @@
 #include <boost/asio/executor_work_guard.hpp>
 #include <boost/asio/io_context.hpp>
 #include <boost/asio/ip/tcp.hpp>
+#include <boost/asio/read.hpp>
 
 #include "db/CharacterRepository.h"
 #include "map/LayerClearance.h"
@@ -27,6 +31,7 @@
 #include "map/WorldPackage.h"
 #include "map/WorldPackageWriter.h"
 #include "network/Session.h"
+#include "protocol/Protocol.h"
 #include "protocol/Serialization.h"
 
 #include "../world/WorldRuntime.h"
@@ -774,6 +779,240 @@ void RuntimeChecks(Checks& checks)
     sim.Stop();
 }
 
+// ---- 3D-5C1: layered transform frames over real loopback sessions -----------
+
+std::uint32_t ReadU32(const std::uint8_t* p)
+{
+    return static_cast<std::uint32_t>(p[0]) | static_cast<std::uint32_t>(p[1]) << 8 |
+           static_cast<std::uint32_t>(p[2]) << 16 | static_cast<std::uint32_t>(p[3]) << 24;
+}
+
+// What one client learned from its wire stream, decoded independently of
+// the server encoder (strict: every frame must be consumed exactly).
+struct WireLog {
+    std::mutex mutex;
+    std::uint64_t v2_frames = 0, v3_frames = 0, other_frames = 0, parse_errors = 0, layer_fields = 0;
+    std::uint32_t self_volume = 0;
+    std::vector<std::uint32_t> self_volumes; // distinct, in order
+    std::unordered_map<std::uint32_t, std::uint32_t> volume_of;         // net -> last known volume
+    std::unordered_map<std::uint32_t, std::uint32_t> volume_changes_of; // net -> layer fields received
+};
+
+void ParseTransformFrame(const std::vector<std::uint8_t>& p, WireLog& log)
+{
+    const std::uint8_t opcode = p[1];
+    const bool v3 = opcode == 0x12;
+    if (opcode == 0x11) ++log.v2_frames;
+    else if (v3) ++log.v3_frames;
+    else {
+        ++log.other_frames;
+        return;
+    }
+    const std::size_t header = 1 + 1 + 4 + 2;
+    if (p.size() < header + 19 + (v3 ? 8 : 0)) {
+        ++log.parse_errors;
+        return;
+    }
+    const std::uint32_t count = static_cast<std::uint32_t>(p[6]) | static_cast<std::uint32_t>(p[7]) << 8;
+    std::size_t at = header + 19;
+    if (v3) {
+        const std::uint32_t self = ReadU32(p.data() + at);
+        at += 8;
+        log.self_volume = self;
+        if (log.self_volumes.empty() || log.self_volumes.back() != self) log.self_volumes.push_back(self);
+    }
+    const std::uint8_t allowed = v3 ? 0x0F : 0x07;
+    for (std::uint32_t r = 1; r < count; ++r) {
+        if (at + 5 > p.size()) {
+            ++log.parse_errors;
+            return;
+        }
+        const std::uint32_t net = ReadU32(p.data() + at);
+        const std::uint8_t mask = p[at + 4];
+        at += 5;
+        if ((mask & ~allowed) != 0) {
+            ++log.parse_errors;
+            return;
+        }
+        at += ((mask & 0x01) ? 12 : 0) + ((mask & 0x02) ? 2 : 0) + ((mask & 0x04) ? 1 : 0);
+        if (mask & 0x08) {
+            if (at + 8 > p.size()) {
+                ++log.parse_errors;
+                return;
+            }
+            log.volume_of[net] = ReadU32(p.data() + at);
+            ++log.volume_changes_of[net];
+            ++log.layer_fields;
+            at += 8;
+        }
+    }
+    if (at != p.size()) ++log.parse_errors;
+}
+
+void ReadWire(asio::ip::tcp::socket& socket, WireLog& log)
+{
+    try {
+        std::vector<std::uint8_t> payload;
+        for (;;) {
+            std::array<std::uint8_t, 4> header{};
+            asio::read(socket, asio::buffer(header));
+            const std::uint32_t length = static_cast<std::uint32_t>(header[0]) << 24 |
+                                         static_cast<std::uint32_t>(header[1]) << 16 |
+                                         static_cast<std::uint32_t>(header[2]) << 8 | header[3];
+            payload.resize(length);
+            if (length > 0) asio::read(socket, asio::buffer(payload));
+            if (payload.empty()) continue;
+            std::lock_guard lock(log.mutex);
+            if (payload[0] == gs::protocol::kCodecCapnp) {
+                if (const auto parsed = gs::protocol::ParsePacket(payload); parsed && parsed->packet.isEntitySpawn()) {
+                    const auto spawn = parsed->packet.getEntitySpawn();
+                    log.volume_of[spawn.getNetId()] = spawn.getVolumeId();
+                } else if (parsed && parsed->packet.isEnterWorldAccept()) {
+                    log.self_volume = parsed->packet.getEnterWorldAccept().getSpawnVolumeId();
+                    log.self_volumes.push_back(log.self_volume);
+                }
+                continue;
+            }
+            if (payload.size() >= 2) ParseTransformFrame(payload, log);
+        }
+    } catch (const std::exception&) {
+        // EOF / reset on teardown ends the reader.
+    }
+}
+
+struct WireClient {
+    asio::io_context io;
+    asio::ip::tcp::socket socket{io};
+    WireLog log;
+    std::thread reader;
+    ~WireClient()
+    {
+        boost::system::error_code ec;
+        socket.close(ec);
+        if (reader.joinable()) reader.join();
+    }
+};
+
+std::shared_ptr<gs::network::Session> Connect(asio::io_context& server_io, asio::ip::tcp::acceptor& acceptor,
+                                              WireClient& client, gs::common::SessionId id)
+{
+    client.socket.connect(asio::ip::tcp::endpoint(asio::ip::address_v4::loopback(), acceptor.local_endpoint().port()));
+    asio::ip::tcp::socket server_socket(server_io);
+    acceptor.accept(server_socket);
+    client.reader = std::thread([&client] { ReadWire(client.socket, client.log); });
+    return std::make_shared<gs::network::Session>(std::move(server_socket), id);
+}
+
+void LayeredFrameChecks(Checks& checks)
+{
+    ScratchDirectory scratch;
+    map::LayeredWorld layered;
+    std::string error;
+    if (!CookFixture(layered, error)) {
+        checks.Report("frame-fixture-cooked", false, error);
+        return;
+    }
+    const auto* floor = WalkableAt(layered, 240, 256, -1, 2);
+    const auto* landing = WalkableAt(layered, 305, 252, 1.5, 3);
+    if (!floor || !landing) return;
+    const std::uint32_t floor_id = floor->id, landing_id = landing->id;
+    map::PackageWriteSpec spec;
+    spec.world_id = "layeredframes_fixture";
+    spec.world_name = "3D-5C1 layered frames fixture";
+    spec.size_cells_x = spec.size_cells_y = static_cast<std::uint32_t>(kWorldSize);
+    spec.cell_size_m = 1;
+    spec.chunk_size_cells = 128;
+    spec.height_raw = [](std::uint32_t, std::uint32_t) { return 0; };
+    spec.attributes = [](std::uint32_t, std::uint32_t) { return std::uint16_t{0}; };
+    spec.logic.spawns.push_back(map::SpawnRegion{1, 0, map::Rect{99.5f, 99.5f, 100.5f, 100.5f}});
+    spec.layered_world = layered;
+    const auto root = scratch.root / "frames_package";
+    const auto written = map::WritePackage(root, spec);
+    gs::game::WorldLoadRequest request;
+    request.package_root = root;
+    request.mob_types_config = IXTREEME_DEFAULT_MOB_TYPES_CONFIG;
+    request.depth = map::ValidationDepth::Full;
+    request.warp_policy = map::WarpPolicy::Strict;
+    map::PackageReport report;
+    auto loaded = written.ok ? gs::game::LoadWorldPackage(request, report) : std::nullopt;
+    if (!loaded) {
+        checks.Report("frame-package-loads", false, written.error);
+        return;
+    }
+
+    IoRunner runner;
+    asio::ip::tcp::acceptor acceptor(runner.io, asio::ip::tcp::endpoint(asio::ip::address_v4::loopback(), 0));
+    WireClient climber, observer, legacy;
+    auto climber_session = Connect(runner.io, acceptor, climber, 95401);
+    auto observer_session = Connect(runner.io, acceptor, observer, 95402);
+    auto legacy_session = Connect(runner.io, acceptor, legacy, 95403);
+    climber_session->SetProtocolVersion(gs::protocol::kLayeredFramesProtocolVersion);
+    observer_session->SetProtocolVersion(gs::protocol::kLayeredFramesProtocolVersion);
+    // legacy_session keeps protocol 1.
+
+    {
+        gs::game::PartitionLayout layout;
+        layout.regions_x = 2;
+        layout.regions_y = 1;
+        gs::game::WorldRuntime sim(runner.io, {}, std::move(*loaded), layout);
+        gs::game::PartitionConfig partition;
+        partition.scoring.adaptive_enabled = false;
+        sim.ConfigurePartition(partition);
+        sim.PostSpawn(climber_session, MakeCharacter(81), gs::game::DebugSpawnOverride{296.0f, 252.0f, floor_id});
+        sim.PostSpawn(observer_session, MakeCharacter(82), gs::game::DebugSpawnOverride{308.0f, 254.0f, landing_id});
+        sim.PostSpawn(legacy_session, MakeCharacter(83), gs::game::DebugSpawnOverride{290.0f, 256.0f, floor_id});
+        sim.Start();
+        const bool entered = WaitFor(10000ms, [&] {
+            return ReadWorld(sim, [](const WorldSnapshot& snap) { return snap.owners.size(); }) == 3;
+        });
+        std::this_thread::sleep_for(500ms);
+        const auto climber_net = ReadPlayer(sim, 95401).net_id;
+        std::uint32_t seq = 0;
+        const auto run_until = Clock::now() + 2500ms;
+        while (Clock::now() < run_until) {
+            sim.PostMoveInput(95401, ++seq, 1.5707963f, gs::game::MoveState::Running);
+            std::this_thread::sleep_for(50ms);
+        }
+        sim.PostMoveInput(95401, ++seq, 1.5707963f, gs::game::MoveState::Idle);
+        std::this_thread::sleep_for(1500ms); // > one resync period
+        const auto end = ReadPlayer(sim, 95401);
+        sim.RequestReplicationValidation();
+        std::string repl;
+        bool repl_done = false;
+        for (int i = 0; i < 400 && !repl_done; ++i) {
+            repl_done = sim.TryTakeReplicationValidationResult(repl);
+            if (!repl_done) std::this_thread::sleep_for(25ms);
+        }
+        sim.Stop();
+
+        std::lock_guard c_lock(climber.log.mutex);
+        std::lock_guard o_lock(observer.log.mutex);
+        std::lock_guard l_lock(legacy.log.mutex);
+        std::string path;
+        for (const auto v : climber.log.self_volumes) path += std::to_string(v) + " ";
+        checks.Report("frames-climber-reaches-landing", entered && end.layered && end.presence.volume_id == landing_id,
+                      Describe(end));
+        checks.Report("layered-session-gets-only-v3-frames-self-volume-follows-portals",
+                      climber.log.v3_frames > 0 && climber.log.v2_frames == 0 && climber.log.parse_errors == 0 &&
+                          climber.log.self_volumes.size() == 6 && climber.log.self_volumes.front() == floor_id &&
+                          climber.log.self_volume == landing_id,
+                      "self volumes " + path);
+        const auto seen = observer.log.volume_of.find(climber_net);
+        checks.Report("layered-observer-learns-every-volume-change",
+                      observer.log.v3_frames > 0 && observer.log.parse_errors == 0 && seen != observer.log.volume_of.end() &&
+                          seen->second == landing_id && observer.log.volume_changes_of[climber_net] >= 1,
+                      Fmt("known=%u changes=%u layer_fields=%llu", seen != observer.log.volume_of.end() ? seen->second : 0u,
+                          observer.log.volume_changes_of[climber_net],
+                          static_cast<unsigned long long>(observer.log.layer_fields)));
+        checks.Report("protocol-1-session-gets-unchanged-v2-frames",
+                      legacy.log.v2_frames > 0 && legacy.log.v3_frames == 0 && legacy.log.parse_errors == 0 &&
+                          legacy.log.layer_fields == 0,
+                      Fmt("v2=%llu v3=%llu", static_cast<unsigned long long>(legacy.log.v2_frames),
+                          static_cast<unsigned long long>(legacy.log.v3_frames)));
+        checks.Report("replication-shadow-audit-with-layered-recipients", repl_done && repl == "OK", repl);
+    }
+}
+
 // ---- 3D-5B2: proven terrain <-> volume transitions --------------------------
 
 // A platform 0.2 m above flat terrain with a wall along its north edge,
@@ -1116,6 +1355,7 @@ int RunLayeredPresenceScenario()
         LayeredSpawnChecks(checks);
         TerrainEdgeDeterministicChecks(checks);
         TerrainEdgeRuntimeChecks(checks);
+        LayeredFrameChecks(checks);
     } catch (const std::exception& error) {
         checks.Report("unexpected-exception", false, error.what());
     }
