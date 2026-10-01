@@ -1613,6 +1613,7 @@ void MergeMapEditorCommands(MapEditorCommands& target, const MapEditorCommands& 
         target.serverWorldId = source.serverWorldId;
         target.serverWorldSpawnX = source.serverWorldSpawnX;
         target.serverWorldSpawnZ = source.serverWorldSpawnZ;
+        target.serverWorldSpawnVolume = source.serverWorldSpawnVolume;
     }
     target.showLayerVolumes = source.showLayerVolumes;
     if (source.placeLayerGround || source.moveLayerGround)
@@ -9408,6 +9409,7 @@ int RunGame(NativeWindow& window,
                         options.worldId = commands.serverWorldId;
                         options.spawnX = commands.serverWorldSpawnX;
                         options.spawnZ = commands.serverWorldSpawnZ;
+                        options.spawnVolumeId = commands.serverWorldSpawnVolume;
                         SceneWorldPackageResult result;
                         const bool exported = ExportSceneServerWorld(exportPath, sceneRuntime.BuildSceneSnapshot(),
                             [&](const MeshSceneEntity& mesh, std::vector<std::array<float, 3>>& vertices,

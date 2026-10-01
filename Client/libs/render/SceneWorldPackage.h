@@ -13,6 +13,9 @@ struct SceneWorldExportOptions
     // point, guessed character identity, or ground-at-zero fallback.
     float spawnX = 0.0f;
     float spawnZ = 0.0f;
+    // 3D-5B: 0 = the terrain; otherwise the generated layer volume the spawn
+    // stands on (the baked actor must fit at the exact point).
+    std::uint32_t spawnVolumeId = 0;
 };
 
 struct SceneWorldPackageResult

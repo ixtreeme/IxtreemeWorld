@@ -778,6 +778,7 @@ struct MapEditorCommands
     std::string serverWorldId;
     float serverWorldSpawnX = 0;
     float serverWorldSpawnZ = 0;
+    std::uint32_t serverWorldSpawnVolume = 0; // 3D-5B: 0 = terrain spawn
     bool placeLayerGround = false;
     bool moveLayerGround = false;
     std::uint32_t layerGroundVolume = 1;

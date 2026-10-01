@@ -278,6 +278,66 @@ void Rejected(const char* name, const fs::path& path, const SceneData& scene,
     Check(name, !exported && !result.errors.empty() && result.files.empty() && !fs::exists(path) && !fs::exists(pending));
 }
 
+std::uint32_t WorldLogicVersion(const fs::path& package)
+{
+    std::ifstream stream(package / "worldlogic.dat", std::ios::binary);
+    std::array<unsigned char, 8> header{};
+    stream.read(reinterpret_cast<char*>(header.data()), static_cast<std::streamsize>(header.size()));
+    return stream ? static_cast<std::uint32_t>(header[4]) | static_cast<std::uint32_t>(header[5]) << 8 |
+                        static_cast<std::uint32_t>(header[6]) << 16 | static_cast<std::uint32_t>(header[7]) << 24
+                  : 0;
+}
+
+// 3D-5B: the player spawn region may stand on a generated layer volume.
+void TestLayeredSpawn(const TemporaryWorkspace& workspace)
+{
+    auto scene = Fixture(true);
+    // The terrain cell under the bridge deck is blocked: a terrain spawn there
+    // is refused, a spawn on the deck above it is valid.
+    scene.terrain.attributes[2 * scene.terrain.cellsX + 1] = map::CellSample::kBlocked;
+    SceneLayerAuthoringResult preview;
+    const bool generated = GenerateSceneLayers(scene, {}, preview);
+    const auto bridge = std::find_if(preview.world.volumes.begin(), preview.world.volumes.end(),
+        [](const auto& volume) { return (volume.tags & map::VolumeTagBridge) != 0; });
+    Check("layered-spawn-fixture-has-baked-bridge", generated && bridge != preview.world.volumes.end() &&
+        preview.world.clearance_profile.has_value());
+    if (!generated || bridge == preview.world.volumes.end()) return;
+
+    SceneWorldExportOptions options{"layered_spawn_world", -3, -1, bridge->id};
+    const auto path = workspace.root / "layered_spawn";
+    SceneWorldPackageResult result;
+    const bool exported = ExportSceneServerWorld(path, scene, {}, options, result);
+    if (!exported)
+        for (const auto& error : result.errors) std::cout << "layered spawn export error: " << error << '\n';
+    map::PackageReport report;
+    const auto loaded = map::LoadServerWorld(path, map::ValidationDepth::Full, report);
+    Check("layered-spawn-export-passes-strict-loader", exported && loaded && report.Ok());
+    Check("layered-spawn-region-keeps-its-volume", loaded && loaded->logic.spawns.size() == 1 &&
+        loaded->logic.spawns[0].volume_id == bridge->id && loaded->logic.spawns[0].bounds.CenterX() == -3.0f &&
+        loaded->logic.spawns[0].bounds.CenterY() == -1.0f);
+    Check("layered-spawn-writes-worldlogic-v2", WorldLogicVersion(path) == map::kWorldLogicLayeredFileVersion);
+    Check("layered-spawn-over-blocked-terrain-cell-is-valid", loaded && !loaded->terrain.Cell(-3, -1).Walkable());
+    const auto placed = loaded && loaded->layered_world
+        ? map::ResolveLayerActorPlacement(*loaded->layered_world, SceneLayerActorProfile(), bridge->id, -3, -1)
+        : map::LayerGroundResult{};
+    Check("layered-spawn-places-baked-actor-on-the-deck", placed.Ok() && Near(placed.state.z, 6));
+
+    Rejected("terrain-spawn-on-blocked-cell-still-rejected", workspace.root / "terrain_blocked_spawn", scene,
+             SceneWorldExportOptions{"terrain_blocked_spawn", -3, -1, 0});
+    Rejected("unknown-spawn-volume-rejected", workspace.root / "unknown_spawn_volume", scene,
+             SceneWorldExportOptions{"unknown_spawn_volume", -3, -1, 999});
+    Rejected("spawn-outside-its-volume-rejected", workspace.root / "spawn_outside_volume", scene,
+             SceneWorldExportOptions{"spawn_outside_volume", -5, -3, bridge->id});
+    Rejected("layered-spawn-without-layers-rejected", workspace.root / "spawn_without_layers", Fixture(false),
+             SceneWorldExportOptions{"spawn_without_layers", -5, -3, 1});
+
+    auto terrain_scene = Fixture(true);
+    const auto terrain_path = workspace.root / "terrain_spawn_v1";
+    Check("terrain-spawn-keeps-worldlogic-v1",
+        ExportSceneServerWorld(terrain_path, terrain_scene, {}, Options(), result) &&
+        WorldLogicVersion(terrain_path) == map::kWorldLogicFileVersion);
+}
+
 void TestNegativeControls(const TemporaryWorkspace& workspace)
 {
     const auto base = Fixture(false);
@@ -589,6 +649,7 @@ int main(int argc, char** argv)
         TestFullExport(workspace);
         TestPrecisionAndNonplanarity(workspace);
         TestNegativeControls(workspace);
+        TestLayeredSpawn(workspace);
         TestFractionalSpawnSeam(workspace);
         TestFractionalPitchOracle(workspace);
         TestPublication(workspace);

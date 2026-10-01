@@ -491,7 +491,8 @@ std::optional<WorldLogic> LoadWorldLogic(const AssetReadFn& read, std::string_vi
     const auto zone_count = ReadU32(*bytes, offset);
     const auto spawn_count = ReadU32(*bytes, offset);
     const auto warp_count = ReadU32(*bytes, offset);
-    if (magic != 0x314c584d || version != 1 ||
+    // v2 (3D-5B) appends a u32 volume id to every spawn record.
+    if (magic != 0x314c584d || (version != 1 && version != 2) ||
         zone_count > 1024 || spawn_count > 1024 || warp_count > 1024) {
         return std::nullopt;
     }
@@ -523,6 +524,9 @@ std::optional<WorldLogic> LoadWorldLogic(const AssetReadFn& read, std::string_vi
                             ReadF32(*bytes, offset),
                             ReadF32(*bytes, offset),
                             ReadF32(*bytes, offset)};
+        if (version == 2) {
+            spawn.volume_id = ReadU32(*bytes, offset);
+        }
         if (offset > bytes->size()) {
             return std::nullopt;
         }

@@ -27,6 +27,9 @@ inline constexpr std::uint32_t kChunkFileMagic = 0x3143584d;  // "MXC1" little-e
 inline constexpr std::uint16_t kChunkFileVersion = 2;         // MXC1 container version
 inline constexpr std::uint32_t kWorldLogicFileMagic = 0x314c584d; // "MXL1"
 inline constexpr std::uint32_t kWorldLogicFileVersion = 1;
+// 3D-5B: v2 appends a u32 volume id to every spawn record. Written only when a
+// spawn region stands on a layered volume; otherwise v1 is byte-identical.
+inline constexpr std::uint32_t kWorldLogicLayeredFileVersion = 2;
 inline constexpr std::uint32_t kWaterBodiesFileMagic = 0x5357584d; // "MXWS" little-endian (MAP-3)
 inline constexpr std::uint32_t kWaterBodiesFileVersion = 1;
 inline constexpr std::uint32_t kMaxWaterBodies = 4096;
@@ -118,6 +121,7 @@ enum class PackageErrorCode : std::uint16_t {
     WorldLogicNoZones = 414,          // retired in MAP-2 (areas are metadata)
     WorldLogicNoPlayerSpawn = 415,
     WorldLogicSpawnBlocked = 416,
+    WorldLogicSpawnVolumeInvalid = 417, // 3D-5B layered player spawn
     SpawnsSyntax = 500,
     SpawnsFieldInvalid = 501,
     SpawnsOutOfBounds = 502,

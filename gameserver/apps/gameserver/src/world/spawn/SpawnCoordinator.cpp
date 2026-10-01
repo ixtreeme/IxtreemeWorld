@@ -414,6 +414,18 @@ std::optional<SpawnPlacement> SpawnCoordinator::ResolveSpawnPosition(std::option
     }
     const float x = spawn->bounds.CenterX();
     const float y = spawn->bounds.CenterY();
+    if (spawn->volume_id != 0) {
+        // 3D-5B: the package binds this region to a layered volume (validated
+        // at load). Never fall back to the terrain under the floor.
+        if (auto layered = ResolveLayeredSpawn(DebugSpawnOverride{x, y, spawn->volume_id})) {
+            LOG_INFO("Using layered player spawn region {} at {}, {} on volume {} z={}", spawn->id, x, y,
+                     spawn->volume_id, layered->position.z);
+            return layered;
+        }
+        LOG_ERROR("Session {}: layered player spawn region {} ({}, {}) on volume {} is not usable", session_id,
+                  spawn->id, x, y, spawn->volume_id);
+        return std::nullopt;
+    }
     if (!IsValidSpawnPoint(x, y)) {
         LOG_ERROR("Session {}: player spawn region {} centre ({}, {}) is not usable (height={}, cell={})",
                   session_id,

@@ -493,6 +493,7 @@ private:
     MapEditorCommands m_commands;
     bool m_showLayerVolumes = false;
     float m_serverWorldSpawn[2] = {0, 0};
+    std::uint32_t m_serverWorldSpawnVolume = 0;
     char m_serverWorldId[65] = "editor-world";
     std::uint32_t m_layerGroundVolume = 1;
     float m_layerGroundPoint[2] = {0, 0};

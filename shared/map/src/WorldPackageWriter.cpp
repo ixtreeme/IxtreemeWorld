@@ -111,8 +111,11 @@ std::vector<std::uint8_t> EncodeWaterBodies(const std::vector<WaterBodyRect>& bo
 std::vector<std::uint8_t> EncodeWorldLogic(const WorldLogic& logic)
 {
     std::vector<std::uint8_t> out;
+    // v2 only when a spawn region stands on a layered volume (3D-5B).
+    const bool layered = std::any_of(logic.spawns.begin(), logic.spawns.end(),
+                                     [](const SpawnRegion& spawn) { return spawn.volume_id != 0; });
     PutU32(out, kWorldLogicFileMagic);
-    PutU32(out, kWorldLogicFileVersion);
+    PutU32(out, layered ? kWorldLogicLayeredFileVersion : kWorldLogicFileVersion);
     PutU32(out, static_cast<std::uint32_t>(logic.zones.size()));
     PutU32(out, static_cast<std::uint32_t>(logic.spawns.size()));
     PutU32(out, static_cast<std::uint32_t>(logic.warps.size()));
@@ -127,6 +130,9 @@ std::vector<std::uint8_t> EncodeWorldLogic(const WorldLogic& logic)
         PutU32(out, spawn.id);
         PutU32(out, spawn.zone_id);
         PutRect(out, spawn.bounds);
+        if (layered) {
+            PutU32(out, spawn.volume_id);
+        }
     }
     for (const auto& warp : logic.warps) {
         PutU32(out, warp.id);
@@ -235,6 +241,12 @@ PackageWriteResult WritePackage(const fs::path& out_dir, const PackageWriteSpec&
     if (spec.mob_spawns && (spec.mob_spawns_version < 1 || spec.mob_spawns_version > 2 ||
                            (legacy && spec.mob_spawns_version != 1))) {
         result.error = "mobSpawns requires layer v1 or v2; v2 requires manifest v3";
+        return result;
+    }
+    const bool layered_spawn = std::any_of(spec.logic.spawns.begin(), spec.logic.spawns.end(),
+                                           [](const SpawnRegion& spawn) { return spawn.volume_id != 0; });
+    if (layered_spawn && (legacy || !spec.layered_world)) {
+        result.error = "a layered player spawn (3D-5B) requires a v3 package with a layered_world sidecar";
         return result;
     }
     if (legacy) {

@@ -1,4 +1,5 @@
 #include "map/WorldPackage.h"
+#include "map/LayerActorMovement.h"
 
 #include <algorithm>
 #include <array>
@@ -1423,9 +1424,10 @@ bool ParseWorldLogic(const std::vector<std::uint8_t>& bytes,
                      "0x314c584d (\"MXL1\")");
         return false;
     }
-    if (version != kWorldLogicFileVersion) {
+    if (version != kWorldLogicFileVersion && version != kWorldLogicLayeredFileVersion) {
         issues.Error(PackageErrorCode::WorldLogicHeaderInvalid, at("version", 4),
-                     "version " + std::to_string(version), std::to_string(kWorldLogicFileVersion));
+                     "version " + std::to_string(version),
+                     std::to_string(kWorldLogicFileVersion) + " or " + std::to_string(kWorldLogicLayeredFileVersion));
         return false;
     }
     const std::uint32_t counts[3] = {zone_count, spawn_count, warp_count};
@@ -1458,7 +1460,8 @@ bool ParseWorldLogic(const std::vector<std::uint8_t>& bytes,
     for (std::uint32_t i = 0; i < spawn_count; ++i) {
         const std::size_t start = cur.Offset();
         SpawnRegion spawn;
-        if (!cur.U32(spawn.id) || !cur.U32(spawn.zone_id) || !read_rect(spawn.bounds)) {
+        if (!cur.U32(spawn.id) || !cur.U32(spawn.zone_id) || !read_rect(spawn.bounds) ||
+            (version == kWorldLogicLayeredFileVersion && !cur.U32(spawn.volume_id))) {
             issues.Error(PackageErrorCode::WorldLogicTruncated, at("spawns[" + std::to_string(i) + "]", start),
                          "file ends inside spawn record " + std::to_string(i), "complete records");
             return false;
@@ -1673,6 +1676,40 @@ void ValidateWorldLogic(const WorldLogic& logic,
 
 // Cross-layer rules against the decoded terrain: warp targets and the
 // centre of every player spawn region must be walkable cells.
+// 3D-5B: a spawn region standing on a layered volume must name a walkable
+// volume of this package's layered world whose clearance bake admits the
+// baked actor at the region centre (exactly where the server places players).
+void ValidateLayeredSpawns(const WorldLogic& logic,
+                           const std::string& file,
+                           const std::optional<LayeredWorld>& layered,
+                           Issues& issues)
+{
+    for (std::size_t i = 0; i < logic.spawns.size(); ++i) {
+        const auto& s = logic.spawns[i];
+        if (s.volume_id == 0 || !FiniteRect(s.bounds)) {
+            continue;
+        }
+        const IssueSite site{"worldLogic", file, "spawns[" + std::to_string(i) + "].volumeId"};
+        const std::string what = "spawn region centre (" + Str(s.bounds.CenterX()) + "," +
+                                 Str(s.bounds.CenterY()) + ") on volume " + std::to_string(s.volume_id);
+        if (!layered || !layered->clearance_profile) {
+            issues.Error(PackageErrorCode::WorldLogicSpawnVolumeInvalid, site,
+                         what + ": the package has no layered world with a clearance bake",
+                         "a layered_world sidecar (MX3D v4) that contains the volume");
+            continue;
+        }
+        const LayerActorProfile actor{layered->clearance_profile->actor_radius_m,
+                                      layered->clearance_profile->actor_height_m};
+        const auto placed =
+            ResolveLayerActorPlacement(*layered, actor, s.volume_id, s.bounds.CenterX(), s.bounds.CenterY());
+        if (!placed.Ok()) {
+            issues.Error(PackageErrorCode::WorldLogicSpawnVolumeInvalid, site,
+                         what + " is " + ToString(placed.status),
+                         "a point of a walkable volume where the baked actor fits");
+        }
+    }
+}
+
 void ValidateAgainstTerrain(const WorldLogic& logic,
                             const std::string& file,
                             const ServerTerrain& terrain,
@@ -1696,6 +1733,9 @@ void ValidateAgainstTerrain(const WorldLogic& logic,
         const auto& s = logic.spawns[i];
         if (!FiniteRect(s.bounds)) {
             continue; // already reported
+        }
+        if (s.volume_id != 0) {
+            continue; // 3D-5B: a layered spawn stands on its volume, not the terrain
         }
         const auto cell = terrain.Cell(s.bounds.CenterX(), s.bounds.CenterY());
         if (cell.status != TerrainStatus::OutsideWorld && !cell.Walkable()) {
@@ -2006,6 +2046,7 @@ const char* ToString(PackageErrorCode code) noexcept
     case PackageErrorCode::WorldLogicNoZones: return "WORLDLOGIC_NO_ZONES";
     case PackageErrorCode::WorldLogicNoPlayerSpawn: return "WORLDLOGIC_NO_PLAYER_SPAWN";
     case PackageErrorCode::WorldLogicSpawnBlocked: return "WORLDLOGIC_SPAWN_BLOCKED";
+    case PackageErrorCode::WorldLogicSpawnVolumeInvalid: return "WORLDLOGIC_SPAWN_VOLUME_INVALID";
     case PackageErrorCode::SpawnsSyntax: return "SPAWNS_SYNTAX";
     case PackageErrorCode::SpawnsFieldInvalid: return "SPAWNS_FIELD_INVALID";
     case PackageErrorCode::SpawnsOutOfBounds: return "SPAWNS_OUT_OF_BOUNDS";
@@ -2442,6 +2483,7 @@ std::optional<ServerWorldData> LoadServerWorld(const fs::path& package_root,
                         const std::size_t before = issues.ErrorCount();
                         if (ParseWorldLogic(*bytes, logic_layer->file, data.logic, issues)) {
                             ValidateWorldLogic(data.logic, logic_layer->file, geometry, issues, options.warp_policy);
+                            ValidateLayeredSpawns(data.logic, logic_layer->file, data.layered_world, issues);
                         }
                         logic_ok = issues.ErrorCount() == before;
                     }

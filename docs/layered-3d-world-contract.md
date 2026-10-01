@@ -193,11 +193,22 @@ changes yet. The world audit (`ValidateLayeredPresence`) checks every
 layered resident's volume, layer, actor placement and exact support z, and
 that ghosts mirror their snapshot.
 
-Not yet: production spawn regions are terrain-only (a spawn volume in world
-logic or the sidecar is needed), there is no terrain↔volume transition,
-mob spawn points are terrain-only, transform frames do not signal volume
-changes (3D-5B, protocol version bump) and no client consumes the new
-fields (3D-5B/5C).
+**3D-5B1 (layered player spawn, done).** A world-logic spawn region may
+stand on a layered volume: `SpawnRegion::volume_id` (0 = terrain), stored
+by worldlogic (`MXL1`) **version 2**, which appends a u32 volume id to every
+spawn record. Version 2 is written only when a spawn is layered; otherwise
+the file stays byte-identical version 1. The strict loader cross-checks
+every layered spawn against the package's layered world: the volume must
+exist with a clearance bake and `ResolveLayerActorPlacement` must admit the
+baked actor at the region centre (`WORLDLOGIC_SPAWN_VOLUME_INVALID`, 417);
+the terrain walkability rule does not apply to it. The writer refuses a
+layered spawn without a v3 package and sidecar. The server's player spawn
+rule places players on that volume (no terrain fallback); the editor export
+takes a "Player spawn volume".
+
+Not yet: there is no terrain↔volume transition (3D-5B2), mob spawn points
+are terrain-only, transform frames do not signal volume changes (protocol
+version bump) and no client consumes the new fields (3D-5C).
 
 No layer-aware production path should be enabled before the fixture and
 contract tests prove deterministic lookup, non-overlap, portal validation,

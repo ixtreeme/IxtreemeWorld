@@ -992,7 +992,11 @@ int RunWorldPackageScenario(const std::string& fixtures_out)
     logic_bytes_case("worldlogic-short-header", PackageErrorCode::WorldLogicTruncated, [](auto& b) { b.resize(12); });
     logic_bytes_case("worldlogic-trailing", PackageErrorCode::WorldLogicTrailingData, [](auto& b) { b.push_back(0); });
     logic_bytes_case("worldlogic-bad-magic", PackageErrorCode::WorldLogicHeaderInvalid, [](auto& b) { b[0] ^= 0xff; });
-    logic_bytes_case("worldlogic-bad-version", PackageErrorCode::WorldLogicHeaderInvalid, [](auto& b) { PutU32At(b, 4, 2); });
+    // Version 2 is the 3D-5B layered-spawn layout (a u32 volume id per spawn
+    // record); 3 is the first unknown version.
+    logic_bytes_case("worldlogic-bad-version", PackageErrorCode::WorldLogicHeaderInvalid, [](auto& b) { PutU32At(b, 4, 3); });
+    logic_bytes_case("worldlogic-v2-spawn-without-volume-field", PackageErrorCode::WorldLogicTruncated,
+                     [](auto& b) { PutU32At(b, 4, 2); });
     logic_bytes_case("worldlogic-too-many-records", PackageErrorCode::WorldLogicHeaderInvalid,
                      [](auto& b) { PutU32At(b, 8, 5000); });
     const float nan = std::numeric_limits<float>::quiet_NaN();

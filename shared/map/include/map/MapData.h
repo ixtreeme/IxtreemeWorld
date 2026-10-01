@@ -85,6 +85,10 @@ struct SpawnRegion {
     std::uint32_t id = 0;
     std::uint32_t zone_id = 0;
     Rect bounds;
+    // 3D-5B: the walkable layered volume the region centre stands on
+    // (0 = terrain). Stored only by worldlogic v2; validated against the
+    // package's layered world and its baked actor.
+    std::uint32_t volume_id = 0;
 };
 
 struct WarpRegion {

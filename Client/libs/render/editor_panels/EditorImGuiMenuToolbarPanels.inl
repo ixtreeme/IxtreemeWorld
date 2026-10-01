@@ -143,13 +143,17 @@ void EditorImGui::RenderMenuBar()
             ImGui::Separator();
             ImGui::InputText("World ID", m_serverWorldId, sizeof(m_serverWorldId));
             ImGui::InputFloat2("Player spawn X/Z (m)", m_serverWorldSpawn);
-            ImGui::TextDisabled("Spawn uses terrain; blocked or outside positions are rejected.");
+            ImGui::InputScalar("Player spawn volume", ImGuiDataType_U32, &m_serverWorldSpawnVolume);
+            ImGui::TextDisabled("Volume 0 spawns on the terrain; otherwise on that generated layer\n"
+                                "volume, where the baked capsule must fit. Blocked or outside\n"
+                                "positions are rejected.");
             if (ImGui::MenuItem("Export strict server world", nullptr, false, CanUseEditorTools()))
             {
                 m_commands.exportServerWorld = true;
                 m_commands.serverWorldId = m_serverWorldId;
                 m_commands.serverWorldSpawnX = m_serverWorldSpawn[0];
                 m_commands.serverWorldSpawnZ = m_serverWorldSpawn[1];
+                m_commands.serverWorldSpawnVolume = m_serverWorldSpawnVolume;
             }
             ImGui::Separator();
             ImGui::TextUnformatted("Support probe (offline)");

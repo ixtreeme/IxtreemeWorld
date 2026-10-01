@@ -169,6 +169,8 @@ bool ExportSceneServerWorld(const std::filesystem::path& path,
             result.errors = result.layers.errors;
             return false;
         }
+        if (options.spawnVolumeId != 0 && (!have_layers || !result.layers.world.clearance_profile))
+            return fail("a layered spawn volume needs generated layers with a clearance bake");
 
         map::PackageWriteSpec spec;
         spec.world_id = options.worldId;
@@ -187,7 +189,7 @@ bool ExportSceneServerWorld(const std::filesystem::path& path,
             return terrain.attributes.empty() ? std::uint16_t{0} :
                 terrain.attributes[static_cast<std::size_t>(terrain.cellsZ - 1u - y) * terrain.cellsX + x];
         };
-        spec.logic.spawns.push_back(map::SpawnRegion{1, 0, spawn_bounds});
+        spec.logic.spawns.push_back(map::SpawnRegion{1, 0, spawn_bounds, options.spawnVolumeId});
         spec.water_model = scene.waterBodies.empty() ? map::WaterModel::None : map::WaterModel::Bodies;
         for (const auto& water : scene.waterBodies) {
             spec.water_bodies.push_back({water.id,
@@ -221,7 +223,17 @@ bool ExportSceneServerWorld(const std::filesystem::path& path,
             if (const auto* issue = report.FirstError()) return fail("full strict package validation failed: " + issue->Format());
             return fail("full strict package validation failed without a usable world");
         }
-        if (!loaded->terrain.Cell(options.spawnX, options.spawnZ).Walkable() ||
+        if (options.spawnVolumeId != 0) {
+            // 3D-5B: the exact authored point on the chosen volume, for the
+            // package's own baked actor (the loader already proved it too).
+            const auto& layered = loaded->layered_world;
+            if (!layered || !layered->clearance_profile ||
+                !map::ResolveLayerActorPlacement(*layered,
+                    map::LayerActorProfile{layered->clearance_profile->actor_radius_m,
+                                           layered->clearance_profile->actor_height_m},
+                    options.spawnVolumeId, options.spawnX, options.spawnZ).Ok())
+                return fail("validated server package cannot place the baked actor at the exact authored layered spawn");
+        } else if (!loaded->terrain.Cell(options.spawnX, options.spawnZ).Walkable() ||
             !loaded->terrain.Height(options.spawnX, options.spawnZ).Ok())
             return fail("validated server package cannot support the exact authored spawn");
         std::string publication_error;

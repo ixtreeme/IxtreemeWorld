@@ -143,3 +143,15 @@ only across one proven portal ("ok via proven portal N"). Strict export
 writes MX3D v4; `SceneLayerGroundTest --validate-package <dir>` validates
 the profile, grids and portal crossings of an exported package. See
 `layered-3d-clearance-portal-review-20260930.md`.
+
+## Layered player spawn (3D-5B1)
+
+**Export strict server world** has a **Player spawn volume** field next to
+**Player spawn X/Z**. Volume 0 keeps the terrain spawn (the terrain cell
+must be walkable). Any other value is the id of a generated layer volume
+(as listed in the generation status): the export binds the spawn region to
+that volume, writes worldlogic v2, and both the strict loader and the
+export itself require the baked capsule to fit at the exact point. A
+layered spawn above a blocked terrain cell is valid. The gameserver then
+admits players onto that volume. See
+`layered-3d-spawn-volume-3d5b1-review-20261001.md`.

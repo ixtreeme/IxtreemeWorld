@@ -6,6 +6,7 @@
 #include <cmath>
 #include <cstdio>
 #include <filesystem>
+#include <fstream>
 #include <functional>
 #include <memory>
 #include <optional>
@@ -22,6 +23,8 @@
 #include "db/CharacterRepository.h"
 #include "map/LayerClearance.h"
 #include "map/LayeredWorldGeometry.h"
+#include "map/ServerTerrain.h"
+#include "map/WorldPackage.h"
 #include "map/WorldPackageWriter.h"
 #include "network/Session.h"
 #include "protocol/Serialization.h"
@@ -771,6 +774,126 @@ void RuntimeChecks(Checks& checks)
     sim.Stop();
 }
 
+// ---- 3D-5B: production player spawn region bound to a layered volume -------
+
+std::uint32_t WorldLogicVersion(const fs::path& package)
+{
+    std::ifstream stream(package / "worldlogic.dat", std::ios::binary);
+    unsigned char header[8] = {};
+    stream.read(reinterpret_cast<char*>(header), sizeof(header));
+    return stream ? static_cast<std::uint32_t>(header[4]) | header[5] << 8 | header[6] << 16 |
+                                        static_cast<std::uint32_t>(header[7]) << 24
+                                  : 0;
+}
+
+void LayeredSpawnChecks(Checks& checks)
+{
+    ScratchDirectory scratch;
+    map::LayeredWorld layered;
+    std::string error;
+    if (!CookFixture(layered, error)) {
+        checks.Report("spawn-fixture-cooked", false, error);
+        return;
+    }
+    const auto* floor = WalkableAt(layered, 240, 256, -1, 2);
+    const auto* bridge = WalkableAt(layered, 250, 250, 4, 7);
+    if (!floor || !bridge) {
+        checks.Report("spawn-fixture-volumes", false);
+        return;
+    }
+    auto make_spec = [&](map::SpawnRegion spawn, bool with_layers) {
+        map::PackageWriteSpec spec;
+        spec.world_id = "layeredspawn_fixture";
+        spec.world_name = "3D-5B layered spawn fixture";
+        spec.size_cells_x = spec.size_cells_y = static_cast<std::uint32_t>(kWorldSize);
+        spec.cell_size_m = 1;
+        spec.chunk_size_cells = 128;
+        spec.height_raw = [](std::uint32_t, std::uint32_t) { return 0; };
+        // The terrain under the bridge deck is blocked: only a layered spawn
+        // can be valid there.
+        spec.attributes = [](std::uint32_t x, std::uint32_t y) {
+            const bool blocked = x >= 245 && x < 255 && y >= 245 && y < 255;
+            return static_cast<std::uint16_t>(blocked ? map::CellSample::kBlocked : 0);
+        };
+        spec.logic.spawns.push_back(spawn);
+        if (with_layers) spec.layered_world = layered;
+        return spec;
+    };
+    auto load = [&](const fs::path& root, map::PackageReport& report) {
+        gs::game::WorldLoadRequest request;
+        request.package_root = root;
+        request.mob_types_config = IXTREEME_DEFAULT_MOB_TYPES_CONFIG;
+        request.depth = map::ValidationDepth::Full;
+        request.warp_policy = map::WarpPolicy::Strict;
+        return gs::game::LoadWorldPackage(request, report);
+    };
+    const map::Rect deck{249.5f, 249.5f, 250.5f, 250.5f};
+
+    // Rejections first (each its own package).
+    struct Bad {
+        const char* name;
+        map::SpawnRegion spawn;
+        map::PackageErrorCode code;
+    };
+    const Bad bad[] = {
+        {"unknown-spawn-volume-refused-at-load", {1, 0, deck, 999}, map::PackageErrorCode::WorldLogicSpawnVolumeInvalid},
+        {"spawn-centre-in-wall-refused-at-load", {1, 0, map::Rect{229.75f, 249.5f, 230.75f, 250.5f}, floor->id},
+         map::PackageErrorCode::WorldLogicSpawnVolumeInvalid},
+        {"spawn-centre-outside-its-volume-refused-at-load", {1, 0, map::Rect{99.5f, 99.5f, 100.5f, 100.5f}, bridge->id},
+         map::PackageErrorCode::WorldLogicSpawnVolumeInvalid},
+        {"terrain-spawn-on-blocked-cell-still-refused", {1, 0, deck, 0}, map::PackageErrorCode::WorldLogicSpawnBlocked},
+    };
+    int index = 0;
+    for (const auto& b : bad) {
+        const auto root = scratch.root / ("bad" + std::to_string(index++));
+        const auto written = map::WritePackage(root, make_spec(b.spawn, true));
+        map::PackageReport report;
+        const auto loaded = written.ok ? load(root, report) : std::nullopt;
+        const auto* first = report.FirstError();
+        checks.Report(b.name, written.ok && !loaded && first && first->code == b.code,
+                      first ? first->Format() : written.error);
+    }
+    const auto no_sidecar = map::WritePackage(scratch.root / "no_sidecar", make_spec({1, 0, deck, bridge->id}, false));
+    checks.Report("layered-spawn-without-sidecar-refused-by-writer", !no_sidecar.ok, no_sidecar.error);
+    const auto terrain_root = scratch.root / "terrain_spawn";
+    const auto terrain_written = map::WritePackage(terrain_root, make_spec({1, 0, map::Rect{99.5f, 99.5f, 100.5f, 100.5f}, 0}, true));
+    checks.Report("terrain-spawn-writes-worldlogic-v1",
+                  terrain_written.ok && WorldLogicVersion(terrain_root) == map::kWorldLogicFileVersion);
+
+    const auto root = scratch.root / "layered_spawn";
+    const auto written = map::WritePackage(root, make_spec({1, 0, deck, bridge->id}, true));
+    map::PackageReport report;
+    auto loaded = written.ok ? load(root, report) : std::nullopt;
+    checks.Report("layered-spawn-package-loads-strictly",
+                  loaded && report.Ok() && WorldLogicVersion(root) == map::kWorldLogicLayeredFileVersion &&
+                      loaded->logic.spawns.size() == 1 && loaded->logic.spawns[0].volume_id == bridge->id,
+                  report.FirstError() ? report.FirstError()->Format() : written.error);
+    if (!loaded) return;
+
+    IoRunner runner;
+    gs::game::PartitionLayout layout;
+    layout.regions_x = 2;
+    layout.regions_y = 1;
+    gs::game::WorldRuntime sim(runner.io, {}, std::move(*loaded), layout);
+    gs::game::PartitionConfig partition;
+    partition.scoring.adaptive_enabled = false;
+    sim.ConfigurePartition(partition);
+    // No debug override: the production player spawn rule.
+    sim.PostSpawn(DetachedSession(runner.io, 95201), MakeCharacter(50), std::nullopt);
+    sim.Start();
+    const bool entered = WaitFor(10000ms, [&] {
+        return ReadWorld(sim, [](const WorldSnapshot& snap) { return snap.owners.size(); }) == 1;
+    });
+    const auto player = ReadPlayer(sim, 95201);
+    checks.Report("production-spawn-region-admits-onto-its-volume",
+                  entered && player.found && player.layered && player.presence.volume_id == bridge->id &&
+                      player.position.x == 250.0f && player.position.y == 250.0f && player.position.z == 6.0f,
+                  Describe(player));
+    const auto audit = AuditNow(sim);
+    checks.Report("production-layered-spawn-audit", audit == "OK", audit);
+    sim.Stop();
+}
+
 } // namespace
 
 int RunLayeredPresenceScenario()
@@ -780,6 +903,7 @@ int RunLayeredPresenceScenario()
         UnitChecks(checks);
         DeterministicChecks(checks);
         RuntimeChecks(checks);
+        LayeredSpawnChecks(checks);
     } catch (const std::exception& error) {
         checks.Report("unexpected-exception", false, error.what());
     }
