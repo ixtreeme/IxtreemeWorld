@@ -9355,12 +9355,15 @@ int RunGame(NativeWindow& window,
                             (clearance.terrain_quads_tested > 0 ? " + terrain" : "") + ".";
                         status += "\nProven step/ramp portals: " + std::to_string(clearance.portals_derived) +
                             " (edges above step height: " + std::to_string(clearance.edges_rejected_step) + ").";
+                        status += "\nProven terrain edges: " + std::to_string(clearance.terrain_edges_derived) +
+                            " (volume sides level with the terrain, step <= 0.35 m).";
                         status += "\nPreview draws up to 256 volumes. Terrain retains its heightfield.";
-                        Tracenf("[LAYER-CLEARANCE] cells=%llu blocked=%llu obstruction_sources=%zu mesh_triangles=%zu terrain_quads=%llu portals=%zu rejected_steps=%zu corridor_cells=%llu corridor_blocked=%llu",
+                        Tracenf("[LAYER-CLEARANCE] cells=%llu blocked=%llu obstruction_sources=%zu mesh_triangles=%zu terrain_quads=%llu portals=%zu terrain_edges=%zu rejected_steps=%zu corridor_cells=%llu corridor_blocked=%llu",
                             static_cast<unsigned long long>(clearance.cells_total),
                             static_cast<unsigned long long>(clearance.cells_blocked),
                             layerAuthoringPreview.obstructionSources, clearance.obstruction_triangles,
                             static_cast<unsigned long long>(clearance.terrain_quads_tested), clearance.portals_derived,
+                            clearance.terrain_edges_derived,
                             clearance.edges_rejected_step, static_cast<unsigned long long>(clearance.corridor_slots),
                             static_cast<unsigned long long>(clearance.corridor_slots_blocked));
                         for (std::size_t i = 0; i < std::min<std::size_t>(8, layerAuthoringPreview.world.volumes.size()); ++i)
@@ -11154,6 +11157,31 @@ int RunGame(NativeWindow& window,
                                         {static_cast<float>(x0), static_cast<float>(a->ground_support->Height(x0, y0) + lift), static_cast<float>(y0)},
                                         {static_cast<float>(x1), static_cast<float>(a->ground_support->Height(x1, y1) + lift), static_cast<float>(y1)},
                                         green});
+                            }
+                            // 3D-5B2 proven terrain edges (cyan): one segment per
+                            // crossable slot, drawn just above the support plane.
+                            const std::array<float, 4> cyan{0.1f, 0.85f, 1.0f, 1.0f};
+                            for (const auto& edge : world.terrain_edges)
+                            {
+                                const mx::map::LayerVolume* volume = nullptr;
+                                for (const auto& candidate : world.volumes)
+                                    if (candidate.id == edge.volume_id) volume = &candidate;
+                                if (!volume || !volume->ground_support) continue;
+                                const std::uint32_t adjacent = edge.terrain_side == 0 ? 0u : edge.across - 1u;
+                                for (std::uint32_t slot = 0; slot < edge.slots; ++slot)
+                                {
+                                    if (edge.CellBlocked(slot, adjacent)) continue;
+                                    const double a0 = edge.span_min + slot * cell;
+                                    const double a1 = std::min(a0 + cell, static_cast<double>(edge.span_max));
+                                    const double x0 = edge.axis == 0 ? edge.edge : a0;
+                                    const double y0 = edge.axis == 0 ? a0 : edge.edge;
+                                    const double x1 = edge.axis == 0 ? edge.edge : a1;
+                                    const double y1 = edge.axis == 0 ? a1 : edge.edge;
+                                    selectedColliderLines.push_back({
+                                        {static_cast<float>(x0), static_cast<float>(volume->ground_support->Height(x0, y0) + 0.08), static_cast<float>(y0)},
+                                        {static_cast<float>(x1), static_cast<float>(volume->ground_support->Height(x1, y1) + 0.08), static_cast<float>(y1)},
+                                        cyan});
+                                }
                             }
                         }
                         if (layerGroundProbe && layerGroundProbe->HasState())

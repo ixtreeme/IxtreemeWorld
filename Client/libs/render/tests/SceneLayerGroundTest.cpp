@@ -583,8 +583,37 @@ void ValidateExternalClearance(const map::LayeredWorld& world)
         if (ok) ++crossed;
     }
     Check("external-every-proven-portal-crossable-by-baked-actor", crossed == proven);
+
+    // 3D-5B2: every terrain edge record has a slot the baked actor can leave
+    // through (volume side; the terrain side is the server's runtime check).
+    std::size_t exits = 0;
+    for (const auto& edge : world.terrain_edges) {
+        const map::LayerVolume* volume = nullptr;
+        for (const auto& candidate : world.volumes)
+            if (candidate.id == edge.volume_id) volume = &candidate;
+        if (!volume) continue;
+        const double inward = edge.terrain_side == 0 ? 1.0 : -1.0;
+        const std::uint32_t adjacent = edge.terrain_side == 0 ? 0u : edge.across - 1u;
+        bool ok = false;
+        for (std::uint32_t slot = 0; slot < edge.slots && !ok; ++slot) {
+            if (edge.CellBlocked(slot, adjacent)) continue;
+            const double along = std::min(static_cast<double>(edge.span_min) + (slot + 0.5) * cell,
+                                          static_cast<double>(edge.span_max) - 0.5 * cell);
+            const double from = edge.edge + inward * 0.3, to = edge.edge - inward * 0.3;
+            SceneLayerGround walker(world, SceneLayerActorProfile());
+            const auto start = edge.axis == 0 ? walker.Place(volume->id, from, along) : walker.Place(volume->id, along, from);
+            if (!start.Ok()) continue;
+            const auto exit = edge.axis == 0
+                ? map::ResolveLayerActorExitToTerrain(world, SceneLayerActorProfile(), start.state, to, along)
+                : map::ResolveLayerActorExitToTerrain(world, SceneLayerActorProfile(), start.state, along, to);
+            ok = exit.Ok() && exit.edge_id == edge.id;
+        }
+        if (ok) ++exits;
+    }
+    Check("external-every-terrain-edge-leavable-by-baked-actor", exits == world.terrain_edges.size());
     std::cout << "EXTERNAL CLEARANCE summary: graded=" << graded << " walkable=" << walkable <<
-        " proven_portals=" << proven << " crossed=" << crossed << " blocked_refused=" << blockedRefused << '\n';
+        " proven_portals=" << proven << " crossed=" << crossed << " blocked_refused=" << blockedRefused <<
+        " terrain_edges=" << world.terrain_edges.size() << " leavable=" << exits << '\n';
 }
 
 void ValidateExternalPackage(const fs::path& path)
@@ -606,7 +635,7 @@ void ValidateExternalPackage(const fs::path& path)
     const auto version = static_cast<std::uint32_t>(header[4]) |
         static_cast<std::uint32_t>(header[5]) << 8 | static_cast<std::uint32_t>(header[6]) << 16 |
         static_cast<std::uint32_t>(header[7]) << 24;
-    Check("external-editor-support-sidecar-is-mx3d-v3-or-v4",file && (version == 3 || version == 4));
+    Check("external-editor-support-sidecar-is-mx3d-v3-to-v5",file && version >= 3 && version <= 5);
     const auto& world = *loaded->layered_world;
     SceneLayerGround adapter(world);
     std::size_t supported = 0, unavailable = 0, unsupported = 0;
@@ -667,7 +696,7 @@ void ValidateExternalPackage(const fs::path& path)
         SameState(unknown.state,previous) && SameState(adapter.State(),previous));
     std::cout << "EXTERNAL SUPPORT summary: volumes=" << world.volumes.size() << " supported=" << supported <<
         " unavailable=" << unavailable << " unsupported=" << unsupported << " MX3D=" << version << '\n';
-    if (version == 4) ValidateExternalClearance(world);
+    if (version >= 4) ValidateExternalClearance(world);
 }
 
 } // namespace

@@ -150,6 +150,30 @@ bool LayerPortalProof::CellBlocked(std::uint32_t slot, std::uint32_t across_cell
     return BitSet(blocked, static_cast<std::uint64_t>(slot) * across + across_cell);
 }
 
+bool LayerTerrainEdge::CellBlocked(std::uint32_t slot, std::uint32_t across_cell) const noexcept
+{
+    if (slot >= slots || across_cell >= across) return true;
+    return BitSet(blocked, static_cast<std::uint64_t>(slot) * across + across_cell);
+}
+
+void LayerTerrainEdgeCorridorAcross(const LayerTerrainEdge& edge,
+                                    const LayerVolume& volume,
+                                    const LayerClearanceProfile& profile,
+                                    double& across0,
+                                    double& across1) noexcept
+{
+    const double reach = static_cast<double>(profile.actor_radius_m) + static_cast<double>(profile.cell_size_m);
+    const double min = edge.axis == 0 ? volume.bounds.min_x : volume.bounds.min_y;
+    const double max = edge.axis == 0 ? volume.bounds.max_x : volume.bounds.max_y;
+    if (edge.terrain_side == 0) {
+        across0 = edge.edge;
+        across1 = std::min(static_cast<double>(edge.edge) + reach, max);
+    } else {
+        across0 = std::max(static_cast<double>(edge.edge) - reach, min);
+        across1 = edge.edge;
+    }
+}
+
 void LayerPortalCorridorAcross(const LayerPortalProof& proof,
                                const LayerVolume& a,
                                const LayerVolume& b,
@@ -279,7 +303,7 @@ bool LayeredWorld::Validate(const Rect& world_bounds, std::string& error) const
         return false;
     }
     if (volumes.empty()) {
-        if (!portals.empty() || clearance_profile) {
+        if (!portals.empty() || clearance_profile || !terrain_edges.empty()) {
             error = "layered-world portals and clearance require at least one volume";
             return false;
         }
@@ -345,7 +369,8 @@ bool LayeredWorld::Validate(const Rect& world_bounds, std::string& error) const
     // ---- 3D-4B clearance and transition proofs ----
     const bool any_proof =
         std::any_of(volumes.begin(), volumes.end(), [](const LayerVolume& v) { return v.clearance.has_value(); }) ||
-        std::any_of(portals.begin(), portals.end(), [](const LayerPortal& p) { return p.proof.has_value(); });
+        std::any_of(portals.begin(), portals.end(), [](const LayerPortal& p) { return p.proof.has_value(); }) ||
+        !terrain_edges.empty();
     if (clearance_profile.has_value() != any_proof) {
         error = clearance_profile ? "layered-world clearance profile has no clearance data"
                                   : "layered-world clearance data requires a clearance profile";
@@ -393,6 +418,69 @@ bool LayeredWorld::Validate(const Rect& world_bounds, std::string& error) const
         if (!why.empty() || !ProofGeometryValid(portal, *source, *target, profile, why)) {
             error = "layered-world portal " + std::to_string(portal.id) + " transition proof is invalid: " + why;
             return false;
+        }
+    }
+
+    // ---- 3D-5B2 terrain edges ----
+    if (terrain_edges.size() > kMaxLayerTerrainEdges) {
+        error = "layered-world terrain edges exceed the limit";
+        return false;
+    }
+    std::unordered_set<std::uint32_t> edge_ids;
+    for (std::size_t i = 0; i < terrain_edges.size(); ++i) {
+        const auto& edge = terrain_edges[i];
+        const std::string label = "layered-world terrain edge " + std::to_string(edge.id);
+        if (edge.id == 0 || !edge_ids.insert(edge.id).second) {
+            error = label + " id must be non-zero and unique";
+            return false;
+        }
+        const auto* volume = FindById(volumes, edge.volume_id);
+        if (volume == nullptr || !volume->clearance || !volume->AllowsGroundMovement()) {
+            error = label + " needs a walkable volume with clearance";
+            return false;
+        }
+        if (edge.axis > 1 || edge.terrain_side > 1 || !Finite(edge.edge) || !Finite(edge.span_min) ||
+            !Finite(edge.span_max) || !(edge.span_min < edge.span_max)) {
+            error = label + " has invalid geometry";
+            return false;
+        }
+        const float min = edge.axis == 0 ? volume->bounds.min_x : volume->bounds.min_y;
+        const float max = edge.axis == 0 ? volume->bounds.max_x : volume->bounds.max_y;
+        const float other_min = edge.axis == 0 ? volume->bounds.min_y : volume->bounds.min_x;
+        const float other_max = edge.axis == 0 ? volume->bounds.max_y : volume->bounds.max_x;
+        if (edge.edge != (edge.terrain_side == 0 ? min : max) || edge.span_min < other_min ||
+            edge.span_max > other_max) {
+            error = label + " is not on its volume's footprint boundary";
+            return false;
+        }
+        const float world_min = edge.axis == 0 ? world_bounds.min_x : world_bounds.min_y;
+        const float world_max = edge.axis == 0 ? world_bounds.max_x : world_bounds.max_y;
+        if (edge.terrain_side == 0 ? !(edge.edge > world_min) : !(edge.edge < world_max)) {
+            error = label + " has its terrain side outside the world";
+            return false;
+        }
+        double across0 = 0.0, across1 = 0.0;
+        LayerTerrainEdgeCorridorAcross(edge, *volume, profile, across0, across1);
+        const std::uint64_t cells = static_cast<std::uint64_t>(edge.slots) * edge.across;
+        if (edge.slots != LayerClearanceCellCount(edge.span_min, edge.span_max, profile.cell_size_m) ||
+            edge.across != LayerClearanceCellCount(across0, across1, profile.cell_size_m) || cells == 0 ||
+            cells > kMaxLayerClearanceCellsPerVolume || !BitsetShapeValid(edge.blocked, cells)) {
+            error = label + " corridor grid does not match its edge and band";
+            return false;
+        }
+        if (!std::isfinite(edge.max_step_m) || edge.max_step_m < 0.0 ||
+            edge.max_step_m > static_cast<double>(profile.step_height_m)) {
+            error = label + " step exceeds the profile";
+            return false;
+        }
+        for (std::size_t j = 0; j < i; ++j) {
+            const auto& other = terrain_edges[j];
+            if (other.volume_id == edge.volume_id && other.axis == edge.axis && other.edge == edge.edge &&
+                other.terrain_side == edge.terrain_side && edge.span_min < other.span_max &&
+                other.span_min < edge.span_max) {
+                error = label + " overlaps terrain edge " + std::to_string(other.id);
+                return false;
+            }
         }
     }
     return true;
@@ -611,11 +699,23 @@ std::vector<std::uint8_t> EncodeLayeredWorld(const LayeredWorld& world)
     if (v4 && !world.clearance_profile->Valid()) {
         return {};
     }
+    // Version 5 only when terrain edges exist (3D-5B2); they need the profile.
+    const bool v5 = !world.terrain_edges.empty();
+    if (v5 && (!v4 || world.terrain_edges.size() > kMaxLayerTerrainEdges)) {
+        return {};
+    }
+    for (const auto& edge : world.terrain_edges) {
+        if (edge.axis > 1 || edge.terrain_side > 1 ||
+            !BitsetShapeValid(edge.blocked, static_cast<std::uint64_t>(edge.slots) * edge.across)) {
+            return {};
+        }
+    }
 
     std::vector<std::uint8_t> out;
     out.reserve(16 + world.volumes.size() * 40 + world.portals.size() * 60);
     PutU32(out, kLayeredWorldFileMagic);
-    PutU32(out, v4 ? kLayeredWorldFileVersion : kLayeredWorldSupportFileVersion);
+    PutU32(out, v5 ? kLayeredWorldTerrainEdgeFileVersion
+                   : (v4 ? kLayeredWorldFileVersion : kLayeredWorldSupportFileVersion));
     PutU32(out, static_cast<std::uint32_t>(world.volumes.size()));
     PutU32(out, static_cast<std::uint32_t>(world.portals.size()));
     if (v4) {
@@ -695,6 +795,23 @@ std::vector<std::uint8_t> EncodeLayeredWorld(const LayeredWorld& world)
             }
         }
     }
+    if (v5) {
+        PutU32(out, static_cast<std::uint32_t>(world.terrain_edges.size()));
+        for (const auto& edge : world.terrain_edges) {
+            PutU32(out, edge.id);
+            PutU32(out, edge.volume_id);
+            PutU8(out, edge.axis);
+            PutU8(out, edge.terrain_side);
+            PutU16(out, 0);
+            PutF32(out, edge.edge);
+            PutF32(out, edge.span_min);
+            PutF32(out, edge.span_max);
+            PutF64(out, edge.max_step_m);
+            PutU32(out, edge.slots);
+            PutU32(out, edge.across);
+            out.insert(out.end(), edge.blocked.begin(), edge.blocked.end());
+        }
+    }
     if (out.size() > kMaxLayeredWorldFileBytes) {
         return {};
     }
@@ -723,7 +840,7 @@ bool DecodeLayeredWorld(const std::vector<std::uint8_t>& bytes, LayeredWorld& wo
         error = "layered-world sidecar magic is invalid";
         return false;
     }
-    if (version < kLayeredWorldFileMinVersion || version > kLayeredWorldFileVersion) {
+    if (version < kLayeredWorldFileMinVersion || version > kLayeredWorldTerrainEdgeFileVersion) {
         error = "layered-world sidecar version " + std::to_string(version) + " is unsupported";
         return false;
     }
@@ -892,6 +1009,43 @@ bool DecodeLayeredWorld(const std::vector<std::uint8_t>& bytes, LayeredWorld& wo
             }
         }
         decoded.portals.push_back(std::move(portal));
+    }
+    if (version >= kLayeredWorldTerrainEdgeFileVersion) {
+        std::uint32_t edge_count = 0;
+        if (!cursor.U32(edge_count)) {
+            error = "layered-world terrain edge count is truncated";
+            return false;
+        }
+        if (edge_count == 0 || edge_count > kMaxLayerTerrainEdges ||
+            static_cast<std::uint64_t>(edge_count) * 44u > cursor.Remaining()) {
+            error = "layered-world terrain edge count exceeds the limit";
+            return false;
+        }
+        decoded.terrain_edges.reserve(edge_count);
+        for (std::uint32_t i = 0; i < edge_count; ++i) {
+            LayerTerrainEdge edge;
+            std::uint16_t reserved = 0;
+            if (!cursor.U32(edge.id) || !cursor.U32(edge.volume_id) || !cursor.U8(edge.axis) ||
+                !cursor.U8(edge.terrain_side) || !cursor.U16(reserved) || !cursor.F32(edge.edge) ||
+                !cursor.F32(edge.span_min) || !cursor.F32(edge.span_max) || !cursor.F64(edge.max_step_m) ||
+                !cursor.U32(edge.slots) || !cursor.U32(edge.across)) {
+                error = "layered-world terrain edge " + std::to_string(i) + " is truncated";
+                return false;
+            }
+            if (edge.axis > 1 || edge.terrain_side > 1 || reserved != 0) {
+                error = "layered-world terrain edge " + std::to_string(i) + " has unsupported flags";
+                return false;
+            }
+            const std::uint64_t cells = static_cast<std::uint64_t>(edge.slots) * edge.across;
+            if (cells == 0 || cells > kMaxLayerClearanceCellsPerVolume || BitBytes(cells) > cursor.Remaining()) {
+                error = "layered-world terrain edge " + std::to_string(i) + " has an invalid size";
+                return false;
+            }
+            std::string raw;
+            cursor.Text(BitBytes(cells), raw);
+            edge.blocked.assign(raw.begin(), raw.end());
+            decoded.terrain_edges.push_back(std::move(edge));
+        }
     }
     if (cursor.Remaining() != 0) {
         error = "layered-world sidecar has trailing bytes at offset " + std::to_string(cursor.Offset());

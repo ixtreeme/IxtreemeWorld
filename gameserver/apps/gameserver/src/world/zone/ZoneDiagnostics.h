@@ -33,6 +33,9 @@ struct ZoneDiagnostics {
     std::atomic<std::uint64_t> layered_moves_transition_total{0};
     std::atomic<std::uint64_t> layered_moves_invalid_total{0};
     std::atomic<std::uint64_t> layered_portal_crossings_total{0};
+    // 3D-5B2: accepted crossings over proven terrain edges.
+    std::atomic<std::uint64_t> layered_terrain_exits_total{0};
+    std::atomic<std::uint64_t> layered_terrain_entries_total{0};
     std::atomic<std::uint64_t> ticks_since_diag{0};
     std::atomic<std::uint64_t> transform_records_since_diag{0};
     std::atomic<std::uint64_t> empty_skips_since_diag{0};

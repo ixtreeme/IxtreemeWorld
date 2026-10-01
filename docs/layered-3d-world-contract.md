@@ -206,9 +206,36 @@ layered spawn without a v3 package and sidecar. The server's player spawn
 rule places players on that volume (no terrain fallback); the editor export
 takes a "Player spawn volume".
 
-Not yet: there is no terrain↔volume transition (3D-5B2), mob spawn points
-are terrain-only, transform frames do not signal volume changes (protocol
-version bump) and no client consumes the new fields (3D-5C).
+**3D-5B2 (proven terrain↔volume transitions, done).** The clearance cook
+also proves `LayerTerrainEdge`s when the terrain height grid is given: one
+record per volume footprint side whose terrain lies within the profile step
+of the support plane along some part of the side (conservative quad-corner
+bounds; slots owned by a proven volume-volume portal are excluded). The
+record spans the whole side; a volume-side corridor (radius + cell inward)
+marks per cell whether the capsule is free above the upper envelope of the
+plane and the local terrain maximum, and every slot that failed the step
+test keeps all its cells blocked. A side with no crossable edge cell gets
+no record. Terrain edges make the sidecar **MX3D v5** (count + records
+after the portals); worlds without them stay v4/v3 byte-identical. A cell
+inside a clear terrain-edge corridor is passable for its volume.
+
+`ResolveLayerActorExitToTerrain` (layered actor to a point outside its
+footprint) and `ResolveLayerActorEnterFromTerrain` (terrain actor into a
+footprint) prove only the volume side: the first terrain edge crossed
+inside its span, the edge-adjacent corridor cell at the crossing clear, the
+volume part of the segment passable and, on entry, the actor placeable at
+the target. The gameserver adds the terrain side from its authoritative
+terrain: a clear terrain path between the crossing point and the terrain
+end, and the terrain height at the crossing within the step of the plane
+(a non-resident chunk is demanded and the crossing waits). Players may
+enter; layered players and mobs may leave; terrain mobs never enter.
+Proven volume portals are always tried before a terrain exit.
+
+Not yet: terrain entities still have no model collision (a terrain player
+blocked from entering at a walled side keeps walking on the terrain under
+the floor, as before), mob spawn points are terrain-only, transform frames
+do not signal volume changes (protocol version bump) and no client
+consumes the new fields (3D-5C).
 
 No layer-aware production path should be enabled before the fixture and
 contract tests prove deterministic lookup, non-overlap, portal validation,

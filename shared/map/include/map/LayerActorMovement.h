@@ -35,4 +35,38 @@ LayerGroundResult ResolveLayerActorMove(const LayeredWorld& world,
     const LayerActorProfile& actor, const LayerGroundState& current,
     VolumeId target_volume, double x, double y) noexcept;
 
+// 3D-5B2: an actor crossing a proven terrain edge. Ok proves the VOLUME side
+// only; the caller, which owns the terrain, must still check the terrain
+// side: known and walkable terrain, a clear terrain path, and a terrain
+// height at the crossing within `step_m` of `plane_z`.
+struct LayerTerrainCrossing {
+    GroundSupportStatus status = GroundSupportStatus::NotAvailable;
+    std::uint32_t edge_id = 0;
+    VolumeId volume_id = 0;
+    LayerId layer_id = 0;
+    double x = 0.0; // crossing point on the edge
+    double y = 0.0;
+    double plane_z = 0.0; // support height at the crossing point
+    double step_m = 0.0;  // the profile step height
+    LayerGroundState inside; // enter only: the grounded pose at the target
+
+    bool Ok() const noexcept { return status == GroundSupportStatus::Ok; }
+};
+
+// A grounded actor on `current` moving to (x, y) OUTSIDE its volume's
+// footprint: Ok when the segment first leaves through a terrain edge of that
+// volume inside its span, the edge-adjacent corridor cell there is proven
+// clear and the volume part of the segment is passable. TransitionRequired
+// when no terrain edge is crossed, Blocked when the crossing is not proven.
+LayerTerrainCrossing ResolveLayerActorExitToTerrain(const LayeredWorld& world,
+    const LayerActorProfile& actor, const LayerGroundState& current, double x, double y) noexcept;
+
+// A terrain actor at (from_x, from_y), outside the footprint it enters,
+// moving to (x, y): Ok when the segment first enters a volume through one of
+// its terrain edges (from the terrain side), the edge-adjacent corridor cell
+// is proven clear, the volume part is passable and the actor fits at (x, y).
+// NotAvailable when no terrain edge is entered (stay a terrain actor).
+LayerTerrainCrossing ResolveLayerActorEnterFromTerrain(const LayeredWorld& world,
+    const LayerActorProfile& actor, double from_x, double from_y, double x, double y) noexcept;
+
 } // namespace mx::map

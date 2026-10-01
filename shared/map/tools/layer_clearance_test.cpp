@@ -277,8 +277,29 @@ bool OracleFree(const std::vector<OraclePlane>& planes, const LayerClearanceProf
     return true;
 }
 
-// Samples 5 x 5 centres of every clear cell of every volume, and of every
-// clear corridor cell (step zone, upper envelope), against the oracle.
+// Highest terrain vertex of the quads a square of half-size `r` around the
+// point touches: an upper bound of the ground under the capsule footprint.
+double TerrainCeilingNear(const LayerTerrainObstruction& t, double x, double y, double r)
+{
+    const auto clamp_index = [&](double v, double origin, std::uint32_t cells) {
+        return static_cast<std::uint32_t>(std::clamp(std::floor((v - origin) / t.cell_size), 0.0,
+                                                     static_cast<double>(cells - 1)));
+    };
+    const auto i0 = clamp_index(x - r, t.origin_x, t.cells_x), i1 = clamp_index(x + r, t.origin_x, t.cells_x);
+    const auto j0 = clamp_index(y - r, t.origin_y, t.cells_y), j1 = clamp_index(y + r, t.origin_y, t.cells_y);
+    double top = -1e300;
+    for (std::uint32_t j = j0; j <= j1 + 1; ++j) {
+        for (std::uint32_t i = i0; i <= i1 + 1; ++i) {
+            top = std::max(top, static_cast<double>(t.heights[j * (t.cells_x + 1) + i]));
+        }
+    }
+    return top;
+}
+
+// Samples 5 x 5 centres of every clear cell of every volume, of every clear
+// corridor cell (step zone, upper envelope) and of every clear terrain-edge
+// corridor cell (envelope of the plane and the local terrain), against the
+// oracle.
 struct OracleResult {
     std::uint64_t samples = 0;
     std::uint64_t violations = 0;
@@ -338,6 +359,35 @@ OracleResult RunOracle(const Built& built, const LayerTerrainObstruction* terrai
                                         tris, result.closest)) {
                             ++result.violations;
                         }
+                    }
+                }
+            }
+        }
+    }
+    for (const auto& edge : built.world.terrain_edges) {
+        if (terrain == nullptr) {
+            ++result.violations; // a terrain edge without terrain data is never valid
+            continue;
+        }
+        const LayerVolume* volume = nullptr;
+        for (const auto& v : built.world.volumes) {
+            if (v.id == edge.volume_id) volume = &v;
+        }
+        double across0 = 0, across1 = 0;
+        LayerTerrainEdgeCorridorAcross(edge, *volume, profile, across0, across1);
+        const auto plane = PlaneOf(*volume->ground_support);
+        for (std::uint32_t s = 0; s < edge.slots; ++s) {
+            for (std::uint32_t c = 0; c < edge.across; ++c) {
+                if (edge.CellBlocked(s, c)) continue;
+                const double l0 = edge.span_min + s * g, l1 = std::min(l0 + g, static_cast<double>(edge.span_max));
+                const double c0 = across0 + c * g, c1 = std::min(c0 + g, across1);
+                for (int u = 0; u <= 4; ++u) {
+                    for (int w = 0; w <= 4; ++w) {
+                        const double along = l0 + (l1 - l0) * u / 4, acr = c0 + (c1 - c0) * w / 4;
+                        const double px = edge.axis == 0 ? acr : along, py = edge.axis == 0 ? along : acr;
+                        const OraclePlane ground{0.0, 0.0, TerrainCeilingNear(*terrain, px, py, profile.actor_radius_m), 1.0};
+                        ++result.samples;
+                        if (!OracleFree({plane, ground}, profile, px, py, tris, result.closest)) ++result.violations;
                     }
                 }
             }
@@ -671,6 +721,122 @@ int main()
         Check("terrain-below-floor-clear", v && v->clearance && !blocked(2, 2) && !blocked(14, 14));
         Check("terrain-quads-tested", built.report.terrain_quads_tested > 0);
         if (built.ok) oracle("terrain", built, &*terrainScene.terrain);
+    }
+
+    // ---------- 9b. terrain edges (3D-5B2) ----------
+    {
+        LayerTerrainObstruction flat;
+        flat.origin_x = 0;
+        flat.origin_y = 0;
+        flat.cell_size = 4; // coarse: the brute-force oracle visits every terrain triangle
+        flat.cells_x = 16;
+        flat.cells_y = 16;
+        flat.heights.assign(17 * 17, 0.0f);
+        Scene platform;
+        platform.layers.push_back(Box(1, 20, 20, -1, 30, 30, 0.2f));        // 0.2 m above the terrain
+        platform.blockers.push_back(Box(9, 20, 29.7f, 0.2f, 30, 30, 2.2f)); // wall along the north edge
+        platform.blockers.push_back(Box(10, 29.7f, 20, 0.2f, 30, 24, 2.2f)); // short wall on the east edge
+        platform.terrain = flat;
+        const auto built = Build(platform);
+        const auto* v = built.ok ? VolumeAt(built.world, 25, 25, 0.2) : nullptr;
+        const auto find_edge = [&](std::uint8_t axis, std::uint8_t side) -> const LayerTerrainEdge* {
+            for (const auto& e : built.world.terrain_edges) {
+                if (e.axis == axis && e.terrain_side == side) return &e;
+            }
+            return nullptr;
+        };
+        const auto* west = find_edge(0, 0);
+        const auto* north = find_edge(1, 1);
+        const auto* east = find_edge(0, 1);
+        Check("terrain-edges-on-open-sides-none-on-walled-side",
+              v && built.world.terrain_edges.size() == 3 && built.report.terrain_edges_derived == 3 && west && east &&
+                  north == nullptr &&
+                  std::abs(west->max_step_m - 0.2) < 1e-6 && west->edge == 20.0f && west->span_min == 20.0f &&
+                  west->span_max == 30.0f,
+              built.error);
+        Check("terrain-edge-cell-at-open-side-clear", west && !west->CellBlocked(20, 0));
+        // East: slots along the short wall (y 20..24 + radius) are blocked, the
+        // rest of the side stays crossable.
+        Check("terrain-edge-partially-walled-side",
+              east && east->CellBlocked(4, east->across - 1) && east->CellBlocked(15, east->across - 1) &&
+                  !east->CellBlocked(28, east->across - 1));
+        if (built.ok) oracle("terrain-edges", built, &*platform.terrain);
+
+        const auto start = v ? ResolveLayerActorPlacement(built.world, actor, v->id, 25, 25) : LayerGroundResult{};
+        const auto exit_west = ResolveLayerActorExitToTerrain(built.world, actor, start.state, 19.8, 25);
+        Check("exit-to-terrain-across-open-edge",
+              start.Ok() && exit_west.Ok() && exit_west.x == 20.0 && exit_west.y == 25.0 &&
+                  exit_west.plane_z == static_cast<double>(0.2f) && exit_west.step_m == profile.step_height_m &&
+                  exit_west.edge_id == west->id,
+              ToString(exit_west.status));
+        const auto near_wall = v ? ResolveLayerActorPlacement(built.world, actor, v->id, 25, 29.0) : LayerGroundResult{};
+        Check("exit-through-wall-edge-refused",
+              ResolveLayerActorExitToTerrain(built.world, actor, near_wall.Ok() ? near_wall.state : start.state, 25,
+                                             30.3).status == GroundSupportStatus::TransitionRequired);
+        Check("exit-target-inside-footprint-is-not-an-exit",
+              ResolveLayerActorExitToTerrain(built.world, actor, start.state, 26, 25).status ==
+                  GroundSupportStatus::TransitionRequired);
+        const auto enter = ResolveLayerActorEnterFromTerrain(built.world, actor, 19.0, 25.0, 20.5, 25.0);
+        Check("enter-from-terrain-across-open-edge",
+              enter.Ok() && enter.volume_id == v->id && enter.inside.volume_id == v->id && enter.inside.x == 20.5 &&
+                  enter.inside.z == static_cast<double>(0.2f) && enter.x == 20.0,
+              ToString(enter.status));
+        Check("enter-through-wall-edge-refused",
+              ResolveLayerActorEnterFromTerrain(built.world, actor, 25.0, 30.5, 25.0, 29.5).status ==
+                  GroundSupportStatus::NotAvailable);
+        Check("enter-at-partially-walled-slot-blocked",
+              ResolveLayerActorEnterFromTerrain(built.world, actor, 30.5, 22.0, 29.5, 22.0).status ==
+                  GroundSupportStatus::Blocked);
+        Check("enter-at-open-part-of-partially-walled-side",
+              ResolveLayerActorEnterFromTerrain(built.world, actor, 30.5, 27.0, 29.5, 27.0).Ok());
+        Check("terrain-move-not-entering-is-not-available",
+              ResolveLayerActorEnterFromTerrain(built.world, actor, 5.0, 5.0, 6.0, 5.0).status ==
+                  GroundSupportStatus::NotAvailable);
+        Check("enter-from-inside-is-not-an-entry",
+              ResolveLayerActorEnterFromTerrain(built.world, actor, 25.0, 25.0, 26.0, 25.0).status ==
+                  GroundSupportStatus::NotAvailable);
+
+        // Codec: version 5 round trip; tampering is refused.
+        const auto bytes = EncodeLayeredWorld(built.world);
+        LayeredWorld decoded;
+        std::string error;
+        const bool round = DecodeLayeredWorld(bytes, decoded, error) &&
+                           decoded.Validate(platform.bounds, error) && EncodeLayeredWorld(decoded) == bytes;
+        Check("terrain-edges-encode-mx3d-v5-and-round-trip",
+              Version(bytes) == kLayeredWorldTerrainEdgeFileVersion && round, error);
+        auto tamper = [&](const char* name, auto&& damage) {
+            LayeredWorld copy = built.world;
+            damage(copy);
+            std::string why;
+            Check(name, !copy.Validate(platform.bounds, why), why);
+        };
+        tamper("tamper-terrain-edge-off-boundary", [](LayeredWorld& w) { w.terrain_edges[0].edge += 0.5f; });
+        tamper("tamper-terrain-edge-step-above-profile", [](LayeredWorld& w) { w.terrain_edges[0].max_step_m = 0.5; });
+        tamper("tamper-terrain-edge-span-outside-footprint", [](LayeredWorld& w) { w.terrain_edges[0].span_max += 1; });
+        tamper("tamper-terrain-edge-duplicate-id", [](LayeredWorld& w) { w.terrain_edges[1].id = w.terrain_edges[0].id; });
+        tamper("tamper-terrain-edge-without-profile", [](LayeredWorld& w) {
+            for (auto& volume : w.volumes) volume.clearance.reset();
+            w.portals.clear();
+            w.clearance_profile.reset();
+        });
+        LayeredWorld rejected;
+        Check("decode-rejects-truncated-terrain-edges",
+              !DecodeLayeredWorld(std::vector<std::uint8_t>(bytes.begin(), bytes.end() - 3), rejected, error));
+        Check("cooking-terrain-edges-is-deterministic", EncodeLayeredWorld(Build(platform).world) == bytes);
+
+        Scene high = platform;
+        high.layers[0] = Box(1, 20, 20, -1, 30, 30, 0.5f); // 0.5 m: above the step
+        const auto high_built = Build(high);
+        Check("too-high-platform-has-no-terrain-edges-and-stays-v4",
+              high_built.ok && high_built.world.terrain_edges.empty() &&
+                  Version(EncodeLayeredWorld(high_built.world)) == kLayeredWorldFileVersion,
+              high_built.error);
+        Check("no-terrain-edge-without-terrain-data", [&] {
+            Scene none = platform;
+            none.terrain.reset();
+            const auto b = Build(none);
+            return b.ok && b.world.terrain_edges.empty();
+        }());
     }
 
     // ---------- 10. codec, validation, determinism ----------

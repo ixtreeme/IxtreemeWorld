@@ -155,3 +155,16 @@ export itself require the baked capsule to fit at the exact point. A
 layered spawn above a blocked terrain cell is valid. The gameserver then
 admits players onto that volume. See
 `layered-3d-spawn-volume-3d5b1-review-20261001.md`.
+
+## Proven terrain edges (3D-5B2)
+
+**Generate layers from collision** also proves terrain edges for every
+generated volume side that is level with the terrain (within the 0.35 m
+step), excluding sides owned by a proven volume portal and sides whose
+edge cells are all blocked (a wall standing on them). The status line
+reports "Proven terrain edges: N"; **Show layer volumes** draws every
+crossable edge slot in cyan. The gameserver lets players step from the
+terrain onto such a volume and back. A floor 1 m above the terrain gets no
+terrain edge (use stairs/ramps: proven portals). Exported sidecars with
+terrain edges are MX3D v5. See
+`layered-3d-terrain-edges-3d5b2-review-20261001.md`.

@@ -40,6 +40,7 @@ struct LayerClearanceReport {
     std::size_t obstruction_triangles = 0;
     std::uint64_t terrain_quads_tested = 0;
     std::size_t portals_derived = 0;
+    std::size_t terrain_edges_derived = 0; // 3D-5B2 volume-to-terrain edges
     std::size_t edges_rejected_step = 0;
     std::uint64_t corridor_slots = 0;
     std::uint64_t corridor_slots_blocked = 0;

@@ -296,6 +296,17 @@ void TestGenerationAndServer(const TemporaryWorkspace& workspace)
     Check("actual-centered-engine-terrain-bounds-retained", result.worldBounds.min_x == -16 && result.worldBounds.min_y == -16 &&
         result.worldBounds.max_x == 16 && result.worldBounds.max_y == 16);
     Check("no-inferred-portals", result.world.portals.empty());
+    {
+        // 3D-5B2: the ground floor sits exactly on the flat terrain, so each of
+        // its four sides is a proven terrain edge; the bridge (6 m up) and the
+        // underpass (6 m down) are not within the step of the terrain.
+        const auto* groundVolume = Volume(result.world, map::VolumeTagGround | map::VolumeTagRoad);
+        const bool groundOnly = groundVolume && std::all_of(result.world.terrain_edges.begin(),
+            result.world.terrain_edges.end(), [&](const auto& edge) { return edge.volume_id == groundVolume->id; });
+        Check("ground-level-floor-gets-four-terrain-edges", result.world.terrain_edges.size() == 4 && groundOnly &&
+            result.clearance.terrain_edges_derived == 4);
+        std::cout << "terrain edges: " << result.world.terrain_edges.size() << '\n';
+    }
     const auto* ground = Volume(result.world, map::VolumeTagGround | map::VolumeTagRoad);
     const auto* underpass = Volume(result.world, map::VolumeTagConnector | map::VolumeTagRoad);
     const auto* upper = Volume(result.world, map::VolumeTagBridge | map::VolumeTagConnector);

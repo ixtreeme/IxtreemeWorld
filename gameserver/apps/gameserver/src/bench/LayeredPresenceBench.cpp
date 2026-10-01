@@ -774,6 +774,216 @@ void RuntimeChecks(Checks& checks)
     sim.Stop();
 }
 
+// ---- 3D-5B2: proven terrain <-> volume transitions --------------------------
+
+// A platform 0.2 m above flat terrain with a wall along its north edge,
+// cooked WITH the terrain so its level sides become proven terrain edges.
+bool CookPlatform(map::LayeredWorld& world, std::string& error)
+{
+    std::vector<map::LayerCollisionMesh> walkable{Box(21, 100, 100, -1, 110, 110, 0.2f)};
+    const auto wall = Box(29, 100, 109.7f, 0.2f, 110, 110, 2.2f);
+    std::vector<map::LayerSourceSurface> surfaces;
+    map::LayerGeometryReport geometry;
+    if (!map::ExtractLayerSourceSurfaces(walkable, {}, surfaces, geometry)) {
+        error = geometry.errors.empty() ? "extract" : geometry.errors.front();
+        return false;
+    }
+    map::LayerGenerationOptions options;
+    options.world_bounds = map::Rect{0, 0, kWorldSize, kWorldSize};
+    options.require_exact_footprints = true;
+    map::LayerGenerationReport generation;
+    if (!map::GenerateLayeredWorld(surfaces, options, world, generation)) {
+        error = generation.errors.empty() ? "generate" : generation.errors.front();
+        return false;
+    }
+    map::LayerTerrainObstruction terrain;
+    terrain.cell_size = 8;
+    terrain.cells_x = terrain.cells_y = static_cast<std::uint32_t>(kWorldSize / 8);
+    terrain.heights.assign(static_cast<std::size_t>(terrain.cells_x + 1) * (terrain.cells_y + 1), 0.0f);
+    std::vector<map::LayerObstructionMesh> obstructions{{walkable[0].source_id, walkable[0].vertices, walkable[0].indices},
+                                                       {wall.source_id, wall.vertices, wall.indices}};
+    map::LayerClearanceReport report;
+    if (!map::CookLayerClearance(world, options.world_bounds, obstructions, &terrain, map::LayerClearanceProfile{},
+                                 report)) {
+        error = report.errors.empty() ? "cook" : report.errors.front();
+        return false;
+    }
+    return true;
+}
+
+void TerrainEdgeDeterministicChecks(Checks& checks)
+{
+    using namespace gs::game;
+    map::LayeredWorld layered;
+    std::string error;
+    const bool cooked = CookPlatform(layered, error);
+    checks.Report("terrain-edge-platform-cooked-open-sides-only", cooked && layered.terrain_edges.size() == 3, error);
+    const auto* platform = cooked ? WalkableAt(layered, 105, 105, -1, 1) : nullptr;
+    ZoneFixture fixture;
+    if (!platform || !fixture.Build()) return;
+    auto& zone = fixture.zones.GetZone(0);
+    ZoneTickContext ctx{fixture.terrain, fixture.logic, fixture.types, fixture.zones};
+    ctx.layered = &layered;
+    ctx.layer_actor = {layered.clearance_profile->actor_radius_m, layered.clearance_profile->actor_height_m};
+    auto& diag = zone.Diagnostics();
+    auto spawn_terrain = [&](std::uint32_t net, float x, float y) {
+        ZoneWriteGuard guard(zone, "terrain edge spawn");
+        SpawnSystem::SpawnPlayer(zone, DetachedSession(fixture.io, net), MakeCharacter(net), Position{x, y, 0.0f}, net);
+        return zone.FindEntity(net);
+    };
+    auto steer = [&](flecs::entity entity, float heading) {
+        ZoneWriteGuard guard(zone, "terrain edge input");
+        entity.set<MoveIntent>({heading, MoveState::Running, 0});
+    };
+    auto tick = [&](int ticks) {
+        for (int i = 0; i < ticks; ++i) {
+            ZoneWriteGuard guard(zone, "terrain edge tick");
+            MovementSystem::Step(zone, 0.05f, ctx);
+        }
+    };
+    constexpr float kEast = 1.5707963f, kSouth = 3.14159265f;
+
+    // Walk east across the platform: enter over the west edge, leave over
+    // the east edge, z following terrain -> plane -> terrain.
+    const auto walker = spawn_terrain(601, 95.0f, 105.0f);
+    steer(walker, kEast);
+    bool entered = false, on_plane = true;
+    for (int i = 0; i < 80; ++i) {
+        tick(1);
+        if (const auto* presence = walker.try_get<LayerPresence>()) {
+            entered = true;
+            on_plane = on_plane && presence->volume_id == platform->id && walker.get<Position>().z == 0.2f;
+        }
+    }
+    const auto after = walker.get<Position>();
+    checks.Report("terrain-player-enters-and-leaves-platform-over-proven-edges",
+                  entered && on_plane && !walker.has<LayerPresence>() && after.x > 112.0f && after.z == 0.0f &&
+                      diag.layered_terrain_entries_total.load() == 1 && diag.layered_terrain_exits_total.load() == 1,
+                  Fmt("x=%.3f z=%.3f entries=%llu exits=%llu", after.x, after.z,
+                      static_cast<unsigned long long>(diag.layered_terrain_entries_total.load()),
+                      static_cast<unsigned long long>(diag.layered_terrain_exits_total.load())));
+
+    // From the north the wall stands on the edge: no proven entry there.
+    const auto north = spawn_terrain(602, 105.0f, 113.0f);
+    steer(north, kSouth);
+    tick(20);
+    checks.Report("terrain-entry-through-walled-edge-refused",
+                  !north.has<LayerPresence>() && diag.layered_terrain_entries_total.load() == 1,
+                  Fmt("y=%.3f", north.get<Position>().y));
+
+    // A layered player walking north into the wall never reaches the edge.
+    {
+        ZoneWriteGuard guard(zone, "terrain edge layered spawn");
+        SpawnSystem::SpawnPlayer(zone, DetachedSession(fixture.io, 603), MakeCharacter(603),
+                                 Position{105.0f, 105.0f, 0.2f}, 603, LayerPresence{platform->id, platform->layer_id});
+    }
+    const auto inside = zone.FindEntity(603);
+    steer(inside, 0.0f);
+    tick(30);
+    checks.Report("layered-player-cannot-exit-through-wall",
+                  inside.has<LayerPresence>() && inside.get<Position>().y < 109.7f - 0.3f &&
+                      diag.layered_terrain_exits_total.load() == 1,
+                  Fmt("y=%.3f", inside.get<Position>().y));
+
+    std::string audit;
+    checks.Report("terrain-edge-audit", ValidateLayeredPresence(fixture.zones, &layered, ctx.layer_actor, audit) &&
+                                            ValidateSpatialIndex(zone, zone.Grid(), audit),
+                  audit);
+
+    // Same platform without terrain edges: a terrain player never enters.
+    map::LayeredWorld no_edges = layered;
+    no_edges.terrain_edges.clear();
+    ctx.layered = &no_edges;
+    const auto legacy = spawn_terrain(604, 95.0f, 102.0f);
+    steer(legacy, kEast);
+    tick(40);
+    checks.Report("without-terrain-edges-terrain-player-stays-terrain",
+                  !legacy.has<LayerPresence>() && legacy.get<Position>().z == 0.0f &&
+                      diag.layered_terrain_entries_total.load() == 1);
+}
+
+void TerrainEdgeRuntimeChecks(Checks& checks)
+{
+    ScratchDirectory scratch;
+    map::LayeredWorld layered;
+    std::string error;
+    if (!CookPlatform(layered, error)) {
+        checks.Report("runtime-platform-cooked", false, error);
+        return;
+    }
+    map::PackageWriteSpec spec;
+    spec.world_id = "terrainedge_fixture";
+    spec.world_name = "3D-5B2 terrain edge fixture";
+    spec.size_cells_x = spec.size_cells_y = static_cast<std::uint32_t>(kWorldSize);
+    spec.cell_size_m = 1;
+    spec.chunk_size_cells = 128;
+    spec.height_raw = [](std::uint32_t, std::uint32_t) { return 0; };
+    spec.attributes = [](std::uint32_t, std::uint32_t) { return std::uint16_t{0}; };
+    spec.logic.spawns.push_back(map::SpawnRegion{1, 0, map::Rect{94.5f, 104.5f, 95.5f, 105.5f}});
+    spec.layered_world = layered;
+    const auto root = scratch.root / "terrain_edge_package";
+    const auto written = map::WritePackage(root, spec);
+    gs::game::WorldLoadRequest request;
+    request.package_root = root;
+    request.mob_types_config = IXTREEME_DEFAULT_MOB_TYPES_CONFIG;
+    request.depth = map::ValidationDepth::Full;
+    request.warp_policy = map::WarpPolicy::Strict;
+    map::PackageReport report;
+    auto loaded = written.ok ? gs::game::LoadWorldPackage(request, report) : std::nullopt;
+    checks.Report("terrain-edge-package-loads-mx3d-v5",
+                  loaded && report.Ok() && loaded->layered_world && loaded->layered_world->terrain_edges.size() == 3,
+                  report.FirstError() ? report.FirstError()->Format() : written.error);
+    if (!loaded) return;
+
+    IoRunner runner;
+    gs::game::PartitionLayout layout;
+    layout.regions_x = 2;
+    layout.regions_y = 1;
+    gs::game::WorldRuntime sim(runner.io, {}, std::move(*loaded), layout);
+    gs::game::PartitionConfig partition;
+    partition.scoring.adaptive_enabled = false;
+    sim.ConfigurePartition(partition);
+    sim.PostSpawn(DetachedSession(runner.io, 95301), MakeCharacter(70), std::nullopt);
+    sim.Start();
+    const bool entered = WaitFor(10000ms, [&] {
+        return ReadWorld(sim, [](const WorldSnapshot& snap) { return snap.owners.size(); }) == 1;
+    });
+    const auto start = ReadPlayer(sim, 95301);
+    std::uint32_t seq = 0;
+    bool seen_on_platform = false;
+    const auto run_until = Clock::now() + 4000ms;
+    while (Clock::now() < run_until) {
+        sim.PostMoveInput(95301, ++seq, 1.5707963f, gs::game::MoveState::Running);
+        std::this_thread::sleep_for(50ms);
+        const auto now = ReadPlayer(sim, 95301);
+        seen_on_platform = seen_on_platform || (now.layered && now.position.z == 0.2f);
+    }
+    sim.PostMoveInput(95301, ++seq, 1.5707963f, gs::game::MoveState::Idle);
+    std::this_thread::sleep_for(300ms);
+    const auto end = ReadPlayer(sim, 95301);
+    struct Crossings {
+        std::uint64_t entries = 0, exits = 0;
+    };
+    const auto crossings = ReadWorld(sim, [](const WorldSnapshot& snap) {
+        Crossings out;
+        for (std::size_t i = 0; i < snap.zones.ZoneCount(); ++i) {
+            out.entries += snap.zones.GetZone(i).Diagnostics().layered_terrain_entries_total.load();
+            out.exits += snap.zones.GetZone(i).Diagnostics().layered_terrain_exits_total.load();
+        }
+        return out;
+    });
+    checks.Report("runtime-terrain-player-crosses-platform-and-returns-to-terrain",
+                  entered && start.found && !start.layered && seen_on_platform && end.found && !end.layered &&
+                      end.position.x > 112.0f && end.position.z == 0.0f && crossings.entries == 1 &&
+                      crossings.exits == 1,
+                  Describe(start) + " -> " + Describe(end) +
+                      Fmt(" entries=%llu exits=%llu", static_cast<unsigned long long>(crossings.entries),
+                          static_cast<unsigned long long>(crossings.exits)));
+    const auto audit = AuditNow(sim);
+    checks.Report("runtime-terrain-edge-audit", audit == "OK", audit);
+    sim.Stop();
+}
+
 // ---- 3D-5B: production player spawn region bound to a layered volume -------
 
 std::uint32_t WorldLogicVersion(const fs::path& package)
@@ -904,6 +1114,8 @@ int RunLayeredPresenceScenario()
         DeterministicChecks(checks);
         RuntimeChecks(checks);
         LayeredSpawnChecks(checks);
+        TerrainEdgeDeterministicChecks(checks);
+        TerrainEdgeRuntimeChecks(checks);
     } catch (const std::exception& error) {
         checks.Report("unexpected-exception", false, error.what());
     }

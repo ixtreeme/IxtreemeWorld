@@ -141,7 +141,7 @@ bool InsideFootprint(const mx::map::LayerVolume& volume, double x, double y)
 // its footprint holds the point, else the far end of a proven portal of the
 // current volume whose footprint holds it (the shared contract re-checks the
 // proof, the crossing and both parts of the segment). Leaving the volume
-// system (no proven neighbour) is refused: there is no terrain transition.
+// system is the caller's separate terrain-edge check (3D-5B2).
 mx::map::LayerGroundResult TryLayeredMove(const mx::map::LayeredWorld& world,
                                           const mx::map::LayerActorProfile& actor,
                                           const LayerPresence& presence,
@@ -192,18 +192,46 @@ mx::map::LayerGroundResult TryLayeredMove(const mx::map::LayeredWorld& world,
 // stair tread (radius + cell), so a single piece crosses at most one portal.
 constexpr float kLayeredSubStepMeters = 0.5f;
 
+// 3D-5B2: the terrain side of a proven terrain-edge crossing, checked against
+// the authoritative (resident) terrain: the terrain path between the edge
+// point and the terrain end of the move is clear, and the terrain at the
+// crossing is within the actor's step of the support plane. A chunk that is
+// not resident is demanded and the crossing waits (never guessed).
+bool TerrainSideAccepts(Zone& zone, ZoneTickContext& ctx, const mx::map::LayerTerrainCrossing& crossing,
+                        float terrain_x, float terrain_y)
+{
+    const auto cx = static_cast<float>(crossing.x);
+    const auto cy = static_cast<float>(crossing.y);
+    const StepCheck path = ctx.terrain.CheckStep(cx, cy, terrain_x, terrain_y);
+    if (path.result == StepResult::NotResident) {
+        zone.TerrainDemand().Add(path.chunk);
+    }
+    if (path.result != StepResult::Clear) {
+        return false;
+    }
+    const auto height = ctx.terrain.Height(cx, cy);
+    return height.Ok() && std::abs(static_cast<double>(height.meters) - crossing.plane_z) <= crossing.step_m;
+}
+
 // Moves along the straight line to (to_x, to_y) in sub-steps; stops at the
 // last accepted point. Returns true when the pose changed. Outcomes are
-// counted per refused/accepted piece.
+// counted per refused/accepted piece. A piece that leaves the volume across
+// a proven terrain edge (and whose terrain side the terrain accepts) ends
+// the layered presence: `presence.volume_id` becomes 0 and z is the terrain.
 bool StepLayered(Zone& zone,
-                 const mx::map::LayeredWorld& world,
-                 const mx::map::LayerActorProfile& actor,
+                 ZoneTickContext& ctx,
                  LayerPresence& presence,
                  Position& position,
                  float to_x,
                  float to_y)
 {
     auto& diag = zone.Diagnostics();
+    if (ctx.layered == nullptr) {
+        diag.layered_moves_invalid_total.fetch_add(1, std::memory_order_relaxed);
+        return false;
+    }
+    const mx::map::LayeredWorld& world = *ctx.layered;
+    const mx::map::LayerActorProfile& actor = ctx.layer_actor;
     const Position start = position;
     const float dx = to_x - start.x;
     const float dy = to_y - start.y;
@@ -215,6 +243,31 @@ bool StepLayered(Zone& zone,
         const float px = i == pieces ? to_x : start.x + dx * fraction;
         const float py = i == pieces ? to_y : start.y + dy * fraction;
         const auto step = TryLayeredMove(world, actor, presence, position, px, py);
+        if (!step.Ok() && step.status == mx::map::GroundSupportStatus::TransitionRequired) {
+            // Leaving the volume: only across a proven terrain edge.
+            const auto* volume = FindLayerVolume(world, presence.volume_id);
+            if (volume != nullptr && volume->HasValidGroundSupport()) {
+                mx::map::LayerGroundState current{presence.volume_id, presence.layer_id,
+                                                  static_cast<double>(position.x), static_cast<double>(position.y), 0.0};
+                current.z = volume->ground_support->Height(current.x, current.y);
+                const auto exit = mx::map::ResolveLayerActorExitToTerrain(world, actor, current, px, py);
+                if (exit.Ok()) {
+                    const auto ground = ctx.terrain.Height(px, py);
+                    if (ground.Ok() && TerrainSideAccepts(zone, ctx, exit, px, py)) {
+                        position = {px, py, ground.meters};
+                        presence = {};
+                        diag.layered_terrain_exits_total.fetch_add(1, std::memory_order_relaxed);
+                        return true;
+                    }
+                    diag.layered_moves_blocked_total.fetch_add(1, std::memory_order_relaxed);
+                    break;
+                }
+                if (exit.status == mx::map::GroundSupportStatus::Blocked) {
+                    diag.layered_moves_blocked_total.fetch_add(1, std::memory_order_relaxed);
+                    break;
+                }
+            }
+        }
         if (!step.Ok()) {
             switch (step.status) {
             case mx::map::GroundSupportStatus::Blocked:
@@ -239,6 +292,26 @@ bool StepLayered(Zone& zone,
         moved = true;
     }
     return moved;
+}
+
+// 3D-5B2: a terrain player whose step enters a volume across a proven terrain
+// edge becomes layered on it (z = the support plane at the target). False =
+// no entry; the caller continues with the terrain step.
+bool TryEnterFromTerrain(Zone& zone, ZoneTickContext& ctx, LayerPresence& presence, Position& position,
+                         float to_x, float to_y)
+{
+    if (ctx.layered == nullptr || ctx.layered->terrain_edges.empty()) {
+        return false;
+    }
+    const auto entry = mx::map::ResolveLayerActorEnterFromTerrain(*ctx.layered, ctx.layer_actor, position.x,
+                                                                  position.y, to_x, to_y);
+    if (!entry.Ok() || !TerrainSideAccepts(zone, ctx, entry, position.x, position.y)) {
+        return false;
+    }
+    position = {to_x, to_y, static_cast<float>(entry.inside.z)};
+    presence = {entry.volume_id, entry.layer_id};
+    zone.Diagnostics().layered_terrain_entries_total.fetch_add(1, std::memory_order_relaxed);
+    return true;
 }
 } // namespace
 
@@ -361,45 +434,48 @@ void MovementSystem::Step(Zone& zone, float dt, ZoneTickContext& ctx)
                                                     position.y + velocity.y * lookahead),TerrainPriority::Prefetch);
             }
         }
-        if (const auto* presence_ptr = entity.try_get<LayerPresence>()) {
-            // 3D-5A layered entity: per axis like the terrain path, but every
-            // piece goes through the cooked clearance / proven-portal
-            // contract and z is the support plane. Terrain warps do not apply
-            // on a floor above them; without layered metadata it cannot move.
-            const LayerPresence original = *presence_ptr;
-            LayerPresence presence = original;
-            if (ctx.layered != nullptr) {
-                if (dx != 0.0f) {
-                    StepLayered(zone, *ctx.layered, ctx.layer_actor, presence, position,
-                                position.x + dx, position.y);
-                }
-                if (dy != 0.0f) {
-                    StepLayered(zone, *ctx.layered, ctx.layer_actor, presence, position,
-                                position.x, position.y + dy);
-                }
-            } else if (dx != 0.0f || dy != 0.0f) {
-                zone.Diagnostics().layered_moves_invalid_total.fetch_add(1, std::memory_order_relaxed);
+        // Per axis: a step whose path is not clear is refused on that axis --
+        // never clamped onto an edge (R10); the other axis may still move.
+        // A layered entity (3D-5A) moves through the cooked clearance /
+        // proven-portal contract with z on the support plane and may leave
+        // to the terrain across a proven terrain edge; a terrain player may
+        // enter a volume across one (3D-5B2). Terrain warps apply only to an
+        // entity that is on the terrain for the whole tick.
+        const auto* presence_ptr = entity.try_get<LayerPresence>();
+        const LayerPresence original = presence_ptr != nullptr ? *presence_ptr : LayerPresence{};
+        LayerPresence presence = original;
+        auto axis_step = [&](float to_x, float to_y) {
+            if (presence.volume_id != 0) {
+                StepLayered(zone, ctx, presence, position, to_x, to_y);
+                return;
             }
-            if (presence.volume_id != original.volume_id || presence.layer_id != original.layer_id) {
-                entity.set<LayerPresence>(presence);
+            if (TryEnterFromTerrain(zone, ctx, presence, position, to_x, to_y)) {
+                return;
             }
-        } else {
-            // Per axis: a step whose path is not clear (outside, not resident,
-            // blocked, too steep, deep water) is refused on that axis -- never
-            // clamped onto an edge (R10); the other axis may still move.
-            const float next_x = position.x + dx;
-            if (dx != 0.0f && try_step(position.x, position.y, next_x, position.y)) {
-                position.x = next_x;
+            if (try_step(position.x, position.y, to_x, to_y)) {
+                position.x = to_x;
+                position.y = to_y;
             }
-
-            const float next_y = position.y + dy;
-            if (dy != 0.0f && try_step(position.x, position.y, position.x, next_y)) {
-                position.y = next_y;
-            }
-
+        };
+        if (dx != 0.0f) {
+            axis_step(position.x + dx, position.y);
+        }
+        if (dy != 0.0f) {
+            axis_step(position.x, position.y + dy);
+        }
+        if (original.volume_id == 0 && presence.volume_id == 0) {
             TryApplyWarp(zone, ctx, position, warp_state, dt);
             entity.set<WarpState>(warp_state);
+        }
+        if (presence.volume_id == 0) {
             position.z = ground_z(position, before_move.z);
+        }
+        if (presence.volume_id != original.volume_id || presence.layer_id != original.layer_id) {
+            if (presence.volume_id != 0) {
+                entity.set<LayerPresence>(presence);
+            } else {
+                entity.remove<LayerPresence>();
+            }
         }
         note_moved(entity, before_move, position);
         // Phase 5B: the replicated transform (position/heading/move_state)
@@ -509,12 +585,16 @@ void MovementSystem::Step(Zone& zone, float dt, ZoneTickContext& ctx)
         if (const auto* presence_ptr = entity.try_get<LayerPresence>()) {
             // 3D-5A layered mob: the whole (possibly low-LOD, long) step is
             // split into pieces of at most one portal each.
+            // It may leave to the terrain across a proven terrain edge; terrain
+            // mobs never enter volumes (3D-5B2 admits players only).
             const LayerPresence original = *presence_ptr;
             LayerPresence presence = original;
-            if (ctx.layered != nullptr && (next.x != position.x || next.y != position.y)) {
-                StepLayered(zone, *ctx.layered, ctx.layer_actor, presence, position, next.x, next.y);
+            if (next.x != position.x || next.y != position.y) {
+                StepLayered(zone, ctx, presence, position, next.x, next.y);
             }
-            if (presence.volume_id != original.volume_id || presence.layer_id != original.layer_id) {
+            if (presence.volume_id == 0) {
+                entity.remove<LayerPresence>();
+            } else if (presence.volume_id != original.volume_id || presence.layer_id != original.layer_id) {
                 entity.set<LayerPresence>(presence);
             }
         } else {

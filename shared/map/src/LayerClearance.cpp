@@ -395,6 +395,187 @@ Rect Strip(const LayerVolume& volume, const LayerPortalProof& proof, const Layer
     return strip;
 }
 
+// ---- 3D-5B2 terrain edges ----------------------------------------------------
+
+// Height bounds of every terrain quad a closed XY rectangle touches. False
+// when the rectangle reaches outside the terrain grid (no data = no proof).
+bool TerrainRange(const LayerTerrainObstruction& t, double x0, double x1, double y0, double y1, double& lo, double& hi)
+{
+    const double gx1 = t.origin_x + static_cast<double>(t.cells_x) * t.cell_size;
+    const double gy1 = t.origin_y + static_cast<double>(t.cells_y) * t.cell_size;
+    if (x0 < t.origin_x || y0 < t.origin_y || x1 > gx1 || y1 > gy1) return false;
+    const auto index = [&](double value, double origin, std::uint32_t cells) {
+        const double raw = std::floor((value - origin) / t.cell_size);
+        return static_cast<std::uint32_t>(std::clamp(raw, 0.0, static_cast<double>(cells - 1)));
+    };
+    // A rectangle edge exactly on a grid line also touches the quad before it.
+    const auto i0 = index(x0 - kRegionSlack, t.origin_x, t.cells_x), i1 = index(x1 + kRegionSlack, t.origin_x, t.cells_x);
+    const auto j0 = index(y0 - kRegionSlack, t.origin_y, t.cells_y), j1 = index(y1 + kRegionSlack, t.origin_y, t.cells_y);
+    const std::size_t stride = static_cast<std::size_t>(t.cells_x) + 1;
+    lo = std::numeric_limits<double>::infinity();
+    hi = -std::numeric_limits<double>::infinity();
+    for (std::uint32_t j = j0; j <= j1 + 1; ++j) {
+        for (std::uint32_t i = i0; i <= i1 + 1; ++i) {
+            const double h = t.heights[static_cast<std::size_t>(j) * stride + i];
+            lo = std::min(lo, h);
+            hi = std::max(hi, h);
+        }
+    }
+    return true;
+}
+
+// Is the slot [along0, along1] of this volume edge covered by a proven
+// volume-to-volume portal (then the outside is another floor, not terrain)?
+bool PortalCoversSlot(const LayeredWorld& world, const LayerVolume& volume, std::uint8_t axis, float edge,
+                      double along0, double along1)
+{
+    for (const auto& portal : world.portals) {
+        if (!portal.proof || (portal.source_volume != volume.id && portal.target_volume != volume.id)) continue;
+        const auto& proof = *portal.proof;
+        if (proof.axis == axis && proof.edge == edge && along0 < proof.span_max && proof.span_min < along1) return true;
+    }
+    return false;
+}
+
+// One terrain edge candidate per footprint side. A slot is valid when the
+// terrain along the slot segment stays within the step of the plane
+// (conservative quad corner bounds) and no proven portal owns it; invalid
+// slots keep every corridor cell blocked, so the runtime refuses crossings
+// there. Corridor cells of valid slots are free above the upper envelope of
+// the plane and the local terrain maximum.
+bool CookTerrainEdge(const LayeredWorld& world, const LayerVolume& volume, std::uint8_t axis, std::uint8_t side,
+                     const Rect& world_bounds, const LayerTerrainObstruction& terrain, const ObstructionSet& obstructions,
+                     const LayerClearanceProfile& profile, LayerTerrainEdge& out, LayerClearanceReport& report)
+{
+    const float edge = axis == 0 ? (side == 0 ? volume.bounds.min_x : volume.bounds.max_x)
+                                 : (side == 0 ? volume.bounds.min_y : volume.bounds.max_y);
+    const float world_min = axis == 0 ? world_bounds.min_x : world_bounds.min_y;
+    const float world_max = axis == 0 ? world_bounds.max_x : world_bounds.max_y;
+    if (side == 0 ? !(edge > world_min) : !(edge < world_max)) return false;
+    LayerTerrainEdge candidate;
+    candidate.volume_id = volume.id;
+    candidate.axis = axis;
+    candidate.terrain_side = side;
+    candidate.edge = edge;
+    candidate.span_min = axis == 0 ? volume.bounds.min_y : volume.bounds.min_x;
+    candidate.span_max = axis == 0 ? volume.bounds.max_y : volume.bounds.max_x;
+    candidate.slots = LayerClearanceCellCount(candidate.span_min, candidate.span_max, profile.cell_size_m);
+    double across0 = 0.0, across1 = 0.0;
+    LayerTerrainEdgeCorridorAcross(candidate, volume, profile, across0, across1);
+    candidate.across = LayerClearanceCellCount(across0, across1, profile.cell_size_m);
+    const std::uint64_t cells = static_cast<std::uint64_t>(candidate.slots) * candidate.across;
+    if (cells == 0 || cells > kMaxLayerClearanceCellsPerVolume) return false;
+    candidate.blocked.assign(static_cast<std::size_t>((cells + 7) / 8), 0);
+
+    const double cell = static_cast<double>(profile.cell_size_m);
+    const double radius = static_cast<double>(profile.actor_radius_m);
+    const double step = static_cast<double>(profile.step_height_m);
+    const Plane plane = PlaneOf(*volume.ground_support);
+    const auto along_range = [&](std::uint32_t slot, double& a0, double& a1) {
+        a0 = static_cast<double>(candidate.span_min) + static_cast<double>(slot) * cell;
+        a1 = std::min(a0 + cell, static_cast<double>(candidate.span_max));
+    };
+    const auto point = [&](double along, double across) {
+        return axis == 0 ? std::array<double, 2>{across, along} : std::array<double, 2>{along, across};
+    };
+    std::vector<bool> valid(candidate.slots, false);
+    bool any_valid = false;
+    for (std::uint32_t slot = 0; slot < candidate.slots; ++slot) {
+        double a0 = 0, a1 = 0;
+        along_range(slot, a0, a1);
+        if (PortalCoversSlot(world, volume, axis, edge, a0, a1)) continue;
+        const auto p0 = point(a0, edge), p1 = point(a1, edge);
+        double t_lo = 0, t_hi = 0;
+        if (!TerrainRange(terrain, std::min(p0[0], p1[0]), std::max(p0[0], p1[0]), std::min(p0[1], p1[1]),
+                          std::max(p0[1], p1[1]), t_lo, t_hi)) {
+            continue;
+        }
+        const double p_lo = std::min(plane.Height(p0[0], p0[1]), plane.Height(p1[0], p1[1]));
+        const double p_hi = std::max(plane.Height(p0[0], p0[1]), plane.Height(p1[0], p1[1]));
+        const double bound = std::max(t_hi - p_lo, p_hi - t_lo);
+        if (!std::isfinite(bound) || bound > step) {
+            ++report.edges_rejected_step;
+            continue;
+        }
+        valid[slot] = true;
+        any_valid = true;
+        candidate.max_step_m = std::max(candidate.max_step_m, std::max(0.0, bound));
+    }
+    if (!any_valid) return false;
+
+    const double grow = radius + kRegionSlack;
+    const auto cell_rect = [&](std::uint32_t slot, std::uint32_t c) {
+        double a0 = 0, a1 = 0;
+        along_range(slot, a0, a1);
+        const double c0 = across0 + static_cast<double>(c) * cell;
+        const double c1 = std::min(c0 + cell, across1);
+        return axis == 0 ? Rect2{c0, c1, a0, a1} : Rect2{a0, a1, c0, c1};
+    };
+    // Per cell: the highest terrain the capsule region can stand on (the
+    // step-zone floor together with the plane). No terrain data = blocked.
+    std::vector<double> ceiling(static_cast<std::size_t>(cells), 0.0);
+    for (std::uint32_t slot = 0; slot < candidate.slots; ++slot) {
+        for (std::uint32_t c = 0; c < candidate.across; ++c) {
+            const std::uint64_t bit = static_cast<std::uint64_t>(slot) * candidate.across + c;
+            const Rect2 centres = cell_rect(slot, c);
+            double t_lo = 0, t_hi = 0;
+            if (!valid[slot] || !TerrainRange(terrain, centres.x0 - grow, centres.x1 + grow, centres.y0 - grow,
+                                              centres.y1 + grow, t_lo, t_hi)) {
+                SetBit(candidate.blocked, bit);
+                continue;
+            }
+            ceiling[static_cast<std::size_t>(bit)] = t_hi;
+        }
+    }
+    const Rect2 band = axis == 0 ? Rect2{across0, across1, candidate.span_min, candidate.span_max}
+                                 : Rect2{candidate.span_min, candidate.span_max, across0, across1};
+    const Rect2 area{band.x0 - grow, band.x1 + grow, band.y0 - grow, band.y1 + grow};
+    const auto range = [&](double min, double max, double origin, std::uint32_t count, std::uint32_t& first,
+                           std::uint32_t& last) {
+        first = static_cast<std::uint32_t>(std::clamp(std::floor((min - grow - origin) / cell), 0.0,
+                                                      static_cast<double>(count - 1)));
+        last = static_cast<std::uint32_t>(std::clamp(std::floor((max + grow - origin) / cell), 0.0,
+                                                     static_cast<double>(count - 1)));
+    };
+    std::array<HalfSpace, 8> region{};
+    obstructions.ForEach(area, report.terrain_quads_tested, [&](const Triangle& triangle) {
+        // Below the plane is below the upper envelope of every cell.
+        if (EntirelyBelow(triangle, &plane, 1, static_cast<double>(profile.floor_contact_m))) return;
+        std::uint32_t s0 = 0, s1 = 0, c0 = 0, c1 = 0;
+        range(axis == 0 ? triangle.min_y : triangle.min_x, axis == 0 ? triangle.max_y : triangle.max_x,
+              candidate.span_min, candidate.slots, s0, s1);
+        range(axis == 0 ? triangle.min_x : triangle.min_y, axis == 0 ? triangle.max_x : triangle.max_y, across0,
+              candidate.across, c0, c1);
+        for (std::uint32_t slot = s0; slot <= s1; ++slot) {
+            for (std::uint32_t c = c0; c <= c1; ++c) {
+                const std::uint64_t bit = static_cast<std::uint64_t>(slot) * candidate.across + c;
+                if (GetBit(candidate.blocked, bit)) continue;
+                const std::array<Plane, 2> floors{plane, Plane{0.0, 0.0, ceiling[static_cast<std::size_t>(bit)], 1.0}};
+                if (EntirelyBelow(triangle, floors.data(), floors.size(), static_cast<double>(profile.floor_contact_m))) {
+                    continue;
+                }
+                const std::size_t n = BuildRegion(cell_rect(slot, c), radius, floors.data(), floors.size(), profile,
+                                                  region.data());
+                if (ClipNonEmpty(triangle, region.data(), n)) SetBit(candidate.blocked, bit);
+            }
+        }
+    });
+    // A side whose edge-adjacent cells are all blocked (a wall along it) can
+    // never be crossed: no record.
+    const std::uint32_t adjacent = side == 0 ? 0u : candidate.across - 1u;
+    bool crossable = false;
+    for (std::uint32_t slot = 0; slot < candidate.slots && !crossable; ++slot) {
+        crossable = !GetBit(candidate.blocked, static_cast<std::uint64_t>(slot) * candidate.across + adjacent);
+    }
+    if (!crossable) return false;
+    report.corridor_slots += cells;
+    for (std::uint64_t bit = 0; bit < cells; ++bit) {
+        report.corridor_slots_blocked += GetBit(candidate.blocked, bit) ? 1u : 0u;
+    }
+    out = std::move(candidate);
+    return true;
+}
+
 } // namespace
 
 bool CookLayerClearance(LayeredWorld& world,
@@ -410,6 +591,7 @@ bool CookLayerClearance(LayeredWorld& world,
         world.portals.erase(std::remove_if(world.portals.begin(), world.portals.end(),
                                            [](const LayerPortal& portal) { return portal.proof.has_value(); }),
                             world.portals.end());
+        world.terrain_edges.clear();
         world.clearance_profile.reset();
     };
     const auto fail = [&](const std::string& message) {
@@ -502,6 +684,24 @@ bool CookLayerClearance(LayeredWorld& world,
     }
     report.portals_derived = derived.size();
     for (auto& portal : derived) world.portals.push_back(std::move(portal));
+    if (terrain != nullptr) {
+        std::uint32_t edge_id = 0;
+        for (const auto& volume : world.volumes) {
+            if (!volume.clearance || !volume.AllowsGroundMovement()) continue;
+            for (std::uint8_t axis = 0; axis < 2; ++axis) {
+                for (std::uint8_t side = 0; side < 2; ++side) {
+                    LayerTerrainEdge edge;
+                    if (!CookTerrainEdge(world, volume, axis, side, world_bounds, *terrain, set, profile, edge, report)) {
+                        continue;
+                    }
+                    if (world.terrain_edges.size() >= kMaxLayerTerrainEdges) return fail("terrain edges exceed the limit");
+                    edge.id = ++edge_id;
+                    world.terrain_edges.push_back(std::move(edge));
+                }
+            }
+        }
+        report.terrain_edges_derived = world.terrain_edges.size();
+    }
     world.clearance_profile = profile;
     if (!world.Validate(world_bounds, error)) return fail("cooked clearance failed validation: " + error);
     if (EncodeLayeredWorld(world).empty()) return fail("cooked clearance does not fit the layered-world sidecar limits");

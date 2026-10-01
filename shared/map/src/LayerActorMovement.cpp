@@ -93,15 +93,14 @@ const LayerVolume* FindVolume(const LayeredWorld& world, VolumeId id)
     return nullptr;
 }
 
-// A clearance cell is covered by a proven portal's step zone when it lies in
-// the corridor band and every corridor cell it overlaps is proven free above
-// the two planes' upper envelope.
-bool CorridorCovers(const LayerPortalProof& proof, const LayerVolume& a, const LayerVolume& b,
-                    const LayerClearanceProfile& profile, const CellRect& cell)
+// A clearance cell is covered by a proven step zone (portal or terrain edge)
+// when it lies in the corridor band and every corridor cell it overlaps is
+// proven free above the zone's upper envelope.
+template <class Proof>
+bool BandCovers(const Proof& proof, double across0, double across1, const LayerClearanceProfile& profile,
+                const CellRect& cell)
 {
     if (proof.slots == 0 || proof.across == 0) return false;
-    double across0 = 0.0, across1 = 0.0;
-    LayerPortalCorridorAcross(proof, a, b, profile, across0, across1);
     const double c0 = proof.axis == 0 ? cell.x0 : cell.y0;
     const double c1 = proof.axis == 0 ? cell.x1 : cell.y1;
     const double l0 = proof.axis == 0 ? cell.y0 : cell.x0;
@@ -127,8 +126,16 @@ bool CorridorCovers(const LayerPortalProof& proof, const LayerVolume& a, const L
     return true;
 }
 
+bool PortalCovers(const LayerPortalProof& proof, const LayerVolume& a, const LayerVolume& b,
+                  const LayerClearanceProfile& profile, const CellRect& cell)
+{
+    double across0 = 0.0, across1 = 0.0;
+    LayerPortalCorridorAcross(proof, a, b, profile, across0, across1);
+    return BandCovers(proof, across0, across1, profile, cell);
+}
+
 // Clear in the volume's own grid, or inside the proven step zone of any
-// proven portal of that volume.
+// proven portal or terrain edge of that volume.
 bool Passable(const LayeredWorld& world, const LayerVolume& volume, const LayerClearanceProfile& profile,
               std::uint32_t i, std::uint32_t j, const CellRect& rect)
 {
@@ -141,7 +148,13 @@ bool Passable(const LayeredWorld& world, const LayerVolume& volume, const LayerC
             if (candidate.id == portal.source_volume) a = &candidate;
             if (candidate.id == portal.target_volume) b = &candidate;
         }
-        if (a != nullptr && b != nullptr && CorridorCovers(*portal.proof, *a, *b, profile, rect)) return true;
+        if (a != nullptr && b != nullptr && PortalCovers(*portal.proof, *a, *b, profile, rect)) return true;
+    }
+    for (const auto& edge : world.terrain_edges) {
+        if (edge.volume_id != volume.id) continue;
+        double across0 = 0.0, across1 = 0.0;
+        LayerTerrainEdgeCorridorAcross(edge, volume, profile, across0, across1);
+        if (BandCovers(edge, across0, across1, profile, rect)) return true;
     }
     return false;
 }
@@ -258,6 +271,170 @@ LayerGroundResult ResolveLayerActorMove(const LayeredWorld& world,
     // Different volume without a proven portal on this segment: an explicit
     // (lift, door, teleport) or missing transition.
     return fail(GroundSupportStatus::TransitionRequired);
+}
+
+namespace {
+
+bool InsideFootprint(const LayerVolume& volume, double x, double y)
+{
+    return x >= volume.bounds.min_x && x < volume.bounds.max_x && y >= volume.bounds.min_y &&
+           y < volume.bounds.max_y;
+}
+
+// Is the point outside the footprint on the edge's terrain side?
+bool OnTerrainSide(const LayerTerrainEdge& edge, double across)
+{
+    return edge.terrain_side == 0 ? across < edge.edge : across >= edge.edge;
+}
+
+// Crossing parameter t in [0, 1] of the segment with the edge line inside the
+// span, or a negative value.
+double CrossEdge(const LayerTerrainEdge& edge, double ax, double ay, double bx, double by, double& cx, double& cy)
+{
+    const double from_across = edge.axis == 0 ? ax : ay;
+    const double to_across = edge.axis == 0 ? bx : by;
+    const double from_along = edge.axis == 0 ? ay : ax;
+    const double to_along = edge.axis == 0 ? by : bx;
+    if (from_across == to_across) return -1.0;
+    const double t = (static_cast<double>(edge.edge) - from_across) / (to_across - from_across);
+    if (!(t >= 0.0 && t <= 1.0)) return -1.0;
+    const double along = from_along + t * (to_along - from_along);
+    if (!(along >= edge.span_min && along <= edge.span_max)) return -1.0;
+    cx = edge.axis == 0 ? static_cast<double>(edge.edge) : along;
+    cy = edge.axis == 0 ? along : static_cast<double>(edge.edge);
+    return t;
+}
+
+// The corridor cell(s) right at the edge where the crossing happens must be
+// proven clear (a slot boundary checks both slots).
+bool EdgeCellClear(const LayerTerrainEdge& edge, const LayerClearanceProfile& profile, double cx, double cy)
+{
+    const double along = edge.axis == 0 ? cy : cx;
+    const double size = static_cast<double>(profile.cell_size_m);
+    const auto slot = [&](double value) {
+        const double raw = std::floor((value - static_cast<double>(edge.span_min)) / size);
+        return static_cast<std::uint32_t>(std::clamp(raw, 0.0, static_cast<double>(edge.slots - 1)));
+    };
+    const std::uint32_t adjacent = edge.terrain_side == 0 ? 0u : edge.across - 1u;
+    for (std::uint32_t s = slot(along - kCellSlack); s <= slot(along + kCellSlack); ++s) {
+        if (edge.CellBlocked(s, adjacent)) return false;
+    }
+    return true;
+}
+
+LayerTerrainCrossing CrossingFailure(GroundSupportStatus status)
+{
+    LayerTerrainCrossing crossing;
+    crossing.status = status;
+    return crossing;
+}
+
+} // namespace
+
+LayerTerrainCrossing ResolveLayerActorExitToTerrain(const LayeredWorld& world,
+    const LayerActorProfile& actor, const LayerGroundState& current, double x, double y) noexcept
+{
+    if (!ActorFinite(actor) || !std::isfinite(x) || !std::isfinite(y)) {
+        return CrossingFailure(GroundSupportStatus::InvalidState);
+    }
+    if (!world.clearance_profile) return CrossingFailure(GroundSupportStatus::NoClearanceProof);
+    const auto& profile = *world.clearance_profile;
+    if (actor.radius_m > profile.actor_radius_m || actor.height_m > profile.actor_height_m) {
+        return CrossingFailure(GroundSupportStatus::ActorNotCovered);
+    }
+    const auto here = ResolveLayerGroundMove(world, current, current.volume_id, current.x, current.y);
+    if (!here.Ok()) return CrossingFailure(here.status);
+    const auto start = ResolveLayerActorPlacement(world, actor, current.volume_id, current.x, current.y);
+    if (!start.Ok()) {
+        return CrossingFailure(start.status == GroundSupportStatus::Blocked ? GroundSupportStatus::InvalidState
+                                                                            : start.status);
+    }
+    const LayerVolume* volume = FindVolume(world, current.volume_id);
+    if (volume == nullptr || !volume->clearance) return CrossingFailure(GroundSupportStatus::NoClearanceProof);
+    if (InsideFootprint(*volume, x, y)) return CrossingFailure(GroundSupportStatus::TransitionRequired);
+    const LayerTerrainEdge* best = nullptr;
+    double best_t = 2.0, best_x = 0.0, best_y = 0.0;
+    for (const auto& edge : world.terrain_edges) {
+        if (edge.volume_id != volume->id || !OnTerrainSide(edge, edge.axis == 0 ? x : y)) continue;
+        double cx = 0.0, cy = 0.0;
+        const double t = CrossEdge(edge, current.x, current.y, x, y, cx, cy);
+        if (t >= 0.0 && t < best_t) {
+            best = &edge;
+            best_t = t;
+            best_x = cx;
+            best_y = cy;
+        }
+    }
+    if (best == nullptr) return CrossingFailure(GroundSupportStatus::TransitionRequired);
+    if (!EdgeCellClear(*best, profile, best_x, best_y)) return CrossingFailure(GroundSupportStatus::Blocked);
+    const bool clear = ForEachSegmentCell(ViewOf(*volume, profile), current.x, current.y, best_x, best_y,
+        [&](std::uint32_t i, std::uint32_t j, const CellRect& rect) {
+            return Passable(world, *volume, profile, i, j, rect);
+        });
+    if (!clear) return CrossingFailure(GroundSupportStatus::Blocked);
+    LayerTerrainCrossing crossing;
+    crossing.status = GroundSupportStatus::Ok;
+    crossing.edge_id = best->id;
+    crossing.volume_id = volume->id;
+    crossing.layer_id = volume->layer_id;
+    crossing.x = best_x;
+    crossing.y = best_y;
+    crossing.plane_z = volume->ground_support->Height(best_x, best_y);
+    crossing.step_m = profile.step_height_m;
+    return crossing;
+}
+
+LayerTerrainCrossing ResolveLayerActorEnterFromTerrain(const LayeredWorld& world,
+    const LayerActorProfile& actor, double from_x, double from_y, double x, double y) noexcept
+{
+    if (!ActorFinite(actor) || !std::isfinite(from_x) || !std::isfinite(from_y) || !std::isfinite(x) ||
+        !std::isfinite(y)) {
+        return CrossingFailure(GroundSupportStatus::InvalidState);
+    }
+    if (!world.clearance_profile || world.terrain_edges.empty()) {
+        return CrossingFailure(GroundSupportStatus::NotAvailable);
+    }
+    const auto& profile = *world.clearance_profile;
+    if (actor.radius_m > profile.actor_radius_m || actor.height_m > profile.actor_height_m) {
+        return CrossingFailure(GroundSupportStatus::ActorNotCovered);
+    }
+    const LayerTerrainEdge* best = nullptr;
+    const LayerVolume* best_volume = nullptr;
+    double best_t = 2.0, best_x = 0.0, best_y = 0.0;
+    for (const auto& edge : world.terrain_edges) {
+        if (!OnTerrainSide(edge, edge.axis == 0 ? from_x : from_y)) continue;
+        const LayerVolume* volume = FindVolume(world, edge.volume_id);
+        if (volume == nullptr || !volume->clearance || !InsideFootprint(*volume, x, y)) continue;
+        double cx = 0.0, cy = 0.0;
+        const double t = CrossEdge(edge, from_x, from_y, x, y, cx, cy);
+        if (t >= 0.0 && t < best_t) {
+            best = &edge;
+            best_volume = volume;
+            best_t = t;
+            best_x = cx;
+            best_y = cy;
+        }
+    }
+    if (best == nullptr) return CrossingFailure(GroundSupportStatus::NotAvailable);
+    if (!EdgeCellClear(*best, profile, best_x, best_y)) return CrossingFailure(GroundSupportStatus::Blocked);
+    const auto placed = ResolveLayerActorPlacement(world, actor, best_volume->id, x, y);
+    if (!placed.Ok()) return CrossingFailure(placed.status);
+    const bool clear = ForEachSegmentCell(ViewOf(*best_volume, profile), best_x, best_y, x, y,
+        [&](std::uint32_t i, std::uint32_t j, const CellRect& rect) {
+            return Passable(world, *best_volume, profile, i, j, rect);
+        });
+    if (!clear) return CrossingFailure(GroundSupportStatus::Blocked);
+    LayerTerrainCrossing crossing;
+    crossing.status = GroundSupportStatus::Ok;
+    crossing.edge_id = best->id;
+    crossing.volume_id = best_volume->id;
+    crossing.layer_id = best_volume->layer_id;
+    crossing.x = best_x;
+    crossing.y = best_y;
+    crossing.plane_z = best_volume->ground_support->Height(best_x, best_y);
+    crossing.step_m = profile.step_height_m;
+    crossing.inside = placed.state;
+    return crossing;
 }
 
 } // namespace mx::map

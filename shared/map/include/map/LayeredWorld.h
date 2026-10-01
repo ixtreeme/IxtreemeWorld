@@ -20,10 +20,14 @@ inline constexpr std::uint32_t kLayeredWorldFileMagic = 0x4433584d; // "MX3D" li
 // portal transition proofs (3D-4B). A world without any of them is still
 // written as version 3, byte-identical to the previous encoder.
 inline constexpr std::uint32_t kLayeredWorldFileVersion = 4;
+// Version 5 (3D-5B2) appends proven terrain edges after the portals. It is
+// written only when a world has terrain edges; otherwise v4 / v3 as before.
+inline constexpr std::uint32_t kLayeredWorldTerrainEdgeFileVersion = 5;
 inline constexpr std::uint32_t kLayeredWorldSupportFileVersion = 3;
 inline constexpr std::uint32_t kLayeredWorldFileMinVersion = 1;
 inline constexpr std::uint32_t kMaxLayeredWorldVolumes = 4096;
 inline constexpr std::uint32_t kMaxLayeredWorldPortals = 8192;
+inline constexpr std::uint32_t kMaxLayerTerrainEdges = 16384;
 inline constexpr std::uint32_t kMaxLayeredWorldNameBytes = 128;
 inline constexpr std::uint64_t kMaxLayeredWorldFileBytes = 4ull << 20;
 // The collision cooker's existing perpendicular coplanarity bound. A stored
@@ -186,6 +190,33 @@ struct LayerPortal {
     bool SourceContains(float x, float y, float z) const noexcept;
 };
 
+// 3D-5B2: a proven edge between a walkable volume and the terrain around it.
+// Along [span_min, span_max] of the volume footprint boundary `edge` (axis 0:
+// x = edge, crossing along x; 1: y = edge) with the terrain outside on
+// `terrain_side` (0: the edge is the footprint minimum, terrain below it; 1:
+// the footprint maximum, terrain above it), the cooked terrain stays within
+// the profile step of the support plane (conservatively over every terrain
+// quad the edge segment touches; the bound is `max_step_m`). A volume-side
+// corridor (radius + cell inward, limited to the footprint) records which
+// capsule-centre cells are free above the upper envelope of the plane and
+// the local terrain. The record proves the volume side only: the runtime
+// still checks the exact terrain height and terrain rules where it crosses.
+struct LayerTerrainEdge {
+    std::uint32_t id = 0;
+    VolumeId volume_id = 0;
+    std::uint8_t axis = 0;
+    std::uint8_t terrain_side = 0;
+    float edge = 0.0f;
+    float span_min = 0.0f;
+    float span_max = 0.0f;
+    double max_step_m = 0.0;
+    std::uint32_t slots = 0;  // cells along the segment
+    std::uint32_t across = 0; // cells across the volume-side band
+    std::vector<std::uint8_t> blocked; // bitset, bit (slot * across + a), 1 = blocked
+
+    bool CellBlocked(std::uint32_t slot, std::uint32_t across_cell) const noexcept;
+};
+
 // Cells of a clearance grid / slots of a portal corridor for a length, the
 // same double computation for the cooker, the reader and the queries.
 std::uint32_t LayerClearanceCellCount(double min, double max, float cell_size) noexcept;
@@ -200,10 +231,20 @@ void LayerPortalCorridorAcross(const LayerPortalProof& proof,
                                double& across0,
                                double& across1) noexcept;
 
+// Volume-side band [across0, across1] of a terrain edge corridor: radius +
+// cell size inward from the edge, limited to the volume footprint.
+void LayerTerrainEdgeCorridorAcross(const LayerTerrainEdge& edge,
+                                    const LayerVolume& volume,
+                                    const LayerClearanceProfile& profile,
+                                    double& across0,
+                                    double& across1) noexcept;
+
 struct LayeredWorld {
     std::vector<LayerVolume> volumes;
     std::vector<LayerPortal> portals;
-    // Present exactly when any clearance grid or portal proof is present.
+    // 3D-5B2 proven volume-to-terrain edges (require the clearance profile).
+    std::vector<LayerTerrainEdge> terrain_edges;
+    // Present exactly when any clearance grid, portal proof or terrain edge is.
     std::optional<LayerClearanceProfile> clearance_profile;
 
     // An empty contract is valid and means legacy single-layer behaviour.
