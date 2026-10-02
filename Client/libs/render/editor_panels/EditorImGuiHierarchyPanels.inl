@@ -1,25 +1,79 @@
 // This file is included from EditorImGui.cpp inside the editor-enabled implementation block.
 // Keep shared anonymous-namespace helpers in EditorImGui.cpp until this panel group is fully decoupled.
 
+void EditorImGui::RenderHierarchyCreateMenuItems()
+{
+    const bool canCreate = CanUseEditorTools() && SceneManager::Instance().HasOpenScene();
+    if (!SceneManager::Instance().HasOpenScene())
+        ImGui::TextDisabled("Open or create a scene first (File menu)");
+    else if (!CanUseEditorTools())
+        ImGui::TextDisabled("Stop Play to add objects");
+
+    const auto primitive = [&](const char* label, const char* type) {
+        if (ImGui::MenuItem(label, nullptr, false, canCreate))
+        {
+            m_commands.addPrimitiveEntity = true;
+            m_commands.primitiveType = type;
+            Tracenf("[PRIMITIVE] Create menu queued type=%s", type);
+        }
+    };
+    primitive(ICON_FA_CUBE "  Cube", "cube");
+    primitive(ICON_FA_CUBE "  Sphere", "sphere");
+    primitive(ICON_FA_CUBE "  Capsule", "capsule");
+    ImGui::Separator();
+    if (ImGui::MenuItem(ICON_FA_LIGHTBULB "  Point Light", nullptr, false,
+            canCreate && m_lightingState.numPointLights < kMaxDynamicPointLights))
+        m_commands.addPointLight = true;
+    UI::ItemTooltip("Light shining in every direction from a point (a lamp, a torch)");
+    if (ImGui::MenuItem(ICON_FA_BULLSEYE "  Spot Light", nullptr, false,
+            canCreate && m_lightingState.numSpotLights < kMaxDynamicSpotLights))
+        m_commands.addSpotLight = true;
+    UI::ItemTooltip("Light shining in a cone (a flashlight, a stage light)");
+    ImGui::Separator();
+    if (ImGui::MenuItem(ICON_FA_DROPLET "  Water Body", nullptr, false, canCreate))
+    {
+        m_commands.addWaterBody = true;
+        Tracen("[EDITOR-3D-SPAWN] Add water requested");
+    }
+    if (ImGui::MenuItem(m_terrainState.exists ? ICON_FA_MOUNTAIN "  Replace Terrain..." : ICON_FA_MOUNTAIN "  Terrain...",
+            nullptr, false, canCreate))
+        OpenCreateTerrainDialog();
+    ImGui::Separator();
+    ImGui::TextDisabled("Models and prefabs: drag them from the Asset Browser");
+}
+
 void EditorImGui::RenderHierarchyToolbar()
 {
-    ImGui::PushItemWidth(-1.0f);
+    // "+": everything that can be added to the scene (the same list as the Create menu).
+    if (UI::IconOnlyButton(ICON_FA_PLUS))
+        ImGui::OpenPopup("HierarchyCreatePopup");
+    UI::ItemTooltip("Add an object to the scene");
+    if (ImGui::BeginPopup("HierarchyCreatePopup"))
+    {
+        RenderHierarchyCreateMenuItems();
+        ImGui::EndPopup();
+    }
+    ImGui::SameLine();
+
+    const bool searching = m_hierarchySearchBuffer[0] != '\0';
+    const float clearWidth = searching ? ImGui::GetFrameHeight() + ImGui::GetStyle().ItemSpacing.x : 0.0f;
+    ImGui::SetNextItemWidth(ImGui::GetContentRegionAvail().x - clearWidth);
     const bool changed = ImGui::InputTextWithHint("##hierarchy_search",
-        ICON_FA_MAGNIFYING_GLASS " Search entities/scenes...",
+        ICON_FA_MAGNIFYING_GLASS "  Search",
         m_hierarchySearchBuffer,
         sizeof(m_hierarchySearchBuffer));
-    ImGui::PopItemWidth();
     if (changed)
         Tracenf("[HIERARCHY] Search filter: '%s'", m_hierarchySearchBuffer);
 
-    if (m_hierarchySearchBuffer[0] != '\0')
+    if (searching)
     {
         ImGui::SameLine();
-        if (ImGui::SmallButton(ICON_FA_XMARK))
+        if (UI::IconOnlyButton(ICON_FA_XMARK))
         {
             m_hierarchySearchBuffer[0] = '\0';
             Tracen("[HIERARCHY] Search filter cleared");
         }
+        UI::ItemTooltip("Clear the search");
     }
 }
 
@@ -251,7 +305,7 @@ void EditorImGui::RenderProjectSceneNode(const ProjectSceneEntry& scene)
     if (!hasChildren)
         flags |= ImGuiTreeNodeFlags_Leaf | ImGuiTreeNodeFlags_NoTreePushOnOpen;
 
-    const std::string label = std::string(ICON_FA_GLOBE) + " " + scene.name + "##" + scene.relativePath;
+    const std::string label = std::string(ICON_FA_GLOBE) + "  " + scene.name + "##" + scene.relativePath;
     const bool open = ImGui::TreeNodeEx(label.c_str(), flags);
     if (ImGui::IsItemHovered() && !scene.relativePath.empty())
         ImGui::SetTooltip("%s", scene.relativePath.c_str());
@@ -260,15 +314,15 @@ void EditorImGui::RenderProjectSceneNode(const ProjectSceneEntry& scene)
         if (SceneManager::Instance().LoadScene(scene.path.string()))
             m_projectStatus = "Scene loaded: " + scene.relativePath;
     }
-    if (scene.active && ImGui::BeginPopupContextItem("##scene_context"))
+    if (ImGui::BeginPopupContextItem("##scene_context"))
     {
-        if (ImGui::MenuItem(ICON_FA_MOUNTAIN " Create Terrain"))
+        if (scene.active)
         {
-            if (m_terrainState.exists)
-                m_replaceTerrainConfirmOpen = true;
-            else
-                m_createTerrainModalOpen = true;
+            RenderHierarchyCreateMenuItems();
+            ImGui::Separator();
         }
+        if (ImGui::MenuItem(ICON_FA_XMARK "  Remove From Hierarchy", nullptr, false, !scene.relativePath.empty()))
+            DetachSceneFromHierarchy(scene);
         ImGui::EndPopup();
     }
 
@@ -316,26 +370,8 @@ void EditorImGui::RenderProjectSceneNode(const ProjectSceneEntry& scene)
     if (!scene.active)
         ImGui::PopStyleColor();
 
-    ImGui::TableSetColumnIndex(1);
-    const ImVec4 eyeColor = scene.active ? ImVec4(0.88f, 0.88f, 0.88f, 1.0f) : ImVec4(0.48f, 0.48f, 0.48f, 1.0f);
-    ImGui::PushStyleColor(ImGuiCol_Text, eyeColor);
-    if (ImGui::SmallButton(scene.active ? ICON_FA_EYE : ICON_FA_EYE_SLASH))
-    {
-        if (!scene.active && !scene.path.empty() && CanUseEditorTools())
-        {
-            if (SceneManager::Instance().LoadScene(scene.path.string()))
-            {
-                m_projectStatus = "Scene enabled: " + scene.relativePath;
-                Tracenf("[HIERARCHY] Scene enabled: %s", scene.relativePath.c_str());
-            }
-        }
-    }
-    ImGui::PopStyleColor();
-    ImGui::SameLine();
-    ImGui::PushStyleColor(ImGuiCol_Text, ImVec4(0.95f, 0.36f, 0.36f, 1.0f));
-    if (ImGui::SmallButton(ICON_FA_TRASH))
-        DetachSceneFromHierarchy(scene);
-    ImGui::PopStyleColor();
+    if (!scene.active)
+        UI::ItemTooltip("Click to open this scene");
 
     if (hasChildren && open)
     {
@@ -355,9 +391,9 @@ void EditorImGui::RenderHierarchyContextMenu(const HierarchySceneEntity& entity)
     ImGui::TextUnformatted(entity.name.c_str());
     ImGui::Separator();
 
-    if (ImGui::MenuItem(ICON_FA_BULLSEYE " Focus Camera", "F"))
+    if (ImGui::MenuItem(ICON_FA_BULLSEYE "  Frame in Scene View", "F"))
         QueueHierarchyFocus(entity);
-    if (ImGui::MenuItem(ICON_FA_COPY " Duplicate"))
+    if (ImGui::MenuItem(ICON_FA_COPY "  Duplicate"))
     {
         m_commands.hierarchyDuplicateEntity = true;
         m_commands.hierarchyEntityType = entity.type;
@@ -368,13 +404,13 @@ void EditorImGui::RenderHierarchyContextMenu(const HierarchySceneEntity& entity)
             entity.objectId,
             static_cast<int>(entity.type));
     }
-    if (ImGui::MenuItem(ICON_FA_PEN " Rename", "F2"))
+    if (ImGui::MenuItem(ICON_FA_PEN "  Rename"))
         StartHierarchyRename(entity);
     if (entity.type == HierarchyEntityType::MeshEntity ||
         entity.type == HierarchyEntityType::PointLight ||
         entity.type == HierarchyEntityType::SpotLight)
     {
-        if (ImGui::MenuItem(ICON_FA_LAYER_GROUP " Create Prefab"))
+        if (ImGui::MenuItem(ICON_FA_LAYER_GROUP "  Create Prefab"))
         {
             QueueHierarchySelection(entity);
             m_commands.createPrefabFromSelection = true;
@@ -383,17 +419,17 @@ void EditorImGui::RenderHierarchyContextMenu(const HierarchySceneEntity& entity)
                 entity.objectId,
                 static_cast<int>(entity.type));
         }
-        if (ImGui::MenuItem(ICON_FA_ROTATE " Revert Prefab Overrides"))
+        if (ImGui::MenuItem(ICON_FA_ROTATE "  Revert Prefab Overrides"))
         {
             QueueHierarchySelection(entity);
             m_commands.revertSelectedPrefabInstance = true;
         }
-        if (ImGui::MenuItem(ICON_FA_FLOPPY_DISK " Apply to Prefab"))
+        if (ImGui::MenuItem(ICON_FA_FLOPPY_DISK "  Apply to Prefab"))
         {
             QueueHierarchySelection(entity);
             m_commands.applySelectedPrefabToAsset = true;
         }
-        if (ImGui::MenuItem(ICON_FA_ROTATE " Refresh All Prefab Instances"))
+        if (ImGui::MenuItem(ICON_FA_ROTATE "  Refresh All Prefab Instances"))
             m_commands.refreshAllPrefabInstances = true;
         if (ImGui::MenuItem("Unpack Prefab Instance"))
         {
@@ -430,7 +466,7 @@ void EditorImGui::RenderHierarchyContextMenu(const HierarchySceneEntity& entity)
 
     ImGui::Separator();
     ImGui::PushStyleColor(ImGuiCol_Text, ImVec4(0.95f, 0.30f, 0.30f, 1.0f));
-    if (ImGui::MenuItem(ICON_FA_TRASH " Delete", "Del"))
+    if (ImGui::MenuItem(ICON_FA_TRASH "  Delete", "Del"))
     {
         m_commands.hierarchyDeleteEntity = true;
         m_commands.hierarchyEntityType = entity.type;
@@ -486,6 +522,8 @@ void EditorImGui::RenderHierarchyEntityNode(std::uint64_t entityHandle)
         icon = ICON_FA_BULLSEYE;
     else if (entity->type == HierarchyEntityType::MeshEntity)
         icon = ICON_FA_CUBE;
+    else if (entity->type == HierarchyEntityType::Camera)
+        icon = ICON_FA_VIDEO;
 
     bool open = false;
     if (m_hierarchyRenamingEntity == entity->entity)
@@ -515,7 +553,7 @@ void EditorImGui::RenderHierarchyEntityNode(std::uint64_t entityHandle)
     else
     {
         const std::string displayName = entity->prefabRoot ? ("Prefab: " + entity->name) : entity->name;
-        const std::string label = std::string(icon) + " " + displayName + "##" + std::to_string(entity->entity);
+        const std::string label = std::string(icon) + "  " + displayName + "##" + std::to_string(entity->entity);
         open = ImGui::TreeNodeEx(label.c_str(), flags);
         if (entity->prefabRoot && ImGui::IsItemHovered())
             ImGui::SetTooltip("Prefab instance\nAsset: %s", entity->prefabAssetId.c_str());
@@ -664,34 +702,43 @@ void EditorImGui::RenderHierarchyEntityNode(std::uint64_t entityHandle)
 
 void EditorImGui::RenderHierarchyPanel()
 {
-    if (ImGui::Begin(ICON_FA_LIST_TREE " Hierarchy"))
+    if (!m_hierarchyPanelOpen)
+        return;
+    if (ImGui::Begin(EditorWindow::Hierarchy, &m_hierarchyPanelOpen))
     {
         RenderHierarchyToolbar();
-        ImGui::Separator();
+        ImGui::Spacing();
 
         const std::vector<ProjectSceneEntry> projectScenes = QueryProjectScenes();
         if (projectScenes.empty())
         {
-            ImGui::TextDisabled("No scene open");
-            ImGui::TextWrapped(ProjectManager::Instance().HasProject()
-                    ? "Create a scene from File to add it to this project."
-                    : "Open a project or create a scene from File.");
+            ImGui::Spacing();
+            ImGui::TextDisabled("No scene is open");
+            ImGui::PushTextWrapPos(0.0f);
+            ImGui::TextDisabled(ProjectManager::Instance().HasProject()
+                    ? "Create a scene with File > New Scene, or open one with File > Open Scene."
+                    : "Open a project (File > Open Project) or create a new one.");
+            ImGui::PopTextWrapPos();
         }
-        else if (ImGui::BeginTable("HierarchyEntityTree", 2,
-            ImGuiTableFlags_Resizable | ImGuiTableFlags_RowBg | ImGuiTableFlags_BordersInnerV | ImGuiTableFlags_SizingStretchProp))
+        else if (ImGui::BeginTable("HierarchyEntityTree", 2, ImGuiTableFlags_SizingStretchProp))
         {
-            ImGui::TableSetupColumn("Label", ImGuiTableColumnFlags_WidthStretch);
-            ImGui::TableSetupColumn("Visibility", ImGuiTableColumnFlags_WidthFixed, 84.0f);
-            ImGui::TableHeadersRow();
+            // The selected row in the accent color, so the selection is obvious at a glance.
+            ImGui::PushStyleColor(ImGuiCol_Header, ImVec4(0.17f, 0.31f, 0.52f, 1.0f));
+            ImGui::PushStyleColor(ImGuiCol_HeaderHovered, ImVec4(0.21f, 0.24f, 0.29f, 1.0f));
+            ImGui::PushStyleColor(ImGuiCol_HeaderActive, ImVec4(0.21f, 0.37f, 0.60f, 1.0f));
+            // Name, and the eye that hides an object in the editor only (it still exists in Play).
+            ImGui::TableSetupColumn("Name", ImGuiTableColumnFlags_WidthStretch);
+            ImGui::TableSetupColumn("Visible", ImGuiTableColumnFlags_WidthFixed, ImGui::GetFrameHeight() + 4.0f);
 
             if (ProjectManager::Instance().HasProject())
             {
                 ImGui::TableNextRow();
                 ImGui::TableSetColumnIndex(0);
                 const ProjectData& project = ProjectManager::Instance().CurrentProject();
-                const std::string rootLabel = std::string(ICON_FA_FOLDER_OPEN) + " " + project.name;
+                const std::string rootLabel = std::string(ICON_FA_FOLDER_OPEN "  ") + project.name;
                 const bool projectOpen = ImGui::TreeNodeEx(rootLabel.c_str(),
                     ImGuiTreeNodeFlags_DefaultOpen | ImGuiTreeNodeFlags_OpenOnArrow | ImGuiTreeNodeFlags_SpanFullWidth);
+                UI::ItemTooltip("The project. Drop a scene from the Asset Browser here to open it.");
                 if (ImGui::BeginDragDropTarget())
                 {
                     if (const ImGuiPayload* payload = ImGui::AcceptDragDropPayload(kAssetPayloadType))
@@ -706,8 +753,6 @@ void EditorImGui::RenderHierarchyPanel()
                     }
                     ImGui::EndDragDropTarget();
                 }
-                ImGui::TableSetColumnIndex(1);
-                ImGui::TextDisabled("-");
                 if (projectOpen)
                 {
                     for (const ProjectSceneEntry& scene : projectScenes)
@@ -720,7 +765,16 @@ void EditorImGui::RenderHierarchyPanel()
                 for (const ProjectSceneEntry& scene : projectScenes)
                     RenderProjectSceneNode(scene);
             }
+            ImGui::PopStyleColor(3);
             ImGui::EndTable();
+
+            if (m_hierarchyEntities.empty() && m_hierarchySearchBuffer[0] == '\0')
+            {
+                ImGui::Spacing();
+                ImGui::PushTextWrapPos(0.0f);
+                ImGui::TextDisabled("The scene is empty. Add objects with + above, or drag models from the Asset Browser.");
+                ImGui::PopTextWrapPos();
+            }
 
             if (!m_logHierarchyRendered)
             {
@@ -731,80 +785,15 @@ void EditorImGui::RenderHierarchyPanel()
                     m_hierarchyEntities.size());
             }
         }
-        if (CanUseEditorTools() && ImGui::BeginPopupContextWindow("HierarchyCreateContext",
+        // Right-click on empty space: the same create list as + and the Create menu.
+        if (ImGui::BeginPopupContextWindow("HierarchyCreateContext",
                 ImGuiPopupFlags_MouseButtonRight | ImGuiPopupFlags_NoOpenOverItems))
         {
-            if (ImGui::BeginMenu("Create"))
-            {
-                if (ImGui::MenuItem(ICON_FA_CUBE " Cube"))
-                {
-                    m_commands.addPrimitiveEntity = true;
-                    m_commands.primitiveType = "cube";
-                    Tracen("[PRIMITIVE] Hierarchy create queued type=cube");
-                }
-                if (ImGui::MenuItem(ICON_FA_CUBE " Sphere"))
-                {
-                    m_commands.addPrimitiveEntity = true;
-                    m_commands.primitiveType = "sphere";
-                    Tracen("[PRIMITIVE] Hierarchy create queued type=sphere");
-                }
-                if (ImGui::MenuItem(ICON_FA_CUBE " Capsule"))
-                {
-                    m_commands.addPrimitiveEntity = true;
-                    m_commands.primitiveType = "capsule";
-                    Tracen("[PRIMITIVE] Hierarchy create queued type=capsule");
-                }
-                ImGui::EndMenu();
-            }
+            RenderHierarchyCreateMenuItems();
             ImGui::EndPopup();
         }
     }
     ImGui::End();
-}
-void EditorImGui::RenderToolsPanel()
-{
-    if (ImGui::Begin("Tools"))
-    {
-        UI::SectionHeader(ICON_FA_WRENCH " Tools");
-        const bool toolsEnabled = CanUseEditorTools();
-        if (!toolsEnabled)
-        {
-            ImGui::TextColored(ImVec4(0.95f, 0.74f, 0.30f, 1.0f), "Tools disabled in Play Mode");
-            ImGui::BeginDisabled();
-        }
-        if (UI::IconButton(ICON_FA_DROPLET, "Water", ImVec2(-1.0f, 0.0f)))
-        {
-            m_commands.addWaterBody = true;
-            Tracen("[EDITOR-3D-SPAWN] Add water requested");
-        }
-
-        ImGui::Separator();
-        UI::SectionHeader(ICON_FA_HAMMER " Editing");
-        if (UI::IconButton(ICON_FA_WATER, "Water Sculpt", ImVec2(-1.0f, 0.0f)))
-            m_waterSculptToolOpen = !m_waterSculptToolOpen;
-        if (UI::IconButton(ICON_FA_MOUNTAIN, "Heightmap", ImVec2(-1.0f, 0.0f)))
-            m_heightmapToolOpen = !m_heightmapToolOpen;
-        if (UI::IconButton(ICON_FA_PAINTBRUSH, "Splat Paint", ImVec2(-1.0f, 0.0f)))
-            m_splatPaintToolOpen = !m_splatPaintToolOpen;
-
-        ImGui::Separator();
-        if (UI::IconButton(ICON_FA_UNDO, "Undo", ImVec2(-1.0f, 0.0f)))
-            m_commands.undo = true;
-        if (UI::IconButton(ICON_FA_FLOPPY_DISK, "Save", ImVec2(-1.0f, 0.0f)))
-            m_commands.save = true;
-        if (UI::IconButton(ICON_FA_ROTATE, "Reload", ImVec2(-1.0f, 0.0f)))
-            m_commands.reload = true;
-
-        if (!toolsEnabled)
-            ImGui::EndDisabled();
-    }
-    ImGui::End();
-
-    if (!m_logToolsRendered)
-    {
-        m_logToolsRendered = true;
-        Tracen("[EDITOR-IMGUI-2] Tools panel rendered");
-    }
 }
 
 void EditorImGui::MarkSelectedWaterBodyChanged()

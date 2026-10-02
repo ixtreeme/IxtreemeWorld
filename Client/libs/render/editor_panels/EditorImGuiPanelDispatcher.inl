@@ -6,33 +6,40 @@ void EditorImGui::RenderEditorPanels()
     if (!m_editorModeActive)
         return;
 
-    RenderDockSpace();
+    // The shell first: the menu bar, toolbar and status bar take their strips of the window and the
+    // dock space fills the rest.
     RenderMenuBar();
+    RenderMainToolbar();
+    RenderStatusBar();
+    RenderDockSpace();
     RenderProjectModal();
     HandleEditorHotkeys();
     RunProjectAutoSave();
     m_pendingScriptChanges = PollScriptFileChanges();  // save-to-live: drained by EngineApplication
-    RenderEditorToolbar();
     RenderHierarchyPanel();
-    RenderSceneSettingsPanel();
-    RenderWorldPanel();
-    RenderToolsPanel();
-    RenderAssetBrowser();
-    RenderScriptsPanel();
-    RenderInspector();
-    RenderBuildOutputPanel();
-    RenderBuildGamePopup();
     RenderSceneViewDropTarget();
     RenderGameViewPanel();
     RenderAnimatorPanel();
-    RenderWaterSculptToolPanel();
-    RenderHeightmapToolPanel();
-    RenderSplatPaintToolPanel();
+    RenderInspector();
+    RenderSceneSettingsPanel();
+    RenderAssetBrowser();
+    RenderScriptsPanel();
+    RenderConsolePanel();
+    RenderBuildOutputPanel();
+    RenderBuildGamePopup();
+    RenderCreateTerrainModal();
+    RenderStatisticsWindow();
+    RenderPhysicsDebuggerWindow();
+    RenderProjectSettingsWindow();
+    RenderLayeredWorldWindow();
+    RenderShortcutsWindow();
+    RenderAboutPopup();
     RenderTreeGeneratorPanel();
     RenderWaterMaterialEditor();
     RenderPbrMaterialEditor();
     RenderCreatePbrMaterialPopup();
     RenderFbxExportPopup();
+    TrackStatusMessages();
 
     // Auto-switch the active viewport tab on Play/Stop: Game (project Main Camera)
     // while playing, Scene View (free-fly editor camera) while editing. ImGui's public
@@ -58,7 +65,7 @@ void EditorImGui::RenderEditorPanels()
     if (m_defaultLayoutTabSelectFrames > 0)
     {
         --m_defaultLayoutTabSelectFrames;
-        for (const char* name : {"Scene View", "Asset Browser", "Inspector", ICON_FA_LIST_TREE " Hierarchy"})
+        for (const char* name : {EditorWindow::SceneView, EditorWindow::AssetBrowser, EditorWindow::Inspector, EditorWindow::Hierarchy})
         {
             ImGuiWindow* window = ImGui::FindWindowByName(name);
             if (window == nullptr || window->DockNode == nullptr)
@@ -74,7 +81,7 @@ void EditorImGui::RenderEditorPanels()
     if (m_startupViewFocusFrames > 0)
     {
         --m_startupViewFocusFrames;
-        ImGui::SetWindowFocus("Scene View");
+        ImGui::SetWindowFocus(EditorWindow::SceneView);
     }
 }
 

@@ -21,6 +21,8 @@
 #include <windows.h>
 #endif
 
+#include <array>
+#include <cmath>
 #include <cstdint>
 #include <limits>
 
@@ -61,6 +63,43 @@ int CreateAdapterVkSurface(ImGuiViewport* viewport,
         reinterpret_cast<VkSurfaceKHR*>(outVkSurface)));
 }
 #endif
+
+// Editor colors (the style and every color written in the panels) are sRGB values. An sRGB
+// render target treats what the shader writes as linear and encodes it, which would show each of
+// them lighter than written: decode the vertex colors to linear first. Alpha is coverage and stays.
+void DecodeDrawDataColorsToLinear(ImDrawData* drawData)
+{
+    static const std::array<std::uint8_t, 256> kSrgbToLinear = [] {
+        std::array<std::uint8_t, 256> table{};
+        for (int i = 0; i < 256; ++i)
+        {
+            const double srgb = static_cast<double>(i) / 255.0;
+            const double linear = srgb <= 0.04045 ? srgb / 12.92 : std::pow((srgb + 0.055) / 1.055, 2.4);
+            table[static_cast<std::size_t>(i)] = static_cast<std::uint8_t>(linear * 255.0 + 0.5);
+        }
+        return table;
+    }();
+    if (!drawData)
+        return;
+    for (int listIndex = 0; listIndex < drawData->CmdListsCount; ++listIndex)
+    {
+        ImVector<ImDrawVert>& vertices = drawData->CmdLists[listIndex]->VtxBuffer;
+        for (ImDrawVert& vertex : vertices)
+        {
+            const ImU32 color = vertex.col;
+            const ImU32 r = kSrgbToLinear[(color >> IM_COL32_R_SHIFT) & 0xFFu];
+            const ImU32 g = kSrgbToLinear[(color >> IM_COL32_G_SHIFT) & 0xFFu];
+            const ImU32 b = kSrgbToLinear[(color >> IM_COL32_B_SHIFT) & 0xFFu];
+            vertex.col = (color & IM_COL32_A_MASK) | (r << IM_COL32_R_SHIFT) | (g << IM_COL32_G_SHIFT) |
+                (b << IM_COL32_B_SHIFT);
+        }
+    }
+}
+
+bool IsSrgbFormat(ixrhi::IXRHIFormat format)
+{
+    return format == ixrhi::IXRHIFormat::R8G8B8A8Srgb || format == ixrhi::IXRHIFormat::B8G8R8A8Srgb;
+}
 
 std::uint32_t CountAdapterDrawCommands(const ImDrawData* drawData)
 {
@@ -260,6 +299,8 @@ void IXVulkanEditorAdapter::DrawFrame(ixrhi::IXRHICommandList& cmd, std::uint64_
             drawData ? drawData->CmdListsCount : 0,
             CountAdapterDrawCommands(drawData));
     }
+    if (IsSrgbFormat(m_rhi->GetMainSwapchain().ColorFormat()))
+        DecodeDrawDataColorsToLinear(drawData);
     ImGui_ImplVulkan_RenderDrawData(drawData, native->Native());
 
     static std::uint32_t lastLoggedDrawCommands = std::numeric_limits<std::uint32_t>::max();

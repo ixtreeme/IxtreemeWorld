@@ -1,59 +1,6 @@
 // This file is included from EditorImGui.cpp inside the editor-enabled implementation block.
 // Keep shared anonymous-namespace helpers in EditorImGui.cpp until this panel group is fully decoupled.
 
-void EditorImGui::RenderGizmoControls()
-{
-    auto publish = [this]() {
-        m_commands.gizmoSettingsChanged = true;
-        m_commands.gizmoOperation = m_gizmoOperation;
-        m_commands.gizmoSnapEnabled = m_gizmoSnapEnabled;
-        m_commands.gizmoSnapValue = m_gizmoSnapValue;
-    };
-
-    ImGui::TextUnformatted("Gizmo");
-    ImGui::SameLine();
-
-    auto operationButton = [&](const char* label, const char* tooltip, MapEditorGizmoOperation operation, const char* trace) {
-        const bool active = m_gizmoOperation == operation;
-        if (active)
-            ImGui::PushStyleColor(ImGuiCol_Button, ImVec4(0.22f, 0.48f, 0.86f, 1.0f));
-        if (ImGui::SmallButton(label))
-        {
-            m_gizmoOperation = operation;
-            publish();
-            Tracen(trace);
-        }
-        if (active)
-            ImGui::PopStyleColor();
-        if (ImGui::IsItemHovered())
-            ImGui::SetTooltip("%s", tooltip);
-        ImGui::SameLine();
-    };
-
-    operationButton("W", "Object Gizmo", MapEditorGizmoOperation::Translate, "[EDITOR-GIZMO] Gizmo operation changed: object");
-    operationButton("E", "Rotate", MapEditorGizmoOperation::Rotate, "[EDITOR-GIZMO] Gizmo operation changed: rotate");
-    operationButton("R", "Scale", MapEditorGizmoOperation::Scale, "[EDITOR-GIZMO] Gizmo operation changed: scale");
-
-    bool snapChanged = ImGui::Checkbox("Snap", &m_gizmoSnapEnabled);
-    if (m_gizmoSnapEnabled)
-    {
-        ImGui::SameLine();
-        const char* labels[] = {"0.1", "0.5", "1.0", "5.0"};
-        ImGui::SetNextItemWidth(72.0f);
-        snapChanged = ImGui::Combo("##GizmoSnap", &m_gizmoSnapIndex, labels, IM_ARRAYSIZE(labels)) || snapChanged;
-        constexpr float values[] = {0.1f, 0.5f, 1.0f, 5.0f};
-        m_gizmoSnapIndex = std::clamp(m_gizmoSnapIndex, 0, 3);
-        m_gizmoSnapValue = values[m_gizmoSnapIndex];
-    }
-    if (snapChanged)
-    {
-        publish();
-        Tracenf("[EDITOR-GIZMO] Snapping: enabled=%d value=%.2f",
-            m_gizmoSnapEnabled ? 1 : 0,
-            m_gizmoSnapValue);
-    }
-}
-
 void EditorImGui::RenderWaterMaterialHeader()
 {
     if (!m_assetLibrary)
@@ -63,7 +10,7 @@ void EditorImGui::RenderWaterMaterialHeader()
     const std::string title = entry ? entry->displayName : m_waterMaterialEditor.materialId;
     UI::SectionHeader(ICON_FA_PALETTE " Water Material");
     ImGui::Text("Editing: %s%s", title.c_str(), m_waterMaterialEditor.dirty ? " *" : "");
-    ImGui::InputText("Name", m_waterMaterialEditor.name, sizeof(m_waterMaterialEditor.name));
+    UI::Prop::InputText("Name", m_waterMaterialEditor.name, sizeof(m_waterMaterialEditor.name));
 
     if (UI::IconButton(ICON_FA_FLOPPY_DISK, "Save"))
         SaveWaterMaterialEditor();
@@ -76,7 +23,7 @@ void EditorImGui::RenderWaterMaterialHeader()
 
     if (ImGui::BeginPopup("NewWaterMaterialPopup"))
     {
-        ImGui::InputText("Name", m_waterMaterialEditor.newName, sizeof(m_waterMaterialEditor.newName));
+        UI::Prop::InputText("Name", m_waterMaterialEditor.newName, sizeof(m_waterMaterialEditor.newName));
         if (UI::IconButton(ICON_FA_CHECK, "Create"))
         {
             AssetLibrary::Entry created{};
@@ -128,14 +75,14 @@ void EditorImGui::RenderWaterMaterialColorsSection(WaterMaterialData& material)
     if (!ImGui::CollapsingHeader("Colors", ImGuiTreeNodeFlags_DefaultOpen))
         return;
     WaterConfig& config = material.config;
-    if (ImGui::Checkbox("Water Enabled", &config.enabled)) MarkWaterMaterialChanged("enabled");
-    if (ImGui::ColorEdit4("Base Color", config.baseColor)) MarkWaterMaterialChanged("base_color");
-    if (ImGui::ColorEdit3("Deep Color", config.deepColor)) MarkWaterMaterialChanged("deep_color");
-    if (ImGui::ColorEdit3("Shallow Color", config.shallowColor)) MarkWaterMaterialChanged("shallow_color");
-    if (ImGui::SliderFloat("Color Depth Min", &config.depthColorMin, 0.0f, 50.0f, "%.2f m")) MarkWaterMaterialChanged("depth_color_min");
-    if (ImGui::SliderFloat("Color Depth Max", &config.depthColorMax, 0.01f, 50.0f, "%.2f m")) MarkWaterMaterialChanged("depth_color_max");
+    if (UI::Prop::Checkbox("Water Enabled", &config.enabled)) MarkWaterMaterialChanged("enabled");
+    if (UI::Prop::ColorEdit4("Base Color", config.baseColor)) MarkWaterMaterialChanged("base_color");
+    if (UI::Prop::ColorEdit3("Deep Color", config.deepColor)) MarkWaterMaterialChanged("deep_color");
+    if (UI::Prop::ColorEdit3("Shallow Color", config.shallowColor)) MarkWaterMaterialChanged("shallow_color");
+    if (UI::Prop::SliderFloat("Color Depth Min", &config.depthColorMin, 0.0f, 50.0f, "%.2f m")) MarkWaterMaterialChanged("depth_color_min");
+    if (UI::Prop::SliderFloat("Color Depth Max", &config.depthColorMax, 0.01f, 50.0f, "%.2f m")) MarkWaterMaterialChanged("depth_color_max");
     config.depthColorMax = std::max(config.depthColorMax, config.depthColorMin + 0.01f);
-    if (ImGui::SliderFloat("Fade Distance", &config.depthFadeDistance, 0.01f, 50.0f, "%.2f m")) MarkWaterMaterialChanged("depth_fade_distance");
+    if (UI::Prop::SliderFloat("Fade Distance", &config.depthFadeDistance, 0.01f, 50.0f, "%.2f m")) MarkWaterMaterialChanged("depth_fade_distance");
 }
 
 void EditorImGui::RenderWaterMaterialWaveSection(WaterMaterialData& material)
@@ -143,13 +90,13 @@ void EditorImGui::RenderWaterMaterialWaveSection(WaterMaterialData& material)
     if (!ImGui::CollapsingHeader("Wave", ImGuiTreeNodeFlags_DefaultOpen))
         return;
     WaterConfig& config = material.config;
-    if (ImGui::SliderFloat("Wave Scale Small", &config.waveScaleSmall, 0.001f, 0.12f, "%.3f")) MarkWaterMaterialChanged("wave_scale_small");
-    if (ImGui::SliderFloat("Wave Scale Large", &config.waveScaleLarge, 0.001f, 0.08f, "%.3f")) MarkWaterMaterialChanged("wave_scale_large");
-    if (ImGui::SliderFloat("Wave Speed Small", &config.waveSpeedSmall, 0.0f, 0.5f, "%.3f")) MarkWaterMaterialChanged("wave_speed_small");
-    if (ImGui::SliderFloat("Wave Speed Large", &config.waveSpeedLarge, 0.0f, 0.5f, "%.3f")) MarkWaterMaterialChanged("wave_speed_large");
-    if (ImGui::SliderFloat("Normal Strength", &config.normalStrength, 0.0f, 2.0f, "%.2f")) MarkWaterMaterialChanged("normal_strength");
-    if (ImGui::SliderFloat("Fresnel Power", &config.fresnelPower, 1.0f, 10.0f, "%.2f")) MarkWaterMaterialChanged("fresnel_power");
-    if (ImGui::SliderFloat("Fresnel Min", &config.fresnelMin, 0.0f, 0.5f, "%.3f")) MarkWaterMaterialChanged("fresnel_min");
+    if (UI::Prop::SliderFloat("Wave Scale Small", &config.waveScaleSmall, 0.001f, 0.12f, "%.3f")) MarkWaterMaterialChanged("wave_scale_small");
+    if (UI::Prop::SliderFloat("Wave Scale Large", &config.waveScaleLarge, 0.001f, 0.08f, "%.3f")) MarkWaterMaterialChanged("wave_scale_large");
+    if (UI::Prop::SliderFloat("Wave Speed Small", &config.waveSpeedSmall, 0.0f, 0.5f, "%.3f")) MarkWaterMaterialChanged("wave_speed_small");
+    if (UI::Prop::SliderFloat("Wave Speed Large", &config.waveSpeedLarge, 0.0f, 0.5f, "%.3f")) MarkWaterMaterialChanged("wave_speed_large");
+    if (UI::Prop::SliderFloat("Normal Strength", &config.normalStrength, 0.0f, 2.0f, "%.2f")) MarkWaterMaterialChanged("normal_strength");
+    if (UI::Prop::SliderFloat("Fresnel Power", &config.fresnelPower, 1.0f, 10.0f, "%.2f")) MarkWaterMaterialChanged("fresnel_power");
+    if (UI::Prop::SliderFloat("Fresnel Min", &config.fresnelMin, 0.0f, 0.5f, "%.3f")) MarkWaterMaterialChanged("fresnel_min");
 }
 
 void EditorImGui::RenderWaterMaterialFoamSection(WaterMaterialData& material)
@@ -157,15 +104,15 @@ void EditorImGui::RenderWaterMaterialFoamSection(WaterMaterialData& material)
     if (!ImGui::CollapsingHeader("Foam"))
         return;
     WaterConfig& config = material.config;
-    if (ImGui::Checkbox("Foam Enabled", &config.foamEnabled)) MarkWaterMaterialChanged("foam_enabled");
+    if (UI::Prop::Checkbox("Foam Enabled", &config.foamEnabled)) MarkWaterMaterialChanged("foam_enabled");
     if (!config.foamEnabled)
         ImGui::BeginDisabled();
-    if (ImGui::SliderFloat("Foam Distance", &config.foamDistance, 0.02f, 1.5f, "%.3f m")) MarkWaterMaterialChanged("foam_distance");
-    if (ImGui::SliderFloat("Foam Softness", &config.foamSoftness, 0.0f, 0.5f, "%.3f")) MarkWaterMaterialChanged("foam_softness");
-    if (ImGui::SliderFloat("Foam Intensity", &config.foamIntensity, 0.0f, 2.0f, "%.2f")) MarkWaterMaterialChanged("foam_intensity");
-    if (ImGui::SliderFloat("Foam Scroll Speed", &config.foamScrollSpeed, -1.0f, 1.0f, "%.3f")) MarkWaterMaterialChanged("foam_scroll_speed");
-    if (ImGui::SliderFloat("Foam Scale", &config.foamScale, 0.1f, 2.0f, "%.2f")) MarkWaterMaterialChanged("foam_scale");
-    if (ImGui::SliderFloat("Terrain Foam Thickness", &config.foamTerrainThickness, 0.0f, 1.0f, "%.3f m")) MarkWaterMaterialChanged("foam_terrain_thickness");
+    if (UI::Prop::SliderFloat("Foam Distance", &config.foamDistance, 0.02f, 1.5f, "%.3f m")) MarkWaterMaterialChanged("foam_distance");
+    if (UI::Prop::SliderFloat("Foam Softness", &config.foamSoftness, 0.0f, 0.5f, "%.3f")) MarkWaterMaterialChanged("foam_softness");
+    if (UI::Prop::SliderFloat("Foam Intensity", &config.foamIntensity, 0.0f, 2.0f, "%.2f")) MarkWaterMaterialChanged("foam_intensity");
+    if (UI::Prop::SliderFloat("Foam Scroll Speed", &config.foamScrollSpeed, -1.0f, 1.0f, "%.3f")) MarkWaterMaterialChanged("foam_scroll_speed");
+    if (UI::Prop::SliderFloat("Foam Scale", &config.foamScale, 0.1f, 2.0f, "%.2f")) MarkWaterMaterialChanged("foam_scale");
+    if (UI::Prop::SliderFloat("Terrain Foam Thickness", &config.foamTerrainThickness, 0.0f, 1.0f, "%.3f m")) MarkWaterMaterialChanged("foam_terrain_thickness");
     if (!config.foamEnabled)
         ImGui::EndDisabled();
 }
@@ -177,17 +124,17 @@ void EditorImGui::RenderWaterMaterialCausticSection(WaterMaterialData& material)
     WaterConfig& config = material.config;
     const char* modes[] = {"Off", "Animated", "Procedural"};
     int mode = static_cast<int>(config.causticMode);
-    if (ImGui::Combo("Caustic Mode", &mode, modes, IM_ARRAYSIZE(modes)))
+    if (UI::Prop::Combo("Caustic Mode", &mode, modes, IM_ARRAYSIZE(modes)))
     {
         config.causticMode = static_cast<WaterConfig::CausticMode>(std::clamp(mode, 0, 2));
         MarkWaterMaterialChanged("caustic_mode");
     }
     if (config.causticMode == WaterConfig::CausticMode::Off)
         ImGui::BeginDisabled();
-    if (ImGui::SliderFloat("Caustic Intensity", &config.causticIntensity, 0.0f, 3.0f, "%.2f")) MarkWaterMaterialChanged("caustic_intensity");
-    if (ImGui::SliderFloat("Caustic Scale", &config.causticScale, 0.1f, 2.0f, "%.2f m")) MarkWaterMaterialChanged("caustic_scale");
-    if (ImGui::SliderFloat("Caustic Speed", &config.causticSpeed, 0.0f, 2.0f, "%.2f")) MarkWaterMaterialChanged("caustic_speed");
-    if (ImGui::SliderFloat("Caustic Max Depth", &config.causticMaxDepth, 1.0f, 30.0f, "%.1f m")) MarkWaterMaterialChanged("caustic_max_depth");
+    if (UI::Prop::SliderFloat("Caustic Intensity", &config.causticIntensity, 0.0f, 3.0f, "%.2f")) MarkWaterMaterialChanged("caustic_intensity");
+    if (UI::Prop::SliderFloat("Caustic Scale", &config.causticScale, 0.1f, 2.0f, "%.2f m")) MarkWaterMaterialChanged("caustic_scale");
+    if (UI::Prop::SliderFloat("Caustic Speed", &config.causticSpeed, 0.0f, 2.0f, "%.2f")) MarkWaterMaterialChanged("caustic_speed");
+    if (UI::Prop::SliderFloat("Caustic Max Depth", &config.causticMaxDepth, 1.0f, 30.0f, "%.1f m")) MarkWaterMaterialChanged("caustic_max_depth");
     if (config.causticMode == WaterConfig::CausticMode::Off)
         ImGui::EndDisabled();
 }
@@ -197,18 +144,18 @@ void EditorImGui::RenderWaterMaterialReflectionSection(WaterMaterialData& materi
     if (!ImGui::CollapsingHeader("Reflection"))
         return;
     WaterConfig& config = material.config;
-    if (ImGui::Checkbox("Reflection Enabled", &config.reflectionEnabled)) MarkWaterMaterialChanged("reflection_enabled");
+    if (UI::Prop::Checkbox("Reflection Enabled", &config.reflectionEnabled)) MarkWaterMaterialChanged("reflection_enabled");
     if (!config.reflectionEnabled)
         ImGui::BeginDisabled();
-    if (ImGui::ColorEdit3("Reflection Color", config.reflectionColor)) MarkWaterMaterialChanged("reflection_color");
+    if (UI::Prop::ColorEdit3("Reflection Color", config.reflectionColor)) MarkWaterMaterialChanged("reflection_color");
     const char* qualities[] = {"Low", "Medium", "High"};
     int quality = static_cast<int>(config.reflectionQuality);
-    if (ImGui::Combo("Reflection Quality", &quality, qualities, IM_ARRAYSIZE(qualities)))
+    if (UI::Prop::Combo("Reflection Quality", &quality, qualities, IM_ARRAYSIZE(qualities)))
     {
         config.reflectionQuality = static_cast<WaterConfig::ReflectionQuality>(std::clamp(quality, 0, 2));
         MarkWaterMaterialChanged("reflection_quality");
     }
-    if (ImGui::SliderFloat("Distortion Strength", &config.reflectionDistortionStrength, 0.0f, 0.2f, "%.3f")) MarkWaterMaterialChanged("reflection_distortion_strength");
+    if (UI::Prop::SliderFloat("Distortion Strength", &config.reflectionDistortionStrength, 0.0f, 0.2f, "%.3f")) MarkWaterMaterialChanged("reflection_distortion_strength");
     if (!config.reflectionEnabled)
         ImGui::EndDisabled();
 }
@@ -218,11 +165,11 @@ void EditorImGui::RenderWaterMaterialRefractionSection(WaterMaterialData& materi
     if (!ImGui::CollapsingHeader("Refraction"))
         return;
     WaterConfig& config = material.config;
-    if (ImGui::Checkbox("Refraction Enabled", &config.refractionEnabled)) MarkWaterMaterialChanged("refraction_enabled");
+    if (UI::Prop::Checkbox("Refraction Enabled", &config.refractionEnabled)) MarkWaterMaterialChanged("refraction_enabled");
     if (!config.refractionEnabled)
         ImGui::BeginDisabled();
-    if (ImGui::SliderFloat("Refraction Strength", &config.refractionStrength, 0.0f, 0.1f, "%.3f")) MarkWaterMaterialChanged("refraction_strength");
-    if (ImGui::SliderFloat("Depth Multiplier", &config.refractionDepthStrength, 0.0f, 2.0f, "%.2f")) MarkWaterMaterialChanged("refraction_depth_strength");
+    if (UI::Prop::SliderFloat("Refraction Strength", &config.refractionStrength, 0.0f, 0.1f, "%.3f")) MarkWaterMaterialChanged("refraction_strength");
+    if (UI::Prop::SliderFloat("Depth Multiplier", &config.refractionDepthStrength, 0.0f, 2.0f, "%.2f")) MarkWaterMaterialChanged("refraction_depth_strength");
     if (!config.refractionEnabled)
         ImGui::EndDisabled();
 }
@@ -232,10 +179,10 @@ void EditorImGui::RenderWaterMaterialEdgeFadeSection(WaterMaterialData& material
     if (!ImGui::CollapsingHeader("Edge Fade", ImGuiTreeNodeFlags_DefaultOpen))
         return;
     WaterConfig& config = material.config;
-    if (ImGui::SliderFloat("Edge Fade Distance", &config.edgeFadeDistance, 0.0f, 3.0f, "%.2f m")) MarkWaterMaterialChanged("edge_fade_distance");
+    if (UI::Prop::SliderFloat("Edge Fade Distance", &config.edgeFadeDistance, 0.0f, 3.0f, "%.2f m")) MarkWaterMaterialChanged("edge_fade_distance");
     const char* curves[] = {"Linear", "Smooth", "Exponential"};
     int curve = static_cast<int>(config.edgeFadeCurve);
-    if (ImGui::Combo("Edge Fade Curve", &curve, curves, IM_ARRAYSIZE(curves)))
+    if (UI::Prop::Combo("Edge Fade Curve", &curve, curves, IM_ARRAYSIZE(curves)))
     {
         config.edgeFadeCurve = static_cast<WaterConfig::EdgeFadeCurve>(std::clamp(curve, 0, 2));
         MarkWaterMaterialChanged("edge_fade_curve");
@@ -307,9 +254,9 @@ void EditorImGui::RenderWaterMaterialTexturesSection(WaterMaterialData& material
     if (changed)
         MarkWaterMaterialChanged("texture_slot");
 
-    if (ImGui::SliderFloat2("Scroll Speed A", material.scrollSpeedA, -1.0f, 1.0f, "%.3f")) MarkWaterMaterialChanged("scroll_speed_a");
-    if (ImGui::SliderFloat2("Scroll Speed B", material.scrollSpeedB, -1.0f, 1.0f, "%.3f")) MarkWaterMaterialChanged("scroll_speed_b");
-    if (ImGui::SliderFloat("Normal Tiling", &material.normalTiling, 0.1f, 20.0f, "%.2f")) MarkWaterMaterialChanged("normal_tiling");
+    if (UI::Prop::SliderFloat2("Scroll Speed A", material.scrollSpeedA, -1.0f, 1.0f, "%.3f")) MarkWaterMaterialChanged("scroll_speed_a");
+    if (UI::Prop::SliderFloat2("Scroll Speed B", material.scrollSpeedB, -1.0f, 1.0f, "%.3f")) MarkWaterMaterialChanged("scroll_speed_b");
+    if (UI::Prop::SliderFloat("Normal Tiling", &material.normalTiling, 0.1f, 20.0f, "%.2f")) MarkWaterMaterialChanged("normal_tiling");
 }
 
 void EditorImGui::RenderWaterMaterialEditor()
@@ -355,7 +302,7 @@ void EditorImGui::RenderPbrMaterialHeader()
 {
     UI::SectionHeader(ICON_FA_PALETTE " PBR Material");
     ImGui::Text("Editing: %s%s", m_pbrMaterialEditor.name, m_pbrMaterialEditor.dirty ? " *" : "");
-    ImGui::InputText("Name", m_pbrMaterialEditor.name, sizeof(m_pbrMaterialEditor.name));
+    UI::Prop::InputText("Name", m_pbrMaterialEditor.name, sizeof(m_pbrMaterialEditor.name));
     if (UI::IconButton(ICON_FA_FLOPPY_DISK, "Save"))
         SavePbrMaterialEditor();
     ImGui::SameLine();
@@ -428,7 +375,7 @@ void EditorImGui::RenderPbrMaterialEditor()
         AssetLibrary::MaterialData& material = m_pbrMaterialEditor.draft;
         int shadingModeIndex = ToLowerAscii(material.shadingMode) == "unlit" ? 1 : 0;
         const char* shadingModes[] = {"Lit", "Unlit"};
-        if (ImGui::Combo("Shading Mode", &shadingModeIndex, shadingModes, IM_ARRAYSIZE(shadingModes)))
+        if (UI::Prop::Combo("Shading Mode", &shadingModeIndex, shadingModes, IM_ARRAYSIZE(shadingModes)))
         {
             material.shadingMode = shadingModeIndex == 1 ? "unlit" : "lit";
             MarkPbrMaterialChanged("shading_mode");
@@ -455,15 +402,15 @@ void EditorImGui::RenderPbrMaterialEditor()
         }
         if (ImGui::CollapsingHeader("Parameters", ImGuiTreeNodeFlags_DefaultOpen))
         {
-            if (ImGui::SliderFloat("Tiling X", &material.tilingScaleX, 0.01f, 32.0f, "%.2f")) MarkPbrMaterialChanged("tiling_x");
-            if (ImGui::SliderFloat("Tiling Y", &material.tilingScaleY, 0.01f, 32.0f, "%.2f")) MarkPbrMaterialChanged("tiling_y");
-            if (ImGui::ColorEdit3("Tint", material.colorTint)) MarkPbrMaterialChanged("color_tint");
+            if (UI::Prop::SliderFloat("Tiling X", &material.tilingScaleX, 0.01f, 32.0f, "%.2f")) MarkPbrMaterialChanged("tiling_x");
+            if (UI::Prop::SliderFloat("Tiling Y", &material.tilingScaleY, 0.01f, 32.0f, "%.2f")) MarkPbrMaterialChanged("tiling_y");
+            if (UI::Prop::ColorEdit3("Tint", material.colorTint)) MarkPbrMaterialChanged("color_tint");
             if (unlitMode)
                 ImGui::PushStyleVar(ImGuiStyleVar_Alpha, ImGui::GetStyle().Alpha * 0.55f);
-            if (ImGui::SliderFloat("Normal Strength", &material.normalStrength, 0.0f, 2.0f, "%.2f")) MarkPbrMaterialChanged("normal_strength");
-            if (ImGui::SliderFloat("AO Strength", &material.aoStrength, 0.0f, 2.0f, "%.2f")) MarkPbrMaterialChanged("ao_strength");
-            if (ImGui::SliderFloat("Roughness Strength", &material.roughnessStrength, 0.0f, 2.0f, "%.2f")) MarkPbrMaterialChanged("roughness_strength");
-            if (ImGui::SliderFloat("Metallic Strength", &material.metallicStrength, 0.0f, 2.0f, "%.2f")) MarkPbrMaterialChanged("metallic_strength");
+            if (UI::Prop::SliderFloat("Normal Strength", &material.normalStrength, 0.0f, 2.0f, "%.2f")) MarkPbrMaterialChanged("normal_strength");
+            if (UI::Prop::SliderFloat("AO Strength", &material.aoStrength, 0.0f, 2.0f, "%.2f")) MarkPbrMaterialChanged("ao_strength");
+            if (UI::Prop::SliderFloat("Roughness Strength", &material.roughnessStrength, 0.0f, 2.0f, "%.2f")) MarkPbrMaterialChanged("roughness_strength");
+            if (UI::Prop::SliderFloat("Metallic Strength", &material.metallicStrength, 0.0f, 2.0f, "%.2f")) MarkPbrMaterialChanged("metallic_strength");
             if (unlitMode)
                 ImGui::PopStyleVar();
         }
@@ -472,14 +419,14 @@ void EditorImGui::RenderPbrMaterialEditor()
             int alphaModeIndex = ToLowerAscii(material.alphaMode) == "mask" ? 1 :
                 (ToLowerAscii(material.alphaMode) == "blend" ? 2 : 0);
             const char* alphaModes[] = {"OPAQUE", "MASK", "BLEND"};
-            if (ImGui::Combo("Alpha Mode", &alphaModeIndex, alphaModes, IM_ARRAYSIZE(alphaModes)))
+            if (UI::Prop::Combo("Alpha Mode", &alphaModeIndex, alphaModes, IM_ARRAYSIZE(alphaModes)))
             {
                 material.alphaMode = alphaModeIndex == 1 ? "mask" : (alphaModeIndex == 2 ? "blend" : "opaque");
                 MarkPbrMaterialChanged("alpha_mode");
             }
             if (alphaModeIndex == 1)
             {
-                if (ImGui::SliderFloat("Alpha Cutoff", &material.alphaCutoff, 0.0f, 1.0f, "%.3f"))
+                if (UI::Prop::SliderFloat("Alpha Cutoff", &material.alphaCutoff, 0.0f, 1.0f, "%.3f"))
                     MarkPbrMaterialChanged("alpha_cutoff");
             }
         }
@@ -494,20 +441,109 @@ void EditorImGui::RenderSelectedTerrainInspector()
     if (!m_terrainState.selected)
         return;
 
-    UI::SectionHeader(ICON_FA_MOUNTAIN " Terrain");
-    ImGui::TextDisabled("flecs=%llu  object=1",
-        static_cast<unsigned long long>(m_selectedHierarchyEntity));
-    ImGui::Text("Name: %s", m_terrainState.name.c_str());
-    ImGui::Separator();
-    ImGui::Text("Size: %.2f m x %.2f m",
-        m_terrainState.widthMeters,
-        m_terrainState.depthMeters);
-    ImGui::Text("Cell size: %.2f m/cell", m_terrainState.cellSizeMeters);
-    ImGui::Text("Cells: %u x %u", m_terrainState.cellsX, m_terrainState.cellsZ);
-    const std::uint64_t verts =
-        static_cast<std::uint64_t>(m_terrainState.cellsX + 1u) *
-        static_cast<std::uint64_t>(m_terrainState.cellsZ + 1u);
-    ImGui::Text("Vertices: %llu", static_cast<unsigned long long>(verts));
+    UI::SectionHeader((std::string(ICON_FA_MOUNTAIN "  ") + (m_terrainState.name.empty() ? "Terrain" : m_terrainState.name)).c_str());
+    if (m_inspectorShowDebugInfo)
+        ImGui::TextDisabled("entity %llu", static_cast<unsigned long long>(m_selectedHierarchyEntity));
+
+    const bool editing = CanUseEditorTools();
+    if (!editing)
+        ImGui::TextColored(UI::Theme::Warning, "Stop Play to edit the terrain.");
+    if (!editing)
+        ImGui::BeginDisabled();
+
+    // The tools follow the tab: switching tabs puts the brush away.
+    int shownTab = -1;
+    if (ImGui::BeginTabBar("##terrain_tools"))
+    {
+        if (ImGui::BeginTabItem(ICON_FA_MOUNTAIN "  Sculpt"))
+        {
+            shownTab = 0;
+            ImGui::Spacing();
+            RenderTerrainSculptTool();
+            ImGui::EndTabItem();
+        }
+        if (ImGui::BeginTabItem(ICON_FA_PAINTBRUSH "  Paint"))
+        {
+            shownTab = 1;
+            ImGui::Spacing();
+            RenderTerrainPaintTool();
+            ImGui::EndTabItem();
+        }
+        if (ImGui::BeginTabItem(ICON_FA_GEAR "  Settings"))
+        {
+            shownTab = 2;
+            ImGui::Spacing();
+            const std::uint64_t vertices = static_cast<std::uint64_t>(m_terrainState.cellsX + 1u) *
+                static_cast<std::uint64_t>(m_terrainState.cellsZ + 1u);
+            UI::Prop::Text("Size", "%.0f x %.0f m", m_terrainState.widthMeters, m_terrainState.depthMeters);
+            UI::Prop::Text("Cell size", "%.2f m", m_terrainState.cellSizeMeters);
+            UI::Prop::Text("Cells", "%u x %u  (%llu vertices)",
+                m_terrainState.cellsX,
+                m_terrainState.cellsZ,
+                static_cast<unsigned long long>(vertices));
+
+            ImGui::SeparatorText("Steep slopes");
+            if (m_terrainState.exists)
+            {
+                bool triplanarEnabled = m_terrainState.triplanarEnabled;
+                float triplanarSharpness = std::clamp(m_terrainState.triplanarSharpness, 1.0f, 16.0f);
+                float triplanarSlopeThreshold = std::clamp(m_terrainState.triplanarSlopeThreshold, 0.0f, 1.0f);
+                float triplanarSlopeTransition = std::clamp(m_terrainState.triplanarSlopeTransition, 0.001f, 1.0f);
+                bool triplanarChanged = false;
+                triplanarChanged |= UI::Prop::Checkbox("Triplanar mapping", &triplanarEnabled);
+                UI::ItemTooltip("Projects the textures from the side on steep slopes, so they do not stretch");
+                if (!triplanarEnabled)
+                    ImGui::BeginDisabled();
+                triplanarChanged |= UI::Prop::SliderFloat("Sharpness", &triplanarSharpness, 1.0f, 16.0f, "%.2f");
+                triplanarChanged |= UI::Prop::SliderFloat("Slope threshold", &triplanarSlopeThreshold, 0.0f, 1.0f, "%.3f");
+                triplanarChanged |= UI::Prop::SliderFloat("Slope transition", &triplanarSlopeTransition, 0.001f, 1.0f, "%.3f");
+                if (!triplanarEnabled)
+                    ImGui::EndDisabled();
+                if (triplanarChanged)
+                {
+                    m_terrainState.triplanarEnabled = triplanarEnabled;
+                    m_terrainState.triplanarSharpness = triplanarSharpness;
+                    m_terrainState.triplanarSlopeThreshold = triplanarSlopeThreshold;
+                    m_terrainState.triplanarSlopeTransition = triplanarSlopeTransition;
+                    m_commands.terrainTriplanarChanged = true;
+                    m_commands.terrainTriplanarEnabled = triplanarEnabled;
+                    m_commands.terrainTriplanarSharpness = triplanarSharpness;
+                    m_commands.terrainTriplanarSlopeThreshold = triplanarSlopeThreshold;
+                    m_commands.terrainTriplanarSlopeTransition = triplanarSlopeTransition;
+                    SceneManager::Instance().MarkDirty();
+                }
+            }
+
+            ImGui::SeparatorText("Terrain data");
+            if (UI::IconButton(ICON_FA_FLOPPY_DISK, "Save Terrain"))
+                m_commands.save = true;
+            UI::ItemTooltip("Write the terrain's heights and paint to disk now (Ctrl+S saves everything)");
+            ImGui::SameLine();
+            if (UI::IconButton(ICON_FA_ARROWS_ROTATE, "Reload From Disk"))
+                m_commands.reload = true;
+            UI::ItemTooltip("Throw away the unsaved terrain edits and load the saved terrain");
+            ImGui::Spacing();
+            if (UI::IconButton(ICON_FA_MOUNTAIN, "Replace With New Terrain..."))
+                OpenCreateTerrainDialog();
+            ImGui::EndTabItem();
+        }
+        ImGui::EndTabBar();
+    }
+    if (shownTab != m_terrainToolTab)
+    {
+        m_terrainToolTab = shownTab;
+        SetToolMode(MapEditorToolMode::None);
+    }
+
+    if (shownTab == 0 || shownTab == 1)
+    {
+        ImGui::Spacing();
+        if (UI::IconButton(ICON_FA_UNDO, "Undo Last Stroke"))
+            m_commands.undo = true;
+        UI::ItemTooltip("Ctrl+Z");
+    }
+    if (!editing)
+        ImGui::EndDisabled();
 }
 
 bool EditorImGui::RenderSelectedPhysicsMaterialAssetInspector()
@@ -527,17 +563,17 @@ bool EditorImGui::RenderSelectedPhysicsMaterialAssetInspector()
     ImGui::TextDisabled("File: %s", m_assetLibrary->AbsolutePath(*entry).generic_string().c_str());
     ImGui::Separator();
 
-    changed |= ImGui::SliderFloat("Friction", &material.friction, 0.0f, 4.0f, "%.2f");
-    changed |= ImGui::SliderFloat("Bounciness", &material.restitution, 0.0f, 1.0f, "%.2f");
-    changed |= ImGui::DragFloat("Density", &material.density, 0.05f, 0.001f, 1000.0f, "%.3f");
-    changed |= ImGui::DragFloat("Linear Damping", &material.linearDamping, 0.01f, 0.0f, 100.0f, "%.3f");
-    changed |= ImGui::DragFloat("Angular Damping", &material.angularDamping, 0.01f, 0.0f, 100.0f, "%.3f");
+    changed |= UI::Prop::SliderFloat("Friction", &material.friction, 0.0f, 4.0f, "%.2f");
+    changed |= UI::Prop::SliderFloat("Bounciness", &material.restitution, 0.0f, 1.0f, "%.2f");
+    changed |= UI::Prop::DragFloat("Density", &material.density, 0.05f, 0.001f, 1000.0f, "%.3f");
+    changed |= UI::Prop::DragFloat("Linear Damping", &material.linearDamping, 0.01f, 0.0f, 100.0f, "%.3f");
+    changed |= UI::Prop::DragFloat("Angular Damping", &material.angularDamping, 0.01f, 0.0f, 100.0f, "%.3f");
     auto combineCombo = [](const char* label, ixtreeme::physics::PhysicsMaterialCombineMode& mode) {
         const char* modes[] = {"Average", "Minimum", "Maximum", "Multiply"};
         int index = mode == ixtreeme::physics::PhysicsMaterialCombineMode::Minimum ? 1 :
             (mode == ixtreeme::physics::PhysicsMaterialCombineMode::Maximum ? 2 :
             (mode == ixtreeme::physics::PhysicsMaterialCombineMode::Multiply ? 3 : 0));
-        if (!ImGui::Combo(label, &index, modes, IM_ARRAYSIZE(modes)))
+        if (!UI::Prop::Combo(label, &index, modes, IM_ARRAYSIZE(modes)))
             return false;
         mode = index == 1 ? ixtreeme::physics::PhysicsMaterialCombineMode::Minimum :
             (index == 2 ? ixtreeme::physics::PhysicsMaterialCombineMode::Maximum :
@@ -653,7 +689,7 @@ bool EditorImGui::RenderSelectedPrefabAssetInspector()
     }
 
     ImGui::SetNextItemWidth(-1.0f);
-    if (ImGui::InputText("Prefab Name", m_prefabInspectorNameBuffer, sizeof(m_prefabInspectorNameBuffer)))
+    if (UI::Prop::InputText("Prefab Name", m_prefabInspectorNameBuffer, sizeof(m_prefabInspectorNameBuffer)))
         m_prefabInspectorDirty = true;
 
     ImGui::Text("Entities: %zu", entities.size());
@@ -802,7 +838,7 @@ bool EditorImGui::RenderSelectedPrefabAssetInspector()
             ImGui::Text("%u", entity.localId);
             ImGui::TableSetColumnIndex(1);
             ImGui::SetNextItemWidth(-1.0f);
-            if (ImGui::InputText("##name", entity.name, sizeof(entity.name)))
+            if (UI::Prop::InputText("##name", entity.name, sizeof(entity.name)))
                 m_prefabInspectorDirty = true;
             if (entity.parentLocalId == 0)
             {
@@ -812,7 +848,7 @@ bool EditorImGui::RenderSelectedPrefabAssetInspector()
             if (entity.transformValid)
             {
                 ImGui::SetNextItemWidth(-1.0f);
-                if (ImGui::DragFloat3("Position", entity.position, 0.05f, 0.0f, 0.0f, "%.2f"))
+                if (UI::Prop::DragFloat3("Position", entity.position, 0.05f, 0.0f, 0.0f, "%.2f"))
                     m_prefabInspectorDirty = true;
                 if (entity.type == "mesh_entity")
                 {
@@ -821,7 +857,7 @@ bool EditorImGui::RenderSelectedPrefabAssetInspector()
                         Degrees(entity.rotation[1]),
                         Degrees(entity.rotation[2])};
                     ImGui::SetNextItemWidth(-1.0f);
-                    if (ImGui::DragFloat3("Rotation", rotationDegrees, 0.5f, 0.0f, 0.0f, "%.1f deg"))
+                    if (UI::Prop::DragFloat3("Rotation", rotationDegrees, 0.5f, 0.0f, 0.0f, "%.1f deg"))
                     {
                         entity.rotation[0] = Radians(rotationDegrees[0]);
                         entity.rotation[1] = Radians(rotationDegrees[1]);
@@ -829,7 +865,7 @@ bool EditorImGui::RenderSelectedPrefabAssetInspector()
                         m_prefabInspectorDirty = true;
                     }
                     ImGui::SetNextItemWidth(-1.0f);
-                    if (ImGui::DragFloat3("Scale", entity.scale, 0.02f, 0.001f, 0.0f, "%.3f"))
+                    if (UI::Prop::DragFloat3("Scale", entity.scale, 0.02f, 0.001f, 0.0f, "%.3f"))
                     {
                         entity.scale[0] = std::max(entity.scale[0], 0.001f);
                         entity.scale[1] = std::max(entity.scale[1], 0.001f);
@@ -849,7 +885,7 @@ bool EditorImGui::RenderSelectedPrefabAssetInspector()
                             ImGui::PushID(static_cast<int>(slotIndex));
                             ImGui::SetNextItemWidth(-1.0f);
                             const std::string label = "Slot " + std::to_string(slotIndex);
-                            if (ImGui::InputText(label.c_str(),
+                            if (UI::Prop::InputText(label.c_str(),
                                     entity.materialSlotBuffers[slotIndex].data(),
                                     entity.materialSlotBuffers[slotIndex].size()))
                             {
@@ -898,7 +934,7 @@ bool EditorImGui::RenderSelectedPrefabAssetInspector()
                         Degrees(entity.rotation[1]),
                         Degrees(entity.rotation[2])};
                     ImGui::SetNextItemWidth(-1.0f);
-                    if (ImGui::DragFloat3("Rotation", rotationDegrees, 0.5f, 0.0f, 0.0f, "%.1f deg"))
+                    if (UI::Prop::DragFloat3("Rotation", rotationDegrees, 0.5f, 0.0f, 0.0f, "%.1f deg"))
                     {
                         entity.rotation[0] = Radians(rotationDegrees[0]);
                         entity.rotation[1] = Radians(rotationDegrees[1]);
@@ -909,24 +945,24 @@ bool EditorImGui::RenderSelectedPrefabAssetInspector()
             }
             if (entity.lightValid)
             {
-                if (ImGui::Checkbox("Enabled", &entity.enabled))
+                if (UI::Prop::Checkbox("Enabled", &entity.enabled))
                     m_prefabInspectorDirty = true;
                 ImGui::SetNextItemWidth(-1.0f);
-                if (ImGui::ColorEdit3("Color", entity.color))
+                if (UI::Prop::ColorEdit3("Color", entity.color))
                     m_prefabInspectorDirty = true;
                 ImGui::SetNextItemWidth(-1.0f);
-                if (ImGui::DragFloat("Intensity", &entity.intensity, 0.05f, 0.0f, 100.0f, "%.2f"))
+                if (UI::Prop::DragFloat("Intensity", &entity.intensity, 0.05f, 0.0f, 100.0f, "%.2f"))
                     m_prefabInspectorDirty = true;
                 ImGui::SetNextItemWidth(-1.0f);
-                if (ImGui::DragFloat("Radius", &entity.radius, 0.1f, 0.1f, 1000.0f, "%.2f"))
+                if (UI::Prop::DragFloat("Radius", &entity.radius, 0.1f, 0.1f, 1000.0f, "%.2f"))
                     m_prefabInspectorDirty = true;
                 if (entity.lightType == "spot")
                 {
                     ImGui::SetNextItemWidth(-1.0f);
-                    if (ImGui::DragFloat("Inner Cone", &entity.innerConeDegrees, 0.25f, 1.0f, 89.0f, "%.1f deg"))
+                    if (UI::Prop::DragFloat("Inner Cone", &entity.innerConeDegrees, 0.25f, 1.0f, 89.0f, "%.1f deg"))
                         m_prefabInspectorDirty = true;
                     ImGui::SetNextItemWidth(-1.0f);
-                    if (ImGui::DragFloat("Outer Cone", &entity.outerConeDegrees, 0.25f, 1.0f, 90.0f, "%.1f deg"))
+                    if (UI::Prop::DragFloat("Outer Cone", &entity.outerConeDegrees, 0.25f, 1.0f, 90.0f, "%.1f deg"))
                         m_prefabInspectorDirty = true;
                     entity.outerConeDegrees = std::max(entity.outerConeDegrees, entity.innerConeDegrees);
                 }
@@ -947,7 +983,7 @@ bool EditorImGui::RenderSelectedPrefabAssetInspector()
                 ? std::string("root")
                 : ("#" + std::to_string(entity.parentLocalId));
             ImGui::SetNextItemWidth(-1.0f);
-            if (ImGui::BeginCombo("##parent", parentPreview.c_str()))
+            if (UI::Prop::BeginCombo("##parent", parentPreview.c_str()))
             {
                 if (ImGui::Selectable("root", entity.parentLocalId == 0))
                 {
@@ -996,7 +1032,16 @@ bool EditorImGui::RenderSelectedPrefabAssetInspector()
 
 void EditorImGui::RenderInspector()
 {
-    if (ImGui::Begin("Inspector"))
+    // A brush tool lives in the Inspector of what it edits: when that is no longer selected, the
+    // Scene View goes back to picking objects.
+    const MapEditorToolMode toolMode = m_editorSettings.toolMode;
+    if (((toolMode == MapEditorToolMode::Heightmap || toolMode == MapEditorToolMode::SplatPaint) && !m_terrainState.selected) ||
+        (toolMode == MapEditorToolMode::WaterSculpt && !m_waterBodyState.selected))
+        SetToolMode(MapEditorToolMode::None);
+
+    if (!m_inspectorPanelOpen)
+        return;
+    if (ImGui::Begin(EditorWindow::Inspector, &m_inspectorPanelOpen))
     {
         if (RenderSelectedPhysicsMaterialAssetInspector())
         {
@@ -1016,8 +1061,13 @@ void EditorImGui::RenderInspector()
             RenderSelectedMeshRendererInspector();
         else
         {
-            ImGui::TextUnformatted("Nothing selected");
-            ImGui::TextWrapped("Select an entity in the Hierarchy or 3D viewport to edit its components.");
+            ImGui::Spacing();
+            ImGui::TextDisabled(ICON_FA_ARROW_POINTER "  Nothing selected");
+            ImGui::Spacing();
+            ImGui::PushTextWrapPos(0.0f);
+            ImGui::TextDisabled("Click an object in the Scene View or the Hierarchy to see and change its settings "
+                                "here. Assets selected in the Asset Browser show here too.");
+            ImGui::PopTextWrapPos();
         }
     }
     ImGui::End();

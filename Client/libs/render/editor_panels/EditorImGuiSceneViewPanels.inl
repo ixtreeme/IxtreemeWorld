@@ -47,30 +47,29 @@ void EditorImGui::RenderDockSpace()
         ImGui::DockBuilderAddNode(dockspaceId, dockBuilderFlags);
         ImGui::DockBuilderSetNodeSize(dockspaceId, viewport->WorkSize);
 
+        // Hierarchy on the left, Inspector (and Scene Settings) on the right, the views in the middle,
+        // the project's files and the messages under them. The toolbar and the status bar are fixed
+        // strips outside the dock space.
         ImGuiID mainId = dockspaceId;
         ImGuiID leftId = 0;
         ImGuiID rightId = 0;
         ImGuiID bottomId = 0;
-        ImGuiID topId = 0;
-        ImGui::DockBuilderSplitNode(mainId, ImGuiDir_Up, 0.06f, &topId, &mainId);
-        ImGui::DockBuilderSplitNode(mainId, ImGuiDir_Left, 0.20f, &leftId, &mainId);
-        ImGui::DockBuilderSplitNode(mainId, ImGuiDir_Right, 0.25f, &rightId, &mainId);
+        ImGui::DockBuilderSplitNode(mainId, ImGuiDir_Left, 0.18f, &leftId, &mainId);
+        ImGui::DockBuilderSplitNode(mainId, ImGuiDir_Right, 0.27f, &rightId, &mainId);
         ImGui::DockBuilderSplitNode(mainId, ImGuiDir_Down, 0.30f, &bottomId, &mainId);
-        ImGui::DockBuilderDockWindow("Editor Toolbar", topId);
-        ImGui::DockBuilderDockWindow(ICON_FA_LIST_TREE " Hierarchy", leftId);
-        ImGui::DockBuilderDockWindow("Tools", leftId);
-        ImGui::DockBuilderDockWindow("Inspector", rightId);
-        ImGui::DockBuilderDockWindow("Scene Settings", rightId);
-        ImGui::DockBuilderDockWindow(ICON_FA_GLOBE " World", rightId);
-        ImGui::DockBuilderDockWindow("Asset Browser", bottomId);
-        ImGui::DockBuilderDockWindow("Scripts", bottomId);
-        ImGui::DockBuilderDockWindow("Build Output", bottomId);
-        ImGui::DockBuilderDockWindow("Scene View", mainId);
-        ImGui::DockBuilderDockWindow("Game", mainId);
-        ImGui::DockBuilderDockWindow(ICON_FA_PERSON_RUNNING " Animator", mainId);
+        ImGui::DockBuilderDockWindow(EditorWindow::Hierarchy, leftId);
+        ImGui::DockBuilderDockWindow(EditorWindow::Inspector, rightId);
+        ImGui::DockBuilderDockWindow(EditorWindow::SceneSettings, rightId);
+        ImGui::DockBuilderDockWindow(EditorWindow::AssetBrowser, bottomId);
+        ImGui::DockBuilderDockWindow(EditorWindow::Scripts, bottomId);
+        ImGui::DockBuilderDockWindow(EditorWindow::Console, bottomId);
+        ImGui::DockBuilderDockWindow(EditorWindow::BuildOutput, bottomId);
+        ImGui::DockBuilderDockWindow(EditorWindow::SceneView, mainId);
+        ImGui::DockBuilderDockWindow(EditorWindow::Game, mainId);
+        ImGui::DockBuilderDockWindow(EditorWindow::Animator, mainId);
         ImGui::DockBuilderFinish(dockspaceId);
         m_defaultLayoutTabSelectFrames = 3;
-        Tracen("[EDITOR-LAYOUT] Default Unity-style dock layout applied");
+        Tracen("[EDITOR-LAYOUT] Default dock layout applied");
     }
     ImGui::End();
 }
@@ -144,7 +143,7 @@ void EditorImGui::RenderSceneViewDropTarget()
         }
     };
 
-    if (!ImGui::Begin("Scene View", nullptr, flags))
+    if (!ImGui::Begin(EditorWindow::SceneView, nullptr, flags))
     {
         // Scene View is not visible (e.g. the Game tab is in front in the same dock).
         // Invalidate its viewport input rect so mouse input over the now-hidden region
@@ -473,8 +472,8 @@ void EditorImGui::RenderGameViewPanel()
         ImGuiWindowFlags_NoScrollbar |
         ImGuiWindowFlags_NoScrollWithMouse |
         ImGuiWindowFlags_NoCollapse;
-    DockBesideIfUnplaced("Game", "Scene View");
-    if (!ImGui::Begin("Game", nullptr, flags))
+    DockBesideIfUnplaced(EditorWindow::Game, EditorWindow::SceneView);
+    if (!ImGui::Begin(EditorWindow::Game, nullptr, flags))
     {
         // Window collapsed or its dock tab is inactive — not visible, so the engine can
         // skip rendering the Game view this frame.

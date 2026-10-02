@@ -281,7 +281,35 @@ private:
     bool CreateDefaultProjectScene();
     void CreateProjectFromDialog();
     void OpenProjectFromDialog(const std::filesystem::path& manifestPath);
-    void RenderEditorToolbar();
+    // Editor shell (EditorImGuiShellPanels.inl): fixed toolbar and status bar, Console, and the
+    // windows opened from the menus.
+    enum class ConsoleSeverity
+    {
+        Info,
+        Warning,
+        Error
+    };
+    struct ConsoleMessage
+    {
+        double time = 0.0;
+        std::string clock;
+        ConsoleSeverity severity = ConsoleSeverity::Info;
+        std::string text;
+    };
+    void RenderMainToolbar();
+    void RenderStatusBar();
+    void RenderConsolePanel();
+    void PushConsoleMessage(ConsoleSeverity severity, std::string text);
+    // Lists every new status text (project, asset, layer, build) in the Console and the status bar.
+    void TrackStatusMessages();
+    void RenderStatisticsWindow();
+    void RenderPhysicsDebuggerWindow();
+    void RenderProjectSettingsWindow();
+    void RenderLayeredWorldWindow();
+    void RenderShortcutsWindow();
+    void RenderAboutPopup();
+    void QueueDebugToggleCommands();
+    void ResetEditorLayout();
     void RenderBuildOutputPanel();
     void OpenBuildGameDialog();
     void RenderBuildGamePopup();
@@ -307,11 +335,13 @@ private:
     bool HierarchySubtreePassesSearch(std::uint64_t entity) const;
     const HierarchySceneEntity* FindHierarchyEntity(std::uint64_t entity) const;
     const HierarchySceneEntity* FindHierarchyEntity(HierarchyEntityType type, std::uint32_t objectId) const;
+    // The selected entity, picked in the Hierarchy or in the Scene View (nullptr: none).
+    const HierarchySceneEntity* SelectedHierarchyEntity() const;
     bool HierarchyPassesSearch(const std::string& name) const;
     void QueueHierarchySelection(const HierarchySceneEntity& entity);
     void QueueHierarchyFocus(const HierarchySceneEntity& entity);
     void StartHierarchyRename(const HierarchySceneEntity& entity);
-    void RenderToolsPanel();
+    void RenderHierarchyCreateMenuItems();
     void RenderInspector();
     void RenderSelectedWaterBodyInspector();
     void RenderSelectedTerrainInspector();
@@ -323,18 +353,19 @@ private:
                                       const PrefabInstanceState& instance,
                                       const std::vector<std::string>& overrides);
     void RenderAddComponentMenu();
+    // The Inspector's title row: what is selected, with the engine-id (debug info) toggle.
+    void RenderInspectorTitle(const char* icon, const char* typeName, std::uint32_t objectId);
     bool RenderAttachedEditorComponents(std::vector<EditorAttachedComponent>& components);
     bool RenderTransformComponent(float* position, float* rotation, float* scale);
     bool RenderAxisFloat(const char* axis, float& value, float r, float g, float b, float speed, float minValue, float maxValue);
-    void RenderWorldPanel();
-    void RenderPerformancePanel();
     void RenderCreateTerrainModal();
+    void OpenCreateTerrainDialog();
     void RenderLightingPanel();
-    void RenderDynamicLightsPanel();
     void RenderGizmoControls();
-    void RenderWaterSculptToolPanel();
-    void RenderHeightmapToolPanel();
-    void RenderSplatPaintToolPanel();
+    // Terrain and water editing tools, shown in the Inspector of the selected terrain / water body.
+    void RenderWaterSculptTool();
+    void RenderTerrainSculptTool();
+    void RenderTerrainPaintTool();
     void RenderSplatLayerSlot(std::uint32_t slotIndex);
     void RenderWaterMaterialEditor();
     void RenderTreeGeneratorPanel();
@@ -585,9 +616,6 @@ private:
     char m_projectOpenPathBuffer[512]{};
     char m_projectBrowsePathBuffer[512]{};
     char m_projectBrowseFilterBuffer[128]{};
-    bool m_waterSculptToolOpen = false;
-    bool m_heightmapToolOpen = false;
-    bool m_splatPaintToolOpen = false;
     bool m_createTerrainModalOpen = false;
     bool m_replaceTerrainConfirmOpen = false;
     float m_createTerrainWidthMeters = 200.0f;
@@ -716,4 +744,31 @@ private:
     bool m_sceneGizmoSnapEnabled = false;
     float m_sceneGizmoSnapValue = 1.0f;
     float m_timeOfDayHours = 12.0f;
+
+    // Editor shell: panels the View menu shows/hides, the Console log and the status bar.
+    bool m_hierarchyPanelOpen = true;
+    bool m_inspectorPanelOpen = true;
+    bool m_sceneSettingsPanelOpen = true;
+    bool m_assetBrowserPanelOpen = true;
+    bool m_scriptsPanelOpen = true;
+    bool m_consolePanelOpen = true;
+    bool m_statisticsWindowOpen = false;
+    bool m_physicsDebuggerOpen = false;
+    bool m_projectSettingsOpen = false;
+    bool m_layeredWorldOpen = false;
+    bool m_shortcutsWindowOpen = false;
+    bool m_openAboutPopup = false;
+    bool m_inspectorShowDebugInfo = false;  // engine ids and asset paths in the Inspector
+    int m_terrainToolTab = 0;               // Inspector > Terrain: 0 Sculpt, 1 Paint, 2 Settings
+    std::vector<ConsoleMessage> m_consoleMessages;
+    std::optional<ConsoleMessage> m_statusBarMessage;
+    bool m_consoleShowInfo = true;
+    bool m_consoleShowWarnings = true;
+    bool m_consoleShowErrors = true;
+    bool m_consoleScrollToBottom = false;
+    std::string m_lastSeenProjectStatus;
+    std::string m_lastSeenAssetStatus;
+    std::string m_lastSeenLayerStatus;
+    ScriptBuildState m_lastSeenBuildState = ScriptBuildState::Idle;
+    ScriptBuildState m_lastSeenGameBuildState = ScriptBuildState::Idle;
 };

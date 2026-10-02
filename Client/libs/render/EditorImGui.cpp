@@ -29,12 +29,14 @@
 #include <algorithm>
 #include <array>
 #include <cctype>
+#include <chrono>
 #include <cmath>
 #include <cstdlib>
 #include <cstring>
 #include <cstdio>
 #include <fstream>
 #include <filesystem>
+#include <format>
 #include <limits>
 #include <map>
 #include <optional>
@@ -46,8 +48,31 @@
 
 namespace
 {
-constexpr const char* kLayoutFile = "editor_layout.ini";
+// v2: the editor shell (fixed toolbar and status bar, renamed panels) starts from a fresh default
+// layout; the old file stays untouched.
+constexpr const char* kLayoutFile = "editor_layout_v2.ini";
 constexpr const char* kRecentProjectsFile = "editor_recent_projects.txt";  // beside the layout
+// Editor windows: "<icon> <title>###<id>". The id after ### keeps docking and the saved layout
+// stable whatever the title shows; FindWindowByName/SetWindowFocus accept the full name.
+namespace EditorWindow
+{
+constexpr const char* SceneView = ICON_FA_CUBES "  Scene View###SceneView";
+constexpr const char* Game = ICON_FA_GAMEPAD "  Game###Game";
+constexpr const char* Animator = ICON_FA_PERSON_RUNNING "  Animator###Animator";
+constexpr const char* Hierarchy = ICON_FA_LIST_TREE "  Hierarchy###Hierarchy";
+constexpr const char* Inspector = ICON_FA_CIRCLE_INFO "  Inspector###Inspector";
+constexpr const char* SceneSettings = ICON_FA_SLIDERS "  Scene Settings###SceneSettings";
+constexpr const char* AssetBrowser = ICON_FA_FOLDER_OPEN "  Asset Browser###AssetBrowser";
+constexpr const char* Scripts = ICON_FA_CODE "  Scripts###Scripts";
+constexpr const char* Console = ICON_FA_TERMINAL "  Console###Console";
+constexpr const char* BuildOutput = ICON_FA_HAMMER "  Build Output###BuildOutput";
+constexpr const char* Statistics = ICON_FA_GAUGE_HIGH "  Statistics###Statistics";
+constexpr const char* PhysicsDebugger = ICON_FA_BUG "  Physics Debugger###PhysicsDebugger";
+constexpr const char* ProjectSettings = ICON_FA_GEAR "  Project Settings###ProjectSettings";
+constexpr const char* LayeredWorld = ICON_FA_LAYER_GROUP "  Layered World###LayeredWorld";
+constexpr const char* Shortcuts = ICON_FA_KEYBOARD "  Keyboard Shortcuts###Shortcuts";
+}
+
 constexpr const char* kAssetPayloadType = "ASSET_ID";
 constexpr const char* kAssetFolderPayloadType = "ASSET_FOLDER_PATH";
 constexpr const char* kHierarchyEntityPayloadType = "HIERARCHY_ENTITY";
@@ -327,7 +352,11 @@ ImVec4 AssetCategoryColor(AssetLibrary::Category category)
     case AssetLibrary::Category::PhysicsMaterial: return ImVec4(0.64f, 0.54f, 0.30f, 1.0f);
     case AssetLibrary::Category::Scene: return ImVec4(0.42f, 0.50f, 0.66f, 1.0f);
     case AssetLibrary::Category::Prefab: return ImVec4(0.67f, 0.48f, 0.82f, 1.0f);
-    default: return ImVec4(0.35f, 0.35f, 0.35f, 1.0f);
+    case AssetLibrary::Category::AnimationClip: return ImVec4(0.86f, 0.60f, 0.26f, 1.0f);
+    case AssetLibrary::Category::AnimatorController: return ImVec4(0.90f, 0.47f, 0.36f, 1.0f);
+    case AssetLibrary::Category::Audio: return ImVec4(0.36f, 0.74f, 0.62f, 1.0f);
+    case AssetLibrary::Category::Script: return ImVec4(0.55f, 0.72f, 0.95f, 1.0f);
+    default: return ImVec4(0.60f, 0.62f, 0.66f, 1.0f);
     }
 }
 
@@ -343,6 +372,10 @@ const char* AssetCategoryIcon(AssetLibrary::Category category)
     case AssetLibrary::Category::PhysicsMaterial: return ICON_FA_GEAR;
     case AssetLibrary::Category::Scene: return ICON_FA_GLOBE;
     case AssetLibrary::Category::Prefab: return ICON_FA_LAYER_GROUP;
+    case AssetLibrary::Category::AnimationClip: return ICON_FA_PERSON_RUNNING;
+    case AssetLibrary::Category::AnimatorController: return ICON_FA_DIAGRAM_PROJECT;
+    case AssetLibrary::Category::Audio: return ICON_FA_MUSIC;
+    case AssetLibrary::Category::Script: return ICON_FA_FILE_CODE;
     default: return ICON_FA_FILE;
     }
 }
@@ -471,16 +504,13 @@ void LoadEditorFonts()
     UI::SetEditorFonts({regular, bold});
 }
 
+// Editor colors are sRGB, like every color written in the panels; the UI backend decodes them for
+// an sRGB render target.
 ImVec4 ColorU8(int r, int g, int b, int a = 255)
 {
-    const auto toLinear = [](int value) {
-        const float srgb = static_cast<float>(value) / 255.0f;
-        return srgb <= 0.04045f ? srgb / 12.92f : ixtreeme::math::Pow((srgb + 0.055f) / 1.055f, 2.4f);
-    };
-    return ImVec4(
-        toLinear(r),
-        toLinear(g),
-        toLinear(b),
+    return ImVec4(static_cast<float>(r) / 255.0f,
+        static_cast<float>(g) / 255.0f,
+        static_cast<float>(b) / 255.0f,
         static_cast<float>(a) / 255.0f);
 }
 
@@ -555,7 +585,8 @@ void ApplyEditorStyle()
     colors[ImGuiCol_TableBorderStrong] = ColorU8(52, 56, 63);
     colors[ImGuiCol_TableBorderLight] = ColorU8(46, 50, 58);
     colors[ImGuiCol_TableRowBg] = ImVec4(0.0f, 0.0f, 0.0f, 0.0f);
-    colors[ImGuiCol_TableRowBgAlt] = ColorU8(255, 255, 255, 10);
+    // Very faint: blending happens in linear space on the sRGB target, where a little white goes far.
+    colors[ImGuiCol_TableRowBgAlt] = ColorU8(255, 255, 255, 3);
     colors[ImGuiCol_NavHighlight] = ColorU8(61, 126, 219, 190);
     colors[ImGuiCol_DockingPreview] = ColorU8(61, 126, 219, 102);
     colors[ImGuiCol_DockingEmptyBg] = ColorU8(27, 29, 33);
@@ -618,9 +649,9 @@ void EditorImGui::SetEditorPlayModeState(const EditorPlayModeState& state)
     const bool wasEditing = m_playModeState.mode == EditorPlayMode::Edit;
     const bool nowEditing = state.mode == EditorPlayMode::Edit;
     if (wasEditing && !nowEditing)
-        m_pendingViewFocusWindow = "Game";        // entered Play: show the Main Camera
+        m_pendingViewFocusWindow = EditorWindow::Game;        // entered Play: show the Main Camera
     else if (!wasEditing && nowEditing)
-        m_pendingViewFocusWindow = "Scene View";  // stopped Play: back to free-fly editor camera
+        m_pendingViewFocusWindow = EditorWindow::SceneView;  // stopped Play: back to free-fly editor camera
     m_playModeState = state;
     if (!CanUseEditorTools())
     {
@@ -2584,6 +2615,7 @@ void EditorImGui::BeginFrame(bool editorModeActive)
 #include "editor_panels/EditorImGuiAnimatorPanels.inl"
 #include "editor_panels/EditorImGuiProjectPanels.inl"
 #include "editor_panels/EditorImGuiMenuToolbarPanels.inl"
+#include "editor_panels/EditorImGuiShellPanels.inl"
 #include "editor_panels/EditorImGuiHierarchyPanels.inl"
 #include "editor_panels/EditorImGuiInspectorPanels.inl"
 #include "editor_panels/EditorImGuiAssetBrowserPanels.inl"

@@ -52,140 +52,140 @@ void EditorImGui::RenderMenuBar()
     const bool editing = CanUseEditorTools();
     if (ImGui::BeginMenu("File"))
     {
-        if (ImGui::MenuItem("New Project...", nullptr, false, editing))
+        if (ImGui::MenuItem(ICON_FA_FOLDER_PLUS "  New Project...", nullptr, false, editing))
             OpenProjectDialog(ProjectDialogMode::Create);
-        if (ImGui::MenuItem("Open Project...", nullptr, false, editing))
+        if (ImGui::MenuItem(ICON_FA_FOLDER_OPEN "  Open Project...", nullptr, false, editing))
             OpenProjectDialog(ProjectDialogMode::Open);
-        if (ImGui::MenuItem("Save Project", "Ctrl+S", false, projects.HasProject()))
-            SaveProjectAndCurrentScene();
-        if (ImGui::BeginMenu("Recent Projects", editing && !projects.RecentProjects().empty()))
+        if (ImGui::BeginMenu("      Recent Projects", editing && !projects.RecentProjects().empty()))
         {
             for (const auto& path : projects.RecentProjects())
             {
                 const std::string label = path.parent_path().filename().string();
                 if (ImGui::MenuItem(label.c_str()))
                     OpenProjectFromDialog(path);
+                UI::ItemTooltip(path.parent_path().generic_string().c_str());
             }
             ImGui::EndMenu();
         }
         ImGui::Separator();
         if (ImGui::MenuItem(ICON_FA_FILE "  New Scene", "Ctrl+N", false, editing))
             scenes.NewScene();
-        if (ImGui::MenuItem(ICON_FA_FOLDER_OPEN "  Open Scene...", "Ctrl+O", false, editing))
+        // The project's scenes are listed right here: switching scene needs no OS file dialog.
+        if (ImGui::BeginMenu(ICON_FA_GLOBE "  Open Scene", editing && projects.HasProject()))
         {
-#if defined(_WIN32)
-            char file[MAX_PATH]{};
-            OPENFILENAMEA ofn{};
-            ofn.lStructSize = sizeof(ofn);
-            ofn.lpstrTitle = "Open Scene";
-            ofn.lpstrFilter = "Scene Files (*.scene)\0*.scene\0All files (*.*)\0*.*\0\0";
-            ofn.lpstrFile = file;
-            ofn.nMaxFile = MAX_PATH;
-            ofn.Flags = OFN_FILEMUSTEXIST | OFN_PATHMUSTEXIST | OFN_NOCHANGEDIR;
-            if (GetOpenFileNameA(&ofn))
-                scenes.LoadScene(file);
-#endif
+            const std::vector<AssetLibrary::Entry> sceneAssets = QuerySceneAssets();
+            if (sceneAssets.empty())
+                ImGui::TextDisabled("The project has no scene yet");
+            const std::string currentScene = CachedComparablePath(scenes.GetCurrentScenePath());
+            for (const AssetLibrary::Entry& scene : sceneAssets)
+            {
+                std::error_code ec;
+                const std::filesystem::path relative = std::filesystem::relative(scene.originalPath, projects.ProjectRoot(), ec);
+                const std::string label = ec ? scene.displayName : relative.generic_string();
+                const bool current = !currentScene.empty() && CachedComparablePath(scene.originalPath) == currentScene;
+                if (ImGui::MenuItem(label.c_str(), nullptr, current))
+                    scenes.LoadScene(scene.originalPath);
+            }
+            ImGui::EndMenu();
         }
-        ImGui::Separator();
-        if (ImGui::MenuItem(ICON_FA_FLOPPY_DISK "  Save Scene As...", "Ctrl+Shift+S"))
-        {
-            if (!RefuseSaveDuringPlay())
-                scenes.SaveSceneAs({});
-        }
-        ImGui::Separator();
-        if (ImGui::BeginMenu("Recent Scenes", editing && !scenes.GetRecentScenes().empty()))
+        if (ImGui::BeginMenu("      Recent Scenes", editing && !scenes.GetRecentScenes().empty()))
         {
             for (const std::string& path : scenes.GetRecentScenes())
             {
                 const std::string label = std::filesystem::path(path).filename().string();
                 if (ImGui::MenuItem(label.c_str()))
                     scenes.LoadScene(path);
+                UI::ItemTooltip(path.c_str());
             }
             ImGui::EndMenu();
+        }
+        ImGui::Separator();
+        if (ImGui::MenuItem(ICON_FA_FLOPPY_DISK "  Save", "Ctrl+S", false, projects.HasProject() || scenes.HasOpenScene()))
+            SaveProjectAndCurrentScene();
+        UI::ItemTooltip("Save the project and the open scene");
+        if (ImGui::MenuItem("      Save Scene As...", "Ctrl+Shift+S", false, scenes.HasOpenScene()))
+        {
+            if (!RefuseSaveDuringPlay())
+                scenes.SaveSceneAs({});
         }
         ImGui::Separator();
         if (ImGui::MenuItem(ICON_FA_HAMMER "  Build Game...", nullptr, false,
                 editing && projects.HasProject() && !IsGameBuildRunning() && !IsBuildRunning()))
             OpenBuildGameDialog();
+        UI::ItemTooltip("Package the project as a game that runs without the editor");
         ImGui::EndMenu();
     }
+
     if (ImGui::BeginMenu("Edit"))
     {
-        ImGui::MenuItem("Undo", "Ctrl+Z", false, false);
-        ImGui::MenuItem("Redo", "Ctrl+Y", false, false);
+        const HierarchySceneEntity* selected = SelectedHierarchyEntity();
+        const bool canEditSelection = editing && selected != nullptr;
+        if (ImGui::MenuItem(ICON_FA_BULLSEYE "  Frame Selection", "F", false, selected != nullptr))
+            QueueHierarchyFocus(*selected);
+        if (ImGui::MenuItem(ICON_FA_PEN "  Rename", nullptr, false, canEditSelection))
+            StartHierarchyRename(*selected);
+        if (ImGui::MenuItem(ICON_FA_COPY "  Duplicate", nullptr, false, canEditSelection))
+        {
+            m_commands.hierarchyDuplicateEntity = true;
+            m_commands.hierarchyEntityType = selected->type;
+            m_commands.hierarchyEntityId = selected->objectId;
+            m_commands.hierarchyEntityHandle = selected->entity;
+        }
+        if (ImGui::MenuItem(ICON_FA_TRASH "  Delete", "Del", false, canEditSelection))
+        {
+            m_commands.hierarchyDeleteEntity = true;
+            m_commands.hierarchyEntityType = selected->type;
+            m_commands.hierarchyEntityId = selected->objectId;
+            m_commands.hierarchyEntityHandle = selected->entity;
+        }
+        ImGui::Separator();
+        if (ImGui::MenuItem(ICON_FA_GEAR "  Project Settings..."))
+            m_projectSettingsOpen = true;
         ImGui::EndMenu();
     }
+
+    if (ImGui::BeginMenu("Create"))
+    {
+        RenderHierarchyCreateMenuItems();
+        ImGui::EndMenu();
+    }
+
     if (ImGui::BeginMenu("View"))
     {
-        ImGui::MenuItem(ICON_FA_PERSON_RUNNING " Animator", nullptr, &m_animatorPanelOpen);
-        ImGui::MenuItem("Demo Window", nullptr, &m_showDemoWindow);
+        // Opens the panel and brings it to the front (it may be hidden behind another tab); the
+        // tick shows which panels are open, the tab's x closes one.
+        const auto panelItem = [this](const char* label, bool& open, const char* window) {
+            if (ImGui::MenuItem(label, nullptr, open))
+            {
+                open = true;
+                m_pendingViewFocusWindow = window;
+            }
+        };
+        panelItem(ICON_FA_LIST_TREE "  Hierarchy", m_hierarchyPanelOpen, EditorWindow::Hierarchy);
+        panelItem(ICON_FA_CIRCLE_INFO "  Inspector", m_inspectorPanelOpen, EditorWindow::Inspector);
+        panelItem(ICON_FA_SLIDERS "  Scene Settings", m_sceneSettingsPanelOpen, EditorWindow::SceneSettings);
+        panelItem(ICON_FA_FOLDER_OPEN "  Asset Browser", m_assetBrowserPanelOpen, EditorWindow::AssetBrowser);
+        panelItem(ICON_FA_CODE "  Scripts", m_scriptsPanelOpen, EditorWindow::Scripts);
+        panelItem(ICON_FA_TERMINAL "  Console", m_consolePanelOpen, EditorWindow::Console);
+        panelItem(ICON_FA_HAMMER "  Build Output", m_buildOutputPanelOpen, EditorWindow::BuildOutput);
+        panelItem(ICON_FA_PERSON_RUNNING "  Animator", m_animatorPanelOpen, EditorWindow::Animator);
+        ImGui::Separator();
+        if (ImGui::MenuItem(ICON_FA_CUBES "  Scene View"))
+            m_pendingViewFocusWindow = EditorWindow::SceneView;
+        if (ImGui::MenuItem(ICON_FA_GAMEPAD "  Game View"))
+            m_pendingViewFocusWindow = EditorWindow::Game;
+        ImGui::Separator();
+        panelItem(ICON_FA_GAUGE_HIGH "  Statistics", m_statisticsWindowOpen, EditorWindow::Statistics);
+        ImGui::Separator();
+        if (ImGui::MenuItem(ICON_FA_ARROWS_ROTATE "  Reset Layout"))
+            ResetEditorLayout();
+        UI::ItemTooltip("Put every panel back where it starts");
         ImGui::EndMenu();
     }
-    if (ImGui::BeginMenu("Audio"))
-    {
-        ImGui::TextDisabled("Bus Volumes");
-        bool volChanged = false;
-        ImGui::SetNextItemWidth(160.0f);
-        volChanged |= ImGui::SliderFloat("Master", &m_audioVolume[0], 0.0f, 1.0f, "%.2f");
-        ImGui::SetNextItemWidth(160.0f);
-        volChanged |= ImGui::SliderFloat("Music", &m_audioVolume[1], 0.0f, 1.0f, "%.2f");
-        ImGui::SetNextItemWidth(160.0f);
-        volChanged |= ImGui::SliderFloat("SFX", &m_audioVolume[2], 0.0f, 1.0f, "%.2f");
-        if (volChanged)
-        {
-            m_commands.audioVolumesChanged = true;
-            m_commands.audioVolume[0] = m_audioVolume[0];
-            m_commands.audioVolume[1] = m_audioVolume[1];
-            m_commands.audioVolume[2] = m_audioVolume[2];
-        }
-        ImGui::EndMenu();
-    }
+
     if (ImGui::BeginMenu("Tools"))
     {
-        if (ImGui::BeginMenu("Layered world"))
-        {
-            if (ImGui::MenuItem("Generate layers from collision", nullptr, false, CanUseEditorTools()))
-                m_commands.generateLayers = true;
-            if (ImGui::MenuItem("Export layer metadata", nullptr, false, CanUseEditorTools()))
-                m_commands.exportLayers = true;
-            ImGui::MenuItem("Show layer volumes", nullptr, &m_showLayerVolumes);
-            ImGui::Separator();
-            ImGui::InputText("World ID", m_serverWorldId, sizeof(m_serverWorldId));
-            ImGui::InputFloat2("Player spawn X/Z (m)", m_serverWorldSpawn);
-            ImGui::InputScalar("Player spawn volume", ImGuiDataType_U32, &m_serverWorldSpawnVolume);
-            ImGui::TextDisabled("Volume 0 spawns on the terrain; otherwise on that generated layer\n"
-                                "volume, where the baked capsule must fit. Blocked or outside\n"
-                                "positions are rejected.");
-            if (ImGui::MenuItem("Export strict server world", nullptr, false, CanUseEditorTools()))
-            {
-                m_commands.exportServerWorld = true;
-                m_commands.serverWorldId = m_serverWorldId;
-                m_commands.serverWorldSpawnX = m_serverWorldSpawn[0];
-                m_commands.serverWorldSpawnZ = m_serverWorldSpawn[1];
-                m_commands.serverWorldSpawnVolume = m_serverWorldSpawnVolume;
-            }
-            ImGui::Separator();
-            ImGui::TextUnformatted("Support probe (offline)");
-            ImGui::InputScalar("Support volume", ImGuiDataType_U32, &m_layerGroundVolume);
-            ImGui::InputFloat2("Support point X/Z (m)", m_layerGroundPoint);
-            if (ImGui::MenuItem("Place support probe", nullptr, false, CanUseEditorTools()))
-                m_commands.placeLayerGround = true;
-            if (ImGui::MenuItem("Move support probe", nullptr, false, CanUseEditorTools()))
-                m_commands.moveLayerGround = true;
-            if (m_commands.placeLayerGround || m_commands.moveLayerGround)
-            {
-                m_commands.layerGroundVolume = m_layerGroundVolume;
-                m_commands.layerGroundX = m_layerGroundPoint[0];
-                m_commands.layerGroundZ = m_layerGroundPoint[1];
-            }
-            if (!m_layerAuthoringStatus.empty())
-            {
-                ImGui::Separator();
-                ImGui::TextWrapped("%s", m_layerAuthoringStatus.c_str());
-            }
-            ImGui::EndMenu();
-        }
-        if (ImGui::MenuItem("Tree Generator..."))
+        if (ImGui::MenuItem(ICON_FA_TREE "  Tree Generator..."))
         {
             if (!m_treeGeneratorPanel)
             {
@@ -197,7 +197,12 @@ void EditorImGui::RenderMenuBar()
             m_treeGeneratorPanel->SetAssetLibrary(m_assetLibrary.get());
             m_treeGeneratorPanel->Show();
         }
-        if (ImGui::BeginMenu("Debug"))
+        if (ImGui::MenuItem(ICON_FA_LAYER_GROUP "  Layered World...", nullptr, m_layeredWorldOpen))
+            m_layeredWorldOpen = true;
+        if (ImGui::MenuItem(ICON_FA_BUG "  Physics Debugger...", nullptr, m_physicsDebuggerOpen))
+            m_physicsDebuggerOpen = true;
+        ImGui::Separator();
+        if (ImGui::BeginMenu(ICON_FA_WRENCH "  Engine Diagnostics"))
         {
             if (ImGui::MenuItem("Capture GPU Frame", "F11"))
                 m_commands.captureGpuFrame = true;
@@ -206,35 +211,27 @@ void EditorImGui::RenderMenuBar()
             if (ImGui::MenuItem("Dump Material Bindings", "F12"))
                 m_commands.dumpMaterialState = true;
             ImGui::Separator();
-            bool debugTogglesChanged = false;
-            debugTogglesChanged = ImGui::MenuItem("Disable Shadow Pass", nullptr, &m_debugDisableShadowPass) || debugTogglesChanged;
-            debugTogglesChanged = ImGui::MenuItem("Disable Water Reflection Pass", nullptr, &m_debugDisableWaterReflectionPass) || debugTogglesChanged;
-            debugTogglesChanged = ImGui::MenuItem("Disable Asset Library Discovery", nullptr, &m_debugDisableAssetLibraryDiscovery) || debugTogglesChanged;
-            debugTogglesChanged = ImGui::MenuItem("Disable Asset Watcher Poll", nullptr, &m_debugDisableAssetWatcherPoll) || debugTogglesChanged;
-            debugTogglesChanged = ImGui::MenuItem("Disable Hierarchy Iteration", nullptr, &m_debugDisableHierarchyIteration) || debugTogglesChanged;
+            bool togglesChanged = false;
+            togglesChanged |= ImGui::MenuItem("Disable Shadow Pass", nullptr, &m_debugDisableShadowPass);
+            togglesChanged |= ImGui::MenuItem("Disable Water Reflection Pass", nullptr, &m_debugDisableWaterReflectionPass);
+            togglesChanged |= ImGui::MenuItem("Disable Asset Library Discovery", nullptr, &m_debugDisableAssetLibraryDiscovery);
+            togglesChanged |= ImGui::MenuItem("Disable Asset Watcher Poll", nullptr, &m_debugDisableAssetWatcherPoll);
+            togglesChanged |= ImGui::MenuItem("Disable Hierarchy Iteration", nullptr, &m_debugDisableHierarchyIteration);
+            if (togglesChanged)
+                QueueDebugToggleCommands();
             ImGui::Separator();
-            debugTogglesChanged = ImGui::MenuItem("Show Physics Colliders", nullptr, &m_debugShowPhysicsColliders) || debugTogglesChanged;
-            debugTogglesChanged = ImGui::MenuItem("Show Physics Contacts", nullptr, &m_debugShowPhysicsContacts) || debugTogglesChanged;
-            debugTogglesChanged = ImGui::MenuItem("Show Physics Body Centers", nullptr, &m_debugShowPhysicsBodyCenters) || debugTogglesChanged;
-            if (debugTogglesChanged)
-            {
-                m_commands.debugPerfTogglesChanged = true;
-                m_commands.disableShadowPass = m_debugDisableShadowPass;
-                m_commands.disableWaterReflectionPass = m_debugDisableWaterReflectionPass;
-                m_commands.disableAssetLibraryDiscovery = m_debugDisableAssetLibraryDiscovery;
-                m_commands.disableAssetWatcherPoll = m_debugDisableAssetWatcherPoll;
-                m_commands.disableHierarchyIteration = m_debugDisableHierarchyIteration;
-                m_commands.showPhysicsColliders = m_debugShowPhysicsColliders;
-                m_commands.showPhysicsContacts = m_debugShowPhysicsContacts;
-                m_commands.showPhysicsBodyCenters = m_debugShowPhysicsBodyCenters;
-            }
+            ImGui::MenuItem("ImGui Demo Window", nullptr, &m_showDemoWindow);
             ImGui::EndMenu();
         }
         ImGui::EndMenu();
     }
+
     if (ImGui::BeginMenu("Help"))
     {
-        ImGui::MenuItem("About IxtreemeEngine", nullptr, false, false);
+        if (ImGui::MenuItem(ICON_FA_KEYBOARD "  Keyboard Shortcuts"))
+            m_shortcutsWindowOpen = true;
+        if (ImGui::MenuItem(ICON_FA_CIRCLE_INFO "  About IxtreemeEngine"))
+            m_openAboutPopup = true;
         ImGui::EndMenu();
     }
 
@@ -545,7 +542,9 @@ void EditorImGui::HandleEditorHotkeys()
 
     if (!io.KeyCtrl && !io.KeyShift && ImGui::IsKeyPressed(ImGuiKey_F, false))
     {
-        if (m_waterBodyState.selected)
+        if (const HierarchySceneEntity* selected = SelectedHierarchyEntity())
+            QueueHierarchyFocus(*selected);
+        else if (m_waterBodyState.selected)
         {
             if (const HierarchySceneEntity* entity = FindHierarchyEntity(HierarchyEntityType::WaterBody, m_waterBodyState.id))
                 QueueHierarchyFocus(*entity);
@@ -609,133 +608,36 @@ void EditorImGui::HandleEditorHotkeys()
         }
     }
 
-    if (io.KeyCtrl && CanUseEditorTools())
+    // W / E / R pick the Move / Rotate / Scale tool, unless the right mouse button is flying the
+    // camera (W is "forward" then).
+    if (CanUseEditorTools() && !io.KeyCtrl && !io.KeyShift && !io.KeyAlt && !ImGui::IsMouseDown(ImGuiMouseButton_Right))
     {
-        SceneManager& scenes = SceneManager::Instance();
-        if (!io.KeyShift && ImGui::IsKeyPressed(ImGuiKey_N, false))
-            scenes.NewScene();
-        if (!io.KeyShift && ImGui::IsKeyPressed(ImGuiKey_O, false))
+        const MapEditorGizmoOperation previous = m_gizmoOperation;
+        if (ImGui::IsKeyPressed(ImGuiKey_W, false))
+            m_gizmoOperation = MapEditorGizmoOperation::Translate;
+        else if (ImGui::IsKeyPressed(ImGuiKey_E, false))
+            m_gizmoOperation = MapEditorGizmoOperation::Rotate;
+        else if (ImGui::IsKeyPressed(ImGuiKey_R, false))
+            m_gizmoOperation = MapEditorGizmoOperation::Scale;
+        if (m_gizmoOperation != previous)
         {
-#if defined(_WIN32)
-            char file[MAX_PATH]{};
-            OPENFILENAMEA ofn{};
-            ofn.lStructSize = sizeof(ofn);
-            ofn.lpstrTitle = "Open Scene";
-            ofn.lpstrFilter = "Scene Files (*.scene)\0*.scene\0All files (*.*)\0*.*\0\0";
-            ofn.lpstrFile = file;
-            ofn.nMaxFile = MAX_PATH;
-            ofn.Flags = OFN_FILEMUSTEXIST | OFN_PATHMUSTEXIST | OFN_NOCHANGEDIR;
-            if (GetOpenFileNameA(&ofn))
-                scenes.LoadScene(file);
-#endif
+            m_commands.gizmoSettingsChanged = true;
+            m_commands.gizmoOperation = m_gizmoOperation;
+            m_commands.gizmoSnapEnabled = m_gizmoSnapEnabled;
+            m_commands.gizmoSnapValue = m_gizmoSnapValue;
         }
     }
-}
 
-void EditorImGui::RenderEditorToolbar()
-{
-    if (!m_editorModeActive)
-        return;
-
-    const ImGuiViewport* viewport = ImGui::GetMainViewport();
-    ImGui::SetNextWindowPos(ImVec2(viewport->WorkPos.x + 12.0f, viewport->WorkPos.y + 12.0f), ImGuiCond_FirstUseEver);
-    ImGui::SetNextWindowSize(ImVec2(760.0f, 58.0f), ImGuiCond_FirstUseEver);
-    if (ImGui::Begin("Editor Toolbar", nullptr,
-        ImGuiWindowFlags_NoCollapse | ImGuiWindowFlags_NoScrollbar))
-    {
-        const bool isEdit = m_playModeState.mode == EditorPlayMode::Edit;
-        const bool isPlay = m_playModeState.mode == EditorPlayMode::Play;
-        const bool isPaused = m_playModeState.mode == EditorPlayMode::PlayPaused;
-
-        if (isEdit)
-        {
-            const bool canPlay = SceneManager::Instance().HasOpenScene();
-            if (!canPlay)
-                ImGui::BeginDisabled();
-            if (UI::IconButton(ICON_FA_PLAY, "Play", ImVec2(96.0f, 32.0f)))
-                m_commands.enterPlayMode = true;
-            if (!canPlay)
-            {
-                ImGui::EndDisabled();
-                if (ImGui::IsItemHovered(ImGuiHoveredFlags_AllowWhenDisabled))
-                    ImGui::SetTooltip("Open a scene to Play");
-            }
-        }
-        else
-        {
-            ImGui::PushStyleColor(ImGuiCol_Button, ImVec4(0.70f, 0.20f, 0.20f, 1.0f));
-            if (UI::IconButton(ICON_FA_STOP, "Stop", ImVec2(96.0f, 32.0f)))
-                m_commands.exitPlayMode = true;
-            ImGui::PopStyleColor();
-            ImGui::SameLine();
-            if (isPlay)
-            {
-                if (UI::IconButton(ICON_FA_PAUSE, "Pause", ImVec2(104.0f, 32.0f)))
-                    m_commands.pausePlayMode = true;
-            }
-            else if (isPaused)
-            {
-                if (UI::IconButton(ICON_FA_PLAY, "Resume", ImVec2(112.0f, 32.0f)))
-                    m_commands.resumePlayMode = true;
-            }
-        }
-
-        ImGui::SameLine();
-        ImGui::Dummy(ImVec2(16.0f, 0.0f));
-        ImGui::SameLine();
-
-        const char* modeText = isEdit ? "EDIT MODE" : isPlay ? "PLAY MODE" : "PAUSED";
-        const ImVec4 modeColor = isEdit
-            ? ImVec4(0.72f, 0.72f, 0.72f, 1.0f)
-            : isPlay ? ImVec4(0.35f, 0.90f, 0.35f, 1.0f) : ImVec4(0.95f, 0.74f, 0.30f, 1.0f);
-        ImGui::TextColored(modeColor, "%s", modeText);
-        if (!isEdit)
-        {
-            ImGui::SameLine();
-            ImGui::TextDisabled("(%.1fs, frame %d)", m_playModeState.elapsedSeconds, m_playModeState.frameCount);
-        }
-
-        ImGui::SameLine();
-        ImGui::Dummy(ImVec2(16.0f, 0.0f));
-        ImGui::SameLine();
-        {
-            // Build the project's native C++ game scripts (<ProjectRoot>/Scripts) into the module DLL.
-            const bool canBuild = isEdit && ProjectManager::Instance().HasProject() && !IsBuildRunning();
-            if (!canBuild)
-                ImGui::BeginDisabled();
-            const char* buildLabel = IsBuildRunning() ? "Building..." : "Build";
-            if (UI::IconButton(ICON_FA_HAMMER, buildLabel, ImVec2(120.0f, 32.0f)))
-                m_commands.buildGameScripts = true;
-            if (!canBuild)
-            {
-                ImGui::EndDisabled();
-                if (ImGui::IsItemHovered(ImGuiHoveredFlags_AllowWhenDisabled))
-                    ImGui::SetTooltip(IsBuildRunning() ? "Build in progress..."
-                        : !isEdit ? "Stop Play to build" : "Open a project to build C++ scripts");
-            }
-        }
-
-        ImGui::SameLine();
-        ImGui::Dummy(ImVec2(24.0f, 0.0f));
-        ImGui::SameLine();
-        RenderGizmoControls();
-
-        ImGui::SameLine();
-        ImGui::Dummy(ImVec2(18.0f, 0.0f));
-        ImGui::SameLine();
-        ImGui::TextDisabled("FPS %.0f | %.2f ms | CPU %.0f%%",
-            m_engineStats.fps,
-            m_engineStats.averageFrameMs > 0.0 ? m_engineStats.averageFrameMs : m_engineStats.frameMs,
-            m_engineStats.processCpuPercent);
-    }
-    ImGui::End();
+    if (io.KeyCtrl && !io.KeyShift && CanUseEditorTools() && ImGui::IsKeyPressed(ImGuiKey_N, false))
+        SceneManager::Instance().NewScene();
 }
 
 void EditorImGui::RenderBuildOutputPanel()
 {
     if (!m_buildOutputPanelOpen)
         return;
-    if (ImGui::Begin("Build Output", &m_buildOutputPanelOpen))
+    DockBesideIfUnplaced(EditorWindow::BuildOutput, EditorWindow::AssetBrowser);
+    if (ImGui::Begin(EditorWindow::BuildOutput, &m_buildOutputPanelOpen))
     {
         if (m_buildState == ScriptBuildState::Running)
             ImGui::TextColored(ImVec4(0.95f, 0.74f, 0.30f, 1.0f), "Building game scripts...");
@@ -893,69 +795,61 @@ void EditorImGui::RenderBuildGamePopup()
 
 void EditorImGui::RenderSceneSettingsPanel()
 {
-    if (ImGui::Begin("Scene Settings"))
+    if (!m_sceneSettingsPanelOpen)
+        return;
+    DockBesideIfUnplaced(EditorWindow::SceneSettings, EditorWindow::Inspector);
+    if (ImGui::Begin(EditorWindow::SceneSettings, &m_sceneSettingsPanelOpen))
     {
         SceneManager& scenes = SceneManager::Instance();
         if (!scenes.HasOpenScene())
         {
-            ImGui::TextUnformatted("No scene open");
-            ImGui::TextWrapped("Create or open a scene before editing scene metadata.");
+            ImGui::TextDisabled("No scene is open");
+            ImGui::TextWrapped("Create or open a scene from the File menu.");
         }
         else
         {
             const SceneData& scene = scenes.GetCurrentScene();
-
-            char nameBuffer[128]{};
-            std::snprintf(nameBuffer, sizeof(nameBuffer), "%s", scene.name.c_str());
-            if (ImGui::InputText("Scene Name", nameBuffer, sizeof(nameBuffer)))
-                scenes.SetSceneName(nameBuffer);
-
-            ImGui::Separator();
-            ImGui::TextUnformatted("Editor Camera");
-            ImGui::Text("Eye: %.1f, %.1f, %.1f",
-                scene.editorCamera.eye[0],
-                scene.editorCamera.eye[1],
-                scene.editorCamera.eye[2]);
-            const CameraEntity* mainCamera = nullptr;
-            for (const CameraEntity& cam : scene.cameras)
+            if (ImGui::CollapsingHeader(ICON_FA_GLOBE "  Scene", ImGuiTreeNodeFlags_DefaultOpen))
             {
-                if (cam.id == scene.mainCameraId)
+                char nameBuffer[128]{};
+                std::snprintf(nameBuffer, sizeof(nameBuffer), "%s", scene.name.c_str());
+                if (UI::Prop::InputText("Name", nameBuffer, sizeof(nameBuffer)))
+                    scenes.SetSceneName(nameBuffer);
+                const CameraEntity* mainCamera = nullptr;
+                for (const CameraEntity& cam : scene.cameras)
                 {
-                    mainCamera = &cam;
-                    break;
+                    if (cam.id == scene.mainCameraId)
+                    {
+                        mainCamera = &cam;
+                        break;
+                    }
                 }
+                if (mainCamera)
+                    UI::Prop::Text("Main camera", "%s  (FOV %.0f)", mainCamera->name.c_str(), mainCamera->fovDegrees);
+                else
+                    UI::Prop::Text("Main camera", "none: the Game view and the built game need one");
             }
-            if (mainCamera)
-                ImGui::Text("Main Camera FOV: %.1f  Near/Far: %.2f / %.1f",
-                    mainCamera->fovDegrees,
-                    mainCamera->nearPlane,
-                    mainCamera->farPlane);
-            else
-                ImGui::TextDisabled("No main camera");
 
-            ImGui::Separator();
-            ImGui::TextUnformatted("Environment");
-            ImGui::Text("Sun: %.1f / %.1f  Intensity: %.2f",
-                scene.lighting.directional.elevationDegrees,
-                scene.lighting.directional.azimuthDegrees,
-                scene.lighting.directional.intensity);
-            ImGui::Text("Ambient: %.2f", scene.lighting.ambient.intensity);
+            if (ImGui::CollapsingHeader(ICON_FA_SUN "  Environment", ImGuiTreeNodeFlags_DefaultOpen))
+                RenderLightingPanel();
 
-            ImGui::Separator();
-            ImGui::TextUnformatted("Physics");
-            PhysicsSceneSettings physicsSettings = scene.physics;
-            bool physicsSettingsChanged = false;
-            physicsSettingsChanged |= ImGui::DragFloat3("Gravity", physicsSettings.gravity, 0.05f, -1000.0f, 1000.0f, "%.2f");
-            physicsSettingsChanged |= ImGui::DragFloat("Fixed Timestep", &physicsSettings.fixedDeltaSeconds, 0.001f, 0.001f, 0.1f, "%.4f s");
-            int maxSubsteps = static_cast<int>(physicsSettings.maxSubsteps);
-            if (ImGui::SliderInt("Max Substeps", &maxSubsteps, 1, 16))
+            if (ImGui::CollapsingHeader(ICON_FA_CUBES "  Physics", ImGuiTreeNodeFlags_DefaultOpen))
             {
-                physicsSettings.maxSubsteps = static_cast<std::uint32_t>(std::clamp(maxSubsteps, 1, 16));
-                physicsSettingsChanged = true;
+                PhysicsSceneSettings physicsSettings = scene.physics;
+                bool physicsSettingsChanged = false;
+                physicsSettingsChanged |= UI::Prop::DragFloat3("Gravity", physicsSettings.gravity, 0.05f, -1000.0f, 1000.0f, "%.2f");
+                UI::ItemTooltip("Earth gravity is 0, -9.81, 0 (m/s^2)");
+                physicsSettingsChanged |= UI::Prop::DragFloat("Fixed timestep", &physicsSettings.fixedDeltaSeconds, 0.001f, 0.001f, 0.1f, "%.4f s");
+                int maxSubsteps = static_cast<int>(physicsSettings.maxSubsteps);
+                if (UI::Prop::SliderInt("Max substeps", &maxSubsteps, 1, 16))
+                {
+                    physicsSettings.maxSubsteps = static_cast<std::uint32_t>(std::clamp(maxSubsteps, 1, 16));
+                    physicsSettingsChanged = true;
+                }
+                if (physicsSettingsChanged)
+                    scenes.SetPhysicsSettings(physicsSettings);
+                ImGui::TextDisabled("Which layers collide: Edit > Project Settings.");
             }
-            if (physicsSettingsChanged)
-                scenes.SetPhysicsSettings(physicsSettings);
-            ImGui::TextDisabled("Default Earth gravity: 0.00, -9.81, 0.00");
         }
     }
     ImGui::End();
@@ -982,6 +876,16 @@ const HierarchySceneEntity* EditorImGui::FindHierarchyEntity(HierarchyEntityType
             return candidate.type == type && candidate.objectId == objectId;
         });
     return it == m_hierarchyEntities.end() ? nullptr : &*it;
+}
+
+const HierarchySceneEntity* EditorImGui::SelectedHierarchyEntity() const
+{
+    for (const HierarchySceneEntity& entity : m_hierarchyEntities)
+    {
+        if (entity.selected)
+            return &entity;
+    }
+    return FindHierarchyEntity(m_selectedHierarchyEntity);
 }
 
 bool EditorImGui::HierarchySubtreePassesSearch(std::uint64_t entity) const
