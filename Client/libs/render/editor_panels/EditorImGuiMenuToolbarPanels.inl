@@ -414,27 +414,39 @@ EditorImGui::ScriptFileChanges EditorImGui::PollScriptFileChanges()
         }
     }
 
-    // (b) native C++ sources (the asset scripts folder, *.cpp,*.h,*.hpp) — a single "something changed"
-    // flag that triggers an auto-build. Headers aren't assets, and brand-new .cpp may not be registered
-    // yet, so scan the directory directly rather than rely on the manifest.
+    // (b) native C++ sources — every .cpp Script asset (wherever it sits in the asset folder) plus the
+    // headers beside them: a single "something changed" flag that triggers an auto-build. A brand-new
+    // .cpp counts once the library registered it (the file watcher refreshes the library), so the
+    // whole asset folder is never walked here.
     const std::filesystem::path scriptsDir = ProjectScriptSourceDir();
     std::unordered_map<std::string, std::filesystem::file_time_type> seen;
-    if (std::filesystem::is_directory(scriptsDir, ec))
+    std::set<std::filesystem::path> sourceDirs;
+    const auto stampSource = [&](const std::filesystem::path& path) {
+        const std::filesystem::file_time_type mt = std::filesystem::last_write_time(path, ec);
+        if (ec)
+            return;
+        const std::string full = path.generic_string();
+        seen[full] = mt;
+        const auto it = m_cppMtimes.find(full);
+        if (it != m_cppMtimes.end() && it->second != mt && !firstPass)
+            changes.changedCpp = true;
+    };
+    for (const AssetLibrary::Entry& e : m_assetLibrary->EntriesFor(AssetLibrary::Category::Script))
     {
-        for (const std::filesystem::directory_entry& de : std::filesystem::recursive_directory_iterator(
-                 scriptsDir, std::filesystem::directory_options::skip_permission_denied, ec))
+        const std::filesystem::path p = m_assetLibrary->AbsolutePath(e);
+        if (!IsNativeScriptSource(scriptsDir, p))
+            continue;
+        stampSource(p);
+        sourceDirs.insert(p.parent_path());
+    }
+    for (const std::filesystem::path& dir : sourceDirs)
+    {
+        for (const std::filesystem::directory_entry& de : std::filesystem::directory_iterator(
+                 dir, std::filesystem::directory_options::skip_permission_denied, ec))
         {
-            // Skips any CMake build tree under the scripts dir (its churn isn't a source edit).
-            if (!de.is_regular_file(ec) || !IsNativeScriptSource(scriptsDir, de.path()))
-                continue;
-            const std::string full = de.path().generic_string();
-            const std::filesystem::file_time_type mt = std::filesystem::last_write_time(de.path(), ec);
-            if (ec)
-                continue;
-            seen[full] = mt;
-            const auto it = m_cppMtimes.find(full);
-            if (it != m_cppMtimes.end() && it->second != mt && !firstPass)
-                changes.changedCpp = true;
+            std::error_code entryEc;
+            if (de.is_regular_file(entryEc) && de.path().extension() != ".cpp" && IsNativeScriptSource(scriptsDir, de.path()))
+                stampSource(de.path());
         }
     }
     if (!firstPass && seen.size() != m_cppMtimes.size())

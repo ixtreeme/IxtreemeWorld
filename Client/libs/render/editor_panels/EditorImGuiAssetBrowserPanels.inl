@@ -7,174 +7,52 @@ void EditorImGui::RenderAssetBrowserToolbar()
         RefreshAssetLibrary();
 }
 
-void EditorImGui::RenderAssetTypeTabs()
+void EditorImGui::RenderAssetCreateMenuItems(const std::string& targetSubpath)
 {
-    const auto tab = [this](const char* label, AssetBrowserFilter filter) {
-        const bool active = m_assetFilter == filter;
-        if (active)
-        {
-            ImGui::PushStyleColor(ImGuiCol_Button, ImGui::GetStyleColorVec4(ImGuiCol_TabActive));
-            ImGui::PushStyleColor(ImGuiCol_ButtonHovered, ImGui::GetStyleColorVec4(ImGuiCol_TabActive));
-            ImGui::PushStyleColor(ImGuiCol_ButtonActive, ImGui::GetStyleColorVec4(ImGuiCol_TabActive));
-        }
-        else
-        {
-            ImGui::PushStyleColor(ImGuiCol_Button, ImGui::GetStyleColorVec4(ImGuiCol_Tab));
-            ImGui::PushStyleColor(ImGuiCol_ButtonHovered, ImGui::GetStyleColorVec4(ImGuiCol_TabHovered));
-            ImGui::PushStyleColor(ImGuiCol_ButtonActive, ImGui::GetStyleColorVec4(ImGuiCol_TabActive));
-        }
-
-        if (ImGui::Button(label))
-        {
-            if (m_assetFilter != filter)
-            {
-                m_assetFilter = filter;
-                m_assetSubpath.clear();
-                m_activeAssetTags.clear();
-                m_selectedAssetId.clear();
-                m_assetInspectorSelectionActive = false;
-            }
-        }
-        ImGui::PopStyleColor(3);
-    };
-
-    tab("All", AssetBrowserFilter::All);
-    ImGui::SameLine();
-    tab("Textures", AssetBrowserFilter::Texture);
-    ImGui::SameLine();
-    tab("Models", AssetBrowserFilter::Model);
-    ImGui::SameLine();
-    tab("Anims", AssetBrowserFilter::Animation);
-    ImGui::SameLine();
-    tab("Anim Clips", AssetBrowserFilter::AnimationClip);
-    ImGui::SameLine();
-    tab("Animators", AssetBrowserFilter::AnimatorController);
-    ImGui::SameLine();
-    tab("Audio", AssetBrowserFilter::Audio);
-    ImGui::SameLine();
-    tab("Scripts", AssetBrowserFilter::Script);
-    ImGui::SameLine();
-    tab("Materials", AssetBrowserFilter::Material);
-    ImGui::SameLine();
-    tab("Water Mats", AssetBrowserFilter::WaterMaterial);
-    ImGui::SameLine();
-    tab("Physics Mats", AssetBrowserFilter::PhysicsMaterial);
-    ImGui::SameLine();
-    tab("Scenes", AssetBrowserFilter::Scene);
-    ImGui::SameLine();
-    tab("Prefabs", AssetBrowserFilter::Prefab);
-}
-
-void EditorImGui::RenderAssetFolderNode(const std::string& path, const std::vector<std::string>& folders)
-{
-    const std::string nodeId = path.empty() ? std::string("__asset_root__") : path;
-    ImGui::PushID(nodeId.c_str());
-
-    const bool selected = AssetLibrary::NormalizeSubpath(path) == AssetLibrary::NormalizeSubpath(m_assetSubpath);
-    ImGuiTreeNodeFlags flags = ImGuiTreeNodeFlags_OpenOnArrow | ImGuiTreeNodeFlags_SpanAvailWidth;
-    if (selected)
-        flags |= ImGuiTreeNodeFlags_Selected;
-
-    bool hasChildren = false;
-    for (const std::string& folder : folders)
+    const std::string target = AssetLibrary::NormalizeSubpath(targetSubpath);
+    if (ImGui::MenuItem("New Folder"))
     {
-        if (IsDirectChildFolder(path, folder))
-        {
-            hasChildren = true;
-            break;
-        }
+        m_assetNewFolderParent = target;
+        CopyToBuffer(m_newAssetFolderName, sizeof(m_newAssetFolderName), UniqueFolderName(AssetBrowserPath(target)));
+        m_assetOpenNewFolderPopup = true;
     }
-    if (!hasChildren)
-        flags |= ImGuiTreeNodeFlags_Leaf;
-
-    const std::string label = FolderDisplayName(path);
-    const bool open = ImGui::TreeNodeEx(label.c_str(), flags);
-    if (ImGui::IsItemClicked() && !ImGui::IsItemToggledOpen())
-    {
-        m_assetSubpath = AssetLibrary::NormalizeSubpath(path);
-        m_selectedAssetId.clear();
-        m_assetInspectorSelectionActive = false;
-    }
-
-    if (ImGui::BeginDragDropTarget())
-    {
-        if (const ImGuiPayload* payload = ImGui::AcceptDragDropPayload(kAssetPayloadType))
-        {
-            const std::string assetId(static_cast<const char*>(payload->Data), payload->DataSize);
-            AssetLibrary::Entry moved{};
-            std::string error;
-            if (m_assetLibrary && m_assetLibrary->MoveAssetToSubpath(assetId, path, moved, error))
-            {
-                m_assetStatus = "Moved asset to " + FolderDisplayName(path);
-                Tracenf("[EDITOR-IMGUI-3] Drag dropped: asset_id=%s target_type=folder path=%s",
-                    assetId.c_str(),
-                    path.c_str());
-            }
-            else
-            {
-                m_assetStatus = "Move failed: " + error;
-            }
-        }
-        ImGui::EndDragDropTarget();
-    }
-
-    if (open)
-    {
-        for (const std::string& folder : folders)
-        {
-            if (IsDirectChildFolder(path, folder))
-                RenderAssetFolderNode(folder, folders);
-        }
-        ImGui::TreePop();
-    }
-
-    ImGui::PopID();
-}
-
-void EditorImGui::RenderAssetFolderPanel()
-{
-    const bool sceneCategory = m_assetFilter == AssetBrowserFilter::Scene;
-    if (UI::IconButton(ICON_FA_HOUSE, "Home"))
-    {
-        m_assetSubpath.clear();
-        m_selectedAssetId.clear();
-        m_assetInspectorSelectionActive = false;
-    }
-    ImGui::SameLine();
-    if (UI::IconButton(ICON_FA_FOLDER_OPEN, "Up"))
-    {
-        m_assetSubpath = ParentSubpath(m_assetSubpath);
-        m_selectedAssetId.clear();
-        m_assetInspectorSelectionActive = false;
-    }
-
-    if (sceneCategory)
-        ImGui::BeginDisabled();
-    if (UI::IconButton(ICON_FA_FOLDER_PLUS, "Folder"))
-        ImGui::OpenPopup("NewAssetFolder");
-    ImGui::SameLine();
-    if (UI::IconButton(ICON_FA_TRASH, "Delete") && !m_assetSubpath.empty())
-        DeleteAssetFolder();
-    if (sceneCategory)
-        ImGui::EndDisabled();
-
-    if (ImGui::BeginPopup("NewAssetFolder"))
-    {
-        ImGui::InputText("Name", m_newAssetFolderName, sizeof(m_newAssetFolderName));
-        if (ImGui::Button("Create"))
-        {
-            CreateAssetFolder();
-            ImGui::CloseCurrentPopup();
-        }
-        ImGui::SameLine();
-        if (ImGui::Button("Cancel"))
-            ImGui::CloseCurrentPopup();
-        ImGui::EndPopup();
-    }
-
     ImGui::Separator();
-    const std::vector<std::string> folders = QueryVisibleFolders();
-    RenderAssetFolderNode("", folders);
+    // Each creator consumes m_assetCreateTarget (see CreateTargetSubpath).
+    const auto createItem = [&](const char* label, void (EditorImGui::*create)()) {
+        if (ImGui::MenuItem(label))
+        {
+            m_assetCreateTarget = target;
+            (this->*create)();
+            m_assetCreateTarget.reset();
+        }
+    };
+    createItem("New Lua Script", &EditorImGui::CreateLuaScriptAsset);
+    createItem("New C++ Script", &EditorImGui::CreateNativeScriptAsset);
+    ImGui::Separator();
+    createItem("New Material", &EditorImGui::CreatePbrMaterialAsset);
+    createItem("New Water Material", static_cast<void (EditorImGui::*)()>(&EditorImGui::CreateWaterMaterialAsset));
+    createItem("New Physics Material", &EditorImGui::CreatePhysicsMaterialAsset);
+    createItem("New Animator Controller", &EditorImGui::CreateAnimatorControllerAsset);
+    ImGui::Separator();
+    if (ImGui::MenuItem("Import Asset..."))
+        OpenImportAssetDialog(target);
+}
+
+void EditorImGui::AcceptAssetBrowserDrop(const std::string& targetSubpath)
+{
+    if (!ImGui::BeginDragDropTarget())
+        return;
+    if (const ImGuiPayload* payload = ImGui::AcceptDragDropPayload(kAssetPayloadType))
+    {
+        const std::string assetId(static_cast<const char*>(payload->Data), payload->DataSize);
+        MoveAssetEntryToFolder(assetId, targetSubpath);
+    }
+    if (const ImGuiPayload* payload = ImGui::AcceptDragDropPayload(kAssetFolderPayloadType))
+    {
+        const std::string source(static_cast<const char*>(payload->Data), payload->DataSize);
+        MoveFolderToFolder(source, targetSubpath);
+    }
+    ImGui::EndDragDropTarget();
 }
 
 void EditorImGui::RenderAssetTile(const AssetLibrary::Entry& entry, float tileSize)
@@ -340,17 +218,17 @@ void EditorImGui::RenderAssetTile(const AssetLibrary::Entry& entry, float tileSi
                 m_assetStatus = "Preview: " + entry.displayName;
             }
         }
-        else
+        else if (entry.category == AssetLibrary::Category::Model)
         {
             ImGui::Separator();
-            if (entry.category == AssetLibrary::Category::Model && ImGui::MenuItem("Export to FBX..."))
+            if (ImGui::MenuItem("Export to FBX..."))
                 OpenFbxExportDialogForAsset(entry);
-            if (ImGui::MenuItem("New Material"))
-                CreatePbrMaterialAsset();
-            if (ImGui::MenuItem("New Water Material"))
-                CreateWaterMaterialAsset();
-            if (ImGui::MenuItem("New Physics Material"))
-                CreatePhysicsMaterialAsset();
+        }
+        ImGui::Separator();
+        if (ImGui::BeginMenu("Create Here"))
+        {
+            RenderAssetCreateMenuItems(entry.subpath);
+            ImGui::EndMenu();
         }
         ImGui::EndPopup();
     }
@@ -386,68 +264,6 @@ void EditorImGui::RenderAssetTile(const AssetLibrary::Entry& entry, float tileSi
     ImGui::PopID();
 }
 
-void EditorImGui::RenderAssetGrid()
-{
-    const std::vector<AssetLibrary::Entry> visibleAssets = QueryVisibleAssets();
-    const std::vector<std::string> folders = QueryVisibleFolders();
-    uint32_t directFolders = 0;
-    for (const std::string& folder : folders)
-    {
-        if (IsDirectChildFolder(m_assetSubpath, folder))
-            ++directFolders;
-    }
-
-    ImGui::Text("%zu assets, %u folders | %s | %s",
-        visibleAssets.size(),
-        directFolders,
-        AssetFilterName(),
-        m_assetSubpath.empty() ? "Home" : m_assetSubpath.c_str());
-    ImGui::Separator();
-
-    const float tileSize = 86.0f;
-    const float cellWidth = 142.0f;
-    const float panelWidth = std::max(1.0f, ImGui::GetContentRegionAvail().x);
-    const float columnStride = cellWidth + ImGui::GetStyle().ItemSpacing.x;
-    const int columns = std::max(1, static_cast<int>((panelWidth + ImGui::GetStyle().ItemSpacing.x) / columnStride));
-    if (ImGui::BeginTable("AssetGridTiles", columns, ImGuiTableFlags_SizingFixedSame | ImGuiTableFlags_NoSavedSettings))
-    {
-        for (int i = 0; i < columns; ++i)
-            ImGui::TableSetupColumn(nullptr, ImGuiTableColumnFlags_WidthFixed, cellWidth);
-
-        for (const AssetLibrary::Entry& entry : visibleAssets)
-        {
-            ImGui::TableNextColumn();
-            ImGui::BeginGroup();
-            RenderAssetTile(entry, tileSize);
-            ImGui::EndGroup();
-        }
-        ImGui::EndTable();
-    }
-
-    if (visibleAssets.empty())
-        ImGui::TextDisabled("No assets in this view.");
-
-    if (ImGui::BeginPopupContextWindow("AssetGridContext", ImGuiPopupFlags_MouseButtonRight | ImGuiPopupFlags_NoOpenOverItems))
-    {
-        if (ImGui::MenuItem("New Material"))
-            CreatePbrMaterialAsset();
-        if (ImGui::MenuItem("New Water Material"))
-            CreateWaterMaterialAsset();
-        if (ImGui::MenuItem("New Physics Material"))
-            CreatePhysicsMaterialAsset();
-        ImGui::EndPopup();
-    }
-
-    if (!m_assetBrowserLogged)
-    {
-        m_assetBrowserLogged = true;
-        Tracenf("[EDITOR-IMGUI-3] Asset Browser rendered, current_path=%s filter_type=%s visible_assets=%zu",
-            m_assetSubpath.c_str(),
-            AssetFilterName(),
-            visibleAssets.size());
-    }
-}
-
 void EditorImGui::RenderAssetBrowserFolderTreeNode(const std::string& subpath)
 {
     const std::string normalized = AssetLibrary::NormalizeSubpath(subpath);
@@ -471,29 +287,10 @@ void EditorImGui::RenderAssetBrowserFolderTreeNode(const std::string& subpath)
         ImGui::EndDragDropSource();
     }
 
-    if (ImGui::BeginDragDropTarget())
-    {
-        if (const ImGuiPayload* payload = ImGui::AcceptDragDropPayload(kAssetPayloadType))
-        {
-            const std::string assetId(static_cast<const char*>(payload->Data), payload->DataSize);
-            MoveAssetEntryToFolder(assetId, normalized);
-        }
-        if (const ImGuiPayload* payload = ImGui::AcceptDragDropPayload(kAssetFolderPayloadType))
-        {
-            const std::string source(static_cast<const char*>(payload->Data), payload->DataSize);
-            MoveFolderToFolder(source, normalized);
-        }
-        ImGui::EndDragDropTarget();
-    }
+    AcceptAssetBrowserDrop(normalized);
 
     if (ImGui::BeginPopupContextItem("FolderTreeContext"))
     {
-        if (ImGui::MenuItem("New Folder"))
-        {
-            m_assetNewFolderParent = normalized;
-            CopyToBuffer(m_newAssetFolderName, sizeof(m_newAssetFolderName), UniqueFolderName(AssetBrowserPath(normalized)));
-            m_assetOpenNewFolderPopup = true;
-        }
         if (!normalized.empty() && ImGui::MenuItem("Rename"))
             BeginFolderRename(normalized);
         if (!normalized.empty() && ImGui::MenuItem("Delete"))
@@ -502,9 +299,9 @@ void EditorImGui::RenderAssetBrowserFolderTreeNode(const std::string& subpath)
             m_assetDeleteIsFolder = true;
             m_assetOpenDeletePopup = true;
         }
-        ImGui::Separator();
-        if (ImGui::MenuItem("Import Asset..."))
-            OpenImportAssetDialog(normalized);
+        if (!normalized.empty())
+            ImGui::Separator();
+        RenderAssetCreateMenuItems(normalized);
         ImGui::EndPopup();
     }
 
@@ -583,28 +380,9 @@ void EditorImGui::RenderAssetBrowserFolderTile(const std::string& subpath, float
         ImGui::Text("%s", FolderDisplayName(subpath).c_str());
         ImGui::EndDragDropSource();
     }
-    if (ImGui::BeginDragDropTarget())
-    {
-        if (const ImGuiPayload* payload = ImGui::AcceptDragDropPayload(kAssetPayloadType))
-        {
-            const std::string assetId(static_cast<const char*>(payload->Data), payload->DataSize);
-            MoveAssetEntryToFolder(assetId, subpath);
-        }
-        if (const ImGuiPayload* payload = ImGui::AcceptDragDropPayload(kAssetFolderPayloadType))
-        {
-            const std::string source(static_cast<const char*>(payload->Data), payload->DataSize);
-            MoveFolderToFolder(source, subpath);
-        }
-        ImGui::EndDragDropTarget();
-    }
+    AcceptAssetBrowserDrop(subpath);
     if (ImGui::BeginPopupContextItem("FolderTileContext"))
     {
-        if (ImGui::MenuItem("New Folder"))
-        {
-            m_assetNewFolderParent = subpath;
-            CopyToBuffer(m_newAssetFolderName, sizeof(m_newAssetFolderName), UniqueFolderName(AssetBrowserPath(subpath)));
-            m_assetOpenNewFolderPopup = true;
-        }
         if (ImGui::MenuItem("Rename"))
             BeginFolderRename(subpath);
         if (ImGui::MenuItem("Delete"))
@@ -614,8 +392,7 @@ void EditorImGui::RenderAssetBrowserFolderTile(const std::string& subpath, float
             m_assetOpenDeletePopup = true;
         }
         ImGui::Separator();
-        if (ImGui::MenuItem("Import Asset..."))
-            OpenImportAssetDialog(subpath);
+        RenderAssetCreateMenuItems(subpath);
         ImGui::EndPopup();
     }
     ImGui::TextUnformatted(FolderDisplayName(subpath).c_str());
@@ -662,27 +439,18 @@ void EditorImGui::RenderAssetBrowserContent()
     if (folders.empty() && assets.empty())
         ImGui::TextDisabled("Empty folder.");
 
+    // The empty area under the tiles takes drops too (into the folder shown) and opens the create menu.
+    const ImVec2 remaining = ImGui::GetContentRegionAvail();
+    if (remaining.x > 1.0f && remaining.y > 1.0f)
+    {
+        ImGui::InvisibleButton("##asset_content_drop", remaining);
+        AcceptAssetBrowserDrop(m_assetSubpath);
+        ImGui::OpenPopupOnItemClick("AssetBrowserContentContext", ImGuiPopupFlags_MouseButtonRight);
+    }
+
     if (ImGui::BeginPopupContextWindow("AssetBrowserContentContext", ImGuiPopupFlags_MouseButtonRight | ImGuiPopupFlags_NoOpenOverItems))
     {
-        if (ImGui::MenuItem("New Folder"))
-        {
-            m_assetNewFolderParent = m_assetSubpath;
-            CopyToBuffer(m_newAssetFolderName, sizeof(m_newAssetFolderName), UniqueFolderName(AssetBrowserPath(m_assetSubpath)));
-            m_assetOpenNewFolderPopup = true;
-        }
-        if (ImGui::MenuItem("New Lua Script"))
-            CreateLuaScriptAsset();
-        if (ImGui::MenuItem("New C++ Script"))
-            CreateNativeScriptAsset();
-        if (ImGui::MenuItem("New Material"))
-            CreatePbrMaterialAsset();
-        if (ImGui::MenuItem("New Water Material"))
-            CreateWaterMaterialAsset();
-        if (ImGui::MenuItem("New Physics Material"))
-            CreatePhysicsMaterialAsset();
-        ImGui::Separator();
-        if (ImGui::MenuItem("Import Asset..."))
-            OpenImportAssetDialog(m_assetSubpath);
+        RenderAssetCreateMenuItems(m_assetSubpath);
         ImGui::EndPopup();
     }
 }
@@ -884,7 +652,7 @@ void EditorImGui::RenderCreatePbrMaterialPopup()
     {
         AssetLibrary::ImportOptions options{};
         options.displayName = m_createMaterialName[0] != '\0' ? m_createMaterialName : "material";
-        options.subpath = m_assetSubpath;
+        options.subpath = m_createMaterialTargetSubpath;
         options.tags = {"material"};
         AssetLibrary::MaterialData material{};
         material.shadingMode = m_createMaterialShadingMode == 1 ? "unlit" : "lit";
@@ -897,8 +665,7 @@ void EditorImGui::RenderCreatePbrMaterialPopup()
         }
         else
         {
-            m_assetFilter = AssetBrowserFilter::Material;
-            m_selectedAssetId = entry.id;
+            RevealCreatedAsset(entry);
             m_assetStatus = "Material created: " + entry.displayName;
             Tracenf("[MATERIAL] created path=%s shadingMode=%s",
                 m_assetLibrary->AbsolutePath(entry).generic_string().c_str(),
@@ -1023,27 +790,6 @@ void EditorImGui::RenderFbxExportPopup()
         ImGui::CloseCurrentPopup();
     }
     ImGui::EndPopup();
-}
-
-void EditorImGui::RenderAssetTagFilters()
-{
-    const std::vector<std::pair<std::string, std::uint32_t>> tags = QueryVisibleTags();
-    ImGui::TextUnformatted("Tags");
-    ImGui::Separator();
-    for (const auto& tag : tags)
-    {
-        bool active = std::find(m_activeAssetTags.begin(), m_activeAssetTags.end(), tag.first) != m_activeAssetTags.end();
-        const std::string label = tag.first + " (" + std::to_string(tag.second) + ")";
-        if (ImGui::Checkbox(label.c_str(), &active))
-        {
-            if (active)
-                m_activeAssetTags.push_back(tag.first);
-            else
-                m_activeAssetTags.erase(std::remove(m_activeAssetTags.begin(), m_activeAssetTags.end(), tag.first), m_activeAssetTags.end());
-        }
-    }
-    if (!m_activeAssetTags.empty() && ImGui::Button("Clear Filters"))
-        m_activeAssetTags.clear();
 }
 
 void EditorImGui::RenderAssetBrowser()
@@ -1205,24 +951,21 @@ void EditorImGui::RenderScriptsPanel()
     else
     {
         const std::filesystem::path scriptsDir = ProjectScriptSourceDir();
-        // A recursive scan: cached with the asset browser listings, not redone every frame.
+        // The .cpp Script assets (anywhere in the asset folder): cached with the browser listings.
         ValidateAssetBrowserCache();
-        if (!m_assetBrowserCache.nativeScriptSources)
+        if (!m_assetBrowserCache.nativeScriptSources && m_assetLibrary)
         {
             auto& sources = m_assetBrowserCache.nativeScriptSources.emplace();
-            std::error_code ec;
-            if (std::filesystem::is_directory(scriptsDir, ec))
+            for (const AssetLibrary::Entry& e : m_assetLibrary->EntriesFor(AssetLibrary::Category::Script))
             {
-                for (const std::filesystem::directory_entry& e :
-                     std::filesystem::recursive_directory_iterator(
-                         scriptsDir, std::filesystem::directory_options::skip_permission_denied, ec))
-                {
-                    if (!e.is_regular_file(ec) || !IsNativeScriptSource(scriptsDir, e.path()))
-                        continue;
-                    sources.emplace_back(e.path(), std::filesystem::relative(e.path(), scriptsDir, ec).generic_string());
-                }
+                const std::filesystem::path p = m_assetLibrary->AbsolutePath(e);
+                if (IsNativeScriptSource(scriptsDir, p))
+                    sources.emplace_back(p, e.subpath.empty() ? e.filename : e.subpath + "/" + e.filename);
             }
+            std::sort(sources.begin(), sources.end(), [](const auto& a, const auto& b) { return a.second < b.second; });
         }
+        if (!m_assetBrowserCache.nativeScriptSources)
+            m_assetBrowserCache.nativeScriptSources.emplace();
         const bool anySource = !m_assetBrowserCache.nativeScriptSources->empty();
         for (const auto& [path, rel] : *m_assetBrowserCache.nativeScriptSources)
         {

@@ -86,7 +86,7 @@ bool WriteAnimationClipSidecar(const std::filesystem::path& clipPath,
 }
 
 bool ProcessImportedFbxAsset(const std::filesystem::path& destination,
-                             const std::filesystem::path& libraryRoot,
+                             const std::filesystem::path& /*libraryRoot: everything goes next to the model*/,
                              std::string& error)
 {
     AssimpImporter importer;
@@ -141,10 +141,10 @@ bool ProcessImportedFbxAsset(const std::filesystem::path& destination,
                 skeletonPath.filename().generic_string().c_str(),
                 animationPaths.size());
 
-            // Emit a retargetable .ixclip wrapper per animation into the library's
-            // animation_clips/ folder so each becomes a standalone, skeleton-agnostic clip
-            // (AssetLibrary::ReconcileFilesystem discovers them as browser entries).
-            const std::filesystem::path clipDir = libraryRoot / "animation_clips" / stem;
+            // Emit a retargetable .ixclip wrapper per animation next to the model, in <model>_clips/,
+            // so each becomes a standalone, skeleton-agnostic clip (the asset library discovers them
+            // as browser entries wherever they are).
+            const std::filesystem::path clipDir = destination.parent_path() / (stem + "_clips");
             const std::string skeletonGuidStr = skeletonGuid ? skeletonGuid->toString() : std::string();
             for (std::size_t i = 0; i < animationPaths.size() && i < result.animations.size(); ++i)
             {
@@ -180,7 +180,8 @@ bool ProcessImportedFbxAsset(const std::filesystem::path& destination,
     defaultMaterials.reserve(result.materials.size());
     MaterialAssetManager::ImportSummary summary{};
     summary.materials = static_cast<std::uint32_t>(result.materials.size());
-    const std::filesystem::path materialsDir = libraryRoot / "materials" / SanitizeStem(destination.stem().string());
+    // The model's materials sit next to it, in <model>_materials/ (no per-type folder).
+    const std::filesystem::path materialsDir = destination.parent_path() / (SanitizeStem(destination.stem().string()) + "_materials");
     for (std::size_t i = 0; i < result.materials.size(); ++i)
     {
         const GltfMaterialSource& material = result.materials[i];

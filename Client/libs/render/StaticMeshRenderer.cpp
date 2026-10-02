@@ -763,7 +763,8 @@ std::vector<Guid> GenerateMaterialAssetsForGltf(const fastgltf::Asset& asset, co
         ? modelFsPath.parent_path()
         : std::filesystem::current_path();
     const std::string meshName = SanitizedStem(modelFsPath.stem().string());
-    const std::filesystem::path materialFolder = projects.AssetRootPath() / "materials" / meshName;
+    // The model's generated materials sit next to it, in <model>_materials/ (no per-type folder).
+    const std::filesystem::path materialFolder = modelDir / (meshName + "_materials");
 
     auto& manager = MaterialAssetManager::Instance();
     MaterialAssetManager::ImportSummary summary{};

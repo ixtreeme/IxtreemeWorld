@@ -813,6 +813,7 @@ bool EditorImGui::RenderSelectedMeshPhysicsComponents()
             {
                 AssetLibrary::ImportOptions opts;
                 opts.displayName = "Locomotion";
+                opts.subpath = m_assetSubpath;  // the folder the asset browser shows
                 AssetLibrary::Entry created;
                 std::string createErr;
                 if (m_assetLibrary->CreateAnimatorController(opts, created, createErr))
@@ -2347,7 +2348,7 @@ void EditorImGui::RenderSplatLayerSlot(std::uint32_t slotIndex)
     }
     ImGui::PopStyleColor(3);
 
-    if (m_assetFilter != AssetBrowserFilter::Scene && ImGui::BeginDragDropTarget())
+    if (ImGui::BeginDragDropTarget())
     {
         if (const ImGuiPayload* payload = ImGui::AcceptDragDropPayload(kAssetPayloadType))
         {

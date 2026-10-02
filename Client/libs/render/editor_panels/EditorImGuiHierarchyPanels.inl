@@ -89,45 +89,63 @@ std::vector<AssetLibrary::Entry> EditorImGui::QuerySceneAssets() const
     if (!projects.HasProject())
         return scenes;
 
-    const std::filesystem::path scenesRoot = projects.ScenesPath();
-    std::error_code ec;
-    if (!std::filesystem::exists(scenesRoot, ec))
-        return scenes;
-
-    for (const auto& entry : std::filesystem::recursive_directory_iterator(
-             scenesRoot,
-             std::filesystem::directory_options::skip_permission_denied,
-             ec))
-    {
-        if (ec)
-            break;
-        std::error_code entryEc;
-        if (!entry.is_regular_file(entryEc) || entry.path().extension() != ".scene")
-            continue;
-
-        std::filesystem::path absolutePath = std::filesystem::absolute(entry.path(), entryEc);
-        if (entryEc)
-            absolutePath = entry.path();
-        const std::filesystem::path relativePath = std::filesystem::relative(absolutePath, projects.ProjectRoot(), entryEc);
-        const std::string relative = entryEc ? entry.path().generic_string() : relativePath.generic_string();
-
-        AssetLibrary::Entry scene;
-        scene.category = AssetLibrary::Category::Scene;
-        scene.displayName = absolutePath.stem().string();
-        scene.filename = absolutePath.filename().string();
-        scene.originalPath = absolutePath.string();
-        const std::filesystem::path sceneRelativePath = std::filesystem::relative(absolutePath, scenesRoot, entryEc);
-        scene.subpath = AssetLibrary::NormalizeSubpath(
-            (entryEc ? std::filesystem::path(relative) : sceneRelativePath).parent_path().generic_string());
-        scene.tags = {"scene"};
-        scene.id = "scene_";
-        for (char ch : relative)
+    // Scenes live in the project's scenes folder and anywhere in the asset folder.
+    std::unordered_set<std::string> seen;
+    const auto collectScenes = [&](const std::filesystem::path& scanRoot) {
+        std::error_code ec;
+        if (!std::filesystem::exists(scanRoot, ec))
+            return;
+        std::filesystem::recursive_directory_iterator it(
+            scanRoot, std::filesystem::directory_options::skip_permission_denied, ec);
+        for (const std::filesystem::recursive_directory_iterator end; !ec && it != end; it.increment(ec))
         {
-            const unsigned char uch = static_cast<unsigned char>(ch);
-            scene.id += std::isalnum(uch) ? static_cast<char>(std::tolower(uch)) : '_';
+            try
+            {
+                std::error_code entryEc;
+                if (it->is_directory(entryEc))
+                {
+                    const std::string name = ToLowerAscii(it->path().filename().string());
+                    if (name.empty() || name.front() == '.' || name == "build" ||
+                        (it.depth() == 0 && AssetLibrary::IsInternalFolder(name)))
+                        it.disable_recursion_pending();
+                    continue;
+                }
+                if (!it->is_regular_file(entryEc) || it->path().extension() != ".scene")
+                    continue;
+
+                std::filesystem::path absolutePath = std::filesystem::absolute(it->path(), entryEc);
+                if (entryEc)
+                    absolutePath = it->path();
+                if (!seen.insert(ComparablePath(absolutePath)).second)
+                    continue;
+                const std::filesystem::path relativePath = std::filesystem::relative(absolutePath, projects.ProjectRoot(), entryEc);
+                const std::string relative = entryEc ? it->path().generic_string() : relativePath.generic_string();
+
+                AssetLibrary::Entry scene;
+                scene.category = AssetLibrary::Category::Scene;
+                scene.displayName = absolutePath.stem().string();
+                scene.filename = absolutePath.filename().string();
+                scene.originalPath = absolutePath.string();
+                const std::filesystem::path sceneRelativePath = std::filesystem::relative(absolutePath, scanRoot, entryEc);
+                scene.subpath = AssetLibrary::NormalizeSubpath(
+                    (entryEc ? std::filesystem::path(relative) : sceneRelativePath).parent_path().generic_string());
+                scene.tags = {"scene"};
+                scene.id = "scene_";
+                for (char ch : relative)
+                {
+                    const unsigned char uch = static_cast<unsigned char>(ch);
+                    scene.id += std::isalnum(uch) ? static_cast<char>(std::tolower(uch)) : '_';
+                }
+                scenes.push_back(std::move(scene));
+            }
+            catch (const std::exception&)
+            {
+                // a name the narrow path API cannot represent: not listed
+            }
         }
-        scenes.push_back(std::move(scene));
-    }
+    };
+    collectScenes(projects.ScenesPath());
+    collectScenes(projects.AssetRootPath());
 
     std::sort(scenes.begin(), scenes.end(), [](const AssetLibrary::Entry& a, const AssetLibrary::Entry& b) {
         return ToLowerAscii(a.originalPath) < ToLowerAscii(b.originalPath);

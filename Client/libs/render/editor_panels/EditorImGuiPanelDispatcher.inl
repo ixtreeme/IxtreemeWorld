@@ -85,7 +85,6 @@ void EditorImGui::RenderTreeGeneratorPanel()
     if (m_treeGeneratorPanel->Render())
     {
         RefreshAssetLibrary();
-        m_assetFilter = AssetBrowserFilter::Model;
         m_assetStatus = m_treeGeneratorPanel->Status();
     }
 }

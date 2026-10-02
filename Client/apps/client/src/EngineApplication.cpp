@@ -676,9 +676,12 @@ std::vector<std::string> LoadDefaultMaterialSlotGuids(const std::string& meshAss
 
         if (ProjectManager::Instance().HasProject())
         {
-            const std::filesystem::path materialFolder =
-                ProjectManager::Instance().AssetRootPath() / "materials" / modelPath.stem();
+            // The model's materials folder: next to it (<model>_materials), or where older imports
+            // put it (Assets/materials/<model>).
+            std::filesystem::path materialFolder = modelPath.parent_path() / (modelPath.stem().string() + "_materials");
             std::error_code ec;
+            if (!std::filesystem::exists(materialFolder, ec))
+                materialFolder = ProjectManager::Instance().AssetRootPath() / "materials" / modelPath.stem();
             std::vector<std::filesystem::path> materialFiles;
             if (std::filesystem::exists(materialFolder, ec))
             {
@@ -2985,7 +2988,7 @@ int RunGame(NativeWindow& window,
             {
                 AssetLibrary projectAssets(ProjectManager::Instance().ProjectRoot(),
                     ProjectManager::Instance().AssetRootPath());
-                if (projectAssets.Initialize())
+                if (projectAssets.InitializeReadOnly())
                     if (auto e = projectAssets.FindById(assetId);
                         e && e->category == AssetLibrary::Category::Model)
                     {
@@ -2997,7 +3000,7 @@ int RunGame(NativeWindow& window,
                 if (auto root = assets.RootPath())
                 {
                     AssetLibrary engineAssets(*root);
-                    if (engineAssets.Initialize())
+                    if (engineAssets.InitializeReadOnly())
                         if (auto e = engineAssets.FindById(assetId);
                             e && e->category == AssetLibrary::Category::Model)
                         {
@@ -5336,7 +5339,7 @@ int RunGame(NativeWindow& window,
                         {
                             AssetLibrary projectAssets(ProjectManager::Instance().ProjectRoot(),
                                 ProjectManager::Instance().AssetRootPath());
-                            if (projectAssets.Initialize())
+                            if (projectAssets.InitializeReadOnly())
                                 if (auto e = projectAssets.FindById(op.assetId);
                                     e && e->category == AssetLibrary::Category::Material)
                                     guid = AssetDatabase::Instance().getOrCreateGuid(projectAssets.AbsolutePath(*e)).toString();
@@ -7020,7 +7023,7 @@ int RunGame(NativeWindow& window,
                     {
                         AssetLibrary projectAssets(ProjectManager::Instance().ProjectRoot(),
                             ProjectManager::Instance().AssetRootPath());
-                        if (projectAssets.Initialize())
+                        if (projectAssets.InitializeReadOnly())
                         {
                             auto entry = projectAssets.FindById(assetId);
                             if (entry && entry->category == AssetLibrary::Category::Model)
@@ -7033,7 +7036,7 @@ int RunGame(NativeWindow& window,
                     if (auto root = assets.RootPath())
                     {
                         AssetLibrary engineAssets(*root);
-                        if (engineAssets.Initialize())
+                        if (engineAssets.InitializeReadOnly())
                         {
                             auto entry = engineAssets.FindById(assetId);
                             if (entry && entry->category == AssetLibrary::Category::Model)
@@ -7120,7 +7123,7 @@ int RunGame(NativeWindow& window,
                     {
                         AssetLibrary projectAssets(ProjectManager::Instance().ProjectRoot(),
                             ProjectManager::Instance().AssetRootPath());
-                        if (projectAssets.Initialize())
+                        if (projectAssets.InitializeReadOnly())
                         {
                             auto entry = projectAssets.FindById(assetId);
                             if (entry && entry->category == AssetLibrary::Category::Prefab)
@@ -7130,7 +7133,7 @@ int RunGame(NativeWindow& window,
                     if (auto root = assets.RootPath())
                     {
                         AssetLibrary engineAssets(*root);
-                        if (engineAssets.Initialize())
+                        if (engineAssets.InitializeReadOnly())
                         {
                             auto entry = engineAssets.FindById(assetId);
                             if (entry && entry->category == AssetLibrary::Category::Prefab)
@@ -7333,7 +7336,7 @@ int RunGame(NativeWindow& window,
 
                     AssetLibrary projectAssets(ProjectManager::Instance().ProjectRoot(),
                         ProjectManager::Instance().AssetRootPath());
-                    if (!projectAssets.Initialize())
+                    if (!projectAssets.InitializeReadOnly())
                     {
                         std::filesystem::remove(tempPath, ec);
                         runtimeSession->SetEditorStatus("Prefab create failed: asset library");
@@ -7341,6 +7344,7 @@ int RunGame(NativeWindow& window,
                     }
                     AssetLibrary::ImportOptions options;
                     options.displayName = prefabName;
+                    options.subpath = editorImGui.CurrentAssetFolder();  // where the asset browser is
                     options.tags = {"prefab"};
                     AssetLibrary::Entry entry;
                     std::string error;

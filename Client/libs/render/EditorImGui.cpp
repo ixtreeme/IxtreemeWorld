@@ -280,19 +280,6 @@ std::string FolderDisplayName(const std::string& subpath)
     return slash == std::string::npos ? normalized : normalized.substr(slash + 1);
 }
 
-bool IsDirectChildFolder(const std::string& parent, const std::string& child)
-{
-    const std::string normalizedParent = AssetLibrary::NormalizeSubpath(parent);
-    const std::string normalizedChild = AssetLibrary::NormalizeSubpath(child);
-    if (normalizedChild.empty() || normalizedChild == normalizedParent)
-        return false;
-    if (normalizedParent.empty())
-        return normalizedChild.find('/') == std::string::npos;
-    if (normalizedChild.rfind(normalizedParent + "/", 0) != 0)
-        return false;
-    return normalizedChild.find('/', normalizedParent.size() + 1) == std::string::npos;
-}
-
 std::filesystem::path MetaSidecarPath(const std::filesystem::path& path)
 {
     return std::filesystem::path(path.string() + ".meta");
@@ -306,17 +293,17 @@ bool IsMetaFile(const std::filesystem::path& path)
 std::string UniqueFolderName(const std::filesystem::path& parent)
 {
     std::error_code ec;
-    const std::string base = "New Folder";
+    const std::string base = "NewFolder";  // a valid name as is (IsValidRenameName rejects spaces)
     if (!std::filesystem::exists(parent / base, ec))
         return base;
     for (int i = 2; i < 1000; ++i)
     {
-        const std::string candidate = base + " " + std::to_string(i);
+        const std::string candidate = base + "_" + std::to_string(i);
         ec.clear();
         if (!std::filesystem::exists(parent / candidate, ec))
             return candidate;
     }
-    return base + " 1000";
+    return base + "_1000";
 }
 
 bool IsSubpathOrSelf(const std::string& maybeChild, const std::string& maybeParent)
@@ -827,7 +814,6 @@ void EditorImGui::InitializeProjectAssetLibrary(const std::filesystem::path& pro
         return;
     }
 
-    m_assetFilter = AssetBrowserFilter::All;
     m_assetSubpath.clear();
     m_selectedAssetId.clear();
     m_assetInspectorSelectionActive = false;
@@ -1155,10 +1141,14 @@ void EditorImGui::EnsureModelAnimationClips(const std::filesystem::path& modelPa
 
     const std::filesystem::path modelDir = modelPath.parent_path();
     const std::string stem = modelPath.stem().string();
-    std::string subpath;
-    subpath.reserve(stem.size());
+    // The clips go next to the model, in <model>_clips (no per-type folder).
+    std::string clipFolder;
+    clipFolder.reserve(stem.size() + 6);
     for (char c : stem)
-        subpath.push_back(std::isalnum(static_cast<unsigned char>(c)) ? c : '_');
+        clipFolder.push_back(std::isalnum(static_cast<unsigned char>(c)) ? c : '_');
+    clipFolder += "_clips";
+    const std::string modelSubpath = AssetBrowserSubpath(modelDir);
+    const std::string subpath = modelSubpath.empty() ? clipFolder : modelSubpath + "/" + clipFolder;
 
     bool createdAny = false;
     for (int i = 0; i < 8; ++i)
@@ -1286,194 +1276,6 @@ bool EditorImGui::SaveModelLodDefault(const std::string& assetId, const LodConfi
     return true;
 }
 
-bool EditorImGui::ActiveAssetCategory(AssetLibrary::Category category) const
-{
-    switch (m_assetFilter)
-    {
-    case AssetBrowserFilter::All: return true;
-    case AssetBrowserFilter::Texture: return category == AssetLibrary::Category::Texture;
-    case AssetBrowserFilter::Model: return category == AssetLibrary::Category::Model;
-    case AssetBrowserFilter::Animation: return category == AssetLibrary::Category::Animation;
-    case AssetBrowserFilter::AnimationClip: return category == AssetLibrary::Category::AnimationClip;
-    case AssetBrowserFilter::AnimatorController: return category == AssetLibrary::Category::AnimatorController;
-    case AssetBrowserFilter::Audio: return category == AssetLibrary::Category::Audio;
-    case AssetBrowserFilter::Script: return category == AssetLibrary::Category::Script;
-    case AssetBrowserFilter::Material: return category == AssetLibrary::Category::Material;
-    case AssetBrowserFilter::WaterMaterial: return category == AssetLibrary::Category::WaterMaterial;
-    case AssetBrowserFilter::PhysicsMaterial: return category == AssetLibrary::Category::PhysicsMaterial;
-    case AssetBrowserFilter::Scene: return category == AssetLibrary::Category::Scene;
-    case AssetBrowserFilter::Prefab: return category == AssetLibrary::Category::Prefab;
-    default: return true;
-    }
-}
-
-AssetLibrary::Category EditorImGui::FolderCategory() const
-{
-    switch (m_assetFilter)
-    {
-    case AssetBrowserFilter::Model: return AssetLibrary::Category::Model;
-    case AssetBrowserFilter::Animation: return AssetLibrary::Category::Animation;
-    case AssetBrowserFilter::AnimationClip: return AssetLibrary::Category::AnimationClip;
-    case AssetBrowserFilter::AnimatorController: return AssetLibrary::Category::AnimatorController;
-    case AssetBrowserFilter::Audio: return AssetLibrary::Category::Audio;
-    case AssetBrowserFilter::Script: return AssetLibrary::Category::Script;
-    case AssetBrowserFilter::Material: return AssetLibrary::Category::Material;
-    case AssetBrowserFilter::WaterMaterial: return AssetLibrary::Category::WaterMaterial;
-    case AssetBrowserFilter::PhysicsMaterial: return AssetLibrary::Category::PhysicsMaterial;
-    case AssetBrowserFilter::Scene: return AssetLibrary::Category::Scene;
-    case AssetBrowserFilter::Prefab: return AssetLibrary::Category::Prefab;
-    case AssetBrowserFilter::All:
-    case AssetBrowserFilter::Texture:
-    default:
-        return AssetLibrary::Category::Texture;
-    }
-}
-
-const char* EditorImGui::AssetFilterName() const
-{
-    switch (m_assetFilter)
-    {
-    case AssetBrowserFilter::All: return "All";
-    case AssetBrowserFilter::Texture: return "Textures";
-    case AssetBrowserFilter::Model: return "Models";
-    case AssetBrowserFilter::Animation: return "Anims";
-    case AssetBrowserFilter::AnimationClip: return "Anim Clips";
-    case AssetBrowserFilter::AnimatorController: return "Animators";
-    case AssetBrowserFilter::Audio: return "Audio";
-    case AssetBrowserFilter::Script: return "Scripts";
-    case AssetBrowserFilter::Material: return "Materials";
-    case AssetBrowserFilter::WaterMaterial: return "Water Mats";
-    case AssetBrowserFilter::PhysicsMaterial: return "Physics Mats";
-    case AssetBrowserFilter::Scene: return "Scenes";
-    case AssetBrowserFilter::Prefab: return "Prefabs";
-    default: return "Assets";
-    }
-}
-
-bool EditorImGui::AssetPassesCurrentFilters(const AssetLibrary::Entry& entry) const
-{
-    if (!ActiveAssetCategory(entry.category))
-        return false;
-    if (AssetLibrary::NormalizeSubpath(entry.subpath) != AssetLibrary::NormalizeSubpath(m_assetSubpath))
-        return false;
-
-    for (const std::string& tag : m_activeAssetTags)
-    {
-        if (std::find(entry.tags.begin(), entry.tags.end(), tag) == entry.tags.end())
-            return false;
-    }
-
-    const std::string search = m_assetSearchBuffer;
-    if (!search.empty() &&
-        !ContainsCaseInsensitive(entry.displayName, search) &&
-        !ContainsCaseInsensitive(entry.filename, search) &&
-        !ContainsCaseInsensitive(AssetLibrary::CategoryName(entry.category), search) &&
-        !ContainsCaseInsensitive(AssetLibrary::TextureRoleName(entry.textureRole), search) &&
-        !ContainsCaseInsensitive(AssetLibrary::TagsToCsv(entry.tags), search))
-    {
-        return false;
-    }
-    return true;
-}
-
-std::vector<AssetLibrary::Entry> EditorImGui::QueryVisibleAssets() const
-{
-    std::vector<AssetLibrary::Entry> result;
-    if (m_assetLibrary)
-    {
-        for (const AssetLibrary::Entry& entry : m_assetLibrary->Entries())
-        {
-            if (AssetPassesCurrentFilters(entry))
-                result.push_back(entry);
-        }
-    }
-    for (const AssetLibrary::Entry& entry : QuerySceneAssets())
-    {
-        if (AssetPassesCurrentFilters(entry))
-            result.push_back(entry);
-    }
-
-    std::sort(result.begin(), result.end(), [](const AssetLibrary::Entry& a, const AssetLibrary::Entry& b) {
-        if (a.category != b.category)
-            return static_cast<int>(a.category) < static_cast<int>(b.category);
-        return ToLowerAscii(a.displayName) < ToLowerAscii(b.displayName);
-    });
-    return result;
-}
-
-std::vector<std::string> EditorImGui::QueryVisibleFolders() const
-{
-    std::set<std::string> folders;
-    if (!m_assetLibrary)
-        return {};
-
-    const AssetLibrary::Category categories[] = {
-        AssetLibrary::Category::Texture,
-        AssetLibrary::Category::Model,
-        AssetLibrary::Category::Animation,
-        AssetLibrary::Category::AnimationClip,
-        AssetLibrary::Category::AnimatorController,
-        AssetLibrary::Category::Material,
-        AssetLibrary::Category::WaterMaterial,
-        AssetLibrary::Category::PhysicsMaterial,
-        AssetLibrary::Category::Scene,
-        AssetLibrary::Category::Prefab,
-    };
-    for (AssetLibrary::Category category : categories)
-    {
-        if (!ActiveAssetCategory(category))
-            continue;
-        if (category == AssetLibrary::Category::Scene)
-        {
-            for (const AssetLibrary::Entry& entry : QuerySceneAssets())
-            {
-                if (!entry.subpath.empty())
-                    folders.insert(AssetLibrary::NormalizeSubpath(entry.subpath));
-            }
-        }
-        else
-        {
-            for (const std::string& folder : m_assetLibrary->FolderSubpathsFor(category))
-                folders.insert(AssetLibrary::NormalizeSubpath(folder));
-        }
-    }
-    return {folders.begin(), folders.end()};
-}
-
-std::vector<std::pair<std::string, std::uint32_t>> EditorImGui::QueryVisibleTags() const
-{
-    std::map<std::string, std::uint32_t> counts;
-    if (!m_assetLibrary)
-        return {};
-
-    for (const AssetLibrary::Entry& entry : m_assetLibrary->Entries())
-    {
-        if (!ActiveAssetCategory(entry.category))
-            continue;
-        if (AssetLibrary::NormalizeSubpath(entry.subpath) != AssetLibrary::NormalizeSubpath(m_assetSubpath))
-            continue;
-        for (const std::string& tag : entry.tags)
-            ++counts[tag];
-    }
-    for (const AssetLibrary::Entry& entry : QuerySceneAssets())
-    {
-        if (!ActiveAssetCategory(entry.category))
-            continue;
-        if (AssetLibrary::NormalizeSubpath(entry.subpath) != AssetLibrary::NormalizeSubpath(m_assetSubpath))
-            continue;
-        for (const std::string& tag : entry.tags)
-            ++counts[tag];
-    }
-
-    std::vector<std::pair<std::string, std::uint32_t>> result(counts.begin(), counts.end());
-    std::sort(result.begin(), result.end(), [](const auto& a, const auto& b) {
-        if (a.second != b.second)
-            return a.second > b.second;
-        return a.first < b.first;
-    });
-    return result;
-}
-
 std::filesystem::path EditorImGui::AssetBrowserRoot() const
 {
     return m_assetLibrary ? m_assetLibrary->LibraryRoot() : std::filesystem::path{};
@@ -1506,7 +1308,7 @@ void EditorImGui::SelectAssetBrowserFolder(const std::string& subpath)
 
 void EditorImGui::ValidateAssetBrowserCache() const
 {
-    constexpr double kAssetBrowserCacheSeconds = 1.0;
+    constexpr double kAssetBrowserCacheSeconds = 10.0;
     const double now = ImGui::GetTime();
     const std::uint64_t revision = m_assetLibrary ? m_assetLibrary->Revision() : 0;
     AssetBrowserCache& cache = m_assetBrowserCache;
@@ -1543,10 +1345,24 @@ std::vector<std::string> EditorImGui::QueryFilesystemChildFolders(const std::str
     {
         if (ec)
             break;
-        std::error_code itemEc;
-        if (!entry.is_directory(itemEc))
-            continue;
-        folders.push_back(AssetBrowserSubpath(entry.path()));
+        try
+        {
+            std::error_code itemEc;
+            if (!entry.is_directory(itemEc))
+                continue;
+            const std::string name = entry.path().filename().string();
+            // Hidden folders and the library's generated thumbnails are not part of the user's tree.
+            if (name.empty() || name.front() == '.' || name.find(".delete_tmp") != std::string::npos)
+                continue;
+            const std::string child = AssetBrowserSubpath(entry.path());
+            if (AssetLibrary::IsInternalFolder(child))
+                continue;
+            folders.push_back(child);
+        }
+        catch (const std::exception&)
+        {
+            // a folder name the narrow path API cannot represent: not listed
+        }
     }
     std::sort(folders.begin(), folders.end(), [](const std::string& a, const std::string& b) {
         return ToLowerAscii(FolderDisplayName(a)) < ToLowerAscii(FolderDisplayName(b));
@@ -1563,26 +1379,22 @@ std::vector<AssetLibrary::Entry> EditorImGui::QueryFilesystemAssetsInFolder(cons
         return cached->second;
     std::vector<AssetLibrary::Entry>& result = m_assetBrowserCache.folderAssets[subpath];
 
-    const std::string target = ComparablePath(AssetBrowserPath(subpath));
-    auto addIfInFolder = [&](const AssetLibrary::Entry& entry, const std::filesystem::path& absolutePath) {
-        if (absolutePath.empty() || IsMetaFile(absolutePath))
-            return;
-        if (ComparablePath(absolutePath.parent_path()) == target)
-            result.push_back(entry);
-    };
-
+    // Library entries know their folder (relative to the asset root): no path canonicalization needed.
+    const std::string target = ToLowerAscii(AssetLibrary::NormalizeSubpath(subpath));
     for (const AssetLibrary::Entry& entry : m_assetLibrary->Entries())
-        addIfInFolder(entry, m_assetLibrary->AbsolutePath(entry));
+    {
+        if (ToLowerAscii(AssetLibrary::NormalizeSubpath(entry.subpath)) == target && !IsMetaFile(entry.filename))
+            result.push_back(entry);
+    }
 
+    const std::string targetComparable = ComparablePath(AssetBrowserPath(subpath));
     for (const AssetLibrary::Entry& entry : QuerySceneAssets())
     {
         if (entry.originalPath.empty())
             continue;
         const std::filesystem::path scenePath(entry.originalPath);
-        const std::string sceneComparable = ComparablePath(scenePath);
-        const std::string rootComparable = ComparablePath(AssetBrowserRoot());
-        if (sceneComparable.rfind(rootComparable + "/", 0) == 0)
-            addIfInFolder(entry, scenePath);
+        if (ComparablePath(scenePath.parent_path()) == targetComparable)
+            result.push_back(entry);
     }
 
     std::sort(result.begin(), result.end(), [](const AssetLibrary::Entry& a, const AssetLibrary::Entry& b) {
@@ -1723,73 +1535,6 @@ EditorImGui::AssetPreviewTexture* EditorImGui::GetAssetPreviewTexture(const Asse
     return &it->second;
 }
 
-void EditorImGui::CreateAssetFolder()
-{
-    if (!m_assetLibrary)
-        return;
-    std::string outSubpath;
-    std::string error;
-    if (!m_assetLibrary->CreateFolder(FolderCategory(), m_assetSubpath, m_newAssetFolderName, outSubpath, error))
-    {
-        m_assetStatus = "Folder create failed: " + error;
-        return;
-    }
-    m_assetSubpath = outSubpath;
-    m_newAssetFolderName[0] = '\0';
-    InvalidateAssetBrowserCache();  // a new folder is not an asset library (manifest) change
-    m_assetStatus = "Folder created: " + FolderDisplayName(outSubpath);
-    Tracenf("[EDITOR-IMGUI-3] Folder created: %s", outSubpath.c_str());
-}
-
-void EditorImGui::DeleteAssetFolder()
-{
-    if (!m_assetLibrary || m_assetSubpath.empty())
-        return;
-
-    std::uint32_t removedAssets = 0;
-    std::string error;
-    const std::string deleted = m_assetSubpath;
-    if (!m_assetLibrary->DeleteFolder(FolderCategory(), m_assetSubpath, removedAssets, error))
-    {
-        m_assetStatus = "Folder delete failed: " + error;
-        return;
-    }
-    m_assetSubpath = ParentSubpath(deleted);
-    InvalidateAssetBrowserCache();  // an empty folder's removal does not touch the manifest
-    m_assetStatus = "Folder deleted, removed assets: " + std::to_string(removedAssets);
-    Tracenf("[EDITOR-IMGUI-3] Folder deleted: %s removed=%u", deleted.c_str(), removedAssets);
-}
-
-void EditorImGui::DeleteAsset(const AssetLibrary::Entry& entry)
-{
-    if (!m_assetLibrary)
-        return;
-
-    const std::string deletedId = entry.id;
-    const std::string deletedName = entry.displayName;
-    std::string error;
-    if (!m_assetLibrary->Remove(entry.id, error))
-    {
-        m_assetStatus = "Delete failed: " + error;
-        return;
-    }
-
-    if (m_selectedAssetId == deletedId)
-    {
-        m_selectedAssetId.clear();
-        m_assetInspectorSelectionActive = false;
-    }
-    if (m_waterMaterialEditor.materialId == deletedId)
-        m_waterMaterialEditor = {};
-    if (m_pbrMaterialEditor.materialId == deletedId)
-        m_pbrMaterialEditor = {};
-    SyncWaterMaterialSnapshot();
-    m_assetStatus = "Deleted asset: " + deletedName;
-    Tracenf("[EDITOR-IMGUI-3] Asset deleted: asset_id=%s type=%s",
-        deletedId.c_str(),
-        AssetLibrary::CategoryName(entry.category));
-}
-
 void EditorImGui::CreateFilesystemFolder(const std::string& parentSubpath, const std::string& requestedName)
 {
     const std::filesystem::path parent = AssetBrowserPath(parentSubpath);
@@ -1821,6 +1566,7 @@ void EditorImGui::BeginAssetRename(const AssetLibrary::Entry& entry)
         return;
     const std::filesystem::path path = entry.originalPath.empty() ? m_assetLibrary->AbsolutePath(entry) : std::filesystem::path(entry.originalPath);
     m_assetRenamePath = path.generic_string();
+    m_assetRenameAssetId = m_assetLibrary->FindById(entry.id) ? entry.id : std::string{};
     m_assetRenameIsFolder = false;
     CopyToBuffer(m_assetRenameBuffer, sizeof(m_assetRenameBuffer), path.filename().string());
     m_assetOpenRenamePopup = true;
@@ -1832,6 +1578,7 @@ void EditorImGui::BeginFolderRename(const std::string& subpath)
         return;
     const std::filesystem::path path = AssetBrowserPath(subpath);
     m_assetRenamePath = path.generic_string();
+    m_assetRenameAssetId.clear();
     m_assetRenameIsFolder = true;
     CopyToBuffer(m_assetRenameBuffer, sizeof(m_assetRenameBuffer), path.filename().string());
     m_assetOpenRenamePopup = true;
@@ -1846,6 +1593,24 @@ void EditorImGui::RenameFilesystemSelection()
     if (!AssetLibrary::IsValidRenameName(std::filesystem::path(requested).stem().string()))
     {
         m_assetStatus = "Rename failed: invalid name";
+        return;
+    }
+
+    // A library asset is renamed by the library: file and .meta together, keeping its id (and with
+    // it every reference to the asset).
+    if (!m_assetRenameIsFolder && m_assetLibrary && !m_assetRenameAssetId.empty())
+    {
+        AssetLibrary::Entry renamed;
+        std::string error;
+        if (!m_assetLibrary->RenameAsset(m_assetRenameAssetId, requested, true, renamed, error))
+        {
+            m_assetStatus = "Rename failed: " + error;
+            return;
+        }
+        m_assetStatus = "Renamed: " + renamed.filename;
+        Tracenf("[EDITOR-ASSET-BROWSER] renamed asset id=%s dst=%s",
+            renamed.id.c_str(),
+            renamed.originalPath.c_str());
         return;
     }
 
@@ -1874,6 +1639,7 @@ void EditorImGui::RenameFilesystemSelection()
         metaMoved = true;
     }
 
+    const std::string sourceSubpath = AssetBrowserSubpath(source);
     std::filesystem::rename(source, destination, ec);
     if (ec)
     {
@@ -1886,8 +1652,15 @@ void EditorImGui::RenameFilesystemSelection()
         return;
     }
 
+    // The assets inside a renamed folder keep their ids: their entries follow the folder.
+    std::string relocateError;
+    if (m_assetRenameIsFolder && m_assetLibrary &&
+        !m_assetLibrary->RelocateFolder(sourceSubpath, AssetBrowserSubpath(destination), relocateError))
+    {
+        TraceError("[EDITOR-ASSET-BROWSER] folder rename manifest update failed: %s", relocateError.c_str());
+    }
     RefreshAssetLibrary();
-    if (m_assetRenameIsFolder && AssetLibrary::NormalizeSubpath(m_assetSubpath).rfind(AssetBrowserSubpath(source), 0) == 0)
+    if (m_assetRenameIsFolder && AssetLibrary::NormalizeSubpath(m_assetSubpath).rfind(sourceSubpath, 0) == 0)
         SelectAssetBrowserFolder(AssetBrowserSubpath(destination));
     m_assetStatus = "Renamed: " + destination.filename().string();
     Tracenf("[EDITOR-ASSET-BROWSER] renamed src=%s dst=%s metaMoved=%s",
@@ -1931,6 +1704,11 @@ void EditorImGui::DeleteFilesystemSelection()
         m_selectedAssetId.clear();
         m_assetInspectorSelectionActive = false;
     }
+    // Drop the deleted assets' entries outright, so the refresh never mistakes another file with the
+    // same name for one of them having moved.
+    std::string forgetError;
+    if (m_assetLibrary && !m_assetLibrary->ForgetPath(path, forgetError))
+        TraceError("[EDITOR-ASSET-BROWSER] delete manifest update failed: %s", forgetError.c_str());
     RefreshAssetLibrary();
     m_assetStatus = "Deleted: " + path.filename().string();
     Tracenf("[EDITOR-ASSET-BROWSER] deleted path=Assets/%s metaDeleted=%s targetTrash=ok",
@@ -1945,58 +1723,28 @@ bool EditorImGui::MoveAssetEntryToFolder(const std::string& assetId, const std::
     auto entry = m_assetLibrary->FindById(assetId);
     if (!entry)
         return false;
-    const std::filesystem::path source = entry->originalPath.empty() ? m_assetLibrary->AbsolutePath(*entry) : std::filesystem::path(entry->originalPath);
-    const std::filesystem::path targetFolder = AssetBrowserPath(targetFolderSubpath);
-    const std::filesystem::path destination = targetFolder / source.filename();
-    std::error_code ec;
-    if (ComparablePath(source.parent_path()) == ComparablePath(targetFolder))
+    const std::string target = AssetLibrary::NormalizeSubpath(targetFolderSubpath);
+    if (ToLowerAscii(AssetLibrary::NormalizeSubpath(entry->subpath)) == ToLowerAscii(target))
         return true;
-    if (std::filesystem::exists(destination, ec))
+
+    // The library moves the file and its .meta and keeps the asset's id.
+    const std::filesystem::path source = m_assetLibrary->AbsolutePath(*entry);
+    AssetLibrary::Entry moved;
+    std::string error;
+    if (!m_assetLibrary->MoveAssetToSubpath(assetId, target, moved, error))
     {
-        m_assetStatus = "Move failed: target already exists";
-        Tracenf("[EDITOR-ASSET-BROWSER] move_failed reason=target_exists src=%s dst=%s",
+        m_assetStatus = "Move failed: " + error;
+        Tracenf("[EDITOR-ASSET-BROWSER] move_failed src=%s target=Assets/%s reason=%s",
             source.generic_string().c_str(),
-            destination.generic_string().c_str());
+            target.c_str(),
+            error.c_str());
         return false;
     }
-    std::filesystem::create_directories(targetFolder, ec);
-    if (ec)
-    {
-        m_assetStatus = "Move failed: " + ec.message();
-        return false;
-    }
-
-    bool metaMoved = false;
-    const std::filesystem::path sourceMeta = MetaSidecarPath(source);
-    const std::filesystem::path destinationMeta = MetaSidecarPath(destination);
-    if (std::filesystem::exists(sourceMeta, ec))
-    {
-        std::filesystem::rename(sourceMeta, destinationMeta, ec);
-        if (ec)
-        {
-            m_assetStatus = "Move failed moving .meta: " + ec.message();
-            return false;
-        }
-        metaMoved = true;
-    }
-
-    std::filesystem::rename(source, destination, ec);
-    if (ec)
-    {
-        if (metaMoved)
-        {
-            std::error_code rollbackEc;
-            std::filesystem::rename(destinationMeta, sourceMeta, rollbackEc);
-        }
-        m_assetStatus = "Move failed: " + ec.message();
-        return false;
-    }
-    RefreshAssetLibrary();
-    m_assetStatus = "Moved: " + source.filename().string();
-    Tracenf("[EDITOR-ASSET-BROWSER] moved src=%s dst=%s metaMoved=%s",
+    m_assetStatus = "Moved: " + moved.filename;
+    Tracenf("[EDITOR-ASSET-BROWSER] moved id=%s src=%s dst=%s",
+        moved.id.c_str(),
         source.generic_string().c_str(),
-        destination.generic_string().c_str(),
-        metaMoved ? "yes" : "no");
+        moved.originalPath.c_str());
     return true;
 }
 
@@ -2026,6 +1774,10 @@ bool EditorImGui::MoveFolderToFolder(const std::string& sourceSubpath, const std
         m_assetStatus = "Move failed: " + ec.message();
         return false;
     }
+    // The assets inside keep their ids: their entries follow the folder.
+    std::string relocateError;
+    if (m_assetLibrary && !m_assetLibrary->RelocateFolder(sourceNorm, AssetBrowserSubpath(destination), relocateError))
+        TraceError("[EDITOR-ASSET-BROWSER] folder move manifest update failed: %s", relocateError.c_str());
     RefreshAssetLibrary();
     if (IsSubpathOrSelf(m_assetSubpath, sourceNorm))
         SelectAssetBrowserFolder(AssetBrowserSubpath(destination));
@@ -2172,13 +1924,69 @@ void EditorImGui::ImportExternalFiles(const std::vector<std::string>& paths, con
 {
     const std::string target = AssetLibrary::NormalizeSubpath(m_assetSubpath);
     for (const std::string& path : paths)
-        ImportAssetFromPath(std::filesystem::path(path), target, trigger ? trigger : "dragdrop");
+    {
+        const std::filesystem::path source(path);
+        std::error_code ec;
+        if (std::filesystem::is_directory(source, ec))
+            ImportFolderFromPath(source, target);
+        else
+            ImportAssetFromPath(source, target, trigger ? trigger : "dragdrop");
+    }
+}
+
+void EditorImGui::ImportFolderFromPath(const std::filesystem::path& sourceFolder, const std::string& targetSubpath)
+{
+    if (!m_assetLibrary)
+        return;
+    std::error_code ec;
+    std::filesystem::path source = std::filesystem::absolute(sourceFolder, ec).lexically_normal();
+    if (!source.has_filename())
+        source = source.parent_path();
+    // A folder that already is (or holds) the asset folder is not copied into itself.
+    const std::string sourceKey = ComparablePath(source);
+    const std::string rootKey = ComparablePath(AssetBrowserRoot());
+    if (sourceKey == rootKey || rootKey.rfind(sourceKey + "/", 0) == 0 || sourceKey.rfind(rootKey + "/", 0) == 0)
+    {
+        m_assetStatus = "Import skipped: that folder is already part of the project assets";
+        return;
+    }
+
+    const std::filesystem::path targetParent = AssetBrowserPath(targetSubpath);
+    std::filesystem::path destination = targetParent / source.filename();
+    for (int i = 2; std::filesystem::exists(destination, ec); ++i)
+        destination = targetParent / (source.filename().string() + "_" + std::to_string(i));
+    std::filesystem::copy(source, destination, std::filesystem::copy_options::recursive, ec);
+    if (ec)
+    {
+        m_assetStatus = "Folder import failed: " + ec.message();
+        return;
+    }
+    RefreshAssetLibrary();  // registers every asset inside the copied folder
+    SelectAssetBrowserFolder(AssetBrowserSubpath(destination));
+    m_assetStatus = "Imported folder: " + destination.filename().string();
+    Tracenf("[EDITOR-ASSET-BROWSER] folder_imported src=%s dst=%s",
+        source.generic_string().c_str(),
+        destination.generic_string().c_str());
+}
+
+std::string EditorImGui::CreateTargetSubpath()
+{
+    const std::string target = m_assetCreateTarget.value_or(m_assetSubpath);
+    m_assetCreateTarget.reset();
+    return AssetLibrary::NormalizeSubpath(target);
+}
+
+void EditorImGui::RevealCreatedAsset(const AssetLibrary::Entry& entry)
+{
+    SelectAssetBrowserFolder(entry.subpath);
+    m_selectedAssetId = entry.id;
 }
 
 void EditorImGui::CreatePbrMaterialAsset()
 {
     if (!m_assetLibrary)
         return;
+    m_createMaterialTargetSubpath = CreateTargetSubpath();
     CopyToBuffer(m_createMaterialName, sizeof(m_createMaterialName), "material");
     m_createMaterialShadingMode = -1;
     m_assetOpenCreateMaterialPopup = true;
@@ -2190,13 +1998,13 @@ void EditorImGui::CreateLuaScriptAsset()
         return;
     AssetLibrary::ImportOptions options;
     options.displayName = "Script";  // CreateLuaScript uniquifies (Script_2, ...); rename via F2 after
-    options.subpath = m_assetSubpath;
+    options.subpath = CreateTargetSubpath();
     options.tags = {"script", "lua"};
     AssetLibrary::Entry entry;
     std::string error;
     if (m_assetLibrary->CreateLuaScript(options, entry, error))
     {
-        m_selectedAssetId = entry.id;
+        RevealCreatedAsset(entry);
         m_assetInspectorSelectionActive = true;
         m_assetStatus = "Created Lua script: " + entry.displayName + " (drag it onto an entity to attach)";
     }
@@ -2206,8 +2014,8 @@ void EditorImGui::CreateLuaScriptAsset()
     }
 }
 
-// A native C++ script source (.cpp/.h/...) under the asset scripts folder. Only the path BELOW that
-// folder is checked for a CMake "build" tree: the project itself may well live under a "build" directory.
+// A native C++ script source (.cpp/.h/...) under the asset folder. Only the path BELOW that folder is
+// checked for a CMake "build" tree: the project itself may well live under a "build" directory.
 static bool IsNativeScriptSource(const std::filesystem::path& scriptsDir, const std::filesystem::path& file)
 {
     std::string ext = file.extension().string();
@@ -2229,9 +2037,8 @@ static bool IsNativeScriptSource(const std::filesystem::path& scriptsDir, const 
 
 std::filesystem::path EditorImGui::ProjectScriptSourceDir() const
 {
-    // Native .cpp game scripts live alongside .lua in the asset library's scripts folder (so both are
-    // first-class, browsable, drag-attachable assets). CategoryDirectory(Script) resolves here too.
-    return ProjectManager::Instance().AssetRootPath() / "scripts";
+    // Native .cpp game scripts are assets like any other: they may sit anywhere in the asset folder.
+    return ProjectManager::Instance().AssetRootPath();
 }
 
 void EditorImGui::CreateNativeScriptAsset()
@@ -2247,10 +2054,10 @@ void EditorImGui::CreateNativeScriptFile(const std::string& className)
         return;
     }
     // Create the .cpp as a first-class Script asset (same path as a Lua script): written into the
-    // library scripts dir, registered, browsable + drag-attachable. The class is named after the file.
+    // target folder, registered, browsable + drag-attachable. The class is named after the file.
     AssetLibrary::ImportOptions options;
     options.displayName = className.empty() ? "MyScript" : className;
-    options.subpath = m_assetSubpath;
+    options.subpath = CreateTargetSubpath();
     options.tags = {"script", "cpp"};
     AssetLibrary::Entry entry;
     std::string error;
@@ -2259,7 +2066,7 @@ void EditorImGui::CreateNativeScriptFile(const std::string& className)
         m_assetStatus = "Create C++ script failed: " + error;
         return;
     }
-    m_selectedAssetId = entry.id;
+    RevealCreatedAsset(entry);
     m_assetInspectorSelectionActive = true;
     // Stamp the new file so the save-to-live poll doesn't see it as a spurious "new .cpp" change.
     std::error_code ec;
@@ -2267,6 +2074,25 @@ void EditorImGui::CreateNativeScriptFile(const std::string& className)
     if (const auto mt = std::filesystem::last_write_time(dest, ec); !ec)
         m_cppMtimes[dest.generic_string()] = mt;
     m_assetStatus = "Created C++ script: " + entry.filename + " (drag it onto an entity, then Build)";
+}
+
+void EditorImGui::CreateAnimatorControllerAsset()
+{
+    if (!m_assetLibrary)
+        return;
+    AssetLibrary::ImportOptions options;
+    options.displayName = "Animator_Controller";
+    options.subpath = CreateTargetSubpath();
+    AssetLibrary::Entry entry;
+    std::string error;
+    if (!m_assetLibrary->CreateAnimatorController(options, entry, error))
+    {
+        m_assetStatus = "Create animator controller failed: " + error;
+        return;
+    }
+    RevealCreatedAsset(entry);
+    m_assetInspectorSelectionActive = true;
+    m_assetStatus = "Animator controller created: " + entry.displayName;
 }
 
 void EditorImGui::CreateWaterMaterialAsset()
@@ -2282,7 +2108,7 @@ bool EditorImGui::CreateWaterMaterialAsset(const std::string& displayName, Asset
         return false;
     AssetLibrary::ImportOptions options{};
     options.displayName = displayName.empty() ? "Water_Material" : displayName;
-    options.subpath = m_assetSubpath;
+    options.subpath = CreateTargetSubpath();
     options.tags = {"water", "material"};
     AssetLibrary::Entry entry{};
     std::string error;
@@ -2291,8 +2117,7 @@ bool EditorImGui::CreateWaterMaterialAsset(const std::string& displayName, Asset
         m_assetStatus = "Water material create failed: " + error;
         return false;
     }
-    m_assetFilter = AssetBrowserFilter::WaterMaterial;
-    m_selectedAssetId = entry.id;
+    RevealCreatedAsset(entry);
     SyncWaterMaterialSnapshot();
     m_assetStatus = "Water material created: " + entry.displayName;
     Tracenf("[EDITOR-IMGUI-4] Material saved: id=%s name=%s",
@@ -2312,7 +2137,7 @@ void EditorImGui::CreatePhysicsMaterialAsset()
 
     AssetLibrary::ImportOptions options{};
     options.displayName = "Physics_Material";
-    options.subpath = m_assetSubpath;
+    options.subpath = CreateTargetSubpath();
     options.tags = {"physics", "material"};
     AssetLibrary::PhysicsMaterialData material{};
     AssetLibrary::Entry entry{};
@@ -2323,8 +2148,7 @@ void EditorImGui::CreatePhysicsMaterialAsset()
         return;
     }
 
-    m_assetFilter = AssetBrowserFilter::PhysicsMaterial;
-    m_selectedAssetId = entry.id;
+    RevealCreatedAsset(entry);
     m_assetInspectorSelectionActive = true;
     m_assetStatus = "Physics material created: " + entry.displayName;
     Tracenf("[PHYSICS-MAT] asset created path=%s", m_assetLibrary->AbsolutePath(entry).generic_string().c_str());
@@ -3067,7 +2891,8 @@ void EditorImGui::InitializeProjectAssetLibrary(const std::filesystem::path& pro
                                                 const std::filesystem::path& assetRoot)
 {
     m_assetLibrary = std::make_unique<AssetLibrary>(projectRoot, assetRoot);
-    if (!m_assetLibrary->Initialize())
+    // The shipped game only reads the manifest the editor wrote: no folder scan, nothing written.
+    if (!m_assetLibrary->InitializeReadOnly())
         m_assetLibrary.reset();
 }
 

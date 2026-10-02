@@ -93,6 +93,9 @@ public:
         std::string rootMotionMode = "none";  // none | bake_xz | bake_full
     };
 
+    // An asset can live anywhere under the library root (the project's Assets folder): subpath is
+    // its folder relative to that root and filename its file name. originalPath always mirrors the
+    // resulting absolute path (kept in sync by the library; it is not an import-source path).
     struct Entry
     {
         std::string id;
@@ -101,6 +104,7 @@ public:
         std::string subpath;
         std::string filename;
         std::string originalPath;
+        std::string guid;  // AssetDatabase GUID (from the .meta) when known: finds the file after it moved
         std::string thumbnail;
         std::string importedAt;
         std::vector<std::string> tags;
@@ -130,6 +134,9 @@ public:
     static void SetFbxSidecarProcessor(FbxSidecarProcessor processor);
 
     bool Initialize();
+    // Loads the manifest only: no folder scan, nothing written. For short-lived lookups and the
+    // game runtime; the editor's library keeps the manifest current.
+    bool InitializeReadOnly();
     const std::vector<Entry>& Entries() const { return m_entries; }
     // Bumped whenever the entries may have changed (manifest written, loaded or refreshed), so a
     // view can cache what it derives from them.
@@ -204,7 +211,13 @@ public:
                                const LodConfig& config,
                                Entry& outEntry,
                                std::string& error);
+    // Moves the asset file (and its .meta) into another folder, keeping its id.
     bool MoveAssetToSubpath(const std::string& id, const std::string& subpath, Entry& outEntry, std::string& error);
+    // Updates entries after files were moved/renamed/deleted on disk by the caller, so ids (and the
+    // references to them) survive. RelocateFolder rewrites every entry inside oldSubpath; ForgetPath
+    // drops the entries at or under a path without touching any file.
+    bool RelocateFolder(const std::string& oldSubpath, const std::string& newSubpath, std::string& error);
+    bool ForgetPath(const std::filesystem::path& absolutePath, std::string& error);
     bool RenameAsset(const std::string& id,
                      const std::string& newBaseName,
                      bool allowTextureRoleChange,
@@ -236,6 +249,12 @@ public:
                           const std::array<MapEditorPaletteSlot, 8>& slots,
                           std::string& error) const;
 
+    // Category of a file the library picks up on its own wherever it sits under the root (by its
+    // extension); nullopt for anything else, including derived data (.ozz) and scenes.
+    static std::optional<Category> DiscoverableCategory(const std::filesystem::path& path);
+    // True for library-internal folders (generated thumbnails) the asset browser does not show.
+    static bool IsInternalFolder(const std::string& subpath);
+
     static const char* CategoryName(Category category);
     static const char* TextureRoleName(TextureRole role);
     static const char* TextureRoleBadge(TextureRole role);
@@ -249,12 +268,18 @@ public:
     static void EndMaterialDiscoveryFrame(std::uint64_t frameNumber);
 
 private:
-    std::filesystem::path CategoryDirectory(Category category) const;
+    // Pre-v2 manifests stored subpaths relative to these per-type folders; only read to migrate.
+    std::filesystem::path LegacyCategoryDirectory(Category category) const;
+    void SyncLocation(Entry& entry) const;
+    std::optional<Entry> MakeDiscoveredEntry(Category category,
+                                             const std::filesystem::path& path,
+                                             const std::unordered_set<std::string>& takenIds,
+                                             std::vector<std::string>& failedMaterialPaths);
     static std::string CategoryString(Category category);
     static std::optional<Category> ParseCategory(const std::string& value);
     static std::optional<TextureRole> ParseTextureRole(const std::string& value);
 
-    bool LoadManifest();
+    bool LoadManifest(bool reconcile = true);
     bool SaveManifest(std::string& error) const;
     bool ReconcileFilesystem(std::string& error);
     bool PopulateTextureMetadata(Entry& entry, bool generateThumbnail, std::string* error = nullptr) const;
@@ -262,14 +287,18 @@ private:
     bool EnsureDirectories() const;
     bool ValidateFile(Category category, const std::filesystem::path& path, std::string& error) const;
     std::string MakeUniqueId(Category category, const std::filesystem::path& sourcePath) const;
-    std::filesystem::path MakeUniqueDestination(Category category,
-                                                const std::string& subpath,
+    std::string MakeUniqueId(Category category,
+                             const std::filesystem::path& sourcePath,
+                             const std::unordered_set<std::string>& takenIds) const;
+    std::filesystem::path MakeUniqueDestination(const std::string& subpath,
                                                 const std::filesystem::path& sourcePath) const;
 
     std::filesystem::path m_clientRoot;
     std::filesystem::path m_libraryRoot;
     std::vector<Entry> m_entries;
     mutable std::uint64_t m_revision = 0;  // see Revision(); SaveManifest() is const
+    bool m_lastReconcileOk = true;         // result of the reconcile LoadManifest() ran
+    std::string m_lastReconcileError;
     std::unordered_set<std::string> m_failedMaterialDiscoveryAttempts;
     bool m_loggedMaterialFailureHint = false;
     mutable std::optional<size_t> m_lastSavedManifestHash;

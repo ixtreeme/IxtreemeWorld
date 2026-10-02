@@ -175,6 +175,8 @@ public:
     void InitializeAssetLibrary(const std::filesystem::path& clientRoot);
     void InitializeProjectAssetLibrary(const std::filesystem::path& projectRoot, const std::filesystem::path& assetRoot);
     void RefreshAssetLibrary();
+    // The folder the asset browser shows (relative to the asset root): where new assets go.
+    const std::string& CurrentAssetFolder() const { return m_assetSubpath; }
     // Generates retargetable .ixclip assets for a loaded rigged model's existing _anim_<i>.ozz
     // sidecars (joint names come from the model's skeleton). Idempotent; no-op if already present.
     void EnsureModelAnimationClips(const std::filesystem::path& modelPath, const std::vector<std::string>& jointNames);
@@ -199,23 +201,6 @@ public:
     void Destroy();
 
 private:
-    enum class AssetBrowserFilter
-    {
-        All,
-        Texture,
-        Model,
-        Animation,
-        AnimationClip,
-        AnimatorController,
-        Audio,
-        Script,
-        Material,
-        WaterMaterial,
-        PhysicsMaterial,
-        Scene,
-        Prefab
-    };
-
     enum class ProjectDialogMode
     {
         None,
@@ -353,37 +338,41 @@ private:
     bool RenderSelectedPrefabAssetInspector();
     void RenderAssetBrowser();
     void RenderAssetBrowserToolbar();
-    void RenderAssetTypeTabs();
-    void RenderAssetFolderPanel();
-    void RenderAssetFolderNode(const std::string& path, const std::vector<std::string>& folders);
     void RenderAssetBrowserFolderTree();
     void RenderAssetBrowserFolderTreeNode(const std::string& subpath);
     void RenderAssetBrowserContent();
     void RenderAssetBrowserBreadcrumb();
     void RenderAssetBrowserFolderTile(const std::string& subpath, float tileSize);
-    void RenderAssetGrid();
+    // "New ..." items of a folder's context menu: everything is created in targetSubpath.
+    void RenderAssetCreateMenuItems(const std::string& targetSubpath);
+    // Drop target accepting assets and folders dragged inside the browser, moved into targetSubpath.
+    void AcceptAssetBrowserDrop(const std::string& targetSubpath);
     void RenderAssetTile(const AssetLibrary::Entry& entry, float tileSize);
-    void RenderAssetTagFilters();
     void DestroyAssetPreviewTextures();
     void DestroyAssetPreviewTexture(AssetPreviewTexture& texture);
     std::optional<std::filesystem::path> AssetPreviewPathFor(const AssetLibrary::Entry& entry) const;
     std::optional<std::filesystem::path> ResolveAssetPreviewPath(const AssetLibrary::Entry& entry) const;
     AssetPreviewTexture* GetAssetPreviewTexture(const AssetLibrary::Entry& entry);
     bool LoadAssetPreviewTexture(const std::filesystem::path& path, AssetPreviewTexture& outTexture);
-    void CreateAssetFolder();
-    void DeleteAssetFolder();
-    void DeleteAsset(const AssetLibrary::Entry& entry);
     void OpenImportAssetDialog(const std::string& targetSubpath);
     void ImportAssetFromPath(const std::filesystem::path& sourcePath,
                              const std::string& targetSubpath,
                              const char* trigger);
+    // Copies a folder dropped from the OS (with everything in it) into the browser folder; the
+    // library then picks up the assets inside.
+    void ImportFolderFromPath(const std::filesystem::path& sourceFolder, const std::string& targetSubpath);
+    // The asset creators below put the new asset into CreateTargetSubpath(): the folder a context
+    // menu was opened on (m_assetCreateTarget, consumed), else the folder the browser shows.
+    std::string CreateTargetSubpath();
+    void RevealCreatedAsset(const AssetLibrary::Entry& entry);
     void CreatePbrMaterialAsset();
     void CreateLuaScriptAsset();                            // new .lua Script asset (browser/Scripts panel)
     void CreateNativeScriptAsset();                         // new .cpp Script asset (browser, default name)
     void CreateNativeScriptFile(const std::string& className);  // new <className>.cpp Script asset
-    // The directory holding native C++ game-script sources (.cpp). They live alongside .lua in the
-    // asset library's scripts folder so both are first-class, browsable assets; the Build pipeline's
-    // CMake project (in <ProjectRoot>/Scripts) compiles them from here.
+    void CreateAnimatorControllerAsset();
+    // Native C++ game-script sources (.cpp) live anywhere under the project's asset folder, like
+    // every other asset; the Build pipeline's CMake project (in <ProjectRoot>/Scripts) compiles all
+    // of them from here.
     std::filesystem::path ProjectScriptSourceDir() const;
     void CreateWaterMaterialAsset();
     bool CreateWaterMaterialAsset(const std::string& displayName, AssetLibrary::Entry& outEntry);
@@ -396,9 +385,6 @@ private:
     bool SavePbrMaterialEditor();
     bool DeleteWaterMaterialEditor();
     void SyncWaterMaterialSnapshot();
-    std::vector<AssetLibrary::Entry> QueryVisibleAssets() const;
-    std::vector<std::string> QueryVisibleFolders() const;
-    std::vector<std::pair<std::string, std::uint32_t>> QueryVisibleTags() const;
     std::vector<std::string> QueryFilesystemChildFolders(const std::string& subpath) const;
     std::vector<AssetLibrary::Entry> QueryFilesystemAssetsInFolder(const std::string& subpath) const;
     // Drops the cached asset browser listings when the asset library changed (or they are too old
@@ -423,10 +409,6 @@ private:
     void DeleteFilesystemSelection();
     bool MoveAssetEntryToFolder(const std::string& assetId, const std::string& targetFolderSubpath);
     bool MoveFolderToFolder(const std::string& sourceSubpath, const std::string& targetFolderSubpath);
-    bool AssetPassesCurrentFilters(const AssetLibrary::Entry& entry) const;
-    bool ActiveAssetCategory(AssetLibrary::Category category) const;
-    AssetLibrary::Category FolderCategory() const;
-    const char* AssetFilterName() const;
     void ApplyTimeOfDayPreset(float hour);
     void MarkSelectedWaterBodyChanged();
     void MarkSelectedLightChanged();
@@ -584,7 +566,6 @@ private:
     float m_createTerrainDepthMeters = 200.0f;
     float m_createTerrainCellSizeMeters = 1.0f;
     int m_createTerrainChunkSizeCells = 64;
-    AssetBrowserFilter m_assetFilter = AssetBrowserFilter::All;
     std::string m_assetSubpath;
     std::string m_selectedAssetId;
     bool m_assetInspectorSelectionActive = false;
@@ -599,7 +580,10 @@ private:
     std::string m_assetNewFolderParent;
     char m_assetRenameBuffer[128]{};
     std::string m_assetRenamePath;
+    std::string m_assetRenameAssetId;  // library asset being renamed (empty: a folder or a scene file)
     bool m_assetRenameIsFolder = false;
+    std::optional<std::string> m_assetCreateTarget;  // see CreateTargetSubpath()
+    std::string m_createMaterialTargetSubpath;       // folder of the pending "Create New Material" popup
     std::string m_assetDeletePath;
     bool m_assetDeleteIsFolder = false;
     bool m_assetOpenNewFolderPopup = false;
@@ -645,7 +629,8 @@ private:
     std::unordered_map<std::string, AssetPreviewTexture> m_assetPreviewTextures;
     // The asset browser's folder/asset/scene listings and preview paths come from directory scans and
     // path canonicalization; redone every frame they cost ~4 ms with a project open. Cached per asset
-    // library revision, and re-read at least once a second for changes made outside the editor.
+    // library revision (the file watcher refreshes the library on outside changes), and re-read every
+    // few seconds as a safety net.
     struct AssetBrowserCache
     {
         const AssetLibrary* library = nullptr;

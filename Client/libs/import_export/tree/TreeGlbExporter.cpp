@@ -375,9 +375,10 @@ TreeExportResult TreeGlbExporter::SaveAsAsset(const ixtreemetree::TreeMesh& mesh
     const std::string safeName = SanitizeAssetName(assetName);
     const std::filesystem::path normalizedProjectRoot = NormalizeProjectRoot(projectRoot);
     const std::filesystem::path assetRoot = normalizedProjectRoot / "Assets";
-    const std::filesystem::path modelDir = assetRoot / "models";
-    const std::filesystem::path textureDir = assetRoot / "textures" / safeName;
-    const std::filesystem::path materialDir = assetRoot / "materials" / safeName;
+    // One folder per tree, holding the model with its textures and materials (no per-type folders).
+    const std::filesystem::path modelDir = assetRoot / safeName;
+    const std::filesystem::path textureDir = modelDir / (safeName + "_textures");
+    const std::filesystem::path materialDir = modelDir / (safeName + "_materials");
     std::error_code ec;
     std::filesystem::create_directories(modelDir, ec);
     std::filesystem::create_directories(materialDir, ec);
