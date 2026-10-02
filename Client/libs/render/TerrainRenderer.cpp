@@ -1909,16 +1909,76 @@ void TerrainRenderer::UpdateShadowCascades(const WorldCamera& camera)
     }
 }
 
-void TerrainRenderer::UploadEditedVertices(ixrhi::IXRHICommandList& cmd)
+void TerrainRenderer::UploadEditedTerrain(ixrhi::IXRHICommandList& cmd, const ixrhi::IXRHIFrameInfo& frame)
 {
-    if (!m_vertexBufferUploadPending || !m_vertexBuffer || !m_vertexEditBuffer)
+    if (m_vertexBufferUploadPending && m_vertexBuffer && m_vertexEditBuffer)
+    {
+        m_vertexBufferUploadPending = false;
+        // Whole-buffer copy (the backend copies from offset 0): only on frames with a sculpt edit. The
+        // barriers order it after earlier frames' vertex reads and before this frame's draws.
+        cmd.TransitionBuffer(*m_vertexBuffer, ixrhi::IXRHIBufferState::VertexRead, ixrhi::IXRHIBufferState::TransferDst);
+        cmd.CopyBuffer(*m_vertexEditBuffer, *m_vertexBuffer, std::min(m_vertexEditBuffer->SizeBytes(), m_vertexBuffer->SizeBytes()));
+        cmd.TransitionBuffer(*m_vertexBuffer, ixrhi::IXRHIBufferState::TransferDst, ixrhi::IXRHIBufferState::VertexRead);
+    }
+    UploadEditedSplat(cmd, frame.frameIndex % kFramesInFlight);
+}
+
+void TerrainRenderer::UploadEditedSplat(ixrhi::IXRHICommandList& cmd, uint32_t frameIndex)
+{
+    if (!m_editorSplatGpuDirty || !m_splatDirtyRect.Valid() || !m_rhi || !m_splatA.image || !m_splatB.image)
         return;
-    m_vertexBufferUploadPending = false;
-    // Whole-buffer copy (the backend copies from offset 0): only on frames with a sculpt edit. The
-    // barriers order it after earlier frames' vertex reads and before this frame's draws.
-    cmd.TransitionBuffer(*m_vertexBuffer, ixrhi::IXRHIBufferState::VertexRead, ixrhi::IXRHIBufferState::TransferDst);
-    cmd.CopyBuffer(*m_vertexEditBuffer, *m_vertexBuffer, std::min(m_vertexEditBuffer->SizeBytes(), m_vertexBuffer->SizeBytes()));
-    cmd.TransitionBuffer(*m_vertexBuffer, ixrhi::IXRHIBufferState::TransferDst, ixrhi::IXRHIBufferState::VertexRead);
+    const SplatDirtyRect rect = m_splatDirtyRect;
+    m_splatDirtyRect = {};
+    m_editorSplatGpuDirty = false;
+
+    const std::size_t layerBytes = static_cast<std::size_t>(m_splatWidth) * m_splatHeight * 4u;
+    if (m_splatA.width != m_splatWidth || m_splatA.height != m_splatHeight ||
+        m_splatB.width != m_splatWidth || m_splatB.height != m_splatHeight ||
+        m_splatABytes.size() != layerBytes || m_splatBBytes.size() != layerBytes ||
+        rect.maxX >= m_splatWidth || rect.maxY >= m_splatHeight)
+    {
+        RefreshSplatTextures(*m_rhi);  // unexpected layout: the whole-texture path
+        return;
+    }
+
+    // This frame slot's staging buffer: the GPU copy that last read it (kFramesInFlight frames ago)
+    // is finished, since the frame began after waiting on that slot's fence.
+    std::shared_ptr<ixrhi::IXRHIBuffer>& staging = m_splatStaging[frameIndex];
+    if (!staging || staging->SizeBytes() < 2u * layerBytes)
+    {
+        staging = CreateRhiBuffer(*m_rhi,
+            2u * layerBytes,
+            ixrhi::IXRHIBufferUsage::TransferSrc,
+            nullptr,
+            "Terrain:SplatStaging");
+        if (!staging)
+        {
+            RefreshSplatTextures(*m_rhi);
+            return;
+        }
+    }
+
+    // Only the painted rectangle: its rows go to the same place in the staging buffer as in the CPU
+    // copy (A at 0, B after it), and the copies read them with the full row pitch.
+    const uint32_t width = rect.maxX - rect.minX + 1u;
+    const uint32_t height = rect.maxY - rect.minY + 1u;
+    const std::size_t rowBytes = static_cast<std::size_t>(width) * 4u;
+    for (uint32_t y = rect.minY; y <= rect.maxY; ++y)
+    {
+        const std::size_t offset = (static_cast<std::size_t>(y) * m_splatWidth + rect.minX) * 4u;
+        staging->Write(offset, m_splatABytes.data() + offset, rowBytes);
+        staging->Write(layerBytes + offset, m_splatBBytes.data() + offset, rowBytes);
+    }
+    const std::uint64_t firstTexel = (static_cast<std::uint64_t>(rect.minY) * m_splatWidth + rect.minX) * 4u;
+    using L = ixrhi::IXRHIImageLayout;
+    cmd.TransitionTexture(*m_splatA.image, L::ShaderReadOnly, L::TransferDst);
+    cmd.TransitionTexture(*m_splatB.image, L::ShaderReadOnly, L::TransferDst);
+    cmd.CopyBufferToTexture(*staging, firstTexel, m_splatWidth, *m_splatA.image, 0, 0,
+        rect.minX, rect.minY, width, height);
+    cmd.CopyBufferToTexture(*staging, layerBytes + firstTexel, m_splatWidth, *m_splatB.image, 0, 0,
+        rect.minX, rect.minY, width, height);
+    cmd.TransitionTexture(*m_splatA.image, L::TransferDst, L::ShaderReadOnly);
+    cmd.TransitionTexture(*m_splatB.image, L::TransferDst, L::ShaderReadOnly);
 }
 
 void TerrainRenderer::RenderSunShadowMap(ixrhi::IXRHICommandList& cmd,
@@ -3099,7 +3159,9 @@ void TerrainRenderer::UpdateEditor(ixrhi::IXRHIDevice& rhi,
     {
         if (m_editorLmbHeld && m_editorBrushVisible)
             ApplyEditorBrush(rhi, deltaSeconds);
-        if (m_editorSplatGpuDirty)
+        // Painted texels upload in the frame (UploadEditedTerrain); this synchronous whole-texture path
+        // is only for a change without a dirty rectangle.
+        if (m_editorSplatGpuDirty && !m_splatDirtyRect.Valid())
             RefreshSplatTextures(rhi);
         return;
     }
@@ -3174,6 +3236,8 @@ void TerrainRenderer::Destroy()
 
     m_vertexBuffer.reset();
     m_vertexEditBuffer.reset();
+    for (std::shared_ptr<ixrhi::IXRHIBuffer>& staging : m_splatStaging)
+        staging.reset();
     m_indexBuffer.reset();
     m_debugVertexBuffer.reset();
     m_debugIndexBuffer.reset();
@@ -3237,6 +3301,7 @@ void TerrainRenderer::Destroy()
     m_editorStrokeActive = false;
     m_editorBrushVisible = false;
     m_editorSplatGpuDirty = false;
+    m_splatDirtyRect = {};
     m_loadedMapDirectory.clear();
     m_loadedServerX = 0;
     m_loadedServerY = 0;
@@ -3443,7 +3508,7 @@ bool TerrainRenderer::CreateFlatBuffers(ixrhi::IXRHIDevice& rhi)
     m_indexCount = static_cast<uint32_t>(indices.size());
 
     // Drawn from video memory (main pass + every shadow cascade); edited (sculpt) through a
-    // host-visible copy that UploadEditedVertices() copies over.
+    // host-visible copy that UploadEditedTerrain() copies over.
     m_vertexBuffer = CreateStaticRhiBuffer(rhi,
         sizeof(Vertex) * vertices.size(),
         ixrhi::IXRHIBufferUsage::Vertex | ixrhi::IXRHIBufferUsage::TransferDst,
@@ -3686,6 +3751,7 @@ bool TerrainRenderer::CreateMapBuffers(ixrhi::IXRHIDevice& rhi, const std::strin
     m_currentUndo = {};
     m_undoStack.clear();
     m_editorSplatGpuDirty = false;
+    m_splatDirtyRect = {};
     if (!field->splat_a_rgba8.empty() && !field->splat_b_rgba8.empty())
     {
         UploadRgbaTexture2D(rhi, "splat_a", field->splat_width, field->splat_height,
@@ -3956,7 +4022,7 @@ bool TerrainRenderer::CreateMapBuffers(ixrhi::IXRHIDevice& rhi, const std::strin
 
     m_indexCount = static_cast<uint32_t>(indices.size());
     // Drawn from video memory (main pass + every shadow cascade); edited (sculpt) through a
-    // host-visible copy that UploadEditedVertices() copies over.
+    // host-visible copy that UploadEditedTerrain() copies over.
     m_vertexBuffer = CreateStaticRhiBuffer(rhi,
         sizeof(Vertex) * vertices.size(),
         ixrhi::IXRHIBufferUsage::Vertex | ixrhi::IXRHIBufferUsage::TransferDst,
@@ -4324,7 +4390,33 @@ uint32_t TerrainRenderer::ActiveSplatLayerSpan()
 
 void TerrainRenderer::MarkSplatDirty(size_t splatIndex)
 {
-    m_activeSplatLayerSpan = -1;  // every per-texel splat write (paint, undo) comes through here
+    // Every per-texel splat write (paint, undo) comes through here, after the write. Grow the cached
+    // active layer span by this texel's layers instead of dropping it: a span that only grows stays
+    // correct (the shader skips zero weights), and a full rescan per painted frame cost ~1 ms.
+    const size_t splatByte = splatIndex * 4u;
+    if (m_activeSplatLayerSpan >= 0 && splatByte + 3u < m_splatABytes.size() && splatByte + 3u < m_splatBBytes.size())
+    {
+        for (int layer = 0; layer < 4; ++layer)
+        {
+            if (m_splatABytes[splatByte + static_cast<size_t>(layer)] > 0)
+                m_activeSplatLayerSpan = std::max(m_activeSplatLayerSpan, layer + 1);
+            if (m_splatBBytes[splatByte + static_cast<size_t>(layer)] > 0)
+                m_activeSplatLayerSpan = std::max(m_activeSplatLayerSpan, layer + 5);
+        }
+    }
+    else
+    {
+        m_activeSplatLayerSpan = -1;
+    }
+    if (m_splatWidth > 0)
+    {
+        const uint32_t texelX = static_cast<uint32_t>(splatIndex % m_splatWidth);
+        const uint32_t texelY = static_cast<uint32_t>(splatIndex / m_splatWidth);
+        m_splatDirtyRect.minX = std::min(m_splatDirtyRect.minX, texelX);
+        m_splatDirtyRect.minY = std::min(m_splatDirtyRect.minY, texelY);
+        m_splatDirtyRect.maxX = std::max(m_splatDirtyRect.maxX, texelX);
+        m_splatDirtyRect.maxY = std::max(m_splatDirtyRect.maxY, texelY);
+    }
     if (m_chunkSplatWidth == 0 || m_chunkSplatHeight == 0 || m_dirtyChunkTexels.empty() || m_splatWidth == 0)
         return;
     const uint32_t sx = static_cast<uint32_t>(splatIndex % m_splatWidth);
@@ -4675,6 +4767,8 @@ bool TerrainRenderer::RefreshSplatTextures(ixrhi::IXRHIDevice& rhi)
     const bool okA = UpdateRgbaTexture2D(rhi, m_splatA, m_splatABytes);
     const bool okB = UpdateRgbaTexture2D(rhi, m_splatB, m_splatBBytes);
     m_editorSplatGpuDirty = !(okA && okB);
+    if (okA && okB)
+        m_splatDirtyRect = {};
     if (BrushDiagLogs() || !(okA && okB))  // every frame while painting: only a stroke's first few
         Tracenf("[TEDIT-DIAG] splat gpu upload terrainId=%p targets=%p/%p textureSize=%ux%u cpuSize=%ux%u okA=%d okB=%d gpuUpload=%s",
             m_sceneTerrainActive ? static_cast<void*>(this) : nullptr,
@@ -4749,8 +4843,7 @@ void TerrainRenderer::UndoLastEditorStroke(ixrhi::IXRHIDevice& rhi)
                 m_splatBBytes[byte + i] = undo.oldWeights[4 + i];
             MarkSplatDirty(undo.index);
         }
-        m_editorSplatGpuDirty = true;
-        RefreshSplatTextures(rhi);
+        m_editorSplatGpuDirty = true;  // uploaded in the frame (MarkSplatDirty grew the rectangle)
     }
     Tracenf("[TERRAIN-EDITOR] undo applied heights=%zu splats=%zu",
         entry.heights.size(),

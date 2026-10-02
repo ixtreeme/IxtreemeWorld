@@ -62,6 +62,16 @@ public:
     void CopyBuffer(const ixrhi::IXRHIBuffer& src,
                     ixrhi::IXRHIBuffer& dst,
                     std::uint64_t byteCount) override;
+    void CopyBufferToTexture(const ixrhi::IXRHIBuffer& src,
+                             std::uint64_t srcOffsetBytes,
+                             std::uint32_t srcRowTexels,
+                             ixrhi::IXRHITexture& dst,
+                             std::uint32_t mipLevel,
+                             std::uint32_t arrayLayer,
+                             std::uint32_t x,
+                             std::uint32_t y,
+                             std::uint32_t width,
+                             std::uint32_t height) override;
     void TransitionBuffer(ixrhi::IXRHIBuffer& buffer,
                           ixrhi::IXRHIBufferState from,
                           ixrhi::IXRHIBufferState to) override;

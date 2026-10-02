@@ -331,6 +331,40 @@ void IXVulkanCommandList::CopyBuffer(const ixrhi::IXRHIBuffer& src,
     vkCmdCopyBuffer(m_cmd, nativeSrc->Native(), nativeDst->Native(), 1, &copy);
 }
 
+void IXVulkanCommandList::CopyBufferToTexture(const ixrhi::IXRHIBuffer& src,
+                                              std::uint64_t srcOffsetBytes,
+                                              std::uint32_t srcRowTexels,
+                                              ixrhi::IXRHITexture& dst,
+                                              std::uint32_t mipLevel,
+                                              std::uint32_t arrayLayer,
+                                              std::uint32_t x,
+                                              std::uint32_t y,
+                                              std::uint32_t width,
+                                              std::uint32_t height)
+{
+    auto* nativeSrc = dynamic_cast<const IXVulkanBuffer*>(&src);
+    auto* nativeDst = dynamic_cast<IXVulkanTexture*>(&dst);
+    assert(nativeSrc != nullptr && nativeDst != nullptr && "foreign IXRHI resource used with IXVulkan backend");
+    if (nativeSrc == nullptr || nativeDst == nullptr || width == 0 || height == 0)
+        return;
+    VkBufferImageCopy copy{};
+    copy.bufferOffset = static_cast<VkDeviceSize>(srcOffsetBytes);
+    copy.bufferRowLength = srcRowTexels;
+    copy.bufferImageHeight = 0;
+    copy.imageSubresource.aspectMask = ToVkAspectMask(nativeDst->Format());
+    copy.imageSubresource.mipLevel = mipLevel;
+    copy.imageSubresource.baseArrayLayer = arrayLayer;
+    copy.imageSubresource.layerCount = 1;
+    copy.imageOffset = {static_cast<std::int32_t>(x), static_cast<std::int32_t>(y), 0};
+    copy.imageExtent = {width, height, 1};
+    vkCmdCopyBufferToImage(m_cmd,
+        nativeSrc->Native(),
+        nativeDst->Native(),
+        VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL,
+        1,
+        &copy);
+}
+
 namespace
 {
 

@@ -10577,7 +10577,7 @@ int RunGame(NativeWindow& window,
             // Sculpted terrain vertices reach the drawn vertex buffer before any pass draws the terrain
             // (outside render passes: nothing is open yet here).
             if (isInWorld && hasSceneTerrain)
-                terrain.UploadEditedVertices(*frameInfo.commandList);
+                terrain.UploadEditedTerrain(*frameInfo.commandList, frameInfo);
             if (isInWorld && hasSceneTerrain && hasFrameCamera && !debugDisableShadowPass)
             {
                 rhiDevice->WriteTimestamp(ixrhi::IXRHITimestampPoint::ShadowPassBegin);

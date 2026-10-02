@@ -170,9 +170,10 @@ public:
                      std::uint32_t targetWidth = 0,
                      std::uint32_t targetHeight = 0,
                      uint32_t viewIndex = 0);
-    // Records the copy of sculpted vertices into the drawn (video memory) vertex buffer. Call once per
+    // Records the uploads of this frame's terrain edits: sculpted vertices into the drawn (video
+    // memory) vertex buffer and the painted splat rectangle into the splat textures. Call once per
     // frame outside any render pass, before the terrain is drawn.
-    void UploadEditedVertices(ixrhi::IXRHICommandList& cmd);
+    void UploadEditedTerrain(ixrhi::IXRHICommandList& cmd, const ixrhi::IXRHIFrameInfo& frame);
     void RenderSunShadowMap(ixrhi::IXRHICommandList& cmd,
                             const ixrhi::IXRHIFrameInfo& frame,
                             const WorldCamera& camera);
@@ -460,7 +461,7 @@ private:
     void MarkHeightDirty(size_t heightIndex);
     void MarkSplatDirty(size_t splatIndex);
     // Highest painted splat layer + 1 (the shader's layer loop bound). Scanning both splat maps is
-    // ~1 ms at 512 m, so it is cached until the splat data changes.
+    // ~1 ms at 512 m, so it is cached: painting grows it per texel (MarkSplatDirty), bulk changes reset it.
     uint32_t ActiveSplatLayerSpan();
     bool RefreshSplatTextures(ixrhi::IXRHIDevice& rhi);
     bool SaveDirtyChunks();
@@ -481,7 +482,7 @@ private:
     WaterMaterialData m_defaultWaterMaterial;
     std::shared_ptr<ixrhi::IXRHIBuffer> m_vertexBuffer;      // drawn: video memory
     std::shared_ptr<ixrhi::IXRHIBuffer> m_vertexEditBuffer;  // host-visible copy the sculpt reads/writes
-    bool m_vertexBufferUploadPending = false;                // edit copy changed: UploadEditedVertices
+    bool m_vertexBufferUploadPending = false;                // edit copy changed: UploadEditedTerrain
     std::shared_ptr<ixrhi::IXRHIBuffer> m_indexBuffer;
     std::shared_ptr<ixrhi::IXRHIBuffer> m_debugVertexBuffer;
     std::shared_ptr<ixrhi::IXRHIBuffer> m_debugIndexBuffer;
@@ -583,6 +584,20 @@ private:
     bool m_waterSculptBrushVisible = false;
     bool m_waterSculptBrushAddMode = true;
     bool m_editorSplatGpuDirty = false;
+    // Painted splat texels since the last upload (MarkSplatDirty): UploadEditedTerrain copies just this
+    // rectangle through a per-frame-slot staging buffer in the frame's command list, instead of a
+    // synchronous whole-texture upload (queue wait) on every painted frame.
+    struct SplatDirtyRect
+    {
+        uint32_t minX = std::numeric_limits<uint32_t>::max();
+        uint32_t minY = std::numeric_limits<uint32_t>::max();
+        uint32_t maxX = 0;
+        uint32_t maxY = 0;
+        bool Valid() const { return minX <= maxX && minY <= maxY; }
+    };
+    SplatDirtyRect m_splatDirtyRect;
+    std::array<std::shared_ptr<ixrhi::IXRHIBuffer>, kFramesInFlight> m_splatStaging;
+    void UploadEditedSplat(ixrhi::IXRHICommandList& cmd, uint32_t frameIndex);
     std::int32_t m_activeSplatLayerSpan = -1;  // ActiveSplatLayerSpan() cache; -1 = splat data changed
     bool m_editorSaveRequested = false;
     bool m_editorReloadRequested = false;

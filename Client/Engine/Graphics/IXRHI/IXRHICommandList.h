@@ -97,6 +97,21 @@ public:
                             IXRHIBuffer& dst,
                             std::uint64_t byteCount) = 0;
 
+    // Copies a texel rectangle from a buffer into one mip level / array layer
+    // of a texture that is in TransferDst. srcRowTexels is the buffer's row
+    // pitch in texels (>= width), so a sub-rectangle of a whole image held in
+    // the buffer copies in place; srcOffsetBytes addresses its first texel.
+    virtual void CopyBufferToTexture(const IXRHIBuffer& src,
+                                     std::uint64_t srcOffsetBytes,
+                                     std::uint32_t srcRowTexels,
+                                     IXRHITexture& dst,
+                                     std::uint32_t mipLevel,
+                                     std::uint32_t arrayLayer,
+                                     std::uint32_t x,
+                                     std::uint32_t y,
+                                     std::uint32_t width,
+                                     std::uint32_t height) = 0;
+
     // Explicit buffer layout/access transition (backend inserts the barrier).
     // Unlocks compute->graphics (ShaderWrite -> VertexRead) and
     // compute->readback (ShaderWrite -> TransferSrc) without native barriers
