@@ -2900,8 +2900,8 @@ void EditorImGui::RefreshAssetLibrary()
 {
     if (!m_assetLibrary)
         return;
-    std::string error;
-    m_assetLibrary->Refresh(error);
+    // The game only re-reads the manifest the editor wrote: it never scans or writes its own folder.
+    m_assetLibrary->InitializeReadOnly();
 }
 
 // Real (non-stub) native game-module loader for the runtime: scans <ProjectRoot>/Binaries for module

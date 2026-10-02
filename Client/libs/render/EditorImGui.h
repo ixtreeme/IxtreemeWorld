@@ -117,6 +117,21 @@ public:
         m_buildLog = std::move(log);
         m_buildOutputPanelOpen = true;
     }
+    // "Build Game" (packaging the project into a folder that runs without the editor).
+    void SetGameBuildRunning()
+    {
+        m_gameBuildState = ScriptBuildState::Running;
+        m_buildOutputPanelOpen = true;
+    }
+    void SetGameBuildResult(bool ok, std::string log, std::filesystem::path executable)
+    {
+        m_gameBuildState = ScriptBuildState::Done;
+        m_gameBuildSucceeded = ok;
+        m_gameBuildLog = std::move(log);
+        m_gameBuildExecutable = std::move(executable);
+        m_buildOutputPanelOpen = true;
+    }
+    bool IsGameBuildRunning() const { return m_gameBuildState == ScriptBuildState::Running; }
 
     // Save-to-live iteration: a per-frame (throttled) mtime poll over the project's .lua Script assets
     // and <ProjectRoot>/Scripts/*.cpp,*.h. EngineApplication drains m_pendingScriptChanges each frame to
@@ -268,6 +283,8 @@ private:
     void OpenProjectFromDialog(const std::filesystem::path& manifestPath);
     void RenderEditorToolbar();
     void RenderBuildOutputPanel();
+    void OpenBuildGameDialog();
+    void RenderBuildGamePopup();
     void RenderScriptsPanel();
     void RenderSceneSettingsPanel();
     struct ProjectSceneEntry
@@ -532,6 +549,17 @@ private:
     bool m_buildSucceeded = false;
     bool m_buildOutputPanelOpen = false;
     std::string m_buildLog;
+    // "Build Game" state (packaging; shown in the Build Output panel) and its dialog.
+    ScriptBuildState m_gameBuildState = ScriptBuildState::Idle;
+    bool m_gameBuildSucceeded = false;
+    std::string m_gameBuildLog;
+    std::filesystem::path m_gameBuildExecutable;
+    bool m_openBuildGamePopup = false;
+    char m_buildGameName[128]{};
+    char m_buildGameOutputDir[512]{};
+    std::string m_buildGameStartupScene;  // project-relative
+    bool m_buildGameCompileScripts = true;
+    bool m_buildGameRunWhenDone = true;
     std::array<MapEditorPaletteSlot, 8> m_paletteSlots{};
     std::vector<std::pair<std::string, WaterMaterialData>> m_waterMaterials;
     std::unordered_map<std::string, std::uint32_t> m_waterMaterialUsageCounts;

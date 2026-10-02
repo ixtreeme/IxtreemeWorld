@@ -22,6 +22,8 @@
 #include "ScriptSystem.h"
 #include "ScriptApiImpl.h"
 #include "BuildService.h"  // ixeditor::build::GameScriptBuildService — cmake Build worker (Editor/Build boundary)
+#include "GamePackager.h"  // ixeditor::build::GamePackageService — "Build Game" packager (Editor/Build boundary)
+#include "platform/open_external.h"
 #include "IXVulkanDevice.h" // ixvulkan::CreateDevice factory seam + editor adapter (backend bootstrap)
 #include "IXVulkanEditorAdapter.h" // backend-specific editor integration (isolated)
 #include "EditorImGui.h"
@@ -1717,6 +1719,15 @@ void MergeMapEditorCommands(MapEditorCommands& target, const MapEditorCommands& 
     target.pausePlayMode = target.pausePlayMode || source.pausePlayMode;
     target.resumePlayMode = target.resumePlayMode || source.resumePlayMode;
     target.buildGameScripts = target.buildGameScripts || source.buildGameScripts;
+    if (source.buildGame)
+    {
+        target.buildGame = true;
+        target.buildGameName = source.buildGameName;
+        target.buildGameOutputDir = source.buildGameOutputDir;
+        target.buildGameStartupScene = source.buildGameStartupScene;
+        target.buildGameCompileScripts = source.buildGameCompileScripts;
+        target.buildGameRunWhenDone = source.buildGameRunWhenDone;
+    }
     target.addWaterBody = target.addWaterBody || source.addWaterBody;
     if (source.createTerrain)
     {
@@ -2823,6 +2834,11 @@ int RunGame(NativeWindow& window,
     // triggers RequestBuild() and drains TryTakeResult(). std::jthread-equivalent lifetime: the
     // service joins its worker on Shutdown()/dtor, so no live thread can outlive RunGame locals.
     ixeditor::build::GameScriptBuildService gameScriptBuild;
+    // "Build Game": packages the project with the editor-less runtime player on a worker thread. When the
+    // C++ scripts are compiled first, the request waits for that build (gamePackageAfterScripts).
+    ixeditor::build::GamePackageService gamePackage;
+    std::optional<ixeditor::build::GamePackageRequest> gamePackageAfterScripts;
+    bool gamePackageRunWhenDone = false;
     std::unordered_map<std::uint32_t, std::string> entityBoundControllerId;
     double animPrevFrameSeconds = 0.0;
     float editorPlayerLookDx = 0.0f;
@@ -3992,7 +4008,8 @@ int RunGame(NativeWindow& window,
 #endif
                              &renderSize](const InputEvent& event)
     {
-#if defined(IXTREEME_WITH_EDITOR)
+        // Gameplay input state, shared by the editor's Play mode and the standalone game: right-drag
+        // mouse-look for the player character, held mouse buttons and arrow keys for scripts.
         if (event.type == InputEvent::MouseMove ||
             event.type == InputEvent::MouseDown ||
             event.type == InputEvent::MouseUp ||
@@ -4035,6 +4052,7 @@ int RunGame(NativeWindow& window,
             }
         }
 
+#if defined(IXTREEME_WITH_EDITOR)
         if (event.type == InputEvent::KeyDown && event.key == Key_Shift)
             editorShiftDown = true;
         else if (event.type == InputEvent::KeyUp && event.key == Key_Shift)
@@ -4114,10 +4132,16 @@ int RunGame(NativeWindow& window,
             return;
         }
 #endif
+#if defined(IXTREEME_WITH_EDITOR)
         const bool editorFlyCameraKey =
             runtimeSession->IsMapEditorOpen() &&
             cameraController.IsFreeCameraEnabled() &&
             isEditorFlyCameraKey(event);
+#else
+        // The game has no editor viewport: its keys always reach gameplay movement.
+        (void)isEditorFlyCameraKey;
+        const bool editorFlyCameraKey = false;
+#endif
         if (editorFlyCameraKey)
         {
             const auto viewportDiag = editorImGui.GetViewportInputDiagnostics();
@@ -4815,6 +4839,114 @@ int RunGame(NativeWindow& window,
     bool debugShowPhysicsBodyCenters = false;
     bool dumpFrameProfileRequested = false;
     Tracen("[VISIBILITY-RESPECT] shadow_pass=yes water_reflection_pass=yes main_pass=yes");
+    // Starting the game simulation of the loaded scene, shared by the editor's Play button and the
+    // standalone game: who drives the camera, the physics world (with the player character bodies),
+    // the audio sources and the script instances (OnStart). The editor wraps it with its own
+    // snapshot/selection handling.
+    auto startPlaySession = [&]() {
+        // With a player character present, Play hands WASD/Space to the character (the editor
+        // free-fly would otherwise capture those keys). Without one, keep free-fly so you can fly
+        // around the running simulation.
+        const bool hasPlayerCharacter = std::any_of(
+            editorMeshEntities.begin(), editorMeshEntities.end(),
+            [](const MeshSceneEntity& m) { return m.hasCharacterController && m.characterController.enabled; });
+        cameraController.SetFreeCameraEnabled(!hasPlayerCharacter);
+        runtimeSession->Start(SceneManager::Instance().GetCurrentScene());
+        rebuildEditorPhysicsWorld();
+        editorCharacterStates.clear();
+        // Audio: create (+ playOnStart-start) each entity's AudioSource for this Play session.
+        entityAudioSources.clear();
+        if (audioEngine.IsInitialized())
+        {
+            for (const MeshSceneEntity& audioMesh : editorMeshEntities)
+            {
+                if (!audioMesh.hasAudioSource || !audioMesh.audioSource.enabled ||
+                    audioMesh.audioSource.clipAssetId.empty())
+                    continue;
+                const std::string clipPath = editorImGui.AudioClipFilePath(audioMesh.audioSource.clipAssetId);
+                if (clipPath.empty())
+                    continue;
+                ixaudio::AudioSourceRuntime rt;
+                if (audioEngine.CreateSource(rt, audioMesh.audioSource, clipPath))
+                {
+                    if (audioMesh.audioSource.playOnStart)
+                        audioEngine.StartSource(rt);
+                    entityAudioSources[audioMesh.id] = std::move(rt);
+                }
+            }
+        }
+        // Scripting: spin up the subsystem and create one live instance per scripted entity,
+        // firing OnStart now. A throwing hook must not abort Play, so isolate every call.
+        entityScripts.clear();
+        scriptSystem = std::make_unique<ixscript::ScriptSystem>(scriptApi);
+        for (const MeshSceneEntity& scriptMesh : editorMeshEntities)
+        {
+            if (!scriptMesh.hasScript || !scriptMesh.script.enabled)
+                continue;
+            std::unique_ptr<ixscript::ScriptInstance> instance =
+                scriptSystem->CreateInstance(scriptMesh.id, scriptMesh.script);
+            if (!instance)
+                continue;
+            try
+            {
+                instance->OnStart();
+            }
+            catch (const std::exception& e)
+            {
+                TraceError("[SCRIPT] OnStart threw entity=%u: %s", scriptMesh.id, e.what());
+            }
+            catch (...)
+            {
+                TraceError("[SCRIPT] OnStart threw entity=%u (unknown)", scriptMesh.id);
+            }
+            entityScripts[scriptMesh.id] = std::move(instance);
+        }
+        Tracenf("[SCRIPT] Play started: %zu live script instance(s)", entityScripts.size());
+        editorPlayerLookDx = 0.0f;
+        editorPlayerLookDy = 0.0f;
+        editorPlay.state.frameCount = 0;
+        editorPlay.state.elapsedSeconds = 0.0;
+        editorPlay.appliedMode = editorPlay.state.mode;
+        Tracenf("[PLAY] session started: player character=%s", hasPlayerCharacter ? "yes" : "no");
+    };
+    // The game's camera (the editor's Game view, the standalone game's screen): the scene's Main
+    // Camera, or in Play the first active player character's camera (follow / first-person /
+    // top-down per its CameraMode). None when the scene has neither.
+    auto buildGameCamera = [&](std::uint32_t width, std::uint32_t height) -> std::optional<WorldCamera> {
+        const CameraEntity* mainCameraEntity = nullptr;
+        for (const CameraEntity& cameraEntity : editorCameras)
+        {
+            if (cameraEntity.id == editorMainCameraId)
+            {
+                mainCameraEntity = &cameraEntity;
+                break;
+            }
+        }
+        if (!mainCameraEntity && !editorCameras.empty())
+            mainCameraEntity = &editorCameras.front();
+        std::optional<CameraEntity> gameCameraEntity;
+        if (mainCameraEntity)
+            gameCameraEntity = *mainCameraEntity;
+        if (editorPlay.state.mode == EditorPlayMode::Play)
+        {
+            for (const MeshSceneEntity& characterMesh : editorMeshEntities)
+            {
+                if (!characterMesh.hasCharacterController || !characterMesh.characterController.enabled)
+                    continue;
+                auto stateIt = editorCharacterStates.find(characterMesh.id);
+                if (stateIt == editorCharacterStates.end() || !stateIt->second.initialized)
+                    continue;
+                phys::CharacterControllerComponent cc = characterMesh.characterController;
+                phys::Sanitize(cc);
+                gameCameraEntity = ComputeCharacterCameraEntity(
+                    mainCameraEntity ? *mainCameraEntity : CameraEntity{}, characterMesh, cc, stateIt->second);
+                break;
+            }
+        }
+        if (!gameCameraEntity)
+            return std::nullopt;
+        return BuildCameraFromEntity(*gameCameraEntity, width, height);
+    };
 #if !defined(IXTREEME_WITH_EDITOR)
     // ---- Standalone runtime boot ----------------------------------------------------------------
     // No editor: find the packaged game (project.ixproj sits next to the runtime exe, placed there by
@@ -4843,7 +4975,12 @@ int RunGame(NativeWindow& window,
                 std::getline(cfg, line);
                 while (!line.empty() && (line.back() == '\r' || line.back() == '\n' || line.back() == ' '))
                     line.pop_back();
-                addProjectCandidate(std::filesystem::path(line));
+                // A relative path is relative to the game folder, not the working directory (a shortcut
+                // may start the game from anywhere).
+                std::filesystem::path gamePath(line);
+                if (!line.empty() && gamePath.is_relative())
+                    gamePath = engineRoot / gamePath;
+                addProjectCandidate(gamePath);
             }
             // (2) Packaged layout: the project sits next to the exe (or an ancestor dir of it).
             for (std::filesystem::path d = engineRoot; ; d = d.parent_path())
@@ -4876,6 +5013,21 @@ int RunGame(NativeWindow& window,
                 ProjectManager& projects = ProjectManager::Instance();
                 Tracenf("[RUNTIME-BOOT] project '%s' at %s",
                     projects.CurrentProject().name.c_str(), projects.ProjectRoot().generic_string().c_str());
+                // The window shows the game's name (not the editor's "<scene> - Editor" title).
+                const std::string gameTitle = projects.CurrentProject().name.empty() ? "Game" : projects.CurrentProject().name;
+                SceneManager::Instance().SetWindowTitleCallback([&window, gameTitle](const std::string&) {
+                    window.SetTitle(gameTitle);
+                });
+                window.SetTitle(gameTitle);
+                // GUIDs of every asset (materials find their textures, models their materials).
+                AssetDatabase::Instance().scan(projects.ProjectRoot());
+                // The project's physics layer collision matrix (rows of '0'/'1', as the editor saves it).
+                const std::vector<std::string>& matrixRows = projects.CurrentProject().physicsCollisionMatrixRows;
+                for (std::size_t row = 0; row < matrixRows.size() && row < editorPhysicsLayerMatrix.size(); ++row)
+                {
+                    for (std::size_t col = 0; col < matrixRows[row].size() && col < editorPhysicsLayerMatrix[row].size(); ++col)
+                        editorPhysicsLayerMatrix[row][col] = matrixRows[row][col] == '1';
+                }
                 syncTerrainAssetRoots();
                 // The scene-mesh + terrain render path is driven by the "map editor open" signal (the
                 // editor sets it at boot); the runtime needs it on too so the loaded scene is drawn. The
@@ -4883,8 +5035,8 @@ int RunGame(NativeWindow& window,
                 runtimeSession->SetMapEditorOpen(true);
                 if (terrainOk)
                     terrain.SetMapEditorOpen(true);
+                // Reads the manifest the editor wrote (no folder scan, nothing written in the game folder).
                 editorImGui.InitializeProjectAssetLibrary(projects.ProjectRoot(), projects.AssetRootPath());
-                editorImGui.RefreshAssetLibrary();
                 editorImGui.LoadProjectGameModules(projects.ProjectRoot());  // native C++ game-module DLLs
                 const std::string startupScene = projects.CurrentProject().startupScene;
                 if (!startupScene.empty() && SceneManager::Instance().LoadScene(startupScene))
@@ -5410,7 +5562,16 @@ int RunGame(NativeWindow& window,
         if (runtimeSession->IsInWorld())
         {
             frameEntities = runtimeSession->GetWorldEntities();
+#if defined(IXTREEME_WITH_EDITOR)
             frameCamera = cameraController.BuildCamera(renderSize.width, renderSize.height);
+#else
+            // The game looks through its own camera (Main Camera / player character, as the editor's
+            // Game view); the free-fly camera only when the scene has none.
+            if (const std::optional<WorldCamera> gameCamera = buildGameCamera(renderSize.width, renderSize.height))
+                frameCamera = *gameCamera;
+            else
+                frameCamera = cameraController.BuildCamera(renderSize.width, renderSize.height);
+#endif
             hasFrameCamera = true;
             lastPickEntities = frameEntities;
             lastPickCamera = frameCamera;
@@ -5478,7 +5639,13 @@ int RunGame(NativeWindow& window,
             {
                 SceneData runtimePendingScene;
                 if (SceneManager::Instance().ConsumePendingScene(runtimePendingScene))
+                {
                     sceneRuntime.ApplySceneData(runtimePendingScene);
+                    // The game plays from its first frame: start the simulation of the scene just built
+                    // (the boot forced Play; this is what the editor's Play button does).
+                    if (editorPlay.state.mode == EditorPlayMode::Play)
+                        startPlaySession();
+                }
             }
 #endif
 #if defined(IXTREEME_WITH_EDITOR)
@@ -6717,6 +6884,58 @@ int RunGame(NativeWindow& window,
                 if (commands.resumePlayMode && editorPlay.state.mode == EditorPlayMode::PlayPaused)
                     editorPlay.state.mode = EditorPlayMode::Play;
 
+                // "Build Game" (Edit, with a project, nothing else building): package the project with the
+                // editor-less runtime player. The C++ scripts are compiled first when asked (the package
+                // then waits for that build, below); the editor saved the project and scene before this.
+                if (commands.buildGame &&
+                    editorPlay.state.mode == EditorPlayMode::Edit &&
+                    ProjectManager::Instance().HasProject() &&
+                    !gamePackage.IsRunning() && !gamePackageAfterScripts && !gameScriptBuild.IsRunning())
+                {
+                    ProjectManager& projects = ProjectManager::Instance();
+                    ixeditor::build::GamePackageRequest request;
+                    const std::filesystem::path exeDir(ExecutableDirectory());
+                    // A runtime player shipped with the editor (binary distribution) ...
+                    request.prebuiltRuntimeDir = exeDir / "Runtime";
+                    // ... else built from the engine sources, configured like this editor's build.
+                    for (std::filesystem::path dir = exeDir; !dir.empty(); dir = dir.parent_path())
+                    {
+                        std::error_code ec;
+                        if (request.editorBuildDir.empty() && std::filesystem::exists(dir / "CMakeCache.txt", ec))
+                            request.editorBuildDir = dir;
+                        if (request.engineSourceDir.empty() && std::filesystem::exists(dir / "CMakeLists.txt", ec))
+                        {
+                            std::ifstream rootCmake(dir / "CMakeLists.txt");
+                            const std::string text((std::istreambuf_iterator<char>(rootCmake)), std::istreambuf_iterator<char>());
+                            if (text.find("IXTREEME_WITH_EDITOR") != std::string::npos)
+                                request.engineSourceDir = dir;
+                        }
+                        if (dir == dir.parent_path())
+                            break;
+                    }
+                    request.buildConfig = ixeditor::build::GameScriptBuildService::BuildConfigForCurrentBinary();
+                    request.projectRoot = projects.ProjectRoot();
+                    request.assetRoot = projects.AssetRootPath();
+                    request.outputDir = std::filesystem::path(commands.buildGameOutputDir);
+                    request.gameName = commands.buildGameName;
+                    request.startupScene = commands.buildGameStartupScene;
+                    gamePackageRunWhenDone = commands.buildGameRunWhenDone;
+                    Tracenf("[BUILD-GAME] requested name=%s output=%s scene=%s scripts=%s",
+                        request.gameName.c_str(),
+                        request.outputDir.generic_string().c_str(),
+                        request.startupScene.c_str(),
+                        commands.buildGameCompileScripts ? "yes" : "no");
+                    if (commands.buildGameCompileScripts)
+                    {
+                        gamePackageAfterScripts = std::move(request);
+                        commands.buildGameScripts = true;  // handled right below, this frame
+                    }
+                    else if (gamePackage.RequestPackage(std::move(request)))
+                    {
+                        editorImGui.SetGameBuildRunning();
+                    }
+                }
+
                 // Build the project's native C++ game scripts (only in Edit, with a project, one at a
                 // time). MUST unload the module first so cmake can overwrite the locked DLL; the worker
                 // thread runs cmake and the main-thread poll (below) reloads on success.
@@ -6752,8 +6971,31 @@ int RunGame(NativeWindow& window,
                     const bool ok = buildResult.ok;
                     if (ok && ProjectManager::Instance().HasProject())
                         editorImGui.LoadProjectGameModules(ProjectManager::Instance().ProjectRoot());
+                    // A waiting "Build Game" goes on only with freshly built scripts.
+                    if (gamePackageAfterScripts)
+                    {
+                        if (ok && gamePackage.RequestPackage(std::move(*gamePackageAfterScripts)))
+                            editorImGui.SetGameBuildRunning();
+                        else if (!ok)
+                            editorImGui.SetGameBuildResult(false,
+                                "[BUILD-GAME] stopped: the C++ game scripts did not build.\n\n" + buildResult.log, {});
+                        gamePackageAfterScripts.reset();
+                    }
                     editorImGui.SetBuildResult(ok, std::move(buildResult.log));
                     Tracenf("[BUILD] game scripts %s", ok ? "OK" : "FAILED");
+                }
+
+                // "Build Game" completion: report, and start the game when asked.
+                if (ixeditor::build::GamePackageResult packageResult{}; gamePackage.TryTakeResult(packageResult))
+                {
+                    Tracenf("[BUILD-GAME] %s", packageResult.ok ? "OK" : "FAILED");
+                    if (packageResult.ok && gamePackageRunWhenDone)
+                    {
+                        std::string launchError;
+                        if (!platform::OpenInDefaultApp(packageResult.executable, &launchError))
+                            packageResult.log += "[BUILD-GAME] could not start the game: " + launchError + "\n";
+                    }
+                    editorImGui.SetGameBuildResult(packageResult.ok, std::move(packageResult.log), packageResult.executable);
                 }
 
                 if (editorPlay.appliedMode == EditorPlayMode::Edit &&
@@ -6773,69 +7015,7 @@ int RunGame(NativeWindow& window,
                     waterSculptStrokeActive = false;
                     editorWaterBodiesDirty = true;
                     terrain.SetWaterSculptBrush(false, 0.0f, 0.0f, 0.0f, true);
-                    // With a player character present, Play hands WASD/Space to the character
-                    // (the editor free-fly would otherwise capture those keys via editorFlyCameraKey).
-                    // Without one, keep free-fly so you can fly around the running simulation.
-                    const bool hasPlayerCharacter = std::any_of(
-                        editorMeshEntities.begin(), editorMeshEntities.end(),
-                        [](const MeshSceneEntity& m) { return m.hasCharacterController && m.characterController.enabled; });
-                    cameraController.SetFreeCameraEnabled(!hasPlayerCharacter);
-                    runtimeSession->Start(SceneManager::Instance().GetCurrentScene());
-                    rebuildEditorPhysicsWorld();
-                    editorCharacterStates.clear();
-                    // Audio: create (+ playOnStart-start) each entity's AudioSource for this Play session.
-                    entityAudioSources.clear();
-                    if (audioEngine.IsInitialized())
-                    {
-                        for (const MeshSceneEntity& audioMesh : editorMeshEntities)
-                        {
-                            if (!audioMesh.hasAudioSource || !audioMesh.audioSource.enabled ||
-                                audioMesh.audioSource.clipAssetId.empty())
-                                continue;
-                            const std::string clipPath = editorImGui.AudioClipFilePath(audioMesh.audioSource.clipAssetId);
-                            if (clipPath.empty())
-                                continue;
-                            ixaudio::AudioSourceRuntime rt;
-                            if (audioEngine.CreateSource(rt, audioMesh.audioSource, clipPath))
-                            {
-                                if (audioMesh.audioSource.playOnStart)
-                                    audioEngine.StartSource(rt);
-                                entityAudioSources[audioMesh.id] = std::move(rt);
-                            }
-                        }
-                    }
-                    // Scripting: spin up the subsystem and create one live instance per scripted entity,
-                    // firing OnStart now. A throwing hook must not abort Play, so isolate every call.
-                    entityScripts.clear();
-                    scriptSystem = std::make_unique<ixscript::ScriptSystem>(scriptApi);
-                    for (const MeshSceneEntity& scriptMesh : editorMeshEntities)
-                    {
-                        if (!scriptMesh.hasScript || !scriptMesh.script.enabled)
-                            continue;
-                        std::unique_ptr<ixscript::ScriptInstance> instance =
-                            scriptSystem->CreateInstance(scriptMesh.id, scriptMesh.script);
-                        if (!instance)
-                            continue;
-                        try
-                        {
-                            instance->OnStart();
-                        }
-                        catch (const std::exception& e)
-                        {
-                            TraceError("[SCRIPT] OnStart threw entity=%u: %s", scriptMesh.id, e.what());
-                        }
-                        catch (...)
-                        {
-                            TraceError("[SCRIPT] OnStart threw entity=%u (unknown)", scriptMesh.id);
-                        }
-                        entityScripts[scriptMesh.id] = std::move(instance);
-                    }
-                    Tracenf("[SCRIPT] Play started: %zu live script instance(s)", entityScripts.size());
-                    editorPlayerLookDx = 0.0f;
-                    editorPlayerLookDy = 0.0f;
-                    editorPlay.state.frameCount = 0;
-                    editorPlay.state.elapsedSeconds = 0.0;
-                    editorPlay.appliedMode = editorPlay.state.mode;
+                    startPlaySession();
                     Tracen("[EDIT-PLAY] Default runtime Play mode enabled (no player UI, network, or character)");
                     Tracen("[EDIT-PLAY] Play Mode active");
                 }
@@ -10562,37 +10742,7 @@ int RunGame(NativeWindow& window,
             const std::optional<WorldCamera> gameViewCamera = [&]() -> std::optional<WorldCamera> {
                 if (!gameViewOk || !runtimeSession->IsMapEditorOpen() || !editorImGui.IsGameViewVisible())
                     return std::nullopt;
-                const CameraEntity* mainCameraEntity = nullptr;
-                for (const CameraEntity& cameraEntity : editorCameras)
-                {
-                    if (cameraEntity.id == editorMainCameraId)
-                    {
-                        mainCameraEntity = &cameraEntity;
-                        break;
-                    }
-                }
-                if (!mainCameraEntity && !editorCameras.empty())
-                    mainCameraEntity = &editorCameras.front();
-                if (!mainCameraEntity)
-                    return std::nullopt;
-                CameraEntity gameCameraEntity = *mainCameraEntity;
-                if (editorPlay.state.mode == EditorPlayMode::Play)
-                {
-                    for (const MeshSceneEntity& characterMesh : editorMeshEntities)
-                    {
-                        if (!characterMesh.hasCharacterController || !characterMesh.characterController.enabled)
-                            continue;
-                        auto stateIt = editorCharacterStates.find(characterMesh.id);
-                        if (stateIt == editorCharacterStates.end() || !stateIt->second.initialized)
-                            continue;
-                        phys::CharacterControllerComponent cc = characterMesh.characterController;
-                        phys::Sanitize(cc);
-                        gameCameraEntity = ComputeCharacterCameraEntity(
-                            *mainCameraEntity, characterMesh, cc, stateIt->second);
-                        break;
-                    }
-                }
-                return BuildCameraFromEntity(gameCameraEntity, gameView.Width(), gameView.Height());
+                return buildGameCamera(gameView.Width(), gameView.Height());
             }();
             if (!drawSceneView && gameViewCamera)
                 shadowCamera = &*gameViewCamera;
@@ -11888,6 +12038,7 @@ int RunGame(NativeWindow& window,
     // Wait out any in-flight game-script build so its worker thread can't outlive this scope.
     // (GameScriptBuildService joins its worker; paths are captured by value — no RunGame refs.)
     gameScriptBuild.Shutdown();
+    gamePackage.Shutdown();
     // Closing the window while still in Play must still honor the script lifecycle: fire OnDestroy on
     // every live instance before the maps unwind (their dtors would otherwise free without the hook).
     for (auto& [scriptEntityId, instance] : entityScripts)

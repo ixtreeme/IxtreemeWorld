@@ -21,6 +21,7 @@ void EditorImGui::RenderEditorPanels()
     RenderScriptsPanel();
     RenderInspector();
     RenderBuildOutputPanel();
+    RenderBuildGamePopup();
     RenderSceneViewDropTarget();
     RenderGameViewPanel();
     RenderAnimatorPanel();

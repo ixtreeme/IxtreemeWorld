@@ -103,6 +103,10 @@ void EditorImGui::RenderMenuBar()
             }
             ImGui::EndMenu();
         }
+        ImGui::Separator();
+        if (ImGui::MenuItem(ICON_FA_HAMMER "  Build Game...", nullptr, false,
+                editing && projects.HasProject() && !IsGameBuildRunning() && !IsBuildRunning()))
+            OpenBuildGameDialog();
         ImGui::EndMenu();
     }
     if (ImGui::BeginMenu("Edit"))
@@ -739,13 +743,152 @@ void EditorImGui::RenderBuildOutputPanel()
             ImGui::TextColored(ImVec4(0.35f, 0.90f, 0.35f, 1.0f), "Build succeeded — module reloaded.");
         else if (m_buildState == ScriptBuildState::Done)
             ImGui::TextColored(ImVec4(0.95f, 0.35f, 0.35f, 1.0f), "Build FAILED — see the log below.");
+
+        // "Build Game" status, with the finished game one click away.
+        if (m_gameBuildState == ScriptBuildState::Running)
+        {
+            ImGui::TextColored(ImVec4(0.95f, 0.74f, 0.30f, 1.0f),
+                "Building the game... (the first time this also compiles the runtime player: several minutes)");
+        }
+        else if (m_gameBuildState == ScriptBuildState::Done && m_gameBuildSucceeded)
+        {
+            ImGui::TextColored(ImVec4(0.35f, 0.90f, 0.35f, 1.0f), "Game built: %s",
+                m_gameBuildExecutable.generic_string().c_str());
+            ImGui::SameLine();
+            std::string openError;
+            if (ImGui::SmallButton("Run Game") && !platform::OpenInDefaultApp(m_gameBuildExecutable, &openError))
+                m_projectStatus = "Run failed: " + openError;
+            ImGui::SameLine();
+            if (ImGui::SmallButton("Open Folder") &&
+                !platform::OpenInDefaultApp(m_gameBuildExecutable.parent_path(), &openError))
+                m_projectStatus = "Open folder failed: " + openError;
+        }
+        else if (m_gameBuildState == ScriptBuildState::Done)
+        {
+            ImGui::TextColored(ImVec4(0.95f, 0.35f, 0.35f, 1.0f), "Game build FAILED — see the log below.");
+        }
         ImGui::Separator();
         ImGui::BeginChild("##buildlog", ImVec2(0, 0), ImGuiChildFlags_Borders,
             ImGuiWindowFlags_HorizontalScrollbar);
-        ImGui::TextUnformatted(m_buildLog.empty() ? "(no output)" : m_buildLog.c_str());
+        if (m_gameBuildState == ScriptBuildState::Done)
+        {
+            ImGui::TextUnformatted(m_gameBuildLog.empty() ? "(no output)" : m_gameBuildLog.c_str());
+            if (!m_buildLog.empty())
+                ImGui::Separator();
+        }
+        if (m_gameBuildState != ScriptBuildState::Done || !m_buildLog.empty())
+            ImGui::TextUnformatted(m_buildLog.empty() ? "(no output)" : m_buildLog.c_str());
         ImGui::EndChild();
     }
     ImGui::End();
+}
+
+void EditorImGui::OpenBuildGameDialog()
+{
+    ProjectManager& projects = ProjectManager::Instance();
+    if (!projects.HasProject())
+        return;
+    const std::string name = projects.CurrentProject().name.empty() ? "Game" : projects.CurrentProject().name;
+    CopyToBuffer(m_buildGameName, sizeof(m_buildGameName), name);
+    // Default output: <Project>/Build/<Name> (a "build" folder: the asset database and the package
+    // copy both skip it, so the game never ends up inside itself).
+    std::string folderName;
+    for (char c : name)
+        folderName.push_back(std::isalnum(static_cast<unsigned char>(c)) || c == '-' ? c : '_');
+    const std::string defaultOutput = (projects.ProjectRoot() / "Build" / folderName).string();
+    if (m_buildGameOutputDir[0] == '\0' ||
+        std::string(m_buildGameOutputDir).rfind(projects.ProjectRoot().string(), 0) != 0)
+        CopyToBuffer(m_buildGameOutputDir, sizeof(m_buildGameOutputDir), defaultOutput);
+
+    // Start in the project's startup scene, else the open scene.
+    m_buildGameStartupScene = projects.CurrentProject().startupScene;
+    if (m_buildGameStartupScene.empty())
+    {
+        const std::string current = SceneManager::Instance().GetCurrentScenePath();
+        std::error_code ec;
+        const std::filesystem::path relative = std::filesystem::relative(current, projects.ProjectRoot(), ec);
+        if (!current.empty() && !ec)
+            m_buildGameStartupScene = relative.generic_string();
+    }
+    // Compile the C++ game scripts first when the project has any.
+    m_buildGameCompileScripts = false;
+    if (m_assetLibrary)
+    {
+        for (const AssetLibrary::Entry& entry : m_assetLibrary->EntriesFor(AssetLibrary::Category::Script))
+            m_buildGameCompileScripts = m_buildGameCompileScripts || ToLowerAscii(entry.filename).ends_with(".cpp");
+    }
+    m_openBuildGamePopup = true;
+}
+
+void EditorImGui::RenderBuildGamePopup()
+{
+    if (m_openBuildGamePopup)
+    {
+        ImGui::OpenPopup("Build Game");
+        m_openBuildGamePopup = false;
+    }
+    if (!ImGui::BeginPopupModal("Build Game", nullptr, ImGuiWindowFlags_AlwaysAutoResize))
+        return;
+
+    ProjectManager& projects = ProjectManager::Instance();
+    ImGui::TextUnformatted("Package this project as a game that runs without the editor.");
+    ImGui::Separator();
+    ImGui::SetNextItemWidth(360.0f);
+    ImGui::InputText("Game name", m_buildGameName, sizeof(m_buildGameName));
+    ImGui::SetNextItemWidth(560.0f);
+    ImGui::InputText("Output folder", m_buildGameOutputDir, sizeof(m_buildGameOutputDir));
+
+    ImGui::SetNextItemWidth(360.0f);
+    const std::string preview = m_buildGameStartupScene.empty() ? std::string("(choose a scene)") : m_buildGameStartupScene;
+    if (ImGui::BeginCombo("Startup scene", preview.c_str()))
+    {
+        for (const AssetLibrary::Entry& scene : QuerySceneAssets())
+        {
+            std::error_code ec;
+            const std::filesystem::path relative = std::filesystem::relative(scene.originalPath, projects.ProjectRoot(), ec);
+            const std::string label = relative.generic_string();
+            if (ec || label.empty() || label.rfind("..", 0) == 0)
+                continue;  // the game can only start in a scene that is part of the project
+            if (ImGui::Selectable(label.c_str(), label == m_buildGameStartupScene))
+                m_buildGameStartupScene = label;
+        }
+        ImGui::EndCombo();
+    }
+    ImGui::Checkbox("Compile the C++ game scripts first", &m_buildGameCompileScripts);
+    ImGui::Checkbox("Run the game when it is built", &m_buildGameRunWhenDone);
+    ImGui::TextDisabled("The folder gets <Game name>.exe, the engine runtime files and the project (Game/).");
+    ImGui::TextDisabled("The project and the open scene are saved first. The first build also compiles the");
+    ImGui::TextDisabled("editor-less runtime player, which takes several minutes.");
+
+    const bool canBuild = m_buildGameName[0] != '\0' && m_buildGameOutputDir[0] != '\0' &&
+        !m_buildGameStartupScene.empty() && CanUseEditorTools() && !IsGameBuildRunning() && !IsBuildRunning();
+    ImGui::Separator();
+    if (!canBuild)
+        ImGui::BeginDisabled();
+    if (ImGui::Button("Build", ImVec2(120.0f, 0.0f)))
+    {
+        // The package is made from what is on disk: save first.
+        if (SaveProjectAndCurrentScene(false))
+        {
+            m_commands.buildGame = true;
+            m_commands.buildGameName = m_buildGameName;
+            m_commands.buildGameOutputDir = m_buildGameOutputDir;
+            m_commands.buildGameStartupScene = m_buildGameStartupScene;
+            m_commands.buildGameCompileScripts = m_buildGameCompileScripts;
+            m_commands.buildGameRunWhenDone = m_buildGameRunWhenDone;
+            m_gameBuildState = ScriptBuildState::Running;  // until EngineApplication reports back
+            m_buildOutputPanelOpen = true;
+            ImGui::CloseCurrentPopup();
+        }
+    }
+    if (!canBuild)
+        ImGui::EndDisabled();
+    ImGui::SameLine();
+    if (ImGui::Button("Cancel", ImVec2(120.0f, 0.0f)) || ImGui::IsKeyPressed(ImGuiKey_Escape))
+        ImGui::CloseCurrentPopup();
+    if (!m_projectStatus.empty())
+        ImGui::TextDisabled("%s", m_projectStatus.c_str());
+    ImGui::EndPopup();
 }
 
 void EditorImGui::RenderSceneSettingsPanel()

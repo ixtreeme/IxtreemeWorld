@@ -828,6 +828,13 @@ struct MapEditorCommands
     bool pausePlayMode = false;
     bool resumePlayMode = false;
     bool buildGameScripts = false;  // compile <ProjectRoot>/Scripts into the game-module DLL + reload
+    // "Build Game": package the project into a folder that runs without the editor.
+    bool buildGame = false;
+    std::string buildGameName;
+    std::string buildGameOutputDir;
+    std::string buildGameStartupScene;   // project-relative
+    bool buildGameCompileScripts = false;
+    bool buildGameRunWhenDone = false;
     bool addWaterBody = false;
     bool createTerrain = false;
     TerrainSceneData terrainCreate;
