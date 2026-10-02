@@ -379,6 +379,15 @@ private:
     std::vector<LastMaterialBinding> m_lastMaterialBindings;
     std::unique_ptr<ixrhi::IXRHIBindGroupLayout> m_bindLayout;
     std::unique_ptr<ixrhi::IXRHIBindGroup> m_bindGroup;
+    // Textures/samplers each bind slot's descriptors currently point at (baseColor, normal, orm), so a
+    // draw re-binding the same material skips the descriptor writes. The bind group keeps every bound
+    // resource alive, so a stored pointer cannot be reused by another texture meanwhile.
+    struct BoundSlotTexture
+    {
+        const ixrhi::IXRHITexture* texture = nullptr;
+        const ixrhi::IXRHISampler* sampler = nullptr;
+    };
+    std::array<std::array<BoundSlotTexture, 3>, kFramesInFlight * kUniformSlots> m_boundSlotTextures{};
     // Pipeline variants (same 5 as before; mask reuses the lit fragment shader):
     // opaque, alpha-mask, unlit, unlit alpha-mask, selection outline.
     std::unique_ptr<ixrhi::IXRHIGraphicsPipeline> m_pipeline;

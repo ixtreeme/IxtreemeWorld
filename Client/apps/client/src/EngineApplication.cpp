@@ -10600,13 +10600,19 @@ int RunGame(NativeWindow& window,
             std::vector<WorldLabelRenderer::Label> plates;
             if (isInWorld && drawSceneView)
             {
-                if (hasSceneTerrain)
-                {
+                // Into the offscreen target (its pass clears depth) the terrain is drawn after the
+                // opaque meshes, so the terrain they cover is depth-rejected instead of shaded (with
+                // its shadow lookups) and overdrawn. Direct swapchain rendering keeps the old order.
+                const bool terrainAfterMeshes = useOffscreenScene;
+                auto renderSceneTerrain = [&](bool clearDepth) {
                     frameSceneRenderCalled = true;
                     rhiDevice->WriteTimestamp(ixrhi::IXRHITimestampPoint::TerrainMainBegin);
-                    terrain.Render(*frameInfo.commandList, frameInfo, camera, renderSize.width, renderSize.height);
+                    terrain.Render(*frameInfo.commandList, frameInfo, camera, renderSize.width, renderSize.height,
+                        /*viewIndex=*/0, clearDepth);
                     rhiDevice->WriteTimestamp(ixrhi::IXRHITimestampPoint::TerrainMainEnd);
-                }
+                };
+                if (hasSceneTerrain && !terrainAfterMeshes)
+                    renderSceneTerrain(true);
                 rhiDevice->WriteTimestamp(ixrhi::IXRHITimestampPoint::SceneOtherBegin);
 
                 plates.reserve(entities.size());
@@ -11128,6 +11134,8 @@ int RunGame(NativeWindow& window,
                     previousFrameNonLodInitialized = true;
                     previousCulledMeshLogSet = std::move(currentCulledMeshLogSet);
                 }
+                if (hasSceneTerrain && terrainAfterMeshes)
+                    renderSceneTerrain(false);
                 if (selectionOutlinesOk)
                 {
                     std::vector<SelectionOutlineRenderer::Line> selectionLines =
@@ -11401,10 +11409,8 @@ int RunGame(NativeWindow& window,
                         // (viewIndex=1) so it can be drawn from the Main Camera without
                         // clobbering the Scene View's water; reflection/refraction reuse this
                         // frame's Scene-view textures (acceptable; per-view RTs are a refinement).
-                        if (hasSceneTerrain)
-                        {
-                            terrain.Render(*frameInfo.commandList, frameInfo, gameCamera, gameExtent.width, gameExtent.height, /*viewIndex=*/1);
-                        }
+                        // The terrain is drawn after the opaque meshes (see the Scene View): the
+                        // Game view pass clears depth, so the terrain needs no clear of its own.
                         if (isInWorld)
                         {
                             // Batch + frustum-cull the Game view meshes (mirroring the Scene
@@ -11462,6 +11468,8 @@ int RunGame(NativeWindow& window,
                         }
                         if (hasSceneTerrain)
                         {
+                            terrain.Render(*frameInfo.commandList, frameInfo, gameCamera, gameExtent.width, gameExtent.height,
+                                /*viewIndex=*/1, /*clearDepth=*/false);
                             terrain.RenderWater(*frameInfo.commandList, frameInfo, gameCamera, seconds, gameExtent.width, gameExtent.height, /*viewIndex=*/1);
                         }
                         gameView.EndMainPass(*frameInfo.commandList);
@@ -11469,9 +11477,18 @@ int RunGame(NativeWindow& window,
                 }
 #endif
                 beginMainPass(); // composite + labels + UI share one swapchain pass
-                rhiDevice->WriteTimestamp(ixrhi::IXRHITimestampPoint::CompositeBegin);
-                offscreenScene.RenderComposite(*frameInfo.commandList, frameInfo);
-                rhiDevice->WriteTimestamp(ixrhi::IXRHITimestampPoint::CompositeEnd);
+                // The editor shows the offscreen scene as its Scene View panel image: a full-window
+                // composite of it under the editor UI would only be covered (the pass clears instead).
+                bool compositeScene = true;
+#if defined(IXTREEME_WITH_EDITOR)
+                compositeScene = !(runtimeSession->IsMapEditorOpen() && editorImGui.ShowsSceneViewAsPanel());
+#endif
+                if (compositeScene)
+                {
+                    rhiDevice->WriteTimestamp(ixrhi::IXRHITimestampPoint::CompositeBegin);
+                    offscreenScene.RenderComposite(*frameInfo.commandList, frameInfo);
+                    rhiDevice->WriteTimestamp(ixrhi::IXRHITimestampPoint::CompositeEnd);
+                }
                 if (isInWorld && worldLabelsOk)
                     worldLabels.Render(*frameInfo.commandList, frameInfo, camera, plates);
             }

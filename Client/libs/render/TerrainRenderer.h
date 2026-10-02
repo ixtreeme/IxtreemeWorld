@@ -157,7 +157,10 @@ public:
                 const WorldCamera& camera,
                 std::uint32_t targetWidth = 0,
                 std::uint32_t targetHeight = 0,
-                uint32_t viewIndex = 0);
+                uint32_t viewIndex = 0,
+                bool clearDepth = true);
+    // clearDepth = false: the pass already cleared depth and opaque meshes were drawn first, so
+    // the terrain they cover is rejected by the depth test instead of being shaded and overdrawn.
     // viewIndex selects the camera-uniform path: 0 = primary (Scene View / free-fly),
     // 1 = secondary (Game view / Main Camera). Mirrors TerrainRenderer::Render.
     void RenderWater(ixrhi::IXRHICommandList& cmd,

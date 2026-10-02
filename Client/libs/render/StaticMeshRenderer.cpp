@@ -2579,12 +2579,18 @@ void StaticMeshRenderer::UpdateMaterialTextureDescriptors(uint32_t frameIndex,
         return;
 
     const uint32_t slot = frameIndex * kUniformSlots + uniformSlot;
-    if (textures.baseColor.texture && textures.baseColor.sampler)
-        m_bindGroup->UpdateTexture(slot, 1, textures.baseColor.texture, textures.baseColor.sampler);
-    if (textures.normal.texture && textures.normal.sampler)
-        m_bindGroup->UpdateTexture(slot, 2, textures.normal.texture, textures.normal.sampler);
-    if (textures.orm.texture && textures.orm.sampler)
-        m_bindGroup->UpdateTexture(slot, 3, textures.orm.texture, textures.orm.sampler);
+    std::array<BoundSlotTexture, 3>& bound = m_boundSlotTextures[slot];
+    auto update = [&](std::uint32_t binding, const MaterialTexture& material, BoundSlotTexture& current) {
+        if (!material.texture || !material.sampler)
+            return;
+        if (current.texture == material.texture.get() && current.sampler == material.sampler.get())
+            return;  // already bound: skip the descriptor write
+        m_bindGroup->UpdateTexture(slot, binding, material.texture, material.sampler);
+        current = {material.texture.get(), material.sampler.get()};
+    };
+    update(1, textures.baseColor, bound[0]);
+    update(2, textures.normal, bound[1]);
+    update(3, textures.orm, bound[2]);
 }
 
 bool StaticMeshRenderer::CreateBindGroup(ixrhi::IXRHIDevice& rhi)
@@ -2624,6 +2630,9 @@ bool StaticMeshRenderer::CreateBindGroup(ixrhi::IXRHIDevice& rhi)
                 m_bindGroup->UpdateTexture(slot, 2, m_normalTexture.image, m_normalTexture.sampler);
             if (m_ormTexture.image && m_ormTexture.sampler)
                 m_bindGroup->UpdateTexture(slot, 3, m_ormTexture.image, m_ormTexture.sampler);
+            m_boundSlotTextures[slot] = {{{m_texture.image.get(), m_texture.sampler.get()},
+                {m_normalTexture.image.get(), m_normalTexture.sampler.get()},
+                {m_ormTexture.image.get(), m_ormTexture.sampler.get()}}};
             m_bindGroup->UpdateBuffer(slot, 4, m_instanceBuffers[frame], 0, instanceBytes);
         }
     }
@@ -3079,8 +3088,9 @@ void StaticMeshRenderer::RenderLodBatchInWorld(ixrhi::IXRHICommandList& cmd,
             materialSlots[1],
             materialSlots[2]);
     }
-    m_lastMaterialBindings.clear();
-    m_lastMaterialBindings.reserve(drawCommands.size());
+    // The bindings of this call are written over the previous call's records (reusing their strings'
+    // buffers): rebuilt every draw of every frame, fresh strings were allocations per draw.
+    std::size_t materialBindingCount = 0;
     const ixrhi::IXRHIGraphicsPipeline* boundPipeline = nullptr;
     // The texture descriptors and the world uniform are bound once per draw call, so one instanced
     // draw may only cover instances that share this slot's material: split each command into runs of
@@ -3153,29 +3163,29 @@ void StaticMeshRenderer::RenderLodBatchInWorld(ixrhi::IXRHICommandList& cmd,
             UpdateWorldUniform(frameIndex, uniformSlot, camera, runInstance, timeSeconds, draw.materialSlot);
             UpdateMaterialTextureDescriptors(frameIndex, uniformSlot, materialTextures);
             const uint32_t bindSlot = frameIndex * kUniformSlots + uniformSlot;
-            LastMaterialBinding binding{};
+            if (materialBindingCount == m_lastMaterialBindings.size())
+                m_lastMaterialBindings.emplace_back();
+            LastMaterialBinding& binding = m_lastMaterialBindings[materialBindingCount++];
             binding.sourceSubmesh = draw.sourceSubmesh;
             binding.materialSlot = draw.materialSlot;
             binding.bindSlot = bindSlot;
-            binding.baseColorTexture = materialTextures.baseColor.texture
-                ? materialTextures.baseColor.texture->DebugName()
-                : std::string();
-            binding.normalTexture = materialTextures.normal.texture
-                ? materialTextures.normal.texture->DebugName()
-                : std::string();
-            binding.ormTexture = materialTextures.orm.texture
-                ? materialTextures.orm.texture->DebugName()
-                : std::string();
+            auto assignName = [](std::string& target, const auto& resource) {
+                if (resource)
+                    target.assign(resource->DebugName());
+                else
+                    target.clear();
+            };
+            assignName(binding.baseColorTexture, materialTextures.baseColor.texture);
+            assignName(binding.normalTexture, materialTextures.normal.texture);
+            assignName(binding.ormTexture, materialTextures.orm.texture);
             binding.resolvedMaterial = materialTextures.resolvedMaterial;
             binding.baseColorTextureGuid = materialTextures.baseColorTextureGuid;
             binding.alphaMode = materialTextures.alphaMode;
             binding.alphaCutoff = materialTextures.alphaCutoff;
             binding.fragmentShaderAlphaPath = materialTextures.fragmentShaderAlphaPath;
             binding.unlit = materialTextures.unlit;
-            binding.pipelineName =
-                pipelineForDraw ? pipelineForDraw->DebugName() : std::string();
+            assignName(binding.pipelineName, pipelineForDraw);
             binding.boundBeforeDraw = true;
-            m_lastMaterialBindings.push_back(std::move(binding));
             ++m_lastMaterialUniformUpdates;
             cmd.BindGroup(0, *m_bindGroup, bindSlot);
             const auto inRun = [&](std::size_t index) {
@@ -3225,6 +3235,7 @@ void StaticMeshRenderer::RenderLodBatchInWorld(ixrhi::IXRHICommandList& cmd,
     };
     drawPass(false);
     drawPass(true);
+    m_lastMaterialBindings.resize(materialBindingCount);
     if (m_outlinePipeline)
     {
         std::vector<std::uint32_t> outlinedInstances;

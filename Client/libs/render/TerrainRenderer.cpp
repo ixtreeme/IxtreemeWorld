@@ -2199,7 +2199,8 @@ void TerrainRenderer::Render(ixrhi::IXRHICommandList& cmd,
                              const WorldCamera& camera,
                              std::uint32_t targetWidth,
                              std::uint32_t targetHeight,
-                             uint32_t viewIndex)
+                             uint32_t viewIndex,
+                             bool clearDepth)
 {
     static bool loggedDraw = false;
     static bool loggedSkip = false;
@@ -2230,7 +2231,8 @@ void TerrainRenderer::Render(ixrhi::IXRHICommandList& cmd,
 
     // Depth-only clear over the draw area (parity with the pre-migration
     // native depth clear inside the outer pass).
-    cmd.ClearDepth(1.0f, 0, 0, extentWidth, extentHeight);
+    if (clearDepth)
+        cmd.ClearDepth(1.0f, 0, 0, extentWidth, extentHeight);
 
     cmd.SetViewport(0.0f, 0.0f, static_cast<float>(extentWidth), static_cast<float>(extentHeight));
     cmd.SetScissor(0, 0, extentWidth, extentHeight);

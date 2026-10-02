@@ -75,6 +75,12 @@ public:
     bool IsGameViewVisible() const { return m_gameViewVisible; }
     // Whether the Scene View panel was visible last frame (e.g. not behind the Game tab in Play).
     bool IsSceneViewVisible() const { return !m_editorModeActive || m_sceneViewVisible; }
+    // The editor UI is up and shows the offscreen scene as its Scene View panel image (so a full-window
+    // composite of that scene under the UI would be covered by it).
+    bool ShowsSceneViewAsPanel() const
+    {
+        return m_editorModeActive && m_textureProvider && m_textureProvider->GetSceneViewTexture() != nullptr;
+    }
 
     // Script text prompts (IScriptApi::PromptText) drawn as small modal-less dialogs during Play. The
     // engine hands the open prompts in each frame and collects the answers after RenderPanels. Secret
