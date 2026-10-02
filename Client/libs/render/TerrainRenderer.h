@@ -112,6 +112,10 @@ public:
     bool HasTerrain() const { return m_sceneTerrainActive; }
     bool IsMapLoadedForDiagnostics() const { return m_mapLoaded; }
     TerrainSceneData GetTerrainSceneData() const;
+    // Same, filled into `out` reusing its grid buffers (no allocation once sized): for per-frame snapshots.
+    void GetTerrainSceneData(TerrainSceneData& out) const;
+    // Everything but the height/attribute/splat grids (name, size, flags): cheap, unlike the above.
+    TerrainSceneData GetTerrainSceneInfo() const;
     void SetTerrainSceneData(const TerrainSceneData& terrain);
     bool RecreatePipeline(ixrhi::IXRHIDevice& rhi);
     // Borrowed IXRHI pass token (null = backend default, i.e. the swapchain pass).
@@ -163,6 +167,9 @@ public:
                      std::uint32_t targetWidth = 0,
                      std::uint32_t targetHeight = 0,
                      uint32_t viewIndex = 0);
+    // Records the copy of sculpted vertices into the drawn (video memory) vertex buffer. Call once per
+    // frame outside any render pass, before the terrain is drawn.
+    void UploadEditedVertices(ixrhi::IXRHICommandList& cmd);
     void RenderSunShadowMap(ixrhi::IXRHICommandList& cmd,
                             const ixrhi::IXRHIFrameInfo& frame,
                             const WorldCamera& camera);
@@ -346,6 +353,9 @@ private:
     bool CreateFlatBuffers(ixrhi::IXRHIDevice& rhi);
     bool CreateMapBuffers(ixrhi::IXRHIDevice& rhi, const std::string& mapDirectory, int32_t serverX, int32_t serverY);
     void BuildTerrainChunkDraws(const std::vector<Vertex>& vertices, std::vector<uint32_t>& indices);
+    // Grows the culling bounds of the chunks under edited vertices (sculpt writes heights straight
+    // into the vertex buffer, after the bounds were built).
+    void ExpandTerrainChunkBounds(const Vertex* vertices, std::size_t count);
     bool CreateFallbackTexture(ixrhi::IXRHIDevice& rhi);
     bool CreateFallbackMask(ixrhi::IXRHIDevice& rhi);
     bool CreateFallbackSplatTextures(ixrhi::IXRHIDevice& rhi);
@@ -446,6 +456,9 @@ private:
     void UndoLastEditorStroke(ixrhi::IXRHIDevice& rhi);
     void MarkHeightDirty(size_t heightIndex);
     void MarkSplatDirty(size_t splatIndex);
+    // Highest painted splat layer + 1 (the shader's layer loop bound). Scanning both splat maps is
+    // ~1 ms at 512 m, so it is cached until the splat data changes.
+    uint32_t ActiveSplatLayerSpan();
     bool RefreshSplatTextures(ixrhi::IXRHIDevice& rhi);
     bool SaveDirtyChunks();
     bool SaveWorldPalette() const;
@@ -463,7 +476,9 @@ private:
     std::string m_waterMaterialEdgeSignature;
     std::vector<std::filesystem::path> m_additionalAssetRoots;
     WaterMaterialData m_defaultWaterMaterial;
-    std::shared_ptr<ixrhi::IXRHIBuffer> m_vertexBuffer;
+    std::shared_ptr<ixrhi::IXRHIBuffer> m_vertexBuffer;      // drawn: video memory
+    std::shared_ptr<ixrhi::IXRHIBuffer> m_vertexEditBuffer;  // host-visible copy the sculpt reads/writes
+    bool m_vertexBufferUploadPending = false;                // edit copy changed: UploadEditedVertices
     std::shared_ptr<ixrhi::IXRHIBuffer> m_indexBuffer;
     std::shared_ptr<ixrhi::IXRHIBuffer> m_debugVertexBuffer;
     std::shared_ptr<ixrhi::IXRHIBuffer> m_debugIndexBuffer;
@@ -561,6 +576,7 @@ private:
     bool m_waterSculptBrushVisible = false;
     bool m_waterSculptBrushAddMode = true;
     bool m_editorSplatGpuDirty = false;
+    std::int32_t m_activeSplatLayerSpan = -1;  // ActiveSplatLayerSpan() cache; -1 = splat data changed
     bool m_editorSaveRequested = false;
     bool m_editorReloadRequested = false;
     bool m_editorUndoRequested = false;

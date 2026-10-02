@@ -17,6 +17,14 @@ EditorSceneRuntime::EditorSceneRuntime(Context context)
 SceneData EditorSceneRuntime::BuildSceneSnapshot() const
 {
     SceneData scene;
+    BuildSceneSnapshot(scene);
+    return scene;
+}
+
+void EditorSceneRuntime::BuildSceneSnapshot(SceneData& scene, bool includeTerrainGrids) const
+{
+    TerrainSceneData terrainBuffers = std::move(scene.terrain);  // keeps the grid capacity
+    scene = SceneData{};
     scene.physics = SceneManager::Instance().GetCurrentScene().physics;
     if (m_context.editorImGui)
         scene.lighting = m_context.editorImGui->GetLightingState();
@@ -37,14 +45,21 @@ SceneData EditorSceneRuntime::BuildSceneSnapshot() const
 
     if (m_context.terrainOk && m_context.terrain)
     {
-        scene.terrain = m_context.terrain->GetTerrainSceneData();
+        if (includeTerrainGrids)
+        {
+            scene.terrain = std::move(terrainBuffers);
+            m_context.terrain->GetTerrainSceneData(scene.terrain);
+        }
+        else
+        {
+            scene.terrain = m_context.terrain->GetTerrainSceneInfo();
+        }
         scene.paletteSlots = m_context.terrain->GetPaletteSlots();
     }
     else if (m_context.runtimeSession)
     {
         scene.paletteSlots = m_context.runtimeSession->GetPaletteSlots();
     }
-    return scene;
 }
 
 void EditorSceneRuntime::ApplySceneData(const SceneData& scene)

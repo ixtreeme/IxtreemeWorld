@@ -114,6 +114,7 @@ bool IXVulkanDevice::EnsureSwapchainObjects()
                 tag);
         }
         m_imagesInFlight.assign(imageCount, VK_NULL_HANDLE);
+        m_imageLastFrame.assign(imageCount, 0);
     }
     return true;
 }
@@ -159,6 +160,7 @@ void IXVulkanDevice::TeardownFrameObjects()
         vkDestroySemaphore(NativeDevice(), sem, nullptr);
     m_renderFinished.clear();
     m_imagesInFlight.clear();
+    m_imageLastFrame.clear();
     if (m_queryPool != VK_NULL_HANDLE)
     {
         vkDestroyQueryPool(NativeDevice(), m_queryPool, nullptr);
@@ -291,7 +293,19 @@ ixrhi::IXRHIFrame IXVulkanDevice::BeginFrame()
     }
     m_activeImage = imageIndex;
 
-    if (m_imagesInFlight[imageIndex] != VK_NULL_HANDLE)
+    // The image's previous frame must be finished before it is rendered again. Every frame older than
+    // frameNumber - kSlots + 1 is already known finished: the slot fence just waited on belongs to frame
+    // frameNumber - kSlots, and each older one was waited on the same way. The stored fence is a slot's
+    // fence object, reused every kSlots frames: for an image last rendered kSlots or more frames ago it
+    // now belongs to a newer frame, and waiting on it waited for the previous frame instead, which
+    // serialized CPU and GPU (with 3 swapchain images and 2 slots, every frame). So wait only for an
+    // image whose frame may still run, while its fence still belongs to that frame.
+    const std::uint64_t frameNumber = m_tracker.GetFrameNumber();
+    const std::uint64_t lastUsePlusOne = m_imageLastFrame[imageIndex];  // 0 = not rendered yet
+    m_imageLastFrame[imageIndex] = frameNumber + 1u;
+    const bool imageFrameMayRun = lastUsePlusOne != 0 &&
+        (lastUsePlusOne - 1u) + IXVulkanFrameTracker::kSlots > frameNumber;
+    if (m_imagesInFlight[imageIndex] != VK_NULL_HANDLE && imageFrameMayRun)
     {
         waitStart = std::chrono::steady_clock::now();
         CheckVk(vkWaitForFences(NativeDevice(), 1, &m_imagesInFlight[imageIndex], VK_TRUE, UINT64_MAX),
@@ -487,6 +501,7 @@ void IXVulkanDevice::Shutdown()
         m_slots = {};
         m_renderFinished.clear();
         m_imagesInFlight.clear();
+        m_imageLastFrame.clear();
         m_swapchain.reset();
         m_queryPool = VK_NULL_HANDLE;
         m_uploadPool = VK_NULL_HANDLE;

@@ -1140,6 +1140,7 @@ void EditorImGui::RenderScriptsPanel()
 {
     if (!m_editorModeActive)
         return;
+    DockBesideIfUnplaced("Scripts", "Asset Browser");
     if (!ImGui::Begin("Scripts"))
     {
         ImGui::End();
@@ -1157,7 +1158,7 @@ void EditorImGui::RenderScriptsPanel()
     if (!canBuild)
         ImGui::EndDisabled();
     ImGui::SameLine();
-    ImGui::TextDisabled("compiles <Project>/Scripts -> Binaries + reloads");
+    ImGui::TextDisabled("compiles Assets/scripts -> Binaries + reloads");
     ImGui::Checkbox("Auto-build on save", &m_autoBuildOnSave);
     ImGui::SameLine();
     ImGui::TextDisabled("(.cpp save -> auto Build in Edit; .lua hot-reloads live in Play)");
@@ -1171,8 +1172,8 @@ void EditorImGui::RenderScriptsPanel()
             m_assetStatus = "Open failed: " + err;
     };
 
-    // --- Native C++ source (<ProjectRoot>/Scripts/*.cpp,*.h) ---
-    ImGui::SeparatorText("C++ source (Scripts/)");
+    // --- Native C++ source (<AssetRoot>/scripts/*.cpp,*.h; <ProjectRoot>/Scripts only holds the build) ---
+    ImGui::SeparatorText("C++ source (Assets/scripts/)");
     if (hasProject && ImGui::Button(ICON_FA_PLUS " New C++ Script"))
     {
         CopyToBuffer(m_newCppScriptName, sizeof(m_newCppScriptName), std::string("MyScript"));
@@ -1204,34 +1205,35 @@ void EditorImGui::RenderScriptsPanel()
     else
     {
         const std::filesystem::path scriptsDir = ProjectScriptSourceDir();
-        std::error_code ec;
-        bool anySource = false;
-        if (std::filesystem::is_directory(scriptsDir, ec))
+        // A recursive scan: cached with the asset browser listings, not redone every frame.
+        ValidateAssetBrowserCache();
+        if (!m_assetBrowserCache.nativeScriptSources)
         {
-            for (const std::filesystem::directory_entry& e :
-                 std::filesystem::recursive_directory_iterator(
-                     scriptsDir, std::filesystem::directory_options::skip_permission_denied, ec))
+            auto& sources = m_assetBrowserCache.nativeScriptSources.emplace();
+            std::error_code ec;
+            if (std::filesystem::is_directory(scriptsDir, ec))
             {
-                if (!e.is_regular_file(ec))
-                    continue;
-                if (e.path().generic_string().find("/build/") != std::string::npos)
-                    continue;
-                std::string ext = e.path().extension().string();
-                std::transform(ext.begin(), ext.end(), ext.begin(),
-                    [](unsigned char c) { return static_cast<char>(std::tolower(c)); });
-                if (ext != ".cpp" && ext != ".h" && ext != ".hpp" && ext != ".cxx" && ext != ".cc")
-                    continue;
-                anySource = true;
-                const std::string rel = std::filesystem::relative(e.path(), scriptsDir, ec).generic_string();
-                ImGui::PushID(rel.c_str());
-                if (ImGui::Selectable((ICON_FA_FILE " " + rel).c_str(), false,
-                        ImGuiSelectableFlags_AllowDoubleClick) &&
-                    ImGui::IsMouseDoubleClicked(ImGuiMouseButton_Left))
+                for (const std::filesystem::directory_entry& e :
+                     std::filesystem::recursive_directory_iterator(
+                         scriptsDir, std::filesystem::directory_options::skip_permission_denied, ec))
                 {
-                    openExternal(e.path());
+                    if (!e.is_regular_file(ec) || !IsNativeScriptSource(scriptsDir, e.path()))
+                        continue;
+                    sources.emplace_back(e.path(), std::filesystem::relative(e.path(), scriptsDir, ec).generic_string());
                 }
-                ImGui::PopID();
             }
+        }
+        const bool anySource = !m_assetBrowserCache.nativeScriptSources->empty();
+        for (const auto& [path, rel] : *m_assetBrowserCache.nativeScriptSources)
+        {
+            ImGui::PushID(rel.c_str());
+            if (ImGui::Selectable((ICON_FA_FILE " " + rel).c_str(), false,
+                    ImGuiSelectableFlags_AllowDoubleClick) &&
+                ImGui::IsMouseDoubleClicked(ImGuiMouseButton_Left))
+            {
+                openExternal(path);
+            }
+            ImGui::PopID();
         }
         if (!anySource)
             ImGui::TextDisabled("No C++ scripts yet — use \"New C++ Script\" or click Build to scaffold Game.cpp.");
@@ -1243,8 +1245,17 @@ void EditorImGui::RenderScriptsPanel()
         CreateLuaScriptAsset();
     if (m_assetLibrary)
     {
-        const std::vector<AssetLibrary::Entry> luaScripts =
+        // Script assets are both languages; the .cpp ones are listed above under C++ source.
+        std::vector<AssetLibrary::Entry> luaScripts =
             m_assetLibrary->EntriesFor(AssetLibrary::Category::Script);
+        luaScripts.erase(std::remove_if(luaScripts.begin(), luaScripts.end(),
+            [](const AssetLibrary::Entry& entry) {
+                std::string ext = std::filesystem::path(entry.filename).extension().string();
+                std::transform(ext.begin(), ext.end(), ext.begin(),
+                    [](unsigned char c) { return static_cast<char>(std::tolower(c)); });
+                return ext != ".lua";
+            }),
+            luaScripts.end());
         if (luaScripts.empty())
             ImGui::TextDisabled("No .lua scripts. Drop a .lua into the asset browser.");
         for (const AssetLibrary::Entry& e : luaScripts)

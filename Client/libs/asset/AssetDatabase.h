@@ -98,6 +98,9 @@ private:
     };
 
     std::filesystem::path canonicalPath(const std::filesystem::path& path) const;
+    // True for a path inside a directory the scan skips (build/, .git/, ...): file-watcher events
+    // there (e.g. compiler outputs under <Project>/Scripts/build) must not register assets either.
+    bool isInIgnoredDirectory(const std::filesystem::path& path) const;
     std::filesystem::path metaPathFor(const std::filesystem::path& assetPath) const;
     std::filesystem::path assetPathForMeta(const std::filesystem::path& metaPath) const;
     std::string displayPath(const std::filesystem::path& path) const;

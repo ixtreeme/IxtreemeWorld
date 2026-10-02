@@ -3662,6 +3662,19 @@ int RunGame(NativeWindow& window,
             cameraController.RestoreSnapshot(snap);
         }});
 #if defined(IXTREEME_WITH_EDITOR)
+    // Refilled every editor frame for SceneManager, without the terrain grids (megabytes); a save
+    // completes it through the refresher below. Kept across frames to reuse its buffers.
+    SceneData frameSceneSnapshot;
+    SceneManager::Instance().SetSnapshotRefresher([&]() {
+        if (!terrainOk || !runtimeSession->IsInWorld())
+            return;  // the per-frame snapshot does not run either: the scene data is the loaded one
+        sceneRuntime.BuildSceneSnapshot(frameSceneSnapshot);
+        SceneManager::Instance().SetCurrentSceneSnapshot(frameSceneSnapshot);
+    });
+    struct SnapshotRefresherReset
+    {
+        ~SnapshotRefresherReset() { SceneManager::Instance().SetSnapshotRefresher({}); }
+    } snapshotRefresherReset;
     auto buildHierarchyEntities = [&]() {
         std::vector<HierarchySceneEntity> entities;
         std::vector<std::uint64_t> liveKeys;
@@ -3813,7 +3826,7 @@ int RunGame(NativeWindow& window,
             ensureEntity(HierarchyEntityType::WaterBody, body.id, EditorDisplayName(body), body.editorHidden);
         if (terrainOk && terrain.HasTerrain())
         {
-            const TerrainSceneData terrainData = terrain.GetTerrainSceneData();
+            const TerrainSceneData terrainData = terrain.GetTerrainSceneInfo();
             ensureEntity(HierarchyEntityType::Terrain, 1u, EditorDisplayName(terrainData), terrainData.editorHidden);
         }
         for (const MeshSceneEntity& mesh : editorMeshEntities)
@@ -6430,7 +6443,7 @@ int RunGame(NativeWindow& window,
                     {
                         if (terrainOk && terrain.HasTerrain())
                         {
-                            TerrainSceneData data = terrain.GetTerrainSceneData();
+                            TerrainSceneData data = terrain.GetTerrainSceneInfo();
                             data.name = name;
                             terrain.SetTerrainSceneData(data);
                         }
@@ -6477,7 +6490,7 @@ int RunGame(NativeWindow& window,
                     {
                         if (terrainOk && terrain.HasTerrain())
                         {
-                            TerrainSceneData data = terrain.GetTerrainSceneData();
+                            TerrainSceneData data = terrain.GetTerrainSceneInfo();
                             data.editorHidden = !data.editorHidden;
                             hidden = data.editorHidden;
                             terrain.SetTerrainSceneData(data);
@@ -9999,7 +10012,7 @@ int RunGame(NativeWindow& window,
                 TerrainEditorState terrainState{};
                 if (terrainOk && terrain.HasTerrain())
                 {
-                    const TerrainSceneData terrainData = terrain.GetTerrainSceneData();
+                    const TerrainSceneData terrainData = terrain.GetTerrainSceneInfo();
                     terrainState = BuildTerrainEditorState(
                         terrainData,
                         selectedEditorObject.type == SelectedEditorObjectType::Terrain);
@@ -10160,7 +10173,8 @@ int RunGame(NativeWindow& window,
                     for (const WaterBody& body : editorWaterBodies)
                         nextEditorWaterBodyId = std::max(nextEditorWaterBodyId, body.id + 1u);
                 }
-                SceneManager::Instance().SetCurrentSceneSnapshot(sceneRuntime.BuildSceneSnapshot());
+                sceneRuntime.BuildSceneSnapshot(frameSceneSnapshot, /*includeTerrainGrids=*/false);
+                SceneManager::Instance().SetCurrentSceneSnapshot(frameSceneSnapshot);
             }
 #endif
         }
@@ -10509,6 +10523,10 @@ int RunGame(NativeWindow& window,
             }
 
             const auto sceneRenderBegin = std::chrono::steady_clock::now();
+            // Sculpted terrain vertices reach the drawn vertex buffer before any pass draws the terrain
+            // (outside render passes: nothing is open yet here).
+            if (isInWorld && hasSceneTerrain)
+                terrain.UploadEditedVertices(*frameInfo.commandList);
             if (isInWorld && hasSceneTerrain && hasFrameCamera && !debugDisableShadowPass)
             {
                 rhiDevice->WriteTimestamp(ixrhi::IXRHITimestampPoint::ShadowPassBegin);
@@ -10573,8 +10591,14 @@ int RunGame(NativeWindow& window,
             else
                 beginMainPass(); // direct mode renders straight into the swapchain pass
 
+            // The editor shows the offscreen scene as its Scene View panel: while that is hidden (the
+            // Game tab in front, as in Play) its draws are skipped; the pass still opens and closes.
+            bool drawSceneView = true;
+#if defined(IXTREEME_WITH_EDITOR)
+            drawSceneView = !useOffscreenScene || !runtimeSession->IsMapEditorOpen() || editorImGui.IsSceneViewVisible();
+#endif
             std::vector<WorldLabelRenderer::Label> plates;
-            if (isInWorld)
+            if (isInWorld && drawSceneView)
             {
                 if (hasSceneTerrain)
                 {
@@ -11310,7 +11334,7 @@ int RunGame(NativeWindow& window,
             if (useOffscreenScene)
             {
                 offscreenScene.EndMainPass(*frameInfo.commandList);
-                if (isInWorld && hasSceneTerrain)
+                if (isInWorld && hasSceneTerrain && drawSceneView)
                 {
                     offscreenScene.SnapshotScene(*frameInfo.commandList, frameInfo);
                     terrain.SetWaterRefractionInputs(offscreenScene.GetColorSnapshotTexture(),
@@ -11412,6 +11436,10 @@ int RunGame(NativeWindow& window,
                                 gameMeshBatches[renderer].push_back(std::move(instance));
                             }
                             for (auto& [gameRenderer, gameInstances] : gameMeshBatches)
+                            {
+                                // Set here too: the Scene View pass (which also sets it) may have
+                                // skipped this renderer (culled there) or not run at all (hidden).
+                                gameRenderer->SetLightingState(runtimeSession->GetLightingState());
                                 gameRenderer->RenderBatchInWorld(*frameInfo.commandList,
                                     frameInfo,
                                     seconds,
@@ -11419,6 +11447,7 @@ int RunGame(NativeWindow& window,
                                     gameInstances,
                                     gameExtent.width,
                                     gameExtent.height);
+                            }
 
                             // Skinned meshes (incl. the player character) were compute-skinned in
                             // the pre-pass into their own top-of-range Game slots; here we only

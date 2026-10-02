@@ -55,6 +55,9 @@ public:
     explicit EditorSceneRuntime(Context context);
 
     SceneData BuildSceneSnapshot() const;
+    // Same, rebuilt into `scene` reusing its terrain grid buffers. Without the terrain grids (heights,
+    // attributes, splat: megabytes) for the per-frame snapshot; a save asks for the full one.
+    void BuildSceneSnapshot(SceneData& scene, bool includeTerrainGrids = true) const;
     void ApplySceneData(const SceneData& scene);
 
 private:

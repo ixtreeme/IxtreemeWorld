@@ -27,7 +27,7 @@ std::vector<EditorImGui::ProjectSceneEntry> EditorImGui::QueryProjectScenes() co
 {
     std::vector<ProjectSceneEntry> scenes;
     const SceneManager& sceneManager = SceneManager::Instance();
-    const std::string activePathKey = ComparablePath(sceneManager.GetCurrentScenePath());
+    const std::string activePathKey = CachedComparablePath(sceneManager.GetCurrentScenePath());
 
     auto appendScene = [&](const std::filesystem::path& path, const std::string& relativePath, bool active) {
         ProjectSceneEntry entry;
@@ -50,7 +50,7 @@ std::vector<EditorImGui::ProjectSceneEntry> EditorImGui::QueryProjectScenes() co
             std::filesystem::path scenePath(attachedPath);
             if (!scenePath.is_absolute())
                 scenePath = projects.ProjectRoot() / scenePath;
-            const bool active = !activePathKey.empty() && ComparablePath(scenePath) == activePathKey;
+            const bool active = !activePathKey.empty() && CachedComparablePath(scenePath) == activePathKey;
             appendScene(scenePath, attachedPath, active);
         }
 
@@ -81,7 +81,10 @@ std::vector<EditorImGui::ProjectSceneEntry> EditorImGui::QueryProjectScenes() co
 
 std::vector<AssetLibrary::Entry> EditorImGui::QuerySceneAssets() const
 {
-    std::vector<AssetLibrary::Entry> scenes;
+    ValidateAssetBrowserCache();  // a recursive scan of the scenes folder: cached like the browser listings
+    if (m_assetBrowserCache.sceneAssets)
+        return *m_assetBrowserCache.sceneAssets;
+    std::vector<AssetLibrary::Entry>& scenes = m_assetBrowserCache.sceneAssets.emplace();
     ProjectManager& projects = ProjectManager::Instance();
     if (!projects.HasProject())
         return scenes;
@@ -136,6 +139,11 @@ bool EditorImGui::AttachSceneToHierarchy(const AssetLibrary::Entry& entry)
 {
     if (entry.category != AssetLibrary::Category::Scene || entry.originalPath.empty())
         return false;
+    if (!CanUseEditorTools())
+    {
+        m_projectStatus = "Stop Play before switching scenes";
+        return false;
+    }
 
     ProjectManager& projects = ProjectManager::Instance();
     std::filesystem::path scenePath(entry.originalPath);
@@ -229,7 +237,7 @@ void EditorImGui::RenderProjectSceneNode(const ProjectSceneEntry& scene)
     const bool open = ImGui::TreeNodeEx(label.c_str(), flags);
     if (ImGui::IsItemHovered() && !scene.relativePath.empty())
         ImGui::SetTooltip("%s", scene.relativePath.c_str());
-    if (ImGui::IsItemClicked() && !ImGui::IsItemToggledOpen() && !scene.active && !scene.path.empty())
+    if (ImGui::IsItemClicked() && !ImGui::IsItemToggledOpen() && !scene.active && !scene.path.empty() && CanUseEditorTools())
     {
         if (SceneManager::Instance().LoadScene(scene.path.string()))
             m_projectStatus = "Scene loaded: " + scene.relativePath;
@@ -295,7 +303,7 @@ void EditorImGui::RenderProjectSceneNode(const ProjectSceneEntry& scene)
     ImGui::PushStyleColor(ImGuiCol_Text, eyeColor);
     if (ImGui::SmallButton(scene.active ? ICON_FA_EYE : ICON_FA_EYE_SLASH))
     {
-        if (!scene.active && !scene.path.empty())
+        if (!scene.active && !scene.path.empty() && CanUseEditorTools())
         {
             if (SceneManager::Instance().LoadScene(scene.path.string()))
             {

@@ -63,9 +63,13 @@ void EditorImGui::RenderDockSpace()
         ImGui::DockBuilderDockWindow("Scene Settings", rightId);
         ImGui::DockBuilderDockWindow(ICON_FA_GLOBE " World", rightId);
         ImGui::DockBuilderDockWindow("Asset Browser", bottomId);
+        ImGui::DockBuilderDockWindow("Scripts", bottomId);
+        ImGui::DockBuilderDockWindow("Build Output", bottomId);
         ImGui::DockBuilderDockWindow("Scene View", mainId);
+        ImGui::DockBuilderDockWindow("Game", mainId);
         ImGui::DockBuilderDockWindow(ICON_FA_PERSON_RUNNING " Animator", mainId);
         ImGui::DockBuilderFinish(dockspaceId);
+        m_defaultLayoutTabSelectFrames = 3;
         Tracen("[EDITOR-LAYOUT] Default Unity-style dock layout applied");
     }
     ImGui::End();
@@ -149,9 +153,11 @@ void EditorImGui::RenderSceneViewDropTarget()
         m_viewportInputDiagnostics.sceneViewRectValid = false;
         m_viewportInputDiagnostics.sceneViewHovered = false;
         m_viewportInputDiagnostics.sceneViewFocused = false;
+        m_sceneViewVisible = false;  // the engine skips drawing the scene view
         ImGui::End();
         return;
     }
+    m_sceneViewVisible = true;
 
     const ImVec2 sceneMin = ImGui::GetCursorScreenPos();
     const ImVec2 avail = ImGui::GetContentRegionAvail();
@@ -447,12 +453,27 @@ void EditorImGui::RenderSceneViewGizmo(const ImVec2& imageMin, const ImVec2& ima
     std::copy(std::begin(m_commands.sceneGizmoScale), std::end(m_commands.sceneGizmoScale), m_sceneGizmoScale);
 }
 
+// Call before Begin(name): docks the window into `anchor`'s dock node when a saved layout has no place
+// for it (saved before the window existed), or holds it as the tiny floating window an undocked view
+// panel auto-sizes to on first use (e.g. a 32x38 "Game").
+static void DockBesideIfUnplaced(const char* name, const char* anchor)
+{
+    const ImGuiWindow* anchorWindow = ImGui::FindWindowByName(anchor);
+    if (anchorWindow == nullptr || anchorWindow->DockId == 0)
+        return;
+    const ImGuiWindow* window = ImGui::FindWindowByName(name);
+    const bool unusable = window != nullptr && window->DockId == 0 &&
+        (window->Size.x < 64.0f || window->Size.y < 64.0f);
+    ImGui::SetNextWindowDockID(anchorWindow->DockId, unusable ? ImGuiCond_Always : ImGuiCond_FirstUseEver);
+}
+
 void EditorImGui::RenderGameViewPanel()
 {
     ImGuiWindowFlags flags =
         ImGuiWindowFlags_NoScrollbar |
         ImGuiWindowFlags_NoScrollWithMouse |
         ImGuiWindowFlags_NoCollapse;
+    DockBesideIfUnplaced("Game", "Scene View");
     if (!ImGui::Begin("Game", nullptr, flags))
     {
         // Window collapsed or its dock tab is inactive — not visible, so the engine can
@@ -941,6 +962,11 @@ void EditorImGui::CreateProjectFromDialog()
 
 void EditorImGui::OpenProjectFromDialog(const std::filesystem::path& manifestPath)
 {
+    if (!CanUseEditorTools())
+    {
+        m_projectStatus = "Stop Play before opening a project";
+        return;
+    }
     std::string error;
     if (!ProjectManager::Instance().OpenProject(manifestPath, error))
     {

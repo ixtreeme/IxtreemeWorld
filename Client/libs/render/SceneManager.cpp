@@ -1838,9 +1838,11 @@ void SceneManager::SetWindowTitleSuffix(std::string suffix)
 
 void SceneManager::SetCurrentSceneSnapshot(const SceneData& scene)
 {
-    SceneData snapshot = scene;
-    snapshot.name = m_currentScene.name.empty() ? scene.name : m_currentScene.name;
-    m_currentScene = std::move(snapshot);
+    // Called every editor frame: copy-assign so the current buffers are reused (a terrain's grids
+    // are megabytes; a fresh copy each frame cost milliseconds).
+    std::string name = m_currentScene.name.empty() ? scene.name : m_currentScene.name;
+    m_currentScene = scene;
+    m_currentScene.name = std::move(name);
 }
 
 void SceneManager::RestoreSceneSnapshot(const SceneData& scene, const std::string& path, bool dirty)
@@ -1904,8 +1906,22 @@ bool SceneManager::LoadScene(const std::string& path)
     return LoadSceneInternal(ResolveProjectScenePath(path));
 }
 
+void SceneManager::SetSnapshotRefresher(std::function<void()> refresher)
+{
+    m_snapshotRefresher = std::move(refresher);
+}
+
+void SceneManager::RefreshSnapshotForSave()
+{
+    // Not while a scene switch is pending (new/load/close): the editor still holds the previous
+    // scene then, and the current scene data is already the complete one being switched to.
+    if (m_snapshotRefresher && !m_hasPendingScene)
+        m_snapshotRefresher();
+}
+
 bool SceneManager::SaveScene()
 {
+    RefreshSnapshotForSave();
     if (m_currentScenePath.empty())
         return SaveSceneAs({});
     return SaveSceneInternal(m_currentScenePath);
@@ -1913,6 +1929,7 @@ bool SceneManager::SaveScene()
 
 bool SceneManager::SaveSceneAs(const std::string& path)
 {
+    RefreshSnapshotForSave();
     std::string target = path.empty() ? DefaultProjectScenePath(m_currentScene) : path;
     if (target.empty())
         target = SaveSceneDialog();

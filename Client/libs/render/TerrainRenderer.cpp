@@ -48,6 +48,16 @@ namespace xm = ixtreeme::math;
 
 constexpr uint32_t kMaxWaterBodyDraws = 64;
 
+// m_sceneTerrain keeps the scene's terrain settings; the live grids are m_heightCmGrid & co. A copy of
+// the loaded grids kept there is dead weight that every GetTerrainSceneData() call used to copy too.
+void ReleaseTerrainGrids(TerrainSceneData& terrain)
+{
+    std::vector<float>().swap(terrain.heightCmGrid);
+    std::vector<std::uint16_t>().swap(terrain.attributes);
+    std::vector<std::uint8_t>().swap(terrain.splatABytes);
+    std::vector<std::uint8_t>().swap(terrain.splatBBytes);
+}
+
 const char* RhiFormatName(ixrhi::IXRHIFormat format)
 {
     switch (format)
@@ -650,6 +660,31 @@ bool TerrainAabbOutsideCameraFrustum(const WorldCamera& camera, WorldVec3 min, W
     return outsideLeft || outsideRight || outsideBottom || outsideTop || outsideNear || outsideFar;
 }
 
+// A shadow cascade's light projection is orthographic along the sun: a caster outside the cascade's
+// side planes cannot shadow anything inside it. Near/far are left to the rasterizer, as before.
+bool TerrainAabbOutsideCascadeFootprint(const WorldMat4& viewProjection, WorldVec3 min, WorldVec3 max)
+{
+    bool outsideLeft = true;
+    bool outsideRight = true;
+    bool outsideBottom = true;
+    bool outsideTop = true;
+    const float* m = viewProjection.m;
+    for (int corner = 0; corner < 8; ++corner)
+    {
+        const float x = (corner & 1) ? max.x : min.x;
+        const float y = (corner & 2) ? max.y : min.y;
+        const float z = (corner & 4) ? max.z : min.z;
+        const float clipX = x * m[0] + y * m[4] + z * m[8] + m[12];
+        const float clipY = x * m[1] + y * m[5] + z * m[9] + m[13];
+        const float clipW = x * m[3] + y * m[7] + z * m[11] + m[15];
+        outsideLeft = outsideLeft && (clipX < -clipW);
+        outsideRight = outsideRight && (clipX > clipW);
+        outsideBottom = outsideBottom && (clipY < -clipW);
+        outsideTop = outsideTop && (clipY > clipW);
+    }
+    return outsideLeft || outsideRight || outsideBottom || outsideTop;
+}
+
 RgbaImage ResizeNearest(const RgbaImage& src, uint32_t width, uint32_t height)
 {
     if (src.width == width && src.height == height)
@@ -757,6 +792,24 @@ std::shared_ptr<ixrhi::IXRHIBuffer> CreateRhiBuffer(ixrhi::IXRHIDevice& rhi,
     desc.sizeBytes = sizeBytes;
     desc.usage = usage;
     desc.cpuAccess = ixrhi::IXRHICpuAccess::Write;
+    desc.debugName = debugName ? debugName : "";
+    const std::size_t bytes = static_cast<std::size_t>(sizeBytes);
+    return rhi.CreateBuffer(desc, initialData, initialData != nullptr ? bytes : 0);
+}
+
+// Device-local, for data the CPU never touches after creation. A host-visible buffer lives in system
+// memory: the GPU then reads it over the bus in every pass that draws it (the terrain index buffer is
+// drawn by the main pass and each shadow cascade).
+std::shared_ptr<ixrhi::IXRHIBuffer> CreateStaticRhiBuffer(ixrhi::IXRHIDevice& rhi,
+                                                          std::uint64_t sizeBytes,
+                                                          ixrhi::IXRHIBufferUsage usage,
+                                                          const void* initialData,
+                                                          const char* debugName)
+{
+    ixrhi::IXRHIBufferDesc desc;
+    desc.sizeBytes = sizeBytes;
+    desc.usage = usage;
+    desc.cpuAccess = ixrhi::IXRHICpuAccess::None;
     desc.debugName = debugName ? debugName : "";
     const std::size_t bytes = static_cast<std::size_t>(sizeBytes);
     return rhi.CreateBuffer(desc, initialData, initialData != nullptr ? bytes : 0);
@@ -1406,6 +1459,7 @@ bool TerrainRenderer::LoadMap(ixrhi::IXRHIDevice& rhi, const std::string& mapDir
 
     rhi.WaitIdle();
     m_vertexBuffer.reset();
+    m_vertexEditBuffer.reset();
     m_indexBuffer.reset();
     m_debugVertexBuffer.reset();
     m_debugIndexBuffer.reset();
@@ -1441,6 +1495,7 @@ bool TerrainRenderer::LoadMap(ixrhi::IXRHIDevice& rhi, const std::string& mapDir
         m_attributes.clear();
         m_splatABytes.clear();
         m_splatBBytes.clear();
+        m_activeSplatLayerSpan = -1;
         m_splatWidth = 0;
         m_splatHeight = 0;
         m_chunkSplatWidth = 0;
@@ -1511,6 +1566,7 @@ bool TerrainRenderer::CreateFlatTerrain(ixrhi::IXRHIDevice& rhi, const TerrainSc
 
     rhi.WaitIdle();
     m_vertexBuffer.reset();
+    m_vertexEditBuffer.reset();
     m_indexBuffer.reset();
     m_debugVertexBuffer.reset();
     m_debugIndexBuffer.reset();
@@ -1533,6 +1589,7 @@ bool TerrainRenderer::CreateFlatTerrain(ixrhi::IXRHIDevice& rhi, const TerrainSc
     m_attributes.clear();
     m_splatABytes.clear();
     m_splatBBytes.clear();
+    m_activeSplatLayerSpan = -1;
     m_dirtyChunkTexels.clear();
     m_undoStack.clear();
 
@@ -1568,6 +1625,7 @@ bool TerrainRenderer::CreateFlatTerrain(ixrhi::IXRHIDevice& rhi, const TerrainSc
         m_splatBBytes = next.splatBBytes;
     else
         m_splatBBytes.assign(expectedSplatBytes, 0);
+    m_activeSplatLayerSpan = -1;
     m_splatUndoRecorded.assign(m_splatABytes.size() + m_splatBBytes.size(), 0);
     const uint32_t chunksX = (m_mapSizeX + m_chunkSizeCells - 1u) / m_chunkSizeCells;
     const uint32_t chunksY = (m_mapSizeY + m_chunkSizeCells - 1u) / m_chunkSizeCells;
@@ -1582,6 +1640,7 @@ bool TerrainRenderer::CreateFlatTerrain(ixrhi::IXRHIDevice& rhi, const TerrainSc
     m_mapLoaded = true;
     m_sceneTerrainActive = true;
     m_sceneTerrain = next;
+    ReleaseTerrainGrids(m_sceneTerrain);
     m_triplanarParamsDirty = true;
     m_terrainShaderOptimDiagLogged = false;
     Tracenf("[TERRAIN-CREATE] dims=%.2fx%.2f m, cellSize=%.2f m, cells=%ux%u, verts=%zu, pos=(0.00,0.00,0.00)",
@@ -1622,6 +1681,7 @@ void TerrainRenderer::ClearTerrain()
         return;
     m_rhi->WaitIdle();
     m_vertexBuffer.reset();
+    m_vertexEditBuffer.reset();
     m_indexBuffer.reset();
     m_debugVertexBuffer.reset();
     m_debugIndexBuffer.reset();
@@ -1638,6 +1698,7 @@ void TerrainRenderer::ClearTerrain()
     m_attributes.clear();
     m_splatABytes.clear();
     m_splatBBytes.clear();
+    m_activeSplatLayerSpan = -1;
     m_dirtyChunkTexels.clear();
     m_heightUndoRecorded.clear();
     m_splatUndoRecorded.clear();
@@ -1656,9 +1717,9 @@ void TerrainRenderer::ClearTerrain()
     Tracenf("[TEDIT-DIAG] active terrain cleared id=%p activeTerrain=NULL", static_cast<void*>(this));
 }
 
-TerrainSceneData TerrainRenderer::GetTerrainSceneData() const
+TerrainSceneData TerrainRenderer::GetTerrainSceneInfo() const
 {
-    TerrainSceneData data = m_sceneTerrain;
+    TerrainSceneData data = m_sceneTerrain;  // holds no grids (ReleaseTerrainGrids)
     data.exists = m_sceneTerrainActive;
     if (data.exists)
     {
@@ -1672,12 +1733,36 @@ TerrainSceneData TerrainRenderer::GetTerrainSceneData() const
         data.depthMeters = m_flatTerrainDepthMeters > 0.0f
             ? m_flatTerrainDepthMeters
             : static_cast<float>(m_mapSizeY) * m_cellScaleMeters;
-        data.heightCmGrid = m_heightCmGrid;
-        data.attributes = m_attributes;
-        data.splatABytes = m_splatABytes;
-        data.splatBBytes = m_splatBBytes;
     }
     return data;
+}
+
+TerrainSceneData TerrainRenderer::GetTerrainSceneData() const
+{
+    TerrainSceneData data;
+    GetTerrainSceneData(data);
+    return data;
+}
+
+void TerrainRenderer::GetTerrainSceneData(TerrainSceneData& out) const
+{
+    // Keep out's grid buffers: assigning into them reuses their capacity, so a caller refreshing the
+    // same snapshot every frame copies megabytes instead of allocating them.
+    std::vector<float> heights = std::move(out.heightCmGrid);
+    std::vector<std::uint16_t> attributes = std::move(out.attributes);
+    std::vector<std::uint8_t> splatA = std::move(out.splatABytes);
+    std::vector<std::uint8_t> splatB = std::move(out.splatBBytes);
+    out = GetTerrainSceneInfo();
+    if (!out.exists)
+        return;
+    heights.assign(m_heightCmGrid.begin(), m_heightCmGrid.end());
+    attributes.assign(m_attributes.begin(), m_attributes.end());
+    splatA.assign(m_splatABytes.begin(), m_splatABytes.end());
+    splatB.assign(m_splatBBytes.begin(), m_splatBBytes.end());
+    out.heightCmGrid = std::move(heights);
+    out.attributes = std::move(attributes);
+    out.splatABytes = std::move(splatA);
+    out.splatBBytes = std::move(splatB);
 }
 
 void TerrainRenderer::SetTerrainSceneData(const TerrainSceneData& terrain)
@@ -1685,6 +1770,7 @@ void TerrainRenderer::SetTerrainSceneData(const TerrainSceneData& terrain)
     if (!m_sceneTerrainActive)
         return;
     m_sceneTerrain = terrain;
+    ReleaseTerrainGrids(m_sceneTerrain);
     m_sceneTerrain.exists = true;
     m_sceneTerrain.triplanarSharpness = std::clamp(m_sceneTerrain.triplanarSharpness, 1.0f, 16.0f);
     m_sceneTerrain.triplanarSlopeThreshold = std::clamp(m_sceneTerrain.triplanarSlopeThreshold, 0.0f, 1.0f);
@@ -1823,6 +1909,18 @@ void TerrainRenderer::UpdateShadowCascades(const WorldCamera& camera)
     }
 }
 
+void TerrainRenderer::UploadEditedVertices(ixrhi::IXRHICommandList& cmd)
+{
+    if (!m_vertexBufferUploadPending || !m_vertexBuffer || !m_vertexEditBuffer)
+        return;
+    m_vertexBufferUploadPending = false;
+    // Whole-buffer copy (the backend copies from offset 0): only on frames with a sculpt edit. The
+    // barriers order it after earlier frames' vertex reads and before this frame's draws.
+    cmd.TransitionBuffer(*m_vertexBuffer, ixrhi::IXRHIBufferState::VertexRead, ixrhi::IXRHIBufferState::TransferDst);
+    cmd.CopyBuffer(*m_vertexEditBuffer, *m_vertexBuffer, std::min(m_vertexEditBuffer->SizeBytes(), m_vertexBuffer->SizeBytes()));
+    cmd.TransitionBuffer(*m_vertexBuffer, ixrhi::IXRHIBufferState::TransferDst, ixrhi::IXRHIBufferState::VertexRead);
+}
+
 void TerrainRenderer::RenderSunShadowMap(ixrhi::IXRHICommandList& cmd,
                                           const ixrhi::IXRHIFrameInfo& frame,
                                           const WorldCamera& camera)
@@ -1866,14 +1964,50 @@ void TerrainRenderer::RenderSunShadowMap(ixrhi::IXRHICommandList& cmd,
         cmd.PushConstants(&m_shadowCascadeViewProj[cascade], sizeof(WorldMat4));
         cmd.SetVertexBuffer(0, *m_vertexBuffer, 0);
         cmd.SetIndexBuffer(*m_indexBuffer, 0, /*thirtyTwoBit=*/true);
-        cmd.DrawIndexed(m_indexCount, 1, 0, 0, 0);
         PassDrawStats& cascadeStats = m_frameDrawStats.shadowCascades[cascade];
         cascadeStats.executed = true;
-        cascadeStats.drawCalls = 1;
-        cascadeStats.chunksDrawn = m_terrainChunks.empty()
-            ? (m_indexCount > 0 ? 1u : 0u)
-            : static_cast<uint32_t>(m_terrainChunks.size());
+        cascadeStats.drawCalls = 0;
+        cascadeStats.chunksDrawn = 0;
         cascadeStats.chunksCulled = 0;
+        if (m_terrainChunks.empty())
+        {
+            cmd.DrawIndexed(m_indexCount, 1, 0, 0, 0);
+            cascadeStats.drawCalls = 1;
+            cascadeStats.chunksDrawn = 1;
+        }
+        else
+        {
+            // Only the chunks under the cascade's footprint: the near cascades cover a small part of
+            // the terrain, and every drawn chunk is vertex/index traffic. Chunks adjacent in the index
+            // buffer are merged into one draw.
+            uint32_t runOffset = 0;
+            uint32_t runCount = 0;
+            auto flushRun = [&]() {
+                if (runCount == 0)
+                    return;
+                cmd.DrawIndexed(runCount, 1, runOffset, 0, 0);
+                ++cascadeStats.drawCalls;
+                runCount = 0;
+            };
+            for (const TerrainChunkDraw& chunk : m_terrainChunks)
+            {
+                if (TerrainAabbOutsideCascadeFootprint(m_shadowCascadeViewProj[cascade], chunk.worldMin, chunk.worldMax))
+                {
+                    ++cascadeStats.chunksCulled;
+                    continue;
+                }
+                ++cascadeStats.chunksDrawn;
+                if (runCount != 0 && runOffset + runCount == chunk.indexOffset)
+                {
+                    runCount += chunk.indexCount;
+                    continue;
+                }
+                flushRun();
+                runOffset = chunk.indexOffset;
+                runCount = chunk.indexCount;
+            }
+            flushRun();
+        }
         if (m_shadowTargets[cascade])
             m_shadowTargets[cascade]->End(cmd);
         if (m_rhi)
@@ -2170,7 +2304,7 @@ void TerrainRenderer::Render(ixrhi::IXRHICommandList& cmd,
     if (!m_terrainShaderOptimDiagLogged)
     {
         const uint32_t activeLayerCount =
-            EstimateActiveSplatLayerSpan(m_splatABytes, m_splatBBytes, m_splatWidth, m_splatHeight);
+            ActiveSplatLayerSpan();
         const uint32_t samplesPerLayer = m_sceneTerrain.triplanarEnabled ? 16u : 5u;
         Tracenf("[TERRAIN-SHADER-DIAG] active_layer_count=%u total_layer_count=8 triplanar_enabled=%s samples_per_pixel_estimate=%u render_pass_count=1 draw_calls_per_frame=%u",
             activeLayerCount,
@@ -3036,6 +3170,7 @@ void TerrainRenderer::Destroy()
     m_waterSceneHeight = 0;
 
     m_vertexBuffer.reset();
+    m_vertexEditBuffer.reset();
     m_indexBuffer.reset();
     m_debugVertexBuffer.reset();
     m_debugIndexBuffer.reset();
@@ -3106,6 +3241,7 @@ void TerrainRenderer::Destroy()
     m_attributes.clear();
     m_splatABytes.clear();
     m_splatBBytes.clear();
+    m_activeSplatLayerSpan = -1;
     m_dirtyChunkTexels.clear();
     m_terrainChunks.clear();
     m_visibleTerrainChunksScratch.clear();
@@ -3159,6 +3295,28 @@ bool TerrainRenderer::EnsureUniformBuffers(ixrhi::IXRHIDevice& rhi)
         }
     }
     return true;
+}
+
+void TerrainRenderer::ExpandTerrainChunkBounds(const Vertex* vertices, std::size_t count)
+{
+    if (m_terrainChunks.empty() || vertices == nullptr || count == 0)
+        return;
+    WorldVec3 lo{vertices[0].position[0], vertices[0].position[1], vertices[0].position[2]};
+    WorldVec3 hi = lo;
+    for (std::size_t i = 1; i < count; ++i)
+    {
+        const float* p = vertices[i].position;
+        lo = {std::min(lo.x, p[0]), std::min(lo.y, p[1]), std::min(lo.z, p[2])};
+        hi = {std::max(hi.x, p[0]), std::max(hi.y, p[1]), std::max(hi.z, p[2])};
+    }
+    // Grow only (never shrink): conservative for the main-pass and shadow-cascade culling.
+    for (TerrainChunkDraw& chunk : m_terrainChunks)
+    {
+        if (chunk.worldMax.x < lo.x || chunk.worldMin.x > hi.x || chunk.worldMax.z < lo.z || chunk.worldMin.z > hi.z)
+            continue;
+        chunk.worldMin.y = std::min(chunk.worldMin.y, lo.y);
+        chunk.worldMax.y = std::max(chunk.worldMax.y, hi.y);
+    }
 }
 
 void TerrainRenderer::BuildTerrainChunkDraws(const std::vector<Vertex>& vertices, std::vector<uint32_t>& indices)
@@ -3281,17 +3439,25 @@ bool TerrainRenderer::CreateFlatBuffers(ixrhi::IXRHIDevice& rhi)
     BuildTerrainChunkDraws(vertices, indices);
     m_indexCount = static_cast<uint32_t>(indices.size());
 
-    m_vertexBuffer = CreateRhiBuffer(rhi,
+    // Drawn from video memory (main pass + every shadow cascade); edited (sculpt) through a
+    // host-visible copy that UploadEditedVertices() copies over.
+    m_vertexBuffer = CreateStaticRhiBuffer(rhi,
         sizeof(Vertex) * vertices.size(),
-        ixrhi::IXRHIBufferUsage::Vertex,
+        ixrhi::IXRHIBufferUsage::Vertex | ixrhi::IXRHIBufferUsage::TransferDst,
         vertices.data(),
         "Terrain:VB");
-    m_indexBuffer = CreateRhiBuffer(rhi,
+    m_vertexEditBuffer = CreateRhiBuffer(rhi,
+        sizeof(Vertex) * vertices.size(),
+        ixrhi::IXRHIBufferUsage::Vertex | ixrhi::IXRHIBufferUsage::TransferSrc,
+        vertices.data(),
+        "Terrain:VB(edit)");
+    m_vertexBufferUploadPending = false;
+    m_indexBuffer = CreateStaticRhiBuffer(rhi,
         sizeof(uint32_t) * indices.size(),
         ixrhi::IXRHIBufferUsage::Index,
         indices.data(),
         "Terrain:IB");
-    if (!m_vertexBuffer || !m_indexBuffer)
+    if (!m_vertexBuffer || !m_vertexEditBuffer || !m_indexBuffer)
         return false;
 
     return EnsureUniformBuffers(rhi);
@@ -3511,6 +3677,7 @@ bool TerrainRenderer::CreateMapBuffers(ixrhi::IXRHIDevice& rhi, const std::strin
     m_chunkSplatHeight = chunksY > 0 ? m_splatHeight / chunksY : 0;
     m_splatABytes = field->splat_a_rgba8;
     m_splatBBytes = field->splat_b_rgba8;
+    m_activeSplatLayerSpan = -1;
     m_heightUndoRecorded.assign(m_heightCmGrid.size(), 0);
     m_splatUndoRecorded.assign(static_cast<size_t>(m_splatWidth) * m_splatHeight, 0);
     m_currentUndo = {};
@@ -3785,17 +3952,25 @@ bool TerrainRenderer::CreateMapBuffers(ixrhi::IXRHIDevice& rhi, const std::strin
     }
 
     m_indexCount = static_cast<uint32_t>(indices.size());
-    m_vertexBuffer = CreateRhiBuffer(rhi,
+    // Drawn from video memory (main pass + every shadow cascade); edited (sculpt) through a
+    // host-visible copy that UploadEditedVertices() copies over.
+    m_vertexBuffer = CreateStaticRhiBuffer(rhi,
         sizeof(Vertex) * vertices.size(),
-        ixrhi::IXRHIBufferUsage::Vertex,
+        ixrhi::IXRHIBufferUsage::Vertex | ixrhi::IXRHIBufferUsage::TransferDst,
         vertices.data(),
         "Terrain:VB");
-    m_indexBuffer = CreateRhiBuffer(rhi,
+    m_vertexEditBuffer = CreateRhiBuffer(rhi,
+        sizeof(Vertex) * vertices.size(),
+        ixrhi::IXRHIBufferUsage::Vertex | ixrhi::IXRHIBufferUsage::TransferSrc,
+        vertices.data(),
+        "Terrain:VB(edit)");
+    m_vertexBufferUploadPending = false;
+    m_indexBuffer = CreateStaticRhiBuffer(rhi,
         sizeof(uint32_t) * indices.size(),
         ixrhi::IXRHIBufferUsage::Index,
         indices.data(),
         "Terrain:IB");
-    if (!m_vertexBuffer || !m_indexBuffer)
+    if (!m_vertexBuffer || !m_vertexEditBuffer || !m_indexBuffer)
         return false;
     m_debugIndexCount = static_cast<uint32_t>(debugIndices.size());
     if (!debugVertices.empty() && !debugIndices.empty())
@@ -3929,7 +4104,7 @@ void TerrainRenderer::ApplyLegacyHeightBrush(float sign, double deltaSeconds)
     const std::uint64_t spanLast = static_cast<std::uint64_t>(maxY) * m_heightGridWidth + maxX;
     const std::uint64_t spanCount = spanLast - spanFirst + 1u;
     std::vector<Vertex> span(static_cast<std::size_t>(spanCount));
-    m_vertexBuffer->Read(spanFirst * sizeof(Vertex), span.data(), spanCount * sizeof(Vertex));
+    m_vertexEditBuffer->Read(spanFirst * sizeof(Vertex), span.data(), spanCount * sizeof(Vertex));
 
     uint32_t changed = 0;
     for (uint32_t gy = minY; gy <= maxY; ++gy)
@@ -3955,7 +4130,11 @@ void TerrainRenderer::ApplyLegacyHeightBrush(float sign, double deltaSeconds)
         }
     }
     if (changed > 0)
-        m_vertexBuffer->Write(spanFirst * sizeof(Vertex), span.data(), spanCount * sizeof(Vertex));
+    {
+        ExpandTerrainChunkBounds(span.data(), span.size());
+        m_vertexEditBuffer->Write(spanFirst * sizeof(Vertex), span.data(), spanCount * sizeof(Vertex));
+        m_vertexBufferUploadPending = true;
+    }
 
     if (changed > 0)
     {
@@ -4130,8 +4309,19 @@ void TerrainRenderer::MarkHeightDirty(size_t heightIndex)
         ++m_dirtyChunkTexels[dirtyIndex];
 }
 
+uint32_t TerrainRenderer::ActiveSplatLayerSpan()
+{
+    if (m_activeSplatLayerSpan < 0)
+    {
+        m_activeSplatLayerSpan = static_cast<std::int32_t>(
+            EstimateActiveSplatLayerSpan(m_splatABytes, m_splatBBytes, m_splatWidth, m_splatHeight));
+    }
+    return static_cast<uint32_t>(m_activeSplatLayerSpan);
+}
+
 void TerrainRenderer::MarkSplatDirty(size_t splatIndex)
 {
+    m_activeSplatLayerSpan = -1;  // every per-texel splat write (paint, undo) comes through here
     if (m_chunkSplatWidth == 0 || m_chunkSplatHeight == 0 || m_dirtyChunkTexels.empty() || m_splatWidth == 0)
         return;
     const uint32_t sx = static_cast<uint32_t>(splatIndex % m_splatWidth);
@@ -4348,7 +4538,7 @@ void TerrainRenderer::ApplyEditorBrush(ixrhi::IXRHIDevice& rhi, double deltaSeco
     const std::uint64_t spanLast = static_cast<std::uint64_t>(maxY) * m_heightGridWidth + maxX;
     const std::uint64_t spanCount = spanLast - spanFirst + 1u;
     std::vector<Vertex> span(static_cast<std::size_t>(spanCount));
-    m_vertexBuffer->Read(spanFirst * sizeof(Vertex), span.data(), spanCount * sizeof(Vertex));
+    m_vertexEditBuffer->Read(spanFirst * sizeof(Vertex), span.data(), spanCount * sizeof(Vertex));
 
     for (uint32_t gy = minY; gy <= maxY; ++gy)
     {
@@ -4415,7 +4605,11 @@ void TerrainRenderer::ApplyEditorBrush(ixrhi::IXRHIDevice& rhi, double deltaSeco
         }
     }
     if (changedHeights > 0)
-        m_vertexBuffer->Write(spanFirst * sizeof(Vertex), span.data(), spanCount * sizeof(Vertex));
+    {
+        ExpandTerrainChunkBounds(span.data(), span.size());
+        m_vertexEditBuffer->Write(spanFirst * sizeof(Vertex), span.data(), spanCount * sizeof(Vertex));
+        m_vertexBufferUploadPending = true;
+    }
     Tracenf("[TEDIT-DIAG] sculpt apply terrainId=%p tool=%s cellRange=(%u,%u)-(%u,%u) changedCells=%u gpuUpload=%s remesh=no",
         m_sceneTerrainActive ? static_cast<void*>(this) : nullptr,
         TeditToolName(m_editorTool),
@@ -4514,7 +4708,7 @@ void TerrainRenderer::UndoLastEditorStroke(ixrhi::IXRHIDevice& rhi)
         {
             const std::uint64_t spanCount = spanLast - spanFirst + 1u;
             std::vector<Vertex> span(static_cast<std::size_t>(spanCount));
-            m_vertexBuffer->Read(spanFirst * sizeof(Vertex), span.data(), spanCount * sizeof(Vertex));
+            m_vertexEditBuffer->Read(spanFirst * sizeof(Vertex), span.data(), spanCount * sizeof(Vertex));
             for (const HeightUndo& undo : entry.heights)
             {
                 if (undo.index >= m_heightCmGrid.size())
@@ -4524,7 +4718,9 @@ void TerrainRenderer::UndoLastEditorStroke(ixrhi::IXRHIDevice& rhi)
                     undo.oldCm * 0.01f;
                 MarkHeightDirty(undo.index);
             }
-            m_vertexBuffer->Write(spanFirst * sizeof(Vertex), span.data(), spanCount * sizeof(Vertex));
+            ExpandTerrainChunkBounds(span.data(), span.size());
+            m_vertexEditBuffer->Write(spanFirst * sizeof(Vertex), span.data(), spanCount * sizeof(Vertex));
+            m_vertexBufferUploadPending = true;
         }
     }
 
@@ -5991,7 +6187,7 @@ void TerrainRenderer::UpdateUniform(uint32_t frameIndex, const WorldCamera& came
     uniform.terrainMaterialParams[2] = std::clamp(m_sceneTerrain.triplanarSlopeThreshold, 0.0f, 1.0f);
     uniform.terrainMaterialParams[3] = std::clamp(m_sceneTerrain.triplanarSlopeTransition, 0.001f, 1.0f);
     uniform.activeLayerCount = static_cast<std::int32_t>(
-        EstimateActiveSplatLayerSpan(m_splatABytes, m_splatBBytes, m_splatWidth, m_splatHeight));
+        ActiveSplatLayerSpan());
     uniform.cameraPos[0] = camera.eye.x;
     uniform.cameraPos[1] = camera.eye.y;
     uniform.cameraPos[2] = camera.eye.z;

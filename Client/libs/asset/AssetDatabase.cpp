@@ -9,6 +9,7 @@
 #include <cstdlib>
 #include <ctime>
 #include <fstream>
+#include <iterator>
 #include <iomanip>
 #include <random>
 #include <sstream>
@@ -649,10 +650,30 @@ std::optional<Guid> AssetDatabase::resolvePath(const std::filesystem::path& absP
     return it->second;
 }
 
+bool AssetDatabase::isInIgnoredDirectory(const std::filesystem::path& path) const
+{
+    std::error_code ec;
+    // Only the components below the scan root count (a project may itself live under a "build"
+    // directory); outside the root or on error nothing is ignored.
+    const std::filesystem::path scope = std::filesystem::relative(path, scanRoot_, ec);
+    if (ec || scope.empty())
+        return false;
+    for (auto it = scope.begin(); it != scope.end(); ++it)
+    {
+        if (std::next(it) == scope.end())
+            break; // the file name itself
+        if (IsIgnoredDirectoryName(*it))
+            return true;
+    }
+    return false;
+}
+
 bool AssetDatabase::runtimeAdd(const std::filesystem::path& absPath)
 {
     const std::filesystem::path assetPath = canonicalPath(absPath);
     if (ToLowerAscii(assetPath.extension().string()) == ".meta")
+        return false;
+    if (isInIgnoredDirectory(assetPath))
         return false;
 
     const AssetType assetType = detectAssetType(assetPath);
@@ -747,6 +768,8 @@ bool AssetDatabase::runtimeMove(const std::filesystem::path& oldAbsPath, const s
     {
         return false;
     }
+    if (isInIgnoredDirectory(newPath))
+        return runtimeRemove(oldPath);
 
     const AssetType assetType = detectAssetType(newPath);
     if (assetType == AssetType::Unknown)
@@ -798,6 +821,8 @@ bool AssetDatabase::runtimeModified(const std::filesystem::path& absPath)
 {
     const std::filesystem::path path = canonicalPath(absPath);
     if (ToLowerAscii(path.extension().string()) == ".meta")
+        return false;
+    if (isInIgnoredDirectory(path))
         return false;
     if (detectAssetType(path) == AssetType::Unknown)
         return false;

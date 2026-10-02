@@ -41,9 +41,14 @@ public:
     VkBuffer Native() const { return m_buffer; }
 
 private:
+    // Host-visible (coherent) memory stays mapped from the first Write/Read on: mapping and unmapping
+    // on every write (per-draw uniforms, per-frame instance data) was a driver round trip each time.
+    void* Mapped();
+
     IXVulkanDevice* m_device = nullptr; // borrowed backend (outlives resources)
     VkBuffer m_buffer = VK_NULL_HANDLE;
     VkDeviceMemory m_memory = VK_NULL_HANDLE;
+    void* m_mapped = nullptr;
     std::uint64_t m_sizeBytes = 0;
     ixrhi::IXRHIBufferUsage m_usage = ixrhi::IXRHIBufferUsage::None;
     std::string m_debugName;

@@ -2088,6 +2088,7 @@ bool AssetLibrary::PopulateTextureMetadata(Entry& entry, bool generateThumbnail,
 
 bool AssetLibrary::LoadManifest()
 {
+    ++m_revision;
     m_entries.clear();
     const auto path = m_libraryRoot / "manifest.json";
     std::string text;
@@ -2217,6 +2218,7 @@ bool AssetLibrary::LoadManifest()
 
 bool AssetLibrary::SaveManifest(std::string& error) const
 {
+    ++m_revision;  // every entry change is persisted through here
     const auto saveBegin = std::chrono::steady_clock::now();
     std::ostringstream json;
     json << "{\n  \"version\": 1,\n  \"assets\": [\n";
@@ -2708,8 +2710,14 @@ bool AssetLibrary::ReconcileFilesystem(std::string& error)
             if (!scriptIt->is_regular_file(ec) || !HasAnyExtension(scriptIt->path(), {".lua", ".cpp"}))
                 continue;
             // Never index a CMake build tree that might sit under the scripts dir (its probe .cpp
-            // files are not game scripts).
-            if (scriptIt->path().generic_string().find("/build/") != std::string::npos)
+            // files are not game scripts). Only the path below the scripts dir counts: the project
+            // itself may live under a "build" directory.
+            std::error_code buildEc;
+            const std::filesystem::path below =
+                std::filesystem::relative(scriptIt->path().parent_path(), scriptDir, buildEc);
+            if (buildEc ||
+                std::any_of(below.begin(), below.end(),
+                    [](const std::filesystem::path& part) { return part == "build" || part == ".."; }))
                 continue;
             const std::string canonical = CanonicalPathString(scriptIt->path());
             if (knownScriptPaths.find(canonical) != knownScriptPaths.end())

@@ -10,6 +10,7 @@
 
 #include <cstdint>
 #include <memory>
+#include <unordered_set>
 #include <vector>
 
 namespace ixvulkan
@@ -68,10 +69,19 @@ private:
     IXVulkanDevice* m_device = nullptr;
     VkDescriptorPool m_pool = VK_NULL_HANDLE;
     std::vector<VkDescriptorSet> m_sets;
-    // Shared lifetime: bound resources outlive any in-flight use of the group.
+    // Shared lifetime: bound resources outlive any in-flight use of the group. Each resource is kept
+    // once (m_kept): groups are rebound every frame (per-draw texture slots), and appending on every
+    // update grew these without bound.
+    template <typename T>
+    void Keep(std::vector<std::shared_ptr<T>>& keeps, const std::shared_ptr<T>& resource)
+    {
+        if (m_kept.insert(resource.get()).second)
+            keeps.push_back(resource);
+    }
     std::vector<std::shared_ptr<ixrhi::IXRHIBuffer>> m_buffers;
     std::vector<std::shared_ptr<ixrhi::IXRHITexture>> m_textures;
     std::vector<std::shared_ptr<ixrhi::IXRHISampler>> m_samplers;
+    std::unordered_set<const void*> m_kept;
 };
 
 } // namespace ixvulkan

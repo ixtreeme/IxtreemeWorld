@@ -30,42 +30,38 @@ IXVulkanBuffer::~IXVulkanBuffer()
     if (m_device == nullptr)
         return;
     const VkDevice native = m_device->NativeDevice();
+    if (m_mapped != nullptr)
+        vkUnmapMemory(native, m_memory);
     if (m_buffer != VK_NULL_HANDLE)
         vkDestroyBuffer(native, m_buffer, nullptr);
     if (m_memory != VK_NULL_HANDLE)
         vkFreeMemory(native, m_memory, nullptr);
 }
 
+void* IXVulkanBuffer::Mapped()
+{
+    if (m_mapped == nullptr)
+    {
+        IXVULKAN_CHECK(*m_device,
+            vkMapMemory(m_device->NativeDevice(), m_memory, 0, VK_WHOLE_SIZE, 0, &m_mapped));
+    }
+    return m_mapped;
+}
+
 void IXVulkanBuffer::Write(std::uint64_t dstOffsetBytes, const void* src, std::size_t byteCount)
 {
     if (src == nullptr || byteCount == 0 || dstOffsetBytes + byteCount > m_sizeBytes)
         return; // InvalidArgument-class misuse: ignore (validated at higher level)
-    void* mapped = nullptr;
-    IXVULKAN_CHECK(*m_device,
-        vkMapMemory(m_device->NativeDevice(),
-            m_memory,
-            static_cast<VkDeviceSize>(dstOffsetBytes),
-            static_cast<VkDeviceSize>(byteCount),
-            0,
-            &mapped));
-    std::memcpy(mapped, src, byteCount);
-    vkUnmapMemory(m_device->NativeDevice(), m_memory);
+    if (void* mapped = Mapped())
+        std::memcpy(static_cast<std::uint8_t*>(mapped) + dstOffsetBytes, src, byteCount);
 }
 
 void IXVulkanBuffer::Read(std::uint64_t srcOffsetBytes, void* dst, std::size_t byteCount)
 {
     if (dst == nullptr || byteCount == 0 || srcOffsetBytes + byteCount > m_sizeBytes)
         return;
-    void* mapped = nullptr;
-    IXVULKAN_CHECK(*m_device,
-        vkMapMemory(m_device->NativeDevice(),
-            m_memory,
-            static_cast<VkDeviceSize>(srcOffsetBytes),
-            static_cast<VkDeviceSize>(byteCount),
-            0,
-            &mapped));
-    std::memcpy(dst, mapped, byteCount);
-    vkUnmapMemory(m_device->NativeDevice(), m_memory);
+    if (const void* mapped = Mapped())
+        std::memcpy(dst, static_cast<const std::uint8_t*>(mapped) + srcOffsetBytes, byteCount);
 }
 
 IXVulkanTexture::IXVulkanTexture(IXVulkanDevice& device,

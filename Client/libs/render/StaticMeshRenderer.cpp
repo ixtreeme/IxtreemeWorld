@@ -3088,29 +3088,49 @@ void StaticMeshRenderer::RenderLodBatchInWorld(ixrhi::IXRHICommandList& cmd,
     const auto materialKey = [](const Instance& instance, std::uint32_t slot) -> std::string_view {
         return slot < instance.materialSlots.size() ? std::string_view(instance.materialSlots[slot]) : std::string_view();
     };
+    // Resolved once per run, then drawn by the opaque or the mask pass (resolving inside each pass
+    // did the material/texture lookups twice per draw, every frame).
+    struct MaterialRun
+    {
+        const InstancedDrawCommand* command = nullptr;
+        InstancedDrawCommand draw;
+        const Instance* instance = nullptr;
+        MaterialTextureViews textures;
+        bool isMask = false;
+    };
+    std::vector<MaterialRun> materialRuns;
+    materialRuns.reserve(drawCommands.size());
+    for (const InstancedDrawCommand& command : drawCommands)
+    for (std::uint32_t runStart = 0; runStart < command.instanceCount;)
+    {
+        std::uint32_t runEnd = runStart + 1;
+        while (runEnd < command.instanceCount &&
+               materialKey(instances[runEnd], command.materialSlot) ==
+                   materialKey(instances[runStart], command.materialSlot))
+            ++runEnd;
+        MaterialRun& run = materialRuns.emplace_back();
+        run.command = &command;
+        run.draw = command;
+        run.draw.firstInstance = command.firstInstance + runStart;
+        run.draw.instanceCount = runEnd - runStart;
+        run.instance = &instances[runStart];
+        run.textures = ResolveMaterialTextureViews(*m_rhi, *run.instance, run.draw.materialSlot);
+        run.isMask = std::strcmp(run.textures.fragmentShaderAlphaPath, "discard") == 0;
+        runStart = runEnd;
+    }
     auto drawPass = [&](bool maskPass) {
-        for (const InstancedDrawCommand& command : drawCommands)
-        for (std::uint32_t runStart = 0; runStart < command.instanceCount;)
+        for (const MaterialRun& run : materialRuns)
         {
-            std::uint32_t runEnd = runStart + 1;
-            while (runEnd < command.instanceCount &&
-                   materialKey(instances[runEnd], command.materialSlot) ==
-                       materialKey(instances[runStart], command.materialSlot))
-                ++runEnd;
-            InstancedDrawCommand draw = command;
-            draw.firstInstance = command.firstInstance + runStart;
-            draw.instanceCount = runEnd - runStart;
-            const Instance& runInstance = instances[runStart];
-            runStart = runEnd;
-            const MaterialTextureViews materialTextures =
-                ResolveMaterialTextureViews(*m_rhi, runInstance, draw.materialSlot);
-            const bool isMask = std::strcmp(materialTextures.fragmentShaderAlphaPath, "discard") == 0;
-            if (isMask != maskPass)
+            if (run.isMask != maskPass)
                 continue;
+            const InstancedDrawCommand& command = *run.command;
+            const InstancedDrawCommand& draw = run.draw;
+            const Instance& runInstance = *run.instance;
+            const MaterialTextureViews& materialTextures = run.textures;
 
             const ixrhi::IXRHIGraphicsPipeline* pipelineForDraw = materialTextures.unlit
-                ? (isMask ? m_unlitMaskPipeline.get() : m_unlitPipeline.get())
-                : (isMask ? m_maskPipeline.get() : m_pipeline.get());
+                ? (run.isMask ? m_unlitMaskPipeline.get() : m_unlitPipeline.get())
+                : (run.isMask ? m_maskPipeline.get() : m_pipeline.get());
             if (std::strcmp(materialTextures.fragmentShaderAlphaPath, "blend-fallback-opaque") == 0)
             {
                 static std::unordered_set<std::string> loggedBlendFallbacks;

@@ -793,6 +793,7 @@ void EditorImGui::InitializeAssetLibrary(const std::filesystem::path& clientRoot
 {
     SetEngineRoot(clientRoot);
     DestroyAssetPreviewTextures();
+    InvalidateAssetBrowserCache();
     m_assetLibrary = std::make_unique<AssetLibrary>(clientRoot);
     if (!m_assetLibrary->Initialize())
     {
@@ -814,6 +815,7 @@ void EditorImGui::InitializeProjectAssetLibrary(const std::filesystem::path& pro
                                                 const std::filesystem::path& assetRoot)
 {
     DestroyAssetPreviewTextures();
+    InvalidateAssetBrowserCache();
     m_assetLibrary = std::make_unique<AssetLibrary>(projectRoot, assetRoot);
     if (!m_assetLibrary->Initialize())
     {
@@ -1500,9 +1502,36 @@ void EditorImGui::SelectAssetBrowserFolder(const std::string& subpath)
     m_activeAssetTags.clear();
 }
 
+void EditorImGui::ValidateAssetBrowserCache() const
+{
+    constexpr double kAssetBrowserCacheSeconds = 1.0;
+    const double now = ImGui::GetTime();
+    const std::uint64_t revision = m_assetLibrary ? m_assetLibrary->Revision() : 0;
+    AssetBrowserCache& cache = m_assetBrowserCache;
+    if (cache.builtAt >= 0.0 && now >= cache.builtAt && now - cache.builtAt < kAssetBrowserCacheSeconds &&
+        cache.library == m_assetLibrary.get() && cache.revision == revision)
+        return;
+    cache = {};
+    cache.library = m_assetLibrary.get();
+    cache.revision = revision;
+    cache.builtAt = now;
+}
+
+std::string EditorImGui::CachedComparablePath(const std::filesystem::path& path) const
+{
+    ValidateAssetBrowserCache();
+    auto [cached, inserted] = m_assetBrowserCache.comparablePaths.try_emplace(path.generic_string());
+    if (inserted)
+        cached->second = ComparablePath(path);
+    return cached->second;
+}
+
 std::vector<std::string> EditorImGui::QueryFilesystemChildFolders(const std::string& subpath) const
 {
-    std::vector<std::string> folders;
+    ValidateAssetBrowserCache();
+    if (const auto cached = m_assetBrowserCache.childFolders.find(subpath); cached != m_assetBrowserCache.childFolders.end())
+        return cached->second;
+    std::vector<std::string>& folders = m_assetBrowserCache.childFolders[subpath];
     const std::filesystem::path directory = AssetBrowserPath(subpath);
     std::error_code ec;
     if (!std::filesystem::exists(directory, ec) || !std::filesystem::is_directory(directory, ec))
@@ -1525,9 +1554,12 @@ std::vector<std::string> EditorImGui::QueryFilesystemChildFolders(const std::str
 
 std::vector<AssetLibrary::Entry> EditorImGui::QueryFilesystemAssetsInFolder(const std::string& subpath) const
 {
-    std::vector<AssetLibrary::Entry> result;
     if (!m_assetLibrary)
-        return result;
+        return {};
+    ValidateAssetBrowserCache();
+    if (const auto cached = m_assetBrowserCache.folderAssets.find(subpath); cached != m_assetBrowserCache.folderAssets.end())
+        return cached->second;
+    std::vector<AssetLibrary::Entry>& result = m_assetBrowserCache.folderAssets[subpath];
 
     const std::string target = ComparablePath(AssetBrowserPath(subpath));
     auto addIfInFolder = [&](const AssetLibrary::Entry& entry, const std::filesystem::path& absolutePath) {
@@ -1580,7 +1612,15 @@ std::optional<std::filesystem::path> EditorImGui::AssetPreviewPathFor(const Asse
 {
     if (!m_assetLibrary)
         return std::nullopt;
+    ValidateAssetBrowserCache();
+    auto [cached, inserted] = m_assetBrowserCache.previewPaths.try_emplace(entry.id);
+    if (inserted)
+        cached->second = ResolveAssetPreviewPath(entry);
+    return cached->second;
+}
 
+std::optional<std::filesystem::path> EditorImGui::ResolveAssetPreviewPath(const AssetLibrary::Entry& entry) const
+{
     const auto thumbnailPath = [this](const AssetLibrary::Entry& textureEntry) -> std::optional<std::filesystem::path> {
         if (textureEntry.thumbnail.empty() ||
             textureEntry.thumbnail == "model_icon" ||
@@ -1694,6 +1734,7 @@ void EditorImGui::CreateAssetFolder()
     }
     m_assetSubpath = outSubpath;
     m_newAssetFolderName[0] = '\0';
+    InvalidateAssetBrowserCache();  // a new folder is not an asset library (manifest) change
     m_assetStatus = "Folder created: " + FolderDisplayName(outSubpath);
     Tracenf("[EDITOR-IMGUI-3] Folder created: %s", outSubpath.c_str());
 }
@@ -1712,6 +1753,7 @@ void EditorImGui::DeleteAssetFolder()
         return;
     }
     m_assetSubpath = ParentSubpath(deleted);
+    InvalidateAssetBrowserCache();  // an empty folder's removal does not touch the manifest
     m_assetStatus = "Folder deleted, removed assets: " + std::to_string(removedAssets);
     Tracenf("[EDITOR-IMGUI-3] Folder deleted: %s removed=%u", deleted.c_str(), removedAssets);
 }
@@ -2160,6 +2202,27 @@ void EditorImGui::CreateLuaScriptAsset()
     {
         m_assetStatus = "Create Lua script failed: " + error;
     }
+}
+
+// A native C++ script source (.cpp/.h/...) under the asset scripts folder. Only the path BELOW that
+// folder is checked for a CMake "build" tree: the project itself may well live under a "build" directory.
+static bool IsNativeScriptSource(const std::filesystem::path& scriptsDir, const std::filesystem::path& file)
+{
+    std::string ext = file.extension().string();
+    std::transform(ext.begin(), ext.end(), ext.begin(),
+        [](unsigned char c) { return static_cast<char>(std::tolower(c)); });
+    if (ext != ".cpp" && ext != ".h" && ext != ".hpp" && ext != ".cxx" && ext != ".cc")
+        return false;
+    std::error_code ec;
+    const std::filesystem::path relative = std::filesystem::relative(file, scriptsDir, ec);
+    if (ec || relative.empty())
+        return false;
+    for (const std::filesystem::path& part : relative.parent_path())
+    {
+        if (part == "build" || part == "..")
+            return false;
+    }
+    return true;
 }
 
 std::filesystem::path EditorImGui::ProjectScriptSourceDir() const

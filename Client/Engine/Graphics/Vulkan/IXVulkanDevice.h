@@ -205,6 +205,7 @@ private:
     bool m_slotsReady = false;
     std::vector<VkSemaphore> m_renderFinished; // per swapchain image
     std::vector<VkFence> m_imagesInFlight; // per swapchain image
+    std::vector<std::uint64_t> m_imageLastFrame; // per swapchain image: frame number that last rendered it
     IXVulkanFrameTracker m_tracker;
     bool m_frameActive = false;
     std::uint32_t m_activeSlot = 0;

@@ -131,6 +131,9 @@ public:
 
     bool Initialize();
     const std::vector<Entry>& Entries() const { return m_entries; }
+    // Bumped whenever the entries may have changed (manifest written, loaded or refreshed), so a
+    // view can cache what it derives from them.
+    std::uint64_t Revision() const { return m_revision; }
     std::vector<Entry> EntriesFor(Category category, const std::string& filter = {}) const;
     std::vector<Entry> QueryEntries(Category category,
                                     const std::string& subpath,
@@ -266,6 +269,7 @@ private:
     std::filesystem::path m_clientRoot;
     std::filesystem::path m_libraryRoot;
     std::vector<Entry> m_entries;
+    mutable std::uint64_t m_revision = 0;  // see Revision(); SaveManifest() is const
     std::unordered_set<std::string> m_failedMaterialDiscoveryAttempts;
     bool m_loggedMaterialFailureHint = false;
     mutable std::optional<size_t> m_lastSavedManifestHash;

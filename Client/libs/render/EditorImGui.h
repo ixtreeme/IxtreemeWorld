@@ -73,6 +73,8 @@ public:
     // True when the Game panel was actually visible (active dock tab, not collapsed) last
     // frame. Lets the engine skip the expensive Game-view scene render when it's not shown.
     bool IsGameViewVisible() const { return m_gameViewVisible; }
+    // Whether the Scene View panel was visible last frame (e.g. not behind the Game tab in Play).
+    bool IsSceneViewVisible() const { return !m_editorModeActive || m_sceneViewVisible; }
 
     // Script text prompts (IScriptApi::PromptText) drawn as small modal-less dialogs during Play. The
     // engine hands the open prompts in each frame and collects the answers after RenderPanels. Secret
@@ -257,6 +259,8 @@ private:
     void RenderSceneViewGizmo(const ImVec2& imageMin, const ImVec2& imageSize);
     void RenderMenuBar();
     bool SaveProjectAndCurrentScene(bool automatic = false);
+    // True (with a status message) while Play is running: Play-mode state is never saved.
+    bool RefuseSaveDuringPlay();
     void RunProjectAutoSave();
     void UpdateAutoSaveWindowTitle(double now);
     void LoadProjectPhysicsSettings();
@@ -357,6 +361,7 @@ private:
     void DestroyAssetPreviewTextures();
     void DestroyAssetPreviewTexture(AssetPreviewTexture& texture);
     std::optional<std::filesystem::path> AssetPreviewPathFor(const AssetLibrary::Entry& entry) const;
+    std::optional<std::filesystem::path> ResolveAssetPreviewPath(const AssetLibrary::Entry& entry) const;
     AssetPreviewTexture* GetAssetPreviewTexture(const AssetLibrary::Entry& entry);
     bool LoadAssetPreviewTexture(const std::filesystem::path& path, AssetPreviewTexture& outTexture);
     void CreateAssetFolder();
@@ -390,6 +395,11 @@ private:
     std::vector<std::pair<std::string, std::uint32_t>> QueryVisibleTags() const;
     std::vector<std::string> QueryFilesystemChildFolders(const std::string& subpath) const;
     std::vector<AssetLibrary::Entry> QueryFilesystemAssetsInFolder(const std::string& subpath) const;
+    // Drops the cached asset browser listings when the asset library changed (or they are too old
+    // to trust for edits made outside the editor).
+    void ValidateAssetBrowserCache() const;
+    void InvalidateAssetBrowserCache() const { m_assetBrowserCache = {}; }
+    std::string CachedComparablePath(const std::filesystem::path& path) const;
     std::filesystem::path AssetBrowserRoot() const;
     std::filesystem::path AssetBrowserPath(const std::string& subpath) const;
     std::string AssetBrowserSubpath(const std::filesystem::path& path) const;
@@ -449,6 +459,8 @@ private:
     bool m_showDemoWindow = false;
     bool m_applyDefaultDockLayout = false;
     bool m_defaultDockLayoutBuilt = false;
+    int m_defaultLayoutTabSelectFrames = 0; // frames left to pick the default layout's front tabs
+    int m_startupViewFocusFrames = 3;       // frames left to focus the Scene View after startup
     bool m_logToolsRendered = false;
     bool m_logInspectorRendered = false;
     bool m_debugDisableShadowPass = false;
@@ -625,9 +637,28 @@ private:
     bool m_componentRegistryLogged = false;
     bool m_logHierarchyRendered = false;
     std::unordered_map<std::string, AssetPreviewTexture> m_assetPreviewTextures;
+    // The asset browser's folder/asset/scene listings and preview paths come from directory scans and
+    // path canonicalization; redone every frame they cost ~4 ms with a project open. Cached per asset
+    // library revision, and re-read at least once a second for changes made outside the editor.
+    struct AssetBrowserCache
+    {
+        const AssetLibrary* library = nullptr;
+        std::uint64_t revision = 0;
+        double builtAt = -1.0;
+        std::unordered_map<std::string, std::vector<std::string>> childFolders;
+        std::unordered_map<std::string, std::vector<AssetLibrary::Entry>> folderAssets;
+        std::optional<std::vector<AssetLibrary::Entry>> sceneAssets;
+        std::unordered_map<std::string, std::optional<std::filesystem::path>> previewPaths;
+        // Scripts panel: native C++ sources (absolute path, path shown relative to the scripts dir).
+        std::optional<std::vector<std::pair<std::filesystem::path, std::string>>> nativeScriptSources;
+        // ComparablePath (absolute + weakly_canonical: filesystem calls) of the Hierarchy's scene paths.
+        std::unordered_map<std::string, std::string> comparablePaths;
+    };
+    mutable AssetBrowserCache m_assetBrowserCache;
     bool m_assetBrowserLogged = false;
     std::string m_loggedDragAssetId;
     bool m_gameViewVisible = false;
+    bool m_sceneViewVisible = true;
     bool m_animatorGraphVisible = false;
     bool m_animatorPanelOpen = true;
     float m_animatorPan[2] = {0.0f, 0.0f};

@@ -48,15 +48,17 @@ void EditorImGui::RenderMenuBar()
 
     SceneManager& scenes = SceneManager::Instance();
     ProjectManager& projects = ProjectManager::Instance();
+    // Scene/project switches would prompt to save (and then restore over) the Play-mode copy.
+    const bool editing = CanUseEditorTools();
     if (ImGui::BeginMenu("File"))
     {
-        if (ImGui::MenuItem("New Project..."))
+        if (ImGui::MenuItem("New Project...", nullptr, false, editing))
             OpenProjectDialog(ProjectDialogMode::Create);
-        if (ImGui::MenuItem("Open Project..."))
+        if (ImGui::MenuItem("Open Project...", nullptr, false, editing))
             OpenProjectDialog(ProjectDialogMode::Open);
         if (ImGui::MenuItem("Save Project", "Ctrl+S", false, projects.HasProject()))
             SaveProjectAndCurrentScene();
-        if (ImGui::BeginMenu("Recent Projects", !projects.RecentProjects().empty()))
+        if (ImGui::BeginMenu("Recent Projects", editing && !projects.RecentProjects().empty()))
         {
             for (const auto& path : projects.RecentProjects())
             {
@@ -67,9 +69,9 @@ void EditorImGui::RenderMenuBar()
             ImGui::EndMenu();
         }
         ImGui::Separator();
-        if (ImGui::MenuItem(ICON_FA_FILE "  New Scene", "Ctrl+N"))
+        if (ImGui::MenuItem(ICON_FA_FILE "  New Scene", "Ctrl+N", false, editing))
             scenes.NewScene();
-        if (ImGui::MenuItem(ICON_FA_FOLDER_OPEN "  Open Scene...", "Ctrl+O"))
+        if (ImGui::MenuItem(ICON_FA_FOLDER_OPEN "  Open Scene...", "Ctrl+O", false, editing))
         {
 #if defined(_WIN32)
             char file[MAX_PATH]{};
@@ -86,9 +88,12 @@ void EditorImGui::RenderMenuBar()
         }
         ImGui::Separator();
         if (ImGui::MenuItem(ICON_FA_FLOPPY_DISK "  Save Scene As...", "Ctrl+Shift+S"))
-            scenes.SaveSceneAs({});
+        {
+            if (!RefuseSaveDuringPlay())
+                scenes.SaveSceneAs({});
+        }
         ImGui::Separator();
-        if (ImGui::BeginMenu("Recent Scenes", !scenes.GetRecentScenes().empty()))
+        if (ImGui::BeginMenu("Recent Scenes", editing && !scenes.GetRecentScenes().empty()))
         {
             for (const std::string& path : scenes.GetRecentScenes())
             {
@@ -274,6 +279,14 @@ void EditorImGui::StoreProjectPhysicsSettings()
 
 bool EditorImGui::SaveProjectAndCurrentScene(bool automatic)
 {
+    if (!CanUseEditorTools())
+    {
+        // Play runs on a throwaway copy of the scene (restored on Stop): never write it out. The
+        // autosave timer is left as is, so the autosave happens right after Play stops.
+        if (!automatic)
+            RefuseSaveDuringPlay();
+        return false;
+    }
     ProjectManager& projects = ProjectManager::Instance();
     if (!projects.HasProject())
     {
@@ -321,9 +334,23 @@ bool EditorImGui::SaveProjectAndCurrentScene(bool automatic)
     return true;
 }
 
+bool EditorImGui::RefuseSaveDuringPlay()
+{
+    if (CanUseEditorTools())
+        return false;
+    m_projectStatus = "Stop Play before saving: Play-mode changes are never saved";
+    Tracen("[PROJECT] save refused during Play");
+    return true;
+}
+
 void EditorImGui::RunProjectAutoSave()
 {
     const double now = ImGui::GetTime();
+    if (!CanUseEditorTools())
+    {
+        UpdateAutoSaveWindowTitle(now);
+        return; // deferred until Play stops (see SaveProjectAndCurrentScene)
+    }
     if (!ProjectManager::Instance().HasProject())
     {
         m_lastAutoSaveSeconds = now;
@@ -397,17 +424,10 @@ EditorImGui::ScriptFileChanges EditorImGui::PollScriptFileChanges()
         for (const std::filesystem::directory_entry& de : std::filesystem::recursive_directory_iterator(
                  scriptsDir, std::filesystem::directory_options::skip_permission_denied, ec))
         {
-            if (!de.is_regular_file(ec))
+            // Skips any CMake build tree under the scripts dir (its churn isn't a source edit).
+            if (!de.is_regular_file(ec) || !IsNativeScriptSource(scriptsDir, de.path()))
                 continue;
-            // Skip any CMake build tree that might sit under the scripts dir (its churn isn't a source edit).
             const std::string full = de.path().generic_string();
-            if (full.find("/build/") != std::string::npos)
-                continue;
-            std::string ext = de.path().extension().string();
-            std::transform(ext.begin(), ext.end(), ext.begin(),
-                [](unsigned char c) { return static_cast<char>(std::tolower(c)); });
-            if (ext != ".cpp" && ext != ".h" && ext != ".hpp" && ext != ".cxx" && ext != ".cc")
-                continue;
             const std::filesystem::file_time_type mt = std::filesystem::last_write_time(de.path(), ec);
             if (ec)
                 continue;
@@ -462,7 +482,10 @@ void EditorImGui::HandleEditorHotkeys()
     if (io.KeyCtrl && ImGui::IsKeyPressed(ImGuiKey_S, false))
     {
         if (io.KeyShift)
-            SceneManager::Instance().SaveSceneAs({});
+        {
+            if (!RefuseSaveDuringPlay())
+                SceneManager::Instance().SaveSceneAs({});
+        }
         else
             SaveProjectAndCurrentScene();
         return;
@@ -570,7 +593,7 @@ void EditorImGui::HandleEditorHotkeys()
         }
     }
 
-    if (io.KeyCtrl)
+    if (io.KeyCtrl && CanUseEditorTools())
     {
         SceneManager& scenes = SceneManager::Instance();
         if (!io.KeyShift && ImGui::IsKeyPressed(ImGuiKey_N, false))
