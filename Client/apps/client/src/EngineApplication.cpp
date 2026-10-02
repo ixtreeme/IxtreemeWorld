@@ -4305,12 +4305,14 @@ int RunGame(NativeWindow& window,
                 const bool terrainToolActiveForDiag =
                     editorSettings.toolMode == MapEditorToolMode::Heightmap ||
                     editorSettings.toolMode == MapEditorToolMode::SplatPaint;
+                // Button events only: with a terrain tool active every mouse move logged ~8 lines (each
+                // flushed to the log file) while painting/sculpting.
+                const bool sculptDiagButtonEvent =
+                    event.type == InputEvent::MouseDown || event.type == InputEvent::MouseUp;
                 const bool shouldLogSculptDiag =
                     QuietLogsForLodDiag()
-                        ? terrainToolActiveForDiag
-                        : (terrainToolActiveForDiag ||
-                            event.type == InputEvent::MouseDown ||
-                            event.type == InputEvent::MouseUp);
+                        ? (terrainToolActiveForDiag && sculptDiagButtonEvent)
+                        : sculptDiagButtonEvent;
                 const auto viewportDiag = editorImGui.GetViewportInputDiagnostics();
                 auto logSculptGateState = [&](const char* stage, bool brushReached, const char* reason) {
                     if (!shouldLogSculptDiag)
@@ -10523,6 +10525,55 @@ int RunGame(NativeWindow& window,
             }
 
             const auto sceneRenderBegin = std::chrono::steady_clock::now();
+            const bool useOffscreenScene = offscreenSceneOk && frameInfo.frameActive;
+            // The editor shows the offscreen scene as its Scene View panel: while that is hidden (the
+            // Game tab in front, as in Play) its draws are skipped; the pass still opens and closes.
+            bool drawSceneView = true;
+            // The sun shadow map is rendered once and sampled by every view; its cascades are fitted
+            // to the Scene View camera, or to the Game view's while only the Game view is drawn (Play).
+            const WorldCamera* shadowCamera = &frameCamera;
+#if defined(IXTREEME_WITH_EDITOR)
+            drawSceneView = !useOffscreenScene || !runtimeSession->IsMapEditorOpen() || editorImGui.IsSceneViewVisible();
+            // The Game view's camera: the project Main Camera, or in Play the first active player
+            // character's camera (follow/first-person/top-down per its CameraMode).
+            const std::optional<WorldCamera> gameViewCamera = [&]() -> std::optional<WorldCamera> {
+                if (!gameViewOk || !runtimeSession->IsMapEditorOpen() || !editorImGui.IsGameViewVisible())
+                    return std::nullopt;
+                const CameraEntity* mainCameraEntity = nullptr;
+                for (const CameraEntity& cameraEntity : editorCameras)
+                {
+                    if (cameraEntity.id == editorMainCameraId)
+                    {
+                        mainCameraEntity = &cameraEntity;
+                        break;
+                    }
+                }
+                if (!mainCameraEntity && !editorCameras.empty())
+                    mainCameraEntity = &editorCameras.front();
+                if (!mainCameraEntity)
+                    return std::nullopt;
+                CameraEntity gameCameraEntity = *mainCameraEntity;
+                if (editorPlay.state.mode == EditorPlayMode::Play)
+                {
+                    for (const MeshSceneEntity& characterMesh : editorMeshEntities)
+                    {
+                        if (!characterMesh.hasCharacterController || !characterMesh.characterController.enabled)
+                            continue;
+                        auto stateIt = editorCharacterStates.find(characterMesh.id);
+                        if (stateIt == editorCharacterStates.end() || !stateIt->second.initialized)
+                            continue;
+                        phys::CharacterControllerComponent cc = characterMesh.characterController;
+                        phys::Sanitize(cc);
+                        gameCameraEntity = ComputeCharacterCameraEntity(
+                            *mainCameraEntity, characterMesh, cc, stateIt->second);
+                        break;
+                    }
+                }
+                return BuildCameraFromEntity(gameCameraEntity, gameView.Width(), gameView.Height());
+            }();
+            if (!drawSceneView && gameViewCamera)
+                shadowCamera = &*gameViewCamera;
+#endif
             // Sculpted terrain vertices reach the drawn vertex buffer before any pass draws the terrain
             // (outside render passes: nothing is open yet here).
             if (isInWorld && hasSceneTerrain)
@@ -10530,7 +10581,7 @@ int RunGame(NativeWindow& window,
             if (isInWorld && hasSceneTerrain && hasFrameCamera && !debugDisableShadowPass)
             {
                 rhiDevice->WriteTimestamp(ixrhi::IXRHITimestampPoint::ShadowPassBegin);
-                terrain.RenderSunShadowMap(*frameInfo.commandList, frameInfo, frameCamera);
+                terrain.RenderSunShadowMap(*frameInfo.commandList, frameInfo, *shadowCamera);
                 rhiDevice->WriteTimestamp(ixrhi::IXRHITimestampPoint::ShadowPassEnd);
             }
             if (isInWorld && hasSceneTerrain && hasFrameCamera && !debugDisableWaterReflectionPass)
@@ -10573,7 +10624,6 @@ int RunGame(NativeWindow& window,
                 rhiDevice->WriteTimestamp(ixrhi::IXRHITimestampPoint::WaterReflectionEnd);
             }
 
-            const bool useOffscreenScene = offscreenSceneOk && frameInfo.frameActive;
             // Main-window pass ownership (Phase 3C): exactly one Begin/End per
             // frame around ALL swapchain rendering (direct or composite + UI).
             bool mainPassOpen = false;
@@ -10591,12 +10641,6 @@ int RunGame(NativeWindow& window,
             else
                 beginMainPass(); // direct mode renders straight into the swapchain pass
 
-            // The editor shows the offscreen scene as its Scene View panel: while that is hidden (the
-            // Game tab in front, as in Play) its draws are skipped; the pass still opens and closes.
-            bool drawSceneView = true;
-#if defined(IXTREEME_WITH_EDITOR)
-            drawSceneView = !useOffscreenScene || !runtimeSession->IsMapEditorOpen() || editorImGui.IsSceneViewVisible();
-#endif
             std::vector<WorldLabelRenderer::Label> plates;
             if (isInWorld && drawSceneView)
             {
@@ -11356,48 +11400,16 @@ int RunGame(NativeWindow& window,
                 }
 #if defined(IXTREEME_WITH_EDITOR)
                 // --- Game view: render the scene from the main camera into the second offscreen target.
-                // Reuses this frame's shadow map (light-space, view-independent) and water reflection.
+                // Reuses this frame's shadow map (its cascades follow this camera while the Scene View
+                // is hidden, see shadowCamera) and water reflection.
                 // Only render the Game view when its panel is actually visible (active dock
                 // tab / not collapsed). Skipping it when hidden avoids a full second scene
                 // render every frame — the biggest editor perf win.
-                if (gameViewOk && runtimeSession->IsMapEditorOpen() && editorImGui.IsGameViewVisible())
                 {
-                    const CameraEntity* mainCameraEntity = nullptr;
-                    for (const CameraEntity& cameraEntity : editorCameras)
-                    {
-                        if (cameraEntity.id == editorMainCameraId)
-                        {
-                            mainCameraEntity = &cameraEntity;
-                            break;
-                        }
-                    }
-                    if (!mainCameraEntity && !editorCameras.empty())
-                        mainCameraEntity = &editorCameras.front();
-                    if (mainCameraEntity)
+                    if (gameViewCamera)  // set while the Game view panel is visible (computed above)
                     {
                         const VkExtent2D gameExtent{gameView.Width(), gameView.Height()};
-                        // In Play, the first active player character drives the Game camera
-                        // (follow/first-person/top-down per its CameraMode). Otherwise the
-                        // scene's static Main Camera is used.
-                        CameraEntity gameCameraEntity = *mainCameraEntity;
-                        if (editorPlay.state.mode == EditorPlayMode::Play)
-                        {
-                            for (const MeshSceneEntity& characterMesh : editorMeshEntities)
-                            {
-                                if (!characterMesh.hasCharacterController || !characterMesh.characterController.enabled)
-                                    continue;
-                                auto stateIt = editorCharacterStates.find(characterMesh.id);
-                                if (stateIt == editorCharacterStates.end() || !stateIt->second.initialized)
-                                    continue;
-                                phys::CharacterControllerComponent cc = characterMesh.characterController;
-                                phys::Sanitize(cc);
-                                gameCameraEntity = ComputeCharacterCameraEntity(
-                                    *mainCameraEntity, characterMesh, cc, stateIt->second);
-                                break;
-                            }
-                        }
-                        const WorldCamera gameCamera =
-                            BuildCameraFromEntity(gameCameraEntity, gameExtent.width, gameExtent.height);
+                        const WorldCamera& gameCamera = *gameViewCamera;
                         gameView.BeginMainPass(*frameInfo.commandList, frameInfo);
                         // Terrain is drawn from the project Main Camera using the secondary
                         // camera-uniform path (viewIndex=1). That path has its own per-frame

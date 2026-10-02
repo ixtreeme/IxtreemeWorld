@@ -572,6 +572,10 @@ private:
     bool m_editorLowerHeld = false;
     bool m_mapEditorOpen = false;
     bool m_editorLmbHeld = false;
+    // Brush applications in the current stroke: the per-application diagnostics (flushed log lines)
+    // are written for the first few only, not every frame while the button is held.
+    std::uint32_t m_brushDiagApplications = 0;
+    bool BrushDiagLogs() const { return m_brushDiagApplications < 2; }
     bool m_editorStrokeActive = false;
     bool m_editorCtrlHeld = false;
     bool m_editorBrushVisible = false;

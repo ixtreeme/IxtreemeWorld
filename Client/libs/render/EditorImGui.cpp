@@ -47,6 +47,7 @@
 namespace
 {
 constexpr const char* kLayoutFile = "editor_layout.ini";
+constexpr const char* kRecentProjectsFile = "editor_recent_projects.txt";  // beside the layout
 constexpr const char* kAssetPayloadType = "ASSET_ID";
 constexpr const char* kAssetFolderPayloadType = "ASSET_FOLDER_PATH";
 constexpr const char* kHierarchyEntityPayloadType = "HIERARCHY_ENTITY";
@@ -605,6 +606,7 @@ bool EditorImGui::Create()
     io.ConfigFlags |= ImGuiConfigFlags_DockingEnable;
     io.ConfigFlags |= ImGuiConfigFlags_ViewportsEnable;
     io.IniFilename = kLayoutFile;
+    ProjectManager::Instance().SetRecentProjectsFile(kRecentProjectsFile);
     m_applyDefaultDockLayout = !std::filesystem::exists(kLayoutFile);
 
     LoadEditorFonts();

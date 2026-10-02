@@ -2946,7 +2946,7 @@ bool TerrainRenderer::HandleEditorInput(const InputEvent& event)
     {
         m_editorCursorX = event.x;
         m_editorCursorY = event.y;
-        if (m_mapEditorOpen && m_editorTerrainToolActive && m_editorLmbHeld)
+        if (m_mapEditorOpen && m_editorTerrainToolActive && m_editorLmbHeld && BrushDiagLogs())
         {
             Tracenf("[TEDIT-DIAG] brush input tool=%s mouse=(%d,%d) activeTerrain=%p",
                 TeditToolModeName(m_editorToolMode),
@@ -2968,6 +2968,7 @@ bool TerrainRenderer::HandleEditorInput(const InputEvent& event)
             if (event.type == InputEvent::MouseDown)
             {
                 m_editorLmbHeld = true;
+                m_brushDiagApplications = 0;
                 if (m_editorTerrainToolActive)
                 {
                     Tracenf("[TEDIT-DIAG] brush input tool=%s mouse=(%d,%d) activeTerrain=%p",
@@ -4205,7 +4206,7 @@ bool TerrainRenderer::RaycastEditorBrush(const WorldCamera& camera,
             m_editorBrushLocalX = std::clamp(hit.x, bounds.minX, bounds.maxX);
             m_editorBrushLocalZ = std::clamp(hit.z, bounds.minZ, bounds.maxZ);
             m_editorBrushVisible = true;
-            if (m_editorLmbHeld && m_editorTerrainToolActive)
+            if (m_editorLmbHeld && m_editorTerrainToolActive && BrushDiagLogs())
             {
                 const float cellXf = (m_spawnLocalXcm + m_editorBrushLocalX * 100.0f) /
                     std::max(m_cellScaleMeters * 100.0f, 0.001f);
@@ -4486,32 +4487,36 @@ void TerrainRenderer::ApplyEditorBrush(ixrhi::IXRHIDevice& rhi, double deltaSeco
             }
         }
         m_editorSplatGpuDirty = m_editorSplatGpuDirty || changed;
-        Tracenf("[TEDIT-DIAG] splat apply terrainId=%p splatTarget=%p/%p layer=%u cellRange=(%u,%u)-(%u,%u) maskUpdated=%s changedCells=%u gpuUpload=%s",
-            m_sceneTerrainActive ? static_cast<void*>(this) : nullptr,
-            m_splatABytes.empty() ? nullptr : static_cast<void*>(m_splatABytes.data()),
-            m_splatBBytes.empty() ? nullptr : static_cast<void*>(m_splatBBytes.data()),
-            m_editorTextureSlot,
-            minX,
-            minY,
-            maxX,
-            maxY,
-            changed ? "yes" : "no",
-            changedCells,
-            m_editorSplatGpuDirty ? "pending" : "no");
-        std::ostringstream chunksText;
-        bool firstChunk = true;
-        for (std::uint32_t packed : touchedChunks)
+        if (BrushDiagLogs())
         {
-            if (!firstChunk)
-                chunksText << ";";
-            firstChunk = false;
-            chunksText << (packed & 0xffffu) << "," << (packed >> 16u);
+            Tracenf("[TEDIT-DIAG] splat apply terrainId=%p splatTarget=%p/%p layer=%u cellRange=(%u,%u)-(%u,%u) maskUpdated=%s changedCells=%u gpuUpload=%s",
+                m_sceneTerrainActive ? static_cast<void*>(this) : nullptr,
+                m_splatABytes.empty() ? nullptr : static_cast<void*>(m_splatABytes.data()),
+                m_splatBBytes.empty() ? nullptr : static_cast<void*>(m_splatBBytes.data()),
+                m_editorTextureSlot,
+                minX,
+                minY,
+                maxX,
+                maxY,
+                changed ? "yes" : "no",
+                changedCells,
+                m_editorSplatGpuDirty ? "pending" : "no");
+            std::ostringstream chunksText;
+            bool firstChunk = true;
+            for (std::uint32_t packed : touchedChunks)
+            {
+                if (!firstChunk)
+                    chunksText << ";";
+                firstChunk = false;
+                chunksText << (packed & 0xffffu) << "," << (packed >> 16u);
+            }
+            Tracenf("[TCHUNK] splat stroke chunksTouched=[%s] dirty=%zu gpuUpload=%s remesh=%s",
+                chunksText.str().c_str(),
+                touchedChunks.size(),
+                changed ? "yes" : "no",
+                changed ? "yes" : "no");
         }
-        Tracenf("[TCHUNK] splat stroke chunksTouched=[%s] dirty=%zu gpuUpload=%s remesh=%s",
-            chunksText.str().c_str(),
-            touchedChunks.size(),
-            changed ? "yes" : "no",
-            changed ? "yes" : "no");
+        ++m_brushDiagApplications;
         return;
     }
 
@@ -4612,51 +4617,55 @@ void TerrainRenderer::ApplyEditorBrush(ixrhi::IXRHIDevice& rhi, double deltaSeco
         m_vertexEditBuffer->Write(spanFirst * sizeof(Vertex), span.data(), spanCount * sizeof(Vertex));
         m_vertexBufferUploadPending = true;
     }
-    Tracenf("[TEDIT-DIAG] sculpt apply terrainId=%p tool=%s cellRange=(%u,%u)-(%u,%u) changedCells=%u gpuUpload=%s remesh=no",
-        m_sceneTerrainActive ? static_cast<void*>(this) : nullptr,
-        TeditToolName(m_editorTool),
-        minX,
-        minY,
-        maxX,
-        maxY,
-        changedHeights,
-        changedHeights > 0 ? "read-modify-write" : "no");
-    const uint32_t brushCellX = static_cast<uint32_t>(std::clamp(
-        centerGridX,
-        0.0f,
-        static_cast<float>(m_heightGridWidth > 0 ? m_heightGridWidth - 1u : 0u)));
-    const uint32_t brushCellY = static_cast<uint32_t>(std::clamp(
-        centerGridY,
-        0.0f,
-        static_cast<float>(m_heightGridHeight > 0 ? m_heightGridHeight - 1u : 0u)));
-    Tracenf("[SCULPT-DIAG] sculpt APPLY terrainId=%p worldPos=(%.2f,%.2f,%.2f) cell=(%u,%u) radius=%.2f strength=%.2f dir=%s cellsModified=%u heightDelta=%.4f gpuUpload=%s remesh=%s",
-        m_sceneTerrainActive ? static_cast<void*>(this) : nullptr,
-        m_editorBrushLocalX,
-        SampleHeightAt(m_editorBrushLocalX, m_editorBrushLocalZ),
-        m_editorBrushLocalZ,
-        brushCellX,
-        brushCellY,
-        m_editorBrushRadiusMeters,
-        m_editorBrushStrength,
-        TeditToolName(m_editorTool),
-        changedHeights,
-        maxHeightDeltaCm * 0.01f,
-        changedHeights > 0 ? "yes" : "no",
-        changedHeights > 0 ? "yes" : "no");
-    std::ostringstream chunksText;
-    bool firstChunk = true;
-    for (std::uint32_t packed : touchedChunks)
+    if (BrushDiagLogs())
     {
-        if (!firstChunk)
-            chunksText << ";";
-        firstChunk = false;
-        chunksText << (packed & 0xffffu) << "," << (packed >> 16u);
+        Tracenf("[TEDIT-DIAG] sculpt apply terrainId=%p tool=%s cellRange=(%u,%u)-(%u,%u) changedCells=%u gpuUpload=%s remesh=no",
+            m_sceneTerrainActive ? static_cast<void*>(this) : nullptr,
+            TeditToolName(m_editorTool),
+            minX,
+            minY,
+            maxX,
+            maxY,
+            changedHeights,
+            changedHeights > 0 ? "read-modify-write" : "no");
+        const uint32_t brushCellX = static_cast<uint32_t>(std::clamp(
+            centerGridX,
+            0.0f,
+            static_cast<float>(m_heightGridWidth > 0 ? m_heightGridWidth - 1u : 0u)));
+        const uint32_t brushCellY = static_cast<uint32_t>(std::clamp(
+            centerGridY,
+            0.0f,
+            static_cast<float>(m_heightGridHeight > 0 ? m_heightGridHeight - 1u : 0u)));
+        Tracenf("[SCULPT-DIAG] sculpt APPLY terrainId=%p worldPos=(%.2f,%.2f,%.2f) cell=(%u,%u) radius=%.2f strength=%.2f dir=%s cellsModified=%u heightDelta=%.4f gpuUpload=%s remesh=%s",
+            m_sceneTerrainActive ? static_cast<void*>(this) : nullptr,
+            m_editorBrushLocalX,
+            SampleHeightAt(m_editorBrushLocalX, m_editorBrushLocalZ),
+            m_editorBrushLocalZ,
+            brushCellX,
+            brushCellY,
+            m_editorBrushRadiusMeters,
+            m_editorBrushStrength,
+            TeditToolName(m_editorTool),
+            changedHeights,
+            maxHeightDeltaCm * 0.01f,
+            changedHeights > 0 ? "yes" : "no",
+            changedHeights > 0 ? "yes" : "no");
+        std::ostringstream chunksText;
+        bool firstChunk = true;
+        for (std::uint32_t packed : touchedChunks)
+        {
+            if (!firstChunk)
+                chunksText << ";";
+            firstChunk = false;
+            chunksText << (packed & 0xffffu) << "," << (packed >> 16u);
+        }
+        Tracenf("[TCHUNK] sculpt stroke chunksTouched=[%s] dirty=%zu gpuUpload=%s remesh=%s",
+            chunksText.str().c_str(),
+            touchedChunks.size(),
+            changedHeights > 0 ? "yes" : "no",
+            changedHeights > 0 ? "yes" : "no");
     }
-    Tracenf("[TCHUNK] sculpt stroke chunksTouched=[%s] dirty=%zu gpuUpload=%s remesh=%s",
-        chunksText.str().c_str(),
-        touchedChunks.size(),
-        changedHeights > 0 ? "yes" : "no",
-        changedHeights > 0 ? "yes" : "no");
+    ++m_brushDiagApplications;
 }
 
 bool TerrainRenderer::RefreshSplatTextures(ixrhi::IXRHIDevice& rhi)
@@ -4666,17 +4675,18 @@ bool TerrainRenderer::RefreshSplatTextures(ixrhi::IXRHIDevice& rhi)
     const bool okA = UpdateRgbaTexture2D(rhi, m_splatA, m_splatABytes);
     const bool okB = UpdateRgbaTexture2D(rhi, m_splatB, m_splatBBytes);
     m_editorSplatGpuDirty = !(okA && okB);
-    Tracenf("[TEDIT-DIAG] splat gpu upload terrainId=%p targets=%p/%p textureSize=%ux%u cpuSize=%ux%u okA=%d okB=%d gpuUpload=%s",
-        m_sceneTerrainActive ? static_cast<void*>(this) : nullptr,
-        m_splatA.image ? static_cast<const void*>(m_splatA.image.get()) : nullptr,
-        m_splatB.image ? static_cast<const void*>(m_splatB.image.get()) : nullptr,
-        m_splatA.width,
-        m_splatA.height,
-        m_splatWidth,
-        m_splatHeight,
-        okA ? 1 : 0,
-        okB ? 1 : 0,
-        (okA && okB) ? "yes" : "no");
+    if (BrushDiagLogs() || !(okA && okB))  // every frame while painting: only a stroke's first few
+        Tracenf("[TEDIT-DIAG] splat gpu upload terrainId=%p targets=%p/%p textureSize=%ux%u cpuSize=%ux%u okA=%d okB=%d gpuUpload=%s",
+            m_sceneTerrainActive ? static_cast<void*>(this) : nullptr,
+            m_splatA.image ? static_cast<const void*>(m_splatA.image.get()) : nullptr,
+            m_splatB.image ? static_cast<const void*>(m_splatB.image.get()) : nullptr,
+            m_splatA.width,
+            m_splatA.height,
+            m_splatWidth,
+            m_splatHeight,
+            okA ? 1 : 0,
+            okB ? 1 : 0,
+            (okA && okB) ? "yes" : "no");
     return okA && okB;
 }
 

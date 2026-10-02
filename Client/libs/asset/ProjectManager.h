@@ -27,6 +27,9 @@ public:
     bool HasProject() const { return m_hasProject; }
     const ProjectData& CurrentProject() const { return m_project; }
     const std::vector<std::filesystem::path>& RecentProjects() const { return m_recentProjects; }
+    // Persists the recent-projects list in `path` (one manifest path per line, UTF-8): loads it now
+    // (dropping projects that no longer exist) and rewrites it on every change. Unset = memory only.
+    void SetRecentProjectsFile(const std::filesystem::path& path);
 
     bool CreateProject(const std::filesystem::path& parentDirectory,
                        const std::string& projectName,
@@ -48,7 +51,10 @@ private:
     bool WriteManifest(std::string& error);
     bool ReadManifest(const std::filesystem::path& manifestPath, std::string& error);
 
+    void SaveRecentProjects() const;
+
     ProjectData m_project;
     bool m_hasProject = false;
     std::vector<std::filesystem::path> m_recentProjects;
+    std::filesystem::path m_recentProjectsFile;
 };
