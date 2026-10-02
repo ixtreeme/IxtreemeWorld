@@ -373,7 +373,8 @@ private:
                              const std::vector<std::uint8_t>& pixels,
                              ixrhi::IXRHISamplerAddress addressMode,
                              Texture& out,
-                             ixrhi::IXRHIFormat format = ixrhi::IXRHIFormat::R8G8B8A8Unorm);
+                             ixrhi::IXRHIFormat format = ixrhi::IXRHIFormat::R8G8B8A8Unorm,
+                             bool generateMips = false);
     bool UpdateRgbaTexture2D(ixrhi::IXRHIDevice& rhi, Texture& texture, const std::vector<std::uint8_t>& pixels);
     bool UploadRgbaTextureArray(ixrhi::IXRHIDevice& rhi,
                                 const std::string& name,
@@ -495,6 +496,11 @@ private:
     // m_uniformBuffers so terrain can be drawn from a second camera in the same frame
     // without clobbering the primary (free-fly) terrain draw. See Render(viewIndex).
     std::array<std::shared_ptr<ixrhi::IXRHIBuffer>, kFramesInFlight> m_uniformBuffersSecondary{};
+    // The water reflection's mirrored camera (view kReflectionUniformView). It is recorded in the
+    // same frame as the Scene View terrain: sharing that view's buffer, the reflection was drawn with
+    // whichever camera was written last (the unmirrored Scene View, without the water-level clip).
+    static constexpr uint32_t kReflectionUniformView = 2;
+    std::array<std::shared_ptr<ixrhi::IXRHIBuffer>, kFramesInFlight> m_uniformBuffersReflection{};
     // One bind-group layout (UBO + 9 combined samplers) with a slot per
     // (view, frame): slot = viewIndex * kFramesInFlight + frameIndex.
     std::unique_ptr<ixrhi::IXRHIBindGroupLayout> m_bindLayout;

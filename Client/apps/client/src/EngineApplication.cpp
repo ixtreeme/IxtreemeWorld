@@ -10760,9 +10760,11 @@ int RunGame(NativeWindow& window,
             if (isInWorld && hasSceneTerrain && hasFrameCamera && !debugDisableWaterReflectionPass)
             {
                 rhiDevice->WriteTimestamp(ixrhi::IXRHITimestampPoint::WaterReflectionBegin);
+                // One reflection per frame, mirrored for the view actually drawn (as the shadow map):
+                // the water samples it at its own screen position, so it must match that camera.
                 terrain.RenderWaterReflection(*frameInfo.commandList,
                     frameInfo,
-                    frameCamera,
+                    *shadowCamera,
                     seconds,
                     [&](const WorldCamera& mirrorCamera,
                         std::uint32_t reflectionWidth,

@@ -1,4 +1,5 @@
 #include "TerrainRenderer.h"
+#include "SceneClearColor.h"
 
 #include "Debug.h"
 #include "IXRHIBinding.h"
@@ -722,36 +723,88 @@ std::vector<uint8_t> ExtractR8Channel(const RgbaImage& image)
     return out;
 }
 
+// A tileable ripple normal map, Y-up encoded (g = up, as Water.hlsl reads it). It is the slope field
+// of a height made of many waves with integer wave vectors (so the tile wraps seamlessly), random
+// directions and phases, and an amplitude falling with frequency. Two crossing sine waves (the old
+// generator) have two dominant directions: tiled across the water they drew a regular grid.
 std::vector<std::uint8_t> GenerateWaterNormalPixels(uint32_t width,
                                                     uint32_t height,
-                                                    float frequencyA,
-                                                    float frequencyB,
-                                                    float amplitude)
+                                                    std::uint32_t seed,
+                                                    float minCyclesPerTile,
+                                                    float maxCyclesPerTile,
+                                                    float rmsSlope)
 {
-    std::vector<std::uint8_t> pixels(static_cast<size_t>(width) * height * 4u, 255);
-    constexpr float pi = xm::Pi;
+    struct Wave
+    {
+        float kx = 0.0f;
+        float ky = 0.0f;
+        float amplitude = 0.0f;
+        float phase = 0.0f;
+    };
+    constexpr float twoPi = xm::Pi * 2.0f;
+    std::uint32_t state = seed * 747796405u + 2891336453u;
+    const auto random01 = [&state]() {
+        state = state * 1664525u + 1013904223u;
+        return static_cast<float>((state >> 8u) & 0xFFFFFFu) / 16777215.0f;
+    };
+    std::vector<Wave> waves;
+    for (int attempt = 0; attempt < 512 && waves.size() < 56u; ++attempt)
+    {
+        const float angle = random01() * twoPi;
+        // Log-uniform over the band: as many short as long ripples per octave.
+        const float cycles = minCyclesPerTile * std::pow(maxCyclesPerTile / minCyclesPerTile, random01());
+        const float kx = std::round(std::cos(angle) * cycles);
+        const float ky = std::round(std::sin(angle) * cycles);
+        if (kx == 0.0f && ky == 0.0f)
+            continue;
+        const float k = std::sqrt(kx * kx + ky * ky);
+        waves.push_back({kx, ky, 1.0f / std::pow(k, 1.6f), random01() * twoPi});
+    }
+
+    const size_t pixelCount = static_cast<size_t>(width) * height;
+    std::vector<float> slopeX(pixelCount, 0.0f);
+    std::vector<float> slopeZ(pixelCount, 0.0f);
+    double sumSquares = 0.0;
     for (uint32_t y = 0; y < height; ++y)
     {
         for (uint32_t x = 0; x < width; ++x)
         {
             const float u = static_cast<float>(x) / static_cast<float>(width);
             const float v = static_cast<float>(y) / static_cast<float>(height);
-            const float h0 = xm::Sin((u * frequencyA + v * 0.35f) * pi * 2.0f);
-            const float h1 = xm::Cos((v * frequencyB - u * 0.28f) * pi * 2.0f);
-            const float dx = amplitude * (xm::Cos((u * frequencyA + v * 0.35f) * pi * 2.0f) * frequencyA -
-                xm::Sin((v * frequencyB - u * 0.28f) * pi * 2.0f) * 0.28f * frequencyB);
-            const float dz = amplitude * (xm::Cos((u * frequencyA + v * 0.35f) * pi * 2.0f) * 0.35f * frequencyA +
-                -xm::Sin((v * frequencyB - u * 0.28f) * pi * 2.0f) * frequencyB);
-            const float ripple = (h0 + h1) * 0.04f;
-            WorldVec3 n = xm::Normalize(WorldVec3{-dx + ripple, 1.0f, -dz - ripple});
-            const size_t offset = (static_cast<size_t>(y) * width + x) * 4u;
-            pixels[offset + 0] = static_cast<std::uint8_t>(std::clamp(n.x * 0.5f + 0.5f, 0.0f, 1.0f) * 255.0f);
-            pixels[offset + 1] = static_cast<std::uint8_t>(std::clamp(n.y * 0.5f + 0.5f, 0.0f, 1.0f) * 255.0f);
-            pixels[offset + 2] = static_cast<std::uint8_t>(std::clamp(n.z * 0.5f + 0.5f, 0.0f, 1.0f) * 255.0f);
-            pixels[offset + 3] = 255;
+            float dx = 0.0f;
+            float dz = 0.0f;
+            for (const Wave& wave : waves)
+            {
+                const float c = std::cos(twoPi * (wave.kx * u + wave.ky * v) + wave.phase) * wave.amplitude * twoPi;
+                dx += c * wave.kx;
+                dz += c * wave.ky;
+            }
+            const size_t index = static_cast<size_t>(y) * width + x;
+            slopeX[index] = dx;
+            slopeZ[index] = dz;
+            sumSquares += static_cast<double>(dx) * dx + static_cast<double>(dz) * dz;
         }
     }
+    const float rms = static_cast<float>(std::sqrt(sumSquares / std::max<double>(1.0, 2.0 * pixelCount)));
+    const float scale = rms > 0.0f ? rmsSlope / rms : 0.0f;
+
+    std::vector<std::uint8_t> pixels(pixelCount * 4u, 255);
+    for (size_t index = 0; index < pixelCount; ++index)
+    {
+        const WorldVec3 n = xm::Normalize(WorldVec3{-slopeX[index] * scale, 1.0f, -slopeZ[index] * scale});
+        pixels[index * 4u + 0] = static_cast<std::uint8_t>(std::clamp(n.x * 0.5f + 0.5f, 0.0f, 1.0f) * 255.0f + 0.5f);
+        pixels[index * 4u + 1] = static_cast<std::uint8_t>(std::clamp(n.y * 0.5f + 0.5f, 0.0f, 1.0f) * 255.0f + 0.5f);
+        pixels[index * 4u + 2] = static_cast<std::uint8_t>(std::clamp(n.z * 0.5f + 0.5f, 0.0f, 1.0f) * 255.0f + 0.5f);
+    }
     return pixels;
+}
+
+// Standard tangent-space normal maps keep "up" in blue; the water shader reads green as up (like the
+// generated ripple maps). Swap them so authored water normal maps tilt the surface as intended.
+void ConvertTangentNormalMapToYUp(std::vector<std::uint8_t>& pixels)
+{
+    for (size_t offset = 0; offset + 3u < pixels.size(); offset += 4u)
+        std::swap(pixels[offset + 1], pixels[offset + 2]);
 }
 
 // Loads SPIR-V words via the asset reader (aborts like the old shader loader
@@ -2087,16 +2140,21 @@ WorldCamera TerrainRenderer::ComputeMirrorCamera(const WorldCamera& camera,
                                                   std::uint32_t targetHeight,
                                                   float waterLevelY) const
 {
+    // A true planar mirror: the scene reflected across the water plane, seen through the camera's
+    // OWN view-projection. A point on the water then lands on the same screen position in both
+    // images, so the water samples the reflection at its own screen coordinate. (Before, a separate
+    // 45-degree look-up camera from below the water produced a mismatched, vertically flipped image.)
+    // The geometry is mirrored, so its winding flips: the reflection pipelines draw both faces.
+    (void)targetWidth;
+    (void)targetHeight;
     const float waterY = waterLevelY;
-    WorldCamera mirror{};
-    mirror.eye = {camera.eye.x, 2.0f * waterY - camera.eye.y, camera.eye.z};
+    const WorldMat4 reflectAcrossWater = WorldMultiply(
+        WorldMultiply(WorldTranslation(0.0f, -waterY, 0.0f), xm::Scale({1.0f, -1.0f, 1.0f})),
+        WorldTranslation(0.0f, waterY, 0.0f));
+    WorldCamera mirror = camera;
+    mirror.eye = {camera.eye.x, 2.0f * waterY - camera.eye.y, camera.eye.z};  // lighting: the mirrored viewer
     mirror.target = {camera.target.x, 2.0f * waterY - camera.target.y, camera.target.z};
-    const float aspect = targetHeight != 0 ? static_cast<float>(targetWidth) / static_cast<float>(targetHeight) : 1.0f;
-    const WorldMat4 view = WorldLookAt(mirror.eye, mirror.target, {0.0f, 1.0f, 0.0f});
-    mirror.nearPlane = camera.nearPlane;
-    mirror.farPlane = camera.farPlane;
-    const WorldMat4 projection = WorldPerspective(xm::DegreesToRadians(45.0f), aspect, mirror.nearPlane, mirror.farPlane);
-    mirror.viewProjection = WorldMultiply(view, projection);
+    mirror.viewProjection = WorldMultiply(reflectAcrossWater, camera.viewProjection);
     return mirror;
 }
 
@@ -2208,7 +2266,7 @@ void TerrainRenderer::RenderWaterReflection(ixrhi::IXRHICommandList& cmd,
     const uint32_t frameIndex = frame.frameIndex % kFramesInFlight;
     const WorldCamera mirror = ComputeMirrorCamera(camera, m_waterReflection.width, m_waterReflection.height, reflectionWaterLevelY);
     m_reflectionClipWaterLevelY = reflectionWaterLevelY;
-    UpdateUniform(frameIndex, mirror, true);
+    UpdateUniform(frameIndex, mirror, true, kReflectionUniformView);
 
     m_waterReflection.target->Begin(cmd);
     cmd.SetViewport(0.0f, 0.0f, static_cast<float>(m_waterReflection.width), static_cast<float>(m_waterReflection.height));
@@ -2232,7 +2290,7 @@ void TerrainRenderer::RenderWaterReflection(ixrhi::IXRHICommandList& cmd,
 
     TerrainPushConstants push{{1.0f, 1.0f, 0.0f, 0.0f}};
     cmd.PushConstants(&push, sizeof(push));
-    cmd.BindGroup(0, *m_bindGroup, frameIndex);
+    cmd.BindGroup(0, *m_bindGroup, kReflectionUniformView * kFramesInFlight + frameIndex);
     cmd.DrawIndexed(m_indexCount, 1, 0, 0, 0);
     ++reflectionStats.drawCalls;
 
@@ -2754,8 +2812,10 @@ bool TerrainRenderer::LoadWaterMaterialTextureSet(ixrhi::IXRHIDevice& rhi,
                 path.c_str());
             return false;
         }
+        if (label.rfind("normal", 0) == 0)
+            ConvertTangentNormalMapToYUp(image.pixels);
         return UploadRgbaTexture2D(rhi, "watermat_" + id + "_" + label, image.width, image.height, image.pixels,
-            ixrhi::IXRHISamplerAddress::Repeat, texture, format);
+            ixrhi::IXRHISamplerAddress::Repeat, texture, format, /*generateMips=*/true);
     };
 
     const bool loadedA = loadTexture(normalAPath, "normal_a", out.normalA, ixrhi::IXRHIFormat::R8G8B8A8Unorm);
@@ -3249,6 +3309,8 @@ void TerrainRenderer::Destroy()
         buffer.reset();
     for (auto& buffer : m_uniformBuffersSecondary)
         buffer.reset();
+    for (auto& buffer : m_uniformBuffersReflection)
+        buffer.reset();
     DestroyTerrainLayers();
     m_baseTexture = {};
     m_normalTexture = {};
@@ -3345,6 +3407,7 @@ bool TerrainRenderer::EnsureUniformBuffers(ixrhi::IXRHIDevice& rhi)
     };
     ensure(m_uniformBuffers, "Terrain:UBO");
     ensure(m_uniformBuffersSecondary, "Terrain:UBO secondary");
+    ensure(m_uniformBuffersReflection, "Terrain:UBO reflection");
 
     for (const auto& buffer : m_uniformBuffers)
     {
@@ -3359,6 +3422,14 @@ bool TerrainRenderer::EnsureUniformBuffers(ixrhi::IXRHIDevice& rhi)
         if (!buffer)
         {
             Tracen("[TERRAIN] secondary uniform buffer creation failed");
+            return false;
+        }
+    }
+    for (const auto& buffer : m_uniformBuffersReflection)
+    {
+        if (!buffer)
+        {
+            Tracen("[TERRAIN] reflection uniform buffer creation failed");
             return false;
         }
     }
@@ -3538,23 +3609,38 @@ bool TerrainRenderer::UploadRgbaTexture2D(ixrhi::IXRHIDevice& rhi,
     const std::vector<std::uint8_t>& pixels,
     ixrhi::IXRHISamplerAddress addressMode,
     Texture& out,
-    ixrhi::IXRHIFormat format)
+    ixrhi::IXRHIFormat format,
+    bool generateMips)
 {
     if (width == 0 || height == 0 || pixels.size() != static_cast<size_t>(width) * height * 4u)
         return false;
 
     out = {};
+    // A texture tiled across a surface needs its mip chain (and trilinear filtering): without it
+    // the distant, grazing-angle part of the surface aliases into shimmering stripes.
+    ArrayMipUpload mipUpload{};
+    if (generateMips)
+    {
+        mipUpload = BuildRgbaArrayMipUpload(width, height, 1, pixels,
+            format == ixrhi::IXRHIFormat::R8G8B8A8Srgb, name.find("normal") != std::string::npos ||
+                name.find("wave") != std::string::npos);
+    }
+    const std::uint32_t mipLevels = generateMips ? mipUpload.mipLevels : 1u;
     ixrhi::IXRHITextureDesc imageDesc;
     imageDesc.width = width;
     imageDesc.height = height;
+    imageDesc.mipLevels = mipLevels;
     imageDesc.format = format;
     imageDesc.usage = ixrhi::IXRHITextureUsage::Sampled | ixrhi::IXRHITextureUsage::TransferDst;
     imageDesc.debugName = "Terrain:" + name;
-    out.image = rhi.CreateTexture(imageDesc, pixels.data(), pixels.size());
+    out.image = generateMips
+        ? rhi.CreateTexture(imageDesc, mipUpload.pixels.data(), mipUpload.pixels.size())
+        : rhi.CreateTexture(imageDesc, pixels.data(), pixels.size());
     if (!out.image)
         return false;
 
-    out.sampler = CreateRhiSampler(rhi, addressMode, /*trilinear=*/false, /*maxLod=*/1.0f, /*mipLodBias=*/0.0f,
+    out.sampler = CreateRhiSampler(rhi, addressMode, /*trilinear=*/generateMips,
+        /*maxLod=*/generateMips ? static_cast<float>(mipLevels - 1u) : 1.0f, /*mipLodBias=*/0.0f,
         ("Terrain:" + name + ":Sampler").c_str());
     if (!out.sampler)
     {
@@ -3565,7 +3651,7 @@ bool TerrainRenderer::UploadRgbaTexture2D(ixrhi::IXRHIDevice& rhi,
     out.format = format;
     out.width = width;
     out.height = height;
-    out.mipLevels = 1;
+    out.mipLevels = mipLevels;
     out.arrayLayers = 1;
     out.name = name;
     return true;
@@ -5468,6 +5554,14 @@ bool TerrainRenderer::CreateBindGroup(ixrhi::IXRHIDevice& rhi)
             return false;
         }
     }
+    for (const auto& buffer : m_uniformBuffersReflection)
+    {
+        if (!buffer)
+        {
+            Tracen("[TERRAIN] CreateBindGroup skipped: reflection uniform buffer is not ready");
+            return false;
+        }
+    }
 
     if (!m_bindLayout)
     {
@@ -5494,10 +5588,10 @@ bool TerrainRenderer::CreateBindGroup(ixrhi::IXRHIDevice& rhi)
     }
 
     // Two camera views (primary = Scene View / free-fly, secondary = Game view
-    // / Main Camera), each with one slot per frame-in-flight. Recreating the
-    // group retires the old sets (RAII); in-flight frames keep theirs alive
-    // through the group's shared keeps.
-    m_bindGroup = rhi.CreateBindGroup(*m_bindLayout, kFramesInFlight * 2u);
+    // / Main Camera), plus the water reflection's mirrored camera, each with one slot per
+    // frame-in-flight. Recreating the group retires the old sets (RAII); in-flight frames keep
+    // theirs alive through the group's shared keeps.
+    m_bindGroup = rhi.CreateBindGroup(*m_bindLayout, kFramesInFlight * (kReflectionUniformView + 1u));
     if (!m_bindGroup)
         return false;
 
@@ -5602,6 +5696,7 @@ void TerrainRenderer::UpdateBindGroup()
     {
         writeSlot(frame, m_uniformBuffers[frame]);
         writeSlot(kFramesInFlight + frame, m_uniformBuffersSecondary[frame]);
+        writeSlot(kReflectionUniformView * kFramesInFlight + frame, m_uniformBuffersReflection[frame]);
     }
 }
 
@@ -5785,13 +5880,14 @@ bool TerrainRenderer::CreateWaterBodyMesh(ixrhi::IXRHIDevice& rhi, WaterBodyGpu&
 
 bool TerrainRenderer::CreateWaterNormalTextures(ixrhi::IXRHIDevice& rhi)
 {
-    constexpr uint32_t kSize = 128;
-    const std::vector<std::uint8_t> small = GenerateWaterNormalPixels(kSize, kSize, 18.0f, 29.0f, 0.020f);
-    const std::vector<std::uint8_t> large = GenerateWaterNormalPixels(kSize, kSize, 5.0f, 8.0f, 0.045f);
+    // Fine ripples and broad swells, each a different random wave set, with full mip chains.
+    constexpr uint32_t kSize = 256;
+    const std::vector<std::uint8_t> small = GenerateWaterNormalPixels(kSize, kSize, 0x5157u, 5.0f, 28.0f, 0.30f);
+    const std::vector<std::uint8_t> large = GenerateWaterNormalPixels(kSize, kSize, 0xB16Bu, 2.0f, 10.0f, 0.24f);
     return UploadRgbaTexture2D(rhi, "water_wave_small", kSize, kSize, small,
-               ixrhi::IXRHISamplerAddress::Repeat, m_waterNormalSmall) &&
+               ixrhi::IXRHISamplerAddress::Repeat, m_waterNormalSmall, ixrhi::IXRHIFormat::R8G8B8A8Unorm, true) &&
             UploadRgbaTexture2D(rhi, "water_wave_large", kSize, kSize, large,
-                ixrhi::IXRHISamplerAddress::Repeat, m_waterNormalLarge);
+                ixrhi::IXRHISamplerAddress::Repeat, m_waterNormalLarge, ixrhi::IXRHIFormat::R8G8B8A8Unorm, true);
 }
 
 bool TerrainRenderer::CreateWaterBindGroup(ixrhi::IXRHIDevice& rhi)
@@ -5965,8 +6061,9 @@ bool TerrainRenderer::CreateOrRecreateWaterReflectionResources(ixrhi::IXRHIDevic
         return false;
     }
 
-    // Color clears to opaque black, depth to 1.0 (parity); depth is not
-    // stored (DONT_CARE) since only the color is sampled afterwards.
+    // Color clears to the scene's own backdrop (what the reflected "sky" must show: black made the
+    // water dark at every grazing view), depth to 1.0; depth is not stored (DONT_CARE) since only
+    // the color is sampled afterwards.
     ixrhi::IXRHIRenderTargetDesc targetDesc;
     targetDesc.color = m_waterReflection.color;
     targetDesc.depth = m_waterReflection.depth;
@@ -5974,10 +6071,10 @@ bool TerrainRenderer::CreateOrRecreateWaterReflectionResources(ixrhi::IXRHIDevic
     targetDesc.colorStore = ixrhi::IXRHIStoreOp::Store;
     targetDesc.depthLoad = ixrhi::IXRHILoadOp::Clear;
     targetDesc.depthStore = ixrhi::IXRHIStoreOp::DontCare;
-    targetDesc.clearColor[0] = 0.0f;
-    targetDesc.clearColor[1] = 0.0f;
-    targetDesc.clearColor[2] = 0.0f;
-    targetDesc.clearColor[3] = 1.0f;
+    targetDesc.clearColor[0] = kSceneClearColor[0];
+    targetDesc.clearColor[1] = kSceneClearColor[1];
+    targetDesc.clearColor[2] = kSceneClearColor[2];
+    targetDesc.clearColor[3] = kSceneClearColor[3];
     targetDesc.clearDepth = 1.0f;
     targetDesc.debugName = "Terrain:Reflection";
     m_waterReflection.target = rhi.CreateRenderTarget(targetDesc);
@@ -6072,8 +6169,9 @@ bool TerrainRenderer::CreateWaterReflectionPipeline(ixrhi::IXRHIDevice& rhi)
     if (!vs || !ps)
         return false;
 
-    // Same terrain shaders as the main pipeline but front-culled (mirrored
-    // winding seen from below the water plane) with blending off.
+    // Same terrain shaders as the main pipeline with blending off. The reflection draws the scene
+    // mirrored across the water plane (ComputeMirrorCamera), which flips its winding: both faces
+    // are drawn, depth sorts them.
     ixrhi::IXRHIGraphicsPipelineDesc desc;
     desc.vertexShader = vs;
     desc.fragmentShader = ps;
@@ -6086,7 +6184,7 @@ bool TerrainRenderer::CreateWaterReflectionPipeline(ixrhi::IXRHIDevice& rhi)
         {2, 0, ixrhi::IXRHIFormat::R32G32Float, offsetof(Vertex, maskUv)},
     };
     desc.topology = ixrhi::IXRHIPrimitiveTopology::TriangleList;
-    desc.cullMode = ixrhi::IXRHICullMode::Front;
+    desc.cullMode = ixrhi::IXRHICullMode::None;
     desc.frontFace = ixrhi::IXRHIFrontFace::Clockwise;
     desc.depthTestEnable = true;
     desc.depthWriteEnable = true;
@@ -6263,7 +6361,9 @@ void TerrainRenderer::DestroyTerrainLayers()
 void TerrainRenderer::UpdateUniform(uint32_t frameIndex, const WorldCamera& camera, bool reflectionPass, uint32_t viewIndex)
 {
     const std::array<std::shared_ptr<ixrhi::IXRHIBuffer>, kFramesInFlight>& targetBuffers =
-        (viewIndex == 0) ? m_uniformBuffers : m_uniformBuffersSecondary;
+        viewIndex == kReflectionUniformView ? m_uniformBuffersReflection
+        : viewIndex == 0                    ? m_uniformBuffers
+                                            : m_uniformBuffersSecondary;
     if (frameIndex >= kFramesInFlight || !targetBuffers[frameIndex])
     {
         Tracen("[TERRAIN] UpdateUniform skipped: uniform buffer is not ready");

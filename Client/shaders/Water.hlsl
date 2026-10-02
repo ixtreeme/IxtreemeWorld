@@ -72,44 +72,71 @@ float3 SafeNormalize(float3 value, float3 fallback)
     return len2 > 0.000001 ? value * rsqrt(len2) : fallback;
 }
 
-float3 SampleWaveNormal(float2 worldXZ)
+// The horizontal tilt (normal x/z, world space) of a Y-up encoded wave normal map sampled in a
+// frame rotated by the orthonormal axes axisX/axisZ: rotating the sampling frame rotates the tilt
+// too, so it is turned back into world space.
+float2 SampleWaveTilt(Texture2D normalMap, SamplerState normalSampler, float2 uv, float2 axisX, float2 axisZ)
+{
+    const float2 tilt = normalMap.Sample(normalSampler, uv).rb * 2.0 - 1.0;
+    return axisX * tilt.x + axisZ * tilt.y;
+}
+
+// How much of a wave layer survives at the pixel's footprint (in tiles of that layer): ripples
+// shorter than a few pixels fade out instead of turning into sparkling noise far away.
+float WaveLayerVisibility(float footprintMeters, float tilesPerMeter, float fadeStartTiles, float fadeEndTiles)
+{
+    return 1.0 - smoothstep(fadeStartTiles, fadeEndTiles, footprintMeters * tilesPerMeter);
+}
+
+float2 SampleWaveTilt(float2 worldXZ)
 {
     const float time = u_levelTimeEnabled.y;
-    const float fineTiling = max(u_waveParams1.x, 0.001);
-    const float broadTiling = max(u_waveParams1.y, 0.001);
-    float2 fineBasis = float2(dot(worldXZ, float2(0.83, 0.56)), dot(worldXZ, float2(-0.56, 0.83)));
-    float2 broadBasis = float2(dot(worldXZ, float2(0.31, 0.95)), dot(worldXZ, float2(-0.95, 0.31)));
-    float2 uvSmall = fineBasis * fineTiling + float2(time * u_waveParams1.z, time * u_waveParams1.z * 0.47);
-    float2 uvLarge = broadBasis * broadTiling - float2(time * u_waveParams1.w * 0.63, time * u_waveParams1.w);
-
-    float3 proceduralSmall = u_waveNormalSmall.Sample(u_waveNormalSmallSampler, uvSmall).rgb * 2.0 - 1.0;
-    float3 proceduralLarge = u_waveNormalLarge.Sample(u_waveNormalLargeSampler, uvLarge).rgb * 2.0 - 1.0;
-    float3 proceduralNormal = (proceduralSmall + proceduralLarge) * 0.5;
+    // Long axis of the pixel's footprint on the water, in metres.
+    const float footprint = max(length(ddx(worldXZ)), length(ddy(worldXZ)));
+    // Each layer is sampled in its own rotated frame so the two tiles never line up into one grid.
+    const float2 fineAxisX = float2(0.83, 0.56);
+    const float2 fineAxisZ = float2(-0.56, 0.83);
+    const float2 broadAxisX = float2(0.31, 0.95);
+    const float2 broadAxisZ = float2(-0.95, 0.31);
+    const float2 fineBasis = float2(dot(worldXZ, fineAxisX), dot(worldXZ, fineAxisZ));
+    const float2 broadBasis = float2(dot(worldXZ, broadAxisX), dot(worldXZ, broadAxisZ));
 
     const bool useNormalA = u_textureParams.x > 0.5;
     const bool useNormalB = u_textureParams.y > 0.5;
     if (useNormalA || useNormalB)
     {
+        // Authored maps: layer B at another scale and orientation than layer A (usually the same
+        // map), otherwise both repeat on the same grid and the tiling shows.
         const float materialTiling = max(u_textureParams.w, 0.001);
         const float2 uvA = worldXZ * materialTiling + u_textureScroll.xy * time;
-        const float2 uvB = worldXZ * materialTiling + u_textureScroll.zw * time;
-        float3 texturedNormal = float3(0.0, 0.0, 0.0);
+        const float2 uvB = broadBasis * (materialTiling * 0.62) + u_textureScroll.zw * time;
+        float2 texturedTilt = float2(0.0, 0.0);
         float layerCount = 0.0;
         if (useNormalA)
         {
-            texturedNormal += u_waveNormalSmall.Sample(u_waveNormalSmallSampler, uvA).rgb * 2.0 - 1.0;
+            texturedTilt += SampleWaveTilt(u_waveNormalSmall, u_waveNormalSmallSampler, uvA, float2(1.0, 0.0), float2(0.0, 1.0)) *
+                WaveLayerVisibility(footprint, materialTiling, 0.01, 0.05);
             layerCount += 1.0;
         }
         if (useNormalB)
         {
-            texturedNormal += u_waveNormalLarge.Sample(u_waveNormalLargeSampler, uvB).rgb * 2.0 - 1.0;
+            texturedTilt += SampleWaveTilt(u_waveNormalLarge, u_waveNormalLargeSampler, uvB, broadAxisX, broadAxisZ) *
+                WaveLayerVisibility(footprint, materialTiling * 0.62, 0.01, 0.05);
             layerCount += 1.0;
         }
-        proceduralNormal = texturedNormal / max(layerCount, 1.0);
+        return texturedTilt / max(layerCount, 1.0);
     }
 
-    return SafeNormalize(float3(proceduralNormal.x, 1.0, proceduralNormal.z) * float3(u_waveParams2.x, 1.0, u_waveParams2.x),
-        float3(0.0, 1.0, 0.0));
+    // The generated maps hold 5-28 (fine) and 2-10 (broad) wave cycles per tile.
+    const float fineTiling = max(u_waveParams1.x, 0.001);
+    const float broadTiling = max(u_waveParams1.y, 0.001);
+    const float2 uvSmall = fineBasis * fineTiling + float2(time * u_waveParams1.z, time * u_waveParams1.z * 0.47);
+    const float2 uvLarge = broadBasis * broadTiling - float2(time * u_waveParams1.w * 0.63, time * u_waveParams1.w);
+    return (SampleWaveTilt(u_waveNormalSmall, u_waveNormalSmallSampler, uvSmall, fineAxisX, fineAxisZ) *
+                   WaveLayerVisibility(footprint, fineTiling, 0.02, 0.09) +
+               SampleWaveTilt(u_waveNormalLarge, u_waveNormalLargeSampler, uvLarge, broadAxisX, broadAxisZ) *
+                   WaveLayerVisibility(footprint, broadTiling, 0.03, 0.15)) *
+        0.5;
 }
 
 float FoamHash(float2 p)
@@ -146,8 +173,12 @@ float4 PSMain(VSOutput input) : SV_Target0
     if (u_levelTimeEnabled.z < 0.5)
         discard;
 
-    float3 n = SampleWaveNormal(input.worldPos.xz);
     float3 v = SafeNormalize(u_cameraPos.xyz - input.worldPos, float3(0.0, 1.0, 0.0));
+    // Toward the horizon the ripples lie flatter: seen at a grazing angle, their full tilt flips the
+    // Fresnel term between "mirror" and "see-through" on every crest, banding the water.
+    const float grazingFlatten = lerp(0.35, 1.0, saturate(abs(v.y) * 4.0));
+    float2 tilt = SampleWaveTilt(input.worldPos.xz) * (u_waveParams2.x * grazingFlatten);
+    float3 n = SafeNormalize(float3(tilt.x, 1.0, tilt.y), float3(0.0, 1.0, 0.0));
     float ndotv = saturate(dot(n, v));
     float fresnel = u_waveParams2.z + (1.0 - u_waveParams2.z) * pow(1.0 - ndotv, u_waveParams2.y);
 
@@ -185,7 +216,11 @@ float4 PSMain(VSOutput input) : SV_Target0
     if (u_refractionParams.x > 0.5)
     {
         float refractionFactor = u_refractionParams.y * (1.0 + u_refractionParams.z * depthT);
-        refractionUv = saturate(screenUv + n.xz * refractionFactor);
+        const float2 distortedUv = saturate(screenUv + n.xz * refractionFactor);
+        // Refract only toward what lies under the water: a distorted sample landing on something in
+        // front of the surface (the shore, a character) would smear it onto the water.
+        const float distortedDepthNdc = u_sceneDepthTexture.Sample(u_sceneDepthSampler, distortedUv).r;
+        refractionUv = distortedDepthNdc > waterDepthNdc ? distortedUv : screenUv;
     }
     float3 refractedColor = u_sceneColorTexture.Sample(u_sceneColorSampler, refractionUv).rgb;
     float3 underwaterColor = lerp(refractedColor, depthWaterColor, fadeT);

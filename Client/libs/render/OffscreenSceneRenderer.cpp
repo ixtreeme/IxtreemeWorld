@@ -6,6 +6,7 @@
 #include "OffscreenSceneRenderer.h"
 
 #include "Debug.h"
+#include "SceneClearColor.h"
 #include "IXRHIShader.h"
 #include "asset/IAssetReader.h"
 
@@ -243,10 +244,10 @@ bool OffscreenSceneRenderer::CreateTargets(ixrhi::IXRHIDevice& rhi)
     clearDesc.colorStore = ixrhi::IXRHIStoreOp::Store;
     clearDesc.depthLoad = ixrhi::IXRHILoadOp::Clear;
     clearDesc.depthStore = ixrhi::IXRHIStoreOp::Store;
-    clearDesc.clearColor[0] = 0.04f;
-    clearDesc.clearColor[1] = 0.05f;
-    clearDesc.clearColor[2] = 0.09f;
-    clearDesc.clearColor[3] = 1.0f;
+    clearDesc.clearColor[0] = kSceneClearColor[0];
+    clearDesc.clearColor[1] = kSceneClearColor[1];
+    clearDesc.clearColor[2] = kSceneClearColor[2];
+    clearDesc.clearColor[3] = kSceneClearColor[3];
     clearDesc.clearDepth = 1.0f;
     clearDesc.debugName = m_tag + ".ClearTarget";
     m_clearTarget = rhi.CreateRenderTarget(clearDesc);

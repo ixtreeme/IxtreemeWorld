@@ -2336,8 +2336,8 @@ bool SkinnedMeshRenderer::CreateReflectionPipeline(ixrhi::IXRHIDevice& rhi,
     if (!vs || !ps)
         return false;
 
-    // Same state as the main pipeline except front-face culling (mirrored
-    // winding seen from below the water plane) — exactly like before.
+    // Same state as the main pipeline (no culling): the reflection draws the mesh mirrored across
+    // the water plane, which flips its winding.
     // A null pass means the backend default (swapchain pass); the token is
     // stored EFFECTIVE (null resolved to m_targetPass at bake time) so later
     // target swaps are detected by RenderInWorldReflection.
@@ -2353,7 +2353,7 @@ bool SkinnedMeshRenderer::CreateReflectionPipeline(ixrhi::IXRHIDevice& rhi,
         {2, 0, ixrhi::IXRHIFormat::R32G32Float, offsetof(Vertex, uv)},
     };
     desc.topology = ixrhi::IXRHIPrimitiveTopology::TriangleList;
-    desc.cullMode = ixrhi::IXRHICullMode::Front;
+    desc.cullMode = ixrhi::IXRHICullMode::None;
     desc.frontFace = ixrhi::IXRHIFrontFace::Clockwise;
     desc.depthTestEnable = true;
     desc.depthWriteEnable = true;
