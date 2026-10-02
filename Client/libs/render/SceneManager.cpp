@@ -19,8 +19,10 @@
 #include <iomanip>
 #include <limits>
 #include <map>
+#include <mutex>
 #include <optional>
 #include <sstream>
+#include <unordered_map>
 #include <utility>
 
 #if defined(_WIN32)
@@ -326,6 +328,135 @@ bool WriteBytes(const std::filesystem::path& path, const std::vector<std::uint8_
         return false;
     if (!bytes.empty())
         file.write(reinterpret_cast<const char*>(bytes.data()), static_cast<std::streamsize>(bytes.size()));
+    file.close();
+    return !file.fail();
+}
+
+// Content stamps of the terrain chunk files this process last wrote or read, so a scene save
+// rewrites only the chunks whose bytes changed (rewriting every chunk file blocked each save and
+// autosave for ~150 ms). A stamp only counts while the file on disk still has the size and write
+// time recorded with it: anything else touching the file forces a rewrite.
+struct TerrainFileStamp
+{
+    std::uint64_t contentHash = 0;
+    std::uintmax_t size = 0;
+    std::filesystem::file_time_type writeTime{};
+};
+
+struct OnDiskFile
+{
+    std::uintmax_t size = 0;
+    std::filesystem::file_time_type writeTime{};
+};
+
+std::mutex g_terrainFileStampMutex;
+std::unordered_map<std::string, TerrainFileStamp> g_terrainFileStamps;
+
+std::string TerrainFileStampKey(const std::filesystem::path& path)
+{
+    return path.lexically_normal().generic_string();
+}
+
+std::uint64_t RotateLeft64(std::uint64_t value, int bits)
+{
+    return (value << bits) | (value >> (64 - bits));
+}
+
+std::uint64_t HashBytes64(const std::vector<std::uint8_t>& bytes)
+{
+    constexpr std::uint64_t kPrime1 = 0x9E3779B185EBCA87ull;
+    constexpr std::uint64_t kPrime2 = 0xC2B2AE3D27D4EB4Full;
+    constexpr std::uint64_t kPrime3 = 0x165667B19E3779F9ull;
+    std::uint64_t hash = 0x27D4EB2F165667C5ull ^ (static_cast<std::uint64_t>(bytes.size()) * kPrime1);
+    size_t i = 0;
+    for (; i + 8u <= bytes.size(); i += 8u)
+    {
+        std::uint64_t word = 0;
+        std::memcpy(&word, bytes.data() + i, 8u);
+        hash ^= RotateLeft64(word * kPrime2, 31) * kPrime1;
+        hash = RotateLeft64(hash, 27) * kPrime1 + kPrime3;
+    }
+    for (; i < bytes.size(); ++i)
+    {
+        hash ^= static_cast<std::uint64_t>(bytes[i]) * kPrime3;
+        hash = RotateLeft64(hash, 11) * kPrime1;
+    }
+    hash ^= hash >> 33;
+    hash *= kPrime2;
+    hash ^= hash >> 29;
+    hash *= kPrime3;
+    hash ^= hash >> 32;
+    return hash;
+}
+
+void RecordTerrainFileStamp(const std::filesystem::path& path, std::uint64_t contentHash,
+                            std::uintmax_t size, std::filesystem::file_time_type writeTime)
+{
+    std::scoped_lock lock(g_terrainFileStampMutex);
+    g_terrainFileStamps[TerrainFileStampKey(path)] = TerrainFileStamp{contentHash, size, writeTime};
+}
+
+void ForgetTerrainFileStamp(const std::filesystem::path& path)
+{
+    std::scoped_lock lock(g_terrainFileStampMutex);
+    g_terrainFileStamps.erase(TerrainFileStampKey(path));
+}
+
+// Size and write time of every file in a directory, from one enumeration (cheaper than a stat per file).
+std::unordered_map<std::string, OnDiskFile> ListFilesOnDisk(const std::filesystem::path& directory)
+{
+    std::unordered_map<std::string, OnDiskFile> files;
+    std::error_code ec;
+    for (std::filesystem::directory_iterator it(directory, ec), end; !ec && it != end; it.increment(ec))
+    {
+        std::error_code entryEc;
+        if (!it->is_regular_file(entryEc))
+            continue;
+        OnDiskFile file;
+        file.size = it->file_size(entryEc);
+        if (entryEc)
+            continue;
+        file.writeTime = it->last_write_time(entryEc);
+        if (entryEc)
+            continue;
+        files.emplace(it->path().filename().generic_string(), file);
+    }
+    return files;
+}
+
+// Writes bytes unless the file on disk is known to hold exactly them already. onDisk lists the
+// files of path's directory (ListFilesOnDisk). written reports whether the file was rewritten.
+bool WriteBytesIfChanged(const std::filesystem::path& path, const std::vector<std::uint8_t>& bytes,
+                         const std::unordered_map<std::string, OnDiskFile>& onDisk, bool& written)
+{
+    written = false;
+    const std::uint64_t contentHash = HashBytes64(bytes);
+    const auto disk = onDisk.find(path.filename().generic_string());
+    if (disk != onDisk.end() && disk->second.size == bytes.size())
+    {
+        std::scoped_lock lock(g_terrainFileStampMutex);
+        const auto stamp = g_terrainFileStamps.find(TerrainFileStampKey(path));
+        if (stamp != g_terrainFileStamps.end() &&
+            stamp->second.contentHash == contentHash &&
+            stamp->second.size == bytes.size() &&
+            stamp->second.writeTime == disk->second.writeTime)
+        {
+            return true;
+        }
+    }
+
+    if (!WriteBytes(path, bytes))
+    {
+        ForgetTerrainFileStamp(path);
+        return false;
+    }
+    written = true;
+    std::error_code ec;
+    const std::filesystem::file_time_type writeTime = std::filesystem::last_write_time(path, ec);
+    if (ec)
+        ForgetTerrainFileStamp(path);
+    else
+        RecordTerrainFileStamp(path, contentHash, bytes.size(), writeTime);
     return true;
 }
 
@@ -534,16 +665,23 @@ bool WriteTerrainChunkSet(const std::filesystem::path& scenePath,
     if (!WriteBytes(absoluteMapDir / "map.manifest", manifest))
         return false;
 
+    const std::unordered_map<std::string, OnDiskFile> chunksOnDisk = ListFilesOnDisk(absoluteMapDir / "chunks");
     std::uint32_t written = 0;
+    std::uint32_t unchanged = 0;
     for (std::uint32_t cy = 0; cy < chunksY; ++cy)
     {
         for (std::uint32_t cx = 0; cx < chunksX; ++cx)
         {
             const std::filesystem::path chunkPath = absoluteMapDir / "chunks" /
                 ("chunk_" + std::to_string(cx) + "_" + std::to_string(cy) + ".mxchunk");
-            if (!WriteBytes(chunkPath, BuildMxChunkBytes(terrain, cx, cy, worldCells, chunkSize)))
+            bool chunkWritten = false;
+            if (!WriteBytesIfChanged(chunkPath, BuildMxChunkBytes(terrain, cx, cy, worldCells, chunkSize),
+                    chunksOnDisk, chunkWritten))
                 return false;
-            ++written;
+            if (chunkWritten)
+                ++written;
+            else
+                ++unchanged;
         }
     }
 
@@ -551,8 +689,9 @@ bool WriteTerrainChunkSet(const std::filesystem::path& scenePath,
     terrain.heightmapRef.clear();
     terrain.splatRef.clear();
     terrain.maskRef.clear();
-    Tracenf("[TCHUNK] save chunks=%u manifest=%s",
+    Tracenf("[TCHUNK] save chunks=%u unchanged=%u manifest=%s",
         written,
+        unchanged,
         terrain.chunkManifestRef.c_str());
     Tracen("[TMAT] saved per-layer params: layers=8");
     return true;
@@ -572,9 +711,16 @@ bool ReadTerrainChunkSet(const std::filesystem::path& sceneDir,
         std::filesystem::path p(path);
         if (!p.is_absolute())
             p = sceneDir / p;
+        // Write time taken before reading: a change made after it fails the stamp check on save.
+        std::error_code timeEc;
+        const std::filesystem::file_time_type writeTime = std::filesystem::last_write_time(p, timeEc);
         std::vector<std::uint8_t> bytes = ReadBytes(p);
         if (bytes.empty())
             return std::nullopt;
+        if (timeEc)
+            ForgetTerrainFileStamp(p);
+        else
+            RecordTerrainFileStamp(p, HashBytes64(bytes), bytes.size(), writeTime);
         return bytes;
     };
     const std::filesystem::path relativeRoot = std::filesystem::relative(mapRoot, sceneDir);

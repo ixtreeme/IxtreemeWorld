@@ -4792,6 +4792,14 @@ int RunGame(NativeWindow& window,
     double lastPerfLogSeconds = -1000.0;
     bool debugDisableAssetLibraryDiscovery = false;
     bool debugDisableAssetWatcherPoll = false;
+    // Watcher-reported asset changes refresh the asset library once the file system has been quiet
+    // for a moment (bounded by a maximum delay), so copying many files in costs one full refresh
+    // instead of one per frame while the copy runs.
+    constexpr auto kAssetRefreshQuietTime = std::chrono::milliseconds(250);
+    constexpr auto kAssetRefreshMaxDelay = std::chrono::milliseconds(1000);
+    bool assetRefreshPending = false;
+    std::chrono::steady_clock::time_point assetRefreshFirstChange{};
+    std::chrono::steady_clock::time_point assetRefreshLastChange{};
     bool debugDisableHierarchyIteration = false;
     bool debugShowPhysicsColliders = false;
     bool showLayerVolumes = false;
@@ -4920,6 +4928,17 @@ int RunGame(NativeWindow& window,
 
         if (assetWatcherChanged)
         {
+            assetRefreshLastChange = std::chrono::steady_clock::now();
+            if (!assetRefreshPending)
+                assetRefreshFirstChange = assetRefreshLastChange;
+            assetRefreshPending = true;
+        }
+        const auto assetRefreshCheck = std::chrono::steady_clock::now();
+        if (assetRefreshPending &&
+            (assetRefreshCheck - assetRefreshLastChange >= kAssetRefreshQuietTime ||
+             assetRefreshCheck - assetRefreshFirstChange >= kAssetRefreshMaxDelay))
+        {
+            assetRefreshPending = false;
             const auto assetRefreshBegin = std::chrono::steady_clock::now();
             if (!debugDisableAssetLibraryDiscovery)
                 editorImGui.RefreshAssetLibrary();
