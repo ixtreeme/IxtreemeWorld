@@ -35,6 +35,7 @@
 #include <functional>
 #include <limits>
 #include <memory>
+#include <optional>
 #include <string>
 #include <unordered_map>
 #include <vector>
@@ -131,6 +132,8 @@ public:
                                   std::shared_ptr<ixrhi::IXRHISampler> sampler,
                                   std::uint32_t width,
                                   std::uint32_t height);
+    // Whether any enabled water body is inside the camera's view (its water pass would draw).
+    bool AnyWaterBodyInView(const WorldCamera& camera) const;
     bool HandleEditorInput(const InputEvent& event);
     void UpdateEditor(ixrhi::IXRHIDevice& rhi,
                       double deltaSeconds,
@@ -139,9 +142,13 @@ public:
                       uint32_t viewportHeight);
     // Reflection callback receives the borrowed IXRHI pass of the reflection
     // target (plus its extent) so guest draws bake against the real pass.
+    // viewWidth x viewHeight is the size of the view the water is drawn into (the reflection is a
+    // fraction of it); nothing is drawn while no water body is in the camera's view.
     void RenderWaterReflection(ixrhi::IXRHICommandList& cmd,
                                const ixrhi::IXRHIFrameInfo& frame,
                                const WorldCamera& camera,
+                               std::uint32_t viewWidth,
+                               std::uint32_t viewHeight,
                                double timeSeconds,
                                const std::function<void(const WorldCamera&,
                                                         std::uint32_t,
@@ -343,6 +350,9 @@ private:
         // cameras in one frame without clobbering. Selected by RenderWater(viewIndex).
         std::array<std::shared_ptr<ixrhi::IXRHIBuffer>, kFramesInFlight> uniformBuffersSecondary{};
         uint32_t indexCount = 0;
+        // World bounds of the mesh, for skipping a body (and its reflection) no camera sees.
+        WorldVec3 boundsMin{};
+        WorldVec3 boundsMax{};
     };
 
     struct WaterMaterialTextureSet
@@ -419,9 +429,12 @@ private:
                                  const WaterMaterialTextureSet* materialTextures = nullptr);
     bool CreateWaterPipeline(ixrhi::IXRHIDevice& rhi);
     bool CreateOrRecreateWaterReflectionResources(ixrhi::IXRHIDevice& rhi, bool force);
+    // viewWidth/viewHeight: the view the reflection is for (0: the swapchain's size).
     bool CreateOrRecreateWaterReflectionResources(ixrhi::IXRHIDevice& rhi,
                                                   bool force,
-                                                  WaterConfig::ReflectionQuality quality);
+                                                  WaterConfig::ReflectionQuality quality,
+                                                  std::uint32_t viewWidth = 0,
+                                                  std::uint32_t viewHeight = 0);
     bool CreateWaterReflectionPipeline(ixrhi::IXRHIDevice& rhi);
     void DestroyWaterReflectionResources();
     void DestroyWaterReflectionPipeline();
@@ -429,7 +442,9 @@ private:
                                     std::uint32_t targetWidth,
                                     std::uint32_t targetHeight,
                                     float waterLevelY) const;
+    // The enabled water body closest to the camera among those in its view (null: none in view).
     const WaterBodyGpu* FindClosestWaterBody(const WorldCamera& camera, float* outDistanceMeters = nullptr) const;
+    bool WaterBodyInView(const WaterBodyGpu& waterBody, const WorldCamera& camera) const;
     const WaterConfig& ResolveWaterConfig(const WaterBody& body) const;
     void DestroyWaterResources();
     void DestroyWaterBodyResources();
@@ -541,6 +556,23 @@ private:
     std::unique_ptr<ixrhi::IXRHIGraphicsPipeline> m_shadowPipeline;
     std::array<WorldMat4, kShadowCascadeCount> m_shadowCascadeViewProj{};
     std::uint64_t m_shadowDrawnFrame = ~0ull;  // frame number of the last RenderSunShadowMap draw
+    // What the shadow map was last drawn from. While it stays the same (an editor camera at rest)
+    // the map is reused instead of drawn again: only the terrain casts into it.
+    struct ShadowMapInputs
+    {
+        float eye[3] = {};
+        float target[3] = {};
+        float sunAzimuth = 0.0f;
+        float sunElevation = 0.0f;
+        const void* vertexBuffer = nullptr;
+        const void* indexBuffer = nullptr;
+        const void* shadowTexture = nullptr;
+        std::uint32_t indexCount = 0;
+        std::uint64_t geometryRevision = 0;
+        bool operator==(const ShadowMapInputs&) const = default;
+    };
+    std::optional<ShadowMapInputs> m_shadowMapInputs;
+    std::uint64_t m_terrainGeometryRevision = 0;  // bumped by every vertex upload (sculpting)
     float m_shadowCascadeSplits[kShadowCascadeCount] = {5.0f, 15.0f, 50.0f, 200.0f};
     Texture m_baseTexture;
     Texture m_normalTexture;

@@ -1,6 +1,14 @@
 // This file is included from EditorImGui.cpp inside the editor-enabled implementation block.
 // Keep shared anonymous-namespace helpers in EditorImGui.cpp until this panel group is fully decoupled.
 
+// A view panel's image area in framebuffer pixels (what its render target should be).
+static void StorePanelPixels(const ImVec2& avail, std::uint32_t (&pixels)[2])
+{
+    const ImVec2 scale = ImGui::GetIO().DisplayFramebufferScale;
+    pixels[0] = static_cast<std::uint32_t>(std::max(0.0f, ixtreeme::math::Round(avail.x * scale.x)));
+    pixels[1] = static_cast<std::uint32_t>(std::max(0.0f, ixtreeme::math::Round(avail.y * scale.y)));
+}
+
 void EditorImGui::RenderDemoPanels()
 {
     if (!m_editorModeActive)
@@ -160,6 +168,7 @@ void EditorImGui::RenderSceneViewDropTarget()
 
     const ImVec2 sceneMin = ImGui::GetCursorScreenPos();
     const ImVec2 avail = ImGui::GetContentRegionAvail();
+    StorePanelPixels(avail, m_sceneViewPanelPixels);
     const ImGuiViewport* mainViewport = ImGui::GetMainViewport();
     const ImVec2 viewportPos = mainViewport ? mainViewport->Pos : ImVec2(0.0f, 0.0f);
     ImVec2 imageMin = sceneMin;
@@ -486,6 +495,7 @@ void EditorImGui::RenderGameViewPanel()
 
     const ImVec2 regionMin = ImGui::GetCursorScreenPos();
     const ImVec2 avail = ImGui::GetContentRegionAvail();
+    StorePanelPixels(avail, m_gameViewPanelPixels);
     ImVec2 imageMin = regionMin;
     ImVec2 imageSize = avail;
     std::uint32_t gameViewWidth = 0;

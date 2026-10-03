@@ -168,10 +168,11 @@ float LinearizeWaterDepth(float ndcDepth)
     return b / max(a - saturate(ndcDepth), 0.000001);
 }
 
+// The depth test runs before shading: most of a water body's surface can lie under the terrain or
+// behind a hill, and those pixels must cost nothing. (A disabled body is not drawn at all.)
+[earlydepthstencil]
 float4 PSMain(VSOutput input) : SV_Target0
 {
-    if (u_levelTimeEnabled.z < 0.5)
-        discard;
 
     float3 v = SafeNormalize(u_cameraPos.xyz - input.worldPos, float3(0.0, 1.0, 0.0));
     // Toward the horizon the ripples lie flatter: seen at a grazing angle, their full tilt flips the

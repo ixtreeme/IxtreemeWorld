@@ -33,19 +33,26 @@ struct VSOutput
     float2 ndc : TEXCOORD1;
 };
 
-// 1 where the sun reaches p, 0 in its shadow; the finest cascade that contains p decides.
-float SunVisibility(float3 p)
+// 1 where the sun reaches a point, 0 in its shadow, from the point's position in each cascade's
+// light space (x/y: shadow map uv, z: depth); the finest cascade that contains it decides.
+float SunVisibility(float3 lightSpace[4])
 {
     [unroll]
     for (int cascade = 0; cascade < 4; ++cascade)
     {
-        const float4 lightSpace = mul(float4(p, 1.0), u_cascadeViewProj[cascade]);
-        const float3 ndc = lightSpace.xyz / max(lightSpace.w, 0.0001);
-        const float2 uv = ndc.xy * 0.5 + 0.5;
-        if (all(uv > 0.0) && all(uv < 1.0) && ndc.z > 0.0 && ndc.z < 1.0)
-            return u_shadow.SampleCmpLevelZero(u_shadowSampler, float3(uv, (float)cascade), ndc.z - u_push.params.y);
+        const float3 p = lightSpace[cascade];
+        if (all(p > 0.0) && all(p < 1.0))
+            return u_shadow.SampleCmpLevelZero(u_shadowSampler, float3(p.xy, (float)cascade), p.z - u_push.params.y);
     }
     return 1.0;  // past the last cascade there is no shadow information: the air there is lit
+}
+
+// A world position in a cascade's light space as (shadow map uv, depth). The cascades' projections
+// are orthographic, so this is affine: along a ray it changes by the same step each march step.
+float3 CascadeLightSpace(float3 p, int cascade)
+{
+    const float3 ndc = mul(float4(p, 1.0), u_cascadeViewProj[cascade]).xyz;
+    return float3(ndc.xy * 0.5 + 0.5, ndc.z);
 }
 
 // Henyey-Greenstein phase, scaled so that even scattering (g = 0) is 1 in every direction.
@@ -71,17 +78,33 @@ float4 MarchPS(VSOutput input) : SV_Target
     const float3 dir = ray / max(distance, 1e-4);
 
     const float rayLength = min(distance, u_push.cameraPos.w);
-    const int steps = clamp((int)(u_push.params.x + 0.5), 4, 128);
+    // Steps of (at most) the same length on every ray: a ray that ends on nearby ground takes a few
+    // of them, not the full count a ray into the sky needs.
+    const int maxSteps = clamp((int)(u_push.params.x + 0.5), 4, 128);
+    const float maxStepLength = u_push.cameraPos.w / maxSteps;
+    const int steps = clamp((int)ceil(rayLength / maxStepLength), 4, maxSteps);
     const float stepLength = rayLength / steps;
     const float stepTransmittance = exp(-u_push.sunDir.w * stepLength);
-    float t = stepLength * InterleavedGradientNoise(input.position.xy);
+    const float t0 = stepLength * InterleavedGradientNoise(input.position.xy);
+    // The march in each cascade's light space: a start and a per-step offset instead of four
+    // matrix transforms per step.
+    float3 lightSpace[4];
+    float3 lightSpaceStep[4];
+    [unroll]
+    for (int cascade = 0; cascade < 4; ++cascade)
+    {
+        lightSpace[cascade] = CascadeLightSpace(camera + dir * t0, cascade);
+        lightSpaceStep[cascade] = CascadeLightSpace(camera + dir * (t0 + stepLength), cascade) - lightSpace[cascade];
+    }
     float transmittance = 1.0;
     float lit = 0.0;
     for (int i = 0; i < steps; ++i)
     {
-        lit += SunVisibility(camera + dir * t) * transmittance;
+        lit += SunVisibility(lightSpace) * transmittance;
         transmittance *= stepTransmittance;
-        t += stepLength;
+        [unroll]
+        for (int c = 0; c < 4; ++c)
+            lightSpace[c] += lightSpaceStep[c];
     }
     // Each lit step scatters (1 - its transmittance) of the sunlight towards the camera. The 0.25 keeps
     // the haze under the brightness of the lit scene (the image is not HDR).

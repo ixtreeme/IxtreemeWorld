@@ -708,8 +708,11 @@ void EditorImGui::RenderProjectSettingsWindow()
             m_commands.renderResolutionHeight = height;
             Tracenf("[RENDER-RES] request mode=%s size=%ux%u", native ? "native" : "fixed", width, height);
         };
-        const char* modes[] = {"Window size", "3840 x 2160", "2560 x 1440", "1920 x 1080", "1600 x 900", "1280 x 720", "Custom"};
-        if (UI::Prop::Combo("Render resolution", &m_renderResolutionMode, modes, IM_ARRAYSIZE(modes)))
+        const char* modes[] = {"View size", "3840 x 2160", "2560 x 1440", "1920 x 1080", "1600 x 900", "1280 x 720", "Custom"};
+        const bool resolutionChanged = UI::Prop::Combo("Render resolution", &m_renderResolutionMode, modes, IM_ARRAYSIZE(modes));
+        UI::ItemTooltip("View size: the Scene View and Game panels render at their own size on screen.\n"
+                        "A fixed size renders that many pixels and scales the image into the panel.");
+        if (resolutionChanged)
         {
             switch (m_renderResolutionMode)
             {

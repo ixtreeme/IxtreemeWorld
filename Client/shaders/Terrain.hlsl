@@ -305,6 +305,13 @@ float3 DecodeLayerNormalGrad(float2 uv, float2 uvDx, float2 uvDy, int layer)
     return SafeNormalize(sampledNormal, float3(0.0, 0.0, 1.0));
 }
 
+// A layer's ambient occlusion, roughness and metallic in one fetch: the renderer packs them into one
+// RGBA array (bound to the ao, roughness and metallic slots alike).
+float3 SampleLayerOrm(float2 uv, float2 uvDx, float2 uvDy, int layer)
+{
+    return u_aoTex.SampleGrad(u_aoSampler, float3(uv, (float)layer), uvDx, uvDy).rgb;
+}
+
 float3 TriplanarNormalToWorld(float3 normalTs, int axis, float3 surfaceNormal)
 {
     if (axis == 0)
@@ -488,9 +495,10 @@ float4 PSMain(VSOutput input) : SV_Target0
         {
             const float3 normalY = TriplanarNormalToWorld(DecodeLayerNormalGrad(uvY, uvYDx, uvYDy, layer), 1, surfaceNormal);
             diffuse = u_paletteTex.SampleGrad(u_paletteSampler, float3(uvY, (float)layer), uvYDx, uvYDy).rgb;
-            sampledAo = u_aoTex.SampleGrad(u_aoSampler, float3(uvY, (float)layer), uvYDx, uvYDy).r;
-            sampledRoughness = u_roughnessTex.SampleGrad(u_roughnessSampler, float3(uvY, (float)layer), uvYDx, uvYDy).r;
-            sampledMetallic = u_metallicTex.SampleGrad(u_metallicSampler, float3(uvY, (float)layer), uvYDx, uvYDy).r;
+            const float3 ormY = SampleLayerOrm(uvY, uvYDx, uvYDy, layer);
+            sampledAo = ormY.r;
+            sampledRoughness = ormY.g;
+            sampledMetallic = ormY.b;
             sampledNormalWs = normalY;
 
             [branch]
@@ -498,18 +506,12 @@ float4 PSMain(VSOutput input) : SV_Target0
             {
                 const float3 diffuseX = u_paletteTex.SampleGrad(u_paletteSampler, float3(uvX, (float)layer), uvXDx, uvXDy).rgb;
                 const float3 diffuseZ = u_paletteTex.SampleGrad(u_paletteSampler, float3(uvZ, (float)layer), uvZDx, uvZDy).rgb;
-                const float triAo =
-                    u_aoTex.SampleGrad(u_aoSampler, float3(uvX, (float)layer), uvXDx, uvXDy).r * triplanarWeights.x +
-                    sampledAo * triplanarWeights.y +
-                    u_aoTex.SampleGrad(u_aoSampler, float3(uvZ, (float)layer), uvZDx, uvZDy).r * triplanarWeights.z;
-                const float triRoughness =
-                    u_roughnessTex.SampleGrad(u_roughnessSampler, float3(uvX, (float)layer), uvXDx, uvXDy).r * triplanarWeights.x +
-                    sampledRoughness * triplanarWeights.y +
-                    u_roughnessTex.SampleGrad(u_roughnessSampler, float3(uvZ, (float)layer), uvZDx, uvZDy).r * triplanarWeights.z;
-                const float triMetallic =
-                    u_metallicTex.SampleGrad(u_metallicSampler, float3(uvX, (float)layer), uvXDx, uvXDy).r * triplanarWeights.x +
-                    sampledMetallic * triplanarWeights.y +
-                    u_metallicTex.SampleGrad(u_metallicSampler, float3(uvZ, (float)layer), uvZDx, uvZDy).r * triplanarWeights.z;
+                const float3 ormX = SampleLayerOrm(uvX, uvXDx, uvXDy, layer);
+                const float3 ormZ = SampleLayerOrm(uvZ, uvZDx, uvZDy, layer);
+                const float3 triOrm = ormX * triplanarWeights.x + ormY * triplanarWeights.y + ormZ * triplanarWeights.z;
+                const float triAo = triOrm.r;
+                const float triRoughness = triOrm.g;
+                const float triMetallic = triOrm.b;
                 const float3 triDiffuse = diffuseX * triplanarWeights.x +
                     diffuse * triplanarWeights.y +
                     diffuseZ * triplanarWeights.z;
@@ -532,9 +534,10 @@ float4 PSMain(VSOutput input) : SV_Target0
         {
             diffuse = u_paletteTex.SampleGrad(u_paletteSampler, float3(materialUv, (float)layer), materialUvDx, materialUvDy).rgb;
             sampledNormal = DecodeLayerNormalGrad(materialUv, materialUvDx, materialUvDy, layer);
-            sampledAo = u_aoTex.SampleGrad(u_aoSampler, float3(materialUv, (float)layer), materialUvDx, materialUvDy).r;
-            sampledRoughness = u_roughnessTex.SampleGrad(u_roughnessSampler, float3(materialUv, (float)layer), materialUvDx, materialUvDy).r;
-            sampledMetallic = u_metallicTex.SampleGrad(u_metallicSampler, float3(materialUv, (float)layer), materialUvDx, materialUvDy).r;
+            const float3 orm = SampleLayerOrm(materialUv, materialUvDx, materialUvDy, layer);
+            sampledAo = orm.r;
+            sampledRoughness = orm.g;
+            sampledMetallic = orm.b;
         }
         albedo += weights[layer] * diffuse * u_materialTintNormal[layer].rgb;
         if (triplanarEnabled)

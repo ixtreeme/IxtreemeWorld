@@ -79,13 +79,18 @@ float4 BlurPS(VSOutput input) : SV_Target
 // rayParams.xy = one texel in uv.
 float4 VolBlurPS(VSOutput input) : SV_Target
 {
+    // The 5x5 box in 9 bilinear taps: a tap 1.5 texels out averages two texels, so weighed twice it
+    // stands for both of them.
+    const float offsets[3] = {-1.5, 0.0, 1.5};
+    const float weights[3] = {2.0, 1.0, 2.0};
     float3 sum = float3(0.0, 0.0, 0.0);
     [unroll]
-    for (int y = -2; y <= 2; ++y)
+    for (int y = 0; y < 3; ++y)
     {
         [unroll]
-        for (int x = -2; x <= 2; ++x)
-            sum += u_source.SampleLevel(u_sourceSampler, input.uv + float2(x, y) * u_push.rayParams.xy, 0.0).rgb;
+        for (int x = 0; x < 3; ++x)
+            sum += u_source.SampleLevel(u_sourceSampler, input.uv + float2(offsets[x], offsets[y]) * u_push.rayParams.xy, 0.0).rgb *
+                (weights[x] * weights[y]);
     }
     return float4(sum / 25.0, 1.0);
 }

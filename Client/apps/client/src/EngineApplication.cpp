@@ -2714,6 +2714,12 @@ int RunGame(NativeWindow& window,
         Tracenf("[MESH-ENTITY] StaticMeshRenderer loaded: %s", modelPath.c_str());
         return entry.renderer.get();
     };
+    // A view panel's pixel size as the render size, or nothing (the panel was not laid out yet).
+    auto panelRenderExtent = [](std::uint32_t width, std::uint32_t height) -> std::optional<VkExtent2D> {
+        if (width < 16u || height < 16u)
+            return std::nullopt;
+        return VkExtent2D{std::min(width, 7680u), std::min(height, 4320u)};
+    };
     auto effectiveRenderExtent = [&]() {
         if (!renderResolutionUseNative &&
             requestedRenderResolution.width > 0 &&
@@ -2721,7 +2727,33 @@ int RunGame(NativeWindow& window,
         {
             return requestedRenderResolution;
         }
+#if defined(IXTREEME_WITH_EDITOR)
+        // "View size" in the editor: the Scene View panel's own size. Rendering the whole window's
+        // size and shrinking it into the panel shaded ~3x the pixels that are shown.
+        if (runtimeSession->IsMapEditorOpen())
+        {
+            std::uint32_t panelWidth = 0;
+            std::uint32_t panelHeight = 0;
+            editorImGui.GetSceneViewPanelPixels(panelWidth, panelHeight);
+            if (const std::optional<VkExtent2D> panel = panelRenderExtent(panelWidth, panelHeight))
+                return *panel;
+        }
+#endif
         return device.GetSwapchainExtent();
+    };
+    // The Game view's size: its panel's (with "View size"), else the Scene View's render size.
+    auto gameViewRenderExtent = [&]() {
+#if defined(IXTREEME_WITH_EDITOR)
+        if (renderResolutionUseNative && runtimeSession->IsMapEditorOpen())
+        {
+            std::uint32_t panelWidth = 0;
+            std::uint32_t panelHeight = 0;
+            editorImGui.GetGameViewPanelPixels(panelWidth, panelHeight);
+            if (const std::optional<VkExtent2D> panel = panelRenderExtent(panelWidth, panelHeight))
+                return *panel;
+        }
+#endif
+        return renderSize;
     };
     auto bindOffscreenSceneTargets = [&]() {
         if (!offscreenSceneOk)
@@ -2778,9 +2810,10 @@ int RunGame(NativeWindow& window,
             offscreenScene.Height());
         if (gameViewOk)
         {
+            const VkExtent2D gameExtent = gameViewRenderExtent();
             gameViewOk = gameView.Recreate(*rhiDevice,
-                renderSize.width,
-                renderSize.height,
+                gameExtent.width,
+                gameExtent.height,
                 offscreenColorFormat,
                 offscreenDepthFormat);
             if (gameViewOk)
@@ -5174,6 +5207,37 @@ int RunGame(NativeWindow& window,
         }
     }
 #endif
+#if defined(IXTREEME_WITH_EDITOR)
+    // The Scene View and Game targets follow their panels' sizes. A size is applied once it has held
+    // for a moment, so dragging a dock splitter does not recreate the targets (and pipelines) on every
+    // frame; meanwhile the panel shows the old image letterboxed.
+    struct ViewResize
+    {
+        VkExtent2D pending{};
+        std::chrono::steady_clock::time_point since{};
+        // True when `wanted` differs from `current` and has stayed the same long enough.
+        bool Due(VkExtent2D wanted, VkExtent2D current)
+        {
+            if (wanted.width == current.width && wanted.height == current.height)
+            {
+                pending = {};
+                return false;
+            }
+            const auto now = std::chrono::steady_clock::now();
+            if (wanted.width != pending.width || wanted.height != pending.height)
+            {
+                pending = wanted;
+                since = now;
+                return false;
+            }
+            return now - since >= std::chrono::milliseconds(150);
+        }
+    };
+    ViewResize sceneViewResize;
+    ViewResize gameViewResize;
+    std::uint64_t syncedWaterMaterialsRevision = 0;
+    bool waterMaterialsSynced = false;
+#endif
     bool running = true;
     while (running)
     {
@@ -5322,9 +5386,10 @@ int RunGame(NativeWindow& window,
                             offscreenScene.Height());
                         if (gameViewOk)
                         {
+                            const VkExtent2D gameExtent = gameViewRenderExtent();
                             gameViewOk = gameView.Recreate(*rhiDevice,
-                                renderSize.width,
-                                renderSize.height,
+                                gameExtent.width,
+                                gameExtent.height,
                                 offscreenColorFormat,
                                 offscreenDepthFormat);
                             if (gameViewOk)
@@ -10413,9 +10478,17 @@ int RunGame(NativeWindow& window,
                     waterMaterialUsageCounts.push_back(usage);
                 editorImGui.SetWaterMaterialUsageCounts(std::move(waterMaterialUsageCounts));
 
-                const auto waterMaterials = editorImGui.GetWaterMaterialsSnapshot();
-                editorImGui.SetWaterMaterials(waterMaterials);
-                terrain.SetWaterMaterials(waterMaterials);
+                // Reading the water materials walks the asset library and the terrain rebuilds their
+                // signatures from it (~0.25 ms): only when they may have changed.
+                const std::uint64_t waterMaterialsRevision = editorImGui.WaterMaterialsRevision();
+                if (!waterMaterialsSynced || waterMaterialsRevision != syncedWaterMaterialsRevision)
+                {
+                    const auto waterMaterials = editorImGui.GetWaterMaterialsSnapshot();
+                    editorImGui.SetWaterMaterials(waterMaterials);
+                    terrain.SetWaterMaterials(waterMaterials);
+                    syncedWaterMaterialsRevision = waterMaterialsRevision;
+                    waterMaterialsSynced = true;
+                }
                 if (editorWaterBodiesDirty)
                 {
                     std::vector<WaterBody> terrainWaterBodies = editorWaterBodies;
@@ -10532,6 +10605,29 @@ int RunGame(NativeWindow& window,
         // IXRHI frame authority (Phase 3C): the backend acquires, records,
         // submits and presents. SwapchainRecreated runs the shared resize
         // orchestration; Skip renders nothing; DeviceLost exits gracefully.
+#if defined(IXTREEME_WITH_EDITOR)
+        // Before the frame records anything: recreating a target waits for the GPU and swaps the
+        // textures the editor UI shows.
+        if (offscreenSceneOk && renderResolutionUseNative && editorImGui.IsSceneViewVisible() &&
+            sceneViewResize.Due(effectiveRenderExtent(), VkExtent2D{offscreenScene.Width(), offscreenScene.Height()}))
+        {
+            recreateOffscreenScene("view-panel-size");
+        }
+        if (gameViewOk && renderResolutionUseNative && runtimeSession->IsMapEditorOpen() && editorImGui.IsGameViewVisible() &&
+            gameViewResize.Due(gameViewRenderExtent(), VkExtent2D{gameView.Width(), gameView.Height()}))
+        {
+            const VkExtent2D gameExtent = gameViewRenderExtent();
+            Tracenf("[RENDER-RES] game view %ux%u -> %ux%u (panel size)",
+                gameView.Width(), gameView.Height(), gameExtent.width, gameExtent.height);
+            gameViewOk = gameView.Recreate(*rhiDevice, gameExtent.width, gameExtent.height,
+                offscreenColorFormat, offscreenDepthFormat);
+            if (gameViewOk)
+                editorAdapter->SetGameViewTexture(gameView.GetColorTexture(), gameView.GetSampler(),
+                    gameView.Width(), gameView.Height());
+            else
+                editorAdapter->SetGameViewTexture(nullptr, nullptr, 0, 0);
+        }
+#endif
         ixrhi::IXRHIFrame rhiFrame = rhiDevice->BeginFrame();
         if (rhiFrame.result == ixrhi::IXRHIFrameResult::SwapchainRecreated)
             handleSwapchainChanged();
@@ -10928,9 +11024,12 @@ int RunGame(NativeWindow& window,
                 rhiDevice->WriteTimestamp(ixrhi::IXRHITimestampPoint::WaterReflectionBegin);
                 // One reflection per frame, mirrored for the view actually drawn (as the shadow map):
                 // the water samples it at its own screen position, so it must match that camera.
+                const bool reflectionForSceneView = shadowCamera == &frameCamera;
                 terrain.RenderWaterReflection(*frameInfo.commandList,
                     frameInfo,
                     *shadowCamera,
+                    reflectionForSceneView ? renderSize.width : gameView.Width(),
+                    reflectionForSceneView ? renderSize.height : gameView.Height(),
                     seconds,
                     [&](const WorldCamera& mirrorCamera,
                         std::uint32_t reflectionWidth,
@@ -11002,9 +11101,6 @@ int RunGame(NativeWindow& window,
                         /*viewIndex=*/0, clearDepth);
                     rhiDevice->WriteTimestamp(ixrhi::IXRHITimestampPoint::TerrainMainEnd);
                 };
-                // The sky first: the background everything else draws over (no depth writes).
-                if (skyOk)
-                    skyRenderer.Render(*frameInfo.commandList, frameInfo, camera, renderSize.width, renderSize.height);
                 if (hasSceneTerrain && !terrainAfterMeshes)
                     renderSceneTerrain(true);
                 rhiDevice->WriteTimestamp(ixrhi::IXRHITimestampPoint::SceneOtherBegin);
@@ -11532,6 +11628,10 @@ int RunGame(NativeWindow& window,
                 }
                 if (hasSceneTerrain && terrainAfterMeshes)
                     renderSceneTerrain(false);
+                // The sky after the opaque geometry: it sits at the far plane and is depth tested, so
+                // only the pixels nothing covers are shaded.
+                if (skyOk)
+                    skyRenderer.Render(*frameInfo.commandList, frameInfo, camera, renderSize.width, renderSize.height);
                 if (selectionOutlinesOk)
                 {
                     std::vector<SelectionOutlineRenderer::Line> selectionLines =
@@ -11738,7 +11838,11 @@ int RunGame(NativeWindow& window,
             if (useOffscreenScene)
             {
                 offscreenScene.EndMainPass(*frameInfo.commandList);
-                if (isInWorld && hasSceneTerrain && drawSceneView)
+                // The water needs a copy of the finished scene (refraction, depth fade) and its own
+                // pass, only while a water body is in view.
+                const bool sceneSnapshotForWater =
+                    isInWorld && hasSceneTerrain && drawSceneView && terrain.AnyWaterBodyInView(camera);
+                if (sceneSnapshotForWater)
                 {
                     offscreenScene.SnapshotScene(*frameInfo.commandList, frameInfo);
                     terrain.SetWaterRefractionInputs(offscreenScene.GetColorSnapshotTexture(),
@@ -11751,12 +11855,12 @@ int RunGame(NativeWindow& window,
                     offscreenScene.EndMainPass(*frameInfo.commandList);
                 }
                 // God rays over the finished scene (water included). They read the depth snapshot:
-                // taken above for the water, or here when there is no terrain.
+                // taken above for the water, or here when no water was drawn.
                 if (godRaysOk && isInWorld && drawSceneView)
                 {
                     const GodRayRenderer::SunShadow sunShadow{terrain.SunShadowTexture(frameInfo.frameNumber),
                         terrain.SunShadowCascadeViewProj(), TerrainRenderer::kSunShadowDepthBias};
-                    if (!hasSceneTerrain && godRays.IsVisible(sceneSky, frameSunLighting, camera, sunShadow))
+                    if (!sceneSnapshotForWater && godRays.IsVisible(sceneSky, frameSunLighting, camera, sunShadow))
                         offscreenScene.SnapshotScene(*frameInfo.commandList, frameInfo);
                     if (godRays.RenderRays(*frameInfo.commandList, frameInfo, /*view=*/0, sceneSky, frameSunLighting,
                             camera, offscreenScene.GetDepthSnapshotTexture(), sunShadow, renderSize.width, renderSize.height))
@@ -11779,9 +11883,6 @@ int RunGame(NativeWindow& window,
                         const VkExtent2D gameExtent{gameView.Width(), gameView.Height()};
                         const WorldCamera& gameCamera = *gameViewCamera;
                         gameView.BeginMainPass(*frameInfo.commandList, frameInfo);
-                        if (skyOk && isInWorld)
-                            skyRenderer.Render(*frameInfo.commandList, frameInfo, gameCamera,
-                                gameExtent.width, gameExtent.height);
                         // Terrain is drawn from the project Main Camera using the secondary
                         // camera-uniform path (viewIndex=1). That path has its own per-frame
                         // uniform buffer + descriptor set, so this draw no longer clobbers the
@@ -11853,8 +11954,13 @@ int RunGame(NativeWindow& window,
                         {
                             terrain.Render(*frameInfo.commandList, frameInfo, gameCamera, gameExtent.width, gameExtent.height,
                                 /*viewIndex=*/1, /*clearDepth=*/false);
-                            terrain.RenderWater(*frameInfo.commandList, frameInfo, gameCamera, seconds, gameExtent.width, gameExtent.height, /*viewIndex=*/1);
                         }
+                        // The sky after the opaque geometry (as in the Scene View), under the water.
+                        if (skyOk && isInWorld)
+                            skyRenderer.Render(*frameInfo.commandList, frameInfo, gameCamera,
+                                gameExtent.width, gameExtent.height);
+                        if (hasSceneTerrain)
+                            terrain.RenderWater(*frameInfo.commandList, frameInfo, gameCamera, seconds, gameExtent.width, gameExtent.height, /*viewIndex=*/1);
                         // God rays over the game image, under the game's UI: close the pass for a depth
                         // snapshot and the ray passes, then reopen it (loaded) for the composite.
                         const GodRayRenderer::SunShadow gameSunShadow{terrain.SunShadowTexture(frameInfo.frameNumber),

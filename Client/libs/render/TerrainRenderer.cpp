@@ -625,6 +625,18 @@ bool LoadAnyTerrainImage(client::asset::IAssetReader& assets,
     return LoadStbImage(assets, path, out, additionalRoots);
 }
 
+// The water reflection's size as a divisor of its view's size.
+std::uint32_t WaterReflectionDivisor(WaterConfig::ReflectionQuality quality)
+{
+    switch (quality)
+    {
+    case WaterConfig::ReflectionQuality::Quarter: return 4u;
+    case WaterConfig::ReflectionQuality::Full: return 1u;
+    case WaterConfig::ReflectionQuality::Half: break;
+    }
+    return 2u;
+}
+
 bool TerrainAabbOutsideCameraFrustum(const WorldCamera& camera, WorldVec3 min, WorldVec3 max)
 {
     const std::array<WorldVec3, 8> corners = {{
@@ -719,6 +731,22 @@ std::vector<uint8_t> ExtractR8Channel(const RgbaImage& image)
             const size_t pixel = static_cast<size_t>(y) * image.width + x;
             out[pixel] = image.pixels[pixel * 4u];
         }
+    }
+    return out;
+}
+
+// Three single-channel layers (ambient occlusion, roughness, metallic) as one RGBA image (A = 255):
+// the terrain shader reads all three with one fetch per layer and projection.
+std::vector<uint8_t> PackOcclusionRoughnessMetallic(const std::vector<uint8_t>& ao,
+                                                    const std::vector<uint8_t>& roughness,
+                                                    const std::vector<uint8_t>& metallic)
+{
+    std::vector<uint8_t> out(ao.size() * 4u, 255);
+    for (size_t i = 0; i < ao.size(); ++i)
+    {
+        out[i * 4u + 0] = ao[i];
+        out[i * 4u + 1] = i < roughness.size() ? roughness[i] : 128;
+        out[i * 4u + 2] = i < metallic.size() ? metallic[i] : 0;
     }
     return out;
 }
@@ -1969,6 +1997,7 @@ void TerrainRenderer::UploadEditedTerrain(ixrhi::IXRHICommandList& cmd, const ix
     if (m_vertexBufferUploadPending && m_vertexBuffer && m_vertexEditBuffer)
     {
         m_vertexBufferUploadPending = false;
+        ++m_terrainGeometryRevision;  // the sun shadow map must be drawn again
         // Whole-buffer copy (the backend copies from offset 0): only on frames with a sculpt edit. The
         // barriers order it after earlier frames' vertex reads and before this frame's draws.
         cmd.TransitionBuffer(*m_vertexBuffer, ixrhi::IXRHIBufferState::VertexRead, ixrhi::IXRHIBufferState::TransferDst);
@@ -2045,8 +2074,30 @@ void TerrainRenderer::RenderSunShadowMap(ixrhi::IXRHICommandList& cmd,
     {
         for (PassDrawStats& cascadeStats : m_frameDrawStats.shadowCascades)
             cascadeStats.skipped = true;
+        m_shadowMapInputs.reset();
         return;
     }
+
+    const DirectionalLight& sun = m_lightingState.directional;
+    const ShadowMapInputs inputs{
+        {camera.eye.x, camera.eye.y, camera.eye.z},
+        {camera.target.x, camera.target.y, camera.target.z},
+        sun.azimuthDegrees,
+        sun.elevationDegrees,
+        m_vertexBuffer.get(),
+        m_indexBuffer.get(),
+        m_shadowTexture.get(),
+        m_indexCount,
+        m_terrainGeometryRevision};
+    if (m_shadowMapInputs && *m_shadowMapInputs == inputs)
+    {
+        // Same camera, sun and terrain as the map already holds (and still shader-readable): reuse it.
+        for (PassDrawStats& cascadeStats : m_frameDrawStats.shadowCascades)
+            cascadeStats.skipped = true;
+        m_shadowDrawnFrame = frame.frameNumber;
+        return;
+    }
+    m_shadowMapInputs = inputs;
 
     UpdateShadowCascades(camera);
 
@@ -2168,7 +2219,8 @@ const TerrainRenderer::WaterBodyGpu* TerrainRenderer::FindClosestWaterBody(const
     float closestDistanceSq = std::numeric_limits<float>::max();
     for (const WaterBodyGpu& waterBody : m_waterBodies)
     {
-        if (!ResolveWaterConfig(waterBody.body).enabled || waterBody.indexCount == 0)
+        if (!ResolveWaterConfig(waterBody.body).enabled || waterBody.indexCount == 0 ||
+            !WaterBodyInView(waterBody, camera))
             continue;
 
         const float centerX = (waterBody.body.bboxMin[0] + waterBody.body.bboxMax[0]) * 0.5f;
@@ -2188,9 +2240,31 @@ const TerrainRenderer::WaterBodyGpu* TerrainRenderer::FindClosestWaterBody(const
     return closest;
 }
 
+bool TerrainRenderer::WaterBodyInView(const WaterBodyGpu& waterBody, const WorldCamera& camera) const
+{
+    // A little height around the flat surface for the wave normals' look; the mesh itself is flat.
+    const WorldVec3 margin{0.5f, 0.5f, 0.5f};
+    return !TerrainAabbOutsideCameraFrustum(camera, waterBody.boundsMin - margin, waterBody.boundsMax + margin);
+}
+
+bool TerrainRenderer::AnyWaterBodyInView(const WorldCamera& camera) const
+{
+    if (!m_sceneTerrainActive || m_sceneTerrain.editorHidden)
+        return false;
+    for (const WaterBodyGpu& waterBody : m_waterBodies)
+    {
+        if (ResolveWaterConfig(waterBody.body).enabled && waterBody.indexCount != 0 &&
+            WaterBodyInView(waterBody, camera))
+            return true;
+    }
+    return false;
+}
+
 void TerrainRenderer::RenderWaterReflection(ixrhi::IXRHICommandList& cmd,
                                               const ixrhi::IXRHIFrameInfo& frame,
                                               const WorldCamera& camera,
+                                              std::uint32_t viewWidth,
+                                              std::uint32_t viewHeight,
                                               double timeSeconds,
                                               const std::function<void(const WorldCamera&,
                                                                        std::uint32_t,
@@ -2243,19 +2317,23 @@ void TerrainRenderer::RenderWaterReflection(ixrhi::IXRHICommandList& cmd,
         return;
     }
 
-    const std::uint32_t swapWidth = m_rhi->GetMainSwapchain().Width();
-    const std::uint32_t swapHeight = m_rhi->GetMainSwapchain().Height();
-    if (swapWidth == 0 || swapHeight == 0)
+    const std::uint32_t baseWidth = viewWidth > 0 ? viewWidth : m_rhi->GetMainSwapchain().Width();
+    const std::uint32_t baseHeight = viewHeight > 0 ? viewHeight : m_rhi->GetMainSwapchain().Height();
+    if (baseWidth == 0 || baseHeight == 0)
     {
         skipReflection();
         return;
     }
 
+    // The reflection is a fraction of the view it is seen in (the water samples it at its own
+    // screen position), so it follows that view's size.
+    const std::uint32_t reflectionDivisor = WaterReflectionDivisor(reflectionConfig.reflectionQuality);
+    const std::uint32_t wantedWidth = std::max(1u, baseWidth / reflectionDivisor);
+    const std::uint32_t wantedHeight = std::max(1u, baseHeight / reflectionDivisor);
     if (m_waterReflection.quality != reflectionConfig.reflectionQuality ||
-        m_waterReflection.width == 0 || m_waterReflection.height == 0 ||
-        m_waterReflection.width > swapWidth || m_waterReflection.height > swapHeight)
+        m_waterReflection.width != wantedWidth || m_waterReflection.height != wantedHeight)
     {
-        CreateOrRecreateWaterReflectionResources(*m_rhi, true, reflectionConfig.reflectionQuality);
+        CreateOrRecreateWaterReflectionResources(*m_rhi, true, reflectionConfig.reflectionQuality, baseWidth, baseHeight);
         CreateWaterReflectionPipeline(*m_rhi);
         UpdateWaterBindGroup();
     }
@@ -2294,14 +2372,46 @@ void TerrainRenderer::RenderWaterReflection(ixrhi::IXRHICommandList& cmd,
     TerrainPushConstants push{{1.0f, 1.0f, 0.0f, 0.0f}};
     cmd.PushConstants(&push, sizeof(push));
     cmd.BindGroup(0, *m_bindGroup, kReflectionUniformView * kFramesInFlight + frameIndex);
-    cmd.DrawIndexed(m_indexCount, 1, 0, 0, 0);
-    ++reflectionStats.drawCalls;
-
-    reflectionStats.executed = reflectionStats.drawCalls > 0;
-    reflectionStats.chunksDrawn = m_terrainChunks.empty()
-        ? (m_indexCount > 0 ? 1u : 0u)
-        : static_cast<uint32_t>(m_terrainChunks.size());
-    reflectionStats.chunksCulled = 0;
+    if (m_terrainChunks.empty())
+    {
+        cmd.DrawIndexed(m_indexCount, 1, 0, 0, 0);
+        ++reflectionStats.drawCalls;
+        reflectionStats.chunksDrawn = 1;
+    }
+    else
+    {
+        // Only the chunks the mirror camera sees that reach above the water (the reflection shader
+        // clips everything under it). Chunks adjacent in the index buffer share one draw.
+        uint32_t runOffset = 0;
+        uint32_t runCount = 0;
+        auto flushRun = [&]() {
+            if (runCount == 0)
+                return;
+            cmd.DrawIndexed(runCount, 1, runOffset, 0, 0);
+            ++reflectionStats.drawCalls;
+            runCount = 0;
+        };
+        for (const TerrainChunkDraw& chunk : m_terrainChunks)
+        {
+            if (chunk.worldMax.y < reflectionWaterLevelY ||
+                TerrainAabbOutsideCameraFrustum(mirror, chunk.worldMin, chunk.worldMax))
+            {
+                ++reflectionStats.chunksCulled;
+                continue;
+            }
+            ++reflectionStats.chunksDrawn;
+            if (runCount != 0 && runOffset + runCount == chunk.indexOffset)
+            {
+                runCount += chunk.indexCount;
+                continue;
+            }
+            flushRun();
+            runOffset = chunk.indexOffset;
+            runCount = chunk.indexCount;
+        }
+        flushRun();
+    }
+    reflectionStats.executed = true;
 
     if (renderEntities)
         renderEntities(mirror,
@@ -2593,7 +2703,7 @@ void TerrainRenderer::RenderWater(ixrhi::IXRHICommandList& cmd,
     {
         WaterBodyGpu& waterBody = m_waterBodies[bodyIndex];
         if (!ResolveWaterConfig(waterBody.body).enabled || !waterBody.indexCount ||
-            !waterBody.vertexBuffer || !waterBody.indexBuffer)
+            !waterBody.vertexBuffer || !waterBody.indexBuffer || !WaterBodyInView(waterBody, camera))
         {
             continue;
         }
@@ -5240,14 +5350,19 @@ bool TerrainRenderer::CreateFallbackTexture(ixrhi::IXRHIDevice& rhi)
     std::vector<uint8_t> roughness(static_cast<size_t>(kSize) * kSize * kLayers, 128);
     std::vector<uint8_t> metallic(static_cast<size_t>(kSize) * kSize * kLayers, 0);
     std::vector<uint8_t> height(static_cast<size_t>(kSize) * kSize * kLayers, 0);
-    return UploadRgbaTextureArray(rhi, "terrain_palette_fallback", kSize, kSize, kLayers, pixels,
-               ixrhi::IXRHIFormat::R8G8B8A8Srgb, m_baseTexture) &&
-            UploadRgbaTextureArray(rhi, "terrain_normal_fallback", kSize, kSize, kLayers, normals,
-                ixrhi::IXRHIFormat::R8G8B8A8Unorm, m_normalTexture) &&
-            UploadR8TextureArray(rhi, "terrain_ao_fallback", kSize, kSize, kLayers, ao, m_aoTexture) &&
-            UploadR8TextureArray(rhi, "terrain_roughness_fallback", kSize, kSize, kLayers, roughness, m_roughnessTexture) &&
-            UploadR8TextureArray(rhi, "terrain_metallic_fallback", kSize, kSize, kLayers, metallic, m_metallicTexture) &&
-            UploadR8TextureArray(rhi, "terrain_height_fallback", kSize, kSize, kLayers, height, m_heightTexture);
+    if (!UploadRgbaTextureArray(rhi, "terrain_palette_fallback", kSize, kSize, kLayers, pixels,
+            ixrhi::IXRHIFormat::R8G8B8A8Srgb, m_baseTexture) ||
+        !UploadRgbaTextureArray(rhi, "terrain_normal_fallback", kSize, kSize, kLayers, normals,
+            ixrhi::IXRHIFormat::R8G8B8A8Unorm, m_normalTexture) ||
+        !UploadRgbaTextureArray(rhi, "terrain_orm_fallback", kSize, kSize, kLayers,
+            PackOcclusionRoughnessMetallic(ao, roughness, metallic), ixrhi::IXRHIFormat::R8G8B8A8Unorm, m_aoTexture) ||
+        !UploadR8TextureArray(rhi, "terrain_height_fallback", kSize, kSize, kLayers, height, m_heightTexture))
+    {
+        return false;
+    }
+    m_roughnessTexture = m_aoTexture;  // the packed array serves all three slots
+    m_metallicTexture = m_aoTexture;
+    return true;
 }
 
 bool TerrainRenderer::CreateFallbackMask(ixrhi::IXRHIDevice& rhi)
@@ -5485,17 +5600,15 @@ bool TerrainRenderer::LoadTerrainPaletteFromPaths(ixrhi::IXRHIDevice& rhi, const
 
     Texture palette{};
     Texture normals{};
-    Texture ao{};
-    Texture roughness{};
-    Texture metallic{};
+    Texture orm{};
     Texture heightTex{};
     if (!UploadRgbaTextureArray(rhi, "terrain_palette", width, height, static_cast<uint32_t>(images.size()), pixels,
             ixrhi::IXRHIFormat::R8G8B8A8Srgb, palette) ||
         !UploadRgbaTextureArray(rhi, "terrain_normals", width, height, static_cast<uint32_t>(images.size()), normalPixels,
             ixrhi::IXRHIFormat::R8G8B8A8Unorm, normals) ||
-        !UploadR8TextureArray(rhi, "terrain_ao", width, height, static_cast<uint32_t>(images.size()), aoPixels, ao) ||
-        !UploadR8TextureArray(rhi, "terrain_roughness", width, height, static_cast<uint32_t>(images.size()), roughnessPixels, roughness) ||
-        !UploadR8TextureArray(rhi, "terrain_metallic", width, height, static_cast<uint32_t>(images.size()), metallicPixels, metallic) ||
+        !UploadRgbaTextureArray(rhi, "terrain_orm", width, height, static_cast<uint32_t>(images.size()),
+            PackOcclusionRoughnessMetallic(aoPixels, roughnessPixels, metallicPixels),
+            ixrhi::IXRHIFormat::R8G8B8A8Unorm, orm) ||
         !UploadR8TextureArray(rhi, "terrain_height", width, height, static_cast<uint32_t>(images.size()), heightPixels, heightTex))
     {
         return false;
@@ -5503,9 +5616,10 @@ bool TerrainRenderer::LoadTerrainPaletteFromPaths(ixrhi::IXRHIDevice& rhi, const
 
     m_baseTexture = std::move(palette);
     m_normalTexture = std::move(normals);
-    m_aoTexture = std::move(ao);
-    m_roughnessTexture = std::move(roughness);
-    m_metallicTexture = std::move(metallic);
+    // One array for the three (the shader takes them in one fetch); it stays bound to all three slots.
+    m_aoTexture = orm;
+    m_roughnessTexture = orm;
+    m_metallicTexture = std::move(orm);
     m_heightTexture = std::move(heightTex);
     m_paletteSlots = slots;
     m_materialParamsDirty = true;
@@ -5865,12 +5979,25 @@ bool TerrainRenderer::CreateWaterBodyMesh(ixrhi::IXRHIDevice& rhi, WaterBodyGpu&
     if (indices.empty())
         return false;
 
-    waterBody.vertexBuffer = CreateRhiBuffer(rhi,
+    waterBody.boundsMin = {vertices[0].position[0], vertices[0].position[1], vertices[0].position[2]};
+    waterBody.boundsMax = waterBody.boundsMin;
+    for (const WaterVertex& vertex : vertices)
+    {
+        waterBody.boundsMin.x = std::min(waterBody.boundsMin.x, vertex.position[0]);
+        waterBody.boundsMin.y = std::min(waterBody.boundsMin.y, vertex.position[1]);
+        waterBody.boundsMin.z = std::min(waterBody.boundsMin.z, vertex.position[2]);
+        waterBody.boundsMax.x = std::max(waterBody.boundsMax.x, vertex.position[0]);
+        waterBody.boundsMax.y = std::max(waterBody.boundsMax.y, vertex.position[1]);
+        waterBody.boundsMax.z = std::max(waterBody.boundsMax.z, vertex.position[2]);
+    }
+
+    // Device-local: the GPU reads the (often large) water mesh in every pass that draws it.
+    waterBody.vertexBuffer = CreateStaticRhiBuffer(rhi,
         sizeof(WaterVertex) * vertices.size(),
         ixrhi::IXRHIBufferUsage::Vertex,
         vertices.data(),
         "Terrain:WaterVB");
-    waterBody.indexBuffer = CreateRhiBuffer(rhi,
+    waterBody.indexBuffer = CreateStaticRhiBuffer(rhi,
         sizeof(uint32_t) * indices.size(),
         ixrhi::IXRHIBufferUsage::Index,
         indices.data(),
@@ -5993,24 +6120,19 @@ bool TerrainRenderer::CreateOrRecreateWaterReflectionResources(ixrhi::IXRHIDevic
 
 bool TerrainRenderer::CreateOrRecreateWaterReflectionResources(ixrhi::IXRHIDevice& rhi,
                                                                bool force,
-                                                               WaterConfig::ReflectionQuality quality)
+                                                               WaterConfig::ReflectionQuality quality,
+                                                               std::uint32_t viewWidth,
+                                                               std::uint32_t viewHeight)
 {
     m_rhi = &rhi;
-    const std::uint32_t swapWidth = rhi.GetMainSwapchain().Width();
-    const std::uint32_t swapHeight = rhi.GetMainSwapchain().Height();
-    if (swapWidth == 0 || swapHeight == 0)
+    const std::uint32_t baseWidth = viewWidth > 0 ? viewWidth : rhi.GetMainSwapchain().Width();
+    const std::uint32_t baseHeight = viewHeight > 0 ? viewHeight : rhi.GetMainSwapchain().Height();
+    if (baseWidth == 0 || baseHeight == 0)
         return false;
 
-    uint32_t divisor = 2;
-    switch (quality)
-    {
-    case WaterConfig::ReflectionQuality::Quarter: divisor = 4; break;
-    case WaterConfig::ReflectionQuality::Half: divisor = 2; break;
-    case WaterConfig::ReflectionQuality::Full: divisor = 1; break;
-    }
-
-    const uint32_t width = std::max(1u, swapWidth / divisor);
-    const uint32_t height = std::max(1u, swapHeight / divisor);
+    const uint32_t divisor = WaterReflectionDivisor(quality);
+    const uint32_t width = std::max(1u, baseWidth / divisor);
+    const uint32_t height = std::max(1u, baseHeight / divisor);
     const ixrhi::IXRHIFormat colorFormat = rhi.GetMainSwapchain().ColorFormat();
     const ixrhi::IXRHIFormat depthFormat = rhi.GetMainSwapchain().DepthFormat();
 

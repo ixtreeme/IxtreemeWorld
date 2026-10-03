@@ -81,6 +81,18 @@ public:
     {
         return m_editorModeActive && m_textureProvider && m_textureProvider->GetSceneViewTexture() != nullptr;
     }
+    // The image area of the Scene View / Game panel in framebuffer pixels, as laid out last frame
+    // (0 x 0 before the panel was first shown). The views render at this size, not the window's.
+    void GetSceneViewPanelPixels(std::uint32_t& width, std::uint32_t& height) const
+    {
+        width = m_sceneViewPanelPixels[0];
+        height = m_sceneViewPanelPixels[1];
+    }
+    void GetGameViewPanelPixels(std::uint32_t& width, std::uint32_t& height) const
+    {
+        width = m_gameViewPanelPixels[0];
+        height = m_gameViewPanelPixels[1];
+    }
 
     // Script text prompts (IScriptApi::PromptText) drawn as small modal-less dialogs during Play. The
     // engine hands the open prompts in each frame and collects the answers after RenderPanels. Secret
@@ -192,6 +204,9 @@ public:
     void SetWaterMaterials(std::vector<std::pair<std::string, WaterMaterialData>> materials);
     void SetWaterMaterialUsageCounts(std::vector<std::pair<std::string, std::uint32_t>> usageCounts);
     std::vector<std::pair<std::string, WaterMaterialData>> GetWaterMaterialsSnapshot() const;
+    // Changes whenever GetWaterMaterialsSnapshot() may return something else: the asset library was
+    // saved, reloaded or replaced, or a water/PBR material has unsaved edits (they are in it).
+    std::uint64_t WaterMaterialsRevision() const;
     void SetPaletteSlots(const std::array<MapEditorPaletteSlot, 8>& slots);
     void SetEngineRoot(const std::filesystem::path& clientRoot);
     void InitializeAssetLibrary(const std::filesystem::path& clientRoot);
@@ -609,6 +624,9 @@ private:
     std::unordered_map<std::string, std::uint32_t> m_waterMaterialUsageCounts;
     WaterMaterialEditorState m_waterMaterialEditor;
     PbrMaterialEditorState m_pbrMaterialEditor;
+    // WaterMaterialsRevision: bumped per unsaved material edit and when the asset library is replaced.
+    mutable std::uint64_t m_waterMaterialsTick = 0;
+    mutable bool m_waterMaterialsDrafting = false;
     std::unique_ptr<tree_tool::TreeGeneratorPanel> m_treeGeneratorPanel;
     std::filesystem::path m_engineRoot;
     std::unique_ptr<AssetLibrary> m_assetLibrary;
@@ -727,6 +745,8 @@ private:
     };
     GameViewRect m_gameViewRect;
     bool m_sceneViewVisible = true;
+    std::uint32_t m_sceneViewPanelPixels[2] = {0u, 0u};
+    std::uint32_t m_gameViewPanelPixels[2] = {0u, 0u};
     bool m_animatorGraphVisible = false;
     bool m_animatorPanelOpen = true;
     float m_animatorPan[2] = {0.0f, 0.0f};

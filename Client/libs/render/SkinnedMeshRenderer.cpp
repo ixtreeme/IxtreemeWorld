@@ -1993,10 +1993,11 @@ bool SkinnedMeshRenderer::VerifyComputeSkin(ixrhi::IXRHIDevice& rhi)
 
 bool SkinnedMeshRenderer::CreateBuffers(ixrhi::IXRHIDevice& rhi)
 {
+    // Device-local: written once here, read by every view's and the reflection's draws.
     m_indexBuffer = CreateRhiBuffer(rhi,
         sizeof(uint32_t) * m_indices.size(),
         ixrhi::IXRHIBufferUsage::Index,
-        ixrhi::IXRHICpuAccess::Write,
+        ixrhi::IXRHICpuAccess::None,
         m_indices.data(),
         "SkinnedMesh:IB");
 

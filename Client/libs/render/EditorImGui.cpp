@@ -802,6 +802,19 @@ void EditorImGui::SyncWaterMaterialSnapshot()
     m_waterMaterials = GetWaterMaterialsSnapshot();
 }
 
+std::uint64_t EditorImGui::WaterMaterialsRevision() const
+{
+    // While a material has unsaved edits the snapshot changes with them: a new revision every call
+    // (and once more when the editing stops, which may have discarded them).
+    const bool drafting = (m_waterMaterialEditor.windowOpen && m_waterMaterialEditor.dirty) ||
+        (m_pbrMaterialEditor.windowOpen && m_pbrMaterialEditor.dirty);
+    if (drafting || drafting != m_waterMaterialsDrafting)
+        ++m_waterMaterialsTick;
+    m_waterMaterialsDrafting = drafting;
+    const std::uint64_t revision = m_assetLibrary ? m_assetLibrary->Revision() : 0;
+    return revision * 1000003ull + m_waterMaterialsTick;
+}
+
 void EditorImGui::SetEngineRoot(const std::filesystem::path& clientRoot)
 {
     m_engineRoot = clientRoot;
@@ -817,6 +830,7 @@ void EditorImGui::InitializeAssetLibrary(const std::filesystem::path& clientRoot
     DestroyAssetPreviewTextures();
     InvalidateAssetBrowserCache();
     m_assetLibrary = std::make_unique<AssetLibrary>(clientRoot);
+    ++m_waterMaterialsTick;  // another library: see WaterMaterialsRevision
     if (!m_assetLibrary->Initialize())
     {
         m_assetLibrary.reset();
@@ -839,6 +853,7 @@ void EditorImGui::InitializeProjectAssetLibrary(const std::filesystem::path& pro
     DestroyAssetPreviewTextures();
     InvalidateAssetBrowserCache();
     m_assetLibrary = std::make_unique<AssetLibrary>(projectRoot, assetRoot);
+    ++m_waterMaterialsTick;  // another library: see WaterMaterialsRevision
     if (!m_assetLibrary->Initialize())
     {
         m_assetLibrary.reset();
@@ -2933,6 +2948,11 @@ void EditorImGui::SetWaterMaterialUsageCounts(std::vector<std::pair<std::string,
 std::vector<std::pair<std::string, WaterMaterialData>> EditorImGui::GetWaterMaterialsSnapshot() const
 {
     return {};
+}
+
+std::uint64_t EditorImGui::WaterMaterialsRevision() const
+{
+    return 0;
 }
 
 void EditorImGui::InitializeAssetLibrary(const std::filesystem::path&)
