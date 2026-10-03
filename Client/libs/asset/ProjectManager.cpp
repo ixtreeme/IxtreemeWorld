@@ -17,6 +17,7 @@ namespace
 {
 using ixtreeme::common::EscapeJson;
 using ixtreeme::common::JsonStringValue;
+using ixtreeme::common::LegacyTextToUtf8;
 using ixtreeme::common::TimestampUtc;
 
 bool JsonArrayBody(const std::string& text, const std::string& key, std::string& out)
@@ -99,7 +100,7 @@ std::vector<std::string> JsonStringArrayValue(const std::string& object, const s
         }
         if (c == '"')
         {
-            values.push_back(value);
+            values.push_back(LegacyTextToUtf8(value));
             inString = false;
             continue;
         }

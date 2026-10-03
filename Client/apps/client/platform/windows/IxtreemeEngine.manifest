@@ -1,0 +1,17 @@
+<?xml version="1.0" encoding="UTF-8" standalone="yes"?>
+<!--
+  Windows packaging data for the engine executable (editor and game runtime).
+
+  activeCodePage UTF-8: the process's narrow strings are UTF-8 on Windows, as they are on Linux,
+  macOS and Android. Paths and text then convert the same way on every machine; with the
+  system's legacy code page a file name such as "Képernyőkép.png" made on one Windows could not
+  be read (or crashed the game) on a Windows set to another language. Windows 10 1903 or later;
+  older versions ignore it.
+-->
+<assembly manifestVersion="1.0" xmlns="urn:schemas-microsoft-com:asm.v1">
+  <application xmlns="urn:schemas-microsoft-com:asm.v3">
+    <windowsSettings>
+      <activeCodePage xmlns="http://schemas.microsoft.com/SMI/2019/WindowsSettings">UTF-8</activeCodePage>
+    </windowsSettings>
+  </application>
+</assembly>

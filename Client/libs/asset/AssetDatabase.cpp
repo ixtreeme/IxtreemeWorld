@@ -21,6 +21,7 @@ namespace
 {
 using ixtreeme::common::EscapeJson;
 using ixtreeme::common::JsonStringValue;
+using ixtreeme::common::LegacyTextToUtf8;
 using ixtreeme::common::TimestampUtc;
 using ixtreeme::common::ToLowerAscii;
 
@@ -91,7 +92,7 @@ std::vector<std::string> JsonStringArrayValue(const std::string& object, const s
             }
             else if (c == '"')
             {
-                values.push_back(current);
+                values.push_back(LegacyTextToUtf8(current));
                 current.clear();
                 inString = false;
             }

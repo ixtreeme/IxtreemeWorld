@@ -52,8 +52,10 @@ using ixtreeme::common::CanonicalPathString;
 using ixtreeme::common::EscapeJson;
 using ixtreeme::common::GenericPath;
 using ixtreeme::common::HasAnyExtension;
+using ixtreeme::common::IsValidUtf8;
 using ixtreeme::common::JsonFloatValue;
 using ixtreeme::common::JsonStringValue;
+using ixtreeme::common::LegacyTextToUtf8;
 using ixtreeme::common::TimestampUtc;
 
 AssetLibrary::FbxSidecarProcessor g_fbxSidecarProcessor = nullptr;
@@ -329,7 +331,7 @@ std::vector<std::string> JsonStringArrayValue(const std::string& object, const s
         }
         if (c == '"')
         {
-            values.push_back(value);
+            values.push_back(LegacyTextToUtf8(value));
             inString = false;
             continue;
         }
@@ -2258,7 +2260,9 @@ bool AssetLibrary::LoadManifest(bool reconcile)
     // absolute original_path; version 2 stores it relative to the library root. No manifest yet: the
     // reconcile below registers whatever the folder already holds.
     const bool legacyLayout = haveManifest && JsonU32Value(text, "version", 1) < 2;
-    bool metadataChanged = legacyLayout || !haveManifest;
+    // A manifest saved before the engine wrote UTF-8 (Windows-1250 names) is read through
+    // LegacyTextToUtf8 and written back as UTF-8.
+    bool metadataChanged = legacyLayout || !haveManifest || !IsValidUtf8(text);
     size_t pos = 0;
     while ((pos = assetsText.find('{', pos)) != std::string::npos)
     {

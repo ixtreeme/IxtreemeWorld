@@ -34,6 +34,7 @@ namespace
 {
 using ixtreeme::common::EscapeJson;
 using ixtreeme::common::GenericPath;
+using ixtreeme::common::LegacyTextToUtf8;
 using ixtreeme::common::TimestampUtc;
 
 struct JsonValue
@@ -194,7 +195,10 @@ private:
         {
             const char ch = m_text[m_pos++];
             if (ch == '"')
+            {
+                out = LegacyTextToUtf8(std::move(out));  // a scene saved before the engine wrote UTF-8
                 return true;
+            }
             if (ch != '\\')
             {
                 out.push_back(ch);

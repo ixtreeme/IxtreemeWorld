@@ -32,6 +32,11 @@ else()
     )
 endif()
 
+if(WIN32)
+    # Windows packaging: narrow strings (paths, text) are UTF-8 in this process, as elsewhere.
+    target_sources(IxtreemeEngine PRIVATE platform/windows/IxtreemeEngine.manifest)
+endif()
+
 target_link_libraries(IxtreemeEngine
     PRIVATE
         IXEngineSelectionSystem
