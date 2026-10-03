@@ -246,19 +246,11 @@ void IXVulkanCommandList::TransitionTexture(ixrhi::IXRHITexture& texture,
     LayoutStageAccess(from, srcStage, srcAccess);
     LayoutStageAccess(to, dstStage, dstAccess);
 
-    // Depth aspects sampled as textures require the depth-read layout; the
-    // color SHADER_READ_ONLY layout is invalid for them. Full-subresource
-    // range so layered depth (shadow cascades) transitions atomically.
-    const bool isDepth = (ToVkAspectMask(native->Format()) & VK_IMAGE_ASPECT_DEPTH_BIT) != 0;
-    VkImageLayout oldLayout = ToVkImageLayout(from);
-    VkImageLayout newLayout = ToVkImageLayout(to);
-    if (isDepth)
-    {
-        if (from == ixrhi::IXRHIImageLayout::ShaderReadOnly)
-            oldLayout = VK_IMAGE_LAYOUT_DEPTH_STENCIL_READ_ONLY_OPTIMAL;
-        if (to == ixrhi::IXRHIImageLayout::ShaderReadOnly)
-            newLayout = VK_IMAGE_LAYOUT_DEPTH_STENCIL_READ_ONLY_OPTIMAL;
-    }
+    // Sampled depth uses SHADER_READ_ONLY too: valid for any sampled image, while the depth-read
+    // layout needs depth-attachment usage, which a sampled-only depth snapshot does not have.
+    // Full-subresource range so layered depth (shadow cascades) transitions atomically.
+    const VkImageLayout oldLayout = ToVkImageLayout(from);
+    const VkImageLayout newLayout = ToVkImageLayout(to);
 
     VkImageMemoryBarrier barrier{};
     barrier.sType = VK_STRUCTURE_TYPE_IMAGE_MEMORY_BARRIER;

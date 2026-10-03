@@ -47,6 +47,14 @@ void RunConversionChecks()
         "conv sRGB RGBA8 -> Vk");
     CheckConv(ixvulkan::FromVkFormat(VK_FORMAT_D32_SFLOAT) == IXRHIFormat::D32Float,
         "conv depth <- Vk");
+    // The depth-stencil format a GPU without D24S8 (AMD) gets: it maps both ways, with both aspects.
+    CheckConv(ixvulkan::FromVkFormat(VK_FORMAT_D32_SFLOAT_S8_UINT) == IXRHIFormat::D32FloatS8Uint,
+        "conv D32S8 <- Vk");
+    CheckConv(ixvulkan::ToVkFormat(IXRHIFormat::D32FloatS8Uint) == VK_FORMAT_D32_SFLOAT_S8_UINT,
+        "conv D32S8 -> Vk");
+    CheckConv(ixvulkan::ToVkAspectMask(IXRHIFormat::D32FloatS8Uint) ==
+            (VK_IMAGE_ASPECT_DEPTH_BIT | VK_IMAGE_ASPECT_STENCIL_BIT),
+        "conv D32S8 aspects");
     CheckConv(ixvulkan::ToVkFormat(IXRHIFormat::Undefined) == VK_FORMAT_UNDEFINED,
         "conv Undefined fallback");
     CheckConv(ixvulkan::FromVkFormat(VK_FORMAT_ASTC_8x8_UNORM_BLOCK) == IXRHIFormat::Undefined,

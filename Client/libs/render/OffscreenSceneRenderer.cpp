@@ -116,8 +116,9 @@ void OffscreenSceneRenderer::EndMainPass(ixrhi::IXRHICommandList& cmd)
     m_activeTarget->End(cmd);
     m_activeTarget = nullptr;
     m_passActive = false;
-    // Producing-use states (the pass wrote color + depth; see header contract).
-    m_colorState = ixrhi::IXRHIImageLayout::ColorAttachment;
+    // The layouts the pass leaves them in (its final layouts): color shader-readable for the editor
+    // panel and the composite, depth still an attachment.
+    m_colorState = ixrhi::IXRHIImageLayout::ShaderReadOnly;
     m_depthState = ixrhi::IXRHIImageLayout::DepthStencilAttachment;
 }
 

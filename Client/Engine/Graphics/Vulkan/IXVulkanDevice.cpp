@@ -486,11 +486,9 @@ bool IXVulkanDevice::UpdateTexture(ixrhi::IXRHITexture& texture, const void* dat
 
 VkImageLayout IXVulkanDevice::SampledReadLayout(ixrhi::IXRHIFormat format)
 {
-    // Depth sampled as a texture must use the depth-read layout; the color
-    // SHADER_READ_ONLY layout is invalid for depth aspects (and was a latent
-    // validation issue wherever depth snapshots are sampled).
-    if ((ToVkAspectMask(format) & VK_IMAGE_ASPECT_DEPTH_BIT) != 0)
-        return VK_IMAGE_LAYOUT_DEPTH_STENCIL_READ_ONLY_OPTIMAL;
+    // Depth as well: SHADER_READ_ONLY is valid for every sampled image, while the depth-read layout
+    // needs depth-attachment usage (a sampled-only depth snapshot has none). See TransitionTexture.
+    (void)format;
     return VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL;
 }
 

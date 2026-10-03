@@ -11,9 +11,10 @@
 // - the editor displays GetColorTexture() through EditorGraphicsBridge,
 // - terrain refraction samples the snapshot textures + sampler.
 //
-// Layout tracking rule (binding): states name the PRODUCING use (e.g. the
-// color image is ColorAttachment after EndMainPass, not ShaderReadOnly), so
-// backend barriers derive correct stages/access from the labels alone.
+// Layout tracking rule (binding): states name the layout the image is really
+// in, since a barrier's old layout must match it (the color image is
+// ShaderReadOnly after EndMainPass: the pass's final layout; its external
+// dependency already orders the color writes before shader reads).
 
 #include "IXRHIBinding.h"
 #include "IXRHIBuffer.h"

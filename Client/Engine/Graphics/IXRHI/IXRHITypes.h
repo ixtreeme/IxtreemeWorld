@@ -28,6 +28,7 @@ enum class IXRHIFormat : std::uint32_t
     D32Float,
     D24UnormS8Uint,
     R16G16B16A16Float,  // HDR colour at half the size of RGBA32F (sky panoramas)
+    D32FloatS8Uint,     // depth + stencil where D24S8 is missing (AMD GPUs)
 };
 
 inline std::uint32_t IXRHIFormatByteSize(IXRHIFormat format)
@@ -42,7 +43,8 @@ inline std::uint32_t IXRHIFormatByteSize(IXRHIFormat format)
     case IXRHIFormat::D24UnormS8Uint: return 4;
     case IXRHIFormat::R32Float: return 4;
     case IXRHIFormat::R32G32Float:
-    case IXRHIFormat::R16G16B16A16Float: return 8;
+    case IXRHIFormat::R16G16B16A16Float:
+    case IXRHIFormat::D32FloatS8Uint: return 8;
     case IXRHIFormat::R32G32B32Float: return 12;
     case IXRHIFormat::R32G32B32A32Float:
     case IXRHIFormat::D32Float: return 16;

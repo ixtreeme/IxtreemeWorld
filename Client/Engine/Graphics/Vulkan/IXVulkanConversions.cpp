@@ -24,6 +24,7 @@ VkFormat ToVkFormat(ixrhi::IXRHIFormat format)
     case F::D32Float: return VK_FORMAT_D32_SFLOAT;
     case F::D24UnormS8Uint: return VK_FORMAT_D24_UNORM_S8_UINT;
     case F::R16G16B16A16Float: return VK_FORMAT_R16G16B16A16_SFLOAT;
+    case F::D32FloatS8Uint: return VK_FORMAT_D32_SFLOAT_S8_UINT;
     case F::Undefined: break;
     }
     return VK_FORMAT_UNDEFINED;
@@ -46,6 +47,7 @@ ixrhi::IXRHIFormat FromVkFormat(VkFormat format)
     case VK_FORMAT_D32_SFLOAT: return F::D32Float;
     case VK_FORMAT_D24_UNORM_S8_UINT: return F::D24UnormS8Uint;
     case VK_FORMAT_R16G16B16A16_SFLOAT: return F::R16G16B16A16Float;
+    case VK_FORMAT_D32_SFLOAT_S8_UINT: return F::D32FloatS8Uint;
     default: break;
     }
     return F::Undefined;
@@ -232,7 +234,8 @@ VkImageAspectFlags ToVkAspectMask(ixrhi::IXRHIFormat format)
     switch (format)
     {
     case F::D32Float: return VK_IMAGE_ASPECT_DEPTH_BIT;
-    case F::D24UnormS8Uint: return VK_IMAGE_ASPECT_DEPTH_BIT | VK_IMAGE_ASPECT_STENCIL_BIT;
+    case F::D24UnormS8Uint:
+    case F::D32FloatS8Uint: return VK_IMAGE_ASPECT_DEPTH_BIT | VK_IMAGE_ASPECT_STENCIL_BIT;
     default: break;
     }
     return VK_IMAGE_ASPECT_COLOR_BIT;
