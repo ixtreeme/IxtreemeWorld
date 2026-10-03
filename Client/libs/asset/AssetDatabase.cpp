@@ -24,6 +24,15 @@ using ixtreeme::common::JsonStringValue;
 using ixtreeme::common::TimestampUtc;
 using ixtreeme::common::ToLowerAscii;
 
+// A path as UTF-8 text ('/' separators). path::string() converts to the system's ANSI code page and
+// throws for a character that page lacks (an "ő" on a Western-European Windows), which stopped the
+// game at boot: paths are never turned into text that way here.
+std::string Utf8(const std::filesystem::path& path)
+{
+    const std::u8string text = path.generic_u8string();
+    return std::string(text.begin(), text.end());
+}
+
 int HexValue(char c)
 {
     if (c >= '0' && c <= '9')
@@ -138,7 +147,7 @@ std::optional<AssetType> ParseAssetType(const std::string& value)
 
 bool IsIgnoredDirectoryName(const std::filesystem::path& path)
 {
-    const std::string name = ToLowerAscii(path.filename().string());
+    const std::string name = ToLowerAscii(Utf8(path.filename()));
     static const std::unordered_set<std::string> ignored = {
         ".git",
         ".vs",
@@ -460,7 +469,7 @@ Guid generateGuidV4()
 
 AssetType detectAssetType(const std::filesystem::path& filePath)
 {
-    const std::string ext = ToLowerAscii(filePath.extension().string());
+    const std::string ext = ToLowerAscii(Utf8(filePath.extension()));
     if (ext == ".gltf" || ext == ".glb" || ext == ".fbx" || ext == ".obj")
         return AssetType::Model;
     if (ext == ".png" || ext == ".jpg" || ext == ".jpeg" || ext == ".tga" ||
@@ -523,13 +532,13 @@ void AssetDatabase::scan(const std::filesystem::path& projectRoot)
     lastStats_ = {};
     scanRoot_ = canonicalPath(projectRoot);
 
-    Tracenf("[ASSET-DB] scan_start root=%s", scanRoot_.generic_string().c_str());
+    Tracenf("[ASSET-DB] scan_start root=%s", Utf8(scanRoot_).c_str());
 
     std::error_code ec;
     if (!std::filesystem::exists(scanRoot_, ec))
     {
         TraceError("[ASSET-DB] error path=%s reason=scan_root_missing regenerating=no",
-            scanRoot_.generic_string().c_str());
+            Utf8(scanRoot_).c_str());
         Tracen("[ASSET-DB] scan_done assets=0 metas_existing=0 metas_generated=0 metas_corrupted=0 duration_ms=0");
         return;
     }
@@ -542,90 +551,101 @@ void AssetDatabase::scan(const std::filesystem::path& projectRoot)
          !ec && it != end;
          it.increment(ec))
     {
-        const std::filesystem::directory_entry& entry = *it;
-        std::error_code entryEc;
-        if (entry.is_directory(entryEc))
+        // One file the scan cannot handle is skipped, not the game's start.
+        try
         {
-            if (IsIgnoredDirectoryName(entry.path()))
-                it.disable_recursion_pending();
-            continue;
-        }
-
-        if (!entry.is_regular_file(entryEc))
-            continue;
-        const std::filesystem::path assetPath = canonicalPath(entry.path());
-        if (ToLowerAscii(assetPath.extension().string()) == ".meta")
-            continue;
-
-        const AssetType assetType = detectAssetType(assetPath);
-        if (assetType == AssetType::Unknown)
-            continue;
-
-        ++lastStats_.assetsScanned;
-        const std::filesystem::path metaPath = metaPathFor(assetPath);
-        bool regenerate = false;
-        Guid guid;
-        if (std::filesystem::exists(metaPath, entryEc))
-        {
-            std::string error;
-            const std::optional<MetaRecord> meta = loadMeta(metaPath, assetPath, error);
-            if (meta)
+            const std::filesystem::directory_entry& entry = *it;
+            std::error_code entryEc;
+            if (entry.is_directory(entryEc))
             {
-                if (meta->assetType != assetType)
+                if (IsIgnoredDirectoryName(entry.path()))
+                    it.disable_recursion_pending();
+                continue;
+            }
+
+            if (!entry.is_regular_file(entryEc))
+                continue;
+            const std::filesystem::path assetPath = canonicalPath(entry.path());
+            if (ToLowerAscii(Utf8(assetPath.extension())) == ".meta")
+                continue;
+
+            const AssetType assetType = detectAssetType(assetPath);
+            if (assetType == AssetType::Unknown)
+                continue;
+
+            ++lastStats_.assetsScanned;
+            const std::filesystem::path metaPath = metaPathFor(assetPath);
+            bool regenerate = false;
+            Guid guid;
+            if (std::filesystem::exists(metaPath, entryEc))
+            {
+                std::string error;
+                const std::optional<MetaRecord> meta = loadMeta(metaPath, assetPath, error);
+                if (meta)
                 {
-                    TraceError("[ASSET-DB] error path=%s reason=asset_type_mismatch regenerating=yes",
-                        displayPath(metaPath).c_str());
-                    regenerate = true;
-                    ++lastStats_.metasCorrupted;
-                }
-                else if (guidToPath_.contains(meta->guid))
-                {
-                    TraceError("[ASSET-DB] error path=%s reason=duplicate_guid regenerating=yes",
-                        displayPath(metaPath).c_str());
-                    regenerate = true;
-                    ++lastStats_.metasCorrupted;
+                    if (meta->assetType != assetType)
+                    {
+                        TraceError("[ASSET-DB] error path=%s reason=asset_type_mismatch regenerating=yes",
+                            displayPath(metaPath).c_str());
+                        regenerate = true;
+                        ++lastStats_.metasCorrupted;
+                    }
+                    else if (guidToPath_.contains(meta->guid))
+                    {
+                        TraceError("[ASSET-DB] error path=%s reason=duplicate_guid regenerating=yes",
+                            displayPath(metaPath).c_str());
+                        regenerate = true;
+                        ++lastStats_.metasCorrupted;
+                    }
+                    else
+                    {
+                        guid = meta->guid;
+                        ++lastStats_.metasExisting;
+                        registerAsset(assetPath, guid);
+                        Tracenf("[ASSET-DB] guid_load path=%s guid=%s assetType=%s",
+                            displayPath(assetPath).c_str(),
+                            guid.toString().c_str(),
+                            AssetTypeName(assetType));
+                    }
                 }
                 else
                 {
-                    guid = meta->guid;
-                    ++lastStats_.metasExisting;
-                    registerAsset(assetPath, guid);
-                    Tracenf("[ASSET-DB] guid_load path=%s guid=%s assetType=%s",
-                        displayPath(assetPath).c_str(),
-                        guid.toString().c_str(),
-                        AssetTypeName(assetType));
+                    TraceError("[ASSET-DB] error path=%s reason=%s regenerating=yes",
+                        displayPath(metaPath).c_str(),
+                        error.c_str());
+                    regenerate = true;
+                    ++lastStats_.metasCorrupted;
                 }
             }
             else
             {
-                TraceError("[ASSET-DB] error path=%s reason=%s regenerating=yes",
-                    displayPath(metaPath).c_str(),
-                    error.c_str());
                 regenerate = true;
-                ++lastStats_.metasCorrupted;
+            }
+
+            if (regenerate)
+            {
+                guid = writeNewMeta(assetPath, assetType);
+                registerAsset(assetPath, guid);
+                ++lastStats_.metasGenerated;
+                Tracenf("[ASSET-DB] guid_assign path=%s guid=%s assetType=%s",
+                    displayPath(assetPath).c_str(),
+                    guid.toString().c_str(),
+                    AssetTypeName(assetType));
             }
         }
-        else
+        catch (const std::exception& error)
         {
-            regenerate = true;
-        }
-
-        if (regenerate)
-        {
-            guid = writeNewMeta(assetPath, assetType);
-            registerAsset(assetPath, guid);
-            ++lastStats_.metasGenerated;
-            Tracenf("[ASSET-DB] guid_assign path=%s guid=%s assetType=%s",
-                displayPath(assetPath).c_str(),
-                guid.toString().c_str(),
-                AssetTypeName(assetType));
+            ++lastStats_.metasCorrupted;
+            TraceError("[ASSET-DB] error path=%s reason=%s regenerating=no (skipped)",
+                displayPath(it->path()).c_str(),
+                error.what());
         }
     }
 
     if (ec)
     {
         TraceError("[ASSET-DB] error path=%s reason=%s regenerating=no",
-            scanRoot_.generic_string().c_str(),
+            Utf8(scanRoot_).c_str(),
             ec.message().c_str());
     }
 
@@ -649,7 +669,7 @@ std::optional<std::filesystem::path> AssetDatabase::resolveGuid(const Guid& guid
 
 std::optional<Guid> AssetDatabase::resolvePath(const std::filesystem::path& absPath) const
 {
-    const auto it = pathToGuid_.find(canonicalPath(absPath).generic_string());
+    const auto it = pathToGuid_.find(Utf8(canonicalPath(absPath)));
     if (it == pathToGuid_.end())
         return std::nullopt;
     return it->second;
@@ -676,7 +696,7 @@ bool AssetDatabase::isInIgnoredDirectory(const std::filesystem::path& path) cons
 bool AssetDatabase::runtimeAdd(const std::filesystem::path& absPath)
 {
     const std::filesystem::path assetPath = canonicalPath(absPath);
-    if (ToLowerAscii(assetPath.extension().string()) == ".meta")
+    if (ToLowerAscii(Utf8(assetPath.extension())) == ".meta")
         return false;
     if (isInIgnoredDirectory(assetPath))
         return false;
@@ -736,7 +756,7 @@ bool AssetDatabase::runtimeAdd(const std::filesystem::path& absPath)
 bool AssetDatabase::runtimeRemove(const std::filesystem::path& absPath)
 {
     const std::filesystem::path path = canonicalPath(absPath);
-    if (ToLowerAscii(path.extension().string()) == ".meta")
+    if (ToLowerAscii(Utf8(path.extension())) == ".meta")
     {
         const std::filesystem::path assetPath = assetPathForMeta(path);
         if (std::filesystem::exists(assetPath))
@@ -768,8 +788,8 @@ bool AssetDatabase::runtimeMove(const std::filesystem::path& oldAbsPath, const s
 {
     const std::filesystem::path oldPath = canonicalPath(oldAbsPath);
     const std::filesystem::path newPath = canonicalPath(newAbsPath);
-    if (ToLowerAscii(newPath.extension().string()) == ".meta" ||
-        ToLowerAscii(oldPath.extension().string()) == ".meta")
+    if (ToLowerAscii(Utf8(newPath.extension())) == ".meta" ||
+        ToLowerAscii(Utf8(oldPath.extension())) == ".meta")
     {
         return false;
     }
@@ -825,7 +845,7 @@ bool AssetDatabase::runtimeMove(const std::filesystem::path& oldAbsPath, const s
 bool AssetDatabase::runtimeModified(const std::filesystem::path& absPath)
 {
     const std::filesystem::path path = canonicalPath(absPath);
-    if (ToLowerAscii(path.extension().string()) == ".meta")
+    if (ToLowerAscii(Utf8(path.extension())) == ".meta")
         return false;
     if (isInIgnoredDirectory(path))
         return false;
@@ -1052,25 +1072,26 @@ std::filesystem::path AssetDatabase::canonicalPath(const std::filesystem::path& 
 
 std::filesystem::path AssetDatabase::metaPathFor(const std::filesystem::path& assetPath) const
 {
-    return std::filesystem::path(assetPath.generic_string() + ".meta");
+    std::filesystem::path meta = assetPath;
+    meta += ".meta";
+    return meta;
 }
 
 std::filesystem::path AssetDatabase::assetPathForMeta(const std::filesystem::path& metaPath) const
 {
-    std::string value = metaPath.generic_string();
-    constexpr const char* suffix = ".meta";
-    if (value.size() >= 5 && ToLowerAscii(value.substr(value.size() - 5)) == suffix)
-        value.resize(value.size() - 5);
-    return canonicalPath(value);
+    std::filesystem::path asset = metaPath;
+    if (ToLowerAscii(Utf8(asset.extension())) == ".meta")
+        asset.replace_extension();
+    return canonicalPath(asset);
 }
 
 std::string AssetDatabase::displayPath(const std::filesystem::path& path) const
 {
     if (scanRoot_.empty())
-        return path.generic_string();
+        return Utf8(path);
     std::error_code ec;
     const std::filesystem::path relative = std::filesystem::relative(path, scanRoot_, ec);
-    return ec ? path.generic_string() : relative.generic_string();
+    return ec ? Utf8(path) : Utf8(relative);
 }
 
 std::optional<AssetDatabase::MetaRecord> AssetDatabase::loadMeta(const std::filesystem::path& metaPath,
@@ -1160,7 +1181,7 @@ Guid AssetDatabase::writeNewMeta(const std::filesystem::path& assetPath, AssetTy
 void AssetDatabase::registerAsset(const std::filesystem::path& assetPath, const Guid& guid)
 {
     const std::filesystem::path canonical = canonicalPath(assetPath);
-    const std::string key = canonical.generic_string();
+    const std::string key = Utf8(canonical);
     const auto oldPathIt = pathToGuid_.find(key);
     if (oldPathIt != pathToGuid_.end() && oldPathIt->second != guid)
     {
@@ -1171,7 +1192,7 @@ void AssetDatabase::registerAsset(const std::filesystem::path& assetPath, const 
 
     const auto oldGuidIt = guidToPath_.find(guid);
     if (oldGuidIt != guidToPath_.end() && canonicalPath(oldGuidIt->second) != canonical)
-        pathToGuid_.erase(canonicalPath(oldGuidIt->second).generic_string());
+        pathToGuid_.erase(Utf8(canonicalPath(oldGuidIt->second)));
 
     guidToPath_[guid] = canonical;
     pathToGuid_[key] = guid;
@@ -1180,7 +1201,7 @@ void AssetDatabase::registerAsset(const std::filesystem::path& assetPath, const 
 std::optional<Guid> AssetDatabase::unregisterAsset(const std::filesystem::path& assetPath)
 {
     const std::filesystem::path canonical = canonicalPath(assetPath);
-    const auto pathIt = pathToGuid_.find(canonical.generic_string());
+    const auto pathIt = pathToGuid_.find(Utf8(canonical));
     if (pathIt == pathToGuid_.end())
         return std::nullopt;
 
