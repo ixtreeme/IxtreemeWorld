@@ -28,6 +28,8 @@ void EditorSceneRuntime::BuildSceneSnapshot(SceneData& scene, bool includeTerrai
     scene.physics = SceneManager::Instance().GetCurrentScene().physics;
     if (m_context.editorImGui)
         scene.lighting = m_context.editorImGui->GetLightingState();
+    if (m_context.sky)
+        scene.sky = *m_context.sky;
     if (m_context.waterBodies)
         scene.waterBodies = *m_context.waterBodies;
     if (m_context.pointLights)
@@ -132,7 +134,12 @@ void EditorSceneRuntime::ApplySceneData(const SceneData& scene)
         m_context.rebuildStaticMeshSpatialIndex();
 
     if (m_context.editorImGui)
+    {
         m_context.editorImGui->SetLightingState(scene.lighting);
+        m_context.editorImGui->SetSkySettings(scene.sky);
+    }
+    if (m_context.sky)
+        *m_context.sky = scene.sky;
     if (m_context.runtimeSession)
     {
         m_context.runtimeSession->SetDynamicLightEditorState({});

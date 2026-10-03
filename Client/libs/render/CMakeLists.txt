@@ -43,6 +43,8 @@ add_library(IXEngineRender STATIC
     StaticMeshRenderer.h
     SkinnedMeshRenderer.cpp
     SkinnedMeshRenderer.h
+    SkyRenderer.cpp
+    SkyRenderer.h
     tools/tree/TreeGeneratorPanel.h
     tools/tree/TreePreviewRenderer.h
     tools/tree/TreeTexturePalette.cpp

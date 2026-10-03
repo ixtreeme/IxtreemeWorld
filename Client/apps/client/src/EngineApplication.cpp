@@ -46,6 +46,7 @@
 #include "SceneWorldPackage.h"
 #include "SelectionSystem.h"
 #include "SelectionOutlineRenderer.h"
+#include "SkyRenderer.h"
 #include "SpatialIndex.h"
 #include "StaticMeshRenderer.h"
 #include "TerrainEditorSystem.h"
@@ -2425,6 +2426,17 @@ int RunGame(NativeWindow& window,
         selectionOutlines.Destroy();
     }
 
+    // The scene sky (Scene Settings > Sky): drawn behind everything in the Scene view, the Game view
+    // and the water reflection. sceneSky is what it draws; the editor Sky panel edits its own copy.
+    SkyRenderer skyRenderer;
+    bool skyOk = skyRenderer.Create(*rhiDevice, assets);
+    if (!skyOk)
+    {
+        Tracenf("[MAIN] SkyRenderer failed to initialize - scenes show a flat backdrop");
+        skyRenderer.Destroy();
+    }
+    SkySettings sceneSky;
+
     OffscreenSceneRenderer offscreenScene;
     // Offscreen targets resolve formats from the live swapchain (as before,
     // when the renderer queried them internally). Refreshed on every
@@ -2461,6 +2473,11 @@ int RunGame(NativeWindow& window,
         {
             selectionOutlines.SetTargetPass(offscreenScene.GetTargetPass());
             selectionOutlines.RecreatePipeline(*rhiDevice);
+        }
+        if (skyOk)
+        {
+            skyRenderer.SetTargetPass(offscreenScene.GetTargetPass());
+            skyRenderer.RecreatePipeline(*rhiDevice);
         }
 #if defined(IXTREEME_WITH_EDITOR)
         editorAdapter->SetSceneViewTexture(offscreenScene.GetColorTexture(),
@@ -2729,6 +2746,11 @@ int RunGame(NativeWindow& window,
         {
             selectionOutlines.SetTargetPass(offscreenScene.GetTargetPass());
             selectionOutlines.RecreatePipeline(*rhiDevice);
+        }
+        if (skyOk)
+        {
+            skyRenderer.SetTargetPass(offscreenScene.GetTargetPass());
+            skyRenderer.RecreatePipeline(*rhiDevice);
         }
 #if defined(IXTREEME_WITH_EDITOR)
         editorAdapter->SetSceneViewTexture(offscreenScene.GetColorTexture(),
@@ -3702,6 +3724,7 @@ int RunGame(NativeWindow& window,
         &editorPointLights,
         &editorSpotLights,
         &editorMeshEntities,
+        &sceneSky,
         &editorWaterBodiesDirty,
         terrainOk,
         &nextEditorWaterBodyId,
@@ -5269,6 +5292,8 @@ int RunGame(NativeWindow& window,
                         }
                         if (selectionOutlinesOk)
                             selectionOutlines.SetTargetPass(offscreenScene.GetTargetPass());
+                        if (skyOk)
+                            skyRenderer.SetTargetPass(offscreenScene.GetTargetPass());
 #if defined(IXTREEME_WITH_EDITOR)
                         editorAdapter->SetSceneViewTexture(offscreenScene.GetColorTexture(),
                             offscreenScene.GetSampler(),
@@ -5314,6 +5339,8 @@ int RunGame(NativeWindow& window,
                     terrain.RecreatePipeline(*rhiDevice);
                 if (selectionOutlinesOk)
                     selectionOutlines.RecreatePipeline(*rhiDevice);
+                if (skyOk)
+                    skyRenderer.RecreatePipeline(*rhiDevice);
                 if (worldLabelsOk)
                     worldLabels.RecreatePipeline(*rhiDevice);
                 runtimeSession->OnRenderPassChanged();
@@ -10319,6 +10346,8 @@ int RunGame(NativeWindow& window,
                 }
                 frameProfile.hierarchyIterationMs = MillisecondsBetween(hierarchyBegin, std::chrono::steady_clock::now());
 
+                // The Sky panel edits the editor's copy; the renderer and the scene snapshot use sceneSky.
+                sceneSky = editorImGui.GetSkySettings();
                 LightingState lightingState = editorImGui.GetLightingState();
                 const bool editorHideEntities = editorPlay.state.mode == EditorPlayMode::Edit;
                 lightingState.numPointLights = 0;
@@ -10338,6 +10367,14 @@ int RunGame(NativeWindow& window,
                     if (lightingState.numSpotLights >= kMaxDynamicSpotLights)
                         break;
                     lightingState.spotLights[lightingState.numSpotLights++] = light;
+                }
+                if (sceneSky.ambientFromSky && skyOk)
+                {
+                    // Last frame's sky average (the sky updates during rendering): close enough.
+                    const std::array<float, 3> skyAmbient = skyRenderer.AverageColor();
+                    lightingState.ambient.r = skyAmbient[0];
+                    lightingState.ambient.g = skyAmbient[1];
+                    lightingState.ambient.b = skyAmbient[2];
                 }
                 editorImGui.SetLightingState(lightingState);
                 terrain.SetLightingState(lightingState);
@@ -10834,6 +10871,22 @@ int RunGame(NativeWindow& window,
             if (!drawSceneView && gameViewCamera)
                 shadowCamera = &*gameViewCamera;
 #endif
+            // The sky's parameters for this frame, before any pass draws it (outside render passes:
+            // a changed sky image is loaded here). Its sun follows the scene's Sun light.
+            if (skyOk && isInWorld)
+            {
+#if defined(IXTREEME_WITH_EDITOR)
+                const LightingState skyLighting = editorImGui.GetLightingState();
+                editorImGui.SetSkyStatus(skyRenderer.Status());
+#else
+                const LightingState skyLighting = SceneManager::Instance().GetCurrentScene().lighting;
+#endif
+                skyRenderer.Update(frameInfo,
+                    sceneSky,
+                    skyLighting,
+                    ProjectManager::Instance().HasProject() ? ProjectManager::Instance().ProjectRoot()
+                                                            : std::filesystem::path{});
+            }
             // Sculpted terrain vertices reach the drawn vertex buffer before any pass draws the terrain
             // (outside render passes: nothing is open yet here).
             if (isInWorld && hasSceneTerrain)
@@ -10881,6 +10934,11 @@ int RunGame(NativeWindow& window,
                                 rec.scale);
                         }
 
+                        // The mirrored sky last: it fills only what no reflected geometry covered.
+                        if (skyOk)
+                            skyRenderer.Render(*frameInfo.commandList, frameInfo, mirrorCamera,
+                                reflectionWidth, reflectionHeight, reflectionPass);
+
                         // (Editor lights are not drawn as the skinned character model in the
                         // water reflection either — removed old debug visualization.)
                     });
@@ -10918,6 +10976,9 @@ int RunGame(NativeWindow& window,
                         /*viewIndex=*/0, clearDepth);
                     rhiDevice->WriteTimestamp(ixrhi::IXRHITimestampPoint::TerrainMainEnd);
                 };
+                // The sky first: the background everything else draws over (no depth writes).
+                if (skyOk)
+                    skyRenderer.Render(*frameInfo.commandList, frameInfo, camera, renderSize.width, renderSize.height);
                 if (hasSceneTerrain && !terrainAfterMeshes)
                     renderSceneTerrain(true);
                 rhiDevice->WriteTimestamp(ixrhi::IXRHITimestampPoint::SceneOtherBegin);
@@ -11676,6 +11737,9 @@ int RunGame(NativeWindow& window,
                         const VkExtent2D gameExtent{gameView.Width(), gameView.Height()};
                         const WorldCamera& gameCamera = *gameViewCamera;
                         gameView.BeginMainPass(*frameInfo.commandList, frameInfo);
+                        if (skyOk && isInWorld)
+                            skyRenderer.Render(*frameInfo.commandList, frameInfo, gameCamera,
+                                gameExtent.width, gameExtent.height);
                         // Terrain is drawn from the project Main Camera using the secondary
                         // camera-uniform path (viewIndex=1). That path has its own per-frame
                         // uniform buffer + descriptor set, so this draw no longer clobbers the
@@ -12165,6 +12229,8 @@ int RunGame(NativeWindow& window,
         worldLabels.Destroy();
     if (selectionOutlinesOk)
         selectionOutlines.Destroy();
+    if (skyOk)
+        skyRenderer.Destroy();
     for (auto& [path, entry] : staticMeshCache)
     {
         (void)path;

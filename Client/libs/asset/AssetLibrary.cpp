@@ -1662,7 +1662,7 @@ std::optional<AssetLibrary::Category> AssetLibrary::DiscoverableCategory(const s
         return Category::Material;
     const std::string ext = ToLower(path.extension().generic_string());
     if (ext == ".png" || ext == ".jpg" || ext == ".jpeg" || ext == ".tga" ||
-        ext == ".bmp" || ext == ".dds" || ext == ".ktx" || ext == ".ktx2")
+        ext == ".bmp" || ext == ".dds" || ext == ".ktx" || ext == ".ktx2" || ext == ".hdr")
         return Category::Texture;
     if (ext == ".glb" || ext == ".gltf" || ext == ".fbx" || ext == ".obj")
         return Category::Model;
@@ -3177,9 +3177,9 @@ bool AssetLibrary::ValidateFile(Category category, const std::filesystem::path& 
     switch (category)
     {
     case Category::Texture:
-        if (!HasAnyExtension(path, {".png", ".jpg", ".jpeg", ".dds", ".tga"}))
+        if (!HasAnyExtension(path, {".png", ".jpg", ".jpeg", ".dds", ".tga", ".hdr"}))
         {
-            error = "textures must be PNG, JPG, DDS or TGA";
+            error = "textures must be PNG, JPG, DDS, TGA or HDR";
             return false;
         }
         break;
@@ -3326,7 +3326,7 @@ std::optional<AssetLibrary::Category> DetectDirectImportCategory(const std::file
 {
     const std::string ext = ToLower(sourcePath.extension().string());
     if (ext == ".png" || ext == ".jpg" || ext == ".jpeg" || ext == ".tga" ||
-        ext == ".bmp" || ext == ".dds" || ext == ".ktx" || ext == ".ktx2")
+        ext == ".bmp" || ext == ".dds" || ext == ".ktx" || ext == ".ktx2" || ext == ".hdr")
         return AssetLibrary::Category::Texture;
     if (ext == ".glb" || ext == ".gltf" || ext == ".fbx" || ext == ".obj")
         return AssetLibrary::Category::Model;

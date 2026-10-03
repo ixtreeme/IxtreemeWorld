@@ -292,6 +292,8 @@ if(WIN32)
     set(WORLD_LABEL_PS_SPV "${GENERATED_SHADER_DIR}/world_label_ps.spv")
     set(RMLUI_VS_SPV "${GENERATED_SHADER_DIR}/rmlui_vs.spv")
     set(RMLUI_PS_SPV "${GENERATED_SHADER_DIR}/rmlui_ps.spv")
+    set(SKY_VS_SPV "${GENERATED_SHADER_DIR}/sky_vs.spv")
+    set(SKY_PS_SPV "${GENERATED_SHADER_DIR}/sky_ps.spv")
 
     add_custom_command(
         OUTPUT "${SKINNED_MESH_VS_SPV}"
@@ -461,6 +463,22 @@ if(WIN32)
         DEPENDS "${CLIENT_ROOT}/shaders/RmlUi.hlsl"
         VERBATIM
     )
+    add_custom_command(
+        OUTPUT "${SKY_VS_SPV}"
+        COMMAND ${CMAKE_COMMAND} -E make_directory "${GENERATED_SHADER_DIR}"
+        COMMAND "${DXC_EXECUTABLE}" -spirv -fvk-use-dx-layout -T vs_6_0 -E VSMain
+            -Fo "${SKY_VS_SPV}" "${CLIENT_ROOT}/shaders/Sky.hlsl"
+        DEPENDS "${CLIENT_ROOT}/shaders/Sky.hlsl"
+        VERBATIM
+    )
+    add_custom_command(
+        OUTPUT "${SKY_PS_SPV}"
+        COMMAND ${CMAKE_COMMAND} -E make_directory "${GENERATED_SHADER_DIR}"
+        COMMAND "${DXC_EXECUTABLE}" -spirv -fvk-use-dx-layout -T ps_6_0 -E PSMain
+            -Fo "${SKY_PS_SPV}" "${CLIENT_ROOT}/shaders/Sky.hlsl"
+        DEPENDS "${CLIENT_ROOT}/shaders/Sky.hlsl"
+        VERBATIM
+    )
     add_custom_target(IXEngineShaders DEPENDS
         "${SKINNED_MESH_VS_SPV}"
         "${SKINNED_MESH_PS_SPV}"
@@ -483,6 +501,8 @@ if(WIN32)
         "${WORLD_LABEL_PS_SPV}"
         "${RMLUI_VS_SPV}"
         "${RMLUI_PS_SPV}"
+        "${SKY_VS_SPV}"
+        "${SKY_PS_SPV}"
     )
 elseif(ANDROID)
     if(CMAKE_ANDROID_NDK)

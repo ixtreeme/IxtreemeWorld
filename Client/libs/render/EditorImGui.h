@@ -171,6 +171,10 @@ public:
     void SetEditorPlayModeState(const EditorPlayModeState& state);
     void SetLightingState(const LightingState& state);
     LightingState GetLightingState() const { return m_lightingState; }
+    void SetSkySettings(const SkySettings& sky) { m_skySettings = sky; }
+    const SkySettings& GetSkySettings() const { return m_skySettings; }
+    // Shown under the sky settings while the sky cannot draw as set (a missing image, ...).
+    void SetSkyStatus(const std::string& status) { m_skyStatus = status; }
     void SetDynamicLightEditorState(const DynamicLightEditorState& state);
     void SetCameraEditorState(const CameraEditorState& state);
     void SetWaterBodyEditorState(const WaterBodyEditorState& state);
@@ -366,6 +370,7 @@ private:
     void RenderCreateTerrainModal();
     void OpenCreateTerrainDialog();
     void RenderLightingPanel();
+    void RenderSkyPanel();
     void RenderGizmoControls();
     // Terrain and water editing tools, shown in the Inspector of the selected terrain / water body.
     void RenderWaterSculptTool();
@@ -554,6 +559,8 @@ private:
     // pending ImGui window to focus, applied at the start of the next panel render.
     const char* m_pendingViewFocusWindow = nullptr;
     LightingState m_lightingState;
+    SkySettings m_skySettings;
+    std::string m_skyStatus;
     DynamicLightEditorState m_dynamicLightState;
     CameraEditorState m_cameraEditorState;
     WaterBodyEditorState m_waterBodyState;

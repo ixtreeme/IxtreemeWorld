@@ -833,6 +833,9 @@ void EditorImGui::RenderSceneSettingsPanel()
             if (ImGui::CollapsingHeader(ICON_FA_SUN "  Environment", ImGuiTreeNodeFlags_DefaultOpen))
                 RenderLightingPanel();
 
+            if (ImGui::CollapsingHeader(ICON_FA_CLOUD_SUN "  Sky", ImGuiTreeNodeFlags_DefaultOpen))
+                RenderSkyPanel();
+
             if (ImGui::CollapsingHeader(ICON_FA_CUBES "  Physics", ImGuiTreeNodeFlags_DefaultOpen))
             {
                 PhysicsSceneSettings physicsSettings = scene.physics;

@@ -330,6 +330,8 @@ std::shared_ptr<ixrhi::IXRHITexture> IXVulkanDevice::CreateTexture(
     if (desc.width == 0 || desc.height == 0 || desc.format == ixrhi::IXRHIFormat::Undefined ||
         desc.mipLevels == 0 || desc.arrayLayers == 0)
         return nullptr;
+    if (desc.cubeMap && (desc.arrayLayers != 6 || desc.width != desc.height))
+        return nullptr;
 
     const VkFormat format = ToVkFormat(desc.format);
     const std::uint32_t pixelBytes = ixrhi::IXRHIFormatByteSize(desc.format);
@@ -350,6 +352,8 @@ std::shared_ptr<ixrhi::IXRHITexture> IXVulkanDevice::CreateTexture(
         create.usage |= VK_IMAGE_USAGE_TRANSFER_DST_BIT;
     create.sharingMode = VK_SHARING_MODE_EXCLUSIVE;
     create.initialLayout = VK_IMAGE_LAYOUT_UNDEFINED;
+    if (desc.cubeMap)
+        create.flags |= VK_IMAGE_CREATE_CUBE_COMPATIBLE_BIT;
 
     VkImage image = VK_NULL_HANDLE;
     CheckVk(vkCreateImage(NativeDevice(), &create, nullptr, &image), "vkCreateImage", __FILE__, __LINE__);
@@ -400,7 +404,9 @@ std::shared_ptr<ixrhi::IXRHITexture> IXVulkanDevice::CreateTexture(
     VkImageViewCreateInfo view{};
     view.sType = VK_STRUCTURE_TYPE_IMAGE_VIEW_CREATE_INFO;
     view.image = image;
-    view.viewType = desc.arrayLayers > 1 ? VK_IMAGE_VIEW_TYPE_2D_ARRAY : VK_IMAGE_VIEW_TYPE_2D;
+    view.viewType = desc.cubeMap ? VK_IMAGE_VIEW_TYPE_CUBE
+        : desc.arrayLayers > 1 ? VK_IMAGE_VIEW_TYPE_2D_ARRAY
+                               : VK_IMAGE_VIEW_TYPE_2D;
     view.format = format;
     view.subresourceRange.aspectMask = isDepth
         ? (ToVkAspectMask(desc.format))

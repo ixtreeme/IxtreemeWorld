@@ -26,6 +26,9 @@ struct IXRHITextureDesc
     IXRHIFormat format = IXRHIFormat::Undefined;
     IXRHITextureUsage usage = IXRHITextureUsage::None;
     std::uint32_t sampleCount = 1;
+    // Cube map: arrayLayers must be 6 (faces +X, -X, +Y, -Y, +Z, -Z) and width == height; the
+    // texture is then sampled as a TextureCube. D3D12: TEXTURECUBE SRV — natural.
+    bool cubeMap = false;
     std::string debugName;
 };
 

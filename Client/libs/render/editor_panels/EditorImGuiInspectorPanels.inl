@@ -1823,7 +1823,11 @@ void EditorImGui::RenderLightingPanel()
     UI::ItemTooltip("Compass direction the sunlight comes from");
 
     ImGui::SeparatorText("Ambient light");
+    ImGui::BeginDisabled(m_skySettings.ambientFromSky);
     UI::Prop::ColorEdit3("Color##ambient", &m_lightingState.ambient.r);
+    ImGui::EndDisabled();
+    if (m_skySettings.ambientFromSky)
+        UI::ItemTooltip("Taken from the sky (Sky > Ambient from sky)");
     UI::Prop::SliderFloat("Intensity##ambient", &m_lightingState.ambient.intensity, 0.0f, 3.0f, "%.2f");
 
     ImGui::SeparatorText("Time of day preset");
@@ -1837,6 +1841,221 @@ void EditorImGui::RenderLightingPanel()
         return false;
     });
     UI::ItemTooltip("Sets the sun and ambient light for that hour");
+}
+
+namespace
+{
+// File-name words that mark each cube face, in SkySettings face order (+X, -X, +Y, -Y, +Z, -Z).
+// Dropping one face fills the others from same-named siblings: sky_right.png -> sky_left.png, ...
+const std::array<std::vector<std::string>, SkySettings::kCubeFaces> kSkyFaceWords = {{
+    {"right", "px", "posx", "rt"},
+    {"left", "nx", "negx", "lf"},
+    {"up", "top", "py", "posy"},
+    {"down", "bottom", "ny", "negy", "dn"},
+    {"front", "pz", "posz", "ft"},
+    {"back", "nz", "negz", "bk"},
+}};
+
+bool IsWordBoundary(const std::string& text, std::size_t index)
+{
+    return index == 0 || index >= text.size() ||
+        !std::isalnum(static_cast<unsigned char>(text[index - 1])) ||
+        !std::isalnum(static_cast<unsigned char>(text[index]));
+}
+
+// Finds the face word in a file stem: a whole word (between separators) or a trailing suffix.
+std::optional<std::pair<std::size_t, std::size_t>> FindSkyFaceWord(const std::string& stem, std::size_t face)
+{
+    std::string lower = stem;
+    std::transform(lower.begin(), lower.end(), lower.begin(),
+        [](unsigned char c) { return static_cast<char>(std::tolower(c)); });
+    for (const std::string& word : kSkyFaceWords[face])
+    {
+        for (std::size_t at = lower.rfind(word); at != std::string::npos; at = at == 0 ? std::string::npos : lower.rfind(word, at - 1))
+        {
+            const std::size_t end = at + word.size();
+            if (IsWordBoundary(lower, at) && (end == lower.size() || !std::isalpha(static_cast<unsigned char>(lower[end]))))
+                return std::make_pair(at, word.size());
+        }
+    }
+    return std::nullopt;
+}
+
+// The other face's word in the same letter case as the one it replaces.
+std::string MatchCase(const std::string& word, const std::string& like)
+{
+    std::string out = word;
+    const bool upper = std::all_of(like.begin(), like.end(),
+        [](unsigned char c) { return !std::isalpha(c) || std::isupper(c); });
+    const bool capitalized = !upper && !like.empty() && std::isupper(static_cast<unsigned char>(like[0]));
+    for (std::size_t i = 0; i < out.size(); ++i)
+    {
+        if (upper || (capitalized && i == 0))
+            out[i] = static_cast<char>(std::toupper(static_cast<unsigned char>(out[i])));
+    }
+    return out;
+}
+} // namespace
+
+void EditorImGui::RenderSkyPanel()
+{
+    SkySettings& sky = m_skySettings;
+    bool changed = false;
+
+    const char* modes[] = {"Color", "Procedural", "Cube map (6 images)", "Panorama (360 image)"};
+    int mode = static_cast<int>(sky.mode);
+    if (UI::Prop::Combo("Type", &mode, modes, IM_ARRAYSIZE(modes)))
+    {
+        sky.mode = static_cast<SkySettings::Mode>(std::clamp(mode, 0, 3));
+        changed = true;
+    }
+    UI::ItemTooltip("What the scene shows behind everything (the water reflects it too)");
+
+    // An image slot: shows the file, takes a texture dropped from the Asset Browser, X clears it.
+    // Returns the project-relative path of a newly dropped texture (empty when nothing was dropped).
+    const auto imageSlot = [&](const char* label, std::string& path, const char* tooltip) {
+        std::string dropped;
+        const std::string name = path.empty() ? std::string("None (drop an image here)")
+                                              : std::filesystem::path(path).filename().string();
+        ImGui::PushID(label);
+        UI::Property(label, [&](const char*) {
+            const float clearWidth = path.empty() ? 0.0f : ImGui::GetFrameHeight() + ImGui::GetStyle().ItemSpacing.x;
+            ImGui::PushStyleColor(ImGuiCol_Button, ImGui::GetStyleColorVec4(ImGuiCol_FrameBg));
+            ImGui::PushStyleColor(ImGuiCol_ButtonHovered, ImGui::GetStyleColorVec4(ImGuiCol_FrameBgHovered));
+            ImGui::PushStyleColor(ImGuiCol_ButtonActive, ImGui::GetStyleColorVec4(ImGuiCol_FrameBgActive));
+            ImGui::PushStyleVar(ImGuiStyleVar_ButtonTextAlign, ImVec2(0.0f, 0.5f));
+            const std::string text = std::string(ICON_FA_IMAGE "  ") + name + "##image";
+            ImGui::Button(text.c_str(), ImVec2(std::max(40.0f, ImGui::GetContentRegionAvail().x - clearWidth), 0.0f));
+            ImGui::PopStyleVar();
+            ImGui::PopStyleColor(3);
+            UI::ItemTooltip(path.empty() ? tooltip : path.c_str());
+            if (ImGui::BeginDragDropTarget())
+            {
+                if (const ImGuiPayload* payload = ImGui::AcceptDragDropPayload(kAssetPayloadType))
+                {
+                    const std::string assetId(static_cast<const char*>(payload->Data), payload->DataSize);
+                    auto entry = m_assetLibrary ? m_assetLibrary->FindById(assetId) : std::optional<AssetLibrary::Entry>{};
+                    if (entry && entry->category == AssetLibrary::Category::Texture)
+                    {
+                        dropped = m_assetLibrary->AssetRelativePath(*entry);
+                        path = dropped;
+                        changed = true;
+                    }
+                    else
+                    {
+                        m_assetStatus = "The sky takes image assets only (PNG, JPG, TGA or HDR)";
+                    }
+                }
+                ImGui::EndDragDropTarget();
+            }
+            if (!path.empty())
+            {
+                ImGui::SameLine();
+                if (ImGui::Button(ICON_FA_XMARK "##clear", ImVec2(ImGui::GetFrameHeight(), 0.0f)))
+                {
+                    path.clear();
+                    changed = true;
+                }
+                UI::ItemTooltip("Remove the image");
+            }
+            return false;
+        });
+        ImGui::PopID();
+        return dropped;
+    };
+
+    switch (sky.mode)
+    {
+    case SkySettings::Mode::Color:
+        changed |= UI::Prop::ColorEdit3("Color##sky", sky.color);
+        break;
+    case SkySettings::Mode::Procedural:
+        changed |= UI::Prop::ColorEdit3("Zenith", sky.zenithColor);
+        UI::ItemTooltip("The sky straight overhead");
+        changed |= UI::Prop::ColorEdit3("Horizon", sky.horizonColor);
+        UI::ItemTooltip("The sky at the horizon; turns warm on the sun's side at sunrise and sunset");
+        changed |= UI::Prop::ColorEdit3("Ground", sky.groundColor);
+        UI::ItemTooltip("Below the horizon, where no terrain covers it");
+        changed |= UI::Prop::SliderFloat("Sun size", &sky.sunSizeDegrees, 0.0f, 10.0f, "%.1f deg");
+        UI::ItemTooltip("Angular size of the sun disc (the real sun is about 0.5); 0 hides it.\n"
+                        "The sun's place and colour come from the Sun above.");
+        changed |= UI::Prop::SliderFloat("Sun glow", &sky.sunGlow, 0.0f, 2.0f, "%.2f");
+        break;
+    case SkySettings::Mode::Cubemap:
+    {
+        static const char* faceLabels[SkySettings::kCubeFaces] = {
+            "Right (+X)", "Left (-X)", "Up (+Y)", "Down (-Y)", "Front (+Z)", "Back (-Z)"};
+        for (std::size_t face = 0; face < SkySettings::kCubeFaces; ++face)
+        {
+            const std::string dropped = imageSlot(faceLabels[face], sky.cubeFacePaths[face],
+                "Drop one face image: faces named like it (right / left / up / down / front / back,\n"
+                "px / nx / py / ny / pz / nz) in the same folder fill the empty slots");
+            if (dropped.empty())
+                continue;
+            // Fill the other empty faces from same-named siblings of the dropped image.
+            const std::filesystem::path droppedPath(dropped);
+            const std::string stem = droppedPath.stem().string();
+            const auto found = FindSkyFaceWord(stem, face);
+            if (!found)
+                continue;
+            const std::filesystem::path projectRoot = ProjectManager::Instance().HasProject()
+                ? ProjectManager::Instance().ProjectRoot() : std::filesystem::path{};
+            int filled = 0;
+            for (std::size_t other = 0; other < SkySettings::kCubeFaces; ++other)
+            {
+                if (other == face || !sky.cubeFacePaths[other].empty())
+                    continue;
+                const std::string original = stem.substr(found->first, found->second);
+                for (const std::string& word : kSkyFaceWords[other])
+                {
+                    const std::string candidateStem = stem.substr(0, found->first) + MatchCase(word, original) +
+                        stem.substr(found->first + found->second);
+                    const std::filesystem::path candidate =
+                        droppedPath.parent_path() / (candidateStem + droppedPath.extension().string());
+                    std::error_code ec;
+                    if (std::filesystem::exists(projectRoot / candidate, ec))
+                    {
+                        sky.cubeFacePaths[other] = candidate.generic_string();
+                        ++filled;
+                        break;
+                    }
+                }
+            }
+            if (filled > 0)
+                m_assetStatus = "Sky: filled " + std::to_string(filled) + " more face(s) from the same folder";
+        }
+        break;
+    }
+    case SkySettings::Mode::Panorama:
+        imageSlot("Panorama", sky.panoramaPath,
+            "An equirectangular 360 x 180 degree image (2:1), PNG, JPG or HDR.\n"
+            "Drop it here from the Asset Browser.");
+        break;
+    }
+
+    if (sky.mode != SkySettings::Mode::Color)
+    {
+        changed |= UI::Prop::SliderFloat("Exposure", &sky.exposure, 0.0f, 8.0f, "%.2f", ImGuiSliderFlags_Logarithmic);
+        UI::ItemTooltip("Brightness multiplier (HDR images often need less than 1)");
+        if (sky.mode != SkySettings::Mode::Procedural)
+        {
+            changed |= UI::Prop::SliderFloat("Rotation", &sky.rotationDegrees, 0.0f, 360.0f, "%.0f deg");
+            UI::ItemTooltip("Turns the image around the vertical axis");
+        }
+        changed |= UI::Prop::ColorEdit3("Tint", sky.tint);
+    }
+    changed |= UI::Prop::Checkbox("Ambient from sky", &sky.ambientFromSky);
+    UI::ItemTooltip("The ambient light takes the sky's average colour (its intensity stays above)");
+
+    if (!m_skyStatus.empty())
+    {
+        ImGui::PushStyleColor(ImGuiCol_Text, UI::Theme::Warning);
+        ImGui::TextWrapped(ICON_FA_TRIANGLE_EXCLAMATION "  %s", m_skyStatus.c_str());
+        ImGui::PopStyleColor();
+    }
+
+    if (changed)
+        SceneManager::Instance().MarkDirty();
 }
 
 void EditorImGui::OpenCreateTerrainDialog()

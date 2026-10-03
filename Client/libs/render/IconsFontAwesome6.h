@@ -43,6 +43,7 @@
 #define ICON_FA_COPY                       "\xef\x83\x85"
 #define ICON_FA_PEN                        "\xef\x8c\x84"
 #define ICON_FA_GLOBE                      "\xef\x82\xac"
+#define ICON_FA_CLOUD_SUN                  "\xef\x9b\x84"
 #define ICON_FA_SUN                        "\xef\x86\x85"
 
 // Added for the editor shell (toolbar, status bar, menus, asset types).

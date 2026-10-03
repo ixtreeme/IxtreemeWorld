@@ -1096,6 +1096,77 @@ void WritePaletteSlot(std::ostream& out, const MapEditorPaletteSlot& slot, bool 
     out << "    }" << (comma ? "," : "") << "\n";
 }
 
+const char* SkyModeName(SkySettings::Mode mode)
+{
+    switch (mode)
+    {
+    case SkySettings::Mode::Color: return "color";
+    case SkySettings::Mode::Procedural: return "procedural";
+    case SkySettings::Mode::Cubemap: return "cubemap";
+    case SkySettings::Mode::Panorama: return "panorama";
+    }
+    return "procedural";
+}
+
+SkySettings::Mode SkyModeFromName(const std::string& name, SkySettings::Mode fallback)
+{
+    if (name == "color")
+        return SkySettings::Mode::Color;
+    if (name == "procedural")
+        return SkySettings::Mode::Procedural;
+    if (name == "cubemap")
+        return SkySettings::Mode::Cubemap;
+    if (name == "panorama")
+        return SkySettings::Mode::Panorama;
+    return fallback;
+}
+
+// The "sky" object inside "environment".
+void WriteSkySettings(std::ostream& out, const SkySettings& sky)
+{
+    out << "    \"sky\": {\n";
+    out << "      \"mode\": \"" << SkyModeName(sky.mode) << "\",\n";
+    out << "      \"color\": " << FloatArray(sky.color, 3) << ",\n";
+    out << "      \"zenith_color\": " << FloatArray(sky.zenithColor, 3) << ",\n";
+    out << "      \"horizon_color\": " << FloatArray(sky.horizonColor, 3) << ",\n";
+    out << "      \"ground_color\": " << FloatArray(sky.groundColor, 3) << ",\n";
+    out << "      \"sun_size_degrees\": " << sky.sunSizeDegrees << ",\n";
+    out << "      \"sun_glow\": " << sky.sunGlow << ",\n";
+    out << "      \"cube_faces\": [";
+    for (std::size_t face = 0; face < sky.cubeFacePaths.size(); ++face)
+        out << (face > 0 ? ", " : "") << "\"" << EscapeJson(sky.cubeFacePaths[face]) << "\"";
+    out << "],\n";
+    out << "      \"panorama\": \"" << EscapeJson(sky.panoramaPath) << "\",\n";
+    out << "      \"exposure\": " << sky.exposure << ",\n";
+    out << "      \"rotation_degrees\": " << sky.rotationDegrees << ",\n";
+    out << "      \"tint\": " << FloatArray(sky.tint, 3) << ",\n";
+    out << "      \"ambient_from_sky\": " << (sky.ambientFromSky ? "true" : "false") << "\n";
+    out << "    }";
+}
+
+SkySettings ReadSkySettings(const JsonValue& object)
+{
+    SkySettings sky;
+    sky.mode = SkyModeFromName(ReadString(object, "mode"), sky.mode);
+    ReadFloatArray(object, "color", sky.color, 3);
+    ReadFloatArray(object, "zenith_color", sky.zenithColor, 3);
+    ReadFloatArray(object, "horizon_color", sky.horizonColor, 3);
+    ReadFloatArray(object, "ground_color", sky.groundColor, 3);
+    sky.sunSizeDegrees = std::clamp(ReadFloat(object, "sun_size_degrees", sky.sunSizeDegrees), 0.0f, 20.0f);
+    sky.sunGlow = std::clamp(ReadFloat(object, "sun_glow", sky.sunGlow), 0.0f, 4.0f);
+    if (const JsonValue* faces = Find(object, "cube_faces"); faces && faces->type == JsonValue::Type::Array)
+    {
+        for (std::size_t face = 0; face < sky.cubeFacePaths.size() && face < faces->array.size(); ++face)
+            sky.cubeFacePaths[face] = faces->array[face].StringOr({});
+    }
+    sky.panoramaPath = ReadString(object, "panorama");
+    sky.exposure = std::clamp(ReadFloat(object, "exposure", sky.exposure), 0.0f, 64.0f);
+    sky.rotationDegrees = ReadFloat(object, "rotation_degrees", sky.rotationDegrees);
+    ReadFloatArray(object, "tint", sky.tint, 3);
+    sky.ambientFromSky = ReadBool(object, "ambient_from_sky", sky.ambientFromSky);
+    return sky;
+}
+
 MapEditorPaletteSlot ReadPaletteSlot(const JsonValue& object)
 {
     MapEditorPaletteSlot slot;
@@ -2188,6 +2259,11 @@ bool SceneManager::LoadSceneInternal(const std::string& path)
         scene.lighting.ambient.r = ambientColor[0];
         scene.lighting.ambient.g = ambientColor[1];
         scene.lighting.ambient.b = ambientColor[2];
+        // Scenes saved before the sky existed keep their old look: the flat backdrop colour.
+        if (const JsonValue* sky = Find(*env, "sky"); sky && sky->type == JsonValue::Type::Object)
+            scene.sky = ReadSkySettings(*sky);
+        else
+            scene.sky.mode = SkySettings::Mode::Color;
     }
     if (const JsonValue* physics = Find(root, "physics"); physics && physics->type == JsonValue::Type::Object)
     {
@@ -2503,8 +2579,9 @@ bool SceneManager::SaveSceneInternal(const std::string& path)
     out << "    \"directional_light_angle_y\": " << scene.lighting.directional.azimuthDegrees << ",\n";
     const float ambientColor[3] = {scene.lighting.ambient.r, scene.lighting.ambient.g, scene.lighting.ambient.b};
     out << "    \"ambient_color\": " << FloatArray(ambientColor, 3) << ",\n";
-    out << "    \"ambient_intensity\": " << scene.lighting.ambient.intensity << "\n";
-    out << "  },\n";
+    out << "    \"ambient_intensity\": " << scene.lighting.ambient.intensity << ",\n";
+    WriteSkySettings(out, scene.sky);
+    out << "\n  },\n";
     out << "  \"physics\": {\n";
     out << "    \"gravity\": " << FloatArray(scene.physics.gravity, 3) << ",\n";
     out << "    \"fixed_delta_seconds\": " << scene.physics.fixedDeltaSeconds << ",\n";

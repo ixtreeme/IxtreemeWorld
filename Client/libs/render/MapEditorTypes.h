@@ -240,6 +240,35 @@ struct LightingState
     std::array<SpotLight, kMaxDynamicSpotLights> spotLights{};
 };
 
+// The scene's sky: what every view shows behind the geometry, and what the water mirrors.
+struct SkySettings
+{
+    enum class Mode : std::int32_t
+    {
+        Color = 0,       // one flat colour
+        Procedural = 1,  // zenith / horizon / ground gradient with a sun disc that follows the Sun
+        Cubemap = 2,     // six images, one per cube face
+        Panorama = 3     // one equirectangular (360 x 180 degree) image, LDR or .hdr
+    };
+    static constexpr std::size_t kCubeFaces = 6;  // +X right, -X left, +Y up, -Y down, +Z front, -Z back
+
+    Mode mode = Mode::Procedural;
+    // Colours are stored as picked in the editor (sRGB) and shown exactly like that.
+    float color[3] = {0.22f, 0.25f, 0.33f};  // = the old fixed backdrop
+    float zenithColor[3] = {0.22f, 0.42f, 0.78f};
+    float horizonColor[3] = {0.72f, 0.82f, 0.93f};
+    float groundColor[3] = {0.36f, 0.34f, 0.32f};
+    float sunSizeDegrees = 1.5f;  // angular diameter of the sun disc; 0 hides it
+    float sunGlow = 0.6f;         // strength of the halo around the sun
+    // Images by project-relative path ("Assets/..."), like the terrain palette.
+    std::array<std::string, kCubeFaces> cubeFacePaths;
+    std::string panoramaPath;
+    float exposure = 1.0f;         // brightness multiplier
+    float rotationDegrees = 0.0f;  // turns the image skies around the vertical axis
+    float tint[3] = {1.0f, 1.0f, 1.0f};
+    bool ambientFromSky = false;   // the ambient light takes the sky's average colour
+};
+
 struct WaterConfig
 {
     enum class ReflectionQuality : std::int32_t

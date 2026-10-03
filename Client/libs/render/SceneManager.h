@@ -16,6 +16,7 @@ struct SceneData
     std::vector<CameraEntity> cameras;
     std::uint32_t mainCameraId = 0;
     LightingState lighting;
+    SkySettings sky;
     PhysicsSceneSettings physics;
     TerrainSceneData terrain;
     std::vector<WaterBody> waterBodies;

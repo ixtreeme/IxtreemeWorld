@@ -31,6 +31,8 @@ public:
         std::vector<PointLight>* pointLights = nullptr;
         std::vector<SpotLight>* spotLights = nullptr;
         std::vector<MeshSceneEntity>* meshEntities = nullptr;
+        // The scene sky the renderer draws (the editor's Sky panel edits its own copy).
+        SkySettings* sky = nullptr;
 
         bool* waterBodiesDirty = nullptr;
         bool terrainOk = false;
