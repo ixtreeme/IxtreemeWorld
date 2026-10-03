@@ -47,6 +47,7 @@
 #include "SelectionSystem.h"
 #include "SelectionOutlineRenderer.h"
 #include "SkyRenderer.h"
+#include "GodRayRenderer.h"
 #include "SpatialIndex.h"
 #include "StaticMeshRenderer.h"
 #include "TerrainEditorSystem.h"
@@ -2436,6 +2437,14 @@ int RunGame(NativeWindow& window,
         skyRenderer.Destroy();
     }
     SkySettings sceneSky;
+    // God rays (Scene Settings > God rays): light shafts from the Sun, over the Scene and Game views.
+    GodRayRenderer godRays;
+    bool godRaysOk = godRays.Create(*rhiDevice, assets);
+    if (!godRaysOk)
+    {
+        Tracenf("[MAIN] GodRayRenderer failed to initialize - no god rays");
+        godRays.Destroy();
+    }
 
     OffscreenSceneRenderer offscreenScene;
     // Offscreen targets resolve formats from the live swapchain (as before,
@@ -2478,6 +2487,11 @@ int RunGame(NativeWindow& window,
         {
             skyRenderer.SetTargetPass(offscreenScene.GetTargetPass());
             skyRenderer.RecreatePipeline(*rhiDevice);
+        }
+        if (godRaysOk)
+        {
+            godRays.SetTargetPass(offscreenScene.GetTargetPass());
+            godRays.RecreatePipeline(*rhiDevice);
         }
 #if defined(IXTREEME_WITH_EDITOR)
         editorAdapter->SetSceneViewTexture(offscreenScene.GetColorTexture(),
@@ -2751,6 +2765,11 @@ int RunGame(NativeWindow& window,
         {
             skyRenderer.SetTargetPass(offscreenScene.GetTargetPass());
             skyRenderer.RecreatePipeline(*rhiDevice);
+        }
+        if (godRaysOk)
+        {
+            godRays.SetTargetPass(offscreenScene.GetTargetPass());
+            godRays.RecreatePipeline(*rhiDevice);
         }
 #if defined(IXTREEME_WITH_EDITOR)
         editorAdapter->SetSceneViewTexture(offscreenScene.GetColorTexture(),
@@ -5294,6 +5313,8 @@ int RunGame(NativeWindow& window,
                             selectionOutlines.SetTargetPass(offscreenScene.GetTargetPass());
                         if (skyOk)
                             skyRenderer.SetTargetPass(offscreenScene.GetTargetPass());
+                        if (godRaysOk)
+                            godRays.SetTargetPass(offscreenScene.GetTargetPass());
 #if defined(IXTREEME_WITH_EDITOR)
                         editorAdapter->SetSceneViewTexture(offscreenScene.GetColorTexture(),
                             offscreenScene.GetSampler(),
@@ -5341,6 +5362,8 @@ int RunGame(NativeWindow& window,
                     selectionOutlines.RecreatePipeline(*rhiDevice);
                 if (skyOk)
                     skyRenderer.RecreatePipeline(*rhiDevice);
+                if (godRaysOk)
+                    godRays.RecreatePipeline(*rhiDevice);
                 if (worldLabelsOk)
                     worldLabels.RecreatePipeline(*rhiDevice);
                 runtimeSession->OnRenderPassChanged();
@@ -10873,17 +10896,20 @@ int RunGame(NativeWindow& window,
 #endif
             // The sky's parameters for this frame, before any pass draws it (outside render passes:
             // a changed sky image is loaded here). Its sun follows the scene's Sun light.
+            // The Sun the sky and the god rays follow.
+#if defined(IXTREEME_WITH_EDITOR)
+            const LightingState frameSunLighting = editorImGui.GetLightingState();
+#else
+            const LightingState frameSunLighting = SceneManager::Instance().GetCurrentScene().lighting;
+#endif
             if (skyOk && isInWorld)
             {
 #if defined(IXTREEME_WITH_EDITOR)
-                const LightingState skyLighting = editorImGui.GetLightingState();
                 editorImGui.SetSkyStatus(skyRenderer.Status());
-#else
-                const LightingState skyLighting = SceneManager::Instance().GetCurrentScene().lighting;
 #endif
                 skyRenderer.Update(frameInfo,
                     sceneSky,
-                    skyLighting,
+                    frameSunLighting,
                     ProjectManager::Instance().HasProject() ? ProjectManager::Instance().ProjectRoot()
                                                             : std::filesystem::path{});
             }
@@ -11724,6 +11750,20 @@ int RunGame(NativeWindow& window,
                     terrain.RenderWater(*frameInfo.commandList, frameInfo, camera, seconds, renderSize.width, renderSize.height);
                     offscreenScene.EndMainPass(*frameInfo.commandList);
                 }
+                // God rays over the finished scene (water included). They read the depth snapshot:
+                // taken above for the water, or here when there is no terrain.
+                if (godRaysOk && isInWorld && drawSceneView)
+                {
+                    if (!hasSceneTerrain && godRays.IsVisible(sceneSky, frameSunLighting, camera))
+                        offscreenScene.SnapshotScene(*frameInfo.commandList, frameInfo);
+                    if (godRays.RenderRays(*frameInfo.commandList, frameInfo, /*view=*/0, sceneSky, frameSunLighting,
+                            camera, offscreenScene.GetDepthSnapshotTexture(), renderSize.width, renderSize.height))
+                    {
+                        offscreenScene.BeginMainPass(*frameInfo.commandList, frameInfo, false);
+                        godRays.Composite(*frameInfo.commandList, frameInfo, /*view=*/0, renderSize.width, renderSize.height);
+                        offscreenScene.EndMainPass(*frameInfo.commandList);
+                    }
+                }
 #if defined(IXTREEME_WITH_EDITOR)
                 // --- Game view: render the scene from the main camera into the second offscreen target.
                 // Reuses this frame's shadow map (its cascades follow this camera while the Scene View
@@ -11812,6 +11852,17 @@ int RunGame(NativeWindow& window,
                             terrain.Render(*frameInfo.commandList, frameInfo, gameCamera, gameExtent.width, gameExtent.height,
                                 /*viewIndex=*/1, /*clearDepth=*/false);
                             terrain.RenderWater(*frameInfo.commandList, frameInfo, gameCamera, seconds, gameExtent.width, gameExtent.height, /*viewIndex=*/1);
+                        }
+                        // God rays over the game image, under the game's UI: close the pass for a depth
+                        // snapshot and the ray passes, then reopen it (loaded) for the composite.
+                        if (godRaysOk && isInWorld && godRays.IsVisible(sceneSky, frameSunLighting, gameCamera))
+                        {
+                            gameView.EndMainPass(*frameInfo.commandList);
+                            gameView.SnapshotScene(*frameInfo.commandList, frameInfo);
+                            godRays.RenderRays(*frameInfo.commandList, frameInfo, /*view=*/1, sceneSky, frameSunLighting,
+                                gameCamera, gameView.GetDepthSnapshotTexture(), gameExtent.width, gameExtent.height);
+                            gameView.BeginMainPass(*frameInfo.commandList, frameInfo, false);
+                            godRays.Composite(*frameInfo.commandList, frameInfo, /*view=*/1, gameExtent.width, gameExtent.height);
                         }
                         // The game's own UI over the game image (a HUD a script opened).
                         if (rmlUi.HasVisibleGameDocuments())
@@ -12231,6 +12282,8 @@ int RunGame(NativeWindow& window,
         selectionOutlines.Destroy();
     if (skyOk)
         skyRenderer.Destroy();
+    if (godRaysOk)
+        godRays.Destroy();
     for (auto& [path, entry] : staticMeshCache)
     {
         (void)path;

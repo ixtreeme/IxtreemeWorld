@@ -836,6 +836,9 @@ void EditorImGui::RenderSceneSettingsPanel()
             if (ImGui::CollapsingHeader(ICON_FA_CLOUD_SUN "  Sky", ImGuiTreeNodeFlags_DefaultOpen))
                 RenderSkyPanel();
 
+            if (ImGui::CollapsingHeader(ICON_FA_SUN "  God rays", ImGuiTreeNodeFlags_DefaultOpen))
+                RenderGodRaysPanel();
+
             if (ImGui::CollapsingHeader(ICON_FA_CUBES "  Physics", ImGuiTreeNodeFlags_DefaultOpen))
             {
                 PhysicsSceneSettings physicsSettings = scene.physics;

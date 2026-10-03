@@ -267,6 +267,13 @@ struct SkySettings
     float rotationDegrees = 0.0f;  // turns the image skies around the vertical axis
     float tint[3] = {1.0f, 1.0f, 1.0f};
     bool ambientFromSky = false;   // the ambient light takes the sky's average colour
+
+    // God rays: light shafts from the Sun where the sky shows past the geometry (screen space).
+    bool godRays = false;
+    float godRayIntensity = 0.8f;   // brightness of the shafts
+    float godRayLength = 0.8f;      // how far across the screen they reach (0..1)
+    float godRayFalloff = 0.975f;   // how fast they fade along their length (closer to 1: longer)
+    std::int32_t godRayQuality = 1; // 0 low (32 samples), 1 medium (64), 2 high (96)
 };
 
 struct WaterConfig

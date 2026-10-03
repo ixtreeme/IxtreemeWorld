@@ -2058,6 +2058,30 @@ void EditorImGui::RenderSkyPanel()
         SceneManager::Instance().MarkDirty();
 }
 
+void EditorImGui::RenderGodRaysPanel()
+{
+    SkySettings& sky = m_skySettings;
+    bool changed = UI::Prop::Checkbox("Enabled##god_rays", &sky.godRays);
+    UI::ItemTooltip("Light shafts from the Sun where the sky shows past terrain, trees and characters.\n"
+                    "They come from the Sun light's direction (Environment > Sun) while it is on the screen.");
+    ImGui::BeginDisabled(!sky.godRays);
+    changed |= UI::Prop::SliderFloat("Intensity##god_rays", &sky.godRayIntensity, 0.0f, 2.0f, "%.2f");
+    changed |= UI::Prop::SliderFloat("Length##god_rays", &sky.godRayLength, 0.05f, 1.0f, "%.2f");
+    UI::ItemTooltip("How far across the screen the shafts reach");
+    changed |= UI::Prop::SliderFloat("Falloff##god_rays", &sky.godRayFalloff, 0.85f, 1.0f, "%.3f");
+    UI::ItemTooltip("How quickly the shafts fade along their length (closer to 1: they fade later)");
+    const char* qualities[] = {"Low (32 samples)", "Medium (64 samples)", "High (96 samples)"};
+    int quality = std::clamp(static_cast<int>(sky.godRayQuality), 0, 2);
+    if (UI::Prop::Combo("Quality##god_rays", &quality, qualities, IM_ARRAYSIZE(qualities)))
+    {
+        sky.godRayQuality = quality;
+        changed = true;
+    }
+    ImGui::EndDisabled();
+    if (changed)
+        SceneManager::Instance().MarkDirty();
+}
+
 void EditorImGui::OpenCreateTerrainDialog()
 {
     if (m_terrainState.exists)

@@ -1140,7 +1140,14 @@ void WriteSkySettings(std::ostream& out, const SkySettings& sky)
     out << "      \"exposure\": " << sky.exposure << ",\n";
     out << "      \"rotation_degrees\": " << sky.rotationDegrees << ",\n";
     out << "      \"tint\": " << FloatArray(sky.tint, 3) << ",\n";
-    out << "      \"ambient_from_sky\": " << (sky.ambientFromSky ? "true" : "false") << "\n";
+    out << "      \"ambient_from_sky\": " << (sky.ambientFromSky ? "true" : "false") << ",\n";
+    out << "      \"god_rays\": {\n";
+    out << "        \"enabled\": " << (sky.godRays ? "true" : "false") << ",\n";
+    out << "        \"intensity\": " << sky.godRayIntensity << ",\n";
+    out << "        \"length\": " << sky.godRayLength << ",\n";
+    out << "        \"falloff\": " << sky.godRayFalloff << ",\n";
+    out << "        \"quality\": " << sky.godRayQuality << "\n";
+    out << "      }\n";
     out << "    }";
 }
 
@@ -1164,6 +1171,14 @@ SkySettings ReadSkySettings(const JsonValue& object)
     sky.rotationDegrees = ReadFloat(object, "rotation_degrees", sky.rotationDegrees);
     ReadFloatArray(object, "tint", sky.tint, 3);
     sky.ambientFromSky = ReadBool(object, "ambient_from_sky", sky.ambientFromSky);
+    if (const JsonValue* rays = Find(object, "god_rays"); rays && rays->type == JsonValue::Type::Object)
+    {
+        sky.godRays = ReadBool(*rays, "enabled", sky.godRays);
+        sky.godRayIntensity = std::clamp(ReadFloat(*rays, "intensity", sky.godRayIntensity), 0.0f, 4.0f);
+        sky.godRayLength = std::clamp(ReadFloat(*rays, "length", sky.godRayLength), 0.05f, 1.0f);
+        sky.godRayFalloff = std::clamp(ReadFloat(*rays, "falloff", sky.godRayFalloff), 0.8f, 1.0f);
+        sky.godRayQuality = std::clamp(static_cast<std::int32_t>(ReadU32(*rays, "quality", 1u)), 0, 2);
+    }
     return sky;
 }
 

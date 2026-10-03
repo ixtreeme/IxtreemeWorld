@@ -294,6 +294,10 @@ if(WIN32)
     set(RMLUI_PS_SPV "${GENERATED_SHADER_DIR}/rmlui_ps.spv")
     set(SKY_VS_SPV "${GENERATED_SHADER_DIR}/sky_vs.spv")
     set(SKY_PS_SPV "${GENERATED_SHADER_DIR}/sky_ps.spv")
+    set(GOD_RAYS_VS_SPV "${GENERATED_SHADER_DIR}/god_rays_vs.spv")
+    set(GOD_RAYS_MASK_PS_SPV "${GENERATED_SHADER_DIR}/god_rays_mask_ps.spv")
+    set(GOD_RAYS_BLUR_PS_SPV "${GENERATED_SHADER_DIR}/god_rays_blur_ps.spv")
+    set(GOD_RAYS_COMPOSITE_PS_SPV "${GENERATED_SHADER_DIR}/god_rays_composite_ps.spv")
 
     add_custom_command(
         OUTPUT "${SKINNED_MESH_VS_SPV}"
@@ -479,6 +483,19 @@ if(WIN32)
         DEPENDS "${CLIENT_ROOT}/shaders/Sky.hlsl"
         VERBATIM
     )
+    foreach(_god_ray_stage IN ITEMS "VS;vs_6_0;VSMain" "MASK_PS;ps_6_0;MaskPS" "BLUR_PS;ps_6_0;BlurPS" "COMPOSITE_PS;ps_6_0;CompositePS")
+        list(GET _god_ray_stage 0 _god_ray_name)
+        list(GET _god_ray_stage 1 _god_ray_profile)
+        list(GET _god_ray_stage 2 _god_ray_entry)
+        add_custom_command(
+            OUTPUT "${GOD_RAYS_${_god_ray_name}_SPV}"
+            COMMAND ${CMAKE_COMMAND} -E make_directory "${GENERATED_SHADER_DIR}"
+            COMMAND "${DXC_EXECUTABLE}" -spirv -fvk-use-dx-layout -T ${_god_ray_profile} -E ${_god_ray_entry}
+                -Fo "${GOD_RAYS_${_god_ray_name}_SPV}" "${CLIENT_ROOT}/shaders/GodRays.hlsl"
+            DEPENDS "${CLIENT_ROOT}/shaders/GodRays.hlsl"
+            VERBATIM
+        )
+    endforeach()
     add_custom_target(IXEngineShaders DEPENDS
         "${SKINNED_MESH_VS_SPV}"
         "${SKINNED_MESH_PS_SPV}"
@@ -503,6 +520,10 @@ if(WIN32)
         "${RMLUI_PS_SPV}"
         "${SKY_VS_SPV}"
         "${SKY_PS_SPV}"
+        "${GOD_RAYS_VS_SPV}"
+        "${GOD_RAYS_MASK_PS_SPV}"
+        "${GOD_RAYS_BLUR_PS_SPV}"
+        "${GOD_RAYS_COMPOSITE_PS_SPV}"
     )
 elseif(ANDROID)
     if(CMAKE_ANDROID_NDK)
