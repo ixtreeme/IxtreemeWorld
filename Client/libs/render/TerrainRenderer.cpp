@@ -1936,7 +1936,9 @@ void TerrainRenderer::UpdateShadowCascades(const WorldCamera& camera)
             center = center + corner;
         center = center * (1.0f / static_cast<float>(corners.size()));
 
-        const WorldVec3 lightEye = center - sunDir * 120.0f;
+        // The light camera sits on the sun's side and looks away from it, so depth grows with the
+        // distance from the sun and the shadow map keeps the surface the sun reaches first.
+        const WorldVec3 lightEye = center + sunDir * 120.0f;
         WorldMat4 lightView = WorldLookAt(lightEye, center, {0.0f, 1.0f, 0.0f});
 
         WorldVec3 minBound{std::numeric_limits<float>::max(), std::numeric_limits<float>::max(), std::numeric_limits<float>::max()};
