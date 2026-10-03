@@ -2548,6 +2548,7 @@ int RunGame(NativeWindow& window,
         WorldVec3 position{};
         float yaw = 0.0f;
         std::array<float, 4> tint{1.0f, 1.0f, 1.0f, 1.0f};
+        std::array<float, 3> scale{1.0f, 1.0f, 1.0f};  // the entity Transform scale
     };
 
     auto getSkinnedMeshRenderer = [&](const std::string& modelPath) -> SkinnedMeshRenderer* {
@@ -10626,9 +10627,10 @@ int RunGame(NativeWindow& window,
                             selectedEditorObject.type == SelectedEditorObjectType::MeshEntity &&
                             selectedEditorObject.id == skinnedEntity.id;
                         const WorldVec3 skinnedPosition{skinnedEntity.position[0],
-                            skinnedEntity.position[1] + skinnedRenderer->GroundOffsetY(),
+                            skinnedEntity.position[1] + skinnedRenderer->GroundOffsetY() * skinnedEntity.scale[1],
                             skinnedEntity.position[2]};
                         const float skinnedYaw = skinnedEntity.rotation[1];
+                        const std::array<float, 3> skinnedScale{skinnedEntity.scale[0], skinnedEntity.scale[1], skinnedEntity.scale[2]};
 
                         // Stage-4 Animator: if an AnimatorController is assigned, evaluate the FSM
                         // and use its pose (highest priority — over the debug clip and MotionState).
@@ -10760,7 +10762,8 @@ int RunGame(NativeWindow& window,
                                 skinnedRenderer->SkinInstance(*frameInfo.commandList, frameInfo, sceneSlot, editorMeshMotion, static_cast<float>(seconds));
                             sceneEditorSkinnedDraws.push_back(SkinnedDrawRecord{skinnedRenderer, sceneSlot, skinnedPosition, skinnedYaw,
                                 skinnedSelected ? std::array<float, 4>{1.25f, 1.15f, 0.65f, 1.0f}
-                                                : std::array<float, 4>{1.0f, 1.0f, 1.0f, 1.0f}});
+                                                : std::array<float, 4>{1.0f, 1.0f, 1.0f, 1.0f},
+                                skinnedScale});
                         }
                         else
                         {
@@ -10785,7 +10788,7 @@ int RunGame(NativeWindow& window,
                                 else
                                     skinnedRenderer->SkinInstance(*frameInfo.commandList, frameInfo, gameSlot, editorMeshMotion, static_cast<float>(seconds));
                                 gameEditorSkinnedDraws.push_back(SkinnedDrawRecord{skinnedRenderer, gameSlot, skinnedPosition, skinnedYaw,
-                                    std::array<float, 4>{1.0f, 1.0f, 1.0f, 1.0f}});
+                                    std::array<float, 4>{1.0f, 1.0f, 1.0f, 1.0f}, skinnedScale});
                             }
                             else
                             {
@@ -10870,7 +10873,8 @@ int RunGame(NativeWindow& window,
                                 rec.position,
                                 rec.yaw,
                                 rec.slot,
-                                rec.tint);
+                                rec.tint,
+                                rec.scale);
                         }
 
                         // (Editor lights are not drawn as the skinned character model in the
@@ -10930,7 +10934,8 @@ int RunGame(NativeWindow& window,
                         rec.slot,
                         rec.tint,
                         renderSize.width,
-                        renderSize.height);
+                        renderSize.height,
+                        rec.scale);
                 }
                 // Name plates over each networked entity. The label sits a fixed height above
                 // the model's grounded origin (the default character's ground offset, if any).
@@ -10997,7 +11002,8 @@ int RunGame(NativeWindow& window,
                             rec.slot,
                             rec.tint,
                             renderSize.width,
-                            renderSize.height);
+                            renderSize.height,
+                            rec.scale);
                         ++frameStaticMeshDrawCalls;
                     }
                     auto logLodDisposition = [&](const StaticMeshLodBatch::LodDispositionRecord& record) {
@@ -11730,7 +11736,7 @@ int RunGame(NativeWindow& window,
                                 if (!rec.renderer)
                                     continue;
                                 rec.renderer->RenderInWorld(*frameInfo.commandList, frameInfo, seconds, gameCamera,
-                                    rec.position, rec.yaw, rec.slot, rec.tint, gameExtent.width, gameExtent.height);
+                                    rec.position, rec.yaw, rec.slot, rec.tint, gameExtent.width, gameExtent.height, rec.scale);
                             }
                         }
                         if (hasSceneTerrain)

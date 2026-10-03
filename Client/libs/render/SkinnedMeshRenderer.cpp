@@ -944,7 +944,8 @@ void SkinnedMeshRenderer::RenderInWorld(ixrhi::IXRHICommandList& cmd,
     uint32_t skinSlot,
     std::array<float, 4> tint,
     std::uint32_t targetWidth,
-    std::uint32_t targetHeight)
+    std::uint32_t targetHeight,
+    std::array<float, 3> scale)
 {
     static bool loggedDraw = false;
     static bool loggedNoPipeline = false;
@@ -979,7 +980,7 @@ void SkinnedMeshRenderer::RenderInWorld(ixrhi::IXRHICommandList& cmd,
     }
 
     const uint32_t uniformSlot = std::min(m_worldUniformCursor++, kUniformSlots - 1);
-    UpdateWorldUniform(frameIndex, uniformSlot, camera, position, yawRadians, timeSeconds, tint);
+    UpdateWorldUniform(frameIndex, uniformSlot, camera, position, yawRadians, timeSeconds, tint, scale);
 
     cmd.SetViewport(0.0f, 0.0f, static_cast<float>(extentWidth), static_cast<float>(extentHeight));
     cmd.SetScissor(0, 0, extentWidth, extentHeight);
@@ -1023,7 +1024,8 @@ void SkinnedMeshRenderer::RenderInWorldReflection(ixrhi::IXRHICommandList& cmd,
     WorldVec3 position,
     float yawRadians,
     uint32_t skinSlot,
-    std::array<float, 4> tint)
+    std::array<float, 4> tint,
+    std::array<float, 3> scale)
 {
     // Reflection draws run inside the terrain-owned native reflection pass.
     // That pass uses the swapchain color/depth formats (same as the backend
@@ -1061,7 +1063,7 @@ void SkinnedMeshRenderer::RenderInWorldReflection(ixrhi::IXRHICommandList& cmd,
     }
 
     const uint32_t uniformSlot = std::min(m_worldUniformCursor++, kUniformSlots - 1);
-    UpdateWorldUniform(frameIndex, uniformSlot, camera, position, yawRadians, 0.0, tint, true, waterLevelY);
+    UpdateWorldUniform(frameIndex, uniformSlot, camera, position, yawRadians, 0.0, tint, scale, true, waterLevelY);
 
     cmd.SetViewport(0.0f, 0.0f, static_cast<float>(targetWidth), static_cast<float>(targetHeight));
     cmd.SetScissor(0, 0, targetWidth, targetHeight);
@@ -1465,7 +1467,17 @@ bool SkinnedMeshRenderer::LoadFbxMesh(const std::string& modelPath)
     std::vector<std::filesystem::path> animationPaths;
     for (std::size_t i = 0; i < result.animations.size(); ++i)
         animationPaths.push_back(fbxPath.parent_path() / (fbxPath.stem().string() + "_anim_" + std::to_string(i) + ".ozz"));
-    if (!std::filesystem::exists(stemSkeleton))
+    // Sidecars written by an older importer (e.g. before FBX pivot nodes were collapsed) carry a
+    // wrong rest pose: the mesh renders scrambled until an animation overrides every bone. They
+    // are derived data, so rebuild them from the FBX whenever they no longer match this import.
+    const bool sidecarMissing = !std::filesystem::exists(stemSkeleton);
+    const bool sidecarStale = !sidecarMissing && !importer.ozzSkeletonSidecarMatches(result, stemSkeleton);
+    if (sidecarStale)
+    {
+        LogFormat("[FBX-IMPORT] stale ozz sidecars (rest pose differs from the FBX) — regenerating path=%s",
+            stemSkeleton.generic_string().c_str());
+    }
+    if (sidecarMissing || sidecarStale)
     {
         std::string ozzError;
         if (!importer.writeOzzSidecars(result, stemSkeleton, animationPaths, ozzError))
@@ -2460,12 +2472,15 @@ void SkinnedMeshRenderer::UpdateWorldUniform(uint32_t frameIndex,
     float yawRadians,
     double timeSeconds,
     std::array<float, 4> tint,
+    std::array<float, 3> scale,
     bool reflectionPass,
     float waterLevelY)
 {
     static bool loggedMvp = false;
 
-    const Mat4 model = Multiply(RotationY(-yawRadians),
+    // Entity scale first (in mesh-local space, where the skinned vertices live), then yaw, then
+    // the world position — so a model authored in centimetres can be sized down per entity.
+    const Mat4 model = Multiply(Multiply(xm::Scale({scale[0], scale[1], scale[2]}), RotationY(-yawRadians)),
         Translation(position.x, position.y, position.z));
     const Mat4 viewProjection = ToLocalMat4(camera.viewProjection);
     const Mat4 mvp = Multiply(model, viewProjection);

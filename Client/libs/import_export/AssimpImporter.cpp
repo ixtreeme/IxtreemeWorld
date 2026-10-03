@@ -16,6 +16,8 @@
 #include <ozz/animation/runtime/skeleton.h>
 #include <ozz/base/io/archive.h>
 #include <ozz/base/io/stream.h>
+#include <ozz/base/maths/simd_math.h>
+#include <ozz/base/maths/soa_transform.h>
 #include <ozz/base/maths/vec_float.h>
 
 #include <algorithm>
@@ -606,9 +608,13 @@ void ExtractAnimations(const aiScene& scene,
             AssimpImporter::BoneTrack track{};
             track.boneIndex = boneIt->second;
             track.keyframes.reserve(ticks.size());
+            // A channel may key only some components (e.g. rotation alone): the others keep the
+            // bone's rest value, never zero — a zero translation collapses the bone onto its parent.
+            const AssimpImporter::AnimationKeyframe restKey = DecomposeTransform(
+                xm::interop::ToAssimpRowMajor(skeleton.bones[static_cast<std::size_t>(boneIt->second)].localTransform), 0.0f);
             for (double tick : ticks)
             {
-                AssimpImporter::AnimationKeyframe key{};
+                AssimpImporter::AnimationKeyframe key = restKey;
                 key.time = static_cast<float>(tick / ticksPerSecond);
                 if (const aiVectorKey* position = FindVectorKey(channel->mPositionKeys, channel->mNumPositionKeys, tick))
                 {
@@ -667,6 +673,89 @@ void FillRawJoint(const AssimpImporter::SkeletonData& skeleton,
     joint.children.resize(children.size());
     for (std::size_t i = 0; i < children.size(); ++i)
         FillRawJoint(skeleton, children[i], joint.children[i]);
+}
+
+// The runtime ozz skeleton for an import: exactly what writeOzzSidecars saves.
+ozz::unique_ptr<ozz::animation::Skeleton> BuildOzzSkeleton(const AssimpImporter::SkeletonData& source,
+                                                           std::string& error)
+{
+    ozz::animation::offline::RawSkeleton rawSkeleton;
+    std::vector<int> roots;
+    for (int i = 0; i < static_cast<int>(source.bones.size()); ++i)
+    {
+        if (source.bones[i].parentIndex < 0)
+            roots.push_back(i);
+    }
+    rawSkeleton.roots.resize(roots.size());
+    for (std::size_t i = 0; i < roots.size(); ++i)
+        FillRawJoint(source, roots[i], rawSkeleton.roots[i]);
+
+    if (!rawSkeleton.Validate())
+    {
+        error = "ozz RawSkeleton validation failed";
+        return nullptr;
+    }
+    ozz::animation::offline::SkeletonBuilder skeletonBuilder;
+    ozz::unique_ptr<ozz::animation::Skeleton> skeleton = skeletonBuilder(rawSkeleton);
+    if (!skeleton)
+        error = "ozz SkeletonBuilder failed";
+    return skeleton;
+}
+
+bool NearlyEqual(float a, float b, float tolerance)
+{
+    return std::fabs(a - b) <= tolerance * std::max(1.0f, std::max(std::fabs(a), std::fabs(b)));
+}
+
+// Same joints, in the same order, with the same rest pose (translations relative to their size,
+// so centimetre and metre rigs compare alike; rotations up to sign).
+bool SameSkeleton(const ozz::animation::Skeleton& a, const ozz::animation::Skeleton& b)
+{
+    if (a.num_joints() != b.num_joints())
+        return false;
+    const auto namesA = a.joint_names();
+    const auto namesB = b.joint_names();
+    const auto parentsA = a.joint_parents();
+    const auto parentsB = b.joint_parents();
+    for (int j = 0; j < a.num_joints(); ++j)
+    {
+        if (parentsA[j] != parentsB[j] || std::strcmp(namesA[j], namesB[j]) != 0)
+            return false;
+    }
+
+    const auto lanes = [](const ozz::math::SimdFloat4& value) {
+        std::array<float, 4> out{};
+        ozz::math::StorePtrU(value, out.data());
+        return out;
+    };
+    const auto restA = a.joint_rest_poses();
+    const auto restB = b.joint_rest_poses();
+    for (int soa = 0; soa < a.num_soa_joints(); ++soa)
+    {
+        const ozz::math::SoaTransform& ta = restA[soa];
+        const ozz::math::SoaTransform& tb = restB[soa];
+        const std::array<std::array<float, 4>, 3> transA{lanes(ta.translation.x), lanes(ta.translation.y), lanes(ta.translation.z)};
+        const std::array<std::array<float, 4>, 3> transB{lanes(tb.translation.x), lanes(tb.translation.y), lanes(tb.translation.z)};
+        const std::array<std::array<float, 4>, 3> scaleA{lanes(ta.scale.x), lanes(ta.scale.y), lanes(ta.scale.z)};
+        const std::array<std::array<float, 4>, 3> scaleB{lanes(tb.scale.x), lanes(tb.scale.y), lanes(tb.scale.z)};
+        const std::array<std::array<float, 4>, 4> rotA{lanes(ta.rotation.x), lanes(ta.rotation.y), lanes(ta.rotation.z), lanes(ta.rotation.w)};
+        const std::array<std::array<float, 4>, 4> rotB{lanes(tb.rotation.x), lanes(tb.rotation.y), lanes(tb.rotation.z), lanes(tb.rotation.w)};
+        for (int lane = 0; lane < 4 && soa * 4 + lane < a.num_joints(); ++lane)
+        {
+            float dot = 0.0f;
+            for (int c = 0; c < 4; ++c)
+                dot += rotA[c][lane] * rotB[c][lane];
+            if (std::fabs(dot) < 0.9999f)
+                return false;
+            for (int c = 0; c < 3; ++c)
+            {
+                if (!NearlyEqual(transA[c][lane], transB[c][lane], 1e-3f) ||
+                    !NearlyEqual(scaleA[c][lane], scaleB[c][lane], 1e-3f))
+                    return false;
+            }
+        }
+    }
+    return true;
 }
 
 bool SaveOzzObject(const std::filesystem::path& path, const auto& object, std::string& error)
@@ -828,30 +917,9 @@ bool AssimpImporter::writeOzzSidecars(const ImportResult& result,
         return false;
     }
 
-    ozz::animation::offline::RawSkeleton rawSkeleton;
-    std::vector<int> roots;
-    for (int i = 0; i < static_cast<int>(result.skeleton->bones.size()); ++i)
-    {
-        if (result.skeleton->bones[i].parentIndex < 0)
-            roots.push_back(i);
-    }
-    rawSkeleton.roots.resize(roots.size());
-    for (std::size_t i = 0; i < roots.size(); ++i)
-        FillRawJoint(*result.skeleton, roots[i], rawSkeleton.roots[i]);
-
-    if (!rawSkeleton.Validate())
-    {
-        error = "ozz RawSkeleton validation failed";
-        return false;
-    }
-
-    ozz::animation::offline::SkeletonBuilder skeletonBuilder;
-    ozz::unique_ptr<ozz::animation::Skeleton> skeleton = skeletonBuilder(rawSkeleton);
+    ozz::unique_ptr<ozz::animation::Skeleton> skeleton = BuildOzzSkeleton(*result.skeleton, error);
     if (!skeleton)
-    {
-        error = "ozz SkeletonBuilder failed";
         return false;
-    }
     if (!SaveOzzObject(skeletonPath, *skeleton, error))
         return false;
 
@@ -915,6 +983,22 @@ bool AssimpImporter::writeOzzSidecars(const ImportResult& result,
                 rawTrack.scales.push_back({time, ozz::math::Float3(key.scale[0], key.scale[1], key.scale[2])});
             }
         }
+        // A joint the take never animates holds its rest pose: an empty ozz track samples as
+        // identity, which would collapse the joint onto its parent.
+        for (std::size_t r = 0; r < result.skeleton->bones.size(); ++r)
+        {
+            const int builtIdx = builtIndexForRaw[r];
+            if (builtIdx < 0 || builtIdx >= static_cast<int>(rawAnimation.tracks.size()))
+                continue;
+            auto& rawTrack = rawAnimation.tracks[builtIdx];
+            const ozz::math::Transform rest = OzzTransformFromMatrix(result.skeleton->bones[r].localTransform);
+            if (rawTrack.translations.empty())
+                rawTrack.translations.push_back({0.0f, rest.translation});
+            if (rawTrack.rotations.empty())
+                rawTrack.rotations.push_back({0.0f, rest.rotation});
+            if (rawTrack.scales.empty())
+                rawTrack.scales.push_back({0.0f, rest.scale});
+        }
         if (!rawAnimation.Validate())
         {
             Tracenf("[FBX-IMPORT] animation skipped name=%s reason=raw_animation_validation_failed",
@@ -937,4 +1021,25 @@ bool AssimpImporter::writeOzzSidecars(const ImportResult& result,
         skeletonPath.generic_string().c_str(),
         animationCount);
     return true;
+}
+
+bool AssimpImporter::ozzSkeletonSidecarMatches(const ImportResult& result,
+                                               const std::filesystem::path& skeletonPath) const
+{
+    if (!result.skeleton || result.skeleton->bones.empty())
+        return false;
+    std::string error;
+    const ozz::unique_ptr<ozz::animation::Skeleton> expected = BuildOzzSkeleton(*result.skeleton, error);
+    if (!expected)
+        return false;
+
+    ozz::io::File file(skeletonPath.string().c_str(), "rb");
+    if (!file.opened())
+        return false;
+    ozz::io::IArchive archive(&file);
+    if (!archive.TestTag<ozz::animation::Skeleton>())
+        return false;
+    ozz::animation::Skeleton existing;
+    archive >> existing;
+    return SameSkeleton(*expected, existing);
 }

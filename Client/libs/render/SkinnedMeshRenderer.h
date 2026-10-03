@@ -104,7 +104,8 @@ public:
         uint32_t skinSlot = 0,
         std::array<float, 4> tint = {1.0f, 1.0f, 1.0f, 1.0f},
         std::uint32_t targetWidth = 0,
-        std::uint32_t targetHeight = 0);
+        std::uint32_t targetHeight = 0,
+        std::array<float, 3> scale = {1.0f, 1.0f, 1.0f});
     void RenderInWorldReflection(ixrhi::IXRHICommandList& cmd,
         const ixrhi::IXRHIFrameInfo& frame,
         const WorldCamera& camera,
@@ -115,7 +116,8 @@ public:
         WorldVec3 position,
         float yawRadians,
         uint32_t skinSlot = 0,
-        std::array<float, 4> tint = {1.0f, 1.0f, 1.0f, 1.0f});
+        std::array<float, 4> tint = {1.0f, 1.0f, 1.0f, 1.0f},
+        std::array<float, 3> scale = {1.0f, 1.0f, 1.0f});
     void SetLightingState(const LightingState& lighting) { m_lightingState = lighting; }
     void SetMotionState(MotionState state);
     float GroundOffsetY() const;
@@ -237,6 +239,7 @@ private:
         float yawRadians,
         double timeSeconds,
         std::array<float, 4> tint,
+        std::array<float, 3> scale,
         bool reflectionPass = false,
         float waterLevelY = 0.0f);
 

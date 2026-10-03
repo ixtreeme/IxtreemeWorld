@@ -9,7 +9,8 @@ bool EditorImGui::RenderAxisFloat(const char* axis,
                                   float b,
                                   float speed,
                                   float minValue,
-                                  float maxValue)
+                                  float maxValue,
+                                  const char* format)
 {
     ImGui::PushID(axis);
     const float width = ImGui::CalcItemWidth();
@@ -17,17 +18,18 @@ bool EditorImGui::RenderAxisFloat(const char* axis,
     ImGui::TextColored(ImVec4(r, g, b, 1.0f), "%s", axis);
     ImGui::SameLine(0.0f, 3.0f);
     ImGui::SetNextItemWidth(std::max(20.0f, width - ImGui::CalcTextSize(axis).x - 3.0f));
-    const bool changed = ImGui::DragFloat("##value", &value, speed, minValue, maxValue, "%.2f");
+    const bool changed = ImGui::DragFloat("##value", &value, speed, minValue, maxValue, format);
     ImGui::EndGroup();
     ImGui::PopID();
     return changed;
 }
 
-bool EditorImGui::RenderTransformComponent(float* position, float* rotation, float* scale)
+bool EditorImGui::RenderTransformComponent(float* position, float* rotation, float* scale, bool meshScale)
 {
     bool changed = false;
     // Position, rotation and scale as one row each: X / Y / Z side by side, like every 3D editor.
-    const auto vectorRow = [&](const char* label, const char* tooltip, float* values, float speed, float minValue, float maxValue) {
+    const auto vectorRow = [&](const char* label, const char* tooltip, float* values, float speed, float minValue, float maxValue,
+                               const char* format = "%.2f") {
         UI::Property(label, [&](const char*) {
             ImGui::PushID(label);
             const float spacing = ImGui::GetStyle().ItemInnerSpacing.x;
@@ -39,7 +41,7 @@ bool EditorImGui::RenderTransformComponent(float* position, float* rotation, flo
                 if (i > 0)
                     ImGui::SameLine(0.0f, spacing);
                 ImGui::PushItemWidth(fieldWidth);
-                changed |= RenderAxisFloat(axes[i], values[i], colors[i].x, colors[i].y, colors[i].z, speed, minValue, maxValue);
+                changed |= RenderAxisFloat(axes[i], values[i], colors[i].x, colors[i].y, colors[i].z, speed, minValue, maxValue, format);
                 ImGui::PopItemWidth();
             }
             ImGui::PopID();
@@ -52,7 +54,12 @@ bool EditorImGui::RenderTransformComponent(float* position, float* rotation, flo
         vectorRow("Position", "Position in metres", position, 0.1f, -500.0f, 500.0f);
         if (rotation)
             vectorRow("Rotation", "Rotation in degrees around X (pitch), Y (yaw) and Z (roll)", rotation, 0.5f, 0.0f, 0.0f);
-        if (scale)
+        // A model scale gets three decimals and a 0.001 floor: models authored in centimetres
+        // (Mixamo FBX) need 0.01, which "%.2f" with a 0.1 drag floor could neither show nor reach.
+        if (scale && meshScale)
+            vectorRow("Scale", "Scale along X, Y and Z (1 = as imported; 0.01 turns centimetres into metres)",
+                scale, 0.01f, 0.001f, 1000.0f, "%.3f");
+        else if (scale)
             vectorRow("Scale", "Size along X, Y and Z", scale, 0.1f, 0.1f, 200.0f);
     }
     return changed;
@@ -1504,7 +1511,7 @@ void EditorImGui::RenderSelectedMeshRendererInspector()
         m_meshRendererState.rotation[1] * 57.2957795f,
         m_meshRendererState.rotation[2] * 57.2957795f};
     float scale[3] = {m_meshRendererState.scale[0], m_meshRendererState.scale[1], m_meshRendererState.scale[2]};
-    if (RenderTransformComponent(position, rotation, scale))
+    if (RenderTransformComponent(position, rotation, scale, /*meshScale=*/true))
     {
         m_meshRendererState.position[0] = position[0];
         m_meshRendererState.position[1] = position[1];

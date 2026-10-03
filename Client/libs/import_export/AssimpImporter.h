@@ -105,4 +105,10 @@ public:
                           const std::vector<std::filesystem::path>& animationPaths,
                           std::string& error,
                           std::vector<std::string>* outJointNames = nullptr) const;
+    // True when the ozz skeleton at skeletonPath is the one writeOzzSidecars would write for
+    // `result` now (same joints, same rest pose). False when it is missing, unreadable, or was
+    // written by an older importer — e.g. before FBX pivot nodes were collapsed, when Mixamo rigs
+    // lost most bone offsets and rendered scrambled whenever no animation overrode every bone.
+    bool ozzSkeletonSidecarMatches(const ImportResult& result,
+                                   const std::filesystem::path& skeletonPath) const;
 };
