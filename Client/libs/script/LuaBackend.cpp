@@ -32,6 +32,15 @@ bool ParseKey(const std::string& name, ScriptKey& out)
     if (name == "Right") { out = ScriptKey::Right; return true; }
     if (name == "MouseLeft") { out = ScriptKey::MouseLeft; return true; }
     if (name == "MouseRight") { out = ScriptKey::MouseRight; return true; }
+    if (name == "Q") { out = ScriptKey::Q; return true; }
+    if (name == "E") { out = ScriptKey::E; return true; }
+    if (name == "R") { out = ScriptKey::R; return true; }
+    if (name == "F") { out = ScriptKey::F; return true; }
+    if (name == "Num1") { out = ScriptKey::Num1; return true; }
+    if (name == "Num2") { out = ScriptKey::Num2; return true; }
+    if (name == "Num3") { out = ScriptKey::Num3; return true; }
+    if (name == "Num4") { out = ScriptKey::Num4; return true; }
+    if (name == "Num5") { out = ScriptKey::Num5; return true; }
     return false;
 }
 
@@ -244,10 +253,56 @@ struct LuaBackend::Impl
             a->SetMaterial(id, slot, material);
         });
 
+        // GetCharacterState(id) -> grounded, moving, running, jumped, planarSpeed (nil if no controller);
+        // SetCharacterAbilities(id, canRun, canJump) (v6)
+        t.set_function("GetCharacterState", [a](sol::this_state s, std::uint32_t id) -> sol::object {
+            sol::state_view lua(s);
+            CharacterState state{};
+            if (!a->GetCharacterState(id, state))
+                return sol::make_object(lua, sol::lua_nil);
+            sol::table result = lua.create_table();
+            result["grounded"] = state.grounded;
+            result["moving"] = state.moving;
+            result["running"] = state.running;
+            result["jumped"] = state.jumped;
+            result["planarSpeed"] = state.planarSpeed;
+            return result;
+        });
+        t.set_function("SetCharacterAbilities", [a](std::uint32_t id, bool canRun, bool canJump) {
+            a->SetCharacterAbilities(id, canRun, canJump);
+        });
+
+        // Game UI documents (v6): UiOpen("ui/hud.rml") -> handle (0 = failed), then by element id.
+        t.set_function("UiOpen", [a](const std::string& path) { return a->UiOpen(path); });
+        t.set_function("UiClose", [a](std::uint32_t doc) { a->UiClose(doc); });
+        t.set_function("UiSetVisible", [a](std::uint32_t doc, bool visible) { a->UiSetVisible(doc, visible); });
+        t.set_function("UiSetText", [a](std::uint32_t doc, const std::string& id, sol::object text) {
+            // Numbers are fine too: UiSetText(doc, "hp", 42)
+            std::string value;
+            if (text.is<std::string>())
+                value = text.as<std::string>();
+            else if (text.is<double>())
+            {
+                char buffer[64];
+                std::snprintf(buffer, sizeof(buffer), "%g", text.as<double>());
+                value = buffer;
+            }
+            a->UiSetText(doc, id, value);
+        });
+        t.set_function("UiSetProperty", [a](std::uint32_t doc, const std::string& id, const std::string& prop,
+                                            const std::string& value) { a->UiSetProperty(doc, id, prop, value); });
+        t.set_function("UiSetClass", [a](std::uint32_t doc, const std::string& id, const std::string& cls, bool on) {
+            a->UiSetClass(doc, id, cls, on);
+        });
+        t.set_function("UiConsumeClick", [a](std::uint32_t doc, const std::string& id) {
+            return a->UiConsumeClick(doc, id);
+        });
+
         // Ergonomic Key.* table: names map to the same strings IsKeyDown accepts (Key.W == "W").
         sol::table keys = lua.create_table();
         for (const char* name : {"W", "A", "S", "D", "Space", "Shift", "Ctrl",
-                                 "Up", "Down", "Left", "Right", "MouseLeft", "MouseRight"})
+                                 "Up", "Down", "Left", "Right", "MouseLeft", "MouseRight",
+                                 "Q", "E", "R", "F", "Num1", "Num2", "Num3", "Num4", "Num5"})
             keys[name] = name;
         t["Key"] = keys;
     }

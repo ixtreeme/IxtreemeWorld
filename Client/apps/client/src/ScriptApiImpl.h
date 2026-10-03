@@ -16,6 +16,7 @@
 
 namespace ixaudio { class AudioEngine; }
 struct MovementInputState;
+class RmlUiLayer;
 
 class ScriptApiImpl final : public ixscript::ScriptApi
 {
@@ -34,6 +35,8 @@ public:
     {
         bool up = false, down = false, left = false, right = false;
         bool mouseLeft = false, mouseRight = false;
+        bool q = false, e = false, r = false, f = false;
+        bool num[5] = {false, false, false, false, false};  // 1..5
     };
 
     // --- refreshed each frame before the OnUpdate loop ---
@@ -78,6 +81,24 @@ public:
     std::uint32_t PromptText(const std::string& title, const std::string& label, bool secret) override;
     int PromptResult(std::uint32_t promptId, char* out, std::uint32_t capacity) override;
     void SetMaterial(std::uint32_t id, std::uint32_t slot, const std::string& materialAssetId) override;
+    bool GetCharacterState(std::uint32_t id, ixscript::CharacterState& out) override;
+    void SetCharacterAbilities(std::uint32_t id, bool canRun, bool canJump) override;
+    std::uint32_t UiOpen(const std::string& documentPath) override;
+    void UiClose(std::uint32_t document) override;
+    void UiSetVisible(std::uint32_t document, bool visible) override;
+    void UiSetText(std::uint32_t document, const std::string& elementId, const std::string& text) override;
+    void UiSetProperty(std::uint32_t document, const std::string& elementId, const std::string& property,
+                       const std::string& value) override;
+    void UiSetClass(std::uint32_t document, const std::string& elementId, const std::string& className,
+                    bool enabled) override;
+    bool UiConsumeClick(std::uint32_t document, const std::string& elementId) override;
+
+    // --- game UI + character controller, wired once by RunGame ---
+    RmlUiLayer* gameUi = nullptr;
+    // A document path relative to the project's asset folder -> the file to load ("" = not found).
+    std::function<std::string(const std::string&)> resolveUiDocument;
+    std::function<bool(std::uint32_t, ixscript::CharacterState&)> getCharacterState;
+    std::function<void(std::uint32_t, bool, bool)> setCharacterAbilities;
 
     // --- script text prompts, drawn by the host UI (the editor) ---
     struct Prompt

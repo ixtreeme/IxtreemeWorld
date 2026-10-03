@@ -16,7 +16,8 @@
 // v3 added IScriptApi spawn/destroy/raycast + animator-param vtable slots (rebuild v2 modules).
 // v4 added IScriptApi generic TCP transport (NetConnect..NetClose) + text prompt slots (rebuild v3).
 // v5 added IScriptApi::SetMaterial (rebuild v4).
-#define IXTREEME_MODULE_API_VERSION 5u
+// v6 added IScriptApi character state/abilities + game UI (RmlUi) slots and action keys (rebuild v5).
+#define IXTREEME_MODULE_API_VERSION 6u
 
 // The exact exported symbol name the engine resolves in each module DLL.
 #define IXTREEME_MODULE_ENTRY_SYMBOL "IxtreemeGameModule_v1"

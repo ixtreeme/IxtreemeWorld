@@ -219,8 +219,10 @@ void EditorImGui::RenderAssetTile(const AssetLibrary::Entry& entry, float tileSi
             m_commands.previewAudioClipId = entry.id;
             m_assetStatus = "Preview: " + entry.displayName;
         }
-        else if (doubleClicked && entry.category == AssetLibrary::Category::Script)
+        else if (doubleClicked && (entry.category == AssetLibrary::Category::Script ||
+                                      entry.category == AssetLibrary::Category::UiDocument))
         {
+            // Scripts and UI documents are text: edit them in the OS's editor for that file type.
             std::string err;
             const std::filesystem::path path = m_assetLibrary->AbsolutePath(entry);
             if (platform::OpenInDefaultApp(path, &err))

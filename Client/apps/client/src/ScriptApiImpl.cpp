@@ -2,6 +2,7 @@
 
 #include "AudioEngine.h"
 #include "Debug.h"
+#include "RmlUiLayer.h"
 #include "ViewportControls.h"  // MovementInputState
 
 #include <algorithm>
@@ -127,6 +128,15 @@ bool ScriptApiImpl::IsKeyDown(ixscript::ScriptKey key)
     case K::Right: return input && input->right;
     case K::MouseLeft: return input && input->mouseLeft;
     case K::MouseRight: return input && input->mouseRight;
+    case K::Q: return input && input->q;
+    case K::E: return input && input->e;
+    case K::R: return input && input->r;
+    case K::F: return input && input->f;
+    case K::Num1: return input && input->num[0];
+    case K::Num2: return input && input->num[1];
+    case K::Num3: return input && input->num[2];
+    case K::Num4: return input && input->num[3];
+    case K::Num5: return input && input->num[4];
     default: return false;
     }
 }
@@ -191,6 +201,75 @@ void ScriptApiImpl::SetMaterial(std::uint32_t id, std::uint32_t slot, const std:
     DeferredOp op{DeferredKind::SetMaterial, materialAssetId, {0.0f, 0.0f, 0.0f}, id};
     op.slot = slot;
     deferredOps.push_back(std::move(op));
+}
+
+bool ScriptApiImpl::GetCharacterState(std::uint32_t id, ixscript::CharacterState& out)
+{
+    out = {};
+    return getCharacterState && getCharacterState(id, out);
+}
+
+void ScriptApiImpl::SetCharacterAbilities(std::uint32_t id, bool canRun, bool canJump)
+{
+    if (setCharacterAbilities)
+        setCharacterAbilities(id, canRun, canJump);
+}
+
+std::uint32_t ScriptApiImpl::UiOpen(const std::string& documentPath)
+{
+    if (!gameUi)
+        return 0;
+    const std::string path = resolveUiDocument ? resolveUiDocument(documentPath) : documentPath;
+    if (path.empty())
+    {
+        LogError("UiOpen: no such document in the asset folder: " + documentPath);
+        return 0;
+    }
+    const std::uint32_t handle = gameUi->OpenGameDocument(path);
+    if (handle == 0)
+        LogError("UiOpen: the document could not be loaded: " + documentPath);
+    return handle;
+}
+
+void ScriptApiImpl::UiClose(std::uint32_t document)
+{
+    if (gameUi)
+        gameUi->CloseGameDocument(document);
+}
+
+void ScriptApiImpl::UiSetVisible(std::uint32_t document, bool visible)
+{
+    if (gameUi)
+        gameUi->SetGameDocumentVisible(document, visible);
+}
+
+void ScriptApiImpl::UiSetText(std::uint32_t document, const std::string& elementId, const std::string& text)
+{
+    if (gameUi)
+        gameUi->SetGameElementText(document, elementId, text);
+}
+
+void ScriptApiImpl::UiSetProperty(std::uint32_t document,
+                                  const std::string& elementId,
+                                  const std::string& property,
+                                  const std::string& value)
+{
+    if (gameUi)
+        gameUi->SetGameElementProperty(document, elementId, property, value);
+}
+
+void ScriptApiImpl::UiSetClass(std::uint32_t document,
+                               const std::string& elementId,
+                               const std::string& className,
+                               bool enabled)
+{
+    if (gameUi)
+        gameUi->SetGameElementClass(document, elementId, className, enabled);
+}
+
+bool ScriptApiImpl::UiConsumeClick(std::uint32_t document, const std::string& elementId)
+{
+    return gameUi != nullptr && gameUi->ConsumeGameElementClick(document, elementId);
 }
 
 ixscript::RaycastHit ScriptApiImpl::Raycast(float ox, float oy, float oz,

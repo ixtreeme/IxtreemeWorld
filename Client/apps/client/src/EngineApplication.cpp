@@ -99,6 +99,11 @@ namespace xm = ixtreeme::math;
 namespace prefab = ixtreeme::prefab;
 namespace phys = ixtreeme::physics;
 
+bool IsSrgbColorFormat(ixrhi::IXRHIFormat format)
+{
+    return format == ixrhi::IXRHIFormat::R8G8B8A8Srgb || format == ixrhi::IXRHIFormat::B8G8R8A8Srgb;
+}
+
 // Builds a render camera from a scene CameraEntity, matching the editor free-fly
 // convention (rotation[0]=pitch, rotation[1]=yaw). Used to drive the Game view.
 WorldCamera BuildCameraFromEntity(const CameraEntity& cameraEntity, uint32_t width, uint32_t height)
@@ -132,6 +137,9 @@ struct CharacterRuntimeState
     RuntimeMoveState moveState = RuntimeMoveState::Idle; // drives walk/run animation
     float planarSpeed = 0.0f;        // continuous horizontal speed (m/s) — drives the Animator "Speed" param
     bool jumpedThisFrame = false;    // a jump was initiated this frame — drives the "Jump" trigger
+    // What the game allows right now (scripts: SetCharacterAbilities, e.g. no running without stamina).
+    bool canRun = true;
+    bool canJump = true;
 };
 
 // Advances one player character (kinematic capsule) for this frame: camera-relative WASD
@@ -185,12 +193,13 @@ void UpdateCharacterController(
         moveX = 0.0f;
         moveZ = 0.0f;
     }
-    const float speed = (inputActive && input.shift) ? cc.runSpeed : cc.walkSpeed;
+    const bool running = inputActive && input.shift && state.canRun;
+    const float speed = running ? cc.runSpeed : cc.walkSpeed;
 
     // Animation state from movement intent: Run when sprinting + moving, Walk when moving,
     // else Idle. Drives the skinned mesh's walk/run/idle clip.
     if (moveLen > 0.0001f)
-        state.moveState = (inputActive && input.shift) ? RuntimeMoveState::Running : RuntimeMoveState::Walking;
+        state.moveState = running ? RuntimeMoveState::Running : RuntimeMoveState::Walking;
     else
         state.moveState = RuntimeMoveState::Idle;
     state.planarSpeed = (moveLen > 0.0001f) ? speed : 0.0f;
@@ -198,7 +207,7 @@ void UpdateCharacterController(
 
     // --- gravity / jump (vertical velocity) ---
     const float gY = worldGravity[1] * cc.gravityScale; // negative downward
-    const bool jumpPressed = inputActive && input.space;
+    const bool jumpPressed = inputActive && input.space && state.canJump;
     if (state.grounded && jumpPressed)
     {
         state.velocity.y = std::sqrt(std::max(0.0f, -2.0f * gY * cc.jumpHeight));
@@ -2477,6 +2486,17 @@ int RunGame(NativeWindow& window,
             gameView.GetSampler(),
             gameView.Width(),
             gameView.Height());
+    // The game's own UI (RmlUi documents opened by scripts) is drawn into the Game view, so the
+    // editor shows it where the built game does; the standalone game draws it over its window.
+    if (gameViewOk)
+    {
+        rmlUi.SetTargetPass(gameView.GetTargetPass());
+        rmlUi.RecreatePipeline(*rhiDevice);
+        rmlUi.Resize(gameView.Width(), gameView.Height());
+    }
+    rmlUi.SetSrgbTarget(IsSrgbColorFormat(gameViewOk ? gameView.ColorFormat() : rhiDevice->GetMainSwapchain().ColorFormat()));
+#else
+    rmlUi.SetSrgbTarget(IsSrgbColorFormat(rhiDevice->GetMainSwapchain().ColorFormat()));
 #endif
     struct StaticMeshCacheEntry
     {
@@ -2992,6 +3012,37 @@ int RunGame(NativeWindow& window,
         for (const auto& [entId, bodyId] : editorPhysicsBodies)
             if (bodyId == hit.bodyId) { outId = entId; break; }
         return true;
+    };
+    // Game UI: scripts open RmlUi documents from the project's asset folder (a HUD, menus, ...).
+    scriptApi.gameUi = &rmlUi;
+    scriptApi.resolveUiDocument = [](const std::string& documentPath) -> std::string {
+        std::filesystem::path path(documentPath);
+        if (path.is_relative() && ProjectManager::Instance().HasProject())
+            path = ProjectManager::Instance().AssetRootPath() / path;
+        std::error_code ec;
+        return std::filesystem::is_regular_file(path, ec) ? path.generic_string() : std::string{};
+    };
+    // Player characters: what the controller did last step, and what it may do (run, jump).
+    scriptApi.getCharacterState = [&](std::uint32_t id, ixscript::CharacterState& out) -> bool {
+        const auto it = editorCharacterStates.find(id);
+        if (it == editorCharacterStates.end() || !it->second.initialized)
+            return false;
+        const CharacterRuntimeState& state = it->second;
+        out.grounded = state.grounded;
+        out.moving = state.moveState != RuntimeMoveState::Idle;
+        out.running = state.moveState == RuntimeMoveState::Running;
+        out.jumped = state.jumpedThisFrame;
+        out.planarSpeed = state.planarSpeed;
+        return true;
+    };
+    scriptApi.setCharacterAbilities = [&](std::uint32_t id, bool canRun, bool canJump) {
+        const bool isCharacter = std::any_of(editorMeshEntities.begin(), editorMeshEntities.end(),
+            [id](const MeshSceneEntity& mesh) { return mesh.id == id && mesh.hasCharacterController; });
+        if (!isCharacter)
+            return;
+        CharacterRuntimeState& state = editorCharacterStates[id];
+        state.canRun = canRun;
+        state.canJump = canJump;
     };
     // Creates a mesh entity for a deferred script spawn, reusing the pre-allocated id (self-contained
     // asset resolution + skinned detection, mirroring the editor's createMeshEntityAt).
@@ -3962,6 +4013,7 @@ int RunGame(NativeWindow& window,
 
     window.SetInputCallback([&runtimeSession,
                              &runtimeUi,
+                             &rmlUi,
                              &editorImGui,
                              &movement,
                              &cameraController,
@@ -4027,6 +4079,20 @@ int RunGame(NativeWindow& window,
             editorHasMousePosition = true;
             editorLastMouseX = event.x;
             editorLastMouseY = event.y;
+
+            // The game's own UI (RmlUi documents opened by scripts) sees the pointer first while Play
+            // runs; a click on one of its buttons is not also a click into the world. In the editor it
+            // lives in the Game view, so the pointer is mapped into that image.
+            if (editorPlay.state.mode == EditorPlayMode::Play && rmlUi.HasVisibleGameDocuments())
+            {
+                InputEvent uiEvent = event;
+                bool overGameImage = true;
+#if defined(IXTREEME_WITH_EDITOR)
+                overGameImage = editorImGui.MapInputToGameView(event, uiEvent);
+#endif
+                if (overGameImage && rmlUi.OnInput(uiEvent) && event.type != InputEvent::MouseMove)
+                    return;
+            }
         }
 
         if (event.type == InputEvent::MouseDown && event.button == MouseButton_Left)
@@ -4048,6 +4114,15 @@ int RunGame(NativeWindow& window,
             case Key_Down: editorScriptInput.down = down; break;
             case Key_Left: editorScriptInput.left = down; break;
             case Key_Right: editorScriptInput.right = down; break;
+            case Key_Q: editorScriptInput.q = down; break;
+            case Key_E: editorScriptInput.e = down; break;
+            case Key_R: editorScriptInput.r = down; break;
+            case Key_F: editorScriptInput.f = down; break;
+            case Key_1: editorScriptInput.num[0] = down; break;
+            case Key_2: editorScriptInput.num[1] = down; break;
+            case Key_3: editorScriptInput.num[2] = down; break;
+            case Key_4: editorScriptInput.num[3] = down; break;
+            case Key_5: editorScriptInput.num[4] = down; break;
             default: break;
             }
         }
@@ -5237,6 +5312,10 @@ int RunGame(NativeWindow& window,
                 if (worldLabelsOk)
                     worldLabels.RecreatePipeline(*rhiDevice);
                 runtimeSession->OnRenderPassChanged();
+#if defined(IXTREEME_WITH_EDITOR)
+                // The game's UI draws into the Game view (recreated above): bake against its new pass.
+                rmlUi.SetTargetPass(gameViewOk ? gameView.GetTargetPass() : nullptr);
+#endif
                 rmlUi.RecreatePipeline(*rhiDevice);
 #if defined(IXTREEME_WITH_EDITOR)
                 editorAdapter->OnRenderPassChanged();
@@ -7040,6 +7119,7 @@ int RunGame(NativeWindow& window,
                     entityScripts.clear();
                     scriptSystem.reset();
                     scriptApi.ResetTransportAndPrompts();  // close script streams, forget prompts
+                    rmlUi.CloseAllGameDocuments();         // the game's UI ends with the Play session
                     entityAudioSources.clear();  // dtors stop + uninit every ma_sound
                     editorWaterBodiesDirty = true;
                     if (editorPlay.playStartSceneWasOpen)
@@ -11659,6 +11739,19 @@ int RunGame(NativeWindow& window,
                                 /*viewIndex=*/1, /*clearDepth=*/false);
                             terrain.RenderWater(*frameInfo.commandList, frameInfo, gameCamera, seconds, gameExtent.width, gameExtent.height, /*viewIndex=*/1);
                         }
+                        // The game's own UI over the game image (a HUD a script opened).
+                        if (rmlUi.HasVisibleGameDocuments())
+                        {
+                            if (rmlUi.TargetPass() != gameView.GetTargetPass())
+                            {
+                                rhiDevice->WaitIdle();  // the old pipeline may still be in flight
+                                rmlUi.SetTargetPass(gameView.GetTargetPass());
+                                rmlUi.RecreatePipeline(*rhiDevice);
+                            }
+                            if (rmlUi.Width() != gameView.Width() || rmlUi.Height() != gameView.Height())
+                                rmlUi.Resize(gameView.Width(), gameView.Height());
+                            rmlUi.Render(*frameInfo.commandList, frameInfo);
+                        }
                         gameView.EndMainPass(*frameInfo.commandList);
                     }
                 }
@@ -11683,7 +11776,9 @@ int RunGame(NativeWindow& window,
             const auto editorUiBegin = std::chrono::steady_clock::now();
             frameRmlUiRenderCalled = true;
             rhiDevice->WriteTimestamp(ixrhi::IXRHITimestampPoint::RmlUiBegin);
-            rmlUi.Render(*frameInfo.commandList, frameInfo);
+#if !defined(IXTREEME_WITH_EDITOR)
+            rmlUi.Render(*frameInfo.commandList, frameInfo);  // the editor draws the game UI into the Game view
+#endif
             rhiDevice->WriteTimestamp(ixrhi::IXRHITimestampPoint::RmlUiEnd);
 #if defined(IXTREEME_WITH_EDITOR)
             frameImGuiRenderCalled = true;

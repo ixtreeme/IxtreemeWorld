@@ -1680,6 +1680,8 @@ std::optional<AssetLibrary::Category> AssetLibrary::DiscoverableCategory(const s
         return Category::Audio;
     if (ext == ".lua" || ext == ".cpp")
         return Category::Script;
+    if (ext == ".rml" || ext == ".rcss")
+        return Category::UiDocument;
     if (ext == ".ixprefab")
         return Category::Prefab;
     return std::nullopt;
@@ -1710,6 +1712,7 @@ const char* AssetLibrary::CategoryName(Category category)
     case Category::AnimatorController: return "Animators";
     case Category::Audio: return "Audio Clips";
     case Category::Script: return "Scripts";
+    case Category::UiDocument: return "UI";
     case Category::Scene: return "Scenes";
     case Category::Prefab: return "Prefabs";
     default: return "Assets";
@@ -2015,6 +2018,7 @@ std::string AssetLibrary::CategoryString(Category category)
     case Category::AnimatorController: return "animator_controller";
     case Category::Audio: return "audio";
     case Category::Script: return "script";
+    case Category::UiDocument: return "ui_document";
     case Category::Scene: return "scene";
     case Category::Prefab: return "prefab";
     default: return "texture";
@@ -2033,6 +2037,7 @@ std::optional<AssetLibrary::Category> AssetLibrary::ParseCategory(const std::str
     if (value == "animator_controller" || value == "animatorcontroller") return Category::AnimatorController;
     if (value == "audio") return Category::Audio;
     if (value == "script") return Category::Script;
+    if (value == "ui_document" || value == "ui") return Category::UiDocument;
     if (value == "scene") return Category::Scene;
     if (value == "prefab") return Category::Prefab;
     return std::nullopt;
@@ -2065,6 +2070,7 @@ std::filesystem::path AssetLibrary::LegacyCategoryDirectory(Category category) c
     case Category::AnimatorController: return m_libraryRoot / "animator_controllers";
     case Category::Audio: return m_libraryRoot / "audio_clips";
     case Category::Script: return m_libraryRoot / "scripts";
+    case Category::UiDocument: return m_libraryRoot / "ui";
     case Category::Scene: return m_libraryRoot / "scenes";
     case Category::Prefab: return m_libraryRoot / "prefabs";
     default: return m_libraryRoot / "textures";
@@ -2695,6 +2701,10 @@ std::optional<AssetLibrary::Entry> AssetLibrary::MakeDiscoveredEntry(Category ca
         entry.tags = HasAnyExtension(path, {".cpp"}) ? std::vector<std::string>{"script", "cpp"}
                                                      : std::vector<std::string>{"script", "lua"};
         break;
+    case Category::UiDocument:
+        entry.tags = HasAnyExtension(path, {".rcss"}) ? std::vector<std::string>{"ui", "rcss"}
+                                                      : std::vector<std::string>{"ui", "rml"};
+        break;
     case Category::Prefab:
         entry.thumbnail = "prefab_icon";
         entry.tags = {"prefab"};
@@ -3231,6 +3241,14 @@ bool AssetLibrary::ValidateFile(Category category, const std::filesystem::path& 
             return false;
         }
         break;
+    case Category::UiDocument:
+        // Game UI (RmlUi): documents and the style sheets they link, loaded by scripts (UiOpen).
+        if (!HasAnyExtension(path, {".rml", ".rcss"}))
+        {
+            error = "UI documents must be RML or RCSS files";
+            return false;
+        }
+        break;
     case Category::AnimatorController:
         if (!HasAnyExtension(path, {".controller"}))
         {
@@ -3277,8 +3295,9 @@ std::string AssetLibrary::MakeUniqueId(Category category,
                             (category == Category::AnimatorController ? "ctrl_" :
                                 (category == Category::Audio ? "audio_" :
                                     (category == Category::Script ? "script_" :
-                                        (category == Category::Scene ? "scene_" :
-                                            (category == Category::Prefab ? "prefab_" : "mat_"))))))))));
+                                        (category == Category::UiDocument ? "ui_" :
+                                            (category == Category::Scene ? "scene_" :
+                                                (category == Category::Prefab ? "prefab_" : "mat_")))))))))));
     const std::string base = prefix + SanitizeStem(sourcePath.stem().string());
     if (!existing.contains(base))
         return base;
@@ -3317,6 +3336,8 @@ std::optional<AssetLibrary::Category> DetectDirectImportCategory(const std::file
         return AssetLibrary::Category::Audio;
     if (ext == ".lua" || ext == ".cpp")
         return AssetLibrary::Category::Script;
+    if (ext == ".rml" || ext == ".rcss")
+        return AssetLibrary::Category::UiDocument;
     if (ext == ".material")
         return AssetLibrary::Category::Material;
     if (ext == ".physmat")

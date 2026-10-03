@@ -478,6 +478,7 @@ void EditorImGui::RenderGameViewPanel()
         // Window collapsed or its dock tab is inactive — not visible, so the engine can
         // skip rendering the Game view this frame.
         m_gameViewVisible = false;
+        m_gameViewRect.valid = false;
         ImGui::End();
         return;
     }
@@ -512,6 +513,16 @@ void EditorImGui::RenderGameViewPanel()
             imageMin.y += (avail.y - imageSize.y) * 0.5f;
         }
     }
+    // Where the game image sits in the window: the game's UI (RmlUi) maps mouse input through it.
+    const ImGuiViewport* mainViewport = ImGui::GetMainViewport();
+    const ImVec2 viewportPos = mainViewport ? mainViewport->Pos : ImVec2(0.0f, 0.0f);
+    m_gameViewRect.valid = gameViewTextureId && avail.x > 1.0f && avail.y > 1.0f && gameViewWidth > 0 && gameViewHeight > 0;
+    m_gameViewRect.min[0] = imageMin.x - viewportPos.x;
+    m_gameViewRect.min[1] = imageMin.y - viewportPos.y;
+    m_gameViewRect.size[0] = imageSize.x;
+    m_gameViewRect.size[1] = imageSize.y;
+    m_gameViewRect.extent[0] = gameViewWidth;
+    m_gameViewRect.extent[1] = gameViewHeight;
     if (gameViewTextureId && avail.x > 1.0f && avail.y > 1.0f)
     {
         ImGui::SetCursorScreenPos(imageMin);

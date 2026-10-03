@@ -115,6 +115,31 @@ public:
     void ShowCharacterCreation();
     void HideCharacterCreation();
     bool IsCharacterCreationVisible() const;
+
+    // --- game documents: .rml files a game script opens and drives (the game owns their content) ---
+    // Opens and shows a document over the whole UI area (path: absolute, or engine-asset relative).
+    // Returns its handle, 0 when it cannot be loaded.
+    std::uint32_t OpenGameDocument(const std::string& path);
+    void CloseGameDocument(std::uint32_t handle);
+    void CloseAllGameDocuments();
+    void SetGameDocumentVisible(std::uint32_t handle, bool visible);
+    // Element by its id attribute. False when the document or the element does not exist.
+    bool SetGameElementText(std::uint32_t handle, const std::string& elementId, const std::string& text);
+    bool SetGameElementProperty(std::uint32_t handle, const std::string& elementId, const std::string& property,
+                                const std::string& value);
+    bool SetGameElementClass(std::uint32_t handle, const std::string& elementId, const std::string& className, bool enabled);
+    // True once per click on the element (or anything inside it) since the last call.
+    bool ConsumeGameElementClick(std::uint32_t handle, const std::string& elementId);
+    bool HasVisibleGameDocuments() const;
+    // The pointer is over a game-document element that is not just its empty body: a click there is
+    // meant for the UI (a button), not for the game world under it.
+    bool IsPointerOverGameUi() const;
+    // UI colors are sRGB: when the render target is sRGB as well, the shader decodes them.
+    void SetSrgbTarget(bool srgb);
+    const ixrhi::IXRHIRenderPass* TargetPass() const;
+    std::uint32_t Width() const;
+    std::uint32_t Height() const;
+
     void Destroy();
 
 private:

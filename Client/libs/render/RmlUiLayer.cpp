@@ -26,7 +26,9 @@
 #include <memory>
 #include <optional>
 #include <string>
+#include <map>
 #include <unordered_map>
+#include <unordered_set>
 #include <vector>
 
 namespace
@@ -356,6 +358,23 @@ public:
     }
 };
 
+// Remembers which elements of a game document were clicked: the clicked element and every ancestor
+// with an id, so a click on a button's label counts for the button. Scripts poll it.
+class GameClickRecorder final : public Rml::EventListener
+{
+public:
+    std::unordered_set<std::string> clicked;
+
+    void ProcessEvent(Rml::Event& event) override
+    {
+        for (Rml::Element* element = event.GetTargetElement(); element != nullptr; element = element->GetParentNode())
+        {
+            if (!element->GetId().empty())
+                clicked.insert(element->GetId());
+        }
+    }
+};
+
 class RmlRenderInterface final : public Rml::RenderInterface
 {
 public:
@@ -397,6 +416,8 @@ public:
     }
 
     void SetTargetPass(const ixrhi::IXRHIRenderPass* pass) { m_targetPass = pass; }
+    const ixrhi::IXRHIRenderPass* TargetPass() const { return m_targetPass; }
+    void SetSrgbTarget(bool srgb) { m_srgbTarget = srgb; }
 
     void Resize(uint32_t width, uint32_t height)
     {
@@ -505,7 +526,10 @@ public:
         {
             float viewport[2];
             float translation[2];
-        } push{{static_cast<float>(m_width), static_cast<float>(m_height)}, {translation.x, translation.y}};
+            float params[4];  // x: the target is sRGB (see RmlUi.hlsl)
+        } push{{static_cast<float>(m_width), static_cast<float>(m_height)},
+            {translation.x, translation.y},
+            {m_srgbTarget ? 1.0f : 0.0f, 0.0f, 0.0f, 0.0f}};
 
         m_cmd->SetGraphicsPipeline(*m_pipeline);
         m_cmd->BindGroup(0, *m_bindGroup, gpuTexture->slot);
@@ -670,7 +694,7 @@ private:
         desc.vertexShader = vs;
         desc.fragmentShader = ps;
         desc.bindGroupLayouts = {m_bindLayout.get()};
-        desc.pushRanges = {{ixrhi::IXRHIShaderStage::Vertex, 0, sizeof(float) * 4}};
+        desc.pushRanges = {{ixrhi::IXRHIShaderStage::Vertex | ixrhi::IXRHIShaderStage::Fragment, 0, sizeof(float) * 8}};
         desc.vertexBindings = {{0, sizeof(Rml::Vertex)}};
         desc.vertexAttributes = {
             {0, 0, ixrhi::IXRHIFormat::R32G32Float, offsetof(Rml::Vertex, position)},
@@ -858,6 +882,7 @@ private:
     ixrhi::IXRHIDevice* m_rhi = nullptr;
     client::asset::IAssetReader* m_assets = nullptr;
     const ixrhi::IXRHIRenderPass* m_targetPass = nullptr; // borrowed (frame owner)
+    bool m_srgbTarget = false;  // decode the sRGB UI colors in the shader
     uint32_t m_width = 1;
     uint32_t m_height = 1;
     ixrhi::IXRHICommandList* m_cmd = nullptr; // borrowed (frame recording)
@@ -960,6 +985,27 @@ struct RmlUiLayer::Impl
     uint32_t viewportWidth = 0;
     uint32_t viewportHeight = 0;
     uint64_t lastFrameDiagSecond = UINT64_MAX;
+
+    // Documents a game script opened (any .rml the project ships), by handle.
+    struct GameDocument
+    {
+        Rml::ElementDocument* document = nullptr;
+        std::unique_ptr<GameClickRecorder> clicks;
+        bool visible = true;
+    };
+    std::map<std::uint32_t, GameDocument> gameDocuments;
+    std::uint32_t nextGameDocument = 1;
+
+    GameDocument* FindGameDocument(std::uint32_t handle)
+    {
+        const auto it = gameDocuments.find(handle);
+        return it == gameDocuments.end() || !it->second.document ? nullptr : &it->second;
+    }
+    Rml::Element* FindGameElement(std::uint32_t handle, const std::string& elementId)
+    {
+        GameDocument* game = FindGameDocument(handle);
+        return game ? game->document->GetElementById(elementId) : nullptr;
+    }
 };
 
 RmlUiLayer::RmlUiLayer() = default;
@@ -1251,6 +1297,7 @@ bool RmlUiLayer::Create(ixrhi::IXRHIDevice& rhi, client::asset::IAssetReader& as
         Tracen("[RMLUI] CreateContext failed");
         return false;
     }
+    m_impl->context->SetDensityIndependentPixelRatio(std::max(0.5f, static_cast<float>(height) / 1080.0f));
     const Rml::Vector2i contextDimensions = m_impl->context->GetDimensions();
     Tracenf("[RMLUI-DIAG] Context dimensions after create: %dx%d",
         contextDimensions.x,
@@ -1593,7 +1640,12 @@ void RmlUiLayer::Resize(uint32_t width, uint32_t height)
     m_impl->viewportHeight = height;
     m_impl->renderer.Resize(width, height);
     if (m_impl->context)
+    {
         m_impl->context->SetDimensions(Rml::Vector2i(static_cast<int>(width), static_cast<int>(height)));
+        // UI is designed at 1080 lines: one "dp" is one pixel there and scales with the height, so a
+        // HUD keeps its proportions at any resolution (and in the editor's scaled Game view).
+        m_impl->context->SetDensityIndependentPixelRatio(std::max(0.5f, static_cast<float>(height) / 1080.0f));
+    }
     if (m_impl->loginDocument)
     {
         m_impl->loginDocument->SetProperty("width", std::to_string(width) + "px");
@@ -1613,6 +1665,8 @@ void RmlUiLayer::Resize(uint32_t width, uint32_t height)
     SetFullscreenDocumentSize(m_impl->settingsDocument, width, height);
     SetFullscreenDocumentSize(m_impl->inventoryDocument, width, height);
     SetFullscreenDocumentSize(m_impl->characterCreationDocument, width, height);
+    for (auto& [handle, game] : m_impl->gameDocuments)
+        SetFullscreenDocumentSize(game.document, width, height);
 }
 
 void RmlUiLayer::SetTargetPass(const ixrhi::IXRHIRenderPass* pass)
@@ -1641,6 +1695,9 @@ bool RmlUiLayer::OnInput(const InputEvent& event)
     const bool creationVisible = m_impl->characterCreationVisible && m_impl->characterCreationDocument;
     const bool capturesInput = loginVisible || lobbyVisible || menuVisible || settingsVisible ||
         inventoryVisible || creationVisible;
+    // A game document takes the clicks that land on its elements (buttons), not those on its empty
+    // body: the world under a HUD stays playable.
+    const auto capturesPointer = [&]() { return capturesInput || IsPointerOverGameUi(); };
     switch (event.type)
     {
     case InputEvent::MouseMove:
@@ -1648,13 +1705,13 @@ bool RmlUiLayer::OnInput(const InputEvent& event)
         return capturesInput;
     case InputEvent::MouseDown:
         m_impl->context->ProcessMouseButtonDown(ToRmlMouseButton(event.button), 0);
-        return capturesInput;
+        return capturesPointer();
     case InputEvent::MouseUp:
         m_impl->context->ProcessMouseButtonUp(ToRmlMouseButton(event.button), 0);
-        return capturesInput;
+        return capturesPointer();
     case InputEvent::MouseWheel:
         m_impl->context->ProcessMouseWheel(static_cast<float>(event.wheelDelta) / 120.0f, 0);
-        return capturesInput;
+        return capturesPointer();
     case InputEvent::KeyDown:
         if (loginVisible && event.key == Key_Enter)
         {
@@ -2147,11 +2204,153 @@ bool RmlUiLayer::IsCharacterCreationVisible() const
     return m_impl && m_impl->characterCreationVisible;
 }
 
+std::uint32_t RmlUiLayer::OpenGameDocument(const std::string& path)
+{
+    if (!m_impl || !m_impl->context || path.empty())
+        return 0;
+    Rml::ElementDocument* document = m_impl->context->LoadDocument(path);
+    if (!document)
+    {
+        Tracenf("[RMLUI] Game document failed to load: %s", path.c_str());
+        return 0;
+    }
+    SetFullscreenDocumentSize(document, m_impl->viewportWidth, m_impl->viewportHeight);
+    Impl::GameDocument game;
+    game.document = document;
+    game.clicks = std::make_unique<GameClickRecorder>();
+    document->AddEventListener(Rml::EventId::Click, game.clicks.get());
+    document->Show();
+    const std::uint32_t handle = m_impl->nextGameDocument++;
+    m_impl->gameDocuments.emplace(handle, std::move(game));
+    Tracenf("[RMLUI] Game document opened: handle=%u path=%s", handle, path.c_str());
+    return handle;
+}
+
+void RmlUiLayer::CloseGameDocument(std::uint32_t handle)
+{
+    if (!m_impl)
+        return;
+    const auto it = m_impl->gameDocuments.find(handle);
+    if (it == m_impl->gameDocuments.end())
+        return;
+    if (it->second.document)
+    {
+        it->second.document->RemoveEventListener(Rml::EventId::Click, it->second.clicks.get());
+        it->second.document->Close();
+    }
+    m_impl->gameDocuments.erase(it);
+}
+
+void RmlUiLayer::CloseAllGameDocuments()
+{
+    if (!m_impl)
+        return;
+    while (!m_impl->gameDocuments.empty())
+        CloseGameDocument(m_impl->gameDocuments.begin()->first);
+}
+
+void RmlUiLayer::SetGameDocumentVisible(std::uint32_t handle, bool visible)
+{
+    Impl::GameDocument* game = m_impl ? m_impl->FindGameDocument(handle) : nullptr;
+    if (!game || game->visible == visible)
+        return;
+    game->visible = visible;
+    if (visible)
+        game->document->Show();
+    else
+        game->document->Hide();
+}
+
+bool RmlUiLayer::SetGameElementText(std::uint32_t handle, const std::string& elementId, const std::string& text)
+{
+    Rml::Element* element = m_impl ? m_impl->FindGameElement(handle, elementId) : nullptr;
+    if (!element)
+        return false;
+    const std::string rml = EscapeRmlText(text);
+    if (element->GetInnerRML() != rml)
+        element->SetInnerRML(rml);
+    return true;
+}
+
+bool RmlUiLayer::SetGameElementProperty(std::uint32_t handle,
+                                        const std::string& elementId,
+                                        const std::string& property,
+                                        const std::string& value)
+{
+    Rml::Element* element = m_impl ? m_impl->FindGameElement(handle, elementId) : nullptr;
+    return element != nullptr && element->SetProperty(property, value);
+}
+
+bool RmlUiLayer::SetGameElementClass(std::uint32_t handle,
+                                     const std::string& elementId,
+                                     const std::string& className,
+                                     bool enabled)
+{
+    Rml::Element* element = m_impl ? m_impl->FindGameElement(handle, elementId) : nullptr;
+    if (!element)
+        return false;
+    if (element->IsClassSet(className) != enabled)
+        element->SetClass(className, enabled);
+    return true;
+}
+
+bool RmlUiLayer::ConsumeGameElementClick(std::uint32_t handle, const std::string& elementId)
+{
+    Impl::GameDocument* game = m_impl ? m_impl->FindGameDocument(handle) : nullptr;
+    return game != nullptr && game->clicks->clicked.erase(elementId) > 0;
+}
+
+bool RmlUiLayer::HasVisibleGameDocuments() const
+{
+    if (!m_impl)
+        return false;
+    return std::any_of(m_impl->gameDocuments.begin(), m_impl->gameDocuments.end(), [](const auto& entry) {
+        return entry.second.document && entry.second.visible;
+    });
+}
+
+bool RmlUiLayer::IsPointerOverGameUi() const
+{
+    if (!m_impl || !m_impl->context)
+        return false;
+    Rml::Element* hover = m_impl->context->GetHoverElement();
+    if (!hover)
+        return false;
+    Rml::ElementDocument* owner = hover->GetOwnerDocument();
+    if (hover == owner)
+        return false;  // the empty body of a full-window HUD
+    return std::any_of(m_impl->gameDocuments.begin(), m_impl->gameDocuments.end(), [owner](const auto& entry) {
+        return entry.second.document == owner && entry.second.visible;
+    });
+}
+
+void RmlUiLayer::SetSrgbTarget(bool srgb)
+{
+    if (m_impl)
+        m_impl->renderer.SetSrgbTarget(srgb);
+}
+
+const ixrhi::IXRHIRenderPass* RmlUiLayer::TargetPass() const
+{
+    return m_impl ? m_impl->renderer.TargetPass() : nullptr;
+}
+
+std::uint32_t RmlUiLayer::Width() const
+{
+    return m_impl ? m_impl->viewportWidth : 0u;
+}
+
+std::uint32_t RmlUiLayer::Height() const
+{
+    return m_impl ? m_impl->viewportHeight : 0u;
+}
+
 void RmlUiLayer::Destroy()
 {
     if (!m_impl)
         return;
 
+    CloseAllGameDocuments();
     if (m_impl->initialized)
         Rml::Shutdown();
     m_impl->renderer.Destroy();

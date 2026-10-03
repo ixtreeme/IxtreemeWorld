@@ -162,6 +162,9 @@ public:
     bool IsTextInputActive() const;
     bool IsSceneViewInputTarget(const InputEvent& event) const;
     InputEvent MapInputToSceneView(const InputEvent& event) const;
+    // A window mouse event in the Game view's pixels (its render target), for the game's own UI.
+    // False when the Game view is not shown or the pointer is outside its image.
+    bool MapInputToGameView(const InputEvent& event, InputEvent& out) const;
     void SetSceneViewKeyboardFocus(bool focused);
     void SetMapEditorSettings(const MapEditorSettings& settings);
     MapEditorSettings GetMapEditorSettings() const { return m_editorSettings; }
@@ -705,6 +708,14 @@ private:
     bool m_assetBrowserLogged = false;
     std::string m_loggedDragAssetId;
     bool m_gameViewVisible = false;
+    struct GameViewRect
+    {
+        bool valid = false;
+        float min[2] = {0.0f, 0.0f};   // window pixels
+        float size[2] = {0.0f, 0.0f};
+        std::uint32_t extent[2] = {0u, 0u};  // render target pixels
+    };
+    GameViewRect m_gameViewRect;
     bool m_sceneViewVisible = true;
     bool m_animatorGraphVisible = false;
     bool m_animatorPanelOpen = true;

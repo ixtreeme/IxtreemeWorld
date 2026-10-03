@@ -53,6 +53,7 @@ enum class AssetType
     AnimatorController,
     AudioClip,
     Script,
+    UiDocument,  // game UI (RmlUi): .rml / .rcss
     Unknown
 };
 

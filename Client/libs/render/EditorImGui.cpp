@@ -356,6 +356,7 @@ ImVec4 AssetCategoryColor(AssetLibrary::Category category)
     case AssetLibrary::Category::AnimatorController: return ImVec4(0.90f, 0.47f, 0.36f, 1.0f);
     case AssetLibrary::Category::Audio: return ImVec4(0.36f, 0.74f, 0.62f, 1.0f);
     case AssetLibrary::Category::Script: return ImVec4(0.55f, 0.72f, 0.95f, 1.0f);
+    case AssetLibrary::Category::UiDocument: return ImVec4(0.93f, 0.55f, 0.85f, 1.0f);
     default: return ImVec4(0.60f, 0.62f, 0.66f, 1.0f);
     }
 }
@@ -376,6 +377,7 @@ const char* AssetCategoryIcon(AssetLibrary::Category category)
     case AssetLibrary::Category::AnimatorController: return ICON_FA_DIAGRAM_PROJECT;
     case AssetLibrary::Category::Audio: return ICON_FA_MUSIC;
     case AssetLibrary::Category::Script: return ICON_FA_FILE_CODE;
+    case AssetLibrary::Category::UiDocument: return ICON_FA_WINDOW_MAXIMIZE;
     default: return ICON_FA_FILE;
     }
 }
@@ -2803,6 +2805,21 @@ InputEvent EditorImGui::MapInputToSceneView(const InputEvent& event) const
     return mapped;
 }
 
+bool EditorImGui::MapInputToGameView(const InputEvent& event, InputEvent& out) const
+{
+    const GameViewRect& rect = m_gameViewRect;
+    if (!rect.valid || !m_gameViewVisible || rect.size[0] <= 1.0f || rect.size[1] <= 1.0f)
+        return false;
+    const float u = (static_cast<float>(event.x) - rect.min[0]) / rect.size[0];
+    const float v = (static_cast<float>(event.y) - rect.min[1]) / rect.size[1];
+    if (u < 0.0f || u >= 1.0f || v < 0.0f || v >= 1.0f)
+        return false;
+    out = event;
+    out.x = static_cast<int>(u * static_cast<float>(rect.extent[0]));
+    out.y = static_cast<int>(v * static_cast<float>(rect.extent[1]));
+    return true;
+}
+
 void EditorImGui::SetSceneViewKeyboardFocus(bool focused)
 {
     if (m_sceneViewKeyboardFocus == focused)
@@ -2854,6 +2871,11 @@ bool EditorImGui::IsSceneViewInputTarget(const InputEvent&) const
 InputEvent EditorImGui::MapInputToSceneView(const InputEvent& event) const
 {
     return event;
+}
+
+bool EditorImGui::MapInputToGameView(const InputEvent&, InputEvent&) const
+{
+    return false;
 }
 
 void EditorImGui::SetSceneViewKeyboardFocus(bool)

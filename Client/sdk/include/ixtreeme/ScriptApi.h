@@ -22,7 +22,21 @@ enum class ScriptKey
     W, A, S, D,
     Space, Shift, Ctrl,
     Up, Down, Left, Right,
-    MouseLeft, MouseRight
+    MouseLeft, MouseRight,
+    // v6: action keys (appended, so the values above keep their numbers)
+    Q, E, R, F,
+    Num1, Num2, Num3, Num4, Num5
+};
+
+// What a player CharacterController did in its last simulation step (v6). POD: safe by value across
+// the /MT module boundary.
+struct CharacterState
+{
+    bool grounded = false;
+    bool moving = false;       // horizontal movement input this step
+    bool running = false;      // moving at run speed (Shift held and running allowed)
+    bool jumped = false;       // a jump started this step
+    float planarSpeed = 0.0f;  // m/s
 };
 
 struct RaycastHit
@@ -109,6 +123,28 @@ public:
     // material slot `slot` of the entity's mesh. DEFERRED like spawn/destroy, so it also applies to an
     // entity spawned earlier in the same frame. An unknown entity or material is a logged no-op.
     virtual void SetMaterial(std::uint32_t id, std::uint32_t slot, const std::string& materialAssetId) = 0;
+
+    // --- character controller (v6) ---
+    // The last step of the entity's player CharacterController; false when it has none (or Play is off).
+    virtual bool GetCharacterState(std::uint32_t id, CharacterState& out) = 0;
+    // What the controller may do from now on: run (Shift) and jump. Both are allowed when Play starts.
+    virtual void SetCharacterAbilities(std::uint32_t id, bool canRun, bool canJump) = 0;
+
+    // --- game UI (v6): RmlUi documents (.rml + .rcss) from the project's asset folder ---
+    // Opens and shows a document (path relative to the asset folder, e.g. "ui/hud.rml") over the game
+    // (the Game view in the editor). Returns its handle, 0 if it cannot be loaded. Every document closes
+    // when Play stops.
+    virtual std::uint32_t UiOpen(const std::string& documentPath) = 0;
+    virtual void UiClose(std::uint32_t document) = 0;
+    virtual void UiSetVisible(std::uint32_t document, bool visible) = 0;
+    // An element by its id attribute: its text, one RCSS property ("width", "62%") or a class on/off.
+    virtual void UiSetText(std::uint32_t document, const std::string& elementId, const std::string& text) = 0;
+    virtual void UiSetProperty(std::uint32_t document, const std::string& elementId, const std::string& property,
+                               const std::string& value) = 0;
+    virtual void UiSetClass(std::uint32_t document, const std::string& elementId, const std::string& className,
+                            bool enabled) = 0;
+    // True once per click on the element (or anything inside it) since the last call.
+    virtual bool UiConsumeClick(std::uint32_t document, const std::string& elementId) = 0;
 
     // (NEVER add an STL-by-value return here — use a caller-owned char* buffer for strings to keep the
     //  /MT module boundary safe. By-value RaycastHit is fine: it is POD, no heap.)

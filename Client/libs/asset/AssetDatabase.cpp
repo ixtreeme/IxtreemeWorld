@@ -125,6 +125,8 @@ std::optional<AssetType> ParseAssetType(const std::string& value)
         return AssetType::AudioClip;
     if (value == "Script")
         return AssetType::Script;
+    if (value == "UiDocument")
+        return AssetType::UiDocument;
     if (value == "Scene")
         return AssetType::Scene;
     if (value == "Prefab")
@@ -476,6 +478,8 @@ AssetType detectAssetType(const std::filesystem::path& filePath)
         return AssetType::AudioClip;
     if (ext == ".lua")
         return AssetType::Script;
+    if (ext == ".rml" || ext == ".rcss")
+        return AssetType::UiDocument;
     if (ext == ".scene")
         return AssetType::Scene;
     if (ext == ".ixprefab")
@@ -497,6 +501,7 @@ const char* AssetTypeName(AssetType type)
     case AssetType::AnimatorController: return "AnimatorController";
     case AssetType::AudioClip: return "AudioClip";
     case AssetType::Script: return "Script";
+    case AssetType::UiDocument: return "UiDocument";
     case AssetType::Scene: return "Scene";
     case AssetType::Prefab: return "Prefab";
     case AssetType::Project: return "Project";

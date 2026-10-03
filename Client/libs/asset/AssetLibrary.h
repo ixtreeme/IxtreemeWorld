@@ -31,7 +31,8 @@ public:
         AnimationClip,
         AnimatorController,
         Audio,
-        Script
+        Script,
+        UiDocument  // game UI (RmlUi): .rml documents and their .rcss style sheets
     };
 
     enum class TextureRole

@@ -87,3 +87,4 @@
 #define ICON_FA_SCROLL                     "\xef\x9c\x8e"
 #define ICON_FA_MAP                        "\xef\x89\xb9"
 #define ICON_FA_ARROW_POINTER              "\xef\x89\x85"
+#define ICON_FA_WINDOW_MAXIMIZE            "\xef\x8b\x90"

@@ -111,6 +111,25 @@ protected:
     // Material slot of THIS entity (see IScriptApi::SetMaterial; v5). Other entities: api->SetMaterial(id, ...).
     void SetMaterial(std::uint32_t slot, const std::string& materialAssetId) { api->SetMaterial(entityId, slot, materialAssetId); }
 
+    // THIS entity's player CharacterController (v6). Other entities: api->GetCharacterState(id, ...).
+    bool GetCharacterState(CharacterState& out) { return api->GetCharacterState(entityId, out); }
+    void SetCharacterAbilities(bool canRun, bool canJump) { api->SetCharacterAbilities(entityId, canRun, canJump); }
+
+    // Game UI documents (v6; see IScriptApi::UiOpen).
+    std::uint32_t UiOpen(const std::string& documentPath) { return api->UiOpen(documentPath); }
+    void UiClose(std::uint32_t document) { api->UiClose(document); }
+    void UiSetVisible(std::uint32_t document, bool visible) { api->UiSetVisible(document, visible); }
+    void UiSetText(std::uint32_t document, const std::string& elementId, const std::string& text) { api->UiSetText(document, elementId, text); }
+    void UiSetProperty(std::uint32_t document, const std::string& elementId, const std::string& property, const std::string& value)
+    {
+        api->UiSetProperty(document, elementId, property, value);
+    }
+    void UiSetClass(std::uint32_t document, const std::string& elementId, const std::string& className, bool enabled)
+    {
+        api->UiSetClass(document, elementId, className, enabled);
+    }
+    bool UiConsumeClick(std::uint32_t document, const std::string& elementId) { return api->UiConsumeClick(document, elementId); }
+
     void Log(const std::string& msg) { api->Log(msg); }
     void LogError(const std::string& msg) { api->LogError(msg); }
 
