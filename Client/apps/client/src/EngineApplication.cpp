@@ -11754,10 +11754,12 @@ int RunGame(NativeWindow& window,
                 // taken above for the water, or here when there is no terrain.
                 if (godRaysOk && isInWorld && drawSceneView)
                 {
-                    if (!hasSceneTerrain && godRays.IsVisible(sceneSky, frameSunLighting, camera))
+                    const GodRayRenderer::SunShadow sunShadow{terrain.SunShadowTexture(frameInfo.frameNumber),
+                        terrain.SunShadowCascadeViewProj(), TerrainRenderer::kSunShadowDepthBias};
+                    if (!hasSceneTerrain && godRays.IsVisible(sceneSky, frameSunLighting, camera, sunShadow))
                         offscreenScene.SnapshotScene(*frameInfo.commandList, frameInfo);
                     if (godRays.RenderRays(*frameInfo.commandList, frameInfo, /*view=*/0, sceneSky, frameSunLighting,
-                            camera, offscreenScene.GetDepthSnapshotTexture(), renderSize.width, renderSize.height))
+                            camera, offscreenScene.GetDepthSnapshotTexture(), sunShadow, renderSize.width, renderSize.height))
                     {
                         offscreenScene.BeginMainPass(*frameInfo.commandList, frameInfo, false);
                         godRays.Composite(*frameInfo.commandList, frameInfo, /*view=*/0, renderSize.width, renderSize.height);
@@ -11855,12 +11857,14 @@ int RunGame(NativeWindow& window,
                         }
                         // God rays over the game image, under the game's UI: close the pass for a depth
                         // snapshot and the ray passes, then reopen it (loaded) for the composite.
-                        if (godRaysOk && isInWorld && godRays.IsVisible(sceneSky, frameSunLighting, gameCamera))
+                        const GodRayRenderer::SunShadow gameSunShadow{terrain.SunShadowTexture(frameInfo.frameNumber),
+                            terrain.SunShadowCascadeViewProj(), TerrainRenderer::kSunShadowDepthBias};
+                        if (godRaysOk && isInWorld && godRays.IsVisible(sceneSky, frameSunLighting, gameCamera, gameSunShadow))
                         {
                             gameView.EndMainPass(*frameInfo.commandList);
                             gameView.SnapshotScene(*frameInfo.commandList, frameInfo);
                             godRays.RenderRays(*frameInfo.commandList, frameInfo, /*view=*/1, sceneSky, frameSunLighting,
-                                gameCamera, gameView.GetDepthSnapshotTexture(), gameExtent.width, gameExtent.height);
+                                gameCamera, gameView.GetDepthSnapshotTexture(), gameSunShadow, gameExtent.width, gameExtent.height);
                             gameView.BeginMainPass(*frameInfo.commandList, frameInfo, false);
                             godRays.Composite(*frameInfo.commandList, frameInfo, /*view=*/1, gameExtent.width, gameExtent.height);
                         }

@@ -2062,20 +2062,56 @@ void EditorImGui::RenderGodRaysPanel()
 {
     SkySettings& sky = m_skySettings;
     bool changed = UI::Prop::Checkbox("Enabled##god_rays", &sky.godRays);
-    UI::ItemTooltip("Light shafts from the Sun where the sky shows past terrain, trees and characters.\n"
-                    "They come from the Sun light's direction (Environment > Sun) while it is on the screen.");
+    UI::ItemTooltip("Light shafts from the Sun (its colour and direction: Environment > Sun)");
     ImGui::BeginDisabled(!sky.godRays);
-    changed |= UI::Prop::SliderFloat("Intensity##god_rays", &sky.godRayIntensity, 0.0f, 2.0f, "%.2f");
-    changed |= UI::Prop::SliderFloat("Length##god_rays", &sky.godRayLength, 0.05f, 1.0f, "%.2f");
-    UI::ItemTooltip("How far across the screen the shafts reach");
-    changed |= UI::Prop::SliderFloat("Falloff##god_rays", &sky.godRayFalloff, 0.85f, 1.0f, "%.3f");
-    UI::ItemTooltip("How quickly the shafts fade along their length (closer to 1: they fade later)");
-    const char* qualities[] = {"Low (32 samples)", "Medium (64 samples)", "High (96 samples)"};
-    int quality = std::clamp(static_cast<int>(sky.godRayQuality), 0, 2);
-    if (UI::Prop::Combo("Quality##god_rays", &quality, qualities, IM_ARRAYSIZE(qualities)))
+    const char* techniques[] = {"Screen space", "Volumetric", "Both"};
+    int technique = std::clamp(static_cast<int>(sky.godRayTechnique), 0, 2);
+    if (UI::Prop::Combo("Technique##god_rays", &technique, techniques, IM_ARRAYSIZE(techniques)))
     {
-        sky.godRayQuality = quality;
+        sky.godRayTechnique = technique;
         changed = true;
+    }
+    UI::ItemTooltip("Screen space: shafts around the sun while it is on the screen, from everything in\n"
+                    "front of it (terrain, trees, characters).\n"
+                    "Volumetric: light scattered in the air, with the terrain's sun shadow cutting it\n"
+                    "into shafts - also seen from the side and with the sun off the screen.\n"
+                    "Both: the two added together.");
+
+    if (sky.godRayTechnique != 1)
+    {
+        ImGui::SeparatorText("Screen space");
+        changed |= UI::Prop::SliderFloat("Intensity##god_rays", &sky.godRayIntensity, 0.0f, 2.0f, "%.2f");
+        changed |= UI::Prop::SliderFloat("Length##god_rays", &sky.godRayLength, 0.05f, 1.0f, "%.2f");
+        UI::ItemTooltip("How far across the screen the shafts reach");
+        changed |= UI::Prop::SliderFloat("Falloff##god_rays", &sky.godRayFalloff, 0.85f, 1.0f, "%.3f");
+        UI::ItemTooltip("How quickly the shafts fade along their length (closer to 1: they fade later)");
+        const char* qualities[] = {"Low (32 samples)", "Medium (64 samples)", "High (96 samples)"};
+        int quality = std::clamp(static_cast<int>(sky.godRayQuality), 0, 2);
+        if (UI::Prop::Combo("Quality##god_rays", &quality, qualities, IM_ARRAYSIZE(qualities)))
+        {
+            sky.godRayQuality = quality;
+            changed = true;
+        }
+    }
+    if (sky.godRayTechnique != 0)
+    {
+        ImGui::SeparatorText("Volumetric");
+        changed |= UI::Prop::SliderFloat("Intensity##volumetric", &sky.volumetricIntensity, 0.0f, 4.0f, "%.2f");
+        changed |= UI::Prop::SliderFloat("Haze##volumetric", &sky.volumetricDensity, 0.0f, 0.05f, "%.4f",
+            ImGuiSliderFlags_Logarithmic);
+        UI::ItemTooltip("How much the air scatters the sunlight: more haze, brighter and denser shafts");
+        changed |= UI::Prop::SliderFloat("Forward scattering##volumetric", &sky.volumetricAnisotropy, 0.0f, 0.95f, "%.2f");
+        UI::ItemTooltip("0: the haze glows the same in every direction; near 1: mostly when looking towards the sun");
+        changed |= UI::Prop::SliderFloat("Distance##volumetric", &sky.volumetricDistance, 5.0f, 200.0f, "%.0f m");
+        UI::ItemTooltip("How far from the camera the light in the air is gathered (the sun shadow reaches 200 m)");
+        const char* steps[] = {"Low (16 steps)", "Medium (32 steps)", "High (64 steps)"};
+        int quality = std::clamp(static_cast<int>(sky.volumetricQuality), 0, 2);
+        if (UI::Prop::Combo("Quality##volumetric", &quality, steps, IM_ARRAYSIZE(steps)))
+        {
+            sky.volumetricQuality = quality;
+            changed = true;
+        }
+        ImGui::TextDisabled("Shafts come from the terrain's sun shadow (Environment > Sun > Casts shadows).");
     }
     ImGui::EndDisabled();
     if (changed)

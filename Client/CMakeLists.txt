@@ -298,6 +298,8 @@ if(WIN32)
     set(GOD_RAYS_MASK_PS_SPV "${GENERATED_SHADER_DIR}/god_rays_mask_ps.spv")
     set(GOD_RAYS_BLUR_PS_SPV "${GENERATED_SHADER_DIR}/god_rays_blur_ps.spv")
     set(GOD_RAYS_COMPOSITE_PS_SPV "${GENERATED_SHADER_DIR}/god_rays_composite_ps.spv")
+    set(GOD_RAYS_VOLBLUR_PS_SPV "${GENERATED_SHADER_DIR}/god_rays_volblur_ps.spv")
+    set(VOLUMETRIC_LIGHT_PS_SPV "${GENERATED_SHADER_DIR}/volumetric_light_ps.spv")
 
     add_custom_command(
         OUTPUT "${SKINNED_MESH_VS_SPV}"
@@ -483,7 +485,7 @@ if(WIN32)
         DEPENDS "${CLIENT_ROOT}/shaders/Sky.hlsl"
         VERBATIM
     )
-    foreach(_god_ray_stage IN ITEMS "VS;vs_6_0;VSMain" "MASK_PS;ps_6_0;MaskPS" "BLUR_PS;ps_6_0;BlurPS" "COMPOSITE_PS;ps_6_0;CompositePS")
+    foreach(_god_ray_stage IN ITEMS "VS;vs_6_0;VSMain" "MASK_PS;ps_6_0;MaskPS" "BLUR_PS;ps_6_0;BlurPS" "COMPOSITE_PS;ps_6_0;CompositePS" "VOLBLUR_PS;ps_6_0;VolBlurPS")
         list(GET _god_ray_stage 0 _god_ray_name)
         list(GET _god_ray_stage 1 _god_ray_profile)
         list(GET _god_ray_stage 2 _god_ray_entry)
@@ -496,6 +498,14 @@ if(WIN32)
             VERBATIM
         )
     endforeach()
+    add_custom_command(
+        OUTPUT "${VOLUMETRIC_LIGHT_PS_SPV}"
+        COMMAND ${CMAKE_COMMAND} -E make_directory "${GENERATED_SHADER_DIR}"
+        COMMAND "${DXC_EXECUTABLE}" -spirv -fvk-use-dx-layout -T ps_6_0 -E MarchPS
+            -Fo "${VOLUMETRIC_LIGHT_PS_SPV}" "${CLIENT_ROOT}/shaders/VolumetricLight.hlsl"
+        DEPENDS "${CLIENT_ROOT}/shaders/VolumetricLight.hlsl"
+        VERBATIM
+    )
     add_custom_target(IXEngineShaders DEPENDS
         "${SKINNED_MESH_VS_SPV}"
         "${SKINNED_MESH_PS_SPV}"
@@ -524,6 +534,8 @@ if(WIN32)
         "${GOD_RAYS_MASK_PS_SPV}"
         "${GOD_RAYS_BLUR_PS_SPV}"
         "${GOD_RAYS_COMPOSITE_PS_SPV}"
+        "${GOD_RAYS_VOLBLUR_PS_SPV}"
+        "${VOLUMETRIC_LIGHT_PS_SPV}"
     )
 elseif(ANDROID)
     if(CMAKE_ANDROID_NDK)

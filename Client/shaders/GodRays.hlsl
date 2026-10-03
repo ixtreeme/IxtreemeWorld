@@ -75,6 +75,21 @@ float4 BlurPS(VSOutput input) : SV_Target
     return float4(sum * (3.0 / samples), 1.0);
 }
 
+// The volumetric light (VolumetricLight.hlsl) blurred over 5x5 texels to hide its step noise;
+// rayParams.xy = one texel in uv.
+float4 VolBlurPS(VSOutput input) : SV_Target
+{
+    float3 sum = float3(0.0, 0.0, 0.0);
+    [unroll]
+    for (int y = -2; y <= 2; ++y)
+    {
+        [unroll]
+        for (int x = -2; x <= 2; ++x)
+            sum += u_source.SampleLevel(u_sourceSampler, input.uv + float2(x, y) * u_push.rayParams.xy, 0.0).rgb;
+    }
+    return float4(sum / 25.0, 1.0);
+}
+
 float4 CompositePS(VSOutput input) : SV_Target
 {
     return float4(u_source.SampleLevel(u_sourceSampler, input.uv, 0.0).rgb * u_push.composite.x, 0.0);

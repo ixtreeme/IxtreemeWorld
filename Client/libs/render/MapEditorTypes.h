@@ -274,6 +274,18 @@ struct SkySettings
     float godRayLength = 0.8f;      // how far across the screen they reach (0..1)
     float godRayFalloff = 0.975f;   // how fast they fade along their length (closer to 1: longer)
     std::int32_t godRayQuality = 1; // 0 low (32 samples), 1 medium (64), 2 high (96)
+    // Which god rays: 0 screen space (shafts around the sun on the screen), 1 volumetric (light
+    // scattered in the air along every view ray, shadowed by the sun shadow map: shafts seen from
+    // the side, with the sun anywhere), 2 both.
+    std::int32_t godRayTechnique = 0;
+    float volumetricIntensity = 1.0f;
+    float volumetricDensity = 0.003f;    // how hazy the air is (scattering per metre)
+    float volumetricAnisotropy = 0.4f;   // forward scattering: 0 even in all directions, 0.9 mostly towards the sun
+    float volumetricDistance = 120.0f;   // how far along a view ray light is gathered (m)
+    std::int32_t volumetricQuality = 1;  // 0 low (16 steps), 1 medium (32), 2 high (64)
+
+    bool ScreenSpaceGodRays() const { return godRays && godRayTechnique != 1; }
+    bool VolumetricGodRays() const { return godRays && godRayTechnique != 0; }
 };
 
 struct WaterConfig

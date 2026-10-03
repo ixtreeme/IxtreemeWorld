@@ -2135,6 +2135,7 @@ void TerrainRenderer::RenderSunShadowMap(ixrhi::IXRHICommandList& cmd,
     cmd.TransitionTexture(*m_shadowTexture,
         ixrhi::IXRHIImageLayout::DepthStencilAttachment,
         ixrhi::IXRHIImageLayout::ShaderReadOnly);
+    m_shadowDrawnFrame = frame.frameNumber;
 }
 
 WorldCamera TerrainRenderer::ComputeMirrorCamera(const WorldCamera& camera,

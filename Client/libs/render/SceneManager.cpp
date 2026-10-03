@@ -1146,7 +1146,13 @@ void WriteSkySettings(std::ostream& out, const SkySettings& sky)
     out << "        \"intensity\": " << sky.godRayIntensity << ",\n";
     out << "        \"length\": " << sky.godRayLength << ",\n";
     out << "        \"falloff\": " << sky.godRayFalloff << ",\n";
-    out << "        \"quality\": " << sky.godRayQuality << "\n";
+    out << "        \"quality\": " << sky.godRayQuality << ",\n";
+    out << "        \"technique\": " << sky.godRayTechnique << ",\n";
+    out << "        \"volumetric_intensity\": " << sky.volumetricIntensity << ",\n";
+    out << "        \"volumetric_density\": " << sky.volumetricDensity << ",\n";
+    out << "        \"volumetric_anisotropy\": " << sky.volumetricAnisotropy << ",\n";
+    out << "        \"volumetric_distance\": " << sky.volumetricDistance << ",\n";
+    out << "        \"volumetric_quality\": " << sky.volumetricQuality << "\n";
     out << "      }\n";
     out << "    }";
 }
@@ -1178,6 +1184,12 @@ SkySettings ReadSkySettings(const JsonValue& object)
         sky.godRayLength = std::clamp(ReadFloat(*rays, "length", sky.godRayLength), 0.05f, 1.0f);
         sky.godRayFalloff = std::clamp(ReadFloat(*rays, "falloff", sky.godRayFalloff), 0.8f, 1.0f);
         sky.godRayQuality = std::clamp(static_cast<std::int32_t>(ReadU32(*rays, "quality", 1u)), 0, 2);
+        sky.godRayTechnique = std::clamp(static_cast<std::int32_t>(ReadU32(*rays, "technique", 0u)), 0, 2);
+        sky.volumetricIntensity = std::clamp(ReadFloat(*rays, "volumetric_intensity", sky.volumetricIntensity), 0.0f, 8.0f);
+        sky.volumetricDensity = std::clamp(ReadFloat(*rays, "volumetric_density", sky.volumetricDensity), 0.0f, 0.2f);
+        sky.volumetricAnisotropy = std::clamp(ReadFloat(*rays, "volumetric_anisotropy", sky.volumetricAnisotropy), 0.0f, 0.95f);
+        sky.volumetricDistance = std::clamp(ReadFloat(*rays, "volumetric_distance", sky.volumetricDistance), 5.0f, 200.0f);
+        sky.volumetricQuality = std::clamp(static_cast<std::int32_t>(ReadU32(*rays, "volumetric_quality", 1u)), 0, 2);
     }
     return sky;
 }

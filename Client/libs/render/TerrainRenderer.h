@@ -177,6 +177,16 @@ public:
     void RenderSunShadowMap(ixrhi::IXRHICommandList& cmd,
                             const ixrhi::IXRHIFrameInfo& frame,
                             const WorldCamera& camera);
+    // The sun shadow cascades for other passes (volumetric light): the D32 array (one layer per
+    // cascade, shader-readable) when RenderSunShadowMap drew it in the frame `frameNumber`, else null.
+    std::shared_ptr<ixrhi::IXRHITexture> SunShadowTexture(std::uint64_t frameNumber) const
+    {
+        return m_shadowDrawnFrame == frameNumber ? m_shadowTexture : nullptr;
+    }
+    // Light view-projection per cascade (row vectors), as drawn; finest first.
+    const WorldMat4* SunShadowCascadeViewProj() const { return m_shadowCascadeViewProj.data(); }
+    static constexpr std::uint32_t SunShadowCascadeCount() { return kShadowCascadeCount; }
+    static constexpr float kSunShadowDepthBias = 0.0015f;
     void ResetFrameDrawStats() { m_frameDrawStats = {}; }
     FrameDrawStats GetFrameDrawStats() const { return m_frameDrawStats; }
     void ToggleWalkabilityDebug();
@@ -530,6 +540,7 @@ private:
     std::array<std::unique_ptr<ixrhi::IXRHIRenderTarget>, kShadowCascadeCount> m_shadowTargets{};
     std::unique_ptr<ixrhi::IXRHIGraphicsPipeline> m_shadowPipeline;
     std::array<WorldMat4, kShadowCascadeCount> m_shadowCascadeViewProj{};
+    std::uint64_t m_shadowDrawnFrame = ~0ull;  // frame number of the last RenderSunShadowMap draw
     float m_shadowCascadeSplits[kShadowCascadeCount] = {5.0f, 15.0f, 50.0f, 200.0f};
     Texture m_baseTexture;
     Texture m_normalTexture;
