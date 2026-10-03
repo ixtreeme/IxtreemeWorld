@@ -408,9 +408,14 @@ std::shared_ptr<ixrhi::IXRHITexture> IXVulkanDevice::CreateTexture(
         : desc.arrayLayers > 1 ? VK_IMAGE_VIEW_TYPE_2D_ARRAY
                                : VK_IMAGE_VIEW_TYPE_2D;
     view.format = format;
-    view.subresourceRange.aspectMask = isDepth
-        ? (ToVkAspectMask(desc.format))
-        : VK_IMAGE_ASPECT_COLOR_BIT;
+    // A depth/stencil texture that is only sampled (never an attachment, e.g. a scene depth snapshot)
+    // gets a depth-only view: a sampled view must name a single aspect, and one with both returned
+    // zero depth (D24S8 scene depth read as 0 by the water and god rays).
+    const bool depthAttachment = (static_cast<std::uint32_t>(desc.usage) &
+        static_cast<std::uint32_t>(ixrhi::IXRHITextureUsage::DepthStencilAttachment)) != 0;
+    view.subresourceRange.aspectMask = !isDepth ? VK_IMAGE_ASPECT_COLOR_BIT
+        : depthAttachment ? ToVkAspectMask(desc.format)
+                          : VK_IMAGE_ASPECT_DEPTH_BIT;
     view.subresourceRange.levelCount = desc.mipLevels;
     view.subresourceRange.layerCount = desc.arrayLayers;
     VkImageView imageView = VK_NULL_HANDLE;
