@@ -3737,7 +3737,11 @@ int RunGame(NativeWindow& window,
     // completes it through the refresher below. Kept across frames to reuse its buffers.
     SceneData frameSceneSnapshot;
     SceneManager::Instance().SetSnapshotRefresher([&]() {
-        if (!terrainOk || !runtimeSession->IsInWorld())
+        // Exactly the per-frame snapshot's condition: whenever that one ran (it leaves the terrain
+        // grids out), a save must get the full one. It used to skip itself out of the world too (map
+        // editor closed with F4 / F2) while the per-frame snapshot kept running — the save then
+        // wrote the grid-less terrain as a flat one.
+        if (!terrainOk)
             return;  // the per-frame snapshot does not run either: the scene data is the loaded one
         sceneRuntime.BuildSceneSnapshot(frameSceneSnapshot);
         SceneManager::Instance().SetCurrentSceneSnapshot(frameSceneSnapshot);

@@ -2421,20 +2421,39 @@ bool SceneManager::SaveSceneInternal(const std::string& path)
             TraceError("[SCENE] invalid terrain height grid: %s", path.c_str());
             return false;
         }
-        // An intentionally new flat terrain may omit its all-zero height grid.
-        if (scene.terrain.heightCmGrid.empty())
-            scene.terrain.heightCmGrid.assign(static_cast<size_t>(expectedHeightCount), 0.0f);
-        if (!WriteTerrainChunkSet(scenePath, scene.terrain, scene.paletteSlots))
-        {
-            TraceError("[SCENE] terrain chunk save failed: %s", path.c_str());
-            return false;
-        }
         std::filesystem::path exactFilename = scenePath.stem();
         exactFilename += "_terrain_exact.height";
-        if (!WriteTerrainHeightmap(scenePath.parent_path() / exactFilename, scene.terrain))
+        std::error_code existsEc;
+        const bool terrainOnDisk = std::filesystem::exists(scenePath.parent_path() / exactFilename, existsEc);
+        if (scene.terrain.heightCmGrid.empty() && terrainOnDisk)
         {
-            TraceError("[SCENE] exact terrain height save failed: %s", path.c_str());
-            return false;
+            // No heights in the data to save (a snapshot taken without the terrain grids) while this
+            // scene already has its terrain on disk: never overwrite that with a flat terrain — keep
+            // the terrain files as they are and save the rest of the scene.
+            TraceError("[SCENE] terrain heights missing from the save data; the terrain files on disk are kept unchanged: %s",
+                path.c_str());
+            std::filesystem::path manifest = scenePath.stem();
+            manifest += "_terrain_map";
+            scene.terrain.chunkManifestRef = GenericPath(manifest / "map.manifest");
+            scene.terrain.heightmapRef.clear();
+            scene.terrain.splatRef.clear();
+            scene.terrain.maskRef.clear();
+        }
+        else
+        {
+            // A scene saved for the first time with a new flat terrain may omit its all-zero grid.
+            if (scene.terrain.heightCmGrid.empty())
+                scene.terrain.heightCmGrid.assign(static_cast<size_t>(expectedHeightCount), 0.0f);
+            if (!WriteTerrainChunkSet(scenePath, scene.terrain, scene.paletteSlots))
+            {
+                TraceError("[SCENE] terrain chunk save failed: %s", path.c_str());
+                return false;
+            }
+            if (!WriteTerrainHeightmap(scenePath.parent_path() / exactFilename, scene.terrain))
+            {
+                TraceError("[SCENE] exact terrain height save failed: %s", path.c_str());
+                return false;
+            }
         }
         scene.terrain.exactHeightmapRef = GenericPath(exactFilename);
         Tracenf("[SCENE] terrain saved: dims=%.2fx%.2f m cellSize=%.2f cells=%ux%u chunkSize=%u manifest=%s triplanar=%s sharpness=%.2f slopeThreshold=%.3f transition=%.3f",
