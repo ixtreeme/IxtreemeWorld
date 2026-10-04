@@ -11104,12 +11104,6 @@ int RunGame(NativeWindow& window,
                     std::array<WorldVec3, 8> corners{};
                 };
                 std::vector<StaticShadowCaster> staticShadowCasters;
-                std::uint64_t castersRevision = 1469598103934665603ull;  // FNV-1a over the casters
-                auto hashCaster = [&castersRevision](const void* data, std::size_t size) {
-                    const auto* bytes = static_cast<const unsigned char*>(data);
-                    for (std::size_t i = 0; i < size; ++i)
-                        castersRevision = (castersRevision ^ bytes[i]) * 1099511628211ull;
-                };
                 if (runtimeSession->IsMapEditorOpen())
                 {
                     for (const MeshSceneEntity& mesh : editorMeshEntities)
@@ -11131,11 +11125,6 @@ int RunGame(NativeWindow& window,
                         caster.instance.materialSlots = mesh.materialSlots;
                         caster.instance.materialOverrides = mesh.materialOverrides;
                         caster.corners = SpatialAabbCorners(StaticMeshWorldAabb(mesh, *renderer));
-                        hashCaster(&caster.renderer, sizeof(caster.renderer));
-                        hashCaster(&mesh.id, sizeof(mesh.id));
-                        hashCaster(mesh.position, sizeof(mesh.position));
-                        hashCaster(mesh.rotation, sizeof(mesh.rotation));
-                        hashCaster(mesh.scale, sizeof(mesh.scale));
                     }
                 }
                 std::vector<const SkinnedDrawRecord*> skinnedShadowCasters;
@@ -11147,10 +11136,6 @@ int RunGame(NativeWindow& window,
                             skinnedShadowCasters.push_back(&record);
                     }
                 }
-                // Skinned casters animate: their shadows are drawn again every frame.
-                if (!skinnedShadowCasters.empty())
-                    hashCaster(&frameInfo.frameNumber, sizeof(frameInfo.frameNumber));
-
                 // Whether a box lies wholly off one side of a cascade (orthographic: x and y only; a
                 // caster sun-wards of its depth range still shades it).
                 auto outsideCascadeFootprint = [](const WorldMat4& lightViewProj, const std::array<WorldVec3, 8>& corners) {
@@ -11170,8 +11155,58 @@ int RunGame(NativeWindow& window,
                     }
                     return left || right || bottom || top;
                 };
+                // Whether a skinned caster's shadow can reach the camera distances a cascade serves: its
+                // distance plus its size and the length of its shadow on the ground (by the sun's
+                // elevation). Characters near the camera stay out of the far cascades, so those keep what
+                // they hold while the characters animate. (Never left out of a finer cascade: the meshes
+                // and the volumetric light take the finest cascade holding a point, which reaches past
+                // its radius along the sunlight.)
+                const float sunElevation =
+                    xm::DegreesToRadians(std::clamp(frameLighting.directional.elevationDegrees, 3.0f, 90.0f));
+                auto skinnedInCascade = [&](const SkinnedDrawRecord& record, std::uint32_t cascade) {
+                    const float scale = std::max({std::abs(record.scale[0]), std::abs(record.scale[1]), std::abs(record.scale[2])});
+                    const float size = record.renderer->LocalExtent() * scale;
+                    const float reach = size * (1.0f + 1.0f / std::tan(sunElevation));
+                    const float dx = record.position.x - shadowCamera->eye.x;
+                    const float dy = record.position.y - shadowCamera->eye.y;
+                    const float dz = record.position.z - shadowCamera->eye.z;
+                    const float distance = std::sqrt(dx * dx + dy * dy + dz * dz);
+                    float nearest = 0.0f;
+                    float farthest = 0.0f;
+                    TerrainRenderer::SunShadowCascadeServes(cascade, nearest, farthest);
+                    return distance + reach >= nearest;
+                };
+                // Per cascade, a hash of what is drawn into it (the static meshes over its footprint, the
+                // skinned ones whose shadow reaches it, animated: every frame); an unchanged cascade is kept.
+                terrain.UpdateSunShadowCascades(*shadowCamera);
+                const WorldMat4* cascadeViewProj = terrain.SunShadowCascadeViewProj();
+                TerrainRenderer::CascadeRevisions castersRevisions{};
+                for (std::uint32_t cascade = 0; cascade < castersRevisions.size(); ++cascade)
+                {
+                    std::uint64_t revision = 1469598103934665603ull;  // FNV-1a
+                    auto hash = [&revision](const void* data, std::size_t size) {
+                        const auto* bytes = static_cast<const unsigned char*>(data);
+                        for (std::size_t i = 0; i < size; ++i)
+                            revision = (revision ^ bytes[i]) * 1099511628211ull;
+                    };
+                    for (const StaticShadowCaster& caster : staticShadowCasters)
+                    {
+                        if (outsideCascadeFootprint(cascadeViewProj[cascade], caster.corners))
+                            continue;
+                        hash(&caster.renderer, sizeof(caster.renderer));
+                        hash(&caster.instance.entityId, sizeof(caster.instance.entityId));
+                        hash(&caster.instance.position, sizeof(caster.instance.position));
+                        hash(caster.instance.rotation, sizeof(caster.instance.rotation));
+                        hash(caster.instance.scale, sizeof(caster.instance.scale));
+                    }
+                    const bool skinnedHere = std::any_of(skinnedShadowCasters.begin(), skinnedShadowCasters.end(),
+                        [&](const SkinnedDrawRecord* record) { return skinnedInCascade(*record, cascade); });
+                    if (skinnedHere)
+                        hash(&frameInfo.frameNumber, sizeof(frameInfo.frameNumber));
+                    castersRevisions[cascade] = revision;
+                }
                 const TerrainRenderer::ShadowCasterDraw drawMeshCasters =
-                    [&](std::uint32_t, const WorldMat4& lightViewProj, const ixrhi::IXRHIRenderPass* pass) {
+                    [&](std::uint32_t cascade, const WorldMat4& lightViewProj, const ixrhi::IXRHIRenderPass* pass) {
                         std::unordered_map<StaticMeshRenderer*, std::vector<StaticMeshRenderer::Instance>> batches;
                         for (const StaticShadowCaster& caster : staticShadowCasters)
                         {
@@ -11182,13 +11217,15 @@ int RunGame(NativeWindow& window,
                             renderer->RenderShadowCasters(*frameInfo.commandList, frameInfo, lightViewProj, instances, pass);
                         for (const SkinnedDrawRecord* record : skinnedShadowCasters)
                         {
+                            if (!skinnedInCascade(*record, cascade))
+                                continue;
                             record->renderer->RenderShadowCaster(*frameInfo.commandList, frameInfo, lightViewProj, pass,
                                 record->position, record->yaw, record->slot, record->scale);
                         }
                     };
                 const bool anyMeshCasters = !staticShadowCasters.empty() || !skinnedShadowCasters.empty();
                 rhiDevice->WriteTimestamp(ixrhi::IXRHITimestampPoint::ShadowPassBegin);
-                terrain.RenderSunShadowMap(*frameInfo.commandList, frameInfo, *shadowCamera, castersRevision,
+                terrain.RenderSunShadowMap(*frameInfo.commandList, frameInfo, *shadowCamera, castersRevisions,
                     anyMeshCasters ? drawMeshCasters : TerrainRenderer::ShadowCasterDraw{});
                 rhiDevice->WriteTimestamp(ixrhi::IXRHITimestampPoint::ShadowPassEnd);
             }

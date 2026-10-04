@@ -90,6 +90,12 @@ public:
     const ozz::animation::Skeleton* Skeleton() const;
     ozz::span<const ozz::math::SoaTransform> RestPoseLocals() const;
     std::uint32_t NumJoints() const;
+    // The model's largest bounding-box side in its own units (before the entity's scale).
+    float LocalExtent() const
+    {
+        return std::max({m_bounds.max[0] - m_bounds.min[0], m_bounds.max[1] - m_bounds.min[1],
+            m_bounds.max[2] - m_bounds.min[2]});
+    }
     std::uint32_t NumSoaJoints() const;
     // Ordered joint names of the loaded skeleton (empty if none) — the retarget key for clips.
     std::vector<std::string> JointNames() const;

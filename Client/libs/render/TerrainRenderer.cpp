@@ -1907,22 +1907,44 @@ void TerrainRenderer::SetWaterRefractionInputs(std::shared_ptr<ixrhi::IXRHITextu
     UpdateWaterBindGroup();
 }
 
+namespace
+{
+// The cascade split distances from the camera: index 0 the near plane, i the radius of cascade i - 1.
+float ShadowCascadeSplit(std::uint32_t index, std::uint32_t cascadeCount)
+{
+    constexpr float nearPlane = 0.1f;
+    constexpr float farPlane = 200.0f;
+    constexpr float lambda = 0.7f;
+    if (index == 0)
+        return nearPlane;
+    if (index >= cascadeCount)
+        return farPlane;
+    const float p = static_cast<float>(index) / static_cast<float>(cascadeCount);
+    const float logSplit = nearPlane * xm::Pow(farPlane / nearPlane, p);
+    const float uniformSplit = nearPlane + (farPlane - nearPlane) * p;
+    return uniformSplit * (1.0f - lambda) + logSplit * lambda;
+}
+} // namespace
+
+void TerrainRenderer::SunShadowCascadeServes(std::uint32_t cascade, float& nearest, float& farthest)
+{
+    // As Terrain.hlsl SampleShadowBlended: cascade c - 1 blends into c over its last tenth.
+    farthest = ShadowCascadeSplit(cascade + 1, kShadowCascadeCount);
+    if (cascade == 0)
+    {
+        nearest = 0.0f;
+        return;
+    }
+    const float previousRadius = ShadowCascadeSplit(cascade, kShadowCascadeCount);
+    const float previousInner = cascade == 1 ? 0.0f : ShadowCascadeSplit(cascade - 1, kShadowCascadeCount);
+    nearest = previousRadius - 0.1f * (previousRadius - previousInner);
+}
+
 void TerrainRenderer::UpdateShadowCascades(const WorldCamera& camera)
 {
-    const float nearPlane = 0.1f;
-    const float farPlane = 200.0f;
-    constexpr float lambda = 0.7f;
-
     float splitPlanes[kShadowCascadeCount + 1]{};
-    splitPlanes[0] = nearPlane;
-    for (uint32_t i = 1; i < kShadowCascadeCount; ++i)
-    {
-        const float p = static_cast<float>(i) / static_cast<float>(kShadowCascadeCount);
-        const float logSplit = nearPlane * xm::Pow(farPlane / nearPlane, p);
-        const float uniformSplit = nearPlane + (farPlane - nearPlane) * p;
-        splitPlanes[i] = uniformSplit * (1.0f - lambda) + logSplit * lambda;
-    }
-    splitPlanes[kShadowCascadeCount] = farPlane;
+    for (uint32_t i = 0; i <= kShadowCascadeCount; ++i)
+        splitPlanes[i] = ShadowCascadeSplit(i, kShadowCascadeCount);
 
     const DirectionalLight& sun = m_lightingState.directional;
     const float azimuthRadians = xm::DegreesToRadians(std::clamp(sun.azimuthDegrees, 0.0f, 360.0f));
@@ -1950,11 +1972,14 @@ void TerrainRenderer::UpdateShadowCascades(const WorldCamera& camera)
         const float texelSize = 2.0f * halfSize / static_cast<float>(kShadowResolution);
         const float centerX = std::floor(eye.x / texelSize) * texelSize;
         const float centerY = std::floor(eye.y / texelSize) * texelSize;
+        // The depth range moves in whole metres too (well inside the padding), so a cascade stays
+        // exactly the same while the camera moves less than a texel and can be kept.
+        const float centerZ = std::floor(eye.z);
         constexpr float depthPadding = 80.0f;
         const WorldMat4 lightProj = WorldOrthographicOffCenter(
             centerX - halfSize, centerX + halfSize,
             centerY - halfSize, centerY + halfSize,
-            eye.z - radius - depthPadding, eye.z + radius + depthPadding);
+            centerZ - radius - depthPadding, centerZ + radius + depthPadding);
         m_shadowCascadeViewProj[cascade] = WorldMultiply(lightView, lightProj);
         m_shadowCascadeSplits[cascade] = radius;
         // In metres: what one unit of the cascade's depth spans, and one texel of its map.
@@ -2080,44 +2105,58 @@ SunShadowReceive TerrainRenderer::SunShadowForMeshes(std::uint64_t frameNumber) 
 void TerrainRenderer::RenderSunShadowMap(ixrhi::IXRHICommandList& cmd,
                                           const ixrhi::IXRHIFrameInfo& frame,
                                           const WorldCamera& camera,
-                                          std::uint64_t castersRevision,
+                                          const CascadeRevisions& castersRevisions,
                                           const ShadowCasterDraw& drawCasters)
 {
     // The terrain casts when there is one; the meshes (drawCasters) cast with or without it.
     const bool drawTerrain = m_sceneTerrainActive && !m_sceneTerrain.editorHidden && m_vertexBuffer &&
         m_indexBuffer && m_indexCount > 0;
     if (!m_lightingState.sunShadowsEnabled || !m_shadowPipeline || !m_shadowTexture || !frame.frameActive ||
-        (!drawTerrain && !drawCasters))
+        !m_shadowMapReadable || (!drawTerrain && !drawCasters))
     {
         for (PassDrawStats& cascadeStats : m_frameDrawStats.shadowCascades)
             cascadeStats.skipped = true;
-        m_shadowMapInputs.reset();
+        for (std::optional<ShadowCascadeInputs>& inputs : m_shadowCascadeInputs)
+            inputs.reset();
         return;
     }
 
-    const DirectionalLight& sun = m_lightingState.directional;
-    const ShadowMapInputs inputs{
-        {camera.eye.x, camera.eye.y, camera.eye.z},
-        sun.azimuthDegrees,
-        sun.elevationDegrees,
-        drawTerrain ? m_vertexBuffer.get() : nullptr,
-        drawTerrain ? m_indexBuffer.get() : nullptr,
-        m_shadowTexture.get(),
-        drawTerrain ? m_indexCount : 0u,
-        m_terrainGeometryRevision,
-        castersRevision};
-    if (m_shadowMapInputs && *m_shadowMapInputs == inputs)
+    UpdateShadowCascades(camera);
+
+    // Only the cascades whose contents may have changed are drawn; the others are kept as they are.
+    std::array<bool, kShadowCascadeCount> redraw{};
+    bool anyRedraw = false;
+    for (uint32_t cascade = 0; cascade < kShadowCascadeCount; ++cascade)
     {
-        // Same camera, sun, terrain and casters as the map already holds (and still shader-readable):
-        // reuse it.
-        for (PassDrawStats& cascadeStats : m_frameDrawStats.shadowCascades)
-            cascadeStats.skipped = true;
+        ShadowCascadeInputs inputs;
+        std::memcpy(inputs.viewProj.data(), m_shadowCascadeViewProj[cascade].m, sizeof(inputs.viewProj));
+        inputs.vertexBuffer = drawTerrain ? m_vertexBuffer.get() : nullptr;
+        inputs.indexBuffer = drawTerrain ? m_indexBuffer.get() : nullptr;
+        inputs.shadowTexture = m_shadowTexture.get();
+        inputs.indexCount = drawTerrain ? m_indexCount : 0u;
+        inputs.geometryRevision = m_terrainGeometryRevision;
+        inputs.castersRevision = cascade < castersRevisions.size() ? castersRevisions[cascade] : 0u;
+        redraw[cascade] = !m_shadowCascadeInputs[cascade] || !(*m_shadowCascadeInputs[cascade] == inputs);
+        if (redraw[cascade])
+        {
+            m_shadowCascadeInputs[cascade] = inputs;
+            anyRedraw = true;
+        }
+        else
+        {
+            m_frameDrawStats.shadowCascades[cascade].skipped = true;
+        }
+    }
+    if (!anyRedraw)
+    {
         m_shadowDrawnFrame = frame.frameNumber;
         return;
     }
-    m_shadowMapInputs = inputs;
-
-    UpdateShadowCascades(camera);
+    // The kept layers must keep their depth: the whole array goes back to an attachment from the
+    // readable layout (contents kept), and each redrawn layer clears in its own pass.
+    cmd.TransitionTexture(*m_shadowTexture,
+        ixrhi::IXRHIImageLayout::ShaderReadOnly,
+        ixrhi::IXRHIImageLayout::DepthStencilAttachment);
 
     if (m_sceneTerrain.triplanarEnabled && !m_triPerfShadowPassLogged)
     {
@@ -2130,6 +2169,8 @@ void TerrainRenderer::RenderSunShadowMap(ixrhi::IXRHICommandList& cmd,
 
     for (uint32_t cascade = 0; cascade < kShadowCascadeCount; ++cascade)
     {
+        if (!redraw[cascade])
+            continue;
         // Cascade timestamp pairs are sequential in IXRHITimestampPoint
         // (CascadeNBegin + 1 == CascadeNEnd); routed through the backend so
         // the legacy timestamp API could be deleted (Phase 3C).
@@ -2206,9 +2247,8 @@ void TerrainRenderer::RenderSunShadowMap(ixrhi::IXRHICommandList& cmd,
             m_rhi->WriteTimestamp(cascadeEnd);
     }
 
-    // Depth-attachment -> sampled transition for the terrain main pass
-    // (binding 9). The next shadow render re-opens the targets with
-    // Clear (UNDEFINED initial), so no transition back is needed.
+    // Depth-attachment -> sampled transition (all layers, drawn or kept) for the terrain main pass
+    // (binding 9), the meshes and the volumetric light.
     cmd.TransitionTexture(*m_shadowTexture,
         ixrhi::IXRHIImageLayout::DepthStencilAttachment,
         ixrhi::IXRHIImageLayout::ShaderReadOnly);

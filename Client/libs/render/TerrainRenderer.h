@@ -186,17 +186,26 @@ public:
     // frame outside any render pass, before the terrain is drawn.
     void UploadEditedTerrain(ixrhi::IXRHICommandList& cmd, const ixrhi::IXRHIFrameInfo& frame);
     // Draws the sun shadow cascades: the terrain (if any), then in each cascade whatever drawCasters
-    // adds (the meshes), given the cascade, its light view-projection and its render pass.
-    // castersRevision changes whenever those casters do (moved, animated): while it, the camera,
-    // the sun and the terrain stay the same, the map already drawn is reused.
+    // adds (the meshes), given the cascade, its light view-projection and its render pass. A cascade
+    // is drawn again only when what it holds may have changed: its placement (the camera moved past
+    // one of its texels, the sun turned), the terrain, or its castersRevisions entry, which changes
+    // whenever the casters drawn into it do (moved, animated). The others keep what they hold.
     using ShadowCasterDraw = std::function<void(std::uint32_t cascade,
                                                 const WorldMat4& lightViewProj,
                                                 const ixrhi::IXRHIRenderPass* pass)>;
+    using CascadeRevisions = std::array<std::uint64_t, SunShadowReceive::kCascades>;
     void RenderSunShadowMap(ixrhi::IXRHICommandList& cmd,
                             const ixrhi::IXRHIFrameInfo& frame,
                             const WorldCamera& camera,
-                            std::uint64_t castersRevision = 0,
+                            const CascadeRevisions& castersRevisions = {},
                             const ShadowCasterDraw& drawCasters = {});
+    // Places the cascades around the camera (RenderSunShadowMap does it too): call it first to know
+    // what each cascade will cover (SunShadowCascadeViewProj).
+    void UpdateSunShadowCascades(const WorldCamera& camera) { UpdateShadowCascades(camera); }
+    // The camera distances whose surfaces sample a cascade (the terrain picks one by distance and
+    // blends into the next over the last tenth of each range): a caster whose shadow cannot land
+    // between them need not be drawn into it.
+    static void SunShadowCascadeServes(std::uint32_t cascade, float& nearest, float& farthest);
     // Clears the cascades once (all lit) so the map is shader-readable before anything draws into
     // it; the terrain and mesh draws bind it either way. Call outside render passes.
     void EnsureSunShadowMapReadable(ixrhi::IXRHICommandList& cmd);
@@ -577,22 +586,21 @@ private:
     bool m_shadowMapReadable = false;           // cleared or drawn at least once: shader-readable
     std::array<float, kShadowCascadeCount> m_shadowCascadeDepthRange{};  // metres per depth unit
     std::array<float, kShadowCascadeCount> m_shadowCascadeTexelSize{};   // metres per texel
-    // What the shadow map was last drawn from. While it stays the same (an editor camera at rest)
-    // the map is reused instead of drawn again: only the terrain casts into it.
-    struct ShadowMapInputs
+    // What each cascade was last drawn from. While it stays the same the cascade is kept instead of
+    // drawn again (its light view-projection covers the camera and the sun: a camera turning in
+    // place, or moving less than a texel, keeps it).
+    struct ShadowCascadeInputs
     {
-        float eye[3] = {};  // the cascades are balls around the eye: turning the camera keeps them
-        float sunAzimuth = 0.0f;
-        float sunElevation = 0.0f;
+        std::array<float, 16> viewProj{};
         const void* vertexBuffer = nullptr;
         const void* indexBuffer = nullptr;
         const void* shadowTexture = nullptr;
         std::uint32_t indexCount = 0;
         std::uint64_t geometryRevision = 0;
         std::uint64_t castersRevision = 0;
-        bool operator==(const ShadowMapInputs&) const = default;
+        bool operator==(const ShadowCascadeInputs&) const = default;
     };
-    std::optional<ShadowMapInputs> m_shadowMapInputs;
+    std::array<std::optional<ShadowCascadeInputs>, kShadowCascadeCount> m_shadowCascadeInputs;
     std::uint64_t m_terrainGeometryRevision = 0;  // bumped by every vertex upload (sculpting)
     float m_shadowCascadeSplits[kShadowCascadeCount] = {5.0f, 15.0f, 50.0f, 200.0f};
     Texture m_baseTexture;
