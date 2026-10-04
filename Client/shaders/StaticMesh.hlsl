@@ -34,6 +34,10 @@ struct SpotLightUbo
     float2 u_lightPadding;
     PointLightUbo u_pointLights[16];
     SpotLightUbo u_spotLights[16];
+    float4x4 u_shadowCascadeViewProj[4];
+    float4 u_shadowParams;
+    float4 u_shadowDepthBias;
+    float4 u_shadowNormalOffset;
 };
 
 [[vk::combinedImageSampler]] [[vk::binding(1, 0)]] Texture2D u_diffuse : register(t0);
@@ -56,6 +60,11 @@ struct StaticMeshInstanceData
 };
 
 [[vk::binding(4, 0)]] StructuredBuffer<StaticMeshInstanceData> u_instances : register(t3);
+
+[[vk::combinedImageSampler]] [[vk::binding(5, 0)]] Texture2DArray<float> u_sunShadowMap : register(t4);
+[[vk::combinedImageSampler]] [[vk::binding(5, 0)]] SamplerComparisonState u_sunShadowSampler : register(s4);
+
+#include "SunShadow.hlsli"
 
 struct VSInput
 {
@@ -97,7 +106,20 @@ VSOutput VSMain(VSInput input, uint instanceId : SV_InstanceID)
     output.materialParams = instance.materialParams;
     output.materialEmissive = instance.materialEmissive;
     output.materialAlpha = instance.materialAlpha;
+#if defined(STATIC_MESH_SHADOW)
+    // Into a sun shadow cascade (mvp = model x light view-projection, orthographic): a caster
+    // between the sun and the cascade's depth range is flattened onto its near plane, not clipped.
+    output.position.z = max(output.position.z, 0.0);
+#endif
     return output;
+}
+
+// The sun shadow pass of alpha-tested (mask) materials: their cut-out parts cast no shadow.
+void ShadowMaskPS(VSOutput input)
+{
+    const float alpha = u_diffuse.Sample(u_sampler, input.uv).a * input.materialBaseColor.a * input.tint.a;
+    if (alpha < input.materialAlpha.y)
+        discard;
 }
 
 float SpecularTerm(float3 normal, float3 lightDir, float3 viewDir, float roughness, float metallic)
@@ -157,8 +179,9 @@ float4 PSMain(VSOutput input) : SV_Target0
     const float metallic = saturate(input.materialParams.x * orm.b);
     const float roughness = saturate(input.materialParams.y * max(orm.g, 0.04));
     const float ao = saturate(input.materialParams.w * orm.r);
-    float3 lighting = u_ambientColor.rgb * ao + u_sunColor.rgb * ndotl;
-    float3 specular = u_sunColor.rgb * SpecularTerm(normal, lightDir, viewDir, roughness, metallic);
+    const float sunShadow = SunShadow(input.worldPos, normalize(input.normal));
+    float3 lighting = u_ambientColor.rgb * ao + u_sunColor.rgb * ndotl * sunShadow;
+    float3 specular = u_sunColor.rgb * SpecularTerm(normal, lightDir, viewDir, roughness, metallic) * sunShadow;
 
     [loop]
     for (int p = 0; p < u_numPointLights; ++p)

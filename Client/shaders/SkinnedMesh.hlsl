@@ -28,10 +28,25 @@ struct SpotLightUbo
     float2 u_lightPadding;
     PointLightUbo u_pointLights[16];
     SpotLightUbo u_spotLights[16];
+    float4x4 u_shadowCascadeViewProj[4];
+    float4 u_shadowParams;
+    float4 u_shadowDepthBias;
+    float4 u_shadowNormalOffset;
 };
 
 [[vk::combinedImageSampler]] [[vk::binding(1, 0)]] Texture2D u_diffuse : register(t0);
 [[vk::combinedImageSampler]] [[vk::binding(1, 0)]] SamplerState u_sampler : register(s0);
+[[vk::combinedImageSampler]] [[vk::binding(2, 0)]] Texture2DArray<float> u_sunShadowMap : register(t1);
+[[vk::combinedImageSampler]] [[vk::binding(2, 0)]] SamplerComparisonState u_sunShadowSampler : register(s1);
+
+#include "SunShadow.hlsli"
+
+// The sun shadow pass: the skinned vertices into one cascade (model x light view-projection).
+struct ShadowPush
+{
+    float4x4 mvp;
+};
+[[vk::push_constant]] ShadowPush u_shadowPush;
 
 struct VSInput
 {
@@ -57,6 +72,14 @@ VSOutput VSMain(VSInput input)
     output.uv = input.uv;
     output.worldPos = worldPos.xyz;
     return output;
+}
+
+float4 ShadowVSMain(VSInput input) : SV_Position
+{
+    float4 position = mul(float4(input.position, 1.0), u_shadowPush.mvp);
+    // Orthographic cascade: a caster sun-wards of its depth range is flattened onto the near plane.
+    position.z = max(position.z, 0.0);
+    return position;
 }
 
 float CausticPattern(float2 uv, float time, float mode)
@@ -86,7 +109,7 @@ float4 PSMain(VSOutput input) : SV_Target0
     float ndotl = saturate(dot(normal, lightDir));
     float3 baseColor = float3(0.62, 0.66, 0.70);
     float3 texColor = u_diffuse.Sample(u_sampler, input.uv).rgb;
-    float3 lighting = u_ambientColor.rgb + u_sunColor.rgb * ndotl;
+    float3 lighting = u_ambientColor.rgb + u_sunColor.rgb * ndotl * SunShadow(input.worldPos, normal);
     [loop]
     for (int p = 0; p < u_numPointLights; ++p)
     {

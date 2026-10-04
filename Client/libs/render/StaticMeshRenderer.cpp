@@ -90,6 +90,10 @@ struct UniformBlock
     float lightPadding[2] = {0.0f, 0.0f};
     PointLightUniform pointLights[kMaxDynamicPointLights]{};
     SpotLightUniform spotLights[kMaxDynamicSpotLights]{};
+    float shadowCascadeViewProj[SunShadowReceive::kCascades][16]{};
+    float shadowParams[4] = {0.0f, 0.0f, 0.0f, 0.0f};
+    float shadowDepthBias[4] = {0.0f, 0.0f, 0.0f, 0.0f};
+    float shadowNormalOffset[4] = {0.0f, 0.0f, 0.0f, 0.0f};
 };
 
 struct InstancedDrawCommand
@@ -2605,6 +2609,7 @@ bool StaticMeshRenderer::CreateBindGroup(ixrhi::IXRHIDevice& rhi)
         {2, ixrhi::IXRHIBindingType::SampledTexture, ixrhi::IXRHIShaderStage::Fragment},
         {3, ixrhi::IXRHIBindingType::SampledTexture, ixrhi::IXRHIShaderStage::Fragment},
         {4, ixrhi::IXRHIBindingType::StorageBuffer, allStages},
+        {5, ixrhi::IXRHIBindingType::SampledTexture, ixrhi::IXRHIShaderStage::Fragment},  // sun shadow cascades
     };
     m_bindLayout = rhi.CreateBindGroupLayout(bindings);
     if (!m_bindLayout)
@@ -2635,10 +2640,26 @@ bool StaticMeshRenderer::CreateBindGroup(ixrhi::IXRHIDevice& rhi)
                 {m_normalTexture.image.get(), m_normalTexture.sampler.get()},
                 {m_ormTexture.image.get(), m_ormTexture.sampler.get()}}};
             m_bindGroup->UpdateBuffer(slot, 4, m_instanceBuffers[frame], 0, instanceBytes);
+            if (m_sunShadow.texture && m_sunShadow.sampler)
+                m_bindGroup->UpdateTexture(slot, 5, m_sunShadow.texture, m_sunShadow.sampler);
         }
     }
+    m_boundSunShadowTexture = m_sunShadow.sampler ? m_sunShadow.texture.get() : nullptr;
     return true;
 }
+
+void StaticMeshRenderer::SetSunShadow(const SunShadowReceive& shadow)
+{
+    m_sunShadow = shadow;
+    if (!m_bindGroup || !shadow.texture || !shadow.sampler || shadow.texture.get() == m_boundSunShadowTexture)
+        return;
+    // A new map (first one, or recreated): every set's binding 5. Not while a frame may still use
+    // the sets: the map is set up front and changes only with the device's resources.
+    for (uint32_t slot = 0; slot < kFramesInFlight * kUniformSlots; ++slot)
+        m_bindGroup->UpdateTexture(slot, 5, shadow.texture, shadow.sampler);
+    m_boundSunShadowTexture = shadow.texture.get();
+}
+
 void StaticMeshRenderer::UpdateInstanceDescriptorSets(uint32_t frameIndex)
 {
     if (!m_bindGroup || frameIndex >= kFramesInFlight || !m_instanceBuffers[frameIndex])
@@ -2820,6 +2841,17 @@ void StaticMeshRenderer::RenderLodBatchInWorld(ixrhi::IXRHICommandList& cmd,
     if (!m_pipeline || !m_unlitPipeline || !m_bindGroup || m_indices.empty() || instances.empty() ||
         !frame.frameActive)
         return;
+    if (!m_boundSunShadowTexture)
+    {
+        // Every lit draw samples the sun shadow map: without one bound the descriptors are incomplete.
+        static bool loggedNoShadowMap = false;
+        if (!loggedNoShadowMap)
+        {
+            LogFormat("[MESH] static mesh draws skipped: no sun shadow map set (SetSunShadow) model=%s", m_modelPath.c_str());
+            loggedNoShadowMap = true;
+        }
+        return;
+    }
     const std::uint32_t extentWidth = targetWidth > 0 ? targetWidth : frame.targetWidth;
     const std::uint32_t extentHeight = targetHeight > 0 ? targetHeight : frame.targetHeight;
     if (extentWidth == 0 || extentHeight == 0)
@@ -2938,23 +2970,9 @@ void StaticMeshRenderer::RenderLodBatchInWorld(ixrhi::IXRHICommandList& cmd,
         }
     }
 
-    const std::uint32_t instanceCount = static_cast<std::uint32_t>(instanceBlocks.size());
-    if (instanceBlocks.empty() || !EnsureInstanceCapacity(*m_rhi, frameIndex, instanceBase + instanceCount))
+    if (!AppendInstanceBlocks(frameIndex, instanceBlocks))
         return;
-    const std::size_t blockBytes = sizeof(InstanceBlock);
-    m_lastInstanceBufferBytes = instanceCount * blockBytes;
-    // Append at the per-frame cursor offset (not offset 0) so multiple calls to this
-    // renderer in one frame don't clobber each other's instance transforms.
-    m_instanceBuffers[frameIndex]->Write(static_cast<std::uint64_t>(instanceBase) * blockBytes,
-        instanceBlocks.data(),
-        m_lastInstanceBufferBytes);
-    // Mirror the same bytes for growth preservation (no GPU readback).
-    if (m_instanceMirror[frameIndex].size() < static_cast<std::size_t>(instanceBase) + instanceCount)
-        m_instanceMirror[frameIndex].resize(static_cast<std::size_t>(instanceBase) + instanceCount);
-    std::memcpy(m_instanceMirror[frameIndex].data() + instanceBase,
-        instanceBlocks.data(),
-        m_lastInstanceBufferBytes);
-    m_worldInstanceCursor = instanceBase + instanceCount;
+    m_lastInstanceBufferBytes = instanceBlocks.size() * sizeof(InstanceBlock);
 
     cmd.SetViewport(0.0f,
         0.0f,
@@ -3274,6 +3292,159 @@ void StaticMeshRenderer::RenderLodBatchInWorld(ixrhi::IXRHICommandList& cmd,
     m_lastSubmittedInstances = static_cast<std::uint32_t>(instances.size());
 }
 
+std::optional<std::uint32_t> StaticMeshRenderer::AppendInstanceBlocks(uint32_t frameIndex,
+    const std::vector<InstanceBlock>& blocks)
+{
+    const std::uint32_t base = m_worldInstanceCursor;
+    const std::uint32_t count = static_cast<std::uint32_t>(blocks.size());
+    if (blocks.empty() || !m_rhi || !EnsureInstanceCapacity(*m_rhi, frameIndex, base + count))
+        return std::nullopt;
+    const std::size_t bytes = blocks.size() * sizeof(InstanceBlock);
+    // Appended at the per-frame cursor (not offset 0): this renderer is drawn several times a frame
+    // (shadow cascades, Scene and Game views) and each draw keeps its records until the GPU reads them.
+    m_instanceBuffers[frameIndex]->Write(static_cast<std::uint64_t>(base) * sizeof(InstanceBlock), blocks.data(), bytes);
+    // Mirror the same bytes for growth preservation (no GPU readback).
+    if (m_instanceMirror[frameIndex].size() < static_cast<std::size_t>(base) + count)
+        m_instanceMirror[frameIndex].resize(static_cast<std::size_t>(base) + count);
+    std::memcpy(m_instanceMirror[frameIndex].data() + base, blocks.data(), bytes);
+    m_worldInstanceCursor = base + count;
+    return base;
+}
+
+bool StaticMeshRenderer::CreateShadowPipelines(ixrhi::IXRHIDevice& rhi, const ixrhi::IXRHIRenderPass* shadowPass)
+{
+    if (!m_assets || !m_bindLayout || !shadowPass)
+        return false;
+    auto vs = LoadShader(rhi, *m_assets, "assets/shaders/static_mesh_shadow_vs.spv",
+        ixrhi::IXRHIShaderStage::Vertex, "VSMain");
+    auto maskPs = LoadShader(rhi, *m_assets, "assets/shaders/static_mesh_shadow_mask_ps.spv",
+        ixrhi::IXRHIShaderStage::Fragment, "ShadowMaskPS");
+    if (!vs || !maskPs)
+        return false;
+
+    // Depth only, like the terrain's cascades: no culling (meshes may be open), a slope-scaled bias.
+    ixrhi::IXRHIGraphicsPipelineDesc desc;
+    desc.vertexShader = vs;
+    desc.fragmentShader = nullptr;
+    desc.bindGroupLayouts = {m_bindLayout.get()};
+    desc.vertexBindings = {{0, sizeof(Vertex)}};
+    desc.vertexAttributes = {
+        {0, 0, ixrhi::IXRHIFormat::R32G32B32Float, offsetof(Vertex, position)},
+        {1, 0, ixrhi::IXRHIFormat::R32G32B32Float, offsetof(Vertex, normal)},
+        {2, 0, ixrhi::IXRHIFormat::R32G32Float, offsetof(Vertex, uv)},
+    };
+    desc.topology = ixrhi::IXRHIPrimitiveTopology::TriangleList;
+    desc.cullMode = ixrhi::IXRHICullMode::None;
+    desc.frontFace = ixrhi::IXRHIFrontFace::Clockwise;
+    desc.depthTestEnable = true;
+    desc.depthWriteEnable = true;
+    desc.depthCompareOp = ixrhi::IXRHICompareOp::LessOrEqual;
+    desc.depthBias.enable = true;
+    desc.depthBias.constantFactor = 1.25f;
+    desc.depthBias.slopeFactor = 1.75f;
+    desc.sampleCount = 1;
+    desc.targetRenderPass = shadowPass;
+    desc.debugName = "StaticMesh:Shadow";
+    m_shadowPipeline = rhi.CreateGraphicsPipeline(desc);
+    desc.fragmentShader = maskPs;
+    desc.debugName = "StaticMesh:ShadowMask";
+    m_shadowMaskPipeline = rhi.CreateGraphicsPipeline(desc);
+    return m_shadowPipeline && m_shadowMaskPipeline;
+}
+
+void StaticMeshRenderer::RenderShadowCasters(ixrhi::IXRHICommandList& cmd,
+    const ixrhi::IXRHIFrameInfo& frame,
+    const WorldMat4& lightViewProj,
+    const std::vector<Instance>& instances,
+    const ixrhi::IXRHIRenderPass* shadowPass)
+{
+    if (!m_rhi || !m_bindGroup || !m_vertexBuffer || !m_indexBuffer || m_indices.empty() || m_draws.empty() ||
+        instances.empty() || !shadowPass || !frame.frameActive || !m_boundSunShadowTexture)
+        return;
+    if (m_shadowPass != shadowPass)
+    {
+        m_shadowPipeline.reset();
+        m_shadowMaskPipeline.reset();
+        m_shadowPipelinesFailed = false;
+        m_shadowPass = shadowPass;
+    }
+    if (!m_shadowPipeline && !m_shadowPipelinesFailed && !CreateShadowPipelines(*m_rhi, shadowPass))
+    {
+        m_shadowPipelinesFailed = true;
+        LogFormat("[MESH] static mesh sun shadow pipelines could not be created model=%s", m_modelPath.c_str());
+    }
+    if (!m_shadowPipeline || !m_shadowMaskPipeline)
+        return;
+
+    const uint32_t frameIndex = frame.frameIndex % kFramesInFlight;
+    if (m_worldRenderFrameIndex != frameIndex)
+    {
+        m_worldRenderFrameIndex = frameIndex;
+        m_worldUniformCursor = 0;
+        m_worldInstanceCursor = 0;
+    }
+
+    // One record per draw (submesh) and instance, its mvp = model x the cascade's light
+    // view-projection; its material says whether it is alpha-masked.
+    WorldCamera lightCamera{};
+    lightCamera.viewProjection = lightViewProj;
+    std::vector<InstanceBlock> blocks;
+    blocks.reserve(m_draws.size() * instances.size());
+    for (const MeshDraw& draw : m_draws)
+    {
+        for (const Instance& instance : instances)
+        {
+            InstanceBlock& block = blocks.emplace_back();
+            FillStaticMeshInstanceBlock(lightCamera, instance, draw.materialSlot, m_materialDefaults, block);
+        }
+    }
+    const std::optional<std::uint32_t> base = AppendInstanceBlocks(frameIndex, blocks);
+    if (!base)
+        return;
+
+    cmd.SetVertexBuffer(0, *m_vertexBuffer, 0);
+    cmd.SetIndexBuffer(*m_indexBuffer, 0, /*thirtyTwoBit=*/true);
+    // Opaque runs need no textures: one set of its own this frame (instances + shadow map bound;
+    // a set the frame's later draws re-point at other textures must not be bound here).
+    const uint32_t opaqueSlot = frameIndex * kUniformSlots + std::min(m_worldUniformCursor++, kUniformSlots - 1);
+    const ixrhi::IXRHIGraphicsPipeline* boundPipeline = nullptr;
+    const std::uint32_t instanceCount = static_cast<std::uint32_t>(instances.size());
+    for (std::size_t drawIndex = 0; drawIndex < m_draws.size(); ++drawIndex)
+    {
+        const MeshDraw& draw = m_draws[drawIndex];
+        if (draw.indexCount == 0)
+            continue;
+        const std::uint32_t drawBase = *base + static_cast<std::uint32_t>(drawIndex) * instanceCount;
+        for (std::uint32_t runStart = 0; runStart < instanceCount;)
+        {
+            const bool masked = blocks[drawBase - *base + runStart].materialAlpha[0] == 1.0f;
+            std::uint32_t runEnd = runStart + 1;
+            // Opaque instances share one draw; a masked one draws alone with its own texture.
+            while (!masked && runEnd < instanceCount && blocks[drawBase - *base + runEnd].materialAlpha[0] != 1.0f)
+                ++runEnd;
+            const ixrhi::IXRHIGraphicsPipeline* pipeline = masked ? m_shadowMaskPipeline.get() : m_shadowPipeline.get();
+            if (boundPipeline != pipeline)
+            {
+                cmd.SetGraphicsPipeline(*pipeline);
+                boundPipeline = pipeline;
+            }
+            if (masked)
+            {
+                const uint32_t uniformSlot = std::min(m_worldUniformCursor++, kUniformSlots - 1);
+                UpdateMaterialTextureDescriptors(frameIndex, uniformSlot,
+                    ResolveMaterialTextureViews(*m_rhi, instances[runStart], draw.materialSlot));
+                cmd.BindGroup(0, *m_bindGroup, frameIndex * kUniformSlots + uniformSlot);
+            }
+            else
+            {
+                cmd.BindGroup(0, *m_bindGroup, opaqueSlot);
+            }
+            cmd.DrawIndexed(draw.indexCount, runEnd - runStart, draw.firstIndex, 0, drawBase + runStart);
+            runStart = runEnd;
+        }
+    }
+}
+
 void StaticMeshRenderer::DestroyPipeline()
 {
     // RAII release (pipelines own VkPipeline + layout in the backend).
@@ -3282,6 +3453,10 @@ void StaticMeshRenderer::DestroyPipeline()
     m_unlitPipeline.reset();
     m_unlitMaskPipeline.reset();
     m_outlinePipeline.reset();
+    m_shadowPipeline.reset();
+    m_shadowMaskPipeline.reset();
+    m_shadowPass = nullptr;
+    m_shadowPipelinesFailed = false;
 }
 
 void StaticMeshRenderer::Destroy()
@@ -3314,6 +3489,9 @@ void StaticMeshRenderer::Destroy()
     m_ormTexture = {};
     m_materialTextureCache.clear();
     m_failedMaterialTextureKeys.clear();
+    // The shadow map belongs to the terrain renderer; holding it past here leaks it at device teardown.
+    m_sunShadow = {};
+    m_boundSunShadowTexture = nullptr;
     m_vertices.clear();
     m_indices.clear();
     m_draws.clear();
@@ -3398,6 +3576,7 @@ void StaticMeshRenderer::UpdateWorldUniform(uint32_t frameIndex,
     FillLightingUniform(m_lightingState, uniform);
     uniform.waterParams[0] = 0.0f;
     uniform.causticParams[0] = 0.0f;
+    FillSunShadowUniform(m_sunShadow, uniform);
 
     if (frameIndex < kFramesInFlight && uniformSlot < kUniformSlots &&
         m_uniformBuffers[frameIndex][uniformSlot])

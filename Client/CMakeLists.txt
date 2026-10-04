@@ -300,13 +300,16 @@ if(WIN32)
     set(GOD_RAYS_COMPOSITE_PS_SPV "${GENERATED_SHADER_DIR}/god_rays_composite_ps.spv")
     set(GOD_RAYS_VOLBLUR_PS_SPV "${GENERATED_SHADER_DIR}/god_rays_volblur_ps.spv")
     set(VOLUMETRIC_LIGHT_PS_SPV "${GENERATED_SHADER_DIR}/volumetric_light_ps.spv")
+    set(STATIC_MESH_SHADOW_VS_SPV "${GENERATED_SHADER_DIR}/static_mesh_shadow_vs.spv")
+    set(STATIC_MESH_SHADOW_MASK_PS_SPV "${GENERATED_SHADER_DIR}/static_mesh_shadow_mask_ps.spv")
+    set(SKINNED_MESH_SHADOW_VS_SPV "${GENERATED_SHADER_DIR}/skinned_mesh_shadow_vs.spv")
 
     add_custom_command(
         OUTPUT "${SKINNED_MESH_VS_SPV}"
         COMMAND ${CMAKE_COMMAND} -E make_directory "${GENERATED_SHADER_DIR}"
         COMMAND "${DXC_EXECUTABLE}" -spirv -T vs_6_0 -E VSMain
             -Fo "${SKINNED_MESH_VS_SPV}" "${CLIENT_ROOT}/shaders/SkinnedMesh.hlsl"
-        DEPENDS "${CLIENT_ROOT}/shaders/SkinnedMesh.hlsl"
+        DEPENDS "${CLIENT_ROOT}/shaders/SkinnedMesh.hlsl" "${CLIENT_ROOT}/shaders/SunShadow.hlsli"
         VERBATIM
     )
     add_custom_command(
@@ -314,7 +317,7 @@ if(WIN32)
         COMMAND ${CMAKE_COMMAND} -E make_directory "${GENERATED_SHADER_DIR}"
         COMMAND "${DXC_EXECUTABLE}" -spirv -T ps_6_0 -E PSMain
             -Fo "${SKINNED_MESH_PS_SPV}" "${CLIENT_ROOT}/shaders/SkinnedMesh.hlsl"
-        DEPENDS "${CLIENT_ROOT}/shaders/SkinnedMesh.hlsl"
+        DEPENDS "${CLIENT_ROOT}/shaders/SkinnedMesh.hlsl" "${CLIENT_ROOT}/shaders/SunShadow.hlsli"
         VERBATIM
     )
     add_custom_command(
@@ -330,7 +333,7 @@ if(WIN32)
         COMMAND ${CMAKE_COMMAND} -E make_directory "${GENERATED_SHADER_DIR}"
         COMMAND "${DXC_EXECUTABLE}" -spirv -T vs_6_0 -E VSMain
             -Fo "${STATIC_MESH_VS_SPV}" "${CLIENT_ROOT}/shaders/StaticMesh.hlsl"
-        DEPENDS "${CLIENT_ROOT}/shaders/StaticMesh.hlsl"
+        DEPENDS "${CLIENT_ROOT}/shaders/StaticMesh.hlsl" "${CLIENT_ROOT}/shaders/SunShadow.hlsli"
         VERBATIM
     )
     add_custom_command(
@@ -338,7 +341,7 @@ if(WIN32)
         COMMAND ${CMAKE_COMMAND} -E make_directory "${GENERATED_SHADER_DIR}"
         COMMAND "${DXC_EXECUTABLE}" -spirv -T ps_6_0 -E PSMain
             -Fo "${STATIC_MESH_PS_SPV}" "${CLIENT_ROOT}/shaders/StaticMesh.hlsl"
-        DEPENDS "${CLIENT_ROOT}/shaders/StaticMesh.hlsl"
+        DEPENDS "${CLIENT_ROOT}/shaders/StaticMesh.hlsl" "${CLIENT_ROOT}/shaders/SunShadow.hlsli"
         VERBATIM
     )
     add_custom_command(
@@ -346,7 +349,7 @@ if(WIN32)
         COMMAND ${CMAKE_COMMAND} -E make_directory "${GENERATED_SHADER_DIR}"
         COMMAND "${DXC_EXECUTABLE}" -spirv -T ps_6_0 -E PSMain -D SHADING_MODE_UNLIT=1
             -Fo "${STATIC_MESH_UNLIT_PS_SPV}" "${CLIENT_ROOT}/shaders/StaticMesh.hlsl"
-        DEPENDS "${CLIENT_ROOT}/shaders/StaticMesh.hlsl"
+        DEPENDS "${CLIENT_ROOT}/shaders/StaticMesh.hlsl" "${CLIENT_ROOT}/shaders/SunShadow.hlsli"
         VERBATIM
     )
     add_custom_command(
@@ -354,7 +357,7 @@ if(WIN32)
         COMMAND ${CMAKE_COMMAND} -E make_directory "${GENERATED_SHADER_DIR}"
         COMMAND "${DXC_EXECUTABLE}" -spirv -T vs_6_0 -E VSMain -D STATIC_MESH_OUTLINE=1
             -Fo "${STATIC_MESH_OUTLINE_VS_SPV}" "${CLIENT_ROOT}/shaders/StaticMesh.hlsl"
-        DEPENDS "${CLIENT_ROOT}/shaders/StaticMesh.hlsl"
+        DEPENDS "${CLIENT_ROOT}/shaders/StaticMesh.hlsl" "${CLIENT_ROOT}/shaders/SunShadow.hlsli"
         VERBATIM
     )
     add_custom_command(
@@ -362,7 +365,7 @@ if(WIN32)
         COMMAND ${CMAKE_COMMAND} -E make_directory "${GENERATED_SHADER_DIR}"
         COMMAND "${DXC_EXECUTABLE}" -spirv -T ps_6_0 -E PSMain -D STATIC_MESH_OUTLINE=1
             -Fo "${STATIC_MESH_OUTLINE_PS_SPV}" "${CLIENT_ROOT}/shaders/StaticMesh.hlsl"
-        DEPENDS "${CLIENT_ROOT}/shaders/StaticMesh.hlsl"
+        DEPENDS "${CLIENT_ROOT}/shaders/StaticMesh.hlsl" "${CLIENT_ROOT}/shaders/SunShadow.hlsli"
         VERBATIM
     )
     add_custom_command(
@@ -506,6 +509,31 @@ if(WIN32)
         DEPENDS "${CLIENT_ROOT}/shaders/VolumetricLight.hlsl"
         VERBATIM
     )
+    # The sun shadow pass of the meshes: depth only, flattened onto the cascade near plane.
+    add_custom_command(
+        OUTPUT "${STATIC_MESH_SHADOW_VS_SPV}"
+        COMMAND ${CMAKE_COMMAND} -E make_directory "${GENERATED_SHADER_DIR}"
+        COMMAND "${DXC_EXECUTABLE}" -spirv -T vs_6_0 -E VSMain -D STATIC_MESH_SHADOW=1
+            -Fo "${STATIC_MESH_SHADOW_VS_SPV}" "${CLIENT_ROOT}/shaders/StaticMesh.hlsl"
+        DEPENDS "${CLIENT_ROOT}/shaders/StaticMesh.hlsl" "${CLIENT_ROOT}/shaders/SunShadow.hlsli"
+        VERBATIM
+    )
+    add_custom_command(
+        OUTPUT "${STATIC_MESH_SHADOW_MASK_PS_SPV}"
+        COMMAND ${CMAKE_COMMAND} -E make_directory "${GENERATED_SHADER_DIR}"
+        COMMAND "${DXC_EXECUTABLE}" -spirv -T ps_6_0 -E ShadowMaskPS
+            -Fo "${STATIC_MESH_SHADOW_MASK_PS_SPV}" "${CLIENT_ROOT}/shaders/StaticMesh.hlsl"
+        DEPENDS "${CLIENT_ROOT}/shaders/StaticMesh.hlsl" "${CLIENT_ROOT}/shaders/SunShadow.hlsli"
+        VERBATIM
+    )
+    add_custom_command(
+        OUTPUT "${SKINNED_MESH_SHADOW_VS_SPV}"
+        COMMAND ${CMAKE_COMMAND} -E make_directory "${GENERATED_SHADER_DIR}"
+        COMMAND "${DXC_EXECUTABLE}" -spirv -T vs_6_0 -E ShadowVSMain
+            -Fo "${SKINNED_MESH_SHADOW_VS_SPV}" "${CLIENT_ROOT}/shaders/SkinnedMesh.hlsl"
+        DEPENDS "${CLIENT_ROOT}/shaders/SkinnedMesh.hlsl" "${CLIENT_ROOT}/shaders/SunShadow.hlsli"
+        VERBATIM
+    )
     add_custom_target(IXEngineShaders DEPENDS
         "${SKINNED_MESH_VS_SPV}"
         "${SKINNED_MESH_PS_SPV}"
@@ -536,6 +564,9 @@ if(WIN32)
         "${GOD_RAYS_COMPOSITE_PS_SPV}"
         "${GOD_RAYS_VOLBLUR_PS_SPV}"
         "${VOLUMETRIC_LIGHT_PS_SPV}"
+        "${STATIC_MESH_SHADOW_VS_SPV}"
+        "${STATIC_MESH_SHADOW_MASK_PS_SPV}"
+        "${SKINNED_MESH_SHADOW_VS_SPV}"
     )
 elseif(ANDROID)
     if(CMAKE_ANDROID_NDK)

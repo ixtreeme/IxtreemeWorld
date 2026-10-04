@@ -118,6 +118,10 @@ struct UniformBlock
     float lightPadding[2] = {0.0f, 0.0f};
     PointLightUniform pointLights[kMaxDynamicPointLights]{};
     SpotLightUniform spotLights[kMaxDynamicSpotLights]{};
+    float shadowCascadeViewProj[SunShadowReceive::kCascades][16]{};
+    float shadowParams[4] = {0.0f, 0.0f, 0.0f, 0.0f};
+    float shadowDepthBias[4] = {0.0f, 0.0f, 0.0f, 0.0f};
+    float shadowNormalOffset[4] = {0.0f, 0.0f, 0.0f, 0.0f};
 };
 
 static_assert(sizeof(SkinnedMeshRenderer::Vertex) == 32, "Graphics vertex layout must stay 32 bytes");
@@ -848,6 +852,8 @@ void SkinnedMeshRenderer::Render(ixrhi::IXRHICommandList& cmd,
         }
         return;
     }
+    if (!SunShadowBound())
+        return;
 
     if (!frame.frameActive || frame.commandList == nullptr)
     {
@@ -960,6 +966,8 @@ void SkinnedMeshRenderer::RenderInWorld(ixrhi::IXRHICommandList& cmd,
         }
         return;
     }
+    if (!SunShadowBound())
+        return;
 
     if (!frame.frameActive || frame.commandList == nullptr)
         return;
@@ -1036,6 +1044,8 @@ void SkinnedMeshRenderer::RenderInWorldReflection(ixrhi::IXRHICommandList& cmd,
     if (!m_bindLayout || !m_pipeline || !m_bindGroup || !m_indexBuffer ||
         m_indexCount == 0 || !frame.frameActive || frame.commandList == nullptr || m_rhi == nullptr)
         return;
+    if (!SunShadowBound())
+        return;
 
     // Bake against the explicit pass when the caller supplies one, else the
     // renderer's own target (offscreen scene pass, or backend default when
@@ -1098,6 +1108,9 @@ void SkinnedMeshRenderer::Destroy()
     }
     for (Texture& texture : m_textures)
         texture = {};
+    // The shadow map belongs to the terrain renderer; holding it past here leaks it at device teardown.
+    m_sunShadow = {};
+    m_boundSunShadowTexture = nullptr;
     m_restVertexBuffer.reset();
 
     m_vertices.clear();
@@ -2177,6 +2190,7 @@ bool SkinnedMeshRenderer::CreateBindGroup(ixrhi::IXRHIDevice& rhi)
     const std::vector<ixrhi::IXRHIBinding> bindings = {
         {0, ixrhi::IXRHIBindingType::UniformBuffer, allStages},
         {1, ixrhi::IXRHIBindingType::SampledTexture, ixrhi::IXRHIShaderStage::Fragment},
+        {2, ixrhi::IXRHIBindingType::SampledTexture, ixrhi::IXRHIShaderStage::Fragment},  // sun shadow cascades
     };
     m_bindLayout = rhi.CreateBindGroupLayout(bindings);
     if (!m_bindLayout)
@@ -2200,11 +2214,122 @@ bool SkinnedMeshRenderer::CreateBindGroup(ixrhi::IXRHIDevice& rhi)
                 const Texture& texture = m_textures[textureIndex];
                 if (texture.image && texture.sampler)
                     m_bindGroup->UpdateTexture(slot, 1, texture.image, texture.sampler);
+                if (m_sunShadow.texture && m_sunShadow.sampler)
+                    m_bindGroup->UpdateTexture(slot, 2, m_sunShadow.texture, m_sunShadow.sampler);
             }
         }
     }
+    m_boundSunShadowTexture = m_sunShadow.sampler ? m_sunShadow.texture.get() : nullptr;
 
     return true;
+}
+
+void SkinnedMeshRenderer::SetSunShadow(const SunShadowReceive& shadow)
+{
+    m_sunShadow = shadow;
+    if (!m_bindGroup || !shadow.texture || !shadow.sampler || shadow.texture.get() == m_boundSunShadowTexture)
+        return;
+    // A new map (first one, or recreated): every set's binding 2. The map is set up front and
+    // changes only with the device's resources, never while a frame uses the sets.
+    for (uint32_t slot = 0; slot < kFramesInFlight * kUniformSlots * kTextureCount; ++slot)
+        m_bindGroup->UpdateTexture(slot, 2, shadow.texture, shadow.sampler);
+    m_boundSunShadowTexture = shadow.texture.get();
+}
+
+bool SkinnedMeshRenderer::SunShadowBound() const
+{
+    if (m_boundSunShadowTexture)
+        return true;
+    static bool loggedNoShadowMap = false;
+    if (!loggedNoShadowMap)
+    {
+        Log("[MESH] skinned mesh draws skipped: no sun shadow map set (SetSunShadow)");
+        loggedNoShadowMap = true;
+    }
+    return false;
+}
+
+bool SkinnedMeshRenderer::CreateShadowPipeline(ixrhi::IXRHIDevice& rhi, const ixrhi::IXRHIRenderPass* shadowPass)
+{
+    if (!m_assets || !shadowPass)
+        return false;
+    auto vs = LoadShader(rhi,
+        *m_assets,
+        "assets/shaders/skinned_mesh_shadow_vs.spv",
+        ixrhi::IXRHIShaderStage::Vertex,
+        "ShadowVSMain");
+    if (!vs)
+        return false;
+
+    // Depth only from the skinned vertices; the cascade's mvp comes as a push constant (no
+    // descriptors). No culling, slope-scaled bias: as the terrain's and the static meshes' casters.
+    ixrhi::IXRHIGraphicsPipelineDesc desc;
+    desc.vertexShader = vs;
+    desc.fragmentShader = nullptr;
+    desc.pushRanges = {{ixrhi::IXRHIShaderStage::Vertex, 0, sizeof(Mat4)}};
+    desc.vertexBindings = {{0, sizeof(Vertex)}};
+    desc.vertexAttributes = {
+        {0, 0, ixrhi::IXRHIFormat::R32G32B32Float, offsetof(Vertex, position)},
+        {1, 0, ixrhi::IXRHIFormat::R32G32B32Float, offsetof(Vertex, normal)},
+        {2, 0, ixrhi::IXRHIFormat::R32G32Float, offsetof(Vertex, uv)},
+    };
+    desc.topology = ixrhi::IXRHIPrimitiveTopology::TriangleList;
+    desc.cullMode = ixrhi::IXRHICullMode::None;
+    desc.frontFace = ixrhi::IXRHIFrontFace::Clockwise;
+    desc.depthTestEnable = true;
+    desc.depthWriteEnable = true;
+    desc.depthCompareOp = ixrhi::IXRHICompareOp::LessOrEqual;
+    desc.depthBias.enable = true;
+    desc.depthBias.constantFactor = 1.25f;
+    desc.depthBias.slopeFactor = 1.75f;
+    desc.sampleCount = 1;
+    desc.targetRenderPass = shadowPass;
+    desc.debugName = "SkinnedMesh:Shadow";
+    m_shadowPipeline = rhi.CreateGraphicsPipeline(desc);
+    return m_shadowPipeline != nullptr;
+}
+
+void SkinnedMeshRenderer::RenderShadowCaster(ixrhi::IXRHICommandList& cmd,
+    const ixrhi::IXRHIFrameInfo& frame,
+    const WorldMat4& lightViewProj,
+    const ixrhi::IXRHIRenderPass* shadowPass,
+    WorldVec3 position,
+    float yawRadians,
+    uint32_t skinSlot,
+    std::array<float, 3> scale)
+{
+    if (!m_rhi || !m_indexBuffer || m_indexCount == 0 || !shadowPass || !frame.frameActive)
+        return;
+    if (m_shadowPass != shadowPass)
+    {
+        m_shadowPipeline.reset();
+        m_shadowPipelineFailed = false;
+        m_shadowPass = shadowPass;
+    }
+    if (!m_shadowPipeline && !m_shadowPipelineFailed && !CreateShadowPipeline(*m_rhi, shadowPass))
+    {
+        m_shadowPipelineFailed = true;
+        Log("[MESH] skinned mesh sun shadow pipeline could not be created");
+    }
+    if (!m_shadowPipeline)
+        return;
+
+    const uint32_t frameIndex = frame.frameIndex % kFramesInFlight;
+    if (skinSlot >= kSkinSlots)
+        skinSlot = 0;
+    if (!m_skinnedOutputBuffers[frameIndex][skinSlot])
+        return;
+
+    // The same placement as the lit draws (UpdateWorldUniform), into the cascade's light space.
+    const Mat4 model = Multiply(Multiply(xm::Scale({scale[0], scale[1], scale[2]}), RotationY(-yawRadians)),
+        Translation(position.x, position.y, position.z));
+    const Mat4 mvp = Multiply(model, ToLocalMat4(lightViewProj));
+    cmd.SetGraphicsPipeline(*m_shadowPipeline);
+    cmd.PushConstants(&mvp, sizeof(mvp));
+    cmd.SetVertexBuffer(0, *m_skinnedOutputBuffers[frameIndex][skinSlot], 0);
+    cmd.SetIndexBuffer(*m_indexBuffer, 0, /*thirtyTwoBit=*/true);
+    for (const MeshDraw& draw : m_draws)
+        cmd.DrawIndexed(draw.indexCount, 1, draw.firstIndex, 0, 0);
 }
 
 bool SkinnedMeshRenderer::CreateComputeBindGroup(ixrhi::IXRHIDevice& rhi)
@@ -2395,6 +2520,9 @@ void SkinnedMeshRenderer::DestroyPipeline()
 {
     DestroyReflectionPipeline();
     m_pipeline.reset();
+    m_shadowPipeline.reset();
+    m_shadowPass = nullptr;
+    m_shadowPipelineFailed = false;
 }
 
 void SkinnedMeshRenderer::DestroyReflectionPipeline()
@@ -2461,6 +2589,9 @@ void SkinnedMeshRenderer::UpdateUniform(uint32_t frameIndex, uint32_t uniformSlo
     noWater.foamEnabled = false;
     noWater.causticMode = WaterConfig::CausticMode::Off;
     FillWaterUniform(noWater, timeSeconds, uniform);
+    SunShadowReceive noShadow = m_sunShadow;  // the preview stands outside the world: lit
+    noShadow.enabled = false;
+    FillSunShadowUniform(noShadow, uniform);
 
     if (frameIndex < kFramesInFlight && uniformSlot < kUniformSlots &&
         m_uniformBuffers[frameIndex][uniformSlot])
@@ -2517,6 +2648,7 @@ void SkinnedMeshRenderer::UpdateWorldUniform(uint32_t frameIndex,
         noWater.causticMode = WaterConfig::CausticMode::Off;
         FillWaterUniform(noWater, timeSeconds, uniform);
     }
+    FillSunShadowUniform(m_sunShadow, uniform);
 
     if (frameIndex < kFramesInFlight && uniformSlot < kUniformSlots &&
         m_uniformBuffers[frameIndex][uniformSlot])

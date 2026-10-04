@@ -1909,13 +1909,6 @@ void TerrainRenderer::SetWaterRefractionInputs(std::shared_ptr<ixrhi::IXRHITextu
 
 void TerrainRenderer::UpdateShadowCascades(const WorldCamera& camera)
 {
-    const WorldVec3 forward = WorldCameraForward(camera);
-    WorldVec3 right = WorldCameraRight(camera);
-    if (xm::Dot(right, right) <= 0.0001f)
-        right = {1.0f, 0.0f, 0.0f};
-    const WorldVec3 up = WorldCameraUp(camera);
-    const float aspect = 16.0f / 9.0f;
-    constexpr float tanHalfFov = 0.41421356237f;
     const float nearPlane = 0.1f;
     const float farPlane = 200.0f;
     constexpr float lambda = 0.7f;
@@ -1938,57 +1931,35 @@ void TerrainRenderer::UpdateShadowCascades(const WorldCamera& camera)
     if (xm::Dot(sunDir, sunDir) <= 0.0001f)
         sunDir = {0.0f, 1.0f, 0.0f};
 
+    // The light camera sits on the sun's side and looks away from it, so depth grows with the
+    // distance from the sun and the shadow map keeps the surface the sun reaches first. It looks from
+    // a fixed point: only the sun turns it, so each cascade's texel grid stays put in the world while
+    // the camera moves (shadow edges do not crawl).
+    const WorldVec3 lightUp = std::abs(sunDir.y) > 0.999f ? WorldVec3{0.0f, 0.0f, 1.0f} : WorldVec3{0.0f, 1.0f, 0.0f};
+    const WorldMat4 lightView = WorldLookAt(sunDir, WorldVec3{0.0f, 0.0f, 0.0f}, lightUp);
+    const WorldVec3 eye = TransformWorldPointNoPerspective(lightView, camera.eye);
+
     for (uint32_t cascade = 0; cascade < kShadowCascadeCount; ++cascade)
     {
-        const float zn = splitPlanes[cascade];
-        const float zf = splitPlanes[cascade + 1];
-        const float nearH = 2.0f * tanHalfFov * zn;
-        const float nearW = nearH * aspect;
-        const float farH = 2.0f * tanHalfFov * zf;
-        const float farW = farH * aspect;
-        const WorldVec3 nearCenter = camera.eye + forward * zn;
-        const WorldVec3 farCenter = camera.eye + forward * zf;
-        std::array<WorldVec3, 8> corners = {
-            nearCenter + up * (nearH * 0.5f) + right * (-nearW * 0.5f),
-            nearCenter + up * (nearH * 0.5f) + right * (nearW * 0.5f),
-            nearCenter + up * (-nearH * 0.5f) + right * (-nearW * 0.5f),
-            nearCenter + up * (-nearH * 0.5f) + right * (nearW * 0.5f),
-            farCenter + up * (farH * 0.5f) + right * (-farW * 0.5f),
-            farCenter + up * (farH * 0.5f) + right * (farW * 0.5f),
-            farCenter + up * (-farH * 0.5f) + right * (-farW * 0.5f),
-            farCenter + up * (-farH * 0.5f) + right * (farW * 0.5f),
-        };
-
-        WorldVec3 center{};
-        for (WorldVec3 corner : corners)
-            center = center + corner;
-        center = center * (1.0f / static_cast<float>(corners.size()));
-
-        // The light camera sits on the sun's side and looks away from it, so depth grows with the
-        // distance from the sun and the shadow map keeps the surface the sun reaches first.
-        const WorldVec3 lightEye = center + sunDir * 120.0f;
-        WorldMat4 lightView = WorldLookAt(lightEye, center, {0.0f, 1.0f, 0.0f});
-
-        WorldVec3 minBound{std::numeric_limits<float>::max(), std::numeric_limits<float>::max(), std::numeric_limits<float>::max()};
-        WorldVec3 maxBound{-std::numeric_limits<float>::max(), -std::numeric_limits<float>::max(), -std::numeric_limits<float>::max()};
-        for (WorldVec3 corner : corners)
-        {
-            const WorldVec3 p = TransformWorldPointNoPerspective(lightView, corner);
-            minBound.x = std::min(minBound.x, p.x);
-            minBound.y = std::min(minBound.y, p.y);
-            minBound.z = std::min(minBound.z, p.z);
-            maxBound.x = std::max(maxBound.x, p.x);
-            maxBound.y = std::max(maxBound.y, p.y);
-            maxBound.z = std::max(maxBound.z, p.z);
-        }
-
-        constexpr float padding = 20.0f;
-        WorldMat4 lightProj = WorldOrthographicOffCenter(
-            minBound.x - padding, maxBound.x + padding,
-            minBound.y - padding, maxBound.y + padding,
-            minBound.z - 80.0f, maxBound.z + 80.0f);
+        // The terrain picks a cascade by the distance from the camera, the meshes and the volumetric
+        // light take the finest one that holds the point: cascade i covers the ball of radius split i
+        // around the eye whichever way the camera looks (any field of view), with a few texels of room
+        // for the filter.
+        const float radius = splitPlanes[cascade + 1];
+        const float halfSize = radius * (1.0f + 8.0f / static_cast<float>(kShadowResolution));
+        const float texelSize = 2.0f * halfSize / static_cast<float>(kShadowResolution);
+        const float centerX = std::floor(eye.x / texelSize) * texelSize;
+        const float centerY = std::floor(eye.y / texelSize) * texelSize;
+        constexpr float depthPadding = 80.0f;
+        const WorldMat4 lightProj = WorldOrthographicOffCenter(
+            centerX - halfSize, centerX + halfSize,
+            centerY - halfSize, centerY + halfSize,
+            eye.z - radius - depthPadding, eye.z + radius + depthPadding);
         m_shadowCascadeViewProj[cascade] = WorldMultiply(lightView, lightProj);
-        m_shadowCascadeSplits[cascade] = zf;
+        m_shadowCascadeSplits[cascade] = radius;
+        // In metres: what one unit of the cascade's depth spans, and one texel of its map.
+        m_shadowCascadeDepthRange[cascade] = 2.0f * (radius + depthPadding);
+        m_shadowCascadeTexelSize[cascade] = texelSize;
     }
 }
 
@@ -2065,12 +2036,58 @@ void TerrainRenderer::UploadEditedSplat(ixrhi::IXRHICommandList& cmd, uint32_t f
     cmd.TransitionTexture(*m_splatB.image, L::TransferDst, L::ShaderReadOnly);
 }
 
+void TerrainRenderer::EnsureSunShadowMapReadable(ixrhi::IXRHICommandList& cmd)
+{
+    if (m_shadowMapReadable || !m_shadowTexture)
+        return;
+    // Every cascade cleared to the far plane (all lit) and left shader-readable: the terrain and
+    // the meshes bind the map in every draw, drawn or not.
+    for (const std::unique_ptr<ixrhi::IXRHIRenderTarget>& target : m_shadowTargets)
+    {
+        if (!target)
+            return;
+        target->Begin(cmd);
+        target->End(cmd);
+    }
+    cmd.TransitionTexture(*m_shadowTexture,
+        ixrhi::IXRHIImageLayout::DepthStencilAttachment,
+        ixrhi::IXRHIImageLayout::ShaderReadOnly);
+    m_shadowMapReadable = true;
+}
+
+SunShadowReceive TerrainRenderer::SunShadowForMeshes(std::uint64_t frameNumber) const
+{
+    // How far a receiving mesh surface must lie behind the stored depth to count as shadowed, and
+    // how far its lookup moves off the surface (about a texel): together they keep curved and
+    // grazing surfaces from shadowing themselves.
+    constexpr float kMeshDepthBiasMeters = 0.04f;
+    constexpr float kMeshNormalOffsetTexels = 1.5f;
+
+    SunShadowReceive out;
+    out.texture = m_shadowTexture;
+    out.sampler = m_shadowSampler;
+    out.enabled = m_shadowTexture && m_shadowDrawnFrame == frameNumber;
+    out.mapSize = static_cast<float>(kShadowResolution);
+    for (std::uint32_t cascade = 0; cascade < kShadowCascadeCount && cascade < SunShadowReceive::kCascades; ++cascade)
+    {
+        out.cascadeViewProj[cascade] = m_shadowCascadeViewProj[cascade];
+        out.depthBias[cascade] = kMeshDepthBiasMeters / std::max(m_shadowCascadeDepthRange[cascade], 0.001f);
+        out.normalOffset[cascade] = m_shadowCascadeTexelSize[cascade] * kMeshNormalOffsetTexels;
+    }
+    return out;
+}
+
 void TerrainRenderer::RenderSunShadowMap(ixrhi::IXRHICommandList& cmd,
                                           const ixrhi::IXRHIFrameInfo& frame,
-                                          const WorldCamera& camera)
+                                          const WorldCamera& camera,
+                                          std::uint64_t castersRevision,
+                                          const ShadowCasterDraw& drawCasters)
 {
-    if (!m_sceneTerrainActive || m_sceneTerrain.editorHidden || !m_lightingState.sunShadowsEnabled || !m_shadowPipeline ||
-        !m_shadowTexture || !m_vertexBuffer || !m_indexBuffer || m_indexCount == 0 || !frame.frameActive)
+    // The terrain casts when there is one; the meshes (drawCasters) cast with or without it.
+    const bool drawTerrain = m_sceneTerrainActive && !m_sceneTerrain.editorHidden && m_vertexBuffer &&
+        m_indexBuffer && m_indexCount > 0;
+    if (!m_lightingState.sunShadowsEnabled || !m_shadowPipeline || !m_shadowTexture || !frame.frameActive ||
+        (!drawTerrain && !drawCasters))
     {
         for (PassDrawStats& cascadeStats : m_frameDrawStats.shadowCascades)
             cascadeStats.skipped = true;
@@ -2081,17 +2098,18 @@ void TerrainRenderer::RenderSunShadowMap(ixrhi::IXRHICommandList& cmd,
     const DirectionalLight& sun = m_lightingState.directional;
     const ShadowMapInputs inputs{
         {camera.eye.x, camera.eye.y, camera.eye.z},
-        {camera.target.x, camera.target.y, camera.target.z},
         sun.azimuthDegrees,
         sun.elevationDegrees,
-        m_vertexBuffer.get(),
-        m_indexBuffer.get(),
+        drawTerrain ? m_vertexBuffer.get() : nullptr,
+        drawTerrain ? m_indexBuffer.get() : nullptr,
         m_shadowTexture.get(),
-        m_indexCount,
-        m_terrainGeometryRevision};
+        drawTerrain ? m_indexCount : 0u,
+        m_terrainGeometryRevision,
+        castersRevision};
     if (m_shadowMapInputs && *m_shadowMapInputs == inputs)
     {
-        // Same camera, sun and terrain as the map already holds (and still shader-readable): reuse it.
+        // Same camera, sun, terrain and casters as the map already holds (and still shader-readable):
+        // reuse it.
         for (PassDrawStats& cascadeStats : m_frameDrawStats.shadowCascades)
             cascadeStats.skipped = true;
         m_shadowDrawnFrame = frame.frameNumber;
@@ -2126,54 +2144,62 @@ void TerrainRenderer::RenderSunShadowMap(ixrhi::IXRHICommandList& cmd,
             m_shadowTargets[cascade]->Begin(cmd);
         cmd.SetViewport(0.0f, 0.0f, static_cast<float>(kShadowResolution), static_cast<float>(kShadowResolution));
         cmd.SetScissor(0, 0, kShadowResolution, kShadowResolution);
-        cmd.SetGraphicsPipeline(*m_shadowPipeline);
-        cmd.PushConstants(&m_shadowCascadeViewProj[cascade], sizeof(WorldMat4));
-        cmd.SetVertexBuffer(0, *m_vertexBuffer, 0);
-        cmd.SetIndexBuffer(*m_indexBuffer, 0, /*thirtyTwoBit=*/true);
         PassDrawStats& cascadeStats = m_frameDrawStats.shadowCascades[cascade];
         cascadeStats.executed = true;
         cascadeStats.drawCalls = 0;
         cascadeStats.chunksDrawn = 0;
         cascadeStats.chunksCulled = 0;
-        if (m_terrainChunks.empty())
+        if (drawTerrain)
         {
-            cmd.DrawIndexed(m_indexCount, 1, 0, 0, 0);
-            cascadeStats.drawCalls = 1;
-            cascadeStats.chunksDrawn = 1;
-        }
-        else
-        {
-            // Only the chunks under the cascade's footprint: the near cascades cover a small part of
-            // the terrain, and every drawn chunk is vertex/index traffic. Chunks adjacent in the index
-            // buffer are merged into one draw.
-            uint32_t runOffset = 0;
-            uint32_t runCount = 0;
-            auto flushRun = [&]() {
-                if (runCount == 0)
-                    return;
-                cmd.DrawIndexed(runCount, 1, runOffset, 0, 0);
-                ++cascadeStats.drawCalls;
-                runCount = 0;
-            };
-            for (const TerrainChunkDraw& chunk : m_terrainChunks)
+            cmd.SetGraphicsPipeline(*m_shadowPipeline);
+            cmd.PushConstants(&m_shadowCascadeViewProj[cascade], sizeof(WorldMat4));
+            cmd.SetVertexBuffer(0, *m_vertexBuffer, 0);
+            cmd.SetIndexBuffer(*m_indexBuffer, 0, /*thirtyTwoBit=*/true);
+            if (m_terrainChunks.empty())
             {
-                if (TerrainAabbOutsideCascadeFootprint(m_shadowCascadeViewProj[cascade], chunk.worldMin, chunk.worldMax))
+                cmd.DrawIndexed(m_indexCount, 1, 0, 0, 0);
+                cascadeStats.drawCalls = 1;
+                cascadeStats.chunksDrawn = 1;
+            }
+            else
+            {
+                // Only the chunks under the cascade's footprint: the near cascades cover a small part of
+                // the terrain, and every drawn chunk is vertex/index traffic. Chunks adjacent in the index
+                // buffer are merged into one draw.
+                uint32_t runOffset = 0;
+                uint32_t runCount = 0;
+                auto flushRun = [&]() {
+                    if (runCount == 0)
+                        return;
+                    cmd.DrawIndexed(runCount, 1, runOffset, 0, 0);
+                    ++cascadeStats.drawCalls;
+                    runCount = 0;
+                };
+                for (const TerrainChunkDraw& chunk : m_terrainChunks)
                 {
-                    ++cascadeStats.chunksCulled;
-                    continue;
-                }
-                ++cascadeStats.chunksDrawn;
-                if (runCount != 0 && runOffset + runCount == chunk.indexOffset)
-                {
-                    runCount += chunk.indexCount;
-                    continue;
+                    if (TerrainAabbOutsideCascadeFootprint(m_shadowCascadeViewProj[cascade], chunk.worldMin, chunk.worldMax))
+                    {
+                        ++cascadeStats.chunksCulled;
+                        continue;
+                    }
+                    ++cascadeStats.chunksDrawn;
+                    if (runCount != 0 && runOffset + runCount == chunk.indexOffset)
+                    {
+                        runCount += chunk.indexCount;
+                        continue;
+                    }
+                    flushRun();
+                    runOffset = chunk.indexOffset;
+                    runCount = chunk.indexCount;
                 }
                 flushRun();
-                runOffset = chunk.indexOffset;
-                runCount = chunk.indexCount;
             }
-            flushRun();
         }
+        // The meshes into the same cascade (they bind their own pipelines; viewport and scissor stay).
+        // The cascades' passes are compatible: casters bake against the first one, as the terrain
+        // does, so one pipeline serves all four.
+        if (drawCasters && m_shadowTargets[cascade])
+            drawCasters(cascade, m_shadowCascadeViewProj[cascade], m_shadowTargets[0]->GetPass());
         if (m_shadowTargets[cascade])
             m_shadowTargets[cascade]->End(cmd);
         if (m_rhi)
@@ -2187,6 +2213,7 @@ void TerrainRenderer::RenderSunShadowMap(ixrhi::IXRHICommandList& cmd,
         ixrhi::IXRHIImageLayout::DepthStencilAttachment,
         ixrhi::IXRHIImageLayout::ShaderReadOnly);
     m_shadowDrawnFrame = frame.frameNumber;
+    m_shadowMapReadable = true;
 }
 
 WorldCamera TerrainRenderer::ComputeMirrorCamera(const WorldCamera& camera,

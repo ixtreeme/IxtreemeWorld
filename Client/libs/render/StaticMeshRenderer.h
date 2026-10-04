@@ -15,6 +15,7 @@
 
 #include "AssetDatabase.h"
 #include "MapEditorTypes.h"
+#include "SunShadow.h"
 #include "WorldCamera.h"
 
 #include "IXRHIBinding.h"
@@ -135,6 +136,16 @@ public:
     // Borrowed target pass (offscreen scene pass); null = backend default.
     void SetTargetPass(const ixrhi::IXRHIRenderPass* pass) { m_targetPass = pass; }
     void SetLightingState(const LightingState& lighting) { m_lightingState = lighting; }
+    // The sun shadow cascades the lit draws sample. Set before the first draw (the map is bound in
+    // every draw) and each frame (cascades follow the camera).
+    void SetSunShadow(const SunShadowReceive& shadow);
+    // These instances into one sun shadow cascade, depth only (alpha-masked materials keep their
+    // cut-outs). Call inside the cascade's render pass (viewport set by its owner).
+    void RenderShadowCasters(ixrhi::IXRHICommandList& cmd,
+        const ixrhi::IXRHIFrameInfo& frame,
+        const WorldMat4& lightViewProj,
+        const std::vector<Instance>& instances,
+        const ixrhi::IXRHIRenderPass* shadowPass);
     void RenderInWorld(ixrhi::IXRHICommandList& cmd,
         const ixrhi::IXRHIFrameInfo& frame,
         double timeSeconds,
@@ -350,6 +361,9 @@ private:
         const MaterialTextureViews& textures);
     bool CreateBindGroup(ixrhi::IXRHIDevice& rhi);
     bool CreatePipeline(ixrhi::IXRHIDevice& rhi);
+    bool CreateShadowPipelines(ixrhi::IXRHIDevice& rhi, const ixrhi::IXRHIRenderPass* shadowPass);
+    // Appends instance blocks at this frame's cursor; returns the first record's index.
+    std::optional<std::uint32_t> AppendInstanceBlocks(uint32_t frameIndex, const std::vector<InstanceBlock>& blocks);
     bool EnsureInstanceCapacity(ixrhi::IXRHIDevice& rhi, uint32_t frameIndex, std::uint32_t requiredRecords);
     void UpdateInstanceDescriptorSets(uint32_t frameIndex);
     void DestroyPipeline();
@@ -395,6 +409,13 @@ private:
     std::unique_ptr<ixrhi::IXRHIGraphicsPipeline> m_unlitPipeline;
     std::unique_ptr<ixrhi::IXRHIGraphicsPipeline> m_unlitMaskPipeline;
     std::unique_ptr<ixrhi::IXRHIGraphicsPipeline> m_outlinePipeline;
+    // Sun shadow pass (depth only), baked against the cascades' pass: opaque, and alpha-masked.
+    std::unique_ptr<ixrhi::IXRHIGraphicsPipeline> m_shadowPipeline;
+    std::unique_ptr<ixrhi::IXRHIGraphicsPipeline> m_shadowMaskPipeline;
+    const ixrhi::IXRHIRenderPass* m_shadowPass = nullptr;
+    bool m_shadowPipelinesFailed = false;
+    SunShadowReceive m_sunShadow;
+    const ixrhi::IXRHITexture* m_boundSunShadowTexture = nullptr;  // what binding 5 holds in every set
     std::vector<Vertex> m_vertices;
     std::vector<uint32_t> m_indices;
     std::vector<MeshDraw> m_draws;

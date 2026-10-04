@@ -2561,9 +2561,10 @@ int RunGame(NativeWindow& window,
         std::uint64_t cursorsResetFrame = std::numeric_limits<std::uint64_t>::max();
     };
     std::unordered_map<std::string, SkinnedMeshCacheEntry> skinnedMeshCache;
-    // Most recent finalized lighting; used to seed an entry created mid-frame so its first
-    // frame is lit (matches the per-frame SetLightingState push to all entries).
-    LightingState skinnedCacheLighting{};
+    // The frame's finalized scene lighting, the one the terrain is lit by. Every mesh renderer gets
+    // it (static ones per draw, skinned ones per frame and when created mid-frame), so meshes and
+    // terrain share one sun, the sun the shadow cascades are drawn from.
+    LightingState frameLighting{};
     // Networked-entity and lobby skinned rendering have no per-entity model path; they are
     // dormant today (nothing ever loaded a model for them). Gate them behind this constant —
     // empty => getSkinnedMeshRenderer returns nullptr => those blocks stay no-ops exactly as
@@ -2605,7 +2606,10 @@ int RunGame(NativeWindow& window,
                 entry.renderer->SetTargetPass(offscreenScene.GetTargetPass());
             entry.renderer->RecreatePipeline(*rhiDevice);
         }
-        entry.renderer->SetLightingState(skinnedCacheLighting);
+        entry.renderer->SetLightingState(frameLighting);
+        // The sun shadow map is bound in every draw (cascades refreshed each frame after the shadow pass).
+        if (terrainOk)
+            entry.renderer->SetSunShadow(terrain.SunShadowForMeshes(0));
         entry.state = SkinnedMeshCacheEntry::State::Loaded;
         Tracenf("[MESH-ENTITY] SkinnedMeshRenderer loaded: %s", modelPath.c_str());
 #if defined(IXTREEME_WITH_EDITOR)
@@ -2710,6 +2714,9 @@ int RunGame(NativeWindow& window,
             TraceError("[MESH-ENTITY] Static mesh load failed: %s", modelPath.c_str());
             return nullptr;
         }
+        // The sun shadow map is bound in every draw (cascades refreshed each frame after the shadow pass).
+        if (terrainOk)
+            entry.renderer->SetSunShadow(terrain.SunShadowForMeshes(0));
         entry.state = StaticMeshCacheEntry::State::LoadedStatic;
         Tracenf("[MESH-ENTITY] StaticMeshRenderer loaded: %s", modelPath.c_str());
         return entry.renderer.get();
@@ -10528,9 +10535,9 @@ int RunGame(NativeWindow& window,
                     editorWaterBodiesDirty = false;
                 }
                 terrain.SetSelectedWaterBodyHighlight(*rhiDevice, 0u);
-                // Push the finalized lighting to every cached skinned model, and stash it so a
-                // model loaded later this frame is seeded lit at create time (getSkinnedMeshRenderer).
-                skinnedCacheLighting = lightingState;
+                // Push the finalized lighting to every cached skinned model, and stash it for the
+                // static meshes' draws and a model loaded later this frame (getSkinnedMeshRenderer).
+                frameLighting = lightingState;
                 for (auto& [skinnedPath, skinnedEntry] : skinnedMeshCache)
                 {
                     (void)skinnedPath;
@@ -10598,6 +10605,15 @@ int RunGame(NativeWindow& window,
                 }
                 sceneRuntime.BuildSceneSnapshot(frameSceneSnapshot, /*includeTerrainGrids=*/false);
                 SceneManager::Instance().SetCurrentSceneSnapshot(frameSceneSnapshot);
+            }
+#else
+            // The game: the lighting of the scene as loaded (ApplySceneData gave the terrain the same).
+            frameLighting = editorImGui.GetLightingState();
+            for (auto& [skinnedPath, skinnedEntry] : skinnedMeshCache)
+            {
+                (void)skinnedPath;
+                if (skinnedEntry.renderer)
+                    skinnedEntry.renderer->SetLightingState(frameLighting);
             }
 #endif
         }
@@ -11013,11 +11029,125 @@ int RunGame(NativeWindow& window,
             // (outside render passes: nothing is open yet here).
             if (isInWorld && hasSceneTerrain)
                 terrain.UploadEditedTerrain(*frameInfo.commandList, frameInfo);
-            if (isInWorld && hasSceneTerrain && hasFrameCamera && !debugDisableShadowPass)
+            // Every terrain and mesh draw binds the sun shadow map: shader-readable from the start.
+            if (terrainOk)
+                terrain.EnsureSunShadowMapReadable(*frameInfo.commandList);
+            if (terrainOk && isInWorld && hasFrameCamera && !debugDisableShadowPass)
             {
+                // The meshes cast into the cascades too: the shown static meshes (each cascade gets
+                // those over its footprint) and this frame's skinned instances (their Scene-view
+                // skin slots: the pose both views draw).
+                struct StaticShadowCaster
+                {
+                    StaticMeshRenderer* renderer = nullptr;
+                    StaticMeshRenderer::Instance instance;
+                    std::array<WorldVec3, 8> corners{};
+                };
+                std::vector<StaticShadowCaster> staticShadowCasters;
+                std::uint64_t castersRevision = 1469598103934665603ull;  // FNV-1a over the casters
+                auto hashCaster = [&castersRevision](const void* data, std::size_t size) {
+                    const auto* bytes = static_cast<const unsigned char*>(data);
+                    for (std::size_t i = 0; i < size; ++i)
+                        castersRevision = (castersRevision ^ bytes[i]) * 1099511628211ull;
+                };
+                if (runtimeSession->IsMapEditorOpen())
+                {
+                    for (const MeshSceneEntity& mesh : editorMeshEntities)
+                    {
+                        if (mesh.skinned || (editorPlay.state.mode == EditorPlayMode::Edit && mesh.editorHidden))
+                            continue;
+                        StaticMeshRenderer* renderer = getStaticMeshRenderer(resolveMeshRuntimePath(mesh));
+                        if (!renderer || !renderer->IsLoaded())
+                            continue;
+                        StaticShadowCaster& caster = staticShadowCasters.emplace_back();
+                        caster.renderer = renderer;
+                        caster.instance.entityId = mesh.id;
+                        caster.instance.position = {mesh.position[0], mesh.position[1], mesh.position[2]};
+                        for (int axis = 0; axis < 3; ++axis)
+                        {
+                            caster.instance.rotation[axis] = mesh.rotation[axis];
+                            caster.instance.scale[axis] = mesh.scale[axis];
+                        }
+                        caster.instance.materialSlots = mesh.materialSlots;
+                        caster.instance.materialOverrides = mesh.materialOverrides;
+                        caster.corners = SpatialAabbCorners(StaticMeshWorldAabb(mesh, *renderer));
+                        hashCaster(&caster.renderer, sizeof(caster.renderer));
+                        hashCaster(&mesh.id, sizeof(mesh.id));
+                        hashCaster(mesh.position, sizeof(mesh.position));
+                        hashCaster(mesh.rotation, sizeof(mesh.rotation));
+                        hashCaster(mesh.scale, sizeof(mesh.scale));
+                    }
+                }
+                std::vector<const SkinnedDrawRecord*> skinnedShadowCasters;
+                for (const std::vector<SkinnedDrawRecord>* records : {&sceneSkinnedDraws, &sceneEditorSkinnedDraws})
+                {
+                    for (const SkinnedDrawRecord& record : *records)
+                    {
+                        if (record.renderer)
+                            skinnedShadowCasters.push_back(&record);
+                    }
+                }
+                // Skinned casters animate: their shadows are drawn again every frame.
+                if (!skinnedShadowCasters.empty())
+                    hashCaster(&frameInfo.frameNumber, sizeof(frameInfo.frameNumber));
+
+                // Whether a box lies wholly off one side of a cascade (orthographic: x and y only; a
+                // caster sun-wards of its depth range still shades it).
+                auto outsideCascadeFootprint = [](const WorldMat4& lightViewProj, const std::array<WorldVec3, 8>& corners) {
+                    bool left = true;
+                    bool right = true;
+                    bool bottom = true;
+                    bool top = true;
+                    const float* m = lightViewProj.m;
+                    for (const WorldVec3& p : corners)
+                    {
+                        const float x = p.x * m[0] + p.y * m[4] + p.z * m[8] + m[12];
+                        const float y = p.x * m[1] + p.y * m[5] + p.z * m[9] + m[13];
+                        left = left && x < -1.0f;
+                        right = right && x > 1.0f;
+                        bottom = bottom && y < -1.0f;
+                        top = top && y > 1.0f;
+                    }
+                    return left || right || bottom || top;
+                };
+                const TerrainRenderer::ShadowCasterDraw drawMeshCasters =
+                    [&](std::uint32_t, const WorldMat4& lightViewProj, const ixrhi::IXRHIRenderPass* pass) {
+                        std::unordered_map<StaticMeshRenderer*, std::vector<StaticMeshRenderer::Instance>> batches;
+                        for (const StaticShadowCaster& caster : staticShadowCasters)
+                        {
+                            if (!outsideCascadeFootprint(lightViewProj, caster.corners))
+                                batches[caster.renderer].push_back(caster.instance);
+                        }
+                        for (auto& [renderer, instances] : batches)
+                            renderer->RenderShadowCasters(*frameInfo.commandList, frameInfo, lightViewProj, instances, pass);
+                        for (const SkinnedDrawRecord* record : skinnedShadowCasters)
+                        {
+                            record->renderer->RenderShadowCaster(*frameInfo.commandList, frameInfo, lightViewProj, pass,
+                                record->position, record->yaw, record->slot, record->scale);
+                        }
+                    };
+                const bool anyMeshCasters = !staticShadowCasters.empty() || !skinnedShadowCasters.empty();
                 rhiDevice->WriteTimestamp(ixrhi::IXRHITimestampPoint::ShadowPassBegin);
-                terrain.RenderSunShadowMap(*frameInfo.commandList, frameInfo, *shadowCamera);
+                terrain.RenderSunShadowMap(*frameInfo.commandList, frameInfo, *shadowCamera, castersRevision,
+                    anyMeshCasters ? drawMeshCasters : TerrainRenderer::ShadowCasterDraw{});
                 rhiDevice->WriteTimestamp(ixrhi::IXRHITimestampPoint::ShadowPassEnd);
+            }
+            // The meshes sample this frame's cascades (or see none drawn: all lit).
+            if (terrainOk)
+            {
+                const SunShadowReceive meshShadow = terrain.SunShadowForMeshes(frameInfo.frameNumber);
+                for (auto& [path, entry] : staticMeshCache)
+                {
+                    (void)path;
+                    if (entry.renderer)
+                        entry.renderer->SetSunShadow(meshShadow);
+                }
+                for (auto& [path, entry] : skinnedMeshCache)
+                {
+                    (void)path;
+                    if (entry.renderer)
+                        entry.renderer->SetSunShadow(meshShadow);
+                }
             }
             if (isInWorld && hasSceneTerrain && hasFrameCamera && !debugDisableWaterReflectionPass)
             {
@@ -11352,7 +11482,7 @@ int RunGame(NativeWindow& window,
                                 }
                                 continue;
                             }
-                            renderer->SetLightingState(runtimeSession->GetLightingState());
+                            renderer->SetLightingState(frameLighting);
                             StaticMeshRenderer::Instance instance{};
                             instance.entityId = mesh.id;
                             instance.position = {mesh.position[0], mesh.position[1], mesh.position[2]};
@@ -11929,7 +12059,7 @@ int RunGame(NativeWindow& window,
                             {
                                 // Set here too: the Scene View pass (which also sets it) may have
                                 // skipped this renderer (culled there) or not run at all (hidden).
-                                gameRenderer->SetLightingState(runtimeSession->GetLightingState());
+                                gameRenderer->SetLightingState(frameLighting);
                                 gameRenderer->RenderBatchInWorld(*frameInfo.commandList,
                                     frameInfo,
                                     seconds,

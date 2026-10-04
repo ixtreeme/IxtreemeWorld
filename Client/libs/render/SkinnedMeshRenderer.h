@@ -21,6 +21,7 @@
 
 #include "WorldCamera.h"
 #include "MapEditorTypes.h"
+#include "SunShadow.h"
 
 #include "IXRHIBinding.h"
 #include "IXRHIBuffer.h"
@@ -119,6 +120,19 @@ public:
         std::array<float, 4> tint = {1.0f, 1.0f, 1.0f, 1.0f},
         std::array<float, 3> scale = {1.0f, 1.0f, 1.0f});
     void SetLightingState(const LightingState& lighting) { m_lightingState = lighting; }
+    // The sun shadow cascades the draws sample. Set before the first draw (the map is bound in every
+    // draw) and each frame (cascades follow the camera).
+    void SetSunShadow(const SunShadowReceive& shadow);
+    // One skinned instance (already skinned into skinSlot this frame) into a sun shadow cascade,
+    // depth only. Call inside the cascade's render pass (viewport set by its owner).
+    void RenderShadowCaster(ixrhi::IXRHICommandList& cmd,
+        const ixrhi::IXRHIFrameInfo& frame,
+        const WorldMat4& lightViewProj,
+        const ixrhi::IXRHIRenderPass* shadowPass,
+        WorldVec3 position,
+        float yawRadians,
+        uint32_t skinSlot,
+        std::array<float, 3> scale);
     void SetMotionState(MotionState state);
     float GroundOffsetY() const;
     std::uint32_t MaterialSlotCount() const { return std::max<std::uint32_t>(1u, static_cast<std::uint32_t>(m_draws.size())); }
@@ -210,6 +224,9 @@ private:
     bool CreateBindGroup(ixrhi::IXRHIDevice& rhi);
     bool CreatePipeline(ixrhi::IXRHIDevice& rhi);
     bool CreateReflectionPipeline(ixrhi::IXRHIDevice& rhi, const ixrhi::IXRHIRenderPass* renderPass);
+    bool CreateShadowPipeline(ixrhi::IXRHIDevice& rhi, const ixrhi::IXRHIRenderPass* shadowPass);
+    // Whether the draws' descriptors are complete (the sun shadow map is bound); logs once if not.
+    bool SunShadowBound() const;
     bool CreateComputeResources(ixrhi::IXRHIDevice& rhi);
     bool CreateComputeBindGroup(ixrhi::IXRHIDevice& rhi);
     bool CreateComputePipeline(ixrhi::IXRHIDevice& rhi);
@@ -255,6 +272,11 @@ private:
     std::unique_ptr<ixrhi::IXRHIGraphicsPipeline> m_pipeline;
     std::unique_ptr<ixrhi::IXRHIGraphicsPipeline> m_reflectionPipeline;
     const ixrhi::IXRHIRenderPass* m_reflectionPass = nullptr; // borrowed (terrain owns)
+    std::unique_ptr<ixrhi::IXRHIGraphicsPipeline> m_shadowPipeline;  // sun shadow cascades, depth only
+    const ixrhi::IXRHIRenderPass* m_shadowPass = nullptr;             // borrowed (terrain owns)
+    bool m_shadowPipelineFailed = false;
+    SunShadowReceive m_sunShadow;
+    const ixrhi::IXRHITexture* m_boundSunShadowTexture = nullptr;     // what binding 2 holds in every set
     std::unique_ptr<ixrhi::IXRHIComputePipeline> m_computePipeline;
     std::vector<Vertex> m_vertices;
     std::vector<uint32_t> m_indices;

@@ -17,6 +17,7 @@
 #include "WorldCamera.h"
 #include "InputEvent.h"
 #include "MapEditorTypes.h"
+#include "SunShadow.h"
 
 #include "IXRHIBinding.h"
 #include "IXRHIBuffer.h"
@@ -181,9 +182,23 @@ public:
     // memory) vertex buffer and the painted splat rectangle into the splat textures. Call once per
     // frame outside any render pass, before the terrain is drawn.
     void UploadEditedTerrain(ixrhi::IXRHICommandList& cmd, const ixrhi::IXRHIFrameInfo& frame);
+    // Draws the sun shadow cascades: the terrain (if any), then in each cascade whatever drawCasters
+    // adds (the meshes), given the cascade, its light view-projection and its render pass.
+    // castersRevision changes whenever those casters do (moved, animated): while it, the camera,
+    // the sun and the terrain stay the same, the map already drawn is reused.
+    using ShadowCasterDraw = std::function<void(std::uint32_t cascade,
+                                                const WorldMat4& lightViewProj,
+                                                const ixrhi::IXRHIRenderPass* pass)>;
     void RenderSunShadowMap(ixrhi::IXRHICommandList& cmd,
                             const ixrhi::IXRHIFrameInfo& frame,
-                            const WorldCamera& camera);
+                            const WorldCamera& camera,
+                            std::uint64_t castersRevision = 0,
+                            const ShadowCasterDraw& drawCasters = {});
+    // Clears the cascades once (all lit) so the map is shader-readable before anything draws into
+    // it; the terrain and mesh draws bind it either way. Call outside render passes.
+    void EnsureSunShadowMapReadable(ixrhi::IXRHICommandList& cmd);
+    // The map as the mesh renderers sample it (enabled when it was drawn in frame `frameNumber`).
+    SunShadowReceive SunShadowForMeshes(std::uint64_t frameNumber) const;
     // The sun shadow cascades for other passes (volumetric light): the D32 array (one layer per
     // cascade, shader-readable) when RenderSunShadowMap drew it in the frame `frameNumber`, else null.
     std::shared_ptr<ixrhi::IXRHITexture> SunShadowTexture(std::uint64_t frameNumber) const
@@ -556,12 +571,14 @@ private:
     std::unique_ptr<ixrhi::IXRHIGraphicsPipeline> m_shadowPipeline;
     std::array<WorldMat4, kShadowCascadeCount> m_shadowCascadeViewProj{};
     std::uint64_t m_shadowDrawnFrame = ~0ull;  // frame number of the last RenderSunShadowMap draw
+    bool m_shadowMapReadable = false;           // cleared or drawn at least once: shader-readable
+    std::array<float, kShadowCascadeCount> m_shadowCascadeDepthRange{};  // metres per depth unit
+    std::array<float, kShadowCascadeCount> m_shadowCascadeTexelSize{};   // metres per texel
     // What the shadow map was last drawn from. While it stays the same (an editor camera at rest)
     // the map is reused instead of drawn again: only the terrain casts into it.
     struct ShadowMapInputs
     {
-        float eye[3] = {};
-        float target[3] = {};
+        float eye[3] = {};  // the cascades are balls around the eye: turning the camera keeps them
         float sunAzimuth = 0.0f;
         float sunElevation = 0.0f;
         const void* vertexBuffer = nullptr;
@@ -569,6 +586,7 @@ private:
         const void* shadowTexture = nullptr;
         std::uint32_t indexCount = 0;
         std::uint64_t geometryRevision = 0;
+        std::uint64_t castersRevision = 0;
         bool operator==(const ShadowMapInputs&) const = default;
     };
     std::optional<ShadowMapInputs> m_shadowMapInputs;
