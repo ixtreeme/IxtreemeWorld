@@ -135,6 +135,9 @@ public:
                                   std::uint32_t height);
     // Whether any enabled water body is inside the camera's view (its water pass would draw).
     bool AnyWaterBodyInView(const WorldCamera& camera) const;
+    // Whether a world box lies wholly under the surface of a water body it is over (by the body's
+    // extent): a transparent thing there is drawn before the water, which then refracts it.
+    bool BoxUnderWater(WorldVec3 boundsMin, WorldVec3 boundsMax) const;
     bool HandleEditorInput(const InputEvent& event);
     void UpdateEditor(ixrhi::IXRHIDevice& rhi,
                       double deltaSeconds,

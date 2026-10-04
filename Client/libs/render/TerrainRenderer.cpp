@@ -2287,6 +2287,24 @@ bool TerrainRenderer::AnyWaterBodyInView(const WorldCamera& camera) const
     return false;
 }
 
+bool TerrainRenderer::BoxUnderWater(WorldVec3 boundsMin, WorldVec3 boundsMax) const
+{
+    if (!m_sceneTerrainActive || m_sceneTerrain.editorHidden)
+        return false;
+    const float centerX = 0.5f * (boundsMin.x + boundsMax.x);
+    const float centerZ = 0.5f * (boundsMin.z + boundsMax.z);
+    for (const WaterBodyGpu& waterBody : m_waterBodies)
+    {
+        if (!ResolveWaterConfig(waterBody.body).enabled || waterBody.indexCount == 0)
+            continue;
+        if (centerX >= waterBody.boundsMin.x && centerX <= waterBody.boundsMax.x &&
+            centerZ >= waterBody.boundsMin.z && centerZ <= waterBody.boundsMax.z &&
+            boundsMax.y <= waterBody.body.waterLevelY)
+            return true;
+    }
+    return false;
+}
+
 void TerrainRenderer::RenderWaterReflection(ixrhi::IXRHICommandList& cmd,
                                               const ixrhi::IXRHIFrameInfo& frame,
                                               const WorldCamera& camera,

@@ -10998,6 +10998,54 @@ int RunGame(NativeWindow& window,
             const ToneMapSettings frameToneMap{std::clamp<std::int32_t>(sceneSky.toneMapping, 0, 2), std::exp2(sceneSky.exposureEv)};
             // The Scene View's editor outlines: drawn over its tone-mapped image, not into the light.
             std::vector<SelectionOutlineRenderer::Line> sceneViewOutlineLines;
+            // Each view's alpha-blended draws (Blend materials): after its opaque scene and sky, the
+            // farthest first; those wholly under a water surface before the water, which refracts them.
+            struct TransparentDraw
+            {
+                float distanceSq = 0.0f;  // from the view's camera to the box's centre
+                bool underWater = false;
+                StaticMeshRenderer* renderer = nullptr;
+                StaticMeshRenderer::Instance instance;
+            };
+            auto addTransparentDraw = [&](std::vector<TransparentDraw>& draws,
+                                          StaticMeshRenderer* renderer,
+                                          const StaticMeshRenderer::Instance& instance,
+                                          const SpatialIndex::Aabb& bounds,
+                                          const WorldCamera& viewCamera) {
+                TransparentDraw& draw = draws.emplace_back();
+                const float dx = 0.5f * (bounds.min.x + bounds.max.x) - viewCamera.eye.x;
+                const float dy = 0.5f * (bounds.min.y + bounds.max.y) - viewCamera.eye.y;
+                const float dz = 0.5f * (bounds.min.z + bounds.max.z) - viewCamera.eye.z;
+                draw.distanceSq = dx * dx + dy * dy + dz * dz;
+                draw.underWater = terrainOk && terrain.BoxUnderWater(bounds.min, bounds.max);
+                draw.renderer = renderer;
+                draw.instance = instance;
+            };
+            auto sortTransparentDraws = [](std::vector<TransparentDraw>& draws) {
+                std::stable_sort(draws.begin(), draws.end(), [](const TransparentDraw& a, const TransparentDraw& b) {
+                    return a.distanceSq > b.distanceSq;
+                });
+            };
+            auto drawTransparents = [&](const std::vector<TransparentDraw>& draws,
+                                        bool underWater,
+                                        const WorldCamera& viewCamera,
+                                        std::uint32_t width,
+                                        std::uint32_t height) {
+                for (const TransparentDraw& draw : draws)
+                {
+                    if (draw.underWater == underWater)
+                        draw.renderer->RenderTransparentInWorld(*frameInfo.commandList,
+                            frameInfo,
+                            seconds,
+                            viewCamera,
+                            draw.instance,
+                            width,
+                            height);
+                }
+            };
+            std::vector<TransparentDraw> sceneTransparentDraws;
+            std::vector<TransparentDraw> gameTransparentDraws;
+            bool sceneWaterPass = false;  // the Scene View's water gets its own pass (after a snapshot)
             // The sun shadow map is rendered once and sampled by every view; its cascades are fitted
             // to the Scene View camera, or to the Game view's while only the Game view is drawn (Play).
             const WorldCamera* shadowCamera = &frameCamera;
@@ -11508,6 +11556,8 @@ int RunGame(NativeWindow& window,
                             instance.selectedForOutline = false;
                             instance.materialSlots = mesh.materialSlots;
                             instance.materialOverrides = mesh.materialOverrides;
+                            if (renderer->HasTransparentDraws(instance))
+                                addTransparentDraw(sceneTransparentDraws, renderer, instance, worldBounds, camera);
                             LodConfig effectiveLodConfig{};
                             std::uint64_t lodConfigHash = 0;
                             std::uint32_t lodLevel = 0;
@@ -11774,6 +11824,14 @@ int RunGame(NativeWindow& window,
                 // only the pixels nothing covers are shaded.
                 if (skyOk)
                     skyRenderer.Render(*frameInfo.commandList, frameInfo, camera, renderSize.width, renderSize.height);
+                // The water is drawn in a pass of its own (over a snapshot of this one) when it is in view.
+                sceneWaterPass = useOffscreenScene && hasSceneTerrain && terrain.AnyWaterBodyInView(camera);
+                // Transparent draws over the sky: those under water now; the rest after the water (its
+                // pass, or right below in direct mode), or now when no water follows.
+                sortTransparentDraws(sceneTransparentDraws);
+                drawTransparents(sceneTransparentDraws, /*underWater=*/true, camera, renderSize.width, renderSize.height);
+                if (useOffscreenScene && !sceneWaterPass)
+                    drawTransparents(sceneTransparentDraws, /*underWater=*/false, camera, renderSize.width, renderSize.height);
                 if (selectionOutlinesOk)
                 {
                     std::vector<SelectionOutlineRenderer::Line> selectionLines =
@@ -11965,6 +12023,8 @@ int RunGame(NativeWindow& window,
                 {
                     terrain.RenderWater(*frameInfo.commandList, frameInfo, camera, seconds, renderSize.width, renderSize.height);
                 }
+                if (!useOffscreenScene)
+                    drawTransparents(sceneTransparentDraws, /*underWater=*/false, camera, renderSize.width, renderSize.height);
                 if (!useOffscreenScene && worldLabelsOk)
                     worldLabels.Render(*frameInfo.commandList, frameInfo, camera, plates);
                 rhiDevice->WriteTimestamp(ixrhi::IXRHITimestampPoint::SceneOtherEnd);
@@ -11985,8 +12045,8 @@ int RunGame(NativeWindow& window,
                 offscreenScene.EndMainPass(*frameInfo.commandList);
                 // The water needs a copy of the finished scene (refraction, depth fade) and its own
                 // pass, only while a water body is in view.
-                const bool sceneSnapshotForWater =
-                    isInWorld && hasSceneTerrain && drawSceneView && terrain.AnyWaterBodyInView(camera);
+                // (Decided where the main pass ended: only inside the drawn world, with water in view.)
+                const bool sceneSnapshotForWater = sceneWaterPass;
                 if (sceneSnapshotForWater)
                 {
                     offscreenScene.SnapshotScene(*frameInfo.commandList, frameInfo);
@@ -11997,6 +12057,8 @@ int RunGame(NativeWindow& window,
                         offscreenScene.Height());
                     offscreenScene.BeginMainPass(*frameInfo.commandList, frameInfo, false);
                     terrain.RenderWater(*frameInfo.commandList, frameInfo, camera, seconds, renderSize.width, renderSize.height);
+                    // The transparent draws above the water, over it.
+                    drawTransparents(sceneTransparentDraws, /*underWater=*/false, camera, renderSize.width, renderSize.height);
                     offscreenScene.EndMainPass(*frameInfo.commandList);
                 }
                 // God rays over the finished scene (water included). They read the depth snapshot:
@@ -12081,6 +12143,9 @@ int RunGame(NativeWindow& window,
                                 instance.scale[2] = mesh->scale[2];
                                 instance.materialSlots = mesh->materialSlots;
                                 instance.materialOverrides = mesh->materialOverrides;
+                                if (renderer->HasTransparentDraws(instance))
+                                    addTransparentDraw(gameTransparentDraws, renderer, instance,
+                                        StaticMeshWorldAabb(*mesh, *renderer), gameCamera);
                                 gameMeshBatches[renderer].push_back(std::move(instance));
                             }
                             for (auto& [gameRenderer, gameInstances] : gameMeshBatches)
@@ -12117,8 +12182,12 @@ int RunGame(NativeWindow& window,
                         if (skyOk && isInWorld)
                             skyRenderer.Render(*frameInfo.commandList, frameInfo, gameCamera,
                                 gameExtent.width, gameExtent.height);
+                        // Transparent draws: those under water, the water, then the rest over it.
+                        sortTransparentDraws(gameTransparentDraws);
+                        drawTransparents(gameTransparentDraws, /*underWater=*/true, gameCamera, gameExtent.width, gameExtent.height);
                         if (hasSceneTerrain)
                             terrain.RenderWater(*frameInfo.commandList, frameInfo, gameCamera, seconds, gameExtent.width, gameExtent.height, /*viewIndex=*/1);
+                        drawTransparents(gameTransparentDraws, /*underWater=*/false, gameCamera, gameExtent.width, gameExtent.height);
                         // God rays over the game image, under the game's UI: close the pass for a depth
                         // snapshot and the ray passes, then reopen it (loaded) for the composite.
                         const GodRayRenderer::SunShadow gameSunShadow{terrain.SunShadowTexture(frameInfo.frameNumber),

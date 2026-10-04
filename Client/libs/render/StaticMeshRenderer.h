@@ -170,6 +170,18 @@ public:
         std::uint32_t lodLevel,
         std::uint32_t targetWidth = 0,
         std::uint32_t targetHeight = 0);
+    // Whether any of the instance's draws has an alpha-blended (Blend) material. The batches above
+    // leave those out: RenderTransparentInWorld draws them, in the frame's back-to-front order.
+    bool HasTransparentDraws(const Instance& instance) const;
+    // The instance's alpha-blended draws, over what is already drawn: depth tested but not written,
+    // back faces before front faces. Call after the opaque scene, the farthest instance first.
+    void RenderTransparentInWorld(ixrhi::IXRHICommandList& cmd,
+        const ixrhi::IXRHIFrameInfo& frame,
+        double timeSeconds,
+        const WorldCamera& camera,
+        const Instance& instance,
+        std::uint32_t targetWidth = 0,
+        std::uint32_t targetHeight = 0);
     void RequestLodQualityBuild(const LodConfig& lodConfig, std::uint64_t configHash, std::uint32_t entityId);
     void Destroy();
 
@@ -409,6 +421,8 @@ private:
     std::unique_ptr<ixrhi::IXRHIGraphicsPipeline> m_unlitPipeline;
     std::unique_ptr<ixrhi::IXRHIGraphicsPipeline> m_unlitMaskPipeline;
     std::unique_ptr<ixrhi::IXRHIGraphicsPipeline> m_outlinePipeline;
+    // Alpha-blended (Blend materials): [lit, unlit] x [back faces, front faces].
+    std::array<std::array<std::unique_ptr<ixrhi::IXRHIGraphicsPipeline>, 2>, 2> m_blendPipelines;
     // Sun shadow pass (depth only), baked against the cascades' pass: opaque, and alpha-masked.
     std::unique_ptr<ixrhi::IXRHIGraphicsPipeline> m_shadowPipeline;
     std::unique_ptr<ixrhi::IXRHIGraphicsPipeline> m_shadowMaskPipeline;

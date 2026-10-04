@@ -667,8 +667,20 @@ const char* AlphaFragmentPath(const std::string& alphaMode)
     if (alphaMode == "mask" || alphaMode == "MASK")
         return "discard";
     if (alphaMode == "blend" || alphaMode == "BLEND")
-        return "blend-fallback-opaque";
+        return "blend";
     return "none";
+}
+
+// Whether the material in an instance's slot is alpha-blended (only a material asset sets that).
+bool IsBlendMaterialSlot(const StaticMeshRenderer::Instance& instance, std::uint32_t materialSlot)
+{
+    if (materialSlot >= instance.materialSlots.size())
+        return false;
+    const std::optional<Guid> guid = Guid::fromString(instance.materialSlots[materialSlot]);
+    if (!guid)
+        return false;
+    const MaterialAsset* material = MaterialAssetManager::Instance().getOrLoad(*guid);
+    return material && material->alphaMode == MaterialAsset::AlphaMode::Blend;
 }
 
 std::string SanitizedStem(std::string value)
@@ -2778,6 +2790,37 @@ bool StaticMeshRenderer::CreatePipeline(ixrhi::IXRHIDevice& rhi)
         !createVariant("StaticMesh:UnlitMask", unlitPs, m_unlitMaskPipeline))
         return false;
 
+    // Alpha-blended: over what is drawn, depth tested but not written. Each side of the faces in its
+    // own draw, back faces first (outward faces are the front ones, see the outline below), so a
+    // closed transparent shape blends its far side under its near side.
+    ixrhi::IXRHIGraphicsPipelineDesc blend = desc;
+    blend.depthWriteEnable = false;
+    blend.depthCompareOp = ixrhi::IXRHICompareOp::LessOrEqual;
+    blend.blendAttachments = {{true,
+        ixrhi::IXRHIBlendFactor::SrcAlpha,
+        ixrhi::IXRHIBlendFactor::OneMinusSrcAlpha,
+        ixrhi::IXRHIBlendOp::Add,
+        ixrhi::IXRHIBlendFactor::One,
+        ixrhi::IXRHIBlendFactor::OneMinusSrcAlpha,
+        ixrhi::IXRHIBlendOp::Add}};
+    const std::array<std::shared_ptr<ixrhi::IXRHIShader>, 2> blendFragments = {ps, unlitPs};
+    const std::array<std::array<const char*, 2>, 2> blendNames = {{
+        {"StaticMesh:BlendBack", "StaticMesh:BlendFront"},
+        {"StaticMesh:UnlitBlendBack", "StaticMesh:UnlitBlendFront"},
+    }};
+    for (std::size_t shading = 0; shading < 2; ++shading)
+    {
+        for (std::size_t side = 0; side < 2; ++side)
+        {
+            blend.fragmentShader = blendFragments[shading];
+            blend.cullMode = side == 0 ? ixrhi::IXRHICullMode::Front : ixrhi::IXRHICullMode::Back;
+            blend.debugName = blendNames[shading][side];
+            m_blendPipelines[shading][side] = rhi.CreateGraphicsPipeline(blend);
+            if (!m_blendPipelines[shading][side])
+                return false;
+        }
+    }
+
     desc.vertexShader = outlineVs;
     desc.fragmentShader = outlinePs;
     desc.cullMode = ixrhi::IXRHICullMode::Front;
@@ -3126,6 +3169,7 @@ void StaticMeshRenderer::RenderLodBatchInWorld(ixrhi::IXRHICommandList& cmd,
         const Instance* instance = nullptr;
         MaterialTextureViews textures;
         bool isMask = false;
+        bool isBlend = false;  // left to RenderTransparentInWorld
     };
     std::vector<MaterialRun> materialRuns;
     materialRuns.reserve(drawCommands.size());
@@ -3145,12 +3189,13 @@ void StaticMeshRenderer::RenderLodBatchInWorld(ixrhi::IXRHICommandList& cmd,
         run.instance = &instances[runStart];
         run.textures = ResolveMaterialTextureViews(*m_rhi, *run.instance, run.draw.materialSlot);
         run.isMask = std::strcmp(run.textures.fragmentShaderAlphaPath, "discard") == 0;
+        run.isBlend = std::strcmp(run.textures.fragmentShaderAlphaPath, "blend") == 0;
         runStart = runEnd;
     }
     auto drawPass = [&](bool maskPass) {
         for (const MaterialRun& run : materialRuns)
         {
-            if (run.isMask != maskPass)
+            if (run.isMask != maskPass || run.isBlend)
                 continue;
             const InstancedDrawCommand& command = *run.command;
             const InstancedDrawCommand& draw = run.draw;
@@ -3160,17 +3205,6 @@ void StaticMeshRenderer::RenderLodBatchInWorld(ixrhi::IXRHICommandList& cmd,
             const ixrhi::IXRHIGraphicsPipeline* pipelineForDraw = materialTextures.unlit
                 ? (run.isMask ? m_unlitMaskPipeline.get() : m_unlitPipeline.get())
                 : (run.isMask ? m_maskPipeline.get() : m_pipeline.get());
-            if (std::strcmp(materialTextures.fragmentShaderAlphaPath, "blend-fallback-opaque") == 0)
-            {
-                static std::unordered_set<std::string> loggedBlendFallbacks;
-                const std::string key = m_modelPath + ":" + std::to_string(draw.materialSlot);
-                if (loggedBlendFallbacks.insert(key).second)
-                    LogFormat("[MATERIAL] BLEND mode not yet supported, falling back to OPAQUE material=%s slot=%u",
-                        materialTextures.resolvedMaterial.c_str(),
-                        draw.materialSlot);
-                pipelineForDraw =
-                    materialTextures.unlit ? m_unlitPipeline.get() : m_pipeline.get();
-            }
 
             if (boundPipeline != pipelineForDraw)
             {
@@ -3290,6 +3324,77 @@ void StaticMeshRenderer::RenderLodBatchInWorld(ixrhi::IXRHICommandList& cmd,
         }
     }
     m_lastSubmittedInstances = static_cast<std::uint32_t>(instances.size());
+}
+
+bool StaticMeshRenderer::HasTransparentDraws(const Instance& instance) const
+{
+    for (const MeshDraw& draw : m_draws)
+    {
+        if (draw.indexCount != 0 && IsBlendMaterialSlot(instance, draw.materialSlot))
+            return true;
+    }
+    return false;
+}
+
+void StaticMeshRenderer::RenderTransparentInWorld(ixrhi::IXRHICommandList& cmd,
+    const ixrhi::IXRHIFrameInfo& frame,
+    double timeSeconds,
+    const WorldCamera& camera,
+    const Instance& instance,
+    std::uint32_t targetWidth,
+    std::uint32_t targetHeight)
+{
+    if (!m_rhi || !m_bindGroup || !m_vertexBuffer || !m_indexBuffer || m_indices.empty() || !frame.frameActive ||
+        !m_boundSunShadowTexture || !m_blendPipelines[0][0] || !m_blendPipelines[1][1])
+        return;
+    const std::uint32_t extentWidth = targetWidth > 0 ? targetWidth : frame.targetWidth;
+    const std::uint32_t extentHeight = targetHeight > 0 ? targetHeight : frame.targetHeight;
+    if (extentWidth == 0 || extentHeight == 0)
+        return;
+
+    std::vector<std::size_t> blendDraws;
+    for (std::size_t i = 0; i < m_draws.size(); ++i)
+    {
+        if (m_draws[i].indexCount != 0 && IsBlendMaterialSlot(instance, m_draws[i].materialSlot))
+            blendDraws.push_back(i);
+    }
+    if (blendDraws.empty())
+        return;
+
+    const uint32_t frameIndex = frame.frameIndex % kFramesInFlight;
+    if (m_worldRenderFrameIndex != frameIndex)
+    {
+        m_worldRenderFrameIndex = frameIndex;
+        m_worldUniformCursor = 0;
+        m_worldInstanceCursor = 0;
+    }
+    std::vector<InstanceBlock> blocks(blendDraws.size());
+    for (std::size_t i = 0; i < blendDraws.size(); ++i)
+        FillStaticMeshInstanceBlock(camera, instance, m_draws[blendDraws[i]].materialSlot, m_materialDefaults, blocks[i]);
+    const std::optional<std::uint32_t> base = AppendInstanceBlocks(frameIndex, blocks);
+    if (!base)
+        return;
+
+    cmd.SetViewport(0.0f, 0.0f, static_cast<float>(extentWidth), static_cast<float>(extentHeight));
+    cmd.SetScissor(0, 0, extentWidth, extentHeight);
+    cmd.SetVertexBuffer(0, *m_vertexBuffer, 0);
+    cmd.SetIndexBuffer(*m_indexBuffer, 0, /*thirtyTwoBit=*/true);
+    for (std::size_t i = 0; i < blendDraws.size(); ++i)
+    {
+        const MeshDraw& draw = m_draws[blendDraws[i]];
+        const MaterialTextureViews textures = ResolveMaterialTextureViews(*m_rhi, instance, draw.materialSlot);
+        const uint32_t uniformSlot = std::min(m_worldUniformCursor++, kUniformSlots - 1);
+        UpdateWorldUniform(frameIndex, uniformSlot, camera, instance, timeSeconds, draw.materialSlot);
+        UpdateMaterialTextureDescriptors(frameIndex, uniformSlot, textures);
+        // The set binds against the bound pipeline's layout: this renderer's first (the previous draw
+        // may be another renderer's); the second side shares the layout, so the set stays bound.
+        const auto& sides = m_blendPipelines[textures.unlit ? 1 : 0];
+        cmd.SetGraphicsPipeline(*sides[0]);  // back faces
+        cmd.BindGroup(0, *m_bindGroup, frameIndex * kUniformSlots + uniformSlot);
+        cmd.DrawIndexed(draw.indexCount, 1, draw.firstIndex, 0, *base + static_cast<std::uint32_t>(i));
+        cmd.SetGraphicsPipeline(*sides[1]);  // front faces
+        cmd.DrawIndexed(draw.indexCount, 1, draw.firstIndex, 0, *base + static_cast<std::uint32_t>(i));
+    }
 }
 
 std::optional<std::uint32_t> StaticMeshRenderer::AppendInstanceBlocks(uint32_t frameIndex,
@@ -3417,10 +3522,12 @@ void StaticMeshRenderer::RenderShadowCasters(ixrhi::IXRHICommandList& cmd,
         const std::uint32_t drawBase = *base + static_cast<std::uint32_t>(drawIndex) * instanceCount;
         for (std::uint32_t runStart = 0; runStart < instanceCount;)
         {
-            const bool masked = blocks[drawBase - *base + runStart].materialAlpha[0] == 1.0f;
+            // Alpha-masked and alpha-blended materials (mode 1, 2) cast where their alpha reaches the
+            // cutoff: a faint glass casts nothing instead of a solid block.
+            const bool masked = blocks[drawBase - *base + runStart].materialAlpha[0] >= 1.0f;
             std::uint32_t runEnd = runStart + 1;
             // Opaque instances share one draw; a masked one draws alone with its own texture.
-            while (!masked && runEnd < instanceCount && blocks[drawBase - *base + runEnd].materialAlpha[0] != 1.0f)
+            while (!masked && runEnd < instanceCount && blocks[drawBase - *base + runEnd].materialAlpha[0] < 1.0f)
                 ++runEnd;
             const ixrhi::IXRHIGraphicsPipeline* pipeline = masked ? m_shadowMaskPipeline.get() : m_shadowPipeline.get();
             if (boundPipeline != pipeline)
@@ -3453,6 +3560,11 @@ void StaticMeshRenderer::DestroyPipeline()
     m_unlitPipeline.reset();
     m_unlitMaskPipeline.reset();
     m_outlinePipeline.reset();
+    for (auto& sides : m_blendPipelines)
+    {
+        for (auto& pipeline : sides)
+            pipeline.reset();
+    }
     m_shadowPipeline.reset();
     m_shadowMaskPipeline.reset();
     m_shadowPass = nullptr;
