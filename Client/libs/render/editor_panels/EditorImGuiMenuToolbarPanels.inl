@@ -839,6 +839,9 @@ void EditorImGui::RenderSceneSettingsPanel()
             if (ImGui::CollapsingHeader(ICON_FA_SUN "  God rays", ImGuiTreeNodeFlags_DefaultOpen))
                 RenderGodRaysPanel();
 
+            if (ImGui::CollapsingHeader(ICON_FA_CAMERA "  Tone mapping", ImGuiTreeNodeFlags_DefaultOpen))
+                RenderToneMappingPanel();
+
             if (ImGui::CollapsingHeader(ICON_FA_CUBES "  Physics", ImGuiTreeNodeFlags_DefaultOpen))
             {
                 PhysicsSceneSettings physicsSettings = scene.physics;

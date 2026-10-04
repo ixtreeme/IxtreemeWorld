@@ -1198,6 +1198,44 @@ SkySettings ReadSkySettings(const JsonValue& object)
     return sky;
 }
 
+const char* ToneMappingName(std::int32_t mode)
+{
+    switch (mode)
+    {
+    case 0: return "none";
+    case 2: return "filmic";
+    default: return "neutral";
+    }
+}
+
+std::int32_t ToneMappingFromName(const std::string& name, std::int32_t fallback)
+{
+    if (name == "none")
+        return 0;
+    if (name == "neutral")
+        return 1;
+    if (name == "filmic")
+        return 2;
+    return fallback;
+}
+
+// The "tone_mapping" object inside "environment" (kept in SkySettings with the scene's other looks).
+void WriteToneMapping(std::ostream& out, const SkySettings& sky)
+{
+    out << "    \"tone_mapping\": {\n";
+    out << "      \"mode\": \"" << ToneMappingName(sky.toneMapping) << "\",\n";
+    out << "      \"exposure_ev\": " << (sky.exposureEv == 0.0f ? 0.0f : sky.exposureEv) << "\n";  // no "-0"
+    out << "    }";
+}
+
+void ReadToneMapping(const JsonValue& object, SkySettings& sky)
+{
+    sky.toneMapping = ToneMappingFromName(ReadString(object, "mode"), sky.toneMapping);
+    sky.exposureEv = std::clamp(ReadFloat(object, "exposure_ev", sky.exposureEv), -8.0f, 8.0f);
+    if (sky.exposureEv == 0.0f)
+        sky.exposureEv = 0.0f;  // a "-0" shows as "-0.0 EV"
+}
+
 MapEditorPaletteSlot ReadPaletteSlot(const JsonValue& object)
 {
     MapEditorPaletteSlot slot;
@@ -2295,6 +2333,10 @@ bool SceneManager::LoadSceneInternal(const std::string& path)
             scene.sky = ReadSkySettings(*sky);
         else
             scene.sky.mode = SkySettings::Mode::Color;
+        // Scenes saved before it get the neutral curve: up to 0.8 they look exactly as they did.
+        if (const JsonValue* toneMapping = Find(*env, "tone_mapping");
+            toneMapping && toneMapping->type == JsonValue::Type::Object)
+            ReadToneMapping(*toneMapping, scene.sky);
     }
     if (const JsonValue* physics = Find(root, "physics"); physics && physics->type == JsonValue::Type::Object)
     {
@@ -2612,6 +2654,8 @@ bool SceneManager::SaveSceneInternal(const std::string& path)
     out << "    \"ambient_color\": " << FloatArray(ambientColor, 3) << ",\n";
     out << "    \"ambient_intensity\": " << scene.lighting.ambient.intensity << ",\n";
     WriteSkySettings(out, scene.sky);
+    out << ",\n";
+    WriteToneMapping(out, scene.sky);
     out << "\n  },\n";
     out << "  \"physics\": {\n";
     out << "    \"gravity\": " << FloatArray(scene.physics.gravity, 3) << ",\n";

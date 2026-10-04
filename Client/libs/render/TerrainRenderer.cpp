@@ -6160,7 +6160,8 @@ bool TerrainRenderer::CreateOrRecreateWaterReflectionResources(ixrhi::IXRHIDevic
     const uint32_t divisor = WaterReflectionDivisor(quality);
     const uint32_t width = std::max(1u, baseWidth / divisor);
     const uint32_t height = std::max(1u, baseHeight / divisor);
-    const ixrhi::IXRHIFormat colorFormat = rhi.GetMainSwapchain().ColorFormat();
+    // Floating point like the views it is mirrored into: a bright sky or sun stays bright in the water.
+    const ixrhi::IXRHIFormat colorFormat = ixrhi::IXRHIFormat::R16G16B16A16Float;
     const ixrhi::IXRHIFormat depthFormat = rhi.GetMainSwapchain().DepthFormat();
 
     if (!force && m_waterReflection.color && m_waterReflection.depth &&

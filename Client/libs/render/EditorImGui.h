@@ -387,6 +387,7 @@ private:
     void RenderLightingPanel();
     void RenderSkyPanel();
     void RenderGodRaysPanel();
+    void RenderToneMappingPanel();
     void RenderGizmoControls();
     // Terrain and water editing tools, shown in the Inspector of the selected terrain / water body.
     void RenderWaterSculptTool();

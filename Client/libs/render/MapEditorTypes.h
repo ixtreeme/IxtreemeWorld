@@ -284,6 +284,13 @@ struct SkySettings
     float volumetricDistance = 120.0f;   // how far along a view ray light is gathered (m)
     std::int32_t volumetricQuality = 1;  // 0 low (16 steps), 1 medium (32), 2 high (64)
 
+    // Tone mapping: how the views' light (floating point, any brightness) is brought to the screen.
+    // Saved as the environment's "tone_mapping", beside the sky.
+    // 0 none: clipped at white (the look before HDR); 1 neutral: colours as authored up to 0.8, then a
+    // soft roll-off to white; 2 filmic (ACES fit): more contrast, brighter midtones.
+    std::int32_t toneMapping = 1;
+    float exposureEv = 0.0f;  // brightness in stops: +1 doubles the light, -1 halves it
+
     bool ScreenSpaceGodRays() const { return godRays && godRayTechnique != 1; }
     bool VolumetricGodRays() const { return godRays && godRayTechnique != 0; }
 };

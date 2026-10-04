@@ -1,7 +1,7 @@
-// OffscreenSceneRenderer — IXRHI-native facade implementation. Same targets,
-// same clear values, same snapshot sequencing, same composite (fullscreen
-// triangle + Reinhard tone map) as before; all Vulkan objects live in the
-// backend behind IXRHI types.
+// OffscreenSceneRenderer — IXRHI-native facade implementation. A floating-point
+// scene target with its snapshots, and the tone-map pass (fullscreen triangle,
+// Composite.hlsl) into the display image or the swapchain; all Vulkan objects
+// live in the backend behind IXRHI types.
 
 #include "OffscreenSceneRenderer.h"
 
@@ -51,7 +51,7 @@ bool OffscreenSceneRenderer::Create(ixrhi::IXRHIDevice& rhi,
                                     client::asset::IAssetReader& assets,
                                     std::uint32_t width,
                                     std::uint32_t height,
-                                    ixrhi::IXRHIFormat colorFormat,
+                                    ixrhi::IXRHIFormat displayFormat,
                                     ixrhi::IXRHIFormat depthFormat,
                                     const std::string& tag)
 {
@@ -60,20 +60,18 @@ bool OffscreenSceneRenderer::Create(ixrhi::IXRHIDevice& rhi,
     m_assets = &assets;
     m_width = width;
     m_height = height;
-    m_colorFormat = colorFormat;
+    m_colorFormat = kSceneColorFormat;
+    m_displayFormat = displayFormat;
     m_depthFormat = depthFormat;
     m_tag = tag.empty() ? "SceneView" : tag;
 
-    if (m_width == 0 || m_height == 0 || m_colorFormat == ixrhi::IXRHIFormat::Undefined ||
+    if (m_width == 0 || m_height == 0 || m_displayFormat == ixrhi::IXRHIFormat::Undefined ||
         m_depthFormat == ixrhi::IXRHIFormat::Undefined)
         return false;
 
     m_ready = CreateTargets(rhi) && CreateComposite(rhi);
     if (m_ready)
-    {
-        Tracenf("[OFFSCREEN] Targets created: %ux%u, format=swapchain-compatible", m_width, m_height);
-        Tracen("[OFFSCREEN] Composite-pass active: swap-chain blit + central Reinhard tone-mapping");
-    }
+        Tracenf("[OFFSCREEN] %s targets created: %ux%u, scene RGBA16F, tone-mapped display", m_tag.c_str(), m_width, m_height);
     else
     {
         Tracen("[OFFSCREEN] Failed to initialize, falling back to direct swap-chain rendering");
@@ -85,14 +83,14 @@ bool OffscreenSceneRenderer::Create(ixrhi::IXRHIDevice& rhi,
 bool OffscreenSceneRenderer::Recreate(ixrhi::IXRHIDevice& rhi,
                                       std::uint32_t width,
                                       std::uint32_t height,
-                                      ixrhi::IXRHIFormat colorFormat,
+                                      ixrhi::IXRHIFormat displayFormat,
                                       ixrhi::IXRHIFormat depthFormat)
 {
     if (!m_assets)
         return false;
     rhi.WaitIdle();
     const std::string tag = m_tag;
-    return Create(rhi, *m_assets, width, height, colorFormat, depthFormat, tag);
+    return Create(rhi, *m_assets, width, height, displayFormat, depthFormat, tag);
 }
 
 void OffscreenSceneRenderer::BeginMainPass(ixrhi::IXRHICommandList& cmd,
@@ -148,14 +146,60 @@ void OffscreenSceneRenderer::SnapshotScene(ixrhi::IXRHICommandList& cmd,
     m_snapshotsReady = true;
 }
 
+void OffscreenSceneRenderer::BeginDisplayPass(ixrhi::IXRHICommandList& cmd,
+                                              const ixrhi::IXRHIFrameInfo& frame,
+                                              const ToneMapSettings& toneMap)
+{
+    if (!m_ready || !frame.frameActive || m_passActive || m_displayPassActive || !m_displayTarget ||
+        !m_displayPipeline)
+        return;
+    // The scene's color is shader-readable here: EndMainPass leaves it so (the pass's final layout).
+    m_displayTarget->Begin(cmd);
+    m_displayPassActive = true;
+    DrawToneMap(cmd, *m_displayPipeline, toneMap);
+}
+
+void OffscreenSceneRenderer::EndDisplayPass(ixrhi::IXRHICommandList& cmd)
+{
+    if (!m_displayPassActive)
+        return;
+    m_displayTarget->End(cmd);
+    m_displayPassActive = false;
+    m_displayReadable = true;
+}
+
+void OffscreenSceneRenderer::EnsureDisplayReadable(ixrhi::IXRHICommandList& cmd)
+{
+    if (!m_ready || m_displayReadable || m_passActive || m_displayPassActive || !m_displayTarget)
+        return;
+    m_displayTarget->Begin(cmd);  // clears it to black
+    m_displayTarget->End(cmd);
+    m_displayReadable = true;
+}
+
 void OffscreenSceneRenderer::RenderComposite(ixrhi::IXRHICommandList& cmd,
-                                             const ixrhi::IXRHIFrameInfo& frame)
+                                             const ixrhi::IXRHIFrameInfo& frame,
+                                             const ToneMapSettings& toneMap)
 {
     if (!m_ready || !frame.frameActive || !m_compositePipeline || !m_bindGroup)
         return;
+    DrawToneMap(cmd, *m_compositePipeline, toneMap);
+}
 
-    cmd.SetGraphicsPipeline(*m_compositePipeline);
+void OffscreenSceneRenderer::DrawToneMap(ixrhi::IXRHICommandList& cmd,
+                                         const ixrhi::IXRHIGraphicsPipeline& pipeline,
+                                         const ToneMapSettings& toneMap)
+{
+    // Composite.hlsl ToneMapParams.
+    struct
+    {
+        float exposure;
+        std::int32_t mode;
+        float padding[2];
+    } params{toneMap.exposure, toneMap.mode, {0.0f, 0.0f}};
+    cmd.SetGraphicsPipeline(pipeline);
     cmd.BindGroup(0, *m_bindGroup, 0);
+    cmd.PushConstants(&params, sizeof(params));
     cmd.Draw(3, 1, 0, 0);
 }
 
@@ -165,18 +209,21 @@ void OffscreenSceneRenderer::Destroy()
         return;
 
     m_compositePipeline.reset();
+    m_displayPipeline.reset();
     m_bindGroup.reset();
     m_bindLayout.reset();
     m_compositeVs.reset();
     m_compositePs.reset();
     m_clearTarget.reset();
     m_loadTarget.reset();
+    m_displayTarget.reset();
     m_activeTarget = nullptr;
     m_sampler.reset();
     m_color.reset();
     m_depth.reset();
     m_colorSnapshot.reset();
     m_depthSnapshot.reset();
+    m_display.reset();
 
     m_colorState = ixrhi::IXRHIImageLayout::Undefined;
     m_depthState = ixrhi::IXRHIImageLayout::Undefined;
@@ -187,12 +234,19 @@ void OffscreenSceneRenderer::Destroy()
     m_assets = nullptr;
     m_ready = false;
     m_passActive = false;
+    m_displayPassActive = false;
+    m_displayReadable = false;
     m_snapshotsReady = false;
 }
 
 const ixrhi::IXRHIRenderPass* OffscreenSceneRenderer::GetTargetPass() const
 {
     return m_clearTarget ? m_clearTarget->GetPass() : nullptr;
+}
+
+const ixrhi::IXRHIRenderPass* OffscreenSceneRenderer::GetDisplayPass() const
+{
+    return m_displayTarget ? m_displayTarget->GetPass() : nullptr;
 }
 
 bool OffscreenSceneRenderer::CreateTargets(ixrhi::IXRHIDevice& rhi)
@@ -222,7 +276,13 @@ bool OffscreenSceneRenderer::CreateTargets(ixrhi::IXRHIDevice& rhi)
         m_depthFormat,
         U::TransferDst | U::Sampled,
         m_tag + ".DepthSnapshot");
-    if (!m_color || !m_depth || !m_colorSnapshot || !m_depthSnapshot)
+    m_display = CreateTargetTexture(rhi,
+        m_width,
+        m_height,
+        m_displayFormat,
+        U::ColorAttachment | U::Sampled,
+        m_tag + ".Display");
+    if (!m_color || !m_depth || !m_colorSnapshot || !m_depthSnapshot || !m_display)
         return false;
 
     ixrhi::IXRHISamplerDesc samplerDesc;
@@ -259,7 +319,20 @@ bool OffscreenSceneRenderer::CreateTargets(ixrhi::IXRHIDevice& rhi)
     loadDesc.debugName = m_tag + ".LoadTarget";
     m_loadTarget = rhi.CreateRenderTarget(loadDesc);
 
-    return m_clearTarget != nullptr && m_loadTarget != nullptr;
+    // The tone-mapped image (no depth: its overlays draw over everything). Cleared to black: only
+    // EnsureDisplayReadable keeps that, the tone map covers every pixel.
+    ixrhi::IXRHIRenderTargetDesc displayDesc;
+    displayDesc.color = m_display;
+    displayDesc.colorLoad = ixrhi::IXRHILoadOp::Clear;
+    displayDesc.colorStore = ixrhi::IXRHIStoreOp::Store;
+    displayDesc.clearColor[0] = 0.0f;
+    displayDesc.clearColor[1] = 0.0f;
+    displayDesc.clearColor[2] = 0.0f;
+    displayDesc.clearColor[3] = 1.0f;
+    displayDesc.debugName = m_tag + ".DisplayTarget";
+    m_displayTarget = rhi.CreateRenderTarget(displayDesc);
+
+    return m_clearTarget != nullptr && m_loadTarget != nullptr && m_displayTarget != nullptr;
 }
 
 bool OffscreenSceneRenderer::CreateComposite(ixrhi::IXRHIDevice& rhi)
@@ -297,6 +370,7 @@ bool OffscreenSceneRenderer::CreateComposite(ixrhi::IXRHIDevice& rhi)
     desc.vertexShader = m_compositeVs;
     desc.fragmentShader = m_compositePs;
     desc.bindGroupLayouts = {m_bindLayout.get()};
+    desc.pushRanges = {{ixrhi::IXRHIShaderStage::Fragment, 0, 16}};  // ToneMapParams
     // No vertex buffers: procedural fullscreen triangle via SV_VertexID.
     desc.topology = ixrhi::IXRHIPrimitiveTopology::TriangleList;
     desc.cullMode = ixrhi::IXRHICullMode::None;
@@ -314,5 +388,8 @@ bool OffscreenSceneRenderer::CreateComposite(ixrhi::IXRHIDevice& rhi)
     desc.targetRenderPass = nullptr; // swapchain pass (backend default, as before)
     desc.debugName = m_tag + ".Composite";
     m_compositePipeline = rhi.CreateGraphicsPipeline(desc);
-    return m_compositePipeline != nullptr;
+    desc.targetRenderPass = m_displayTarget->GetPass();
+    desc.debugName = m_tag + ".ToneMap";
+    m_displayPipeline = rhi.CreateGraphicsPipeline(desc);
+    return m_compositePipeline != nullptr && m_displayPipeline != nullptr;
 }

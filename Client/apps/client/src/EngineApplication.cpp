@@ -2480,7 +2480,7 @@ int RunGame(NativeWindow& window,
         }
         if (selectionOutlinesOk)
         {
-            selectionOutlines.SetTargetPass(offscreenScene.GetTargetPass());
+            selectionOutlines.SetTargetPass(offscreenScene.GetDisplayPass());
             selectionOutlines.RecreatePipeline(*rhiDevice);
         }
         if (skyOk)
@@ -2494,7 +2494,7 @@ int RunGame(NativeWindow& window,
             godRays.RecreatePipeline(*rhiDevice);
         }
 #if defined(IXTREEME_WITH_EDITOR)
-        editorAdapter->SetSceneViewTexture(offscreenScene.GetColorTexture(),
+        editorAdapter->SetSceneViewTexture(offscreenScene.GetDisplayTexture(),
             offscreenScene.GetSampler(),
             offscreenScene.Width(),
             offscreenScene.Height());
@@ -2503,7 +2503,10 @@ int RunGame(NativeWindow& window,
 
     // Second offscreen target for the Game view (rendered from the scene's main camera).
     // Uses a render-pass-compatible target, so the renderers' existing pipelines work as-is.
+    // The game itself has no Game view: it shows offscreenScene, so it skips these screen-sized
+    // floating-point targets.
     OffscreenSceneRenderer gameView;
+#if defined(IXTREEME_WITH_EDITOR)
     bool gameViewOk = gameView.Create(*rhiDevice,
         assets,
         renderSize.width,
@@ -2511,9 +2514,8 @@ int RunGame(NativeWindow& window,
         offscreenColorFormat,
         offscreenDepthFormat,
         "GameView");
-#if defined(IXTREEME_WITH_EDITOR)
     if (gameViewOk)
-        editorAdapter->SetGameViewTexture(gameView.GetColorTexture(),
+        editorAdapter->SetGameViewTexture(gameView.GetDisplayTexture(),
             gameView.GetSampler(),
             gameView.Width(),
             gameView.Height());
@@ -2521,12 +2523,13 @@ int RunGame(NativeWindow& window,
     // editor shows it where the built game does; the standalone game draws it over its window.
     if (gameViewOk)
     {
-        rmlUi.SetTargetPass(gameView.GetTargetPass());
+        rmlUi.SetTargetPass(gameView.GetDisplayPass());
         rmlUi.RecreatePipeline(*rhiDevice);
         rmlUi.Resize(gameView.Width(), gameView.Height());
     }
-    rmlUi.SetSrgbTarget(IsSrgbColorFormat(gameViewOk ? gameView.ColorFormat() : rhiDevice->GetMainSwapchain().ColorFormat()));
+    rmlUi.SetSrgbTarget(IsSrgbColorFormat(gameViewOk ? gameView.DisplayFormat() : rhiDevice->GetMainSwapchain().ColorFormat()));
 #else
+    bool gameViewOk = false;
     rmlUi.SetSrgbTarget(IsSrgbColorFormat(rhiDevice->GetMainSwapchain().ColorFormat()));
 #endif
     struct StaticMeshCacheEntry
@@ -2797,7 +2800,7 @@ int RunGame(NativeWindow& window,
         }
         if (selectionOutlinesOk)
         {
-            selectionOutlines.SetTargetPass(offscreenScene.GetTargetPass());
+            selectionOutlines.SetTargetPass(offscreenScene.GetDisplayPass());
             selectionOutlines.RecreatePipeline(*rhiDevice);
         }
         if (skyOk)
@@ -2811,7 +2814,7 @@ int RunGame(NativeWindow& window,
             godRays.RecreatePipeline(*rhiDevice);
         }
 #if defined(IXTREEME_WITH_EDITOR)
-        editorAdapter->SetSceneViewTexture(offscreenScene.GetColorTexture(),
+        editorAdapter->SetSceneViewTexture(offscreenScene.GetDisplayTexture(),
             offscreenScene.GetSampler(),
             offscreenScene.Width(),
             offscreenScene.Height());
@@ -2824,7 +2827,7 @@ int RunGame(NativeWindow& window,
                 offscreenColorFormat,
                 offscreenDepthFormat);
             if (gameViewOk)
-                editorAdapter->SetGameViewTexture(gameView.GetColorTexture(),
+                editorAdapter->SetGameViewTexture(gameView.GetDisplayTexture(),
                     gameView.GetSampler(),
                     gameView.Width(),
                     gameView.Height());
@@ -5381,13 +5384,13 @@ int RunGame(NativeWindow& window,
                                 offscreenScene.Height());
                         }
                         if (selectionOutlinesOk)
-                            selectionOutlines.SetTargetPass(offscreenScene.GetTargetPass());
+                            selectionOutlines.SetTargetPass(offscreenScene.GetDisplayPass());
                         if (skyOk)
                             skyRenderer.SetTargetPass(offscreenScene.GetTargetPass());
                         if (godRaysOk)
                             godRays.SetTargetPass(offscreenScene.GetTargetPass());
 #if defined(IXTREEME_WITH_EDITOR)
-                        editorAdapter->SetSceneViewTexture(offscreenScene.GetColorTexture(),
+                        editorAdapter->SetSceneViewTexture(offscreenScene.GetDisplayTexture(),
                             offscreenScene.GetSampler(),
                             offscreenScene.Width(),
                             offscreenScene.Height());
@@ -5400,7 +5403,7 @@ int RunGame(NativeWindow& window,
                                 offscreenColorFormat,
                                 offscreenDepthFormat);
                             if (gameViewOk)
-                                editorAdapter->SetGameViewTexture(gameView.GetColorTexture(),
+                                editorAdapter->SetGameViewTexture(gameView.GetDisplayTexture(),
                                     gameView.GetSampler(),
                                     gameView.Width(),
                                     gameView.Height());
@@ -5441,7 +5444,7 @@ int RunGame(NativeWindow& window,
                 runtimeSession->OnRenderPassChanged();
 #if defined(IXTREEME_WITH_EDITOR)
                 // The game's UI draws into the Game view (recreated above): bake against its new pass.
-                rmlUi.SetTargetPass(gameViewOk ? gameView.GetTargetPass() : nullptr);
+                rmlUi.SetTargetPass(gameViewOk ? gameView.GetDisplayPass() : nullptr);
 #endif
                 rmlUi.RecreatePipeline(*rhiDevice);
 #if defined(IXTREEME_WITH_EDITOR)
@@ -10638,7 +10641,7 @@ int RunGame(NativeWindow& window,
             gameViewOk = gameView.Recreate(*rhiDevice, gameExtent.width, gameExtent.height,
                 offscreenColorFormat, offscreenDepthFormat);
             if (gameViewOk)
-                editorAdapter->SetGameViewTexture(gameView.GetColorTexture(), gameView.GetSampler(),
+                editorAdapter->SetGameViewTexture(gameView.GetDisplayTexture(), gameView.GetSampler(),
                     gameView.Width(), gameView.Height());
             else
                 editorAdapter->SetGameViewTexture(nullptr, nullptr, 0, 0);
@@ -10991,6 +10994,10 @@ int RunGame(NativeWindow& window,
             // The editor shows the offscreen scene as its Scene View panel: while that is hidden (the
             // Game tab in front, as in Play) its draws are skipped; the pass still opens and closes.
             bool drawSceneView = true;
+            // How the views' floating-point light reaches the screen (Scene Settings > Tone mapping).
+            const ToneMapSettings frameToneMap{std::clamp<std::int32_t>(sceneSky.toneMapping, 0, 2), std::exp2(sceneSky.exposureEv)};
+            // The Scene View's editor outlines: drawn over its tone-mapped image, not into the light.
+            std::vector<SelectionOutlineRenderer::Line> sceneViewOutlineLines;
             // The sun shadow map is rendered once and sampled by every view; its cascades are fitted
             // to the Scene View camera, or to the Game view's while only the Game view is drawn (Play).
             const WorldCamera* shadowCamera = &frameCamera;
@@ -11032,6 +11039,11 @@ int RunGame(NativeWindow& window,
             // Every terrain and mesh draw binds the sun shadow map: shader-readable from the start.
             if (terrainOk)
                 terrain.EnsureSunShadowMapReadable(*frameInfo.commandList);
+            // The editor panels show the views' display images, even on frames a view is not drawn.
+            if (offscreenSceneOk)
+                offscreenScene.EnsureDisplayReadable(*frameInfo.commandList);
+            if (gameViewOk)
+                gameView.EnsureDisplayReadable(*frameInfo.commandList);
             if (terrainOk && isInWorld && hasFrameCamera && !debugDisableShadowPass)
             {
                 // The meshes cast into the cascades too: the shown static meshes (each cascade gets
@@ -11939,12 +11951,15 @@ int RunGame(NativeWindow& window,
                             break;
                         }
                     }
-                    selectionOutlines.Render(*frameInfo.commandList,
-                        frameInfo,
-                        camera,
-                        selectionLines,
-                        renderSize.width,
-                        renderSize.height);
+                    if (useOffscreenScene)
+                        sceneViewOutlineLines = std::move(selectionLines);
+                    else
+                        selectionOutlines.Render(*frameInfo.commandList,
+                            frameInfo,
+                            camera,
+                            selectionLines,
+                            renderSize.width,
+                            renderSize.height);
                 }
                 if (!useOffscreenScene && hasSceneTerrain)
                 {
@@ -12001,6 +12016,19 @@ int RunGame(NativeWindow& window,
                     }
                 }
 #if defined(IXTREEME_WITH_EDITOR)
+                // The Scene View panel shows the tone-mapped image, with the editor outlines over it.
+                if (drawSceneView && runtimeSession->IsMapEditorOpen() && editorImGui.ShowsSceneViewAsPanel())
+                {
+                    offscreenScene.BeginDisplayPass(*frameInfo.commandList, frameInfo, frameToneMap);
+                    if (selectionOutlinesOk && !sceneViewOutlineLines.empty())
+                        selectionOutlines.Render(*frameInfo.commandList,
+                            frameInfo,
+                            camera,
+                            sceneViewOutlineLines,
+                            renderSize.width,
+                            renderSize.height);
+                    offscreenScene.EndDisplayPass(*frameInfo.commandList);
+                }
                 // --- Game view: render the scene from the main camera into the second offscreen target.
                 // Reuses this frame's shadow map (its cascades follow this camera while the Scene View
                 // is hidden, see shadowCamera) and water reflection.
@@ -12104,20 +12132,23 @@ int RunGame(NativeWindow& window,
                             gameView.BeginMainPass(*frameInfo.commandList, frameInfo, false);
                             godRays.Composite(*frameInfo.commandList, frameInfo, /*view=*/1, gameExtent.width, gameExtent.height);
                         }
-                        // The game's own UI over the game image (a HUD a script opened).
+                        gameView.EndMainPass(*frameInfo.commandList);
+                        // The panel shows the tone-mapped image, with the game's own UI (a HUD a script
+                        // opened) over it, as the built game draws it over its tone-mapped window.
+                        gameView.BeginDisplayPass(*frameInfo.commandList, frameInfo, frameToneMap);
                         if (rmlUi.HasVisibleGameDocuments())
                         {
-                            if (rmlUi.TargetPass() != gameView.GetTargetPass())
+                            if (rmlUi.TargetPass() != gameView.GetDisplayPass())
                             {
                                 rhiDevice->WaitIdle();  // the old pipeline may still be in flight
-                                rmlUi.SetTargetPass(gameView.GetTargetPass());
+                                rmlUi.SetTargetPass(gameView.GetDisplayPass());
                                 rmlUi.RecreatePipeline(*rhiDevice);
                             }
                             if (rmlUi.Width() != gameView.Width() || rmlUi.Height() != gameView.Height())
                                 rmlUi.Resize(gameView.Width(), gameView.Height());
                             rmlUi.Render(*frameInfo.commandList, frameInfo);
                         }
-                        gameView.EndMainPass(*frameInfo.commandList);
+                        gameView.EndDisplayPass(*frameInfo.commandList);
                     }
                 }
 #endif
@@ -12131,7 +12162,7 @@ int RunGame(NativeWindow& window,
                 if (compositeScene)
                 {
                     rhiDevice->WriteTimestamp(ixrhi::IXRHITimestampPoint::CompositeBegin);
-                    offscreenScene.RenderComposite(*frameInfo.commandList, frameInfo);
+                    offscreenScene.RenderComposite(*frameInfo.commandList, frameInfo, frameToneMap);
                     rhiDevice->WriteTimestamp(ixrhi::IXRHITimestampPoint::CompositeEnd);
                 }
                 if (isInWorld && worldLabelsOk)

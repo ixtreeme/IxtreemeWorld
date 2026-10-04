@@ -2111,9 +2111,30 @@ void EditorImGui::RenderGodRaysPanel()
             sky.volumetricQuality = quality;
             changed = true;
         }
-        ImGui::TextDisabled("Shafts come from the terrain's sun shadow (Environment > Sun > Casts shadows).");
+        ImGui::TextDisabled("Shafts come from the sun shadow (Environment > Sun > Casts shadows).");
     }
     ImGui::EndDisabled();
+    if (changed)
+        SceneManager::Instance().MarkDirty();
+}
+
+void EditorImGui::RenderToneMappingPanel()
+{
+    SkySettings& sky = m_skySettings;
+    bool changed = false;
+    const char* modes[] = {"None", "Neutral", "Filmic"};
+    int mode = std::clamp(static_cast<int>(sky.toneMapping), 0, 2);
+    if (UI::Prop::Combo("Curve##tone_mapping", &mode, modes, IM_ARRAYSIZE(modes)))
+    {
+        sky.toneMapping = mode;
+        changed = true;
+    }
+    UI::ItemTooltip("How light brighter than white reaches the screen.\n"
+                    "None: clipped at white.\n"
+                    "Neutral: colours up to 0.8 exactly as set, brighter ones roll off smoothly to white.\n"
+                    "Filmic: an ACES-like film curve - more contrast, brighter midtones.");
+    changed |= UI::Prop::SliderFloat("Exposure##tone_mapping", &sky.exposureEv, -4.0f, 4.0f, "%+.1f EV");
+    UI::ItemTooltip("Brightness of the whole image in stops: +1 doubles the light, -1 halves it");
     if (changed)
         SceneManager::Instance().MarkDirty();
 }
