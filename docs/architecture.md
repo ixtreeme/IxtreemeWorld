@@ -14,7 +14,7 @@
 
 | Réteg | Választás |
 |---|---|
-| Nyelv | C++ (natív, teljes projekt) |
+| Nyelv | C++ (az editor/engine nyelve) — a projektek játék-scriptjei: AngelScript (`.as`) és Lua (`.lua`) |
 | Renderelés | Vulkan |
 | UI | NoesisGUI |
 | Modell / animáció | Granny 2.9 |

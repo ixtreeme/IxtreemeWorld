@@ -486,7 +486,7 @@ AssetType detectAssetType(const std::filesystem::path& filePath)
         return AssetType::AnimatorController;
     if (ext == ".wav" || ext == ".ogg" || ext == ".mp3" || ext == ".flac")
         return AssetType::AudioClip;
-    if (ext == ".lua")
+    if (ext == ".lua" || ext == ".as")
         return AssetType::Script;
     if (ext == ".rml" || ext == ".rcss")
         return AssetType::UiDocument;

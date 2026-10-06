@@ -1,7 +1,7 @@
 #include "EditorImGui.h"
 
-#include "NativeBackend.h"  // ixscript::NativeBackend::RegisteredNames() for the Script inspector
-#include "platform/open_external.h"  // open .lua/.cpp scripts in the OS default editor
+#include "NativeBackend.h"  // legacy native C++ scripting (kept; no longer offered to projects)
+#include "platform/open_external.h"  // open .lua/.as/.cpp scripts in the OS default editor
 
 #include "AssetDatabase.h"
 #include "AssimpExporter.h"
@@ -2062,6 +2062,28 @@ void EditorImGui::CreateLuaScriptAsset()
     }
 }
 
+void EditorImGui::CreateAngelScriptAsset()
+{
+    if (!m_assetLibrary)
+        return;
+    AssetLibrary::ImportOptions options;
+    options.displayName = "Script";  // CreateAngelScript uniquifies (Script_2, ...); rename via F2 after
+    options.subpath = CreateTargetSubpath();
+    options.tags = {"script", "angelscript"};
+    AssetLibrary::Entry entry;
+    std::string error;
+    if (m_assetLibrary->CreateAngelScript(options, entry, error))
+    {
+        RevealCreatedAsset(entry);
+        m_assetInspectorSelectionActive = true;
+        m_assetStatus = "Created AngelScript: " + entry.displayName + " (drag it onto an entity to attach)";
+    }
+    else
+    {
+        m_assetStatus = "Create AngelScript failed: " + error;
+    }
+}
+
 // A native C++ script source (.cpp/.h/...) under the asset folder. Only the path BELOW that folder is
 // checked for a CMake "build" tree: the project itself may well live under a "build" directory.
 static bool IsNativeScriptSource(const std::filesystem::path& scriptsDir, const std::filesystem::path& file)
@@ -2087,6 +2109,19 @@ std::filesystem::path EditorImGui::ProjectScriptSourceDir() const
 {
     // Native .cpp game scripts are assets like any other: they may sit anywhere in the asset folder.
     return ProjectManager::Instance().AssetRootPath();
+}
+
+bool EditorImGui::ProjectHasNativeScriptSources() const
+{
+    if (!m_assetLibrary)
+        return false;
+    const std::filesystem::path scriptsDir = ProjectScriptSourceDir();
+    for (const AssetLibrary::Entry& e : m_assetLibrary->EntriesFor(AssetLibrary::Category::Script))
+    {
+        if (IsNativeScriptSource(scriptsDir, m_assetLibrary->AbsolutePath(e)))
+            return true;
+    }
+    return false;
 }
 
 void EditorImGui::CreateNativeScriptAsset()

@@ -117,9 +117,11 @@ public:
     // Build pipeline driven from RunGame's frame loop. Called from EngineApplication.
     void LoadProjectGameModules(const std::filesystem::path& projectRoot);
     void UnloadGameModules();
-    // Ensure <ProjectRoot>/Scripts exists with an engine-owned CMakeLists.txt (ALWAYS regenerated, the
-    // dev never edits it) + a starter Game.cpp (only if no *.cpp). Idempotent; called before every Build.
-    void EnsureProjectScriptsScaffold(const std::filesystem::path& projectRoot);
+    // Prepares <ProjectRoot>/Scripts for the LEGACY C++ build: creates the dirs, migrates stray
+    // sources, and (re)generates the engine-owned CMakeLists.txt only when the project actually has
+    // .cpp script sources. C++ is no longer a project language — nothing is seeded. Returns true when
+    // there is something to build.
+    bool EnsureProjectScriptsScaffold(const std::filesystem::path& projectRoot);
     std::filesystem::path EngineSdkIncludeDir() const;  // resolves <root>/sdk/include (searches up)
     void SetBuildRunning() { m_buildState = ScriptBuildState::Running; }
     void SetBuildResult(bool ok, std::string log)
@@ -145,13 +147,14 @@ public:
     }
     bool IsGameBuildRunning() const { return m_gameBuildState == ScriptBuildState::Running; }
 
-    // Save-to-live iteration: a per-frame (throttled) mtime poll over the project's .lua Script assets
-    // and <ProjectRoot>/Scripts/*.cpp,*.h. EngineApplication drains m_pendingScriptChanges each frame to
-    // hot-reload Lua (in Play) and auto-build native C++ (in Edit).
+    // Save-to-live iteration: a per-frame (throttled) mtime poll over the project's .lua/.as Script
+    // assets and <ProjectRoot>/Scripts/*.cpp,*.h. EngineApplication drains m_pendingScriptChanges each
+    // frame to hot-reload AngelScript/Lua (in Play) and auto-build legacy native C++ (in Edit).
     struct ScriptFileChanges
     {
-        std::vector<std::string> changedLua;  // Script asset ids whose .lua mtime changed
-        bool changedCpp = false;              // any <Project>/Scripts/*.cpp,*.h,*.hpp changed/added/removed
+        std::vector<std::string> changedLua;          // Script asset ids whose .lua mtime changed
+        std::vector<std::string> changedAngelScript;  // Script asset ids whose .as mtime changed
+        bool changedCpp = false;                      // any <Project>/Scripts/*.cpp,*.h,*.hpp changed/added/removed
     };
     ScriptFileChanges PollScriptFileChanges();
     ScriptFileChanges m_pendingScriptChanges;  // set in RenderEditorPanels, drained by EngineApplication
@@ -442,13 +445,17 @@ private:
     void RevealCreatedAsset(const AssetLibrary::Entry& entry);
     void CreatePbrMaterialAsset();
     void CreateLuaScriptAsset();                            // new .lua Script asset (browser/Scripts panel)
-    void CreateNativeScriptAsset();                         // new .cpp Script asset (browser, default name)
-    void CreateNativeScriptFile(const std::string& className);  // new <className>.cpp Script asset
+    void CreateAngelScriptAsset();                          // new .as Script asset (browser/Scripts panel)
+    void CreateNativeScriptAsset();                         // LEGACY: new .cpp Script asset (kept, not offered)
+    void CreateNativeScriptFile(const std::string& className);  // LEGACY: new <className>.cpp Script asset
     void CreateAnimatorControllerAsset();
     // Native C++ game-script sources (.cpp) live anywhere under the project's asset folder, like
     // every other asset; the Build pipeline's CMake project (in <ProjectRoot>/Scripts) compiles all
     // of them from here.
     std::filesystem::path ProjectScriptSourceDir() const;
+    // True while the project still has LEGACY C++ script sources (.cpp Script assets): the editor only
+    // offers the C++ compile path in that case (AngelScript/Lua need no build).
+    bool ProjectHasNativeScriptSources() const;
     void CreateWaterMaterialAsset();
     bool CreateWaterMaterialAsset(const std::string& displayName, AssetLibrary::Entry& outEntry);
     void CreatePhysicsMaterialAsset();
@@ -641,6 +648,7 @@ private:
     double m_lastScriptPollSeconds = 0.0;
     bool m_autoBuildOnSave = true;
     std::unordered_map<std::string, std::filesystem::file_time_type> m_luaMtimes;  // key = Script asset id
+    std::unordered_map<std::string, std::filesystem::file_time_type> m_angelMtimes;  // key = Script asset id
     std::unordered_map<std::string, std::filesystem::file_time_type> m_cppMtimes;  // key = abs source path
     int m_lastAutoSaveTitleRemainingSeconds = -1;
     char m_projectParentBuffer[512]{};

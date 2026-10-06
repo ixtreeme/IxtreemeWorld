@@ -617,6 +617,7 @@ void EditorImGui::ActivateCurrentProject()
     // Reset the save-to-live poll for the new project: clear the old project's mtimes and force a fresh
     // first-pass seed (so a project switch never spuriously reports changes / auto-builds).
     m_luaMtimes.clear();
+    m_angelMtimes.clear();
     m_cppMtimes.clear();
     m_lastScriptPollSeconds = 0.0;
     LoadProjectPhysicsSettings();
@@ -734,7 +735,7 @@ std::filesystem::path EditorImGui::EngineSdkIncludeDir() const
     return m_engineRoot / "sdk" / "include";  // not found — emit the nominal path (build fails loudly)
 }
 
-void EditorImGui::EnsureProjectScriptsScaffold(const std::filesystem::path& projectRoot)
+bool EditorImGui::EnsureProjectScriptsScaffold(const std::filesystem::path& projectRoot)
 {
     std::error_code ec;
     // scriptsDir holds the engine-owned CMake project + build tree only. The dev's .cpp SOURCES are
@@ -746,7 +747,7 @@ void EditorImGui::EnsureProjectScriptsScaffold(const std::filesystem::path& proj
     if (ec)
     {
         m_projectStatus = "Failed to create Scripts/: " + ec.message();
-        return;
+        return false;
     }
     std::filesystem::create_directories(srcDir, ec);
 
@@ -776,6 +777,28 @@ void EditorImGui::EnsureProjectScriptsScaffold(const std::filesystem::path& proj
             if (!moveEc)
                 std::filesystem::remove(stray, moveEc);
         }
+    }
+
+    // C++ is no longer a project scripting language (AngelScript + Lua are): there is nothing to
+    // scaffold — no CMake project, no seeded Game.cpp — unless the project still carries LEGACY C++
+    // script sources, which keep building. Returns whether the project is buildable at all.
+    bool hasCpp = false;
+    for (std::filesystem::recursive_directory_iterator it(
+             srcDir, std::filesystem::directory_options::skip_permission_denied, ec), end;
+         !ec && it != end && !hasCpp; it.increment(ec))
+    {
+        std::error_code entryEc;
+        hasCpp = it->is_regular_file(entryEc) && it->path().extension() == ".cpp" &&
+            IsNativeScriptSource(srcDir, it->path());
+    }
+    if (!hasCpp)
+    {
+        if (m_assetLibrary)
+        {
+            std::string reconcileError;
+            m_assetLibrary->Refresh(reconcileError);
+        }
+        return false;
     }
 
     // CMake target name must be a bare identifier — sanitize the (possibly spaced) project name.
@@ -839,55 +862,16 @@ void EditorImGui::EnsureProjectScriptsScaffold(const std::filesystem::path& proj
         std::ofstream(cmakeFile, std::ios::binary) << tmpl;
     }
 
-    // Seed a starter Game.cpp (at the asset folder root) if the project has no C++ source anywhere yet.
-    // The class is named after the file (Game) so dragging it onto an entity attaches the right class.
-    bool hasCpp = false;
-    for (std::filesystem::recursive_directory_iterator it(
-             srcDir, std::filesystem::directory_options::skip_permission_denied, ec), end;
-         !ec && it != end && !hasCpp; it.increment(ec))
-    {
-        std::error_code entryEc;
-        hasCpp = it->is_regular_file(entryEc) && it->path().extension() == ".cpp" &&
-            IsNativeScriptSource(srcDir, it->path());
-    }
-    if (!hasCpp)
-    {
-        const char* seed =
-            "#include \"ixtreeme/NativeScript.h\"\n"
-            "#include \"ixtreeme/IxModuleRegistry.inl\"\n\n"
-            "// Your first game script. Spins the entity around Y at `speed` deg/sec. `speed` is editable\n"
-            "// in the inspector and serialized, thanks to IX_REFLECT. Each script is self-contained (the\n"
-            "// registry .inl is inline-merged), so add more via \"New C++ Script\" — no special file.\n"
-            "class Game : public ixscript::NativeScript\n"
-            "{\n"
-            "public:\n"
-            "    float speed = 90.0f;  // deg/sec\n\n"
-            "    void OnUpdate(float dt) override\n"
-            "    {\n"
-            "        float r[3];\n"
-            "        GetRotation(r);  // Euler degrees\n"
-            "        r[1] += speed * dt;\n"
-            "        SetRotation(r);\n"
-            "    }\n\n"
-            "    IX_REFLECT(Game, speed)\n"
-            "};\n"
-            "IXSCRIPT_REGISTER(Game)\n";
-        const std::filesystem::path seedPath = srcDir / "Game.cpp";
-        std::ofstream(seedPath, std::ios::binary) << seed;
-        // Stamp the just-seeded file into the poll map so it isn't seen as a "new .cpp" on the next
-        // poll (which would otherwise fire one redundant auto-build right after the first build).
-        const std::filesystem::file_time_type mt = std::filesystem::last_write_time(seedPath, ec);
-        if (!ec)
-            m_cppMtimes[seedPath.generic_string()] = mt;
-    }
+    // (No Game.cpp seed: C++ scripts are legacy-only; new projects start with AngelScript/Lua.)
 
-    // Register any migrated/seeded .cpp as Script assets now, so they appear in the asset browser
+    // Register any migrated .cpp as Script assets now, so they appear in the asset browser
     // immediately (Refresh's reconcile discovery picks up sources not yet in the manifest).
     if (m_assetLibrary)
     {
         std::string reconcileError;
         m_assetLibrary->Refresh(reconcileError);
     }
+    return true;
 }
 
 bool EditorImGui::LoadProjectStartupScene()

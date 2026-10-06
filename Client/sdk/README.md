@@ -1,12 +1,16 @@
 # IxtreemeWorld Native C++ Game Module SDK
 
+> **Legacy path.** C++ is no longer a project scripting language: projects use **AngelScript**
+> (`.as`) and **Lua** (`.lua`) assets — both hot-reload in Play and need no build step. This SDK
+> documents the native C++ game-module path, kept for existing projects and engine-internal scripts.
+
 Write your game's gameplay code in native C++ and run it in the **prebuilt** IxtreemeWorld engine — no
 engine source required. You compile your `NativeScript` classes into a **game module DLL** against the
 headers in this SDK; the engine loads it at project open and your classes appear in the Script
 component's **Native** class picker, running in Play exactly like the built-in scripts.
 
-This is the C++ counterpart to Lua scripting (`.lua` assets). Use C++ for performance-critical or large
-systems; use Lua for small, fast-iteration gameplay. Both work without the engine source.
+This is the C++ counterpart to AngelScript/Lua scripting. Use it only for legacy projects; new
+gameplay should be written in AngelScript or Lua, which also work without the engine source.
 
 ## Requirements (read this first)
 

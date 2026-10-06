@@ -616,8 +616,8 @@ void EditorImGui::RenderHierarchyEntityNode(std::uint64_t entityHandle)
                 }
             }
             // Drag a Script asset onto a mesh row -> attach a Script component. The asset's file type
-            // selects the backend: .lua -> Lua (by asset id, hot-reloaded); .cpp -> native C++ (by
-            // class name = filename stem, compiled — binds the name now, resolves once Built).
+            // selects the backend: .as -> AngelScript, .lua -> Lua (both by asset id, hot-reloaded in
+            // Play). Legacy .cpp assets are not attachable (C++ is no longer a project language).
             else if (entity->type == HierarchyEntityType::MeshEntity && m_assetLibrary)
             {
                 if (const ImGuiPayload* assetPayload = ImGui::AcceptDragDropPayload(kAssetPayloadType))
@@ -627,39 +627,30 @@ void EditorImGui::RenderHierarchyEntityNode(std::uint64_t entityHandle)
                     if (auto e = m_assetLibrary->FindById(assetId);
                         e && e->category == AssetLibrary::Category::Script)
                     {
-                        const bool isCpp = e->filename.size() >= 4 &&
-                            e->filename.compare(e->filename.size() - 4, 4, ".cpp") == 0;
-                        m_commands.attachScriptToEntity = true;
-                        m_commands.attachScriptEntityId = entity->objectId;
-                        if (isCpp)
+                        const std::string extension = std::filesystem::path(e->filename).extension().string();
+                        if (extension == ".as")
                         {
-                            const std::string className =
-                                std::filesystem::path(e->filename).stem().string();
-                            m_commands.attachScriptBackend = ixscript::ScriptBackendType::Native;
-                            m_commands.attachScriptClassName = className;
-                            m_commands.attachScriptAssetId.clear();
-                            m_projectStatus = "Attached C++ script '" + className + "' to " + entity->name;
+                            m_commands.attachScriptToEntity = true;
+                            m_commands.attachScriptEntityId = entity->objectId;
+                            m_commands.attachScriptBackend = ixscript::ScriptBackendType::AngelScript;
+                            m_commands.attachScriptAssetId = assetId;
+                            m_commands.attachScriptClassName.clear();
+                            m_projectStatus = "Attached AngelScript to " + entity->name;
                         }
-                        else
+                        else if (extension == ".lua")
                         {
+                            m_commands.attachScriptToEntity = true;
+                            m_commands.attachScriptEntityId = entity->objectId;
                             m_commands.attachScriptBackend = ixscript::ScriptBackendType::Lua;
                             m_commands.attachScriptAssetId = assetId;
                             m_commands.attachScriptClassName.clear();
                             m_projectStatus = "Attached Lua script to " + entity->name;
                         }
+                        else
+                        {
+                            m_projectStatus = "C++ scripts are not attachable; use AngelScript or Lua";
+                        }
                     }
-                }
-                // Drag a registered native C++ class onto a mesh row -> attach a Native Script component.
-                else if (const ImGuiPayload* classPayload = ImGui::AcceptDragDropPayload(kNativeClassPayloadType))
-                {
-                    const std::string className(static_cast<const char*>(classPayload->Data),
-                        static_cast<size_t>(classPayload->DataSize));
-                    m_commands.attachScriptToEntity = true;
-                    m_commands.attachScriptEntityId = entity->objectId;
-                    m_commands.attachScriptBackend = ixscript::ScriptBackendType::Native;
-                    m_commands.attachScriptClassName = className;
-                    m_commands.attachScriptAssetId.clear();
-                    m_projectStatus = "Attached C++ script '" + className + "' to " + entity->name;
                 }
             }
             ImGui::EndDragDropTarget();

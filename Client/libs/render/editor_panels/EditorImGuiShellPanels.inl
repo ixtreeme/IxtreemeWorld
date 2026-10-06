@@ -227,7 +227,9 @@ void EditorImGui::RenderMainToolbar()
         }
     }
 
-    // Right: compile the project's C++ game scripts (the Scripts panel has the details).
+    // Right: compile the project's LEGACY C++ game scripts. Only shown while the project actually has
+    // .cpp Script assets — AngelScript/Lua scripts are hot-reloaded and need no build step.
+    if (ProjectHasNativeScriptSources())
     {
         const char* label = IsBuildRunning() ? ICON_FA_HAMMER "  Compiling..." : ICON_FA_HAMMER "  Compile Scripts";
         const float width = ImGui::CalcTextSize(label).x + style.FramePadding.x * 2.0f;
@@ -239,11 +241,11 @@ void EditorImGui::RenderMainToolbar()
             m_commands.buildGameScripts = true;
         if (!canBuild)
             ImGui::EndDisabled();
-        UI::ItemTooltip(IsBuildRunning() ? "Compiling the C++ game scripts..."
-            : !isEdit                    ? "Stop Play to compile the C++ game scripts"
+        UI::ItemTooltip(IsBuildRunning() ? "Compiling the legacy C++ game scripts..."
+            : !isEdit                    ? "Stop Play to compile the legacy C++ game scripts"
             : !ProjectManager::Instance().HasProject()
-                ? "Open a project to compile its C++ game scripts"
-                : "Compile the project's C++ game scripts and reload them (the result is in Build Output)");
+                ? "Open a project to compile its legacy C++ game scripts"
+                : "Compile the project's legacy C++ game scripts and reload them (the result is in Build Output)");
     }
     ImGui::End();
 }

@@ -1,9 +1,10 @@
 #pragma once
 
-// The scripting subsystem facade the engine talks to. Owns the backends (Native C++ now, Lua later),
-// routes ScriptComponent -> ScriptInstance by backend kind. The engine's Play loop creates one
-// instance per scripted entity and drives its lifecycle. libs/script depends on NOTHING engine-
-// specific; the engine-API bindings arrive through the injected ScriptApi facade.
+// The scripting subsystem facade the engine talks to. Owns the backends (AngelScript + Lua for
+// projects, legacy Native C++ internally) and routes ScriptComponent -> ScriptInstance by backend
+// kind. The engine's Play loop creates one instance per scripted entity and drives its lifecycle.
+// libs/script depends on NOTHING engine-specific; the engine-API bindings arrive through the
+// injected ScriptApi facade.
 
 #include "IScriptBackend.h"
 #include "ScriptComponent.h"
@@ -32,16 +33,23 @@ public:
     // Hot-reload: drop the cached source for a .lua asset so the next CreateInstance recompiles it.
     void InvalidateLuaSource(const std::string& assetId);
 
-    // Registered native class names (for the inspector's class picker).
+    // Hot-reload: mark a .as asset's compiled module stale so the next CreateInstance rebuilds it.
+    void InvalidateAngelScriptSource(const std::string& assetId);
+
+    // Registered native class names (engine-internal; not offered to projects).
     static std::vector<std::string> NativeClassNames();
 
     // Chunk-1 VM proof (kept; the Lua backend builds on this).
     static bool RunLuaString(const std::string& code);
 
+    // Same smoke test for the AngelScript VM (logs "[SCRIPT] angelscript ok").
+    static bool RunAngelScriptString(const std::string& code);
+
 private:
     ScriptApi& m_api;
     std::unique_ptr<IScriptBackend> m_native;
     std::unique_ptr<IScriptBackend> m_lua;
+    std::unique_ptr<IScriptBackend> m_angelScript;
 };
 
 } // namespace ixscript

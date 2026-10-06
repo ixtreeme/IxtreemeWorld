@@ -95,8 +95,8 @@ void EditorImGui::RenderAssetCreateMenuItems(const std::string& targetSubpath)
             m_assetCreateTarget.reset();
         }
     };
+    createItem(ICON_FA_FILE_CODE "  New AngelScript", &EditorImGui::CreateAngelScriptAsset);
     createItem(ICON_FA_FILE_CODE "  New Lua Script", &EditorImGui::CreateLuaScriptAsset);
-    createItem(ICON_FA_FILE_CODE "  New C++ Script", &EditorImGui::CreateNativeScriptAsset);
     ImGui::Separator();
     createItem(ICON_FA_PALETTE "  New Material", &EditorImGui::CreatePbrMaterialAsset);
     createItem(ICON_FA_DROPLET "  New Water Material", static_cast<void (EditorImGui::*)()>(&EditorImGui::CreateWaterMaterialAsset));
@@ -1002,21 +1002,6 @@ void EditorImGui::RenderScriptsPanel()
 
     const bool hasProject = ProjectManager::Instance().HasProject();
 
-    // Build the project's native C++ game scripts (same action as the toolbar Build button).
-    const bool canBuild = hasProject && m_playModeState.mode == EditorPlayMode::Edit && !IsBuildRunning();
-    if (!canBuild)
-        ImGui::BeginDisabled();
-    if (ImGui::Button(IsBuildRunning() ? ICON_FA_HAMMER "  Compiling..." : ICON_FA_HAMMER "  Compile Scripts"))
-        m_commands.buildGameScripts = true;
-    if (!canBuild)
-        ImGui::EndDisabled();
-    ImGui::SameLine();
-    ImGui::TextDisabled("compiles the C++ scripts and reloads them; the result is in Build Output");
-    ImGui::Checkbox("Compile on save", &m_autoBuildOnSave);
-    ImGui::SameLine();
-    ImGui::TextDisabled("(saving a .cpp compiles it while editing; .lua scripts reload live in Play)");
-    ImGui::Separator();
-
     auto openExternal = [this](const std::filesystem::path& p) {
         std::string err;
         if (platform::OpenInDefaultApp(p, &err))
@@ -1024,39 +1009,83 @@ void EditorImGui::RenderScriptsPanel()
         else
             m_assetStatus = "Open failed: " + err;
     };
-
-    // --- Native C++ source (<AssetRoot>/scripts/*.cpp,*.h; <ProjectRoot>/Scripts only holds the build) ---
-    ImGui::SeparatorText("C++ source (Assets/scripts/)");
-    if (hasProject && ImGui::Button(ICON_FA_PLUS " New C++ Script"))
-    {
-        CopyToBuffer(m_newCppScriptName, sizeof(m_newCppScriptName), std::string("MyScript"));
-        m_openNewCppScriptPopup = true;
-    }
-    if (m_openNewCppScriptPopup)
-    {
-        ImGui::OpenPopup("NewCppScript");
-        m_openNewCppScriptPopup = false;
-    }
-    if (ImGui::BeginPopupModal("NewCppScript", nullptr, ImGuiWindowFlags_AlwaysAutoResize))
-    {
-        ImGui::TextUnformatted("Class name (the file is named after it):");
-        ImGui::InputText("##cppname", m_newCppScriptName, sizeof(m_newCppScriptName));
-        if (ImGui::Button("Create") && m_newCppScriptName[0] != '\0')
+    const auto scriptAssetsWithExtension = [this](const char* extension) {
+        std::vector<AssetLibrary::Entry> scripts =
+            m_assetLibrary->EntriesFor(AssetLibrary::Category::Script);
+        const std::string wanted = extension;
+        scripts.erase(std::remove_if(scripts.begin(), scripts.end(),
+            [&wanted](const AssetLibrary::Entry& entry) {
+                std::string fileExt = std::filesystem::path(entry.filename).extension().string();
+                std::transform(fileExt.begin(), fileExt.end(), fileExt.begin(),
+                    [](unsigned char c) { return static_cast<char>(std::tolower(c)); });
+                return fileExt != wanted;
+            }),
+            scripts.end());
+        return scripts;
+    };
+    const auto renderScriptList = [&](const std::vector<AssetLibrary::Entry>& scripts, const char* dragLabel) {
+        for (const AssetLibrary::Entry& e : scripts)
         {
-            CreateNativeScriptFile(m_newCppScriptName);
-            ImGui::CloseCurrentPopup();
+            ImGui::PushID(e.id.c_str());
+            if (ImGui::Selectable((ICON_FA_FILE " " + e.displayName).c_str(), false,
+                    ImGuiSelectableFlags_AllowDoubleClick) &&
+                ImGui::IsMouseDoubleClicked(ImGuiMouseButton_Left))
+            {
+                openExternal(m_assetLibrary->AbsolutePath(e));
+            }
+            // Drag onto an entity row in the Hierarchy to attach it (Unity-style).
+            if (ImGui::BeginDragDropSource())
+            {
+                ImGui::SetDragDropPayload(kAssetPayloadType, e.id.data(), e.id.size());
+                ImGui::Text("%s", e.displayName.c_str());
+                ImGui::TextDisabled("%s", dragLabel);
+                ImGui::EndDragDropSource();
+            }
+            ImGui::PopID();
         }
-        ImGui::SameLine();
-        if (ImGui::Button("Cancel"))
-            ImGui::CloseCurrentPopup();
-        ImGui::EndPopup();
+    };
+
+    // --- AngelScript (.as assets): a project scripting language (hot-reloaded in Play, like Lua) ---
+    ImGui::SeparatorText("AngelScript (.as assets)");
+    if (m_assetLibrary && ImGui::Button(ICON_FA_PLUS " New AngelScript"))
+        CreateAngelScriptAsset();
+    if (m_assetLibrary)
+    {
+        const std::vector<AssetLibrary::Entry> scripts = scriptAssetsWithExtension(".as");
+        if (scripts.empty())
+            ImGui::TextDisabled("No .as scripts. Drop an .as into the asset browser or click New AngelScript.");
+        renderScriptList(scripts, "AngelScript script");
     }
     if (!hasProject)
-    {
         ImGui::TextDisabled("No project open.");
-    }
-    else
+
+    // --- Lua script assets ---
+    ImGui::SeparatorText("Lua scripts (.lua assets)");
+    if (m_assetLibrary && ImGui::Button(ICON_FA_PLUS " New Lua Script"))
+        CreateLuaScriptAsset();
+    if (m_assetLibrary)
     {
+        const std::vector<AssetLibrary::Entry> luaScripts = scriptAssetsWithExtension(".lua");
+        if (luaScripts.empty())
+            ImGui::TextDisabled("No .lua scripts. Drop a .lua into the asset browser.");
+        renderScriptList(luaScripts, "Lua script");
+    }
+
+    // --- LEGACY native C++ sources: shown only while the project actually has .cpp Script assets ---
+    if (hasProject && ProjectHasNativeScriptSources())
+    {
+        ImGui::SeparatorText("Legacy C++ source");
+        ImGui::TextDisabled("C++ is no longer a project scripting language (use AngelScript or Lua).");
+        const bool canBuild = m_playModeState.mode == EditorPlayMode::Edit && !IsBuildRunning();
+        if (!canBuild)
+            ImGui::BeginDisabled();
+        if (ImGui::Button(IsBuildRunning() ? ICON_FA_HAMMER "  Compiling..." : ICON_FA_HAMMER "  Compile Legacy C++ Scripts"))
+            m_commands.buildGameScripts = true;
+        if (!canBuild)
+            ImGui::EndDisabled();
+        ImGui::SameLine();
+        ImGui::Checkbox("Compile on save", &m_autoBuildOnSave);
+
         const std::filesystem::path scriptsDir = ProjectScriptSourceDir();
         // The .cpp Script assets (anywhere in the asset folder): cached with the browser listings.
         ValidateAssetBrowserCache();
@@ -1073,7 +1102,6 @@ void EditorImGui::RenderScriptsPanel()
         }
         if (!m_assetBrowserCache.nativeScriptSources)
             m_assetBrowserCache.nativeScriptSources.emplace();
-        const bool anySource = !m_assetBrowserCache.nativeScriptSources->empty();
         for (const auto& [path, rel] : *m_assetBrowserCache.nativeScriptSources)
         {
             ImGui::PushID(rel.c_str());
@@ -1082,69 +1110,6 @@ void EditorImGui::RenderScriptsPanel()
                 ImGui::IsMouseDoubleClicked(ImGuiMouseButton_Left))
             {
                 openExternal(path);
-            }
-            ImGui::PopID();
-        }
-        if (!anySource)
-            ImGui::TextDisabled("No C++ scripts yet — use \"New C++ Script\" or click Build to scaffold Game.cpp.");
-    }
-
-    // --- Lua script assets ---
-    ImGui::SeparatorText("Lua scripts (.lua assets)");
-    if (m_assetLibrary && ImGui::Button(ICON_FA_PLUS " New Lua Script"))
-        CreateLuaScriptAsset();
-    if (m_assetLibrary)
-    {
-        // Script assets are both languages; the .cpp ones are listed above under C++ source.
-        std::vector<AssetLibrary::Entry> luaScripts =
-            m_assetLibrary->EntriesFor(AssetLibrary::Category::Script);
-        luaScripts.erase(std::remove_if(luaScripts.begin(), luaScripts.end(),
-            [](const AssetLibrary::Entry& entry) {
-                std::string ext = std::filesystem::path(entry.filename).extension().string();
-                std::transform(ext.begin(), ext.end(), ext.begin(),
-                    [](unsigned char c) { return static_cast<char>(std::tolower(c)); });
-                return ext != ".lua";
-            }),
-            luaScripts.end());
-        if (luaScripts.empty())
-            ImGui::TextDisabled("No .lua scripts. Drop a .lua into the asset browser.");
-        for (const AssetLibrary::Entry& e : luaScripts)
-        {
-            ImGui::PushID(e.id.c_str());
-            if (ImGui::Selectable((ICON_FA_FILE " " + e.displayName).c_str(), false,
-                    ImGuiSelectableFlags_AllowDoubleClick) &&
-                ImGui::IsMouseDoubleClicked(ImGuiMouseButton_Left))
-            {
-                openExternal(m_assetLibrary->AbsolutePath(e));
-            }
-            // Drag a .lua onto an entity row in the hierarchy to attach it (Unity-style).
-            if (ImGui::BeginDragDropSource())
-            {
-                ImGui::SetDragDropPayload(kAssetPayloadType, e.id.data(), e.id.size());
-                ImGui::Text("%s", e.displayName.c_str());
-                ImGui::TextDisabled("Lua script");
-                ImGui::EndDragDropSource();
-            }
-            ImGui::PopID();
-        }
-    }
-
-    // --- Registered native C++ classes (drag onto an entity to attach a Native Script component) ---
-    ImGui::SeparatorText("Registered C++ classes");
-    {
-        const std::vector<std::string> classes = ixscript::NativeBackend::RegisteredNames();
-        if (classes.empty())
-            ImGui::TextDisabled("No native classes — Build your C++ scripts first.");
-        for (const std::string& cls : classes)
-        {
-            ImGui::PushID(cls.c_str());
-            ImGui::Selectable((ICON_FA_FILE " " + cls).c_str());
-            if (ImGui::BeginDragDropSource())
-            {
-                ImGui::SetDragDropPayload(kNativeClassPayloadType, cls.data(), cls.size());
-                ImGui::Text("%s", cls.c_str());
-                ImGui::TextDisabled("C++ class");
-                ImGui::EndDragDropSource();
             }
             ImGui::PopID();
         }

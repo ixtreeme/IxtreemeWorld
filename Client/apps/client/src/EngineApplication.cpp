@@ -2346,6 +2346,8 @@ int RunGame(NativeWindow& window,
 
     // Chunk-1 scripting proof: confirm the Lua VM compiles + runs (logs "[SCRIPT] lua ok").
     ixscript::ScriptSystem::RunLuaString("local x = 2 + 2; assert(x == 4)");
+    // Same proof for the AngelScript VM (logs "[SCRIPT] angelscript ok").
+    ixscript::ScriptSystem::RunAngelScriptString("int main() { int x = 2 + 2; if (x != 4) return 1; return 0; }");
 
 #if defined(IXTREEME_WITH_EDITOR)
 #if defined(_WIN32)
@@ -3059,8 +3061,9 @@ int RunGame(NativeWindow& window,
     scriptApi.resolveAudioClip = [&](const std::string& clipAssetId) {
         return editorImGui.AudioClipFilePath(clipAssetId);
     };
-    // Lua backend: resolve a .lua asset id -> file path, then slurp its UTF-8 source. Cross-platform
-    // ifstream idiom (same as the scene/prefab text loads); libs/script never sees the filesystem.
+    // Lua/AngelScript backends: resolve a script asset id -> file path, then slurp its UTF-8 source.
+    // Cross-platform ifstream idiom (same as the scene/prefab text loads); libs/script never sees the
+    // filesystem.
     scriptApi.resolveScriptSource = [&](const std::string& scriptAssetId) -> std::string {
         const std::string path = editorImGui.ScriptSourceFilePath(scriptAssetId);
         if (path.empty())
@@ -5300,25 +5303,32 @@ int RunGame(NativeWindow& window,
         EditorImGui::ScriptFileChanges scriptChanges = std::move(editorImGui.m_pendingScriptChanges);
         editorImGui.m_pendingScriptChanges = {};
 
-        // Lua hot-reload (no build): if a live .lua changed, rebuild every Play-live instance bound to it
-        // from fresh source — instantly. scriptSystem is non-null only in Play/PlayPaused; in Edit nothing
-        // is live and the per-Play backend is recreated fresh on the next Play-enter, so Edit is a no-op.
-        if (!scriptChanges.changedLua.empty() && scriptSystem)
-        {
-            const std::unordered_set<std::string> changedSet(
-                scriptChanges.changedLua.begin(), scriptChanges.changedLua.end());
+        // Script hot-reload (no build): if a live .lua or .as changed, rebuild every Play-live
+        // instance bound to it from fresh source — instantly. scriptSystem is non-null only in
+        // Play/PlayPaused; in Edit nothing is live and the per-Play backend is recreated fresh on the
+        // next Play-enter, so Edit is a no-op.
+        const auto hotReloadScripts = [&](const std::vector<std::string>& changedAssets,
+                                          ixscript::ScriptBackendType backend, const char* language) {
+            if (changedAssets.empty() || !scriptSystem)
+                return;
+            const std::unordered_set<std::string> changedSet(changedAssets.begin(), changedAssets.end());
             for (const std::string& assetId : changedSet)
-                scriptSystem->InvalidateLuaSource(assetId);
+            {
+                if (backend == ixscript::ScriptBackendType::Lua)
+                    scriptSystem->InvalidateLuaSource(assetId);
+                else
+                    scriptSystem->InvalidateAngelScriptSource(assetId);
+            }
             for (MeshSceneEntity& reloadMesh : editorMeshEntities)
             {
                 if (!reloadMesh.hasScript || !reloadMesh.script.enabled ||
-                    reloadMesh.script.backend != ixscript::ScriptBackendType::Lua ||
+                    reloadMesh.script.backend != backend ||
                     changedSet.find(reloadMesh.script.scriptAssetId) == changedSet.end())
                     continue;
                 auto it = entityScripts.find(reloadMesh.id);
                 if (it == entityScripts.end())
                     continue;  // not live yet; a later CreateInstance will use the fresh source
-                // Destroy the old instance (releasing its sol::environment) BEFORE recreating.
+                // Destroy the old instance (releasing its VM state) BEFORE recreating.
                 if (it->second)
                 {
                     try { it->second->OnDestroy(); }
@@ -5335,10 +5345,12 @@ int RunGame(NativeWindow& window,
                 try { fresh->OnStart(); }
                 catch (...) { TraceError("[SCRIPT] OnStart threw entity=%u", reloadMesh.id); }
                 it->second = std::move(fresh);
-                Tracenf("[SCRIPT] hot-reloaded Lua entity=%u asset=%s",
-                    reloadMesh.id, reloadMesh.script.scriptAssetId.c_str());
+                Tracenf("[SCRIPT] hot-reloaded %s entity=%u asset=%s",
+                    language, reloadMesh.id, reloadMesh.script.scriptAssetId.c_str());
             }
-        }
+        };
+        hotReloadScripts(scriptChanges.changedLua, ixscript::ScriptBackendType::Lua, "Lua");
+        hotReloadScripts(scriptChanges.changedAngelScript, ixscript::ScriptBackendType::AngelScript, "AngelScript");
         // scriptChanges.changedCpp is consumed in the command block below (where `commands` is in scope).
 #endif
 
@@ -7156,20 +7168,37 @@ int RunGame(NativeWindow& window,
                     !gameScriptBuild.IsRunning())
                 {
                     const std::filesystem::path projectRoot = ProjectManager::Instance().ProjectRoot();
-                    const std::filesystem::path scriptsDir =
-                        ixeditor::build::GameScriptBuildService::ScriptsDirFor(projectRoot);
-                    const std::filesystem::path buildDir =
-                        ixeditor::build::GameScriptBuildService::BuildDirFor(projectRoot);
-                    editorImGui.EnsureProjectScriptsScaffold(projectRoot);
-                    editorImGui.UnloadGameModules();  // *** release the LoadLibrary lock before overwrite ***
-                    // The module MUST be built with the SAME config (CRT + iterator-debug-level) as the
-                    // running engine, or const std::string&/STL params across the boundary corrupt: a
-                    // Release engine is /MT (IDL=0), a Debug engine /MTd (IDL=2). Match it.
-                    const std::string buildConfig =
-                        ixeditor::build::GameScriptBuildService::BuildConfigForCurrentBinary();
-                    Tracenf("[BUILD] game scripts: starting cmake (config=%s)", buildConfig.c_str());
-                    if (gameScriptBuild.RequestBuild(scriptsDir, buildDir, buildConfig))
-                        editorImGui.SetBuildRunning();
+                    // C++ is legacy-only now: with no .cpp script sources there is nothing to compile,
+                    // so a waiting "Build Game" goes straight on to packaging.
+                    if (!editorImGui.EnsureProjectScriptsScaffold(projectRoot))
+                    {
+                        Tracen("[BUILD] game scripts: nothing to compile (no legacy C++ scripts)");
+                        editorImGui.SetBuildResult(true,
+                            "[BUILD] nothing to compile: the project has no legacy C++ scripts.\n"
+                            "AngelScript (.as) and Lua (.lua) scripts run without a build step.\n");
+                        if (gamePackageAfterScripts)
+                        {
+                            if (gamePackage.RequestPackage(std::move(*gamePackageAfterScripts)))
+                                editorImGui.SetGameBuildRunning();
+                            gamePackageAfterScripts.reset();
+                        }
+                    }
+                    else
+                    {
+                        const std::filesystem::path scriptsDir =
+                            ixeditor::build::GameScriptBuildService::ScriptsDirFor(projectRoot);
+                        const std::filesystem::path buildDir =
+                            ixeditor::build::GameScriptBuildService::BuildDirFor(projectRoot);
+                        editorImGui.UnloadGameModules();  // *** release the LoadLibrary lock before overwrite ***
+                        // The module MUST be built with the SAME config (CRT + iterator-debug-level) as the
+                        // running engine, or const std::string&/STL params across the boundary corrupt: a
+                        // Release engine is /MT (IDL=0), a Debug engine /MTd (IDL=2). Match it.
+                        const std::string buildConfig =
+                            ixeditor::build::GameScriptBuildService::BuildConfigForCurrentBinary();
+                        Tracenf("[BUILD] game scripts: starting cmake (config=%s)", buildConfig.c_str());
+                        if (gameScriptBuild.RequestBuild(scriptsDir, buildDir, buildConfig))
+                            editorImGui.SetBuildRunning();
+                    }
                 }
 
                 // Build completion (main thread): reload the module on success — the registry mutation
@@ -9148,7 +9177,8 @@ int RunGame(NativeWindow& window,
                         it->hasScript = true;
                         it->script = {};
                         it->script.backend = commands.attachScriptBackend;
-                        if (commands.attachScriptBackend == ixscript::ScriptBackendType::Lua)
+                        if (commands.attachScriptBackend == ixscript::ScriptBackendType::Lua ||
+                            commands.attachScriptBackend == ixscript::ScriptBackendType::AngelScript)
                             it->script.scriptAssetId = commands.attachScriptAssetId;
                         else
                             it->script.nativeClassName = commands.attachScriptClassName;

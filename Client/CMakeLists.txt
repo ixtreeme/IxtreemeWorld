@@ -127,6 +127,7 @@ vcpkg_require(
 	rmlui
 	zlib
     stb
+    "angelscript[addons]"
 )
 
 if(IXTREEME_WITH_EDITOR)

@@ -15,35 +15,6 @@ namespace ixscript
 namespace
 {
 
-// String -> ScriptKey, the single source of truth for the Lua key names. Case-sensitive; an unknown
-// name yields false from IsKeyDown rather than an error. Mirrors the ScriptKey enum in ScriptApi.h.
-bool ParseKey(const std::string& name, ScriptKey& out)
-{
-    if (name == "W") { out = ScriptKey::W; return true; }
-    if (name == "A") { out = ScriptKey::A; return true; }
-    if (name == "S") { out = ScriptKey::S; return true; }
-    if (name == "D") { out = ScriptKey::D; return true; }
-    if (name == "Space") { out = ScriptKey::Space; return true; }
-    if (name == "Shift") { out = ScriptKey::Shift; return true; }
-    if (name == "Ctrl") { out = ScriptKey::Ctrl; return true; }
-    if (name == "Up") { out = ScriptKey::Up; return true; }
-    if (name == "Down") { out = ScriptKey::Down; return true; }
-    if (name == "Left") { out = ScriptKey::Left; return true; }
-    if (name == "Right") { out = ScriptKey::Right; return true; }
-    if (name == "MouseLeft") { out = ScriptKey::MouseLeft; return true; }
-    if (name == "MouseRight") { out = ScriptKey::MouseRight; return true; }
-    if (name == "Q") { out = ScriptKey::Q; return true; }
-    if (name == "E") { out = ScriptKey::E; return true; }
-    if (name == "R") { out = ScriptKey::R; return true; }
-    if (name == "F") { out = ScriptKey::F; return true; }
-    if (name == "Num1") { out = ScriptKey::Num1; return true; }
-    if (name == "Num2") { out = ScriptKey::Num2; return true; }
-    if (name == "Num3") { out = ScriptKey::Num3; return true; }
-    if (name == "Num4") { out = ScriptKey::Num4; return true; }
-    if (name == "Num5") { out = ScriptKey::Num5; return true; }
-    return false;
-}
-
 // Reads a hook function out of a script's environment; returns an invalid function if absent (so an
 // optional hook like OnCollision is simply skipped, matching a native script not overriding it).
 sol::protected_function GrabHook(sol::environment& env, const char* name)
@@ -181,7 +152,7 @@ struct LuaBackend::Impl
         });
 
         t.set_function("IsKeyDown", [a](const std::string& key) {
-            ScriptKey k; return ParseKey(key, k) ? a->IsKeyDown(k) : false;
+            ScriptKey k; return ParseKeyName(key, k) ? a->IsKeyDown(k) : false;
         });
         t.set_function("MouseDelta", [a]() {
             float dx = 0.0f, dy = 0.0f; a->GetMouseDelta(dx, dy); return std::make_tuple(dx, dy);

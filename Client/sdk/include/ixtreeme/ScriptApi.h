@@ -2,8 +2,8 @@
 
 // The language-agnostic SEAM between scripts and the engine. libs/script defines this pure-virtual
 // facade; apps/client implements it (ScriptApiImpl) against the real engine state (entities, input,
-// audio, ...). BOTH backends (native C++ and Lua) call the engine ONLY through here — so a script
-// can never reach past this surface, and a 3rd backend (C#) would reuse the exact same API.
+// audio, ...). ALL backends (AngelScript, Lua, legacy native C++) call the engine ONLY through here —
+// so a script can never reach past this surface.
 //
 // Rotations are Euler angles in DEGREES at this boundary (script-friendly); the impl converts to/from
 // the radians the engine stores. Entity ids are the editor MeshSceneEntity ids (0 = none/invalid).
@@ -27,6 +27,36 @@ enum class ScriptKey
     Q, E, R, F,
     Num1, Num2, Num3, Num4, Num5
 };
+
+// String -> ScriptKey, the single source of truth for the script-facing key names. Shared by the
+// backends so Lua and AngelScript accept the exact same strings. Case-sensitive; an unknown name
+// yields false (the caller answers false from IsKeyDown rather than erroring).
+inline bool ParseKeyName(const std::string& name, ScriptKey& out)
+{
+    if (name == "W") { out = ScriptKey::W; return true; }
+    if (name == "A") { out = ScriptKey::A; return true; }
+    if (name == "S") { out = ScriptKey::S; return true; }
+    if (name == "D") { out = ScriptKey::D; return true; }
+    if (name == "Space") { out = ScriptKey::Space; return true; }
+    if (name == "Shift") { out = ScriptKey::Shift; return true; }
+    if (name == "Ctrl") { out = ScriptKey::Ctrl; return true; }
+    if (name == "Up") { out = ScriptKey::Up; return true; }
+    if (name == "Down") { out = ScriptKey::Down; return true; }
+    if (name == "Left") { out = ScriptKey::Left; return true; }
+    if (name == "Right") { out = ScriptKey::Right; return true; }
+    if (name == "MouseLeft") { out = ScriptKey::MouseLeft; return true; }
+    if (name == "MouseRight") { out = ScriptKey::MouseRight; return true; }
+    if (name == "Q") { out = ScriptKey::Q; return true; }
+    if (name == "E") { out = ScriptKey::E; return true; }
+    if (name == "R") { out = ScriptKey::R; return true; }
+    if (name == "F") { out = ScriptKey::F; return true; }
+    if (name == "Num1") { out = ScriptKey::Num1; return true; }
+    if (name == "Num2") { out = ScriptKey::Num2; return true; }
+    if (name == "Num3") { out = ScriptKey::Num3; return true; }
+    if (name == "Num4") { out = ScriptKey::Num4; return true; }
+    if (name == "Num5") { out = ScriptKey::Num5; return true; }
+    return false;
+}
 
 // What a player CharacterController did in its last simulation step (v6). POD: safe by value across
 // the /MT module boundary.

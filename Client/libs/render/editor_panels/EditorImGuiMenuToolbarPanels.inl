@@ -392,26 +392,30 @@ EditorImGui::ScriptFileChanges EditorImGui::PollScriptFileChanges()
 
     std::error_code ec;
 
-    // (a) .lua Script assets — report each changed asset id (hot-reloaded live). Native .cpp Script
-    // assets are ALSO in this category now, but they're compiled (handled by the .cpp poll below), not
-    // hot-reloaded — so skip them here or we'd fire a bogus Lua reload on a C++ edit.
+    // (a) .lua + .as Script assets — report each changed asset id (hot-reloaded live). Legacy .cpp
+    // Script assets are ALSO in this category, but they're compiled (handled by the .cpp poll below),
+    // not hot-reloaded — so skip them here or we'd fire a bogus script reload on a C++ edit.
     for (const AssetLibrary::Entry& e : m_assetLibrary->EntriesFor(AssetLibrary::Category::Script))
     {
-        if (e.filename.size() < 4 ||
-            e.filename.compare(e.filename.size() - 4, 4, ".lua") != 0)
+        const bool isLua = e.filename.size() >= 4 &&
+            e.filename.compare(e.filename.size() - 4, 4, ".lua") == 0;
+        const bool isAngelScript = e.filename.size() >= 3 &&
+            e.filename.compare(e.filename.size() - 3, 3, ".as") == 0;
+        if (!isLua && !isAngelScript)
             continue;
         const std::filesystem::path p = m_assetLibrary->AbsolutePath(e);
         const std::filesystem::file_time_type mt = std::filesystem::last_write_time(p, ec);
         if (ec)
             continue;  // mid-write/locked — catch it next tick
-        const auto it = m_luaMtimes.find(e.id);
-        if (it == m_luaMtimes.end())
-            m_luaMtimes[e.id] = mt;
+        auto& mtimes = isLua ? m_luaMtimes : m_angelMtimes;
+        const auto it = mtimes.find(e.id);
+        if (it == mtimes.end())
+            mtimes[e.id] = mt;
         else if (it->second != mt)
         {
             it->second = mt;
             if (!firstPass)
-                changes.changedLua.push_back(e.id);
+                (isLua ? changes.changedLua : changes.changedAngelScript).push_back(e.id);
         }
     }
 
@@ -756,7 +760,10 @@ void EditorImGui::RenderBuildGamePopup()
         }
         ImGui::EndCombo();
     }
-    ImGui::Checkbox("Compile the C++ game scripts first", &m_buildGameCompileScripts);
+    if (ProjectHasNativeScriptSources())
+        ImGui::Checkbox("Compile the legacy C++ game scripts first", &m_buildGameCompileScripts);
+    else
+        m_buildGameCompileScripts = false;  // AngelScript/Lua need no build step
     ImGui::Checkbox("Run the game when it is built", &m_buildGameRunWhenDone);
     ImGui::TextDisabled("The folder gets <Game name>.exe, the engine runtime files and the project (Game/).");
     ImGui::TextDisabled("The project and the open scene are saved first. The first build also compiles the");

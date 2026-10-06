@@ -1022,41 +1022,41 @@ bool EditorImGui::RenderSelectedMeshPhysicsComponents()
             auto& sc = m_meshRendererState.script;
             changed |= UI::Prop::Checkbox("Enabled", &sc.enabled);
 
-            const char* backends[] = {"Native (C++)", "Lua"};
+            // Project scripting languages: AngelScript and Lua (both hot-reload in Play). Legacy Native
+            // (C++) components still run, but C++ is no longer offered to projects.
+            const char* backends[] = {"AngelScript", "Lua"};
             int backendIdx = (sc.backend == ixscript::ScriptBackendType::Lua) ? 1 : 0;
             if (UI::Prop::Combo("Backend", &backendIdx, backends, IM_ARRAYSIZE(backends)))
             {
                 sc.backend = (backendIdx == 1) ? ixscript::ScriptBackendType::Lua
-                                               : ixscript::ScriptBackendType::Native;
+                                               : ixscript::ScriptBackendType::AngelScript;
                 changed = true;
             }
 
             if (sc.backend == ixscript::ScriptBackendType::Native)
             {
-                const std::vector<std::string> classes = ixscript::NativeBackend::RegisteredNames();
-                const std::string preview = sc.nativeClassName.empty() ? "(class)" : sc.nativeClassName;
-                if (UI::Prop::BeginCombo("Class", preview.c_str()))
-                {
-                    for (const std::string& cls : classes)
-                        if (ImGui::Selectable(cls.c_str(), cls == sc.nativeClassName))
-                        {
-                            sc.nativeClassName = cls;
-                            changed = true;
-                        }
-                    ImGui::EndCombo();
-                }
-                if (classes.empty())
-                    ImGui::TextDisabled("No native scripts registered (IXSCRIPT_REGISTER).");
+                ImGui::TextDisabled("Legacy native C++ script (engine-internal). Pick AngelScript or Lua to migrate.");
             }
-            else if (m_assetLibrary)  // Lua: pick a .lua asset from the project library
+            else if (m_assetLibrary)  // AngelScript / Lua: pick a script asset from the project library
             {
-                const std::vector<AssetLibrary::Entry> scripts =
+                const bool isLua = sc.backend == ixscript::ScriptBackendType::Lua;
+                const char* wantedExt = isLua ? ".lua" : ".as";
+                std::vector<AssetLibrary::Entry> scripts =
                     m_assetLibrary->EntriesFor(AssetLibrary::Category::Script);
+                scripts.erase(std::remove_if(scripts.begin(), scripts.end(),
+                    [wantedExt](const AssetLibrary::Entry& entry) {
+                        std::string ext = std::filesystem::path(entry.filename).extension().string();
+                        std::transform(ext.begin(), ext.end(), ext.begin(),
+                            [](unsigned char c) { return static_cast<char>(std::tolower(c)); });
+                        return ext != wantedExt;
+                    }),
+                    scripts.end());
                 std::string preview = sc.scriptAssetId.empty() ? "(no script)" : sc.scriptAssetId;
                 for (const AssetLibrary::Entry& e : scripts)
                     if (e.id == sc.scriptAssetId) { preview = e.displayName; break; }
                 // Label must differ from the "Script" CollapsingHeader above (same PushID scope → ID clash).
-                if (UI::Prop::BeginCombo("Lua Script", preview.c_str()))
+                const char* comboLabel = isLua ? "Lua Script" : "AngelScript";
+                if (UI::Prop::BeginCombo(comboLabel, preview.c_str()))
                 {
                     if (ImGui::Selectable("(no script)", sc.scriptAssetId.empty())) { sc.scriptAssetId.clear(); changed = true; }
                     for (const AssetLibrary::Entry& e : scripts)
@@ -1068,7 +1068,9 @@ bool EditorImGui::RenderSelectedMeshPhysicsComponents()
                     ImGui::EndCombo();
                 }
                 if (scripts.empty())
-                    ImGui::TextDisabled("No .lua scripts in the project. Drop a .lua into the asset browser.");
+                    ImGui::TextDisabled(isLua
+                        ? "No .lua scripts in the project. Drop a .lua into the asset browser."
+                        : "No .as scripts in the project. Drop an .as into the asset browser.");
             }
 
             // Reflected fields (Unity-[SerializeField] style): if the chosen native class declares fields

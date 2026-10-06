@@ -925,8 +925,8 @@ struct MapEditorCommands
     bool attachScriptToEntity = false;
     std::uint32_t attachScriptEntityId = 0;  // MeshSceneEntity.id of the dropped-on row
     ixscript::ScriptBackendType attachScriptBackend = ixscript::ScriptBackendType::None;
-    std::string attachScriptAssetId;    // Lua backend: the .lua asset id
-    std::string attachScriptClassName;  // Native backend: the registered class name
+    std::string attachScriptAssetId;    // AngelScript/Lua backend: the .as/.lua asset id
+    std::string attachScriptClassName;  // legacy Native backend: the registered class name
     bool fitSelectedColliderToMesh = false;
     bool lodQualityCommitRequested = false;
     std::uint32_t lodQualityCommitEntityId = 0;

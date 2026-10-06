@@ -1680,7 +1680,7 @@ std::optional<AssetLibrary::Category> AssetLibrary::DiscoverableCategory(const s
         return Category::AnimatorController;
     if (ext == ".wav" || ext == ".ogg" || ext == ".mp3" || ext == ".flac")
         return Category::Audio;
-    if (ext == ".lua" || ext == ".cpp")
+    if (ext == ".lua" || ext == ".as" || ext == ".cpp")
         return Category::Script;
     if (ext == ".rml" || ext == ".rcss")
         return Category::UiDocument;
@@ -2703,6 +2703,7 @@ std::optional<AssetLibrary::Entry> AssetLibrary::MakeDiscoveredEntry(Category ca
         break;
     case Category::Script:
         entry.tags = HasAnyExtension(path, {".cpp"}) ? std::vector<std::string>{"script", "cpp"}
+                   : HasAnyExtension(path, {".as"})  ? std::vector<std::string>{"script", "angelscript"}
                                                      : std::vector<std::string>{"script", "lua"};
         break;
     case Category::UiDocument:
@@ -3237,11 +3238,11 @@ bool AssetLibrary::ValidateFile(Category category, const std::filesystem::path& 
         }
         break;
     case Category::Script:
-        // Scripts are either Lua (.lua, hot-reloaded) or native C++ game-module sources (.cpp,
-        // compiled by the Build pipeline). Both are first-class, browsable, drag-attachable assets.
-        if (!HasAnyExtension(path, {".lua", ".cpp"}))
+        // Scripts are AngelScript (.as) or Lua (.lua) — both hot-reloaded in Play — or legacy native
+        // C++ game-module sources (.cpp, compiled by the Build pipeline).
+        if (!HasAnyExtension(path, {".lua", ".as", ".cpp"}))
         {
-            error = "scripts must be LUA or C++ (.cpp)";
+            error = "scripts must be AngelScript (.as), LUA (.lua) or legacy C++ (.cpp)";
             return false;
         }
         break;
@@ -3338,7 +3339,7 @@ std::optional<AssetLibrary::Category> DetectDirectImportCategory(const std::file
         return AssetLibrary::Category::Animation;
     if (ext == ".wav" || ext == ".ogg" || ext == ".mp3" || ext == ".flac")
         return AssetLibrary::Category::Audio;
-    if (ext == ".lua" || ext == ".cpp")
+    if (ext == ".lua" || ext == ".as" || ext == ".cpp")
         return AssetLibrary::Category::Script;
     if (ext == ".rml" || ext == ".rcss")
         return AssetLibrary::Category::UiDocument;
@@ -3687,6 +3688,68 @@ bool AssetLibrary::CreateLuaScript(const ImportOptions& options, Entry& outEntry
         return false;
     }
     Tracenf("[ASSET-LIBRARY] lua script created id=%s file=%s", entry.id.c_str(), entry.filename.c_str());
+    outEntry = entry;
+    return true;
+}
+
+bool AssetLibrary::CreateAngelScript(const ImportOptions& options, Entry& outEntry, std::string& error)
+{
+    const std::string displayName = options.displayName.empty() ? "Script" : options.displayName;
+    const std::string subpath = NormalizeSubpath(options.subpath);
+    Entry entry;
+    entry.id = MakeUniqueId(Category::Script, displayName);
+    entry.category = Category::Script;
+    entry.displayName = displayName;
+    entry.subpath = subpath;
+    entry.filename = SanitizeStem(displayName) + ".as";
+    entry.importedAt = TimestampUtc();
+    entry.tags = NormalizeTags(options.tags.empty() ? std::vector<std::string>{"script", "angelscript"}
+                                                    : options.tags);
+
+    std::filesystem::path destination = AbsolutePath(entry);
+    for (uint32_t i = 2; std::filesystem::exists(destination); ++i)
+    {
+        entry.filename = SanitizeStem(displayName) + "_" + std::to_string(i) + ".as";
+        destination = AbsolutePath(entry);
+    }
+
+    const std::string body =
+        "// " + displayName + " : an AngelScript script. Attach by dragging it onto an entity (or pick it\n"
+        "// in the Script component). Edit + save -> it hot-reloads live in Play. The engine creates ONE\n"
+        "// `Script` object per entity; same-named members are auto-filled before OnStart (uint\n"
+        "// id/entityId = the entity; inspector parameters by name). Keep state in members — module\n"
+        "// globals are shared by every entity using this asset. The full engine API is bound as global\n"
+        "// functions (GetPosition, IsKeyDown, Raycast, SpawnMesh, UiOpen, NetConnect, ...).\n\n"
+        "class Script\n"
+        "{\n"
+        "    uint entityId;        // filled by the engine\n"
+        "    float speed = 90.0f;  // Inspector parameter \"speed\" (declare a member with the same name)\n\n"
+        "    void OnStart()\n"
+        "    {\n"
+        "    }\n\n"
+        "    void OnUpdate(float dt)\n"
+        "    {\n"
+        "        float3 r = GetRotation(entityId);  // Euler degrees\n"
+        "        SetRotation(entityId, r.x, r.y + speed * dt, r.z);\n"
+        "    }\n\n"
+        "    void OnDestroy()\n"
+        "    {\n"
+        "    }\n\n"
+        "    // void OnCollision(uint otherEntityId) {}\n"
+        "}\n";
+    if (!AtomicWriteText(destination, body, error))
+        return false;
+
+    SyncLocation(entry);
+    m_entries.push_back(entry);
+    if (!SaveManifest(error))
+    {
+        std::error_code ec;
+        std::filesystem::remove(destination, ec);
+        m_entries.pop_back();
+        return false;
+    }
+    Tracenf("[ASSET-LIBRARY] angelscript created id=%s file=%s", entry.id.c_str(), entry.filename.c_str());
     outEntry = entry;
     return true;
 }
