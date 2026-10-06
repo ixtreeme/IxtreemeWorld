@@ -5,6 +5,7 @@
 #include "Debug.h"
 #include "MaterialAssetManager.h"
 #include "math/IXMath.h"
+#include "particles/ParticleEffectIO.h"
 
 #if defined(_WIN32)
 #ifndef WIN32_LEAN_AND_MEAN
@@ -1682,6 +1683,8 @@ std::optional<AssetLibrary::Category> AssetLibrary::DiscoverableCategory(const s
         return Category::Audio;
     if (ext == ".lua" || ext == ".as" || ext == ".cpp")
         return Category::Script;
+    if (ext == ".particle")
+        return Category::ParticleEffect;
     if (ext == ".rml" || ext == ".rcss")
         return Category::UiDocument;
     if (ext == ".ixprefab")
@@ -1712,6 +1715,7 @@ const char* AssetLibrary::CategoryName(Category category)
     case Category::PhysicsMaterial: return "Physics Materials";
     case Category::AnimationClip: return "Animation Clips";
     case Category::AnimatorController: return "Animators";
+    case Category::ParticleEffect: return "Particle Effects";
     case Category::Audio: return "Audio Clips";
     case Category::Script: return "Scripts";
     case Category::UiDocument: return "UI";
@@ -2018,6 +2022,7 @@ std::string AssetLibrary::CategoryString(Category category)
     case Category::PhysicsMaterial: return "physics_material";
     case Category::AnimationClip: return "animation_clip";
     case Category::AnimatorController: return "animator_controller";
+    case Category::ParticleEffect: return "particle_effect";
     case Category::Audio: return "audio";
     case Category::Script: return "script";
     case Category::UiDocument: return "ui_document";
@@ -2037,6 +2042,7 @@ std::optional<AssetLibrary::Category> AssetLibrary::ParseCategory(const std::str
     if (value == "physics_material" || value == "physicsmaterial") return Category::PhysicsMaterial;
     if (value == "animation_clip" || value == "animationclip") return Category::AnimationClip;
     if (value == "animator_controller" || value == "animatorcontroller") return Category::AnimatorController;
+    if (value == "particle_effect" || value == "particleeffect") return Category::ParticleEffect;
     if (value == "audio") return Category::Audio;
     if (value == "script") return Category::Script;
     if (value == "ui_document" || value == "ui") return Category::UiDocument;
@@ -2697,6 +2703,15 @@ std::optional<AssetLibrary::Entry> AssetLibrary::MakeDiscoveredEntry(Category ca
         entry.id = preferredId(JsonStringValue(text, "id"));
         break;
     }
+    case Category::ParticleEffect:
+    {
+        const std::string text = readText();
+        entry.tags = {"effect", "particle"};
+        if (const std::string name = JsonStringValue(text, "display_name"); !name.empty())
+            entry.displayName = name;
+        entry.id = preferredId(JsonStringValue(text, "id"));
+        break;
+    }
     case Category::Audio:
         entry.thumbnail = "audio_icon";
         entry.tags = {"audio"};
@@ -3261,6 +3276,13 @@ bool AssetLibrary::ValidateFile(Category category, const std::filesystem::path& 
             return false;
         }
         break;
+    case Category::ParticleEffect:
+        if (!HasAnyExtension(path, {".particle"}))
+        {
+            error = "particle effects must be PARTICLE files";
+            return false;
+        }
+        break;
     case Category::Scene:
         if (!HasAnyExtension(path, {".scene"}))
         {
@@ -3298,11 +3320,12 @@ std::string AssetLibrary::MakeUniqueId(Category category,
                     (category == Category::PhysicsMaterial ? "physmat_" :
                         (category == Category::AnimationClip ? "clip_" :
                             (category == Category::AnimatorController ? "ctrl_" :
+                                (category == Category::ParticleEffect ? "fx_" :
                                 (category == Category::Audio ? "audio_" :
                                     (category == Category::Script ? "script_" :
                                         (category == Category::UiDocument ? "ui_" :
                                             (category == Category::Scene ? "scene_" :
-                                                (category == Category::Prefab ? "prefab_" : "mat_")))))))))));
+                                                (category == Category::Prefab ? "prefab_" : "mat_"))))))))))));
     const std::string base = prefix + SanitizeStem(sourcePath.stem().string());
     if (!existing.contains(base))
         return base;
@@ -3341,6 +3364,8 @@ std::optional<AssetLibrary::Category> DetectDirectImportCategory(const std::file
         return AssetLibrary::Category::Audio;
     if (ext == ".lua" || ext == ".as" || ext == ".cpp")
         return AssetLibrary::Category::Script;
+    if (ext == ".particle")
+        return AssetLibrary::Category::ParticleEffect;
     if (ext == ".rml" || ext == ".rcss")
         return AssetLibrary::Category::UiDocument;
     if (ext == ".material")
@@ -4165,6 +4190,48 @@ bool AssetLibrary::CreateAnimatorController(const ImportOptions& options, Entry&
     }
 
     Tracenf("[ANIM-CTRL] created id=%s file=%s", entry.id.c_str(), entry.filename.c_str());
+    outEntry = entry;
+    return true;
+}
+
+bool AssetLibrary::CreateParticleEffect(const ImportOptions& options,
+                                        const ixparticle::ParticleSystemComponent& effect,
+                                        Entry& outEntry,
+                                        std::string& error)
+{
+    const std::string displayName = options.displayName.empty() ? "Particle_Effect" : options.displayName;
+    const std::string subpath = NormalizeSubpath(options.subpath);
+    Entry entry;
+    entry.id = MakeUniqueId(Category::ParticleEffect, displayName);
+    entry.category = Category::ParticleEffect;
+    entry.displayName = displayName;
+    entry.subpath = subpath;
+    entry.filename = SanitizeStem(displayName) + ".particle";
+    entry.importedAt = TimestampUtc();
+    entry.tags = NormalizeTags(options.tags.empty() ? std::vector<std::string>{"effect", "particle"} : options.tags);
+
+    std::filesystem::path destination = AbsolutePath(entry);
+    for (uint32_t i = 2; std::filesystem::exists(destination); ++i)
+    {
+        entry.filename = SanitizeStem(displayName) + "_" + std::to_string(i) + ".particle";
+        destination = AbsolutePath(entry);
+    }
+
+    const std::string body = ixparticle::WriteParticleEffectJson(effect, entry.id, displayName);
+    if (!AtomicWriteText(destination, body, error))
+        return false;
+
+    SyncLocation(entry);
+    m_entries.push_back(entry);
+    if (!SaveManifest(error))
+    {
+        std::error_code ec;
+        std::filesystem::remove(destination, ec);
+        m_entries.pop_back();
+        return false;
+    }
+
+    Tracenf("[PARTICLE-FX] created id=%s file=%s", entry.id.c_str(), entry.filename.c_str());
     outEntry = entry;
     return true;
 }

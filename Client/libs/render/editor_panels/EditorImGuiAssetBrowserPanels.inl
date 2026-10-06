@@ -102,6 +102,7 @@ void EditorImGui::RenderAssetCreateMenuItems(const std::string& targetSubpath)
     createItem(ICON_FA_DROPLET "  New Water Material", static_cast<void (EditorImGui::*)()>(&EditorImGui::CreateWaterMaterialAsset));
     createItem(ICON_FA_CUBES "  New Physics Material", &EditorImGui::CreatePhysicsMaterialAsset);
     createItem(ICON_FA_DIAGRAM_PROJECT "  New Animator Controller", &EditorImGui::CreateAnimatorControllerAsset);
+    createItem(ICON_FA_SHAPES "  New Particle Effect", &EditorImGui::CreateParticleEffectAsset);
     ImGui::Separator();
     if (ImGui::MenuItem(ICON_FA_FILE_IMPORT "  Import Asset..."))
         OpenImportAssetDialog(target);

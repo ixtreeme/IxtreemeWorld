@@ -131,6 +131,8 @@ std::optional<AssetType> ParseAssetType(const std::string& value)
         return AssetType::AnimationClip;
     if (value == "AnimatorController")
         return AssetType::AnimatorController;
+    if (value == "ParticleEffect")
+        return AssetType::ParticleEffect;
     if (value == "AudioClip")
         return AssetType::AudioClip;
     if (value == "Script")
@@ -484,6 +486,8 @@ AssetType detectAssetType(const std::filesystem::path& filePath)
         return AssetType::AnimationClip;
     if (ext == ".controller")
         return AssetType::AnimatorController;
+    if (ext == ".particle")
+        return AssetType::ParticleEffect;
     if (ext == ".wav" || ext == ".ogg" || ext == ".mp3" || ext == ".flac")
         return AssetType::AudioClip;
     if (ext == ".lua" || ext == ".as")
@@ -509,6 +513,7 @@ const char* AssetTypeName(AssetType type)
     case AssetType::Animation: return "Animation";
     case AssetType::AnimationClip: return "AnimationClip";
     case AssetType::AnimatorController: return "AnimatorController";
+    case AssetType::ParticleEffect: return "ParticleEffect";
     case AssetType::AudioClip: return "AudioClip";
     case AssetType::Script: return "Script";
     case AssetType::UiDocument: return "UiDocument";

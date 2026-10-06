@@ -1,6 +1,8 @@
 add_library(IXEngineParticle STATIC
     ParticleSimulator.cpp
     ParticleSimulator.h
+    ParticleEffectIO.cpp
+    ParticleEffectIO.h
     ParticleComponents.h
 )
 
@@ -13,6 +15,8 @@ target_include_directories(IXEngineParticle
 target_link_libraries(IXEngineParticle
     PUBLIC
         IXEngineDebug
+    PRIVATE
+        IXEngineCommon
 )
 
 target_compile_definitions(IXEngineParticle

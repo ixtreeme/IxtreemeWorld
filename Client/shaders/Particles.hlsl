@@ -13,14 +13,15 @@
 
 #pragma pack_matrix(row_major)
 
-// All members are float4 so the structured-buffer element layout is 48 bytes under every packing
+// All members are float4 so the structured-buffer element layout is 64 bytes under every packing
 // rule (DX layout and Vulkan std430 alike) — a float3 member would be 16-byte aligned and make the
-// stride 64, silently mismatching the C++ InstanceData.
+// stride larger, silently mismatching the C++ InstanceData.
 struct ParticleInstanceData
 {
     float4 positionSize;  // xyz = world position, w = size (m)
     float4 rotation;      // x = rotation in radians, yzw unused
     float4 color;         // straight rgba
+    float4 uvRect;        // flipbook atlas cell: xy = offset, zw = size
 };
 
 [[vk::binding(0, 0)]] cbuffer ParticleView : register(b0)
@@ -69,7 +70,8 @@ VSOutput VSMain(uint vertexId : SV_VertexID, uint instanceId : SV_InstanceID)
     VSOutput output;
     output.clipPos = mul(float4(world, 1.0), u_viewProj);
     output.position = output.clipPos;
-    output.uv = corner * 0.5 + 0.5;
+    // The flipbook atlas cell for this particle's current frame.
+    output.uv = particle.uvRect.xy + (corner * 0.5 + 0.5) * particle.uvRect.zw;
     output.color = particle.color;
     return output;
 }

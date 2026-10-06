@@ -228,6 +228,10 @@ public:
     // A Texture asset id -> its file path ("" = not found). Used by the ParticleRenderer's
     // texture resolver (the renderer decodes + caches the image itself).
     std::string TextureFilePath(const std::string& textureId) const;
+    // A .particle effect asset id -> its file path ("" = not found).
+    std::string ParticleEffectFilePath(const std::string& effectId) const;
+    // Reads a .particle preset and copies its parameters into `out` (the inspector's picker).
+    bool ApplyParticleEffectPreset(const std::string& effectId, ixparticle::ParticleSystemComponent& out) const;
     // Absolute filesystem path of a Script asset's .lua file (empty if none) — for the Lua backend.
     std::string ScriptSourceFilePath(const std::string& scriptId) const;
     // Id of the first AnimationClip whose display name matches (empty if none) — for auto-filling
@@ -449,6 +453,11 @@ private:
     void CreatePbrMaterialAsset();
     void CreateLuaScriptAsset();                            // new .lua Script asset (browser/Scripts panel)
     void CreateAngelScriptAsset();                          // new .as Script asset (browser/Scripts panel)
+    // New .particle preset: from the selected entity's Particle System component when it has one,
+    // else the component defaults.
+    void CreateParticleEffectAsset();
+    // Writes `effect` out as a new .particle preset asset and reveals it in the browser.
+    void CreateParticleEffectFromComponent(const ixparticle::ParticleSystemComponent& effect);
     void CreateNativeScriptAsset();                         // LEGACY: new .cpp Script asset (kept, not offered)
     void CreateNativeScriptFile(const std::string& className);  // LEGACY: new <className>.cpp Script asset
     void CreateAnimatorControllerAsset();

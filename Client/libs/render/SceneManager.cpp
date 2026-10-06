@@ -1549,6 +1549,7 @@ void WriteParticleSystemComponent(std::ostream& out, const ixparticle::ParticleS
 {
     out << "      \"particle_system\": {\n";
     out << "        \"texture_asset_id\": \"" << EscapeJson(p.textureAssetId) << "\",\n";
+    out << "        \"effect_asset_id\": \"" << EscapeJson(p.effectAssetId) << "\",\n";
     out << "        \"enabled\": " << (p.enabled ? "true" : "false") << ",\n";
     out << "        \"play_on_start\": " << (p.playOnStart ? "true" : "false") << ",\n";
     out << "        \"loop\": " << (p.loop ? "true" : "false") << ",\n";
@@ -1563,7 +1564,7 @@ void WriteParticleSystemComponent(std::ostream& out, const ixparticle::ParticleS
     out << "        \"start_speed_max\": " << p.startSpeedMax << ",\n";
     out << "        \"start_size_min\": " << p.startSizeMin << ",\n";
     out << "        \"start_size_max\": " << p.startSizeMax << ",\n";
-    out << "        \"end_size_scale\": " << p.endSizeScale << ",\n";
+    out << "        \"size_over_life\": " << FloatArray(p.sizeOverLife, 4) << ",\n";
     out << "        \"direction\": " << FloatArray(p.direction, 3) << ",\n";
     out << "        \"cone_angle\": " << p.coneAngle << ",\n";
     out << "        \"shape_radius\": " << p.shapeRadius << ",\n";
@@ -1572,8 +1573,19 @@ void WriteParticleSystemComponent(std::ostream& out, const ixparticle::ParticleS
     out << "        \"rotation_speed\": " << p.rotationSpeed << ",\n";
     out << "        \"soft_particles\": " << (p.softParticles ? "true" : "false") << ",\n";
     out << "        \"soft_distance\": " << p.softDistance << ",\n";
-    out << "        \"start_color\": " << FloatArray(p.startColor, 4) << ",\n";
-    out << "        \"end_color\": " << FloatArray(p.endColor, 4) << "\n";
+    out << "        \"atlas_columns\": " << p.atlasColumns << ",\n";
+    out << "        \"atlas_rows\": " << p.atlasRows << ",\n";
+    out << "        \"shape\": \"" << ixparticle::ShapeName(p.shape) << "\",\n";
+    out << "        \"local_space\": " << (p.localSpace ? "true" : "false") << ",\n";
+    out << "        \"shape_extents\": " << FloatArray(p.shapeExtents, 3) << ",\n";
+    out << "        \"shape_arc\": " << p.shapeArc << ",\n";
+    out << "        \"collide_with_ground\": " << (p.collideWithGround ? "true" : "false") << ",\n";
+    out << "        \"collision_bounce\": " << p.collisionBounce << ",\n";
+    out << "        \"collision_friction\": " << p.collisionFriction << ",\n";
+    out << "        \"ground_plane_y\": " << p.groundPlaneY << ",\n";
+    out << "        \"start_color\": " << FloatArray(p.colorOverLife, 4) << ",\n";
+    out << "        \"end_color\": " << FloatArray(p.colorOverLife + 12, 4) << ",\n";
+    out << "        \"color_over_life\": " << FloatArray(p.colorOverLife, 16) << "\n";
     out << "      }";
 }
 
@@ -2013,6 +2025,7 @@ ixparticle::ParticleSystemComponent ReadParticleSystemComponent(const JsonValue&
     if (const JsonValue* object = Find(entity, "particle_system"); object && object->type == JsonValue::Type::Object)
     {
         p.textureAssetId = ReadString(*object, "texture_asset_id");
+        p.effectAssetId = ReadString(*object, "effect_asset_id");
         p.enabled = ReadBool(*object, "enabled", p.enabled);
         p.playOnStart = ReadBool(*object, "play_on_start", p.playOnStart);
         p.loop = ReadBool(*object, "loop", p.loop);
@@ -2027,7 +2040,29 @@ ixparticle::ParticleSystemComponent ReadParticleSystemComponent(const JsonValue&
         p.startSpeedMax = ReadFloat(*object, "start_speed_max", p.startSpeedMax);
         p.startSizeMin = ReadFloat(*object, "start_size_min", p.startSizeMin);
         p.startSizeMax = ReadFloat(*object, "start_size_max", p.startSizeMax);
-        p.endSizeScale = ReadFloat(*object, "end_size_scale", p.endSizeScale);
+        // Backward compatibility: pre-curve files stored a linear start/end pair + an end size
+        // scale. Apply those first, then let the curve arrays (when present) override.
+        {
+            float startColor[4] = {p.colorOverLife[0], p.colorOverLife[1], p.colorOverLife[2], p.colorOverLife[3]};
+            float endColor[4] = {p.colorOverLife[12], p.colorOverLife[13], p.colorOverLife[14], p.colorOverLife[15]};
+            ReadFloatArray(*object, "start_color", startColor, 4);
+            ReadFloatArray(*object, "end_color", endColor, 4);
+            for (int c = 0; c < 4; ++c)
+            {
+                p.colorOverLife[c] = startColor[c];
+                p.colorOverLife[12 + c] = endColor[c];
+                p.colorOverLife[4 + c] = startColor[c] + (endColor[c] - startColor[c]) * (1.0f / 3.0f);
+                p.colorOverLife[8 + c] = startColor[c] + (endColor[c] - startColor[c]) * (2.0f / 3.0f);
+            }
+            ReadFloatArray(*object, "color_over_life", p.colorOverLife, 16);
+
+            const float endSizeScale = ReadFloat(*object, "end_size_scale", p.sizeOverLife[3]);
+            p.sizeOverLife[0] = 1.0f;
+            p.sizeOverLife[1] = 1.0f;
+            p.sizeOverLife[2] = 1.0f;
+            p.sizeOverLife[3] = endSizeScale;
+            ReadFloatArray(*object, "size_over_life", p.sizeOverLife, 4);
+        }
         ReadFloatArray(*object, "direction", p.direction, 3);
         p.coneAngle = ReadFloat(*object, "cone_angle", p.coneAngle);
         p.shapeRadius = ReadFloat(*object, "shape_radius", p.shapeRadius);
@@ -2036,8 +2071,16 @@ ixparticle::ParticleSystemComponent ReadParticleSystemComponent(const JsonValue&
         p.rotationSpeed = ReadFloat(*object, "rotation_speed", p.rotationSpeed);
         p.softParticles = ReadBool(*object, "soft_particles", p.softParticles);
         p.softDistance = ReadFloat(*object, "soft_distance", p.softDistance);
-        ReadFloatArray(*object, "start_color", p.startColor, 4);
-        ReadFloatArray(*object, "end_color", p.endColor, 4);
+        p.atlasColumns = static_cast<int>(ReadU32(*object, "atlas_columns", static_cast<std::uint32_t>(p.atlasColumns)));
+        p.atlasRows = static_cast<int>(ReadU32(*object, "atlas_rows", static_cast<std::uint32_t>(p.atlasRows)));
+        p.shape = ixparticle::ParseShape(ReadString(*object, "shape"));
+        p.localSpace = ReadBool(*object, "local_space", p.localSpace);
+        ReadFloatArray(*object, "shape_extents", p.shapeExtents, 3);
+        p.shapeArc = ReadFloat(*object, "shape_arc", p.shapeArc);
+        p.collideWithGround = ReadBool(*object, "collide_with_ground", p.collideWithGround);
+        p.collisionBounce = ReadFloat(*object, "collision_bounce", p.collisionBounce);
+        p.collisionFriction = ReadFloat(*object, "collision_friction", p.collisionFriction);
+        p.groundPlaneY = ReadFloat(*object, "ground_plane_y", p.groundPlaneY);
     }
     ixparticle::Sanitize(p);
     return p;

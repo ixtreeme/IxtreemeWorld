@@ -16,6 +16,24 @@ float Lerp(float a, float b, float t)
     return a + (b - a) * t;
 }
 
+// Piecewise-linear sampling of the 4-key curves (t = 0, 1/3, 2/3, 1).
+float SampleCurve(const float keys[4], float t)
+{
+    const float scaled = std::clamp(t, 0.0f, 1.0f) * 3.0f;
+    const int index = std::min(static_cast<int>(scaled), 2);
+    const float f = scaled - static_cast<float>(index);
+    return Lerp(keys[index], keys[index + 1], f);
+}
+
+void SampleGradient(const float keys[16], float t, float out[4])
+{
+    const float scaled = std::clamp(t, 0.0f, 1.0f) * 3.0f;
+    const int index = std::min(static_cast<int>(scaled), 2);
+    const float f = scaled - static_cast<float>(index);
+    for (int c = 0; c < 4; ++c)
+        out[c] = Lerp(keys[index * 4 + c], keys[(index + 1) * 4 + c], f);
+}
+
 // Orthonormal basis around `direction` (which must be normalized): `tangent`, `bitangent`.
 void BuildBasis(const float direction[3], float tangent[3], float bitangent[3])
 {
@@ -79,15 +97,45 @@ void ParticleSimulator::SpawnParticle(const ParticleSystemComponent& component,
 {
     Particle particle;
 
-    // Spawn in a sphere around the emitter origin.
-    float offsetDirection[3] = {Random01() * 2.0f - 1.0f, Random01() * 2.0f - 1.0f, Random01() * 2.0f - 1.0f};
-    const float offsetLengthSq = offsetDirection[0] * offsetDirection[0] + offsetDirection[1] * offsetDirection[1] +
-        offsetDirection[2] * offsetDirection[2];
-    const float offsetLength = std::sqrt(std::max(offsetLengthSq, 1e-6f));
-    const float offsetRadius = component.shapeRadius * std::cbrt(Random01());
-    particle.position[0] = emitterPosition[0] + offsetDirection[0] / offsetLength * offsetRadius;
-    particle.position[1] = emitterPosition[1] + offsetDirection[1] / offsetLength * offsetRadius;
-    particle.position[2] = emitterPosition[2] + offsetDirection[2] / offsetLength * offsetRadius;
+    // Spawn inside the emitter's shape volume (offsets in the emitter's local axes; the caller
+    // decides whether that means world or local space).
+    float offset[3] = {0.0f, 0.0f, 0.0f};
+    switch (component.shape)
+    {
+    case ParticleShape::Point:
+        break;
+    case ParticleShape::Sphere:
+    {
+        float offsetDirection[3] = {Random01() * 2.0f - 1.0f, Random01() * 2.0f - 1.0f, Random01() * 2.0f - 1.0f};
+        const float offsetLength = std::sqrt(std::max(offsetDirection[0] * offsetDirection[0] +
+            offsetDirection[1] * offsetDirection[1] + offsetDirection[2] * offsetDirection[2], 1e-6f));
+        const float offsetRadius = component.shapeRadius * std::cbrt(Random01());
+        offset[0] = offsetDirection[0] / offsetLength * offsetRadius;
+        offset[1] = offsetDirection[1] / offsetLength * offsetRadius;
+        offset[2] = offsetDirection[2] / offsetLength * offsetRadius;
+        break;
+    }
+    case ParticleShape::Box:
+        offset[0] = (Random01() * 2.0f - 1.0f) * component.shapeExtents[0];
+        offset[1] = (Random01() * 2.0f - 1.0f) * component.shapeExtents[1];
+        offset[2] = (Random01() * 2.0f - 1.0f) * component.shapeExtents[2];
+        break;
+    case ParticleShape::Circle:
+    {
+        const float halfArc = component.shapeArc * 0.5f * 0.01745329252f;
+        const float angle = (Random01() * 2.0f - 1.0f) * halfArc;
+        const float radius = component.shapeRadius * std::sqrt(Random01());
+        offset[0] = std::cos(angle) * radius;
+        offset[2] = std::sin(angle) * radius;
+        break;
+    }
+    case ParticleShape::Edge:
+        offset[0] = (Random01() * 2.0f - 1.0f) * component.shapeExtents[0];
+        break;
+    }
+    particle.position[0] = emitterPosition[0] + offset[0];
+    particle.position[1] = emitterPosition[1] + offset[1];
+    particle.position[2] = emitterPosition[2] + offset[2];
 
     // A random direction inside the cone around `direction`.
     const float cosMax = std::cos(component.coneAngle * 0.01745329252f);
@@ -111,7 +159,7 @@ void ParticleSimulator::SpawnParticle(const ParticleSystemComponent& component,
     particle.rotation = Random01() * 6.28318530718f;
     particle.angularVelocity = (Random01() * 2.0f - 1.0f) * component.rotationSpeed * 0.01745329252f;
     for (int c = 0; c < 4; ++c)
-        particle.color[c] = component.startColor[c];
+        particle.color[c] = component.colorOverLife[c];
 
     m_particles.push_back(particle);
 }
@@ -119,7 +167,9 @@ void ParticleSimulator::SpawnParticle(const ParticleSystemComponent& component,
 void ParticleSimulator::Update(const ParticleSystemComponent& component,
                                const float emitterPosition[3],
                                const float emitterDirection[3],
-                               float dtSeconds)
+                               float dtSeconds,
+                               GroundHeightFn groundHeight,
+                               void* groundUser)
 {
     const float dt = std::clamp(dtSeconds, 0.0f, kMaxStepSeconds);
 
@@ -146,9 +196,23 @@ void ParticleSimulator::Update(const ParticleSystemComponent& component,
         particle.position[0] += particle.velocity[0] * dt;
         particle.position[1] += particle.velocity[1] * dt;
         particle.position[2] += particle.velocity[2] * dt;
-        particle.size = Lerp(particle.spawnSize, particle.spawnSize * component.endSizeScale, t);
-        for (int c = 0; c < 4; ++c)
-            particle.color[c] = Lerp(component.startColor[c], component.endColor[c], t);
+        // Ground collision: clamp to the queried height and bounce/damp there.
+        if (groundHeight != nullptr)
+        {
+            const float groundY = groundHeight(groundUser, particle.position[0], particle.position[2]);
+            if (particle.position[1] < groundY)
+            {
+                particle.position[1] = groundY;
+                if (particle.velocity[1] < 0.0f)
+                {
+                    particle.velocity[1] = -particle.velocity[1] * component.collisionBounce;
+                    particle.velocity[0] *= component.collisionFriction;
+                    particle.velocity[2] *= component.collisionFriction;
+                }
+            }
+        }
+        particle.size = particle.spawnSize * SampleCurve(component.sizeOverLife, t);
+        SampleGradient(component.colorOverLife, t, particle.color);
         particle.rotation += particle.angularVelocity * dt;
         ++i;
     }

@@ -28,6 +28,10 @@ struct Particle
     float color[4] = {1.0f, 1.0f, 1.0f, 1.0f};  // current color (start -> end lerp)
 };
 
+// Ground height query for collision: returns the world Y at (x, z). The engine wires the terrain
+// (or a plane) here; a null query disables collision for the call.
+using GroundHeightFn = float (*)(void* user, float x, float z);
+
 class ParticleSimulator
 {
 public:
@@ -48,10 +52,13 @@ public:
 
     // Steps one frame. `emitterPosition` is the entity's world position; `emitterDirection` is the
     // component's direction rotated by the entity's rotation (normalized by the caller or here).
+    // `groundHeight`/`groundUser`: the optional collision query (world-space emitters only).
     void Update(const ParticleSystemComponent& component,
                 const float emitterPosition[3],
                 const float emitterDirection[3],
-                float dtSeconds);
+                float dtSeconds,
+                GroundHeightFn groundHeight = nullptr,
+                void* groundUser = nullptr);
 
     void Clear() { m_particles.clear(); }
 

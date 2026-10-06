@@ -32,6 +32,7 @@ public:
         AnimatorController,
         Audio,
         Script,
+        ParticleEffect,  // .particle: a reusable Particle System parameter preset
         UiDocument  // game UI (RmlUi): .rml documents and their .rcss style sheets
     };
 
@@ -196,6 +197,12 @@ public:
     // Creates a .controller asset seeded with a default Idle/Walk/Run locomotion graph
     // (Speed/IsGrounded/Jump params; clip ids empty — assigned later in the Inspector/graph editor).
     bool CreateAnimatorController(const ImportOptions& options, Entry& outEntry, std::string& error);
+    // Creates a .particle effect preset asset: a reusable Particle System parameter set. The
+    // inspector's preset picker applies it to a component (a copy — no runtime asset dependency).
+    bool CreateParticleEffect(const ImportOptions& options,
+                              const ixparticle::ParticleSystemComponent& effect,
+                              Entry& outEntry,
+                              std::string& error);
     // Creates a new .lua Script asset seeded with an OnStart/OnUpdate/OnDestroy template.
     bool CreateLuaScript(const ImportOptions& options, Entry& outEntry, std::string& error);
     // Creates a new .as AngelScript asset seeded with a `class Script` template (the project's

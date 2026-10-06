@@ -5152,6 +5152,19 @@ int RunGame(NativeWindow& window,
         editorPlay.appliedMode = editorPlay.state.mode;
         Tracenf("[PLAY] session started: player character=%s", hasPlayerCharacter ? "yes" : "no");
     };
+    // Ground collision for particles: the terrain's height where the scene has terrain, else the
+    // emitter's fallback plane (the context is per-emitter, passed with each Update call).
+    struct ParticleGroundContext
+    {
+        const TerrainRenderer* terrain = nullptr;
+        float planeY = 0.0f;
+    };
+    auto particleGroundHeight = +[](void* user, float x, float z) -> float {
+        const auto* context = static_cast<const ParticleGroundContext*>(user);
+        return context->terrain != nullptr
+            ? context->terrain->SampleHeight(WorldVec3{x, 0.0f, z})
+            : context->planeY;
+    };
     // Particles: keep one CPU simulator per emitting entity in sync with the scene, and step it.
     // In Play this runs after physics/scripts/audio settle; in Edit it runs once per frame (the
     // render pre-pass) so emitters preview while authoring — the two paths never double-step.
@@ -5176,15 +5189,37 @@ int RunGame(NativeWindow& window,
                 continue;
             }
             {
-                const float emitterPosition[3] = {
+                float emitterPosition[3] = {
                     meshIt->position[0], meshIt->position[1], meshIt->position[2]};
-                const xm::Quat rotation = xm::FromEulerRadians(
-                    {meshIt->rotation[0], meshIt->rotation[1], meshIt->rotation[2]});
-                const xm::Vec3 direction = xm::Rotate(rotation,
-                    {meshIt->particleSystem.direction[0], meshIt->particleSystem.direction[1],
-                     meshIt->particleSystem.direction[2]});
-                const float emitterDirection[3] = {direction.x, direction.y, direction.z};
-                it->second.Update(meshIt->particleSystem, emitterPosition, emitterDirection, dt);
+                float emitterDirection[3] = {
+                    meshIt->particleSystem.direction[0], meshIt->particleSystem.direction[1],
+                    meshIt->particleSystem.direction[2]};
+                if (meshIt->particleSystem.localSpace)
+                {
+                    // Local space: simulate around the origin along the emitter's own axes; the
+                    // renderer transforms each particle by the emitter's transform.
+                    emitterPosition[0] = 0.0f;
+                    emitterPosition[1] = 0.0f;
+                    emitterPosition[2] = 0.0f;
+                }
+                else
+                {
+                    const xm::Quat rotation = xm::FromEulerRadians(
+                        {meshIt->rotation[0], meshIt->rotation[1], meshIt->rotation[2]});
+                    const xm::Vec3 direction = xm::Rotate(rotation,
+                        {meshIt->particleSystem.direction[0], meshIt->particleSystem.direction[1],
+                         meshIt->particleSystem.direction[2]});
+                    emitterDirection[0] = direction.x;
+                    emitterDirection[1] = direction.y;
+                    emitterDirection[2] = direction.z;
+                }
+                const ixparticle::GroundHeightFn groundQuery =
+                    (meshIt->particleSystem.collideWithGround && !meshIt->particleSystem.localSpace)
+                    ? particleGroundHeight : nullptr;
+                ParticleGroundContext groundContext{
+                    terrainOk ? &terrain : nullptr, meshIt->particleSystem.groundPlaneY};
+                it->second.Update(meshIt->particleSystem, emitterPosition, emitterDirection, dt,
+                    groundQuery, groundQuery != nullptr ? &groundContext : nullptr);
             }
             ++it;
         }
@@ -11267,18 +11302,52 @@ int RunGame(NativeWindow& window,
                     batch.softDistance = particleMesh.particleSystem.softDistance;
                     const std::vector<ixparticle::Particle>& particles = simIt->second.Particles();
                     batch.instances.reserve(particles.size());
+                    // Flipbook: the atlas cell for each particle's current frame (over its lifetime).
+                    const int atlasColumns = std::max(1, particleMesh.particleSystem.atlasColumns);
+                    const int atlasRows = std::max(1, particleMesh.particleSystem.atlasRows);
+                    const int atlasFrames = atlasColumns * atlasRows;
+                    const float cellWidth = 1.0f / static_cast<float>(atlasColumns);
+                    const float cellHeight = 1.0f / static_cast<float>(atlasRows);
+                    // Local-space emitters store particle positions in their own axes: transform them
+                    // by the emitter's transform here.
+                    const bool localSpace = particleMesh.particleSystem.localSpace;
+                    xm::Quat localRotation;  // identity unless localSpace
+                    if (localSpace)
+                        localRotation = xm::FromEulerRadians(
+                            {particleMesh.rotation[0], particleMesh.rotation[1], particleMesh.rotation[2]});
                     for (const ixparticle::Particle& particle : particles)
                     {
                         ParticleRenderer::InstanceData data;
-                        data.position[0] = particle.position[0];
-                        data.position[1] = particle.position[1];
-                        data.position[2] = particle.position[2];
+                        if (localSpace)
+                        {
+                            const xm::Vec3 world = xm::Rotate(localRotation,
+                                {particle.position[0], particle.position[1], particle.position[2]});
+                            data.position[0] = particleMesh.position[0] + world.x;
+                            data.position[1] = particleMesh.position[1] + world.y;
+                            data.position[2] = particleMesh.position[2] + world.z;
+                        }
+                        else
+                        {
+                            data.position[0] = particle.position[0];
+                            data.position[1] = particle.position[1];
+                            data.position[2] = particle.position[2];
+                        }
                         data.size = particle.size;
                         data.rotation = particle.rotation;
                         data.color[0] = particle.color[0];
                         data.color[1] = particle.color[1];
                         data.color[2] = particle.color[2];
                         data.color[3] = particle.color[3];
+                        if (atlasFrames > 1)
+                        {
+                            const float lifeT = std::clamp(
+                                particle.age / std::max(particle.lifetime, 1e-4f), 0.0f, 1.0f);
+                            const int frame = std::min(static_cast<int>(lifeT * atlasFrames), atlasFrames - 1);
+                            data.uvRect[0] = static_cast<float>(frame % atlasColumns) * cellWidth;
+                            data.uvRect[1] = static_cast<float>(frame / atlasColumns) * cellHeight;
+                            data.uvRect[2] = cellWidth;
+                            data.uvRect[3] = cellHeight;
+                        }
                         batch.instances.push_back(data);
                     }
                 }

@@ -40,7 +40,7 @@ class IAssetReader;
 class ParticleRenderer
 {
 public:
-    // One particle as the vertex shader consumes it (48 bytes; mirrored by ParticleInstanceData in
+    // One particle as the vertex shader consumes it (64 bytes; mirrored by ParticleInstanceData in
     // shaders/Particles.hlsl, whose members are all float4 so the layout matches under every packing
     // rule). The static_assert guards the mirror.
     struct InstanceData
@@ -50,8 +50,9 @@ public:
         float rotation = 0.0f;
         float padding[3] = {0.0f, 0.0f, 0.0f};
         float color[4] = {1.0f, 1.0f, 1.0f, 1.0f};
+        float uvRect[4] = {0.0f, 0.0f, 1.0f, 1.0f};  // atlas cell: xy = offset, zw = size
     };
-    static_assert(sizeof(InstanceData) == 48, "ParticleInstanceData layout must stay 48 bytes");
+    static_assert(sizeof(InstanceData) == 64, "ParticleInstanceData layout must stay 64 bytes");
 
     // One emitter's live particles for one frame (built by the engine from the simulator).
     struct Batch

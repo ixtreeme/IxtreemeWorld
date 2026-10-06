@@ -98,6 +98,7 @@ target_link_libraries(IXEngineRender
         IXEnginePhysics
         IXEngineAudio
         IXEngineScript
+        IXEngineParticle
         IXEngineImportExport
         IXEngineMapData
         fastgltf::fastgltf

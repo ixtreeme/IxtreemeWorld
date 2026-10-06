@@ -372,6 +372,7 @@ ixparticle::ParticleSystemComponent ReadParticleSystem(const std::string& object
     if (component.empty())
         return p;
     p.textureAssetId = ixtreeme::common::JsonStringValue(component, "texture_asset_id");
+    p.effectAssetId = ixtreeme::common::JsonStringValue(component, "effect_asset_id");
     p.enabled = ixtreeme::common::JsonBoolValue(component, "enabled", p.enabled);
     p.playOnStart = ixtreeme::common::JsonBoolValue(component, "play_on_start", p.playOnStart);
     p.loop = ixtreeme::common::JsonBoolValue(component, "loop", p.loop);
@@ -388,7 +389,28 @@ ixparticle::ParticleSystemComponent ReadParticleSystem(const std::string& object
     p.startSpeedMax = ixtreeme::common::JsonFloatValue(component, "start_speed_max", p.startSpeedMax);
     p.startSizeMin = ixtreeme::common::JsonFloatValue(component, "start_size_min", p.startSizeMin);
     p.startSizeMax = ixtreeme::common::JsonFloatValue(component, "start_size_max", p.startSizeMax);
-    p.endSizeScale = ixtreeme::common::JsonFloatValue(component, "end_size_scale", p.endSizeScale);
+    // Backward compatibility: pre-curve files stored a linear start/end pair + an end size scale.
+    {
+        float startColor[4] = {p.colorOverLife[0], p.colorOverLife[1], p.colorOverLife[2], p.colorOverLife[3]};
+        float endColor[4] = {p.colorOverLife[12], p.colorOverLife[13], p.colorOverLife[14], p.colorOverLife[15]};
+        ixtreeme::common::JsonFloatArrayValue(component, "start_color", startColor, 4);
+        ixtreeme::common::JsonFloatArrayValue(component, "end_color", endColor, 4);
+        for (int c = 0; c < 4; ++c)
+        {
+            p.colorOverLife[c] = startColor[c];
+            p.colorOverLife[12 + c] = endColor[c];
+            p.colorOverLife[4 + c] = startColor[c] + (endColor[c] - startColor[c]) * (1.0f / 3.0f);
+            p.colorOverLife[8 + c] = startColor[c] + (endColor[c] - startColor[c]) * (2.0f / 3.0f);
+        }
+        ixtreeme::common::JsonFloatArrayValue(component, "color_over_life", p.colorOverLife, 16);
+
+        const float endSizeScale = ixtreeme::common::JsonFloatValue(component, "end_size_scale", p.sizeOverLife[3]);
+        p.sizeOverLife[0] = 1.0f;
+        p.sizeOverLife[1] = 1.0f;
+        p.sizeOverLife[2] = 1.0f;
+        p.sizeOverLife[3] = endSizeScale;
+        ixtreeme::common::JsonFloatArrayValue(component, "size_over_life", p.sizeOverLife, 4);
+    }
     ixtreeme::common::JsonFloatArrayValue(component, "direction", p.direction, 3);
     p.coneAngle = ixtreeme::common::JsonFloatValue(component, "cone_angle", p.coneAngle);
     p.shapeRadius = ixtreeme::common::JsonFloatValue(component, "shape_radius", p.shapeRadius);
@@ -397,8 +419,18 @@ ixparticle::ParticleSystemComponent ReadParticleSystem(const std::string& object
     p.rotationSpeed = ixtreeme::common::JsonFloatValue(component, "rotation_speed", p.rotationSpeed);
     p.softParticles = ixtreeme::common::JsonBoolValue(component, "soft_particles", p.softParticles);
     p.softDistance = ixtreeme::common::JsonFloatValue(component, "soft_distance", p.softDistance);
-    ixtreeme::common::JsonFloatArrayValue(component, "start_color", p.startColor, 4);
-    ixtreeme::common::JsonFloatArrayValue(component, "end_color", p.endColor, 4);
+    p.atlasColumns = static_cast<int>(ixtreeme::common::JsonFloatValue(
+        component, "atlas_columns", static_cast<float>(p.atlasColumns)));
+    p.atlasRows = static_cast<int>(ixtreeme::common::JsonFloatValue(
+        component, "atlas_rows", static_cast<float>(p.atlasRows)));
+    p.shape = ixparticle::ParseShape(ixtreeme::common::JsonStringValue(component, "shape"));
+    p.localSpace = ixtreeme::common::JsonBoolValue(component, "local_space", p.localSpace);
+    ixtreeme::common::JsonFloatArrayValue(component, "shape_extents", p.shapeExtents, 3);
+    p.shapeArc = ixtreeme::common::JsonFloatValue(component, "shape_arc", p.shapeArc);
+    p.collideWithGround = ixtreeme::common::JsonBoolValue(component, "collide_with_ground", p.collideWithGround);
+    p.collisionBounce = ixtreeme::common::JsonFloatValue(component, "collision_bounce", p.collisionBounce);
+    p.collisionFriction = ixtreeme::common::JsonFloatValue(component, "collision_friction", p.collisionFriction);
+    p.groundPlaneY = ixtreeme::common::JsonFloatValue(component, "ground_plane_y", p.groundPlaneY);
     ixparticle::Sanitize(p);
     return p;
 }
@@ -630,6 +662,7 @@ void WriteParticleSystem(std::ostream& out, const ixparticle::ParticleSystemComp
     out << ",\n";
     out << indent << "\"particle_system\": {\n";
     out << indent << "  \"texture_asset_id\": \"" << ixtreeme::common::EscapeJson(p.textureAssetId) << "\",\n";
+    out << indent << "  \"effect_asset_id\": \"" << ixtreeme::common::EscapeJson(p.effectAssetId) << "\",\n";
     out << indent << "  \"enabled\": " << (p.enabled ? "true" : "false") << ",\n";
     out << indent << "  \"play_on_start\": " << (p.playOnStart ? "true" : "false") << ",\n";
     out << indent << "  \"loop\": " << (p.loop ? "true" : "false") << ",\n";
@@ -644,7 +677,7 @@ void WriteParticleSystem(std::ostream& out, const ixparticle::ParticleSystemComp
     out << indent << "  \"start_speed_max\": " << p.startSpeedMax << ",\n";
     out << indent << "  \"start_size_min\": " << p.startSizeMin << ",\n";
     out << indent << "  \"start_size_max\": " << p.startSizeMax << ",\n";
-    out << indent << "  \"end_size_scale\": " << p.endSizeScale << ",\n";
+    out << indent << "  \"size_over_life\": " << FloatArray(p.sizeOverLife, 4) << ",\n";
     out << indent << "  \"direction\": " << FloatArray(p.direction, 3) << ",\n";
     out << indent << "  \"cone_angle\": " << p.coneAngle << ",\n";
     out << indent << "  \"shape_radius\": " << p.shapeRadius << ",\n";
@@ -653,8 +686,19 @@ void WriteParticleSystem(std::ostream& out, const ixparticle::ParticleSystemComp
     out << indent << "  \"rotation_speed\": " << p.rotationSpeed << ",\n";
     out << indent << "  \"soft_particles\": " << (p.softParticles ? "true" : "false") << ",\n";
     out << indent << "  \"soft_distance\": " << p.softDistance << ",\n";
-    out << indent << "  \"start_color\": " << FloatArray(p.startColor, 4) << ",\n";
-    out << indent << "  \"end_color\": " << FloatArray(p.endColor, 4) << "\n";
+    out << indent << "  \"atlas_columns\": " << p.atlasColumns << ",\n";
+    out << indent << "  \"atlas_rows\": " << p.atlasRows << ",\n";
+    out << indent << "  \"shape\": \"" << ixparticle::ShapeName(p.shape) << "\",\n";
+    out << indent << "  \"local_space\": " << (p.localSpace ? "true" : "false") << ",\n";
+    out << indent << "  \"shape_extents\": " << FloatArray(p.shapeExtents, 3) << ",\n";
+    out << indent << "  \"shape_arc\": " << p.shapeArc << ",\n";
+    out << indent << "  \"collide_with_ground\": " << (p.collideWithGround ? "true" : "false") << ",\n";
+    out << indent << "  \"collision_bounce\": " << p.collisionBounce << ",\n";
+    out << indent << "  \"collision_friction\": " << p.collisionFriction << ",\n";
+    out << indent << "  \"ground_plane_y\": " << p.groundPlaneY << ",\n";
+    out << indent << "  \"start_color\": " << FloatArray(p.colorOverLife, 4) << ",\n";
+    out << indent << "  \"end_color\": " << FloatArray(p.colorOverLife + 12, 4) << ",\n";
+    out << indent << "  \"color_over_life\": " << FloatArray(p.colorOverLife, 16) << "\n";
     out << indent << "}";
 }
 

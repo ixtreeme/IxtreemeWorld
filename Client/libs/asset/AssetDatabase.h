@@ -51,6 +51,7 @@ enum class AssetType
     Project,
     AnimationClip,
     AnimatorController,
+    ParticleEffect,
     AudioClip,
     Script,
     UiDocument,  // game UI (RmlUi): .rml / .rcss

@@ -37,12 +37,47 @@ inline ParticleBlendMode ParseBlendMode(const std::string& s)
     return ParticleBlendMode::Alpha;
 }
 
+// Where new particles are born around the emitter origin (all offsets in the emitter's local axes).
+enum class ParticleShape : std::uint8_t
+{
+    Point = 0,   // exactly at the origin
+    Sphere,      // inside a sphere of shapeRadius
+    Box,         // inside a box of shapeExtents half-extents
+    Circle,      // inside a disc of shapeRadius in the local XZ plane (shapeArc degrees)
+    Edge         // along the local X axis, +/- shapeExtents[0]
+};
+
+inline const char* ShapeName(ParticleShape shape)
+{
+    switch (shape)
+    {
+    case ParticleShape::Point: return "Point";
+    case ParticleShape::Sphere: return "Sphere";
+    case ParticleShape::Box: return "Box";
+    case ParticleShape::Circle: return "Circle";
+    case ParticleShape::Edge: return "Edge";
+    }
+    return "Sphere";
+}
+
+inline ParticleShape ParseShape(const std::string& s)
+{
+    if (s == "Point") return ParticleShape::Point;
+    if (s == "Box") return ParticleShape::Box;
+    if (s == "Circle") return ParticleShape::Circle;
+    if (s == "Edge") return ParticleShape::Edge;
+    return ParticleShape::Sphere;
+}
+
 // One emitter on one entity. Emission is a cone around `direction` (rotated by the entity's
 // rotation), spawned in a sphere of `shapeRadius` at the entity origin. Per particle the sim
 // interpolates size and color from the Start* values to the End* values over its lifetime.
 struct ParticleSystemComponent
 {
     std::string textureAssetId;  // AssetLibrary Texture id ("" = soft white round default)
+    // The .particle preset this component's parameters were applied from ("" = authored inline).
+    // A record for the inspector's picker; the parameters above stay the runtime source of truth.
+    std::string effectAssetId;
     bool enabled = true;
     bool playOnStart = true;     // begin emitting when Play starts
     bool loop = true;            // false: emission stops after `duration`, live particles finish
@@ -59,11 +94,21 @@ struct ParticleSystemComponent
     float startSpeedMax = 1.4f;
     float startSizeMin = 0.12f;
     float startSizeMax = 0.25f;
-    float endSizeScale = 0.2f;   // size multiplier at the end of a particle's life
+    // Size over lifetime: a piecewise-linear multiplier curve sampled at t = 0, 1/3, 2/3, 1.
+    float sizeOverLife[4] = {1.0f, 1.0f, 1.0f, 0.2f};
 
     float direction[3] = {0.0f, 1.0f, 0.0f};  // local emission axis
     float coneAngle = 20.0f;     // half-angle of the emission cone, degrees
     float shapeRadius = 0.15f;   // spawn sphere radius around the emitter origin
+
+    // Emission shape (spawn volume) and simulation space.
+    ParticleShape shape = ParticleShape::Sphere;
+    float shapeExtents[3] = {0.5f, 0.1f, 0.5f};  // Box half-extents / Edge half-length (x)
+    float shapeArc = 360.0f;                     // Circle arc, degrees (centred on local +X)
+    // Local space: particles are simulated in the emitter's local axes and follow it as it moves and
+    // rotates (smoke on a vehicle, an aura on a character). World space (default): they stay where
+    // they spawned.
+    bool localSpace = false;
 
     float gravity = -1.5f;       // m/s^2 along world Y
     float drag = 0.0f;           // velocity damping per second (0 = none)
@@ -75,8 +120,25 @@ struct ParticleSystemComponent
     bool softParticles = true;
     float softDistance = 0.5f;
 
-    float startColor[4] = {1.0f, 0.85f, 0.5f, 1.0f};
-    float endColor[4] = {1.0f, 0.25f, 0.1f, 0.0f};
+    // Flipbook: the texture is an atlas of atlasColumns x atlasRows cells, played over each
+    // particle's lifetime (1x1 = a single sprite, the default).
+    int atlasColumns = 1;
+    int atlasRows = 1;
+
+    // Ground collision (world space): particles bounce against the terrain height (or the fallback
+    // plane when the scene has no terrain). Local-space emitters do not collide.
+    bool collideWithGround = false;
+    float collisionBounce = 0.3f;    // 0 = stick, 1 = perfect bounce
+    float collisionFriction = 0.5f;  // horizontal velocity kept on impact
+    float groundPlaneY = 0.0f;       // the fallback ground height without terrain
+
+    // Colour gradient over lifetime: RGBA keys at t = 0, 1/3, 2/3, 1 (flattened: key i at
+    // colorOverLife[i * 4 .. i * 4 + 3]).
+    float colorOverLife[16] = {
+        1.0f, 0.85f, 0.5f, 1.0f,
+        1.0f, 0.60f, 0.3f, 0.8f,
+        1.0f, 0.40f, 0.2f, 0.4f,
+        1.0f, 0.25f, 0.1f, 0.0f};
 };
 
 inline void Sanitize(ParticleSystemComponent& p)
@@ -91,17 +153,24 @@ inline void Sanitize(ParticleSystemComponent& p)
     p.startSpeedMax = std::clamp(p.startSpeedMax, p.startSpeedMin, 1000.0f);
     p.startSizeMin = std::clamp(p.startSizeMin, 0.0f, 1000.0f);
     p.startSizeMax = std::clamp(p.startSizeMax, p.startSizeMin, 1000.0f);
-    p.endSizeScale = std::clamp(p.endSizeScale, 0.0f, 100.0f);
+    for (float& key : p.sizeOverLife)
+        key = std::clamp(key, 0.0f, 100.0f);
     p.coneAngle = std::clamp(p.coneAngle, 0.0f, 180.0f);
     p.shapeRadius = std::clamp(p.shapeRadius, 0.0f, 1000.0f);
+    for (float& e : p.shapeExtents)
+        e = std::clamp(e, 0.0f, 1000.0f);
+    p.shapeArc = std::clamp(p.shapeArc, 1.0f, 360.0f);
     p.gravity = std::clamp(p.gravity, -500.0f, 500.0f);
     p.drag = std::clamp(p.drag, 0.0f, 100.0f);
     p.rotationSpeed = std::clamp(p.rotationSpeed, -3600.0f, 3600.0f);
     p.softDistance = std::clamp(p.softDistance, 0.01f, 100.0f);
-    for (float& c : p.startColor)
-        c = std::clamp(c, 0.0f, 100.0f);
-    for (float& c : p.endColor)
-        c = std::clamp(c, 0.0f, 100.0f);
+    p.atlasColumns = std::clamp(p.atlasColumns, 1, 64);
+    p.atlasRows = std::clamp(p.atlasRows, 1, 64);
+    p.collisionBounce = std::clamp(p.collisionBounce, 0.0f, 1.0f);
+    p.collisionFriction = std::clamp(p.collisionFriction, 0.0f, 1.0f);
+    p.groundPlaneY = std::clamp(p.groundPlaneY, -10000.0f, 10000.0f);
+    for (auto& key : p.colorOverLife)
+        key = std::clamp(key, 0.0f, 100.0f);
 }
 
 } // namespace ixparticle

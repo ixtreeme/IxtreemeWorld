@@ -1,6 +1,7 @@
 #include "EditorImGui.h"
 
 #include "NativeBackend.h"  // legacy native C++ scripting (kept; no longer offered to projects)
+#include "particles/ParticleEffectIO.h"  // .particle preset read/write
 #include "platform/open_external.h"  // open .lua/.as/.cpp scripts in the OS default editor
 
 #include "AssetDatabase.h"
@@ -355,6 +356,7 @@ ImVec4 AssetCategoryColor(AssetLibrary::Category category)
     case AssetLibrary::Category::Prefab: return ImVec4(0.67f, 0.48f, 0.82f, 1.0f);
     case AssetLibrary::Category::AnimationClip: return ImVec4(0.86f, 0.60f, 0.26f, 1.0f);
     case AssetLibrary::Category::AnimatorController: return ImVec4(0.90f, 0.47f, 0.36f, 1.0f);
+    case AssetLibrary::Category::ParticleEffect: return ImVec4(0.95f, 0.72f, 0.30f, 1.0f);
     case AssetLibrary::Category::Audio: return ImVec4(0.36f, 0.74f, 0.62f, 1.0f);
     case AssetLibrary::Category::Script: return ImVec4(0.55f, 0.72f, 0.95f, 1.0f);
     case AssetLibrary::Category::UiDocument: return ImVec4(0.93f, 0.55f, 0.85f, 1.0f);
@@ -376,6 +378,7 @@ const char* AssetCategoryIcon(AssetLibrary::Category category)
     case AssetLibrary::Category::Prefab: return ICON_FA_LAYER_GROUP;
     case AssetLibrary::Category::AnimationClip: return ICON_FA_PERSON_RUNNING;
     case AssetLibrary::Category::AnimatorController: return ICON_FA_DIAGRAM_PROJECT;
+    case AssetLibrary::Category::ParticleEffect: return ICON_FA_SHAPES;
     case AssetLibrary::Category::Audio: return ICON_FA_MUSIC;
     case AssetLibrary::Category::Script: return ICON_FA_FILE_CODE;
     case AssetLibrary::Category::UiDocument: return ICON_FA_WINDOW_MAXIMIZE;
@@ -406,8 +409,10 @@ const char* ImportDetectedTypeName(const std::filesystem::path& path)
         return "Anim";
     if (ext == ".wav" || ext == ".ogg" || ext == ".mp3" || ext == ".flac")
         return "Audio";
-    if (ext == ".lua")
+    if (ext == ".lua" || ext == ".as" || ext == ".cpp")
         return "Script";
+    if (ext == ".particle")
+        return "Particle Effect";
     if (ext == ".scene")
         return "Scene";
     return "Unknown";
@@ -1285,6 +1290,32 @@ std::string EditorImGui::TextureFilePath(const std::string& textureId) const
     if (!entry || entry->category != AssetLibrary::Category::Texture)
         return {};
     return m_assetLibrary->AbsolutePath(*entry).generic_string();
+}
+
+std::string EditorImGui::ParticleEffectFilePath(const std::string& effectId) const
+{
+    if (!m_assetLibrary || effectId.empty())
+        return {};
+    const auto entry = m_assetLibrary->FindById(effectId);
+    if (!entry || entry->category != AssetLibrary::Category::ParticleEffect)
+        return {};
+    return m_assetLibrary->AbsolutePath(*entry).generic_string();
+}
+
+bool EditorImGui::ApplyParticleEffectPreset(const std::string& effectId,
+                                            ixparticle::ParticleSystemComponent& out) const
+{
+    const std::string path = ParticleEffectFilePath(effectId);
+    if (path.empty())
+        return false;
+    std::ifstream file(path, std::ios::binary);
+    if (!file)
+        return false;
+    const std::string text((std::istreambuf_iterator<char>(file)), std::istreambuf_iterator<char>());
+    if (!ixparticle::ParseParticleEffectJson(text, out))
+        return false;
+    out.effectAssetId = effectId;
+    return true;
 }
 
 std::string EditorImGui::ScriptSourceFilePath(const std::string& scriptId) const
@@ -2187,6 +2218,39 @@ void EditorImGui::CreateAnimatorControllerAsset()
     RevealCreatedAsset(entry);
     m_assetInspectorSelectionActive = true;
     m_assetStatus = "Animator controller created: " + entry.displayName;
+}
+
+void EditorImGui::CreateParticleEffectAsset()
+{
+    ixparticle::ParticleSystemComponent effect;  // defaults
+    if (m_meshRendererState.selected && m_meshRendererState.hasParticleSystem)
+        effect = m_meshRendererState.particleSystem;
+    CreateParticleEffectFromComponent(effect);
+}
+
+void EditorImGui::CreateParticleEffectFromComponent(const ixparticle::ParticleSystemComponent& effect)
+{
+    if (!m_assetLibrary)
+    {
+        m_assetStatus = "Open a project to create a particle effect";
+        return;
+    }
+    AssetLibrary::ImportOptions options;
+    options.displayName = m_meshRendererState.name.empty()
+        ? std::string("Particle_Effect")
+        : m_meshRendererState.name + "_Effect";
+    options.subpath = CreateTargetSubpath();
+    options.tags = {"effect", "particle"};
+    AssetLibrary::Entry entry;
+    std::string error;
+    if (!m_assetLibrary->CreateParticleEffect(options, effect, entry, error))
+    {
+        m_assetStatus = "Create particle effect failed: " + error;
+        return;
+    }
+    RevealCreatedAsset(entry);
+    m_assetInspectorSelectionActive = true;
+    m_assetStatus = "Particle effect created: " + entry.displayName;
 }
 
 void EditorImGui::CreateWaterMaterialAsset()

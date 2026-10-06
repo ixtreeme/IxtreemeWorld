@@ -609,6 +609,78 @@ void EditorImGui::RenderSelectedLightInspector()
         m_commands.deleteSelectedLight = true;
 }
 
+// A compact 4-key, piecewise-linear curve editor for the particle size-over-life curve.
+static bool ParticleCurveEditor4(const char* label, float values[4])
+{
+    bool changed = false;
+    const float width = 220.0f;
+    const float height = 56.0f;
+    ImGui::InvisibleButton(label, ImVec2(width, height));
+    const ImVec2 origin = ImGui::GetItemRectMin();
+    ImDrawList* draw = ImGui::GetWindowDrawList();
+    const ImVec2 end(origin.x + width, origin.y + height);
+    draw->AddRectFilled(origin, end, IM_COL32(22, 24, 28, 255), 3.0f);
+    draw->AddRect(origin, end, IM_COL32(72, 76, 84, 255), 3.0f);
+
+    const auto pointPosition = [&](int index, float value) {
+        return ImVec2(origin.x + width * (static_cast<float>(index) / 3.0f),
+            origin.y + height * (1.0f - std::clamp(value, 0.0f, 1.0f)));
+    };
+    for (int i = 0; i < 3; ++i)
+    {
+        draw->AddLine(pointPosition(i, values[i]), pointPosition(i + 1, values[i + 1]),
+            IM_COL32(255, 176, 64, 255), 2.0f);
+    }
+    for (int i = 0; i < 4; ++i)
+        draw->AddCircleFilled(pointPosition(i, values[i]), 4.0f, IM_COL32(255, 210, 120, 255));
+
+    if (ImGui::IsItemActive())
+    {
+        const ImVec2 mouse = ImGui::GetIO().MousePos;
+        int nearest = 0;
+        float nearestDistance = 1e9f;
+        for (int i = 0; i < 4; ++i)
+        {
+            const ImVec2 p = pointPosition(i, values[i]);
+            const float dx = p.x - mouse.x;
+            const float dy = p.y - mouse.y;
+            const float distance = dx * dx + dy * dy;
+            if (distance < nearestDistance)
+            {
+                nearestDistance = distance;
+                nearest = i;
+            }
+        }
+        const float value = std::clamp(1.0f - (mouse.y - origin.y) / height, 0.0f, 1.0f);
+        if (values[nearest] != value)
+        {
+            values[nearest] = value;
+            changed = true;
+        }
+    }
+    return changed;
+}
+
+// A preview bar of the 4-key colour gradient (flattened: key i at keys[i * 4 .. i * 4 + 3]).
+static void ParticleGradientBar4(const float keys[16])
+{
+    ImGui::InvisibleButton("##gradient", ImVec2(220.0f, 16.0f));
+    const ImVec2 a = ImGui::GetItemRectMin();
+    const ImVec2 b = ImGui::GetItemRectMax();
+    ImDrawList* draw = ImGui::GetWindowDrawList();
+    for (int i = 0; i < 3; ++i)
+    {
+        const ImVec2 p0(a.x + (b.x - a.x) * (static_cast<float>(i) / 3.0f), a.y);
+        const ImVec2 p1(a.x + (b.x - a.x) * (static_cast<float>(i + 1) / 3.0f), b.y);
+        const ImU32 c0 = ImGui::ColorConvertFloat4ToU32(
+            ImVec4(keys[i * 4 + 0], keys[i * 4 + 1], keys[i * 4 + 2], 1.0f));
+        const ImU32 c1 = ImGui::ColorConvertFloat4ToU32(
+            ImVec4(keys[(i + 1) * 4 + 0], keys[(i + 1) * 4 + 1], keys[(i + 1) * 4 + 2], 1.0f));
+        draw->AddRectFilledMultiColor(p0, p1, c0, c1, c1, c0);
+    }
+    draw->AddRect(a, b, IM_COL32(72, 76, 84, 255));
+}
+
 bool EditorImGui::RenderSelectedMeshPhysicsComponents()
 {
     bool changed = false;
@@ -1267,6 +1339,44 @@ bool EditorImGui::RenderSelectedMeshPhysicsComponents()
                 }
             }
 
+            if (m_assetLibrary)
+            {
+                const std::vector<AssetLibrary::Entry> effects =
+                    m_assetLibrary->EntriesFor(AssetLibrary::Category::ParticleEffect);
+                std::string effectPreview = ps.effectAssetId.empty() ? "(inline parameters)" : ps.effectAssetId;
+                for (const AssetLibrary::Entry& e : effects)
+                    if (e.id == ps.effectAssetId) { effectPreview = e.displayName; break; }
+                if (UI::Prop::BeginCombo("Effect Preset", effectPreview.c_str()))
+                {
+                    if (ImGui::Selectable("(inline parameters)", ps.effectAssetId.empty()))
+                    {
+                        ps.effectAssetId.clear();
+                        particleChanged = true;
+                    }
+                    for (const AssetLibrary::Entry& e : effects)
+                    {
+                        const bool selected = (e.id == ps.effectAssetId);
+                        if (ImGui::Selectable(e.displayName.c_str(), selected))
+                        {
+                            if (ApplyParticleEffectPreset(e.id, ps))
+                                particleChanged = true;
+                        }
+                        if (selected)
+                            ImGui::SetItemDefaultFocus();
+                    }
+                    ImGui::EndCombo();
+                }
+                if (!ps.effectAssetId.empty())
+                {
+                    if (ImGui::SmallButton("Re-apply Preset") && ApplyParticleEffectPreset(ps.effectAssetId, ps))
+                        particleChanged = true;
+                    ImGui::SameLine();
+                }
+                if (ImGui::SmallButton("Save As New Effect"))
+                    CreateParticleEffectFromComponent(ps);
+                ImGui::TextDisabled("Presets copy their parameters into this component.");
+            }
+
             ImGui::SeparatorText("Emission");
             particleChanged |= UI::Prop::DragFloat("Duration (s)", &ps.duration, 0.05f, 0.05f, 3600.0f);
             particleChanged |= UI::Prop::DragFloat("Rate (/s)", &ps.emissionRate, 0.5f, 0.0f, 5000.0f);
@@ -1280,7 +1390,8 @@ bool EditorImGui::RenderSelectedMeshPhysicsComponents()
             particleChanged |= UI::Prop::DragFloat("Speed Max", &ps.startSpeedMax, 0.05f, 0.0f, 100.0f);
             particleChanged |= UI::Prop::DragFloat("Size Min", &ps.startSizeMin, 0.01f, 0.0f, 100.0f);
             particleChanged |= UI::Prop::DragFloat("Size Max", &ps.startSizeMax, 0.01f, 0.0f, 100.0f);
-            particleChanged |= UI::Prop::DragFloat("End Size x", &ps.endSizeScale, 0.01f, 0.0f, 10.0f);
+            ImGui::TextUnformatted("Size Over Life");
+            particleChanged |= ParticleCurveEditor4("##size_curve", ps.sizeOverLife);
             particleChanged |= UI::Prop::DragFloat("Gravity", &ps.gravity, 0.05f, -50.0f, 50.0f);
             particleChanged |= UI::Prop::DragFloat("Drag", &ps.drag, 0.05f, 0.0f, 20.0f);
             particleChanged |= UI::Prop::DragFloat("Spin (deg/s)", &ps.rotationSpeed, 1.0f, -720.0f, 720.0f);
@@ -1289,15 +1400,52 @@ bool EditorImGui::RenderSelectedMeshPhysicsComponents()
             if (ImGui::IsItemHovered())
                 ImGui::SetTooltip("Fades the sprite where it comes close to scene geometry\n"
                                   "(needs the scene depth snapshot; the Scene View and the game).");
+            particleChanged |= UI::Prop::DragInt("Atlas Columns", &ps.atlasColumns, 1.0f, 1, 64);
+            particleChanged |= UI::Prop::DragInt("Atlas Rows", &ps.atlasRows, 1.0f, 1, 64);
+            if (ps.atlasColumns > 1 || ps.atlasRows > 1)
+                ImGui::TextDisabled("Flipbook: the cells play over each particle's lifetime.");
 
             ImGui::SeparatorText("Shape");
+            const char* shapes[] = {"Point", "Sphere", "Box", "Circle", "Edge"};
+            int shapeIndex = static_cast<int>(ps.shape);
+            if (UI::Prop::Combo("Emission Shape", &shapeIndex, shapes, IM_ARRAYSIZE(shapes)))
+            {
+                ps.shape = static_cast<ixparticle::ParticleShape>(shapeIndex);
+                particleChanged = true;
+            }
+            particleChanged |= UI::Prop::Checkbox("Local Space", &ps.localSpace);
+            if (ImGui::IsItemHovered())
+                ImGui::SetTooltip("Particles follow the emitter as it moves and rotates.");
+            if (ps.shape == ixparticle::ParticleShape::Sphere || ps.shape == ixparticle::ParticleShape::Circle)
+                particleChanged |= UI::Prop::DragFloat("Radius", &ps.shapeRadius, 0.01f, 0.0f, 50.0f);
+            if (ps.shape == ixparticle::ParticleShape::Box)
+                particleChanged |= UI::Prop::DragFloat3("Extents", ps.shapeExtents, 0.01f, 0.0f, 50.0f);
+            if (ps.shape == ixparticle::ParticleShape::Edge)
+                particleChanged |= UI::Prop::DragFloat("Half Length", &ps.shapeExtents[0], 0.01f, 0.0f, 50.0f);
+            if (ps.shape == ixparticle::ParticleShape::Circle)
+                particleChanged |= UI::Prop::DragFloat("Arc (deg)", &ps.shapeArc, 1.0f, 1.0f, 360.0f);
             particleChanged |= UI::Prop::DragFloat3("Direction", ps.direction, 0.05f, -1.0f, 1.0f);
             particleChanged |= UI::Prop::DragFloat("Cone Angle", &ps.coneAngle, 0.5f, 0.0f, 180.0f);
-            particleChanged |= UI::Prop::DragFloat("Radius", &ps.shapeRadius, 0.01f, 0.0f, 50.0f);
+
+            ImGui::SeparatorText("Collision");
+            particleChanged |= UI::Prop::Checkbox("Collide With Ground", &ps.collideWithGround);
+            if (ps.collideWithGround)
+            {
+                particleChanged |= UI::Prop::DragFloat("Bounce", &ps.collisionBounce, 0.01f, 0.0f, 1.0f);
+                particleChanged |= UI::Prop::DragFloat("Friction", &ps.collisionFriction, 0.01f, 0.0f, 1.0f);
+                particleChanged |= UI::Prop::DragFloat("Fallback Ground Y", &ps.groundPlaneY, 0.1f, -1000.0f, 1000.0f);
+                if (ps.localSpace)
+                    ImGui::TextDisabled("Local-space emitters do not collide with the ground.");
+                else
+                    ImGui::TextDisabled("Collides with the terrain where the scene has one.");
+            }
 
             ImGui::SeparatorText("Color");
-            particleChanged |= UI::Prop::ColorEdit4("Start", ps.startColor, ImGuiColorEditFlags_AlphaBar);
-            particleChanged |= UI::Prop::ColorEdit4("End", ps.endColor, ImGuiColorEditFlags_AlphaBar);
+            ParticleGradientBar4(ps.colorOverLife);
+            particleChanged |= UI::Prop::ColorEdit4("Color 0", &ps.colorOverLife[0], ImGuiColorEditFlags_AlphaBar);
+            particleChanged |= UI::Prop::ColorEdit4("Color 1", &ps.colorOverLife[4], ImGuiColorEditFlags_AlphaBar);
+            particleChanged |= UI::Prop::ColorEdit4("Color 2", &ps.colorOverLife[8], ImGuiColorEditFlags_AlphaBar);
+            particleChanged |= UI::Prop::ColorEdit4("Color 3", &ps.colorOverLife[12], ImGuiColorEditFlags_AlphaBar);
 
             if (particleChanged)
             {
