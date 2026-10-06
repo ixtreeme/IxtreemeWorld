@@ -252,6 +252,11 @@ bool AsUiConsumeClick(std::uint32_t document, const std::string& elementId)
     return Api().UiConsumeClick(document, elementId);
 }
 
+void AsParticlePlay(std::uint32_t id) { Api().ParticlePlay(id); }
+void AsParticleStop(std::uint32_t id) { Api().ParticleStop(id); }
+void AsParticleRestart(std::uint32_t id) { Api().ParticleRestart(id); }
+void AsParticleEmit(std::uint32_t id, std::uint32_t count) { Api().ParticleEmit(id, count); }
+
 // `self` equivalents (defined after the instance class: they read the executing instance).
 std::uint32_t AsSelf();
 std::string AsParam(const std::string& key);
@@ -474,6 +479,11 @@ void RegisterBindings(asIScriptEngine* engine)
     RegisterGlobal(engine, "void UiSetProperty(uint document, const string &in elementId, const string &in property, const string &in value)", &AsUiSetProperty);
     RegisterGlobal(engine, "void UiSetClass(uint document, const string &in elementId, const string &in className, bool enabled)", &AsUiSetClass);
     RegisterGlobal(engine, "bool UiConsumeClick(uint document, const string &in elementId)", &AsUiConsumeClick);
+
+    RegisterGlobal(engine, "void ParticlePlay(uint id)", &AsParticlePlay);
+    RegisterGlobal(engine, "void ParticleStop(uint id)", &AsParticleStop);
+    RegisterGlobal(engine, "void ParticleRestart(uint id)", &AsParticleRestart);
+    RegisterGlobal(engine, "void ParticleEmit(uint id, uint count)", &AsParticleEmit);
 
     RegisterGlobal(engine, "uint Self()", &AsSelf);
     RegisterGlobal(engine, "string Param(const string &in key)", &AsParam);

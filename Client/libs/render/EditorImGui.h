@@ -225,6 +225,9 @@ public:
     // Absolute filesystem path of an AnimatorController asset's .controller file (empty if none).
     std::string AnimatorControllerFilePath(const std::string& controllerId) const;
     std::string AudioClipFilePath(const std::string& clipId) const;
+    // A Texture asset id -> its file path ("" = not found). Used by the ParticleRenderer's
+    // texture resolver (the renderer decodes + caches the image itself).
+    std::string TextureFilePath(const std::string& textureId) const;
     // Absolute filesystem path of a Script asset's .lua file (empty if none) — for the Lua backend.
     std::string ScriptSourceFilePath(const std::string& scriptId) const;
     // Id of the first AnimationClip whose display name matches (empty if none) — for auto-filling

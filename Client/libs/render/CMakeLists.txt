@@ -13,6 +13,8 @@ add_library(IXEngineRender STATIC
     MapEditorTypes.h
     WorldLabelRenderer.cpp
     WorldLabelRenderer.h
+    ParticleRenderer.cpp
+    ParticleRenderer.h
     OffscreenSceneRenderer.cpp
     OffscreenSceneRenderer.h
     RmlUiLayer.cpp

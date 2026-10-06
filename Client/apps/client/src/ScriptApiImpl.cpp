@@ -272,6 +272,30 @@ bool ScriptApiImpl::UiConsumeClick(std::uint32_t document, const std::string& el
     return gameUi != nullptr && gameUi->ConsumeGameElementClick(document, elementId);
 }
 
+void ScriptApiImpl::ParticlePlay(std::uint32_t id)
+{
+    if (particlePlay)
+        particlePlay(id);
+}
+
+void ScriptApiImpl::ParticleStop(std::uint32_t id)
+{
+    if (particleStop)
+        particleStop(id);
+}
+
+void ScriptApiImpl::ParticleRestart(std::uint32_t id)
+{
+    if (particleRestart)
+        particleRestart(id);
+}
+
+void ScriptApiImpl::ParticleEmit(std::uint32_t id, std::uint32_t count)
+{
+    if (particleEmit)
+        particleEmit(id, count);
+}
+
 ixscript::RaycastHit ScriptApiImpl::Raycast(float ox, float oy, float oz,
                                             float dx, float dy, float dz, float maxDist)
 {

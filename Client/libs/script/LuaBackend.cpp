@@ -269,6 +269,14 @@ struct LuaBackend::Impl
             return a->UiConsumeClick(doc, id);
         });
 
+        // --- particles (v7): the entity's Particle System component ---
+        t.set_function("ParticlePlay", [a](std::uint32_t id) { a->ParticlePlay(id); });
+        t.set_function("ParticleStop", [a](std::uint32_t id) { a->ParticleStop(id); });
+        t.set_function("ParticleRestart", [a](std::uint32_t id) { a->ParticleRestart(id); });
+        t.set_function("ParticleEmit", [a](std::uint32_t id, std::uint32_t count) {
+            a->ParticleEmit(id, count);
+        });
+
         // Ergonomic Key.* table: names map to the same strings IsKeyDown accepts (Key.W == "W").
         sol::table keys = lua.create_table();
         for (const char* name : {"W", "A", "S", "D", "Space", "Shift", "Ctrl",

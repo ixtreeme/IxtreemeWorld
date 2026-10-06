@@ -3,6 +3,7 @@
 #include "physics/PhysicsComponents.h"
 #include "audio/AudioComponents.h"
 #include "script/ScriptComponent.h"
+#include "particles/ParticleComponents.h"
 
 #include <cstdint>
 #include <cstddef>
@@ -466,6 +467,8 @@ struct MeshSceneEntity
     ixaudio::AudioListenerComponent audioListener;
     bool hasScript = false;
     ixscript::ScriptComponent script;
+    bool hasParticleSystem = false;
+    ixparticle::ParticleSystemComponent particleSystem;
     // Stage-3 temporary clip binding (id of an AnimationClip asset, or empty). Runtime-only —
     // not serialized; replaced by the real Animator component in Stage 4.
     std::string debugAnimationClipId;
@@ -539,7 +542,8 @@ enum class EditorComponentType
     CharacterController,
     AudioSource,
     AudioListener,
-    Script
+    Script,
+    ParticleSystem
 };
 
 struct HierarchySceneEntity
@@ -613,6 +617,8 @@ struct MeshRendererEditorState
     ixaudio::AudioListenerComponent audioListener;
     bool hasScript = false;
     ixscript::ScriptComponent script;
+    bool hasParticleSystem = false;
+    ixparticle::ParticleSystemComponent particleSystem;
     // Stage-3 temporary clip binding (id of an AnimationClip asset, or empty). Runtime-only —
     // not serialized; replaced by the real Animator component in Stage 4.
     std::string debugAnimationClipId;

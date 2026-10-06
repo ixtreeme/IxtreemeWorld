@@ -176,6 +176,19 @@ public:
     // True once per click on the element (or anything inside it) since the last call.
     virtual bool UiConsumeClick(std::uint32_t document, const std::string& elementId) = 0;
 
+    // --- particles (v7): the entity's Particle System component ---
+    // Starts/resumes emission (creates the emitter's simulator if it has not started). No-op when
+    // the entity has no Particle System component. Live particles from before a Stop keep going
+    // until their lifetimes end.
+    virtual void ParticlePlay(std::uint32_t id) = 0;
+    // Stops emitting; the live particles finish. The emitter stays stopped (a later ParticlePlay
+    // resumes it without clearing).
+    virtual void ParticleStop(std::uint32_t id) = 0;
+    // Clears the live particles and restarts emission (with the component's burst).
+    virtual void ParticleRestart(std::uint32_t id) = 0;
+    // Spawns `count` particles immediately, even while emission is stopped.
+    virtual void ParticleEmit(std::uint32_t id, std::uint32_t count) = 0;
+
     // (NEVER add an STL-by-value return here — use a caller-owned char* buffer for strings to keep the
     //  /MT module boundary safe. By-value RaycastHit is fine: it is POD, no heap.)
 };

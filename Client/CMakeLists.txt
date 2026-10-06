@@ -304,6 +304,8 @@ if(WIN32)
     set(STATIC_MESH_SHADOW_VS_SPV "${GENERATED_SHADER_DIR}/static_mesh_shadow_vs.spv")
     set(STATIC_MESH_SHADOW_MASK_PS_SPV "${GENERATED_SHADER_DIR}/static_mesh_shadow_mask_ps.spv")
     set(SKINNED_MESH_SHADOW_VS_SPV "${GENERATED_SHADER_DIR}/skinned_mesh_shadow_vs.spv")
+    set(PARTICLE_VS_SPV "${GENERATED_SHADER_DIR}/particle_vs.spv")
+    set(PARTICLE_PS_SPV "${GENERATED_SHADER_DIR}/particle_ps.spv")
 
     add_custom_command(
         OUTPUT "${SKINNED_MESH_VS_SPV}"
@@ -535,6 +537,22 @@ if(WIN32)
         DEPENDS "${CLIENT_ROOT}/shaders/SkinnedMesh.hlsl" "${CLIENT_ROOT}/shaders/SunShadow.hlsli"
         VERBATIM
     )
+    add_custom_command(
+        OUTPUT "${PARTICLE_VS_SPV}"
+        COMMAND ${CMAKE_COMMAND} -E make_directory "${GENERATED_SHADER_DIR}"
+        COMMAND "${DXC_EXECUTABLE}" -spirv -T vs_6_0 -E VSMain
+            -Fo "${PARTICLE_VS_SPV}" "${CLIENT_ROOT}/shaders/Particles.hlsl"
+        DEPENDS "${CLIENT_ROOT}/shaders/Particles.hlsl"
+        VERBATIM
+    )
+    add_custom_command(
+        OUTPUT "${PARTICLE_PS_SPV}"
+        COMMAND ${CMAKE_COMMAND} -E make_directory "${GENERATED_SHADER_DIR}"
+        COMMAND "${DXC_EXECUTABLE}" -spirv -T ps_6_0 -E PSMain
+            -Fo "${PARTICLE_PS_SPV}" "${CLIENT_ROOT}/shaders/Particles.hlsl"
+        DEPENDS "${CLIENT_ROOT}/shaders/Particles.hlsl"
+        VERBATIM
+    )
     add_custom_target(IXEngineShaders DEPENDS
         "${SKINNED_MESH_VS_SPV}"
         "${SKINNED_MESH_PS_SPV}"
@@ -568,6 +586,8 @@ if(WIN32)
         "${STATIC_MESH_SHADOW_VS_SPV}"
         "${STATIC_MESH_SHADOW_MASK_PS_SPV}"
         "${SKINNED_MESH_SHADOW_VS_SPV}"
+        "${PARTICLE_VS_SPV}"
+        "${PARTICLE_PS_SPV}"
     )
 elseif(ANDROID)
     if(CMAKE_ANDROID_NDK)
@@ -588,6 +608,7 @@ add_subdirectory(libs/audio)
 add_subdirectory(libs/script)
 add_subdirectory(libs/import_export)
 add_subdirectory(libs/animation)
+add_subdirectory(libs/particles)
 add_subdirectory(libs/render)
 add_subdirectory(libs/prefab)
 add_subdirectory(libs/mesh_system)

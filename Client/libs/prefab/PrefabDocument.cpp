@@ -365,6 +365,44 @@ ixscript::ScriptComponent ReadScript(const std::string& object)
     return s;
 }
 
+ixparticle::ParticleSystemComponent ReadParticleSystem(const std::string& object)
+{
+    ixparticle::ParticleSystemComponent p;
+    const std::string component = ExtractNamedObject(object, "particle_system");
+    if (component.empty())
+        return p;
+    p.textureAssetId = ixtreeme::common::JsonStringValue(component, "texture_asset_id");
+    p.enabled = ixtreeme::common::JsonBoolValue(component, "enabled", p.enabled);
+    p.playOnStart = ixtreeme::common::JsonBoolValue(component, "play_on_start", p.playOnStart);
+    p.loop = ixtreeme::common::JsonBoolValue(component, "loop", p.loop);
+    p.blendMode = ixparticle::ParseBlendMode(ixtreeme::common::JsonStringValue(component, "blend_mode"));
+    p.duration = ixtreeme::common::JsonFloatValue(component, "duration", p.duration);
+    p.emissionRate = ixtreeme::common::JsonFloatValue(component, "emission_rate", p.emissionRate);
+    p.burstCount = static_cast<int>(ixtreeme::common::JsonFloatValue(
+        component, "burst_count", static_cast<float>(p.burstCount)));
+    p.maxParticles = static_cast<int>(ixtreeme::common::JsonFloatValue(
+        component, "max_particles", static_cast<float>(p.maxParticles)));
+    p.startLifetimeMin = ixtreeme::common::JsonFloatValue(component, "start_lifetime_min", p.startLifetimeMin);
+    p.startLifetimeMax = ixtreeme::common::JsonFloatValue(component, "start_lifetime_max", p.startLifetimeMax);
+    p.startSpeedMin = ixtreeme::common::JsonFloatValue(component, "start_speed_min", p.startSpeedMin);
+    p.startSpeedMax = ixtreeme::common::JsonFloatValue(component, "start_speed_max", p.startSpeedMax);
+    p.startSizeMin = ixtreeme::common::JsonFloatValue(component, "start_size_min", p.startSizeMin);
+    p.startSizeMax = ixtreeme::common::JsonFloatValue(component, "start_size_max", p.startSizeMax);
+    p.endSizeScale = ixtreeme::common::JsonFloatValue(component, "end_size_scale", p.endSizeScale);
+    ixtreeme::common::JsonFloatArrayValue(component, "direction", p.direction, 3);
+    p.coneAngle = ixtreeme::common::JsonFloatValue(component, "cone_angle", p.coneAngle);
+    p.shapeRadius = ixtreeme::common::JsonFloatValue(component, "shape_radius", p.shapeRadius);
+    p.gravity = ixtreeme::common::JsonFloatValue(component, "gravity", p.gravity);
+    p.drag = ixtreeme::common::JsonFloatValue(component, "drag", p.drag);
+    p.rotationSpeed = ixtreeme::common::JsonFloatValue(component, "rotation_speed", p.rotationSpeed);
+    p.softParticles = ixtreeme::common::JsonBoolValue(component, "soft_particles", p.softParticles);
+    p.softDistance = ixtreeme::common::JsonFloatValue(component, "soft_distance", p.softDistance);
+    ixtreeme::common::JsonFloatArrayValue(component, "start_color", p.startColor, 4);
+    ixtreeme::common::JsonFloatArrayValue(component, "end_color", p.endColor, 4);
+    ixparticle::Sanitize(p);
+    return p;
+}
+
 ixtreeme::physics::RigidbodyComponent ReadRigidbody(const std::string& object)
 {
     ixtreeme::physics::RigidbodyComponent rigidbody;
@@ -546,6 +584,8 @@ PrefabInstanceState ReadPrefabInstance(const std::string& object, const std::str
     return prefab;
 }
 
+void WriteParticleSystem(std::ostream& out, const ixparticle::ParticleSystemComponent& p, const std::string& indent);
+
 void WriteMeshObject(std::ostream& out, const MeshSceneEntity& mesh, const std::string& displayName, const std::string& indent)
 {
     WritePrefabInstance(out, mesh.prefabAssetId, mesh.prefabInstance, indent);
@@ -580,8 +620,44 @@ void WriteMeshObject(std::ostream& out, const MeshSceneEntity& mesh, const std::
     }
     if (mesh.hasScript)
         WriteScript(out, mesh.script, indent);
+    if (mesh.hasParticleSystem)
+        WriteParticleSystem(out, mesh.particleSystem, indent);
     out << "\n";
 }
+
+void WriteParticleSystem(std::ostream& out, const ixparticle::ParticleSystemComponent& p, const std::string& indent)
+{
+    out << ",\n";
+    out << indent << "\"particle_system\": {\n";
+    out << indent << "  \"texture_asset_id\": \"" << ixtreeme::common::EscapeJson(p.textureAssetId) << "\",\n";
+    out << indent << "  \"enabled\": " << (p.enabled ? "true" : "false") << ",\n";
+    out << indent << "  \"play_on_start\": " << (p.playOnStart ? "true" : "false") << ",\n";
+    out << indent << "  \"loop\": " << (p.loop ? "true" : "false") << ",\n";
+    out << indent << "  \"blend_mode\": \"" << ixparticle::BlendModeName(p.blendMode) << "\",\n";
+    out << indent << "  \"duration\": " << p.duration << ",\n";
+    out << indent << "  \"emission_rate\": " << p.emissionRate << ",\n";
+    out << indent << "  \"burst_count\": " << p.burstCount << ",\n";
+    out << indent << "  \"max_particles\": " << p.maxParticles << ",\n";
+    out << indent << "  \"start_lifetime_min\": " << p.startLifetimeMin << ",\n";
+    out << indent << "  \"start_lifetime_max\": " << p.startLifetimeMax << ",\n";
+    out << indent << "  \"start_speed_min\": " << p.startSpeedMin << ",\n";
+    out << indent << "  \"start_speed_max\": " << p.startSpeedMax << ",\n";
+    out << indent << "  \"start_size_min\": " << p.startSizeMin << ",\n";
+    out << indent << "  \"start_size_max\": " << p.startSizeMax << ",\n";
+    out << indent << "  \"end_size_scale\": " << p.endSizeScale << ",\n";
+    out << indent << "  \"direction\": " << FloatArray(p.direction, 3) << ",\n";
+    out << indent << "  \"cone_angle\": " << p.coneAngle << ",\n";
+    out << indent << "  \"shape_radius\": " << p.shapeRadius << ",\n";
+    out << indent << "  \"gravity\": " << p.gravity << ",\n";
+    out << indent << "  \"drag\": " << p.drag << ",\n";
+    out << indent << "  \"rotation_speed\": " << p.rotationSpeed << ",\n";
+    out << indent << "  \"soft_particles\": " << (p.softParticles ? "true" : "false") << ",\n";
+    out << indent << "  \"soft_distance\": " << p.softDistance << ",\n";
+    out << indent << "  \"start_color\": " << FloatArray(p.startColor, 4) << ",\n";
+    out << indent << "  \"end_color\": " << FloatArray(p.endColor, 4) << "\n";
+    out << indent << "}";
+}
+
 
 void WritePointObject(std::ostream& out, const PointLight& light, const std::string& displayName, const std::string& indent)
 {
@@ -681,6 +757,11 @@ PrefabEntity ParseEntityObject(const std::string& object, const std::string& fal
         {
             entity.mesh.hasScript = true;
             entity.mesh.script = ReadScript(object);
+        }
+        if (!ExtractNamedObject(object, "particle_system").empty())
+        {
+            entity.mesh.hasParticleSystem = true;
+            entity.mesh.particleSystem = ReadParticleSystem(object);
         }
         return entity;
     }

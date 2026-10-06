@@ -146,6 +146,24 @@ void OffscreenSceneRenderer::SnapshotScene(ixrhi::IXRHICommandList& cmd,
     m_snapshotsReady = true;
 }
 
+void OffscreenSceneRenderer::SnapshotDepth(ixrhi::IXRHICommandList& cmd,
+                                           const ixrhi::IXRHIFrameInfo& frame)
+{
+    if (!m_ready || !frame.frameActive || m_passActive || !m_depthSnapshot)
+        return;
+
+    using L = ixrhi::IXRHIImageLayout;
+    cmd.TransitionTexture(*m_depth, m_depthState, L::TransferSrc);
+    cmd.TransitionTexture(*m_depthSnapshot, m_depthSnapshotState, L::TransferDst);
+    cmd.CopyTexture(*m_depth, *m_depthSnapshot);
+    cmd.TransitionTexture(*m_depth, L::TransferSrc, L::DepthStencilAttachment);
+    cmd.TransitionTexture(*m_depthSnapshot, L::TransferDst, L::ShaderReadOnly);
+    m_depthState = L::DepthStencilAttachment;
+    m_depthSnapshotState = L::ShaderReadOnly;
+
+    m_snapshotsReady = true;
+}
+
 void OffscreenSceneRenderer::BeginDisplayPass(ixrhi::IXRHICommandList& cmd,
                                               const ixrhi::IXRHIFrameInfo& frame,
                                               const ToneMapSettings& toneMap)

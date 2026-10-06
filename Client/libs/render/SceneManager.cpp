@@ -1545,6 +1545,38 @@ void WriteScriptComponent(std::ostream& out, const ixscript::ScriptComponent& s)
     out << "      }";
 }
 
+void WriteParticleSystemComponent(std::ostream& out, const ixparticle::ParticleSystemComponent& p)
+{
+    out << "      \"particle_system\": {\n";
+    out << "        \"texture_asset_id\": \"" << EscapeJson(p.textureAssetId) << "\",\n";
+    out << "        \"enabled\": " << (p.enabled ? "true" : "false") << ",\n";
+    out << "        \"play_on_start\": " << (p.playOnStart ? "true" : "false") << ",\n";
+    out << "        \"loop\": " << (p.loop ? "true" : "false") << ",\n";
+    out << "        \"blend_mode\": \"" << ixparticle::BlendModeName(p.blendMode) << "\",\n";
+    out << "        \"duration\": " << p.duration << ",\n";
+    out << "        \"emission_rate\": " << p.emissionRate << ",\n";
+    out << "        \"burst_count\": " << p.burstCount << ",\n";
+    out << "        \"max_particles\": " << p.maxParticles << ",\n";
+    out << "        \"start_lifetime_min\": " << p.startLifetimeMin << ",\n";
+    out << "        \"start_lifetime_max\": " << p.startLifetimeMax << ",\n";
+    out << "        \"start_speed_min\": " << p.startSpeedMin << ",\n";
+    out << "        \"start_speed_max\": " << p.startSpeedMax << ",\n";
+    out << "        \"start_size_min\": " << p.startSizeMin << ",\n";
+    out << "        \"start_size_max\": " << p.startSizeMax << ",\n";
+    out << "        \"end_size_scale\": " << p.endSizeScale << ",\n";
+    out << "        \"direction\": " << FloatArray(p.direction, 3) << ",\n";
+    out << "        \"cone_angle\": " << p.coneAngle << ",\n";
+    out << "        \"shape_radius\": " << p.shapeRadius << ",\n";
+    out << "        \"gravity\": " << p.gravity << ",\n";
+    out << "        \"drag\": " << p.drag << ",\n";
+    out << "        \"rotation_speed\": " << p.rotationSpeed << ",\n";
+    out << "        \"soft_particles\": " << (p.softParticles ? "true" : "false") << ",\n";
+    out << "        \"soft_distance\": " << p.softDistance << ",\n";
+    out << "        \"start_color\": " << FloatArray(p.startColor, 4) << ",\n";
+    out << "        \"end_color\": " << FloatArray(p.endColor, 4) << "\n";
+    out << "      }";
+}
+
 void WriteSceneEntity(std::ostream& out, const MeshSceneEntity& mesh, bool comma)
 {
     out << "    {\n";
@@ -1657,6 +1689,11 @@ void WriteSceneEntity(std::ostream& out, const MeshSceneEntity& mesh, bool comma
     {
         out << ",\n";
         WriteScriptComponent(out, mesh.script);
+    }
+    if (mesh.hasParticleSystem)
+    {
+        out << ",\n";
+        WriteParticleSystemComponent(out, mesh.particleSystem);
     }
     out << "\n";
     out << "    }" << (comma ? "," : "") << "\n";
@@ -1970,6 +2007,42 @@ ixscript::ScriptComponent ReadScriptComponent(const JsonValue& entity)
     return s;
 }
 
+ixparticle::ParticleSystemComponent ReadParticleSystemComponent(const JsonValue& entity)
+{
+    ixparticle::ParticleSystemComponent p;
+    if (const JsonValue* object = Find(entity, "particle_system"); object && object->type == JsonValue::Type::Object)
+    {
+        p.textureAssetId = ReadString(*object, "texture_asset_id");
+        p.enabled = ReadBool(*object, "enabled", p.enabled);
+        p.playOnStart = ReadBool(*object, "play_on_start", p.playOnStart);
+        p.loop = ReadBool(*object, "loop", p.loop);
+        p.blendMode = ixparticle::ParseBlendMode(ReadString(*object, "blend_mode"));
+        p.duration = ReadFloat(*object, "duration", p.duration);
+        p.emissionRate = ReadFloat(*object, "emission_rate", p.emissionRate);
+        p.burstCount = static_cast<int>(ReadU32(*object, "burst_count", static_cast<std::uint32_t>(p.burstCount)));
+        p.maxParticles = static_cast<int>(ReadU32(*object, "max_particles", static_cast<std::uint32_t>(p.maxParticles)));
+        p.startLifetimeMin = ReadFloat(*object, "start_lifetime_min", p.startLifetimeMin);
+        p.startLifetimeMax = ReadFloat(*object, "start_lifetime_max", p.startLifetimeMax);
+        p.startSpeedMin = ReadFloat(*object, "start_speed_min", p.startSpeedMin);
+        p.startSpeedMax = ReadFloat(*object, "start_speed_max", p.startSpeedMax);
+        p.startSizeMin = ReadFloat(*object, "start_size_min", p.startSizeMin);
+        p.startSizeMax = ReadFloat(*object, "start_size_max", p.startSizeMax);
+        p.endSizeScale = ReadFloat(*object, "end_size_scale", p.endSizeScale);
+        ReadFloatArray(*object, "direction", p.direction, 3);
+        p.coneAngle = ReadFloat(*object, "cone_angle", p.coneAngle);
+        p.shapeRadius = ReadFloat(*object, "shape_radius", p.shapeRadius);
+        p.gravity = ReadFloat(*object, "gravity", p.gravity);
+        p.drag = ReadFloat(*object, "drag", p.drag);
+        p.rotationSpeed = ReadFloat(*object, "rotation_speed", p.rotationSpeed);
+        p.softParticles = ReadBool(*object, "soft_particles", p.softParticles);
+        p.softDistance = ReadFloat(*object, "soft_distance", p.softDistance);
+        ReadFloatArray(*object, "start_color", p.startColor, 4);
+        ReadFloatArray(*object, "end_color", p.endColor, 4);
+    }
+    ixparticle::Sanitize(p);
+    return p;
+}
+
 MeshSceneEntity ReadMeshSceneEntity(const JsonValue& entity)
 {
     MeshSceneEntity mesh;
@@ -2065,6 +2138,11 @@ MeshSceneEntity ReadMeshSceneEntity(const JsonValue& entity)
     {
         mesh.hasScript = true;
         mesh.script = ReadScriptComponent(entity);
+    }
+    if (const JsonValue* particleObj = Find(entity, "particle_system"); particleObj && particleObj->type == JsonValue::Type::Object)
+    {
+        mesh.hasParticleSystem = true;
+        mesh.particleSystem = ReadParticleSystemComponent(entity);
     }
     if (mesh.lod.enabled &&
         std::none_of(mesh.editorComponents.begin(), mesh.editorComponents.end(), [](const EditorAttachedComponent& component) {

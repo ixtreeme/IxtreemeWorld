@@ -140,6 +140,8 @@ void EditorImGui::RenderAddComponentMenu()
             return hasMesh && m_meshRendererState.hasAudioListener;
         if (id == "scripting.script")
             return hasMesh && m_meshRendererState.hasScript;
+        if (id == "effects.particle_system")
+            return hasMesh && m_meshRendererState.hasParticleSystem;
         return hasMesh && hasAttachedComponent(definition.id);
     };
 
@@ -1209,6 +1211,100 @@ bool EditorImGui::RenderSelectedMeshPhysicsComponents()
                     changed = true;
                 }
             }
+        }
+        ImGui::PopID();
+    }
+
+    if (m_meshRendererState.hasParticleSystem)
+    {
+        ImGui::PushID("effects.particle_system");
+        const bool open = ImGui::CollapsingHeader(ICON_FA_SHAPES " Particle System",
+            ImGuiTreeNodeFlags_DefaultOpen | ImGuiTreeNodeFlags_AllowOverlap);
+        componentMenu("ParticleSystemComponentMenu", "effects.particle_system");
+        if (open)
+        {
+            auto& ps = m_meshRendererState.particleSystem;
+            bool particleChanged = false;
+            particleChanged |= UI::Prop::Checkbox("Enabled", &ps.enabled);
+            particleChanged |= UI::Prop::Checkbox("Play On Start", &ps.playOnStart);
+            particleChanged |= UI::Prop::Checkbox("Loop", &ps.loop);
+
+            const char* blendModes[] = {"Alpha", "Additive"};
+            int blendIndex = ps.blendMode == ixparticle::ParticleBlendMode::Additive ? 1 : 0;
+            if (UI::Prop::Combo("Blending", &blendIndex, blendModes, IM_ARRAYSIZE(blendModes)))
+            {
+                ps.blendMode = blendIndex == 1 ? ixparticle::ParticleBlendMode::Additive
+                                               : ixparticle::ParticleBlendMode::Alpha;
+                particleChanged = true;
+            }
+
+            if (m_assetLibrary)
+            {
+                const std::vector<AssetLibrary::Entry> textures =
+                    m_assetLibrary->EntriesFor(AssetLibrary::Category::Texture);
+                std::string preview = ps.textureAssetId.empty() ? "(default soft sprite)" : ps.textureAssetId;
+                for (const AssetLibrary::Entry& e : textures)
+                    if (e.id == ps.textureAssetId) { preview = e.displayName; break; }
+                if (UI::Prop::BeginCombo("Texture", preview.c_str()))
+                {
+                    if (ImGui::Selectable("(default soft sprite)", ps.textureAssetId.empty()))
+                    {
+                        ps.textureAssetId.clear();
+                        particleChanged = true;
+                    }
+                    for (const AssetLibrary::Entry& e : textures)
+                    {
+                        const bool selected = (e.id == ps.textureAssetId);
+                        if (ImGui::Selectable(e.displayName.c_str(), selected))
+                        {
+                            ps.textureAssetId = e.id;
+                            particleChanged = true;
+                        }
+                        if (selected)
+                            ImGui::SetItemDefaultFocus();
+                    }
+                    ImGui::EndCombo();
+                }
+            }
+
+            ImGui::SeparatorText("Emission");
+            particleChanged |= UI::Prop::DragFloat("Duration (s)", &ps.duration, 0.05f, 0.05f, 3600.0f);
+            particleChanged |= UI::Prop::DragFloat("Rate (/s)", &ps.emissionRate, 0.5f, 0.0f, 5000.0f);
+            particleChanged |= UI::Prop::DragInt("Burst", &ps.burstCount, 1.0f, 0, 10000);
+            particleChanged |= UI::Prop::DragInt("Max Particles", &ps.maxParticles, 4.0f, 1, 65536);
+
+            ImGui::SeparatorText("Particle");
+            particleChanged |= UI::Prop::DragFloat("Lifetime Min", &ps.startLifetimeMin, 0.02f, 0.02f, 60.0f);
+            particleChanged |= UI::Prop::DragFloat("Lifetime Max", &ps.startLifetimeMax, 0.02f, 0.02f, 60.0f);
+            particleChanged |= UI::Prop::DragFloat("Speed Min", &ps.startSpeedMin, 0.05f, 0.0f, 100.0f);
+            particleChanged |= UI::Prop::DragFloat("Speed Max", &ps.startSpeedMax, 0.05f, 0.0f, 100.0f);
+            particleChanged |= UI::Prop::DragFloat("Size Min", &ps.startSizeMin, 0.01f, 0.0f, 100.0f);
+            particleChanged |= UI::Prop::DragFloat("Size Max", &ps.startSizeMax, 0.01f, 0.0f, 100.0f);
+            particleChanged |= UI::Prop::DragFloat("End Size x", &ps.endSizeScale, 0.01f, 0.0f, 10.0f);
+            particleChanged |= UI::Prop::DragFloat("Gravity", &ps.gravity, 0.05f, -50.0f, 50.0f);
+            particleChanged |= UI::Prop::DragFloat("Drag", &ps.drag, 0.05f, 0.0f, 20.0f);
+            particleChanged |= UI::Prop::DragFloat("Spin (deg/s)", &ps.rotationSpeed, 1.0f, -720.0f, 720.0f);
+            particleChanged |= UI::Prop::Checkbox("Soft Particles", &ps.softParticles);
+            particleChanged |= UI::Prop::DragFloat("Soft Distance", &ps.softDistance, 0.01f, 0.01f, 10.0f);
+            if (ImGui::IsItemHovered())
+                ImGui::SetTooltip("Fades the sprite where it comes close to scene geometry\n"
+                                  "(needs the scene depth snapshot; the Scene View and the game).");
+
+            ImGui::SeparatorText("Shape");
+            particleChanged |= UI::Prop::DragFloat3("Direction", ps.direction, 0.05f, -1.0f, 1.0f);
+            particleChanged |= UI::Prop::DragFloat("Cone Angle", &ps.coneAngle, 0.5f, 0.0f, 180.0f);
+            particleChanged |= UI::Prop::DragFloat("Radius", &ps.shapeRadius, 0.01f, 0.0f, 50.0f);
+
+            ImGui::SeparatorText("Color");
+            particleChanged |= UI::Prop::ColorEdit4("Start", ps.startColor, ImGuiColorEditFlags_AlphaBar);
+            particleChanged |= UI::Prop::ColorEdit4("End", ps.endColor, ImGuiColorEditFlags_AlphaBar);
+
+            if (particleChanged)
+            {
+                ixparticle::Sanitize(ps);
+                changed = true;
+            }
+            ImGui::TextDisabled("Simulates in Play (world space). Alpha/Additive blends over the scene.");
         }
         ImGui::PopID();
     }

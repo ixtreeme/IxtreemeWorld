@@ -69,6 +69,9 @@ public:
                        bool clear = true);
     void EndMainPass(ixrhi::IXRHICommandList& cmd);
     void SnapshotScene(ixrhi::IXRHICommandList& cmd, const ixrhi::IXRHIFrameInfo& frame);
+    // Depth-only variant for consumers that need just the scene depth (soft particles): skips the
+    // full-resolution color copy the water refraction needs.
+    void SnapshotDepth(ixrhi::IXRHICommandList& cmd, const ixrhi::IXRHIFrameInfo& frame);
     // Tone-maps the finished scene into the display image and leaves its pass open for overlays.
     void BeginDisplayPass(ixrhi::IXRHICommandList& cmd,
                           const ixrhi::IXRHIFrameInfo& frame,

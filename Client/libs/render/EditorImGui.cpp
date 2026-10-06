@@ -198,9 +198,9 @@ struct InspectorComponentDefinition
     bool addableToMesh;
 };
 
-const std::array<InspectorComponentDefinition, 20>& InspectorComponentRegistry()
+const std::array<InspectorComponentDefinition, 21>& InspectorComponentRegistry()
 {
-    static const std::array<InspectorComponentDefinition, 20> registry{{
+    static const std::array<InspectorComponentDefinition, 21> registry{{
         {"builtin.transform", "Transform", "Core", EditorComponentType::None, false},
         {"builtin.mesh_renderer", "MeshRenderer", "Rendering", EditorComponentType::MeshRenderer, false},
         {kLodComponentId, "LOD Group", "Rendering", EditorComponentType::None, true},
@@ -217,6 +217,7 @@ const std::array<InspectorComponentDefinition, 20>& InspectorComponentRegistry()
         {"audio.audio_source", "Audio Source", "Audio", EditorComponentType::AudioSource, true},
         {"audio.audio_listener", "Audio Listener", "Audio", EditorComponentType::AudioListener, true},
         {"scripting.script", "Script", "Scripting", EditorComponentType::Script, true},
+        {"effects.particle_system", "Particle System", "Effects", EditorComponentType::ParticleSystem, true},
         {"builtin.water_body", "Water Body", "Rendering", EditorComponentType::WaterBody, false},
         {"builtin.point_light", "Point Light", "Lighting", EditorComponentType::PointLight, false},
         {"builtin.spot_light", "Spot Light", "Lighting", EditorComponentType::SpotLight, false},
@@ -1272,6 +1273,16 @@ std::string EditorImGui::AudioClipFilePath(const std::string& clipId) const
         return {};
     const auto entry = m_assetLibrary->FindById(clipId);
     if (!entry || entry->category != AssetLibrary::Category::Audio)
+        return {};
+    return m_assetLibrary->AbsolutePath(*entry).generic_string();
+}
+
+std::string EditorImGui::TextureFilePath(const std::string& textureId) const
+{
+    if (!m_assetLibrary || textureId.empty())
+        return {};
+    const auto entry = m_assetLibrary->FindById(textureId);
+    if (!entry || entry->category != AssetLibrary::Category::Texture)
         return {};
     return m_assetLibrary->AbsolutePath(*entry).generic_string();
 }
@@ -3102,6 +3113,16 @@ std::string EditorImGui::AudioClipFilePath(const std::string& clipId) const
         return {};
     const auto entry = m_assetLibrary->FindById(clipId);
     if (!entry || entry->category != AssetLibrary::Category::Audio)
+        return {};
+    return m_assetLibrary->AbsolutePath(*entry).generic_string();
+}
+
+std::string EditorImGui::TextureFilePath(const std::string& textureId) const
+{
+    if (!m_assetLibrary || textureId.empty())
+        return {};
+    const auto entry = m_assetLibrary->FindById(textureId);
+    if (!entry || entry->category != AssetLibrary::Category::Texture)
         return {};
     return m_assetLibrary->AbsolutePath(*entry).generic_string();
 }

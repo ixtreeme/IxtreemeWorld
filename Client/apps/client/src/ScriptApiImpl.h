@@ -92,6 +92,10 @@ public:
     void UiSetClass(std::uint32_t document, const std::string& elementId, const std::string& className,
                     bool enabled) override;
     bool UiConsumeClick(std::uint32_t document, const std::string& elementId) override;
+    void ParticlePlay(std::uint32_t id) override;
+    void ParticleStop(std::uint32_t id) override;
+    void ParticleRestart(std::uint32_t id) override;
+    void ParticleEmit(std::uint32_t id, std::uint32_t count) override;
 
     // --- game UI + character controller, wired once by RunGame ---
     RmlUiLayer* gameUi = nullptr;
@@ -99,6 +103,11 @@ public:
     std::function<std::string(const std::string&)> resolveUiDocument;
     std::function<bool(std::uint32_t, ixscript::CharacterState&)> getCharacterState;
     std::function<void(std::uint32_t, bool, bool)> setCharacterAbilities;
+    // Particle System actions (wired once by RunGame; no-ops when unset).
+    std::function<void(std::uint32_t)> particlePlay;
+    std::function<void(std::uint32_t)> particleStop;
+    std::function<void(std::uint32_t)> particleRestart;
+    std::function<void(std::uint32_t, std::uint32_t)> particleEmit;
 
     // --- script text prompts, drawn by the host UI (the editor) ---
     struct Prompt

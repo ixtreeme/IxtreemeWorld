@@ -46,6 +46,7 @@ target_link_libraries(IxtreemeEngine
         IXEnginePhysics
         IXEngineRender
         IXEngineAnimation
+        IXEngineParticle
         IXEngineAudio
         IXEngineScript
         IXEngineEditorBuild
