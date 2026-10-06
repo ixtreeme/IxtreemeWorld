@@ -39,6 +39,7 @@ std::string WriteParticleEffectJson(const ParticleSystemComponent& e,
     out << "  \"display_name\": \"" << ixtreeme::common::EscapeJson(displayName) << "\",\n";
     out << "  \"texture_asset_id\": \"" << ixtreeme::common::EscapeJson(e.textureAssetId) << "\",\n";
     out << "  \"blend_mode\": \"" << BlendModeName(e.blendMode) << "\",\n";
+    out << "  \"gpu_simulation\": " << (e.gpuSimulation ? "true" : "false") << ",\n";
     out << "  \"duration\": " << e.duration << ",\n";
     out << "  \"emission_rate\": " << e.emissionRate << ",\n";
     out << "  \"burst_count\": " << e.burstCount << ",\n";
@@ -83,6 +84,7 @@ bool ParseParticleEffectJson(const std::string& text, ParticleSystemComponent& o
 
     out.textureAssetId = ixtreeme::common::JsonStringValue(text, "texture_asset_id");
     out.blendMode = ParseBlendMode(ixtreeme::common::JsonStringValue(text, "blend_mode"));
+    out.gpuSimulation = ixtreeme::common::JsonBoolValue(text, "gpu_simulation", out.gpuSimulation);
     out.duration = ixtreeme::common::JsonFloatValue(text, "duration", out.duration);
     out.emissionRate = ixtreeme::common::JsonFloatValue(text, "emission_rate", out.emissionRate);
     out.burstCount = static_cast<int>(ixtreeme::common::JsonFloatValue(

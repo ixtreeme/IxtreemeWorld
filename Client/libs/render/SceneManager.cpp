@@ -1553,6 +1553,7 @@ void WriteParticleSystemComponent(std::ostream& out, const ixparticle::ParticleS
     out << "        \"enabled\": " << (p.enabled ? "true" : "false") << ",\n";
     out << "        \"play_on_start\": " << (p.playOnStart ? "true" : "false") << ",\n";
     out << "        \"loop\": " << (p.loop ? "true" : "false") << ",\n";
+    out << "        \"gpu_simulation\": " << (p.gpuSimulation ? "true" : "false") << ",\n";
     out << "        \"blend_mode\": \"" << ixparticle::BlendModeName(p.blendMode) << "\",\n";
     out << "        \"duration\": " << p.duration << ",\n";
     out << "        \"emission_rate\": " << p.emissionRate << ",\n";
@@ -2029,6 +2030,7 @@ ixparticle::ParticleSystemComponent ReadParticleSystemComponent(const JsonValue&
         p.enabled = ReadBool(*object, "enabled", p.enabled);
         p.playOnStart = ReadBool(*object, "play_on_start", p.playOnStart);
         p.loop = ReadBool(*object, "loop", p.loop);
+        p.gpuSimulation = ReadBool(*object, "gpu_simulation", p.gpuSimulation);
         p.blendMode = ixparticle::ParseBlendMode(ReadString(*object, "blend_mode"));
         p.duration = ReadFloat(*object, "duration", p.duration);
         p.emissionRate = ReadFloat(*object, "emission_rate", p.emissionRate);

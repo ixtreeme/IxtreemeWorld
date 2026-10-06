@@ -81,6 +81,9 @@ struct ParticleSystemComponent
     bool enabled = true;
     bool playOnStart = true;     // begin emitting when Play starts
     bool loop = true;            // false: emission stops after `duration`, live particles finish
+    // GPU simulation: a compute pass simulates this emitter's particles (for high counts). The GPU
+    // path has no ground collision, no local space and no duration/loop handling (continuous only).
+    bool gpuSimulation = false;
     ParticleBlendMode blendMode = ParticleBlendMode::Alpha;
 
     float duration = 3.0f;       // seconds of emission per cycle (loop) / total (no loop)

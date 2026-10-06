@@ -306,6 +306,9 @@ if(WIN32)
     set(SKINNED_MESH_SHADOW_VS_SPV "${GENERATED_SHADER_DIR}/skinned_mesh_shadow_vs.spv")
     set(PARTICLE_VS_SPV "${GENERATED_SHADER_DIR}/particle_vs.spv")
     set(PARTICLE_PS_SPV "${GENERATED_SHADER_DIR}/particle_ps.spv")
+    set(PARTICLE_GPU_VS_SPV "${GENERATED_SHADER_DIR}/particle_gpu_vs.spv")
+    set(PARTICLE_GPU_PS_SPV "${GENERATED_SHADER_DIR}/particle_gpu_ps.spv")
+    set(PARTICLE_SIM_CS_SPV "${GENERATED_SHADER_DIR}/particles_sim_cs.spv")
 
     add_custom_command(
         OUTPUT "${SKINNED_MESH_VS_SPV}"
@@ -553,6 +556,30 @@ if(WIN32)
         DEPENDS "${CLIENT_ROOT}/shaders/Particles.hlsl"
         VERBATIM
     )
+    add_custom_command(
+        OUTPUT "${PARTICLE_GPU_VS_SPV}"
+        COMMAND ${CMAKE_COMMAND} -E make_directory "${GENERATED_SHADER_DIR}"
+        COMMAND "${DXC_EXECUTABLE}" -spirv -T vs_6_0 -E VSMain
+            -Fo "${PARTICLE_GPU_VS_SPV}" "${CLIENT_ROOT}/shaders/ParticlesGpu.hlsl"
+        DEPENDS "${CLIENT_ROOT}/shaders/ParticlesGpu.hlsl"
+        VERBATIM
+    )
+    add_custom_command(
+        OUTPUT "${PARTICLE_GPU_PS_SPV}"
+        COMMAND ${CMAKE_COMMAND} -E make_directory "${GENERATED_SHADER_DIR}"
+        COMMAND "${DXC_EXECUTABLE}" -spirv -T ps_6_0 -E PSMain
+            -Fo "${PARTICLE_GPU_PS_SPV}" "${CLIENT_ROOT}/shaders/ParticlesGpu.hlsl"
+        DEPENDS "${CLIENT_ROOT}/shaders/ParticlesGpu.hlsl"
+        VERBATIM
+    )
+    add_custom_command(
+        OUTPUT "${PARTICLE_SIM_CS_SPV}"
+        COMMAND ${CMAKE_COMMAND} -E make_directory "${GENERATED_SHADER_DIR}"
+        COMMAND "${DXC_EXECUTABLE}" -spirv -T cs_6_0 -E CSMain
+            -Fo "${PARTICLE_SIM_CS_SPV}" "${CLIENT_ROOT}/shaders/ParticlesSim.hlsl"
+        DEPENDS "${CLIENT_ROOT}/shaders/ParticlesSim.hlsl"
+        VERBATIM
+    )
     add_custom_target(IXEngineShaders DEPENDS
         "${SKINNED_MESH_VS_SPV}"
         "${SKINNED_MESH_PS_SPV}"
@@ -588,6 +615,9 @@ if(WIN32)
         "${SKINNED_MESH_SHADOW_VS_SPV}"
         "${PARTICLE_VS_SPV}"
         "${PARTICLE_PS_SPV}"
+        "${PARTICLE_GPU_VS_SPV}"
+        "${PARTICLE_GPU_PS_SPV}"
+        "${PARTICLE_SIM_CS_SPV}"
     )
 elseif(ANDROID)
     if(CMAKE_ANDROID_NDK)

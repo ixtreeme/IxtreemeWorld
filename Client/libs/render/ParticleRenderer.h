@@ -63,7 +63,44 @@ public:
         // bound, e.g. the depth snapshot is unavailable).
         bool softParticles = true;
         float softDistance = 0.5f;
+        // CPU path: the per-particle data built this frame. GPU path: the emitter's state buffer
+        // (simulated by SimulateGpuEmitter) is drawn instead.
+        bool gpu = false;
+        std::uint32_t gpuEntityId = 0;
         std::vector<InstanceData> instances;
+    };
+
+    // The parameters the engine feeds the GPU simulation each frame (a mirror of the component
+    // fields the compute needs; the renderer never sees the component).
+    struct GpuEmitterParams
+    {
+        float emitterPosition[3] = {0.0f, 0.0f, 0.0f};
+        float emitterDirection[3] = {0.0f, 1.0f, 0.0f};
+        float gravity = -1.5f;
+        float drag = 0.0f;
+        float coneAngle = 20.0f;     // degrees
+        float rotationSpeed = 0.0f;  // degrees/s
+        float shapeRadius = 0.15f;
+        float shapeArc = 360.0f;     // degrees
+        float shape = 1.0f;          // ixparticle::ParticleShape ordinal
+        float shapeExtents[3] = {0.5f, 0.1f, 0.5f};
+        float lifetimeMin = 0.7f;
+        float lifetimeMax = 1.2f;
+        float speedMin = 0.6f;
+        float speedMax = 1.4f;
+        float sizeMin = 0.12f;
+        float sizeMax = 0.25f;
+        float sizeOverLife[4] = {1.0f, 1.0f, 1.0f, 0.2f};
+        float colorOverLife[16] = {
+            1.0f, 0.85f, 0.5f, 1.0f,
+            1.0f, 0.60f, 0.3f, 0.8f,
+            1.0f, 0.40f, 0.2f, 0.4f,
+            1.0f, 0.25f, 0.1f, 0.0f};
+        int atlasColumns = 1;
+        int atlasRows = 1;
+        int maxParticles = 256;
+        float emissionRate = 25.0f;
+        bool startPlaying = true;  // the emitter's initial state (scripts can change it later)
     };
 
     ParticleRenderer() = default;
@@ -79,6 +116,22 @@ public:
                        std::shared_ptr<ixrhi::IXRHISampler> sampler,
                        float nearPlane,
                        float farPlane);
+
+    // GPU simulation: advances one emitter a frame (creates it lazily, writes its parameters,
+    // dispatches the compute and emits the write->vertex-read barrier). Call OUTSIDE any render
+    // pass, before the view draws; returns false when the GPU path is unavailable.
+    bool SimulateGpuEmitter(ixrhi::IXRHICommandList& cmd,
+                            const ixrhi::IXRHIFrameInfo& frame,
+                            std::uint32_t entityId,
+                            const GpuEmitterParams& params,
+                            float dtSeconds);
+    // Script controls (no-ops when the emitter has not been created yet).
+    void GpuEmitterPlay(std::uint32_t entityId);
+    void GpuEmitterStop(std::uint32_t entityId);
+    void GpuEmitterRestart(std::uint32_t entityId);
+    void GpuEmitterEmit(std::uint32_t entityId, std::uint32_t count);
+    // Forgets every GPU emitter (Play session boundaries / project switches).
+    void ResetGpuEmitters();
     // Resolves a texture asset id to a file path ("" = not found). Wired by the engine; the
     // renderer itself never touches the asset DB.
     void SetTextureResolver(std::function<std::string(const std::string&)> resolver)
@@ -113,10 +166,48 @@ private:
         std::shared_ptr<ixrhi::IXRHISampler> sampler;
     };
 
+    // The GPU simulation's per-emitter uniform (must match ParticlesSim.hlsl's SimParams exactly:
+    // 13 float4s).
+    struct GpuSimUniform
+    {
+        float emitterPos[4];     // xyz = position, w = dt
+        float emitterDir[4];     // xyz = normalized direction
+        float params0[4];        // gravity, drag, cone angle (rad), rotation speed (rad)
+        float params1[4];        // shape radius, shape arc (rad), shape ordinal, unused
+        float shapeExtents[4];
+        float spawn[4];          // spawn budget, spawn cursor, frame seed, max particles
+        float sizeOverLife[4];
+        float color0[4];
+        float color1[4];
+        float color2[4];
+        float color3[4];
+        float life[4];           // lifetime min/max, size min/max
+        float speed[4];          // speed min/max, atlas columns, atlas rows
+    };
+    static_assert(sizeof(GpuSimUniform) == 208, "SimParams layout must stay 13 float4s");
+    static constexpr std::uint64_t kGpuStateBytes = 96;  // ParticlesSim.hlsl ParticleState
+
+    struct GpuEmitter
+    {
+        std::shared_ptr<ixrhi::IXRHIBuffer> state;     // Storage|Vertex: the compute's ParticleState
+        std::shared_ptr<ixrhi::IXRHIBuffer> uniform;   // GpuSimUniform
+        std::unique_ptr<ixrhi::IXRHIBindGroup> computeBindGroup;
+        std::uint32_t maxParticles = 0;
+        float spawnAccumulator = 0.0f;
+        std::uint32_t spawnCursor = 0;
+        std::uint32_t frameSeed = 1;
+        int pendingBurst = 0;
+        bool playing = true;
+        bool initialized = false;
+        std::uint64_t lastSeenFrame = 0;  // stale emitters are pruned (frames in flight grace)
+    };
+
     bool CreateBuffers(ixrhi::IXRHIDevice& rhi);
     bool CreateBindGroup(ixrhi::IXRHIDevice& rhi);
     bool CreateDefaultTexture(ixrhi::IXRHIDevice& rhi);
     bool CreateDefaultDepthTexture(ixrhi::IXRHIDevice& rhi);
+    bool CreateGpuSimResources(ixrhi::IXRHIDevice& rhi);
+    GpuEmitter* EnsureGpuEmitter(ixrhi::IXRHIDevice& rhi, std::uint32_t entityId, int maxParticles);
     const TextureEntry* ResolveTexture(const std::string& assetId);
 
     ixrhi::IXRHIDevice* m_rhi = nullptr;
@@ -132,6 +223,17 @@ private:
     std::unique_ptr<ixrhi::IXRHIBindGroup> m_bindGroup;
     std::unique_ptr<ixrhi::IXRHIGraphicsPipeline> m_alphaPipeline;
     std::unique_ptr<ixrhi::IXRHIGraphicsPipeline> m_additivePipeline;
+    // GPU simulation path: the compute pipeline + its layout, the GPU draw shaders/pipelines and the
+    // per-emitter state (keyed by entity id).
+    std::shared_ptr<ixrhi::IXRHIShader> m_gpuVertexShader;
+    std::shared_ptr<ixrhi::IXRHIShader> m_gpuPixelShader;
+    std::shared_ptr<ixrhi::IXRHIShader> m_gpuSimShader;
+    std::unique_ptr<ixrhi::IXRHIBindGroupLayout> m_gpuSimLayout;
+    std::unique_ptr<ixrhi::IXRHIComputePipeline> m_gpuSimPipeline;
+    std::unique_ptr<ixrhi::IXRHIGraphicsPipeline> m_gpuAlphaPipeline;
+    std::unique_ptr<ixrhi::IXRHIGraphicsPipeline> m_gpuAdditivePipeline;
+    std::unordered_map<std::uint32_t, GpuEmitter> m_gpuEmitters;
+    std::uint64_t m_lastGpuPruneFrame = 0;
     TextureEntry m_defaultTexture;
     std::unordered_map<std::string, TextureEntry> m_textures;  // key = texture asset id
     std::vector<std::string> m_failedTextureIds;  // logged once; retried only after a restart

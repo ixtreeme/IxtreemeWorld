@@ -1300,6 +1300,11 @@ bool EditorImGui::RenderSelectedMeshPhysicsComponents()
             particleChanged |= UI::Prop::Checkbox("Enabled", &ps.enabled);
             particleChanged |= UI::Prop::Checkbox("Play On Start", &ps.playOnStart);
             particleChanged |= UI::Prop::Checkbox("Loop", &ps.loop);
+            particleChanged |= UI::Prop::Checkbox("GPU Simulation", &ps.gpuSimulation);
+            if (ImGui::IsItemHovered())
+                ImGui::SetTooltip("Simulates this emitter on the GPU (for high particle counts).\n"
+                                  "The GPU path has no ground collision, no local space and\n"
+                                  "emits continuously (no duration/loop).");
 
             const char* blendModes[] = {"Alpha", "Additive"};
             int blendIndex = ps.blendMode == ixparticle::ParticleBlendMode::Additive ? 1 : 0;
@@ -1312,11 +1317,17 @@ bool EditorImGui::RenderSelectedMeshPhysicsComponents()
 
             if (m_assetLibrary)
             {
-                const std::vector<AssetLibrary::Entry> textures =
-                    m_assetLibrary->EntriesFor(AssetLibrary::Category::Texture);
-                std::string preview = ps.textureAssetId.empty() ? "(default soft sprite)" : ps.textureAssetId;
-                for (const AssetLibrary::Entry& e : textures)
-                    if (e.id == ps.textureAssetId) { preview = e.displayName; break; }
+                // The category list is only materialized while the combo is OPEN: EntriesFor copies
+                // every entry of the category, which is far too heavy to do every frame (the Texture
+                // category can hold thousands). The preview uses one FindById lookup instead.
+                std::string preview = "(default soft sprite)";
+                if (!ps.textureAssetId.empty())
+                {
+                    preview = ps.textureAssetId;
+                    if (const auto entry = m_assetLibrary->FindById(ps.textureAssetId);
+                        entry && entry->category == AssetLibrary::Category::Texture)
+                        preview = entry->displayName;
+                }
                 if (UI::Prop::BeginCombo("Texture", preview.c_str()))
                 {
                     if (ImGui::Selectable("(default soft sprite)", ps.textureAssetId.empty()))
@@ -1324,6 +1335,8 @@ bool EditorImGui::RenderSelectedMeshPhysicsComponents()
                         ps.textureAssetId.clear();
                         particleChanged = true;
                     }
+                    const std::vector<AssetLibrary::Entry> textures =
+                        m_assetLibrary->EntriesFor(AssetLibrary::Category::Texture);
                     for (const AssetLibrary::Entry& e : textures)
                     {
                         const bool selected = (e.id == ps.textureAssetId);
@@ -1341,11 +1354,15 @@ bool EditorImGui::RenderSelectedMeshPhysicsComponents()
 
             if (m_assetLibrary)
             {
-                const std::vector<AssetLibrary::Entry> effects =
-                    m_assetLibrary->EntriesFor(AssetLibrary::Category::ParticleEffect);
-                std::string effectPreview = ps.effectAssetId.empty() ? "(inline parameters)" : ps.effectAssetId;
-                for (const AssetLibrary::Entry& e : effects)
-                    if (e.id == ps.effectAssetId) { effectPreview = e.displayName; break; }
+                // Same lazy pattern for the effect presets (usually few, but keep it uniform).
+                std::string effectPreview = "(inline parameters)";
+                if (!ps.effectAssetId.empty())
+                {
+                    effectPreview = ps.effectAssetId;
+                    if (const auto entry = m_assetLibrary->FindById(ps.effectAssetId);
+                        entry && entry->category == AssetLibrary::Category::ParticleEffect)
+                        effectPreview = entry->displayName;
+                }
                 if (UI::Prop::BeginCombo("Effect Preset", effectPreview.c_str()))
                 {
                     if (ImGui::Selectable("(inline parameters)", ps.effectAssetId.empty()))
@@ -1353,6 +1370,8 @@ bool EditorImGui::RenderSelectedMeshPhysicsComponents()
                         ps.effectAssetId.clear();
                         particleChanged = true;
                     }
+                    const std::vector<AssetLibrary::Entry> effects =
+                        m_assetLibrary->EntriesFor(AssetLibrary::Category::ParticleEffect);
                     for (const AssetLibrary::Entry& e : effects)
                     {
                         const bool selected = (e.id == ps.effectAssetId);
@@ -1384,68 +1403,93 @@ bool EditorImGui::RenderSelectedMeshPhysicsComponents()
             particleChanged |= UI::Prop::DragInt("Max Particles", &ps.maxParticles, 4.0f, 1, 65536);
 
             ImGui::SeparatorText("Particle");
-            particleChanged |= UI::Prop::DragFloat("Lifetime Min", &ps.startLifetimeMin, 0.02f, 0.02f, 60.0f);
-            particleChanged |= UI::Prop::DragFloat("Lifetime Max", &ps.startLifetimeMax, 0.02f, 0.02f, 60.0f);
-            particleChanged |= UI::Prop::DragFloat("Speed Min", &ps.startSpeedMin, 0.05f, 0.0f, 100.0f);
-            particleChanged |= UI::Prop::DragFloat("Speed Max", &ps.startSpeedMax, 0.05f, 0.0f, 100.0f);
-            particleChanged |= UI::Prop::DragFloat("Size Min", &ps.startSizeMin, 0.01f, 0.0f, 100.0f);
-            particleChanged |= UI::Prop::DragFloat("Size Max", &ps.startSizeMax, 0.01f, 0.0f, 100.0f);
+            // Min/max pairs share one row each (fewer widgets = less per-frame ImGui work).
+            float lifetimeRange[2] = {ps.startLifetimeMin, ps.startLifetimeMax};
+            if (UI::Prop::DragFloat2("Lifetime Min/Max", lifetimeRange, 0.02f, 0.02f, 60.0f))
+            {
+                ps.startLifetimeMin = lifetimeRange[0];
+                ps.startLifetimeMax = lifetimeRange[1];
+                particleChanged = true;
+            }
+            float speedRange[2] = {ps.startSpeedMin, ps.startSpeedMax};
+            if (UI::Prop::DragFloat2("Speed Min/Max", speedRange, 0.05f, 0.0f, 100.0f))
+            {
+                ps.startSpeedMin = speedRange[0];
+                ps.startSpeedMax = speedRange[1];
+                particleChanged = true;
+            }
+            float sizeRange[2] = {ps.startSizeMin, ps.startSizeMax};
+            if (UI::Prop::DragFloat2("Size Min/Max", sizeRange, 0.01f, 0.0f, 100.0f))
+            {
+                ps.startSizeMin = sizeRange[0];
+                ps.startSizeMax = sizeRange[1];
+                particleChanged = true;
+            }
             ImGui::TextUnformatted("Size Over Life");
             particleChanged |= ParticleCurveEditor4("##size_curve", ps.sizeOverLife);
             particleChanged |= UI::Prop::DragFloat("Gravity", &ps.gravity, 0.05f, -50.0f, 50.0f);
             particleChanged |= UI::Prop::DragFloat("Drag", &ps.drag, 0.05f, 0.0f, 20.0f);
             particleChanged |= UI::Prop::DragFloat("Spin (deg/s)", &ps.rotationSpeed, 1.0f, -720.0f, 720.0f);
             particleChanged |= UI::Prop::Checkbox("Soft Particles", &ps.softParticles);
-            particleChanged |= UI::Prop::DragFloat("Soft Distance", &ps.softDistance, 0.01f, 0.01f, 10.0f);
             if (ImGui::IsItemHovered())
                 ImGui::SetTooltip("Fades the sprite where it comes close to scene geometry\n"
                                   "(needs the scene depth snapshot; the Scene View and the game).");
+            if (ps.softParticles)
+                particleChanged |= UI::Prop::DragFloat("Soft Distance", &ps.softDistance, 0.01f, 0.01f, 10.0f);
             particleChanged |= UI::Prop::DragInt("Atlas Columns", &ps.atlasColumns, 1.0f, 1, 64);
             particleChanged |= UI::Prop::DragInt("Atlas Rows", &ps.atlasRows, 1.0f, 1, 64);
             if (ps.atlasColumns > 1 || ps.atlasRows > 1)
                 ImGui::TextDisabled("Flipbook: the cells play over each particle's lifetime.");
 
-            ImGui::SeparatorText("Shape");
-            const char* shapes[] = {"Point", "Sphere", "Box", "Circle", "Edge"};
-            int shapeIndex = static_cast<int>(ps.shape);
-            if (UI::Prop::Combo("Emission Shape", &shapeIndex, shapes, IM_ARRAYSIZE(shapes)))
+            // The advanced groups live behind collapsed sub-headers: their widgets only render while
+            // open, keeping the per-frame inspector cost low (at high frame rates ImGui is the cost).
+            if (ImGui::CollapsingHeader("Shape"))
             {
-                ps.shape = static_cast<ixparticle::ParticleShape>(shapeIndex);
-                particleChanged = true;
-            }
-            particleChanged |= UI::Prop::Checkbox("Local Space", &ps.localSpace);
-            if (ImGui::IsItemHovered())
-                ImGui::SetTooltip("Particles follow the emitter as it moves and rotates.");
-            if (ps.shape == ixparticle::ParticleShape::Sphere || ps.shape == ixparticle::ParticleShape::Circle)
-                particleChanged |= UI::Prop::DragFloat("Radius", &ps.shapeRadius, 0.01f, 0.0f, 50.0f);
-            if (ps.shape == ixparticle::ParticleShape::Box)
-                particleChanged |= UI::Prop::DragFloat3("Extents", ps.shapeExtents, 0.01f, 0.0f, 50.0f);
-            if (ps.shape == ixparticle::ParticleShape::Edge)
-                particleChanged |= UI::Prop::DragFloat("Half Length", &ps.shapeExtents[0], 0.01f, 0.0f, 50.0f);
-            if (ps.shape == ixparticle::ParticleShape::Circle)
-                particleChanged |= UI::Prop::DragFloat("Arc (deg)", &ps.shapeArc, 1.0f, 1.0f, 360.0f);
-            particleChanged |= UI::Prop::DragFloat3("Direction", ps.direction, 0.05f, -1.0f, 1.0f);
-            particleChanged |= UI::Prop::DragFloat("Cone Angle", &ps.coneAngle, 0.5f, 0.0f, 180.0f);
-
-            ImGui::SeparatorText("Collision");
-            particleChanged |= UI::Prop::Checkbox("Collide With Ground", &ps.collideWithGround);
-            if (ps.collideWithGround)
-            {
-                particleChanged |= UI::Prop::DragFloat("Bounce", &ps.collisionBounce, 0.01f, 0.0f, 1.0f);
-                particleChanged |= UI::Prop::DragFloat("Friction", &ps.collisionFriction, 0.01f, 0.0f, 1.0f);
-                particleChanged |= UI::Prop::DragFloat("Fallback Ground Y", &ps.groundPlaneY, 0.1f, -1000.0f, 1000.0f);
-                if (ps.localSpace)
-                    ImGui::TextDisabled("Local-space emitters do not collide with the ground.");
-                else
-                    ImGui::TextDisabled("Collides with the terrain where the scene has one.");
+                const char* shapes[] = {"Point", "Sphere", "Box", "Circle", "Edge"};
+                int shapeIndex = static_cast<int>(ps.shape);
+                if (UI::Prop::Combo("Emission Shape", &shapeIndex, shapes, IM_ARRAYSIZE(shapes)))
+                {
+                    ps.shape = static_cast<ixparticle::ParticleShape>(shapeIndex);
+                    particleChanged = true;
+                }
+                particleChanged |= UI::Prop::Checkbox("Local Space", &ps.localSpace);
+                if (ImGui::IsItemHovered())
+                    ImGui::SetTooltip("Particles follow the emitter as it moves and rotates.");
+                if (ps.shape == ixparticle::ParticleShape::Sphere || ps.shape == ixparticle::ParticleShape::Circle)
+                    particleChanged |= UI::Prop::DragFloat("Radius", &ps.shapeRadius, 0.01f, 0.0f, 50.0f);
+                if (ps.shape == ixparticle::ParticleShape::Box)
+                    particleChanged |= UI::Prop::DragFloat3("Extents", ps.shapeExtents, 0.01f, 0.0f, 50.0f);
+                if (ps.shape == ixparticle::ParticleShape::Edge)
+                    particleChanged |= UI::Prop::DragFloat("Half Length", &ps.shapeExtents[0], 0.01f, 0.0f, 50.0f);
+                if (ps.shape == ixparticle::ParticleShape::Circle)
+                    particleChanged |= UI::Prop::DragFloat("Arc (deg)", &ps.shapeArc, 1.0f, 1.0f, 360.0f);
+                particleChanged |= UI::Prop::DragFloat3("Direction", ps.direction, 0.05f, -1.0f, 1.0f);
+                particleChanged |= UI::Prop::DragFloat("Cone Angle", &ps.coneAngle, 0.5f, 0.0f, 180.0f);
             }
 
-            ImGui::SeparatorText("Color");
-            ParticleGradientBar4(ps.colorOverLife);
-            particleChanged |= UI::Prop::ColorEdit4("Color 0", &ps.colorOverLife[0], ImGuiColorEditFlags_AlphaBar);
-            particleChanged |= UI::Prop::ColorEdit4("Color 1", &ps.colorOverLife[4], ImGuiColorEditFlags_AlphaBar);
-            particleChanged |= UI::Prop::ColorEdit4("Color 2", &ps.colorOverLife[8], ImGuiColorEditFlags_AlphaBar);
-            particleChanged |= UI::Prop::ColorEdit4("Color 3", &ps.colorOverLife[12], ImGuiColorEditFlags_AlphaBar);
+            if (ImGui::CollapsingHeader("Collision"))
+            {
+                particleChanged |= UI::Prop::Checkbox("Collide With Ground", &ps.collideWithGround);
+                if (ps.collideWithGround)
+                {
+                    particleChanged |= UI::Prop::DragFloat("Bounce", &ps.collisionBounce, 0.01f, 0.0f, 1.0f);
+                    particleChanged |= UI::Prop::DragFloat("Friction", &ps.collisionFriction, 0.01f, 0.0f, 1.0f);
+                    particleChanged |= UI::Prop::DragFloat("Fallback Ground Y", &ps.groundPlaneY, 0.1f, -1000.0f, 1000.0f);
+                    if (ps.localSpace)
+                        ImGui::TextDisabled("Local-space emitters do not collide with the ground.");
+                    else
+                        ImGui::TextDisabled("Collides with the terrain where the scene has one.");
+                }
+            }
+
+            if (ImGui::CollapsingHeader("Color"))
+            {
+                ParticleGradientBar4(ps.colorOverLife);
+                particleChanged |= UI::Prop::ColorEdit4("Color 0", &ps.colorOverLife[0], ImGuiColorEditFlags_AlphaBar);
+                particleChanged |= UI::Prop::ColorEdit4("Color 1", &ps.colorOverLife[4], ImGuiColorEditFlags_AlphaBar);
+                particleChanged |= UI::Prop::ColorEdit4("Color 2", &ps.colorOverLife[8], ImGuiColorEditFlags_AlphaBar);
+                particleChanged |= UI::Prop::ColorEdit4("Color 3", &ps.colorOverLife[12], ImGuiColorEditFlags_AlphaBar);
+            }
 
             if (particleChanged)
             {
@@ -1813,7 +1857,9 @@ void EditorImGui::RenderSelectedMeshRendererInspector()
     if (RenderSelectedMeshPhysicsComponents())
         MarkSelectedMeshRendererChanged();
 
-    if (ImGui::CollapsingHeader(ICON_FA_LAYER_GROUP " Layer generation", ImGuiTreeNodeFlags_DefaultOpen | ImGuiTreeNodeFlags_AllowOverlap))
+    // Collapsed by default: its 13 tag checkboxes would otherwise render every frame (the inspector's
+    // cost is proportional to the widgets drawn, which matters at high frame rates).
+    if (ImGui::CollapsingHeader(ICON_FA_LAYER_GROUP " Layer generation", ImGuiTreeNodeFlags_AllowOverlap))
     {
         bool changed = UI::Prop::Checkbox("Include collision surfaces", &m_meshRendererState.layerAuthoring.enabled);
         ImGui::TextDisabled("Bounds and floor heights are derived from collision geometry.");
@@ -1974,6 +2020,12 @@ void EditorImGui::RenderSelectedMeshRendererInspector()
         MeshSceneEntity::MaterialOverride& material = findOverride();
         bool changed = false;
         changed |= UI::Prop::Checkbox("Override Active", &material.enabled);
+        // The override fields only render while the override is active: ten widgets that otherwise
+        // cost ImGui time every frame for nothing.
+        if (!material.enabled)
+            ImGui::TextDisabled("Enable Override Active to edit the material override.");
+        else
+        {
         changed |= UI::Prop::ColorEdit4("BaseColor Tint", material.baseColor, ImGuiColorEditFlags_Float);
         changed |= UI::Prop::SliderFloat("Metallic", &material.metallic, 0.0f, 1.0f, "%.2f");
         changed |= UI::Prop::SliderFloat("Roughness", &material.roughness, 0.0f, 1.0f, "%.2f");
@@ -1995,6 +2047,7 @@ void EditorImGui::RenderSelectedMeshRendererInspector()
         material.emissiveIntensity = std::clamp(material.emissiveIntensity, 0.0f, 20.0f);
         material.uvTiling[0] = std::clamp(material.uvTiling[0], 0.01f, 64.0f);
         material.uvTiling[1] = std::clamp(material.uvTiling[1], 0.01f, 64.0f);
+        }
 
         if (changed)
         {

@@ -92,14 +92,36 @@ bool ParticleRenderer::Create(ixrhi::IXRHIDevice& rhi, client::asset::IAssetRead
         return false;
     }
 
+    // The GPU simulation path is optional: without its shaders the CPU path still works.
+    m_gpuVertexShader = LoadShader(rhi, assets, "assets/shaders/particle_gpu_vs.spv",
+        ixrhi::IXRHIShaderStage::Vertex, "VSMain");
+    m_gpuPixelShader = LoadShader(rhi, assets, "assets/shaders/particle_gpu_ps.spv",
+        ixrhi::IXRHIShaderStage::Fragment, "PSMain");
+    m_gpuSimShader = LoadShader(rhi, assets, "assets/shaders/particles_sim_cs.spv",
+        ixrhi::IXRHIShaderStage::Compute, "CSMain");
+    if (!m_gpuVertexShader || !m_gpuPixelShader || !m_gpuSimShader)
+        TraceError("[PARTICLE] GPU simulation shaders missing - GPU emitters are unavailable");
+
     if (!CreateBuffers(rhi) || !CreateDefaultTexture(rhi) || !CreateDefaultDepthTexture(rhi) ||
-        !CreateBindGroup(rhi))
+        !CreateBindGroup(rhi) || !CreateGpuSimResources(rhi))
     {
         TraceError("[PARTICLE] renderer resource creation failed");
         Destroy();
         return false;
     }
     return RecreatePipeline(rhi);
+}
+
+bool ParticleRenderer::CreateGpuSimResources(ixrhi::IXRHIDevice& rhi)
+{
+    if (!m_gpuSimShader)
+        return true;  // optional path
+    const std::vector<ixrhi::IXRHIBinding> bindings = {
+        {0, ixrhi::IXRHIBindingType::UniformBuffer, ixrhi::IXRHIShaderStage::Compute},
+        {1, ixrhi::IXRHIBindingType::StorageBuffer, ixrhi::IXRHIShaderStage::Compute},
+    };
+    m_gpuSimLayout = rhi.CreateBindGroupLayout(bindings);
+    return m_gpuSimLayout != nullptr;
 }
 
 bool ParticleRenderer::CreateBuffers(ixrhi::IXRHIDevice& rhi)
@@ -193,7 +215,9 @@ bool ParticleRenderer::CreateDefaultDepthTexture(ixrhi::IXRHIDevice& rhi)
 bool ParticleRenderer::CreateBindGroup(ixrhi::IXRHIDevice& rhi)
 {
     const std::vector<ixrhi::IXRHIBinding> bindings = {
-        {0, ixrhi::IXRHIBindingType::UniformBuffer, ixrhi::IXRHIShaderStage::Vertex},
+        // The view uniform carries the soft-particle parameters the pixel shader reads too.
+        {0, ixrhi::IXRHIBindingType::UniformBuffer,
+            ixrhi::IXRHIShaderStage::Vertex | ixrhi::IXRHIShaderStage::Fragment},
         {1, ixrhi::IXRHIBindingType::SampledTexture, ixrhi::IXRHIShaderStage::Fragment},
         {2, ixrhi::IXRHIBindingType::StorageBuffer, ixrhi::IXRHIShaderStage::Vertex},
         {3, ixrhi::IXRHIBindingType::SampledTexture, ixrhi::IXRHIShaderStage::Fragment},  // scene depth
@@ -290,6 +314,47 @@ bool ParticleRenderer::RecreatePipeline(ixrhi::IXRHIDevice& rhi)
         TraceError("[PARTICLE] pipeline creation failed");
         return false;
     }
+
+    // GPU simulation path (optional): the GPU draw pipelines share the CPU bind group layout, and
+    // the compute pipeline simulates the emitter state buffers.
+    m_gpuAlphaPipeline.reset();
+    m_gpuAdditivePipeline.reset();
+    m_gpuSimPipeline.reset();
+    if (m_gpuVertexShader && m_gpuPixelShader)
+    {
+        auto buildGpu = [&](bool additive) {
+            ixrhi::IXRHIGraphicsPipelineDesc desc;
+            desc.vertexShader = m_gpuVertexShader;
+            desc.fragmentShader = m_gpuPixelShader;
+            desc.bindGroupLayouts = {m_bindLayout.get()};
+            desc.topology = ixrhi::IXRHIPrimitiveTopology::TriangleList;
+            desc.cullMode = ixrhi::IXRHICullMode::None;
+            desc.depthTestEnable = true;
+            desc.depthWriteEnable = false;
+            desc.depthCompareOp = ixrhi::IXRHICompareOp::LessOrEqual;
+            desc.blendAttachments = {{true,
+                ixrhi::IXRHIBlendFactor::One,
+                additive ? ixrhi::IXRHIBlendFactor::One : ixrhi::IXRHIBlendFactor::OneMinusSrcAlpha,
+                ixrhi::IXRHIBlendOp::Add,
+                ixrhi::IXRHIBlendFactor::One,
+                additive ? ixrhi::IXRHIBlendFactor::One : ixrhi::IXRHIBlendFactor::OneMinusSrcAlpha,
+                ixrhi::IXRHIBlendOp::Add}};
+            desc.sampleCount = 1;
+            desc.targetRenderPass = m_targetPass;
+            desc.debugName = additive ? "ParticlesGpu:Additive" : "ParticlesGpu:Alpha";
+            return rhi.CreateGraphicsPipeline(desc);
+        };
+        m_gpuAlphaPipeline = buildGpu(false);
+        m_gpuAdditivePipeline = buildGpu(true);
+    }
+    if (m_gpuSimShader && m_gpuSimLayout)
+    {
+        ixrhi::IXRHIComputePipelineDesc desc;
+        desc.computeShader = m_gpuSimShader;
+        desc.bindGroupLayouts = {m_gpuSimLayout.get()};
+        desc.debugName = "Particles:Simulation";
+        m_gpuSimPipeline = rhi.CreateComputePipeline(desc);
+    }
     return true;
 }
 
@@ -348,13 +413,30 @@ void ParticleRenderer::RenderInWorld(ixrhi::IXRHICommandList& cmd,
                                      std::uint32_t width,
                                      std::uint32_t height)
 {
-    if (!m_rhi || !frame.frameActive || batch.instances.empty())
-        return;
-    const ixrhi::IXRHIGraphicsPipeline* pipeline =
-        batch.additive ? m_additivePipeline.get() : m_alphaPipeline.get();
-    if (!pipeline || !m_bindGroup)
+    if (!m_rhi || !frame.frameActive)
         return;
     if (width == 0 || height == 0)
+        return;
+
+    // GPU emitters draw their whole state buffer with a fixed instance count (dead particles are
+    // size 0); CPU emitters draw the instances appended to the shared buffer this frame.
+    const GpuEmitter* gpuEmitter = nullptr;
+    const ixrhi::IXRHIGraphicsPipeline* pipeline = nullptr;
+    if (batch.gpu)
+    {
+        const auto it = m_gpuEmitters.find(batch.gpuEntityId);
+        if (it == m_gpuEmitters.end() || !it->second.state || !it->second.initialized)
+            return;
+        gpuEmitter = &it->second;
+        pipeline = batch.additive ? m_gpuAdditivePipeline.get() : m_gpuAlphaPipeline.get();
+    }
+    else
+    {
+        if (batch.instances.empty())
+            return;
+        pipeline = batch.additive ? m_additivePipeline.get() : m_alphaPipeline.get();
+    }
+    if (!pipeline || !m_bindGroup)
         return;
 
     const std::uint32_t frameIndex = frame.frameIndex % kFramesInFlight;
@@ -364,27 +446,37 @@ void ParticleRenderer::RenderInWorld(ixrhi::IXRHICommandList& cmd,
         m_instanceCursor = 0;
         m_drawSlotCursor = 0;
     }
-    if (m_instanceCursor >= kMaxInstances)
-        return;  // this frame's buffer is full (the capacity warning was logged)
 
-    std::uint32_t count = static_cast<std::uint32_t>(batch.instances.size());
-    if (count > kMaxInstances - m_instanceCursor)
+    std::uint32_t count = 0;
+    std::uint32_t base = 0;
+    if (gpuEmitter)
     {
-        count = kMaxInstances - m_instanceCursor;
-        if (!m_loggedCapacity)
-        {
-            TraceError("[PARTICLE] instance buffer full (%u): %zu particles dropped this frame",
-                kMaxInstances, batch.instances.size() - count);
-            m_loggedCapacity = true;
-        }
+        count = gpuEmitter->maxParticles;
     }
-    if (count == 0)
-        return;
+    else
+    {
+        if (m_instanceCursor >= kMaxInstances)
+            return;  // this frame's buffer is full (the capacity warning was logged)
 
-    const std::uint32_t base = m_instanceCursor;
-    m_instanceBuffers[frameIndex]->Write(static_cast<std::uint64_t>(base) * sizeof(InstanceData),
-        batch.instances.data(), static_cast<std::size_t>(count) * sizeof(InstanceData));
-    m_instanceCursor = base + count;
+        count = static_cast<std::uint32_t>(batch.instances.size());
+        if (count > kMaxInstances - m_instanceCursor)
+        {
+            count = kMaxInstances - m_instanceCursor;
+            if (!m_loggedCapacity)
+            {
+                TraceError("[PARTICLE] instance buffer full (%u): %zu particles dropped this frame",
+                    kMaxInstances, batch.instances.size() - count);
+                m_loggedCapacity = true;
+            }
+        }
+        if (count == 0)
+            return;
+
+        base = m_instanceCursor;
+        m_instanceBuffers[frameIndex]->Write(static_cast<std::uint64_t>(base) * sizeof(InstanceData),
+            batch.instances.data(), static_cast<std::size_t>(count) * sizeof(InstanceData));
+        m_instanceCursor = base + count;
+    }
 
     // The billboard's camera basis (same derivation as WorldLabelRenderer).
     ViewUniform uniform{};
@@ -412,6 +504,15 @@ void ParticleRenderer::RenderInWorld(ixrhi::IXRHICommandList& cmd,
     if (texture && texture->texture && texture->sampler)
         m_bindGroup->UpdateTexture(bindSlot, 1, texture->texture, texture->sampler);
 
+    // Rebind the instance storage for this slot: the shared per-frame buffer (CPU path) or the
+    // emitter's GPU state buffer. Slots are shared between CPU and GPU draws, so this is per draw.
+    if (gpuEmitter)
+        m_bindGroup->UpdateBuffer(bindSlot, 2, gpuEmitter->state, 0,
+            kGpuStateBytes * gpuEmitter->maxParticles);
+    else
+        m_bindGroup->UpdateBuffer(bindSlot, 2, m_instanceBuffers[frameIndex], 0,
+            sizeof(InstanceData) * kMaxInstances);
+
     cmd.SetViewport(0.0f, 0.0f, static_cast<float>(width), static_cast<float>(height));
     cmd.SetScissor(0, 0, width, height);
     cmd.SetGraphicsPipeline(*pipeline);
@@ -419,10 +520,219 @@ void ParticleRenderer::RenderInWorld(ixrhi::IXRHICommandList& cmd,
     cmd.Draw(6, count, 0, base);
 }
 
+ParticleRenderer::GpuEmitter* ParticleRenderer::EnsureGpuEmitter(ixrhi::IXRHIDevice& rhi,
+                                                                 std::uint32_t entityId,
+                                                                 int maxParticles)
+{
+    maxParticles = std::clamp(maxParticles, 1, 65536);
+    GpuEmitter& emitter = m_gpuEmitters[entityId];
+    if (emitter.state && emitter.uniform && emitter.computeBindGroup &&
+        emitter.maxParticles == static_cast<std::uint32_t>(maxParticles))
+        return &emitter;
+
+    // (Re)create the emitter's state + uniform buffers and its compute bind group. The state buffer
+    // starts zeroed (lifetime 0 = dead), so an uninitialized slot can never render garbage.
+    std::vector<std::uint8_t> zeroState(static_cast<std::size_t>(kGpuStateBytes) *
+        static_cast<std::size_t>(maxParticles), 0);
+    ixrhi::IXRHIBufferDesc stateDesc;
+    stateDesc.sizeBytes = zeroState.size();
+    stateDesc.usage = ixrhi::IXRHIBufferUsage::Storage | ixrhi::IXRHIBufferUsage::Vertex;
+    stateDesc.debugName = "Particle:GPUState";
+    emitter.state = rhi.CreateBuffer(stateDesc, zeroState.data(), zeroState.size());
+    ixrhi::IXRHIBufferDesc uniformDesc;
+    uniformDesc.sizeBytes = sizeof(GpuSimUniform);
+    uniformDesc.usage = ixrhi::IXRHIBufferUsage::Uniform;
+    uniformDesc.cpuAccess = ixrhi::IXRHICpuAccess::Write;
+    uniformDesc.debugName = "Particle:GPUSimParams";
+    emitter.uniform = rhi.CreateBuffer(uniformDesc, nullptr, 0);
+    if (!emitter.state || !emitter.uniform || !m_gpuSimLayout)
+    {
+        emitter.state.reset();
+        emitter.uniform.reset();
+        emitter.computeBindGroup.reset();
+        return nullptr;
+    }
+    emitter.computeBindGroup = rhi.CreateBindGroup(*m_gpuSimLayout, 1);
+    if (!emitter.computeBindGroup)
+    {
+        emitter.state.reset();
+        emitter.uniform.reset();
+        return nullptr;
+    }
+    emitter.computeBindGroup->UpdateBuffer(0, 0, emitter.uniform, 0, sizeof(GpuSimUniform));
+    emitter.computeBindGroup->UpdateBuffer(0, 1, emitter.state, 0, stateDesc.sizeBytes);
+
+    emitter.maxParticles = static_cast<std::uint32_t>(maxParticles);
+    emitter.spawnAccumulator = 0.0f;
+    emitter.spawnCursor = 0;
+    emitter.frameSeed = 1;
+    emitter.pendingBurst = 0;
+    emitter.playing = true;
+    emitter.initialized = false;
+    Tracenf("[PARTICLE][gpu] emitter created entity=%u maxParticles=%u", entityId, emitter.maxParticles);
+    return &emitter;
+}
+
+bool ParticleRenderer::SimulateGpuEmitter(ixrhi::IXRHICommandList& cmd,
+                                          const ixrhi::IXRHIFrameInfo& frame,
+                                          std::uint32_t entityId,
+                                          const GpuEmitterParams& params,
+                                          float dtSeconds)
+{
+    if (!m_rhi || !frame.frameActive || !m_gpuSimPipeline || !m_gpuSimLayout)
+        return false;
+    GpuEmitter* emitterPtr = EnsureGpuEmitter(*m_rhi, entityId, params.maxParticles);
+    if (!emitterPtr)
+        return false;
+    GpuEmitter& emitter = *emitterPtr;
+    emitter.lastSeenFrame = frame.frameNumber;
+    // Prune emitters whose entity is gone (once per frame; a generous grace so buffers still read
+    // by a frame in flight are never released).
+    if (frame.frameNumber != m_lastGpuPruneFrame)
+    {
+        m_lastGpuPruneFrame = frame.frameNumber;
+        for (auto it = m_gpuEmitters.begin(); it != m_gpuEmitters.end();)
+        {
+            if (it->second.lastSeenFrame + 120 < frame.frameNumber)
+                it = m_gpuEmitters.erase(it);
+            else
+                ++it;
+        }
+    }
+    if (!emitter.initialized)
+        emitter.playing = params.startPlaying;
+
+    // Spawn budget: the rate accumulator plus any queued bursts (scripts); a stopped emitter only
+    // fires queued bursts. The compute respawns the ring range [cursor, cursor + budget).
+    if (emitter.playing && dtSeconds > 0.0f)
+        emitter.spawnAccumulator += params.emissionRate * dtSeconds;
+    std::uint32_t budget = 0;
+    if (emitter.spawnAccumulator >= 1.0f)
+    {
+        budget = static_cast<std::uint32_t>(emitter.spawnAccumulator);
+        emitter.spawnAccumulator -= static_cast<float>(budget);
+    }
+    if (emitter.pendingBurst > 0)
+    {
+        budget += static_cast<std::uint32_t>(emitter.pendingBurst);
+        emitter.pendingBurst = 0;
+    }
+    budget = std::min(budget, emitter.maxParticles);
+
+    GpuSimUniform uniform{};
+    uniform.emitterPos[0] = params.emitterPosition[0];
+    uniform.emitterPos[1] = params.emitterPosition[1];
+    uniform.emitterPos[2] = params.emitterPosition[2];
+    uniform.emitterPos[3] = std::clamp(dtSeconds, 0.0f, 0.1f);
+    uniform.emitterDir[0] = params.emitterDirection[0];
+    uniform.emitterDir[1] = params.emitterDirection[1];
+    uniform.emitterDir[2] = params.emitterDirection[2];
+    uniform.params0[0] = params.gravity;
+    uniform.params0[1] = params.drag;
+    uniform.params0[2] = params.coneAngle * 0.01745329252f;
+    uniform.params0[3] = params.rotationSpeed * 0.01745329252f;
+    uniform.params1[0] = params.shapeRadius;
+    uniform.params1[1] = params.shapeArc * 0.01745329252f;
+    uniform.params1[2] = params.shape;
+    uniform.shapeExtents[0] = params.shapeExtents[0];
+    uniform.shapeExtents[1] = params.shapeExtents[1];
+    uniform.shapeExtents[2] = params.shapeExtents[2];
+    uniform.spawn[0] = static_cast<float>(budget);
+    uniform.spawn[1] = static_cast<float>(emitter.spawnCursor);
+    uniform.spawn[2] = static_cast<float>(emitter.frameSeed);
+    uniform.spawn[3] = static_cast<float>(emitter.maxParticles);
+    std::memcpy(uniform.sizeOverLife, params.sizeOverLife, sizeof(uniform.sizeOverLife));
+    std::memcpy(uniform.color0, params.colorOverLife + 0, sizeof(uniform.color0));
+    std::memcpy(uniform.color1, params.colorOverLife + 4, sizeof(uniform.color1));
+    std::memcpy(uniform.color2, params.colorOverLife + 8, sizeof(uniform.color2));
+    std::memcpy(uniform.color3, params.colorOverLife + 12, sizeof(uniform.color3));
+    uniform.life[0] = params.lifetimeMin;
+    uniform.life[1] = params.lifetimeMax;
+    uniform.life[2] = params.sizeMin;
+    uniform.life[3] = params.sizeMax;
+    uniform.speed[0] = params.speedMin;
+    uniform.speed[1] = params.speedMax;
+    uniform.speed[2] = static_cast<float>(std::max(params.atlasColumns, 1));
+    uniform.speed[3] = static_cast<float>(std::max(params.atlasRows, 1));
+    emitter.uniform->Write(0, &uniform, sizeof(uniform));
+
+    // Outside any pass (the engine calls this in the render pre-pass). The same buffer is drawn
+    // later this frame, hence the write -> vertex-read barrier (the skinning path's pattern).
+    if (emitter.initialized)
+        cmd.TransitionBuffer(*emitter.state, ixrhi::IXRHIBufferState::VertexRead,
+            ixrhi::IXRHIBufferState::ShaderWrite);
+    cmd.SetComputePipeline(*m_gpuSimPipeline);
+    cmd.BindGroup(0, *emitter.computeBindGroup, 0);
+    const std::uint32_t groups = (emitter.maxParticles + 63u) / 64u;
+    cmd.Dispatch(groups, 1, 1);
+    cmd.TransitionBuffer(*emitter.state, ixrhi::IXRHIBufferState::ShaderWrite,
+        ixrhi::IXRHIBufferState::VertexRead);
+    emitter.initialized = true;
+
+    emitter.spawnCursor = (emitter.spawnCursor + budget) % emitter.maxParticles;
+    ++emitter.frameSeed;
+    return true;
+}
+
+void ParticleRenderer::GpuEmitterPlay(std::uint32_t entityId)
+{
+    const auto it = m_gpuEmitters.find(entityId);
+    if (it != m_gpuEmitters.end())
+        it->second.playing = true;
+}
+
+void ParticleRenderer::GpuEmitterStop(std::uint32_t entityId)
+{
+    const auto it = m_gpuEmitters.find(entityId);
+    if (it != m_gpuEmitters.end())
+        it->second.playing = false;
+}
+
+void ParticleRenderer::GpuEmitterRestart(std::uint32_t entityId)
+{
+    const auto it = m_gpuEmitters.find(entityId);
+    if (it == m_gpuEmitters.end())
+        return;
+    it->second.playing = true;
+    it->second.spawnAccumulator = 0.0f;
+    it->second.pendingBurst = static_cast<int>(it->second.maxParticles);  // respawn everything
+}
+
+void ParticleRenderer::GpuEmitterEmit(std::uint32_t entityId, std::uint32_t count)
+{
+    const auto it = m_gpuEmitters.find(entityId);
+    if (it == m_gpuEmitters.end())
+        return;
+    it->second.pendingBurst += static_cast<int>(std::min<std::uint32_t>(count, 10000u));
+}
+
+void ParticleRenderer::ResetGpuEmitters()
+{
+    // In-place reset: the buffers stay alive (a frame in flight may still read them), every emitter
+    // is respawned fresh on its next simulation (a full ring pass overwrites all slots).
+    for (auto& [entityId, emitter] : m_gpuEmitters)
+    {
+        (void)entityId;
+        emitter.pendingBurst = static_cast<int>(emitter.maxParticles);
+        emitter.playing = true;
+        emitter.spawnAccumulator = 0.0f;
+        emitter.spawnCursor = 0;
+        emitter.initialized = false;
+    }
+}
+
 void ParticleRenderer::Destroy()
 {
     m_alphaPipeline.reset();
     m_additivePipeline.reset();
+    m_gpuAlphaPipeline.reset();
+    m_gpuAdditivePipeline.reset();
+    m_gpuSimPipeline.reset();
+    m_gpuSimLayout.reset();
+    m_gpuEmitters.clear();
+    m_gpuVertexShader.reset();
+    m_gpuPixelShader.reset();
+    m_gpuSimShader.reset();
     m_bindGroup.reset();
     m_bindLayout.reset();
     for (auto& buffer : m_instanceBuffers)

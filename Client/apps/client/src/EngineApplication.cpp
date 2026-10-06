@@ -3167,6 +3167,11 @@ int RunGame(NativeWindow& window,
             [&](const MeshSceneEntity& mesh) { return mesh.id == id; });
         if (meshIt == editorMeshEntities.end() || !meshIt->hasParticleSystem)
             return;
+        if (meshIt->particleSystem.gpuSimulation)
+        {
+            particleRenderer.GpuEmitterPlay(id);
+            return;
+        }
         const auto simIt = entityParticles.find(id);
         if (simIt == entityParticles.end())
             entityParticles[id].Reset(meshIt->particleSystem, id);
@@ -3178,6 +3183,11 @@ int RunGame(NativeWindow& window,
             [&](const MeshSceneEntity& mesh) { return mesh.id == id; });
         if (meshIt == editorMeshEntities.end() || !meshIt->hasParticleSystem)
             return;
+        if (meshIt->particleSystem.gpuSimulation)
+        {
+            particleRenderer.GpuEmitterStop(id);
+            return;
+        }
         const auto simIt = entityParticles.find(id);
         if (simIt == entityParticles.end())
             entityParticles[id].Reset(meshIt->particleSystem, id, /*startEmitting=*/false);
@@ -3189,6 +3199,11 @@ int RunGame(NativeWindow& window,
             [&](const MeshSceneEntity& mesh) { return mesh.id == id; });
         if (meshIt == editorMeshEntities.end() || !meshIt->hasParticleSystem)
             return;
+        if (meshIt->particleSystem.gpuSimulation)
+        {
+            particleRenderer.GpuEmitterRestart(id);
+            return;
+        }
         entityParticles[id].Reset(meshIt->particleSystem, id);
     };
     scriptApi.particleEmit = [&](std::uint32_t id, std::uint32_t count) {
@@ -3196,6 +3211,11 @@ int RunGame(NativeWindow& window,
             [&](const MeshSceneEntity& mesh) { return mesh.id == id; });
         if (meshIt == editorMeshEntities.end() || !meshIt->hasParticleSystem)
             return;
+        if (meshIt->particleSystem.gpuSimulation)
+        {
+            particleRenderer.GpuEmitterEmit(id, count);
+            return;
+        }
         auto simIt = entityParticles.find(id);
         if (simIt == entityParticles.end())
         {
@@ -5078,6 +5098,7 @@ int RunGame(NativeWindow& window,
     bool debugShowPhysicsContacts = false;
     bool debugShowPhysicsBodyCenters = false;
     bool dumpFrameProfileRequested = false;
+    bool loggedParticleSoftDepth = false;
     Tracen("[VISIBILITY-RESPECT] shadow_pass=yes water_reflection_pass=yes main_pass=yes");
     // Starting the game simulation of the loaded scene, shared by the editor's Play button and the
     // standalone game: who drives the camera, the physics world (with the player character bodies),
@@ -5122,6 +5143,7 @@ int RunGame(NativeWindow& window,
         // Particles: drop the previous session's simulators. The per-frame update creates one per
         // emitting entity lazily (also for entities spawned mid-Play).
         entityParticles.clear();
+        particleRenderer.ResetGpuEmitters();
         for (const MeshSceneEntity& scriptMesh : editorMeshEntities)
         {
             if (!scriptMesh.hasScript || !scriptMesh.script.enabled)
@@ -5173,7 +5195,8 @@ int RunGame(NativeWindow& window,
     auto updateParticleSimulators = [&](float dt) {
         for (const MeshSceneEntity& mesh : editorMeshEntities)
         {
-            if (!mesh.hasParticleSystem || !mesh.particleSystem.enabled || !mesh.particleSystem.playOnStart)
+            if (!mesh.hasParticleSystem || !mesh.particleSystem.enabled || !mesh.particleSystem.playOnStart ||
+                mesh.particleSystem.gpuSimulation)
                 continue;
             if (entityParticles.find(mesh.id) == entityParticles.end())
                 entityParticles[mesh.id].Reset(mesh.particleSystem, mesh.id);
@@ -5183,7 +5206,7 @@ int RunGame(NativeWindow& window,
             auto meshIt = std::find_if(editorMeshEntities.begin(), editorMeshEntities.end(),
                 [&](const MeshSceneEntity& m) { return m.id == it->first; });
             if (meshIt == editorMeshEntities.end() || !meshIt->hasParticleSystem ||
-                !meshIt->particleSystem.enabled)
+                !meshIt->particleSystem.enabled || meshIt->particleSystem.gpuSimulation)
             {
                 it = entityParticles.erase(it);
                 continue;
@@ -5222,6 +5245,55 @@ int RunGame(NativeWindow& window,
                     groundQuery, groundQuery != nullptr ? &groundContext : nullptr);
             }
             ++it;
+        }
+    };
+    // GPU particle emitters: one compute dispatch per emitter per frame, outside any render pass
+    // (the compute writes the state buffer the transparent queue draws later). Runs in Play and in
+    // Edit alike, so GPU emitters preview while authoring.
+    auto simulateGpuParticleEmitters = [&](ixrhi::IXRHICommandList& cmd,
+                                            const ixrhi::IXRHIFrameInfo& frame, float dt) {
+        if (!particleRendererOk)
+            return;
+        for (const MeshSceneEntity& mesh : editorMeshEntities)
+        {
+            const ixparticle::ParticleSystemComponent& component = mesh.particleSystem;
+            if (!mesh.hasParticleSystem || !component.enabled || !component.gpuSimulation)
+                continue;
+            ParticleRenderer::GpuEmitterParams params;
+            params.emitterPosition[0] = mesh.position[0];
+            params.emitterPosition[1] = mesh.position[1];
+            params.emitterPosition[2] = mesh.position[2];
+            const xm::Quat rotation = xm::FromEulerRadians(
+                {mesh.rotation[0], mesh.rotation[1], mesh.rotation[2]});
+            const xm::Vec3 direction = xm::Rotate(rotation,
+                {component.direction[0], component.direction[1], component.direction[2]});
+            params.emitterDirection[0] = direction.x;
+            params.emitterDirection[1] = direction.y;
+            params.emitterDirection[2] = direction.z;
+            params.gravity = component.gravity;
+            params.drag = component.drag;
+            params.coneAngle = component.coneAngle;
+            params.rotationSpeed = component.rotationSpeed;
+            params.shapeRadius = component.shapeRadius;
+            params.shapeArc = component.shapeArc;
+            params.shape = static_cast<float>(static_cast<int>(component.shape));
+            params.shapeExtents[0] = component.shapeExtents[0];
+            params.shapeExtents[1] = component.shapeExtents[1];
+            params.shapeExtents[2] = component.shapeExtents[2];
+            params.lifetimeMin = component.startLifetimeMin;
+            params.lifetimeMax = component.startLifetimeMax;
+            params.speedMin = component.startSpeedMin;
+            params.speedMax = component.startSpeedMax;
+            params.sizeMin = component.startSizeMin;
+            params.sizeMax = component.startSizeMax;
+            std::memcpy(params.sizeOverLife, component.sizeOverLife, sizeof(params.sizeOverLife));
+            std::memcpy(params.colorOverLife, component.colorOverLife, sizeof(params.colorOverLife));
+            params.atlasColumns = component.atlasColumns;
+            params.atlasRows = component.atlasRows;
+            params.maxParticles = component.maxParticles;
+            params.emissionRate = component.emissionRate;
+            params.startPlaying = component.playOnStart;
+            particleRenderer.SimulateGpuEmitter(cmd, frame, mesh.id, params, dt);
         }
     };
     // The game's camera (the editor's Game view, the standalone game's screen): the scene's Main
@@ -7437,6 +7509,7 @@ int RunGame(NativeWindow& window,
                     rmlUi.CloseAllGameDocuments();         // the game's UI ends with the Play session
                     entityAudioSources.clear();  // dtors stop + uninit every ma_sound
                     entityParticles.clear();     // the simulators are Play-session state
+                    particleRenderer.ResetGpuEmitters();
                     editorWaterBodiesDirty = true;
                     if (editorPlay.playStartSceneWasOpen)
                     {
@@ -11269,13 +11342,41 @@ int RunGame(NativeWindow& window,
             // them under/above the surface and they blend back-to-front with the transparent meshes.
             auto collectParticleDraws = [&](std::vector<TransparentDraw>& draws, const WorldCamera& viewCamera,
                                             bool allowSoftParticles) {
-                if (!particleRendererOk || entityParticles.empty())
+                // GPU emitters have no CPU simulator, so the CPU map may be empty while they render.
+                if (!particleRendererOk)
                     return;
                 for (const MeshSceneEntity& particleMesh : editorMeshEntities)
                 {
                     if (!particleMesh.hasParticleSystem || !particleMesh.particleSystem.enabled)
                         continue;
                     const auto simIt = entityParticles.find(particleMesh.id);
+                    if (particleMesh.particleSystem.gpuSimulation)
+                    {
+                        // GPU emitter: its state buffer is drawn directly (the compute ran in the
+                        // render pre-pass). The fixed instance count comes from maxParticles.
+                        TransparentDraw& draw = draws.emplace_back();
+                        const float gdx = particleMesh.position[0] - viewCamera.eye.x;
+                        const float gdy = particleMesh.position[1] - viewCamera.eye.y;
+                        const float gdz = particleMesh.position[2] - viewCamera.eye.z;
+                        draw.distanceSq = gdx * gdx + gdy * gdy + gdz * gdz;
+                        const SpatialIndex::Aabb gbounds = {
+                            {particleMesh.position[0] - 0.5f, particleMesh.position[1] - 0.5f,
+                             particleMesh.position[2] - 0.5f},
+                            {particleMesh.position[0] + 0.5f, particleMesh.position[1] + 0.5f,
+                             particleMesh.position[2] + 0.5f}};
+                        draw.underWater = terrainOk && terrain.BoxUnderWater(gbounds.min, gbounds.max);
+                        draw.particleRenderer = &particleRenderer;
+                        ParticleRenderer::Batch& gpuBatch = draw.particleBatch;
+                        gpuBatch.gpu = true;
+                        gpuBatch.gpuEntityId = particleMesh.id;
+                        gpuBatch.additive =
+                            particleMesh.particleSystem.blendMode == ixparticle::ParticleBlendMode::Additive;
+                        gpuBatch.textureAssetId = particleMesh.particleSystem.textureAssetId;
+                        gpuBatch.softParticles =
+                            allowSoftParticles && particleMesh.particleSystem.softParticles;
+                        gpuBatch.softDistance = particleMesh.particleSystem.softDistance;
+                        continue;
+                    }
                     if (simIt == entityParticles.end() || simIt->second.Particles().empty())
                         continue;
 
@@ -11353,7 +11454,8 @@ int RunGame(NativeWindow& window,
                 }
             };
             bool sceneWaterPass = false;  // the Scene View's water gets its own pass (after a snapshot)
-            bool sceneSnapshotPass = false;  // the Scene View closes/snapshots/reopens (water and/or soft particles)
+            bool sceneSnapshotPass = false;  // the Scene View closes/snapshots/reopens (water)
+            bool sceneParticleSoft = false;  // a visible emitter wants the soft-particle depth fade
             // The sun shadow map is rendered once and sampled by every view; its cascades are fitted
             // to the Scene View camera, or to the Game view's while only the Game view is drawn (Play).
             const WorldCamera* shadowCamera = &frameCamera;
@@ -11373,6 +11475,10 @@ int RunGame(NativeWindow& window,
             // is visible without entering Play. Play steps them in the simulation block instead.
             if (editorPlay.state.mode == EditorPlayMode::Edit)
                 updateParticleSimulators(static_cast<float>(deltaSeconds));
+            // GPU particle emitters simulate once per frame outside any render pass, in Play and in
+            // Edit alike (the compute writes the buffer the transparent queue draws later).
+            simulateGpuParticleEmitters(*frameInfo.commandList, frameInfo,
+                static_cast<float>(deltaSeconds));
 
             // The sky's parameters for this frame, before any pass draws it (outside render passes:
             // a changed sky image is loaded here). Its sun follows the scene's Sun light.
@@ -12176,14 +12282,16 @@ int RunGame(NativeWindow& window,
                     skyRenderer.Render(*frameInfo.commandList, frameInfo, camera, renderSize.width, renderSize.height);
                 // The water is drawn in a pass of its own (over a snapshot of this one) when it is in view.
                 sceneWaterPass = useOffscreenScene && hasSceneTerrain && terrain.AnyWaterBodyInView(camera);
-                // Soft particles read the scene depth snapshot: when particles are visible the main
-                // pass is closed, snapshotted (depth only unless water needs the color too) and
-                // reopened, so they draw with the current frame's depth instead of a stale one.
+                // Soft particles read the scene depth snapshot. Closing/reopening the main pass for
+                // them cost ~1 ms a frame, so the pass is only split for the water; the depth for the
+                // soft fade is copied at the END of the frame and used (one frame stale) next frame.
                 collectParticleDraws(sceneTransparentDraws, camera, /*allowSoftParticles=*/true);
-                const bool sceneHasParticles = std::any_of(sceneTransparentDraws.begin(),
+                sceneParticleSoft = useOffscreenScene && std::any_of(sceneTransparentDraws.begin(),
                     sceneTransparentDraws.end(),
-                    [](const TransparentDraw& draw) { return draw.particleRenderer != nullptr; });
-                sceneSnapshotPass = useOffscreenScene && (sceneWaterPass || sceneHasParticles);
+                    [](const TransparentDraw& draw) {
+                        return draw.particleRenderer != nullptr && draw.particleBatch.softParticles;
+                    });
+                sceneSnapshotPass = useOffscreenScene && sceneWaterPass;
                 // Transparent draws over the sky: those under water now; the rest after the water (its
                 // pass, or right below in direct mode), or now when no water follows.
                 sortTransparentDraws(sceneTransparentDraws);
@@ -12401,25 +12509,23 @@ int RunGame(NativeWindow& window,
             if (useOffscreenScene)
             {
                 offscreenScene.EndMainPass(*frameInfo.commandList);
-                // The water (refraction, depth fade) and/or the soft particles need a copy of the
-                // finished scene and a pass of their own. (Decided where the main pass ended.)
+                bool sceneDepthSnapshotted = false;
+                // The water needs a copy of the finished scene (refraction, depth fade) and a pass of
+                // its own. (Decided where the main pass ended.)
                 if (sceneSnapshotPass)
                 {
-                    if (sceneWaterPass)
-                        offscreenScene.SnapshotScene(*frameInfo.commandList, frameInfo);
-                    else
-                        offscreenScene.SnapshotDepth(*frameInfo.commandList, frameInfo);
-                    if (sceneWaterPass)
-                        terrain.SetWaterRefractionInputs(offscreenScene.GetColorSnapshotTexture(),
-                            offscreenScene.GetDepthSnapshotTexture(),
-                            offscreenScene.GetSampler(),
-                            offscreenScene.Width(),
-                            offscreenScene.Height());
+                    offscreenScene.SnapshotScene(*frameInfo.commandList, frameInfo);
+                    sceneDepthSnapshotted = true;
+                    terrain.SetWaterRefractionInputs(offscreenScene.GetColorSnapshotTexture(),
+                        offscreenScene.GetDepthSnapshotTexture(),
+                        offscreenScene.GetSampler(),
+                        offscreenScene.Width(),
+                        offscreenScene.Height());
+                    // The above-water particles fade against THIS frame's depth (copied just above).
                     particleRenderer.SetSceneDepth(offscreenScene.GetDepthSnapshotTexture(),
                         offscreenScene.GetSampler(), camera.nearPlane, camera.farPlane);
                     offscreenScene.BeginMainPass(*frameInfo.commandList, frameInfo, false);
-                    if (sceneWaterPass)
-                        terrain.RenderWater(*frameInfo.commandList, frameInfo, camera, seconds, renderSize.width, renderSize.height);
+                    terrain.RenderWater(*frameInfo.commandList, frameInfo, camera, seconds, renderSize.width, renderSize.height);
                     // The transparent draws above the water (and the soft particles), over it.
                     drawTransparents(sceneTransparentDraws, /*underWater=*/false, camera, renderSize.width, renderSize.height);
                     offscreenScene.EndMainPass(*frameInfo.commandList);
@@ -12431,7 +12537,10 @@ int RunGame(NativeWindow& window,
                     const GodRayRenderer::SunShadow sunShadow{terrain.SunShadowTexture(frameInfo.frameNumber),
                         terrain.SunShadowCascadeViewProj(), TerrainRenderer::kSunShadowDepthBias};
                     if (!sceneSnapshotPass && godRays.IsVisible(sceneSky, frameSunLighting, camera, sunShadow))
+                    {
                         offscreenScene.SnapshotScene(*frameInfo.commandList, frameInfo);
+                        sceneDepthSnapshotted = true;
+                    }
                     if (godRays.RenderRays(*frameInfo.commandList, frameInfo, /*view=*/0, sceneSky, frameSunLighting,
                             camera, offscreenScene.GetDepthSnapshotTexture(), sunShadow, renderSize.width, renderSize.height))
                     {
@@ -12439,6 +12548,23 @@ int RunGame(NativeWindow& window,
                         godRays.Composite(*frameInfo.commandList, frameInfo, /*view=*/0, renderSize.width, renderSize.height);
                         offscreenScene.EndMainPass(*frameInfo.commandList);
                     }
+                }
+                // Soft particles without water: copy the depth at the end of the frame, at most every
+                // 4th frame (a full-resolution depth copy is ~1 ms at 4K; the fade being a few frames
+                // stale is invisible). A snapshot already taken this frame (water / god rays) is reused.
+                if (sceneParticleSoft && !sceneDepthSnapshotted && (frameInfo.frameNumber % 4u) == 0u)
+                {
+                    offscreenScene.SnapshotDepth(*frameInfo.commandList, frameInfo);
+                    sceneDepthSnapshotted = true;
+                }
+                if (sceneParticleSoft && sceneDepthSnapshotted)
+                    particleRenderer.SetSceneDepth(offscreenScene.GetDepthSnapshotTexture(),
+                        offscreenScene.GetSampler(), camera.nearPlane, camera.farPlane);
+                if (sceneParticleSoft && !loggedParticleSoftDepth)
+                {
+                    loggedParticleSoftDepth = true;
+                    Tracenf("[PARTICLE] soft particles active: depth snapshot %ux%u (every 4th frame)",
+                        offscreenScene.Width(), offscreenScene.Height());
                 }
 #if defined(IXTREEME_WITH_EDITOR)
                 // The Scene View panel shows the tone-mapped image, with the editor outlines over it.

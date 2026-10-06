@@ -376,6 +376,7 @@ ixparticle::ParticleSystemComponent ReadParticleSystem(const std::string& object
     p.enabled = ixtreeme::common::JsonBoolValue(component, "enabled", p.enabled);
     p.playOnStart = ixtreeme::common::JsonBoolValue(component, "play_on_start", p.playOnStart);
     p.loop = ixtreeme::common::JsonBoolValue(component, "loop", p.loop);
+    p.gpuSimulation = ixtreeme::common::JsonBoolValue(component, "gpu_simulation", p.gpuSimulation);
     p.blendMode = ixparticle::ParseBlendMode(ixtreeme::common::JsonStringValue(component, "blend_mode"));
     p.duration = ixtreeme::common::JsonFloatValue(component, "duration", p.duration);
     p.emissionRate = ixtreeme::common::JsonFloatValue(component, "emission_rate", p.emissionRate);
@@ -666,6 +667,7 @@ void WriteParticleSystem(std::ostream& out, const ixparticle::ParticleSystemComp
     out << indent << "  \"enabled\": " << (p.enabled ? "true" : "false") << ",\n";
     out << indent << "  \"play_on_start\": " << (p.playOnStart ? "true" : "false") << ",\n";
     out << indent << "  \"loop\": " << (p.loop ? "true" : "false") << ",\n";
+    out << indent << "  \"gpu_simulation\": " << (p.gpuSimulation ? "true" : "false") << ",\n";
     out << indent << "  \"blend_mode\": \"" << ixparticle::BlendModeName(p.blendMode) << "\",\n";
     out << indent << "  \"duration\": " << p.duration << ",\n";
     out << indent << "  \"emission_rate\": " << p.emissionRate << ",\n";
