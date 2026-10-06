@@ -64,9 +64,13 @@ public:
                   std::uint32_t height,
                   ixrhi::IXRHIFormat displayFormat,
                   ixrhi::IXRHIFormat depthFormat);
+    // storeDepth=false uses a depth attachment whose contents are discarded at pass end (DontCare):
+    // consumers that need the depth snapshot (water refraction, god rays, soft particles) must ask
+    // for a storing pass, otherwise SnapshotScene/SnapshotDepth degrade to a no-op.
     void BeginMainPass(ixrhi::IXRHICommandList& cmd,
                        const ixrhi::IXRHIFrameInfo& frame,
-                       bool clear = true);
+                       bool clear = true,
+                       bool storeDepth = true);
     void EndMainPass(ixrhi::IXRHICommandList& cmd);
     void SnapshotScene(ixrhi::IXRHICommandList& cmd, const ixrhi::IXRHIFrameInfo& frame);
     // Depth-only variant for consumers that need just the scene depth (soft particles): skips the
@@ -130,8 +134,12 @@ private:
 
     std::unique_ptr<ixrhi::IXRHIRenderTarget> m_clearTarget;
     std::unique_ptr<ixrhi::IXRHIRenderTarget> m_loadTarget;
+    std::unique_ptr<ixrhi::IXRHIRenderTarget> m_clearTargetNoDepthStore;
+    std::unique_ptr<ixrhi::IXRHIRenderTarget> m_loadTargetNoDepthStore;
     std::unique_ptr<ixrhi::IXRHIRenderTarget> m_displayTarget;
     const ixrhi::IXRHIRenderTarget* m_activeTarget = nullptr; // borrowed, begun pass
+    bool m_activeTargetStoresDepth = true;
+    bool m_depthStoreValid = false;  // the depth image holds this frame's scene depth
 
     std::shared_ptr<ixrhi::IXRHIShader> m_compositeVs;
     std::shared_ptr<ixrhi::IXRHIShader> m_compositePs;

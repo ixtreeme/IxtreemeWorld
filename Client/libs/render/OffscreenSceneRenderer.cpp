@@ -95,14 +95,19 @@ bool OffscreenSceneRenderer::Recreate(ixrhi::IXRHIDevice& rhi,
 
 void OffscreenSceneRenderer::BeginMainPass(ixrhi::IXRHICommandList& cmd,
                                            const ixrhi::IXRHIFrameInfo& frame,
-                                           bool clear)
+                                           bool clear,
+                                           bool storeDepth)
 {
     if (!m_ready || !frame.frameActive || m_passActive)
         return;
 
-    m_activeTarget = clear ? m_clearTarget.get() : m_loadTarget.get();
+    if (clear)
+        m_activeTarget = storeDepth ? m_clearTarget.get() : m_clearTargetNoDepthStore.get();
+    else
+        m_activeTarget = storeDepth ? m_loadTarget.get() : m_loadTargetNoDepthStore.get();
     if (!m_activeTarget)
         return;
+    m_activeTargetStoresDepth = storeDepth;
     m_activeTarget->Begin(cmd);
     m_passActive = true;
 }
@@ -114,6 +119,8 @@ void OffscreenSceneRenderer::EndMainPass(ixrhi::IXRHICommandList& cmd)
     m_activeTarget->End(cmd);
     m_activeTarget = nullptr;
     m_passActive = false;
+    // DontCare depth is undefined after the pass: snapshot copies must not read it.
+    m_depthStoreValid = m_activeTargetStoresDepth;
     // The layouts the pass leaves them in (its final layouts): color shader-readable for the editor
     // panel and the composite, depth still an attachment.
     m_colorState = ixrhi::IXRHIImageLayout::ShaderReadOnly;
@@ -135,6 +142,14 @@ void OffscreenSceneRenderer::SnapshotScene(ixrhi::IXRHICommandList& cmd,
     m_colorState = L::ShaderReadOnly;
     m_colorSnapshotState = L::ShaderReadOnly;
 
+    // A DontCare depth pass leaves the depth image undefined: skip the copy and let the consumers
+    // keep the previous frame's snapshot instead of sampling garbage.
+    if (!m_depthStoreValid)
+    {
+        m_snapshotsReady = true;
+        return;
+    }
+
     cmd.TransitionTexture(*m_depth, m_depthState, L::TransferSrc);
     cmd.TransitionTexture(*m_depthSnapshot, m_depthSnapshotState, L::TransferDst);
     cmd.CopyTexture(*m_depth, *m_depthSnapshot);
@@ -151,6 +166,8 @@ void OffscreenSceneRenderer::SnapshotDepth(ixrhi::IXRHICommandList& cmd,
 {
     if (!m_ready || !frame.frameActive || m_passActive || !m_depthSnapshot)
         return;
+    if (!m_depthStoreValid)
+        return;  // the pass discarded the depth (DontCare); nothing valid to copy
 
     using L = ixrhi::IXRHIImageLayout;
     cmd.TransitionTexture(*m_depth, m_depthState, L::TransferSrc);
@@ -234,8 +251,12 @@ void OffscreenSceneRenderer::Destroy()
     m_compositePs.reset();
     m_clearTarget.reset();
     m_loadTarget.reset();
+    m_clearTargetNoDepthStore.reset();
+    m_loadTargetNoDepthStore.reset();
     m_displayTarget.reset();
     m_activeTarget = nullptr;
+    m_activeTargetStoresDepth = true;
+    m_depthStoreValid = false;
     m_sampler.reset();
     m_color.reset();
     m_depth.reset();
@@ -337,6 +358,18 @@ bool OffscreenSceneRenderer::CreateTargets(ixrhi::IXRHIDevice& rhi)
     loadDesc.debugName = m_tag + ".LoadTarget";
     m_loadTarget = rhi.CreateRenderTarget(loadDesc);
 
+    // DontCare-depth variants: the depth is written for depth testing but its contents are dropped
+    // at pass end, saving a full-resolution depth store on frames nothing reads the snapshot.
+    ixrhi::IXRHIRenderTargetDesc noStoreClearDesc = clearDesc;
+    noStoreClearDesc.depthStore = ixrhi::IXRHIStoreOp::DontCare;
+    noStoreClearDesc.debugName = m_tag + ".ClearTargetNoDepthStore";
+    m_clearTargetNoDepthStore = rhi.CreateRenderTarget(noStoreClearDesc);
+
+    ixrhi::IXRHIRenderTargetDesc noStoreLoadDesc = loadDesc;
+    noStoreLoadDesc.depthStore = ixrhi::IXRHIStoreOp::DontCare;
+    noStoreLoadDesc.debugName = m_tag + ".LoadTargetNoDepthStore";
+    m_loadTargetNoDepthStore = rhi.CreateRenderTarget(noStoreLoadDesc);
+
     // The tone-mapped image (no depth: its overlays draw over everything). Cleared to black: only
     // EnsureDisplayReadable keeps that, the tone map covers every pixel.
     ixrhi::IXRHIRenderTargetDesc displayDesc;
@@ -350,7 +383,9 @@ bool OffscreenSceneRenderer::CreateTargets(ixrhi::IXRHIDevice& rhi)
     displayDesc.debugName = m_tag + ".DisplayTarget";
     m_displayTarget = rhi.CreateRenderTarget(displayDesc);
 
-    return m_clearTarget != nullptr && m_loadTarget != nullptr && m_displayTarget != nullptr;
+    return m_clearTarget != nullptr && m_loadTarget != nullptr &&
+        m_clearTargetNoDepthStore != nullptr && m_loadTargetNoDepthStore != nullptr &&
+        m_displayTarget != nullptr;
 }
 
 bool OffscreenSceneRenderer::CreateComposite(ixrhi::IXRHIDevice& rhi)

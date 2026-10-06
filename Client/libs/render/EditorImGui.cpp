@@ -821,6 +821,12 @@ std::uint64_t EditorImGui::WaterMaterialsRevision() const
     return revision * 1000003ull + m_waterMaterialsTick;
 }
 
+std::uint64_t EditorImGui::AssetLibraryRevision() const
+{
+    const std::uint64_t revision = m_assetLibrary ? m_assetLibrary->Revision() : 0;
+    return (m_assetLibraryGeneration << 40) ^ revision;
+}
+
 void EditorImGui::SetEngineRoot(const std::filesystem::path& clientRoot)
 {
     m_engineRoot = clientRoot;
@@ -837,6 +843,7 @@ void EditorImGui::InitializeAssetLibrary(const std::filesystem::path& clientRoot
     InvalidateAssetBrowserCache();
     m_assetLibrary = std::make_unique<AssetLibrary>(clientRoot);
     ++m_waterMaterialsTick;  // another library: see WaterMaterialsRevision
+    ++m_assetLibraryGeneration;
     if (!m_assetLibrary->Initialize())
     {
         m_assetLibrary.reset();
@@ -860,6 +867,7 @@ void EditorImGui::InitializeProjectAssetLibrary(const std::filesystem::path& pro
     InvalidateAssetBrowserCache();
     m_assetLibrary = std::make_unique<AssetLibrary>(projectRoot, assetRoot);
     ++m_waterMaterialsTick;  // another library: see WaterMaterialsRevision
+    ++m_assetLibraryGeneration;
     if (!m_assetLibrary->Initialize())
     {
         m_assetLibrary.reset();
@@ -1398,17 +1406,27 @@ void EditorImGui::SelectAssetBrowserFolder(const std::string& subpath)
 
 void EditorImGui::ValidateAssetBrowserCache() const
 {
+    // Checked (and rebuilt) at most once a frame, at the frame's first query: the lists the panels
+    // iterate by reference stay valid through the frame even when something in the loop refreshes
+    // the library (a drop on a folder tile, "Create Here"); the change shows from the next frame.
+    const int frame = ImGui::GetFrameCount();
+    AssetBrowserCache& cache = m_assetBrowserCache;
+    if (cache.validatedFrame == frame)
+        return;
     constexpr double kAssetBrowserCacheSeconds = 10.0;
     const double now = ImGui::GetTime();
     const std::uint64_t revision = m_assetLibrary ? m_assetLibrary->Revision() : 0;
-    AssetBrowserCache& cache = m_assetBrowserCache;
     if (cache.builtAt >= 0.0 && now >= cache.builtAt && now - cache.builtAt < kAssetBrowserCacheSeconds &&
         cache.library == m_assetLibrary.get() && cache.revision == revision)
+    {
+        cache.validatedFrame = frame;
         return;
+    }
     cache = {};
     cache.library = m_assetLibrary.get();
     cache.revision = revision;
     cache.builtAt = now;
+    cache.validatedFrame = frame;
 }
 
 std::string EditorImGui::CachedComparablePath(const std::filesystem::path& path) const
@@ -1420,7 +1438,7 @@ std::string EditorImGui::CachedComparablePath(const std::filesystem::path& path)
     return cached->second;
 }
 
-std::vector<std::string> EditorImGui::QueryFilesystemChildFolders(const std::string& subpath) const
+const std::vector<std::string>& EditorImGui::QueryFilesystemChildFolders(const std::string& subpath) const
 {
     ValidateAssetBrowserCache();
     if (const auto cached = m_assetBrowserCache.childFolders.find(subpath); cached != m_assetBrowserCache.childFolders.end())
@@ -1460,10 +1478,13 @@ std::vector<std::string> EditorImGui::QueryFilesystemChildFolders(const std::str
     return folders;
 }
 
-std::vector<AssetLibrary::Entry> EditorImGui::QueryFilesystemAssetsInFolder(const std::string& subpath) const
+const std::vector<AssetLibrary::Entry>& EditorImGui::QueryFilesystemAssetsInFolder(const std::string& subpath) const
 {
     if (!m_assetLibrary)
-        return {};
+    {
+        static const std::vector<AssetLibrary::Entry> kEmpty;
+        return kEmpty;
+    }
     ValidateAssetBrowserCache();
     if (const auto cached = m_assetBrowserCache.folderAssets.find(subpath); cached != m_assetBrowserCache.folderAssets.end())
         return cached->second;
@@ -2158,12 +2179,38 @@ bool EditorImGui::ProjectHasNativeScriptSources() const
     if (!m_assetLibrary)
         return false;
     const std::filesystem::path scriptsDir = ProjectScriptSourceDir();
-    for (const AssetLibrary::Entry& e : m_assetLibrary->EntriesFor(AssetLibrary::Category::Script))
+    for (const AssetLibrary::Entry& e : CachedScriptAssets(".cpp"))
     {
         if (IsNativeScriptSource(scriptsDir, m_assetLibrary->AbsolutePath(e)))
             return true;
     }
     return false;
+}
+
+const std::vector<AssetLibrary::Entry>& EditorImGui::CachedScriptAssets(const char* extension) const
+{
+    static const std::vector<AssetLibrary::Entry> kEmpty;
+    if (!m_assetLibrary || extension == nullptr)
+        return kEmpty;
+    CachedScriptList& cache = m_scriptAssetCache[extension];
+    const std::uint64_t revision = m_assetLibrary->Revision();
+    if (cache.valid && cache.library == m_assetLibrary.get() && cache.revision == revision)
+        return cache.entries;
+
+    cache.entries = m_assetLibrary->EntriesFor(AssetLibrary::Category::Script);
+    const std::string wanted = extension;
+    cache.entries.erase(std::remove_if(cache.entries.begin(), cache.entries.end(),
+        [&wanted](const AssetLibrary::Entry& entry) {
+            std::string ext = std::filesystem::path(entry.filename).extension().string();
+            std::transform(ext.begin(), ext.end(), ext.begin(),
+                [](unsigned char c) { return static_cast<char>(std::tolower(c)); });
+            return ext != wanted;
+        }),
+        cache.entries.end());
+    cache.library = m_assetLibrary.get();
+    cache.revision = revision;
+    cache.valid = true;
+    return cache.entries;
 }
 
 void EditorImGui::CreateNativeScriptAsset()
@@ -3061,6 +3108,11 @@ std::vector<std::pair<std::string, WaterMaterialData>> EditorImGui::GetWaterMate
 }
 
 std::uint64_t EditorImGui::WaterMaterialsRevision() const
+{
+    return 0;
+}
+
+std::uint64_t EditorImGui::AssetLibraryRevision() const
 {
     return 0;
 }

@@ -1114,17 +1114,8 @@ bool EditorImGui::RenderSelectedMeshPhysicsComponents()
             else if (m_assetLibrary)  // AngelScript / Lua: pick a script asset from the project library
             {
                 const bool isLua = sc.backend == ixscript::ScriptBackendType::Lua;
-                const char* wantedExt = isLua ? ".lua" : ".as";
-                std::vector<AssetLibrary::Entry> scripts =
-                    m_assetLibrary->EntriesFor(AssetLibrary::Category::Script);
-                scripts.erase(std::remove_if(scripts.begin(), scripts.end(),
-                    [wantedExt](const AssetLibrary::Entry& entry) {
-                        std::string ext = std::filesystem::path(entry.filename).extension().string();
-                        std::transform(ext.begin(), ext.end(), ext.begin(),
-                            [](unsigned char c) { return static_cast<char>(std::tolower(c)); });
-                        return ext != wantedExt;
-                    }),
-                    scripts.end());
+                // Cached per asset-library revision (EntriesFor copies the whole Script category).
+                const std::vector<AssetLibrary::Entry>& scripts = CachedScriptAssets(isLua ? ".lua" : ".as");
                 std::string preview = sc.scriptAssetId.empty() ? "(no script)" : sc.scriptAssetId;
                 for (const AssetLibrary::Entry& e : scripts)
                     if (e.id == sc.scriptAssetId) { preview = e.displayName; break; }

@@ -981,6 +981,7 @@ struct RmlUiLayer::Impl
     bool settingsVisible = false;
     bool inventoryVisible = false;
     bool characterCreationVisible = false;
+    bool updatedWithVisibleDocument = false;  // the last Update() ran while a document was shown
     bool initialized = false;
     uint32_t viewportWidth = 0;
     uint32_t viewportHeight = 0;
@@ -1581,7 +1582,17 @@ bool RmlUiLayer::Create(ixrhi::IXRHIDevice& rhi, client::asset::IAssetReader& as
 void RmlUiLayer::Update()
 {
     if (m_impl && m_impl->context)
+    {
         m_impl->context->Update();
+        m_impl->updatedWithVisibleDocument = HasAnyVisibleDocument();
+    }
+}
+
+bool RmlUiLayer::NeedsUpdate() const
+{
+    // RmlUi applies a hide (the display property) and unloads a closed document in Context::Update:
+    // after the last shown document goes, one more Update takes it off the screen.
+    return HasAnyVisibleDocument() || (m_impl && m_impl->updatedWithVisibleDocument);
 }
 
 void RmlUiLayer::Render(ixrhi::IXRHICommandList& cmd, const ixrhi::IXRHIFrameInfo& frame)
@@ -2307,6 +2318,26 @@ bool RmlUiLayer::HasVisibleGameDocuments() const
     return std::any_of(m_impl->gameDocuments.begin(), m_impl->gameDocuments.end(), [](const auto& entry) {
         return entry.second.document && entry.second.visible;
     });
+}
+
+bool RmlUiLayer::HasAnyVisibleDocument() const
+{
+    if (!m_impl)
+        return false;
+    const auto visible = [](bool flag, const Rml::ElementDocument* document) {
+        return flag && document != nullptr;
+    };
+    if (visible(m_impl->loginVisible, m_impl->loginDocument) ||
+        visible(m_impl->lobbyVisible, m_impl->lobbyDocument) ||
+        visible(m_impl->hudVisible, m_impl->hudDocument) ||
+        visible(m_impl->menuVisible, m_impl->menuDocument) ||
+        visible(m_impl->settingsVisible, m_impl->settingsDocument) ||
+        visible(m_impl->inventoryVisible, m_impl->inventoryDocument) ||
+        visible(m_impl->characterCreationVisible, m_impl->characterCreationDocument))
+    {
+        return true;
+    }
+    return HasVisibleGameDocuments();
 }
 
 bool RmlUiLayer::IsPointerOverGameUi() const

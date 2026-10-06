@@ -67,6 +67,16 @@ int CreateAdapterVkSurface(ImGuiViewport* viewport,
 // Editor colors (the style and every color written in the panels) are sRGB values. An sRGB
 // render target treats what the shader writes as linear and encodes it, which would show each of
 // them lighter than written: decode the vertex colors to linear first. Alpha is coverage and stays.
+//
+// The UI uses a small set of RGB values (style colours, text), so a direct-mapped memo cache turns
+// the per-vertex work into one lookup after the first frame instead of three table reads + shifts.
+namespace
+{
+constexpr std::size_t kColorDecodeCacheSize = 1024;
+std::array<std::uint32_t, kColorDecodeCacheSize> g_colorDecodeKeys{};    // source RGB (0 = empty)
+std::array<std::uint32_t, kColorDecodeCacheSize> g_colorDecodeValues{};  // decoded RGB
+} // namespace
+
 void DecodeDrawDataColorsToLinear(ImDrawData* drawData)
 {
     static const std::array<std::uint8_t, 256> kSrgbToLinear = [] {
@@ -87,11 +97,19 @@ void DecodeDrawDataColorsToLinear(ImDrawData* drawData)
         for (ImDrawVert& vertex : vertices)
         {
             const ImU32 color = vertex.col;
-            const ImU32 r = kSrgbToLinear[(color >> IM_COL32_R_SHIFT) & 0xFFu];
-            const ImU32 g = kSrgbToLinear[(color >> IM_COL32_G_SHIFT) & 0xFFu];
-            const ImU32 b = kSrgbToLinear[(color >> IM_COL32_B_SHIFT) & 0xFFu];
-            vertex.col = (color & IM_COL32_A_MASK) | (r << IM_COL32_R_SHIFT) | (g << IM_COL32_G_SHIFT) |
-                (b << IM_COL32_B_SHIFT);
+            const ImU32 rgb = color & 0x00FFFFFFu;
+            const std::size_t index = ((rgb * 2654435761u) >> 22) & (kColorDecodeCacheSize - 1u);
+            ImU32 decoded = g_colorDecodeValues[index];
+            if (g_colorDecodeKeys[index] != rgb)
+            {
+                const ImU32 r = kSrgbToLinear[(rgb >> IM_COL32_R_SHIFT) & 0xFFu];
+                const ImU32 g = kSrgbToLinear[(rgb >> IM_COL32_G_SHIFT) & 0xFFu];
+                const ImU32 b = kSrgbToLinear[(rgb >> IM_COL32_B_SHIFT) & 0xFFu];
+                decoded = (r << IM_COL32_R_SHIFT) | (g << IM_COL32_G_SHIFT) | (b << IM_COL32_B_SHIFT);
+                g_colorDecodeKeys[index] = rgb;
+                g_colorDecodeValues[index] = decoded;
+            }
+            vertex.col = decoded | (color & IM_COL32_A_MASK);
         }
     }
 }

@@ -100,7 +100,10 @@ public:
         int atlasRows = 1;
         int maxParticles = 256;
         float emissionRate = 25.0f;
+        int burstCount = 0;        // spawned when emission starts (as the CPU path's Reset)
         bool startPlaying = true;  // the emitter's initial state (scripts can change it later)
+        // The emitter's local X, Y, Z axes in world space (rows): the spawn shape is oriented by them.
+        float emitterAxes[9] = {1.0f, 0.0f, 0.0f, 0.0f, 1.0f, 0.0f, 0.0f, 0.0f, 1.0f};
     };
 
     ParticleRenderer() = default;
@@ -149,7 +152,9 @@ public:
 
 private:
     static constexpr std::uint32_t kFramesInFlight = 2;
-    static constexpr std::uint32_t kDrawSlots = 32;
+    // Descriptor sets / view uniforms per frame: one per emitter draw (both views). Past the last one
+    // a draw is dropped: a set already bound in the frame's commands must not be rewritten.
+    static constexpr std::uint32_t kDrawSlots = 128;
     static constexpr std::uint32_t kMaxInstances = 16384;
 
     struct ViewUniform
@@ -173,7 +178,7 @@ private:
         float emitterPos[4];     // xyz = position, w = dt
         float emitterDir[4];     // xyz = normalized direction
         float params0[4];        // gravity, drag, cone angle (rad), rotation speed (rad)
-        float params1[4];        // shape radius, shape arc (rad), shape ordinal, unused
+        float params1[4];        // shape radius, shape arc (rad), shape ordinal, clear (1: all others die)
         float shapeExtents[4];
         float spawn[4];          // spawn budget, spawn cursor, frame seed, max particles
         float sizeOverLife[4];
@@ -183,14 +188,19 @@ private:
         float color3[4];
         float life[4];           // lifetime min/max, size min/max
         float speed[4];          // speed min/max, atlas columns, atlas rows
+        float axisX[4];          // the emitter's local axes in world space (spawn shape orientation)
+        float axisY[4];
+        float axisZ[4];
     };
-    static_assert(sizeof(GpuSimUniform) == 208, "SimParams layout must stay 13 float4s");
+    static_assert(sizeof(GpuSimUniform) == 256, "SimParams layout must stay 16 float4s");
     static constexpr std::uint64_t kGpuStateBytes = 96;  // ParticlesSim.hlsl ParticleState
 
     struct GpuEmitter
     {
         std::shared_ptr<ixrhi::IXRHIBuffer> state;     // Storage|Vertex: the compute's ParticleState
-        std::shared_ptr<ixrhi::IXRHIBuffer> uniform;   // GpuSimUniform
+        // GpuSimUniform, one per frame in flight (and a compute set each): the CPU writes this
+        // frame's while the previous frame's dispatch may still be reading its own.
+        std::array<std::shared_ptr<ixrhi::IXRHIBuffer>, kFramesInFlight> uniforms;
         std::unique_ptr<ixrhi::IXRHIBindGroup> computeBindGroup;
         std::uint32_t maxParticles = 0;
         float spawnAccumulator = 0.0f;
@@ -198,7 +208,12 @@ private:
         std::uint32_t frameSeed = 1;
         int pendingBurst = 0;
         bool playing = true;
-        bool initialized = false;
+        // Whether its initial play state is decided (by the component's playOnStart on its first
+        // simulation, or by a script's Play/Stop before that); cleared when Play starts.
+        bool started = false;
+        bool startBurstPending = false;  // the component's burstCount, on the next simulation
+        bool clearPending = false;       // the next dispatch kills every particle it does not spawn
+        bool initialized = false;  // dispatched at least once: the state buffer has been drawn from
         std::uint64_t lastSeenFrame = 0;  // stale emitters are pruned (frames in flight grace)
     };
 

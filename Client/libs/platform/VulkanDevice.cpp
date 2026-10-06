@@ -290,8 +290,35 @@ bool VulkanDevice::CreateInstance(NativeWindow& window)
 {
 #ifdef _DEBUG
     m_validationEnabled = ValidationLayerAvailable();
+    // IX_VALIDATION=0 disables the layers in Debug builds for performance measurements
+    // (validation costs several ms/frame); any other value forces them on when available.
+    bool validationOverrideSet = false;
+    bool validationOverrideEnabled = false;
+#ifdef _WIN32
+    char* validationEnv = nullptr;
+    std::size_t validationEnvSize = 0;
+    if (_dupenv_s(&validationEnv, &validationEnvSize, "IX_VALIDATION") == 0 && validationEnv)
+    {
+        validationOverrideSet = true;
+        validationOverrideEnabled = validationEnv[0] != '0';
+        std::free(validationEnv);
+    }
+#else
+    if (const char* validationEnv = std::getenv("IX_VALIDATION"))
+    {
+        validationOverrideSet = true;
+        validationOverrideEnabled = validationEnv[0] != '0';
+    }
+#endif
+    if (validationOverrideSet)
+        m_validationEnabled = m_validationEnabled && validationOverrideEnabled;
     if (!m_validationEnabled)
-        Log("VK_LAYER_KHRONOS_validation unavailable; continuing without validation.");
+    {
+        if (validationOverrideSet)
+            Log("Vulkan validation disabled via IX_VALIDATION.");
+        else
+            Log("VK_LAYER_KHRONOS_validation unavailable; continuing without validation.");
+    }
 #endif
 
     const char* surfaceExtension = window.DescribeNative().vulkanSurfaceExtension;

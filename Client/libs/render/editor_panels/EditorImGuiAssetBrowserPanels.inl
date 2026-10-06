@@ -498,6 +498,8 @@ void EditorImGui::RenderAssetBrowserContent()
     const bool searching = m_assetSearchBuffer[0] != '\0';
     std::vector<std::string> folders;
     std::vector<AssetLibrary::Entry> assets;
+    const std::vector<std::string>* folderView = &folders;
+    const std::vector<AssetLibrary::Entry>* assetView = &assets;
     if (searching)
     {
         for (const AssetLibrary::Entry& entry : m_assetLibrary->Entries())
@@ -517,8 +519,8 @@ void EditorImGui::RenderAssetBrowserContent()
     }
     else
     {
-        folders = QueryFilesystemChildFolders(m_assetSubpath);
-        assets = QueryFilesystemAssetsInFolder(m_assetSubpath);
+        folderView = &QueryFilesystemChildFolders(m_assetSubpath);
+        assetView = &QueryFilesystemAssetsInFolder(m_assetSubpath);
     }
 
     const float panelWidth = std::max(1.0f, ImGui::GetContentRegionAvail().x);
@@ -532,13 +534,13 @@ void EditorImGui::RenderAssetBrowserContent()
             ImGui::SetCursorPosX(ImGui::GetCursorPosX() + (kAssetCellWidth - kAssetTileSize) * 0.5f);
             ImGui::BeginGroup();
         };
-        for (const std::string& folder : folders)
+        for (const std::string& folder : *folderView)
         {
             beginCell();
             RenderAssetBrowserFolderTile(folder, kAssetTileSize);
             ImGui::EndGroup();
         }
-        for (const AssetLibrary::Entry& entry : assets)
+        for (const AssetLibrary::Entry& entry : *assetView)
         {
             beginCell();
             RenderAssetTile(entry, kAssetTileSize);
@@ -546,7 +548,7 @@ void EditorImGui::RenderAssetBrowserContent()
         }
         ImGui::EndTable();
     }
-    if (folders.empty() && assets.empty())
+    if (folderView->empty() && assetView->empty())
     {
         ImGui::Spacing();
         ImGui::TextDisabled(searching ? "Nothing matches the search."
@@ -1010,19 +1012,10 @@ void EditorImGui::RenderScriptsPanel()
         else
             m_assetStatus = "Open failed: " + err;
     };
-    const auto scriptAssetsWithExtension = [this](const char* extension) {
-        std::vector<AssetLibrary::Entry> scripts =
-            m_assetLibrary->EntriesFor(AssetLibrary::Category::Script);
-        const std::string wanted = extension;
-        scripts.erase(std::remove_if(scripts.begin(), scripts.end(),
-            [&wanted](const AssetLibrary::Entry& entry) {
-                std::string fileExt = std::filesystem::path(entry.filename).extension().string();
-                std::transform(fileExt.begin(), fileExt.end(), fileExt.begin(),
-                    [](unsigned char c) { return static_cast<char>(std::tolower(c)); });
-                return fileExt != wanted;
-            }),
-            scripts.end());
-        return scripts;
+    // Cached per asset-library revision: the panel renders every frame and EntriesFor copies the
+    // whole Script category.
+    const auto scriptAssetsWithExtension = [this](const char* extension) -> const std::vector<AssetLibrary::Entry>& {
+        return CachedScriptAssets(extension);
     };
     const auto renderScriptList = [&](const std::vector<AssetLibrary::Entry>& scripts, const char* dragLabel) {
         for (const AssetLibrary::Entry& e : scripts)
@@ -1052,7 +1045,7 @@ void EditorImGui::RenderScriptsPanel()
         CreateAngelScriptAsset();
     if (m_assetLibrary)
     {
-        const std::vector<AssetLibrary::Entry> scripts = scriptAssetsWithExtension(".as");
+        const std::vector<AssetLibrary::Entry>& scripts = scriptAssetsWithExtension(".as");
         if (scripts.empty())
             ImGui::TextDisabled("No .as scripts. Drop an .as into the asset browser or click New AngelScript.");
         renderScriptList(scripts, "AngelScript script");
@@ -1066,7 +1059,7 @@ void EditorImGui::RenderScriptsPanel()
         CreateLuaScriptAsset();
     if (m_assetLibrary)
     {
-        const std::vector<AssetLibrary::Entry> luaScripts = scriptAssetsWithExtension(".lua");
+        const std::vector<AssetLibrary::Entry>& luaScripts = scriptAssetsWithExtension(".lua");
         if (luaScripts.empty())
             ImGui::TextDisabled("No .lua scripts. Drop a .lua into the asset browser.");
         renderScriptList(luaScripts, "Lua script");

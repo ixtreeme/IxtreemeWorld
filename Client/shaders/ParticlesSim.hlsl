@@ -24,7 +24,7 @@ struct ParticleState
     float4 u_emitterPos;    // xyz = emitter position, w = dt
     float4 u_emitterDir;    // xyz = normalized emission axis
     float4 u_params0;       // x gravity, y drag, z cone angle (rad), w rotation speed (rad)
-    float4 u_params1;       // x shape radius, y shape arc (rad), z shape, w unused
+    float4 u_params1;       // x shape radius, y shape arc (rad), z shape, w clear (1: the rest die)
     float4 u_shapeExtents;  // xyz = box/edge extents
     float4 u_spawn;         // x spawn budget, y spawn cursor, z frame seed, w max particles
     float4 u_sizeOverLife;  // 4 keys
@@ -34,6 +34,9 @@ struct ParticleState
     float4 u_color3;
     float4 u_life;          // x lifetime min, y lifetime max, z size min, w size max
     float4 u_speed;         // x speed min, y speed max, z atlas columns, w atlas rows
+    float4 u_axisX;         // xyz = the emitter's local axes in world space: the spawn shape's orientation
+    float4 u_axisY;
+    float4 u_axisZ;
 };
 
 [[vk::binding(1, 0)]] RWStructuredBuffer<ParticleState> u_particles : register(u0);
@@ -128,10 +131,13 @@ void Spawn(uint slot, uint salt)
     {
         offset = float3((r0 * 2.0 - 1.0) * u_shapeExtents.x, 0.0, 0.0);
     }
-    p.positionSize.xyz = emitterPosition + offset;
+    // The shape is in the emitter's local axes: turned with the entity, as on the CPU.
+    p.positionSize.xyz = emitterPosition + offset.x * u_axisX.xyz + offset.y * u_axisY.xyz + offset.z * u_axisZ.xyz;
 
     // Random direction inside the cone around the emission axis.
-    float3 direction = normalize(max(u_emitterDir.xyz, 1e-5));
+    // (Any sign: a downward axis emits downward. A zero axis falls back to +Y, as on the CPU.)
+    const float3 axis = u_emitterDir.xyz;
+    float3 direction = dot(axis, axis) > 1e-12 ? normalize(axis) : float3(0.0, 1.0, 0.0);
     float3 tangent;
     float3 bitangent;
     BuildBasis(direction, tangent, bitangent);
@@ -169,6 +175,16 @@ void CSMain(uint3 id : SV_DispatchThreadID)
     if (budget > 0 && ((slot + maxParticles - cursor) % maxParticles) < budget)
     {
         Spawn(slot, 0u);
+        return;
+    }
+
+    // Restart / Play started: every particle not respawned just now goes.
+    if (u_params1.w > 0.5)
+    {
+        ParticleState dead = u_particles[slot];
+        dead.lifeSpawn.x = 0.0;
+        dead.positionSize.w = 0.0;
+        u_particles[slot] = dead;
         return;
     }
 

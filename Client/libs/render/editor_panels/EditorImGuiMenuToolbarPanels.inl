@@ -636,6 +636,25 @@ void EditorImGui::HandleEditorHotkeys()
         SceneManager::Instance().NewScene();
 }
 
+// A cmake/game build log can be megabytes; rendering it whole builds millions of vertices every
+// frame. Only the tail matters while watching a build, so cap what is drawn.
+static void RenderBuildLogTail(const std::string& log)
+{
+    constexpr std::size_t kMaxCharacters = 8 * 1024;
+    if (log.empty())
+    {
+        ImGui::TextDisabled("(no output)");
+        return;
+    }
+    if (log.size() > kMaxCharacters)
+    {
+        ImGui::TextDisabled("... (%zu earlier characters not shown)", log.size() - kMaxCharacters);
+        ImGui::TextUnformatted(log.c_str() + (log.size() - kMaxCharacters), log.c_str() + log.size());
+        return;
+    }
+    ImGui::TextUnformatted(log.c_str());
+}
+
 void EditorImGui::RenderBuildOutputPanel()
 {
     if (!m_buildOutputPanelOpen)
@@ -678,12 +697,12 @@ void EditorImGui::RenderBuildOutputPanel()
             ImGuiWindowFlags_HorizontalScrollbar);
         if (m_gameBuildState == ScriptBuildState::Done)
         {
-            ImGui::TextUnformatted(m_gameBuildLog.empty() ? "(no output)" : m_gameBuildLog.c_str());
+            RenderBuildLogTail(m_gameBuildLog);
             if (!m_buildLog.empty())
                 ImGui::Separator();
         }
         if (m_gameBuildState != ScriptBuildState::Done || !m_buildLog.empty())
-            ImGui::TextUnformatted(m_buildLog.empty() ? "(no output)" : m_buildLog.c_str());
+            RenderBuildLogTail(m_buildLog);
         ImGui::EndChild();
     }
     ImGui::End();

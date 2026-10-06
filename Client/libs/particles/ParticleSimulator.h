@@ -53,12 +53,15 @@ public:
     // Steps one frame. `emitterPosition` is the entity's world position; `emitterDirection` is the
     // component's direction rotated by the entity's rotation (normalized by the caller or here).
     // `groundHeight`/`groundUser`: the optional collision query (world-space emitters only).
+    // `emitterAxes`: the entity's local X, Y, Z axes in world space (9 floats, rows) that orient the
+    // spawn shape of a world-space emitter; null = the world axes (local-space emitters).
     void Update(const ParticleSystemComponent& component,
                 const float emitterPosition[3],
                 const float emitterDirection[3],
                 float dtSeconds,
                 GroundHeightFn groundHeight = nullptr,
-                void* groundUser = nullptr);
+                void* groundUser = nullptr,
+                const float* emitterAxes = nullptr);
 
     void Clear() { m_particles.clear(); }
 
@@ -72,7 +75,8 @@ private:
                        const float emitterPosition[3],
                        const float direction[3],
                        const float tangent[3],
-                       const float bitangent[3]);
+                       const float bitangent[3],
+                       const float* axes);
 
     std::vector<Particle> m_particles;
     std::uint32_t m_rng = 1u;

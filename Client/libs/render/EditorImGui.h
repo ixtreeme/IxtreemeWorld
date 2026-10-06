@@ -210,6 +210,9 @@ public:
     // Changes whenever GetWaterMaterialsSnapshot() may return something else: the asset library was
     // saved, reloaded or replaced, or a water/PBR material has unsaved edits (they are in it).
     std::uint64_t WaterMaterialsRevision() const;
+    // Changes whenever the asset library may describe something else: refreshed, an entry edited
+    // (a LOD default saved), or another library (a project opened). For caches over its entries.
+    std::uint64_t AssetLibraryRevision() const;
     void SetPaletteSlots(const std::array<MapEditorPaletteSlot, 8>& slots);
     void SetEngineRoot(const std::filesystem::path& clientRoot);
     void InitializeAssetLibrary(const std::filesystem::path& clientRoot);
@@ -468,6 +471,10 @@ private:
     // True while the project still has LEGACY C++ script sources (.cpp Script assets): the editor only
     // offers the C++ compile path in that case (AngelScript/Lua need no build).
     bool ProjectHasNativeScriptSources() const;
+    // Script assets of one extension (".as" / ".lua" / ".cpp"), cached per asset-library revision:
+    // the toolbar, the Scripts panel and the inspector need these lists every frame, and EntriesFor
+    // copies every matching entry.
+    const std::vector<AssetLibrary::Entry>& CachedScriptAssets(const char* extension) const;
     void CreateWaterMaterialAsset();
     bool CreateWaterMaterialAsset(const std::string& displayName, AssetLibrary::Entry& outEntry);
     void CreatePhysicsMaterialAsset();
@@ -479,8 +486,10 @@ private:
     bool SavePbrMaterialEditor();
     bool DeleteWaterMaterialEditor();
     void SyncWaterMaterialSnapshot();
-    std::vector<std::string> QueryFilesystemChildFolders(const std::string& subpath) const;
-    std::vector<AssetLibrary::Entry> QueryFilesystemAssetsInFolder(const std::string& subpath) const;
+    // Both return references into the asset browser cache: callers must not hold them across a
+    // cache invalidation (library swap) or across frames; use within the current frame is safe.
+    const std::vector<std::string>& QueryFilesystemChildFolders(const std::string& subpath) const;
+    const std::vector<AssetLibrary::Entry>& QueryFilesystemAssetsInFolder(const std::string& subpath) const;
     // Drops the cached asset browser listings when the asset library changed (or they are too old
     // to trust for edits made outside the editor).
     void ValidateAssetBrowserCache() const;
@@ -646,10 +655,21 @@ private:
     PbrMaterialEditorState m_pbrMaterialEditor;
     // WaterMaterialsRevision: bumped per unsaved material edit and when the asset library is replaced.
     mutable std::uint64_t m_waterMaterialsTick = 0;
+    std::uint64_t m_assetLibraryGeneration = 0;  // bumped for each new library (AssetLibraryRevision)
     mutable bool m_waterMaterialsDrafting = false;
     std::unique_ptr<tree_tool::TreeGeneratorPanel> m_treeGeneratorPanel;
     std::filesystem::path m_engineRoot;
     std::unique_ptr<AssetLibrary> m_assetLibrary;
+    // Cached script lists (see CachedScriptAssets), keyed by extension and invalidated by the
+    // library revision.
+    struct CachedScriptList
+    {
+        const AssetLibrary* library = nullptr;
+        std::uint64_t revision = 0;
+        bool valid = false;
+        std::vector<AssetLibrary::Entry> entries;
+    };
+    mutable std::unordered_map<std::string, CachedScriptList> m_scriptAssetCache;
     ProjectDialogMode m_projectDialogMode = ProjectDialogMode::None;
     bool m_projectPopupNeedsOpen = false;
     bool m_projectCreateBrowserVisible = false;
@@ -744,6 +764,7 @@ private:
         const AssetLibrary* library = nullptr;
         std::uint64_t revision = 0;
         double builtAt = -1.0;
+        int validatedFrame = -1;  // the ImGui frame it was last checked in (at most once a frame)
         std::unordered_map<std::string, std::vector<std::string>> childFolders;
         std::unordered_map<std::string, std::vector<AssetLibrary::Entry>> folderAssets;
         std::optional<std::vector<AssetLibrary::Entry>> sceneAssets;

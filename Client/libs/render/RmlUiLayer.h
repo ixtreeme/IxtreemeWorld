@@ -131,6 +131,14 @@ public:
     // True once per click on the element (or anything inside it) since the last call.
     bool ConsumeGameElementClick(std::uint32_t handle, const std::string& elementId);
     bool HasVisibleGameDocuments() const;
+    // True while ANY RmlUi document is shown (script-opened game documents or the built-in
+    // login/lobby/HUD/... ones). The engine skips Context::Update() while this is false: RmlUi walks
+    // every document's layout and animations each Update, which costs real frame time when nothing
+    // is on screen (the editor's normal state).
+    bool HasAnyVisibleDocument() const;
+    // Whether Update() has work: a document is shown, or one was at the last Update (its hide or
+    // close takes effect in the next one). Call Update() while this is true.
+    bool NeedsUpdate() const;
     // The pointer is over a game-document element that is not just its empty body: a click there is
     // meant for the UI (a button), not for the game world under it.
     bool IsPointerOverGameUi() const;

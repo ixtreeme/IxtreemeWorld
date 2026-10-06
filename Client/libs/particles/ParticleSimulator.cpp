@@ -93,7 +93,8 @@ void ParticleSimulator::SpawnParticle(const ParticleSystemComponent& component,
                                       const float emitterPosition[3],
                                       const float direction[3],
                                       const float tangent[3],
-                                      const float bitangent[3])
+                                      const float bitangent[3],
+                                      const float* axes)
 {
     Particle particle;
 
@@ -133,6 +134,12 @@ void ParticleSimulator::SpawnParticle(const ParticleSystemComponent& component,
         offset[0] = (Random01() * 2.0f - 1.0f) * component.shapeExtents[0];
         break;
     }
+    if (axes != nullptr)  // the shape turns with the entity (world-space emitters)
+    {
+        const float local[3] = {offset[0], offset[1], offset[2]};
+        for (int c = 0; c < 3; ++c)
+            offset[c] = local[0] * axes[c] + local[1] * axes[3 + c] + local[2] * axes[6 + c];
+    }
     particle.position[0] = emitterPosition[0] + offset[0];
     particle.position[1] = emitterPosition[1] + offset[1];
     particle.position[2] = emitterPosition[2] + offset[2];
@@ -169,7 +176,8 @@ void ParticleSimulator::Update(const ParticleSystemComponent& component,
                                const float emitterDirection[3],
                                float dtSeconds,
                                GroundHeightFn groundHeight,
-                               void* groundUser)
+                               void* groundUser,
+                               const float* emitterAxes)
 {
     const float dt = std::clamp(dtSeconds, 0.0f, kMaxStepSeconds);
 
@@ -247,7 +255,7 @@ void ParticleSimulator::Update(const ParticleSystemComponent& component,
         {
             const int burst = std::min(m_pendingBurst, spawnBudget);
             for (int i = 0; i < burst; ++i)
-                SpawnParticle(component, emitterPosition, direction, tangent, bitangent);
+                SpawnParticle(component, emitterPosition, direction, tangent, bitangent, emitterAxes);
             m_pendingBurst -= burst;
             spawnBudget -= burst;
         }
@@ -262,7 +270,7 @@ void ParticleSimulator::Update(const ParticleSystemComponent& component,
             m_emitAccumulator -= static_cast<float>(rateSpawns);
             rateSpawns = std::min(rateSpawns, spawnBudget);
             for (int i = 0; i < rateSpawns; ++i)
-                SpawnParticle(component, emitterPosition, direction, tangent, bitangent);
+                SpawnParticle(component, emitterPosition, direction, tangent, bitangent, emitterAxes);
 
             if (m_emissionTime >= duration)
             {
