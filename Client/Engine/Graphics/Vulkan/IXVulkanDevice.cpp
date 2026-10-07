@@ -13,6 +13,7 @@
 #include "IXVulkanSwapchain.h"
 #include "IXVulkanSync.h"
 #include "VulkanDevice.h"
+#include "Debug.h"
 
 #include <algorithm>
 #include <cstdlib>
@@ -30,6 +31,43 @@ void LogAbort(const char* message)
     // (Debug.h) is linked via IXEnginePlatform's IXEngineDebug dependency.
     (void)message;
     std::abort();
+}
+
+bool EnvironmentFlagExplicitlyDisabled(const char* name)
+{
+#if defined(_WIN32)
+    char* value = nullptr;
+    std::size_t length = 0;
+    if (_dupenv_s(&value, &length, name) != 0 || value == nullptr)
+        return false;
+    const bool disabled = std::strcmp(value, "0") == 0 || std::strcmp(value, "false") == 0 ||
+        std::strcmp(value, "FALSE") == 0;
+    std::free(value);
+    return disabled;
+#else
+    const char* value = std::getenv(name);
+    return value != nullptr && (std::strcmp(value, "0") == 0 || std::strcmp(value, "false") == 0 ||
+        std::strcmp(value, "FALSE") == 0);
+#endif
+}
+
+// Set to anything but empty, 0 or false.
+bool EnvironmentFlagEnabled(const char* name)
+{
+#if defined(_WIN32)
+    char* value = nullptr;
+    std::size_t length = 0;
+    if (_dupenv_s(&value, &length, name) != 0 || value == nullptr)
+        return false;
+    const bool enabled = value[0] != '\0' && std::strcmp(value, "0") != 0 && std::strcmp(value, "false") != 0 &&
+        std::strcmp(value, "FALSE") != 0;
+    std::free(value);
+    return enabled;
+#else
+    const char* value = std::getenv(name);
+    return value != nullptr && value[0] != '\0' && std::strcmp(value, "0") != 0 && std::strcmp(value, "false") != 0 &&
+        std::strcmp(value, "FALSE") != 0;
+#endif
 }
 
 } // namespace
@@ -62,7 +100,23 @@ IXVulkanDevice::IXVulkanDevice(VulkanDevice& loop) : m_loop(&loop)
         m_swapchain->Rebuild();
         EnsureSwapchainObjects();
     }
+    // GPU pass timestamps: debug-log builds always, any other build with IX_GPU_PROFILE=1.
+#if defined(IXTREEME_DEBUG_LOGS)
+    m_gpuTimestampsAllowed = true;
+#else
+    m_gpuTimestampsAllowed = EnvironmentFlagEnabled("IX_GPU_PROFILE");
+#endif
     CreateTimestampPool();
+    if (m_gpuTimestampsAllowed)
+        Tracen("[VULKAN] GPU pass timestamps on (IX_GPU_PROFILE)");
+    if (!EnvironmentFlagExplicitlyDisabled("IX_ASYNC_PRESENT"))
+    {
+        StartAsyncPresent();
+    }
+    else
+    {
+        Tracen("[VULKAN] async present scheduler disabled (--sync-present / IX_ASYNC_PRESENT=0)");
+    }
 }
 
 IXVulkanDevice::~IXVulkanDevice()
@@ -177,11 +231,14 @@ void IXVulkanDevice::CopyBufferSync(VkBuffer src, VkBuffer dst, VkDeviceSize siz
     submit.commandBufferCount = 1;
     submit.pCommandBuffers = &cmd;
     // Parity with pre-migration staging uploads: submit + queue wait-idle.
-    CheckVk(vkQueueSubmit(m_loop->GetGraphicsQueue(), 1, &submit, VK_NULL_HANDLE),
-        "vkQueueSubmit(copy)",
-        __FILE__,
-        __LINE__);
-    CheckVk(vkQueueWaitIdle(m_loop->GetGraphicsQueue()), "vkQueueWaitIdle(copy)", __FILE__, __LINE__);
+    {
+        std::lock_guard<std::mutex> queueLock(m_queueSubmitPresentMutex);
+        CheckVk(vkQueueSubmit(m_loop->GetGraphicsQueue(), 1, &submit, VK_NULL_HANDLE),
+            "vkQueueSubmit(copy)",
+            __FILE__,
+            __LINE__);
+        CheckVk(vkQueueWaitIdle(m_loop->GetGraphicsQueue()), "vkQueueWaitIdle(copy)", __FILE__, __LINE__);
+    }
     vkFreeCommandBuffers(NativeDevice(), m_uploadPool, 1, &cmd);
 }
 
@@ -641,11 +698,14 @@ void IXVulkanDevice::UploadTextureRegions(VkImage image,
     submit.commandBufferCount = 1;
     submit.pCommandBuffers = &cmd;
     // Parity with pre-migration upload: submit + queue wait-idle (setup-time only).
-    CheckVk(vkQueueSubmit(m_loop->GetGraphicsQueue(), 1, &submit, VK_NULL_HANDLE),
-        "vkQueueSubmit(upload)",
-        __FILE__,
-        __LINE__);
-    CheckVk(vkQueueWaitIdle(m_loop->GetGraphicsQueue()), "vkQueueWaitIdle(upload)", __FILE__, __LINE__);
+    {
+        std::lock_guard<std::mutex> queueLock(m_queueSubmitPresentMutex);
+        CheckVk(vkQueueSubmit(m_loop->GetGraphicsQueue(), 1, &submit, VK_NULL_HANDLE),
+            "vkQueueSubmit(upload)",
+            __FILE__,
+            __LINE__);
+        CheckVk(vkQueueWaitIdle(m_loop->GetGraphicsQueue()), "vkQueueWaitIdle(upload)", __FILE__, __LINE__);
+    }
     vkFreeCommandBuffers(NativeDevice(), m_uploadPool, 1, &cmd);
 
     vkDestroyBuffer(NativeDevice(), staging, nullptr);

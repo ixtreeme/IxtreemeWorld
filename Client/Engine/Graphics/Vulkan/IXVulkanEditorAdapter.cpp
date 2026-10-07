@@ -22,6 +22,7 @@
 #endif
 
 #include <array>
+#include <chrono>
 #include <cmath>
 #include <cstdint>
 #include <limits>
@@ -63,6 +64,59 @@ int CreateAdapterVkSurface(ImGuiViewport* viewport,
         reinterpret_cast<VkSurfaceKHR*>(outVkSurface)));
 }
 #endif
+
+// The platform backend's viewport DPI scale (ImGuiPlatformIO::Platform_GetWindowDpiScale), asked for
+// every viewport every frame. The Win32 one asks the OS each time (a version check, a monitor query).
+// A viewport's scale only changes when it moves to another monitor or the display scale is changed,
+// so it is asked again when the viewport moves or resizes, and otherwise every half second.
+float (*g_backendWindowDpiScale)(ImGuiViewport*) = nullptr;
+struct ViewportDpi
+{
+    ImGuiID id = 0;  // 0 = free
+    ImVec2 pos;
+    ImVec2 size;
+    std::chrono::steady_clock::time_point asked;
+    float scale = 1.0f;
+};
+std::array<ViewportDpi, 16> g_viewportDpi{};
+
+float CachedWindowDpiScale(ImGuiViewport* viewport)
+{
+    if (g_backendWindowDpiScale == nullptr || viewport == nullptr)
+        return 1.0f;
+    const auto now = std::chrono::steady_clock::now();
+    ViewportDpi* entry = nullptr;
+    for (ViewportDpi& candidate : g_viewportDpi)
+    {
+        if (candidate.id == viewport->ID)
+        {
+            entry = &candidate;
+            break;
+        }
+    }
+    if (entry != nullptr && entry->pos.x == viewport->Pos.x && entry->pos.y == viewport->Pos.y &&
+        entry->size.x == viewport->Size.x && entry->size.y == viewport->Size.y &&
+        now - entry->asked < std::chrono::milliseconds(500))
+        return entry->scale;
+    if (entry == nullptr)
+    {
+        // A free entry, or else the one asked longest ago.
+        entry = &g_viewportDpi[0];
+        for (ViewportDpi& candidate : g_viewportDpi)
+        {
+            if (candidate.id == 0 || candidate.asked < entry->asked)
+                entry = &candidate;
+            if (candidate.id == 0)
+                break;
+        }
+    }
+    entry->id = viewport->ID;
+    entry->pos = viewport->Pos;
+    entry->size = viewport->Size;
+    entry->asked = now;
+    entry->scale = g_backendWindowDpiScale(viewport);
+    return entry->scale;
+}
 
 // Editor colors (the style and every color written in the panels) are sRGB values. An sRGB
 // render target treats what the shader writes as linear and encodes it, which would show each of
@@ -177,6 +231,14 @@ bool IXVulkanEditorAdapter::CreateBackend(void* windowHandle)
 #if defined(_WIN32)
     ImGui::GetPlatformIO().Platform_CreateVkSurface = CreateAdapterVkSurface;
 #endif
+    // The platform backend's DPI query, asked again only when a viewport moves (see CachedWindowDpiScale).
+    ImGuiPlatformIO& platformIO = ImGui::GetPlatformIO();
+    if (platformIO.Platform_GetWindowDpiScale != nullptr && platformIO.Platform_GetWindowDpiScale != CachedWindowDpiScale)
+    {
+        g_backendWindowDpiScale = platformIO.Platform_GetWindowDpiScale;
+        g_viewportDpi = {};
+        platformIO.Platform_GetWindowDpiScale = CachedWindowDpiScale;
+    }
 
     ImGui_ImplVulkan_InitInfo init{};
     init.ApiVersion = VK_API_VERSION_1_2;
@@ -225,6 +287,7 @@ void IXVulkanEditorAdapter::ShutdownBackend()
     }
 #if defined(_WIN32)
     ImGui_ImplWin32_Shutdown();
+    g_backendWindowDpiScale = nullptr;
 #endif
     if (ImGui::GetCurrentContext() != nullptr)
         ImGui::DestroyContext();

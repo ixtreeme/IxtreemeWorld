@@ -43,6 +43,8 @@ public:
     // Called before a save to complete the current scene snapshot: the editor's per-frame snapshot
     // leaves out the terrain grids (megabytes) and the refresher sets the full one.
     void SetSnapshotRefresher(std::function<void()> refresher);
+    // Whether a loaded scene waits for ConsumePendingScene (asked every frame: no SceneData to build).
+    bool HasPendingScene() const { return m_hasPendingScene; }
     bool ConsumePendingScene(SceneData& outScene);
     void SetWindowTitleCallback(std::function<void(const std::string&)> callback);
     void SetWindowTitleSuffix(std::string suffix);

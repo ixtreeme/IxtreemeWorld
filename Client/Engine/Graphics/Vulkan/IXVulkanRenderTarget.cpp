@@ -335,6 +335,7 @@ VkFramebuffer IXVulkanDevice::CreateFramebufferFor(VkRenderPass pass,
 
 void IXVulkanDevice::WaitIdle()
 {
+    WaitForAsyncPresentIdle();
     CheckVk(vkDeviceWaitIdle(NativeDevice()), "vkDeviceWaitIdle", __FILE__, __LINE__);
 }
 

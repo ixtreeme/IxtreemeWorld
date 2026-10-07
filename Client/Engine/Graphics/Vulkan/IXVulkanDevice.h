@@ -34,10 +34,15 @@
 #include <vulkan/vulkan.h>
 
 #include <array>
+#include <atomic>
 #include <chrono>
+#include <condition_variable>
+#include <cstddef>
 #include <cstdint>
+#include <deque>
 #include <functional>
 #include <mutex>
+#include <thread>
 
 class VulkanDevice;
 
@@ -113,6 +118,7 @@ public:
     bool TryReadTimestamps(ixrhi::IXRHITimestampResults& gpu,
                            ixrhi::IXRHICpuFrameTiming& cpu) override;
     std::unique_ptr<ixrhi::IXRHIOcclusionQueries> CreateOcclusionQueries(std::uint32_t count) override;
+    std::uint64_t GetPresentedFrameCount() const override { return m_presentedFrames.load(std::memory_order_relaxed); }
     const ixrhi::IXRHICapabilities& GetCapabilities() const override { return m_capabilities; }
 
     // Releases ALL backend Vulkan objects (frame contexts, swapchain object,
@@ -156,6 +162,13 @@ public:
                                        std::uint32_t height) const;
 
 private:
+    struct PendingPresent
+    {
+        VkSwapchainKHR swapchain = VK_NULL_HANDLE;
+        VkSemaphore waitSemaphore = VK_NULL_HANDLE;
+        std::uint32_t imageIndex = 0;
+    };
+
     void QueryCapabilities();
     // Multi-subresource staged upload (tight layer-major/mip-minor packing,
     // see IXRHITexture.h). initialLayout/finalLayout bracket the copies;
@@ -193,6 +206,12 @@ private:
     // Synchronous backend-driven (re)build for the requested size. Returns
     // false (with dirty set, except for zero size) when nothing was built.
     bool RecreateSwapchainNow(std::uint32_t width, std::uint32_t height);
+    void StartAsyncPresent();
+    void StopAsyncPresent();
+    void WaitForAsyncPresentIdle();
+    void WaitForAsyncPresentCapacity();
+    void EnqueueAsyncPresent(PendingPresent present);
+    void AsyncPresentLoop();
 
     VulkanDevice* m_loop = nullptr; // borrowed device/queue/swapchain infrastructure
     ixrhi::IXRHICapabilities m_capabilities;
@@ -233,6 +252,20 @@ private:
     ixrhi::IXRHICpuFrameTiming m_activeCpuTiming{};
     std::chrono::steady_clock::time_point m_cpuFrameStart{};
     std::chrono::steady_clock::time_point m_cpuWorkStart{};
+
+    // Bounded present scheduler. It is enabled by default; --sync-present or
+    // IX_ASYNC_PRESENT=0 keeps the synchronous path available for rollback.
+    bool m_asyncPresentEnabled = false;
+    bool m_asyncPresentStop = false;
+    std::thread m_asyncPresentThread;
+    std::mutex m_asyncPresentMutex;
+    std::condition_variable m_asyncPresentWake;
+    std::deque<PendingPresent> m_asyncPresentQueue;
+    std::size_t m_asyncPresentOutstanding = 0;
+    std::atomic<bool> m_asyncPresentSwapchainDirty{false};
+    std::atomic<std::uint64_t> m_presentedFrames{0};  // successful presents (GetPresentedFrameCount)
+    bool m_gpuTimestampsAllowed = false;  // CreateTimestampPool: debug-log build or IX_GPU_PROFILE=1
+    mutable std::mutex m_queueSubmitPresentMutex;
 };
 
 #define IXVULKAN_CHECK(device, call) (device).CheckVk((call), #call, __FILE__, __LINE__)

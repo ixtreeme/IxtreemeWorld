@@ -146,6 +146,10 @@ public:
                                    IXRHICpuFrameTiming& cpu) = 0;
     // ---- Occlusion queries (see IXRHIOcclusionQueries); null when unsupported.
     virtual std::unique_ptr<IXRHIOcclusionQueries> CreateOcclusionQueries(std::uint32_t count) = 0;
+    // Frames handed to the presentation engine so far (successful presents, on whichever thread
+    // presents). With a present thread the render loop can count frames that were never shown; this
+    // counts the ones that were.
+    virtual std::uint64_t GetPresentedFrameCount() const = 0;
 
     virtual const IXRHICapabilities& GetCapabilities() const = 0;
 };

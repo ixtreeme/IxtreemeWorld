@@ -32,6 +32,11 @@
 #include "physics/PhysicsWorld.h"
 #if defined(_WIN32)
 #include "NativeWindow_Win32.h"
+#include <pdh.h>
+#include <pdhmsg.h>
+#include <psapi.h>
+#pragma comment(lib, "pdh.lib")
+#pragma comment(lib, "psapi.lib")
 #endif
 #if defined(__ANDROID__)
 #include "NativeWindow_Android.h"
@@ -102,6 +107,118 @@ namespace
 namespace xm = ixtreeme::math;
 namespace prefab = ixtreeme::prefab;
 namespace phys = ixtreeme::physics;
+
+// Lightweight process/system telemetry for the in-panel Game View overlay. The
+// counters are sampled at most once per second so the diagnostics do not become
+// part of the frame-time measurement they report.
+struct RuntimePerformanceMonitor
+{
+    double gpuUsagePercent = -1.0;
+    bool gpuUsageAvailable = false;
+    double ramUsagePercent = 0.0;
+    double processRamMb = 0.0;
+    double lastSampleSeconds = -1.0;
+
+#if defined(_WIN32)
+    HQUERY gpuQuery = nullptr;
+    HCOUNTER gpuUtilizationCounter = nullptr;
+    bool gpuQueryInitialized = false;
+
+    ~RuntimePerformanceMonitor()
+    {
+        if (gpuQuery != nullptr)
+            PdhCloseQuery(gpuQuery);
+    }
+
+    void InitializeGpuQuery()
+    {
+        if (gpuQueryInitialized)
+            return;
+        gpuQueryInitialized = true;
+        if (PdhOpenQueryW(nullptr, 0, &gpuQuery) != ERROR_SUCCESS)
+        {
+            gpuQuery = nullptr;
+            return;
+        }
+        if (PdhAddEnglishCounterW(gpuQuery,
+                L"\\GPU Engine(*)\\Utilization Percentage",
+                0,
+                &gpuUtilizationCounter) != ERROR_SUCCESS)
+        {
+            PdhCloseQuery(gpuQuery);
+            gpuQuery = nullptr;
+            gpuUtilizationCounter = nullptr;
+        }
+    }
+
+    void SampleGpu()
+    {
+        InitializeGpuQuery();
+        gpuUsageAvailable = false;
+        gpuUsagePercent = -1.0;
+        if (gpuQuery == nullptr || gpuUtilizationCounter == nullptr ||
+            PdhCollectQueryData(gpuQuery) != ERROR_SUCCESS)
+            return;
+
+        DWORD bufferBytes = 0;
+        DWORD itemCount = 0;
+        PDH_STATUS status = PdhGetFormattedCounterArrayW(
+            gpuUtilizationCounter, PDH_FMT_DOUBLE, &bufferBytes, &itemCount, nullptr);
+        if (status != PDH_MORE_DATA || bufferBytes == 0 || itemCount == 0)
+            return;
+
+        std::vector<unsigned char> buffer(bufferBytes);
+        auto* items = reinterpret_cast<PDH_FMT_COUNTERVALUE_ITEM_W*>(buffer.data());
+        status = PdhGetFormattedCounterArrayW(
+            gpuUtilizationCounter, PDH_FMT_DOUBLE, &bufferBytes, &itemCount, items);
+        if (status != ERROR_SUCCESS)
+            return;
+
+        const std::wstring processNeedle = L"pid_" + std::to_wstring(GetCurrentProcessId()) + L"_";
+        double total = 0.0;
+        bool matched = false;
+        for (DWORD index = 0; index < itemCount; ++index)
+        {
+            const auto& item = items[index];
+            if (item.szName == nullptr ||
+                std::wstring(item.szName).find(processNeedle) == std::wstring::npos)
+                continue;
+            matched = true;
+            if (item.FmtValue.CStatus == ERROR_SUCCESS)
+                total += std::max(0.0, item.FmtValue.doubleValue);
+        }
+        if (matched)
+        {
+            gpuUsagePercent = std::clamp(total, 0.0, 100.0);
+            gpuUsageAvailable = true;
+        }
+    }
+#endif
+
+    void Sample(double nowSeconds)
+    {
+        if (lastSampleSeconds >= 0.0 && nowSeconds - lastSampleSeconds < 1.0)
+            return;
+        lastSampleSeconds = nowSeconds;
+#if defined(_WIN32)
+        MEMORYSTATUSEX memory{};
+        memory.dwLength = sizeof(memory);
+        if (GlobalMemoryStatusEx(&memory) != FALSE)
+            ramUsagePercent = static_cast<double>(memory.dwMemoryLoad);
+
+        PROCESS_MEMORY_COUNTERS_EX processMemory{};
+        if (GetProcessMemoryInfo(GetCurrentProcess(),
+                reinterpret_cast<PROCESS_MEMORY_COUNTERS*>(&processMemory),
+                sizeof(processMemory)) != FALSE)
+            processRamMb = static_cast<double>(processMemory.WorkingSetSize) / (1024.0 * 1024.0);
+
+        SampleGpu();
+#else
+        gpuUsageAvailable = false;
+        gpuUsagePercent = -1.0;
+#endif
+    }
+};
 
 bool IsSrgbColorFormat(ixrhi::IXRHIFormat format)
 {
@@ -392,7 +509,53 @@ struct FrameCpuProfile
     double editorUiRenderMs = 0.0;
     double submitPresentMs = 0.0;
     double totalCpuFrameMs = 0.0;
+    // The phases IX_PERF_LOG reports (both builds).
+    double frameWaitMs = 0.0;    // BeginFrame: the frame slot's fence, the swapchain image
+    double simulationMs = 0.0;   // Play: characters, physics, scripts, audio, particles, all of it
+    double physicsMs = 0.0;      //   of which characters and the physics step
+    double scriptsMs = 0.0;      //   of which scripts (OnUpdate, collisions, deferred ops)
+    double particlesMs = 0.0;    // CPU particle emitters (Play and Edit)
+    double animationMs = 0.0;    // skinning pre-pass: animators, clip sampling, palettes, dispatches
+    double shadowPassMs = 0.0;   // sun shadow casters gathered and recorded
+    std::uint32_t skinnedInstances = 0;  // character instances skinned this frame (all views)
 };
+
+// IX_PERF_LOG=<seconds>: one [PERF] line per interval with the averaged frame phases, the render
+// loop's and the presented frame rates, the scene's load and (with IX_GPU_PROFILE=1) the GPU passes.
+// For measuring a scene the way it runs, the shipped game included; off unless the variable is set.
+struct PerfLogState
+{
+    double intervalSeconds = 0.0;  // 0 = off
+    std::chrono::steady_clock::time_point windowStart{};
+    std::uint64_t presentedAtWindowStart = 0;
+    std::uint32_t frames = 0;
+    FrameCpuProfile sum{};
+    double maxFrameMs = 0.0;
+    std::uint64_t skinnedSum = 0;
+    std::uint64_t frameCounter = 0;
+    std::uint32_t gpuSamples = 0;
+    double gpuFrame = 0.0, gpuShadow = 0.0, gpuReflection = 0.0, gpuTerrain = 0.0, gpuScene = 0.0,
+           gpuPost = 0.0, gpuUi = 0.0;
+};
+
+double PerfLogIntervalFromEnvironment()
+{
+    std::string text;
+#if defined(_WIN32)
+    char* value = nullptr;
+    std::size_t length = 0;
+    if (_dupenv_s(&value, &length, "IX_PERF_LOG") == 0 && value != nullptr)
+    {
+        text = value;
+        std::free(value);
+    }
+#else
+    if (const char* value = std::getenv("IX_PERF_LOG"))
+        text = value;
+#endif
+    const double seconds = text.empty() ? 0.0 : std::atof(text.c_str());
+    return seconds > 0.0 ? std::clamp(seconds, 0.25, 60.0) : 0.0;
+}
 
 struct PhysicsDebugContact
 {
@@ -5159,11 +5322,21 @@ int RunGame(NativeWindow& window,
     // Frame stats + debug toggles: cheap POD, shared so the runtime's render/stats path compiles. The
     // editor-only perf-overlay accumulators ride along harmlessly (they just go unused in the runtime).
     EngineStats engineStats{};
+    RuntimePerformanceMonitor performanceMonitor;
+    engineStats.renderer = "Vulkan";
+    if (!rhiDevice->GetCapabilities().deviceName.empty())
+        engineStats.renderer += " / " + rhiDevice->GetCapabilities().deviceName;
     double statsAccumSeconds = 0.0;
     double statsFrameMsAccum = 0.0;
     double statsMinFrameMs = std::numeric_limits<double>::max();
     double statsMaxFrameMs = 0.0;
     std::uint32_t statsFrameCount = 0;
+    double sceneViewStatsAccumSeconds = 0.0;
+    std::uint32_t sceneViewStatsFrameCount = 0;
+    double sceneViewFps = 0.0;
+    double gameViewStatsAccumSeconds = 0.0;
+    std::uint32_t gameViewStatsFrameCount = 0;
+    double gameViewFps = 0.0;
     std::clock_t statsPreviousCpuClock = std::clock();
     double statsPreviousCpuSampleSeconds = 0.0;
     const unsigned int statsHardwareThreads = std::max(1u, std::thread::hardware_concurrency());
@@ -5190,6 +5363,29 @@ int RunGame(NativeWindow& window,
     bool debugShowPhysicsBodyCenters = false;
     bool dumpFrameProfileRequested = false;
     bool loggedParticleSoftDepth = false;
+    PerfLogState perfLog;
+    perfLog.intervalSeconds = PerfLogIntervalFromEnvironment();
+    if (perfLog.intervalSeconds > 0.0)
+        Tracenf("[PERF] frame phase log every %.2f s (IX_PERF_LOG)%s", perfLog.intervalSeconds,
+            " - set IX_GPU_PROFILE=1 for GPU pass times");
+    // Without a project or an open scene the Scene View shows only the default sky: what
+    // its image depends on, as last drawn. It is drawn again only when this changes.
+    struct EmptySceneViewKey
+    {
+        float viewProjection[16]{};
+        std::uint32_t width = 0;
+        std::uint32_t height = 0;
+        std::int32_t toneMapMode = 0;
+        float exposure = 0.0f;
+        const void* display = nullptr;  // the image the panel shows: a new one is drawn into at once
+        bool operator==(const EmptySceneViewKey& other) const
+        {
+            return std::memcmp(viewProjection, other.viewProjection, sizeof(viewProjection)) == 0 &&
+                width == other.width && height == other.height && toneMapMode == other.toneMapMode &&
+                exposure == other.exposure && display == other.display;
+        }
+    };
+    std::optional<EmptySceneViewKey> emptySceneViewDrawn;
     std::uint64_t editorSnapshotTick = 0;  // editor-frame counter for the throttled scene snapshot
     Tracen("[VISIBILITY-RESPECT] shadow_pass=yes water_reflection_pass=yes main_pass=yes");
     // Starting the game simulation of the loaded scene, shared by the editor's Play button and the
@@ -5830,6 +6026,8 @@ int RunGame(NativeWindow& window,
 #if defined(IXTREEME_WITH_EDITOR)
         const double frameMs = std::max(0.0, deltaSeconds * 1000.0);
         statsAccumSeconds += std::max(0.0, deltaSeconds);
+        sceneViewStatsAccumSeconds += std::max(0.0, deltaSeconds);
+        gameViewStatsAccumSeconds += std::max(0.0, deltaSeconds);
         statsFrameMsAccum += frameMs;
         statsMinFrameMs = std::min(statsMinFrameMs, frameMs);
         statsMaxFrameMs = std::max(statsMaxFrameMs, frameMs);
@@ -5872,6 +6070,30 @@ int RunGame(NativeWindow& window,
             statsFrameCount = 0;
         }
 #endif
+#if defined(IXTREEME_WITH_EDITOR)
+        // Count only completed Scene View render passes. Cached empty-editor frames and
+        // frames where the panel is hidden intentionally contribute zero here.
+        if (sceneViewStatsAccumSeconds >= 0.25)
+        {
+            sceneViewFps = static_cast<double>(sceneViewStatsFrameCount) / sceneViewStatsAccumSeconds;
+            sceneViewStatsAccumSeconds = 0.0;
+            sceneViewStatsFrameCount = 0;
+        }
+        engineStats.sceneViewFps = sceneViewFps;
+        engineStats.sceneViewFrameMs = sceneViewFps > 0.0 ? 1000.0 / sceneViewFps : 0.0;
+        if (gameViewStatsAccumSeconds >= 0.25)
+        {
+            gameViewFps = static_cast<double>(gameViewStatsFrameCount) / gameViewStatsAccumSeconds;
+            gameViewStatsAccumSeconds = 0.0;
+            gameViewStatsFrameCount = 0;
+        }
+        engineStats.gameViewFps = gameViewFps;
+        performanceMonitor.Sample(seconds);
+        engineStats.gpuUsagePercent = performanceMonitor.gpuUsagePercent;
+        engineStats.gpuUsageAvailable = performanceMonitor.gpuUsageAvailable;
+        engineStats.ramUsagePercent = performanceMonitor.ramUsagePercent;
+        engineStats.processRamMb = performanceMonitor.processRamMb;
+#endif
         terrain.SetPerformanceFps(engineStats.fps);
 #if defined(IXTREEME_WITH_EDITOR)
         if (runtimeSession->IsMapEditorOpen() && cameraController.IsFreeCameraEnabled())
@@ -5884,6 +6106,7 @@ int RunGame(NativeWindow& window,
         // Per-frame game simulation — runs in BOTH the editor (Play mode) and the standalone runtime
         // (which forces mode=Play at boot). The state it touches is all shared/unguarded; only the
         // editor's Edit-mode tooling around it stays gated.
+        const auto simulationBegin = std::chrono::steady_clock::now();
         if (editorPlay.state.mode == EditorPlayMode::Play)
         {
             editorPlay.state.elapsedSeconds += deltaSeconds;
@@ -5902,6 +6125,7 @@ int RunGame(NativeWindow& window,
             editorScriptInput.mouseLeft = editorLeftMouseHeld;
             editorScriptInput.mouseRight = editorRightMouseHeld;
             scriptApi.input = &editorScriptInput;
+            const auto physicsBegin = std::chrono::steady_clock::now();
             // Drive player character controllers BEFORE the physics step: each writes its
             // resolved transform to the mesh; the kinematic sync in stepEditorPhysicsWorld
             // then moves the Jolt body to match (so it pushes dynamic objects).
@@ -5937,6 +6161,8 @@ int RunGame(NativeWindow& window,
                 editorPlayerLookDy = 0.0f;
             }
             stepEditorPhysicsWorld(static_cast<float>(deltaSeconds));
+            frameProfile.physicsMs = MillisecondsBetween(physicsBegin, std::chrono::steady_clock::now());
+            const auto scriptsBegin = std::chrono::steady_clock::now();
 
             // Scripting: drive each live instance's OnUpdate after physics/character have settled, so a
             // script's SetPosition wins for this frame (and the audio push below sees the new transform).
@@ -6086,6 +6312,7 @@ int RunGame(NativeWindow& window,
                 SceneManager::Instance().MarkDirty();
             }
 
+            frameProfile.scriptsMs = MillisecondsBetween(scriptsBegin, std::chrono::steady_clock::now());
             // Audio: push live AudioSource state (volume/pitch/3D position) each Play frame, after
             // transforms settle. Drop sources whose entity vanished (the dtor stops the sound).
             if (audioEngine.IsInitialized() && !entityAudioSources.empty())
@@ -6107,8 +6334,11 @@ int RunGame(NativeWindow& window,
 
             // Particles: step each live emitter after physics/scripts/audio settle. World-space, so
             // the emitter may move without dragging its particles along.
+            const auto particlesBegin = std::chrono::steady_clock::now();
             updateParticleSimulators(static_cast<float>(deltaSeconds));
+            frameProfile.particlesMs = MillisecondsBetween(particlesBegin, std::chrono::steady_clock::now());
         }
+        frameProfile.simulationMs = MillisecondsBetween(simulationBegin, std::chrono::steady_clock::now());
         {
             const auto ecsUpdateBegin = std::chrono::steady_clock::now();
             runtimeSession->UpdateNetwork();
@@ -6204,6 +6434,7 @@ int RunGame(NativeWindow& window,
             // Standalone runtime: materialize a freshly-loaded scene into the live entity set (the editor
             // does this inside its own block below). Without this, editorMeshEntities stays empty -> the
             // scene never renders. ApplySceneData also applies the scene's saved camera.
+            if (SceneManager::Instance().HasPendingScene())
             {
                 SceneData runtimePendingScene;
                 if (SceneManager::Instance().ConsumePendingScene(runtimePendingScene))
@@ -6222,14 +6453,19 @@ int RunGame(NativeWindow& window,
                 terrain.SetMapEditorOpen(runtimeSession->IsMapEditorOpen());
                 const MapEditorSettings editorSettings = editorImGui.GetMapEditorSettings();
                 terrain.SetMapEditorSettings(editorSettings);
-                SceneData pendingScene;
-                if (SceneManager::Instance().ConsumePendingScene(pendingScene))
+                // (A SceneData only when one is waiting: building and freeing an empty one every frame
+                // is not free.)
+                if (SceneManager::Instance().HasPendingScene())
                 {
-                    sceneRuntime.ApplySceneData(pendingScene);
-                    layerAuthoringPreview = {};
-                    layerGroundProbe.reset();
-                    layerGroundWorld.reset();
-                    editorImGui.SetLayerAuthoringStatus("Scene changed: generate layers from collision.");
+                    SceneData pendingScene;
+                    if (SceneManager::Instance().ConsumePendingScene(pendingScene))
+                    {
+                        sceneRuntime.ApplySceneData(pendingScene);
+                        layerAuthoringPreview = {};
+                        layerGroundProbe.reset();
+                        layerGroundWorld.reset();
+                        editorImGui.SetLayerAuthoringStatus("Scene changed: generate layers from collision.");
+                    }
                 }
                 MapEditorCommands commands = runtimeSession->ConsumeMapEditorCommands();
                 MergeMapEditorCommands(commands, editorImGui.ConsumeCommands());
@@ -11055,7 +11291,9 @@ int RunGame(NativeWindow& window,
                 editorAdapter->SetGameViewTexture(nullptr, nullptr, 0, 0);
         }
 #endif
+        const auto frameWaitBegin = std::chrono::steady_clock::now();
         ixrhi::IXRHIFrame rhiFrame = rhiDevice->BeginFrame();
+        frameProfile.frameWaitMs = MillisecondsBetween(frameWaitBegin, std::chrono::steady_clock::now());
         if (rhiFrame.result == ixrhi::IXRHIFrameResult::SwapchainRecreated)
             handleSwapchainChanged();
         if (rhiFrame.result == ixrhi::IXRHIFrameResult::DeviceLost)
@@ -11097,6 +11335,7 @@ int RunGame(NativeWindow& window,
             //   sceneSkinnedDraws       — networked entities (Scene/offscreen + water reflection)
             //   sceneEditorSkinnedDraws — editor mesh entities, Scene-view (bottom-up) slots
             //   gameEditorSkinnedDraws  — editor mesh entities, Game-view (top-down) slots
+            const auto animationBegin = std::chrono::steady_clock::now();
             std::vector<SkinnedDrawRecord> sceneSkinnedDraws;
             std::vector<SkinnedDrawRecord> sceneEditorSkinnedDraws;
             std::vector<SkinnedDrawRecord> gameEditorSkinnedDraws;
@@ -11397,6 +11636,9 @@ int RunGame(NativeWindow& window,
                     lobbySkinned->Skin(*frameInfo.commandList, frameInfo, seconds);
             }
 
+            frameProfile.animationMs = MillisecondsBetween(animationBegin, std::chrono::steady_clock::now());
+            frameProfile.skinnedInstances = static_cast<std::uint32_t>(
+                sceneSkinnedDraws.size() + sceneEditorSkinnedDraws.size() + gameEditorSkinnedDraws.size());
             const auto sceneRenderBegin = std::chrono::steady_clock::now();
             const bool useOffscreenScene = offscreenSceneOk && frameInfo.frameActive;
             // The editor shows the offscreen scene as its Scene View panel: while that is hidden (the
@@ -11590,6 +11832,27 @@ int RunGame(NativeWindow& window,
             const WorldCamera* shadowCamera = &frameCamera;
 #if defined(IXTREEME_WITH_EDITOR)
             drawSceneView = !useOffscreenScene || !runtimeSession->IsMapEditorOpen() || editorImGui.IsSceneViewVisible();
+            // No project or open scene: the panel keeps its image (the default sky) until its camera, size or tone
+            // mapping changes — redrawing the same sky every frame was most of the empty editor's GPU work.
+            if (drawSceneView && useOffscreenScene && runtimeSession->IsMapEditorOpen() &&
+                !ProjectManager::Instance().HasProject() && !SceneManager::Instance().HasOpenScene())
+            {
+                EmptySceneViewKey key;
+                std::memcpy(key.viewProjection, frameCamera.viewProjection.m, sizeof(key.viewProjection));
+                key.width = renderSize.width;
+                key.height = renderSize.height;
+                key.toneMapMode = frameToneMap.mode;
+                key.exposure = frameToneMap.exposure;
+                key.display = offscreenScene.GetDisplayTexture().get();
+                if (emptySceneViewDrawn && *emptySceneViewDrawn == key)
+                    drawSceneView = false;
+                else
+                    emptySceneViewDrawn = key;
+            }
+            else
+            {
+                emptySceneViewDrawn.reset();
+            }
             // The Game view's camera: the project Main Camera, or in Play the first active player
             // character's camera (follow/first-person/top-down per its CameraMode).
             const std::optional<WorldCamera> gameViewCamera = [&]() -> std::optional<WorldCamera> {
@@ -11603,7 +11866,11 @@ int RunGame(NativeWindow& window,
             // Particles preview in Edit: keep the emitters simulating while authoring, so the effect
             // is visible without entering Play. Play steps them in the simulation block instead.
             if (editorPlay.state.mode == EditorPlayMode::Edit)
+            {
+                const auto particlesBegin = std::chrono::steady_clock::now();
                 updateParticleSimulators(static_cast<float>(deltaSeconds));
+                frameProfile.particlesMs = MillisecondsBetween(particlesBegin, std::chrono::steady_clock::now());
+            }
             // GPU particle emitters simulate once per frame outside any render pass, in Play and in
             // Edit alike (the compute writes the buffer the transparent queue draws later).
             simulateGpuParticleEmitters(*frameInfo.commandList, frameInfo,
@@ -11642,6 +11909,7 @@ int RunGame(NativeWindow& window,
                 gameView.EnsureDisplayReadable(*frameInfo.commandList);
             if (terrainOk && isInWorld && hasFrameCamera && !debugDisableShadowPass)
             {
+                const auto shadowPassBegin = std::chrono::steady_clock::now();
                 // The meshes cast into the cascades too: the shown static meshes (each cascade gets
                 // those over its footprint) and this frame's skinned instances (their Scene-view
                 // skin slots: the pose both views draw).
@@ -11785,6 +12053,7 @@ int RunGame(NativeWindow& window,
                 terrain.RenderSunShadowMap(*frameInfo.commandList, frameInfo, *shadowCamera, castersRevisions,
                     anyMeshCasters ? drawMeshCasters : TerrainRenderer::ShadowCasterDraw{});
                 rhiDevice->WriteTimestamp(ixrhi::IXRHITimestampPoint::ShadowPassEnd);
+                frameProfile.shadowPassMs = MillisecondsBetween(shadowPassBegin, std::chrono::steady_clock::now());
             }
             // The meshes sample this frame's cascades (or see none drawn: all lit).
             if (terrainOk)
@@ -12690,6 +12959,11 @@ int RunGame(NativeWindow& window,
                 if (drawSceneView)
                 {
                     offscreenScene.EndMainPass(*frameInfo.commandList);
+#if defined(IXTREEME_WITH_EDITOR)
+                    if (runtimeSession->IsMapEditorOpen() && editorImGui.IsSceneViewVisible() &&
+                        editorImGui.ShowsSceneViewAsPanel())
+                        ++sceneViewStatsFrameCount;
+#endif
                     bool sceneDepthSnapshotted = false;
                     // The water needs a copy of the finished scene (refraction, depth fade) and a pass of
                     // its own. (Decided where the main pass ended.)
@@ -12865,6 +13139,10 @@ int RunGame(NativeWindow& window,
                         const GodRayRenderer::SunShadow gameSunShadow{terrain.SunShadowTexture(frameInfo.frameNumber),
                             terrain.SunShadowCascadeViewProj(), TerrainRenderer::kSunShadowDepthBias};
                         gameView.EndMainPass(*frameInfo.commandList);
+#if defined(IXTREEME_WITH_EDITOR)
+                        if (runtimeSession->IsMapEditorOpen() && editorImGui.IsGameViewVisible())
+                            ++gameViewStatsFrameCount;
+#endif
                         if (godRaysOk && isInWorld && godRays.IsVisible(sceneSky, frameSunLighting, gameCamera, gameSunShadow))
                         {
                             // God rays only read the depth, and the pass is over: the depth itself, no copy.
@@ -13151,6 +13429,89 @@ int RunGame(NativeWindow& window,
         engineStats.cpuSubmitPresentMs = frameProfile.submitPresentMs;
         engineStats.cpuEcsUpdateMs = frameProfile.ecsSystemsUpdateMs;
         engineStats.cpuAssetWatcherMs = frameProfile.assetWatcherPollMs;
+        if (perfLog.intervalSeconds > 0.0)
+        {
+            const auto perfNow = std::chrono::steady_clock::now();
+            if (perfLog.frames == 0)
+            {
+                perfLog.windowStart = perfNow;
+                perfLog.presentedAtWindowStart = rhiDevice->GetPresentedFrameCount();
+            }
+            FrameCpuProfile& sum = perfLog.sum;
+            sum.totalCpuFrameMs += frameProfile.totalCpuFrameMs;
+            sum.frameWaitMs += frameProfile.frameWaitMs;
+            sum.simulationMs += frameProfile.simulationMs;
+            sum.physicsMs += frameProfile.physicsMs;
+            sum.scriptsMs += frameProfile.scriptsMs;
+            sum.particlesMs += frameProfile.particlesMs;
+            sum.animationMs += frameProfile.animationMs;
+            sum.sceneRenderMs += frameProfile.sceneRenderMs;
+            sum.shadowPassMs += frameProfile.shadowPassMs;
+            sum.editorUiRenderMs += frameProfile.editorUiRenderMs;
+            sum.submitPresentMs += frameProfile.submitPresentMs;
+            perfLog.maxFrameMs = std::max(perfLog.maxFrameMs, frameProfile.totalCpuFrameMs);
+            perfLog.skinnedSum += frameProfile.skinnedInstances;
+            ++perfLog.frames;
+
+            // GPU passes (IX_GPU_PROFILE=1), one frame in 64: a capture waits for the GPU, so sampling
+            // more often would slow the very frames it measures.
+            ixrhi::IXRHITimestampResults gpu{};
+            ixrhi::IXRHICpuFrameTiming gpuCpu{};
+            if (rhiDevice->TryReadTimestamps(gpu, gpuCpu))
+            {
+                using P = ixrhi::IXRHITimestampPoint;
+                const auto span = [&gpu](P from, P to) -> double {
+                    const auto a = static_cast<std::uint32_t>(from);
+                    const auto b = static_cast<std::uint32_t>(to);
+                    if (!gpu.pointValid[a] || !gpu.pointValid[b] || gpu.pointNanoseconds[b] < gpu.pointNanoseconds[a])
+                        return 0.0;
+                    return static_cast<double>(gpu.pointNanoseconds[b] - gpu.pointNanoseconds[a]) / 1.0e6;
+                };
+                perfLog.gpuFrame += span(P::FrameBegin, P::FrameEnd);
+                perfLog.gpuShadow += span(P::ShadowPassBegin, P::ShadowPassEnd);
+                perfLog.gpuReflection += span(P::WaterReflectionBegin, P::WaterReflectionEnd);
+                perfLog.gpuTerrain += span(P::TerrainMainBegin, P::TerrainMainEnd);
+                perfLog.gpuScene += span(P::SceneOtherBegin, P::SceneOtherEnd);
+                perfLog.gpuPost += span(P::SceneOtherEnd, P::RmlUiBegin);
+                perfLog.gpuUi += span(P::RmlUiBegin, P::RmlUiEnd) + span(P::ImGuiBegin, P::ImGuiEnd);
+                ++perfLog.gpuSamples;
+            }
+            if ((++perfLog.frameCounter % 64u) == 0u)
+                rhiDevice->RequestGpuFrameCapture();
+
+            const double windowSeconds = std::chrono::duration<double>(perfNow - perfLog.windowStart).count();
+            if (windowSeconds >= perfLog.intervalSeconds && perfLog.frames > 1)
+            {
+                const double n = static_cast<double>(perfLog.frames);
+                const double presented =
+                    static_cast<double>(rhiDevice->GetPresentedFrameCount() - perfLog.presentedAtWindowStart);
+                std::size_t aliveParticles = 0;
+                for (const auto& [particleEntityId, simulator] : entityParticles)
+                {
+                    (void)particleEntityId;
+                    aliveParticles += simulator.AliveCount();
+                }
+                Tracenf("[PERF] loop %.0f fps, presented %.0f fps | cpu ms: frame %.3f (max %.3f) wait %.3f "
+                        "sim %.3f (physics %.3f scripts %.3f particles %.3f) anim %.3f render %.3f (shadow %.3f) "
+                        "ui %.3f submit %.3f | scene: %zu meshes, %.0f skinned, %zu cpu emitters, %zu particles",
+                    n / windowSeconds, presented / windowSeconds, sum.totalCpuFrameMs / n, perfLog.maxFrameMs,
+                    sum.frameWaitMs / n, sum.simulationMs / n, sum.physicsMs / n, sum.scriptsMs / n,
+                    sum.particlesMs / n, sum.animationMs / n, sum.sceneRenderMs / n, sum.shadowPassMs / n,
+                    sum.editorUiRenderMs / n, sum.submitPresentMs / n, editorMeshEntities.size(),
+                    static_cast<double>(perfLog.skinnedSum) / n, entityParticles.size(), aliveParticles);
+                if (perfLog.gpuSamples > 0)
+                {
+                    const double g = static_cast<double>(perfLog.gpuSamples);
+                    Tracenf("[PERF] gpu ms (%u samples): frame %.3f shadow %.3f reflection %.3f terrain %.3f "
+                            "scene %.3f post %.3f ui %.3f",
+                        perfLog.gpuSamples, perfLog.gpuFrame / g, perfLog.gpuShadow / g, perfLog.gpuReflection / g,
+                        perfLog.gpuTerrain / g, perfLog.gpuScene / g, perfLog.gpuPost / g, perfLog.gpuUi / g);
+                }
+                const double interval = perfLog.intervalSeconds;
+                perfLog = PerfLogState{};
+                perfLog.intervalSeconds = interval;
+            }
+        }
 #if defined(IXTREEME_WITH_EDITOR)
         if (dumpFrameProfileRequested)
         {

@@ -215,11 +215,22 @@ void EditorImGui::RenderSceneViewDropTarget()
         ImGui::SetCursorScreenPos(imageMin);
         ImGui::Image(reinterpret_cast<ImTextureID>(sceneViewTextureId), imageSize);
         sceneViewItemDrawn = true;
+        ImDrawList* drawList = ImGui::GetWindowDrawList();
+        char sceneViewFpsText[96]{};
+        std::snprintf(sceneViewFpsText,
+            sizeof(sceneViewFpsText),
+            "Scene render: %.1f FPS  (%.2f ms)",
+            m_engineStats.sceneViewFps,
+            m_engineStats.sceneViewFrameMs);
+        const ImVec2 fpsTextSize = ImGui::CalcTextSize(sceneViewFpsText);
+        const ImVec2 fpsTextMin(imageMin.x + 8.0f, imageMin.y + 8.0f);
+        const ImVec2 fpsTextMax(fpsTextMin.x + fpsTextSize.x + 12.0f, fpsTextMin.y + fpsTextSize.y + 8.0f);
+        drawList->AddRectFilled(fpsTextMin, fpsTextMax, IM_COL32(10, 12, 18, 190), 4.0f);
+        drawList->AddText(ImVec2(fpsTextMin.x + 6.0f, fpsTextMin.y + 4.0f), IM_COL32(230, 240, 255, 255), sceneViewFpsText);
         if (!m_sceneViewSelectionOutline.empty() &&
             sceneViewWidth > 0 &&
             sceneViewHeight > 0)
         {
-            ImDrawList* drawList = ImGui::GetWindowDrawList();
             auto toScenePoint = [&](float x, float y) {
                 const float u = x / static_cast<float>(sceneViewWidth);
                 const float v = y / static_cast<float>(sceneViewHeight);
@@ -537,6 +548,39 @@ void EditorImGui::RenderGameViewPanel()
     {
         ImGui::SetCursorScreenPos(imageMin);
         ImGui::Image(reinterpret_cast<ImTextureID>(gameViewTextureId), imageSize);
+        ImDrawList* drawList = ImGui::GetWindowDrawList();
+        char gpuText[32]{};
+        if (m_engineStats.gpuUsageAvailable)
+            std::snprintf(gpuText, sizeof(gpuText), "%.1f%%", m_engineStats.gpuUsagePercent);
+        else
+            std::snprintf(gpuText, sizeof(gpuText), "n/a");
+        char gameStatsText[256]{};
+        std::snprintf(gameStatsText,
+            sizeof(gameStatsText),
+            "FPS %.1f | CPU %.1f%% | GPU %s | RAM %.1f%% (%.0f MB)",
+            m_engineStats.gameViewFps,
+            m_engineStats.processCpuPercent,
+            gpuText,
+            m_engineStats.ramUsagePercent,
+            m_engineStats.processRamMb);
+        char rendererText[256]{};
+        std::snprintf(rendererText,
+            sizeof(rendererText),
+            "Renderer: %s",
+            m_engineStats.renderer.empty() ? "unknown" : m_engineStats.renderer.c_str());
+        const ImVec2 statsLineSize = ImGui::CalcTextSize(gameStatsText);
+        const ImVec2 rendererLineSize = ImGui::CalcTextSize(rendererText);
+        const float lineHeight = ImGui::GetTextLineHeight();
+        const ImVec2 statsTextMin(imageMin.x + 8.0f, imageMin.y + 8.0f);
+        const float statsWidth = std::max(statsLineSize.x, rendererLineSize.x) + 12.0f;
+        const ImVec2 statsTextMax(statsTextMin.x + statsWidth, statsTextMin.y + lineHeight * 2.0f + 10.0f);
+        drawList->AddRectFilled(statsTextMin, statsTextMax, IM_COL32(10, 12, 18, 190), 4.0f);
+        drawList->AddText(ImVec2(statsTextMin.x + 6.0f, statsTextMin.y + 4.0f),
+            IM_COL32(230, 240, 255, 255),
+            gameStatsText);
+        drawList->AddText(ImVec2(statsTextMin.x + 6.0f, statsTextMin.y + 4.0f + lineHeight),
+            IM_COL32(205, 220, 235, 255),
+            rendererText);
     }
     else if (avail.x > 1.0f && avail.y > 1.0f)
     {
@@ -986,4 +1030,3 @@ void EditorImGui::OpenProjectFromDialog(const std::filesystem::path& manifestPat
     ActivateCurrentProject();
     ImGui::CloseCurrentPopup();
 }
-

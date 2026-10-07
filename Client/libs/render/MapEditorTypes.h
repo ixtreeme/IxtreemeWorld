@@ -785,12 +785,22 @@ struct CameraEditorState
 struct EngineStats
 {
     double fps = 0.0;
+    double gameViewFps = 0.0;
+    // Actual Scene View offscreen render cadence. This excludes frames where the
+    // panel reuses a cached image or is hidden behind another dock tab.
+    double sceneViewFps = 0.0;
+    double sceneViewFrameMs = 0.0;
     double frameMs = 0.0;
     double averageFrameMs = 0.0;
     double minFrameMs = 0.0;
     double maxFrameMs = 0.0;
     double frameBudgetPercent = 0.0;
     double processCpuPercent = 0.0;
+    double gpuUsagePercent = -1.0;
+    bool gpuUsageAvailable = false;
+    double ramUsagePercent = 0.0;
+    double processRamMb = 0.0;
+    std::string renderer;
     std::uint32_t swapchainWidth = 0;
     std::uint32_t swapchainHeight = 0;
     std::uint32_t renderWidth = 0;
