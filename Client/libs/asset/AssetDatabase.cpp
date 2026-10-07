@@ -400,15 +400,18 @@ std::string WithDependenciesField(std::string text, const std::vector<Guid>& dep
 
 std::string Guid::toString() const
 {
-    std::ostringstream out;
-    out << std::hex << std::setfill('0') << std::nouppercase;
+    // Lowercase hex, 8-4-4-4-12, formatted by hand: renderers look textures up by GUID every frame.
+    static constexpr char kHex[] = "0123456789abcdef";
+    std::string out;
+    out.reserve(36);
     for (size_t i = 0; i < bytes.size(); ++i)
     {
         if (i == 4 || i == 6 || i == 8 || i == 10)
-            out << '-';
-        out << std::setw(2) << static_cast<int>(bytes[i]);
+            out.push_back('-');
+        out.push_back(kHex[bytes[i] >> 4]);
+        out.push_back(kHex[bytes[i] & 0x0f]);
     }
-    return out.str();
+    return out;
 }
 
 std::optional<Guid> Guid::fromString(const std::string& value)

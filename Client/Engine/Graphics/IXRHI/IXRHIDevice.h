@@ -144,6 +144,8 @@ public:
     virtual void RequestGpuFrameCapture() = 0;
     virtual bool TryReadTimestamps(IXRHITimestampResults& gpu,
                                    IXRHICpuFrameTiming& cpu) = 0;
+    // ---- Occlusion queries (see IXRHIOcclusionQueries); null when unsupported.
+    virtual std::unique_ptr<IXRHIOcclusionQueries> CreateOcclusionQueries(std::uint32_t count) = 0;
 
     virtual const IXRHICapabilities& GetCapabilities() const = 0;
 };

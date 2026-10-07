@@ -31,6 +31,7 @@
 #include "IXRHIRenderTarget.h"
 #include "IXRHITexture.h"
 
+#include <array>
 #include <cstdint>
 #include <memory>
 #include <string>
@@ -76,6 +77,11 @@ public:
     // Depth-only variant for consumers that need just the scene depth (soft particles): skips the
     // full-resolution color copy the water refraction needs.
     void SnapshotDepth(ixrhi::IXRHICommandList& cmd, const ixrhi::IXRHIFrameInfo& frame);
+    // The scene depth itself, made shader-readable, for reads after the scene pass (the god rays): no
+    // copy. Null when the pass discarded it (or is still open). It becomes an attachment again when the
+    // next pass begins; whatever reads it while a pass draws into it needs a snapshot instead.
+    std::shared_ptr<ixrhi::IXRHITexture> ReadableDepth(ixrhi::IXRHICommandList& cmd,
+                                                       const ixrhi::IXRHIFrameInfo& frame);
     // Tone-maps the finished scene into the display image and leaves its pass open for overlays.
     void BeginDisplayPass(ixrhi::IXRHICommandList& cmd,
                           const ixrhi::IXRHIFrameInfo& frame,
@@ -87,6 +93,14 @@ public:
     void RenderComposite(ixrhi::IXRHICommandList& cmd,
                          const ixrhi::IXRHIFrameInfo& frame,
                          const ToneMapSettings& toneMap);
+    // Light added to the scene by this frame's tone-map draw, before exposure and the curve: up to two
+    // images over the whole view (any size: sampled bilinear), each with a weight. The god rays come in
+    // this way instead of in an additive pass of their own over the scene image. Forgotten when the
+    // next frame's scene pass begins (cleared).
+    void SetAddedLight(const std::shared_ptr<ixrhi::IXRHITexture>& first,
+                       float firstWeight,
+                       const std::shared_ptr<ixrhi::IXRHITexture>& second,
+                       float secondWeight);
     void Destroy();
 
     bool IsReady() const { return m_ready; }
@@ -113,8 +127,12 @@ private:
     bool CreateTargets(ixrhi::IXRHIDevice& rhi);
     bool CreateComposite(ixrhi::IXRHIDevice& rhi);
     void DrawToneMap(ixrhi::IXRHICommandList& cmd,
+                     const ixrhi::IXRHIFrameInfo& frame,
                      const ixrhi::IXRHIGraphicsPipeline& pipeline,
                      const ToneMapSettings& toneMap);
+
+    // The tone-map sets, one per frame in flight (their added-light images change between frames).
+    static constexpr std::uint32_t kToneMapSets = 2;
 
     ixrhi::IXRHIDevice* m_rhi = nullptr;
     client::asset::IAssetReader* m_assets = nullptr;
@@ -147,6 +165,11 @@ private:
     std::unique_ptr<ixrhi::IXRHIBindGroup> m_bindGroup;
     std::unique_ptr<ixrhi::IXRHIGraphicsPipeline> m_compositePipeline;  // into the swapchain pass
     std::unique_ptr<ixrhi::IXRHIGraphicsPipeline> m_displayPipeline;    // into the display image
+    // SetAddedLight's images and weights for this frame's tone-map draw, and what each set binds
+    // (bindings 1 and 2; the scene color stands in where no image is added, weighed 0).
+    std::array<std::shared_ptr<ixrhi::IXRHITexture>, 2> m_addedLight{};
+    std::array<float, 2> m_addedLightWeight{};
+    std::array<std::array<std::shared_ptr<ixrhi::IXRHITexture>, 2>, kToneMapSets> m_boundAddedLight{};
 
     // Tracked producing-use states (see header contract).
     ixrhi::IXRHIImageLayout m_colorState = ixrhi::IXRHIImageLayout::Undefined;

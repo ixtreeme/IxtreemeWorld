@@ -424,7 +424,7 @@ std::shared_ptr<ixrhi::IXRHITexture> IXVulkanDevice::CreateTexture(
         __FILE__,
         __LINE__);
 
-    return std::make_shared<IXVulkanTexture>(*this,
+    auto texture = std::make_shared<IXVulkanTexture>(*this,
         image,
         memory,
         imageView,
@@ -434,6 +434,22 @@ std::shared_ptr<ixrhi::IXRHITexture> IXVulkanDevice::CreateTexture(
         desc.arrayLayers,
         desc.format,
         desc.debugName);
+    // A depth+stencil attachment that is sampled too (the scene depth, read after its pass) is sampled
+    // through a depth-only view of its own.
+    const bool sampled = (static_cast<std::uint32_t>(desc.usage) &
+        static_cast<std::uint32_t>(ixrhi::IXRHITextureUsage::Sampled)) != 0;
+    if (depthAttachment && sampled && view.subresourceRange.aspectMask != VK_IMAGE_ASPECT_DEPTH_BIT)
+    {
+        VkImageViewCreateInfo depthOnly = view;
+        depthOnly.subresourceRange.aspectMask = VK_IMAGE_ASPECT_DEPTH_BIT;
+        VkImageView sampledView = VK_NULL_HANDLE;
+        CheckVk(vkCreateImageView(NativeDevice(), &depthOnly, nullptr, &sampledView),
+            "vkCreateImageView(depth-only)",
+            __FILE__,
+            __LINE__);
+        texture->SetSampledView(sampledView);
+    }
+    return texture;
 }
 
 bool IXVulkanDevice::UpdateTexture(ixrhi::IXRHITexture& texture, const void* data, std::size_t byteCount)

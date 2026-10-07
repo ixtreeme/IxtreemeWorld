@@ -5,12 +5,18 @@
 
 [[vk::combinedImageSampler]] [[vk::binding(0, 0)]] Texture2D u_sceneColor : register(t0);
 [[vk::combinedImageSampler]] [[vk::binding(0, 0)]] SamplerState u_sceneSampler : register(s0);
+// Light added to the scene before exposure (OffscreenSceneRenderer::SetAddedLight: the god rays),
+// each image weighed by addedLightWeight (0 where none is added).
+[[vk::combinedImageSampler]] [[vk::binding(1, 0)]] Texture2D u_addedLight0 : register(t1);
+[[vk::combinedImageSampler]] [[vk::binding(1, 0)]] SamplerState u_addedLight0Sampler : register(s1);
+[[vk::combinedImageSampler]] [[vk::binding(2, 0)]] Texture2D u_addedLight1 : register(t2);
+[[vk::combinedImageSampler]] [[vk::binding(2, 0)]] SamplerState u_addedLight1Sampler : register(s2);
 
 struct ToneMapParams
 {
     float exposure;  // light multiplier before the curve
     int mode;        // 0 none (clipped at white), 1 neutral, 2 filmic
-    float2 padding;
+    float2 addedLightWeight;
 };
 [[vk::push_constant]] ToneMapParams u_toneMap;
 
@@ -55,6 +61,10 @@ float3 FilmicToneMap(float3 x)
 float4 PSMain(VSOutput input) : SV_Target0
 {
     float3 color = u_sceneColor.Sample(u_sceneSampler, input.uv).rgb;
+    if (u_toneMap.addedLightWeight.x != 0.0)
+        color += u_addedLight0.SampleLevel(u_addedLight0Sampler, input.uv, 0.0).rgb * u_toneMap.addedLightWeight.x;
+    if (u_toneMap.addedLightWeight.y != 0.0)
+        color += u_addedLight1.SampleLevel(u_addedLight1Sampler, input.uv, 0.0).rgb * u_toneMap.addedLightWeight.y;
     // A floating-point target keeps what an 8-bit one clipped: NaN, infinity, negative light.
     if (any(isnan(color)))
         color = 0.0.xxx;

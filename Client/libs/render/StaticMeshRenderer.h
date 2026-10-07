@@ -316,7 +316,7 @@ private:
         MaterialTexture normal;
         MaterialTexture orm;
         std::string resolvedMaterial = "gltf_baked";
-        std::string baseColorTextureGuid = "EMPTY";
+        std::optional<Guid> baseColorTextureGuid;  // the material's base colour texture (diagnostics)
         std::string alphaMode = "OPAQUE";
         float alphaCutoff = 0.5f;
         const char* fragmentShaderAlphaPath = "none";
@@ -332,7 +332,7 @@ private:
         std::string normalTexture;
         std::string ormTexture;
         std::string resolvedMaterial = "gltf_baked";
-        std::string baseColorTextureGuid = "EMPTY";
+        std::optional<Guid> baseColorTextureGuid;  // the material's base colour texture (diagnostics)
         std::string alphaMode = "OPAQUE";
         float alphaCutoff = 0.5f;
         const char* fragmentShaderAlphaPath = "none";
@@ -400,8 +400,23 @@ private:
     Texture m_texture;
     Texture m_normalTexture;
     Texture m_ormTexture;
-    std::unordered_map<std::string, Texture> m_materialTextureCache;
-    std::unordered_set<std::string> m_failedMaterialTextureKeys;
+    // Material textures by (role, texture GUID). Looked up for every draw of every pass, so the key
+    // builds no strings.
+    struct MaterialTextureKey
+    {
+        std::uint8_t role = 0;  // see MaterialTextureRoleIndex
+        Guid guid;
+        bool operator==(const MaterialTextureKey& other) const { return role == other.role && guid == other.guid; }
+    };
+    struct MaterialTextureKeyHash
+    {
+        std::size_t operator()(const MaterialTextureKey& key) const noexcept
+        {
+            return std::hash<Guid>{}(key.guid) ^ (static_cast<std::size_t>(key.role) * 0x9e3779b97f4a7c15ull);
+        }
+    };
+    std::unordered_map<MaterialTextureKey, Texture, MaterialTextureKeyHash> m_materialTextureCache;
+    std::unordered_set<MaterialTextureKey, MaterialTextureKeyHash> m_failedMaterialTextureKeys;
     std::vector<LastMaterialBinding> m_lastMaterialBindings;
     std::unique_ptr<ixrhi::IXRHIBindGroupLayout> m_bindLayout;
     std::unique_ptr<ixrhi::IXRHIBindGroup> m_bindGroup;

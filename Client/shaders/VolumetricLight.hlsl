@@ -3,7 +3,7 @@
 // Volumetric light: the sunlight the air scatters towards the camera along each view ray. The sun
 // shadow cascades decide which parts of the ray the sun reaches, so shadowed air stays dark and lit
 // air between the shadows shows as shafts — seen from the side too, wherever the sun is. Rendered at
-// half size; a per-pixel offset of the march steps turns banding into fine noise that the blur pass
+// quarter size; a per-pixel offset of the march steps turns banding into fine noise that the blur pass
 // (GodRays.hlsl VolBlurPS) removes. The vertex stage is GodRays.hlsl VSMain (same interface).
 
 [[vk::combinedImageSampler]] [[vk::binding(0, 0)]] Texture2D u_depth : register(t0);
@@ -96,15 +96,65 @@ float4 MarchPS(VSOutput input) : SV_Target
         lightSpace[cascade] = CascadeLightSpace(camera + dir * t0, cascade);
         lightSpaceStep[cascade] = CascadeLightSpace(camera + dir * (t0 + stepLength), cascade) - lightSpace[cascade];
     }
+    // The last step (from 0) at which the march is still inside each cascade's box, and whether it
+    // starts inside all of them.
+    bool startsInsideAll = true;
+    int lastInside[4];
+    [unroll]
+    for (int box = 0; box < 4; ++box)
+    {
+        const float3 a = lightSpace[box];
+        const float3 b = lightSpaceStep[box];
+        startsInsideAll = startsInsideAll && all(a > 0.0) && all(a < 1.0);
+        // Steps until each coordinate reaches the edge (0 or 1) it moves towards.
+        const float3 towardsOne = step(0.0, b);
+        const float3 exitAt = lerp(a, 1.0 - a, towardsOne) / max(abs(b), 1e-12);
+        lastInside[box] = (int)ceil(min(min(min(exitAt.x, exitAt.y), exitAt.z), 4096.0)) - 1;
+    }
     float transmittance = 1.0;
     float lit = 0.0;
-    for (int i = 0; i < steps; ++i)
+    if (startsInsideAll)
     {
-        lit += SunVisibility(lightSpace) * transmittance;
-        transmittance *= stepTransmittance;
+        // The usual case: the march starts inside every box (the cascades are centred on the eye that
+        // drives them). A ray leaves a convex box once and for all, so the finest cascade holding a
+        // step only grows along the ray: each cascade takes the stretch up to where the ray leaves it,
+        // with no per-step search.
+        int cursor = 0;
         [unroll]
         for (int c = 0; c < 4; ++c)
-            lightSpace[c] += lightSpaceStep[c];
+        {
+            const int end = min(lastInside[c] + 1, steps);
+            float3 p = lightSpace[c] + lightSpaceStep[c] * (float)cursor;
+            for (int i = cursor; i < end; ++i)
+            {
+                lit += u_shadow.SampleCmpLevelZero(u_shadowSampler, float3(p.xy, (float)c), p.z - u_push.params.y) *
+                    transmittance;
+                transmittance *= stepTransmittance;
+                p += lightSpaceStep[c];
+            }
+            cursor = max(cursor, end);
+        }
+        // Past the last cascade there is no shadow information: the air there is lit. Those steps add
+        // up to a geometric series.
+        const int rest = steps - cursor;
+        if (rest > 0)
+        {
+            const float oneMinus = 1.0 - stepTransmittance;
+            lit += transmittance * (oneMinus > 1e-5 ? (1.0 - pow(stepTransmittance, (float)rest)) / oneMinus : (float)rest);
+        }
+    }
+    else
+    {
+        // A camera other than the one the cascades follow (the editor Game view while the Scene view
+        // drives them): the finest cascade holding each step, step by step.
+        for (int i = 0; i < steps; ++i)
+        {
+            lit += SunVisibility(lightSpace) * transmittance;
+            transmittance *= stepTransmittance;
+            [unroll]
+            for (int c = 0; c < 4; ++c)
+                lightSpace[c] += lightSpaceStep[c];
+        }
     }
     // Each lit step scatters (1 - its transmittance) of the sunlight towards the camera. The 0.25 keeps
     // the haze under the brightness of the lit scene (the image is not HDR).

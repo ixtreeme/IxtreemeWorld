@@ -495,6 +495,20 @@ std::unique_ptr<ixrhi::IXRHIFence> IXVulkanDevice::CreateFence(bool signaled)
     return std::make_unique<IXVulkanFence>(*this, fence);
 }
 
+std::unique_ptr<ixrhi::IXRHIOcclusionQueries> IXVulkanDevice::CreateOcclusionQueries(std::uint32_t count)
+{
+    if (count == 0)
+        return nullptr;
+    VkQueryPoolCreateInfo create{};
+    create.sType = VK_STRUCTURE_TYPE_QUERY_POOL_CREATE_INFO;
+    create.queryType = VK_QUERY_TYPE_OCCLUSION;
+    create.queryCount = count;
+    VkQueryPool pool = VK_NULL_HANDLE;
+    if (vkCreateQueryPool(NativeDevice(), &create, nullptr, &pool) != VK_SUCCESS)
+        return nullptr;
+    return std::make_unique<IXVulkanOcclusionQueries>(*this, pool, count);
+}
+
 std::unique_ptr<ixrhi::IXRHISemaphore> IXVulkanDevice::CreateSemaphore()
 {
     VkSemaphoreCreateInfo create{};

@@ -3,7 +3,7 @@
 // God rays — screen-space light shafts (GPU Gems 3, "Volumetric Light Scattering as a Post-Process"):
 //   MaskPS      the sun and its halo where the sky shows (depth at the far plane), black elsewhere;
 //   BlurPS      a radial blur of the mask towards the sun's screen position, fading along the ray;
-//   CompositePS the result added over the scene image.
+// The blurred result is added to the scene by its tone-map pass (Composite.hlsl).
 // Each pass reads one texture (binding 0) and takes all its parameters from the push constants.
 
 [[vk::combinedImageSampler]] [[vk::binding(0, 0)]] Texture2D u_source : register(t0);
@@ -95,7 +95,3 @@ float4 VolBlurPS(VSOutput input) : SV_Target
     return float4(sum / 25.0, 1.0);
 }
 
-float4 CompositePS(VSOutput input) : SV_Target
-{
-    return float4(u_source.SampleLevel(u_sourceSampler, input.uv, 0.0).rgb * u_push.composite.x, 0.0);
-}

@@ -45,6 +45,8 @@ struct IXRHIBlendAttachment
     IXRHIBlendFactor srcAlpha = IXRHIBlendFactor::One;
     IXRHIBlendFactor dstAlpha = IXRHIBlendFactor::Zero;
     IXRHIBlendOp alphaOp = IXRHIBlendOp::Add;
+    // False: the attachment is left as it is (a draw only for the depth test, e.g. an occlusion query).
+    bool writeColor = true;
 };
 
 struct IXRHIPushRange

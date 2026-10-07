@@ -135,6 +135,15 @@ public:
                                   std::uint32_t height);
     // Whether any enabled water body is inside the camera's view (its water pass would draw).
     bool AnyWaterBodyInView(const WorldCamera& camera) const;
+    // Whether the Scene view's water is seen past the opaque scene, by an occlusion query of the
+    // water surface (depth test only) drawn every frame it is in view. Results come a frame slot
+    // later, so the water comes back two frames after it shows from behind something (and is kept
+    // for a few frames after it is last seen). Per frame: BeginWaterVisibility outside any pass before
+    // the scene pass, then QueryWaterVisibility inside it once the opaque scene is drawn.
+    void BeginWaterVisibility(ixrhi::IXRHICommandList& cmd, const ixrhi::IXRHIFrameInfo& frame);
+    void QueryWaterVisibility(ixrhi::IXRHICommandList& cmd, const ixrhi::IXRHIFrameInfo& frame,
+                              const WorldCamera& camera, std::uint32_t viewWidth, std::uint32_t viewHeight);
+    bool WaterMayBeVisible(std::uint64_t frameNumber) const;
     // Whether a world box lies wholly under the surface of a water body it is over (by the body's
     // extent): a transparent thing there is drawn before the water, which then refracts it.
     bool BoxUnderWater(WorldVec3 boundsMin, WorldVec3 boundsMax) const;
@@ -563,6 +572,13 @@ private:
     std::unique_ptr<ixrhi::IXRHIBindGroupLayout> m_waterBindLayout;
     std::unique_ptr<ixrhi::IXRHIBindGroup> m_waterBindGroup;
     std::unique_ptr<ixrhi::IXRHIGraphicsPipeline> m_waterPipeline;
+    // The water visibility query (see WaterMayBeVisible): the surface drawn for the depth test only,
+    // one query per frame slot, and the last frame it was seen.
+    std::unique_ptr<ixrhi::IXRHIGraphicsPipeline> m_waterOcclusionPipeline;
+    std::unique_ptr<ixrhi::IXRHIOcclusionQueries> m_waterQueries;
+    std::array<bool, kFramesInFlight> m_waterQueryIssued{};
+    std::uint64_t m_waterSeenFrame = 0;
+    bool m_waterSeen = false;  // m_waterSeenFrame holds a frame
     // Refraction inputs are IXRHI-owned (shared lifetime: recreating the
     // offscreen target cannot dangle these). Native handles resolve locally
     // at descriptor-write time (backend bridge, transition-only).

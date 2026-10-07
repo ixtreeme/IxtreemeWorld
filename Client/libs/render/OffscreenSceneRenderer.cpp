@@ -102,11 +102,23 @@ void OffscreenSceneRenderer::BeginMainPass(ixrhi::IXRHICommandList& cmd,
         return;
 
     if (clear)
+    {
+        // A new frame's scene: the light added to the last one (SetAddedLight) no longer applies.
+        m_addedLight = {};
+        m_addedLightWeight = {};
+    }
+    if (clear)
         m_activeTarget = storeDepth ? m_clearTarget.get() : m_clearTargetNoDepthStore.get();
     else
         m_activeTarget = storeDepth ? m_loadTarget.get() : m_loadTargetNoDepthStore.get();
     if (!m_activeTarget)
         return;
+    // Read after the last pass (ReadableDepth): an attachment again.
+    if (m_depthState == ixrhi::IXRHIImageLayout::ShaderReadOnly)
+    {
+        cmd.TransitionTexture(*m_depth, m_depthState, ixrhi::IXRHIImageLayout::DepthStencilAttachment);
+        m_depthState = ixrhi::IXRHIImageLayout::DepthStencilAttachment;
+    }
     m_activeTargetStoresDepth = storeDepth;
     m_activeTarget->Begin(cmd);
     m_passActive = true;
@@ -181,6 +193,19 @@ void OffscreenSceneRenderer::SnapshotDepth(ixrhi::IXRHICommandList& cmd,
     m_snapshotsReady = true;
 }
 
+std::shared_ptr<ixrhi::IXRHITexture> OffscreenSceneRenderer::ReadableDepth(ixrhi::IXRHICommandList& cmd,
+                                                                           const ixrhi::IXRHIFrameInfo& frame)
+{
+    if (!m_ready || !frame.frameActive || m_passActive || !m_depth || !m_depthStoreValid)
+        return nullptr;
+    if (m_depthState != ixrhi::IXRHIImageLayout::ShaderReadOnly)
+    {
+        cmd.TransitionTexture(*m_depth, m_depthState, ixrhi::IXRHIImageLayout::ShaderReadOnly);
+        m_depthState = ixrhi::IXRHIImageLayout::ShaderReadOnly;
+    }
+    return m_depth;
+}
+
 void OffscreenSceneRenderer::BeginDisplayPass(ixrhi::IXRHICommandList& cmd,
                                               const ixrhi::IXRHIFrameInfo& frame,
                                               const ToneMapSettings& toneMap)
@@ -191,7 +216,7 @@ void OffscreenSceneRenderer::BeginDisplayPass(ixrhi::IXRHICommandList& cmd,
     // The scene's color is shader-readable here: EndMainPass leaves it so (the pass's final layout).
     m_displayTarget->Begin(cmd);
     m_displayPassActive = true;
-    DrawToneMap(cmd, *m_displayPipeline, toneMap);
+    DrawToneMap(cmd, frame, *m_displayPipeline, toneMap);
 }
 
 void OffscreenSceneRenderer::EndDisplayPass(ixrhi::IXRHICommandList& cmd)
@@ -218,22 +243,44 @@ void OffscreenSceneRenderer::RenderComposite(ixrhi::IXRHICommandList& cmd,
 {
     if (!m_ready || !frame.frameActive || !m_compositePipeline || !m_bindGroup)
         return;
-    DrawToneMap(cmd, *m_compositePipeline, toneMap);
+    DrawToneMap(cmd, frame, *m_compositePipeline, toneMap);
+}
+
+void OffscreenSceneRenderer::SetAddedLight(const std::shared_ptr<ixrhi::IXRHITexture>& first,
+                                           float firstWeight,
+                                           const std::shared_ptr<ixrhi::IXRHITexture>& second,
+                                           float secondWeight)
+{
+    m_addedLight = {first, second};
+    m_addedLightWeight = {first ? firstWeight : 0.0f, second ? secondWeight : 0.0f};
 }
 
 void OffscreenSceneRenderer::DrawToneMap(ixrhi::IXRHICommandList& cmd,
+                                         const ixrhi::IXRHIFrameInfo& frame,
                                          const ixrhi::IXRHIGraphicsPipeline& pipeline,
                                          const ToneMapSettings& toneMap)
 {
+    // This frame slot's set: the GPU is done with it (its frame's fence was waited for). An image
+    // not added this frame is bound as the scene color, weighed 0.
+    const std::uint32_t set = frame.frameIndex % kToneMapSets;
+    for (std::uint32_t i = 0; i < 2; ++i)
+    {
+        const std::shared_ptr<ixrhi::IXRHITexture>& image = m_addedLight[i] ? m_addedLight[i] : m_color;
+        if (m_boundAddedLight[set][i] != image)
+        {
+            m_bindGroup->UpdateTexture(set, 1 + i, image, m_sampler);
+            m_boundAddedLight[set][i] = image;  // held: a freed image's address could come back
+        }
+    }
     // Composite.hlsl ToneMapParams.
     struct
     {
         float exposure;
         std::int32_t mode;
-        float padding[2];
-    } params{toneMap.exposure, toneMap.mode, {0.0f, 0.0f}};
+        float addedLightWeight[2];
+    } params{toneMap.exposure, toneMap.mode, {m_addedLightWeight[0], m_addedLightWeight[1]}};
     cmd.SetGraphicsPipeline(pipeline);
-    cmd.BindGroup(0, *m_bindGroup, 0);
+    cmd.BindGroup(0, *m_bindGroup, set);
     cmd.PushConstants(&params, sizeof(params));
     cmd.Draw(3, 1, 0, 0);
 }
@@ -245,6 +292,9 @@ void OffscreenSceneRenderer::Destroy()
 
     m_compositePipeline.reset();
     m_displayPipeline.reset();
+    m_addedLight = {};
+    m_addedLightWeight = {};
+    m_boundAddedLight = {};
     m_bindGroup.reset();
     m_bindLayout.reset();
     m_compositeVs.reset();
@@ -408,16 +458,24 @@ bool OffscreenSceneRenderer::CreateComposite(ixrhi::IXRHIDevice& rhi)
     if (!m_compositeVs || !m_compositePs)
         return false;
 
+    // 0: the scene color; 1, 2: the light added to it (SetAddedLight), the scene color until then.
     const std::vector<ixrhi::IXRHIBinding> bindings = {
         {0, ixrhi::IXRHIBindingType::SampledTexture, ixrhi::IXRHIShaderStage::Fragment},
+        {1, ixrhi::IXRHIBindingType::SampledTexture, ixrhi::IXRHIShaderStage::Fragment},
+        {2, ixrhi::IXRHIBindingType::SampledTexture, ixrhi::IXRHIShaderStage::Fragment},
     };
     m_bindLayout = rhi.CreateBindGroupLayout(bindings);
     if (!m_bindLayout)
         return false;
-    m_bindGroup = rhi.CreateBindGroup(*m_bindLayout, 1);
+    m_bindGroup = rhi.CreateBindGroup(*m_bindLayout, kToneMapSets);
     if (!m_bindGroup)
         return false;
-    m_bindGroup->UpdateTexture(0, 0, m_color, m_sampler);
+    for (std::uint32_t set = 0; set < kToneMapSets; ++set)
+    {
+        for (std::uint32_t binding = 0; binding < 3; ++binding)
+            m_bindGroup->UpdateTexture(set, binding, m_color, m_sampler);
+        m_boundAddedLight[set] = {m_color, m_color};
+    }
 
     ixrhi::IXRHIGraphicsPipelineDesc desc;
     desc.vertexShader = m_compositeVs;

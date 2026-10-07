@@ -241,9 +241,9 @@ bool ParticleRenderer::CreateBindGroup(ixrhi::IXRHIDevice& rhi)
                 sizeof(InstanceData) * kMaxInstances);
             if (m_dummyDepth && m_defaultTexture.sampler)
                 m_bindGroup->UpdateTexture(setIndex, 3, m_dummyDepth, m_defaultTexture.sampler);
+            m_boundDepth[setIndex] = m_dummyDepth;
         }
     }
-    m_boundDepth = m_dummyDepth.get();
     return true;
 }
 
@@ -252,25 +252,18 @@ void ParticleRenderer::SetSceneDepth(std::shared_ptr<ixrhi::IXRHITexture> depth,
                                      float nearPlane,
                                      float farPlane)
 {
+    // Bound per draw (DrawBatch), into the set of the frame being recorded: rewriting every slot here
+    // touched the sets the frames in flight still used.
     m_sceneNear = nearPlane > 0.0f ? nearPlane : 0.1f;
     m_sceneFar = farPlane > m_sceneNear ? farPlane : m_sceneNear + 1.0f;
     if (!depth || !sampler)
     {
-        if (m_boundDepth != m_dummyDepth.get() && m_bindGroup && m_dummyDepth && m_defaultTexture.sampler)
-        {
-            for (std::uint32_t slot = 0; slot < kFramesInFlight * kDrawSlots; ++slot)
-                m_bindGroup->UpdateTexture(slot, 3, m_dummyDepth, m_defaultTexture.sampler);
-            m_boundDepth = m_dummyDepth.get();
-        }
+        m_sceneDepth.reset();
+        m_sceneDepthSampler.reset();
         return;
     }
     m_sceneDepth = std::move(depth);
     m_sceneDepthSampler = std::move(sampler);
-    if (!m_bindGroup || m_boundDepth == m_sceneDepth.get())
-        return;
-    for (std::uint32_t slot = 0; slot < kFramesInFlight * kDrawSlots; ++slot)
-        m_bindGroup->UpdateTexture(slot, 3, m_sceneDepth, m_sceneDepthSampler);
-    m_boundDepth = m_sceneDepth.get();
 }
 
 bool ParticleRenderer::RecreatePipeline(ixrhi::IXRHIDevice& rhi)
@@ -522,6 +515,15 @@ void ParticleRenderer::RenderInWorld(ixrhi::IXRHICommandList& cmd,
     else
         m_bindGroup->UpdateBuffer(bindSlot, 2, m_instanceBuffers[frameIndex], 0,
             sizeof(InstanceData) * kMaxInstances);
+    // The depth the soft fade reads (SetSceneDepth; the dummy one until there is one).
+    const bool haveSceneDepth = m_sceneDepth && m_sceneDepthSampler;
+    const std::shared_ptr<ixrhi::IXRHITexture>& depthImage = haveSceneDepth ? m_sceneDepth : m_dummyDepth;
+    if (depthImage && m_boundDepth[bindSlot] != depthImage)
+    {
+        m_bindGroup->UpdateTexture(bindSlot, 3, depthImage,
+            haveSceneDepth ? m_sceneDepthSampler : m_defaultTexture.sampler);
+        m_boundDepth[bindSlot] = depthImage;  // held: a freed image's address could come back
+    }
 
     cmd.SetViewport(0.0f, 0.0f, static_cast<float>(width), static_cast<float>(height));
     cmd.SetScissor(0, 0, width, height);
@@ -809,7 +811,7 @@ void ParticleRenderer::Destroy()
     m_sceneDepth.reset();
     m_sceneDepthSampler.reset();
     m_dummyDepth.reset();
-    m_boundDepth = nullptr;
+    m_boundDepth = {};
     m_sceneNear = 0.1f;
     m_sceneFar = 1000.0f;
     m_vertexShader.reset();

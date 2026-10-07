@@ -108,7 +108,7 @@ void IXVulkanBindGroup::UpdateTexture(std::uint32_t setIndex,
     // Sampled depth too (terrain shadow map, scene-depth refraction input): see TransitionTexture.
     VkDescriptorImageInfo info{};
     info.sampler = nativeSampler->Native();
-    info.imageView = nativeTexture->NativeView();
+    info.imageView = nativeTexture->NativeSampledView();
     info.imageLayout = VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL;
     VkWriteDescriptorSet write{};
     write.sType = VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET;
@@ -133,7 +133,7 @@ void IXVulkanBindGroup::UpdateSampledImage(std::uint32_t setIndex,
     Keep(m_textures, texture);
 
     VkDescriptorImageInfo info{};
-    info.imageView = nativeTexture->NativeView();
+    info.imageView = nativeTexture->NativeSampledView();
     info.imageLayout = VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL;
     VkWriteDescriptorSet write{};
     write.sType = VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET;

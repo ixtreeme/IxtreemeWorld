@@ -2516,11 +2516,6 @@ int RunGame(NativeWindow& window,
             skyRenderer.SetTargetPass(offscreenScene.GetTargetPass());
             skyRenderer.RecreatePipeline(*rhiDevice);
         }
-        if (godRaysOk)
-        {
-            godRays.SetTargetPass(offscreenScene.GetTargetPass());
-            godRays.RecreatePipeline(*rhiDevice);
-        }
         if (particleRendererOk)
         {
             particleRenderer.SetTargetPass(offscreenScene.GetTargetPass());
@@ -2890,11 +2885,6 @@ int RunGame(NativeWindow& window,
         {
             skyRenderer.SetTargetPass(offscreenScene.GetTargetPass());
             skyRenderer.RecreatePipeline(*rhiDevice);
-        }
-        if (godRaysOk)
-        {
-            godRays.SetTargetPass(offscreenScene.GetTargetPass());
-            godRays.RecreatePipeline(*rhiDevice);
         }
 #if defined(IXTREEME_WITH_EDITOR)
         editorAdapter->SetSceneViewTexture(offscreenScene.GetDisplayTexture(),
@@ -5747,8 +5737,6 @@ int RunGame(NativeWindow& window,
                             selectionOutlines.SetTargetPass(offscreenScene.GetDisplayPass());
                         if (skyOk)
                             skyRenderer.SetTargetPass(offscreenScene.GetTargetPass());
-                        if (godRaysOk)
-                            godRays.SetTargetPass(offscreenScene.GetTargetPass());
                         if (particleRendererOk)
                             particleRenderer.SetTargetPass(offscreenScene.GetTargetPass());
 #if defined(IXTREEME_WITH_EDITOR)
@@ -5799,8 +5787,6 @@ int RunGame(NativeWindow& window,
                     selectionOutlines.RecreatePipeline(*rhiDevice);
                 if (skyOk)
                     skyRenderer.RecreatePipeline(*rhiDevice);
-                if (godRaysOk)
-                    godRays.RecreatePipeline(*rhiDevice);
                 if (worldLabelsOk)
                     worldLabels.RecreatePipeline(*rhiDevice);
                 if (particleRendererOk)
@@ -11763,8 +11749,17 @@ int RunGame(NativeWindow& window,
                     }
                     const bool skinnedHere = std::any_of(skinnedShadowCasters.begin(), skinnedShadowCasters.end(),
                         [&](const SkinnedDrawRecord* record) { return skinnedInCascade(*record, cascade); });
+                    // An animated caster changes the cascade every frame. The far cascades follow it every
+                    // 2nd / 4th frame: a pose a few frames old in a shadow that far away does not show, and
+                    // each cascade redraw is ~0.025 ms. (The camera moving still redraws them at once:
+                    // their matrices change.)
                     if (skinnedHere)
-                        hash(&frameInfo.frameNumber, sizeof(frameInfo.frameNumber));
+                    {
+                        const std::uint64_t period = cascade < 2 ? 1u : (cascade == 2 ? 2u : 4u);
+                        // (Cascade 3 offset by a frame: it redraws on an odd frame, cascade 2 on the even ones.)
+                        const std::uint64_t animationTick = (frameInfo.frameNumber + (cascade == 3 ? 1u : 0u)) / period;
+                        hash(&animationTick, sizeof(animationTick));
+                    }
                     castersRevisions[cascade] = revision;
                 }
                 const TerrainRenderer::ShadowCasterDraw drawMeshCasters =
@@ -11808,7 +11803,15 @@ int RunGame(NativeWindow& window,
                         entry.renderer->SetSunShadow(meshShadow);
                 }
             }
-            if (isInWorld && hasSceneTerrain && hasFrameCamera && !debugDisableWaterReflectionPass)
+            // The Scene view's water visibility query (see QueryWaterVisibility below): its slot is read
+            // back and reset here, outside any pass, before the reflection and the water decide on it.
+            const bool sceneWaterQuery = useOffscreenScene && drawSceneView && hasSceneTerrain && isInWorld;
+            if (sceneWaterQuery)
+                terrain.BeginWaterVisibility(*frameInfo.commandList, frameInfo);
+            // The reflection follows the camera the shadows do; a Scene view whose water is hidden
+            // behind the scene needs none.
+            if (isInWorld && hasSceneTerrain && hasFrameCamera && !debugDisableWaterReflectionPass &&
+                !(sceneWaterQuery && shadowCamera == &frameCamera && !terrain.WaterMayBeVisible(frameInfo.frameNumber)))
             {
                 rhiDevice->WriteTimestamp(ixrhi::IXRHITimestampPoint::WaterReflectionBegin);
                 // One reflection per frame, mirrored for the view actually drawn (as the shadow map):
@@ -11874,7 +11877,18 @@ int RunGame(NativeWindow& window,
             // A hidden Scene View draws nothing: skip its whole pass (full-res clear + tone map) —
             // the panel keeps showing its last image until it is shown again.
             if (useOffscreenScene && drawSceneView)
+            {
+                // The refraction inputs (this view's snapshots) are handed over before the water is
+                // bound this frame, not only in frames that draw it: its descriptor sets are rewritten
+                // when they change.
+                if (hasSceneTerrain && isInWorld)
+                    terrain.SetWaterRefractionInputs(offscreenScene.GetColorSnapshotTexture(),
+                        offscreenScene.GetDepthSnapshotTexture(),
+                        offscreenScene.GetSampler(),
+                        offscreenScene.Width(),
+                        offscreenScene.Height());
                 offscreenScene.BeginMainPass(*frameInfo.commandList, frameInfo);
+            }
             else if (!useOffscreenScene)
                 beginMainPass(); // direct mode renders straight into the swapchain pass
 
@@ -12436,8 +12450,15 @@ int RunGame(NativeWindow& window,
                 // only the pixels nothing covers are shaded.
                 if (skyOk)
                     skyRenderer.Render(*frameInfo.commandList, frameInfo, camera, renderSize.width, renderSize.height);
-                // The water is drawn in a pass of its own (over a snapshot of this one) when it is in view.
-                sceneWaterPass = useOffscreenScene && hasSceneTerrain && terrain.AnyWaterBodyInView(camera);
+                // The water is drawn in a pass of its own (over a snapshot of this one) when it is in view
+                // and not hidden behind the opaque scene: an occlusion query of its surface, against
+                // this pass's finished depth, answers for the frames to come (the snapshot alone is
+                // ~0.09 ms at 1510x832).
+                if (useOffscreenScene && hasSceneTerrain)
+                    terrain.QueryWaterVisibility(*frameInfo.commandList, frameInfo, camera, renderSize.width,
+                        renderSize.height);
+                sceneWaterPass = useOffscreenScene && hasSceneTerrain && terrain.AnyWaterBodyInView(camera) &&
+                    terrain.WaterMayBeVisible(frameInfo.frameNumber);
                 // Soft particles read the scene depth snapshot. Closing/reopening the main pass for
                 // them cost ~1 ms a frame, so the pass is only split for the water; the depth for the
                 // soft fade is copied at the END of the frame and used (one frame stale) next frame.
@@ -12690,24 +12711,23 @@ int RunGame(NativeWindow& window,
                         drawTransparents(sceneTransparentDraws, /*underWater=*/false, camera, renderSize.width, renderSize.height);
                         offscreenScene.EndMainPass(*frameInfo.commandList);
                     }
-                    // God rays over the finished scene (water included). They read the depth snapshot:
-                    // taken above for the water, or here when no water was drawn.
+                    // God rays over the finished scene (water included). They read the depth: the snapshot
+                    // taken above for the water, or else the depth itself (the pass is over: no copy).
                     if (godRaysOk && isInWorld && drawSceneView)
                     {
                         const GodRayRenderer::SunShadow sunShadow{terrain.SunShadowTexture(frameInfo.frameNumber),
                             terrain.SunShadowCascadeViewProj(), TerrainRenderer::kSunShadowDepthBias};
+                        std::shared_ptr<ixrhi::IXRHITexture> rayDepth = offscreenScene.GetDepthSnapshotTexture();
                         if (!sceneSnapshotPass && godRays.IsVisible(sceneSky, frameSunLighting, camera, sunShadow))
+                            rayDepth = offscreenScene.ReadableDepth(*frameInfo.commandList, frameInfo);
+                        // The scene's tone-map draw adds them (no pass of their own over the image).
+                        GodRayRenderer::AddedLight rays;
+                        if (rayDepth &&
+                            godRays.RenderRays(*frameInfo.commandList, frameInfo, /*view=*/0, sceneSky, frameSunLighting,
+                                camera, rayDepth, sunShadow, renderSize.width, renderSize.height) &&
+                            godRays.TakeAddedLight(/*view=*/0, rays))
                         {
-                            // God rays only read the depth; the full colour copy would be wasted.
-                            offscreenScene.SnapshotDepth(*frameInfo.commandList, frameInfo);
-                            sceneDepthSnapshotted = true;
-                        }
-                        if (godRays.RenderRays(*frameInfo.commandList, frameInfo, /*view=*/0, sceneSky, frameSunLighting,
-                                camera, offscreenScene.GetDepthSnapshotTexture(), sunShadow, renderSize.width, renderSize.height))
-                        {
-                            offscreenScene.BeginMainPass(*frameInfo.commandList, frameInfo, false);
-                            godRays.Composite(*frameInfo.commandList, frameInfo, /*view=*/0, renderSize.width, renderSize.height);
-                            offscreenScene.EndMainPass(*frameInfo.commandList);
+                            offscreenScene.SetAddedLight(rays.shafts, rays.shaftsWeight, rays.volume, rays.volumeWeight);
                         }
                     }
                     // Soft particles without water: copy the depth at the end of the frame, at most every
@@ -12840,21 +12860,26 @@ int RunGame(NativeWindow& window,
                         if (hasSceneTerrain)
                             terrain.RenderWater(*frameInfo.commandList, frameInfo, gameCamera, seconds, gameExtent.width, gameExtent.height, /*viewIndex=*/1);
                         drawTransparents(gameTransparentDraws, /*underWater=*/false, gameCamera, gameExtent.width, gameExtent.height);
-                        // God rays over the game image, under the game's UI: close the pass for a depth
-                        // snapshot and the ray passes, then reopen it (loaded) for the composite.
+                        // God rays over the game image, under the game's UI: after the pass, from its depth;
+                        // the game view's tone-map draw adds them.
                         const GodRayRenderer::SunShadow gameSunShadow{terrain.SunShadowTexture(frameInfo.frameNumber),
                             terrain.SunShadowCascadeViewProj(), TerrainRenderer::kSunShadowDepthBias};
+                        gameView.EndMainPass(*frameInfo.commandList);
                         if (godRaysOk && isInWorld && godRays.IsVisible(sceneSky, frameSunLighting, gameCamera, gameSunShadow))
                         {
-                            gameView.EndMainPass(*frameInfo.commandList);
-                            // God rays only read the depth; the full colour copy would be wasted.
-                            gameView.SnapshotDepth(*frameInfo.commandList, frameInfo);
-                            godRays.RenderRays(*frameInfo.commandList, frameInfo, /*view=*/1, sceneSky, frameSunLighting,
-                                gameCamera, gameView.GetDepthSnapshotTexture(), gameSunShadow, gameExtent.width, gameExtent.height);
-                            gameView.BeginMainPass(*frameInfo.commandList, frameInfo, /*clear=*/false);
-                            godRays.Composite(*frameInfo.commandList, frameInfo, /*view=*/1, gameExtent.width, gameExtent.height);
+                            // God rays only read the depth, and the pass is over: the depth itself, no copy.
+                            const std::shared_ptr<ixrhi::IXRHITexture> gameDepth =
+                                gameView.ReadableDepth(*frameInfo.commandList, frameInfo);
+                            GodRayRenderer::AddedLight gameRays;
+                            if (gameDepth &&
+                                godRays.RenderRays(*frameInfo.commandList, frameInfo, /*view=*/1, sceneSky, frameSunLighting,
+                                    gameCamera, gameDepth, gameSunShadow, gameExtent.width, gameExtent.height) &&
+                                godRays.TakeAddedLight(/*view=*/1, gameRays))
+                            {
+                                gameView.SetAddedLight(gameRays.shafts, gameRays.shaftsWeight, gameRays.volume,
+                                    gameRays.volumeWeight);
+                            }
                         }
-                        gameView.EndMainPass(*frameInfo.commandList);
                         // The panel shows the tone-mapped image, with the game's own UI (a HUD a script
                         // opened) over it, as the built game draws it over its tone-mapped window.
                         gameView.BeginDisplayPass(*frameInfo.commandList, frameInfo, frameToneMap);

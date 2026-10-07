@@ -2178,13 +2178,27 @@ bool EditorImGui::ProjectHasNativeScriptSources() const
 {
     if (!m_assetLibrary)
         return false;
+    // Cached per library revision: the check resolves paths on disk (std::filesystem::relative) and
+    // the toolbar asks every frame.
     const std::filesystem::path scriptsDir = ProjectScriptSourceDir();
+    const std::uint64_t revision = m_assetLibrary->Revision();
+    if (m_nativeSourcesValid && m_nativeSourcesLibrary == m_assetLibrary.get() &&
+        m_nativeSourcesRevision == revision && m_nativeSourcesDir == scriptsDir)
+        return m_hasNativeSources;
+    m_hasNativeSources = false;
     for (const AssetLibrary::Entry& e : CachedScriptAssets(".cpp"))
     {
         if (IsNativeScriptSource(scriptsDir, m_assetLibrary->AbsolutePath(e)))
-            return true;
+        {
+            m_hasNativeSources = true;
+            break;
+        }
     }
-    return false;
+    m_nativeSourcesLibrary = m_assetLibrary.get();
+    m_nativeSourcesRevision = revision;
+    m_nativeSourcesDir = scriptsDir;
+    m_nativeSourcesValid = true;
+    return m_hasNativeSources;
 }
 
 const std::vector<AssetLibrary::Entry>& EditorImGui::CachedScriptAssets(const char* extension) const

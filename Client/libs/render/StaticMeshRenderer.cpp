@@ -968,6 +968,20 @@ bool LoadGltfMaterialTextures(client::asset::IAssetReader& assets,
     return loadedAny;
 }
 
+// The material texture cache key's role (EnsureMaterialTexture): the decode differs per role.
+std::uint8_t MaterialTextureRoleIndex(const char* role)
+{
+    if (role == nullptr)
+        return 0;
+    if (std::strcmp(role, "baseColor") == 0)
+        return 1;
+    if (std::strcmp(role, "normal") == 0)
+        return 2;
+    if (std::strcmp(role, "metallicRoughness") == 0)
+        return 3;
+    return 4;
+}
+
 } // namespace
 
 StaticMeshRenderer::~StaticMeshRenderer()
@@ -1311,8 +1325,8 @@ void StaticMeshRenderer::DumpMaterialState(const char* entityName, const Instanc
             alphaCutoff = binding->alphaCutoff;
             if (binding->resolvedMaterial != "gltf_baked")
                 resolvedName = binding->resolvedMaterial;
-            if (binding->baseColorTextureGuid != "EMPTY")
-                baseColorTextureGuid = binding->baseColorTextureGuid;
+            if (binding->baseColorTextureGuid)
+                baseColorTextureGuid = binding->baseColorTextureGuid->toString();
         }
 
         LogFormat("[MATBIND-DIAG]   submesh=%zu materialSlot=%u", i, materialSlot);
@@ -2479,12 +2493,12 @@ const StaticMeshRenderer::Texture* StaticMeshRenderer::EnsureMaterialTexture(ixr
     if (!guid)
         return nullptr;
 
-    const std::string guidText = guid->toString();
-    const std::string key = std::string(role ? role : "texture") + ":" + guidText;
+    const MaterialTextureKey key{MaterialTextureRoleIndex(role), *guid};
     if (const auto it = m_materialTextureCache.find(key); it != m_materialTextureCache.end())
         return it->second.image != nullptr ? &it->second : nullptr;
     if (m_failedMaterialTextureKeys.find(key) != m_failedMaterialTextureKeys.end())
         return nullptr;
+    const std::string guidText = guid->toString();
 
     const std::optional<std::filesystem::path> path = AssetDatabase::Instance().resolveGuid(*guid);
     if (!path)
@@ -2561,9 +2575,7 @@ StaticMeshRenderer::MaterialTextureViews StaticMeshRenderer::ResolveMaterialText
     views.resolvedMaterial = material->name.empty()
         ? material->path.filename().generic_string()
         : material->name;
-    views.baseColorTextureGuid = material->baseColorTexture
-        ? material->baseColorTexture->toString()
-        : std::string("EMPTY");
+    views.baseColorTextureGuid = material->baseColorTexture;
     views.alphaMode = MaterialAlphaModeName(material->alphaMode);
     views.alphaCutoff = material->alphaCutoff;
     views.fragmentShaderAlphaPath = AlphaFragmentPath(views.alphaMode);

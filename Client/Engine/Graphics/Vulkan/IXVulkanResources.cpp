@@ -3,8 +3,10 @@
 #include "IXVulkanResources.h"
 
 #include "IXVulkanDevice.h"
+#include "IXVulkanCommandList.h"
 #include "VulkanDevice.h"
 
+#include <algorithm>
 #include <cstring>
 
 namespace ixvulkan
@@ -92,6 +94,8 @@ IXVulkanTexture::~IXVulkanTexture()
     if (m_device == nullptr)
         return;
     const VkDevice native = m_device->NativeDevice();
+    if (m_sampledView != VK_NULL_HANDLE)
+        vkDestroyImageView(native, m_sampledView, nullptr);
     if (m_view != VK_NULL_HANDLE)
         vkDestroyImageView(native, m_view, nullptr);
     if (m_image != VK_NULL_HANDLE)
@@ -262,6 +266,54 @@ void IXVulkanBufferUpload::ReleaseStaging()
     if (m_stagingMemory != VK_NULL_HANDLE)
         vkFreeMemory(native, m_stagingMemory, nullptr);
     m_stagingMemory = VK_NULL_HANDLE;
+}
+
+IXVulkanOcclusionQueries::IXVulkanOcclusionQueries(IXVulkanDevice& device, VkQueryPool pool, std::uint32_t count)
+    : m_device(&device)
+    , m_pool(pool)
+    , m_count(count)
+{
+}
+
+IXVulkanOcclusionQueries::~IXVulkanOcclusionQueries()
+{
+    if (m_device != nullptr && m_pool != VK_NULL_HANDLE)
+        vkDestroyQueryPool(m_device->NativeDevice(), m_pool, nullptr);
+}
+
+void IXVulkanOcclusionQueries::Reset(ixrhi::IXRHICommandList& cmd, std::uint32_t first, std::uint32_t count)
+{
+    auto* native = dynamic_cast<IXVulkanCommandList*>(&cmd);
+    if (native == nullptr || first >= m_count)
+        return;
+    vkCmdResetQueryPool(native->Native(), m_pool, first, std::min(count, m_count - first));
+}
+
+void IXVulkanOcclusionQueries::Begin(ixrhi::IXRHICommandList& cmd, std::uint32_t index)
+{
+    auto* native = dynamic_cast<IXVulkanCommandList*>(&cmd);
+    if (native != nullptr && index < m_count)
+        vkCmdBeginQuery(native->Native(), m_pool, index, 0);  // not precise: zero or not is enough
+}
+
+void IXVulkanOcclusionQueries::End(ixrhi::IXRHICommandList& cmd, std::uint32_t index)
+{
+    auto* native = dynamic_cast<IXVulkanCommandList*>(&cmd);
+    if (native != nullptr && index < m_count)
+        vkCmdEndQuery(native->Native(), m_pool, index);
+}
+
+bool IXVulkanOcclusionQueries::TryGetResult(std::uint32_t index, std::uint64_t& samples)
+{
+    if (m_device == nullptr || index >= m_count)
+        return false;
+    std::uint64_t result[2] = {0, 0};  // value, availability
+    const VkResult status = vkGetQueryPoolResults(m_device->NativeDevice(), m_pool, index, 1, sizeof(result),
+        result, sizeof(result), VK_QUERY_RESULT_64_BIT | VK_QUERY_RESULT_WITH_AVAILABILITY_BIT);
+    if ((status != VK_SUCCESS && status != VK_NOT_READY) || result[1] == 0)
+        return false;
+    samples = result[0];
+    return true;
 }
 
 } // namespace ixvulkan

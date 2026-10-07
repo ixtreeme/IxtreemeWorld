@@ -256,7 +256,8 @@ private:
     std::shared_ptr<ixrhi::IXRHITexture> m_sceneDepth;
     std::shared_ptr<ixrhi::IXRHISampler> m_sceneDepthSampler;
     std::shared_ptr<ixrhi::IXRHITexture> m_dummyDepth;
-    const ixrhi::IXRHITexture* m_boundDepth = nullptr;
+    // What each draw slot's set binds as the depth (binding 3), held for its address.
+    std::array<std::shared_ptr<ixrhi::IXRHITexture>, kFramesInFlight * kDrawSlots> m_boundDepth{};
     float m_sceneNear = 0.1f;
     float m_sceneFar = 1000.0f;
     std::uint64_t m_lastFrameNumber = 0;

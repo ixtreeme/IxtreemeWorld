@@ -192,8 +192,9 @@ std::unique_ptr<ixrhi::IXRHIGraphicsPipeline> IXVulkanDevice::CreateGraphicsPipe
     for (const auto& blend : desc.blendAttachments)
     {
         VkPipelineColorBlendAttachmentState entry{};
-        entry.colorWriteMask = VK_COLOR_COMPONENT_R_BIT | VK_COLOR_COMPONENT_G_BIT |
-            VK_COLOR_COMPONENT_B_BIT | VK_COLOR_COMPONENT_A_BIT;
+        entry.colorWriteMask = blend.writeColor
+            ? (VK_COLOR_COMPONENT_R_BIT | VK_COLOR_COMPONENT_G_BIT | VK_COLOR_COMPONENT_B_BIT | VK_COLOR_COMPONENT_A_BIT)
+            : 0u;
         entry.blendEnable = blend.blendEnable ? VK_TRUE : VK_FALSE;
         entry.srcColorBlendFactor = ToVkBlendFactor(blend.srcColor);
         entry.dstColorBlendFactor = ToVkBlendFactor(blend.dstColor);

@@ -670,6 +670,12 @@ private:
         std::vector<AssetLibrary::Entry> entries;
     };
     mutable std::unordered_map<std::string, CachedScriptList> m_scriptAssetCache;
+    // ProjectHasNativeScriptSources, cached per library revision and script folder.
+    mutable const AssetLibrary* m_nativeSourcesLibrary = nullptr;
+    mutable std::uint64_t m_nativeSourcesRevision = 0;
+    mutable std::filesystem::path m_nativeSourcesDir;
+    mutable bool m_nativeSourcesValid = false;
+    mutable bool m_hasNativeSources = false;
     ProjectDialogMode m_projectDialogMode = ProjectDialogMode::None;
     bool m_projectPopupNeedsOpen = false;
     bool m_projectCreateBrowserVisible = false;

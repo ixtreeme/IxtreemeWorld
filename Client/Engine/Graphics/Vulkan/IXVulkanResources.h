@@ -5,6 +5,7 @@
 // order the pre-migration code used (view/sampler before image, etc.).
 
 #include "IXRHIBuffer.h"
+#include "IXRHIQuery.h"
 #include "IXRHIShader.h"
 #include "IXRHITexture.h"
 #include "IXVulkanConversions.h"
@@ -78,12 +79,17 @@ public:
 
     VkImage Native() const { return m_image; }
     VkImageView NativeView() const { return m_view; }
+    // The view shaders sample through: a depth+stencil attachment's own view names both aspects,
+    // which a sampled view must not, so such a texture also gets a depth-only one.
+    VkImageView NativeSampledView() const { return m_sampledView != VK_NULL_HANDLE ? m_sampledView : m_view; }
+    void SetSampledView(VkImageView view) { m_sampledView = view; }  // owned (destroyed with the texture)
 
 private:
     IXVulkanDevice* m_device = nullptr;
     VkImage m_image = VK_NULL_HANDLE;
     VkDeviceMemory m_memory = VK_NULL_HANDLE;
     VkImageView m_view = VK_NULL_HANDLE;
+    VkImageView m_sampledView = VK_NULL_HANDLE;
     std::uint32_t m_width = 0;
     std::uint32_t m_height = 0;
     std::uint32_t m_mipLevels = 1;
@@ -155,6 +161,24 @@ private:
     VkFence m_fence = VK_NULL_HANDLE;
     bool m_ready = false;
     bool m_taken = false;
+};
+
+class IXVulkanOcclusionQueries final : public ixrhi::IXRHIOcclusionQueries
+{
+public:
+    IXVulkanOcclusionQueries(IXVulkanDevice& device, VkQueryPool pool, std::uint32_t count);
+    ~IXVulkanOcclusionQueries() override;
+
+    std::uint32_t Count() const override { return m_count; }
+    void Reset(ixrhi::IXRHICommandList& cmd, std::uint32_t first, std::uint32_t count) override;
+    void Begin(ixrhi::IXRHICommandList& cmd, std::uint32_t index) override;
+    void End(ixrhi::IXRHICommandList& cmd, std::uint32_t index) override;
+    bool TryGetResult(std::uint32_t index, std::uint64_t& samples) override;
+
+private:
+    IXVulkanDevice* m_device = nullptr;
+    VkQueryPool m_pool = VK_NULL_HANDLE;
+    std::uint32_t m_count = 0;
 };
 
 } // namespace ixvulkan

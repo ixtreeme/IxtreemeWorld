@@ -112,6 +112,7 @@ public:
     void RequestGpuFrameCapture() override;
     bool TryReadTimestamps(ixrhi::IXRHITimestampResults& gpu,
                            ixrhi::IXRHICpuFrameTiming& cpu) override;
+    std::unique_ptr<ixrhi::IXRHIOcclusionQueries> CreateOcclusionQueries(std::uint32_t count) override;
     const ixrhi::IXRHICapabilities& GetCapabilities() const override { return m_capabilities; }
 
     // Releases ALL backend Vulkan objects (frame contexts, swapchain object,

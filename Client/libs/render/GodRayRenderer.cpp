@@ -103,7 +103,6 @@ bool GodRayRenderer::Create(ixrhi::IXRHIDevice& rhi, client::asset::IAssetReader
     m_vs = LoadShader(rhi, assets, "assets/shaders/god_rays_vs.spv", S::Vertex, "VSMain");
     m_maskPs = LoadShader(rhi, assets, "assets/shaders/god_rays_mask_ps.spv", S::Fragment, "MaskPS");
     m_blurPs = LoadShader(rhi, assets, "assets/shaders/god_rays_blur_ps.spv", S::Fragment, "BlurPS");
-    m_compositePs = LoadShader(rhi, assets, "assets/shaders/god_rays_composite_ps.spv", S::Fragment, "CompositePS");
     m_volumeBlurPs = LoadShader(rhi, assets, "assets/shaders/god_rays_volblur_ps.spv", S::Fragment, "VolBlurPS");
     m_marchPs = LoadShader(rhi, assets, "assets/shaders/volumetric_light_ps.spv", S::Fragment, "MarchPS");
 
@@ -132,9 +131,7 @@ bool GodRayRenderer::Create(ixrhi::IXRHIDevice& rhi, client::asset::IAssetReader
     {
         m_maskBindings = rhi.CreateBindGroup(*m_bindLayout, sets);
         m_blurBindings = rhi.CreateBindGroup(*m_bindLayout, sets);
-        m_compositeBindings = rhi.CreateBindGroup(*m_bindLayout, sets);
         m_volumeBlurBindings = rhi.CreateBindGroup(*m_bindLayout, sets);
-        m_volumeCompositeBindings = rhi.CreateBindGroup(*m_bindLayout, sets);
     }
     if (m_marchLayout)
         m_marchBindings = rhi.CreateBindGroup(*m_marchLayout, sets);
@@ -153,20 +150,19 @@ bool GodRayRenderer::Create(ixrhi::IXRHIDevice& rhi, client::asset::IAssetReader
     if (m_prototypeTexture)
         m_prototypeTarget = CreateRayTarget(rhi, m_prototypeTexture, "GodRays:Prototype");
 
-    const bool resources = m_vs && m_maskPs && m_blurPs && m_compositePs && m_volumeBlurPs && m_marchPs &&
+    const bool resources = m_vs && m_maskPs && m_blurPs && m_volumeBlurPs && m_marchPs &&
         m_sampler && m_shadowSampler && m_bindLayout && m_marchLayout && m_maskBindings && m_blurBindings &&
-        m_compositeBindings && m_volumeBlurBindings && m_volumeCompositeBindings && m_marchBindings && buffers &&
+        m_volumeBlurBindings && m_marchBindings && buffers &&
         m_prototypeTarget;
     if (resources)
     {
-        const ixrhi::IXRHIRenderPass* half = m_prototypeTarget->GetPass();
-        m_maskPipeline = BuildPipeline(m_maskPs, *m_bindLayout, sizeof(Push), half, false, "GodRays:Mask");
-        m_blurPipeline = BuildPipeline(m_blurPs, *m_bindLayout, sizeof(Push), half, false, "GodRays:Blur");
-        m_volumeBlurPipeline = BuildPipeline(m_volumeBlurPs, *m_bindLayout, sizeof(Push), half, false, "GodRays:VolumeBlur");
-        m_marchPipeline = BuildPipeline(m_marchPs, *m_marchLayout, sizeof(VolumetricPush), half, false, "GodRays:Volumetric");
-        m_compositePipeline = BuildPipeline(m_compositePs, *m_bindLayout, sizeof(Push), m_targetPass, true, "GodRays:Composite");
+        const ixrhi::IXRHIRenderPass* rayPass = m_prototypeTarget->GetPass();
+        m_maskPipeline = BuildPipeline(m_maskPs, *m_bindLayout, sizeof(Push), rayPass, "GodRays:Mask");
+        m_blurPipeline = BuildPipeline(m_blurPs, *m_bindLayout, sizeof(Push), rayPass, "GodRays:Blur");
+        m_volumeBlurPipeline = BuildPipeline(m_volumeBlurPs, *m_bindLayout, sizeof(Push), rayPass, "GodRays:VolumeBlur");
+        m_marchPipeline = BuildPipeline(m_marchPs, *m_marchLayout, sizeof(VolumetricPush), rayPass, "GodRays:Volumetric");
     }
-    const bool pipelines = m_maskPipeline && m_blurPipeline && m_volumeBlurPipeline && m_marchPipeline && m_compositePipeline;
+    const bool pipelines = m_maskPipeline && m_blurPipeline && m_volumeBlurPipeline && m_marchPipeline;
     Tracenf("[GOD-RAYS] Create: resources=%d pipelines=%d", resources ? 1 : 0, pipelines ? 1 : 0);
     if (resources && pipelines)
         return true;
@@ -174,22 +170,11 @@ bool GodRayRenderer::Create(ixrhi::IXRHIDevice& rhi, client::asset::IAssetReader
     return false;
 }
 
-bool GodRayRenderer::RecreatePipeline(ixrhi::IXRHIDevice& rhi)
-{
-    if (!m_rhi || !m_bindLayout)
-        return true;
-    m_rhi = &rhi;
-    // Only the composite bakes against the borrowed scene pass; the rest use the prototype.
-    m_compositePipeline = BuildPipeline(m_compositePs, *m_bindLayout, sizeof(Push), m_targetPass, true, "GodRays:Composite");
-    return true;
-}
-
 std::unique_ptr<ixrhi::IXRHIGraphicsPipeline> GodRayRenderer::BuildPipeline(
     const std::shared_ptr<ixrhi::IXRHIShader>& ps,
     const ixrhi::IXRHIBindGroupLayout& layout,
     std::uint32_t pushBytes,
     const ixrhi::IXRHIRenderPass* pass,
-    bool additive,
     const char* name)
 {
     if (!m_rhi || !m_vs || !ps)
@@ -203,21 +188,7 @@ std::unique_ptr<ixrhi::IXRHIGraphicsPipeline> GodRayRenderer::BuildPipeline(
     desc.cullMode = ixrhi::IXRHICullMode::None;
     desc.depthTestEnable = false;
     desc.depthWriteEnable = false;
-    if (additive)
-    {
-        // Light adds to the image; the image's alpha stays.
-        desc.blendAttachments = {{true,
-            ixrhi::IXRHIBlendFactor::One,
-            ixrhi::IXRHIBlendFactor::One,
-            ixrhi::IXRHIBlendOp::Add,
-            ixrhi::IXRHIBlendFactor::Zero,
-            ixrhi::IXRHIBlendFactor::One,
-            ixrhi::IXRHIBlendOp::Add}};
-    }
-    else
-    {
-        desc.blendAttachments = {ixrhi::IXRHIBlendAttachment{}};
-    }
+    desc.blendAttachments = {ixrhi::IXRHIBlendAttachment{}};
     desc.sampleCount = 1;
     desc.targetRenderPass = pass;
     desc.debugName = name;
@@ -334,10 +305,10 @@ bool GodRayRenderer::IsVisible(const SkySettings& sky,
 
 bool GodRayRenderer::EnsureViewTargets(ViewTargets& targets, std::uint32_t width, std::uint32_t height)
 {
-    const std::uint32_t halfWidth = std::max(1u, width / 2u);
-    const std::uint32_t halfHeight = std::max(1u, height / 2u);
+    const std::uint32_t rayWidth = std::max(1u, width / 4u);
+    const std::uint32_t rayHeight = std::max(1u, height / 4u);
     if (targets.maskTarget && targets.blurTarget && targets.volumeTarget && targets.volumeBlurTarget &&
-        targets.width == halfWidth && targets.height == halfHeight)
+        targets.width == rayWidth && targets.height == rayHeight)
         return true;
     // The old targets may still be read by frames in flight.
     if (targets.maskTarget || targets.blurTarget || targets.volumeTarget || targets.volumeBlurTarget)
@@ -347,10 +318,10 @@ bool GodRayRenderer::EnsureViewTargets(ViewTargets& targets, std::uint32_t width
     targets = ViewTargets{};
     targets.lastScreenSpaceState = lastScreenSpaceState;
     targets.lastVolumetricState = lastVolumetricState;
-    targets.mask = CreateRayTexture(*m_rhi, halfWidth, halfHeight, "GodRays:Mask");
-    targets.blur = CreateRayTexture(*m_rhi, halfWidth, halfHeight, "GodRays:Blur");
-    targets.volume = CreateRayTexture(*m_rhi, halfWidth, halfHeight, "GodRays:Volume");
-    targets.volumeBlur = CreateRayTexture(*m_rhi, halfWidth, halfHeight, "GodRays:VolumeBlur");
+    targets.mask = CreateRayTexture(*m_rhi, rayWidth, rayHeight, "GodRays:Mask");
+    targets.blur = CreateRayTexture(*m_rhi, rayWidth, rayHeight, "GodRays:Blur");
+    targets.volume = CreateRayTexture(*m_rhi, rayWidth, rayHeight, "GodRays:Volume");
+    targets.volumeBlur = CreateRayTexture(*m_rhi, rayWidth, rayHeight, "GodRays:VolumeBlur");
     if (targets.mask)
         targets.maskTarget = CreateRayTarget(*m_rhi, targets.mask, "GodRays:Mask");
     if (targets.blur)
@@ -366,8 +337,8 @@ bool GodRayRenderer::EnsureViewTargets(ViewTargets& targets, std::uint32_t width
         targets.lastVolumetricState = lastVolumetricState;
         return false;
     }
-    targets.width = halfWidth;
-    targets.height = halfHeight;
+    targets.width = rayWidth;
+    targets.height = rayHeight;
     return true;
 }
 
@@ -441,7 +412,6 @@ bool GodRayRenderer::RenderRays(ixrhi::IXRHICommandList& cmd,
     {
         m_maskBindings->UpdateTexture(set, 0, depth, m_sampler);
         m_blurBindings->UpdateTexture(set, 0, targets.mask, m_sampler);
-        m_compositeBindings->UpdateTexture(set, 0, targets.blur, m_sampler);
         // The mask: the sun where the sky shows. The shafts: the mask blurred towards the sun.
         DrawFullscreen(cmd, *targets.maskTarget, targets.width, targets.height, *m_maskPipeline,
             *m_maskBindings, set, &push, sizeof(push));
@@ -458,7 +428,6 @@ bool GodRayRenderer::RenderRays(ixrhi::IXRHICommandList& cmd,
         m_marchBindings->UpdateTexture(set, 1, shadow.texture, m_shadowSampler);
         m_marchBindings->UpdateBuffer(set, 2, m_cascadeBuffers[frameIndex], 0, kCascadeBufferBytes);
         m_volumeBlurBindings->UpdateTexture(set, 0, targets.volume, m_sampler);
-        m_volumeCompositeBindings->UpdateTexture(set, 0, targets.volumeBlur, m_sampler);
         DrawFullscreen(cmd, *targets.volumeTarget, targets.width, targets.height, *m_marchPipeline,
             *m_marchBindings, set, &volumetric, sizeof(volumetric));
         Push blur{};
@@ -471,37 +440,28 @@ bool GodRayRenderer::RenderRays(ixrhi::IXRHICommandList& cmd,
     return true;
 }
 
-void GodRayRenderer::Composite(ixrhi::IXRHICommandList& cmd,
-                               const ixrhi::IXRHIFrameInfo& frame,
-                               std::uint32_t view,
-                               std::uint32_t width,
-                               std::uint32_t height)
+bool GodRayRenderer::TakeAddedLight(std::uint32_t view, AddedLight& out)
 {
-    if (view >= kViews || !m_compositePipeline || !frame.frameActive || width == 0 || height == 0)
-        return;
+    out = AddedLight{};
+    if (view >= kViews)
+        return false;
     ViewTargets& targets = m_views[view];
     if (!targets.screenSpaceReady && !targets.volumetricReady)
-        return;
-    const std::uint32_t set = view * kFramesInFlight + frame.frameIndex % kFramesInFlight;
-    cmd.SetViewport(0.0f, 0.0f, static_cast<float>(width), static_cast<float>(height));
-    cmd.SetScissor(0, 0, width, height);
-    cmd.SetGraphicsPipeline(*m_compositePipeline);
-    if (targets.volumetricReady)
-    {
-        Push push{};
-        push.composite[0] = 1.0f;  // its intensity is in the march already
-        cmd.BindGroup(0, *m_volumeCompositeBindings, set);
-        cmd.PushConstants(&push, sizeof(push));
-        cmd.Draw(3, 1, 0, 0);
-    }
+        return false;
+    // The shafts take their intensity here; the volumetric light has it in the march already.
     if (targets.screenSpaceReady)
     {
-        cmd.BindGroup(0, *m_compositeBindings, set);
-        cmd.PushConstants(&targets.push, sizeof(targets.push));
-        cmd.Draw(3, 1, 0, 0);
+        out.shafts = targets.blur;
+        out.shaftsWeight = targets.push.composite[0];
+    }
+    if (targets.volumetricReady)
+    {
+        out.volume = targets.volumeBlur;
+        out.volumeWeight = 1.0f;
     }
     targets.screenSpaceReady = false;
     targets.volumetricReady = false;
+    return true;
 }
 
 void GodRayRenderer::Destroy()
@@ -510,7 +470,6 @@ void GodRayRenderer::Destroy()
     m_blurPipeline.reset();
     m_marchPipeline.reset();
     m_volumeBlurPipeline.reset();
-    m_compositePipeline.reset();
     for (ViewTargets& targets : m_views)
         targets = ViewTargets{};
     m_prototypeTarget.reset();
@@ -519,10 +478,8 @@ void GodRayRenderer::Destroy()
         buffer.reset();
     m_maskBindings.reset();
     m_blurBindings.reset();
-    m_compositeBindings.reset();
     m_marchBindings.reset();
     m_volumeBlurBindings.reset();
-    m_volumeCompositeBindings.reset();
     m_bindLayout.reset();
     m_marchLayout.reset();
     m_sampler.reset();
@@ -530,7 +487,6 @@ void GodRayRenderer::Destroy()
     m_vs.reset();
     m_maskPs.reset();
     m_blurPs.reset();
-    m_compositePs.reset();
     m_volumeBlurPs.reset();
     m_marchPs.reset();
     m_rhi = nullptr;

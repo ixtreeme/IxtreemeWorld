@@ -911,11 +911,12 @@ std::shared_ptr<ixrhi::IXRHISampler> CreateRhiSampler(ixrhi::IXRHIDevice& rhi,
     desc.addressU = addressMode;
     desc.addressV = addressMode;
     desc.addressW = addressMode;
-    // Anisotropy only for repeat (tiling) samplers on capable hardware —
-    // parity with the pre-migration sampler setup, via capabilities instead
-    // of native device limits.
+    // Anisotropy only for repeat (tiling) samplers on capable hardware, at most 4x: the terrain is
+    // seen at grazing angles over most of the screen, where 16x took ~0.07 ms of the terrain pass's
+    // ~0.37 ms (1510x832) for no visible difference (8x: ~0.01 ms).
+    constexpr std::uint32_t kMaxTerrainAnisotropy = 4;
     if (addressMode == ixrhi::IXRHISamplerAddress::Repeat && caps.supportsAnisotropy)
-        desc.maxAnisotropy = caps.maxAnisotropy;
+        desc.maxAnisotropy = std::min(caps.maxAnisotropy, kMaxTerrainAnisotropy);
     desc.maxLod = maxLod;
     desc.mipLodBias = mipLodBias;
     desc.debugName = debugName ? debugName : "";
@@ -2327,6 +2328,76 @@ bool TerrainRenderer::AnyWaterBodyInView(const WorldCamera& camera) const
     return false;
 }
 
+void TerrainRenderer::BeginWaterVisibility(ixrhi::IXRHICommandList& cmd, const ixrhi::IXRHIFrameInfo& frame)
+{
+    if (!m_rhi || !frame.frameActive || !m_waterOcclusionPipeline)
+        return;
+    if (!m_waterQueries)
+        m_waterQueries = m_rhi->CreateOcclusionQueries(kFramesInFlight);
+    if (!m_waterQueries)
+        return;
+    const std::uint32_t slot = frame.frameIndex % kFramesInFlight;
+    // This slot's query from its last frame has finished: that frame's fence was waited for. A result
+    // that is somehow not there counts as seen.
+    if (m_waterQueryIssued[slot])
+    {
+        std::uint64_t samples = 0;
+        if (!m_waterQueries->TryGetResult(slot, samples) || samples > 0)
+        {
+            m_waterSeenFrame = frame.frameNumber;
+            m_waterSeen = true;
+        }
+        m_waterQueryIssued[slot] = false;
+    }
+    m_waterQueries->Reset(cmd, slot, 1);
+}
+
+void TerrainRenderer::QueryWaterVisibility(ixrhi::IXRHICommandList& cmd,
+                                           const ixrhi::IXRHIFrameInfo& frame,
+                                           const WorldCamera& camera,
+                                           std::uint32_t viewWidth,
+                                           std::uint32_t viewHeight)
+{
+    if (!m_waterQueries || !m_waterOcclusionPipeline || !frame.frameActive || viewWidth == 0 || viewHeight == 0 ||
+        !m_sceneTerrainActive || m_sceneTerrain.editorHidden)
+        return;
+    const std::uint32_t slot = frame.frameIndex % kFramesInFlight;
+    bool begun = false;
+    for (const WaterBodyGpu& waterBody : m_waterBodies)
+    {
+        if (!ResolveWaterConfig(waterBody.body).enabled || waterBody.indexCount == 0 || !waterBody.vertexBuffer ||
+            !waterBody.indexBuffer || !WaterBodyInView(waterBody, camera))
+            continue;
+        if (!begun)
+        {
+            m_waterQueries->Begin(cmd, slot);
+            cmd.SetGraphicsPipeline(*m_waterOcclusionPipeline);
+            cmd.SetViewport(0.0f, 0.0f, static_cast<float>(viewWidth), static_cast<float>(viewHeight));
+            cmd.SetScissor(0, 0, viewWidth, viewHeight);
+            cmd.PushConstants(&camera.viewProjection, sizeof(WorldMat4));
+            begun = true;
+        }
+        cmd.SetVertexBuffer(0, *waterBody.vertexBuffer, 0);
+        cmd.SetIndexBuffer(*waterBody.indexBuffer, 0, /*thirtyTwoBit=*/true);
+        cmd.DrawIndexed(waterBody.indexCount, 1, 0, 0, 0);
+    }
+    if (begun)
+    {
+        m_waterQueries->End(cmd, slot);
+        m_waterQueryIssued[slot] = true;
+    }
+}
+
+bool TerrainRenderer::WaterMayBeVisible(std::uint64_t frameNumber) const
+{
+    // Kept this many frames after the query last saw it: a camera turning back and forth over a
+    // hilltop does not make it flicker in and out.
+    constexpr std::uint64_t kKeepFrames = 8;
+    if (!m_waterQueries || !m_waterOcclusionPipeline)
+        return true;  // no queries: always drawn when in view
+    return m_waterSeen && frameNumber <= m_waterSeenFrame + kKeepFrames;
+}
+
 bool TerrainRenderer::BoxUnderWater(WorldVec3 boundsMin, WorldVec3 boundsMax) const
 {
     if (!m_sceneTerrainActive || m_sceneTerrain.editorHidden)
@@ -3473,6 +3544,10 @@ void TerrainRenderer::Destroy()
     // Teardown drain: in-flight frames may still reference terrain buffers
     // and textures being released here (parity with the old device wait).
     m_rhi->WaitIdle();
+
+    m_waterQueries.reset();
+    m_waterQueryIssued = {};
+    m_waterSeen = false;
 
     DestroyPipeline();
     DestroyShadowResources();
@@ -6186,6 +6261,10 @@ void TerrainRenderer::UpdateWaterBindGroup()
 {
     if (!m_waterBindGroup || !m_waterNormalSmall.image || !m_waterNormalLarge.image || !m_waterReflection.color)
         return;
+    // Every frame slot's sets are rewritten: the GPU must be done with the frames still using them
+    // (rare: refraction inputs or reflection target replaced, water materials changed).
+    if (m_rhi)
+        m_rhi->WaitIdle();
 
     for (std::uint32_t bodyIndex = 0; bodyIndex < static_cast<std::uint32_t>(m_waterBodies.size()); ++bodyIndex)
     {
@@ -6458,6 +6537,35 @@ bool TerrainRenderer::CreateWaterPipeline(ixrhi::IXRHIDevice& rhi)
     desc.targetRenderPass = m_targetPass;
     desc.debugName = "Terrain:Water";
     m_waterPipeline = rhi.CreateGraphicsPipeline(desc);
+
+    // The visibility query's draw (QueryWaterVisibility): the same surface, depth-tested only. The
+    // shadow depth shader takes the position and a view-projection push constant; no fragment shader,
+    // no colour written. Without it the water is simply always drawn when in view.
+    if (auto occlusionVs = LoadShader(rhi, *m_assets, "assets/shaders/shadow_depth_vs.spv",
+            ixrhi::IXRHIShaderStage::Vertex, "VSMain"))
+    {
+        ixrhi::IXRHIGraphicsPipelineDesc occlusion;
+        occlusion.vertexShader = occlusionVs;
+        occlusion.fragmentShader = nullptr;
+        occlusion.pushRanges = {{ixrhi::IXRHIShaderStage::Vertex, 0, sizeof(WorldMat4)}};
+        occlusion.vertexBindings = {{0, sizeof(WaterVertex)}};
+        occlusion.vertexAttributes = {
+            {0, 0, ixrhi::IXRHIFormat::R32G32B32Float, offsetof(WaterVertex, position)},
+        };
+        occlusion.topology = ixrhi::IXRHIPrimitiveTopology::TriangleList;
+        occlusion.cullMode = ixrhi::IXRHICullMode::None;
+        occlusion.frontFace = ixrhi::IXRHIFrontFace::Clockwise;
+        occlusion.depthTestEnable = true;
+        occlusion.depthWriteEnable = false;
+        occlusion.depthCompareOp = ixrhi::IXRHICompareOp::LessOrEqual;
+        ixrhi::IXRHIBlendAttachment noColor{};
+        noColor.writeColor = false;
+        occlusion.blendAttachments = {noColor};
+        occlusion.sampleCount = 1;
+        occlusion.targetRenderPass = m_targetPass;
+        occlusion.debugName = "Terrain:WaterOcclusion";
+        m_waterOcclusionPipeline = rhi.CreateGraphicsPipeline(occlusion);
+    }
     return m_waterPipeline != nullptr;
 }
 
@@ -6508,6 +6616,7 @@ void TerrainRenderer::DestroyPipeline()
 void TerrainRenderer::DestroyWaterPipeline()
 {
     m_waterPipeline.reset();
+    m_waterOcclusionPipeline.reset();
 }
 
 void TerrainRenderer::DestroyWaterReflectionPipeline()
