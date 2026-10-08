@@ -46,6 +46,11 @@ public:
     // coherent memory, no explicit flush needed by the caller).
     virtual void Write(std::uint64_t dstOffsetBytes, const void* src, std::size_t byteCount) = 0;
 
+    // The host address of a Write-visible buffer's memory (the one Write copies into), mapped until
+    // the buffer is destroyed; coherent, so nothing needs flushing. Ask for it on one thread (the
+    // first ask maps); then several threads may write through it at once, each to bytes of its own.
+    virtual void* HostAddress() = 0;
+
     // Host read-back from a Write-visible buffer (staging/readback paths such
     // as compute verification). Out-of-range reads are ignored.
     virtual void Read(std::uint64_t srcOffsetBytes, void* dst, std::size_t byteCount) = 0;

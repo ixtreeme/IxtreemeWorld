@@ -521,6 +521,7 @@ struct FrameCpuProfile
     double animationMs = 0.0;    // skinning pre-pass: animators, clip sampling, palettes, dispatches
     double renderRecordsMs = 0.0;  // of which: the mesh render records checked (and rebuilt)
     double shadowPassMs = 0.0;   // sun shadow casters gathered and recorded
+    double particleInstancesMs = 0.0;  // the frame's CPU particle instances built and uploaded
     std::uint32_t skinnedInstances = 0;  // character instances skinned this frame (all views)
 };
 
@@ -5885,15 +5886,44 @@ int RunGame(NativeWindow& window,
     // render pre-pass) so emitters preview while authoring — the two paths never double-step.
     // A newly appearing emitter (a spawned prefab, a component just added) starts lazily here;
     // playOnStart=false emitters wait for a script's ParticlePlay/ParticleEmit.
-    auto updateParticleSimulators = [&](float dt) {
-        for (const MeshSceneEntity& mesh : editorMeshEntities)
+    // The entities with an enabled particle system, as indices into editorMeshEntities in entity order:
+    // gathered where they are used (the simulation, the frame's instances), not looked for in every
+    // entity by each emitter loop, view and pass.
+    std::vector<std::uint32_t> particleEntityIndices;
+    auto gatherParticleEntities = [&]() {
+        particleEntityIndices.clear();
+        for (std::uint32_t index = 0; index < static_cast<std::uint32_t>(editorMeshEntities.size()); ++index)
         {
-            if (!mesh.hasParticleSystem || !mesh.particleSystem.enabled || !mesh.particleSystem.playOnStart ||
-                mesh.particleSystem.gpuSimulation)
+            const MeshSceneEntity& mesh = editorMeshEntities[index];
+            if (mesh.hasParticleSystem && mesh.particleSystem.enabled)
+                particleEntityIndices.push_back(index);
+        }
+    };
+    // Whether a frame's particle work is split over the job system: per emitter, and only once there
+    // is enough of it to pay for the hand-off (IX_PARALLEL_PARTICLES=0: always in order, here).
+    constexpr std::size_t kParallelParticleMinimum = 4096;
+    auto parallelParticles = [](std::size_t particles) {
+        static const bool enabled = ixjobs::FeatureEnabled("IX_PARALLEL_PARTICLES");
+        return enabled && particles >= kParallelParticleMinimum && ixjobs::JobSystem::Instance().Parallel();
+    };
+    struct ParticleStep
+    {
+        ixparticle::ParticleSimulator* simulator = nullptr;
+        const MeshSceneEntity* mesh = nullptr;
+    };
+    std::vector<ParticleStep> particleSteps;
+    auto updateParticleSimulators = [&](float dt) {
+        gatherParticleEntities();
+        for (std::uint32_t index : particleEntityIndices)
+        {
+            const MeshSceneEntity& mesh = editorMeshEntities[index];
+            if (!mesh.particleSystem.playOnStart || mesh.particleSystem.gpuSimulation)
                 continue;
             if (entityParticles.find(mesh.id) == entityParticles.end())
                 entityParticles[mesh.id].Reset(mesh.particleSystem, mesh.id);
         }
+        particleSteps.clear();
+        std::size_t particleCount = 0;
         for (auto it = entityParticles.begin(); it != entityParticles.end();)
         {
             // By id (a scan per emitter was 10 000 entities x 50 emitters a frame); the scan stays for
@@ -5911,7 +5941,17 @@ int RunGame(NativeWindow& window,
                 it = entityParticles.erase(it);
                 continue;
             }
+            particleSteps.push_back({&it->second, meshIt});
+            particleCount += it->second.AliveCount();
+            ++it;
+        }
+        // Each emitter steps on its own: its simulator and random stream, a ground query that only reads
+        // the terrain. So they step in parallel, one emitter a task, with the same results in any order.
+        const auto step = [&](std::uint32_t begin, std::uint32_t end, std::uint32_t) {
+            for (std::uint32_t stepIndex = begin; stepIndex < end; ++stepIndex)
             {
+                ixparticle::ParticleSimulator& simulator = *particleSteps[stepIndex].simulator;
+                const MeshSceneEntity* meshIt = particleSteps[stepIndex].mesh;
                 float emitterPosition[3] = {
                     meshIt->position[0], meshIt->position[1], meshIt->position[2]};
                 float emitterDirection[3] = {
@@ -5953,11 +5993,125 @@ int RunGame(NativeWindow& window,
                     ? particleGroundHeight : nullptr;
                 ParticleGroundContext groundContext{
                     terrainOk ? &terrain : nullptr, meshIt->particleSystem.groundPlaneY};
-                it->second.Update(meshIt->particleSystem, emitterPosition, emitterDirection, dt,
+                simulator.Update(meshIt->particleSystem, emitterPosition, emitterDirection, dt,
                     groundQuery, groundQuery != nullptr ? &groundContext : nullptr, spawnAxes);
             }
-            ++it;
+        };
+        const std::uint32_t stepCount = static_cast<std::uint32_t>(particleSteps.size());
+        if (parallelParticles(particleCount))
+            ixjobs::JobSystem::Instance().ParallelFor(stepCount, 1, step);
+        else
+            step(0, stepCount, 0);
+    };
+    // The frame's CPU particle instances, every emitter's. They are in world space, so all views and
+    // passes share them: written once, straight into the frame's instance buffer (the emitters in
+    // parallel, each into its own range); collectParticleDraws gives each view's draws their ranges.
+    struct ParticleDrawEmitter
+    {
+        const MeshSceneEntity* mesh = nullptr;
+        const ixparticle::ParticleSimulator* simulator = nullptr;  // null: a GPU emitter
+        std::uint32_t instanceBase = 0;
+        std::uint32_t instanceCount = 0;
+    };
+    std::vector<ParticleDrawEmitter> particleDrawEmitters;
+    // Writes the emitter's instances (as many as fit: count) to out, GPU memory: written only.
+    auto fillParticleInstances = [&](const ParticleDrawEmitter& emitter, ParticleRenderer::InstanceData* out,
+                                     std::uint32_t count) {
+        const MeshSceneEntity& particleMesh = *emitter.mesh;
+        const std::vector<ixparticle::Particle>& particles = emitter.simulator->Particles();
+        // Flipbook: the atlas cell for each particle's current frame (over its lifetime).
+        const int atlasColumns = std::max(1, particleMesh.particleSystem.atlasColumns);
+        const int atlasRows = std::max(1, particleMesh.particleSystem.atlasRows);
+        const int atlasFrames = atlasColumns * atlasRows;
+        const float cellWidth = 1.0f / static_cast<float>(atlasColumns);
+        const float cellHeight = 1.0f / static_cast<float>(atlasRows);
+        // Local-space emitters store particle positions in their own axes: transform them by the
+        // emitter's transform here.
+        const bool localSpace = particleMesh.particleSystem.localSpace;
+        xm::Quat localRotation;  // identity unless localSpace
+        if (localSpace)
+            localRotation = xm::FromEulerRadians(
+                {particleMesh.rotation[0], particleMesh.rotation[1], particleMesh.rotation[2]});
+        for (std::uint32_t k = 0; k < count; ++k)
+        {
+            const ixparticle::Particle& particle = particles[k];
+            ParticleRenderer::InstanceData data;
+            if (localSpace)
+            {
+                const xm::Vec3 world = xm::Rotate(localRotation,
+                    {particle.position[0], particle.position[1], particle.position[2]});
+                data.position[0] = particleMesh.position[0] + world.x;
+                data.position[1] = particleMesh.position[1] + world.y;
+                data.position[2] = particleMesh.position[2] + world.z;
+            }
+            else
+            {
+                data.position[0] = particle.position[0];
+                data.position[1] = particle.position[1];
+                data.position[2] = particle.position[2];
+            }
+            data.size = particle.size;
+            data.rotation = particle.rotation;
+            data.color[0] = particle.color[0];
+            data.color[1] = particle.color[1];
+            data.color[2] = particle.color[2];
+            data.color[3] = particle.color[3];
+            if (atlasFrames > 1)
+            {
+                const float lifeT = std::clamp(particle.age / std::max(particle.lifetime, 1e-4f), 0.0f, 1.0f);
+                const int frame = std::min(static_cast<int>(lifeT * atlasFrames), atlasFrames - 1);
+                data.uvRect[0] = static_cast<float>(frame % atlasColumns) * cellWidth;
+                data.uvRect[1] = static_cast<float>(frame / atlasColumns) * cellHeight;
+                data.uvRect[2] = cellWidth;
+                data.uvRect[3] = cellHeight;
+            }
+            out[k] = data;
         }
+    };
+    auto buildParticleInstances = [&](const ixrhi::IXRHIFrameInfo& frame) {
+        particleDrawEmitters.clear();
+        if (!particleRendererOk)
+            return;
+        gatherParticleEntities();
+        std::uint32_t total = 0;
+        for (std::uint32_t index : particleEntityIndices)
+        {
+            const MeshSceneEntity& mesh = editorMeshEntities[index];
+            ParticleDrawEmitter emitter;
+            emitter.mesh = &mesh;
+            if (!mesh.particleSystem.gpuSimulation)
+            {
+                // A CPU emitter without a simulator or particles has nothing to draw.
+                const auto simIt = entityParticles.find(mesh.id);
+                if (simIt == entityParticles.end() || simIt->second.Particles().empty())
+                    continue;
+                emitter.simulator = &simIt->second;
+                emitter.instanceBase = total;
+                emitter.instanceCount = static_cast<std::uint32_t>(simIt->second.Particles().size());
+                total += emitter.instanceCount;
+            }
+            particleDrawEmitters.push_back(emitter);
+        }
+        if (total == 0)
+            return;
+        std::uint32_t granted = 0;
+        ParticleRenderer::InstanceData* instances = particleRenderer.BeginCpuInstances(frame, total, granted);
+        if (!instances)
+            return;
+        const auto fill = [&](std::uint32_t begin, std::uint32_t end, std::uint32_t) {
+            for (std::uint32_t i = begin; i < end; ++i)
+            {
+                const ParticleDrawEmitter& emitter = particleDrawEmitters[i];
+                if (emitter.simulator && emitter.instanceBase < granted)
+                    fillParticleInstances(emitter, instances + emitter.instanceBase,
+                        std::min(emitter.instanceCount, granted - emitter.instanceBase));
+            }
+        };
+        const std::uint32_t emitterCount = static_cast<std::uint32_t>(particleDrawEmitters.size());
+        if (parallelParticles(total))
+            ixjobs::JobSystem::Instance().ParallelFor(emitterCount, 1, fill);
+        else
+            fill(0, emitterCount, 0);
     };
     // GPU particle emitters: one compute dispatch per emitter per frame, outside any render pass
     // (the compute writes the state buffer the transparent queue draws later). Runs in Play and in
@@ -5966,10 +6120,12 @@ int RunGame(NativeWindow& window,
                                             const ixrhi::IXRHIFrameInfo& frame, float dt) {
         if (!particleRendererOk)
             return;
-        for (const MeshSceneEntity& mesh : editorMeshEntities)
+        gatherParticleEntities();
+        for (std::uint32_t index : particleEntityIndices)
         {
+            const MeshSceneEntity& mesh = editorMeshEntities[index];
             const ixparticle::ParticleSystemComponent& component = mesh.particleSystem;
-            if (!mesh.hasParticleSystem || !component.enabled || !component.gpuSimulation)
+            if (!component.gpuSimulation)
                 continue;
             ParticleRenderer::GpuEmitterParams params;
             params.emitterPosition[0] = mesh.position[0];
@@ -12136,7 +12292,7 @@ int RunGame(NativeWindow& window,
                 bool underWater = false;
                 StaticMeshRenderer* renderer = nullptr;
                 StaticMeshRenderer::Instance instance;
-                // Particle emitters: `particleRenderer` set, `particleBatch` owns the per-particle data.
+                // Particle emitters: `particleRenderer` set, `particleBatch` points at the emitter's instances.
                 ParticleRenderer* particleRenderer = nullptr;
                 ParticleRenderer::Batch particleBatch;
             };
@@ -12193,14 +12349,13 @@ int RunGame(NativeWindow& window,
             // them under/above the surface and they blend back-to-front with the transparent meshes.
             auto collectParticleDraws = [&](std::vector<TransparentDraw>& draws, const WorldCamera& viewCamera,
                                             bool allowSoftParticles) {
-                // GPU emitters have no CPU simulator, so the CPU map may be empty while they render.
+                // The frame's emitters, in entity order (buildParticleInstances): the GPU ones and the
+                // CPU ones with particles.
                 if (!particleRendererOk)
                     return;
-                for (const MeshSceneEntity& particleMesh : editorMeshEntities)
+                for (const ParticleDrawEmitter& emitter : particleDrawEmitters)
                 {
-                    if (!particleMesh.hasParticleSystem || !particleMesh.particleSystem.enabled)
-                        continue;
-                    const auto simIt = entityParticles.find(particleMesh.id);
+                    const MeshSceneEntity& particleMesh = *emitter.mesh;
                     if (particleMesh.particleSystem.gpuSimulation)
                     {
                         // GPU emitter: its state buffer is drawn directly (the compute ran in the
@@ -12228,8 +12383,6 @@ int RunGame(NativeWindow& window,
                         gpuBatch.softDistance = particleMesh.particleSystem.softDistance;
                         continue;
                     }
-                    if (simIt == entityParticles.end() || simIt->second.Particles().empty())
-                        continue;
 
                     TransparentDraw& draw = draws.emplace_back();
                     const float dx = particleMesh.position[0] - viewCamera.eye.x;
@@ -12252,56 +12405,8 @@ int RunGame(NativeWindow& window,
                     // Scene View / the game; the editor's Game View has no per-view snapshot yet).
                     batch.softParticles = allowSoftParticles && particleMesh.particleSystem.softParticles;
                     batch.softDistance = particleMesh.particleSystem.softDistance;
-                    const std::vector<ixparticle::Particle>& particles = simIt->second.Particles();
-                    batch.instances.reserve(particles.size());
-                    // Flipbook: the atlas cell for each particle's current frame (over its lifetime).
-                    const int atlasColumns = std::max(1, particleMesh.particleSystem.atlasColumns);
-                    const int atlasRows = std::max(1, particleMesh.particleSystem.atlasRows);
-                    const int atlasFrames = atlasColumns * atlasRows;
-                    const float cellWidth = 1.0f / static_cast<float>(atlasColumns);
-                    const float cellHeight = 1.0f / static_cast<float>(atlasRows);
-                    // Local-space emitters store particle positions in their own axes: transform them
-                    // by the emitter's transform here.
-                    const bool localSpace = particleMesh.particleSystem.localSpace;
-                    xm::Quat localRotation;  // identity unless localSpace
-                    if (localSpace)
-                        localRotation = xm::FromEulerRadians(
-                            {particleMesh.rotation[0], particleMesh.rotation[1], particleMesh.rotation[2]});
-                    for (const ixparticle::Particle& particle : particles)
-                    {
-                        ParticleRenderer::InstanceData data;
-                        if (localSpace)
-                        {
-                            const xm::Vec3 world = xm::Rotate(localRotation,
-                                {particle.position[0], particle.position[1], particle.position[2]});
-                            data.position[0] = particleMesh.position[0] + world.x;
-                            data.position[1] = particleMesh.position[1] + world.y;
-                            data.position[2] = particleMesh.position[2] + world.z;
-                        }
-                        else
-                        {
-                            data.position[0] = particle.position[0];
-                            data.position[1] = particle.position[1];
-                            data.position[2] = particle.position[2];
-                        }
-                        data.size = particle.size;
-                        data.rotation = particle.rotation;
-                        data.color[0] = particle.color[0];
-                        data.color[1] = particle.color[1];
-                        data.color[2] = particle.color[2];
-                        data.color[3] = particle.color[3];
-                        if (atlasFrames > 1)
-                        {
-                            const float lifeT = std::clamp(
-                                particle.age / std::max(particle.lifetime, 1e-4f), 0.0f, 1.0f);
-                            const int frame = std::min(static_cast<int>(lifeT * atlasFrames), atlasFrames - 1);
-                            data.uvRect[0] = static_cast<float>(frame % atlasColumns) * cellWidth;
-                            data.uvRect[1] = static_cast<float>(frame / atlasColumns) * cellHeight;
-                            data.uvRect[2] = cellWidth;
-                            data.uvRect[3] = cellHeight;
-                        }
-                        batch.instances.push_back(data);
-                    }
+                    batch.instanceBase = emitter.instanceBase;
+                    batch.instanceCount = emitter.instanceCount;
                 }
             };
             bool sceneWaterPass = false;  // the Scene View's water gets its own pass (after a snapshot)
@@ -12355,6 +12460,11 @@ int RunGame(NativeWindow& window,
             // Edit alike (the compute writes the buffer the transparent queue draws later).
             simulateGpuParticleEmitters(*frameInfo.commandList, frameInfo,
                 static_cast<float>(deltaSeconds));
+            {
+                const auto instancesBegin = std::chrono::steady_clock::now();
+                buildParticleInstances(frameInfo);
+                frameProfile.particleInstancesMs = MillisecondsBetween(instancesBegin, std::chrono::steady_clock::now());
+            }
 
             // The sky's parameters for this frame, before any pass draws it (outside render passes:
             // a changed sky image is loaded here). Its sun follows the scene's Sun light.
@@ -14017,6 +14127,7 @@ int RunGame(NativeWindow& window,
             sum.physicsMs += frameProfile.physicsMs;
             sum.scriptsMs += frameProfile.scriptsMs;
             sum.particlesMs += frameProfile.particlesMs;
+            sum.particleInstancesMs += frameProfile.particleInstancesMs;
             sum.animationMs += frameProfile.animationMs;
             sum.renderRecordsMs += frameProfile.renderRecordsMs;
             sum.sceneRenderMs += frameProfile.sceneRenderMs;
@@ -14071,12 +14182,12 @@ int RunGame(NativeWindow& window,
                     aliveParticles += simulator.AliveCount();
                 }
                 Tracenf("[PERF] loop %.0f fps, presented %.0f fps | cpu ms: frame %.3f (max %.3f) wait %.3f "
-                        "sim %.3f (physics %.3f scripts %.3f particles %.3f) anim %.3f (records %.3f) render %.3f (shadow %.3f) "
-                        "ui %.3f submit %.3f | scene: %zu meshes, %.0f skinned, %zu cpu emitters, %zu particles",
+                        "sim %.3f (physics %.3f scripts %.3f particles %.3f) anim %.3f (records %.3f) render %.3f (shadow %.3f "
+                        "particles %.3f) ui %.3f submit %.3f | scene: %zu meshes, %.0f skinned, %zu cpu emitters, %zu particles",
                     n / windowSeconds, presented / windowSeconds, sum.totalCpuFrameMs / n, perfLog.maxFrameMs,
                     sum.frameWaitMs / n, sum.simulationMs / n, sum.physicsMs / n, sum.scriptsMs / n,
                     sum.particlesMs / n, sum.animationMs / n, sum.renderRecordsMs / n, sum.sceneRenderMs / n,
-                    sum.shadowPassMs / n,
+                    sum.shadowPassMs / n, sum.particleInstancesMs / n,
                     sum.editorUiRenderMs / n, sum.submitPresentMs / n, editorMeshEntities.size(),
                     static_cast<double>(perfLog.skinnedSum) / n, entityParticles.size(), aliveParticles);
                 if (perfLog.gpuSamples > 0)

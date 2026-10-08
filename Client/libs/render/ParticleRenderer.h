@@ -27,6 +27,7 @@
 #include <array>
 #include <cstdint>
 #include <functional>
+#include <limits>
 #include <memory>
 #include <string>
 #include <unordered_map>
@@ -63,11 +64,12 @@ public:
         // bound, e.g. the depth snapshot is unavailable).
         bool softParticles = true;
         float softDistance = 0.5f;
-        // CPU path: the per-particle data built this frame. GPU path: the emitter's state buffer
-        // (simulated by SimulateGpuEmitter) is drawn instead.
+        // CPU path: the emitter's range of the frame's instances (BeginCpuInstances). GPU path: the
+        // emitter's state buffer (simulated by SimulateGpuEmitter) is drawn instead.
         bool gpu = false;
         std::uint32_t gpuEntityId = 0;
-        std::vector<InstanceData> instances;
+        std::uint32_t instanceBase = 0;
+        std::uint32_t instanceCount = 0;
     };
 
     // The parameters the engine feeds the GPU simulation each frame (a mirror of the component
@@ -142,6 +144,15 @@ public:
         m_textureResolver = std::move(resolver);
     }
 
+    // Room for the frame's CPU particles, every emitter's, once a frame before any CPU batch is drawn:
+    // the frame's instance buffer itself (grown to fit, up to kMaxInstances), to be written in place,
+    // by several threads at once if need be (each to instances of its own; write only, it is GPU
+    // memory). They do not depend on the view, so each view and pass draws its emitters' ranges of
+    // them. Null when there is none; `granted` is how many fit.
+    InstanceData* BeginCpuInstances(const ixrhi::IXRHIFrameInfo& frame,
+                                    std::uint32_t count,
+                                    std::uint32_t& granted);
+
     void RenderInWorld(ixrhi::IXRHICommandList& cmd,
                        const ixrhi::IXRHIFrameInfo& frame,
                        const WorldCamera& camera,
@@ -155,7 +166,8 @@ private:
     // Descriptor sets / view uniforms per frame: one per emitter draw (both views). Past the last one
     // a draw is dropped: a set already bound in the frame's commands must not be rewritten.
     static constexpr std::uint32_t kDrawSlots = 128;
-    static constexpr std::uint32_t kMaxInstances = 16384;
+    static constexpr std::uint32_t kInitialInstances = 16384;
+    static constexpr std::uint32_t kMaxInstances = 1u << 20;  // 64 MB a frame in flight
 
     struct ViewUniform
     {
@@ -233,6 +245,7 @@ private:
     std::shared_ptr<ixrhi::IXRHIShader> m_vertexShader;
     std::shared_ptr<ixrhi::IXRHIShader> m_pixelShader;
     std::array<std::shared_ptr<ixrhi::IXRHIBuffer>, kFramesInFlight> m_instanceBuffers{};
+    std::array<std::uint32_t, kFramesInFlight> m_instanceCapacity{};
     std::array<std::shared_ptr<ixrhi::IXRHIBuffer>, kFramesInFlight * kDrawSlots> m_uniformBuffers{};
     std::unique_ptr<ixrhi::IXRHIBindGroupLayout> m_bindLayout;
     std::unique_ptr<ixrhi::IXRHIBindGroup> m_bindGroup;
@@ -261,7 +274,9 @@ private:
     float m_sceneNear = 0.1f;
     float m_sceneFar = 1000.0f;
     std::uint64_t m_lastFrameNumber = 0;
-    std::uint32_t m_instanceCursor = 0;
     std::uint32_t m_drawSlotCursor = 0;
+    // The frame BeginCpuInstances last ran in, and how many instances it gave room for.
+    std::uint64_t m_uploadedFrameNumber = std::numeric_limits<std::uint64_t>::max();
+    std::uint32_t m_uploadedCount = 0;
     bool m_loggedCapacity = false;
 };

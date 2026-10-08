@@ -129,13 +129,14 @@ bool ParticleRenderer::CreateBuffers(ixrhi::IXRHIDevice& rhi)
     for (std::uint32_t frame = 0; frame < kFramesInFlight; ++frame)
     {
         ixrhi::IXRHIBufferDesc desc;
-        desc.sizeBytes = sizeof(InstanceData) * kMaxInstances;
+        desc.sizeBytes = sizeof(InstanceData) * kInitialInstances;
         desc.usage = ixrhi::IXRHIBufferUsage::Storage;
         desc.cpuAccess = ixrhi::IXRHICpuAccess::Write;
         desc.debugName = "Particle:Instances";
         m_instanceBuffers[frame] = rhi.CreateBuffer(desc, nullptr, 0);
         if (!m_instanceBuffers[frame])
             return false;
+        m_instanceCapacity[frame] = kInitialInstances;
     }
     for (std::uint32_t slot = 0; slot < kFramesInFlight * kDrawSlots; ++slot)
     {
@@ -238,7 +239,7 @@ bool ParticleRenderer::CreateBindGroup(ixrhi::IXRHIDevice& rhi)
             if (m_defaultTexture.texture && m_defaultTexture.sampler)
                 m_bindGroup->UpdateTexture(setIndex, 1, m_defaultTexture.texture, m_defaultTexture.sampler);
             m_bindGroup->UpdateBuffer(setIndex, 2, m_instanceBuffers[frame], 0,
-                sizeof(InstanceData) * kMaxInstances);
+                sizeof(InstanceData) * m_instanceCapacity[frame]);
             if (m_dummyDepth && m_defaultTexture.sampler)
                 m_bindGroup->UpdateTexture(setIndex, 3, m_dummyDepth, m_defaultTexture.sampler);
             m_boundDepth[setIndex] = m_dummyDepth;
@@ -425,7 +426,7 @@ void ParticleRenderer::RenderInWorld(ixrhi::IXRHICommandList& cmd,
     }
     else
     {
-        if (batch.instances.empty())
+        if (batch.instanceCount == 0)
             return;
         pipeline = batch.additive ? m_additivePipeline.get() : m_alphaPipeline.get();
     }
@@ -436,7 +437,6 @@ void ParticleRenderer::RenderInWorld(ixrhi::IXRHICommandList& cmd,
     if (frame.frameNumber != m_lastFrameNumber)
     {
         m_lastFrameNumber = frame.frameNumber;
-        m_instanceCursor = 0;
         m_drawSlotCursor = 0;
     }
     if (m_drawSlotCursor >= kDrawSlots)
@@ -458,27 +458,13 @@ void ParticleRenderer::RenderInWorld(ixrhi::IXRHICommandList& cmd,
     }
     else
     {
-        if (m_instanceCursor >= kMaxInstances)
-            return;  // this frame's buffer is full (the capacity warning was logged)
-
-        count = static_cast<std::uint32_t>(batch.instances.size());
-        if (count > kMaxInstances - m_instanceCursor)
-        {
-            count = kMaxInstances - m_instanceCursor;
-            if (!m_loggedCapacity)
-            {
-                TraceError("[PARTICLE] instance buffer full (%u): %zu particles dropped this frame",
-                    kMaxInstances, batch.instances.size() - count);
-                m_loggedCapacity = true;
-            }
-        }
+        // Its range of this frame's upload (past what the buffer took: nothing, or the part it did).
+        if (frame.frameNumber != m_uploadedFrameNumber || batch.instanceBase >= m_uploadedCount)
+            return;
+        base = batch.instanceBase;
+        count = std::min(batch.instanceCount, m_uploadedCount - base);
         if (count == 0)
             return;
-
-        base = m_instanceCursor;
-        m_instanceBuffers[frameIndex]->Write(static_cast<std::uint64_t>(base) * sizeof(InstanceData),
-            batch.instances.data(), static_cast<std::size_t>(count) * sizeof(InstanceData));
-        m_instanceCursor = base + count;
     }
 
     // The billboard's camera basis (same derivation as WorldLabelRenderer).
@@ -514,7 +500,7 @@ void ParticleRenderer::RenderInWorld(ixrhi::IXRHICommandList& cmd,
             kGpuStateBytes * gpuEmitter->maxParticles);
     else
         m_bindGroup->UpdateBuffer(bindSlot, 2, m_instanceBuffers[frameIndex], 0,
-            sizeof(InstanceData) * kMaxInstances);
+            sizeof(InstanceData) * m_instanceCapacity[frameIndex]);
     // The depth the soft fade reads (SetSceneDepth; the dummy one until there is one).
     const bool haveSceneDepth = m_sceneDepth && m_sceneDepthSampler;
     const std::shared_ptr<ixrhi::IXRHITexture>& depthImage = haveSceneDepth ? m_sceneDepth : m_dummyDepth;
@@ -530,6 +516,56 @@ void ParticleRenderer::RenderInWorld(ixrhi::IXRHICommandList& cmd,
     cmd.SetGraphicsPipeline(*pipeline);
     cmd.BindGroup(0, *m_bindGroup, bindSlot);
     cmd.Draw(6, count, 0, base);
+}
+
+ParticleRenderer::InstanceData* ParticleRenderer::BeginCpuInstances(const ixrhi::IXRHIFrameInfo& frame,
+                                                                    std::uint32_t count,
+                                                                    std::uint32_t& granted)
+{
+    m_uploadedFrameNumber = frame.frameNumber;
+    m_uploadedCount = 0;
+    granted = 0;
+    if (!m_rhi || !frame.frameActive || count == 0)
+        return nullptr;
+    const std::uint32_t frameIndex = frame.frameIndex % kFramesInFlight;
+    if (count > kMaxInstances)
+    {
+        if (!m_loggedCapacity)
+        {
+            TraceError("[PARTICLE] more than %u CPU particles in a frame: %u not drawn", kMaxInstances,
+                count - kMaxInstances);
+            m_loggedCapacity = true;
+        }
+        count = kMaxInstances;
+    }
+    if (count > m_instanceCapacity[frameIndex] || !m_instanceBuffers[frameIndex])
+    {
+        // The frame in flight that last used this buffer is done with it, and the draw sets point at
+        // the frame's buffer per draw (the sets that pointed at the old one keep it alive).
+        std::uint32_t capacity = std::max(m_instanceCapacity[frameIndex], kInitialInstances);
+        while (capacity < count)
+            capacity = std::min(capacity * 2u, kMaxInstances);
+        ixrhi::IXRHIBufferDesc desc;
+        desc.sizeBytes = sizeof(InstanceData) * capacity;
+        desc.usage = ixrhi::IXRHIBufferUsage::Storage;
+        desc.cpuAccess = ixrhi::IXRHICpuAccess::Write;
+        desc.debugName = "Particle:Instances";
+        if (std::shared_ptr<ixrhi::IXRHIBuffer> grown = m_rhi->CreateBuffer(desc, nullptr, 0))
+        {
+            m_instanceBuffers[frameIndex] = std::move(grown);
+            m_instanceCapacity[frameIndex] = capacity;
+            Tracenf("[PARTICLE] frame %u instance buffer: %u particles", frameIndex, capacity);
+        }
+        if (!m_instanceBuffers[frameIndex])
+            return nullptr;
+        count = std::min(count, m_instanceCapacity[frameIndex]);
+    }
+    auto* instances = static_cast<InstanceData*>(m_instanceBuffers[frameIndex]->HostAddress());
+    if (!instances)
+        return nullptr;
+    m_uploadedCount = count;
+    granted = count;
+    return instances;
 }
 
 ParticleRenderer::GpuEmitter* ParticleRenderer::EnsureGpuEmitter(ixrhi::IXRHIDevice& rhi,
@@ -803,6 +839,7 @@ void ParticleRenderer::Destroy()
     m_bindLayout.reset();
     for (auto& buffer : m_instanceBuffers)
         buffer.reset();
+    m_instanceCapacity = {};
     for (auto& buffer : m_uniformBuffers)
         buffer.reset();
     m_textures.clear();
@@ -820,7 +857,8 @@ void ParticleRenderer::Destroy()
     m_assets = nullptr;
     m_targetPass = nullptr;
     m_lastFrameNumber = 0;
-    m_instanceCursor = 0;
     m_drawSlotCursor = 0;
+    m_uploadedFrameNumber = std::numeric_limits<std::uint64_t>::max();
+    m_uploadedCount = 0;
     m_loggedCapacity = false;
 }

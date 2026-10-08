@@ -236,6 +236,44 @@ Hátravan:
   pipeline-ok), statikusnál 6–13 ms. Aszinkron GPU-feltöltés (transfer queue) és pipeline-megosztás csökkentené.
 - A jelenet-JSON parse és a paletta-dekódolás a legnagyobb indulási tétel.
 
+## Részecskék (5. lépés) – 2026-10-08
+
+- **Emitterenként egy job.** A szimulátor gyűjtése soros: új emitterek indulnak, a megszűntek kiesnek. Utána
+  minden emitter külön feladatként lép (`IX_PARALLEL_PARTICLES`). Mindegyiknek saját szimulátora és saját
+  véletlen-sorozata van (az entitás-id a seed), a talaj-lekérdezés pedig csak olvassa a terepet, így az eredmény
+  a futás sorrendjétől független. 4096 részecske alatt sorosan fut, mert ott a szétosztás többe kerülne.
+- **A CPU-részecskék példányadata frame-enként egyszer készül.** Eddig minden nézet és pass újra felépítette és
+  feltöltötte. Mivel világtérben vannak, minden nézet ugyanazt használhatja: emitterenként párhuzamosan,
+  közvetlenül a frame példány-bufferébe íródnak, és minden nézet a saját emittereinek tartományát rajzolja
+  (`ParticleRenderer::BeginCpuInstances`, `Batch::instanceBase/instanceCount`).
+  - Új RHI-hívás: `IXRHIBuffer::HostAddress()`. Ez egy CPU-ról írható buffer állandó leképezése; dokumentáltan
+    több szál is írhat rajta keresztül egyszerre, egymástól független bájtokra.
+- **A példány-buffer nő.** Eddig frame-enként legfeljebb 16 384 CPU-részecske rajzolódott ki, a többi elveszett.
+  Most a buffer frame-enként és szükség szerint duplázódik, legfeljebb 1 048 576 részecskéig.
+- **Az emitterek listája egyszer készül.** A szimuláció, a GPU-emitterek és a nézetek eddig mind a 10 000
+  entitást végignézték; most egyszer gyűjtődik ki az emitterek listája.
+
+Részecske-terhelt változat (`Main.scene.particles`: 101 CPU-emitter, ~100 000 részecske), buildelt játék:
+
+| Mód | szimuláció | példányadat | CPU-munka (frame − GPU-várakozás) | FPS | kirajzolt részecske |
+| --- | --- | --- | --- | --- | --- |
+| az 5. lépés előtt | 2,44 ms | (a renderben) | ~7,7 ms | 127–131 | 16 384 |
+| `IX_JOBS=0` | 2,45 ms | 0,71 ms | ~9,5 ms* | 105* | ~100 000 |
+| `IX_PARALLEL_PARTICLES=0` | 2,46 ms | 0,72 ms | ~7,0 ms | 134 | ~100 000 |
+| párhuzamos | **0,44–0,48 ms** | **0,48–0,54 ms** | **4,2–4,8 ms** | 121–133 (GPU-korlátos) | ~100 000 |
+
+\* Ez egy későbbi mérésből van, amikor a gép lassabb volt: ugyanakkor a párhuzamos mód 4,8 ms és 121 FPS volt
+(korábban 4,2 ms és 133 FPS).
+
+A terhelt alapjelenetben (50 CPU-emitter, ~5000 részecske) a szimuláció 0,20 ms helyett 0,12 ms, a példányadat
+~0,1 ms; 145 FPS, visszaesés nincs. A szinkronizációs validáció 0 hibát jelzett, beleértve a növekvő buffert is.
+A buildelt játékban és az editorban (Edit-előnézet és Play) is helyesen rajzolódnak a részecskék. Az editor
+frame-jében a részecskék ~1,1 ms-ot tesznek ki; a 25 ms-os frame fő tételei a 10 000 entitásos hierarchia
+és a UI.
+
+A tervből kimaradt: a Scene és Game transparent queue szálankénti gyűjtése és összefésülése. A gyűjtés most
+emitterenként csak néhány mező, a meglévő `stable_sort` megmarad, így ez nem mérhető tétel.
+
 ## Következmény a párhuzamosítási tervre
 
 - A legnagyobb nyereség a **render-adatok kinyerésének** átalakítása (a terv 3. lépése). Kell hozzá
