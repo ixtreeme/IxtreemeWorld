@@ -2145,6 +2145,78 @@ SunShadowReceive TerrainRenderer::SunShadowForMeshes(std::uint64_t frameNumber) 
     return out;
 }
 
+bool TerrainRenderer::StaticShadowRegions(std::uint32_t cascade, const ShadowCasters& casters,
+                                          std::vector<StaticShadowRegion>& regions) const
+{
+    regions.clear();
+    if (!casters.staticLeft)
+        return true;
+    const float* m = m_shadowCascadeViewProj[cascade].m;
+    const float resolution = static_cast<float>(kShadowResolution);
+    std::uint64_t area = 0;
+    for (const StaticCasterBounds& bounds : *casters.staticLeft)
+    {
+        // The box's texels in the layer (clip x, y to texels as the viewport maps them), a texel
+        // past each side for its rasterized edge.
+        float minX = std::numeric_limits<float>::max();
+        float minY = std::numeric_limits<float>::max();
+        float maxX = std::numeric_limits<float>::lowest();
+        float maxY = std::numeric_limits<float>::lowest();
+        for (int corner = 0; corner < 8; ++corner)
+        {
+            const float x = (corner & 1) ? bounds.max.x : bounds.min.x;
+            const float y = (corner & 2) ? bounds.max.y : bounds.min.y;
+            const float z = (corner & 4) ? bounds.max.z : bounds.min.z;
+            const float clipW = x * m[3] + y * m[7] + z * m[11] + m[15];
+            const float w = std::abs(clipW) > 1e-6f ? clipW : 1.0f;
+            const float ndcX = (x * m[0] + y * m[4] + z * m[8] + m[12]) / w;
+            const float ndcY = (x * m[1] + y * m[5] + z * m[9] + m[13]) / w;
+            minX = std::min(minX, (ndcX + 1.0f) * 0.5f * resolution);
+            maxX = std::max(maxX, (ndcX + 1.0f) * 0.5f * resolution);
+            minY = std::min(minY, (ndcY + 1.0f) * 0.5f * resolution);
+            maxY = std::max(maxY, (ndcY + 1.0f) * 0.5f * resolution);
+        }
+        const float x0 = std::clamp(std::floor(minX) - 1.0f, 0.0f, resolution);
+        const float x1 = std::clamp(std::ceil(maxX) + 1.0f, 0.0f, resolution);
+        const float y0 = std::clamp(std::floor(minY) - 1.0f, 0.0f, resolution);
+        const float y1 = std::clamp(std::ceil(maxY) + 1.0f, 0.0f, resolution);
+        if (x1 <= x0 || y1 <= y0)
+            continue;  // not over this cascade
+        if (regions.size() == kMaxStaticShadowRegions)
+            return false;
+        StaticShadowRegion region;
+        region.x = static_cast<std::uint32_t>(x0);
+        region.y = static_cast<std::uint32_t>(y0);
+        region.width = static_cast<std::uint32_t>(x1 - x0);
+        region.height = static_cast<std::uint32_t>(y1 - y0);
+        area += static_cast<std::uint64_t>(region.width) * region.height;
+        if (area * 4u > static_cast<std::uint64_t>(kShadowResolution) * kShadowResolution)
+            return false;
+        // The cascade's view-projection with the region's clip range stretched to [-1, 1]: a box over
+        // the region is then over the clip square.
+        const float ax = x0 / resolution * 2.0f - 1.0f;
+        const float bx = x1 / resolution * 2.0f - 1.0f;
+        const float ay = y0 / resolution * 2.0f - 1.0f;
+        const float by = y1 / resolution * 2.0f - 1.0f;
+        const float scaleX = 2.0f / (bx - ax);
+        const float offsetX = -(ax + bx) / (bx - ax);
+        const float scaleY = 2.0f / (by - ay);
+        const float offsetY = -(ay + by) / (by - ay);
+        region.region.clipMin[0] = ax;
+        region.region.clipMin[1] = ay;
+        region.region.clipMax[0] = bx;
+        region.region.clipMax[1] = by;
+        region.region.viewProj = m_shadowCascadeViewProj[cascade];
+        for (int row = 0; row < 4; ++row)
+        {
+            region.region.viewProj.m[row * 4 + 0] = scaleX * m[row * 4 + 0] + offsetX * m[row * 4 + 3];
+            region.region.viewProj.m[row * 4 + 1] = scaleY * m[row * 4 + 1] + offsetY * m[row * 4 + 3];
+        }
+        regions.push_back(region);
+    }
+    return true;
+}
+
 bool TerrainRenderer::EnsureStaticShadowCache(ixrhi::IXRHICommandList& cmd)
 {
     if (m_staticShadowTexture)
@@ -2164,6 +2236,7 @@ bool TerrainRenderer::EnsureStaticShadowCache(ixrhi::IXRHICommandList& cmd)
     if (!texture)
         return false;
     std::array<std::unique_ptr<ixrhi::IXRHIRenderTarget>, kShadowCascadeCount> staticTargets;
+    std::array<std::unique_ptr<ixrhi::IXRHIRenderTarget>, kShadowCascadeCount> staticLoadTargets;
     std::array<std::unique_ptr<ixrhi::IXRHIRenderTarget>, kShadowCascadeCount> overlayTargets;
     for (uint32_t cascade = 0; cascade < kShadowCascadeCount; ++cascade)
     {
@@ -2176,11 +2249,13 @@ bool TerrainRenderer::EnsureStaticShadowCache(ixrhi::IXRHICommandList& cmd)
         targetDesc.clearDepth = 1.0f;
         targetDesc.debugName = "Terrain:ShadowCascadeStatic" + std::to_string(cascade);
         staticTargets[cascade] = m_rhi->CreateRenderTarget(targetDesc);
-        targetDesc.depth = m_shadowTexture;
         targetDesc.depthLoad = ixrhi::IXRHILoadOp::Load;
+        targetDesc.debugName = "Terrain:ShadowCascadeStaticKept" + std::to_string(cascade);
+        staticLoadTargets[cascade] = m_rhi->CreateRenderTarget(targetDesc);
+        targetDesc.depth = m_shadowTexture;
         targetDesc.debugName = "Terrain:ShadowCascadeOverlay" + std::to_string(cascade);
         overlayTargets[cascade] = m_rhi->CreateRenderTarget(targetDesc);
-        if (!staticTargets[cascade] || !overlayTargets[cascade])
+        if (!staticTargets[cascade] || !staticLoadTargets[cascade] || !overlayTargets[cascade])
             return false;
     }
     // Every layer cleared once: each is then a depth attachment, the layout the copies start from.
@@ -2191,6 +2266,7 @@ bool TerrainRenderer::EnsureStaticShadowCache(ixrhi::IXRHICommandList& cmd)
     }
     m_staticShadowTexture = std::move(texture);
     m_staticShadowTargets = std::move(staticTargets);
+    m_staticShadowLoadTargets = std::move(staticLoadTargets);
     m_shadowOverlayTargets = std::move(overlayTargets);
     for (std::optional<ShadowCascadeInputs>& inputs : m_staticShadowInputs)
         inputs.reset();
@@ -2220,13 +2296,17 @@ void TerrainRenderer::RenderSunShadowMap(ixrhi::IXRHICommandList& cmd,
     UpdateShadowCascades(camera);
 
     // Only the cascades whose contents may have changed are drawn; the others are kept as they are.
-    // A redrawn cascade holding moving casters is composed: its static cache layer (drawn again only
-    // if what it holds changed), copied in, the moving casters over it.
+    // With the static cache, a redrawn cascade is composed: its static cache layer (the terrain and the
+    // static casters) copied in, the moving casters over it. A static layer that only lacks the frame's
+    // static caster change takes just that; it is drawn whole when anything else changed (the cascade
+    // moved, the terrain) or the change is not known.
+    enum class StaticLayerUpdate : std::uint8_t { Kept, Whole, Delta };
     std::array<bool, kShadowCascadeCount> redraw{};
     std::array<bool, kShadowCascadeCount> compose{};
-    std::array<bool, kShadowCascadeCount> redrawStatic{};
+    std::array<StaticLayerUpdate, kShadowCascadeCount> staticUpdate{};
     bool anyRedraw = false;
     bool anyCompose = false;
+    const bool staticCache = casters.drawStatic && EnsureStaticShadowCache(cmd);
     for (uint32_t cascade = 0; cascade < kShadowCascadeCount; ++cascade)
     {
         ShadowCascadeInputs inputs;
@@ -2246,17 +2326,25 @@ void TerrainRenderer::RenderSunShadowMap(ixrhi::IXRHICommandList& cmd,
         }
         m_shadowCascadeInputs[cascade] = inputs;
         anyRedraw = true;
-        if (inputs.dynamicRevision != 0 && casters.drawDynamic && EnsureStaticShadowCache(cmd))
+        if (!staticCache)
+            continue;
+        compose[cascade] = true;
+        anyCompose = true;
+        ShadowCascadeInputs staticInputs = inputs;
+        staticInputs.dynamicRevision = 0;
+        staticInputs.shadowTexture = m_staticShadowTexture.get();
+        const std::optional<ShadowCascadeInputs>& held = m_staticShadowInputs[cascade];
+        if (held && *held == staticInputs)
+            continue;  // kept
+        bool delta = false;
+        if (held && casters.staticDeltaFrom != 0 && held->castersRevision == casters.staticDeltaFrom)
         {
-            compose[cascade] = true;
-            anyCompose = true;
-            ShadowCascadeInputs staticInputs = inputs;
-            staticInputs.dynamicRevision = 0;
-            staticInputs.shadowTexture = m_staticShadowTexture.get();
-            redrawStatic[cascade] = !m_staticShadowInputs[cascade] || !(*m_staticShadowInputs[cascade] == staticInputs);
-            if (redrawStatic[cascade])
-                m_staticShadowInputs[cascade] = staticInputs;
+            ShadowCascadeInputs advanced = *held;
+            advanced.castersRevision = staticInputs.castersRevision;
+            delta = advanced == staticInputs;
         }
+        staticUpdate[cascade] = delta ? StaticLayerUpdate::Delta : StaticLayerUpdate::Whole;
+        m_staticShadowInputs[cascade] = staticInputs;
     }
     if (!anyRedraw)
     {
@@ -2281,7 +2369,8 @@ void TerrainRenderer::RenderSunShadowMap(ixrhi::IXRHICommandList& cmd,
     // The casters (and the terrain) bake their pipelines against the first cascade's pass; the other
     // targets' passes are compatible with it (same depth format, only the load differs).
     const ixrhi::IXRHIRenderPass* casterPass = m_shadowTargets[0] ? m_shadowTargets[0]->GetPass() : nullptr;
-    const auto drawTerrainInto = [&](uint32_t cascade, PassDrawStats& cascadeStats) {
+    // (cullViewProj: what picks the chunks, the cascade's or a region's of it.)
+    const auto drawTerrainInto = [&](uint32_t cascade, PassDrawStats& cascadeStats, const WorldMat4& cullViewProj) {
         if (drawTerrain)
         {
             cmd.SetGraphicsPipeline(*m_shadowPipeline);
@@ -2310,7 +2399,7 @@ void TerrainRenderer::RenderSunShadowMap(ixrhi::IXRHICommandList& cmd,
                 };
                 for (const TerrainChunkDraw& chunk : m_terrainChunks)
                 {
-                    if (TerrainAabbOutsideCascadeFootprint(m_shadowCascadeViewProj[cascade], chunk.worldMin, chunk.worldMax))
+                    if (TerrainAabbOutsideCascadeFootprint(cullViewProj, chunk.worldMin, chunk.worldMax))
                     {
                         ++cascadeStats.chunksCulled;
                         continue;
@@ -2342,18 +2431,42 @@ void TerrainRenderer::RenderSunShadowMap(ixrhi::IXRHICommandList& cmd,
         cmd.SetScissor(0, 0, kShadowResolution, kShadowResolution);
     };
 
-    // The composed cascades' static layers that changed: terrain and static casters, as a full draw.
+    // The static layers that changed: drawn whole, or the frame's static caster change drawn over them
+    // (where those that left were, cleared and drawn again; then those that joined).
+    std::vector<StaticShadowRegion> regions;
     for (uint32_t cascade = 0; cascade < kShadowCascadeCount; ++cascade)
     {
-        if (!compose[cascade] || !redrawStatic[cascade])
+        if (staticUpdate[cascade] == StaticLayerUpdate::Kept)
             continue;
         PassDrawStats& cascadeStats = beginCascadeStats(cascade);
-        m_staticShadowTargets[cascade]->Begin(cmd);
-        setShadowViewport();
-        drawTerrainInto(cascade, cascadeStats);
-        if (casters.drawStatic)
+        if (staticUpdate[cascade] == StaticLayerUpdate::Delta && !StaticShadowRegions(cascade, casters, regions))
+            staticUpdate[cascade] = StaticLayerUpdate::Whole;
+        if (staticUpdate[cascade] == StaticLayerUpdate::Whole)
+        {
+            m_staticShadowTargets[cascade]->Begin(cmd);
+            setShadowViewport();
+            drawTerrainInto(cascade, cascadeStats, m_shadowCascadeViewProj[cascade]);
             casters.drawStatic(cascade, m_shadowCascadeViewProj[cascade], casterPass);
-        m_staticShadowTargets[cascade]->End(cmd);
+            m_staticShadowTargets[cascade]->End(cmd);
+            continue;
+        }
+        const bool joined = casters.staticJoined > 0 && casters.drawStaticJoined;
+        if (regions.empty() && !joined)
+            continue;
+        m_staticShadowLoadTargets[cascade]->Begin(cmd);
+        setShadowViewport();
+        for (const StaticShadowRegion& region : regions)
+        {
+            cmd.SetScissor(region.x, region.y, region.width, region.height);
+            cmd.ClearDepth(1.0f, region.x, region.y, region.width, region.height);
+            drawTerrainInto(cascade, cascadeStats, region.region.viewProj);
+            if (casters.drawStaticRegion)
+                casters.drawStaticRegion(cascade, m_shadowCascadeViewProj[cascade], region.region, casterPass);
+        }
+        cmd.SetScissor(0, 0, kShadowResolution, kShadowResolution);
+        if (joined)
+            casters.drawStaticJoined(cascade, m_shadowCascadeViewProj[cascade], casterPass);
+        m_staticShadowLoadTargets[cascade]->End(cmd);
     }
     // ...copied into their cascades,
     if (anyCompose)
@@ -2394,12 +2507,15 @@ void TerrainRenderer::RenderSunShadowMap(ixrhi::IXRHICommandList& cmd,
         if (compose[cascade])
         {
             // ...and the moving casters over them.
-            if (!redrawStatic[cascade])
+            if (staticUpdate[cascade] == StaticLayerUpdate::Kept)
                 beginCascadeStats(cascade);
-            m_shadowOverlayTargets[cascade]->Begin(cmd);
-            setShadowViewport();
-            casters.drawDynamic(cascade, m_shadowCascadeViewProj[cascade], casterPass);
-            m_shadowOverlayTargets[cascade]->End(cmd);
+            if (m_shadowCascadeInputs[cascade]->dynamicRevision != 0 && casters.drawDynamic)
+            {
+                m_shadowOverlayTargets[cascade]->Begin(cmd);
+                setShadowViewport();
+                casters.drawDynamic(cascade, m_shadowCascadeViewProj[cascade], casterPass);
+                m_shadowOverlayTargets[cascade]->End(cmd);
+            }
         }
         else if (m_shadowTargets[cascade])
         {
@@ -2407,7 +2523,7 @@ void TerrainRenderer::RenderSunShadowMap(ixrhi::IXRHICommandList& cmd,
             PassDrawStats& cascadeStats = beginCascadeStats(cascade);
             m_shadowTargets[cascade]->Begin(cmd);
             setShadowViewport();
-            drawTerrainInto(cascade, cascadeStats);
+            drawTerrainInto(cascade, cascadeStats, m_shadowCascadeViewProj[cascade]);
             if (casters.drawStatic)
                 casters.drawStatic(cascade, m_shadowCascadeViewProj[cascade], casterPass);
             if (casters.drawDynamic)
@@ -6869,6 +6985,8 @@ void TerrainRenderer::DestroyShadowResources()
     for (auto& target : m_shadowTargets)
         target.reset();
     for (auto& target : m_staticShadowTargets)
+        target.reset();
+    for (auto& target : m_staticShadowLoadTargets)
         target.reset();
     for (auto& target : m_shadowOverlayTargets)
         target.reset();

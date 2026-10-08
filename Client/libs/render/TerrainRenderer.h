@@ -208,12 +208,40 @@ public:
                                                 const WorldMat4& lightViewProj,
                                                 const ixrhi::IXRHIRenderPass* pass)>;
     using CascadeRevisions = std::array<std::uint64_t, SunShadowReceive::kCascades>;
+    // The part of a cascade a static caster change draws again: its clip-space xy range (of the
+    // cascade's lightViewProj), and that range stretched to the whole clip square (regionViewProj).
+    struct ShadowRegion
+    {
+        float clipMin[2] = {-1.0f, -1.0f};
+        float clipMax[2] = {1.0f, 1.0f};
+        WorldMat4 viewProj{};
+    };
+    // Draws the static casters over a region of a cascade, with the cascade's lightViewProj.
+    using ShadowCasterRegionDraw = std::function<void(std::uint32_t cascade,
+                                                      const WorldMat4& lightViewProj,
+                                                      const ShadowRegion& region,
+                                                      const ixrhi::IXRHIRenderPass* pass)>;
+    struct StaticCasterBounds
+    {
+        WorldVec3 min{};
+        WorldVec3 max{};
+    };
     struct ShadowCasters
     {
         CascadeRevisions staticRevisions{};
         CascadeRevisions dynamicRevisions{};  // 0: no moving caster in the cascade
         ShadowCasterDraw drawStatic;
         ShadowCasterDraw drawDynamic;
+        // How the static casters changed since the frame before, when their revision was
+        // staticDeltaFrom (0: not known): staticJoined of them joined (drawStaticJoined draws those),
+        // and those in staticLeft left or moved (their bounds as drawn). A static cache layer that holds
+        // staticDeltaFrom takes just this: the joined drawn over it, and where each that left was, the
+        // layer cleared and drawn again (drawStaticRegion). Any other changed layer is drawn whole.
+        std::uint64_t staticDeltaFrom = 0;
+        std::uint32_t staticJoined = 0;
+        const std::vector<StaticCasterBounds>* staticLeft = nullptr;
+        ShadowCasterDraw drawStaticJoined;
+        ShadowCasterRegionDraw drawStaticRegion;
     };
     void RenderSunShadowMap(ixrhi::IXRHICommandList& cmd,
                             const ixrhi::IXRHIFrameInfo& frame,
@@ -613,6 +641,23 @@ private:
     std::shared_ptr<ixrhi::IXRHITexture> m_staticShadowTexture;
     std::array<std::unique_ptr<ixrhi::IXRHIRenderTarget>, kShadowCascadeCount> m_staticShadowTargets{};
     std::array<std::unique_ptr<ixrhi::IXRHIRenderTarget>, kShadowCascadeCount> m_shadowOverlayTargets{};
+    // The static cache layers kept (load): what a static caster change is drawn over.
+    std::array<std::unique_ptr<ixrhi::IXRHIRenderTarget>, kShadowCascadeCount> m_staticShadowLoadTargets{};
+    // Where a static caster that left a cascade was: the texels taken out and drawn again, and the
+    // cascade's view-projection stretched over them (to pick what is drawn there).
+    struct StaticShadowRegion
+    {
+        std::uint32_t x = 0;
+        std::uint32_t y = 0;
+        std::uint32_t width = 0;
+        std::uint32_t height = 0;
+        ShadowRegion region;
+    };
+    static constexpr std::size_t kMaxStaticShadowRegions = 16;
+    // The regions of a cascade's static layer the casters that left need drawn again; false when that
+    // is more than drawing it whole (too many, or a quarter of it).
+    bool StaticShadowRegions(std::uint32_t cascade, const ShadowCasters& casters,
+                             std::vector<StaticShadowRegion>& regions) const;
     bool m_staticShadowCacheFailed = false;
     bool EnsureStaticShadowCache(ixrhi::IXRHICommandList& cmd);
     std::unique_ptr<ixrhi::IXRHIGraphicsPipeline> m_shadowPipeline;

@@ -3108,6 +3108,9 @@ int RunGame(NativeWindow& window,
         std::string runtimePath;      // the model's resolved path
         bool modelIsSkinned = false;  // the static path found the model rigged
         bool awaitingModel = false;   // its model was loading: built again once a model is finished
+        // In the cascades' static shadow cache (a settled caster, see the sun shadow pass); next to the
+        // fields the per-frame loops read (one cache line less per record).
+        bool inStaticShadow = false;
         std::uint64_t modelRevision = 0;  // staticModelRevision when it was built
         StaticMeshRenderer* renderer = nullptr;  // null: no static draws
         StaticMeshRenderer::Instance instance;   // its prepared points at prepared below
@@ -3115,6 +3118,8 @@ int RunGame(NativeWindow& window,
         SpatialIndex::Aabb worldBounds{};
         std::array<WorldVec3, 8> corners{};
         std::uint64_t changedFrame = 0;  // renderRecordFrame it was last built or its materials read in
+        // The bounds it was drawn into the static shadow cache with (where its shadow is taken out).
+        TerrainRenderer::StaticCasterBounds staticShadowBounds{};
     };
     // An entity finds its record by the slot it holds (MeshSceneEntity::renderRecordSlot). A deque: a
     // record stays where it is while others are added, so pointers to records (and to their instances)
@@ -3133,6 +3138,32 @@ int RunGame(NativeWindow& window,
     std::vector<ShadowCasterBatch> settledShadowCasterBatches;
     std::vector<ShadowCasterBatch> movingShadowCasterBatches;
     constexpr std::uint64_t kShadowSettleFrames = 30;
+    // The static shadow cache's casters: a revision moved on whenever one joins or leaves, how many
+    // are in it, and the frame's change (those that joined; the bounds of those that left, also
+    // gathered between frames when a gone entity's record is dropped). The cascades' cache layers take
+    // just that change instead of being drawn again whole.
+    std::uint64_t staticShadowRevision = 1;
+    std::uint32_t staticShadowCount = 0;
+    std::vector<const StaticMeshRenderRecord*> staticShadowJoined;
+    std::vector<TerrainRenderer::StaticCasterBounds> staticShadowLeft;
+    // The settled casters' clip-space extents per cascade (for the regions a change draws again), in
+    // the settled batches' order, and the frame each was worked out in.
+    struct CasterClipRect
+    {
+        float minX = 0.0f;
+        float minY = 0.0f;
+        float maxX = 0.0f;
+        float maxY = 0.0f;
+    };
+    std::array<std::vector<CasterClipRect>, SunShadowReceive::kCascades> settledCasterClipRects;
+    std::array<std::uint64_t, SunShadowReceive::kCascades> settledCasterClipRectsFrame{};
+    auto leaveStaticShadow = [&](StaticMeshRenderRecord& record) {
+        if (!record.inStaticShadow)
+            return;
+        record.inStaticShadow = false;
+        --staticShadowCount;
+        staticShadowLeft.push_back(record.staticShadowBounds);
+    };
     // The entity's record, given a slot of its own first if it has none (or holds another's).
     auto staticMeshRenderRecordSlot = [&](const MeshSceneEntity& mesh) -> StaticMeshRenderRecord& {
         std::uint32_t slot = mesh.renderRecordSlot;
@@ -6399,6 +6430,7 @@ int RunGame(NativeWindow& window,
                 if (record.inUse && (record.validatedFrame == std::numeric_limits<std::uint64_t>::max() ||
                                         record.validatedFrame + 120u < renderRecordFrame))
                 {
+                    leaveStaticShadow(record);
                     record = {};
                     freeStaticMeshRenderRecords.push_back(slot);
                 }
@@ -12576,9 +12608,10 @@ int RunGame(NativeWindow& window,
                 for (ShadowCasterBatch& batch : movingShadowCasterBatches)
                     batch.casters.clear();
                 bool anyStaticCasters = false;
-                // What the settled casters are, as one value: the cascades' static cache layers are
-                // drawn again when it changes (a caster settled, left, or one appeared).
-                std::uint64_t settledRevision = 1469598103934665603ull;  // FNV-1a
+                // The settled casters joining the static cache, and those leaving it (moved, or not
+                // drawn any more); staticShadowRevision moves on with any of it.
+                staticShadowJoined.clear();
+                std::uint32_t seenInStaticShadow = 0;
                 if (runtimeSession->IsMapEditorOpen())
                 {
                     std::size_t lastSettled = 0;
@@ -12599,24 +12632,58 @@ int RunGame(NativeWindow& window,
                     for (const MeshSceneEntity& mesh : editorMeshEntities)
                     {
                         if (mesh.skinned || (editorPlay.state.mode == EditorPlayMode::Edit && mesh.editorHidden))
+                        {
+                            // Not a static caster now: out of the cache if it was in (its record, if any).
+                            const std::uint32_t slot = mesh.renderRecordSlot;
+                            if (staticShadowCount > 0 && slot < staticMeshRenderRecords.size() &&
+                                staticMeshRenderRecords[slot].inUse && staticMeshRenderRecords[slot].entityId == mesh.id)
+                                leaveStaticShadow(staticMeshRenderRecords[slot]);
                             continue;
-                        const StaticMeshRenderRecord& record = staticMeshRenderRecord(mesh);
+                        }
+                        StaticMeshRenderRecord& record = staticMeshRenderRecord(mesh);
                         if (!record.renderer)
+                        {
+                            leaveStaticShadow(record);
                             continue;
+                        }
                         anyStaticCasters = true;
                         if (record.changedFrame + kShadowSettleFrames < renderRecordFrame)
                         {
                             addTo(settledShadowCasterBatches, lastSettled, record);
-                            const std::uint64_t key[2] = {reinterpret_cast<std::uintptr_t>(&record), record.changedFrame};
-                            for (std::uint64_t word : key)
-                                settledRevision = (settledRevision ^ word) * 1099511628211ull;
+                            if (!record.inStaticShadow)
+                            {
+                                record.inStaticShadow = true;
+                                record.staticShadowBounds = {record.worldBounds.min, record.worldBounds.max};
+                                ++staticShadowCount;
+                                staticShadowJoined.push_back(&record);
+                            }
+                            ++seenInStaticShadow;
                         }
                         else
                         {
                             addTo(movingShadowCasterBatches, lastMoving, record);
+                            leaveStaticShadow(record);
                         }
                     }
                 }
+                // Those in the cache not seen left it too: their entity is gone (its record was not
+                // asked for this frame; every entity's is, the casters' above).
+                if (seenInStaticShadow < staticShadowCount)
+                {
+                    for (StaticMeshRenderRecord& record : staticMeshRenderRecords)
+                    {
+                        if (record.inStaticShadow && record.validatedFrame != renderRecordFrame)
+                            leaveStaticShadow(record);
+                    }
+                }
+                const std::uint64_t staticShadowDeltaFrom = staticShadowRevision;
+                if (!staticShadowJoined.empty() || !staticShadowLeft.empty())
+                    ++staticShadowRevision;
+                // (The joined by renderer, one batch each when drawn.)
+                std::stable_sort(staticShadowJoined.begin(), staticShadowJoined.end(),
+                    [](const StaticMeshRenderRecord* a, const StaticMeshRenderRecord* b) {
+                        return std::less<const StaticMeshRenderer*>()(a->renderer, b->renderer);
+                    });
                 std::vector<const SkinnedDrawRecord*> skinnedShadowCasters;
                 for (const std::vector<SkinnedDrawRecord>* records : {&sceneSkinnedDraws, &sceneEditorSkinnedDraws})
                 {
@@ -12673,7 +12740,7 @@ int RunGame(NativeWindow& window,
                 TerrainRenderer::ShadowCasters shadowCasters;
                 for (std::uint32_t cascade = 0; cascade < shadowCasters.staticRevisions.size(); ++cascade)
                 {
-                    shadowCasters.staticRevisions[cascade] = settledRevision;
+                    shadowCasters.staticRevisions[cascade] = staticShadowRevision;
                     // The moving casters over the cascade's footprint, and the characters whose shadow
                     // reaches it (0: none, the cascade is the static cache alone).
                     std::uint64_t revision = 1469598103934665603ull;  // FNV-1a
@@ -12716,14 +12783,16 @@ int RunGame(NativeWindow& window,
                 StaticMeshRenderer::InstanceList cascadeInstances;
                 std::vector<SkinnedMeshRenderer::ShadowCasterInstance> skinnedCascadeInstances;
                 std::vector<SkinnedMeshRenderer*> skinnedCascadeRenderers;
+                // (filterViewProj picks the casters drawn: those over its clip square.)
                 const auto drawMeshBatches = [&](const std::vector<ShadowCasterBatch>& batches,
-                                                 const WorldMat4& lightViewProj, const ixrhi::IXRHIRenderPass* pass) {
+                                                 const WorldMat4& lightViewProj, const WorldMat4& filterViewProj,
+                                                 const ixrhi::IXRHIRenderPass* pass) {
                     for (const ShadowCasterBatch& batch : batches)
                     {
                         cascadeInstances.clear();
                         for (const StaticMeshRenderRecord* caster : batch.casters)
                         {
-                            if (!outsideCascadeFootprint(lightViewProj, caster->corners))
+                            if (!outsideCascadeFootprint(filterViewProj, caster->corners))
                                 cascadeInstances.push_back(&caster->instance);
                         }
                         if (!cascadeInstances.empty())
@@ -12733,11 +12802,78 @@ int RunGame(NativeWindow& window,
                 };
                 shadowCasters.drawStatic =
                     [&](std::uint32_t, const WorldMat4& lightViewProj, const ixrhi::IXRHIRenderPass* pass) {
-                        drawMeshBatches(settledShadowCasterBatches, lightViewProj, pass);
+                        drawMeshBatches(settledShadowCasterBatches, lightViewProj, lightViewProj, pass);
                     };
+                shadowCasters.staticDeltaFrom = staticShadowDeltaFrom;
+                shadowCasters.staticJoined = static_cast<std::uint32_t>(staticShadowJoined.size());
+                shadowCasters.staticLeft = &staticShadowLeft;
+                shadowCasters.drawStaticJoined =
+                    [&](std::uint32_t, const WorldMat4& lightViewProj, const ixrhi::IXRHIRenderPass* pass) {
+                        for (std::size_t first = 0; first < staticShadowJoined.size();)
+                        {
+                            StaticMeshRenderer* renderer = staticShadowJoined[first]->renderer;
+                            cascadeInstances.clear();
+                            std::size_t end = first;
+                            for (; end < staticShadowJoined.size() && staticShadowJoined[end]->renderer == renderer; ++end)
+                            {
+                                if (!outsideCascadeFootprint(lightViewProj, staticShadowJoined[end]->corners))
+                                    cascadeInstances.push_back(&staticShadowJoined[end]->instance);
+                            }
+                            if (!cascadeInstances.empty())
+                                renderer->RenderShadowCasters(*frameInfo.commandList, frameInfo, lightViewProj,
+                                    cascadeInstances, pass);
+                            first = end;
+                        }
+                    };
+                // A region the change draws again: the settled casters over it, picked by their clip-space
+                // extent in the cascade, worked out once a frame per cascade for all its regions.
+                shadowCasters.drawStaticRegion = [&](std::uint32_t cascade, const WorldMat4& lightViewProj,
+                                                     const TerrainRenderer::ShadowRegion& region,
+                                                     const ixrhi::IXRHIRenderPass* pass) {
+                    std::vector<CasterClipRect>& rects = settledCasterClipRects[cascade];
+                    if (settledCasterClipRectsFrame[cascade] != frameInfo.frameNumber)
+                    {
+                        settledCasterClipRectsFrame[cascade] = frameInfo.frameNumber;
+                        rects.clear();
+                        const float* m = lightViewProj.m;
+                        for (const ShadowCasterBatch& batch : settledShadowCasterBatches)
+                        {
+                            for (const StaticMeshRenderRecord* caster : batch.casters)
+                            {
+                                CasterClipRect rect{std::numeric_limits<float>::max(), std::numeric_limits<float>::max(),
+                                    std::numeric_limits<float>::lowest(), std::numeric_limits<float>::lowest()};
+                                for (const WorldVec3& p : caster->corners)
+                                {
+                                    const float x = p.x * m[0] + p.y * m[4] + p.z * m[8] + m[12];
+                                    const float y = p.x * m[1] + p.y * m[5] + p.z * m[9] + m[13];
+                                    rect.minX = std::min(rect.minX, x);
+                                    rect.minY = std::min(rect.minY, y);
+                                    rect.maxX = std::max(rect.maxX, x);
+                                    rect.maxY = std::max(rect.maxY, y);
+                                }
+                                rects.push_back(rect);
+                            }
+                        }
+                    }
+                    std::size_t index = 0;
+                    for (const ShadowCasterBatch& batch : settledShadowCasterBatches)
+                    {
+                        cascadeInstances.clear();
+                        for (const StaticMeshRenderRecord* caster : batch.casters)
+                        {
+                            const CasterClipRect& rect = rects[index++];
+                            if (rect.maxX >= region.clipMin[0] && rect.minX <= region.clipMax[0] &&
+                                rect.maxY >= region.clipMin[1] && rect.minY <= region.clipMax[1])
+                                cascadeInstances.push_back(&caster->instance);
+                        }
+                        if (!cascadeInstances.empty())
+                            batch.renderer->RenderShadowCasters(*frameInfo.commandList, frameInfo, lightViewProj,
+                                cascadeInstances, pass);
+                    }
+                };
                 shadowCasters.drawDynamic =
                     [&](std::uint32_t cascade, const WorldMat4& lightViewProj, const ixrhi::IXRHIRenderPass* pass) {
-                        drawMeshBatches(movingShadowCasterBatches, lightViewProj, pass);
+                        drawMeshBatches(movingShadowCasterBatches, lightViewProj, lightViewProj, pass);
                         // The characters by model: the pipeline and index buffer set once per model.
                         skinnedCascadeRenderers.clear();
                         for (const SkinnedDrawRecord* record : skinnedShadowCasters)
@@ -12763,6 +12899,7 @@ int RunGame(NativeWindow& window,
                 rhiDevice->WriteTimestamp(ixrhi::IXRHITimestampPoint::ShadowPassBegin);
                 terrain.RenderSunShadowMap(*frameInfo.commandList, frameInfo, *shadowCamera, shadowCasters);
                 rhiDevice->WriteTimestamp(ixrhi::IXRHITimestampPoint::ShadowPassEnd);
+                staticShadowLeft.clear();  // taken (a layer that missed it is drawn whole: the revision moved on)
                 frameProfile.shadowPassMs = MillisecondsBetween(shadowPassBegin, std::chrono::steady_clock::now());
             }
             // The meshes sample this frame's cascades (or see none drawn: all lit).

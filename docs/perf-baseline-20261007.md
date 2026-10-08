@@ -311,6 +311,49 @@ Ami maradt (nem fizika):
   frame-ben). Kaszkádonkénti revízió vagy több frame-re elosztott újrarajzolás segítene.
 - Az editorban Play közben az Inspector változásai el vannak dobva, így ott csak a Play indítása épít világot.
 
+## Statikus árnyék-cache: csak a változás rajzolódik – 2026-10-08
+
+Ha egy statikus árnyékvető megjelent vagy eltűnt, eddig minden kaszkád statikus rétege teljesen újrarajzolódott. A
+terhelt jelenetben ez egy frame-ben ~20,5 ms GPU és ~4,5 ms CPU volt; minden frame-re kényszerítve 37 FPS-t adott.
+A fő tétel a 3004 fa egyenként 6472 háromszöggel. Most a réteg csak a változást kapja meg:
+
+- **A belépő árnyékvetők** (letelepedett vagy új) a meglévő rétegre rajzolódnak rá. A mélység csak közelebb
+  kerülhet, így az eredmény ugyanaz, mint egy teljes újrarajzolásé.
+- **A kilépő árnyékvetők** (elmozdult, eltűnt, rejtett) helyén a réteg egy texelnyi ráhagyással töröl
+  (`ClearDepth` téglalapra), majd scissorral újrarajzolja a terepet és az ott lévő statikus árnyékvetőket.
+  - A téglalapot a régi befoglaló dobozból számolja (amivel az árnyékvetőt a cache-be rajzolta), a kaszkád
+    vetítésével.
+  - Az ott lévő árnyékvetőket a kaszkád-vetítésben vett téglalapjuk alapján választja ki. Ezt kaszkádonként
+    frame-enként egyszer számolja ki, és a régiók abból választanak.
+- **Teljes újrarajzolás csak akkor van,** ha a kaszkád elmozdult, a terep változott, vagy a változás nem
+  ismert. Ugyanígy, ha 16-nál több régió kellene, vagy a régiók a réteg negyedénél többet fednek.
+- **A változás a render-rekordban követődik:** `inStaticShadow` és a rajzolás kori befoglaló doboz. Egy
+  kaszkád, amelyben nincs mozgó árnyékvető, most szintén a statikus réteg másolata.
+  - Új render target a megtartott rétegre (`m_staticShadowLoadTargets`).
+  - A `ShadowCasters` új mezői: `staticDeltaFrom`, `staticJoined`, `staticLeft`, `drawStaticJoined`,
+    `drawStaticRegion`.
+
+Spawn-teszt, buildelt játék, a 2 másodperces ablak legnagyobb frame-je (ezen a gépen ~10 ms akkor is, ha semmi
+nem történik):
+
+| Esemény | az árnyékjavítás előtt | most |
+| --- | --- | --- |
+| betöltött fa spawnja | 26–28 ms | 8–10 ms |
+| a fa törlése | 27 ms | 8–10 ms |
+| 12 fa törlése egy frame-ben (erős nap): az árnyékpass CPU-ja | – | 12,4 ms régiónkénti szűréssel, 5,0 ms a téglalap-cache-sel |
+
+Ellenőrzés:
+
+- **Képi:** erős napfényes változaton 12 közeli fa törlése előtt és után. Az árnyékuk eltűnt, a többi árnyék
+  ép, téglalap alakú lyuk vagy perem nincs.
+- **Validáció:** a szinkronizációs validáció 0 hibát jelzett.
+- **A/B az előző commit ellen:** ugyanaz az FPS. Az árnyékpass CPU-ja 0,69 helyett 0,78 ms, a rekordonkénti
+  könyvelés miatt (az új jelzőt a sűrűn olvasott mezők mellé tettem, így 0,88 ms-ról jött le).
+
+Ami maradt: ha a kamera mozog, a kaszkádok mátrixa változik, és akkor a teljes újrarajzolás továbbra is jár. Ebben a
+sűrű jelenetben ez frame-enként ~20 ms GPU lehet. Ehhez árnyék-LOD vagy a statikus réteg görgetése kellene
+(eltolás és a szélek utánrajzolása).
+
 ## Következmény a párhuzamosítási tervre
 
 - A legnagyobb nyereség a **render-adatok kinyerésének** átalakítása (a terv 3. lépése). Kell hozzá
