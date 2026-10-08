@@ -1083,9 +1083,11 @@ bool StaticMeshRenderer::LoadCpu(client::asset::IAssetReader& assets, const std:
     return true;
 }
 
-bool StaticMeshRenderer::FinishGpu(ixrhi::IXRHIDevice& rhi)
+bool StaticMeshRenderer::FinishGpu(ixrhi::IXRHIDevice& rhi, bool deferUploads)
 {
     m_rhi = &rhi;
+    m_deferUploads = deferUploads;
+    m_pendingUploads = deferUploads ? std::make_unique<PendingUploads>() : nullptr;
     if (m_pendingMaterialImport)
     {
         GenerateMaterialAssetsForGltf(m_pendingMaterialImport->asset, m_modelPath);
@@ -1859,18 +1861,53 @@ bool StaticMeshRenderer::LoadStaticFbxMesh(const std::string& modelPath)
 
 bool StaticMeshRenderer::CreateBuffers(ixrhi::IXRHIDevice& rhi)
 {
-    m_vertexBuffer = CreateRhiBuffer(rhi,
-        sizeof(Vertex) * m_vertices.size(),
-        ixrhi::IXRHIBufferUsage::Vertex,
-        ixrhi::IXRHICpuAccess::None,
-        m_vertices.data(),
-        ("StaticMesh:" + m_modelPath + ":VB").c_str());
-    m_indexBuffer = CreateRhiBuffer(rhi,
-        sizeof(uint32_t) * m_indices.size(),
-        ixrhi::IXRHIBufferUsage::Index,
-        ixrhi::IXRHICpuAccess::None,
-        m_indices.data(),
-        ("StaticMesh:" + m_modelPath + ":IB").c_str());
+    const std::uint64_t vertexBytes = sizeof(Vertex) * m_vertices.size();
+    const std::uint64_t indexBytes = sizeof(uint32_t) * m_indices.size();
+    if (m_deferUploads && m_pendingUploads)
+    {
+        // Made empty, the data staged (RecordPendingUploads copies it in).
+        m_vertexBuffer = CreateRhiBuffer(rhi,
+            vertexBytes,
+            ixrhi::IXRHIBufferUsage::Vertex | ixrhi::IXRHIBufferUsage::TransferDst,
+            ixrhi::IXRHICpuAccess::None,
+            nullptr,
+            ("StaticMesh:" + m_modelPath + ":VB").c_str());
+        m_indexBuffer = CreateRhiBuffer(rhi,
+            indexBytes,
+            ixrhi::IXRHIBufferUsage::Index | ixrhi::IXRHIBufferUsage::TransferDst,
+            ixrhi::IXRHICpuAccess::None,
+            nullptr,
+            ("StaticMesh:" + m_modelPath + ":IB").c_str());
+        m_pendingUploads->vertexStaging = CreateRhiBuffer(rhi,
+            vertexBytes,
+            ixrhi::IXRHIBufferUsage::TransferSrc,
+            ixrhi::IXRHICpuAccess::Write,
+            m_vertices.data(),
+            ("StaticMesh:" + m_modelPath + ":VBStaging").c_str());
+        m_pendingUploads->indexStaging = CreateRhiBuffer(rhi,
+            indexBytes,
+            ixrhi::IXRHIBufferUsage::TransferSrc,
+            ixrhi::IXRHICpuAccess::Write,
+            m_indices.data(),
+            ("StaticMesh:" + m_modelPath + ":IBStaging").c_str());
+        if (!m_pendingUploads->vertexStaging || !m_pendingUploads->indexStaging)
+            return false;
+    }
+    else
+    {
+        m_vertexBuffer = CreateRhiBuffer(rhi,
+            vertexBytes,
+            ixrhi::IXRHIBufferUsage::Vertex,
+            ixrhi::IXRHICpuAccess::None,
+            m_vertices.data(),
+            ("StaticMesh:" + m_modelPath + ":VB").c_str());
+        m_indexBuffer = CreateRhiBuffer(rhi,
+            indexBytes,
+            ixrhi::IXRHIBufferUsage::Index,
+            ixrhi::IXRHICpuAccess::None,
+            m_indices.data(),
+            ("StaticMesh:" + m_modelPath + ":IB").c_str());
+    }
     if (!m_vertexBuffer || !m_indexBuffer)
         return false;
     for (uint32_t frame = 0; frame < kFramesInFlight; ++frame)
@@ -2446,7 +2483,49 @@ void StaticMeshRenderer::LodWorkerMain()
     }
 }
 
-bool StaticMeshRenderer::UploadTexture(ixrhi::IXRHIDevice& rhi, const RgbaImage& source, Texture& texture)
+bool StaticMeshRenderer::RecordPendingUploads(ixrhi::IXRHICommandList& cmd, const ixrhi::IXRHIFrameInfo& frame)
+{
+    if (!m_pendingUploads)
+        return false;
+    if (!frame.frameActive)
+        return true;
+    PendingUploads& uploads = *m_pendingUploads;
+    if (uploads.recordedFrame != std::numeric_limits<std::uint64_t>::max())
+    {
+        // The frame that copied them is done once its slot comes round again.
+        if (frame.frameNumber < uploads.recordedFrame + kFramesInFlight)
+            return true;
+        m_pendingUploads.reset();
+        return false;
+    }
+    uploads.recordedFrame = frame.frameNumber;
+    if (uploads.vertexStaging && m_vertexBuffer)
+    {
+        cmd.CopyBuffer(*uploads.vertexStaging, *m_vertexBuffer, uploads.vertexStaging->SizeBytes());
+        cmd.TransitionBuffer(*m_vertexBuffer, ixrhi::IXRHIBufferState::TransferDst, ixrhi::IXRHIBufferState::VertexRead);
+    }
+    if (uploads.indexStaging && m_indexBuffer)
+    {
+        cmd.CopyBuffer(*uploads.indexStaging, *m_indexBuffer, uploads.indexStaging->SizeBytes());
+        cmd.TransitionBuffer(*m_indexBuffer, ixrhi::IXRHIBufferState::TransferDst, ixrhi::IXRHIBufferState::IndexRead);
+    }
+    const std::array<Texture*, 3> textures = {&m_texture, &m_normalTexture, &m_ormTexture};
+    for (std::size_t i = 0; i < textures.size(); ++i)
+    {
+        const std::shared_ptr<ixrhi::IXRHIBuffer>& staging = uploads.textureStaging[i];
+        Texture& texture = *textures[i];
+        if (!staging || !texture.image)
+            continue;
+        cmd.TransitionTexture(*texture.image, ixrhi::IXRHIImageLayout::Undefined, ixrhi::IXRHIImageLayout::TransferDst);
+        cmd.CopyBufferToTexture(*staging, 0, texture.width, *texture.image, 0, 0, 0, 0, texture.width, texture.height);
+        cmd.TransitionTexture(*texture.image, ixrhi::IXRHIImageLayout::TransferDst,
+            ixrhi::IXRHIImageLayout::ShaderReadOnly);
+    }
+    return true;
+}
+
+bool StaticMeshRenderer::UploadTexture(ixrhi::IXRHIDevice& rhi, const RgbaImage& source, Texture& texture,
+                                       std::shared_ptr<ixrhi::IXRHIBuffer>* staging)
 {
     RgbaImage image = source;
     const ixrhi::IXRHITextureUsage sampledUpload =
@@ -2464,7 +2543,23 @@ bool StaticMeshRenderer::UploadTexture(ixrhi::IXRHIDevice& rhi, const RgbaImage&
     desc.format = image.format;
     desc.usage = sampledUpload;
     desc.debugName = "StaticMesh:" + image.name;
-    auto uploaded = rhi.CreateTexture(desc, image.pixels.data(), image.pixels.size());
+    std::shared_ptr<ixrhi::IXRHITexture> uploaded;
+    if (staging)
+    {
+        uploaded = rhi.CreateTexture(desc, nullptr, 0);
+        *staging = CreateRhiBuffer(rhi,
+            image.pixels.size(),
+            ixrhi::IXRHIBufferUsage::TransferSrc,
+            ixrhi::IXRHICpuAccess::Write,
+            image.pixels.data(),
+            ("StaticMesh:" + image.name + ":Staging").c_str());
+        if (!*staging)
+            return false;
+    }
+    else
+    {
+        uploaded = rhi.CreateTexture(desc, image.pixels.data(), image.pixels.size());
+    }
     if (!uploaded)
         return false;
 
@@ -2516,9 +2611,11 @@ void StaticMeshRenderer::DecodeTextures(const std::string& modelPath)
 
 bool StaticMeshRenderer::UploadDecodedTextures(ixrhi::IXRHIDevice& rhi)
 {
-    const bool uploaded = UploadTexture(rhi, m_decodedTextures[0], m_texture) &&
-        UploadTexture(rhi, m_decodedTextures[1], m_normalTexture) &&
-        UploadTexture(rhi, m_decodedTextures[2], m_ormTexture);
+    const bool defer = m_deferUploads && m_pendingUploads;
+    const bool uploaded =
+        UploadTexture(rhi, m_decodedTextures[0], m_texture, defer ? &m_pendingUploads->textureStaging[0] : nullptr) &&
+        UploadTexture(rhi, m_decodedTextures[1], m_normalTexture, defer ? &m_pendingUploads->textureStaging[1] : nullptr) &&
+        UploadTexture(rhi, m_decodedTextures[2], m_ormTexture, defer ? &m_pendingUploads->textureStaging[2] : nullptr);
     for (RgbaImage& image : m_decodedTextures)
         image = {};
     return uploaded;
@@ -2964,7 +3061,7 @@ void StaticMeshRenderer::RenderLodBatchInWorld(ixrhi::IXRHICommandList& cmd,
     m_lastInstanceBufferBytes = 0;
     m_lastInstanceBufferRebuilt = false;
     if (!m_pipeline || !m_unlitPipeline || m_bindPages.empty() || m_indices.empty() || instances.empty() ||
-        !frame.frameActive)
+        !frame.frameActive || !UploadsRecorded())
         return;
     if (!m_boundSunShadowTexture)
     {
@@ -3515,7 +3612,7 @@ void StaticMeshRenderer::RenderTransparentInWorld(ixrhi::IXRHICommandList& cmd,
     std::uint32_t targetHeight)
 {
     if (!m_rhi || m_bindPages.empty() || !m_vertexBuffer || !m_indexBuffer || m_indices.empty() || !frame.frameActive ||
-        !m_boundSunShadowTexture || !m_blendPipelines[0][0] || !m_blendPipelines[1][1])
+        !m_boundSunShadowTexture || !m_blendPipelines[0][0] || !m_blendPipelines[1][1] || !UploadsRecorded())
         return;
     const std::uint32_t extentWidth = targetWidth > 0 ? targetWidth : frame.targetWidth;
     const std::uint32_t extentHeight = targetHeight > 0 ? targetHeight : frame.targetHeight;
@@ -3628,7 +3725,7 @@ void StaticMeshRenderer::RenderShadowCasters(ixrhi::IXRHICommandList& cmd,
     const ixrhi::IXRHIRenderPass* shadowPass)
 {
     if (!m_rhi || m_bindPages.empty() || !m_vertexBuffer || !m_indexBuffer || m_indices.empty() || m_draws.empty() ||
-        instances.empty() || !shadowPass || !frame.frameActive || !m_boundSunShadowTexture)
+        instances.empty() || !shadowPass || !frame.frameActive || !m_boundSunShadowTexture || !UploadsRecorded())
         return;
     if (m_shadowPass != shadowPass)
     {
@@ -3749,6 +3846,7 @@ void StaticMeshRenderer::Destroy()
     DestroyPipeline();
     m_bindPages.clear();
     m_bindLayout.reset();
+    m_pendingUploads.reset();
     m_vertexBuffer.reset();
     m_indexBuffer.reset();
     m_lodBuffers.clear();

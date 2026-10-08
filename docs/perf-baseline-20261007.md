@@ -432,7 +432,28 @@ Ellenőrzés:
 - A szinkronizációs validáció 0 hibát jelzett.
 - `IX_SKIN_VERIFY=1` mellett minden csúcs a tűrésen belül van (15 481/15 481 és 6498/6498).
 
-A statikus modellek `FinishGpu`-ja ugyanígy szinkron tölt fel (6–13 ms); erre ugyanez a módszer alkalmazható.
+### Statikus modellek ugyanígy
+
+A statikus modellek `FinishGpu`-ja is szinkron töltötte fel a vertex- és index-buffert és a három textúrát. A
+statikus modell csak render passokon belül rajzolódik, ahol másolni nem lehet. Ezért:
+
+- **A feltöltéseket az alkalmazás rögzíti** minden frame-ben egy fix ponton: a GPU-részecskék szimulációja után,
+  a passokon kívül, az árnyékpass előtt. A lista a befejezett, még fel nem töltött rendererekből áll
+  (`staticMeshUploads`, `StaticMeshRenderer::RecordPendingUploads`).
+- **Védelem:** ha egy modell ezen a ponton túl készül el (blokkoló lekérés frame közben), addig nem rajzol
+  (`UploadsRecorded`), amíg a következő frame be nem másolja az adatát.
+- **Opcionális:** `FinishGpu(rhi, deferUploads)`; a `Create` továbbra is szinkron.
+
+| Modell | befejezés előtte | most |
+| --- | --- | --- |
+| a fa másolata, játék közben | 5,7 ms (első import: 24,5 ms) | 4,0 ms |
+| a fa, induláskor | 5,9–9,3 ms | 4,0 ms |
+
+Ellenőrzés: a fák, kockák és árnyékaik a korábbi képpel egyezően rajzolódnak, a buildelt játékban és az editorban
+(Play) is. A szinkronizációs validáció 0 hibát jelzett.
+
+Ami maradt: az anyagok első rajzoláskor betöltött textúrái (`EnsureMaterialTexture`) még szinkron töltődnek fel,
+rajzolás közben.
 
 ## Következmény a párhuzamosítási tervre
 

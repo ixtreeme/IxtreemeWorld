@@ -158,8 +158,15 @@ public:
     // Create in two halves, so a model loads off the render thread: LoadCpu on any thread (parses
     // the model and decodes its textures, touching no device; false: not a static model or failed,
     // see Status()), then FinishGpu on the render thread (buffers, textures, descriptors, pipelines).
+    // deferUploads: the vertex and index buffers and the textures are made empty and their data
+    // staged instead of uploaded and waited for (a model finished mid-game waited for the frames in
+    // flight); RecordPendingUploads copies it in, and the model draws nothing until it has.
     bool LoadCpu(client::asset::IAssetReader& assets, const std::string& modelPath);
-    bool FinishGpu(ixrhi::IXRHIDevice& rhi);
+    bool FinishGpu(ixrhi::IXRHIDevice& rhi, bool deferUploads = false);
+    bool HasPendingUploads() const { return m_pendingUploads != nullptr; }
+    // The staged uploads, recorded once into the frame (outside render passes, before the model is
+    // drawn in it); true while it still needs calls (its staging goes once that frame is done).
+    bool RecordPendingUploads(ixrhi::IXRHICommandList& cmd, const ixrhi::IXRHIFrameInfo& frame);
     bool RecreatePipeline(ixrhi::IXRHIDevice& rhi);
     // Borrowed target pass (offscreen scene pass); null = backend default.
     void SetTargetPass(const ixrhi::IXRHIRenderPass* pass) { m_targetPass = pass; }
@@ -391,7 +398,22 @@ private:
     std::filesystem::path LodCachePath(const std::string& modelPath, std::uint64_t configHash) const;
     void DecodeTextures(const std::string& modelPath);  // into m_decodedTextures (LoadCpu)
     bool UploadDecodedTextures(ixrhi::IXRHIDevice& rhi);
-    bool UploadTexture(ixrhi::IXRHIDevice& rhi, const RgbaImage& source, Texture& texture);
+    // staging: when given, the texture is made empty and its texels go there (a deferred upload).
+    bool UploadTexture(ixrhi::IXRHIDevice& rhi, const RgbaImage& source, Texture& texture,
+                       std::shared_ptr<ixrhi::IXRHIBuffer>* staging = nullptr);
+    // FinishGpu's deferred uploads: the data, and the frame that recorded the copies.
+    struct PendingUploads
+    {
+        std::shared_ptr<ixrhi::IXRHIBuffer> vertexStaging;
+        std::shared_ptr<ixrhi::IXRHIBuffer> indexStaging;
+        std::array<std::shared_ptr<ixrhi::IXRHIBuffer>, 3> textureStaging{};  // diffuse, normal, orm
+        std::uint64_t recordedFrame = std::numeric_limits<std::uint64_t>::max();
+    };
+    // Whether the model's data is on the GPU for this frame's draws (copied, or the copies recorded).
+    bool UploadsRecorded() const
+    {
+        return !m_pendingUploads || m_pendingUploads->recordedFrame != std::numeric_limits<std::uint64_t>::max();
+    }
     const Texture* EnsureMaterialTexture(ixrhi::IXRHIDevice& rhi,
         const std::optional<Guid>& guid,
         ixrhi::IXRHIFormat format,
@@ -461,6 +483,8 @@ private:
     const ixrhi::IXRHIRenderPass* m_targetPass = nullptr; // borrowed (frame owner)
     client::asset::IAssetReader* m_assets = nullptr;
     std::shared_ptr<ixrhi::IXRHIBuffer> m_vertexBuffer;
+    std::unique_ptr<PendingUploads> m_pendingUploads;
+    bool m_deferUploads = false;  // FinishGpu's, for CreateBuffers and UploadDecodedTextures
     std::shared_ptr<ixrhi::IXRHIBuffer> m_indexBuffer;
     // Grown when a frame appends more records than it holds. The records a frame wrote before stay
     // in the old buffer, which the sets bound to it keep alive.
