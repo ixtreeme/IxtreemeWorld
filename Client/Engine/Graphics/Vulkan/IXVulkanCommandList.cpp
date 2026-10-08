@@ -564,7 +564,10 @@ void IXVulkanDevice::ExecuteAndWait(const std::function<void(ixrhi::IXRHICommand
     submit.commandBufferCount = 1;
     VkCommandBuffer cmd = native->Native();
     submit.pCommandBuffers = &cmd;
-    IXVULKAN_CHECK(*this, vkQueueSubmit(Loop().GetGraphicsQueue(), 1, &submit, fence));
+    {
+        std::lock_guard<std::mutex> queueLock(QueueSubmitMutex());
+        IXVULKAN_CHECK(*this, vkQueueSubmit(Loop().GetGraphicsQueue(), 1, &submit, fence));
+    }
     IXVULKAN_CHECK(*this, vkWaitForFences(NativeDevice(), 1, &fence, VK_TRUE, UINT64_MAX));
     vkDestroyFence(NativeDevice(), fence, nullptr);
 }

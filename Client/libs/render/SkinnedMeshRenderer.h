@@ -234,11 +234,24 @@ private:
     };
     // A skin slot is one instance's bone palette and skinned vertices per frame in flight. Pages of
     // kSkinSlots, made when a frame skins more instances of the model than they hold.
+    // A slot's buffers are made when it is first reserved (EnsureSkinSlot): one instance of a model
+    // does not make the 128 buffers of a whole page.
     struct SkinPage
     {
         std::unique_ptr<ixrhi::IXRHIBindGroup> computeGroup;  // set = frame index * kSkinSlots + slot
         std::array<std::array<std::shared_ptr<ixrhi::IXRHIBuffer>, kSkinSlots>, kFramesInFlight> palettes{};
         std::array<std::array<std::shared_ptr<ixrhi::IXRHIBuffer>, kSkinSlots>, kFramesInFlight> outputs{};
+    };
+    // A model finished while frames are in flight does not wait for the GPU to take its data: its
+    // index and rest-vertex buffers and textures are made empty, the data put in host-visible staging,
+    // and the first frame that skins the model copies it in ahead of its dispatches
+    // (RecordPendingUploads). The staging goes once that frame is done.
+    struct PendingUploads
+    {
+        std::shared_ptr<ixrhi::IXRHIBuffer> indexStaging;
+        std::shared_ptr<ixrhi::IXRHIBuffer> restStaging;
+        std::array<std::shared_ptr<ixrhi::IXRHIBuffer>, kTextureCount> textureStaging{};
+        std::uint64_t recordedFrame = std::numeric_limits<std::uint64_t>::max();
     };
 
     struct RawMesh
@@ -343,6 +356,8 @@ private:
     bool UploadBonePalette(MotionState state, float animTimeSeconds, uint32_t frameIndex, uint32_t skinSlot);
     bool UploadBonePalette(float animTimeSeconds, uint32_t frameIndex);
     void DispatchSkin(ixrhi::IXRHICommandList& cmd, uint32_t frameIndex, uint32_t skinSlot);
+    // The deferred uploads (PendingUploads) into the frame, once; before the model's first dispatch.
+    void RecordPendingUploads(ixrhi::IXRHICommandList& cmd, const ixrhi::IXRHIFrameInfo& frame);
     void DispatchSkin(ixrhi::IXRHICommandList& cmd, uint32_t frameIndex);
     void EmitSkinBarrier(ixrhi::IXRHICommandList& cmd, uint32_t frameIndex, uint32_t skinSlot);
     void DestroyComputeResources();
@@ -387,6 +402,10 @@ private:
     std::vector<RestVertexGpu> m_restVerticesGpu;
     std::array<Texture, kTextureCount> m_textures{};
     std::shared_ptr<ixrhi::IXRHIBuffer> m_restVertexBuffer;
+    std::unique_ptr<PendingUploads> m_pendingUploads;
+    // FinishGpu: uploads deferred into the first frame (false with IX_SKIN_VERIFY=1: uploaded and
+    // waited for there, then the GPU skinning checked against the CPU's).
+    bool m_deferUploads = false;
     uint32_t m_indexCount = 0;
     MeshBounds m_bounds{};
     std::unique_ptr<OzzRuntime> m_ozz;

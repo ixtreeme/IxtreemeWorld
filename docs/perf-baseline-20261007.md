@@ -387,6 +387,53 @@ Ami maradt: a sávok újrarajzolása gyaloglás közben kb. 0,8 ms CPU, mert a s
 mélységlépés átlépésekor (64 m a fény irányában) továbbra is teljes újrarajzolás van. A volumetrikus fény biasa
 mélységegységben maradt, így ott kissé nagyobb lett.
 
+## Riggelt modell befejezése a fő szálon – 2026-10-08
+
+A riggelt modell betöltésének GPU-s befejezése (`SkinnedMeshRenderer::FinishGpu`) játék közben 21–38 ms volt a fő
+szálon. A lépések mérése (a még be nem töltött KicsiK-másolat, játék közben):
+
+| Lépés | Idő |
+| --- | --- |
+| a skin-slotok bufferei (egy lapon 2 frame × 32 slot × 2 buffer = 128 külön memóriafoglalás) | 9–20 ms |
+| index-buffer feltöltése (a szinkron másolás `vkQueueWaitIdle`-lel kivárja a repülő frame-eket) | 11 ms |
+| textúrák feltöltése (ugyanígy szinkron) | 2–5,5 ms |
+| `VerifyComputeSkin` (CPU-skin, GPU-dispatch, kivárás, visszaolvasás, összevetés) | 3 ms |
+| pipeline-ok | 0,3–0,7 ms (5 ms csak a legelső alkalommal) |
+
+Javítások:
+
+- **A slot bufferei első használatkor készülnek** (`EnsureSkinSlot`). Egy példány 4 buffert foglal, nem 128-at.
+  Ez memóriát is spórol: a 15 000 csúcsos modell kimeneti bufferei slotonként ~1 MB-osak.
+- **A feltöltéseket az első frame rögzíti, amely skinneli a modellt.** Az index- és nyugalmi-csúcs buffer,
+  valamint a textúrák üresen készülnek, az adat host-látható staging bufferbe kerül. A modell első
+  dispatch-e előtt a frame saját parancslistája másolja be (`RecordPendingUploads`, sorrendben a rajzolások
+  előtt); a staging akkor szabadul fel, amikor az a frame lefutott. Így nincs CPU-oldali várakozás és nincs
+  külön submit.
+- **A `VerifyComputeSkin` opcionális lett** (`IX_SKIN_VERIFY=1`): akkor a régi, szinkron út fut, és minden
+  modellnél ellenőriz.
+- **Javított hiba (a külön szálas present óta élt):** az `ExecuteAndWait` és az aszinkron buffer-feltöltés úgy
+  hívta a `vkQueueSubmit`-et, hogy nem fogta a queue-mutexet, amelyet a present szál a `vkQueuePresentKHR`
+  körül tart. Ha a grafikus és a present queue ugyanaz a `VkQueue`, ez tiltott, egyidejű hozzáférés volt.
+
+Eredmény (buildelt játék):
+
+| Modell | befejezés előtte | most |
+| --- | --- | --- |
+| KicsiK-másolat, játék közben | 30,9 ms | 4,4–4,6 ms |
+| Arissa, indulás | 20,6 ms | 2,3–3,4 ms |
+| KicsiK, indulás (az első pipeline-ok miatt) | 37,5 ms | 11,8–12,1 ms |
+
+A még be nem töltött riggelt modell spawnjának ablakában a legnagyobb frame 33–37 ms helyett 17–20 ms. A maradékot
+a spawn saját költsége adja (az első spawnnál a 10 000 elemű entitásvektor egyszeri növelése, asset-keresés).
+
+Ellenőrzés:
+
+- A karakterek textúrázva, helyesen rajzolódnak.
+- A szinkronizációs validáció 0 hibát jelzett.
+- `IX_SKIN_VERIFY=1` mellett minden csúcs a tűrésen belül van (15 481/15 481 és 6498/6498).
+
+A statikus modellek `FinishGpu`-ja ugyanígy szinkron tölt fel (6–13 ms); erre ugyanez a módszer alkalmazható.
+
 ## Következmény a párhuzamosítási tervre
 
 - A legnagyobb nyereség a **render-adatok kinyerésének** átalakítása (a terv 3. lépése). Kell hozzá

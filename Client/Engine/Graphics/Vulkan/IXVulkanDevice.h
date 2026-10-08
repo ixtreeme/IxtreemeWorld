@@ -129,6 +129,9 @@ public:
 
     // ---- backend-internal helpers (Vulkan module only) ----
     VulkanDevice& Loop() const { return *m_loop; }
+    // Held around every vkQueueSubmit / vkQueuePresentKHR: the present thread presents on a queue that
+    // may be the graphics queue itself (VkQueue host access is externally synchronized).
+    std::mutex& QueueSubmitMutex() const { return m_queueSubmitPresentMutex; }
     VkDevice NativeDevice() const;
     VkRenderPass ResolveRenderPass(const ixrhi::IXRHIRenderPass* pass) const;
     void SetDebugName(VkObjectType type, std::uint64_t handle, const char* name) const;

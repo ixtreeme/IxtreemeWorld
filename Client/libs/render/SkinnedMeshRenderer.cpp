@@ -715,9 +715,34 @@ bool SkinnedMeshRenderer::LoadCpu(client::asset::IAssetReader& assets, const std
     return true;
 }
 
+namespace
+{
+// IX_SKIN_VERIFY=1: each model's GPU skinning is checked against the CPU's when it is made (the GPU is
+// waited for: a hitch per model). Off by default.
+bool SkinVerifyRequested()
+{
+    std::string value;
+#if defined(_WIN32)
+    char* text = nullptr;
+    std::size_t length = 0;
+    if (_dupenv_s(&text, &length, "IX_SKIN_VERIFY") == 0 && text)
+    {
+        value = text;
+        std::free(text);
+    }
+#else
+    if (const char* text = std::getenv("IX_SKIN_VERIFY"))
+        value = text;
+#endif
+    return value == "1" || value == "true" || value == "on";
+}
+} // namespace
+
 bool SkinnedMeshRenderer::FinishGpu(ixrhi::IXRHIDevice& rhi)
 {
     m_rhi = &rhi;
+    static const bool verify = SkinVerifyRequested();
+    m_deferUploads = !verify;
     const bool loaded = m_decodedTextures != nullptr;
     const bool buffers = loaded ? CreateBuffers(rhi) : false;
     const bool compute = buffers ? CreateComputeResources(rhi) : false;
@@ -772,6 +797,7 @@ void SkinnedMeshRenderer::SkinInstance(ixrhi::IXRHICommandList& cmd,
         return;
     if (!EnsureSkinSlot(skinSlot))
         return;
+    RecordPendingUploads(cmd, frame);
 
     const uint32_t frameIndex = frame.frameIndex % kFramesInFlight;
 
@@ -807,6 +833,7 @@ void SkinnedMeshRenderer::SkinInstanceFromPose(ixrhi::IXRHICommandList& cmd,
         return;
     if (!EnsureSkinSlot(skinSlot))
         return;
+    RecordPendingUploads(cmd, frame);
 
     const uint32_t frameIndex = frame.frameIndex % kFramesInFlight;
     if (frameIndex >= kFramesInFlight || !BonePalette(frameIndex, skinSlot) ||
@@ -1122,6 +1149,7 @@ void SkinnedMeshRenderer::Destroy()
 
     m_uniformPages.clear();
     m_bindLayout.reset();
+    m_pendingUploads.reset();
     m_indexBuffer.reset();
     m_worldRenderFrameNumber = std::numeric_limits<std::uint64_t>::max();
     m_worldUniformCursor = 0;
@@ -1861,6 +1889,7 @@ void SkinnedMeshRenderer::RecordSkins(ixrhi::IXRHICommandList& cmd,
 {
     if (!m_computePipeline || !frame.frameActive || slotCount == 0)
         return;
+    RecordPendingUploads(cmd, frame);
     const uint32_t frameIndex = frame.frameIndex % kFramesInFlight;
     cmd.SetComputePipeline(*m_computePipeline);
     SkinPushConstants push{};
@@ -1928,6 +1957,7 @@ void SkinnedMeshRenderer::RecordSkin(ixrhi::IXRHICommandList& cmd, const ixrhi::
 {
     if (!m_computePipeline || !frame.frameActive || !SkinnedOutput(frame.frameIndex % kFramesInFlight, skinSlot))
         return;
+    RecordPendingUploads(cmd, frame);
     const uint32_t frameIndex = frame.frameIndex % kFramesInFlight;
     DispatchSkin(cmd, frameIndex, skinSlot);
     EmitSkinBarrier(cmd, frameIndex, skinSlot);
@@ -2059,6 +2089,43 @@ bool SkinnedMeshRenderer::UploadBonePalette(MotionState state, float animTimeSec
     return UploadPaletteToBuffer(frameIndex, skinSlot);
 }
 
+void SkinnedMeshRenderer::RecordPendingUploads(ixrhi::IXRHICommandList& cmd, const ixrhi::IXRHIFrameInfo& frame)
+{
+    if (!m_pendingUploads || !frame.frameActive)
+        return;
+    PendingUploads& uploads = *m_pendingUploads;
+    if (uploads.recordedFrame != std::numeric_limits<std::uint64_t>::max())
+    {
+        // The frame that copied them is done once its slot comes round again.
+        if (frame.frameNumber >= uploads.recordedFrame + kFramesInFlight)
+            m_pendingUploads.reset();
+        return;
+    }
+    uploads.recordedFrame = frame.frameNumber;
+    if (uploads.indexStaging && m_indexBuffer)
+    {
+        cmd.CopyBuffer(*uploads.indexStaging, *m_indexBuffer, uploads.indexStaging->SizeBytes());
+        cmd.TransitionBuffer(*m_indexBuffer, ixrhi::IXRHIBufferState::TransferDst, ixrhi::IXRHIBufferState::IndexRead);
+    }
+    if (uploads.restStaging && m_restVertexBuffer)
+    {
+        cmd.CopyBuffer(*uploads.restStaging, *m_restVertexBuffer, uploads.restStaging->SizeBytes());
+        cmd.TransitionBuffer(*m_restVertexBuffer, ixrhi::IXRHIBufferState::TransferDst,
+            ixrhi::IXRHIBufferState::ShaderRead);
+    }
+    for (uint32_t textureIndex = 0; textureIndex < kTextureCount; ++textureIndex)
+    {
+        const std::shared_ptr<ixrhi::IXRHIBuffer>& staging = uploads.textureStaging[textureIndex];
+        Texture& texture = m_textures[textureIndex];
+        if (!staging || !texture.image)
+            continue;
+        cmd.TransitionTexture(*texture.image, ixrhi::IXRHIImageLayout::Undefined, ixrhi::IXRHIImageLayout::TransferDst);
+        cmd.CopyBufferToTexture(*staging, 0, texture.width, *texture.image, 0, 0, 0, 0, texture.width, texture.height);
+        cmd.TransitionTexture(*texture.image, ixrhi::IXRHIImageLayout::TransferDst,
+            ixrhi::IXRHIImageLayout::ShaderReadOnly);
+    }
+}
+
 void SkinnedMeshRenderer::DispatchSkin(ixrhi::IXRHICommandList& cmd, uint32_t frameIndex)
 {
     DispatchSkin(cmd, frameIndex, 0);
@@ -2182,14 +2249,32 @@ bool SkinnedMeshRenderer::VerifyComputeSkin(ixrhi::IXRHIDevice& rhi)
 
 bool SkinnedMeshRenderer::CreateBuffers(ixrhi::IXRHIDevice& rhi)
 {
-    // Device-local: written once here, read by every view's and the reflection's draws.
+    // Device-local: written once, read by every view's and the reflection's draws.
+    const std::uint64_t bytes = sizeof(uint32_t) * m_indices.size();
+    if (!m_deferUploads)
+    {
+        m_indexBuffer = CreateRhiBuffer(rhi,
+            bytes,
+            ixrhi::IXRHIBufferUsage::Index,
+            ixrhi::IXRHICpuAccess::None,
+            m_indices.data(),
+            "SkinnedMesh:IB");
+        return m_indexBuffer != nullptr;
+    }
+    m_pendingUploads = std::make_unique<PendingUploads>();
     m_indexBuffer = CreateRhiBuffer(rhi,
-        sizeof(uint32_t) * m_indices.size(),
-        ixrhi::IXRHIBufferUsage::Index,
+        bytes,
+        ixrhi::IXRHIBufferUsage::Index | ixrhi::IXRHIBufferUsage::TransferDst,
         ixrhi::IXRHICpuAccess::None,
-        m_indices.data(),
+        nullptr,
         "SkinnedMesh:IB");
-    return m_indexBuffer != nullptr;
+    m_pendingUploads->indexStaging = CreateRhiBuffer(rhi,
+        bytes,
+        ixrhi::IXRHIBufferUsage::TransferSrc,
+        ixrhi::IXRHICpuAccess::Write,
+        m_indices.data(),
+        "SkinnedMesh:IBStaging");
+    return m_indexBuffer != nullptr && m_pendingUploads->indexStaging != nullptr;
 }
 
 bool SkinnedMeshRenderer::CreateComputeResources(ixrhi::IXRHIDevice& rhi)
@@ -2206,12 +2291,32 @@ bool SkinnedMeshRenderer::CreateComputeResources(ixrhi::IXRHIDevice& rhi)
         return false;
     }
 
-    m_restVertexBuffer = CreateRhiBuffer(rhi,
-        restSize,
-        ixrhi::IXRHIBufferUsage::Storage,
-        ixrhi::IXRHICpuAccess::None,
-        m_restVerticesGpu.data(),
-        "SkinnedMesh:RestVertices");
+    if (m_deferUploads && m_pendingUploads)
+    {
+        m_restVertexBuffer = CreateRhiBuffer(rhi,
+            restSize,
+            ixrhi::IXRHIBufferUsage::Storage | ixrhi::IXRHIBufferUsage::TransferDst,
+            ixrhi::IXRHICpuAccess::None,
+            nullptr,
+            "SkinnedMesh:RestVertices");
+        m_pendingUploads->restStaging = CreateRhiBuffer(rhi,
+            restSize,
+            ixrhi::IXRHIBufferUsage::TransferSrc,
+            ixrhi::IXRHICpuAccess::Write,
+            m_restVerticesGpu.data(),
+            "SkinnedMesh:RestStaging");
+        if (!m_pendingUploads->restStaging)
+            return false;
+    }
+    else
+    {
+        m_restVertexBuffer = CreateRhiBuffer(rhi,
+            restSize,
+            ixrhi::IXRHIBufferUsage::Storage,
+            ixrhi::IXRHICpuAccess::None,
+            m_restVerticesGpu.data(),
+            "SkinnedMesh:RestVertices");
+    }
     if (!m_restVertexBuffer)
         return false;
 
@@ -2229,7 +2334,7 @@ bool SkinnedMeshRenderer::CreateComputeResources(ixrhi::IXRHIDevice& rhi)
         return false;
     if (!CreateComputePipeline(rhi))
         return false;
-    if (!VerifyComputeSkin(rhi))
+    if (!m_deferUploads && (!EnsureSkinSlot(0) || !VerifyComputeSkin(rhi)))
         return false;
 
     LogFormat("[COMPUTE] resources OK rest=%zu bytes output/frame/slot=%zu bytes palette/frame/slot=%zu bytes slots=%u (up to %u)",
@@ -2248,39 +2353,13 @@ SkinnedMeshRenderer::SkinPage* SkinnedMeshRenderer::AddSkinPage(ixrhi::IXRHIDevi
     const std::uint64_t restSize = sizeof(RestVertexGpu) * m_restVerticesGpu.size();
     const std::uint64_t vertexSize = sizeof(Vertex) * m_vertices.size();
     const std::uint64_t paletteSize = sizeof(Mat4) * static_cast<size_t>(m_boneCount);
+    (void)restSize;
+    (void)vertexSize;
+    (void)paletteSize;
     auto page = std::make_unique<SkinPage>();
     page->computeGroup = rhi.CreateBindGroup(*m_computeBindLayout, kFramesInFlight * kSkinSlots);
     if (!page->computeGroup)
         return nullptr;
-    for (uint32_t frame = 0; frame < kFramesInFlight; ++frame)
-    {
-        for (uint32_t slot = 0; slot < kSkinSlots; ++slot)
-        {
-            std::shared_ptr<ixrhi::IXRHIBuffer>& palette = page->palettes[frame][slot];
-            std::shared_ptr<ixrhi::IXRHIBuffer>& output = page->outputs[frame][slot];
-            palette = CreateRhiBuffer(rhi,
-                paletteSize,
-                ixrhi::IXRHIBufferUsage::Storage,
-                ixrhi::IXRHICpuAccess::Write,
-                nullptr,
-                "SkinnedMesh:BonePalette");
-            // Skinned output is written by compute and read as vertex input
-            // (plus transfer-source for verification readback).
-            output = CreateRhiBuffer(rhi,
-                vertexSize,
-                ixrhi::IXRHIBufferUsage::Storage | ixrhi::IXRHIBufferUsage::Vertex |
-                    ixrhi::IXRHIBufferUsage::TransferSrc,
-                ixrhi::IXRHICpuAccess::None,
-                nullptr,
-                "SkinnedMesh:SkinnedOutput");
-            if (!palette || !output)
-                return nullptr;
-            const uint32_t set = frame * kSkinSlots + slot;
-            page->computeGroup->UpdateBuffer(set, 0, m_restVertexBuffer, 0, restSize);
-            page->computeGroup->UpdateBuffer(set, 1, palette, 0, paletteSize);
-            page->computeGroup->UpdateBuffer(set, 2, output, 0, vertexSize);
-        }
-    }
     m_skinPages.push_back(std::move(page));
     return m_skinPages.back().get();
 }
@@ -2301,6 +2380,40 @@ bool SkinnedMeshRenderer::EnsureSkinSlot(uint32_t skinSlot)
             }
             return false;
         }
+    }
+    // The slot's own buffers (both frames), when it is first used: its sets were never bound.
+    SkinPage& page = *m_skinPages[skinSlot / kSkinSlots];
+    const uint32_t slot = skinSlot % kSkinSlots;
+    if (page.outputs[0][slot] && page.outputs[kFramesInFlight - 1][slot])
+        return true;
+    const std::uint64_t restSize = sizeof(RestVertexGpu) * m_restVerticesGpu.size();
+    const std::uint64_t vertexSize = sizeof(Vertex) * m_vertices.size();
+    const std::uint64_t paletteSize = sizeof(Mat4) * static_cast<size_t>(m_boneCount);
+    for (uint32_t frame = 0; frame < kFramesInFlight; ++frame)
+    {
+        std::shared_ptr<ixrhi::IXRHIBuffer> palette = CreateRhiBuffer(*m_rhi,
+            paletteSize,
+            ixrhi::IXRHIBufferUsage::Storage,
+            ixrhi::IXRHICpuAccess::Write,
+            nullptr,
+            "SkinnedMesh:BonePalette");
+        // Skinned output is written by compute and read as vertex input
+        // (plus transfer-source for verification readback).
+        std::shared_ptr<ixrhi::IXRHIBuffer> output = CreateRhiBuffer(*m_rhi,
+            vertexSize,
+            ixrhi::IXRHIBufferUsage::Storage | ixrhi::IXRHIBufferUsage::Vertex |
+                ixrhi::IXRHIBufferUsage::TransferSrc,
+            ixrhi::IXRHICpuAccess::None,
+            nullptr,
+            "SkinnedMesh:SkinnedOutput");
+        if (!palette || !output)
+            return false;
+        const uint32_t set = frame * kSkinSlots + slot;
+        page.computeGroup->UpdateBuffer(set, 0, m_restVertexBuffer, 0, restSize);
+        page.computeGroup->UpdateBuffer(set, 1, palette, 0, paletteSize);
+        page.computeGroup->UpdateBuffer(set, 2, output, 0, vertexSize);
+        page.palettes[frame][slot] = std::move(palette);
+        page.outputs[frame][slot] = std::move(output);
     }
     return true;
 }
@@ -2390,7 +2503,23 @@ bool SkinnedMeshRenderer::UploadDecodedTextures(ixrhi::IXRHIDevice& rhi)
         imageDesc.format = dds.format;
         imageDesc.usage = sampledUpload;
         imageDesc.debugName = "SkinnedMesh:" + dds.filename;
-        texture.image = rhi.CreateTexture(imageDesc, dds.pixels.data(), dds.pixels.size());
+        if (m_deferUploads && m_pendingUploads)
+        {
+            // Made empty; its texels (mip 0, all an image of mipLevels 1 takes) from staging.
+            texture.image = rhi.CreateTexture(imageDesc, nullptr, 0);
+            m_pendingUploads->textureStaging[textureIndex] = CreateRhiBuffer(rhi,
+                dds.pixels.size(),
+                ixrhi::IXRHIBufferUsage::TransferSrc,
+                ixrhi::IXRHICpuAccess::Write,
+                dds.pixels.data(),
+                ("SkinnedMesh:" + dds.filename + ":Staging").c_str());
+            if (!m_pendingUploads->textureStaging[textureIndex])
+                return false;
+        }
+        else
+        {
+            texture.image = rhi.CreateTexture(imageDesc, dds.pixels.data(), dds.pixels.size());
+        }
         if (!texture.image)
             return false;
 

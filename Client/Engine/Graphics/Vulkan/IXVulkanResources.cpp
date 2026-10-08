@@ -210,6 +210,7 @@ IXVulkanBufferUpload::IXVulkanBufferUpload(IXVulkanDevice& device,
     submit.commandBufferCount = 1;
     submit.pCommandBuffers = &cmd;
     // No wait: completion is polled via IsReady (parity with the old LOD path).
+    std::lock_guard<std::mutex> queueLock(device.QueueSubmitMutex());
     IXVULKAN_CHECK(device,
         vkQueueSubmit(device.Loop().GetGraphicsQueue(), 1, &submit, m_fence));
 }
