@@ -81,6 +81,8 @@ public:
         float uvOffset[2] = {0.0f, 0.0f};
     };
 
+    struct PreparedInstance;
+
     struct Instance
     {
         std::uint32_t entityId = 0;
@@ -91,7 +93,15 @@ public:
         bool selectedForOutline = false;
         std::vector<std::string> materialSlots;
         std::vector<MeshSceneEntity::MaterialOverride> materialOverrides;
+        // Optional: what this instance's records hold that no view changes (PrepareInstance), kept
+        // by the caller while the instance is unchanged. Draws then skip building its matrix and
+        // looking up its materials; one made by another renderer, or before the material assets
+        // changed, is not used.
+        const PreparedInstance* prepared = nullptr;
     };
+    // The instances of one batch draw. Pointers: the caller keeps its instances (and their material
+    // lists) where they are instead of copying them into every batch of every pass.
+    using InstanceList = std::vector<const Instance*>;
 
     struct LodDiagnostics
     {
@@ -126,8 +136,20 @@ public:
         float materialAlpha[4] = {0.0f, 0.5f, 0.0f, 0.0f};
     };
 
+    struct PreparedInstance
+    {
+        const StaticMeshRenderer* renderer = nullptr;  // whose material slots these are
+        std::uint64_t materialRevision = 0;            // MaterialAssetManager::Revision() read at
+        std::vector<InstanceBlock> slots;              // per material slot; mvp is the view's
+        bool hasTransparentDraws = false;
+    };
+
     StaticMeshRenderer() = default;
     ~StaticMeshRenderer();
+
+    // The instance's view-independent records (see Instance::prepared). Made again when the instance
+    // or MaterialAssetManager::Revision() changes; cheap to keep, about 200 bytes per material slot.
+    void PrepareInstance(const Instance& instance, PreparedInstance& out) const;
 
     bool Create(ixrhi::IXRHIDevice& rhi,
                 client::asset::IAssetReader& assets,
@@ -144,7 +166,7 @@ public:
     void RenderShadowCasters(ixrhi::IXRHICommandList& cmd,
         const ixrhi::IXRHIFrameInfo& frame,
         const WorldMat4& lightViewProj,
-        const std::vector<Instance>& instances,
+        const InstanceList& instances,
         const ixrhi::IXRHIRenderPass* shadowPass);
     void RenderInWorld(ixrhi::IXRHICommandList& cmd,
         const ixrhi::IXRHIFrameInfo& frame,
@@ -157,14 +179,14 @@ public:
         const ixrhi::IXRHIFrameInfo& frame,
         double timeSeconds,
         const WorldCamera& camera,
-        const std::vector<Instance>& instances,
+        const InstanceList& instances,
         std::uint32_t targetWidth = 0,
         std::uint32_t targetHeight = 0);
     void RenderLodBatchInWorld(ixrhi::IXRHICommandList& cmd,
         const ixrhi::IXRHIFrameInfo& frame,
         double timeSeconds,
         const WorldCamera& camera,
-        const std::vector<Instance>& instances,
+        const InstanceList& instances,
         const LodConfig& lodConfig,
         std::uint64_t configHash,
         std::uint32_t lodLevel,
@@ -192,7 +214,7 @@ public:
     bool HasVertexBuffer() const { return m_vertexBuffer != nullptr; }
     bool HasIndexBuffer() const { return m_indexBuffer != nullptr; }
     bool HasTexture() const { return m_texture.image != nullptr; }
-    bool HasDescriptors() const { return m_bindGroup != nullptr && m_bindLayout != nullptr; }
+    bool HasDescriptors() const { return !m_bindPages.empty() && m_bindLayout != nullptr; }
     std::size_t VertexCount() const { return m_vertices.size(); }
     std::size_t IndexCount() const { return m_indices.size(); }
     std::size_t TriangleCount() const { return m_indices.size() / 3u; }
@@ -222,7 +244,9 @@ public:
 
 private:
     static constexpr uint32_t kFramesInFlight = 2;
+    // Bind sets per page and frame in flight (see BindPage), and the most pages a renderer makes.
     static constexpr uint32_t kUniformSlots = 64;
+    static constexpr uint32_t kMaxBindPages = 64;
     static constexpr uint32_t kInitialInstanceCapacity = 256;
 
     struct Vertex
@@ -368,19 +392,51 @@ private:
     MaterialTextureViews ResolveMaterialTextureViews(ixrhi::IXRHIDevice& rhi,
         const Instance& instance,
         std::uint32_t materialSlot);
-    void UpdateMaterialTextureDescriptors(uint32_t frameIndex,
-        uint32_t uniformSlot,
-        const MaterialTextureViews& textures);
+    // Textures/samplers each bind set's descriptors point at (baseColor, normal, orm), so a draw
+    // re-binding the same material skips the descriptor writes. A bind group keeps every resource
+    // ever bound to it alive, so a stored pointer cannot be reused by another texture meanwhile.
+    struct BoundSlotTexture
+    {
+        const ixrhi::IXRHITexture* texture = nullptr;
+        const ixrhi::IXRHISampler* sampler = nullptr;
+    };
+    // Every draw of a frame binds a set of its own: a set must not change once the frame's command
+    // list has bound it. Sets come in pages of kUniformSlots per frame in flight; a frame drawing more
+    // than the pages hold adds one, kept for the frames after.
+    struct BindPage
+    {
+        std::unique_ptr<ixrhi::IXRHIBindGroup> group;  // set = frame index * kUniformSlots + slot
+        std::shared_ptr<ixrhi::IXRHIBuffer> uniforms;  // every set's UniformBlock (kUniformStride apart)
+        std::array<std::array<BoundSlotTexture, 3>, kFramesInFlight * kUniformSlots> textures{};
+        // The instance buffer binding 4 points at: re-pointed when the set is next taken, after a
+        // frame grew the buffer (never while a frame that bound the set may still run).
+        std::array<const ixrhi::IXRHIBuffer*, kFramesInFlight * kUniformSlots> instances{};
+    };
+    struct BindSlot
+    {
+        BindPage* page = nullptr;
+        std::uint32_t set = 0;
+        std::uint32_t id = 0;  // page * sets per page + set (diagnostics)
+    };
+    // Starts this renderer's set and instance cursors over when the frame is a new one.
+    void BeginFrameSlots(const ixrhi::IXRHIFrameInfo& frame);
+    // The frame's next set, its instance binding current; none past kMaxBindPages (logged once).
+    std::optional<BindSlot> NextBindSlot(uint32_t frameIndex);
+    BindPage* AddBindPage(ixrhi::IXRHIDevice& rhi);
+    void UpdateMaterialTextureDescriptors(const BindSlot& slot, const MaterialTextureViews& textures);
     bool CreateBindGroup(ixrhi::IXRHIDevice& rhi);
     bool CreatePipeline(ixrhi::IXRHIDevice& rhi);
     bool CreateShadowPipelines(ixrhi::IXRHIDevice& rhi, const ixrhi::IXRHIRenderPass* shadowPass);
+    // The instance's record for one material slot in the view (its prepared one when usable).
+    void FillInstanceBlock(const WorldMat4& viewProjection,
+        const Instance& instance,
+        std::uint32_t materialSlot,
+        InstanceBlock& out) const;
     // Appends instance blocks at this frame's cursor; returns the first record's index.
     std::optional<std::uint32_t> AppendInstanceBlocks(uint32_t frameIndex, const std::vector<InstanceBlock>& blocks);
     bool EnsureInstanceCapacity(ixrhi::IXRHIDevice& rhi, uint32_t frameIndex, std::uint32_t requiredRecords);
-    void UpdateInstanceDescriptorSets(uint32_t frameIndex);
     void DestroyPipeline();
-    void UpdateWorldUniform(uint32_t frameIndex,
-        uint32_t uniformSlot,
+    void UpdateWorldUniform(const BindSlot& slot,
         const WorldCamera& camera,
         const Instance& instance,
         double timeSeconds,
@@ -391,12 +447,10 @@ private:
     client::asset::IAssetReader* m_assets = nullptr;
     std::shared_ptr<ixrhi::IXRHIBuffer> m_vertexBuffer;
     std::shared_ptr<ixrhi::IXRHIBuffer> m_indexBuffer;
-    std::array<std::array<std::shared_ptr<ixrhi::IXRHIBuffer>, kUniformSlots>, kFramesInFlight> m_uniformBuffers{};
+    // Grown when a frame appends more records than it holds. The records a frame wrote before stay
+    // in the old buffer, which the sets bound to it keep alive.
     std::array<std::shared_ptr<ixrhi::IXRHIBuffer>, kFramesInFlight> m_instanceBuffers{};
     std::array<std::uint32_t, kFramesInFlight> m_instanceBufferCapacity{};
-    // CPU mirror of instance records per frame (lets growth preserve already
-    // written records without GPU readback; same bytes as the old map-copy).
-    std::array<std::vector<InstanceBlock>, kFramesInFlight> m_instanceMirror{};
     Texture m_texture;
     Texture m_normalTexture;
     Texture m_ormTexture;
@@ -419,16 +473,8 @@ private:
     std::unordered_set<MaterialTextureKey, MaterialTextureKeyHash> m_failedMaterialTextureKeys;
     std::vector<LastMaterialBinding> m_lastMaterialBindings;
     std::unique_ptr<ixrhi::IXRHIBindGroupLayout> m_bindLayout;
-    std::unique_ptr<ixrhi::IXRHIBindGroup> m_bindGroup;
-    // Textures/samplers each bind slot's descriptors currently point at (baseColor, normal, orm), so a
-    // draw re-binding the same material skips the descriptor writes. The bind group keeps every bound
-    // resource alive, so a stored pointer cannot be reused by another texture meanwhile.
-    struct BoundSlotTexture
-    {
-        const ixrhi::IXRHITexture* texture = nullptr;
-        const ixrhi::IXRHISampler* sampler = nullptr;
-    };
-    std::array<std::array<BoundSlotTexture, 3>, kFramesInFlight * kUniformSlots> m_boundSlotTextures{};
+    std::vector<std::unique_ptr<BindPage>> m_bindPages;
+    bool m_loggedBindPagesFull = false;
     // Pipeline variants (same 5 as before; mask reuses the lit fragment shader):
     // opaque, alpha-mask, unlit, unlit alpha-mask, selection outline.
     std::unique_ptr<ixrhi::IXRHIGraphicsPipeline> m_pipeline;
@@ -472,6 +518,9 @@ private:
     std::array<float, 3> m_boundsMax = {0.0f, 0.0f, 0.0f};
     LightingState m_lightingState;
     LoadStatus m_status = LoadStatus::NotLoaded;
+    // The frame the cursors below count in (its frame number: a renderer drawn every other frame
+    // meets the same frame index again without the frame between).
+    std::uint64_t m_worldRenderFrameNumber = std::numeric_limits<std::uint64_t>::max();
     uint32_t m_worldRenderFrameIndex = std::numeric_limits<uint32_t>::max();
     uint32_t m_worldUniformCursor = 0;
     // Per-frame write cursor into the instance storage buffer. The same renderer can be

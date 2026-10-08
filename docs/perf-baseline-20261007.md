@@ -20,7 +20,8 @@ A `Client/tools/perf/make_stress_scene.js` az AkitaOnline `Main` jelenet másola
 A bemeneti fájlt sosem írja felül.
 
 - 62 további animált karakter: 31 Arissa és 31 KicsiK, a játékos körül, 3 m-es rácsban. Ez 64 karakter
-  összesen, mert modellenként 32 a motor korlátja (lásd lent).
+  összesen, mert a mérés idején modellenként 32 volt a motor korlátja (lásd lent; azóta javítva). A generátor
+  argumentumai: `node make_stress_scene.js <be> <ki> [karakterek=62] [objektumok=10000] [emitterek=100]`.
 - 10 000 statikus objektum 400×400 m-en: 30% fa (`ujfa`), 70% doboz.
 - 100 részecske-emitter a játékoshoz legközelebbi dobozokon: 50 CPU-s, 50 GPU-s, emitterenként 200 részecske.
 
@@ -71,6 +72,44 @@ A tényleges animáció karakterenként kb. 5 µs.
 3. Egy összeomlás a swapchain újraépítésekor (`[MAIN] swapchain changed, recreating pipelines`, exit 139),
    a mintavételező futása után. 18 minimalizálás/visszaállítás ciklusban nem reprodukálódott. Az 1. pont
    érvénytelen parancspuffere valószínű ok.
+
+## Javítások és a 3. lépés (render-adatok kinyerése) után – 2026-10-08
+
+Ugyanaz a terhelt jelenet, ugyanaz a gép és ablakméret, buildelt játék:
+
+| Állapot | FPS | CPU-frame | GPU-frame (ebből árnyék) |
+| --- | --- | --- | --- |
+| Alapvonal | 36 | 28,0 ms (render 25,0, árnyék 15,3, animáció 2,0) | 18–22 ms (12–15) |
+| Render-rekordok | 45 | 22,6 ms, ebből 8 ms GPU-várakozás (render 10,9, árnyék 6,0) | 22 ms (15,6) |
+| + statikus árnyék-cache | 115 | 8,6 ms (render 5,7, árnyék 1,1) | 7,2 ms (0,6–0,9) |
+| + rekord-slotok, egyszeri frustum | **137** | 7,3 ms, ebből 2 ms GPU-várakozás (render 3,3, árnyék 0,8, animáció 1,4) | 7,3 ms (0,7) |
+
+A jelenet most GPU-korlátos: a 7,3 ms-ből 5,5 ms a fő jelenet-pass (a sok fa és doboz rajzolása).
+A Vulkan-validáció tiszta (0 bájtos napló) a teljes jeleneten, a 256 karakteres tömegen és az editorban
+(Scene nézet szerkesztés közben, Game nézet Play-ben).
+
+Mi változott:
+
+- **Uniform-slot túlcsordulás javítva.** A `StaticMeshRenderer` és a `SkinnedMeshRenderer` descriptor set-jei és
+  uniformjai 64/32-es lapokban bővülnek. Egy frame-en belül egyetlen kötött set-et sem ír át semmi; a példány-buffer
+  kötése csak akkor frissül, amikor a slotot frissen kiosztja.
+- **A 32-es skin-slot korlát megszűnt.** A slotok szintén lapokban jönnek létre, legfeljebb 1024 példány/modell
+  frame-enként. 256 karakterrel (modellenként 128) ellenőrizve.
+- **Aszinkron present.** A swapchaint az acquire (render szál) és a present szál most zárral éri el. A validáció ezt
+  korábban szálkezelési hibaként jelezte.
+- **Render-rekordok.** Statikus mesh-entitásonként frame-ek között megmaradó rekord: feloldott renderer,
+  világ-AABB, sarokpontok, valamint előre kiszámolt példányblokk (modellmátrix és anyag). Csak akkor épül újra, ha az
+  entitás vagy egy anyag-asset megváltozik (`MaterialAssetManager::Revision`). A transzformot minden frame-ben,
+  a modellútvonalat és az anyagokat entitásonként 4 frame-enként vizsgálja. A batch-ek példány-mutatókat kapnak,
+  nem másolatokat (`StaticMeshRenderer::InstanceList`).
+- **Statikus árnyék-cache.** A terep és a nyugvó statikus mesh-ek mélysége külön rétegben marad meg. Ha egy kaszkádban
+  mozgó árnyékvető van (karakter, vagy egy mesh, ami az utolsó 30 frame-ben mozgott), a kaszkád ennek a rétegnek a
+  másolata, és csak a mozgók rajzolódnak rá. Új RHI-hívás: `CopyTextureLayer`. Plusz 64 MB GPU-memória, csak ha kell.
+- **Kisebb tételek.** Egy részecske-emitter id alapján keresi a saját entitását (eddig lineárisan, 50 × 10 000
+  frame-enként). A nézet frustuma nézetenként egyszer számolódik. A kiszűrt mesh-ek naplózó halmazai csak a LOD-
+  diagnosztikával futnak. Minimalizált ablaknál a fő ciklus 5 ms-ot alszik (eddig 57 000 kört futott másodpercenként).
+- **Editor-hierarchia.** A szülő→gyerek és id→elem index egyszer épül fel. A hierarchia-panel eddig O(N²) volt:
+  10 000 entitásnál az editor ~5 FPS-ről ~40 FPS-re javult. A maradék fő tétele a frame-enkénti hierarchia-újraépítés.
 
 ## Következmény a párhuzamosítási tervre
 

@@ -194,20 +194,31 @@ public:
     // memory) vertex buffer and the painted splat rectangle into the splat textures. Call once per
     // frame outside any render pass, before the terrain is drawn.
     void UploadEditedTerrain(ixrhi::IXRHICommandList& cmd, const ixrhi::IXRHIFrameInfo& frame);
-    // Draws the sun shadow cascades: the terrain (if any), then in each cascade whatever drawCasters
-    // adds (the meshes), given the cascade, its light view-projection and its render pass. A cascade
-    // is drawn again only when what it holds may have changed: its placement (the camera moved past
-    // one of its texels, the sun turned), the terrain, or its castersRevisions entry, which changes
-    // whenever the casters drawn into it do (moved, animated). The others keep what they hold.
+    // Draws the sun shadow cascades: the terrain (if any), then in each cascade what the casters add
+    // (the meshes), given the cascade, its light view-projection and its render pass. A cascade is
+    // drawn again only when what it holds may have changed: its placement (the camera moved past one
+    // of its texels, the sun turned), the terrain, or its casters' revision, which changes whenever
+    // the casters drawn into it do (moved, animated). The others keep what they hold.
+    //
+    // The static casters are drawn with the terrain into a cache layer of the cascade's own, kept
+    // while they, the terrain and the cascade stay the same. A cascade holding moving casters (an
+    // animated character redraws it every frame) is then a copy of that layer with only the moving
+    // ones drawn over it, instead of the whole scene again.
     using ShadowCasterDraw = std::function<void(std::uint32_t cascade,
                                                 const WorldMat4& lightViewProj,
                                                 const ixrhi::IXRHIRenderPass* pass)>;
     using CascadeRevisions = std::array<std::uint64_t, SunShadowReceive::kCascades>;
+    struct ShadowCasters
+    {
+        CascadeRevisions staticRevisions{};
+        CascadeRevisions dynamicRevisions{};  // 0: no moving caster in the cascade
+        ShadowCasterDraw drawStatic;
+        ShadowCasterDraw drawDynamic;
+    };
     void RenderSunShadowMap(ixrhi::IXRHICommandList& cmd,
                             const ixrhi::IXRHIFrameInfo& frame,
                             const WorldCamera& camera,
-                            const CascadeRevisions& castersRevisions = {},
-                            const ShadowCasterDraw& drawCasters = {});
+                            const ShadowCasters& casters = {});
     // Places the cascades around the camera (RenderSunShadowMap does it too): call it first to know
     // what each cascade will cover (SunShadowCascadeViewProj).
     void UpdateSunShadowCascades(const WorldCamera& camera) { UpdateShadowCascades(camera); }
@@ -596,6 +607,14 @@ private:
     std::shared_ptr<ixrhi::IXRHITexture> m_shadowTexture;
     std::shared_ptr<ixrhi::IXRHISampler> m_shadowSampler;
     std::array<std::unique_ptr<ixrhi::IXRHIRenderTarget>, kShadowCascadeCount> m_shadowTargets{};
+    // The static cache (see RenderSunShadowMap): made the first time a cascade holds moving casters.
+    // Its layers are drawn by their own targets and copied into the cascades, which the moving casters
+    // are then drawn over by targets that keep (load) the depth instead of clearing it.
+    std::shared_ptr<ixrhi::IXRHITexture> m_staticShadowTexture;
+    std::array<std::unique_ptr<ixrhi::IXRHIRenderTarget>, kShadowCascadeCount> m_staticShadowTargets{};
+    std::array<std::unique_ptr<ixrhi::IXRHIRenderTarget>, kShadowCascadeCount> m_shadowOverlayTargets{};
+    bool m_staticShadowCacheFailed = false;
+    bool EnsureStaticShadowCache(ixrhi::IXRHICommandList& cmd);
     std::unique_ptr<ixrhi::IXRHIGraphicsPipeline> m_shadowPipeline;
     std::array<WorldMat4, kShadowCascadeCount> m_shadowCascadeViewProj{};
     std::uint64_t m_shadowDrawnFrame = ~0ull;  // frame number of the last RenderSunShadowMap draw
@@ -614,9 +633,12 @@ private:
         std::uint32_t indexCount = 0;
         std::uint64_t geometryRevision = 0;
         std::uint64_t castersRevision = 0;
+        std::uint64_t dynamicRevision = 0;
         bool operator==(const ShadowCascadeInputs&) const = default;
     };
     std::array<std::optional<ShadowCascadeInputs>, kShadowCascadeCount> m_shadowCascadeInputs;
+    // What each static cache layer was drawn from (the terrain and the static casters only).
+    std::array<std::optional<ShadowCascadeInputs>, kShadowCascadeCount> m_staticShadowInputs;
     std::uint64_t m_terrainGeometryRevision = 0;  // bumped by every vertex upload (sculpting)
     float m_shadowCascadeSplits[kShadowCascadeCount] = {5.0f, 15.0f, 50.0f, 200.0f};
     Texture m_baseTexture;

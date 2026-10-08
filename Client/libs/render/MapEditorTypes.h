@@ -420,6 +420,9 @@ struct LayerAuthoringSettings
 struct MeshSceneEntity
 {
     std::uint32_t id = 0;
+    // Runtime only (never saved): where the renderer keeps this entity's render record, checked
+    // against the id on use (a copied entity carries its original's, and gets one of its own).
+    mutable std::uint32_t renderRecordSlot = 0xffffffffu;
     std::string name;
     std::string prefabAssetId;
     PrefabInstanceState prefabInstance;
@@ -445,6 +448,7 @@ struct MeshSceneEntity
         float emissiveIntensity = 0.0f;
         float uvTiling[2] = {1.0f, 1.0f};
         float uvOffset[2] = {0.0f, 0.0f};
+        bool operator==(const MaterialOverride&) const = default;
     };
     std::vector<std::string> materialSlots;
     std::vector<MaterialOverride> materialOverrides;

@@ -722,6 +722,15 @@ void EditorImGui::SetHierarchySceneState(std::uint64_t sceneRootEntity,
     m_sceneRootEntity = sceneRootEntity;
     m_sceneRootName = sceneRootName.empty() ? "Untitled" : std::move(sceneRootName);
     m_hierarchyEntities = std::move(entities);
+    m_hierarchyIndexByEntity.clear();
+    for (auto& [parent, children] : m_hierarchyChildren)
+        children.clear();  // the lists keep their storage from frame to frame
+    for (std::size_t i = 0; i < m_hierarchyEntities.size(); ++i)
+    {
+        const HierarchySceneEntity& entity = m_hierarchyEntities[i];
+        m_hierarchyIndexByEntity.emplace(entity.entity, i);
+        m_hierarchyChildren[entity.parent].push_back(entity.entity);
+    }
     m_selectedHierarchyEntity = 0;
     for (const HierarchySceneEntity& entity : m_hierarchyEntities)
     {

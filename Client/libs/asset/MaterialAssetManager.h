@@ -89,8 +89,13 @@ public:
                                 const std::string& materialName,
                                 ImportSummary* summary = nullptr);
     void invalidate(const Guid& guid);
+    // Changes whenever what a material GUID resolves to may have: a material loaded, saved (its
+    // edits are applied to the loaded asset, then saved) or dropped. Whoever keeps values read from
+    // the materials keeps this with them and reads them again when it moves on.
+    std::uint64_t Revision() const { return revision_; }
 
 private:
     AssetDatabase& db_;
     std::unordered_map<Guid, std::unique_ptr<MaterialAsset>> cache_;
+    std::uint64_t revision_ = 1;
 };

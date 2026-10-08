@@ -290,6 +290,35 @@ void IXVulkanCommandList::CopyTexture(const ixrhi::IXRHITexture& src, ixrhi::IXR
         &copy);
 }
 
+void IXVulkanCommandList::CopyTextureLayer(const ixrhi::IXRHITexture& src,
+                                           std::uint32_t srcLayer,
+                                           ixrhi::IXRHITexture& dst,
+                                           std::uint32_t dstLayer)
+{
+    auto* nativeSrc = dynamic_cast<const IXVulkanTexture*>(&src);
+    auto* nativeDst = dynamic_cast<IXVulkanTexture*>(&dst);
+    assert(nativeSrc != nullptr && nativeDst != nullptr && "foreign IXRHITexture used with IXVulkan backend");
+    if (nativeSrc == nullptr || nativeDst == nullptr || srcLayer >= nativeSrc->ArrayLayers() ||
+        dstLayer >= nativeDst->ArrayLayers())
+        return;
+    const VkImageAspectFlags aspect = ToVkAspectMask(nativeSrc->Format());
+    VkImageCopy copy{};
+    copy.srcSubresource.aspectMask = aspect;
+    copy.srcSubresource.baseArrayLayer = srcLayer;
+    copy.srcSubresource.layerCount = 1;
+    copy.dstSubresource.aspectMask = aspect;
+    copy.dstSubresource.baseArrayLayer = dstLayer;
+    copy.dstSubresource.layerCount = 1;
+    copy.extent = {nativeSrc->Width(), nativeSrc->Height(), 1};
+    vkCmdCopyImage(m_cmd,
+        nativeSrc->Native(),
+        VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL,
+        nativeDst->Native(),
+        VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL,
+        1,
+        &copy);
+}
+
 void IXVulkanCommandList::ClearDepth(float depth,
                                      std::uint32_t x,
                                      std::uint32_t y,

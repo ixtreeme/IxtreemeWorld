@@ -90,6 +90,12 @@ public:
     // Full-subresource same-size copy. Both textures must already be in
     // TransferSrc (src) / TransferDst (dst); aspects derive from formats.
     virtual void CopyTexture(const IXRHITexture& src, IXRHITexture& dst) = 0;
+    // One array layer (mip 0) into a layer of a texture of the same size and format, in the same
+    // layouts as CopyTexture.
+    virtual void CopyTextureLayer(const IXRHITexture& src,
+                                  std::uint32_t srcLayer,
+                                  IXRHITexture& dst,
+                                  std::uint32_t dstLayer) = 0;
 
     // Whole- or part-buffer copy. Ordering with surrounding commands follows
     // recording order (same queue); explicit state transitions still apply.

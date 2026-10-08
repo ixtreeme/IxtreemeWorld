@@ -309,6 +309,7 @@ MaterialAsset* MaterialAssetManager::getOrLoad(const Guid& guid)
         guid.toString().c_str());
     MaterialAsset* result = material.get();
     cache_[guid] = std::move(material);
+    ++revision_;
     return result;
 }
 
@@ -324,6 +325,7 @@ bool MaterialAssetManager::save(const MaterialAsset& material)
         return false;
     }
     file << MaterialJson(material);
+    ++revision_;
     Tracenf("[MATERIAL-ASSET] save OK path=%s guid=%s",
         material.path.generic_string().c_str(),
         material.guid.toString().c_str());
@@ -422,4 +424,5 @@ Guid MaterialAssetManager::createFromGltfMaterial(const GltfMaterialSource& gltf
 void MaterialAssetManager::invalidate(const Guid& guid)
 {
     cache_.erase(guid);
+    ++revision_;
 }

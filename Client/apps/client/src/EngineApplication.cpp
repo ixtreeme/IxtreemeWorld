@@ -16,6 +16,7 @@
 #include "ParticleSimulator.h"
 #include "AssetWatcher.h"
 #include "LODSystem.h"
+#include "MaterialAssetManager.h"
 #include "MeshSystem.h"
 #include "NativeWindow.h"
 #include "AnimationRuntime.h"
@@ -85,6 +86,7 @@
 #include <cstdlib>
 #include <cstring>
 #include <ctime>
+#include <deque>
 #include <filesystem>
 #include <fstream>
 #include <atomic>
@@ -536,6 +538,7 @@ struct PerfLogState
     std::uint32_t gpuSamples = 0;
     double gpuFrame = 0.0, gpuShadow = 0.0, gpuReflection = 0.0, gpuTerrain = 0.0, gpuScene = 0.0,
            gpuPost = 0.0, gpuUi = 0.0;
+    std::array<double, 4> gpuCascades{};  // each sun shadow cascade's draw (0 when kept)
 };
 
 double PerfLogIntervalFromEnvironment()
@@ -2740,18 +2743,18 @@ int RunGame(NativeWindow& window,
 
     // Per-model skinned (rigged character) renderer cache. Keyed by the same resolved
     // runtime path as staticMeshCache, so multiple DISTINCT rigged models render at once.
-    // Each entry owns its own SkinnedMeshRenderer (pipelines, buffers, and its own 32-slot
-    // skin pool), so per-frame skin slots are allocated PER renderer (no global namespace).
+    // Each entry owns its own SkinnedMeshRenderer (pipelines, buffers, and its own skin-slot
+    // pool), so per-frame skin slots are allocated PER renderer (no global namespace).
     struct SkinnedMeshCacheEntry
     {
         enum class State { Unknown, Loaded, Failed };
         std::unique_ptr<SkinnedMeshRenderer> renderer;
         State state = State::Unknown;
-        // Per-frame skin-slot cursors: Scene view consumes bottom-up, Game view top-down,
-        // out of THIS renderer's MaxSkinSlots() pool. Reset lazily once per device frame so a
-        // model drawn in both views in one command buffer never clobbers its own poses.
-        std::uint32_t sceneSlotCursor = 0;
-        std::uint32_t gameSlotCursor = SkinnedMeshRenderer::MaxSkinSlots();
+        // Per-frame skin-slot cursor over THIS renderer's pool (up to MaxSkinSlots(); the renderer
+        // makes slots as they are first used). Reset lazily once per device frame; the Scene and Game
+        // views take slots from it alike, so a model drawn in both views in one command buffer never
+        // clobbers its own poses.
+        std::uint32_t slotCursor = 0;
         std::uint64_t cursorsResetFrame = std::numeric_limits<std::uint64_t>::max();
     };
     std::unordered_map<std::string, SkinnedMeshCacheEntry> skinnedMeshCache;
@@ -2824,6 +2827,8 @@ int RunGame(NativeWindow& window,
     // the library changes (a refresh, a saved LOD default, another library) or another project opens.
     std::uint64_t meshCachesLibraryRevision = 0;
     std::filesystem::path meshCachesProjectRoot;
+    // Moves on whenever the caches are dropped: what was resolved through them may resolve otherwise.
+    std::uint64_t meshCachesGeneration = 1;
     auto validateMeshCaches = [&]() {
         const std::uint64_t libraryRevision = editorImGui.AssetLibraryRevision();
         const std::filesystem::path projectRoot = ProjectManager::Instance().HasProject()
@@ -2835,6 +2840,7 @@ int RunGame(NativeWindow& window,
         lodDefaultCache.clear();
         meshCachesLibraryRevision = libraryRevision;
         meshCachesProjectRoot = projectRoot;
+        ++meshCachesGeneration;
     };
     auto findModelLodDefault = [&](const std::string& assetId) -> std::optional<LodConfig> {
         if (assetId.empty())
@@ -2960,6 +2966,137 @@ int RunGame(NativeWindow& window,
         entry.state = StaticMeshCacheEntry::State::LoadedStatic;
         Tracenf("[MESH-ENTITY] StaticMeshRenderer loaded: %s", modelPath.c_str());
         return entry.renderer.get();
+    };
+    // Render extraction: what a mesh entity's draws need, kept between frames. It is built again only
+    // when the entity's model, transform or materials, the model path resolution or the material
+    // assets change; the passes read it instead of resolving the model, building the world bounds and
+    // the per-instance records and copying the material lists for every entity, pass and frame.
+    // (Renderers are never dropped from staticMeshCache, so the pointer stays valid.)
+    struct StaticMeshRenderRecord
+    {
+        bool inUse = false;
+        std::uint32_t entityId = 0;
+        std::uint64_t validatedFrame = std::numeric_limits<std::uint64_t>::max();
+        // What it was built from, with the instance's transform and materials.
+        std::uint64_t meshCachesGeneration = 0;
+        std::string meshAssetPath;
+        bool skinned = false;
+        std::string runtimePath;      // the model's resolved path
+        bool modelIsSkinned = false;  // the static path found the model rigged
+        StaticMeshRenderer* renderer = nullptr;  // null: no static draws
+        StaticMeshRenderer::Instance instance;   // its prepared points at prepared below
+        StaticMeshRenderer::PreparedInstance prepared;
+        SpatialIndex::Aabb worldBounds{};
+        std::array<WorldVec3, 8> corners{};
+        std::uint64_t changedFrame = 0;  // renderRecordFrame it was last built or its materials read in
+    };
+    // An entity finds its record by the slot it holds (MeshSceneEntity::renderRecordSlot). A deque: a
+    // record stays where it is while others are added, so pointers to records (and to their instances)
+    // hold for the frame. The slots of entities that are gone are freed between frames and reused.
+    std::deque<StaticMeshRenderRecord> staticMeshRenderRecords;
+    std::vector<std::uint32_t> freeStaticMeshRenderRecords;
+    std::uint64_t renderRecordFrame = 0;
+    // The sun shadow pass's static mesh casters by renderer, refilled every frame (their storage is
+    // kept): those settled (unchanged for kShadowSettleFrames) go into the cascades' static cache, the
+    // others (physics bodies, things scripts move) are drawn over it with the characters.
+    struct ShadowCasterBatch
+    {
+        StaticMeshRenderer* renderer = nullptr;
+        std::vector<const StaticMeshRenderRecord*> casters;
+    };
+    std::vector<ShadowCasterBatch> settledShadowCasterBatches;
+    std::vector<ShadowCasterBatch> movingShadowCasterBatches;
+    constexpr std::uint64_t kShadowSettleFrames = 30;
+    // recheck: compare everything now (the entity was just changed by the caller).
+    auto staticMeshRenderRecord = [&](const MeshSceneEntity& mesh, bool recheck = false) -> StaticMeshRenderRecord& {
+        std::uint32_t slot = mesh.renderRecordSlot;
+        if (slot >= staticMeshRenderRecords.size() || !staticMeshRenderRecords[slot].inUse ||
+            staticMeshRenderRecords[slot].entityId != mesh.id)
+        {
+            if (!freeStaticMeshRenderRecords.empty())
+            {
+                slot = freeStaticMeshRenderRecords.back();
+                freeStaticMeshRenderRecords.pop_back();
+                staticMeshRenderRecords[slot] = {};
+            }
+            else
+            {
+                slot = static_cast<std::uint32_t>(staticMeshRenderRecords.size());
+                staticMeshRenderRecords.emplace_back();
+            }
+            staticMeshRenderRecords[slot].inUse = true;
+            staticMeshRenderRecords[slot].entityId = mesh.id;
+            mesh.renderRecordSlot = slot;
+        }
+        StaticMeshRenderRecord& record = staticMeshRenderRecords[slot];
+        if (record.validatedFrame == renderRecordFrame && !recheck)
+            return record;
+        // The transform every frame; the model path and the materials (string compares, ~10 000
+        // entities) every 4th frame per entity, staggered, or at once when asked to (an edit shows
+        // up to 3 frames late otherwise).
+        const bool checkAssets = recheck || record.validatedFrame == std::numeric_limits<std::uint64_t>::max() ||
+            ((mesh.id + renderRecordFrame) & 3u) == 0u;
+        record.validatedFrame = renderRecordFrame;
+        StaticMeshRenderer::Instance& instance = record.instance;
+        const bool unchanged = record.meshCachesGeneration == meshCachesGeneration &&
+            record.skinned == mesh.skinned &&
+            instance.entityId == mesh.id &&
+            instance.position.x == mesh.position[0] && instance.position.y == mesh.position[1] &&
+            instance.position.z == mesh.position[2] &&
+            std::equal(std::begin(mesh.rotation), std::end(mesh.rotation), std::begin(instance.rotation)) &&
+            std::equal(std::begin(mesh.scale), std::end(mesh.scale), std::begin(instance.scale)) &&
+            (!checkAssets ||
+                (record.meshAssetPath == mesh.meshAssetPath &&
+                    instance.materialSlots == mesh.materialSlots &&
+                    instance.materialOverrides == mesh.materialOverrides));
+        if (unchanged)
+        {
+            if (record.renderer && record.prepared.materialRevision != MaterialAssetManager::Instance().Revision())
+            {
+                record.renderer->PrepareInstance(instance, record.prepared);
+                record.changedFrame = renderRecordFrame;
+            }
+            return record;
+        }
+        record.changedFrame = renderRecordFrame;
+        record.meshCachesGeneration = meshCachesGeneration;
+        record.meshAssetPath = mesh.meshAssetPath;
+        record.skinned = mesh.skinned;
+        instance = {};
+        instance.entityId = mesh.id;
+        instance.position = {mesh.position[0], mesh.position[1], mesh.position[2]};
+        for (int axis = 0; axis < 3; ++axis)
+        {
+            instance.rotation[axis] = mesh.rotation[axis];
+            instance.scale[axis] = mesh.scale[axis];
+        }
+        instance.materialSlots = mesh.materialSlots;
+        instance.materialOverrides = mesh.materialOverrides;
+        record.runtimePath = resolveMeshRuntimePath(mesh);
+        record.renderer = nullptr;
+        record.modelIsSkinned = false;
+        if (!mesh.skinned)
+        {
+            StaticMeshRenderer* renderer = getStaticMeshRenderer(record.runtimePath);
+            if (renderer && renderer->IsLoaded())
+            {
+                record.renderer = renderer;
+            }
+            else
+            {
+                const auto cached = staticMeshCache.find(record.runtimePath);
+                record.modelIsSkinned = cached != staticMeshCache.end() &&
+                    cached->second.state == StaticMeshCacheEntry::State::UnsupportedSkinned;
+            }
+        }
+        if (record.renderer)
+        {
+            record.worldBounds = StaticMeshWorldAabb(mesh, *record.renderer);
+            record.corners = SpatialAabbCorners(record.worldBounds);
+            record.renderer->PrepareInstance(instance, record.prepared);
+            instance.prepared = &record.prepared;
+        }
+        return record;
     };
     // A view panel's pixel size as the render size, or nothing (the panel was not laid out yet).
     auto panelRenderExtent = [](std::uint32_t width, std::uint32_t height) -> std::optional<VkExtent2D> {
@@ -5491,9 +5628,16 @@ int RunGame(NativeWindow& window,
         }
         for (auto it = entityParticles.begin(); it != entityParticles.end();)
         {
-            auto meshIt = std::find_if(editorMeshEntities.begin(), editorMeshEntities.end(),
-                [&](const MeshSceneEntity& m) { return m.id == it->first; });
-            if (meshIt == editorMeshEntities.end() || !meshIt->hasParticleSystem ||
+            // By id (a scan per emitter was 10 000 entities x 50 emitters a frame); the scan stays for
+            // an entity the lookup does not hold yet.
+            const MeshSceneEntity* meshIt = findMeshEntityById(it->first);
+            if (!meshIt)
+            {
+                const auto found = std::find_if(editorMeshEntities.begin(), editorMeshEntities.end(),
+                    [&](const MeshSceneEntity& m) { return m.id == it->first; });
+                meshIt = found != editorMeshEntities.end() ? &*found : nullptr;
+            }
+            if (!meshIt || !meshIt->hasParticleSystem ||
                 !meshIt->particleSystem.enabled || meshIt->particleSystem.gpuSimulation)
             {
                 it = entityParticles.erase(it);
@@ -5789,6 +5933,22 @@ int RunGame(NativeWindow& window,
         if (!running)
             break;
         validateMeshCaches();
+        // The mesh render records are checked again (once) in each frame that asks for them; those of
+        // entities that are gone (not asked for in a while) are dropped here, between frames.
+        ++renderRecordFrame;
+        if ((renderRecordFrame & 63u) == 0u)
+        {
+            for (std::uint32_t slot = 0; slot < staticMeshRenderRecords.size(); ++slot)
+            {
+                StaticMeshRenderRecord& record = staticMeshRenderRecords[slot];
+                if (record.inUse && (record.validatedFrame == std::numeric_limits<std::uint64_t>::max() ||
+                                        record.validatedFrame + 120u < renderRecordFrame))
+                {
+                    record = {};
+                    freeStaticMeshRenderRecords.push_back(slot);
+                }
+            }
+        }
 
 #if defined(IXTREEME_WITH_EDITOR)
         // Local discovery batch id (monotonic per loop iteration; the legacy
@@ -11306,35 +11466,25 @@ int RunGame(NativeWindow& window,
             const ixrhi::IXRHIFrameInfo& frameInfo = rhiFrame.info;
             const uint64_t frameNumber = frameInfo.frameNumber;
             // Per-frame skin-slot allocation over the per-model skinned cache. Each entry owns
-            // its own MaxSkinSlots() pool; Scene view (+ water reflection) consumes bottom-up,
-            // Game view top-down, both reset lazily once per device frame, so a model drawn in
+            // its own MaxSkinSlots() pool; the Scene view (+ water reflection) and the Game view
+            // take slots from one cursor, reset lazily once per device frame, so a model drawn in
             // BOTH views in one command buffer never overwrites its own poses. UINT32_MAX = skip.
-            auto resetSkinnedCursorsIfNewFrame = [&](SkinnedMeshCacheEntry& e) {
+            auto allocSkinSlot = [&](SkinnedMeshCacheEntry& e) -> std::uint32_t {
                 if (e.cursorsResetFrame != frameNumber)
                 {
-                    e.sceneSlotCursor = 0;
-                    e.gameSlotCursor = SkinnedMeshRenderer::MaxSkinSlots();
+                    e.slotCursor = 0;
                     e.cursorsResetFrame = frameNumber;
                 }
-            };
-            auto allocSceneSkinSlot = [&](SkinnedMeshCacheEntry& e) -> std::uint32_t {
-                resetSkinnedCursorsIfNewFrame(e);
-                if (e.sceneSlotCursor >= e.gameSlotCursor)
+                if (e.slotCursor >= SkinnedMeshRenderer::MaxSkinSlots())
                     return std::numeric_limits<std::uint32_t>::max();
-                return e.sceneSlotCursor++;
-            };
-            auto allocGameSkinSlot = [&](SkinnedMeshCacheEntry& e) -> std::uint32_t {
-                resetSkinnedCursorsIfNewFrame(e);
-                if (e.gameSlotCursor == 0 || e.gameSlotCursor <= e.sceneSlotCursor)
-                    return std::numeric_limits<std::uint32_t>::max();
-                return --e.gameSlotCursor;
+                return e.slotCursor++;
             };
             // Skinned draws recorded by the pre-pass (which issues the compute SkinInstance
             // BEFORE any render pass begins — a compute dispatch + barrier inside a render pass
             // is illegal). The render passes only replay these as RenderInWorld draws:
             //   sceneSkinnedDraws       — networked entities (Scene/offscreen + water reflection)
-            //   sceneEditorSkinnedDraws — editor mesh entities, Scene-view (bottom-up) slots
-            //   gameEditorSkinnedDraws  — editor mesh entities, Game-view (top-down) slots
+            //   sceneEditorSkinnedDraws — editor mesh entities, Scene-view slots
+            //   gameEditorSkinnedDraws  — editor mesh entities, Game-view slots
             const auto animationBegin = std::chrono::steady_clock::now();
             std::vector<SkinnedDrawRecord> sceneSkinnedDraws;
             std::vector<SkinnedDrawRecord> sceneEditorSkinnedDraws;
@@ -11381,7 +11531,7 @@ int RunGame(NativeWindow& window,
                     SkinnedMeshCacheEntry& defaultEntry = skinnedMeshCache[kDefaultCharacterModelPath];
                     for (const auto& entity : entities)
                     {
-                        const std::uint32_t slot = allocSceneSkinSlot(defaultEntry);
+                        const std::uint32_t slot = allocSkinSlot(defaultEntry);
                         if (slot == std::numeric_limits<std::uint32_t>::max())
                             break;
                         defaultSkinned->SkinInstance(*frameInfo.commandList,
@@ -11421,18 +11571,14 @@ int RunGame(NativeWindow& window,
                     {
                         if (editorPlay.state.mode == EditorPlayMode::Edit && skinnedEntity.editorHidden)
                             continue;
-                        const std::string skinnedRuntimePath = resolveMeshRuntimePath(skinnedEntity);
+                        const StaticMeshRenderRecord& meshRecord = staticMeshRenderRecord(skinnedEntity);
+                        const std::string& skinnedRuntimePath = meshRecord.runtimePath;
                         // Self-heal: an entity flagged static whose model is actually a rigged
                         // glTF/FBX (static path reports UnsupportedSkinned) is promoted to skinned.
-                        if (!skinnedEntity.skinned)
+                        if (!skinnedEntity.skinned && meshRecord.modelIsSkinned)
                         {
-                            auto skinnedCacheIt = staticMeshCache.find(skinnedRuntimePath);
-                            if (skinnedCacheIt != staticMeshCache.end() &&
-                                skinnedCacheIt->second.state == StaticMeshCacheEntry::State::UnsupportedSkinned)
-                            {
-                                skinnedEntity.skinned = true;
-                                SceneManager::Instance().MarkDirty();
-                            }
+                            skinnedEntity.skinned = true;
+                            SceneManager::Instance().MarkDirty();
                         }
                         if (!skinnedEntity.skinned)
                             continue;
@@ -11577,7 +11723,7 @@ int RunGame(NativeWindow& window,
                         }
 #endif
 
-                        const std::uint32_t sceneSlot = allocSceneSkinSlot(skinnedEntry);
+                        const std::uint32_t sceneSlot = allocSkinSlot(skinnedEntry);
                         if (sceneSlot != std::numeric_limits<std::uint32_t>::max())
                         {
                             if (animatorPose.size() != 0)
@@ -11604,7 +11750,7 @@ int RunGame(NativeWindow& window,
 
                         if (willRenderGameView)
                         {
-                            const std::uint32_t gameSlot = allocGameSkinSlot(skinnedEntry);
+                            const std::uint32_t gameSlot = allocSkinSlot(skinnedEntry);
                             if (gameSlot != std::numeric_limits<std::uint32_t>::max())
                             {
                                 if (animatorPose.size() != 0)
@@ -11913,34 +12059,52 @@ int RunGame(NativeWindow& window,
                 // The meshes cast into the cascades too: the shown static meshes (each cascade gets
                 // those over its footprint) and this frame's skinned instances (their Scene-view
                 // skin slots: the pose both views draw).
-                struct StaticShadowCaster
-                {
-                    StaticMeshRenderer* renderer = nullptr;
-                    StaticMeshRenderer::Instance instance;
-                    std::array<WorldVec3, 8> corners{};
-                };
-                std::vector<StaticShadowCaster> staticShadowCasters;
+                // The casters' render records (kept between frames), by renderer: each cascade draws
+                // one batch per renderer of those over its footprint.
+                for (ShadowCasterBatch& batch : settledShadowCasterBatches)
+                    batch.casters.clear();
+                for (ShadowCasterBatch& batch : movingShadowCasterBatches)
+                    batch.casters.clear();
+                bool anyStaticCasters = false;
+                // What the settled casters are, as one value: the cascades' static cache layers are
+                // drawn again when it changes (a caster settled, left, or one appeared).
+                std::uint64_t settledRevision = 1469598103934665603ull;  // FNV-1a
                 if (runtimeSession->IsMapEditorOpen())
                 {
+                    std::size_t lastSettled = 0;
+                    std::size_t lastMoving = 0;
+                    // Few renderers: the previous entity's batch, else a scan.
+                    const auto addTo = [](std::vector<ShadowCasterBatch>& batches, std::size_t& last,
+                                           const StaticMeshRenderRecord& record) {
+                        if (last >= batches.size() || batches[last].renderer != record.renderer)
+                        {
+                            last = 0;
+                            while (last < batches.size() && batches[last].renderer != record.renderer)
+                                ++last;
+                            if (last == batches.size())
+                                batches.push_back({record.renderer, {}});
+                        }
+                        batches[last].casters.push_back(&record);
+                    };
                     for (const MeshSceneEntity& mesh : editorMeshEntities)
                     {
                         if (mesh.skinned || (editorPlay.state.mode == EditorPlayMode::Edit && mesh.editorHidden))
                             continue;
-                        StaticMeshRenderer* renderer = getStaticMeshRenderer(resolveMeshRuntimePath(mesh));
-                        if (!renderer || !renderer->IsLoaded())
+                        const StaticMeshRenderRecord& record = staticMeshRenderRecord(mesh);
+                        if (!record.renderer)
                             continue;
-                        StaticShadowCaster& caster = staticShadowCasters.emplace_back();
-                        caster.renderer = renderer;
-                        caster.instance.entityId = mesh.id;
-                        caster.instance.position = {mesh.position[0], mesh.position[1], mesh.position[2]};
-                        for (int axis = 0; axis < 3; ++axis)
+                        anyStaticCasters = true;
+                        if (record.changedFrame + kShadowSettleFrames < renderRecordFrame)
                         {
-                            caster.instance.rotation[axis] = mesh.rotation[axis];
-                            caster.instance.scale[axis] = mesh.scale[axis];
+                            addTo(settledShadowCasterBatches, lastSettled, record);
+                            const std::uint64_t key[2] = {reinterpret_cast<std::uintptr_t>(&record), record.changedFrame};
+                            for (std::uint64_t word : key)
+                                settledRevision = (settledRevision ^ word) * 1099511628211ull;
                         }
-                        caster.instance.materialSlots = mesh.materialSlots;
-                        caster.instance.materialOverrides = mesh.materialOverrides;
-                        caster.corners = SpatialAabbCorners(StaticMeshWorldAabb(mesh, *renderer));
+                        else
+                        {
+                            addTo(movingShadowCasterBatches, lastMoving, record);
+                        }
                     }
                 }
                 std::vector<const SkinnedDrawRecord*> skinnedShadowCasters;
@@ -11996,24 +12160,33 @@ int RunGame(NativeWindow& window,
                 // skinned ones whose shadow reaches it, animated: every frame); an unchanged cascade is kept.
                 terrain.UpdateSunShadowCascades(*shadowCamera);
                 const WorldMat4* cascadeViewProj = terrain.SunShadowCascadeViewProj();
-                TerrainRenderer::CascadeRevisions castersRevisions{};
-                for (std::uint32_t cascade = 0; cascade < castersRevisions.size(); ++cascade)
+                TerrainRenderer::ShadowCasters shadowCasters;
+                for (std::uint32_t cascade = 0; cascade < shadowCasters.staticRevisions.size(); ++cascade)
                 {
+                    shadowCasters.staticRevisions[cascade] = settledRevision;
+                    // The moving casters over the cascade's footprint, and the characters whose shadow
+                    // reaches it (0: none, the cascade is the static cache alone).
                     std::uint64_t revision = 1469598103934665603ull;  // FNV-1a
+                    bool movingHere = false;
                     auto hash = [&revision](const void* data, std::size_t size) {
                         const auto* bytes = static_cast<const unsigned char*>(data);
                         for (std::size_t i = 0; i < size; ++i)
                             revision = (revision ^ bytes[i]) * 1099511628211ull;
                     };
-                    for (const StaticShadowCaster& caster : staticShadowCasters)
+                    for (const ShadowCasterBatch& batch : movingShadowCasterBatches)
                     {
-                        if (outsideCascadeFootprint(cascadeViewProj[cascade], caster.corners))
-                            continue;
-                        hash(&caster.renderer, sizeof(caster.renderer));
-                        hash(&caster.instance.entityId, sizeof(caster.instance.entityId));
-                        hash(&caster.instance.position, sizeof(caster.instance.position));
-                        hash(caster.instance.rotation, sizeof(caster.instance.rotation));
-                        hash(caster.instance.scale, sizeof(caster.instance.scale));
+                        for (const StaticMeshRenderRecord* caster : batch.casters)
+                        {
+                            if (outsideCascadeFootprint(cascadeViewProj[cascade], caster->corners))
+                                continue;
+                            movingHere = true;
+                            hash(&caster->renderer, sizeof(caster->renderer));
+                            hash(&caster->instance.entityId, sizeof(caster->instance.entityId));
+                            hash(&caster->instance.position, sizeof(caster->instance.position));
+                            hash(caster->instance.rotation, sizeof(caster->instance.rotation));
+                            hash(caster->instance.scale, sizeof(caster->instance.scale));
+                            hash(&caster->changedFrame, sizeof(caster->changedFrame));
+                        }
                     }
                     const bool skinnedHere = std::any_of(skinnedShadowCasters.begin(), skinnedShadowCasters.end(),
                         [&](const SkinnedDrawRecord* record) { return skinnedInCascade(*record, cascade); });
@@ -12028,18 +12201,31 @@ int RunGame(NativeWindow& window,
                         const std::uint64_t animationTick = (frameInfo.frameNumber + (cascade == 3 ? 1u : 0u)) / period;
                         hash(&animationTick, sizeof(animationTick));
                     }
-                    castersRevisions[cascade] = revision;
+                    shadowCasters.dynamicRevisions[cascade] = movingHere || skinnedHere ? (revision | 1u) : 0u;
                 }
-                const TerrainRenderer::ShadowCasterDraw drawMeshCasters =
-                    [&](std::uint32_t cascade, const WorldMat4& lightViewProj, const ixrhi::IXRHIRenderPass* pass) {
-                        std::unordered_map<StaticMeshRenderer*, std::vector<StaticMeshRenderer::Instance>> batches;
-                        for (const StaticShadowCaster& caster : staticShadowCasters)
+                StaticMeshRenderer::InstanceList cascadeInstances;
+                const auto drawMeshBatches = [&](const std::vector<ShadowCasterBatch>& batches,
+                                                 const WorldMat4& lightViewProj, const ixrhi::IXRHIRenderPass* pass) {
+                    for (const ShadowCasterBatch& batch : batches)
+                    {
+                        cascadeInstances.clear();
+                        for (const StaticMeshRenderRecord* caster : batch.casters)
                         {
-                            if (!outsideCascadeFootprint(lightViewProj, caster.corners))
-                                batches[caster.renderer].push_back(caster.instance);
+                            if (!outsideCascadeFootprint(lightViewProj, caster->corners))
+                                cascadeInstances.push_back(&caster->instance);
                         }
-                        for (auto& [renderer, instances] : batches)
-                            renderer->RenderShadowCasters(*frameInfo.commandList, frameInfo, lightViewProj, instances, pass);
+                        if (!cascadeInstances.empty())
+                            batch.renderer->RenderShadowCasters(*frameInfo.commandList, frameInfo, lightViewProj,
+                                cascadeInstances, pass);
+                    }
+                };
+                shadowCasters.drawStatic =
+                    [&](std::uint32_t, const WorldMat4& lightViewProj, const ixrhi::IXRHIRenderPass* pass) {
+                        drawMeshBatches(settledShadowCasterBatches, lightViewProj, pass);
+                    };
+                shadowCasters.drawDynamic =
+                    [&](std::uint32_t cascade, const WorldMat4& lightViewProj, const ixrhi::IXRHIRenderPass* pass) {
+                        drawMeshBatches(movingShadowCasterBatches, lightViewProj, pass);
                         for (const SkinnedDrawRecord* record : skinnedShadowCasters)
                         {
                             if (!skinnedInCascade(*record, cascade))
@@ -12048,10 +12234,10 @@ int RunGame(NativeWindow& window,
                                 record->position, record->yaw, record->slot, record->scale);
                         }
                     };
-                const bool anyMeshCasters = !staticShadowCasters.empty() || !skinnedShadowCasters.empty();
+                if (!anyStaticCasters && skinnedShadowCasters.empty())
+                    shadowCasters = {};
                 rhiDevice->WriteTimestamp(ixrhi::IXRHITimestampPoint::ShadowPassBegin);
-                terrain.RenderSunShadowMap(*frameInfo.commandList, frameInfo, *shadowCamera, castersRevisions,
-                    anyMeshCasters ? drawMeshCasters : TerrainRenderer::ShadowCasterDraw{});
+                terrain.RenderSunShadowMap(*frameInfo.commandList, frameInfo, *shadowCamera, shadowCasters);
                 rhiDevice->WriteTimestamp(ixrhi::IXRHITimestampPoint::ShadowPassEnd);
                 frameProfile.shadowPassMs = MillisecondsBetween(shadowPassBegin, std::chrono::steady_clock::now());
             }
@@ -12348,6 +12534,7 @@ int RunGame(NativeWindow& window,
                         return "none";
                     };
                     std::unordered_set<std::uint32_t> currentCulledMeshLogSet;
+                    const xm::Frustum sceneViewFrustum = xm::ExtractFrustumVulkan(camera.viewProjection);
                     // The lighting is per renderer, not per entity: several entities usually share
                     // one renderer, so apply it once per renderer per frame (it is a large struct).
                     std::unordered_set<StaticMeshRenderer*> litStaticRenderers;
@@ -12359,25 +12546,30 @@ int RunGame(NativeWindow& window,
                         const MeshSceneEntity& mesh = *meshPtr;
                         if (editorPlay.state.mode == EditorPlayMode::Edit && mesh.editorHidden)
                             continue;
-                        const std::string runtimePath = resolveMeshRuntimePath(mesh);
                         // Skinned mesh entities are handled in the dedicated skinned pass above
                         // (they are not tracked in the static spatial index), so skip them here.
                         if (mesh.skinned)
                             continue;
-                        if (StaticMeshRenderer* renderer = getStaticMeshRenderer(runtimePath))
+                        const StaticMeshRenderRecord* meshRecord = &staticMeshRenderRecord(mesh);
+                        const std::string& runtimePath = meshRecord->runtimePath;
+                        if (StaticMeshRenderer* renderer = meshRecord->renderer)
                         {
                             if (meshPtr->materialSlots.empty())
                             {
                                 EnsureMeshEntityMaterialSlots(*meshPtr);
                                 if (!meshPtr->materialSlots.empty())
+                                {
                                     SceneManager::Instance().MarkDirty();
+                                    // Drawn with its slots this frame already: check its record again.
+                                    meshRecord = &staticMeshRenderRecord(mesh, /*recheck=*/true);
+                                }
                             }
-                            const SpatialIndex::Aabb worldBounds = StaticMeshWorldAabb(mesh, *renderer);
-                            if (renderer->IsLoaded() &&
-                                WorldAabbOutsideCameraFrustum(camera, SpatialAabbCorners(worldBounds)))
+                            const SpatialIndex::Aabb& worldBounds = meshRecord->worldBounds;
+                            if (!xm::Intersects(sceneViewFrustum, worldBounds))
                             {
                                 ++frameStaticMeshFrustumCulled;
-                                currentCulledMeshLogSet.insert(mesh.id);
+                                if (LodLogsEnabled())
+                                    currentCulledMeshLogSet.insert(mesh.id);
                                 if (mesh.lod.enabled)
                                 {
                                     LodConfig cullLodConfig{};
@@ -12421,7 +12613,9 @@ int RunGame(NativeWindow& window,
                                     record.drawIndexCount = 0;
                                     logLodDisposition(record);
                                 }
-                                const bool cullLogChanged = previousCulledMeshLogSet.find(mesh.id) == previousCulledMeshLogSet.end();
+                                // (Tracked with the LOD diagnostics: a set entry per culled mesh per frame.)
+                                const bool cullLogChanged = LodLogsEnabled() &&
+                                    previousCulledMeshLogSet.find(mesh.id) == previousCulledMeshLogSet.end();
                                 if (cullLogChanged)
                                 {
                                     Tracenf("[MESH-CULL] culled id=%u name=%s path=%s",
@@ -12433,19 +12627,8 @@ int RunGame(NativeWindow& window,
                             }
                             if (litStaticRenderers.insert(renderer).second)
                                 renderer->SetLightingState(frameLighting);
-                            StaticMeshRenderer::Instance instance{};
-                            instance.entityId = mesh.id;
-                            instance.position = {mesh.position[0], mesh.position[1], mesh.position[2]};
-                            instance.rotation[0] = mesh.rotation[0];
-                            instance.rotation[1] = mesh.rotation[1];
-                            instance.rotation[2] = mesh.rotation[2];
-                            instance.scale[0] = mesh.scale[0];
-                            instance.scale[1] = mesh.scale[1];
-                            instance.scale[2] = mesh.scale[2];
-                            instance.tint = {1.0f, 1.0f, 1.0f, 1.0f};
-                            instance.selectedForOutline = false;
-                            instance.materialSlots = mesh.materialSlots;
-                            instance.materialOverrides = mesh.materialOverrides;
+                            // The record's instance (untinted, not outlined): drawn from where it is kept.
+                            const StaticMeshRenderer::Instance& instance = meshRecord->instance;
                             if (renderer->HasTransparentDraws(instance))
                                 addTransparentDraw(sceneTransparentDraws, renderer, instance, worldBounds, camera);
                             LodConfig effectiveLodConfig{};
@@ -12608,12 +12791,13 @@ int RunGame(NativeWindow& window,
                             else
                             {
                                 ++frameNonLodEntities;
-                                staticMeshSelectedLods.erase(mesh.id);
+                                if (!staticMeshSelectedLods.empty())
+                                    staticMeshSelectedLods.erase(mesh.id);
                             }
                             StaticMeshLodBatchKey key{renderer, lodConfigHash, lodLevel};
                             StaticMeshLodBatch& batch = staticMeshBatches[key];
                             batch.config = effectiveLodConfig;
-                            batch.instances.push_back(std::move(instance));
+                            batch.instances.push_back(&instance);
                             if (lodDispositionActive)
                                 batch.lodDispositionRecords.push_back(lodDispositionRecord);
                         }
@@ -12621,7 +12805,7 @@ int RunGame(NativeWindow& window,
                     for (auto& [key, batch] : staticMeshBatches)
                     {
                         StaticMeshRenderer* renderer = key.renderer;
-                        std::vector<StaticMeshRenderer::Instance>& instances = batch.instances;
+                        const StaticMeshRenderer::InstanceList& instances = batch.instances;
                         if (!renderer || instances.empty())
                             continue;
                         if (key.configHash != 0)
@@ -13066,7 +13250,7 @@ int RunGame(NativeWindow& window,
                             // view) instead of one un-batched RenderInWorld per entity. This
                             // collapses N per-entity draws into one instanced draw per renderer
                             // and skips off-screen meshes — the main per-mesh cost of the Game view.
-                            std::unordered_map<StaticMeshRenderer*, std::vector<StaticMeshRenderer::Instance>> gameMeshBatches;
+                            std::unordered_map<StaticMeshRenderer*, StaticMeshRenderer::InstanceList> gameMeshBatches;
                             const std::vector<std::uint32_t> gameMeshCandidates =
                                 staticMeshSpatialIndex.QueryFrustum(SpatialFrustumFromCamera(gameCamera));
                             for (std::uint32_t candidateId : gameMeshCandidates)
@@ -13074,24 +13258,14 @@ int RunGame(NativeWindow& window,
                                 const MeshSceneEntity* mesh = findMeshEntityById(candidateId);
                                 if (!mesh || mesh->editorHidden || mesh->skinned)
                                     continue;
-                                StaticMeshRenderer* renderer = getStaticMeshRenderer(resolveMeshRuntimePath(*mesh));
-                                if (!renderer || !renderer->IsLoaded())
+                                const StaticMeshRenderRecord& meshRecord = staticMeshRenderRecord(*mesh);
+                                StaticMeshRenderer* renderer = meshRecord.renderer;
+                                if (!renderer)
                                     continue;
-                                StaticMeshRenderer::Instance instance{};
-                                instance.entityId = mesh->id;
-                                instance.position = {mesh->position[0], mesh->position[1], mesh->position[2]};
-                                instance.rotation[0] = mesh->rotation[0];
-                                instance.rotation[1] = mesh->rotation[1];
-                                instance.rotation[2] = mesh->rotation[2];
-                                instance.scale[0] = mesh->scale[0];
-                                instance.scale[1] = mesh->scale[1];
-                                instance.scale[2] = mesh->scale[2];
-                                instance.materialSlots = mesh->materialSlots;
-                                instance.materialOverrides = mesh->materialOverrides;
-                                if (renderer->HasTransparentDraws(instance))
-                                    addTransparentDraw(gameTransparentDraws, renderer, instance,
-                                        StaticMeshWorldAabb(*mesh, *renderer), gameCamera);
-                                gameMeshBatches[renderer].push_back(std::move(instance));
+                                if (renderer->HasTransparentDraws(meshRecord.instance))
+                                    addTransparentDraw(gameTransparentDraws, renderer, meshRecord.instance,
+                                        meshRecord.worldBounds, gameCamera);
+                                gameMeshBatches[renderer].push_back(&meshRecord.instance);
                             }
                             for (auto& [gameRenderer, gameInstances] : gameMeshBatches)
                             {
@@ -13418,6 +13592,10 @@ int RunGame(NativeWindow& window,
         // no submission; the backend asserts pairing in Debug).
         if (rhiFrame)
             rhiDevice->EndFrame(rhiFrame);
+        else if (rhiFrame.result == ixrhi::IXRHIFrameResult::Skip)
+            // No frame to draw (minimized window): the loop would otherwise spin a core tens of
+            // thousands of times a second until it is restored.
+            std::this_thread::sleep_for(std::chrono::milliseconds(5));
         frameProfile.submitPresentMs = MillisecondsBetween(submitPresentBegin, std::chrono::steady_clock::now());
         frameProfile.totalCpuFrameMs = MillisecondsBetween(frameCpuStart, std::chrono::steady_clock::now());
         // Carry this frame's CPU profile + present mode into engineStats so next frame's
@@ -13474,6 +13652,11 @@ int RunGame(NativeWindow& window,
                 perfLog.gpuScene += span(P::SceneOtherBegin, P::SceneOtherEnd);
                 perfLog.gpuPost += span(P::SceneOtherEnd, P::RmlUiBegin);
                 perfLog.gpuUi += span(P::RmlUiBegin, P::RmlUiEnd) + span(P::ImGuiBegin, P::ImGuiEnd);
+                for (std::uint32_t cascade = 0; cascade < perfLog.gpuCascades.size(); ++cascade)
+                {
+                    const auto begin = static_cast<P>(static_cast<std::uint32_t>(P::ShadowCascade0Begin) + cascade * 2u);
+                    perfLog.gpuCascades[cascade] += span(begin, static_cast<P>(static_cast<std::uint32_t>(begin) + 1u));
+                }
                 ++perfLog.gpuSamples;
             }
             if ((++perfLog.frameCounter % 64u) == 0u)
@@ -13502,10 +13685,12 @@ int RunGame(NativeWindow& window,
                 if (perfLog.gpuSamples > 0)
                 {
                     const double g = static_cast<double>(perfLog.gpuSamples);
-                    Tracenf("[PERF] gpu ms (%u samples): frame %.3f shadow %.3f reflection %.3f terrain %.3f "
-                            "scene %.3f post %.3f ui %.3f",
-                        perfLog.gpuSamples, perfLog.gpuFrame / g, perfLog.gpuShadow / g, perfLog.gpuReflection / g,
-                        perfLog.gpuTerrain / g, perfLog.gpuScene / g, perfLog.gpuPost / g, perfLog.gpuUi / g);
+                    Tracenf("[PERF] gpu ms (%u samples): frame %.3f shadow %.3f (cascades %.2f %.2f %.2f %.2f) "
+                            "reflection %.3f terrain %.3f scene %.3f post %.3f ui %.3f",
+                        perfLog.gpuSamples, perfLog.gpuFrame / g, perfLog.gpuShadow / g, perfLog.gpuCascades[0] / g,
+                        perfLog.gpuCascades[1] / g, perfLog.gpuCascades[2] / g, perfLog.gpuCascades[3] / g,
+                        perfLog.gpuReflection / g, perfLog.gpuTerrain / g, perfLog.gpuScene / g, perfLog.gpuPost / g,
+                        perfLog.gpuUi / g);
                 }
                 const double interval = perfLog.intervalSeconds;
                 perfLog = PerfLogState{};

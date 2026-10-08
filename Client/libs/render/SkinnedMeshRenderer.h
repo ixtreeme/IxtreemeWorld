@@ -40,6 +40,7 @@
 #include <filesystem>
 #include <limits>
 #include <memory>
+#include <optional>
 #include <string>
 #include <vector>
 
@@ -142,7 +143,8 @@ public:
     void SetMotionState(MotionState state);
     float GroundOffsetY() const;
     std::uint32_t MaterialSlotCount() const { return std::max<std::uint32_t>(1u, static_cast<std::uint32_t>(m_draws.size())); }
-    static constexpr uint32_t MaxSkinSlots() { return kSkinSlots; }
+    // How many instances of this model a frame can skin (slots past the first page are made on use).
+    static constexpr uint32_t MaxSkinSlots() { return kSkinSlots * kMaxSkinPages; }
     void Destroy();
 
     struct Vertex
@@ -165,8 +167,33 @@ public:
 private:
     static constexpr uint32_t kFramesInFlight = 2;
     static constexpr uint32_t kTextureCount = 2;
+    // Per page (see UniformPage, SkinPage), and the most pages a renderer makes.
     static constexpr uint32_t kUniformSlots = 32;
+    static constexpr uint32_t kMaxUniformPages = 64;
     static constexpr uint32_t kSkinSlots = 32;
+    static constexpr uint32_t kMaxSkinPages = 32;
+
+    // Every draw of a frame writes a UniformBlock of its own: a draw recorded earlier must not read a
+    // later one's. Pages of kUniformSlots per frame in flight, with a set per slot and texture; a frame
+    // drawing more than the pages hold adds one, kept for the frames after.
+    struct UniformPage
+    {
+        std::unique_ptr<ixrhi::IXRHIBindGroup> group;  // set = index * kTextureCount + texture
+        std::shared_ptr<ixrhi::IXRHIBuffer> uniforms;  // each index's UniformBlock, kUniformStride apart
+    };
+    struct UniformSlot
+    {
+        UniformPage* page = nullptr;
+        std::uint32_t index = 0;  // frame index * kUniformSlots + slot in the page
+    };
+    // A skin slot is one instance's bone palette and skinned vertices per frame in flight. Pages of
+    // kSkinSlots, made when a frame skins more instances of the model than they hold.
+    struct SkinPage
+    {
+        std::unique_ptr<ixrhi::IXRHIBindGroup> computeGroup;  // set = frame index * kSkinSlots + slot
+        std::array<std::array<std::shared_ptr<ixrhi::IXRHIBuffer>, kSkinSlots>, kFramesInFlight> palettes{};
+        std::array<std::array<std::shared_ptr<ixrhi::IXRHIBuffer>, kSkinSlots>, kFramesInFlight> outputs{};
+    };
 
     struct RawMesh
     {
@@ -228,13 +255,23 @@ private:
     bool CreateBuffers(ixrhi::IXRHIDevice& rhi);
     bool CreateTextures(ixrhi::IXRHIDevice& rhi, const std::string& modelPath);
     bool CreateBindGroup(ixrhi::IXRHIDevice& rhi);
+    UniformPage* AddUniformPage(ixrhi::IXRHIDevice& rhi);
+    // Starts the uniform cursor over when the frame is a new one.
+    void BeginFrameSlots(const ixrhi::IXRHIFrameInfo& frame);
+    // The frame's next uniform slot; none past kMaxUniformPages (logged once).
+    std::optional<UniformSlot> NextUniformSlot(uint32_t frameIndex);
+    SkinPage* AddSkinPage(ixrhi::IXRHIDevice& rhi);
+    // Makes the skin slot's page; false past MaxSkinSlots() (logged once).
+    bool EnsureSkinSlot(uint32_t skinSlot);
+    // The slot's buffers for the frame index, or null when the slot was never made.
+    ixrhi::IXRHIBuffer* SkinnedOutput(uint32_t frameIndex, uint32_t skinSlot) const;
+    ixrhi::IXRHIBuffer* BonePalette(uint32_t frameIndex, uint32_t skinSlot) const;
     bool CreatePipeline(ixrhi::IXRHIDevice& rhi);
     bool CreateReflectionPipeline(ixrhi::IXRHIDevice& rhi, const ixrhi::IXRHIRenderPass* renderPass);
     bool CreateShadowPipeline(ixrhi::IXRHIDevice& rhi, const ixrhi::IXRHIRenderPass* shadowPass);
     // Whether the draws' descriptors are complete (the sun shadow map is bound); logs once if not.
     bool SunShadowBound() const;
     bool CreateComputeResources(ixrhi::IXRHIDevice& rhi);
-    bool CreateComputeBindGroup(ixrhi::IXRHIDevice& rhi);
     bool CreateComputePipeline(ixrhi::IXRHIDevice& rhi);
     bool VerifyComputeSkin(ixrhi::IXRHIDevice& rhi);
     bool SkinPose(float animTimeSeconds, bool updateBounds, bool logSamples, MotionState state = MotionState::Idle);
@@ -254,9 +291,8 @@ private:
     void DestroyAnimation();
     void DestroyPipeline();
     void DestroyReflectionPipeline();
-    void UpdateUniform(uint32_t frameIndex, uint32_t uniformSlot, double timeSeconds, float aspect);
-    void UpdateWorldUniform(uint32_t frameIndex,
-        uint32_t uniformSlot,
+    void UpdateUniform(const UniformSlot& slot, double timeSeconds, float aspect);
+    void UpdateWorldUniform(const UniformSlot& slot,
         const WorldCamera& camera,
         WorldVec3 position,
         float yawRadians,
@@ -270,11 +306,12 @@ private:
     const ixrhi::IXRHIRenderPass* m_targetPass = nullptr; // borrowed (frame owner)
     client::asset::IAssetReader* m_assets = nullptr;
     std::shared_ptr<ixrhi::IXRHIBuffer> m_indexBuffer;
-    std::array<std::array<std::shared_ptr<ixrhi::IXRHIBuffer>, kUniformSlots>, kFramesInFlight> m_uniformBuffers{};
     std::unique_ptr<ixrhi::IXRHIBindGroupLayout> m_bindLayout;
-    std::unique_ptr<ixrhi::IXRHIBindGroup> m_bindGroup;
+    std::vector<std::unique_ptr<UniformPage>> m_uniformPages;
     std::unique_ptr<ixrhi::IXRHIBindGroupLayout> m_computeBindLayout;
-    std::unique_ptr<ixrhi::IXRHIBindGroup> m_computeBindGroup;
+    std::vector<std::unique_ptr<SkinPage>> m_skinPages;
+    bool m_loggedUniformPagesFull = false;
+    bool m_loggedSkinPagesFull = false;
     std::unique_ptr<ixrhi::IXRHIGraphicsPipeline> m_pipeline;
     std::unique_ptr<ixrhi::IXRHIGraphicsPipeline> m_reflectionPipeline;
     const ixrhi::IXRHIRenderPass* m_reflectionPass = nullptr; // borrowed (terrain owns)
@@ -292,8 +329,6 @@ private:
     std::vector<RestVertexGpu> m_restVerticesGpu;
     std::array<Texture, kTextureCount> m_textures{};
     std::shared_ptr<ixrhi::IXRHIBuffer> m_restVertexBuffer;
-    std::array<std::array<std::shared_ptr<ixrhi::IXRHIBuffer>, kSkinSlots>, kFramesInFlight> m_bonePaletteBuffers{};
-    std::array<std::array<std::shared_ptr<ixrhi::IXRHIBuffer>, kSkinSlots>, kFramesInFlight> m_skinnedOutputBuffers{};
     uint32_t m_indexCount = 0;
     MeshBounds m_bounds{};
     std::unique_ptr<OzzRuntime> m_ozz;
@@ -302,7 +337,9 @@ private:
     uint32_t m_boneCount = 0;
     MotionState m_motionState = MotionState::Idle;
     LightingState m_lightingState;
-    uint32_t m_worldRenderFrameIndex = std::numeric_limits<uint32_t>::max();
+    // The frame the uniform cursor counts in (its frame number: a model drawn every other frame meets
+    // the same frame index again without the frame between).
+    std::uint64_t m_worldRenderFrameNumber = std::numeric_limits<std::uint64_t>::max();
     uint32_t m_worldUniformCursor = 0;
     double m_lastAnimationLogTime = -1000.0;
 };

@@ -55,7 +55,7 @@ struct StaticMeshLodBatch
     };
 
     LodConfig config;
-    std::vector<StaticMeshRenderer::Instance> instances;
+    StaticMeshRenderer::InstanceList instances;  // the instances are the caller's (render records)
     std::vector<LodDispositionRecord> lodDispositionRecords;
 };
 

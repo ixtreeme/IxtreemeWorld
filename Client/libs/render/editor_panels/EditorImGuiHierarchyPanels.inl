@@ -488,12 +488,7 @@ void EditorImGui::RenderHierarchyEntityNode(std::uint64_t entityHandle)
     if (m_hierarchySearchBuffer[0] != '\0' && !HierarchySubtreePassesSearch(entityHandle))
         return;
 
-    std::vector<std::uint64_t> children;
-    for (const HierarchySceneEntity& candidate : m_hierarchyEntities)
-    {
-        if (candidate.parent == entityHandle)
-            children.push_back(candidate.entity);
-    }
+    const std::vector<std::uint64_t>& children = HierarchyChildren(entityHandle);
 
     ImGui::TableNextRow();
     ImGui::TableSetColumnIndex(0);

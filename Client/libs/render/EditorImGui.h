@@ -752,6 +752,11 @@ private:
     std::uint64_t m_sceneRootEntity = 0;
     std::string m_sceneRootName = "Untitled";
     std::vector<HierarchySceneEntity> m_hierarchyEntities;
+    // Built with m_hierarchyEntities: each entity's place in it, and each parent's children (in list
+    // order). Rows looked children and entities up by a scan of the list: O(n^2) per frame.
+    std::unordered_map<std::uint64_t, std::size_t> m_hierarchyIndexByEntity;
+    std::unordered_map<std::uint64_t, std::vector<std::uint64_t>> m_hierarchyChildren;
+    const std::vector<std::uint64_t>& HierarchyChildren(std::uint64_t entity) const;
     std::vector<std::string> m_attachedScenePaths;
     std::vector<platform::DynamicLibraryHandle> m_loadedGameModules;  // native C++ game-module DLLs
     std::uint64_t m_selectedHierarchyEntity = 0;

@@ -113,6 +113,8 @@ void IXVulkanDevice::AsyncPresentLoop()
         {
             // VkQueue host access is externally synchronized. This also covers the
             // same-queue case where graphics and present use one VkQueue handle.
+            // The swapchain's too: the frame's acquire runs on the render thread.
+            std::lock_guard<std::mutex> swapchainLock(m_swapchainMutex);
             std::lock_guard<std::mutex> queueLock(m_queueSubmitPresentMutex);
             result = vkQueuePresentKHR(m_loop->GetPresentQueue(), &present);
         }
@@ -382,12 +384,46 @@ ixrhi::IXRHIFrame IXVulkanDevice::BeginFrame()
 
     auto acquireStart = std::chrono::steady_clock::now();
     std::uint32_t imageIndex = 0;
-    const VkResult acquire = vkAcquireNextImageKHR(NativeDevice(),
-        m_loop->GetSwapchain(),
-        UINT64_MAX,
-        context.imageAvailable,
-        VK_NULL_HANDLE,
-        &imageIndex);
+    VkResult acquire = VK_NOT_READY;
+    if (!m_asyncPresentEnabled)
+    {
+        acquire = vkAcquireNextImageKHR(NativeDevice(),
+            m_loop->GetSwapchain(),
+            UINT64_MAX,
+            context.imageAvailable,
+            VK_NULL_HANDLE,
+            &imageIndex);
+    }
+    else
+    {
+        // The present thread uses the swapchain too, so the acquire holds its lock. It must not block
+        // while frames still wait to be presented: the image it waits for may come free only after
+        // they are. So, while any are queued, it takes a free image or waits for one more present.
+        // With none queued (only this thread queues them) it may block on the presentation engine.
+        for (;;)
+        {
+            std::size_t outstanding = 0;
+            {
+                std::lock_guard<std::mutex> lock(m_asyncPresentMutex);
+                outstanding = m_asyncPresentOutstanding;
+            }
+            {
+                std::lock_guard<std::mutex> swapchainLock(m_swapchainMutex);
+                acquire = vkAcquireNextImageKHR(NativeDevice(),
+                    m_loop->GetSwapchain(),
+                    outstanding == 0 ? UINT64_MAX : 0,
+                    context.imageAvailable,
+                    VK_NULL_HANDLE,
+                    &imageIndex);
+            }
+            if (outstanding == 0 || (acquire != VK_NOT_READY && acquire != VK_TIMEOUT))
+                break;
+            std::unique_lock<std::mutex> lock(m_asyncPresentMutex);
+            m_asyncPresentWake.wait(lock, [&] {
+                return m_asyncPresentStop || m_asyncPresentOutstanding < outstanding;
+            });
+        }
+    }
     auto acquireEnd = std::chrono::steady_clock::now();
     if (m_activeCpuTiming.valid)
         m_activeCpuTiming.acquireImageMs =

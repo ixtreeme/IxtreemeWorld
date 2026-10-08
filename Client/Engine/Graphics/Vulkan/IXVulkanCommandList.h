@@ -59,6 +59,10 @@ public:
                            ixrhi::IXRHIImageLayout from,
                            ixrhi::IXRHIImageLayout to) override;
     void CopyTexture(const ixrhi::IXRHITexture& src, ixrhi::IXRHITexture& dst) override;
+    void CopyTextureLayer(const ixrhi::IXRHITexture& src,
+                          std::uint32_t srcLayer,
+                          ixrhi::IXRHITexture& dst,
+                          std::uint32_t dstLayer) override;
     void CopyBuffer(const ixrhi::IXRHIBuffer& src,
                     ixrhi::IXRHIBuffer& dst,
                     std::uint64_t byteCount) override;

@@ -96,6 +96,10 @@ struct UniformBlock
     float shadowNormalOffset[4] = {0.0f, 0.0f, 0.0f, 0.0f};
 };
 
+// Bind sets' UniformBlocks share a page's buffer this far apart: a multiple of 256 bytes, the most
+// any device asks uniform buffer offsets to be aligned to.
+constexpr std::uint64_t kUniformStride = (sizeof(UniformBlock) + 255u) & ~std::uint64_t{255u};
+
 struct InstancedDrawCommand
 {
     uint32_t firstIndex = 0;
@@ -395,7 +399,7 @@ StaticMeshRenderer::MaterialDefaults ResolveMaterialSlotDefaults(
     return defaults;
 }
 
-void FillStaticMeshInstanceBlock(const WorldCamera& camera,
+void FillStaticMeshInstanceBlock(const Mat4& viewProjection,
     const StaticMeshRenderer::Instance& instance,
     uint32_t materialSlot,
     const std::vector<StaticMeshRenderer::MaterialDefaults>& materialDefaults,
@@ -403,7 +407,7 @@ void FillStaticMeshInstanceBlock(const WorldCamera& camera,
 {
     out = {};
     out.model = BuildStaticMeshModelMatrix(instance);
-    out.mvp = Multiply(out.model, ToLocalMat4(camera.viewProjection));
+    out.mvp = Multiply(out.model, viewProjection);
     out.tint[0] = instance.tint[0];
     out.tint[1] = instance.tint[1];
     out.tint[2] = instance.tint[2];
@@ -1828,20 +1832,6 @@ bool StaticMeshRenderer::CreateBuffers(ixrhi::IXRHIDevice& rhi)
         ("StaticMesh:" + m_modelPath + ":IB").c_str());
     if (!m_vertexBuffer || !m_indexBuffer)
         return false;
-    for (auto& frameBuffers : m_uniformBuffers)
-    {
-        for (auto& buffer : frameBuffers)
-        {
-            buffer = CreateRhiBuffer(rhi,
-                sizeof(UniformBlock),
-                ixrhi::IXRHIBufferUsage::Uniform,
-                ixrhi::IXRHICpuAccess::Write,
-                nullptr,
-                ("StaticMesh:" + m_modelPath + ":UBO").c_str());
-            if (!buffer)
-                return false;
-        }
-    }
     for (uint32_t frame = 0; frame < kFramesInFlight; ++frame)
     {
         m_instanceBufferCapacity[frame] = kInitialInstanceCapacity;
@@ -1853,7 +1843,6 @@ bool StaticMeshRenderer::CreateBuffers(ixrhi::IXRHIDevice& rhi)
             ("StaticMesh:" + m_modelPath + ":Instances").c_str());
         if (!m_instanceBuffers[frame])
             return false;
-        m_instanceMirror[frame].assign(m_instanceBufferCapacity[frame], InstanceBlock{});
     }
     return true;
 }
@@ -2600,21 +2589,18 @@ StaticMeshRenderer::MaterialTextureViews StaticMeshRenderer::ResolveMaterialText
     return views;
 }
 
-void StaticMeshRenderer::UpdateMaterialTextureDescriptors(uint32_t frameIndex,
-    uint32_t uniformSlot,
-    const MaterialTextureViews& textures)
+void StaticMeshRenderer::UpdateMaterialTextureDescriptors(const BindSlot& slot, const MaterialTextureViews& textures)
 {
-    if (!m_bindGroup || frameIndex >= kFramesInFlight || uniformSlot >= kUniformSlots)
+    if (!slot.page)
         return;
 
-    const uint32_t slot = frameIndex * kUniformSlots + uniformSlot;
-    std::array<BoundSlotTexture, 3>& bound = m_boundSlotTextures[slot];
+    std::array<BoundSlotTexture, 3>& bound = slot.page->textures[slot.set];
     auto update = [&](std::uint32_t binding, const MaterialTexture& material, BoundSlotTexture& current) {
         if (!material.texture || !material.sampler)
             return;
         if (current.texture == material.texture.get() && current.sampler == material.sampler.get())
             return;  // already bound: skip the descriptor write
-        m_bindGroup->UpdateTexture(slot, binding, material.texture, material.sampler);
+        slot.page->group->UpdateTexture(slot.set, binding, material.texture, material.sampler);
         current = {material.texture.get(), material.sampler.get()};
     };
     update(1, textures.baseColor, bound[0]);
@@ -2624,7 +2610,6 @@ void StaticMeshRenderer::UpdateMaterialTextureDescriptors(uint32_t frameIndex,
 
 bool StaticMeshRenderer::CreateBindGroup(ixrhi::IXRHIDevice& rhi)
 {
-    constexpr uint32_t kBindSlots = kFramesInFlight * kUniformSlots;
     const ixrhi::IXRHIShaderStage allStages =
         ixrhi::IXRHIShaderStage::Vertex | ixrhi::IXRHIShaderStage::Fragment;
     const std::vector<ixrhi::IXRHIBinding> bindings = {
@@ -2638,64 +2623,110 @@ bool StaticMeshRenderer::CreateBindGroup(ixrhi::IXRHIDevice& rhi)
     m_bindLayout = rhi.CreateBindGroupLayout(bindings);
     if (!m_bindLayout)
         return false;
-    m_bindGroup = rhi.CreateBindGroup(*m_bindLayout, kBindSlots);
-    if (!m_bindGroup)
+    m_bindPages.clear();
+    m_loggedBindPagesFull = false;
+    if (!AddBindPage(rhi))
         return false;
-
-    for (uint32_t frame = 0; frame < kFramesInFlight; ++frame)
-    {
-        const std::uint64_t instanceBytes =
-            sizeof(InstanceBlock) * m_instanceBufferCapacity[frame];
-        for (uint32_t uniformSlot = 0; uniformSlot < kUniformSlots; ++uniformSlot)
-        {
-            const uint32_t slot = frame * kUniformSlots + uniformSlot;
-            m_bindGroup->UpdateBuffer(slot,
-                0,
-                m_uniformBuffers[frame][uniformSlot],
-                0,
-                sizeof(UniformBlock));
-            if (m_texture.image && m_texture.sampler)
-                m_bindGroup->UpdateTexture(slot, 1, m_texture.image, m_texture.sampler);
-            if (m_normalTexture.image && m_normalTexture.sampler)
-                m_bindGroup->UpdateTexture(slot, 2, m_normalTexture.image, m_normalTexture.sampler);
-            if (m_ormTexture.image && m_ormTexture.sampler)
-                m_bindGroup->UpdateTexture(slot, 3, m_ormTexture.image, m_ormTexture.sampler);
-            m_boundSlotTextures[slot] = {{{m_texture.image.get(), m_texture.sampler.get()},
-                {m_normalTexture.image.get(), m_normalTexture.sampler.get()},
-                {m_ormTexture.image.get(), m_ormTexture.sampler.get()}}};
-            m_bindGroup->UpdateBuffer(slot, 4, m_instanceBuffers[frame], 0, instanceBytes);
-            if (m_sunShadow.texture && m_sunShadow.sampler)
-                m_bindGroup->UpdateTexture(slot, 5, m_sunShadow.texture, m_sunShadow.sampler);
-        }
-    }
     m_boundSunShadowTexture = m_sunShadow.sampler ? m_sunShadow.texture.get() : nullptr;
     return true;
+}
+
+StaticMeshRenderer::BindPage* StaticMeshRenderer::AddBindPage(ixrhi::IXRHIDevice& rhi)
+{
+    if (!m_bindLayout || m_bindPages.size() >= kMaxBindPages)
+        return nullptr;
+    constexpr uint32_t kSets = kFramesInFlight * kUniformSlots;
+    auto page = std::make_unique<BindPage>();
+    page->group = rhi.CreateBindGroup(*m_bindLayout, kSets);
+    page->uniforms = CreateRhiBuffer(rhi,
+        kUniformStride * kSets,
+        ixrhi::IXRHIBufferUsage::Uniform,
+        ixrhi::IXRHICpuAccess::Write,
+        nullptr,
+        ("StaticMesh:" + m_modelPath + ":UBO").c_str());
+    if (!page->group || !page->uniforms)
+        return nullptr;
+    for (uint32_t set = 0; set < kSets; ++set)
+    {
+        const uint32_t frame = set / kUniformSlots;
+        page->group->UpdateBuffer(set, 0, page->uniforms, kUniformStride * set, sizeof(UniformBlock));
+        if (m_texture.image && m_texture.sampler)
+            page->group->UpdateTexture(set, 1, m_texture.image, m_texture.sampler);
+        if (m_normalTexture.image && m_normalTexture.sampler)
+            page->group->UpdateTexture(set, 2, m_normalTexture.image, m_normalTexture.sampler);
+        if (m_ormTexture.image && m_ormTexture.sampler)
+            page->group->UpdateTexture(set, 3, m_ormTexture.image, m_ormTexture.sampler);
+        page->textures[set] = {{{m_texture.image.get(), m_texture.sampler.get()},
+            {m_normalTexture.image.get(), m_normalTexture.sampler.get()},
+            {m_ormTexture.image.get(), m_ormTexture.sampler.get()}}};
+        page->group->UpdateBuffer(set, 4, m_instanceBuffers[frame], 0,
+            sizeof(InstanceBlock) * m_instanceBufferCapacity[frame]);
+        page->instances[set] = m_instanceBuffers[frame].get();
+        if (m_sunShadow.texture && m_sunShadow.sampler)
+            page->group->UpdateTexture(set, 5, m_sunShadow.texture, m_sunShadow.sampler);
+    }
+    m_bindPages.push_back(std::move(page));
+    return m_bindPages.back().get();
+}
+
+void StaticMeshRenderer::BeginFrameSlots(const ixrhi::IXRHIFrameInfo& frame)
+{
+    if (m_worldRenderFrameNumber == frame.frameNumber)
+        return;
+    m_worldRenderFrameNumber = frame.frameNumber;
+    m_worldRenderFrameIndex = frame.frameIndex % kFramesInFlight;
+    m_worldUniformCursor = 0;
+    m_worldInstanceCursor = 0;
+}
+
+std::optional<StaticMeshRenderer::BindSlot> StaticMeshRenderer::NextBindSlot(uint32_t frameIndex)
+{
+    if (!m_rhi || frameIndex >= kFramesInFlight || !m_instanceBuffers[frameIndex])
+        return std::nullopt;
+    const uint32_t pageIndex = m_worldUniformCursor / kUniformSlots;
+    while (pageIndex >= m_bindPages.size())
+    {
+        if (!AddBindPage(*m_rhi))
+        {
+            if (!m_loggedBindPagesFull)
+            {
+                LogFormat("[MESH] static mesh draws skipped: more than %u draws in one frame model=%s",
+                    kMaxBindPages * kUniformSlots, m_modelPath.c_str());
+                m_loggedBindPagesFull = true;
+            }
+            return std::nullopt;
+        }
+    }
+    BindSlot slot;
+    slot.page = m_bindPages[pageIndex].get();
+    slot.set = frameIndex * kUniformSlots + m_worldUniformCursor % kUniformSlots;
+    slot.id = pageIndex * kFramesInFlight * kUniformSlots + slot.set;
+    ++m_worldUniformCursor;
+    // The frame grew the instance buffer since this set last pointed at it. The set is unbound: the
+    // frames that bound it have run (this frame index's fence), and this one takes each set once.
+    const ixrhi::IXRHIBuffer* instances = m_instanceBuffers[frameIndex].get();
+    if (slot.page->instances[slot.set] != instances)
+    {
+        slot.page->group->UpdateBuffer(slot.set, 4, m_instanceBuffers[frameIndex], 0,
+            sizeof(InstanceBlock) * m_instanceBufferCapacity[frameIndex]);
+        slot.page->instances[slot.set] = instances;
+    }
+    return slot;
 }
 
 void StaticMeshRenderer::SetSunShadow(const SunShadowReceive& shadow)
 {
     m_sunShadow = shadow;
-    if (!m_bindGroup || !shadow.texture || !shadow.sampler || shadow.texture.get() == m_boundSunShadowTexture)
+    if (m_bindPages.empty() || !shadow.texture || !shadow.sampler || shadow.texture.get() == m_boundSunShadowTexture)
         return;
     // A new map (first one, or recreated): every set's binding 5. Not while a frame may still use
     // the sets: the map is set up front and changes only with the device's resources.
-    for (uint32_t slot = 0; slot < kFramesInFlight * kUniformSlots; ++slot)
-        m_bindGroup->UpdateTexture(slot, 5, shadow.texture, shadow.sampler);
-    m_boundSunShadowTexture = shadow.texture.get();
-}
-
-void StaticMeshRenderer::UpdateInstanceDescriptorSets(uint32_t frameIndex)
-{
-    if (!m_bindGroup || frameIndex >= kFramesInFlight || !m_instanceBuffers[frameIndex])
-        return;
-
-    const std::uint64_t instanceBytes =
-        sizeof(InstanceBlock) * m_instanceBufferCapacity[frameIndex];
-    for (uint32_t uniformSlot = 0; uniformSlot < kUniformSlots; ++uniformSlot)
+    for (const std::unique_ptr<BindPage>& page : m_bindPages)
     {
-        const uint32_t slot = frameIndex * kUniformSlots + uniformSlot;
-        m_bindGroup->UpdateBuffer(slot, 4, m_instanceBuffers[frameIndex], 0, instanceBytes);
+        for (uint32_t set = 0; set < kFramesInFlight * kUniformSlots; ++set)
+            page->group->UpdateTexture(set, 5, shadow.texture, shadow.sampler);
     }
+    m_boundSunShadowTexture = shadow.texture.get();
 }
 
 bool StaticMeshRenderer::EnsureInstanceCapacity(ixrhi::IXRHIDevice& rhi,
@@ -2712,11 +2743,9 @@ bool StaticMeshRenderer::EnsureInstanceCapacity(ixrhi::IXRHIDevice& rhi,
     while (nextCapacity < requiredRecords)
         nextCapacity *= 2u;
 
-    // Preserve instance records already written this frame: growing mid-frame rebinds the
-    // bind groups to the new buffer, so earlier (recorded but not executed) draws must
-    // still find their transforms at the same offsets. The CPU mirror carries the
-    // prefix bytes (same content the old GPU map-copy preserved, without readback).
-    const std::uint32_t previousCapacity = m_instanceBufferCapacity[frameIndex];
+    // The frame's draws recorded so far read their records from the old buffer (their sets keep it
+    // alive); the sets taken from now on point at the new one (NextBindSlot), which gets the records
+    // appended from here on.
     m_instanceBuffers[frameIndex] = CreateRhiBuffer(rhi,
         sizeof(InstanceBlock) * nextCapacity,
         ixrhi::IXRHIBufferUsage::Storage,
@@ -2725,15 +2754,7 @@ bool StaticMeshRenderer::EnsureInstanceCapacity(ixrhi::IXRHIDevice& rhi,
         ("StaticMesh:" + m_modelPath + ":Instances").c_str());
     if (!m_instanceBuffers[frameIndex])
         return false;
-    m_instanceMirror[frameIndex].resize(nextCapacity);
-    if (previousCapacity > 0)
-    {
-        m_instanceBuffers[frameIndex]->Write(0,
-            m_instanceMirror[frameIndex].data(),
-            sizeof(InstanceBlock) * previousCapacity);
-    }
     m_instanceBufferCapacity[frameIndex] = nextCapacity;
-    UpdateInstanceDescriptorSets(frameIndex);
     m_lastInstanceBufferRebuilt = true;
     return true;
 }
@@ -2857,8 +2878,7 @@ void StaticMeshRenderer::RenderInWorld(ixrhi::IXRHICommandList& cmd,
     std::uint32_t targetWidth,
     std::uint32_t targetHeight)
 {
-    std::vector<Instance> instances;
-    instances.push_back(instance);
+    const InstanceList instances = {&instance};
     RenderBatchInWorld(cmd, frame, timeSeconds, camera, instances, targetWidth, targetHeight);
 }
 
@@ -2866,7 +2886,7 @@ void StaticMeshRenderer::RenderBatchInWorld(ixrhi::IXRHICommandList& cmd,
     const ixrhi::IXRHIFrameInfo& frame,
     double timeSeconds,
     const WorldCamera& camera,
-    const std::vector<Instance>& instances,
+    const InstanceList& instances,
     std::uint32_t targetWidth,
     std::uint32_t targetHeight)
 {
@@ -2878,7 +2898,7 @@ void StaticMeshRenderer::RenderLodBatchInWorld(ixrhi::IXRHICommandList& cmd,
     const ixrhi::IXRHIFrameInfo& frame,
     double timeSeconds,
     const WorldCamera& camera,
-    const std::vector<Instance>& instances,
+    const InstanceList& instances,
     const LodConfig& lodConfig,
     std::uint64_t configHash,
     std::uint32_t lodLevel,
@@ -2893,7 +2913,7 @@ void StaticMeshRenderer::RenderLodBatchInWorld(ixrhi::IXRHICommandList& cmd,
     m_lastOverrideActiveDraws = 0;
     m_lastInstanceBufferBytes = 0;
     m_lastInstanceBufferRebuilt = false;
-    if (!m_pipeline || !m_unlitPipeline || !m_bindGroup || m_indices.empty() || instances.empty() ||
+    if (!m_pipeline || !m_unlitPipeline || m_bindPages.empty() || m_indices.empty() || instances.empty() ||
         !frame.frameActive)
         return;
     if (!m_boundSunShadowTexture)
@@ -2912,7 +2932,7 @@ void StaticMeshRenderer::RenderLodBatchInWorld(ixrhi::IXRHICommandList& cmd,
     if (extentWidth == 0 || extentHeight == 0)
         return;
 
-    const std::uint32_t diagnosticEntityId = instances.empty() ? 0u : instances.front().entityId;
+    const std::uint32_t diagnosticEntityId = instances.empty() ? 0u : instances.front()->entityId;
     const bool useLodBuffer = configHash != 0 && lodLevel > 0 &&
         EnsureLodBuffers(lodConfig, configHash, diagnosticEntityId);
     const LodIndexBuffer* lodSet = nullptr;
@@ -2961,12 +2981,7 @@ void StaticMeshRenderer::RenderLodBatchInWorld(ixrhi::IXRHICommandList& cmd,
     }
 
     const uint32_t frameIndex = frame.frameIndex % kFramesInFlight;
-    if (m_worldRenderFrameIndex != frameIndex)
-    {
-        m_worldRenderFrameIndex = frameIndex;
-        m_worldUniformCursor = 0;
-        m_worldInstanceCursor = 0;
-    }
+    BeginFrameSlots(frame);
     const uint32_t instanceBase = m_worldInstanceCursor;
 
     std::vector<StaticMeshRenderer::InstanceBlock> instanceBlocks;
@@ -2978,6 +2993,7 @@ void StaticMeshRenderer::RenderLodBatchInWorld(ixrhi::IXRHICommandList& cmd,
         : m_draws.size();
     instanceBlocks.reserve(instances.size() * std::max<std::size_t>(1u, drawCountForLevel));
     drawCommands.reserve(drawCountForLevel);
+    const Mat4 viewProjection = ToLocalMat4(camera.viewProjection);
     auto appendDraw = [&](std::uint32_t firstIndex, std::uint32_t indexCount, std::uint32_t materialSlot, std::uint32_t sourceSubmesh) {
         if (indexCount == 0)
             return;
@@ -2989,13 +3005,11 @@ void StaticMeshRenderer::RenderLodBatchInWorld(ixrhi::IXRHICommandList& cmd,
             command.instanceCount = static_cast<uint32_t>(instances.size());
             command.materialSlot = materialSlot;
             command.sourceSubmesh = sourceSubmesh;
-            for (const Instance& instance : instances)
+            for (const Instance* instance : instances)
             {
-                StaticMeshRenderer::InstanceBlock block{};
-                FillStaticMeshInstanceBlock(camera, instance, materialSlot, m_materialDefaults, block);
-                instanceBlocks.push_back(block);
-                const bool overrideActive = std::any_of(instance.materialOverrides.begin(),
-                    instance.materialOverrides.end(),
+                FillInstanceBlock(viewProjection, *instance, materialSlot, instanceBlocks.emplace_back());
+                const bool overrideActive = std::any_of(instance->materialOverrides.begin(),
+                    instance->materialOverrides.end(),
                     [&](const MeshSceneEntity::MaterialOverride& material) {
                         return material.enabled && material.slot == materialSlot;
                     });
@@ -3041,7 +3055,7 @@ void StaticMeshRenderer::RenderLodBatchInWorld(ixrhi::IXRHICommandList& cmd,
     const auto findInstanceIndex = [&](std::uint32_t entityId) -> std::optional<std::size_t> {
         for (std::size_t i = 0; i < instances.size(); ++i)
         {
-            if (instances[i].entityId == entityId)
+            if (instances[i]->entityId == entityId)
                 return i;
         }
         return std::nullopt;
@@ -3053,7 +3067,7 @@ void StaticMeshRenderer::RenderLodBatchInWorld(ixrhi::IXRHICommandList& cmd,
     {
         for (std::size_t i = 0; i < instances.size(); ++i)
         {
-            if (instances[i].entityId != 3u)
+            if (instances[i]->entityId != 3u)
             {
                 refInstanceIndex = i;
                 break;
@@ -3067,7 +3081,7 @@ void StaticMeshRenderer::RenderLodBatchInWorld(ixrhi::IXRHICommandList& cmd,
                                  std::uint32_t entityId,
                                  const InstancedDrawCommand& draw,
                                  std::size_t instanceIndex,
-                                 uint32_t uniformSlot,
+                                 uint32_t bindSlot,
                                  const ixrhi::IXRHIGraphicsPipeline* pipelineForDraw) {
         const std::size_t absoluteInstance = static_cast<std::size_t>(draw.firstInstance) + instanceIndex;
         const std::size_t instanceOffset = absoluteInstance * sizeof(InstanceBlock);
@@ -3086,7 +3100,7 @@ void StaticMeshRenderer::RenderLodBatchInWorld(ixrhi::IXRHICommandList& cmd,
             instanceOffset,
             draw.instanceCount,
             draw.firstInstance,
-            frameIndex * kUniformSlots + uniformSlot);
+            bindSlot);
     };
     const auto logMaterialDiag = [&](const char* tag,
                                      const Instance& instance,
@@ -3190,15 +3204,15 @@ void StaticMeshRenderer::RenderLodBatchInWorld(ixrhi::IXRHICommandList& cmd,
     {
         std::uint32_t runEnd = runStart + 1;
         while (runEnd < command.instanceCount &&
-               materialKey(instances[runEnd], command.materialSlot) ==
-                   materialKey(instances[runStart], command.materialSlot))
+               materialKey(*instances[runEnd], command.materialSlot) ==
+                   materialKey(*instances[runStart], command.materialSlot))
             ++runEnd;
         MaterialRun& run = materialRuns.emplace_back();
         run.command = &command;
         run.draw = command;
         run.draw.firstInstance = command.firstInstance + runStart;
         run.draw.instanceCount = runEnd - runStart;
-        run.instance = &instances[runStart];
+        run.instance = instances[runStart];
         run.textures = ResolveMaterialTextureViews(*m_rhi, *run.instance, run.draw.materialSlot);
         run.isMask = std::strcmp(run.textures.fragmentShaderAlphaPath, "discard") == 0;
         run.isBlend = std::strcmp(run.textures.fragmentShaderAlphaPath, "blend") == 0;
@@ -3224,10 +3238,12 @@ void StaticMeshRenderer::RenderLodBatchInWorld(ixrhi::IXRHICommandList& cmd,
                 boundPipeline = pipelineForDraw;
             }
 
-            const uint32_t uniformSlot = std::min(m_worldUniformCursor++, kUniformSlots - 1);
-            UpdateWorldUniform(frameIndex, uniformSlot, camera, runInstance, timeSeconds, draw.materialSlot);
-            UpdateMaterialTextureDescriptors(frameIndex, uniformSlot, materialTextures);
-            const uint32_t bindSlot = frameIndex * kUniformSlots + uniformSlot;
+            const std::optional<BindSlot> slot = NextBindSlot(frameIndex);
+            if (!slot)
+                return;
+            UpdateWorldUniform(*slot, camera, runInstance, timeSeconds, draw.materialSlot);
+            UpdateMaterialTextureDescriptors(*slot, materialTextures);
+            const uint32_t bindSlot = slot->id;
             if (materialBindingCount == m_lastMaterialBindings.size())
                 m_lastMaterialBindings.emplace_back();
             LastMaterialBinding& binding = m_lastMaterialBindings[materialBindingCount++];
@@ -3252,7 +3268,7 @@ void StaticMeshRenderer::RenderLodBatchInWorld(ixrhi::IXRHICommandList& cmd,
             assignName(binding.pipelineName, pipelineForDraw);
             binding.boundBeforeDraw = true;
             ++m_lastMaterialUniformUpdates;
-            cmd.BindGroup(0, *m_bindGroup, bindSlot);
+            cmd.BindGroup(0, *slot->page->group, slot->set);
             const auto inRun = [&](std::size_t index) {
                 const std::size_t first = draw.firstInstance - command.firstInstance;
                 return index >= first && index < first + draw.instanceCount;
@@ -3265,14 +3281,14 @@ void StaticMeshRenderer::RenderLodBatchInWorld(ixrhi::IXRHICommandList& cmd,
                     if (!loggedMaterialE3)
                     {
                         logMaterialDiag("[LOD-MAT-E3]",
-                            instances[*diagnosticInstanceIndex],
+                            *instances[*diagnosticInstanceIndex],
                             instanceBlocks[absoluteInstance],
                             draw.materialSlot,
                             absoluteInstance,
                             true);
                         loggedMaterialE3 = true;
                     }
-                    logDrawDiag("[LOD-DRAW-E3]", diagnosticEntityId, command, *diagnosticInstanceIndex, uniformSlot, pipelineForDraw);
+                    logDrawDiag("[LOD-DRAW-E3]", diagnosticEntityId, command, *diagnosticInstanceIndex, bindSlot, pipelineForDraw);
                 }
             }
             if (refInstanceIndex && inRun(*refInstanceIndex))
@@ -3283,14 +3299,14 @@ void StaticMeshRenderer::RenderLodBatchInWorld(ixrhi::IXRHICommandList& cmd,
                     if (!loggedMaterialRef)
                     {
                         logMaterialDiag("[LOD-MAT-REF]",
-                            instances[*refInstanceIndex],
+                            *instances[*refInstanceIndex],
                             instanceBlocks[absoluteInstance],
                             draw.materialSlot,
                             absoluteInstance,
                             false);
                         loggedMaterialRef = true;
                     }
-                    logDrawDiag("[LOD-DRAW-REF]", instances[*refInstanceIndex].entityId, command, *refInstanceIndex, uniformSlot, pipelineForDraw);
+                    logDrawDiag("[LOD-DRAW-REF]", instances[*refInstanceIndex]->entityId, command, *refInstanceIndex, bindSlot, pipelineForDraw);
                 }
             }
             cmd.DrawIndexed(draw.indexCount, draw.instanceCount, draw.firstIndex, 0, draw.firstInstance);
@@ -3307,18 +3323,18 @@ void StaticMeshRenderer::RenderLodBatchInWorld(ixrhi::IXRHICommandList& cmd,
         outlinedInstances.reserve(instances.size());
         for (std::uint32_t i = 0; i < instances.size(); ++i)
         {
-            if (instances[i].selectedForOutline)
+            if (instances[i]->selectedForOutline)
                 outlinedInstances.push_back(i);
         }
-        if (!outlinedInstances.empty())
+        const std::optional<BindSlot> slot = outlinedInstances.empty() ? std::nullopt : NextBindSlot(frameIndex);
+        if (slot)
         {
             cmd.SetGraphicsPipeline(*m_outlinePipeline);
             const MaterialTextureViews materialTextures =
-                ResolveMaterialTextureViews(*m_rhi, instances.front(), 0);
-            const uint32_t uniformSlot = std::min(m_worldUniformCursor++, kUniformSlots - 1);
-            UpdateWorldUniform(frameIndex, uniformSlot, camera, instances.front(), timeSeconds, 0);
-            UpdateMaterialTextureDescriptors(frameIndex, uniformSlot, materialTextures);
-            cmd.BindGroup(0, *m_bindGroup, frameIndex * kUniformSlots + uniformSlot);
+                ResolveMaterialTextureViews(*m_rhi, *instances.front(), 0);
+            UpdateWorldUniform(*slot, camera, *instances.front(), timeSeconds, 0);
+            UpdateMaterialTextureDescriptors(*slot, materialTextures);
+            cmd.BindGroup(0, *slot->page->group, slot->set);
 
             for (const InstancedDrawCommand& draw : drawCommands)
             {
@@ -3338,8 +3354,49 @@ void StaticMeshRenderer::RenderLodBatchInWorld(ixrhi::IXRHICommandList& cmd,
     m_lastSubmittedInstances = static_cast<std::uint32_t>(instances.size());
 }
 
+void StaticMeshRenderer::PrepareInstance(const Instance& instance, PreparedInstance& out) const
+{
+    const Mat4 identity = Identity();
+    out.renderer = this;
+    out.slots.resize(MaterialSlotCount());
+    for (std::uint32_t slot = 0; slot < out.slots.size(); ++slot)
+        FillStaticMeshInstanceBlock(identity, instance, slot, m_materialDefaults, out.slots[slot]);
+    out.hasTransparentDraws = false;
+    for (const MeshDraw& draw : m_draws)
+    {
+        if (draw.indexCount != 0 && IsBlendMaterialSlot(instance, draw.materialSlot))
+        {
+            out.hasTransparentDraws = true;
+            break;
+        }
+    }
+    // Read after the lookups: a material they loaded moved the revision on.
+    out.materialRevision = MaterialAssetManager::Instance().Revision();
+}
+
+void StaticMeshRenderer::FillInstanceBlock(const WorldMat4& viewProjection,
+    const Instance& instance,
+    std::uint32_t materialSlot,
+    InstanceBlock& out) const
+{
+    const PreparedInstance* prepared = instance.prepared;
+    if (prepared && prepared->renderer == this && materialSlot < prepared->slots.size() &&
+        prepared->materialRevision == MaterialAssetManager::Instance().Revision())
+    {
+        out = prepared->slots[materialSlot];
+        out.mvp = Multiply(out.model, viewProjection);
+        std::memcpy(out.tint, instance.tint.data(), sizeof(out.tint));
+        return;
+    }
+    FillStaticMeshInstanceBlock(viewProjection, instance, materialSlot, m_materialDefaults, out);
+}
+
 bool StaticMeshRenderer::HasTransparentDraws(const Instance& instance) const
 {
+    const PreparedInstance* prepared = instance.prepared;
+    if (prepared && prepared->renderer == this &&
+        prepared->materialRevision == MaterialAssetManager::Instance().Revision())
+        return prepared->hasTransparentDraws;
     for (const MeshDraw& draw : m_draws)
     {
         if (draw.indexCount != 0 && IsBlendMaterialSlot(instance, draw.materialSlot))
@@ -3356,7 +3413,7 @@ void StaticMeshRenderer::RenderTransparentInWorld(ixrhi::IXRHICommandList& cmd,
     std::uint32_t targetWidth,
     std::uint32_t targetHeight)
 {
-    if (!m_rhi || !m_bindGroup || !m_vertexBuffer || !m_indexBuffer || m_indices.empty() || !frame.frameActive ||
+    if (!m_rhi || m_bindPages.empty() || !m_vertexBuffer || !m_indexBuffer || m_indices.empty() || !frame.frameActive ||
         !m_boundSunShadowTexture || !m_blendPipelines[0][0] || !m_blendPipelines[1][1])
         return;
     const std::uint32_t extentWidth = targetWidth > 0 ? targetWidth : frame.targetWidth;
@@ -3374,15 +3431,11 @@ void StaticMeshRenderer::RenderTransparentInWorld(ixrhi::IXRHICommandList& cmd,
         return;
 
     const uint32_t frameIndex = frame.frameIndex % kFramesInFlight;
-    if (m_worldRenderFrameIndex != frameIndex)
-    {
-        m_worldRenderFrameIndex = frameIndex;
-        m_worldUniformCursor = 0;
-        m_worldInstanceCursor = 0;
-    }
+    BeginFrameSlots(frame);
     std::vector<InstanceBlock> blocks(blendDraws.size());
+    const Mat4 viewProjection = ToLocalMat4(camera.viewProjection);
     for (std::size_t i = 0; i < blendDraws.size(); ++i)
-        FillStaticMeshInstanceBlock(camera, instance, m_draws[blendDraws[i]].materialSlot, m_materialDefaults, blocks[i]);
+        FillInstanceBlock(viewProjection, instance, m_draws[blendDraws[i]].materialSlot, blocks[i]);
     const std::optional<std::uint32_t> base = AppendInstanceBlocks(frameIndex, blocks);
     if (!base)
         return;
@@ -3395,14 +3448,16 @@ void StaticMeshRenderer::RenderTransparentInWorld(ixrhi::IXRHICommandList& cmd,
     {
         const MeshDraw& draw = m_draws[blendDraws[i]];
         const MaterialTextureViews textures = ResolveMaterialTextureViews(*m_rhi, instance, draw.materialSlot);
-        const uint32_t uniformSlot = std::min(m_worldUniformCursor++, kUniformSlots - 1);
-        UpdateWorldUniform(frameIndex, uniformSlot, camera, instance, timeSeconds, draw.materialSlot);
-        UpdateMaterialTextureDescriptors(frameIndex, uniformSlot, textures);
+        const std::optional<BindSlot> slot = NextBindSlot(frameIndex);
+        if (!slot)
+            return;
+        UpdateWorldUniform(*slot, camera, instance, timeSeconds, draw.materialSlot);
+        UpdateMaterialTextureDescriptors(*slot, textures);
         // The set binds against the bound pipeline's layout: this renderer's first (the previous draw
         // may be another renderer's); the second side shares the layout, so the set stays bound.
         const auto& sides = m_blendPipelines[textures.unlit ? 1 : 0];
         cmd.SetGraphicsPipeline(*sides[0]);  // back faces
-        cmd.BindGroup(0, *m_bindGroup, frameIndex * kUniformSlots + uniformSlot);
+        cmd.BindGroup(0, *slot->page->group, slot->set);
         cmd.DrawIndexed(draw.indexCount, 1, draw.firstIndex, 0, *base + static_cast<std::uint32_t>(i));
         cmd.SetGraphicsPipeline(*sides[1]);  // front faces
         cmd.DrawIndexed(draw.indexCount, 1, draw.firstIndex, 0, *base + static_cast<std::uint32_t>(i));
@@ -3420,10 +3475,6 @@ std::optional<std::uint32_t> StaticMeshRenderer::AppendInstanceBlocks(uint32_t f
     // Appended at the per-frame cursor (not offset 0): this renderer is drawn several times a frame
     // (shadow cascades, Scene and Game views) and each draw keeps its records until the GPU reads them.
     m_instanceBuffers[frameIndex]->Write(static_cast<std::uint64_t>(base) * sizeof(InstanceBlock), blocks.data(), bytes);
-    // Mirror the same bytes for growth preservation (no GPU readback).
-    if (m_instanceMirror[frameIndex].size() < static_cast<std::size_t>(base) + count)
-        m_instanceMirror[frameIndex].resize(static_cast<std::size_t>(base) + count);
-    std::memcpy(m_instanceMirror[frameIndex].data() + base, blocks.data(), bytes);
     m_worldInstanceCursor = base + count;
     return base;
 }
@@ -3472,10 +3523,10 @@ bool StaticMeshRenderer::CreateShadowPipelines(ixrhi::IXRHIDevice& rhi, const ix
 void StaticMeshRenderer::RenderShadowCasters(ixrhi::IXRHICommandList& cmd,
     const ixrhi::IXRHIFrameInfo& frame,
     const WorldMat4& lightViewProj,
-    const std::vector<Instance>& instances,
+    const InstanceList& instances,
     const ixrhi::IXRHIRenderPass* shadowPass)
 {
-    if (!m_rhi || !m_bindGroup || !m_vertexBuffer || !m_indexBuffer || m_indices.empty() || m_draws.empty() ||
+    if (!m_rhi || m_bindPages.empty() || !m_vertexBuffer || !m_indexBuffer || m_indices.empty() || m_draws.empty() ||
         instances.empty() || !shadowPass || !frame.frameActive || !m_boundSunShadowTexture)
         return;
     if (m_shadowPass != shadowPass)
@@ -3494,26 +3545,16 @@ void StaticMeshRenderer::RenderShadowCasters(ixrhi::IXRHICommandList& cmd,
         return;
 
     const uint32_t frameIndex = frame.frameIndex % kFramesInFlight;
-    if (m_worldRenderFrameIndex != frameIndex)
-    {
-        m_worldRenderFrameIndex = frameIndex;
-        m_worldUniformCursor = 0;
-        m_worldInstanceCursor = 0;
-    }
+    BeginFrameSlots(frame);
 
     // One record per draw (submesh) and instance, its mvp = model x the cascade's light
     // view-projection; its material says whether it is alpha-masked.
-    WorldCamera lightCamera{};
-    lightCamera.viewProjection = lightViewProj;
     std::vector<InstanceBlock> blocks;
     blocks.reserve(m_draws.size() * instances.size());
     for (const MeshDraw& draw : m_draws)
     {
-        for (const Instance& instance : instances)
-        {
-            InstanceBlock& block = blocks.emplace_back();
-            FillStaticMeshInstanceBlock(lightCamera, instance, draw.materialSlot, m_materialDefaults, block);
-        }
+        for (const Instance* instance : instances)
+            FillInstanceBlock(lightViewProj, *instance, draw.materialSlot, blocks.emplace_back());
     }
     const std::optional<std::uint32_t> base = AppendInstanceBlocks(frameIndex, blocks);
     if (!base)
@@ -3521,9 +3562,12 @@ void StaticMeshRenderer::RenderShadowCasters(ixrhi::IXRHICommandList& cmd,
 
     cmd.SetVertexBuffer(0, *m_vertexBuffer, 0);
     cmd.SetIndexBuffer(*m_indexBuffer, 0, /*thirtyTwoBit=*/true);
-    // Opaque runs need no textures: one set of its own this frame (instances + shadow map bound;
-    // a set the frame's later draws re-point at other textures must not be bound here).
-    const uint32_t opaqueSlot = frameIndex * kUniformSlots + std::min(m_worldUniformCursor++, kUniformSlots - 1);
+    // Opaque runs need no textures: one set of its own this frame (instances + shadow map bound),
+    // taken by the first of them.
+    std::optional<BindSlot> opaqueSlot;
+    const auto materialKey = [](const Instance& instance, std::uint32_t slot) -> std::string_view {
+        return slot < instance.materialSlots.size() ? std::string_view(instance.materialSlots[slot]) : std::string_view();
+    };
     const ixrhi::IXRHIGraphicsPipeline* boundPipeline = nullptr;
     const std::uint32_t instanceCount = static_cast<std::uint32_t>(instances.size());
     for (std::size_t drawIndex = 0; drawIndex < m_draws.size(); ++drawIndex)
@@ -3538,26 +3582,42 @@ void StaticMeshRenderer::RenderShadowCasters(ixrhi::IXRHICommandList& cmd,
             // cutoff: a faint glass casts nothing instead of a solid block.
             const bool masked = blocks[drawBase - *base + runStart].materialAlpha[0] >= 1.0f;
             std::uint32_t runEnd = runStart + 1;
-            // Opaque instances share one draw; a masked one draws alone with its own texture.
-            while (!masked && runEnd < instanceCount && blocks[drawBase - *base + runEnd].materialAlpha[0] < 1.0f)
-                ++runEnd;
+            // Opaque instances share one draw, and masked ones of one material one with its texture.
+            if (masked)
+            {
+                const std::string_view material = materialKey(*instances[runStart], draw.materialSlot);
+                while (runEnd < instanceCount && blocks[drawBase - *base + runEnd].materialAlpha[0] >= 1.0f &&
+                       materialKey(*instances[runEnd], draw.materialSlot) == material)
+                    ++runEnd;
+            }
+            else
+            {
+                while (runEnd < instanceCount && blocks[drawBase - *base + runEnd].materialAlpha[0] < 1.0f)
+                    ++runEnd;
+            }
+            std::optional<BindSlot> slot;
+            if (masked)
+            {
+                slot = NextBindSlot(frameIndex);
+                if (slot)
+                    UpdateMaterialTextureDescriptors(*slot,
+                        ResolveMaterialTextureViews(*m_rhi, *instances[runStart], draw.materialSlot));
+            }
+            else
+            {
+                if (!opaqueSlot)
+                    opaqueSlot = NextBindSlot(frameIndex);
+                slot = opaqueSlot;
+            }
+            if (!slot)
+                return;
             const ixrhi::IXRHIGraphicsPipeline* pipeline = masked ? m_shadowMaskPipeline.get() : m_shadowPipeline.get();
             if (boundPipeline != pipeline)
             {
                 cmd.SetGraphicsPipeline(*pipeline);
                 boundPipeline = pipeline;
             }
-            if (masked)
-            {
-                const uint32_t uniformSlot = std::min(m_worldUniformCursor++, kUniformSlots - 1);
-                UpdateMaterialTextureDescriptors(frameIndex, uniformSlot,
-                    ResolveMaterialTextureViews(*m_rhi, instances[runStart], draw.materialSlot));
-                cmd.BindGroup(0, *m_bindGroup, frameIndex * kUniformSlots + uniformSlot);
-            }
-            else
-            {
-                cmd.BindGroup(0, *m_bindGroup, opaqueSlot);
-            }
+            cmd.BindGroup(0, *slot->page->group, slot->set);
             cmd.DrawIndexed(draw.indexCount, runEnd - runStart, draw.firstIndex, 0, drawBase + runStart);
             runStart = runEnd;
         }
@@ -3589,7 +3649,7 @@ void StaticMeshRenderer::Destroy()
     if (!m_rhi)
         return;
     DestroyPipeline();
-    m_bindGroup.reset();
+    m_bindPages.clear();
     m_bindLayout.reset();
     m_vertexBuffer.reset();
     m_indexBuffer.reset();
@@ -3598,16 +3658,11 @@ void StaticMeshRenderer::Destroy()
     // (parity with the old fence-wait in Destroy).
     m_pendingLodUploads.clear();
     m_retiredLodBuffers.clear();
-    for (auto& frameBuffers : m_uniformBuffers)
-    {
-        for (auto& buffer : frameBuffers)
-            buffer.reset();
-    }
     for (auto& buffer : m_instanceBuffers)
         buffer.reset();
     m_instanceBufferCapacity = {};
-    for (auto& mirror : m_instanceMirror)
-        mirror.clear();
+    m_worldRenderFrameNumber = std::numeric_limits<std::uint64_t>::max();
+    m_worldRenderFrameIndex = std::numeric_limits<uint32_t>::max();
     m_texture = {};
     m_normalTexture = {};
     m_ormTexture = {};
@@ -3636,8 +3691,7 @@ void StaticMeshRenderer::Destroy()
     m_rhi = nullptr;
 }
 
-void StaticMeshRenderer::UpdateWorldUniform(uint32_t frameIndex,
-    uint32_t uniformSlot,
+void StaticMeshRenderer::UpdateWorldUniform(const BindSlot& slot,
     const WorldCamera& camera,
     const Instance& instance,
     double,
@@ -3702,7 +3756,6 @@ void StaticMeshRenderer::UpdateWorldUniform(uint32_t frameIndex,
     uniform.causticParams[0] = 0.0f;
     FillSunShadowUniform(m_sunShadow, uniform);
 
-    if (frameIndex < kFramesInFlight && uniformSlot < kUniformSlots &&
-        m_uniformBuffers[frameIndex][uniformSlot])
-        m_uniformBuffers[frameIndex][uniformSlot]->Write(0, &uniform, sizeof(uniform));
+    if (slot.page && slot.page->uniforms)
+        slot.page->uniforms->Write(kUniformStride * slot.set, &uniform, sizeof(uniform));
 }

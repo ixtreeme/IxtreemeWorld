@@ -897,11 +897,17 @@ bool EditorImGui::HierarchyPassesSearch(const std::string& name) const
 
 const HierarchySceneEntity* EditorImGui::FindHierarchyEntity(std::uint64_t entity) const
 {
-    auto it = std::find_if(m_hierarchyEntities.begin(), m_hierarchyEntities.end(),
-        [entity](const HierarchySceneEntity& candidate) {
-            return candidate.entity == entity;
-        });
-    return it == m_hierarchyEntities.end() ? nullptr : &*it;
+    const auto it = m_hierarchyIndexByEntity.find(entity);
+    return it == m_hierarchyIndexByEntity.end() || it->second >= m_hierarchyEntities.size()
+        ? nullptr
+        : &m_hierarchyEntities[it->second];
+}
+
+const std::vector<std::uint64_t>& EditorImGui::HierarchyChildren(std::uint64_t entity) const
+{
+    static const std::vector<std::uint64_t> kNone;
+    const auto it = m_hierarchyChildren.find(entity);
+    return it == m_hierarchyChildren.end() ? kNone : it->second;
 }
 
 const HierarchySceneEntity* EditorImGui::FindHierarchyEntity(HierarchyEntityType type, std::uint32_t objectId) const
@@ -930,9 +936,9 @@ bool EditorImGui::HierarchySubtreePassesSearch(std::uint64_t entity) const
         return false;
     if (HierarchyPassesSearch(node->name))
         return true;
-    for (const HierarchySceneEntity& child : m_hierarchyEntities)
+    for (std::uint64_t child : HierarchyChildren(entity))
     {
-        if (child.parent == entity && HierarchySubtreePassesSearch(child.entity))
+        if (HierarchySubtreePassesSearch(child))
             return true;
     }
     return false;

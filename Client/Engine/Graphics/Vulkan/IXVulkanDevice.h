@@ -266,6 +266,9 @@ private:
     std::atomic<std::uint64_t> m_presentedFrames{0};  // successful presents (GetPresentedFrameCount)
     bool m_gpuTimestampsAllowed = false;  // CreateTimestampPool: debug-log build or IX_GPU_PROFILE=1
     mutable std::mutex m_queueSubmitPresentMutex;
+    // The swapchain's host access is externally synchronized: the present thread's vkQueuePresentKHR
+    // and the frame's vkAcquireNextImageKHR take this (before m_queueSubmitPresentMutex).
+    std::mutex m_swapchainMutex;
 };
 
 #define IXVULKAN_CHECK(device, call) (device).CheckVk((call), #call, __FILE__, __LINE__)

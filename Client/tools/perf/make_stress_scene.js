@@ -1,8 +1,11 @@
 // Builds a stress copy of the AkitaOnline Main scene (writes ONLY the given output scene file).
-// usage: node make_stress_scene.js <input.scene> <output.scene>
+// usage: node make_stress_scene.js <input.scene> <output.scene> [characters=62] [props=10000] [emitters=100]
 const fs = require("fs");
-const [input, output] = process.argv.slice(2);
-if (!input || !output || input === output) throw new Error("usage: input output (different files)");
+const [input, output, characterArg, propArg, emitterArg] = process.argv.slice(2);
+if (!input || !output || input === output) throw new Error("usage: input output (different files) [characters] [props] [emitters]");
+const characterCount = characterArg !== undefined ? Number(characterArg) : 62;
+const propCount = propArg !== undefined ? Number(propArg) : 10000;
+const emitterCount = emitterArg !== undefined ? Number(emitterArg) : 100;
 
 const scene = JSON.parse(fs.readFileSync(input, "utf8"));
 let seed = 20261007;
@@ -17,11 +20,11 @@ const cube = byName("Cube 3");
 const clone = (o) => JSON.parse(JSON.stringify(o));
 let nextId = 2000;
 
-// 1) Characters: 31 more of each skinned model (32 per model is the engine's per-frame cap), in a
-//    grid around the player.
+// 1) Characters: alternately Arissa and KicsiK copies, in a square grid around the player.
 const centre = player.position;
 const characters = [];
-for (let i = 0; i < 62; ++i) {
+const columns = Math.max(1, Math.ceil(Math.sqrt(characterCount)));
+for (let i = 0; i < characterCount; ++i) {
   const isArissa = i % 2 === 0;
   const e = clone(isArissa ? arissa : player);
   for (const k of ["rigidbody", "collider", "character_controller", "audio_listener", "script",
@@ -29,15 +32,15 @@ for (let i = 0; i < 62; ++i) {
     delete e[k];
   e.id = nextId++;
   e.name = (isArissa ? "Crowd Arissa " : "Crowd KicsiK ") + i;
-  const gx = (i % 8) - 3.5, gz = Math.floor(i / 8) - 3.5;
+  const gx = (i % columns) - (columns - 1) / 2, gz = Math.floor(i / columns) - (columns - 1) / 2;
   e.position = [centre[0] + gx * 3.0 + range(-0.5, 0.5), isArissa ? 0 : centre[1], centre[2] + gz * 3.0 + range(-0.5, 0.5)];
   e.rotation = [isArissa ? 0 : 3.14157, range(-3.14, 3.14), isArissa ? 0 : 3.14159];
   characters.push(e);
 }
 
-// 2) Static props: 10 000 over 400 x 400 m — 30% trees, 70% boxes.
+// 2) Static props over 400 x 400 m — 30% trees, 70% boxes.
 const props = [];
-for (let i = 0; i < 10000; ++i) {
+for (let i = 0; i < propCount; ++i) {
   const isTree = rand() < 0.3;
   const e = clone(isTree ? tree : cube);
   for (const k of ["rigidbody", "collider", "lod_component", "editor_components"]) delete e[k];
@@ -50,11 +53,11 @@ for (let i = 0; i < 10000; ++i) {
   props.push(e);
 }
 
-// 3) Particle emitters on the 100 boxes nearest the player: half CPU, half GPU.
+// 3) Particle emitters on the boxes nearest the player: half CPU, half GPU.
 const template = player.particle_system;
 const near = props.filter((p) => p.name.startsWith("Prop Box"))
   .map((p) => ({ p, d: Math.hypot(p.position[0] - centre[0], p.position[2] - centre[2]) }))
-  .sort((a, b) => a.d - b.d).slice(0, 100);
+  .sort((a, b) => a.d - b.d).slice(0, emitterCount);
 near.forEach(({ p }, i) => {
   const ps = clone(template);
   ps.gpu_simulation = i % 2 === 1;
