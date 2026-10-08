@@ -320,6 +320,45 @@ void IXVulkanCommandList::CopyTextureLayer(const ixrhi::IXRHITexture& src,
         &copy);
 }
 
+void IXVulkanCommandList::CopyTextureLayerRegion(const ixrhi::IXRHITexture& src,
+                                                 std::uint32_t srcLayer,
+                                                 std::uint32_t srcX,
+                                                 std::uint32_t srcY,
+                                                 ixrhi::IXRHITexture& dst,
+                                                 std::uint32_t dstLayer,
+                                                 std::uint32_t dstX,
+                                                 std::uint32_t dstY,
+                                                 std::uint32_t width,
+                                                 std::uint32_t height)
+{
+    auto* nativeSrc = dynamic_cast<const IXVulkanTexture*>(&src);
+    auto* nativeDst = dynamic_cast<IXVulkanTexture*>(&dst);
+    assert(nativeSrc != nullptr && nativeDst != nullptr && "foreign IXRHITexture used with IXVulkan backend");
+    if (nativeSrc == nullptr || nativeDst == nullptr || srcLayer >= nativeSrc->ArrayLayers() ||
+        dstLayer >= nativeDst->ArrayLayers() || width == 0 || height == 0 ||
+        srcX + width > nativeSrc->Width() || srcY + height > nativeSrc->Height() ||
+        dstX + width > nativeDst->Width() || dstY + height > nativeDst->Height())
+        return;
+    const VkImageAspectFlags aspect = ToVkAspectMask(nativeSrc->Format());
+    VkImageCopy copy{};
+    copy.srcSubresource.aspectMask = aspect;
+    copy.srcSubresource.baseArrayLayer = srcLayer;
+    copy.srcSubresource.layerCount = 1;
+    copy.srcOffset = {static_cast<std::int32_t>(srcX), static_cast<std::int32_t>(srcY), 0};
+    copy.dstSubresource.aspectMask = aspect;
+    copy.dstSubresource.baseArrayLayer = dstLayer;
+    copy.dstSubresource.layerCount = 1;
+    copy.dstOffset = {static_cast<std::int32_t>(dstX), static_cast<std::int32_t>(dstY), 0};
+    copy.extent = {width, height, 1};
+    vkCmdCopyImage(m_cmd,
+        nativeSrc->Native(),
+        VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL,
+        nativeDst->Native(),
+        VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL,
+        1,
+        &copy);
+}
+
 void IXVulkanCommandList::ClearDepth(float depth,
                                      std::uint32_t x,
                                      std::uint32_t y,

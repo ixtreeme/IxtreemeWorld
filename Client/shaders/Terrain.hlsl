@@ -176,7 +176,12 @@ float SampleShadowPCF(float3 worldPos, int cascadeIndex)
         return 1.0;
 
     const float shadowSize = max(u_shadowParams.y, 1.0);
-    const float compareDepth = ndc.z - u_shadowParams.z;
+    // The bias: u_shadowParams.z depth units less u_shadowParams.w metres of the cascade's depth (its
+    // matrix's z column is 1 / its depth range in metres): the padding the range carries for its moves
+    // takes no bias.
+    const float4x4 cascadeMatrix = u_cascadeViewProj[cascadeIndex];
+    const float depthPerMetre = length(float3(cascadeMatrix[0][2], cascadeMatrix[1][2], cascadeMatrix[2][2]));
+    const float compareDepth = ndc.z - (u_shadowParams.z - u_shadowParams.w * depthPerMetre);
     // A 5x5 grid of bilinear compare taps one texel apart weights, along each axis, the texels
     // base-2 .. base+3 by (1-f, 1, 1, 1, 1, f). Each adjacent pair of them is one bilinear tap placed
     // at the pair's weight ratio, so the same filter takes 3x3 = 9 taps instead of 25 (the shadow

@@ -59,6 +59,16 @@ public:
                            ixrhi::IXRHIImageLayout from,
                            ixrhi::IXRHIImageLayout to) override;
     void CopyTexture(const ixrhi::IXRHITexture& src, ixrhi::IXRHITexture& dst) override;
+    void CopyTextureLayerRegion(const ixrhi::IXRHITexture& src,
+                                std::uint32_t srcLayer,
+                                std::uint32_t srcX,
+                                std::uint32_t srcY,
+                                ixrhi::IXRHITexture& dst,
+                                std::uint32_t dstLayer,
+                                std::uint32_t dstX,
+                                std::uint32_t dstY,
+                                std::uint32_t width,
+                                std::uint32_t height) override;
     void CopyTextureLayer(const ixrhi::IXRHITexture& src,
                           std::uint32_t srcLayer,
                           ixrhi::IXRHITexture& dst,

@@ -3156,6 +3156,8 @@ int RunGame(NativeWindow& window,
         float maxY = 0.0f;
     };
     std::array<std::vector<CasterClipRect>, SunShadowReceive::kCascades> settledCasterClipRects;
+    std::vector<const StaticMeshRenderRecord*> settledCasterList;
+    std::uint64_t settledCasterListFrame = std::numeric_limits<std::uint64_t>::max();
     std::array<std::uint64_t, SunShadowReceive::kCascades> settledCasterClipRectsFrame{};
     auto leaveStaticShadow = [&](StaticMeshRenderRecord& record) {
         if (!record.inStaticShadow)
@@ -12834,26 +12836,39 @@ int RunGame(NativeWindow& window,
                     if (settledCasterClipRectsFrame[cascade] != frameInfo.frameNumber)
                     {
                         settledCasterClipRectsFrame[cascade] = frameInfo.frameNumber;
-                        rects.clear();
-                        const float* m = lightViewProj.m;
-                        for (const ShadowCasterBatch& batch : settledShadowCasterBatches)
+                        // The settled casters in batch order, once a frame (for every cascade with regions).
+                        if (settledCasterListFrame != frameInfo.frameNumber)
                         {
-                            for (const StaticMeshRenderRecord* caster : batch.casters)
-                            {
-                                CasterClipRect rect{std::numeric_limits<float>::max(), std::numeric_limits<float>::max(),
-                                    std::numeric_limits<float>::lowest(), std::numeric_limits<float>::lowest()};
-                                for (const WorldVec3& p : caster->corners)
-                                {
-                                    const float x = p.x * m[0] + p.y * m[4] + p.z * m[8] + m[12];
-                                    const float y = p.x * m[1] + p.y * m[5] + p.z * m[9] + m[13];
-                                    rect.minX = std::min(rect.minX, x);
-                                    rect.minY = std::min(rect.minY, y);
-                                    rect.maxX = std::max(rect.maxX, x);
-                                    rect.maxY = std::max(rect.maxY, y);
-                                }
-                                rects.push_back(rect);
-                            }
+                            settledCasterListFrame = frameInfo.frameNumber;
+                            settledCasterList.clear();
+                            for (const ShadowCasterBatch& batch : settledShadowCasterBatches)
+                                settledCasterList.insert(settledCasterList.end(), batch.casters.begin(), batch.casters.end());
                         }
+                        rects.resize(settledCasterList.size());
+                        // A box's clip x, y extent: its centre's, plus its half size through the matrix's magnitudes.
+                        const float* m = lightViewProj.m;
+                        const auto computeRects = [&](std::uint32_t begin, std::uint32_t end, std::uint32_t) {
+                            for (std::uint32_t i = begin; i < end; ++i)
+                            {
+                                const SpatialIndex::Aabb& bounds = settledCasterList[i]->worldBounds;
+                                const float cx = 0.5f * (bounds.min.x + bounds.max.x);
+                                const float cy = 0.5f * (bounds.min.y + bounds.max.y);
+                                const float cz = 0.5f * (bounds.min.z + bounds.max.z);
+                                const float ex = 0.5f * (bounds.max.x - bounds.min.x);
+                                const float ey = 0.5f * (bounds.max.y - bounds.min.y);
+                                const float ez = 0.5f * (bounds.max.z - bounds.min.z);
+                                const float x = cx * m[0] + cy * m[4] + cz * m[8] + m[12];
+                                const float y = cx * m[1] + cy * m[5] + cz * m[9] + m[13];
+                                const float hx = std::abs(ex * m[0]) + std::abs(ey * m[4]) + std::abs(ez * m[8]);
+                                const float hy = std::abs(ex * m[1]) + std::abs(ey * m[5]) + std::abs(ez * m[9]);
+                                rects[i] = {x - hx, y - hy, x + hx, y + hy};
+                            }
+                        };
+                        const std::uint32_t count = static_cast<std::uint32_t>(settledCasterList.size());
+                        if (ixjobs::JobSystem::Instance().Parallel() && count >= 2048u)
+                            ixjobs::JobSystem::Instance().ParallelFor(count, 1024, computeRects);
+                        else
+                            computeRects(0, count, 0);
                     }
                     std::size_t index = 0;
                     for (const ShadowCasterBatch& batch : settledShadowCasterBatches)

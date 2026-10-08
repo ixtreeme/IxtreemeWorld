@@ -350,9 +350,42 @@ Ellenőrzés:
 - **A/B az előző commit ellen:** ugyanaz az FPS. Az árnyékpass CPU-ja 0,69 helyett 0,78 ms, a rekordonkénti
   könyvelés miatt (az új jelzőt a sűrűn olvasott mezők mellé tettem, így 0,88 ms-ról jött le).
 
-Ami maradt: ha a kamera mozog, a kaszkádok mátrixa változik, és akkor a teljes újrarajzolás továbbra is jár. Ebben a
-sűrű jelenetben ez frame-enként ~20 ms GPU lehet. Ehhez árnyék-LOD vagy a statikus réteg görgetése kellene
-(eltolás és a szélek utánrajzolása).
+### Mozgó kamera: a statikus réteg eltolódik
+
+A kaszkádok a fény rögzített nézetéből, a saját texelrácsukhoz illesztve követik a kamerát. Ha egy kaszkád csak
+egész texelnyit mozdult, és a mélységtartománya ugyanaz, a statikus rétege továbbra is helyes, csak eltolva. Ezért
+a réteg nem rajzolódik újra:
+
+- A tartalma egész texelekkel eltolódik: a kaszkád saját árnyéktérkép-rétegén át másolódik vissza új helyre
+  (új RHI-hívás: `CopyTextureLayerRegion`).
+- A szabaddá vált szélsávok a régiók közé kerülnek, és ugyanúgy újrarajzolódnak, mint a kilépő árnyékvetők helyei
+  (`StaticShadowShift`, `StaticShadowRegions`).
+- A mélységtartomány közepe 64 méteres lépésekben mozog (eddig 1 méteresekben), a ráhagyás ugyanennyivel nőtt. Így
+  mozgás közben ritkán kell teljes újrarajzolás.
+- A terep árnyék-biasa méterben a régi maradt: a `Terrain.hlsl` a mátrixból olvasott mélységskálával kivonja a
+  ráhagyás részét.
+- `IX_SHADOW_SHIFT=0`: a mozdult kaszkád egészben rajzolódik újra, mint eddig; összehasonlításhoz.
+
+Erős napfényes változat, buildelt játék, 3 másodperc gyaloglás (W):
+
+| Mód | FPS gyaloglás közben | árnyékpass CPU | GPU-várakozás |
+| --- | --- | --- | --- |
+| `IX_SHADOW_SHIFT=0` (teljes újrarajzolás) | 73–90 | 2,1–3,2 ms | 5,4–6,9 ms |
+| eltolással | **113–124** | ~1,55 ms | 3,1–3,7 ms |
+| állva (összevetésként) | 132–135 | ~0,78 ms | ~3,4 ms |
+
+Az alap terhelt jeleneten a teljes újrarajzolással mért gyaloglás korábban 40–58 FPS volt.
+
+Ellenőrzés:
+
+- **Képi:** ugyanaz a gyaloglás eltolással és nélküle ugyanazt az árnyékképet adja. A kezdőpozícióban az árnyékok
+  a módosítás előtti képpel azonosak (a terep biasa nem változott).
+- **Validáció:** a szinkronizációs validáció gyaloglás közben 0 hibát jelzett. Az első futás kimutatta, hogy a fő
+  árnyéktérképről hiányzott a `TransferSrc`, a statikus cache-ről a `TransferDst` használat; ez javítva.
+
+Ami maradt: a sávok újrarajzolása gyaloglás közben kb. 0,8 ms CPU, mert a sávokba lógó fák egészben rajzolódnak. A
+mélységlépés átlépésekor (64 m a fény irányában) továbbra is teljes újrarajzolás van. A volumetrikus fény biasa
+mélységegységben maradt, így ott kissé nagyobb lett.
 
 ## Következmény a párhuzamosítási tervre
 

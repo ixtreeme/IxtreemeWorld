@@ -96,6 +96,18 @@ public:
                                   std::uint32_t srcLayer,
                                   IXRHITexture& dst,
                                   std::uint32_t dstLayer) = 0;
+    // A rectangle of one array layer (mip 0) to a place in a layer of a texture of the same format,
+    // in the same layouts as CopyTexture.
+    virtual void CopyTextureLayerRegion(const IXRHITexture& src,
+                                        std::uint32_t srcLayer,
+                                        std::uint32_t srcX,
+                                        std::uint32_t srcY,
+                                        IXRHITexture& dst,
+                                        std::uint32_t dstLayer,
+                                        std::uint32_t dstX,
+                                        std::uint32_t dstY,
+                                        std::uint32_t width,
+                                        std::uint32_t height) = 0;
 
     // Whole- or part-buffer copy. Ordering with surrounding commands follows
     // recording order (same queue); explicit state transitions still apply.

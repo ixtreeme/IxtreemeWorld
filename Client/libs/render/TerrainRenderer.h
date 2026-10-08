@@ -305,6 +305,9 @@ private:
     static constexpr uint32_t kFramesInFlight = 2;
     static constexpr uint32_t kShadowCascadeCount = 4;
     static constexpr uint32_t kShadowResolution = 2048;
+    // The cascades' depth ranges move in steps of this many metres (see UpdateShadowCascades); their
+    // padding carries one more step.
+    static constexpr float kShadowDepthStepMeters = 64.0f;
     static constexpr uint32_t kMaxTerrainWaterBodies = 8;
 
     struct Vertex
@@ -654,10 +657,15 @@ private:
         ShadowRegion region;
     };
     static constexpr std::size_t kMaxStaticShadowRegions = 16;
-    // The regions of a cascade's static layer the casters that left need drawn again; false when that
-    // is more than drawing it whole (too many, or a quarter of it).
-    bool StaticShadowRegions(std::uint32_t cascade, const ShadowCasters& casters,
-                             std::vector<StaticShadowRegion>& regions) const;
+    // The regions of a cascade's static layer to draw again: the edges a shift (in texels) uncovered,
+    // and where the casters that left were; false when that is more than drawing it whole (too many,
+    // or a quarter of it).
+    bool StaticShadowRegions(std::uint32_t cascade, const ShadowCasters& casters, std::int32_t shiftX,
+                             std::int32_t shiftY, std::vector<StaticShadowRegion>& regions) const;
+    // Whether a cascade moved only across its own texel grid since a layer was drawn with oldViewProj:
+    // the layer's contents are then still right, moved by (shiftX, shiftY) texels.
+    static bool StaticShadowShift(const std::array<float, 16>& oldViewProj, const std::array<float, 16>& newViewProj,
+                                  std::int32_t& shiftX, std::int32_t& shiftY);
     bool m_staticShadowCacheFailed = false;
     bool EnsureStaticShadowCache(ixrhi::IXRHICommandList& cmd);
     std::unique_ptr<ixrhi::IXRHIGraphicsPipeline> m_shadowPipeline;

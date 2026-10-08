@@ -2015,10 +2015,12 @@ void TerrainRenderer::UpdateShadowCascades(const WorldCamera& camera)
         const float texelSize = 2.0f * halfSize / static_cast<float>(kShadowResolution);
         const float centerX = std::floor(eye.x / texelSize) * texelSize;
         const float centerY = std::floor(eye.y / texelSize) * texelSize;
-        // The depth range moves in whole metres too (well inside the padding), so a cascade stays
-        // exactly the same while the camera moves less than a texel and can be kept.
-        const float centerZ = std::floor(eye.z);
-        constexpr float depthPadding = 80.0f;
+        // The depth range moves in steps of 64 m (the padding has room for them): a cascade stays
+        // exactly the same while the camera moves less than a texel and can be kept, and while it moves
+        // across its texels only, its static cache layer is moved instead of drawn again (a depth step
+        // changes every depth in it: drawn again).
+        const float centerZ = std::floor(eye.z / kShadowDepthStepMeters) * kShadowDepthStepMeters;
+        constexpr float depthPadding = 80.0f + kShadowDepthStepMeters;
         const WorldMat4 lightProj = WorldOrthographicOffCenter(
             centerX - halfSize, centerX + halfSize,
             centerY - halfSize, centerY + halfSize,
@@ -2145,43 +2147,40 @@ SunShadowReceive TerrainRenderer::SunShadowForMeshes(std::uint64_t frameNumber) 
     return out;
 }
 
-bool TerrainRenderer::StaticShadowRegions(std::uint32_t cascade, const ShadowCasters& casters,
-                                          std::vector<StaticShadowRegion>& regions) const
+bool TerrainRenderer::StaticShadowShift(const std::array<float, 16>& oldViewProj,
+                                        const std::array<float, 16>& newViewProj,
+                                        std::int32_t& shiftX, std::int32_t& shiftY)
+{
+    // The same light view, size and depth range: only the x, y translation may differ.
+    for (int i = 0; i < 16; ++i)
+    {
+        if (i != 12 && i != 13 && oldViewProj[i] != newViewProj[i])
+            return false;
+    }
+    // A world point's clip x, y move by the translation's change; in texels (the viewport maps clip
+    // [-1, 1] over the layer), that must be whole.
+    const float resolution = static_cast<float>(kShadowResolution);
+    const float x = (newViewProj[12] - oldViewProj[12]) * 0.5f * resolution;
+    const float y = (newViewProj[13] - oldViewProj[13]) * 0.5f * resolution;
+    const float roundedX = std::round(x);
+    const float roundedY = std::round(y);
+    if (std::abs(x - roundedX) > 0.01f || std::abs(y - roundedY) > 0.01f ||
+        std::abs(roundedX) >= resolution || std::abs(roundedY) >= resolution)
+        return false;
+    shiftX = static_cast<std::int32_t>(roundedX);
+    shiftY = static_cast<std::int32_t>(roundedY);
+    return true;
+}
+
+bool TerrainRenderer::StaticShadowRegions(std::uint32_t cascade, const ShadowCasters& casters, std::int32_t shiftX,
+                                          std::int32_t shiftY, std::vector<StaticShadowRegion>& regions) const
 {
     regions.clear();
-    if (!casters.staticLeft)
-        return true;
     const float* m = m_shadowCascadeViewProj[cascade].m;
     const float resolution = static_cast<float>(kShadowResolution);
     std::uint64_t area = 0;
-    for (const StaticCasterBounds& bounds : *casters.staticLeft)
-    {
-        // The box's texels in the layer (clip x, y to texels as the viewport maps them), a texel
-        // past each side for its rasterized edge.
-        float minX = std::numeric_limits<float>::max();
-        float minY = std::numeric_limits<float>::max();
-        float maxX = std::numeric_limits<float>::lowest();
-        float maxY = std::numeric_limits<float>::lowest();
-        for (int corner = 0; corner < 8; ++corner)
-        {
-            const float x = (corner & 1) ? bounds.max.x : bounds.min.x;
-            const float y = (corner & 2) ? bounds.max.y : bounds.min.y;
-            const float z = (corner & 4) ? bounds.max.z : bounds.min.z;
-            const float clipW = x * m[3] + y * m[7] + z * m[11] + m[15];
-            const float w = std::abs(clipW) > 1e-6f ? clipW : 1.0f;
-            const float ndcX = (x * m[0] + y * m[4] + z * m[8] + m[12]) / w;
-            const float ndcY = (x * m[1] + y * m[5] + z * m[9] + m[13]) / w;
-            minX = std::min(minX, (ndcX + 1.0f) * 0.5f * resolution);
-            maxX = std::max(maxX, (ndcX + 1.0f) * 0.5f * resolution);
-            minY = std::min(minY, (ndcY + 1.0f) * 0.5f * resolution);
-            maxY = std::max(maxY, (ndcY + 1.0f) * 0.5f * resolution);
-        }
-        const float x0 = std::clamp(std::floor(minX) - 1.0f, 0.0f, resolution);
-        const float x1 = std::clamp(std::ceil(maxX) + 1.0f, 0.0f, resolution);
-        const float y0 = std::clamp(std::floor(minY) - 1.0f, 0.0f, resolution);
-        const float y1 = std::clamp(std::ceil(maxY) + 1.0f, 0.0f, resolution);
-        if (x1 <= x0 || y1 <= y0)
-            continue;  // not over this cascade
+    // A region of texels [x0, x1) x [y0, y1); false past the limits.
+    const auto addRegion = [&](float x0, float y0, float x1, float y1) {
         if (regions.size() == kMaxStaticShadowRegions)
             return false;
         StaticShadowRegion region;
@@ -2213,6 +2212,49 @@ bool TerrainRenderer::StaticShadowRegions(std::uint32_t cascade, const ShadowCas
             region.region.viewProj.m[row * 4 + 1] = scaleY * m[row * 4 + 1] + offsetY * m[row * 4 + 3];
         }
         regions.push_back(region);
+        return true;
+    };
+    // The edges the shift uncovered (the contents moved by it; what was past the far edge is gone).
+    if (shiftX > 0 && !addRegion(0.0f, 0.0f, static_cast<float>(shiftX), resolution))
+        return false;
+    if (shiftX < 0 && !addRegion(resolution + static_cast<float>(shiftX), 0.0f, resolution, resolution))
+        return false;
+    if (shiftY > 0 && !addRegion(0.0f, 0.0f, resolution, static_cast<float>(shiftY)))
+        return false;
+    if (shiftY < 0 && !addRegion(0.0f, resolution + static_cast<float>(shiftY), resolution, resolution))
+        return false;
+    if (!casters.staticLeft)
+        return true;
+    for (const StaticCasterBounds& bounds : *casters.staticLeft)
+    {
+        // The box's texels in the layer (clip x, y to texels as the viewport maps them), a texel
+        // past each side for its rasterized edge.
+        float minX = std::numeric_limits<float>::max();
+        float minY = std::numeric_limits<float>::max();
+        float maxX = std::numeric_limits<float>::lowest();
+        float maxY = std::numeric_limits<float>::lowest();
+        for (int corner = 0; corner < 8; ++corner)
+        {
+            const float x = (corner & 1) ? bounds.max.x : bounds.min.x;
+            const float y = (corner & 2) ? bounds.max.y : bounds.min.y;
+            const float z = (corner & 4) ? bounds.max.z : bounds.min.z;
+            const float clipW = x * m[3] + y * m[7] + z * m[11] + m[15];
+            const float w = std::abs(clipW) > 1e-6f ? clipW : 1.0f;
+            const float ndcX = (x * m[0] + y * m[4] + z * m[8] + m[12]) / w;
+            const float ndcY = (x * m[1] + y * m[5] + z * m[9] + m[13]) / w;
+            minX = std::min(minX, (ndcX + 1.0f) * 0.5f * resolution);
+            maxX = std::max(maxX, (ndcX + 1.0f) * 0.5f * resolution);
+            minY = std::min(minY, (ndcY + 1.0f) * 0.5f * resolution);
+            maxY = std::max(maxY, (ndcY + 1.0f) * 0.5f * resolution);
+        }
+        const float x0 = std::clamp(std::floor(minX) - 1.0f, 0.0f, resolution);
+        const float x1 = std::clamp(std::ceil(maxX) + 1.0f, 0.0f, resolution);
+        const float y0 = std::clamp(std::floor(minY) - 1.0f, 0.0f, resolution);
+        const float y1 = std::clamp(std::ceil(maxY) + 1.0f, 0.0f, resolution);
+        if (x1 <= x0 || y1 <= y0)
+            continue;  // not over this cascade
+        if (!addRegion(x0, y0, x1, y1))
+            return false;
     }
     return true;
 }
@@ -2230,7 +2272,8 @@ bool TerrainRenderer::EnsureStaticShadowCache(ixrhi::IXRHICommandList& cmd)
     desc.mipLevels = 1;
     desc.arrayLayers = kShadowCascadeCount;
     desc.format = ixrhi::IXRHIFormat::D32Float;
-    desc.usage = ixrhi::IXRHITextureUsage::DepthStencilAttachment | ixrhi::IXRHITextureUsage::TransferSrc;
+    desc.usage = ixrhi::IXRHITextureUsage::DepthStencilAttachment | ixrhi::IXRHITextureUsage::TransferSrc |
+        ixrhi::IXRHITextureUsage::TransferDst;  // (moved: copied back in at its new place)
     desc.debugName = "Terrain:ShadowCascadesStatic";
     std::shared_ptr<ixrhi::IXRHITexture> texture = m_rhi->CreateTexture(desc, nullptr, 0);
     if (!texture)
@@ -2304,6 +2347,10 @@ void TerrainRenderer::RenderSunShadowMap(ixrhi::IXRHICommandList& cmd,
     std::array<bool, kShadowCascadeCount> redraw{};
     std::array<bool, kShadowCascadeCount> compose{};
     std::array<StaticLayerUpdate, kShadowCascadeCount> staticUpdate{};
+    // (A delta layer's shift, in texels: the cascade moved across its texel grid.)
+    std::array<std::int32_t, kShadowCascadeCount> shiftX{};
+    std::array<std::int32_t, kShadowCascadeCount> shiftY{};
+    bool anyShift = false;
     bool anyRedraw = false;
     bool anyCompose = false;
     const bool staticCache = casters.drawStatic && EnsureStaticShadowCache(cmd);
@@ -2336,13 +2383,28 @@ void TerrainRenderer::RenderSunShadowMap(ixrhi::IXRHICommandList& cmd,
         const std::optional<ShadowCascadeInputs>& held = m_staticShadowInputs[cascade];
         if (held && *held == staticInputs)
             continue;  // kept
+        // What the held layer needs to become this one: moved (the cascade moved across its texels),
+        // the frame's static caster change, or both; anything else and it is drawn whole.
         bool delta = false;
-        if (held && casters.staticDeltaFrom != 0 && held->castersRevision == casters.staticDeltaFrom)
+        if (held)
         {
             ShadowCascadeInputs advanced = *held;
-            advanced.castersRevision = staticInputs.castersRevision;
+            // (IX_SHADOW_SHIFT=0: a moved cascade is drawn whole, as before; for comparing.)
+            static const bool shiftLayers = ixjobs::FeatureEnabled("IX_SHADOW_SHIFT");
+            if (shiftLayers && advanced.viewProj != staticInputs.viewProj &&
+                StaticShadowShift(advanced.viewProj, staticInputs.viewProj, shiftX[cascade], shiftY[cascade]))
+                advanced.viewProj = staticInputs.viewProj;
+            if (advanced.castersRevision != staticInputs.castersRevision && casters.staticDeltaFrom != 0 &&
+                held->castersRevision == casters.staticDeltaFrom)
+                advanced.castersRevision = staticInputs.castersRevision;
             delta = advanced == staticInputs;
         }
+        if (!delta)
+        {
+            shiftX[cascade] = 0;
+            shiftY[cascade] = 0;
+        }
+        anyShift = anyShift || shiftX[cascade] != 0 || shiftY[cascade] != 0;
         staticUpdate[cascade] = delta ? StaticLayerUpdate::Delta : StaticLayerUpdate::Whole;
         m_staticShadowInputs[cascade] = staticInputs;
     }
@@ -2431,15 +2493,61 @@ void TerrainRenderer::RenderSunShadowMap(ixrhi::IXRHICommandList& cmd,
         cmd.SetScissor(0, 0, kShadowResolution, kShadowResolution);
     };
 
-    // The static layers that changed: drawn whole, or the frame's static caster change drawn over them
-    // (where those that left were, cleared and drawn again; then those that joined).
+    // The moved static layers: their contents moved by the shift, through the cascade's own layer of
+    // the map (drawn into after this anyway): the layer copied there, then back in its new place.
+    // The edges this uncovers are drawn below with the caster change.
+    if (anyShift)
+    {
+        cmd.TransitionTexture(*m_staticShadowTexture,
+            ixrhi::IXRHIImageLayout::DepthStencilAttachment,
+            ixrhi::IXRHIImageLayout::TransferSrc);
+        cmd.TransitionTexture(*m_shadowTexture,
+            ixrhi::IXRHIImageLayout::DepthStencilAttachment,
+            ixrhi::IXRHIImageLayout::TransferDst);
+        for (uint32_t cascade = 0; cascade < kShadowCascadeCount; ++cascade)
+        {
+            if (shiftX[cascade] != 0 || shiftY[cascade] != 0)
+                cmd.CopyTextureLayer(*m_staticShadowTexture, cascade, *m_shadowTexture, cascade);
+        }
+        cmd.TransitionTexture(*m_shadowTexture,
+            ixrhi::IXRHIImageLayout::TransferDst,
+            ixrhi::IXRHIImageLayout::TransferSrc);
+        cmd.TransitionTexture(*m_staticShadowTexture,
+            ixrhi::IXRHIImageLayout::TransferSrc,
+            ixrhi::IXRHIImageLayout::TransferDst);
+        for (uint32_t cascade = 0; cascade < kShadowCascadeCount; ++cascade)
+        {
+            const std::int32_t dx = shiftX[cascade];
+            const std::int32_t dy = shiftY[cascade];
+            if (dx == 0 && dy == 0)
+                continue;
+            const std::uint32_t width = kShadowResolution - static_cast<std::uint32_t>(std::abs(dx));
+            const std::uint32_t height = kShadowResolution - static_cast<std::uint32_t>(std::abs(dy));
+            cmd.CopyTextureLayerRegion(*m_shadowTexture, cascade,
+                dx < 0 ? static_cast<std::uint32_t>(-dx) : 0u, dy < 0 ? static_cast<std::uint32_t>(-dy) : 0u,
+                *m_staticShadowTexture, cascade,
+                dx > 0 ? static_cast<std::uint32_t>(dx) : 0u, dy > 0 ? static_cast<std::uint32_t>(dy) : 0u,
+                width, height);
+        }
+        cmd.TransitionTexture(*m_staticShadowTexture,
+            ixrhi::IXRHIImageLayout::TransferDst,
+            ixrhi::IXRHIImageLayout::DepthStencilAttachment);
+        cmd.TransitionTexture(*m_shadowTexture,
+            ixrhi::IXRHIImageLayout::TransferSrc,
+            ixrhi::IXRHIImageLayout::DepthStencilAttachment);
+    }
+
+    // The static layers that changed: drawn whole, or the frame's change drawn over them (the edges a
+    // shift uncovered and where the casters that left were, cleared and drawn again; then the casters
+    // that joined).
     std::vector<StaticShadowRegion> regions;
     for (uint32_t cascade = 0; cascade < kShadowCascadeCount; ++cascade)
     {
         if (staticUpdate[cascade] == StaticLayerUpdate::Kept)
             continue;
         PassDrawStats& cascadeStats = beginCascadeStats(cascade);
-        if (staticUpdate[cascade] == StaticLayerUpdate::Delta && !StaticShadowRegions(cascade, casters, regions))
+        if (staticUpdate[cascade] == StaticLayerUpdate::Delta &&
+            !StaticShadowRegions(cascade, casters, shiftX[cascade], shiftY[cascade], regions))
             staticUpdate[cascade] = StaticLayerUpdate::Whole;
         if (staticUpdate[cascade] == StaticLayerUpdate::Whole)
         {
@@ -6203,8 +6311,9 @@ bool TerrainRenderer::CreateShadowResources(ixrhi::IXRHIDevice& rhi)
     shadowDesc.mipLevels = 1;
     shadowDesc.arrayLayers = kShadowCascadeCount;
     shadowDesc.format = ixrhi::IXRHIFormat::D32Float;
+    // (The static cache's layers are copied in; a moved cache layer goes through its cascade's layer.)
     shadowDesc.usage = ixrhi::IXRHITextureUsage::DepthStencilAttachment | ixrhi::IXRHITextureUsage::Sampled |
-        ixrhi::IXRHITextureUsage::TransferDst;  // the static cache's layers are copied in
+        ixrhi::IXRHITextureUsage::TransferDst | ixrhi::IXRHITextureUsage::TransferSrc;
     shadowDesc.debugName = "Terrain:ShadowCascades";
     m_shadowTexture = rhi.CreateTexture(shadowDesc, nullptr, 0);
     if (!m_shadowTexture)
@@ -7070,8 +7179,11 @@ void TerrainRenderer::UpdateUniform(uint32_t frameIndex, const WorldCamera& came
     uniform.shadowParams[0] = (!reflectionPass && m_lightingState.sunShadowsEnabled &&
         m_shadowTexture != nullptr) ? 1.0f : 0.0f;
     uniform.shadowParams[1] = static_cast<float>(kShadowResolution);
+    // The compare bias: 0.0015 of a cascade's depth range as it was before the range took on the
+    // step's padding (Terrain.hlsl takes that padding's share back out, in metres), so the terrain's
+    // shadows start where they did.
     uniform.shadowParams[2] = 0.0015f;
-    uniform.shadowParams[3] = 0.0f;
+    uniform.shadowParams[3] = 0.0015f * 2.0f * kShadowDepthStepMeters;
     if (reflectionPass)
     {
         uniform.numPointLights = 0;
