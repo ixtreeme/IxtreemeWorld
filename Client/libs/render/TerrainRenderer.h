@@ -267,6 +267,11 @@ public:
     }
     // Light view-projection per cascade (row vectors), as drawn; finest first.
     const WorldMat4* SunShadowCascadeViewProj() const { return m_shadowCascadeViewProj.data(); }
+    // A cascade's texel size in metres, as placed.
+    float SunShadowCascadeTexelSize(std::uint32_t cascade) const
+    {
+        return cascade < kShadowCascadeCount ? m_shadowCascadeTexelSize[cascade] : 0.0f;
+    }
     static constexpr std::uint32_t SunShadowCascadeCount() { return kShadowCascadeCount; }
     static constexpr float kSunShadowDepthBias = 0.0015f;
     void ResetFrameDrawStats() { m_frameDrawStats = {}; }

@@ -1089,9 +1089,211 @@ bool StaticMeshRenderer::LoadCpu(client::asset::IAssetReader& assets, const std:
             return false;
         }
     }
+    BuildShadowLods();
     DecodeTextures(modelPath);
     m_status = LoadStatus::NotLoaded;  // on the CPU; FinishGpu makes it LoadedStatic
     return true;
+}
+
+void StaticMeshRenderer::BuildShadowLods()
+{
+    m_shadowLodIndices.clear();
+    for (std::vector<MeshDraw>& draws : m_shadowLodDraws)
+        draws.clear();
+    m_shadowCardVertices.clear();
+    m_shadowCardDraws.clear();
+    if (m_vertices.empty() || m_indices.empty())
+        return;
+    const auto masked = [&](const MeshDraw& draw) {
+        return draw.materialSlot < m_materialDefaults.size() &&
+            AlphaModeCode(m_materialDefaults[draw.materialSlot].alphaMode) >= 1.0f;
+    };
+    const auto started = std::chrono::steady_clock::now();
+    std::vector<std::uint32_t> welded(m_indices.size());
+    meshopt_generateShadowIndexBuffer(welded.data(), m_indices.data(), m_indices.size(),
+        &m_vertices.front().position[0], m_vertices.size(), sizeof(float) * 3u, sizeof(Vertex));
+
+    // Opaque submeshes, simplified (a model of a few hundred opaque triangles keeps its own).
+    std::size_t opaqueIndices = 0;
+    for (const MeshDraw& draw : m_draws)
+        opaqueIndices += masked(draw) ? 0u : draw.indexCount;
+    std::array<std::size_t, kShadowLodLevels> levelIndices{};
+    if (opaqueIndices >= 3u * 256u)
+    {
+        for (std::vector<MeshDraw>& draws : m_shadowLodDraws)
+            draws.assign(m_draws.size(), MeshDraw{});
+        std::vector<std::uint32_t> source;
+        std::vector<std::uint32_t> simplified;
+        for (std::size_t drawIndex = 0; drawIndex < m_draws.size(); ++drawIndex)
+        {
+            const MeshDraw& draw = m_draws[drawIndex];
+            if (draw.indexCount == 0 || masked(draw))
+                continue;
+            source.assign(welded.begin() + draw.firstIndex, welded.begin() + draw.firstIndex + draw.indexCount);
+            MeshDraw kept{};  // the coarsest level kept so far (indexCount 0: the draw's own)
+            float keptError = 0.0f;  // how far off the surface it is
+            for (std::size_t level = 0; level < kShadowLodLevels; ++level)
+            {
+                simplified.resize(source.size());
+                float error = 0.0f;
+                const std::size_t count = meshopt_simplify(simplified.data(), source.data(), source.size(),
+                    &m_vertices.front().position[0], m_vertices.size(), sizeof(Vertex), 0,
+                    std::max(kShadowLodErrors[level] - keptError, 0.0f),
+                    meshopt_SimplifySparse | meshopt_SimplifyErrorAbsolute, &error);
+                if (count >= 3u && count * 4u <= source.size() * 3u)
+                {
+                    kept.firstIndex = static_cast<std::uint32_t>(m_shadowLodIndices.size());
+                    kept.indexCount = static_cast<std::uint32_t>(count);
+                    kept.materialSlot = draw.materialSlot;
+                    kept.vertexCount = draw.vertexCount;
+                    m_shadowLodIndices.insert(m_shadowLodIndices.end(), simplified.begin(), simplified.begin() + count);
+                    source.assign(simplified.begin(), simplified.begin() + count);
+                    keptError += error;
+                }
+                m_shadowLodDraws[level][drawIndex] = kept;
+                levelIndices[level] += kept.indexCount != 0 ? kept.indexCount : draw.indexCount;
+            }
+        }
+    }
+
+    // Alpha-masked submeshes of many small separate pieces (leaf cards). A simplifier cannot merge
+    // them; at the coarsest level a share of them is drawn instead, each grown about its centre to
+    // cover the area of those left out (a crown's shadow keeps its density; kShadowCardCover of it,
+    // as the grown pieces overlap each other less than the many small ones did).
+    constexpr std::uint32_t kNone = std::numeric_limits<std::uint32_t>::max();
+    constexpr float kFar = std::numeric_limits<float>::max();
+    std::size_t cardIndicesBefore = 0;
+    std::size_t cardIndicesAfter = 0;
+    std::vector<std::uint32_t> parent;
+    std::vector<std::uint32_t> pieceOfRoot;
+    std::vector<std::uint32_t> cardVertexOf;
+    for (std::size_t drawIndex = 0; drawIndex < m_draws.size(); ++drawIndex)
+    {
+        const MeshDraw& draw = m_draws[drawIndex];
+        const std::uint32_t triangles = draw.indexCount / 3u;
+        if (!masked(draw) || triangles < 256u)
+            continue;
+        if (parent.empty())
+        {
+            parent.resize(m_vertices.size());
+            pieceOfRoot.assign(m_vertices.size(), kNone);
+            cardVertexOf.assign(m_vertices.size(), kNone);
+        }
+        // The pieces: triangles joined through shared (welded) corners.
+        const std::uint32_t* corners = welded.data() + draw.firstIndex;
+        for (std::uint32_t i = 0; i < draw.indexCount; ++i)
+            parent[corners[i]] = corners[i];
+        const auto root = [&](std::uint32_t v) {
+            while (parent[v] != v)
+            {
+                parent[v] = parent[parent[v]];
+                v = parent[v];
+            }
+            return v;
+        };
+        for (std::uint32_t t = 0; t < triangles; ++t)
+        {
+            const std::uint32_t a = root(corners[t * 3u]);
+            parent[root(corners[t * 3u + 1u])] = a;
+            parent[root(corners[t * 3u + 2u])] = a;
+        }
+        std::vector<std::uint32_t> pieceOf(triangles);
+        std::vector<std::uint32_t> pieceTriangles;
+        std::vector<std::uint32_t> roots;
+        for (std::uint32_t t = 0; t < triangles; ++t)
+        {
+            const std::uint32_t r = root(corners[t * 3u]);
+            if (pieceOfRoot[r] == kNone)
+            {
+                pieceOfRoot[r] = static_cast<std::uint32_t>(pieceTriangles.size());
+                pieceTriangles.push_back(0);
+                roots.push_back(r);
+            }
+            pieceOf[t] = pieceOfRoot[r];
+            ++pieceTriangles[pieceOf[t]];
+        }
+        for (const std::uint32_t r : roots)
+            pieceOfRoot[r] = kNone;
+        const std::uint32_t pieces = static_cast<std::uint32_t>(pieceTriangles.size());
+        if (pieces < 64u || *std::max_element(pieceTriangles.begin(), pieceTriangles.end()) > 16u)
+            continue;  // not cards
+
+        // The kept pieces: an evenly mixed share (by a hash of their number, the same every load).
+        const std::uint32_t keep = std::max(1u, static_cast<std::uint32_t>(std::lround(pieces * kShadowCardKeep)));
+        std::vector<std::uint32_t> order(pieces);
+        for (std::uint32_t p = 0; p < pieces; ++p)
+            order[p] = p;
+        std::nth_element(order.begin(), order.begin() + keep, order.end(),
+            [](std::uint32_t a, std::uint32_t b) { return a * 0x9E3779B1u < b * 0x9E3779B1u; });
+        std::vector<std::uint8_t> kept(pieces, 0);
+        for (std::uint32_t k = 0; k < keep; ++k)
+            kept[order[k]] = 1;
+        const float grow = std::sqrt(kShadowCardCover * static_cast<float>(pieces) / static_cast<float>(keep));
+        // Each kept piece's centre: the middle of its bounds.
+        std::vector<std::array<float, 6>> bounds(pieces, {kFar, kFar, kFar, -kFar, -kFar, -kFar});
+        for (std::uint32_t t = 0; t < triangles; ++t)
+        {
+            if (!kept[pieceOf[t]])
+                continue;
+            std::array<float, 6>& box = bounds[pieceOf[t]];
+            for (std::uint32_t k = 0; k < 3u; ++k)
+            {
+                const float* p = m_vertices[m_indices[draw.firstIndex + t * 3u + k]].position;
+                for (int axis = 0; axis < 3; ++axis)
+                {
+                    box[axis] = std::min(box[axis], p[axis]);
+                    box[axis + 3] = std::max(box[axis + 3], p[axis]);
+                }
+            }
+        }
+        // Their triangles, on copies of their own vertices (uvs kept for the cut-out) moved out.
+        MeshDraw cards{};
+        cards.firstIndex = static_cast<std::uint32_t>(m_shadowLodIndices.size());
+        cards.materialSlot = draw.materialSlot;
+        const std::size_t firstCardVertex = m_shadowCardVertices.size();
+        for (std::uint32_t t = 0; t < triangles; ++t)
+        {
+            if (!kept[pieceOf[t]])
+                continue;
+            const std::array<float, 6>& box = bounds[pieceOf[t]];
+            for (std::uint32_t k = 0; k < 3u; ++k)
+            {
+                const std::uint32_t source = m_indices[draw.firstIndex + t * 3u + k];
+                if (cardVertexOf[source] == kNone)
+                {
+                    Vertex vertex = m_vertices[source];
+                    for (int axis = 0; axis < 3; ++axis)
+                    {
+                        const float centre = 0.5f * (box[axis] + box[axis + 3]);
+                        vertex.position[axis] = centre + (vertex.position[axis] - centre) * grow;
+                    }
+                    cardVertexOf[source] = static_cast<std::uint32_t>(m_shadowCardVertices.size());
+                    m_shadowCardVertices.push_back(vertex);
+                }
+                m_shadowLodIndices.push_back(cardVertexOf[source]);
+            }
+        }
+        for (std::uint32_t i = 0; i < draw.indexCount; ++i)
+            cardVertexOf[m_indices[draw.firstIndex + i]] = kNone;
+        cards.indexCount = static_cast<std::uint32_t>(m_shadowLodIndices.size() - cards.firstIndex);
+        cards.vertexCount = static_cast<std::uint32_t>(m_shadowCardVertices.size() - firstCardVertex);
+        if (m_shadowCardDraws.empty())
+            m_shadowCardDraws.assign(m_draws.size(), MeshDraw{});
+        m_shadowCardDraws[drawIndex] = cards;
+        cardIndicesBefore += draw.indexCount;
+        cardIndicesAfter += cards.indexCount;
+    }
+
+    if (m_shadowLodIndices.empty())
+    {
+        for (std::vector<MeshDraw>& draws : m_shadowLodDraws)
+            draws.clear();
+        return;
+    }
+    LogFormat("[STATIC-MESH] shadow lods: %s opaque_tris=%zu levels=%zu/%zu/%zu cards_tris=%zu->%zu (%.2f ms)",
+        m_modelPath.c_str(), opaqueIndices / 3u, levelIndices[0] / 3u, levelIndices[1] / 3u, levelIndices[2] / 3u,
+        cardIndicesBefore / 3u, cardIndicesAfter / 3u,
+        std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - started).count());
 }
 
 bool StaticMeshRenderer::FinishGpu(ixrhi::IXRHIDevice& rhi, bool deferUploads)
@@ -1921,6 +2123,35 @@ bool StaticMeshRenderer::CreateBuffers(ixrhi::IXRHIDevice& rhi)
     }
     if (!m_vertexBuffer || !m_indexBuffer)
         return false;
+    // The shadow detail levels (none made: the model's own triangles in every cascade).
+    m_shadowLodIndexBuffer.reset();
+    m_shadowCardVertexBuffer.reset();
+    const bool deferred = m_deferUploads && m_pendingUploads;
+    const auto makeShadowLodBuffer = [&](const void* data, std::uint64_t bytes, ixrhi::IXRHIBufferUsage usage,
+                                         std::shared_ptr<ixrhi::IXRHIBuffer>* staging, const char* name) {
+        std::shared_ptr<ixrhi::IXRHIBuffer> buffer = CreateRhiBuffer(rhi,
+            bytes,
+            deferred ? usage | ixrhi::IXRHIBufferUsage::TransferDst : usage,
+            ixrhi::IXRHICpuAccess::None,
+            deferred ? nullptr : data,
+            ("StaticMesh:" + m_modelPath + ":" + name).c_str());
+        if (buffer && deferred)
+        {
+            *staging = CreateRhiBuffer(rhi, bytes, ixrhi::IXRHIBufferUsage::TransferSrc, ixrhi::IXRHICpuAccess::Write,
+                data, ("StaticMesh:" + m_modelPath + ":" + name + "Staging").c_str());
+            if (!*staging)
+                buffer.reset();
+        }
+        return buffer;
+    };
+    if (!m_shadowLodIndices.empty())
+        m_shadowLodIndexBuffer = makeShadowLodBuffer(m_shadowLodIndices.data(),
+            sizeof(std::uint32_t) * m_shadowLodIndices.size(), ixrhi::IXRHIBufferUsage::Index,
+            deferred ? &m_pendingUploads->shadowLodIndexStaging : nullptr, "ShadowLodIB");
+    if (m_shadowLodIndexBuffer && !m_shadowCardVertices.empty())
+        m_shadowCardVertexBuffer = makeShadowLodBuffer(m_shadowCardVertices.data(),
+            sizeof(Vertex) * m_shadowCardVertices.size(), ixrhi::IXRHIBufferUsage::Vertex,
+            deferred ? &m_pendingUploads->shadowCardVertexStaging : nullptr, "ShadowCardVB");
     for (uint32_t frame = 0; frame < kFramesInFlight; ++frame)
     {
         m_instanceBufferCapacity[frame] = kInitialInstanceCapacity;
@@ -2558,6 +2789,19 @@ void StaticMeshRenderer::RecordPendingUploads(ixrhi::IXRHICommandList& cmd, cons
     {
         cmd.CopyBuffer(*uploads.indexStaging, *m_indexBuffer, uploads.indexStaging->SizeBytes());
         cmd.TransitionBuffer(*m_indexBuffer, ixrhi::IXRHIBufferState::TransferDst, ixrhi::IXRHIBufferState::IndexRead);
+    }
+    if (uploads.shadowLodIndexStaging && m_shadowLodIndexBuffer)
+    {
+        cmd.CopyBuffer(*uploads.shadowLodIndexStaging, *m_shadowLodIndexBuffer, uploads.shadowLodIndexStaging->SizeBytes());
+        cmd.TransitionBuffer(*m_shadowLodIndexBuffer, ixrhi::IXRHIBufferState::TransferDst,
+            ixrhi::IXRHIBufferState::IndexRead);
+    }
+    if (uploads.shadowCardVertexStaging && m_shadowCardVertexBuffer)
+    {
+        cmd.CopyBuffer(*uploads.shadowCardVertexStaging, *m_shadowCardVertexBuffer,
+            uploads.shadowCardVertexStaging->SizeBytes());
+        cmd.TransitionBuffer(*m_shadowCardVertexBuffer, ixrhi::IXRHIBufferState::TransferDst,
+            ixrhi::IXRHIBufferState::VertexRead);
     }
     const std::array<Texture*, 3> textures = {&m_texture, &m_normalTexture, &m_ormTexture};
     for (std::size_t i = 0; i < textures.size(); ++i)
@@ -3752,11 +3996,34 @@ bool StaticMeshRenderer::CreateShadowPipelines(ixrhi::IXRHIDevice& rhi, const ix
     return m_shadowPipeline && m_shadowMaskPipeline;
 }
 
+namespace
+{
+// IX_SHADOW_LOD=0: every caster draws its own triangles into every cascade (for comparing).
+bool ShadowLodsEnabled()
+{
+    std::string value;
+#if defined(_WIN32)
+    char* text = nullptr;
+    std::size_t length = 0;
+    if (_dupenv_s(&text, &length, "IX_SHADOW_LOD") == 0 && text)
+    {
+        value = text;
+        std::free(text);
+    }
+#else
+    if (const char* text = std::getenv("IX_SHADOW_LOD"))
+        value = text;
+#endif
+    return value != "0";
+}
+} // namespace
+
 void StaticMeshRenderer::RenderShadowCasters(ixrhi::IXRHICommandList& cmd,
     const ixrhi::IXRHIFrameInfo& frame,
     const WorldMat4& lightViewProj,
     const InstanceList& instances,
-    const ixrhi::IXRHIRenderPass* shadowPass)
+    const ixrhi::IXRHIRenderPass* shadowPass,
+    float shadowTexelMeters)
 {
     if (!m_rhi || m_bindPages.empty() || !m_vertexBuffer || !m_indexBuffer || m_indices.empty() || m_draws.empty() ||
         instances.empty() || !shadowPass || !frame.frameActive || !m_boundSunShadowTexture || !UploadsRecorded())
@@ -3788,9 +4055,27 @@ void StaticMeshRenderer::RenderShadowCasters(ixrhi::IXRHICommandList& cmd,
     const std::optional<std::uint32_t> base = AppendInstanceBlocks(frameIndex, blocks);
     if (!base)
         return;
+    // Each instance's shadow detail level here: how many of them stay within half a texel at its
+    // scale (0: its own triangles; the last: its leaf cards thinned too).
+    static const bool lodsEnabled = ShadowLodsEnabled();
+    std::vector<std::uint8_t> levels(instances.size(), 0);
+    if (lodsEnabled && m_shadowLodIndexBuffer && shadowTexelMeters > 0.0f)
+    {
+        const float allowed = 0.5f * shadowTexelMeters;
+        for (std::size_t i = 0; i < instances.size(); ++i)
+        {
+            const float* scale = instances[i]->scale;
+            const float largest = std::max({std::abs(scale[0]), std::abs(scale[1]), std::abs(scale[2])});
+            std::uint8_t level = 0;
+            while (level < kShadowLodLevels && kShadowLodErrors[level] * largest <= allowed)
+                ++level;
+            levels[i] = level;
+        }
+    }
 
-    cmd.SetVertexBuffer(0, *m_vertexBuffer, 0);
-    cmd.SetIndexBuffer(*m_indexBuffer, 0, /*thirtyTwoBit=*/true);
+    const ixrhi::IXRHIBuffer* boundVertexBuffer = nullptr;
+    const ixrhi::IXRHIBuffer* boundIndexBuffer = nullptr;
+    const auto thinCards = [&](std::uint32_t i) { return levels[i] == kShadowLodLevels; };
     // Opaque runs need no textures: one set of its own this frame (instances + shadow map bound),
     // taken by the first of them.
     std::optional<BindSlot> opaqueSlot;
@@ -3816,12 +4101,14 @@ void StaticMeshRenderer::RenderShadowCasters(ixrhi::IXRHICommandList& cmd,
             {
                 const std::string_view material = materialKey(*instances[runStart], draw.materialSlot);
                 while (runEnd < instanceCount && blocks[drawBase - *base + runEnd].materialAlpha[0] >= 1.0f &&
-                       materialKey(*instances[runEnd], draw.materialSlot) == material)
+                       materialKey(*instances[runEnd], draw.materialSlot) == material &&
+                       thinCards(runEnd) == thinCards(runStart))
                     ++runEnd;
             }
             else
             {
-                while (runEnd < instanceCount && blocks[drawBase - *base + runEnd].materialAlpha[0] < 1.0f)
+                while (runEnd < instanceCount && blocks[drawBase - *base + runEnd].materialAlpha[0] < 1.0f &&
+                       levels[runEnd] == levels[runStart])
                     ++runEnd;
             }
             std::optional<BindSlot> slot;
@@ -3847,7 +4134,35 @@ void StaticMeshRenderer::RenderShadowCasters(ixrhi::IXRHICommandList& cmd,
                 boundPipeline = pipeline;
             }
             cmd.BindGroup(0, *slot->page->group, slot->set);
-            cmd.DrawIndexed(draw.indexCount, runEnd - runStart, draw.firstIndex, 0, drawBase + runStart);
+            // Opaque runs at their detail level; masked ones as they are, or as thinned cards.
+            const MeshDraw* lod = nullptr;
+            bool cards = false;
+            if (masked)
+            {
+                cards = thinCards(runStart) && m_shadowCardVertexBuffer && !m_shadowCardDraws.empty() &&
+                    m_shadowCardDraws[drawIndex].indexCount != 0;
+                if (cards)
+                    lod = &m_shadowCardDraws[drawIndex];
+            }
+            else if (levels[runStart] > 0 && !m_shadowLodDraws[levels[runStart] - 1u].empty() &&
+                     m_shadowLodDraws[levels[runStart] - 1u][drawIndex].indexCount != 0)
+            {
+                lod = &m_shadowLodDraws[levels[runStart] - 1u][drawIndex];
+            }
+            const ixrhi::IXRHIBuffer* vertexBuffer = cards ? m_shadowCardVertexBuffer.get() : m_vertexBuffer.get();
+            if (boundVertexBuffer != vertexBuffer)
+            {
+                cmd.SetVertexBuffer(0, *vertexBuffer, 0);
+                boundVertexBuffer = vertexBuffer;
+            }
+            const ixrhi::IXRHIBuffer* indexBuffer = lod ? m_shadowLodIndexBuffer.get() : m_indexBuffer.get();
+            if (boundIndexBuffer != indexBuffer)
+            {
+                cmd.SetIndexBuffer(*indexBuffer, 0, /*thirtyTwoBit=*/true);
+                boundIndexBuffer = indexBuffer;
+            }
+            const MeshDraw& drawn = lod ? *lod : draw;
+            cmd.DrawIndexed(drawn.indexCount, runEnd - runStart, drawn.firstIndex, 0, drawBase + runStart);
             runStart = runEnd;
         }
     }
@@ -3883,6 +4198,8 @@ void StaticMeshRenderer::Destroy()
     m_pendingUploads.reset();
     m_vertexBuffer.reset();
     m_indexBuffer.reset();
+    m_shadowLodIndexBuffer.reset();
+    m_shadowCardVertexBuffer.reset();
     m_lodBuffers.clear();
     // Dropping in-flight uploads waits for their fences and releases staging
     // (parity with the old fence-wait in Destroy).

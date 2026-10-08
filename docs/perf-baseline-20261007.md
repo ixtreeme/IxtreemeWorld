@@ -468,6 +468,64 @@ szálon dekódolták a képfájlt, és szinkron töltötték fel.
 A betöltött modell (új anyagokkal) spawnjának ablakában a legnagyobb frame 8,8 ms, a jelenet szokásos szintje. A fák
 textúrázva rajzolódnak, a szinkronizációs validáció 0 hibát jelzett.
 
+## Árnyék-LOD – 2026-10-08
+
+A távoli kaszkádok texele nagy: az 50 m-ig tartóé 4,9 cm, a 200 m-ig tartóé 19,6 cm. Ott a modell minden háromszöge fölösleges.
+
+A modell betöltésekor, a betöltő szálon készülnek az árnyék részletességi szintjei (`BuildShadowLods`):
+
+- **Opak részhálók:** a varratoknál összevarrva (a mélységpass csak pozíciót olvas), meshoptimizerrel egyszerűsítve.
+  - 3 szint, 5 / 16 / 64 mm hibán belül (modellegységben), mindegyik az előzőből.
+  - Egy szint csak akkor marad meg, ha legalább negyedét leveszi az előzőnek; különben az előző szint ismétlődik.
+- **Maszkolt levélkártyák:** egy maszkolt részháló, amely sok kis különálló darabból áll (legalább 64 darab,
+  darabonként legfeljebb 16 háromszög), csak a legdurvább szinten egyszerűsödik. Ilyenkor:
+  - a darabok negyede rajzolódik;
+  - mindegyik a középpontja körül nagyobb lesz, hogy a kimaradtak területének 70%-át fedje
+    (`kShadowCardCover`). A nagy kártyák kevésbé fedik egymást, mint a sok kicsi, ezért kell a 70%.
+  - Ellenőrzés közelre kényszerítve: 100%-os fedéssel a talaj átlagfényessége 7%-kal sötétebb lett, 70%-kal az
+    alsó képfél átlaga egyezik (343,4 mindkettőn).
+- **Szintválasztás példányonként:** a kaszkád a legdurvább olyan szintet rajzolja, amelynek hibája a példány
+  legnagyobb skálájával szorozva a texel felén belül marad. 1,5-ös skáláig az 50 m-es kaszkád a 2. szintet, a 200 m-es
+  kaszkád a 3. szintet és a ritkított kártyákat rajzolja.
+- **GPU-adat:** a szintek saját index-bufferbe kerülnek, a kártyák saját vertex-bufferbe. A halasztott feltöltéssel
+  együtt másolódnak be.
+- **Kikapcsolás:** `IX_SHADOW_LOD=0`, összehasonlításhoz.
+
+A fa (`ujfa.glb`) szintjei:
+
+| Rész | Eredeti | 1. szint | 2. szint | 3. szint |
+| --- | --- | --- | --- | --- |
+| kéreg | 4456 háromszög | 4456 | 1187 | 181 |
+| levelek | 2016 háromszög | 2016 | 2016 | 504 |
+
+A szintek elkészítése 3,4 ms a betöltő szálon.
+
+Mérés: buildelt játék, a statikus réteg minden kaszkádban minden frame-ben egészben újrarajzolva (ideiglenes
+mérőkapcsolóval, amely nem került be a kódba):
+
+| Jelenet | LOD nélkül | LOD-dal |
+| --- | --- | --- |
+| alap terhelt: árnyék GPU | 21,8–23,5 ms (34 FPS) | 17,5–19,0 ms (41 FPS) |
+| alap terhelt: 200 m-es kaszkád | 5,7–6,8 ms | 1,2–1,8 ms |
+| alap terhelt: 50 m-es kaszkád | 3,7 ms | 3,4 ms |
+| erős nap: árnyék GPU | 11,3–13,7 ms (53 FPS) | 7,4–8,0 ms (70 FPS) |
+| erős nap: 200 m-es kaszkád | 5,1–5,7 ms | 1,1 ms |
+
+Állóképben nincs különbség (128–131 FPS mindkét módban), mert a statikus réteg ott a cache-ből jön. A nyereség a
+teljes újrarajzoláskor (mélységlépés, terepváltozás), a sávok és régiók újrarajzolásakor és a mozgó árnyékvetőknél
+jelentkezik.
+
+Ellenőrzés:
+
+- **Képi:** a távoli domboldal árnyékai LOD-dal és nélküle azonosak (átlagos eltérés 3,5 a 765-ös skálán, főleg a
+  mozgó karakterek és a részecskék miatt).
+- **Validáció:** a szinkronizációs validáció 0 hibát jelzett az alap jeleneten és a játék közbeni fa-spawnnál
+  (halasztott LOD-feltöltés).
+- **Editor:** a Scene nézet és a Play rendben rajzol. A ctest 5/5.
+
+Ami maradt: az első két kaszkád (5 m és 15 m) teljes újrarajzolása 6,5 ms és 5 ms. Ezt a maszkolt levelek kitöltése
+viszi (közelről nagy a fedett terület), nem a háromszögszám, ezért itt a LOD nem segít.
+
 ## Következmény a párhuzamosítási tervre
 
 - A legnagyobb nyereség a **render-adatok kinyerésének** átalakítása (a terv 3. lépése). Kell hozzá

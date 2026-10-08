@@ -176,12 +176,15 @@ public:
     // every draw) and each frame (cascades follow the camera).
     void SetSunShadow(const SunShadowReceive& shadow);
     // These instances into one sun shadow cascade, depth only (alpha-masked materials keep their
-    // cut-outs). Call inside the cascade's render pass (viewport set by its owner).
+    // cut-outs). Call inside the cascade's render pass (viewport set by its owner). shadowTexelMeters:
+    // the cascade's texel size; each instance is drawn at the coarsest shadow detail level that stays
+    // within half a texel at its scale (BuildShadowLods; 0: the model's own triangles).
     void RenderShadowCasters(ixrhi::IXRHICommandList& cmd,
         const ixrhi::IXRHIFrameInfo& frame,
         const WorldMat4& lightViewProj,
         const InstanceList& instances,
-        const ixrhi::IXRHIRenderPass* shadowPass);
+        const ixrhi::IXRHIRenderPass* shadowPass,
+        float shadowTexelMeters = 0.0f);
     void RenderInWorld(ixrhi::IXRHICommandList& cmd,
         const ixrhi::IXRHIFrameInfo& frame,
         double timeSeconds,
@@ -398,6 +401,18 @@ private:
     void WriteLodCpuCache(const LodCpuSet& set) const;
     std::filesystem::path LodCachePath(const std::string& modelPath, std::uint64_t configHash) const;
     void DecodeTextures(const std::string& modelPath);  // into m_decodedTextures (LoadCpu)
+    // Sun shadow detail levels (LoadCpu): each opaque submesh welded across its uv and normal seams
+    // (a depth pass reads positions only) and simplified to within kShadowLodErrors[level] of its
+    // surface, in model units, each level from the one before. A level that takes off less than a
+    // quarter of the one before is that one again. An alpha-masked submesh of many small separate
+    // pieces (leaf cards) has the coarsest level only: kShadowCardKeep of the pieces, each grown
+    // about its centre to cover kShadowCardCover of the area of those left out (the shadow's
+    // density then matches the full crown's: the grown pieces overlap each other less).
+    static constexpr std::size_t kShadowLodLevels = 3;
+    static constexpr std::array<float, kShadowLodLevels> kShadowLodErrors = {0.005f, 0.016f, 0.064f};
+    static constexpr float kShadowCardKeep = 0.25f;
+    static constexpr float kShadowCardCover = 0.7f;
+    void BuildShadowLods();
     bool UploadDecodedTextures(ixrhi::IXRHIDevice& rhi);
     // staging: when given, the texture is made empty and its texels go there (a deferred upload).
     bool UploadTexture(ixrhi::IXRHIDevice& rhi, const RgbaImage& source, Texture& texture,
@@ -407,6 +422,8 @@ private:
     {
         std::shared_ptr<ixrhi::IXRHIBuffer> vertexStaging;
         std::shared_ptr<ixrhi::IXRHIBuffer> indexStaging;
+        std::shared_ptr<ixrhi::IXRHIBuffer> shadowLodIndexStaging;
+        std::shared_ptr<ixrhi::IXRHIBuffer> shadowCardVertexStaging;
         std::array<std::shared_ptr<ixrhi::IXRHIBuffer>, 3> textureStaging{};  // diffuse, normal, orm
         std::uint64_t recordedFrame = std::numeric_limits<std::uint64_t>::max();
     };
@@ -487,6 +504,15 @@ private:
     std::unique_ptr<PendingUploads> m_pendingUploads;
     bool m_deferUploads = false;  // FinishGpu's, for CreateBuffers and UploadDecodedTextures
     std::shared_ptr<ixrhi::IXRHIBuffer> m_indexBuffer;
+    // The shadow detail levels' indices, and per level and draw its span in them (indexCount 0: the
+    // draw's own indices; none for a model too small or without opaque submeshes). The leaf cards'
+    // spans in them index their own vertices. Neither kind for a model with nothing to take off.
+    std::vector<std::uint32_t> m_shadowLodIndices;
+    std::array<std::vector<MeshDraw>, kShadowLodLevels> m_shadowLodDraws;
+    std::vector<Vertex> m_shadowCardVertices;
+    std::vector<MeshDraw> m_shadowCardDraws;
+    std::shared_ptr<ixrhi::IXRHIBuffer> m_shadowLodIndexBuffer;
+    std::shared_ptr<ixrhi::IXRHIBuffer> m_shadowCardVertexBuffer;
     // Grown when a frame appends more records than it holds. The records a frame wrote before stay
     // in the old buffer, which the sets bound to it keep alive.
     std::array<std::shared_ptr<ixrhi::IXRHIBuffer>, kFramesInFlight> m_instanceBuffers{};

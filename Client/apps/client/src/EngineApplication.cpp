@@ -12794,10 +12794,12 @@ int RunGame(NativeWindow& window,
                 StaticMeshRenderer::InstanceList cascadeInstances;
                 std::vector<SkinnedMeshRenderer::ShadowCasterInstance> skinnedCascadeInstances;
                 std::vector<SkinnedMeshRenderer*> skinnedCascadeRenderers;
-                // (filterViewProj picks the casters drawn: those over its clip square.)
-                const auto drawMeshBatches = [&](const std::vector<ShadowCasterBatch>& batches,
+                // (filterViewProj picks the casters drawn: those over its clip square. The cascade's texel
+                // size picks each one's shadow detail level.)
+                const auto drawMeshBatches = [&](const std::vector<ShadowCasterBatch>& batches, std::uint32_t cascade,
                                                  const WorldMat4& lightViewProj, const WorldMat4& filterViewProj,
                                                  const ixrhi::IXRHIRenderPass* pass) {
+                    const float texelMeters = terrain.SunShadowCascadeTexelSize(cascade);
                     for (const ShadowCasterBatch& batch : batches)
                     {
                         cascadeInstances.clear();
@@ -12808,18 +12810,19 @@ int RunGame(NativeWindow& window,
                         }
                         if (!cascadeInstances.empty())
                             batch.renderer->RenderShadowCasters(*frameInfo.commandList, frameInfo, lightViewProj,
-                                cascadeInstances, pass);
+                                cascadeInstances, pass, texelMeters);
                     }
                 };
                 shadowCasters.drawStatic =
-                    [&](std::uint32_t, const WorldMat4& lightViewProj, const ixrhi::IXRHIRenderPass* pass) {
-                        drawMeshBatches(settledShadowCasterBatches, lightViewProj, lightViewProj, pass);
+                    [&](std::uint32_t cascade, const WorldMat4& lightViewProj, const ixrhi::IXRHIRenderPass* pass) {
+                        drawMeshBatches(settledShadowCasterBatches, cascade, lightViewProj, lightViewProj, pass);
                     };
                 shadowCasters.staticDeltaFrom = staticShadowDeltaFrom;
                 shadowCasters.staticJoined = static_cast<std::uint32_t>(staticShadowJoined.size());
                 shadowCasters.staticLeft = &staticShadowLeft;
                 shadowCasters.drawStaticJoined =
-                    [&](std::uint32_t, const WorldMat4& lightViewProj, const ixrhi::IXRHIRenderPass* pass) {
+                    [&](std::uint32_t cascade, const WorldMat4& lightViewProj, const ixrhi::IXRHIRenderPass* pass) {
+                        const float texelMeters = terrain.SunShadowCascadeTexelSize(cascade);
                         for (std::size_t first = 0; first < staticShadowJoined.size();)
                         {
                             StaticMeshRenderer* renderer = staticShadowJoined[first]->renderer;
@@ -12832,7 +12835,7 @@ int RunGame(NativeWindow& window,
                             }
                             if (!cascadeInstances.empty())
                                 renderer->RenderShadowCasters(*frameInfo.commandList, frameInfo, lightViewProj,
-                                    cascadeInstances, pass);
+                                    cascadeInstances, pass, texelMeters);
                             first = end;
                         }
                     };
@@ -12879,6 +12882,7 @@ int RunGame(NativeWindow& window,
                         else
                             computeRects(0, count, 0);
                     }
+                    const float texelMeters = terrain.SunShadowCascadeTexelSize(cascade);
                     std::size_t index = 0;
                     for (const ShadowCasterBatch& batch : settledShadowCasterBatches)
                     {
@@ -12892,12 +12896,12 @@ int RunGame(NativeWindow& window,
                         }
                         if (!cascadeInstances.empty())
                             batch.renderer->RenderShadowCasters(*frameInfo.commandList, frameInfo, lightViewProj,
-                                cascadeInstances, pass);
+                                cascadeInstances, pass, texelMeters);
                     }
                 };
                 shadowCasters.drawDynamic =
                     [&](std::uint32_t cascade, const WorldMat4& lightViewProj, const ixrhi::IXRHIRenderPass* pass) {
-                        drawMeshBatches(movingShadowCasterBatches, lightViewProj, lightViewProj, pass);
+                        drawMeshBatches(movingShadowCasterBatches, cascade, lightViewProj, lightViewProj, pass);
                         // The characters by model: the pipeline and index buffer set once per model.
                         skinnedCascadeRenderers.clear();
                         for (const SkinnedDrawRecord* record : skinnedShadowCasters)
