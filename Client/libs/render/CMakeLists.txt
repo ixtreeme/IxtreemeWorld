@@ -94,6 +94,7 @@ target_link_libraries(IXEngineRender
         IXEnginePlatform
         IXEngineAsset
         IXEngineCommon
+        IXEngineJobs
         IXEngineMath
         IXEnginePhysics
         IXEngineAudio

@@ -163,6 +163,7 @@ add_subdirectory(libs/math)
 add_subdirectory(${CLIENT_LIBS_DIR}/ixtreemetree)
 add_subdirectory(libs/common)
 add_subdirectory(libs/debug)
+add_subdirectory(libs/jobs)
 add_subdirectory(${CMAKE_CURRENT_SOURCE_DIR}/../shared/map shared_map_build)
 
 find_package(fastgltf CONFIG REQUIRED)

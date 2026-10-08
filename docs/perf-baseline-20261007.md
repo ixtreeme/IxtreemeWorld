@@ -111,6 +111,31 @@ Mi változott:
 - **Editor-hierarchia.** A szülő→gyerek és id→elem index egyszer épül fel. A hierarchia-panel eddig O(N²) volt:
   10 000 entitásnál az editor ~5 FPS-ről ~40 FPS-re javult. A maradék fő tétele a frame-enkénti hierarchia-újraépítés.
 
+## Job-rendszer (1. lépés) – 2026-10-08
+
+`libs/jobs` (`IXEngineJobs`): egyetlen közös worker pool az editorban és a buildelt játékban is. Alapból
+hardverszál − 1 worker (legfeljebb 31). `IX_JOBS=0`: minden a hívó szálon fut, ugyanazon a hívási úton.
+`IX_JOBS_WORKERS=<n>`: a workerek száma. `IX_PARALLEL_CULL=0`: csak a render-előkészítés megy sorosan.
+
+- Fork-join modell: a feladat függvénypointer és adat (nincs allokáció), egy `Counter` számolja a csoportot,
+  és a váró szál maga is futtat feladatokat (egymásba ágyazott várakozás is működik). A `ParallelFor`
+  chunk-indexet ad, így a chunkonkénti kimenetek soros és párhuzamos módban is ugyanabban a sorrendben fésülődnek.
+- A Jolt is ezt a poolt használja (`EngineJoltJobSystem`, `JobSystemWithBarrier` alapon), nem a saját,
+  hardverszál − 1 méretű poolját.
+- Párhuzamos lett: a render-rekordok ellenőrzése, a Scene nézet jelöltjeinek osztályozása (entitás, rekord,
+  frustum), valamint a nagy batch-ek példányblokkjainak kitöltése (a fő nézetben és az árnyékban is).
+
+Terhelt jelenet, 15 worker (16 szálas CPU), a CPU tényleges munkája (frame − GPU-várakozás):
+
+| Mód | CPU-munka | rekordok | render |
+| --- | --- | --- | --- |
+| `IX_JOBS=0` | 5,45 ms | 1,11 ms | 2,91 ms |
+| párhuzamos | **3,78 ms** | 0,29 ms | 2,07 ms |
+
+Az FPS (137) nem változott, mert a jelenet GPU-korlátos. A nyereség CPU-tartalék. 1000 leeső dinamikus
+dobozzal a fizika 0,70–0,93 ms helyett 0,58–0,63 ms; az editorban 4 Play/Stop ciklus hibátlanul lefutott.
+A Vulkan-validáció tiszta.
+
 ## Következmény a párhuzamosítási tervre
 
 - A legnagyobb nyereség a **render-adatok kinyerésének** átalakítása (a terv 3. lépése). Kell hozzá

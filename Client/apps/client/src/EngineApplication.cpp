@@ -15,6 +15,7 @@
 #include "ParticleRenderer.h"
 #include "ParticleSimulator.h"
 #include "AssetWatcher.h"
+#include "JobSystem.h"
 #include "LODSystem.h"
 #include "MaterialAssetManager.h"
 #include "MeshSystem.h"
@@ -518,6 +519,7 @@ struct FrameCpuProfile
     double scriptsMs = 0.0;      //   of which scripts (OnUpdate, collisions, deferred ops)
     double particlesMs = 0.0;    // CPU particle emitters (Play and Edit)
     double animationMs = 0.0;    // skinning pre-pass: animators, clip sampling, palettes, dispatches
+    double renderRecordsMs = 0.0;  // of which: the mesh render records checked (and rebuilt)
     double shadowPassMs = 0.0;   // sun shadow casters gathered and recorded
     std::uint32_t skinnedInstances = 0;  // character instances skinned this frame (all views)
 };
@@ -3007,8 +3009,8 @@ int RunGame(NativeWindow& window,
     std::vector<ShadowCasterBatch> settledShadowCasterBatches;
     std::vector<ShadowCasterBatch> movingShadowCasterBatches;
     constexpr std::uint64_t kShadowSettleFrames = 30;
-    // recheck: compare everything now (the entity was just changed by the caller).
-    auto staticMeshRenderRecord = [&](const MeshSceneEntity& mesh, bool recheck = false) -> StaticMeshRenderRecord& {
+    // The entity's record, given a slot of its own first if it has none (or holds another's).
+    auto staticMeshRenderRecordSlot = [&](const MeshSceneEntity& mesh) -> StaticMeshRenderRecord& {
         std::uint32_t slot = mesh.renderRecordSlot;
         if (slot >= staticMeshRenderRecords.size() || !staticMeshRenderRecords[slot].inUse ||
             staticMeshRenderRecords[slot].entityId != mesh.id)
@@ -3028,17 +3030,17 @@ int RunGame(NativeWindow& window,
             staticMeshRenderRecords[slot].entityId = mesh.id;
             mesh.renderRecordSlot = slot;
         }
-        StaticMeshRenderRecord& record = staticMeshRenderRecords[slot];
-        if (record.validatedFrame == renderRecordFrame && !recheck)
-            return record;
-        // The transform every frame; the model path and the materials (string compares, ~10 000
-        // entities) every 4th frame per entity, staggered, or at once when asked to (an edit shows
-        // up to 3 frames late otherwise).
+        return staticMeshRenderRecords[slot];
+    };
+    // Whether the record still shows the entity. The transform every frame; the model path and the
+    // materials (string compares, ~10 000 entities) every 4th frame per entity, staggered, or at once
+    // when asked to (an edit shows up to 3 frames late otherwise). Reads only: safe in parallel.
+    auto staticMeshRenderRecordMatches = [&](const StaticMeshRenderRecord& record, const MeshSceneEntity& mesh,
+                                             bool recheck) {
         const bool checkAssets = recheck || record.validatedFrame == std::numeric_limits<std::uint64_t>::max() ||
             ((mesh.id + renderRecordFrame) & 3u) == 0u;
-        record.validatedFrame = renderRecordFrame;
-        StaticMeshRenderer::Instance& instance = record.instance;
-        const bool unchanged = record.meshCachesGeneration == meshCachesGeneration &&
+        const StaticMeshRenderer::Instance& instance = record.instance;
+        return record.meshCachesGeneration == meshCachesGeneration &&
             record.skinned == mesh.skinned &&
             instance.entityId == mesh.id &&
             instance.position.x == mesh.position[0] && instance.position.y == mesh.position[1] &&
@@ -3049,6 +3051,15 @@ int RunGame(NativeWindow& window,
                 (record.meshAssetPath == mesh.meshAssetPath &&
                     instance.materialSlots == mesh.materialSlots &&
                     instance.materialOverrides == mesh.materialOverrides));
+    };
+    // recheck: compare everything now (the entity was just changed by the caller).
+    auto staticMeshRenderRecord = [&](const MeshSceneEntity& mesh, bool recheck = false) -> StaticMeshRenderRecord& {
+        StaticMeshRenderRecord& record = staticMeshRenderRecordSlot(mesh);
+        if (record.validatedFrame == renderRecordFrame && !recheck)
+            return record;
+        const bool unchanged = staticMeshRenderRecordMatches(record, mesh, recheck);
+        record.validatedFrame = renderRecordFrame;
+        StaticMeshRenderer::Instance& instance = record.instance;
         if (unchanged)
         {
             if (record.renderer && record.prepared.materialRevision != MaterialAssetManager::Instance().Revision())
@@ -3397,6 +3408,54 @@ int RunGame(NativeWindow& window,
             return nullptr;
         MeshSceneEntity& mesh = editorMeshEntities[lookupIt->second];
         return mesh.id == id ? &mesh : nullptr;
+    };
+    // Every mesh entity's record checked for the frame, up front: the checks in parallel (each marks
+    // only its own record checked), then the changed records rebuilt here in entity order (building
+    // one resolves paths and loads models: this thread's work). IX_PARALLEL_CULL=0 checks serially.
+    std::vector<std::vector<std::uint32_t>> changedRenderRecordChunks;
+    auto validateStaticMeshRenderRecords = [&]() {
+        const std::uint32_t count = static_cast<std::uint32_t>(editorMeshEntities.size());
+        constexpr std::uint32_t kGrain = 512;
+        ixjobs::JobSystem& jobs = ixjobs::JobSystem::Instance();
+        static const bool parallel = ixjobs::FeatureEnabled("IX_PARALLEL_CULL");
+        const std::uint32_t chunks = ixjobs::JobSystem::ChunkCount(count, kGrain);
+        if (changedRenderRecordChunks.size() < chunks)
+            changedRenderRecordChunks.resize(chunks);
+        for (std::vector<std::uint32_t>& changed : changedRenderRecordChunks)
+            changed.clear();
+        const std::uint64_t materialRevision = MaterialAssetManager::Instance().Revision();
+        const auto check = [&](std::uint32_t begin, std::uint32_t end, std::uint32_t chunk) {
+            for (std::uint32_t i = begin; i < end; ++i)
+            {
+                const MeshSceneEntity& mesh = editorMeshEntities[i];
+                // No record of its own yet: one is given (a write) on this thread below.
+                const std::uint32_t slot = mesh.renderRecordSlot;
+                if (slot >= staticMeshRenderRecords.size() || !staticMeshRenderRecords[slot].inUse ||
+                    staticMeshRenderRecords[slot].entityId != mesh.id)
+                {
+                    changedRenderRecordChunks[chunk].push_back(i);
+                    continue;
+                }
+                StaticMeshRenderRecord& record = staticMeshRenderRecords[slot];
+                if (record.validatedFrame == renderRecordFrame)
+                    continue;
+                if (staticMeshRenderRecordMatches(record, mesh, false) &&
+                    (!record.renderer || record.prepared.materialRevision == materialRevision))
+                    record.validatedFrame = renderRecordFrame;
+                else
+                    changedRenderRecordChunks[chunk].push_back(i);
+            }
+        };
+        if (parallel)
+            jobs.ParallelFor(count, kGrain, check);
+        else
+            for (std::uint32_t chunk = 0; chunk < chunks; ++chunk)
+                check(chunk * kGrain, std::min(count, (chunk + 1u) * kGrain), chunk);
+        for (std::uint32_t chunk = 0; chunk < chunks; ++chunk)
+        {
+            for (std::uint32_t index : changedRenderRecordChunks[chunk])
+                staticMeshRenderRecord(editorMeshEntities[index]);
+        }
     };
     // Shared sim/render/physics helpers (mesh spatial sync, script-spawn, physics world build/step) —
     // the standalone runtime's per-frame sim calls these; everything they touch is unguarded state.
@@ -5500,6 +5559,11 @@ int RunGame(NativeWindow& window,
     bool debugShowPhysicsBodyCenters = false;
     bool dumpFrameProfileRequested = false;
     bool loggedParticleSoftDepth = false;
+    {
+        const ixjobs::JobSystem& jobs = ixjobs::JobSystem::Instance();
+        Tracenf("[JOBS] shared worker pool: %u workers%s (IX_JOBS, IX_JOBS_WORKERS)", jobs.WorkerCount(),
+            jobs.Parallel() ? "" : ", serial");
+    }
     PerfLogState perfLog;
     perfLog.intervalSeconds = PerfLogIntervalFromEnvironment();
     if (perfLog.intervalSeconds > 0.0)
@@ -11567,6 +11631,9 @@ int RunGame(NativeWindow& window,
                         ? static_cast<float>(std::clamp(seconds - animPrevFrameSeconds, 0.0, 0.25))
                         : 0.0f;
                     animPrevFrameSeconds = seconds;
+                    const auto renderRecordsBegin = std::chrono::steady_clock::now();
+                    validateStaticMeshRenderRecords();
+                    frameProfile.renderRecordsMs = MillisecondsBetween(renderRecordsBegin, std::chrono::steady_clock::now());
                     for (MeshSceneEntity& skinnedEntity : editorMeshEntities)
                     {
                         if (editorPlay.state.mode == EditorPlayMode::Edit && skinnedEntity.editorHidden)
@@ -12538,19 +12605,63 @@ int RunGame(NativeWindow& window,
                     // The lighting is per renderer, not per entity: several entities usually share
                     // one renderer, so apply it once per renderer per frame (it is a large struct).
                     std::unordered_set<StaticMeshRenderer*> litStaticRenderers;
-                    for (std::uint32_t meshId : spatialCandidates)
+                    // Each candidate's entity, record and frustum test, worked out in parallel up front
+                    // (IX_PARALLEL_CULL): each writes only its own entry, read in order below. The
+                    // records were all checked this frame already (validateStaticMeshRenderRecords).
+                    enum class ViewCandidateState : std::uint8_t { Skip, Culled, Visible, Serial };
+                    struct ViewCandidate
                     {
-                        MeshSceneEntity* meshPtr = findMeshEntityById(meshId);
-                        if (!meshPtr)
+                        MeshSceneEntity* mesh = nullptr;
+                        const StaticMeshRenderRecord* record = nullptr;
+                        ViewCandidateState state = ViewCandidateState::Skip;
+                    };
+                    std::vector<ViewCandidate> viewCandidates(spatialCandidates.size());
+                    {
+                        const bool hideEditorHidden = editorPlay.state.mode == EditorPlayMode::Edit;
+                        const auto classify = [&](std::uint32_t begin, std::uint32_t end, std::uint32_t) {
+                            for (std::uint32_t i = begin; i < end; ++i)
+                            {
+                                ViewCandidate& candidate = viewCandidates[i];
+                                MeshSceneEntity* candidateMesh = findMeshEntityById(spatialCandidates[i]);
+                                // Skinned mesh entities are handled in the dedicated skinned pass above
+                                // (they are not tracked in the static spatial index), so skip them here.
+                                if (!candidateMesh || (hideEditorHidden && candidateMesh->editorHidden) ||
+                                    candidateMesh->skinned)
+                                    continue;
+                                candidate.mesh = candidateMesh;
+                                const std::uint32_t slot = candidateMesh->renderRecordSlot;
+                                const StaticMeshRenderRecord* record = slot < staticMeshRenderRecords.size()
+                                    ? &staticMeshRenderRecords[slot]
+                                    : nullptr;
+                                if (!record || !record->inUse || record->entityId != candidateMesh->id ||
+                                    record->validatedFrame != renderRecordFrame || candidateMesh->materialSlots.empty())
+                                {
+                                    candidate.state = ViewCandidateState::Serial;  // needs writes: below
+                                    continue;
+                                }
+                                candidate.record = record;
+                                if (!record->renderer)
+                                    continue;
+                                candidate.state = xm::Intersects(sceneViewFrustum, record->worldBounds)
+                                    ? ViewCandidateState::Visible
+                                    : ViewCandidateState::Culled;
+                            }
+                        };
+                        static const bool parallelCull = ixjobs::FeatureEnabled("IX_PARALLEL_CULL");
+                        const std::uint32_t candidateCount = static_cast<std::uint32_t>(viewCandidates.size());
+                        if (parallelCull)
+                            ixjobs::JobSystem::Instance().ParallelFor(candidateCount, 512, classify);
+                        else
+                            classify(0, candidateCount, 0);
+                    }
+                    for (const ViewCandidate& candidate : viewCandidates)
+                    {
+                        if (candidate.state == ViewCandidateState::Skip)
                             continue;
+                        MeshSceneEntity* meshPtr = candidate.mesh;
                         const MeshSceneEntity& mesh = *meshPtr;
-                        if (editorPlay.state.mode == EditorPlayMode::Edit && mesh.editorHidden)
-                            continue;
-                        // Skinned mesh entities are handled in the dedicated skinned pass above
-                        // (they are not tracked in the static spatial index), so skip them here.
-                        if (mesh.skinned)
-                            continue;
-                        const StaticMeshRenderRecord* meshRecord = &staticMeshRenderRecord(mesh);
+                        const StaticMeshRenderRecord* meshRecord =
+                            candidate.state == ViewCandidateState::Serial ? &staticMeshRenderRecord(mesh) : candidate.record;
                         const std::string& runtimePath = meshRecord->runtimePath;
                         if (StaticMeshRenderer* renderer = meshRecord->renderer)
                         {
@@ -12565,7 +12676,10 @@ int RunGame(NativeWindow& window,
                                 }
                             }
                             const SpatialIndex::Aabb& worldBounds = meshRecord->worldBounds;
-                            if (!xm::Intersects(sceneViewFrustum, worldBounds))
+                            const bool culled = candidate.state == ViewCandidateState::Serial
+                                ? !xm::Intersects(sceneViewFrustum, worldBounds)
+                                : candidate.state == ViewCandidateState::Culled;
+                            if (culled)
                             {
                                 ++frameStaticMeshFrustumCulled;
                                 if (LodLogsEnabled())
@@ -13623,6 +13737,7 @@ int RunGame(NativeWindow& window,
             sum.scriptsMs += frameProfile.scriptsMs;
             sum.particlesMs += frameProfile.particlesMs;
             sum.animationMs += frameProfile.animationMs;
+            sum.renderRecordsMs += frameProfile.renderRecordsMs;
             sum.sceneRenderMs += frameProfile.sceneRenderMs;
             sum.shadowPassMs += frameProfile.shadowPassMs;
             sum.editorUiRenderMs += frameProfile.editorUiRenderMs;
@@ -13675,11 +13790,12 @@ int RunGame(NativeWindow& window,
                     aliveParticles += simulator.AliveCount();
                 }
                 Tracenf("[PERF] loop %.0f fps, presented %.0f fps | cpu ms: frame %.3f (max %.3f) wait %.3f "
-                        "sim %.3f (physics %.3f scripts %.3f particles %.3f) anim %.3f render %.3f (shadow %.3f) "
+                        "sim %.3f (physics %.3f scripts %.3f particles %.3f) anim %.3f (records %.3f) render %.3f (shadow %.3f) "
                         "ui %.3f submit %.3f | scene: %zu meshes, %.0f skinned, %zu cpu emitters, %zu particles",
                     n / windowSeconds, presented / windowSeconds, sum.totalCpuFrameMs / n, perfLog.maxFrameMs,
                     sum.frameWaitMs / n, sum.simulationMs / n, sum.physicsMs / n, sum.scriptsMs / n,
-                    sum.particlesMs / n, sum.animationMs / n, sum.sceneRenderMs / n, sum.shadowPassMs / n,
+                    sum.particlesMs / n, sum.animationMs / n, sum.renderRecordsMs / n, sum.sceneRenderMs / n,
+                    sum.shadowPassMs / n,
                     sum.editorUiRenderMs / n, sum.submitPresentMs / n, editorMeshEntities.size(),
                     static_cast<double>(perfLog.skinnedSum) / n, entityParticles.size(), aliveParticles);
                 if (perfLog.gpuSamples > 0)
@@ -13885,6 +14001,8 @@ int RunGame(NativeWindow& window,
     // releases frame contexts, swapchain object, query pool and upload pool.
     rhiDevice->Shutdown();
     device.Destroy();
+    // The workers finish and leave before the process tears down what their tasks reach.
+    ixjobs::JobSystem::Instance().Stop();
     return 0;
 }
 }

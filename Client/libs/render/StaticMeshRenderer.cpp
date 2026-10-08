@@ -3,6 +3,7 @@
 #include "AssimpImporter.h"
 #include "Debug.h"
 #include "IXRHIShader.h"
+#include "JobSystem.h"
 #include "MaterialAssetManager.h"
 #include "ProjectManager.h"
 #include "asset/IAssetReader.h"
@@ -3005,9 +3006,13 @@ void StaticMeshRenderer::RenderLodBatchInWorld(ixrhi::IXRHICommandList& cmd,
             command.instanceCount = static_cast<uint32_t>(instances.size());
             command.materialSlot = materialSlot;
             command.sourceSubmesh = sourceSubmesh;
+            const std::size_t first = instanceBlocks.size();
+            instanceBlocks.resize(first + instances.size());
+            FillInstanceBlocks(viewProjection, instances, materialSlot, instanceBlocks.data() + first);
             for (const Instance* instance : instances)
             {
-                FillInstanceBlock(viewProjection, *instance, materialSlot, instanceBlocks.emplace_back());
+                if (instance->materialOverrides.empty())
+                    continue;
                 const bool overrideActive = std::any_of(instance->materialOverrides.begin(),
                     instance->materialOverrides.end(),
                     [&](const MeshSceneEntity::MaterialOverride& material) {
@@ -3391,6 +3396,44 @@ void StaticMeshRenderer::FillInstanceBlock(const WorldMat4& viewProjection,
     FillStaticMeshInstanceBlock(viewProjection, instance, materialSlot, m_materialDefaults, out);
 }
 
+bool StaticMeshRenderer::PreparedUsable(const Instance& instance) const
+{
+    const PreparedInstance* prepared = instance.prepared;
+    return prepared && prepared->renderer == this &&
+        prepared->materialRevision == MaterialAssetManager::Instance().Revision();
+}
+
+void StaticMeshRenderer::FillInstanceBlocks(const WorldMat4& viewProjection,
+    const InstanceList& instances,
+    std::uint32_t materialSlot,
+    InstanceBlock* out) const
+{
+    const std::uint32_t count = static_cast<std::uint32_t>(instances.size());
+    constexpr std::uint32_t kGrain = 1024;
+    static const bool parallel = ixjobs::FeatureEnabled("IX_PARALLEL_CULL");
+    if (!parallel || count < 2u * kGrain)
+    {
+        for (std::uint32_t i = 0; i < count; ++i)
+            FillInstanceBlock(viewProjection, *instances[i], materialSlot, out[i]);
+        return;
+    }
+    std::vector<std::uint8_t> left(count, 0);  // 1: not prepared, filled below
+    ixjobs::JobSystem::Instance().ParallelFor(count, kGrain, [&](std::uint32_t begin, std::uint32_t end, std::uint32_t) {
+        for (std::uint32_t i = begin; i < end; ++i)
+        {
+            if (PreparedUsable(*instances[i]) && materialSlot < instances[i]->prepared->slots.size())
+                FillInstanceBlock(viewProjection, *instances[i], materialSlot, out[i]);
+            else
+                left[i] = 1;
+        }
+    });
+    for (std::uint32_t i = 0; i < count; ++i)
+    {
+        if (left[i])
+            FillInstanceBlock(viewProjection, *instances[i], materialSlot, out[i]);
+    }
+}
+
 bool StaticMeshRenderer::HasTransparentDraws(const Instance& instance) const
 {
     const PreparedInstance* prepared = instance.prepared;
@@ -3549,13 +3592,10 @@ void StaticMeshRenderer::RenderShadowCasters(ixrhi::IXRHICommandList& cmd,
 
     // One record per draw (submesh) and instance, its mvp = model x the cascade's light
     // view-projection; its material says whether it is alpha-masked.
-    std::vector<InstanceBlock> blocks;
-    blocks.reserve(m_draws.size() * instances.size());
-    for (const MeshDraw& draw : m_draws)
-    {
-        for (const Instance* instance : instances)
-            FillInstanceBlock(lightViewProj, *instance, draw.materialSlot, blocks.emplace_back());
-    }
+    std::vector<InstanceBlock> blocks(m_draws.size() * instances.size());
+    for (std::size_t drawIndex = 0; drawIndex < m_draws.size(); ++drawIndex)
+        FillInstanceBlocks(lightViewProj, instances, m_draws[drawIndex].materialSlot,
+            blocks.data() + drawIndex * instances.size());
     const std::optional<std::uint32_t> base = AppendInstanceBlocks(frameIndex, blocks);
     if (!base)
         return;

@@ -43,6 +43,7 @@ target_link_libraries(IxtreemeEngine
         IXEngineTerrainEditorSystem
         IXEngineMeshSystem
         IXEnginePrefab
+        IXEngineJobs
         IXEnginePhysics
         IXEngineRender
         IXEngineAnimation

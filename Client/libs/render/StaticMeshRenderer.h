@@ -432,6 +432,14 @@ private:
         const Instance& instance,
         std::uint32_t materialSlot,
         InstanceBlock& out) const;
+    bool PreparedUsable(const Instance& instance) const;
+    // FillInstanceBlock for every instance into out[0, instances.size()): those with a usable
+    // prepared record in parallel (large batches), the others (their materials are looked up, which
+    // is not thread-safe) on this thread after.
+    void FillInstanceBlocks(const WorldMat4& viewProjection,
+        const InstanceList& instances,
+        std::uint32_t materialSlot,
+        InstanceBlock* out) const;
     // Appends instance blocks at this frame's cursor; returns the first record's index.
     std::optional<std::uint32_t> AppendInstanceBlocks(uint32_t frameIndex, const std::vector<InstanceBlock>& blocks);
     bool EnsureInstanceCapacity(ixrhi::IXRHIDevice& rhi, uint32_t frameIndex, std::uint32_t requiredRecords);
