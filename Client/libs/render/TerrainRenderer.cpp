@@ -1,4 +1,6 @@
 #include "TerrainRenderer.h"
+
+#include "JobSystem.h"
 #include "SceneClearColor.h"
 
 #include "Debug.h"
@@ -960,6 +962,30 @@ struct ArrayMipUpload
     uint32_t mipLevels = 1;
 };
 
+// sRGB byte -> linear, and linear (in kLinearSteps steps) -> the nearest sRGB byte: the mip chains'
+// gamma-correct box filter looked both up per pixel with powf (most of a terrain palette's load).
+constexpr uint32_t kLinearSteps = 16384;
+const std::array<float, 256>& SrgbByteToLinearTable()
+{
+    static const std::array<float, 256> table = [] {
+        std::array<float, 256> values{};
+        for (uint32_t i = 0; i < 256; ++i)
+            values[i] = SrgbToLinear(static_cast<float>(i) / 255.0f);
+        return values;
+    }();
+    return table;
+}
+const std::vector<uint8_t>& LinearToSrgbByteTable()
+{
+    static const std::vector<uint8_t> table = [] {
+        std::vector<uint8_t> values(kLinearSteps + 1u);
+        for (uint32_t i = 0; i <= kLinearSteps; ++i)
+            values[i] = QuantizeByte(LinearToSrgb(static_cast<float>(i) / static_cast<float>(kLinearSteps)));
+        return values;
+    }();
+    return table;
+}
+
 ArrayMipUpload BuildRgbaArrayMipUpload(uint32_t width,
                                        uint32_t height,
                                        uint32_t layers,
@@ -971,16 +997,27 @@ ArrayMipUpload BuildRgbaArrayMipUpload(uint32_t width,
     upload.mipLevels = FullMipCount(width, height);
 
     const size_t baseLayerBytes = static_cast<size_t>(width) * height * 4u;
-    for (uint32_t layer = 0; layer < layers; ++layer)
+    // Layer-major, mip-minor: each layer's chain has its own place, so the layers are filtered in
+    // parallel on the shared pool.
+    size_t layerChainBytes = 0;
+    for (uint32_t mip = 0, w = width, h = height; mip < upload.mipLevels; ++mip, w = std::max(1u, w >> 1u), h = std::max(1u, h >> 1u))
+        layerChainBytes += static_cast<size_t>(w) * h * 4u;
+    upload.pixels.resize(layerChainBytes * layers);
+    const std::array<float, 256>& toLinear = SrgbByteToLinearTable();
+    const std::vector<uint8_t>& toSrgb = LinearToSrgbByteTable();
+    ixjobs::JobSystem::Instance().ParallelFor(layers, 1, [&](uint32_t layerBegin, uint32_t layerEnd, uint32_t) {
+    for (uint32_t layer = layerBegin; layer < layerEnd; ++layer)
     {
         std::vector<uint8_t> current(baseLayerBytes);
         std::memcpy(current.data(), basePixels.data() + static_cast<size_t>(layer) * baseLayerBytes, baseLayerBytes);
         uint32_t mipWidth = width;
         uint32_t mipHeight = height;
+        size_t writeOffset = layerChainBytes * layer;
 
         for (uint32_t mip = 0; mip < upload.mipLevels; ++mip)
         {
-            upload.pixels.insert(upload.pixels.end(), current.begin(), current.end());
+            std::memcpy(upload.pixels.data() + writeOffset, current.data(), current.size());
+            writeOffset += current.size();
 
             if (mip + 1u >= upload.mipLevels)
                 break;
@@ -1011,9 +1048,9 @@ ArrayMipUpload BuildRgbaArrayMipUpload(uint32_t width,
                             }
                             else if (srgbColor)
                             {
-                                accum[0] += SrgbToLinear(static_cast<float>(current[src + 0]) / 255.0f);
-                                accum[1] += SrgbToLinear(static_cast<float>(current[src + 1]) / 255.0f);
-                                accum[2] += SrgbToLinear(static_cast<float>(current[src + 2]) / 255.0f);
+                                accum[0] += toLinear[current[src + 0]];
+                                accum[1] += toLinear[current[src + 1]];
+                                accum[2] += toLinear[current[src + 2]];
                                 accum[3] += static_cast<float>(current[src + 3]) / 255.0f;
                             }
                             else
@@ -1039,9 +1076,13 @@ ArrayMipUpload BuildRgbaArrayMipUpload(uint32_t width,
                     }
                     else if (srgbColor)
                     {
-                        next[dst + 0] = QuantizeByte(LinearToSrgb(accum[0] / samples));
-                        next[dst + 1] = QuantizeByte(LinearToSrgb(accum[1] / samples));
-                        next[dst + 2] = QuantizeByte(LinearToSrgb(accum[2] / samples));
+                        const auto srgb = [&](float linear) {
+                            const float step = std::clamp(linear, 0.0f, 1.0f) * static_cast<float>(kLinearSteps);
+                            return toSrgb[static_cast<size_t>(step + 0.5f)];
+                        };
+                        next[dst + 0] = srgb(accum[0] / samples);
+                        next[dst + 1] = srgb(accum[1] / samples);
+                        next[dst + 2] = srgb(accum[2] / samples);
                         next[dst + 3] = QuantizeByte(accum[3] / samples);
                     }
                     else
@@ -1058,6 +1099,7 @@ ArrayMipUpload BuildRgbaArrayMipUpload(uint32_t width,
             mipHeight = nextHeight;
         }
     }
+    });
 
     return upload;
 }
@@ -5777,10 +5819,39 @@ bool TerrainRenderer::LoadTerrainPaletteFromPaths(ixrhi::IXRHIDevice& rhi, const
     std::array<RgbaImage, 8> heightImages{};
     uint32_t width = 0;
     uint32_t height = 0;
+    // Every layer's images read and decoded at once, in parallel on the shared pool (each into its
+    // own image); a failed or missing one takes its default below.
+    struct ImageLoad
+    {
+        const std::string* path = nullptr;
+        RgbaImage* image = nullptr;
+        bool loaded = false;
+    };
+    std::array<std::array<ImageLoad, 6>, 8> loads{};
+    std::vector<ImageLoad*> pending;
     for (uint32_t i = 0; i < images.size(); ++i)
     {
-        if (slots[i].texturePath.empty() || !LoadAnyTerrainImage(*m_assets, slots[i].texturePath, images[i], &m_additionalAssetRoots))
+        const std::string* paths[6] = {&slots[i].texturePath, &slots[i].normalTexturePath, &slots[i].aoTexturePath,
+            &slots[i].roughnessTexturePath, &slots[i].metallicTexturePath, &slots[i].heightTexturePath};
+        RgbaImage* targets[6] = {&images[i], &normalImages[i], &aoImages[i], &roughnessImages[i], &metallicImages[i],
+            &heightImages[i]};
+        for (uint32_t kind = 0; kind < 6; ++kind)
         {
+            loads[i][kind] = {paths[kind], targets[kind], false};
+            if (!paths[kind]->empty())
+                pending.push_back(&loads[i][kind]);
+        }
+    }
+    ixjobs::JobSystem::Instance().ParallelFor(static_cast<uint32_t>(pending.size()), 1,
+        [&](uint32_t begin, uint32_t end, uint32_t) {
+            for (uint32_t k = begin; k < end; ++k)
+                pending[k]->loaded = LoadAnyTerrainImage(*m_assets, *pending[k]->path, *pending[k]->image, &m_additionalAssetRoots);
+        });
+    for (uint32_t i = 0; i < images.size(); ++i)
+    {
+        if (!loads[i][0].loaded)
+        {
+            images[i] = {};
             Tracenf("[TERRAIN-PALETTE] using default diffuse for layer %u path=%s", i, slots[i].texturePath.c_str());
         }
     }
@@ -5826,8 +5897,7 @@ bool TerrainRenderer::LoadTerrainPaletteFromPaths(ixrhi::IXRHIDevice& rhi, const
 
     for (uint32_t i = 0; i < normalImages.size(); ++i)
     {
-        if (!slots[i].normalTexturePath.empty() &&
-            LoadAnyTerrainImage(*m_assets, slots[i].normalTexturePath, normalImages[i], &m_additionalAssetRoots))
+        if (loads[i][1].loaded)
         {
             normalImages[i] = ResizeNearest(normalImages[i], width, height);
             continue;
@@ -5843,8 +5913,8 @@ bool TerrainRenderer::LoadTerrainPaletteFromPaths(ixrhi::IXRHIDevice& rhi, const
             normalImages[i].pixels[p + 3] = 255;
         }
     }
-    auto loadSingleChannelOrDefault = [&](const std::string& path, RgbaImage& image, uint8_t defaultValue) {
-        if (!path.empty() && LoadAnyTerrainImage(*m_assets, path, image, &m_additionalAssetRoots))
+    auto loadedSingleChannelOrDefault = [&](const ImageLoad& load, RgbaImage& image, uint8_t defaultValue) {
+        if (load.loaded)
         {
             image = ResizeNearest(image, width, height);
             return;
@@ -5854,10 +5924,10 @@ bool TerrainRenderer::LoadTerrainPaletteFromPaths(ixrhi::IXRHIDevice& rhi, const
 
     for (uint32_t i = 0; i < images.size(); ++i)
     {
-        loadSingleChannelOrDefault(slots[i].aoTexturePath, aoImages[i], 255);
-        loadSingleChannelOrDefault(slots[i].roughnessTexturePath, roughnessImages[i], 128);
-        loadSingleChannelOrDefault(slots[i].metallicTexturePath, metallicImages[i], 0);
-        loadSingleChannelOrDefault(slots[i].heightTexturePath, heightImages[i], 0);
+        loadedSingleChannelOrDefault(loads[i][2], aoImages[i], 255);
+        loadedSingleChannelOrDefault(loads[i][3], roughnessImages[i], 128);
+        loadedSingleChannelOrDefault(loads[i][4], metallicImages[i], 0);
+        loadedSingleChannelOrDefault(loads[i][5], heightImages[i], 0);
     }
 
     std::vector<uint8_t> pixels;

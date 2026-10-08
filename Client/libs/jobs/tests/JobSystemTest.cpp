@@ -81,6 +81,15 @@ void RunChecks(ixjobs::JobSystem& jobs, const char* mode)
     }
     jobs.Wait(counter);
     Check(ran.load() == 1000u && counter.Done(), "Submit/Wait runs every task");
+
+    // Background work: done by workers (or the caller when it asks to help), counted the same way.
+    ixjobs::Counter background;
+    std::atomic<std::uint32_t> loaded{0};
+    Data loadData{&loaded};
+    for (std::uint32_t i = 0; i < 64; ++i)
+        jobs.SubmitBackground([](void* d, std::uint32_t) { static_cast<Data*>(d)->ran->fetch_add(1); }, &loadData, i, &background);
+    jobs.Wait(background, /*runBackground=*/true);
+    Check(loaded.load() == 64u && background.Done(), "background tasks all run");
 }
 } // namespace
 

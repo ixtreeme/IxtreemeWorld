@@ -144,7 +144,7 @@ public:
         bool hasTransparentDraws = false;
     };
 
-    StaticMeshRenderer() = default;
+    StaticMeshRenderer();
     ~StaticMeshRenderer();
 
     // The instance's view-independent records (see Instance::prepared). Made again when the instance
@@ -154,6 +154,11 @@ public:
     bool Create(ixrhi::IXRHIDevice& rhi,
                 client::asset::IAssetReader& assets,
                 const std::string& modelPath);
+    // Create in two halves, so a model loads off the render thread: LoadCpu on any thread (parses
+    // the model and decodes its textures, touching no device; false: not a static model or failed,
+    // see Status()), then FinishGpu on the render thread (buffers, textures, descriptors, pipelines).
+    bool LoadCpu(client::asset::IAssetReader& assets, const std::string& modelPath);
+    bool FinishGpu(ixrhi::IXRHIDevice& rhi);
     bool RecreatePipeline(ixrhi::IXRHIDevice& rhi);
     // Borrowed target pass (offscreen scene pass); null = backend default.
     void SetTargetPass(const ixrhi::IXRHIRenderPass* pass) { m_targetPass = pass; }
@@ -383,7 +388,8 @@ private:
     bool LoadLodCpuCache(std::uint64_t configHash, LodCpuSet& out) const;
     void WriteLodCpuCache(const LodCpuSet& set) const;
     std::filesystem::path LodCachePath(const std::string& modelPath, std::uint64_t configHash) const;
-    bool CreateTextures(ixrhi::IXRHIDevice& rhi, const std::string& modelPath);
+    void DecodeTextures(const std::string& modelPath);  // into m_decodedTextures (LoadCpu)
+    bool UploadDecodedTextures(ixrhi::IXRHIDevice& rhi);
     bool UploadTexture(ixrhi::IXRHIDevice& rhi, const RgbaImage& source, Texture& texture);
     const Texture* EnsureMaterialTexture(ixrhi::IXRHIDevice& rhi,
         const std::optional<Guid>& guid,
@@ -520,6 +526,11 @@ private:
     std::uint32_t m_lodCoalescedDropped = 0;
     std::unordered_map<std::uint64_t, LodCpuSet> m_lodPendingResults;
     std::vector<MaterialDefaults> m_materialDefaults;
+    std::array<RgbaImage, 3> m_decodedTextures;  // diffuse, normal, orm: LoadCpu -> FinishGpu
+    // A glTF's parsed asset, LoadCpu -> FinishGpu: registering its materials (the material manager
+    // and the asset database are not thread-safe) is the render thread's work.
+    struct PendingMaterialImport;
+    std::unique_ptr<PendingMaterialImport> m_pendingMaterialImport;
     std::uint32_t m_materialSlotCount = 1;
     std::string m_alphaModeName = "opaque";
     std::array<float, 3> m_boundsMin = {0.0f, 0.0f, 0.0f};

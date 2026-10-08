@@ -2728,11 +2728,36 @@ int RunGame(NativeWindow& window,
     bool gameViewOk = false;
     rmlUi.SetSrgbTarget(IsSrgbColorFormat(rhiDevice->GetMainSwapchain().ColorFormat()));
 #endif
+    // A model's CPU half (the renderer's LoadCpu: reading and parsing it, decoding its textures) on a
+    // loading thread; this thread finishes it (FinishGpu) once that is done. Freeing one waits for its
+    // loading thread, so a load never outlives its renderer.
+    struct ModelLoadJob
+    {
+        ixjobs::Counter done;
+        StaticMeshRenderer* staticRenderer = nullptr;
+        SkinnedMeshRenderer* skinnedRenderer = nullptr;
+        client::asset::IAssetReader* assets = nullptr;
+        std::string modelPath;
+        bool cpuLoaded = false;
+        double cpuMs = 0.0;
+        std::chrono::steady_clock::time_point asked;
+        ~ModelLoadJob() { ixjobs::JobSystem::Instance().Wait(done, /*runBackground=*/true); }
+    };
+    const ixjobs::TaskFunction runModelLoad = [](void* data, std::uint32_t) {
+        ModelLoadJob& job = *static_cast<ModelLoadJob*>(data);
+        const auto begin = std::chrono::steady_clock::now();
+        job.cpuLoaded = job.staticRenderer ? job.staticRenderer->LoadCpu(*job.assets, job.modelPath)
+                                           : job.skinnedRenderer->LoadCpu(*job.assets, job.modelPath);
+        job.cpuMs = MillisecondsBetween(begin, std::chrono::steady_clock::now());
+    };
+    std::uint32_t modelLoadsInFlight = 0;
+    std::uint64_t modelLoadsStarted = 0;
     struct StaticMeshCacheEntry
     {
         enum class State
         {
             Unknown,
+            Loading,  // the renderer is its loading thread's until load is done
             LoadedStatic,
             UnsupportedSkinned,
             Failed
@@ -2740,8 +2765,15 @@ int RunGame(NativeWindow& window,
 
         std::unique_ptr<StaticMeshRenderer> renderer;
         State state = State::Unknown;
+        std::unique_ptr<ModelLoadJob> load;  // while Loading (after renderer: freed, and waited for, first)
     };
     std::unordered_map<std::string, StaticMeshCacheEntry> staticMeshCache;
+    // Moves on whenever a static model is finished (loaded or not): the render records that waited for
+    // one are built again. The entities whose spatial sync found their model loading are synced again
+    // at the next frame's start (pumpModelLoads).
+    std::uint64_t staticModelRevision = 0;
+    std::vector<std::string> finishedStaticModelPaths;
+    std::unordered_map<std::string, std::unordered_set<std::uint32_t>> pendingSpatialSyncs;
 
     // Per-model skinned (rigged character) renderer cache. Keyed by the same resolved
     // runtime path as staticMeshCache, so multiple DISTINCT rigged models render at once.
@@ -2749,9 +2781,10 @@ int RunGame(NativeWindow& window,
     // pool), so per-frame skin slots are allocated PER renderer (no global namespace).
     struct SkinnedMeshCacheEntry
     {
-        enum class State { Unknown, Loaded, Failed };
+        enum class State { Unknown, Loading, Loaded, Failed };
         std::unique_ptr<SkinnedMeshRenderer> renderer;
         State state = State::Unknown;
+        std::unique_ptr<ModelLoadJob> load;  // while Loading (after renderer: freed, and waited for, first)
         // Per-frame skin-slot cursor over THIS renderer's pool (up to MaxSkinSlots(); the renderer
         // makes slots as they are first used). Reset lazily once per device frame; the Scene and Game
         // views take slots from it alike, so a model drawn in both views in one command buffer never
@@ -2782,41 +2815,74 @@ int RunGame(NativeWindow& window,
         std::array<float, 3> scale{1.0f, 1.0f, 1.0f};  // the entity Transform scale
     };
 
-    auto getSkinnedMeshRenderer = [&](const std::string& modelPath) -> SkinnedMeshRenderer* {
-        if (modelPath.empty())
-            return nullptr;
-        auto& entry = skinnedMeshCache[modelPath];
-        if (entry.state == SkinnedMeshCacheEntry::State::Loaded)
-            return entry.renderer.get();
-        if (entry.state == SkinnedMeshCacheEntry::State::Failed)
-            return nullptr;
-        entry.renderer = std::make_unique<SkinnedMeshRenderer>();
-        if (!entry.renderer->Create(*rhiDevice, assets, modelPath))
+    // Rigged models load the way static ones do (see requestStaticMeshRenderer): request starts the
+    // load and gives the renderer once it is finished, get waits for it.
+    auto finishSkinnedMeshLoad = [&](const std::string& modelPath, SkinnedMeshCacheEntry& entry) {
+        const auto finishBegin = std::chrono::steady_clock::now();
+        bool loaded = entry.load->cpuLoaded;
+        if (loaded)
+        {
+            // Its pipelines are made for the pass that is current now.
+            if (offscreenSceneOk)
+                entry.renderer->SetTargetPass(offscreenScene.GetTargetPass());
+            loaded = entry.renderer->FinishGpu(*rhiDevice);
+        }
+        const auto finished = std::chrono::steady_clock::now();
+        const double cpuMs = entry.load->cpuMs;
+        const double finishMs = MillisecondsBetween(finishBegin, finished);
+        const double askedMs = MillisecondsBetween(entry.load->asked, finished);
+        entry.load.reset();
+        --modelLoadsInFlight;
+        if (!loaded)
         {
             entry.renderer.reset();
             entry.state = SkinnedMeshCacheEntry::State::Failed;
             TraceError("[MESH-ENTITY] Failed to load skinned model: %s", modelPath.c_str());
-            return nullptr;
-        }
-        // SkinnedMeshRenderer::Create() internally Destroy()s first (clearing any render pass),
-        // so wire the offscreen pass + rebuild the pipeline AFTER Create, not before.
-        if (offscreenSceneOk)
-        {
-                entry.renderer->SetTargetPass(offscreenScene.GetTargetPass());
-            entry.renderer->RecreatePipeline(*rhiDevice);
+            return;
         }
         entry.renderer->SetLightingState(frameLighting);
         // The sun shadow map is bound in every draw (cascades refreshed each frame after the shadow pass).
         if (terrainOk)
             entry.renderer->SetSunShadow(terrain.SunShadowForMeshes(0));
         entry.state = SkinnedMeshCacheEntry::State::Loaded;
-        Tracenf("[MESH-ENTITY] SkinnedMeshRenderer loaded: %s", modelPath.c_str());
+        Tracenf("[MESH-ENTITY] SkinnedMeshRenderer loaded: %s (%.1f ms: loading %.1f, finishing %.1f; %.1f ms after asked)",
+            modelPath.c_str(), cpuMs + finishMs, cpuMs, finishMs, askedMs);
 #if defined(IXTREEME_WITH_EDITOR)
         // Auto-generate retargetable .ixclip assets from this model's existing _anim_<i>.ozz
         // sidecars so they appear under the asset browser's "Anim Clips" tab (idempotent).
         editorImGui.EnsureModelAnimationClips(modelPath, entry.renderer->JointNames());
 #endif
-        return entry.renderer.get();
+    };
+    auto requestSkinnedMeshRenderer = [&](const std::string& modelPath) -> SkinnedMeshRenderer* {
+        if (modelPath.empty())
+            return nullptr;
+        auto& entry = skinnedMeshCache[modelPath];
+        if (entry.state == SkinnedMeshCacheEntry::State::Unknown)
+        {
+            entry.renderer = std::make_unique<SkinnedMeshRenderer>();
+            entry.load = std::make_unique<ModelLoadJob>();
+            entry.load->skinnedRenderer = entry.renderer.get();
+            entry.load->assets = &assets;
+            entry.load->modelPath = modelPath;
+            entry.load->asked = std::chrono::steady_clock::now();
+            entry.state = SkinnedMeshCacheEntry::State::Loading;
+            ++modelLoadsInFlight;
+            ++modelLoadsStarted;
+            ixjobs::JobSystem::Instance().SubmitBackground(runModelLoad, entry.load.get(), 0, &entry.load->done);
+        }
+        if (entry.state == SkinnedMeshCacheEntry::State::Loading && entry.load->done.Done())
+            finishSkinnedMeshLoad(modelPath, entry);
+        return entry.state == SkinnedMeshCacheEntry::State::Loaded ? entry.renderer.get() : nullptr;
+    };
+    auto getSkinnedMeshRenderer = [&](const std::string& modelPath) -> SkinnedMeshRenderer* {
+        if (SkinnedMeshRenderer* renderer = requestSkinnedMeshRenderer(modelPath))
+            return renderer;
+        const auto it = modelPath.empty() ? skinnedMeshCache.end() : skinnedMeshCache.find(modelPath);
+        if (it == skinnedMeshCache.end() || it->second.state != SkinnedMeshCacheEntry::State::Loading)
+            return nullptr;
+        ixjobs::JobSystem::Instance().Wait(it->second.load->done, /*runBackground=*/true);
+        finishSkinnedMeshLoad(modelPath, it->second);
+        return it->second.state == SkinnedMeshCacheEntry::State::Loaded ? it->second.renderer.get() : nullptr;
     };
     // resolveMeshRuntimePath hits the filesystem (exists()) up to four times per mesh per frame; the
     // resolution only changes when the file set does, so cache it and clear the cache on an asset
@@ -2915,59 +2981,114 @@ int RunGame(NativeWindow& window,
         const std::filesystem::path skeleton = path.parent_path() / (path.stem().string() + "_skeleton.ozz");
         return std::filesystem::exists(skeleton);
     };
-    auto getStaticMeshRenderer = [&](const std::string& modelPath) -> StaticMeshRenderer* {
-        if (modelPath.empty())
-            return nullptr;
-        auto& entry = staticMeshCache[modelPath];
-        if (entry.state == StaticMeshCacheEntry::State::LoadedStatic)
-            return entry.renderer.get();
-        if (entry.state == StaticMeshCacheEntry::State::UnsupportedSkinned ||
-            entry.state == StaticMeshCacheEntry::State::Failed)
-            return nullptr;
-
-        if (modelHasSkeletalSidecar(modelPath))
+    // A loaded model's renderer on this thread (buffers, textures, pipelines), once its loading thread
+    // is done with it; or what it turned out to be (rigged, or not loadable).
+    auto finishStaticMeshLoad = [&](const std::string& modelPath, StaticMeshCacheEntry& entry) {
+        const auto finishBegin = std::chrono::steady_clock::now();
+        bool loaded = entry.load->cpuLoaded;
+        if (loaded)
         {
-            entry.state = StaticMeshCacheEntry::State::UnsupportedSkinned;
-            Tracenf("[MESH-ENTITY] Skinned FBX detected and skipped for mesh entity static path: %s", modelPath.c_str());
-            return nullptr;
+            // Its pipelines are made for the pass that is current now.
+            if (offscreenSceneOk)
+                entry.renderer->SetTargetPass(offscreenScene.GetTargetPass());
+            loaded = entry.renderer->FinishGpu(*rhiDevice);
         }
-
-        bool isSkinned = false;
-        std::string inspectError;
-        std::string ext = std::filesystem::path(modelPath).extension().string();
-        std::transform(ext.begin(), ext.end(), ext.begin(), [](unsigned char c) {
-            return static_cast<char>(std::tolower(c));
-        });
-        const bool builtinPrimitive = modelPath.rfind("builtin://primitive/", 0) == 0;
-        if (!builtinPrimitive && ext != ".fbx" && !StaticMeshRenderer::DetectSkinnedGltf(assets, modelPath, isSkinned, &inspectError))
+        const auto finished = std::chrono::steady_clock::now();
+        const double cpuMs = entry.load->cpuMs;
+        const double finishMs = MillisecondsBetween(finishBegin, finished);
+        const double askedMs = MillisecondsBetween(entry.load->asked, finished);
+        entry.load.reset();
+        --modelLoadsInFlight;
+        ++staticModelRevision;
+        finishedStaticModelPaths.push_back(modelPath);
+        if (loaded)
         {
-            entry.state = StaticMeshCacheEntry::State::Failed;
-            TraceError("[MESH-ENTITY] Static mesh inspect failed: %s (%s)", modelPath.c_str(), inspectError.c_str());
-            return nullptr;
+            // The sun shadow map is bound in every draw (cascades refreshed each frame after the shadow pass).
+            if (terrainOk)
+                entry.renderer->SetSunShadow(terrain.SunShadowForMeshes(0));
+            entry.state = StaticMeshCacheEntry::State::LoadedStatic;
+            Tracenf("[MESH-ENTITY] StaticMeshRenderer loaded: %s (%.1f ms: loading %.1f, finishing %.1f; %.1f ms after asked)",
+                modelPath.c_str(), cpuMs + finishMs, cpuMs, finishMs, askedMs);
+            return;
         }
-        if (isSkinned)
+        const bool skinned = entry.renderer->Status() == StaticMeshRenderer::LoadStatus::UnsupportedSkinned;
+        entry.renderer.reset();
+        if (skinned)
         {
             entry.state = StaticMeshCacheEntry::State::UnsupportedSkinned;
             Tracenf("[MESH-ENTITY] Skinned glTF detected and skipped for mesh entity static path: %s", modelPath.c_str());
-            return nullptr;
         }
-
-        entry.renderer = std::make_unique<StaticMeshRenderer>();
-        if (offscreenSceneOk)
-            entry.renderer->SetTargetPass(offscreenScene.GetTargetPass());
-        if (!entry.renderer->Create(*rhiDevice, assets, modelPath))
+        else
         {
-            entry.renderer.reset();
             entry.state = StaticMeshCacheEntry::State::Failed;
             TraceError("[MESH-ENTITY] Static mesh load failed: %s", modelPath.c_str());
-            return nullptr;
         }
-        // The sun shadow map is bound in every draw (cascades refreshed each frame after the shadow pass).
-        if (terrainOk)
-            entry.renderer->SetSunShadow(terrain.SunShadowForMeshes(0));
-        entry.state = StaticMeshCacheEntry::State::LoadedStatic;
-        Tracenf("[MESH-ENTITY] StaticMeshRenderer loaded: %s", modelPath.c_str());
-        return entry.renderer.get();
+    };
+    // The model's renderer if it is loaded; otherwise its load is started (once) on a loading thread
+    // and nothing is given until it is finished: the frame goes on without the model. For the
+    // per-frame paths (the render records, the spatial index); getStaticMeshRenderer waits instead.
+    auto requestStaticMeshRenderer = [&](const std::string& modelPath) -> StaticMeshRenderer* {
+        if (modelPath.empty())
+            return nullptr;
+        auto& entry = staticMeshCache[modelPath];
+        if (entry.state == StaticMeshCacheEntry::State::Unknown)
+        {
+            if (modelHasSkeletalSidecar(modelPath))
+            {
+                entry.state = StaticMeshCacheEntry::State::UnsupportedSkinned;
+                Tracenf("[MESH-ENTITY] Skinned FBX detected and skipped for mesh entity static path: %s", modelPath.c_str());
+                return nullptr;
+            }
+            entry.renderer = std::make_unique<StaticMeshRenderer>();
+            entry.load = std::make_unique<ModelLoadJob>();
+            entry.load->staticRenderer = entry.renderer.get();
+            entry.load->assets = &assets;
+            entry.load->modelPath = modelPath;
+            entry.load->asked = std::chrono::steady_clock::now();
+            entry.state = StaticMeshCacheEntry::State::Loading;
+            ++modelLoadsInFlight;
+            ++modelLoadsStarted;
+            ixjobs::JobSystem::Instance().SubmitBackground(runModelLoad, entry.load.get(), 0, &entry.load->done);
+        }
+        if (entry.state == StaticMeshCacheEntry::State::Loading && entry.load->done.Done())
+            finishStaticMeshLoad(modelPath, entry);
+        return entry.state == StaticMeshCacheEntry::State::LoadedStatic ? entry.renderer.get() : nullptr;
+    };
+    auto staticMeshModelLoading = [&](const std::string& modelPath) {
+        const auto it = staticMeshCache.find(modelPath);
+        return it != staticMeshCache.end() && it->second.state == StaticMeshCacheEntry::State::Loading;
+    };
+    // The model's renderer, waiting for its load (this thread loads too) when it is not finished yet:
+    // for what needs the model now (physics shapes, picking, the gizmo, exports).
+    auto getStaticMeshRenderer = [&](const std::string& modelPath) -> StaticMeshRenderer* {
+        if (StaticMeshRenderer* renderer = requestStaticMeshRenderer(modelPath))
+            return renderer;
+        const auto it = modelPath.empty() ? staticMeshCache.end() : staticMeshCache.find(modelPath);
+        if (it == staticMeshCache.end() || it->second.state != StaticMeshCacheEntry::State::Loading)
+            return nullptr;
+        ixjobs::JobSystem::Instance().Wait(it->second.load->done, /*runBackground=*/true);
+        finishStaticMeshLoad(modelPath, it->second);
+        return it->second.state == StaticMeshCacheEntry::State::LoadedStatic ? it->second.renderer.get() : nullptr;
+    };
+    // Waits for every model being loaded (this thread loads too) and finishes them.
+    auto finishAllModelLoads = [&]() {
+        if (modelLoadsInFlight == 0)
+            return;
+        ixjobs::JobSystem& jobs = ixjobs::JobSystem::Instance();
+        for (auto& [path, entry] : staticMeshCache)
+        {
+            if (entry.state != StaticMeshCacheEntry::State::Loading)
+                continue;
+            jobs.Wait(entry.load->done, /*runBackground=*/true);
+            finishStaticMeshLoad(path, entry);
+        }
+        for (auto& [path, entry] : skinnedMeshCache)
+        {
+            if (entry.state != SkinnedMeshCacheEntry::State::Loading)
+                continue;
+            jobs.Wait(entry.load->done, /*runBackground=*/true);
+            finishSkinnedMeshLoad(path, entry);
+        }
     };
     // Render extraction: what a mesh entity's draws need, kept between frames. It is built again only
     // when the entity's model, transform or materials, the model path resolution or the material
@@ -2985,6 +3106,8 @@ int RunGame(NativeWindow& window,
         bool skinned = false;
         std::string runtimePath;      // the model's resolved path
         bool modelIsSkinned = false;  // the static path found the model rigged
+        bool awaitingModel = false;   // its model was loading: built again once a model is finished
+        std::uint64_t modelRevision = 0;  // staticModelRevision when it was built
         StaticMeshRenderer* renderer = nullptr;  // null: no static draws
         StaticMeshRenderer::Instance instance;   // its prepared points at prepared below
         StaticMeshRenderer::PreparedInstance prepared;
@@ -3041,6 +3164,7 @@ int RunGame(NativeWindow& window,
             ((mesh.id + renderRecordFrame) & 3u) == 0u;
         const StaticMeshRenderer::Instance& instance = record.instance;
         return record.meshCachesGeneration == meshCachesGeneration &&
+            (!record.awaitingModel || record.modelRevision == staticModelRevision) &&
             record.skinned == mesh.skinned &&
             instance.entityId == mesh.id &&
             instance.position.x == mesh.position[0] && instance.position.y == mesh.position[1] &&
@@ -3086,9 +3210,11 @@ int RunGame(NativeWindow& window,
         record.runtimePath = resolveMeshRuntimePath(mesh);
         record.renderer = nullptr;
         record.modelIsSkinned = false;
+        record.awaitingModel = false;
         if (!mesh.skinned)
         {
-            StaticMeshRenderer* renderer = getStaticMeshRenderer(record.runtimePath);
+            // Not waited for: until its model is loaded the entity has no draws.
+            StaticMeshRenderer* renderer = requestStaticMeshRenderer(record.runtimePath);
             if (renderer && renderer->IsLoaded())
             {
                 record.renderer = renderer;
@@ -3098,8 +3224,11 @@ int RunGame(NativeWindow& window,
                 const auto cached = staticMeshCache.find(record.runtimePath);
                 record.modelIsSkinned = cached != staticMeshCache.end() &&
                     cached->second.state == StaticMeshCacheEntry::State::UnsupportedSkinned;
+                record.awaitingModel = cached != staticMeshCache.end() &&
+                    cached->second.state == StaticMeshCacheEntry::State::Loading;
             }
         }
+        record.modelRevision = staticModelRevision;
         if (record.renderer)
         {
             record.worldBounds = StaticMeshWorldAabb(mesh, *record.renderer);
@@ -3159,10 +3288,12 @@ int RunGame(NativeWindow& window,
             return;
         renderSize.width = offscreenScene.Width();
         renderSize.height = offscreenScene.Height();
+        // (Models still loading are left alone here and below: they take the pass that is current
+        // when they are finished, and the frame's lighting and shadows.)
         for (auto& [skinnedPath, skinnedEntry] : skinnedMeshCache)
         {
             (void)skinnedPath;
-            if (skinnedEntry.renderer)
+            if (skinnedEntry.state == SkinnedMeshCacheEntry::State::Loaded)
             {
                 skinnedEntry.renderer->SetTargetPass(offscreenScene.GetTargetPass());
                 skinnedEntry.renderer->RecreatePipeline(*rhiDevice);
@@ -3171,7 +3302,7 @@ int RunGame(NativeWindow& window,
         for (auto& [path, entry] : staticMeshCache)
         {
             (void)path;
-            if (entry.renderer)
+            if (entry.state == StaticMeshCacheEntry::State::LoadedStatic)
             {
                 entry.renderer->SetTargetPass(offscreenScene.GetTargetPass());
                 entry.renderer->RecreatePipeline(*rhiDevice);
@@ -3461,11 +3592,14 @@ int RunGame(NativeWindow& window,
     // the standalone runtime's per-frame sim calls these; everything they touch is unguarded state.
     auto syncStaticMeshSpatialEntity = [&](const MeshSceneEntity& mesh) {
         const std::string runtimePath = resolveMeshRuntimePath(mesh);
-        StaticMeshRenderer* renderer = getStaticMeshRenderer(runtimePath);
+        StaticMeshRenderer* renderer = requestStaticMeshRenderer(runtimePath);
         if (!renderer || !renderer->IsLoaded())
         {
             if (staticMeshSpatialIndexed.erase(mesh.id) > 0)
                 staticMeshSpatialIndex.Remove(mesh.id);
+            // Its model is loading: synced again once it is finished (pumpModelLoads).
+            if (staticMeshModelLoading(runtimePath))
+                pendingSpatialSyncs[runtimePath].insert(mesh.id);
             return false;
         }
 
@@ -3480,6 +3614,38 @@ int RunGame(NativeWindow& window,
             staticMeshSpatialIndex.Update(mesh.id, bounds);
         }
         return true;
+    };
+    // At a frame's start: the model loads that are done are finished, and the entities that waited for
+    // those models go into the spatial index (drawn from this frame on).
+    auto pumpModelLoads = [&]() {
+        if (modelLoadsInFlight > 0)
+        {
+            for (auto& [path, entry] : staticMeshCache)
+            {
+                if (entry.state == StaticMeshCacheEntry::State::Loading && entry.load->done.Done())
+                    finishStaticMeshLoad(path, entry);
+            }
+            for (auto& [path, entry] : skinnedMeshCache)
+            {
+                if (entry.state == SkinnedMeshCacheEntry::State::Loading && entry.load->done.Done())
+                    finishSkinnedMeshLoad(path, entry);
+            }
+        }
+        if (finishedStaticModelPaths.empty())
+            return;
+        std::vector<std::string> finished;
+        finished.swap(finishedStaticModelPaths);
+        for (const std::string& path : finished)
+        {
+            auto waiting = pendingSpatialSyncs.extract(path);
+            if (waiting.empty())
+                continue;
+            for (std::uint32_t id : waiting.mapped())
+            {
+                if (const MeshSceneEntity* mesh = findMeshEntityById(id))
+                    syncStaticMeshSpatialEntity(*mesh);
+            }
+        }
     };
     // Wire the script facade's stable members once. Per-frame scalars (dt/movement/mouse) are refreshed
     // before each Play frame's OnUpdate loop. The callbacks capture RunGame-local state by reference.
@@ -3678,12 +3844,22 @@ int RunGame(NativeWindow& window,
         std::transform(ext.begin(), ext.end(), ext.begin(),
             [](unsigned char c) { return static_cast<char>(std::tolower(c)); });
         if (ext == ".fbx")
+        {
             mesh.skinned = std::filesystem::exists(path.parent_path() / (path.stem().string() + "_skeleton.ozz"));
+        }
         else if (ext == ".glb" || ext == ".gltf")
         {
-            bool isSkinned = false;
-            std::string detectError;
-            mesh.skinned = StaticMeshRenderer::DetectSkinnedGltf(assets, path.string(), isSkinned, &detectError) && isSkinned;
+            // Not parsed here (a big model takes tens of ms, the frame waits): rigged if the model caches
+            // already know it so; a model new to them starts as a static one, its load (on a loading
+            // thread) finds it rigged, and the render pre-pass then makes the entity a skinned one.
+            const std::string runtimePath = resolveMeshRuntimePath(mesh);
+            const auto skinnedIt = skinnedMeshCache.find(runtimePath);
+            const auto staticIt = staticMeshCache.find(runtimePath);
+            mesh.skinned = (skinnedIt != skinnedMeshCache.end() &&
+                               skinnedIt->second.state != SkinnedMeshCacheEntry::State::Failed &&
+                               skinnedIt->second.state != SkinnedMeshCacheEntry::State::Unknown) ||
+                (staticIt != staticMeshCache.end() &&
+                    staticIt->second.state == StaticMeshCacheEntry::State::UnsupportedSkinned);
         }
         mesh.materialSlots = LoadDefaultMaterialSlotGuids(mesh.meshAssetPath, ResolveModelSubmeshCount(mesh.meshAssetPath));
         editorMeshEntities.push_back(mesh);
@@ -4259,13 +4435,40 @@ int RunGame(NativeWindow& window,
             b.min.x, b.min.y, b.min.z,
             b.max.x, b.max.y, b.max.z);
     };
+    // A scene's models all start loading here, at once, on the loading threads; the entities whose
+    // model is loaded go into the index now, the others once it is (finishSceneModelLoads waits for
+    // them before the scene's first frame: no model shows up late).
+    std::chrono::steady_clock::time_point sceneModelLoadsBegin{};
+    std::uint32_t sceneModelLoadsStarted = 0;
     auto rebuildStaticMeshSpatialIndex = [&]() {
         staticMeshSpatialIndex.Clear();
         staticMeshSpatialIndexed.clear();
+        pendingSpatialSyncs.clear();
         rebuildMeshEntityLookup();
+        sceneModelLoadsBegin = std::chrono::steady_clock::now();
+        const std::uint64_t loadsBefore = modelLoadsStarted;
+        for (const MeshSceneEntity& mesh : editorMeshEntities)
+        {
+            if (mesh.skinned)
+                requestSkinnedMeshRenderer(resolveMeshRuntimePath(mesh));
+        }
         for (const MeshSceneEntity& mesh : editorMeshEntities)
             syncStaticMeshSpatialEntity(mesh);
+        sceneModelLoadsStarted = static_cast<std::uint32_t>(modelLoadsStarted - loadsBefore);
         logStaticMeshSpatialBuild();
+    };
+    auto finishSceneModelLoads = [&]() {
+        const auto waitBegin = std::chrono::steady_clock::now();
+        finishAllModelLoads();
+        pumpModelLoads();
+        if (sceneModelLoadsStarted > 0)
+        {
+            const auto now = std::chrono::steady_clock::now();
+            Tracenf("[SCENE] models: %u started with the spatial index, all ready %.1f ms after that (%.1f ms of it waited for here)",
+                sceneModelLoadsStarted, MillisecondsBetween(sceneModelLoadsBegin, now), MillisecondsBetween(waitBegin, now));
+            logStaticMeshSpatialBuild();
+        }
+        sceneModelLoadsStarted = 0;
     };
     auto logStaticMeshSpatialMutations = [&]() {
         const SpatialIndex::MutationStats mutations = staticMeshSpatialIndex.ConsumeMutationStats();
@@ -4319,7 +4522,8 @@ int RunGame(NativeWindow& window,
             snap.yaw = state.yaw;
             snap.pitch = state.pitch;
             cameraController.RestoreSnapshot(snap);
-        }});
+        },
+        finishSceneModelLoads});
 #if defined(IXTREEME_WITH_EDITOR)
     // Refilled every editor frame for SceneManager, without the terrain grids (megabytes); a save
     // completes it through the refresher below. Kept across frames to reuse its buffers.
@@ -6000,6 +6204,7 @@ int RunGame(NativeWindow& window,
         // The mesh render records are checked again (once) in each frame that asks for them; those of
         // entities that are gone (not asked for in a while) are dropped here, between frames.
         ++renderRecordFrame;
+        pumpModelLoads();
         if ((renderRecordFrame & 63u) == 0u)
         {
             for (std::uint32_t slot = 0; slot < staticMeshRenderRecords.size(); ++slot)
@@ -6135,13 +6340,13 @@ int RunGame(NativeWindow& window,
                         for (auto& [skinnedPath, skinnedEntry] : skinnedMeshCache)
                         {
                             (void)skinnedPath;
-                            if (skinnedEntry.renderer)
+                            if (skinnedEntry.state == SkinnedMeshCacheEntry::State::Loaded)
                                 skinnedEntry.renderer->SetTargetPass(offscreenScene.GetTargetPass());
                         }
                         for (auto& [path, entry] : staticMeshCache)
                         {
                             (void)path;
-                            if (entry.renderer)
+                            if (entry.state == StaticMeshCacheEntry::State::LoadedStatic)
                                 entry.renderer->SetTargetPass(offscreenScene.GetTargetPass());
                         }
                         if (terrainOk)
@@ -6192,13 +6397,13 @@ int RunGame(NativeWindow& window,
                 for (auto& [skinnedPath, skinnedEntry] : skinnedMeshCache)
                 {
                     (void)skinnedPath;
-                    if (skinnedEntry.renderer)
+                    if (skinnedEntry.state == SkinnedMeshCacheEntry::State::Loaded)
                         skinnedEntry.renderer->RecreatePipeline(*rhiDevice);
                 }
                 for (auto& [path, entry] : staticMeshCache)
                 {
                     (void)path;
-                    if (entry.renderer)
+                    if (entry.state == StaticMeshCacheEntry::State::LoadedStatic)
                         entry.renderer->RecreatePipeline(*rhiDevice);
                 }
                 if (terrainOk)
@@ -11397,12 +11602,12 @@ int RunGame(NativeWindow& window,
                 }
                 terrain.SetSelectedWaterBodyHighlight(*rhiDevice, 0u);
                 // Push the finalized lighting to every cached skinned model, and stash it for the
-                // static meshes' draws and a model loaded later this frame (getSkinnedMeshRenderer).
+                // static meshes' draws and a model finished later (finishSkinnedMeshLoad).
                 frameLighting = lightingState;
                 for (auto& [skinnedPath, skinnedEntry] : skinnedMeshCache)
                 {
                     (void)skinnedPath;
-                    if (skinnedEntry.renderer)
+                    if (skinnedEntry.state == SkinnedMeshCacheEntry::State::Loaded)
                         skinnedEntry.renderer->SetLightingState(lightingState);
                 }
                 if (commands.paletteSlotChanged)
@@ -11483,7 +11688,7 @@ int RunGame(NativeWindow& window,
             for (auto& [skinnedPath, skinnedEntry] : skinnedMeshCache)
             {
                 (void)skinnedPath;
-                if (skinnedEntry.renderer)
+                if (skinnedEntry.state == SkinnedMeshCacheEntry::State::Loaded)
                     skinnedEntry.renderer->SetLightingState(frameLighting);
             }
 #endif
@@ -11671,7 +11876,8 @@ int RunGame(NativeWindow& window,
                             if (skinnedEntity.materialSlots.size() != beforeSlotCount)
                                 SceneManager::Instance().MarkDirty();
                         }
-                        SkinnedMeshRenderer* skinnedRenderer = getSkinnedMeshRenderer(skinnedRuntimePath);
+                        // Not waited for: the character shows once its model is loaded.
+                        SkinnedMeshRenderer* skinnedRenderer = requestSkinnedMeshRenderer(skinnedRuntimePath);
                         if (!skinnedRenderer)
                             continue;
                         SkinnedMeshCacheEntry& skinnedEntry = skinnedMeshCache[skinnedRuntimePath];
@@ -12390,13 +12596,13 @@ int RunGame(NativeWindow& window,
                 for (auto& [path, entry] : staticMeshCache)
                 {
                     (void)path;
-                    if (entry.renderer)
+                    if (entry.state == StaticMeshCacheEntry::State::LoadedStatic)
                         entry.renderer->SetSunShadow(meshShadow);
                 }
                 for (auto& [path, entry] : skinnedMeshCache)
                 {
                     (void)path;
-                    if (entry.renderer)
+                    if (entry.state == SkinnedMeshCacheEntry::State::Loaded)
                         entry.renderer->SetSunShadow(meshShadow);
                 }
             }
@@ -14041,6 +14247,17 @@ int RunGame(NativeWindow& window,
         skyRenderer.Destroy();
     if (godRaysOk)
         godRays.Destroy();
+    // Loads still running are waited for first (freeing a load waits for it).
+    for (auto& [path, entry] : staticMeshCache)
+    {
+        (void)path;
+        entry.load.reset();
+    }
+    for (auto& [skinnedPath, skinnedEntry] : skinnedMeshCache)
+    {
+        (void)skinnedPath;
+        skinnedEntry.load.reset();
+    }
     for (auto& [path, entry] : staticMeshCache)
     {
         (void)path;

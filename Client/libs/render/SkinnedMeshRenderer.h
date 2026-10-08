@@ -70,6 +70,12 @@ public:
     bool Create(ixrhi::IXRHIDevice& rhi,
                 client::asset::IAssetReader& assets,
                 const std::string& modelPath);
+    // Create in two halves, so a model loads off the render thread: LoadCpu on any thread (the mesh,
+    // its skeleton and clips, a CPU skin for the bounds, its textures decoded; touches no device),
+    // then FinishGpu on the render thread (buffers, compute skinning, textures, descriptors,
+    // pipelines).
+    bool LoadCpu(client::asset::IAssetReader& assets, const std::string& modelPath);
+    bool FinishGpu(ixrhi::IXRHIDevice& rhi);
     bool RecreatePipeline(ixrhi::IXRHIDevice& rhi);
     // Borrowed IXRHI pass token; null = backend default (swapchain pass).
     void SetTargetPass(const ixrhi::IXRHIRenderPass* pass) { m_targetPass = pass; }
@@ -295,7 +301,9 @@ private:
     bool LoadFbxMesh(const std::string& modelPath);
     bool LoadOzzPose(const std::string& modelPath);
     bool CreateBuffers(ixrhi::IXRHIDevice& rhi);
-    bool CreateTextures(ixrhi::IXRHIDevice& rhi, const std::string& modelPath);
+    struct DecodedTextures;  // LoadCpu -> FinishGpu
+    void DecodeTextures(const std::string& modelPath);
+    bool UploadDecodedTextures(ixrhi::IXRHIDevice& rhi);
     bool CreateBindGroup(ixrhi::IXRHIDevice& rhi);
     UniformPage* AddUniformPage(ixrhi::IXRHIDevice& rhi);
     // Starts the uniform cursor over when the frame is a new one.
@@ -382,6 +390,8 @@ private:
     uint32_t m_indexCount = 0;
     MeshBounds m_bounds{};
     std::unique_ptr<OzzRuntime> m_ozz;
+    std::unique_ptr<DecodedTextures> m_decodedTextures;
+    std::string m_loadedModelPath;
     std::vector<std::unique_ptr<PoseScratch>> m_poseScratch;  // indexed by ixjobs worker
     std::vector<ixtreeme::math::Mat4> m_inverseBindMatrices;
     std::vector<ixtreeme::math::Mat4> m_bonePaletteCpu;

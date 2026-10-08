@@ -104,6 +104,19 @@ void JobSystem::Stop()
     while (TryRunOne())
     {
     }
+    for (;;)
+    {
+        Task task;
+        {
+            std::lock_guard<std::mutex> lock(m_mutex);
+            if (m_backgroundQueue.empty())
+                break;
+            task = m_backgroundQueue.front();
+            m_backgroundQueue.pop_front();
+            m_queued.fetch_sub(1, std::memory_order_relaxed);
+        }
+        Run(task);
+    }
 }
 
 void JobSystem::Submit(TaskFunction fn, void* data, std::uint32_t index, Counter* counter)
@@ -149,12 +162,30 @@ void JobSystem::SubmitRange(TaskFunction fn, void* data, std::uint32_t first, st
             m_wake.notify_one();
 }
 
-void JobSystem::Wait(Counter& counter)
+void JobSystem::SubmitBackground(TaskFunction fn, void* data, std::uint32_t index, Counter* counter)
+{
+    if (counter)
+        counter->m_pending.fetch_add(1, std::memory_order_relaxed);
+    const Task task{fn, data, index, counter};
+    if (m_workers.empty())
+    {
+        Run(task);
+        return;
+    }
+    {
+        std::lock_guard<std::mutex> lock(m_mutex);
+        m_backgroundQueue.push_back(task);
+        m_queued.fetch_add(1, std::memory_order_relaxed);
+    }
+    m_wake.notify_one();
+}
+
+void JobSystem::Wait(Counter& counter, bool runBackground)
 {
     std::uint32_t idle = 0;
     while (!counter.Done())
     {
-        if (TryRunOne())
+        if (TryRunOne(runBackground))
         {
             idle = 0;
             continue;
@@ -166,15 +197,16 @@ void JobSystem::Wait(Counter& counter)
     }
 }
 
-bool JobSystem::TryRunOne()
+bool JobSystem::TryRunOne(bool runBackground)
 {
     Task task;
     {
         std::lock_guard<std::mutex> lock(m_mutex);
-        if (m_queue.empty())
+        std::deque<Task>& queue = !m_queue.empty() || !runBackground ? m_queue : m_backgroundQueue;
+        if (queue.empty())
             return false;
-        task = m_queue.front();
-        m_queue.pop_front();
+        task = queue.front();
+        queue.pop_front();
         m_queued.fetch_sub(1, std::memory_order_relaxed);
     }
     Run(task);
@@ -203,11 +235,13 @@ void JobSystem::WorkerMain(std::uint32_t worker)
         Task task;
         {
             std::unique_lock<std::mutex> lock(m_mutex);
-            m_wake.wait(lock, [this] { return m_stop || !m_queue.empty(); });
-            if (m_queue.empty())
+            m_wake.wait(lock, [this] { return m_stop || !m_queue.empty() || !m_backgroundQueue.empty(); });
+            // A frame's tasks first; background work only when none is queued.
+            std::deque<Task>& queue = !m_queue.empty() ? m_queue : m_backgroundQueue;
+            if (queue.empty())
                 return;  // stopping, nothing left
-            task = m_queue.front();
-            m_queue.pop_front();
+            task = queue.front();
+            queue.pop_front();
             m_queued.fetch_sub(1, std::memory_order_relaxed);
         }
         Run(task);

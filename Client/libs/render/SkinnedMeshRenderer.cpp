@@ -694,17 +694,34 @@ bool SkinnedMeshRenderer::Create(ixrhi::IXRHIDevice& rhi,
     const std::string& modelPath)
 {
     Destroy();
-    m_rhi = &rhi;
-    m_assets = &assets;
+    return LoadCpu(assets, modelPath) && FinishGpu(rhi);
+}
 
+bool SkinnedMeshRenderer::LoadCpu(client::asset::IAssetReader& assets, const std::string& modelPath)
+{
+    m_assets = &assets;
+    m_loadedModelPath = modelPath;
     std::string ext = std::filesystem::path(modelPath).extension().string();
     std::transform(ext.begin(), ext.end(), ext.begin(), [](unsigned char c) {
         return static_cast<char>(std::tolower(c));
     });
     const bool loaded = ext == ".fbx" ? LoadFbxMesh(modelPath) : LoadGltfMesh(modelPath);
+    if (!loaded)
+    {
+        LogFormat("[MESH] Create: loaded=0 model=%s", modelPath.c_str());
+        return false;
+    }
+    DecodeTextures(modelPath);
+    return true;
+}
+
+bool SkinnedMeshRenderer::FinishGpu(ixrhi::IXRHIDevice& rhi)
+{
+    m_rhi = &rhi;
+    const bool loaded = m_decodedTextures != nullptr;
     const bool buffers = loaded ? CreateBuffers(rhi) : false;
     const bool compute = buffers ? CreateComputeResources(rhi) : false;
-    const bool textures = compute ? CreateTextures(rhi, modelPath) : false;
+    const bool textures = compute ? UploadDecodedTextures(rhi) : false;
     const bool descriptors = textures ? CreateBindGroup(rhi) : false;
     const bool pipeline = descriptors ? CreatePipeline(rhi) : false;
 
@@ -2302,19 +2319,20 @@ ixrhi::IXRHIBuffer* SkinnedMeshRenderer::BonePalette(uint32_t frameIndex, uint32
     return m_skinPages[skinSlot / kSkinSlots]->palettes[frameIndex][skinSlot % kSkinSlots].get();
 }
 
-bool SkinnedMeshRenderer::CreateTextures(ixrhi::IXRHIDevice& rhi, const std::string& modelPath)
+struct SkinnedMeshRenderer::DecodedTextures
+{
+    std::array<DdsImage, SkinnedMeshRenderer::kTextureCount> images;
+};
+
+void SkinnedMeshRenderer::DecodeTextures(const std::string& modelPath)
 {
     const std::array<std::string, kTextureCount> textureFiles = {
         modelPath + "#baseColor",
         modelPath + "#fallback"};
-
-    const ixrhi::IXRHITextureUsage sampledUpload =
-        ixrhi::IXRHITextureUsage::Sampled | ixrhi::IXRHITextureUsage::TransferDst;
-    const ixrhi::IXRHICapabilities& caps = rhi.GetCapabilities();
-
+    m_decodedTextures = std::make_unique<DecodedTextures>();
     for (uint32_t textureIndex = 0; textureIndex < kTextureCount; ++textureIndex)
     {
-        DdsImage dds{};
+        DdsImage& dds = m_decodedTextures->images[textureIndex];
         bool loaded = false;
         if (textureIndex == 0)
         {
@@ -2329,7 +2347,19 @@ bool SkinnedMeshRenderer::CreateTextures(ixrhi::IXRHIDevice& rhi, const std::str
                 textureFiles[textureIndex].c_str());
             dds = CreateFallbackWhiteDdsImage(textureFiles[textureIndex]);
         }
+    }
+}
 
+bool SkinnedMeshRenderer::UploadDecodedTextures(ixrhi::IXRHIDevice& rhi)
+{
+    if (!m_decodedTextures)
+        return false;
+    const ixrhi::IXRHITextureUsage sampledUpload =
+        ixrhi::IXRHITextureUsage::Sampled | ixrhi::IXRHITextureUsage::TransferDst;
+    const ixrhi::IXRHICapabilities& caps = rhi.GetCapabilities();
+    for (uint32_t textureIndex = 0; textureIndex < kTextureCount; ++textureIndex)
+    {
+        DdsImage& dds = m_decodedTextures->images[textureIndex];
         if (!rhi.IsTextureFormatSupported(dds.format, sampledUpload))
         {
             LogFormat("[DDS] unsupported format features for %s format=%s",
@@ -2387,7 +2417,7 @@ bool SkinnedMeshRenderer::CreateTextures(ixrhi::IXRHIDevice& rhi, const std::str
             texture.height,
             texture.mipLevels);
     }
-
+    m_decodedTextures.reset();
     return true;
 }
 

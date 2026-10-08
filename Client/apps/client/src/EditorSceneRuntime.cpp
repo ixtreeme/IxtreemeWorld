@@ -6,6 +6,7 @@
 #include "RuntimeSession.h"
 #include "TerrainRenderer.h"
 
+#include <chrono>
 #include <algorithm>
 #include <utility>
 
@@ -66,6 +67,17 @@ void EditorSceneRuntime::BuildSceneSnapshot(SceneData& scene, bool includeTerrai
 
 void EditorSceneRuntime::ApplySceneData(const SceneData& scene)
 {
+    // Where a scene's load spends its time (the steps below, in ms), for load-time work.
+    using Clock = std::chrono::steady_clock;
+    Clock::time_point stepBegin = Clock::now();
+    const Clock::time_point applyBegin = stepBegin;
+    double slotsMs = 0.0, spatialMs = 0.0, terrainMs = 0.0, waterMs = 0.0, paletteMs = 0.0, modelsMs = 0.0;
+    const auto lap = [&stepBegin]() {
+        const Clock::time_point now = Clock::now();
+        const double ms = std::chrono::duration<double, std::milli>(now - stepBegin).count();
+        stepBegin = now;
+        return ms;
+    };
     if (m_context.waterBodies)
         *m_context.waterBodies = scene.waterBodies;
     if (m_context.pointLights)
@@ -81,6 +93,7 @@ void EditorSceneRuntime::ApplySceneData(const SceneData& scene)
                 m_context.ensureMeshMaterialSlots(mesh);
         }
     }
+    slotsMs = lap();
 
     if (m_context.clearSelection)
         m_context.clearSelection();
@@ -130,8 +143,10 @@ void EditorSceneRuntime::ApplySceneData(const SceneData& scene)
     if (m_context.applyEditorCamera)
         m_context.applyEditorCamera(scene.editorCamera);
 
+    lap();
     if (m_context.rebuildStaticMeshSpatialIndex)
         m_context.rebuildStaticMeshSpatialIndex();
+    spatialMs = lap();
 
     if (m_context.editorImGui)
     {
@@ -152,14 +167,17 @@ void EditorSceneRuntime::ApplySceneData(const SceneData& scene)
             m_context.syncTerrainAssetRoots();
 
         m_context.terrain->SetLightingState(scene.lighting);
+        lap();
         if (scene.terrain.exists)
         {
             m_context.terrain->CreateFlatTerrain(*m_context.rhi, scene.terrain);
+            terrainMs = lap();
             if (m_context.waterBodies)
             {
                 m_context.terrain->SetWaterBodies(*m_context.rhi, *m_context.waterBodies);
                 *m_context.waterBodies = m_context.terrain->GetWaterBodies();
             }
+            waterMs = lap();
         }
         else
         {
@@ -173,7 +191,16 @@ void EditorSceneRuntime::ApplySceneData(const SceneData& scene)
         {
             m_context.editorImGui->SetPaletteSlots(m_context.terrain->GetPaletteSlots());
         }
+        paletteMs = lap();
     }
+    lap();
+    if (m_context.finishSceneModelLoads)
+        m_context.finishSceneModelLoads();
+    modelsMs = lap();
+    Tracenf("[SCENE] apply %.1f ms: material slots %.1f, mesh spatial index %.1f, terrain %.1f, "
+            "water %.1f, terrain palette %.1f, then waiting for the models %.1f",
+        std::chrono::duration<double, std::milli>(Clock::now() - applyBegin).count(), slotsMs, spatialMs, terrainMs,
+        waterMs, paletteMs, modelsMs);
 
     if (m_context.waterBodiesDirty)
         *m_context.waterBodiesDirty = false;

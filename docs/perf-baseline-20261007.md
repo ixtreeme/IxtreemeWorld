@@ -169,6 +169,73 @@ Javított hiányosságok:
   layout-váltása és a render passok külső függősége nem fedte az attachment-olvasást (`LOAD`, mélységteszt), és
   a swapchain-kép acquire-jét sem. Javítva; a terhelt jeleneten és a tömegen is 0 hazárd.
 
+## Aszinkron asset-betöltés (4. lépés) – 2026-10-08
+
+- **Háttérsor a job-rendszerben** (`SubmitBackground`): hosszú munka, amire egyetlen frame sem vár. A workerek
+  csak akkor veszik elő, ha nincs frame-feladat, és a `Wait` is csak külön kérésre (`runBackground`) futtatja.
+  Workerek nélkül (`IX_JOBS=0`) azonnal lefut a hívó szálon, ez a régi, szinkron viselkedés.
+- **A modellek létrehozása két félre vált.** A `LoadCpu` bármely szálon futhat: fájlolvasás, parse és a
+  textúrák dekódolása, eszköz nélkül. A `FinishGpu` a render-szálon fut: bufferek, textúrafeltöltés, descriptorok,
+  pipeline-ok. A glTF-anyagok regisztrálása (`MaterialAssetManager`, `AssetDatabase`, egyik sem szálbiztos)
+  a `FinishGpu`-ba került.
+- **A frame-enkénti utak csak kérik a modellt.** Ilyen a render-rekord, a térbeli index és a skinning-előfázis.
+  Az első kérés háttérbe küldi a betöltést, és a frame a modell nélkül megy tovább. A frame elején a
+  `pumpModelLoads` befejezi a kész betöltéseket, és a modellre váró entitásokat beteszi a térbeli indexbe. Ahol a
+  modell azonnal kell (fizikai alak, kijelölés, gizmo, export), a `get…` megvárja, és közben maga is tölt.
+- **Jelenetbetöltéskor a térbeli index újraépítése indítja el az összes modellt.** Ezek a terep-palettával egy
+  időben töltődnek, és az `ApplySceneData` végén (`finishSceneModelLoads`) mind elkészül, így az első frame-ről
+  egy modell sem hiányzik.
+- **A script-spawn nem parse-olja a glTF-et a fő szálon.** Egy 15 MB-os modellnél ez eddig 18 ms volt. Ha a
+  cache már ismeri a modellt, onnan dönti el, hogy riggelt-e. Ha nem, statikusként indul, a betöltés jelzi a
+  rigget, és a skinning-előfázis meglévő önjavítása skinneddé teszi.
+- **Egyéb indulási munka:**
+  - A terep-paletta képei és mip-láncai rétegenként párhuzamosan készülnek, sRGB↔lineáris táblákkal.
+  - A jelenet `mesh_entity` elemei párhuzamosan dolgozódnak fel, a fájlbeli sorrendben.
+  - A hang aszinkron dekódol: a zene és a hurkolt klip streamel.
+  - A betöltési lépések mérése logba kerül (`[SCENE] load/apply/models`, modellenként betöltés és befejezés).
+
+Indulás, terhelt jelenet, buildelt játék (a legnagyobb frame az, amelyben a jelenet betöltődik):
+
+| Állapot | legnagyobb frame | jelenet alkalmazása |
+| --- | --- | --- |
+| a 4. lépés előtt | 2548 ms | – |
+| `IX_JOBS=0` (soros, a mostani kóddal) | 1606 ms | 1299 ms |
+| párhuzamos | **868–878 ms** | 576–585 ms |
+
+A párhuzamos indulás bontása:
+
+- Jelenet-JSON: ~305 ms, ebből a parse 239 ms, soros.
+- Alkalmazás: a paletta 365–382 ms, a víz 78 ms, az anyagslotok 39 ms, a térbeli index 25 ms. A modellekre a
+  végén már csak 54–61 ms-ot kell várni: az 5 modell a többi lépéssel párhuzamosan, ~540 ms alatt töltődik be.
+
+Játék közbeni spawn: a jelenetben még nem szereplő modellt (a KicsiK 15 MB-os másolata) tölt be egy Lua-script, és a
+2 másodperces ablak legnagyobb frame-jét mérem:
+
+| Mód | legnagyobb frame |
+| --- | --- |
+| `IX_JOBS=0` (szinkron betöltés) | 228 ms |
+| párhuzamos | 71 ms |
+| párhuzamos, a spawn nem parse-ol | **54 ms** |
+
+A modell ~150 ms alatt töltődik be: 127 ms a betöltő szálon, 21–31 ms a fő szálon (`FinishGpu`). A maradék spawn-költség
+nem asset-betöltés:
+
+- Minden spawn és destroy után a teljes fizikai világ újraépül (`rebuildEditorPhysicsWorld`): ~37 ms a 10 000
+  entitásos jeleneten.
+- Az első spawn átméretezi a 10 000 elemű entitásvektort: ~8 ms, egyszeri.
+
+Ellenőrzés:
+
+- A szinkronizációs validáció 0 hibát jelzett, beleértve a játék közbeni betöltést.
+- Ha betöltés közben zárják be az ablakot, a kilépés megvárja a betöltést és tisztán lezárul (exit code 0).
+- Editorban a projektmegnyitás, a Play, a spawn és a Stop hibátlanul lefutott.
+
+Hátravan:
+
+- A `FinishGpu` a fő szálon fut: skinned modellnél 21–38 ms (bufferek, compute-skin ellenőrzés, textúrák,
+  pipeline-ok), statikusnál 6–13 ms. Aszinkron GPU-feltöltés (transfer queue) és pipeline-megosztás csökkentené.
+- A jelenet-JSON parse és a paletta-dekódolás a legnagyobb indulási tétel.
+
 ## Következmény a párhuzamosítási tervre
 
 - A legnagyobb nyereség a **render-adatok kinyerésének** átalakítása (a terv 3. lépése). Kell hozzá

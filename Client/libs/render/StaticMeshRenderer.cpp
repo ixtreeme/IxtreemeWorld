@@ -989,6 +989,13 @@ std::uint8_t MaterialTextureRoleIndex(const char* role)
 
 } // namespace
 
+struct StaticMeshRenderer::PendingMaterialImport
+{
+    fastgltf::Asset asset;
+};
+
+StaticMeshRenderer::StaticMeshRenderer() = default;
+
 StaticMeshRenderer::~StaticMeshRenderer()
 {
     Destroy();
@@ -1012,15 +1019,85 @@ bool StaticMeshRenderer::Create(ixrhi::IXRHIDevice& rhi,
     const std::string& modelPath)
 {
     Destroy();
-    m_rhi = &rhi;
+    return LoadCpu(assets, modelPath) && FinishGpu(rhi);
+}
+
+bool StaticMeshRenderer::LoadCpu(client::asset::IAssetReader& assets, const std::string& modelPath)
+{
     m_assets = &assets;
     m_modelPath = modelPath;
     m_status = LoadStatus::Failed;
-    bool loaded = false;
+    m_pendingMaterialImport.reset();
+    auto logLoadFailure = [&]() {
+        LogFormat("[MESH] Create: loaded=0 buffers=0 textures=0 descriptors=0 pipeline=0 verts=%zu indices=%zu drawcalls=%zu model=%s",
+            m_vertices.size(),
+            m_indices.size(),
+            m_draws.size(),
+            modelPath.c_str());
+    };
+
+    const bool builtinPrimitive = modelPath.rfind("builtin://primitive/", 0) == 0;
+    const std::string ext = LowercaseExtension(modelPath);
+    if (builtinPrimitive)
+    {
+        if (!LoadBuiltinPrimitiveMesh(modelPath))
+        {
+            logLoadFailure();
+            return false;
+        }
+    }
+    else if (ext == ".fbx")
+    {
+        if (!LoadStaticFbxMesh(modelPath))
+        {
+            logLoadFailure();
+            return false;
+        }
+    }
+    else
+    {
+        bool isSkinned = false;
+        std::string error;
+        if (!DetectSkinnedGltf(assets, modelPath, isSkinned, &error))
+        {
+            LogFormat("[STATIC-MESH] inspect failed: %s reason=%s", modelPath.c_str(), error.c_str());
+            logLoadFailure();
+            return false;
+        }
+        if (isSkinned)
+        {
+            m_status = LoadStatus::UnsupportedSkinned;
+            LogFormat("[STATIC-MESH] skinned glTF detected, static renderer will not load it: %s", modelPath.c_str());
+            logLoadFailure();
+            return false;
+        }
+
+        if (!LoadStaticGltfMesh(modelPath))
+        {
+            logLoadFailure();
+            return false;
+        }
+    }
+    DecodeTextures(modelPath);
+    m_status = LoadStatus::NotLoaded;  // on the CPU; FinishGpu makes it LoadedStatic
+    return true;
+}
+
+bool StaticMeshRenderer::FinishGpu(ixrhi::IXRHIDevice& rhi)
+{
+    m_rhi = &rhi;
+    if (m_pendingMaterialImport)
+    {
+        GenerateMaterialAssetsForGltf(m_pendingMaterialImport->asset, m_modelPath);
+        m_pendingMaterialImport.reset();
+    }
+    const std::string& modelPath = m_modelPath;
+    const bool loaded = !m_vertices.empty() && !m_indices.empty();
     bool buffers = false;
     bool textures = false;
     bool descriptors = false;
     bool pipeline = false;
+    m_status = LoadStatus::Failed;
     auto logCreateState = [&]() {
         LogFormat("[MESH] Create: loaded=%d buffers=%d textures=%d descriptors=%d pipeline=%d verts=%zu indices=%zu drawcalls=%zu texture=%s bbox_min=(%.3f,%.3f,%.3f) bbox_max=(%.3f,%.3f,%.3f)",
             loaded ? 1 : 0,
@@ -1035,57 +1112,18 @@ bool StaticMeshRenderer::Create(ixrhi::IXRHIDevice& rhi,
             m_boundsMin[0], m_boundsMin[1], m_boundsMin[2],
             m_boundsMax[0], m_boundsMax[1], m_boundsMax[2]);
     };
-
-    const bool builtinPrimitive = modelPath.rfind("builtin://primitive/", 0) == 0;
-    const std::string ext = LowercaseExtension(modelPath);
-    if (builtinPrimitive)
+    if (!loaded)
     {
-        if (!LoadBuiltinPrimitiveMesh(modelPath))
-        {
-            logCreateState();
-            return false;
-        }
+        logCreateState();
+        return false;
     }
-    else if (ext == ".fbx")
-    {
-        if (!LoadStaticFbxMesh(modelPath))
-        {
-            logCreateState();
-            return false;
-        }
-    }
-    else
-    {
-        bool isSkinned = false;
-        std::string error;
-        if (!DetectSkinnedGltf(assets, modelPath, isSkinned, &error))
-        {
-            LogFormat("[STATIC-MESH] inspect failed: %s reason=%s", modelPath.c_str(), error.c_str());
-            logCreateState();
-            return false;
-        }
-        if (isSkinned)
-        {
-            m_status = LoadStatus::UnsupportedSkinned;
-            LogFormat("[STATIC-MESH] skinned glTF detected, static renderer will not load it: %s", modelPath.c_str());
-            logCreateState();
-            return false;
-        }
-
-        if (!LoadStaticGltfMesh(modelPath))
-        {
-            logCreateState();
-            return false;
-        }
-    }
-    loaded = true;
     if (!CreateBuffers(rhi))
     {
         logCreateState();
         return false;
     }
     buffers = HasVertexBuffer() && HasIndexBuffer();
-    if (!CreateTextures(rhi, modelPath))
+    if (!UploadDecodedTextures(rhi))
     {
         logCreateState();
         return false;
@@ -1495,7 +1533,9 @@ bool StaticMeshRenderer::LoadStaticGltfMesh(const std::string& modelPath)
         m_boundsMax = {0.0f, 0.0f, 0.0f};
         return false;
     }
-    GenerateMaterialAssetsForGltf(asset, modelPath);
+    // Its materials are registered in FinishGpu (this may run on a loading thread); asset is not
+    // read past here.
+    m_pendingMaterialImport = std::make_unique<PendingMaterialImport>(PendingMaterialImport{std::move(*parsed)});
     LogFormat("[MPERF] mesh=%s verts=%zu submeshes=%zu materials=%u alpha=%s",
         modelPath.c_str(),
         m_vertices.size(),
@@ -2454,11 +2494,14 @@ bool StaticMeshRenderer::UploadTexture(ixrhi::IXRHIDevice& rhi, const RgbaImage&
     return true;
 }
 
-bool StaticMeshRenderer::CreateTextures(ixrhi::IXRHIDevice& rhi, const std::string& modelPath)
+void StaticMeshRenderer::DecodeTextures(const std::string& modelPath)
 {
-    RgbaImage diffuse{};
-    RgbaImage normal{};
-    RgbaImage orm{};
+    RgbaImage& diffuse = m_decodedTextures[0];
+    RgbaImage& normal = m_decodedTextures[1];
+    RgbaImage& orm = m_decodedTextures[2];
+    diffuse = {};
+    normal = {};
+    orm = {};
     if (!m_assets || !LoadGltfMaterialTextures(*m_assets, modelPath, diffuse, normal, orm))
     {
         LogFormat("[STATIC-MESH] using fallback PBR textures for %s", modelPath.c_str());
@@ -2469,10 +2512,16 @@ bool StaticMeshRenderer::CreateTextures(ixrhi::IXRHIDevice& rhi, const std::stri
         normal = CreateFallbackNormalImage(modelPath);
     if (orm.pixels.empty())
         orm = CreateFallbackOrmImage(modelPath);
+}
 
-    return UploadTexture(rhi, diffuse, m_texture) &&
-        UploadTexture(rhi, normal, m_normalTexture) &&
-        UploadTexture(rhi, orm, m_ormTexture);
+bool StaticMeshRenderer::UploadDecodedTextures(ixrhi::IXRHIDevice& rhi)
+{
+    const bool uploaded = UploadTexture(rhi, m_decodedTextures[0], m_texture) &&
+        UploadTexture(rhi, m_decodedTextures[1], m_normalTexture) &&
+        UploadTexture(rhi, m_decodedTextures[2], m_ormTexture);
+    for (RgbaImage& image : m_decodedTextures)
+        image = {};
+    return uploaded;
 }
 
 const StaticMeshRenderer::Texture* StaticMeshRenderer::EnsureMaterialTexture(ixrhi::IXRHIDevice& rhi,

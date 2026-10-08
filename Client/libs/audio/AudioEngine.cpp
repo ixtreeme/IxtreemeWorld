@@ -150,8 +150,11 @@ bool AudioEngine::CreateSource(AudioSourceRuntime& rt, const AudioSourceComponen
     if (!m_impl->engineOk || absFilePath.empty())
         return false;
 
-    // Looping clips (music) stream; one-shots decode upfront for low latency.
-    ma_uint32 flags = comp.loop ? MA_SOUND_FLAG_STREAM : MA_SOUND_FLAG_DECODE;
+    // Looping clips and music stream; other one-shots decode upfront for low latency. Either way on
+    // miniaudio's own job thread (ASYNC): decoding a song here held the frame for ~0.5 s. A sound
+    // started before its data is there begins playing once it is.
+    const bool stream = comp.loop || comp.bus == AudioBus::Music;
+    ma_uint32 flags = (stream ? MA_SOUND_FLAG_STREAM : MA_SOUND_FLAG_DECODE) | MA_SOUND_FLAG_ASYNC;
     if (!comp.is3d)
         flags |= MA_SOUND_FLAG_NO_SPATIALIZATION;
 

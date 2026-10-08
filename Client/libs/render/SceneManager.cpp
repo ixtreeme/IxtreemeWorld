@@ -2,6 +2,7 @@
 
 #include "Common.h"
 #include "Debug.h"
+#include "JobSystem.h"
 #include "ProjectManager.h"
 #include "map/MapData.h"
 #include "schema/map_manifest.capnp.h"
@@ -2135,7 +2136,7 @@ MeshSceneEntity ReadMeshSceneEntity(const JsonValue& entity)
             if (value.type == JsonValue::Type::String)
                 mesh.materialSlots.push_back(value.string);
         }
-        Tracenf("[MATERIAL-SLOTS] loaded entity=%u slots=%zu", mesh.id, mesh.materialSlots.size());
+        // (Counted per scene by the loader: a line per entity was 10 000 flushed lines for a big scene.)
     }
     if (const JsonValue* materials = Find(entity, "material_overrides"); materials && materials->type == JsonValue::Type::Array)
     {
@@ -2410,9 +2411,15 @@ bool SceneManager::LoadSceneInternal(const std::string& path)
         return false;
     }
 
+    using Clock = std::chrono::steady_clock;
+    const Clock::time_point readBegin = Clock::now();
     std::string text((std::istreambuf_iterator<char>(file)), std::istreambuf_iterator<char>());
+    const std::size_t textBytes = text.size();
+    const Clock::time_point parseBegin = Clock::now();
     JsonValue root;
-    if (!JsonParser(std::move(text)).Parse(root) || root.type != JsonValue::Type::Object)
+    const bool parsed = JsonParser(std::move(text)).Parse(root);
+    const Clock::time_point parseEnd = Clock::now();
+    if (!parsed || root.type != JsonValue::Type::Object)
     {
         TraceError("[SCENE] JSON parse error: %s", path.c_str());
         TraceError("[SCENE] load FAILED: parse error path=%s", path.c_str());
@@ -2583,8 +2590,28 @@ bool SceneManager::LoadSceneInternal(const std::string& path)
         Tracen("[SCENE] no terrain in scene");
     }
 
+    const Clock::time_point entitiesBegin = Clock::now();
     if (const JsonValue* entities = Find(root, "entities"); entities && entities->type == JsonValue::Type::Array)
     {
+        // The mesh entities (most of a big scene) are read in parallel on the shared pool, each into
+        // its own place, and kept in file order; the other kinds below, in order, on this thread.
+        std::vector<const JsonValue*> meshNodes;
+        for (const JsonValue& entity : entities->array)
+        {
+            if (ReadString(entity, "type") == "mesh_entity")
+                meshNodes.push_back(&entity);
+        }
+        const std::size_t firstMesh = scene.meshEntities.size();
+        scene.meshEntities.resize(firstMesh + meshNodes.size());
+        ixjobs::JobSystem::Instance().ParallelFor(static_cast<std::uint32_t>(meshNodes.size()), 256,
+            [&](std::uint32_t begin, std::uint32_t end, std::uint32_t) {
+                for (std::uint32_t i = begin; i < end; ++i)
+                    scene.meshEntities[firstMesh + i] = ReadMeshSceneEntity(*meshNodes[i]);
+            });
+        std::size_t entitiesWithSlots = 0;
+        for (std::size_t i = firstMesh; i < scene.meshEntities.size(); ++i)
+            entitiesWithSlots += scene.meshEntities[i].materialSlots.empty() ? 0u : 1u;
+        Tracenf("[MATERIAL-SLOTS] loaded slots of %zu mesh entities", entitiesWithSlots);
         for (const JsonValue& entity : entities->array)
         {
             const std::string type = ReadString(entity, "type");
@@ -2618,7 +2645,7 @@ bool SceneManager::LoadSceneInternal(const std::string& path)
             }
             else if (type == "mesh_entity")
             {
-                scene.meshEntities.push_back(ReadMeshSceneEntity(entity));
+                // (read above)
             }
             else if (type == "camera")
             {
@@ -2671,6 +2698,12 @@ bool SceneManager::LoadSceneInternal(const std::string& path)
     Tracenf("[SCENE] Loaded successfully: %s (%zu entities)",
         path.c_str(),
         scene.waterBodies.size() + scene.pointLights.size() + scene.spotLights.size() + scene.meshEntities.size());
+    const auto ms = [](Clock::time_point from, Clock::time_point to) {
+        return std::chrono::duration<double, std::milli>(to - from).count();
+    };
+    Tracenf("[SCENE] load %.1f ms: read %.1f (%zu KB), parse %.1f, entities and the rest %.1f",
+        ms(readBegin, Clock::now()), ms(readBegin, parseBegin), textBytes / 1024u, ms(parseBegin, parseEnd),
+        ms(entitiesBegin, Clock::now()));
     return true;
 }
 

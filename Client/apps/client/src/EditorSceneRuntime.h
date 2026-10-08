@@ -52,6 +52,9 @@ public:
         std::uint32_t* mainCameraId = nullptr;
         std::function<EditorCameraState()> captureEditorCamera;
         std::function<void(const EditorCameraState&)> applyEditorCamera;
+        // Waits for the scene's models, which rebuildStaticMeshSpatialIndex started loading (they load
+        // while the terrain does), and puts their entities into the spatial index.
+        std::function<void()> finishSceneModelLoads;
     };
 
     explicit EditorSceneRuntime(Context context);

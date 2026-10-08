@@ -61,8 +61,13 @@ public:
     void Submit(TaskFunction fn, void* data, std::uint32_t index, Counter* counter);
     // fn(data, i) for i in [first, first + count), queued at once (one lock, one wake-up).
     void SubmitRange(TaskFunction fn, void* data, std::uint32_t first, std::uint32_t count, Counter* counter);
-    // Returns once every task counted in `counter` has run; runs queued tasks meanwhile.
-    void Wait(Counter& counter);
+    // Long work that no frame waits for (loading an asset): run by a worker when no frame task is
+    // queued, and never by a thread helping in Wait (a frame would take on a 100 ms load). Runs
+    // right away when the pool has no workers.
+    void SubmitBackground(TaskFunction fn, void* data, std::uint32_t index, Counter* counter);
+    // Returns once every task counted in `counter` has run; runs queued tasks meanwhile (background
+    // ones too when runBackground: a caller that blocks anyway, e.g. on the asset it needs now).
+    void Wait(Counter& counter, bool runBackground = false);
 
     // fn(begin, end, chunk) over [0, count) in chunks of about `grain` items (at least 1), in
     // parallel; returns when all have run. Chunk i always covers the same range, so per-chunk
@@ -91,14 +96,15 @@ private:
 
     JobSystem() = default;
     void WorkerMain(std::uint32_t worker);
-    bool TryRunOne();
+    bool TryRunOne(bool runBackground = false);
     void Run(const Task& task);
 
     std::vector<std::thread> m_workers;
     std::mutex m_mutex;
     std::condition_variable m_wake;
     std::deque<Task> m_queue;
-    std::atomic<std::uint32_t> m_queued{0};  // m_queue's size, read without the lock by spinning workers
+    std::deque<Task> m_backgroundQueue;
+    std::atomic<std::uint32_t> m_queued{0};  // both queues' size, read without the lock by spinning workers
     std::atomic<bool> m_stopping{false};
     bool m_stop = false;
     std::atomic<std::uint64_t> m_tasksRun{0};
