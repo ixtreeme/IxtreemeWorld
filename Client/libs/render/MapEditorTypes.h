@@ -476,8 +476,8 @@ struct MeshSceneEntity
     // Stage-3 temporary clip binding (id of an AnimationClip asset, or empty). Runtime-only —
     // not serialized; replaced by the real Animator component in Stage 4.
     std::string debugAnimationClipId;
-    // Stage-4 Animator: id of an AnimatorController asset (or empty). Runtime-only for now (full
-    // AnimatorComponent + serialization is a follow-up); takes priority over debugAnimationClipId.
+    // Stage-4 Animator: id of an AnimatorController asset (or empty), saved with the scene
+    // (animator_controller_id); takes priority over debugAnimationClipId.
     std::string animatorControllerId;
 };
 

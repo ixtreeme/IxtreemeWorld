@@ -11634,6 +11634,20 @@ int RunGame(NativeWindow& window,
                     const auto renderRecordsBegin = std::chrono::steady_clock::now();
                     validateStaticMeshRenderRecords();
                     frameProfile.renderRecordsMs = MillisecondsBetween(renderRecordsBegin, std::chrono::steady_clock::now());
+                    // Each character's pose for the frame, in three steps: here, per entity, what it
+                    // plays (animator, clip or motion state) and its skin slots; then the poses and
+                    // bone palettes, in parallel (IX_PARALLEL_ANIMATION); then the skinning dispatches,
+                    // recorded on this thread in entity order.
+                    struct SkinWork
+                    {
+                        SkinnedMeshRenderer* renderer = nullptr;
+                        ixanim::AnimatorRuntime* animator = nullptr;  // evaluated first, wins
+                        ixanim::ClipPlayback* playback = nullptr;     // the debug clip, else
+                        SkinnedMeshRenderer::MotionState motion = SkinnedMeshRenderer::MotionState::Idle;
+                        std::uint32_t slots[2] = {};                  // Scene view, Game view
+                        std::uint32_t slotCount = 0;
+                    };
+                    std::vector<SkinWork> skinWorks;
                     for (MeshSceneEntity& skinnedEntity : editorMeshEntities)
                     {
                         if (editorPlay.state.mode == EditorPlayMode::Edit && skinnedEntity.editorHidden)
@@ -11649,10 +11663,14 @@ int RunGame(NativeWindow& window,
                         }
                         if (!skinnedEntity.skinned)
                             continue;
-                        const std::size_t beforeSlotCount = skinnedEntity.materialSlots.size();
-                        EnsureMeshEntityMaterialSlots(skinnedEntity);
-                        if (skinnedEntity.materialSlots.size() != beforeSlotCount)
-                            SceneManager::Instance().MarkDirty();
+                        // (Only when its record was built again: the model or its materials changed.)
+                        if (skinnedEntity.materialSlots.empty() || meshRecord.changedFrame == renderRecordFrame)
+                        {
+                            const std::size_t beforeSlotCount = skinnedEntity.materialSlots.size();
+                            EnsureMeshEntityMaterialSlots(skinnedEntity);
+                            if (skinnedEntity.materialSlots.size() != beforeSlotCount)
+                                SceneManager::Instance().MarkDirty();
+                        }
                         SkinnedMeshRenderer* skinnedRenderer = getSkinnedMeshRenderer(skinnedRuntimePath);
                         if (!skinnedRenderer)
                             continue;
@@ -11673,8 +11691,11 @@ int RunGame(NativeWindow& window,
 
                         // Stage-4 Animator: if an AnimatorController is assigned, evaluate the FSM
                         // and use its pose (highest priority — over the debug clip and MotionState).
-                        ozz::span<const ozz::math::SoaTransform> animatorPose;
-#if defined(IXTREEME_WITH_EDITOR)
+                        // (Its controller and clips resolve through the project asset library, in the
+                        // editor and in the built game alike.)
+                        SkinWork work;
+                        work.renderer = skinnedRenderer;
+                        work.motion = editorMeshMotion;
                         if (!skinnedEntity.animatorControllerId.empty())
                         {
                             const std::string& ctrlId = skinnedEntity.animatorControllerId;
@@ -11735,9 +11756,7 @@ int RunGame(NativeWindow& window,
                                     if (csIt->second.jumpedThisFrame)
                                         ixanim::SetTrigger(animator, "Jump");
                                 }
-                                animatorPose = ixanim::EvaluateAnimator(animator, animDeltaSeconds,
-                                    skinnedRenderer->RestPoseLocals(),
-                                    [&](const std::string& clipId) { return editorImGui.AnimationClipFilePath(clipId); });
+                                work.animator = &animator;
                             }
                         }
                         else
@@ -11746,15 +11765,12 @@ int RunGame(NativeWindow& window,
                             entityControllers.erase(skinnedEntity.id);
                             entityBoundControllerId.erase(skinnedEntity.id);
                         }
-#endif
 
                         // Stage-3 temp binding: if a debug clip is assigned, (re)bind it retargeted
                         // onto this character's skeleton and sample it ONCE this frame. The slots
                         // below then skin from that pose (SkinInstanceFromPose) instead of the
                         // built-in MotionState clip. Sampling here (pre-pass) keeps Scene + Game in
                         // lockstep on the same pose and advances the clock exactly once per frame.
-                        ozz::span<const ozz::math::SoaTransform> retargetedPose;
-#if defined(IXTREEME_WITH_EDITOR)
                         {
                             const std::string& clipId = skinnedEntity.debugAnimationClipId;
                             if (clipId.empty())
@@ -11783,22 +11799,16 @@ int RunGame(NativeWindow& window,
                                 if (auto pbIt = entityClipPlaybacks.find(skinnedEntity.id);
                                     pbIt != entityClipPlaybacks.end() && pbIt->second.ready)
                                 {
-                                    retargetedPose = ixanim::SampleAndRetarget(pbIt->second,
-                                        skinnedRenderer->RestPoseLocals(), animDeltaSeconds);
+                                    work.playback = &pbIt->second;
                                 }
                             }
                         }
-#endif
 
                         const std::uint32_t sceneSlot = allocSkinSlot(skinnedEntry);
-                        if (sceneSlot != std::numeric_limits<std::uint32_t>::max())
+                        if (sceneSlot != std::numeric_limits<std::uint32_t>::max() &&
+                            skinnedRenderer->ReserveSkinSlot(sceneSlot))
                         {
-                            if (animatorPose.size() != 0)
-                                skinnedRenderer->SkinInstanceFromPose(*frameInfo.commandList, frameInfo, sceneSlot, animatorPose);
-                            else if (retargetedPose.size() != 0)
-                                skinnedRenderer->SkinInstanceFromPose(*frameInfo.commandList, frameInfo, sceneSlot, retargetedPose);
-                            else
-                                skinnedRenderer->SkinInstance(*frameInfo.commandList, frameInfo, sceneSlot, editorMeshMotion, static_cast<float>(seconds));
+                            work.slots[work.slotCount++] = sceneSlot;
                             sceneEditorSkinnedDraws.push_back(SkinnedDrawRecord{skinnedRenderer, sceneSlot, skinnedPosition, skinnedYaw,
                                 skinnedSelected ? std::array<float, 4>{1.25f, 1.15f, 0.65f, 1.0f}
                                                 : std::array<float, 4>{1.0f, 1.0f, 1.0f, 1.0f},
@@ -11818,14 +11828,10 @@ int RunGame(NativeWindow& window,
                         if (willRenderGameView)
                         {
                             const std::uint32_t gameSlot = allocSkinSlot(skinnedEntry);
-                            if (gameSlot != std::numeric_limits<std::uint32_t>::max())
+                            if (gameSlot != std::numeric_limits<std::uint32_t>::max() &&
+                                skinnedRenderer->ReserveSkinSlot(gameSlot))
                             {
-                                if (animatorPose.size() != 0)
-                                    skinnedRenderer->SkinInstanceFromPose(*frameInfo.commandList, frameInfo, gameSlot, animatorPose);
-                                else if (retargetedPose.size() != 0)
-                                    skinnedRenderer->SkinInstanceFromPose(*frameInfo.commandList, frameInfo, gameSlot, retargetedPose);
-                                else
-                                    skinnedRenderer->SkinInstance(*frameInfo.commandList, frameInfo, gameSlot, editorMeshMotion, static_cast<float>(seconds));
+                                work.slots[work.slotCount++] = gameSlot;
                                 gameEditorSkinnedDraws.push_back(SkinnedDrawRecord{skinnedRenderer, gameSlot, skinnedPosition, skinnedYaw,
                                     std::array<float, 4>{1.0f, 1.0f, 1.0f, 1.0f}, skinnedScale});
                             }
@@ -11840,7 +11846,62 @@ int RunGame(NativeWindow& window,
                                 }
                             }
                         }
+                        if (work.slotCount > 0 || work.animator || work.playback)
+                            skinWorks.push_back(work);
                     }
+
+                    // The poses and palettes. Each work touches only its entity's animator / clip
+                    // state and its own slots' palettes; a thread samples into scratch of its own.
+                    ixjobs::JobSystem& jobs = ixjobs::JobSystem::Instance();
+                    static const bool parallelAnimation = ixjobs::FeatureEnabled("IX_PARALLEL_ANIMATION");
+                    const std::uint32_t poseThreads = parallelAnimation ? jobs.WorkerCount() + 1u : 1u;
+                    for (const SkinWork& work : skinWorks)
+                        work.renderer->ReserveParallelPalettes(poseThreads);
+                    const ixanim::ClipPathResolver resolveClipPath = [&](const std::string& clipId) {
+                        return editorImGui.AnimationClipFilePath(clipId);
+                    };
+                    const auto prepare = [&](std::uint32_t begin, std::uint32_t end, std::uint32_t) {
+                        for (std::uint32_t i = begin; i < end; ++i)
+                        {
+                            SkinWork& work = skinWorks[i];
+                            const ozz::span<const ozz::math::SoaTransform> rest = work.renderer->RestPoseLocals();
+                            ozz::span<const ozz::math::SoaTransform> animatorPose;
+                            ozz::span<const ozz::math::SoaTransform> retargetedPose;
+                            if (work.animator)
+                                animatorPose = ixanim::EvaluateAnimator(*work.animator, animDeltaSeconds, rest, resolveClipPath);
+                            if (work.playback)
+                                retargetedPose = ixanim::SampleAndRetarget(*work.playback, rest, animDeltaSeconds);
+                            const ozz::span<const ozz::math::SoaTransform> pose =
+                                animatorPose.size() != 0 ? animatorPose : retargetedPose;
+                            if (work.slotCount > 0 &&
+                                !work.renderer->PreparePalette(frameInfo, work.slots, work.slotCount, pose,
+                                    work.motion, static_cast<float>(seconds)))
+                                work.slotCount = 0;  // nothing to skin from
+                        }
+                    };
+                    if (parallelAnimation)
+                        jobs.ParallelFor(static_cast<std::uint32_t>(skinWorks.size()), 4, prepare);
+                    else
+                        prepare(0, static_cast<std::uint32_t>(skinWorks.size()), 0);
+                    // The dispatches by model (one pipeline bind each), then one barrier for all their
+                    // outputs before the passes draw them.
+                    std::vector<std::pair<SkinnedMeshRenderer*, std::vector<std::uint32_t>>> skinSlotsByRenderer;
+                    for (const SkinWork& work : skinWorks)
+                    {
+                        if (work.slotCount == 0)
+                            continue;
+                        auto group = std::find_if(skinSlotsByRenderer.begin(), skinSlotsByRenderer.end(),
+                            [&](const auto& entry) { return entry.first == work.renderer; });
+                        if (group == skinSlotsByRenderer.end())
+                            group = skinSlotsByRenderer.insert(skinSlotsByRenderer.end(), {work.renderer, {}});
+                        group->second.insert(group->second.end(), work.slots, work.slots + work.slotCount);
+                    }
+                    for (const auto& [renderer, slots] : skinSlotsByRenderer)
+                        renderer->RecordSkins(*frameInfo.commandList, frameInfo, slots.data(),
+                            static_cast<std::uint32_t>(slots.size()), /*withoutBarrier=*/true);
+                    if (!skinSlotsByRenderer.empty())
+                        frameInfo.commandList->BufferMemoryBarrier(ixrhi::IXRHIBufferState::ShaderWrite,
+                            ixrhi::IXRHIBufferState::VertexRead);
                 }
             }
             else if (runtimeSession->IsLobbyActive())
@@ -12271,6 +12332,8 @@ int RunGame(NativeWindow& window,
                     shadowCasters.dynamicRevisions[cascade] = movingHere || skinnedHere ? (revision | 1u) : 0u;
                 }
                 StaticMeshRenderer::InstanceList cascadeInstances;
+                std::vector<SkinnedMeshRenderer::ShadowCasterInstance> skinnedCascadeInstances;
+                std::vector<SkinnedMeshRenderer*> skinnedCascadeRenderers;
                 const auto drawMeshBatches = [&](const std::vector<ShadowCasterBatch>& batches,
                                                  const WorldMat4& lightViewProj, const ixrhi::IXRHIRenderPass* pass) {
                     for (const ShadowCasterBatch& batch : batches)
@@ -12293,12 +12356,24 @@ int RunGame(NativeWindow& window,
                 shadowCasters.drawDynamic =
                     [&](std::uint32_t cascade, const WorldMat4& lightViewProj, const ixrhi::IXRHIRenderPass* pass) {
                         drawMeshBatches(movingShadowCasterBatches, lightViewProj, pass);
+                        // The characters by model: the pipeline and index buffer set once per model.
+                        skinnedCascadeRenderers.clear();
                         for (const SkinnedDrawRecord* record : skinnedShadowCasters)
                         {
-                            if (!skinnedInCascade(*record, cascade))
-                                continue;
-                            record->renderer->RenderShadowCaster(*frameInfo.commandList, frameInfo, lightViewProj, pass,
-                                record->position, record->yaw, record->slot, record->scale);
+                            if (std::find(skinnedCascadeRenderers.begin(), skinnedCascadeRenderers.end(), record->renderer) ==
+                                skinnedCascadeRenderers.end())
+                                skinnedCascadeRenderers.push_back(record->renderer);
+                        }
+                        for (SkinnedMeshRenderer* renderer : skinnedCascadeRenderers)
+                        {
+                            skinnedCascadeInstances.clear();
+                            for (const SkinnedDrawRecord* record : skinnedShadowCasters)
+                            {
+                                if (record->renderer == renderer && skinnedInCascade(*record, cascade))
+                                    skinnedCascadeInstances.push_back({record->position, record->yaw, record->slot, record->scale});
+                            }
+                            renderer->RenderShadowCasters(*frameInfo.commandList, frameInfo, lightViewProj, pass,
+                                skinnedCascadeInstances.data(), skinnedCascadeInstances.size());
                         }
                     };
                 if (!anyStaticCasters && skinnedShadowCasters.empty())

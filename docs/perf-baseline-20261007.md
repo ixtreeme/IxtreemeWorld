@@ -136,6 +136,39 @@ Az FPS (137) nem változott, mert a jelenet GPU-korlátos. A nyereség CPU-tarta
 dobozzal a fizika 0,70–0,93 ms helyett 0,58–0,63 ms; az editorban 4 Play/Stop ciklus hibátlanul lefutott.
 A Vulkan-validáció tiszta.
 
+## Animáció (2. lépés) – 2026-10-08
+
+A karakterek pózát a skinning-előfázis három lépésben számolja ki:
+
+1. **Soros, entitásonként:** mit játszik a karakter (animátor, klip vagy mozgásállapot), az animátor-kötés és a
+   paraméterek, valamint a skin-slotok lefoglalása.
+2. **Párhuzamos (`IX_PARALLEL_ANIMATION`):** az animátor kiértékelése, a klip mintavétele, a csontpaletta
+   számítása és feltöltése. Szálanként saját ozz-scratch van (`ReserveParallelPalettes`, `PreparePalette`).
+3. **Soros:** a dispatchek modellenként egy pipeline-kötéssel, a végén pedig egyetlen közös memória-barrier
+   (új RHI-hívás: `BufferMemoryBarrier`) a slotonkénti barrierek helyett. A skinned árnyékvetők is modellenként,
+   kötegben rajzolódnak.
+
+256 karakter (128 animátoros Arissa és 128 beépített klipes KicsiK), buildelt játék:
+
+| Mód | FPS | animáció | GPU-frame |
+| --- | --- | --- | --- |
+| javítások előtt | 180 | 1,09 ms (soros) / 0,85 ms | ~5,5 ms |
+| `IX_JOBS=0` | 204 | 0,93 ms | 4,8 ms |
+| párhuzamos | **205** | **0,51 ms** | 4,8 ms |
+
+Az FPS-nyereség a közös barrierből jön: a 256 külön barrier sorba rendezte a GPU-n a skinning-dispatcheket.
+
+Javított hiányosságok:
+
+- **Az animátor a buildelt játékban nem futott.** Az AnimatorController és a debug-klip kiértékelése editor-only
+  volt, mert a klip- és kontrollerútvonalat csak az editor oldotta fel. A futásidejű `EditorImGui` most ugyanúgy
+  feloldja őket a projekt asset-könyvtárából.
+- **Az animátor-hozzárendelés nem mentődött a jelenetbe.** Új mező: `animator_controller_id`. A prefabok még
+  nem mentik.
+- **Szinkronizációs validáció** (`VK_KHRONOS_VALIDATION_VALIDATE_SYNC=true`): a mélység- és színattachmentek
+  layout-váltása és a render passok külső függősége nem fedte az attachment-olvasást (`LOAD`, mélységteszt), és
+  a swapchain-kép acquire-jét sem. Javítva; a terhelt jeleneten és a tömegen is 0 hazárd.
+
 ## Következmény a párhuzamosítási tervre
 
 - A legnagyobb nyereség a **render-adatok kinyerésének** átalakítása (a terv 3. lépése). Kell hozzá

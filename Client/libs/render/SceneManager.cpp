@@ -1604,6 +1604,9 @@ void WriteSceneEntity(std::ostream& out, const MeshSceneEntity& mesh, bool comma
     out << "      \"mesh_asset_id\": \"" << EscapeJson(mesh.meshAssetId) << "\",\n";
     out << "      \"mesh_asset_path\": \"" << EscapeJson(mesh.meshAssetPath) << "\",\n";
     out << "      \"skinned\": " << (mesh.skinned ? "true" : "false");
+    // The AnimatorController the character plays (an asset id), in the editor and in the built game.
+    if (!mesh.animatorControllerId.empty())
+        out << ",\n      \"animator_controller_id\": \"" << EscapeJson(mesh.animatorControllerId) << "\"";
     if (mesh.layerAuthoring.enabled || mesh.layerAuthoring.tags != 0)
     {
         out << ",\n";
@@ -2103,6 +2106,7 @@ MeshSceneEntity ReadMeshSceneEntity(const JsonValue& entity)
     mesh.meshAssetId = ReadString(entity, "mesh_asset_id");
     mesh.meshAssetPath = ReadString(entity, "mesh_asset_path");
     mesh.skinned = ReadBool(entity, "skinned", mesh.skinned);
+    mesh.animatorControllerId = ReadString(entity, "animator_controller_id");
     if (const JsonValue* authoring = Find(entity, "layer_authoring");
         authoring && authoring->type == JsonValue::Type::Object)
     {

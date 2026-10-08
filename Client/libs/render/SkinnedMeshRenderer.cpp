@@ -1,5 +1,7 @@
 #include "SkinnedMeshRenderer.h"
 
+#include "JobSystem.h"
+
 #include "AssimpImporter.h"
 #include "Debug.h"
 #include "IXRHIShader.h"
@@ -47,6 +49,14 @@
 #include <utility>
 #include <variant>
 #include <vector>
+
+struct SkinnedMeshRenderer::PoseScratch
+{
+    ozz::animation::SamplingJob::Context context;
+    std::vector<ozz::math::SoaTransform> locals;
+    std::vector<ozz::math::Float4x4> models;
+    std::vector<ixtreeme::math::Mat4> palette;
+};
 
 struct SkinnedMeshRenderer::OzzRuntime
 {
@@ -1693,6 +1703,16 @@ bool SkinnedMeshRenderer::SamplePoseFromState(float animTimeSeconds, MotionState
 {
     if (!m_ozz)
         return false;
+    return SamplePose(animTimeSeconds, state, m_ozz->context, outLocals);
+}
+
+bool SkinnedMeshRenderer::SamplePose(float animTimeSeconds,
+    MotionState state,
+    ozz::animation::SamplingJob::Context& context,
+    ozz::span<ozz::math::SoaTransform> outLocals) const
+{
+    if (!m_ozz)
+        return false;
 
     // Select the clip for the requested motion state, falling back to idle (then the rest
     // pose) when the requested clip isn't loaded.
@@ -1712,7 +1732,7 @@ bool SkinnedMeshRenderer::SamplePoseFromState(float animTimeSeconds, MotionState
             : 0.0f;
         ozz::animation::SamplingJob samplingJob;
         samplingJob.animation = clip;
-        samplingJob.context = &m_ozz->context;
+        samplingJob.context = &context;
         samplingJob.ratio = ratio;
         samplingJob.output = outLocals;
         if (!samplingJob.Run())
@@ -1728,13 +1748,22 @@ bool SkinnedMeshRenderer::SamplePoseFromState(float animTimeSeconds, MotionState
 
 bool SkinnedMeshRenderer::BuildPaletteFromLocals(ozz::span<const ozz::math::SoaTransform> locals)
 {
-    if (!m_ozz || m_boneCount == 0)
+    if (!m_ozz)
+        return false;
+    return BuildPalette(locals, ozz::make_span(m_ozz->models), m_bonePaletteCpu);
+}
+
+bool SkinnedMeshRenderer::BuildPalette(ozz::span<const ozz::math::SoaTransform> locals,
+    ozz::span<ozz::math::Float4x4> models,
+    std::vector<ixtreeme::math::Mat4>& palette) const
+{
+    if (!m_ozz || m_boneCount == 0 || palette.size() < m_boneCount)
         return false;
 
     ozz::animation::LocalToModelJob localToModel;
     localToModel.skeleton = &m_ozz->skeleton;
     localToModel.input = locals;
-    localToModel.output = ozz::make_span(m_ozz->models);
+    localToModel.output = models;
     if (!localToModel.Run())
         return false;
 
@@ -1749,9 +1778,142 @@ bool SkinnedMeshRenderer::BuildPaletteFromLocals(ozz::span<const ozz::math::SoaT
                 m_inverseBindMatrices[bone].m[2 * 4 + col],
                 m_inverseBindMatrices[bone].m[3 * 4 + col]);
         }
-        m_bonePaletteCpu[bone] = ToRowVectorPaletteMatrix(m_ozz->models[bone] * inverseBind);
+        palette[bone] = ToRowVectorPaletteMatrix(models[bone] * inverseBind);
     }
     return true;
+}
+
+void SkinnedMeshRenderer::ReserveParallelPalettes(uint32_t threads)
+{
+    if (!m_ozz)
+        return;
+    while (m_poseScratch.size() < threads)
+    {
+        auto scratch = std::make_unique<PoseScratch>();
+        scratch->context.Resize(m_ozz->skeleton.num_joints());
+        scratch->locals.resize(static_cast<size_t>(m_ozz->skeleton.num_soa_joints()));
+        scratch->models.resize(static_cast<size_t>(m_ozz->skeleton.num_joints()));
+        scratch->palette.assign(m_boneCount, IdentityPaletteMatrix());
+        m_poseScratch.push_back(std::move(scratch));
+    }
+}
+
+bool SkinnedMeshRenderer::PreparePalette(const ixrhi::IXRHIFrameInfo& frame,
+    const uint32_t* skinSlots,
+    uint32_t slotCount,
+    ozz::span<const ozz::math::SoaTransform> pose,
+    MotionState state,
+    float animTimeSeconds)
+{
+    const uint32_t worker = ixjobs::JobSystem::CurrentWorker();
+    const uint32_t frameIndex = frame.frameIndex % kFramesInFlight;
+    if (!m_ozz || m_boneCount == 0 || worker >= m_poseScratch.size() || !frame.frameActive)
+        return false;
+    PoseScratch& scratch = *m_poseScratch[worker];
+    ozz::span<const ozz::math::SoaTransform> locals = pose;
+    if (locals.empty())
+    {
+        if (!SamplePose(animTimeSeconds, state, scratch.context, ozz::make_span(scratch.locals)))
+            return false;
+        locals = ozz::make_span(scratch.locals);
+    }
+    else if (locals.size() < NumSoaJoints())
+    {
+        return false;  // a pose for another skeleton
+    }
+    if (!BuildPalette(locals, ozz::make_span(scratch.models), scratch.palette))
+        return false;
+    const std::size_t bytes = sizeof(Mat4) * m_boneCount;
+    bool written = false;
+    for (uint32_t i = 0; i < slotCount; ++i)
+    {
+        if (ixrhi::IXRHIBuffer* palette = BonePalette(frameIndex, skinSlots[i]))
+        {
+            palette->Write(0, scratch.palette.data(), bytes);
+            written = true;
+        }
+    }
+    return written;
+}
+
+void SkinnedMeshRenderer::RecordSkins(ixrhi::IXRHICommandList& cmd,
+    const ixrhi::IXRHIFrameInfo& frame,
+    const uint32_t* skinSlots,
+    uint32_t slotCount,
+    bool withoutBarrier)
+{
+    if (!m_computePipeline || !frame.frameActive || slotCount == 0)
+        return;
+    const uint32_t frameIndex = frame.frameIndex % kFramesInFlight;
+    cmd.SetComputePipeline(*m_computePipeline);
+    SkinPushConstants push{};
+    push.vertexCount = static_cast<uint32_t>(m_vertices.size());
+    push.boneCount = m_boneCount;
+    const uint32_t groupCount = (push.vertexCount + 63u) / 64u;
+    for (uint32_t i = 0; i < slotCount; ++i)
+    {
+        const uint32_t slot = skinSlots[i];
+        if (!SkinnedOutput(frameIndex, slot))
+            continue;
+        cmd.BindGroup(0, *m_skinPages[slot / kSkinSlots]->computeGroup, frameIndex * kSkinSlots + slot % kSkinSlots);
+        cmd.PushConstants(&push, sizeof(push));
+        cmd.Dispatch(groupCount, 1, 1);
+        if (!withoutBarrier)
+            EmitSkinBarrier(cmd, frameIndex, slot);
+    }
+}
+
+void SkinnedMeshRenderer::RenderShadowCasters(ixrhi::IXRHICommandList& cmd,
+    const ixrhi::IXRHIFrameInfo& frame,
+    const WorldMat4& lightViewProj,
+    const ixrhi::IXRHIRenderPass* shadowPass,
+    const ShadowCasterInstance* instances,
+    std::size_t count)
+{
+    if (!m_rhi || !m_indexBuffer || m_indexCount == 0 || !shadowPass || !frame.frameActive || count == 0)
+        return;
+    if (m_shadowPass != shadowPass)
+    {
+        m_shadowPipeline.reset();
+        m_shadowPipelineFailed = false;
+        m_shadowPass = shadowPass;
+    }
+    if (!m_shadowPipeline && !m_shadowPipelineFailed && !CreateShadowPipeline(*m_rhi, shadowPass))
+    {
+        m_shadowPipelineFailed = true;
+        Log("[MESH] skinned mesh sun shadow pipeline could not be created");
+    }
+    if (!m_shadowPipeline)
+        return;
+    const uint32_t frameIndex = frame.frameIndex % kFramesInFlight;
+    const Mat4 lightViewProjLocal = ToLocalMat4(lightViewProj);
+    cmd.SetGraphicsPipeline(*m_shadowPipeline);
+    cmd.SetIndexBuffer(*m_indexBuffer, 0, /*thirtyTwoBit=*/true);
+    for (std::size_t i = 0; i < count; ++i)
+    {
+        const ShadowCasterInstance& instance = instances[i];
+        ixrhi::IXRHIBuffer* skinned = SkinnedOutput(frameIndex, instance.skinSlot);
+        if (!skinned)
+            continue;
+        // The same placement as the lit draws (UpdateWorldUniform), into the cascade's light space.
+        const Mat4 model = Multiply(Multiply(xm::Scale({instance.scale[0], instance.scale[1], instance.scale[2]}),
+                                        RotationY(-instance.yawRadians)),
+            Translation(instance.position.x, instance.position.y, instance.position.z));
+        const Mat4 mvp = Multiply(model, lightViewProjLocal);
+        cmd.PushConstants(&mvp, sizeof(mvp));
+        cmd.SetVertexBuffer(0, *skinned, 0);
+        for (const MeshDraw& draw : m_draws)
+            cmd.DrawIndexed(draw.indexCount, 1, draw.firstIndex, 0, 0);
+    }
+}
+
+void SkinnedMeshRenderer::RecordSkin(ixrhi::IXRHICommandList& cmd, const ixrhi::IXRHIFrameInfo& frame, uint32_t skinSlot)
+{
+    if (!m_computePipeline || !frame.frameActive || !SkinnedOutput(frame.frameIndex % kFramesInFlight, skinSlot))
+        return;
+    const uint32_t frameIndex = frame.frameIndex % kFramesInFlight;
+    DispatchSkin(cmd, frameIndex, skinSlot);
+    EmitSkinBarrier(cmd, frameIndex, skinSlot);
 }
 
 bool SkinnedMeshRenderer::CpuSkinVertices(bool updateBounds, bool logSamples)

@@ -125,6 +125,9 @@ public:
     virtual void TransitionBuffer(IXRHIBuffer& buffer,
                                   IXRHIBufferState from,
                                   IXRHIBufferState to) = 0;
+    // The same for every buffer at once: one barrier after many writes (e.g. the frame's
+    // skinning dispatches) instead of one per buffer.
+    virtual void BufferMemoryBarrier(IXRHIBufferState from, IXRHIBufferState to) = 0;
 };
 
 } // namespace ixrhi

@@ -31,6 +31,8 @@
 #include "IXRHIRenderPass.h"
 #include "IXRHITexture.h"
 
+#include <ozz/animation/runtime/sampling_job.h>
+#include <ozz/base/maths/simd_math.h>
 #include <ozz/base/maths/soa_transform.h>
 #include <ozz/base/span.h>
 
@@ -86,6 +88,44 @@ public:
                               const ixrhi::IXRHIFrameInfo& frame,
                               uint32_t skinSlot,
                               ozz::span<const ozz::math::SoaTransform> localPose);
+
+    // Skinning in two halves, so that many instances' poses are worked out in parallel. On the
+    // recording thread first: ReserveSkinSlot for each slot, and ReserveParallelPalettes for the
+    // threads that will prepare them (ixjobs::JobSystem::CurrentWorker() indexes the scratch). Then
+    // PreparePalette from any of those threads, each instance on one thread: it writes the frame's
+    // bone palette of the instance's slots (Scene and Game view: the same pose). Then RecordSkin per
+    // slot, on the recording thread, outside any render pass.
+    bool ReserveSkinSlot(uint32_t skinSlot) { return EnsureSkinSlot(skinSlot); }
+    void ReserveParallelPalettes(uint32_t threads);
+    // An empty pose: the built-in clip for the state, at animTimeSeconds.
+    bool PreparePalette(const ixrhi::IXRHIFrameInfo& frame,
+                        const uint32_t* skinSlots,
+                        uint32_t slotCount,
+                        ozz::span<const ozz::math::SoaTransform> pose,
+                        MotionState state,
+                        float animTimeSeconds);
+    void RecordSkin(ixrhi::IXRHICommandList& cmd, const ixrhi::IXRHIFrameInfo& frame, uint32_t skinSlot);
+    // Many slots' dispatches; withoutBarrier: the caller issues one barrier for all of them after
+    // (BufferMemoryBarrier ShaderWrite -> VertexRead) before any draw reads them.
+    void RecordSkins(ixrhi::IXRHICommandList& cmd,
+        const ixrhi::IXRHIFrameInfo& frame,
+        const uint32_t* skinSlots,
+        uint32_t slotCount,
+        bool withoutBarrier);
+    // Many skinned instances into one sun shadow cascade (RenderShadowCaster, with the state set once).
+    struct ShadowCasterInstance
+    {
+        WorldVec3 position{};
+        float yawRadians = 0.0f;
+        uint32_t skinSlot = 0;
+        std::array<float, 3> scale = {1.0f, 1.0f, 1.0f};
+    };
+    void RenderShadowCasters(ixrhi::IXRHICommandList& cmd,
+        const ixrhi::IXRHIFrameInfo& frame,
+        const WorldMat4& lightViewProj,
+        const ixrhi::IXRHIRenderPass* shadowPass,
+        const ShadowCasterInstance* instances,
+        std::size_t count);
     // Skeleton accessors for the animation layer (clip retargeting, rest-pose fallback).
     // Return null/empty when no skeleton is loaded yet.
     const ozz::animation::Skeleton* Skeleton() const;
@@ -248,6 +288,8 @@ private:
     };
 
     struct OzzRuntime;
+    // One thread's sampling context and transforms for PreparePalette (sized to this skeleton).
+    struct PoseScratch;
 
     bool LoadGltfMesh(const std::string& modelPath);
     bool LoadFbxMesh(const std::string& modelPath);
@@ -279,7 +321,15 @@ private:
     // palette without the (CPU-only, bounds/verify) vertex-skinning loop, and so an external
     // pose can be injected (SkinInstanceFromPose).
     bool SamplePoseFromState(float animTimeSeconds, MotionState state, ozz::span<ozz::math::SoaTransform> outLocals);
+    bool SamplePose(float animTimeSeconds,
+        MotionState state,
+        ozz::animation::SamplingJob::Context& context,
+        ozz::span<ozz::math::SoaTransform> outLocals) const;
     bool BuildPaletteFromLocals(ozz::span<const ozz::math::SoaTransform> locals);
+    // locals -> model transforms -> palette (bone x inverse bind, row-vector), into the given buffers.
+    bool BuildPalette(ozz::span<const ozz::math::SoaTransform> locals,
+        ozz::span<ozz::math::Float4x4> models,
+        std::vector<ixtreeme::math::Mat4>& palette) const;
     bool CpuSkinVertices(bool updateBounds, bool logSamples);
     bool UploadPaletteToBuffer(uint32_t frameIndex, uint32_t skinSlot);
     bool UploadBonePalette(MotionState state, float animTimeSeconds, uint32_t frameIndex, uint32_t skinSlot);
@@ -332,6 +382,7 @@ private:
     uint32_t m_indexCount = 0;
     MeshBounds m_bounds{};
     std::unique_ptr<OzzRuntime> m_ozz;
+    std::vector<std::unique_ptr<PoseScratch>> m_poseScratch;  // indexed by ixjobs worker
     std::vector<ixtreeme::math::Mat4> m_inverseBindMatrices;
     std::vector<ixtreeme::math::Mat4> m_bonePaletteCpu;
     uint32_t m_boneCount = 0;

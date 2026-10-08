@@ -213,14 +213,15 @@ void LayoutStageAccess(ixrhi::IXRHIImageLayout layout,
         stage = VK_PIPELINE_STAGE_FRAGMENT_SHADER_BIT;
         access = VK_ACCESS_SHADER_READ_BIT;
         break;
+    // Attachments are read too: a pass that loads them (and depth testing) reads what is there.
     case L::ColorAttachment:
         stage = VK_PIPELINE_STAGE_COLOR_ATTACHMENT_OUTPUT_BIT;
-        access = VK_ACCESS_COLOR_ATTACHMENT_WRITE_BIT;
+        access = VK_ACCESS_COLOR_ATTACHMENT_READ_BIT | VK_ACCESS_COLOR_ATTACHMENT_WRITE_BIT;
         break;
     case L::DepthStencilAttachment:
         stage = VK_PIPELINE_STAGE_EARLY_FRAGMENT_TESTS_BIT |
             VK_PIPELINE_STAGE_LATE_FRAGMENT_TESTS_BIT;
-        access = VK_ACCESS_DEPTH_STENCIL_ATTACHMENT_WRITE_BIT;
+        access = VK_ACCESS_DEPTH_STENCIL_ATTACHMENT_READ_BIT | VK_ACCESS_DEPTH_STENCIL_ATTACHMENT_WRITE_BIT;
         break;
     case L::Present:
         stage = VK_PIPELINE_STAGE_BOTTOM_OF_PIPE_BIT;
@@ -460,6 +461,21 @@ void IXVulkanCommandList::TransitionBuffer(ixrhi::IXRHIBuffer& buffer,
     barrier.offset = 0;
     barrier.size = static_cast<VkDeviceSize>(native->SizeBytes());
     vkCmdPipelineBarrier(m_cmd, srcStage, dstStage, 0, 0, nullptr, 1, &barrier, 0, nullptr);
+}
+
+void IXVulkanCommandList::BufferMemoryBarrier(ixrhi::IXRHIBufferState from, ixrhi::IXRHIBufferState to)
+{
+    VkPipelineStageFlags srcStage = 0;
+    VkAccessFlags srcAccess = 0;
+    VkPipelineStageFlags dstStage = 0;
+    VkAccessFlags dstAccess = 0;
+    BufferStageAccess(from, srcStage, srcAccess);
+    BufferStageAccess(to, dstStage, dstAccess);
+    VkMemoryBarrier barrier{};
+    barrier.sType = VK_STRUCTURE_TYPE_MEMORY_BARRIER;
+    barrier.srcAccessMask = srcAccess;
+    barrier.dstAccessMask = dstAccess;
+    vkCmdPipelineBarrier(m_cmd, srcStage, dstStage, 0, 1, &barrier, 0, nullptr, 0, nullptr);
 }
 
 std::unique_ptr<ixrhi::IXRHICommandList> IXVulkanDevice::CreateCommandList()

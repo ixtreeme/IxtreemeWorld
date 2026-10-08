@@ -79,6 +79,7 @@ public:
     void TransitionBuffer(ixrhi::IXRHIBuffer& buffer,
                           ixrhi::IXRHIBufferState from,
                           ixrhi::IXRHIBufferState to) override;
+    void BufferMemoryBarrier(ixrhi::IXRHIBufferState from, ixrhi::IXRHIBufferState to) override;
 
     VkCommandBuffer Native() const { return m_cmd; }
 

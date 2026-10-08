@@ -3245,7 +3245,40 @@ std::optional<LodConfig> EditorImGui::FindModelLodDefault(const std::string&) co
 
 // Asset-path resolvers are NOT editor UI — they're plain asset-library lookups (imgui-free), so they
 // get REAL implementations in the runtime build too. They resolve once the runtime initializes the
-// project asset library (InitializeProjectAssetLibrary), letting the shared sim load audio + Lua.
+// project asset library (InitializeProjectAssetLibrary), letting the shared sim load audio + Lua,
+// and animate characters through their AnimatorControllers and clips.
+std::string EditorImGui::AnimationClipFilePath(const std::string& clipId) const
+{
+    if (!m_assetLibrary || clipId.empty())
+        return {};
+    const auto entry = m_assetLibrary->FindById(clipId);
+    if (!entry || entry->category != AssetLibrary::Category::AnimationClip)
+        return {};
+    return m_assetLibrary->AbsolutePath(*entry).generic_string();
+}
+
+std::string EditorImGui::AnimatorControllerFilePath(const std::string& controllerId) const
+{
+    if (!m_assetLibrary || controllerId.empty())
+        return {};
+    const auto entry = m_assetLibrary->FindById(controllerId);
+    if (!entry || entry->category != AssetLibrary::Category::AnimatorController)
+        return {};
+    return m_assetLibrary->AbsolutePath(*entry).generic_string();
+}
+
+std::string EditorImGui::FindAnimationClipIdByDisplayName(const std::string& displayName) const
+{
+    if (!m_assetLibrary || displayName.empty())
+        return {};
+    for (const AssetLibrary::Entry& entry : m_assetLibrary->Entries())
+    {
+        if (entry.category == AssetLibrary::Category::AnimationClip && entry.displayName == displayName)
+            return entry.id;
+    }
+    return {};
+}
+
 std::string EditorImGui::AudioClipFilePath(const std::string& clipId) const
 {
     if (!m_assetLibrary || clipId.empty())
