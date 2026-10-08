@@ -274,6 +274,43 @@ frame-jében a részecskék ~1,1 ms-ot tesznek ki; a 25 ms-os frame fő tételei
 A tervből kimaradt: a Scene és Game transparent queue szálankénti gyűjtése és összefésülése. A gyűjtés most
 emitterenként csak néhány mező, a meglévő `stable_sort` megmarad, így ez nem mérhető tétel.
 
+## Spawn és destroy: a fizika és az árnyék – 2026-10-08
+
+- **A fizikai világ testenként változik.** A script `SpawnMesh`/`DestroyEntity` után eddig a teljes Jolt-világ
+  újraépült (~37 ms 10 000 entitásnál), és minden test elvesztette a sebességét, a kontaktusok pedig újraindultak
+  (`CollisionEnter` minden spawn után). Most a spawnolt entitás teste hozzáadódik (`createPhysicsBodyForEntity`,
+  ugyanaz, amiből a teljes építés is dolgozik), a törölté pedig kikerül. A teljes újraépítés csak akkor marad, ha
+  az entitás jointban van (a joint a testeket fogja), vagy ha még nincs világ.
+- **A törlések egyszerre hagyják el az entitáslistát** a drain végén, egy menetben. Eddig minden destroy külön
+  keresett és külön törölt a 10 000 elemű listából, és utána mindig újraépült az id-index.
+- **Egy új anyag betöltése nem rajzoltatja újra az összes árnyékot.** A spawnolt fa két, addig nem töltött anyagot
+  hozott. A `MaterialAssetManager` revíziója ettől lépett, minden render-rekord újra-előkészült és „változottnak”
+  számított, így 30 frame-en át mind a ~10 000 árnyékvető mozgóként rajzolódott (2 másodpercig 63–75 FPS). Két
+  javítás:
+  - Az első betöltés nem lépteti a revíziót; a mentés, a generált anyag mentése és az eldobás továbbra is igen.
+  - A `PrepareInstance` megmondja, változott-e ténylegesen az előkészített adat; csak akkor számít a rekord
+    változottnak.
+
+Spawn-teszt (`Main.scene.spawntest`, buildelt játék), a 2 másodperces ablak legnagyobb frame-je:
+
+| Esemény | előtte | most |
+| --- | --- | --- |
+| még be nem töltött riggelt modell spawnja | 54 ms | 33–35 ms |
+| betöltött statikus modell (fa) spawnja | 45 ms, utána 2 s-ig 63 FPS | 26–28 ms, utána 145 FPS |
+| a riggelt modell törlése | 42 ms | 8–18 ms |
+| a fa törlése | 49 ms | 27 ms |
+
+Ellenőrzés: a jointos kocka törlése teljes újraépítést kér (helyes). A dinamikus kocka törlése csak a saját
+testét veszi ki, a többi tovább mozog. Az 1000 eső dobozos jelenet 1005 testtel épül fel. A szinkronizációs
+validáció 0 hibát jelzett.
+
+Ami maradt (nem fizika):
+
+- A még be nem töltött riggelt modell `FinishGpu`-ja a fő szálon 21–31 ms.
+- A statikus árnyékvető megjelenése vagy eltűnése mind a 4 kaszkád statikus cache-ét újrarajzolja (~20 ms egy
+  frame-ben). Kaszkádonkénti revízió vagy több frame-re elosztott újrarajzolás segítene.
+- Az editorban Play közben az Inspector változásai el vannak dobva, így ott csak a Play indítása épít világot.
+
 ## Következmény a párhuzamosítási tervre
 
 - A legnagyobb nyereség a **render-adatok kinyerésének** átalakítása (a terv 3. lépése). Kell hozzá

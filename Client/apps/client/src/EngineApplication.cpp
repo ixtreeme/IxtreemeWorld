@@ -3187,11 +3187,12 @@ int RunGame(NativeWindow& window,
         StaticMeshRenderer::Instance& instance = record.instance;
         if (unchanged)
         {
-            if (record.renderer && record.prepared.materialRevision != MaterialAssetManager::Instance().Revision())
-            {
-                record.renderer->PrepareInstance(instance, record.prepared);
+            // The material assets changed: its records are made again, and the record counts as
+            // changed (its shadow drawn again, ...) only if they did. A material loaded for another
+            // model changes none: every caster in the scene redrew its shadow for 30 frames.
+            if (record.renderer && record.prepared.materialRevision != MaterialAssetManager::Instance().Revision() &&
+                record.renderer->PrepareInstance(instance, record.prepared))
                 record.changedFrame = renderRecordFrame;
-            }
             return record;
         }
         record.changedFrame = renderRecordFrame;
@@ -3925,10 +3926,170 @@ int RunGame(NativeWindow& window,
         if (physicsIt != editorPhysicsBodies.end())
         {
             editorPhysicsWorld.DestroyBody(physicsIt->second);
+            editorPhysicsBodyBindings.erase(physicsIt->second);
             editorPhysicsBodies.erase(physicsIt);
         }
         if (staticMeshSpatialIndexed.erase(id) > 0)
             staticMeshSpatialIndex.Remove(id);
+    };
+    struct PhysicsBodyCounts
+    {
+        std::uint32_t created = 0;
+        std::uint32_t dynamic = 0;
+        std::uint32_t statics = 0;
+        std::uint32_t kinematic = 0;
+        std::uint32_t gravity = 0;
+    };
+    // The entity's physics body (from its collider, rigidbody or character controller), made in the
+    // world and bound to the entity; 0 when it has none (or it could not be made). Its joints are made
+    // by rebuildEditorPhysicsWorld.
+    auto createPhysicsBodyForEntity = [&](const MeshSceneEntity& mesh, PhysicsBodyCounts& counts) -> phys::BodyId {
+        const bool isCharacter = mesh.hasCharacterController && mesh.characterController.enabled;
+        if ((!mesh.hasCollider || !mesh.collider.enabled) && !isCharacter)
+            return phys::BodyId{0};
+        phys::PhysicsBodyDesc desc{};
+        const bool rigidbodyEnabled = mesh.hasRigidbody && mesh.rigidbody.enabled;
+        desc.bodyType = rigidbodyEnabled ? mesh.rigidbody.bodyType : phys::BodyType::Static;
+        desc.rigidbody = rigidbodyEnabled ? mesh.rigidbody : phys::RigidbodyComponent{};
+        if (!rigidbodyEnabled)
+            desc.rigidbody.useGravity = false;
+        desc.collider = mesh.collider;
+        desc.transform = PhysicsTransformFromMesh(mesh);
+        desc.scale[0] = mesh.scale[0];
+        desc.scale[1] = mesh.scale[1];
+        desc.scale[2] = mesh.scale[2];
+        if (isCharacter)
+        {
+            // Player character: kinematic capsule on the Player layer, driven by the
+            // CharacterController. Movement is resolved in UpdateCharacterController; the
+            // kinematic sync moves this body to match the mesh each physics step.
+            phys::CharacterControllerComponent cc = mesh.characterController;
+            phys::Sanitize(cc);
+            desc.bodyType = phys::BodyType::Kinematic;
+            desc.rigidbody = phys::RigidbodyComponent{};
+            desc.rigidbody.enabled = true;
+            desc.rigidbody.bodyType = phys::BodyType::Kinematic;
+            desc.rigidbody.useGravity = false;
+            if (!mesh.hasCollider || mesh.collider.shape != phys::ColliderShape::Capsule)
+            {
+                desc.collider = phys::ColliderComponent{};
+                desc.collider.shape = phys::ColliderShape::Capsule;
+                desc.collider.radius = cc.capsuleRadius;
+                desc.collider.height = cc.capsuleHeight;
+                desc.collider.center[1] = cc.capsuleHeight * 0.5f; // seat capsule on feet
+            }
+            desc.collider.layer = phys::PhysicsLayer::Player;
+        }
+        if (desc.collider.shape == phys::ColliderShape::Mesh ||
+            desc.collider.shape == phys::ColliderShape::ConvexHull)
+        {
+            StaticMeshRenderer* renderer = getStaticMeshRenderer(resolveMeshRuntimePath(mesh));
+            if (renderer && renderer->CopyPhysicsMesh(desc.meshVertices, desc.meshIndices))
+            {
+                Tracenf("[PHYSICS] %s collider geometry entity=%u name=%s verts=%zu tris=%zu",
+                    phys::ToString(desc.collider.shape),
+                    mesh.id,
+                    mesh.name.c_str(),
+                    desc.meshVertices.size(),
+                    desc.meshIndices.size() / 3u);
+            }
+            else
+            {
+                Tracenf("[PHYSICS] %s collider geometry missing entity=%u name=%s fallback=box",
+                    phys::ToString(desc.collider.shape),
+                    mesh.id,
+                    mesh.name.c_str());
+            }
+        }
+        if (rigidbodyEnabled &&
+            desc.rigidbody.useGravity &&
+            desc.bodyType == phys::BodyType::Static)
+        {
+            desc.bodyType = phys::BodyType::Dynamic;
+            Tracenf("[PHYSICS] body auto-promoted entity=%u name=%s reason=static-rigidbody-with-gravity",
+                mesh.id,
+                mesh.name.c_str());
+        }
+        bool physicsMaterialApplied = false;
+        if (!desc.collider.materialAssetId.empty())
+        {
+            if (auto physicsMaterial = editorImGui.FindPhysicsMaterial(desc.collider.materialAssetId))
+            {
+                desc.collider.friction = physicsMaterial->friction;
+                desc.collider.restitution = physicsMaterial->restitution;
+                desc.collider.frictionCombine = physicsMaterial->frictionCombine;
+                desc.collider.restitutionCombine = physicsMaterial->restitutionCombine;
+                desc.rigidbody.linearDamping = physicsMaterial->linearDamping;
+                desc.rigidbody.angularDamping = physicsMaterial->angularDamping;
+                if (rigidbodyEnabled && desc.bodyType == phys::BodyType::Dynamic)
+                    desc.rigidbody.mass = std::max(0.001f, desc.rigidbody.mass * physicsMaterial->density);
+                physicsMaterialApplied = true;
+            }
+            else
+            {
+                Tracenf("[PHYSICS-MAT] missing entity=%u material=%s",
+                    mesh.id,
+                    desc.collider.materialAssetId.c_str());
+            }
+        }
+        const phys::BodyId bodyId = editorPhysicsWorld.CreateBody(desc);
+        if (bodyId == 0)
+            return phys::BodyId{0};
+        editorPhysicsBodies[mesh.id] = bodyId;
+        editorPhysicsBodyBindings[bodyId] = PhysicsBodyEntityBinding{mesh.id, mesh.name, false};
+        ++counts.created;
+        if (desc.bodyType == phys::BodyType::Dynamic)
+        {
+            ++counts.dynamic;
+            if (desc.rigidbody.useGravity)
+                ++counts.gravity;
+        }
+        else if (desc.bodyType == phys::BodyType::Kinematic)
+        {
+            ++counts.kinematic;
+        }
+        else
+        {
+            ++counts.statics;
+        }
+        Tracenf("[PHYSICS] body entity=%u name=%s type=%s gravity=%u sleep=%u ccd=%u collider=%s layer=%s material=%s mass=%.3f friction=%.2f bounce=%.2f combine=(%s,%s) scale=(%.3f,%.3f,%.3f)",
+            mesh.id,
+            mesh.name.c_str(),
+            phys::ToString(desc.bodyType),
+            desc.rigidbody.useGravity ? 1u : 0u,
+            desc.rigidbody.allowSleeping ? 1u : 0u,
+            desc.rigidbody.continuousCollision ? 1u : 0u,
+            phys::ToString(desc.collider.shape),
+            phys::ToString(desc.collider.layer),
+            physicsMaterialApplied ? desc.collider.materialAssetId.c_str() : "none",
+            desc.rigidbody.mass,
+            desc.collider.friction,
+            desc.collider.restitution,
+            phys::ToString(desc.collider.frictionCombine),
+            phys::ToString(desc.collider.restitutionCombine),
+            desc.scale[0],
+            desc.scale[1],
+            desc.scale[2]);
+        return bodyId;
+    };
+    // The entities that take part in a joint, at either end. A joint holds its bodies, so such an
+    // entity's body is not added or removed alone: the world is built again instead.
+    auto physicsJointEntities = [&]() {
+        std::unordered_set<std::uint32_t> entities;
+        for (const MeshSceneEntity& mesh : editorMeshEntities)
+        {
+            if (mesh.hasFixedJoint && mesh.fixedJoint.enabled && mesh.fixedJoint.connectedEntityId != 0)
+            {
+                entities.insert(mesh.id);
+                entities.insert(mesh.fixedJoint.connectedEntityId);
+            }
+            if (mesh.hasHingeJoint && mesh.hingeJoint.enabled && mesh.hingeJoint.connectedEntityId != 0)
+            {
+                entities.insert(mesh.id);
+                entities.insert(mesh.hingeJoint.connectedEntityId);
+            }
+        }
+        return entities;
     };
     auto clearEditorPhysicsWorld = [&]() {
         editorPhysicsBodies.clear();
@@ -3951,11 +4112,7 @@ int RunGame(NativeWindow& window,
             Tracen("[PHYSICS] world create failed");
             return false;
         }
-        std::uint32_t createdBodies = 0;
-        std::uint32_t dynamicBodies = 0;
-        std::uint32_t staticBodies = 0;
-        std::uint32_t kinematicBodies = 0;
-        std::uint32_t gravityBodies = 0;
+        PhysicsBodyCounts counts;
         std::uint32_t fixedJoints = 0;
         std::uint32_t hingeJoints = 0;
         auto makeJointPairKey = [](std::uint32_t a, std::uint32_t b) -> std::uint64_t {
@@ -3981,139 +4138,12 @@ int RunGame(NativeWindow& window,
                     0u,
                     terrainData.name.empty() ? std::string("Terrain") : terrainData.name,
                     true};
-                ++createdBodies;
-                ++staticBodies;
+                ++counts.created;
+                ++counts.statics;
             }
         }
         for (const MeshSceneEntity& mesh : editorMeshEntities)
-        {
-            const bool isCharacter = mesh.hasCharacterController && mesh.characterController.enabled;
-            if ((!mesh.hasCollider || !mesh.collider.enabled) && !isCharacter)
-                continue;
-            phys::PhysicsBodyDesc desc{};
-            const bool rigidbodyEnabled = mesh.hasRigidbody && mesh.rigidbody.enabled;
-            desc.bodyType = rigidbodyEnabled ? mesh.rigidbody.bodyType : phys::BodyType::Static;
-            desc.rigidbody = rigidbodyEnabled ? mesh.rigidbody : phys::RigidbodyComponent{};
-            if (!rigidbodyEnabled)
-                desc.rigidbody.useGravity = false;
-            desc.collider = mesh.collider;
-            desc.transform = PhysicsTransformFromMesh(mesh);
-            desc.scale[0] = mesh.scale[0];
-            desc.scale[1] = mesh.scale[1];
-            desc.scale[2] = mesh.scale[2];
-            if (isCharacter)
-            {
-                // Player character: kinematic capsule on the Player layer, driven by the
-                // CharacterController. Movement is resolved in UpdateCharacterController; the
-                // kinematic sync moves this body to match the mesh each physics step.
-                phys::CharacterControllerComponent cc = mesh.characterController;
-                phys::Sanitize(cc);
-                desc.bodyType = phys::BodyType::Kinematic;
-                desc.rigidbody = phys::RigidbodyComponent{};
-                desc.rigidbody.enabled = true;
-                desc.rigidbody.bodyType = phys::BodyType::Kinematic;
-                desc.rigidbody.useGravity = false;
-                if (!mesh.hasCollider || mesh.collider.shape != phys::ColliderShape::Capsule)
-                {
-                    desc.collider = phys::ColliderComponent{};
-                    desc.collider.shape = phys::ColliderShape::Capsule;
-                    desc.collider.radius = cc.capsuleRadius;
-                    desc.collider.height = cc.capsuleHeight;
-                    desc.collider.center[1] = cc.capsuleHeight * 0.5f; // seat capsule on feet
-                }
-                desc.collider.layer = phys::PhysicsLayer::Player;
-            }
-            if (desc.collider.shape == phys::ColliderShape::Mesh ||
-                desc.collider.shape == phys::ColliderShape::ConvexHull)
-            {
-                StaticMeshRenderer* renderer = getStaticMeshRenderer(resolveMeshRuntimePath(mesh));
-                if (renderer && renderer->CopyPhysicsMesh(desc.meshVertices, desc.meshIndices))
-                {
-                    Tracenf("[PHYSICS] %s collider geometry entity=%u name=%s verts=%zu tris=%zu",
-                        phys::ToString(desc.collider.shape),
-                        mesh.id,
-                        mesh.name.c_str(),
-                        desc.meshVertices.size(),
-                        desc.meshIndices.size() / 3u);
-                }
-                else
-                {
-                    Tracenf("[PHYSICS] %s collider geometry missing entity=%u name=%s fallback=box",
-                        phys::ToString(desc.collider.shape),
-                        mesh.id,
-                        mesh.name.c_str());
-                }
-            }
-            if (rigidbodyEnabled &&
-                desc.rigidbody.useGravity &&
-                desc.bodyType == phys::BodyType::Static)
-            {
-                desc.bodyType = phys::BodyType::Dynamic;
-                Tracenf("[PHYSICS] body auto-promoted entity=%u name=%s reason=static-rigidbody-with-gravity",
-                    mesh.id,
-                    mesh.name.c_str());
-            }
-            bool physicsMaterialApplied = false;
-            if (!desc.collider.materialAssetId.empty())
-            {
-                if (auto physicsMaterial = editorImGui.FindPhysicsMaterial(desc.collider.materialAssetId))
-                {
-                    desc.collider.friction = physicsMaterial->friction;
-                    desc.collider.restitution = physicsMaterial->restitution;
-                    desc.collider.frictionCombine = physicsMaterial->frictionCombine;
-                    desc.collider.restitutionCombine = physicsMaterial->restitutionCombine;
-                    desc.rigidbody.linearDamping = physicsMaterial->linearDamping;
-                    desc.rigidbody.angularDamping = physicsMaterial->angularDamping;
-                    if (rigidbodyEnabled && desc.bodyType == phys::BodyType::Dynamic)
-                        desc.rigidbody.mass = std::max(0.001f, desc.rigidbody.mass * physicsMaterial->density);
-                    physicsMaterialApplied = true;
-                }
-                else
-                {
-                    Tracenf("[PHYSICS-MAT] missing entity=%u material=%s",
-                        mesh.id,
-                        desc.collider.materialAssetId.c_str());
-                }
-            }
-            const phys::BodyId bodyId = editorPhysicsWorld.CreateBody(desc);
-            if (bodyId == 0)
-                continue;
-            editorPhysicsBodies[mesh.id] = bodyId;
-            editorPhysicsBodyBindings[bodyId] = PhysicsBodyEntityBinding{mesh.id, mesh.name, false};
-            ++createdBodies;
-            if (desc.bodyType == phys::BodyType::Dynamic)
-            {
-                ++dynamicBodies;
-                if (desc.rigidbody.useGravity)
-                    ++gravityBodies;
-            }
-            else if (desc.bodyType == phys::BodyType::Kinematic)
-            {
-                ++kinematicBodies;
-            }
-            else
-            {
-                ++staticBodies;
-            }
-            Tracenf("[PHYSICS] body entity=%u name=%s type=%s gravity=%u sleep=%u ccd=%u collider=%s layer=%s material=%s mass=%.3f friction=%.2f bounce=%.2f combine=(%s,%s) scale=(%.3f,%.3f,%.3f)",
-                mesh.id,
-                mesh.name.c_str(),
-                phys::ToString(desc.bodyType),
-                desc.rigidbody.useGravity ? 1u : 0u,
-                desc.rigidbody.allowSleeping ? 1u : 0u,
-                desc.rigidbody.continuousCollision ? 1u : 0u,
-                phys::ToString(desc.collider.shape),
-                phys::ToString(desc.collider.layer),
-                physicsMaterialApplied ? desc.collider.materialAssetId.c_str() : "none",
-                desc.rigidbody.mass,
-                desc.collider.friction,
-                desc.collider.restitution,
-                phys::ToString(desc.collider.frictionCombine),
-                phys::ToString(desc.collider.restitutionCombine),
-                desc.scale[0],
-                desc.scale[1],
-                desc.scale[2]);
-        }
+            createPhysicsBodyForEntity(mesh, counts);
         for (const MeshSceneEntity& mesh : editorMeshEntities)
         {
             if (!mesh.hasFixedJoint || !mesh.fixedJoint.enabled || mesh.fixedJoint.connectedEntityId == 0)
@@ -4203,11 +4233,11 @@ int RunGame(NativeWindow& window,
         editorPhysicsWorldActive = true;
         editorPhysicsStepLogFrames = 0;
         Tracenf("[PHYSICS] play world rebuilt bodies=%u dynamic=%u static=%u kinematic=%u gravityBodies=%u worldGravity=(%.2f,%.2f,%.2f) fixedDt=%.4f maxSubsteps=%u fixedJoints=%u hingeJoints=%u meshEntities=%zu",
-            createdBodies,
-            dynamicBodies,
-            staticBodies,
-            kinematicBodies,
-            gravityBodies,
+            counts.created,
+            counts.dynamic,
+            counts.statics,
+            counts.kinematic,
+            counts.gravity,
             physicsSettings.gravity[0],
             physicsSettings.gravity[1],
             physicsSettings.gravity[2],
@@ -6826,11 +6856,37 @@ int RunGame(NativeWindow& window,
                 // legally enqueue more ops, reallocating the vector — a range-for/reference would dangle.
                 // Ops queued during the drain run next frame.
                 const std::size_t drainCount = scriptApi.deferredOps.size();
+                // The physics world changes body by body: a spawned entity's body is added, a destroyed
+                // one's removed (removeStaticMeshSpatialEntity), the rest keep moving as they were. Only
+                // an entity in a joint (or no world yet) builds the world again. The destroyed entities
+                // leave the entity list at once, after the drain.
+                const bool spawnsOrDestroys = std::any_of(scriptApi.deferredOps.begin(),
+                    scriptApi.deferredOps.begin() + static_cast<std::ptrdiff_t>(drainCount),
+                    [](const ScriptApiImpl::DeferredOp& queued) {
+                        return queued.kind == ScriptApiImpl::DeferredKind::SpawnMesh ||
+                            queued.kind == ScriptApiImpl::DeferredKind::Destroy;
+                    });
+                bool rebuildPhysics = spawnsOrDestroys && !editorPhysicsWorldActive;
+                const std::unordered_set<std::uint32_t> jointEntities =
+                    spawnsOrDestroys ? physicsJointEntities() : std::unordered_set<std::uint32_t>{};
+                std::unordered_set<std::uint32_t> destroyedEntities;
+                // An entity by id that is not destroyed in this drain (by the lookup, else a search).
+                auto findLiveEntity = [&](std::uint32_t id) -> MeshSceneEntity* {
+                    if (destroyedEntities.count(id) > 0)
+                        return nullptr;
+                    if (MeshSceneEntity* found = findMeshEntityById(id))
+                        return found;
+                    const auto it = std::find_if(editorMeshEntities.begin(), editorMeshEntities.end(),
+                        [&](const MeshSceneEntity& m) { return m.id == id; });
+                    return it != editorMeshEntities.end() ? &*it : nullptr;
+                };
                 for (std::size_t opIdx = 0; opIdx < drainCount; ++opIdx)
                 {
                     const ScriptApiImpl::DeferredOp op = scriptApi.deferredOps[opIdx];
                     if (op.kind == ScriptApiImpl::DeferredKind::Destroy)
                     {
+                        if (jointEntities.count(op.id) > 0)
+                            rebuildPhysics = true;
                         if (auto sit = entityScripts.find(op.id); sit != entityScripts.end())
                         {
                             if (sit->second)
@@ -6843,10 +6899,7 @@ int RunGame(NativeWindow& window,
                         entityAudioSources.erase(op.id);
                         entityParticles.erase(op.id);
                         removeStaticMeshSpatialEntity(op.id);
-                        auto meshIt = std::find_if(editorMeshEntities.begin(), editorMeshEntities.end(),
-                            [&](const MeshSceneEntity& m) { return m.id == op.id; });
-                        if (meshIt != editorMeshEntities.end())
-                            editorMeshEntities.erase(meshIt);
+                        destroyedEntities.insert(op.id);
                         if (selectedEditorObject.type == SelectedEditorObjectType::MeshEntity &&
                             selectedEditorObject.id == op.id)
                             selectedEditorObject = {};
@@ -6867,9 +6920,8 @@ int RunGame(NativeWindow& window,
                                     e && e->category == AssetLibrary::Category::Material)
                                     guid = AssetDatabase::Instance().getOrCreateGuid(projectAssets.AbsolutePath(*e)).toString();
                         }
-                        auto meshIt = std::find_if(editorMeshEntities.begin(), editorMeshEntities.end(),
-                            [&](const MeshSceneEntity& m) { return m.id == op.id; });
-                        if (guid.empty() || meshIt == editorMeshEntities.end())
+                        MeshSceneEntity* meshIt = findLiveEntity(op.id);
+                        if (guid.empty() || !meshIt)
                         {
                             TraceError("[SCRIPT] SetMaterial: unknown %s (entity=%u material=%s)",
                                 guid.empty() ? "material" : "entity", op.id, op.assetId.c_str());
@@ -6887,13 +6939,27 @@ int RunGame(NativeWindow& window,
                     else  // SpawnMesh
                     {
                         spawnMeshEntityForScript(op.assetId, op.pos, op.id);
+                        if (jointEntities.count(op.id) > 0)
+                            rebuildPhysics = true;
+                        else if (!rebuildPhysics)
+                        {
+                            PhysicsBodyCounts counts;
+                            createPhysicsBodyForEntity(editorMeshEntities.back(), counts);
+                        }
                     }
                 }
                 // Erase only what we drained; any ops a hook queued during the drain stay for next frame.
                 scriptApi.deferredOps.erase(scriptApi.deferredOps.begin(),
                     scriptApi.deferredOps.begin() + static_cast<std::ptrdiff_t>(drainCount));
-                rebuildMeshEntityLookup();
-                rebuildEditorPhysicsWorld();  // the entity set changed
+                if (!destroyedEntities.empty())
+                {
+                    editorMeshEntities.erase(std::remove_if(editorMeshEntities.begin(), editorMeshEntities.end(),
+                        [&](const MeshSceneEntity& m) { return destroyedEntities.count(m.id) > 0; }),
+                        editorMeshEntities.end());
+                    rebuildMeshEntityLookup();  // the indices moved (a spawn adds its own entry)
+                }
+                if (rebuildPhysics)
+                    rebuildEditorPhysicsWorld();
                 SceneManager::Instance().MarkDirty();
             }
 

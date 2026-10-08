@@ -3408,24 +3408,33 @@ void StaticMeshRenderer::RenderLodBatchInWorld(ixrhi::IXRHICommandList& cmd,
     m_lastSubmittedInstances = static_cast<std::uint32_t>(instances.size());
 }
 
-void StaticMeshRenderer::PrepareInstance(const Instance& instance, PreparedInstance& out) const
+bool StaticMeshRenderer::PrepareInstance(const Instance& instance, PreparedInstance& out) const
 {
     const Mat4 identity = Identity();
+    const std::uint32_t slotCount = MaterialSlotCount();
+    bool changed = out.renderer != this || out.slots.size() != slotCount;
     out.renderer = this;
-    out.slots.resize(MaterialSlotCount());
-    for (std::uint32_t slot = 0; slot < out.slots.size(); ++slot)
-        FillStaticMeshInstanceBlock(identity, instance, slot, m_materialDefaults, out.slots[slot]);
-    out.hasTransparentDraws = false;
+    out.slots.resize(slotCount);
+    for (std::uint32_t slot = 0; slot < slotCount; ++slot)
+    {
+        InstanceBlock block{};
+        FillStaticMeshInstanceBlock(identity, instance, slot, m_materialDefaults, block);
+        changed = changed || std::memcmp(&block, &out.slots[slot], sizeof(InstanceBlock)) != 0;
+        out.slots[slot] = block;
+    }
+    bool hasTransparentDraws = false;
     for (const MeshDraw& draw : m_draws)
     {
         if (draw.indexCount != 0 && IsBlendMaterialSlot(instance, draw.materialSlot))
         {
-            out.hasTransparentDraws = true;
+            hasTransparentDraws = true;
             break;
         }
     }
-    // Read after the lookups: a material they loaded moved the revision on.
+    changed = changed || hasTransparentDraws != out.hasTransparentDraws;
+    out.hasTransparentDraws = hasTransparentDraws;
     out.materialRevision = MaterialAssetManager::Instance().Revision();
+    return changed;
 }
 
 void StaticMeshRenderer::FillInstanceBlock(const WorldMat4& viewProjection,

@@ -149,7 +149,8 @@ public:
 
     // The instance's view-independent records (see Instance::prepared). Made again when the instance
     // or MaterialAssetManager::Revision() changes; cheap to keep, about 200 bytes per material slot.
-    void PrepareInstance(const Instance& instance, PreparedInstance& out) const;
+    // True when they differ from what out held (a material loaded for another model changes none).
+    bool PrepareInstance(const Instance& instance, PreparedInstance& out) const;
 
     bool Create(ixrhi::IXRHIDevice& rhi,
                 client::asset::IAssetReader& assets,

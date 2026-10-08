@@ -89,9 +89,12 @@ public:
                                 const std::string& materialName,
                                 ImportSummary* summary = nullptr);
     void invalidate(const Guid& guid);
-    // Changes whenever what a material GUID resolves to may have: a material loaded, saved (its
-    // edits are applied to the loaded asset, then saved) or dropped. Whoever keeps values read from
-    // the materials keeps this with them and reads them again when it moves on.
+    // Changes whenever what a material GUID resolves to may have: a material saved (its edits are
+    // applied to the loaded asset, then saved; a generated one is saved too) or dropped. Whoever keeps
+    // values read from the materials keeps this with them and reads them again when it moves on.
+    // Loading one (a first getOrLoad) does not move it: whatever read a GUID loaded it then, so no
+    // kept value can be of one not loaded yet (a load that failed and now works means files changed,
+    // and an asset library refresh reads everything again).
     std::uint64_t Revision() const { return revision_; }
 
 private:

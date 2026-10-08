@@ -309,7 +309,6 @@ MaterialAsset* MaterialAssetManager::getOrLoad(const Guid& guid)
         guid.toString().c_str());
     MaterialAsset* result = material.get();
     cache_[guid] = std::move(material);
-    ++revision_;
     return result;
 }
 
