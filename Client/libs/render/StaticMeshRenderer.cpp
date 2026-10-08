@@ -989,6 +989,17 @@ std::uint8_t MaterialTextureRoleIndex(const char* role)
 
 } // namespace
 
+struct StaticMeshRenderer::MaterialTextureLoad
+{
+    ixjobs::Counter decoded;  // the decode job
+    std::filesystem::path path;
+    ixrhi::IXRHIFormat format = ixrhi::IXRHIFormat::R8G8B8A8Unorm;
+    std::string role;
+    RgbaImage image;
+    bool ok = false;
+    ~MaterialTextureLoad() { ixjobs::JobSystem::Instance().Wait(decoded, /*runBackground=*/true); }
+};
+
 struct StaticMeshRenderer::PendingMaterialImport
 {
     fastgltf::Asset asset;
@@ -2483,20 +2494,59 @@ void StaticMeshRenderer::LodWorkerMain()
     }
 }
 
-bool StaticMeshRenderer::RecordPendingUploads(ixrhi::IXRHICommandList& cmd, const ixrhi::IXRHIFrameInfo& frame)
+void StaticMeshRenderer::RecordTextureUpload(ixrhi::IXRHICommandList& cmd, const Texture& texture,
+                                             const ixrhi::IXRHIBuffer& staging)
 {
+    cmd.TransitionTexture(*texture.image, ixrhi::IXRHIImageLayout::Undefined, ixrhi::IXRHIImageLayout::TransferDst);
+    cmd.CopyBufferToTexture(staging, 0, texture.width, *texture.image, 0, 0, 0, 0, texture.width, texture.height);
+    cmd.TransitionTexture(*texture.image, ixrhi::IXRHIImageLayout::TransferDst, ixrhi::IXRHIImageLayout::ShaderReadOnly);
+}
+
+void StaticMeshRenderer::RecordPendingUploads(ixrhi::IXRHICommandList& cmd, const ixrhi::IXRHIFrameInfo& frame)
+{
+    if (!m_rhi || !frame.frameActive)
+        return;
+    // The material textures decoded since: made, and copied in ahead of the frame's draws.
+    for (auto it = m_materialTextureLoads.begin(); it != m_materialTextureLoads.end();)
+    {
+        MaterialTextureLoad& load = *it->second;
+        if (!load.decoded.Done())
+        {
+            ++it;
+            continue;
+        }
+        Texture texture{};
+        std::shared_ptr<ixrhi::IXRHIBuffer> staging;
+        if (!load.ok || !UploadTexture(*m_rhi, load.image, texture, &staging) || !staging)
+        {
+            m_failedMaterialTextureKeys.insert(it->first);
+            LogFormat("[MATBIND-DIAG] texture %s failed role=%s path=%s", load.ok ? "upload" : "decode",
+                load.role.c_str(), load.path.generic_string().c_str());
+            it = m_materialTextureLoads.erase(it);
+            continue;
+        }
+        RecordTextureUpload(cmd, texture, *staging);
+        m_materialTextureStaging.push_back({std::move(staging), frame.frameNumber});
+        LogFormat("[MATBIND-DIAG] texture loaded role=%s image=%s path=%s", load.role.c_str(), texture.name.c_str(),
+            load.path.generic_string().c_str());
+        m_materialTextureCache.emplace(it->first, std::move(texture));
+        it = m_materialTextureLoads.erase(it);
+    }
+    // Staging whose copy's frame is done (its slot came round again).
+    m_materialTextureStaging.erase(std::remove_if(m_materialTextureStaging.begin(), m_materialTextureStaging.end(),
+                                       [&](const RetiredStaging& staging) {
+                                           return frame.frameNumber >= staging.frame + kFramesInFlight;
+                                       }),
+        m_materialTextureStaging.end());
+
     if (!m_pendingUploads)
-        return false;
-    if (!frame.frameActive)
-        return true;
+        return;
     PendingUploads& uploads = *m_pendingUploads;
     if (uploads.recordedFrame != std::numeric_limits<std::uint64_t>::max())
     {
-        // The frame that copied them is done once its slot comes round again.
-        if (frame.frameNumber < uploads.recordedFrame + kFramesInFlight)
-            return true;
-        m_pendingUploads.reset();
-        return false;
+        if (frame.frameNumber >= uploads.recordedFrame + kFramesInFlight)
+            m_pendingUploads.reset();
+        return;
     }
     uploads.recordedFrame = frame.frameNumber;
     if (uploads.vertexStaging && m_vertexBuffer)
@@ -2513,34 +2563,29 @@ bool StaticMeshRenderer::RecordPendingUploads(ixrhi::IXRHICommandList& cmd, cons
     for (std::size_t i = 0; i < textures.size(); ++i)
     {
         const std::shared_ptr<ixrhi::IXRHIBuffer>& staging = uploads.textureStaging[i];
-        Texture& texture = *textures[i];
-        if (!staging || !texture.image)
-            continue;
-        cmd.TransitionTexture(*texture.image, ixrhi::IXRHIImageLayout::Undefined, ixrhi::IXRHIImageLayout::TransferDst);
-        cmd.CopyBufferToTexture(*staging, 0, texture.width, *texture.image, 0, 0, 0, 0, texture.width, texture.height);
-        cmd.TransitionTexture(*texture.image, ixrhi::IXRHIImageLayout::TransferDst,
-            ixrhi::IXRHIImageLayout::ShaderReadOnly);
+        if (staging && textures[i]->image)
+            RecordTextureUpload(cmd, *textures[i], *staging);
     }
-    return true;
 }
 
 bool StaticMeshRenderer::UploadTexture(ixrhi::IXRHIDevice& rhi, const RgbaImage& source, Texture& texture,
                                        std::shared_ptr<ixrhi::IXRHIBuffer>* staging)
 {
-    RgbaImage image = source;
+    const RgbaImage& image = source;
     const ixrhi::IXRHITextureUsage sampledUpload =
         ixrhi::IXRHITextureUsage::Sampled | ixrhi::IXRHITextureUsage::TransferDst;
-    if (!rhi.IsTextureFormatSupported(image.format, sampledUpload))
+    ixrhi::IXRHIFormat format = image.format;
+    if (!rhi.IsTextureFormatSupported(format, sampledUpload))
     {
-        image.format = ixrhi::IXRHIFormat::R8G8B8A8Unorm;
-        if (!rhi.IsTextureFormatSupported(image.format, sampledUpload))
+        format = ixrhi::IXRHIFormat::R8G8B8A8Unorm;  // the same RGBA8 texels
+        if (!rhi.IsTextureFormatSupported(format, sampledUpload))
             return false;
     }
 
     ixrhi::IXRHITextureDesc desc;
     desc.width = image.width;
     desc.height = image.height;
-    desc.format = image.format;
+    desc.format = format;
     desc.usage = sampledUpload;
     desc.debugName = "StaticMesh:" + image.name;
     std::shared_ptr<ixrhi::IXRHITexture> uploaded;
@@ -2585,7 +2630,7 @@ bool StaticMeshRenderer::UploadTexture(ixrhi::IXRHIDevice& rhi, const RgbaImage&
     texture.width = image.width;
     texture.height = image.height;
     texture.mipLevels = 1;
-    texture.format = image.format;
+    texture.format = format;
     return true;
 }
 
@@ -2646,35 +2691,24 @@ const StaticMeshRenderer::Texture* StaticMeshRenderer::EnsureMaterialTexture(ixr
         return nullptr;
     }
 
-    RgbaImage image{};
-    if (!DecodeTextureFile(*path, format, role ? role : "texture", image))
-    {
-        m_failedMaterialTextureKeys.insert(key);
-        LogFormat("[MATBIND-DIAG] texture decode failed role=%s guid=%s path=%s",
-            role ? role : "texture",
-            guidText.c_str(),
-            path->generic_string().c_str());
-        return nullptr;
-    }
-
-    Texture texture{};
-    if (!UploadTexture(rhi, image, texture))
-    {
-        m_failedMaterialTextureKeys.insert(key);
-        LogFormat("[MATBIND-DIAG] texture upload failed role=%s guid=%s path=%s",
-            role ? role : "texture",
-            guidText.c_str(),
-            path->generic_string().c_str());
-        return nullptr;
-    }
-
-    auto [it, _] = m_materialTextureCache.emplace(key, std::move(texture));
-    LogFormat("[MATBIND-DIAG] texture loaded role=%s guid=%s image=%s path=%s",
-        role ? role : "texture",
-        guidText.c_str(),
-        it->second.name.c_str(),
-        path->generic_string().c_str());
-    return &it->second;
+    // Called while drawing (inside a render pass): the texture is decoded on a loading thread and
+    // made and copied in by RecordPendingUploads; until then the model's own texture stands in.
+    (void)rhi;
+    if (m_materialTextureLoads.find(key) != m_materialTextureLoads.end())
+        return nullptr;  // on its way
+    auto load = std::make_unique<MaterialTextureLoad>();
+    load->path = *path;
+    load->format = format;
+    load->role = role ? role : "texture";
+    MaterialTextureLoad* started = load.get();
+    m_materialTextureLoads.emplace(key, std::move(load));
+    ixjobs::JobSystem::Instance().SubmitBackground(
+        [](void* data, std::uint32_t) {
+            MaterialTextureLoad& texture = *static_cast<MaterialTextureLoad*>(data);
+            texture.ok = DecodeTextureFile(texture.path, texture.format, texture.role.c_str(), texture.image);
+        },
+        started, 0, &started->decoded);
+    return nullptr;
 }
 
 StaticMeshRenderer::MaterialTextureViews StaticMeshRenderer::ResolveMaterialTextureViews(ixrhi::IXRHIDevice& rhi,
@@ -3862,6 +3896,8 @@ void StaticMeshRenderer::Destroy()
     m_texture = {};
     m_normalTexture = {};
     m_ormTexture = {};
+    m_materialTextureLoads.clear();  // (waits for their decodes)
+    m_materialTextureStaging.clear();
     m_materialTextureCache.clear();
     m_failedMaterialTextureKeys.clear();
     // The shadow map belongs to the terrain renderer; holding it past here leaks it at device teardown.

@@ -164,9 +164,10 @@ public:
     bool LoadCpu(client::asset::IAssetReader& assets, const std::string& modelPath);
     bool FinishGpu(ixrhi::IXRHIDevice& rhi, bool deferUploads = false);
     bool HasPendingUploads() const { return m_pendingUploads != nullptr; }
-    // The staged uploads, recorded once into the frame (outside render passes, before the model is
-    // drawn in it); true while it still needs calls (its staging goes once that frame is done).
-    bool RecordPendingUploads(ixrhi::IXRHICommandList& cmd, const ixrhi::IXRHIFrameInfo& frame);
+    // Once a frame, outside render passes, before the model is drawn in it: the staged uploads
+    // (FinishGpu's, once), and the material textures decoded since (made and copied in; usable by
+    // the frame's draws). Staging goes once the frame that copied it is done.
+    void RecordPendingUploads(ixrhi::IXRHICommandList& cmd, const ixrhi::IXRHIFrameInfo& frame);
     bool RecreatePipeline(ixrhi::IXRHIDevice& rhi);
     // Borrowed target pass (offscreen scene pass); null = backend default.
     void SetTargetPass(const ixrhi::IXRHIRenderPass* pass) { m_targetPass = pass; }
@@ -509,6 +510,20 @@ private:
         }
     };
     std::unordered_map<MaterialTextureKey, Texture, MaterialTextureKeyHash> m_materialTextureCache;
+    // Material textures on their way: decoded on a loading thread (EnsureMaterialTexture starts it, at
+    // draw time), then made and copied in by RecordPendingUploads; the model's own textures stand in.
+    struct MaterialTextureLoad;
+    std::unordered_map<MaterialTextureKey, std::unique_ptr<MaterialTextureLoad>, MaterialTextureKeyHash>
+        m_materialTextureLoads;
+    // Their staging, kept until the frame that copied it is done.
+    struct RetiredStaging
+    {
+        std::shared_ptr<ixrhi::IXRHIBuffer> buffer;
+        std::uint64_t frame = 0;
+    };
+    std::vector<RetiredStaging> m_materialTextureStaging;
+    // A texture's copy from its staging, with the layout changes around it (outside render passes).
+    static void RecordTextureUpload(ixrhi::IXRHICommandList& cmd, const Texture& texture, const ixrhi::IXRHIBuffer& staging);
     std::unordered_set<MaterialTextureKey, MaterialTextureKeyHash> m_failedMaterialTextureKeys;
     std::vector<LastMaterialBinding> m_lastMaterialBindings;
     std::unique_ptr<ixrhi::IXRHIBindGroupLayout> m_bindLayout;

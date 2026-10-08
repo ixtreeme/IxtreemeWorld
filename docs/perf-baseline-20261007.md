@@ -452,8 +452,21 @@ statikus modell csak render passokon belül rajzolódik, ahol másolni nem lehet
 Ellenőrzés: a fák, kockák és árnyékaik a korábbi képpel egyezően rajzolódnak, a buildelt játékban és az editorban
 (Play) is. A szinkronizációs validáció 0 hibát jelzett.
 
-Ami maradt: az anyagok első rajzoláskor betöltött textúrái (`EnsureMaterialTexture`) még szinkron töltődnek fel,
-rajzolás közben.
+### Anyag-textúrák
+
+Az anyagok textúrái (`EnsureMaterialTexture`) eddig az első rajzoláskor töltődtek be, a render passon belül: a fő
+szálon dekódolták a képfájlt, és szinkron töltötték fel.
+
+- **Most a betöltés aszinkron:** az első kérés csak elindítja a dekódolást egy betöltő szálon, és addig a modell
+  saját textúrái helyettesítik az anyagét.
+- **A kész textúrák a feltöltési ponton kerülnek a GPU-ra.** A modellek feltöltési pontján (passokon kívül) jön
+  létre az objektum és rögzítődik a másolás, így a frame rajzolásai már használhatják. A staging akkor szabadul
+  fel, amikor az a frame lefutott.
+- Az alkalmazás ezt minden frame-ben minden betöltött statikus modellre meghívja, nem egy listára.
+- Az `UploadTexture` már nem másolja le a képet a memóriában.
+
+A betöltött modell (új anyagokkal) spawnjának ablakában a legnagyobb frame 8,8 ms, a jelenet szokásos szintje. A fák
+textúrázva rajzolódnak, a szinkronizációs validáció 0 hibát jelzett.
 
 ## Következmény a párhuzamosítási tervre
 

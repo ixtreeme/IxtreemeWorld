@@ -2773,9 +2773,6 @@ int RunGame(NativeWindow& window,
     // one are built again. The entities whose spatial sync found their model loading are synced again
     // at the next frame's start (pumpModelLoads).
     std::uint64_t staticModelRevision = 0;
-    // Static models finished with their uploads deferred: each frame copies theirs in (outside render
-    // passes, before any pass draws them) until their staging is gone.
-    std::vector<StaticMeshRenderer*> staticMeshUploads;
     std::vector<std::string> finishedStaticModelPaths;
     std::unordered_map<std::string, std::unordered_set<std::uint32_t>> pendingSpatialSyncs;
 
@@ -2997,8 +2994,6 @@ int RunGame(NativeWindow& window,
             if (offscreenSceneOk)
                 entry.renderer->SetTargetPass(offscreenScene.GetTargetPass());
             loaded = entry.renderer->FinishGpu(*rhiDevice, /*deferUploads=*/true);
-            if (loaded && entry.renderer->HasPendingUploads())
-                staticMeshUploads.push_back(entry.renderer.get());
         }
         const auto finished = std::chrono::steady_clock::now();
         const double cpuMs = entry.load->cpuMs;
@@ -12566,16 +12561,13 @@ int RunGame(NativeWindow& window,
             // Edit alike (the compute writes the buffer the transparent queue draws later).
             simulateGpuParticleEmitters(*frameInfo.commandList, frameInfo,
                 static_cast<float>(deltaSeconds));
-            // The static models finished since: their data copied in before any pass draws them.
-            for (std::size_t i = 0; i < staticMeshUploads.size();)
+            // The static models' data finished since (a model's, a material texture's): copied in
+            // before any pass draws them.
+            for (auto& [path, entry] : staticMeshCache)
             {
-                if (staticMeshUploads[i]->RecordPendingUploads(*frameInfo.commandList, frameInfo))
-                {
-                    ++i;
-                    continue;
-                }
-                staticMeshUploads[i] = staticMeshUploads.back();
-                staticMeshUploads.pop_back();
+                (void)path;
+                if (entry.state == StaticMeshCacheEntry::State::LoadedStatic)
+                    entry.renderer->RecordPendingUploads(*frameInfo.commandList, frameInfo);
             }
             {
                 const auto instancesBegin = std::chrono::steady_clock::now();
