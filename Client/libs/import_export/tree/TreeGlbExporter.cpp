@@ -6,6 +6,7 @@
 #include "MaterialAssetManager.h"
 #include <ixtreemetree/leaf_trim.h>
 #include <stb_image.h>
+#include "asset/ExrImage.h"
 
 #include <algorithm>
 #include <chrono>
@@ -446,7 +447,22 @@ TreeExportResult TreeGlbExporter::SaveAsAsset(const ixtreemetree::TreeMesh& mesh
         int width = 0;
         int height = 0;
         int channels = 0;
-        stbi_uc* pixels = stbi_load(leafTexturePath.string().c_str(), &width, &height, &channels, 4);
+        std::vector<std::uint8_t> exrPixels;
+        stbi_uc* stbPixels = nullptr;
+        if (client::asset::IsExrPath(leafTexturePath))
+        {
+            std::string error;
+            auto exr = client::asset::LoadExr(leafTexturePath, error);
+            if (exr)
+            {
+                width = exr->width;
+                height = exr->height;
+                exrPixels = client::asset::ExrRgba8(*exr, client::asset::ExrByteMode::LinearData);
+            }
+            else TraceError("[TREE-EXR] %s", error.c_str());
+        }
+        else stbPixels = stbi_load(leafTexturePath.string().c_str(), &width, &height, &channels, 4);
+        const std::uint8_t* pixels = exrPixels.empty() ? stbPixels : exrPixels.data();
         if (pixels && width > 0 && height > 0)
         {
             trimmedMesh = mesh;
@@ -460,8 +476,7 @@ TreeExportResult TreeGlbExporter::SaveAsAsset(const ixtreemetree::TreeMesh& mesh
                 result.leafAreaReduction * 100.0f);
             outputMesh = &trimmedMesh;
         }
-        if (pixels)
-            stbi_image_free(pixels);
+        stbi_image_free(stbPixels);
     }
     if (!WriteGlb(*outputMesh,
             modelPath,

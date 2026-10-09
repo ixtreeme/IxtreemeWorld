@@ -2233,7 +2233,7 @@ void EditorImGui::RenderSkyPanel()
                     }
                     else
                     {
-                        m_assetStatus = "The sky takes image assets only (PNG, JPG, TGA or HDR)";
+                        m_assetStatus = "The sky takes image assets only (PNG, JPG, TGA, HDR or EXR)";
                     }
                 }
                 ImGui::EndDragDropTarget();
@@ -2318,7 +2318,7 @@ void EditorImGui::RenderSkyPanel()
     }
     case SkySettings::Mode::Panorama:
         imageSlot("Panorama", sky.panoramaPath,
-            "An equirectangular 360 x 180 degree image (2:1), PNG, JPG or HDR.\n"
+            "An equirectangular 360 x 180 degree image (2:1), PNG, JPG, HDR or EXR.\n"
             "Drop it here from the Asset Browser.");
         break;
     }

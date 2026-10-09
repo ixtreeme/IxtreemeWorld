@@ -142,6 +142,15 @@ endif()
 target_compile_features(IXEngineRender PUBLIC cxx_std_20)
 
 if(BUILD_TESTING AND NOT ANDROID)
+    add_executable(ExrImageTest tests/ExrImageTest.cpp)
+    target_link_libraries(ExrImageTest PRIVATE IXEngineRender)
+    target_compile_features(ExrImageTest PRIVATE cxx_std_20)
+    if(MSVC)
+        set_target_properties(ExrImageTest PROPERTIES
+            MSVC_RUNTIME_LIBRARY "MultiThreaded$<$<CONFIG:Debug>:Debug>")
+    endif()
+    add_test(NAME ExrImageTest COMMAND ExrImageTest)
+
     add_executable(SceneLayerGroundTest tests/SceneLayerGroundTest.cpp)
     target_link_libraries(SceneLayerGroundTest PRIVATE IXEngineRender)
     target_compile_features(SceneLayerGroundTest PRIVATE cxx_std_20)

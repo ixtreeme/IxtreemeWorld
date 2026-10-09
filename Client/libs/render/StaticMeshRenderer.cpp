@@ -1,3 +1,4 @@
+#include "asset/ExrImage.h"
 #include "StaticMeshRenderer.h"
 
 #include "AssimpImporter.h"
@@ -900,6 +901,18 @@ bool DecodeGltfTexture(const fastgltf::Asset& asset,
     int width = 0;
     int height = 0;
     int channels = 0;
+    if (client::asset::IsExr(encoded))
+    {
+        std::string error;
+        auto exr = client::asset::DecodeExr(encoded, error);
+        if (!exr) { LogFormat("[EXR] %s", error.c_str()); return false; }
+        out.name = std::string(image.name.empty() ? label : image.name);
+        out.width = static_cast<std::uint32_t>(exr->width);
+        out.height = static_cast<std::uint32_t>(exr->height);
+        out.format = ixrhi::IXRHIFormat::R16G16B16A16Float;
+        out.pixels = client::asset::ExrHalfPixels(*exr);
+        return true;
+    }
     stbi_uc* decoded = stbi_load_from_memory(
         encoded.data(), static_cast<int>(encoded.size()), &width, &height, &channels, 4);
     if (!decoded || width <= 0 || height <= 0)
@@ -932,6 +945,19 @@ bool DecodeTextureFile(const std::filesystem::path& path,
     std::vector<uint8_t> encoded((std::istreambuf_iterator<char>(file)), std::istreambuf_iterator<char>());
     if (encoded.empty())
         return false;
+
+    if (client::asset::IsExr(encoded) || client::asset::IsExrPath(path))
+    {
+        std::string error;
+        auto exr = client::asset::DecodeExr(encoded, error);
+        if (!exr) { LogFormat("[EXR] %s", error.c_str()); return false; }
+        out.name = path.filename().generic_string();
+        out.width = static_cast<std::uint32_t>(exr->width);
+        out.height = static_cast<std::uint32_t>(exr->height);
+        out.format = ixrhi::IXRHIFormat::R16G16B16A16Float;
+        out.pixels = client::asset::ExrHalfPixels(*exr);
+        return true;
+    }
 
     int width = 0;
     int height = 0;
@@ -2857,6 +2883,9 @@ bool StaticMeshRenderer::UploadTexture(ixrhi::IXRHIDevice& rhi, const RgbaImage&
     ixrhi::IXRHIFormat format = image.format;
     if (!rhi.IsTextureFormatSupported(format, sampledUpload))
     {
+        // A half-float payload must never be reinterpreted as RGBA8.
+        if (format == ixrhi::IXRHIFormat::R16G16B16A16Float)
+            return false;
         format = ixrhi::IXRHIFormat::R8G8B8A8Unorm;  // the same RGBA8 texels
         if (!rhi.IsTextureFormatSupported(format, sampledUpload))
             return false;

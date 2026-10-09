@@ -1,7 +1,7 @@
 #pragma once
 
 // SkyRenderer — the scene's sky (SkySettings): a flat colour, a procedural gradient with a sun disc
-// that follows the Sun light, a six-image cube map, or an equirectangular panorama (LDR or .hdr).
+// that follows the Sun light, a six-image cube map, or an equirectangular panorama (LDR, .hdr or .exr).
 //
 // Draw contract: one full-screen triangle at the far plane with depth test LessOrEqual and no depth
 // writes, so it can be drawn first (it becomes the background) or after the opaque geometry (the

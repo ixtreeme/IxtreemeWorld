@@ -127,6 +127,7 @@ vcpkg_require(
 	rmlui
 	zlib
     stb
+    openexr
     "angelscript[addons]"
 )
 
@@ -169,6 +170,7 @@ add_subdirectory(${CMAKE_CURRENT_SOURCE_DIR}/../shared/map shared_map_build)
 find_package(fastgltf CONFIG REQUIRED)
 find_package(assimp CONFIG REQUIRED)
 find_package(efsw CONFIG REQUIRED)
+find_package(OpenEXR 3 CONFIG REQUIRED)
 FetchContent_Declare(
     meshoptimizer
     GIT_REPOSITORY https://github.com/zeux/meshoptimizer.git

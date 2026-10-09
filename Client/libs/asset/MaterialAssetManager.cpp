@@ -1,3 +1,4 @@
+#include "asset/ExrImage.h"
 #include "MaterialAssetManager.h"
 
 #include "Common.h"
@@ -333,6 +334,7 @@ std::optional<Guid> MaterialAssetManager::packOcclusionRoughnessMetallic(const M
         int width = 0;
         int height = 0;
         stbi_uc* pixels = nullptr;
+        std::vector<std::uint8_t> exrPixels;
     };
     std::array<Image, 3> images{};
     std::uint64_t hash = 1469598103934665603ull;  // FNV-1a of the sources: the file's name
@@ -354,7 +356,20 @@ std::optional<Guid> MaterialAssetManager::packOcclusionRoughnessMetallic(const M
         if (!path)
             continue;
         int channels = 0;
-        images[i].pixels = stbi_load(path->string().c_str(), &images[i].width, &images[i].height, &channels, 4);
+        if (client::asset::IsExrPath(*path))
+        {
+            std::string error;
+            auto exr = client::asset::LoadExr(*path, error);
+            if (exr)
+            {
+                images[i].width = exr->width;
+                images[i].height = exr->height;
+                images[i].exrPixels = client::asset::ExrRgba8(*exr, client::asset::ExrByteMode::LinearData);
+                images[i].pixels = images[i].exrPixels.data();
+            }
+            else TraceError("[MATERIAL-EXR] %s", error.c_str());
+        }
+        else images[i].pixels = stbi_load(path->string().c_str(), &images[i].width, &images[i].height, &channels, 4);
         if (images[i].pixels)
         {
             width = std::max(width, images[i].width);
@@ -364,7 +379,7 @@ std::optional<Guid> MaterialAssetManager::packOcclusionRoughnessMetallic(const M
     const auto release = [&]() {
         for (Image& image : images)
         {
-            if (image.pixels)
+            if (image.pixels && image.exrPixels.empty())
                 stbi_image_free(image.pixels);
             image.pixels = nullptr;
         }

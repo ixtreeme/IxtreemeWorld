@@ -1,3 +1,4 @@
+#include "asset/ExrImage.h"
 #include "EditorImGui.h"
 
 #include "NativeBackend.h"  // legacy native C++ scripting (kept; no longer offered to projects)
@@ -399,7 +400,7 @@ const char* ImportDetectedTypeName(const std::filesystem::path& path)
 {
     const std::string ext = ToLowerAscii(path.extension().string());
     if (ext == ".png" || ext == ".jpg" || ext == ".jpeg" || ext == ".tga" ||
-        ext == ".bmp" || ext == ".dds" || ext == ".ktx" || ext == ".ktx2")
+        ext == ".bmp" || ext == ".dds" || ext == ".ktx" || ext == ".ktx2" || ext == ".hdr" || ext == ".exr")
         return "Texture";
     if (ext == ".glb" || ext == ".gltf" || ext == ".fbx" || ext == ".obj")
         return "Model";
@@ -1609,11 +1610,26 @@ bool EditorImGui::LoadAssetPreviewTexture(const std::filesystem::path& path, Ass
     int width = 0;
     int height = 0;
     int channels = 0;
-    stbi_uc* decoded = stbi_load(path.string().c_str(), &width, &height, &channels, 4);
+    std::vector<std::uint8_t> exrPixels;
+    stbi_uc* stbPixels = nullptr;
+    if (client::asset::IsExrPath(path))
+    {
+        std::string decodeError;
+        auto exr = client::asset::LoadExr(path, decodeError);
+        if (exr)
+        {
+            width = exr->width;
+            height = exr->height;
+            exrPixels = client::asset::ExrRgba8(*exr, client::asset::ExrByteMode::Preview);
+        }
+        else TraceError("[EXR] %s", decodeError.c_str());
+    }
+    else stbPixels = stbi_load(path.string().c_str(), &width, &height, &channels, 4);
+    const std::uint8_t* decoded = exrPixels.empty() ? stbPixels : exrPixels.data();
     if (!decoded || width <= 0 || height <= 0)
     {
         if (decoded)
-            stbi_image_free(decoded);
+            stbi_image_free(stbPixels);
         TraceError("[EDITOR-IMGUI] Failed to decode asset thumbnail: %s", path.string().c_str());
         return false;
     }
@@ -1624,7 +1640,7 @@ bool EditorImGui::LoadAssetPreviewTexture(const std::filesystem::path& path, Ass
         static_cast<std::uint32_t>(width),
         static_cast<std::uint32_t>(height),
         path.filename().generic_string().c_str());
-    stbi_image_free(decoded);
+    stbi_image_free(stbPixels);
     if (!outTexture.handle.IsValid())
         return false;
 

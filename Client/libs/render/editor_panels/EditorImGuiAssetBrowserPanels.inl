@@ -640,7 +640,7 @@ void EditorImGui::RenderAssetBrowserOperationPopups()
         ImGui::TextDisabled("Target: %s", target.generic_string().c_str());
         ImGui::TextWrapped("Choose a supported source file, or drag files from Explorer onto the editor window.");
         ImGui::InputText("Source File", m_assetImportPathBuffer, sizeof(m_assetImportPathBuffer));
-        ImGui::TextDisabled("Supported: png jpg jpeg tga bmp dds ktx glb gltf fbx obj material anim ozz wav ogg mp3 flac");
+        ImGui::TextDisabled("Supported: png jpg jpeg tga bmp dds ktx hdr exr glb gltf fbx obj material anim ozz wav ogg mp3 flac");
 
         ImGui::Separator();
         ImGui::InputText("Browse Path", m_assetImportBrowserPathBuffer, sizeof(m_assetImportBrowserPathBuffer));

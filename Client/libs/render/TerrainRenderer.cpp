@@ -1,3 +1,4 @@
+#include "asset/ExrImage.h"
 #include "TerrainRenderer.h"
 
 #include "JobSystem.h"
@@ -580,11 +581,24 @@ bool DdsToRgba(const DdsImage& dds, RgbaImage& out)
 bool LoadStbImage(client::asset::IAssetReader& assets,
     const std::string& path,
     RgbaImage& out,
-    const std::vector<std::filesystem::path>* additionalRoots = nullptr)
+    const std::vector<std::filesystem::path>* additionalRoots = nullptr, bool srgbColor = false)
 {
     auto bytes = ReadTerrainAssetBytes(assets, path, additionalRoots);
     if (!bytes)
         return false;
+    if (client::asset::IsExr(*bytes) || client::asset::IsExrPath(path))
+    {
+        std::string error;
+        auto exr = client::asset::DecodeExr(*bytes, error);
+        if (!exr) { TraceError("[TERRAIN-EXR] %s", error.c_str()); return false; }
+        out = {};
+        out.filename = std::filesystem::path(path).filename().generic_string();
+        out.width = static_cast<std::uint32_t>(exr->width);
+        out.height = static_cast<std::uint32_t>(exr->height);
+        // Terrain's mixed-format atlas stores normalized RGBA8 data, not radiance.
+        out.pixels = client::asset::ExrRgba8(*exr, srgbColor ? client::asset::ExrByteMode::SrgbColor : client::asset::ExrByteMode::LinearData);
+        return true;
+    }
     int width = 0;
     int height = 0;
     int channels = 0;
@@ -607,7 +621,7 @@ bool LoadStbImage(client::asset::IAssetReader& assets,
 bool LoadAnyTerrainImage(client::asset::IAssetReader& assets,
     const std::string& path,
     RgbaImage& out,
-    const std::vector<std::filesystem::path>* additionalRoots = nullptr)
+    const std::vector<std::filesystem::path>* additionalRoots = nullptr, bool srgbColor = false)
 {
     std::string ext = std::filesystem::path(path).extension().string();
     std::transform(ext.begin(), ext.end(), ext.begin(), [](unsigned char c) {
@@ -619,12 +633,12 @@ bool LoadAnyTerrainImage(client::asset::IAssetReader& assets,
         return LoadDdsImage(assets, path, dds, additionalRoots) && DdsToRgba(dds, out);
     }
     if (ext == ".png" || ext == ".jpg" || ext == ".jpeg" || ext == ".tga" || ext == ".bmp")
-        return LoadStbImage(assets, path, out, additionalRoots);
+        return LoadStbImage(assets, path, out, additionalRoots, srgbColor);
 
     DdsImage dds{};
     if (LoadDdsImage(assets, path, dds, additionalRoots))
         return DdsToRgba(dds, out);
-    return LoadStbImage(assets, path, out, additionalRoots);
+    return LoadStbImage(assets, path, out, additionalRoots, srgbColor);
 }
 
 // The water reflection's size as a divisor of its view's size.
@@ -3473,7 +3487,7 @@ bool TerrainRenderer::LoadWaterMaterialTextureSet(ixrhi::IXRHIDevice& rhi,
         if (path.empty())
             return false;
         RgbaImage image{};
-        if (!LoadAnyTerrainImage(*m_assets, path, image, &m_additionalAssetRoots))
+        if (!LoadAnyTerrainImage(*m_assets, path, image, &m_additionalAssetRoots, format == ixrhi::IXRHIFormat::R8G8B8A8Srgb))
         {
             Tracenf("[WATER-MAT] failed to load %s texture for %s: %s",
                 label.c_str(),
@@ -6056,6 +6070,7 @@ bool TerrainRenderer::LoadTerrainPaletteFromPaths(ixrhi::IXRHIDevice& rhi, const
         const std::string* path = nullptr;
         RgbaImage* image = nullptr;
         bool loaded = false;
+        bool srgbColor = false;
     };
     std::array<std::array<ImageLoad, 6>, 8> loads{};
     std::vector<ImageLoad*> pending;
@@ -6067,7 +6082,7 @@ bool TerrainRenderer::LoadTerrainPaletteFromPaths(ixrhi::IXRHIDevice& rhi, const
             &heightImages[i]};
         for (uint32_t kind = 0; kind < 6; ++kind)
         {
-            loads[i][kind] = {paths[kind], targets[kind], false};
+            loads[i][kind] = {paths[kind], targets[kind], false, kind == 0};
             if (!paths[kind]->empty())
                 pending.push_back(&loads[i][kind]);
         }
@@ -6075,7 +6090,7 @@ bool TerrainRenderer::LoadTerrainPaletteFromPaths(ixrhi::IXRHIDevice& rhi, const
     ixjobs::JobSystem::Instance().ParallelFor(static_cast<uint32_t>(pending.size()), 1,
         [&](uint32_t begin, uint32_t end, uint32_t) {
             for (uint32_t k = begin; k < end; ++k)
-                pending[k]->loaded = LoadAnyTerrainImage(*m_assets, *pending[k]->path, *pending[k]->image, &m_additionalAssetRoots);
+                pending[k]->loaded = LoadAnyTerrainImage(*m_assets, *pending[k]->path, *pending[k]->image, &m_additionalAssetRoots, pending[k]->srgbColor);
         });
     for (uint32_t i = 0; i < images.size(); ++i)
     {

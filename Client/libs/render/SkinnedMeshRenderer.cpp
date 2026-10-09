@@ -1,3 +1,4 @@
+#include "asset/ExrImage.h"
 #include "SkinnedMeshRenderer.h"
 
 #include "JobSystem.h"
@@ -418,6 +419,17 @@ bool LoadGltfBaseColorTexture(client::asset::IAssetReader& assets,
             encoded.empty())
             continue;
 
+        if (client::asset::IsExr(encoded))
+        {
+            std::string error;
+            auto exr = client::asset::DecodeExr(encoded, error);
+            if (!exr) { LogFormat("[EXR] %s", error.c_str()); continue; }
+            out = CreateRgbaImage(std::string(image.name.empty() ? "glTF baseColorTexture" : image.name),
+                static_cast<std::uint32_t>(exr->width), static_cast<std::uint32_t>(exr->height), client::asset::ExrHalfPixels(*exr));
+            out.format = ixrhi::IXRHIFormat::R16G16B16A16Float;
+            return true;
+        }
+
         int width = 0;
         int height = 0;
         int channels = 0;
@@ -450,6 +462,16 @@ bool LoadGltfBaseColorTexture(client::asset::IAssetReader& assets,
 
 bool LoadRgbaTextureFile(const std::filesystem::path& path, DdsImage& out)
 {
+    if (client::asset::IsExrPath(path))
+    {
+        std::string error;
+        auto exr = client::asset::LoadExr(path, error);
+        if (!exr) { LogFormat("[EXR] %s", error.c_str()); return false; }
+        out = CreateRgbaImage(path.filename().generic_string(), static_cast<std::uint32_t>(exr->width),
+            static_cast<std::uint32_t>(exr->height), client::asset::ExrHalfPixels(*exr));
+        out.format = ixrhi::IXRHIFormat::R16G16B16A16Float;
+        return true;
+    }
     int width = 0;
     int height = 0;
     int channels = 0;

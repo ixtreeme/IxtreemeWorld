@@ -479,7 +479,7 @@ AssetType detectAssetType(const std::filesystem::path& filePath)
     if (ext == ".gltf" || ext == ".glb" || ext == ".fbx" || ext == ".obj")
         return AssetType::Model;
     if (ext == ".png" || ext == ".jpg" || ext == ".jpeg" || ext == ".tga" ||
-        ext == ".bmp" || ext == ".dds" || ext == ".ktx" || ext == ".ktx2" || ext == ".hdr")
+        ext == ".bmp" || ext == ".dds" || ext == ".ktx" || ext == ".ktx2" || ext == ".hdr" || ext == ".exr")
         return AssetType::Texture;
     if (ext == ".material" || ext == ".physmat")
         return AssetType::Material;

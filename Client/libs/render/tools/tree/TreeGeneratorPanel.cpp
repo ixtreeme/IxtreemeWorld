@@ -1,3 +1,4 @@
+#include "asset/ExrImage.h"
 #include "TreeGeneratorPanel.h"
 
 #include "AssetLibrary.h"
@@ -90,7 +91,22 @@ std::array<float, 4> MaterialPreviewColor(const Guid& guid, float alpha)
     int width = 0;
     int height = 0;
     int channels = 0;
-    stbi_uc* pixels = stbi_load(path->string().c_str(), &width, &height, &channels, 4);
+    std::vector<std::uint8_t> exrPixels;
+    stbi_uc* stbPixels = nullptr;
+    if (client::asset::IsExrPath(*path))
+    {
+        std::string decodeError;
+        auto exr = client::asset::LoadExr(*path, decodeError);
+        if (exr)
+        {
+            width = exr->width;
+            height = exr->height;
+            exrPixels = client::asset::ExrRgba8(*exr, client::asset::ExrByteMode::Preview);
+        }
+        else TraceError("[EXR] %s", decodeError.c_str());
+    }
+    else stbPixels = stbi_load(path->string().c_str(), &width, &height, &channels, 4);
+    const std::uint8_t* pixels = exrPixels.empty() ? stbPixels : exrPixels.data();
     if (!pixels)
         return color;
     const std::size_t count = static_cast<std::size_t>(width) * static_cast<std::size_t>(height);
@@ -104,7 +120,7 @@ std::array<float, 4> MaterialPreviewColor(const Guid& guid, float alpha)
             sum[c] += pixels[i * 4u + static_cast<std::size_t>(c)] / 255.0 * a;
         weight += a;
     }
-    stbi_image_free(pixels);
+    stbi_image_free(stbPixels);
     if (weight > 0.0)
     {
         for (int c = 0; c < 3; ++c)

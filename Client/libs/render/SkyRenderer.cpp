@@ -1,3 +1,4 @@
+#include "asset/ExrImage.h"
 #include "SkyRenderer.h"
 
 #include "Debug.h"
@@ -100,7 +101,7 @@ std::uint16_t FloatToHalf(float value)
     return static_cast<std::uint16_t>(std::min<std::uint32_t>(half, 0x7bffu));
 }
 
-// A decoded RGBA image: linear floats for .hdr, sRGB bytes otherwise.
+// A decoded RGBA image: linear floats for .hdr/.exr, sRGB bytes otherwise.
 struct SkyImage
 {
     int width = 0;
@@ -145,7 +146,16 @@ std::optional<SkyImage> LoadSkyImage(const std::filesystem::path& path, std::str
     SkyImage image;
     int channels = 0;
     const int size = static_cast<int>(bytes.size());
-    if (LowerExtension(path) == ".hdr" || stbi_is_hdr_from_memory(bytes.data(), size))
+    if (client::asset::IsExr(bytes) || client::asset::IsExrPath(path))
+    {
+        auto exr = client::asset::DecodeExr(bytes, error);
+        if (!exr) return std::nullopt;
+        image.width = exr->width;
+        image.height = exr->height;
+        image.hdr = true;
+        image.linear = std::move(exr->rgba);
+    }
+    else if (LowerExtension(path) == ".hdr" || stbi_is_hdr_from_memory(bytes.data(), size))
     {
         float* pixels = stbi_loadf_from_memory(bytes.data(), size, &image.width, &image.height, &channels, 4);
         if (!pixels)
@@ -162,7 +172,7 @@ std::optional<SkyImage> LoadSkyImage(const std::filesystem::path& path, std::str
         stbi_uc* pixels = stbi_load_from_memory(bytes.data(), size, &image.width, &image.height, &channels, 4);
         if (!pixels)
         {
-            error = "cannot read " + path.filename().string() + " (PNG, JPG, TGA or HDR)";
+            error = "cannot read " + path.filename().string() + " (PNG, JPG, TGA, HDR or EXR)";
             return std::nullopt;
         }
         image.srgb.assign(pixels, pixels + static_cast<std::size_t>(image.width) * image.height * 4u);
@@ -490,7 +500,7 @@ void SkyRenderer::LoadImages(const SkySettings& sky, const std::filesystem::path
             std::string error;
             std::optional<SkyImage> image;
             if (sky.panoramaPath.empty())
-                m_panoramaStatus = "Drop a panorama image (PNG, JPG or HDR) on the Panorama slot";
+                m_panoramaStatus = "Drop a panorama image (PNG, JPG, HDR or EXR) on the Panorama slot";
             else if (!(image = LoadSkyImage(ResolveImagePath(sky.panoramaPath, projectRoot), error)))
                 m_panoramaStatus = error;
             if (image)

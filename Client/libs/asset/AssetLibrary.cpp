@@ -1,3 +1,4 @@
+#include "asset/ExrImage.h"
 #include "AssetLibrary.h"
 
 #include "AssetDatabase.h"
@@ -1482,6 +1483,15 @@ bool ReadDdsResolution(const std::filesystem::path& path, std::uint32_t& width, 
 
 bool ReadImageResolution(const std::filesystem::path& path, std::uint32_t& width, std::uint32_t& height)
 {
+    if (client::asset::IsExrPath(path))
+    {
+        std::string error;
+        int w = 0, h = 0;
+        if (!client::asset::ReadExrResolution(path, w, h, error)) return false;
+        width = static_cast<std::uint32_t>(w);
+        height = static_cast<std::uint32_t>(h);
+        return true;
+    }
     const std::string ext = ToLower(path.extension().string());
     if (ext == ".dds")
         return ReadDdsResolution(path, width, height);
@@ -1665,7 +1675,7 @@ std::optional<AssetLibrary::Category> AssetLibrary::DiscoverableCategory(const s
         return Category::Material;
     const std::string ext = ToLower(path.extension().generic_string());
     if (ext == ".png" || ext == ".jpg" || ext == ".jpeg" || ext == ".tga" ||
-        ext == ".bmp" || ext == ".dds" || ext == ".ktx" || ext == ".ktx2" || ext == ".hdr")
+        ext == ".bmp" || ext == ".dds" || ext == ".ktx" || ext == ".ktx2" || ext == ".hdr" || ext == ".exr")
         return Category::Texture;
     if (ext == ".glb" || ext == ".gltf" || ext == ".fbx" || ext == ".obj")
         return Category::Model;
@@ -2103,7 +2113,22 @@ bool AssetLibrary::GenerateTextureThumbnail(const Entry& entry, std::string& thu
     int width = 0;
     int height = 0;
     int channels = 0;
-    stbi_uc* decoded = stbi_load(source.string().c_str(), &width, &height, &channels, 4);
+    std::vector<std::uint8_t> exrPixels;
+    stbi_uc* stbPixels = nullptr;
+    if (client::asset::IsExrPath(source))
+    {
+        std::string decodeError;
+        auto exr = client::asset::LoadExr(source, decodeError);
+        if (exr)
+        {
+            width = exr->width;
+            height = exr->height;
+            exrPixels = client::asset::ExrRgba8(*exr, client::asset::ExrByteMode::Preview);
+        }
+        else TraceError("[EXR] %s", decodeError.c_str());
+    }
+    else stbPixels = stbi_load(source.string().c_str(), &width, &height, &channels, 4);
+    const std::uint8_t* decoded = exrPixels.empty() ? stbPixels : exrPixels.data();
     std::uint32_t outWidth = 96;
     std::uint32_t outHeight = 96;
     std::vector<std::uint8_t> output;
@@ -2118,12 +2143,12 @@ bool AssetLibrary::GenerateTextureThumbnail(const Entry& entry, std::string& thu
             static_cast<std::uint32_t>(height),
             outWidth,
             outHeight);
-        stbi_image_free(decoded);
+        stbi_image_free(stbPixels);
     }
     else
     {
         if (decoded)
-            stbi_image_free(decoded);
+            stbi_image_free(stbPixels);
 
         std::array<std::uint8_t, 4> color{130, 140, 150, 255};
         switch (entry.textureRole)
@@ -3197,11 +3222,13 @@ bool AssetLibrary::ValidateFile(Category category, const std::filesystem::path& 
     switch (category)
     {
     case Category::Texture:
-        if (!HasAnyExtension(path, {".png", ".jpg", ".jpeg", ".dds", ".tga", ".hdr"}))
+        if (!HasAnyExtension(path, {".png", ".jpg", ".jpeg", ".dds", ".tga", ".hdr", ".exr"}))
         {
-            error = "textures must be PNG, JPG, DDS, TGA or HDR";
+            error = "textures must be PNG, JPG, DDS, TGA, HDR or EXR";
             return false;
         }
+        if (client::asset::IsExrPath(path) && !client::asset::LoadExr(path, error))
+            return false;
         break;
     case Category::Model:
         if (!HasAnyExtension(path, {".gltf", ".glb", ".fbx"}))
@@ -3354,7 +3381,7 @@ std::optional<AssetLibrary::Category> DetectDirectImportCategory(const std::file
 {
     const std::string ext = ToLower(sourcePath.extension().string());
     if (ext == ".png" || ext == ".jpg" || ext == ".jpeg" || ext == ".tga" ||
-        ext == ".bmp" || ext == ".dds" || ext == ".ktx" || ext == ".ktx2" || ext == ".hdr")
+        ext == ".bmp" || ext == ".dds" || ext == ".ktx" || ext == ".ktx2" || ext == ".hdr" || ext == ".exr")
         return AssetLibrary::Category::Texture;
     if (ext == ".glb" || ext == ".gltf" || ext == ".fbx" || ext == ".obj")
         return AssetLibrary::Category::Model;

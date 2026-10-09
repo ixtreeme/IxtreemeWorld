@@ -252,7 +252,7 @@ struct SkySettings
         Color = 0,       // one flat colour
         Procedural = 1,  // zenith / horizon / ground gradient with a sun disc that follows the Sun
         Cubemap = 2,     // six images, one per cube face
-        Panorama = 3     // one equirectangular (360 x 180 degree) image, LDR or .hdr
+        Panorama = 3     // one equirectangular (360 x 180 degree) image, LDR, .hdr or .exr
     };
     static constexpr std::size_t kCubeFaces = 6;  // +X right, -X left, +Y up, -Y down, +Z front, -Z back
 

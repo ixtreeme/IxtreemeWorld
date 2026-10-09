@@ -1,3 +1,4 @@
+#include "asset/ExrImage.h"
 #include "ParticleRenderer.h"
 
 #include "Debug.h"
@@ -44,7 +45,8 @@ std::shared_ptr<ixrhi::IXRHIShader> LoadShader(ixrhi::IXRHIDevice& rhi,
     return rhi.CreateShader(desc);
 }
 
-bool DecodeTextureFile(const std::string& path, int& width, int& height, std::vector<std::uint8_t>& pixels)
+bool DecodeTextureFile(const std::string& path, int& width, int& height, std::vector<std::uint8_t>& pixels,
+                       ixrhi::IXRHIFormat& format)
 {
     std::ifstream file(path, std::ios::binary);
     if (!file)
@@ -52,6 +54,19 @@ bool DecodeTextureFile(const std::string& path, int& width, int& height, std::ve
     std::vector<std::uint8_t> encoded((std::istreambuf_iterator<char>(file)), std::istreambuf_iterator<char>());
     if (encoded.empty())
         return false;
+
+    if (client::asset::IsExr(encoded) || client::asset::IsExrPath(path))
+    {
+        std::string error;
+        auto exr = client::asset::DecodeExr(encoded, error);
+        if (!exr) { TraceError("[PARTICLE-EXR] %s", error.c_str()); return false; }
+        width = exr->width;
+        height = exr->height;
+        pixels = client::asset::ExrHalfPixels(*exr);
+        format = ixrhi::IXRHIFormat::R16G16B16A16Float;
+        return true;
+    }
+    format = ixrhi::IXRHIFormat::R8G8B8A8Unorm;
 
     int channels = 0;
     stbi_uc* decoded = stbi_load_from_memory(
@@ -373,7 +388,8 @@ const ParticleRenderer::TextureEntry* ParticleRenderer::ResolveTexture(const std
     int width = 0;
     int height = 0;
     std::vector<std::uint8_t> pixels;
-    if (!DecodeTextureFile(path, width, height, pixels))
+    ixrhi::IXRHIFormat format = ixrhi::IXRHIFormat::R8G8B8A8Unorm;
+    if (!DecodeTextureFile(path, width, height, pixels, format))
     {
         TraceError("[PARTICLE] texture '%s' could not be decoded (using the default sprite)", path.c_str());
         m_failedTextureIds.push_back(assetId);
@@ -383,7 +399,7 @@ const ParticleRenderer::TextureEntry* ParticleRenderer::ResolveTexture(const std
     ixrhi::IXRHITextureDesc desc;
     desc.width = static_cast<std::uint32_t>(width);
     desc.height = static_cast<std::uint32_t>(height);
-    desc.format = ixrhi::IXRHIFormat::R8G8B8A8Unorm;
+    desc.format = format;
     desc.usage = ixrhi::IXRHITextureUsage::Sampled | ixrhi::IXRHITextureUsage::TransferDst;
     desc.debugName = "Particle:" + assetId;
     TextureEntry entry;
