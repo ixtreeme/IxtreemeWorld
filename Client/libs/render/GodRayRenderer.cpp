@@ -285,7 +285,7 @@ const char* GodRayRenderer::BuildVolumetricPush(const SkySettings& sky,
     out.sunColor[3] = std::clamp(sky.volumetricAnisotropy, 0.0f, 0.95f);
     out.params[0] = static_cast<float>(StepsForQuality(sky.volumetricQuality));
     out.params[1] = shadow.depthBias;
-    out.params[2] = 0.0f;
+    out.params[2] = shadow.depthBias * shadow.extraDepthPaddingMeters;
     out.params[3] = 0.0f;
     return nullptr;
 }

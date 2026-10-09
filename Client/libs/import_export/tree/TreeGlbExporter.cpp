@@ -4,6 +4,8 @@
 #include "Common.h"
 #include "Debug.h"
 #include "MaterialAssetManager.h"
+#include <ixtreemetree/leaf_trim.h>
+#include <stb_image.h>
 
 #include <algorithm>
 #include <chrono>
@@ -394,28 +396,79 @@ TreeExportResult TreeGlbExporter::SaveAsAsset(const ixtreemetree::TreeMesh& mesh
         result.error = "model asset already exists";
         return result;
     }
+    // A given material's base colour texture is what the .glb points at (where it is in the project);
+    // without one, the built-in texture is copied beside the model.
+    const MaterialAsset* barkMaterial =
+        materialBinding.barkMaterial ? MaterialAssetManager::Instance().getOrLoad(*materialBinding.barkMaterial) : nullptr;
+    const MaterialAsset* leafMaterial =
+        materialBinding.leafMaterial ? MaterialAssetManager::Instance().getOrLoad(*materialBinding.leafMaterial) : nullptr;
+    const auto materialTexture = [](const MaterialAsset* material) -> std::filesystem::path {
+        if (!material || !material->baseColorTexture)
+            return {};
+        const std::optional<std::filesystem::path> path = AssetDatabase::Instance().resolveGuid(*material->baseColorTexture);
+        std::error_code exists;
+        return path && std::filesystem::exists(*path, exists) ? *path : std::filesystem::path{};
+    };
     std::string dependencyError;
-    const std::filesystem::path barkTexturePath =
-        CopyTextureDependency(materialBinding.barkBaseColorTexturePath, textureDir, "bark_basecolor", dependencyError);
+    std::filesystem::path barkTexturePath = materialTexture(barkMaterial);
+    if (barkTexturePath.empty())
+        barkTexturePath =
+            CopyTextureDependency(materialBinding.barkBaseColorTexturePath, textureDir, "bark_basecolor", dependencyError);
     if (!dependencyError.empty())
     {
         result.error = dependencyError;
         return result;
     }
-    const std::filesystem::path leafTexturePath =
-        CopyTextureDependency(materialBinding.leafBaseColorTexturePath, textureDir, "leaves_basecolor", dependencyError);
+    std::filesystem::path leafTexturePath = materialTexture(leafMaterial);
+    if (leafTexturePath.empty())
+        leafTexturePath =
+            CopyTextureDependency(materialBinding.leafBaseColorTexturePath, textureDir, "leaves_basecolor", dependencyError);
     if (!dependencyError.empty())
     {
         result.error = dependencyError;
         return result;
     }
+    const float leafAlphaCutoff = leafMaterial ? leafMaterial->alphaCutoff : materialBinding.leafAlphaCutoff;
     std::uint64_t binarySizeBytes = 0;
-    if (!WriteGlb(mesh,
+    // The leaf cards cut to the visible part of their atlas cells (a convex polygon around the leaf):
+    // the texture's transparent parts are then not rasterized in every view and shadow cascade (the
+    // same look, a fraction of the area).
+    ixtreemetree::TreeMesh trimmedMesh;
+    const ixtreemetree::TreeMesh* outputMesh = &mesh;
+    // (Only for alpha-masked leaves, and where the leaf texture maps 1:1 onto the cards: an opaque
+    // material draws the whole card, and one that tiles or offsets its uvs shows another part of the
+    // texture than the cards' uvs say.)
+    const bool leafUvsAsGenerated = !leafMaterial ||
+        (leafMaterial->alphaMode == MaterialAsset::AlphaMode::Mask &&
+         leafMaterial->uvTiling == std::array<float, 2>{1.0f, 1.0f} && leafMaterial->uvOffset == std::array<float, 2>{0.0f, 0.0f});
+    if (materialBinding.trimTransparentLeafBorders && leafUvsAsGenerated && !leafTexturePath.empty())
+    {
+        int width = 0;
+        int height = 0;
+        int channels = 0;
+        stbi_uc* pixels = stbi_load(leafTexturePath.string().c_str(), &width, &height, &channels, 4);
+        if (pixels && width > 0 && height > 0)
+        {
+            trimmedMesh = mesh;
+            const std::vector<std::uint8_t> rgba(pixels, pixels + static_cast<std::size_t>(width) * height * 4u);
+            const ixtreemetree::LeafTrimStats trim = ixtreemetree::cutoutLeafCards(trimmedMesh.leaves, rgba,
+                static_cast<std::uint32_t>(width), static_cast<std::uint32_t>(height));
+            if (trim.areaBefore > 0.0)
+                result.leafAreaReduction = static_cast<float>(1.0 - trim.areaAfter / trim.areaBefore);
+            Tracenf("[TREE-PERF] leaf cards cut to their visible texels: cards=%u area -%.1f%%",
+                trim.trimmedCards,
+                result.leafAreaReduction * 100.0f);
+            outputMesh = &trimmedMesh;
+        }
+        if (pixels)
+            stbi_image_free(pixels);
+    }
+    if (!WriteGlb(*outputMesh,
             modelPath,
             safeName,
             RelativeUri(barkTexturePath, modelDir),
             RelativeUri(leafTexturePath, modelDir),
-            materialBinding.leafAlphaCutoff,
+            leafAlphaCutoff,
             &binarySizeBytes))
     {
         result.error = "failed to write glb";
@@ -441,23 +494,40 @@ TreeExportResult TreeGlbExporter::SaveAsAsset(const ixtreemetree::TreeMesh& mesh
     if (!leafTexturePath.empty())
         AssetDatabase::Instance().getOrCreateGuid(leafTexturePath);
 
+    // The model's materials: the given ones, or ones made from the built-in textures.
     std::vector<Guid> defaultMaterials;
     defaultMaterials.reserve(2);
     MaterialAssetManager::ImportSummary summary{};
-    GltfMaterialSource bark{};
-    bark.name = "bark";
-    bark.baseColor = {0.42f, 0.26f, 0.12f, 1.0f};
-    bark.roughness = 0.82f;
-    bark.baseColorTexturePath = barkTexturePath;
-    defaultMaterials.push_back(MaterialAssetManager::Instance().createFromGltfMaterial(bark, materialDir, "bark", &summary));
-    GltfMaterialSource leaves{};
-    leaves.name = "leaves";
-    leaves.baseColor = {0.22f, 0.56f, 0.22f, 1.0f};
-    leaves.roughness = 0.7f;
-    leaves.alphaMode = "mask";
-    leaves.alphaCutoff = materialBinding.leafAlphaCutoff;
-    leaves.baseColorTexturePath = leafTexturePath;
-    defaultMaterials.push_back(MaterialAssetManager::Instance().createFromGltfMaterial(leaves, materialDir, "leaves", &summary));
+    if (barkMaterial)
+    {
+        defaultMaterials.push_back(*materialBinding.barkMaterial);
+    }
+    else
+    {
+        GltfMaterialSource bark{};
+        bark.name = "bark";
+        bark.baseColor = {0.42f, 0.26f, 0.12f, 1.0f};
+        bark.roughness = 0.82f;
+        bark.emissive = {0.0f, 0.0f, 0.0f, 1.0f};  // as a glTF material reads (strength 1)
+        bark.baseColorTexturePath = barkTexturePath;
+        defaultMaterials.push_back(MaterialAssetManager::Instance().createFromGltfMaterial(bark, materialDir, "bark", &summary));
+    }
+    if (leafMaterial)
+    {
+        defaultMaterials.push_back(*materialBinding.leafMaterial);
+    }
+    else
+    {
+        GltfMaterialSource leaves{};
+        leaves.name = "leaves";
+        leaves.baseColor = {0.22f, 0.56f, 0.22f, 1.0f};
+        leaves.roughness = 0.7f;
+        leaves.emissive = {0.0f, 0.0f, 0.0f, 1.0f};
+        leaves.alphaMode = "mask";
+        leaves.alphaCutoff = materialBinding.leafAlphaCutoff;
+        leaves.baseColorTexturePath = leafTexturePath;
+        defaultMaterials.push_back(MaterialAssetManager::Instance().createFromGltfMaterial(leaves, materialDir, "leaves", &summary));
+    }
 
     AssetDatabase::Instance().scan(normalizedProjectRoot);
     AssetDatabase::Instance().writeDefaultMaterials(modelPath, defaultMaterials);

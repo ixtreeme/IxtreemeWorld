@@ -1267,19 +1267,6 @@ double EstimateAverageSlopeAxes(const std::vector<float>& heightCmGrid,
     return samples == 0 ? 1.0 : axesTotal / static_cast<double>(samples);
 }
 
-WorldMat4 WorldOrthographicOffCenter(float left, float right, float bottom, float top, float zNear, float zFar)
-{
-    WorldMat4 r{};
-    r.m[0] = 2.0f / (right - left);
-    r.m[5] = 2.0f / (top - bottom);
-    r.m[10] = 1.0f / (zFar - zNear);
-    r.m[12] = -(right + left) / (right - left);
-    r.m[13] = -(top + bottom) / (top - bottom);
-    r.m[14] = -zNear / (zFar - zNear);
-    r.m[15] = 1.0f;
-    return r;
-}
-
 WorldVec3 TransformWorldPointNoPerspective(const WorldMat4& m, WorldVec3 p)
 {
     return {
@@ -2013,18 +2000,32 @@ void TerrainRenderer::UpdateShadowCascades(const WorldCamera& camera)
         const float radius = splitPlanes[cascade + 1];
         const float halfSize = radius * (1.0f + 8.0f / static_cast<float>(kShadowResolution));
         const float texelSize = 2.0f * halfSize / static_cast<float>(kShadowResolution);
-        const float centerX = std::floor(eye.x / texelSize) * texelSize;
-        const float centerY = std::floor(eye.y / texelSize) * texelSize;
         // The depth range moves in steps of 64 m (the padding has room for them): a cascade stays
         // exactly the same while the camera moves less than a texel and can be kept, and while it moves
         // across its texels only, its static cache layer is moved instead of drawn again (a depth step
         // changes every depth in it: drawn again).
-        const float centerZ = std::floor(eye.z / kShadowDepthStepMeters) * kShadowDepthStepMeters;
+        static const bool staggerDepth = [] {
+            std::string value;
+#if defined(_WIN32)
+            char* text = nullptr;
+            std::size_t length = 0;
+            if (_dupenv_s(&text, &length, "IX_SHADOW_DEPTH_STAGGER") == 0 && text)
+            {
+                value = text;
+                std::free(text);
+            }
+#else
+            if (const char* text = std::getenv("IX_SHADOW_DEPTH_STAGGER")) value = text;
+#endif
+            return value == "1";
+        }();
+        // Each cascade keeps the same depth span and at most one step of lag. Offsetting its
+        // lattice splits the four depth-refresh events into 16 m intervals instead of one spike.
+        const float phase = staggerDepth ? cascade * (kShadowDepthStepMeters / kShadowCascadeCount) : 0.0f;
+        const float centerZ = std::floor((eye.z - phase) / kShadowDepthStepMeters) * kShadowDepthStepMeters + phase;
         constexpr float depthPadding = 80.0f + kShadowDepthStepMeters;
-        const WorldMat4 lightProj = WorldOrthographicOffCenter(
-            centerX - halfSize, centerX + halfSize,
-            centerY - halfSize, centerY + halfSize,
-            centerZ - radius - depthPadding, centerZ + radius + depthPadding);
+        const WorldMat4 lightProj = MakeSunShadowProjection(eye.x, eye.y, centerZ,
+            halfSize, radius + depthPadding, kShadowResolution);
         m_shadowCascadeViewProj[cascade] = WorldMultiply(lightView, lightProj);
         m_shadowCascadeSplits[cascade] = radius;
         // In metres: what one unit of the cascade's depth spans, and one texel of its map.
@@ -2971,6 +2972,11 @@ void TerrainRenderer::RenderWaterReflection(ixrhi::IXRHICommandList& cmd,
             reflectionWaterLevelY);
 
     m_waterReflection.target->End(cmd);
+    if (!m_waterReflection.readable)
+    {
+        m_waterReflection.readable = true;
+        UpdateWaterBindGroup();
+    }
 
     m_reflectionClipWaterLevelY = std::numeric_limits<float>::quiet_NaN();
 }
@@ -6666,7 +6672,11 @@ void TerrainRenderer::WriteWaterBindGroupSets(std::uint32_t bodyIndex,
     m_waterBindGroup->UpdateBuffer(slot, 0, uniformBuffer, 0, sizeof(WaterUniformBlock));
     m_waterBindGroup->UpdateTexture(slot, 1, normalA->image, normalA->sampler);
     m_waterBindGroup->UpdateTexture(slot, 2, normalBSafe->image, normalBSafe->sampler);
-    m_waterBindGroup->UpdateTexture(slot, 3, m_waterReflection.color, m_waterReflection.sampler);
+    // Even a shader branch that skips reflection needs valid descriptor layouts.
+    // A newly created target becomes readable only after its first completed pass.
+    m_waterBindGroup->UpdateTexture(slot, 3,
+        m_waterReflection.readable ? m_waterReflection.color : m_waterNormalSmall.image,
+        m_waterReflection.readable ? m_waterReflection.sampler : m_waterNormalSmall.sampler);
     // Refraction snapshots are IXRHI-owned (shared lifetime); sampler and
     // view resolve independently with wave-normal fallbacks, exactly like
     // the old null-view path.
@@ -7364,7 +7374,7 @@ TerrainRenderer::WaterUniformBlock TerrainRenderer::BuildWaterUniform(const Worl
     uniform.levelTimeEnabled[1] = static_cast<float>(timeSeconds);
     uniform.levelTimeEnabled[2] = water.enabled ? 1.0f : 0.0f;
     uniform.levelTimeEnabled[3] = 0.0f;
-    uniform.reflectionParams[0] = (reflectionTarget && water.reflectionEnabled && m_waterReflection.color) ? 1.0f : 0.0f;
+    uniform.reflectionParams[0] = (reflectionTarget && water.reflectionEnabled && m_waterReflection.readable) ? 1.0f : 0.0f;
     uniform.reflectionParams[1] = std::clamp(water.reflectionDistortionStrength, 0.0f, 0.2f);
     uniform.reflectionParams[2] = m_waterReflection.width > 0 ? static_cast<float>(m_waterReflection.width) : 1.0f;
     uniform.reflectionParams[3] = m_waterReflection.height > 0 ? static_cast<float>(m_waterReflection.height) : 1.0f;

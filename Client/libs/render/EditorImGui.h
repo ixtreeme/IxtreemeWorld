@@ -409,6 +409,8 @@ private:
     void RenderSplatLayerSlot(std::uint32_t slotIndex);
     void RenderWaterMaterialEditor();
     void RenderTreeGeneratorPanel();
+    // Whether the Inspector shows the Tree Generator's settings (instead of the selection).
+    bool InspectorShowsTreeGenerator();
     void RenderWaterMaterialHeader();
     void RenderWaterMaterialColorsSection(WaterMaterialData& material);
     void RenderWaterMaterialWaveSection(WaterMaterialData& material);
@@ -484,6 +486,12 @@ private:
     void MarkPbrMaterialChanged(const char* field);
     bool SaveWaterMaterialEditor();
     bool SavePbrMaterialEditor();
+    // The PBR editor on a .material file (the renderer's materials): its draft written into the loaded
+    // material (packMaps: the occlusion, roughness and metallic maps packed again when they changed).
+    bool PbrEditorEditsMaterialFile() const;
+    void ApplyPbrDraftToMaterial(struct MaterialAsset& material, bool packMaps);
+    std::string TextureEntryIdForGuid(const std::optional<Guid>& guid) const;
+    std::optional<Guid> TextureGuidForEntryId(const std::string& entryId) const;
     bool DeleteWaterMaterialEditor();
     void SyncWaterMaterialSnapshot();
     // Both return references into the asset browser cache: callers must not hold them across a
@@ -658,6 +666,7 @@ private:
     std::uint64_t m_assetLibraryGeneration = 0;  // bumped for each new library (AssetLibraryRevision)
     mutable bool m_waterMaterialsDrafting = false;
     std::unique_ptr<tree_tool::TreeGeneratorPanel> m_treeGeneratorPanel;
+    bool m_inspectorShowsTreeGenerator = false;
     std::filesystem::path m_engineRoot;
     std::unique_ptr<AssetLibrary> m_assetLibrary;
     // Cached script lists (see CachedScriptAssets), keyed by extension and invalidated by the

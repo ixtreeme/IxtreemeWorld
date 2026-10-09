@@ -274,6 +274,7 @@ public:
     }
     static constexpr std::uint32_t SunShadowCascadeCount() { return kShadowCascadeCount; }
     static constexpr float kSunShadowDepthBias = 0.0015f;
+    static constexpr float SunShadowExtraDepthPaddingMeters() { return 2.0f * kShadowDepthStepMeters; }
     void ResetFrameDrawStats() { m_frameDrawStats = {}; }
     FrameDrawStats GetFrameDrawStats() const { return m_frameDrawStats; }
     void ToggleWalkabilityDebug();
@@ -411,6 +412,7 @@ private:
 
     struct WaterReflectionResources
     {
+        bool readable = false;
         std::shared_ptr<ixrhi::IXRHITexture> color;
         std::shared_ptr<ixrhi::IXRHITexture> depth;
         std::shared_ptr<ixrhi::IXRHISampler> sampler;

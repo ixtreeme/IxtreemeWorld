@@ -58,7 +58,7 @@ public:
         std::string heightTextureId;
         float tilingScaleX = 1.0f;
         float tilingScaleY = 1.0f;
-        float colorTint[3] = {1.0f, 1.0f, 1.0f};
+        float colorTint[4] = {1.0f, 1.0f, 1.0f, 1.0f};  // rgb, and alpha (kept in .material files)
         float normalStrength = 1.0f;
         float aoStrength = 1.0f;
         float roughnessStrength = 1.0f;

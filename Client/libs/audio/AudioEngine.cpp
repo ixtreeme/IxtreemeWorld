@@ -110,7 +110,7 @@ void AudioEngine::PlayOneShot(const std::string& absFilePath, AudioBus bus)
 
 // --- AudioSourceRuntime (defined here, where ma_sound is a complete type) ---
 AudioSourceRuntime::AudioSourceRuntime(AudioSourceRuntime&& other) noexcept
-    : sound(other.sound), ok(other.ok)
+    : sound(other.sound), ok(other.ok), pausedByEntity(other.pausedByEntity), resumeAfterEntityPause(other.resumeAfterEntityPause)
 {
     other.sound = nullptr;
     other.ok = false;
@@ -127,6 +127,8 @@ AudioSourceRuntime& AudioSourceRuntime::operator=(AudioSourceRuntime&& other) no
         }
         sound = other.sound;
         ok = other.ok;
+        pausedByEntity = other.pausedByEntity;
+        resumeAfterEntityPause = other.resumeAfterEntityPause;
         other.sound = nullptr;
         other.ok = false;
     }
@@ -181,8 +183,20 @@ bool AudioEngine::CreateSource(AudioSourceRuntime& rt, const AudioSourceComponen
 
 void AudioEngine::StartSource(AudioSourceRuntime& rt)
 {
-    if (rt.ok && rt.sound)
-        ma_sound_start(rt.sound);
+    if (rt.ok && rt.sound) {
+        if (rt.pausedByEntity) rt.resumeAfterEntityPause = true;
+        else ma_sound_start(rt.sound);
+    }
+}
+
+void AudioEngine::SetSourcePaused(AudioSourceRuntime& rt, bool paused)
+{
+    if (!rt.ok || !rt.sound || rt.pausedByEntity == paused) return;
+    if (paused) {
+        rt.resumeAfterEntityPause = ma_sound_is_playing(rt.sound) && !ma_sound_at_end(rt.sound);
+        ma_sound_stop(rt.sound);
+    } else if (rt.resumeAfterEntityPause) ma_sound_start(rt.sound);
+    rt.pausedByEntity = paused;
 }
 
 void AudioEngine::UpdateSource(AudioSourceRuntime& rt, const AudioSourceComponent& comp, const float pos[3])

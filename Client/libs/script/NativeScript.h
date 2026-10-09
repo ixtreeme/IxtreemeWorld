@@ -95,6 +95,14 @@ protected:
         return api->Raycast(ox, oy, oz, dx, dy, dz, maxDist);
     }
 
+    RaycastHit RaycastFiltered(float ox,float oy,float oz,float dx,float dy,float dz,float maxDist,
+        const QueryFilter& filter) { return api->RaycastFiltered(ox,oy,oz,dx,dy,dz,maxDist,&filter); }
+    std::uint32_t OverlapSphere(float x,float y,float z,float radius,const QueryFilter& filter,
+        SphereOverlapHit* output,std::uint32_t capacity,std::uint32_t* truncated) {
+        return api->OverlapSphere(x,y,z,radius,&filter,output,capacity,truncated);
+    }
+    void SetEntityEnabled(std::uint32_t id,bool enabled) { api->SetEntityEnabled(id,enabled); }
+
     // --- animator parameters (operate on THIS entity's animator) ---
     void SetAnimatorFloat(const std::string& name, float v) { api->SetAnimatorFloat(entityId, name, v); }
     void SetAnimatorBool(const std::string& name, bool v) { api->SetAnimatorBool(entityId, name, v); }

@@ -7,9 +7,28 @@
 #include "WorldMath.h"
 
 #include <array>
+#include <cmath>
 #include <cstdint>
 #include <cstring>
 #include <memory>
+
+// Fixed scale and whole texel translation. Constructing translated min/max bounds first
+// introduces cancellation that changes scale by a few ULPs and invalidates cached layers.
+inline WorldMat4 MakeSunShadowProjection(float eyeX, float eyeY, float centerZ,
+    float halfSize, float depthHalf, std::uint32_t resolution)
+{
+    WorldMat4 projection{};
+    projection.m[0] = 1.0f / halfSize;
+    projection.m[5] = 1.0f / halfSize;
+    projection.m[10] = 1.0f / (2.0f * depthHalf);
+    const float texelSize = 2.0f * halfSize / static_cast<float>(resolution);
+    const float clipTexel = 2.0f / static_cast<float>(resolution);
+    projection.m[12] = -std::floor(eyeX / texelSize) * clipTexel;
+    projection.m[13] = -std::floor(eyeY / texelSize) * clipTexel;
+    projection.m[14] = 0.5f - centerZ * projection.m[10];
+    projection.m[15] = 1.0f;
+    return projection;
+}
 
 struct SunShadowReceive
 {

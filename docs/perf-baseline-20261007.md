@@ -538,3 +538,345 @@ viszi (közelről nagy a fedett terület), nem a háromszögszám, ezért itt a 
 - A GPU-oldalon az árnyékvetők számát kell csökkenteni: méret szerinti kiszűrés a távoli kaszkádokból,
   árnyék-LOD, statikus árnyékok gyorsítótárazása.
 - Az 1. és 2. talált hibát a 3. lépés előtt vagy azzal együtt kell javítani.
+
+## 2026-10-08: fő pass, árnyékstabilitás és ABI 7
+
+A mérések standalone **Release** runtime-on, az elkülönített stresszprojekt másolatán készültek.
+A validáció külön **Debug**, `IX_VALIDATION=1`, `IX_JOBS=0`, Vulkan synchronization validation
+beállítással futott; annak FPS-e nem teljesítményeredmény. Az async present maradt az alapértelmezés.
+Az első három kétmásodperces GPU-mérési ablakot kihagytuk, a további GPU-időket mintaszámmal súlyoztuk.
+A megjelenített FPS és a Scene GPU ideje külön mérőszám.
+
+### Fő pass lebontása fix kamerával
+
+Az ideiglenes kapcsolók csak egy-egy rajzolási kategóriát hagytak ki; a jelenetet és az árnyékpass
+tagságát nem változtatták. A kihagyások eredménye nem összeadható: az opak geometria az utána
+rajzolt felületek kitakarását is befolyásolja.
+
+| Fő pass változat | Átlag FPS | Scene GPU, ms |
+| --- | ---: | ---: |
+| Teljes jelenet, 1. kontroll | 137,5 | 5,543 |
+| Teljes jelenet, 2. kontroll | 132,2 | 5,795 |
+| Teljes jelenet, 3. kontroll | 132,2 | 5,760 |
+| Opak statikus nélkül | 136,3 | 5,354 |
+| Maszkolt statikus nélkül | 197,0 | 3,258 |
+| Skinnelt nélkül | 132,0 | 5,691 |
+| Részecskék nélkül | 132,3 | 5,638 |
+| Átlátszó nélkül | 131,8 | 5,707 |
+
+A maszkolt levelek dominálnak: kihagyásuk körülbelül **2,3–2,5 ms**-ot vesz le a Scene passból.
+A többi kategória nyeresége ezen a terhelésen kicsi, illetve a futások szórásába esik.
+A kapcsolók és a mérőkód eltávolítva; a logok a git által figyelmen kívül hagyott
+`Client/build/followup-audit-20261008/category-*` könyvtárakban maradtak.
+
+### Kipróbált, elvetett változatok
+
+**Maszkolt depth prepass:** a levelek alpha-tested mélységpassa után EQUAL mélységteszttel,
+early depth/stencil színpass következett. Két A/B párban:
+
+| Futás | Scene GPU, prepass nélkül / vele | FPS, prepass nélkül / vele |
+| --- | --- | --- |
+| 1 | 5,599 / 5,523 ms | 133,5 / 134,7 |
+| 2 | 5,616 / 5,616 ms | 135,3 / 135,7 |
+
+Nincs ismételhető érdemi nyereség; a kód, shader-változatok és SPV-k eltávolítva.
+Csak a `tested-prepass-*` futások érvényesek. A korábbi `prepass-*` könyvtárak sikertelen
+fordítás utáni régi bináris futását tartalmazzák, azokból nem következtetünk.
+
+**Fák főnézeti LOD-ja:** 3004 fán próbáltuk a meglévő rendszerrel, kizárólag jelenetmásolaton
+(30/65/130 m, 0,65/0,35/0,15 arány). Az első párban 5,697 → 5,155 ms, a másodikban
+5,655 → 6,320 ms Scene GPU-idő adódott. Azonos kamera mellett a pixelek 19,47%-án 8/255-nél
+nagyobb eltérés jelentkezett. A bizonytalan teljesítmény és a látható részletvesztés miatt elvetve.
+Az eredeti jelenet és a modellek nem kaptak LOD-tartalmi módosítást. Vetített méret szerinti
+főnézeti tárgykihagyás sem került be, mert képi változás nélkül nincs rá mért elfogadható jelölt.
+
+### Árnyék-cache: stabil vetítési együtthatók
+
+Gyaloglás közben a régi ortografikus mátrix a mozgó bal/jobb határok kivonásából számította a
+skálát. Lebegőpontos kerekítés miatt a skála néhány ULP-vel változott. A cache ezt valódi
+vetítésváltozásnak látta, így az első két kaszkád gyakran teljesen újrarajzolódott.
+
+A `MakeSunShadowProjection` közvetlenül a rögzített félméretből számítja a skálát és egész
+texeles eltolásból a transzlációt. A mélységtartomány és a felbontás megmarad. A teszt a
+mélységtartomány két végét, a skála bitpontos állandóságát és az egész texeles eltolást ellenőrzi.
+
+Determinista, vízszintes 6 m/s kameramozgás, öt másodperc után indulva, 36 másodperces futások:
+
+| Változat | FPS | GPU frame, ms | Árnyék GPU, ms | Legnagyobb CPU frame a mérési szakaszban, ms |
+| --- | ---: | ---: | ---: | ---: |
+| Régi vetítés | 150,7 | 6,493 | 2,099 | 23,534 |
+| Régi vetítés, ismétlés | 148,6 | 6,716 | 2,257 | 24,933 |
+| Stabil vetítés | 163,8 | 5,889 | 1,504 | 22,210 |
+| Stabil vetítés, ismétlés | 160,2 | 5,929 | 1,410 | 22,944 |
+| Stabil vetítés + eltolt mélységfázis | 158,0 | 6,068 | 1,464 | 23,775 |
+
+A stabil vetítés **8–9% FPS-nyereséget** adott gyaloglás közben. A teljes statikus újrarajzolások
+száma a bemelegítés után az első két kaszkádon 828/1885, illetve 824/1867 helyett 1/1 lett;
+a mélységlépés tényleges átlépése továbbra is teljes újrarajzolást igényel.
+A futások időalapú kamerautat használnak, ezért a képkockaszámuk különböző.
+
+A kaszkád × 16 m mélységfázis az `IX_SHADOW_DEPTH_STAGGER=1` kapcsolóval próbálható;
+**alapból kikapcsolva**. Megszüntette a négy egyidejű mélységfrissítést (1/2/4/8 maszkok),
+de a legrosszabb CPU-frame és az átlag FPS nem javult a stabil vetítéshez képest.
+Ezért az eredeti elfogadási feltételt nem tekintjük teljesítettnek. Közeli kaszkád felbontása
+és árnyékvetőinek száma nem csökkent.
+
+A statikus képi ellenőrzésből a mozgó karaktereket, részecskéket és scripteket eltávolítottuk
+egy másolaton. Ugyanabból a kamerából a stabil és a régi vetítés átlagos csatornaeltérése
+0,374/255; a pixelek 0,286%-án nagyobb 8/255-nél. A különbségkép apró árnyék- és levéléleket
+mutat; nincs kihagyott objektum vagy új részletcsökkentés. Ez numerikus képi eltérés,
+nem bitazonos eredmény. Az ellenőrizhető képek: `stable-control.ppm`, `stable-on.ppm`,
+`stable-on-preview.png`, `stable-image-diff.png` a mérési könyvtárban.
+
+### Volumetrikus bias és első képkocka
+
+A `VolumetricLight.hlsl` a Terrain shaderrel azonos, VP z-oszlopából számolt méterarányos
+korrekcióval kezeli a megnövelt árnyékmélység-ráhagyást. Mindkét raymarch út korrigálva,
+a tárolt `volumetric_light_ps.spv` újragenerálva. A volumetrikus és screen-space út is
+futott a szinkron validációban.
+
+A betöltött editor első képkockáján a víz inicializálatlan ReflectionColor és ColorSnapshot
+textúrát kapott. A snapshot getter csak olvasható layoutban ad vissza textúrát; a reflection
+descriptor az első elkészült passig a meglévő fallbacket kapja. Javítás után a betöltött
+Scene és a Game/Play útvonalon sem maradt layout- vagy szinkronizációs hiba.
+
+### Script és prefab: a felhasználó által jóváhagyott ABI 7
+
+- `RaycastFiltered`: rögzített layer mapping, trigger-szűrés, ignore entity; a régi `Raycast` megmarad.
+- `OverlapSphere`: stabil entity-id sorrend, egyesített duplikátumok, caller-owned tömb,
+  legfeljebb 1024 kimenet, `truncated` jelzés. A korlát a kimenetre vonatkozik; sűrű
+  világban a teljes fizikai keresés továbbra is költséges lehet.
+- `SetEntityEnabled`: deferred commit, örökölt tiltás a lokális flag megtartásával;
+  render/árnyék, fizika, script, animáció, audio és CPU/GPU particle együtt szünetel.
+  A Jolt RemoveBody nullázza a sebességet, ezért azt külön snapshot őrzi.
+  Visszakapcsoláskor a tiltás alatt szerkesztett transform is átkerül a fizikai testre.
+- `SpawnPrefab`: mesh-root, mesh/point/spot támogatás, parent/joint id-remap, közös
+  publikálás az OnStart előtt, spatial/fizika/árnyék integráció. Hibás hierarchia nem
+  publikálható részlegesen. Kamerás vagy nem mesh-root prefab jelenleg nem támogatott.
+- A prefab most menti/betölti az `animator_controller_id` és lokális `enabled` mezőt.
+- Editorban a script által törölt szülő megmaradó gyermekeit leválasztjuk a Flecs
+  tükörből; így a nem rekurzív `DestroyEntity` nem törli őket mellékhatásként.
+
+A kanonikus és szállított SDK-headerek azonosak. **Az ABI 6 DLL-eket újra kell fordítani**;
+az eltérő verzió betöltését a motor továbbra is elutasítja. Részletes aláírások és bindingok:
+`Client/sdk/README.md`, elfogadott szerződés: `docs/script-query-abi-proposal-20261008.md`.
+
+Az új PrefabRuntimeTest és ScriptQueryTest ellenőrzi a hierarchia/ID-remap/szerializálás
+hibáit, a valós Jolt lekérdezéseket és szüneteltetést, a Lua és AngelScript bindingokat,
+az ABI 6 elutasítását, valamint a stabil árnyékvetítést. A runtime és editor Play tesztjelenet
+a deferred spawn/query/tiltás/visszakapcsolás/törlés teljes útját is bejárja; egy OnStart
+és egy OnDestroy történik, és a tiltás alatt módosított pozíció helyesen visszatér a fizikába.
+
+A későbbi job-fázisokhoz ezen a jeleneten nem találtunk új, kellően nagy CPU-tételt;
+a no-op hálózat és a scriptek nem kaptak mesterséges párhuzamosítást.
+
+### Végső ellenőrzés és üres editor
+
+- Editor és runtime: Debug és Release build sikeres, konfigurációnként **ctest 7/7**.
+- Vulkan synchronization validation: standalone stresszjelenet, standalone ABI 7 tesztjelenet,
+  betöltött editor Scene és editor Play; **0 VUID/layout/szinkronizációs hiba** a javítások után.
+  A Scene/Play automatizálása ideiglenes, a rendes projektbetöltési és Play command útvonalat
+  használó driverrel történt; a driver eltávolítva, mindkét végső editor bináris újrafordítva.
+  A régi sikertelen Scene/Play logok diagnosztikai bizonyítékként megmaradtak.
+- A GPU emitter a tiltás alatt kimarad a dispatch/draw útból és nem takarítható ki;
+  visszakapcsoláskor a grace-idő frissül, így egy másik aktív emitter takarítása sem
+  indítja újra. A két-emitteres runtime teszt egyetlen gyermek-emitter létrehozását várja.
+- Az üres editor végső Release futása: **4228–4293 megjelenített FPS**, 0,233–0,236 ms
+  CPU-frame, körülbelül 0,098 ms GPU-frame és 0,085 ms UI GPU. A korábbi kontroll
+  4274–4277 FPS volt: az új runtime API ezen az üres állapoton nem hoz érdemi FPS-nyereséget.
+  A **6500–7000 FPS cél még nincs meg**; a terhelt jeleneten mért 8–9% nyereség külön eredmény.
+- Saját mérőkód, kihagyó kapcsolók és képkimentés eltávolítva; az eredeti Main.scene és
+  a teszt előtti manifest visszaállítva. Commit/push nem történt.
+
+Újramérési bizonyítékok: `Client/build/followup-audit-20261008/` (gitignored). A fejlécazonosság
+és `git diff --check` ellenőrizve. A mérési logok nem helyettesítik a játék tartalmának tesztelését;
+audio-visszatérés és az animátor állapotmegtartása kódút-ellenőrzést kapott, külön hangos vagy
+vizuális állapot-visszatérési tesztet nem állítunk.
+
+## Fagenerátor: levélkártyák – 2026-10-08
+
+A generátor fái erősen csökkentették az FPS-t. A mért ok a levélkártyák raszterterülete: a levelek alfa-maszkoltak,
+így minden kártya teljes területe végigmegy a fő passon és minden árnyékkaszkádon. A fő pass lebontásában a maszkolt
+levelek kihagyása 2,3–2,5 ms-ot vett le a ~5,7 ms-ból.
+
+Egy fára jutó kártyák (a presetek natív méretben, egységük az engine-ben méter):
+
+| Fa | kártya | kártyaterület |
+| --- | --- | --- |
+| a stresszjelenet fája (alapbeállítás) | 1008 | 328 m² |
+| Oak Medium preset | 2592 | 18 427 m² |
+
+Javítások:
+
+- **Az átlátszó szél levágása mentéskor** (`trimLeafCards`, a Codex kezdte; kikapcsolható:
+  `TreeMaterialBinding::trimTransparentLeafBorders`). A beépített levéltextúrák 2×2-es atlaszok, 80–93%-ban teljesen
+  átlátszók.
+  - Mentéskor minden kártya az atlaszcellája látható részére zsugorodik, 16 pixeles ráhagyással a szűrt élnek.
+  - Az uv és a pozíció együtt mozog, így a textúra nem nyúlik; a háromszögszám és az indexek változatlanok.
+  - Üres cella és nem generátor-topológia érintetlen marad.
+  - A cella területéből a beépített textúráknál 27–59% marad meg.
+- **A levélcsomók a gally mentén ülnek.** Eddig egy gally összes csomója a csúcsán, egy ~0,35 m-es foltban ült
+  egymáson: a „levél kezdete” paraméter csak a csúcson túli eltolást méretezte. Most a csomók a gally `start`-jától
+  a csúcsáig oszlanak el, ahogy a paraméter szól.
+- **A „Double” kártyák keresztezik egymást.** A kártyák eddig teljes körön oszlottak el, így páros darabszámnál a
+  fél fordulattal elforgatott kártya ugyanabba a síkba esett: a „Double” két egymásra rajzolt kártya volt. Páros
+  darabszámnál most fél körön oszlanak el.
+- **A panel kiírja a fa levélkártyáinak számát és területét**, mentéskor pedig a levágott arányt.
+- **Az előnézet** a vetített, rendezett háromszögeket csak változáskor számolja újra (pine_medium: 3,53 → 1,35 ms
+  frame-enként, a Codex mérőeszközével).
+
+Mérés: a stresszjelenet 3004 fája ugyanazzal a fával, egyszer vágás nélkül, egyszer a mentéskori vágással
+(−45,8% levélterület), buildelt játék, álló kamera:
+
+| Fa | FPS | Scene GPU |
+| --- | --- | --- |
+| eredeti | 131–136 | 5,72–6,05 ms |
+| vágott | **145–150** | **4,77–5,02 ms** |
+
+A nyereség az árnyékkaszkádok újrarajzolásakor is jelentkezik, ugyanannyi területtel kevesebb.
+
+Ellenőrzés:
+
+- **Képi:** a lombkorona-régió a kettőben azonos (átlagos eltérés 1,26 a 765-ös skálán, JPEG-zaj; 48-nál nagyobb
+  eltérés egy pixelen sincs).
+- **Mentés az editorban:** Oak Medium mentve, 2592 kártya vágva, −46%.
+- **Teszt:** a `TreeGeneratorTest` (ctest, most 8/8) a vágást, a gally menti elhelyezést és a keresztező kártyákat
+  ellenőrzi. A régi generátorral a két utóbbi teszt elbukik.
+
+Ami maradt:
+
+- **A korábban mentett fák nincsenek vágva.** A nyereséghez újra kell menteni őket a generátorból, vagy egy
+  utólagos vágóeszköz kell a meglévő `.glb`-khez. Ugyanez a művelet egy meglévő fán is működik: a mérésnél így
+  készült a vágott fa.
+- **Ugyanaz a preset most másképp néz ki:** teltebb a korona, mert a levelek a gallyakon oszlanak el. Erdőhöz
+  kevesebb vagy kisebb levél (count, size) és a „Single” kártya a legolcsóbb.
+- **Távoli fák a fő nézetben:** a levélkártyák ritkítása (mint az árnyék-LOD-ban) vagy impostor. A főnézeti
+  LOD-próba képi eltérés miatt el lett vetve (lásd fent).
+
+### A fő pass: a kéreg részletességi szintjei
+
+A vágott levelekkel a fő pass még ~5 ms volt. Ideiglenes kihagyó kapcsolókkal lebontva (vágott fa, álló kamera):
+
+| Tétel | GPU-idő |
+| --- | --- |
+| a statikus hálók nélkül maradó rész (karakterek, ég, részecskék) | ~1,1 ms |
+| opak statikus hálók (3004 fa kérge, 7000 doboz) | 2,0–2,5 ms |
+| maszkolt levelek | ~1,6 ms |
+
+A kéreg fánként 4456 háromszög, a távoli fákon pixelnél jóval kisebbek. Ezért:
+
+- **A fő nézetnek is vannak részletességi szintjei** (`BuildLods`, az árnyék-LOD-dal együtt épül a betöltő szálon).
+  Az opak részhálók ugyanúgy 5 / 16 / 64 mm hibán belül egyszerűsödnek, de a varratok megmaradnak, így a textúra
+  és az árnyalás nem változik. Az árnyék szintjei összevarrt felületből készülnek, azok itt rossz uv-t adnának.
+- **Szintválasztás példányonként:** a legdurvább szint, amelynek hibája a példány skálájával, a legközelebbi
+  pontja mélységén a képre vetítve fél pixel alatt marad (`kViewLodMaxErrorPixels`). A vetítés skáláját és a
+  mélységet a view-projection mátrixból olvassa.
+- **Csoportosítás szint szerint:** egy rajzolás példányai szintenként csoportosítva rajzolódnak (a sorrendjük a
+  szinten belül marad), így egy szint egy futás. A maszkolt részhálók (levelek) a saját indexeikkel rajzolódnak.
+- **Kikapcsolás:** `IX_VIEW_LOD=0`, összehasonlításhoz.
+- A fa kérge: 4456 → 1336 → 247 háromszög.
+
+Stresszjelenet, buildelt játék, álló kamera, vágott fával:
+
+| Állapot | FPS | Scene GPU |
+| --- | --- | --- |
+| eredeti fa (a mai nap elején) | 131–136 | 5,72–6,05 ms |
+| vágott fa, LOD nélkül | 141–143 | 5,09–6,16 ms |
+| vágott fa, LOD-dal | **173–176** | **3,67–4,06 ms** |
+
+Az opak rész így ~1,0 ms. Ami maradt: ~1,1 ms alap, ~1,0 ms opak, ~1,7 ms levél.
+
+- **Képi:** LOD-dal és nélküle a fák régiójában az átlagos eltérés 1,82 a 765-ös skálán. A különbségkép csak
+  JPEG-zajt és a mozgó részecskéket mutatja.
+- **Validáció:** a szinkronizációs validáció 0 hibát jelzett. Az editor Scene nézete és a kijelölés rendben van.
+- **Kipróbálva, elvetve:** a példányok közelről távolra rendezése (hogy a takart levelek korán kiessenek) nem hozott
+  mérhető javulást.
+- **A levelek további csökkentése** csak képi változással lehetséges, például a távoli fák kártyáinak ritkításával,
+  ahogy az árnyékban.
+
+### A fagenerátor felülete
+
+- **Az ablak csak a nézet:** a fa előnézete a sarkában a kártya- és háromszögszámmal. Húzás forgat, a görgő
+  közelít, dupla kattintás visszaállít.
+- **A beállítások az Inspectorban vannak, felcímkézve.** Az Inspector attól kezdve mutatja őket, hogy a nézet
+  fókuszt kap (vagy megnyílik), addig, amíg a Scene View, a Game nézet, a Hierarchy vagy az Asset Browser fókuszt
+  nem kap.
+  - Szakaszok: General, Trunk and Branches (Trunk / Level 1–3 lapok), Bark, Leaves, Output.
+  - A korábbi felirat nélküli ágszint-mezők nevet és súgót kaptak.
+- **Textúra helyett material:** a kéreg és a levél egy-egy Material-t fogad (az Asset Browserből húzva, vagy
+  kattintásra listából, a mappájával).
+  - Material nélkül a beépített kéreg vagy levél marad.
+  - Megadott materialnál a mentett modell alapanyaga az lesz (nem készül új), a `.glb` a textúrájára hivatkozik,
+    és a levelek vágása is ezzel a textúrával megy. Csak akkor vág, ha a material nem csempéz és nem tol el uv-t.
+  - A nem alfa-maszkolt levél-materialra figyelmeztet. Az atlasz rácsa (oszlop és sor) is állítható, mert egy saját
+    levéltextúra nem feltétlenül 2×2-es.
+- **Eltávolított mezők:** a „Tree Type”, a tinták, a „Flat Shading” és a „Textured” sem a generált, sem a mentett
+  fára nem hatottak.
+- **Javítva: négy material kettő helyett.** Mentéskor a generátor elkészíti a `bark` és a `leaves` materialt,
+  és beírja őket a modell alapanyagai közé. Az első betöltéskor a renderer a `.glb`-ből újra legyártotta őket. Az
+  `emissive` erőssége a kettőben eltért (0 vs 1), ezért a betöltő `_v2` másolatot mentett, és átírta rájuk a modell
+  alapanyagait. Egy választott material így elveszett volna.
+  - Most a betöltés megtartja a modell meglévő, mind elérhető alapanyagait (`GenerateMaterialAssetsForGltf`).
+  - Az exporter is a glTF-nek megfelelő erősséggel menti őket.
+
+### PBR material editor: a beállítások eddig nem jutottak el a rendererhez
+
+A PBR editor egy `.material` fájl mentésekor csak a színt, az erősségeket, a shading módot és az alpha módot írta ki.
+A textúra-slotok (Diffuse, Normal, AO, Roughness, Metallic, Height) és a tiling elvesztek. Az editor mutatta őket,
+de a renderer, amely a `.material` fájlt olvassa, sosem kapta meg őket.
+
+- **Mentés:** most minden mező a fájlba kerül, a tint alfája is (`baseColor.a`, színválasztó alfa-sávval). Az alfa
+  a textúráéval szorzódik, a mask cutoffnál és a blendnél számít.
+- **ORM-csomagolás:** a shader egy csomagolt textúrát olvas (R occlusion, G roughness, B metallic). A külön AO-,
+  roughness- és metallic-térképet az editor ebbe csomagolja (`packOcclusionRoughnessMetallic`).
+  - A csomag a material mellé kerül, a forrásairól elnevezve. A korábbi csomagok törlődnek.
+  - A forrástérképek a material fájlban is megmaradnak (`roughness`, `metallic`, `height` kulcsok), így újranyitva
+    az editor mutatja őket.
+- **Élő előnézet:** a változás mentés nélkül, azonnal látszik a jelenetben (`MaterialAssetManager::markChanged`). A
+  mentés írja ki a fájlba.
+- **Height:** a térkép megmarad, de shader még nem használja.
+- **Ellenőrizve az editorban:** egy fa kéreg-materialján hat textúra, 3×1-es tiling és fehér tint. A jelenetben a
+  kéreg a beállított textúrával, csempézve rajzolódik. A mentett fájlban minden mező ott van, a csomagolt ORM
+  1024²-es.
+
+## Egyetlen közeli fa – 2026-10-09
+
+A felhasználó fája (`D:/AkitaOnline`, `tree_36330`) a projekt egy másolatán (`Client/build/akita-copy-20261008`)
+mérve, a koronára néző közeli nézetből:
+- 54 m magas, 4032 levélkártya (átlagosan 1,5 m-es), a vágás után is 10 570 m² levélterület;
+- a levél-material opak, `Stylized_Leaves` JPG-textúrával (alfa nélkül), a kéreg-material `mask` módban.
+
+| Változat | FPS | Scene GPU |
+| --- | --- | --- |
+| fa nélkül | 446 | 0,48 ms |
+| fával, a mai nap elején | 155 | 4,40–4,48 ms |
+| + maszkolt mélység-előpass | 195 | 3,69–3,70 ms |
+| + opak shader `discard` nélkül | **263** | **1,96–1,97 ms** |
+
+- **Opak változat `discard` nélkül** (`static_mesh_opaque_ps.spv`, `static_mesh_unlit_opaque_ps.spv`,
+  `STATIC_MESH_OPAQUE`).
+  - A static mesh shaderében `discard` van (alfa-maszk, vízalatti vágás). Emiatt a hardver az opak rajzolásoknál
+    sem tesztelte a mélységet árnyalás előtt, és minden takart réteget teljesen árnyalt.
+  - Opak materialnál a `discard` sosem futott le, ezért a kép nem változik. Ez minden opak statikus hálót érint.
+  - Kikapcsolás: `IX_OPAQUE_NO_DISCARD=0`.
+- **A maszkolt rajzolások két lépésben.**
+  - Előbb a mélységük kerül be: az árnyékpass alfateszt-shadere végzi, színt nem ír.
+  - Utána a színük, `LessOrEqual` teszttel, mélységírás nélkül: csak a látható texel árnyalódik.
+  - Kikapcsolás: `IX_MASK_PREPASS=0`.
+  - A stresszjeleneten egyedül nem hozott sokat (a Codex is ezt mérte). Közeli, sokrétegű koronánál viszont 16%.
+- **Levélkártya-kivágás sokszögre** (`cutoutLeafCards`, mentéskor, a `trimLeafCards` helyett).
+  - A kártya a látható texelek konvex burkára szűkül (8 px ráhagyással, legfeljebb kb. 8 csúcs, a cellára vágva),
+    háromszöglegyezőként rajzolódik.
+  - A beépített egyleveles atlaszoknál a kártya ~40%-kal kisebb a téglalapra vágottnál.
+  - Csak alfa-maszkolt levél-materialnál fut, mert opak materialnál látható részt vágna le. A felhasználó fáján
+    ezért nem alkalmazható: a mérésnél a mentéskori atlaszhoz vágva valódi lombot vágott le.
+- **A kártyák a mentéskori levéltextúrához igazodnak:** a levél-material textúrájának vagy alpha módjának cseréje
+  után a fát újra kell menteni. A generátor panelje ezt jelzi.
+
+Ellenőrzés:
+
+- **Képi:** a közeli nézetben az új és a régi út képe azonos (átlagos eltérés 0,92 a 765-ös skálán).
+- **Validáció:** a szinkronizációs validáció 0 hibát jelzett a stresszjeleneten és a felhasználó jelenetének
+  másolatán.
+- **Stresszjelenet:** a fő pass 4,79–5,10 helyett 4,58–4,63 ms, visszaesés nincs.
+- **Tesztek:** a ctest 8/8, a `TreeGeneratorTest` a kivágást is ellenőrzi.

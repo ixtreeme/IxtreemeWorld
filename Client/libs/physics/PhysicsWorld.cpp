@@ -749,6 +749,8 @@ struct PhysicsWorld::Impl
     JPH::PhysicsSystem system;
     std::unordered_map<BodyId, JPH::BodyID> bodies;
     std::unordered_map<ConstraintId, JPH::Ref<JPH::Constraint>> constraints;
+    struct SuspendedMotion { JPH::Vec3 linear, angular; bool active; };
+    std::unordered_map<BodyId, SuspendedMotion> suspendedMotion;
 #else
     std::unordered_map<BodyId, PhysicsTransform> bodies;
 #endif
@@ -872,10 +874,11 @@ void PhysicsWorld::Destroy()
         for (const auto& entry : m_impl->constraints)
             m_impl->system.RemoveConstraint(entry.second);
         m_impl->constraints.clear();
+        m_impl->suspendedMotion.clear();
         JPH::BodyInterface& bodies = m_impl->system.GetBodyInterface();
         for (const auto& entry : m_impl->bodies)
         {
-            bodies.RemoveBody(entry.second);
+            if (bodies.IsAdded(entry.second)) bodies.RemoveBody(entry.second);
             bodies.DestroyBody(entry.second);
         }
     }
@@ -1142,12 +1145,58 @@ void PhysicsWorld::DestroyBody(BodyId id)
         return;
 #if defined(IXENGINE_PHYSICS_WITH_JOLT)
     JPH::BodyInterface& bodies = m_impl->system.GetBodyInterface();
-    bodies.RemoveBody(it->second);
+    for (auto constraint = m_impl->constraints.begin(); constraint != m_impl->constraints.end();) {
+        auto* joint = static_cast<JPH::TwoBodyConstraint*>(constraint->second.GetPtr());
+        if (joint->GetBody1()->GetID() == it->second || joint->GetBody2()->GetID() == it->second) {
+            m_impl->system.RemoveConstraint(constraint->second);
+            constraint = m_impl->constraints.erase(constraint);
+        } else ++constraint;
+    }
+    if (bodies.IsAdded(it->second)) bodies.RemoveBody(it->second);
     bodies.DestroyBody(it->second);
 #endif
     m_impl->bodies.erase(it);
 #if defined(IXENGINE_PHYSICS_WITH_JOLT)
     m_impl->bodySurfaces.erase(id);
+    m_impl->suspendedMotion.erase(id);
+#endif
+}
+
+void PhysicsWorld::SetBodyEnabled(BodyId id, bool enabled)
+{
+    if (!m_impl || !m_impl->created) return;
+    auto it = m_impl->bodies.find(id);
+    if (it == m_impl->bodies.end()) return;
+#if defined(IXENGINE_PHYSICS_WITH_JOLT)
+    auto& bodies = m_impl->system.GetBodyInterface();
+    if (bodies.IsAdded(it->second) == enabled) return;
+    // Keep body/velocity/constraint objects, but suspend constraints before removing a body.
+    for (auto& [cid, base] : m_impl->constraints) {
+        auto* joint = static_cast<JPH::TwoBodyConstraint*>(base.GetPtr());
+        if (!enabled && (joint->GetBody1()->GetID() == it->second || joint->GetBody2()->GetID() == it->second))
+            joint->SetEnabled(false);
+    }
+    if (enabled) {
+        const auto motion = m_impl->suspendedMotion.find(id);
+        bodies.AddBody(it->second, motion != m_impl->suspendedMotion.end() && motion->second.active
+            ? JPH::EActivation::Activate : JPH::EActivation::DontActivate);
+        if (motion != m_impl->suspendedMotion.end()) {
+            bodies.SetLinearAndAngularVelocity(it->second, motion->second.linear, motion->second.angular);
+            m_impl->suspendedMotion.erase(motion);
+        }
+    } else {
+        // Jolt deactivation zeroes motion, so snapshot it before RemoveBody.
+        if (bodies.GetMotionType(it->second) != JPH::EMotionType::Static)
+            m_impl->suspendedMotion[id] = {bodies.GetLinearVelocity(it->second),
+                bodies.GetAngularVelocity(it->second), bodies.IsActive(it->second)};
+        bodies.RemoveBody(it->second);
+    }
+    for (auto& [cid, base] : m_impl->constraints) {
+        auto* joint = static_cast<JPH::TwoBodyConstraint*>(base.GetPtr());
+        joint->SetEnabled(bodies.IsAdded(joint->GetBody1()->GetID()) && bodies.IsAdded(joint->GetBody2()->GetID()));
+    }
+#else
+    (void)enabled;
 #endif
 }
 
@@ -1164,7 +1213,7 @@ void PhysicsWorld::SetBodyTransform(BodyId id, const PhysicsTransform& transform
         it->second,
         JPH::RVec3(transform.position[0], transform.position[1], transform.position[2]),
         JPH::Quat(transform.rotation[0], transform.rotation[1], transform.rotation[2], transform.rotation[3]),
-        JPH::EActivation::Activate);
+        bodies.IsAdded(it->second) ? JPH::EActivation::Activate : JPH::EActivation::DontActivate);
 #else
     it->second = transform;
 #endif
@@ -1204,12 +1253,32 @@ bool PhysicsWorld::SetLinearVelocity(BodyId id, const float velocity[3])
     JPH::BodyInterface& bodies = m_impl->system.GetBodyInterface();
     if (bodies.GetMotionType(it->second) == JPH::EMotionType::Static)
         return false;
-    bodies.SetLinearVelocity(it->second, JPH::Vec3(velocity[0], velocity[1], velocity[2]));
+    if (auto paused = m_impl->suspendedMotion.find(id); paused != m_impl->suspendedMotion.end())
+        paused->second.linear = JPH::Vec3(velocity[0], velocity[1], velocity[2]);
+    else bodies.SetLinearVelocity(it->second, JPH::Vec3(velocity[0], velocity[1], velocity[2]));
 #else
     (void)velocity;
     return false;
 #endif
     return true;
+}
+
+bool PhysicsWorld::SetAngularVelocity(BodyId id, const float velocity[3])
+{
+    if (!m_impl || !m_impl->created || !velocity) return false;
+    auto it=m_impl->bodies.find(id);
+    if(it==m_impl->bodies.end()) return false;
+#if defined(IXENGINE_PHYSICS_WITH_JOLT)
+    auto& bodies=m_impl->system.GetBodyInterface();
+    if(bodies.GetMotionType(it->second)==JPH::EMotionType::Static) return false;
+    const JPH::Vec3 value(velocity[0],velocity[1],velocity[2]);
+    if(auto paused=m_impl->suspendedMotion.find(id); paused!=m_impl->suspendedMotion.end())
+        paused->second.angular=value;
+    else bodies.SetAngularVelocity(it->second,value);
+    return true;
+#else
+    return false;
+#endif
 }
 
 bool PhysicsWorld::GetLinearVelocity(BodyId id, float outVelocity[3]) const
@@ -1225,7 +1294,9 @@ bool PhysicsWorld::GetLinearVelocity(BodyId id, float outVelocity[3]) const
     if (it == m_impl->bodies.end())
         return false;
 #if defined(IXENGINE_PHYSICS_WITH_JOLT)
-    const JPH::Vec3 velocity = m_impl->system.GetBodyInterface().GetLinearVelocity(it->second);
+    const auto paused = m_impl->suspendedMotion.find(id);
+    const JPH::Vec3 velocity = paused != m_impl->suspendedMotion.end() ? paused->second.linear
+        : m_impl->system.GetBodyInterface().GetLinearVelocity(it->second);
     outVelocity[0] = velocity.GetX();
     outVelocity[1] = velocity.GetY();
     outVelocity[2] = velocity.GetZ();
@@ -1249,7 +1320,9 @@ bool PhysicsWorld::GetAngularVelocity(BodyId id, float outVelocity[3]) const
     if (it == m_impl->bodies.end())
         return false;
 #if defined(IXENGINE_PHYSICS_WITH_JOLT)
-    const JPH::Vec3 velocity = m_impl->system.GetBodyInterface().GetAngularVelocity(it->second);
+    const auto paused = m_impl->suspendedMotion.find(id);
+    const JPH::Vec3 velocity = paused != m_impl->suspendedMotion.end() ? paused->second.angular
+        : m_impl->system.GetBodyInterface().GetAngularVelocity(it->second);
     outVelocity[0] = velocity.GetX();
     outVelocity[1] = velocity.GetY();
     outVelocity[2] = velocity.GetZ();
@@ -1284,7 +1357,7 @@ bool PhysicsWorld::MoveKinematic(BodyId id, const PhysicsTransform& targetTransf
         return false;
 #if defined(IXENGINE_PHYSICS_WITH_JOLT)
     JPH::BodyInterface& bodies = m_impl->system.GetBodyInterface();
-    if (bodies.GetMotionType(it->second) != JPH::EMotionType::Kinematic)
+    if (!bodies.IsAdded(it->second) || bodies.GetMotionType(it->second) != JPH::EMotionType::Kinematic)
         return false;
     const float safeDelta = std::clamp(deltaSeconds, 1.0f / 240.0f, 1.0f / 15.0f);
     bodies.MoveKinematic(
@@ -1313,7 +1386,7 @@ bool PhysicsWorld::AddForce(BodyId id, const float force[3])
         return false;
 #if defined(IXENGINE_PHYSICS_WITH_JOLT)
     JPH::BodyInterface& bodies = m_impl->system.GetBodyInterface();
-    if (bodies.GetMotionType(it->second) != JPH::EMotionType::Dynamic)
+    if (!bodies.IsAdded(it->second) || bodies.GetMotionType(it->second) != JPH::EMotionType::Dynamic)
         return false;
     bodies.AddForce(it->second, JPH::Vec3(force[0], force[1], force[2]), JPH::EActivation::Activate);
 #else
@@ -1332,7 +1405,7 @@ bool PhysicsWorld::AddImpulse(BodyId id, const float impulse[3])
         return false;
 #if defined(IXENGINE_PHYSICS_WITH_JOLT)
     JPH::BodyInterface& bodies = m_impl->system.GetBodyInterface();
-    if (bodies.GetMotionType(it->second) != JPH::EMotionType::Dynamic)
+    if (!bodies.IsAdded(it->second) || bodies.GetMotionType(it->second) != JPH::EMotionType::Dynamic)
         return false;
     bodies.AddImpulse(it->second, JPH::Vec3(impulse[0], impulse[1], impulse[2]));
 #else
@@ -1351,7 +1424,7 @@ bool PhysicsWorld::AddAngularImpulse(BodyId id, const float angularImpulse[3])
         return false;
 #if defined(IXENGINE_PHYSICS_WITH_JOLT)
     JPH::BodyInterface& bodies = m_impl->system.GetBodyInterface();
-    if (bodies.GetMotionType(it->second) != JPH::EMotionType::Dynamic)
+    if (!bodies.IsAdded(it->second) || bodies.GetMotionType(it->second) != JPH::EMotionType::Dynamic)
         return false;
     bodies.AddAngularImpulse(it->second, JPH::Vec3(angularImpulse[0], angularImpulse[1], angularImpulse[2]));
 #else

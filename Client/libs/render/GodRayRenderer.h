@@ -48,6 +48,7 @@ public:
         std::shared_ptr<ixrhi::IXRHITexture> texture;  // D32 array, one layer per cascade, shader-readable
         const WorldMat4* cascadeViewProj = nullptr;    // kCascades light view-projections, finest first
         float depthBias = 0.0015f;
+        float extraDepthPaddingMeters = 0.0f; // extra span excluded from the depth-unit bias
     };
 
     bool Create(ixrhi::IXRHIDevice& rhi, client::asset::IAssetReader& assets);

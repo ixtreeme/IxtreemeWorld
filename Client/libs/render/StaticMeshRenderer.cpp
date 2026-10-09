@@ -790,6 +790,21 @@ std::vector<Guid> GenerateMaterialAssetsForGltf(const fastgltf::Asset& asset, co
     auto& manager = MaterialAssetManager::Instance();
     MaterialAssetManager::ImportSummary summary{};
     const std::size_t materialCount = asset.materials.empty() ? 1u : asset.materials.size();
+    // A model that has its materials already (its .meta's default materials, one per glTF material,
+    // all still there: the ones it was imported or saved with, or chosen for it) keeps them. Made
+    // again from the file on every load, any that differed from the saved one (a tree's, by its
+    // emissive strength) was saved again as <name>_v2 and replaced the model's own, a chosen one too.
+    {
+        const std::vector<Guid> existing = AssetDatabase::Instance().loadDefaultMaterials(modelFsPath);
+        const bool allThere = existing.size() == materialCount &&
+            std::all_of(existing.begin(), existing.end(), [](const Guid& guid) {
+                const std::optional<std::filesystem::path> path = AssetDatabase::Instance().resolveGuid(guid);
+                std::error_code exists;
+                return path && std::filesystem::exists(*path, exists);
+            });
+        if (allThere)
+            return existing;
+    }
     summary.materials = static_cast<std::uint32_t>(materialCount);
     defaultMaterials.reserve(materialCount);
     for (std::size_t i = 0; i < materialCount; ++i)
@@ -1089,17 +1104,27 @@ bool StaticMeshRenderer::LoadCpu(client::asset::IAssetReader& assets, const std:
             return false;
         }
     }
-    BuildShadowLods();
+    BuildLods();
     DecodeTextures(modelPath);
     m_status = LoadStatus::NotLoaded;  // on the CPU; FinishGpu makes it LoadedStatic
     return true;
 }
 
-void StaticMeshRenderer::BuildShadowLods()
+void StaticMeshRenderer::BuildLods()
 {
-    m_shadowLodIndices.clear();
+    m_lodIndices.clear();
     for (std::vector<MeshDraw>& draws : m_shadowLodDraws)
         draws.clear();
+    for (std::vector<MeshDraw>& draws : m_viewLodDraws)
+        draws.clear();
+    m_modelRadius = 0.0f;
+    for (int corner = 0; corner < 8; ++corner)
+    {
+        const float x = (corner & 1) ? m_boundsMax[0] : m_boundsMin[0];
+        const float y = (corner & 2) ? m_boundsMax[1] : m_boundsMin[1];
+        const float z = (corner & 4) ? m_boundsMax[2] : m_boundsMin[2];
+        m_modelRadius = std::max(m_modelRadius, std::sqrt(x * x + y * y + z * z));
+    }
     m_shadowCardVertices.clear();
     m_shadowCardDraws.clear();
     if (m_vertices.empty() || m_indices.empty())
@@ -1117,10 +1142,13 @@ void StaticMeshRenderer::BuildShadowLods()
     std::size_t opaqueIndices = 0;
     for (const MeshDraw& draw : m_draws)
         opaqueIndices += masked(draw) ? 0u : draw.indexCount;
-    std::array<std::size_t, kShadowLodLevels> levelIndices{};
-    if (opaqueIndices >= 3u * 256u)
-    {
-        for (std::vector<MeshDraw>& draws : m_shadowLodDraws)
+    std::array<std::size_t, kLodLevels> levelIndices{};
+    std::array<std::size_t, kLodLevels> viewLevelIndices{};
+    // Each opaque draw's levels, from the given indices (welded for the shadow, as they are for the view).
+    const auto simplifyLevels = [&](const std::vector<std::uint32_t>& sourceIndices,
+                                    std::array<std::vector<MeshDraw>, kLodLevels>& out,
+                                    std::array<std::size_t, kLodLevels>& outIndices) {
+        for (std::vector<MeshDraw>& draws : out)
             draws.assign(m_draws.size(), MeshDraw{});
         std::vector<std::uint32_t> source;
         std::vector<std::uint32_t> simplified;
@@ -1129,31 +1157,36 @@ void StaticMeshRenderer::BuildShadowLods()
             const MeshDraw& draw = m_draws[drawIndex];
             if (draw.indexCount == 0 || masked(draw))
                 continue;
-            source.assign(welded.begin() + draw.firstIndex, welded.begin() + draw.firstIndex + draw.indexCount);
+            source.assign(sourceIndices.begin() + draw.firstIndex, sourceIndices.begin() + draw.firstIndex + draw.indexCount);
             MeshDraw kept{};  // the coarsest level kept so far (indexCount 0: the draw's own)
             float keptError = 0.0f;  // how far off the surface it is
-            for (std::size_t level = 0; level < kShadowLodLevels; ++level)
+            for (std::size_t level = 0; level < kLodLevels; ++level)
             {
                 simplified.resize(source.size());
                 float error = 0.0f;
                 const std::size_t count = meshopt_simplify(simplified.data(), source.data(), source.size(),
                     &m_vertices.front().position[0], m_vertices.size(), sizeof(Vertex), 0,
-                    std::max(kShadowLodErrors[level] - keptError, 0.0f),
+                    std::max(kLodErrors[level] - keptError, 0.0f),
                     meshopt_SimplifySparse | meshopt_SimplifyErrorAbsolute, &error);
                 if (count >= 3u && count * 4u <= source.size() * 3u)
                 {
-                    kept.firstIndex = static_cast<std::uint32_t>(m_shadowLodIndices.size());
+                    kept.firstIndex = static_cast<std::uint32_t>(m_lodIndices.size());
                     kept.indexCount = static_cast<std::uint32_t>(count);
                     kept.materialSlot = draw.materialSlot;
                     kept.vertexCount = draw.vertexCount;
-                    m_shadowLodIndices.insert(m_shadowLodIndices.end(), simplified.begin(), simplified.begin() + count);
+                    m_lodIndices.insert(m_lodIndices.end(), simplified.begin(), simplified.begin() + count);
                     source.assign(simplified.begin(), simplified.begin() + count);
                     keptError += error;
                 }
-                m_shadowLodDraws[level][drawIndex] = kept;
-                levelIndices[level] += kept.indexCount != 0 ? kept.indexCount : draw.indexCount;
+                out[level][drawIndex] = kept;
+                outIndices[level] += kept.indexCount != 0 ? kept.indexCount : draw.indexCount;
             }
         }
+    };
+    if (opaqueIndices >= 3u * 256u)
+    {
+        simplifyLevels(welded, m_shadowLodDraws, levelIndices);
+        simplifyLevels(m_indices, m_viewLodDraws, viewLevelIndices);
     }
 
     // Alpha-masked submeshes of many small separate pieces (leaf cards). A simplifier cannot merge
@@ -1248,7 +1281,7 @@ void StaticMeshRenderer::BuildShadowLods()
         }
         // Their triangles, on copies of their own vertices (uvs kept for the cut-out) moved out.
         MeshDraw cards{};
-        cards.firstIndex = static_cast<std::uint32_t>(m_shadowLodIndices.size());
+        cards.firstIndex = static_cast<std::uint32_t>(m_lodIndices.size());
         cards.materialSlot = draw.materialSlot;
         const std::size_t firstCardVertex = m_shadowCardVertices.size();
         for (std::uint32_t t = 0; t < triangles; ++t)
@@ -1270,12 +1303,12 @@ void StaticMeshRenderer::BuildShadowLods()
                     cardVertexOf[source] = static_cast<std::uint32_t>(m_shadowCardVertices.size());
                     m_shadowCardVertices.push_back(vertex);
                 }
-                m_shadowLodIndices.push_back(cardVertexOf[source]);
+                m_lodIndices.push_back(cardVertexOf[source]);
             }
         }
         for (std::uint32_t i = 0; i < draw.indexCount; ++i)
             cardVertexOf[m_indices[draw.firstIndex + i]] = kNone;
-        cards.indexCount = static_cast<std::uint32_t>(m_shadowLodIndices.size() - cards.firstIndex);
+        cards.indexCount = static_cast<std::uint32_t>(m_lodIndices.size() - cards.firstIndex);
         cards.vertexCount = static_cast<std::uint32_t>(m_shadowCardVertices.size() - firstCardVertex);
         if (m_shadowCardDraws.empty())
             m_shadowCardDraws.assign(m_draws.size(), MeshDraw{});
@@ -1284,14 +1317,17 @@ void StaticMeshRenderer::BuildShadowLods()
         cardIndicesAfter += cards.indexCount;
     }
 
-    if (m_shadowLodIndices.empty())
+    if (m_lodIndices.empty())
     {
         for (std::vector<MeshDraw>& draws : m_shadowLodDraws)
             draws.clear();
+        for (std::vector<MeshDraw>& draws : m_viewLodDraws)
+            draws.clear();
         return;
     }
-    LogFormat("[STATIC-MESH] shadow lods: %s opaque_tris=%zu levels=%zu/%zu/%zu cards_tris=%zu->%zu (%.2f ms)",
+    LogFormat("[STATIC-MESH] lods: %s opaque_tris=%zu shadow=%zu/%zu/%zu view=%zu/%zu/%zu cards_tris=%zu->%zu (%.2f ms)",
         m_modelPath.c_str(), opaqueIndices / 3u, levelIndices[0] / 3u, levelIndices[1] / 3u, levelIndices[2] / 3u,
+        viewLevelIndices[0] / 3u, viewLevelIndices[1] / 3u, viewLevelIndices[2] / 3u,
         cardIndicesBefore / 3u, cardIndicesAfter / 3u,
         std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - started).count());
 }
@@ -2124,7 +2160,7 @@ bool StaticMeshRenderer::CreateBuffers(ixrhi::IXRHIDevice& rhi)
     if (!m_vertexBuffer || !m_indexBuffer)
         return false;
     // The shadow detail levels (none made: the model's own triangles in every cascade).
-    m_shadowLodIndexBuffer.reset();
+    m_lodIndexBuffer.reset();
     m_shadowCardVertexBuffer.reset();
     const bool deferred = m_deferUploads && m_pendingUploads;
     const auto makeShadowLodBuffer = [&](const void* data, std::uint64_t bytes, ixrhi::IXRHIBufferUsage usage,
@@ -2144,11 +2180,11 @@ bool StaticMeshRenderer::CreateBuffers(ixrhi::IXRHIDevice& rhi)
         }
         return buffer;
     };
-    if (!m_shadowLodIndices.empty())
-        m_shadowLodIndexBuffer = makeShadowLodBuffer(m_shadowLodIndices.data(),
-            sizeof(std::uint32_t) * m_shadowLodIndices.size(), ixrhi::IXRHIBufferUsage::Index,
-            deferred ? &m_pendingUploads->shadowLodIndexStaging : nullptr, "ShadowLodIB");
-    if (m_shadowLodIndexBuffer && !m_shadowCardVertices.empty())
+    if (!m_lodIndices.empty())
+        m_lodIndexBuffer = makeShadowLodBuffer(m_lodIndices.data(),
+            sizeof(std::uint32_t) * m_lodIndices.size(), ixrhi::IXRHIBufferUsage::Index,
+            deferred ? &m_pendingUploads->lodIndexStaging : nullptr, "ShadowLodIB");
+    if (m_lodIndexBuffer && !m_shadowCardVertices.empty())
         m_shadowCardVertexBuffer = makeShadowLodBuffer(m_shadowCardVertices.data(),
             sizeof(Vertex) * m_shadowCardVertices.size(), ixrhi::IXRHIBufferUsage::Vertex,
             deferred ? &m_pendingUploads->shadowCardVertexStaging : nullptr, "ShadowCardVB");
@@ -2790,10 +2826,10 @@ void StaticMeshRenderer::RecordPendingUploads(ixrhi::IXRHICommandList& cmd, cons
         cmd.CopyBuffer(*uploads.indexStaging, *m_indexBuffer, uploads.indexStaging->SizeBytes());
         cmd.TransitionBuffer(*m_indexBuffer, ixrhi::IXRHIBufferState::TransferDst, ixrhi::IXRHIBufferState::IndexRead);
     }
-    if (uploads.shadowLodIndexStaging && m_shadowLodIndexBuffer)
+    if (uploads.lodIndexStaging && m_lodIndexBuffer)
     {
-        cmd.CopyBuffer(*uploads.shadowLodIndexStaging, *m_shadowLodIndexBuffer, uploads.shadowLodIndexStaging->SizeBytes());
-        cmd.TransitionBuffer(*m_shadowLodIndexBuffer, ixrhi::IXRHIBufferState::TransferDst,
+        cmd.CopyBuffer(*uploads.lodIndexStaging, *m_lodIndexBuffer, uploads.lodIndexStaging->SizeBytes());
+        cmd.TransitionBuffer(*m_lodIndexBuffer, ixrhi::IXRHIBufferState::TransferDst,
             ixrhi::IXRHIBufferState::IndexRead);
     }
     if (uploads.shadowCardVertexStaging && m_shadowCardVertexBuffer)
@@ -3184,6 +3220,11 @@ bool StaticMeshRenderer::EnsureInstanceCapacity(ixrhi::IXRHIDevice& rhi,
     return true;
 }
 
+namespace
+{
+bool EnvironmentSwitchOn(const char* name);
+} // namespace
+
 bool StaticMeshRenderer::CreatePipeline(ixrhi::IXRHIDevice& rhi)
 {
     if (!m_assets || !m_bindLayout)
@@ -3195,11 +3236,19 @@ bool StaticMeshRenderer::CreatePipeline(ixrhi::IXRHIDevice& rhi)
         ixrhi::IXRHIShaderStage::Fragment, "PSMain");
     auto unlitPs = LoadShader(rhi, *m_assets, "assets/shaders/static_mesh_unlit_ps.spv",
         ixrhi::IXRHIShaderStage::Fragment, "PSMain");
+    // The opaque draws' fragment shaders: no discard, so the depth test runs before shading.
+    auto opaquePs = LoadShader(rhi, *m_assets, "assets/shaders/static_mesh_opaque_ps.spv",
+        ixrhi::IXRHIShaderStage::Fragment, "PSMain");
+    auto unlitOpaquePs = LoadShader(rhi, *m_assets, "assets/shaders/static_mesh_unlit_opaque_ps.spv",
+        ixrhi::IXRHIShaderStage::Fragment, "PSMain");
     auto outlineVs = LoadShader(rhi, *m_assets, "assets/shaders/static_mesh_outline_vs.spv",
         ixrhi::IXRHIShaderStage::Vertex, "VSMain");
     auto outlinePs = LoadShader(rhi, *m_assets, "assets/shaders/static_mesh_outline_ps.spv",
         ixrhi::IXRHIShaderStage::Fragment, "PSMain");
-    if (!vs || !ps || !unlitPs || !outlineVs || !outlinePs)
+    // (The shadow pass's alpha test: the same vertex output, so it pairs with the view's vertex shader.)
+    auto maskDepthPs = LoadShader(rhi, *m_assets, "assets/shaders/static_mesh_shadow_mask_ps.spv",
+        ixrhi::IXRHIShaderStage::Fragment, "ShadowMaskPS");
+    if (!vs || !ps || !unlitPs || !opaquePs || !unlitOpaquePs || !outlineVs || !outlinePs || !maskDepthPs)
         return false;
 
     ixrhi::IXRHIGraphicsPipelineDesc desc;
@@ -3242,10 +3291,30 @@ bool StaticMeshRenderer::CreatePipeline(ixrhi::IXRHIDevice& rhi)
         return target != nullptr;
     };
     desc.debugName = "StaticMesh:Opaque";
-    if (!createVariant("StaticMesh:Opaque", ps, m_pipeline) ||
+    // (IX_OPAQUE_NO_DISCARD=0: the opaque draws with the shader that can discard, as before; for comparing.)
+    static const bool opaqueVariants = EnvironmentSwitchOn("IX_OPAQUE_NO_DISCARD");
+    if (!createVariant("StaticMesh:Opaque", opaqueVariants ? opaquePs : ps, m_pipeline) ||
         !createVariant("StaticMesh:Mask", ps, m_maskPipeline) ||
-        !createVariant("StaticMesh:Unlit", unlitPs, m_unlitPipeline) ||
+        !createVariant("StaticMesh:Unlit", opaqueVariants ? unlitOpaquePs : unlitPs, m_unlitPipeline) ||
         !createVariant("StaticMesh:UnlitMask", unlitPs, m_unlitMaskPipeline))
+        return false;
+
+    // The masked draws' two steps: depth only (alpha-tested), then colour on that depth (less-or-equal,
+    // not written: equal for the nearest texel, which is the only one left).
+    ixrhi::IXRHIGraphicsPipelineDesc maskDepth = desc;
+    maskDepth.fragmentShader = maskDepthPs;
+    maskDepth.blendAttachments[0].writeColor = false;
+    maskDepth.debugName = "StaticMesh:MaskDepth";
+    m_maskDepthPipeline = rhi.CreateGraphicsPipeline(maskDepth);
+    ixrhi::IXRHIGraphicsPipelineDesc onDepth = desc;
+    onDepth.depthWriteEnable = false;
+    onDepth.depthCompareOp = ixrhi::IXRHICompareOp::LessOrEqual;
+    onDepth.debugName = "StaticMesh:MaskOnDepth";
+    m_maskOnDepthPipeline = rhi.CreateGraphicsPipeline(onDepth);
+    onDepth.fragmentShader = unlitPs;
+    onDepth.debugName = "StaticMesh:UnlitMaskOnDepth";
+    m_unlitMaskOnDepthPipeline = rhi.CreateGraphicsPipeline(onDepth);
+    if (!m_maskDepthPipeline || !m_maskOnDepthPipeline || !m_unlitMaskOnDepthPipeline)
         return false;
 
     // Alpha-blended: over what is drawn, depth tested but not written. Each side of the faces in its
@@ -3319,11 +3388,33 @@ void StaticMeshRenderer::RenderBatchInWorld(ixrhi::IXRHICommandList& cmd,
     RenderLodBatchInWorld(cmd, frame, timeSeconds, camera, instances, defaultLod, 0, 0, targetWidth, targetHeight);
 }
 
+namespace
+{
+// A comparison switch: on unless the environment sets it to 0 (IX_VIEW_LOD, IX_SHADOW_LOD).
+bool EnvironmentSwitchOn(const char* name)
+{
+    std::string value;
+#if defined(_WIN32)
+    char* text = nullptr;
+    std::size_t length = 0;
+    if (_dupenv_s(&text, &length, name) == 0 && text)
+    {
+        value = text;
+        std::free(text);
+    }
+#else
+    if (const char* text = std::getenv(name))
+        value = text;
+#endif
+    return value != "0";
+}
+} // namespace
+
 void StaticMeshRenderer::RenderLodBatchInWorld(ixrhi::IXRHICommandList& cmd,
     const ixrhi::IXRHIFrameInfo& frame,
     double timeSeconds,
     const WorldCamera& camera,
-    const InstanceList& instances,
+    const InstanceList& instancesIn,
     const LodConfig& lodConfig,
     std::uint64_t configHash,
     std::uint32_t lodLevel,
@@ -3338,7 +3429,7 @@ void StaticMeshRenderer::RenderLodBatchInWorld(ixrhi::IXRHICommandList& cmd,
     m_lastOverrideActiveDraws = 0;
     m_lastInstanceBufferBytes = 0;
     m_lastInstanceBufferRebuilt = false;
-    if (!m_pipeline || !m_unlitPipeline || m_bindPages.empty() || m_indices.empty() || instances.empty() ||
+    if (!m_pipeline || !m_unlitPipeline || m_bindPages.empty() || m_indices.empty() || instancesIn.empty() ||
         !frame.frameActive || !UploadsRecorded())
         return;
     if (!m_boundSunShadowTexture)
@@ -3357,7 +3448,7 @@ void StaticMeshRenderer::RenderLodBatchInWorld(ixrhi::IXRHICommandList& cmd,
     if (extentWidth == 0 || extentHeight == 0)
         return;
 
-    const std::uint32_t diagnosticEntityId = instances.empty() ? 0u : instances.front()->entityId;
+    const std::uint32_t diagnosticEntityId = instancesIn.empty() ? 0u : instancesIn.front()->entityId;
     const bool useLodBuffer = configHash != 0 && lodLevel > 0 &&
         EnsureLodBuffers(lodConfig, configHash, diagnosticEntityId);
     const LodIndexBuffer* lodSet = nullptr;
@@ -3404,6 +3495,71 @@ void StaticMeshRenderer::RenderLodBatchInWorld(ixrhi::IXRHICommandList& cmd,
         }
         lodLevel = 0;
     }
+
+    // Each instance's view detail level (a model LOD config aside): how many of the levels' errors,
+    // at its scale and nearest depth, project under kViewLodMaxErrorPixels (the view's y scale and
+    // depth read from the view-projection: row vectors, clip w the depth). The instances are drawn
+    // grouped by level (keeping their order within it), so a level is one run.
+    static const bool viewLodsEnabled = EnvironmentSwitchOn("IX_VIEW_LOD");
+    InstanceList grouped;
+    std::vector<std::uint8_t> viewLevels;
+    const InstanceList* drawn = &instancesIn;
+    if (!lodSet && viewLodsEnabled && m_lodIndexBuffer && !m_viewLodDraws[0].empty())
+    {
+        const float* vp = camera.viewProjection.m;
+        const float pixelsAtUnitDepth =
+            0.5f * static_cast<float>(extentHeight) * std::sqrt(vp[1] * vp[1] + vp[5] * vp[5] + vp[9] * vp[9]);
+        std::array<std::uint32_t, kLodLevels + 1> counts{};
+        viewLevels.resize(instancesIn.size());
+        for (std::size_t i = 0; i < instancesIn.size(); ++i)
+        {
+            const Instance& instance = *instancesIn[i];
+            const float scale = std::max({std::abs(instance.scale[0]), std::abs(instance.scale[1]), std::abs(instance.scale[2])});
+            const float depth = static_cast<float>(instance.position.x) * vp[3] + static_cast<float>(instance.position.y) * vp[7] +
+                static_cast<float>(instance.position.z) * vp[11] + vp[15] - m_modelRadius * scale;
+            std::uint8_t level = 0;
+            if (depth > camera.nearPlane)
+            {
+                const float pixelsPerModelUnit = pixelsAtUnitDepth * scale / depth;
+                while (level < kLodLevels && kLodErrors[level] * pixelsPerModelUnit <= kViewLodMaxErrorPixels)
+                    ++level;
+            }
+            viewLevels[i] = level;
+            ++counts[level];
+        }
+        if (counts[0] == instancesIn.size())
+        {
+            viewLevels.clear();
+        }
+        else
+        {
+            std::array<std::uint32_t, kLodLevels + 1> next{};
+            for (std::size_t level = 1; level < next.size(); ++level)
+                next[level] = next[level - 1] + counts[level - 1];
+            grouped.resize(instancesIn.size());
+            std::vector<std::uint8_t> groupedLevels(instancesIn.size());
+            for (std::size_t i = 0; i < instancesIn.size(); ++i)
+            {
+                const std::uint32_t at = next[viewLevels[i]]++;
+                grouped[at] = instancesIn[i];
+                groupedLevels[at] = viewLevels[i];
+            }
+            viewLevels = std::move(groupedLevels);
+            drawn = &grouped;
+        }
+    }
+    const InstanceList& instances = *drawn;
+    // Whether a draw (submesh) has view levels: its runs are split by level then.
+    const auto levelled = [&](std::uint32_t submesh) {
+        if (viewLevels.empty() || submesh >= m_draws.size())
+            return false;
+        for (const std::vector<MeshDraw>& draws : m_viewLodDraws)
+        {
+            if (submesh < draws.size() && draws[submesh].indexCount != 0)
+                return true;
+        }
+        return false;
+    };
 
     const uint32_t frameIndex = frame.frameIndex % kFramesInFlight;
     BeginFrameSlots(frame);
@@ -3481,6 +3637,7 @@ void StaticMeshRenderer::RenderLodBatchInWorld(ixrhi::IXRHICommandList& cmd,
     const std::shared_ptr<ixrhi::IXRHIBuffer>& boundIndexBuffer =
         lodSet && lodSet->buffer ? lodSet->buffer : m_indexBuffer;
     cmd.SetIndexBuffer(*boundIndexBuffer, 0, /*thirtyTwoBit=*/true);
+    const ixrhi::IXRHIBuffer* currentIndexBuffer = boundIndexBuffer.get();
     const auto findInstanceIndex = [&](std::uint32_t entityId) -> std::optional<std::size_t> {
         for (std::size_t i = 0; i < instances.size(); ++i)
         {
@@ -3625,16 +3782,19 @@ void StaticMeshRenderer::RenderLodBatchInWorld(ixrhi::IXRHICommandList& cmd,
         MaterialTextureViews textures;
         bool isMask = false;
         bool isBlend = false;  // left to RenderTransparentInWorld
+        std::uint8_t level = 0;  // the view detail level its instances are drawn at
     };
     std::vector<MaterialRun> materialRuns;
     materialRuns.reserve(drawCommands.size());
     for (const InstancedDrawCommand& command : drawCommands)
     for (std::uint32_t runStart = 0; runStart < command.instanceCount;)
     {
+        const bool byLevel = levelled(command.sourceSubmesh);
         std::uint32_t runEnd = runStart + 1;
         while (runEnd < command.instanceCount &&
                materialKey(*instances[runEnd], command.materialSlot) ==
-                   materialKey(*instances[runStart], command.materialSlot))
+                   materialKey(*instances[runStart], command.materialSlot) &&
+               (!byLevel || viewLevels[runEnd] == viewLevels[runStart]))
             ++runEnd;
         MaterialRun& run = materialRuns.emplace_back();
         run.command = &command;
@@ -3645,11 +3805,20 @@ void StaticMeshRenderer::RenderLodBatchInWorld(ixrhi::IXRHICommandList& cmd,
         run.textures = ResolveMaterialTextureViews(*m_rhi, *run.instance, run.draw.materialSlot);
         run.isMask = std::strcmp(run.textures.fragmentShaderAlphaPath, "discard") == 0;
         run.isBlend = std::strcmp(run.textures.fragmentShaderAlphaPath, "blend") == 0;
+        run.level = byLevel ? viewLevels[runStart] : 0;
         runStart = runEnd;
     }
-    auto drawPass = [&](bool maskPass) {
-        for (const MaterialRun& run : materialRuns)
+    // The masked runs (leaves) in two steps, each run's set made in the first and bound again in the
+    // second (MaskStep). The lit shader can discard, which keeps the hardware from rejecting a hidden
+    // texel before shading it: a crown seen up close was shaded once for every layer of its leaves.
+    // (IX_MASK_PREPASS=0: in one step, as before; for comparing.)
+    enum class MaskStep { Single, Depth, Colour };
+    static const bool maskPrepass = EnvironmentSwitchOn("IX_MASK_PREPASS");
+    std::vector<std::optional<BindSlot>> maskRunSlots(materialRuns.size());
+    auto drawPass = [&](bool maskPass, MaskStep step) {
+        for (std::size_t runIndex = 0; runIndex < materialRuns.size(); ++runIndex)
         {
+            const MaterialRun& run = materialRuns[runIndex];
             if (run.isMask != maskPass || run.isBlend)
                 continue;
             const InstancedDrawCommand& command = *run.command;
@@ -3660,6 +3829,10 @@ void StaticMeshRenderer::RenderLodBatchInWorld(ixrhi::IXRHICommandList& cmd,
             const ixrhi::IXRHIGraphicsPipeline* pipelineForDraw = materialTextures.unlit
                 ? (run.isMask ? m_unlitMaskPipeline.get() : m_unlitPipeline.get())
                 : (run.isMask ? m_maskPipeline.get() : m_pipeline.get());
+            if (step == MaskStep::Depth)
+                pipelineForDraw = m_maskDepthPipeline.get();
+            else if (step == MaskStep::Colour)
+                pipelineForDraw = materialTextures.unlit ? m_unlitMaskOnDepthPipeline.get() : m_maskOnDepthPipeline.get();
 
             if (boundPipeline != pipelineForDraw)
             {
@@ -3667,11 +3840,30 @@ void StaticMeshRenderer::RenderLodBatchInWorld(ixrhi::IXRHICommandList& cmd,
                 boundPipeline = pipelineForDraw;
             }
 
+            if (step == MaskStep::Colour)
+            {
+                // The set its depth step made.
+                const std::optional<BindSlot>& kept = maskRunSlots[runIndex];
+                if (!kept)
+                    continue;
+                if (currentIndexBuffer != boundIndexBuffer.get())
+                {
+                    cmd.SetIndexBuffer(*boundIndexBuffer, 0, /*thirtyTwoBit=*/true);
+                    currentIndexBuffer = boundIndexBuffer.get();
+                }
+                cmd.BindGroup(0, *kept->page->group, kept->set);
+                cmd.DrawIndexed(draw.indexCount, draw.instanceCount, draw.firstIndex, 0, draw.firstInstance);
+                ++m_lastSubmittedDrawCalls;
+                m_lastSubmittedIndexCount += draw.indexCount;
+                continue;
+            }
             const std::optional<BindSlot> slot = NextBindSlot(frameIndex);
             if (!slot)
                 return;
             UpdateWorldUniform(*slot, camera, runInstance, timeSeconds, draw.materialSlot);
             UpdateMaterialTextureDescriptors(*slot, materialTextures);
+            if (step == MaskStep::Depth)
+                maskRunSlots[runIndex] = slot;
             const uint32_t bindSlot = slot->id;
             if (materialBindingCount == m_lastMaterialBindings.size())
                 m_lastMaterialBindings.emplace_back();
@@ -3738,13 +3930,36 @@ void StaticMeshRenderer::RenderLodBatchInWorld(ixrhi::IXRHICommandList& cmd,
                     logDrawDiag("[LOD-DRAW-REF]", instances[*refInstanceIndex]->entityId, command, *refInstanceIndex, bindSlot, pipelineForDraw);
                 }
             }
-            cmd.DrawIndexed(draw.indexCount, draw.instanceCount, draw.firstIndex, 0, draw.firstInstance);
+            // An opaque run at its level's indices (a masked one keeps its own: its uvs).
+            const MeshDraw* lod = nullptr;
+            if (run.level > 0 && !run.isMask)
+            {
+                const MeshDraw& span = m_viewLodDraws[run.level - 1u][draw.sourceSubmesh];
+                if (span.indexCount != 0)
+                    lod = &span;
+            }
+            const ixrhi::IXRHIBuffer* indexBuffer = lod ? m_lodIndexBuffer.get() : boundIndexBuffer.get();
+            if (currentIndexBuffer != indexBuffer)
+            {
+                cmd.SetIndexBuffer(*indexBuffer, 0, /*thirtyTwoBit=*/true);
+                currentIndexBuffer = indexBuffer;
+            }
+            const std::uint32_t indexCount = lod ? lod->indexCount : draw.indexCount;
+            cmd.DrawIndexed(indexCount, draw.instanceCount, lod ? lod->firstIndex : draw.firstIndex, 0, draw.firstInstance);
             ++m_lastSubmittedDrawCalls;
-            m_lastSubmittedIndexCount += draw.indexCount;
+            m_lastSubmittedIndexCount += indexCount;
         }
     };
-    drawPass(false);
-    drawPass(true);
+    drawPass(false, MaskStep::Single);
+    if (maskPrepass && m_maskDepthPipeline && m_maskOnDepthPipeline && m_unlitMaskOnDepthPipeline)
+    {
+        drawPass(true, MaskStep::Depth);
+        drawPass(true, MaskStep::Colour);
+    }
+    else
+    {
+        drawPass(true, MaskStep::Single);
+    }
     m_lastMaterialBindings.resize(materialBindingCount);
     if (m_outlinePipeline)
     {
@@ -3758,6 +3973,8 @@ void StaticMeshRenderer::RenderLodBatchInWorld(ixrhi::IXRHICommandList& cmd,
         const std::optional<BindSlot> slot = outlinedInstances.empty() ? std::nullopt : NextBindSlot(frameIndex);
         if (slot)
         {
+            if (currentIndexBuffer != boundIndexBuffer.get())
+                cmd.SetIndexBuffer(*boundIndexBuffer, 0, /*thirtyTwoBit=*/true);
             cmd.SetGraphicsPipeline(*m_outlinePipeline);
             const MaterialTextureViews materialTextures =
                 ResolveMaterialTextureViews(*m_rhi, *instances.front(), 0);
@@ -4001,20 +4218,7 @@ namespace
 // IX_SHADOW_LOD=0: every caster draws its own triangles into every cascade (for comparing).
 bool ShadowLodsEnabled()
 {
-    std::string value;
-#if defined(_WIN32)
-    char* text = nullptr;
-    std::size_t length = 0;
-    if (_dupenv_s(&text, &length, "IX_SHADOW_LOD") == 0 && text)
-    {
-        value = text;
-        std::free(text);
-    }
-#else
-    if (const char* text = std::getenv("IX_SHADOW_LOD"))
-        value = text;
-#endif
-    return value != "0";
+    return EnvironmentSwitchOn("IX_SHADOW_LOD");
 }
 } // namespace
 
@@ -4059,7 +4263,7 @@ void StaticMeshRenderer::RenderShadowCasters(ixrhi::IXRHICommandList& cmd,
     // scale (0: its own triangles; the last: its leaf cards thinned too).
     static const bool lodsEnabled = ShadowLodsEnabled();
     std::vector<std::uint8_t> levels(instances.size(), 0);
-    if (lodsEnabled && m_shadowLodIndexBuffer && shadowTexelMeters > 0.0f)
+    if (lodsEnabled && m_lodIndexBuffer && shadowTexelMeters > 0.0f)
     {
         const float allowed = 0.5f * shadowTexelMeters;
         for (std::size_t i = 0; i < instances.size(); ++i)
@@ -4067,7 +4271,7 @@ void StaticMeshRenderer::RenderShadowCasters(ixrhi::IXRHICommandList& cmd,
             const float* scale = instances[i]->scale;
             const float largest = std::max({std::abs(scale[0]), std::abs(scale[1]), std::abs(scale[2])});
             std::uint8_t level = 0;
-            while (level < kShadowLodLevels && kShadowLodErrors[level] * largest <= allowed)
+            while (level < kLodLevels && kLodErrors[level] * largest <= allowed)
                 ++level;
             levels[i] = level;
         }
@@ -4075,7 +4279,7 @@ void StaticMeshRenderer::RenderShadowCasters(ixrhi::IXRHICommandList& cmd,
 
     const ixrhi::IXRHIBuffer* boundVertexBuffer = nullptr;
     const ixrhi::IXRHIBuffer* boundIndexBuffer = nullptr;
-    const auto thinCards = [&](std::uint32_t i) { return levels[i] == kShadowLodLevels; };
+    const auto thinCards = [&](std::uint32_t i) { return levels[i] == kLodLevels; };
     // Opaque runs need no textures: one set of its own this frame (instances + shadow map bound),
     // taken by the first of them.
     std::optional<BindSlot> opaqueSlot;
@@ -4155,7 +4359,7 @@ void StaticMeshRenderer::RenderShadowCasters(ixrhi::IXRHICommandList& cmd,
                 cmd.SetVertexBuffer(0, *vertexBuffer, 0);
                 boundVertexBuffer = vertexBuffer;
             }
-            const ixrhi::IXRHIBuffer* indexBuffer = lod ? m_shadowLodIndexBuffer.get() : m_indexBuffer.get();
+            const ixrhi::IXRHIBuffer* indexBuffer = lod ? m_lodIndexBuffer.get() : m_indexBuffer.get();
             if (boundIndexBuffer != indexBuffer)
             {
                 cmd.SetIndexBuffer(*indexBuffer, 0, /*thirtyTwoBit=*/true);
@@ -4175,6 +4379,9 @@ void StaticMeshRenderer::DestroyPipeline()
     m_maskPipeline.reset();
     m_unlitPipeline.reset();
     m_unlitMaskPipeline.reset();
+    m_maskDepthPipeline.reset();
+    m_maskOnDepthPipeline.reset();
+    m_unlitMaskOnDepthPipeline.reset();
     m_outlinePipeline.reset();
     for (auto& sides : m_blendPipelines)
     {
@@ -4198,7 +4405,7 @@ void StaticMeshRenderer::Destroy()
     m_pendingUploads.reset();
     m_vertexBuffer.reset();
     m_indexBuffer.reset();
-    m_shadowLodIndexBuffer.reset();
+    m_lodIndexBuffer.reset();
     m_shadowCardVertexBuffer.reset();
     m_lodBuffers.clear();
     // Dropping in-flight uploads waits for their fences and releases staging

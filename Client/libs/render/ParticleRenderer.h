@@ -132,6 +132,7 @@ public:
                             float dtSeconds);
     // Script controls (no-ops when the emitter has not been created yet).
     void GpuEmitterPlay(std::uint32_t entityId);
+    void GpuEmitterSetEntityPaused(std::uint32_t entityId, bool paused);
     void GpuEmitterStop(std::uint32_t entityId);
     void GpuEmitterRestart(std::uint32_t entityId);
     void GpuEmitterEmit(std::uint32_t entityId, std::uint32_t count);
@@ -220,6 +221,7 @@ private:
         std::uint32_t frameSeed = 1;
         int pendingBurst = 0;
         bool playing = true;
+        bool entityPaused = false; // retained while disabled; no simulation/draw dispatches
         // Whether its initial play state is decided (by the component's playOnStart on its first
         // simulation, or by a script's Play/Stop before that); cleared when Play starts.
         bool started = false;

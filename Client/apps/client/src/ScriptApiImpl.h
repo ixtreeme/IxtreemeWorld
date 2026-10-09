@@ -97,6 +97,15 @@ public:
     void ParticleRestart(std::uint32_t id) override;
     void ParticleEmit(std::uint32_t id, std::uint32_t count) override;
 
+    ixscript::RaycastHit RaycastFiltered(float ox, float oy, float oz, float dx, float dy, float dz,
+        float maxDistance, const ixscript::QueryFilter* filter) override;
+    std::uint32_t OverlapSphere(float x, float y, float z, float radius,
+        const ixscript::QueryFilter* filter, ixscript::SphereOverlapHit* output,
+        std::uint32_t capacity, std::uint32_t* truncated) override;
+    void SetEntityEnabled(std::uint32_t id, bool enabled) override;
+    std::function<ixscript::RaycastHit(const float*, const float*, float, const ixscript::QueryFilter&)> raycastFiltered;
+    std::function<std::vector<ixscript::SphereOverlapHit>(const float*, float, const ixscript::QueryFilter&)> overlapSphere;
+
     // --- game UI + character controller, wired once by RunGame ---
     RmlUiLayer* gameUi = nullptr;
     // A document path relative to the project's asset folder -> the file to load ("" = not found).
@@ -127,13 +136,14 @@ public:
     void ResetTransportAndPrompts();
 
     // --- deferred spawn/destroy queue (drained by the engine after the script OnUpdate loop) ---
-    enum class DeferredKind { SpawnMesh, SpawnPrefab, Destroy, SetMaterial };
+    enum class DeferredKind { SpawnMesh, SpawnPrefab, Destroy, SetMaterial, SetEnabled };
     struct DeferredOp
     {
         DeferredKind kind;
         std::string assetId;
         float pos[3] = {0.0f, 0.0f, 0.0f};
         std::uint32_t id = 0;  // pre-allocated for spawns; target for destroy
+        bool enabled = true;
         std::uint32_t slot = 0;  // SetMaterial: material slot (assetId = the material)
     };
     std::vector<DeferredOp> deferredOps;

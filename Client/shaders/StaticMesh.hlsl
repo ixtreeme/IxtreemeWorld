@@ -155,13 +155,19 @@ float4 PSMain(VSOutput input) : SV_Target0
 #if defined(STATIC_MESH_OUTLINE)
     return float4(1.0, 0.78, 0.18, 1.0);
 #else
+    // The opaque draws' variant (STATIC_MESH_OPAQUE) has no discard at all: a shader that can discard
+    // keeps the hardware from testing depth before shading, so every hidden layer was shaded.
+#if !defined(STATIC_MESH_OPAQUE)
     if (u_lightPadding.x > 0.5 && input.worldPos.y < u_lightPadding.y)
         discard;
+#endif
 
     float4 texSample = u_diffuse.Sample(u_sampler, input.uv);
     const float alpha = texSample.a * input.materialBaseColor.a * input.tint.a;
+#if !defined(STATIC_MESH_OPAQUE)
     if (input.materialAlpha.x > 0.5 && input.materialAlpha.x < 1.5 && alpha < input.materialAlpha.y)
         discard;
+#endif
 
     float3 texColor = texSample.rgb;
     float3 albedo = texColor * input.materialBaseColor.rgb * input.tint.rgb;

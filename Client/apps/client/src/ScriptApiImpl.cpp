@@ -171,7 +171,8 @@ void ScriptApiImpl::LogError(const std::string& msg) { TraceError("[SCRIPT] %s",
 
 std::uint32_t ScriptApiImpl::SpawnMesh(const std::string& meshAssetId, float x, float y, float z)
 {
-    if (!nextEntityId || meshAssetId.empty())
+    if (!nextEntityId || !*nextEntityId || *nextEntityId == UINT32_MAX || meshAssetId.empty() ||
+        !std::isfinite(x) || !std::isfinite(y) || !std::isfinite(z))
         return 0;
     const std::uint32_t id = (*nextEntityId)++;  // pre-allocate; the drain reuses this exact id
     deferredOps.push_back({DeferredKind::SpawnMesh, meshAssetId, {x, y, z}, id});
@@ -180,7 +181,8 @@ std::uint32_t ScriptApiImpl::SpawnMesh(const std::string& meshAssetId, float x, 
 
 std::uint32_t ScriptApiImpl::SpawnPrefab(const std::string& prefabAssetId, float x, float y, float z)
 {
-    if (!nextEntityId || prefabAssetId.empty())
+    if (!nextEntityId || !*nextEntityId || *nextEntityId == UINT32_MAX || prefabAssetId.empty() ||
+        !std::isfinite(x) || !std::isfinite(y) || !std::isfinite(z))
         return 0;
     const std::uint32_t id = (*nextEntityId)++;
     deferredOps.push_back({DeferredKind::SpawnPrefab, prefabAssetId, {x, y, z}, id});
@@ -310,6 +312,53 @@ ixscript::RaycastHit ScriptApiImpl::Raycast(float ox, float oy, float oz,
     const float origin[3] = {ox, oy, oz};
     out.hit = raycast(origin, dir, maxDist, out.entityId, out.point, out.normal, out.distance);
     return out;
+}
+
+ixscript::RaycastHit ScriptApiImpl::RaycastFiltered(float ox, float oy, float oz,
+    float dx, float dy, float dz, float maxDistance, const ixscript::QueryFilter* filter)
+{
+    const ixscript::QueryFilter f = filter ? *filter : ixscript::QueryFilter{};
+    if (!raycastFiltered || f.reserved || (f.flags & ~1u) || !f.layerMask ||
+        !std::isfinite(ox) || !std::isfinite(oy) || !std::isfinite(oz) ||
+        !std::isfinite(dx) || !std::isfinite(dy) || !std::isfinite(dz) ||
+        !std::isfinite(maxDistance) || maxDistance <= 0) return {};
+    const double len = std::sqrt(double(dx)*dx + double(dy)*dy + double(dz)*dz);
+    if (len < 1e-6) return {};
+    const float o[3] = {ox, oy, oz};
+    const float d[3] = {float(dx/len), float(dy/len), float(dz/len)};
+    return raycastFiltered(o, d, maxDistance, f);
+}
+
+std::uint32_t ScriptApiImpl::OverlapSphere(float x, float y, float z, float radius,
+    const ixscript::QueryFilter* filter, ixscript::SphereOverlapHit* output,
+    std::uint32_t capacity, std::uint32_t* truncated)
+{
+    if (truncated) *truncated = 0;
+    const ixscript::QueryFilter f = filter ? *filter : ixscript::QueryFilter{};
+    if (!overlapSphere || f.reserved || (f.flags & ~1u) || !f.layerMask ||
+        !std::isfinite(x) || !std::isfinite(y) || !std::isfinite(z) ||
+        !std::isfinite(radius) || radius <= 0 || (capacity && !output)) return 0;
+    const float center[3] = {x,y,z};
+    auto hits = overlapSphere(center, radius, f);
+    std::sort(hits.begin(), hits.end(), [](const auto& a, const auto& b) {return a.entityId < b.entityId;});
+    std::size_t unique = 0;
+    for (const auto hit : hits) {
+        if (unique && hits[unique-1].entityId == hit.entityId) hits[unique-1].flags |= hit.flags;
+        else hits[unique++] = hit;
+    }
+    const auto count = static_cast<std::uint32_t>(std::min<std::size_t>(unique,
+        std::min(capacity, ixscript::kMaxOverlapResults)));
+    if (count) std::copy_n(hits.data(), count, output);
+    if (truncated) *truncated = unique > count ? 1u : 0u;
+    return count;
+}
+
+void ScriptApiImpl::SetEntityEnabled(std::uint32_t id, bool enabled)
+{
+    if (!id) return;
+    DeferredOp op{DeferredKind::SetEnabled, {}, {0,0,0}, id};
+    op.enabled = enabled;
+    deferredOps.push_back(std::move(op));
 }
 
 void ScriptApiImpl::SetAnimatorFloat(std::uint32_t id, const std::string& name, float value)

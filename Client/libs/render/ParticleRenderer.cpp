@@ -658,7 +658,7 @@ bool ParticleRenderer::SimulateGpuEmitter(ixrhi::IXRHICommandList& cmd,
         m_lastGpuPruneFrame = frame.frameNumber;
         for (auto it = m_gpuEmitters.begin(); it != m_gpuEmitters.end();)
         {
-            if (it->second.lastSeenFrame + 120 < frame.frameNumber)
+            if (!it->second.entityPaused && it->second.lastSeenFrame + 120 < frame.frameNumber)
                 it = m_gpuEmitters.erase(it);
             else
                 ++it;
@@ -774,6 +774,19 @@ void ParticleRenderer::GpuEmitterPlay(std::uint32_t entityId)
     it->second.playing = true;
 }
 
+void ParticleRenderer::GpuEmitterSetEntityPaused(std::uint32_t entityId, bool paused)
+{
+    const auto it = m_gpuEmitters.find(entityId);
+    if (it != m_gpuEmitters.end())
+    {
+        // Another emitter may prune this frame before this resumed entity is
+        // simulated. Refresh its grace period before releasing pause protection.
+        if (it->second.entityPaused && !paused)
+            it->second.lastSeenFrame = m_lastGpuPruneFrame;
+        it->second.entityPaused = paused;
+    }
+}
+
 void ParticleRenderer::GpuEmitterStop(std::uint32_t entityId)
 {
     const auto it = m_gpuEmitters.find(entityId);
@@ -815,6 +828,7 @@ void ParticleRenderer::ResetGpuEmitters()
         (void)entityId;
         emitter.pendingBurst = 0;
         emitter.playing = true;
+        emitter.entityPaused = false;
         emitter.started = false;
         emitter.startBurstPending = false;
         emitter.clearPending = true;

@@ -178,6 +178,27 @@ struct LuaBackend::Impl
             return std::make_tuple(h.hit, h.entityId,
                 h.point[0], h.point[1], h.point[2], h.normal[0], h.normal[1], h.normal[2], h.distance);
         });
+        t.set_function("SetEntityEnabled", [a](std::uint32_t id, bool enabled) { a->SetEntityEnabled(id, enabled); });
+        t.set_function("RaycastFiltered", [a](float ox,float oy,float oz,float dx,float dy,float dz,float distance,
+            std::uint32_t mask, bool triggers, std::uint32_t ignore) {
+            const QueryFilter f{mask, triggers ? 1u : 0u, ignore, 0};
+            const auto h = a->RaycastFiltered(ox,oy,oz,dx,dy,dz,distance,&f);
+            return std::make_tuple(h.hit,h.entityId,h.point[0],h.point[1],h.point[2],
+                h.normal[0],h.normal[1],h.normal[2],h.distance);
+        });
+        t.set_function("OverlapSphere", [a](sol::this_state state, float x,float y,float z,float radius,
+            std::uint32_t mask, bool triggers, std::uint32_t ignore, std::uint32_t capacity) {
+            const QueryFilter f{mask,triggers ? 1u : 0u,ignore,0};
+            std::vector<SphereOverlapHit> hits(std::min(capacity,kMaxOverlapResults));
+            std::uint32_t truncated=0;
+            const auto count=a->OverlapSphere(x,y,z,radius,&f,hits.data(),static_cast<std::uint32_t>(hits.size()),&truncated);
+            sol::state_view lua(state); auto results=lua.create_table();
+            for (std::uint32_t i=0;i<count;++i) {
+                auto hit=lua.create_table(); hit["entityId"]=hits[i].entityId; hit["trigger"]=(hits[i].flags&1u)!=0;
+                results[i+1]=hit;
+            }
+            return std::make_tuple(results,truncated!=0);
+        });
         t.set_function("SetAnimatorFloat", [a](std::uint32_t id, const std::string& n, float v) {
             a->SetAnimatorFloat(id, n, v);
         });

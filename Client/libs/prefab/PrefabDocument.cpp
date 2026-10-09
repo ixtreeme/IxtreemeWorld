@@ -4,6 +4,8 @@
 
 #include <algorithm>
 #include <cstdlib>
+#include <cmath>
+#include <set>
 #include <map>
 #include <sstream>
 
@@ -630,6 +632,10 @@ void WriteMeshObject(std::ostream& out, const MeshSceneEntity& mesh, const std::
     out << indent << "\"rotation\": " << FloatArray(mesh.rotation, 3) << ",\n";
     out << indent << "\"scale\": " << FloatArray(mesh.scale, 3) << ",\n";
     out << indent << "\"skinned\": " << (mesh.skinned ? "true" : "false");
+    out << ",\n" << indent << "\"enabled\": " << (mesh.enabled ? "true" : "false");
+    if (!mesh.animatorControllerId.empty())
+        out << ",\n" << indent << "\"animator_controller_id\": \""
+            << ixtreeme::common::EscapeJson(mesh.animatorControllerId) << "\"";
     WriteMaterials(out, mesh.materialSlots, indent);
     WriteMaterialOverrides(out, mesh.materialOverrides, indent);
     if (mesh.hasRigidbody)
@@ -760,6 +766,8 @@ PrefabEntity ParseEntityObject(const std::string& object, const std::string& fal
         ixtreeme::common::JsonFloatArrayValue(object, "rotation", entity.mesh.rotation, 3);
         ixtreeme::common::JsonFloatArrayValue(object, "scale", entity.mesh.scale, 3);
         entity.mesh.skinned = ixtreeme::common::JsonBoolValue(object, "skinned", entity.mesh.skinned);
+        entity.mesh.enabled = ixtreeme::common::JsonBoolValue(object, "enabled", true);
+        entity.mesh.animatorControllerId = ixtreeme::common::JsonStringValue(object, "animator_controller_id");
         entity.mesh.materialSlots = ixtreeme::common::JsonStringArrayValue(object, "materials");
         const std::vector<std::string> materialOverrides = ExtractNamedArrayObjects(object, "material_overrides");
         for (const std::string& materialOverride : materialOverrides)
@@ -899,6 +907,15 @@ void WriteSpotLight(std::ostream& out, const SpotLight& light, const std::string
 
 void WriteDocument(std::ostream& out, const PrefabDocument& document)
 {
+    // A document built from a live scene holds world IDs in its joints. Store local references,
+    // so a runtime instance never binds a prefab joint to an unrelated live scene entity.
+    std::map<std::uint32_t, std::uint32_t> localMeshIds;
+    for (std::size_t i = 0; i < document.entities.size(); ++i)
+    {
+        const auto& entity = document.entities[i];
+        if (entity.kind == PrefabTemplate::Kind::Mesh && entity.mesh.id != 0)
+            localMeshIds.emplace(entity.mesh.id, entity.localId == 0 ? static_cast<std::uint32_t>(i + 1) : entity.localId);
+    }
     out << "{\n";
     out << "  \"version\": 2,\n";
     out << "  \"name\": \"" << ixtreeme::common::EscapeJson(document.name.empty() ? "Prefab" : document.name) << "\",\n";
@@ -910,7 +927,18 @@ void WriteDocument(std::ostream& out, const PrefabDocument& document)
         out << "      \"local_id\": " << (entity.localId == 0 ? static_cast<std::uint32_t>(i + 1) : entity.localId) << ",\n";
         out << "      \"parent_local_id\": " << entity.parentLocalId << ",\n";
         if (entity.kind == PrefabTemplate::Kind::Mesh)
-            WriteMeshObject(out, entity.mesh, entity.name.empty() ? entity.mesh.name : entity.name, "      ");
+        {
+            MeshSceneEntity mesh = entity.mesh;
+            const auto localJoint = [&](std::uint32_t id) {
+                const auto found = localMeshIds.find(id);
+                // Scene captures carry live ids; parsed documents already carry local ids.
+                // External scene joints cannot target another prefab instance by accident.
+                return found != localMeshIds.end() ? found->second : localMeshIds.empty() ? id : 0u;
+            };
+            if (mesh.hasFixedJoint) mesh.fixedJoint.connectedEntityId = localJoint(mesh.fixedJoint.connectedEntityId);
+            if (mesh.hasHingeJoint) mesh.hingeJoint.connectedEntityId = localJoint(mesh.hingeJoint.connectedEntityId);
+            WriteMeshObject(out, mesh, entity.name.empty() ? mesh.name : entity.name, "      ");
+        }
         else if (entity.kind == PrefabTemplate::Kind::PointLight)
             WritePointObject(out, entity.point, entity.name.empty() ? entity.point.name : entity.name, "      ");
         else if (entity.kind == PrefabTemplate::Kind::SpotLight)
@@ -961,6 +989,132 @@ PrefabTemplate ParseTemplate(const std::string& text, const std::string& fallbac
     prefab.point = entity.point;
     prefab.spot = entity.spot;
     return prefab;
+}
+
+bool InstantiateRuntime(const PrefabDocument& document, const std::string& assetId,
+    std::uint32_t rootId, const float position[3],
+    const std::function<std::uint32_t()>& allocateMeshId,
+    const std::function<std::uint32_t()>& allocateLightId,
+    RuntimePrefabInstance& result, std::string& error)
+{
+    result = {};
+    error.clear();
+    if (rootId == 0 || document.entities.empty() ||
+        document.entities.front().kind != PrefabTemplate::Kind::Mesh)
+    {
+        error = "runtime prefab requires a mesh root";
+        return false;
+    }
+    std::map<std::uint32_t, const PrefabEntity*> sources;
+    for (const auto& entity : document.entities)
+    {
+        if (entity.localId == 0 || !sources.emplace(entity.localId, &entity).second ||
+            entity.kind == PrefabTemplate::Kind::Unsupported)
+        {
+            error = "invalid or duplicate prefab local id/type";
+            return false;
+        }
+    }
+    const auto rootLocalId = document.entities.front().localId;
+    if (document.entities.front().parentLocalId != 0)
+    {
+        error = "prefab root has a parent";
+        return false;
+    }
+    for (const auto& entity : document.entities)
+    {
+        const PrefabEntity* ancestor = &entity;
+        std::size_t hops = 0;
+        while (ancestor->localId != rootLocalId)
+        {
+            const auto parent = sources.find(ancestor->parentLocalId);
+            if (parent == sources.end() || ++hops >= sources.size())
+            {
+                error = "prefab parent is missing or cyclic";
+                return false;
+            }
+            ancestor = parent->second;
+        }
+        if (entity.kind == PrefabTemplate::Kind::Mesh)
+        {
+            const auto validateJoint = [&](std::uint32_t id) {
+                const auto target = sources.find(id);
+                return id == 0 || (target != sources.end() && target->second->kind == PrefabTemplate::Kind::Mesh);
+            };
+            if ((entity.mesh.hasFixedJoint && entity.mesh.fixedJoint.enabled && !validateJoint(entity.mesh.fixedJoint.connectedEntityId)) ||
+                (entity.mesh.hasHingeJoint && entity.mesh.hingeJoint.enabled && !validateJoint(entity.mesh.hingeJoint.connectedEntityId)))
+            {
+                error = "prefab joint target must be a local mesh id";
+                return false;
+            }
+        }
+    }
+    if (!allocateMeshId || !allocateLightId || !position ||
+        !std::isfinite(position[0]) || !std::isfinite(position[1]) || !std::isfinite(position[2])) {
+        error = "invalid prefab allocator or spawn position"; return false;
+    }
+    std::map<std::uint32_t, SceneParentRef> refs;
+    std::set<std::uint32_t> meshIds, lightIds;
+    for (const auto& entity : document.entities)
+    {
+        const bool mesh = entity.kind == PrefabTemplate::Kind::Mesh;
+        const auto id = entity.localId == rootLocalId ? rootId : mesh ? allocateMeshId() : allocateLightId();
+        if (!id || !(mesh ? meshIds : lightIds).insert(id).second) {
+            error = "prefab allocator returned zero or a duplicate id"; return false;
+        }
+        refs.emplace(entity.localId, SceneParentRef{
+            mesh ? "mesh_entity" : entity.kind == PrefabTemplate::Kind::PointLight ? "point_light" : "spot_light",
+            id});
+    }
+    const auto& root = document.entities.front().mesh;
+    const auto apply = [&](auto& object, const PrefabEntity& entity) {
+        object.id = refs.at(entity.localId).id;
+        object.name = entity.name.empty() ? object.name : entity.name;
+        object.parent = entity.parentLocalId == 0 ? SceneParentRef{} : refs.at(entity.parentLocalId);
+        for (int axis = 0; axis < 3; ++axis)
+            object.position[axis] += position[axis] - root.position[axis];
+        const std::string nestedAsset = !object.prefabInstance.assetId.empty()
+            ? object.prefabInstance.assetId : object.prefabAssetId;
+        if (nestedAsset.empty() || nestedAsset == assetId)
+        {
+            object.prefabAssetId = assetId;
+            object.prefabInstance = {};
+            object.prefabInstance.assetId = assetId;
+            object.prefabInstance.localId = entity.localId;
+        }
+        else
+        {
+            object.prefabAssetId = nestedAsset;
+            object.prefabInstance.assetId = nestedAsset;
+        }
+        object.prefabInstance.linked = true;
+    };
+    for (const auto& entity : document.entities)
+    {
+        if (entity.kind == PrefabTemplate::Kind::Mesh)
+        {
+            auto& mesh = result.meshes.emplace_back(entity.mesh);
+            apply(mesh, entity);
+            if (mesh.hasFixedJoint && mesh.fixedJoint.connectedEntityId != 0)
+            {
+                const auto target = refs.find(mesh.fixedJoint.connectedEntityId);
+                mesh.fixedJoint.connectedEntityId = target == refs.end() ? 0 : target->second.id;
+            }
+            if (mesh.hasHingeJoint && mesh.hingeJoint.connectedEntityId != 0)
+            {
+                const auto target = refs.find(mesh.hingeJoint.connectedEntityId);
+                mesh.hingeJoint.connectedEntityId = target == refs.end() ? 0 : target->second.id;
+            }
+            mesh.effectiveEnabled = true;
+            mesh.activationChanged = false;
+            mesh.renderRecordSlot = ~0u; // no link into a previous live world's render cache
+        }
+        else if (entity.kind == PrefabTemplate::Kind::PointLight)
+            apply(result.points.emplace_back(entity.point), entity);
+        else if (entity.kind == PrefabTemplate::Kind::SpotLight)
+            apply(result.spots.emplace_back(entity.spot), entity);
+    }
+    return true;
 }
 
 } // namespace ixtreeme::prefab

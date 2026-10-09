@@ -157,6 +157,28 @@ bool AsRaycast(float ox, float oy, float oz, float dx, float dy, float dz, float
     return hit.hit;
 }
 
+void AsSetEntityEnabled(std::uint32_t id, bool enabled) { Api().SetEntityEnabled(id,enabled); }
+bool AsRaycastFiltered(float ox,float oy,float oz,float dx,float dy,float dz,float distance,
+    std::uint32_t mask,bool triggers,std::uint32_t ignore,AsRaycastHit* out)
+{
+    const QueryFilter filter{mask,triggers ? 1u : 0u,ignore,0};
+    const auto h=Api().RaycastFiltered(ox,oy,oz,dx,dy,dz,distance,&filter);
+    if (out) { out->entityId=h.entityId; out->distance=h.distance; out->hit=h.hit;
+        out->point={h.point[0],h.point[1],h.point[2]}; out->normal={h.normal[0],h.normal[1],h.normal[2]}; }
+    return h.hit;
+}
+CScriptArray* AsOverlapSphere(float x,float y,float z,float radius,std::uint32_t mask,
+    bool triggers,std::uint32_t ignore,std::uint32_t capacity,bool* truncated)
+{
+    const QueryFilter f{mask,triggers ? 1u : 0u,ignore,0};
+    std::vector<SphereOverlapHit> hits(std::min(capacity,kMaxOverlapResults)); std::uint32_t cut=0;
+    const auto count=Api().OverlapSphere(x,y,z,radius,&f,hits.data(),static_cast<std::uint32_t>(hits.size()),&cut);
+    if(truncated) *truncated=cut!=0;
+    auto* type=asGetActiveContext()->GetEngine()->GetTypeInfoByDecl("array<SphereOverlapHit>");
+    auto* result=CScriptArray::Create(type,count);
+    for(std::uint32_t i=0;i<count;++i) result->SetValue(i,&hits[i]);
+    return result;
+}
 void AsSetAnimatorFloat(std::uint32_t id, const std::string& name, float value)
 {
     Api().SetAnimatorFloat(id, name, value);
@@ -419,6 +441,9 @@ void RegisterValueTypes(asIScriptEngine* engine)
     result = engine->RegisterObjectProperty("RaycastHit", "float3 point", static_cast<int>(offsetof(AsRaycastHit, point)));
     result = engine->RegisterObjectProperty("RaycastHit", "float3 normal", static_cast<int>(offsetof(AsRaycastHit, normal)));
 
+    result = engine->RegisterObjectType("SphereOverlapHit", sizeof(SphereOverlapHit), podFlags);
+    result = engine->RegisterObjectProperty("SphereOverlapHit", "uint entityId", offsetof(SphereOverlapHit,entityId));
+    result = engine->RegisterObjectProperty("SphereOverlapHit", "uint flags", offsetof(SphereOverlapHit,flags));
     result = engine->RegisterObjectType("CharacterState", sizeof(AsCharacterState), podFlags);
     if (result < 0) TraceError("[SCRIPT][angelscript] RegisterObjectType CharacterState failed (%d)", result);
     result = engine->RegisterObjectProperty("CharacterState", "bool grounded", static_cast<int>(offsetof(AsCharacterState, grounded)));
@@ -431,6 +456,9 @@ void RegisterValueTypes(asIScriptEngine* engine)
 
 void RegisterBindings(asIScriptEngine* engine)
 {
+    RegisterGlobal(engine, "void SetEntityEnabled(uint id, bool enabled)", &AsSetEntityEnabled);
+    RegisterGlobal(engine, "bool RaycastFiltered(float ox,float oy,float oz,float dx,float dy,float dz,float distance,uint mask,bool triggers,uint ignore,RaycastHit &out hit)", &AsRaycastFiltered);
+    RegisterGlobal(engine, "array<SphereOverlapHit>@ OverlapSphere(float x,float y,float z,float radius,uint mask,bool triggers,uint ignore,uint capacity,bool &out truncated)", &AsOverlapSphere);
     RegisterGlobal(engine, "uint Find(const string &in name)", &AsFind);
     RegisterGlobal(engine, "bool EntityExists(uint id)", &AsEntityExists);
     RegisterGlobal(engine, "string GetName(uint id)", &AsGetName);

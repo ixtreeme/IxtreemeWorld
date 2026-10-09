@@ -90,10 +90,30 @@ void EditorImGui::RenderTreeGeneratorPanel()
     if (!m_treeGeneratorPanel)
         return;
     m_treeGeneratorPanel->SetAssetLibrary(m_assetLibrary.get());
-    if (m_treeGeneratorPanel->Render())
+    m_treeGeneratorPanel->RenderView();
+}
+
+bool EditorImGui::InspectorShowsTreeGenerator()
+{
+    // From when the Tree Generator view takes focus (or opens) until a window that selects things
+    // does: the Scene View, the Game view, the Hierarchy or the Asset Browser.
+    if (!m_treeGeneratorPanel || !m_treeGeneratorPanel->IsOpen())
     {
-        RefreshAssetLibrary();
-        m_assetStatus = m_treeGeneratorPanel->Status();
+        m_inspectorShowsTreeGenerator = false;
+        return false;
     }
+    if (m_treeGeneratorPanel->TakeInspectorRequest())
+    {
+        m_inspectorShowsTreeGenerator = true;
+    }
+    else if (const ImGuiWindow* focused = ImGui::GetCurrentContext()->NavWindow)
+    {
+        for (const char* name : {EditorWindow::SceneView, EditorWindow::Game, EditorWindow::Hierarchy, EditorWindow::AssetBrowser})
+        {
+            if (focused->RootWindow == ImGui::FindWindowByName(name))
+                m_inspectorShowsTreeGenerator = false;
+        }
+    }
+    return m_inspectorShowsTreeGenerator;
 }
 

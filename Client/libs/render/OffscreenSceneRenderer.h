@@ -108,13 +108,13 @@ public:
     const ixrhi::IXRHIRenderPass* GetDisplayPass() const;
     const std::shared_ptr<ixrhi::IXRHITexture>& GetColorTexture() const { return m_color; }
     const std::shared_ptr<ixrhi::IXRHITexture>& GetDisplayTexture() const { return m_display; }
-    const std::shared_ptr<ixrhi::IXRHITexture>& GetColorSnapshotTexture() const
+    std::shared_ptr<ixrhi::IXRHITexture> GetColorSnapshotTexture() const
     {
-        return m_colorSnapshot;
+        return m_colorSnapshotState == ixrhi::IXRHIImageLayout::ShaderReadOnly ? m_colorSnapshot : nullptr;
     }
-    const std::shared_ptr<ixrhi::IXRHITexture>& GetDepthSnapshotTexture() const
+    std::shared_ptr<ixrhi::IXRHITexture> GetDepthSnapshotTexture() const
     {
-        return m_depthSnapshot;
+        return m_depthSnapshotState == ixrhi::IXRHIImageLayout::ShaderReadOnly ? m_depthSnapshot : nullptr;
     }
     const std::shared_ptr<ixrhi::IXRHISampler>& GetSampler() const { return m_sampler; }
     std::uint32_t Width() const { return m_width; }

@@ -404,7 +404,12 @@ void EditorImGui::RenderPbrMaterialEditor()
         {
             if (UI::Prop::SliderFloat("Tiling X", &material.tilingScaleX, 0.01f, 32.0f, "%.2f")) MarkPbrMaterialChanged("tiling_x");
             if (UI::Prop::SliderFloat("Tiling Y", &material.tilingScaleY, 0.01f, 32.0f, "%.2f")) MarkPbrMaterialChanged("tiling_y");
-            if (UI::Prop::ColorEdit3("Tint", material.colorTint)) MarkPbrMaterialChanged("color_tint");
+            // (The alpha too for a .material: it multiplies the texture's, for the mask cut-off and blending.)
+            const bool tintChanged = PbrEditorEditsMaterialFile()
+                ? UI::Prop::ColorEdit4("Tint", material.colorTint, ImGuiColorEditFlags_AlphaBar)
+                : UI::Prop::ColorEdit3("Tint", material.colorTint);
+            if (tintChanged)
+                MarkPbrMaterialChanged("color_tint");
             if (unlitMode)
                 ImGui::PushStyleVar(ImGuiStyleVar_Alpha, ImGui::GetStyle().Alpha * 0.55f);
             if (UI::Prop::SliderFloat("Normal Strength", &material.normalStrength, 0.0f, 2.0f, "%.2f")) MarkPbrMaterialChanged("normal_strength");
@@ -1043,7 +1048,15 @@ void EditorImGui::RenderInspector()
         return;
     if (ImGui::Begin(EditorWindow::Inspector, &m_inspectorPanelOpen))
     {
-        if (RenderSelectedPhysicsMaterialAssetInspector())
+        if (InspectorShowsTreeGenerator())
+        {
+            if (m_treeGeneratorPanel->RenderInspector())
+            {
+                RefreshAssetLibrary();
+                m_assetStatus = m_treeGeneratorPanel->Status();
+            }
+        }
+        else if (RenderSelectedPhysicsMaterialAssetInspector())
         {
         }
         else if (RenderSelectedPrefabAssetInspector())

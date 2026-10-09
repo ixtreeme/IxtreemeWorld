@@ -2451,6 +2451,16 @@ bool EditorImGui::OpenPbrMaterialEditor(const std::string& materialId)
             m_pbrMaterialEditor.draft.colorTint[0] = material->baseColor[0];
             m_pbrMaterialEditor.draft.colorTint[1] = material->baseColor[1];
             m_pbrMaterialEditor.draft.colorTint[2] = material->baseColor[2];
+            m_pbrMaterialEditor.draft.colorTint[3] = material->baseColor[3];
+            m_pbrMaterialEditor.draft.tilingScaleX = material->uvTiling[0];
+            m_pbrMaterialEditor.draft.tilingScaleY = material->uvTiling[1];
+            // The textures as the material file has them (the asset list's copy may be older).
+            m_pbrMaterialEditor.draft.diffuseTextureId = TextureEntryIdForGuid(material->baseColorTexture);
+            m_pbrMaterialEditor.draft.normalTextureId = TextureEntryIdForGuid(material->normalTexture);
+            m_pbrMaterialEditor.draft.aoTextureId = TextureEntryIdForGuid(material->aoTexture);
+            m_pbrMaterialEditor.draft.roughnessTextureId = TextureEntryIdForGuid(material->roughnessTexture);
+            m_pbrMaterialEditor.draft.metallicTextureId = TextureEntryIdForGuid(material->metallicTexture);
+            m_pbrMaterialEditor.draft.heightTextureId = TextureEntryIdForGuid(material->heightTexture);
             m_pbrMaterialEditor.draft.normalStrength = material->normalStrength;
             m_pbrMaterialEditor.draft.aoStrength = material->aoStrength;
             m_pbrMaterialEditor.draft.roughnessStrength = material->roughness;
@@ -2479,6 +2489,92 @@ void EditorImGui::MarkWaterMaterialChanged(const char* field)
         field ? field : "unknown");
 }
 
+bool EditorImGui::PbrEditorEditsMaterialFile() const
+{
+    if (!m_assetLibrary || m_pbrMaterialEditor.materialId.empty())
+        return false;
+    const std::optional<AssetLibrary::Entry> entry = m_assetLibrary->FindById(m_pbrMaterialEditor.materialId);
+    return entry && !entry->originalPath.empty() &&
+        ToLowerAscii(std::filesystem::path(entry->originalPath).extension().string()) == ".material";
+}
+
+std::string EditorImGui::TextureEntryIdForGuid(const std::optional<Guid>& guid) const
+{
+    if (!guid || !m_assetLibrary)
+        return {};
+    const std::string text = guid->toString();
+    const std::optional<std::filesystem::path> path = AssetDatabase::Instance().resolveGuid(*guid);
+    for (const AssetLibrary::Entry& entry : m_assetLibrary->Entries())
+    {
+        if (entry.category != AssetLibrary::Category::Texture)
+            continue;
+        if (entry.guid == text)
+            return entry.id;
+        if (path && entry.filename == path->filename().string())
+        {
+            std::error_code ec;
+            if (std::filesystem::equivalent(m_assetLibrary->AbsolutePath(entry), *path, ec))
+                return entry.id;
+        }
+    }
+    return {};
+}
+
+std::optional<Guid> EditorImGui::TextureGuidForEntryId(const std::string& entryId) const
+{
+    if (entryId.empty() || !m_assetLibrary)
+        return std::nullopt;
+    const std::optional<AssetLibrary::Entry> entry = m_assetLibrary->FindById(entryId);
+    if (!entry)
+        return std::nullopt;
+    if (const std::optional<Guid> known = Guid::fromString(entry->guid); known && AssetDatabase::Instance().resolveGuid(*known))
+        return known;
+    std::filesystem::path path =
+        entry->originalPath.empty() ? m_assetLibrary->AbsolutePath(*entry) : std::filesystem::path(entry->originalPath);
+    if (path.is_relative())
+        path = m_assetLibrary->AbsolutePath(*entry);
+    return AssetDatabase::Instance().getOrCreateGuid(path);
+}
+
+void EditorImGui::ApplyPbrDraftToMaterial(MaterialAsset& material, bool packMaps)
+{
+    const AssetLibrary::MaterialData& draft = m_pbrMaterialEditor.draft;
+    for (std::size_t c = 0; c < 4u; ++c)
+        material.baseColor[c] = std::clamp(draft.colorTint[c], 0.0f, 1.0f);
+    material.metallic = draft.metallicStrength;
+    material.roughness = draft.roughnessStrength;
+    material.normalStrength = draft.normalStrength;
+    material.aoStrength = draft.aoStrength;
+    material.uvTiling = {std::max(draft.tilingScaleX, 0.001f), std::max(draft.tilingScaleY, 0.001f)};
+    material.shadingMode =
+        ToLowerAscii(draft.shadingMode) == "unlit" ? MaterialAsset::ShadingMode::Unlit : MaterialAsset::ShadingMode::Lit;
+    const std::string alphaMode = ToLowerAscii(draft.alphaMode);
+    material.alphaMode = alphaMode == "mask" ? MaterialAsset::AlphaMode::Mask :
+        (alphaMode == "blend" ? MaterialAsset::AlphaMode::Blend : MaterialAsset::AlphaMode::Opaque);
+    material.alphaCutoff = std::clamp(draft.alphaCutoff, 0.0f, 1.0f);
+    material.baseColorTexture = TextureGuidForEntryId(draft.diffuseTextureId);
+    material.normalTexture = TextureGuidForEntryId(draft.normalTextureId);
+    material.heightTexture = TextureGuidForEntryId(draft.heightTextureId);
+    // The occlusion, roughness and metallic maps go to the shaders as one packed texture: packed again
+    // when they changed (a packed one the material came with, a glTF's, stays while they do not).
+    const std::optional<Guid> ao = TextureGuidForEntryId(draft.aoTextureId);
+    const std::optional<Guid> roughness = TextureGuidForEntryId(draft.roughnessTextureId);
+    const std::optional<Guid> metallic = TextureGuidForEntryId(draft.metallicTextureId);
+    const bool hadMaps = material.aoTexture || material.roughnessTexture || material.metallicTexture;
+    const bool mapsChanged = ao != material.aoTexture || roughness != material.roughnessTexture || metallic != material.metallicTexture;
+    material.aoTexture = ao;
+    material.roughnessTexture = roughness;
+    material.metallicTexture = metallic;
+    const bool anyMap = ao || roughness || metallic;
+    if (packMaps && (mapsChanged || (anyMap && !material.metallicRoughnessTexture)))
+    {
+        if (anyMap)
+            material.metallicRoughnessTexture = MaterialAssetManager::Instance().packOcclusionRoughnessMetallic(material);
+        else if (hadMaps)
+            material.metallicRoughnessTexture.reset();
+    }
+}
+
 void EditorImGui::MarkPbrMaterialChanged(const char* field)
 {
     if (m_pbrMaterialEditor.materialId.empty())
@@ -2486,6 +2582,17 @@ void EditorImGui::MarkPbrMaterialChanged(const char* field)
     m_pbrMaterialEditor.dirty = true;
     SceneManager::Instance().MarkDirty();
     SyncWaterMaterialSnapshot();
+    // A .material shows the change at once (Save writes it): the loaded material takes the draft.
+    if (PbrEditorEditsMaterialFile())
+    {
+        const std::optional<AssetLibrary::Entry> entry = m_assetLibrary->FindById(m_pbrMaterialEditor.materialId);
+        const Guid guid = AssetDatabase::Instance().getOrCreateGuid(std::filesystem::path(entry->originalPath));
+        if (MaterialAsset* material = MaterialAssetManager::Instance().getOrLoad(guid))
+        {
+            ApplyPbrDraftToMaterial(*material, field && std::strcmp(field, "texture_slot") == 0);
+            MaterialAssetManager::Instance().markChanged();
+        }
+    }
     Tracenf("[EDITOR-IMGUI-4] Material parameter changed: material_id=%s field=%s",
         m_pbrMaterialEditor.materialId.c_str(),
         field ? field : "unknown");
@@ -2616,22 +2723,11 @@ bool EditorImGui::SavePbrMaterialEditor()
             m_assetStatus = "Material save failed: unable to load material asset";
             return false;
         }
+        // Every field the editor shows: the textures and the tiling too (they were not written, so a
+        // material's textures changed here never reached the renderer).
         material->name = requestedName;
-        material->baseColor[0] = m_pbrMaterialEditor.draft.colorTint[0];
-        material->baseColor[1] = m_pbrMaterialEditor.draft.colorTint[1];
-        material->baseColor[2] = m_pbrMaterialEditor.draft.colorTint[2];
-        material->metallic = m_pbrMaterialEditor.draft.metallicStrength;
-        material->roughness = m_pbrMaterialEditor.draft.roughnessStrength;
-        material->normalStrength = m_pbrMaterialEditor.draft.normalStrength;
-        material->aoStrength = m_pbrMaterialEditor.draft.aoStrength;
-        material->shadingMode =
-            ToLowerAscii(m_pbrMaterialEditor.draft.shadingMode) == "unlit"
-                ? MaterialAsset::ShadingMode::Unlit
-                : MaterialAsset::ShadingMode::Lit;
+        ApplyPbrDraftToMaterial(*material, true);
         const std::string alphaMode = ToLowerAscii(m_pbrMaterialEditor.draft.alphaMode);
-        material->alphaMode = alphaMode == "mask" ? MaterialAsset::AlphaMode::Mask :
-            (alphaMode == "blend" ? MaterialAsset::AlphaMode::Blend : MaterialAsset::AlphaMode::Opaque);
-        material->alphaCutoff = std::clamp(m_pbrMaterialEditor.draft.alphaCutoff, 0.0f, 1.0f);
         if (!MaterialAssetManager::Instance().save(*material))
         {
             m_assetStatus = "Material save failed: write failed";

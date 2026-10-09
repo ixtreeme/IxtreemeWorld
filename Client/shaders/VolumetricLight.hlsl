@@ -22,7 +22,7 @@ struct VolumetricPush
     float4 cameraPos;            // xyz; w = how far along the ray light is gathered (m)
     float4 sunDir;               // xyz towards the sun; w = scattering per metre
     float4 sunColor;             // rgb linear (colour x intensity); w = forward-scattering g
-    float4 params;               // x = steps; y = shadow depth bias
+    float4 params;               // x = steps; y = depth-unit bias; z = bias correction in metres
 };
 [[vk::push_constant]] VolumetricPush u_push;
 
@@ -35,14 +35,14 @@ struct VSOutput
 
 // 1 where the sun reaches a point, 0 in its shadow, from the point's position in each cascade's
 // light space (x/y: shadow map uv, z: depth); the finest cascade that contains it decides.
-float SunVisibility(float3 lightSpace[4])
+float SunVisibility(float3 lightSpace[4], float compareBias[4])
 {
     [unroll]
     for (int cascade = 0; cascade < 4; ++cascade)
     {
         const float3 p = lightSpace[cascade];
         if (all(p > 0.0) && all(p < 1.0))
-            return u_shadow.SampleCmpLevelZero(u_shadowSampler, float3(p.xy, (float)cascade), p.z - u_push.params.y);
+            return u_shadow.SampleCmpLevelZero(u_shadowSampler, float3(p.xy, (float)cascade), p.z - compareBias[cascade]);
     }
     return 1.0;  // past the last cascade there is no shadow information: the air there is lit
 }
@@ -90,11 +90,15 @@ float4 MarchPS(VSOutput input) : SV_Target
     // matrix transforms per step.
     float3 lightSpace[4];
     float3 lightSpaceStep[4];
+    float compareBias[4];
     [unroll]
     for (int cascade = 0; cascade < 4; ++cascade)
     {
         lightSpace[cascade] = CascadeLightSpace(camera + dir * t0, cascade);
         lightSpaceStep[cascade] = CascadeLightSpace(camera + dir * (t0 + stepLength), cascade) - lightSpace[cascade];
+        const float4x4 matrix = u_cascadeViewProj[cascade];
+        const float depthPerMetre = length(float3(matrix[0][2], matrix[1][2], matrix[2][2]));
+        compareBias[cascade] = max(0.0, u_push.params.y - u_push.params.z * depthPerMetre);
     }
     // The last step (from 0) at which the march is still inside each cascade's box, and whether it
     // starts inside all of them.
@@ -127,7 +131,7 @@ float4 MarchPS(VSOutput input) : SV_Target
             float3 p = lightSpace[c] + lightSpaceStep[c] * (float)cursor;
             for (int i = cursor; i < end; ++i)
             {
-                lit += u_shadow.SampleCmpLevelZero(u_shadowSampler, float3(p.xy, (float)c), p.z - u_push.params.y) *
+                lit += u_shadow.SampleCmpLevelZero(u_shadowSampler, float3(p.xy, (float)c), p.z - compareBias[c]) *
                     transmittance;
                 transmittance *= stepTransmittance;
                 p += lightSpaceStep[c];
@@ -149,7 +153,7 @@ float4 MarchPS(VSOutput input) : SV_Target
         // drives them): the finest cascade holding each step, step by step.
         for (int i = 0; i < steps; ++i)
         {
-            lit += SunVisibility(lightSpace) * transmittance;
+            lit += SunVisibility(lightSpace, compareBias) * transmittance;
             transmittance *= stepTransmittance;
             [unroll]
             for (int c = 0; c < 4; ++c)

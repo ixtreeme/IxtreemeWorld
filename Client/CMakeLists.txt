@@ -279,6 +279,8 @@ if(WIN32)
     set(STATIC_MESH_VS_SPV "${GENERATED_SHADER_DIR}/static_mesh_vs.spv")
     set(STATIC_MESH_PS_SPV "${GENERATED_SHADER_DIR}/static_mesh_ps.spv")
     set(STATIC_MESH_UNLIT_PS_SPV "${GENERATED_SHADER_DIR}/static_mesh_unlit_ps.spv")
+    set(STATIC_MESH_OPAQUE_PS_SPV "${GENERATED_SHADER_DIR}/static_mesh_opaque_ps.spv")
+    set(STATIC_MESH_UNLIT_OPAQUE_PS_SPV "${GENERATED_SHADER_DIR}/static_mesh_unlit_opaque_ps.spv")
     set(STATIC_MESH_OUTLINE_VS_SPV "${GENERATED_SHADER_DIR}/static_mesh_outline_vs.spv")
     set(STATIC_MESH_OUTLINE_PS_SPV "${GENERATED_SHADER_DIR}/static_mesh_outline_ps.spv")
     set(TERRAIN_VS_SPV "${GENERATED_SHADER_DIR}/terrain_vs.spv")
@@ -355,6 +357,23 @@ if(WIN32)
         COMMAND ${CMAKE_COMMAND} -E make_directory "${GENERATED_SHADER_DIR}"
         COMMAND "${DXC_EXECUTABLE}" -spirv -T ps_6_0 -E PSMain -D SHADING_MODE_UNLIT=1
             -Fo "${STATIC_MESH_UNLIT_PS_SPV}" "${CLIENT_ROOT}/shaders/StaticMesh.hlsl"
+        DEPENDS "${CLIENT_ROOT}/shaders/StaticMesh.hlsl" "${CLIENT_ROOT}/shaders/SunShadow.hlsli"
+        VERBATIM
+    )
+    # The opaque draws' variants: no discard, so the depth test can run before shading.
+    add_custom_command(
+        OUTPUT "${STATIC_MESH_OPAQUE_PS_SPV}"
+        COMMAND ${CMAKE_COMMAND} -E make_directory "${GENERATED_SHADER_DIR}"
+        COMMAND "${DXC_EXECUTABLE}" -spirv -T ps_6_0 -E PSMain -D STATIC_MESH_OPAQUE=1
+            -Fo "${STATIC_MESH_OPAQUE_PS_SPV}" "${CLIENT_ROOT}/shaders/StaticMesh.hlsl"
+        DEPENDS "${CLIENT_ROOT}/shaders/StaticMesh.hlsl" "${CLIENT_ROOT}/shaders/SunShadow.hlsli"
+        VERBATIM
+    )
+    add_custom_command(
+        OUTPUT "${STATIC_MESH_UNLIT_OPAQUE_PS_SPV}"
+        COMMAND ${CMAKE_COMMAND} -E make_directory "${GENERATED_SHADER_DIR}"
+        COMMAND "${DXC_EXECUTABLE}" -spirv -T ps_6_0 -E PSMain -D SHADING_MODE_UNLIT=1 -D STATIC_MESH_OPAQUE=1
+            -Fo "${STATIC_MESH_UNLIT_OPAQUE_PS_SPV}" "${CLIENT_ROOT}/shaders/StaticMesh.hlsl"
         DEPENDS "${CLIENT_ROOT}/shaders/StaticMesh.hlsl" "${CLIENT_ROOT}/shaders/SunShadow.hlsli"
         VERBATIM
     )
@@ -587,6 +606,8 @@ if(WIN32)
         "${STATIC_MESH_VS_SPV}"
         "${STATIC_MESH_PS_SPV}"
         "${STATIC_MESH_UNLIT_PS_SPV}"
+        "${STATIC_MESH_OPAQUE_PS_SPV}"
+        "${STATIC_MESH_UNLIT_OPAQUE_PS_SPV}"
         "${STATIC_MESH_OUTLINE_VS_SPV}"
         "${STATIC_MESH_OUTLINE_PS_SPV}"
         "${TERRAIN_VS_SPV}"

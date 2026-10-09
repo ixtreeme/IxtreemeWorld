@@ -179,6 +179,7 @@ struct PointLight
     float intensity = 3.0f;
     float radius = 10.0f;
     bool enabled = true;
+    bool effectiveEnabled = true; // runtime ancestor gate
     bool editorHidden = false;
 };
 
@@ -199,6 +200,7 @@ struct SpotLight
     float innerConeDegrees = 20.0f;
     float outerConeDegrees = 35.0f;
     bool enabled = true;
+    bool effectiveEnabled = true; // runtime ancestor gate
     bool editorHidden = false;
 };
 
@@ -213,6 +215,7 @@ struct CameraEntity
     std::string prefabAssetId;
     PrefabInstanceState prefabInstance;
     SceneParentRef parent;
+    bool effectiveEnabled = true; // runtime ancestor gate, never serialized
     float position[3] = {0.0f, 8.0f, -18.0f};
     float rotation[3] = {-0.4363323f, 0.0f, 0.0f};
     float fovDegrees = 60.0f;
@@ -432,6 +435,9 @@ struct MeshSceneEntity
     float position[3] = {0.0f, 0.0f, 0.0f};
     float rotation[3] = {0.0f, 0.0f, 0.0f};
     float scale[3] = {1.0f, 1.0f, 1.0f};
+    bool enabled = true; // serialized local flag; descendants retain their own flag
+    bool effectiveEnabled = true; // runtime only, includes ancestors
+    bool activationChanged = false; // runtime reconciliation, never serialized
     bool skinned = false;
     bool editorHidden = false;
 

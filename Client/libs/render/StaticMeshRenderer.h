@@ -178,7 +178,7 @@ public:
     // These instances into one sun shadow cascade, depth only (alpha-masked materials keep their
     // cut-outs). Call inside the cascade's render pass (viewport set by its owner). shadowTexelMeters:
     // the cascade's texel size; each instance is drawn at the coarsest shadow detail level that stays
-    // within half a texel at its scale (BuildShadowLods; 0: the model's own triangles).
+    // within half a texel at its scale (BuildLods; 0: the model's own triangles).
     void RenderShadowCasters(ixrhi::IXRHICommandList& cmd,
         const ixrhi::IXRHIFrameInfo& frame,
         const WorldMat4& lightViewProj,
@@ -401,18 +401,22 @@ private:
     void WriteLodCpuCache(const LodCpuSet& set) const;
     std::filesystem::path LodCachePath(const std::string& modelPath, std::uint64_t configHash) const;
     void DecodeTextures(const std::string& modelPath);  // into m_decodedTextures (LoadCpu)
-    // Sun shadow detail levels (LoadCpu): each opaque submesh welded across its uv and normal seams
-    // (a depth pass reads positions only) and simplified to within kShadowLodErrors[level] of its
-    // surface, in model units, each level from the one before. A level that takes off less than a
-    // quarter of the one before is that one again. An alpha-masked submesh of many small separate
-    // pieces (leaf cards) has the coarsest level only: kShadowCardKeep of the pieces, each grown
-    // about its centre to cover kShadowCardCover of the area of those left out (the shadow's
-    // density then matches the full crown's: the grown pieces overlap each other less).
-    static constexpr std::size_t kShadowLodLevels = 3;
-    static constexpr std::array<float, kShadowLodLevels> kShadowLodErrors = {0.005f, 0.016f, 0.064f};
+    // Detail levels (LoadCpu): each opaque submesh simplified to within kLodErrors[level] of its
+    // surface, in model units, each level from the one before; a level that takes off less than a
+    // quarter of the one before is that one again. Two sets of them: the sun shadow's, of the
+    // surface welded across its uv and normal seams (a depth pass reads positions only), and the
+    // view's, the seams kept (its texture and lighting stay). For the shadow, an alpha-masked
+    // submesh of many small separate pieces (leaf cards) has the coarsest level too:
+    // kShadowCardKeep of the pieces, each grown about its centre to cover kShadowCardCover of the
+    // area of those left out (the shadow's density then matches the full crown's: the grown pieces
+    // overlap each other less). The view draws an instance at the coarsest level whose error, at its
+    // scale and nearest depth, projects under kViewLodMaxErrorPixels.
+    static constexpr std::size_t kLodLevels = 3;
+    static constexpr std::array<float, kLodLevels> kLodErrors = {0.005f, 0.016f, 0.064f};
     static constexpr float kShadowCardKeep = 0.25f;
     static constexpr float kShadowCardCover = 0.7f;
-    void BuildShadowLods();
+    static constexpr float kViewLodMaxErrorPixels = 0.5f;
+    void BuildLods();
     bool UploadDecodedTextures(ixrhi::IXRHIDevice& rhi);
     // staging: when given, the texture is made empty and its texels go there (a deferred upload).
     bool UploadTexture(ixrhi::IXRHIDevice& rhi, const RgbaImage& source, Texture& texture,
@@ -422,7 +426,7 @@ private:
     {
         std::shared_ptr<ixrhi::IXRHIBuffer> vertexStaging;
         std::shared_ptr<ixrhi::IXRHIBuffer> indexStaging;
-        std::shared_ptr<ixrhi::IXRHIBuffer> shadowLodIndexStaging;
+        std::shared_ptr<ixrhi::IXRHIBuffer> lodIndexStaging;
         std::shared_ptr<ixrhi::IXRHIBuffer> shadowCardVertexStaging;
         std::array<std::shared_ptr<ixrhi::IXRHIBuffer>, 3> textureStaging{};  // diffuse, normal, orm
         std::uint64_t recordedFrame = std::numeric_limits<std::uint64_t>::max();
@@ -504,14 +508,17 @@ private:
     std::unique_ptr<PendingUploads> m_pendingUploads;
     bool m_deferUploads = false;  // FinishGpu's, for CreateBuffers and UploadDecodedTextures
     std::shared_ptr<ixrhi::IXRHIBuffer> m_indexBuffer;
-    // The shadow detail levels' indices, and per level and draw its span in them (indexCount 0: the
-    // draw's own indices; none for a model too small or without opaque submeshes). The leaf cards'
-    // spans in them index their own vertices. Neither kind for a model with nothing to take off.
-    std::vector<std::uint32_t> m_shadowLodIndices;
-    std::array<std::vector<MeshDraw>, kShadowLodLevels> m_shadowLodDraws;
+    // The detail levels' indices (BuildLods), and per level and draw its span in them (indexCount 0:
+    // the draw's own indices; none for a model too small or without opaque submeshes), the shadow's
+    // and the view's. The leaf cards' spans in them index their own vertices. None for a model with
+    // nothing to take off.
+    std::vector<std::uint32_t> m_lodIndices;
+    std::array<std::vector<MeshDraw>, kLodLevels> m_shadowLodDraws;
+    std::array<std::vector<MeshDraw>, kLodLevels> m_viewLodDraws;
+    float m_modelRadius = 0.0f;  // the farthest point of the bounds from the model's origin
     std::vector<Vertex> m_shadowCardVertices;
     std::vector<MeshDraw> m_shadowCardDraws;
-    std::shared_ptr<ixrhi::IXRHIBuffer> m_shadowLodIndexBuffer;
+    std::shared_ptr<ixrhi::IXRHIBuffer> m_lodIndexBuffer;
     std::shared_ptr<ixrhi::IXRHIBuffer> m_shadowCardVertexBuffer;
     // Grown when a frame appends more records than it holds. The records a frame wrote before stay
     // in the old buffer, which the sets bound to it keep alive.
@@ -561,6 +568,12 @@ private:
     std::unique_ptr<ixrhi::IXRHIGraphicsPipeline> m_maskPipeline;
     std::unique_ptr<ixrhi::IXRHIGraphicsPipeline> m_unlitPipeline;
     std::unique_ptr<ixrhi::IXRHIGraphicsPipeline> m_unlitMaskPipeline;
+    // The alpha-masked draws in two steps (RenderLodBatchInWorld): their depth, alpha-tested by a shader
+    // that does nothing else and writes no colour; then their colour where that depth is theirs, not
+    // written (so the hardware rejects a hidden texel before shading it).
+    std::unique_ptr<ixrhi::IXRHIGraphicsPipeline> m_maskDepthPipeline;
+    std::unique_ptr<ixrhi::IXRHIGraphicsPipeline> m_maskOnDepthPipeline;
+    std::unique_ptr<ixrhi::IXRHIGraphicsPipeline> m_unlitMaskOnDepthPipeline;
     std::unique_ptr<ixrhi::IXRHIGraphicsPipeline> m_outlinePipeline;
     // Alpha-blended (Blend materials): [lit, unlit] x [back faces, front faces].
     std::array<std::array<std::unique_ptr<ixrhi::IXRHIGraphicsPipeline>, 2>, 2> m_blendPipelines;

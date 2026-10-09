@@ -25,6 +25,7 @@
 #include "AudioEngine.h"
 #include "ScriptSystem.h"
 #include "ScriptApiImpl.h"
+#include "EntityActivation.h"
 #include "BuildService.h"  // ixeditor::build::GameScriptBuildService — cmake Build worker (Editor/Build boundary)
 #include "GamePackager.h"  // ixeditor::build::GamePackageService — "Build Game" packager (Editor/Build boundary)
 #include "platform/open_external.h"
@@ -3483,6 +3484,7 @@ int RunGame(NativeWindow& window,
     ScriptApiImpl scriptApi;
     std::unique_ptr<ixscript::ScriptSystem> scriptSystem;
     std::unordered_map<std::uint32_t, std::unique_ptr<ixscript::ScriptInstance>> entityScripts;
+    std::unordered_set<std::uint32_t> startedEntityScripts;
     // In-engine game-script Build: cmake runs on a worker thread (10-30s) so the UI stays responsive;
     // the reload + log update happen on the main thread when the worker signals done. Owned by the
     // Editor/Build service boundary (ixeditor::build::GameScriptBuildService); the frame loop only
@@ -3565,6 +3567,7 @@ int RunGame(NativeWindow& window,
     // Shared sim helpers (the mesh-entity set + its id->index lookup are unguarded state, and these are
     // used by the standalone runtime's per-frame sim, e.g. the deferred spawn/destroy drain).
     auto rebuildMeshEntityLookup = [&]() {
+        ResolveEntityActivation(editorMeshEntities, editorPointLights, editorSpotLights, &editorCameras);
         editorMeshEntityLookup.clear();
         for (std::size_t i = 0; i < editorMeshEntities.size(); ++i)
             editorMeshEntityLookup[editorMeshEntities[i].id] = i;
@@ -3627,6 +3630,10 @@ int RunGame(NativeWindow& window,
     // Shared sim/render/physics helpers (mesh spatial sync, script-spawn, physics world build/step) —
     // the standalone runtime's per-frame sim calls these; everything they touch is unguarded state.
     auto syncStaticMeshSpatialEntity = [&](const MeshSceneEntity& mesh) {
+        if (!mesh.effectiveEnabled) {
+            if (staticMeshSpatialIndexed.erase(mesh.id)) staticMeshSpatialIndex.Remove(mesh.id);
+            return false;
+        }
         const std::string runtimePath = resolveMeshRuntimePath(mesh);
         StaticMeshRenderer* renderer = requestStaticMeshRenderer(runtimePath);
         if (!renderer || !renderer->IsLoaded())
@@ -3737,6 +3744,38 @@ int RunGame(NativeWindow& window,
             if (bodyId == hit.bodyId) { outId = entId; break; }
         return true;
     };
+    auto physicsQueryFilter = [&](const ixscript::QueryFilter& filter) {
+        phys::PhysicsQueryFilter out;
+        out.layerMask = filter.layerMask;
+        out.hitTriggers = (filter.flags & 1u) != 0;
+        if (const auto it = editorPhysicsBodies.find(filter.ignoreEntityId); it != editorPhysicsBodies.end())
+            out.ignoreBody = it->second;
+        return out;
+    };
+    auto physicsEntityId = [&](phys::BodyId body) -> std::uint32_t {
+        const auto it = editorPhysicsBodyBindings.find(body);
+        return it == editorPhysicsBodyBindings.end() ? 0u : it->second.entityId;
+    };
+    scriptApi.raycastFiltered = [&](const float* origin, const float* direction, float distance,
+        const ixscript::QueryFilter& filter) {
+        ixscript::RaycastHit out;
+        if (!editorPhysicsWorldActive) return out;
+        phys::PhysicsRaycastHit hit;
+        if (editorPhysicsWorld.Raycast(origin, direction, distance, physicsQueryFilter(filter), hit)) {
+            out.hit = true; out.entityId = physicsEntityId(hit.bodyId); out.distance = hit.distance;
+            std::copy_n(hit.position, 3, out.point); std::copy_n(hit.normal, 3, out.normal);
+        }
+        return out;
+    };
+    scriptApi.overlapSphere = [&](const float* center, float radius, const ixscript::QueryFilter& filter) {
+        std::vector<ixscript::SphereOverlapHit> out;
+        if (!editorPhysicsWorldActive) return out;
+        // Collect before truncating: output order must not depend on Jolt broad-phase traversal.
+        for (const auto& hit : editorPhysicsWorld.OverlapSphere(center, radius, physicsQueryFilter(filter),
+            std::numeric_limits<std::size_t>::max()))
+            out.push_back({physicsEntityId(hit.bodyId), hit.trigger ? 1u : 0u});
+        return out;
+    };
     // Game UI: scripts open RmlUi documents from the project's asset folder (a HUD, menus, ...).
     scriptApi.gameUi = &rmlUi;
     scriptApi.resolveUiDocument = [](const std::string& documentPath) -> std::string {
@@ -3832,6 +3871,56 @@ int RunGame(NativeWindow& window,
         }
         simIt->second.QueueBurst(count);
     };
+    auto resolvePrefabAssetPath = [&](const std::string& assetId)
+        -> std::optional<std::pair<AssetLibrary::Entry, std::filesystem::path>> {
+        if (assetId.empty())
+            return std::nullopt;
+        if (ProjectManager::Instance().HasProject())
+        {
+            AssetLibrary projectAssets(ProjectManager::Instance().ProjectRoot(),
+                ProjectManager::Instance().AssetRootPath());
+            if (projectAssets.InitializeReadOnly())
+            {
+                auto entry = projectAssets.FindById(assetId);
+                if (entry && entry->category == AssetLibrary::Category::Prefab)
+                    return std::make_pair(*entry, projectAssets.AbsolutePath(*entry));
+            }
+        }
+        if (auto root = assets.RootPath())
+        {
+            AssetLibrary engineAssets(*root);
+            if (engineAssets.InitializeReadOnly())
+            {
+                auto entry = engineAssets.FindById(assetId);
+                if (entry && entry->category == AssetLibrary::Category::Prefab)
+                    return std::make_pair(*entry, engineAssets.AbsolutePath(*entry));
+            }
+        }
+        return std::nullopt;
+    };
+    auto loadPrefabDocument = [&](const std::string& assetId)
+        -> std::optional<std::pair<prefab::PrefabDocument, std::filesystem::path>> {
+        const auto resolved = resolvePrefabAssetPath(assetId);
+        if (!resolved)
+        {
+            TraceError("[PREFAB] load failed: asset not found id=%s", assetId.c_str());
+            return std::nullopt;
+        }
+        std::ifstream file(resolved->second, std::ios::binary);
+        if (!file)
+        {
+            TraceError("[PREFAB] load failed: unreadable path=%s", resolved->second.string().c_str());
+            return std::nullopt;
+        }
+        const std::string text((std::istreambuf_iterator<char>(file)), std::istreambuf_iterator<char>());
+        prefab::PrefabDocument prefabData = prefab::ParseDocument(text, resolved->first.displayName);
+        if (prefabData.entities.empty())
+        {
+            TraceError("[PREFAB] load failed: unsupported file=%s", resolved->second.string().c_str());
+            return std::nullopt;
+        }
+        return std::make_pair(std::move(prefabData), resolved->second);
+    };
     // Creates a mesh entity for a deferred script spawn, reusing the pre-allocated id (self-contained
     // asset resolution + skinned detection, mirroring the editor's createMeshEntityAt).
     auto spawnMeshEntityForScript = [&](const std::string& assetId, const float pos[3],
@@ -3905,6 +3994,10 @@ int RunGame(NativeWindow& window,
     auto fitMeshColliderToBounds = [&](MeshSceneEntity& mesh) {
         if (!mesh.hasCollider)
             return false;
+        if (!mesh.effectiveEnabled) {
+            if (staticMeshSpatialIndexed.erase(mesh.id)) staticMeshSpatialIndex.Remove(mesh.id);
+            return false;
+        }
         const std::string runtimePath = resolveMeshRuntimePath(mesh);
         StaticMeshRenderer* renderer = getStaticMeshRenderer(runtimePath);
         if (!renderer || !renderer->IsLoaded())
@@ -4264,6 +4357,9 @@ int RunGame(NativeWindow& window,
                 mesh.hingeJoint.axis[1],
                 mesh.hingeJoint.axis[2]);
         }
+        for (const auto& mesh : editorMeshEntities)
+            if (const auto body = editorPhysicsBodies.find(mesh.id); body != editorPhysicsBodies.end())
+                editorPhysicsWorld.SetBodyEnabled(body->second, mesh.effectiveEnabled);
         editorPhysicsWorldActive = true;
         editorPhysicsStepLogFrames = 0;
         Tracenf("[PHYSICS] play world rebuilt bodies=%u dynamic=%u static=%u kinematic=%u gravityBodies=%u worldGravity=(%.2f,%.2f,%.2f) fixedDt=%.4f maxSubsteps=%u fixedJoints=%u hingeJoints=%u meshEntities=%zu",
@@ -4300,7 +4396,7 @@ int RunGame(NativeWindow& window,
             for (const auto& [meshId, bodyId] : editorPhysicsBodies)
             {
                 MeshSceneEntity* mesh = findMeshEntityById(meshId);
-                if (!mesh)
+                if (!mesh || !mesh->effectiveEnabled)
                     continue;
                 const bool isCharacter = mesh->hasCharacterController && mesh->characterController.enabled;
                 const bool isKinematicRigidbody = mesh->hasRigidbody && mesh->rigidbody.enabled &&
@@ -4836,11 +4932,28 @@ int RunGame(NativeWindow& window,
         }
 
         std::unordered_set<std::uint64_t> liveKeySet(liveKeys.begin(), liveKeys.end());
+        // ChildOf deletes descendants with their parent. Scripts delete only the
+        // requested object, so detach surviving mirrors before removing stale parents.
+        std::unordered_set<ecs_entity_t> staleHandles;
+        for (const auto& [key, handle] : editorHierarchyEntities)
+            if (!liveKeySet.contains(key)) staleHandles.insert(handle);
+        for (const auto& [key, handle] : editorHierarchyEntities)
+        {
+            const auto parent = editorHierarchyParents.find(handle);
+            if (liveKeySet.contains(key) && parent != editorHierarchyParents.end() &&
+                staleHandles.contains(parent->second))
+            {
+                ecs_add_pair(editorHierarchyWorld.get(), handle, EcsChildOf, editorSceneRootEntity);
+                parent->second = editorSceneRootEntity;
+            }
+        }
         for (auto it = editorHierarchyEntities.begin(); it != editorHierarchyEntities.end();)
         {
             if (!liveKeySet.contains(it->first))
             {
-                ecs_delete(editorHierarchyWorld.get(), it->second);
+                // A stale ancestor may already have deleted this stale mirror.
+                if (ecs_is_alive(editorHierarchyWorld.get(), it->second))
+                    ecs_delete(editorHierarchyWorld.get(), it->second);
                 editorHierarchyNames.erase(it->second);
                 editorHierarchyParents.erase(it->second);
                 editorHierarchyNoteTags.erase(it->second);
@@ -5888,6 +6001,7 @@ int RunGame(NativeWindow& window,
                 ixaudio::AudioSourceRuntime rt;
                 if (audioEngine.CreateSource(rt, audioMesh.audioSource, clipPath))
                 {
+                    audioEngine.SetSourcePaused(rt, !audioMesh.effectiveEnabled);
                     if (audioMesh.audioSource.playOnStart)
                         audioEngine.StartSource(rt);
                     entityAudioSources[audioMesh.id] = std::move(rt);
@@ -5897,6 +6011,7 @@ int RunGame(NativeWindow& window,
         // Scripting: spin up the subsystem and create one live instance per scripted entity,
         // firing OnStart now. A throwing hook must not abort Play, so isolate every call.
         entityScripts.clear();
+        startedEntityScripts.clear();
         scriptSystem = std::make_unique<ixscript::ScriptSystem>(scriptApi);
         // Particles: drop the previous session's simulators. The per-frame update creates one per
         // emitting entity lazily (also for entities spawned mid-Play).
@@ -5912,7 +6027,10 @@ int RunGame(NativeWindow& window,
                 continue;
             try
             {
-                instance->OnStart();
+                if (scriptMesh.effectiveEnabled) {
+                    startedEntityScripts.insert(scriptMesh.id);
+                    instance->OnStart();
+                }
             }
             catch (const std::exception& e)
             {
@@ -5959,7 +6077,7 @@ int RunGame(NativeWindow& window,
         for (std::uint32_t index = 0; index < static_cast<std::uint32_t>(editorMeshEntities.size()); ++index)
         {
             const MeshSceneEntity& mesh = editorMeshEntities[index];
-            if (mesh.hasParticleSystem && mesh.particleSystem.enabled)
+            if (mesh.effectiveEnabled && mesh.hasParticleSystem && mesh.particleSystem.enabled)
                 particleEntityIndices.push_back(index);
         }
     };
@@ -6005,6 +6123,7 @@ int RunGame(NativeWindow& window,
                 it = entityParticles.erase(it);
                 continue;
             }
+            if (!meshIt->effectiveEnabled) { ++it; continue; }
             particleSteps.push_back({&it->second, meshIt});
             particleCount += it->second.AliveCount();
             ++it;
@@ -6245,14 +6364,15 @@ int RunGame(NativeWindow& window,
         const CameraEntity* mainCameraEntity = nullptr;
         for (const CameraEntity& cameraEntity : editorCameras)
         {
-            if (cameraEntity.id == editorMainCameraId)
+            if (cameraEntity.effectiveEnabled && cameraEntity.id == editorMainCameraId)
             {
                 mainCameraEntity = &cameraEntity;
                 break;
             }
         }
-        if (!mainCameraEntity && !editorCameras.empty())
-            mainCameraEntity = &editorCameras.front();
+        if (!mainCameraEntity)
+            for (const auto& camera : editorCameras)
+                if (camera.effectiveEnabled) { mainCameraEntity = &camera; break; }
         std::optional<CameraEntity> gameCameraEntity;
         if (mainCameraEntity)
             gameCameraEntity = *mainCameraEntity;
@@ -6260,7 +6380,7 @@ int RunGame(NativeWindow& window,
         {
             for (const MeshSceneEntity& characterMesh : editorMeshEntities)
             {
-                if (!characterMesh.hasCharacterController || !characterMesh.characterController.enabled)
+                if (!characterMesh.effectiveEnabled || !characterMesh.hasCharacterController || !characterMesh.characterController.enabled)
                     continue;
                 auto stateIt = editorCharacterStates.find(characterMesh.id);
                 if (stateIt == editorCharacterStates.end() || !stateIt->second.initialized)
@@ -6526,7 +6646,8 @@ int RunGame(NativeWindow& window,
                     entityScripts.erase(it);  // recompile failed — drop (the backend logged the error)
                     continue;
                 }
-                try { fresh->OnStart(); }
+                startedEntityScripts.erase(reloadMesh.id);
+                try { if (reloadMesh.effectiveEnabled) { startedEntityScripts.insert(reloadMesh.id); fresh->OnStart(); } }
                 catch (...) { TraceError("[SCRIPT] OnStart threw entity=%u", reloadMesh.id); }
                 it->second = std::move(fresh);
                 Tracenf("[SCRIPT] hot-reloaded %s entity=%u asset=%s",
@@ -6785,7 +6906,7 @@ int RunGame(NativeWindow& window,
                 const bool characterInputActive = !runtimeSession->IsTextInputFocused();
                 for (MeshSceneEntity& characterMesh : editorMeshEntities)
                 {
-                    if (!characterMesh.hasCharacterController || !characterMesh.characterController.enabled)
+                    if (!characterMesh.effectiveEnabled || !characterMesh.hasCharacterController || !characterMesh.characterController.enabled)
                         continue;
                     phys::CharacterControllerComponent cc = characterMesh.characterController;
                     phys::Sanitize(cc);
@@ -6834,13 +6955,14 @@ int RunGame(NativeWindow& window,
                         it = entityScripts.erase(it);
                         continue;
                     }
-                    if (!meshIt->script.enabled)  // disabled mid-Play: keep the instance, skip its update
+                    if (!meshIt->effectiveEnabled || !meshIt->script.enabled)  // disabled mid-Play: keep the instance, skip its update
                     {
                         ++it;
                         continue;
                     }
                     try
                     {
+                        if (startedEntityScripts.insert(it->first).second) it->second->OnStart();
                         it->second->OnUpdate(static_cast<float>(deltaSeconds));
                     }
                     catch (const std::exception& e)
@@ -6866,7 +6988,8 @@ int RunGame(NativeWindow& window,
                     std::min(editorLastStepEntityEventCount, editorPhysicsEntityEvents.size());
                 auto fireCollision = [&](std::uint32_t self, std::uint32_t other) {
                     auto it = entityScripts.find(self);
-                    if (it == entityScripts.end() || !it->second)
+                    const MeshSceneEntity* eventMesh = findMeshEntityById(self);
+                    if (!eventMesh || !eventMesh->effectiveEnabled || it == entityScripts.end() || !it->second)
                         return;
                     try { it->second->OnCollision(other); }
                     catch (...) { TraceError("[SCRIPT] OnCollision threw entity=%u", self); }
@@ -6899,12 +7022,15 @@ int RunGame(NativeWindow& window,
                     scriptApi.deferredOps.begin() + static_cast<std::ptrdiff_t>(drainCount),
                     [](const ScriptApiImpl::DeferredOp& queued) {
                         return queued.kind == ScriptApiImpl::DeferredKind::SpawnMesh ||
+                            queued.kind == ScriptApiImpl::DeferredKind::SpawnPrefab ||
                             queued.kind == ScriptApiImpl::DeferredKind::Destroy;
                     });
                 bool rebuildPhysics = spawnsOrDestroys && !editorPhysicsWorldActive;
+                bool activationDirty = spawnsOrDestroys;
                 const std::unordered_set<std::uint32_t> jointEntities =
                     spawnsOrDestroys ? physicsJointEntities() : std::unordered_set<std::uint32_t>{};
                 std::unordered_set<std::uint32_t> destroyedEntities;
+                std::vector<std::uint32_t> spawnedPrefabMeshes;
                 // An entity by id that is not destroyed in this drain (by the lookup, else a search).
                 auto findLiveEntity = [&](std::uint32_t id) -> MeshSceneEntity* {
                     if (destroyedEntities.count(id) > 0)
@@ -6931,13 +7057,21 @@ int RunGame(NativeWindow& window,
                             }
                             entityScripts.erase(sit);
                         }
+                        startedEntityScripts.erase(op.id);
                         entityAudioSources.erase(op.id);
                         entityParticles.erase(op.id);
+                        particleRenderer.GpuEmitterSetEntityPaused(op.id, false);
                         removeStaticMeshSpatialEntity(op.id);
                         destroyedEntities.insert(op.id);
                         if (selectedEditorObject.type == SelectedEditorObjectType::MeshEntity &&
                             selectedEditorObject.id == op.id)
                             selectedEditorObject = {};
+                    }
+                    else if (op.kind == ScriptApiImpl::DeferredKind::SetEnabled)
+                    {
+                        if (auto* mesh = findLiveEntity(op.id); mesh && mesh->enabled != op.enabled) {
+                            mesh->enabled = op.enabled; activationDirty = true;
+                        }
                     }
                     else if (op.kind == ScriptApiImpl::DeferredKind::SetMaterial)
                     {
@@ -6968,8 +7102,61 @@ int RunGame(NativeWindow& window,
                     }
                     else if (op.kind == ScriptApiImpl::DeferredKind::SpawnPrefab)
                     {
-                        Tracenf("[SCRIPT] SpawnPrefab not yet supported (entity=%u asset=%s) — use SpawnMesh",
-                            op.id, op.assetId.c_str());
+                        const auto loaded = loadPrefabDocument(op.assetId);
+                        if (!loaded)
+                            continue;
+                        const auto& document = loaded->first;
+                        const auto pointCount = std::count_if(document.entities.begin(), document.entities.end(),
+                            [](const prefab::PrefabEntity& e) { return e.kind == prefab::PrefabTemplate::Kind::PointLight; });
+                        const auto spotCount = std::count_if(document.entities.begin(), document.entities.end(),
+                            [](const prefab::PrefabEntity& e) { return e.kind == prefab::PrefabTemplate::Kind::SpotLight; });
+                        if (editorPointLights.size() + pointCount > kMaxDynamicPointLights ||
+                            editorSpotLights.size() + spotCount > kMaxDynamicSpotLights)
+                        {
+                            TraceError("[SCRIPT] SpawnPrefab failed root=%u: light limit", op.id);
+                            continue;
+                        }
+                        prefab::RuntimePrefabInstance instance;
+                        std::string error;
+                        if (!prefab::InstantiateRuntime(document, op.assetId, op.id, op.pos,
+                            [&] { return nextEditorMeshEntityId++; }, [&] { return nextEditorLightId++; }, instance, error))
+                        {
+                            TraceError("[SCRIPT] SpawnPrefab failed root=%u: %s", op.id, error.c_str());
+                            continue;
+                        }
+                        editorMeshEntities.reserve(editorMeshEntities.size() + instance.meshes.size());
+                        for (auto& mesh : instance.meshes)
+                        {
+                            mesh.name = makeUniqueSceneEntityName(mesh.name.empty() ? "Spawned Prefab" : mesh.name);
+                            if (mesh.materialSlots.empty())
+                                mesh.materialSlots = LoadDefaultMaterialSlotGuids(mesh.meshAssetPath, ResolveModelSubmeshCount(mesh.meshAssetPath));
+                            const auto id = mesh.id;
+                            editorMeshEntities.push_back(std::move(mesh));
+                            auto& liveMesh = editorMeshEntities.back();
+                            editorMeshEntityLookup[id] = editorMeshEntities.size() - 1u;
+                            syncStaticMeshSpatialEntity(liveMesh);
+                            if ((liveMesh.hasFixedJoint && liveMesh.fixedJoint.enabled) ||
+                                (liveMesh.hasHingeJoint && liveMesh.hingeJoint.enabled))
+                                rebuildPhysics = true;
+                            else if (!rebuildPhysics)
+                            {
+                                PhysicsBodyCounts counts;
+                                createPhysicsBodyForEntity(liveMesh, counts);
+                            }
+                            spawnedPrefabMeshes.push_back(id);
+                        }
+                        for (auto& light : instance.points)
+                        {
+                            light.name = makeUniqueSceneEntityName(light.name.empty() ? "Spawned Point Light" : light.name);
+                            editorPointLights.push_back(std::move(light));
+                        }
+                        for (auto& light : instance.spots)
+                        {
+                            light.name = makeUniqueSceneEntityName(light.name.empty() ? "Spawned Spot Light" : light.name);
+                            editorSpotLights.push_back(std::move(light));
+                        }
+                        Tracenf("[SCRIPT] SpawnPrefab root=%u asset=%s meshes=%zu points=%zu spots=%zu", op.id,
+                            op.assetId.c_str(), instance.meshes.size(), instance.points.size(), instance.spots.size());
                     }
                     else  // SpawnMesh
                     {
@@ -6993,8 +7180,66 @@ int RunGame(NativeWindow& window,
                         editorMeshEntities.end());
                     rebuildMeshEntityLookup();  // the indices moved (a spawn adds its own entry)
                 }
-                if (rebuildPhysics)
+                // Resolve inherited flags once at commit, then update spatial/shadow membership and
+                // physics bodies. Existing bodies retain transforms and velocities while suspended.
+                if (activationDirty) rebuildMeshEntityLookup();
+                if (rebuildPhysics) {
+                    // A joint requires rebuilding the world; unaffected bodies still keep motion,
+                    // including the snapshots of bodies currently disabled outside the broad phase.
+                    struct Motion { float linear[3], angular[3]; };
+                    std::unordered_map<std::uint32_t, Motion> motion;
+                    for (const auto& [id,body] : editorPhysicsBodies) {
+                        Motion saved{};
+                        if (editorPhysicsWorld.GetLinearVelocity(body,saved.linear) &&
+                            editorPhysicsWorld.GetAngularVelocity(body,saved.angular)) motion.emplace(id,saved);
+                    }
                     rebuildEditorPhysicsWorld();
+                    for (const auto& [id,saved] : motion)
+                        if (const auto body=editorPhysicsBodies.find(id); body!=editorPhysicsBodies.end()) {
+                            editorPhysicsWorld.SetLinearVelocity(body->second,saved.linear);
+                            editorPhysicsWorld.SetAngularVelocity(body->second,saved.angular);
+                        }
+                }
+                if (activationDirty) for (auto& mesh : editorMeshEntities) {
+                    if (!mesh.activationChanged && std::find(spawnedPrefabMeshes.begin(),spawnedPrefabMeshes.end(),mesh.id)==spawnedPrefabMeshes.end()) continue;
+                    syncStaticMeshSpatialEntity(mesh);
+                    mesh.activationChanged = false;
+                    particleRenderer.GpuEmitterSetEntityPaused(mesh.id, !mesh.effectiveEnabled);
+                    if (const auto body = editorPhysicsBodies.find(mesh.id); body != editorPhysicsBodies.end()) {
+                        if (mesh.effectiveEnabled)
+                            editorPhysicsWorld.SetBodyTransform(body->second, PhysicsTransformFromMesh(mesh));
+                        editorPhysicsWorld.SetBodyEnabled(body->second, mesh.effectiveEnabled);
+                    }
+                }
+                // Publish the whole prefab before OnStart: every sibling is visible to script queries.
+                // Hooks may enqueue more operations, which the next frame drains.
+                for (const auto id : spawnedPrefabMeshes)
+                {
+                    const MeshSceneEntity* mesh = findMeshEntityById(id);
+                    if (!mesh) continue; // also destroyed in this drain
+                    if (audioEngine.IsInitialized() && mesh->hasAudioSource && mesh->audioSource.enabled &&
+                        !mesh->audioSource.clipAssetId.empty())
+                    {
+                        const std::string path = editorImGui.AudioClipFilePath(mesh->audioSource.clipAssetId);
+                        ixaudio::AudioSourceRuntime source;
+                        if (!path.empty() && audioEngine.CreateSource(source, mesh->audioSource, path))
+                        {
+                            audioEngine.SetSourcePaused(source, !mesh->effectiveEnabled);
+                            if (mesh->audioSource.playOnStart) audioEngine.StartSource(source);
+                            entityAudioSources[id] = std::move(source);
+                        }
+                    }
+                    if (scriptSystem && mesh->hasScript && mesh->script.enabled)
+                    {
+                        auto script = scriptSystem->CreateInstance(id, mesh->script);
+                        if (script)
+                        {
+                            try { if (mesh->effectiveEnabled) { startedEntityScripts.insert(id); script->OnStart(); } }
+                            catch (...) { TraceError("[SCRIPT] OnStart threw entity=%u", id); }
+                            entityScripts[id] = std::move(script);
+                        }
+                    }
+                }
                 SceneManager::Instance().MarkDirty();
             }
 
@@ -7013,6 +7258,7 @@ int RunGame(NativeWindow& window,
                         continue;
                     }
                     const float audioPos[3] = {meshIt->position[0], meshIt->position[1], meshIt->position[2]};
+                    audioEngine.SetSourcePaused(it->second, !meshIt->effectiveEnabled || !meshIt->audioSource.enabled);
                     audioEngine.UpdateSource(it->second, meshIt->audioSource, audioPos);
                     ++it;
                 }
@@ -7068,7 +7314,7 @@ int RunGame(NativeWindow& window,
                 const WorldVec3 listenForward = WorldCameraForward(frameCamera);
                 WorldVec3 listenPos = frameCamera.eye;
                 for (const MeshSceneEntity& listenerMesh : editorMeshEntities)
-                    if (listenerMesh.hasAudioListener && listenerMesh.audioListener.enabled)
+                    if (listenerMesh.effectiveEnabled && listenerMesh.hasAudioListener && listenerMesh.audioListener.enabled)
                     {
                         listenPos = WorldVec3{listenerMesh.position[0], listenerMesh.position[1], listenerMesh.position[2]};
                         break;
@@ -7951,6 +8197,17 @@ int RunGame(NativeWindow& window,
 
                     if (!setHierarchyParent(type, id, parent))
                         return false;
+                    rebuildMeshEntityLookup();
+                    for (auto& mesh : editorMeshEntities) if (mesh.activationChanged) {
+                        syncStaticMeshSpatialEntity(mesh);
+                        mesh.activationChanged = false;
+                        particleRenderer.GpuEmitterSetEntityPaused(mesh.id,!mesh.effectiveEnabled);
+                        if (const auto body=editorPhysicsBodies.find(mesh.id); body!=editorPhysicsBodies.end()) {
+                            if (mesh.effectiveEnabled)
+                                editorPhysicsWorld.SetBodyTransform(body->second,PhysicsTransformFromMesh(mesh));
+                            editorPhysicsWorld.SetBodyEnabled(body->second,mesh.effectiveEnabled);
+                        }
+                    }
                     SceneManager::Instance().MarkDirty();
                     runtimeSession->SetEditorStatus(parent.IsValid()
                         ? "Hierarchy parent changed"
@@ -8804,56 +9061,6 @@ int RunGame(NativeWindow& window,
                         spawn.x,
                         spawn.y,
                         spawn.z);
-                };
-                auto resolvePrefabAssetPath = [&](const std::string& assetId)
-                    -> std::optional<std::pair<AssetLibrary::Entry, std::filesystem::path>> {
-                    if (assetId.empty())
-                        return std::nullopt;
-                    if (ProjectManager::Instance().HasProject())
-                    {
-                        AssetLibrary projectAssets(ProjectManager::Instance().ProjectRoot(),
-                            ProjectManager::Instance().AssetRootPath());
-                        if (projectAssets.InitializeReadOnly())
-                        {
-                            auto entry = projectAssets.FindById(assetId);
-                            if (entry && entry->category == AssetLibrary::Category::Prefab)
-                                return std::make_pair(*entry, projectAssets.AbsolutePath(*entry));
-                        }
-                    }
-                    if (auto root = assets.RootPath())
-                    {
-                        AssetLibrary engineAssets(*root);
-                        if (engineAssets.InitializeReadOnly())
-                        {
-                            auto entry = engineAssets.FindById(assetId);
-                            if (entry && entry->category == AssetLibrary::Category::Prefab)
-                                return std::make_pair(*entry, engineAssets.AbsolutePath(*entry));
-                        }
-                    }
-                    return std::nullopt;
-                };
-                auto loadPrefabDocument = [&](const std::string& assetId)
-                    -> std::optional<std::pair<prefab::PrefabDocument, std::filesystem::path>> {
-                    const auto resolved = resolvePrefabAssetPath(assetId);
-                    if (!resolved)
-                    {
-                        TraceError("[PREFAB] load failed: asset not found id=%s", assetId.c_str());
-                        return std::nullopt;
-                    }
-                    std::ifstream file(resolved->second, std::ios::binary);
-                    if (!file)
-                    {
-                        TraceError("[PREFAB] load failed: unreadable path=%s", resolved->second.string().c_str());
-                        return std::nullopt;
-                    }
-                    const std::string text((std::istreambuf_iterator<char>(file)), std::istreambuf_iterator<char>());
-                    prefab::PrefabDocument prefabData = prefab::ParseDocument(text, resolved->first.displayName);
-                    if (prefabData.entities.empty())
-                    {
-                        TraceError("[PREFAB] load failed: unsupported file=%s", resolved->second.string().c_str());
-                        return std::nullopt;
-                    }
-                    return std::make_pair(std::move(prefabData), resolved->second);
                 };
                 auto selectedPrefabRoot = [&]() -> std::optional<std::pair<HierarchyEntityType, std::uint32_t>> {
                     if (selectedEditorObject.type == SelectedEditorObjectType::MeshEntity)
@@ -11771,7 +11978,7 @@ int RunGame(NativeWindow& window,
                 lightingState.numPointLights = 0;
                 for (const PointLight& light : editorPointLights)
                 {
-                    if (editorHideEntities && light.editorHidden)
+                    if (!light.effectiveEnabled || (editorHideEntities && light.editorHidden))
                         continue;
                     if (lightingState.numPointLights >= kMaxDynamicPointLights)
                         break;
@@ -11780,7 +11987,7 @@ int RunGame(NativeWindow& window,
                 lightingState.numSpotLights = 0;
                 for (const SpotLight& light : editorSpotLights)
                 {
-                    if (editorHideEntities && light.editorHidden)
+                    if (!light.effectiveEnabled || (editorHideEntities && light.editorHidden))
                         continue;
                     if (lightingState.numSpotLights >= kMaxDynamicSpotLights)
                         break;
@@ -11940,8 +12147,18 @@ int RunGame(NativeWindow& window,
                 ++editorSnapshotTick;
             }
 #else
-            // The game: the lighting of the scene as loaded (ApplySceneData gave the terrain the same).
+            // Include spawned lights and inherited activation in standalone games too.
             frameLighting = editorImGui.GetLightingState();
+            frameLighting.numPointLights = 0;
+            for (const auto& light : editorPointLights)
+                if (light.effectiveEnabled && frameLighting.numPointLights < kMaxDynamicPointLights)
+                    frameLighting.pointLights[frameLighting.numPointLights++] = light;
+            frameLighting.numSpotLights = 0;
+            for (const auto& light : editorSpotLights)
+                if (light.effectiveEnabled && frameLighting.numSpotLights < kMaxDynamicSpotLights)
+                    frameLighting.spotLights[frameLighting.numSpotLights++] = light;
+            editorImGui.SetLightingState(frameLighting);
+            terrain.SetLightingState(frameLighting);
             for (auto& [skinnedPath, skinnedEntry] : skinnedMeshCache)
             {
                 (void)skinnedPath;
@@ -12112,7 +12329,7 @@ int RunGame(NativeWindow& window,
                     std::vector<SkinWork> skinWorks;
                     for (MeshSceneEntity& skinnedEntity : editorMeshEntities)
                     {
-                        if (editorPlay.state.mode == EditorPlayMode::Edit && skinnedEntity.editorHidden)
+                        if (!skinnedEntity.effectiveEnabled || (editorPlay.state.mode == EditorPlayMode::Edit && skinnedEntity.editorHidden))
                             continue;
                         const StaticMeshRenderRecord& meshRecord = staticMeshRenderRecord(skinnedEntity);
                         const std::string& skinnedRuntimePath = meshRecord.runtimePath;
@@ -12642,7 +12859,7 @@ int RunGame(NativeWindow& window,
                     };
                     for (const MeshSceneEntity& mesh : editorMeshEntities)
                     {
-                        if (mesh.skinned || (editorPlay.state.mode == EditorPlayMode::Edit && mesh.editorHidden))
+                        if (!mesh.effectiveEnabled || mesh.skinned || (editorPlay.state.mode == EditorPlayMode::Edit && mesh.editorHidden))
                         {
                             // Not a static caster now: out of the cache if it was in (its record, if any).
                             const std::uint32_t slot = mesh.renderRecordSlot;
@@ -13247,7 +13464,7 @@ int RunGame(NativeWindow& window,
                                 MeshSceneEntity* candidateMesh = findMeshEntityById(spatialCandidates[i]);
                                 // Skinned mesh entities are handled in the dedicated skinned pass above
                                 // (they are not tracked in the static spatial index), so skip them here.
-                                if (!candidateMesh || (hideEditorHidden && candidateMesh->editorHidden) ||
+                                if (!candidateMesh || !candidateMesh->effectiveEnabled || (hideEditorHidden && candidateMesh->editorHidden) ||
                                     candidateMesh->skinned)
                                     continue;
                                 candidate.mesh = candidateMesh;
@@ -13910,7 +14127,8 @@ int RunGame(NativeWindow& window,
                     if (godRaysOk && isInWorld && drawSceneView)
                     {
                         const GodRayRenderer::SunShadow sunShadow{terrain.SunShadowTexture(frameInfo.frameNumber),
-                            terrain.SunShadowCascadeViewProj(), TerrainRenderer::kSunShadowDepthBias};
+                            terrain.SunShadowCascadeViewProj(), TerrainRenderer::kSunShadowDepthBias,
+                            TerrainRenderer::SunShadowExtraDepthPaddingMeters()};
                         std::shared_ptr<ixrhi::IXRHITexture> rayDepth = offscreenScene.GetDepthSnapshotTexture();
                         if (!sceneSnapshotPass && godRays.IsVisible(sceneSky, frameSunLighting, camera, sunShadow))
                             rayDepth = offscreenScene.ReadableDepth(*frameInfo.commandList, frameInfo);
@@ -13992,7 +14210,7 @@ int RunGame(NativeWindow& window,
                             for (std::uint32_t candidateId : gameMeshCandidates)
                             {
                                 const MeshSceneEntity* mesh = findMeshEntityById(candidateId);
-                                if (!mesh || mesh->editorHidden || mesh->skinned)
+                                if (!mesh || !mesh->effectiveEnabled || mesh->editorHidden || mesh->skinned)
                                     continue;
                                 const StaticMeshRenderRecord& meshRecord = staticMeshRenderRecord(*mesh);
                                 StaticMeshRenderer* renderer = meshRecord.renderer;
@@ -14047,7 +14265,8 @@ int RunGame(NativeWindow& window,
                         // God rays over the game image, under the game's UI: after the pass, from its depth;
                         // the game view's tone-map draw adds them.
                         const GodRayRenderer::SunShadow gameSunShadow{terrain.SunShadowTexture(frameInfo.frameNumber),
-                            terrain.SunShadowCascadeViewProj(), TerrainRenderer::kSunShadowDepthBias};
+                            terrain.SunShadowCascadeViewProj(), TerrainRenderer::kSunShadowDepthBias,
+                            TerrainRenderer::SunShadowExtraDepthPaddingMeters()};
                         gameView.EndMainPass(*frameInfo.commandList);
 #if defined(IXTREEME_WITH_EDITOR)
                         if (runtimeSession->IsMapEditorOpen() && editorImGui.IsGameViewVisible())

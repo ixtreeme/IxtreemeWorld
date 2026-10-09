@@ -78,6 +78,20 @@ struct RaycastHit
     bool hit = false;
 };
 
+// ABI 7 queries. Layer bits: Default=0, StaticWorld=1, DynamicObject=2,
+// Player=3, Trigger=4, Projectile=5, Foliage=6, NoCollision=7.
+struct QueryFilter {
+    std::uint32_t layerMask = 0xffu;
+    std::uint32_t flags = 1u; // bit 0 includes sensors/triggers
+    std::uint32_t ignoreEntityId = 0;
+    std::uint32_t reserved = 0;
+};
+struct SphereOverlapHit {
+    std::uint32_t entityId = 0; // terrain/non-entity body
+    std::uint32_t flags = 0; // bit 0: trigger
+};
+inline constexpr std::uint32_t kMaxOverlapResults = 1024;
+
 // The SDK-facing facade — the EXACT surface a native game-module DLL may call. Every method is
 // heap-safe across the engine's static-CRT (/MT) DLL boundary: scalars, raw float[3] buffers the
 // caller owns, and STL params passed by const-ref that the engine only READS (never frees). No method
@@ -188,6 +202,16 @@ public:
     virtual void ParticleRestart(std::uint32_t id) = 0;
     // Spawns `count` particles immediately, even while emission is stopped.
     virtual void ParticleEmit(std::uint32_t id, std::uint32_t count) = 0;
+
+    // --- ABI 7 (appended slots): null filter means all layers, including triggers. ---
+    virtual RaycastHit RaycastFiltered(float ox, float oy, float oz,
+        float dx, float dy, float dz, float maxDistance, const QueryFilter* filter) = 0;
+    // Sorted unique entity ids. capacity is clamped to 1024; truncated is 1 if more exist.
+    // Invalid arguments return zero and clear truncated; output is caller-owned.
+    virtual std::uint32_t OverlapSphere(float x, float y, float z, float radius,
+        const QueryFilter* filter, SphereOverlapHit* output, std::uint32_t capacity,
+        std::uint32_t* truncated) = 0;
+    virtual void SetEntityEnabled(std::uint32_t id, bool enabled) = 0;
 
     // (NEVER add an STL-by-value return here — use a caller-owned char* buffer for strings to keep the
     //  /MT module boundary safe. By-value RaycastHit is fine: it is POD, no heap.)

@@ -56,6 +56,17 @@ target_link_libraries(IxtreemeEngine
 
 target_compile_features(IxtreemeEngine PRIVATE cxx_std_20)
 
+if(BUILD_TESTING AND NOT ANDROID)
+    add_executable(ScriptQueryTest tests/ScriptQueryTest.cpp src/ScriptApiImpl.cpp)
+    target_include_directories(ScriptQueryTest PRIVATE src)
+    target_link_libraries(ScriptQueryTest PRIVATE IXEngineRender IXEnginePhysics IXEngineAudio IXEngineScript IXEngineVulkan)
+    target_compile_features(ScriptQueryTest PRIVATE cxx_std_20)
+    if(MSVC)
+        set_target_properties(ScriptQueryTest PROPERTIES MSVC_RUNTIME_LIBRARY "MultiThreaded$<$<CONFIG:Debug>:Debug>")
+    endif()
+    add_test(NAME ScriptQueryTest COMMAND ScriptQueryTest)
+endif()
+
 target_compile_definitions(IxtreemeEngine
     PRIVATE
         $<$<BOOL:${IXTREEME_WITH_EDITOR}>:IXTREEME_WITH_EDITOR=1>
